@@ -63,6 +63,8 @@ extern void test_teko_aot_escape_analysis_register_allocation(void);
 extern void test_teko_aot_dead_code_elimination_purgue(void);
 extern void test_teko_aot_common_subexpression_elimination_filter(void);
 
+extern void test_teko_aot_constant_folding_math_collapse(void);
+
 int main(void) {
     UNITY_BEGIN();
 
@@ -125,6 +127,7 @@ int main(void) {
     RUN_TEST(test_teko_aot_escape_analysis_register_allocation);
     RUN_TEST(test_teko_aot_dead_code_elimination_purgue);
     RUN_TEST(test_teko_aot_common_subexpression_elimination_filter);
+    RUN_TEST(test_teko_aot_constant_folding_math_collapse);
 
     return UNITY_END();
 }

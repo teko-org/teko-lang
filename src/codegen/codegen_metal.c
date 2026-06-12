@@ -16,12 +16,10 @@ MetalContext* teko_metal_create(const char* output_asm_path, TekoTarget target) 
     return ctx;
 }
 
-// O ROTEADOR POLIMÓRFICO CENTRAL: Encaminha os opcodes para a função correta de OS/CPU
 static void teko_metal_route_instruction(MetalContext* ctx, OpCode op, int32_t arg) {
     auto os = ctx->target.os;
     auto arch = ctx->target.arch;
 
-    // 1. Ecossistema Apple (macOS Darwin)
     if (os == OS_MACOS_DARWIN) {
         if (arch == ARCH_APPLE_SILICON || arch == ARCH_ARM64) {
             emit_darwin_arm64(ctx, op, arg);
@@ -32,17 +30,14 @@ static void teko_metal_route_instruction(MetalContext* ctx, OpCode op, int32_t a
             return;
         }
     }
-    // 2. Ecossistema Windows (PE/COFF MSVC)
     else if (os == OS_WINDOWS) {
         if (arch == ARCH_X86_64) { emit_win_x86_64(ctx, op, arg); return; }
         if (arch == ARCH_X86)    { emit_win_x86(ctx, op, arg); return; }
         if (arch == ARCH_ARM64)  { emit_win_arm64(ctx, op, arg); return; }
     }
-    // 3. Ecossistema Bare-Metal / Virtualizadores independentes de OS
     else if (os == OS_BARE_METAL || os == OS_WASI) {
         if (arch == ARCH_WASM32 || arch == ARCH_WASM64) { emit_wasm_pure(ctx, op, arg); return; }
     }
-    // 4. Ecossistema Linux e BSD Unix (Mapeamento padrão unificado)
     else {
         if (os == OS_LINUX) {
             switch (arch) {
@@ -65,85 +60,127 @@ static void teko_metal_route_instruction(MetalContext* ctx, OpCode op, int32_t a
     }
 }
 
-// Varredura linear com Motores CSE e DCE integrados cooperativamente
+static int32_t read_le_int32(const unsigned char* bytecode, uint32_t index) {
+    return (bytecode[index + 0] << 0)  |
+           (bytecode[index + 1] << 8)  |
+           (bytecode[index + 2] << 16) |
+           (bytecode[index + 3] << 24);
+}
+
 static void process_linear_il_bytes(MetalContext* ctx, const unsigned char* bytecode, uint32_t size) {
     uint32_t i = 0;
     bool dead_code_zone = false;
 
-    // ESTADO DE CACHE DO MOTOR CSE
     bool accum_has_value = false;
     int32_t accum_last_value = 0;
-    OpCode last_arith_op = (OpCode)0; // Rastreia a última operação matemática realizada
+    OpCode last_arith_op = (OpCode)0;
 
+    unsigned char* local_il = (unsigned char*)malloc(size);
+    if (!local_il) return;
+    memcpy(local_il, bytecode, size);
+
+    // PASSO 1: CONSTANT FOLDING (Pre-processador de colapso estático)
+    uint32_t scan = 0;
+    while (scan < size) {
+        OpCode op = (OpCode)local_il[scan];
+
+        if (op == OP_ICONST && (scan + 10 < size)) {
+            OpCode next_op = (OpCode)local_il[scan + 5];
+            if (next_op == OP_ICONST) {
+                OpCode arith_op = (OpCode)local_il[scan + 10];
+
+                if (arith_op == OP_ADD || arith_op == OP_SUB || arith_op == OP_MUL || arith_op == OP_DIV) {
+                    int32_t c1 = read_le_int32(local_il, scan + 1);
+                    int32_t c2 = read_le_int32(local_il, scan + 6);
+                    int32_t res = 0;
+                    bool fold_ok = true;
+
+                    if (arith_op == OP_ADD) res = c1 + c2;
+                    else if (arith_op == OP_SUB) res = c1 - c2;
+                    else if (arith_op == OP_MUL) res = c1 * c2;
+                    else if (arith_op == OP_DIV) {
+                        if (c2 != 0) res = c1 / c2;
+                        else fold_ok = false;
+                    }
+
+                    if (fold_ok) {
+                        local_il[scan + 1] = (res >> 0) & 0xFF;
+                        local_il[scan + 2] = (res >> 8) & 0xFF;
+                        local_il[scan + 3] = (res >> 16) & 0xFF;
+                        local_il[scan + 4] = (res >> 24) & 0xFF;
+
+                        // CORREÇÃO MESTRE: Preenche as posições colapsadas com 0xCC (Marcador Neutro)
+                        // Isso protege o byte 0x00 do legítimo OP_HALT!
+                        memset(&local_il[scan + 5], 0xCC, 6);
+                    }
+                }
+            }
+        }
+
+        if (op == OP_ICONST || op == OP_SCONST || op == OP_JMP || op == OP_JMP_IF_FALSE) scan += 5;
+        else scan += 1;
+    }
+
+    // PASSO 2: FILTRO EMISSOR COOPERATIVO (DCE + CSE)
     while (i < size) {
-        OpCode op = (OpCode)bytecode[i++];
+        uint32_t current_op_index = i;
+        OpCode op = (OpCode)local_il[i++];
         int32_t arg = 0;
-        bool skip_by_cse = false; // Flag de supressão de instrução redundante
+        bool skip_by_cse = false;
+
+        // Ignora RIGOROSAMENTE apenas os bytes marcados pelo Constant Folding (0xCC)
+        if (op == 0xCC) {
+            continue;
+        }
 
         if (op == OP_ICONST || op == OP_SCONST || op == OP_JMP || op == OP_JMP_IF_FALSE) {
-            arg = (bytecode[i + 0] << 0)  |
-                  (bytecode[i + 1] << 8)  |
-                  (bytecode[i + 2] << 16) |
-                  (bytecode[i + 3] << 24);
+            arg = read_le_int32(local_il, current_op_index + 1);
             i += 4;
         }
 
-        // BARREIRA DE RESSURREIÇÃO DCE / INVALIDAÇÃO DE CACHE CSE (Uma label quebra o fluxo linear)
         if ((int)op >= 100) {
             dead_code_zone = false;
-            accum_has_value = false; // Invalida o cache porque não sabemos a origem do salto
+            accum_has_value = false;
             last_arith_op = (OpCode)0;
         }
 
-        // AVALIAÇÃO DO MOTOR CSE (Apenas em áreas alcançáveis)
         if (!dead_code_zone) {
             if (op == OP_ICONST) {
                 if (accum_has_value && accum_last_value == arg && last_arith_op == (OpCode)0) {
-                    skip_by_cse = true; // Constante redundante consecutiva detectada!
+                    skip_by_cse = true;
                 } else {
                     accum_last_value = arg;
                     accum_has_value = true;
-                    last_arith_op = (OpCode)0; // Reset porque reescreveu o acumulador
+                    last_arith_op = (OpCode)0;
                 }
             }
             else if (op == OP_ADD || op == OP_SUB || op == OP_MUL || op == OP_DIV) {
                 if (last_arith_op == op) {
-                    // Operação matemática idêntica consecutiva sem mutação de registradores detectada!
                     skip_by_cse = true;
                 } else {
                     last_arith_op = op;
-                    accum_has_value = false; // O resultado mudou, invalida valor constante
+                    accum_has_value = false;
                 }
             }
             else if (op == OP_STORE || op == OP_LOAD || op == OP_SPAWN_ASYNC || op == OP_CHAN_INIT) {
-                // Instruções de barreira ou efeito colateral invalidam estados parciais do CSE
                 last_arith_op = (OpCode)0;
             }
         }
 
-        // DESPACHO DOS EVENTOS SE PASSAR PELO FILTRO DUPLO (DCE + CSE)
         if (!dead_code_zone) {
-            if (skip_by_cse) {
-                printf("[CSE Opt]: Subexpressao redundante purgada da emissao: 0x%02X (arg: %d)\n", op, arg);
-            } else {
-                if (op == OP_ICONST || op == OP_SCONST || op == OP_JMP || op == OP_JMP_IF_FALSE) {
-                    teko_metal_route_instruction(ctx, op, arg);
-                }
-                else {
-                    teko_metal_route_instruction(ctx, op, 0);
-                }
+            if (!skip_by_cse) {
+                teko_metal_route_instruction(ctx, op, arg);
             }
-        } else {
-            printf("[DCE Opt]: Instrucao morta purgada da emissao: 0x%02X\n", op);
         }
 
-        // GATILHO DCE
         if (op == OP_RETURN || op == OP_HALT) {
             dead_code_zone = true;
             accum_has_value = false;
             last_arith_op = (OpCode)0;
         }
     }
+
+    free(local_il);
 }
 
 void teko_metal_emit_program(MetalContext* ctx, const unsigned char* bytecode, uint32_t size) {

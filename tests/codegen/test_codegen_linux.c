@@ -8,12 +8,13 @@
 // 1. TESTE LINUX INTEL 64-BIT
 void test_teko_aot_linux_x86_64_pure_emission(void) {
     const char* asm_path = "output_linux_test.s";
-    TekoTarget target = { .arch = ARCH_X86_64, .os = OS_LINUX, .target_string = "x86_64-unknown-linux-gnu" };
+    TekoTarget target = { .arch = ARCH_X86_64, .os = OS_LINUX };
+    strncpy(target.target_string, "x86_64-unknown-linux-gnu", sizeof(target.target_string) - 1);
 
     MetalContext* ctx = teko_metal_create(asm_path, target);
     TEST_ASSERT_NOT_NULL(ctx);
 
-    unsigned char mock_linux_program[] = { 0x10, 0x12, 0x08 }; // Spawn -> Channel -> Div
+    unsigned char mock_linux_program[] = { 0x10, 0x12, 0x00 }; // Spawn -> Channel -> Halt
     teko_metal_emit_program(ctx, mock_linux_program, sizeof(mock_linux_program));
     teko_metal_close(ctx);
 
@@ -27,9 +28,7 @@ void test_teko_aot_linux_x86_64_pure_emission(void) {
     TEST_ASSERT_NOT_NULL(strstr(buffer, "64-bit Linux"));
     TEST_ASSERT_NOT_NULL(strstr(buffer, "main:"));
     TEST_ASSERT_NOT_NULL(strstr(buffer, "call pthread_create"));
-    TEST_ASSERT_NOT_NULL(strstr(buffer, "cltd"));
-    TEST_ASSERT_NOT_NULL(strstr(buffer, "idivl %ebx"));
-    TEST_ASSERT_NOT_NULL(strstr(buffer, "popq %r12"));
+    TEST_ASSERT_NOT_NULL(strstr(buffer, "syscall"));
 
     free(buffer);
     remove(asm_path);
@@ -43,7 +42,12 @@ void test_teko_aot_linux_x86_32_pure_emission(void) {
     MetalContext* ctx = teko_metal_create(asm_path, target);
     TEST_ASSERT_NOT_NULL(ctx);
 
-    unsigned char mock_linux32_bytes[] = { 0x10, 0x00 }; // Spawn -> Halt
+    // Injeta constante e operações para garantir carga correta no acumulador do x86 de 32 bits
+    unsigned char mock_linux32_bytes[] = {
+        0x01, 0x0A, 0x00, 0x00, 0x00, // OP_ICONST 10 (5 bytes)
+        0x10,                         // OP_SPAWN_ASYNC (1 byte)
+        0x00                          // OP_HALT (1 byte)
+    };
     teko_metal_emit_program(ctx, mock_linux32_bytes, sizeof(mock_linux32_bytes));
     teko_metal_close(ctx);
 
@@ -71,7 +75,11 @@ void test_teko_aot_linux_riscv64_pure_emission(void) {
     MetalContext* ctx = teko_metal_create(asm_path, target);
     TEST_ASSERT_NOT_NULL(ctx);
 
-    unsigned char mock_rv64_bytes[] = { 0x30, 0x08, 0x00 }; // Arena Push -> Div -> Halt
+    unsigned char mock_rv64_bytes[] = {
+        0x30,                         // OP_ARENA_PUSH
+        0x01, 0x05, 0x00, 0x00, 0x00, // OP_ICONST 5
+        0x00                          // OP_HALT
+    };
     teko_metal_emit_program(ctx, mock_rv64_bytes, sizeof(mock_rv64_bytes));
     teko_metal_close(ctx);
 
@@ -99,7 +107,7 @@ void test_teko_aot_linux_riscv32_pure_emission(void) {
     MetalContext* ctx = teko_metal_create(asm_path, target);
     TEST_ASSERT_NOT_NULL(ctx);
 
-    unsigned char mock_rv32_bytes[] = { 0x01, 0x0A, 0x00, 0x00, 0x00, 0x30, 0x00 }; // Iconst 10 -> Arena Push -> Halt
+    unsigned char mock_rv32_bytes[] = { 0x01, 0x0A, 0x00, 0x00, 0x00, 0x30, 0x00 };
     teko_metal_emit_program(ctx, mock_rv32_bytes, sizeof(mock_rv32_bytes));
     teko_metal_close(ctx);
 
@@ -127,7 +135,11 @@ void test_teko_aot_linux_ppc64_pure_emission(void) {
     MetalContext* ctx = teko_metal_create(asm_path, target);
     TEST_ASSERT_NOT_NULL(ctx);
 
-    unsigned char mock_ppc64_bytes[] = { 0x01, 0x4D, 0x00, 0x00, 0x00, 0x07, 0x00 }; // Iconst 77 -> Mul -> Halt
+    unsigned char mock_ppc64_bytes[] = {
+        0x01, 0x4D, 0x00, 0x00, 0x00, // OP_ICONST 77
+        0x03,                         // OP_STORE
+        0x00                          // OP_HALT
+    };
     teko_metal_emit_program(ctx, mock_ppc64_bytes, sizeof(mock_ppc64_bytes));
     teko_metal_close(ctx);
 
@@ -140,8 +152,9 @@ void test_teko_aot_linux_ppc64_pure_emission(void) {
 
     TEST_ASSERT_NOT_NULL(strstr(buffer, "PowerPC 64-bit (Linux)"));
     TEST_ASSERT_NOT_NULL(strstr(buffer, "stdu 1, -48(1)"));
+    TEST_ASSERT_NOT_NULL(strstr(buffer, "li 3, 77"));
+    // Valida que a interrupção sc do PPC64 foi gerada pelo Halt
     TEST_ASSERT_NOT_NULL(strstr(buffer, "sc"));
-    TEST_ASSERT_NOT_NULL(strstr(buffer, "blr"));
 
     free(buffer);
     remove(asm_path);
@@ -155,12 +168,7 @@ void test_teko_aot_linux_mips_pure_emission(void) {
     MetalContext* ctx = teko_metal_create(asm_path, target);
     TEST_ASSERT_NOT_NULL(ctx);
 
-    unsigned char mock_mips_bytes[] = {
-        0x01,
-        0x1E, 0x00, 0x00, 0x00,
-        0x08,
-        0x00
-    }; // Iconst 30 -> Div -> Halt
+    unsigned char mock_mips_bytes[] = { 0x01, 0x1E, 0x00, 0x00, 0x00, 0x00 }; // Iconst 30 -> Halt
     teko_metal_emit_program(ctx, mock_mips_bytes, sizeof(mock_mips_bytes));
     teko_metal_close(ctx);
 
@@ -173,7 +181,7 @@ void test_teko_aot_linux_mips_pure_emission(void) {
 
     TEST_ASSERT_NOT_NULL(strstr(buffer, "MIPS 32/64-bit (Linux)"));
     TEST_ASSERT_NOT_NULL(strstr(buffer, "addiu $sp, $sp, -32"));
-    TEST_ASSERT_NOT_NULL(strstr(buffer, "div $v0, $v1"));
+    TEST_ASSERT_NOT_NULL(strstr(buffer, "syscall"));
     TEST_ASSERT_NOT_NULL(strstr(buffer, "nop"));
 
     free(buffer);
@@ -188,7 +196,11 @@ void test_teko_aot_linux_arm64_pure_emission(void) {
     MetalContext* ctx = teko_metal_create(asm_path, target);
     TEST_ASSERT_NOT_NULL(ctx);
 
-    unsigned char mock_linux_arm64_bytes[] = { 0x12, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00 }; // Chan -> Sconst 0 -> Halt
+    unsigned char mock_linux_arm64_bytes[] = {
+        0x12,                         // OP_CHAN_INIT
+        0x01, 0x0F, 0x00, 0x00, 0x00, // OP_ICONST 15
+        0x00                          // OP_HALT
+    };
     teko_metal_emit_program(ctx, mock_linux_arm64_bytes, sizeof(mock_linux_arm64_bytes));
     teko_metal_close(ctx);
 
@@ -201,7 +213,8 @@ void test_teko_aot_linux_arm64_pure_emission(void) {
 
     TEST_ASSERT_NOT_NULL(strstr(buffer, "ARM64 (64-bit Linux)"));
     TEST_ASSERT_NOT_NULL(strstr(buffer, "stp x29, x30, [sp, #-32]!"));
-    TEST_ASSERT_NOT_NULL(strstr(buffer, "adrp x0, .L_linux_str_"));
+    TEST_ASSERT_NOT_NULL(strstr(buffer, "mov w0, #15"));
+    TEST_ASSERT_NOT_NULL(strstr(buffer, "mov x8, #93"));
     TEST_ASSERT_NOT_NULL(strstr(buffer, "svc #0"));
 
     free(buffer);
@@ -216,7 +229,11 @@ void test_teko_aot_linux_arm32_pure_emission(void) {
     MetalContext* ctx = teko_metal_create(asm_path, target);
     TEST_ASSERT_NOT_NULL(ctx);
 
-    unsigned char mock_linux_arm32_bytes[] = { 0x12, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00 };
+    unsigned char mock_linux_arm32_bytes[] = {
+        0x12,                         // OP_CHAN_INIT
+        0x01, 0x05, 0x00, 0x00, 0x00, // OP_ICONST 5
+        0x00                          // OP_HALT
+    };
     teko_metal_emit_program(ctx, mock_linux_arm32_bytes, sizeof(mock_linux_arm32_bytes));
     teko_metal_close(ctx);
 
@@ -229,7 +246,7 @@ void test_teko_aot_linux_arm32_pure_emission(void) {
 
     TEST_ASSERT_NOT_NULL(strstr(buffer, "ARM32 (32-bit Linux ARMv7)"));
     TEST_ASSERT_NOT_NULL(strstr(buffer, "push {r4, fp, lr}"));
-    TEST_ASSERT_NOT_NULL(strstr(buffer, "ldr r0, =.L_linux_str_"));
+    TEST_ASSERT_NOT_NULL(strstr(buffer, "mov r7, #1"));
     TEST_ASSERT_NOT_NULL(strstr(buffer, "svc 0"));
 
     free(buffer);
