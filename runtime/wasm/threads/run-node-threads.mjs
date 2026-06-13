@@ -1,8 +1,9 @@
-// Phase 10.4 Layer B harness (node worker_threads): genuine multicore. For each
-// module, main() runs on this thread and blocks on memory.atomic.wait32; its
-// SPAWN calls the host teko_rt.spawn, which starts a REAL Worker (separate OS
-// thread) that re-instantiates the same module against the shared memory and runs
-// the routine via teko_invoke — publishing the value through the atomic channel.
+// Phase 10.4 Layer B harness (node worker_threads): genuine multicore. main()
+// runs inside a runner Worker (blocking on memory.atomic.wait32 is only safe off
+// the main thread, and keeps the main thread free to bootstrap workers). The
+// runner's SPAWN is brokered here on the main thread, which starts a REAL producer
+// Worker that re-instantiates the same module against the shared memory and
+// publishes the value through the atomic channel.
 //
 // Modules:
 //   samples/threads.wasm          -> 777 (hand-written Layer B reference)
@@ -11,27 +12,26 @@ import { Worker } from "node:worker_threads";
 import { readFile } from "node:fs/promises";
 
 const here = (p) => new URL(p, import.meta.url);
-const workerURL = here("./worker.mjs");
 
-async function runModule(wasmRel, expected) {
-  const wasmPath = here(wasmRel).pathname;
-  const bytes = await readFile(wasmPath);
+async function runModule(wasmRel) {
+  const bytes = await readFile(here(wasmRel));
   const memory = new WebAssembly.Memory({ initial: 1, maximum: 1, shared: true });
   const pending = [];
-  // SPAWN -> start a real Worker thread that runs routine `fn` against the shared memory.
-  const imports = {
-    env: { memory },
-    teko_rt: {
-      spawn: (fn, arg) => {
-        const w = new Worker(workerURL, { workerData: { memory, wasmPath, fn, arg } });
-        pending.push(new Promise((res) => w.on("message", () => w.terminate().then(res, res))));
-      },
-    },
-  };
-  const { instance } = await WebAssembly.instantiate(bytes, imports);
-  const got = instance.exports.main();      // blocks until the Worker notifies
-  await Promise.all(pending);
-  return got;
+  return await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("timeout (deadlock?)")), 20000);
+    const runner = new Worker(here("./runner.mjs"), { workerData: { memory, bytes } });
+    runner.on("error", reject);
+    runner.on("message", (m) => {
+      if (m && m.spawn) {
+        const [fn, arg] = m.spawn;
+        const prod = new Worker(here("./worker.mjs"), { workerData: { memory, bytes, fn, arg } });
+        pending.push(new Promise((res) => prod.on("message", () => prod.terminate().then(res, res))));
+      } else if (m && "result" in m) {
+        clearTimeout(timer);
+        Promise.all(pending).then(() => runner.terminate()).then(() => resolve(m.result), () => resolve(m.result));
+      }
+    });
+  });
 }
 
 const fixtures = [
@@ -42,7 +42,7 @@ const fixtures = [
 let failures = 0;
 for (const { file, expected, name, optional } of fixtures) {
   try {
-    const got = await runModule(file, expected);
+    const got = await runModule(file);
     if (got === expected) console.log(`OK   ${name}: main() = ${got} (real worker_threads hand-off)`);
     else { console.error(`FAIL ${name}: main() = ${got}, expected ${expected}`); failures++; }
   } catch (e) {
