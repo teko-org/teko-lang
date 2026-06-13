@@ -98,12 +98,15 @@ void test_teko_linker_e2e_extern_service_injection_and_elf_generation(void) {
     bool found_hello = false;
     bool found_cqrs = false;
 
-    // Scans the bytes looking for the contiguous sequences of text signatures at any offset in the binary
-    for (long idx = 0; idx < binary_size - 10; idx++) {
-        if (memcmp(&full_binary_buffer[idx], "Hello Teko", 10) == 0) {
+    // Scans the bytes looking for the contiguous sequences of text signatures at any offset in the binary.
+    // Each memcmp is bounded by its own length so neither reads past the buffer (the "Hello Teko" scan is
+    // 10 bytes, the "CQRS_Service_Active" scan is 19 bytes — a single `binary_size - 10` bound is NOT enough
+    // for the 19-byte compare and overflows the heap buffer near the end).
+    for (long idx = 0; idx < binary_size; idx++) {
+        if (idx + 10 <= binary_size && memcmp(&full_binary_buffer[idx], "Hello Teko", 10) == 0) {
             found_hello = true;
         }
-        if (memcmp(&full_binary_buffer[idx], "CQRS_Service_Active", 19) == 0) {
+        if (idx + 19 <= binary_size && memcmp(&full_binary_buffer[idx], "CQRS_Service_Active", 19) == 0) {
             found_cqrs = true;
         }
     }
