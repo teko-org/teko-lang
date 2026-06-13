@@ -264,7 +264,7 @@ To support the native features of massive M:N concurrency, blocking channels, an
 | 1 | ~~FFI / generics / AOT modules with no test coverage~~ | Test debt | ✅ Resolved 2026-06-13 |
 | 2 | ~~No validation of codegen output per target (16 emitters)~~ | Test debt | ✅ Resolved 2026-06-13 |
 | 3 | ~~CI has no Windows runner (PE/COFF path unexercised)~~ | Infra | ✅ Resolved 2026-06-13 |
-| 4 | WASM stubbed opcodes — arena implemented; concurrency hooked + deferred (#9) | Code/Arch | 🟢 MVP done 2026-06-13 |
+| 4 | ~~WASM stubbed opcodes — arena implemented; concurrency hooked + deferred (#9)~~ | Code/Arch | ✅ Resolved 2026-06-13 (MVP) |
 | 5 | ~~`CMake GLOB_RECURSE` for source collection (stale builds)~~ | Infra | ✅ Resolved 2026-06-13 |
 | 6 | ~~Scattered architecture docs / no `ARCHITECTURE.md`~~ | Docs | ✅ Resolved 2026-06-13 |
 | 7 | 16 near-identical codegen emitters (duplication) | Code debt | Low |

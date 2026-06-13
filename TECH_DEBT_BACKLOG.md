@@ -12,7 +12,7 @@
 | 1 | ~~FFI / generics / AOT modules with no tests~~ | Test debt | 4 | 5 | 3 | **27** | ✅ Resolved 2026-06-13 |
 | 2 | ~~No validation of codegen output per target~~ | Test debt | 4 | 4 | 3 | **24** | ✅ Resolved 2026-06-13 |
 | 3 | ~~CI with no Windows runner (PE/COFF unexercised)~~ | Infra | 3 | 3 | 2 | **24** | ✅ Resolved 2026-06-13 |
-| 4 | WASM stubbed opcodes (arena/async/channels) | Code/Arch | 4 | 5 | 4 | **18** | 🟢 MVP done 2026-06-13 |
+| 4 | ~~WASM stubbed opcodes (arena/async/channels)~~ | Code/Arch | 4 | 5 | 4 | **18** | ✅ Resolved 2026-06-13 (MVP; real concurrency → #9) |
 | 5 | ~~`CMake GLOB_RECURSE` (stale builds)~~ | Infra | 2 | 2 | 1 | **20** | ✅ Resolved 2026-06-13 |
 | 6 | ~~Scattered docs / no `ARCHITECTURE.md`~~ | Docs | 3 | 2 | 3 | **15** | ✅ Resolved 2026-06-13 |
 | 7 | 16 near-identical emitters (duplication) | Code debt | 4 | 3 | 4 | **14** | 🟢 Low |
@@ -77,7 +77,7 @@ Verified: the `teko` binary now builds with 0 warnings and runs (prints the AOT 
 
 **Files:** `.github/workflows/ci.yml`.
 
-## 4. WASM backend with stubbed opcodes — `18` 🟢 MVP DONE 2026-06-13
+## 4. WASM backend with stubbed opcodes — `18` ✅ RESOLVED 2026-06-13 (MVP)
 
 **Category:** Code / Architecture debt
 
@@ -89,7 +89,9 @@ Verified: the `teko` binary now builds with 0 warnings and runs (prints the AOT 
 - **Arena allocator: implemented for real.** The prologue declares a mutable global `(global $arena_sp (mut i32) (i32.const 2048))` (based above the `.data` region at offset 1024); `OP_ARENA_PUSH` does an O(1) bump (`global.get`/`i32.const 1024`/`i32.add`/`global.set`) and `OP_ARENA_POP` rewinds it. Covered by `tests/codegen/test_codegen_embedded.c::test_teko_aot_wasm_arena_and_concurrency_hooks`.
 - **Concurrency ops: honest host-runtime hooks instead of silent comments.** `OP_SPAWN_ASYNC`/`OP_CHAN_INIT`/`OP_CHAN_PUT`/`OP_AWAIT_INTENT` now emit `call $teko_spawn` / `$teko_chan_init` / `$teko_chan_put` / `$teko_await`, backed by `(import "teko_rt" ...)` declarations in the prologue. Real semantics are deferred — see item 9. Also fixed a residual Portuguese comment (`Label Marcacao` → `Label marker`).
 
-**Files:** `src/codegen/bare_metal/emit_wasm.c`; `tests/codegen/test_codegen_embedded.c`.
+**Post-fix (`5b65436`):** the item-4 commit's new WASM test perturbed the heap layout enough to expose a pre-existing latent heap-buffer-overflow in `test_codegen_linker_e2e.c` (a 19-byte `memcmp` under a `binary_size - 10` loop bound), which crashed the Windows runner (no Unity output — a buffered-stdout-lost-on-crash signature). Found via ASan/UBSan locally and fixed by bounding each `memcmp` by its own length. After the fix, PR #2 CI is **green on all three OSes** (Linux/macOS/Windows).
+
+**Files:** `src/codegen/bare_metal/emit_wasm.c`; `tests/codegen/test_codegen_embedded.c`; `tests/codegen/test_codegen_linker_e2e.c`.
 
 ## 5. `CMake GLOB_RECURSE` for source collection — `20` ✅ RESOLVED 2026-06-13
 
