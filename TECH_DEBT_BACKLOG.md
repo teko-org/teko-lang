@@ -13,7 +13,7 @@
 | 2 | No validation of codegen output per target | Test debt | 4 | 4 | 3 | **24** | 🔴 High |
 | 3 | CI with no Windows runner (PE/COFF unexercised) | Infra | 3 | 3 | 2 | **24** | 🔴 High |
 | 4 | WASM backend with stubbed opcodes (arena/async/channels) | Code/Arch | 4 | 5 | 4 | **18** | 🟡 Medium |
-| 5 | `CMake GLOB_RECURSE` (stale builds) | Infra | 2 | 2 | 1 | **20** | 🟡 Medium |
+| 5 | ~~`CMake GLOB_RECURSE` (stale builds)~~ | Infra | 2 | 2 | 1 | **20** | ✅ Resolved 2026-06-13 |
 | 6 | Scattered docs / no `ARCHITECTURE.md` | Docs | 3 | 2 | 3 | **15** | 🟡 Medium |
 | 7 | 16 near-identical emitters (duplication) | Code debt | 4 | 3 | 4 | **14** | 🟢 Low |
 | 8 | ~~Versioned build artifacts~~ (resolved) | — | — | — | — | — | ✅ Close |
@@ -84,15 +84,15 @@ Verified: the `teko` binary now builds with 0 warnings and runs (prints the AOT 
 
 **Files:** `src/codegen/bare_metal/emit_wasm.c:71+`.
 
-## 5. `CMake GLOB_RECURSE` for source collection — `20` 🟡
+## 5. `CMake GLOB_RECURSE` for source collection — `20` ✅ RESOLVED 2026-06-13
 
 **Category:** Infra debt
 
-**Situation:** `CMakeLists.txt` uses `file(GLOB_RECURSE CORE_SOURCES "src/*.c")`. CMake explicitly recommends against this: adding a new `.c` does not trigger a reconfigure, leading to stale builds and "works on my machine."
+**Situation:** `CMakeLists.txt` used `file(GLOB_RECURSE CORE_SOURCES "src/*.c")` (and the same for `tests/`). CMake explicitly recommends against this: adding a new `.c` does not trigger a reconfigure, leading to stale builds and "works on my machine."
 
 **Business justification:** Near-zero cost to fix; avoids an entire class of intermittent, hard-to-diagnose build failures.
 
-**Remediation:** List sources explicitly, or keep the glob with `CONFIGURE_DEPENDS`. Applies to the `tests/` glob too.
+**Resolution (2026-06-13):** Replaced both globs with explicit `CORE_SOURCES` (60 files) and `TEST_SOURCES` (42 files) lists, grouped by subsystem with a note to add new files there. Verified the lists match the filesystem exactly and that build + tests pass on both VM dispatch paths.
 
 **Files:** `CMakeLists.txt`.
 

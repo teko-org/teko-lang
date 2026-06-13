@@ -13,11 +13,80 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(unity)
 
-# 1. Collect ALL .c and .h files from src and from ANY subfolder (such as src/codegen)
-file(GLOB_RECURSE CORE_SOURCES "src/*.c" "src/*.h")
-
-# Strictly remove the main entry point so it becomes the core static library
-list(REMOVE_ITEM CORE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/main.c")
+# 1. Core compiler engine sources (everything in src/ except the main entry point).
+#    Listed explicitly on purpose: GLOB_RECURSE does not re-trigger CMake when files
+#    are added/removed, which causes stale builds. When you add a new .c file under
+#    src/, add it to this list.
+set(CORE_SOURCES
+        # Frontend: lexer + parser modules
+        src/lexer.c
+        src/lexer_string.c
+        src/parser.c
+        src/parser_async_control.c
+        src/parser_concurrent.c
+        src/parser_di.c
+        src/parser_extensions.c
+        src/parser_ffi.c
+        src/parser_generics.c
+        src/parser_messaging.c
+        src/parser_statements.c
+        src/parser_string.c
+        src/parser_types.c
+        src/parser_visibility.c
+        # Semantics + symbols + type checking
+        src/semantic_concurrent.c
+        src/semantic_struct.c
+        src/symbol_table.c
+        src/type_checker.c
+        # Intermediate language + bytecode codegen
+        src/codegen_li.c
+        src/codegen_aot.c
+        src/teko_il.c
+        # Virtual machine + runtime
+        src/vm_core.c
+        src/vm_arena.c
+        src/vm_concurrency.c
+        src/vm_debug.c
+        src/vm_intrinsics.c
+        src/vm_scheduler.c
+        src/runtime/teko_arena.c
+        src/runtime/teko_channel.c
+        src/runtime/teko_mem_sys.c
+        src/runtime/teko_thread.c
+        # Tooling: target detection, SDK, LSP, project manager
+        src/teko_target.c
+        src/teko_sdk.c
+        src/teko_lsp.c
+        src/project_manager.c
+        # Metal backend orchestrator + optimizer
+        src/codegen/codegen_metal.c
+        src/codegen/codegen_opt.c
+        # Native static linker (tld): object/executable format writers
+        src/codegen/tld_elf.c
+        src/codegen/tld_elf_arch.c
+        src/codegen/tld_elf_reloc.c
+        src/codegen/tld_macho.c
+        src/codegen/tld_pe.c
+        src/codegen/tld_symbols.c
+        src/codegen/tld_wasm.c
+        # Per-target instruction emitters
+        src/codegen/apple/emit_darwin_arm64.c
+        src/codegen/apple/emit_darwin_x86_64.c
+        src/codegen/bare_metal/emit_wasm.c
+        src/codegen/bsd_unix/emit_freebsd_arm64.c
+        src/codegen/bsd_unix/emit_freebsd_x86_64.c
+        src/codegen/linux/emit_linux_arm32.c
+        src/codegen/linux/emit_linux_arm64.c
+        src/codegen/linux/emit_linux_mips.c
+        src/codegen/linux/emit_linux_ppc64.c
+        src/codegen/linux/emit_linux_riscv32.c
+        src/codegen/linux/emit_linux_riscv64.c
+        src/codegen/linux/emit_linux_x86.c
+        src/codegen/linux/emit_linux_x86_64.c
+        src/codegen/windows/emit_win_arm64.c
+        src/codegen/windows/emit_win_x86.c
+        src/codegen/windows/emit_win_x86_64.c
+)
 
 # Create the internal static library with the entire compiler engine
 add_library(teko_core STATIC ${CORE_SOURCES})
@@ -30,8 +99,52 @@ add_executable(teko src/main.c)
 target_link_libraries(teko PRIVATE teko_core)
 target_include_directories(teko PRIVATE src)
 
-# 3. TARGET 2: The Isolated Test Suite (Test Entry Point)
-file(GLOB_RECURSE TEST_SOURCES "tests/*.c" "tests/*.h")
+# 3. TARGET 2: The Isolated Test Suite (Test Entry Point).
+#    Also listed explicitly. When you add a new test .c file, add it here.
+set(TEST_SOURCES
+        tests/test_main.c
+        tests/test_async.c
+        tests/test_codegen_li.c
+        tests/test_concurrent.c
+        tests/test_di_semantics.c
+        tests/test_messaging.c
+        tests/test_project.c
+        tests/test_semantics.c
+        tests/test_statement.c
+        tests/test_strings.c
+        tests/test_target.c
+        tests/test_teko_il.c
+        tests/test_tooling.c
+        tests/test_type_checker.c
+        tests/test_types.c
+        tests/test_visibility.c
+        tests/test_vm_arena.c
+        tests/test_vm_concurrency.c
+        tests/test_vm_core.c
+        tests/test_vm_debug.c
+        tests/test_vm_scheduler.c
+        tests/codegen/test_codegen_apple.c
+        tests/codegen/test_codegen_cse.c
+        tests/codegen/test_codegen_dce.c
+        tests/codegen/test_codegen_embedded.c
+        tests/codegen/test_codegen_folding.c
+        tests/codegen/test_codegen_linker.c
+        tests/codegen/test_codegen_linker_arch.c
+        tests/codegen/test_codegen_linker_e2e.c
+        tests/codegen/test_codegen_linker_macho.c
+        tests/codegen/test_codegen_linker_pe.c
+        tests/codegen/test_codegen_linker_reloc.c
+        tests/codegen/test_codegen_linker_wasm.c
+        tests/codegen/test_codegen_linux.c
+        tests/codegen/test_codegen_opt.c
+        tests/codegen/test_codegen_symbols.c
+        tests/codegen/test_codegen_unix.c
+        tests/codegen/test_codegen_windows.c
+        tests/runtime/test_runtime_arena.c
+        tests/runtime/test_runtime_channel.c
+        tests/runtime/test_runtime_mem.c
+        tests/runtime/test_runtime_thread.c
+)
 add_executable(teko_tests ${TEST_SOURCES})
 target_link_libraries(teko_tests PRIVATE teko_core unity)
 target_include_directories(teko_tests PRIVATE src)
