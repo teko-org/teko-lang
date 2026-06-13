@@ -62,13 +62,18 @@ The arena (`$arena_sp`) is reused for all of these allocations.
 1. **Golden emission tests** (extend `tests/codegen/test_codegen_embedded.c`): assert the
    emitted WAT contains the Layer-A primitives per increment (run-queue ops, channel ring
    buffer, `$teko_sched_run`, `call_indirect`).
-2. **Execution tests under a standalone engine in CI:** a new CI job installs **wasmtime**,
-   emits a small program to `.wasm` (via `tld_wasm`), runs it, and checks output/exit — real
-   execution, no browser. Modeled on the existing non-blocking riscv64-QEMU job; starts as
-   `continue-on-error` until stable, then promoted.
-3. **Layer B** execution tests run under **node `worker_threads`** (threads-capable) in a
-   dedicated job.
-4. The C compiler itself keeps building/testing under **ASan + UBSan on both dispatch paths**
+2. **Execution under a standalone engine (CI):** job `wasm-wasmtime` builds the WASM fixture
+   with `wat2wasm` and runs it under **Node** and **wasmtime** — real execution, no browser.
+   Modeled on the non-blocking riscv64-QEMU job; `continue-on-error` until stable.
+3. **Execution in a headless browser (CI):** job `wasm-browser` (Playwright + Chromium) loads
+   the module in a page served with **COOP/COEP** (`Cross-Origin-Opener-Policy: same-origin` +
+   `Cross-Origin-Embedder-Policy: require-corp`) and asserts behavioral **parity** with the
+   standalone engines, plus `crossOriginIsolated === true` (the prerequisite for Layer B's
+   SharedArrayBuffer + Web Workers). Browser coverage is required even when WASM ships only as
+   an add-in to another host — `continue-on-error` until stable. Harness: `runtime/wasm/`.
+4. **Layer B** parallel execution additionally runs under **node `worker_threads`** in a
+   dedicated job (added with increment 10.4).
+5. The C compiler itself keeps building/testing under **ASan + UBSan on both dispatch paths**
    every commit, as in Phase 9.
 
 ## 6. Incremental plan (one increment per commit; build+test+ASan green; CI green via PR)

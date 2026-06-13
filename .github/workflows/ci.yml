@@ -94,3 +94,49 @@ jobs:
 
       - name: Run test suite under QEMU (emulated riscv64, slow)
         run: qemu-riscv64-static ./build/teko_tests
+
+  # ---------------------------------------------------------------------------
+  # Phase 10 WASM concurrency harness (non-blocking until the backend stabilizes).
+  # Executes the emitted-channel WASM pattern under a standalone engine and a
+  # headless browser to guarantee behavioral parity. See runtime/wasm/README.md.
+  # ---------------------------------------------------------------------------
+  wasm-wasmtime:
+    name: WASM exec — channels under Node + wasmtime (non-blocking)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Checkout Repository Code
+        uses: actions/checkout@v4
+      - name: Install WABT (wat2wasm) + wasmtime
+        run: |
+          sudo apt-get update && sudo apt-get install -y wabt
+          curl https://wasmtime.dev/install.sh -sSf | bash
+      - name: Build the WASM fixture (wat2wasm)
+        run: wat2wasm runtime/wasm/samples/channels.wat -o runtime/wasm/samples/channels.wasm
+      - name: Run under Node (standalone engine)
+        run: node runtime/wasm/run-node.mjs
+      - name: Run under wasmtime
+        run: ~/.wasmtime/bin/wasmtime run --invoke test runtime/wasm/samples/channels.wasm
+
+  wasm-browser:
+    name: WASM exec — headless Chromium, COOP/COEP (non-blocking)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Checkout Repository Code
+        uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Install WABT (wat2wasm)
+        run: sudo apt-get update && sudo apt-get install -y wabt
+      - name: Build the WASM fixture (wat2wasm)
+        run: wat2wasm runtime/wasm/samples/channels.wat -o runtime/wasm/samples/channels.wasm
+      - name: Install harness deps + Chromium
+        working-directory: runtime/wasm
+        run: |
+          npm install
+          npx playwright install --with-deps chromium
+      - name: Run headless-browser harness (parity + crossOriginIsolated check)
+        working-directory: runtime/wasm
+        run: node run-browser.mjs
