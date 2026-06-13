@@ -10,7 +10,7 @@
 |---|------|----------|:----:|:----:|:----:|:-----:|:----:|
 | 0 | ~~`teko` target missing `target_include_directories` → main binary does not build~~ | Infra (blocker) | 5 | 5 | 1 | **50** | ✅ Resolved 2026-06-13 |
 | 1 | ~~FFI / generics / AOT modules with no tests~~ | Test debt | 4 | 5 | 3 | **27** | ✅ Resolved 2026-06-13 |
-| 2 | No validation of codegen output per target | Test debt | 4 | 4 | 3 | **24** | 🔴 High |
+| 2 | ~~No validation of codegen output per target~~ | Test debt | 4 | 4 | 3 | **24** | ✅ Resolved 2026-06-13 |
 | 3 | CI with no Windows runner (PE/COFF unexercised) | Infra | 3 | 3 | 2 | **24** | 🔴 High |
 | 4 | WASM backend with stubbed opcodes (arena/async/channels) | Code/Arch | 4 | 5 | 4 | **18** | 🟡 Medium |
 | 5 | ~~`CMake GLOB_RECURSE` (stale builds)~~ | Infra | 2 | 2 | 1 | **20** | ✅ Resolved 2026-06-13 |
@@ -52,17 +52,17 @@ Verified: the `teko` binary now builds with 0 warnings and runs (prints the AOT 
 
 **Files:** `src/parser_ffi.c`, `src/parser_generics.c`, `src/parser_extensions.c`, `src/codegen_aot.c`; new tests under `tests/`.
 
-## 2. No validation of codegen output per target — `24` 🔴
+## 2. No validation of codegen output per target — `24` ✅ RESOLVED 2026-06-13
 
 **Category:** Test debt
 
-**Situation:** There are 16 emitters (`src/codegen/{linux,apple,bsd_unix,windows,bare_metal}/emit_*.c`). There are good linker/E2E tests (`tests/codegen/test_codegen_linker_e2e.c`, `_macho`, `_pe`, `_reloc`) and opt tests (CSE/DCE/folding), but the **per-architecture instruction output** (the `fprintf` of each `emit_*`) is not asserted — only Linux/x86_64 has a genuinely covered path.
+**Situation:** There are 16 emitters (`src/codegen/{linux,apple,bsd_unix,windows,bare_metal}/emit_*.c`). On re-audit, all 16 already had per-target emission tests with conservative per-architecture substring assertions — `tests/codegen/test_codegen_{linux (8), apple (2), unix/freebsd (2), windows (3), embedded/wasm (1)}.c` — covering the prologue and the syscall/halt path. The real gap was that the **core arithmetic opcodes** (`OP_ADD/SUB/MUL/DIV`) were unasserted for almost every target, which is exactly the surface most at risk during the emitter de-duplication refactor (item 7).
 
 **Business justification:** Emitting a wrong instruction on an untested target (e.g., ARM32, MIPS, PPC64, RISC-V) is a silent regression: it passes CI and produces an invalid binary on the user's hardware. Binary reliability is the core product.
 
-**Remediation:** A per-target test that compiles a minimal program and compares the emitted string against an expected golden (prologue, `OP_ADD`, epilogue). Add one target per sprint.
+**Resolution (2026-06-13):** Verified the existing 16 per-target emission tests, then added `tests/codegen/test_codegen_emitters_arithmetic.c`: a single table-driven test that drives `OP_ADD` through every one of the 16 emitters and asserts the architecture-specific add mnemonic (e.g. `addl %ebx, %eax`, `add w0, w0, w1`, `addu $v0, $v0, $v1`, `add 3, 3, 4`, `i32.add`). This is the conservative golden safety-net required before item 7.
 
-**Files:** `src/codegen/*/emit_*.c`, mirror `tests/codegen/test_codegen_linux.c`.
+**Files:** `src/codegen/*/emit_*.c`; `tests/codegen/test_codegen_emitters_arithmetic.c` plus the existing `test_codegen_{linux,apple,unix,windows,embedded}.c`.
 
 ## 3. CI does not build or test on Windows — `24` 🔴
 

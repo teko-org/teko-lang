@@ -74,6 +74,7 @@ extern void test_teko_linker_e2e_extern_service_injection_and_elf_generation(voi
 extern void test_teko_linker_wasm_leb128_compression_logic(void);
 extern void test_teko_linker_macho_64_binary_signature_integrity(void);
 extern void test_teko_linker_pe_coff_multi_architecture_signatures(void);
+extern void test_codegen_emitters_arithmetic_add_per_target(void);
 
 extern void test_teko_runtime_sys_allocation_and_page_recycling(void);
 extern void test_teko_runtime_scheduler_cooperative_multithreading(void);
@@ -154,6 +155,7 @@ int main(void) {
     RUN_TEST(test_teko_linker_wasm_leb128_compression_logic);
     RUN_TEST(test_teko_linker_macho_64_binary_signature_integrity);
     RUN_TEST(test_teko_linker_pe_coff_multi_architecture_signatures);
+    RUN_TEST(test_codegen_emitters_arithmetic_add_per_target);
 
     RUN_TEST(test_teko_runtime_sys_allocation_and_page_recycling);
     RUN_TEST(test_teko_runtime_scheduler_cooperative_multithreading);

@@ -130,6 +130,7 @@ set(TEST_SOURCES
         tests/codegen/test_codegen_apple.c
         tests/codegen/test_codegen_cse.c
         tests/codegen/test_codegen_dce.c
+        tests/codegen/test_codegen_emitters_arithmetic.c
         tests/codegen/test_codegen_embedded.c
         tests/codegen/test_codegen_folding.c
         tests/codegen/test_codegen_linker.c

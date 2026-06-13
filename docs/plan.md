@@ -245,7 +245,7 @@ To support the native features of massive M:N concurrency, blocking channels, an
 |---|------|----------|:--------:|
 | 0 | ~~`teko` exe missing include dir → main binary does not build~~ | Infra (build blocker) | ✅ Resolved 2026-06-13 |
 | 1 | ~~FFI / generics / AOT modules with no test coverage~~ | Test debt | ✅ Resolved 2026-06-13 |
-| 2 | No validation of codegen output per target (16 emitters) | Test debt | High |
+| 2 | ~~No validation of codegen output per target (16 emitters)~~ | Test debt | ✅ Resolved 2026-06-13 |
 | 3 | CI has no Windows runner (PE/COFF path unexercised) | Infra | High |
 | 4 | WASM backend with stubbed opcodes (arena/async/channels emit only comments) | Code/Arch | Medium |
 | 5 | ~~`CMake GLOB_RECURSE` for source collection (stale builds)~~ | Infra | ✅ Resolved 2026-06-13 |
