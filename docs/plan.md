@@ -268,8 +268,32 @@ To support the native features of massive M:N concurrency, blocking channels, an
 | 5 | ~~`CMake GLOB_RECURSE` for source collection (stale builds)~~ | Infra | ✅ Resolved 2026-06-13 |
 | 6 | ~~Scattered architecture docs / no `ARCHITECTURE.md`~~ | Docs | ✅ Resolved 2026-06-13 |
 | 7 | ~~Near-identical codegen emitters (duplication)~~ | Code debt | ✅ Resolved 2026-06-13 — riscv32/64 + x86_64 SysV trio + arm64 GAS trio unified into shared parameterized cores; win_arm64 + Windows x86 kept separate by design (MASM/Intel ≠ AT&T-GAS) |
+| 8 | ~~Versioned build artifacts~~ | — | ✅ Closed (was a false positive) |
+| 9 | WASM concurrency backend (full spawn/channels) | Code/Arch | ➡️ Roadmap feature (own PR) — see below; MVP already delivered |
+| 10 | ~~Broader emitter de-dup (x86_64 SysV / arm64 GAS)~~ | Code debt | ✅ Resolved 2026-06-13 (win_arm64 separate) |
 
-See `TECH_DEBT_BACKLOG.md` for full scoring, business justification, file paths, and the phased remediation plan.
+**Phase 9 status (2026-06-13):** items **0–8 and 10 resolved**; item **7 fully resolved** (riscv32/64 + x86_64 SysV trio + arm64 GAS trio unified into shared cores, Windows MASM/Intel emitters kept separate by design); item **9 reclassified as a roadmap feature** (below), to be implemented in a dedicated PR. CI is green across the full matrix: native Linux x86_64/arm64, Windows x86_64/arm64, macOS arm64, plus emulated Linux riscv64 (QEMU, non-blocking).
+
+See `TECH_DEBT_BACKLOG.md` for full scoring, business justification, and file paths.
+
+---
+
+## 🧪 Roadmap Feature: WASM Concurrency Backend (dedicated PR)
+
+*Reclassified from tech-debt item #9. This is a new capability, not a fix — the current WASM MVP is complete and nothing is broken.*
+
+**Already delivered (MVP, in this branch):** a real O(1) arena allocator emitted as linear-memory bump code, plus **honest host-runtime hooks** for the concurrency opcodes (`call $teko_spawn` / `$teko_chan_init` / `$teko_chan_put` / `$teko_await`, declared via `(import "teko_rt" ...)`). The emitted module is valid and self-consistent; the concurrency ops simply delegate to a host runtime that does not exist yet.
+
+**Goal of the feature:** make Teko's concurrency model actually run on WASM.
+
+**Design options evaluated (trade-offs):**
+1. **Embedded VM / cooperative scheduler compiled to WASM** — reproduce Teko's **M:N green-thread** model on a *single* WASM thread (the same cooperative scheduler the native runtime uses, lowered to WASM). Faithful to the language's semantics; **missing only multicore parallelism**. **Likely the starting point** (no extra proposals required, runs in any WASM engine).
+2. **`--target=wasm-threads`** — emit `(import "env" "memory" ... shared)` + the atomics set (`memory.atomic.wait/notify`, `i32.atomic.*`) for blocking channels, and spawn via host **Web Workers**. Adds **real multicore parallelism**, but Workers are **1:1 OS threads, not M:N** — a semantic mismatch with green threads, and it needs per-environment host glue + a threads-capable CI engine.
+3. Combine: option 1 for the green-thread scheduler, option 2 as an opt-in for multicore.
+
+**Caveat:** WASM has **no GA stack-switching** proposal, so true green-thread context switches must be synthesized by the compiled scheduler (option 1) rather than using a native primitive.
+
+**Scope for the dedicated PR:** start with option 1 (cooperative scheduler → WASM, single thread) to honour the M:N model, then optionally layer option 2 for parallelism. Provide a minimal host `teko_rt` and an integration test under a WASM engine.
 
 ---
 

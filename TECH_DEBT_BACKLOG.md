@@ -3,6 +3,8 @@
 > Audit via the `/engineering:tech-debt` skill — revised on 2026-06-13.
 > Prioritization: `Priority = (Impact + Risk) × (6 − Effort)`, each axis from 1 to 5.
 > Project: the Teko language compiler in **C23** — 61 `.c` / 44 `.h`, ~10.3k LOC in `src/`; 42 test files (Unity).
+>
+> **Phase 9 outcome (2026-06-13):** items **0–8 and 10 resolved**; item **7 fully resolved** (riscv32/64 + x86_64 SysV trio + arm64 GAS trio unified into shared cores; Windows MASM/Intel emitters kept separate by design); item **9 reclassified as a roadmap feature** ("WASM concurrency backend"), to be built in a dedicated PR — the WASM MVP (real arena + honest hooks) is already delivered and nothing is broken. CI green across the full matrix (Linux x86_64/arm64, Windows x86_64/arm64, macOS arm64, + emulated Linux riscv64).
 
 ## Prioritized summary
 
@@ -17,7 +19,7 @@
 | 6 | ~~Scattered docs / no `ARCHITECTURE.md`~~ | Docs | 3 | 2 | 3 | **15** | ✅ Resolved 2026-06-13 |
 | 7 | ~~Near-identical emitters (duplication)~~ | Code debt | 4 | 3 | 4 | **14** | ✅ Resolved 2026-06-13 (riscv + x86_64/arm64 GAS via #10; win/x86 separate) |
 | 8 | ~~Versioned build artifacts~~ (resolved) | — | — | — | — | — | ✅ Close |
-| 9 | WASM real concurrency (deferred → WASM threads proposal) | Code/Arch | 3 | 3 | 5 | **24** | ⏸️ Deferred (tracked) |
+| 9 | WASM concurrency backend (full spawn/channels) | Code/Arch | 3 | 3 | 5 | **24** | ➡️ Reclassified as ROADMAP FEATURE (own PR) — MVP delivered |
 | 10 | Broader emitter de-dup (x86_64 SysV trio / arm64 GAS trio) | Code debt | 3 | 2 | 4 | **10** | ✅ Resolved 2026-06-13 (win_arm64 kept separate) |
 
 ---
@@ -139,17 +141,13 @@ Verified: the `teko` binary now builds with 0 warnings and runs (prints the AOT 
 
 `git ls-files` shows 0 files under `cmake-build-debug/` or `node_modules/`; both are already in `.gitignore`. The previous backlog item was incorrect — **close**.
 
-## 9. WASM real concurrency — ⏸️ DEFERRED (depends on the WASM threads proposal)
+## 9. WASM concurrency backend — ➡️ RECLASSIFIED AS A ROADMAP FEATURE (not debt)
 
-**Category:** Code / Architecture debt
+**Not technical debt.** Nothing is broken or silently wrong: the WASM MVP (item 4) ships a **real arena allocator** plus **honest host-runtime hooks** for `OP_SPAWN_ASYNC` / `OP_CHAN_INIT` / `OP_CHAN_PUT` / `OP_AWAIT_INTENT` (`call $teko_spawn` / `$teko_chan_init` / `$teko_chan_put` / `$teko_await`, declared as `(import "teko_rt" ...)`). A *full* WASM concurrency runtime is a new capability, so it is moved out of the debt backlog and tracked as a **roadmap feature** (to be built in its own PR). See the design and trade-offs in **`docs/plan.md` → "Roadmap Feature: WASM Concurrency Backend"**.
 
-**Situation:** The WASM MVP (item 4) routes `OP_SPAWN_ASYNC`, `OP_CHAN_INIT`, `OP_CHAN_PUT`, and `OP_AWAIT_INTENT` to imported host-runtime functions (`$teko_spawn`, `$teko_chan_init`, `$teko_chan_put`, `$teko_await`). These are honest placeholders, not a real green-thread/channel runtime.
+**Why it is a feature, not a cleanup:** delivering real concurrency on WASM is an architectural decision with genuine trade-offs (single-thread cooperative scheduler vs. multicore Workers; WASM has no GA stack-switching), not a fix to something defective.
 
-**Why deferred (technical rationale):** Genuine M:N concurrency and blocking channels cannot be expressed in standalone WAT. They require the **WASM threads proposal**: a `shared` linear memory, the atomic instruction set (`memory.atomic.wait` / `memory.atomic.notify`, `i32.atomic.*`), and a host-side spawn mechanism (e.g. a JS `Worker` that instantiates the same module against the shared memory). That is an environment/runtime concern beyond the code emitter, so it is tracked separately rather than rushed.
-
-**Remediation (future):** (1) Emit `(import "env" "memory" (memory $mem 1 1 shared))` when a `--target=wasm-threads` flag is set; (2) implement channel buffers as atomic ring buffers in shared memory with `wait`/`notify`; (3) provide the host `teko_rt` glue (Worker spawn + module re-instantiation); (4) add a runtime/integration test under a WASM engine that supports threads.
-
-**Files:** `src/codegen/bare_metal/emit_wasm.c`; future host runtime glue.
+**Files (future PR):** `src/codegen/bare_metal/emit_wasm.c`; a new host `teko_rt` runtime.
 
 ## 10. Broader emitter de-duplication — `10` ✅ RESOLVED 2026-06-13 (win_arm64 kept separate)
 
