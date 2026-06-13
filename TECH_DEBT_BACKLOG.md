@@ -15,9 +15,10 @@
 | 4 | ~~WASM stubbed opcodes (arena/async/channels)~~ | Code/Arch | 4 | 5 | 4 | **18** | ✅ Resolved 2026-06-13 (MVP; real concurrency → #9) |
 | 5 | ~~`CMake GLOB_RECURSE` (stale builds)~~ | Infra | 2 | 2 | 1 | **20** | ✅ Resolved 2026-06-13 |
 | 6 | ~~Scattered docs / no `ARCHITECTURE.md`~~ | Docs | 3 | 2 | 3 | **15** | ✅ Resolved 2026-06-13 |
-| 7 | 16 near-identical emitters (duplication) | Code debt | 4 | 3 | 4 | **14** | 🟢 Low |
+| 7 | Near-identical emitters (duplication) | Code debt | 4 | 3 | 4 | **14** | 🟢 riscv unified 2026-06-13 (broader → #10) |
 | 8 | ~~Versioned build artifacts~~ (resolved) | — | — | — | — | — | ✅ Close |
 | 9 | WASM real concurrency (deferred → WASM threads proposal) | Code/Arch | 3 | 3 | 5 | **24** | ⏸️ Deferred (tracked) |
+| 10 | Broader emitter de-dup (x86_64 SysV trio / arm64 quad) | Code debt | 3 | 2 | 4 | **10** | ⏸️ Deferred (tracked) |
 
 ---
 
@@ -120,17 +121,19 @@ Verified: the `teko` binary now builds with 0 warnings and runs (prints the AOT 
 
 **Files:** `docs/ARCHITECTURE.md` (new), `docs/plan.md`, `docs/vm_plan.md`, `docs/BACKEND_AOT_PLAN.md`, `TEKO_COMPILER_MEMORANDUM.txt`.
 
-## 7. 16 near-identical codegen emitters — `14` 🟢
+## 7. Near-identical codegen emitters — `14` 🟢 riscv UNIFIED 2026-06-13 (broader → #10)
 
 **Category:** Code debt
 
-**Situation:** Every `emit_*.c` has the same signature `void emit_X(MetalContext*, OpCode, int32_t)` and the same `switch (op)`; pairs like `emit_linux_riscv32.c` vs `riscv64.c` differ in ~40 lines (basically `sw/sd`, `lw/ld`). Every change to the IL ISA requires editing 16 files.
+**Situation:** Every `emit_*.c` has the same signature `void emit_X(MetalContext*, OpCode, int32_t)` and the same `switch (op)`. The clearest duplicate was `emit_linux_riscv32.c` vs `riscv64.c`, which differed only in load/store width (`sw/lw` vs `sd/ld`), frame/offset sizes, the arena frame size, the banner bit-width, and the local-label tag — i.e. *purely per-ISA mnemonics/widths*.
 
-**Business justification:** Duplication multiplies the cost and risk of any evolution of the opcode set; a fix forgotten in 1 of the 16 becomes an architecture-specific bug.
+**Business justification:** Duplication multiplies the cost and risk of any evolution of the opcode set; a fix forgotten in 1 of the N files becomes an architecture-specific bug.
 
-**Remediation:** Extract the common structure (the `switch` dispatch) and parameterize only the per-ISA mnemonics — an instruction table or X-macros. Low-risk refactor if done after item 2 (golden tests provide the safety net).
+**Resolution (2026-06-13):** First built the safety net — extended the per-target golden tests to assert ADD/SUB/MUL/DIV mnemonics for all 16 emitters — then extracted `emit_linux_riscv_common.{c,h}` (a single parameterized core) so riscv32/riscv64 are now ~10-line wrappers. Verified **byte-for-byte identical** emitted output for all 16 targets via a full-output capture/diff harness. ASan/UBSan clean on both dispatch paths.
 
-**Files:** `src/codegen/{linux,apple,bsd_unix,windows}/emit_*.c`.
+**Deferred (→ item 10):** The other families (x86_64 SysV trio: linux/darwin/freebsd; arm64 quad: linux/darwin/freebsd/windows) are *not* pure-mnemonic duplicates — they diverge structurally (different syscall sequences, symbol decoration `_main`/`_pthread_create`, MASM `AREA`/`PROC` directives on Windows ARM) and even in emitted comment text. Unifying them would require parameterizing structural differences and per-OS comment strings, yielding a worse abstraction for little gain and re-introducing regression risk on the just-stabilized Windows CI. Kept separate by design; the new arithmetic goldens now guard all 16 against drift.
+
+**Files:** `src/codegen/linux/emit_linux_riscv{32,64,_common}.{c,h}`; `tests/codegen/test_codegen_emitters_arithmetic.c`.
 
 ## 8. Versioned build artifacts — ✅ RESOLVED
 
@@ -147,6 +150,18 @@ Verified: the `teko` binary now builds with 0 warnings and runs (prints the AOT 
 **Remediation (future):** (1) Emit `(import "env" "memory" (memory $mem 1 1 shared))` when a `--target=wasm-threads` flag is set; (2) implement channel buffers as atomic ring buffers in shared memory with `wait`/`notify`; (3) provide the host `teko_rt` glue (Worker spawn + module re-instantiation); (4) add a runtime/integration test under a WASM engine that supports threads.
 
 **Files:** `src/codegen/bare_metal/emit_wasm.c`; future host runtime glue.
+
+## 10. Broader emitter de-duplication — ⏸️ DEFERRED (structural divergence)
+
+**Category:** Code debt
+
+**Situation:** After unifying the riscv32/64 pair (item 7), the remaining duplication is the shared *arithmetic* block across the x86_64 SysV trio (linux/darwin/freebsd) and the arm64 quad (linux/darwin/freebsd/windows).
+
+**Why deferred (technical rationale):** Unlike riscv32/64, these are not pure-mnemonic duplicates. They diverge in syscall sequences (`syscall`/sys_exit 60 vs `int $0x80` vs `svc`), symbol decoration (`main` vs `_main`, `pthread_create` vs `_pthread_create`), local-label tags, Windows-ARM MASM directives (`AREA |.text|, CODE`, `PROC`), and emitted comment text. A byte-identical shared core would need ~10+ string/structural parameters per family — a worse abstraction than the current explicit files, and a regression risk on the freshly-green CI (esp. Windows). The arithmetic goldens (item 2) now guard all 16 emitters against drift, so the duplication is a maintenance cost, not a correctness risk.
+
+**Remediation (future, only if the maintenance cost grows):** extract just the family-shared arithmetic block (ADD/SUB/MUL + the div skeleton) into a helper parameterized by register-operand strings and label tag, leaving prologue/syscall/symbol concerns per-emitter; verify byte-identical output with the existing capture/diff harness.
+
+**Files:** `src/codegen/{linux,apple,bsd_unix,windows}/emit_{x86_64,arm64,...}.c`.
 
 ---
 
