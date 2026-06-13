@@ -61,6 +61,8 @@ set(CORE_SOURCES
         # Metal backend orchestrator + optimizer
         src/codegen/codegen_metal.c
         src/codegen/codegen_opt.c
+        # Shared per-family emitter cores (de-duplicated)
+        src/codegen/emit_x86_64_sysv_common.c
         # Native static linker (tld): object/executable format writers
         src/codegen/tld_elf.c
         src/codegen/tld_elf_arch.c
