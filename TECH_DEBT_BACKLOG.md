@@ -15,7 +15,7 @@
 | 4 | ~~WASM stubbed opcodes (arena/async/channels)~~ | Code/Arch | 4 | 5 | 4 | **18** | ✅ Resolved 2026-06-13 (MVP; real concurrency → #9) |
 | 5 | ~~`CMake GLOB_RECURSE` (stale builds)~~ | Infra | 2 | 2 | 1 | **20** | ✅ Resolved 2026-06-13 |
 | 6 | ~~Scattered docs / no `ARCHITECTURE.md`~~ | Docs | 3 | 2 | 3 | **15** | ✅ Resolved 2026-06-13 |
-| 7 | Near-identical emitters (duplication) | Code debt | 4 | 3 | 4 | **14** | 🟢 riscv unified 2026-06-13 (broader → #10) |
+| 7 | ~~Near-identical emitters (duplication)~~ | Code debt | 4 | 3 | 4 | **14** | ✅ Resolved 2026-06-13 (riscv + x86_64/arm64 GAS via #10; win/x86 separate) |
 | 8 | ~~Versioned build artifacts~~ (resolved) | — | — | — | — | — | ✅ Close |
 | 9 | WASM real concurrency (deferred → WASM threads proposal) | Code/Arch | 3 | 3 | 5 | **24** | ⏸️ Deferred (tracked) |
 | 10 | Broader emitter de-dup (x86_64 SysV trio / arm64 GAS trio) | Code debt | 3 | 2 | 4 | **10** | ✅ Resolved 2026-06-13 (win_arm64 kept separate) |
@@ -121,7 +121,7 @@ Verified: the `teko` binary now builds with 0 warnings and runs (prints the AOT 
 
 **Files:** `docs/ARCHITECTURE.md` (new), `docs/plan.md`, `docs/vm_plan.md`, `docs/BACKEND_AOT_PLAN.md`, `TEKO_COMPILER_MEMORANDUM.txt`.
 
-## 7. Near-identical codegen emitters — `14` 🟢 riscv UNIFIED 2026-06-13 (broader → #10)
+## 7. Near-identical codegen emitters — `14` ✅ RESOLVED 2026-06-13
 
 **Category:** Code debt
 
@@ -131,7 +131,7 @@ Verified: the `teko` binary now builds with 0 warnings and runs (prints the AOT 
 
 **Resolution (2026-06-13):** First built the safety net — extended the per-target golden tests to assert ADD/SUB/MUL/DIV mnemonics for all 16 emitters — then extracted `emit_linux_riscv_common.{c,h}` (a single parameterized core) so riscv32/riscv64 are now ~10-line wrappers. Verified **byte-for-byte identical** emitted output for all 16 targets via a full-output capture/diff harness. ASan/UBSan clean on both dispatch paths.
 
-**Deferred (→ item 10):** The other families (x86_64 SysV trio: linux/darwin/freebsd; arm64 quad: linux/darwin/freebsd/windows) are *not* pure-mnemonic duplicates — they diverge structurally (different syscall sequences, symbol decoration `_main`/`_pthread_create`, MASM `AREA`/`PROC` directives on Windows ARM) and even in emitted comment text. Unifying them would require parameterizing structural differences and per-OS comment strings, yielding a worse abstraction for little gain and re-introducing regression risk on the just-stabilized Windows CI. Kept separate by design; the new arithmetic goldens now guard all 16 against drift.
+**Broader families (completed in item 10):** the x86_64 SysV trio (linux/darwin/freebsd) and the arm64 GAS trio (linux/darwin/freebsd) were subsequently unified too, via `emit_x86_64_sysv_common` and `emit_arm64_gas_common` — see item 10. **Kept separate by design:** `emit_win_arm64` (MASM `AREA`/`PROC` directives) and the Windows x86 emitters (Intel/MASM syntax) are structurally unlike the AT&T/GAS families; unifying them would worsen the abstraction. The arithmetic goldens guard all 16 emitters against drift. Net: every emitter that is a true near-duplicate is now de-duplicated; what remains separate is separate on purpose.
 
 **Files:** `src/codegen/linux/emit_linux_riscv{32,64,_common}.{c,h}`; `tests/codegen/test_codegen_emitters_arithmetic.c`.
 

@@ -267,7 +267,7 @@ To support the native features of massive M:N concurrency, blocking channels, an
 | 4 | ~~WASM stubbed opcodes — arena implemented; concurrency hooked + deferred (#9)~~ | Code/Arch | ✅ Resolved 2026-06-13 (MVP) |
 | 5 | ~~`CMake GLOB_RECURSE` for source collection (stale builds)~~ | Infra | ✅ Resolved 2026-06-13 |
 | 6 | ~~Scattered architecture docs / no `ARCHITECTURE.md`~~ | Docs | ✅ Resolved 2026-06-13 |
-| 7 | Near-identical codegen emitters (duplication) | Code debt | 🟢 riscv unified 2026-06-13 (broader → backlog #10) |
+| 7 | ~~Near-identical codegen emitters (duplication)~~ | Code debt | ✅ Resolved 2026-06-13 — riscv32/64 + x86_64 SysV trio + arm64 GAS trio unified into shared parameterized cores; win_arm64 + Windows x86 kept separate by design (MASM/Intel ≠ AT&T-GAS) |
 
 See `TECH_DEBT_BACKLOG.md` for full scoring, business justification, file paths, and the phased remediation plan.
 
