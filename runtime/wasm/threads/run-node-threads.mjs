@@ -30,14 +30,17 @@ async function runModule(wasmRel) {
     workers.push(runner);
     runner.on("error", fail);
     runner.on("message", (m) => {
-      if (m && m.spawn) {
+      if (m && m.log) {
+        console.log(m.log);
+      } else if (m && m.spawn) {
         const [fn, arg] = m.spawn;
         const prod = new Worker(here("./worker.mjs"), { workerData: { memory, bytes, fn, arg } });
         workers.push(prod);
         prod.on("error", fail);
         pending.push(new Promise((res) => prod.on("message", (pm) => {
+          if (pm && pm.log) { console.log(pm.log); return; }
           if (pm && pm.error) fail(new Error(`producer: ${pm.error}`));
-          res();
+          if (pm && pm.done) res();
         })));
       } else if (m && m.error) {
         fail(new Error(`runner: ${m.error}`));
