@@ -3,7 +3,7 @@
 #include <stdlib.h>
 
 void test_teko_aot_escape_analysis_register_allocation(void) {
-    // Cenário 1: Bytecode contíguo onde a constante NÃO escapa (Apenas uma soma isolada)
+    // Scenario 1: Contiguous bytecode where the constant does NOT escape (only an isolated sum)
     unsigned char mock_local_code[] = {
         0x01, 0x05, 0x00, 0x00, 0x00,  // OP_ICONST 5
         0x05                           // OP_ADD
@@ -16,10 +16,10 @@ void test_teko_aot_escape_analysis_register_allocation(void) {
 
     TEST_ASSERT_EQUAL_UINT32(2, out_count);
     TEST_ASSERT_FALSE(out_ins[0].escapes);
-    // Verificação de sucesso: Constante foi otimizada para reter no registrador temporário REG_TEMP0!
+    // Success verification: Constant was optimized to be retained in the temporary register REG_TEMP0!
     TEST_ASSERT_EQUAL_INT(REG_TEMP0, out_ins[0].assigned_reg);
 
-    // Cenário 2: Bytecode onde a constante ESCAPA (Existe um OP_RETURN subsequente)
+    // Scenario 2: Bytecode where the constant ESCAPES (a subsequent OP_RETURN exists)
     unsigned char mock_escape_code[] = {
         0x01, 0x0A, 0x00, 0x00, 0x00,  // OP_ICONST 10
         0x22                           // OP_RETURN
@@ -28,6 +28,6 @@ void test_teko_aot_escape_analysis_register_allocation(void) {
     teko_optimize_register_allocation(mock_escape_code, sizeof(mock_escape_code), out_ins, &out_count);
 
     TEST_ASSERT_TRUE(out_ins[0].escapes);
-    // Verificação de sucesso: Como o dado escapa, o otimizador reteve no REG_ACCUMULATOR obrigatório
+    // Success verification: Since the data escapes, the optimizer retained it in the mandatory REG_ACCUMULATOR
     TEST_ASSERT_EQUAL_INT(REG_ACCUMULATOR, out_ins[0].assigned_reg);
 }

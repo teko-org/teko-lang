@@ -111,7 +111,7 @@ void emit_linux_mips(MetalContext* ctx, OpCode op, int32_t arg) {
             break;
 
         default:
-            // RESSURREIÇÃO DCE MIPS
+            // DCE RESURRECTION MIPS
             if ((int)op >= 100) {
                 fprintf(ctx->file, ".L_mips_label_%d:\n", (int)op);
             }

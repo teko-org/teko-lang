@@ -8,7 +8,7 @@ void test_teko_linker_macho_64_binary_signature_integrity(void) {
     const char* filename = "output_macho_linker_test_arm";
     uint8_t mock_macho_opcodes[] = { 0x90, 0xC3 };
 
-    // 1. TESTA BINÁRIO EXECUTÁVEL NO APPLE SILICON (is_shared = false)
+    // 1. TESTS EXECUTABLE BINARY ON APPLE SILICON (is_shared = false)
     bool success_arm = tld_macho_write_executable(filename, mock_macho_opcodes, sizeof(mock_macho_opcodes), CPU_TYPE_ARM64, false);
     TEST_ASSERT_TRUE(success_arm);
 
@@ -17,17 +17,17 @@ void test_teko_linker_macho_64_binary_signature_integrity(void) {
     uint32_t magic_read = 0;
     fread(&magic_read, 4, 1, f);
 
-    // Pula os próximos 8 bytes para ler o campo 'filetype' de 32 bits diretamente
+    // Skips the next 8 bytes to read the 32-bit 'filetype' field directly
     fseek(f, 12, SEEK_SET);
     uint32_t filetype_read = 0;
     fread(&filetype_read, 4, 1, f);
     fclose(f);
 
     TEST_ASSERT_EQUAL_HEX32(MH_MAGIC_64, magic_read);
-    TEST_ASSERT_EQUAL_UINT32(MH_EXECUTE, filetype_read); // Deve ser executável ordinário (2)
+    TEST_ASSERT_EQUAL_UINT32(MH_EXECUTE, filetype_read); // Should be an ordinary executable (2)
     remove(filename);
 
-    // 2. TESTA BIBLIOTECA COMPARTILHADA .DYLIB NO INTEL MAC (is_shared = true)
+    // 2. TESTS SHARED LIBRARY .DYLIB ON INTEL MAC (is_shared = true)
     const char* filename_intel = "output_macho_linker_test_intel.dylib";
     bool success_intel = tld_macho_write_executable(filename_intel, mock_macho_opcodes, sizeof(mock_macho_opcodes), CPU_TYPE_X86_64, true);
     TEST_ASSERT_TRUE(success_intel);
@@ -43,6 +43,6 @@ void test_teko_linker_macho_64_binary_signature_integrity(void) {
     fclose(f_intel);
 
     TEST_ASSERT_EQUAL_HEX32(MH_MAGIC_64, magic_intel);
-    TEST_ASSERT_EQUAL_UINT32(MH_DYLIB, filetype_intel); // Deve ser biblioteca dinâmica configurada (6)
+    TEST_ASSERT_EQUAL_UINT32(MH_DYLIB, filetype_intel); // Should be a configured dynamic library (6)
     remove(filename_intel);
 }

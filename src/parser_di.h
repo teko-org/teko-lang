@@ -4,7 +4,7 @@
 #include "parser.h"
 #include "parser_types.h"
 
-// Nós específicos para a arquitetura de Injeção de Dependência na AST
+// Specific nodes for the Dependency Injection architecture in the AST
 typedef enum {
     NODE_DI_INTERFACE = 500,
     NODE_DI_SERVICE,
@@ -13,14 +13,14 @@ typedef enum {
     NODE_METHOD_DECL
 } DIASTNodeType;
 
-// Ciclos de vida das Arenas injetadas nativamente
+// Lifetimes of natively injected arenas
 typedef enum {
-    LIFETIME_TRANSIENT, // Nova instância na Frame Arena do destino (Padrão)
-    LIFETIME_SCOPED,    // Fixo por Green Thread / Request Arena
-    LIFETIME_SINGLETON  // Fixo na Arena do Contexto Principal (main)
+    LIFETIME_TRANSIENT, // New instance in the destination frame arena (default)
+    LIFETIME_SCOPED,    // Fixed per green thread / request arena
+    LIFETIME_SINGLETON  // Fixed in the main context arena (main)
 } DILifetime;
 
-// Estrutura para os métodos declarados dentro de interfaces ou implementados em serviços
+// Structure for methods declared inside interfaces or implemented in services
 typedef struct DIMethodSignature {
     char* method_name;
     TypeInfo* return_type;
@@ -28,14 +28,14 @@ typedef struct DIMethodSignature {
     char* parameters_raw;
 } DIMethodSignature;
 
-// Estrutura para dependências injetadas em Handlers com amarração de Arena
+// Structure for dependencies injected into handlers with arena binding
 typedef struct HandlerDependency {
     char* dep_type;
     char* dep_name;
-    DILifetime lifetime; // <-- NOVO: Controla a estratégia de alocação da dependência
+    DILifetime lifetime; // <-- NEW: Controls the dependency's allocation strategy
 } HandlerDependency;
 
-// Nó da AST para o ecossistema de Injeção de Dependência
+// AST node for the Dependency Injection ecosystem
 typedef struct DIASTNode {
     int type;
     char* name;
@@ -60,7 +60,7 @@ typedef struct DIASTNode {
             int method_count;
         } di_decorator;
 
-        // Propriedades do Handler com injeção dirigida por Arena
+        // Handler properties with arena-directed injection
         struct {
             bool is_async_handler;
             char* handle_param_name;
@@ -71,7 +71,7 @@ typedef struct DIASTNode {
     } data;
 } DIASTNode;
 
-// Assinaturas públicas do Parser de DI
+// Public signatures for the DI parser
 DIASTNode* parse_di_interface(Parser* parser, bool is_exported);
 DIASTNode* parse_di_service(Parser* parser);
 DIASTNode* parse_di_decorator(Parser* parser);

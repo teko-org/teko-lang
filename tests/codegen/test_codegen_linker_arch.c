@@ -6,11 +6,11 @@ void test_teko_linker_arch_x64_mov_encoding_integrity(void) {
     uint8_t buffer[32];
     memset(buffer, 0, sizeof(buffer));
 
-    // Testa o codificador para x86_64 carregando a constante 42
+    // Tests the encoder for x86_64 loading the constant 42
     uint32_t bytes = tld_arch_encode_instruction(ARCH_X86_64, OP_ICONST, 42, buffer);
 
     TEST_ASSERT_EQUAL_UINT32(5, bytes);
-    TEST_ASSERT_EQUAL_HEX8(0xB8, buffer[0]); // Opcode de carga imediata em %eax
+    TEST_ASSERT_EQUAL_HEX8(0xB8, buffer[0]); // Immediate load opcode into %eax
     TEST_ASSERT_EQUAL_INT32(42, buffer[1] | (buffer[2] << 8));
 }
 
@@ -18,11 +18,11 @@ void test_teko_linker_arch_arm64_add_encoding_integrity(void) {
     uint8_t buffer[32];
     memset(buffer, 0, sizeof(buffer));
 
-    // Testa o codificador para ARM64 aplicando a instrução ADD
+    // Tests the encoder for ARM64 applying the ADD instruction
     uint32_t bytes = tld_arch_encode_instruction(ARCH_ARM64, OP_ADD, 0, buffer);
 
     TEST_ASSERT_EQUAL_UINT32(4, bytes);
-    // Valida o padrão binário fixo de 32 bits da instrução ADD w0, w0, w1 em Little Endian
+    // Validates the fixed 32-bit binary pattern of the ADD w0, w0, w1 instruction in Little Endian
     TEST_ASSERT_EQUAL_HEX8(0x00, buffer[0]);
     TEST_ASSERT_EQUAL_HEX8(0x00, buffer[1]);
     TEST_ASSERT_EQUAL_HEX8(0x01, buffer[2]);
@@ -46,7 +46,7 @@ void test_teko_linker_arch_arm32_mov_encoding(void) {
 
     uint32_t bytes = tld_arch_encode_instruction(ARCH_ARM32, OP_ICONST, 5, buffer);
     TEST_ASSERT_EQUAL_UINT32(4, bytes);
-    // Valida mov r0, #5 em formato de 32-bit fixo RISC Little Endian
+    // Validates mov r0, #5 in fixed 32-bit RISC Little Endian format
     TEST_ASSERT_EQUAL_HEX8(0x05, buffer[0]);
     TEST_ASSERT_EQUAL_HEX8(0x00, buffer[1]);
     TEST_ASSERT_EQUAL_HEX8(0xA0, buffer[2]);
@@ -59,7 +59,7 @@ void test_teko_linker_arch_ppc64_add_encoding(void) {
 
     uint32_t bytes = tld_arch_encode_instruction(ARCH_PPC64, OP_ADD, 0, buffer);
     TEST_ASSERT_EQUAL_UINT32(4, bytes);
-    // add r3, r3, r4 binário fixo do PowerPC
+    // add r3, r3, r4 fixed binary for PowerPC
     TEST_ASSERT_EQUAL_HEX8(0x14, buffer[0]);
     TEST_ASSERT_EQUAL_HEX8(0x22, buffer[1]);
     TEST_ASSERT_EQUAL_HEX8(0x63, buffer[2]);

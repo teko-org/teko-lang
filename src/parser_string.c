@@ -3,7 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-// Função auxiliar para contar ocorrências seguidas de um determinado caractere
+// Helper function to count consecutive occurrences of a given character
 static int count_consecutive_chars(const char* str, int start, char target) {
     int count = 0;
     while (str[start + count] == target) {
@@ -12,7 +12,7 @@ static int count_consecutive_chars(const char* str, int start, char target) {
     return count;
 }
 
-// Desestruturador recursivo de blocos interpolados usando aridade de chaves (bX)
+// Recursive destructurer of interpolated blocks using brace arity (bX)
 static void desubstitute_interpolation(ExtendedStringToken* ext_token, StringASTNode* node) {
     const char* text = ext_token->raw_content;
     if (!text) return;
@@ -29,13 +29,13 @@ static void desubstitute_interpolation(ExtendedStringToken* ext_token, StringAST
     int static_start = 0;
 
     while (cursor < len) {
-        // Procura chaves de abertura '{'
+        // Look for opening braces '{'
         if (text[cursor] == '{') {
             int open_count = count_consecutive_chars(text, cursor, '{');
 
-            // Valida se a quantidade de chaves atende exatamente o critério da aridade bX
+            // Check if the brace count exactly meets the bX arity criterion
             if (open_count >= target_arity) {
-                // Se havia texto estático antes deste bloco, salva o fragmento estático
+                // If there was static text before this block, save the static fragment
                 if (cursor > static_start) {
                     if (node->data.interpolated_string.part_count >= cap) {
                         cap *= 2;
@@ -52,11 +52,11 @@ static void desubstitute_interpolation(ExtendedStringToken* ext_token, StringAST
                     node->data.interpolated_string.part_count++;
                 }
 
-                // Ajusta o cursor pulando o excesso de chaves externas se valerem as mais internas
-                // Exemplo: `{"{{a}}": "{{{B}}}"}`b2 -> se aridade é 2 e abriram 3 chaves, 1 é tratada como caractere estático
+                // Adjust the cursor by skipping excess outer braces when inner ones apply
+                // Example: `{"{{a}}": "{{{B}}}"}`b2 -> if arity is 2 and 3 braces opened, 1 is treated as a static character
                 int extra_brackets = open_count - target_arity;
                 if (extra_brackets > 0) {
-                    // Adiciona a chave sobressalente como texto estático
+                    // Add the surplus brace as static text
                     if (node->data.interpolated_string.part_count >= cap) {
                         cap *= 2;
                         node->data.interpolated_string.parts = (StringPartNode*)realloc(
@@ -71,10 +71,10 @@ static void desubstitute_interpolation(ExtendedStringToken* ext_token, StringAST
                     node->data.interpolated_string.part_count++;
                 }
 
-                cursor += open_count; // Move para dentro da expressão lógica
+                cursor += open_count; // Move inside the logic expression
                 int expr_start = cursor;
 
-                // Varre procurando o fechamento correspondente '}'
+                // Scan for the matching closing '}'
                 while (cursor < len) {
                     if (text[cursor] == '}') {
                         int close_count = count_consecutive_chars(text, cursor, '}');
@@ -84,7 +84,7 @@ static void desubstitute_interpolation(ExtendedStringToken* ext_token, StringAST
                             strncpy(expr_text, &text[expr_start], expr_len);
                             expr_text[expr_len] = '\0';
 
-                            // Adiciona a expressão lógica à lista de partes
+                            // Add the logic expression to the parts list
                             if (node->data.interpolated_string.part_count >= cap) {
                                 cap *= 2;
                                 node->data.interpolated_string.parts = (StringPartNode*)realloc(
@@ -95,7 +95,7 @@ static void desubstitute_interpolation(ExtendedStringToken* ext_token, StringAST
                             node->data.interpolated_string.part_count++;
 
                             cursor += close_count;
-                            static_start = cursor; // Redefine início do próximo fragmento estático
+                            static_start = cursor; // Reset the start of the next static fragment
                             break;
                         }
                     }
@@ -107,7 +107,7 @@ static void desubstitute_interpolation(ExtendedStringToken* ext_token, StringAST
         cursor++;
     }
 
-    // Salva o bloco final estático se restou algum texto após a última interpolação
+    // Save the final static block if any text remained after the last interpolation
     if (cursor > static_start) {
         if (node->data.interpolated_string.part_count >= cap) {
             cap *= 2;
@@ -125,7 +125,7 @@ static void desubstitute_interpolation(ExtendedStringToken* ext_token, StringAST
     }
 }
 
-// Analisa os metadados do token estendido e retorna o nó correto para a AST
+// Parses the extended token metadata and returns the correct node for the AST
 StringASTNode* parse_advanced_string_expr(Parser* parser, ExtendedStringToken* ext_token) {
     if (!ext_token) return NULL;
 
@@ -142,14 +142,14 @@ StringASTNode* parse_advanced_string_expr(Parser* parser, ExtendedStringToken* e
         node->data.interpolated_string.parts = NULL;
         node->data.interpolated_string.part_count = 0;
 
-        // Dispara o algoritmo de desestruturação lendo a aridade de chaves
+        // Trigger the destructuring algorithm reading the brace arity
         desubstitute_interpolation(ext_token, node);
     }
 
     return node;
 }
 
-// Liberação recursiva e segura contra vazamento de memória heap nas strings
+// Safe recursive deallocation against heap memory leaks in strings
 void free_string_ast_node(StringASTNode* node) {
     if (!node) return;
 

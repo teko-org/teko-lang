@@ -13,7 +13,7 @@ void test_teko_aot_freebsd_x86_64_pure_emission(void) {
     MetalContext* ctx = teko_metal_create(asm_path, target);
     TEST_ASSERT_NOT_NULL(ctx);
 
-    // Carrega canal e concorrência sem empilhar constantes numéricas vulneráveis
+    // Loads channel and concurrency without stacking vulnerable numeric constants
     unsigned char mock_bsd_bytes[] = { 0x12, 0x10, 0x00 };
     teko_metal_emit_program(ctx, mock_bsd_bytes, sizeof(mock_bsd_bytes));
     teko_metal_close(ctx);

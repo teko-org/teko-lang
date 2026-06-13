@@ -6,7 +6,7 @@
 
 #define MH_MAGIC_64          0xFEEDFACF
 #define MH_EXECUTE           0x2
-#define MH_DYLIB             0x6        // NOVO: Tipo de arquivo para Bibliotecas Dinâmicas (.dylib)
+#define MH_DYLIB             0x6        // NEW: File type for Dynamic Libraries (.dylib)
 
 #define CPU_TYPE_X86_64      0x01000007
 #define CPU_TYPE_ARM64       0x0100000C
@@ -64,7 +64,7 @@ typedef struct {
     uint32_t ntools;
 } TekoMachBuildVersionCommand;
 
-// Assinatura atualizada: Agora recebe 'is_shared' vindo do gerenciador de projetos
+// Updated signature: Now receives 'is_shared' from the project manager
 bool tld_macho_write_executable(const char* filename, const uint8_t* machine_code, uint32_t code_size, int32_t cpu_type, bool is_shared);
 
 #endif // TLD_MACHO_H

@@ -18,7 +18,7 @@ void emit_darwin_arm64(MetalContext* ctx, OpCode op, int32_t arg) {
             break;
 
         case OP_HALT:
-            fprintf(ctx->file, "    ;; [AOT Halt]: Termina execucao do programa.\n");
+            fprintf(ctx->file, "    ;; [AOT Halt]: Terminates program execution.\n");
             break;
 
         case OP_ICONST:
@@ -76,7 +76,7 @@ void emit_darwin_arm64(MetalContext* ctx, OpCode op, int32_t arg) {
             break;
 
         case OP_CHAN_INIT:
-            fprintf(ctx->file, "    ;; --- [AOT Channel Allocation na Arena] ---\n");
+            fprintf(ctx->file, "    ;; --- [AOT Channel Allocation in the Arena] ---\n");
             fprintf(ctx->file, "    mov x0, x19\n");
             fprintf(ctx->file, "    add x19, x19, #32\n");
             break;
@@ -104,7 +104,7 @@ void emit_darwin_arm64(MetalContext* ctx, OpCode op, int32_t arg) {
             break;
 
         default:
-            // RESSURREIÇÃO DCE: Emite o rótulo se for uma instrução lógica mapeada acima de 100
+            // DCE RESURRECTION: Emits the label if it is a logical instruction mapped above 100
             if ((int)op >= 100) {
                 fprintf(ctx->file, ".L_arm_label_%d:\n", (int)op);
             }

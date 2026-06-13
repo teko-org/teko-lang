@@ -3,7 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-// Valida se o usuário tentou criar primitivos de concorrência usando let/mut em vez de :=
+// Validates whether the user tried to create concurrency primitives using let/mut instead of :=
 ConcurrentValidationResult validate_concurrency_variable_creation(const StatementASTNode* var_node) {
     ConcurrentValidationResult result = {CONC_ERR_NONE, NULL};
 
@@ -24,7 +24,7 @@ ConcurrentValidationResult validate_concurrency_variable_creation(const Statemen
             result.error_message = (char*)malloc(msg_len);
             if (result.error_message) {
                 snprintf(result.error_message, msg_len,
-                         "[Erro Semântico]: Instanciação ilegal da variável '%s'. Primitivos do tipo '%s' devem obrigatoriamente ser criados com o operador de atribuição rápida ':='.",
+                         "[Semantic Error]: Illegal instantiation of variable '%s'. Primitives of type '%s' must be created with the quick assignment operator ':='.",
                          var_node->data.var_decl.var_name, type_name);
             }
 
@@ -35,19 +35,19 @@ ConcurrentValidationResult validate_concurrency_variable_creation(const Statemen
     return result;
 }
 
-// Implementação explícita da validação de métodos do ecossistema concorrente
+// Explicit implementation of method validation for the concurrent ecosystem
 ConcurrentValidationResult validate_channel_method_access(const char* method_name) {
     ConcurrentValidationResult result = {CONC_ERR_NONE, NULL};
     if (!method_name) return result;
 
-    // Lista de métodos nativos permitidos no ecossistema assíncrono e concorrente da Teko
+    // List of native methods allowed in the Teko asynchronous and concurrent ecosystem
     if (strcmp(method_name, "put") == 0 ||
         strcmp(method_name, "add") == 0 ||
         strcmp(method_name, "done") == 0 ||
         strcmp(method_name, "wait") == 0 ||
         strcmp(method_name, "lock") == 0 ||
         strcmp(method_name, "unlock") == 0) {
-        return result; // Operação válida!
+        return result; // Valid operation!
     }
 
     result.error_type = CONC_ERR_ILLEGAL_METHOD;
@@ -55,14 +55,14 @@ ConcurrentValidationResult validate_channel_method_access(const char* method_nam
     result.error_message = (char*)malloc(msg_len);
     if (result.error_message) {
         snprintf(result.error_message, msg_len,
-                 "[Erro Semântico]: O método '.%s' não é uma operação válida no ecossistema concorrente.",
+                 "[Semantic Error]: The method '.%s' is not a valid operation in the concurrent ecosystem.",
                  method_name);
     }
     fprintf(stderr, "%s\n", result.error_message);
     return result;
 }
 
-// Desalocação segura de strings de diagnósticos
+// Safe deallocation of diagnostic strings
 void free_concurrent_validation_result(ConcurrentValidationResult result) {
     if (result.error_message) {
         free(result.error_message);

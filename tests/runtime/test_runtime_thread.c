@@ -17,12 +17,12 @@ void test_teko_runtime_scheduler_cooperative_multithreading(void) {
     TekoScheduler scheduler;
     tld_scheduler_init(&scheduler);
 
-    // Garante que o contexto da thread principal do Host iniciou ativa
+    // Ensures that the Host main thread context started as active
     TEST_ASSERT_EQUAL_UINT32(1, scheduler.thread_count);
     TEST_ASSERT_EQUAL_INT32(0, scheduler.current_running_id);
     TEST_ASSERT_EQUAL_INT(THREAD_RUNNING, scheduler.threads[0].state);
 
-    // 1. Spawna duas Green Threads leves com pilhas de 64KB isoladas
+    // 1. Spawns two lightweight Green Threads with isolated 64KB stacks
     int32_t t1 = tld_thread_spawn(&scheduler, mock_green_thread_task_1);
     int32_t t2 = tld_thread_spawn(&scheduler, mock_green_thread_task_2);
 
@@ -33,19 +33,19 @@ void test_teko_runtime_scheduler_cooperative_multithreading(void) {
     TEST_ASSERT_EQUAL_INT(THREAD_READY, scheduler.threads[t1].state);
     TEST_ASSERT_EQUAL_INT(THREAD_READY, scheduler.threads[t2].state);
 
-    // Simula as chamadas de funções interceptadas pelo escalonador nos loops lógicos
+    // Simulates function calls intercepted by the scheduler in logic loops
     mock_green_thread_task_1();
     mock_green_thread_task_2();
 
-    // 2. Roda a malha do escalonador limpando os estados e alternando o contexto
+    // 2. Runs the scheduler loop clearing states and switching context
     tld_scheduler_run(&scheduler);
 
-    // Certifica que as Green Threads executaram e modificaram o barramento compartilhado
+    // Certifies that the Green Threads executed and modified the shared bus
     TEST_ASSERT_EQUAL_INT(42, g_test_counter);
     TEST_ASSERT_EQUAL_INT(THREAD_ZOMBIE, scheduler.threads[t1].state);
     TEST_ASSERT_EQUAL_INT(THREAD_ZOMBIE, scheduler.threads[t2].state);
 
-    // 3. Desalocação e limpeza dos frames de pilha virtuais
+    // 3. Deallocation and cleanup of virtual stack frames
     for (uint32_t i = 0; i < scheduler.thread_count; i++) {
         if (scheduler.threads[i].stack_memory) {
             free(scheduler.threads[i].stack_memory);

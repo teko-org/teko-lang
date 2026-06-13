@@ -5,7 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-// 1. TESTE WINDOWS 32-BIT (x86)
+// 1. WINDOWS 32-BIT TEST (x86)
 void test_teko_aot_windows_x86_32_pure_emission(void) {
     const char* asm_path = "output_win32_test.asm";
     TekoTarget target = { .arch = ARCH_X86, .os = OS_WINDOWS };
@@ -13,7 +13,7 @@ void test_teko_aot_windows_x86_32_pure_emission(void) {
     MetalContext* ctx = teko_metal_create(asm_path, target);
     TEST_ASSERT_NOT_NULL(ctx);
 
-    // OP_STORE no meio blinda os literais contra o pre-processador de folding
+    // OP_STORE in the middle shields the literals against the folding pre-processor
     unsigned char mock_win32_bytes[] = {
         0x01, 0x64, 0x00, 0x00, 0x00, // OP_ICONST 100
         0x03,                         // OP_STORE
@@ -39,7 +39,7 @@ void test_teko_aot_windows_x86_32_pure_emission(void) {
     remove(asm_path);
 }
 
-// 2. TESTE WINDOWS 64-BIT (x86_64)
+// 2. WINDOWS 64-BIT TEST (x86_64)
 void test_teko_aot_windows_x86_64_pure_emission(void) {
     const char* asm_path = "output_win64_test.asm";
     TekoTarget target = { .arch = ARCH_X86_64, .os = OS_WINDOWS };
@@ -66,7 +66,7 @@ void test_teko_aot_windows_x86_64_pure_emission(void) {
     remove(asm_path);
 }
 
-// 3. TESTE WINDOWS ARM64
+// 3. WINDOWS ARM64 TEST
 void test_teko_aot_windows_arm64_pure_emission(void) {
     const char* asm_path = "output_win_arm64_test.asm";
 

@@ -3,27 +3,27 @@
 
 #include "parser.h"
 
-// Níveis de visibilidade e encapsulamento da linguagem
+// Language visibility and encapsulation levels
 typedef enum {
-    VIS_INTERNAL = 0, // Visibilidade padrão (omissão)
-    VIS_PROJECT_PUB,  // Modificador 'pub' (visível no projeto)
-    VIS_EXPORTED_EXP  // Modificador 'exp' (exportado para fora)
+    VIS_INTERNAL = 0, // Default visibility (omitted modifier)
+    VIS_PROJECT_PUB,  // 'pub' modifier (visible within the project)
+    VIS_EXPORTED_EXP  // 'exp' modifier (exported outside)
 } VisibilityKind;
 
-// Nós específicos de declarações com escopo de visibilidade expandida na AST
+// Specific AST nodes for declarations with expanded visibility scope
 typedef enum {
     NODE_VISIBLE_DECL = 1100
 } VisibilityASTNodeType;
 
-// Nó envoltório que associa um nível de visibilidade a qualquer declaração global
+// Wrapper node that associates a visibility level with any global declaration
 typedef struct VisibilityASTNode {
     int type;                  // NODE_VISIBLE_DECL
-    VisibilityKind visibility; // KIND do modificador
-    void* decorated_node;      // Aponta para o nó real (Nó de Struct, Função, Interface, etc.)
-    int decorated_node_type;   // Guarda o tipo original do nó decorado para o Codegen
+    VisibilityKind visibility; // Modifier kind
+    void* decorated_node;      // Points to the real node (struct, function, interface, etc.)
+    int decorated_node_type;   // Stores the original type of the decorated node for codegen
 } VisibilityASTNode;
 
-// Assinaturas públicas do Parser de Visibilidade
+// Public signatures for the Visibility parser
 VisibilityASTNode* parse_global_declaration_with_visibility(Parser* parser);
 void free_visibility_ast_node(VisibilityASTNode* node);
 

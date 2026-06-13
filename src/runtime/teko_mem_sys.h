@@ -5,7 +5,7 @@
 #include <stddef.h>
 #include <stdbool.h>
 
-// Assinaturas abstratas e limpas que blindam as Arenas contra diferenças de OS
+// Abstract, clean signatures that shield the Arenas from OS differences
 void* teko_sys_allocate_pages(size_t size);
 bool  teko_sys_free_pages(void* address, size_t size);
 

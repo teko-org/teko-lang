@@ -3,15 +3,15 @@
 
 #include "parser.h"
 
-// Nós específicos para concorrência na AST
+// Specific nodes for concurrency in the AST
 typedef enum {
-    NODE_ASYNC_FN = 200,   // Início do bloco assíncrono
-    NODE_AWAIT_EXPR,       // Expressão await
-    NODE_DEFER_BLOCK,      // Bloco defer comum
-    NODE_ASYNC_DEFER_BLOCK,// Bloco async defer
-    NODE_WHEN_MODIFIER,    // Comando condicional pós-fixado 'when'
-    NODE_CHAN_INIT,        // Inicialização de canal: chan<T> ou chan<T>(cap)
-    NODE_CONCURRENT_OBJECT // waiter ou mutex
+    NODE_ASYNC_FN = 200,   // Start of an async block
+    NODE_AWAIT_EXPR,       // await expression
+    NODE_DEFER_BLOCK,      // Regular defer block
+    NODE_ASYNC_DEFER_BLOCK,// Async defer block
+    NODE_WHEN_MODIFIER,    // Post-fix conditional command 'when'
+    NODE_CHAN_INIT,        // Channel initialization: chan<T> or chan<T>(cap)
+    NODE_CONCURRENT_OBJECT // waiter or mutex
 } ConcurrentASTNodeType;
 
 typedef enum {
@@ -19,33 +19,33 @@ typedef enum {
     OBJ_MUTEX
 } ConcurrentObjectType;
 
-// Estrutura unificada de nós concorrentes para a AST
+// Unified concurrent node structure for the AST
 typedef struct ConcurrentASTNode {
     int type; // ConcurrentASTNodeType
     union {
-        // Expressão await: await <expr>
+        // await expression: await <expr>
         struct {
             struct ConcurrentASTNode* expression;
         } await_expr;
 
-        // Modificador condicional pós-fixado: <cmd> when <condition>
+        // Post-fix conditional modifier: <cmd> when <condition>
         struct {
             struct ConcurrentASTNode* command;
             char* condition_lexeme;
         } when_modifier;
 
-        // Inicialização de canal: chan<type>(capacity)
+        // Channel initialization: chan<type>(capacity)
         struct {
             char* channel_type;
-            int capacity; // 0 se for unbounded (sem capacidade definida)
+            int capacity; // 0 if unbounded (no capacity defined)
         } chan_init;
 
-        // Primitivos de sincronização: waiter ou mutex
+        // Synchronization primitives: waiter or mutex
         struct {
             ConcurrentObjectType obj_type;
         } sync_obj;
 
-        // Blocos defer / async defer
+        // defer / async defer blocks
         struct {
             struct ConcurrentASTNode** statements;
             int statement_count;
@@ -53,7 +53,7 @@ typedef struct ConcurrentASTNode {
     } data;
 } ConcurrentASTNode;
 
-// Assinaturas das funções do Parser de Concorrência
+// Function signatures for the Concurrency parser
 ConcurrentASTNode* parse_await_expression(Parser* parser);
 ConcurrentASTNode* parse_defer_statement(Parser* parser, bool is_async);
 ConcurrentASTNode* parse_concurrency_assignment(Parser* parser);

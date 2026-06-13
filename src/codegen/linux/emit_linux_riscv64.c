@@ -104,7 +104,7 @@ void emit_linux_riscv64(MetalContext* ctx, OpCode op, int32_t arg) {
             break;
 
         default:
-            // RESSURREIÇÃO DCE RV64
+            // DCE RESURRECTION RV64
             if ((int)op >= 100) {
                 fprintf(ctx->file, ".L_rv64_label_%d:\n", (int)op);
             }

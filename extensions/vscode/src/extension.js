@@ -5,31 +5,31 @@ const { LanguageClient } = require('vscode-languageclient/node');
 
 let client;
 
-// Resolve dinamicamente o caminho do compilador Teko de forma flexível
+// Dynamically resolves the Teko compiler path in a flexible way
 function resolveCompilerPath(context) {
-    // Nível 1: Tenta ler uma configuração personalizada do próprio VS Code (Definida pelo usuário)
+    // Level 1: Attempts to read a custom setting from VS Code itself (set by the user)
     const configPath = vscode.workspace.getConfiguration('teko').get('compilerPath');
     if (configPath && configPath.trim() !== "") {
         return configPath;
     }
 
-    // Nível 2: Se a extensão foi empacotada com o binário embutido (Distribuição de Loja / GitHub Releases)
-    // O binário ficaria em: extensions/vscode/bin/teko
+    // Level 2: If the extension was packaged with an embedded binary (Store Distribution / GitHub Releases)
+    // The binary would be at: extensions/vscode/bin/teko
     const embeddedPath = path.join(context.extensionPath, 'bin', process.platform === 'win32' ? 'teko.exe' : 'teko');
-    // Para simplificar sem checagem de fs síncrona pesada, retornamos como fallback viável
+    // For simplicity, without a heavy synchronous fs check, we return it as a viable fallback
 
-    // Nível 3: Padrão da Indústria - Assume que o executável está adicionado nas variáveis de ambiente do SO (PATH)
-    // Facilitando chamadas globais como simplesmente 'teko'
+    // Level 3: Industry Standard - Assumes the executable is added to the OS environment variables (PATH)
+    // Enabling global calls as simply 'teko'
     return "teko";
 }
 
 function activate(context) {
-    console.log('Extensão Teko dinâmica ativada com sucesso!');
+    console.log('Teko dynamic extension activated successfully!');
 
-    // Resolve o caminho dinamicamente sem travar strings fixas no código
+    // Resolves the path dynamically without hard-coding fixed strings
     const compilerPath = resolveCompilerPath(context);
 
-    // 1. CONFIGURAÇÃO E ALOCAÇÃO DO LANGUAGE SERVER (LSP CLIENT)
+    // 1. LANGUAGE SERVER SETUP AND ALLOCATION (LSP CLIENT)
     const serverOptions = {
         run: { command: compilerPath, args: ["check"] },
         debug: { command: compilerPath, args: ["check"] }
@@ -45,17 +45,17 @@ function activate(context) {
     client = new LanguageClient('tekoLanguageServer', 'Teko Language Server', serverOptions, clientOptions);
     client.start();
 
-    // 2. COMANDO DA IDE: Teko: Executar Projeto (Run)
+    // 2. IDE COMMAND: Teko: Run Project (Run)
     let runCommand = vscode.commands.registerCommand('teko.run', function () {
         const folders = vscode.workspace.workspaceFolders;
         if (!folders) {
-            vscode.window.showErrorMessage('Abra uma pasta contendo um projeto Teko (.tkp) primeiro.');
+            vscode.window.showErrorMessage('Open a folder containing a Teko project (.tkp) first.');
             return;
         }
 
         vscode.workspace.findFiles('**/*.tkp').then((files) => {
             if (files.length === 0) {
-                vscode.window.showErrorMessage('Manifesto do projeto (<nome>.tkp) não encontrado.');
+                vscode.window.showErrorMessage('Project manifest (<name>.tkp) not found.');
                 return;
             }
             const tkpPath = files[0].fsPath;
@@ -64,7 +64,7 @@ function activate(context) {
 
             cp.exec(`"${compilerPath}" run "${tkpPath}"`, (err, stdout, stderr) => {
                 if (err) {
-                    outputChannel.appendLine(`[Erro de Runtime]:\n${stderr}`);
+                    outputChannel.appendLine(`[Runtime Error]:\n${stderr}`);
                     return;
                 }
                 outputChannel.appendLine(stdout);
@@ -72,7 +72,7 @@ function activate(context) {
         });
     });
 
-    // 3. COMANDO DA IDE: Teko: Compilar Projeto (Build)
+    // 3. IDE COMMAND: Teko: Build Project (Build)
     let buildCommand = vscode.commands.registerCommand('teko.build', function () {
         const folders = vscode.workspace.workspaceFolders;
         if (!folders) return;
@@ -83,10 +83,10 @@ function activate(context) {
 
             cp.exec(`"${compilerPath}" build "${tkpPath}"`, (err, stdout, stderr) => {
                 if (err) {
-                    vscode.window.showErrorMessage('Falha catastrófica ao compilar o projeto.');
+                    vscode.window.showErrorMessage('Catastrophic failure while compiling the project.');
                     return;
                 }
-                vscode.window.showInformationMessage('Artefato Teko gerado com sucesso no diretório!');
+                vscode.window.showInformationMessage('Teko artifact generated successfully in the directory!');
             });
         });
     });

@@ -4,7 +4,7 @@
 #include <string.h>
 #include <ctype.h>
 
-// Mapeamento interno de palavras-chave para busca rápida
+// Internal keyword mapping for fast lookup
 typedef struct {
     const char* keyword;
     TokenType type;
@@ -24,14 +24,14 @@ static KeywordMap keywords[] = {
     {NULL, TOKEN_UNKNOWN}, {"required", TOKEN_REQD},
 };
 
-// Inicializa o analisador léxico
+// Initializes the lexer
 void lexer_init(Lexer* lexer, const char* source) {
     lexer->source = source;
     lexer->cursor = 0;
     lexer->line = 1;
 }
 
-// Funções auxiliares privadas (static) de leitura de caracteres
+// Private (static) helper functions for reading characters
 static char peek(Lexer* lexer) {
     return lexer->source[lexer->cursor];
 }
@@ -76,14 +76,14 @@ static void skip_whitespace_and_comments(Lexer* lexer) {
 
 static Token lex_string(Lexer* lexer) {
     const int start_pos = lexer->cursor;
-    advance(lexer); // Consome o primeiro '"'
+    advance(lexer); // Consume the first '"'
 
-    // Verifica se é o início de uma string de triplas aspas: """
+    // Check if this is the start of a triple-quoted string: """
     if (peek(lexer) == '"' && peek_next(lexer) == '"') {
-        advance(lexer); // Consome o segundo '"'
-        advance(lexer); // Consome o terceiro '"'
+        advance(lexer); // Consume the second '"'
+        advance(lexer); // Consume the third '"'
 
-        // Varre até encontrar o fechamento """
+        // Scan until the closing """ is found
         while (true) {
             const char c = peek(lexer);
             if (c == '\0') break;
@@ -93,9 +93,9 @@ static Token lex_string(Lexer* lexer) {
             }
 
             if (c == '"' && lexer->source[lexer->cursor + 1] == '"' && lexer->source[lexer->cursor + 2] == '"') {
-                advance(lexer); // Consome o primeiro '"'
-                advance(lexer); // Consome o segundo '"'
-                advance(lexer); // Consome o terceiro '"'
+                advance(lexer); // Consume the first '"'
+                advance(lexer); // Consume the second '"'
+                advance(lexer); // Consume the third '"'
                 break;
             }
             advance(lexer);
@@ -106,7 +106,7 @@ static Token lex_string(Lexer* lexer) {
         return token;
     }
 
-    // Comportamento padrão para strings normais "..."
+    // Default behavior for normal strings "..."
     while (peek(lexer) != '"' && peek(lexer) != '\0') {
         if (peek(lexer) == '\n') lexer->line++;
         advance(lexer);
@@ -120,7 +120,7 @@ static Token lex_string(Lexer* lexer) {
 
 static Token lex_char(Lexer* lexer) {
     const int start_pos = lexer->cursor;
-    advance(lexer); // consome '\''
+    advance(lexer); // consume '\''
 
     if (peek(lexer) == '\\') advance(lexer);
     advance(lexer);
@@ -152,7 +152,7 @@ static Token lex_number(Lexer* lexer) {
 static Token lex_identifier(Lexer* lexer, bool is_macro) {
     int start_pos = lexer->cursor;
 
-    if (is_macro) advance(lexer); // consome '@'
+    if (is_macro) advance(lexer); // consume '@'
 
     while (isalnum(peek(lexer)) || peek(lexer) == '_' || peek(lexer) == '.') {
         if (peek(lexer) == '.' && !isalnum(peek_next(lexer)) && peek_next(lexer) != '_') {
@@ -180,7 +180,7 @@ static Token lex_identifier(Lexer* lexer, bool is_macro) {
     return token;
 }
 
-// Retorna o próximo Token lido do arquivo fonte
+// Returns the next Token read from the source file
 Token lexer_next_token(Lexer* lexer) {
     skip_whitespace_and_comments(lexer);
 
@@ -217,7 +217,7 @@ Token lexer_next_token(Lexer* lexer) {
                 type = TOKEN_ELVIS;
             } else if (peek(lexer) == '.') {
                 advance(lexer);
-                type = TOKEN_SAFE_DOT; // Captura ?. como um token único
+                type = TOKEN_SAFE_DOT; // Captures ?. as a single token
             } else {
                 type = TOKEN_QUESTION;
             }
@@ -315,7 +315,7 @@ const char* get_token_type_name(TokenType type) {
         case TOKEN_EOF: return "EOF";
         case TOKEN_UNKNOWN: return "UNKNOWN_OR_ERROR";
 
-        // Palavras-chave (Keywords)
+        // Keywords
         case TOKEN_USE: return "KEYWORD_USE";
         case TOKEN_FROM: return "KEYWORD_FROM";
         case TOKEN_EXTERN: return "KEYWORD_EXTERN";
@@ -348,7 +348,7 @@ const char* get_token_type_name(TokenType type) {
         case TOKEN_PUB: return "KEYWORD_PUB";
         case TOKEN_REQD: return "KEYWORD_REQUIRED";
 
-        // Identificadores e Literais
+        // Identifiers and Literals
         case TOKEN_IDENTIFIER: return "IDENTIFIER";
         case TOKEN_MACRO_IDENT: return "MACRO_IDENTIFIER";
         case TOKEN_LIT_INT: return "LITERAL_INT";
@@ -364,7 +364,7 @@ const char* get_token_type_name(TokenType type) {
         case TOKEN_SAFE_DOT: return "SAFE_NAVIGATION_DOT";
         case TOKEN_ELVIS: return "OPERATOR_ELVIS";
 
-        // Delimitadores e Pontuação
+        // Delimiters and Punctuation
         case TOKEN_LPAREN: return "LPAREN";
         case TOKEN_RPAREN: return "RPAREN";
         case TOKEN_LBRACE: return "LBRACE";
@@ -379,7 +379,7 @@ const char* get_token_type_name(TokenType type) {
         case TOKEN_DBL_COLON: return "DOUBLE_COLON";
         case TOKEN_ARROW: return "ARROW_INLINE";
 
-        // Operadores Matemáticos, Lógicos e Bitwise Expandidos
+        // Extended Mathematical, Logical, and Bitwise Operators
         case TOKEN_PLUS: return "OPERATOR_PLUS";
         case TOKEN_MINUS: return "OPERATOR_MINUS";
         case TOKEN_MUL: return "OPERATOR_MULTIPLY";
@@ -402,7 +402,7 @@ const char* get_token_type_name(TokenType type) {
         case TOKEN_EQ: return "OPERATOR_EQUAL_COMPARISON";
         case TOKEN_NE: return "OPERATOR_NOT_EQUAL";
 
-        // Operadores de Atribuição Composta e Especial
+        // Compound and Special Assignment Operators
         case TOKEN_ASSIGN: return "ASSIGN_EQUAL";
         case TOKEN_QUICK_ASSIGN: return "QUICK_ASSIGN";
         case TOKEN_ADD_ASSIGN: return "ASSIGN_ADD";

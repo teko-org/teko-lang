@@ -6,18 +6,18 @@
 #include "../teko_target.h"
 #include "../codegen_li.h"
 
-// Contexto do emissor contíguo bare-metal
+// Context of the contiguous bare-metal emitter
 typedef struct {
     FILE* file;
     TekoTarget target;
     uint32_t label_count;
 } MetalContext;
 
-// 1. ECOSSISTEMA APPLE (Kernel Darwin)
+// 1. APPLE ECOSYSTEM (Darwin Kernel)
 void emit_darwin_arm64(MetalContext* ctx, OpCode op, int32_t arg);
 void emit_darwin_x86_64(MetalContext* ctx, OpCode op, int32_t arg);
 
-// 2. ECOSSISTEMA LINUX (ELF ABI)
+// 2. LINUX ECOSYSTEM (ELF ABI)
 void emit_linux_x86_64(MetalContext* ctx, OpCode op, int32_t arg);
 void emit_linux_x86(MetalContext* ctx, OpCode op, int32_t arg);
 void emit_linux_arm64(MetalContext* ctx, OpCode op, int32_t arg);
@@ -27,19 +27,19 @@ void emit_linux_riscv32(MetalContext* ctx, OpCode op, int32_t arg);
 void emit_linux_mips(MetalContext* ctx, OpCode op, int32_t arg);
 void emit_linux_ppc64(MetalContext* ctx, OpCode op, int32_t arg);
 
-// 3. ECOSSISTEMA WINDOWS (PE/COFF Vector)
+// 3. WINDOWS ECOSYSTEM (PE/COFF Vector)
 void emit_win_x86_64(MetalContext* ctx, OpCode op, int32_t arg);
 void emit_win_x86(MetalContext* ctx, OpCode op, int32_t arg);
 void emit_win_arm64(MetalContext* ctx, OpCode op, int32_t arg);
 
-// 4. ECOSSISTEMA BSD UNIX (FreeBSD Nativo)
+// 4. BSD UNIX ECOSYSTEM (Native FreeBSD)
 void emit_freebsd_x86_64(MetalContext* ctx, OpCode op, int32_t arg);
 void emit_freebsd_arm64(MetalContext* ctx, OpCode op, int32_t arg);
 
-// 5. AMBIENTES EMBARCADOS E VIRTUAIS (Bare-Metal)
+// 5. EMBEDDED AND VIRTUAL ENVIRONMENTS (Bare-Metal)
 void emit_wasm_pure(MetalContext* ctx, OpCode op, int32_t arg);
 
-// Assinaturas de ciclo de vida do Orquestrador Central
+// Lifecycle signatures of the Central Orchestrator
 MetalContext* teko_metal_create(const char* output_asm_path, TekoTarget target);
 void teko_metal_emit_program(MetalContext* ctx, const unsigned char* bytecode, uint32_t size);
 void teko_metal_close(MetalContext* ctx);

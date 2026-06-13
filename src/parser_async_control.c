@@ -8,7 +8,7 @@ static void async_ctrl_advance(Parser* parser) {
     parser->peek_token = lexer_next_token(parser->lexer);
 }
 
-// Analisa os casos internos de um switch padrão/comum
+// Parses the internal cases of a standard/common switch
 static void parse_statement_switch_cases(Parser* parser, AsyncControlASTNode* switch_node) {
     int cap = 4;
     switch_node->data.statement_switch.cases = (SwitchCaseNode*)malloc(sizeof(SwitchCaseNode) * cap);
@@ -28,14 +28,14 @@ static void parse_statement_switch_cases(Parser* parser, AsyncControlASTNode* sw
         SwitchCaseNode* c_case = &switch_node->data.statement_switch.cases[switch_node->data.statement_switch.case_count];
         c_case->condition_pattern = strdup(parser->current_token.lexeme);
         c_case->case_body_raw = NULL;
-        async_ctrl_advance(parser); // Consome a condição/padrão (ex: null, ou _)
+        async_ctrl_advance(parser); // Consume the condition/pattern (e.g.: null, or _)
 
-        // Consome a seta condicional obrigatória '=>'
+        // Consume the mandatory conditional arrow '=>'
         if (parser->current_token.type == TOKEN_ARROW) {
             async_ctrl_advance(parser);
         }
 
-        // Captura o corpo associado ao caso do switch tradicional (pode terminar em ';' ou bloco '{}')
+        // Capture the body associated with the traditional switch case (can end with ';' or a '{}' block)
         int body_start = parser->lexer->cursor;
         if (parser->current_token.type == TOKEN_LBRACE) {
             async_ctrl_advance(parser);
@@ -61,7 +61,7 @@ static void parse_statement_switch_cases(Parser* parser, AsyncControlASTNode* sw
     }
 }
 
-// Analisa os braços internos do inline switch (Mantido do estágio anterior)
+// Parses the internal arms of an inline switch (carried over from prior stage)
 static void parse_switch_arms(Parser* parser, AsyncControlASTNode* switch_node) {
     int cap = 4;
     switch_node->data.inline_switch.arms = (SwitchArmNode*)malloc(sizeof(SwitchArmNode) * cap);
@@ -116,9 +116,9 @@ static void parse_switch_arms(Parser* parser, AsyncControlASTNode* switch_node) 
     }
 }
 
-// Ponto de entrada unificado para analisar expressões de controle assíncronas e desvios
+// Unified entry point to parse async control expressions and branches
 AsyncControlASTNode* parse_async_control_statement(Parser* parser) {
-    // NOVO BLOCO PREDITIVO: Se o comando iniciar de fato com 'switch', trata-se do switch comum de escopo
+    // NEW PREDICTIVE BLOCK: If the statement actually starts with 'switch', it is the scoped common switch
     if (parser->current_token.type == TOKEN_SWITCH) {
         AsyncControlASTNode* stmt_switch = (AsyncControlASTNode*)malloc(sizeof(AsyncControlASTNode));
         stmt_switch->type = NODE_STATEMENT_SWITCH;
@@ -126,12 +126,12 @@ AsyncControlASTNode* parse_async_control_statement(Parser* parser) {
         stmt_switch->data.statement_switch.cases = NULL;
         stmt_switch->data.statement_switch.case_count = 0;
 
-        async_ctrl_advance(parser); // Consome 'switch'
+        async_ctrl_advance(parser); // Consume 'switch'
 
-        // Isola e captura a expressão de controle contida entre parênteses (exs)
+        // Isolate and capture the control expression inside parentheses (exs)
         if (parser->current_token.type == TOKEN_LPAREN) {
             int expr_start = parser->lexer->cursor;
-            async_ctrl_advance(parser); // Consome '('
+            async_ctrl_advance(parser); // Consume '('
             while (parser->current_token.type != TOKEN_RPAREN && parser->current_token.type != TOKEN_EOF) {
                 async_ctrl_advance(parser);
             }
@@ -140,20 +140,20 @@ AsyncControlASTNode* parse_async_control_statement(Parser* parser) {
             strncpy(stmt_switch->data.statement_switch.control_expression_raw, &parser->lexer->source[expr_start], expr_len);
             stmt_switch->data.statement_switch.control_expression_raw[expr_len] = '\0';
 
-            if (parser->current_token.type == TOKEN_RPAREN) async_ctrl_advance(parser); // Consome ')'
+            if (parser->current_token.type == TOKEN_RPAREN) async_ctrl_advance(parser); // Consume ')'
         }
 
-        // Processa o corpo estruturado dos casos do switch padrão
+        // Process the structured body of standard switch cases
         if (parser->current_token.type == TOKEN_LBRACE) {
-            async_ctrl_advance(parser); // Consome '{'
+            async_ctrl_advance(parser); // Consume '{'
             parse_statement_switch_cases(parser, stmt_switch);
-            if (parser->current_token.type == TOKEN_RBRACE) async_ctrl_advance(parser); // Consome '}'
+            if (parser->current_token.type == TOKEN_RBRACE) async_ctrl_advance(parser); // Consume '}'
         }
 
         return stmt_switch;
     }
 
-    // --- SE NÃO FOR SWITCH INICIAL, SEGUE O FLUXO ORIGINAL DA EXPR 'WHEN' E 'INLINE SWITCH' ---
+    // --- IF NOT AN INITIAL SWITCH, FOLLOW THE ORIGINAL 'WHEN' EXPR AND 'INLINE SWITCH' FLOW ---
     AsyncControlASTNode* node = (AsyncControlASTNode*)malloc(sizeof(AsyncControlASTNode));
     node->type = NODE_WHEN_EXPR;
     node->data.when_expr.command_raw = NULL;
@@ -198,7 +198,7 @@ AsyncControlASTNode* parse_async_control_statement(Parser* parser) {
 
             async_ctrl_advance(parser);
 
-            if (parser->current_token.type == TOKEN_LBRACE) {
+                if (parser->current_token.type == TOKEN_LBRACE) {
                 async_ctrl_advance(parser);
                 parse_switch_arms(parser, switch_node);
                 if (parser->current_token.type == TOKEN_RBRACE) async_ctrl_advance(parser);
@@ -216,19 +216,19 @@ AsyncControlASTNode* parse_async_control_statement(Parser* parser) {
         raised_node->data.raised_catch.error_variable_name = NULL;
         raised_node->data.raised_catch.catch_body_raw = NULL;
 
-        async_ctrl_advance(parser); // Consome 'raised'
+        async_ctrl_advance(parser); // Consume 'raised'
 
         if (parser->current_token.type == TOKEN_LPAREN) {
-            async_ctrl_advance(parser); // Consome '('
+            async_ctrl_advance(parser); // Consume '('
             if (parser->current_token.type == TOKEN_IDENTIFIER) {
                 raised_node->data.raised_catch.error_variable_name = strdup(parser->current_token.lexeme);
                 async_ctrl_advance(parser);
             }
-            if (parser->current_token.type == TOKEN_RPAREN) async_ctrl_advance(parser); // Consome ')'
+            if (parser->current_token.type == TOKEN_RPAREN) async_ctrl_advance(parser); // Consume ')'
         }
 
         if (parser->current_token.type == TOKEN_LBRACE) {
-            async_ctrl_advance(parser); // Consome '{'
+            async_ctrl_advance(parser); // Consume '{'
             int body_start = parser->lexer->cursor;
             int depth = 1;
 
@@ -252,7 +252,7 @@ AsyncControlASTNode* parse_async_control_statement(Parser* parser) {
     return node;
 }
 
-// Liberação de memória atualizada contendo o descarte seguro do switch comum e validações de ponteiros nulos
+// Updated memory deallocation with safe disposal of the common switch and null pointer checks
 void free_async_control_ast_node(AsyncControlASTNode* node) {
     if (!node) return;
 

@@ -4,7 +4,7 @@
 #include "parser_statements.h"
 #include "parser_visibility.h"
 
-// --- DEFINIÇÃO DA ISA (OPCODES) DA LI TEKO ---
+// --- TEKO IL ISA (OPCODES) DEFINITION ---
 typedef enum {
     OP_PROLOG = 0xFE,
     OP_EPILOG = 0xFF,
@@ -19,30 +19,30 @@ typedef enum {
     OP_MUL = 0x07,
     OP_DIV = 0x08,
 
-    // Concorrência e Canais
+    // Concurrency and Channels
     OP_SPAWN_ASYNC = 0x10,
     OP_AWAIT_INTENT = 0x11,
     OP_CHAN_INIT = 0x12,
     OP_CHAN_PUT = 0x13,
 
-    // Fluxo e Desvios
+    // Control Flow and Branches
     OP_JMP = 0x20,
     OP_JMP_IF_FALSE = 0x21,
     OP_RETURN = 0x22,
 
-    // --- NOVO: GERENCIAMENTO DE ARENA BARE-METAL COMPATÍVEL ---
-    OP_ARENA_PUSH = 0x30, // Inicia região contígua no silício
-    OP_ARENA_POP = 0x31   // Limpeza em lote O(1) via hardware
+    // --- NEW: BARE-METAL COMPATIBLE ARENA MANAGEMENT ---
+    OP_ARENA_PUSH = 0x30, // Starts a contiguous region on silicon
+    OP_ARENA_POP = 0x31   // O(1) batch cleanup via hardware
 } OpCode;
 
-// Estrutura interna para a tabela de símbolos de strings constantes (Pool de Strings)
+// Internal structure for the constant string symbol table (String Pool)
 typedef struct {
     char** strings;
     int count;
     int capacity;
 } ConstantStringPool;
 
-// Estrutura que representa o Buffer final do bytecode binário em memória
+// Structure representing the final binary bytecode buffer in memory
 typedef struct {
     unsigned char* code;
     int size;
@@ -50,7 +50,7 @@ typedef struct {
     ConstantStringPool pool;
 } BytecodeBuffer;
 
-// Funções públicas do Emissor de Bytecode da LI
+// Public functions of the IL Bytecode Emitter
 BytecodeBuffer* codegen_li_create_context(void);
 void codegen_li_emit_statement(BytecodeBuffer* buffer, const StatementASTNode* stmt);
 int codegen_li_add_string_constant(BytecodeBuffer* buffer, const char* str);

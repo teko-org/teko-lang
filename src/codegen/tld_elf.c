@@ -4,7 +4,7 @@
 #include <stdlib.h>
 
 // ====================================================================
-// EMISSOR NATIVO PARA ARQUITETURAS DE 32 BITS (ELF32)
+// NATIVE EMITTER FOR 32-BIT ARCHITECTURES (ELF32)
 // ====================================================================
 bool tld_elf32_write_executable(const char* filename, const uint8_t* machine_code, uint32_t code_size, uint16_t architecture) {
     if (!filename || !machine_code || code_size == 0) return false;
@@ -15,32 +15,32 @@ bool tld_elf32_write_executable(const char* filename, const uint8_t* machine_cod
     TekoElf32_Ehdr ehdr;
     TekoElf32_Phdr phdr;
 
-    // 1. CONFIGURAÇÃO DO CABEÇALHO ELF32
+    // 1. ELF32 HEADER CONFIGURATION
     memset(&ehdr, 0, sizeof(TekoElf32_Ehdr));
     ehdr.e_ident[0] = ELF_MAGIC_0;
     ehdr.e_ident[1] = ELF_MAGIC_1;
     ehdr.e_ident[2] = ELF_MAGIC_2;
     ehdr.e_ident[3] = ELF_MAGIC_3;
-    ehdr.e_ident[4] = ELF_CLASS_32; // Identifica como classe de 32 bits
+    ehdr.e_ident[4] = ELF_CLASS_32; // Identifies as 32-bit class
     ehdr.e_ident[5] = ELF_DATA_2LSB;
     ehdr.e_ident[6] = ELF_VERSION_CUR;
     ehdr.e_ident[7] = ELF_OS_LINUX;
 
     ehdr.e_type      = ELF_TYPE_EXEC;
-    ehdr.e_machine   = architecture; // ELF_ARCH_386 ou ELF_ARCH_ARM32
+    ehdr.e_machine   = architecture; // ELF_ARCH_386 or ELF_ARCH_ARM32
     ehdr.e_version   = ELF_VERSION_CUR;
 
-    // Endereço virtual base de carregamento padrão para sistemas de 32 bits no Linux (VMA)
+    // Default base virtual load address for 32-bit Linux systems (VMA)
     uint32_t base_vaddr = 0x08048000;
 
-    ehdr.e_ehsize    = sizeof(TekoElf32_Ehdr); // 52 bytes físicos
-    ehdr.e_phentsize = sizeof(TekoElf32_Phdr); // 32 bytes físicos
+    ehdr.e_ehsize    = sizeof(TekoElf32_Ehdr); // 52 physical bytes
+    ehdr.e_phentsize = sizeof(TekoElf32_Phdr); // 32 physical bytes
     ehdr.e_phnum     = 1;
     ehdr.e_phoff     = ehdr.e_ehsize;
 
     ehdr.e_entry     = base_vaddr + ehdr.e_ehsize + (ehdr.e_phnum * ehdr.e_phentsize);
 
-    // Pool estático .rodata simplificado para paridade de recursos da linguagem
+    // Simplified static .rodata pool for language feature parity
     const char* mock_strings[] = { "Hello Teko", "32Bit_Core_Active" };
     uint32_t rodata_size = 0;
     for (int i = 0; i < 2; i++) rodata_size += strlen(mock_strings[i]) + 1;
@@ -54,22 +54,22 @@ bool tld_elf32_write_executable(const char* filename, const uint8_t* machine_cod
         }
     }
 
-    // 2. CONSTRUÇÃO DO PROGRAM HEADER (ELF32 layout)
+    // 2. PROGRAM HEADER CONSTRUCTION (ELF32 layout)
     memset(&phdr, 0, sizeof(TekoElf32_Phdr));
     phdr.p_type   = PT_LOAD;
     phdr.p_offset = 0;
     phdr.p_vaddr  = base_vaddr;
     phdr.p_paddr  = base_vaddr;
-    phdr.p_flags  = PF_R | PF_W | PF_X; // Permissões unificadas
+    phdr.p_flags  = PF_R | PF_W | PF_X; // Unified permissions
 
     uint32_t total_payload_size = code_size + rodata_size;
     uint32_t total_file_size = ehdr.e_ehsize + (ehdr.e_phnum * ehdr.e_phentsize) + total_payload_size;
 
     phdr.p_filesz = total_file_size;
     phdr.p_memsz  = total_file_size;
-    phdr.p_align  = 0x1000; // Alinhamento de página padrão de 4KB
+    phdr.p_align  = 0x1000; // Default 4KB page alignment
 
-    // 3. GRAVAÇÃO DOS BLOCOS ATÔMICOS DE 32 BITS
+    // 3. WRITING THE 32-BIT ATOMIC BLOCKS
     fwrite(&ehdr, 1, sizeof(TekoElf32_Ehdr), out);
     fwrite(&phdr, 1, sizeof(TekoElf32_Phdr), out);
     fwrite(machine_code, 1, code_size, out);
@@ -84,7 +84,7 @@ bool tld_elf32_write_executable(const char* filename, const uint8_t* machine_cod
 }
 
 // ====================================================================
-// EMISSOR NATIVO PARA ARQUITETURAS DE 64 BITS (ELF64)
+// NATIVE EMITTER FOR 64-BIT ARCHITECTURES (ELF64)
 // ====================================================================
 bool tld_elf64_write_executable(const char* filename, const uint8_t* machine_code, uint32_t code_size, uint16_t architecture) {
     if (!filename || !machine_code || code_size == 0) return false;
@@ -93,7 +93,7 @@ bool tld_elf64_write_executable(const char* filename, const uint8_t* machine_cod
     if (!out) return false;
 
     TekoElf64_Ehdr ehdr;
-    TekoElf64_Phdr phdr[2]; // Expandido para 2 Program Headers (1 para LOAD, 1 para NOTE do FreeBSD)
+    TekoElf64_Phdr phdr[2]; // Expanded to 2 Program Headers (1 for LOAD, 1 for FreeBSD NOTE)
 
     memset(&ehdr, 0, sizeof(TekoElf64_Ehdr));
     ehdr.e_ident[0] = ELF_MAGIC_0;
@@ -104,7 +104,7 @@ bool tld_elf64_write_executable(const char* filename, const uint8_t* machine_cod
     ehdr.e_ident[5] = ELF_DATA_2LSB;
     ehdr.e_ident[6] = ELF_VERSION_CUR;
 
-    // CASAMENTO UNIX/FREEBSD: Configura o campo de identificação de ABI nativa
+    // UNIX/FREEBSD MATCHING: Sets the native ABI identification field
     ehdr.e_ident[7] = ELF_OS_FREEBSD;
 
     ehdr.e_type      = ELF_TYPE_EXEC;
@@ -115,19 +115,19 @@ bool tld_elf64_write_executable(const char* filename, const uint8_t* machine_cod
 
     ehdr.e_ehsize    = sizeof(TekoElf64_Ehdr);
     ehdr.e_phentsize = sizeof(TekoElf64_Phdr);
-    ehdr.e_phnum     = 2; // Agora temos 2 Program Headers para carregar o binário UNIX de forma correta
+    ehdr.e_phnum     = 2; // We now have 2 Program Headers to load the UNIX binary correctly
     ehdr.e_phoff     = ehdr.e_ehsize;
 
     ehdr.e_entry     = base_vaddr + ehdr.e_ehsize + (ehdr.e_phnum * ehdr.e_phentsize);
 
-    // Estrutura física exata da nota ABI exigida pelo Kernel do FreeBSD (16 bytes estruturais + payload)
+    // Exact physical structure of the ABI note required by the FreeBSD Kernel (16 structural bytes + payload)
     uint32_t freebsd_note[] = {
-        4,             // Namesz: "FreeBSD" ocupará 4 bytes alinhados (com \0)
-        4,             // Descsz: Tamanho do valor da nota (4 bytes do inteiro de versão)
-        NT_FREEBSD_ABI_TAG, // Type: Identificador 1
-        0x45455246,    // Name: "FREE" em Little Endian
-        0x00445342,    // Name: "BSD\0" em Little Endian
-        1400000        // Desc: Versão estável do Kernel alvo (Ex: FreeBSD 14)
+        4,             // Namesz: "FreeBSD" will occupy 4 aligned bytes (with \0)
+        4,             // Descsz: Size of the note value (4 bytes of the version integer)
+        NT_FREEBSD_ABI_TAG, // Type: Identifier 1
+        0x45455246,    // Name: "FREE" in Little Endian
+        0x00445342,    // Name: "BSD\0" in Little Endian
+        1400000        // Desc: Target stable kernel version (e.g.: FreeBSD 14)
     };
     uint32_t note_size = sizeof(freebsd_note);
 
@@ -145,7 +145,7 @@ bool tld_elf64_write_executable(const char* filename, const uint8_t* machine_cod
         }
     }
 
-    // PROGRAM HEADER 1: O segmento PT_LOAD soberano (.text + .rodata + .note)
+    // PROGRAM HEADER 1: The sovereign PT_LOAD segment (.text + .rodata + .note)
     memset(&phdr[0], 0, sizeof(TekoElf64_Phdr));
     phdr[0].p_type   = PT_LOAD;
     phdr[0].p_flags  = PF_R | PF_W | PF_X;
@@ -160,10 +160,10 @@ bool tld_elf64_write_executable(const char* filename, const uint8_t* machine_cod
     phdr[0].p_memsz  = total_file_size;
     phdr[0].p_align  = 0x1000;
 
-    // PROGRAM HEADER 2: O segmento PT_NOTE (Diz expressamente ao Kernel UNIX que o binário é do FreeBSD)
+    // PROGRAM HEADER 2: The PT_NOTE segment (Explicitly tells the UNIX Kernel that the binary is FreeBSD)
     memset(&phdr[1], 0, sizeof(TekoElf64_Phdr));
     phdr[1].p_type   = 4; // PT_NOTE
-    phdr[1].p_flags  = PF_R; // Apenas leitura
+    phdr[1].p_flags  = PF_R; // Read-only
     phdr[1].p_offset = ehdr.e_ehsize + (ehdr.e_phnum * ehdr.e_phentsize) + code_size + rodata_size;
     phdr[1].p_vaddr  = base_vaddr + phdr[1].p_offset;
     phdr[1].p_paddr  = phdr[1].p_vaddr;
@@ -171,7 +171,7 @@ bool tld_elf64_write_executable(const char* filename, const uint8_t* machine_cod
     phdr[1].p_memsz  = note_size;
     phdr[1].p_align  = 4;
 
-    // ESCRITA ATÔMICA
+    // ATOMIC WRITE
     fwrite(&ehdr, 1, sizeof(TekoElf64_Ehdr), out);
     fwrite(&phdr, 1, sizeof(TekoElf64_Phdr) * 2, out);
     fwrite(machine_code, 1, code_size, out);

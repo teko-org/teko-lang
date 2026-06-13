@@ -4,23 +4,23 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#define TEKO_ARENA_PAGE_SIZE 4096 // Tamanho base de 4KB por página da Arena
+#define TEKO_ARENA_PAGE_SIZE 4096 // Base size of 4KB per Arena page
 
-// Estrutura de uma página/bloco contíguo da Arena
+// Structure of a contiguous Arena page/block
 typedef struct TekoArenaPage {
     unsigned char* memory;
     size_t capacity;
     size_t offset;
-    struct TekoArenaPage* next; // Encadeamento para o caso de estouro de capacidade
+    struct TekoArenaPage* next; // Linked list for overflow cases
 } TekoArenaPage;
 
-// Estrutura do gerenciador da Arena (Atende ao ctx: arena da linguagem)
+// Structure of the Arena manager (serves as the language-level arena context)
 typedef struct {
     TekoArenaPage* head;
     TekoArenaPage* current;
 } TekoArena;
 
-// Assinaturas públicas do Alocador por Região
+// Public signatures of the Region Allocator
 TekoArena* teko_arena_create(void);
 void* teko_arena_alloc(TekoArena* arena, size_t size);
 void teko_arena_reset(TekoArena* arena);

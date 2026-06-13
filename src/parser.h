@@ -3,24 +3,24 @@
 
 #include "lexer.h"
 
-// Tipo do nó da AST
+// AST node type
 typedef enum {
     NODE_PROGRAM,
     NODE_USE_STMT,
-    /* Adicione novos nós aqui conforme expandir o parser */
+    /* Add new nodes here as the parser expands */
 } ASTNodeType;
 
-// Estrutura genérica para nós da AST
+// Generic structure for AST nodes
 typedef struct ASTNode {
     ASTNodeType type;
     union {
-        // Dados para o nó 'use' (ex: use my::namespace; ou use dep from "str")
+        // Data for the 'use' node (e.g. use my::namespace; or use dep from "str")
         struct {
             char* path;
-            char* from_source; // Preenchido se houver 'from "..."'
+            char* from_source; // Populated when 'from "..."' is present
         } use_stmt;
 
-        // Bloco de programa contendo múltiplos nós filhos
+        // Program block containing multiple child nodes
         struct {
             struct ASTNode** children;
             int child_count;
@@ -28,7 +28,7 @@ typedef struct ASTNode {
     } data;
 } ASTNode;
 
-// Estado do Parser
+// Parser state
 typedef struct {
     Lexer* lexer;
     Token current_token;
@@ -36,7 +36,7 @@ typedef struct {
     bool is_stdlib_compilation;
 } Parser;
 
-// Funções públicas do Parser
+// Public parser functions
 void parser_init(Parser* parser, Lexer* lexer);
 ASTNode* parser_parse_program(Parser* parser);
 ASTNode* parse_use_statement(Parser* parser);

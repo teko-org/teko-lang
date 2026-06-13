@@ -20,14 +20,14 @@ StructValidationResult validate_required_properties(const MessageProperty* defin
                 }
             }
 
-            // Se um campo obrigatório foi esquecido na inicialização, dispara erro semântico
+            // If a required field was omitted during initialization, raise a semantic error
             if (!found) {
                 result.error_type = STRUCT_ERR_MISSING_REQUIRED;
                 int msg_len = 128 + (int)strlen(defined_props[i].prop_name);
                 result.error_message = (char*)malloc(msg_len);
                 if (result.error_message) {
                     snprintf(result.error_message, msg_len,
-                             "[Erro Semântico]: Inicialização inválida. A propriedade obrigatória (required) '%s' não foi definida.",
+                             "[Semantic Error]: Invalid initialization. The required property '%s' was not defined.",
                              defined_props[i].prop_name);
                 }
                 fprintf(stderr, "%s\n", result.error_message);

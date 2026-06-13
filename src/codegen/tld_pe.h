@@ -13,7 +13,7 @@
 
 #define PE_CHAR_EXECUTABLE   0x0002     // Executable Image
 #define PE_CHAR_32BIT_MACH   0x0100     // 32-bit word machine
-#define PE_CHAR_DLL          0x2000     // NOVO: Flag indicando que a imagem é uma DLL (.dll) [INDEX]
+#define PE_CHAR_DLL          0x2000     // NEW: Flag indicating the image is a DLL (.dll) [INDEX]
 
 #define PE_MAGIC_PE32        0x010B     // PE32 (32-bit)
 #define PE_MAGIC_PE32_PLUS   0x020B     // PE32+ (64-bit)
@@ -137,7 +137,7 @@ typedef struct {
 
 #pragma pack(pop)
 
-// Assinatura pública polimórfica atualizada do Linker do Windows
+// Updated polymorphic public signature of the Windows Linker
 bool tld_pe_write_executable(const char* filename, const uint8_t* machine_code, uint32_t code_size, uint16_t machine_type, bool is_shared);
 
 #endif // TLD_PE_H

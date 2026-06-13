@@ -4,34 +4,34 @@
 #include "parser.h"
 #include "parser_types.h"
 
-// Nós específicos para extensões e operadores inline na AST
+// Specific nodes for extensions and inline operators in the AST
 typedef enum {
     NODE_TYPE_EXTENSION = 700,
     NODE_EXTENSION_METHOD,
     NODE_EXTENSION_OPERATOR
 } ExtensionASTNodeType;
 
-// Estrutura para descrever um método ou operador dentro do extend
+// Structure describing a method or operator inside an extend block
 typedef struct ExtensionMemberNode {
-    int type;                // NODE_EXTENSION_METHOD ou NODE_EXTENSION_OPERATOR
-    char* name;              // Nome do método ou o símbolo do operador (ex: "+")
-    TypeInfo* return_type;   // Tipo de retorno
-    char* param_name;        // Nome do parâmetro (para operadores)
-    TypeInfo* param_type;    // Tipo do parâmetro (para operadores)
-    bool is_inline;          // true se definido com '=>'
-    char* body_raw;          // Conteúdo do corpo ou expressão inline para o gerador de código
+    int type;                // NODE_EXTENSION_METHOD or NODE_EXTENSION_OPERATOR
+    char* name;              // Method name or operator symbol (e.g.: "+")
+    TypeInfo* return_type;   // Return type
+    char* param_name;        // Parameter name (for operators)
+    TypeInfo* param_type;    // Parameter type (for operators)
+    bool is_inline;          // true if defined with '=>'
+    char* body_raw;          // Body content or inline expression for the code generator
 } ExtensionMemberNode;
 
-// Nó principal do bloco extend na AST
+// Main AST node for the extend block
 typedef struct ExtensionASTNode {
     int type;                // NODE_TYPE_EXTENSION
-    char* self_param_name;   // Ex: "self"
-    TypeInfo* self_type;     // O tipo que está sendo estendido (ex: "string" ou "str")
+    char* self_param_name;   // E.g.: "self"
+    TypeInfo* self_type;     // The type being extended (e.g.: "string" or "str")
     ExtensionMemberNode* members;
     int member_count;
 } ExtensionASTNode;
 
-// Assinaturas públicas do Parser de Extensões
+// Public signatures for the Extensions parser
 ExtensionASTNode* parse_type_extension(Parser* parser);
 void free_extension_ast_node(ExtensionASTNode* node);
 

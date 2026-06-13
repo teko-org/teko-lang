@@ -8,7 +8,7 @@ static void ext_advance(Parser* parser) {
     parser->peek_token = lexer_next_token(parser->lexer);
 }
 
-// Analisa os membros internos do bloco extend (métodos e operadores inline)
+// Parses the inner members of the extend block (methods and inline operators)
 static void parse_extension_members(Parser* parser, ExtensionASTNode* ext_node) {
     int cap = 4;
     ext_node->members = (ExtensionMemberNode*)malloc(sizeof(ExtensionMemberNode) * cap);
@@ -28,36 +28,36 @@ static void parse_extension_members(Parser* parser, ExtensionASTNode* ext_node) 
         member->is_inline = false;
         member->body_raw = NULL;
 
-        // Caso 1: Sobrecarga de Operador -> operator +(string: str) : str => ...
+        // Case 1: Operator overload -> operator +(string: str) : str => ...
         if (parser->current_token.type == TOKEN_OPERATOR) {
             member->type = NODE_EXTENSION_OPERATOR;
-            ext_advance(parser); // Consome 'operator'
+            ext_advance(parser); // Consume 'operator'
 
-            // Captura o lexema do operador (ex: "+", "-", etc.)
+            // Capture the operator lexeme (e.g.: "+", "-", etc.)
             member->name = strdup(parser->current_token.lexeme);
             ext_advance(parser);
 
-            // Processa o parâmetro único do operador
+            // Process the operator's single parameter
             if (parser->current_token.type == TOKEN_LPAREN) {
-                ext_advance(parser); // Consome '('
+                ext_advance(parser); // Consume '('
                 if (parser->current_token.type == TOKEN_IDENTIFIER) {
                     member->param_name = strdup(parser->current_token.lexeme);
                     ext_advance(parser);
                 }
                 if (parser->current_token.type == TOKEN_COLON) {
-                    ext_advance(parser); // Consome ':'
+                    ext_advance(parser); // Consume ':'
                     member->param_type = parse_complete_type_info(parser);
                 }
-                if (parser->current_token.type == TOKEN_RPAREN) ext_advance(parser); // Consome ')'
+                if (parser->current_token.type == TOKEN_RPAREN) ext_advance(parser); // Consume ')'
             }
         }
-        // Caso 2: Método de Extensão Normal -> append_line(string: str) : str { ... }
+        // Case 2: Normal extension method -> append_line(string: str) : str { ... }
         else if (parser->current_token.type == TOKEN_IDENTIFIER) {
             member->type = NODE_EXTENSION_METHOD;
             member->name = strdup(parser->current_token.lexeme);
-            ext_advance(parser); // Consome o nome do método
+            ext_advance(parser); // Consume the method name
 
-            // Pula os parâmetros do método de forma genérica para focar na estrutura
+            // Skip method parameters generically to focus on the structure
             if (parser->current_token.type == TOKEN_LPAREN) {
                 ext_advance(parser);
                 while (parser->current_token.type != TOKEN_RPAREN && parser->current_token.type != TOKEN_EOF) {
@@ -70,18 +70,18 @@ static void parse_extension_members(Parser* parser, ExtensionASTNode* ext_node) 
             continue;
         }
 
-        // Captura o tipo de retorno comum a ambos: ': str'
+        // Capture the return type common to both: ': str'
         if (parser->current_token.type == TOKEN_COLON) {
-            ext_advance(parser); // Consome ':'
+            ext_advance(parser); // Consume ':'
             member->return_type = parse_complete_type_info(parser);
         }
 
-        // Determina se o corpo é Inline (=>) ou Bloco ({})
+        // Determine whether the body is inline (=>) or a block ({})
         if (parser->current_token.type == TOKEN_ARROW) {
             member->is_inline = true;
-            ext_advance(parser); // Consome '=>'
+            ext_advance(parser); // Consume '=>'
 
-            // Captura tudo até o ponto e vírgula como expressão literal
+            // Capture everything up to the semicolon as a literal expression
             int expr_start = parser->lexer->cursor;
             while (parser->current_token.type != TOKEN_SEMICOLON && parser->current_token.type != TOKEN_EOF) {
                 ext_advance(parser);
@@ -95,9 +95,9 @@ static void parse_extension_members(Parser* parser, ExtensionASTNode* ext_node) 
         }
         else if (parser->current_token.type == TOKEN_LBRACE) {
             member->is_inline = false;
-            ext_advance(parser); // Consome '{'
+            ext_advance(parser); // Consume '{'
 
-            // Captura o bloco respeitando o aninhamento de chaves
+            // Capture the block respecting brace nesting
             int block_start = parser->lexer->cursor;
             int depth = 1;
             while (depth > 0 && parser->current_token.type != TOKEN_EOF) {
@@ -105,7 +105,7 @@ static void parse_extension_members(Parser* parser, ExtensionASTNode* ext_node) 
                 if (parser->current_token.type == TOKEN_RBRACE) depth--;
                 ext_advance(parser);
             }
-            int block_len = (parser->lexer->cursor - block_start) - 1; // ignora a chave de fechamento
+            int block_len = (parser->lexer->cursor - block_start) - 1; // ignore the closing brace
             member->body_raw = (char*)malloc(block_len + 1);
             strncpy(member->body_raw, &parser->lexer->source[block_start], block_len);
             member->body_raw[block_len] = '\0';
@@ -115,9 +115,9 @@ static void parse_extension_members(Parser* parser, ExtensionASTNode* ext_node) 
     }
 }
 
-// Ponto de entrada: extend(self: string) { ... }
+// Entry point: extend(self: string) { ... }
 ExtensionASTNode* parse_type_extension(Parser* parser) {
-    ext_advance(parser); // Consome 'extend'
+    ext_advance(parser); // Consume 'extend'
 
     ExtensionASTNode* node = (ExtensionASTNode*)malloc(sizeof(ExtensionASTNode));
     node->type = NODE_TYPE_EXTENSION;
@@ -126,31 +126,31 @@ ExtensionASTNode* parse_type_extension(Parser* parser) {
     node->members = NULL;
     node->member_count = 0;
 
-    // Processa a assinatura de amarração do receptor: (self: string)
+    // Process the receiver binding signature: (self: string)
     if (parser->current_token.type == TOKEN_LPAREN) {
-        ext_advance(parser); // Consome '('
+        ext_advance(parser); // Consume '('
         if (parser->current_token.type == TOKEN_IDENTIFIER) {
             node->self_param_name = strdup(parser->current_token.lexeme);
-            ext_advance(parser); // Consome 'self'
+            ext_advance(parser); // Consume 'self'
         }
         if (parser->current_token.type == TOKEN_COLON) {
-            ext_advance(parser); // Consome ':'
-            node->self_type = parse_complete_type_info(parser); // Identifica "string"
+            ext_advance(parser); // Consume ':'
+            node->self_type = parse_complete_type_info(parser); // Identifies "string"
         }
-        if (parser->current_token.type == TOKEN_RPAREN) ext_advance(parser); // Consome ')'
+        if (parser->current_token.type == TOKEN_RPAREN) ext_advance(parser); // Consume ')'
     }
 
-    // Processa o corpo contendo as definições das extensões
+    // Process the body containing the extension definitions
     if (parser->current_token.type == TOKEN_LBRACE) {
-        ext_advance(parser); // Consome '{'
+        ext_advance(parser); // Consume '{'
         parse_extension_members(parser, node);
-        if (parser->current_token.type == TOKEN_RBRACE) ext_advance(parser); // Consome '}'
+        if (parser->current_token.type == TOKEN_RBRACE) ext_advance(parser); // Consume '}'
     }
 
     return node;
 }
 
-// Liberação de memória recursiva e segura
+// Safe recursive memory deallocation
 void free_extension_ast_node(ExtensionASTNode* node) {
     if (!node) return;
     if (node->self_param_name) free(node->self_param_name);

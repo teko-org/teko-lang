@@ -4,7 +4,7 @@
 #include "vm_core.h"
 #include <stdint.h>
 
-// Identificadores internos exclusivos para cada biblioteca @ nativa
+// Unique internal identifiers for each native @ library
 typedef enum {
     INTRINSIC_MARSHALL_TO_PTR = 1,
     INTRINSIC_MARSHALL_FROM_PTR,
@@ -15,7 +15,7 @@ typedef enum {
     INTRINSIC_UNKNOWN = 0
 } TekoIntrinsicKind;
 
-// Assinaturas públicas do subsistema de Intrinsics
+// Public signatures of the Intrinsics subsystem
 TekoIntrinsicKind vm_intrinsic_resolve(const char* qualified_name);
 int32_t vm_intrinsic_execute(TekoIntrinsicKind kind, TekoVM* vm, int32_t* args, int arg_count);
 

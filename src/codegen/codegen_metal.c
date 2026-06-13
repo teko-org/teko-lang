@@ -79,7 +79,7 @@ static void process_linear_il_bytes(MetalContext* ctx, const unsigned char* byte
     if (!local_il) return;
     memcpy(local_il, bytecode, size);
 
-    // PASSO 1: CONSTANT FOLDING (Pre-processador de colapso estático)
+    // STEP 1: CONSTANT FOLDING (Static collapse preprocessor)
     uint32_t scan = 0;
     while (scan < size) {
         OpCode op = (OpCode)local_il[scan];
@@ -109,8 +109,8 @@ static void process_linear_il_bytes(MetalContext* ctx, const unsigned char* byte
                         local_il[scan + 3] = (res >> 16) & 0xFF;
                         local_il[scan + 4] = (res >> 24) & 0xFF;
 
-                        // CORREÇÃO MESTRE: Preenche as posições colapsadas com 0xCC (Marcador Neutro)
-                        // Isso protege o byte 0x00 do legítimo OP_HALT!
+                        // MASTER FIX: Fills collapsed positions with 0xCC (Neutral Marker)
+                        // This protects the 0x00 byte of the legitimate OP_HALT!
                         memset(&local_il[scan + 5], 0xCC, 6);
                     }
                 }
@@ -121,14 +121,14 @@ static void process_linear_il_bytes(MetalContext* ctx, const unsigned char* byte
         else scan += 1;
     }
 
-    // PASSO 2: FILTRO EMISSOR COOPERATIVO (DCE + CSE)
+    // STEP 2: COOPERATIVE EMITTER FILTER (DCE + CSE)
     while (i < size) {
         uint32_t current_op_index = i;
         OpCode op = (OpCode)local_il[i++];
         int32_t arg = 0;
         bool skip_by_cse = false;
 
-        // Ignora RIGOROSAMENTE apenas os bytes marcados pelo Constant Folding (0xCC)
+        // STRICTLY ignores only the bytes marked by constant folding (0xCC)
         if (op == 0xCC) {
             continue;
         }

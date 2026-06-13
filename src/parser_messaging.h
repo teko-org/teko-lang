@@ -3,9 +3,9 @@
 
 #include "parser.h"
 #include "parser_types.h"
-#include "parser_di.h" // Inclusão obrigatória para herdar DILifetime e HandlerDependency
+#include "parser_di.h" // Mandatory include to inherit DILifetime and HandlerDependency
 
-// Nós específicos para Mensageria e CQRS na AST
+// Specific nodes for Messaging and CQRS in the AST
 typedef enum {
     NODE_MSG_COMMAND = 400,
     NODE_MSG_QUERY,
@@ -14,7 +14,7 @@ typedef enum {
     NODE_STRUCT_PROP
 } MessagingASTNodeType;
 
-// Estrutura para propriedades de comandos, queries e notificações
+// Structure for properties of commands, queries, and notifications
 typedef struct MessageProperty {
     char* prop_name;
     TypeInfo* prop_type;
@@ -22,36 +22,36 @@ typedef struct MessageProperty {
     bool is_mutable;
 } MessageProperty;
 
-// Nó principal da AST para Mensageria e CQRS integrado com o gerenciamento de DI por Arena
+// Main AST node for Messaging and CQRS integrated with arena-based DI management
 typedef struct MessagingASTNode {
     int type;
     char* name;
     union {
-        // Dados para command e notification
+        // Data for command and notification
         struct {
             MessageProperty* properties;
             int property_count;
         } msg_struct;
 
-        // Dados para query (possui tipo de retorno associado)
+        // Data for query (has an associated return type)
         struct {
             MessageProperty* properties;
             int property_count;
             TypeInfo* return_intent_type;
         } query_struct;
 
-        // Dados para: handler for Name { ... } com escopos de alocação de dependências
+        // Data for: handler for Name { ... } with dependency allocation scopes
         struct {
             bool is_async_handler;
             char* handle_param_name;
             TypeInfo* handle_return_type;
-            HandlerDependency* dependencies; // Herdado do parser_di.h para linkar as Arenas
+            HandlerDependency* dependencies; // Inherited from parser_di.h to link arenas
             int dependency_count;
         } msg_handler;
     } data;
 } MessagingASTNode;
 
-// Assinaturas públicas do Parser de Mensageria
+// Public signatures for the Messaging parser
 MessagingASTNode* parse_messaging_structure(Parser* parser);
 MessagingASTNode* parse_messaging_handler(Parser* parser);
 void free_messaging_ast_node(MessagingASTNode* node);

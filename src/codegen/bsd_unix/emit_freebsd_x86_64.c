@@ -18,7 +18,7 @@ void emit_freebsd_x86_64(MetalContext* ctx, OpCode op, int32_t arg) {
             break;
 
         case OP_HALT:
-            fprintf(ctx->file, "    ;; [FreeBSD Halt]: sys_exit nativo via interrupcao BSD\n");
+            fprintf(ctx->file, "    ;; [FreeBSD Halt]: native sys_exit via BSD interrupt\n");
             fprintf(ctx->file, "    movq $1, %%rax\n");
             fprintf(ctx->file, "    movq $0, %%rdi\n");
             fprintf(ctx->file, "    int $0x80\n");
@@ -109,7 +109,7 @@ void emit_freebsd_x86_64(MetalContext* ctx, OpCode op, int32_t arg) {
             break;
 
         default:
-            // RESSURREIÇÃO DCE: Garante a geração do rótulo quando o byte for uma instrução lógica
+            // DCE RESURRECTION: Ensures label generation when the byte is a logical instruction
             if ((int)op >= 100) {
                 fprintf(ctx->file, ".L_bsd_label_%d:\n", (int)op);
             }

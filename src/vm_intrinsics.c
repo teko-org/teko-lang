@@ -4,7 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-// Resolve a string textual de namespace para um ID estável de intrinsic
+// Resolves the textual namespace string to a stable intrinsic ID
 TekoIntrinsicKind vm_intrinsic_resolve(const char* qualified_name) {
     if (!qualified_name) return INTRINSIC_UNKNOWN;
 
@@ -18,33 +18,33 @@ TekoIntrinsicKind vm_intrinsic_resolve(const char* qualified_name) {
     return INTRINSIC_UNKNOWN;
 }
 
-// Executa em C puro de altíssima velocidade as funções do framework nativo @
+// Executes the native @ framework functions in pure C at maximum speed
 int32_t vm_intrinsic_execute(TekoIntrinsicKind kind, TekoVM* vm, int32_t* args, int arg_count) {
     if (!vm) return -1;
 
     switch (kind) {
         case INTRINSIC_MARSHALL_TO_PTR: {
-            // @marshall.to_ptr(val) -> Converte o registrador inteiro em um endereço físico
+            // @marshall.to_ptr(val) -> Converts the integer register into a physical address
             if (arg_count < 1) return 0;
             uintptr_t ptr = (uintptr_t)&args[0];
             return (int32_t)ptr;
         }
 
         case INTRINSIC_STRINGS_CONCAT: {
-            // @strings.concat(s1, s2) -> Junta strings alocando diretamente na Arena da VM
-            // (Para fins de teste de infraestrutura, simulamos o resultado da concatenação)
-            printf("[Intrinsic @strings.concat]: Strings concatenadas com sucesso.\n");
+            // @strings.concat(s1, s2) -> Joins strings by allocating directly in the VM Arena
+            // (For infrastructure testing purposes, we simulate the concatenation result)
+            printf("[Intrinsic @strings.concat]: Strings concatenated successfully.\n");
             return 0;
         }
 
         case INTRINSIC_FLOWS_NOTIFY: {
-            // @flows.notify(data) -> Despacha o evento CQRS acionando o Handler injetado
-            printf("[Intrinsic @flows.notify]: Evento CQRS disparado para processamento assincrono.\n");
-            return 1; // Retorna status de sucesso
+            // @flows.notify(data) -> Dispatches the CQRS event triggering the injected Handler
+            printf("[Intrinsic @flows.notify]: CQRS event dispatched for asynchronous processing.\n");
+            return 1; // Returns success status
         }
 
         default:
-            fprintf(stderr, "[Erro de Runtime]: Chamada para Intrinsic inválida ou não implementada.\n");
+            fprintf(stderr, "[Runtime Error]: Call to invalid or unimplemented Intrinsic.\n");
             return -1;
     }
 }

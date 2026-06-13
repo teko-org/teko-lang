@@ -17,7 +17,7 @@ void emit_darwin_x86_64(MetalContext* ctx, OpCode op, int32_t arg) {
             break;
 
         case OP_HALT:
-            fprintf(ctx->file, "    ;; [AOT Halt]: Encerra o fluxo no Mac Intel.\n");
+            fprintf(ctx->file, "    ;; [AOT Halt]: Terminates flow on Mac Intel.\n");
             break;
 
         case OP_ICONST:

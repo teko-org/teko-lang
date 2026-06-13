@@ -4,7 +4,7 @@ project(teko C)
 set(CMAKE_C_STANDARD 23)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
-# --- Gerenciador de Dependências Nativo (Unity) ---
+# --- Native Dependency Manager (Unity) ---
 include(FetchContent)
 FetchContent_Declare(
         unity
@@ -13,23 +13,24 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(unity)
 
-# 1. Coleta TODOS os arquivos .c e .h de src e de QUALQUER subpasta (como src/codegen)
+# 1. Collect ALL .c and .h files from src and from ANY subfolder (such as src/codegen)
 file(GLOB_RECURSE CORE_SOURCES "src/*.c" "src/*.h")
 
-# Remove rigidamente o ponto de entrada principal para virar biblioteca estática core
+# Strictly remove the main entry point so it becomes the core static library
 list(REMOVE_ITEM CORE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/main.c")
 
-# Cria a biblioteca estática interna com todo o motor do seu compilador
+# Create the internal static library with the entire compiler engine
 add_library(teko_core STATIC ${CORE_SOURCES})
 
-# Garante a visibilidade de includes em subdiretórios relativos
+# Ensure visibility of includes in relative subdirectories
 target_include_directories(teko_core PRIVATE src)
 
-# 2. ALVO 1: O Compilador Oficial (Ponto de Entrada de Produção)
+# 2. TARGET 1: The Official Compiler (Production Entry Point)
 add_executable(teko src/main.c)
 target_link_libraries(teko PRIVATE teko_core)
+target_include_directories(teko PRIVATE src)
 
-# 3. ALVO 2: A Suite de Testes Isolada (Ponto de Entrada de Testes)
+# 3. TARGET 2: The Isolated Test Suite (Test Entry Point)
 file(GLOB_RECURSE TEST_SOURCES "tests/*.c" "tests/*.h")
 add_executable(teko_tests ${TEST_SOURCES})
 target_link_libraries(teko_tests PRIVATE teko_core unity)

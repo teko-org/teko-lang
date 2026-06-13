@@ -5,7 +5,7 @@
 
 #define HASH_TABLE_INITIAL_SIZE 31
 
-// Algoritmo clássico de hash djb2 para mapeamento rápido de identificadores strings
+// Classic djb2 hash algorithm for fast string identifier mapping
 static unsigned long hash_string(const char* str) {
     unsigned long hash = 5381;
     int c;
@@ -29,9 +29,9 @@ SymbolTableScope* symbol_table_create_scope(SymbolTableScope* parent) {
 bool symbol_table_insert(SymbolTableScope* scope, const char* name, SymbolKind kind, TypeInfo* type, bool is_mutable) {
     if (!scope || !name) return false;
 
-    // Impede redeclaração direta no mesmo nível de escopo local
+    // Prevents direct redeclaration at the same local scope level
     if (symbol_table_lookup_current_scope(scope, name) != NULL) {
-        fprintf(stderr, "[Erro Semântico]: Símbolo '%s' já foi declarado neste escopo.\n", name);
+        fprintf(stderr, "[Semantic Error]: Symbol '%s' has already been declared in this scope.\n", name);
         return false;
     }
 
@@ -41,28 +41,28 @@ bool symbol_table_insert(SymbolTableScope* scope, const char* name, SymbolKind k
 
     symbol->name = strdup(name);
     symbol->kind = kind;
-    symbol->type_info = type; // Vincula os metadados do tipo
+    symbol->type_info = type; // Binds the type metadata
     symbol->is_mutable = is_mutable;
 
-    // Insere no topo do bucket correspondente (Chaining à esquerda)
+    // Insert at the top of the corresponding bucket (left-chaining)
     symbol->next = scope->buckets[index];
     scope->buckets[index] = symbol;
 
     return true;
 }
 
-// Busca recursiva subindo na hierarquia de escopos aninhados (Escopo de Bloco -> Função -> Global)
+// Recursive lookup ascending the nested scope hierarchy (Block Scope -> Function -> Global)
 Symbol* symbol_table_lookup(SymbolTableScope* scope, const char* name) {
     SymbolTableScope* current = scope;
     while (current != NULL) {
         Symbol* sym = symbol_table_lookup_current_scope(current, name);
         if (sym != NULL) return sym;
-        current = current->parent_scope; // Sobe um nível
+        current = current->parent_scope; // Move up one level
     }
     return NULL;
 }
 
-// Busca estrita restrita unicamente ao escopo local corrente
+// Strict lookup restricted solely to the current local scope
 Symbol* symbol_table_lookup_current_scope(SymbolTableScope* scope, const char* name) {
     if (!scope || !name) return NULL;
 
@@ -87,7 +87,7 @@ void symbol_table_free_scope(SymbolTableScope* scope) {
             Symbol* temp = current;
             current = current->next;
             free(temp->name);
-            // Nota: type_info não é desalocado aqui pois pertence à AST central
+            // Note: type_info is not freed here as it belongs to the central AST
             free(temp);
         }
     }

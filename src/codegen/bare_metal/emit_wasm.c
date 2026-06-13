@@ -6,7 +6,7 @@ void emit_wasm_pure(MetalContext* ctx, OpCode op, int32_t arg) {
 
     switch (op) {
         // ====================================================================
-        // 1. INICIALIZAÇÃO DO MÓDULO VIRTUAL E ESCOPO DA FUNÇÃO (WAT FORMAT)
+        // 1. VIRTUAL MODULE INITIALIZATION AND FUNCTION SCOPE (WAT FORMAT)
         // ====================================================================
         case OP_PROLOG:
             fprintf(ctx->file, "(module\n");
@@ -18,10 +18,10 @@ void emit_wasm_pure(MetalContext* ctx, OpCode op, int32_t arg) {
             break;
 
         // ====================================================================
-        // 2. OPCODES DE LITERAIS, MEMÓRIA E CONVERSÃO
+        // 2. LITERAL, MEMORY AND CONVERSION OPCODES
         // ====================================================================
         case OP_HALT:
-            fprintf(ctx->file, "    ;; [WASM Halt]: Interrompe a execucao empilhando o acumulador\n");
+            fprintf(ctx->file, "    ;; [WASM Halt]: Stops execution by pushing the accumulator\n");
             fprintf(ctx->file, "    local.get $w0\n");
             break;
 
@@ -30,7 +30,7 @@ void emit_wasm_pure(MetalContext* ctx, OpCode op, int32_t arg) {
             break;
 
         case OP_SCONST:
-            fprintf(ctx->file, "    i32.const %d ;; Offset do Constant Pool na Memoria Linear\n", arg * 32);
+            fprintf(ctx->file, "    i32.const %d ;; Offset of Constant Pool in Linear Memory\n", arg * 32);
             break;
 
         case OP_STORE:
@@ -42,7 +42,7 @@ void emit_wasm_pure(MetalContext* ctx, OpCode op, int32_t arg) {
             break;
 
         // ====================================================================
-        // 3. OPERAÇÕES MATEMÁTICAS NA PILHA VIRTUAL
+        // 3. MATHEMATICAL OPERATIONS ON THE VIRTUAL STACK
         // ====================================================================
         case OP_ADD:
             fprintf(ctx->file, "    local.get $w0\n    local.get $w1\n    i32.add\n    local.set $w0\n");
@@ -68,25 +68,25 @@ void emit_wasm_pure(MetalContext* ctx, OpCode op, int32_t arg) {
             break;
 
         // ====================================================================
-        // 4. ALOCADOR DE ARENA NATIVO (MÉTODO O(1))
+        // 4. NATIVE ARENA ALLOCATOR (O(1) METHOD)
         // ====================================================================
         case OP_ARENA_PUSH:
-            fprintf(ctx->file, "    ;; --- [WASM Arena Push]: Isolamento de frame de 1024 bytes ---\n");
+            fprintf(ctx->file, "    ;; --- [WASM Arena Push]: Frame isolation of 1024 bytes ---\n");
             break;
 
         case OP_ARENA_POP:
-            fprintf(ctx->file, "    ;; --- [WASM Arena Pop]: Limpeza instantanea de bloco ---\n");
+            fprintf(ctx->file, "    ;; --- [WASM Arena Pop]: Instantaneous block cleanup ---\n");
             break;
 
         // ====================================================================
-        // 5. PARALELISMO WEB VIRTUAL (WASM THREADS EXTENSION)
+        // 5. VIRTUAL WEB PARALLELISM (WASM THREADS EXTENSION)
         // ====================================================================
         case OP_SPAWN_ASYNC:
             fprintf(ctx->file, "    ;; --- [WASM Async Worker Spawn] ---\n");
             break;
 
         case OP_CHAN_INIT:
-            fprintf(ctx->file, "    ;; --- [WASM Channel Allocation na Memoria Linear] ---\n");
+            fprintf(ctx->file, "    ;; --- [WASM Channel Allocation in Linear Memory] ---\n");
             break;
 
         case OP_CHAN_PUT:
@@ -97,7 +97,7 @@ void emit_wasm_pure(MetalContext* ctx, OpCode op, int32_t arg) {
             break;
 
         // ====================================================================
-        // 6. CONTROLE DE FLUXO E FECHAMENTO DO MÓDULO
+        // 6. CONTROL FLOW AND MODULE CLOSING
         // ====================================================================
         case OP_JMP:
             fprintf(ctx->file, "    br $label_%d\n", arg);
@@ -117,7 +117,7 @@ void emit_wasm_pure(MetalContext* ctx, OpCode op, int32_t arg) {
             break;
 
         default:
-            // RESSURREIÇÃO DCE: Injeta o comentário estrutural se for uma instrução lógica mapeada acima de 100
+            // DCE RESURRECTION: Injects the structural comment if it is a logical instruction mapped above 100
             if ((int)op >= 100) {
                 fprintf(ctx->file, "    ;; Label Marcacao: $label_%d\n", (int)op);
             }

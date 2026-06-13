@@ -3,13 +3,13 @@
 #include <stdlib.h>
 #include <string.h>
 
-// Avança os tokens usando o estado do parser original
+// Advances tokens using the original parser state
 static void ffi_advance(Parser* parser) {
     parser->current_token = parser->peek_token;
     parser->peek_token = lexer_next_token(parser->lexer);
 }
 
-// Auxiliar para capturar tipos complexos (ex: ptr<void>, ptr<ptr<char>>, str[])
+// Helper to capture complex types (e.g.: ptr<void>, ptr<ptr<char>>, str[])
 static char* parse_complex_type(Parser* parser) {
     char type_buffer[512] = {0};
 
@@ -20,10 +20,10 @@ static char* parse_complex_type(Parser* parser) {
     strcat(type_buffer, parser->current_token.lexeme);
     ffi_advance(parser);
 
-    // Trata tipos genéricos/ponteiros recursivos como ptr<ptr<char>> ou ptr<ExternalStructure>
+    // Handle recursive generic/pointer types such as ptr<ptr<char>> or ptr<ExternalStructure>
     if (parser->current_token.type == TOKEN_LT) {
         strcat(type_buffer, "<");
-        ffi_advance(parser); // Consome '<'
+        ffi_advance(parser); // Consume '<'
 
         char* inner_type = parse_complex_type(parser);
         strcat(type_buffer, inner_type);
@@ -31,25 +31,25 @@ static char* parse_complex_type(Parser* parser) {
 
         if (parser->current_token.type == TOKEN_GT) {
             strcat(type_buffer, ">");
-            ffi_advance(parser); // Consome '>'
+            ffi_advance(parser); // Consume '>'
         }
     }
 
-    // Trata arrays como str[]
+    // Handle arrays like str[]
     if (parser->current_token.type == TOKEN_LBRACKET) {
-        ffi_advance(parser); // Consome '['
+        ffi_advance(parser); // Consume '['
         if (parser->current_token.type == TOKEN_RBRACKET) {
             strcat(type_buffer, "[]");
-            ffi_advance(parser); // Consome ']'
+            ffi_advance(parser); // Consume ']'
         }
     }
 
     return strdup(type_buffer);
 }
 
-// Analisa uma assinatura de função individual do FFI
+// Parses a single FFI function signature
 static void parse_single_function_signature(Parser* parser, FFIFunctionNode* fn) {
-    ffi_advance(parser); // Consome 'fn'
+    ffi_advance(parser); // Consume 'fn'
 
     if (parser->current_token.type == TOKEN_IDENTIFIER) {
         fn->fn_name = strdup(parser->current_token.lexeme);
@@ -57,7 +57,7 @@ static void parse_single_function_signature(Parser* parser, FFIFunctionNode* fn)
     }
 
     if (parser->current_token.type == TOKEN_LPAREN) {
-        ffi_advance(parser); // Consome '('
+        ffi_advance(parser); // Consume '('
 
         int cap = 4;
         fn->params = (FFIFnParam*)malloc(sizeof(FFIFnParam) * cap);
@@ -71,25 +71,25 @@ static void parse_single_function_signature(Parser* parser, FFIFunctionNode* fn)
                 }
 
                 fn->params[fn->param_count].param_name = strdup(parser->current_token.lexeme);
-                ffi_advance(parser); // Consome o nome do parâmetro
+                ffi_advance(parser); // Consume the parameter name
 
                 if (parser->current_token.type == TOKEN_COLON) {
-                    ffi_advance(parser); // Consome ':'
+                    ffi_advance(parser); // Consume ':'
                     fn->params[fn->param_count].param_type = parse_complex_type(parser);
                 }
                 fn->param_count++;
             }
 
             if (parser->current_token.type == TOKEN_COMMA) {
-                ffi_advance(parser); // Consome ','
+                ffi_advance(parser); // Consume ','
             }
         }
-        if (parser->current_token.type == TOKEN_RPAREN) ffi_advance(parser); // Consome ')'
+        if (parser->current_token.type == TOKEN_RPAREN) ffi_advance(parser); // Consume ')'
     }
 
-    // Captura o tipo de retorno ': tipo'
+    // Capture the return type ': type'
     if (parser->current_token.type == TOKEN_COLON) {
-        ffi_advance(parser); // Consome ':'
+        ffi_advance(parser); // Consume ':'
         fn->return_type = parse_complex_type(parser);
     } else {
         fn->return_type = strdup("void");
@@ -98,29 +98,29 @@ static void parse_single_function_signature(Parser* parser, FFIFunctionNode* fn)
     fn->alias = NULL;
 }
 
-// Ponto de entrada para analisar qualquer bloco 'extern'
+// Entry point to parse any 'extern' block
 FFIASTNode* parse_extern_declaration(Parser* parser) {
-    ffi_advance(parser); // Consome 'extern'
+    ffi_advance(parser); // Consume 'extern'
 
     FFIASTNode* node = (FFIASTNode*)malloc(sizeof(FFIASTNode));
     node->from_lib = NULL;
 
-    // NOVO CASO: extern """ código nativo C """ as { ... }
+    // NEW CASE: extern """ native C code """ as { ... }
     if (parser->current_token.type == TOKEN_LIT_MULTILINE_STR) {
         node->type = NODE_FFI_INLINE_C;
         node->data.ffi_inline_c.c_code_block = strdup(parser->current_token.lexeme);
-        ffi_advance(parser); // Consome o bloco de string multilinha
+        ffi_advance(parser); // Consume the multiline string block
 
-        // Valida e consome a palavra-chave obrigatória 'as'
+        // Validate and consume the mandatory 'as' keyword
         if (parser->current_token.type == TOKEN_AS) {
-            ffi_advance(parser); // Consome 'as'
+            ffi_advance(parser); // Consume 'as'
         } else {
-            fprintf(stderr, "[Erro Sintático] Linha %d: Esperado 'as' após o bloco de código nativo extern\n", parser->current_token.line);
+            fprintf(stderr, "[Syntax Error] Line %d: Expected 'as' after the extern native code block\n", parser->current_token.line);
         }
 
-        // Processa o escopo de mapeamento das funções Teko '{ ... }'
+        // Process the Teko function mapping scope '{ ... }'
         if (parser->current_token.type == TOKEN_LBRACE) {
-            ffi_advance(parser); // Consome '{'
+            ffi_advance(parser); // Consume '{'
 
             int cap = 4;
             node->data.ffi_inline_c.declarations = (FFIASTNode**)malloc(sizeof(FFIASTNode*) * cap);
@@ -138,7 +138,7 @@ FFIASTNode* parse_extern_declaration(Parser* parser) {
                     inner_fn->type = NODE_FFI_FUNCTION;
                     inner_fn->from_lib = NULL;
 
-                    // Reutiliza a assinatura que já tínhamos implementado no arquivo anterior
+                    // Reuse the signature already implemented earlier
                     parse_single_function_signature(parser, &inner_fn->data.ffi_function);
 
                     if (parser->current_token.type == TOKEN_SEMICOLON) {
@@ -147,18 +147,18 @@ FFIASTNode* parse_extern_declaration(Parser* parser) {
 
                     node->data.ffi_inline_c.declarations[node->data.ffi_inline_c.declaration_count++] = inner_fn;
                 } else {
-                    ffi_advance(parser); // Limpeza caso digitem algo fora do padrão
+                    ffi_advance(parser); // Cleanup if something out of spec is typed
                 }
             }
 
             if (parser->current_token.type == TOKEN_RBRACE) {
-                ffi_advance(parser); // Consome '}'
+                ffi_advance(parser); // Consume '}'
             }
         }
         return node;
     }
 
-    // --- DAQUI PARA BAIXO SEGUE O FLUXO ORIGINAL ANTERIOR COMPACTADO ---
+    // --- BELOW THIS POINT FOLLOWS THE ORIGINAL PRIOR FLOW, COMPACTED ---
     if (parser->current_token.type == TOKEN_STRUCT) {
         node->type = NODE_FFI_STRUCT;
         ffi_advance(parser);
@@ -240,7 +240,7 @@ FFIASTNode* parse_extern_declaration(Parser* parser) {
     return node;
 }
 
-// Limpeza recursiva da memória para o subsistema de FFI
+// Recursive memory cleanup for the FFI subsystem
 void free_ffi_ast_node(FFIASTNode* node) {
     if (!node) return;
     if (node->from_lib) {

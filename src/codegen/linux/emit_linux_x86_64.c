@@ -6,7 +6,7 @@ void emit_linux_x86_64(MetalContext* ctx, OpCode op, int32_t arg) {
 
     switch (op) {
         // ====================================================================
-        // 1. DIRETIVAS DE INICIALIZAÇÃO, SÍMBOLOS E PRÓLOGO (ELF ABI LINUX)
+        // 1. INITIALIZATION DIRECTIVES, SYMBOLS AND PROLOGUE (ELF ABI LINUX)
         // ====================================================================
         case OP_PROLOG:
             fprintf(ctx->file, ";; ==================================================\n");
@@ -15,44 +15,44 @@ void emit_linux_x86_64(MetalContext* ctx, OpCode op, int32_t arg) {
             fprintf(ctx->file, ".global main\n\n");
             fprintf(ctx->file, "main:\n");
 
-            // Prólogo System V AMD64 ABI: Preserva o Frame Pointer e o registrador da Arena (%r12)
+            // System V AMD64 ABI Prologue: Preserves the Frame Pointer and the Arena register (%r12)
             fprintf(ctx->file, "    pushq %%rbp\n");
             fprintf(ctx->file, "    movq %%rsp, %%rbp\n");
-            fprintf(ctx->file, "    pushq %%r12\n\n"); // %r12 é o registrador callee-saved da nossa Arena Ativa
+            fprintf(ctx->file, "    pushq %%r12\n\n"); // %r12 is the callee-saved register of our Active Arena
             break;
 
         // ====================================================================
-        // 2. OPCODES DE LITERAIS, REGISTRADORES E CONVERSÃO
+        // 2. LITERAL, REGISTER AND CONVERSION OPCODES
         // ====================================================================
         case OP_HALT:
-            fprintf(ctx->file, "    ;; [Linux x86_64 Halt]: sys_exit nativo via interrupcao\n");
-            fprintf(ctx->file, "    movq $60, %%rax\n"); // Syscall exit no Linux x86_64 é 60
-            fprintf(ctx->file, "    movq $0, %%rdi\n");  // Código de saída 0
+            fprintf(ctx->file, "    ;; [Linux x86_64 Halt]: native sys_exit via interrupt\n");
+            fprintf(ctx->file, "    movq $60, %%rax\n"); // Linux x86_64 exit syscall number is 60
+            fprintf(ctx->file, "    movq $0, %%rdi\n");  // Exit code 0
             fprintf(ctx->file, "    syscall\n");
             break;
 
         case OP_ICONST:
-            // Carrega um valor imediato diretamente no acumulador soberano %eax
+            // Loads an immediate value directly into the primary accumulator %eax
             fprintf(ctx->file, "    movl $%d, %%eax\n", arg);
             break;
 
         case OP_SCONST:
-            // Endereçamento RIP-relative nativo e obrigatório para ELF PIE no Linux
+            // Native RIP-relative addressing, mandatory for ELF PIE on Linux
             fprintf(ctx->file, "    leaq .L_linux_str_%d(%%rip), %%rax\n", arg);
             break;
 
         case OP_STORE:
-            // Transfere o acumulador principal %eax para o registrador base %ebx
+            // Transfers the primary accumulator %eax to the base register %ebx
             fprintf(ctx->file, "    movl %%eax, %%ebx\n");
             break;
 
         case OP_LOAD:
-            // Restaura o valor guardado de %ebx de volta para %eax
+            // Restores the saved value from %ebx back into %eax
             fprintf(ctx->file, "    movl %%ebx, %%eax\n");
             break;
 
         // ====================================================================
-        // 3. MOTOR ARITMÉTICO CORE E PROTEÇÃO CONTRA DIVISÃO POR ZERO
+        // 3. CORE ARITHMETIC ENGINE AND DIVISION-BY-ZERO GUARD
         // ====================================================================
         case OP_ADD:
             fprintf(ctx->file, "    addl %%ebx, %%eax\n");
@@ -68,37 +68,37 @@ void emit_linux_x86_64(MetalContext* ctx, OpCode op, int32_t arg) {
 
         case OP_DIV:
             ctx->label_count++;
-            // BARREIRA DE HARDWARE: Compara o divisor %ebx com zero
+            // HARDWARE BARRIER: Compares the divisor %ebx with zero
             fprintf(ctx->file, "    cmpl $0, %%ebx\n");
             fprintf(ctx->file, "    je .L_linux_div_zero_%d\n", ctx->label_count);
 
-            // Preparação x86_64: Estende o sinal de %eax para o par %edx:%eax antes da divisao
+            // x86_64 preparation: Sign-extends %eax into the %edx:%eax pair before division
             fprintf(ctx->file, "    cltd\n");
             fprintf(ctx->file, "    idivl %%ebx\n");
             fprintf(ctx->file, "    jmp .L_linux_div_ok_%d\n", ctx->label_count);
 
             fprintf(ctx->file, ".L_linux_div_zero_%d:\n", ctx->label_count);
-            fprintf(ctx->file, "    movl $-1, %%eax\n"); // Evita o crash enviando o fallback
+            fprintf(ctx->file, "    movl $-1, %%eax\n"); // Avoids crash by returning fallback value
             fprintf(ctx->file, ".L_linux_div_ok_%d:\n", ctx->label_count);
             break;
 
         // ====================================================================
-        // 4. GERENCIAMENTO DE MEMÓRIA POR REGIÃO (ARENA NATIVA O(1))
+        // 4. REGION-BASED MEMORY MANAGEMENT (NATIVE ARENA O(1))
         // ====================================================================
         case OP_ARENA_PUSH:
-            // Aloca 1KB contíguo decrementando o Stack Pointer (%rsp)
+            // Allocates a contiguous 1KB block by decrementing the Stack Pointer (%rsp)
             fprintf(ctx->file, "    subq $1024, %%rsp\n");
-            // %r12 vira o cursor estático contíguo da Arena
+            // %r12 becomes the contiguous static cursor of the Arena
             fprintf(ctx->file, "    movq %%rsp, %%r12\n");
             break;
 
         case OP_ARENA_POP:
-            // Desalocação atômica em tempo O(1) restaurando a pilha
+            // Atomic O(1) deallocation by restoring the stack
             fprintf(ctx->file, "    addq $1024, %%rsp\n");
             break;
 
         // ====================================================================
-        // 5. PARALELISMO E CANAIS (INTRINSICS INTEGRADAS ÀS THREADS DO LINUX)
+        // 5. PARALLELISM AND CHANNELS (INTRINSICS INTEGRATED WITH LINUX THREADS)
         // ====================================================================
         case OP_SPAWN_ASYNC:
             fprintf(ctx->file, "    ;; --- [Linux AOT Coroutine Spawn via pthread_create] ---\n");
@@ -120,7 +120,7 @@ void emit_linux_x86_64(MetalContext* ctx, OpCode op, int32_t arg) {
             break;
 
         // ====================================================================
-        // 6. CONTROLE DE FLUXO E RETORNO DE SUB-ROTINAS
+        // 6. CONTROL FLOW AND SUBROUTINE RETURN
         // ====================================================================
         case OP_JMP:
             fprintf(ctx->file, "    jmp .L_linux_label_%d\n", arg);
@@ -133,14 +133,14 @@ void emit_linux_x86_64(MetalContext* ctx, OpCode op, int32_t arg) {
 
         case OP_RETURN:
         case OP_EPILOG:
-            // Epílogo: Restaura a Arena original %r12 e desmonta o frame de pilha
+            // Epilogue: Restores the original Arena %r12 and tears down the stack frame
             fprintf(ctx->file, "    popq %%r12\n");
             fprintf(ctx->file, "    popq %%rbp\n");
             fprintf(ctx->file, "    ret\n");
             break;
 
         default:
-            // RESSURREIÇÃO DCE LINUX X86_64
+            // DCE RESURRECTION LINUX X86_64
             if ((int)op >= 100) {
                 fprintf(ctx->file, ".L_linux_label_%d:\n", (int)op);
             }

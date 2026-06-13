@@ -23,7 +23,7 @@ TekoProjectConfig* teko_project_load(const char* tkp_filepath) {
 
     FILE* file = fopen(tkp_filepath, "r");
     if (!file) {
-        fprintf(stderr, "[Erro de Projeto]: Não foi possível abrir o manifesto '%s'.\n", tkp_filepath);
+        fprintf(stderr, "[Project Error]: Could not open manifest '%s'.\n", tkp_filepath);
         return NULL;
     }
 
@@ -70,7 +70,7 @@ TekoProjectConfig* teko_project_load(const char* tkp_filepath) {
                 config->author = trim_quotes(val_buf);
             }
         }
-        else if (strstr(line, "type:")) { // <-- NOVO: Captura do tipo de saída do manifesto
+        else if (strstr(line, "type:")) { // <-- NEW: Capture the output type from the manifest
             char val_buf[128];
             if (sscanf(line, " type: %127[^;]", val_buf) == 1) {
                 char* clean_val = trim_quotes(val_buf);
@@ -89,18 +89,18 @@ TekoProjectConfig* teko_project_load(const char* tkp_filepath) {
 bool teko_project_validate_structure(const TekoProjectConfig* config) {
     if (!config || !config->root_dir) return false;
 
-    // REGRA 1: Se o manifesto omitir o tipo ou for desconhecido, quebra o build
+    // RULE 1: If the manifest omits the type or it is unknown, break the build
     if (config->target_type == TARGET_UNKNOWN) {
-        fprintf(stderr, "[Erro de Configuração]: O tipo de destino (type) não foi definido no manifesto .tkp do projeto '%s'.\n", config->project_name);
+        fprintf(stderr, "[Configuration Error]: The target type (type) was not defined in the .tkp manifest of project '%s'.\n", config->project_name);
         return false;
     }
 
-    // REGRA 2: A checagem física do arquivo main.tks torna-se condicional, obrigatória apenas para executáveis
+    // RULE 2: The physical check for main.tks becomes conditional, required only for executables
     if (config->target_type == TARGET_EXECUTABLE) {
         char main_path[512];
         snprintf(main_path, sizeof(main_path), "%s/main.tks", config->root_dir);
         if (access(main_path, F_OK) != 0) {
-            fprintf(stderr, "[Erro de Estrutura]: Projetos do tipo 'executable' exigem obrigatoriamente o ponto de entrada 'main.tks'.\n");
+            fprintf(stderr, "[Structure Error]: Projects of type 'executable' require the entry point 'main.tks'.\n");
             return false;
         }
     }

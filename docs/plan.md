@@ -1,66 +1,73 @@
-# 🗺️ Plano de Árvore Tecnológica: Linguagem Teko
+# 🗺️ Technology Tree Plan: The Teko Language
+
+> Action plan updated on 2026-06-13. Phases 1–8 reflect work already delivered/in
+> progress. Phase 9 is the Technical Debt Resolution hardening track (from
+> `TECH_DEBT_BACKLOG.md`), to be addressed before/alongside expanding the language
+> surface. Phases 10–17 were derived from the project owner's roadmap memorandum
+> (`TEKO_COMPILER_MEMORANDUM.txt`). The Self-Containment (Self-Hosting) milestone —
+> originally phase 9 — is the final phase, 18.
 
 ```mermaid
 graph TD
-    %% Estilo do Grafo
+    %% Graph Style
     classDef default fill:#1f2937,stroke:#4b5563,stroke-width:1px,color:#f3f4f6;
     classDef ide fill:#1d4ed8,stroke:#3b82f6,stroke-width:2px,color:#eff6ff;
     classDef protocols fill:#111827,stroke:#6b7280,stroke-width:1px,color:#9ca3af;
     classDef teko fill:#7c2d12,stroke:#ea580c,stroke-width:2px,color:#ffedd5;
 
-    %% Nós de Origem (IDEs)
+    %% Source Nodes (IDEs)
     VS[VS Code / Cursor]:::ide
     JB[CLion / IntelliJ / Fleet]:::ide
     NV[Neovim / Vim]:::ide
 
-    %% Protocolos Unificados
+    %% Unified Protocols
     LSP[Language Server Protocol - JSON-RPC]:::protocols
     DAP[Debug Adapter Protocol - JSON-RPC]:::protocols
 
-    %% Motores Internos Teko
+    %% Teko Internal Engines
     TKLS[Teko Language Server - tekols]:::teko
     TKVM[Teko VM / Debugger Core]:::teko
 
-    %% Conexões
+    %% Connections
     VS -->|Stdio| LSP
     JB -->|TCP| LSP
     NV -->|Stdio| LSP
-    
+
     VS -->|TCP| DAP
     JB -->|TCP| DAP
-    
+
     LSP --> TKLS
     DAP --> TKVM
 ```
 
 ```mermaid
 graph TD
-    %% Estilo do Grafo
+    %% Graph Style
     classDef default fill:#1f2937,stroke:#4b5563,stroke-width:1px,color:#f3f4f6;
     classDef phase fill:#111827,stroke:#3b82f6,stroke-width:2px,color:#eff6ff;
     classDef test fill:#064e3b,stroke:#059669,stroke-width:1px,color:#ecfdf5;
 
-    %% Nós Principais
-    F1[Fase 1: Verificador de Tipos]:::phase
-    F2[Fase 2: Código Intermediário LI]:::phase
-    F3[Fase 3: VM & Alocação por Região]:::phase
-    F4[Fase 4: Core Tooling @ Libs]:::phase
-    F5[Fase 5: Backend & Emissão de RI]:::phase
+    %% Main Nodes
+    F1[Phase 1: Type Checker]:::phase
+    F2[Phase 2: Intermediate Language IL]:::phase
+    F3[Phase 3: VM & Region Allocation]:::phase
+    F4[Phase 4: Core Tooling @ Libs]:::phase
+    F5[Phase 5: Backend & IR Emission]:::phase
 
-    %% Nós de Testes
+    %% Test Nodes
     T1[tests/test_type_checker.c]:::test
     T2[tests/test_codegen_li.c]:::test
     T3[tests/test_vm.c]:::test
     T4[tests/test_tooling.c]:::test
     T5[tests/test_codegen_native.c]:::test
 
-    %% Fluxo de Dependências
+    %% Dependency Flow
     F1 --> F2
     F2 --> F3
     F3 --> F4
     F4 --> F5
 
-    %% Conexões com Testes
+    %% Connections to Tests
     F1 -.-> T1
     F2 -.-> T2
     F3 -.-> T3
@@ -70,161 +77,297 @@ graph TD
 
 ---
 
-## 🛠️ Fase 1: Verificador de Tipos (Type Checker)
-*O Frontend precisa garantir que o código é semanticamente 100% válido antes de qualquer tentativa de tradução.*
+## 🛠️ Phase 1: Type Checker
+*The frontend must guarantee the code is 100% semantically valid before any translation attempt.*
 
-*   **1.1 Algoritmo de Inferência e Resolução:**
-    *   Implementar o sistema de unificação de tipos para inferência em operadores `:=` (ex: `wg := waiter` infere o tipo `teko::waiter`).
-    *   Criar o resolvedor de tipos complexos: genéricos aninhados (`map<str, mut i32>`), nuláveis (`ExternalStructure?`) e aridades de funções (`func<i32, void>`).
-*   **1.2 Checagem de Atribuição e Regras de Mutabilidade:**
-    *   Garantir barreira contra atribuições inválidas (ex: tentar jogar uma literal `LIT_STR` em um tipo `i32`).
-    *   Conectar a AST com a Tabela de Símbolos para travar atribuições em variáveis `let` imutáveis (ex: falhar se houver escrita em um símbolo cujo metadado `is_mutable` seja `false`).
-*   **1.3 Validação de Fluxo Assíncrono e Concorrência:**
-    *   Validar se expressões `await` são aplicadas estritamente a retornos envelopados em `intent<T>`.
-    *   Verificar se blocos `defer` tradicionais **não** contêm expressões `await`, enquanto blocos `async defer` as exigem ou permitem.
-*   **🧪 Testes Associados (`tests/test_type_checker.c`):**
-    *   Asserções do Unity injetando erros intencionais de mutabilidade e tipos primitivos incompatíveis, validando que o compilador os rejeita.
-
----
-
-## 💾 Fase 2: Arquitetura da Linguagem Intermediária (LI) e Emissão de Bytecode
-*Definição de um formato de instrução compacto e independente de plataforma, ideal para portabilidade e para alimentar a nossa VM.*
-
-*   **2.1 Design da ISA (Instruction Set Architecture) da LI:**
-    *   Projetar um conjunto de instruções baseado em registradores virtuais ou pilha (ex: `ICONST`, `STORE_MUT`, `SPAWN_ASYNC`, `CHAN_PUT`, `AWAIT_INTENT`).
-    *   Estruturar o formato do arquivo binário compilado (`.tkb` - Teko Bytecode) contendo: Cabeçalho com Magic Number, Tabela de Constantes (Literais, Strings), Metadados de Namespaces/Tipos e o vetor de instruções brutas (*opcodes*).
-*   **2.2 O Emissor de Bytecode (Codegen da LI):**
-    *   Criar o módulo `src/codegen_li.c` que percorre a AST validada e traduz os nós em instruções lineares da LI.
-    *   Mapear o switch inline e blocos condicionalizados `when` em desvios condicionais eficientes de bytecode (`JMP_IF_FALSE`).
-*   **🧪 Testes Associados (`tests/test_codegen_li.c`):**
-    *   Compilar pequenos trechos sintáticos e inspecionar os bytes gerados na memória para validar se os *opcodes* batem com a especificação da ISA.
+*   **1.1 Inference and Resolution Algorithm:**
+    *   Implement the type unification system for inference on `:=` operators (e.g., `wg := waiter` infers the type `teko::waiter`).
+    *   Build the complex-type resolver: nested generics (`map<str, mut i32>`), nullables (`ExternalStructure?`), and function arities (`func<i32, void>`).
+*   **1.2 Assignment Checking and Mutability Rules:**
+    *   Enforce a barrier against invalid assignments (e.g., trying to put a `LIT_STR` literal into an `i32` type).
+    *   Connect the AST to the Symbol Table to lock assignments to immutable `let` variables (e.g., fail on a write to a symbol whose `is_mutable` metadata is `false`).
+*   **1.3 Async Flow and Concurrency Validation:**
+    *   Validate that `await` expressions are applied strictly to returns wrapped in `intent<T>`.
+    *   Verify that traditional `defer` blocks do **not** contain `await` expressions, whereas `async defer` blocks require or allow them.
+*   **🧪 Associated Tests (`tests/test_type_checker.c`):**
+    *   Unity assertions injecting intentional mutability and incompatible-primitive-type errors, validating that the compiler rejects them.
 
 ---
 
-## 🚀 Fase 3: Máquina Virtual (VM) de Desenvolvimento
-*O ambiente de execução ágil, portátil e multiplataforma para o desenvolvedor, responsável por rodar o bytecode `.tkb` de forma performática.*
+## 💾 Phase 2: Intermediate Language (IL) Architecture and Bytecode Emission
+*Definition of a compact, platform-independent instruction format, ideal for portability and for feeding our VM.*
 
-*   **3.1 O Interpretador Core:**
-    *   Implementar o laço de execução principal (`src/vm_core.c`) baseado em um loop `switch-case` otimizado (ou ponteiros de etiquetas/labels se você preferir otimizar no C23) para processar os opcodes da LI.
-    *   Criar o subsistema de Contexto e Call Stack isolado por Green Threads / Corrotinas para suportar os métodos assíncronas de forma nativa.
-*   **3.2 Motor Concorrente da VM (Green Threads, Canais e Semáforos):**
-    *   Desenvolver o **Scheduler M:N** (M Green Threads mapeadas em N threads nativas do OS via `pthread` ou as novas C23 threads).
-    *   Implementar as estruturas internas reais de controle para canais síncronos/assíncronos, travamentos de exclusão mútua (`mutex`) e contadores do `waiter`.
-*   **3.3 O Alocador por Região Real (Region-Based Memory Management):**
-    *   Criar o motor da **Arena de Memória** nativa (a estrutura de runtime que atende ao `ctx: arena` do seu `main`). Toda alocação interna de Green Threads e dados do programa do usuário deve ser empurrada para blocos contínuos da arena, garantindo que o encerramento da arena limpe gigabytes de lixo instantaneamente via O(1) sem necessidade de um Garbage Collector pausando a execução.
-*   **🧪 Testes Associados (`tests/test_vm.c`):**
-    *   Executar bytecodes que abrem canais, disparam loops concorrentes e validam se o Scheduler distribui a carga e se a Arena limpa a memória perfeitamente.
+*   **2.1 IL ISA (Instruction Set Architecture) Design:**
+    *   Design an instruction set based on virtual registers or a stack (e.g., `ICONST`, `STORE_MUT`, `SPAWN_ASYNC`, `CHAN_PUT`, `AWAIT_INTENT`).
+    *   Structure the compiled binary file format (`.tkb` - Teko Bytecode) containing: a header with a Magic Number, a Constants Table (literals, strings), Namespace/Type metadata, and the raw instruction vector (*opcodes*).
+*   **2.2 The Bytecode Emitter (IL Codegen):**
+    *   Create the `src/codegen_li.c` module that walks the validated AST and translates nodes into linear IL instructions.
+    *   Map the inline switch and conditionalized `when` blocks into efficient conditional bytecode branches (`JMP_IF_FALSE`).
+*   **🧪 Associated Tests (`tests/test_codegen_li.c`):**
+    *   Compile small syntactic snippets and inspect the bytes generated in memory to validate that the *opcodes* match the ISA specification.
 
 ---
 
-## 🧰 Fase 4: Core Tooling & Framework Nativo (Suporte ao `@`)
-*A criação da biblioteca padrão e ferramentas internas da linguagem, escritas no ecossistema e expostas transparentemente através do açúcar sintático `@`.*
+## 🚀 Phase 3: Development Virtual Machine (VM)
+*The agile, portable, cross-platform execution environment for the developer, responsible for running `.tkb` bytecode performantly.*
 
-*   **4.1 Mapeamento e Ligação dos Namespaces Internos:**
-    *   Criar os arquivos de cabeçalho teko (ex: `strings.tk`, `marshall.tk`, `flows.tk`, `lists.tk`, `logger.tk`).
-    *   Estruturar o subsistema de **Intrinsics / Builtins** no compilador: quando o Type Checker intercepta um identificador iniciado por `@` (que expandimos para `teko::`), o compilador sabe que deve ligar aquela chamada diretamente às funções internas de alta performance implementadas no runtime da VM ou em C puro (FFI).
-*   **4.2 Desenvolvimento das sub-bibliotecas `@` Obrigatórias:**
-    *   `@marshall`: Funções de conversão e conversão de ponteiros (`to_ptr`, `from_ptr`) conversas entre tipos Teko e tipos nativos de C (FFI).
-    *   `@flows`: Motor arquitetural orientado a eventos para CQRS (`request`, `notify`, `send`), resolvendo a injeção dos Handlers automáticos.
-    *   `@lists` e `@strings`: Manipulação de arrays mutáveis, coleções dinâmicas de decimais e concatenações otimizadas.
-*   **4.3 O Driver CLI do Compilador:**
-    *   Criar o utilitário de terminal principal (`teko compile`, `teko run`).
-    *   Injetar a flag de controle de privilégio `is_stdlib_compilation` que criamos. Se o driver CLI compilar a pasta do compilador/stdlib, liga a flag como `true` para permitir o uso de `teko::`; se for projeto de terceiros, força o uso estrito do `@`.
-*   **🧪 Testes Associados (`tests/test_tooling.c`):**
-    *   Compilar códigos contendo `@strings.concat` e verificar se a expansão sintática e o direcionamento de memória em runtime estão íntegros.
+*   **3.1 The Core Interpreter:**
+    *   Implement the main execution loop (`src/vm_core.c`) based on an optimized `switch-case` loop (or label pointers if you prefer to optimize in C23) to process IL opcodes.
+    *   Build the Context and Call Stack subsystem isolated per Green Thread / coroutine to support async methods natively.
+*   **3.2 The VM Concurrency Engine (Green Threads, Channels, and Semaphores):**
+    *   Develop the **M:N Scheduler** (M Green Threads mapped onto N native OS threads via `pthread` or the new C23 threads).
+    *   Implement the real internal control structures for sync/async channels, mutual-exclusion locks (`mutex`), and `waiter` counters.
+*   **3.3 The Real Region-Based Allocator (Region-Based Memory Management):**
+    *   Build the native **Memory Arena** engine (the runtime structure that serves the `ctx: arena` of your `main`). Every internal Green Thread allocation and user program data must be pushed into contiguous arena blocks, ensuring that closing the arena clears gigabytes of garbage instantly via O(1) with no Garbage Collector pausing execution.
+*   **🧪 Associated Tests (`tests/test_vm.c`):**
+    *   Run bytecodes that open channels, fire concurrent loops, and validate that the Scheduler distributes the load and the Arena clears memory perfectly.
 
 ---
 
-## 🎛️ Fase 5: Backend Avançado e Emissão de RI (LLVM / C)
-*A etapa definitiva de produção. Quando o usuário precisar de performance máxima de execução (*Ahead-of-Time*), o compilador pula a VM e gera binários nativos otimizados.*
+## 🧰 Phase 4: Core Tooling & Native Framework (Support for `@`)
+*Creating the language's standard library and internal tooling, written in the ecosystem and exposed transparently through the `@` syntactic sugar.*
 
-*   **5.1 Transpilação Intermediária para C Puro ou Emissão de RI LLVM:**
-    *   **Abordagem Transpilação para C:** Converter a AST validada ou as instruções da LI diretamente em código C estruturado, mapeando as Green Threads para a biblioteca `libuv` ou construções nativas de Threads assíncronas, invocando em seguida o `clang` ou `gcc` local do sistema para gerar o executável binário final.
-    *   **Abordagem LLVM RI:** Consumir a API do LLVM para emitir instruções textuais `.ll`, aproveitando as otimizações industriais de registradores e gerando código nativo direto para **arm64** (Mac M1/M2/M3) ou **x86_64** (Intel/AMD).
-*   **5.2 Casamento de Tipos e Geração do FFI Fixo:**
-    *   Gerar a tradução exata de tipos complexos descritos no bloco `extern struct` ou `extern fn ... from "my.dylib" as "GetMy"`, convertendo strings arbitrárias da Teko em ponteiros `char*` tradicionais de C e vinculando nativamente via `dlopen`/`dlsym` ou linkagem direta.
-*   **🧪 Testes Associados (`tests/test_codegen_native.c`):**
-    *   Gerar um binário final de um programa completo Teko, executá-lo no sistema operacional hospedeiro e inspecionar se o resultado de saída e o comportamento concorrente condizem com o especificado.
-
-
----
-
-# 🗺️ Plano Estratégico: Compilador Teko - Do AOT ao Auto-Controle (Self-Hosting)
-
-Este documento estabelece o roteiro técnico definitivo para as fases finais de desenvolvimento da linguagem **Teko**. O objetivo central é transformar o ecossistema em uma infraestrutura de nível de sistemas puramente **autônoma e autossuficiente**, eliminando por completo a dependência de compiladores e linkadores de terceiros (Clang, GCC, MSVC, Link.exe), e capacitando o compilador a gerar executáveis bare-metal diretamente a partir da escrita de bytes estruturais de arquivos binários de sistemas operacionais.
+*   **4.1 Mapping and Linking the Internal Namespaces:**
+    *   Create the teko header files (e.g., `strings.tk`, `marshall.tk`, `flows.tk`, `lists.tk`, `logger.tk`).
+    *   Structure the **Intrinsics / Builtins** subsystem in the compiler: when the Type Checker intercepts an identifier starting with `@` (which we expand to `teko::`), the compiler knows to link that call directly to the high-performance internal functions implemented in the VM runtime or in pure C (FFI).
+*   **4.2 Development of the Mandatory `@` Sub-libraries:**
+    *   `@marshall`: Pointer conversion functions (`to_ptr`, `from_ptr`) for conversions between Teko types and native C types (FFI).
+    *   `@flows`: Event-driven architectural engine for CQRS (`request`, `notify`, `send`), resolving automatic Handler injection.
+    *   `@lists` and `@strings`: Manipulation of mutable arrays, dynamic decimal collections, and optimized concatenations.
+*   **4.3 The Compiler CLI Driver:**
+    *   Create the main terminal utility (`teko compile`, `teko run`).
+    *   Inject the `is_stdlib_compilation` privilege-control flag we created. If the CLI driver compiles the compiler/stdlib folder, it turns the flag on as `true` to allow the use of `teko::`; if it's a third-party project, it strictly forces the use of `@`.
+*   **🧪 Associated Tests (`tests/test_tooling.c`):**
+    *   Compile code containing `@strings.concat` and verify that the syntactic expansion and runtime memory routing are intact.
 
 ---
 
-## 🏗️ Visão Geral da Jornada Arquitetural
+## 🎛️ Phase 5: Advanced Backend and IR Emission (LLVM / C)
+*The definitive production stage. When the user needs maximum execution performance (*Ahead-of-Time*), the compiler skips the VM and generates optimized native binaries.*
 
+*   **5.1 Intermediate Transpilation to Pure C or LLVM IR Emission:**
+    *   **Transpile-to-C Approach:** Convert the validated AST or the IL instructions directly into structured C code, mapping Green Threads to the `libuv` library or native async Thread constructs, then invoking the system's local `clang` or `gcc` to produce the final binary executable.
+    *   **LLVM IR Approach:** Consume the LLVM API to emit textual `.ll` instructions, leveraging industrial register optimizations and generating native code directly for **arm64** (Mac M1/M2/M3) or **x86_64** (Intel/AMD).
+*   **5.2 Type Matching and Fixed FFI Generation:**
+    *   Generate the exact translation of complex types described in the `extern struct` block or `extern fn ... from "my.dylib" as "GetMy"`, converting arbitrary Teko strings into traditional C `char*` pointers and binding natively via `dlopen`/`dlsym` or direct linking.
+*   **🧪 Associated Tests (`tests/test_codegen_native.c`):**
+    *   Generate a final binary of a complete Teko program, run it on the host operating system, and inspect whether the output result and concurrent behavior match the specification.
+
+---
+
+# 🗺️ Strategic Plan: The Teko Compiler — From AOT to Self-Control (Self-Hosting)
+
+This document establishes the definitive technical roadmap for the final development phases of the **Teko** language. The central goal is to transform the ecosystem into a purely **autonomous and self-sufficient** systems-level infrastructure, completely eliminating any dependency on third-party compilers and linkers (Clang, GCC, MSVC, Link.exe), and empowering the compiler to generate bare-metal executables directly by writing the structural bytes of operating-system binary files.
+
+---
+
+## 🏗️ Architectural Journey Overview
+
+```
 ┌──────────────────────────────┐
-│  FASE 6: OTIMIZAÇÕES GLOBAIS │ ➔ Constant Folding, Inlining e Análise de Fluxo
+│  PHASE 6: GLOBAL OPTIMIZATIONS│ ➔ Constant Folding, Inlining, and Flow Analysis      [DONE]
 └──────────────┬───────────────┘
                ▼
 ┌──────────────────────────────┐
-│  FASE 7: ENGENHARIA DO LINKER│ ➔ Geração direta de ELF, Mach-O e PE/COFF sem ferramentas externas
+│  PHASE 7: LINKER ENGINEERING  │ ➔ Direct ELF, Mach-O, and PE/COFF generation         [IN PROGRESS]
 └──────────────┬───────────────┘
                ▼
 ┌──────────────────────────────┐
-│  FASE 8: RUNTIME EMBUTIDO    │ ➔ Syscalls Diretas, Alocador Virtual de Arenas e Green Threads
+│  PHASE 8: EMBEDDED RUNTIME    │ ➔ Direct Syscalls, Virtual Arena Allocator, Threads  [VALIDATED]
 └──────────────┬───────────────┘
                ▼
 ┌──────────────────────────────┐
-│  FASE 9: AUTO-CONTENÇÃO      │ ➔ Bootstrapping do Compilador (Reescrita de C para Teko)
+│  PHASE 9: TECHNICAL DEBT      │ ➔ Build hardening, test coverage, WASM, de-duplication
+└──────────────┬───────────────┘
+               ▼
+┌──────────────────────────────┐
+│  PHASES 10–17: LANG SURFACE   │ ➔ Grammar, Concurrency, OOP, Optionals, Web/Crypto,
+│  (from the Memorandum roadmap)│   Parsers/Templates, Interop, Native Testing
+└──────────────┬───────────────┘
+               ▼
+┌──────────────────────────────┐
+│  PHASE 18: SELF-CONTAINMENT   │ ➔ Compiler Bootstrapping (Rewrite from C to Teko)
 └──────────────────────────────┘
+```
 
 ---
 
-## 🚀 FASE 6: Otimizações Globais do Backend Metal
-A Fase 6 foca em expandir o motor de análise estática e reordenamento da Linguagem Intermediária (LI) no orquestrador central antes do despacho de instruções para as CPUs.
+## 🚀 PHASE 6: Global Optimizations of the Metal Backend — *Done*
+Phase 6 focuses on expanding the static analysis and reordering engine of the Intermediate Language (IL) in the central orchestrator before dispatching instructions to the CPUs.
 
-### 1. Constant Folding (Dobradura de Constantes)
-*   **Mecânica:** O otimizador executa uma varredura preditiva buscando operações aritméticas cujos operandos sejam literais conhecidos em tempo de compilação (ex: `OP_ICONST 10`, `OP_ICONST 5`, `OP_ADD`).
-*   **Aplicação no Silício:** O compilador colapsa as instruções em tempo de build, computando o resultado e emitindo uma única instrução limpa de carga (`OP_ICONST 15`), poupando ciclos de clock em tempo de execução.
+### 1. Constant Folding
+*   **Mechanics:** The optimizer runs a predictive sweep looking for arithmetic operations whose operands are literals known at compile time (e.g., `OP_ICONST 10`, `OP_ICONST 5`, `OP_ADD`).
+*   **Application on Silicon:** The compiler collapses the instructions at build time, computing the result and emitting a single clean load instruction (`OP_ICONST 15`), saving clock cycles at runtime.
 
-### 2. Inlining Estático Automático de Funções
-*   **Mecânica:** O compilador analisa o grafo de controle buscando sub-rotinas pequenas (funções "folha" de tamanho de bytecode reduzido que não efetuam chamadas para terceiros).
-*   **Aplicação no Silício:** O opcode de desvio físico (`bl`, `call`, `jal`) é substituído diretamente pela cópia fiel do corpo da função. Isso elimina o custo físico de stack frames, preservação de Link Registers e limpezas de pipeline, destrancando o potencial máximo do CSE e do DCE no bloco expandido.
-
----
-
-## 🛠️ FASE 7: Engenharia do Linker Nativo Estático (`tld`)
-A Fase 7 elimina a chamada ao comando `system()` do sistema hospedeiro. O compilador Teko passará a se comunicar com os kernels gravando os formatos binários executáveis diretamente em disco.
-
-### 1. Escrita Direta de Formatos de Objeto e Cabeçalhos de Executáveis
-O backend abandonará a geração de código assembly textual (.s/.asm) e implementará emissores binários para injetar as tabelas estruturais de metadados:
-*   **Linux / FreeBSD (Formatos ELF64):** Escrita direta de cabeçalhos ELF (`Elf64_Ehdr`), seções de cabeçalho de programa (`Elf64_Phdr`) e marcas de nota ELF exigidas pelos validadores do Kernel BSD.
-*   **macOS (Formato Mach-O):** Escrita de cabeçalhos de arquitetura (`mach_header_64`) e comandos de carga de segmento (`segment_command_64`).
-*   **Windows (Formato PE/COFF):** Escrita das estruturas DOS e NT Headers (`IMAGE_DOS_HEADER`, `IMAGE_NT_HEADERS`).
-
-### 2. Mecanismo de Resolução de Símbolos e Relocação (*The Linking Engine*)
-*   **Symbol Resolution:** Mapear referências globais cruzadas ligando o código gerado pelo programador às seções de dados estáticos (`.rodata`/`.rdata`).
-*   **Relocation Offsets:** Calcular offsets e remendar em tempo de linkagem os endereços virtuais de saltos condicionais longos (`JMP`) e chamadas do runtime, cravando independência total de infraestruturas externas.
+### 2. Automatic Static Function Inlining
+*   **Mechanics:** The compiler analyzes the control graph looking for small subroutines (small-bytecode "leaf" functions that make no calls to third parties).
+*   **Application on Silicon:** The physical branch opcode (`bl`, `call`, `jal`) is replaced directly with a faithful copy of the function body. This eliminates the physical cost of stack frames, Link Register preservation, and pipeline flushes, unlocking the full potential of CSE and DCE in the expanded block.
 
 ---
 
-## 🧵 FASE 8: O Runtime Nativo Embutido (*Teko Core Runtime*)
-Para dar suporte aos recursos nativos de concorrência massiva M:N, canais bloqueantes e promoção de escopo por análise de escape, a linguagem embutirá o seu próprio runtime estático de baixo nível escrito de forma bare-metal.
+## 🛠️ PHASE 7: Static Native Linker Engineering (`tld`) — *In Progress*
+Phase 7 eliminates the call to the host system's `system()` command. The Teko compiler will communicate with kernels by writing the executable binary formats directly to disk.
 
-### 1. Subsistema Concorrente M:N Cooperativo Nativo
-*   **Unix-Like:** Ingestão de chamadas de sistema puras via instruções assembly (`syscall` / `svc` / `ecall`) invocando a syscall de clonagem (`sys_clone` no Linux) ou gerenciamento de threads nativas do FreeBSD (`thr_new`) para orquestrar o escalonador cooperativo de Green Threads sem carregar a biblioteca libc padrão de C.
-*   **Windows:** Linkagem estática limpa orientada aos ponteiros de exportação das APIs do barramento `kernel32.dll` (como `CreateThread` e primitivos atômicos).
+### 1. Direct Writing of Object Formats and Executable Headers
+The backend will abandon textual assembly code generation (.s/.asm) and implement binary emitters to inject the structural metadata tables:
+*   **Linux / FreeBSD (ELF64 formats):** Direct writing of ELF headers (`Elf64_Ehdr`), program header sections (`Elf64_Phdr`), and the ELF note marks required by BSD kernel validators.
+*   **macOS (Mach-O format):** Writing of architecture headers (`mach_header_64`) and segment load commands (`segment_command_64`).
+*   **Windows (PE/COFF format):** Writing of the DOS and NT Header structures (`IMAGE_DOS_HEADER`, `IMAGE_NT_HEADERS`).
 
-### 2. Barramento de Alocação de Arenas Globais
-*   Mapeamento e requisição de páginas virtuais de memória diretamente ao sistema operacional via `mmap`/`munmap` no Unix e `VirtualAlloc` no Windows para alimentar em tempo constante $O(1)$ o barramento de arenas locais do compilador, isolando totalmente os escopos de memória.
+### 2. Symbol Resolution and Relocation Mechanism (*The Linking Engine*)
+*   **Symbol Resolution:** Map cross-global references, linking the programmer-generated code to the static data sections (`.rodata`/`.rdata`).
+*   **Relocation Offsets:** Compute offsets and patch, at link time, the virtual addresses of long conditional jumps (`JMP`) and runtime calls, cementing total independence from external infrastructure.
 
 ---
 
-## 🔄 FASE 9: Auto-Contenção (Self-Hosting / Bootstrapping)
-A etapa final que coroa a maturidade industrial de uma linguagem de programação de sistemas: usar a própria linguagem para compilar a si mesma.
+## 🧵 PHASE 8: The Embedded Native Runtime (*Teko Core Runtime*) — *Validated*
+To support the native features of massive M:N concurrency, blocking channels, and scope promotion via escape analysis, the language embeds its own low-level static runtime written bare-metal.
 
-### 1. Tradução dos Módulos do Compilador de C para Teko
-*   O Frontend (Lexer, Parser, AST Parser) e o Backend (Type Checker, Codegen Intermediário, Codegen Metal, Linker) serão inteiramente reescritos usando a sintaxe e os recursos nativos da linguagem Teko (segurança de tipos, controle estrito de mutabilidade e injeção automática de dependências).
+### 1. Native Cooperative M:N Concurrency Subsystem
+*   **Unix-Like:** Ingest pure system calls via assembly instructions (`syscall` / `svc` / `ecall`), invoking the clone syscall (`sys_clone` on Linux) or native FreeBSD thread management (`thr_new`) to orchestrate the cooperative Green Thread scheduler without loading C's standard libc.
+*   **Windows:** Clean static linkage oriented to the export pointers of the `kernel32.dll` bus APIs (such as `CreateThread` and atomic primitives).
 
-### 2. O Ciclo de Execução do Bootstrapping
-Para certificar a estabilidade bit-a-bit e a independência total da linguagem, a validação industrial ocorrerá em um ciclo fechado de três estágios de compilação cruzada:
-1.  **Estágio 1:** O compilador estável original (escrito em C) lê o novo código-fonte (escrito em Teko). O output gerado é o **Compilador Binário A**.
-2.  **Estágio 2:** O **Compilador Binário A** assume o controle e lê o mesmo código-fonte escrito em Teko novamente. O output gerado é o **Compilador Binário B**.
-3.  **Estágio 3 (Homologação):** O **Compilador Binário B** compila o código-fonte em Teko uma terceira vez, gerando o **Compilador Binário C**.
-4.  **Validação Final:** O **Binário C** e o **Binário B** devem ser rigorosa e matematicamente **bit-a-bit idênticos** em nível de soma de verificação hash. Quando este ciclo fechar, o compilador Teko estará **100% autônomo, livre de C e auto-contido**.
+### 2. Global Arena Allocation Bus
+*   Map and request virtual memory pages directly from the operating system via `mmap`/`munmap` on Unix and `VirtualAlloc` on Windows to feed, in constant $O(1)$ time, the compiler's local arena bus, fully isolating memory scopes.
 
+---
+
+## 🧹 PHASE 9: Technical Debt Resolution
+*Promoted to the first post-runtime phase: harden what is already built before expanding the language surface in Phases 10–17. Source: `TECH_DEBT_BACKLOG.md`. To be tackled continuously alongside the feature phases. Priority = (Impact + Risk) × (6 − Effort).*
+
+> ✅ **Build blocker RESOLVED 2026-06-13:** the `teko` executable target in `CMakeLists.txt`
+> was missing `target_include_directories(teko PRIVATE src)` (only `teko_core` and `teko_tests`
+> had it), so the main compiler binary failed to build (`'teko_target.h' file not found` when
+> compiling `src/main.c`). Fixed by adding the missing line; the `teko` binary now builds with
+> 0 warnings and runs, and the full test suite still passes (71 tests, 0 failures).
+
+| # | Item | Category | Priority |
+|---|------|----------|:--------:|
+| 0 | ~~`teko` exe missing include dir → main binary does not build~~ | Infra (build blocker) | ✅ Resolved 2026-06-13 |
+| 1 | FFI / generics / AOT modules with no test coverage | Test debt | High |
+| 2 | No validation of codegen output per target (16 emitters) | Test debt | High |
+| 3 | CI has no Windows runner (PE/COFF path unexercised) | Infra | High |
+| 4 | WASM backend with stubbed opcodes (arena/async/channels emit only comments) | Code/Arch | Medium |
+| 5 | `CMake GLOB_RECURSE` for source collection (stale builds) | Infra | Medium |
+| 6 | Scattered architecture docs / no `ARCHITECTURE.md` | Docs | Medium |
+| 7 | 16 near-identical codegen emitters (duplication) | Code debt | Low |
+
+See `TECH_DEBT_BACKLOG.md` for full scoring, business justification, file paths, and the phased remediation plan.
+
+---
+
+# 🧬 Roadmap from the Memorandum (Phases 10–17)
+
+These phases were lifted from the project owner's roadmap memorandum (`TEKO_COMPILER_MEMORANDUM.txt`, Sections 2–4 — the long-term conceptual requirements, the reserved keyword matrix, and the immediate next steps). They expand the **language surface** that sits on top of the now-validated backend/runtime, and must land before the Self-Hosting milestone.
+
+---
+
+## 🔤 PHASE 10: Frontend Grammar & Lexer Extension
+*The immediate next step from the memorandum: get every new token, AST node, and literal form into the frontend so the feature phases below have a grammar to compile against.*
+
+### 1. Reserved Keyword Matrix (Lexer Tokens)
+Inject the full token table the Lexer and Parser must mandatorily process:
+*   Resilience: `circuit`, `fallback`, `delayed`, `retry`, `exponential`, `logarithmic`, `attempts`, `timeout`.
+*   OOP & concurrency: `class`, `abstract`, `trait`, `event`, `raise`, `subscribe`, `fanout`, `fire_and_forget`, `shared`, `atomic`, `routines`, `duplex`.
+*   Web: `api`, `middleware`, `get`, `post`, `put`, `delete`, `rpc`, `websocket`, `use`.
+*   Tooling: `parse`, `json`, `csv`, `xml`, `html`, `bundle`, `minify`, `crypto`, `hash`, `encrypt`.
+*   Core: `comptime`, `defer`, `soa`, `null`.
+
+### 2. AST Node Mapping
+*   Extend the Abstract Syntax Tree (`ast.h`) with nodes representing the new Web, OOP, and cryptographic expressions so the rest of the compiler has a representation to lower.
+
+### 3. Native Literal Suffixes (Literal Add-ons)
+*   Captured in the Lexer with zero runtime cost: Time (`ms`, `s`, `m`, `h`, `d`), Data (`b`, `kb`, `mb`, `gb`), and socket Bandwidth (`kbps`, `mbps`, `gbps`).
+
+---
+
+## 🧵 PHASE 11: Advanced Concurrency, Signaling & Duplex Channels
+*Native concurrency primitives beyond the base M:N scheduler delivered in Phase 8.*
+
+*   `routines`: Fire pure background tasks and executions at the runtime level.
+*   `duplex chan`: Full-Duplex native channels (symmetric, bidirectional) managing isolated RX and TX buses at the hardware level. Has an internal state machine able to signal a legitimate close (`.close()`) or drops/failures, unblocking and waking threads stuck during a panic and returning structured errors. Can be used as a safe alternative model for consuming isolated dependencies without export.
+*   `delayed chan`: Timed channels. Messages receive timestamps and consumer threads are suspended on the Timer Queue, woken by interrupts.
+*   `broadcast chan`: Non-destructive 1:N Pub-Sub channels based on registers.
+*   Automated Shared Memory: `shared` block and `atomic` control. The compiler transparently injects lightweight locks (Spinlocks/Memory Fences).
+*   `circuit` (Circuit Breaker) coupled with `retry` routines:
+    *   Support for `exponential` and `logarithmic` backoff algorithms.
+    *   Limit by `attempts`, global `timeout`, or both combined.
+    *   If both limits are provided, the compiler computes the incremental relative retry time, branching straight to the `fallback` if the time limit is exceeded.
+
+---
+
+## 🧱 PHASE 12: Bare-Metal Object-Oriented Paradigm
+*Object orientation with zero runtime reflection overhead.*
+
+*   Support for Concrete, Generic (`<T>` via monomorphization), and Abstract classes.
+*   Complete rejection of runtime object Attributes/Annotations.
+*   Multiple behavior inheritance implemented via `traits`.
+*   Event subsystem (`event`, `raise`, `subscribe`): behavior defined at subscription time — `fanout` (parallel Green Threads) or `fire_and_forget` (forgets).
+
+---
+
+## 🎯 PHASE 13: Zero-Overhead Optionals & Compile-Time Metaprogramming
+
+*   Nullability `?T` via packed Value Types. The Elvis operator (`??`) compiles directly to hardware conditional instructions (`je`/`cbz`).
+*   `comptime`: Code execution at build time. Metaprogramming happens during compilation.
+*   `soa` (Structure of Arrays): An optimization that reorganizes array layouts in RAM to enable pure native SIMD vectorization invisibly.
+*   `defer`: Syntactic registration of mandatory scope-closing routines.
+
+---
+
+## 🌐 PHASE 14: Native Networking, Web Architecture & Cryptography
+*Comprehensive networking from OSI Layer 4 to Layer 7, plus the native web keyword surface and hardware-accelerated cryptography.*
+
+### 1. Networking Stack
+*   Raw sockets, asynchronous TCP, UDP, and QUIC via io_uring/kqueue/IOCP.
+*   Native TLS 1.3 embedded in the IP bus.
+*   Integrated polyglot routing and handling spanning HTTP/1.x, HTTP/2, HTTP/3, HTTP/4, bidirectional WebSockets (`ws_chan`), and gRPC (RPC).
+
+### 2. Native Web Architecture by Keywords
+*   Expressive syntax for APIs and micro-applications (`api`, `middleware`, `get`, `post`, `put`, `delete`, `rpc`, `websocket`, `use`). Generation of static Radix trees compiled AOT.
+
+### 3. Hardware-Accelerated Cryptography (AES-NI/AVX)
+*   SHA256, SHA512, BLAKE3, AES256-GCM, CHACHA20-POLY1305, ED25519, and RSA.
+
+---
+
+## 🧩 PHASE 15: Enterprise Parsers & Embedded Template Compiler
+
+*   Linear O(1), reflection-free execution: `parse.json`, `parse.csv`, `parse.xml`.
+*   Native Template Engine integrated via rich String Literals: `html"""..."""`.
+*   Integrated Bundler and Minifier at compile time: `bundle()` and `minify` commands optimize and embed static CSS/JS/Assets into the `.rodata` section.
+
+---
+
+## 🔗 PHASE 16: Interoperability & Rich Metadata (`.teko_meta`)
+
+*   Lookup via `include_paths`, `static_links`, and `dynamic_links` in the `.tkp`.
+*   Teko modules embed rich type metadata in the `.teko_meta` section.
+*   Pure C objects expose signatures via automatic header (`.h`) parsing.
+*   Managed runtimes (non-AOT .NET, JVM) are isolated and handled via IPC. Native static support is guaranteed when .NET uses Native AOT compilation.
+
+---
+
+## 🧪 PHASE 17: Native Testing (`.tkt`) & Code Coverage
+
+*   `.tkt` extension for co-located test files (same tree as the object under test). The release build ignores these files automatically.
+*   Native Code Coverage via codegen-assisted instrumentation, injecting counters into RAM at the start of each Basic Block. The linker embeds the `.teko_cov_map` section associating counters with code lines. The runtime dumps the counters at process end in a binary format (`.tkcov`).
+
+---
+
+# 🔄 Final Milestone (Phase 18)
+
+---
+
+## 🔄 PHASE 18: Self-Containment (Self-Hosting / Bootstrapping)
+*Originally phase 9. The final step that crowns the industrial maturity of a systems programming language: using the language itself to compile itself.*
+
+### 1. Translating the Compiler Modules from C to Teko
+*   The Frontend (Lexer, Parser, AST Parser) and the Backend (Type Checker, Intermediate Codegen, Metal Codegen, Linker) will be entirely rewritten using the syntax and native features of the Teko language (type safety, strict mutability control, and automatic dependency injection).
+
+### 2. The Bootstrapping Execution Cycle
+To certify bit-for-bit stability and total language independence, industrial validation occurs in a closed three-stage cross-compilation cycle:
+1.  **Stage 1:** The original stable compiler (written in C) reads the new source code (written in Teko). The generated output is **Compiler Binary A**.
+2.  **Stage 2:** **Compiler Binary A** takes over and reads the same Teko source code again. The generated output is **Compiler Binary B**.
+3.  **Stage 3 (Validation):** **Compiler Binary B** compiles the Teko source a third time, generating **Compiler Binary C**.
+4.  **Final Validation:** **Binary C** and **Binary B** must be rigorously and mathematically **bit-for-bit identical** at the hash checksum level. When this cycle closes, the Teko compiler is **100% autonomous, C-free, and self-contained**.

@@ -8,7 +8,7 @@ static void stmt_advance(Parser* parser) {
     parser->peek_token = lexer_next_token(parser->lexer);
 }
 
-// Auxiliar para engolir múltiplos nós internos de escopo block { ... }
+// Helper to consume multiple inner nodes within a block scope { ... }
 static void parse_block_statements(Parser* parser, StatementASTNode*** list, int* count) {
     int cap = 4;
     *list = (StatementASTNode**)malloc(sizeof(StatementASTNode*) * cap);
@@ -28,14 +28,14 @@ static void parse_block_statements(Parser* parser, StatementASTNode*** list, int
         if (stmt != NULL) {
             (*list)[(*count)++] = stmt;
         } else {
-            stmt_advance(parser); // Evita travamentos caso venha um token inválido
+            stmt_advance(parser); // Prevents stalls if an invalid token is encountered
         }
     }
 }
 
-// Analisa declarações de funções locais (incluindo async fn main)
+// Parses local function declarations (including async fn main)
 StatementASTNode* parse_function_declaration(Parser* parser, bool is_async) {
-    stmt_advance(parser); // Consome 'fn'
+    stmt_advance(parser); // Consume 'fn'
 
     StatementASTNode* node = (StatementASTNode*)malloc(sizeof(StatementASTNode));
     node->type = NODE_FUNC_DECL;
@@ -52,9 +52,9 @@ StatementASTNode* parse_function_declaration(Parser* parser, bool is_async) {
         stmt_advance(parser);
     }
 
-    // Varre parâmetros da função: (ctx: arena, args: str[])
+    // Scan function parameters: (ctx: arena, args: str[])
     if (parser->current_token.type == TOKEN_LPAREN) {
-        stmt_advance(parser); // Consome '('
+        stmt_advance(parser); // Consume '('
         int cap = 4;
         node->data.func_decl.params = (FuncParamNode*)malloc(sizeof(FuncParamNode) * cap);
 
@@ -71,16 +71,16 @@ StatementASTNode* parse_function_declaration(Parser* parser, bool is_async) {
 
                 FuncParamNode* p = &node->data.func_decl.params[node->data.func_decl.param_count++];
                 p->param_name = strdup(parser->current_token.lexeme);
-                stmt_advance(parser); // Consome nome
+                stmt_advance(parser); // Consume name
 
                 if (parser->current_token.type == TOKEN_COLON) {
-                    stmt_advance(parser); // Consome ':'
+                    stmt_advance(parser); // Consume ':'
                     p->param_type = parse_complete_type_info(parser);
                 } else {
                     p->param_type = NULL;
                 }
             } else {
-                stmt_advance(parser); // Consome token inválido dentro dos parênteses
+                stmt_advance(parser); // Consume invalid token inside parentheses
             }
 
             if (parser->current_token.type == TOKEN_COMMA) {
@@ -104,40 +104,40 @@ StatementASTNode* parse_function_declaration(Parser* parser, bool is_async) {
     return node;
 }
 
-// Analisa instruções locais de variáveis: let/mut nome [: tipo] = expr;
+// Parses local variable statements: let/mut name [: type] = expr;
 StatementASTNode* parse_variable_declaration(Parser* parser) {
-    // 1. Variáveis locais temporárias simples para coleta de dados
+    // 1. Simple local temporary variables for data collection
     bool is_mut = (parser->current_token.type == TOKEN_MUT);
     char* local_var_name = NULL;
     TypeInfo* local_var_type = NULL;
     char* local_initializer_raw = NULL;
 
-    stmt_advance(parser); // Consome 'let' ou 'mut'
+    stmt_advance(parser); // Consume 'let' or 'mut'
 
-    // Valida o identificador obrigatório
+    // Validate the mandatory identifier
     if (parser->current_token.type == TOKEN_IDENTIFIER) {
         local_var_name = strdup(parser->current_token.lexeme);
         stmt_advance(parser);
     } else {
-        // Se falhar aqui, nenhum nó estrutural foi alocado no Heap ainda.
-        // Não há chance matemática de vazamento.
+        // If it fails here, no structural node has been allocated on the heap yet.
+        // There is no possibility of a leak.
         return NULL;
     }
 
-    // Processa tipo opcional ': tipo'
+    // Process optional type annotation ': type'
     if (parser->current_token.type == TOKEN_COLON) {
         stmt_advance(parser);
         local_var_type = parse_complete_type_info(parser);
         if (!local_var_type) {
-            // Se falhar o parsing do tipo, limpa o nome clonado e sai com segurança
+            // If type parsing fails, free the cloned name and exit safely
             free(local_var_name);
             return NULL;
         }
     }
 
-    // Processa a inicialização '='
+    // Process the initializer '='
     if (parser->current_token.type == TOKEN_ASSIGN) {
-        stmt_advance(parser); // Consome '='
+        stmt_advance(parser); // Consume '='
 
         int expr_start = parser->lexer->cursor;
         while (true) {
@@ -161,7 +161,7 @@ StatementASTNode* parse_variable_declaration(Parser* parser) {
             strncpy(local_initializer_raw, &parser->lexer->source[expr_start], expr_len);
             local_initializer_raw[expr_len] = '\0';
 
-            // Sanitiza os caracteres de formatação residuais
+            // Strip trailing formatting characters
             int last_idx = expr_len - 1;
             while (last_idx >= 0 && (local_initializer_raw[last_idx] == ';' ||
                                      local_initializer_raw[last_idx] == ' ' ||
@@ -177,7 +177,7 @@ StatementASTNode* parse_variable_declaration(Parser* parser) {
         stmt_advance(parser);
     }
 
-    // 2. ALOCAÇÃO TARDIA: Tudo passou com sucesso? Só agora instanciamos o nó na memória Heap!
+    // 2. LATE ALLOCATION: Did everything succeed? Only now do we instantiate the node on the heap!
     StatementASTNode* node = (StatementASTNode*)malloc(sizeof(StatementASTNode));
     if (!node) {
         free(local_var_name);
@@ -195,28 +195,28 @@ StatementASTNode* parse_variable_declaration(Parser* parser) {
     return node;
 }
 
-// Analisa loops estruturados: for (mut i: i32; i < 10; i++) { ... }
+// Parses structured loops: for (mut i: i32; i < 10; i++) { ... }
 StatementASTNode* parse_for_loop(Parser* parser) {
-    // 1. Variáveis locais temporárias simples para coleta de dados
+    // 1. Simple local temporary variables for data collection
     StatementASTNode* local_init_stmt = NULL;
     char* local_condition_raw = NULL;
     char* local_increment_raw = NULL;
 
-    stmt_advance(parser); // Consome 'for'
+    stmt_advance(parser); // Consume 'for'
 
     if (parser->current_token.type == TOKEN_LPAREN) {
-        stmt_advance(parser); // Consome '('
+        stmt_advance(parser); // Consume '('
 
-        // Processa inicializador do loop
+        // Process the loop initializer
         if (parser->current_token.type == TOKEN_LET || parser->current_token.type == TOKEN_MUT) {
             local_init_stmt = parse_variable_declaration(parser);
             if (!local_init_stmt) {
-                // Aborta imediatamente sem deixar nós órfãos
+                // Abort immediately without leaving orphan nodes
                 return NULL;
             }
         }
 
-        // Processa expressão de condição
+        // Process the condition expression
         int cond_start = parser->lexer->cursor;
         while (true) {
             if (parser->current_token.type == TOKEN_SEMICOLON || parser->current_token.type == TOKEN_EOF) {
@@ -240,7 +240,7 @@ StatementASTNode* parse_for_loop(Parser* parser) {
             stmt_advance(parser);
         }
 
-        // Processa expressão de incremento
+        // Process the increment expression
         int inc_start = parser->lexer->cursor;
         while (true) {
             if (parser->current_token.type == TOKEN_RPAREN || parser->current_token.type == TOKEN_EOF) {
@@ -262,14 +262,14 @@ StatementASTNode* parse_for_loop(Parser* parser) {
         }
 
         if (parser->current_token.type == TOKEN_RPAREN) {
-            stmt_advance(parser); // Consome ')'
+            stmt_advance(parser); // Consume ')'
         }
     } else {
-        // Se falhar o parêntese inicial, sai sem nenhuma alocação estrutural no Heap
+        // If the opening parenthesis is missing, exit without any structural heap allocation
         return NULL;
     }
 
-    // 2. ALOCAÇÃO TARDIA: Instancia o corpo estruturado principal do loop
+    // 2. LATE ALLOCATION: Instantiate the main structured body of the loop
     StatementASTNode* node = (StatementASTNode*)malloc(sizeof(StatementASTNode));
     if (!node) {
         if (local_init_stmt) free_statement_ast_node(local_init_stmt);
@@ -285,7 +285,7 @@ StatementASTNode* parse_for_loop(Parser* parser) {
     node->data.for_loop.body_statements = NULL;
     node->data.for_loop.body_count = 0;
 
-    // Captura o bloco interno '{ ... }' diretamente anexado ao nó pai validado
+    // Capture the inner block '{ ... }' directly attached to the validated parent node
     if (parser->current_token.type == TOKEN_LBRACE) {
         stmt_advance(parser);
         parse_block_statements(parser, &node->data.for_loop.body_statements, &node->data.for_loop.body_count);
@@ -297,10 +297,10 @@ StatementASTNode* parse_for_loop(Parser* parser) {
     return node;
 }
 
-// Roteador central de instruções (Statement dispatcher)
+// Central statement router (statement dispatcher)
 StatementASTNode* parse_statement(Parser* parser) {
     if (parser->current_token.type == TOKEN_ASYNC && parser->peek_token.type == TOKEN_FN) {
-        stmt_advance(parser); // Consome 'async'
+        stmt_advance(parser); // Consume 'async'
         return parse_function_declaration(parser, true);
     }
     if (parser->current_token.type == TOKEN_FN) {
@@ -313,8 +313,8 @@ StatementASTNode* parse_statement(Parser* parser) {
         return parse_for_loop(parser);
     }
 
-    // CORREÇÃO DO LEAK 111 / GLOBAL SCOPE:
-    // Só aloca e processa o fallback de instrução genérica se houver um token válido a ser consumido.
+    // LEAK FIX 111 / GLOBAL SCOPE:
+    // Only allocate and process the generic statement fallback if there is a valid token to consume.
     if (parser->current_token.type == TOKEN_EOF || parser->current_token.type == TOKEN_UNKNOWN) {
         return NULL;
     }
@@ -340,7 +340,7 @@ StatementASTNode* parse_statement(Parser* parser) {
     return node;
 }
 
-// Liberação de memória recursiva limpa e segura contra ponteiros nulos
+// Clean and null-safe recursive memory deallocation
 void free_statement_ast_node(StatementASTNode* node) {
     if (!node) return;
 

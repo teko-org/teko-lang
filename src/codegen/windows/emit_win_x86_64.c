@@ -109,7 +109,7 @@ void emit_win_x86_64(MetalContext* ctx, OpCode op, int32_t arg) {
             break;
 
         default:
-            // RESSURREIÇÃO DCE: Injeta a label x64 acima de 100
+            // DCE RESURRECTION: Injects the x64 label above 100
             if ((int)op >= 100) {
                 fprintf(ctx->file, ".L_win64_label_%d:\n", (int)op);
             }

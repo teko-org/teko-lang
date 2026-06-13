@@ -8,7 +8,7 @@ TekoTarget teko_target_detect_host(void) {
     target.os = OS_UNKNOWN;
     strcpy(target.target_string, "unknown-unknown-unknown");
 
-    // 1. Detecção Detalhada da Arquitetura do Host
+    // 1. Detailed Detection of the Host Architecture
 #if defined(__APPLE__) && defined(__aarch64__)
     target.arch = ARCH_APPLE_SILICON;
 #elif defined(__aarch64__) || defined(_M_ARM64)
@@ -27,7 +27,7 @@ TekoTarget teko_target_detect_host(void) {
     target.arch = ARCH_ARM32;
 #endif
 
-    // 2. Detecção do Sistema Operacional do Host
+    // 2. Detection of the Host Operating System
 #if defined(__APPLE__) && defined(__MACH__)
     target.os = OS_MACOS_DARWIN;
 #elif defined(__linux__)
@@ -36,7 +36,7 @@ TekoTarget teko_target_detect_host(void) {
     target.os = OS_WINDOWS;
 #endif
 
-    // 3. Traduz o Host detectado para a string canônica aceita pelo ecossistema LLVM
+    // 3. Translates the detected host into the canonical string accepted by the LLVM ecosystem
     const char* arch_str = "unknown";
     switch (target.arch) {
         case ARCH_APPLE_SILICON: arch_str = "aarch64"; break;
@@ -62,14 +62,14 @@ TekoTarget teko_target_detect_host(void) {
     return target;
 }
 
-// Analisador dinâmico de Cross-Compilation injetado por parâmetros de rua (ex: teko build --target wasm32-wasi)
+// Dynamic cross-compilation parser driven by command-line parameters (e.g. teko build --target wasm32-wasi)
 TekoTarget teko_target_parse(const char* target_str) {
     TekoTarget target = { ARCH_UNKNOWN, OS_UNKNOWN, "" };
     if (!target_str) return target;
 
     strncpy(target.target_string, target_str, sizeof(target.target_string) - 1);
 
-    // Mapeamento exaustivo de chaves textuais da arquitetura
+    // Exhaustive mapping of architecture text keys
     if (strstr(target_str, "x86_64"))      target.arch = ARCH_X86_64;
     else if (strstr(target_str, "i386") || strstr(target_str, "x86")) target.arch = ARCH_X86;
     else if (strstr(target_str, "apple-darwin") && (strstr(target_str, "aarch64") || strstr(target_str, "arm64"))) target.arch = ARCH_APPLE_SILICON;
@@ -83,7 +83,7 @@ TekoTarget teko_target_parse(const char* target_str) {
     else if (strstr(target_str, "powerpc") || strstr(target_str, "ppc"))  target.arch = ARCH_PPC64;
     else if (strstr(target_str, "arm"))     target.arch = ARCH_ARM32;
 
-    // Mapeamento de ambientes operacionais e firmware bare-metal
+    // Mapping of operating environments and bare-metal firmware
     if (strstr(target_str, "darwin") || strstr(target_str, "apple") || strstr(target_str, "macos")) target.os = OS_MACOS_DARWIN;
     else if (strstr(target_str, "linux"))   target.os = OS_LINUX;
     else if (strstr(target_str, "windows") || strstr(target_str, "win32")) target.os = OS_WINDOWS;

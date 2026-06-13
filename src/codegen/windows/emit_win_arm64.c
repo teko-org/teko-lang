@@ -104,7 +104,7 @@ void emit_win_arm64(MetalContext* ctx, OpCode op, int32_t arg) {
             break;
 
         default:
-            // RESSURREIÇÃO DCE: Injeta a label ARM64 PE acima de 100
+            // DCE RESURRECTION: Injects the ARM64 PE label above 100
             if ((int)op >= 100) {
                 fprintf(ctx->file, ".L_win_arm_label_%d:\n", (int)op);
             }

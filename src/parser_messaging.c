@@ -8,14 +8,14 @@ static void msg_advance(Parser* parser) {
     parser->peek_token = lexer_next_token(parser->lexer);
 }
 
-// Analisa as propriedades internas de comandos, queries e notificações
+// Parses the internal properties of commands, queries, and notifications
 static void parse_message_properties(Parser* parser, MessageProperty** props, int* count) {
     int cap = 4;
     *props = (MessageProperty*)malloc(sizeof(MessageProperty) * cap);
     *count = 0;
 
     if (parser->current_token.type == TOKEN_LBRACE) {
-        msg_advance(parser); // Consome '{'
+        msg_advance(parser); // Consume '{'
 
         while (parser->current_token.type != TOKEN_RBRACE && parser->current_token.type != TOKEN_EOF) {
             bool is_req = false;
@@ -39,10 +39,10 @@ static void parse_message_properties(Parser* parser, MessageProperty** props, in
                 (*props)[*count].prop_name = strdup(parser->current_token.lexeme);
                 (*props)[*count].is_required = is_req;
                 (*props)[*count].is_mutable = is_mut;
-                msg_advance(parser); // Consome nome da propriedade
+                msg_advance(parser); // Consume property name
 
                 if (parser->current_token.type == TOKEN_COLON) {
-                    msg_advance(parser); // Consome ':'
+                    msg_advance(parser); // Consume ':'
                     (*props)[*count].prop_type = parse_complete_type_info(parser);
                 } else {
                     (*props)[*count].prop_type = NULL;
@@ -55,12 +55,12 @@ static void parse_message_properties(Parser* parser, MessageProperty** props, in
             }
         }
         if (parser->current_token.type == TOKEN_RBRACE) {
-            msg_advance(parser); // Consome '}'
+            msg_advance(parser); // Consume '}'
         }
     }
 }
 
-// Ponto de entrada para analisar estruturas: command, query e notification
+// Entry point to parse structures: command, query, and notification
 MessagingASTNode* parse_messaging_structure(Parser* parser) {
     auto node = (MessagingASTNode*)malloc(sizeof(MessagingASTNode));
     if (!node) return NULL;
@@ -94,9 +94,9 @@ MessagingASTNode* parse_messaging_structure(Parser* parser) {
     return node;
 }
 
-// Ponto de entrada: handler for Name { ... } com mapeamento das dependencias e suas Arenas
+// Entry point: handler for Name { ... } with dependency mapping and their arenas
 MessagingASTNode* parse_messaging_handler(Parser* parser) {
-    msg_advance(parser); // Consome 'handler'
+    msg_advance(parser); // Consume 'handler'
 
     if (strcmp(parser->current_token.lexeme, "for") == 0) {
         msg_advance(parser);
@@ -139,11 +139,11 @@ MessagingASTNode* parse_messaging_handler(Parser* parser) {
             }
         }
 
-        // Processa a injeção nativa 'with (DILifetime Type name)' dirigindo o tempo de vida da Arena
+        // Process native 'with (DILifetime Type name)' injection directing the arena lifetime
         if (strcmp(parser->current_token.lexeme, "with") == 0) {
-            msg_advance(parser); // Consome 'with'
+            msg_advance(parser); // Consume 'with'
             if (parser->current_token.type == TOKEN_LPAREN) {
-                msg_advance(parser); // Consome '('
+                msg_advance(parser); // Consume '('
                 int cap = 2;
                 node->data.msg_handler.dependencies = (HandlerDependency*)malloc(sizeof(HandlerDependency) * cap);
 
@@ -157,9 +157,9 @@ MessagingASTNode* parse_messaging_handler(Parser* parser) {
                     HandlerDependency* d = &node->data.msg_handler.dependencies[node->data.msg_handler.dependency_count];
                     d->dep_type = NULL;
                     d->dep_name = NULL;
-                    d->lifetime = LIFETIME_TRANSIENT; // Default amarrado à Arena destino
+                    d->lifetime = LIFETIME_TRANSIENT; // Default bound to the destination arena
 
-                    // Lê opcionalmente modificadores explícitos: singleton, scoped, transient [1]
+                    // Optionally read explicit modifiers: singleton, scoped, transient [1]
                     if (parser->current_token.type == TOKEN_IDENTIFIER) {
                         if (strcmp(parser->current_token.lexeme, "singleton") == 0) {
                             d->lifetime = LIFETIME_SINGLETON;
@@ -174,11 +174,11 @@ MessagingASTNode* parse_messaging_handler(Parser* parser) {
                     }
 
                     if (parser->current_token.type == TOKEN_IDENTIFIER) {
-                        d->dep_type = strdup(parser->current_token.lexeme); // Interface (ex: IEmailSender) [1]
+                        d->dep_type = strdup(parser->current_token.lexeme); // Interface (e.g.: IEmailSender) [1]
                         msg_advance(parser);
 
                         if (parser->current_token.type == TOKEN_IDENTIFIER) {
-                            d->dep_name = strdup(parser->current_token.lexeme); // Nome (ex: sender) [1]
+                            d->dep_name = strdup(parser->current_token.lexeme); // Name (e.g.: sender) [1]
                             msg_advance(parser);
                         }
                         node->data.msg_handler.dependency_count++;
@@ -205,7 +205,7 @@ MessagingASTNode* parse_messaging_handler(Parser* parser) {
     return node;
 }
 
-// Liberação em cascata limpa de memória contra leaks
+// Clean cascade memory deallocation against leaks
 void free_messaging_ast_node(MessagingASTNode* node) {
     if (!node) return;
     if (node->name) free(node->name);

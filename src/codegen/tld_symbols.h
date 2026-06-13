@@ -7,30 +7,30 @@
 #define MAX_SYMBOL_NAME 128
 #define MAX_SYMBOL_COUNT 512
 
-// Tipo de símbolo mapeado no silício
+// Symbol type mapped on silicon
 typedef enum {
-    SYM_FUNC,      // Função ou Método público
-    SYM_SERVICE,   // Serviço ou Injeção de Dependência nativa
-    SYM_RODATA     // String ou Constante imutável (.rodata)
+    SYM_FUNC,      // Public function or method
+    SYM_SERVICE,   // Service or native dependency injection
+    SYM_RODATA     // Immutable string or constant (.rodata)
 } TekoSymbolType;
 
-// Estrutura física de um Símbolo na Tabela do Linker
+// Physical structure of a Symbol in the Linker Table
 typedef struct {
     char name[MAX_SYMBOL_NAME];
     TekoSymbolType type;
-    uint64_t virtual_address; // Endereço virtual calculado na RAM (VMA)
-    uint32_t local_offset;     // Offset relativo dentro do seu próprio bloco de bytes
-    bool is_defined;          // True se o corpo físico foi fornecido, False se for dependência externa
+    uint64_t virtual_address; // Virtual address computed in RAM (VMA)
+    uint32_t local_offset;     // Relative offset within its own byte block
+    bool is_defined;          // True if the physical body was provided, False if it is an external dependency
 } TekoLinkerSymbol;
 
-// Estrutura de uma Referência Pendente (Onde a dependência foi invocada e precisa de injeção)
+// Structure of a Pending Reference (Where the dependency was invoked and needs injection)
 typedef struct {
-    char target_name[MAX_SYMBOL_NAME]; // Nome do símbolo que ela busca
-    uint32_t patch_offset;              // Posição exata no código onde os bytes do salto devem ser injetados
-    uint64_t call_site_vaddr;          // Endereço virtual de onde a chamada está ocorrendo
+    char target_name[MAX_SYMBOL_NAME]; // Name of the symbol it is looking for
+    uint32_t patch_offset;              // Exact position in the code where the jump bytes must be injected
+    uint64_t call_site_vaddr;          // Virtual address from which the call is occurring
 } TekoDependencyPatch;
 
-// Estrutura unificada da Tabela do Linker
+// Unified Linker Table structure
 typedef struct {
     TekoLinkerSymbol symbols[MAX_SYMBOL_COUNT];
     uint32_t symbol_count;
@@ -38,7 +38,7 @@ typedef struct {
     uint32_t patch_count;
 } TekoSymbolTable;
 
-// Assinaturas públicas do Gerenciador de Dependências do Linker
+// Public signatures of the Linker Dependency Manager
 void tld_symbols_init(TekoSymbolTable* table);
 bool tld_symbols_define(TekoSymbolTable* table, const char* name, TekoSymbolType type, uint32_t local_offset);
 void tld_symbols_reference(TekoSymbolTable* table, const char* target_name, uint32_t patch_offset);

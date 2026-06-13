@@ -18,7 +18,7 @@ void emit_win_x86(MetalContext* ctx, OpCode op, int32_t arg) {
             break;
 
         case OP_HALT:
-            fprintf(ctx->file, "    ;; [Windows x86 Halt]: Termina o processo via API Win32\n");
+            fprintf(ctx->file, "    ;; [Windows x86 Halt]: Terminates the process via Win32 API\n");
             fprintf(ctx->file, "    push 0\n");
             fprintf(ctx->file, "    call ExitProcess\n");
             break;
@@ -109,7 +109,7 @@ void emit_win_x86(MetalContext* ctx, OpCode op, int32_t arg) {
             break;
 
         default:
-            // RESSURREIÇÃO DCE: Injeta a label Win32 acima de 100
+            // DCE RESURRECTION: Injects the Win32 label above 100
             if ((int)op >= 100) {
                 fprintf(ctx->file, ".L_win32_label_%d:\n", (int)op);
             }

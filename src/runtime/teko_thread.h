@@ -4,7 +4,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-#define TEKO_STACK_SIZE (64 * 1024) // 64KB de pilha isolada por Green Thread
+#define TEKO_STACK_SIZE (64 * 1024) // 64KB of isolated stack per Green Thread
 #define MAX_THREADS     128
 
 typedef enum {
@@ -14,30 +14,30 @@ typedef enum {
     THREAD_ZOMBIE
 } TekoThreadState;
 
-// Estrutura física para preservação do contexto da CPU (Agnóstica por abstração)
+// Physical structure for CPU context preservation (abstraction-agnostic)
 typedef struct {
-    void*    esp;      // Ponteiro de Pilha (Stack Pointer)
+    void*    esp;      // Stack Pointer
     void*    ebp;      // Frame Pointer
-    void*    eip;      // Ponteiro de Instrução (Program Counter)
-    uint64_t regs[8];  // Registradores gerais callee-saved (r12-r15, rbx, etc.)
+    void*    eip;      // Instruction Pointer (Program Counter)
+    uint64_t regs[8];  // Callee-saved general registers (r12-r15, rbx, etc.)
 } TekoCpuContext;
 
-// Estrutura do Bloco de Controle de Thread (TCB)
+// Thread Control Block (TCB) structure
 typedef struct {
     uint32_t        id;
     TekoThreadState state;
-    uint8_t*        stack_memory;  // Ponteiro da pilha alocada
-    TekoCpuContext  context;       // Contexto salvo da CPU
+    uint8_t*        stack_memory;  // Pointer to the allocated stack
+    TekoCpuContext  context;       // Saved CPU context
 } TekoGreenThread;
 
-// O Escalonador Central M:N Cooperativo
+// The Central Cooperative M:N Scheduler
 typedef struct {
     TekoGreenThread threads[MAX_THREADS];
     uint32_t        thread_count;
-    int32_t         current_running_id; // ID da thread ativa na CPU
+    int32_t         current_running_id; // ID of the thread currently active on the CPU
 } TekoScheduler;
 
-// Assinaturas públicas do barramento concorrente nativo
+// Public signatures of the native concurrent bus
 void tld_scheduler_init(TekoScheduler* sched);
 int32_t tld_thread_spawn(TekoScheduler* sched, void (*fn)(void));
 void tld_thread_yield(TekoScheduler* sched);

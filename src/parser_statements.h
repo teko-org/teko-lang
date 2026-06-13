@@ -4,7 +4,7 @@
 #include "parser.h"
 #include "parser_types.h"
 
-// Nós para declarações e instruções restantes na AST
+// Nodes for remaining declarations and statements in the AST
 typedef enum {
     NODE_ELVIS_EXPR = 950,
     NODE_FUNC_DECL = 1000,
@@ -14,17 +14,17 @@ typedef enum {
     NODE_BLOCK_STMT
 } StatementASTNodeType;
 
-// Estrutura para representar parâmetros de funções locais
+// Structure representing local function parameters
 typedef struct FuncParamNode {
     char* param_name;
     TypeInfo* param_type;
 } FuncParamNode;
 
-// Nó unificado de instruções para a AST
+// Unified statement node for the AST
 typedef struct StatementASTNode {
     int type; // StatementASTNodeType
     union {
-        // Dados para declaração de funções: [async] fn nome(...) : tipo { ... }
+        // Data for function declarations: [async] fn name(...) : type { ... }
         struct {
             char* fn_name;
             bool is_async;
@@ -35,15 +35,15 @@ typedef struct StatementASTNode {
             int body_count;
         } func_decl;
 
-        // Dados para: let/mut nome: tipo = expressão;
+        // Data for: let/mut name: type = expression;
         struct {
             char* var_name;
             bool is_mutable;
-            TypeInfo* var_type; // Pode ser NULL se houver inferência
+            TypeInfo* var_type; // May be NULL when type inference is used
             char* initializer_raw;
         } var_decl;
 
-        // Dados para: for (mut i: i32; i < len; i++) { ... }
+        // Data for: for (mut i: i32; i < len; i++) { ... }
         struct {
             struct StatementASTNode* init_stmt;
             char* condition_raw;
@@ -52,14 +52,14 @@ typedef struct StatementASTNode {
             int body_count;
         } for_loop;
 
-        // Dados para expressões isoladas (Chamadas de métodos, macros @, atribuições simples)
+        // Data for standalone expressions (method calls, @ macros, simple assignments)
         struct {
             char* expression_raw;
         } expr_stmt;
     } data;
 } StatementASTNode;
 
-// Assinaturas públicas do Parser de Declarações e Instruções
+// Public signatures for the Declarations and Statements parser
 StatementASTNode* parse_function_declaration(Parser* parser, bool is_async);
 StatementASTNode* parse_variable_declaration(Parser* parser);
 StatementASTNode* parse_for_loop(Parser* parser);

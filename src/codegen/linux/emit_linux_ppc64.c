@@ -107,7 +107,7 @@ void emit_linux_ppc64(MetalContext* ctx, OpCode op, int32_t arg) {
             break;
 
         default:
-            // RESSURREIÇÃO DCE PPC64
+            // DCE RESURRECTION PPC64
             if ((int)op >= 100) {
                 fprintf(ctx->file, ".L_ppc64_label_%d:\n", (int)op);
             }

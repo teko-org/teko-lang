@@ -16,7 +16,7 @@ void emit_freebsd_arm64(MetalContext* ctx, OpCode op, int32_t arg) {
             break;
 
         case OP_HALT:
-            fprintf(ctx->file, "    ;; [FreeBSD ARM64 Halt]: sys_exit nativo via interrupcao svc\n");
+            fprintf(ctx->file, "    ;; [FreeBSD ARM64 Halt]: native sys_exit via svc interrupt\n");
             fprintf(ctx->file, "    mov w0, #0\n");
             fprintf(ctx->file, "    mov x8, #1\n");
             fprintf(ctx->file, "    svc #0\n");
@@ -105,7 +105,7 @@ void emit_freebsd_arm64(MetalContext* ctx, OpCode op, int32_t arg) {
             break;
 
         default:
-            // RESSURREIÇÃO DCE: Mapeia o rótulo RISC do FreeBSD para acima de 100
+            // DCE RESURRECTION: Maps the FreeBSD RISC label to above 100
             if ((int)op >= 100) {
                 fprintf(ctx->file, ".L_bsd_arm_label_%d:\n", (int)op);
             }

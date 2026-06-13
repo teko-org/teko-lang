@@ -104,7 +104,7 @@ void emit_linux_riscv32(MetalContext* ctx, OpCode op, int32_t arg) {
             break;
 
         default:
-            // RESSURREIÇÃO DCE RV32
+            // DCE RESURRECTION RV32
             if ((int)op >= 100) {
                 fprintf(ctx->file, ".L_rv32_label_%d:\n", (int)op);
             }

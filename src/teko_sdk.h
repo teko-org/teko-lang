@@ -9,7 +9,7 @@ typedef struct {
     const char* return_type_name;
 } VirtualSDKEntry;
 
-// Assinaturas atualizadas para o gerenciamento de diretório segregado
+// Updated signatures for segregated directory management
 void teko_sdk_inject_builtins(SymbolTableScope* global_scope);
 bool teko_sdk_is_reserved_intrinsic(const char* name);
 bool teko_sdk_verify_directory(const char* project_root);

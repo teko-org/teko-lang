@@ -6,20 +6,20 @@
 #include <string.h>
 
 // ====================================================================
-// 1. TESTE DO MOTOR WEBASSEMBLY NATIVO (WASM / WAT BARE-METAL)
+// 1. NATIVE WEBASSEMBLY ENGINE TEST (WASM / WAT BARE-METAL)
 // ====================================================================
 void test_teko_aot_wasm_pure_emission_integrity(void) {
     const char* asm_path = "output_wasm_test.wat";
 
     TekoTarget target;
-    target.arch = ARCH_WASM32; // Configura o processador virtual WASM
-    target.os = OS_WASI;      // OS abstrato para Web/Servidores
+    target.arch = ARCH_WASM32; // Configures the WASM virtual processor
+    target.os = OS_WASI;      // Abstract OS for Web/Servers
     strncpy(target.target_string, "wasm32-wasi", sizeof(target.target_string) - 1);
 
     MetalContext* ctx = teko_metal_create(asm_path, target);
     TEST_ASSERT_NOT_NULL(ctx);
 
-    // Injeta a sequência contígua da nossa ISA: Carga Constante -> Canal -> Parada
+    // Injects the contiguous sequence of our ISA: Constant Load -> Channel -> Halt
     unsigned char mock_wasm_bytes[] = {
         0x01, 0x2A, 0x00, 0x00, 0x00, // OP_ICONST 42 (5 bytes)
         0x12                          // OP_CHAN_INIT (1 byte)
@@ -39,7 +39,7 @@ void test_teko_aot_wasm_pure_emission_integrity(void) {
     buffer[bytes] = '\0';
     fclose(file);
 
-    // Asserções estruturadas validando a fidelidade da gramática S-Expression do WebAssembly
+    // Structured assertions validating the fidelity of the WebAssembly S-Expression grammar
     TEST_ASSERT_NOT_NULL(strstr(buffer, "(module"));
     TEST_ASSERT_NOT_NULL(strstr(buffer, "i32.const 42"));
     TEST_ASSERT_NOT_NULL(strstr(buffer, "(memory 1)"));

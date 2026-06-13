@@ -108,7 +108,7 @@ void emit_linux_x86(MetalContext* ctx, OpCode op, int32_t arg) {
             break;
 
         default:
-            // RESSURREIÇÃO DCE LINUX 32
+            // DCE RESURRECTION LINUX 32
             if ((int)op >= 100) {
                 fprintf(ctx->file, ".L_linux32_label_%d:\n", (int)op);
             }

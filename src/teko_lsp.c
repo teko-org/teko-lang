@@ -12,11 +12,11 @@ TekoLanguageServer* teko_lsp_create(void) {
     return server;
 }
 
-// Roteador corrigido e blindado contra variações de formatação JSON-RPC das IDEs
+// Fixed router, hardened against JSON-RPC formatting variations from IDEs
 LSPRequestKind teko_lsp_parse_request(const char* json_rpc_payload) {
     if (!json_rpc_payload) return LSP_REQ_UNKNOWN;
 
-    // Busca direta simplificada pelas assinaturas do protocolo unificado
+    // Simplified direct search for unified protocol signatures
     if (strstr(json_rpc_payload, "initialize"))         return LSP_REQ_INITIALIZE;
     if (strstr(json_rpc_payload, "didOpen"))            return LSP_REQ_DID_OPEN;
     if (strstr(json_rpc_payload, "didChange"))          return LSP_REQ_DID_CHANGE;
@@ -29,7 +29,7 @@ LSPRequestKind teko_lsp_parse_request(const char* json_rpc_payload) {
 void teko_lsp_process_formatting(TekoLanguageServer* server, const char* file_path) {
     if (!file_path) return;
     printf("Content-Length: 128\r\n\r\n");
-    printf("{\"jsonrpc\":\"2.0\",\"result\":[{\"range\":{\"start\":{\"line\":0,\"character\":0}},\"newText\":\"/* Codigo Formatado Teko */\\n\"}]);\n");
+    printf("{\"jsonrpc\":\"2.0\",\"result\":[{\"range\":{\"start\":{\"line\":0,\"character\":0}},\"newText\":\"/* Formatted Teko Code */\\n\"}]);\n");
 }
 
 void teko_lsp_send_diagnostics(TekoLanguageServer* server, const char* file_path, const char* error_msg, int line) {

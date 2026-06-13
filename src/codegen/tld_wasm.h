@@ -4,7 +4,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-// Assinatura mágica de 4 bytes e versão do cabeçalho binário WASM
+// 4-byte magic signature and version of the WASM binary header
 #define WASM_MAGIC_0        0x00
 #define WASM_MAGIC_1        0x61
 #define WASM_MAGIC_2        0x73
@@ -14,27 +14,27 @@
 #define WASM_VERSION_2      0x00
 #define WASM_VERSION_3      0x00
 
-// Identificadores de Seções Oficiais do Módulo WASM
+// Official WASM Module Section Identifiers
 typedef enum {
     WASM_SEC_CUSTOM   = 0,
-    WASM_SEC_TYPE     = 1,  // Assinaturas de funções
+    WASM_SEC_TYPE     = 1,  // Function signatures
     WASM_SEC_IMPORT   = 2,
-    WASM_SEC_FUNCTION = 3,  // Índices de funções
+    WASM_SEC_FUNCTION = 3,  // Function indices
     WASM_SEC_TABLE    = 4,
-    WASM_SEC_MEMORY   = 5,  // Declaração de memória linear
+    WASM_SEC_MEMORY   = 5,  // Linear memory declaration
     WASM_SEC_GLOBAL   = 6,
-    WASM_SEC_EXPORT   = 7,  // Exportações de main/funções
+    WASM_SEC_EXPORT   = 7,  // Exports of main/functions
     WASM_SEC_START    = 8,
     WASM_SEC_ELEMENT  = 9,
-    WASM_SEC_CODE     = 10, // Corpo binário das instruções (Opcodes)
-    WASM_SEC_DATA     = 11  // Strings estáticas e pooling (.rodata)
+    WASM_SEC_CODE     = 10, // Binary instruction body (Opcodes)
+    WASM_SEC_DATA     = 11  // Static strings and pooling (.rodata)
 } TekoWasmSectionId;
 
-// Tipos de Dados Primitivos do WebAssembly
+// WebAssembly Primitive Data Types
 #define WASM_TYPE_I32      0x7F
 #define WASM_TYPE_FUNC     0x60
 
-// Assinatura pública do motor do Linker WASM Binário
+// Public signature of the Binary WASM Linker engine
 uint32_t tld_wasm_encode_leb128(uint32_t value, uint8_t* out_buffer);
 bool tld_wasm_write_module(const char* filename, const uint8_t* code_payload, uint32_t payload_size);
 

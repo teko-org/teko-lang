@@ -4,24 +4,24 @@
 #include <stdbool.h>
 #include "project_manager.h"
 
-// Tipos de requisições padronizadas pelo protocolo LSP
+// Request types standardized by the LSP protocol
 typedef enum {
-    LSP_REQ_INITIALIZE,      // Mapeia o aperto de mão inicial da IDE
-    LSP_REQ_DID_OPEN,        // Notifica que o usuário abriu um arquivo .tks
-    LSP_REQ_DID_CHANGE,      // Notifica alteração de texto em tempo real (para linter)
-    LSP_REQ_FORMATTING,      // Disparado no atalho de formatar código (fmt)
-    LSP_REQ_COMPLETION,      // Disparado para autocompletar métodos (ex: @marshall.)
+    LSP_REQ_INITIALIZE,      // Maps the initial handshake from the IDE
+    LSP_REQ_DID_OPEN,        // Notifies that the user opened a .tks file
+    LSP_REQ_DID_CHANGE,      // Notifies real-time text changes (for the linter)
+    LSP_REQ_FORMATTING,      // Triggered by the format code shortcut (fmt)
+    LSP_REQ_COMPLETION,      // Triggered for method autocompletion (e.g. @marshall.)
     LSP_REQ_UNKNOWN
 } LSPRequestKind;
 
-// Estrutura do Servidor LSP (tekols)
+// LSP Server structure (tekols)
 typedef struct {
     bool is_initialized;
     char* current_workspace_root;
     TekoProjectConfig* active_project;
 } TekoLanguageServer;
 
-// Assinaturas públicas do Servidor de Linguagem
+// Public signatures of the Language Server
 TekoLanguageServer* teko_lsp_create(void);
 LSPRequestKind teko_lsp_parse_request(const char* json_rpc_payload);
 void teko_lsp_process_formatting(TekoLanguageServer* server, const char* file_path);

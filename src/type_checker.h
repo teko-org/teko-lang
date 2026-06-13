@@ -10,7 +10,7 @@ typedef enum {
     TYPE_ERR_INCOMPATIBLE_ASSIGN,
     TYPE_ERR_IMMUTABLE_WRITE,
     TYPE_ERR_UNDECLARED_SYMBOL,
-    TYPE_ERR_ESCAPE_VIOLATION     // Novo: Erro se houver fuga ilegal de escopo
+    TYPE_ERR_ESCAPE_VIOLATION     // New: Error if there is an illegal scope escape
 } TypeErrorKind;
 
 typedef struct TypeCheckResult {
@@ -19,7 +19,7 @@ typedef struct TypeCheckResult {
     TypeInfo* resolved_type;
 } TypeCheckResult;
 
-// Funções públicas do Type Checker expandido
+// Public functions of the expanded Type Checker
 TypeCheckResult check_statement_types(SymbolTableScope* scope, const StatementASTNode* stmt);
 TypeCheckResult check_expression_type(SymbolTableScope* scope, const char* raw_expression);
 TypeCheckResult validate_elvis_operator_types(TypeInfo* left_type, TypeInfo* right_type);

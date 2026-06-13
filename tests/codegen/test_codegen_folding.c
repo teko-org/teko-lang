@@ -15,8 +15,8 @@ void test_teko_aot_constant_folding_math_collapse(void) {
     MetalContext* ctx = teko_metal_create(asm_path, target);
     TEST_ASSERT_NOT_NULL(ctx);
 
-    // Injeta a sequência: OP_ICONST 20 (0x01) -> OP_ICONST 30 (0x01) -> OP_ADD (0x05)
-    // O compilador DEVE colapsar em uma unica instrucao: OP_ICONST 50
+    // Injects the sequence: OP_ICONST 20 (0x01) -> OP_ICONST 30 (0x01) -> OP_ADD (0x05)
+    // The compiler MUST collapse into a single instruction: OP_ICONST 50
     unsigned char mock_folding_bytes[] = {
         0x01, 0x14, 0x00, 0x00, 0x00, // OP_ICONST 20
         0x01, 0x1E, 0x00, 0x00, 0x00, // OP_ICONST 30
@@ -35,15 +35,15 @@ void test_teko_aot_constant_folding_math_collapse(void) {
     buffer[bytes] = '\0';
     fclose(file);
 
-    // ASSERÇÃO DE SUCESSO DO FOLDING:
-    // O mnemônico de carga com o valor colapsado de "50" DEVE existir!
+    // FOLDING SUCCESS ASSERTION:
+    // The load mnemonic with the collapsed value "50" MUST exist!
     TEST_ASSERT_NOT_NULL(strstr(buffer, "mov w0, #50"));
 
-    // As instrucoes individuais originais nao podem ter sido escritas no arquivo final!
+    // The original individual instructions must not have been written to the final file!
     TEST_ASSERT_NULL(strstr(buffer, "mov w0, #20"));
     TEST_ASSERT_NULL(strstr(buffer, "mov w0, #30"));
 
-    // O mnemônico de adicao fisica da CPU tambem foi removido porque a expressao morreu em compilação!
+    // The physical CPU addition mnemonic was also removed because the expression died at compile time!
     TEST_ASSERT_NULL(strstr(buffer, "add w0, w0, w1"));
 
     free(buffer);

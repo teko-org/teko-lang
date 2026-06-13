@@ -10,23 +10,23 @@ typedef enum {
     SYM_FUNCTION
 } SymbolKind;
 
-// Estrutura para representar uma entrada individual na tabela
+// Structure representing an individual entry in the table
 typedef struct Symbol {
     char* name;
     SymbolKind kind;
     TypeInfo* type_info;
-    bool is_mutable;           // Controla se foi declarada com let (false) ou mut (true)
-    struct Symbol* next;       // Encadeamento para tratamento de colisões (Chaining)
+    bool is_mutable;           // Controls whether declared with let (false) or mut (true)
+    struct Symbol* next;       // Linked list for collision handling (chaining)
 } Symbol;
 
-// Estrutura que representa um nível de escopo (Hierarquia Aninhada)
+// Structure representing a scope level (nested hierarchy)
 typedef struct SymbolTableScope {
     Symbol** buckets;
     int size;
-    struct SymbolTableScope* parent_scope; // Aponta para o escopo pai (Escopo Superior)
+    struct SymbolTableScope* parent_scope; // Points to the parent scope (outer scope)
 } SymbolTableScope;
 
-// Assinaturas públicas da Tabela de Símbolos
+// Public Symbol Table function signatures
 SymbolTableScope* symbol_table_create_scope(SymbolTableScope* parent);
 bool symbol_table_insert(SymbolTableScope* scope, const char* name, SymbolKind kind, TypeInfo* type, bool is_mutable);
 Symbol* symbol_table_lookup(SymbolTableScope* scope, const char* name);

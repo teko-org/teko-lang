@@ -4,13 +4,13 @@
 #include "parser_statements.h"
 #include <stdio.h>
 
-// Estrutura que gerencia o buffer de escrita do arquivo C transpilado
+// Structure that manages the write buffer of the transpiled C file
 typedef struct {
     FILE* file;
     int indent_level;
 } AOTContext;
 
-// Assinaturas públicas do Backend AOT
+// Public signatures of the AOT Backend
 AOTContext* codegen_aot_create(const char* output_c_path);
 void codegen_aot_emit_header(AOTContext* ctx, const char* project_name);
 void codegen_aot_emit_statement(AOTContext* ctx, const StatementASTNode* stmt);

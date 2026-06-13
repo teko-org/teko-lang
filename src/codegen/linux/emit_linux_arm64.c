@@ -6,7 +6,7 @@ void emit_linux_arm64(MetalContext* ctx, OpCode op, int32_t arg) {
 
     switch (op) {
         // ====================================================================
-        // 1. DIRETIVAS DE INICIALIZAÇÃO, SÍMBOLOS E PRÓLOGO (AAPCS64 ELF ABI)
+        // 1. INITIALIZATION DIRECTIVES, SYMBOLS AND PROLOGUE (AAPCS64 ELF ABI)
         // ====================================================================
         case OP_PROLOG:
             fprintf(ctx->file, ";; ==================================================\n");
@@ -16,20 +16,20 @@ void emit_linux_arm64(MetalContext* ctx, OpCode op, int32_t arg) {
             fprintf(ctx->file, ".align 4\n\n");
             fprintf(ctx->file, "main:\n");
 
-            // Prólogo ELF: Reserva frame alinhado de 32 bytes na pilha física.
-            // Preserva x29 (FP), x30 (LR) e o cursor da nossa Arena (x19)
+            // ELF Prologue: Reserves a 32-byte aligned frame on the physical stack.
+            // Preserves x29 (FP), x30 (LR) and our Arena cursor (x19)
             fprintf(ctx->file, "    stp x29, x30, [sp, #-32]!\n");
             fprintf(ctx->file, "    str x19, [sp, #16]\n");
             fprintf(ctx->file, "    mov x29, sp\n\n");
             break;
 
         // ====================================================================
-        // 2. OPCODES DE LITERAIS, REGISTRADORES E CONVERSÃO
+        // 2. LITERAL, REGISTER AND CONVERSION OPCODES
         // ====================================================================
         case OP_HALT:
-            fprintf(ctx->file, "    ;; [Linux ARM64 Halt]: sys_exit nativo via interrupcao svc\n");
-            fprintf(ctx->file, "    mov w0, #0\n");   // Código de saída 0 em w0
-            fprintf(ctx->file, "    mov x8, #93\n");  // Número da syscall exit no Linux AArch64 é 93
+            fprintf(ctx->file, "    ;; [Linux ARM64 Halt]: native sys_exit via svc interrupt\n");
+            fprintf(ctx->file, "    mov w0, #0\n");   // Exit code 0 in w0
+            fprintf(ctx->file, "    mov x8, #93\n");  // Linux AArch64 exit syscall number is 93
             fprintf(ctx->file, "    svc #0\n");       // Supervisor Call (Syscall trap)
             break;
 
@@ -51,7 +51,7 @@ void emit_linux_arm64(MetalContext* ctx, OpCode op, int32_t arg) {
             break;
 
         // ====================================================================
-        // 3. MOTOR ARITMÉTICO CORE RISC DE 32 BITS
+        // 3. 32-BIT RISC CORE ARITHMETIC ENGINE
         // ====================================================================
         case OP_ADD:
             fprintf(ctx->file, "    add w0, w0, w1\n");
@@ -76,7 +76,7 @@ void emit_linux_arm64(MetalContext* ctx, OpCode op, int32_t arg) {
             break;
 
         // ====================================================================
-        // 4. GERENCIAMENTO DE MEMÓRIA POR REGIÃO (ARENA NATIVA O(1))
+        // 4. REGION-BASED MEMORY MANAGEMENT (NATIVE ARENA O(1))
         // ====================================================================
         case OP_ARENA_PUSH:
             fprintf(ctx->file, "    sub sp, sp, #1024\n");
@@ -88,7 +88,7 @@ void emit_linux_arm64(MetalContext* ctx, OpCode op, int32_t arg) {
             break;
 
         // ====================================================================
-        // 5. PARALELISMO E CANAIS (INTRINSICS THREADS DO LINUX)
+        // 5. PARALLELISM AND CHANNELS (LINUX THREAD INTRINSICS)
         // ====================================================================
         case OP_SPAWN_ASYNC:
             fprintf(ctx->file, "    ;; --- [Linux ARM64 Spawn via pthread_create] ---\n");
@@ -109,7 +109,7 @@ void emit_linux_arm64(MetalContext* ctx, OpCode op, int32_t arg) {
             break;
 
         // ====================================================================
-        // 6. CONTROLE DE FLUXO, DESVIOS E EPÍLOGO
+        // 6. CONTROL FLOW, BRANCHES AND EPILOGUE
         // ====================================================================
         case OP_JMP:
             fprintf(ctx->file, "    b .L_linux_arm_label_%d\n", arg);
@@ -127,7 +127,7 @@ void emit_linux_arm64(MetalContext* ctx, OpCode op, int32_t arg) {
             break;
 
         default:
-            // RESSURREIÇÃO DCE LINUX ARM64
+            // DCE RESURRECTION LINUX ARM64
             if ((int)op >= 100) {
                 fprintf(ctx->file, ".L_linux_arm_label_%d:\n", (int)op);
             }

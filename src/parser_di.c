@@ -8,7 +8,7 @@ static void di_advance(Parser* parser) {
     parser->peek_token = lexer_next_token(parser->lexer);
 }
 
-// Analisa a lista de assinaturas de métodos dentro dos blocos de DI
+// Parses the list of method signatures inside DI blocks
 static void parse_di_methods(Parser* parser, DIMethodSignature** methods, int* count) {
     int cap = 4;
     *methods = (DIMethodSignature*)malloc(sizeof(DIMethodSignature) * cap);
@@ -74,7 +74,7 @@ static void parse_di_methods(Parser* parser, DIMethodSignature** methods, int* c
     }
 }
 
-// Analisa: [exp] interface IEmailSender { ... }
+// Parses: [exp] interface IEmailSender { ... }
 DIASTNode* parse_di_interface(Parser* parser, bool is_exported) {
     di_advance(parser);
 
@@ -100,7 +100,7 @@ DIASTNode* parse_di_interface(Parser* parser, bool is_exported) {
     return node;
 }
 
-// Analisa: service EmailSender : IEmailSender { ... }
+// Parses: service EmailSender : IEmailSender { ... }
 DIASTNode* parse_di_service(Parser* parser) {
     di_advance(parser);
 
@@ -134,7 +134,7 @@ DIASTNode* parse_di_service(Parser* parser) {
     return node;
 }
 
-// Analisa: decorates(next: IEmailSender, 0) { ... }
+// Parses: decorates(next: IEmailSender, 0) { ... }
 DIASTNode* parse_di_decorator(Parser* parser) {
     di_advance(parser);
 
@@ -184,14 +184,14 @@ DIASTNode* parse_di_decorator(Parser* parser) {
     return node;
 }
 
-// Analisa cláusula 'with' com suporte explícito a escopos de alocação de Arena
+// Parses the 'with' clause with explicit support for arena allocation scopes
 static void parse_handler_dependencies_with_arenas(Parser* parser, HandlerDependency** deps, int* count) {
     int cap = 2;
     *deps = (HandlerDependency*)malloc(sizeof(HandlerDependency) * cap);
     *count = 0;
 
     if (parser->current_token.type == TOKEN_LPAREN) {
-        di_advance(parser); // Consome '('
+        di_advance(parser); // Consume '('
 
         while (true) {
             if (parser->current_token.type == TOKEN_RPAREN || parser->current_token.type == TOKEN_EOF) {
@@ -206,9 +206,9 @@ static void parse_handler_dependencies_with_arenas(Parser* parser, HandlerDepend
             HandlerDependency* d = &(*deps)[*count];
             d->dep_type = NULL;
             d->dep_name = NULL;
-            d->lifetime = LIFETIME_TRANSIENT; // Alocação na Arena destino por padrão
+            d->lifetime = LIFETIME_TRANSIENT; // Allocation in the destination arena by default
 
-            // Intercepta e consome qualificadores de escopo de Arena explícitos, se digitados pelo usuário
+            // Intercept and consume explicit arena scope qualifiers if typed by the user
             if (parser->current_token.type == TOKEN_IDENTIFIER) {
                 if (strcmp(parser->current_token.lexeme, "singleton") == 0) {
                     d->lifetime = LIFETIME_SINGLETON;
@@ -222,19 +222,19 @@ static void parse_handler_dependencies_with_arenas(Parser* parser, HandlerDepend
                 }
             }
 
-            // Captura o Tipo estrutural da interface a ser injetada (ex: IEmailSender)
+            // Capture the structural type of the interface to be injected (e.g.: IEmailSender)
             if (parser->current_token.type == TOKEN_IDENTIFIER) {
                 d->dep_type = strdup(parser->current_token.lexeme);
                 di_advance(parser);
 
-                // Captura o nome da variável de injeção (ex: sender)
+                // Capture the injection variable name (e.g.: sender)
                 if (parser->current_token.type == TOKEN_IDENTIFIER) {
                     d->dep_name = strdup(parser->current_token.lexeme);
                     di_advance(parser);
                 }
                 (*count)++;
             } else {
-                di_advance(parser); // Limpeza caso venha lixo
+                di_advance(parser); // Cleanup in case garbage tokens appear
             }
 
             if (parser->current_token.type == TOKEN_COMMA) di_advance(parser);
@@ -243,7 +243,7 @@ static void parse_handler_dependencies_with_arenas(Parser* parser, HandlerDepend
     }
 }
 
-// Liberação de memória unificada do subsistema DI contra leaks
+// Unified DI subsystem memory deallocation against leaks
 void free_di_ast_node(DIASTNode* node) {
     if (!node) return;
     if (node->name) free(node->name);
@@ -294,7 +294,7 @@ void free_di_ast_node(DIASTNode* node) {
             free(node->data.di_decorator.methods);
         }
     } else {
-        // Tratamento genérico para fallback de nós associados a mensagens ou handlers
+        // Generic fallback handling for nodes associated with messages or handlers
         if (node->data.msg_handler.handle_param_name) {
             free(node->data.msg_handler.handle_param_name);
         }

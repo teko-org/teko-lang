@@ -4,41 +4,41 @@
 #include "parser.h"
 #include "lexer_string.h"
 
-// Nós específicos para o motor de strings avançado na AST
+// Specific nodes for the advanced string engine in the AST
 typedef enum {
-    NODE_STRING_LITERAL_EXPR = 610, // String estática pura
-    NODE_STRING_INTERPOLATED_EXPR,  // String interpolada contendo blocos textuais e lógicos
-    NODE_STRING_PART_STATIC,        // Parte estática da interpolação
-    NODE_STRING_PART_EXPRESSION     // Expressão interna (ex: variável ou constante)
+    NODE_STRING_LITERAL_EXPR = 610, // Pure static string
+    NODE_STRING_INTERPOLATED_EXPR,  // Interpolated string containing text and logic blocks
+    NODE_STRING_PART_STATIC,        // Static part of the interpolation
+    NODE_STRING_PART_EXPRESSION     // Internal expression (e.g.: variable or constant)
 } StringASTNodeType;
 
-// Representa um fragmento de uma string interpolada
+// Represents a fragment of an interpolated string
 typedef struct StringPartNode {
     int type; // NODE_STRING_PART_STATIC ou NODE_STRING_PART_EXPRESSION
-    char* content; // Texto estático bruto ou lexema da expressão a ser resolvida
+    char* content; // Raw static text or the lexeme of the expression to be resolved
 } StringPartNode;
 
-// Nó principal de string na AST
+// Main string node in the AST
 typedef struct StringASTNode {
     int type; // StringASTNodeType
     bool is_raw;
     bool is_multiline;
     union {
-        // Para strings literais estáticas puras (normais ou raw)
+        // For pure static string literals (normal or raw)
         struct {
             char* value;
         } static_string;
 
-        // Para strings interpoladas desestruturadas
+        // For destructured interpolated strings
         struct {
             StringPartNode* parts;
             int part_count;
-            int bracket_arity; // Aridade 'X' do sufixo bX
+            int bracket_arity; // Arity 'X' of the bX suffix
         } interpolated_string;
     } data;
 } StringASTNode;
 
-// Assinaturas públicas do Parser de Strings
+// Public signatures for the String parser
 StringASTNode* parse_advanced_string_expr(Parser* parser, ExtendedStringToken* ext_token);
 void free_string_ast_node(StringASTNode* node);
 

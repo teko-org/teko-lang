@@ -13,7 +13,7 @@ bool tld_region_register_thread(TekoRegionManager* manager, uint32_t thread_id) 
 
     TekoSubArena* arena = &manager->thread_arenas[thread_id];
 
-    // Invoca a chamada de sistema pura (mmap / VirtualAlloc) para requisitar 128KB limpos
+    // Invokes the raw system call (mmap / VirtualAlloc) to request 128KB of clean memory
     arena->memory_raw = (uint8_t*)teko_sys_allocate_pages(TEKO_ARENA_PAGE_SIZE);
     if (!arena->memory_raw) {
         return false;
@@ -22,7 +22,7 @@ bool tld_region_register_thread(TekoRegionManager* manager, uint32_t thread_id) 
     arena->capacity = TEKO_ARENA_PAGE_SIZE;
     arena->offset = 0;
 
-    printf("[Teko Arenas]: Sub-Arena O(1) registrada e isolada para a Green Thread %d (128KB RAM Virtual).\n", thread_id);
+    printf("[Teko Arenas]: O(1) Sub-Arena registered and isolated for Green Thread %d (128KB Virtual RAM).\n", thread_id);
     return true;
 }
 
@@ -32,16 +32,16 @@ void* tld_region_alloc(TekoRegionManager* manager, uint32_t thread_id, size_t si
     TekoSubArena* arena = &manager->thread_arenas[thread_id];
     if (!arena->memory_raw) return NULL;
 
-    // Alinhamento de memória nativo em 8 bytes para maximizar o barramento de leitura de dados da CPU
+    // Native 8-byte memory alignment to maximize the CPU data read bus
     size_t aligned_size = (size + 7) & ~7;
 
-    // Proteção de transbordo: Se a Sub-Arena local estourar, o runtime nega a alocação
+    // Overflow protection: if the local Sub-Arena overflows, the runtime denies the allocation
     if (arena->offset + aligned_size > arena->capacity) {
-        fprintf(stderr, "[Teko Runtime Panic]: Out of Memory na Sub-Arena da Thread %d!\n", thread_id);
+        fprintf(stderr, "[Teko Runtime Panic]: Out of Memory in Thread %d Sub-Arena!\n", thread_id);
         return NULL;
     }
 
-    // Alocação atômica em O(1): apenas desloca o cursor e retorna o endereço inicial
+    // Atomic O(1) allocation: just advances the cursor and returns the starting address
     void* alloc_ptr = &arena->memory_raw[arena->offset];
     arena->offset += aligned_size;
 
@@ -53,10 +53,10 @@ void tld_region_reset_thread(TekoRegionManager* manager, uint32_t thread_id) {
 
     TekoSubArena* arena = &manager->thread_arenas[thread_id];
 
-    // LIMPEZA EM TEMPO CONSTANTE O(1): Zera o cursor linear instantaneamente.
-    // Toda a memória é marcada para reutilização sem loops de free individuais!
+    // CONSTANT TIME O(1) CLEANUP: Instantly zeroes the linear cursor.
+    // All memory is marked for reuse without individual free loops!
     arena->offset = 0;
-    printf("[Teko Arenas]: Ciclo de vida encerrado. Sub-Arena da Thread %d reciclada em 1 ciclo de clock.\n", thread_id);
+    printf("[Teko Arenas]: Lifecycle ended. Thread %d Sub-Arena recycled in 1 clock cycle.\n", thread_id);
 }
 
 void tld_region_destroy(TekoRegionManager* manager, uint32_t thread_count) {
@@ -65,7 +65,7 @@ void tld_region_destroy(TekoRegionManager* manager, uint32_t thread_count) {
     for (uint32_t i = 0; i < thread_count; i++) {
         TekoSubArena* arena = &manager->thread_arenas[i];
         if (arena->memory_raw) {
-            // Devolve as páginas brutas de volta para o Kernel de forma higiênica
+            // Returns the raw pages back to the Kernel cleanly
             teko_sys_free_pages(arena->memory_raw, arena->capacity);
             arena->memory_raw = NULL;
         }

@@ -1,16 +1,16 @@
-# 🗺️ Plano de Execução Incremental: Fase 3 - Máquina Virtual & Debugger
+# 🗺️ Incremental Execution Plan: Phase 3 - Virtual Machine & Debugger
 
 ```mermaid
 graph TD
-    %% Estilo do Grafo
+    %% Graph Style
     classDef default fill:#1f2937,stroke:#4b5563,stroke-width:1px,color:#f3f4f6;
     classDef sprint fill:#111827,stroke:#3b82f6,stroke-width:2px,color:#eff6ff;
     classDef debug fill:#7c2d12,stroke:#ea580c,stroke-width:1px,color:#ffedd5;
 
-    S1[Sprint 3.1: Interpretador Core & Arena O 1]:::sprint
-    S2[Sprint 3.2: Agendador Green Threads M:N]:::sprint
-    S3[Sprint 3.3: Canais & Semáforos Concorrentes]:::sprint
-    S4[Sprint 3.4: Motor de Debug & Símbolos Lineares]:::debug
+    S1[Sprint 3.1: Core Interpreter & Arena O 1]:::sprint
+    S2[Sprint 3.2: M:N Green Thread Scheduler]:::sprint
+    S3[Sprint 3.3: Concurrent Channels & Semaphores]:::sprint
+    S4[Sprint 3.4: Debug Engine & Linear Symbols]:::debug
 
     S1 --> S2
     S2 --> S3
@@ -19,48 +19,48 @@ graph TD
 
 ---
 
-## 🛠️ Sprint 3.1: O Interpretador Core & Alocador Arena ($O(1)$)
-*Objetivo: Ler o arquivo compactado `.tkb`, validar o cabeçalho mágico `TEKO` e rodar as instruções sequenciais em uma única thread nativa com alocação em bloco contíguo.*
+## 🛠️ Sprint 3.1: The Core Interpreter & Arena Allocator ($O(1)$)
+*Goal: Read the compiled `.tkb` file, validate the `TEKO` magic header, and run sequential instructions on a single native thread with contiguous block allocation.*
 
-*   **Entregas em Código (`src/vm_core.c` / `.h`):**
-    *   Estrutura `TekoVM` contendo o registrador de instrução `IP` (Instruction Pointer), vetor de registradores virtuais genéricos e ponteiro para o bytecode lido.
-    *   O laço principal executado via `while(true)` com técnica de *computed gotos* do C23 para maximizar a performance do desvio de opcodes em vez de um switch lento.
-    *   Estrutura da `Arena`: Um `malloc` bruto de uma página de memória (ex: 4KB) onde todas as strings e estruturas alocadas em tempo de execução são inseridas sequencialmente via deslocamento de ponteiro (*offset*). O descarte limpa tudo instantaneamente.
-*   **🧪 Teste Unitário Relacionado (`tests/test_vm_core.c`):**
-    *   Injetar opcodes aritméticos estruturados e validar se a Arena limpa 100% da memória do runtime em tempo constante $O(1)$ ao fim da execução.
-
----
-
-## 🔄 Sprint 3.2: O Scheduler M:N & Context Switching de Green Threads
-*Objetivo: Implementar o suporte assíncrono real da linguagem, permitindo que a keyword `async` crie corrotinas leves (M) controladas por um agendador rodando em threads nativas (N).*
-
-*   **Entregas em Código (`src/vm_scheduler.c` / `.h`):**
-    *   Estrutura `GreenThread` contendo seu próprio estado de registradores, pilha local e status de ciclo de vida (`READY`, `RUNNING`, `BLOCKED`, `DEAD`).
-    *   Implementação da troca de contexto (*Context Switching*) manual salvando e restaurando o estado dos registradores virtuais sem depender de chamadas pesadas de kernel.
-    *   Mecanismo de *Yielding*: O opcode `OP_SPAWN_ASYNC` suspende a execução da Green Thread corrente e joga a nova tarefa na fila global de prontos do Scheduler.
-*   **🧪 Testes Associados (`tests/test_vm_scheduler.c`):**
-    *   Simular o disparo de 1000 Green Threads simultâneas executando tarefas de computação pura e checar se o scheduler as alterna perfeitamente sem travar.
+*   **Code Deliverables (`src/vm_core.c` / `.h`):**
+    *   `TekoVM` structure containing the `IP` (Instruction Pointer) register, an array of generic virtual registers, and a pointer to the loaded bytecode.
+    *   The main loop executed via `while(true)` using the C23 *computed gotos* technique to maximize opcode dispatch performance instead of a slow switch.
+    *   `Arena` structure: A raw `malloc` of one memory page (e.g. 4KB) where all strings and structures allocated at runtime are inserted sequentially via pointer *offset*. Discarding wipes everything instantly.
+*   **🧪 Related Unit Test (`tests/test_vm_core.c`):**
+    *   Inject structured arithmetic opcodes and validate that the Arena clears 100% of runtime memory in constant $O(1)$ time at the end of execution.
 
 ---
 
-## 🚦 Sprint 3.3: Canais Síncronos, Bounded e Primitivos de Sincronização
-*Objetivo: Dar vida aos operadores concorrentes extraídos do Parser: `chan<T>`, `waiter` e `mutex`, amarrando-os ao estado de bloqueio do Scheduler.*
+## 🔄 Sprint 3.2: The M:N Scheduler & Green Thread Context Switching
+*Goal: Implement the language's real async support, allowing the `async` keyword to create lightweight coroutines (M) controlled by a scheduler running on native threads (N).*
 
-*   **Entregas em Código (`src/vm_concurrency.c` / `.h`):**
-    *   Estrutura interna para canais: Buffer circular thread-safe protegido por travas atômicas se for *bounded*, ou fila encadeada se for *unbounded*.
-    *   Sincronização de Bloqueio: Se uma Green Thread executar `OP_CHAN_PUT` (ou leitura) e o canal estiver cheio/vazio, o Scheduler muda o status dela para `BLOCKED` e move o cursor para a próxima tarefa pronta, eliminando o consumo de CPU por *busy-waiting*.
-    *   Acoplamento dos métodos nativos homologados: `lock()`, `unlock()`, `add()`, `done()`, `wait()`.
-*   **🧪 Testes Associados (`tests/test_vm_channels.c`):**
-    *   Um produtor e um consumidor trocando mensagens decimais através de um canal e validando se o Scheduler gerencia as Green Threads bloqueadas.
+*   **Code Deliverables (`src/vm_scheduler.c` / `.h`):**
+    *   `GreenThread` structure containing its own register state, local stack, and lifecycle status (`READY`, `RUNNING`, `BLOCKED`, `DEAD`).
+    *   Manual *Context Switching* implementation saving and restoring virtual register state without relying on heavy kernel calls.
+    *   *Yielding* mechanism: The `OP_SPAWN_ASYNC` opcode suspends the current Green Thread's execution and places the new task in the Scheduler's global ready queue.
+*   **🧪 Associated Tests (`tests/test_vm_scheduler.c`):**
+    *   Simulate firing 1000 simultaneous Green Threads executing pure computation tasks and check that the scheduler alternates them perfectly without locking up.
 
 ---
 
-## 🐛 Sprint 3.4: Infraestrutura de Depuração (The Teko Debugger)
-*Objetivo: Adicionar suporte nativo à inspeção de estado em tempo de execução, permitindo pausar o interpretador, ler o valor de variáveis locais da Arena e avançar instrução por instrução.*
+## 🚦 Sprint 3.3: Synchronous Channels, Bounded Channels, and Synchronization Primitives
+*Goal: Bring to life the concurrent operators extracted from the Parser: `chan<T>`, `waiter`, and `mutex`, binding them to the Scheduler's blocking state.*
 
-*   **Entregas em Código (`src/vm_debug.c` / `.h`):**
-    *   Geração de um mapa de símbolos lineares em tempo de compilação (*Debug Symbols*) associando o endereço do Bytecode físico com a linha e coluna do arquivo fonte original.
-    *   Estrutura de `Breakpoints`: Um vetor de endereços de memória da LI marcados para pausa. Quando o laço do interpretador core atinge um endereço registrado, ele suspende a Green Thread e entra em modo de escuta CLI interativo.
-    *   Rotinas de Controle do Motor de Debug: `vm_debug_step_into()`, `vm_debug_continue()`, e a função `vm_debug_inspect_arena()` para mapear o Heap em tempo real.
-*   **🧪 Testes Associados (`tests/test_vm_debug.c`):**
-    *   Configurar um breakpoint fictício via código no Unity, rodar o interpretador e validar se o estado da VM congela e expõe os registradores com precisão matemática.
+*   **Code Deliverables (`src/vm_concurrency.c` / `.h`):**
+    *   Internal channel structure: thread-safe circular buffer protected by atomic locks if *bounded*, or a linked queue if *unbounded*.
+    *   Blocking Synchronization: If a Green Thread executes `OP_CHAN_PUT` (or a read) and the channel is full/empty, the Scheduler changes its status to `BLOCKED` and moves the cursor to the next ready task, eliminating CPU waste from *busy-waiting*.
+    *   Coupling of certified native methods: `lock()`, `unlock()`, `add()`, `done()`, `wait()`.
+*   **🧪 Associated Tests (`tests/test_vm_channels.c`):**
+    *   A producer and a consumer exchanging decimal messages through a channel and validating that the Scheduler manages the blocked Green Threads correctly.
+
+---
+
+## 🐛 Sprint 3.4: Debugging Infrastructure (The Teko Debugger)
+*Goal: Add native support for runtime state inspection, allowing the interpreter to be paused, local Arena variable values to be read, and execution to advance instruction by instruction.*
+
+*   **Code Deliverables (`src/vm_debug.c` / `.h`):**
+    *   Generation of a linear symbol map at compile time (*Debug Symbols*) associating the physical Bytecode address with the line and column of the original source file.
+    *   `Breakpoints` structure: An array of IL memory addresses marked for pause. When the core interpreter loop reaches a registered address, it suspends the Green Thread and enters interactive CLI listening mode.
+    *   Debug Engine Control Routines: `vm_debug_step_into()`, `vm_debug_continue()`, and the `vm_debug_inspect_arena()` function to map the Heap in real time.
+*   **🧪 Associated Tests (`tests/test_vm_debug.c`):**
+    *   Set up a fictional breakpoint via code in Unity, run the interpreter, and validate that the VM state freezes and exposes the registers with mathematical precision.

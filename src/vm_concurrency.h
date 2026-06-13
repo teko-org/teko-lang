@@ -5,31 +5,31 @@
 #include <stdbool.h>
 #include "vm_scheduler.h"
 
-// Estrutura física de um Canal (suporta Bounded e Unbounded circular)
+// Physical structure of a Channel (supports Bounded and circular Unbounded)
 typedef struct {
     int32_t* buffer;
     uint32_t capacity;
     uint32_t head;
     uint32_t tail;
     uint32_t count;
-    GreenThread* blocked_readers; // Fila de Green Threads esperando dados
-    GreenThread* blocked_writers; // Fila de Green Threads esperando espaço
+    GreenThread* blocked_readers; // Queue of Green Threads waiting for data
+    GreenThread* blocked_writers; // Queue of Green Threads waiting for space
 } TekoVMChannel;
 
-// Estrutura física do Mutex (Exclusão Mútua)
+// Physical structure of a Mutex (Mutual Exclusion)
 typedef struct {
     bool is_locked;
     GreenThread* owner;
-    GreenThread* blocked_threads; // Fila de espera pelo Lock
+    GreenThread* blocked_threads; // Wait queue for the lock
 } TekoVMMutex;
 
-// Estrutura física do Waiter (Grupo de Espera)
+// Physical structure of a Waiter (Wait Group)
 typedef struct {
     int32_t counter;
-    GreenThread* blocked_waiters; // Green Threads paradas no .wait()
+    GreenThread* blocked_waiters; // Green Threads stopped at .wait()
 } TekoVMWaiter;
 
-// Assinaturas públicas do Runtime de Concorrência
+// Public signatures of the Concurrency Runtime
 TekoVMChannel* teko_channel_create(uint32_t capacity);
 bool teko_channel_put(TekoVMChannel* chan, int32_t value, VMScheduler* sched, TekoVM* vm);
 bool teko_channel_get(TekoVMChannel* chan, int32_t* out_value, VMScheduler* sched, TekoVM* vm);

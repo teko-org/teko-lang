@@ -56,35 +56,35 @@ TypeCheckResult check_expression_type(SymbolTableScope* scope, const char* raw_e
         int len = 64 + (int)strlen(raw_expression);
         res.error_message = (char*)malloc(len);
         if (res.error_message) {
-            snprintf(res.error_message, len, "[Erro de Tipo]: Símbolo '%s' não declarado.", raw_expression);
+            snprintf(res.error_message, len, "[Type Error]: Symbol '%s' not declared.", raw_expression);
         }
     }
 
     return res;
 }
 
-// ALGORITMO DE ANÁLISE DE ESCAPE: Rastreia se um ponteiro local foge do escopo de sua Frame Arena
+// ESCAPE ANALYSIS ALGORITHM: Tracks whether a local pointer escapes its Frame Arena scope
 void perform_escape_analysis(SymbolTableScope* scope, StatementASTNode* stmt, const char* return_target_type) {
     if (!stmt || !scope) return;
 
-    // Se o nó for uma atribuição em variável de escopo superior ou um retorno de referência
+    // If the node is an assignment to an outer-scope variable or a reference return
     if (stmt->type == NODE_VAR_DECL && stmt->data.var_decl.initializer_raw) {
-        // Exemplo: se estamos atribuindo a uma referência ou retornando dados dinâmicos
+        // Example: if we are assigning to a reference or returning dynamic data
         if (return_target_type && (strcmp(return_target_type, "str") == 0 || strcmp(return_target_type, "ptr") == 0)) {
-            // MARCAÇÃO SINTÁTICA NA AST: O compilador detecta o escape e sinaliza a necessidade de PROMOÇÃO
-            // Usamos um marcador interno temporário no tipo do nó para o codegen da IL saber que deve ejetar OP_ARENA_PROMOTE
-            printf("[Escape Analysis]: O dado da variável '%s' escapou do escopo local e será promovido para a Arena superior.\n",
+            // SYNTACTIC ANNOTATION IN THE AST: The compiler detects the escape and signals the need for PROMOTION
+            // We use a temporary internal marker on the node type so that IL codegen knows to emit OP_ARENA_PROMOTE
+            printf("[Escape Analysis]: Variable '%s' data escaped the local scope and will be promoted to the parent Arena.\n",
                    stmt->data.var_decl.var_name);
         }
     }
 }
 
-// Analisa os nós sintáticos aplicando as barreiras semânticas e as regras remanescentes da especificação
+// Analyzes syntactic nodes applying semantic barriers and the remaining specification rules
 TypeCheckResult check_statement_types(SymbolTableScope* scope, const StatementASTNode* stmt) {
     TypeCheckResult res = create_blank_result();
     if (!stmt || !scope) return res;
 
-    // 1. Validação de Declarações de Variáveis, Tipos Arbitrários e Coerções
+    // 1. Validation of Variable Declarations, Arbitrary Types, and Coercions
     if (stmt->type == NODE_VAR_DECL) {
         const char* var_name = stmt->data.var_decl.var_name;
         TypeInfo* declared_type = stmt->data.var_decl.var_type;
@@ -102,21 +102,21 @@ TypeCheckResult check_statement_types(SymbolTableScope* scope, const StatementAS
         TypeInfo* final_type = declared_type ? declared_type : inferred_type;
 
         if (declared_type && inferred_type && declared_type->base_name && inferred_type->base_name) {
-            // REGRA 1: COERÇÃO IMPLÍCITA DE PRECISÃO (Permite i32 -> decimal ou i32 -> bigint)
+            // RULE 1: IMPLICIT PRECISION COERCION (Allows i32 -> decimal or i32 -> bigint)
             bool is_valid_coercion = false;
             if (strcmp(inferred_type->base_name, "i32") == 0 &&
                (strcmp(declared_type->base_name, "decimal") == 0 || strcmp(declared_type->base_name, "bigint") == 0)) {
                 is_valid_coercion = true;
             }
 
-            // Se os tipos forem diferentes e não for uma coerção numérica válida, dispara erro
+            // If the types differ and it is not a valid numeric coercion, raise an error
             if (strcmp(declared_type->base_name, inferred_type->base_name) != 0 && !is_valid_coercion) {
                 res.error_kind = TYPE_ERR_INCOMPATIBLE_ASSIGN;
                 int len = 128 + (int)strlen(var_name) + (int)strlen(declared_type->base_name) + (int)strlen(inferred_type->base_name);
                 res.error_message = (char*)malloc(len);
                 if (res.error_message) {
                     snprintf(res.error_message, len,
-                             "[Erro de Tipo]: Tipo incompatível em '%s'. Esperado '%s', recebeu '%s'.",
+                             "[Type Error]: Incompatible type in '%s'. Expected '%s', got '%s'.",
                              var_name, declared_type->base_name, inferred_type->base_name);
                 }
                 fprintf(stderr, "%s\n", res.error_message);
@@ -127,23 +127,23 @@ TypeCheckResult check_statement_types(SymbolTableScope* scope, const StatementAS
         symbol_table_insert(scope, var_name, SYM_VARIABLE, final_type, stmt->data.var_decl.is_mutable);
     }
 
-    // 2. Validação de Reatribuições, Mutabilidade e Expressões de Controle Pós-fixadas (when)
+    // 2. Validation of Reassignments, Mutability, and Postfix Control Expressions (when)
     else if (stmt->type == NODE_EXPR_STMT) {
         const char* expr = stmt->data.expr_stmt.expression_raw;
         if (!expr) return res;
 
-        // Procura qualquer indício de atribuição (simples ou composta) varrendo a string da expressão
-        // Esta é uma aproximação segura para texto bruto antes do parse completo de expressões
+        // Look for any sign of assignment (simple or compound) by scanning the expression string
+        // This is a safe approximation for raw text before full expression parsing
         char* assign_ptr = strchr(expr, '=');
         if (assign_ptr) {
-            // Isola o identificador à esquerda, ignorando os operadores compostos adjacentes (ex: +, -, >, <, &, |, ^)
+            // Isolate the left-hand identifier, ignoring adjacent compound operator characters (e.g.: +, -, >, <, &, |, ^)
             int name_len = (int)(assign_ptr - expr);
             if (name_len > 0 && (expr[name_len - 1] == '+' || expr[name_len - 1] == '-' ||
                                  expr[name_len - 1] == '*' || expr[name_len - 1] == '/' ||
                                  expr[name_len - 1] == '>' || expr[name_len - 1] == '<' ||
                                  expr[name_len - 1] == '&' || expr[name_len - 1] == '|' ||
                                  expr[name_len - 1] == '^')) {
-                name_len--; // Recua o cursor para ignorar o caractere do operador composto (ex: o '>' em '>>=')
+                name_len--; // Back up the cursor to skip the compound operator character (e.g.: the '>' in '>>=')
             }
 
             char* var_name = (char*)malloc(name_len + 1);
@@ -151,7 +151,7 @@ TypeCheckResult check_statement_types(SymbolTableScope* scope, const StatementAS
                 strncpy(var_name, expr, name_len);
                 var_name[name_len] = '\0';
 
-                // Remove espaços em branco
+                // Remove whitespace
                 int trim_idx = (int)strlen(var_name) - 1;
                 while (trim_idx >= 0 && (var_name[trim_idx] == ' ' || var_name[trim_idx] == '>' || var_name[trim_idx] == '<')) {
                     var_name[trim_idx] = '\0';
@@ -160,14 +160,14 @@ TypeCheckResult check_statement_types(SymbolTableScope* scope, const StatementAS
 
                 Symbol* sym = symbol_table_lookup(scope, var_name);
                 if (sym) {
-                    // BARREIRA DE ATRIBUIÇÃO COMPOSTA: Impede alteração por op= em let
+                    // COMPOUND ASSIGNMENT BARRIER: Prevents modification via op= on let
                     if (!sym->is_mutable) {
                         res.error_kind = TYPE_ERR_IMMUTABLE_WRITE;
                         int len = 128 + (int)strlen(var_name);
                         res.error_message = (char*)malloc(len);
                         if (res.error_message) {
                             snprintf(res.error_message, len,
-                                     "[Erro Semântico]: A variável '%s' é imutável (let) e não pode sofrer atribuição composta.",
+                                     "[Semantic Error]: Variable '%s' is immutable (let) and cannot undergo compound assignment.",
                                      var_name);
                         }
                         fprintf(stderr, "%s\n", res.error_message);
@@ -181,40 +181,40 @@ TypeCheckResult check_statement_types(SymbolTableScope* scope, const StatementAS
     return res;
 }
 
-// Regra semântica para o operador Elvis: tipo? ?? tipo
+// Semantic rule for the Elvis operator: type? ?? type
 TypeCheckResult validate_elvis_operator_types(TypeInfo* left_type, TypeInfo* right_type) {
     TypeCheckResult res = { .error_kind = TYPE_ERR_NONE, .error_message = nullptr, .resolved_type = nullptr };
 
     if (!left_type || !right_type) return res;
 
-    // Regra 1: O lado esquerdo precisa ser uma referência nulável - ESCAPADO ?\?
+    // Rule 1: The left-hand side must be a nullable reference - ESCAPED ?\?
     if (!left_type->is_nullable) {
         res.error_kind = TYPE_ERR_INCOMPATIBLE_ASSIGN;
-        res.error_message = strdup("[Erro Semântico]: O operador Elvis '?\?' só pode ser aplicado a variáveis nuláveis (marcardas com ?).");
+        res.error_message = strdup("[Semantic Error]: The Elvis operator '?\?' can only be applied to nullable variables (marked with ?).");
         fprintf(stderr, "%s\n", res.error_message);
         return res;
     }
 
-    // Regra 2: Os tipos base devem coincidir (ex: str? ?? str) - ESCAPADO ?\?
+    // Rule 2: The base types must match (e.g.: str? ?? str) - ESCAPED ?\?
     if (strcmp(left_type->base_name, right_type->base_name) != 0) {
         res.error_kind = TYPE_ERR_INCOMPATIBLE_ASSIGN;
-        res.error_message = strdup("[Erro de Tipo]: O valor padrão à direita do operador '?\?' deve ser do mesmo tipo que a variável da esquerda.");
+        res.error_message = strdup("[Type Error]: The default value on the right side of the '?\?' operator must be the same type as the left-hand variable.");
         fprintf(stderr, "%s\n", res.error_message);
         return res;
     }
 
-    // Regra 3: O tipo resultante é purificado (perde a nulabilidade)
+    // Rule 3: The resulting type is purified (loses nullability)
     res.resolved_type = right_type;
     return res;
 }
 
-// Valida a navegação segura: objeto?.propriedade
+// Validates safe navigation: object?.property
 TypeCheckResult validate_safe_navigation_types(TypeInfo* object_type, const char* property_name) {
     TypeCheckResult res = { .error_kind = TYPE_ERR_NONE, .error_message = NULL, .resolved_type = NULL };
 
     if (!object_type || !property_name) return res;
 
-    // Resolução do tipo da propriedade (Simulação baseada na sua propriedade .length de str)
+    // Property type resolution (Simulation based on the .length property of str)
     res.resolved_type = (TypeInfo*)malloc(sizeof(TypeInfo));
     if (res.resolved_type) {
         res.resolved_type->kind = NODE_TYPE_BASIC;
@@ -225,7 +225,7 @@ TypeCheckResult validate_safe_navigation_types(TypeInfo* object_type, const char
             res.resolved_type->base_name = strdup("void");
         }
 
-        // REGRA DE OURO: Se o objeto era nulável e usamos ?., o resultado TEM que se tornar nulável temporariamente!
+        // GOLDEN RULE: If the object was nullable and we used ?., the result MUST temporarily become nullable!
         res.resolved_type->is_nullable = object_type->is_nullable;
         res.resolved_type->is_array = false;
         res.resolved_type->is_array_elem_mut = false;

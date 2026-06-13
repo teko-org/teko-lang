@@ -2,7 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-// Auxiliar para enfileirar uma Green Thread em uma lista de bloqueados
+// Helper to enqueue a Green Thread into a blocked list
 static void block_thread(GreenThread** list_head, GreenThread* thread) {
     if (!thread) return;
     thread->state = THREAD_BLOCKED;
@@ -17,7 +17,7 @@ static void block_thread(GreenThread** list_head, GreenThread* thread) {
     }
 }
 
-// Auxiliar para desbloquear a primeira Green Thread de uma lista e devolvê-la ao Scheduler
+// Helper to unblock the first Green Thread from a list and return it to the Scheduler
 static void unblock_thread(GreenThread** list_head, VMScheduler* sched) {
     if (!*list_head || !sched) return;
 
@@ -27,7 +27,7 @@ static void unblock_thread(GreenThread** list_head, VMScheduler* sched) {
     thread->state = THREAD_READY;
     thread->next = NULL;
 
-    // Recoloca a corrotina liberada na cauda da fila de execução global
+    // Re-enqueues the released coroutine at the tail of the global execution queue
     if (!sched->queue_head) {
         sched->queue_head = thread;
         sched->queue_tail = thread;
@@ -41,7 +41,7 @@ TekoVMChannel* teko_channel_create(uint32_t capacity) {
     auto chan = (TekoVMChannel*)malloc(sizeof(TekoVMChannel));
     if (!chan) return NULL;
 
-    chan->capacity = capacity == 0 ? 1 : capacity; // Garante tamanho mínimo de 1 para bounded básico
+    chan->capacity = capacity == 0 ? 1 : capacity; // Guarantees a minimum size of 1 for basic bounded channels
     chan->buffer = (int32_t*)calloc(chan->capacity, sizeof(int32_t));
     chan->head = 0;
     chan->tail = 0;
@@ -51,16 +51,16 @@ TekoVMChannel* teko_channel_create(uint32_t capacity) {
     return chan;
 }
 
-// Operação Assíncrona de Escrita no Canal (chan.put)
+// Asynchronous Write operation on the channel (chan.put)
 bool teko_channel_put(TekoVMChannel* chan, int32_t value, VMScheduler* sched, TekoVM* vm) {
     if (!chan || !sched || !vm) return false;
 
-    // Se o canal estiver cheio, bloqueia a Green Thread atual imediatamente
+    // If the channel is full, immediately block the current Green Thread
     if (chan->count >= chan->capacity) {
         auto active = sched->current_thread;
         if (active) {
             block_thread(&chan->blocked_writers, active);
-            vm_scheduler_yield(sched, vm); // Suspende a execução da VM corrente
+            vm_scheduler_yield(sched, vm); // Suspends execution of the current VM
         }
         return false;
     }
@@ -69,18 +69,18 @@ bool teko_channel_put(TekoVMChannel* chan, int32_t value, VMScheduler* sched, Te
     chan->tail = (chan->tail + 1) % chan->capacity;
     chan->count++;
 
-    // Se havia alguma Green Thread parada esperando para ler dados, libera ela!
+    // If there was a Green Thread waiting to read data, release it!
     if (chan->blocked_readers) {
         unblock_thread(&chan->blocked_readers, sched);
     }
     return true;
 }
 
-// Operação de Leitura do Canal
+// Channel Read operation
 bool teko_channel_get(TekoVMChannel* chan, int32_t* out_value, VMScheduler* sched, TekoVM* vm) {
     if (!chan || !out_value || !sched || !vm) return false;
 
-    // Se o canal estiver completamente vazio, bota a Green Thread na geladeira
+    // If the channel is completely empty, put the Green Thread on hold
     if (chan->count == 0) {
         auto active = sched->current_thread;
         if (active) {
@@ -94,14 +94,14 @@ bool teko_channel_get(TekoVMChannel* chan, int32_t* out_value, VMScheduler* sche
     chan->head = (chan->head + 1) % chan->capacity;
     chan->count--;
 
-    // Se havia alguma Green Thread bloqueada esperando espaço para escrever, acorda ela!
+    // If there was a Green Thread blocked waiting for space to write, wake it up!
     if (chan->blocked_writers) {
         unblock_thread(&chan->blocked_writers, sched);
     }
     return true;
 }
 
-// Operação mtx.lock()
+// mtx.lock() operation
 void teko_mutex_lock(TekoVMMutex* mutex, VMScheduler* sched, TekoVM* vm) {
     if (!mutex || !sched || !vm) return;
 
@@ -117,7 +117,7 @@ void teko_mutex_lock(TekoVMMutex* mutex, VMScheduler* sched, TekoVM* vm) {
     }
 }
 
-// Operação mtx.unlock()
+// mtx.unlock() operation
 void teko_mutex_unlock(TekoVMMutex* mutex, VMScheduler* sched, TekoVM* vm) {
     if (!mutex || !mutex->is_locked || !sched) return;
 
@@ -129,21 +129,21 @@ void teko_mutex_unlock(TekoVMMutex* mutex, VMScheduler* sched, TekoVM* vm) {
     }
 }
 
-// Operação wg.add(X)
+// wg.add(X) operation
 void teko_waiter_add(TekoVMWaiter* waiter, int32_t delta) {
     if (waiter) waiter->counter += delta;
 }
 
-// Operação wg.done()
+// wg.done() operation
 void teko_waiter_done(TekoVMWaiter* waiter) {
     if (waiter) waiter->counter--;
 }
 
-// Operação wg.wait()
+// wg.wait() operation
 void teko_waiter_wait(TekoVMWaiter* waiter, VMScheduler* sched, TekoVM* vm) {
     if (!waiter || !sched || !vm) return;
 
-    // Se o contador for maior que zero, a Green Thread atual fica travada até as outras darem .done()
+    // If the counter is greater than zero, the current Green Thread stays locked until the others call .done()
     if (waiter->counter > 0) {
         auto active = sched->current_thread;
         if (active) {

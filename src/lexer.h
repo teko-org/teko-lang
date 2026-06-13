@@ -3,13 +3,13 @@
 
 #include <stdbool.h>
 
-// Enumeração de todos os tipos de tokens da linguagem
+// Enumeration of all token types in the language
 typedef enum {
-    // Fim do arquivo / Erro
+    // End of file / Error
     TOKEN_EOF = 0,
     TOKEN_UNKNOWN,
 
-    // Palavras-chave (Keywords)
+    // Keywords
     TOKEN_USE, TOKEN_FROM, TOKEN_EXTERN, TOKEN_STRUCT, TOKEN_FN, TOKEN_AS,
     TOKEN_CONST, TOKEN_ASYNC, TOKEN_LET, TOKEN_MUT, TOKEN_DEFER, TOKEN_RETURN,
     TOKEN_WHEN, TOKEN_FOR, TOKEN_SWITCH, TOKEN_NULL, TOKEN_RAISED, TOKEN_WHERE,
@@ -17,21 +17,21 @@ typedef enum {
     TOKEN_COMMAND, TOKEN_HANDLER, TOKEN_NOTIFICATION, TOKEN_WITH, TOKEN_QUERY,
     TOKEN_OPERATOR, TOKEN_PUB, TOKEN_REQD,
 
-    TOKEN_STRING_LIT,       // "texto" comum ou """multilinha""" tradicional
-    TOKEN_STRING_INTERPOLATED,    // `texto {expr}` comum ou ```multilinha``` interpolada
-    TOKEN_STRING_RAW_LIT,         // $"texto" ou $"""multilinha""" (Ignora escapes)
-    TOKEN_STRING_RAW_INTERP,       // $`texto` ou $```multilinha``` (Ignora escapes, processa interpolação)
+    TOKEN_STRING_LIT,       // common "text" or traditional """multiline"""
+    TOKEN_STRING_INTERPOLATED,    // common `text {expr}` or interpolated ```multiline```
+    TOKEN_STRING_RAW_LIT,         // $"text" or $"""multiline""" (ignores escapes)
+    TOKEN_STRING_RAW_INTERP,       // $`text` or $```multiline``` (ignores escapes, processes interpolation)
 
-    // Identificadores e Literais
+    // Identifiers and Literals
     TOKEN_IDENTIFIER,
-    TOKEN_MACRO_IDENT,       // Ex: @marshall.to_ptr
-    TOKEN_LIT_INT,           // Ex: 1, 3_000, 255
-    TOKEN_LIT_FLOAT,         // Ex: 1.2
-    TOKEN_LIT_STR,           // Ex: "World"
-    TOKEN_LIT_CHAR,          // Ex: 'a'
-    TOKEN_LIT_MULTILINE_STR, // Ex: """...\n..."""
+    TOKEN_MACRO_IDENT,       // e.g.: @marshall.to_ptr
+    TOKEN_LIT_INT,           // e.g.: 1, 3_000, 255
+    TOKEN_LIT_FLOAT,         // e.g.: 1.2
+    TOKEN_LIT_STR,           // e.g.: "World"
+    TOKEN_LIT_CHAR,          // e.g.: 'a'
+    TOKEN_LIT_MULTILINE_STR, // e.g.: """...\n..."""
 
-    // Símbolos de Pontuação e Delimitadores
+    // Punctuation Symbols and Delimiters
     TOKEN_LPAREN, TOKEN_RPAREN,     // ( )
     TOKEN_LBRACE, TOKEN_RBRACE,     // { }
     TOKEN_LBRACKET, TOKEN_RBRACKET, // [ ]
@@ -45,7 +45,7 @@ typedef enum {
     TOKEN_DBL_COLON,                // ::
     TOKEN_ARROW,                    // =>
 
-    // Operadores Matemáticos, Lógicos e Bitwise Expandidos
+    // Extended Mathematical, Logical, and Bitwise Operators
     TOKEN_PLUS,          // +
     TOKEN_MINUS,         // -
     TOKEN_MUL,           // *
@@ -68,7 +68,7 @@ typedef enum {
     TOKEN_EQ,            // ==
     TOKEN_NE,            // !=
 
-    // Operadores de Atribuição Composta e Especial
+    // Compound and Special Assignment Operators
     TOKEN_ASSIGN,        // =
     TOKEN_QUICK_ASSIGN,  // :=
     TOKEN_ADD_ASSIGN,    // +=
@@ -83,21 +83,21 @@ typedef enum {
     TOKEN_XOR_ASSIGN     // ^=
 } TokenType;
 
-// Estrutura que representa um Token
+// Structure representing a Token
 typedef struct {
     TokenType type;
     char* lexeme;
     int line;
 } Token;
 
-// Estado do Lexer
+// Lexer state
 typedef struct {
     const char* source;
     int cursor;
     int line;
 } Lexer;
 
-// Assinaturas das funções públicas do Lexer
+// Public Lexer function signatures
 void lexer_init(Lexer* lexer, const char* source);
 Token lexer_next_token(Lexer* lexer);
 const char* get_token_type_name(TokenType type);

@@ -1,61 +1,61 @@
-# 🗺️ Plano de Engenharia: Compilador Leko AOT Bare-Metal (Fase 5)
+# 🗺️ Engineering Plan: Leko AOT Bare-Metal Compiler (Phase 5)
 
-Este documento especifica a arquitetura definitiva do backend **Ahead-of-Time (AOT)** da linguagem **Leko**. O objetivo é eliminar completamente a dependência de uma Máquina Virtual (VM) no modo de produção (*Release*), transpilando a Árvore Sintática Abstrata (AST) e a Linguagem Intermediária (LI) diretamente em código de máquina nativo (*bare-metal*) específico para cada combinação de **Sistema Operacional e Arquitetura de Processador**.
+This document specifies the definitive architecture of the **Ahead-of-Time (AOT)** backend for the **Leko** language. The goal is to completely eliminate the dependency on a Virtual Machine (VM) in production (*Release*) mode, transpiling the Abstract Syntax Tree (AST) and Intermediate Language (IL) directly into native (*bare-metal*) machine code specific to each combination of **Operating System and Processor Architecture**.
 
 ---
 
-## 1. Matriz de Destinos Nativos (Target Triples) e ABIs
+## 1. Native Target Matrix (Target Triples) and ABIs
 
-Para suportar a universalidade da linguagem sem depender de ecossistemas pesados de terceiros, o backend em C puro segmenta o gerenciamento de chamadas e convenções de registradores (*Calling Conventions*) conforme a tabela abaixo:
+To support the universality of the language without depending on heavy third-party ecosystems, the pure C backend segments call management and register conventions (*Calling Conventions*) as shown in the table below:
 
-| Sistema Operacional (OS) | Família de Executável | Convenção de Chamada / ABI | Saída de Sistema (Syscall) |
+| Operating System (OS) | Executable Family | Calling Convention / ABI | System Exit (Syscall) |
 | :--- | :--- | :--- | :--- |
 | **macOS (Darwin)** | Mach-O (`.s` -> `.o`) | ARM64 Standard Apple ABI | `svc #0x80` / `sys_exit` (1) |
 | **Linux (64-bit)** | ELF (`.s` -> `.o`) | System V AMD64 ABI | `syscall` / `sys_exit` (60) |
 | **Linux (32-bit)** | ELF (`.s` -> `.o`) | System V i386 ABI | `int $0x80` / `sys_exit` (1) |
 | **Windows (64-bit)** | PE/COFF (`.s` -> `.obj`) | Microsoft x64 Calling Convention | `ExitProcess` via `KERNEL32` |
 | **FreeBSD (Unix)** | ELF (`.s` -> `.o`) | System V AMD64 (FreeBSD syscall) | `int $0x80` / `sys_exit` (1) |
-| **Bare-Metal (WASM)** | WebAssembly Web Text | Expressões S-Expression Monádicas | Instrução `unreachable` |
-| **Bare-Metal (AVR)** | Flat Binary (Arduino) | Atmel AVR 8-bit ABI | Loop infinito `rjmp .` |
+| **Bare-Metal (WASM)** | WebAssembly Web Text | Monadic S-Expression Expressions | `unreachable` instruction |
+| **Bare-Metal (AVR)** | Flat Binary (Arduino) | Atmel AVR 8-bit ABI | Infinite loop `rjmp .` |
 
 ---
 
-## 2. Requisitos Físicos por Opcode da ISA Leko
+## 2. Physical Requirements per Leko ISA Opcode
 
-Cada arquivo de arquitetura segregado nas subpastas (`apple/`, `linux/`, `windows/`, `bsd_unix/`, `bare_metal/`) deve implementar um `switch` contíguo traduzindo os opcodes abstratos da LI para instruções reais de registradores de hardware:
+Each architecture file segregated in the subfolders (`apple/`, `linux/`, `windows/`, `bsd_unix/`, `bare_metal/`) must implement a contiguous `switch` translating the abstract IL opcodes into real hardware register instructions:
 
-### A) Carga de Texto e Alocação de Strings (`OP_SCONST`)
-Como strings dinâmicas ou literais não cabem diretamente dentro de um único registrador de CPU, o compilador adota estratégias de ponteiros de memória relativos:
-*   **macOS (Darwin ARM64):** Injeta o operador de página `adrp x0, .L_str_idx@PAGE` combinado com a carga de deslocamento `add x0, x0, .L_str_idx@PAGEOFF`. Armazena os bytes na seção `.section __TEXT,__cstring,cstring_literals` via diretiva `.asciz`.
-*   **Linux / FreeBSD (x86_64):** Utiliza endereçamento relativo ao ponteiro de instrução (*RIP-relative*) através de `leaq .L_str_idx(%rip), %rax`. Armazena os bytes na seção `.section .rodata` via diretiva `.asciz`.
-*   **Windows (x86_64):** Adota a sintaxe Intel com `lea rax, [rip + .L_str_idx]`. Armazena os bytes na seção `.section .rdata,"dr"` utilizando a diretiva de definição de bytes `db "texto", 0`.
-*   **WebAssembly (WASM):** Mapeia todos os literais contiguamente no segmento de dados do módulo virtual: `(data (i32.const offset) "texto\00")`.
-*   **AVR (Microcontroladores 8-bit):** Injeta o modificador `.section .progmem.data` para salvar o texto na memória Flash do chip, impedindo que strings estáticas devorem a escassa memória RAM (SRAM) do hardware. A carga quebra o ponteiro de 16-bits em dois registradores: `ldi r24, lo8(.L_str_idx)` e `ldi r25, hi8(.L_str_idx)`.
+### A) Text Loading and String Allocation (`OP_SCONST`)
+Because dynamic strings or literals do not fit directly inside a single CPU register, the compiler adopts relative memory pointer strategies:
+*   **macOS (Darwin ARM64):** Injects the page operator `adrp x0, .L_str_idx@PAGE` combined with the offset load `add x0, x0, .L_str_idx@PAGEOFF`. Stores the bytes in the `.section __TEXT,__cstring,cstring_literals` section via the `.asciz` directive.
+*   **Linux / FreeBSD (x86_64):** Uses instruction-pointer-relative (*RIP-relative*) addressing via `leaq .L_str_idx(%rip), %rax`. Stores the bytes in the `.section .rodata` section via the `.asciz` directive.
+*   **Windows (x86_64):** Adopts Intel syntax with `lea rax, [rip + .L_str_idx]`. Stores the bytes in the `.section .rdata,"dr"` section using the byte-definition directive `db "text", 0`.
+*   **WebAssembly (WASM):** Maps all literals contiguously in the virtual module's data segment: `(data (i32.const offset) "text\00")`.
+*   **AVR (8-bit Microcontrollers):** Injects the `.section .progmem.data` modifier to save the text in the chip's Flash memory, preventing static strings from consuming the scarce hardware RAM (SRAM). The load splits the 16-bit pointer across two registers: `ldi r24, lo8(.L_str_idx)` and `ldi r25, hi8(.L_str_idx)`.
 
-### B) Proteções Aritméticas no Silício (`OP_ADD`, `OP_DIV`)
-*   **Processadores RISC (ARM64, RISC-V, MIPS):** Executam aritmética de três operandos (`add w0, w0, w1`). O `OP_DIV` exige uma barreira de hardware prévia através de saltos se o divisor for zero (`cbz` no ARM, `beqz` no RISC-V) para evitar o travamento (*crash*) do processador por exceção de ponto flutuante.
-*   **Processadores CISC (x86_64, x86_32):** Executam aritmética de dois operandos com acúmulo no primeiro registrador (`addl %ebx, %eax`). O `OP_DIV` exige estender o sinal do acumulador antes da instrução física (`cltd` em 64-bit, `cdq` em 32-bit), e o desvio de segurança contra divisão por zero utiliza `cmpl $0, %ebx` combinado com o salto condicional `je`.
+### B) Arithmetic Protections in Silicon (`OP_ADD`, `OP_DIV`)
+*   **RISC Processors (ARM64, RISC-V, MIPS):** Execute three-operand arithmetic (`add w0, w0, w1`). `OP_DIV` requires a prior hardware barrier via branches if the divisor is zero (`cbz` on ARM, `beqz` on RISC-V) to prevent a processor crash from a floating-point exception.
+*   **CISC Processors (x86_64, x86_32):** Execute two-operand arithmetic accumulating into the first register (`addl %ebx, %eax`). `OP_DIV` requires sign-extending the accumulator before the physical instruction (`cltd` in 64-bit, `cdq` in 32-bit), and the safety branch against division by zero uses `cmpl $0, %ebx` combined with the conditional jump `je`.
 
-### C) O Alocador de Arenas Físico Nativo (`OP_ARENA_PUSH`, `OP_ARENA_POP`)
-Para dar suporte ao gerenciamento de memória automático de custo zero (*Region-Based Memory Management*) sem o peso de um Garbage Collector ou checagens dinâmicas de Heap em produção:
-*   O compilador reserva um registrador imutável e preservável entre funções (*callee-saved register*) para atuar como o **Cursor da Arena Ativa** (`x19` no ARM64, `%r12` no x86_64, `x9` no RISC-V, `r28/r29` no AVR).
-*   **`OP_ARENA_PUSH` (Início de Bloco `using`):** Aloca um frame contíguo fixo de memória (ex: 1024 bytes) decrementando diretamente o ponteiro de pilha física da CPU (`sp` / `%rsp`) e travando o registrador da Arena neste endereço.
-*   **`OP_ARENA_POP` (Descarte de Escopo):** Executa a liberação de toda a memória da região em tempo constante **\(O(1)\)**, recuando o ponteiro de pilha em lote através de uma única instrução de adição aritmética (`add sp, sp, #1024` ou `addq $1024, %rsp`). Gigabytes de dados locais são limpos em um único ciclo de clock.
+### C) The Native Physical Arena Allocator (`OP_ARENA_PUSH`, `OP_ARENA_POP`)
+To support zero-cost automatic memory management (*Region-Based Memory Management*) without the overhead of a Garbage Collector or dynamic Heap checks in production:
+*   The compiler reserves an immutable callee-saved register to act as the **Active Arena Cursor** (`x19` on ARM64, `%r12` on x86_64, `x9` on RISC-V, `r28/r29` on AVR).
+*   **`OP_ARENA_PUSH` (`using` Block Start):** Allocates a fixed contiguous memory frame (e.g. 1024 bytes) by directly decrementing the CPU's physical stack pointer (`sp` / `%rsp`) and locking the Arena register to that address.
+*   **`OP_ARENA_POP` (Scope Discard):** Releases all the region's memory in constant time **\(O(1)\)**, rolling back the stack pointer in batch via a single arithmetic addition instruction (`add sp, sp, #1024` or `addq $1024, %rsp`). Gigabytes of local data are wiped in a single clock cycle.
 
 ---
 
-## 3. Fluxo de Orquestração do Emissor Central (`codegen_metal.c`)
+## 3. Central Emitter Orchestration Flow (`codegen_metal.c`)
 
-Para coordenar a geração multimotores sem gerar conflitos de tipos ou alertas lógicos nas IDEs, o arquivo principal de roteamento utiliza marcas sentinelas (`0xFE` para inicializar o Prólogo físico do OS de destino e `0xFF` para cuspir o Epílogo de fechamento), varrendo a LI de forma contígua:
+To coordinate multi-engine generation without producing type conflicts or logical warnings in IDEs, the main routing file uses sentinel markers (`0xFE` to initialize the target OS's physical Prologue and `0xFF` to emit the closing Epilogue), scanning the IL contiguously:
 
 ```c
 void teko_metal_emit_program(MetalContext* ctx, const unsigned char* bytecode, uint32_t size) {
     if (!ctx || !bytecode || size == 0) return;
 
-    // 1. Despacha o sinal de início (Injeta diretivas .global e alinhamentos de pilha do OS)
+    // 1. Dispatch the start signal (Injects .global directives and OS stack alignments)
     teko_metal_route_instruction(ctx, 0xFE, 0);
 
-    // 2. Varredura linear e triagem rigorosa de Opcodes e argumentos Little Endian
+    // 2. Linear scan and strict triage of Opcodes and Little Endian arguments
     uint32_t i = 0;
     while (i < size) {
         OpCode op = (OpCode)bytecode[i++];
@@ -67,16 +67,16 @@ void teko_metal_emit_program(MetalContext* ctx, const unsigned char* bytecode, u
         teko_metal_route_instruction(ctx, op, arg);
     }
 
-    // 3. Despacha o sinal de término (Restaura registradores e injeta a instrução 'ret' ou 'syscall')
+    // 3. Dispatch the termination signal (Restores registers and injects the 'ret' or 'syscall' instruction)
     teko_metal_route_instruction(ctx, 0xFF, 0);
 }
 ```
 
 ---
 
-## 4. Próximos Passos de Codificação Dinâmica
+## 4. Next Dynamic Coding Steps
 
-Com a árvore física de pastas montada via terminal (`mkdir -p`) e o planejamento de hardware documentado, os submódulos serão codificados na seguinte sequência estável de arquivos isolados:
+With the physical folder tree built via terminal (`mkdir -p`) and the hardware planning documented, the submodules will be coded in the following stable sequence of isolated files:
 
 1.  `src/codegen/apple/emit_darwin_arm64.c`
 2.  `src/codegen/bsd_unix/emit_freebsd_x86_64.c`
@@ -85,4 +85,4 @@ Com a árvore física de pastas montada via terminal (`mkdir -p`) e o planejamen
 5.  `src/codegen/bare_metal/emit_wasm.c`
 6.  `src/codegen/bare_metal/emit_avr.c`
 
-Cada incremento será suportado por asserções rígidas do Unity dentro da pasta `tests/codegen/` para garantir 100% de estabilidade de baixo nível.
+Each increment will be backed by strict Unity assertions within the `tests/codegen/` folder to guarantee 100% low-level stability.

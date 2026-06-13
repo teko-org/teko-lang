@@ -13,7 +13,7 @@ typedef struct StructValidationResult {
     char* error_message;
 } StructValidationResult;
 
-// Valida se as chaves fornecidas contêm todos os campos definidos como 'required'
+// Validates whether the provided keys contain all fields defined as 'required'
 StructValidationResult validate_required_properties(const MessageProperty* defined_props, int defined_count,
                                                    const char** initialized_names, int initialized_count);
 void free_struct_validation_result(StructValidationResult result);

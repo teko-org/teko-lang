@@ -12,11 +12,11 @@ void test_teko_aot_common_subexpression_elimination_filter(void) {
     MetalContext* ctx = teko_metal_create(asm_path, target);
     TEST_ASSERT_NOT_NULL(ctx);
 
-    // Adiciona uma marca de instrução neutra (OP_STORE) para isolar o barramento e certificar o CSE
+    // Adds a neutral instruction marker (OP_STORE) to isolate the bus and certify CSE
     unsigned char mock_cse_bytes[] = {
         0x01, 0x2A, 0x00, 0x00, 0x00, // OP_ICONST 42
         0x03,                         // OP_STORE
-        0x01, 0x2A, 0x00, 0x00, 0x00  // OP_ICONST 42 (Redundante capturada pelo CSE)
+        0x01, 0x2A, 0x00, 0x00, 0x00  // OP_ICONST 42 (Redundant copy captured by CSE)
     };
 
     teko_metal_emit_program(ctx, mock_cse_bytes, sizeof(mock_cse_bytes));
