@@ -96,48 +96,68 @@ jobs:
         run: qemu-riscv64-static ./build/teko_tests
 
   # ---------------------------------------------------------------------------
-  # Phase 10 WASM concurrency harness (non-blocking until the backend stabilizes).
-  # Executes the emitted-channel WASM pattern under a standalone engine and a
-  # headless browser to guarantee behavioral parity. See runtime/wasm/README.md.
+  # Phase 10 WASM concurrency backend. These jobs build the compiler, emit a REAL
+  # spawn + blocking-channel module from the Teko backend (emit-demo), and run it
+  # — plus the hand-written reference fixtures — under a standalone engine and a
+  # headless browser to guarantee behavioral parity. Now gating (the backend is
+  # stable: emitted.wasm round-trips a channel through a spawned green thread,
+  # main() == 7). See runtime/wasm/README.md.
   # ---------------------------------------------------------------------------
   wasm-wasmtime:
-    name: WASM exec — channels under Node + wasmtime (non-blocking)
+    name: WASM exec — emitter + references under Node + wasmtime
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - name: Checkout Repository Code
         uses: actions/checkout@v4
-      - name: Install WABT (wat2wasm) + wasmtime
+      - name: Install toolchain (clang / ninja / WABT) + wasmtime
         run: |
-          sudo apt-get update && sudo apt-get install -y wabt
+          sudo apt-get update && sudo apt-get install -y cmake ninja-build clang wabt
           curl https://wasmtime.dev/install.sh -sSf | bash
-      - name: Build the WASM fixtures (wat2wasm)
+      - name: Build the compiler core (Release) -> libteko_core.a
+        run: |
+          cmake -S . -B build -G "Ninja" -DCMAKE_C_COMPILER=clang -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --target teko_core --parallel 4
+      - name: Emit a real spawn+channel module from the Teko backend
+        run: |
+          cc -I src runtime/wasm/emit-demo/emit_spawn_channel.c build/libteko_core.a -o emit_spawn_channel
+          ./emit_spawn_channel runtime/wasm/samples/emitted.wat
+      - name: Assemble all modules (wat2wasm)
         run: |
           wat2wasm runtime/wasm/samples/channels.wat  -o runtime/wasm/samples/channels.wasm
           wat2wasm runtime/wasm/samples/scheduler.wat -o runtime/wasm/samples/scheduler.wasm
-      - name: Run under Node (standalone engine; channels=42, scheduler=15)
+          wat2wasm runtime/wasm/samples/emitted.wat   -o runtime/wasm/samples/emitted.wasm
+      - name: Run under Node (channels=42, scheduler=15, emitted main=7)
         run: node runtime/wasm/run-node.mjs
       - name: Run under wasmtime
         run: |
           ~/.wasmtime/bin/wasmtime run --invoke test runtime/wasm/samples/channels.wasm
           ~/.wasmtime/bin/wasmtime run --invoke test runtime/wasm/samples/scheduler.wasm
+          ~/.wasmtime/bin/wasmtime run --invoke main runtime/wasm/samples/emitted.wasm
 
   wasm-browser:
-    name: WASM exec — headless Chromium, COOP/COEP (non-blocking)
+    name: WASM exec — headless Chromium, COOP/COEP
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - name: Checkout Repository Code
         uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
-      - name: Install WABT (wat2wasm)
-        run: sudo apt-get update && sudo apt-get install -y wabt
-      - name: Build the WASM fixtures (wat2wasm)
+      - name: Install toolchain (clang / ninja / WABT)
+        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build clang wabt
+      - name: Build the compiler core (Release) -> libteko_core.a
+        run: |
+          cmake -S . -B build -G "Ninja" -DCMAKE_C_COMPILER=clang -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --target teko_core --parallel 4
+      - name: Emit a real spawn+channel module from the Teko backend
+        run: |
+          cc -I src runtime/wasm/emit-demo/emit_spawn_channel.c build/libteko_core.a -o emit_spawn_channel
+          ./emit_spawn_channel runtime/wasm/samples/emitted.wat
+      - name: Assemble all modules (wat2wasm)
         run: |
           wat2wasm runtime/wasm/samples/channels.wat  -o runtime/wasm/samples/channels.wasm
           wat2wasm runtime/wasm/samples/scheduler.wat -o runtime/wasm/samples/scheduler.wasm
+          wat2wasm runtime/wasm/samples/emitted.wat   -o runtime/wasm/samples/emitted.wasm
       - name: Install harness deps + Chromium
         working-directory: runtime/wasm
         run: |

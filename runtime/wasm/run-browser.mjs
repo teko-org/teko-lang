@@ -7,7 +7,7 @@ import { chromium } from "playwright";
 import { startServer } from "./server.mjs";
 
 const PORT = Number(process.env.PORT ?? 8092);
-const EXPECTED = { channels: 42, scheduler: 15 };
+const EXPECTED = { channels: 42, scheduler: 15, emitted: 7 };
 const server = await startServer(PORT);
 let exitCode = 0;
 try {

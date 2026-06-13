@@ -90,13 +90,27 @@ The arena (`$arena_sp`) is reused for all of these allocations.
   fn_index+arg), `call_indirect` dispatch, and **blocking channels via yield** (an empty
   receive calls `$sched_run` re-entrantly to run a producer, then resumes — no mid-function
   suspension). Executed under Node + wasmtime + headless Chromium in CI (`test() → 15`).
-- **10.2b — wire the scheduler into the emitter** ⏳ *needs approval (architectural)*: the
-  emitter currently produces a **single `$main` function**; real `call_indirect` spawn needs
-  the **IL/codegen to lower each `routine` body to a separate WASM function** indexed in a
-  table. That is a cross-cutting IL change (new function-boundary opcodes), not a per-opcode
-  `emit_wasm.c` tweak — so it is gated on approval, like 10.3.
+- **10.2b — wire the scheduler into the emitter** ✅ *done*: new function-boundary opcodes
+  (`OP_FUNC_BEGIN`/`OP_FUNC_END`, plus blocking `OP_CHAN_GET`) lower each green-thread body
+  to a **separate WASM function** indexed in a `(table … funcref)`. `OP_SPAWN_ASYNC` now
+  enqueues `{fn_index, arg}` into an in-module run queue and the scheduler dispatches it via
+  `call_indirect (type $task)`; `OP_AWAIT_INTENT` and a blocked `OP_CHAN_GET` yield to
+  `$teko_sched_run`. **No host runtime imports** — the module instantiates standalone.
+  - *Prerequisite fixed:* the emitter mixed a stack-push model (`ICONST`) with a register
+    model (`$w0/$w1`), so its output was **never valid WASM** (the golden tests only
+    `strstr`, never assembled it). 10.2b moves the emitter to a consistent **accumulator
+    model** (`$w0` accumulator, `$w1` scratch, `$cp` channel pointer) so every op is
+    stack-neutral and each function ends with exactly one value.
+  - *Executable proof:* `runtime/wasm/emit-demo/emit_spawn_channel.c` drives the real backend
+    to emit a spawn + blocking-channel program; CI assembles it with `wat2wasm` and runs it
+    under Node + wasmtime + headless Chromium — a spawned green thread round-trips a channel
+    value, `main() == 7`. The `wasm-wasmtime`/`wasm-browser` jobs are now **gating**.
+  - *Native backends unaffected:* the new opcodes are below the native emitters' label
+    threshold and carry their args centrally in the orchestrator, so the 16 native emitters
+    and their goldens are byte-for-byte unchanged (full suite + ASan/UBSan both dispatch
+    paths green).
 - **10.3 — mid-function suspension** (the hard part): state-machine/CPS lowering so a green
-  thread can suspend *mid-body* (not just run-to-completion). Reviewed sub-project; gated.
+  thread can suspend *mid-body* (not just run-to-completion). Reviewed sub-project; **next**.
 - **10.4 — `--target=wasm-threads`** (Layer B): shared memory + atomics + Web Worker host
   glue; node `worker_threads` execution test. Opt-in parallelism.
 

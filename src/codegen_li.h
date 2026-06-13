@@ -24,6 +24,14 @@ typedef enum {
     OP_AWAIT_INTENT = 0x11,
     OP_CHAN_INIT = 0x12,
     OP_CHAN_PUT = 0x13,
+    OP_CHAN_GET = 0x14, // Blocking channel receive (yields to the scheduler if empty)
+
+    // Phase 10.2b: function-boundary opcodes for green-thread lowering. Each
+    // routine body is emitted as a separate WASM function indexed in a table so
+    // SPAWN_ASYNC can dispatch it via call_indirect. OP_FUNC_BEGIN carries a
+    // 4-byte little-endian routine id (its table slot); OP_FUNC_END closes it.
+    OP_FUNC_BEGIN = 0x40,
+    OP_FUNC_END = 0x41,
 
     // Control Flow and Branches
     OP_JMP = 0x20,

@@ -51,11 +51,13 @@ void test_teko_aot_wasm_pure_emission_integrity(void) {
 }
 
 // ====================================================================
-// 2. WASM ARENA ALLOCATOR + IN-MODULE CHANNELS + SPAWN/AWAIT HOOKS
+// 2. WASM ARENA ALLOCATOR + IN-MODULE CHANNELS + COOPERATIVE CONCURRENCY
 // ====================================================================
-// The O(1) arena is real linear-memory bump code. Phase 10.1: channels are now
-// real in-module ring buffers in linear memory (no host import); only spawn and
-// await still delegate to the host runtime (cooperative scheduler is Phase 10.2).
+// The O(1) arena is real linear-memory bump code. Phase 10.1: channels are real
+// in-module ring buffers. Phase 10.2b: spawn/await are now real cooperative
+// primitives compiled into the module (run queue + scheduler), with no host
+// runtime imports at all — so the module instantiates standalone (verified
+// executably by the wasm-emit CI job).
 void test_teko_aot_wasm_arena_and_concurrency_hooks(void) {
     const char* asm_path = "output_wasm_arena_test.wat";
 
@@ -98,10 +100,75 @@ void test_teko_aot_wasm_arena_and_concurrency_hooks(void) {
     TEST_ASSERT_NULL(strstr(buffer, "call $teko_chan_put"));
     TEST_ASSERT_NULL(strstr(buffer, "\"chan_init\""));
 
-    // Spawn / await still delegate to honest host-runtime hooks (Phase 10.2).
-    TEST_ASSERT_NOT_NULL(strstr(buffer, "(import \"teko_rt\" \"spawn\""));
-    TEST_ASSERT_NOT_NULL(strstr(buffer, "call $teko_spawn"));
-    TEST_ASSERT_NOT_NULL(strstr(buffer, "call $teko_await"));
+    // Phase 10.2b: spawn/await are real cooperative primitives — SPAWN enqueues
+    // into the in-module run queue, AWAIT yields to the in-module scheduler.
+    TEST_ASSERT_NOT_NULL(strstr(buffer, "(type $task (func (param i32)))")); // call_indirect signature
+    TEST_ASSERT_NOT_NULL(strstr(buffer, "(func $teko_enqueue"));             // run-queue append
+    TEST_ASSERT_NOT_NULL(strstr(buffer, "(func $teko_sched_run"));           // cooperative scheduler
+    TEST_ASSERT_NOT_NULL(strstr(buffer, "call $teko_enqueue"));              // SPAWN_ASYNC -> enqueue
+    TEST_ASSERT_NOT_NULL(strstr(buffer, "call $teko_sched_run"));            // AWAIT_INTENT -> yield
+    // No host runtime: the legacy spawn/await imports are gone, so the module
+    // instantiates with no imports.
+    TEST_ASSERT_NULL(strstr(buffer, "(import \"teko_rt\" \"spawn\""));
+    TEST_ASSERT_NULL(strstr(buffer, "call $teko_spawn"));
+    TEST_ASSERT_NULL(strstr(buffer, "call $teko_await"));
+
+    free(buffer);
+    remove(asm_path);
+}
+
+// ====================================================================
+// 3. WASM MULTI-FUNCTION GREEN-THREAD LOWERING (Phase 10.2b)
+// ====================================================================
+// Each routine body is emitted as a SEPARATE WASM function indexed in a table,
+// and SPAWN dispatches it via call_indirect. This pins the structural shape of
+// the lowering; the wasm-emit CI job verifies it actually runs (channel value
+// round-trips through a spawned green thread -> main() == 7).
+void test_teko_aot_wasm_multifunction_spawn_lowering(void) {
+    const char* asm_path = "output_wasm_multifn_test.wat";
+
+    TekoTarget target;
+    target.arch = ARCH_WASM32;
+    target.os = OS_WASI;
+    strncpy(target.target_string, "wasm32-wasi", sizeof(target.target_string) - 1);
+
+    MetalContext* ctx = teko_metal_create(asm_path, target);
+    TEST_ASSERT_NOT_NULL(ctx);
+
+    // main: CHAN_INIT, ICONST 0, SPAWN_ASYNC, CHAN_GET, HALT
+    // routine 0: FUNC_BEGIN(0), ICONST 7, CHAN_PUT, FUNC_END
+    unsigned char prog[] = {
+        0x12,                         // OP_CHAN_INIT
+        0x01, 0x00, 0x00, 0x00, 0x00, // OP_ICONST 0 (routine index)
+        0x10,                         // OP_SPAWN_ASYNC
+        0x14,                         // OP_CHAN_GET (blocking receive)
+        0x00,                         // OP_HALT
+        0x40, 0x00, 0x00, 0x00, 0x00, // OP_FUNC_BEGIN id=0
+        0x01, 0x07, 0x00, 0x00, 0x00, // OP_ICONST 7
+        0x13,                         // OP_CHAN_PUT
+        0x41                          // OP_FUNC_END
+    };
+    teko_metal_emit_program(ctx, prog, sizeof(prog));
+    teko_metal_close(ctx);
+
+    FILE* file = fopen(asm_path, "r");
+    TEST_ASSERT_NOT_NULL(file);
+    char* buffer = (char*)malloc(8192);
+    TEST_ASSERT_NOT_NULL(buffer);
+    memset(buffer, 0, 8192);
+    size_t bytes = fread(buffer, 1, 8191, file);
+    buffer[bytes] = '\0';
+    fclose(file);
+
+    // The green-thread body is its own function with a param (the channel base).
+    TEST_ASSERT_NOT_NULL(strstr(buffer, "(func $routine_0 (param $arg i32)"));
+    // SPAWN is dispatched indirectly through the function table.
+    TEST_ASSERT_NOT_NULL(strstr(buffer, "call_indirect (type $task)"));
+    // The table + its initialiser list the routine as table slot 0.
+    TEST_ASSERT_NOT_NULL(strstr(buffer, "(table 1 funcref)"));
+    TEST_ASSERT_NOT_NULL(strstr(buffer, "(elem (i32.const 0) $routine_0)"));
+    // The blocking receive yields to the scheduler when the channel is empty.
+    TEST_ASSERT_NOT_NULL(strstr(buffer, "call $teko_sched_run"));
 
     free(buffer);
     remove(asm_path);

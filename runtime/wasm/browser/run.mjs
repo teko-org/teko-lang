@@ -5,17 +5,19 @@
 // (SharedArrayBuffer + Web Workers).
 const out = document.getElementById("out");
 const fixtures = [
-  { file: "../samples/channels.wasm", expected: 42, name: "channels" },
-  { file: "../samples/scheduler.wasm", expected: 15, name: "scheduler" },
+  { file: "../samples/channels.wasm", expected: 42, name: "channels", entry: "test" },
+  { file: "../samples/scheduler.wasm", expected: 15, name: "scheduler", entry: "test" },
+  // Real compiler output (Phase 10.2b): spawn + blocking channel -> main() == 7.
+  { file: "../samples/emitted.wasm", expected: 7, name: "emitted", entry: "main" },
 ];
 const results = {};
 let lines = [];
-for (const { file, expected, name } of fixtures) {
+for (const { file, expected, name, entry } of fixtures) {
   try {
     const res = await WebAssembly.instantiateStreaming(fetch(file), {});
-    const got = res.instance.exports.test();
+    const got = res.instance.exports[entry]();
     results[name] = got;
-    lines.push(`${name}: test() = ${got} (expected ${expected})`);
+    lines.push(`${name}: ${entry}() = ${got} (expected ${expected})`);
   } catch (e) {
     results[name] = `error: ${e}`;
     lines.push(`${name}: error: ${e}`);

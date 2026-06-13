@@ -13,6 +13,9 @@ MetalContext* teko_metal_create(const char* output_asm_path, TekoTarget target) 
     ctx->file = f;
     ctx->target = target;
     ctx->label_count = 0;
+    ctx->wasm_open = 0;
+    ctx->wasm_routine_count = 0;
+    memset(ctx->wasm_routine_ids, 0, sizeof(ctx->wasm_routine_ids));
     return ctx;
 }
 
@@ -117,7 +120,8 @@ static void process_linear_il_bytes(MetalContext* ctx, const unsigned char* byte
             }
         }
 
-        if (op == OP_ICONST || op == OP_SCONST || op == OP_JMP || op == OP_JMP_IF_FALSE) scan += 5;
+        if (op == OP_ICONST || op == OP_SCONST || op == OP_JMP || op == OP_JMP_IF_FALSE ||
+            op == OP_FUNC_BEGIN) scan += 5;
         else scan += 1;
     }
 
@@ -133,12 +137,16 @@ static void process_linear_il_bytes(MetalContext* ctx, const unsigned char* byte
             continue;
         }
 
-        if (op == OP_ICONST || op == OP_SCONST || op == OP_JMP || op == OP_JMP_IF_FALSE) {
+        if (op == OP_ICONST || op == OP_SCONST || op == OP_JMP || op == OP_JMP_IF_FALSE ||
+            op == OP_FUNC_BEGIN) {
             arg = read_le_int32(local_il, current_op_index + 1);
             i += 4;
         }
 
-        if ((int)op >= 100) {
+        // Function boundaries start a fresh emission context, exactly like a
+        // label target: a routine body after $main's HALT must not inherit
+        // $main's dead-code zone, and CSE/const accumulators reset per function.
+        if ((int)op >= 100 || op == OP_FUNC_BEGIN || op == OP_FUNC_END) {
             dead_code_zone = false;
             accum_has_value = false;
             last_arith_op = (OpCode)0;
@@ -162,7 +170,8 @@ static void process_linear_il_bytes(MetalContext* ctx, const unsigned char* byte
                     accum_has_value = false;
                 }
             }
-            else if (op == OP_STORE || op == OP_LOAD || op == OP_SPAWN_ASYNC || op == OP_CHAN_INIT) {
+            else if (op == OP_STORE || op == OP_LOAD || op == OP_SPAWN_ASYNC ||
+                     op == OP_CHAN_INIT || op == OP_CHAN_GET) {
                 last_arith_op = (OpCode)0;
             }
         }
