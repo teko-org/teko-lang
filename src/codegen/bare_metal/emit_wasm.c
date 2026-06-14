@@ -154,17 +154,17 @@ static void emit_wasm_threads(MetalContext* ctx, OpCode op, int32_t arg) {
             break;
 
         case OP_CHAN_GET:
-            // Block on the atomic until the flag is set, then load the value.
-            // GUARDED loop with a BOUNDED wait (1 ms, not infinite): notify is an
-            // optimization, never a correctness guarantee — a cross-instance
-            // memory.atomic.notify can be missed (observed on CI). The loop re-reads
-            // the flag every iteration, so a missed wakeup costs at most the timeout,
-            // not a deadlock. The producer's store of the flag is what guarantees
-            // eventual progress.
-            fprintf(f, "    ;; [WASM-threads Channel Get]: guarded loop, bounded memory.atomic.wait32\n");
+            // Busy-poll the channel flag with an ATOMIC load until the producer
+            // sets it, then read the value. This deliberately does NOT use
+            // memory.atomic.wait32/notify: a cross-instance notify was observed to
+            // never reach the waiter on some runtimes (the wait blocks forever).
+            // Cross-thread visibility of the shared memory is guaranteed by the
+            // memory model, so the atomic load is certain to observe the store —
+            // no notify required. (A production scheduler would back off; this is
+            // the correctness-first form for the cooperative-over-threads MVP.)
+            fprintf(f, "    ;; [WASM-threads Channel Get]: notify-free atomic busy-poll on the flag\n");
             fprintf(f, "    (block $ready\n      (loop $spin\n");
             fprintf(f, "        (br_if $ready (i32.eq (i32.atomic.load offset=0 (local.get $cp)) (i32.const 1)))\n");
-            fprintf(f, "        (drop (memory.atomic.wait32 offset=0 (local.get $cp) (i32.const 0) (i64.const 1000000)))\n");
             fprintf(f, "        (br $spin)))\n");
             fprintf(f, "    local.get $cp\n    i32.atomic.load offset=4\n    local.set $w0\n");
             break;

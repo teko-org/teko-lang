@@ -22,13 +22,13 @@
     (local.set $cp (i32.const 2048))
     (i32.atomic.store offset=0 (local.get $cp) (i32.const 0))   ;; ready = 0
     (call $teko_spawn (i32.const 0) (local.get $cp))            ;; host starts a real Worker
-    ;; GUARDED loop with a BOUNDED wait (1 ms): notify is best-effort, so re-read
-    ;; the flag each iteration — a missed cross-instance notify costs at most the
-    ;; timeout, never a deadlock. The producer's flag store guarantees progress.
+    ;; Notify-free atomic busy-poll: a cross-instance memory.atomic.notify was
+    ;; observed never to reach the waiter on some runtimes, so we do not rely on
+    ;; it. Cross-thread visibility of the shared memory is guaranteed, so the
+    ;; atomic load is certain to observe the producer's flag store.
     (block $ready
       (loop $spin
         (br_if $ready (i32.eq (i32.atomic.load offset=0 (local.get $cp)) (i32.const 1)))
-        (drop (memory.atomic.wait32 offset=0 (local.get $cp) (i32.const 0) (i64.const 1000000)))
         (br $spin)))
     (i32.atomic.load offset=4 (local.get $cp)))
 

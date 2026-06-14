@@ -24,8 +24,13 @@ async function runModule(wasmRel) {
   const cleanup = () => workers.forEach((w) => w.terminate().catch(() => {}));
   return await new Promise((resolve, reject) => {
     const fail = (err) => { clearTimeout(timer); cleanup(); reject(err instanceof Error ? err : new Error(String(err))); };
-    const timer = setTimeout(() => fail(new Error(`watchdog: no atomic notify within ${WATCHDOG_MS}ms`)), WATCHDOG_MS);
+    const timer = setTimeout(() => fail(new Error(`watchdog: no progress within ${WATCHDOG_MS}ms`)), WATCHDOG_MS);
     const pending = [];
+    // Diagnostic third party: watch the shared memory's channel cell over time.
+    // Channel base is 2048 (arena start) => flag at i32[512].
+    const observer = new Worker(here("./observer.mjs"), { workerData: { memory, flagIdx: 2048 >> 2 } });
+    workers.push(observer);
+    observer.on("message", (m) => { if (m && m.log) console.log(m.log); });
     const runner = new Worker(here("./runner.mjs"), { workerData: { memory, bytes } });
     workers.push(runner);
     runner.on("error", fail);

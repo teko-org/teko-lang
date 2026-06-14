@@ -272,10 +272,11 @@ void test_teko_aot_wasm_threads_layer_b_emission(void) {
 
     // Shared memory import (the prerequisite for the atomics proposal).
     TEST_ASSERT_NOT_NULL(strstr(buffer, "(import \"env\" \"memory\" (memory 1 1 shared))"));
-    // Atomic channel ops: publish + wake + wait.
+    // Atomic channel ops: the producer publishes (store) + notifies; the consumer
+    // busy-polls the flag with an atomic load (notify-free — see emit_wasm.c).
     TEST_ASSERT_NOT_NULL(strstr(buffer, "i32.atomic.store"));
     TEST_ASSERT_NOT_NULL(strstr(buffer, "memory.atomic.notify"));
-    TEST_ASSERT_NOT_NULL(strstr(buffer, "memory.atomic.wait32"));
+    TEST_ASSERT_NOT_NULL(strstr(buffer, "i32.atomic.load"));
     // SPAWN delegates to the host Worker; a dispatcher is exported for it to call.
     TEST_ASSERT_NOT_NULL(strstr(buffer, "(import \"teko_rt\" \"spawn\""));
     TEST_ASSERT_NOT_NULL(strstr(buffer, "call $teko_spawn"));
