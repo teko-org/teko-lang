@@ -235,6 +235,65 @@ void test_teko_aot_wasm_midfunction_suspension(void) {
 }
 
 // ====================================================================
+// 6. WASM MULTI-SPAWN CONTENTION — N ROUTINES, ONE CHANNEL (Phase 10 stability)
+// ====================================================================
+// Five green-thread producers compete on one channel; the consumer drains and
+// sums them. Pins the multi-routine lowering (a 5-entry function table). The
+// wasm-exec CI jobs verify it runs deterministically (main() == 15).
+void test_teko_aot_wasm_multispawn_contention(void) {
+    const char* asm_path = "output_wasm_multispawn_test.wat";
+
+    TekoTarget target;
+    target.arch = ARCH_WASM32;
+    target.os = OS_WASI;
+    strncpy(target.target_string, "wasm32-wasi", sizeof(target.target_string) - 1);
+
+    MetalContext* ctx = teko_metal_create(asm_path, target);
+    TEST_ASSERT_NOT_NULL(ctx);
+
+    // main: CHAN_INIT, (ICONST k, SPAWN)x5, CHAN_GET STORE, (CHAN_GET ADD STORE)x3,
+    //       CHAN_GET ADD, HALT ; then 5 producer routines putting 1..5.
+    unsigned char prog[256];
+    int n = 0;
+    prog[n++] = 0x12; // CHAN_INIT
+    for (int k = 0; k < 5; k++) {
+        prog[n++] = 0x01; prog[n++] = (unsigned char)k; prog[n++] = 0; prog[n++] = 0; prog[n++] = 0; // ICONST k
+        prog[n++] = 0x10; // SPAWN_ASYNC
+    }
+    prog[n++] = 0x14; prog[n++] = 0x04;             // CHAN_GET, STORE
+    for (int k = 1; k < 4; k++) { prog[n++] = 0x14; prog[n++] = 0x05; prog[n++] = 0x04; } // GET ADD STORE
+    prog[n++] = 0x14; prog[n++] = 0x05;             // CHAN_GET, ADD
+    prog[n++] = 0x00;                               // HALT
+    for (int k = 0; k < 5; k++) {
+        prog[n++] = 0x40; prog[n++] = (unsigned char)k; prog[n++] = 0; prog[n++] = 0; prog[n++] = 0; // FUNC_BEGIN k
+        prog[n++] = 0x01; prog[n++] = (unsigned char)(k + 1); prog[n++] = 0; prog[n++] = 0; prog[n++] = 0; // ICONST k+1
+        prog[n++] = 0x13;                           // CHAN_PUT
+        prog[n++] = 0x41;                           // FUNC_END
+    }
+    teko_metal_emit_program(ctx, prog, (uint32_t)n);
+    teko_metal_close(ctx);
+
+    FILE* file = fopen(asm_path, "r");
+    TEST_ASSERT_NOT_NULL(file);
+    char* buffer = (char*)malloc(16384);
+    TEST_ASSERT_NOT_NULL(buffer);
+    memset(buffer, 0, 16384);
+    size_t bytes = fread(buffer, 1, 16383, file);
+    buffer[bytes] = '\0';
+    fclose(file);
+
+    // All five green threads are emitted and indexed in a 5-entry table.
+    TEST_ASSERT_NOT_NULL(strstr(buffer, "(func $routine_0 (param $arg i32)"));
+    TEST_ASSERT_NOT_NULL(strstr(buffer, "(func $routine_4 (param $arg i32)"));
+    TEST_ASSERT_NOT_NULL(strstr(buffer, "(table 5 funcref)"));
+    TEST_ASSERT_NOT_NULL(strstr(buffer, "(elem (i32.const 0) $routine_0 $routine_1 $routine_2 $routine_3 $routine_4)"));
+    TEST_ASSERT_NOT_NULL(strstr(buffer, "call_indirect (type $task)"));
+
+    free(buffer);
+    remove(asm_path);
+}
+
+// ====================================================================
 // 5. WASM-THREADS (LAYER B): SHARED MEMORY + ATOMICS + HOST SPAWN (Phase 10.4)
 // ====================================================================
 // With a `...-wasm-threads` target the backend emits the opt-in real-multicore

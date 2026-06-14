@@ -28,6 +28,13 @@ Fixtures:
   delegates to a host `teko_rt.spawn` that starts a real Worker. `main() → 99` on a
   real OS thread (`threads/run-node-threads.mjs`, `browser/threads-*`).
 - `samples/threads.wat` — hand-written Layer B reference (same ABI, `main() → 777`).
+- `samples/emitted_multi.wat` — **real compiler output (stability)**: five green-thread
+  producers contend on one channel; the consumer drains and sums them (`main() → 15`).
+  Exercises the run queue with several routines + a 5-entry function table.
+
+All harnesses run each module repeatedly per execution (cooperative 500×, Layer B
+hand-offs 100× node / 30× browser) so scheduling flakiness can't hide behind a
+single pass; any iteration that mismatches or times out fails the job.
 - `samples/channels.wat` — hand-written reference: Phase 10.1 channel ring buffer
   (`test() → 42`).
 - `samples/scheduler.wat` — hand-written reference: Phase 10.2 cooperative

@@ -61,6 +61,7 @@ extern void test_teko_aot_wasm_arena_and_concurrency_hooks(void);
 extern void test_teko_aot_wasm_multifunction_spawn_lowering(void);
 extern void test_teko_aot_wasm_midfunction_suspension(void);
 extern void test_teko_aot_wasm_threads_layer_b_emission(void);
+extern void test_teko_aot_wasm_multispawn_contention(void);
 extern void test_teko_aot_freebsd_x86_64_pure_emission(void);
 extern void test_teko_aot_freebsd_arm64_pure_emission(void);
 extern void test_teko_aot_windows_x86_32_pure_emission(void);
@@ -151,6 +152,7 @@ int main(void) {
     RUN_TEST(test_teko_aot_wasm_multifunction_spawn_lowering);
     RUN_TEST(test_teko_aot_wasm_midfunction_suspension);
     RUN_TEST(test_teko_aot_wasm_threads_layer_b_emission);
+    RUN_TEST(test_teko_aot_wasm_multispawn_contention);
     RUN_TEST(test_teko_aot_freebsd_x86_64_pure_emission);
     RUN_TEST(test_teko_aot_freebsd_arm64_pure_emission);
     RUN_TEST(test_teko_aot_windows_x86_32_pure_emission);

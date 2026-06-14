@@ -14,6 +14,7 @@ const fixtures = [
   { file: "./samples/scheduler.wasm", expected: 15, name: "scheduler (10.2)", entry: "test" },
   { file: "./samples/emitted.wasm", expected: 7, name: "emitted spawn+channel (10.2b)", entry: "main", optional: true },
   { file: "./samples/emitted_suspend.wasm", expected: 30, name: "emitted mid-function suspension (10.3)", entry: "main", optional: true },
+  { file: "./samples/emitted_multi.wasm", expected: 15, name: "emitted multi-spawn contention (5 producers)", entry: "main", optional: true },
 ];
 
 // Determinism stress: re-instantiate and re-run each module many times; every run

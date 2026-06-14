@@ -11,6 +11,8 @@ const fixtures = [
   { file: "../samples/emitted.wasm", expected: 7, name: "emitted", entry: "main" },
   // Real compiler output (Phase 10.3): mid-function suspension -> main() == 30.
   { file: "../samples/emitted_suspend.wasm", expected: 30, name: "emittedSuspend", entry: "main" },
+  // Real compiler output: 5 producers contending on one channel -> main() == 15.
+  { file: "../samples/emitted_multi.wasm", expected: 15, name: "emittedMulti", entry: "main" },
 ];
 // Determinism stress: re-instantiate + re-run each module many times; report the
 // value only if every run matched.
