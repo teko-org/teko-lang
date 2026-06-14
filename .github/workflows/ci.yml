@@ -63,53 +63,29 @@ jobs:
         run: ${{ matrix.test_bin }}
 
   # ---------------------------------------------------------------------------
-  # DIAGNOSTIC (temporary, non-blocking): hunt the intermittent Windows x86_64
-  # crash. It does not reproduce off-Windows under ASan/UBSan/heap+stack poisoning,
-  # so run the suite many times on Windows under (1) MSVC AddressSanitizer (heap
-  # overflow / use-after-free) and (2) /RTC1 runtime checks (uninitialized-local
-  # reads — what ASan misses). Either should stamp the exact file:line/variable.
-  # Removed once the root cause is fixed and the gating Windows job is consistent.
+  # DIAGNOSTIC #1 (temporary, non-blocking): /RTC1 runtime checks. The intermittent
+  # Windows x86_64 crash does not reproduce off-Windows under ASan/UBSan/heap+stack
+  # poisoning, so the prime suspect is an uninitialized-local read (ASan misses
+  # those; a value benign-zero on macOS is garbage on Windows). /RTC1 catches it
+  # DETERMINISTICALLY (it tracks initialization, not the value) and needs NO runtime
+  # DLL. Run the suite 20x; a failure stamps "Run-Time Check Failure #3 - The
+  # variable 'x' is being used without being initialized" with file:line.
+  # This is a SEPARATE job so a broken ASan setup can never block this signal.
   # ---------------------------------------------------------------------------
-  windows-crash-hunt:
-    name: Windows x86_64 crash hunt (ASan + /RTC1, non-blocking diagnostic)
+  windows-rtc:
+    name: Windows x86_64 /RTC1 uninitialized-read hunt (non-blocking diagnostic)
     runs-on: windows-latest
     continue-on-error: true
-    timeout-minutes: 30
+    timeout-minutes: 25
     steps:
       - name: Checkout Repository Code
         uses: actions/checkout@v4
-
-      - name: Configure + build with MSVC AddressSanitizer
-        shell: pwsh
-        run: |
-          cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_FLAGS="/fsanitize=address /Zi"
-          cmake --build build-asan --config Release --parallel 4
-
-      - name: Stage ASan runtime DLL next to the test exe
-        shell: pwsh
-        run: |
-          $dll = Get-ChildItem "C:\Program Files\Microsoft Visual Studio" -Recurse -Filter "clang_rt.asan_dynamic-x86_64.dll" -ErrorAction SilentlyContinue | Select-Object -First 1
-          if ($dll) { Copy-Item $dll.FullName ".\build-asan\Release\"; Write-Host "staged: $($dll.FullName)" } else { Write-Host "WARN: ASan DLL not found" }
-
-      - name: Run suite 20x under ASan (force the intermittent crash + stamp)
-        shell: pwsh
-        run: |
-          $bad = 0
-          for ($i = 1; $i -le 20; $i++) {
-            Write-Host "===== ASan run $i / 20 ====="
-            & .\build-asan\Release\teko_tests.exe
-            if ($LASTEXITCODE -ne 0) { Write-Host "!!! ASan run $i exited $LASTEXITCODE"; $bad++ }
-          }
-          Write-Host "ASan: $bad / 20 runs crashed/failed"
-          if ($bad -gt 0) { exit 1 }
-
-      - name: Configure + build Debug with /RTC1 (uninitialized-local checks)
+      - name: Configure + build Debug (/RTC1 is on by default for MSVC Debug)
         shell: pwsh
         run: |
           cmake -S . -B build-rtc -DCMAKE_BUILD_TYPE=Debug
           cmake --build build-rtc --config Debug --parallel 4
-
-      - name: Run suite 20x under /RTC1 (catches uninitialized reads ASan misses)
+      - name: Run suite 20x under /RTC1
         shell: pwsh
         run: |
           $bad = 0
@@ -119,6 +95,47 @@ jobs:
             if ($LASTEXITCODE -ne 0) { Write-Host "!!! RTC run $i exited $LASTEXITCODE"; $bad++ }
           }
           Write-Host "RTC1: $bad / 20 runs crashed/failed"
+          if ($bad -gt 0) { exit 1 }
+
+  # ---------------------------------------------------------------------------
+  # DIAGNOSTIC #2 (temporary, non-blocking): MSVC AddressSanitizer (heap overflow /
+  # use-after-free). The first attempt failed to LOAD (0xC0000139 ENTRYPOINT_NOT_
+  # FOUND) because the wrong clang_rt.asan_dynamic-x86_64.dll resolved. Here we add
+  # the EXACT toolset bin (the one cl.exe used) to PATH via vswhere so the matching
+  # ASan runtime DLL loads. Separate job so its setup can't block windows-rtc.
+  # ---------------------------------------------------------------------------
+  windows-asan:
+    name: Windows x86_64 ASan heap hunt (non-blocking diagnostic)
+    runs-on: windows-latest
+    continue-on-error: true
+    timeout-minutes: 25
+    steps:
+      - name: Checkout Repository Code
+        uses: actions/checkout@v4
+      - name: Configure + build with MSVC AddressSanitizer
+        shell: pwsh
+        run: |
+          cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_FLAGS="/fsanitize=address /Zi"
+          cmake --build build-asan --config Release --parallel 4
+      - name: Put the matching ASan runtime DLL on PATH (vswhere -> default toolset)
+        shell: pwsh
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+          $ver = (Get-Content "$vs\VC\Auxiliary\Build\Microsoft.VCToolsVersion.default.txt").Trim()
+          $bin = "$vs\VC\Tools\MSVC\$ver\bin\Hostx64\x64"
+          Write-Host "toolset bin: $bin"
+          if (Test-Path "$bin\clang_rt.asan_dynamic-x86_64.dll") { Write-Host "ASan DLL present" } else { Write-Host "WARN: ASan DLL NOT in $bin" }
+          Add-Content $env:GITHUB_PATH $bin
+      - name: Run suite 20x under ASan
+        shell: pwsh
+        run: |
+          $bad = 0
+          for ($i = 1; $i -le 20; $i++) {
+            Write-Host "===== ASan run $i / 20 ====="
+            & .\build-asan\Release\teko_tests.exe
+            if ($LASTEXITCODE -ne 0) { Write-Host "!!! ASan run $i exited $LASTEXITCODE"; $bad++ }
+          }
+          Write-Host "ASan: $bad / 20 runs crashed/failed"
           if ($bad -gt 0) { exit 1 }
 
   # ---------------------------------------------------------------------------
