@@ -80,10 +80,25 @@ accordingly; Self-Containment is now Phase 20.
     it to `#out`; `run-dom.mjs` (Playwright, COOP/COEP) asserts `#out > span` textContent.
     Golden `test_teko_aot_wasm_dom_import_lowering` pins the imports, the `$a*` staging, the
     call shape, and the generated glue.
+- **MVP-3 — events/callbacks. ✅ delivered.**
+  - JS→Teko: `OP_SETARG` already lets a callback routine call `dom.*`; the module now
+    exports a `teko_invoke(fn_index, arg)` dispatcher that `call_indirect`s a table slot
+    with the same routine ABI the cooperative scheduler uses (frame[0]=arg → callee `$w0`).
+  - New `dom.on(handle, "event", fn_index)` import; the glue registers
+    `handles[h].addEventListener(event, () => teko_invoke(fn, h))`, passing the attached
+    handle as the callback arg. Callback routines get the `$a*` staging locals.
+  - **Surface:** one-way registration `dom.on` + synchronous callback dispatch. The
+    callback receives the **attached element's handle** (an `i32`) — no event object is
+    marshalled (that needs richer marshalling / an allocator; deferred).
+  - Fixed a latent CSE bug surfaced here: ops that clobber `$w0` (`SCONST`/`LOAD`/
+    `CHAN_GET`/`CALL_IMPORT`) now invalidate the ICONST reuse cache. Layer A fixtures
+    still 42/15/7/30/15 (500×).
+  - Executable proof: `emit-demo/emit_events.c` registers a click listener whose Teko
+    handler sets the text; `run-events.mjs` (Playwright) clicks `#count` and asserts
+    `"0" → "clicked!"`. Golden `test_teko_aot_wasm_event_callback_lowering`.
 - **MVP-1b — frontend lowering (gated).** Lower the parsed `extern` AST → import table
   + a call-expression IL path so a real `.tks` (once a source driver exists) emits the
   import automatically. Needs the call-expression IL path, which does not exist yet.
-- **MVP-3 — events/callbacks (gated).** JS→Teko via the function table (listeners).
 - **MVP-4 — ergonomic facades (gated).** Generated JS facade + Teko-side `string`
   ergonomics; a real allocator (the bump arena does not free).
 

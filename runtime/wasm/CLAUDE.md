@@ -12,7 +12,8 @@ runners execute and assert. (Locally, `npm i wabt` gives a JS `wat2wasm` to vali
 - `emit-demo/` — C drivers: `emit_spawn_channel.c` (→7), `emit_suspend.c` (→30),
   `emit_multi.c` (→15), `emit_threads.c` (Layer B →99), `emit_ffi.c` (Browser FFI MVP-1:
   `(import "env" "log")` + `OP_CALL_IMPORT` + pooled string), `emit_dom.c` (MVP-2: multi-arg
-  `dom.*` imports + `OP_SETARG` + auto-generated `.glue.mjs`). Output `.wat`/`.glue.mjs` gitignored.
+  `dom.*` imports + `OP_SETARG` + auto-generated `.glue.mjs`), `emit_events.c` (MVP-3:
+  `dom.on` + exported `teko_invoke` callback dispatcher). Output `.wat`/`.glue.mjs` gitignored.
 - `samples/` — hand-written reference fixtures: `channels.wat` (42), `scheduler.wat` (15),
   `threads.wat` (Layer B reference, 777). `emitted*.wat`/`*.wasm` are generated/gitignored.
 - `run-node.mjs`, `run-browser.mjs` — Layer A under Node / headless Chromium.
@@ -22,6 +23,11 @@ runners execute and assert. (Locally, `npm i wabt` gives a JS `wat2wasm` to vali
   (Playwright, COOP/COEP): Teko builds a `<span>"hello from teko"` and appends it to `#out`
   entirely through the auto-generated `dom.*` glue; the harness asserts `#out > span` text.
   Strings cross as `(ptr,len)`; DOM nodes as `i32` handles (Teko→JS read direction only).
+- `run-events.mjs` + `browser/events.html` + `browser/events-run.mjs` — Browser FFI MVP-3
+  proof (JS→Teko): `$main` registers a click listener via `dom.on`; the harness clicks
+  `#count` and the glue calls `exports.teko_invoke(fn, handle)`, dispatching the Teko
+  callback that sets the text (`"0" → "clicked!"`). The glue is now
+  `makeTekoDomImports(getMemory, getInstance)` — the 2nd thunk exposes `teko_invoke`.
 - `threads/` (`run-node-threads.mjs`, `runner.mjs`, `worker.mjs`) — Layer B via
   `worker_threads`. `browser/threads-*.mjs` + `run-threads-browser.mjs` — Layer B via Web Workers.
 - `server.mjs` — static server with COOP/COEP (required for SharedArrayBuffer / Layer B).

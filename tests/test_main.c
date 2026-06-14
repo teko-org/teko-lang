@@ -64,6 +64,7 @@ extern void test_teko_aot_wasm_pure_emission_integrity(void);
 extern void test_teko_aot_wasm_string_pool_data_segment(void);
 extern void test_teko_aot_wasm_ffi_import_lowering(void);
 extern void test_teko_aot_wasm_dom_import_lowering(void);
+extern void test_teko_aot_wasm_event_callback_lowering(void);
 extern void test_teko_aot_wasm_arena_and_concurrency_hooks(void);
 extern void test_teko_aot_wasm_multifunction_spawn_lowering(void);
 extern void test_teko_aot_wasm_midfunction_suspension(void);
@@ -170,6 +171,7 @@ int main(void) {
     RUN_TEST(test_teko_aot_wasm_string_pool_data_segment);
     RUN_TEST(test_teko_aot_wasm_ffi_import_lowering);
     RUN_TEST(test_teko_aot_wasm_dom_import_lowering);
+    RUN_TEST(test_teko_aot_wasm_event_callback_lowering);
     RUN_TEST(test_teko_aot_wasm_arena_and_concurrency_hooks);
     RUN_TEST(test_teko_aot_wasm_multifunction_spawn_lowering);
     RUN_TEST(test_teko_aot_wasm_midfunction_suspension);

@@ -12,11 +12,14 @@ void test_teko_aot_common_subexpression_elimination_filter(void) {
     MetalContext* ctx = teko_metal_create(asm_path, target);
     TEST_ASSERT_NOT_NULL(ctx);
 
-    // Adds a neutral instruction marker (OP_STORE) to isolate the bus and certify CSE
+    // Adds a genuinely accumulator-neutral instruction (OP_STORE = 0x04: $w0 -> $w1,
+    // leaving $w0 intact) between two identical constants, so CSE may drop the
+    // second load. (OP_LOAD = 0x03 would *clobber* $w0 from $w1 and is intentionally
+    // NOT eliminable across — see the accumulator-clobber guard in codegen_metal.c.)
     unsigned char mock_cse_bytes[] = {
         0x01, 0x2A, 0x00, 0x00, 0x00, // OP_ICONST 42
-        0x03,                         // OP_STORE
-        0x01, 0x2A, 0x00, 0x00, 0x00  // OP_ICONST 42 (Redundant copy captured by CSE)
+        0x04,                         // OP_STORE ($w0 -> $w1; $w0 preserved)
+        0x01, 0x2A, 0x00, 0x00, 0x00  // OP_ICONST 42 (redundant copy captured by CSE)
     };
 
     teko_metal_emit_program(ctx, mock_cse_bytes, sizeof(mock_cse_bytes));

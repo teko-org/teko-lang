@@ -215,7 +215,7 @@ void test_teko_aot_wasm_dom_import_lowering(void) {
     glue[gbytes] = '\0';
     fclose(gf);
 
-    TEST_ASSERT_NOT_NULL(strstr(glue, "export function makeTekoDomImports(getMemory)"));
+    TEST_ASSERT_NOT_NULL(strstr(glue, "export function makeTekoDomImports(getMemory, getInstance)"));
     TEST_ASSERT_NOT_NULL(strstr(glue, "new Uint8Array(getMemory().buffer, p >>> 0, n >>> 0)"));
     // Only the two declared imports get glue methods (createElement + setText);
     // unused vocabulary (appendChild/getElementById) is not emitted.
@@ -223,6 +223,99 @@ void test_teko_aot_wasm_dom_import_lowering(void) {
     TEST_ASSERT_NOT_NULL(strstr(glue, "setText:"));
     TEST_ASSERT_NULL(strstr(glue, "appendChild:"));
     TEST_ASSERT_NULL(strstr(glue, "getElementById:"));
+    free(glue);
+
+    remove(asm_path);
+    remove(glue_path);
+}
+
+// ====================================================================
+// 1e. WASM DOM EVENTS: JS→Teko callbacks (dom.on + teko_invoke) (Phase 11 / MVP-3)
+// ====================================================================
+// `dom.on(handle, "click", fn_index)` registers a DOM listener; when it fires the
+// glue calls the exported teko_invoke(fn_index, handle), which dispatches the Teko
+// callback routine via call_indirect. The run-events Playwright step proves the
+// round-trip; this golden pins the dom.on import, the exported teko_invoke
+// dispatcher, the staging locals inside the callback routine, and the glue
+// listener wiring.
+void test_teko_aot_wasm_event_callback_lowering(void) {
+    const char* asm_path  = "output_wasm_events_test.wat";
+    const char* glue_path = "output_wasm_events_test.glue.mjs";
+
+    TekoTarget target;
+    target.arch = ARCH_WASM32;
+    target.os = OS_WASI;
+    strncpy(target.target_string, "wasm32-wasi", sizeof(target.target_string) - 1);
+
+    MetalContext* ctx = teko_metal_create(asm_path, target);
+    TEST_ASSERT_NOT_NULL(ctx);
+
+    static const char* strings[] = { "click", "hit" };
+    static const TekoWasmImport imports[] = {
+        { "dom", "on",      4, 0 }, // (handle,ptr,len,fn) : #0
+        { "dom", "setText", 3, 0 }, // (handle,ptr,len)    : #1
+    };
+    teko_metal_set_strings(ctx, strings, 2);
+    teko_metal_set_imports(ctx, imports, 2);
+
+    // $main: on(handle=0, "click", fn=0); then a callback routine 0: setText(arg,"hit").
+    unsigned char prog[] = {
+        0x0A, 0x00, 0x00, 0x00, 0x00, // OP_SETARG 0  (handle in $a0; $w0 garbage ok for golden)
+        0x02, 0x00, 0x00, 0x00, 0x00, // OP_SCONST 0  ("click")
+        0x0A, 0x01, 0x00, 0x00, 0x00, // OP_SETARG 1  (ptr)
+        0x01, 0x05, 0x00, 0x00, 0x00, // OP_ICONST 5  (len)
+        0x0A, 0x02, 0x00, 0x00, 0x00, // OP_SETARG 2  (len)
+        0x01, 0x00, 0x00, 0x00, 0x00, // OP_ICONST 0  (fn index)
+        0x09, 0x00, 0x00, 0x00, 0x00, // OP_CALL_IMPORT 0 (on)
+        0x00,                         // OP_HALT
+        0x40, 0x00, 0x00, 0x00, 0x00, // OP_FUNC_BEGIN 0 (callback)
+        0x0A, 0x00, 0x00, 0x00, 0x00, // OP_SETARG 0 (arg handle)
+        0x02, 0x01, 0x00, 0x00, 0x00, // OP_SCONST 1 ("hit")
+        0x0A, 0x01, 0x00, 0x00, 0x00, // OP_SETARG 1 (ptr)
+        0x01, 0x03, 0x00, 0x00, 0x00, // OP_ICONST 3 (len)
+        0x09, 0x01, 0x00, 0x00, 0x00, // OP_CALL_IMPORT 1 (setText)
+        0x41                          // OP_FUNC_END
+    };
+    teko_metal_emit_program(ctx, prog, sizeof(prog));
+
+    int glue_rc = teko_metal_emit_dom_glue(ctx, glue_path);
+    teko_metal_close(ctx);
+    TEST_ASSERT_EQUAL_INT(0, glue_rc);
+
+    // --- assert the emitted WAT ---
+    FILE* file = fopen(asm_path, "r");
+    TEST_ASSERT_NOT_NULL(file);
+    char* buffer = (char*)malloc(8192);
+    TEST_ASSERT_NOT_NULL(buffer);
+    memset(buffer, 0, 8192);
+    size_t bytes = fread(buffer, 1, 8191, file);
+    buffer[bytes] = '\0';
+    fclose(file);
+
+    TEST_ASSERT_NOT_NULL(strstr(buffer,
+        "(import \"dom\" \"on\" (func $import_0 (param i32) (param i32) (param i32) (param i32)))"));
+    // The exported JS->Teko dispatcher and its call_indirect.
+    TEST_ASSERT_NOT_NULL(strstr(buffer, "(func $teko_invoke (export \"teko_invoke\")"));
+    TEST_ASSERT_NOT_NULL(strstr(buffer, "call_indirect (type $task)"));
+    // The callback routine carries the import-arg staging locals too.
+    TEST_ASSERT_NOT_NULL(strstr(buffer, "(func $routine_0"));
+    char* routine = strstr(buffer, "(func $routine_0");
+    TEST_ASSERT_NOT_NULL(strstr(routine, "(local $a0 i32) (local $a1 i32) (local $a2 i32)"));
+    TEST_ASSERT_NOT_NULL(strstr(routine, "call $import_1")); // setText inside the callback
+    free(buffer);
+
+    // --- assert the auto-generated glue wires the listener to teko_invoke ---
+    FILE* gf = fopen(glue_path, "r");
+    TEST_ASSERT_NOT_NULL(gf);
+    char* glue = (char*)malloc(8192);
+    TEST_ASSERT_NOT_NULL(glue);
+    memset(glue, 0, 8192);
+    size_t gbytes = fread(glue, 1, 8191, gf);
+    glue[gbytes] = '\0';
+    fclose(gf);
+
+    TEST_ASSERT_NOT_NULL(strstr(glue, "getInstance().exports.teko_invoke"));
+    TEST_ASSERT_NOT_NULL(strstr(glue, "addEventListener(str(p, n), () => invoke(fn, h))"));
     free(glue);
 
     remove(asm_path);

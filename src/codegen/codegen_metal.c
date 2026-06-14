@@ -218,6 +218,16 @@ static void process_linear_il_bytes(MetalContext* ctx, const unsigned char* byte
                      op == OP_SETARG) {
                 last_arith_op = (OpCode)0;
             }
+
+            // Any op that overwrites the accumulator with a *non-constant* value
+            // invalidates the ICONST CSE cache — otherwise a later `ICONST k` that
+            // matches a stale accum_last_value gets wrongly skipped while $w0 in
+            // fact holds a string ptr / load / call result. (SETARG/STORE only read
+            // $w0 or write $w1, so they leave the cache intact.)
+            if (op == OP_SCONST || op == OP_LOAD || op == OP_CHAN_GET ||
+                op == OP_CALL_IMPORT) {
+                accum_has_value = false;
+            }
         }
 
         if (!dead_code_zone) {

@@ -5,11 +5,11 @@
 // appends it to #out entirely through the dom.* host imports.
 import { makeTekoDomImports } from "../samples/emitted_dom.glue.mjs";
 
-let memory;
-const imports = makeTekoDomImports(() => memory);
+let memory, instance;
+const imports = makeTekoDomImports(() => memory, () => instance);
 try {
   const bytes = await (await fetch("../samples/emitted_dom.wasm")).arrayBuffer();
-  const { instance } = await WebAssembly.instantiate(bytes, imports);
+  ({ instance } = await WebAssembly.instantiate(bytes, imports));
   memory = instance.exports.memory;
   instance.exports.main();
   const span = document.querySelector("#out > span");
