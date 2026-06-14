@@ -46,14 +46,50 @@ teko_free(big); // double free
 const after = teko_alloc(40000);
 check(inRange(after, 40000), "heap usable after a double free (no corruption/trap)");
 
-// 6. reset bulk-reclaims the whole region.
+// 6. invalid / wild / null frees are safe no-ops (no trap, heap still usable).
+teko_free(0);                  // null
+teko_free(after + 3);          // interior / misaligned pointer
+teko_free(HEAP_BASE - 100);    // below the heap
+teko_free(HEAP_END + 100);     // above the heap
+teko_free(0x7fffffff);         // wild
+teko_free(after);              // (real) free so the next reset starts clean
+const stillOk = teko_alloc(40000);
+check(inRange(stillOk, 40000), "invalid/null/wild frees are safe no-ops");
+teko_free(stillOk);
+
+// 7. reset bulk-reclaims the whole region.
 teko_reset();
 const full = teko_alloc(49000);
 check(inRange(full, 49000), "teko_reset reclaims the whole heap");
+teko_free(full);
 
-// 7. OOM returns 0, not a trap or out-of-range pointer.
+// 8. OOM returns 0, not a trap or out-of-range pointer.
 const oom = teko_alloc(1 << 20);
 check(oom === 0, "over-capacity alloc returns 0 (OOM), no trap");
+
+// 9. 10k-cycle alloc->free->alloc loop: memory is REUSED, the heap does not grow
+//    unboundedly, no leak/overflow/double-free. Track the high-water pointer.
+teko_reset();
+let hiWater = 0;
+let prev = 0;
+for (let i = 0; i < 10000; i++) {
+  const sz = 8 + ((i * 37) % 512);          // varied small sizes
+  const p = teko_alloc(sz);
+  if (!inRange(p, sz)) { check(false, `cycle ${i}: alloc out of range`); break; }
+  fill(p, sz, i & 0xff);                      // touch it
+  if (!allSame(p, sz, i & 0xff)) { check(false, `cycle ${i}: write corrupted`); break; }
+  hiWater = Math.max(hiWater, p + sz);
+  teko_free(p);                               // free immediately => next iter must reuse
+  prev = p;
+}
+// With free+coalesce, a free-then-alloc of similar size must reuse low addresses,
+// so the high-water mark stays near the heap base, NOT climbing to HEAP_END.
+check(hiWater < HEAP_BASE + 2048,
+  `10k alloc/free reuse memory (high-water ${hiWater - HEAP_BASE}B from base, not growing)`);
+// And after the loop the whole heap is still allocatable in one block.
+teko_reset();
+const whole = teko_alloc(49000);
+check(inRange(whole, 49000), "heap fully intact after 10k alloc/free cycles");
 
 if (failures === 0) {
   console.log("OK   allocator: range/overlap/reuse/coalesce/double-free/reset/OOM all pass");

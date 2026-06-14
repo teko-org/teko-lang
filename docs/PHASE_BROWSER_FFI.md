@@ -98,13 +98,22 @@ accordingly; Self-Containment is now Phase 20.
     handler sets the text; `run-events.mjs` (Playwright) clicks `#count` and asserts
     `"0" → "clicked!"`. Golden `test_teko_aot_wasm_event_callback_lowering`.
 - **MVP-4 — real allocator + ergonomic facades. ✅ delivered (closes Phase 11).**
-  - **Real allocator** (`emit_wasm_heap_runtime`): an implicit free-list over the heap
-    region `[16384..65536)` — 8-byte block headers `{size, free}`, `teko_alloc` first-fit
-    + split, `teko_free` mark + **forward-coalescing** sweep, `teko_reset` bulk reclaim.
-    Exported `teko_alloc`/`teko_free`/`teko_reset`; lazily initialized; OOM→0; one page.
-    *Strategy chosen: free-list first-fit + coalescing (real per-object free) plus a
-    `teko_reset` region path. Size-class segregation is a possible future optimization;
-    a growable/unified arena+heap and a `(memory)` grow path are deferred.*
+  - **Real allocator** (`emit_wasm_heap_runtime`): an implicit free-list over a heap
+    region `[16384..65536)` **dedicated and separate from the cooperative bump arena**
+    (the two regions never mix) — 8-byte-aligned blocks with an 8-byte header
+    `{size, free}`, `teko_alloc` first-fit + split, `teko_free` **validates** the pointer
+    (real, currently-used block start) then marks + **forward-coalesces** adjacent free
+    blocks, `teko_reset` bulk reclaim. Exported `teko_alloc`/`teko_free`/`teko_reset`;
+    lazily initialized; OOM→0; one page.
+    *Strategy (per the directive — simplicity + correctness over performance): free-list
+    first-fit with block headers + coalescing of adjacent free blocks, 8-byte aligned, in
+    a dedicated heap. Size-class segregation is a possible future optimization; a
+    growable/unified arena+heap and a `(memory)` grow path are deferred.*
+    *Non-negotiable criteria met: real reuse of freed memory; `teko_free` of
+    null/out-of-range/interior/double-freed pointers is a safe no-op; a dedicated 10k-cycle
+    alloc→free→alloc stress proves memory is reused (the high-water mark stays near the
+    heap base, not growing) with no leak/overflow/double-free; ASan/UBSan clean on both
+    dispatch paths + TSan; deterministic and testable from Node/browser + a C golden.*
   - **JS→Teko strings:** glue/facade `TextEncoder` → `teko_alloc` → copy → `(ptr,len)`.
     `teko_invoke2(fn, a0, a1)` delivers both to the callee (`$w0`,`$w1`).
   - **Ergonomic facade** (`teko_metal_emit_facade` → `<mod>.mjs`): `async instantiate(bytes)`

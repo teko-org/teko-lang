@@ -31,7 +31,9 @@ runners execute and assert. (Locally, `npm i wabt` gives a JS `wat2wasm` to vali
   callback that sets the text (`"0" → "clicked!"`). The glue is now
   `makeTekoDomImports(getMemory, getInstance)` — the 2nd thunk exposes `teko_invoke`.
 - `run-alloc.mjs` — MVP-4 allocator stress on `emitted.wasm`'s exported
-  `teko_alloc`/`teko_free`/`teko_reset` (range/overlap/reuse/coalesce/double-free/reset/OOM).
+  `teko_alloc`/`teko_free`/`teko_reset` (range/overlap/reuse/coalesce/double-free/reset/OOM
+  + a 10k-cycle alloc→free→alloc loop asserting bounded reuse, and null/wild/interior frees
+  as safe no-ops). `teko_free` validates the pointer before freeing.
 - `run-facade.mjs` + `browser/facade.html` + `browser/facade-run.mjs` — MVP-4 facade +
   JS→Teko string: the auto-generated `emitted_alloc.mjs` exposes `mod.showMessage(str)`,
   which `teko_alloc`s the JS string, copies bytes, and dispatches the Teko routine → `#out`.

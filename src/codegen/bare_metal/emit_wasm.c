@@ -236,8 +236,10 @@ static void emit_wasm_scheduler_runtime(FILE* f) {
 // non-freeing cooperative bump arena. An implicit free-list over the heap region
 // [HEAP_BASE..HEAP_END): each block is an 8-byte header { [0]=payload size,
 // [4]=free flag } followed by its payload. teko_alloc is first-fit with splitting;
-// teko_free marks the block and runs a forward-coalescing pass (merging adjacent
-// free blocks) so repeated alloc/free does not fragment the heap into dust.
+// teko_free validates the pointer (real, currently-used block start) then marks it
+// and runs a forward-coalescing pass (merging adjacent free blocks) so repeated
+// alloc/free does not fragment the heap into dust. null / wild / interior / double
+// frees are safe no-ops.
 // teko_reset bulk-reclaims the whole region. Lazily initialized as one big free
 // block on first use. Exported for the host (JS materializes data here) and usable
 // from Teko. Bounds: stays within the single (memory 1) page; OOM returns 0.
@@ -274,11 +276,31 @@ static void emit_wasm_heap_runtime(FILE* f) {
     fprintf(f, "      (br $L)))\n");
     fprintf(f, "    (i32.const 0))\n"); // OOM
 
-    // teko_free(ptr): mark free, then a single forward-coalescing sweep from base.
+    // teko_free(ptr): VALIDATE then free. The block header is at ptr-8; we walk the
+    // block list and only free if ptr-8 is a real, currently-used block start. So
+    // null, out-of-range/wild pointers, interior/misaligned pointers, and double
+    // frees are all safe no-ops (no corruption). On a valid free we mark the block
+    // and run a single forward-coalescing sweep merging adjacent free blocks.
     fprintf(f, "  (func $teko_free (export \"teko_free\") (param $ptr i32)\n");
-    fprintf(f, "    (local $cur i32) (local $sz i32) (local $nxt i32)\n");
+    fprintf(f, "    (local $tgt i32) (local $cur i32) (local $sz i32) (local $nxt i32) (local $ok i32)\n");
     fprintf(f, "    (if (i32.eqz (local.get $ptr)) (then (return)))\n");
-    fprintf(f, "    (i32.store offset=4 (i32.sub (local.get $ptr) (i32.const 8)) (i32.const 1))\n");
+    fprintf(f, "    (local.set $tgt (i32.sub (local.get $ptr) (i32.const 8)))\n");
+    fprintf(f, "    (if (i32.or (i32.lt_u (local.get $tgt) (i32.const %d))\n", TEKO_WASM_HEAP_BASE);
+    fprintf(f, "                (i32.ge_u (local.get $tgt) (i32.const %d))) (then (return)))\n", TEKO_WASM_HEAP_END);
+    // Validate $tgt is a real block boundary that is currently used.
+    fprintf(f, "    (local.set $cur (i32.const %d))\n", TEKO_WASM_HEAP_BASE);
+    fprintf(f, "    (block $v (loop $V\n");
+    fprintf(f, "      (br_if $v (i32.ge_u (local.get $cur) (i32.const %d)))\n", TEKO_WASM_HEAP_END);
+    fprintf(f, "      (br_if $v (i32.gt_u (local.get $cur) (local.get $tgt)))\n");   // stepped past → invalid
+    fprintf(f, "      (if (i32.eq (local.get $cur) (local.get $tgt)) (then\n");
+    fprintf(f, "        (if (i32.eqz (i32.load offset=4 (local.get $cur))) (then\n"); // used → free it
+    fprintf(f, "          (i32.store offset=4 (local.get $cur) (i32.const 1))\n");
+    fprintf(f, "          (local.set $ok (i32.const 1))))\n");
+    fprintf(f, "        (br $v)))\n");
+    fprintf(f, "      (local.set $cur (i32.add (i32.add (local.get $cur) (i32.const 8)) (i32.load offset=0 (local.get $cur))))\n");
+    fprintf(f, "      (br $V)))\n");
+    fprintf(f, "    (if (i32.eqz (local.get $ok)) (then (return)))\n");             // invalid / double-free → no-op
+    // Forward-coalescing sweep.
     fprintf(f, "    (local.set $cur (i32.const %d))\n", TEKO_WASM_HEAP_BASE);
     fprintf(f, "    (block $done (loop $L\n");
     fprintf(f, "      (br_if $done (i32.ge_u (local.get $cur) (i32.const %d)))\n", TEKO_WASM_HEAP_END);
