@@ -18,17 +18,21 @@
 
   ;; Main thread: init the atomic cell, spawn the worker, block until ready, read.
   (func $main (export "main") (result i32)
-    (local $cp i32)
+    (local $cp i32) (local $spins i32)
     (local.set $cp (i32.const 2048))
     (i32.atomic.store offset=0 (local.get $cp) (i32.const 0))   ;; ready = 0
     (call $teko_spawn (i32.const 0) (local.get $cp))            ;; host starts a real Worker
     ;; Notify-free atomic busy-poll: a cross-instance memory.atomic.notify was
     ;; observed never to reach the waiter on some runtimes, so we do not rely on
     ;; it. Cross-thread visibility of the shared memory is guaranteed, so the
-    ;; atomic load is certain to observe the producer's flag store.
+    ;; atomic load is certain to observe the producer's flag store. Bounded by
+    ;; ~2e9 spins -> unreachable, so a stuck producer traps instead of spinning
+    ;; forever.
     (block $ready
       (loop $spin
         (br_if $ready (i32.eq (i32.atomic.load offset=0 (local.get $cp)) (i32.const 1)))
+        (local.set $spins (i32.add (local.get $spins) (i32.const 1)))
+        (if (i32.gt_u (local.get $spins) (i32.const 2000000000)) (then unreachable))
         (br $spin)))
     (i32.atomic.load offset=4 (local.get $cp)))
 

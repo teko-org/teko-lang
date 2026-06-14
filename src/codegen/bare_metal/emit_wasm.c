@@ -98,7 +98,7 @@ static void emit_wasm_threads(MetalContext* ctx, OpCode op, int32_t arg) {
             fprintf(f, "  (global $arena_sp (mut i32) (i32.const 2048))\n");
             fprintf(f, "  (type $task (func (param i32)))\n");
             fprintf(f, "  (func $main (result i32)\n");
-            fprintf(f, "    (local $w0 i32) (local $w1 i32) (local $cp i32)\n");
+            fprintf(f, "    (local $w0 i32) (local $w1 i32) (local $cp i32) (local $spins i32)\n");
             ctx->wasm_open = 1;
             break;
 
@@ -162,9 +162,17 @@ static void emit_wasm_threads(MetalContext* ctx, OpCode op, int32_t arg) {
             // memory model, so the atomic load is certain to observe the store —
             // no notify required. (A production scheduler would back off; this is
             // the correctness-first form for the cooperative-over-threads MVP.)
-            fprintf(f, "    ;; [WASM-threads Channel Get]: notify-free atomic busy-poll on the flag\n");
+            // Bounded: spin at most ~2e9 iterations (~1-2s of CPU) so a producer
+            // that never publishes traps with `unreachable` instead of spinning
+            // forever / pegging a core indefinitely. The harness watchdog and the
+            // job timeout-minutes are outer backstops; this makes the module itself
+            // terminate with a clear hard error.
+            fprintf(f, "    ;; [WASM-threads Channel Get]: notify-free atomic busy-poll (bounded) on the flag\n");
+            fprintf(f, "    i32.const 0\n    local.set $spins\n");
             fprintf(f, "    (block $ready\n      (loop $spin\n");
             fprintf(f, "        (br_if $ready (i32.eq (i32.atomic.load offset=0 (local.get $cp)) (i32.const 1)))\n");
+            fprintf(f, "        (local.set $spins (i32.add (local.get $spins) (i32.const 1)))\n");
+            fprintf(f, "        (if (i32.gt_u (local.get $spins) (i32.const 2000000000)) (then unreachable))\n");
             fprintf(f, "        (br $spin)))\n");
             fprintf(f, "    local.get $cp\n    i32.atomic.load offset=4\n    local.set $w0\n");
             break;
@@ -186,7 +194,7 @@ static void emit_wasm_threads(MetalContext* ctx, OpCode op, int32_t arg) {
                 fprintf(f, "  )\n");
             }
             fprintf(f, "  (func $routine_%d (param $arg i32)\n", arg);
-            fprintf(f, "    (local $w0 i32) (local $w1 i32) (local $cp i32)\n");
+            fprintf(f, "    (local $w0 i32) (local $w1 i32) (local $cp i32) (local $spins i32)\n");
             fprintf(f, "    local.get $arg\n    local.set $cp\n");
             ctx->wasm_open = 2;
             if (ctx->wasm_routine_count < 64) ctx->wasm_routine_ids[ctx->wasm_routine_count] = arg;
