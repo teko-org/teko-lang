@@ -59,12 +59,21 @@ const fixtures = [
   { file: "../samples/emitted_threads.wasm", expected: 99, name: "emitted wasm-threads (10.4)", optional: true },
 ];
 
+// STRESS: repeat the real cross-thread hand-off many times per run so scheduling
+// flakiness a single iteration would hide gets surfaced. Any wrong value or
+// timeout in any iteration fails the job.
+const REPS = Number(process.env.TEKO_THREADS_REPS ?? 100);
+
 let failures = 0;
 for (const { file, expected, name, optional } of fixtures) {
   try {
-    const got = await runModule(file);
-    if (got === expected) console.log(`OK   ${name}: main() = ${got} (real worker_threads hand-off)`);
-    else { console.error(`FAIL ${name}: main() = ${got}, expected ${expected}`); failures++; }
+    let ok = 0;
+    for (let i = 0; i < REPS; i++) {
+      const got = await runModule(file);
+      if (got !== expected) { console.error(`FAIL ${name} iter ${i + 1}/${REPS}: main() = ${got}, expected ${expected}`); failures++; break; }
+      ok++;
+    }
+    if (ok === REPS) console.log(`OK   ${name}: ${REPS}/${REPS} real worker_threads hand-offs all = ${expected}`);
   } catch (e) {
     if (optional && /no such file|ENOENT/.test(String(e))) { console.log(`SKIP ${name}: not built`); continue; }
     console.error(`FAIL ${name}: ${e}`); failures++;

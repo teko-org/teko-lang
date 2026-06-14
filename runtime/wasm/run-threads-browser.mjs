@@ -15,7 +15,8 @@ try {
   browser = await chromium.launch();
   const page = await browser.newPage();
   await page.goto(`http://localhost:${PORT}/browser/threads.html`, { waitUntil: "load", timeout: 30000 });
-  await page.waitForFunction(() => window.__tekoThreads !== undefined, { timeout: 30000 });
+  // Stress loops run many real Web Worker hand-offs in-page; allow ample time.
+  await page.waitForFunction(() => window.__tekoThreads !== undefined, { timeout: 120000 });
   const results = await page.evaluate(() => window.__tekoThreads);
   const isolated = await page.evaluate(() => window.__crossOriginIsolated);
   for (const [name, expected] of Object.entries(EXPECTED)) {

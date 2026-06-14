@@ -12,14 +12,23 @@ const fixtures = [
   // Real compiler output (Phase 10.3): mid-function suspension -> main() == 30.
   { file: "../samples/emitted_suspend.wasm", expected: 30, name: "emittedSuspend", entry: "main" },
 ];
+// Determinism stress: re-instantiate + re-run each module many times; report the
+// value only if every run matched.
+const REPS = Number(new URLSearchParams(location.search).get("reps") ?? 100);
 const results = {};
 let lines = [];
 for (const { file, expected, name, entry } of fixtures) {
   try {
-    const res = await WebAssembly.instantiateStreaming(fetch(file), {});
-    const got = res.instance.exports[entry]();
-    results[name] = got;
-    lines.push(`${name}: ${entry}() = ${got} (expected ${expected})`);
+    const bytes = await (await fetch(file)).arrayBuffer();
+    let last = null;
+    let allOk = true;
+    for (let i = 0; i < REPS; i++) {
+      const res = await WebAssembly.instantiate(bytes.slice(0), {});
+      last = res.instance.exports[entry]();
+      if (last !== expected) { allOk = false; lines.push(`${name}: iter ${i + 1}/${REPS} = ${last} (expected ${expected})`); break; }
+    }
+    results[name] = allOk ? last : `mismatch(${last})`;
+    if (allOk) lines.push(`${name}: ${REPS}/${REPS} runs = ${last}`);
   } catch (e) {
     results[name] = `error: ${e}`;
     lines.push(`${name}: error: ${e}`);

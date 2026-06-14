@@ -16,6 +16,11 @@ const fixtures = [
   { file: "./samples/emitted_suspend.wasm", expected: 30, name: "emitted mid-function suspension (10.3)", entry: "main", optional: true },
 ];
 
+// Determinism stress: re-instantiate and re-run each module many times; every run
+// must produce the identical result (the cooperative scheduler is single-threaded
+// and load-based, so any variation would be a real bug, not a race).
+const REPS = Number(process.env.TEKO_WASM_REPS ?? 500);
+
 let failures = 0;
 for (const { file, expected, name, entry, optional } of fixtures) {
   try {
@@ -26,14 +31,14 @@ for (const { file, expected, name, entry, optional } of fixtures) {
       if (optional) { console.log(`SKIP ${name}: ${file} not built`); continue; }
       throw e;
     }
-    const { instance } = await WebAssembly.instantiate(bytes, {});
-    const got = instance.exports[entry]();
-    if (got !== expected) {
-      console.error(`FAIL ${name}: ${entry}() = ${got}, expected ${expected}`);
-      failures++;
-    } else {
-      console.log(`OK   ${name}: ${entry}() = ${got}`);
+    let ok = 0;
+    for (let i = 0; i < REPS; i++) {
+      const { instance } = await WebAssembly.instantiate(bytes, {});
+      const got = instance.exports[entry]();
+      if (got !== expected) { console.error(`FAIL ${name} iter ${i + 1}/${REPS}: ${entry}() = ${got}, expected ${expected}`); failures++; break; }
+      ok++;
     }
+    if (ok === REPS) console.log(`OK   ${name}: ${REPS}/${REPS} runs all = ${expected}`);
   } catch (e) {
     console.error(`FAIL ${name}: ${e}`);
     failures++;

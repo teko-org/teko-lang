@@ -30,14 +30,22 @@ function runModule(bytes) {
   });
 }
 
+// STRESS: repeat the real Web Worker hand-off many times; report the value only
+// if EVERY iteration matched, else an error string (so the Playwright harness fails).
+const REPS = Number(new URLSearchParams(location.search).get("reps") ?? 30);
 const results = {};
 const lines = [];
 for (const { file, expected, name } of fixtures) {
   try {
     const bytes = await (await fetch(file)).arrayBuffer();
-    const got = await runModule(bytes);
-    results[name] = got;
-    lines.push(`${name}: main() = ${got} (expected ${expected})`);
+    let last = null;
+    let allOk = true;
+    for (let i = 0; i < REPS; i++) {
+      last = await runModule(bytes.slice(0));
+      if (last !== expected) { allOk = false; lines.push(`${name}: iter ${i + 1}/${REPS} = ${last} (expected ${expected})`); break; }
+    }
+    results[name] = allOk ? last : `mismatch(${last})`;
+    if (allOk) lines.push(`${name}: ${REPS}/${REPS} hand-offs = ${last}`);
   } catch (e) {
     results[name] = `error: ${e}`;
     lines.push(`${name}: error: ${e}`);

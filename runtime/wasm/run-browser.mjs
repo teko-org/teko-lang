@@ -15,7 +15,7 @@ try {
   browser = await chromium.launch();
   const page = await browser.newPage();
   await page.goto(`http://localhost:${PORT}/browser/index.html`, { waitUntil: "load", timeout: 30000 });
-  await page.waitForFunction(() => window.__tekoResults !== undefined, { timeout: 20000 });
+  await page.waitForFunction(() => window.__tekoResults !== undefined, { timeout: 40000 });
   const results = await page.evaluate(() => window.__tekoResults);
   const isolated = await page.evaluate(() => window.__crossOriginIsolated);
   for (const [name, expected] of Object.entries(EXPECTED)) {
