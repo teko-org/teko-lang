@@ -49,6 +49,16 @@ static char* parse_complex_type(Parser* parser) {
 
 // Parses a single FFI function signature
 static void parse_single_function_signature(Parser* parser, FFIFunctionNode* fn) {
+    // Defensive zero-init: not every field is set on every syntactic path (e.g. a
+    // function with no parameter list never touches params/param_count). Leaving
+    // them as malloc garbage makes free_ffi_ast_node wild-free them — an
+    // intermittent crash (heap-value dependent; ~50% on Windows, deterministic
+    // under ThreadSanitizer). Initialise every pointer/count up front.
+    fn->fn_name = NULL;
+    fn->return_type = NULL;
+    fn->alias = NULL;
+    fn->params = NULL;
+    fn->param_count = 0;
     ffi_advance(parser); // Consume 'fn'
 
     if (parser->current_token.type == TOKEN_IDENTIFIER) {
@@ -71,6 +81,7 @@ static void parse_single_function_signature(Parser* parser, FFIFunctionNode* fn)
                 }
 
                 fn->params[fn->param_count].param_name = strdup(parser->current_token.lexeme);
+                fn->params[fn->param_count].param_type = NULL; // set below only if ': type' present
                 ffi_advance(parser); // Consume the parameter name
 
                 if (parser->current_token.type == TOKEN_COLON) {
@@ -102,7 +113,7 @@ static void parse_single_function_signature(Parser* parser, FFIFunctionNode* fn)
 FFIASTNode* parse_extern_declaration(Parser* parser) {
     ffi_advance(parser); // Consume 'extern'
 
-    FFIASTNode* node = (FFIASTNode*)malloc(sizeof(FFIASTNode));
+    FFIASTNode* node = (FFIASTNode*)calloc(1, sizeof(FFIASTNode));
     node->from_lib = NULL;
 
     // NEW CASE: extern """ native C code """ as { ... }
@@ -134,7 +145,7 @@ FFIASTNode* parse_extern_declaration(Parser* parser) {
                             node->data.ffi_inline_c.declarations, sizeof(FFIASTNode*) * cap);
                     }
 
-                    FFIASTNode* inner_fn = (FFIASTNode*)malloc(sizeof(FFIASTNode));
+                    FFIASTNode* inner_fn = (FFIASTNode*)calloc(1, sizeof(FFIASTNode));
                     inner_fn->type = NODE_FFI_FUNCTION;
                     inner_fn->from_lib = NULL;
 
@@ -178,6 +189,7 @@ FFIASTNode* parse_extern_declaration(Parser* parser) {
                         node->data.ffi_struct.fields = (FFIStructField*)realloc(node->data.ffi_struct.fields, sizeof(FFIStructField) * cap);
                     }
                     node->data.ffi_struct.fields[node->data.ffi_struct.field_count].field_name = strdup(parser->current_token.lexeme);
+                    node->data.ffi_struct.fields[node->data.ffi_struct.field_count].field_type = NULL; // set below only if ': type'
                     ffi_advance(parser);
                     if (parser->current_token.type == TOKEN_COLON) {
                         ffi_advance(parser);
@@ -204,7 +216,7 @@ FFIASTNode* parse_extern_declaration(Parser* parser) {
                     cap *= 2;
                     node->data.ffi_block.functions = (FFIASTNode**)realloc(node->data.ffi_block.functions, sizeof(FFIASTNode*) * cap);
                 }
-                FFIASTNode* inner_fn = (FFIASTNode*)malloc(sizeof(FFIASTNode));
+                FFIASTNode* inner_fn = (FFIASTNode*)calloc(1, sizeof(FFIASTNode));
                 inner_fn->type = NODE_FFI_FUNCTION;
                 inner_fn->from_lib = NULL;
                 parse_single_function_signature(parser, &inner_fn->data.ffi_function);
