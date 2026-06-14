@@ -63,80 +63,53 @@ jobs:
         run: ${{ matrix.test_bin }}
 
   # ---------------------------------------------------------------------------
-  # DIAGNOSTIC #1 (temporary, non-blocking): /RTC1 runtime checks. The intermittent
-  # Windows x86_64 crash does not reproduce off-Windows under ASan/UBSan/heap+stack
-  # poisoning, so the prime suspect is an uninitialized-local read (ASan misses
-  # those; a value benign-zero on macOS is garbage on Windows). /RTC1 catches it
-  # DETERMINISTICALLY (it tracks initialization, not the value) and needs NO runtime
-  # DLL. Run the suite 20x; a failure stamps "Run-Time Check Failure #3 - The
-  # variable 'x' is being used without being initialized" with file:line.
-  # This is a SEPARATE job so a broken ASan setup can never block this signal.
+  # Regression guard for the FFI wild-free bug (the intermittent Windows crash):
+  # it was an uninitialized-pointer free, invisible to ASan/UBSan/heap+stack
+  # poisoning but a DETERMINISTIC SEGV under ThreadSanitizer. Run the suite under
+  # TSan so this class of bug (and real data races) fails CI deterministically.
   # ---------------------------------------------------------------------------
-  windows-rtc:
-    name: Windows x86_64 /RTC1 uninitialized-read hunt (non-blocking diagnostic)
-    runs-on: windows-latest
-    continue-on-error: true
-    timeout-minutes: 25
+  tsan:
+    name: ThreadSanitizer (Linux Clang) — uninit/race regression guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Checkout Repository Code
         uses: actions/checkout@v4
-      - name: Configure + build Debug (/RTC1 is on by default for MSVC Debug)
-        shell: pwsh
+      - name: Install build deps
         run: |
-          cmake -S . -B build-rtc -DCMAKE_BUILD_TYPE=Debug
-          cmake --build build-rtc --config Debug --parallel 4
-      - name: Run suite 20x under /RTC1
-        shell: pwsh
+          sudo rm -f /etc/apt/sources.list.d/microsoft*.list /etc/apt/sources.list.d/azure*.list /etc/apt/sources.list.d/azure-cli*.list 2>/dev/null || true
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build clang
+      - name: Configure + build with ThreadSanitizer
         run: |
-          $bad = 0
-          for ($i = 1; $i -le 20; $i++) {
-            Write-Host "===== RTC run $i / 20 ====="
-            & .\build-rtc\Debug\teko_tests.exe
-            if ($LASTEXITCODE -ne 0) { Write-Host "!!! RTC run $i exited $LASTEXITCODE"; $bad++ }
-          }
-          Write-Host "RTC1: $bad / 20 runs crashed/failed"
-          if ($bad -gt 0) { exit 1 }
+          cmake -S . -B build-tsan -G "Ninja" -DCMAKE_C_COMPILER=clang -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_FLAGS="-fsanitize=thread -fno-omit-frame-pointer -g -O1"
+          cmake --build build-tsan --target teko_tests --parallel 4
+      - name: Run suite under TSan
+        run: TSAN_OPTIONS=halt_on_error=1 ./build-tsan/teko_tests
 
   # ---------------------------------------------------------------------------
-  # DIAGNOSTIC #2 (temporary, non-blocking): MSVC AddressSanitizer (heap overflow /
-  # use-after-free). The first attempt failed to LOAD (0xC0000139 ENTRYPOINT_NOT_
-  # FOUND) because the wrong clang_rt.asan_dynamic-x86_64.dll resolved. Here we add
-  # the EXACT toolset bin (the one cl.exe used) to PATH via vswhere so the matching
-  # ASan runtime DLL loads. Separate job so its setup can't block windows-rtc.
+  # Direct proof the intermittent Windows x86_64 crash is gone: run the bare
+  # Release suite many times (the bug hit ~50% of single runs). Gating.
   # ---------------------------------------------------------------------------
-  windows-asan:
-    name: Windows x86_64 ASan heap hunt (non-blocking diagnostic)
+  windows-stress:
+    name: Windows x86_64 stress — bare Release suite 20x
     runs-on: windows-latest
-    continue-on-error: true
     timeout-minutes: 25
     steps:
       - name: Checkout Repository Code
         uses: actions/checkout@v4
-      - name: Configure + build with MSVC AddressSanitizer
+      - name: Configure + build (Release)
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release; cmake --build build --config Release --parallel 4
+      - name: Run the suite 20x (must be green every time)
         shell: pwsh
         run: |
-          cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_FLAGS="/fsanitize=address /Zi"
-          cmake --build build-asan --config Release --parallel 4
-      - name: Put the matching ASan runtime DLL on PATH (vswhere -> default toolset)
-        shell: pwsh
-        run: |
-          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
-          $ver = (Get-Content "$vs\VC\Auxiliary\Build\Microsoft.VCToolsVersion.default.txt").Trim()
-          $bin = "$vs\VC\Tools\MSVC\$ver\bin\Hostx64\x64"
-          Write-Host "toolset bin: $bin"
-          if (Test-Path "$bin\clang_rt.asan_dynamic-x86_64.dll") { Write-Host "ASan DLL present" } else { Write-Host "WARN: ASan DLL NOT in $bin" }
-          Add-Content $env:GITHUB_PATH $bin
-      - name: Run suite 20x under ASan
-        shell: pwsh
-        run: |
-          $bad = 0
           for ($i = 1; $i -le 20; $i++) {
-            Write-Host "===== ASan run $i / 20 ====="
-            & .\build-asan\Release\teko_tests.exe
-            if ($LASTEXITCODE -ne 0) { Write-Host "!!! ASan run $i exited $LASTEXITCODE"; $bad++ }
+            Write-Host "===== run $i / 20 ====="
+            & .\build\Release\teko_tests.exe
+            if ($LASTEXITCODE -ne 0) { Write-Host "!!! run $i FAILED exit $LASTEXITCODE"; exit 1 }
           }
-          Write-Host "ASan: $bad / 20 runs crashed/failed"
-          if ($bad -gt 0) { exit 1 }
+          Write-Host "20/20 clean"
 
   # ---------------------------------------------------------------------------
   # riscv64 has NO native GitHub-hosted runner. We cross-compile a static
