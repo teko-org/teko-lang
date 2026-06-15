@@ -161,6 +161,9 @@ extern void test_teko_uuid_parse_format(void);
 extern void test_teko_uuid_v4_structure(void);
 extern void test_teko_uuid_v7_structure(void);
 extern void test_teko_uuid_v8_structure(void);
+extern void test_teko_bn_modexp_rsa3233(void);
+extern void test_teko_bn_modexp_fermat_p256(void);
+extern void test_teko_bn_modexp_identity(void);
 
 int main(void) {
     // Unbuffered output: stream every line live so a crash on a CI runner shows
@@ -332,6 +335,9 @@ int main(void) {
     RUN_TEST(test_teko_uuid_v4_structure);
     RUN_TEST(test_teko_uuid_v7_structure);
     RUN_TEST(test_teko_uuid_v8_structure);
+    RUN_TEST(test_teko_bn_modexp_rsa3233);
+    RUN_TEST(test_teko_bn_modexp_fermat_p256);
+    RUN_TEST(test_teko_bn_modexp_identity);
 
     return UNITY_END();
 }
