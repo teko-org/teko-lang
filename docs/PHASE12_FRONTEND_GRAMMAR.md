@@ -80,9 +80,15 @@ foundational pieces unblock a *real* expression frontend and belong early in Pha
      `MetalContext`). `let`/`mut NAME [: type] = <init>` → `STORE_LOCAL`; a reference →
      `LOAD_LOCAL`. Initializers: int/string literals, a `@dom` call result, or another
      local (full expressions arrive in P12-E). Locals are `$main`-scoped (handlers excluded).
-   - **P12-E — general expressions** (next): Pratt parser over the operator tokens →
-     IL; integer arithmetic + comparisons first (float / `&&`/`||` short-circuit deferred).
-   - **P12-F — multiple nested handle args**: spill intermediates to named locals.
+   - **P12-E — general expressions. ✅ done.** Precedence-climbing (Pratt) parser for
+     integer arithmetic + comparisons (`+ - * / % == != < <= > >=`, left-assoc, parens),
+     in `let` initializers. New opcodes `OP_MOD`/`OP_EQ`/`OP_NE`/`OP_LT`/`OP_LE`/`OP_GT`/
+     `OP_GE` ($w0 = $w0 ⊕ $w1; MOD guards ÷0). Each binary node spills its left operand to
+     a fresh temp local (above the named locals), so arbitrary nesting works in the
+     accumulator model. *Scope: integer only; float and `&&`/`||` short-circuit deferred.
+     Expressions are wired in `let` initializers; call-argument expressions are a small
+     follow-up (args today take literals/locals).*
+   - **P12-F — multiple nested handle args** (next): spill intermediates to named locals.
 5. **Base encoding (functional)** — real `base64`/`hex` encode+decode (runtime/intrinsic +
    grammar + executable round-trip test against known vectors). The first clean functional
    win; deterministic, no external deps.

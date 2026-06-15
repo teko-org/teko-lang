@@ -214,7 +214,9 @@ static void process_linear_il_bytes(MetalContext* ctx, const unsigned char* byte
                     last_arith_op = (OpCode)0;
                 }
             }
-            else if (op == OP_ADD || op == OP_SUB || op == OP_MUL || op == OP_DIV) {
+            else if (op == OP_ADD || op == OP_SUB || op == OP_MUL || op == OP_DIV ||
+                     op == OP_MOD || op == OP_EQ || op == OP_NE ||
+                     op == OP_LT || op == OP_LE || op == OP_GT || op == OP_GE) {
                 if (last_arith_op == op) {
                     skip_by_cse = true;
                 } else {

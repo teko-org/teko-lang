@@ -589,6 +589,32 @@ void emit_wasm_pure(MetalContext* ctx, OpCode op, int32_t arg) {
             fprintf(f, "    local.set $w0\n");
             break;
 
+        // Phase 12 (P12-E): integer modulo + comparisons ($w0 = $w0 <op> $w1).
+        case OP_MOD: // guard divide-by-zero (→ 0), like OP_DIV
+            fprintf(f, "    local.get $w1\n    i32.eqz\n    if (result i32)\n");
+            fprintf(f, "      i32.const 0\n    else\n");
+            fprintf(f, "      local.get $w0\n      local.get $w1\n      i32.rem_s\n    end\n");
+            fprintf(f, "    local.set $w0\n");
+            break;
+        case OP_EQ:
+            fprintf(f, "    local.get $w0\n    local.get $w1\n    i32.eq\n    local.set $w0\n");
+            break;
+        case OP_NE:
+            fprintf(f, "    local.get $w0\n    local.get $w1\n    i32.ne\n    local.set $w0\n");
+            break;
+        case OP_LT:
+            fprintf(f, "    local.get $w0\n    local.get $w1\n    i32.lt_s\n    local.set $w0\n");
+            break;
+        case OP_LE:
+            fprintf(f, "    local.get $w0\n    local.get $w1\n    i32.le_s\n    local.set $w0\n");
+            break;
+        case OP_GT:
+            fprintf(f, "    local.get $w0\n    local.get $w1\n    i32.gt_s\n    local.set $w0\n");
+            break;
+        case OP_GE:
+            fprintf(f, "    local.get $w0\n    local.get $w1\n    i32.ge_s\n    local.set $w0\n");
+            break;
+
         // ====================================================================
         // 4. NATIVE ARENA ALLOCATOR (O(1) bump)
         // ====================================================================

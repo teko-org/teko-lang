@@ -129,6 +129,11 @@ void codegen_li_emit_load_local(BytecodeBuffer* buffer, int slot) {
     emit_int(buffer, slot);
 }
 
+void codegen_li_emit_binop(BytecodeBuffer* buffer, OpCode op) {
+    if (!buffer) return;
+    emit_byte(buffer, (unsigned char)op); // single-byte: ADD/SUB/MUL/DIV/MOD/EQ/NE/LT/LE/GT/GE
+}
+
 void codegen_li_emit_call_import(BytecodeBuffer* buffer, int import_index) {
     if (!buffer) return;
     emit_byte(buffer, OP_CALL_IMPORT);

@@ -295,6 +295,55 @@ void test_frontend_interop_named_locals(void) {
     codegen_li_free_context(buffer);
 }
 
+// Phase 12 (P12-E): integer expressions in `let` initializers. `(6*7)%50` lowers via
+// the Pratt parser spilling operands to temp locals; result stored to the named local.
+void test_frontend_interop_expressions(void) {
+    const char* src =
+        "extern fn sink(n) from \"env\" as \"sink\";\n"
+        "let r = (6 * 7) % 50;\n"
+        "sink(r);\n";
+
+    BytecodeBuffer* buffer = codegen_li_create_context();
+    TEST_ASSERT_NOT_NULL(buffer);
+    TEST_ASSERT_EQUAL_INT(0, teko_compile_interop(src, buffer));
+
+    // r is $v0; the expression uses at least one temp local above it.
+    TEST_ASSERT_TRUE(buffer->local_count >= 2);
+
+    // The IL contains MUL and MOD opcodes, and STORE_LOCAL/LOAD_LOCAL spills.
+    int saw_mul = 0, saw_mod = 0, saw_store_local = 0, saw_load_local = 0;
+    for (int i = 0; i < buffer->size; i++) {
+        if (buffer->code[i] == OP_MUL) saw_mul = 1;
+        if (buffer->code[i] == OP_MOD) saw_mod = 1;
+        if (buffer->code[i] == OP_STORE_LOCAL) saw_store_local = 1;
+        if (buffer->code[i] == OP_LOAD_LOCAL) saw_load_local = 1;
+    }
+    TEST_ASSERT_TRUE(saw_mul);
+    TEST_ASSERT_TRUE(saw_mod);
+    TEST_ASSERT_TRUE(saw_store_local);
+    TEST_ASSERT_TRUE(saw_load_local);
+
+    // Through the bridge: the WAT carries the arithmetic + guarded modulo + temp locals.
+    TekoTarget target;
+    target.arch = ARCH_WASM32;
+    target.os = OS_WASI;
+    strncpy(target.target_string, "wasm32-wasi", sizeof(target.target_string) - 1);
+    const char* wat = "output_expr.wat";
+    TEST_ASSERT_EQUAL_INT(0, codegen_li_emit_wasm(buffer, wat, target, NULL, NULL, NULL, NULL, 0));
+    FILE* f = fopen(wat, "r");
+    TEST_ASSERT_NOT_NULL(f);
+    char* out = (char*)malloc(16384);
+    memset(out, 0, 16384);
+    size_t n = fread(out, 1, 16383, f); out[n] = '\0'; fclose(f);
+    TEST_ASSERT_NOT_NULL(strstr(out, "i32.mul"));
+    TEST_ASSERT_NOT_NULL(strstr(out, "i32.rem_s"));
+    TEST_ASSERT_NOT_NULL(strstr(out, "(local $v1 i32)")); // a temp above $v0
+    free(out);
+    remove(wat);
+
+    codegen_li_free_context(buffer);
+}
+
 // Phase 11 (Browser FFI frontend FE-A): import table dedup + interop emit helpers.
 // Models the IL a parser would emit for `log("hi")` where
 // `extern fn log(msg) from "env" as "log"`: SCONST &"hi" -> CALL_IMPORT #0 -> HALT.

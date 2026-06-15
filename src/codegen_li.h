@@ -19,6 +19,16 @@ typedef enum {
     OP_MUL = 0x07,
     OP_DIV = 0x08,
 
+    // Phase 12 (P12-E): integer modulo + comparisons ($w0 = $w0 <op> $w1, result
+    // 0/1 for comparisons). Single-byte ops like ADD/SUB/MUL/DIV.
+    OP_MOD = 0x0D,
+    OP_EQ = 0x0E,
+    OP_NE = 0x0F,
+    OP_LT = 0x15,
+    OP_LE = 0x16,
+    OP_GT = 0x17,
+    OP_GE = 0x18,
+
     // Phase 11 (Browser FFI): call a host import declared via `extern fn … from
     // "ns" as "name"`. Carries a 4-byte little-endian import index (into the
     // module's import table); the WASM emitter lowers it to `call $import_<idx>`.
@@ -116,6 +126,7 @@ void codegen_li_emit_store(BytecodeBuffer* buffer); // $w1 <- $w0
 void codegen_li_emit_load(BytecodeBuffer* buffer);  // $w0 <- $w1
 void codegen_li_emit_store_local(BytecodeBuffer* buffer, int slot); // $vslot <- $w0
 void codegen_li_emit_load_local(BytecodeBuffer* buffer, int slot);  // $w0 <- $vslot
+void codegen_li_emit_binop(BytecodeBuffer* buffer, OpCode op);       // $w0 = $w0 <op> $w1
 void codegen_li_emit_setarg(BytecodeBuffer* buffer, int slot);
 void codegen_li_emit_call_import(BytecodeBuffer* buffer, int import_index);
 void codegen_li_emit_func_begin(BytecodeBuffer* buffer, int routine_id);
