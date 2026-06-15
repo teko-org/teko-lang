@@ -211,3 +211,101 @@ int teko_bn_modexp(const uint8_t* mod_be, size_t mod_len,
     if (teko_mont_init(&mont, mod_be, mod_len) != 0) return -1;
     return teko_mont_modexp(&mont, base_be, base_len, exp_be, exp_len, out_be, mod_len);
 }
+
+// --- Limb-level field operations (see header) -------------------------------------------
+
+uint32_t teko_bn_mask1(uint32_t flag) {
+    return 0u - (flag & 1u);
+}
+
+void teko_bn_cselect(uint32_t* out, const uint32_t* a, const uint32_t* b,
+                     int n, uint32_t mask) {
+    int i;
+    for (i = 0; i < n; ++i) {
+        out[i] = (a[i] & mask) | (b[i] & ~mask);
+    }
+}
+
+void teko_bn_cswap(uint32_t* a, uint32_t* b, int n, uint32_t mask) {
+    int i;
+    for (i = 0; i < n; ++i) {
+        uint32_t t = mask & (a[i] ^ b[i]);
+        a[i] ^= t;
+        b[i] ^= t;
+    }
+}
+
+void teko_bn_load_be(uint32_t* limbs, int n, const uint8_t* bytes, size_t blen) {
+    teko_bn_from_be(limbs, n, bytes, blen);
+}
+
+void teko_bn_store_be(uint8_t* bytes, size_t blen, const uint32_t* limbs, int n) {
+    teko_bn_to_be(bytes, blen, limbs, n);
+}
+
+int teko_bn_is_zero(const uint32_t* a, int n) {
+    uint32_t acc = 0u;
+    int i;
+    for (i = 0; i < n; ++i) acc |= a[i];
+    return (int)(1u ^ ((acc | (0u - acc)) >> 31)); // 1 iff acc == 0, branchless
+}
+
+int teko_bn_eq(const uint32_t* a, const uint32_t* b, int n) {
+    uint32_t acc = 0u;
+    int i;
+    for (i = 0; i < n; ++i) acc |= (a[i] ^ b[i]);
+    return (int)(1u ^ ((acc | (0u - acc)) >> 31));
+}
+
+void teko_mont_mul(const TekoMont* mont, uint32_t* out,
+                   const uint32_t* a, const uint32_t* b) {
+    teko_bn_montmul(out, a, b, mont->m, mont->n, mont->n0);
+}
+
+void teko_mont_add(const TekoMont* mont, uint32_t* out,
+                   const uint32_t* a, const uint32_t* b) {
+    uint32_t t[TEKO_BN_MAX_LIMBS];
+    uint32_t tmp[TEKO_BN_MAX_LIMBS];
+    uint64_t carry = 0u;
+    uint32_t borrow, do_sub, mask;
+    int i, n = mont->n;
+    for (i = 0; i < n; ++i) {
+        uint64_t s = (uint64_t)a[i] + b[i] + carry;
+        t[i] = (uint32_t)s;
+        carry = s >> 32;
+    }
+    borrow = teko_bn_sub(tmp, t, mont->m, n);    // tmp = t - m
+    // Subtract m iff the sum overflowed n limbs (carry) or t >= m (no borrow).
+    do_sub = (uint32_t)carry | (borrow ^ 1u);
+    mask = teko_bn_mask1(do_sub);
+    teko_bn_cselect(out, tmp, t, n, mask);
+}
+
+void teko_mont_sub(const TekoMont* mont, uint32_t* out,
+                   const uint32_t* a, const uint32_t* b) {
+    uint32_t t[TEKO_BN_MAX_LIMBS];
+    uint32_t tmp[TEKO_BN_MAX_LIMBS];
+    uint64_t carry = 0u;
+    uint32_t borrow, mask;
+    int i, n = mont->n;
+    borrow = teko_bn_sub(t, a, b, n);            // t = a - b (mod 2^(32n))
+    for (i = 0; i < n; ++i) {                     // tmp = t + m
+        uint64_t s = (uint64_t)t[i] + mont->m[i] + carry;
+        tmp[i] = (uint32_t)s;
+        carry = s >> 32;
+    }
+    mask = teko_bn_mask1(borrow);                 // if a < b, add m back
+    teko_bn_cselect(out, tmp, t, n, mask);
+}
+
+void teko_mont_to(const TekoMont* mont, uint32_t* out, const uint32_t* a) {
+    teko_bn_montmul(out, a, mont->rr, mont->m, mont->n, mont->n0);
+}
+
+void teko_mont_from(const TekoMont* mont, uint32_t* out, const uint32_t* a) {
+    uint32_t one[TEKO_BN_MAX_LIMBS];
+    int i, n = mont->n;
+    for (i = 0; i < n; ++i) one[i] = 0u;
+    one[0] = 1u;
+    teko_bn_montmul(out, a, one, mont->m, mont->n, mont->n0);
+}

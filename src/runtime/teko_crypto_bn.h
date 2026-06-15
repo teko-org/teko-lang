@@ -37,4 +37,51 @@ int teko_bn_modexp(const uint8_t* mod_be, size_t mod_len,
                    const uint8_t* exp_be, size_t exp_len,
                    uint8_t* out_be);
 
+// --- Limb-level field operations (shared by the NIST P-curves; Phase 13.3b) -------------
+//
+// These operate on little-endian limb arrays of length mont->n. Modular add/sub are domain
+// agnostic (they work on either ordinary or Montgomery-form residues since both are linear).
+// Montgomery multiplication consumes and produces Montgomery-form values. teko_mont_to /
+// teko_mont_from convert an ordinary residue (< m) to/from Montgomery form. All inputs must
+// be reduced (< m); outputs are reduced. None branch on the limb *values* (constant-time
+// w.r.t. secret data), so they are safe for secret-dependent curve arithmetic.
+
+// out = a * b mod m, all in Montgomery form (out, a, b are Montgomery-form residues).
+void teko_mont_mul(const TekoMont* mont, uint32_t* out,
+                   const uint32_t* a, const uint32_t* b);
+
+// out = a + b mod m (domain agnostic; a, b < m).
+void teko_mont_add(const TekoMont* mont, uint32_t* out,
+                   const uint32_t* a, const uint32_t* b);
+
+// out = a - b mod m (domain agnostic; a, b < m).
+void teko_mont_sub(const TekoMont* mont, uint32_t* out,
+                   const uint32_t* a, const uint32_t* b);
+
+// out = a * R mod m  (ordinary residue a < m  ->  Montgomery form).
+void teko_mont_to(const TekoMont* mont, uint32_t* out, const uint32_t* a);
+
+// out = a * R^{-1} mod m  (Montgomery form a  ->  ordinary residue).
+void teko_mont_from(const TekoMont* mont, uint32_t* out, const uint32_t* a);
+
+// Constant-time conditional copy: out = (mask ? a : b), per limb. mask must be 0 or
+// 0xFFFFFFFF (use teko_bn_mask1 to broadcast a 0/1 flag). out may alias a or b.
+void teko_bn_cselect(uint32_t* out, const uint32_t* a, const uint32_t* b,
+                     int n, uint32_t mask);
+
+// Constant-time conditional swap of a and b when mask == 0xFFFFFFFF (no-op when 0).
+void teko_bn_cswap(uint32_t* a, uint32_t* b, int n, uint32_t mask);
+
+// Broadcast a 0/1 flag to a full 0x00000000 / 0xFFFFFFFF limb mask (branchless).
+uint32_t teko_bn_mask1(uint32_t flag);
+
+// Load/store little-endian limbs from/to a big-endian byte buffer (zero-extending / -padding).
+void teko_bn_load_be(uint32_t* limbs, int n, const uint8_t* bytes, size_t blen);
+void teko_bn_store_be(uint8_t* bytes, size_t blen, const uint32_t* limbs, int n);
+
+// Constant-time comparisons over n limbs. teko_bn_is_zero returns 1 iff all limbs are 0.
+// teko_bn_eq returns 1 iff a == b. Both return 0/1 without a value-dependent branch.
+int teko_bn_is_zero(const uint32_t* a, int n);
+int teko_bn_eq(const uint32_t* a, const uint32_t* b, int n);
+
 #endif // TEKO_CRYPTO_BN_H
