@@ -1,8 +1,12 @@
 # Hand-off — Native Runner + Full Crypto Language Surface (then WASM follow-ups)
 
 ## ⇒ NEXT SESSION COLD-START: Sub-phase C "big step" — compile the C crypto runtime → wasm32
-**Everything below is DONE and CI-green; this is the one substantial remaining piece.** State at
-hand-off: native runner + full native crypto surface DONE (A.1, B.1–B.10); WASM `random.bytes`
+**STATUS: HANDED OFF, NOT STARTED.** This is the one substantial remaining piece; everything else
+is DONE and CI-green. It was handed off because it is a multi-increment, toolchain-heavy
+sub-project that **cannot be validated on the macOS dev box without installing a wasm32 toolchain**
+(see the toolchain box below — Apple clang lacks the wasm32 target), so it warrants a fresh,
+well-resourced session rather than low-context blind-on-CI iteration. State at hand-off (HEAD
+`fed2b2d`): native runner + full native crypto surface DONE (A.1, B.1–B.10); WASM `random.bytes`
 (C.1) and `uuid.v4/v7` (C.2) DONE via host imports. Branch `feat/phase-13-native-crypto` (PR #6),
 single owner, tree clean, all 4 gates green.
 
@@ -13,13 +17,33 @@ AEAD, Ed25519/X25519, ECDSA, RSA) still emits `unreachable` on the WASM target
 **compile the single C runtime (`src/runtime/teko_crypto_*.c`) to wasm32 and have the emitted
 module use it**, so WASM lowers to the SAME source of truth as native.
 
+**⚠️ TOOLCHAIN — verified findings (2026-06-15, save the next session a dead end):**
+- The macOS **Apple `clang` (`/usr/bin/clang`) has NO wasm32 target** ("No available targets …
+  compatible with triple wasm32"). Use **brew LLVM** instead: `/opt/homebrew/opt/llvm/bin/clang`
+  *does* list `wasm32`. (Linux CI's `clang` may or may not — verify `clang --print-targets | grep
+  wasm`; install `lld` + a wasm-capable clang if not.)
+- **No `wasm-ld`** in the brew llvm bin by default → `brew install lld` (provides
+  `wasm-ld`); the Linux CI job needs `apt-get install -y lld` (or the wasi-sdk's bundled one).
+- **Freestanding has NO `<string.h>`/`<stdlib.h>`** — the crypto sources `#include <string.h>`
+  (memcpy/memset/strlen) and some use `<stdlib.h>` (malloc). Two clean options:
+  - **Recommended: wasi-sdk** (`wasm32-wasi` clang + a real libc → string.h/stdlib.h/malloc all
+    present, no shims). Download the release tarball (locally + a CI install step). Heavier but
+    removes ALL the shim yak-shaving; compile with `--target=wasm32-wasi --sysroot=<wasi-sdk>/share/wasi-sysroot`.
+  - **Lighter: brew llvm + lld + hand shims** — provide a minimal `string.h`/`stdlib.h` on the
+    include path and freestanding `memcpy/memset/memmove` definitions (the compiler also lowers
+    struct copies to `memcpy`/`memset` libcalls — must be defined). malloc → route to `$teko_alloc`.
+  Decide ONE up front; don't mix.
+- A first end-to-end smoke (do this BEFORE touching the emitter): compile ONE pure hash
+  (`teko_crypto_sha512.c`, no malloc/entropy) → a reactor `.wasm`
+  (`-Wl,--no-entry -Wl,--export=teko_sha512 -Wl,--import-memory`), instantiate in Node against a
+  shared `WebAssembly.Memory`, and check a known digest. Only once that works, wire the glue+emitter.
+
 **Recommended approach (investigate + decide first — this is a design step):**
-1. **Build the crypto C → wasm32.** `clang --target=wasm32 -nostdlib -ffreestanding -O2 -c` the
-   `TEKO_CRYPTO_SOURCES` (already a CMake var, reused by `teko_core`/`teko_rt`). They are
-   portable C23, no libc *except* `memcpy/memset/malloc` and (CSPRNG) entropy. Provide a tiny
-   freestanding shim: `memcpy/memset/memmove` (trivial), and route `malloc`/`free` to the
-   module's existing bump allocator (`$teko_alloc`) — or compile a minimal `walloc`-style heap.
-   CSPRNG entropy → the `env.teko_random` host import already wired (C.1).
+1. **Build the crypto C → wasm32** (see toolchain box above). Start with the pure hashes (no
+   malloc/entropy) to prove the pipeline, then the rest. `TEKO_CRYPTO_SOURCES` is already a CMake
+   var. CSPRNG entropy → the `env.teko_random` host import already wired (C.1); the wasm32 build
+   of `teko_crypto_random.c` will need its OS-entropy `#if`s routed to that import (it currently
+   targets getrandom/arc4random/BCrypt — none exist on wasm32).
 2. **Link/compose with the emitted module.** Two options to evaluate: (a) `wasm-ld` the crypto
    `.o` set + the teko-emitted module's `.o` into one module (requires emitting the teko module
    as an object, not just WAT — bigger change); or (b) keep the crypto as a SECOND wasm module
