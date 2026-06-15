@@ -1404,6 +1404,9 @@ void emit_wasm_pure(MetalContext* ctx, OpCode op, int32_t arg) {
         case OP_FUNC_BEGIN: {
             // Close whatever function is currently open, then open $routine_<id>.
             if (ctx->wasm_open == 1) {
+                // Phase 14: a `routines`-bearing program drains the cooperative scheduler
+                // before $main returns, so fired background tasks run to completion.
+                if (ctx->wasm_emit_spawn) fprintf(f, "    call $teko_sched_run\n");
                 fprintf(f, "    local.get $w0\n  )\n");          // close $main (result i32)
             } else if (ctx->wasm_open == 2) {
                 fprintf(f, "    i32.const 0\n  )\n");            // close previous routine (state 0)
@@ -1459,6 +1462,9 @@ void emit_wasm_pure(MetalContext* ctx, OpCode op, int32_t arg) {
         case OP_RETURN:
         case OP_EPILOG: {
             if (ctx->wasm_open == 1) {
+                // Phase 14: drain the scheduler before $main returns (routines programs
+                // with no trailing routine table still close $main here).
+                if (ctx->wasm_emit_spawn) fprintf(f, "    call $teko_sched_run\n");
                 fprintf(f, "    local.get $w0\n  )\n");
             } else if (ctx->wasm_open == 2) {
                 fprintf(f, "    i32.const 0\n  )\n");

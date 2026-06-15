@@ -504,11 +504,53 @@ static void collect_functions(const char* source, ImportBinding** fns, int* nfns
     }
 }
 
+// Phase 14 (14.A): lower a plain `NAME(arg, …)` extern call inside a routine/handler
+// body. Current token is the callee IDENTIFIER (peek == '('); the callee must resolve to
+// a registered import (e.g. `emit`). Args are string/int literals in this subset (enough
+// to drive `emit("…")` from a background routine); other arg forms are skipped. Returns 1
+// if it consumed a call, 0 if the current token was not a resolvable extern call.
+static int lower_routine_extern_call(BytecodeBuffer* buffer, Parser* p,
+                                     ImportBinding* binds, int nb) {
+    if (p->current_token.type != TOKEN_IDENTIFIER || p->peek_token.type != TOKEN_LPAREN)
+        return 0;
+    int idx = bind_lookup(binds, nb, p->current_token.lexeme);
+    if (idx < 0) return 0;
+    fe_advance(p); // consume NAME
+    fe_advance(p); // consume '('
+    CallArg args[16];
+    int nargs = 0;
+    while (p->current_token.type != TOKEN_RPAREN && p->current_token.type != TOKEN_EOF) {
+        if (nargs < 16 && (p->current_token.type == TOKEN_LIT_STR ||
+                           p->current_token.type == TOKEN_STRING_LIT)) {
+            args[nargs].is_string = 1; args[nargs].sval = strip_quotes(p->current_token.lexeme);
+            args[nargs].ival = 0; args[nargs].is_local = 0; args[nargs].slot = 0;
+            nargs++; fe_advance(p);
+        } else if (nargs < 16 && p->current_token.type == TOKEN_LIT_INT) {
+            args[nargs].is_string = 0; args[nargs].sval = NULL;
+            args[nargs].ival = atoi(p->current_token.lexeme);
+            args[nargs].is_local = 0; args[nargs].slot = 0;
+            nargs++; fe_advance(p);
+        } else if (p->current_token.type == TOKEN_COMMA) {
+            fe_advance(p);
+        } else {
+            fe_advance(p);
+        }
+    }
+    if (p->current_token.type == TOKEN_RPAREN) fe_advance(p);
+    if (p->current_token.type == TOKEN_SEMICOLON) fe_advance(p);
+    lower_call(buffer, idx, args, nargs);
+    for (int i = 0; i < nargs; i++) if (args[i].sval) free(args[i].sval);
+    return 1;
+}
+
 // Routine pass: emit each `fn NAME(param) { body }` as a table routine. The handler is
 // invoked via teko_invoke(slot, event_arg): on entry $w0 = the arg, which we stash to
-// $w1 so `param` references (LOAD) survive across the body's @dom calls.
+// $w1 so `param` references (LOAD) survive across the body's @dom calls. Phase 14: a body
+// may also contain plain extern calls (e.g. `emit("…")`) so a `routines`-fired background
+// task can do real work; `binds` resolves those callees.
 static void emit_handler_routines(const char* source, BytecodeBuffer* buffer,
-                                  ImportBinding* fns, int nfns, TempAlloc* ta) {
+                                  ImportBinding* fns, int nfns,
+                                  ImportBinding* binds, int nb, TempAlloc* ta) {
     Lexer lx; lexer_init(&lx, source);
     Parser p; parser_init(&p, &lx);
 
@@ -561,6 +603,10 @@ static void emit_handler_routines(const char* source, BytecodeBuffer* buffer,
                      is_dom_macro(p.current_token.lexeme) &&
                      p.peek_token.type == TOKEN_LPAREN) {
                 lower_intrinsic_call(buffer, &p, &ctx);
+            } else if (is_codec_head(&p)) {
+                lower_base_codec(buffer, &p, &ctx); // hash/crypto/codec inside a routine
+            } else if (lower_routine_extern_call(buffer, &p, binds, nb)) {
+                // consumed a plain extern call (e.g. emit("…"))
             } else {
                 fe_advance(&p);
             }
@@ -648,6 +694,42 @@ int teko_compile_interop(const char* source, BytecodeBuffer* buffer) {
             }
             codegen_li_emit_store_local(buffer, s); // $vs = $w0
             if (parser.current_token.type == TOKEN_SEMICOLON) fe_advance(&parser);
+        } else if (parser.current_token.type == TOKEN_ROUTINES) {
+            // Phase 14 (14.A): `routines { foo(); bar(); }` — fire each enclosed call as a
+            // background task. Each `NAME(…)` resolves to a top-level `fn NAME`'s table slot
+            // (collect_functions assigned it); we lower `ICONST slot; OP_SPAWN_ASYNC`, which
+            // enqueues the routine on the cooperative scheduler. The runtime drains the queue
+            // before the program exits (WASM `$teko_sched_run` at $main close / native
+            // `teko_rt_run` at HALT). Args are ignored in this MVP (fire pure tasks).
+            fe_advance(&parser); // consume 'routines'
+            if (parser.current_token.type == TOKEN_LBRACE) {
+                fe_advance(&parser); // consume '{'
+                int depth = 1;
+                while (parser.current_token.type != TOKEN_EOF && depth > 0) {
+                    if (parser.current_token.type == TOKEN_LBRACE) { depth++; fe_advance(&parser); }
+                    else if (parser.current_token.type == TOKEN_RBRACE) { depth--; fe_advance(&parser); }
+                    else if (parser.current_token.type == TOKEN_IDENTIFIER &&
+                             parser.peek_token.type == TOKEN_LPAREN) {
+                        int slot = bind_lookup(fns, nfns, parser.current_token.lexeme);
+                        // Skip `NAME ( … )` entirely; spawn the resolved routine slot.
+                        fe_advance(&parser); // NAME
+                        fe_advance(&parser); // '('
+                        int pdepth = 1;
+                        while (parser.current_token.type != TOKEN_EOF && pdepth > 0) {
+                            if (parser.current_token.type == TOKEN_LPAREN) pdepth++;
+                            else if (parser.current_token.type == TOKEN_RPAREN) pdepth--;
+                            fe_advance(&parser);
+                        }
+                        if (parser.current_token.type == TOKEN_SEMICOLON) fe_advance(&parser);
+                        if (slot >= 0) {
+                            codegen_li_emit_iconst(buffer, slot);
+                            codegen_li_emit_spawn_async(buffer);
+                        }
+                    } else {
+                        fe_advance(&parser);
+                    }
+                }
+            }
         } else if (parser.current_token.type == TOKEN_EXTERN) {
             FFIASTNode* node = parse_extern_declaration(&parser);
             if (node) {
@@ -746,7 +828,7 @@ int teko_compile_interop(const char* source, BytecodeBuffer* buffer) {
 
     // Emit handler bodies as table routines (after main), so @dom.on references resolve.
     // (May raise the temp high-water for nested args inside handler bodies.)
-    emit_handler_routines(source, buffer, fns, nfns, &ta);
+    emit_handler_routines(source, buffer, fns, nfns, binds, nb, &ta);
 
     // Phase 12: how many $v locals to declare per function — named locals plus the
     // expression/nested-arg temp high-water (across $main and the handler routines).

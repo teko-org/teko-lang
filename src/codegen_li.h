@@ -131,6 +131,12 @@ typedef struct {
     // linear memory with it (imported from env). Native targets ignore this (they link the
     // same C runtime directly via libteko_rt.a).
     int uses_crypto_ext;
+    // Phase 14 (14.A): 1 if the program fires background tasks via a `routines { … }`
+    // block (lowered to OP_SPAWN_ASYNC). The backends then ensure the cooperative
+    // scheduler is drained before the program exits: WASM emits `call $teko_sched_run`
+    // at $main close; the native runner calls `teko_rt_run` at HALT and emits the
+    // routine function-pointer table. Spawn-free programs stay byte-identical.
+    int uses_spawn;
 } BytecodeBuffer;
 
 // Public functions of the IL Bytecode Emitter
@@ -159,6 +165,9 @@ void codegen_li_emit_setarg(BytecodeBuffer* buffer, int slot);
 void codegen_li_emit_call_import(BytecodeBuffer* buffer, int import_index);
 void codegen_li_emit_func_begin(BytecodeBuffer* buffer, int routine_id);
 void codegen_li_emit_func_end(BytecodeBuffer* buffer);
+// Phase 14 (14.A): fire the routine whose table slot is in $w0 as a background task.
+// Sets buffer->uses_spawn so the backends drain the scheduler before program exit.
+void codegen_li_emit_spawn_async(BytecodeBuffer* buffer);
 void codegen_li_emit_halt(BytecodeBuffer* buffer);
 
 #endif // CODEGEN_LI_H

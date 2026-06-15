@@ -642,3 +642,52 @@ void test_codegen_li_import_table_and_interop_emit(void) {
 
     codegen_li_free_context(buffer);
 }
+
+// Phase 14 (14.A): a `routines { … }` block fires each enclosed call as a background task.
+// The frontend lowers it to ICONST <slot> + OP_SPAWN_ASYNC (per call), sets uses_spawn, and
+// emits the named `fn` as a table routine. The WASM bridge then drains the cooperative
+// scheduler at $main close (`call $teko_sched_run`) so the tasks run before exit.
+void test_frontend_interop_routines_spawn(void) {
+    const char* src =
+        "extern fn log(msg: str) from \"env\" as \"log\";\n"
+        "fn worker() { log(\"worker ran\"); }\n"
+        "log(\"main start\");\n"
+        "routines { worker(); worker(); }\n";
+
+    BytecodeBuffer* buffer = codegen_li_create_context();
+    TEST_ASSERT_NOT_NULL(buffer);
+    TEST_ASSERT_EQUAL_INT(0, teko_compile_interop(src, buffer));
+
+    // Firing a routine sets the spawn flag and lowers to OP_SPAWN_ASYNC + a table routine.
+    TEST_ASSERT_EQUAL_INT(1, buffer->uses_spawn);
+    int spawns = 0, func_begins = 0;
+    for (int i = 0; i < buffer->size; i++) {
+        if (buffer->code[i] == OP_SPAWN_ASYNC) spawns++;
+        else if (buffer->code[i] == OP_FUNC_BEGIN) func_begins++;
+    }
+    TEST_ASSERT_EQUAL_INT(2, spawns);       // two worker() calls fired
+    TEST_ASSERT_EQUAL_INT(1, func_begins);  // one `fn worker` emitted as a routine
+
+    // Through the WASM bridge: the routine body, the scheduler drain at $main close, and a
+    // function table with the routine must all be present.
+    TekoTarget target;
+    target.arch = ARCH_WASM32;
+    target.os = OS_WASI;
+    strncpy(target.target_string, "wasm32-wasi", sizeof(target.target_string) - 1);
+    const char* wat = "output_interop_routines.wat";
+    TEST_ASSERT_EQUAL_INT(0, codegen_li_emit_wasm(buffer, wat, target, NULL, NULL, NULL, NULL, 0));
+
+    FILE* f = fopen(wat, "r");
+    TEST_ASSERT_NOT_NULL(f);
+    char* out = (char*)malloc(65536);
+    memset(out, 0, 65536);
+    size_t n = fread(out, 1, 65535, f); out[n] = '\0'; fclose(f);
+    TEST_ASSERT_NOT_NULL(strstr(out, "(func $routine_0"));        // worker lowered to a routine
+    TEST_ASSERT_NOT_NULL(strstr(out, "call $teko_enqueue"));      // spawn enqueues the task
+    TEST_ASSERT_NOT_NULL(strstr(out, "call $teko_sched_run"));    // drained before $main returns
+    TEST_ASSERT_NOT_NULL(strstr(out, "(elem (i32.const 0) $routine_0"));
+    free(out);
+    remove(wat);
+
+    codegen_li_free_context(buffer);
+}

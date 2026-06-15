@@ -26,6 +26,7 @@ BytecodeBuffer* codegen_li_create_context(void) {
     buffer->uses_random = 0;
     buffer->uses_uuid_rng = 0;
     buffer->uses_crypto_ext = 0;
+    buffer->uses_spawn = 0;
 
     return buffer;
 }
@@ -177,6 +178,12 @@ void codegen_li_emit_func_begin(BytecodeBuffer* buffer, int routine_id) {
 void codegen_li_emit_func_end(BytecodeBuffer* buffer) {
     if (!buffer) return;
     emit_byte(buffer, OP_FUNC_END);
+}
+
+void codegen_li_emit_spawn_async(BytecodeBuffer* buffer) {
+    if (!buffer) return;
+    buffer->uses_spawn = 1; // backends drain the scheduler before program exit
+    emit_byte(buffer, OP_SPAWN_ASYNC);
 }
 
 void codegen_li_emit_halt(BytecodeBuffer* buffer) {
