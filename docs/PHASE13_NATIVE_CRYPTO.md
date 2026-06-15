@@ -9,15 +9,29 @@
 ## ▶ RESUME POINT (for the next session — same branch/PR #6)
 Done & CI-green: **13.1, 13.1 `hash.sha256` wiring, 13.3a, 13.2, 13.4, the Curve25519
 block (X25519 + Ed25519), the legacy hashes (MD5 + SHA-1, C + `hash.md5`/`hash.sha1` WASM
-surface), and UUID (full C runtime + `uuid.v3`/`uuid.v5` WASM surface)**. 23 crypto/uuid
-runtime modules; suite **147/147**; every increment ASan+UBSan (both dispatch paths) + TSan
-clean; all four CI gates green.
+surface), UUID (full C runtime nil/v3/v4/v5/v7/v8 + parse/format, `uuid.v3`/`uuid.v5` WASM
+surface), AND the Montgomery bignum layer (`teko_crypto_bn.c`)**. 24 crypto/uuid runtime
+modules; suite **151/151**; every increment ASan+UBSan (both dispatch paths) + TSan clean;
+all four CI gates green. Head at hand-off: `8f5e8fb`.
 
-**ONLY remaining work — the asymmetric NIST/RSA block (incremental, KAT-anchored, one
-verified increment per commit, CI-green each step):** the bignum layer (below) → ECDH/ECDSA
-**P-256** → **P-384** → **RSA** (PKCS#1 v1.5 / OAEP / PSS). Optional follow-ups noted in the
-doc: the WASM host entropy/time import (unlocks `uuid.v4`/`v7` + WASM CSPRNG surface), and
-compiling the C crypto runtime to wasm (unlocks sha512/sha3/blake3 WASM surface).
+**ONLY remaining work — finish the asymmetric NIST/RSA block (incremental, KAT-anchored, one
+verified increment per commit, CI-green each step):**
+1. **Expose field ops from the bignum** for ECC: add `teko_mont_mul`/`add`/`sub`/`to`/`from`
+   (limb-level) to `teko_crypto_bn.h` (the CIOS `teko_bn_montmul` is already implemented as a
+   `static` — promote/wrap it). Field inverse via Fermat = `teko_mont_modexp` with `p-2`.
+2. **P-256 ECDH** — `teko_crypto_p256.c`: field mod p (the P-256 prime), **RCB complete
+   (exception-free) point add/double for a=-3**, constant-time scalar mult, public-key +
+   ECDH. KAT vs. NIST CAVP ECDH.
+3. **P-256 ECDSA** — sign (RFC 6979 deterministic nonce via HMAC-SHA-256, already available)
+   + verify. KAT vs. NIST/RFC 6979.
+4. **P-384** — same shape, 12×32 limbs.
+5. **RSA** — sits directly on the verified `teko_mont_modexp`: PKCS#1 v1.5 + OAEP (MGF1) +
+   PSS, plus key parsing. KAT vs. FIPS 186 / RFC 8017 / Wycheproof.
+
+Optional follow-ups: the WASM host entropy/time import (unlocks `uuid.v4`/`v7` + WASM CSPRNG
+surface), and compiling the C crypto runtime to wasm32 (unlocks sha512/sha3/blake3 WASM
+surface). The owner add-ons (legacy MD5/SHA-1 + UUID incl. v8) are **complete** — only the
+asymmetric block is left before Phase 13 is done.
 
 ### DECISION TO DOCUMENT & IMPLEMENT FIRST — the bignum layer (owner pre-approved)
 Build a shared **fixed-capacity, little-endian 32-bit-limb multi-precision integer** module
