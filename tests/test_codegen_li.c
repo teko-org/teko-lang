@@ -1,6 +1,9 @@
 #include "unity.h"
 #include "codegen_li.h"
+#include "codegen_li_wasm.h"
+#include "teko_target.h"
 #include "parser_statements.h"
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -40,6 +43,46 @@ void test_bytecode_emission_and_constant_pooling(void) {
     // Cleanup
     free(stmt.data.var_decl.var_name);
     free(stmt.data.var_decl.initializer_raw);
+    codegen_li_free_context(buffer);
+}
+
+// Phase 11 (Browser FFI frontend FE-B): bridge a frontend IL BytecodeBuffer to the
+// WASM backend (codegen_li_emit_wasm) and assert the emitted .wat carries the import,
+// the call site, and the string pool data segment — IL -> WASM without a parser.
+void test_codegen_li_to_wasm_bridge(void) {
+    BytecodeBuffer* buffer = codegen_li_create_context();
+    TEST_ASSERT_NOT_NULL(buffer);
+
+    int imp = codegen_li_add_import(buffer, "env", "log", 1, 0);
+    int s = codegen_li_add_string_constant(buffer, "hi");
+    codegen_li_emit_sconst(buffer, s);
+    codegen_li_emit_call_import(buffer, imp);
+    codegen_li_emit_halt(buffer);
+
+    TekoTarget target;
+    target.arch = ARCH_WASM32;
+    target.os = OS_WASI;
+    strncpy(target.target_string, "wasm32-wasi", sizeof(target.target_string) - 1);
+
+    const char* wat = "output_li_wasm_bridge.wat";
+    int rc = codegen_li_emit_wasm(buffer, wat, target, NULL, NULL, NULL, NULL, 0);
+    TEST_ASSERT_EQUAL_INT(0, rc);
+
+    FILE* f = fopen(wat, "r");
+    TEST_ASSERT_NOT_NULL(f);
+    char* out = (char*)malloc(16384);
+    TEST_ASSERT_NOT_NULL(out);
+    memset(out, 0, 16384);
+    size_t n = fread(out, 1, 16383, f);
+    out[n] = '\0';
+    fclose(f);
+
+    TEST_ASSERT_NOT_NULL(strstr(out, "(import \"env\" \"log\" (func $import_0 (param i32)))"));
+    TEST_ASSERT_NOT_NULL(strstr(out, "call $import_0"));
+    TEST_ASSERT_NOT_NULL(strstr(out, "(data (i32.const 1024) \"hi\\00\")"));
+
+    free(out);
+    remove(wat);
     codegen_li_free_context(buffer);
 }
 

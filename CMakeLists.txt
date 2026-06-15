@@ -40,6 +40,7 @@ set(CORE_SOURCES
         src/type_checker.c
         # Intermediate language + bytecode codegen
         src/codegen_li.c
+        src/codegen_li_wasm.c
         src/codegen_aot.c
         src/teko_il.c
         # Virtual machine + runtime
