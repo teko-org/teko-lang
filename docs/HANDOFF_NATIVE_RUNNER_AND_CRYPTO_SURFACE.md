@@ -16,6 +16,15 @@
   is already emitted by `emit_native_hosted` (dispatch table mirrors the WASM emitter); the
   remaining work is the `teko_rt_*` crypto wrappers + executable `.tks` KATs (`hash.sha256`
   first).
+- **Sub-phase B, step 1 — `hash.sha256` native surface: DONE.** `hash.sha256(msg)` lowers
+  to `OP_CALL_RUNTIME` id 4 → `teko_rt_sha256_hex` (in `libteko_rt.a`), which calls the
+  portable C SHA-256 runtime. The crypto sources are now a shared CMake list
+  (`TEKO_CRYPTO_SOURCES`) linked into BOTH `teko_core` and `teko_rt`, so produced binaries
+  are self-contained. Proven by `runtime/native/samples/hash_sha256.tks`: `hash.sha256("abc")`
+  prints the FIPS 180-4 digest natively on macOS arm64 + Linux x86_64/arm64 (asserted in
+  `run-native.sh`). **Next:** the rest of `hash.*` (sha384/512, sha3/shake, blake3/blake2b),
+  then HMAC — each a `teko_rt_*` wrapper + dispatch id + executable `.tks` KAT; then multi-arg
+  staging is already supported by `emit_native_hosted` for AEAD/sign/verify.
 
 > **Status:** owner-approved next work. Same PR/branch as Phase 13:
 > `feat/phase-13-native-crypto` (PR #6). The Phase 13 crypto **runtime** is complete and

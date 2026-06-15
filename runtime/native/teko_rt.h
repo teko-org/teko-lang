@@ -20,4 +20,10 @@
 // top-level `emit("…")` to this. Writes the string followed by a newline to stdout.
 void teko_rt_emit(const char* s);
 
+// Hash surface (OP_CALL_RUNTIME id 4). `hash.sha256(msg)` hashes the raw bytes of the
+// NUL-terminated message and returns a freshly-allocated lowercase hex digest string
+// (caller-owned; short-lived programs leak it like the WASM bump allocator does). This
+// matches the existing WASM hash surface (hash.sha256("abc") hashes the bytes "abc").
+char* teko_rt_sha256_hex(const char* msg);
+
 #endif // TEKO_RT_H

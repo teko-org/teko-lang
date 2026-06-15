@@ -34,5 +34,7 @@ check() {
 }
 
 check hello.tks "hello from teko native"
+# FIPS 180-4 SHA-256("abc") known-answer vector.
+check hash_sha256.tks "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
 
 echo "All native runner proofs passed."

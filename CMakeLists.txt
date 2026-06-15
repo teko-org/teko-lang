@@ -17,6 +17,43 @@ FetchContent_MakeAvailable(unity)
 #    Listed explicitly on purpose: GLOB_RECURSE does not re-trigger CMake when files
 #    are added/removed, which causes stale builds. When you add a new .c file under
 #    src/, add it to this list.
+
+# Native cryptography (Phase 13) — embedded runtime primitives, the single source of
+# truth. Shared between teko_core (compiler + KAT suite) and teko_rt (the archive linked
+# into produced native binaries via the hosted runner). When you add a crypto .c, add it
+# here once.
+set(TEKO_CRYPTO_SOURCES
+        src/runtime/teko_crypto_sha2.c
+        src/runtime/teko_crypto_md5.c
+        src/runtime/teko_crypto_sha1.c
+        src/runtime/teko_crypto_sha512.c
+        src/runtime/teko_crypto_hmac.c
+        src/runtime/teko_crypto_sha3.c
+        src/runtime/teko_crypto_blake3.c
+        src/runtime/teko_crypto_random.c
+        src/runtime/teko_crypto_hkdf.c
+        src/runtime/teko_crypto_pbkdf2.c
+        src/runtime/teko_crypto_chacha20.c
+        src/runtime/teko_crypto_poly1305.c
+        src/runtime/teko_crypto_chachapoly.c
+        src/runtime/teko_crypto_aes.c
+        src/runtime/teko_crypto_aes_modes.c
+        src/runtime/teko_crypto_aes_gcm.c
+        src/runtime/teko_crypto_scrypt.c
+        src/runtime/teko_crypto_blake2b.c
+        src/runtime/teko_crypto_argon2.c
+        src/runtime/teko_crypto_fe25519.c
+        src/runtime/teko_crypto_x25519.c
+        src/runtime/teko_crypto_ed25519.c
+        src/runtime/teko_uuid.c
+        src/runtime/teko_crypto_bn.c
+        src/runtime/teko_crypto_ec.c
+        src/runtime/teko_crypto_ecc.c
+        src/runtime/teko_crypto_p256.c
+        src/runtime/teko_crypto_p384.c
+        src/runtime/teko_crypto_rsa.c
+)
+
 set(CORE_SOURCES
         # Frontend: lexer + parser modules
         src/lexer.c
@@ -55,36 +92,8 @@ set(CORE_SOURCES
         src/runtime/teko_channel.c
         src/runtime/teko_mem_sys.c
         src/runtime/teko_thread.c
-        # Native cryptography (Phase 13) — embedded runtime primitives
-        src/runtime/teko_crypto_sha2.c
-        src/runtime/teko_crypto_md5.c
-        src/runtime/teko_crypto_sha1.c
-        src/runtime/teko_crypto_sha512.c
-        src/runtime/teko_crypto_hmac.c
-        src/runtime/teko_crypto_sha3.c
-        src/runtime/teko_crypto_blake3.c
-        src/runtime/teko_crypto_random.c
-        src/runtime/teko_crypto_hkdf.c
-        src/runtime/teko_crypto_pbkdf2.c
-        src/runtime/teko_crypto_chacha20.c
-        src/runtime/teko_crypto_poly1305.c
-        src/runtime/teko_crypto_chachapoly.c
-        src/runtime/teko_crypto_aes.c
-        src/runtime/teko_crypto_aes_modes.c
-        src/runtime/teko_crypto_aes_gcm.c
-        src/runtime/teko_crypto_scrypt.c
-        src/runtime/teko_crypto_blake2b.c
-        src/runtime/teko_crypto_argon2.c
-        src/runtime/teko_crypto_fe25519.c
-        src/runtime/teko_crypto_x25519.c
-        src/runtime/teko_crypto_ed25519.c
-        src/runtime/teko_uuid.c
-        src/runtime/teko_crypto_bn.c
-        src/runtime/teko_crypto_ec.c
-        src/runtime/teko_crypto_ecc.c
-        src/runtime/teko_crypto_p256.c
-        src/runtime/teko_crypto_p384.c
-        src/runtime/teko_crypto_rsa.c
+        # Native cryptography (Phase 13) — embedded runtime primitives (shared list)
+        ${TEKO_CRYPTO_SOURCES}
         # Tooling: target detection, SDK, LSP, project manager
         src/teko_target.c
         src/teko_sdk.c
@@ -142,8 +151,11 @@ target_include_directories(teko PRIVATE src)
 #     the surface ABI shims (teko_rt_emit, and the crypto wrappers added in Sub-phase B)
 #     over the portable C crypto runtime (the single source of truth). Self-contained so
 #     produced binaries need nothing else.
-add_library(teko_rt STATIC runtime/native/teko_rt.c)
-target_include_directories(teko_rt PRIVATE runtime/native src/runtime)
+add_library(teko_rt STATIC runtime/native/teko_rt.c ${TEKO_CRYPTO_SOURCES})
+target_include_directories(teko_rt PRIVATE runtime/native src/runtime src)
+if (WIN32)
+    target_link_libraries(teko_rt PRIVATE bcrypt) # CSPRNG: BCryptGenRandom
+endif()
 
 # 3. TARGET 2: The Isolated Test Suite (Test Entry Point).
 #    Also listed explicitly. When you add a new test .c file, add it here.
