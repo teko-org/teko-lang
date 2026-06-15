@@ -114,6 +114,11 @@ extern void test_codegen_emitters_arithmetic_per_target(void);
 extern void test_teko_runtime_sys_allocation_and_page_recycling(void);
 extern void test_teko_runtime_scheduler_cooperative_multithreading(void);
 extern void test_teko_runtime_channels_blocking_and_signaling(void);
+extern void test_teko_duplex_bidirectional_roundtrip(void);
+extern void test_teko_duplex_capacity_full(void);
+extern void test_teko_duplex_close_drains_then_signals(void);
+extern void test_teko_duplex_drop_signals_peer(void);
+extern void test_teko_duplex_badarg(void);
 extern void test_teko_runtime_arena_thread_isolation_and_alignment(void);
 extern void test_teko_crypto_md5_rfc1321_vectors(void);
 extern void test_teko_crypto_md5_streaming_matches_oneshot(void);
@@ -304,6 +309,11 @@ int main(void) {
     RUN_TEST(test_teko_runtime_sys_allocation_and_page_recycling);
     RUN_TEST(test_teko_runtime_scheduler_cooperative_multithreading);
     RUN_TEST(test_teko_runtime_channels_blocking_and_signaling);
+    RUN_TEST(test_teko_duplex_bidirectional_roundtrip);
+    RUN_TEST(test_teko_duplex_capacity_full);
+    RUN_TEST(test_teko_duplex_close_drains_then_signals);
+    RUN_TEST(test_teko_duplex_drop_signals_peer);
+    RUN_TEST(test_teko_duplex_badarg);
     RUN_TEST(test_teko_runtime_arena_thread_isolation_and_alignment);
 
     RUN_TEST(test_teko_crypto_md5_rfc1321_vectors);
