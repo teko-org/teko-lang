@@ -459,6 +459,48 @@ static void lower_base_codec(BytecodeBuffer* b, Parser* p, const LowerCtx* ctx) 
     codegen_li_emit_call_runtime(b, id);                 // $w0 = rt(args); sets uses_codec/uses_hash by id
 }
 
+// --- duplex channels (Phase 14, 14.B) -------------------------------------------
+// `duplex.open/send/recv/poll/close(args)`. The lexer folds `duplex.open` into ONE dotted
+// IDENTIFIER (bare `duplex` stays the keyword), so this reuses the dotted-identifier call
+// path — but lowers to the dedicated OP_DUPLEX_* opcodes (not OP_CALL_RUNTIME). Args are
+// int literals (capacity / endpoint / value) or named locals (the channel handle); they are
+// lowered with lower_codec_value, staged via OP_SETARG (0..n-2) with the last left in $w0.
+// The result (handle / value / status) lands in $w0. Returns the opcode, or -1.
+static int duplex_op_for(const char* lex, int* arity) {
+    int a = 1; int op = -1;
+    if (!lex) return -1;
+    if      (strcmp(lex, "duplex.open")  == 0) { op = OP_DUPLEX_OPEN;  a = 1; }
+    else if (strcmp(lex, "duplex.send")  == 0) { op = OP_DUPLEX_SEND;  a = 3; }
+    else if (strcmp(lex, "duplex.recv")  == 0) { op = OP_DUPLEX_RECV;  a = 2; }
+    else if (strcmp(lex, "duplex.poll")  == 0) { op = OP_DUPLEX_POLL;  a = 2; }
+    else if (strcmp(lex, "duplex.close") == 0) { op = OP_DUPLEX_CLOSE; a = 1; }
+    if (op >= 0 && arity) *arity = a;
+    return op;
+}
+
+static int is_duplex_head(const Parser* p) {
+    return p->current_token.type == TOKEN_IDENTIFIER &&
+           duplex_op_for(p->current_token.lexeme, NULL) >= 0 &&
+           p->peek_token.type == TOKEN_LPAREN;
+}
+
+static void lower_duplex_call(BytecodeBuffer* b, Parser* p, const LowerCtx* ctx) {
+    int arity = 1;
+    int op = duplex_op_for(p->current_token.lexeme, &arity);
+    if (op < 0) { op = OP_DUPLEX_OPEN; arity = 1; }
+    fe_advance(p);                                       // consume the dotted identifier
+    if (p->current_token.type == TOKEN_LPAREN) fe_advance(p);
+    for (int i = 0; i < arity; i++) {
+        lower_codec_value(b, p, ctx);                    // arg i -> $w0 (int / named local)
+        if (i < arity - 1) {
+            codegen_li_emit_setarg(b, i);
+            if (p->current_token.type == TOKEN_COMMA) fe_advance(p);
+        }
+    }
+    if (p->current_token.type == TOKEN_RPAREN) fe_advance(p);
+    codegen_li_emit_duplex(b, (OpCode)op);               // $w0 = duplex op result
+}
+
 // Skip a whole `extern …;` / `extern { … }` declaration. Needed by the fn scanners
 // below so the `fn` token INSIDE `extern fn …` is not mistaken for a handler.
 static void skip_extern_decl(Parser* p) {
@@ -605,6 +647,9 @@ static void emit_handler_routines(const char* source, BytecodeBuffer* buffer,
                 lower_intrinsic_call(buffer, &p, &ctx);
             } else if (is_codec_head(&p)) {
                 lower_base_codec(buffer, &p, &ctx); // hash/crypto/codec inside a routine
+            } else if (is_duplex_head(&p)) {
+                lower_duplex_call(buffer, &p, &ctx); // duplex op inside a routine (14.B)
+                if (p.current_token.type == TOKEN_SEMICOLON) fe_advance(&p);
             } else if (lower_routine_extern_call(buffer, &p, binds, nb)) {
                 // consumed a plain extern call (e.g. emit("…"))
             } else {
@@ -685,6 +730,8 @@ int teko_compile_interop(const char* source, BytecodeBuffer* buffer) {
                 lower_intrinsic_call(buffer, &parser, &top_ctx); // result handle -> $w0
             } else if (is_codec_head(&parser)) {
                 lower_base_codec(buffer, &parser, &top_ctx);      // P12-G: result ptr -> $w0
+            } else if (is_duplex_head(&parser)) {
+                lower_duplex_call(buffer, &parser, &top_ctx);     // 14.B: handle/value -> $w0
             } else {
                 // Integer expression (P12-E): literals, locals, parens, + - * / % and
                 // comparisons. Temps live above the named locals ($v{nlocals}+).
@@ -756,6 +803,10 @@ int teko_compile_interop(const char* source, BytecodeBuffer* buffer) {
                    parser.peek_token.type == TOKEN_LPAREN) {
             // Top-level @dom/@js intrinsic call statement.
             lower_intrinsic_call(buffer, &parser, &top_ctx);
+        } else if (is_duplex_head(&parser)) {
+            // Top-level duplex statement: duplex.send/close/… ( args )  (result discarded).
+            lower_duplex_call(buffer, &parser, &top_ctx);
+            if (parser.current_token.type == TOKEN_SEMICOLON) fe_advance(&parser);
         } else if (parser.current_token.type == TOKEN_IDENTIFIER &&
                    parser.peek_token.type == TOKEN_LPAREN) {
             // Top-level call statement: NAME ( arg, … )

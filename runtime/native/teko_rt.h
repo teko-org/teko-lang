@@ -20,6 +20,10 @@
 // top-level `emit("…")` to this. Writes the string followed by a newline to stdout.
 void teko_rt_emit(const char* s);
 
+// Print an integer followed by a newline (Phase 14 — concurrency proofs surface i32 results
+// such as channel values and structured statuses). `extern fn emit_int(n) … as "teko_rt_emit_int"`.
+void teko_rt_emit_int(long n);
+
 // Hash surface (OP_CALL_RUNTIME id 4). `hash.sha256(msg)` hashes the raw bytes of the
 // NUL-terminated message and returns a freshly-allocated lowercase hex digest string
 // (caller-owned; short-lived programs leak it like the WASM bump allocator does). This
@@ -117,5 +121,13 @@ char* teko_rt_uuid_v7(int ignored);
 // teko_rt_run drains the queue to completion (called at `$main` exit). See teko_rt_sched.c.
 void teko_rt_spawn(long slot, long arg);
 void teko_rt_run(void);
+
+// Phase 14 (14.B) — duplex channel surface wrappers (OP_DUPLEX_* lower to these). The handle
+// is a TekoDuplex* carried as a register-width integer; values/statuses are i32 at the surface.
+long teko_rt_duplex_open(long capacity);
+long teko_rt_duplex_send(long handle, long endpoint, long value);
+long teko_rt_duplex_recv(long handle, long endpoint);
+long teko_rt_duplex_poll(long handle, long endpoint);
+long teko_rt_duplex_close(long handle);
 
 #endif // TEKO_RT_H

@@ -59,6 +59,24 @@ const char* teko_native_runtime_symbol(int32_t id, int* out_arity) {
     return sym;
 }
 
+// Phase 14 (14.B): OP_DUPLEX_* -> teko_rt_duplex_* symbol + arity (mirrors the WASM reactor
+// import table). The duplex C runtime is the single source of truth; these wrappers adapt the
+// integer-handle ABI onto it (linked from libteko_rt.a).
+const char* teko_native_duplex_symbol(OpCode op, int* out_arity) {
+    int arity = 1;
+    const char* sym = NULL;
+    switch (op) {
+        case OP_DUPLEX_OPEN:  sym = "teko_rt_duplex_open";  arity = 1; break; // (capacity)
+        case OP_DUPLEX_SEND:  sym = "teko_rt_duplex_send";  arity = 3; break; // (handle, ep, value)
+        case OP_DUPLEX_RECV:  sym = "teko_rt_duplex_recv";  arity = 2; break; // (handle, ep)
+        case OP_DUPLEX_POLL:  sym = "teko_rt_duplex_poll";  arity = 2; break; // (handle, ep)
+        case OP_DUPLEX_CLOSE: sym = "teko_rt_duplex_close"; arity = 1; break; // (handle)
+        default: break;
+    }
+    if (out_arity) *out_arity = arity;
+    return sym;
+}
+
 // --- helpers ---------------------------------------------------------------------
 static int is_macho(const MetalContext* ctx) { return ctx->target.os == OS_MACOS_DARWIN; }
 static int is_arm64(const MetalContext* ctx) {
@@ -343,6 +361,19 @@ void emit_native_hosted(MetalContext* ctx, OpCode op, int32_t arg) {
         case OP_CALL_RUNTIME: {
             int arity = 1;
             const char* sym = teko_native_runtime_symbol(arg, &arity);
+            if (sym) emit_call(ctx, sym, arity);
+            break;
+        }
+
+        // Phase 14 (14.B): duplex channel ops — lower to the teko_rt_duplex_* runtime calls
+        // (staging slots + $w0 marshalled by emit_call, exactly like OP_CALL_RUNTIME).
+        case OP_DUPLEX_OPEN:
+        case OP_DUPLEX_SEND:
+        case OP_DUPLEX_RECV:
+        case OP_DUPLEX_POLL:
+        case OP_DUPLEX_CLOSE: {
+            int arity = 1;
+            const char* sym = teko_native_duplex_symbol(op, &arity);
             if (sym) emit_call(ctx, sym, arity);
             break;
         }

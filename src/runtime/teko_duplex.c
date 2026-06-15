@@ -74,6 +74,13 @@ TekoDuplexStatus teko_duplex_recv(TekoDuplex* d, int endpoint, int32_t* out_valu
     return status_for_empty(d->state);
 }
 
+TekoDuplexStatus teko_duplex_poll(const TekoDuplex* d, int endpoint) {
+    if (!d || (endpoint != 0 && endpoint != 1)) return TEKO_DX_BADARG;
+    const TekoDuplexRing* r = &d->ring[endpoint ? 0 : 1]; // same ring recv(ep) would read
+    if (r->size > 0) return TEKO_DX_OK;
+    return status_for_empty(d->state);
+}
+
 void teko_duplex_close(TekoDuplex* d) {
     // A drop is terminal and outranks a later graceful close.
     if (d && d->state == TEKO_DUPLEX_OPEN) d->state = TEKO_DUPLEX_CLOSED;

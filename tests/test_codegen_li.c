@@ -691,3 +691,39 @@ void test_frontend_interop_routines_spawn(void) {
 
     codegen_li_free_context(buffer);
 }
+
+// Phase 14 (14.B): `duplex.*` dotted-identifier calls lower to the dedicated OP_DUPLEX_*
+// opcodes (not OP_CALL_RUNTIME), set uses_duplex, and stage multi-arg ops via OP_SETARG.
+void test_frontend_interop_duplex_lowering(void) {
+    const char* src =
+        "extern fn emit_int(n: i32) from \"teko_rt\" as \"teko_rt_emit_int\";\n"
+        "let h = duplex.open(4);\n"
+        "duplex.send(h, 0, 111);\n"
+        "let a = duplex.recv(h, 1);\n"
+        "emit_int(a);\n"
+        "duplex.close(h);\n"
+        "let s = duplex.poll(h, 1);\n";
+
+    BytecodeBuffer* buffer = codegen_li_create_context();
+    TEST_ASSERT_NOT_NULL(buffer);
+    TEST_ASSERT_EQUAL_INT(0, teko_compile_interop(src, buffer));
+
+    TEST_ASSERT_EQUAL_INT(1, buffer->uses_duplex);
+    int n_open = 0, n_send = 0, n_recv = 0, n_poll = 0, n_close = 0;
+    for (int i = 0; i < buffer->size; i++) {
+        switch (buffer->code[i]) {
+            case OP_DUPLEX_OPEN:  n_open++;  break;
+            case OP_DUPLEX_SEND:  n_send++;  break;
+            case OP_DUPLEX_RECV:  n_recv++;  break;
+            case OP_DUPLEX_POLL:  n_poll++;  break;
+            case OP_DUPLEX_CLOSE: n_close++; break;
+            default: break;
+        }
+    }
+    TEST_ASSERT_EQUAL_INT(1, n_open);
+    TEST_ASSERT_EQUAL_INT(1, n_send);
+    TEST_ASSERT_EQUAL_INT(1, n_recv);
+    TEST_ASSERT_EQUAL_INT(1, n_poll);
+    TEST_ASSERT_EQUAL_INT(1, n_close);
+    codegen_li_free_context(buffer);
+}

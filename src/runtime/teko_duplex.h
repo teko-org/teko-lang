@@ -48,6 +48,11 @@ TekoDuplexStatus teko_duplex_send(TekoDuplex* d, int endpoint, int32_t value);
 // (OK), even after close. When empty: OPEN → EMPTY, CLOSED → CLOSED, DROPPED → DROPPED.
 TekoDuplexStatus teko_duplex_recv(TekoDuplex* d, int endpoint, int32_t* out_value);
 
+// Non-consuming status probe for `endpoint`'s recv direction: OK if data is buffered, else
+// the empty-status for the current state (EMPTY/CLOSED/DROPPED). Lets a caller distinguish a
+// transient EMPTY (yield/retry) from a terminal CLOSED/DROPPED without an in-band sentinel.
+TekoDuplexStatus teko_duplex_poll(const TekoDuplex* d, int endpoint);
+
 void            teko_duplex_close(TekoDuplex* d); // legitimate close (OPEN → CLOSED)
 void            teko_duplex_drop(TekoDuplex* d);  // panic/failure (→ DROPPED)
 TekoDuplexState teko_duplex_state(const TekoDuplex* d);

@@ -277,7 +277,9 @@ static void process_linear_il_bytes(MetalContext* ctx, const unsigned char* byte
             else if (op == OP_STORE || op == OP_LOAD || op == OP_SPAWN_ASYNC ||
                      op == OP_CHAN_INIT || op == OP_CHAN_GET || op == OP_CALL_IMPORT ||
                      op == OP_SETARG || op == OP_STORE_LOCAL || op == OP_LOAD_LOCAL ||
-                     op == OP_CALL_RUNTIME) {
+                     op == OP_CALL_RUNTIME ||
+                     op == OP_DUPLEX_OPEN || op == OP_DUPLEX_SEND || op == OP_DUPLEX_RECV ||
+                     op == OP_DUPLEX_POLL || op == OP_DUPLEX_CLOSE) {
                 last_arith_op = (OpCode)0;
             }
 
@@ -293,9 +295,13 @@ static void process_linear_il_bytes(MetalContext* ctx, const unsigned char* byte
             // there — it only re-emits a redundant `local.set $w0`.) Without this, two
             // consecutive `routines { f(); f(); }` spawns of the same slot elide the second
             // ICONST and the second spawn reads the clobbered register → wrong slot.
+            // Phase 14: OP_DUPLEX_* also lower to runtime `call`s (teko_rt_duplex_*) that
+            // clobber $w0 with the handle/value/status result — same rule as the calls above.
             if (op == OP_SCONST || op == OP_LOAD || op == OP_CHAN_GET ||
                 op == OP_CALL_IMPORT || op == OP_LOAD_LOCAL || op == OP_CALL_RUNTIME ||
-                op == OP_SPAWN_ASYNC) {
+                op == OP_SPAWN_ASYNC ||
+                op == OP_DUPLEX_OPEN || op == OP_DUPLEX_SEND || op == OP_DUPLEX_RECV ||
+                op == OP_DUPLEX_POLL || op == OP_DUPLEX_CLOSE) {
                 accum_has_value = false;
             }
         }

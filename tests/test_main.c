@@ -37,6 +37,7 @@ extern void test_codegen_li_to_wasm_bridge(void);
 extern void test_frontend_interop_extern_call_to_il(void);
 extern void test_frontend_interop_dom_intrinsics(void);
 extern void test_frontend_interop_routines_spawn(void);
+extern void test_frontend_interop_duplex_lowering(void);
 extern void test_frontend_interop_event_handler(void);
 extern void test_frontend_interop_named_locals(void);
 extern void test_frontend_interop_expressions(void);
@@ -232,6 +233,7 @@ int main(void) {
     RUN_TEST(test_frontend_interop_extern_call_to_il);
     RUN_TEST(test_frontend_interop_dom_intrinsics);
     RUN_TEST(test_frontend_interop_routines_spawn);
+    RUN_TEST(test_frontend_interop_duplex_lowering);
     RUN_TEST(test_frontend_interop_event_handler);
     RUN_TEST(test_frontend_interop_named_locals);
     RUN_TEST(test_frontend_interop_expressions);

@@ -17,6 +17,7 @@
 #include "teko_crypto_rsa.h"
 #include "teko_crypto_random.h"
 #include "teko_uuid.h"
+#include "teko_duplex.h"
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -44,7 +45,35 @@
 void teko_rt_emit(const char* s) {
     puts(s ? s : "");
 }
+// Phase 14: print an integer (one per line) — lets concurrency proofs surface i32 results
+// (channel values, statuses) the same way teko_rt_emit surfaces strings.
+void teko_rt_emit_int(long n) {
+    printf("%ld\n", n);
+}
 #endif
+
+// Phase 14 (14.B) — duplex channel surface wrappers. The OP_DUPLEX_* opcodes lower to these
+// (SysV/AAPCS calls); the duplex C runtime (src/runtime/teko_duplex.c) is the source of truth.
+// The handle is the TekoDuplex* carried through the surface as a register-width integer; all
+// values/statuses are i32 at the .tks level. Available on every target (native + wasm reactor).
+long teko_rt_duplex_open(long capacity) {
+    return (long)(intptr_t)teko_duplex_open((uint32_t)capacity);
+}
+long teko_rt_duplex_send(long handle, long endpoint, long value) {
+    return (long)teko_duplex_send((TekoDuplex*)(intptr_t)handle, (int)endpoint, (int32_t)value);
+}
+long teko_rt_duplex_recv(long handle, long endpoint) {
+    int32_t v = 0;
+    (void)teko_duplex_recv((TekoDuplex*)(intptr_t)handle, (int)endpoint, &v);
+    return (long)v; // value (0 when empty/closed — callers probe status via duplex.poll)
+}
+long teko_rt_duplex_poll(long handle, long endpoint) {
+    return (long)teko_duplex_poll((TekoDuplex*)(intptr_t)handle, (int)endpoint);
+}
+long teko_rt_duplex_close(long handle) {
+    teko_duplex_close((TekoDuplex*)(intptr_t)handle);
+    return 0;
+}
 
 // Decode a hex string into a fresh byte buffer (caller frees via free). Sets *out_len.
 // Returns NULL on odd length or a non-hex digit. An empty string decodes to a 0-length

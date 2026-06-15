@@ -45,10 +45,13 @@ void test_teko_duplex_close_drains_then_signals(void) {
     TEST_ASSERT_EQUAL_INT(TEKO_DX_OK, teko_duplex_send(d, 0, 8));
     teko_duplex_close(d);
     TEST_ASSERT_EQUAL_INT(TEKO_DUPLEX_CLOSED, teko_duplex_state(d));
+    // poll is non-consuming: still OK while buffered data remains, even after close.
+    TEST_ASSERT_EQUAL_INT(TEKO_DX_OK, teko_duplex_poll(d, 1));
     // Buffered data is still drained after close (graceful end-of-stream)...
     TEST_ASSERT_EQUAL_INT(TEKO_DX_OK, teko_duplex_recv(d, 1, &v)); TEST_ASSERT_EQUAL_INT32(7, v);
     TEST_ASSERT_EQUAL_INT(TEKO_DX_OK, teko_duplex_recv(d, 1, &v)); TEST_ASSERT_EQUAL_INT32(8, v);
-    // ...then recv reports CLOSED (structured end-of-stream — no hang) instead of EMPTY.
+    // ...then poll/recv report CLOSED (structured end-of-stream — no hang) instead of EMPTY.
+    TEST_ASSERT_EQUAL_INT(TEKO_DX_CLOSED, teko_duplex_poll(d, 1));
     TEST_ASSERT_EQUAL_INT(TEKO_DX_CLOSED, teko_duplex_recv(d, 1, &v));
     // A send on a closed channel is rejected with a structured error.
     TEST_ASSERT_EQUAL_INT(TEKO_DX_CLOSED, teko_duplex_send(d, 0, 99));

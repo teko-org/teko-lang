@@ -69,6 +69,17 @@ typedef enum {
     OP_FUNC_BEGIN = 0x40,
     OP_FUNC_END = 0x41,
 
+    // Phase 14 (14.B): duplex channel ops — a dedicated opcode family (owner decision) for
+    // the `duplex.*` surface. Each lowers to a teko_rt_duplex_* call on the native runner and
+    // to the wasm32 runtime-reactor import on WASM (the duplex C runtime is the single source
+    // of truth). Args are staged via OP_SETARG (0..n-2) + the accumulator (last), exactly like
+    // OP_CALL_RUNTIME; a result (handle / value / status) lands in $w0.
+    OP_DUPLEX_OPEN  = 0x42, // open(capacity) -> handle
+    OP_DUPLEX_SEND  = 0x43, // send(handle, endpoint, value) -> status
+    OP_DUPLEX_RECV  = 0x44, // recv(handle, endpoint) -> value
+    OP_DUPLEX_POLL  = 0x45, // poll(handle, endpoint) -> status (non-consuming)
+    OP_DUPLEX_CLOSE = 0x46, // close(handle) -> 0
+
     // Control Flow and Branches
     OP_JMP = 0x20,
     OP_JMP_IF_FALSE = 0x21,
@@ -131,6 +142,10 @@ typedef struct {
     // linear memory with it (imported from env). Native targets ignore this (they link the
     // same C runtime directly via libteko_rt.a).
     int uses_crypto_ext;
+    // Phase 14 (14.B): 1 if the program uses a `duplex.*` channel op (OP_DUPLEX_*). The native
+    // runner links the duplex C runtime via teko_rt; the WASM backend imports it from the
+    // runtime reactor + shares linear memory. Duplex-free programs stay byte-identical.
+    int uses_duplex;
     // Phase 14 (14.A): 1 if the program fires background tasks via a `routines { … }`
     // block (lowered to OP_SPAWN_ASYNC). The backends then ensure the cooperative
     // scheduler is drained before the program exits: WASM emits `call $teko_sched_run`
@@ -168,6 +183,8 @@ void codegen_li_emit_func_end(BytecodeBuffer* buffer);
 // Phase 14 (14.A): fire the routine whose table slot is in $w0 as a background task.
 // Sets buffer->uses_spawn so the backends drain the scheduler before program exit.
 void codegen_li_emit_spawn_async(BytecodeBuffer* buffer);
+// Phase 14 (14.B): emit a duplex op (one of OP_DUPLEX_*); sets buffer->uses_duplex.
+void codegen_li_emit_duplex(BytecodeBuffer* buffer, OpCode op);
 void codegen_li_emit_halt(BytecodeBuffer* buffer);
 
 #endif // CODEGEN_LI_H

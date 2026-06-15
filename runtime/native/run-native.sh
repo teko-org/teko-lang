@@ -75,6 +75,14 @@ worker ran
 worker ran
 EXP
 )"
+# Phase 14 (14.B): duplex channel — bidirectional (0->1 then 1->0) + a structured CLOSED
+# status (3) from poll() after close, instead of blocking. Lowers to OP_DUPLEX_* -> teko_rt.
+check duplex.tks "$(cat <<'EXP'
+111
+222
+3
+EXP
+)"
 # FIPS 180-4 SHA-256("abc") known-answer vector.
 check hash_sha256.tks "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
 
