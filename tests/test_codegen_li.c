@@ -42,3 +42,53 @@ void test_bytecode_emission_and_constant_pooling(void) {
     free(stmt.data.var_decl.initializer_raw);
     codegen_li_free_context(buffer);
 }
+
+// Phase 11 (Browser FFI frontend FE-A): import table dedup + interop emit helpers.
+// Models the IL a parser would emit for `log("hi")` where
+// `extern fn log(msg) from "env" as "log"`: SCONST &"hi" -> CALL_IMPORT #0 -> HALT.
+void test_codegen_li_import_table_and_interop_emit(void) {
+    BytecodeBuffer* buffer = codegen_li_create_context();
+    TEST_ASSERT_NOT_NULL(buffer);
+
+    // Import table dedup by (ns, name).
+    int i0 = codegen_li_add_import(buffer, "env", "log", 1, 0);
+    int i1 = codegen_li_add_import(buffer, "env", "log", 1, 0); // duplicate
+    int i2 = codegen_li_add_import(buffer, "dom", "setText", 3, 0);
+    TEST_ASSERT_EQUAL_INT(0, i0);
+    TEST_ASSERT_EQUAL_INT(0, i1);
+    TEST_ASSERT_EQUAL_INT(1, i2);
+    TEST_ASSERT_EQUAL_INT(2, buffer->import_count);
+    TEST_ASSERT_EQUAL_STRING("env", buffer->imports[0].ns);
+    TEST_ASSERT_EQUAL_STRING("log", buffer->imports[0].name);
+    TEST_ASSERT_EQUAL_INT(1, buffer->imports[0].n_params);
+    TEST_ASSERT_EQUAL_INT(0, buffer->imports[0].has_result);
+
+    // Emit: SCONST &"hi" (pool 0) -> CALL_IMPORT #0 -> HALT.
+    int s = codegen_li_add_string_constant(buffer, "hi");
+    TEST_ASSERT_EQUAL_INT(0, s);
+    codegen_li_emit_sconst(buffer, s);
+    codegen_li_emit_call_import(buffer, i0);
+    codegen_li_emit_halt(buffer);
+
+    // Expected bytes: 0x02 00000000 | 0x09 00000000 | 0x00
+    TEST_ASSERT_EQUAL_INT(11, buffer->size);
+    const unsigned char expected[] = {
+        0x02, 0x00, 0x00, 0x00, 0x00, // OP_SCONST 0
+        0x09, 0x00, 0x00, 0x00, 0x00, // OP_CALL_IMPORT 0
+        0x00                          // OP_HALT
+    };
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(expected, buffer->code, sizeof(expected));
+
+    // setarg/iconst/func_begin/func_end helpers emit the right opcodes too.
+    int before = buffer->size;
+    codegen_li_emit_setarg(buffer, 2);
+    TEST_ASSERT_EQUAL_UINT8(OP_SETARG, buffer->code[before]);
+    TEST_ASSERT_EQUAL_UINT8(2, buffer->code[before + 1]);
+    int b2 = buffer->size;
+    codegen_li_emit_func_begin(buffer, 0);
+    codegen_li_emit_func_end(buffer);
+    TEST_ASSERT_EQUAL_UINT8(OP_FUNC_BEGIN, buffer->code[b2]);
+    TEST_ASSERT_EQUAL_UINT8(OP_FUNC_END, buffer->code[b2 + 5]);
+
+    codegen_li_free_context(buffer);
+}

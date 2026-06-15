@@ -16,6 +16,10 @@ BytecodeBuffer* codegen_li_create_context(void) {
     buffer->pool.count = 0;
     buffer->pool.strings = (char**)malloc(sizeof(char*) * buffer->pool.capacity);
 
+    buffer->import_capacity = 8;
+    buffer->import_count = 0;
+    buffer->imports = (TekoILImport*)malloc(sizeof(TekoILImport) * buffer->import_capacity);
+
     return buffer;
 }
 
@@ -54,6 +58,73 @@ int codegen_li_add_string_constant(BytecodeBuffer* buffer, const char* str) {
 
     buffer->pool.strings[buffer->pool.count] = strdup(str);
     return buffer->pool.count++;
+}
+
+// Registers a host import (deduped by ns+name); returns its table index.
+int codegen_li_add_import(BytecodeBuffer* buffer, const char* ns, const char* name,
+                          int n_params, int has_result) {
+    if (!buffer || !ns || !name) return -1;
+
+    for (int i = 0; i < buffer->import_count; i++) {
+        if (strcmp(buffer->imports[i].ns, ns) == 0 &&
+            strcmp(buffer->imports[i].name, name) == 0) {
+            return i;
+        }
+    }
+
+    if (buffer->import_count >= buffer->import_capacity) {
+        buffer->import_capacity *= 2;
+        buffer->imports = (TekoILImport*)realloc(buffer->imports,
+                                                 sizeof(TekoILImport) * buffer->import_capacity);
+    }
+
+    TekoILImport* im = &buffer->imports[buffer->import_count];
+    im->ns = strdup(ns);
+    im->name = strdup(name);
+    im->n_params = n_params;
+    im->has_result = has_result;
+    return buffer->import_count++;
+}
+
+// --- IL emit helpers for the interop lowering (parser → IL) ---
+void codegen_li_emit_iconst(BytecodeBuffer* buffer, int value) {
+    if (!buffer) return;
+    emit_byte(buffer, OP_ICONST);
+    emit_int(buffer, value);
+}
+
+void codegen_li_emit_sconst(BytecodeBuffer* buffer, int pool_index) {
+    if (!buffer) return;
+    emit_byte(buffer, OP_SCONST);
+    emit_int(buffer, pool_index);
+}
+
+void codegen_li_emit_setarg(BytecodeBuffer* buffer, int slot) {
+    if (!buffer) return;
+    emit_byte(buffer, OP_SETARG);
+    emit_int(buffer, slot);
+}
+
+void codegen_li_emit_call_import(BytecodeBuffer* buffer, int import_index) {
+    if (!buffer) return;
+    emit_byte(buffer, OP_CALL_IMPORT);
+    emit_int(buffer, import_index);
+}
+
+void codegen_li_emit_func_begin(BytecodeBuffer* buffer, int routine_id) {
+    if (!buffer) return;
+    emit_byte(buffer, OP_FUNC_BEGIN);
+    emit_int(buffer, routine_id);
+}
+
+void codegen_li_emit_func_end(BytecodeBuffer* buffer) {
+    if (!buffer) return;
+    emit_byte(buffer, OP_FUNC_END);
+}
+
+void codegen_li_emit_halt(BytecodeBuffer* buffer) {
+    if (!buffer) return;
+    emit_byte(buffer, OP_HALT);
 }
 
 // Recursively traverses the AST and emits ISA instructions based on virtual registers
@@ -163,5 +234,10 @@ void codegen_li_free_context(BytecodeBuffer* buffer) {
         if (buffer->pool.strings[i]) free(buffer->pool.strings[i]);
     }
     free(buffer->pool.strings);
+    for (int i = 0; i < buffer->import_count; i++) {
+        if (buffer->imports[i].ns) free(buffer->imports[i].ns);
+        if (buffer->imports[i].name) free(buffer->imports[i].name);
+    }
+    free(buffer->imports);
     free(buffer);
 }

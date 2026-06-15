@@ -62,12 +62,27 @@ typedef struct {
     int capacity;
 } ConstantStringPool;
 
+// Phase 11 (Browser FFI frontend): a host import the IL declares, lowered from an
+// `extern fn … from "ns" as "name"` (or a `@dom`/`@js` intrinsic). The WASM backend
+// turns each into an `(import "ns" "name" (func …))`; OP_CALL_IMPORT carries the
+// index into this table. Kept frontend-side so the parser populates it directly.
+typedef struct {
+    char* ns;        // import module/namespace, e.g. "env" or "dom"
+    char* name;      // imported field, e.g. "log" or "setText"
+    int n_params;    // i32 params
+    int has_result;  // 1 if it returns an i32
+} TekoILImport;
+
 // Structure representing the final binary bytecode buffer in memory
 typedef struct {
     unsigned char* code;
     int size;
     int capacity;
     ConstantStringPool pool;
+    // Phase 11: the import table populated from `extern`/`@dom` declarations.
+    TekoILImport* imports;
+    int import_count;
+    int import_capacity;
 } BytecodeBuffer;
 
 // Public functions of the IL Bytecode Emitter
@@ -76,5 +91,20 @@ void codegen_li_emit_statement(BytecodeBuffer* buffer, const StatementASTNode* s
 int codegen_li_add_string_constant(BytecodeBuffer* buffer, const char* str);
 void codegen_li_write_to_file(const BytecodeBuffer* buffer, const char* filename);
 void codegen_li_free_context(BytecodeBuffer* buffer);
+
+// Phase 11 (Browser FFI frontend): register a host import (deduped by ns+name) and
+// return its table index — the arg for OP_CALL_IMPORT.
+int codegen_li_add_import(BytecodeBuffer* buffer, const char* ns, const char* name,
+                          int n_params, int has_result);
+
+// Phase 11 (Browser FFI frontend): IL emit helpers used by the parser→IL lowering of
+// the interop surface. Each appends to `buffer->code`.
+void codegen_li_emit_iconst(BytecodeBuffer* buffer, int value);
+void codegen_li_emit_sconst(BytecodeBuffer* buffer, int pool_index);
+void codegen_li_emit_setarg(BytecodeBuffer* buffer, int slot);
+void codegen_li_emit_call_import(BytecodeBuffer* buffer, int import_index);
+void codegen_li_emit_func_begin(BytecodeBuffer* buffer, int routine_id);
+void codegen_li_emit_func_end(BytecodeBuffer* buffer);
+void codegen_li_emit_halt(BytecodeBuffer* buffer);
 
 #endif // CODEGEN_LI_H

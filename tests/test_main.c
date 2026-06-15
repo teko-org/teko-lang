@@ -30,6 +30,7 @@ extern void test_required_properties_validation(void);
 extern void test_type_compatibility_assignment(void);
 extern void test_let_immutability_protection(void);
 extern void test_bytecode_emission_and_constant_pooling(void);
+extern void test_codegen_li_import_table_and_interop_emit(void);
 extern void test_di_lifetime_arena_assignment(void);
 extern void test_escape_analysis_region_promotion(void);
 extern void test_implicit_precision_coercion_for_arbitrary_types(void);
@@ -139,6 +140,7 @@ int main(void) {
     RUN_TEST(test_type_compatibility_assignment);
     RUN_TEST(test_let_immutability_protection);
     RUN_TEST(test_bytecode_emission_and_constant_pooling);
+    RUN_TEST(test_codegen_li_import_table_and_interop_emit);
     RUN_TEST(test_di_lifetime_arena_assignment);
     RUN_TEST(test_escape_analysis_region_promotion);
     RUN_TEST(test_implicit_precision_coercion_for_arbitrary_types);
