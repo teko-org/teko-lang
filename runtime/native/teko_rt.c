@@ -9,6 +9,7 @@
 #include "teko_crypto_aes_gcm.h"
 #include "teko_crypto_chachapoly.h"
 #include "teko_crypto_ed25519.h"
+#include "teko_crypto_x25519.h"
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -277,5 +278,20 @@ char* teko_rt_ed25519_verify(const char* pub_hex, const char* msg_hex, const cha
     free(pub); free(msg); free(sig);
     char* out = (char*)malloc(2);
     if (out) { out[0] = ok ? '1' : '0'; out[1] = '\0'; }
+    return out;
+}
+
+// --- Key exchange: X25519 --------------------------------------------------------
+char* teko_rt_x25519(const char* scalar_hex, const char* u_hex) {
+    size_t sl = 0, ul = 0;
+    uint8_t* scalar = teko_rt_from_hex(scalar_hex, &sl);
+    uint8_t* u = teko_rt_from_hex(u_hex, &ul);
+    char* out = NULL;
+    if (scalar && u && sl == TEKO_X25519_LEN && ul == TEKO_X25519_LEN) {
+        uint8_t shared[TEKO_X25519_LEN];
+        teko_x25519(shared, scalar, u);
+        out = teko_rt_to_hex(shared, TEKO_X25519_LEN);
+    }
+    free(scalar); free(u);
     return out;
 }

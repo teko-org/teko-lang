@@ -79,4 +79,11 @@ check sign_ed25519.tks "$(cat <<'EXP'
 EXP
 )"
 
+# X25519 ECDH (RFC 7748 §5 test vectors 1 & 2).
+check x25519.tks "$(cat <<'EXP'
+c3da55379de9c6908e94ea4df28d084f32eccf03491c71f754b4075577a28552
+95cbde9476e8907d7aade45cb4b873f88b595a68799fa152e6f8f7647aac7957
+EXP
+)"
+
 echo "All native runner proofs passed."

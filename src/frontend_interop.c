@@ -347,6 +347,8 @@ static int codec_id_for(const char* lex) {
     // verify(pubHex, msgHex, sigHex) -> "1" (valid) | "0" (invalid).
     if (strcmp(lex, "crypto.ed25519_sign") == 0) return 24;
     if (strcmp(lex, "crypto.ed25519_verify") == 0) return 25;
+    // Key exchange — X25519 (RFC 7748). x25519(scalarHex, uHex) -> sharedHex. id 26.
+    if (strcmp(lex, "crypto.x25519") == 0) return 26;
     // Legacy hashes (insecure — interop only): in-module WAT runtimes, ids 6/7.
     if (strcmp(lex, "hash.md5") == 0) return 6;
     if (strcmp(lex, "hash.sha1") == 0) return 7;
@@ -371,6 +373,7 @@ static int runtime_arity(int id) {
         case 20: case 21: case 22: case 23: return 4; // AEAD: key, nonce, aad, msg/ct‖tag
         case 24: return 2; // ed25519_sign(seed, msg)
         case 25: return 3; // ed25519_verify(pub, msg, sig)
+        case 26: return 2; // x25519(scalar, u)
         default: return 1;
     }
 }

@@ -64,4 +64,8 @@ char* teko_rt_chacha20poly1305_open(const char* key_hex, const char* nonce_hex,
 char* teko_rt_ed25519_sign(const char* seed_hex, const char* msg_hex);
 char* teko_rt_ed25519_verify(const char* pub_hex, const char* msg_hex, const char* sig_hex);
 
+// Key exchange — X25519 (OP_CALL_RUNTIME id 26). x25519(scalarHex, uHex) -> 32-byte shared
+// secret as hex. Both inputs must be 32 bytes; returns NULL on a malformed length.
+char* teko_rt_x25519(const char* scalar_hex, const char* u_hex);
+
 #endif // TEKO_RT_H

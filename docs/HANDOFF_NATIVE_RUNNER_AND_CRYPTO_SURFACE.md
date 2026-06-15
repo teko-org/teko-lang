@@ -60,8 +60,11 @@
   `crypto.ed25519_verify` (id 25, arity 3: pubHex, msgHex, sigHex → `"1"`/`"0"`). Proven by
   `runtime/native/samples/sign_ed25519.tks` against RFC 8032 Test 3 (deterministic signature
   reproduced exactly; valid→1; tampered→0) on macOS arm64 + Linux x86_64/arm64.
+- **Sub-phase B, step 6 — X25519 ECDH native surface: DONE.** `crypto.x25519(scalarHex, uHex)`
+  (id 26, arity 2) → 32-byte shared-secret hex. Proven by `runtime/native/samples/x25519.tks`
+  against RFC 7748 §5 vectors 1 & 2 on macOS arm64 + Linux x86_64/arm64.
 - **Sub-phase B — REMAINING:** SHAKE (msg,len), ECDSA P-256/384 sign/verify, RSA-PSS
-  sign/verify, RSA-OAEP encrypt/decrypt, X25519/ECDH, KDF (HKDF/PBKDF2), RNG (`random.bytes`).
+  sign/verify, RSA-OAEP encrypt/decrypt, KDF (HKDF/PBKDF2), RNG (`random.bytes`).
   Each: `codec_id_for` id + `runtime_arity` + `teko_native_runtime_symbol` entry + `teko_rt_*`
   wrapper (hex-at-surface) + an executable `.tks` KAT in `run-native.sh`. The established
   pattern (see AEAD/HMAC/Ed25519) scales directly; 8 staging slots cover all current arities.
