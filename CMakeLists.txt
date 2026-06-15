@@ -118,6 +118,7 @@ set(TEST_SOURCES
         tests/test_semantics.c
         tests/test_statement.c
         tests/test_strings.c
+        tests/test_lexer_phase12.c
         tests/test_target.c
         tests/test_teko_il.c
         tests/test_tooling.c

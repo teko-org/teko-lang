@@ -21,7 +21,28 @@ static KeywordMap keywords[] = {
     {"decorates", TOKEN_DECORATES}, {"extend", TOKEN_EXTEND}, {"command", TOKEN_COMMAND},
     {"handler", TOKEN_HANDLER}, {"notification", TOKEN_NOTIFICATION}, {"with", TOKEN_WITH},
     {"query", TOKEN_QUERY}, {"operator", TOKEN_OPERATOR}, {"pub", TOKEN_PUB},
-    {NULL, TOKEN_UNKNOWN}, {"required", TOKEN_REQD},
+    {"required", TOKEN_REQD},
+    // Phase 12 — reserved keyword matrix.
+    // Resilience:
+    {"circuit", TOKEN_CIRCUIT}, {"fallback", TOKEN_FALLBACK}, {"delayed", TOKEN_DELAYED},
+    {"retry", TOKEN_RETRY}, {"exponential", TOKEN_EXPONENTIAL}, {"logarithmic", TOKEN_LOGARITHMIC},
+    {"attempts", TOKEN_ATTEMPTS}, {"timeout", TOKEN_TIMEOUT},
+    // OOP & concurrency:
+    {"class", TOKEN_CLASS}, {"abstract", TOKEN_ABSTRACT}, {"trait", TOKEN_TRAIT},
+    {"event", TOKEN_EVENT}, {"raise", TOKEN_RAISE}, {"subscribe", TOKEN_SUBSCRIBE},
+    {"fanout", TOKEN_FANOUT}, {"fire_and_forget", TOKEN_FIRE_AND_FORGET}, {"shared", TOKEN_SHARED},
+    {"atomic", TOKEN_ATOMIC}, {"routines", TOKEN_ROUTINES}, {"duplex", TOKEN_DUPLEX},
+    // Web:
+    {"api", TOKEN_API}, {"middleware", TOKEN_MIDDLEWARE}, {"get", TOKEN_GET},
+    {"post", TOKEN_POST}, {"put", TOKEN_PUT}, {"delete", TOKEN_DELETE},
+    {"rpc", TOKEN_RPC}, {"websocket", TOKEN_WEBSOCKET},
+    // Tooling:
+    {"parse", TOKEN_PARSE}, {"json", TOKEN_JSON}, {"csv", TOKEN_CSV}, {"xml", TOKEN_XML},
+    {"html", TOKEN_HTML}, {"bundle", TOKEN_BUNDLE}, {"minify", TOKEN_MINIFY},
+    {"crypto", TOKEN_CRYPTO}, {"hash", TOKEN_HASH}, {"encrypt", TOKEN_ENCRYPT},
+    // Core:
+    {"comptime", TOKEN_COMPTIME}, {"soa", TOKEN_SOA},
+    {NULL, TOKEN_UNKNOWN}, // sentinel — MUST be last (the lookup loop stops here)
 };
 
 // Initializes the lexer

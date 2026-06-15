@@ -17,6 +17,24 @@ typedef enum {
     TOKEN_COMMAND, TOKEN_HANDLER, TOKEN_NOTIFICATION, TOKEN_WITH, TOKEN_QUERY,
     TOKEN_OPERATOR, TOKEN_PUB, TOKEN_REQD,
 
+    // Phase 12 — reserved keyword matrix (recognition only; lowering lands in the
+    // respective feature phases 13–16).
+    // Resilience:
+    TOKEN_CIRCUIT, TOKEN_FALLBACK, TOKEN_DELAYED, TOKEN_RETRY,
+    TOKEN_EXPONENTIAL, TOKEN_LOGARITHMIC, TOKEN_ATTEMPTS, TOKEN_TIMEOUT,
+    // OOP & concurrency:
+    TOKEN_CLASS, TOKEN_ABSTRACT, TOKEN_TRAIT, TOKEN_EVENT, TOKEN_RAISE,
+    TOKEN_SUBSCRIBE, TOKEN_FANOUT, TOKEN_FIRE_AND_FORGET, TOKEN_SHARED,
+    TOKEN_ATOMIC, TOKEN_ROUTINES, TOKEN_DUPLEX,
+    // Web:
+    TOKEN_API, TOKEN_MIDDLEWARE, TOKEN_GET, TOKEN_POST, TOKEN_PUT,
+    TOKEN_DELETE, TOKEN_RPC, TOKEN_WEBSOCKET,
+    // Tooling:
+    TOKEN_PARSE, TOKEN_JSON, TOKEN_CSV, TOKEN_XML, TOKEN_HTML,
+    TOKEN_BUNDLE, TOKEN_MINIFY, TOKEN_CRYPTO, TOKEN_HASH, TOKEN_ENCRYPT,
+    // Core:
+    TOKEN_COMPTIME, TOKEN_SOA,
+
     TOKEN_STRING_LIT,       // common "text" or traditional """multiline"""
     TOKEN_STRING_INTERPOLATED,    // common `text {expr}` or interpolated ```multiline```
     TOKEN_STRING_RAW_LIT,         // $"text" or $"""multiline""" (ignores escapes)
