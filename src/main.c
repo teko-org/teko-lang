@@ -7,6 +7,70 @@
 #include "codegen/tld_elf.h"
 #include "codegen/tld_elf_arch.h"
 #include "codegen/tld_symbols.h"
+#include "codegen_li.h"
+#include "codegen_li_wasm.h"
+#include "frontend_interop.h"
+
+// Read an entire file into a NUL-terminated heap string (caller frees). NULL on error.
+static char* read_file_to_string(const char* path) {
+    FILE* f = fopen(path, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    if (n < 0) { fclose(f); return NULL; }
+    fseek(f, 0, SEEK_SET);
+    char* buf = (char*)malloc((size_t)n + 1);
+    if (!buf) { fclose(f); return NULL; }
+    size_t got = fread(buf, 1, (size_t)n, f);
+    buf[got] = '\0';
+    fclose(f);
+    return buf;
+}
+
+// Phase 11 (Browser FFI frontend FE-D): real .tks -> IL -> WASM compile path. No
+// mock bytecode: the interop frontend lexes/parses the source, lowers it to IL, and
+// the bridge emits a real .wat (plus auto-generated dom.* glue alongside it).
+static int compile_wasm_source(const char* input_path, const char* out_wat) {
+    char* source = read_file_to_string(input_path);
+    if (!source) {
+        fprintf(stderr, "[Teko WASM]: cannot read source %s\n", input_path);
+        return 1;
+    }
+
+    BytecodeBuffer* buffer = codegen_li_create_context();
+    if (!buffer) { free(source); return 1; }
+
+    if (teko_compile_interop(source, buffer) != 0) {
+        fprintf(stderr, "[Teko WASM]: frontend failed on %s\n", input_path);
+        codegen_li_free_context(buffer);
+        free(source);
+        return 1;
+    }
+
+    TekoTarget target;
+    memset(&target, 0, sizeof target);
+    target.arch = ARCH_WASM32;
+    target.os = OS_WASI;
+    strncpy(target.target_string, "wasm32-wasi", sizeof(target.target_string) - 1);
+
+    // Glue path: "<out_wat without .wat>.glue.mjs" (emitted next to the module).
+    char glue_path[512];
+    size_t wl = strlen(out_wat);
+    if (wl > 4 && strcmp(out_wat + wl - 4, ".wat") == 0) {
+        snprintf(glue_path, sizeof(glue_path), "%.*s.glue.mjs", (int)(wl - 4), out_wat);
+    } else {
+        snprintf(glue_path, sizeof(glue_path), "%s.glue.mjs", out_wat);
+    }
+
+    int rc = codegen_li_emit_wasm(buffer, out_wat, target, glue_path, NULL, NULL, NULL, 0);
+    codegen_li_free_context(buffer);
+    free(source);
+
+    if (rc == 0) {
+        printf("[Teko WASM]: compiled %s -> %s (+ glue %s)\n", input_path, out_wat, glue_path);
+    }
+    return rc;
+}
 
 static uint16_t get_linker_elf_machine(TekoArch arch) {
     switch (arch) {
@@ -31,13 +95,51 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    const char* input_path = argv[1];
     bool stop_at_assembly = false;
     bool stop_at_object = false;
+    bool target_wasm = false;
+    const char* out_path = NULL;
+    const char* input_path = NULL;
 
-    for (int i = 2; i < argc; i++) {
-        if (strcmp(argv[i], "-S") == 0) stop_at_assembly = true;
-        if (strcmp(argv[i], "-c") == 0) stop_at_object = true;
+    // Robust arg scan: the input is the first positional that is neither the
+    // optional `build` subcommand, a flag, nor a flag's value.
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-S") == 0) { stop_at_assembly = true; continue; }
+        if (strcmp(argv[i], "-c") == 0) { stop_at_object = true; continue; }
+        if (strncmp(argv[i], "--target=", 9) == 0) {
+            if (strncmp(argv[i] + 9, "wasm", 4) == 0) target_wasm = true;
+            continue;
+        }
+        if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) { out_path = argv[++i]; continue; }
+        if (strcmp(argv[i], "build") == 0) continue; // optional subcommand
+        if (argv[i][0] == '-') continue;             // unknown flag
+        if (!input_path) input_path = argv[i];       // first positional = input
+    }
+
+    if (!input_path) {
+        fprintf(stderr, "[Fatal Error]: no input file/project given.\n");
+        return 1;
+    }
+
+    // ====================================================================
+    // WASM TARGET: real .tks -> IL -> WASM (Phase 11 Browser FFI; no mock).
+    // ====================================================================
+    if (target_wasm) {
+        char derived[512];
+        if (!out_path) {
+            // Default output: "<input without .tks>.wat" (or "<input>.wat").
+            size_t il = strlen(input_path);
+            if (il > 4 && strcmp(input_path + il - 4, ".tks") == 0) {
+                snprintf(derived, sizeof(derived), "%.*s.wat", (int)(il - 4), input_path);
+            } else {
+                snprintf(derived, sizeof(derived), "%s.wat", input_path);
+            }
+            out_path = derived;
+        }
+        printf("[Teko Pipeline]: WASM target — compiling Teko source directly.\n");
+        int rc = compile_wasm_source(input_path, out_path);
+        if (rc == 0) printf("\n[Compilation Pipeline Executed Successfully].\n");
+        return rc;
     }
 
     // DEFAULT HOST TARGET (can be parameterized via a later flag)

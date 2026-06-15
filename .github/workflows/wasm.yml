@@ -41,10 +41,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y cmake ninja-build clang wabt
           curl https://wasmtime.dev/install.sh -sSf | bash
-      - name: Build the compiler core (Release) -> libteko_core.a
+      - name: Build the compiler core + teko driver (Release)
         run: |
           cmake -S . -B build -G "Ninja" -DCMAKE_C_COMPILER=clang -DCMAKE_BUILD_TYPE=Release
-          cmake --build build --target teko_core --parallel 4
+          cmake --build build --target teko_core teko --parallel 4
       - name: Emit real concurrency modules from the Teko backend
         run: |
           cc -I src runtime/wasm/emit-demo/emit_spawn_channel.c build/libteko_core.a -o emit_spawn_channel
@@ -55,6 +55,8 @@ jobs:
           ./emit_suspend        runtime/wasm/samples/emitted_suspend.wat
           ./emit_multi          runtime/wasm/samples/emitted_multi.wat
           ./emit_ffi            runtime/wasm/samples/emitted_ffi.wat
+      - name: Compile a REAL .tks to WASM with the teko binary (no emit-demo, no mock)
+        run: ./build/teko build runtime/wasm/samples/hello.tks --target=wasm -o runtime/wasm/samples/hello.wat
       - name: Assemble all modules (wat2wasm)
         run: |
           wat2wasm runtime/wasm/samples/channels.wat        -o runtime/wasm/samples/channels.wasm
@@ -63,10 +65,13 @@ jobs:
           wat2wasm runtime/wasm/samples/emitted_suspend.wat -o runtime/wasm/samples/emitted_suspend.wasm
           wat2wasm runtime/wasm/samples/emitted_multi.wat   -o runtime/wasm/samples/emitted_multi.wasm
           wat2wasm runtime/wasm/samples/emitted_ffi.wat     -o runtime/wasm/samples/emitted_ffi.wasm
+          wat2wasm runtime/wasm/samples/hello.wat           -o runtime/wasm/samples/hello.wasm
       - name: Run under Node (channels=42, scheduler=15, emitted=7, suspend=30, multi=15)
         run: node runtime/wasm/run-node.mjs
       - name: Run Browser-FFI proof under Node (host env.log reads pooled string)
         run: node runtime/wasm/run-ffi.mjs
+      - name: Run SOURCE→WASM proof under Node (teko-compiled hello.tks)
+        run: node runtime/wasm/run-source.mjs
       - name: Run allocator stress under Node (alloc/free/coalesce/double-free/reset)
         run: node runtime/wasm/run-alloc.mjs
       - name: Run under wasmtime
