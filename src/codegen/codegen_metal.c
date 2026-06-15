@@ -24,6 +24,7 @@ MetalContext* teko_metal_create(const char* output_asm_path, TekoTarget target) 
     ctx->wasm_import_count = 0;
     ctx->wasm_local_count = 0;
     ctx->wasm_emit_codecs = 0;
+    ctx->wasm_emit_hash = 0;
     return ctx;
 }
 
@@ -47,6 +48,11 @@ void teko_metal_set_local_count(MetalContext* ctx, int count) {
 void teko_metal_set_emit_codecs(MetalContext* ctx, int enabled) {
     if (!ctx) return;
     ctx->wasm_emit_codecs = enabled ? 1 : 0;
+}
+
+void teko_metal_set_emit_hash(MetalContext* ctx, int enabled) {
+    if (!ctx) return;
+    ctx->wasm_emit_hash = enabled ? 1 : 0;
 }
 
 static void teko_metal_route_instruction(MetalContext* ctx, OpCode op, int32_t arg) {

@@ -34,6 +34,8 @@ int codegen_li_emit_wasm(const BytecodeBuffer* buffer, const char* wat_path,
     teko_metal_set_local_count(ctx, buffer->local_count);
     // Phase 12 (P12-G): emit the base64/hex codec runtime only if the program uses it.
     teko_metal_set_emit_codecs(ctx, buffer->uses_codec);
+    // Phase 13 (13.1): emit the in-module SHA hash runtime only if the program uses it.
+    teko_metal_set_emit_hash(ctx, buffer->uses_hash);
 
     teko_metal_emit_program(ctx, buffer->code, (uint32_t)buffer->size);
 

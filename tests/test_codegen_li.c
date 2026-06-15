@@ -453,6 +453,55 @@ void test_frontend_interop_base_encoding(void) {
     codegen_li_free_context(buffer);
 }
 
+// Phase 13.1: hash.sha256(x) lowers like a codec — OP_CALL_RUNTIME id 4 — and the
+// bridge emits the in-module SHA-256 runtime + the shared common helpers, gated on
+// buffer->uses_hash (not uses_codec, so codec-free programs stay lean).
+void test_frontend_interop_hash_sha256(void) {
+    const char* src =
+        "extern fn emit(s) from \"env\" as \"emit\";\n"
+        "emit(hash.sha256(\"abc\"));\n";
+
+    BytecodeBuffer* buffer = codegen_li_create_context();
+    TEST_ASSERT_NOT_NULL(buffer);
+    TEST_ASSERT_EQUAL_INT(0, teko_compile_interop(src, buffer));
+
+    // Hash flag set; codec flag untouched (no base64/hex used here).
+    TEST_ASSERT_EQUAL_INT(1, buffer->uses_hash);
+    TEST_ASSERT_EQUAL_INT(0, buffer->uses_codec);
+
+    int n_runtime = 0, saw_sha256 = 0;
+    for (int i = 0; i < buffer->size; i++) {
+        if (buffer->code[i] == OP_CALL_RUNTIME) {
+            n_runtime++;
+            int id = (int)buffer->code[i + 1]; // 4-byte LE arg; low byte is the id
+            if (id == 4) saw_sha256 = 1;
+        }
+    }
+    TEST_ASSERT_EQUAL_INT(1, n_runtime);
+    TEST_ASSERT_TRUE(saw_sha256);
+
+    TekoTarget target;
+    target.arch = ARCH_WASM32;
+    target.os = OS_WASI;
+    strncpy(target.target_string, "wasm32-wasi", sizeof(target.target_string) - 1);
+    const char* wat = "output_hash.wat";
+    TEST_ASSERT_EQUAL_INT(0, codegen_li_emit_wasm(buffer, wat, target, NULL, NULL, NULL, NULL, 0));
+    FILE* f = fopen(wat, "r");
+    TEST_ASSERT_NOT_NULL(f);
+    char* out = (char*)malloc(65536);
+    memset(out, 0, 65536);
+    size_t n = fread(out, 1, 65535, f); out[n] = '\0'; fclose(f);
+    TEST_ASSERT_NOT_NULL(strstr(out, "(func $teko_sha256_hex (export \"teko_sha256_hex\")"));
+    TEST_ASSERT_NOT_NULL(strstr(out, "call $teko_sha256_hex"));
+    TEST_ASSERT_NOT_NULL(strstr(out, "(func $teko_strlen"));   // shared common runtime
+    TEST_ASSERT_NOT_NULL(strstr(out, "(func $teko_hexc"));     // shared common runtime
+    TEST_ASSERT_NULL(strstr(out, "$teko_base64_encode"));      // codec runtime omitted
+    free(out);
+    remove(wat);
+
+    codegen_li_free_context(buffer);
+}
+
 // Phase 11 (Browser FFI frontend FE-A): import table dedup + interop emit helpers.
 // Models the IL a parser would emit for `log("hi")` where
 // `extern fn log(msg) from "env" as "log"`: SCONST &"hi" -> CALL_IMPORT #0 -> HALT.

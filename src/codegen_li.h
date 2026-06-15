@@ -113,6 +113,9 @@ typedef struct {
     // Phase 12 (P12-G): 1 if the program calls a base64/hex codec, so the backend emits
     // the codec runtime functions (otherwise omitted, keeping lean modules lean).
     int uses_codec;
+    // Phase 13 (13.1): 1 if the program calls a hash primitive (hash.sha256/.sha512), so
+    // the backend emits the in-module SHA runtime (otherwise omitted).
+    int uses_hash;
 } BytecodeBuffer;
 
 // Public functions of the IL Bytecode Emitter

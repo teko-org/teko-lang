@@ -89,3 +89,21 @@ numbering" note: hashes → CSPRNG + HKDF/PBKDF2 → symmetric/AEAD → asymmetr
 **13.1, SHA-256 first** — the smallest foundational primitive, FIPS 180-4 KATs. Lands as a
 KAT-tested C runtime unit before any lowering, establishing the per-primitive template
 (runtime unit → KAT test → CMake/RUN_TEST registration) the rest of the phase repeats.
+
+## Progress — 13.1 (Hashes & MAC)
+- **SHA-256** — C runtime (`teko_crypto_sha2.c`) + FIPS 180-4 KATs (incl. 1M-byte vector,
+  streaming-vs-one-shot). ✅
+- **SHA-512 / SHA-384** — C runtime (`teko_crypto_sha512.c`) + FIPS KATs. ✅
+- **HMAC-SHA-256 / -512** — C runtime (`teko_crypto_hmac.c`) + RFC 4231 KATs. ✅
+- **Language wiring (interleaved, owner-requested early):** `hash.sha256(x)` compiles from
+  **real `.tks`** through the `teko` binary to WASM and runs. It lexes as one dotted
+  identifier (like `base64.encode`), lowers to `OP_CALL_RUNTIME` id 4, and the WASM backend
+  emits an **in-module SHA-256** (`emit_wasm_hash_runtime` in `emit_wasm.c`) — no host
+  crypto, no external deps; the produced module computes the digest itself, mirroring the
+  KAT-tested C reference. Proven by `runtime/wasm/run-hash.mjs` (FIPS 180-4 vectors for
+  `"abc"`, `""`, and the fox sentence) in `wasm.yml`, plus the IL/emit golden
+  `test_frontend_interop_hash_sha256`. A `uses_hash` flag gates the runtime so non-hashing
+  modules stay lean (the shared `$teko_strlen`/`$teko_hexc` helpers were factored into a
+  common block). ✅
+- **Next:** `hash.sha512` WASM lowering (id 5, i64 runtime) + SHA-3 (Keccak/SHAKE) and
+  BLAKE3 C runtimes with KATs, then close 13.1.

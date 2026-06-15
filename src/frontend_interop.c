@@ -319,6 +319,12 @@ static int codec_id_for(const char* lex) {
     if (strcmp(lex, "base64.decode") == 0) return 1;
     if (strcmp(lex, "hex.encode") == 0) return 2;
     if (strcmp(lex, "hex.decode") == 0) return 3;
+    // Phase 13 (13.1): native hash primitives. Same dotted-identifier lowering as the
+    // base codecs — `hash.sha256(x)` takes a string/local/nested value, lowers it to a
+    // NUL-terminated pointer in $w0, then OP_CALL_RUNTIME invokes the in-module SHA-256
+    // runtime which returns a pointer to the lowercase hex digest. (hash.sha512 = id 5,
+    // wired in the next increment alongside its i64 WAT runtime.)
+    if (strcmp(lex, "hash.sha256") == 0) return 4;
     return -1;
 }
 
@@ -356,8 +362,7 @@ static void lower_base_codec(BytecodeBuffer* b, Parser* p, const LowerCtx* ctx) 
     if (p->current_token.type == TOKEN_LPAREN) fe_advance(p);
     lower_codec_value(b, p, ctx);                        // arg ptr -> $w0
     if (p->current_token.type == TOKEN_RPAREN) fe_advance(p);
-    codegen_li_emit_call_runtime(b, id);                 // $w0 = codec($w0)
-    b->uses_codec = 1;
+    codegen_li_emit_call_runtime(b, id);                 // $w0 = codec($w0); sets uses_codec/uses_hash by id
 }
 
 // Skip a whole `extern …;` / `extern { … }` declaration. Needed by the fn scanners
