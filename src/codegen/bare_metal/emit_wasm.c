@@ -520,6 +520,10 @@ void emit_wasm_pure(MetalContext* ctx, OpCode op, int32_t arg) {
             // staging slots (Phase 11 multi-param imports — see OP_SETARG).
             fprintf(f, "    (local $w0 i32) (local $w1 i32) (local $cp i32)\n");
             fprintf(f, "    (local $a0 i32) (local $a1 i32) (local $a2 i32)\n");
+            // Phase 12: named local variables ($v0..$v{n-1}) for `let`/`mut` bindings.
+            for (int v = 0; v < ctx->wasm_local_count; v++) {
+                fprintf(f, "    (local $v%d i32)\n", v);
+            }
             ctx->wasm_open = 1;
             break;
 
@@ -552,6 +556,15 @@ void emit_wasm_pure(MetalContext* ctx, OpCode op, int32_t arg) {
 
         case OP_LOAD:
             fprintf(f, "    local.get $w1\n    local.set $w0\n");
+            break;
+
+        // Phase 12: named local variables ($v0..$vN).
+        case OP_STORE_LOCAL:
+            fprintf(f, "    local.get $w0\n    local.set $v%d\n", arg);
+            break;
+
+        case OP_LOAD_LOCAL:
+            fprintf(f, "    local.get $v%d\n    local.set $w0\n", arg);
             break;
 
         // ====================================================================

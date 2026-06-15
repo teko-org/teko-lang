@@ -74,7 +74,15 @@ foundational pieces unblock a *real* expression frontend and belong early in Pha
 3. **P12-1A** symmetry audit — ✅ done (`decrypt` + base-encoding tokens added; others listed).
 4. **Foundational frontend (D → E → F)** — `let`/`mut` named locals → general expressions
    (Pratt) → multiple nested handle args. *Prerequisite for expressing/calling any feature
-   (e.g. `let s = base64.encode(x)`). Larger; plan reported before landing.*
+   (e.g. `let s = base64.encode(x)`).*
+   - **P12-D — named locals. ✅ done.** New IL ops `OP_LOAD_LOCAL`/`OP_STORE_LOCAL` backed
+     by real WASM locals (`$v0..$vN`, declared at `$main` open; count threaded via
+     `MetalContext`). `let`/`mut NAME [: type] = <init>` → `STORE_LOCAL`; a reference →
+     `LOAD_LOCAL`. Initializers: int/string literals, a `@dom` call result, or another
+     local (full expressions arrive in P12-E). Locals are `$main`-scoped (handlers excluded).
+   - **P12-E — general expressions** (next): Pratt parser over the operator tokens →
+     IL; integer arithmetic + comparisons first (float / `&&`/`||` short-circuit deferred).
+   - **P12-F — multiple nested handle args**: spill intermediates to named locals.
 5. **Base encoding (functional)** — real `base64`/`hex` encode+decode (runtime/intrinsic +
    grammar + executable round-trip test against known vectors). The first clean functional
    win; deterministic, no external deps.

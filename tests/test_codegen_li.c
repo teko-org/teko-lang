@@ -248,6 +248,53 @@ void test_frontend_interop_event_handler(void) {
     codegen_li_free_context(buffer);
 }
 
+// Phase 12 (P12-D): named local variables. `let x = 42; sink(x)` lowers the binding
+// to a named local ($v0) via STORE_LOCAL and reads it back via LOAD_LOCAL.
+void test_frontend_interop_named_locals(void) {
+    const char* src =
+        "extern fn sink(n) from \"env\" as \"sink\";\n"
+        "let x = 42;\n"
+        "sink(x);\n";
+
+    BytecodeBuffer* buffer = codegen_li_create_context();
+    TEST_ASSERT_NOT_NULL(buffer);
+    TEST_ASSERT_EQUAL_INT(0, teko_compile_interop(src, buffer));
+
+    // One named local declared.
+    TEST_ASSERT_EQUAL_INT(1, buffer->local_count);
+
+    // IL: ICONST 42 -> STORE_LOCAL 0 -> (call: LOAD_LOCAL 0 -> CALL_IMPORT 0) -> HALT.
+    const unsigned char expected[] = {
+        0x01, 0x2A, 0x00, 0x00, 0x00, // ICONST 42
+        0x0C, 0x00, 0x00, 0x00, 0x00, // STORE_LOCAL 0
+        0x0B, 0x00, 0x00, 0x00, 0x00, // LOAD_LOCAL 0
+        0x09, 0x00, 0x00, 0x00, 0x00, // CALL_IMPORT 0 (sink)
+        0x00                          // HALT
+    };
+    TEST_ASSERT_EQUAL_INT((int)sizeof(expected), buffer->size);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(expected, buffer->code, sizeof(expected));
+
+    // Through the bridge: $main declares $v0 and uses local.set/get $v0.
+    TekoTarget target;
+    target.arch = ARCH_WASM32;
+    target.os = OS_WASI;
+    strncpy(target.target_string, "wasm32-wasi", sizeof(target.target_string) - 1);
+    const char* wat = "output_locals.wat";
+    TEST_ASSERT_EQUAL_INT(0, codegen_li_emit_wasm(buffer, wat, target, NULL, NULL, NULL, NULL, 0));
+    FILE* f = fopen(wat, "r");
+    TEST_ASSERT_NOT_NULL(f);
+    char* out = (char*)malloc(16384);
+    memset(out, 0, 16384);
+    size_t n = fread(out, 1, 16383, f); out[n] = '\0'; fclose(f);
+    TEST_ASSERT_NOT_NULL(strstr(out, "(local $v0 i32)"));
+    TEST_ASSERT_NOT_NULL(strstr(out, "local.set $v0"));
+    TEST_ASSERT_NOT_NULL(strstr(out, "local.get $v0"));
+    free(out);
+    remove(wat);
+
+    codegen_li_free_context(buffer);
+}
+
 // Phase 11 (Browser FFI frontend FE-A): import table dedup + interop emit helpers.
 // Models the IL a parser would emit for `log("hi")` where
 // `extern fn log(msg) from "env" as "log"`: SCONST &"hi" -> CALL_IMPORT #0 -> HALT.

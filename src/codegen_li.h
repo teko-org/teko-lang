@@ -31,6 +31,14 @@ typedef enum {
     // accumulator), so an N-param import needs N-1 preceding OP_SETARGs.
     OP_SETARG = 0x0A,
 
+    // Phase 12 (Frontend Grammar): named local variables. Each carries a 4-byte
+    // little-endian slot index into the function's named-local file ($v0..$vN). The
+    // WASM emitter declares the locals at function open and lowers:
+    //   OP_STORE_LOCAL n  →  local.set $vn   (from the accumulator $w0)
+    //   OP_LOAD_LOCAL  n  →  local.get $vn → $w0
+    OP_LOAD_LOCAL = 0x0B,
+    OP_STORE_LOCAL = 0x0C,
+
     // Concurrency and Channels
     OP_SPAWN_ASYNC = 0x10,
     OP_AWAIT_INTENT = 0x11,
@@ -83,6 +91,9 @@ typedef struct {
     TekoILImport* imports;
     int import_count;
     int import_capacity;
+    // Phase 12: count of named local variables ($v0..$v{local_count-1}) the program
+    // uses in $main; threaded to the WASM emitter so it declares them at function open.
+    int local_count;
 } BytecodeBuffer;
 
 // Public functions of the IL Bytecode Emitter
@@ -103,6 +114,8 @@ void codegen_li_emit_iconst(BytecodeBuffer* buffer, int value);
 void codegen_li_emit_sconst(BytecodeBuffer* buffer, int pool_index);
 void codegen_li_emit_store(BytecodeBuffer* buffer); // $w1 <- $w0
 void codegen_li_emit_load(BytecodeBuffer* buffer);  // $w0 <- $w1
+void codegen_li_emit_store_local(BytecodeBuffer* buffer, int slot); // $vslot <- $w0
+void codegen_li_emit_load_local(BytecodeBuffer* buffer, int slot);  // $w0 <- $vslot
 void codegen_li_emit_setarg(BytecodeBuffer* buffer, int slot);
 void codegen_li_emit_call_import(BytecodeBuffer* buffer, int import_index);
 void codegen_li_emit_func_begin(BytecodeBuffer* buffer, int routine_id);

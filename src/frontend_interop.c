@@ -81,14 +81,17 @@ static void register_extern(BytecodeBuffer* buffer, const FFIASTNode* node,
     }
 }
 
-// A literal call argument.
-typedef struct { int is_string; char* sval; int ival; } CallArg;
+// A call argument: a string literal, an int literal, or a named local (Phase 12).
+typedef struct { int is_string; char* sval; int ival; int is_local; int slot; } CallArg;
 
 // Lower a resolved call: args 0..n-2 staged via OP_SETARG, the last left in $w0,
-// then OP_CALL_IMPORT. String args are pooled; int args are immediates.
+// then OP_CALL_IMPORT. String args are pooled; int args are immediates; local args
+// load from their named slot.
 static void lower_call(BytecodeBuffer* buffer, int import_index, CallArg* args, int n) {
     for (int i = 0; i < n; i++) {
-        if (args[i].is_string) {
+        if (args[i].is_local) {
+            codegen_li_emit_load_local(buffer, args[i].slot);
+        } else if (args[i].is_string) {
             int s = codegen_li_add_string_constant(buffer, args[i].sval);
             codegen_li_emit_sconst(buffer, s);
         } else {
@@ -122,10 +125,12 @@ typedef struct {
     const char* param_name; // current handler param, or NULL at top level
     ImportBinding* fns;      // handler name -> table slot (idx = slot)
     int nfns;
+    ImportBinding* locals;   // Phase 12: named local -> slot (idx = $v slot)
+    int nlocals;
 } LowerCtx;
 
 // A flat "producer" (one wasm param). kind: 0=ICONST payload, 1=SCONST pool idx,
-// 2=LOAD the handler param ($w0 <- $w1, no payload).
+// 2=LOAD the handler param ($w0 <- $w1), 3=LOAD_LOCAL payload (a named local).
 typedef struct { int kind; int payload; } Prod;
 
 static void lower_intrinsic_call(BytecodeBuffer* buffer, Parser* p, const LowerCtx* ctx); // recursive
@@ -175,8 +180,11 @@ static void lower_intrinsic_call(BytecodeBuffer* buffer, Parser* p, const LowerC
             fe_advance(p);
         } else if (p->current_token.type == TOKEN_IDENTIFIER && np + 1 <= 32) {
             const char* id = p->current_token.lexeme;
+            int lslot = ctx ? bind_lookup(ctx->locals, ctx->nlocals, id) : -1;
             if (ctx && ctx->param_name && strcmp(id, ctx->param_name) == 0) {
                 prods[np].kind = 2; prods[np].payload = 0; np++;            // LOAD handler param
+            } else if (lslot >= 0) {
+                prods[np].kind = 3; prods[np].payload = lslot; np++;        // LOAD_LOCAL (named local)
             } else {
                 int slot = ctx ? bind_lookup(ctx->fns, ctx->nfns, id) : -1;
                 if (slot >= 0) { prods[np].kind = 0; prods[np].payload = slot; np++; } // fn ref -> ICONST slot
@@ -204,6 +212,7 @@ static void lower_intrinsic_call(BytecodeBuffer* buffer, Parser* p, const LowerC
         switch (prods[k].kind) {
             case 1: codegen_li_emit_sconst(buffer, prods[k].payload); break;
             case 2: codegen_li_emit_load(buffer); break;
+            case 3: codegen_li_emit_load_local(buffer, prods[k].payload); break;
             default: codegen_li_emit_iconst(buffer, prods[k].payload); break;
         }
         if (slot < total - 1) codegen_li_emit_setarg(buffer, slot);
@@ -306,6 +315,8 @@ static void emit_handler_routines(const char* source, BytecodeBuffer* buffer,
         ctx.param_name = param[0] ? param : NULL;
         ctx.fns = fns;
         ctx.nfns = nfns;
+        ctx.locals = NULL; // $main's named locals are a different WASM scope
+        ctx.nlocals = 0;
 
         int depth = 1;
         while (p.current_token.type != TOKEN_EOF && depth > 0) {
@@ -339,10 +350,66 @@ int teko_compile_interop(const char* source, BytecodeBuffer* buffer) {
     ImportBinding* fns = NULL;
     int nfns = 0, capfns = 0;
     collect_functions(source, &fns, &nfns, &capfns);
-    LowerCtx top_ctx; top_ctx.param_name = NULL; top_ctx.fns = fns; top_ctx.nfns = nfns;
+
+    // Phase 12: named local variables ($v0..) declared with `let`/`mut` at top level.
+    ImportBinding* locals = NULL;
+    int nlocals = 0, caplocals = 0;
+    LowerCtx top_ctx;
+    top_ctx.param_name = NULL;
+    top_ctx.fns = fns; top_ctx.nfns = nfns;
+    top_ctx.locals = NULL; top_ctx.nlocals = 0; // refreshed before each use below
 
     while (parser.current_token.type != TOKEN_EOF) {
-        if (parser.current_token.type == TOKEN_EXTERN) {
+        // Keep the top-level lowering context's local view current.
+        top_ctx.locals = locals; top_ctx.nlocals = nlocals;
+
+        if ((parser.current_token.type == TOKEN_LET || parser.current_token.type == TOKEN_MUT) &&
+            parser.peek_token.type == TOKEN_IDENTIFIER) {
+            // `let`/`mut NAME [: type] = <initializer>` — a named local binding.
+            fe_advance(&parser); // consume let/mut
+            char lname[96];
+            strncpy(lname, parser.current_token.lexeme, sizeof(lname) - 1);
+            lname[sizeof(lname) - 1] = '\0';
+            fe_advance(&parser); // consume NAME
+            if (parser.current_token.type == TOKEN_COLON) { // optional ': type'
+                fe_advance(&parser);
+                while (parser.current_token.type != TOKEN_ASSIGN &&
+                       parser.current_token.type != TOKEN_QUICK_ASSIGN &&
+                       parser.current_token.type != TOKEN_SEMICOLON &&
+                       parser.current_token.type != TOKEN_EOF) fe_advance(&parser);
+            }
+            if (parser.current_token.type == TOKEN_ASSIGN ||
+                parser.current_token.type == TOKEN_QUICK_ASSIGN) fe_advance(&parser);
+
+            // Assign (or reuse) this name's slot.
+            int s = bind_lookup(locals, nlocals, lname);
+            if (s < 0) { s = nlocals; bind_add(&locals, &nlocals, &caplocals, lname, s); }
+            top_ctx.locals = locals; top_ctx.nlocals = nlocals;
+
+            // Lower the initializer into $w0 (full expressions arrive in P12-E).
+            if (parser.current_token.type == TOKEN_LIT_INT) {
+                codegen_li_emit_iconst(buffer, atoi(parser.current_token.lexeme));
+                fe_advance(&parser);
+            } else if (parser.current_token.type == TOKEN_LIT_STR ||
+                       parser.current_token.type == TOKEN_STRING_LIT) {
+                char* sv = strip_quotes(parser.current_token.lexeme);
+                codegen_li_emit_sconst(buffer, codegen_li_add_string_constant(buffer, sv));
+                free(sv);
+                fe_advance(&parser);
+            } else if (parser.current_token.type == TOKEN_MACRO_IDENT &&
+                       is_dom_macro(parser.current_token.lexeme) &&
+                       parser.peek_token.type == TOKEN_LPAREN) {
+                lower_intrinsic_call(buffer, &parser, &top_ctx); // result handle -> $w0
+            } else if (parser.current_token.type == TOKEN_IDENTIFIER) {
+                int src = bind_lookup(locals, nlocals, parser.current_token.lexeme);
+                if (src >= 0) codegen_li_emit_load_local(buffer, src); // let y = x
+                fe_advance(&parser);
+            } else {
+                fe_advance(&parser); // unsupported initializer in this subset
+            }
+            codegen_li_emit_store_local(buffer, s); // $vs = $w0
+            if (parser.current_token.type == TOKEN_SEMICOLON) fe_advance(&parser);
+        } else if (parser.current_token.type == TOKEN_EXTERN) {
             FFIASTNode* node = parse_extern_declaration(&parser);
             if (node) {
                 register_extern(buffer, node, &binds, &nb, &capb);
@@ -385,12 +452,24 @@ int teko_compile_interop(const char* source, BytecodeBuffer* buffer) {
                     args[nargs].is_string = 1;
                     args[nargs].sval = strip_quotes(parser.current_token.lexeme);
                     args[nargs].ival = 0;
+                    args[nargs].is_local = 0; args[nargs].slot = 0;
                     nargs++;
                     fe_advance(&parser);
                 } else if (nargs < 16 && parser.current_token.type == TOKEN_LIT_INT) {
                     args[nargs].is_string = 0;
                     args[nargs].sval = NULL;
                     args[nargs].ival = atoi(parser.current_token.lexeme);
+                    args[nargs].is_local = 0; args[nargs].slot = 0;
+                    nargs++;
+                    fe_advance(&parser);
+                } else if (nargs < 16 && parser.current_token.type == TOKEN_IDENTIFIER &&
+                           bind_lookup(locals, nlocals, parser.current_token.lexeme) >= 0) {
+                    // A named local passed as a call argument (Phase 12).
+                    args[nargs].is_string = 0;
+                    args[nargs].sval = NULL;
+                    args[nargs].ival = 0;
+                    args[nargs].is_local = 1;
+                    args[nargs].slot = bind_lookup(locals, nlocals, parser.current_token.lexeme);
                     nargs++;
                     fe_advance(&parser);
                 } else if (parser.current_token.type == TOKEN_COMMA) {
@@ -414,6 +493,9 @@ int teko_compile_interop(const char* source, BytecodeBuffer* buffer) {
 
     codegen_li_emit_halt(buffer); // close main
 
+    // Phase 12: tell the backend how many named locals to declare in $main.
+    buffer->local_count = nlocals;
+
     // Emit handler bodies as table routines (after main), so @dom.on references resolve.
     emit_handler_routines(source, buffer, fns, nfns);
 
@@ -421,5 +503,7 @@ int teko_compile_interop(const char* source, BytecodeBuffer* buffer) {
     free(binds);
     for (int i = 0; i < nfns; i++) free(fns[i].name);
     free(fns);
+    for (int i = 0; i < nlocals; i++) free(locals[i].name);
+    free(locals);
     return 0;
 }

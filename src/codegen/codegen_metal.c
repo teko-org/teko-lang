@@ -22,6 +22,7 @@ MetalContext* teko_metal_create(const char* output_asm_path, TekoTarget target) 
     ctx->wasm_string_count = 0;
     ctx->wasm_imports = NULL;
     ctx->wasm_import_count = 0;
+    ctx->wasm_local_count = 0;
     return ctx;
 }
 
@@ -35,6 +36,11 @@ void teko_metal_set_imports(MetalContext* ctx, const TekoWasmImport* imports, in
     if (!ctx) return;
     ctx->wasm_imports = imports;
     ctx->wasm_import_count = (count > 0) ? count : 0;
+}
+
+void teko_metal_set_local_count(MetalContext* ctx, int count) {
+    if (!ctx) return;
+    ctx->wasm_local_count = (count > 0) ? count : 0;
 }
 
 static void teko_metal_route_instruction(MetalContext* ctx, OpCode op, int32_t arg) {
@@ -100,7 +106,8 @@ static int count_routine_yields(const unsigned char* il, uint32_t start, uint32_
         if (op == OP_FUNC_END) break;
         if (op == OP_CHAN_GET) yields++;
         if (op == OP_ICONST || op == OP_SCONST || op == OP_JMP || op == OP_JMP_IF_FALSE ||
-            op == OP_FUNC_BEGIN || op == OP_CALL_IMPORT || op == OP_SETARG) p += 5;
+            op == OP_FUNC_BEGIN || op == OP_CALL_IMPORT || op == OP_SETARG ||
+            op == OP_LOAD_LOCAL || op == OP_STORE_LOCAL) p += 5;
         else p += 1;
     }
     return yields;
@@ -157,7 +164,8 @@ static void process_linear_il_bytes(MetalContext* ctx, const unsigned char* byte
         }
 
         if (op == OP_ICONST || op == OP_SCONST || op == OP_JMP || op == OP_JMP_IF_FALSE ||
-            op == OP_FUNC_BEGIN || op == OP_CALL_IMPORT || op == OP_SETARG) scan += 5;
+            op == OP_FUNC_BEGIN || op == OP_CALL_IMPORT || op == OP_SETARG ||
+            op == OP_LOAD_LOCAL || op == OP_STORE_LOCAL) scan += 5;
         else scan += 1;
     }
 
@@ -174,7 +182,8 @@ static void process_linear_il_bytes(MetalContext* ctx, const unsigned char* byte
         }
 
         if (op == OP_ICONST || op == OP_SCONST || op == OP_JMP || op == OP_JMP_IF_FALSE ||
-            op == OP_FUNC_BEGIN || op == OP_CALL_IMPORT || op == OP_SETARG) {
+            op == OP_FUNC_BEGIN || op == OP_CALL_IMPORT || op == OP_SETARG ||
+            op == OP_LOAD_LOCAL || op == OP_STORE_LOCAL) {
             arg = read_le_int32(local_il, current_op_index + 1);
             i += 4;
         }
@@ -215,17 +224,17 @@ static void process_linear_il_bytes(MetalContext* ctx, const unsigned char* byte
             }
             else if (op == OP_STORE || op == OP_LOAD || op == OP_SPAWN_ASYNC ||
                      op == OP_CHAN_INIT || op == OP_CHAN_GET || op == OP_CALL_IMPORT ||
-                     op == OP_SETARG) {
+                     op == OP_SETARG || op == OP_STORE_LOCAL || op == OP_LOAD_LOCAL) {
                 last_arith_op = (OpCode)0;
             }
 
             // Any op that overwrites the accumulator with a *non-constant* value
             // invalidates the ICONST CSE cache — otherwise a later `ICONST k` that
             // matches a stale accum_last_value gets wrongly skipped while $w0 in
-            // fact holds a string ptr / load / call result. (SETARG/STORE only read
-            // $w0 or write $w1, so they leave the cache intact.)
+            // fact holds a string ptr / load / call result. (SETARG/STORE/STORE_LOCAL
+            // only read $w0 or write elsewhere, so they leave the cache intact.)
             if (op == OP_SCONST || op == OP_LOAD || op == OP_CHAN_GET ||
-                op == OP_CALL_IMPORT) {
+                op == OP_CALL_IMPORT || op == OP_LOAD_LOCAL) {
                 accum_has_value = false;
             }
         }

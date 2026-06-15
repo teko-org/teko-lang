@@ -20,6 +20,8 @@ BytecodeBuffer* codegen_li_create_context(void) {
     buffer->import_count = 0;
     buffer->imports = (TekoILImport*)malloc(sizeof(TekoILImport) * buffer->import_capacity);
 
+    buffer->local_count = 0;
+
     return buffer;
 }
 
@@ -113,6 +115,18 @@ void codegen_li_emit_store(BytecodeBuffer* buffer) {
 void codegen_li_emit_load(BytecodeBuffer* buffer) {
     if (!buffer) return;
     emit_byte(buffer, OP_LOAD);  // $w0 <- $w1
+}
+
+void codegen_li_emit_store_local(BytecodeBuffer* buffer, int slot) {
+    if (!buffer) return;
+    emit_byte(buffer, OP_STORE_LOCAL);
+    emit_int(buffer, slot);
+}
+
+void codegen_li_emit_load_local(BytecodeBuffer* buffer, int slot) {
+    if (!buffer) return;
+    emit_byte(buffer, OP_LOAD_LOCAL);
+    emit_int(buffer, slot);
 }
 
 void codegen_li_emit_call_import(BytecodeBuffer* buffer, int import_index) {

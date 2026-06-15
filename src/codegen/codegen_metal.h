@@ -46,6 +46,9 @@ typedef struct {
     // OP_CALL_IMPORT to `call $import_<idx>`. Unused by the native emitters.
     const TekoWasmImport* wasm_imports;
     int wasm_import_count;
+    // Phase 12 (Frontend Grammar): number of named local variables ($v0..$v{n-1}) to
+    // declare in $main. 0 = none (legacy/emit-demo programs). Unused by native emitters.
+    int wasm_local_count;
 } MetalContext;
 
 // Phase 11: hand the WASM emitter the IL string pool before teko_metal_emit_program
@@ -57,6 +60,10 @@ void teko_metal_set_strings(MetalContext* ctx, const char** strings, int count);
 // so it can declare `(import …)` and lower OP_CALL_IMPORT. `imports` must outlive the
 // emit call.
 void teko_metal_set_imports(MetalContext* ctx, const TekoWasmImport* imports, int count);
+
+// Phase 12: declare `count` named local i32 variables ($v0..$v{count-1}) in $main.
+// Call before teko_metal_emit_program; 0 (or not calling) keeps the legacy behavior.
+void teko_metal_set_local_count(MetalContext* ctx, int count);
 
 // Phase 11 (Browser FFI MVP-2): write an auto-generated JS glue module to `path`
 // that implements the `dom.*` host imports currently set on `ctx` (via

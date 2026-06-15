@@ -30,6 +30,9 @@ int codegen_li_emit_wasm(const BytecodeBuffer* buffer, const char* wat_path,
         teko_metal_set_imports(ctx, wimports, buffer->import_count);
     }
 
+    // Phase 12: declare the program's named locals in $main.
+    teko_metal_set_local_count(ctx, buffer->local_count);
+
     teko_metal_emit_program(ctx, buffer->code, (uint32_t)buffer->size);
 
     // Auto-generated host glue / facade (before close — close frees ctx).
