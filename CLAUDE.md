@@ -7,7 +7,8 @@ polymorphic backend lowers to **16 native emitters** (ELF / Mach-O / PE-COFF) pl
 canonical docs rather than duplicating them.
 
 ## Canonical docs (read these for depth)
-- `docs/plan.md` — the phased roadmap (Phases 1–19; WASM Concurrency = Phase 10, done).
+- `docs/plan.md` — the phased roadmap (Phases 1–21; WASM Concurrency = Phase 10 done, Browser
+  FFI = Phase 11 merged, Frontend Grammar = Phase 12 current, Native Cryptography = Phase 13 planned).
 - `docs/ARCHITECTURE.md` — compiler architecture; `docs/BACKEND_AOT_PLAN.md`, `docs/vm_plan.md`.
 - `README.md` → **Supported Targets** — the 16 emitters + WASM A/B with honest CI status.
 - `docs/PHASE10_WASM_CONCURRENCY.md` — the WASM concurrency backend design.
@@ -90,8 +91,10 @@ output locally (the goldens only `strstr`; always *assemble + run*, never trust 
 - **Required-check phantom-block** with path filters → solved with the always-running `gate` job
   (above). Require only the gates.
 - **Roadmap:** the "WASM Concurrency Backend" was reclassified from a tech-debt item to its own
-  **Phase 10** (merged via PR #3). Browser FFI / JS-DOM interop is the **current phase**
-  (Phase 11; `docs/PHASE_BROWSER_FFI.md`).
+  **Phase 10** (merged via PR #3). Browser FFI / JS-DOM interop = **Phase 11** (merged via PR #4).
+  **Phase 12** (Frontend Grammar & Lexer Extension) is the **current phase** (PR #5;
+  `docs/PHASE12_FRONTEND_GRAMMAR.md`). **Phase 13 = Native Cryptography** (dedicated, planned —
+  symmetric + asymmetric, owner-requested); the old 13–20 shifted to 14–21 (Self-Hosting = 21).
 - **Browser FFI backend AND a real `.tks` frontend are built.** The WASM backend lowers the
   full Browser FFI surface (imports, DOM, events, allocator, facade), and the frontend now
   compiles real source for it: `teko build <f>.tks --target=wasm` lexes/parses/lowers the
@@ -101,11 +104,13 @@ output locally (the goldens only `strstr`; always *assemble + run*, never trust 
   features beyond the source subset remain exercised via the `emit-demo/*.c` drivers.
 
 ## Current state / next
-Phase 10 (WASM concurrency, Layers A & B) is **merged and CI-green**. **Phase 11 (Browser FFI /
-JS-DOM interop) is complete and CI-green** on branch `feat/browser-ffi-interop` (PR #4, awaiting
-human merge): MVP-1a string pool `(data …)`, MVP-1b `extern → (import …)` + `OP_CALL_IMPORT`,
-MVP-2 DOM (`dom.*` multi-arg imports + `OP_SETARG` + auto-generated `.glue.mjs`), MVP-3 JS→Teko
-events (`dom.on` + exported `teko_invoke`), MVP-4 real freeing allocator
-(`teko_alloc`/`teko_free`/`teko_reset`, free-list + coalescing) + `teko_invoke2` + JS→Teko
-strings + ergonomic facade (`<mod>.mjs`) + rich event payload (`dom.on_value`). All proven via
-emit-demos under Node + headless Chromium (Playwright). See `docs/PHASE_BROWSER_FFI.md`.
+Phases 10 (WASM concurrency) and 11 (Browser FFI / JS-DOM interop, incl. the real `.tks → IL →
+WASM` interop frontend) are **merged and CI-green** (PR #3, PR #4). **Phase 12 (Frontend Grammar
+& Lexer Extension) is current** on branch `feat/phase-12-frontend-grammar` (PR #5):
+done so far — the reserved keyword matrix → tokens (P12-A, incl. the `keywords[]` sentinel fix),
+native literal unit suffixes (P12-B; time/data/bandwidth, longest-match), and the symmetry-audit
+tokens (P12-1A; `decrypt` + base-encoding `encode`/`decode`/`base64`/`base32`/`hex`). Next:
+foundational frontend (named locals → general expressions → multiple nested args), then base
+encoding made **functional**. Crypto keywords (`crypto`/`hash`/`encrypt`/`decrypt`) are
+**reserved → lowering in Phase 13** (Native Cryptography, planned). See
+`docs/PHASE12_FRONTEND_GRAMMAR.md`.

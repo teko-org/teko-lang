@@ -39,10 +39,11 @@ A pass over the matrix for transform pairs without a counterpart:
 ### Governing rule (from this point on)
 **No token ships "dead."** Every new token must come with grammar + functional logic +
 an executable test, **or** be explicitly marked *reserved — lowering in Phase X* in the
-status table below. The existing recognition-only keywords are all **reserved**:
-resilience/concurrency/OOP → Phases 13–14; web → Phase 16; comptime/soa → Phase 15;
-crypto (`crypto`/`hash`/`encrypt`/`decrypt`/`sign`/`verify`) → crypto phase (14/16). The
-base-encoding set is the first group to become **functional** within Phase 12 (block C).
+status table below. The existing recognition-only keywords are all **reserved** (post-renumber): crypto
+(`crypto`/`hash`/`encrypt`/`decrypt`, and `sign`/`verify` once added) → **Phase 13 (Native
+Cryptography)**; resilience/concurrency → Phase 14; OOP → Phase 15; comptime/soa → Phase 16;
+web → Phase 17. The base-encoding set (`encode`/`decode` over `base64`/`base32`/`hex`) is
+**not** cryptography and is the first group to become **functional** within Phase 12.
 
 ### 2. Native literal suffixes (zero runtime cost, captured in the lexer)
 - **Time:** `ms`, `s`, `m`, `h`, `d`

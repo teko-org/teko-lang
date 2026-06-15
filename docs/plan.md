@@ -4,9 +4,10 @@
 > progress. Phase 9 is the Technical Debt Resolution hardening track (from
 > `TECH_DEBT_BACKLOG.md`). Phase 10 is the WASM Concurrency Backend feature
 > (delivered — merged via PR #3). Phase 11 is the Browser FFI / JS-DOM Interop
-> feature (current; `docs/PHASE_BROWSER_FFI.md`). Phases 12–19 were derived from the
-> project owner's roadmap memorandum (`TEKO_COMPILER_MEMORANDUM.txt`). The
-> Self-Containment (Self-Hosting) milestone is the final phase, 20.
+> feature (merged via PR #4; `docs/PHASE_BROWSER_FFI.md`). Phase 12 (Frontend Grammar)
+> is current (PR #5). Phase 13 is the dedicated Native Cryptography phase (planned).
+> The memorandum-derived language phases are 12 and 14–21 (`TEKO_COMPILER_MEMORANDUM.txt`).
+> The Self-Containment (Self-Hosting) milestone is the final phase, 21.
 
 ## 📚 Documentation Map
 
@@ -15,12 +16,12 @@ To stop the planning docs from drifting, here is the single source of truth for 
 | Document | Role | Status |
 |----------|------|--------|
 | [`README.md`](../README.md) | Project overview, features, quick start | Canonical (user-facing) |
-| **`docs/plan.md`** (this file) | The roadmap — phases 1–20, current status | **Canonical (roadmap)** |
+| **`docs/plan.md`** (this file) | The roadmap — phases 1–21, current status | **Canonical (roadmap)** |
 | [`docs/ARCHITECTURE.md`](./ARCHITECTURE.md) | Compiler pipeline & module/file map | **Canonical (architecture)** |
 | [`docs/PHASE10_WASM_CONCURRENCY.md`](./PHASE10_WASM_CONCURRENCY.md) | Phase 10 design & implementation (delivered) | Canonical (feature design) |
 | [`docs/PHASE_BROWSER_FFI.md`](./PHASE_BROWSER_FFI.md) | Phase 11 design & plan (Browser FFI / JS-DOM interop) | Canonical (feature design) |
 | [`TECH_DEBT_BACKLOG.md`](../TECH_DEBT_BACKLOG.md) | Prioritized maintenance backlog | Canonical (tech debt) |
-| [`TEKO_COMPILER_MEMORANDUM.txt`](../TEKO_COMPILER_MEMORANDUM.txt) | Owner's checkpoint memorandum; source of phases 12–19 | Reference / historical |
+| [`TEKO_COMPILER_MEMORANDUM.txt`](../TEKO_COMPILER_MEMORANDUM.txt) | Owner's checkpoint memorandum; source of phases 12 & 14–21 | Reference / historical |
 | [`docs/vm_plan.md`](./vm_plan.md) | Phase 3 (VM & debugger) sprint detail | Reference / historical (phase delivered) |
 | [`docs/BACKEND_AOT_PLAN.md`](./BACKEND_AOT_PLAN.md) | Phase 5 AOT backend spec (target matrix, ABIs, per-opcode requirements) | Reference (backend spec) |
 | [`PITCH.md`](../PITCH.md) / [`PITCH-pt-br.md`](../PITCH-pt-br.md) | Marketing pitch (EN / PT-BR) | Reference |
@@ -205,16 +206,24 @@ This document establishes the definitive technical roadmap for the final develop
 └──────────────┬───────────────┘
                ▼
 ┌──────────────────────────────┐
-│  PHASE 11: BROWSER FFI/JS-DOM │ ➔ extern→imports, string-pool data, JS/DOM interop (current)
+│  PHASE 11: BROWSER FFI/JS-DOM │ ➔ extern→imports, string-pool data, JS/DOM interop (merged PR #4)
 └──────────────┬───────────────┘
                ▼
 ┌──────────────────────────────┐
-│  PHASES 12–19: LANG SURFACE   │ ➔ Grammar, Concurrency, OOP, Optionals, Web/Crypto,
+│  PHASE 12: FRONTEND GRAMMAR   │ ➔ Keyword matrix, literal suffixes, real frontend (current — PR #5)
+└──────────────┬───────────────┘
+               ▼
+┌──────────────────────────────┐
+│  PHASE 13: NATIVE CRYPTOGRAPHY│ ➔ Symmetric + asymmetric ciphers, hashes, KDFs (planned)
+└──────────────┬───────────────┘
+               ▼
+┌──────────────────────────────┐
+│  PHASES 14–20: LANG SURFACE   │ ➔ Concurrency, OOP, Optionals, Networking/Web,
 │  (from the Memorandum roadmap)│   Parsers/Templates, Interop, Native Testing
 └──────────────┬───────────────┘
                ▼
 ┌──────────────────────────────┐
-│  PHASE 20: SELF-CONTAINMENT   │ ➔ Compiler Bootstrapping (Rewrite from C to Teko)
+│  PHASE 21: SELF-CONTAINMENT   │ ➔ Compiler Bootstrapping (Rewrite from C to Teko)
 └──────────────────────────────┘
 ```
 
@@ -261,7 +270,7 @@ To support the native features of massive M:N concurrency, blocking channels, an
 ---
 
 ## 🧹 PHASE 9: Technical Debt Resolution
-*Promoted to the first post-runtime phase: harden what is already built before expanding the language surface in Phases 12–19. Source: `TECH_DEBT_BACKLOG.md`. To be tackled continuously alongside the feature phases. Priority = (Impact + Risk) × (6 − Effort).*
+*Promoted to the first post-runtime phase: harden what is already built before expanding the language surface in Phases 12–21. Source: `TECH_DEBT_BACKLOG.md`. To be tackled continuously alongside the feature phases. Priority = (Impact + Risk) × (6 − Effort).*
 
 > ✅ **Build blocker RESOLVED 2026-06-13:** the `teko` executable target in `CMakeLists.txt`
 > was missing `target_include_directories(teko PRIVATE src)` (only `teko_core` and `teko_tests`
@@ -325,9 +334,9 @@ intrinsics, strings, and `fn` event handlers compile from source. **Phase 11 com
 
 ---
 
-# 🧬 Roadmap from the Memorandum (Phases 12–19)
+# 🧬 Roadmap from the Memorandum (Phases 12 & 14–21)
 
-These phases were lifted from the project owner's roadmap memorandum (`TEKO_COMPILER_MEMORANDUM.txt`, Sections 2–4 — the long-term conceptual requirements, the reserved keyword matrix, and the immediate next steps). They expand the **language surface** that sits on top of the now-validated backend/runtime, and must land before the Self-Hosting milestone.
+These phases were lifted from the project owner's roadmap memorandum (`TEKO_COMPILER_MEMORANDUM.txt`, Sections 2–4 — the long-term conceptual requirements, the reserved keyword matrix, and the immediate next steps). They expand the **language surface** that sits on top of the now-validated backend/runtime, and must land before the Self-Hosting milestone. **Phase 13 (Native Cryptography)** is interleaved here as a dedicated, owner-requested phase (not from the memorandum) — it is sequenced after Phase 12 and owns all cipher/hash/KDF work formerly bundled into the networking phase.
 
 ---
 
@@ -348,9 +357,57 @@ Inject the full token table the Lexer and Parser must mandatorily process:
 ### 3. Native Literal Suffixes (Literal Add-ons)
 *   Captured in the Lexer with zero runtime cost: Time (`ms`, `s`, `m`, `h`, `d`), Data (`b`, `kb`, `mb`, `gb`), and socket Bandwidth (`kbps`, `mbps`, `gbps`).
 
+> **Crypto keywords are reserved here, lowered in Phase 13.** Phase 12 tokenizes
+> `crypto`, `hash`, `encrypt`, `decrypt` (and will reserve `sign`/`verify` when added)
+> as **reserved — lowering in Phase 13 (Native Cryptography)**. Base encoding
+> (`encode`/`decode` over `base64`/`base32`/`hex`) is **not** cryptography and ships
+> **functional within Phase 12** (deterministic, no external deps).
+
 ---
 
-## 🧵 PHASE 13: Advanced Concurrency, Signaling & Duplex Channels
+## 🔐 PHASE 13: Native Cryptography — *Planned (implementation gated until Phase 12 closes)*
+*A dedicated phase: implement the widest practical set of **symmetric** and **asymmetric**
+ciphers natively — no external libraries, no OpenSSL. Pure Teko/C primitives that every
+backend (the 16 native emitters + WASM) can emit, with constant-time discipline where it
+matters and test-vector-driven proof (NIST/RFC KATs + round-trips). This phase owns the
+cryptography moved out of the old "Networking, Web & Cryptography" phase (now Phase 17,
+Networking & Web), which consumes these primitives for TLS 1.3.*
+
+**Surface (Teko keywords):** `crypto`, `hash`, `encrypt`/`decrypt`, `sign`/`verify`
+(to be added), `encode`/`decode` interop with Phase 12 base codecs. Each lands with
+grammar + functional logic + executable KAT tests — never a dead token.
+
+### Sub-phases (proposed order — easiest/foundational first)
+- **13.1 — Hashes & MAC primitives.** SHA-256, SHA-512, SHA-3 (Keccak), BLAKE3, and
+  HMAC over them. Foundational (KDFs, signatures, AEAD all depend on these). Pure,
+  deterministic, KAT-friendly → *most viable native, do first.*
+- **13.2 — Symmetric / AEAD.** ChaCha20-Poly1305 (RFC 8439) first (no hardware dep,
+  portable), then AES-128/192/256 in CTR / CBC / GCM. AES is viable in software
+  (T-tables or, preferably, bitsliced/constant-time); AES-NI/hardware acceleration is a
+  later optimization, not a correctness requirement.
+- **13.3 — KDF / utility & CSPRNG.** HKDF, PBKDF2 (cheap once HMAC exists), then the
+  memory-hard scrypt / Argon2 (harder). A platform CSPRNG (`getrandom`/`BCryptGenRandom`/
+  `arc4random` + WASM host import). Sequenced before asymmetric (key generation needs it).
+- **13.4 — Asymmetric.** Curve25519 family first — **X25519** (key exchange) and
+  **Ed25519** (signatures): fixed-field, well-specified, no big-int-asymmetry headaches →
+  *most viable native asymmetric.* Then NIST curves **ECDSA/ECDH P-256/P-384**. **RSA**
+  (PKCS#1 v1.5, OAEP, PSS) last — needs a bignum (multi-precision) layer, which is the
+  largest/hardest native piece.
+
+### Viability notes (native, no libs)
+- **Most viable / do early:** SHA-2/SHA-3/BLAKE3, HMAC, HKDF/PBKDF2, ChaCha20-Poly1305,
+  X25519, Ed25519 — all fixed-width, KAT-verifiable, no bignum.
+- **Harder:** AES constant-time (bitslicing) + GCM (GF(2^128) car­ryless mul), P-256/P-384
+  (modular field + point arithmetic), scrypt/Argon2 (memory-hard).
+- **Hardest:** RSA — requires a full multi-precision bignum (Montgomery mul, modexp) and
+  careful padding; gate as the final sub-phase.
+
+*Effort: large, multi-increment, spanning several sub-phases. Implementation begins only
+after Phase 12 is complete and the cipher coverage below is signed off.*
+
+---
+
+## 🧵 PHASE 14: Advanced Concurrency, Signaling & Duplex Channels
 *Native concurrency primitives beyond the base M:N scheduler delivered in Phase 8.*
 
 *   `routines`: Fire pure background tasks and executions at the runtime level.
@@ -365,7 +422,7 @@ Inject the full token table the Lexer and Parser must mandatorily process:
 
 ---
 
-## 🧱 PHASE 14: Bare-Metal Object-Oriented Paradigm
+## 🧱 PHASE 15: Bare-Metal Object-Oriented Paradigm
 *Object orientation with zero runtime reflection overhead.*
 
 *   Support for Concrete, Generic (`<T>` via monomorphization), and Abstract classes.
@@ -375,7 +432,7 @@ Inject the full token table the Lexer and Parser must mandatorily process:
 
 ---
 
-## 🎯 PHASE 15: Zero-Overhead Optionals & Compile-Time Metaprogramming
+## 🎯 PHASE 16: Zero-Overhead Optionals & Compile-Time Metaprogramming
 
 *   Nullability `?T` via packed Value Types. The Elvis operator (`??`) compiles directly to hardware conditional instructions (`je`/`cbz`).
 *   `comptime`: Code execution at build time. Metaprogramming happens during compilation.
@@ -384,23 +441,20 @@ Inject the full token table the Lexer and Parser must mandatorily process:
 
 ---
 
-## 🌐 PHASE 16: Native Networking, Web Architecture & Cryptography
-*Comprehensive networking from OSI Layer 4 to Layer 7, plus the native web keyword surface and hardware-accelerated cryptography.*
+## 🌐 PHASE 17: Native Networking & Web Architecture
+*Comprehensive networking from OSI Layer 4 to Layer 7, plus the native web keyword surface. Cryptography is its own dedicated phase — see **Phase 13: Native Cryptography**; TLS 1.3 below consumes Phase 13's cipher/KDF/CSPRNG primitives.*
 
 ### 1. Networking Stack
 *   Raw sockets, asynchronous TCP, UDP, and QUIC via io_uring/kqueue/IOCP.
-*   Native TLS 1.3 embedded in the IP bus.
+*   Native TLS 1.3 embedded in the IP bus (built on the Phase 13 cryptographic primitives).
 *   Integrated polyglot routing and handling spanning HTTP/1.x, HTTP/2, HTTP/3, HTTP/4, bidirectional WebSockets (`ws_chan`), and gRPC (RPC).
 
 ### 2. Native Web Architecture by Keywords
 *   Expressive syntax for APIs and micro-applications (`api`, `middleware`, `get`, `post`, `put`, `delete`, `rpc`, `websocket`, `use`). Generation of static Radix trees compiled AOT.
 
-### 3. Hardware-Accelerated Cryptography (AES-NI/AVX)
-*   SHA256, SHA512, BLAKE3, AES256-GCM, CHACHA20-POLY1305, ED25519, and RSA.
-
 ---
 
-## 🧩 PHASE 17: Enterprise Parsers & Embedded Template Compiler
+## 🧩 PHASE 18: Enterprise Parsers & Embedded Template Compiler
 
 *   Linear O(1), reflection-free execution: `parse.json`, `parse.csv`, `parse.xml`.
 *   Native Template Engine integrated via rich String Literals: `html"""..."""`.
@@ -408,7 +462,7 @@ Inject the full token table the Lexer and Parser must mandatorily process:
 
 ---
 
-## 🔗 PHASE 18: Interoperability & Rich Metadata (`.teko_meta`)
+## 🔗 PHASE 19: Interoperability & Rich Metadata (`.teko_meta`)
 
 *   Lookup via `include_paths`, `static_links`, and `dynamic_links` in the `.tkp`.
 *   Teko modules embed rich type metadata in the `.teko_meta` section.
@@ -417,18 +471,18 @@ Inject the full token table the Lexer and Parser must mandatorily process:
 
 ---
 
-## 🧪 PHASE 19: Native Testing (`.tkt`) & Code Coverage
+## 🧪 PHASE 20: Native Testing (`.tkt`) & Code Coverage
 
 *   `.tkt` extension for co-located test files (same tree as the object under test). The release build ignores these files automatically.
 *   Native Code Coverage via codegen-assisted instrumentation, injecting counters into RAM at the start of each Basic Block. The linker embeds the `.teko_cov_map` section associating counters with code lines. The runtime dumps the counters at process end in a binary format (`.tkcov`).
 
 ---
 
-# 🔄 Final Milestone (Phase 20)
+# 🔄 Final Milestone (Phase 21)
 
 ---
 
-## 🔄 PHASE 20: Self-Containment (Self-Hosting / Bootstrapping)
+## 🔄 PHASE 21: Self-Containment (Self-Hosting / Bootstrapping)
 *The final step that crowns the industrial maturity of a systems programming language: using the language itself to compile itself.*
 
 ### 1. Translating the Compiler Modules from C to Teko
