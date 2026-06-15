@@ -57,4 +57,11 @@ char* teko_rt_chacha20poly1305_seal(const char* key_hex, const char* nonce_hex,
 char* teko_rt_chacha20poly1305_open(const char* key_hex, const char* nonce_hex,
                                     const char* aad_hex, const char* ct_tag_hex);
 
+// Signatures — Ed25519 (OP_CALL_RUNTIME ids 24/25). sign takes a 32-byte hex seed and a hex
+// message, derives the public key, and returns the 64-byte signature as hex. verify takes a
+// 32-byte hex public key, hex message, and 64-byte hex signature; returns "1" if valid, "0"
+// otherwise (or on malformed input).
+char* teko_rt_ed25519_sign(const char* seed_hex, const char* msg_hex);
+char* teko_rt_ed25519_verify(const char* pub_hex, const char* msg_hex, const char* sig_hex);
+
 #endif // TEKO_RT_H

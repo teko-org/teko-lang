@@ -343,6 +343,10 @@ static int codec_id_for(const char* lex) {
     if (strcmp(lex, "crypto.aes_gcm_open") == 0) return 21;
     if (strcmp(lex, "crypto.chacha20poly1305_seal") == 0) return 22;
     if (strcmp(lex, "crypto.chacha20poly1305_open") == 0) return 23;
+    // Signatures — Ed25519 (ids 24/25). sign(seedHex, msgHex) -> sigHex;
+    // verify(pubHex, msgHex, sigHex) -> "1" (valid) | "0" (invalid).
+    if (strcmp(lex, "crypto.ed25519_sign") == 0) return 24;
+    if (strcmp(lex, "crypto.ed25519_verify") == 0) return 25;
     // Legacy hashes (insecure — interop only): in-module WAT runtimes, ids 6/7.
     if (strcmp(lex, "hash.md5") == 0) return 6;
     if (strcmp(lex, "hash.sha1") == 0) return 7;
@@ -365,6 +369,8 @@ static int runtime_arity(int id) {
     switch (id) {
         case 17: case 18: case 19: return 2; // hmac.sha256/384/512
         case 20: case 21: case 22: case 23: return 4; // AEAD: key, nonce, aad, msg/ct‖tag
+        case 24: return 2; // ed25519_sign(seed, msg)
+        case 25: return 3; // ed25519_verify(pub, msg, sig)
         default: return 1;
     }
 }

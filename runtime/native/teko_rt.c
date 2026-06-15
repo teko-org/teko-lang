@@ -8,6 +8,7 @@
 #include "teko_crypto_aes.h"
 #include "teko_crypto_aes_gcm.h"
 #include "teko_crypto_chachapoly.h"
+#include "teko_crypto_ed25519.h"
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -244,5 +245,37 @@ char* teko_rt_chacha20poly1305_open(const char* key_hex, const char* nonce_hex,
         }
     }
     free(k); free(n); free(a); free(ct);
+    return out;
+}
+
+// --- Signatures: Ed25519 ---------------------------------------------------------
+char* teko_rt_ed25519_sign(const char* seed_hex, const char* msg_hex) {
+    size_t sl = 0, ml = 0;
+    uint8_t* seed = teko_rt_from_hex(seed_hex, &sl);
+    uint8_t* msg = teko_rt_from_hex(msg_hex, &ml);
+    char* out = NULL;
+    if (seed && msg && sl == TEKO_ED25519_SEED_LEN) {
+        uint8_t pub[TEKO_ED25519_PUB_LEN];
+        uint8_t sig[TEKO_ED25519_SIG_LEN];
+        teko_ed25519_pubkey(pub, seed);
+        teko_ed25519_sign(sig, msg, ml, seed, pub);
+        out = teko_rt_to_hex(sig, TEKO_ED25519_SIG_LEN);
+    }
+    free(seed); free(msg);
+    return out;
+}
+
+char* teko_rt_ed25519_verify(const char* pub_hex, const char* msg_hex, const char* sig_hex) {
+    size_t pl = 0, ml = 0, gl = 0;
+    uint8_t* pub = teko_rt_from_hex(pub_hex, &pl);
+    uint8_t* msg = teko_rt_from_hex(msg_hex, &ml);
+    uint8_t* sig = teko_rt_from_hex(sig_hex, &gl);
+    int ok = 0;
+    if (pub && msg && sig && pl == TEKO_ED25519_PUB_LEN && gl == TEKO_ED25519_SIG_LEN) {
+        ok = (teko_ed25519_verify(sig, msg, ml, pub) == 0);
+    }
+    free(pub); free(msg); free(sig);
+    char* out = (char*)malloc(2);
+    if (out) { out[0] = ok ? '1' : '0'; out[1] = '\0'; }
     return out;
 }

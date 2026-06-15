@@ -31,6 +31,8 @@ const char* teko_native_runtime_symbol(int32_t id, int* out_arity) {
         case 21: sym = "teko_rt_aes_gcm_open";            arity = 4; break; // (key,nonce,aad,ct‖tag)
         case 22: sym = "teko_rt_chacha20poly1305_seal";   arity = 4; break;
         case 23: sym = "teko_rt_chacha20poly1305_open";   arity = 4; break;
+        case 24: sym = "teko_rt_ed25519_sign";   arity = 2; break; // (seed, msg)
+        case 25: sym = "teko_rt_ed25519_verify"; arity = 3; break; // (pub, msg, sig)
         case 6: sym = "teko_rt_md5_hex";       break; // legacy
         case 7: sym = "teko_rt_sha1_hex";      break; // legacy
         case 8: sym = "teko_rt_uuid_v3";       break;

@@ -70,4 +70,13 @@ d31a8d34648e60db7b86afbc53ef7ec2a4aded51296e08fea9e2b5a736ee62d63dbea45e8ca96712
 EXP
 )"
 
+# Ed25519 sign/verify (RFC 8032 Test 3): deterministic signature, valid verify (1),
+# tampered verify (0).
+check sign_ed25519.tks "$(cat <<'EXP'
+6291d657deec24024827e69c3abe01a30ce548a284743a445e3680d7db5ac3ac18ff9b538d16f290ae67f760984dc6594a7c15e9716ed28dc027beceea1ec40a
+1
+0
+EXP
+)"
+
 echo "All native runner proofs passed."
