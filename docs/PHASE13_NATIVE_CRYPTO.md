@@ -105,5 +105,20 @@ KAT-tested C runtime unit before any lowering, establishing the per-primitive te
   `test_frontend_interop_hash_sha256`. A `uses_hash` flag gates the runtime so non-hashing
   modules stay lean (the shared `$teko_strlen`/`$teko_hexc` helpers were factored into a
   common block). ✅
-- **Next:** `hash.sha512` WASM lowering (id 5, i64 runtime) + SHA-3 (Keccak/SHAKE) and
-  BLAKE3 C runtimes with KATs, then close 13.1.
+- **SHA-3 / SHAKE** — C runtime (`teko_crypto_sha3.c`): Keccak-f[1600] sponge, SHA3-256/512
+  + SHAKE128/256 XOFs, FIPS 202 KATs (+ chunked-absorb / byte-squeeze equivalence). ✅
+- **BLAKE3** — C runtime (`teko_crypto_blake3.c`): chunk/parent tree + CV stack, official
+  test vectors (0/1/3/64/1024/2048/3072 — multi-chunk trees) + streaming equivalence. ✅
+
+**13.1 status: hash + MAC primitives complete** (SHA-256, SHA-512/384, SHA-3/SHAKE, BLAKE3,
+HMAC), each KAT-tested in C, with the `hash.sha256` language surface proven executable from
+real `.tks`. Deferred to the start of the next sub-phase (not blocking 13.1 close): wiring
+`hash.sha512` / `hash.sha3_256` / `hash.blake3` to the WASM backend (the C runtimes are the
+source of truth; only `sha256` has its WASM lowering so far). Suite 109/109; all four CI
+gates green.
+
+## Next: 13.3a — CSPRNG + cheap KDF (HKDF, PBKDF2)
+HKDF (RFC 5869) and PBKDF2 (RFC 6070) drop straight onto the HMAC primitive; the platform
+CSPRNG (`getrandom`/`BCryptGenRandom`/`arc4random` + WASM host import) lands alongside. Then
+13.2 (ChaCha20-Poly1305 → AES). **Owner gates still pending before their sub-steps:**
+constant-time AES strategy (before 13.2 AES) and the RSA bignum layer (before 13.3b RSA).

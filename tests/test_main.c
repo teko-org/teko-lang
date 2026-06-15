@@ -120,6 +120,8 @@ extern void test_teko_crypto_sha512_streaming_matches_oneshot(void);
 extern void test_teko_crypto_hmac_rfc4231_vectors(void);
 extern void test_teko_crypto_sha3_known_answer_vectors(void);
 extern void test_teko_crypto_shake_known_answer_vectors(void);
+extern void test_teko_crypto_blake3_known_answer_vectors(void);
+extern void test_teko_crypto_blake3_streaming_matches_oneshot(void);
 
 int main(void) {
     // Unbuffered output: stream every line live so a crash on a CI runner shows
@@ -250,6 +252,8 @@ int main(void) {
     RUN_TEST(test_teko_crypto_hmac_rfc4231_vectors);
     RUN_TEST(test_teko_crypto_sha3_known_answer_vectors);
     RUN_TEST(test_teko_crypto_shake_known_answer_vectors);
+    RUN_TEST(test_teko_crypto_blake3_known_answer_vectors);
+    RUN_TEST(test_teko_crypto_blake3_streaming_matches_oneshot);
 
     return UNITY_END();
 }
