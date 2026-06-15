@@ -80,6 +80,15 @@ typedef enum {
     OP_DUPLEX_POLL  = 0x45, // poll(handle, endpoint) -> status (non-consuming)
     OP_DUPLEX_CLOSE = 0x46, // close(handle) -> 0
 
+    // Phase 14 (14.C): delayed (timed) channel ops — same dedicated-opcode + teko_rt_delayed_*
+    // / reactor-import lowering as the duplex family.
+    OP_DELAYED_OPEN    = 0x47, // open(capacity) -> handle
+    OP_DELAYED_SEND    = 0x48, // send(handle, value, delay) -> status
+    OP_DELAYED_ADVANCE = 0x49, // advance(handle, dt) -> new logical time
+    OP_DELAYED_RECV    = 0x4A, // recv(handle) -> value (earliest due)
+    OP_DELAYED_POLL    = 0x4B, // poll(handle) -> status (non-consuming)
+    OP_DELAYED_CLOSE   = 0x4C, // close(handle) -> 0
+
     // Control Flow and Branches
     OP_JMP = 0x20,
     OP_JMP_IF_FALSE = 0x21,
@@ -146,6 +155,9 @@ typedef struct {
     // runner links the duplex C runtime via teko_rt; the WASM backend imports it from the
     // runtime reactor + shares linear memory. Duplex-free programs stay byte-identical.
     int uses_duplex;
+    // Phase 14 (14.C): 1 if the program uses a `delayed.*` timed-channel op (OP_DELAYED_*).
+    // Same backend wiring as uses_duplex (native teko_rt link / WASM reactor import).
+    int uses_delayed;
     // Phase 14 (14.A): 1 if the program fires background tasks via a `routines { … }`
     // block (lowered to OP_SPAWN_ASYNC). The backends then ensure the cooperative
     // scheduler is drained before the program exits: WASM emits `call $teko_sched_run`
@@ -185,6 +197,8 @@ void codegen_li_emit_func_end(BytecodeBuffer* buffer);
 void codegen_li_emit_spawn_async(BytecodeBuffer* buffer);
 // Phase 14 (14.B): emit a duplex op (one of OP_DUPLEX_*); sets buffer->uses_duplex.
 void codegen_li_emit_duplex(BytecodeBuffer* buffer, OpCode op);
+// Phase 14 (14.C): emit a delayed-channel op (one of OP_DELAYED_*); sets buffer->uses_delayed.
+void codegen_li_emit_delayed(BytecodeBuffer* buffer, OpCode op);
 void codegen_li_emit_halt(BytecodeBuffer* buffer);
 
 #endif // CODEGEN_LI_H

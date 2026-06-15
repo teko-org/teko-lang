@@ -1,0 +1,26 @@
+// Phase 14 (14.C) native runner — `delayed.*` timed channel.
+// Messages are stamped with a delivery time (now + delay) and released in delivery-time order
+// as the logical clock advances (a timer tick). Sent out of order (30@30, 10@10, 20@20), they
+// come back in time order (10, 20, 30). Lowers to OP_DELAYED_* → teko_rt_delayed_* over the C
+// runtime. poll() before the clock reaches a message yields a structured NOT_READY (1).
+extern fn emit_int(n: i32) from "teko_rt" as "teko_rt_emit_int";
+
+let d = delayed.open(8);
+delayed.send(d, 30, 30);
+delayed.send(d, 10, 10);
+delayed.send(d, 20, 20);
+
+let p0 = delayed.poll(d);   // nothing due at t=0 → NOT_READY (1)
+emit_int(p0);               // 1
+
+delayed.advance(d, 15);     // t=15: only the @10 message is due
+let a = delayed.recv(d);
+emit_int(a);                // 10
+
+delayed.advance(d, 10);     // t=25
+let b = delayed.recv(d);
+emit_int(b);                // 20
+
+delayed.advance(d, 10);     // t=35
+let c = delayed.recv(d);
+emit_int(c);                // 30

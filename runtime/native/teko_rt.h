@@ -130,4 +130,12 @@ long teko_rt_duplex_recv(long handle, long endpoint);
 long teko_rt_duplex_poll(long handle, long endpoint);
 long teko_rt_duplex_close(long handle);
 
+// Phase 14 (14.C) — delayed (timed) channel surface wrappers (OP_DELAYED_* lower to these).
+long teko_rt_delayed_open(long capacity);
+long teko_rt_delayed_send(long handle, long value, long delay);
+long teko_rt_delayed_advance(long handle, long dt);
+long teko_rt_delayed_recv(long handle);
+long teko_rt_delayed_poll(long handle);
+long teko_rt_delayed_close(long handle);
+
 #endif // TEKO_RT_H

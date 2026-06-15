@@ -747,3 +747,43 @@ void test_frontend_interop_duplex_lowering(void) {
 
     codegen_li_free_context(buffer);
 }
+
+// Phase 14 (14.C): `delayed.*` dotted-identifier calls lower to the dedicated OP_DELAYED_*
+// opcodes, set uses_delayed, and (on WASM) import the reactor entry points over shared memory.
+void test_frontend_interop_delayed_lowering(void) {
+    const char* src =
+        "extern fn emit_int(n: i32) from \"teko_rt\" as \"teko_rt_emit_int\";\n"
+        "let d = delayed.open(8);\n"
+        "delayed.send(d, 10, 10);\n"
+        "delayed.advance(d, 15);\n"
+        "let a = delayed.recv(d);\n"
+        "emit_int(a);\n"
+        "let p = delayed.poll(d);\n"
+        "delayed.close(d);\n";
+
+    BytecodeBuffer* buffer = codegen_li_create_context();
+    TEST_ASSERT_NOT_NULL(buffer);
+    TEST_ASSERT_EQUAL_INT(0, teko_compile_interop(src, buffer));
+
+    TEST_ASSERT_EQUAL_INT(1, buffer->uses_delayed);
+    int n_open = 0, n_send = 0, n_adv = 0, n_recv = 0, n_poll = 0, n_close = 0;
+    for (int i = 0; i < buffer->size; i++) {
+        switch (buffer->code[i]) {
+            case OP_DELAYED_OPEN:    n_open++;  break;
+            case OP_DELAYED_SEND:    n_send++;  break;
+            case OP_DELAYED_ADVANCE: n_adv++;   break;
+            case OP_DELAYED_RECV:    n_recv++;  break;
+            case OP_DELAYED_POLL:    n_poll++;  break;
+            case OP_DELAYED_CLOSE:   n_close++; break;
+            default: break;
+        }
+    }
+    TEST_ASSERT_EQUAL_INT(1, n_open);
+    TEST_ASSERT_EQUAL_INT(1, n_send);
+    TEST_ASSERT_EQUAL_INT(1, n_adv);
+    TEST_ASSERT_EQUAL_INT(1, n_recv);
+    TEST_ASSERT_EQUAL_INT(1, n_poll);
+    TEST_ASSERT_EQUAL_INT(1, n_close);
+    // (The WASM emission of these opcodes is asserted once the reactor lowering lands, 14.C.3.)
+    codegen_li_free_context(buffer);
+}

@@ -83,6 +83,16 @@ check duplex.tks "$(cat <<'EXP'
 3
 EXP
 )"
+# Phase 14 (14.C): delayed (timed) channel — messages sent out of order (30@30,10@10,20@20)
+# are released in delivery-time order (10,20,30) as the logical clock advances; poll before
+# anything is due returns a structured NOT_READY (1). Lowers to OP_DELAYED_* -> teko_rt.
+check delayed.tks "$(cat <<'EXP'
+1
+10
+20
+30
+EXP
+)"
 # FIPS 180-4 SHA-256("abc") known-answer vector.
 check hash_sha256.tks "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
 

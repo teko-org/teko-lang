@@ -18,6 +18,7 @@
 #include "teko_crypto_random.h"
 #include "teko_uuid.h"
 #include "teko_duplex.h"
+#include "teko_delayed.h"
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -72,6 +73,29 @@ long teko_rt_duplex_poll(long handle, long endpoint) {
 }
 long teko_rt_duplex_close(long handle) {
     teko_duplex_close((TekoDuplex*)(intptr_t)handle);
+    return 0;
+}
+
+// Phase 14 (14.C) — delayed (timed) channel surface wrappers (OP_DELAYED_* lower to these).
+long teko_rt_delayed_open(long capacity) {
+    return (long)(intptr_t)teko_delayed_open((uint32_t)capacity);
+}
+long teko_rt_delayed_send(long handle, long value, long delay) {
+    return (long)teko_delayed_send((TekoDelayed*)(intptr_t)handle, (int32_t)value, (uint32_t)delay);
+}
+long teko_rt_delayed_advance(long handle, long dt) {
+    return (long)teko_delayed_advance((TekoDelayed*)(intptr_t)handle, (uint32_t)dt);
+}
+long teko_rt_delayed_recv(long handle) {
+    int32_t v = 0;
+    (void)teko_delayed_recv((TekoDelayed*)(intptr_t)handle, &v);
+    return (long)v; // earliest-due value (0 when none due — callers probe via delayed.poll)
+}
+long teko_rt_delayed_poll(long handle) {
+    return (long)teko_delayed_poll((TekoDelayed*)(intptr_t)handle);
+}
+long teko_rt_delayed_close(long handle) {
+    teko_delayed_close((TekoDelayed*)(intptr_t)handle);
     return 0;
 }
 

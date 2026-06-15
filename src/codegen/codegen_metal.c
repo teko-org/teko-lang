@@ -285,7 +285,9 @@ static void process_linear_il_bytes(MetalContext* ctx, const unsigned char* byte
                      op == OP_SETARG || op == OP_STORE_LOCAL || op == OP_LOAD_LOCAL ||
                      op == OP_CALL_RUNTIME ||
                      op == OP_DUPLEX_OPEN || op == OP_DUPLEX_SEND || op == OP_DUPLEX_RECV ||
-                     op == OP_DUPLEX_POLL || op == OP_DUPLEX_CLOSE) {
+                     op == OP_DUPLEX_POLL || op == OP_DUPLEX_CLOSE ||
+                     op == OP_DELAYED_OPEN || op == OP_DELAYED_SEND || op == OP_DELAYED_ADVANCE ||
+                     op == OP_DELAYED_RECV || op == OP_DELAYED_POLL || op == OP_DELAYED_CLOSE) {
                 last_arith_op = (OpCode)0;
             }
 
@@ -307,7 +309,9 @@ static void process_linear_il_bytes(MetalContext* ctx, const unsigned char* byte
                 op == OP_CALL_IMPORT || op == OP_LOAD_LOCAL || op == OP_CALL_RUNTIME ||
                 op == OP_SPAWN_ASYNC ||
                 op == OP_DUPLEX_OPEN || op == OP_DUPLEX_SEND || op == OP_DUPLEX_RECV ||
-                op == OP_DUPLEX_POLL || op == OP_DUPLEX_CLOSE) {
+                op == OP_DUPLEX_POLL || op == OP_DUPLEX_CLOSE ||
+                op == OP_DELAYED_OPEN || op == OP_DELAYED_SEND || op == OP_DELAYED_ADVANCE ||
+                op == OP_DELAYED_RECV || op == OP_DELAYED_POLL || op == OP_DELAYED_CLOSE) {
                 accum_has_value = false;
             }
         }
