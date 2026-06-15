@@ -134,6 +134,30 @@ merge/force-push** (the human merges).
    the existing `OP_CHAN_*`. Recommend dedicated opcodes (clearer goldens, free slots ample).
 
 ## 6. Status
-- **14.0** — in progress (this doc + branch + draft PR + pinned green baseline).
+- **14.0** — ✅ done (this doc + branch + draft PR #7 + pinned green baseline 167/167).
+- **14.A — `routines` (background tasks)** — ✅ done. `routines { foo(); bar(); }` fires each
+  enclosed call as a cooperative background task on BOTH targets, with an executable `.tks`
+  proof on each (no dead token):
+  - **IL:** `OP_SPAWN_ASYNC` (0x10, reused) + `codegen_li_emit_spawn_async`; a `uses_spawn`
+    flag gates all backend additions so spawn-free programs stay byte-identical.
+  - **Frontend (`frontend_interop.c`):** the `routines { … }` block resolves each `NAME()` to
+    a top-level `fn NAME`'s table slot → `ICONST slot; OP_SPAWN_ASYNC`. Routine/handler bodies
+    now lower plain extern calls (e.g. `emit`) + codec/crypto calls, not only `@dom`, so a
+    fired task can do real work.
+  - **WASM (`emit_wasm.c`):** Layer A run queue (`$teko_enqueue`) reused; `call $teko_sched_run`
+    is emitted at `$main` close when `uses_spawn`, draining fired routines before exit. Proof:
+    `runtime/wasm/samples/routines.tks` + `run-routines.mjs` (order `[main start, main end,
+    worker×3]` — deferred, not inline). Wired into `wasm.yml`.
+  - **Native runner (`emit_native_hosted.c` + `runtime/native/teko_rt_sched.c`):** the hosted
+    emitter became multi-function — `OP_FUNC_BEGIN/END` emit `teko_routine_<slot>` functions
+    after `$main` (which now `ret`s before them), `OP_SPAWN_ASYNC` → `teko_rt_spawn`, a routine
+    function-pointer table is emitted at EPILOG, and `teko_rt_run` drains at HALT — all gated by
+    `uses_spawn`. The scheduler lives in a **separate TU** (`teko_rt_sched.c`) so the linker
+    pulls it (and needs the table externs) ONLY for routines programs; crypto binaries are
+    untouched (run-native.sh: all 13 crypto/uuid/hello proofs still green). Proof:
+    `runtime/native/samples/routines.tks` in `run-native.sh`.
+  - **Semantics (MVP):** run-to-completion cooperative tasks, drained at program exit (an
+    implicit join-at-exit). Blocking/suspending rendezvous between routines is 14.B+ work.
+- **14.B–14.F** — not started.
 </content>
 </invoke>

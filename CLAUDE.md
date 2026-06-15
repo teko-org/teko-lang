@@ -8,7 +8,9 @@ canonical docs rather than duplicating them.
 
 ## Canonical docs (read these for depth)
 - `docs/plan.md` — the phased roadmap (Phases 1–21; WASM Concurrency = Phase 10 done, Browser
-  FFI = Phase 11 merged, Frontend Grammar = Phase 12 current, Native Cryptography = Phase 13 complete).
+  FFI = Phase 11 merged, Frontend Grammar = Phase 12 current, Native Cryptography = Phase 13
+  complete/merged, Advanced Concurrency = Phase 14 in progress —
+  `docs/PHASE14_ADVANCED_CONCURRENCY.md`).
 - `docs/ARCHITECTURE.md` — compiler architecture; `docs/BACKEND_AOT_PLAN.md`, `docs/vm_plan.md`.
 - `README.md` → **Supported Targets** — the 16 emitters + WASM A/B with honest CI status.
 - `docs/PHASE10_WASM_CONCURRENCY.md` — the WASM concurrency backend design.
@@ -180,3 +182,22 @@ All four gates green (167/167; ASan/UBSan both dispatch paths + TSan; 16 native 
 Phase 12 (Frontend Grammar & Lexer Extension) work continues on its own branch (PR #5). See
 `docs/PHASE13_NATIVE_CRYPTO.md`, `docs/HANDOFF_NATIVE_RUNNER_AND_CRYPTO_SURFACE.md`, and
 `docs/PHASE12_FRONTEND_GRAMMAR.md`.
+
+**Phase 14 (Advanced Concurrency, Signaling & Duplex Channels) is IN PROGRESS** on
+`feat/phase-14-advanced-concurrency` (PR #7, draft) — `docs/PHASE14_ADVANCED_CONCURRENCY.md`.
+Sub-block **14.A `routines` (background tasks) is DONE** on both targets (no dead token): a
+`routines { foo(); bar(); }` block fires each enclosed call as a cooperative green thread.
+- **WASM:** reuses the Phase-10 Layer-A run queue; `call $teko_sched_run` is emitted at `$main`
+  close (gated by `uses_spawn`) so fired routines drain before exit. Proof
+  `runtime/wasm/run-routines.mjs`.
+- **Native runner:** the hosted emitter went multi-function — `OP_FUNC_BEGIN/END` emit
+  `teko_routine_<slot>` functions after `$main`, `OP_SPAWN_ASYNC` → `teko_rt_spawn`, a routine
+  function-pointer table is emitted, and `teko_rt_run` drains at HALT. The scheduler is a
+  **separate TU** (`runtime/native/teko_rt_sched.c`) so the linker pulls it ONLY for routines
+  programs — crypto binaries stay byte-identical. Proof `runtime/native/samples/routines.tks`.
+- **Decision (14.A):** `routines` MVP = run-to-completion cooperative tasks, drained at program
+  exit (implicit join-at-exit). Routine/handler bodies now lower plain extern + codec/crypto
+  calls (not only `@dom`). Blocking/suspending rendezvous between routines is 14.B+ work.
+- 167/167 → 168/168 (added `test_frontend_interop_routines_spawn`); ASan/UBSan both dispatch
+  paths + TSan green; 16 native goldens + all crypto native/WASM proofs intact.
+Remaining 14.B–14.F: `duplex`/`delayed`/`broadcast` channels, `shared`+`atomic`, `circuit`+`retry`.

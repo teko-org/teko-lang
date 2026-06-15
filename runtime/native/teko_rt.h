@@ -111,4 +111,11 @@ char* teko_rt_random_bytes(int n);
 char* teko_rt_uuid_v4(int ignored);
 char* teko_rt_uuid_v7(int ignored);
 
+// Phase 14 (14.A) — cooperative scheduler for `routines` (background tasks). Implemented in
+// the separate TU teko_rt_sched.c (linked only when a binary uses routines). teko_rt_spawn
+// enqueues the routine at function-table `slot` with `arg` (lowered from OP_SPAWN_ASYNC);
+// teko_rt_run drains the queue to completion (called at `$main` exit). See teko_rt_sched.c.
+void teko_rt_spawn(long slot, long arg);
+void teko_rt_run(void);
+
 #endif // TEKO_RT_H

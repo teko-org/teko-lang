@@ -128,6 +128,69 @@ static void emit_call(MetalContext* ctx, const char* sym, int arity) {
     }
 }
 
+// Emit the register-save prolog (identical frame for $main and every routine): set up the
+// frame pointer + saved-register area sized by frame_size_*.
+static void emit_frame_enter(MetalContext* ctx) {
+    FILE* f = ctx->file;
+    if (is_arm64(ctx)) {
+        int fr = frame_size_arm(ctx);
+        fprintf(f, "    stp x29, x30, [sp, #-%d]!\n", fr);
+        fprintf(f, "    mov x29, sp\n");
+        fprintf(f, "    str x19, [x29, #16]\n");
+    } else {
+        int fr = frame_size_x86(ctx);
+        fprintf(f, "    pushq %%rbp\n");
+        fprintf(f, "    movq %%rsp, %%rbp\n");
+        fprintf(f, "    pushq %%rbx\n");
+        fprintf(f, "    subq $%d, %%rsp\n", fr);
+    }
+}
+
+// Emit the matching epilog + return (recomputes the frame size identically).
+static void emit_frame_leave(MetalContext* ctx) {
+    FILE* f = ctx->file;
+    if (is_arm64(ctx)) {
+        int fr = frame_size_arm(ctx);
+        fprintf(f, "    ldr x19, [x29, #16]\n");
+        fprintf(f, "    ldp x29, x30, [sp], #%d\n", fr);
+        fprintf(f, "    ret\n");
+    } else {
+        int fr = frame_size_x86(ctx);
+        fprintf(f, "    addq $%d, %%rsp\n", fr);
+        fprintf(f, "    popq %%rbx\n");
+        fprintf(f, "    popq %%rbp\n");
+        fprintf(f, "    ret\n");
+    }
+}
+
+// Emit a no-argument runtime call (used for the Phase 14 scheduler drain teko_rt_run).
+static void emit_call_noarg(MetalContext* ctx, const char* sym) {
+    FILE* f = ctx->file;
+    const char* pre = sym_prefix(ctx);
+    if (is_arm64(ctx)) fprintf(f, "    bl %s%s\n", pre, sym);
+    else               fprintf(f, "    call %s%s%s\n", pre, sym, is_macho(ctx) ? "" : "@PLT");
+}
+
+// Phase 14 (14.A): emit the routine function-pointer table + count the native scheduler
+// (teko_rt_sched.c) walks. Slots are dense (0..count-1) in declaration order, matching the
+// frontend's collect_functions slot assignment and the OP_SPAWN_ASYNC slot operand.
+static void emit_routine_table(MetalContext* ctx) {
+    FILE* f = ctx->file;
+    const char* pre = sym_prefix(ctx);
+    int n = ctx->wasm_routine_count;
+    if (is_macho(ctx)) fprintf(f, "    .section __DATA,__data\n");
+    else               fprintf(f, "    .data\n");
+    fprintf(f, "    .p2align 3\n");
+    fprintf(f, "    .globl %steko_routine_table\n", pre);
+    fprintf(f, "%steko_routine_table:\n", pre);
+    for (int k = 0; k < n && k < 64; k++)
+        fprintf(f, "    .quad %steko_routine_%d\n", pre, ctx->wasm_routine_ids[k]);
+    if (n <= 0) fprintf(f, "    .quad 0\n"); // never empty (defensive)
+    fprintf(f, "    .globl %steko_routine_count\n", pre);
+    fprintf(f, "%steko_routine_count:\n", pre);
+    fprintf(f, "    .quad %d\n", n);
+}
+
 // --- the emitter -----------------------------------------------------------------
 void emit_native_hosted(MetalContext* ctx, OpCode op, int32_t arg) {
     if (!ctx || !ctx->file) return;
@@ -159,40 +222,61 @@ void emit_native_hosted(MetalContext* ctx, OpCode op, int32_t arg) {
             fprintf(f, "    .globl %smain\n", pre);
             fprintf(f, "    .p2align %d\n", arm ? 2 : 4);
             fprintf(f, "%smain:\n", pre);
-            if (arm) {
-                int fr = frame_size_arm(ctx);
-                fprintf(f, "    stp x29, x30, [sp, #-%d]!\n", fr);
-                fprintf(f, "    mov x29, sp\n");
-                fprintf(f, "    str x19, [x29, #16]\n\n");
-            } else {
-                int fr = frame_size_x86(ctx);
-                fprintf(f, "    pushq %%rbp\n");
-                fprintf(f, "    movq %%rsp, %%rbp\n");
-                fprintf(f, "    pushq %%rbx\n");
-                fprintf(f, "    subq $%d, %%rsp\n\n", fr);
-            }
+            emit_frame_enter(ctx);
+            fprintf(f, "\n");
+            ctx->wasm_open = 1;          // $main open (Phase 14 multi-function tracking)
+            ctx->wasm_routine_count = 0; // routine table accumulated at FUNC_BEGIN
             break;
         }
 
         case OP_HALT:
-            // Set the process exit status to 0; the actual teardown/ret is at EPILOG.
+            // Phase 14: drain fired background tasks before $main returns (run-to-completion).
+            // The frame is still live here; the actual ret is emitted when $main closes.
+            if (ctx->wasm_emit_spawn) emit_call_noarg(ctx, "teko_rt_run");
+            // Set the process exit status to 0; the actual teardown/ret is at the close.
             if (arm) fprintf(f, "    mov w0, #0\n");
             else     fprintf(f, "    movl $0, %%eax\n");
             break;
 
+        // Phase 14 (14.A): green-thread body boundaries. Each routine is emitted as a
+        // separate native function `teko_routine_<slot>(long arg)` AFTER $main returns, so
+        // FUNC_BEGIN first closes the open function (main → ret, or the previous routine),
+        // then opens the new one. The arg lands in $w0 on entry (x0 already; rdi→rax on x86).
+        case OP_FUNC_BEGIN:
+            if (ctx->wasm_open == 1)      emit_frame_leave(ctx); // close $main
+            else if (ctx->wasm_open == 2) emit_frame_leave(ctx); // close previous routine
+            fprintf(f, "\n    .p2align %d\n", arm ? 2 : 4);
+            fprintf(f, "%steko_routine_%d:\n", pre, arg);
+            emit_frame_enter(ctx);
+            if (!arm) fprintf(f, "    movq %%rdi, %%rax\n"); // $w0 = spawn arg (x0 already on arm)
+            if (ctx->wasm_routine_count < 64)
+                ctx->wasm_routine_ids[ctx->wasm_routine_count] = arg;
+            ctx->wasm_routine_count++;
+            ctx->wasm_open = 2;
+            break;
+
+        case OP_FUNC_END:
+            if (ctx->wasm_open == 2) { emit_frame_leave(ctx); ctx->wasm_open = 0; }
+            break;
+
         case OP_EPILOG:
         case OP_RETURN:
+            // Close whatever function is still open ($main when the program has no routines;
+            // already 0 for a routines program — $main closed at the first FUNC_BEGIN).
+            if (ctx->wasm_open != 0) { emit_frame_leave(ctx); ctx->wasm_open = 0; }
+            // Phase 14: emit the routine function-pointer table the scheduler walks.
+            if (ctx->wasm_emit_spawn) emit_routine_table(ctx);
+            break;
+
+        // Phase 14 (14.A): fire the routine whose table slot is in $w0 as a background task.
+        case OP_SPAWN_ASYNC:
             if (arm) {
-                int fr = frame_size_arm(ctx);
-                fprintf(f, "    ldr x19, [x29, #16]\n");
-                fprintf(f, "    ldp x29, x30, [sp], #%d\n", fr);
-                fprintf(f, "    ret\n");
+                fprintf(f, "    mov x1, #0\n");        // arg = 0 (slot already in x0 = $w0)
+                fprintf(f, "    bl %steko_rt_spawn\n", pre);
             } else {
-                int fr = frame_size_x86(ctx);
-                fprintf(f, "    addq $%d, %%rsp\n", fr);
-                fprintf(f, "    popq %%rbx\n");
-                fprintf(f, "    popq %%rbp\n");
-                fprintf(f, "    ret\n");
+                fprintf(f, "    movq %%rax, %%rdi\n");  // slot
+                fprintf(f, "    xorl %%esi, %%esi\n");  // arg = 0
+                fprintf(f, "    call %steko_rt_spawn%s\n", pre, is_macho(ctx) ? "" : "@PLT");
             }
             break;
 

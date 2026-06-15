@@ -137,6 +137,10 @@ static int compile_native_source(const char* input_path, const char* out_path,
         }
     }
     teko_metal_set_local_count(ctx, buffer->local_count);
+    // Phase 14 (14.A): emit the routine function-pointer table + a teko_rt_run drain at
+    // $main exit when the program fires background tasks (`routines { … }`). Spawn-free
+    // programs leave the flag 0 → emitted assembly is byte-identical to before Phase 14.
+    teko_metal_set_emit_spawn(ctx, buffer->uses_spawn);
 
     teko_metal_emit_program(ctx, buffer->code, (uint32_t)buffer->size);
     teko_metal_close(ctx);
