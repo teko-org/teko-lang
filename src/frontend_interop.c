@@ -371,6 +371,10 @@ static int codec_id_for(const char* lex) {
     if (strcmp(lex, "crypto.rsa_oaep_decrypt") == 0) return 40;
     // CSPRNG — random.bytes(n) -> n random bytes as hex. id 41.
     if (strcmp(lex, "random.bytes") == 0) return 41;
+    // UUID v4 (random) / v7 (time-ordered + random) -> canonical UUID string. ids 42/43.
+    // No surface args (entropy/time come from the runtime/host); the lowered $w0 is ignored.
+    if (strcmp(lex, "uuid.v4") == 0) return 42;
+    if (strcmp(lex, "uuid.v7") == 0) return 43;
     // Legacy hashes (insecure — interop only): in-module WAT runtimes, ids 6/7.
     if (strcmp(lex, "hash.md5") == 0) return 6;
     if (strcmp(lex, "hash.sha1") == 0) return 7;

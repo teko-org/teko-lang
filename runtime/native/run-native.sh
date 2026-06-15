@@ -48,6 +48,22 @@ check_random() {
   echo "OK: random -> two distinct 32-byte draws"
 }
 
+# UUID v4/v7: non-deterministic, so assert the canonical layout + version/variant nibbles.
+check_uuid() {
+  local sample="$1" exe got l1 l2
+  exe="$TMP/$(basename "$sample" .tks)"
+  echo "--- $sample (uuid) ---"
+  "$TEKO" build "$HERE/samples/$sample" --target=host --rt-lib="$RTLIB" -o "$exe" \
+    || fail "compile/link failed for $sample"
+  got="$("$exe")" || fail "$sample exited non-zero"
+  l1="$(printf '%s\n' "$got" | sed -n 1p)"; l2="$(printf '%s\n' "$got" | sed -n 2p)"
+  printf '%s' "$l1" | grep -Eq '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$' \
+    || fail "uuid v4 malformed: [$l1]"
+  printf '%s' "$l2" | grep -Eq '^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$' \
+    || fail "uuid v7 malformed: [$l2]"
+  echo "OK: uuid -> v4 [$l1], v7 [$l2]"
+}
+
 check hello.tks "hello from teko native"
 # FIPS 180-4 SHA-256("abc") known-answer vector.
 check hash_sha256.tks "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
@@ -137,5 +153,6 @@ EXP
 )"
 
 check_random random.tks
+check_uuid uuid_rng.tks
 
 echo "All native runner proofs passed."

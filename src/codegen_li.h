@@ -120,6 +120,10 @@ typedef struct {
     // backend declares the host entropy import (env.teko_random) + the in-module CSPRNG
     // hex wrapper. Native targets ignore this (they link the C CSPRNG via teko_rt).
     int uses_random;
+    // Phase 13 (Sub-phase C): 1 if the program calls `uuid.v4`/`uuid.v7` (ids 42/43), so the
+    // WASM backend declares the host entropy import (env.teko_random) + time import
+    // (env.teko_now) and the self-contained v4/v7 runtime. Native targets ignore this.
+    int uses_uuid_rng;
 } BytecodeBuffer;
 
 // Public functions of the IL Bytecode Emitter

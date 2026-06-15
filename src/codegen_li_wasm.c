@@ -38,6 +38,8 @@ int codegen_li_emit_wasm(const BytecodeBuffer* buffer, const char* wat_path,
     teko_metal_set_emit_hash(ctx, buffer->uses_hash);
     // Phase 13 (Sub-phase C): declare the host entropy import + CSPRNG wrapper only if used.
     teko_metal_set_emit_random(ctx, buffer->uses_random);
+    // Phase 13 (Sub-phase C): declare the host entropy + time imports + uuid.v4/v7 runtime.
+    teko_metal_set_emit_uuid_rng(ctx, buffer->uses_uuid_rng);
 
     teko_metal_emit_program(ctx, buffer->code, (uint32_t)buffer->size);
 

@@ -59,6 +59,10 @@ typedef struct {
     // in-module CSPRNG hex wrapper (only when the program calls random.bytes). Native
     // emitters ignore this (they link the C CSPRNG into the binary via teko_rt).
     int wasm_emit_random;
+    // Phase 13 (Sub-phase C): 1 to declare the host entropy + time imports (env.teko_random,
+    // env.teko_now) + the self-contained in-module uuid.v4/v7 runtime. Native emitters ignore
+    // this (they link the C uuid runtime + CSPRNG into the binary via teko_rt).
+    int wasm_emit_uuid_rng;
     // Phase 13 (native runner): 1 routes x86_64/arm64 emission to the libc-hosted,
     // assemble-able emitter (emit_native_hosted.c) instead of the freestanding "metal"
     // emitters — produces a binary the system `cc` links against teko_rt and RUNS. The
@@ -85,6 +89,7 @@ void teko_metal_set_local_count(MetalContext* ctx, int count);
 void teko_metal_set_emit_codecs(MetalContext* ctx, int enabled);
 void teko_metal_set_emit_hash(MetalContext* ctx, int enabled);
 void teko_metal_set_emit_random(MetalContext* ctx, int enabled);
+void teko_metal_set_emit_uuid_rng(MetalContext* ctx, int enabled);
 
 // Phase 13 (native runner): route x86_64/arm64 emission to the libc-hosted emitter.
 void teko_metal_set_hosted(MetalContext* ctx, int enabled);

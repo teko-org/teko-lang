@@ -853,6 +853,53 @@ static void emit_wasm_random_runtime(FILE* f) {
     fprintf(f, "    (local.get $out))\n");
 }
 
+// Phase 13 (Sub-phase C): self-contained uuid.v4 / uuid.v7 on the WASM surface. Entropy comes
+// from the host import env.teko_random; v7 also reads a 48-bit Unix-ms timestamp from
+// env.teko_now (i64). Output is the canonical lowercase "8-4-4-4-12" string. Depends only on
+// $teko_alloc + the host imports (its own inline select-based hex formatter — no codec/hash
+// runtime), so a uuid-only module stays lean. Frontend lowers uuid.v4()/v7() -> id 42/43; the
+// (ignored) $w0 arg keeps the funcs compatible with the accumulator dispatch.
+static void emit_wasm_uuid_rng_runtime(FILE* f) {
+    fprintf(f, "  (func $teko_uuid_rng_fmt (param $b i32) (result i32)\n");
+    fprintf(f, "    (local $out i32) (local $i i32) (local $pos i32) (local $x i32) (local $nb i32)\n");
+    fprintf(f, "    (local.set $out (call $teko_alloc (i32.const 37)))\n");
+    fprintf(f, "    (block $od (loop $ol (br_if $od (i32.ge_u (local.get $i) (i32.const 16)))\n");
+    fprintf(f, "      (local.set $x (i32.load8_u (i32.add (local.get $b) (local.get $i))))\n");
+    fprintf(f, "      (local.set $nb (i32.shr_u (local.get $x) (i32.const 4)))\n");
+    fprintf(f, "      (i32.store8 (i32.add (local.get $out) (local.get $pos))\n");
+    fprintf(f, "        (i32.add (local.get $nb) (select (i32.const 48) (i32.const 87) (i32.lt_u (local.get $nb) (i32.const 10)))))\n");
+    fprintf(f, "      (local.set $pos (i32.add (local.get $pos) (i32.const 1)))\n");
+    fprintf(f, "      (local.set $nb (i32.and (local.get $x) (i32.const 15)))\n");
+    fprintf(f, "      (i32.store8 (i32.add (local.get $out) (local.get $pos))\n");
+    fprintf(f, "        (i32.add (local.get $nb) (select (i32.const 48) (i32.const 87) (i32.lt_u (local.get $nb) (i32.const 10)))))\n");
+    fprintf(f, "      (local.set $pos (i32.add (local.get $pos) (i32.const 1)))\n");
+    fprintf(f, "      (if (i32.or (i32.or (i32.eq (local.get $i) (i32.const 3)) (i32.eq (local.get $i) (i32.const 5)))\n");
+    fprintf(f, "                  (i32.or (i32.eq (local.get $i) (i32.const 7)) (i32.eq (local.get $i) (i32.const 9))))\n");
+    fprintf(f, "        (then (i32.store8 (i32.add (local.get $out) (local.get $pos)) (i32.const 45)) (local.set $pos (i32.add (local.get $pos) (i32.const 1)))))\n");
+    fprintf(f, "      (local.set $i (i32.add (local.get $i) (i32.const 1))) (br $ol)))\n");
+    fprintf(f, "    (i32.store8 (i32.add (local.get $out) (i32.const 36)) (i32.const 0)) (local.get $out))\n");
+
+    fprintf(f, "  (func $teko_uuid_v4 (export \"teko_uuid_v4\") (param $ignore i32) (result i32) (local $b i32)\n");
+    fprintf(f, "    (local.set $b (call $teko_alloc (i32.const 16)))\n");
+    fprintf(f, "    (call $teko_random (local.get $b) (i32.const 16))\n");
+    fprintf(f, "    (i32.store8 (i32.add (local.get $b) (i32.const 6)) (i32.or (i32.and (i32.load8_u (i32.add (local.get $b) (i32.const 6))) (i32.const 15)) (i32.const 0x40)))\n");
+    fprintf(f, "    (i32.store8 (i32.add (local.get $b) (i32.const 8)) (i32.or (i32.and (i32.load8_u (i32.add (local.get $b) (i32.const 8))) (i32.const 0x3f)) (i32.const 0x80)))\n");
+    fprintf(f, "    (call $teko_uuid_rng_fmt (local.get $b)))\n");
+
+    fprintf(f, "  (func $teko_uuid_v7 (export \"teko_uuid_v7\") (param $ignore i32) (result i32) (local $b i32) (local $ms i64) (local $i i32)\n");
+    fprintf(f, "    (local.set $b (call $teko_alloc (i32.const 16)))\n");
+    fprintf(f, "    (call $teko_random (local.get $b) (i32.const 16))\n");
+    fprintf(f, "    (local.set $ms (call $teko_now))\n");
+    fprintf(f, "    (local.set $i (i32.const 0))\n");
+    fprintf(f, "    (block $td (loop $tl (br_if $td (i32.ge_u (local.get $i) (i32.const 6)))\n");
+    fprintf(f, "      (i32.store8 (i32.add (local.get $b) (local.get $i))\n");
+    fprintf(f, "        (i32.wrap_i64 (i64.and (i64.shr_u (local.get $ms) (i64.extend_i32_u (i32.mul (i32.sub (i32.const 5) (local.get $i)) (i32.const 8)))) (i64.const 0xff))))\n");
+    fprintf(f, "      (local.set $i (i32.add (local.get $i) (i32.const 1))) (br $tl)))\n");
+    fprintf(f, "    (i32.store8 (i32.add (local.get $b) (i32.const 6)) (i32.or (i32.and (i32.load8_u (i32.add (local.get $b) (i32.const 6))) (i32.const 15)) (i32.const 0x70)))\n");
+    fprintf(f, "    (i32.store8 (i32.add (local.get $b) (i32.const 8)) (i32.or (i32.and (i32.load8_u (i32.add (local.get $b) (i32.const 8))) (i32.const 0x3f)) (i32.const 0x80)))\n");
+    fprintf(f, "    (call $teko_uuid_rng_fmt (local.get $b)))\n");
+}
+
 // The non-suspending half of a channel receive: read buf[head] -> $w0, advance
 // head = (head+1) % cap. Channel base is in $cp.
 static void emit_wasm_chan_read(FILE* f) {
@@ -1042,8 +1089,13 @@ void emit_wasm_pure(MetalContext* ctx, OpCode op, int32_t arg) {
             fprintf(f, "(module\n");
             fprintf(f, "  ;; --- Target: WebAssembly Text Format (cooperative concurrency, Phase 10.3) ---\n");
             emit_wasm_imports(ctx);            // Phase 11 FFI host imports — must precede definitions
-            if (ctx->wasm_emit_random) {       // Phase 13 Sub-phase C: host entropy import (must precede memory)
+            // Phase 13 Sub-phase C host imports (must precede memory). Entropy is shared by
+            // random.bytes and uuid.v4/v7; the time import is uuid.v7-only.
+            if (ctx->wasm_emit_random || ctx->wasm_emit_uuid_rng) {
                 fprintf(f, "  (import \"env\" \"teko_random\" (func $teko_random (param i32 i32)))\n");
+            }
+            if (ctx->wasm_emit_uuid_rng) {
+                fprintf(f, "  (import \"env\" \"teko_now\" (func $teko_now (result i64)))\n");
             }
             fprintf(f, "  (memory 1)\n");
             fprintf(f, "  (export \"memory\" (memory 0))\n");
@@ -1059,6 +1111,7 @@ void emit_wasm_pure(MetalContext* ctx, OpCode op, int32_t arg) {
                 emit_wasm_uuid_runtime(f);    // Phase 13 UUID v3/v5 (name-based)
             }
             if (ctx->wasm_emit_random) emit_wasm_random_runtime(f); // Phase 13 Sub-phase C CSPRNG
+            if (ctx->wasm_emit_uuid_rng) emit_wasm_uuid_rng_runtime(f); // Phase 13 Sub-phase C uuid v4/v7
             fprintf(f, "  (func $main (result i32)\n");
             // $w0 accumulator, $w1 scratch, $cp channel ptr, $a0..$a2 import-arg
             // staging slots (Phase 11 multi-param imports — see OP_SETARG).
@@ -1115,6 +1168,8 @@ void emit_wasm_pure(MetalContext* ctx, OpCode op, int32_t arg) {
             else if (arg == 8) fn = "teko_uuid_v3";    // Phase 13 UUID (name-based)
             else if (arg == 9) fn = "teko_uuid_v5";
             else if (arg == 41) fn = "teko_random_hex"; // Phase 13 Sub-phase C CSPRNG (host entropy)
+            else if (arg == 42) fn = "teko_uuid_v4";    // Phase 13 Sub-phase C uuid v4 (host entropy)
+            else if (arg == 43) fn = "teko_uuid_v7";    // Phase 13 Sub-phase C uuid v7 (host time+entropy)
             if (fn) {
                 fprintf(f, "    local.get $w0\n    call $%s\n    local.set $w0\n", fn);
             } else {

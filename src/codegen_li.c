@@ -24,6 +24,7 @@ BytecodeBuffer* codegen_li_create_context(void) {
     buffer->uses_codec = 0;
     buffer->uses_hash = 0;
     buffer->uses_random = 0;
+    buffer->uses_uuid_rng = 0;
 
     return buffer;
 }
@@ -145,6 +146,7 @@ void codegen_li_emit_call_runtime(BytecodeBuffer* buffer, int codec_id) {
     // runtime block), not the SHA family — flag it separately so hash-free programs that
     // only use randomness don't drag in the hash runtime.
     if (codec_id == 41) buffer->uses_random = 1;
+    else if (codec_id == 42 || codec_id == 43) buffer->uses_uuid_rng = 1; // uuid.v4/v7
     else if (codec_id >= 4) buffer->uses_hash = 1;
     else buffer->uses_codec = 1;
     emit_byte(buffer, OP_CALL_RUNTIME);

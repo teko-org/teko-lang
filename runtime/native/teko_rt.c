@@ -16,7 +16,9 @@
 #include "teko_crypto_p384.h"
 #include "teko_crypto_rsa.h"
 #include "teko_crypto_random.h"
+#include "teko_uuid.h"
 #include <stdio.h>
+#include <time.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -512,4 +514,34 @@ char* teko_rt_random_bytes(int n) {
     if (teko_csprng_bytes(buf, (size_t)n) == 0) out = teko_rt_to_hex(buf, (size_t)n);
     free(buf);
     return out;
+}
+
+// --- UUID v4 / v7 ----------------------------------------------------------------
+// Canonical-format a 16-byte UUID into a fresh NUL-terminated 36-char string.
+static char* teko_rt_uuid_str(const uint8_t u[16]) {
+    char* out = (char*)malloc(TEKO_UUID_STR_LEN + 1);
+    if (!out) return NULL;
+    teko_uuid_format(out, u);          // writes 36 chars, no NUL
+    out[TEKO_UUID_STR_LEN] = '\0';
+    return out;
+}
+
+char* teko_rt_uuid_v4(int ignored) {
+    (void)ignored;
+    uint8_t u[TEKO_UUID_LEN];
+    if (teko_uuid_v4(u) != 0) return NULL;
+    return teko_rt_uuid_str(u);
+}
+
+char* teko_rt_uuid_v7(int ignored) {
+    (void)ignored;
+    uint64_t unix_ms;
+    struct timespec ts;
+    if (clock_gettime(CLOCK_REALTIME, &ts) == 0)
+        unix_ms = (uint64_t)ts.tv_sec * 1000ull + (uint64_t)(ts.tv_nsec / 1000000l);
+    else
+        unix_ms = (uint64_t)time(NULL) * 1000ull;
+    uint8_t u[TEKO_UUID_LEN];
+    if (teko_uuid_v7(u, unix_ms) != 0) return NULL;
+    return teko_rt_uuid_str(u);
 }

@@ -27,6 +27,7 @@ MetalContext* teko_metal_create(const char* output_asm_path, TekoTarget target) 
     ctx->wasm_emit_codecs = 0;
     ctx->wasm_emit_hash = 0;
     ctx->wasm_emit_random = 0;
+    ctx->wasm_emit_uuid_rng = 0;
     ctx->hosted = 0;
     return ctx;
 }
@@ -61,6 +62,11 @@ void teko_metal_set_emit_hash(MetalContext* ctx, int enabled) {
 void teko_metal_set_emit_random(MetalContext* ctx, int enabled) {
     if (!ctx) return;
     ctx->wasm_emit_random = enabled ? 1 : 0;
+}
+
+void teko_metal_set_emit_uuid_rng(MetalContext* ctx, int enabled) {
+    if (!ctx) return;
+    ctx->wasm_emit_uuid_rng = enabled ? 1 : 0;
 }
 
 void teko_metal_set_hosted(MetalContext* ctx, int enabled) {

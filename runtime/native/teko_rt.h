@@ -104,4 +104,11 @@ char* teko_rt_rsa_oaep_decrypt(const char* n_hex, const char* d_hex, const char*
 // Returns NULL on n <= 0 or n > 1024.
 char* teko_rt_random_bytes(int n);
 
+// UUID v4 (random) / v7 (time-ordered + random) (ids 42/43). No surface args (the `int`
+// parameter is the lowered, ignored accumulator). Returns a fresh canonical lowercase UUID
+// string ("8-4-4-4-12"), or NULL if entropy is unavailable. v7 timestamps with the host's
+// current Unix-ms clock.
+char* teko_rt_uuid_v4(int ignored);
+char* teko_rt_uuid_v7(int ignored);
+
 #endif // TEKO_RT_H
