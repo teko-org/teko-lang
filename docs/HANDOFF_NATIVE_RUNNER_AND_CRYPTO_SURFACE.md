@@ -22,9 +22,19 @@
   (`TEKO_CRYPTO_SOURCES`) linked into BOTH `teko_core` and `teko_rt`, so produced binaries
   are self-contained. Proven by `runtime/native/samples/hash_sha256.tks`: `hash.sha256("abc")`
   prints the FIPS 180-4 digest natively on macOS arm64 + Linux x86_64/arm64 (asserted in
-  `run-native.sh`). **Next:** the rest of `hash.*` (sha384/512, sha3/shake, blake3/blake2b),
-  then HMAC — each a `teko_rt_*` wrapper + dispatch id + executable `.tks` KAT; then multi-arg
-  staging is already supported by `emit_native_hosted` for AEAD/sign/verify.
+  `run-native.sh`).
+- **Sub-phase B, step 2 — fixed-size hash family native surface: DONE.** `hash.sha384`,
+  `hash.sha512`, `hash.sha3_256`, `hash.sha3_512`, `hash.blake3`, `hash.blake2b` (ids
+  5/10/11/12/15/16) now lower to `teko_rt_*` wrappers over the C runtime. Proven by
+  `runtime/native/samples/hash_family.tks` against FIPS/NIST/RFC `abc` vectors (BLAKE3 uses
+  the spec empty-input vector — the official non-empty BLAKE3 vectors use a 0,1,2,… byte
+  pattern, not ASCII). **No silent dead/wrong tokens on WASM:** the WASM `OP_CALL_RUNTIME`
+  emitter now traps (`unreachable`) on a runtime id it doesn't yet lower (reserved-with-target)
+  instead of mis-calling base64 — these ids get their real WASM lowering in Sub-phase C.
+  **Next (B.3):** generalize the codec/runtime frontend lowering to **multi-arg** (it is
+  single-arg today) — `emit_native_hosted` already marshals N args via OP_SETARG staging — to
+  wire HMAC (key,msg), SHAKE (msg,len), then AEAD (`encrypt`/`decrypt`), `sign`/`verify`, RSA,
+  ECDH, KDF/RNG.
 
 > **Status:** owner-approved next work. Same PR/branch as Phase 13:
 > `feat/phase-13-native-crypto` (PR #6). The Phase 13 crypto **runtime** is complete and

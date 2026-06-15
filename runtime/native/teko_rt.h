@@ -26,4 +26,13 @@ void teko_rt_emit(const char* s);
 // matches the existing WASM hash surface (hash.sha256("abc") hashes the bytes "abc").
 char* teko_rt_sha256_hex(const char* msg);
 
+// Rest of the fixed-size hash family (OP_CALL_RUNTIME ids 5,10,11,12,15,16). Same shape
+// as sha256: hash the raw message bytes, return a fresh lowercase hex digest string.
+char* teko_rt_sha384_hex(const char* msg);   // id 10 — SHA-384
+char* teko_rt_sha512_hex(const char* msg);   // id 5  — SHA-512
+char* teko_rt_sha3_256_hex(const char* msg); // id 11 — SHA3-256
+char* teko_rt_sha3_512_hex(const char* msg); // id 12 — SHA3-512
+char* teko_rt_blake3_hex(const char* msg);   // id 15 — BLAKE3 (32-byte default output)
+char* teko_rt_blake2b_hex(const char* msg);  // id 16 — BLAKE2b (64-byte default output)
+
 #endif // TEKO_RT_H

@@ -1069,8 +1069,9 @@ void emit_wasm_pure(MetalContext* ctx, OpCode op, int32_t arg) {
 
         // Phase 12 (P12-G): native base-encoding codec. $w0 = codec($w0).
         case OP_CALL_RUNTIME: {
-            const char* fn = "teko_base64_encode";
-            if (arg == 1) fn = "teko_base64_decode";
+            const char* fn = NULL;
+            if (arg == 0) fn = "teko_base64_encode";
+            else if (arg == 1) fn = "teko_base64_decode";
             else if (arg == 2) fn = "teko_hex_encode";
             else if (arg == 3) fn = "teko_hex_decode";
             else if (arg == 4) fn = "teko_sha256_hex"; // Phase 13.1
@@ -1078,7 +1079,15 @@ void emit_wasm_pure(MetalContext* ctx, OpCode op, int32_t arg) {
             else if (arg == 7) fn = "teko_sha1_hex";   // Phase 13 legacy
             else if (arg == 8) fn = "teko_uuid_v3";    // Phase 13 UUID (name-based)
             else if (arg == 9) fn = "teko_uuid_v5";
-            fprintf(f, "    local.get $w0\n    call $%s\n    local.set $w0\n", fn);
+            if (fn) {
+                fprintf(f, "    local.get $w0\n    call $%s\n    local.set $w0\n", fn);
+            } else {
+                // Reserved-with-target: this crypto runtime id has a native lowering
+                // (teko_rt) but no WASM lowering yet (deferred to Sub-phase C: compile the
+                // C runtime -> wasm32 + import). Trap loudly rather than mis-call another
+                // runtime fn, so the token is never silently wrong on the WASM surface.
+                fprintf(f, "    unreachable ;; crypto runtime id %d not yet lowered to WASM\n", arg);
+            }
             break;
         }
 

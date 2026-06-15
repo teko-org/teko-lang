@@ -18,6 +18,12 @@ const char* teko_native_runtime_symbol(int32_t id, int* out_arity) {
         case 2: sym = "teko_rt_hex_encode";    break;
         case 3: sym = "teko_rt_hex_decode";    break;
         case 4: sym = "teko_rt_sha256_hex";    break; // Phase 13.1
+        case 5: sym = "teko_rt_sha512_hex";    break;
+        case 10: sym = "teko_rt_sha384_hex";   break;
+        case 11: sym = "teko_rt_sha3_256_hex"; break;
+        case 12: sym = "teko_rt_sha3_512_hex"; break;
+        case 15: sym = "teko_rt_blake3_hex";   break;
+        case 16: sym = "teko_rt_blake2b_hex";  break;
         case 6: sym = "teko_rt_md5_hex";       break; // legacy
         case 7: sym = "teko_rt_sha1_hex";      break; // legacy
         case 8: sym = "teko_rt_uuid_v3";       break;
