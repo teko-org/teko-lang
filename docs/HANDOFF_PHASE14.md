@@ -2,8 +2,22 @@
 
 Branch `feat/phase-14-advanced-concurrency` (PR #7, draft). This is the live continuation guide:
 what's done, the **exact reusable pattern** for the channel sub-blocks, and the remaining work
-(14.D–14.F). Pair with `docs/PHASE14_ADVANCED_CONCURRENCY.md` (design) and the memory file
+(14.E–14.F). Pair with `docs/PHASE14_ADVANCED_CONCURRENCY.md` (design) and the memory file
 `teko-phase14-advanced-concurrency`.
+
+## ▶ RESUME POINT (read first)
+- **Branch:** `feat/phase-14-advanced-concurrency`; resume from its latest commit (this doc's
+  commit is the tip). Working tree is clean and fully pushed to `origin`. Suite **184/184**;
+  ASan+UBSan (both dispatch paths) + TSan green; 16 native goldens intact; all 4 CI gates green.
+- **Done & CI-green:** 14.A routines, 14.B duplex, 14.C delayed, 14.D broadcast (4 of 6).
+- **Next:** **14.E `shared` block + `atomic`** (sub-plan below), then **14.F `circuit` + `retry`**.
+- **Before starting:** `git fetch && git checkout feat/phase-14-advanced-concurrency && git pull --ff-only`,
+  rebuild (`cmake --build build`), run `./build/teko_tests` (expect 184/184), then follow the
+  sub-plan. The channel sub-blocks (14.B/C/D) are the template; **14.E/14.F are NOT channels** —
+  read their specifics below before reaching for the template.
+- Local quirks: Ninja isn't installed → use the pre-configured `build/` (Unix Makefiles). The
+  Write tool sometimes appends a stray `</content>` line — strip it before building. `wat2wasm`
+  + `node` + LLVM `clang`/`wasm-ld` are available (the last two build the reactor).
 
 ## Status
 - **14.A `routines`** — DONE, CI-green.
@@ -71,22 +85,72 @@ Recommend the `broadcast.*` dotted-ident surface to reuse the pattern verbatim, 
 `teko_broadcast.c`: a slot buffer + one read cursor per subscriber; `publish` writes once,
 each subscriber reads non-destructively from its own cursor (so all N see every value).
 
-## 14.E `shared` block + `atomic` — specifics (largest; sub-plan before coding)
-`shared { … }` block whose state the compiler treats as concurrently accessed, injecting a
-coarse whole-block lock (owner decision); `atomic` qualifies one op to a fenced RMW. Native:
-`<stdatomic.h>` / a spinlock in teko_rt. WASM: Layer B atomics for the threaded target; Layer A
-is single-threaded so the lock is a fence/no-op. This needs frontend block-grammar work
-(`shared` is TOKEN_SHARED, `atomic` is TOKEN_ATOMIC). Report a scoped sub-plan first; flag any
-real scope-fork (e.g. escape analysis depth) to the owner.
+## 14.E `shared` block + `atomic` — sub-plan (largest/most novel; NOT the channel template)
+Owner decision: **coarse whole-block lock** (the compiler injects ONE lock around the entire
+`shared { … }` block — not per-field). `atomic` qualifies a single op to a fenced atomic RMW.
+This is a frontend block-grammar + lock-injection feature, distinct from the channel runtimes.
 
-## 14.F `circuit` + `retry` — specifics
-Resilience control flow, mostly independent of channels. `retry { } fallback { }` with
-`attempts` / global `timeout` limits and `exponential`/`logarithmic` backoff; `circuit`
-open/half-open/closed breaker. The backoff schedule is computable in a C runtime helper
-(`teko_circuit.c`?) returning the next delay / a branch-to-fallback decision; reuses the 14.C
-logical-clock idea for the time budget. Tokens TOKEN_CIRCUIT/RETRY/FALLBACK/EXPONENTIAL/
-LOGARITHMIC/ATTEMPTS/TIMEOUT are reserved. This is more frontend-control-flow than the channel
-sub-blocks — design the lowering (loop + branch IL, or a runtime-driven trampoline) before coding.
+Recommended MVP (deterministic + provable, mirrors how the channel runtimes stayed
+scheduler-agnostic): a C runtime `src/runtime/teko_shared.c` (source of truth) exposing a
+re-entrancy-safe coarse lock + atomic counter primitives, KAT-tested in Unity:
+  `TekoLock* teko_shared_lock_new(void); teko_shared_enter(l); teko_shared_leave(l);`
+  `long teko_atomic_add(long* cell, long delta); long teko_atomic_load(long* cell);` (etc.)
+On native use `<stdatomic.h>` (`atomic_flag` spinlock / `atomic_fetch_add`); the lock must be a
+real fence so it's correct under the TSan gate. On WASM Layer A (single-threaded cooperative)
+the lock is a no-op/fence and the atomics are plain loads/stores; on `-wasm-threads` (Layer B)
+lower to the atomics proposal — but the executable proof can be single-threaded (assert the
+locked block's accumulated result), since Layer A is the default and is what `run-*.mjs` drives.
+
+Steps (sub-plan; report it before coding, flag a real fork e.g. if escape analysis is needed):
+1. `.1` runtime `teko_shared.{h,c}` + Unity KATs (lock enter/leave balance; atomic add/load
+   single-threaded determinism). Add to CMake (CORE_SOURCES + teko_rt). 
+2. `.2` native surface: opcodes `OP_SHARED_ENTER/LEAVE` + `OP_ATOMIC_*` (next free byte 0x53+);
+   `uses_shared` flag; CSE invalidation for any \$w0-clobbering ones. Frontend: parse the
+   `shared { … }` BLOCK (TOKEN_SHARED + braces) — emit ENTER at `{`, lower the inner statements
+   (reuse the existing statement-lowering helpers), emit LEAVE at `}`. `atomic x += e` (TOKEN_ATOMIC)
+   → `OP_ATOMIC_ADD`. Native wrappers `teko_rt_shared_*`/`teko_rt_atomic_*`; emitter cases; a
+   `.tks` proof (a `shared { }` block with an `atomic` accumulator → emit the final value).
+3. `.3` WASM: add `teko_shared.c` to the reactor + exports; emitter imports + cases; `.tks` proof.
+Design note: the coarse lock + atomics are runtime calls (handle/cell as a register-width int),
+so they fit the existing OP_CALL-style marshalling. The novel part is the `shared { }` BLOCK
+grammar (open/close bracketing the inner statements) — design that first.
+
+## 14.F `circuit` + `retry` — sub-plan (resilience control-flow; NOT the channel template)
+`retry { … } fallback { … }` with `attempts` and/or global `timeout` limits and
+`exponential`/`logarithmic` backoff between attempts; `circuit` = an open/half-open/closed
+breaker wrapping a call. Tokens TOKEN_CIRCUIT/RETRY/FALLBACK/EXPONENTIAL/LOGARITHMIC/ATTEMPTS/
+TIMEOUT are reserved. From `plan.md`: when BOTH `attempts` and `timeout` are given, the compiler
+computes the incremental relative retry time and **branches straight to `fallback`** once the
+projected next-attempt delay would exceed the time budget.
+
+Recommended MVP — keep the POLICY in a C runtime (source of truth, deterministic, KAT-testable),
+the CONTROL-FLOW in emitted IL:
+1. `.1` runtime `src/runtime/teko_retry.{h,c}` + Unity KATs. A retry-policy object:
+   `TekoRetry* teko_retry_new(int attempts, uint64_t timeout, int mode /*0=exp,1=log*/, uint64_t base);`
+   `int teko_retry_should_continue(TekoRetry*, int attempt, uint64_t elapsed);` (0=give up→fallback)
+   `uint64_t teko_retry_next_delay(TekoRetry*, int attempt);` (exp: base<<attempt; log: base*ln-ish
+   integer approx) and the combined attempts+timeout branch-to-fallback rule. A circuit-breaker
+   object: `teko_circuit_new(threshold, cooldown)`, `teko_circuit_allow()`, `teko_circuit_record(ok)`
+   with CLOSED→OPEN→HALF_OPEN transitions. Test the backoff sequence + the fallback-on-budget rule
+   + breaker transitions deterministically (pass explicit attempt/elapsed, like 14.C's logical clock).
+2. `.2` native surface: this differs from channels — `retry { } fallback { }` is a control
+   structure, not a call. Lowering options (pick after a quick spike): (a) the simplest provable
+   MVP lowers a `retry`/`fallback` over a *single retriable extern call* to a loop in emitted IL
+   driven by the policy object (`OP_JMP`/`OP_JMP_IF_FALSE` already exist) — attempt the call, ask
+   the policy `should_continue`, loop or branch to the fallback block; or (b) a runtime trampoline.
+   Recommend (a) for a deterministic `.tks` proof: a flaky call that fails K times then succeeds
+   (assert it retried), and a permanently-failing one that lands in `fallback` (assert the
+   fallback ran). Emit `OP_RETRY_*`/policy calls + the loop. `circuit.*` can be dotted-ident
+   runtime calls like the channels.
+3. `.3` WASM: add `teko_retry.c` to the reactor + exports; emitter cases; `.tks` proof.
+Design the `retry { }`/`fallback { }` block grammar + the loop/branch lowering BEFORE coding;
+this is the most control-flow-heavy sub-block. The backoff time budget reuses the 14.C
+logical-clock idea (pass elapsed in) to stay deterministic.
+
+## Closing Phase 14
+After 14.F: full suite + sanitizers + 4 gates green; update `docs/PHASE14_ADVANCED_CONCURRENCY.md`
+(all sub-blocks done) + CLAUDE.md + this doc; then tell the owner Phase 14 is ready to leave
+draft (the owner merges — no merge/force-push from the agent).
 
 ## Gotchas
 - The Write tool sometimes appends a stray `</content>` line — strip it
