@@ -21,4 +21,10 @@ void teko_hmac_sha512(const uint8_t* key, size_t key_len,
                       const uint8_t* msg, size_t msg_len,
                       uint8_t out[TEKO_SHA512_DIGEST_LEN]);
 
+// HMAC-SHA-384: out = HMAC(key, msg), 48-byte tag (block size 128, like SHA-512). Used by
+// the RFC 6979 deterministic-nonce generator for P-384 ECDSA.
+void teko_hmac_sha384(const uint8_t* key, size_t key_len,
+                      const uint8_t* msg, size_t msg_len,
+                      uint8_t out[TEKO_SHA384_DIGEST_LEN]);
+
 #endif // TEKO_CRYPTO_HMAC_H

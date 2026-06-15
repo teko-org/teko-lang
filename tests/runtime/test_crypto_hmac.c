@@ -31,6 +31,15 @@ static void assert_hmac512(const uint8_t* key, size_t kl,
     TEST_ASSERT_EQUAL_STRING(expect, got);
 }
 
+static void assert_hmac384(const uint8_t* key, size_t kl,
+                           const uint8_t* msg, size_t ml, const char* expect) {
+    uint8_t mac[TEKO_SHA384_DIGEST_LEN];
+    char got[TEKO_SHA384_DIGEST_LEN * 2u + 1u];
+    teko_hmac_sha384(key, kl, msg, ml, mac);
+    to_hex(mac, TEKO_SHA384_DIGEST_LEN, got);
+    TEST_ASSERT_EQUAL_STRING(expect, got);
+}
+
 // RFC 4231 known-answer vectors for HMAC-SHA-256 and HMAC-SHA-512.
 void test_teko_crypto_hmac_rfc4231_vectors(void) {
     uint8_t key[131];
@@ -43,6 +52,9 @@ void test_teko_crypto_hmac_rfc4231_vectors(void) {
     assert_hmac512(key, 20u, (const uint8_t*)"Hi There", 8u,
         "87aa7cdea5ef619d4ff0b4241a1d6cb02379f4e2ce4ec2787ad0b30545e17cde"
         "daa833b7d6b8a702038b274eaea3f4e4be9d914eeb61f1702e696c203a126854");
+    assert_hmac384(key, 20u, (const uint8_t*)"Hi There", 8u,
+        "afd03944d84895626b0825f4ab46907f15f9dadbe4101ec682aa034c7cebc59c"
+        "faea9ea9076ede7f4af152e8b2fa9cb6");
 
     // Case 2: key = "Jefe", data = "what do ya want for nothing?".
     assert_hmac256((const uint8_t*)"Jefe", 4u,
@@ -52,6 +64,10 @@ void test_teko_crypto_hmac_rfc4231_vectors(void) {
         (const uint8_t*)"what do ya want for nothing?", 28u,
         "164b7a7bfcf819e2e395fbe73b56e0a387bd64222e831fd610270cd7ea250554"
         "9758bf75c05a994a6d034f65f8f0e6fdcaeab1a34d4a6b4b636e070a38bce737");
+    assert_hmac384((const uint8_t*)"Jefe", 4u,
+        (const uint8_t*)"what do ya want for nothing?", 28u,
+        "af45d2e376484031617f78d2b58a6b1b9c7ef464f5a01b47e42ec3736322445e"
+        "8e2240ca5e69e2c78b3239ecfab21649");
 
     // Case 3: key = 0xaa x 20, data = 0xdd x 50.
     memset(key, 0xaa, 20u);
@@ -73,6 +89,9 @@ void test_teko_crypto_hmac_rfc4231_vectors(void) {
     assert_hmac512(key, 25u, data, 50u,
         "b0ba465637458c6990e5a8c5f61d4af7e576d97ff94b872de76f8050361ee3db"
         "a91ca5c11aa25eb4d679275cc5788063a5f19741120c4f2de2adebeb10a298dd");
+    assert_hmac384(key, 25u, data, 50u,
+        "3e8a69b7783c25851933ab6290af6ca77a9981480850009cc5577c6e1f573b4e"
+        "6801dd23c4a7d679ccf8a386c674cffb");
 
     // Case 6: key = 0xaa x 131 (> block size, hashed first), short data.
     memset(key, 0xaa, 131u);
