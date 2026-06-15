@@ -31,11 +31,14 @@ The asymmetric block was built as KAT-anchored increments on the bignum layer:
    decrypt, OAEP (MGF1) encrypt/decrypt, PSS sign/verify. KATs: NIST FIPS 186 SigGen,
    Project Wycheproof OAEP/PSS, plus round-trips.
 
-**Remaining (optional, owner to confirm before investing — NOT required for Phase 13):** the
-WASM host entropy/time import (unlocks `uuid.v4`/`v7` + WASM CSPRNG surface), and compiling
-the C crypto runtime to wasm32 (unlocks sha512/sha3/blake3 WASM surface). See the WASM
-deferral decision below. The native C runtimes are the single source of truth and are fully
-KAT-tested for all 16 native targets.
+**Next work (owner-approved 2026-06-15, same PR #6) — NOT started, handed off to a fresh
+session:** wire the **full crypto language surface** to the C runtime (native-first, no dead
+tokens, executable `.tks` proofs), then the WASM follow-ups (host entropy/time import; compile
+the C runtime → wasm32). This requires **building a real native runner first** (the native
+backend is currently emission-only). The complete cold-start brief, the two design decisions
+(native-first; hex-at-surface ABI), and the sequenced plan are in
+**`docs/HANDOFF_NATIVE_RUNNER_AND_CRYPTO_SURFACE.md`**. The native C runtimes are the single
+source of truth and are fully KAT-tested.
 
 ### DECISION TO DOCUMENT & IMPLEMENT FIRST — the bignum layer (owner pre-approved)
 Build a shared **fixed-capacity, little-endian 32-bit-limb multi-precision integer** module
@@ -87,9 +90,17 @@ runtime** (`src/runtime/teko_crypto_*.c`) — the same place Phase 8's concurren
 - **The correctness gate.** Each primitive is KAT-tested directly in the Unity suite
   (`tests/runtime/test_crypto_*.c`) against NIST/RFC vectors + round-trips, independent of
   any language wiring. Pure, deterministic, MSVC-portable, trivially sanitizer-clean.
-- **Linked into produced native binaries** via `tld`, exactly as the concurrency runtime is
-  (the "Teko Core Runtime", Phase 8). The `hash`/`crypto`/`sign`/`verify` tokens lower to
-  calls into it.
+- **Intended to be linked into produced native binaries** via `tld` so the
+  `hash`/`crypto`/`sign`/`verify` tokens lower to calls into it. ⚠️ **CORRECTION (discovered
+  2026-06-15):** this native linking is **NOT implemented yet** — and neither is it for the
+  Phase 8 concurrency runtime. The native backend is **emission-only ("no runner")**: the
+  `--target=<native>` build path encodes **mock bytecode** (`main.c` ~L187, `ICONST 31; HALT`)
+  via an `ICONST`/`HALT`-level encoder, the `emit_*_common.c` cores emit assembly **text** that
+  is only `strstr`-checked by goldens, no external C-runtime object is linked into output, and
+  **no native-compiled `.tks` is ever executed**. Wiring the crypto **language surface** to the
+  native C runtime therefore first requires **building a real native runner** — see
+  `docs/HANDOFF_NATIVE_RUNNER_AND_CRYPTO_SURFACE.md` (the owner-approved next sub-phase).
+- **The basis for the WASM surface.** Where a primitive is small and hot (hashes, ChaCha20)
 - **The basis for the WASM surface.** Where a primitive is small and hot (hashes, ChaCha20)
   it can additionally be emitted as on-demand WAT (the Phase 12-G pattern) and proved with
   assemble+run; otherwise the native C library remains the reference and WASM lowering is

@@ -98,8 +98,12 @@ output locally (the goldens only `strstr`; always *assemble + run*, never trust 
   PR #6); the old 13–20 shifted to 14–21 (Self-Hosting = 21).
 - **Phase 13 (Native Cryptography) decisions.** Every primitive is **portable C23 in the
   embedded native runtime** (`src/runtime/teko_crypto_*.c`) — the single source of truth,
-  KAT-tested in the Unity suite against NIST/RFC vectors; the native targets link it, and it
-  is the reference for WASM lowering. **Constant-time AES = table-free GF(2⁸) arithmetic
+  KAT-tested in the Unity suite against NIST/RFC vectors; it is *intended* to be linked into
+  native targets and is the reference for WASM lowering. ⚠️ **The native backend is currently
+  emission-only ("no runner") and links no external C runtime** — the `--target=<native>`
+  build encodes mock bytecode and never executes; wiring the crypto *language surface* needs a
+  real native runner built first. See `docs/HANDOFF_NATIVE_RUNNER_AND_CRYPTO_SURFACE.md`.
+  **Constant-time AES = table-free GF(2⁸) arithmetic
   S-box** (field-inverse-by-exponentiation `x^254` over a branchless `gmul` + affine bitwise
   map); **no lookup tables, no secret-dependent branches/indexing** (cache-timing-immune).
   AES-NI/hardware accel is a future optimization, **not** a correctness gate. **WASM crypto
