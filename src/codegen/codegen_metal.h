@@ -63,6 +63,12 @@ typedef struct {
     // env.teko_now) + the self-contained in-module uuid.v4/v7 runtime. Native emitters ignore
     // this (they link the C uuid runtime + CSPRNG into the binary via teko_rt).
     int wasm_emit_uuid_rng;
+    // Phase 13 (Sub-phase C, "big step"): 1 to import the compiled-C crypto reactor
+    // (crypto.wasm) — declare its teko_rt_* entry points from the "crypto" module and
+    // share one linear memory with it (memory imported from env instead of module-owned).
+    // Set when the program uses a crypto primitive beyond the in-module hash/uuid set
+    // (ids 5,10-40). Native emitters ignore this (they link the same C runtime directly).
+    int wasm_emit_crypto_ext;
     // Phase 13 (native runner): 1 routes x86_64/arm64 emission to the libc-hosted,
     // assemble-able emitter (emit_native_hosted.c) instead of the freestanding "metal"
     // emitters — produces a binary the system `cc` links against teko_rt and RUNS. The
@@ -90,6 +96,7 @@ void teko_metal_set_emit_codecs(MetalContext* ctx, int enabled);
 void teko_metal_set_emit_hash(MetalContext* ctx, int enabled);
 void teko_metal_set_emit_random(MetalContext* ctx, int enabled);
 void teko_metal_set_emit_uuid_rng(MetalContext* ctx, int enabled);
+void teko_metal_set_emit_crypto_ext(MetalContext* ctx, int enabled);
 
 // Phase 13 (native runner): route x86_64/arm64 emission to the libc-hosted emitter.
 void teko_metal_set_hosted(MetalContext* ctx, int enabled);

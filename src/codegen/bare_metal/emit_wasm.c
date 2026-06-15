@@ -1,6 +1,28 @@
 #include "../codegen_metal.h"
+#include "../emit_native_hosted.h" // teko_native_runtime_symbol — single id→symbol+arity source
 #include <stdio.h>
 #include <string.h>
+
+// Phase 13 (Sub-phase C, "big step"): the crypto runtime ids whose WASM lowering is the
+// compiled-C reactor (crypto.wasm), NOT an in-module WAT runtime. Everything in the
+// OP_CALL_RUNTIME table with id >= 4 EXCEPT the in-module set {4 sha256, 6 md5, 7 sha1,
+// 8/9 uuid v3/v5, 41 random, 42/43 uuid v4/v7}. For these ids the emitted module imports
+// the reactor's teko_rt_* entry point from the "crypto" namespace (resolved, with arity,
+// via teko_native_runtime_symbol — the same table the native runner uses).
+static int wasm_is_crypto_ext_id(int id) {
+    switch (id) {
+        case 5: case 10: case 11: case 12: case 15: case 16:        // sha512/384, sha3, blake
+        case 17: case 18: case 19:                                  // HMAC
+        case 20: case 21: case 22: case 23:                         // AEAD
+        case 24: case 25: case 26:                                  // Ed25519, X25519
+        case 27: case 28:                                           // KDF
+        case 29: case 30: case 31: case 32:                         // ECDSA
+        case 33: case 34:                                           // SHAKE
+        case 37: case 38: case 39: case 40:                         // RSA
+            return 1;
+        default: return 0;
+    }
+}
 
 // ===========================================================================
 // WASM (WAT) emitter — Phase 10.3: cooperative concurrency with mid-function
@@ -1097,7 +1119,31 @@ void emit_wasm_pure(MetalContext* ctx, OpCode op, int32_t arg) {
             if (ctx->wasm_emit_uuid_rng) {
                 fprintf(f, "  (import \"env\" \"teko_now\" (func $teko_now (result i64)))\n");
             }
-            fprintf(f, "  (memory 1)\n");
+            // Phase 13 Sub-phase C (big step): import the compiled-C crypto reactor's
+            // teko_rt_* entry points. The reactor (crypto.wasm) is a SECOND module the
+            // host instantiates against the SAME linear memory; its bump heap lives above
+            // Teko's [0..65536) region (link --global-base=65536), so the allocators never
+            // alias. Declare an import per reactor-backed id (all imports must precede defs).
+            if (ctx->wasm_emit_crypto_ext) {
+                for (int id = 0; id <= 40; id++) {
+                    int ar = 1;
+                    const char* sym;
+                    if (!wasm_is_crypto_ext_id(id)) continue;
+                    sym = teko_native_runtime_symbol(id, &ar);
+                    if (!sym) continue;
+                    fprintf(f, "  (import \"crypto\" \"%s\" (func $crypto_%d", sym, id);
+                    for (int p = 0; p < ar; p++) fprintf(f, " (param i32)");
+                    fprintf(f, " (result i32)))\n");
+                }
+            }
+            // Memory: module-owned by default; when the crypto reactor is in play it is
+            // host-owned and SHARED (imported from env), so both modules address the same
+            // bytes. Re-export it either way so harnesses can read results via exports.memory.
+            if (ctx->wasm_emit_crypto_ext) {
+                fprintf(f, "  (import \"env\" \"memory\" (memory 1))\n");
+            } else {
+                fprintf(f, "  (memory 1)\n");
+            }
             fprintf(f, "  (export \"memory\" (memory 0))\n");
             fprintf(f, "  (global $arena_sp (mut i32) (i32.const 2048))\n");
             emit_wasm_scheduler_runtime(f);
@@ -1172,12 +1218,20 @@ void emit_wasm_pure(MetalContext* ctx, OpCode op, int32_t arg) {
             else if (arg == 43) fn = "teko_uuid_v7";    // Phase 13 Sub-phase C uuid v7 (host time+entropy)
             if (fn) {
                 fprintf(f, "    local.get $w0\n    call $%s\n    local.set $w0\n", fn);
+            } else if (wasm_is_crypto_ext_id(arg)) {
+                // Reactor-backed crypto: call the imported teko_rt_* entry point. Multi-arg
+                // ABI mirrors OP_CALL_IMPORT — args 0..n-2 come from the staging slots
+                // $a0..$a(n-2) (set by OP_SETARG), the last from $w0; the result lands in
+                // $w0. Stack-neutral: n pushes consumed by the call, one result popped.
+                int ar = 1;
+                teko_native_runtime_symbol(arg, &ar);
+                for (int p = 0; p + 1 < ar; p++) fprintf(f, "    local.get $a%d\n", p);
+                fprintf(f, "    local.get $w0\n    call $crypto_%d\n    local.set $w0\n", arg);
             } else {
-                // Reserved-with-target: this crypto runtime id has a native lowering
-                // (teko_rt) but no WASM lowering yet (deferred to Sub-phase C: compile the
-                // C runtime -> wasm32 + import). Trap loudly rather than mis-call another
-                // runtime fn, so the token is never silently wrong on the WASM surface.
-                fprintf(f, "    unreachable ;; crypto runtime id %d not yet lowered to WASM\n", arg);
+                // Genuinely un-lowered runtime id (none remain in the crypto surface): trap
+                // loudly rather than mis-call another runtime fn, so a token is never silently
+                // wrong on the WASM surface.
+                fprintf(f, "    unreachable ;; crypto runtime id %d not lowered to WASM\n", arg);
             }
             break;
         }

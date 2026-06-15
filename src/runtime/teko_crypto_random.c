@@ -3,7 +3,24 @@
 
 #include "teko_crypto_random.h"
 
-#if defined(_WIN32)
+#if defined(__wasm__)
+
+// WASM target: there is no OS entropy source in the module. Route to the host
+// import `env.teko_random(ptr, len)` — the SAME entropy import the emitted Teko
+// module already declares for `random.bytes`/`uuid.v4`/`v7` (Node:
+// crypto.randomFillSync; browser: crypto.getRandomValues). The import name is
+// fixed via attributes so wasm-ld emits it without `--allow-undefined`.
+__attribute__((import_module("env"), import_name("teko_random")))
+extern void teko_rt_host_random(uint8_t* out, uint32_t len);
+
+int teko_csprng_bytes(uint8_t* out, size_t len) {
+    if (len == 0u) return 0;
+    if (!out) return -1;
+    teko_rt_host_random(out, (uint32_t)len);
+    return 0;
+}
+
+#elif defined(_WIN32)
 
 #include <windows.h>
 #include <bcrypt.h>

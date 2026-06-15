@@ -17,13 +17,19 @@
 #include "teko_crypto_rsa.h"
 #include "teko_crypto_random.h"
 #include "teko_uuid.h"
-#include <stdio.h>
-#include <time.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#if !defined(__wasm__)
+// stdio/time back the print primitive (teko_rt_emit) and the UUID v4/v7 clock —
+// neither exists in the freestanding wasm32 build. On WASM the crypto reactor
+// exports only the pure crypto wrappers (ids 4-40); emit + uuid.v4/v7 + random
+// (ids 41-43) are lowered in-module by the emitter, so guard them out here.
+#include <stdio.h>
+#include <time.h>
 #if defined(_WIN32)
 #include <windows.h> // GetSystemTimeAsFileTime (no POSIX clock_gettime on MSVC)
+#endif
 #endif
 
 #define TEKO_RT_KDF_MAX_OUT 1024 // bound variable-length output buffers (KDF/XOF) to a sane size
@@ -34,9 +40,11 @@
 // the portable C crypto runtime (the single source of truth), which is compiled into
 // the same archive so produced binaries are self-contained.
 
+#if !defined(__wasm__)
 void teko_rt_emit(const char* s) {
     puts(s ? s : "");
 }
+#endif
 
 // Decode a hex string into a fresh byte buffer (caller frees via free). Sets *out_len.
 // Returns NULL on odd length or a non-hex digit. An empty string decodes to a 0-length
@@ -509,6 +517,10 @@ char* teko_rt_rsa_oaep_decrypt(const char* n_hex, const char* d_hex, const char*
 }
 
 // --- CSPRNG ----------------------------------------------------------------------
+// ids 41-43 (random.bytes, uuid.v4/v7) are lowered in-module on WASM (host
+// entropy/time imports), so the reactor doesn't export them — guard out the
+// clock/CSPRNG-string wrappers that would otherwise pull stdio/time on wasm32.
+#if !defined(__wasm__)
 char* teko_rt_random_bytes(int n) {
     if (n <= 0 || n > TEKO_RT_KDF_MAX_OUT) return NULL;
     uint8_t* buf = (uint8_t*)malloc((size_t)n);
@@ -562,3 +574,4 @@ char* teko_rt_uuid_v7(int ignored) {
     if (teko_uuid_v7(u, teko_rt_unix_ms()) != 0) return NULL;
     return teko_rt_uuid_str(u);
 }
+#endif // !__wasm__ (CSPRNG / UUID v4-v7 tail)

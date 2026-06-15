@@ -6,8 +6,18 @@
 > vectors (NIST / RFC KATs) + round-trips. Phase 17 (Networking & Web) later consumes these
 > primitives for TLS 1.3. See `docs/plan.md` → "PHASE 13: Native Cryptography".
 
-## ▶ STATUS: COMPLETE — asymmetric block landed (same branch/PR #6)
-**Phase 13 is functionally complete.** Done & CI-green: 13.1, 13.1 `hash.sha256` wiring,
+## ▶ STATUS: FULLY COMPLETE — runtime + native surface + WASM surface (2026-06-15, PR #6)
+**Phase 13 is fully complete on all three layers.** Beyond the runtime + native surface below,
+the **WASM crypto surface is now DONE** (Sub-phase C "big step"): the single C runtime is
+compiled to a wasm32 reactor (`runtime/wasm/crypto/`) that the emitted module imports and shares
+linear memory with, so `OP_CALL_RUNTIME` ids 5,10-40 (every hash/HMAC/AEAD/KDF/signature beyond
+the in-module sha256/md5/sha1/uuid set) lower on WASM to the SAME implementation as native — no
+hand-emitted WAT, no dead tokens. Entropy via the `env.teko_random` host import. Proven by
+`runtime/wasm/run-crypto.mjs` (32 KAT vectors) in `wasm.yml`. See
+`docs/HANDOFF_NATIVE_RUNNER_AND_CRYPTO_SURFACE.md` → "Sub-phase C, step 3" for the full design.
+
+### Earlier: asymmetric block landed (same branch/PR #6)
+**Phase 13 runtime + native surface complete.** Done & CI-green: 13.1, 13.1 `hash.sha256` wiring,
 13.3a, 13.2, 13.4, the Curve25519 block (X25519 + Ed25519), legacy hashes (MD5 + SHA-1, C +
 `hash.md5`/`hash.sha1` WASM surface), UUID (full C runtime nil/v3/v4/v5/v7/v8 + parse/format,
 `uuid.v3`/`uuid.v5` WASM surface), the Montgomery bignum layer, **and the full asymmetric
@@ -31,14 +41,14 @@ The asymmetric block was built as KAT-anchored increments on the bignum layer:
    decrypt, OAEP (MGF1) encrypt/decrypt, PSS sign/verify. KATs: NIST FIPS 186 SigGen,
    Project Wycheproof OAEP/PSS, plus round-trips.
 
-**Next work (owner-approved 2026-06-15, same PR #6) — NOT started, handed off to a fresh
-session:** wire the **full crypto language surface** to the C runtime (native-first, no dead
-tokens, executable `.tks` proofs), then the WASM follow-ups (host entropy/time import; compile
-the C runtime → wasm32). This requires **building a real native runner first** (the native
-backend is currently emission-only). The complete cold-start brief, the two design decisions
-(native-first; hex-at-surface ABI), and the sequenced plan are in
-**`docs/HANDOFF_NATIVE_RUNNER_AND_CRYPTO_SURFACE.md`**. The native C runtimes are the single
-source of truth and are fully KAT-tested.
+**Follow-on work (owner-approved 2026-06-15, same PR #6) — ✅ ALL DONE.** The native runner was
+built (Sub-phase A), the **full crypto language surface** wired to the C runtime native-first
+(Sub-phase B, no dead tokens, executable `.tks` proofs), and the WASM follow-ups completed
+(Sub-phase C: host entropy/time imports for CSPRNG + uuid.v4/v7, then the "big step" — compile
+the C runtime → wasm32 reactor for the whole hash/HMAC/AEAD/KDF/signature surface). The complete
+record, the two design decisions (native-first; hex-at-surface ABI), and the per-step progress
+log are in **`docs/HANDOFF_NATIVE_RUNNER_AND_CRYPTO_SURFACE.md`**. The native C runtimes are the
+single source of truth (KAT-tested) and are now the source for BOTH native and WASM lowering.
 
 ### DECISION TO DOCUMENT & IMPLEMENT FIRST — the bignum layer (owner pre-approved)
 Build a shared **fixed-capacity, little-endian 32-bit-limb multi-precision integer** module

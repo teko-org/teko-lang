@@ -1,8 +1,15 @@
 # Hand-off — Native Runner + Full Crypto Language Surface (then WASM follow-ups)
 
-## ⇒ NEXT SESSION COLD-START: Sub-phase C "big step" — compile the C crypto runtime → wasm32
-**STATUS: HANDED OFF, NOT STARTED.** This is the one substantial remaining piece; everything else
-is DONE and CI-green. It was handed off because it is a multi-increment, toolchain-heavy
+## ⇒ Sub-phase C "big step" — compile the C crypto runtime → wasm32
+**STATUS: ✅ DONE & CI-green (2026-06-15).** Phase 13 is now FULLY COMPLETE — runtime + native
+surface + WASM surface. The full crypto language surface (hashes/HMAC/AEAD/KDF/signatures/RSA,
+OP_CALL_RUNTIME ids 5,10-40) works on the WASM target via the compiled-C reactor; no id traps any
+more. See the "Sub-phase C, step 3 (big step)" progress-log entry below for the mechanism and
+inventory. The original cold-start brief that follows is retained for historical context.
+
+### (historical cold-start brief — superseded by the DONE entry above)
+This was the one substantial remaining piece; everything else
+was already DONE and CI-green. It was handed off because it is a multi-increment, toolchain-heavy
 sub-project that **cannot be validated on the macOS dev box without installing a wasm32 toolchain**
 (see the toolchain box below — Apple clang lacks the wasm32 target), so it warrants a fresh,
 well-resourced session rather than low-context blind-on-CI iteration. State at hand-off (HEAD
@@ -190,16 +197,39 @@ ABI to recompile for wasm32.
   `check_uuid` (asserts canonical layout + version/variant nibbles) and
   `runtime/wasm/samples/uuid_rng.tks` + `run-uuid-rng.mjs` (host fills deterministic
   entropy/time → exact v4/v7 KATs). macOS arm64 + Linux x86_64/arm64 + Node.
-- **REMAINING — Sub-phase C (the big step):** the rest of the surface (hashes/HMAC/AEAD/
-  asymmetric, ids 4-40) still traps (`unreachable`) on WASM. Compile the C crypto runtime →
-  wasm32 + import so WASM lowers to the SAME single implementation instead of re-emitting WAT
-  per primitive (and declare the `$a` staging locals for multi-arg `OP_CALL_RUNTIME` on WASM).
-  Executable proofs in the Node/Chromium harness. **This is the substantial remaining piece.**
-  Each: `codec_id_for` id + `runtime_arity` + `teko_native_runtime_symbol` entry + `teko_rt_*`
-  wrapper (hex-at-surface) + an executable `.tks` KAT in `run-native.sh`. The established
-  pattern (see AEAD/HMAC/Ed25519) scales directly; 8 staging slots cover all current arities.
-  For ECDSA, check the `teko_crypto_ecc/p256/p384` APIs for the key/point + nonce (RFC 6979)
-  shapes; for RSA, `teko_crypto_rsa` for the key encoding the KATs expect.
+- **Sub-phase C, step 3 — the "big step": full crypto surface on WASM via a compiled-C
+  reactor: DONE (2026-06-15).** Every remaining crypto runtime id (5,10-40 — hashes beyond
+  sha256, HMAC, AEAD, KDF, X25519, Ed25519, ECDSA, SHAKE, RSA) now lowers on the WASM target
+  to the SAME single C runtime as native, NOT a hand-emitted WAT re-implementation. Mechanism:
+  - **Reactor:** `src/runtime/teko_crypto_*.c` + the `teko_rt_*` hex-at-surface wrappers +
+    `teko_uuid.c` are compiled to a freestanding **wasm32 "reactor" module** (`crypto.wasm`)
+    by `runtime/wasm/crypto/build-crypto-reactor.sh` (a wasm32-capable clang + `wasm-ld` from
+    LLVM lld + the dir's tiny libc shim — `memcpy/memset/memmove/memcmp/strlen` + a bump
+    `malloc`; **no wasi-sdk**). `<stdint.h>`/`<stddef.h>` are clang freestanding headers; the
+    shim supplies `<string.h>`/`<stdlib.h>`. `teko_crypto_random.c` routes its OS-entropy `#if`
+    to a new `__wasm__` branch that calls the host import `env.teko_random` (RSA PSS/OAEP draw
+    their salt/seed from it). `teko_rt.c`'s emit + uuid.v4/v7 + random tail (ids 41-43, already
+    in-module on WASM) is guarded out under `#if !defined(__wasm__)` — single source preserved,
+    native untouched.
+  - **Shared memory, no allocator collision:** the reactor is linked
+    `--no-stack-first --global-base=65536 -z stack-size=1MiB`, so its entire image (rodata +
+    shadow stack) and its bump heap (from the linker `__heap_base`) live ABOVE Teko's
+    `[0..65536)` region (string pool / arena / `$teko_alloc`). The reactor imports `env.memory`;
+    the emitted Teko module ALSO imports `env.memory` (host-owned & shared) whenever a
+    reactor-backed id is used — gated by a new `uses_crypto_ext` flag so every non-crypto
+    program is byte-for-byte unchanged (verified by diff).
+  - **Emitter:** `emit_wasm.c` declares `(import "crypto" "teko_rt_*" …)` per reactor id (arity
+    from the shared `teko_native_runtime_symbol`), switches memory to imported, and routes
+    `OP_CALL_RUNTIME` ids 5,10-40 to `call $crypto_<id>` with the existing `$a0..$a2` staging
+    ABI (max arity 4). The `unreachable` trap remains only for genuinely-unwired ids (none
+    remain in the surface — no dead tokens).
+  - **Proofs:** `runtime/wasm/samples/crypto_{hash,hmac,aead,sign,kdf,rsa}.tks` compiled by the
+    real `teko` binary → wat → wasm, instantiated against the reactor under Node by
+    `runtime/wasm/run-crypto.mjs`, asserting the SAME FIPS/NIST/RFC KAT vectors as the native
+    proofs (32 vectors total: hash 8, HMAC 3, AEAD 5, sign/ECDH 11, KDF 2, RSA 3). Wired into
+    `wasm.yml` (`apt-get install lld`; build reactor; compile + assemble + run). All four gates
+    green; 167/167 Unity suite, ASan/UBSan both dispatch paths + TSan clean; 16 native goldens
+    and the native crypto runner unchanged.
 
 > **Status:** owner-approved next work. Same PR/branch as Phase 13:
 > `feat/phase-13-native-crypto` (PR #6). The Phase 13 crypto **runtime** is complete and

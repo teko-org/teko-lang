@@ -124,6 +124,13 @@ typedef struct {
     // WASM backend declares the host entropy import (env.teko_random) + time import
     // (env.teko_now) and the self-contained v4/v7 runtime. Native targets ignore this.
     int uses_uuid_rng;
+    // Phase 13 (Sub-phase C, "big step"): 1 if the program calls a crypto primitive whose
+    // WASM lowering is the compiled C runtime reactor (ids 5,10-40 — every hash/HMAC/AEAD/
+    // KDF/signature beyond the in-module sha256/md5/sha1/uuid set). The WASM backend then
+    // imports the reactor's teko_rt_* entry points from the "crypto" module and shares one
+    // linear memory with it (imported from env). Native targets ignore this (they link the
+    // same C runtime directly via libteko_rt.a).
+    int uses_crypto_ext;
 } BytecodeBuffer;
 
 // Public functions of the IL Bytecode Emitter

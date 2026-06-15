@@ -25,6 +25,7 @@ BytecodeBuffer* codegen_li_create_context(void) {
     buffer->uses_hash = 0;
     buffer->uses_random = 0;
     buffer->uses_uuid_rng = 0;
+    buffer->uses_crypto_ext = 0;
 
     return buffer;
 }
@@ -145,9 +146,17 @@ void codegen_li_emit_call_runtime(BytecodeBuffer* buffer, int codec_id) {
     // id 41 = random.bytes: a CSPRNG that needs a host entropy import on WASM (its own
     // runtime block), not the SHA family — flag it separately so hash-free programs that
     // only use randomness don't drag in the hash runtime.
+    // WASM emission flags (native ignores these — it always links libteko_rt.a):
+    //  - ids 0-3  : base64/hex codecs (in-module).
+    //  - ids 4,6,7,8,9 : sha256 + legacy md5/sha1 + uuid v3/v5 — in-module WAT runtimes.
+    //  - id 41 / 42,43 : CSPRNG / uuid v4,v7 — in-module + host entropy/time imports.
+    //  - everything else >= 4 (sha512/384, sha3, shake, blake, HMAC, AEAD, KDF, X25519,
+    //    Ed25519, ECDSA, RSA) : the compiled-C crypto reactor, imported on WASM.
     if (codec_id == 41) buffer->uses_random = 1;
     else if (codec_id == 42 || codec_id == 43) buffer->uses_uuid_rng = 1; // uuid.v4/v7
-    else if (codec_id >= 4) buffer->uses_hash = 1;
+    else if (codec_id == 4 || codec_id == 6 || codec_id == 7 ||
+             codec_id == 8 || codec_id == 9) buffer->uses_hash = 1;       // in-module set
+    else if (codec_id >= 4) buffer->uses_crypto_ext = 1;                  // reactor set
     else buffer->uses_codec = 1;
     emit_byte(buffer, OP_CALL_RUNTIME);
     emit_int(buffer, codec_id);

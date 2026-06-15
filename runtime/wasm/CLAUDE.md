@@ -51,6 +51,24 @@ the runners execute and assert. (Locally, `npm i wabt` gives a JS `wat2wasm`.)
   `worker_threads`. `browser/threads-*.mjs` + `run-threads-browser.mjs` — Layer B via Web Workers.
 - `server.mjs` — static server with COOP/COEP (required for SharedArrayBuffer / Layer B).
 
+## Crypto surface (Phase 13 Sub-phase C, "big step")
+The full crypto language surface (`hash.*`/`hmac.*`/`crypto.*`/`kdf.*` beyond the in-module
+sha256/md5/sha1/uuid set) runs on WASM by importing a **compiled-C reactor**, not by
+hand-emitting WAT per primitive:
+- `crypto/build-crypto-reactor.sh` compiles `src/runtime/teko_crypto_*.c` + the `teko_rt_*` hex
+  wrappers to `crypto/crypto.wasm` — a freestanding wasm32 module (wasm32 clang + `wasm-ld` from
+  LLVM lld + `crypto/libc_shim.c` + `crypto/include/`; **no wasi-sdk**). It imports `env.memory`
+  + `env.teko_random`, exports `teko_rt_*` (ids 5,10-40). Linked `--global-base=65536
+  --no-stack-first` so its image+heap sit above Teko's `[0..65536)` region (no allocator alias).
+- The emitted Teko module (when it uses a reactor-backed id) imports those entry points from the
+  `crypto` namespace and shares the host-owned linear memory. Inputs/outputs are hex strings
+  passed by pointer through the shared memory.
+- `run-crypto.mjs` instantiates the reactor + each `samples/crypto_{hash,hmac,aead,sign,kdf,
+  rsa}.tks` (teko-compiled) against one shared `WebAssembly.Memory`, runs `main`, and asserts the
+  emitted output against the SAME FIPS/NIST/RFC KAT vectors as the native proofs (32 total). Only
+  the `.tks` is committed; the `.wat`/`.wasm`/reactor are regenerated in `wasm.yml` (`apt-get
+  install lld`).
+
 ## Layer B note
 `main()` blocks, so it runs in a **runner worker** (the node main thread must stay free to
 bootstrap the producer). The channel **receive busy-polls** the flag (bounded, `unreachable`

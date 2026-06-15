@@ -115,10 +115,17 @@ output locally (the goldens only `strstr`; always *assemble + run*, never trust 
   S-box** (field-inverse-by-exponentiation `x^254` over a branchless `gmul` + affine bitwise
   map); **no lookup tables, no secret-dependent branches/indexing** (cache-timing-immune).
   AES-NI/hardware accel is a future optimization, **not** a correctness gate. **WASM crypto
-  lowering is deferred** to a "compile the C runtime → wasm32 + import" step (NOT hand-emitted
-  WAT per primitive — that would be a second implementation of each algorithm); only
-  `hash.sha256` has a WASM lowering so far (in-module, FIPS-validated). `hash.sha512`/`sha3`/
-  `blake3` + `random`/HKDF/PBKDF2 stay reserved-with-target on the WASM surface until then.
+  lowering is DONE (Sub-phase C "big step", 2026-06-15):** the single C runtime is compiled to a
+  freestanding **wasm32 "reactor" module** (`runtime/wasm/crypto/build-crypto-reactor.sh`:
+  wasm32 clang + `wasm-ld` + a tiny libc shim, **no wasi-sdk**) the emitted Teko module imports
+  (namespace `crypto`) and shares ONE linear memory with — NOT hand-emitted WAT per primitive,
+  the SAME source of truth as native. Reactor image+heap are linked above Teko's `[0..65536)`
+  window (`--global-base=65536 --no-stack-first`), so the allocators never alias.
+  `OP_CALL_RUNTIME` ids 5,10-40 lower to `call $crypto_<id>` (gated by a `uses_crypto_ext` flag;
+  non-crypto modules stay byte-identical). Entropy = the `env.teko_random` host import
+  (`teko_crypto_random.c` `__wasm__` branch). In-module ids 4/6/7/8/9 (sha256/md5/sha1/uuid
+  v3/v5) + 41/42/43 (random/uuid v4/v7) remain in-module. Proofs: `runtime/wasm/run-crypto.mjs`
+  over `crypto_{hash,hmac,aead,sign,kdf,rsa}.tks` (same KAT vectors as native) in `wasm.yml`.
 - **Phase 13 asymmetric block (P-curves + RSA) — DONE (decisions).** Shared **Montgomery
   bignum** (`teko_crypto_bn.c`, CIOS, runtime R²/n′, MSVC-safe 32-bit limbs) exposes a
   limb-level field API; the **NIST P-curves** (`teko_crypto_ec.c` group law +
@@ -155,12 +162,21 @@ output locally (the goldens only `strstr`; always *assemble + run*, never trust 
 
 ## Current state / next
 Phases 10 (WASM concurrency) and 11 (Browser FFI / JS-DOM interop) are **merged and CI-green**
-(PR #3, PR #4). **Phase 13 (Native Cryptography) is functionally complete and CI-green** on
-`feat/phase-13-native-crypto` (PR #6, ready to leave draft): the full hash/MAC, KDF, symmetric/
-AEAD, memory-hard, and **asymmetric** (X25519, Ed25519, P-256 & P-384 ECDH/ECDSA, RSA PKCS#1
-v1.5 / OAEP / PSS) primitives as KAT-tested portable C runtimes (suite 167/167, all four gates
-green). The `crypto`/`hash`/`sign`/`verify`/`encrypt`/`decrypt` **language surface** beyond
-`hash.sha256` + `uuid.v3`/`v5` is **not yet wired** — that frontend lowering, and the deferred
-WASM crypto path (compile C runtime → wasm32 + host entropy import), are the next crypto steps.
+(PR #3, PR #4). **Phase 13 (Native Cryptography) is FULLY COMPLETE and CI-green** on
+`feat/phase-13-native-crypto` (PR #6, ready to leave draft) — runtime + native surface + WASM
+surface, all three:
+- **Runtime:** the full hash/MAC, KDF, symmetric/AEAD, memory-hard, and **asymmetric** (X25519,
+  Ed25519, P-256 & P-384 ECDH/ECDSA, RSA PKCS#1 v1.5 / OAEP / PSS) primitives as KAT-tested
+  portable C runtimes (Unity suite 167/167).
+- **Native surface:** `crypto`/`hash`/`hmac`/`kdf`/`uuid`/`random` tokens lower (via
+  `OP_CALL_RUNTIME` → `teko_rt_*` over the linked C runtime) to runnable binaries, each with an
+  executable `.tks` KAT (`runtime/native/run-native.sh`, `native.yml`).
+- **WASM surface (Sub-phase C "big step"):** the SAME C runtime is compiled to a wasm32 reactor
+  (`runtime/wasm/crypto/`) the emitted module imports + shares memory with; ids 5,10-40 lower to
+  `call $crypto_<id>`, entropy via `env.teko_random`. Proven by `runtime/wasm/run-crypto.mjs`
+  (32 KAT vectors, `wasm.yml`). **No dead crypto tokens on any target.**
+
+All four gates green (167/167; ASan/UBSan both dispatch paths + TSan; 16 native goldens intact).
 Phase 12 (Frontend Grammar & Lexer Extension) work continues on its own branch (PR #5). See
-`docs/PHASE13_NATIVE_CRYPTO.md` and `docs/PHASE12_FRONTEND_GRAMMAR.md`.
+`docs/PHASE13_NATIVE_CRYPTO.md`, `docs/HANDOFF_NATIVE_RUNNER_AND_CRYPTO_SURFACE.md`, and
+`docs/PHASE12_FRONTEND_GRAMMAR.md`.

@@ -39,7 +39,8 @@ jobs:
         run: |
           sudo rm -f /etc/apt/sources.list.d/microsoft*.list /etc/apt/sources.list.d/azure*.list /etc/apt/sources.list.d/azure-cli*.list 2>/dev/null || true
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build clang wabt
+          # lld provides wasm-ld for the Phase 13 crypto reactor (C runtime -> wasm32).
+          sudo apt-get install -y cmake ninja-build clang lld wabt
           # The wasmtime installer downloads a release tarball and can flake on the network
           # (seen: ~/.wasmtime/bin/wasmtime missing -> later exit 127). Retry, then verify the
           # binary actually landed so a failed install fails THIS step with a clear message.
@@ -71,6 +72,15 @@ jobs:
           ./build/teko build runtime/wasm/samples/uuid.tks  --target=wasm -o runtime/wasm/samples/uuid.wat
           ./build/teko build runtime/wasm/samples/random.tks --target=wasm -o runtime/wasm/samples/random.wat
           ./build/teko build runtime/wasm/samples/uuid_rng.tks --target=wasm -o runtime/wasm/samples/uuid_rng.wat
+      - name: Build the crypto reactor (C runtime -> wasm32) + compile crypto .tks proofs
+        run: |
+          # Compile the single C crypto runtime to a wasm32 reactor module the emitted
+          # crypto modules import (Phase 13 Sub-phase C "big step"). clang ships wasm32;
+          # wasm-ld comes from lld (installed above).
+          bash runtime/wasm/crypto/build-crypto-reactor.sh runtime/wasm/crypto/crypto.wasm
+          for s in crypto_hash crypto_hmac crypto_aead crypto_sign crypto_kdf crypto_rsa; do
+            ./build/teko build runtime/wasm/samples/$s.tks --target=wasm -o runtime/wasm/samples/$s.wat
+          done
       - name: Assemble all modules (wat2wasm)
         run: |
           wat2wasm runtime/wasm/samples/channels.wat        -o runtime/wasm/samples/channels.wasm
@@ -85,6 +95,9 @@ jobs:
           wat2wasm runtime/wasm/samples/uuid.wat            -o runtime/wasm/samples/uuid.wasm
           wat2wasm runtime/wasm/samples/random.wat          -o runtime/wasm/samples/random.wasm
           wat2wasm runtime/wasm/samples/uuid_rng.wat        -o runtime/wasm/samples/uuid_rng.wasm
+          for s in crypto_hash crypto_hmac crypto_aead crypto_sign crypto_kdf crypto_rsa; do
+            wat2wasm runtime/wasm/samples/$s.wat -o runtime/wasm/samples/$s.wasm
+          done
       - name: Run under Node (channels=42, scheduler=15, emitted=7, suspend=30, multi=15)
         run: node runtime/wasm/run-node.mjs
       - name: Run Browser-FFI proof under Node (host env.log reads pooled string)
@@ -103,6 +116,8 @@ jobs:
         run: node runtime/wasm/run-uuid-rng.mjs
       - name: Run allocator stress under Node (alloc/free/coalesce/double-free/reset)
         run: node runtime/wasm/run-alloc.mjs
+      - name: Run FULL crypto surface proof under Node (teko-compiled crypto_*.tks via the C reactor)
+        run: node runtime/wasm/run-crypto.mjs
       - name: Run under wasmtime
         run: |
           ~/.wasmtime/bin/wasmtime run --invoke test runtime/wasm/samples/channels.wasm
