@@ -14,10 +14,13 @@
 #include "teko_crypto_pbkdf2.h"
 #include "teko_crypto_p256.h"
 #include "teko_crypto_p384.h"
+#include "teko_crypto_rsa.h"
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+
+#define TEKO_RT_KDF_MAX_OUT 1024 // bound variable-length output buffers (KDF/XOF) to a sane size
 
 // See teko_rt.h. This translation unit is compiled into the static archive
 // `libteko_rt.a`, which the native runner links into every produced executable.
@@ -106,6 +109,32 @@ char* teko_rt_sha3_512_hex(const char* msg) {
     uint8_t digest[TEKO_SHA3_512_DIGEST_LEN];
     teko_sha3_512(p, len, digest);
     return teko_rt_to_hex(digest, TEKO_SHA3_512_DIGEST_LEN);
+}
+
+// SHAKE128/256 XOF: msg is a plain string, out_len is the requested squeeze length (bytes).
+// Returns the lowercase-hex of `out_len` output bytes. Output bounded like the KDFs.
+char* teko_rt_shake128(const char* msg, int out_len) {
+    if (out_len <= 0 || out_len > TEKO_RT_KDF_MAX_OUT) return NULL;
+    const uint8_t* p = (const uint8_t*)(msg ? msg : "");
+    size_t len = msg ? strlen(msg) : 0;
+    uint8_t* out = (uint8_t*)malloc((size_t)out_len);
+    if (!out) return NULL;
+    teko_shake128(p, len, out, (size_t)out_len);
+    char* hex = teko_rt_to_hex(out, (size_t)out_len);
+    free(out);
+    return hex;
+}
+
+char* teko_rt_shake256(const char* msg, int out_len) {
+    if (out_len <= 0 || out_len > TEKO_RT_KDF_MAX_OUT) return NULL;
+    const uint8_t* p = (const uint8_t*)(msg ? msg : "");
+    size_t len = msg ? strlen(msg) : 0;
+    uint8_t* out = (uint8_t*)malloc((size_t)out_len);
+    if (!out) return NULL;
+    teko_shake256(p, len, out, (size_t)out_len);
+    char* hex = teko_rt_to_hex(out, (size_t)out_len);
+    free(out);
+    return hex;
 }
 
 char* teko_rt_blake3_hex(const char* msg) {
@@ -301,8 +330,6 @@ char* teko_rt_x25519(const char* scalar_hex, const char* u_hex) {
 }
 
 // --- KDF: HKDF-SHA-256 / PBKDF2-HMAC-SHA-256 -------------------------------------
-#define TEKO_RT_KDF_MAX_OUT 1024 // bound the output buffer to a sane size
-
 char* teko_rt_hkdf_sha256(const char* ikm_hex, const char* salt_hex,
                           const char* info_hex, int out_len) {
     if (out_len <= 0 || out_len > TEKO_RT_KDF_MAX_OUT) return NULL;
@@ -397,4 +424,80 @@ char* teko_rt_ecdsa_p384_verify(const char* pub_hex, const char* hash_hex, const
               teko_p384_ecdsa_verify(pub, hash, hl, sig) == 0);
     free(pub); free(hash); free(sig);
     return teko_rt_bool(ok);
+}
+
+// --- RSA: PSS sign/verify, OAEP encrypt/decrypt (SHA-256 + MGF1-SHA-256) ---------
+#define TEKO_RT_RSA_PSS_SALT_LEN 32u // = hLen for SHA-256 (randomized salt, secure default)
+
+char* teko_rt_rsa_pss_sign(const char* n_hex, const char* d_hex, const char* mhash_hex) {
+    size_t nl = 0, dl = 0, ml = 0;
+    uint8_t* n = teko_rt_from_hex(n_hex, &nl);
+    uint8_t* d = teko_rt_from_hex(d_hex, &dl);
+    uint8_t* mh = teko_rt_from_hex(mhash_hex, &ml);
+    char* out = NULL;
+    if (n && d && mh && ml == 32) {
+        uint8_t* sig = (uint8_t*)malloc(nl);
+        if (sig) {
+            if (teko_rsa_pss_sign(n, nl, d, dl, TEKO_RSA_SHA256, mh, ml,
+                                  TEKO_RT_RSA_PSS_SALT_LEN, sig) == 0)
+                out = teko_rt_to_hex(sig, nl);
+            free(sig);
+        }
+    }
+    free(n); free(d); free(mh);
+    return out;
+}
+
+char* teko_rt_rsa_pss_verify(const char* n_hex, const char* e_hex,
+                             const char* mhash_hex, const char* sig_hex) {
+    size_t nl = 0, el = 0, ml = 0, sl = 0;
+    uint8_t* n = teko_rt_from_hex(n_hex, &nl);
+    uint8_t* e = teko_rt_from_hex(e_hex, &el);
+    uint8_t* mh = teko_rt_from_hex(mhash_hex, &ml);
+    uint8_t* sig = teko_rt_from_hex(sig_hex, &sl);
+    int ok = (n && e && mh && sig && ml == 32 &&
+              teko_rsa_pss_verify(n, nl, e, el, TEKO_RSA_SHA256, mh, ml,
+                                  TEKO_RT_RSA_PSS_SALT_LEN, sig, sl) == 0);
+    free(n); free(e); free(mh); free(sig);
+    return teko_rt_bool(ok);
+}
+
+char* teko_rt_rsa_oaep_encrypt(const char* n_hex, const char* e_hex, const char* msg_hex) {
+    size_t nl = 0, el = 0, ml = 0;
+    uint8_t* n = teko_rt_from_hex(n_hex, &nl);
+    uint8_t* e = teko_rt_from_hex(e_hex, &el);
+    uint8_t* msg = teko_rt_from_hex(msg_hex, &ml);
+    char* out = NULL;
+    if (n && e && msg) {
+        uint8_t* ct = (uint8_t*)malloc(nl);
+        if (ct) {
+            if (teko_rsa_oaep_encrypt(n, nl, e, el, TEKO_RSA_SHA256, NULL, 0, msg, ml, ct) == 0)
+                out = teko_rt_to_hex(ct, nl);
+            free(ct);
+        }
+    }
+    free(n); free(e); free(msg);
+    return out;
+}
+
+char* teko_rt_rsa_oaep_decrypt(const char* n_hex, const char* d_hex, const char* ct_hex) {
+    size_t nl = 0, dl = 0, cl = 0;
+    uint8_t* n = teko_rt_from_hex(n_hex, &nl);
+    uint8_t* d = teko_rt_from_hex(d_hex, &dl);
+    uint8_t* ct = teko_rt_from_hex(ct_hex, &cl);
+    char* out = NULL;
+    if (!n || !d || !ct) {
+        out = teko_rt_reject();
+    } else {
+        uint8_t* rec = (uint8_t*)malloc(nl ? nl : 1);
+        if (rec) {
+            size_t rlen = 0;
+            int rc = teko_rsa_oaep_decrypt(n, nl, d, dl, TEKO_RSA_SHA256, NULL, 0,
+                                           ct, cl, rec, &rlen);
+            out = (rc == 0) ? teko_rt_to_hex(rec, rlen) : teko_rt_reject();
+            free(rec);
+        }
+    }
+    free(n); free(d); free(ct);
+    return out;
 }

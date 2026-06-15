@@ -76,6 +76,11 @@ char* teko_rt_hkdf_sha256(const char* ikm_hex, const char* salt_hex,
 char* teko_rt_pbkdf2_sha256(const char* pass_hex, const char* salt_hex,
                             int iterations, int dk_len);
 
+// SHAKE128/256 extendable-output functions (ids 33/34). msg is a plain string; out_len is the
+// requested squeeze length in bytes; returns that many output bytes as lowercase hex.
+char* teko_rt_shake128(const char* msg, int out_len);
+char* teko_rt_shake256(const char* msg, int out_len);
+
 // ECDSA over NIST P-256 / P-384 (ids 29-32, RFC 6979 deterministic). sign takes the private
 // scalar (32/48 bytes) + a message-digest hash, returns the r‖s signature (64/96 bytes) as
 // hex. verify takes the uncompressed public key (X‖Y, 64/96 bytes), the hash, and the
@@ -84,5 +89,15 @@ char* teko_rt_ecdsa_p256_sign(const char* priv_hex, const char* hash_hex);
 char* teko_rt_ecdsa_p256_verify(const char* pub_hex, const char* hash_hex, const char* sig_hex);
 char* teko_rt_ecdsa_p384_sign(const char* priv_hex, const char* hash_hex);
 char* teko_rt_ecdsa_p384_verify(const char* pub_hex, const char* hash_hex, const char* sig_hex);
+
+// RSA over SHA-256 + MGF1-SHA-256 (ids 37-40). Keys are big-endian hex. PSS uses a random
+// salt of hLen (32) — sign returns the signature hex, verify returns "1"/"0". OAEP uses a
+// random seed + empty label — encrypt returns ciphertext hex, decrypt returns the recovered
+// message hex or "REJECT". The mhash arg to PSS is the 32-byte message digest.
+char* teko_rt_rsa_pss_sign(const char* n_hex, const char* d_hex, const char* mhash_hex);
+char* teko_rt_rsa_pss_verify(const char* n_hex, const char* e_hex,
+                             const char* mhash_hex, const char* sig_hex);
+char* teko_rt_rsa_oaep_encrypt(const char* n_hex, const char* e_hex, const char* msg_hex);
+char* teko_rt_rsa_oaep_decrypt(const char* n_hex, const char* d_hex, const char* ct_hex);
 
 #endif // TEKO_RT_H

@@ -359,6 +359,16 @@ static int codec_id_for(const char* lex) {
     if (strcmp(lex, "crypto.ecdsa_p256_verify") == 0) return 30;
     if (strcmp(lex, "crypto.ecdsa_p384_sign") == 0) return 31;
     if (strcmp(lex, "crypto.ecdsa_p384_verify") == 0) return 32;
+    // SHAKE128/256 XOF (msg + output length). ids 33/34.
+    if (strcmp(lex, "hash.shake128") == 0) return 33;
+    if (strcmp(lex, "hash.shake256") == 0) return 34;
+    // RSA (RFC 8017) — keys are big-endian hex (modulus n, exponent e/d), SHA-256 + MGF1.
+    // PSS sign/verify (salt_len=hLen, random salt); OAEP encrypt/decrypt (random seed, empty
+    // label). ids 37-40. sign->sigHex; verify->"1"/"0"; encrypt->ctHex; decrypt->msgHex|REJECT.
+    if (strcmp(lex, "crypto.rsa_pss_sign") == 0) return 37;
+    if (strcmp(lex, "crypto.rsa_pss_verify") == 0) return 38;
+    if (strcmp(lex, "crypto.rsa_oaep_encrypt") == 0) return 39;
+    if (strcmp(lex, "crypto.rsa_oaep_decrypt") == 0) return 40;
     // Legacy hashes (insecure — interop only): in-module WAT runtimes, ids 6/7.
     if (strcmp(lex, "hash.md5") == 0) return 6;
     if (strcmp(lex, "hash.sha1") == 0) return 7;
@@ -388,6 +398,11 @@ static int runtime_arity(int id) {
         case 28: return 4; // pbkdf2_sha256(pass, salt, iters, len)
         case 29: case 31: return 2; // ecdsa_p256/p384_sign(priv, hash)
         case 30: case 32: return 3; // ecdsa_p256/p384_verify(pub, hash, sig)
+        case 33: case 34: return 2; // shake128/256(msg, out_len)
+        case 37: return 3; // rsa_pss_sign(n, d, mhash)
+        case 38: return 4; // rsa_pss_verify(n, e, mhash, sig)
+        case 39: return 3; // rsa_oaep_encrypt(n, e, msg)
+        case 40: return 3; // rsa_oaep_decrypt(n, d, ct)
         default: return 1;
     }
 }

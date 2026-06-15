@@ -105,4 +105,20 @@ efd48b2aacb6a8fd1140dd9cd45e81d69d2c877b56aaf991c34d0ea84eaf3716f7cb1c942d657c41
 EXP
 )"
 
+# SHAKE128/256 (FIPS 202, empty message, 32-byte output).
+check shake.tks "$(cat <<'EXP'
+7f9c2ba4e88f827d616045507605853ed73b8093f6efbc88eb1a6eacfa66ef26
+46b9dd2b0ba88d13233b3feb743eeb243fcd52ea62b81b82b50c27646ed5762f
+EXP
+)"
+
+# RSA PSS + OAEP: sign->verify (1), wrong-message verify (0), OAEP encrypt->decrypt round-trip
+# recovering the plaintext "Hello, RSA!" (48656c6c6f2c2052534121).
+check rsa.tks "$(cat <<'EXP'
+1
+0
+48656c6c6f2c2052534121
+EXP
+)"
+
 echo "All native runner proofs passed."

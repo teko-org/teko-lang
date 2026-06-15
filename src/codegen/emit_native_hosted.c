@@ -40,6 +40,12 @@ const char* teko_native_runtime_symbol(int32_t id, int* out_arity) {
         case 30: sym = "teko_rt_ecdsa_p256_verify"; arity = 3; break; // (pub, hash, sig)
         case 31: sym = "teko_rt_ecdsa_p384_sign";   arity = 2; break;
         case 32: sym = "teko_rt_ecdsa_p384_verify"; arity = 3; break;
+        case 33: sym = "teko_rt_shake128"; arity = 2; break; // (msg, out_len)
+        case 34: sym = "teko_rt_shake256"; arity = 2; break;
+        case 37: sym = "teko_rt_rsa_pss_sign";     arity = 3; break; // (n, d, mhash)
+        case 38: sym = "teko_rt_rsa_pss_verify";   arity = 4; break; // (n, e, mhash, sig)
+        case 39: sym = "teko_rt_rsa_oaep_encrypt"; arity = 3; break; // (n, e, msg)
+        case 40: sym = "teko_rt_rsa_oaep_decrypt"; arity = 3; break; // (n, d, ct)
         case 6: sym = "teko_rt_md5_hex";       break; // legacy
         case 7: sym = "teko_rt_sha1_hex";      break; // legacy
         case 8: sym = "teko_rt_uuid_v3";       break;

@@ -77,10 +77,20 @@
   `runtime/native/samples/sign_ecdsa.tks` against RFC 6979 A.2.5 (P-256) and A.2.6 (P-384) for
   "sample": deterministic signature reproduced exactly, valid→1, tampered→0, on macOS arm64 +
   Linux x86_64/arm64.
-- **Sub-phase B — REMAINING:** SHAKE (msg,len), RSA-PSS sign/verify, RSA-OAEP encrypt/decrypt,
-  RNG (`random.bytes`). RSA needs the key encoding the `teko_crypto_rsa` KATs use (check
-  `teko_crypto_rsa.h` + `tests/runtime/test_crypto_rsa.c` for the modulus/exponent + message
-  shapes); RNG output is non-deterministic so its proof asserts length/format, not an exact KAT.
+- **Sub-phase B, step 9 — SHAKE + RSA native surface: DONE.** `hash.shake128/256(msg, outLen)`
+  (ids 33/34, arity 2) → `outLen` squeezed bytes as hex (FIPS 202 empty-message KAT). RSA
+  (ids 37-40, RFC 8017, SHA-256/MGF1): `crypto.rsa_pss_sign(n,d,mhash)` /
+  `rsa_pss_verify(n,e,mhash,sig)` (random salt sLen=32) and `crypto.rsa_oaep_encrypt(n,e,msg)` /
+  `rsa_oaep_decrypt(n,d,ct)` (random seed, empty label). The RSA surface is **secure-by-default**
+  (randomized salt/seed → non-deterministic sig/ct), so `runtime/native/samples/rsa.tks` proves
+  the deterministic outcomes — PSS sign→verify (1), wrong-message verify (0), OAEP
+  encrypt→decrypt round-trip recovering the exact plaintext — with the 2048-bit key `let`-bound;
+  the crypto math is KAT-pinned in the Unity suite. Proven on macOS arm64 + Linux x86_64/arm64.
+- **Sub-phase B — REMAINING:** RNG (`random.bytes(n)`) only. Output is non-deterministic, so its
+  proof should assert length/format (2·n hex chars) and that two calls differ, not an exact KAT.
+  Then **Sub-phase C** (WASM substrate) remains: the whole native surface (ids 5,10-40) currently
+  traps (`unreachable`) on WASM — wire host entropy/time + compile the C runtime → wasm32 so WASM
+  lowers to the same single implementation.
   Each: `codec_id_for` id + `runtime_arity` + `teko_native_runtime_symbol` entry + `teko_rt_*`
   wrapper (hex-at-surface) + an executable `.tks` KAT in `run-native.sh`. The established
   pattern (see AEAD/HMAC/Ed25519) scales directly; 8 staging slots cover all current arities.
