@@ -155,6 +155,10 @@ extern void test_teko_crypto_x25519_rfc7748_vectors(void);
 extern void test_teko_crypto_x25519_dh_agreement(void);
 extern void test_teko_crypto_ed25519_rfc8032_test1(void);
 extern void test_teko_crypto_ed25519_sign_verify_roundtrip(void);
+extern void test_teko_uuid_known_answer_vectors(void);
+extern void test_teko_uuid_parse_format(void);
+extern void test_teko_uuid_v4_structure(void);
+extern void test_teko_uuid_v7_structure(void);
 
 int main(void) {
     // Unbuffered output: stream every line live so a crash on a CI runner shows
@@ -320,6 +324,10 @@ int main(void) {
     RUN_TEST(test_teko_crypto_x25519_dh_agreement);
     RUN_TEST(test_teko_crypto_ed25519_rfc8032_test1);
     RUN_TEST(test_teko_crypto_ed25519_sign_verify_roundtrip);
+    RUN_TEST(test_teko_uuid_known_answer_vectors);
+    RUN_TEST(test_teko_uuid_parse_format);
+    RUN_TEST(test_teko_uuid_v4_structure);
+    RUN_TEST(test_teko_uuid_v7_structure);
 
     return UNITY_END();
 }
