@@ -117,8 +117,33 @@ real `.tks`. Deferred to the start of the next sub-phase (not blocking 13.1 clos
 source of truth; only `sha256` has its WASM lowering so far). Suite 109/109; all four CI
 gates green.
 
-## Next: 13.3a — CSPRNG + cheap KDF (HKDF, PBKDF2)
-HKDF (RFC 5869) and PBKDF2 (RFC 6070) drop straight onto the HMAC primitive; the platform
-CSPRNG (`getrandom`/`BCryptGenRandom`/`arc4random` + WASM host import) lands alongside. Then
-13.2 (ChaCha20-Poly1305 → AES). **Owner gates still pending before their sub-steps:**
-constant-time AES strategy (before 13.2 AES) and the RSA bignum layer (before 13.3b RSA).
+## Progress — 13.3a (CSPRNG + cheap KDF)
+- **Platform CSPRNG** — C runtime (`teko_crypto_random.c`): `BCryptGenRandom` (Windows,
+  links `bcrypt`), `arc4random_buf` (macOS/BSD), `getrandom` + `/dev/urandom` fallback
+  (Linux/POSIX). No KAT possible (non-deterministic); wrapper-contract + distribution
+  sanity tests instead. ✅
+- **HKDF-SHA256/512** — C runtime (`teko_crypto_hkdf.c`), RFC 5869 SHA-256 KATs (cases
+  1–3 incl. zero-salt default) + over-long rejection; SHA-512 structural invariant. ✅
+- **PBKDF2-HMAC-SHA256/512** — C runtime (`teko_crypto_pbkdf2.c`), RFC 7914 §11 SHA-256
+  KATs (c=1 and c=80000) + zero-iteration rejection; SHA-512 structural invariant.
+  (RFC 6070 is HMAC-SHA1-only, which Teko deliberately omits → RFC 7914 is the
+  authoritative SHA-256 source.) ✅
+
+**13.3a status: complete.** Suite 115/115; all four CI gates green.
+
+### Decision (registered): deferred WASM crypto lowering
+The C runtime is the source of truth for every primitive. Only `hash.sha256` has a WASM
+lowering so far (hand-emitted, FIPS-validated). Hand-emitting SHA-512 (i64), SHA-3 (Keccak)
+and BLAKE3 in WAT is **rejected** — large, fragile, and a second implementation of each
+algorithm, contradicting "implement once in C." The right WASM path is to **compile the C
+crypto runtime to wasm32 and import it** (the same host-import shape as `dom.*`), which also
+covers the WASM **CSPRNG host import**. That is its own infrastructure increment, sequenced
+as a dedicated "crypto → wasm" step (candidate: end of 13.2 or a standalone increment), not
+hand-emission. Until then `hash.sha512`/`sha3`/`blake3` and `random`/HKDF/PBKDF2 remain
+**reserved-with-target** on the WASM surface (no dead tokens: they are not exposed in `.tks`
+for the WASM target yet; the native C runtimes are fully KAT-tested).
+
+## Next: 13.2 — Symmetric / AEAD
+ChaCha20-Poly1305 (RFC 8439) first (no hardware dep), then AES-128/192/256 CTR/CBC/GCM.
+**Owner gate before AES:** confirm the constant-time AES strategy (bitsliced vs.
+table-free). The RSA bignum layer remains a later gate (before 13.3b RSA).
