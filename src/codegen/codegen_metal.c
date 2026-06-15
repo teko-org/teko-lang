@@ -286,8 +286,16 @@ static void process_linear_il_bytes(MetalContext* ctx, const unsigned char* byte
             // matches a stale accum_last_value gets wrongly skipped while $w0 in
             // fact holds a string ptr / load / call result. (SETARG/STORE/STORE_LOCAL
             // only read $w0 or write elsewhere, so they leave the cache intact.)
+            // Phase 14: OP_SPAWN_ASYNC lowers to a runtime `call` on the native runner
+            // (teko_rt_spawn), which clobbers the accumulator register ($w0/rax) — so it
+            // must invalidate the cache too, exactly like CALL_IMPORT/CALL_RUNTIME. (On
+            // WASM $w0 is a local that survives the call, but the cache reset is harmless
+            // there — it only re-emits a redundant `local.set $w0`.) Without this, two
+            // consecutive `routines { f(); f(); }` spawns of the same slot elide the second
+            // ICONST and the second spawn reads the clobbered register → wrong slot.
             if (op == OP_SCONST || op == OP_LOAD || op == OP_CHAN_GET ||
-                op == OP_CALL_IMPORT || op == OP_LOAD_LOCAL || op == OP_CALL_RUNTIME) {
+                op == OP_CALL_IMPORT || op == OP_LOAD_LOCAL || op == OP_CALL_RUNTIME ||
+                op == OP_SPAWN_ASYNC) {
                 accum_has_value = false;
             }
         }
