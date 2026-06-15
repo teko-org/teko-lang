@@ -187,7 +187,15 @@ The RSA bignum layer remains a later documented decision (before 13.3b RSA).
 
 **13.4 status: complete.** Suite 133/133.
 
-## Next: 13.3b — Asymmetric
-X25519 + Ed25519 (Curve25519, fixed-field — most viable native) first, then ECDSA/ECDH
-P-256/P-384, then **RSA last** (needs the multi-precision bignum layer — a documented
-decision at that point: Montgomery multiplication, modexp, constant-time posture).
+## Progress — 13.3b (Asymmetric)
+- **Shared field `fe25519`** — `teko_crypto_fe25519.c` (radix-2^16 GF(2^255-19), MSVC-safe,
+  constant-time), used by both X25519 and Ed25519. ✅
+- **X25519** — `teko_crypto_x25519.c` (RFC 7748), constant-time Montgomery ladder; RFC 7748
+  §5.2 + §6.1 DH KATs. ✅
+- **Ed25519** — `teko_crypto_ed25519.c` (RFC 8032) on fe25519 + SHA-512: Edwards point
+  add/scalarmult, point compression, scalar reduction mod L; RFC 8032 KATs (Test 1 verify +
+  Test 3 exact deterministic sign) + round-trip/tamper. ✅
+- **ECDSA / ECDH P-256 / P-384** — next (NIST prime-field + point arithmetic).
+- **RSA** — last (needs the multi-precision bignum layer; documented decision at that point).
+
+**Curve25519 block complete** (X25519 + Ed25519). Suite 137/137.
