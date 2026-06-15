@@ -72,9 +72,18 @@ EXPORTS=(teko_rt_sha512_hex teko_rt_sha384_hex teko_rt_sha3_256_hex teko_rt_sha3
          teko_rt_rsa_oaep_encrypt teko_rt_rsa_oaep_decrypt)
 LDEXPORTS=(); for e in "${EXPORTS[@]}"; do LDEXPORTS+=("--export=$e"); done
 
-# Layout: --no-stack-first + --global-base=65536 keep the whole image above Teko's
-# [0..65536); -z stack-size=1MiB gives RSA bignum scratch room on the shadow stack.
-"$WASMLD" --no-entry --import-memory --no-stack-first --global-base=65536 \
+# Layout: keep the whole reactor image (data + shadow stack + heap) ABOVE Teko's
+# [0..65536) region so the two allocators never alias. --global-base=65536 places the
+# DATA there; the stack must land after the data (not at address 0). Newer lld defaults to
+# --stack-first (stack at [0..stack-size) — would collide with Teko) and offers
+# --no-stack-first to opt out; older lld is already data-first and does NOT know that flag.
+# Probe for it: pass it when supported, omit it otherwise (old default is what we want).
+# -z stack-size=1MiB gives RSA bignum scratch room and works on every lld version.
+STACK_FLAG=()
+if "$WASMLD" --help 2>/dev/null | grep -q -- '--no-stack-first'; then
+  STACK_FLAG=(--no-stack-first)
+fi
+"$WASMLD" --no-entry --import-memory "${STACK_FLAG[@]}" --global-base=65536 \
   -z stack-size=1048576 "${LDEXPORTS[@]}" "${OBJS[@]}" -o "$OUT"
 
 echo "[crypto-reactor] wrote $OUT ($(wc -c < "$OUT") bytes)"
