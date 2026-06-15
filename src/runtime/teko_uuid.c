@@ -69,6 +69,11 @@ int teko_uuid_v7(uint8_t out[16], uint64_t unix_ms) {
     return 0;
 }
 
+void teko_uuid_v8(uint8_t out[16], const uint8_t data[16]) {
+    memcpy(out, data, 16u);
+    teko_uuid_stamp(out, 8u); // version 8 + 10xx variant over the custom bits
+}
+
 void teko_uuid_format(char out[36], const uint8_t uuid[16]) {
     static const char* HEX = "0123456789abcdef";
     static const int dash_after[4] = {3, 5, 7, 9}; // byte indices after which a '-' goes

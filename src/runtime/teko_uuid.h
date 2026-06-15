@@ -30,6 +30,10 @@ int teko_uuid_v4(uint8_t out[TEKO_UUID_LEN]);
 // in so the caller controls the clock (and tests are deterministic in structure). Returns 0/-1.
 int teko_uuid_v7(uint8_t out[TEKO_UUID_LEN], uint64_t unix_ms);
 
+// v8 = custom (RFC 9562): 122 caller-defined bits with the version-8 + 10xx-variant bits
+// stamped over the supplied 16 bytes. Fully deterministic.
+void teko_uuid_v8(uint8_t out[TEKO_UUID_LEN], const uint8_t data[TEKO_UUID_LEN]);
+
 // Canonical lowercase format into a 36-char buffer (no NUL written).
 void teko_uuid_format(char out[TEKO_UUID_STR_LEN], const uint8_t uuid[TEKO_UUID_LEN]);
 

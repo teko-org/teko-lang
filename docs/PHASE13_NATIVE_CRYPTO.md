@@ -7,13 +7,17 @@
 > primitives for TLS 1.3. See `docs/plan.md` → "PHASE 13: Native Cryptography".
 
 ## ▶ RESUME POINT (for the next session — same branch/PR #6)
-Done & CI-green: **13.1, 13.1 `hash.sha256` wiring, 13.3a, 13.2, 13.4, and the Curve25519
-block (X25519 + Ed25519)**. 20 crypto runtime modules; suite **137/137**; every increment
-ASan+UBSan (both dispatch paths) + TSan clean; all four CI gates green. Head at hand-off:
-`51b2a0b`.
+Done & CI-green: **13.1, 13.1 `hash.sha256` wiring, 13.3a, 13.2, 13.4, the Curve25519
+block (X25519 + Ed25519), the legacy hashes (MD5 + SHA-1, C + `hash.md5`/`hash.sha1` WASM
+surface), and UUID (full C runtime + `uuid.v3`/`uuid.v5` WASM surface)**. 23 crypto/uuid
+runtime modules; suite **147/147**; every increment ASan+UBSan (both dispatch paths) + TSan
+clean; all four CI gates green.
 
-**Remaining (in order):** ECDH/ECDSA **P-256** → **P-384** → **RSA** (PKCS#1 v1.5 / OAEP /
-PSS). These need the bignum layer below.
+**ONLY remaining work — the asymmetric NIST/RSA block (incremental, KAT-anchored, one
+verified increment per commit, CI-green each step):** the bignum layer (below) → ECDH/ECDSA
+**P-256** → **P-384** → **RSA** (PKCS#1 v1.5 / OAEP / PSS). Optional follow-ups noted in the
+doc: the WASM host entropy/time import (unlocks `uuid.v4`/`v7` + WASM CSPRNG surface), and
+compiling the C crypto runtime to wasm (unlocks sha512/sha3/blake3 WASM surface).
 
 ### DECISION TO DOCUMENT & IMPLEMENT FIRST — the bignum layer (owner pre-approved)
 Build a shared **fixed-capacity, little-endian 32-bit-limb multi-precision integer** module
@@ -36,7 +40,8 @@ NIST CAVP (ECDSA/ECDH P-256/P-384) and the RSA test vectors (FIPS 186 / RFC 8017
   security (signatures, password hashing, integrity vs. an adversary). The headers and the
   CLAUDE.md Decisions log say so explicitly. Security uses → SHA-256/SHA-3/BLAKE3.
 - **UUID/GUID — native primitive.** C runtime covers **nil, v3 (MD5), v4 (CSPRNG), v5
-  (SHA-1), v7 (time-ordered)** + canonical parse/format, all KAT/structure-tested. **Language
+  (SHA-1), v7 (time-ordered), v8 (custom, RFC 9562)** + canonical parse/format, all
+  KAT/structure-tested. **Language
   surface:** `uuid`/`guid` reserved tokens (lexer) and the deterministic name-based
   generators **`uuid.v5(name)` / `uuid.v3(name)`** (DNS namespace) are lowered to an in-module
   WASM UUID runtime (SHA-1/MD5 raw cores over `ns||name` + version/variant stamp + canonical

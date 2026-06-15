@@ -63,6 +63,25 @@ void test_teko_uuid_v4_structure(void) {
     TEST_ASSERT_NOT_EQUAL(0, memcmp(a, b, 16u));
 }
 
+// v8: custom — version 8 + variant stamped; all other (non version/variant) bytes preserved.
+void test_teko_uuid_v8_structure(void) {
+    uint8_t data[16], u[16];
+    unsigned i;
+    for (i = 0u; i < 16u; ++i) data[i] = (uint8_t)(0x10u + i);
+
+    teko_uuid_v8(u, data);
+    TEST_ASSERT_EQUAL_INT(8, teko_uuid_version(u));
+    TEST_ASSERT_EQUAL_INT(1, teko_uuid_is_rfc4122_variant(u));
+    // Bytes 6 and 8 carry version/variant; every other byte is the supplied custom data.
+    for (i = 0u; i < 16u; ++i) {
+        if (i == 6u || i == 8u) continue;
+        TEST_ASSERT_EQUAL_UINT8(data[i], u[i]);
+    }
+    // The low nibble of byte 6 and low 6 bits of byte 8 are preserved from the custom data.
+    TEST_ASSERT_EQUAL_UINT8((uint8_t)((data[6] & 0x0fu) | 0x80u), u[6]);
+    TEST_ASSERT_EQUAL_UINT8((uint8_t)((data[8] & 0x3fu) | 0x80u), u[8]);
+}
+
 // v7: time-ordered — the 48-bit big-endian timestamp prefix is preserved; version/variant set.
 void test_teko_uuid_v7_structure(void) {
     uint8_t a[16], b[16];
