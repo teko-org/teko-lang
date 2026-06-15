@@ -120,6 +120,10 @@ extern void test_teko_duplex_capacity_full(void);
 extern void test_teko_duplex_close_drains_then_signals(void);
 extern void test_teko_duplex_drop_signals_peer(void);
 extern void test_teko_duplex_badarg(void);
+extern void test_teko_delayed_releases_in_time_order(void);
+extern void test_teko_delayed_same_time_is_fifo(void);
+extern void test_teko_delayed_capacity_and_close(void);
+extern void test_teko_delayed_badarg(void);
 extern void test_teko_runtime_arena_thread_isolation_and_alignment(void);
 extern void test_teko_crypto_md5_rfc1321_vectors(void);
 extern void test_teko_crypto_md5_streaming_matches_oneshot(void);
@@ -316,6 +320,10 @@ int main(void) {
     RUN_TEST(test_teko_duplex_close_drains_then_signals);
     RUN_TEST(test_teko_duplex_drop_signals_peer);
     RUN_TEST(test_teko_duplex_badarg);
+    RUN_TEST(test_teko_delayed_releases_in_time_order);
+    RUN_TEST(test_teko_delayed_same_time_is_fifo);
+    RUN_TEST(test_teko_delayed_capacity_and_close);
+    RUN_TEST(test_teko_delayed_badarg);
     RUN_TEST(test_teko_runtime_arena_thread_isolation_and_alignment);
 
     RUN_TEST(test_teko_crypto_md5_rfc1321_vectors);
