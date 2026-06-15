@@ -35,10 +35,15 @@ NIST CAVP (ECDSA/ECDH P-256/P-384) and the RSA test vectors (FIPS 186 / RFC 8017
   backward-compat/interop (e.g. UUID v3/v5, legacy checksums/protocols), **never** for
   security (signatures, password hashing, integrity vs. an adversary). The headers and the
   CLAUDE.md Decisions log say so explicitly. Security uses → SHA-256/SHA-3/BLAKE3.
-- **UUID/GUID (planned in this phase).** Native primitive — token + grammar + functional
-  `.tks` surface: **v4** (CSPRNG), **v7** (time-ordered), **v5** (SHA-1), **v3** (MD5),
-  **nil**, plus canonical parse/format (8-4-4-4-12, validation). KATs for the deterministic
-  forms (RFC 4122/9562) and structure/version/variant + uniqueness for the random ones.
+- **UUID/GUID — native primitive.** C runtime covers **nil, v3 (MD5), v4 (CSPRNG), v5
+  (SHA-1), v7 (time-ordered)** + canonical parse/format, all KAT/structure-tested. **Language
+  surface:** `uuid`/`guid` reserved tokens (lexer) and the deterministic name-based
+  generators **`uuid.v5(name)` / `uuid.v3(name)`** (DNS namespace) are lowered to an in-module
+  WASM UUID runtime (SHA-1/MD5 raw cores over `ns||name` + version/variant stamp + canonical
+  format) with **executable `.tks` proof** (`run-uuid.mjs`, RFC 4122 vectors). **v4/v7 surface
+  is reserved-with-target** for WASM (they need a host entropy/time import — the same deferred
+  bucket as the WASM CSPRNG); their C runtime is complete. No dead token: every exposed
+  `uuid.*` operation does real work.
 
 ## Surface (Teko keywords — reserved in Phase 12, lowered here)
 `crypto`, `hash`, `encrypt`/`decrypt`, `sign`/`verify`, plus `encode`/`decode` interop with

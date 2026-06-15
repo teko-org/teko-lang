@@ -49,6 +49,7 @@ static KeywordMap keywords[] = {
     {"serialize", TOKEN_SERIALIZE}, {"stringify", TOKEN_STRINGIFY},       // reserved → Phase 18
     // Core:
     {"comptime", TOKEN_COMPTIME}, {"soa", TOKEN_SOA},
+    {"uuid", TOKEN_UUID}, {"guid", TOKEN_GUID},      // UUID/GUID primitive (Phase 13)
     {NULL, TOKEN_UNKNOWN}, // sentinel — MUST be last (the lookup loop stops here)
 };
 

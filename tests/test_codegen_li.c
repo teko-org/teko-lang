@@ -547,6 +547,52 @@ void test_frontend_interop_hash_legacy(void) {
     codegen_li_free_context(buffer);
 }
 
+// Phase 13: uuid.v3 / uuid.v5 lower to OP_CALL_RUNTIME ids 8 / 9 and the bridge emits the
+// in-module UUID runtime (built on the MD5/SHA-1 raw cores + the fmt helper).
+void test_frontend_interop_uuid(void) {
+    const char* src =
+        "extern fn emit(s) from \"env\" as \"emit\";\n"
+        "emit(uuid.v5(\"python.org\"));\n"
+        "emit(uuid.v3(\"python.org\"));\n";
+
+    BytecodeBuffer* buffer = codegen_li_create_context();
+    TEST_ASSERT_NOT_NULL(buffer);
+    TEST_ASSERT_EQUAL_INT(0, teko_compile_interop(src, buffer));
+    TEST_ASSERT_EQUAL_INT(1, buffer->uses_hash);
+
+    int saw_v3 = 0, saw_v5 = 0;
+    for (int i = 0; i < buffer->size; i++) {
+        if (buffer->code[i] == OP_CALL_RUNTIME) {
+            int id = (int)buffer->code[i + 1];
+            if (id == 8) saw_v3 = 1;
+            if (id == 9) saw_v5 = 1;
+        }
+    }
+    TEST_ASSERT_TRUE(saw_v3);
+    TEST_ASSERT_TRUE(saw_v5);
+
+    TekoTarget target;
+    target.arch = ARCH_WASM32;
+    target.os = OS_WASI;
+    strncpy(target.target_string, "wasm32-wasi", sizeof(target.target_string) - 1);
+    const char* wat = "output_uuid.wat";
+    TEST_ASSERT_EQUAL_INT(0, codegen_li_emit_wasm(buffer, wat, target, NULL, NULL, NULL, NULL, 0));
+    FILE* f = fopen(wat, "r");
+    TEST_ASSERT_NOT_NULL(f);
+    char* out = (char*)malloc(262144);
+    memset(out, 0, 262144);
+    size_t n = fread(out, 1, 262143, f); out[n] = '\0'; fclose(f);
+    TEST_ASSERT_NOT_NULL(strstr(out, "(func $teko_uuid_v5 (export \"teko_uuid_v5\")"));
+    TEST_ASSERT_NOT_NULL(strstr(out, "(func $teko_uuid_v3 (export \"teko_uuid_v3\")"));
+    TEST_ASSERT_NOT_NULL(strstr(out, "(func $teko_uuid_fmt"));
+    TEST_ASSERT_NOT_NULL(strstr(out, "(func $teko_sha1_raw"));   // raw cores feed UUID
+    TEST_ASSERT_NOT_NULL(strstr(out, "(func $teko_md5_raw"));
+    free(out);
+    remove(wat);
+
+    codegen_li_free_context(buffer);
+}
+
 // Phase 11 (Browser FFI frontend FE-A): import table dedup + interop emit helpers.
 // Models the IL a parser would emit for `log("hi")` where
 // `extern fn log(msg) from "env" as "log"`: SCONST &"hi" -> CALL_IMPORT #0 -> HALT.

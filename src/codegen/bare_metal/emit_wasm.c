@@ -594,12 +594,12 @@ static void emit_wasm_md5_runtime(FILE* f) {
     for (i = 0; i < 64; ++i) fprintf(f, "    (i32.store offset=%d (local.get $p) (i32.const %u))\n", 256 + i * 4, (unsigned)S[i]);
     fprintf(f, "    (global.set $md5_t (local.get $p)) (local.get $p))\n");
 
-    fprintf(f, "  (func $teko_md5_hex (export \"teko_md5_hex\") (param $in i32) (result i32)\n");
-    fprintf(f, "    (local $len i32) (local $nb i32) (local $msg i32) (local $padlen i32) (local $kp i32)\n");
-    fprintf(f, "    (local $i i32) (local $t i32) (local $blk i32) (local $bitlen i32) (local $out i32) (local $x i32)\n");
+    // Raw core: writes the 16 little-endian digest bytes of MD5(in[0..len)) to out.
+    fprintf(f, "  (func $teko_md5_raw (param $in i32) (param $len i32) (param $out i32)\n");
+    fprintf(f, "    (local $nb i32) (local $msg i32) (local $padlen i32) (local $kp i32)\n");
+    fprintf(f, "    (local $i i32) (local $t i32) (local $blk i32) (local $bitlen i32)\n");
     fprintf(f, "    (local $f i32) (local $g i32) (local $a i32) (local $b i32) (local $c i32) (local $d i32)\n");
     fprintf(f, "    (local $h0 i32) (local $h1 i32) (local $h2 i32) (local $h3 i32)\n");
-    fprintf(f, "    (local.set $len (call $teko_strlen (local.get $in)))\n");
     fprintf(f, "    (local.set $kp (call $teko_md5_t))\n");
     fprintf(f, "    (local.set $nb (i32.div_u (i32.add (local.get $len) (i32.const 72)) (i32.const 64)))\n");
     fprintf(f, "    (local.set $padlen (i32.mul (local.get $nb) (i32.const 64)))\n");
@@ -644,13 +644,18 @@ static void emit_wasm_md5_runtime(FILE* f) {
     fprintf(f, "      (local.set $h0 (i32.add (local.get $h0) (local.get $a))) (local.set $h1 (i32.add (local.get $h1) (local.get $b)))\n");
     fprintf(f, "      (local.set $h2 (i32.add (local.get $h2) (local.get $c))) (local.set $h3 (i32.add (local.get $h3) (local.get $d)))\n");
     fprintf(f, "      (local.set $i (i32.add (local.get $i) (i32.const 1))) (br $bl)))\n");
-    // Little-endian 16-byte digest -> 32 hex chars (store words LE, read bytes).
-    fprintf(f, "    (i32.store offset=0 (local.get $msg) (local.get $h0)) (i32.store offset=4 (local.get $msg) (local.get $h1))\n");
-    fprintf(f, "    (i32.store offset=8 (local.get $msg) (local.get $h2)) (i32.store offset=12 (local.get $msg) (local.get $h3))\n");
+    // Write the 16-byte little-endian digest to the caller's out buffer (store words LE).
+    fprintf(f, "    (i32.store offset=0 (local.get $out) (local.get $h0)) (i32.store offset=4 (local.get $out) (local.get $h1))\n");
+    fprintf(f, "    (i32.store offset=8 (local.get $out) (local.get $h2)) (i32.store offset=12 (local.get $out) (local.get $h3)))\n");
+    // Hex wrapper: NUL-terminated input -> 32-char hex string.
+    fprintf(f, "  (func $teko_md5_hex (export \"teko_md5_hex\") (param $in i32) (result i32)\n");
+    fprintf(f, "    (local $dig i32) (local $out i32) (local $i i32) (local $x i32)\n");
+    fprintf(f, "    (local.set $dig (call $teko_alloc (i32.const 16)))\n");
+    fprintf(f, "    (call $teko_md5_raw (local.get $in) (call $teko_strlen (local.get $in)) (local.get $dig))\n");
     fprintf(f, "    (local.set $out (call $teko_alloc (i32.const 33)))\n");
     fprintf(f, "    (local.set $i (i32.const 0))\n");
     fprintf(f, "    (block $od (loop $ol (br_if $od (i32.ge_u (local.get $i) (i32.const 16)))\n");
-    fprintf(f, "      (local.set $x (i32.load8_u (i32.add (local.get $msg) (local.get $i))))\n");
+    fprintf(f, "      (local.set $x (i32.load8_u (i32.add (local.get $dig) (local.get $i))))\n");
     fprintf(f, "      (i32.store8 (i32.add (local.get $out) (i32.shl (local.get $i) (i32.const 1))) (call $teko_hexc (i32.shr_u (local.get $x) (i32.const 4))))\n");
     fprintf(f, "      (i32.store8 (i32.add (local.get $out) (i32.add (i32.shl (local.get $i) (i32.const 1)) (i32.const 1))) (call $teko_hexc (i32.and (local.get $x) (i32.const 15))))\n");
     fprintf(f, "      (local.set $i (i32.add (local.get $i) (i32.const 1))) (br $ol)))\n");
@@ -661,12 +666,13 @@ static void emit_wasm_md5_runtime(FILE* f) {
 // Big-endian (like SHA-256); NUL-terminated input -> 40-char hex. frontend lowers
 // hash.sha1(x) to OP_CALL_RUNTIME id 7.
 static void emit_wasm_sha1_runtime(FILE* f) {
-    fprintf(f, "  (func $teko_sha1_hex (export \"teko_sha1_hex\") (param $in i32) (result i32)\n");
-    fprintf(f, "    (local $len i32) (local $nb i32) (local $msg i32) (local $padlen i32) (local $w i32)\n");
-    fprintf(f, "    (local $i i32) (local $t i32) (local $blk i32) (local $bitlen i32) (local $out i32) (local $x i32)\n");
+    // Raw core: writes the 20 big-endian digest bytes of SHA-1(in[0..len)) to out (binary,
+    // length-based — usable for UUID v5 whose input contains NUL bytes).
+    fprintf(f, "  (func $teko_sha1_raw (param $in i32) (param $len i32) (param $out i32)\n");
+    fprintf(f, "    (local $nb i32) (local $msg i32) (local $padlen i32) (local $w i32)\n");
+    fprintf(f, "    (local $i i32) (local $t i32) (local $blk i32) (local $bitlen i32)\n");
     fprintf(f, "    (local $f i32) (local $k i32) (local $tmp i32) (local $a i32) (local $b i32) (local $c i32) (local $d i32) (local $e i32)\n");
     fprintf(f, "    (local $h0 i32) (local $h1 i32) (local $h2 i32) (local $h3 i32) (local $h4 i32)\n");
-    fprintf(f, "    (local.set $len (call $teko_strlen (local.get $in)))\n");
     fprintf(f, "    (local.set $nb (i32.div_u (i32.add (local.get $len) (i32.const 72)) (i32.const 64)))\n");
     fprintf(f, "    (local.set $padlen (i32.mul (local.get $nb) (i32.const 64)))\n");
     fprintf(f, "    (local.set $msg (call $teko_alloc (local.get $padlen)))\n");
@@ -724,20 +730,96 @@ static void emit_wasm_sha1_runtime(FILE* f) {
     fprintf(f, "      (local.set $h0 (i32.add (local.get $h0) (local.get $a))) (local.set $h1 (i32.add (local.get $h1) (local.get $b))) (local.set $h2 (i32.add (local.get $h2) (local.get $c)))\n");
     fprintf(f, "      (local.set $h3 (i32.add (local.get $h3) (local.get $d))) (local.set $h4 (i32.add (local.get $h4) (local.get $e)))\n");
     fprintf(f, "      (local.set $i (i32.add (local.get $i) (i32.const 1))) (br $bl)))\n");
-    // Big-endian 20-byte digest -> 40 hex chars.
-    fprintf(f, "    (i32.store offset=0 (local.get $w) (local.get $h0)) (i32.store offset=4 (local.get $w) (local.get $h1)) (i32.store offset=8 (local.get $w) (local.get $h2))\n");
-    fprintf(f, "    (i32.store offset=12 (local.get $w) (local.get $h3)) (i32.store offset=16 (local.get $w) (local.get $h4))\n");
+    // Write the 20-byte big-endian digest to the caller's out buffer.
+    fprintf(f, "    (i32.store8 (i32.add (local.get $out) (i32.const 0)) (i32.shr_u (local.get $h0) (i32.const 24)))\n");
+    fprintf(f, "    (i32.store8 (i32.add (local.get $out) (i32.const 1)) (i32.shr_u (local.get $h0) (i32.const 16)))\n");
+    fprintf(f, "    (i32.store8 (i32.add (local.get $out) (i32.const 2)) (i32.shr_u (local.get $h0) (i32.const 8)))\n");
+    fprintf(f, "    (i32.store8 (i32.add (local.get $out) (i32.const 3)) (local.get $h0))\n");
+    fprintf(f, "    (i32.store8 (i32.add (local.get $out) (i32.const 4)) (i32.shr_u (local.get $h1) (i32.const 24)))\n");
+    fprintf(f, "    (i32.store8 (i32.add (local.get $out) (i32.const 5)) (i32.shr_u (local.get $h1) (i32.const 16)))\n");
+    fprintf(f, "    (i32.store8 (i32.add (local.get $out) (i32.const 6)) (i32.shr_u (local.get $h1) (i32.const 8)))\n");
+    fprintf(f, "    (i32.store8 (i32.add (local.get $out) (i32.const 7)) (local.get $h1))\n");
+    fprintf(f, "    (i32.store8 (i32.add (local.get $out) (i32.const 8)) (i32.shr_u (local.get $h2) (i32.const 24)))\n");
+    fprintf(f, "    (i32.store8 (i32.add (local.get $out) (i32.const 9)) (i32.shr_u (local.get $h2) (i32.const 16)))\n");
+    fprintf(f, "    (i32.store8 (i32.add (local.get $out) (i32.const 10)) (i32.shr_u (local.get $h2) (i32.const 8)))\n");
+    fprintf(f, "    (i32.store8 (i32.add (local.get $out) (i32.const 11)) (local.get $h2))\n");
+    fprintf(f, "    (i32.store8 (i32.add (local.get $out) (i32.const 12)) (i32.shr_u (local.get $h3) (i32.const 24)))\n");
+    fprintf(f, "    (i32.store8 (i32.add (local.get $out) (i32.const 13)) (i32.shr_u (local.get $h3) (i32.const 16)))\n");
+    fprintf(f, "    (i32.store8 (i32.add (local.get $out) (i32.const 14)) (i32.shr_u (local.get $h3) (i32.const 8)))\n");
+    fprintf(f, "    (i32.store8 (i32.add (local.get $out) (i32.const 15)) (local.get $h3))\n");
+    fprintf(f, "    (i32.store8 (i32.add (local.get $out) (i32.const 16)) (i32.shr_u (local.get $h4) (i32.const 24)))\n");
+    fprintf(f, "    (i32.store8 (i32.add (local.get $out) (i32.const 17)) (i32.shr_u (local.get $h4) (i32.const 16)))\n");
+    fprintf(f, "    (i32.store8 (i32.add (local.get $out) (i32.const 18)) (i32.shr_u (local.get $h4) (i32.const 8)))\n");
+    fprintf(f, "    (i32.store8 (i32.add (local.get $out) (i32.const 19)) (local.get $h4)))\n");
+    // Hex wrapper: NUL-terminated input -> 40-char hex string.
+    fprintf(f, "  (func $teko_sha1_hex (export \"teko_sha1_hex\") (param $in i32) (result i32)\n");
+    fprintf(f, "    (local $dig i32) (local $out i32) (local $i i32) (local $x i32)\n");
+    fprintf(f, "    (local.set $dig (call $teko_alloc (i32.const 20)))\n");
+    fprintf(f, "    (call $teko_sha1_raw (local.get $in) (call $teko_strlen (local.get $in)) (local.get $dig))\n");
     fprintf(f, "    (local.set $out (call $teko_alloc (i32.const 41)))\n");
     fprintf(f, "    (local.set $i (i32.const 0))\n");
-    fprintf(f, "    (block $od (loop $ol (br_if $od (i32.ge_u (local.get $i) (i32.const 5)))\n");
-    fprintf(f, "      (local.set $x (i32.load (i32.add (local.get $w) (i32.shl (local.get $i) (i32.const 2)))))\n");
-    fprintf(f, "      (local.set $t (i32.const 0))\n");
-    fprintf(f, "      (block $nd (loop $nl (br_if $nd (i32.ge_u (local.get $t) (i32.const 8)))\n");
-    fprintf(f, "        (i32.store8 (i32.add (local.get $out) (i32.add (i32.mul (local.get $i) (i32.const 8)) (local.get $t)))\n");
-    fprintf(f, "          (call $teko_hexc (i32.and (i32.shr_u (local.get $x) (i32.sub (i32.const 28) (i32.shl (local.get $t) (i32.const 2)))) (i32.const 15))))\n");
-    fprintf(f, "        (local.set $t (i32.add (local.get $t) (i32.const 1))) (br $nl)))\n");
-    fprintf(f, "      (local.set $i (i32.add (local.get $i) (i32.const 1))) (br $ol)))\n");
+    fprintf(f, "    (block $hd (loop $hl (br_if $hd (i32.ge_u (local.get $i) (i32.const 20)))\n");
+    fprintf(f, "      (local.set $x (i32.load8_u (i32.add (local.get $dig) (local.get $i))))\n");
+    fprintf(f, "      (i32.store8 (i32.add (local.get $out) (i32.shl (local.get $i) (i32.const 1))) (call $teko_hexc (i32.shr_u (local.get $x) (i32.const 4))))\n");
+    fprintf(f, "      (i32.store8 (i32.add (local.get $out) (i32.add (i32.shl (local.get $i) (i32.const 1)) (i32.const 1))) (call $teko_hexc (i32.and (local.get $x) (i32.const 15))))\n");
+    fprintf(f, "      (local.set $i (i32.add (local.get $i) (i32.const 1))) (br $hl)))\n");
     fprintf(f, "    (i32.store8 (i32.add (local.get $out) (i32.const 40)) (i32.const 0)) (local.get $out))\n");
+}
+
+// Phase 13: native in-module UUID v3/v5 (RFC 4122) — name-based, DNS namespace. Builds
+// (namespace||name) and hashes it with the length-based MD5/SHA-1 raw cores (the input has
+// NUL bytes), stamps version+variant, and formats canonically. frontend lowers uuid.v3(name)
+// -> id 8, uuid.v5(name) -> id 9. v4/v7 (entropy/time) stay C-runtime-only (host import TBD).
+static void emit_wasm_uuid_runtime(FILE* f) {
+    static const uint8_t NS_DNS[16] = {
+        0x6b,0xa7,0xb8,0x10,0x9d,0xad,0x11,0xd1,0x80,0xb4,0x00,0xc0,0x4f,0xd4,0x30,0xc8
+    };
+    int i;
+
+    // Format 16 bytes at $b into a fresh canonical "8-4-4-4-12" lowercase string (37 bytes).
+    fprintf(f, "  (func $teko_uuid_fmt (param $b i32) (result i32)\n");
+    fprintf(f, "    (local $out i32) (local $i i32) (local $pos i32) (local $x i32)\n");
+    fprintf(f, "    (local.set $out (call $teko_alloc (i32.const 37)))\n");
+    fprintf(f, "    (block $od (loop $ol (br_if $od (i32.ge_u (local.get $i) (i32.const 16)))\n");
+    fprintf(f, "      (local.set $x (i32.load8_u (i32.add (local.get $b) (local.get $i))))\n");
+    fprintf(f, "      (i32.store8 (i32.add (local.get $out) (local.get $pos)) (call $teko_hexc (i32.shr_u (local.get $x) (i32.const 4)))) (local.set $pos (i32.add (local.get $pos) (i32.const 1)))\n");
+    fprintf(f, "      (i32.store8 (i32.add (local.get $out) (local.get $pos)) (call $teko_hexc (i32.and (local.get $x) (i32.const 15)))) (local.set $pos (i32.add (local.get $pos) (i32.const 1)))\n");
+    fprintf(f, "      (if (i32.or (i32.or (i32.eq (local.get $i) (i32.const 3)) (i32.eq (local.get $i) (i32.const 5))) (i32.or (i32.eq (local.get $i) (i32.const 7)) (i32.eq (local.get $i) (i32.const 9))))\n");
+    fprintf(f, "        (then (i32.store8 (i32.add (local.get $out) (local.get $pos)) (i32.const 45)) (local.set $pos (i32.add (local.get $pos) (i32.const 1)))))\n");
+    fprintf(f, "      (local.set $i (i32.add (local.get $i) (i32.const 1))) (br $ol)))\n");
+    fprintf(f, "    (i32.store8 (i32.add (local.get $out) (i32.const 36)) (i32.const 0)) (local.get $out))\n");
+
+    // v5 = SHA-1(DNS-ns || name) truncated to 16, version 5 / variant 10xx.
+    fprintf(f, "  (func $teko_uuid_v5 (export \"teko_uuid_v5\") (param $name i32) (result i32)\n");
+    fprintf(f, "    (local $nl i32) (local $buf i32) (local $dig i32) (local $i i32)\n");
+    fprintf(f, "    (local.set $nl (call $teko_strlen (local.get $name)))\n");
+    fprintf(f, "    (local.set $buf (call $teko_alloc (i32.add (i32.const 16) (local.get $nl))))\n");
+    for (i = 0; i < 16; ++i) fprintf(f, "    (i32.store8 (i32.add (local.get $buf) (i32.const %d)) (i32.const %u))\n", i, (unsigned)NS_DNS[i]);
+    fprintf(f, "    (local.set $i (i32.const 0))\n");
+    fprintf(f, "    (block $cd (loop $cl (br_if $cd (i32.ge_u (local.get $i) (local.get $nl)))\n");
+    fprintf(f, "      (i32.store8 (i32.add (i32.add (local.get $buf) (i32.const 16)) (local.get $i)) (i32.load8_u (i32.add (local.get $name) (local.get $i))))\n");
+    fprintf(f, "      (local.set $i (i32.add (local.get $i) (i32.const 1))) (br $cl)))\n");
+    fprintf(f, "    (local.set $dig (call $teko_alloc (i32.const 20)))\n");
+    fprintf(f, "    (call $teko_sha1_raw (local.get $buf) (i32.add (i32.const 16) (local.get $nl)) (local.get $dig))\n");
+    fprintf(f, "    (i32.store8 (i32.add (local.get $dig) (i32.const 6)) (i32.or (i32.and (i32.load8_u (i32.add (local.get $dig) (i32.const 6))) (i32.const 15)) (i32.const 0x50)))\n");
+    fprintf(f, "    (i32.store8 (i32.add (local.get $dig) (i32.const 8)) (i32.or (i32.and (i32.load8_u (i32.add (local.get $dig) (i32.const 8))) (i32.const 0x3f)) (i32.const 0x80)))\n");
+    fprintf(f, "    (call $teko_uuid_fmt (local.get $dig)))\n");
+
+    // v3 = MD5(DNS-ns || name), version 3 / variant 10xx.
+    fprintf(f, "  (func $teko_uuid_v3 (export \"teko_uuid_v3\") (param $name i32) (result i32)\n");
+    fprintf(f, "    (local $nl i32) (local $buf i32) (local $dig i32) (local $i i32)\n");
+    fprintf(f, "    (local.set $nl (call $teko_strlen (local.get $name)))\n");
+    fprintf(f, "    (local.set $buf (call $teko_alloc (i32.add (i32.const 16) (local.get $nl))))\n");
+    for (i = 0; i < 16; ++i) fprintf(f, "    (i32.store8 (i32.add (local.get $buf) (i32.const %d)) (i32.const %u))\n", i, (unsigned)NS_DNS[i]);
+    fprintf(f, "    (local.set $i (i32.const 0))\n");
+    fprintf(f, "    (block $cd (loop $cl (br_if $cd (i32.ge_u (local.get $i) (local.get $nl)))\n");
+    fprintf(f, "      (i32.store8 (i32.add (i32.add (local.get $buf) (i32.const 16)) (local.get $i)) (i32.load8_u (i32.add (local.get $name) (local.get $i))))\n");
+    fprintf(f, "      (local.set $i (i32.add (local.get $i) (i32.const 1))) (br $cl)))\n");
+    fprintf(f, "    (local.set $dig (call $teko_alloc (i32.const 16)))\n");
+    fprintf(f, "    (call $teko_md5_raw (local.get $buf) (i32.add (i32.const 16) (local.get $nl)) (local.get $dig))\n");
+    fprintf(f, "    (i32.store8 (i32.add (local.get $dig) (i32.const 6)) (i32.or (i32.and (i32.load8_u (i32.add (local.get $dig) (i32.const 6))) (i32.const 15)) (i32.const 0x30)))\n");
+    fprintf(f, "    (i32.store8 (i32.add (local.get $dig) (i32.const 8)) (i32.or (i32.and (i32.load8_u (i32.add (local.get $dig) (i32.const 8))) (i32.const 0x3f)) (i32.const 0x80)))\n");
+    fprintf(f, "    (call $teko_uuid_fmt (local.get $dig)))\n");
 }
 
 // The non-suspending half of a channel receive: read buf[head] -> $w0, advance
@@ -940,6 +1022,7 @@ void emit_wasm_pure(MetalContext* ctx, OpCode op, int32_t arg) {
                 emit_wasm_hash_runtime(f);    // Phase 13.1 SHA-256
                 emit_wasm_md5_runtime(f);     // Phase 13 legacy MD5
                 emit_wasm_sha1_runtime(f);    // Phase 13 legacy SHA-1
+                emit_wasm_uuid_runtime(f);    // Phase 13 UUID v3/v5 (name-based)
             }
             fprintf(f, "  (func $main (result i32)\n");
             // $w0 accumulator, $w1 scratch, $cp channel ptr, $a0..$a2 import-arg
@@ -993,6 +1076,8 @@ void emit_wasm_pure(MetalContext* ctx, OpCode op, int32_t arg) {
             else if (arg == 4) fn = "teko_sha256_hex"; // Phase 13.1
             else if (arg == 6) fn = "teko_md5_hex";    // Phase 13 legacy
             else if (arg == 7) fn = "teko_sha1_hex";   // Phase 13 legacy
+            else if (arg == 8) fn = "teko_uuid_v3";    // Phase 13 UUID (name-based)
+            else if (arg == 9) fn = "teko_uuid_v5";
             fprintf(f, "    local.get $w0\n    call $%s\n    local.set $w0\n", fn);
             break;
         }

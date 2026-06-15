@@ -41,6 +41,7 @@ typedef enum {
     TOKEN_SERIALIZE, TOKEN_STRINGIFY,                // (reserved → Phase 18, static per-type serializers)
     // Core:
     TOKEN_COMPTIME, TOKEN_SOA,
+    TOKEN_UUID, TOKEN_GUID,                          // UUID/GUID primitive (Phase 13)
 
     TOKEN_STRING_LIT,       // common "text" or traditional """multiline"""
     TOKEN_STRING_INTERPOLATED,    // common `text {expr}` or interpolated ```multiline```

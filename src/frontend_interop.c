@@ -328,6 +328,9 @@ static int codec_id_for(const char* lex) {
     // Legacy hashes (insecure — interop only): in-module WAT runtimes, ids 6/7.
     if (strcmp(lex, "hash.md5") == 0) return 6;
     if (strcmp(lex, "hash.sha1") == 0) return 7;
+    // UUID name-based generators (deterministic; DNS namespace) — ids 8/9.
+    if (strcmp(lex, "uuid.v3") == 0) return 8;
+    if (strcmp(lex, "uuid.v5") == 0) return 9;
     return -1;
 }
 
