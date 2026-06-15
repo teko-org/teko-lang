@@ -6,32 +6,36 @@
 > vectors (NIST / RFC KATs) + round-trips. Phase 17 (Networking & Web) later consumes these
 > primitives for TLS 1.3. See `docs/plan.md` → "PHASE 13: Native Cryptography".
 
-## ▶ RESUME POINT (for the next session — same branch/PR #6)
-Done & CI-green: **13.1, 13.1 `hash.sha256` wiring, 13.3a, 13.2, 13.4, the Curve25519
-block (X25519 + Ed25519), the legacy hashes (MD5 + SHA-1, C + `hash.md5`/`hash.sha1` WASM
-surface), UUID (full C runtime nil/v3/v4/v5/v7/v8 + parse/format, `uuid.v3`/`uuid.v5` WASM
-surface), AND the Montgomery bignum layer (`teko_crypto_bn.c`)**. 24 crypto/uuid runtime
-modules; suite **151/151**; every increment ASan+UBSan (both dispatch paths) + TSan clean;
-all four CI gates green. Head at hand-off: `8f5e8fb`.
+## ▶ STATUS: COMPLETE — asymmetric block landed (same branch/PR #6)
+**Phase 13 is functionally complete.** Done & CI-green: 13.1, 13.1 `hash.sha256` wiring,
+13.3a, 13.2, 13.4, the Curve25519 block (X25519 + Ed25519), legacy hashes (MD5 + SHA-1, C +
+`hash.md5`/`hash.sha1` WASM surface), UUID (full C runtime nil/v3/v4/v5/v7/v8 + parse/format,
+`uuid.v3`/`uuid.v5` WASM surface), the Montgomery bignum layer, **and the full asymmetric
+NIST/RSA block: P-256 ECDH+ECDSA, P-384 ECDH+ECDSA, and RSA (PKCS#1 v1.5 sign + encrypt,
+OAEP, PSS).** Suite **167/167**; every increment ASan+UBSan (both dispatch paths) + TSan
+clean; all four CI gates green each step.
 
-**ONLY remaining work — finish the asymmetric NIST/RSA block (incremental, KAT-anchored, one
-verified increment per commit, CI-green each step):**
-1. **Expose field ops from the bignum** for ECC: add `teko_mont_mul`/`add`/`sub`/`to`/`from`
-   (limb-level) to `teko_crypto_bn.h` (the CIOS `teko_bn_montmul` is already implemented as a
-   `static` — promote/wrap it). Field inverse via Fermat = `teko_mont_modexp` with `p-2`.
-2. **P-256 ECDH** — `teko_crypto_p256.c`: field mod p (the P-256 prime), **RCB complete
-   (exception-free) point add/double for a=-3**, constant-time scalar mult, public-key +
-   ECDH. KAT vs. NIST CAVP ECDH.
-3. **P-256 ECDSA** — sign (RFC 6979 deterministic nonce via HMAC-SHA-256, already available)
-   + verify. KAT vs. NIST/RFC 6979.
-4. **P-384** — same shape, 12×32 limbs.
-5. **RSA** — sits directly on the verified `teko_mont_modexp`: PKCS#1 v1.5 + OAEP (MGF1) +
-   PSS, plus key parsing. KAT vs. FIPS 186 / RFC 8017 / Wycheproof.
+The asymmetric block was built as KAT-anchored increments on the bignum layer:
+1. **Field ops** — `teko_mont_mul`/`add`/`sub`/`to`/`from`, `teko_bn_cselect`/`cswap`/`mask1`,
+   `teko_bn_load_be`/`store_be`, `teko_bn_is_zero`/`eq`, `teko_mont_reduce_once` in
+   `teko_crypto_bn.*`; field inverse via Fermat (`teko_ec_fp_inv`, exponent p-2).
+2. **Generic a=-3 group law** — `teko_crypto_ec.*`: a line-for-line transcription of the
+   Renes–Costello–Batina **complete (exception-free)** Algorithm 4 (add) / Algorithm 6
+   (double) of eprint 2015/1060, a constant-time double-and-add ladder, and field inverse.
+3. **Curve-generic ECDH/ECDSA** — `teko_crypto_ecc.*`: descriptor-driven (field prime, order,
+   b, G, byte width, RFC 6979 HMAC); RFC 6979 deterministic nonces; KATs from NIST CAVP CDH
+   and RFC 6979 A.2.5/A.2.6.
+4. **P-256 / P-384** — `teko_crypto_p256.*` / `teko_crypto_p384.*`: standard parameters +
+   descriptor (HMAC-SHA-256 / HMAC-SHA-384). HMAC-SHA-384 added to `teko_crypto_hmac.*`.
+5. **RSA** — `teko_crypto_rsa.*` on `teko_bn_modexp`: PKCS#1 v1.5 sign/verify + encrypt/
+   decrypt, OAEP (MGF1) encrypt/decrypt, PSS sign/verify. KATs: NIST FIPS 186 SigGen,
+   Project Wycheproof OAEP/PSS, plus round-trips.
 
-Optional follow-ups: the WASM host entropy/time import (unlocks `uuid.v4`/`v7` + WASM CSPRNG
-surface), and compiling the C crypto runtime to wasm32 (unlocks sha512/sha3/blake3 WASM
-surface). The owner add-ons (legacy MD5/SHA-1 + UUID incl. v8) are **complete** — only the
-asymmetric block is left before Phase 13 is done.
+**Remaining (optional, owner to confirm before investing — NOT required for Phase 13):** the
+WASM host entropy/time import (unlocks `uuid.v4`/`v7` + WASM CSPRNG surface), and compiling
+the C crypto runtime to wasm32 (unlocks sha512/sha3/blake3 WASM surface). See the WASM
+deferral decision below. The native C runtimes are the single source of truth and are fully
+KAT-tested for all 16 native targets.
 
 ### DECISION TO DOCUMENT & IMPLEMENT FIRST — the bignum layer (owner pre-approved)
 Build a shared **fixed-capacity, little-endian 32-bit-limb multi-precision integer** module
@@ -253,7 +257,37 @@ The RSA bignum layer remains a later documented decision (before 13.3b RSA).
 - **Ed25519** — `teko_crypto_ed25519.c` (RFC 8032) on fe25519 + SHA-512: Edwards point
   add/scalarmult, point compression, scalar reduction mod L; RFC 8032 KATs (Test 1 verify +
   Test 3 exact deterministic sign) + round-trip/tamper. ✅
-- **ECDSA / ECDH P-256 / P-384** — next (NIST prime-field + point arithmetic).
-- **RSA** — last (needs the multi-precision bignum layer; documented decision at that point).
+- **Montgomery bignum layer** — `teko_crypto_bn.c` (CIOS modexp, runtime R²/n′) + the
+  limb-level field API (mul/add/sub/to/from, constant-time select/swap, reduce-once, be
+  load/store, is_zero/eq). KATs: textbook RSA, Fermat on the P-256 prime, multi-limb montmul
+  cross-checked vs. modexp. ✅
+- **Generic a=-3 group law** — `teko_crypto_ec.c`: RCB complete (exception-free) Algorithm 4
+  (add) + Algorithm 6 (double) of eprint 2015/1060, transcribed line-for-line; constant-time
+  double-and-add ladder; Fermat field inverse. Shared by P-256 and P-384. ✅
+- **Curve-generic ECDH/ECDSA** — `teko_crypto_ecc.c`: descriptor-driven (prime, order, b, G,
+  byte width, RFC 6979 HMAC). FIPS 186 bits2int, RFC 6979 deterministic nonces, on-curve
+  validation, projective→affine. ✅
+- **P-256 ECDH + ECDSA** — `teko_crypto_p256.c` (secp256r1, HMAC-SHA-256). KATs: NIST CAVP
+  KAS_ECC_CDH_PrimitiveTest COUNT 0/1; RFC 6979 A.2.5 (SHA-256) "sample"/"test" exact (r,s);
+  off-curve + tamper rejection. ✅
+- **P-384 ECDH + ECDSA** — `teko_crypto_p384.c` (secp384r1, 12×32 limbs, HMAC-SHA-384; new
+  HMAC-SHA-384 in `teko_crypto_hmac.c`, RFC 4231 KAT). KATs: NIST CAVP CDH COUNT 0; RFC 6979
+  A.2.6 (SHA-384) exact (r,s); off-curve + tamper rejection. ✅
+- **RSA** — `teko_crypto_rsa.c` on `teko_bn_modexp`: PKCS#1 v1.5 signatures (DigestInfo) and
+  encryption (EME-PKCS1-v1_5, legacy), OAEP (EME-OAEP + MGF1), PSS (EMSA-PSS + MGF1), for
+  SHA-256/384/512. KATs: NIST FIPS 186 SigGen PKCS#1 v1.5 (exact S); Project Wycheproof OAEP
+  (decrypt) and PSS (verify); encrypt→decrypt / sign→verify round-trips; tamper rejection.
+  Non-CRT modexp (correctness gate; blinding/CRT are future side-channel/perf work). ✅
 
-**Curve25519 block complete** (X25519 + Ed25519). Suite 137/137.
+**Asymmetric block complete** (Curve25519 + P-256 + P-384 + RSA). Suite 167/167; all four CI
+gates green.
+
+### DECISION (registered): constant-time posture of the asymmetric block
+The **P-curve** scalar multiplication is constant-time (fixed-trace double-and-add with
+branchless `cselect`; field inverse uses the public exponent p-2 so its schedule is
+data-independent). The **RFC 6979** rejection-sampling loop branches on candidate-`k` range
+(a standard, accepted minor leak). **RSA** private operations are **not** constant-time
+(square-and-multiply modexp); blinding / CRT / Montgomery-ladder hardening are documented
+future optimizations, **not** a Phase 13 correctness gate — consistent with the AES-NI/PCLMUL
+posture taken for symmetric. Legacy **PKCS#1 v1.5 decryption** is padding-oracle-prone (kept
+for interop; prefer OAEP); OAEP/PSS decoding accumulates its verdict without early-out.

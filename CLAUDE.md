@@ -8,7 +8,7 @@ canonical docs rather than duplicating them.
 
 ## Canonical docs (read these for depth)
 - `docs/plan.md` — the phased roadmap (Phases 1–21; WASM Concurrency = Phase 10 done, Browser
-  FFI = Phase 11 merged, Frontend Grammar = Phase 12 current, Native Cryptography = Phase 13 planned).
+  FFI = Phase 11 merged, Frontend Grammar = Phase 12 current, Native Cryptography = Phase 13 complete).
 - `docs/ARCHITECTURE.md` — compiler architecture; `docs/BACKEND_AOT_PLAN.md`, `docs/vm_plan.md`.
 - `README.md` → **Supported Targets** — the 16 emitters + WASM A/B with honest CI status.
 - `docs/PHASE10_WASM_CONCURRENCY.md` — the WASM concurrency backend design.
@@ -93,8 +93,9 @@ output locally (the goldens only `strstr`; always *assemble + run*, never trust 
 - **Roadmap:** the "WASM Concurrency Backend" was reclassified from a tech-debt item to its own
   **Phase 10** (merged via PR #3). Browser FFI / JS-DOM interop = **Phase 11** (merged via PR #4).
   **Phase 12** (Frontend Grammar & Lexer Extension) is the **current phase** (PR #5;
-  `docs/PHASE12_FRONTEND_GRAMMAR.md`). **Phase 13 = Native Cryptography** (dedicated, planned —
-  symmetric + asymmetric, owner-requested); the old 13–20 shifted to 14–21 (Self-Hosting = 21).
+  `docs/PHASE12_FRONTEND_GRAMMAR.md`). **Phase 13 = Native Cryptography** (dedicated,
+  owner-requested, **functionally complete & CI-green** on `feat/phase-13-native-crypto`,
+  PR #6); the old 13–20 shifted to 14–21 (Self-Hosting = 21).
 - **Phase 13 (Native Cryptography) decisions.** Every primitive is **portable C23 in the
   embedded native runtime** (`src/runtime/teko_crypto_*.c`) — the single source of truth,
   KAT-tested in the Unity suite against NIST/RFC vectors; the native targets link it, and it
@@ -106,6 +107,21 @@ output locally (the goldens only `strstr`; always *assemble + run*, never trust 
   WAT per primitive — that would be a second implementation of each algorithm); only
   `hash.sha256` has a WASM lowering so far (in-module, FIPS-validated). `hash.sha512`/`sha3`/
   `blake3` + `random`/HKDF/PBKDF2 stay reserved-with-target on the WASM surface until then.
+- **Phase 13 asymmetric block (P-curves + RSA) — DONE (decisions).** Shared **Montgomery
+  bignum** (`teko_crypto_bn.c`, CIOS, runtime R²/n′, MSVC-safe 32-bit limbs) exposes a
+  limb-level field API; the **NIST P-curves** (`teko_crypto_ec.c` group law +
+  `teko_crypto_ecc.c` curve-generic ECDH/ECDSA, instantiated by `teko_crypto_p256.c` /
+  `teko_crypto_p384.c`) use the **Renes–Costello–Batina complete (exception-free) formulas**
+  (Algorithm 4/6, eprint 2015/1060, transcribed line-for-line) with a **constant-time
+  double-and-add ladder** and **RFC 6979** deterministic nonces (HMAC-SHA-256/384). **RSA**
+  (`teko_crypto_rsa.c`) sits on `teko_bn_modexp`: PKCS#1 v1.5 sign+encrypt, OAEP (MGF1), PSS.
+  **Constant-time posture:** P-curve scalarmult is CT (branchless select; Fermat inverse with
+  public p-2 exponent); **RSA private ops are NOT CT** (square-and-multiply modexp) and
+  **PKCS#1 v1.5 decryption is padding-oracle-prone** — blinding/CRT and CT decryption are
+  documented future work, not a correctness gate (same posture as AES-NI). KATs: NIST CAVP
+  CDH, RFC 6979 A.2.5/A.2.6, FIPS 186 SigGen, Project Wycheproof OAEP/PSS. No language
+  surface yet (C-runtime + KATs only) — `crypto`/`sign`/`verify`/`encrypt`/`decrypt` token
+  lowering is later frontend work; the asymmetric runtime is the source of truth for it.
 - **Legacy hashes MD5 + SHA-1 are LEGACY/INSECURE (decision).** Provided as native C
   runtimes (`teko_crypto_md5.c`/`teko_crypto_sha1.c`) + KATs and on the `hash` surface
   (`hash.md5`/`hash.sha1`, in-module WASM, `.tks`-proven) **only** for backward-compat/interop
@@ -126,13 +142,13 @@ output locally (the goldens only `strstr`; always *assemble + run*, never trust 
   features beyond the source subset remain exercised via the `emit-demo/*.c` drivers.
 
 ## Current state / next
-Phases 10 (WASM concurrency) and 11 (Browser FFI / JS-DOM interop, incl. the real `.tks → IL →
-WASM` interop frontend) are **merged and CI-green** (PR #3, PR #4). **Phase 12 (Frontend Grammar
-& Lexer Extension) is current** on branch `feat/phase-12-frontend-grammar` (PR #5):
-done so far — the reserved keyword matrix → tokens (P12-A, incl. the `keywords[]` sentinel fix),
-native literal unit suffixes (P12-B; time/data/bandwidth, longest-match), and the symmetry-audit
-tokens (P12-1A; `decrypt` + base-encoding `encode`/`decode`/`base64`/`base32`/`hex`). Next:
-foundational frontend (named locals → general expressions → multiple nested args), then base
-encoding made **functional**. Crypto keywords (`crypto`/`hash`/`encrypt`/`decrypt`) are
-**reserved → lowering in Phase 13** (Native Cryptography, planned). See
-`docs/PHASE12_FRONTEND_GRAMMAR.md`.
+Phases 10 (WASM concurrency) and 11 (Browser FFI / JS-DOM interop) are **merged and CI-green**
+(PR #3, PR #4). **Phase 13 (Native Cryptography) is functionally complete and CI-green** on
+`feat/phase-13-native-crypto` (PR #6, ready to leave draft): the full hash/MAC, KDF, symmetric/
+AEAD, memory-hard, and **asymmetric** (X25519, Ed25519, P-256 & P-384 ECDH/ECDSA, RSA PKCS#1
+v1.5 / OAEP / PSS) primitives as KAT-tested portable C runtimes (suite 167/167, all four gates
+green). The `crypto`/`hash`/`sign`/`verify`/`encrypt`/`decrypt` **language surface** beyond
+`hash.sha256` + `uuid.v3`/`v5` is **not yet wired** — that frontend lowering, and the deferred
+WASM crypto path (compile C runtime → wasm32 + host entropy import), are the next crypto steps.
+Phase 12 (Frontend Grammar & Lexer Extension) work continues on its own branch (PR #5). See
+`docs/PHASE13_NATIVE_CRYPTO.md` and `docs/PHASE12_FRONTEND_GRAMMAR.md`.

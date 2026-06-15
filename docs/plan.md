@@ -214,7 +214,7 @@ This document establishes the definitive technical roadmap for the final develop
 └──────────────┬───────────────┘
                ▼
 ┌──────────────────────────────┐
-│  PHASE 13: NATIVE CRYPTOGRAPHY│ ➔ Symmetric + asymmetric ciphers, hashes, KDFs (planned)
+│  PHASE 13: NATIVE CRYPTOGRAPHY│ ➔ Symmetric + asymmetric ciphers, hashes, KDFs (complete)
 └──────────────┬───────────────┘
                ▼
 ┌──────────────────────────────┐
@@ -365,13 +365,22 @@ Inject the full token table the Lexer and Parser must mandatorily process:
 
 ---
 
-## 🔐 PHASE 13: Native Cryptography — *Planned (implementation gated until Phase 12 closes)*
+## 🔐 PHASE 13: Native Cryptography — *Functionally complete (PR #6, branch `feat/phase-13-native-crypto`)*
 *A dedicated phase: implement the widest practical set of **symmetric** and **asymmetric**
 ciphers natively — no external libraries, no OpenSSL. Pure Teko/C primitives that every
 backend (the 16 native emitters + WASM) can emit, with constant-time discipline where it
 matters and test-vector-driven proof (NIST/RFC KATs + round-trips). This phase owns the
 cryptography moved out of the old "Networking, Web & Cryptography" phase (now Phase 17,
 Networking & Web), which consumes these primitives for TLS 1.3.*
+
+> **Status: all sub-phases landed and CI-green.** 13.1 (SHA-2/3, SHAKE, BLAKE3, HMAC,
+> incl. legacy MD5/SHA-1 + UUID), 13.3a (CSPRNG, HKDF, PBKDF2), 13.2 (ChaCha20-Poly1305,
+> AES-128/192/256 CTR/CBC/GCM), 13.4 (scrypt, BLAKE2b, Argon2), and 13.3b asymmetric
+> (X25519, Ed25519, **P-256 ECDH/ECDSA, P-384 ECDH/ECDSA, RSA PKCS#1 v1.5 / OAEP / PSS**).
+> Single source of truth = the portable C runtime (`src/runtime/teko_crypto_*.c`), KAT-tested
+> (167/167) against NIST CAVP / FIPS 186 / RFC 6979 / RFC 8017 / Project Wycheproof. WASM
+> lowering beyond `hash.sha256` (and `uuid.v3`/`v5`) is the documented deferred follow-up
+> (compile the C runtime → wasm32 + host entropy import). See `docs/PHASE13_NATIVE_CRYPTO.md`.
 
 **Goal:** the **maximum** practical coverage of symmetric **and** asymmetric ciphers,
 all native. **Surface (Teko keywords):** `crypto`, `hash`, `encrypt`/`decrypt`,
