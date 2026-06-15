@@ -319,7 +319,9 @@ See `TECH_DEBT_BACKLOG.md` for full scoring, business justification, and file pa
 `OP_CALL_IMPORT` · **MVP-2** ✅ DOM (`dom.*` multi-arg imports + auto-generated glue) ·
 **MVP-3** ✅ JS→Teko events (`dom.on` + exported `teko_invoke`) · **MVP-4** ✅ real allocator
 (`teko_alloc`/`teko_free`/`teko_reset` free-list + coalescing) + JS→Teko strings + ergonomic
-facade (`<mod>.mjs`) + rich event payload (`dom.on_value`). **Phase 11 complete, CI-green.**
+facade (`<mod>.mjs`) + rich event payload (`dom.on_value`). **FE-A..F** ✅ wire a real
+`.tks → IL → WASM` frontend (`teko build … --target=wasm`, no mock): `extern`, `@dom`/`@js`
+intrinsics, strings, and `fn` event handlers compile from source. **Phase 11 complete, CI-green.**
 
 ---
 

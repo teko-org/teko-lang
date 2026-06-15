@@ -132,11 +132,28 @@ accordingly; Self-Containment is now Phase 20.
 Browser-FFI-adjacent work (real `.tks` frontend lowering, below) is independent and
 explicitly out of this phase's scope.
 
-### Deferred beyond Phase 11 (not required to close it)
-- **Frontend `.tks` lowering (gated).** Lower the parsed `extern` AST → import table + a
-  call-expression IL path so a real `.tks` (once a source driver exists) emits the import
-  automatically. Needs the call-expression IL path, which does not exist yet. (Independent
-  of the Browser FFI backend, which is fully exercised via the emit-demos.)
+- **FE — real `.tks` → IL → WASM frontend. ✅ delivered (no more mock bytecode).**
+  - **FE-A/B:** `codegen_li` gains an import table + interop IL emit helpers, and
+    `codegen_li_emit_wasm` bridges an IL `BytecodeBuffer` to the WASM backend (string pool
+    → `(data)`, import table → `(import …)`, IL → module, + auto glue/facade).
+  - **FE-C:** `frontend_interop.c` (`teko_compile_interop`) compiles the interop subset of
+    real Teko source, driving the real lexer and reusing the real `parse_extern_declaration`
+    — `extern fn … from "ns" as "name"` is now **consumed**, not discarded, and a call to
+    one lowers to `OP_SCONST/OP_ICONST` + `OP_SETARG` + `OP_CALL_IMPORT`.
+  - **FE-D:** `main.c --target=wasm` reads a real `.tks` and emits a real `.wat` (+glue) —
+    **mock bytecode removed on the WASM path**. Proof: the `teko` binary compiles
+    `samples/hello.tks` and `run-source.mjs` runs it.
+  - **FE-E:** `@dom.method(...)` / `@js.method(...)` intrinsics from source → `dom.*`/`js.*`
+    imports; strings expand to `(ptr,len)`; the leading arg may be a nested `@dom` call.
+    Proof: `samples/dom.tks` compiled by the binary drives the DOM in headless Chromium.
+  - **FE-F:** event handlers from source — a `fn` handler is lowered to a table routine; the
+    handler param (the event arg) is stashed/loaded; `@dom.on(elem, "click", handler)`
+    resolves the handler to its table slot. Proof: `samples/events.tks` — a click fires the
+    Teko `fn` via `teko_invoke` and updates the DOM in Chromium.
+  - Bounded subset (documented): args are string/int literals, a handler param ref, a
+    function ref, or one leading nested `@dom` call; named locals / general expressions /
+    multiple nested handle args are future work. The interop surface (extern/@dom/strings/
+    events) compiles from source end-to-end.
 
 Discipline: 1 increment per commit; Release + ASan/UBSan on both dispatch paths (TSan for
 the allocator); native emitter goldens unchanged; the 4 CI workflows green; patient

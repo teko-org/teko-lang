@@ -180,6 +180,74 @@ void test_frontend_interop_dom_intrinsics(void) {
     codegen_li_free_context(buffer);
 }
 
+// Phase 11 (Browser FFI frontend FE-F): event handlers from source. A `fn` handler
+// becomes a table routine; @dom.on(elem, "click", handler) registers it (the handler
+// name resolves to its table slot). Asserts imports, the main-level on() call with the
+// fn-ref, and the routine body (param stash/load + setText).
+void test_frontend_interop_event_handler(void) {
+    const char* src =
+        "fn onClick(target) {\n"
+        "  @dom.setText(target, \"hit\");\n"
+        "}\n"
+        "@dom.on(@dom.getElementById(\"count\"), \"click\", onClick);\n";
+
+    BytecodeBuffer* buffer = codegen_li_create_context();
+    TEST_ASSERT_NOT_NULL(buffer);
+    TEST_ASSERT_EQUAL_INT(0, teko_compile_interop(src, buffer));
+
+    // dom imports: getElementById (#0), on (#1), setText (#2).
+    TEST_ASSERT_EQUAL_INT(3, buffer->import_count);
+    TEST_ASSERT_EQUAL_STRING("getElementById", buffer->imports[0].name);
+    TEST_ASSERT_EQUAL_STRING("on", buffer->imports[1].name);
+    TEST_ASSERT_EQUAL_INT(4, buffer->imports[1].n_params);
+    TEST_ASSERT_EQUAL_STRING("setText", buffer->imports[2].name);
+
+    // The IL must contain a function boundary (the handler routine) and the handler's
+    // table slot (0) referenced as an immediate by the on() call.
+    int saw_func_begin = 0, saw_func_end = 0;
+    for (int i = 0; i < buffer->size; i++) {
+        if (buffer->code[i] == OP_FUNC_BEGIN) saw_func_begin = 1;
+        if (buffer->code[i] == OP_FUNC_END) saw_func_end = 1;
+    }
+    TEST_ASSERT_TRUE(saw_func_begin);
+    TEST_ASSERT_TRUE(saw_func_end);
+
+    // Through the bridge: the module exports teko_invoke (JS->Teko) and a table, plus
+    // the dom.on import and a $routine_0 with a setText call.
+    TekoTarget target;
+    target.arch = ARCH_WASM32;
+    target.os = OS_WASI;
+    strncpy(target.target_string, "wasm32-wasi", sizeof(target.target_string) - 1);
+    const char* wat = "output_events_src.wat";
+    const char* glue = "output_events_src.glue.mjs";
+    TEST_ASSERT_EQUAL_INT(0, codegen_li_emit_wasm(buffer, wat, target, glue, NULL, NULL, NULL, 0));
+
+    FILE* f = fopen(wat, "r");
+    TEST_ASSERT_NOT_NULL(f);
+    char* out = (char*)malloc(32768);
+    memset(out, 0, 32768);
+    size_t n = fread(out, 1, 32767, f); out[n] = '\0'; fclose(f);
+    TEST_ASSERT_NOT_NULL(strstr(out, "(import \"dom\" \"on\""));
+    TEST_ASSERT_NOT_NULL(strstr(out, "(func $teko_invoke (export \"teko_invoke\")"));
+    TEST_ASSERT_NOT_NULL(strstr(out, "(func $routine_0"));
+    char* routine = strstr(out, "(func $routine_0");
+    TEST_ASSERT_NOT_NULL(strstr(routine, "call $import_2")); // setText inside the handler
+    free(out);
+    remove(wat);
+
+    // The glue exposes the dom.on listener wiring (addEventListener -> teko_invoke).
+    FILE* gf = fopen(glue, "r");
+    TEST_ASSERT_NOT_NULL(gf);
+    char* g = (char*)malloc(8192);
+    memset(g, 0, 8192);
+    size_t gn = fread(g, 1, 8191, gf); g[gn] = '\0'; fclose(gf);
+    TEST_ASSERT_NOT_NULL(strstr(g, "addEventListener(str(p, n), () => invoke(fn, h))"));
+    free(g);
+    remove(glue);
+
+    codegen_li_free_context(buffer);
+}
+
 // Phase 11 (Browser FFI frontend FE-A): import table dedup + interop emit helpers.
 // Models the IL a parser would emit for `log("hi")` where
 // `extern fn log(msg) from "env" as "log"`: SCONST &"hi" -> CALL_IMPORT #0 -> HALT.

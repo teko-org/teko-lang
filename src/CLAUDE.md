@@ -33,8 +33,15 @@ type/semantic (`semantic_*`) → **IL bytecode** (`codegen_li.c/.h`, `BytecodeBu
   (`emit_wasm_heap_runtime`: free-list first-fit + coalescing `teko_alloc`/`teko_free`/
   `teko_reset` over `[16384..65536)`), `teko_invoke2(fn,a0,a1)` for `(ptr,len)` payloads, an
   auto-generated ergonomic facade (`teko_metal_emit_facade` → `<mod>.mjs`), and `dom.on_value`
-  rich event payloads. The parser→IL wiring for real `.tks` source is the remaining
-  (out-of-phase) Browser FFI work.
+  rich event payloads.
+- **Real `.tks` → IL → WASM frontend is wired (FE-A..F), no mock bytecode.** `codegen_li.c`
+  carries an import table + interop emit helpers; `codegen_li_wasm.c` (`codegen_li_emit_wasm`)
+  bridges an IL `BytecodeBuffer` to the backend; `frontend_interop.c` (`teko_compile_interop`)
+  compiles the interop subset of real source — reusing the real lexer + `parse_extern_declaration`
+  — covering `extern`, top-level calls, `@dom`/`@js` intrinsics (`(ptr,len)` string expansion,
+  one leading nested arg) and `fn` event handlers (lowered to table routines, registered via
+  `@dom.on`). `main.c --target=wasm` compiles a real `.tks`. General expressions / named locals
+  remain future work; the interop surface compiles source→wasm end-to-end.
 - The IL CSE in `codegen_metal.c` must invalidate its ICONST reuse cache after any op that
   clobbers `$w0` (`SCONST`/`LOAD`/`CHAN_GET`/`CALL_IMPORT`); `STORE`/`SETARG` are cache-safe
   (they read `$w0` or write `$w1`). Eliminating a const across a `$w0`-clobber is a bug.

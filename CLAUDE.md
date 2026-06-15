@@ -92,11 +92,13 @@ output locally (the goldens only `strstr`; always *assemble + run*, never trust 
 - **Roadmap:** the "WASM Concurrency Backend" was reclassified from a tech-debt item to its own
   **Phase 10** (merged via PR #3). Browser FFI / JS-DOM interop is the **current phase**
   (Phase 11; `docs/PHASE_BROWSER_FFI.md`).
-- **Browser FFI backend is built; the `.tks` frontend is not.** The WASM backend now lowers the
-  full Browser FFI surface (imports, DOM, events, allocator, facade) and is exercised via the
-  `emit-demo/*.c` drivers. The real `.tks→.wat` driver (`main.c` uses mock bytecode) +
-  parser→IL lowering of `extern`/`@dom` (FFI is still parsed-but-discarded in
-  `parser_visibility.c`) is **out of Phase 11 scope** — a separate, later effort.
+- **Browser FFI backend AND a real `.tks` frontend are built.** The WASM backend lowers the
+  full Browser FFI surface (imports, DOM, events, allocator, facade), and the frontend now
+  compiles real source for it: `teko build <f>.tks --target=wasm` lexes/parses/lowers the
+  interop subset (`extern`, `@dom`/`@js`, strings, `fn` event handlers) to IL → `.wat` with
+  **no mock bytecode** (`frontend_interop.c` + `codegen_li_wasm.c`; reuses the real lexer +
+  `parse_extern_declaration`). General expressions / named locals are future work; backend
+  features beyond the source subset remain exercised via the `emit-demo/*.c` drivers.
 
 ## Current state / next
 Phase 10 (WASM concurrency, Layers A & B) is **merged and CI-green**. **Phase 11 (Browser FFI /

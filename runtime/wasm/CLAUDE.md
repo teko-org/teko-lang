@@ -2,11 +2,17 @@
 
 See the root `CLAUDE.md` for the backend design and CI. This is the host-side test harness.
 
-## Important: no `.tks → .wat` pipeline yet
-The CLI (`src/main.c`) emits from mock bytecode, not real source. So executable proof drives
-the emitter **directly**: each `emit-demo/*.c` links `build/libteko_core.a`, builds an IL byte
-program, and calls `teko_metal_emit_program` to write a `.wat`. `wat2wasm` assembles it; the
-runners execute and assert. (Locally, `npm i wabt` gives a JS `wat2wasm` to validate output.)
+## Two proof paths: real `.tks` source, and emit-demos
+The CLI now compiles **real Teko source** for the WASM target:
+`teko build <file>.tks --target=wasm -o out.wat` lexes/parses/lowers the interop subset
+(`extern`, `@dom`/`@js`, strings, `fn` event handlers) to IL → `.wat` (+ auto glue/facade),
+no mock bytecode (`frontend_interop.c` / `codegen_li_wasm.c`). The source proofs:
+`samples/hello.tks` (`run-source.mjs`), `samples/dom.tks` (`run-dom-source.mjs`),
+`samples/events.tks` (`run-events-source.mjs`).
+The **emit-demos** remain as direct-backend proofs (and cover backend features whose source
+syntax is still future work): each `emit-demo/*.c` links `build/libteko_core.a`, builds an IL
+byte program, and calls `teko_metal_emit_program` to write a `.wat`. `wat2wasm` assembles;
+the runners execute and assert. (Locally, `npm i wabt` gives a JS `wat2wasm`.)
 
 ## Layout
 - `emit-demo/` — C drivers: `emit_spawn_channel.c` (→7), `emit_suspend.c` (→30),

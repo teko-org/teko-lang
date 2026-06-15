@@ -115,13 +115,22 @@ static int intrinsic_has_result(const char* method) {
             strcmp(method, "createElement") == 0) ? 1 : 0;
 }
 
-// A flat literal "producer" (one wasm param): a pooled string ptr, a string length,
-// or an integer immediate.
-typedef struct { int is_sconst; int payload; } Prod; // is_sconst: 1=SCONST pool idx, 0=ICONST val
+// Lowering context threaded through @dom calls: the current handler param name (an
+// identifier arg matching it loads the event arg from $w1) and the handler name->table
+// slot map (an identifier arg matching one is a function reference -> its table index).
+typedef struct {
+    const char* param_name; // current handler param, or NULL at top level
+    ImportBinding* fns;      // handler name -> table slot (idx = slot)
+    int nfns;
+} LowerCtx;
 
-static void lower_intrinsic_call(BytecodeBuffer* buffer, Parser* p); // recursive
+// A flat "producer" (one wasm param). kind: 0=ICONST payload, 1=SCONST pool idx,
+// 2=LOAD the handler param ($w0 <- $w1, no payload).
+typedef struct { int kind; int payload; } Prod;
 
-static void lower_intrinsic_call(BytecodeBuffer* buffer, Parser* p) {
+static void lower_intrinsic_call(BytecodeBuffer* buffer, Parser* p, const LowerCtx* ctx); // recursive
+
+static void lower_intrinsic_call(BytecodeBuffer* buffer, Parser* p, const LowerCtx* ctx) {
     // current token is the MACRO_IDENT, e.g. "@dom.setText". Split into ns + method.
     char full[128];
     strncpy(full, p->current_token.lexeme, sizeof(full) - 1);
@@ -144,12 +153,12 @@ static void lower_intrinsic_call(BytecodeBuffer* buffer, Parser* p) {
     // Optional leading nested intrinsic call as arg0 (its result -> $w0).
     int has_nested = 0;
     if (p->current_token.type == TOKEN_MACRO_IDENT) {
-        lower_intrinsic_call(buffer, p); // emits inner; result in $w0
+        lower_intrinsic_call(buffer, p, ctx); // emits inner; result in $w0
         has_nested = 1;
         if (p->current_token.type == TOKEN_COMMA) fe_advance(p);
     }
 
-    // Collect the remaining literal args, expanded to flat producers (string -> ptr+len).
+    // Collect the remaining args, expanded to flat producers (string -> ptr+len).
     Prod prods[32];
     int np = 0;
     while (p->current_token.type != TOKEN_RPAREN && p->current_token.type != TOKEN_EOF) {
@@ -158,11 +167,21 @@ static void lower_intrinsic_call(BytecodeBuffer* buffer, Parser* p) {
             int idx = codegen_li_add_string_constant(buffer, s);
             int len = (int)strlen(s);
             free(s);
-            prods[np].is_sconst = 1; prods[np].payload = idx; np++;   // ptr
-            prods[np].is_sconst = 0; prods[np].payload = len; np++;   // len
+            prods[np].kind = 1; prods[np].payload = idx; np++;   // ptr (SCONST)
+            prods[np].kind = 0; prods[np].payload = len; np++;   // len (ICONST)
             fe_advance(p);
         } else if (p->current_token.type == TOKEN_LIT_INT && np + 1 <= 32) {
-            prods[np].is_sconst = 0; prods[np].payload = atoi(p->current_token.lexeme); np++;
+            prods[np].kind = 0; prods[np].payload = atoi(p->current_token.lexeme); np++;
+            fe_advance(p);
+        } else if (p->current_token.type == TOKEN_IDENTIFIER && np + 1 <= 32) {
+            const char* id = p->current_token.lexeme;
+            if (ctx && ctx->param_name && strcmp(id, ctx->param_name) == 0) {
+                prods[np].kind = 2; prods[np].payload = 0; np++;            // LOAD handler param
+            } else {
+                int slot = ctx ? bind_lookup(ctx->fns, ctx->nfns, id) : -1;
+                if (slot >= 0) { prods[np].kind = 0; prods[np].payload = slot; np++; } // fn ref -> ICONST slot
+                // else: unknown identifier in this subset — produces nothing
+            }
             fe_advance(p);
         } else if (p->current_token.type == TOKEN_COMMA) {
             fe_advance(p);
@@ -178,12 +197,15 @@ static void lower_intrinsic_call(BytecodeBuffer* buffer, Parser* p) {
     // Stage the nested result (param 0) unless it is the only/last param.
     if (has_nested && total > 1) codegen_li_emit_setarg(buffer, 0);
 
-    // Emit the literal producers at absolute slots [has_nested .. total-1]; the last
-    // param stays in $w0.
+    // Emit the producers at absolute slots [has_nested .. total-1]; the last param
+    // stays in $w0.
     for (int k = 0; k < np; k++) {
         int slot = (has_nested ? 1 : 0) + k;
-        if (prods[k].is_sconst) codegen_li_emit_sconst(buffer, prods[k].payload);
-        else codegen_li_emit_iconst(buffer, prods[k].payload);
+        switch (prods[k].kind) {
+            case 1: codegen_li_emit_sconst(buffer, prods[k].payload); break;
+            case 2: codegen_li_emit_load(buffer); break;
+            default: codegen_li_emit_iconst(buffer, prods[k].payload); break;
+        }
         if (slot < total - 1) codegen_li_emit_setarg(buffer, slot);
     }
 
@@ -193,6 +215,112 @@ static void lower_intrinsic_call(BytecodeBuffer* buffer, Parser* p) {
 
 static int is_dom_macro(const char* lexeme) {
     return lexeme && (strncmp(lexeme, "@dom.", 5) == 0 || strncmp(lexeme, "@js.", 4) == 0);
+}
+
+// Skip a whole `extern …;` / `extern { … }` declaration. Needed by the fn scanners
+// below so the `fn` token INSIDE `extern fn …` is not mistaken for a handler.
+static void skip_extern_decl(Parser* p) {
+    fe_advance(p); // consume 'extern'
+    while (p->current_token.type != TOKEN_LBRACE &&
+           p->current_token.type != TOKEN_SEMICOLON &&
+           p->current_token.type != TOKEN_EOF) {
+        fe_advance(p);
+    }
+    if (p->current_token.type == TOKEN_LBRACE) {
+        int depth = 0;
+        while (p->current_token.type != TOKEN_EOF) {
+            if (p->current_token.type == TOKEN_LBRACE) { depth++; fe_advance(p); }
+            else if (p->current_token.type == TOKEN_RBRACE) {
+                depth--; fe_advance(p);
+                if (depth == 0) break;
+            } else {
+                fe_advance(p);
+            }
+        }
+        if (p->current_token.type == TOKEN_SEMICOLON) fe_advance(p);
+    } else if (p->current_token.type == TOKEN_SEMICOLON) {
+        fe_advance(p);
+    }
+}
+
+// Pre-pass: assign each top-level `fn NAME` a table slot (declaration order), so a
+// main-level @dom.on(…, NAME) can resolve the handler reference before its body.
+static void collect_functions(const char* source, ImportBinding** fns, int* nfns, int* capfns) {
+    Lexer lx; lexer_init(&lx, source);
+    Parser p; parser_init(&p, &lx);
+    int slot = 0;
+    while (p.current_token.type != TOKEN_EOF) {
+        if (p.current_token.type == TOKEN_EXTERN) {
+            skip_extern_decl(&p); // do not treat `extern fn` as a handler
+        } else if (p.current_token.type == TOKEN_FN && p.peek_token.type == TOKEN_IDENTIFIER) {
+            bind_add(fns, nfns, capfns, p.peek_token.lexeme, slot++);
+            fe_advance(&p); // consume 'fn'
+            fe_advance(&p); // consume name
+        } else {
+            fe_advance(&p);
+        }
+    }
+}
+
+// Routine pass: emit each `fn NAME(param) { body }` as a table routine. The handler is
+// invoked via teko_invoke(slot, event_arg): on entry $w0 = the arg, which we stash to
+// $w1 so `param` references (LOAD) survive across the body's @dom calls.
+static void emit_handler_routines(const char* source, BytecodeBuffer* buffer,
+                                  ImportBinding* fns, int nfns) {
+    Lexer lx; lexer_init(&lx, source);
+    Parser p; parser_init(&p, &lx);
+
+    while (p.current_token.type != TOKEN_EOF) {
+        if (p.current_token.type == TOKEN_EXTERN) { skip_extern_decl(&p); continue; }
+        if (p.current_token.type != TOKEN_FN) { fe_advance(&p); continue; }
+        fe_advance(&p); // consume 'fn'
+        if (p.current_token.type != TOKEN_IDENTIFIER) continue;
+
+        char fn_name[96];
+        strncpy(fn_name, p.current_token.lexeme, sizeof(fn_name) - 1);
+        fn_name[sizeof(fn_name) - 1] = '\0';
+        int slot = bind_lookup(fns, nfns, fn_name);
+        fe_advance(&p); // consume name
+
+        // Parameter list: capture the single event param name (if any).
+        char param[96]; param[0] = '\0';
+        if (p.current_token.type == TOKEN_LPAREN) {
+            fe_advance(&p);
+            if (p.current_token.type == TOKEN_IDENTIFIER) {
+                strncpy(param, p.current_token.lexeme, sizeof(param) - 1);
+                param[sizeof(param) - 1] = '\0';
+            }
+            while (p.current_token.type != TOKEN_RPAREN && p.current_token.type != TOKEN_EOF) {
+                fe_advance(&p); // skip rest of params / types
+            }
+            if (p.current_token.type == TOKEN_RPAREN) fe_advance(&p);
+        }
+        // Body open brace.
+        while (p.current_token.type != TOKEN_LBRACE && p.current_token.type != TOKEN_EOF) fe_advance(&p);
+        if (p.current_token.type == TOKEN_LBRACE) fe_advance(&p);
+
+        codegen_li_emit_func_begin(buffer, slot >= 0 ? slot : 0);
+        if (param[0]) codegen_li_emit_store(buffer); // $w1 = event arg
+
+        LowerCtx ctx;
+        ctx.param_name = param[0] ? param : NULL;
+        ctx.fns = fns;
+        ctx.nfns = nfns;
+
+        int depth = 1;
+        while (p.current_token.type != TOKEN_EOF && depth > 0) {
+            if (p.current_token.type == TOKEN_LBRACE) { depth++; fe_advance(&p); }
+            else if (p.current_token.type == TOKEN_RBRACE) { depth--; fe_advance(&p); }
+            else if (p.current_token.type == TOKEN_MACRO_IDENT &&
+                     is_dom_macro(p.current_token.lexeme) &&
+                     p.peek_token.type == TOKEN_LPAREN) {
+                lower_intrinsic_call(buffer, &p, &ctx);
+            } else {
+                fe_advance(&p);
+            }
+        }
+        codegen_li_emit_func_end(buffer);
+    }
 }
 
 int teko_compile_interop(const char* source, BytecodeBuffer* buffer) {
@@ -206,6 +334,13 @@ int teko_compile_interop(const char* source, BytecodeBuffer* buffer) {
     ImportBinding* binds = NULL;
     int nb = 0, capb = 0;
 
+    // Pre-pass: map every handler `fn NAME` to a table slot so main-level
+    // @dom.on(…, NAME) can reference it even if declared later.
+    ImportBinding* fns = NULL;
+    int nfns = 0, capfns = 0;
+    collect_functions(source, &fns, &nfns, &capfns);
+    LowerCtx top_ctx; top_ctx.param_name = NULL; top_ctx.fns = fns; top_ctx.nfns = nfns;
+
     while (parser.current_token.type != TOKEN_EOF) {
         if (parser.current_token.type == TOKEN_EXTERN) {
             FFIASTNode* node = parse_extern_declaration(&parser);
@@ -213,11 +348,26 @@ int teko_compile_interop(const char* source, BytecodeBuffer* buffer) {
                 register_extern(buffer, node, &binds, &nb, &capb);
                 free_ffi_ast_node(node);
             }
+        } else if (parser.current_token.type == TOKEN_FN) {
+            // Handler declaration: skip its body in the main pass; it is emitted as a
+            // table routine after main's HALT (emit_handler_routines).
+            while (parser.current_token.type != TOKEN_LBRACE &&
+                   parser.current_token.type != TOKEN_EOF) fe_advance(&parser);
+            int depth = 0;
+            while (parser.current_token.type != TOKEN_EOF) {
+                if (parser.current_token.type == TOKEN_LBRACE) { depth++; fe_advance(&parser); }
+                else if (parser.current_token.type == TOKEN_RBRACE) {
+                    depth--; fe_advance(&parser);
+                    if (depth == 0) break;
+                } else {
+                    fe_advance(&parser);
+                }
+            }
         } else if (parser.current_token.type == TOKEN_MACRO_IDENT &&
                    is_dom_macro(parser.current_token.lexeme) &&
                    parser.peek_token.type == TOKEN_LPAREN) {
             // Top-level @dom/@js intrinsic call statement.
-            lower_intrinsic_call(buffer, &parser);
+            lower_intrinsic_call(buffer, &parser, &top_ctx);
         } else if (parser.current_token.type == TOKEN_IDENTIFIER &&
                    parser.peek_token.type == TOKEN_LPAREN) {
             // Top-level call statement: NAME ( arg, … )
@@ -264,7 +414,12 @@ int teko_compile_interop(const char* source, BytecodeBuffer* buffer) {
 
     codegen_li_emit_halt(buffer); // close main
 
+    // Emit handler bodies as table routines (after main), so @dom.on references resolve.
+    emit_handler_routines(source, buffer, fns, nfns);
+
     for (int i = 0; i < nb; i++) free(binds[i].name);
     free(binds);
+    for (int i = 0; i < nfns; i++) free(fns[i].name);
+    free(fns);
     return 0;
 }

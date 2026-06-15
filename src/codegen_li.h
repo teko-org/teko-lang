@@ -101,6 +101,8 @@ int codegen_li_add_import(BytecodeBuffer* buffer, const char* ns, const char* na
 // the interop surface. Each appends to `buffer->code`.
 void codegen_li_emit_iconst(BytecodeBuffer* buffer, int value);
 void codegen_li_emit_sconst(BytecodeBuffer* buffer, int pool_index);
+void codegen_li_emit_store(BytecodeBuffer* buffer); // $w1 <- $w0
+void codegen_li_emit_load(BytecodeBuffer* buffer);  // $w0 <- $w1
 void codegen_li_emit_setarg(BytecodeBuffer* buffer, int slot);
 void codegen_li_emit_call_import(BytecodeBuffer* buffer, int import_index);
 void codegen_li_emit_func_begin(BytecodeBuffer* buffer, int routine_id);

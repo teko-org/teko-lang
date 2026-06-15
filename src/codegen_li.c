@@ -105,6 +105,16 @@ void codegen_li_emit_setarg(BytecodeBuffer* buffer, int slot) {
     emit_int(buffer, slot);
 }
 
+void codegen_li_emit_store(BytecodeBuffer* buffer) {
+    if (!buffer) return;
+    emit_byte(buffer, OP_STORE); // $w1 <- $w0
+}
+
+void codegen_li_emit_load(BytecodeBuffer* buffer) {
+    if (!buffer) return;
+    emit_byte(buffer, OP_LOAD);  // $w0 <- $w1
+}
+
 void codegen_li_emit_call_import(BytecodeBuffer* buffer, int import_index) {
     if (!buffer) return;
     emit_byte(buffer, OP_CALL_IMPORT);
