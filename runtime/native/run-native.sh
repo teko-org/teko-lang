@@ -33,6 +33,25 @@ check() {
   echo "OK: $base -> [$got]"
 }
 
+# Phase 16 (16.F): a FAIL-LOUD case — the program must exit NON-ZERO and print <diag> to stderr
+# (a checked conversion that rejects its input must not silently truncate). <pre> is the stdout
+# emitted before the abort.
+check_fail() {
+  local sample="$1" pre="$2" diag="$3"
+  local base exe out err rc
+  base="$(basename "$sample" .tks)"
+  exe="$TMP/$base"
+  echo "--- $sample (fail-loud) ---"
+  "$TEKO" build "$HERE/samples/$sample" --target=host --rt-lib="$RTLIB" -o "$exe" \
+    || fail "compile/link failed for $sample"
+  set +e; out="$("$exe" 2>"$TMP/$base.err")"; rc=$?; set -e   # the abort is EXPECTED (errexit off)
+  err="$(cat "$TMP/$base.err")"
+  [ "$rc" -ne 0 ] || fail "$base: expected non-zero exit (fail-loud), got 0"
+  [ "$out" = "$pre" ] || fail "$base: expected stdout [$pre], got [$out]"
+  case "$err" in *"$diag"*) : ;; *) fail "$base: stderr [$err] missing [$diag]";; esac
+  echo "OK: $base -> exit $rc, stderr contains [$diag]"
+}
+
 # Real-time waiters: assert exact stdout AND a LOWER BOUND on real wall-clock elapsed (the time
 # base is the real monotonic clock, so we assert >= min_ms with tolerance, not an exact duration).
 # Timed via perl Time::HiRes (portable; macOS `date` lacks %N).
@@ -102,6 +121,71 @@ check_uuid() {
 }
 
 check hello.tks "hello from teko native"
+# Phase 16 (16.A): culture-invariant conversion surface — int/bool to_string + str_concat
+# (OP_CALL_RUNTIME ids 49/51/52 -> teko_rt_* over the portable teko_convert.c source of truth).
+# Asserts the locale-invariant default: `.`-decimal, NO digit grouping, canonical "true"/"false".
+check convert.tks "$(cat <<'EXP'
+42
+1000000
+true
+false
+x = 42
+EXP
+)"
+# Phase 16 (16.B): auto-`to_string` on string concatenation (the core deliverable). `+` with a
+# string operand becomes culture-invariant concatenation; non-string operands auto-convert via
+# to_string (id 49) + str_concat (id 52). No explicit conversion call appears in the source.
+check concat.tks "$(cat <<'EXP'
+x = 42
+sum = 50
+42 items
+count: 42
+n=42
+EXP
+)"
+# Phase 16 (16.C): string INTERPOLATION — `"…{expr}…"` interpolates each hole (auto-to_string),
+# `{{`/`}}` are literal braces. Same str_concat machinery as 16.B; culture-invariant.
+check interp.tks "$(cat <<'EXP'
+x = 42
+42 items, 42 total
+sum = 50
+count: 42
+braces { } kept
+[42]
+EXP
+)"
+# Phase 16 (16.D): user-defined-type to_string in concat/interpolation. A class with a to_string
+# method dispatches it (via OP_CALL_FUNC); a class without one gets the synthesized default
+# ClassName(fields). Zero runtime reflection.
+check tostring.tks "$(cat <<'EXP'
+temp is T=25
+[T=25]
+point = Point(3, 4)
+p=Point(3, 4)
+EXP
+)"
+# Phase 16 (16.E): EXPLICIT integer formats (developer-supplied spec) — radix / zero-pad /
+# thousands grouping (ids 56/57/58). Distinct from the culture-invariant default; still locale-free.
+check format.tks "$(cat <<'EXP'
+ff
+1010
+100
+00042
+1,000,000
+hex = ff
+EXP
+)"
+# Phase 16 (16.F): CHECKED string->primitive parse (ids 53/55). Happy path returns the value
+# (auto-to_string'd back on concat); the fail-loud path aborts non-zero with a stderr diagnostic.
+check parse.tks "$(cat <<'EXP'
+n = 123
+neg = -42
+ws = 7
+true
+false
+EXP
+)"
+check_fail parse_fail.tks "before" "convert.parse_int: invalid integer"
 # Phase 15 (15.A): concrete class — fields + methods + STATIC dispatch, zero runtime reflection.
 # `Point()` -> OP_OBJ_NEW; `p.x = 3` -> OP_OBJ_SET; `p.sum()`/`p.scale(10)` -> OP_CALL_FUNC
 # (the method routine reads `self.x`/`self.y` via OP_OBJ_GET). Prints 7 (3+4) then 70 ((3+4)*10).

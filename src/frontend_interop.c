@@ -342,6 +342,58 @@ static int localcls_get(const char* n) {
     for (int i = 0; i < g_nlocalcls; i++) if (strcmp(g_localcls[i].name, n) == 0) return g_localcls[i].cls;
     return -1;
 }
+
+// Phase 16 (16.B): the static value-type of a lowered expression result in $w0. VT_INT is a
+// register-width integer (object/class handles ride here too); VT_STR a NUL-terminated string
+// pointer. This drives auto-`to_string` on `+`: when either operand of `+` is a string, the op
+// becomes culture-invariant string CONCATENATION (OP_CALL_RUNTIME id 52), with any int operand
+// first converted via id 49 (`teko_rt_int_to_string`). The conversion resolves at compile time —
+// zero runtime reflection — exactly the hook Phase 15 left for the auto-call machinery.
+#define TEKO_VT_INT 0
+#define TEKO_VT_STR 1
+// Phase 16 (16.D): an object-typed expression result — `TEKO_VT_OBJ_BASE + class_index`. In a
+// concat/interpolation it coerces to a string by dispatching the class's (own or inherited)
+// `to_string` method (Phase-15 hook, resolved by name → OP_CALL_FUNC), or, when the class defines
+// none, by synthesizing the culture-invariant default `ClassName(field0, field1, …)`. Zero runtime
+// reflection (the slot / field layout are compile-time constants).
+#define TEKO_VT_OBJ_BASE 2
+
+// Phase 16: the value-type a runtime primitive (OP_CALL_RUNTIME id) leaves in $w0. Almost all
+// codec/convert/hash/format ids return a string POINTER (VT_STR); the CHECKED parsers (16.F) return
+// an integer (VT_INT) — so `"n=" + convert.parse_int(s)` concatenates correctly (the int is then
+// auto-`to_string`'d), not treated as a pointer.
+static int runtime_result_vt(int id) {
+    return (id == 53 || id == 55) ? TEKO_VT_INT : TEKO_VT_STR; // parse_int / parse_bool
+}
+static int codec_id_for(const char* lex); // fwd (defined with the codec surface below)
+
+// Set by lower_init_value to the value-type of the initializer it just lowered, so lower_let_stmt /
+// lower_reassign can remember a string-typed local (read like g_last_inst_class).
+static int g_last_init_vt = TEKO_VT_INT;
+
+// Names of string-typed named locals (so `s` reads as VT_STR in an expression). Per-function scope,
+// reset alongside g_localcls. Mirrors the localcls registry (name set membership).
+static char g_localstr[TEKO_MAX_LOCALCLS][96];
+static int  g_nlocalstr;
+static void localstr_reset(void) { g_nlocalstr = 0; }
+static void localstr_set(const char* n, int is_str) {
+    for (int i = 0; i < g_nlocalstr; i++)
+        if (strcmp(g_localstr[i], n) == 0) {            // already known string-typed
+            if (!is_str) { // demote: a reassignment to a non-string value
+                g_localstr[i][0] = g_localstr[i][1] = '\0'; // tombstone (empty name never matches)
+            }
+            return;
+        }
+    if (is_str && g_nlocalstr < TEKO_MAX_LOCALCLS) {
+        strncpy(g_localstr[g_nlocalstr], n, 95); g_localstr[g_nlocalstr][95] = '\0';
+        g_nlocalstr++;
+    }
+}
+static int localstr_get(const char* n) {
+    if (!n || !n[0]) return 0;
+    for (int i = 0; i < g_nlocalstr; i++) if (strcmp(g_localstr[i], n) == 0) return 1;
+    return 0;
+}
 // Split a dotted lexeme "base.member" into its two parts. Returns 1 on success (a dot present).
 static int dotted_split(const char* lex, char* base, char* member) {
     const char* dot = lex ? strchr(lex, '.') : NULL;
@@ -491,8 +543,33 @@ static OpCode p12_tok_op(TokenType t) {
     }
 }
 
-static void eval_expr_prec(BytecodeBuffer* b, Parser* p, const LowerCtx* ctx,
-                           int min_prec, TempAlloc* ta);
+// Phase 16 (16.B): the expression evaluators now RETURN the result's value-type (TEKO_VT_*), so a
+// binary `+` with a string operand lowers to culture-invariant concatenation (auto-`to_string`).
+static int eval_expr_prec(BytecodeBuffer* b, Parser* p, const LowerCtx* ctx,
+                          int min_prec, TempAlloc* ta);
+static int is_codec_head(const Parser* p);   // fwd (defined with the codec surface below)
+static void lower_base_codec(BytecodeBuffer* b, Parser* p, const LowerCtx* ctx); // fwd
+static int lower_interp_string(BytecodeBuffer* b, Parser* p, const LowerCtx* ctx); // fwd (16.C)
+// Phase 16 (16.D): coerce the operand VALUE in $w0 (per its value-type `vt`) to a string pointer in
+// $w0 — int via to_string (id 49), string unchanged, object via its to_string / synthesized default.
+static void coerce_to_string_in_w0(BytecodeBuffer* b, const LowerCtx* ctx, int vt); // fwd (16.D)
+
+// Phase 16 (16.C): a STRING-INTERPOLATION literal — a `"…"` whose (unescaped) content contains a
+// `{expr}` hole (e.g. `"x = {n}"`, `"{p}"`). `{{`/`}}` are literal braces. The interop frontend
+// treats a brace-bearing double-quoted literal as interpolated (matching the owner's `"{p}"`
+// surface); a literal `{` is written `{{`. (The full-AST backtick interpolation subsystem in
+// parser_string.c is separate and unchanged.)
+static int strlit_is_interp(const char* lexeme) {
+    if (!lexeme) return 0;
+    // Any `{` (a `{expr}` hole, or the `{{` escape) routes through interpolation lowering, which
+    // also unescapes `{{`/`}}`. The `}}` escape is honored even with no `{` present. A literal brace
+    // in a double-quoted string is written `{{`/`}}` (a lone `{` opens an interpolation hole).
+    for (const char* s = lexeme; *s; s++) {
+        if (s[0] == '{') return 1;
+        if (s[0] == '}' && s[1] == '}') return 1;
+    }
+    return 0;
+}
 
 // Phase 15 (15.A): `obj.field` READ as an expression primary -> OP_OBJ_GET(handle, idx) -> $w0.
 // `obj` must be a class-typed local and `member` one of its fields (resolved at compile time).
@@ -516,43 +593,225 @@ static int lower_member_read(BytecodeBuffer* b, Parser* p, const LowerCtx* ctx) 
     return 1;
 }
 
-static void eval_primary(BytecodeBuffer* b, Parser* p, const LowerCtx* ctx, TempAlloc* ta) {
+static int eval_primary(BytecodeBuffer* b, Parser* p, const LowerCtx* ctx, TempAlloc* ta) {
     if (p->current_token.type == TOKEN_LIT_INT) {
         codegen_li_emit_iconst(b, atoi(p->current_token.lexeme));
         fe_advance(p);
+        return TEKO_VT_INT;
+    } else if (p->current_token.type == TOKEN_LIT_STR || p->current_token.type == TOKEN_STRING_LIT) {
+        if (strlit_is_interp(p->current_token.lexeme)) {
+            // Phase 16 (16.C): an interpolated literal `"…{expr}…"` -> concat of chunks + holes.
+            return lower_interp_string(b, p, ctx);
+        }
+        // Phase 16 (16.B): a string-literal primary -> SCONST pointer in $w0 (VT_STR), so `"a" + x`
+        // (or a bare string sub-expression) is recognized as concatenation, not arithmetic.
+        char* sv = strip_quotes(p->current_token.lexeme);
+        codegen_li_emit_sconst(b, codegen_li_add_string_constant(b, sv));
+        free(sv); fe_advance(p);
+        return TEKO_VT_STR;
+    } else if (is_codec_head(p)) {
+        // Phase 16 (16.B/16.F): a codec / convert / hash call primary — most return a string pointer
+        // (VT_STR); the checked parsers return an int (VT_INT). So `"n=" + convert.parse_int(s)`
+        // concatenates correctly (the int is auto-`to_string`'d), not mistaken for a pointer.
+        int id = codec_id_for(p->current_token.lexeme);
+        lower_base_codec(b, p, ctx);
+        return runtime_result_vt(id);
     } else if (p->current_token.type == TOKEN_LPAREN) {
         fe_advance(p);
-        eval_expr_prec(b, p, ctx, 1, ta);
+        int vt = eval_expr_prec(b, p, ctx, 1, ta);
         if (p->current_token.type == TOKEN_RPAREN) fe_advance(p);
+        return vt;
     } else if (lower_member_read(b, p, ctx)) {
-        // `obj.field` read consumed (e.g. inside `self.x + self.y`).
+        // `obj.field` read consumed (e.g. inside `self.x + self.y`). Field cells are integers here.
+        return TEKO_VT_INT;
     } else if (p->current_token.type == TOKEN_IDENTIFIER) {
         int s = ctx ? bind_lookup(ctx->locals, ctx->nlocals, p->current_token.lexeme) : -1;
-        if (s >= 0) codegen_li_emit_load_local(b, s);
+        int isstr = localstr_get(p->current_token.lexeme);
+        int ci = localcls_get(p->current_token.lexeme); // Phase 16.D: a class-instance local?
+        if (s >= 0) codegen_li_emit_load_local(b, s);   // $w0 = value (int / string ptr / handle)
         else codegen_li_emit_iconst(b, 0); // unknown identifier in this subset → 0
         fe_advance(p);
+        if (s >= 0 && ci >= 0) return TEKO_VT_OBJ_BASE + ci; // object handle → dispatch to_string
+        return isstr ? TEKO_VT_STR : TEKO_VT_INT;
     } else {
         codegen_li_emit_iconst(b, 0); // empty/unsupported primary → 0
+        return TEKO_VT_INT;
     }
 }
 
-static void eval_expr_prec(BytecodeBuffer* b, Parser* p, const LowerCtx* ctx,
-                           int min_prec, TempAlloc* ta) {
-    eval_primary(b, p, ctx, ta); // left operand → $w0
+static int eval_expr_prec(BytecodeBuffer* b, Parser* p, const LowerCtx* ctx,
+                          int min_prec, TempAlloc* ta) {
+    int vt_l = eval_primary(b, p, ctx, ta); // left operand → $w0
     while (p12_tok_prec(p->current_token.type) >= min_prec &&
            p12_tok_prec(p->current_token.type) > 0) {
         int prec = p12_tok_prec(p->current_token.type);
-        OpCode op = p12_tok_op(p->current_token.type);
+        TokenType optok = p->current_token.type;
+        OpCode op = p12_tok_op(optok);
         fe_advance(p); // consume the operator
         int t = ta->next_temp++;
         if (ta->next_temp > ta->hw) ta->hw = ta->next_temp;
-        codegen_li_emit_store_local(b, t);        // temp = left
-        eval_expr_prec(b, p, ctx, prec + 1, ta);  // right → $w0 (left-associative)
-        codegen_li_emit_store(b);                 // $w1 = right
-        codegen_li_emit_load_local(b, t);         // $w0 = left
-        codegen_li_emit_binop(b, op);             // $w0 = left <op> right
-        ta->next_temp--;                          // free temp
+        codegen_li_emit_store_local(b, t);            // temp = left (raw value)
+        int vt_r = eval_expr_prec(b, p, ctx, prec + 1, ta);  // right → $w0 (left-associative)
+        if (optok == TOKEN_PLUS && (vt_l == TEKO_VT_STR || vt_r == TEKO_VT_STR)) {
+            // Phase 16 (16.B): a `+` with a string operand is culture-invariant CONCATENATION with
+            // auto-`to_string`. Right is in $w0 — convert it to a string if it is an int (id 49),
+            // stash it, then build the left string and call str_concat (id 52, arg0=left, $w0=right).
+            coerce_to_string_in_w0(b, ctx, vt_r);      // $w0 = to_string(right) (int/object/string)
+            int t2 = ta->next_temp++;
+            if (ta->next_temp > ta->hw) ta->hw = ta->next_temp;
+            codegen_li_emit_store_local(b, t2);        // temp2 = right (string ptr)
+            codegen_li_emit_load_local(b, t);          // $w0 = left (raw)
+            coerce_to_string_in_w0(b, ctx, vt_l);      // $w0 = to_string(left)
+            codegen_li_emit_setarg(b, 0);              // $a0 = left string
+            codegen_li_emit_load_local(b, t2);         // $w0 = right string
+            codegen_li_emit_call_runtime(b, 52);       // $w0 = str_concat(left, right)
+            ta->next_temp--;                           // free temp2
+            vt_l = TEKO_VT_STR;
+        } else {
+            codegen_li_emit_store(b);                  // $w1 = right
+            codegen_li_emit_load_local(b, t);          // $w0 = left
+            codegen_li_emit_binop(b, op);              // $w0 = left <op> right
+            vt_l = TEKO_VT_INT;
+        }
+        ta->next_temp--;                               // free temp
     }
+    return vt_l;
+}
+
+// Phase 16 (16.C): lower an interpolated string literal `"…{expr}…"` to a single string pointer in
+// $w0 (VT_STR), built by concatenating literal chunks and per-hole `to_string(expr)` — the same
+// culture-invariant auto-`to_string` as `+`. Each hole's expression is re-lexed through a sub-parser
+// that shares THIS lowering ctx (so locals/temps resolve), then reuses str_concat (id 52). `{{`/`}}`
+// are literal braces. Current token is the string literal; it is consumed before returning.
+static int lower_interp_string(BytecodeBuffer* b, Parser* p, const LowerCtx* ctx) {
+    char* content = strip_quotes(p->current_token.lexeme);   // inner text, no surrounding quotes
+    TempAlloc* ta = ctx->ta;
+    int acc = ta->next_temp++;                                // accumulator temp (running result)
+    if (ta->next_temp > ta->hw) ta->hw = ta->next_temp;
+    int have_acc = 0;
+
+    // Append the string pointer currently in $w0 to the accumulator (str_concat, left-assoc).
+    #define INTERP_APPEND_W0() do {                                                       \
+        if (!have_acc) { codegen_li_emit_store_local(b, acc); have_acc = 1; }             \
+        else {                                                                            \
+            int tp = ta->next_temp++; if (ta->next_temp > ta->hw) ta->hw = ta->next_temp; \
+            codegen_li_emit_store_local(b, tp);          /* tp = piece */                 \
+            codegen_li_emit_load_local(b, acc); codegen_li_emit_setarg(b, 0); /* a0=acc */\
+            codegen_li_emit_load_local(b, tp);           /* $w0 = piece */                \
+            codegen_li_emit_call_runtime(b, 52);         /* $w0 = concat(acc, piece) */   \
+            codegen_li_emit_store_local(b, acc);                                          \
+            ta->next_temp--;                                                              \
+        }                                                                                 \
+    } while (0)
+
+    char lit[4096]; int ln = 0;
+    const char* s = content ? content : "";
+    while (*s) {
+        if (s[0] == '{' && s[1] == '{') { if (ln < (int)sizeof(lit)-1) lit[ln++]='{'; s += 2; continue; }
+        if (s[0] == '}' && s[1] == '}') { if (ln < (int)sizeof(lit)-1) lit[ln++]='}'; s += 2; continue; }
+        if (s[0] == '{') {
+            // Flush any pending literal chunk as a SCONST piece.
+            if (ln > 0) {
+                lit[ln] = '\0';
+                codegen_li_emit_sconst(b, codegen_li_add_string_constant(b, lit));
+                INTERP_APPEND_W0();
+                ln = 0;
+            }
+            // Extract the hole expression up to the matching '}' (brace-depth aware).
+            s++; // past '{'
+            char expr[1024]; int en = 0, depth = 1;
+            while (*s && depth > 0) {
+                if (*s == '{') depth++;
+                else if (*s == '}') { depth--; if (depth == 0) break; }
+                if (en < (int)sizeof(expr)-1) expr[en++] = *s;
+                s++;
+            }
+            expr[en] = '\0';
+            if (*s == '}') s++; // past closing '}'
+            // Re-lex + lower the hole expression with the SHARED ctx (locals/temps), then to_string.
+            Lexer sublx; lexer_init(&sublx, expr);
+            Parser subp; parser_init(&subp, &sublx);
+            int vt = eval_expr_prec(b, &subp, ctx, 1, ta);   // hole value → $w0
+            coerce_to_string_in_w0(b, ctx, vt);              // auto-to_string (int/object/string)
+            INTERP_APPEND_W0();
+            continue;
+        }
+        if (ln < (int)sizeof(lit)-1) lit[ln++] = *s;
+        s++;
+    }
+    if (ln > 0) { // trailing literal chunk
+        lit[ln] = '\0';
+        codegen_li_emit_sconst(b, codegen_li_add_string_constant(b, lit));
+        INTERP_APPEND_W0();
+    }
+    if (!have_acc) { // empty / all-escaped → the empty string
+        codegen_li_emit_sconst(b, codegen_li_add_string_constant(b, ""));
+        codegen_li_emit_store_local(b, acc); have_acc = 1;
+    }
+    codegen_li_emit_load_local(b, acc); // result → $w0
+    ta->next_temp--;                    // free acc
+    #undef INTERP_APPEND_W0
+    if (content) free(content);
+    fe_advance(p); // consume the interpolated literal
+    return TEKO_VT_STR;
+}
+
+// Phase 16 (16.D): coerce an OBJECT handle in $w0 (instance of class `ci`) to a string pointer in
+// $w0. If the class defines (or inherits) a `to_string` method, dispatch it statically through the
+// Phase-15 hook (self=arg0, routine slot via OP_CALL_FUNC) — exactly like `p.to_string()`. When the
+// class defines none, synthesize the culture-invariant default `ClassName(f0, f1, …)` over the
+// fields (each rendered via the integer to_string), the compile-time generated-stringifier spirit.
+static void emit_object_to_string(BytecodeBuffer* b, const LowerCtx* ctx, int ci) {
+    TempAlloc* ta = ctx->ta;
+    int midx = (ci >= 0) ? class_method_idx(ci, "to_string") : -1;
+    if (ci >= 0 && midx >= 0 && g_class[ci].method_slot[midx] >= 0) {
+        codegen_li_emit_setarg(b, 0);                              // $a0 = self (the handle)
+        codegen_li_emit_iconst(b, g_class[ci].method_slot[midx]); // $w0 = method slot (static)
+        codegen_li_emit_call_func(b, 1);                          // $w0 = self.to_string()
+        return;
+    }
+    // --- synthesized default: "ClassName(" + field0 + ", " + field1 + … + ")" -----------------
+    int th = ta->next_temp++;  if (ta->next_temp > ta->hw) ta->hw = ta->next_temp; // handle
+    codegen_li_emit_store_local(b, th);
+    int acc = ta->next_temp++; if (ta->next_temp > ta->hw) ta->hw = ta->next_temp; // running result
+    char head[120]; snprintf(head, sizeof(head), "%s(", (ci >= 0) ? g_class[ci].name : "?");
+    codegen_li_emit_sconst(b, codegen_li_add_string_constant(b, head));
+    codegen_li_emit_store_local(b, acc);
+    int nf = (ci >= 0) ? g_class[ci].nfields : 0;
+    for (int i = 0; i < nf; i++) {
+        if (i > 0) {                                              // acc += ", "
+            int tp = ta->next_temp++; if (ta->next_temp > ta->hw) ta->hw = ta->next_temp;
+            codegen_li_emit_sconst(b, codegen_li_add_string_constant(b, ", "));
+            codegen_li_emit_store_local(b, tp);
+            codegen_li_emit_load_local(b, acc); codegen_li_emit_setarg(b, 0);
+            codegen_li_emit_load_local(b, tp);  codegen_li_emit_call_runtime(b, 52);
+            codegen_li_emit_store_local(b, acc); ta->next_temp--;
+        }
+        codegen_li_emit_load_local(b, th); codegen_li_emit_setarg(b, 0);     // $a0 = handle
+        codegen_li_emit_iconst(b, i); codegen_li_emit_object(b, OP_OBJ_GET); // $w0 = field i
+        codegen_li_emit_call_runtime(b, 49);                                 // -> decimal string
+        int tp = ta->next_temp++; if (ta->next_temp > ta->hw) ta->hw = ta->next_temp;
+        codegen_li_emit_store_local(b, tp);                                  // acc += fieldstr
+        codegen_li_emit_load_local(b, acc); codegen_li_emit_setarg(b, 0);
+        codegen_li_emit_load_local(b, tp);  codegen_li_emit_call_runtime(b, 52);
+        codegen_li_emit_store_local(b, acc); ta->next_temp--;
+    }
+    {                                                             // acc += ")"
+        int tp = ta->next_temp++; if (ta->next_temp > ta->hw) ta->hw = ta->next_temp;
+        codegen_li_emit_sconst(b, codegen_li_add_string_constant(b, ")"));
+        codegen_li_emit_store_local(b, tp);
+        codegen_li_emit_load_local(b, acc); codegen_li_emit_setarg(b, 0);
+        codegen_li_emit_load_local(b, tp);  codegen_li_emit_call_runtime(b, 52);
+        codegen_li_emit_store_local(b, acc); ta->next_temp--;
+    }
+    codegen_li_emit_load_local(b, acc);  // $w0 = the assembled default
+    ta->next_temp -= 2;                  // free acc + th
+}
+
+static void coerce_to_string_in_w0(BytecodeBuffer* b, const LowerCtx* ctx, int vt) {
+    if (vt == TEKO_VT_STR) return;                            // already a string pointer
+    if (vt >= TEKO_VT_OBJ_BASE) { emit_object_to_string(b, ctx, vt - TEKO_VT_OBJ_BASE); return; }
+    codegen_li_emit_call_runtime(b, 49);                      // VT_INT → culture-invariant decimal
 }
 
 // --- base-encoding codecs (P12-G) -----------------------------------------------
@@ -640,6 +899,21 @@ static int codec_id_for(const char* lex) {
     // UUID name-based generators (deterministic; DNS namespace) — ids 8/9.
     if (strcmp(lex, "uuid.v3") == 0) return 8;
     if (strcmp(lex, "uuid.v5") == 0) return 9;
+    // Phase 16 (Casting / Conversions & Parsing) — culture-invariant conversion surface, string-
+    // returning like the crypto/time ids. `convert.int_to_str(n)` lowers n (an int immediate/local)
+    // in $w0; `convert.str_concat(a, b)` stages a + leaves b in $w0 (arity 2). The lexer folds
+    // `convert.int_to_str` into ONE dotted identifier (same rule as `time.now_unix`). Parse +
+    // explicit-format + the auto-call on concat/interpolation are later 16.x sub-blocks.
+    if (strcmp(lex, "convert.int_to_str") == 0)  return 49;
+    if (strcmp(lex, "convert.bool_to_str") == 0) return 51;
+    if (strcmp(lex, "convert.str_concat") == 0)  return 52;
+    // Phase 16.E — explicit integer formats (developer-supplied spec; deviates from the default).
+    if (strcmp(lex, "convert.to_radix") == 0)    return 56; // (v, base 2..36)
+    if (strcmp(lex, "convert.pad") == 0)         return 57; // (v, width)
+    if (strcmp(lex, "convert.group") == 0)       return 58; // (v) -> thousands-grouped
+    // Phase 16.F — CHECKED parse (string -> primitive; fail-loud on malformed input).
+    if (strcmp(lex, "convert.parse_int") == 0)   return 53; // (str) -> i32
+    if (strcmp(lex, "convert.parse_bool") == 0)  return 55; // (str) -> 0/1
     return -1;
 }
 
@@ -668,6 +942,9 @@ static int runtime_arity(int id) {
         case 38: return 4; // rsa_pss_verify(n, e, mhash, sig)
         case 39: return 3; // rsa_oaep_encrypt(n, e, msg)
         case 40: return 3; // rsa_oaep_decrypt(n, d, ct)
+        case 52: return 2; // convert.str_concat(a, b)
+        case 56: return 2; // convert.to_radix(v, base)
+        case 57: return 2; // convert.pad(v, width)
         default: return 1;
     }
 }
@@ -967,10 +1244,15 @@ static int  lower_trait_dispatch(BytecodeBuffer* b, Parser* p, LowerEnv* env);  
 
 static void lower_init_value(BytecodeBuffer* b, Parser* p, LowerEnv* env) {
     LowerCtx* ctx = env->ctx;
-    if (p->current_token.type == TOKEN_LIT_STR || p->current_token.type == TOKEN_STRING_LIT) {
+    g_last_init_vt = TEKO_VT_INT; // Phase 16 (16.B): default; the string-yielding cases set VT_STR
+    if ((p->current_token.type == TOKEN_LIT_STR || p->current_token.type == TOKEN_STRING_LIT) &&
+        p12_tok_prec(p->peek_token.type) == 0 && !strlit_is_interp(p->current_token.lexeme)) {
+        // A LONE, NON-interpolated string literal. `"a" + x` and `"{x}"` fall through to
+        // eval_expr_prec (→ eval_primary), lowered as concatenation / interpolation (16.B/16.C).
         char* sv = strip_quotes(p->current_token.lexeme);
         codegen_li_emit_sconst(b, codegen_li_add_string_constant(b, sv));
         free(sv); fe_advance(p);
+        g_last_init_vt = TEKO_VT_STR;
     } else if (is_instantiation_head(p)) {
         // Phase 15 (15.A/15.C): `ClassName(...)` / `T(...)` / `Box<Arg>(...)` instantiation ->
         // OP_OBJ_NEW -> handle in $w0 (sets g_last_inst_class for the let binding).
@@ -982,7 +1264,8 @@ static void lower_init_value(BytecodeBuffer* b, Parser* p, LowerEnv* env) {
     } else if (p->current_token.type == TOKEN_MACRO_IDENT && is_dom_macro(p->current_token.lexeme) &&
                p->peek_token.type == TOKEN_LPAREN) {
         lower_intrinsic_call(b, p, ctx);
-    } else if (is_codec_head(p))   { lower_base_codec(b, p, ctx); }
+    } else if (is_codec_head(p))   { int id = codec_id_for(p->current_token.lexeme);
+                                     lower_base_codec(b, p, ctx); g_last_init_vt = runtime_result_vt(id); }
     else if (is_duplex_head(p))    { lower_duplex_call(b, p, ctx); }
     else if (is_delayed_head(p))   { lower_delayed_call(b, p, ctx); }
     else if (is_bcast_head(p))     { lower_bcast_call(b, p, ctx); }
@@ -1015,7 +1298,7 @@ static void lower_init_value(BytecodeBuffer* b, Parser* p, LowerEnv* env) {
         codegen_li_emit_iconst(b, cooldown);  // last arg in $w0
         codegen_li_emit_retry(b, OP_CIRCUIT_NEW); // $w0 = breaker handle
     }
-    else { env_sync(env); eval_expr_prec(b, p, ctx, 1, ctx->ta); } // integer expression -> $w0
+    else { env_sync(env); g_last_init_vt = eval_expr_prec(b, p, ctx, 1, ctx->ta); } // expr -> $w0 (VT tracked)
 }
 
 // `let`/`mut NAME [: type] = <init>;` inside a body — allocate (or reuse) a $v slot, lower the
@@ -1065,6 +1348,8 @@ static void lower_let_stmt(BytecodeBuffer* b, Parser* p, LowerEnv* env) {
     } else if (rhs_class >= 0) {
         localcls_set(lname, rhs_class);
     }
+    // Phase 16 (16.B): remember a string-typed local so `s` reads as VT_STR in a later concat.
+    localstr_set(lname, g_last_init_vt == TEKO_VT_STR);
     if (p->current_token.type == TOKEN_SEMICOLON) fe_advance(p);
 }
 
@@ -1092,23 +1377,58 @@ static int lower_reassign(BytecodeBuffer* b, Parser* p, LowerEnv* env) {
         codegen_li_emit_iconst(b, rhs_class >= 0 ? class_type_id(rhs_class) : -1);
         codegen_li_emit_store_local(b, g_traitlocal[tl].tid_slot);
     }
+    // Phase 16 (16.B): keep the local's string-typed-ness in sync with its new value.
+    localstr_set(nm, g_last_init_vt == TEKO_VT_STR);
     if (p->current_token.type == TOKEN_SEMICOLON) fe_advance(p);
     return 1;
 }
 
-// `NAME(arg, …);` extern call inside a body. Args may be string/int literals or named locals
-// (loaded from their slot), staged via OP_SETARG with the last left in $w0. Returns 1 if it
-// resolved NAME to a registered import, else 0 (caller skips the token).
+// Phase 16 (16.B): a call argument that is an EXPRESSION rather than a bare literal/local — namely
+// a parenthesized expression, or a primary immediately followed by a binary operator (e.g.
+// `"x = " + n`). Such an argument is evaluated into $w0 (auto-`to_string`-on-`+` happens inside
+// eval_expr_prec) and spilled to a temp local, then passed as a local-slot CallArg — reusing the
+// existing marshalling. *temps_used is bumped; the caller restores ctx->ta->next_temp after the
+// call. Returns 1 if it consumed an expression argument, 0 if `*p` is a simple literal/local form
+// the caller should handle directly. `locals`/`nlocals` is the current named-local table.
+static int try_lower_call_arg_expr(BytecodeBuffer* b, Parser* p, const LowerCtx* ctx,
+                                   ImportBinding* locals, int nlocals,
+                                   CallArg* arg, int* temps_used) {
+    int is_paren = (p->current_token.type == TOKEN_LPAREN);
+    int is_str   = (p->current_token.type == TOKEN_LIT_STR || p->current_token.type == TOKEN_STRING_LIT);
+    int is_prim  = (is_str || p->current_token.type == TOKEN_LIT_INT ||
+                    (p->current_token.type == TOKEN_IDENTIFIER &&
+                     bind_lookup(locals, nlocals, p->current_token.lexeme) >= 0));
+    // Phase 16.C: a bare interpolated literal `"{n}"` (no trailing operator) is also an expression.
+    int is_interp = is_str && strlit_is_interp(p->current_token.lexeme);
+    if (!is_paren && !is_interp && !(is_prim && p12_tok_prec(p->peek_token.type) > 0)) return 0;
+    TempAlloc* ta = ctx->ta;
+    eval_expr_prec(b, p, ctx, 1, ta);                 // expression → $w0 (string ptr or int)
+    int t = ta->next_temp++;
+    if (ta->next_temp > ta->hw) ta->hw = ta->next_temp;
+    codegen_li_emit_store_local(b, t);                // spill so subsequent args don't clobber it
+    arg->is_string = 0; arg->sval = NULL; arg->ival = 0; arg->is_local = 1; arg->slot = t;
+    (*temps_used)++;
+    return 1;
+}
+
+// `NAME(arg, …);` extern call inside a body. Args may be EXPRESSIONS (Phase 16.B — incl. string
+// concatenation `"x = " + n`), string/int literals, or named locals (loaded from their slot),
+// staged via OP_SETARG with the last left in $w0. Returns 1 if it resolved NAME to a registered
+// import, else 0 (caller skips the token).
 static int lower_call_stmt(BytecodeBuffer* b, Parser* p, LowerEnv* env) {
     if (p->current_token.type != TOKEN_IDENTIFIER || p->peek_token.type != TOKEN_LPAREN) return 0;
     int idx = bind_lookup(*env->binds, *env->nb, p->current_token.lexeme);
     if (idx < 0) return 0;
     fe_advance(p); // NAME
     fe_advance(p); // '('
+    env_sync(env); // position ctx->locals + temp allocator before evaluating any expression arg
     CallArg args[16];
-    int nargs = 0;
+    int nargs = 0, temps_used = 0;
     while (p->current_token.type != TOKEN_RPAREN && p->current_token.type != TOKEN_EOF) {
-        if (nargs < 16 && (p->current_token.type == TOKEN_LIT_STR ||
+        if (nargs < 16 && try_lower_call_arg_expr(b, p, env->ctx, *env->locals, *env->nlocals,
+                                                  &args[nargs], &temps_used)) {
+            nargs++;
+        } else if (nargs < 16 && (p->current_token.type == TOKEN_LIT_STR ||
                            p->current_token.type == TOKEN_STRING_LIT)) {
             args[nargs].is_string = 1; args[nargs].sval = strip_quotes(p->current_token.lexeme);
             args[nargs].ival = 0; args[nargs].is_local = 0; args[nargs].slot = 0;
@@ -1133,6 +1453,7 @@ static int lower_call_stmt(BytecodeBuffer* b, Parser* p, LowerEnv* env) {
     if (p->current_token.type == TOKEN_RPAREN) fe_advance(p);
     if (p->current_token.type == TOKEN_SEMICOLON) fe_advance(p);
     lower_call(b, idx, args, nargs);
+    env->ctx->ta->next_temp -= temps_used; // free expression-arg spill temps
     for (int i = 0; i < nargs; i++) if (args[i].sval) free(args[i].sval);
     return 1;
 }
@@ -2174,7 +2495,7 @@ static void emit_class_body(Parser* p, BytecodeBuffer* buffer, int ci,
         renv.locals = &rlocals; renv.nlocals = &rnlocals; renv.caplocals = &rcaplocals;
         renv.binds = &binds; renv.nb = &nb; renv.ctx = &ctx;
 
-        localcls_reset(); // method scope: self (+ any objects it instantiates) are class-typed
+        localcls_reset(); localstr_reset(); // method scope: self (+ any objects it instantiates) are class-typed
         traitlocal_reset(); // method scope: trait-typed locals don't leak across method bodies
         for (int pi = 0; pi < nparams; pi++) {
             int ps = env_alloc_local(&renv, params[pi]);
@@ -2229,7 +2550,7 @@ static void emit_method_routines(const char* source, BytecodeBuffer* buffer,
         if (p.current_token.type == TOKEN_LBRACE) fe_advance(&p);
         emit_class_body(&p, buffer, ci, fns, nfns, binds, nb, ta);
     }
-    localcls_reset();
+    localcls_reset(); localstr_reset();
 }
 
 // Phase 15.C: emit each MONOMORPHIZED instance's methods. For each `Tmpl$Arg` concrete instance, set
@@ -2261,7 +2582,7 @@ static void emit_mono_routines(const char* source, BytecodeBuffer* buffer,
         }
         g_subst_param[0] = '\0'; g_subst_arg[0] = '\0';
     }
-    localcls_reset();
+    localcls_reset(); localstr_reset();
 }
 
 int teko_compile_interop(const char* source, BytecodeBuffer* buffer) {
@@ -2293,7 +2614,7 @@ int teko_compile_interop(const char* source, BytecodeBuffer* buffer) {
     collect_events(source, fns, nfns); // Phase 15.D: events + their static subscriptions
     collect_classes(source, nfns);
     check_oop_collisions(); // ambiguous trait composition -> g_oop_error (compile failure below)
-    localcls_reset();
+    localcls_reset(); localstr_reset();
     if (g_oop_error) return 1; // do not emit a module with an unresolved OOP compile error
 
     // Phase 12: named local variables ($v0..) declared with `let`/`mut` at top level.
@@ -2548,7 +2869,11 @@ int teko_compile_interop(const char* source, BytecodeBuffer* buffer) {
             int temps_used = 0; // codec-arg results spilled to temp locals
             while (parser.current_token.type != TOKEN_RPAREN &&
                    parser.current_token.type != TOKEN_EOF) {
-                if (nargs < 16 && is_codec_head(&parser)) {
+                if (nargs < 16 && try_lower_call_arg_expr(buffer, &parser, &top_ctx, locals, nlocals,
+                                                          &args[nargs], &temps_used)) {
+                    // Phase 16.B: an expression argument (e.g. `"x = " + n`) — evaluated + spilled.
+                    nargs++;
+                } else if (nargs < 16 && is_codec_head(&parser)) {
                     // base64/hex codec call as an argument (P12-G): lower eagerly and
                     // spill the result pointer to a temp local, then pass the local.
                     lower_base_codec(buffer, &parser, &top_ctx); // $w0 = result ptr

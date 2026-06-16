@@ -20,6 +20,9 @@ static int wasm_is_crypto_ext_id(int id) {
         case 33: case 34:                                           // SHAKE
         case 37: case 38: case 39: case 40:                         // RSA
         case 44: case 45: case 46: case 47: case 48:               // wall-clock / timezone surface
+        case 49: case 51: case 52:                                  // Phase 16 conversion surface
+        case 53: case 55:                                           // Phase 16.F checked parse
+        case 56: case 57: case 58:                                  // Phase 16.E explicit formats
             return 1;
         default: return 0;
     }
@@ -1126,7 +1129,7 @@ void emit_wasm_pure(MetalContext* ctx, OpCode op, int32_t arg) {
             // Teko's [0..65536) region (link --global-base=65536), so the allocators never
             // alias. Declare an import per reactor-backed id (all imports must precede defs).
             if (ctx->wasm_emit_crypto_ext) {
-                for (int id = 0; id <= 48; id++) {
+                for (int id = 0; id <= 58; id++) {   // Phase 16: conversion surface ends at id 58
                     int ar = 1;
                     const char* sym;
                     if (!wasm_is_crypto_ext_id(id)) continue;
