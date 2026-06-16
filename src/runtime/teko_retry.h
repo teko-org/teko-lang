@@ -42,6 +42,14 @@ uint64_t teko_retry_next_delay(const TekoRetry* r, int attempt);
 // docs/plan.md (branch straight to fallback rather than start a doomed attempt).
 int teko_retry_should_continue(const TekoRetry* r, int attempt, uint64_t elapsed);
 
+// Phase 14 (real-time clock): the surface drives the timeout off the REAL monotonic clock.
+// teko_retry_mark_start records the policy's start instant (same unit as `timeout` — the wrappers
+// pass ms derived from teko_rt_now_ns); teko_retry_should_continue_rt computes elapsed = now-start
+// and applies the same rule. The explicit-elapsed teko_retry_should_continue above stays for the
+// deterministic KATs.
+void teko_retry_mark_start(TekoRetry* r, uint64_t start);
+int  teko_retry_should_continue_rt(const TekoRetry* r, int attempt, uint64_t now);
+
 // --- circuit breaker ------------------------------------------------------------
 // threshold: consecutive failures that trip CLOSED→OPEN. cooldown: time (same unit as `now`)
 // the breaker stays OPEN before allowing a HALF_OPEN trial.

@@ -1177,11 +1177,11 @@ void emit_wasm_pure(MetalContext* ctx, OpCode op, int32_t arg) {
             // Pure i32 (handle/count/time) — the teko_retry C policy is the shared source of truth.
             if (ctx->wasm_emit_retry) {
                 fprintf(f, "  (import \"crypto\" \"teko_rt_retry_new\" (func $retry_new (param i32) (param i32) (param i32) (param i32) (result i32)))\n");
-                fprintf(f, "  (import \"crypto\" \"teko_rt_retry_should_continue\" (func $retry_should_continue (param i32) (param i32) (param i32) (result i32)))\n");
+                fprintf(f, "  (import \"crypto\" \"teko_rt_retry_should_continue\" (func $retry_should_continue (param i32) (param i32) (result i32)))\n");
                 fprintf(f, "  (import \"crypto\" \"teko_rt_retry_next_delay\" (func $retry_next_delay (param i32) (param i32) (result i32)))\n");
                 fprintf(f, "  (import \"crypto\" \"teko_rt_circuit_new\" (func $circuit_new (param i32) (param i32) (result i32)))\n");
-                fprintf(f, "  (import \"crypto\" \"teko_rt_circuit_allow\" (func $circuit_allow (param i32) (param i32) (result i32)))\n");
-                fprintf(f, "  (import \"crypto\" \"teko_rt_circuit_record\" (func $circuit_record (param i32) (param i32) (param i32) (result i32)))\n");
+                fprintf(f, "  (import \"crypto\" \"teko_rt_circuit_allow\" (func $circuit_allow (param i32) (result i32)))\n");
+                fprintf(f, "  (import \"crypto\" \"teko_rt_circuit_record\" (func $circuit_record (param i32) (param i32) (result i32)))\n");
             }
             // Phase 14 (real-time clock): timespan waiters read the host MONOTONIC ns clock
             // (env.teko_now_ns) and spin cooperatively until the real deadline — `wait` just spins,
@@ -1429,10 +1429,10 @@ void emit_wasm_pure(MetalContext* ctx, OpCode op, int32_t arg) {
                              (op == OP_RETRY_NEXT_DELAY)      ? "retry_next_delay" :
                              (op == OP_CIRCUIT_NEW)           ? "circuit_new" :
                              (op == OP_CIRCUIT_ALLOW)         ? "circuit_allow" : "circuit_record";
+            // Real-clock arities: should_continue(handle,attempt)=2, next_delay(handle,attempt)=2,
+            // circuit_new(threshold,cooldown)=2, circuit_record(handle,ok)=2, circuit_allow(handle)=1.
             int ar = (op == OP_RETRY_NEW) ? 4 :
-                     (op == OP_RETRY_SHOULD_CONTINUE || op == OP_CIRCUIT_RECORD) ? 3 :
-                     (op == OP_RETRY_NEXT_DELAY) ? 2 :
-                     (op == OP_CIRCUIT_NEW || op == OP_CIRCUIT_ALLOW) ? 2 : 2;
+                     (op == OP_CIRCUIT_ALLOW) ? 1 : 2;
             for (int p = 0; p + 1 < ar; p++) fprintf(f, "    local.get $a%d\n", p);
             fprintf(f, "    local.get $w0\n    call $%s\n    local.set $w0\n", fn);
             break;

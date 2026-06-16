@@ -979,11 +979,10 @@ static void lower_retry_block(BytecodeBuffer* b, Parser* p, LowerEnv* env) {
     char nm[64];
     snprintf(nm, sizeof(nm), "__retry_pol_%d", id);  int s_pol  = env_alloc_local(env, nm);
     snprintf(nm, sizeof(nm), "__retry_att_%d", id);  int s_att  = env_alloc_local(env, nm);
-    snprintf(nm, sizeof(nm), "__retry_ela_%d", id);  int s_ela  = env_alloc_local(env, nm);
     snprintf(nm, sizeof(nm), "__retry_ok_%d",  id);  int s_ok   = env_alloc_local(env, nm);
     snprintf(nm, sizeof(nm), "__retry_suc_%d", id);  int s_suc  = env_alloc_local(env, nm);
 
-    // policy = retry_new(attempts, timeout, mode, base)
+    // policy = retry_new(attempts, timeout, mode, base) — records its real start instant.
     codegen_li_emit_iconst(b, attempts); codegen_li_emit_setarg(b, 0);
     codegen_li_emit_iconst(b, timeout);  codegen_li_emit_setarg(b, 1);
     codegen_li_emit_iconst(b, mode);     codegen_li_emit_setarg(b, 2);
@@ -991,14 +990,12 @@ static void lower_retry_block(BytecodeBuffer* b, Parser* p, LowerEnv* env) {
     codegen_li_emit_retry(b, OP_RETRY_NEW);
     codegen_li_emit_store_local(b, s_pol);
     emit_set_local_const(b, s_att, 0); // attempt = 0
-    emit_set_local_const(b, s_ela, 0); // elapsed = 0
     emit_set_local_const(b, s_suc, 0); // succeeded = 0
 
     codegen_li_emit_cf(b, OP_LOOP_BEGIN);
-    //   if (should_continue(policy, attempt, elapsed) == 0) break  (give up -> exit, succeeded=0)
+    //   if (should_continue(policy, attempt) == 0) break — the policy reads REAL elapsed internally
     codegen_li_emit_load_local(b, s_pol); codegen_li_emit_setarg(b, 0);
-    codegen_li_emit_load_local(b, s_att); codegen_li_emit_setarg(b, 1);
-    codegen_li_emit_load_local(b, s_ela); // last in $w0
+    codegen_li_emit_load_local(b, s_att); // last in $w0
     codegen_li_emit_retry(b, OP_RETRY_SHOULD_CONTINUE); // $w0 = 0/1
     codegen_li_emit_cf(b, OP_BREAK_IF_FALSE);
     //   body -> $w0 (ok/fail); ok = $w0
@@ -1010,12 +1007,12 @@ static void lower_retry_block(BytecodeBuffer* b, Parser* p, LowerEnv* env) {
     emit_set_local_const(b, s_suc, 1);
     codegen_li_emit_cf(b, OP_BREAK);
     codegen_li_emit_cf(b, OP_IF_END);
-    //   elapsed += next_delay(policy, attempt)
+    //   back off for next_delay(policy, attempt) ms on the REAL clock (accumulates real elapsed,
+    //   which drives the timeout budget); then attempt += 1.
     codegen_li_emit_load_local(b, s_pol); codegen_li_emit_setarg(b, 0);
     codegen_li_emit_load_local(b, s_att); // last in $w0
-    codegen_li_emit_retry(b, OP_RETRY_NEXT_DELAY); // $w0 = delay
-    emit_local_add_w0(b, s_ela);
-    //   attempt += 1
+    codegen_li_emit_retry(b, OP_RETRY_NEXT_DELAY); // $w0 = delay ms
+    codegen_li_emit_wait(b);                        // real-time backoff wait
     codegen_li_emit_iconst(b, 1);
     emit_local_add_w0(b, s_att);
     codegen_li_emit_cf(b, OP_LOOP_END);
@@ -1055,19 +1052,17 @@ static void lower_circuit_block(BytecodeBuffer* b, Parser* p, LowerEnv* env) {
     }
 
     emit_set_local_const(b, s_failed, 1); // assume failed (fallback) until proven otherwise
-    // allowed = circuit_allow(cb, 0)
-    codegen_li_emit_load_local(b, cb); codegen_li_emit_setarg(b, 0);
-    codegen_li_emit_iconst(b, 0); // now = 0 (logical clock MVP)
+    // allowed = circuit_allow(cb) — the breaker consults the REAL clock for its cooldown internally
+    codegen_li_emit_load_local(b, cb); // handle in $w0
     codegen_li_emit_retry(b, OP_CIRCUIT_ALLOW); // $w0 = 0/1
     codegen_li_emit_store_local(b, s_allowed);
-    //   if (allowed) { body -> ok; record(cb, ok, 0); if (ok) failed = 0 }
+    //   if (allowed) { body -> ok; record(cb, ok); if (ok) failed = 0 }
     codegen_li_emit_load_local(b, s_allowed);
     codegen_li_emit_cf(b, OP_IF_BEGIN);
     lower_block(b, p, env);                 // body -> $w0
     codegen_li_emit_store_local(b, s_ok);
     codegen_li_emit_load_local(b, cb);  codegen_li_emit_setarg(b, 0);
-    codegen_li_emit_load_local(b, s_ok); codegen_li_emit_setarg(b, 1);
-    codegen_li_emit_iconst(b, 0);       // now = 0
+    codegen_li_emit_load_local(b, s_ok); // ok in $w0
     codegen_li_emit_retry(b, OP_CIRCUIT_RECORD);
     codegen_li_emit_load_local(b, s_ok);
     codegen_li_emit_cf(b, OP_IF_BEGIN);

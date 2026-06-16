@@ -135,11 +135,11 @@ const char* teko_native_retry_symbol(OpCode op, int* out_arity) {
     const char* sym = NULL;
     switch (op) {
         case OP_RETRY_NEW:             sym = "teko_rt_retry_new";             arity = 4; break;
-        case OP_RETRY_SHOULD_CONTINUE: sym = "teko_rt_retry_should_continue"; arity = 3; break;
+        case OP_RETRY_SHOULD_CONTINUE: sym = "teko_rt_retry_should_continue"; arity = 2; break; // real clock
         case OP_RETRY_NEXT_DELAY:      sym = "teko_rt_retry_next_delay";      arity = 2; break;
         case OP_CIRCUIT_NEW:           sym = "teko_rt_circuit_new";           arity = 2; break;
-        case OP_CIRCUIT_ALLOW:         sym = "teko_rt_circuit_allow";         arity = 2; break;
-        case OP_CIRCUIT_RECORD:        sym = "teko_rt_circuit_record";        arity = 3; break;
+        case OP_CIRCUIT_ALLOW:         sym = "teko_rt_circuit_allow";         arity = 1; break; // real clock
+        case OP_CIRCUIT_RECORD:        sym = "teko_rt_circuit_record";        arity = 2; break; // real clock
         default: break;
     }
     if (out_arity) *out_arity = arity;

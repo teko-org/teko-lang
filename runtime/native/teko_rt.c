@@ -174,13 +174,19 @@ long teko_rt_bcast_close(long handle) {
 // The handle is a TekoRetry*/TekoCircuit* carried as a register-width integer; the time/count
 // args are i32 at the surface (ms fit in i32 for the MVP — the teko_retry C policy is the single
 // source of truth). mode: 0 = exponential, non-zero = logarithmic.
+// Phase 14 (real-time clock): the policy units are canonical ms; the timeout/cooldown are driven
+// by the REAL monotonic clock (teko_rt_now_ns, read as ms). The wrappers record the start instant
+// and supply real `now`/`elapsed` so the surface ops don't carry a logical time argument.
+static long teko_rt_now_ms(void) { return (long)(teko_rt_now_ns() / 1000000LL); }
 long teko_rt_retry_new(long attempts, long timeout, long mode, long base) {
-    return (long)(intptr_t)teko_retry_new((int)attempts, (uint64_t)(unsigned long)timeout,
+    TekoRetry* r = teko_retry_new((int)attempts, (uint64_t)(unsigned long)timeout,
         mode ? TEKO_BACKOFF_LOGARITHMIC : TEKO_BACKOFF_EXPONENTIAL, (uint64_t)(unsigned long)base);
+    teko_retry_mark_start(r, (uint64_t)teko_rt_now_ms());
+    return (long)(intptr_t)r;
 }
-long teko_rt_retry_should_continue(long handle, long attempt, long elapsed) {
-    return teko_retry_should_continue((const TekoRetry*)(intptr_t)handle, (int)attempt,
-                                      (uint64_t)(unsigned long)elapsed);
+long teko_rt_retry_should_continue(long handle, long attempt) {
+    return teko_retry_should_continue_rt((const TekoRetry*)(intptr_t)handle, (int)attempt,
+                                         (uint64_t)teko_rt_now_ms());
 }
 long teko_rt_retry_next_delay(long handle, long attempt) {
     return (long)teko_retry_next_delay((const TekoRetry*)(intptr_t)handle, (int)attempt);
@@ -188,11 +194,11 @@ long teko_rt_retry_next_delay(long handle, long attempt) {
 long teko_rt_circuit_new(long threshold, long cooldown) {
     return (long)(intptr_t)teko_circuit_new((int)threshold, (uint64_t)(unsigned long)cooldown);
 }
-long teko_rt_circuit_allow(long handle, long now) {
-    return teko_circuit_allow((TekoCircuit*)(intptr_t)handle, (uint64_t)(unsigned long)now);
+long teko_rt_circuit_allow(long handle) {
+    return teko_circuit_allow((TekoCircuit*)(intptr_t)handle, (uint64_t)teko_rt_now_ms());
 }
-long teko_rt_circuit_record(long handle, long ok, long now) {
-    teko_circuit_record((TekoCircuit*)(intptr_t)handle, (int)ok, (uint64_t)(unsigned long)now);
+long teko_rt_circuit_record(long handle, long ok) {
+    teko_circuit_record((TekoCircuit*)(intptr_t)handle, (int)ok, (uint64_t)teko_rt_now_ms());
     return 0;
 }
 

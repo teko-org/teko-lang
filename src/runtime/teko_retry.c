@@ -9,6 +9,7 @@ struct TekoRetry {
     uint64_t        timeout;
     TekoBackoffMode mode;
     uint64_t        base;
+    uint64_t        start; // Phase 14 (real-time): start instant for the real-clock timeout
 };
 
 // floor(log2(n)) for n >= 1.
@@ -25,10 +26,19 @@ TekoRetry* teko_retry_new(int attempts, uint64_t timeout, TekoBackoffMode mode, 
     r->timeout = timeout;
     r->mode = (mode == TEKO_BACKOFF_LOGARITHMIC) ? TEKO_BACKOFF_LOGARITHMIC : TEKO_BACKOFF_EXPONENTIAL;
     r->base = base;
+    r->start = 0;
     return r;
 }
 
 void teko_retry_free(TekoRetry* r) { free(r); }
+
+// Phase 14 (real-time clock): record the start instant, and decide via real elapsed (now-start).
+void teko_retry_mark_start(TekoRetry* r, uint64_t start) { if (r) r->start = start; }
+int teko_retry_should_continue_rt(const TekoRetry* r, int attempt, uint64_t now) {
+    if (!r) return 0;
+    uint64_t elapsed = (now >= r->start) ? (now - r->start) : 0;
+    return teko_retry_should_continue(r, attempt, elapsed);
+}
 
 uint64_t teko_retry_next_delay(const TekoRetry* r, int attempt) {
     if (!r) return 0;
