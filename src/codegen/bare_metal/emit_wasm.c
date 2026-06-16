@@ -1369,6 +1369,43 @@ void emit_wasm_pure(MetalContext* ctx, OpCode op, int32_t arg) {
             fprintf(f, "    local.get $w0\n    call $teko_await\n    call $teko_sched_run\n");
             break;
 
+        // Phase 14 (control-flow foundation): structured loops + branches. A loop is a block
+        // (break target $brk_N) wrapping a loop (continue/back-edge target $cont_N); `if` uses the
+        // native WASM (if … end) form. Conditions arrive in $w0. Bodies are stack-neutral (the
+        // accumulator model), so the unreachable tail after a br validates fine.
+        case OP_LOOP_BEGIN: {
+            int id = ctx->cf_id_next++;
+            if (ctx->cf_loop_sp < 64) ctx->cf_loop_stack[ctx->cf_loop_sp++] = id;
+            fprintf(f, "    (block $brk_%d (loop $cont_%d\n", id, id);
+            break;
+        }
+        case OP_LOOP_END: {
+            int id = (ctx->cf_loop_sp > 0) ? ctx->cf_loop_stack[--ctx->cf_loop_sp] : 0;
+            fprintf(f, "    br $cont_%d))\n", id); // back-edge, close loop, close block
+            break;
+        }
+        case OP_BREAK: {
+            int id = (ctx->cf_loop_sp > 0) ? ctx->cf_loop_stack[ctx->cf_loop_sp - 1] : 0;
+            fprintf(f, "    br $brk_%d\n", id);
+            break;
+        }
+        case OP_CONTINUE: {
+            int id = (ctx->cf_loop_sp > 0) ? ctx->cf_loop_stack[ctx->cf_loop_sp - 1] : 0;
+            fprintf(f, "    br $cont_%d\n", id);
+            break;
+        }
+        case OP_BREAK_IF_FALSE: {
+            int id = (ctx->cf_loop_sp > 0) ? ctx->cf_loop_stack[ctx->cf_loop_sp - 1] : 0;
+            fprintf(f, "    local.get $w0\n    i32.eqz\n    br_if $brk_%d\n", id);
+            break;
+        }
+        case OP_IF_BEGIN:
+            fprintf(f, "    local.get $w0\n    if\n");
+            break;
+        case OP_IF_END:
+            fprintf(f, "    end\n");
+            break;
+
         // Phase 12: named local variables ($v0..$vN).
         case OP_STORE_LOCAL:
             fprintf(f, "    local.get $w0\n    local.set $v%d\n", arg);

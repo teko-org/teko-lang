@@ -36,6 +36,9 @@ MetalContext* teko_metal_create(const char* output_asm_path, TekoTarget target) 
     ctx->wasm_emit_shared = 0;
     ctx->wasm_emit_wait = 0;
     ctx->wasm_emit_await = 0;
+    ctx->cf_id_next = 0;
+    ctx->cf_loop_sp = 0;
+    ctx->cf_if_sp = 0;
     ctx->hosted = 0;
     return ctx;
 }
@@ -322,7 +325,10 @@ static void process_linear_il_bytes(MetalContext* ctx, const unsigned char* byte
                      op == OP_BCAST_RECV || op == OP_BCAST_POLL || op == OP_BCAST_CLOSE ||
                      op == OP_SHARED_ENTER || op == OP_SHARED_LEAVE || op == OP_ATOMIC_CELL ||
                      op == OP_ATOMIC_ADD || op == OP_ATOMIC_LOAD || op == OP_ATOMIC_STORE ||
-                     op == OP_WAIT || op == OP_AWAIT_FOR) {
+                     op == OP_WAIT || op == OP_AWAIT_FOR ||
+                     op == OP_LOOP_BEGIN || op == OP_LOOP_END || op == OP_BREAK ||
+                     op == OP_CONTINUE || op == OP_BREAK_IF_FALSE ||
+                     op == OP_IF_BEGIN || op == OP_IF_END) {
                 last_arith_op = (OpCode)0;
             }
 
@@ -351,7 +357,10 @@ static void process_linear_il_bytes(MetalContext* ctx, const unsigned char* byte
                 op == OP_BCAST_RECV || op == OP_BCAST_POLL || op == OP_BCAST_CLOSE ||
                 op == OP_SHARED_ENTER || op == OP_SHARED_LEAVE || op == OP_ATOMIC_CELL ||
                 op == OP_ATOMIC_ADD || op == OP_ATOMIC_LOAD || op == OP_ATOMIC_STORE ||
-                op == OP_WAIT || op == OP_AWAIT_FOR) {
+                op == OP_WAIT || op == OP_AWAIT_FOR ||
+                op == OP_LOOP_BEGIN || op == OP_LOOP_END || op == OP_BREAK ||
+                op == OP_CONTINUE || op == OP_BREAK_IF_FALSE ||
+                op == OP_IF_BEGIN || op == OP_IF_END) {
                 accum_has_value = false;
             }
         }

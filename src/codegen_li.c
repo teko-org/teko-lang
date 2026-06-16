@@ -229,6 +229,11 @@ void codegen_li_emit_await(BytecodeBuffer* buffer) {
     emit_byte(buffer, OP_AWAIT_FOR);
 }
 
+void codegen_li_emit_cf(BytecodeBuffer* buffer, OpCode op) {
+    if (!buffer) return;
+    emit_byte(buffer, (unsigned char)op); // single-byte structured control-flow opcode
+}
+
 void codegen_li_emit_halt(BytecodeBuffer* buffer) {
     if (!buffer) return;
     emit_byte(buffer, OP_HALT);

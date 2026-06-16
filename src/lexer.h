@@ -29,6 +29,9 @@ typedef enum {
     // Phase 14 (14.G) — timespan waiters: `wait <ts>;` (sync sleep) / `await <ts>;`
     // (cooperative timed yield). Timespan literals (10ms/2s/…) already lex (Phase 12 unit).
     TOKEN_WAIT, TOKEN_AWAIT,
+    // Phase 14 (control-flow foundation) — structured loops + branches lowered from source:
+    // `while (cond) { }`, `loop { }`, `if (cond) { }`, `break;`, `continue;`.
+    TOKEN_WHILE, TOKEN_LOOP, TOKEN_IF, TOKEN_BREAK, TOKEN_CONTINUE,
     // Web:
     TOKEN_API, TOKEN_MIDDLEWARE, TOKEN_GET, TOKEN_POST, TOKEN_PUT,
     TOKEN_DELETE, TOKEN_RPC, TOKEN_WEBSOCKET,

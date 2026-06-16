@@ -979,6 +979,61 @@ void test_frontend_interop_waiters_lowering(void) {
     codegen_li_free_context(buffer);
 }
 
+// Phase 14 (control-flow foundation): `while`/`loop`/`if`/`break`/`continue` + reassignment lower
+// to the structured OP_LOOP_*/OP_IF_*/OP_BREAK* opcodes; on WASM to (block $brk (loop $cont …)) +
+// (if … end). Pins the opcode set in the IL and the structured forms in the emitted .wat.
+void test_frontend_interop_controlflow_lowering(void) {
+    const char* src =
+        "extern fn emit_int(n: i32) from \"teko_rt\" as \"teko_rt_emit_int\";\n"
+        "let i = 0;\n"
+        "while (i < 3) { i = i + 1; }\n"
+        "loop { if (i >= 5) { break; } i = i + 1; }\n"
+        "emit_int(i);\n";
+
+    BytecodeBuffer* buffer = codegen_li_create_context();
+    TEST_ASSERT_NOT_NULL(buffer);
+    TEST_ASSERT_EQUAL_INT(0, teko_compile_interop(src, buffer));
+
+    int n_lbeg=0,n_lend=0,n_break=0,n_bif=0,n_ifb=0,n_ife=0;
+    for (int i = 0; i < buffer->size; i++) {
+        switch (buffer->code[i]) {
+            case OP_LOOP_BEGIN:     n_lbeg++;  break;
+            case OP_LOOP_END:       n_lend++;  break;
+            case OP_BREAK:          n_break++; break;
+            case OP_BREAK_IF_FALSE: n_bif++;   break;
+            case OP_IF_BEGIN:       n_ifb++;   break;
+            case OP_IF_END:         n_ife++;   break;
+            default: break;
+        }
+    }
+    TEST_ASSERT_EQUAL_INT(2, n_lbeg);   // while + loop
+    TEST_ASSERT_EQUAL_INT(2, n_lend);
+    TEST_ASSERT_EQUAL_INT(1, n_bif);    // while condition
+    TEST_ASSERT_EQUAL_INT(1, n_break);  // break inside loop
+    TEST_ASSERT_EQUAL_INT(1, n_ifb);    // if
+    TEST_ASSERT_EQUAL_INT(1, n_ife);
+
+    TekoTarget target;
+    target.arch = ARCH_WASM32;
+    target.os = OS_WASI;
+    strncpy(target.target_string, "wasm32-wasi", sizeof(target.target_string) - 1);
+    const char* wat = "output_interop_controlflow.wat";
+    TEST_ASSERT_EQUAL_INT(0, codegen_li_emit_wasm(buffer, wat, target, NULL, NULL, NULL, NULL, 0));
+    FILE* f = fopen(wat, "r");
+    TEST_ASSERT_NOT_NULL(f);
+    char* out = (char*)malloc(65536);
+    memset(out, 0, 65536);
+    size_t n = fread(out, 1, 65535, f); out[n] = '\0'; fclose(f);
+    TEST_ASSERT_NOT_NULL(strstr(out, "(block $brk_0 (loop $cont_0"));
+    TEST_ASSERT_NOT_NULL(strstr(out, "br_if $brk_0"));   // while condition test
+    TEST_ASSERT_NOT_NULL(strstr(out, "br $cont_0"));     // back-edge
+    TEST_ASSERT_NOT_NULL(strstr(out, "br $brk_1"));      // break in the second loop
+    free(out);
+    remove(wat);
+
+    codegen_li_free_context(buffer);
+}
+
 void test_frontend_interop_timespan_normalization(void) {
     const char* src =
         "let d = delayed.open(8);\n"

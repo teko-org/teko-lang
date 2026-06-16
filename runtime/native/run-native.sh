@@ -119,6 +119,14 @@ check waiters.tks "$(cat <<'EXP'
 EXP
 )"
 
+# Phase 14 (control-flow foundation): structured loops + branches lowered from source — a
+# while-loop sums 0..4 = 10; a loop{}+if+break/continue counts to 5. Lowers to OP_LOOP_*/OP_IF_*.
+check controlflow.tks "$(cat <<'EXP'
+10
+5
+EXP
+)"
+
 # FIPS 180-4 SHA-256("abc") known-answer vector.
 check hash_sha256.tks "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
 

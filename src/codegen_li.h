@@ -115,6 +115,21 @@ typedef enum {
     OP_WAIT      = 0x59, // wait(ms)  — block the current thread for ms
     OP_AWAIT_FOR = 0x5A, // await(ms) — cooperative yield with an ms deadline
 
+    // Phase 14 (control-flow foundation): STRUCTURED loops + branches lowered from real source —
+    // native asm labels (.Lcont_/.Lbrk_/.Lendif_) + jmp/jcc, WASM structured (block $brk (loop
+    // $cont …)) + (if … end). All single-byte; the backends keep a loop-id + if-id stack so
+    // BREAK/CONTINUE/BREAK_IF_FALSE target the innermost loop. These break linear flow, so each is
+    // a CSE barrier (added to BOTH invalidation sets in codegen_metal.c). A `while (c) { b }` is
+    // LOOP_BEGIN; <c→$w0>; BREAK_IF_FALSE; <b>; LOOP_END. A `loop { b }` omits the BREAK_IF_FALSE.
+    // An `if (c) { b }` is <c→$w0>; IF_BEGIN; <b>; IF_END (enters the body iff $w0 != 0).
+    OP_LOOP_BEGIN     = 0x5B, // open a loop (block $brk + loop $cont; native .Lcont label)
+    OP_LOOP_END       = 0x5C, // back-edge to loop top + close (native jmp .Lcont; .Lbrk:)
+    OP_BREAK          = 0x5D, // unconditional break to the innermost loop exit
+    OP_CONTINUE       = 0x5E, // unconditional jump to the innermost loop top
+    OP_BREAK_IF_FALSE = 0x5F, // break the innermost loop when $w0 == 0 (while-condition test)
+    OP_IF_BEGIN       = 0x60, // enter the if-body iff $w0 != 0 (else skip to IF_END)
+    OP_IF_END         = 0x61, // close the if-body
+
     // Control Flow and Branches
     OP_JMP = 0x20,
     OP_JMP_IF_FALSE = 0x21,
@@ -246,6 +261,9 @@ void codegen_li_emit_shared(BytecodeBuffer* buffer, OpCode op);
 void codegen_li_emit_wait(BytecodeBuffer* buffer);
 // Phase 14 (14.G): emit OP_AWAIT_FOR (cooperative timed yield); sets uses_await + uses_spawn.
 void codegen_li_emit_await(BytecodeBuffer* buffer);
+// Phase 14 (control-flow foundation): emit a single-byte structured control-flow opcode
+// (OP_LOOP_BEGIN/END, OP_BREAK[_IF_FALSE], OP_CONTINUE, OP_IF_BEGIN/END).
+void codegen_li_emit_cf(BytecodeBuffer* buffer, OpCode op);
 void codegen_li_emit_halt(BytecodeBuffer* buffer);
 
 #endif // CODEGEN_LI_H

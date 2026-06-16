@@ -93,6 +93,15 @@ typedef struct {
     // Phase 14 (14.G): 1 when the program uses `await <ts>;` (OP_AWAIT_FOR) → declare the host
     // import (env.teko_await) and drain $teko_sched_run. Native ignores it (links teko_rt_await_ms).
     int wasm_emit_await;
+    // Phase 14 (control-flow foundation): structured loop/if lowering state, shared by the native
+    // hosted emitter and the WASM emitter. cf_id_next assigns a fresh monotonic id to each
+    // LOOP_BEGIN/IF_BEGIN; cf_loop_stack/cf_if_stack track the active (nesting) ids so
+    // BREAK/CONTINUE/BREAK_IF_FALSE/LOOP_END and IF_END resolve to the innermost construct.
+    int cf_id_next;
+    int cf_loop_stack[64];
+    int cf_loop_sp;
+    int cf_if_stack[64];
+    int cf_if_sp;
     // Phase 13 (native runner): 1 routes x86_64/arm64 emission to the libc-hosted,
     // assemble-able emitter (emit_native_hosted.c) instead of the freestanding "metal"
     // emitters — produces a binary the system `cc` links against teko_rt and RUNS. The

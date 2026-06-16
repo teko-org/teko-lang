@@ -476,6 +476,51 @@ void emit_native_hosted(MetalContext* ctx, OpCode op, int32_t arg) {
         case OP_WAIT:      emit_call(ctx, "teko_rt_sleep_ms", 1); break;
         case OP_AWAIT_FOR: emit_call(ctx, "teko_rt_await_ms", 1); break;
 
+        // Phase 14 (control-flow foundation): structured loops + branches via local asm labels.
+        // The loop top is `.Lcont_<id>` (continue target) and the exit is `.Lbrk_<id>` (break
+        // target); `if` skips to `.Lendif_<id>`. The id stacks resolve break/continue to the
+        // innermost loop. Conditions arrive in $w0 (0 = false).
+        case OP_LOOP_BEGIN: {
+            int id = ctx->cf_id_next++;
+            if (ctx->cf_loop_sp < 64) ctx->cf_loop_stack[ctx->cf_loop_sp++] = id;
+            fprintf(f, ".Lcont_%d:\n", id);
+            break;
+        }
+        case OP_LOOP_END: {
+            int id = (ctx->cf_loop_sp > 0) ? ctx->cf_loop_stack[--ctx->cf_loop_sp] : 0;
+            fprintf(f, arm ? "    b .Lcont_%d\n.Lbrk_%d:\n" : "    jmp .Lcont_%d\n.Lbrk_%d:\n",
+                    id, id);
+            break;
+        }
+        case OP_BREAK: {
+            int id = (ctx->cf_loop_sp > 0) ? ctx->cf_loop_stack[ctx->cf_loop_sp - 1] : 0;
+            fprintf(f, arm ? "    b .Lbrk_%d\n" : "    jmp .Lbrk_%d\n", id);
+            break;
+        }
+        case OP_CONTINUE: {
+            int id = (ctx->cf_loop_sp > 0) ? ctx->cf_loop_stack[ctx->cf_loop_sp - 1] : 0;
+            fprintf(f, arm ? "    b .Lcont_%d\n" : "    jmp .Lcont_%d\n", id);
+            break;
+        }
+        case OP_BREAK_IF_FALSE: {
+            int id = (ctx->cf_loop_sp > 0) ? ctx->cf_loop_stack[ctx->cf_loop_sp - 1] : 0;
+            if (arm) fprintf(f, "    cmp w0, #0\n    b.eq .Lbrk_%d\n", id);
+            else     fprintf(f, "    cmpl $0, %%eax\n    je .Lbrk_%d\n", id);
+            break;
+        }
+        case OP_IF_BEGIN: {
+            int id = ctx->cf_id_next++;
+            if (ctx->cf_if_sp < 64) ctx->cf_if_stack[ctx->cf_if_sp++] = id;
+            if (arm) fprintf(f, "    cmp w0, #0\n    b.eq .Lendif_%d\n", id);
+            else     fprintf(f, "    cmpl $0, %%eax\n    je .Lendif_%d\n", id);
+            break;
+        }
+        case OP_IF_END: {
+            int id = (ctx->cf_if_sp > 0) ? ctx->cf_if_stack[--ctx->cf_if_sp] : 0;
+            fprintf(f, ".Lendif_%d:\n", id);
+            break;
+        }
+
         // Integer ALU ($w0 = $w0 <op> $w1). Pointers use x; arithmetic uses w.
         case OP_ADD: fprintf(f, arm ? "    add w0, w0, w19\n"  : "    addl %%ebx, %%eax\n"); break;
         case OP_SUB: fprintf(f, arm ? "    sub w0, w0, w19\n"  : "    subl %%ebx, %%eax\n"); break;
