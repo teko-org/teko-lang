@@ -23,6 +23,7 @@
 #include "teko_retry.h"
 #include "teko_time.h"
 #include "teko_object.h"
+#include "teko_vtable.h"
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -798,4 +799,15 @@ long teko_rt_object_get(long handle, long idx) {
 long teko_rt_object_free(long handle) {
     teko_object_free((TekoObject*)(intptr_t)handle);
     return 0;
+}
+
+// Phase 15 (15.B) — static vtable surface wrappers. The OP_VTABLE_* opcodes lower to these; the
+// teko_vtable C runtime is the source of truth (compile-time-populated dispatch table). Available
+// on every target (native + the wasm32 reactor). Pure register-width integers (type/method/slot).
+long teko_rt_vtable_set(long type_id, long method_id, long slot) {
+    teko_vtable_set(type_id, method_id, slot);
+    return 0;
+}
+long teko_rt_vtable_get(long type_id, long method_id) {
+    return teko_vtable_get(type_id, method_id);
 }

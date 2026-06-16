@@ -173,6 +173,15 @@ typedef enum {
     // the callee spilled to frame[0]. Sets uses_spawn (the routine table + scheduler TU are needed).
     OP_CALL_FUNC = 0x6E, // 4-byte argc: $w0 = call slot=$w0 with args $a0..$a(argc-1)
 
+    // Phase 15 (15.B): static vtable ops — the abstract/trait dynamic-dispatch table. Same
+    // dedicated-opcode + teko_rt_vtable_* (native) / wasm reactor-import lowering as the channel
+    // families (args staged via OP_SETARG 0..n-2, last in $w0; result in $w0). The teko_vtable C
+    // runtime is the single source of truth. VTABLE_SET populates an entry at $main start;
+    // VTABLE_GET resolves (type_id, method_id) -> routine slot at a dynamic call site, which then
+    // feeds OP_CALL_FUNC. Both are $w0-clobbering runtime calls (CSE barriers).
+    OP_VTABLE_SET = 0x6F, // vtable_set(type_id, method_id, slot) -> 0
+    OP_VTABLE_GET = 0x70, // vtable_get(type_id, method_id) -> slot
+
     // Control Flow and Branches
     OP_JMP = 0x20,
     OP_JMP_IF_FALSE = 0x21,
@@ -270,6 +279,9 @@ typedef struct {
     // shares linear memory (same wiring as the channel families). Object-free programs stay
     // byte-identical.
     int uses_object;
+    // Phase 15 (15.B): 1 if the program uses a static-vtable op (OP_VTABLE_*) — i.e. abstract/trait
+    // dynamic dispatch. Native links teko_rt_vtable_*; WASM imports from the reactor + shared memory.
+    int uses_vtable;
 } BytecodeBuffer;
 
 // Public functions of the IL Bytecode Emitter
@@ -328,6 +340,8 @@ void codegen_li_emit_object(BytecodeBuffer* buffer, OpCode op);
 // Phase 15 (15.A): synchronously call the routine in $w0 with `argc` args staged in $a0..$a(argc-1)
 // (OP_CALL_FUNC); the result lands in $w0. Sets buffer->uses_spawn (routine table + scheduler).
 void codegen_li_emit_call_func(BytecodeBuffer* buffer, int argc);
+// Phase 15 (15.B): emit a static-vtable op (OP_VTABLE_SET/GET); sets buffer->uses_vtable.
+void codegen_li_emit_vtable(BytecodeBuffer* buffer, OpCode op);
 void codegen_li_emit_halt(BytecodeBuffer* buffer);
 
 #endif // CODEGEN_LI_H

@@ -1309,6 +1309,56 @@ void test_codegen_li_object_family(void) {
     codegen_li_free_context(buffer);
 }
 
+// Phase 15 (15.B): the static-vtable IL family (OP_VTABLE_*) lowers to teko_rt_vtable_* reactor
+// imports on WASM. Hand-build the IL for `vtable_set(1, 0, 7); slot = vtable_get(1, 0)` (a vtable
+// population + a dynamic-dispatch lookup) and assert the opcodes + uses_vtable + the emitted .wat
+// (reactor imports, shared memory, call sites).
+void test_codegen_li_vtable_family(void) {
+    BytecodeBuffer* buffer = codegen_li_create_context();
+    TEST_ASSERT_NOT_NULL(buffer);
+    buffer->local_count = 1;
+
+    // vtable_set(type=1, method=0, slot=7)
+    codegen_li_emit_iconst(buffer, 1); codegen_li_emit_setarg(buffer, 0); // $a0 = type_id
+    codegen_li_emit_iconst(buffer, 0); codegen_li_emit_setarg(buffer, 1); // $a1 = method_id
+    codegen_li_emit_iconst(buffer, 7);                                    // $w0 = slot
+    codegen_li_emit_vtable(buffer, OP_VTABLE_SET);
+    // slot = vtable_get(type=1, method=0)
+    codegen_li_emit_iconst(buffer, 1); codegen_li_emit_setarg(buffer, 0); // $a0 = type_id
+    codegen_li_emit_iconst(buffer, 0);                                    // $w0 = method_id
+    codegen_li_emit_vtable(buffer, OP_VTABLE_GET);                        // $w0 = slot
+    codegen_li_emit_store_local(buffer, 0);
+    codegen_li_emit_halt(buffer);
+
+    TEST_ASSERT_EQUAL_INT(1, buffer->uses_vtable);
+    int saw_set = 0, saw_get = 0;
+    for (int i = 0; i < buffer->size; i++) {
+        if (buffer->code[i] == (unsigned char)OP_VTABLE_SET) saw_set = 1;
+        if (buffer->code[i] == (unsigned char)OP_VTABLE_GET) saw_get = 1;
+    }
+    TEST_ASSERT_TRUE(saw_set && saw_get);
+
+    TekoTarget target;
+    target.arch = ARCH_WASM32; target.os = OS_WASI;
+    strncpy(target.target_string, "wasm32-wasi", sizeof(target.target_string) - 1);
+    const char* wat = "output_vtable_family.wat";
+    TEST_ASSERT_EQUAL_INT(0, codegen_li_emit_wasm(buffer, wat, target, NULL, NULL, NULL, NULL, 0));
+    FILE* f = fopen(wat, "r");
+    TEST_ASSERT_NOT_NULL(f);
+    char* out = (char*)malloc(65536);
+    TEST_ASSERT_NOT_NULL(out);
+    memset(out, 0, 65536);
+    size_t n = fread(out, 1, 65535, f); out[n] = '\0'; fclose(f);
+    TEST_ASSERT_NOT_NULL(strstr(out, "(import \"crypto\" \"teko_rt_vtable_set\" (func $vtable_set (param i32) (param i32) (param i32) (result i32)))"));
+    TEST_ASSERT_NOT_NULL(strstr(out, "(import \"crypto\" \"teko_rt_vtable_get\" (func $vtable_get (param i32) (param i32) (result i32)))"));
+    TEST_ASSERT_NOT_NULL(strstr(out, "(import \"env\" \"memory\" (memory 1))"));
+    TEST_ASSERT_NOT_NULL(strstr(out, "call $vtable_set"));
+    TEST_ASSERT_NOT_NULL(strstr(out, "call $vtable_get"));
+    free(out);
+    remove(wat);
+    codegen_li_free_context(buffer);
+}
+
 // Phase 15 (15.A): the synchronous table-call primitive (OP_CALL_FUNC) — method dispatch. Build
 // IL for a routine `fn add5(n) { return n + 5; }` and a $main that calls it synchronously with 7,
 // then assert (1) the OP_CALL_FUNC opcode + uses_spawn flag, and (2) the emitted .wat dispatches

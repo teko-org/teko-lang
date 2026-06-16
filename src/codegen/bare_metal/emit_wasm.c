@@ -1156,6 +1156,11 @@ void emit_wasm_pure(MetalContext* ctx, OpCode op, int32_t arg) {
                 fprintf(f, "  (import \"crypto\" \"teko_rt_object_get\" (func $object_get (param i32) (param i32) (result i32)))\n");
                 fprintf(f, "  (import \"crypto\" \"teko_rt_object_free\" (func $object_free (param i32) (result i32)))\n");
             }
+            // Phase 15 (15.B): static-vtable dispatch entry points from the SAME runtime reactor.
+            if (ctx->wasm_emit_vtable) {
+                fprintf(f, "  (import \"crypto\" \"teko_rt_vtable_set\" (func $vtable_set (param i32) (param i32) (param i32) (result i32)))\n");
+                fprintf(f, "  (import \"crypto\" \"teko_rt_vtable_get\" (func $vtable_get (param i32) (param i32) (result i32)))\n");
+            }
             // Phase 14 (14.C): delayed (timed) channel entry points, also from the reactor.
             if (ctx->wasm_emit_delayed) {
                 fprintf(f, "  (import \"crypto\" \"teko_rt_delayed_open\" (func $delayed_open (param i32) (result i32)))\n");
@@ -1206,7 +1211,7 @@ void emit_wasm_pure(MetalContext* ctx, OpCode op, int32_t arg) {
             // address the same bytes. Re-export it either way so harnesses can read results.
             if (ctx->wasm_emit_crypto_ext || ctx->wasm_emit_duplex || ctx->wasm_emit_delayed ||
                 ctx->wasm_emit_bcast || ctx->wasm_emit_shared || ctx->wasm_emit_retry ||
-                ctx->wasm_emit_object) {
+                ctx->wasm_emit_object || ctx->wasm_emit_vtable) {
                 fprintf(f, "  (import \"env\" \"memory\" (memory 1))\n");
             } else {
                 fprintf(f, "  (memory 1)\n");
@@ -1333,6 +1338,16 @@ void emit_wasm_pure(MetalContext* ctx, OpCode op, int32_t arg) {
                              (op == OP_OBJ_SET) ? "object_set" :
                              (op == OP_OBJ_GET) ? "object_get" : "object_free";
             int ar = (op == OP_OBJ_SET) ? 3 : (op == OP_OBJ_GET) ? 2 : 1;
+            for (int p = 0; p + 1 < ar; p++) fprintf(f, "    local.get $a%d\n", p);
+            fprintf(f, "    local.get $w0\n    call $%s\n    local.set $w0\n", fn);
+            break;
+        }
+
+        // Phase 15 (15.B): static-vtable ops — call the reactor's imported teko_rt_vtable_*.
+        case OP_VTABLE_SET:
+        case OP_VTABLE_GET: {
+            const char* fn = (op == OP_VTABLE_SET) ? "vtable_set" : "vtable_get";
+            int ar = (op == OP_VTABLE_SET) ? 3 : 2;
             for (int p = 0; p + 1 < ar; p++) fprintf(f, "    local.get $a%d\n", p);
             fprintf(f, "    local.get $w0\n    call $%s\n    local.set $w0\n", fn);
             break;

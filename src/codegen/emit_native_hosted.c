@@ -169,6 +169,20 @@ const char* teko_native_object_symbol(OpCode op, int* out_arity) {
     return sym;
 }
 
+// Phase 15 (15.B): OP_VTABLE_* -> teko_rt_vtable_* symbol + arity (mirrors the WASM reactor import
+// table). The teko_vtable C runtime is the single source of truth (linked from libteko_rt.a).
+const char* teko_native_vtable_symbol(OpCode op, int* out_arity) {
+    int arity = 2;
+    const char* sym = NULL;
+    switch (op) {
+        case OP_VTABLE_SET: sym = "teko_rt_vtable_set"; arity = 3; break; // (type_id, method_id, slot)
+        case OP_VTABLE_GET: sym = "teko_rt_vtable_get"; arity = 2; break; // (type_id, method_id)
+        default: break;
+    }
+    if (out_arity) *out_arity = arity;
+    return sym;
+}
+
 // --- helpers ---------------------------------------------------------------------
 static int is_macho(const MetalContext* ctx) { return ctx->target.os == OS_MACOS_DARWIN; }
 static int is_arm64(const MetalContext* ctx) {
@@ -620,6 +634,16 @@ void emit_native_hosted(MetalContext* ctx, OpCode op, int32_t arg) {
         case OP_OBJ_FREE: {
             int arity = 1;
             const char* sym = teko_native_object_symbol(op, &arity);
+            if (sym) emit_call(ctx, sym, arity);
+            break;
+        }
+
+        // Phase 15 (15.B): static-vtable ops -> teko_rt_vtable_* runtime calls (abstract/trait
+        // dynamic dispatch — VTABLE_GET feeds the resolved slot to a following OP_CALL_FUNC).
+        case OP_VTABLE_SET:
+        case OP_VTABLE_GET: {
+            int arity = 2;
+            const char* sym = teko_native_vtable_symbol(op, &arity);
             if (sym) emit_call(ctx, sym, arity);
             break;
         }

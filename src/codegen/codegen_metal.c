@@ -32,6 +32,7 @@ MetalContext* teko_metal_create(const char* output_asm_path, TekoTarget target) 
     ctx->wasm_emit_spawn = 0;
     ctx->wasm_emit_duplex = 0;
     ctx->wasm_emit_object = 0;
+    ctx->wasm_emit_vtable = 0;
     ctx->wasm_emit_delayed = 0;
     ctx->wasm_emit_bcast = 0;
     ctx->wasm_emit_shared = 0;
@@ -130,6 +131,11 @@ void teko_metal_set_emit_retry(MetalContext* ctx, int enabled) {
 void teko_metal_set_emit_object(MetalContext* ctx, int enabled) {
     if (!ctx) return;
     ctx->wasm_emit_object = enabled ? 1 : 0;
+}
+
+void teko_metal_set_emit_vtable(MetalContext* ctx, int enabled) {
+    if (!ctx) return;
+    ctx->wasm_emit_vtable = enabled ? 1 : 0;
 }
 
 void teko_metal_set_hosted(MetalContext* ctx, int enabled) {
@@ -348,7 +354,8 @@ static void process_linear_il_bytes(MetalContext* ctx, const unsigned char* byte
                      op == OP_RETRY_NEXT_DELAY || op == OP_CIRCUIT_NEW ||
                      op == OP_CIRCUIT_ALLOW || op == OP_CIRCUIT_RECORD ||
                      op == OP_OBJ_NEW || op == OP_OBJ_SET || op == OP_OBJ_GET ||
-                     op == OP_OBJ_FREE || op == OP_CALL_FUNC) {
+                     op == OP_OBJ_FREE || op == OP_CALL_FUNC ||
+                     op == OP_VTABLE_SET || op == OP_VTABLE_GET) {
                 last_arith_op = (OpCode)0;
             }
 
@@ -385,7 +392,8 @@ static void process_linear_il_bytes(MetalContext* ctx, const unsigned char* byte
                 op == OP_RETRY_NEXT_DELAY || op == OP_CIRCUIT_NEW ||
                 op == OP_CIRCUIT_ALLOW || op == OP_CIRCUIT_RECORD ||
                 op == OP_OBJ_NEW || op == OP_OBJ_SET || op == OP_OBJ_GET ||
-                op == OP_OBJ_FREE || op == OP_CALL_FUNC) {
+                op == OP_OBJ_FREE || op == OP_CALL_FUNC ||
+                op == OP_VTABLE_SET || op == OP_VTABLE_GET) {
                 accum_has_value = false;
             }
         }

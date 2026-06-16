@@ -61,6 +61,8 @@ int codegen_li_emit_wasm(const BytecodeBuffer* buffer, const char* wat_path,
     teko_metal_set_emit_retry(ctx, buffer->uses_retry);
     // Phase 15 (15.A): import the object instance-store entry points from the reactor + share memory.
     teko_metal_set_emit_object(ctx, buffer->uses_object);
+    // Phase 15 (15.B): import the static-vtable dispatch entry points from the reactor + share memory.
+    teko_metal_set_emit_vtable(ctx, buffer->uses_vtable);
 
     teko_metal_emit_program(ctx, buffer->code, (uint32_t)buffer->size);
 

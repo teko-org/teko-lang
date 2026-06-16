@@ -200,4 +200,10 @@ long teko_rt_object_set(long handle, long idx, long value); // -> 0
 long teko_rt_object_get(long handle, long idx);        // -> value
 long teko_rt_object_free(long handle);                 // -> 0
 
+// Phase 15 (15.B) — static vtable surface wrappers (OP_VTABLE_* lower to these). The teko_vtable
+// C runtime (src/runtime/teko_vtable.c) is the source of truth — a compile-time-populated
+// type_id × method_id -> routine-slot table backing abstract/trait dynamic dispatch.
+long teko_rt_vtable_set(long type_id, long method_id, long slot); // -> 0
+long teko_rt_vtable_get(long type_id, long method_id);            // -> slot (-1 if unset)
+
 #endif // TEKO_RT_H
