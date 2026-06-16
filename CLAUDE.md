@@ -207,11 +207,12 @@ via dedicated **OP_DUPLEX_*** opcodes (`duplex.open/send/recv/poll/close`, a dot
 surface — bare `duplex` stays the keyword). Native lowers to `teko_rt_duplex_*`; WASM compiles
 the SAME C runtime into the reactor and imports it (pure i32 handle/value/status, shared
 memory). Proofs `runtime/native/samples/duplex.tks` + `runtime/wasm/run-duplex.mjs`. Suite 174/174.
-Sub-block **14.C `delayed chan` is DONE** on both targets: timed/timestamped messages on a
-logical clock (`delayed.advance` ticks it), released in delivery-time order — C runtime
-`src/runtime/teko_delayed.c` (4 KATs) → dedicated `OP_DELAYED_*` (`delayed.*`) → native
-`teko_rt_delayed_*` + WASM reactor. Proofs `runtime/native/samples/delayed.tks` +
-`runtime/wasm/run-delayed.mjs`. Suite 179/179.
+Sub-block **14.C `delayed chan` is DONE** on both targets: timed/timestamped messages on the
+**REAL monotonic clock** (absolute ns deadlines; the logical `delayed.advance` was removed in the
+real-time correction), released in deadline order — C runtime `src/runtime/teko_delayed.c` (4 KATs,
+`now_ns` passed in) → dedicated `OP_DELAYED_*` (`delayed.*`) → native `teko_rt_delayed_*` + WASM
+reactor (both read `teko_rt_now_ns`/`env.teko_now_ns`). Proofs `runtime/native/samples/delayed.tks`
++ `runtime/wasm/run-delayed.mjs` (real-deadline order + elapsed lower bound).
 Sub-block **14.D `broadcast chan` is DONE** on both targets: non-destructive 1:N pub-sub (ring +
 per-subscriber cursors; publish-once/read-by-all) — C runtime `src/runtime/teko_broadcast.c`
 (4 KATs) → dedicated `OP_BCAST_*` (`broadcast.*` dotted-ident) → native `teko_rt_bcast_*` + WASM
@@ -234,10 +235,11 @@ Sub-block **control-flow foundation is DONE**: `while`/`loop`/`if`/`break`/`cont
 reassignment lower from source (structured `OP_LOOP_*`/`OP_IF_*`/`OP_BREAK*` 0x5B-0x61; native asm
 labels + WASM `(block (loop))`/`(if end)`). A shared block-body dispatcher is reused by loop/if AND
 routine bodies (loops inside a background `fn`). Proofs `controlflow.tks` native + WASM.
-Sub-block **14.G `await`/`wait` timespan waiters is DONE**: `wait <ts>;` (sync sleep,
-`teko_rt_sleep_ms` / `env.teko_sleep`) + `await <ts>;` (cooperative timed yield, `teko_rt_await_ms`
-/ `env.teko_await` + `$teko_sched_run`); opcodes `OP_WAIT` 0x59 / `OP_AWAIT_FOR` 0x5A; timespan
-literals normalize to canonical ms at compile time (adopted in channel delay args). Proofs
+Sub-block **14.G `await`/`wait` timespan waiters is DONE** (on the **real monotonic clock**):
+`wait <ts>;` (real-time spin, `teko_rt_wait_ns` / WASM i64 deadline loop on `env.teko_now_ns`) +
+`await <ts>;` (same, plus `$teko_sched_run` drain — `teko_rt_await_ns`); both NON-BLOCKING (only
+the time source is real). Opcodes `OP_WAIT` 0x59 / `OP_AWAIT_FOR` 0x5A; timespan literals normalize
+to canonical ms at compile time (adopted in channel delay args). Proofs
 `waiters.tks` native + WASM.
 Sub-block **14.H real `.tks` capstone is DONE**: one program combining functions + a background
 routine with a LOOP + main loops + atomic (14.E) + delayed channel (14.C) + await/wait (14.G) →
@@ -251,9 +253,16 @@ share a channel by passing its handle (the channel's backing store lives in the 
 consumer drains with a structured **poll** loop (`poll → if ready recv else stop/await`) — no
 blocking-recv/`select` needed. The Phase-10 `OP_SPAWN_ASYNC` (in-module channel `arg=$cp`) is
 untouched. Proof `producer_consumer.tks` native + WASM → 15.
+**Real-time clock (owner pre-merge correction) is DONE**: waiters/delays/timeouts run on a **real
+MONOTONIC ns clock** (`teko_rt_now_ns` = CLOCK_MONOTONIC / QueryPerformanceCounter; WASM imports
+`env.teko_now_ns`), replacing the logical clock — keeping cooperative NON-BLOCKING scheduling (only
+the time source changed). Runtimes stay clock-agnostic + KAT-deterministic (time passed in); time
+tests assert real-elapsed lower bounds + ordering (no exact counters). **Pending (owner, not yet
+done): a wall-clock/timezone surface** — current timestamp + TZ-aware conversion via the OS
+(system TZ + DST default, user time-calc allowed); see `docs/HANDOFF_PHASE14.md`.
 **PHASE 14 IS COMPLETE** — 14.A–14.I + control-flow foundation all done & CI-green on all four
 gates; no dead tokens (every reserved concurrency/resilience keyword is live with an executable
-`.tks` proof on native AND WASM); routines support real producer/consumer via Go-style args. Suite
-200/200; ASan/UBSan (both dispatch paths) + TSan green; 16 native goldens intact. **Ready to leave
-draft** (PR #7; the human merges — no merge/force-push from the agent). Continuation/history:
-`docs/HANDOFF_PHASE14.md`.
+`.tks` proof on native AND WASM); routines support real producer/consumer via Go-style args; all
+timing on the real monotonic clock. Suite 200/200; ASan/UBSan (both dispatch paths) + TSan green;
+16 native goldens intact. **Ready to leave draft** (PR #7; the human merges — no merge/force-push
+from the agent). Continuation/history: `docs/HANDOFF_PHASE14.md`.

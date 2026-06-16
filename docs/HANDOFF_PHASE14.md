@@ -62,6 +62,25 @@ it. (14.F's routine-trampoline alternative avoids loop-IL, but the 14.H samples 
    (capstone: functions + threads + loops + channels + await/wait, showcasing 14.A–14.G). Also adopt
    timespan literals in the 14.C/14.F delay args (compile-time-normalized → runtimes unchanged).
 
+## ✚ OWNER PRE-MERGE CORRECTIONS (2026-06-16)
+1. **Real-time monotonic clock — DONE.** The time base for ALL waiters/delays/timeouts is a real
+   MONOTONIC ns clock (`teko_rt_now_ns()` = CLOCK_MONOTONIC / QueryPerformanceCounter; WASM imports
+   `env.teko_now_ns`), replacing the logical clock — keeping cooperative NON-BLOCKING scheduling
+   (the OS thread is never blocked; only the time source changed). Commits `0ad939d` (waiters),
+   `5d9e194` (delayed — `advance` removed, absolute ns deadlines), `8aa2bf6` (retry/circuit real
+   elapsed/cooldown). Runtimes stay clock-agnostic (time passed in → KAT-deterministic); the
+   wrappers supply the real clock. Time tests assert real-elapsed LOWER BOUNDS + ordering (tolerant,
+   fast, non-flaky), never exact counters. All reactor harnesses now pass `env.teko_now_ns`.
+2. **Wall-clock + timezone surface — PENDING (owner ask).** Fetching a current timestamp or doing
+   a timezone conversion must also go through the OS: use the system local time + timezone as the
+   default, honor DST, but still let the user apply time calculations. This is a NEW date/time
+   language surface (distinct from the monotonic clock above — that's for elapsed/deadlines; this is
+   wall-clock civil time). Design sketch: an OS-backed `time.*` surface — `time.now()` (Unix epoch
+   from CLOCK_REALTIME / time(); WASM host import), local/UTC breakdown via `localtime_r`/`gmtime_r`
+   (OS tz database → DST), field accessors + formatting, and arithmetic on epoch values. Implement
+   as portable C runtime (source of truth, KATs with a fixed epoch for determinism) → native
+   `teko_rt_time_*` + WASM reactor/host imports → `.tks` proofs both targets. NOT yet started.
+
 ## ▶ RESUME POINT (read first) — for a FRESH session on this same branch/PR
 - **Branch:** `feat/phase-14-advanced-concurrency` (PR #7, draft); resume from its latest commit
   (this doc's commit is the tip). Working tree clean, fully pushed to `origin`. Suite **194/194**;

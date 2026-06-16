@@ -178,12 +178,14 @@ merge/force-push** (the human merges).
     sentinel; `emit_int`/`env.log_int` surface i32 results in the proofs.
 - **14.C — `delayed chan` (timed/timestamped)** — ✅ done on both targets (executable `.tks`
   proof each). Runtime `src/runtime/teko_delayed.{h,c}` (4 Unity KATs): each message is stamped
-  with a delivery time on a **logical clock** (advanced via `delayed.advance` — deterministic,
-  clock-source-agnostic, models the Timer Queue); `recv` releases the earliest-due message in
-  delivery-time order (stable FIFO on ties); non-blocking structured statuses. Surface: dedicated
-  `OP_DELAYED_OPEN/SEND/ADVANCE/RECV/POLL/CLOSE` (`delayed.*` dotted-identifier). Native →
-  `teko_rt_delayed_*`; WASM → reactor imports (same C runtime). Proofs
-  `runtime/native/samples/delayed.tks` (1/10/20/30) + `runtime/wasm/run-delayed.mjs`. CI-wired.
+  with an absolute **ns DEADLINE on the REAL monotonic clock** (now + delay; the runtime stays
+  clock-agnostic — `now_ns` is passed in, KAT-deterministic); `recv` releases the earliest-due
+  message in deadline order (stable FIFO on ties, timing-robust); non-blocking structured statuses.
+  Surface: dedicated `OP_DELAYED_OPEN/SEND/RECV/POLL/CLOSE` (`delayed.*` dotted-identifier; the
+  former logical `delayed.advance` was removed in the real-time-clock correction). Native →
+  `teko_rt_delayed_*` (read teko_rt_now_ns); WASM → reactor imports (read env.teko_now_ns). Proofs
+  `runtime/native/samples/delayed.tks` + `runtime/wasm/run-delayed.mjs` (real-deadline order
+  [10,30,20] + elapsed ≥ ~5ms). CI-wired.
 - **14.D — `broadcast chan` (non-destructive 1:N pub-sub)** — ✅ done on both targets. Runtime
   `src/runtime/teko_broadcast.{h,c}` (4 Unity KATs): a bounded overwriting ring keyed by a
   monotonic write sequence + one read cursor per subscriber; `publish` writes once, each
@@ -216,18 +218,18 @@ merge/force-push** (the human merges).
   (0x65-0x67) → native `teko_rt_retry_*`/`teko_rt_circuit_*`, WASM reactor imports. Proofs
   `runtime/native/samples/resilience.tks` + `runtime/wasm/run-resilience.mjs`
   ([3,777,2,555,1,444,3,2,5]). Suite 198/198.
-- **14.G — Timespan waiters: `await` (async) + `wait` (sync)** — ✅ done on both targets
-  (executable `.tks` proof each). `wait <ts>;` = synchronous sleep (native `teko_rt_sleep_ms`
-  real nanosleep/Win Sleep; WASM `env.teko_sleep` host import). `await <ts>;` = cooperative timed
-  yield (native `teko_rt_await_ms` advances a logical clock + drains the run queue; WASM
-  `env.teko_await` records ms + `$teko_sched_run` drain). New keywords `wait`/`await`; opcodes
-  `OP_WAIT` 0x59 / `OP_AWAIT_FOR` 0x5A (single-byte, ms in $w0). Timespan literals (`10ms`/`2s`)
-  normalize to canonical ms at compile time (`literal_canonical_value`), adopted in
-  `lower_codec_value` so 14.C/14.F delay args accept timespan literals (runtimes unchanged).
-  Proofs `runtime/native/samples/waiters.tks` (1,2,3 — await ran the queued worker) +
-  `runtime/wasm/run-waiters.mjs` (order 1,2,3 + host saw normalized await=5/wait=10 ms). Suite
-  196/196. *MVP: native tasks are run-to-completion, so `await` is a cooperative yield + logical
-  clock advance (WASM Layer A mirrors it), not real timer suspension — future work.*
+- **14.G — Timespan waiters: `await` (async) + `wait` (sync)** — ✅ done on both targets, on the
+  **REAL monotonic clock** (executable `.tks` proof each). `wait <ts>;` spins on the real clock
+  until now+ms elapses; `await <ts>;` ALSO drains the run queue each turn (cooperative). Both are
+  NON-BLOCKING — the OS thread is never blocked in the kernel; only the time source is real (owner
+  decision). Native `teko_rt_wait_ns` / `teko_rt_await_ns`; WASM emits an in-module i64 deadline
+  loop reading `env.teko_now_ns` (+ `$teko_sched_run` for await). Keywords `wait`/`await`; opcodes
+  `OP_WAIT` 0x59 / `OP_AWAIT_FOR` 0x5A (ms in $w0). Timespan literals (`10ms`/`2s`) normalize to
+  canonical ms at compile time (`literal_canonical_value`), adopted in `lower_codec_value` so
+  14.C/14.F delay args accept timespan literals. Proofs assert a LOWER BOUND on real elapsed +
+  interleave order (non-deterministic clock → no exact counters): native `waiters.tks` (order
+  1,2,3 + ≥12ms via run-native.sh check_timed); WASM `run-waiters.mjs` (order 1,2,3 + ≥12ms via
+  process.hrtime.bigint).
 - **Control-flow foundation** — ✅ done on both targets. `while (cond) { }`, `loop { }`,
   `if (cond) { }`, `break;`, `continue;` + local reassignment lower from source. Structured IL
   opcodes `OP_LOOP_BEGIN/END` (0x5B/0x5C), `OP_BREAK` (0x5D), `OP_CONTINUE` (0x5E),
@@ -258,7 +260,19 @@ merge/force-push** (the human merges).
   `runtime/wasm/run-producer-consumer.mjs` (producer task given `(channel, count)` fills it; the
   consumer poll-drains → 15). Suite 200/200.
 
+- **Real-time clock (owner pre-merge correction)** — ✅ the time base for ALL waiters/delays/
+  timeouts is now a **real MONOTONIC nanosecond clock**, not a logical clock — while keeping
+  cooperative NON-BLOCKING scheduling (the OS thread is never blocked in the kernel; only the time
+  source changed). `teko_rt_now_ns()` = CLOCK_MONOTONIC (POSIX/macOS) / QueryPerformanceCounter
+  (Windows/MSVC); WASM imports `env.teko_now_ns` (Node `process.hrtime.bigint()` — real ns;
+  browser `performance.now()*1e6`, best-effort/coarsened — documented). Applied to 14.G waiters
+  (real deadline spin), 14.C delayed (absolute ns deadlines; logical `advance` removed), and 14.F
+  retry/circuit timeouts (real elapsed/cooldown). The runtimes stay clock-agnostic + KAT-
+  deterministic (time passed in); the wrappers supply the real clock. Time tests assert LOWER
+  BOUNDS on real elapsed + ordering (tolerant, fast, non-flaky), never exact counters.
+
 **Phase 14 is COMPLETE** — all sub-blocks (14.A–14.I) + the control-flow foundation are done and
 CI-green on all four gates; no dead tokens (every reserved concurrency/resilience keyword is live
-with an executable `.tks` proof on native AND WASM), and routines support real concurrent
-producer/consumer via Go-style arguments. Ready to leave draft.
+with an executable `.tks` proof on native AND WASM); routines support real concurrent
+producer/consumer via Go-style arguments; and all timing runs on the real monotonic clock. Ready
+to leave draft.
