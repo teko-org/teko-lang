@@ -86,10 +86,16 @@ both freestanding-safe (no `snprintf`/`strtod`/`setlocale`).
   yet). Bounded-but-real (touches frontend evaluator + both emitters + IL arg reader).
 - **17.B — checked int↔float casts.** `OP_I2F`/`OP_F2I` surfaced as explicit fail-loud conversion
   builtins; overflow traps/aborts. Small, builds on 17.A. Proof via the cast `.tks`.
-- **17.C — `teko_convert_f64_to_string` C core + KATs (no surface yet).** The Ryu/Grisu-class
-  shortest-round-trip formatter as the source of truth, KAT-tested (round-trip + boundary vectors:
-  `0.0`, `-0.0`, integers-as-float, `0.1`, `1e308`, subnormals, etc.). **Large** — the formatter
-  is the hard part. Lands as runtime + KATs only (like the parse core did in 16.A).
+- **17.C — `teko_convert_f64_to_string` C core + KATs (no surface yet).** Shortest-round-trip
+  formatter as the source of truth, KAT-tested. **Formatter = Ryu (owner-APPROVED).** A carefully
+  transcribed public-domain Ryu reference (with attribution), **portable `umul128` via 64-bit halves
+  (NO `__int128`/`__multi3`)**, a static power-of-5 table, freestanding-safe (no `math.h`/`snprintf`/
+  `strtod` — only the reactor shim's `mem*`/`malloc`). Render culture-invariant `.`-decimal, falling
+  to `e`-notation only at extreme exponents (documented threshold). Heavy KAT vectors: `0.0`, `-0.0`,
+  `1.0`, integers-as-float, `0.1`, halfway/boundary values, subnormal `5e-324`, max
+  `1.7976931348623157e308`, powers of 10. ONE C source compiled identically to native (id 50, 17.D)
+  and the WASM reactor → byte-identical. **Large** — the formatter is the hard part. Lands as runtime
+  + KATs only (no surface; like the parse core in 16.A).
 - **17.D — `convert.float_to_str` surface + auto-`to_string` for floats.** Wire id 50 on both
   targets; extend the concat/interpolation coercion (16.B/16.D) so a `VT_FLOAT` operand
   auto-converts. Proof `.tks` → byte-identical float output native + WASM.
@@ -200,11 +206,17 @@ Verification: suite 232/232 (17.B adds no runtime C → no new KATs); ASan/UBSan
 path and float-free modules emit zero float opcodes — purely additive). Implementation continues at
 **17.C** (the freestanding shortest-round-trip `teko_convert_f64_to_string` formatter + KATs).
 
-## Reserved — future exact base-10 `decimal` type (Phase 17.F, pending owner decision)
-Owner design note: an EXACT base-10 `decimal` (C#-`decimal` / SQL `DECIMAL` style, 128-bit — exact
-for money, distinct from the binary f64 here) will probably be added; final placement (17.F in this
-phase vs. its own phase) is the owner's call. To make that decision **zero-cost and future-proof**,
-17.A RESERVES — without implementing — the encoding so an approval never renumbers anything:
+## Phase 17.F — exact base-10 `decimal` type (owner-APPROVED; implemented AFTER 17.A–17.E)
+**Owner decision: APPROVED, C#-`System.Decimal` semantics.** An EXACT base-10 `decimal`, **128-bit /
+16 bytes** = a **96-bit coefficient + sign + scale 0–28** (base-10), distinct from the binary f64 —
+exact for money. **Banker's rounding (round-half-to-even) by default**, matching C# `System.Decimal`.
+Self-contained 128-bit base-10 arithmetic (**no libc, no `__int128` — 64-bit limb pairs**), a decimal
+formatter + parser reusing the 17.C/17.E infra, checked fail-loud casts, ONE KAT-tested C runtime →
+native + WASM reactor (byte-identical), `.tks` proofs on both targets. **Sequenced AFTER the f64 core
+(17.A–17.E) closes.** Because it is large, before implementing 17.F a sub-block plan + diff-size
+estimate is reported to the owner, with a recommendation on whether it warrants its own PR (same
+phase). The opcodes/value-type reserved below **go live in 17.F**. The reservation (made in 17.A) so
+an approval never renumbers anything:
 - **Value-type slot** `TEKO_VT_DECIMAL = (1 << 21)` (its own high sentinel, in `frontend_interop.c`).
 - **Opcode byte range `0x83–0x96`** reserved CONTIGUOUSLY right after the float ops (`codegen_li.h`),
   mirroring the float layout: `OP_DCONST` (0x83), `OP_DADD/DSUB/DMUL/DDIV/DMOD` (0x84–0x88),

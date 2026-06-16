@@ -220,13 +220,14 @@ typedef enum {
     // that traps on WASM also aborts on native. Result i32 in $w0 (clobbers $w0 with a non-const).
     OP_F2I          = 0x82, // $w0 = (i32)trunc($f0)  (checked, fail-loud)
 
-    // Phase 17.F (RESERVED — owner design note, pending final decision): an EXACT base-10
-    // `decimal` type (C#-decimal / SQL DECIMAL style, 128-bit — exact for money, distinct from the
-    // binary f64 above). The opcode byte range 0x83–0x96 is RESERVED CONTIGUOUSLY for it now (zero
-    // cost, future-proof: if `decimal` is approved we add the enum constants + lowering WITHOUT
+    // Phase 17.F (RESERVED — owner-APPROVED, implemented after 17.A–17.E): an EXACT base-10
+    // `decimal` type — C# System.Decimal semantics: 128-bit / 16 bytes (96-bit coefficient + sign +
+    // scale 0–28), banker's rounding (round-half-to-even) default; exact for money, distinct from the
+    // binary f64 above. The opcode byte range 0x83–0x96 is RESERVED CONTIGUOUSLY for it now (zero
+    // cost, future-proof: 17.F adds the enum constants + lowering WITHOUT
     // renumbering any float/integer opcode). These are NOT emitted, NOT enum constants, and have NO
-    // live token (no dead-token gate trip) — they are claimed only as documentation, exactly like
-    // the 0x76/0x82 float reservations above. Mirrors the float layout:
+    // live token (no dead-token gate trip) — they are claimed only as documentation/reservation
+    // (the way 0x76/0x82 were before 17.B promoted them to live enum constants). Mirrors the float layout:
     //   0x83 = OP_DCONST        (4-byte decimal-pool index; $d0 = decimal_pool[idx])
     //   0x84 = OP_DADD   0x85 = OP_DSUB   0x86 = OP_DMUL   0x87 = OP_DDIV   0x88 = OP_DMOD
     //   0x89 = OP_DEQ    0x8A = OP_DNE    0x8B = OP_DLT    0x8C = OP_DLE    0x8D = OP_DGT  0x8E = OP_DGE
