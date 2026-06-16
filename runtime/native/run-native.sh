@@ -102,6 +102,14 @@ check_uuid() {
 }
 
 check hello.tks "hello from teko native"
+# Phase 15 (15.A): concrete class — fields + methods + STATIC dispatch, zero runtime reflection.
+# `Point()` -> OP_OBJ_NEW; `p.x = 3` -> OP_OBJ_SET; `p.sum()`/`p.scale(10)` -> OP_CALL_FUNC
+# (the method routine reads `self.x`/`self.y` via OP_OBJ_GET). Prints 7 (3+4) then 70 ((3+4)*10).
+check class.tks "$(cat <<'EXP'
+7
+70
+EXP
+)"
 # Phase 14 (14.A): `routines { worker(); worker(); }` fires two background tasks. The native
 # scheduler (teko_rt_run) drains them at $main exit, so they run AFTER main's body — the two
 # "worker ran" lines follow "main start"/"main end", proving deferred (not inline) execution.

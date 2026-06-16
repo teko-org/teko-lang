@@ -1361,3 +1361,62 @@ void test_codegen_li_call_func_sync(void) {
     remove(wat);
     codegen_li_free_context(buffer);
 }
+
+// Phase 15 (15.A): compile a REAL class `.tks` (declaration + fields + method + instantiation +
+// field write + method call) through the interop frontend, and assert the lowering: OP_OBJ_NEW
+// (instantiation), OP_OBJ_SET (field writes), OP_OBJ_GET (field reads in the method), OP_CALL_FUNC
+// (static method dispatch), plus uses_object/uses_spawn and a method body emitted as a routine.
+void test_frontend_interop_class_concrete(void) {
+    const char* src =
+        "extern fn emit_int(n) from \"teko_rt\" as \"teko_rt_emit_int\";\n"
+        "class Point {\n"
+        "  let x;\n"
+        "  let y;\n"
+        "  fn sum(self) { return self.x + self.y; }\n"
+        "}\n"
+        "let p = Point();\n"
+        "p.x = 3;\n"
+        "p.y = 4;\n"
+        "let s = p.sum();\n"
+        "emit_int(s);\n";
+
+    BytecodeBuffer* buffer = codegen_li_create_context();
+    TEST_ASSERT_NOT_NULL(buffer);
+    TEST_ASSERT_EQUAL_INT(0, teko_compile_interop(src, buffer));
+
+    TEST_ASSERT_EQUAL_INT(1, buffer->uses_object); // class instances -> teko_object runtime
+    TEST_ASSERT_EQUAL_INT(1, buffer->uses_spawn);  // method dispatch -> routine table + scheduler
+
+    int saw_new = 0, saw_set = 0, saw_get = 0, saw_call = 0, n_set = 0;
+    for (int i = 0; i < buffer->size; i++) {
+        unsigned char op = buffer->code[i];
+        if (op == (unsigned char)OP_OBJ_NEW)  saw_new = 1;
+        if (op == (unsigned char)OP_OBJ_SET){ saw_set = 1; n_set++; }
+        if (op == (unsigned char)OP_OBJ_GET)  saw_get = 1;
+        if (op == (unsigned char)OP_CALL_FUNC) saw_call = 1;
+    }
+    TEST_ASSERT_TRUE(saw_new);            // p = Point()
+    TEST_ASSERT_TRUE(saw_set && n_set >= 2); // p.x = 3; p.y = 4;
+    TEST_ASSERT_TRUE(saw_get);            // self.x / self.y inside sum()
+    TEST_ASSERT_TRUE(saw_call);           // p.sum() static dispatch
+
+    // Through the bridge: the method body is a table routine; the object runtime is imported.
+    TekoTarget target;
+    target.arch = ARCH_WASM32;
+    target.os = OS_WASI;
+    strncpy(target.target_string, "wasm32-wasi", sizeof(target.target_string) - 1);
+    const char* wat = "output_class_concrete.wat";
+    TEST_ASSERT_EQUAL_INT(0, codegen_li_emit_wasm(buffer, wat, target, NULL, NULL, NULL, NULL, 0));
+    FILE* f = fopen(wat, "r");
+    TEST_ASSERT_NOT_NULL(f);
+    char* out = (char*)malloc(65536);
+    TEST_ASSERT_NOT_NULL(out);
+    memset(out, 0, 65536);
+    size_t n = fread(out, 1, 65535, f); out[n] = '\0'; fclose(f);
+    TEST_ASSERT_NOT_NULL(strstr(out, "call $object_new"));
+    TEST_ASSERT_NOT_NULL(strstr(out, "call_indirect (type $task)")); // method dispatch
+    TEST_ASSERT_NOT_NULL(strstr(out, "(func $routine_0"));            // sum() emitted as a routine
+    free(out);
+    remove(wat);
+    codegen_li_free_context(buffer);
+}

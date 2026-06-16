@@ -158,6 +158,73 @@ typedef struct {
 // 2=LOAD the handler param ($w0 <- $w1), 3=LOAD_LOCAL payload (a named local).
 typedef struct { int kind; int payload; } Prod;
 
+// ---- Phase 15 (15.A): class registry + member access -----------------------------
+// ZERO RUNTIME REFLECTION: a class is a COMPILE-TIME layout (ordered field list) + a method
+// table (each method -> a routine table slot, shared with `fn` handlers). Instances are
+// teko_object handles; `obj.field` resolves the field's index at compile time (OP_OBJ_GET/SET)
+// and `obj.method(args)` resolves the method's slot at compile time (static dispatch via
+// OP_CALL_FUNC, passing `self` as arg0). File-static state — one single-threaded compile per
+// teko_compile_interop call (reset at entry); avoids threading the registry through every helper.
+#define TEKO_MAX_CLASSES        64
+#define TEKO_CLASS_MAX_FIELDS   64
+#define TEKO_CLASS_MAX_METHODS  64
+typedef struct {
+    char name[96];
+    char fields[TEKO_CLASS_MAX_FIELDS][96]; int nfields;
+    char methods[TEKO_CLASS_MAX_METHODS][96];
+    int  method_slot[TEKO_CLASS_MAX_METHODS];    // routine table slot (global, dense)
+    int  method_nparams[TEKO_CLASS_MAX_METHODS]; // includes the implicit leading `self`
+    int  nmethods;
+} ClassInfo;
+static ClassInfo g_class[TEKO_MAX_CLASSES];
+static int g_nclass;
+
+// local var name -> class index (-1 = not a class instance). Per-function scope (reset for $main
+// and for each method body), so a method's `self`/locals don't alias $main's instance names.
+#define TEKO_MAX_LOCALCLS 256
+typedef struct { char name[96]; int cls; } LocalClass;
+static LocalClass g_localcls[TEKO_MAX_LOCALCLS];
+static int g_nlocalcls;
+
+static int class_find(const char* n) {
+    for (int i = 0; i < g_nclass; i++) if (strcmp(g_class[i].name, n) == 0) return i;
+    return -1;
+}
+static int class_field_idx(int ci, const char* f) {
+    if (ci < 0 || ci >= g_nclass) return -1;
+    ClassInfo* c = &g_class[ci];
+    for (int i = 0; i < c->nfields; i++) if (strcmp(c->fields[i], f) == 0) return i;
+    return -1;
+}
+static int class_method_idx(int ci, const char* m) {
+    if (ci < 0 || ci >= g_nclass) return -1;
+    ClassInfo* c = &g_class[ci];
+    for (int i = 0; i < c->nmethods; i++) if (strcmp(c->methods[i], m) == 0) return i;
+    return -1;
+}
+static void localcls_reset(void) { g_nlocalcls = 0; }
+static void localcls_set(const char* n, int ci) {
+    for (int i = 0; i < g_nlocalcls; i++)
+        if (strcmp(g_localcls[i].name, n) == 0) { g_localcls[i].cls = ci; return; }
+    if (g_nlocalcls < TEKO_MAX_LOCALCLS) {
+        strncpy(g_localcls[g_nlocalcls].name, n, 95); g_localcls[g_nlocalcls].name[95] = '\0';
+        g_localcls[g_nlocalcls].cls = ci; g_nlocalcls++;
+    }
+}
+static int localcls_get(const char* n) {
+    for (int i = 0; i < g_nlocalcls; i++) if (strcmp(g_localcls[i].name, n) == 0) return g_localcls[i].cls;
+    return -1;
+}
+// Split a dotted lexeme "base.member" into its two parts. Returns 1 on success (a dot present).
+static int dotted_split(const char* lex, char* base, char* member) {
+    const char* dot = lex ? strchr(lex, '.') : NULL;
+    if (!dot) return 0;
+    size_t bl = (size_t)(dot - lex); if (bl >= 96) bl = 95;
+    memcpy(base, lex, bl); base[bl] = '\0';
+    strncpy(member, dot + 1, 95); member[95] = '\0';
+    return 1;
+}
+
 static int is_dom_macro(const char* lexeme); // defined below
 static void lower_intrinsic_call(BytecodeBuffer* buffer, Parser* p, const LowerCtx* ctx); // recursive
 
@@ -285,6 +352,28 @@ static OpCode p12_tok_op(TokenType t) {
 static void eval_expr_prec(BytecodeBuffer* b, Parser* p, const LowerCtx* ctx,
                            int min_prec, TempAlloc* ta);
 
+// Phase 15 (15.A): `obj.field` READ as an expression primary -> OP_OBJ_GET(handle, idx) -> $w0.
+// `obj` must be a class-typed local and `member` one of its fields (resolved at compile time).
+// Returns 1 if it consumed a member read, 0 otherwise (a method call `obj.method(` or a non-class
+// dotted ident — e.g. duplex.* — is left for the caller). Current token is the dotted IDENTIFIER.
+static int lower_member_read(BytecodeBuffer* b, Parser* p, const LowerCtx* ctx) {
+    if (p->current_token.type != TOKEN_IDENTIFIER) return 0;
+    char base[96], member[96];
+    if (!dotted_split(p->current_token.lexeme, base, member)) return 0;
+    int ci = localcls_get(base);
+    if (ci < 0) return 0;
+    int fidx = class_field_idx(ci, member);
+    if (fidx < 0) return 0; // not a field (could be a method — handled by the call path)
+    int hslot = ctx ? bind_lookup(ctx->locals, ctx->nlocals, base) : -1;
+    if (hslot < 0) return 0;
+    codegen_li_emit_load_local(b, hslot);  // $w0 = handle
+    codegen_li_emit_setarg(b, 0);          // $a0 = handle
+    codegen_li_emit_iconst(b, fidx);       // $w0 = field index (compile-time constant)
+    codegen_li_emit_object(b, OP_OBJ_GET); // $w0 = field value
+    fe_advance(p);
+    return 1;
+}
+
 static void eval_primary(BytecodeBuffer* b, Parser* p, const LowerCtx* ctx, TempAlloc* ta) {
     if (p->current_token.type == TOKEN_LIT_INT) {
         codegen_li_emit_iconst(b, atoi(p->current_token.lexeme));
@@ -293,6 +382,8 @@ static void eval_primary(BytecodeBuffer* b, Parser* p, const LowerCtx* ctx, Temp
         fe_advance(p);
         eval_expr_prec(b, p, ctx, 1, ta);
         if (p->current_token.type == TOKEN_RPAREN) fe_advance(p);
+    } else if (lower_member_read(b, p, ctx)) {
+        // `obj.field` read consumed (e.g. inside `self.x + self.y`).
     } else if (p->current_token.type == TOKEN_IDENTIFIER) {
         int s = ctx ? bind_lookup(ctx->locals, ctx->nlocals, p->current_token.lexeme) : -1;
         if (s >= 0) codegen_li_emit_load_local(b, s);
@@ -726,12 +817,23 @@ static void env_sync(LowerEnv* env) {
 
 // Lower an initializer / RHS value into $w0: string literal, @dom/@js intrinsic, codec/hash/crypto,
 // duplex/delayed/broadcast/atomic op, or an integer expression (literals/locals/parens/arith/cmp).
+// Phase 15 (15.A): forward decls for the class-surface value forms (defined after lower_call_stmt,
+// since they reuse lower_codec_value / eval_expr_prec).
+static void lower_instantiation(BytecodeBuffer* b, Parser* p);                      // ClassName(...)
+static int  lower_member_call(BytecodeBuffer* b, Parser* p, const LowerCtx* ctx);   // obj.method(...)
+
 static void lower_init_value(BytecodeBuffer* b, Parser* p, LowerEnv* env) {
     LowerCtx* ctx = env->ctx;
     if (p->current_token.type == TOKEN_LIT_STR || p->current_token.type == TOKEN_STRING_LIT) {
         char* sv = strip_quotes(p->current_token.lexeme);
         codegen_li_emit_sconst(b, codegen_li_add_string_constant(b, sv));
         free(sv); fe_advance(p);
+    } else if (p->current_token.type == TOKEN_IDENTIFIER && p->peek_token.type == TOKEN_LPAREN &&
+               class_find(p->current_token.lexeme) >= 0) {
+        // Phase 15 (15.A): `ClassName(...)` instantiation -> OP_OBJ_NEW -> handle in $w0.
+        lower_instantiation(b, p);
+    } else if (lower_member_call(b, p, ctx)) {
+        // Phase 15 (15.A): `obj.method(args)` as an RHS -> OP_CALL_FUNC -> result in $w0.
     } else if (p->current_token.type == TOKEN_MACRO_IDENT && is_dom_macro(p->current_token.lexeme) &&
                p->peek_token.type == TOKEN_LPAREN) {
         lower_intrinsic_call(b, p, ctx);
@@ -788,9 +890,14 @@ static void lower_let_stmt(BytecodeBuffer* b, Parser* p, LowerEnv* env) {
         fe_advance(p);
     int s = bind_lookup(*env->locals, *env->nlocals, lname);
     if (s < 0) { s = *env->nlocals; bind_add(env->locals, env->nlocals, env->caplocals, lname, s); }
+    // Phase 15 (15.A): if the RHS is a `ClassName(...)` instantiation, remember this local's class
+    // so later `lname.field` / `lname.method(...)` resolve their compile-time index/slot.
+    int rhs_class = (p->current_token.type == TOKEN_IDENTIFIER && p->peek_token.type == TOKEN_LPAREN)
+                    ? class_find(p->current_token.lexeme) : -1;
     env_sync(env);
     lower_init_value(b, p, env);
     codegen_li_emit_store_local(b, s);
+    if (rhs_class >= 0) localcls_set(lname, rhs_class);
     if (p->current_token.type == TOKEN_SEMICOLON) fe_advance(p);
 }
 
@@ -850,6 +957,103 @@ static int lower_call_stmt(BytecodeBuffer* b, Parser* p, LowerEnv* env) {
     return 1;
 }
 
+// Phase 15 (15.A): `ClassName(...)` instantiation -> OP_OBJ_NEW(nfields) -> handle in $w0. Current
+// token is the class-name IDENTIFIER (peek '('). Constructor arguments are skipped in the MVP
+// (fields are assigned explicitly after construction); the field COUNT is the class's compile-time
+// layout size, so the instance has exactly the right number of zero-initialized cells.
+static void lower_instantiation(BytecodeBuffer* b, Parser* p) {
+    int ci = class_find(p->current_token.lexeme);
+    fe_advance(p); // ClassName
+    if (p->current_token.type == TOKEN_LPAREN) fe_advance(p);
+    int depth = 1; // skip the (possibly empty) constructor-arg list
+    while (p->current_token.type != TOKEN_EOF && depth > 0) {
+        if (p->current_token.type == TOKEN_LPAREN) depth++;
+        else if (p->current_token.type == TOKEN_RPAREN) depth--;
+        if (depth > 0) fe_advance(p); else fe_advance(p); // consume incl. the closing ')'
+    }
+    int nf = (ci >= 0) ? g_class[ci].nfields : 0;
+    codegen_li_emit_iconst(b, nf);
+    codegen_li_emit_object(b, OP_OBJ_NEW); // $w0 = handle
+}
+
+// Phase 15 (15.A): `obj.method(args)` STATIC dispatch -> OP_CALL_FUNC. `obj` must be a class-typed
+// local; `member` one of its methods (slot resolved at compile time). `self` (the instance handle)
+// is passed as arg0, then each explicit arg (int / named local). The result lands in $w0. Returns
+// 1 if consumed, 0 if not a class method call (e.g. duplex.*/a non-class dotted ident).
+static int lower_member_call(BytecodeBuffer* b, Parser* p, const LowerCtx* ctx) {
+    if (p->current_token.type != TOKEN_IDENTIFIER || p->peek_token.type != TOKEN_LPAREN) return 0;
+    char base[96], member[96];
+    if (!dotted_split(p->current_token.lexeme, base, member)) return 0;
+    int ci = localcls_get(base);
+    if (ci < 0) return 0;
+    int midx = class_method_idx(ci, member);
+    if (midx < 0) return 0;
+    int hslot = ctx ? bind_lookup(ctx->locals, ctx->nlocals, base) : -1;
+    if (hslot < 0) return 0;
+    int slot = g_class[ci].method_slot[midx];
+    fe_advance(p);                                       // consume "obj.method"
+    if (p->current_token.type == TOKEN_LPAREN) fe_advance(p);
+    codegen_li_emit_load_local(b, hslot);               // $w0 = self handle
+    codegen_li_emit_setarg(b, 0);                       // $a0 = self
+    int argc = 1;
+    while (p->current_token.type != TOKEN_RPAREN && p->current_token.type != TOKEN_EOF && argc < 8) {
+        if (p->current_token.type == TOKEN_COMMA) { fe_advance(p); continue; }
+        lower_codec_value(b, p, ctx);                   // arg -> $w0 (int / named local)
+        codegen_li_emit_setarg(b, argc);                // $a{argc} = arg
+        argc++;
+    }
+    if (p->current_token.type == TOKEN_RPAREN) fe_advance(p);
+    codegen_li_emit_iconst(b, slot);                    // $w0 = method slot (static dispatch)
+    codegen_li_emit_call_func(b, argc);                 // $w0 = method result
+    return 1;
+}
+
+// Phase 15 (15.A): `obj.field = <expr>;` field WRITE -> OP_OBJ_SET(handle, idx, value). Returns 1
+// if consumed. The value is evaluated FIRST into a temp (it may itself read `obj.field` via
+// OP_OBJ_GET, which stages $a0 — so we must not have the SET's handle/idx staged yet).
+static int lower_member_write(BytecodeBuffer* b, Parser* p, LowerEnv* env) {
+    if (p->current_token.type != TOKEN_IDENTIFIER || p->peek_token.type != TOKEN_ASSIGN) return 0;
+    char base[96], member[96];
+    if (!dotted_split(p->current_token.lexeme, base, member)) return 0;
+    int ci = localcls_get(base);
+    if (ci < 0) return 0;
+    int fidx = class_field_idx(ci, member);
+    if (fidx < 0) return 0;
+    int hslot = bind_lookup(*env->locals, *env->nlocals, base);
+    if (hslot < 0) return 0;
+    fe_advance(p); // "obj.field"
+    fe_advance(p); // '='
+    env_sync(env);
+    lower_init_value(b, p, env);                        // value -> $w0 (may use $a0 via member reads)
+    int t = env->ctx->ta->next_temp++;
+    if (env->ctx->ta->next_temp > env->ctx->ta->hw) env->ctx->ta->hw = env->ctx->ta->next_temp;
+    codegen_li_emit_store_local(b, t);                  // temp = value
+    codegen_li_emit_load_local(b, hslot); codegen_li_emit_setarg(b, 0); // $a0 = handle
+    codegen_li_emit_iconst(b, fidx);      codegen_li_emit_setarg(b, 1); // $a1 = field index
+    codegen_li_emit_load_local(b, t);                  // $w0 = value
+    codegen_li_emit_object(b, OP_OBJ_SET);
+    env->ctx->ta->next_temp--;                          // free the temp
+    if (p->current_token.type == TOKEN_SEMICOLON) fe_advance(p);
+    return 1;
+}
+
+// Phase 15 (15.A): a class member STATEMENT — `obj.field = expr;`, `obj.method(args);` (result
+// discarded). Returns 1 if consumed. Shared by the top-level loop and the block dispatcher.
+static int lower_member_stmt(BytecodeBuffer* b, Parser* p, LowerEnv* env) {
+    if (lower_member_write(b, p, env)) return 1;
+    if (p->current_token.type == TOKEN_IDENTIFIER && p->peek_token.type == TOKEN_LPAREN) {
+        char base[96], member[96];
+        if (dotted_split(p->current_token.lexeme, base, member) &&
+            localcls_get(base) >= 0 && class_method_idx(localcls_get(base), member) >= 0) {
+            env_sync(env);
+            lower_member_call(b, p, env->ctx);          // result discarded
+            if (p->current_token.type == TOKEN_SEMICOLON) fe_advance(p);
+            return 1;
+        }
+    }
+    return 0;
+}
+
 // `while (cond) { body }` — LOOP_BEGIN; <cond→$w0>; BREAK_IF_FALSE; body; LOOP_END.
 static void lower_while(BytecodeBuffer* b, Parser* p, LowerEnv* env) {
     fe_advance(p); // 'while'
@@ -904,6 +1108,17 @@ static void lower_one_stmt(BytecodeBuffer* b, Parser* p, LowerEnv* env) {
     } else if (p->current_token.type == TOKEN_WAIT || p->current_token.type == TOKEN_AWAIT) {
         env_sync(env);
         lower_wait_await(b, p, ctx, p->current_token.type == TOKEN_AWAIT);
+    } else if (p->current_token.type == TOKEN_RETURN) {
+        // Phase 15 (15.A): `return <expr>;` — evaluate the expression into $w0 (the routine's
+        // result; a native routine leaves $w0 in rax across `ret`, WASM spills it at FUNC_END).
+        // MVP: no early-return control flow — `return` is expected as a method's last statement.
+        fe_advance(p);
+        if (p->current_token.type != TOKEN_SEMICOLON && p->current_token.type != TOKEN_RBRACE &&
+            p->current_token.type != TOKEN_EOF) {
+            env_sync(env);
+            lower_init_value(b, p, env); // value -> $w0 (member reads/calls, arithmetic, ints, locals)
+        }
+        if (p->current_token.type == TOKEN_SEMICOLON) fe_advance(p);
     } else if (p->current_token.type == TOKEN_MACRO_IDENT && is_dom_macro(p->current_token.lexeme) &&
                p->peek_token.type == TOKEN_LPAREN) {
         lower_intrinsic_call(b, p, ctx);
@@ -920,6 +1135,8 @@ static void lower_one_stmt(BytecodeBuffer* b, Parser* p, LowerEnv* env) {
     } else if (p->current_token.type == TOKEN_CIRCUIT &&
                p->peek_token.type == TOKEN_IDENTIFIER) {
         lower_circuit_block(b, p, env);   // 14.F: circuit cb { } fallback { }
+    } else if (lower_member_stmt(b, p, env)) {
+        /* Phase 15: obj.field = expr; / obj.method(args); consumed */
     } else if (lower_reassign(b, p, env)) {
         /* NAME = expr; consumed */
     } else if (lower_call_stmt(b, p, env)) {
@@ -1138,8 +1355,105 @@ static void skip_extern_decl(Parser* p) {
     }
 }
 
+// Phase 15 (15.A): skip a whole `class NAME [..] { … }` declaration (brace-matched). Current
+// token is TOKEN_CLASS. Used so the fn/handler passes don't treat a class's methods as top-level
+// routines, and so the main lowering pass doesn't emit a class declaration as a statement.
+static void skip_class_decl(Parser* p) {
+    fe_advance(p); // 'class'
+    while (p->current_token.type != TOKEN_LBRACE && p->current_token.type != TOKEN_EOF) fe_advance(p);
+    if (p->current_token.type == TOKEN_LBRACE) {
+        int d = 1; fe_advance(p);
+        while (p->current_token.type != TOKEN_EOF && d > 0) {
+            if (p->current_token.type == TOKEN_LBRACE) d++;
+            else if (p->current_token.type == TOKEN_RBRACE) d--;
+            fe_advance(p);
+        }
+    }
+}
+
+// Phase 15 (15.A): pre-pass that builds the class registry (g_class) — each class's ordered field
+// list (compile-time layout) and method table (each method -> a routine slot, continuing the
+// global counter after the top-level `fn`s at base_slot). Method bodies are emitted later by
+// emit_method_routines in the SAME class/declaration order, so slots stay dense and consistent
+// with the backend's routine function table.
+static void collect_classes(const char* source, int base_slot) {
+    g_nclass = 0;
+    Lexer lx; lexer_init(&lx, source);
+    Parser p; parser_init(&p, &lx);
+    int slot = base_slot;
+    while (p.current_token.type != TOKEN_EOF) {
+        if (p.current_token.type != TOKEN_CLASS || p.peek_token.type != TOKEN_IDENTIFIER) {
+            fe_advance(&p); continue;
+        }
+        if (g_nclass >= TEKO_MAX_CLASSES) { skip_class_decl(&p); continue; }
+        ClassInfo* c = &g_class[g_nclass];
+        memset(c, 0, sizeof(*c));
+        fe_advance(&p); // 'class'
+        strncpy(c->name, p.current_token.lexeme, 95); c->name[95] = '\0';
+        fe_advance(&p); // class name
+        while (p.current_token.type != TOKEN_LBRACE && p.current_token.type != TOKEN_EOF) fe_advance(&p);
+        if (p.current_token.type == TOKEN_LBRACE) fe_advance(&p); // '{'
+        int depth = 1;
+        while (p.current_token.type != TOKEN_EOF && depth > 0) {
+            if (p.current_token.type == TOKEN_LBRACE) { depth++; fe_advance(&p); continue; }
+            if (p.current_token.type == TOKEN_RBRACE) { depth--; fe_advance(&p); continue; }
+            if (depth == 1 && (p.current_token.type == TOKEN_LET || p.current_token.type == TOKEN_MUT) &&
+                p.peek_token.type == TOKEN_IDENTIFIER) {
+                fe_advance(&p); // let/mut
+                if (c->nfields < TEKO_CLASS_MAX_FIELDS) {
+                    strncpy(c->fields[c->nfields], p.current_token.lexeme, 95);
+                    c->fields[c->nfields][95] = '\0'; c->nfields++;
+                }
+                fe_advance(&p); // field name
+                while (p.current_token.type != TOKEN_SEMICOLON && p.current_token.type != TOKEN_RBRACE &&
+                       p.current_token.type != TOKEN_EOF) fe_advance(&p); // skip ': type'
+                if (p.current_token.type == TOKEN_SEMICOLON) fe_advance(&p);
+                continue;
+            }
+            if (depth == 1 && p.current_token.type == TOKEN_FN && p.peek_token.type == TOKEN_IDENTIFIER) {
+                fe_advance(&p); // 'fn'
+                int mi = c->nmethods;
+                if (mi < TEKO_CLASS_MAX_METHODS) {
+                    strncpy(c->methods[mi], p.current_token.lexeme, 95); c->methods[mi][95] = '\0';
+                    c->method_slot[mi] = slot;
+                    c->method_nparams[mi] = 0;
+                    c->nmethods++;
+                }
+                slot++; // every method consumes a routine slot, even if the table is full
+                fe_advance(&p); // method name
+                if (p.current_token.type == TOKEN_LPAREN) {
+                    fe_advance(&p);
+                    int expect = 1; // a param name follows '(' or ','
+                    while (p.current_token.type != TOKEN_RPAREN && p.current_token.type != TOKEN_EOF) {
+                        if (expect && p.current_token.type == TOKEN_IDENTIFIER) {
+                            if (mi < TEKO_CLASS_MAX_METHODS) c->method_nparams[mi]++;
+                            expect = 0;
+                        } else if (p.current_token.type == TOKEN_COMMA) expect = 1;
+                        fe_advance(&p);
+                    }
+                    if (p.current_token.type == TOKEN_RPAREN) fe_advance(&p);
+                }
+                while (p.current_token.type != TOKEN_LBRACE && p.current_token.type != TOKEN_RBRACE &&
+                       p.current_token.type != TOKEN_EOF) fe_advance(&p); // skip return-type annotation
+                if (p.current_token.type == TOKEN_LBRACE) { // skip the method body
+                    int d2 = 1; fe_advance(&p);
+                    while (p.current_token.type != TOKEN_EOF && d2 > 0) {
+                        if (p.current_token.type == TOKEN_LBRACE) d2++;
+                        else if (p.current_token.type == TOKEN_RBRACE) d2--;
+                        fe_advance(&p);
+                    }
+                }
+                continue;
+            }
+            fe_advance(&p);
+        }
+        g_nclass++;
+    }
+}
+
 // Pre-pass: assign each top-level `fn NAME` a table slot (declaration order), so a
-// main-level @dom.on(…, NAME) can resolve the handler reference before its body.
+// main-level @dom.on(…, NAME) can resolve the handler reference before its body. Class bodies
+// are skipped (their methods get slots in collect_classes, continuing the same counter).
 static void collect_functions(const char* source, ImportBinding** fns, int* nfns, int* capfns) {
     Lexer lx; lexer_init(&lx, source);
     Parser p; parser_init(&p, &lx);
@@ -1147,6 +1461,8 @@ static void collect_functions(const char* source, ImportBinding** fns, int* nfns
     while (p.current_token.type != TOKEN_EOF) {
         if (p.current_token.type == TOKEN_EXTERN) {
             skip_extern_decl(&p); // do not treat `extern fn` as a handler
+        } else if (p.current_token.type == TOKEN_CLASS) {
+            skip_class_decl(&p);  // methods are not top-level routines (see collect_classes)
         } else if (p.current_token.type == TOKEN_FN && p.peek_token.type == TOKEN_IDENTIFIER) {
             bind_add(fns, nfns, capfns, p.peek_token.lexeme, slot++);
             fe_advance(&p); // consume 'fn'
@@ -1209,6 +1525,7 @@ static void emit_handler_routines(const char* source, BytecodeBuffer* buffer,
 
     while (p.current_token.type != TOKEN_EOF) {
         if (p.current_token.type == TOKEN_EXTERN) { skip_extern_decl(&p); continue; }
+        if (p.current_token.type == TOKEN_CLASS) { skip_class_decl(&p); continue; } // methods: emit_method_routines
         if (p.current_token.type != TOKEN_FN) { fe_advance(&p); continue; }
         fe_advance(&p); // consume 'fn'
         if (p.current_token.type != TOKEN_IDENTIFIER) continue;
@@ -1283,6 +1600,92 @@ static void emit_handler_routines(const char* source, BytecodeBuffer* buffer,
     }
 }
 
+// Phase 15 (15.A): emit each class method body as a table routine (slots assigned in
+// collect_classes, continuing after the top-level fns). A method takes its instance as the
+// leading `self` param (bound from spawn arg 0) plus any explicit params; `self`'s class is
+// recorded so `self.field` / `self.method(...)` resolve at compile time. Body lowering reuses
+// the SAME statement dispatcher as $main and `fn` handlers, so methods compose loops/branches/
+// field access/method calls. Walks classes/methods in the SAME order collect_classes assigned
+// slots, so the routine table stays dense and correct.
+static void emit_method_routines(const char* source, BytecodeBuffer* buffer,
+                                 ImportBinding* fns, int nfns,
+                                 ImportBinding* binds, int nb, TempAlloc* ta) {
+    Lexer lx; lexer_init(&lx, source);
+    Parser p; parser_init(&p, &lx);
+    while (p.current_token.type != TOKEN_EOF) {
+        if (p.current_token.type != TOKEN_CLASS || p.peek_token.type != TOKEN_IDENTIFIER) {
+            fe_advance(&p); continue;
+        }
+        fe_advance(&p); // 'class'
+        int ci = class_find(p.current_token.lexeme);
+        fe_advance(&p); // class name
+        while (p.current_token.type != TOKEN_LBRACE && p.current_token.type != TOKEN_EOF) fe_advance(&p);
+        if (p.current_token.type == TOKEN_LBRACE) fe_advance(&p);
+        int depth = 1;
+        while (p.current_token.type != TOKEN_EOF && depth > 0) {
+            if (p.current_token.type == TOKEN_LBRACE) { depth++; fe_advance(&p); continue; }
+            if (p.current_token.type == TOKEN_RBRACE) { depth--; fe_advance(&p); continue; }
+            if (!(depth == 1 && p.current_token.type == TOKEN_FN &&
+                  p.peek_token.type == TOKEN_IDENTIFIER)) { fe_advance(&p); continue; }
+
+            fe_advance(&p); // 'fn'
+            char mname[96]; strncpy(mname, p.current_token.lexeme, 95); mname[95] = '\0';
+            int midx = class_method_idx(ci, mname);
+            int slot = (ci >= 0 && midx >= 0) ? g_class[ci].method_slot[midx] : 0;
+            fe_advance(&p); // method name
+
+            char params[8][96]; int nparams = 0;
+            if (p.current_token.type == TOKEN_LPAREN) {
+                fe_advance(&p);
+                int expect = 1;
+                while (p.current_token.type != TOKEN_RPAREN && p.current_token.type != TOKEN_EOF) {
+                    if (expect && p.current_token.type == TOKEN_IDENTIFIER && nparams < 8) {
+                        strncpy(params[nparams], p.current_token.lexeme, 95); params[nparams][95] = '\0';
+                        nparams++; expect = 0;
+                    } else if (p.current_token.type == TOKEN_COMMA) expect = 1;
+                    fe_advance(&p);
+                }
+                if (p.current_token.type == TOKEN_RPAREN) fe_advance(&p);
+            }
+            while (p.current_token.type != TOKEN_LBRACE && p.current_token.type != TOKEN_EOF) fe_advance(&p);
+            if (p.current_token.type == TOKEN_LBRACE) fe_advance(&p);
+
+            codegen_li_emit_func_begin(buffer, slot);
+            if (nparams > 0) codegen_li_emit_store(buffer); // $w1 = arg0 (parity with the handler ABI)
+
+            LowerCtx ctx;
+            ctx.param_name = nparams > 0 ? params[0] : NULL;
+            ctx.fns = fns; ctx.nfns = nfns;
+            ctx.locals = NULL; ctx.nlocals = 0; ctx.ta = ta;
+            ta->next_temp = 0;
+            ImportBinding* rlocals = NULL; int rnlocals = 0, rcaplocals = 0;
+            LowerEnv renv;
+            renv.locals = &rlocals; renv.nlocals = &rnlocals; renv.caplocals = &rcaplocals;
+            renv.binds = &binds; renv.nb = &nb; renv.ctx = &ctx;
+
+            localcls_reset(); // method scope: self (+ any objects it instantiates) are class-typed
+            for (int pi = 0; pi < nparams; pi++) {
+                int ps = env_alloc_local(&renv, params[pi]);
+                codegen_li_emit_load_spawn_arg(buffer, pi); // $w0 = args[pi]
+                codegen_li_emit_store_local(buffer, ps);
+            }
+            // The leading param IS the instance: bind it to this method's class so member access
+            // inside the body resolves (`self.x` -> OP_OBJ_GET, `self.m()` -> OP_CALL_FUNC).
+            if (nparams > 0 && ci >= 0) localcls_set(params[0], ci);
+
+            while (p.current_token.type != TOKEN_RBRACE && p.current_token.type != TOKEN_EOF) {
+                lower_one_stmt(buffer, &p, &renv);
+            }
+            if (p.current_token.type == TOKEN_RBRACE) fe_advance(&p);
+
+            for (int i = 0; i < rnlocals; i++) free(rlocals[i].name);
+            free(rlocals);
+            codegen_li_emit_func_end(buffer);
+        }
+    }
+    localcls_reset();
+}
+
 int teko_compile_interop(const char* source, BytecodeBuffer* buffer) {
     if (!source || !buffer) return 1;
 
@@ -1299,6 +1702,12 @@ int teko_compile_interop(const char* source, BytecodeBuffer* buffer) {
     ImportBinding* fns = NULL;
     int nfns = 0, capfns = 0;
     collect_functions(source, &fns, &nfns, &capfns);
+
+    // Phase 15 (15.A): pre-pass the class layouts + method table. Method routine slots continue
+    // the global counter after the top-level fns (nfns), so the routine function table stays dense
+    // across handlers + methods. localcls is the per-scope instance->class map; reset for $main.
+    collect_classes(source, nfns);
+    localcls_reset();
 
     // Phase 12: named local variables ($v0..) declared with `let`/`mut` at top level.
     ImportBinding* locals = NULL;
@@ -1388,6 +1797,12 @@ int teko_compile_interop(const char* source, BytecodeBuffer* buffer) {
                 register_extern(buffer, node, &binds, &nb, &capb);
                 free_ffi_ast_node(node);
             }
+        } else if (parser.current_token.type == TOKEN_CLASS) {
+            // Phase 15 (15.A): a class declaration emits no top-level code; its layout/methods
+            // were pre-collected, and method bodies are emitted after $main (emit_method_routines).
+            skip_class_decl(&parser);
+        } else if (lower_member_stmt(buffer, &parser, &top_env)) {
+            // Phase 15 (15.A): top-level `obj.field = expr;` / `obj.method(args);`.
         } else if (parser.current_token.type == TOKEN_FN) {
             // Handler declaration: skip its body in the main pass; it is emitted as a
             // table routine after main's HALT (emit_handler_routines).
@@ -1528,6 +1943,11 @@ int teko_compile_interop(const char* source, BytecodeBuffer* buffer) {
     // Emit handler bodies as table routines (after main), so @dom.on references resolve.
     // (May raise the temp high-water for nested args inside handler bodies.)
     emit_handler_routines(source, buffer, fns, nfns, binds, nb, &ta);
+
+    // Phase 15 (15.A): emit class method bodies as table routines (after the handlers; their
+    // slots continue past nfns, matching collect_classes). Methods may use named locals + temps,
+    // so this also feeds the shared $v high-water below.
+    emit_method_routines(source, buffer, fns, nfns, binds, nb, &ta);
 
     // Phase 12: how many $v locals to declare per function — named locals plus the
     // expression/nested-arg temp high-water (across $main and the handler routines).
