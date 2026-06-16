@@ -62,6 +62,8 @@ const char* teko_native_runtime_symbol(int32_t id, int* out_arity) {
         case 56: sym = "teko_rt_to_radix";         arity = 2; break; // (v, radix) -> base str
         case 57: sym = "teko_rt_pad";              arity = 2; break; // (v, width) -> zero-padded
         case 58: sym = "teko_rt_group";            arity = 1; break; // (v) -> "1,000,000"
+        case 53: sym = "teko_rt_parse_int";        arity = 1; break; // (str) -> i32 (checked)
+        case 55: sym = "teko_rt_parse_bool";       arity = 1; break; // (str) -> 0/1 (checked)
         case 6: sym = "teko_rt_md5_hex";       break; // legacy
         case 7: sym = "teko_rt_sha1_hex";      break; // legacy
         case 8: sym = "teko_rt_uuid_v3";       break;

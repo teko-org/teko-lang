@@ -21,6 +21,7 @@ static int wasm_is_crypto_ext_id(int id) {
         case 37: case 38: case 39: case 40:                         // RSA
         case 44: case 45: case 46: case 47: case 48:               // wall-clock / timezone surface
         case 49: case 51: case 52:                                  // Phase 16 conversion surface
+        case 53: case 55:                                           // Phase 16.F checked parse
         case 56: case 57: case 58:                                  // Phase 16.E explicit formats
             return 1;
         default: return 0;

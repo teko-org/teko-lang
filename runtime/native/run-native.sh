@@ -33,6 +33,25 @@ check() {
   echo "OK: $base -> [$got]"
 }
 
+# Phase 16 (16.F): a FAIL-LOUD case — the program must exit NON-ZERO and print <diag> to stderr
+# (a checked conversion that rejects its input must not silently truncate). <pre> is the stdout
+# emitted before the abort.
+check_fail() {
+  local sample="$1" pre="$2" diag="$3"
+  local base exe out err rc
+  base="$(basename "$sample" .tks)"
+  exe="$TMP/$base"
+  echo "--- $sample (fail-loud) ---"
+  "$TEKO" build "$HERE/samples/$sample" --target=host --rt-lib="$RTLIB" -o "$exe" \
+    || fail "compile/link failed for $sample"
+  set +e; out="$("$exe" 2>"$TMP/$base.err")"; rc=$?; set -e   # the abort is EXPECTED (errexit off)
+  err="$(cat "$TMP/$base.err")"
+  [ "$rc" -ne 0 ] || fail "$base: expected non-zero exit (fail-loud), got 0"
+  [ "$out" = "$pre" ] || fail "$base: expected stdout [$pre], got [$out]"
+  case "$err" in *"$diag"*) : ;; *) fail "$base: stderr [$err] missing [$diag]";; esac
+  echo "OK: $base -> exit $rc, stderr contains [$diag]"
+}
+
 # Real-time waiters: assert exact stdout AND a LOWER BOUND on real wall-clock elapsed (the time
 # base is the real monotonic clock, so we assert >= min_ms with tolerance, not an exact duration).
 # Timed via perl Time::HiRes (portable; macOS `date` lacks %N).
@@ -156,6 +175,17 @@ ff
 hex = ff
 EXP
 )"
+# Phase 16 (16.F): CHECKED string->primitive parse (ids 53/55). Happy path returns the value
+# (auto-to_string'd back on concat); the fail-loud path aborts non-zero with a stderr diagnostic.
+check parse.tks "$(cat <<'EXP'
+n = 123
+neg = -42
+ws = 7
+true
+false
+EXP
+)"
+check_fail parse_fail.tks "before" "convert.parse_int: invalid integer"
 # Phase 15 (15.A): concrete class — fields + methods + STATIC dispatch, zero runtime reflection.
 # `Point()` -> OP_OBJ_NEW; `p.x = 3` -> OP_OBJ_SET; `p.sum()`/`p.scale(10)` -> OP_CALL_FUNC
 # (the method routine reads `self.x`/`self.y` via OP_OBJ_GET). Prints 7 (3+4) then 70 ((3+4)*10).

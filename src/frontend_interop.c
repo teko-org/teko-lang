@@ -358,6 +358,15 @@ static int localcls_get(const char* n) {
 // reflection (the slot / field layout are compile-time constants).
 #define TEKO_VT_OBJ_BASE 2
 
+// Phase 16: the value-type a runtime primitive (OP_CALL_RUNTIME id) leaves in $w0. Almost all
+// codec/convert/hash/format ids return a string POINTER (VT_STR); the CHECKED parsers (16.F) return
+// an integer (VT_INT) — so `"n=" + convert.parse_int(s)` concatenates correctly (the int is then
+// auto-`to_string`'d), not treated as a pointer.
+static int runtime_result_vt(int id) {
+    return (id == 53 || id == 55) ? TEKO_VT_INT : TEKO_VT_STR; // parse_int / parse_bool
+}
+static int codec_id_for(const char* lex); // fwd (defined with the codec surface below)
+
 // Set by lower_init_value to the value-type of the initializer it just lowered, so lower_let_stmt /
 // lower_reassign can remember a string-typed local (read like g_last_inst_class).
 static int g_last_init_vt = TEKO_VT_INT;
@@ -601,10 +610,12 @@ static int eval_primary(BytecodeBuffer* b, Parser* p, const LowerCtx* ctx, TempA
         free(sv); fe_advance(p);
         return TEKO_VT_STR;
     } else if (is_codec_head(p)) {
-        // Phase 16 (16.B): a codec / convert / hash call primary returns a string POINTER (VT_STR) —
-        // e.g. `convert.int_to_str(n)` or `hash.sha256(x)` appearing inside a concat expression.
+        // Phase 16 (16.B/16.F): a codec / convert / hash call primary — most return a string pointer
+        // (VT_STR); the checked parsers return an int (VT_INT). So `"n=" + convert.parse_int(s)`
+        // concatenates correctly (the int is auto-`to_string`'d), not mistaken for a pointer.
+        int id = codec_id_for(p->current_token.lexeme);
         lower_base_codec(b, p, ctx);
-        return TEKO_VT_STR;
+        return runtime_result_vt(id);
     } else if (p->current_token.type == TOKEN_LPAREN) {
         fe_advance(p);
         int vt = eval_expr_prec(b, p, ctx, 1, ta);
@@ -900,6 +911,9 @@ static int codec_id_for(const char* lex) {
     if (strcmp(lex, "convert.to_radix") == 0)    return 56; // (v, base 2..36)
     if (strcmp(lex, "convert.pad") == 0)         return 57; // (v, width)
     if (strcmp(lex, "convert.group") == 0)       return 58; // (v) -> thousands-grouped
+    // Phase 16.F — CHECKED parse (string -> primitive; fail-loud on malformed input).
+    if (strcmp(lex, "convert.parse_int") == 0)   return 53; // (str) -> i32
+    if (strcmp(lex, "convert.parse_bool") == 0)  return 55; // (str) -> 0/1
     return -1;
 }
 
@@ -1250,7 +1264,8 @@ static void lower_init_value(BytecodeBuffer* b, Parser* p, LowerEnv* env) {
     } else if (p->current_token.type == TOKEN_MACRO_IDENT && is_dom_macro(p->current_token.lexeme) &&
                p->peek_token.type == TOKEN_LPAREN) {
         lower_intrinsic_call(b, p, ctx);
-    } else if (is_codec_head(p))   { lower_base_codec(b, p, ctx); g_last_init_vt = TEKO_VT_STR; }
+    } else if (is_codec_head(p))   { int id = codec_id_for(p->current_token.lexeme);
+                                     lower_base_codec(b, p, ctx); g_last_init_vt = runtime_result_vt(id); }
     else if (is_duplex_head(p))    { lower_duplex_call(b, p, ctx); }
     else if (is_delayed_head(p))   { lower_delayed_call(b, p, ctx); }
     else if (is_bcast_head(p))     { lower_bcast_call(b, p, ctx); }

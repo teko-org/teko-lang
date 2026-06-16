@@ -823,3 +823,25 @@ char* teko_rt_str_concat(const char* a, const char* b) { return teko_convert_str
 char* teko_rt_to_radix(int v, int radix) { return teko_convert_i64_to_radix((long long)v, radix); }
 char* teko_rt_pad(int v, int width)      { return teko_convert_i64_pad((long long)v, width); }
 char* teko_rt_group(int v)               { return teko_convert_i64_grouped((long long)v, ','); }
+
+// Phase 16.F — CHECKED parse (fail-loud). A malformed/overflowing input does NOT silently return 0
+// (no silent truncation/UB): it aborts the program. Native prints a diagnostic to stderr and exits
+// non-zero; the wasm32 reactor traps (`unreachable` -> a WebAssembly RuntimeError the host sees).
+static void teko_rt_die(const char* msg) {
+#if defined(__wasm__)
+    (void)msg; __builtin_trap();
+#else
+    fputs("teko: ", stderr); fputs(msg, stderr); fputs("\n", stderr);
+    exit(70); // EX_DATAERR
+#endif
+}
+int teko_rt_parse_int(const char* s) {
+    long long v;
+    if (!teko_convert_parse_i64(s, &v)) teko_rt_die("convert.parse_int: invalid integer");
+    return (int)v;
+}
+int teko_rt_parse_bool(const char* s) {
+    int v;
+    if (!teko_convert_parse_bool(s, &v)) teko_rt_die("convert.parse_bool: invalid boolean");
+    return v;
+}

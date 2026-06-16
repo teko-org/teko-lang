@@ -218,5 +218,8 @@ char* teko_rt_str_concat(const char* a, const char* b); // id 52: a ‖ b
 char* teko_rt_to_radix(int v, int radix);              // id 56: base 2..36 (hex/oct/bin/…)
 char* teko_rt_pad(int v, int width);                   // id 57: zero-pad to a min width
 char* teko_rt_group(int v);                            // id 58: thousands grouping with ','
+// Phase 16.F — CHECKED parse (fail-loud: aborts native / traps wasm on malformed input).
+int teko_rt_parse_int(const char* s);                  // id 53: string -> i32 (checked)
+int teko_rt_parse_bool(const char* s);                 // id 55: "true"/"false" -> 0/1 (checked)
 
 #endif // TEKO_RT_H
