@@ -24,6 +24,7 @@
 #include "teko_time.h"
 #include "teko_object.h"
 #include "teko_vtable.h"
+#include "teko_convert.h"
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -811,3 +812,10 @@ long teko_rt_vtable_set(long type_id, long method_id, long slot) {
 long teko_rt_vtable_get(long type_id, long method_id) {
     return teko_vtable_get(type_id, method_id);
 }
+
+// Phase 16 (Casting / Type Conversions & Parsing) — culture-invariant conversion surface.
+// teko_convert.c is the source of truth (linked natively, compiled into the wasm32 reactor). The
+// value-carrying params are i32 to match the accumulator/reactor ABI; the full i64 core is KAT'd.
+char* teko_rt_int_to_string(int v)  { return teko_convert_i64_to_string((long long)v); }
+char* teko_rt_bool_to_string(int v) { return teko_convert_bool_to_string(v); }
+char* teko_rt_str_concat(const char* a, const char* b) { return teko_convert_str_concat(a, b); }

@@ -640,6 +640,14 @@ static int codec_id_for(const char* lex) {
     // UUID name-based generators (deterministic; DNS namespace) — ids 8/9.
     if (strcmp(lex, "uuid.v3") == 0) return 8;
     if (strcmp(lex, "uuid.v5") == 0) return 9;
+    // Phase 16 (Casting / Conversions & Parsing) — culture-invariant conversion surface, string-
+    // returning like the crypto/time ids. `convert.int_to_str(n)` lowers n (an int immediate/local)
+    // in $w0; `convert.str_concat(a, b)` stages a + leaves b in $w0 (arity 2). The lexer folds
+    // `convert.int_to_str` into ONE dotted identifier (same rule as `time.now_unix`). Parse +
+    // explicit-format + the auto-call on concat/interpolation are later 16.x sub-blocks.
+    if (strcmp(lex, "convert.int_to_str") == 0)  return 49;
+    if (strcmp(lex, "convert.bool_to_str") == 0) return 51;
+    if (strcmp(lex, "convert.str_concat") == 0)  return 52;
     return -1;
 }
 
@@ -668,6 +676,7 @@ static int runtime_arity(int id) {
         case 38: return 4; // rsa_pss_verify(n, e, mhash, sig)
         case 39: return 3; // rsa_oaep_encrypt(n, e, msg)
         case 40: return 3; // rsa_oaep_decrypt(n, d, ct)
+        case 52: return 2; // convert.str_concat(a, b)
         default: return 1;
     }
 }

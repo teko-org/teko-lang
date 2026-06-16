@@ -206,4 +206,13 @@ long teko_rt_object_free(long handle);                 // -> 0
 long teko_rt_vtable_set(long type_id, long method_id, long slot); // -> 0
 long teko_rt_vtable_get(long type_id, long method_id);            // -> slot (-1 if unset)
 
+// Phase 16 (Casting / Type Conversions & Parsing) — culture-invariant conversion surface
+// (OP_CALL_RUNTIME ids 49/51/52). String-returning, like the crypto/time surface; the teko_convert
+// C runtime (src/runtime/teko_convert.c) is the source of truth (linked natively, compiled into the
+// wasm32 reactor). The value-carrying params are i32 to match the accumulator/reactor ABI ($w0 is
+// i32 on WASM); the full-range i64 core is exercised directly by the Unity KATs.
+char* teko_rt_int_to_string(int v);                    // id 49: signed decimal
+char* teko_rt_bool_to_string(int v);                   // id 51: "true"/"false"
+char* teko_rt_str_concat(const char* a, const char* b); // id 52: a ‖ b
+
 #endif // TEKO_RT_H

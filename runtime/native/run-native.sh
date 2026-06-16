@@ -102,6 +102,17 @@ check_uuid() {
 }
 
 check hello.tks "hello from teko native"
+# Phase 16 (16.A): culture-invariant conversion surface — int/bool to_string + str_concat
+# (OP_CALL_RUNTIME ids 49/51/52 -> teko_rt_* over the portable teko_convert.c source of truth).
+# Asserts the locale-invariant default: `.`-decimal, NO digit grouping, canonical "true"/"false".
+check convert.tks "$(cat <<'EXP'
+42
+1000000
+true
+false
+x = 42
+EXP
+)"
 # Phase 15 (15.A): concrete class — fields + methods + STATIC dispatch, zero runtime reflection.
 # `Point()` -> OP_OBJ_NEW; `p.x = 3` -> OP_OBJ_SET; `p.sum()`/`p.scale(10)` -> OP_CALL_FUNC
 # (the method routine reads `self.x`/`self.y` via OP_OBJ_GET). Prints 7 (3+4) then 70 ((3+4)*10).

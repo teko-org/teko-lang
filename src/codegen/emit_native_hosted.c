@@ -55,6 +55,10 @@ const char* teko_native_runtime_symbol(int32_t id, int* out_arity) {
         case 46: sym = "teko_rt_time_now_utc";     arity = 1; break; // ignored arg
         case 47: sym = "teko_rt_time_format_local"; arity = 1; break; // (epoch str)
         case 48: sym = "teko_rt_time_format_utc";  arity = 1; break; // (epoch str)
+        // Phase 16 (Casting / Conversions & Parsing) — culture-invariant conversion surface.
+        case 49: sym = "teko_rt_int_to_string";    arity = 1; break; // (i32) -> decimal str
+        case 51: sym = "teko_rt_bool_to_string";   arity = 1; break; // (0/1) -> "true"/"false"
+        case 52: sym = "teko_rt_str_concat";       arity = 2; break; // (a, b) -> a‖b
         case 6: sym = "teko_rt_md5_hex";       break; // legacy
         case 7: sym = "teko_rt_sha1_hex";      break; // legacy
         case 8: sym = "teko_rt_uuid_v3";       break;
