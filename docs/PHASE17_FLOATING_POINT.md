@@ -336,3 +336,45 @@ approval never renumbers anything:
 These are claimed **only as documentation/comments** (exactly like the `0x76`/`0x82` float
 reservations) — **no enum constants, no emitted opcodes, no live token** (no dead-token gate trip),
 **no orphan reference**.
+
+### Status — 17.F.1 (the 256-byte exact base-10 `decimal` runtime CORE) is DONE
+Runtime + KATs only (NO language surface / opcodes / frontend — those are 17.F.3/.4; this mirrors
+the parse/format cores that landed without surface in 16.A/17.C). Additive: NO emitter/frontend/
+opcode file was touched, so the 16 native goldens and all prior native/WASM proofs are byte-identical.
+- **Value type** `src/runtime/teko_decimal.h` — the owner-LOCKED 256-byte `teko_decimal`
+  (`uint8_t sign,scale,flags,_pad[5]; uint64_t limb[31]`), value = (-1)^sign·COEFF·10^(-scale),
+  COEFF = LE unsigned 1984-bit integer, scale 0–38, always finite. `_Static_assert(sizeof==256)` +
+  `_Static_assert(_Alignof==8)` (hold on Apple/Linux clang AND `--target=wasm32 -ffreestanding
+  -nostdlib`). ABI = ALWAYS by pointer.
+- **Runtime** `src/runtime/teko_decimal.c` — self-contained 64-bit-limb arithmetic with banker's
+  rounding: portable `umul64` (no `__int128`), `bn_add/sub/cmp/mul`, `bn_mul_pow10`, `bn_divmod`
+  (**Knuth Algorithm D**, base 2^32 half-limbs), `bn_round_drop_decimals` (round-half-to-even). All
+  temps are fixed-size stack arrays (≤64 limbs); NO `__int128`/libm/`snprintf`/`malloc`. Public API
+  (by pointer, int 1=ok/0=fail-loud): `teko_decimal_add/sub/mul/div/mod`, `teko_decimal_cmp`,
+  `teko_decimal_zero`, and the test helper `teko_decimal_from_components`.
+- **Semantics (pinned; the file's header is the canonical statement):** each op computes the EXACT
+  result then (1) banker's-rounds to scale 38 only if it needs >38 frac digits, (2) fails-loud on
+  coeff ≥ 2^1984 or div/mod-by-zero. Per-op: add/sub align to max scale; mul scale = sa+sb (cap 38);
+  div to scale 38 (guard-digit + sticky banker's); mod = `a - trunc(a/b)·b` (Python
+  `Decimal.__mod__`, `//` toward zero), result scale = max(a.scale,b.scale); cmp aligns in a wide
+  temp, ±0 equal. Results stored UN-NORMALIZED at the natural scale. **Owner-confirmation note:**
+  the one place the C and the Python oracle initially disagreed was the *scale of a zero `mod`
+  remainder* — Python's `Decimal` subtraction picks its own zero-exponent; the C's exact `a−t·b`
+  lands at `max(a.scale,b.scale)`. Resolved by pinning the oracle to the C's deterministic rule
+  (the well-defined choice). No other ambiguity surfaced.
+- **KATs** `tools/gen_decimal_kats.py` (committed generator, fixed-seed LCG, Python `decimal`
+  oracle: prec≥600, `ROUND_HALF_EVEN`) emits `tests/runtime/teko_decimal_kat_vectors.h` (committed):
+  **1326 vectors** (1311 ok / 15 expect_fail), each operand+result in the exact 256-byte LE encoding.
+  Covers all ops, scales 0–38, negatives/±0, banker's ties, non-terminating div (1/3, 2/7, n/{3,7,9,
+  11,13,17,23} at scale 38 — the Knuth-division safety net), near-590-digit operands, coeff overflow
+  & div/mod-by-zero → expect_fail. `tests/runtime/test_decimal.c` asserts the ok-flag AND (on ok)
+  `memcmp(out,expected,256)==0` byte-for-byte; registered in `tests/test_main.c`.
+- **Build wiring:** `teko_decimal.c` added to CMake `CORE_SOURCES` + the `teko_rt` archive, and to
+  `build-crypto-reactor.sh` SRCS (compile-only, NOT EXPORTS — no surface yet; the reactor still links).
+- **Verification:** suite **241/241** (238 + struct-layout + from-components + the 1326-vector KAT);
+  ASan+UBSan clean on BOTH dispatch paths; TSan clean; wasm32 freestanding compile + `_Static_assert`s
+  confirmed; 16 native goldens + all prior proofs byte-identical; no `__int128`/libm/`snprintf`/`malloc`
+  in `teko_decimal.c`.
+
+Next: **17.F.2** (decimal parse/format core, reusing the 17.C/17.E patterns) → **17.F.3/.4** (the
+opcodes + language surface + checked casts). 17.F.1 is the source of truth those build on.
