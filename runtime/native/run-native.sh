@@ -135,6 +135,16 @@ braces { } kept
 [42]
 EXP
 )"
+# Phase 16 (16.D): user-defined-type to_string in concat/interpolation. A class with a to_string
+# method dispatches it (via OP_CALL_FUNC); a class without one gets the synthesized default
+# ClassName(fields). Zero runtime reflection.
+check tostring.tks "$(cat <<'EXP'
+temp is T=25
+[T=25]
+point = Point(3, 4)
+p=Point(3, 4)
+EXP
+)"
 # Phase 15 (15.A): concrete class — fields + methods + STATIC dispatch, zero runtime reflection.
 # `Point()` -> OP_OBJ_NEW; `p.x = 3` -> OP_OBJ_SET; `p.sum()`/`p.scale(10)` -> OP_CALL_FUNC
 # (the method routine reads `self.x`/`self.y` via OP_OBJ_GET). Prints 7 (3+4) then 70 ((3+4)*10).
