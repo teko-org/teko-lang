@@ -169,6 +169,12 @@ extern void test_teko_time_format_utc(void);
 extern void test_teko_time_format_offset(void);
 extern void test_teko_time_days_from_civil_roundtrip(void);
 extern void test_teko_time_epoch_str_and_parse(void);
+extern void test_teko_convert_i64_to_string(void);
+extern void test_teko_convert_bool_to_string(void);
+extern void test_teko_convert_str_concat(void);
+extern void test_teko_convert_parse_i64_valid(void);
+extern void test_teko_convert_parse_i64_invalid(void);
+extern void test_teko_convert_parse_bool(void);
 extern void test_teko_runtime_arena_thread_isolation_and_alignment(void);
 extern void test_teko_crypto_md5_rfc1321_vectors(void);
 extern void test_teko_crypto_md5_streaming_matches_oneshot(void);
@@ -414,6 +420,12 @@ int main(void) {
     RUN_TEST(test_teko_time_format_offset);
     RUN_TEST(test_teko_time_days_from_civil_roundtrip);
     RUN_TEST(test_teko_time_epoch_str_and_parse);
+    RUN_TEST(test_teko_convert_i64_to_string);
+    RUN_TEST(test_teko_convert_bool_to_string);
+    RUN_TEST(test_teko_convert_str_concat);
+    RUN_TEST(test_teko_convert_parse_i64_valid);
+    RUN_TEST(test_teko_convert_parse_i64_invalid);
+    RUN_TEST(test_teko_convert_parse_bool);
     RUN_TEST(test_teko_runtime_arena_thread_isolation_and_alignment);
 
     RUN_TEST(test_teko_crypto_md5_rfc1321_vectors);
