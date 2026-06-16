@@ -87,9 +87,20 @@ surface; integer/float values are marshalled as their canonical string form into
     **16.D**. Concatenating a *codec/convert call result* directly (`convert.int_to_str(x) + "y"`)
     needs binding to a local first (`let s = …; "y" + s`) — the one-token-lookahead arg detector
     can't see the operator past the call's `)`; documented, not a dead token.
-- **16.C — Interpolation auto-`to_string`.** `"pre{e}post"` (the lexer already tokenizes
-  `TOKEN_STRING_INTERPOLATED` / `_RAW_INTERP`) lowers to nested concat + per-hole `to_string`.
-  **MEDIUM** (size depends on how much interpolation parsing already exists — to be scoped at 16.C open).
+- **16.C — Interpolation auto-`to_string`. ✅ DONE & locally green both targets.** A double-quoted
+  literal with a `{expr}` hole interpolates: `strlit_is_interp` flags a brace-bearing literal, and
+  `lower_interp_string` builds the result by concatenating literal chunks with per-hole
+  `to_string(expr)` — reusing 16.B's `str_concat` (id 52) + `to_string` (id 49). Each hole is
+  re-lexed through a sub-`Parser` sharing the lowering `ctx` (so locals/temps resolve), so a hole
+  can hold any expression (`"sum = {n + 8}"`). `{{`/`}}` are literal braces. Routed from
+  `eval_primary`, the call-arg expression path (bare `emit("{n}")`), and `lower_init_value`
+  (`let s = "[{n}]"`). Proofs `runtime/{native,wasm}/samples/interp.tks` → `x = 42 / 42 items, 42
+  total / sum = 50 / count: 42 / braces { } kept / [42]` (byte-identical).
+  - **Design decision (documented):** the interop frontend treats a brace-bearing double-quoted
+    `"…"` as interpolated (matching the owner's `"{p}"` surface) — a lone `{` opens a hole, `{{`/`}}`
+    escape a literal brace. The separate full-AST backtick interpolation subsystem
+    (`parser_string.c`, `TOKEN_STRING_INTERPOLATED`) is unchanged; this is the interop-frontend
+    lowering path. No existing sample has a brace-bearing string literal (no regression).
 - **16.D — User-defined-type `to_string` in concat/interpolation.** Concrete receiver →
   `OP_CALL_FUNC` to the `to_string` slot; abstract/trait receiver → vtable slot. When absent,
   synthesize the culture-invariant default (per-type field-walk generator). **MEDIUM** (reuses the

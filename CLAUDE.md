@@ -340,6 +340,9 @@ landed in 16.A but its surface is deferred to **16.F**. Sub-block **16.B is DONE
 the core deliverable): auto-`to_string` on `+` — value-type tracking in the frontend makes `"a" + n`
 culture-invariant concatenation (int operand auto-converted via id 49 + `str_concat` id 52), string
 locals tracked, extern call args accept expressions; proofs `concat.tks` → `x = 42/sum = 50/42
-items/count: 42/n=42` (byte-identical). Order: 16.A ✅ → 16.B ✅ → 16.C interpolation → 16.D
-user-type `to_string` dispatch + synth default → 16.E explicit-format → 16.F checked inter-type
-conversions (+ a float-formatting step).
+items/count: 42/n=42` (byte-identical). Sub-block **16.C is DONE** (locally green): string
+INTERPOLATION — a `"…{expr}…"` literal interpolates each hole (auto-`to_string`, re-lexed through a
+sub-parser sharing the ctx), `{{`/`}}` escape; proofs `interp.tks` → `x = 42/42 items, 42
+total/sum = 50/count: 42/braces { } kept/[42]`. Order: 16.A ✅ → 16.B ✅ → 16.C ✅ → 16.D user-type
+`to_string` dispatch + synth default → 16.E explicit-format → 16.F checked inter-type conversions
+(+ a float-formatting step).
