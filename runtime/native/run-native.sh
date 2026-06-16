@@ -124,6 +124,17 @@ count: 42
 n=42
 EXP
 )"
+# Phase 16 (16.C): string INTERPOLATION — `"…{expr}…"` interpolates each hole (auto-to_string),
+# `{{`/`}}` are literal braces. Same str_concat machinery as 16.B; culture-invariant.
+check interp.tks "$(cat <<'EXP'
+x = 42
+42 items, 42 total
+sum = 50
+count: 42
+braces { } kept
+[42]
+EXP
+)"
 # Phase 15 (15.A): concrete class — fields + methods + STATIC dispatch, zero runtime reflection.
 # `Point()` -> OP_OBJ_NEW; `p.x = 3` -> OP_OBJ_SET; `p.sum()`/`p.scale(10)` -> OP_CALL_FUNC
 # (the method routine reads `self.x`/`self.y` via OP_OBJ_GET). Prints 7 (3+4) then 70 ((3+4)*10).

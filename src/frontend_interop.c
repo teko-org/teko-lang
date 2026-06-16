@@ -534,6 +534,24 @@ static int eval_expr_prec(BytecodeBuffer* b, Parser* p, const LowerCtx* ctx,
                           int min_prec, TempAlloc* ta);
 static int is_codec_head(const Parser* p);   // fwd (defined with the codec surface below)
 static void lower_base_codec(BytecodeBuffer* b, Parser* p, const LowerCtx* ctx); // fwd
+static int lower_interp_string(BytecodeBuffer* b, Parser* p, const LowerCtx* ctx); // fwd (16.C)
+
+// Phase 16 (16.C): a STRING-INTERPOLATION literal — a `"…"` whose (unescaped) content contains a
+// `{expr}` hole (e.g. `"x = {n}"`, `"{p}"`). `{{`/`}}` are literal braces. The interop frontend
+// treats a brace-bearing double-quoted literal as interpolated (matching the owner's `"{p}"`
+// surface); a literal `{` is written `{{`. (The full-AST backtick interpolation subsystem in
+// parser_string.c is separate and unchanged.)
+static int strlit_is_interp(const char* lexeme) {
+    if (!lexeme) return 0;
+    // Any `{` (a `{expr}` hole, or the `{{` escape) routes through interpolation lowering, which
+    // also unescapes `{{`/`}}`. The `}}` escape is honored even with no `{` present. A literal brace
+    // in a double-quoted string is written `{{`/`}}` (a lone `{` opens an interpolation hole).
+    for (const char* s = lexeme; *s; s++) {
+        if (s[0] == '{') return 1;
+        if (s[0] == '}' && s[1] == '}') return 1;
+    }
+    return 0;
+}
 
 // Phase 15 (15.A): `obj.field` READ as an expression primary -> OP_OBJ_GET(handle, idx) -> $w0.
 // `obj` must be a class-typed local and `member` one of its fields (resolved at compile time).
@@ -563,6 +581,10 @@ static int eval_primary(BytecodeBuffer* b, Parser* p, const LowerCtx* ctx, TempA
         fe_advance(p);
         return TEKO_VT_INT;
     } else if (p->current_token.type == TOKEN_LIT_STR || p->current_token.type == TOKEN_STRING_LIT) {
+        if (strlit_is_interp(p->current_token.lexeme)) {
+            // Phase 16 (16.C): an interpolated literal `"…{expr}…"` -> concat of chunks + holes.
+            return lower_interp_string(b, p, ctx);
+        }
         // Phase 16 (16.B): a string-literal primary -> SCONST pointer in $w0 (VT_STR), so `"a" + x`
         // (or a bare string sub-expression) is recognized as concatenation, not arithmetic.
         char* sv = strip_quotes(p->current_token.lexeme);
@@ -632,6 +654,84 @@ static int eval_expr_prec(BytecodeBuffer* b, Parser* p, const LowerCtx* ctx,
         ta->next_temp--;                               // free temp
     }
     return vt_l;
+}
+
+// Phase 16 (16.C): lower an interpolated string literal `"…{expr}…"` to a single string pointer in
+// $w0 (VT_STR), built by concatenating literal chunks and per-hole `to_string(expr)` — the same
+// culture-invariant auto-`to_string` as `+`. Each hole's expression is re-lexed through a sub-parser
+// that shares THIS lowering ctx (so locals/temps resolve), then reuses str_concat (id 52). `{{`/`}}`
+// are literal braces. Current token is the string literal; it is consumed before returning.
+static int lower_interp_string(BytecodeBuffer* b, Parser* p, const LowerCtx* ctx) {
+    char* content = strip_quotes(p->current_token.lexeme);   // inner text, no surrounding quotes
+    TempAlloc* ta = ctx->ta;
+    int acc = ta->next_temp++;                                // accumulator temp (running result)
+    if (ta->next_temp > ta->hw) ta->hw = ta->next_temp;
+    int have_acc = 0;
+
+    // Append the string pointer currently in $w0 to the accumulator (str_concat, left-assoc).
+    #define INTERP_APPEND_W0() do {                                                       \
+        if (!have_acc) { codegen_li_emit_store_local(b, acc); have_acc = 1; }             \
+        else {                                                                            \
+            int tp = ta->next_temp++; if (ta->next_temp > ta->hw) ta->hw = ta->next_temp; \
+            codegen_li_emit_store_local(b, tp);          /* tp = piece */                 \
+            codegen_li_emit_load_local(b, acc); codegen_li_emit_setarg(b, 0); /* a0=acc */\
+            codegen_li_emit_load_local(b, tp);           /* $w0 = piece */                \
+            codegen_li_emit_call_runtime(b, 52);         /* $w0 = concat(acc, piece) */   \
+            codegen_li_emit_store_local(b, acc);                                          \
+            ta->next_temp--;                                                              \
+        }                                                                                 \
+    } while (0)
+
+    char lit[4096]; int ln = 0;
+    const char* s = content ? content : "";
+    while (*s) {
+        if (s[0] == '{' && s[1] == '{') { if (ln < (int)sizeof(lit)-1) lit[ln++]='{'; s += 2; continue; }
+        if (s[0] == '}' && s[1] == '}') { if (ln < (int)sizeof(lit)-1) lit[ln++]='}'; s += 2; continue; }
+        if (s[0] == '{') {
+            // Flush any pending literal chunk as a SCONST piece.
+            if (ln > 0) {
+                lit[ln] = '\0';
+                codegen_li_emit_sconst(b, codegen_li_add_string_constant(b, lit));
+                INTERP_APPEND_W0();
+                ln = 0;
+            }
+            // Extract the hole expression up to the matching '}' (brace-depth aware).
+            s++; // past '{'
+            char expr[1024]; int en = 0, depth = 1;
+            while (*s && depth > 0) {
+                if (*s == '{') depth++;
+                else if (*s == '}') { depth--; if (depth == 0) break; }
+                if (en < (int)sizeof(expr)-1) expr[en++] = *s;
+                s++;
+            }
+            expr[en] = '\0';
+            if (*s == '}') s++; // past closing '}'
+            // Re-lex + lower the hole expression with the SHARED ctx (locals/temps), then to_string.
+            Lexer sublx; lexer_init(&sublx, expr);
+            Parser subp; parser_init(&subp, &sublx);
+            int vt = eval_expr_prec(b, &subp, ctx, 1, ta);   // hole value → $w0
+            if (vt != TEKO_VT_STR) codegen_li_emit_call_runtime(b, 49); // auto-to_string(int)
+            INTERP_APPEND_W0();
+            continue;
+        }
+        if (ln < (int)sizeof(lit)-1) lit[ln++] = *s;
+        s++;
+    }
+    if (ln > 0) { // trailing literal chunk
+        lit[ln] = '\0';
+        codegen_li_emit_sconst(b, codegen_li_add_string_constant(b, lit));
+        INTERP_APPEND_W0();
+    }
+    if (!have_acc) { // empty / all-escaped → the empty string
+        codegen_li_emit_sconst(b, codegen_li_add_string_constant(b, ""));
+        codegen_li_emit_store_local(b, acc); have_acc = 1;
+    }
+    codegen_li_emit_load_local(b, acc); // result → $w0
+    ta->next_temp--;                    // free acc
+    #undef INTERP_APPEND_W0
+    if (content) free(content);
+    fe_advance(p); // consume the interpolated literal
+    return TEKO_VT_STR;
 }
 
 // --- base-encoding codecs (P12-G) -----------------------------------------------
@@ -1057,9 +1157,9 @@ static void lower_init_value(BytecodeBuffer* b, Parser* p, LowerEnv* env) {
     LowerCtx* ctx = env->ctx;
     g_last_init_vt = TEKO_VT_INT; // Phase 16 (16.B): default; the string-yielding cases set VT_STR
     if ((p->current_token.type == TOKEN_LIT_STR || p->current_token.type == TOKEN_STRING_LIT) &&
-        p12_tok_prec(p->peek_token.type) == 0) {
-        // A LONE string literal (no trailing operator). `"a" + x` falls through to eval_expr_prec,
-        // which lowers it as a concatenation (Phase 16.B auto-`to_string`).
+        p12_tok_prec(p->peek_token.type) == 0 && !strlit_is_interp(p->current_token.lexeme)) {
+        // A LONE, NON-interpolated string literal. `"a" + x` and `"{x}"` fall through to
+        // eval_expr_prec (→ eval_primary), lowered as concatenation / interpolation (16.B/16.C).
         char* sv = strip_quotes(p->current_token.lexeme);
         codegen_li_emit_sconst(b, codegen_li_add_string_constant(b, sv));
         free(sv); fe_advance(p);
@@ -1204,11 +1304,13 @@ static int try_lower_call_arg_expr(BytecodeBuffer* b, Parser* p, const LowerCtx*
                                    ImportBinding* locals, int nlocals,
                                    CallArg* arg, int* temps_used) {
     int is_paren = (p->current_token.type == TOKEN_LPAREN);
-    int is_prim  = (p->current_token.type == TOKEN_LIT_STR || p->current_token.type == TOKEN_STRING_LIT ||
-                    p->current_token.type == TOKEN_LIT_INT ||
+    int is_str   = (p->current_token.type == TOKEN_LIT_STR || p->current_token.type == TOKEN_STRING_LIT);
+    int is_prim  = (is_str || p->current_token.type == TOKEN_LIT_INT ||
                     (p->current_token.type == TOKEN_IDENTIFIER &&
                      bind_lookup(locals, nlocals, p->current_token.lexeme) >= 0));
-    if (!is_paren && !(is_prim && p12_tok_prec(p->peek_token.type) > 0)) return 0;
+    // Phase 16.C: a bare interpolated literal `"{n}"` (no trailing operator) is also an expression.
+    int is_interp = is_str && strlit_is_interp(p->current_token.lexeme);
+    if (!is_paren && !is_interp && !(is_prim && p12_tok_prec(p->peek_token.type) > 0)) return 0;
     TempAlloc* ta = ctx->ta;
     eval_expr_prec(b, p, ctx, 1, ta);                 // expression → $w0 (string ptr or int)
     int t = ta->next_temp++;
