@@ -1,26 +1,25 @@
-// Phase 14 (14.C) WASM — `delayed.*` timed channel via the runtime reactor.
-// OP_DELAYED_* import teko_rt_delayed_* from the compiled-C reactor (crypto.wasm) and share
-// its linear memory — the SAME delayed C runtime as the native runner. Messages sent out of
-// order are released in delivery-time order as the logical clock advances. env.log_int surfaces
-// the i32 results.
+// Phase 14 (14.C, real-time clock) WASM — `delayed.*` timed channel via the runtime reactor on the
+// REAL MONOTONIC clock (logical `advance` removed). OP_DELAYED_* import teko_rt_delayed_* from the
+// compiled-C reactor (crypto.wasm), which reads the host clock (env.teko_now_ns) and shares linear
+// memory — the SAME delayed C runtime as native. Sent out of deadline order (10@2ms, 20@6ms,
+// 30@4ms), they are poll-drained in real-deadline order: 10, 30, 20. env.log_int surfaces results.
 extern fn log_int(n: i32) from "env" as "log_int";
 
 let d = delayed.open(8);
-delayed.send(d, 30, 30);
-delayed.send(d, 10, 10);
-delayed.send(d, 20, 20);
+delayed.send(d, 10, 2);
+delayed.send(d, 20, 6);
+delayed.send(d, 30, 4);
 
-let p0 = delayed.poll(d);   // t=0: nothing due → NOT_READY (1)
-log_int(p0);                // 1
-
-delayed.advance(d, 15);
-let a = delayed.recv(d);
-log_int(a);                 // 10
-
-delayed.advance(d, 10);
-let b = delayed.recv(d);
-log_int(b);                 // 20
-
-delayed.advance(d, 10);
-let c = delayed.recv(d);
-log_int(c);                 // 30
+let guard = 0;
+loop {
+  guard = guard + 1;
+  if (guard > 2000000) { break; }
+  let st = delayed.poll(d);
+  if (st == 2) { break; }   // EMPTY
+  if (st == 4) { break; }   // CLOSED
+  if (st == 0) {            // due
+    let v = delayed.recv(d);
+    log_int(v);
+  }
+}
+delayed.close(d);

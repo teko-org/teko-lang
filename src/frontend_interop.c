@@ -529,7 +529,6 @@ static int delayed_op_for(const char* lex, int* arity) {
     if (!lex) return -1;
     if      (strcmp(lex, "delayed.open")    == 0) { op = OP_DELAYED_OPEN;    a = 1; }
     else if (strcmp(lex, "delayed.send")    == 0) { op = OP_DELAYED_SEND;    a = 3; }
-    else if (strcmp(lex, "delayed.advance") == 0) { op = OP_DELAYED_ADVANCE; a = 2; }
     else if (strcmp(lex, "delayed.recv")    == 0) { op = OP_DELAYED_RECV;    a = 1; }
     else if (strcmp(lex, "delayed.poll")    == 0) { op = OP_DELAYED_POLL;    a = 1; }
     else if (strcmp(lex, "delayed.close")   == 0) { op = OP_DELAYED_CLOSE;   a = 1; }

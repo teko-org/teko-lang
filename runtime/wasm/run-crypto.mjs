@@ -74,6 +74,7 @@ async function runGroup(reactorBytes, group) {
     memory,
     // Deterministic counter fill — exact KATs for deterministic primitives; for RSA's
     // random salt/seed only the round-trip outcome is asserted, so any fill works.
+    teko_now_ns: () => process.hrtime.bigint(), // reactor delayed/retry clock (real ns)
     teko_random: (ptr, len) => {
       const u = new Uint8Array(memory.buffer);
       for (let i = 0; i < (len >>> 0); i++) u[(ptr >>> 0) + i] = (i * 7 + 1) & 0xff;

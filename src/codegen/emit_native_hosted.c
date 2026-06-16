@@ -84,7 +84,6 @@ const char* teko_native_delayed_symbol(OpCode op, int* out_arity) {
     switch (op) {
         case OP_DELAYED_OPEN:    sym = "teko_rt_delayed_open";    arity = 1; break; // (capacity)
         case OP_DELAYED_SEND:    sym = "teko_rt_delayed_send";    arity = 3; break; // (handle, value, delay)
-        case OP_DELAYED_ADVANCE: sym = "teko_rt_delayed_advance"; arity = 2; break; // (handle, dt)
         case OP_DELAYED_RECV:    sym = "teko_rt_delayed_recv";    arity = 1; break; // (handle)
         case OP_DELAYED_POLL:    sym = "teko_rt_delayed_poll";    arity = 1; break; // (handle)
         case OP_DELAYED_CLOSE:   sym = "teko_rt_delayed_close";   arity = 1; break; // (handle)
@@ -505,7 +504,6 @@ void emit_native_hosted(MetalContext* ctx, OpCode op, int32_t arg) {
         // Phase 14 (14.C): delayed (timed) channel ops -> teko_rt_delayed_* runtime calls.
         case OP_DELAYED_OPEN:
         case OP_DELAYED_SEND:
-        case OP_DELAYED_ADVANCE:
         case OP_DELAYED_RECV:
         case OP_DELAYED_POLL:
         case OP_DELAYED_CLOSE: {

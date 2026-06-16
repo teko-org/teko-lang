@@ -24,25 +24,30 @@ while (i < 5) {
 let total = atomic.load(c);
 emit_int(total);               // 15
 
-// (main) loop + delayed channel: send 3 timed messages, drain them in delivery-time order (14.C).
+// (main) loop + delayed channel (14.C, real-time): send 3 timed messages (1@1ms,2@2ms,3@3ms),
+// poll-drain them in real-deadline order as the real monotonic clock elapses.
 let d = delayed.open(8);
 let k = 0;
 while (k < 3) {
   k = k + 1;
-  delayed.send(d, k, k);       // value k, delay k
+  delayed.send(d, k, k);       // value k, due in k ms
 }
-delayed.advance(d, 100);       // make all due
 let sum = 0;
-let m = 0;
-while (m < 3) {
-  m = m + 1;
-  let r = delayed.recv(d);     // earliest-due value -> a local
-  sum = sum + r;
+let guard = 0;
+loop {
+  guard = guard + 1;
+  if (guard > 2000000) { break; }
+  let st = delayed.poll(d);
+  if (st == 2) { break; }      // EMPTY: drained
+  if (st == 0) {               // a message is due
+    let r = delayed.recv(d);
+    sum = sum + r;
+  }
 }
 emit_int(sum);                 // 1+2+3 = 6
 
-// (14.A + 14.G) fire the looping worker as a background task, yield to it, then sleep.
+// (14.A + 14.G) fire the looping worker as a background task, yield to it, then wait (real time).
 routines { worker(); }
 await 1ms;                     // cooperative yield -> the worker loop runs here (emits 1,2,3)
-wait 1ms;                      // synchronous sleep
+wait 1ms;                      // real-time wait
 emit_int(42);                  // final marker

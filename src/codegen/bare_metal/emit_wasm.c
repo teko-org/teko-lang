@@ -1150,7 +1150,6 @@ void emit_wasm_pure(MetalContext* ctx, OpCode op, int32_t arg) {
             if (ctx->wasm_emit_delayed) {
                 fprintf(f, "  (import \"crypto\" \"teko_rt_delayed_open\" (func $delayed_open (param i32) (result i32)))\n");
                 fprintf(f, "  (import \"crypto\" \"teko_rt_delayed_send\" (func $delayed_send (param i32) (param i32) (param i32) (result i32)))\n");
-                fprintf(f, "  (import \"crypto\" \"teko_rt_delayed_advance\" (func $delayed_advance (param i32) (param i32) (result i32)))\n");
                 fprintf(f, "  (import \"crypto\" \"teko_rt_delayed_recv\" (func $delayed_recv (param i32) (result i32)))\n");
                 fprintf(f, "  (import \"crypto\" \"teko_rt_delayed_poll\" (func $delayed_poll (param i32) (result i32)))\n");
                 fprintf(f, "  (import \"crypto\" \"teko_rt_delayed_close\" (func $delayed_close (param i32) (result i32)))\n");
@@ -1315,17 +1314,14 @@ void emit_wasm_pure(MetalContext* ctx, OpCode op, int32_t arg) {
         // Phase 14 (14.C): delayed (timed) channel ops — imported reactor calls, same ABI.
         case OP_DELAYED_OPEN:
         case OP_DELAYED_SEND:
-        case OP_DELAYED_ADVANCE:
         case OP_DELAYED_RECV:
         case OP_DELAYED_POLL:
         case OP_DELAYED_CLOSE: {
             const char* fn = (op == OP_DELAYED_OPEN)    ? "delayed_open" :
                              (op == OP_DELAYED_SEND)    ? "delayed_send" :
-                             (op == OP_DELAYED_ADVANCE) ? "delayed_advance" :
                              (op == OP_DELAYED_RECV)    ? "delayed_recv" :
                              (op == OP_DELAYED_POLL)    ? "delayed_poll" : "delayed_close";
-            int ar = (op == OP_DELAYED_SEND) ? 3 :
-                     (op == OP_DELAYED_ADVANCE) ? 2 : 1;
+            int ar = (op == OP_DELAYED_SEND) ? 3 : 1;
             for (int p = 0; p + 1 < ar; p++) fprintf(f, "    local.get $a%d\n", p);
             fprintf(f, "    local.get $w0\n    call $%s\n    local.set $w0\n", fn);
             break;

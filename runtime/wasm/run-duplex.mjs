@@ -14,6 +14,7 @@ const out = [];
 const env = {
   memory,
   // The reactor imports env.teko_random (crypto); duplex doesn't use it — stub it.
+  teko_now_ns: () => process.hrtime.bigint(), // reactor delayed/retry clock (real ns)
   teko_random: (ptr, len) => {
     const u = new Uint8Array(memory.buffer);
     for (let i = 0; i < (len >>> 0); i++) u[(ptr >>> 0) + i] = 0;

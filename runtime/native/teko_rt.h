@@ -148,10 +148,11 @@ long teko_rt_duplex_recv(long handle, long endpoint);
 long teko_rt_duplex_poll(long handle, long endpoint);
 long teko_rt_duplex_close(long handle);
 
-// Phase 14 (14.C) — delayed (timed) channel surface wrappers (OP_DELAYED_* lower to these).
+// Phase 14 (14.C) — delayed (timed) channel surface wrappers (OP_DELAYED_* lower to these). The
+// time base is the real MONOTONIC clock (the wrappers call teko_rt_now_ns); a message is due once
+// REAL time has advanced by its `delay` ms — there is no logical `advance` (owner decision).
 long teko_rt_delayed_open(long capacity);
-long teko_rt_delayed_send(long handle, long value, long delay);
-long teko_rt_delayed_advance(long handle, long dt);
+long teko_rt_delayed_send(long handle, long value, long delay_ms);
 long teko_rt_delayed_recv(long handle);
 long teko_rt_delayed_poll(long handle);
 long teko_rt_delayed_close(long handle);

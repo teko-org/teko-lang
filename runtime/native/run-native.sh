@@ -101,16 +101,16 @@ check duplex.tks "$(cat <<'EXP'
 3
 EXP
 )"
-# Phase 14 (14.C): delayed (timed) channel — messages sent out of order (30@30,10@10,20@20)
-# are released in delivery-time order (10,20,30) as the logical clock advances; poll before
-# anything is due returns a structured NOT_READY (1). Lowers to OP_DELAYED_* -> teko_rt.
-check delayed.tks "$(cat <<'EXP'
-1
+# Phase 14 (14.C, real-time clock): delayed (timed) channel on the REAL monotonic clock. Sent out
+# of deadline order (10@2ms, 20@6ms, 30@4ms), they are poll-drained in real-deadline order
+# (10,30,20) — timing-robust (recv returns the earliest-due). Last is due at 6ms, so real elapsed
+# >= ~5ms. Lowers to OP_DELAYED_* -> teko_rt_delayed_* (the wrapper reads teko_rt_now_ns).
+check_timed delayed.tks "$(cat <<'EXP'
 10
-20
 30
+20
 EXP
-)"
+)" 5
 # Phase 14 (14.D): broadcast (non-destructive 1:N pub-sub) — one publisher, two subscribers;
 # each value is written once but BOTH subscribers read it independently (10,20 / 10,20).
 check broadcast.tks "$(cat <<'EXP'

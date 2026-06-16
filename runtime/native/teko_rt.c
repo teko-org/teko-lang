@@ -126,19 +126,21 @@ long teko_rt_duplex_close(long handle) {
 long teko_rt_delayed_open(long capacity) {
     return (long)(intptr_t)teko_delayed_open((uint32_t)capacity);
 }
-long teko_rt_delayed_send(long handle, long value, long delay) {
-    return (long)teko_delayed_send((TekoDelayed*)(intptr_t)handle, (int32_t)value, (uint32_t)delay);
-}
-long teko_rt_delayed_advance(long handle, long dt) {
-    return (long)teko_delayed_advance((TekoDelayed*)(intptr_t)handle, (uint32_t)dt);
+// Phase 14 (real-time clock): the delay is canonical ms (i32 surface); the deadline math is real
+// ns. The wrapper reads the real MONOTONIC clock (teko_rt_now_ns) and passes it to the runtime, so
+// a message becomes due once REAL time has advanced by `delay` ms — no logical `advance` tick.
+long teko_rt_delayed_send(long handle, long value, long delay_ms) {
+    return (long)teko_delayed_send((TekoDelayed*)(intptr_t)handle, (int32_t)value,
+                                   (uint64_t)(long long)delay_ms * 1000000ULL,
+                                   (uint64_t)teko_rt_now_ns());
 }
 long teko_rt_delayed_recv(long handle) {
     int32_t v = 0;
-    (void)teko_delayed_recv((TekoDelayed*)(intptr_t)handle, &v);
+    (void)teko_delayed_recv((TekoDelayed*)(intptr_t)handle, &v, (uint64_t)teko_rt_now_ns());
     return (long)v; // earliest-due value (0 when none due — callers probe via delayed.poll)
 }
 long teko_rt_delayed_poll(long handle) {
-    return (long)teko_delayed_poll((TekoDelayed*)(intptr_t)handle);
+    return (long)teko_delayed_poll((TekoDelayed*)(intptr_t)handle, (uint64_t)teko_rt_now_ns());
 }
 long teko_rt_delayed_close(long handle) {
     teko_delayed_close((TekoDelayed*)(intptr_t)handle);
