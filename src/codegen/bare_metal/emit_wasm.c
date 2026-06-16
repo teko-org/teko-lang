@@ -957,7 +957,7 @@ static void emit_wasm_threads(MetalContext* ctx, OpCode op, int32_t arg) {
             fprintf(f, "  (global $arena_sp (mut i32) (i32.const 2048))\n");
             fprintf(f, "  (type $task (func (param i32)))\n");
             fprintf(f, "  (func $main (result i32)\n");
-            fprintf(f, "    (local $w0 i32) (local $w1 i32) (local $cp i32) (local $spins i32) (local $tdl i64)\n");
+            fprintf(f, "    (local $w0 i32) (local $w1 i32) (local $cp i32) (local $spins i32) (local $tdl i64) (local $callfp i32)\n");
             ctx->wasm_open = 1;
             break;
 
@@ -1053,7 +1053,7 @@ static void emit_wasm_threads(MetalContext* ctx, OpCode op, int32_t arg) {
                 fprintf(f, "  )\n");
             }
             fprintf(f, "  (func $routine_%d (param $arg i32)\n", arg);
-            fprintf(f, "    (local $w0 i32) (local $w1 i32) (local $cp i32) (local $spins i32) (local $tdl i64)\n");
+            fprintf(f, "    (local $w0 i32) (local $w1 i32) (local $cp i32) (local $spins i32) (local $tdl i64) (local $callfp i32)\n");
             fprintf(f, "    local.get $arg\n    local.set $cp\n");
             ctx->wasm_open = 2;
             if (ctx->wasm_routine_count < 64) ctx->wasm_routine_ids[ctx->wasm_routine_count] = arg;
@@ -1233,7 +1233,7 @@ void emit_wasm_pure(MetalContext* ctx, OpCode op, int32_t arg) {
             fprintf(f, "  (func $main (result i32)\n");
             // $w0 accumulator, $w1 scratch, $cp channel ptr, $a0..$a2 import-arg
             // staging slots (Phase 11 multi-param imports — see OP_SETARG).
-            fprintf(f, "    (local $w0 i32) (local $w1 i32) (local $cp i32) (local $tdl i64)\n");
+            fprintf(f, "    (local $w0 i32) (local $w1 i32) (local $cp i32) (local $tdl i64) (local $callfp i32)\n");
             fprintf(f, "    (local $a0 i32) (local $a1 i32) (local $a2 i32) (local $a3 i32) (local $a4 i32) (local $a5 i32) (local $a6 i32) (local $a7 i32)\n");
             // Phase 12: named local variables ($v0..$v{n-1}) for `let`/`mut` bindings.
             for (int v = 0; v < ctx->wasm_local_count; v++) {
@@ -1660,21 +1660,26 @@ void emit_wasm_pure(MetalContext* ctx, OpCode op, int32_t arg) {
         // $arena_sp, store the staged args $a0..$a(argc-1) into it (frame[4*k] — read by the
         // callee via OP_LOAD_SPAWN_ARG), then call_indirect the $task table with slot=$w0. The
         // callee runs to completion (methods don't suspend) and spills its result to frame[0]
-        // (see OP_FUNC_END), which we reload into $w0. The frame is bumped permanently (monotonic,
-        // like a spawn) so it never aliases a callee's own nested frames — no stack-discipline
-        // hazard if the method also spawns.
+        // (see OP_FUNC_END), which we reload into $w0. STACK-DISCIPLINED so NESTED sync calls work
+        // (a method calling its own/another method): we save this call's frame pointer in $callfp,
+        // RESERVE it by bumping $arena_sp BEFORE the call (so the callee's own nested frames allocate
+        // strictly above and never alias ours), then after the call read the result from $callfp[0]
+        // and POP back to $callfp + FRAME (freeing this frame + any the callee left). A spawn inside
+        // the callee bumps monotonically from a higher base, so save/restore never frees a live task.
         case OP_CALL_FUNC: {
             int argc = arg;
-            fprintf(f, "    ;; [WASM CallFunc]: sync-call slot=$w0 with %d arg(s); result <- frame[0]\n", argc);
+            fprintf(f, "    ;; [WASM CallFunc]: sync-call slot=$w0 with %d arg(s); nesting-safe frame\n", argc);
             for (int k = 0; k < argc; k++)
                 fprintf(f, "    global.get $arena_sp\n    local.get $a%d\n    i32.store offset=%d\n", k, 4 * k);
-            fprintf(f, "    global.get $arena_sp\n");   // $arg (= frame base; methods ignore $cp)
+            fprintf(f, "    global.get $arena_sp\n    local.set $callfp\n");                 // save frame ptr
+            fprintf(f, "    global.get $arena_sp\n    i32.const %d\n    i32.add\n    global.set $arena_sp\n", TEKO_WASM_FRAME_BYTES); // reserve BEFORE the call
+            fprintf(f, "    local.get $callfp\n");      // $arg (= frame base; methods ignore $cp)
             fprintf(f, "    i32.const 0\n");            // $state = 0 (fresh entry)
-            fprintf(f, "    global.get $arena_sp\n");   // $frame
+            fprintf(f, "    local.get $callfp\n");      // $frame
             fprintf(f, "    local.get $w0\n");          // fn index (table slot)
             fprintf(f, "    call_indirect (type $task)\n    drop\n"); // discard the returned state
-            fprintf(f, "    global.get $arena_sp\n    i32.load offset=0\n    local.set $w0\n"); // result
-            fprintf(f, "    global.get $arena_sp\n    i32.const %d\n    i32.add\n    global.set $arena_sp\n", TEKO_WASM_FRAME_BYTES);
+            fprintf(f, "    local.get $callfp\n    i32.load offset=0\n    local.set $w0\n"); // result <- saved frame[0]
+            fprintf(f, "    local.get $callfp\n    i32.const %d\n    i32.add\n    global.set $arena_sp\n", TEKO_WASM_FRAME_BYTES); // pop back
             break;
         }
 
@@ -1698,7 +1703,7 @@ void emit_wasm_pure(MetalContext* ctx, OpCode op, int32_t arg) {
             }
             int n = ctx->wasm_routine_yields;                    // yield points in this routine
             fprintf(f, "  (func $routine_%d (param $arg i32) (param $state i32) (param $frame i32) (result i32)\n", arg);
-            fprintf(f, "    (local $w0 i32) (local $w1 i32) (local $cp i32) (local $tdl i64)\n");
+            fprintf(f, "    (local $w0 i32) (local $w1 i32) (local $cp i32) (local $tdl i64) (local $callfp i32)\n");
             // Import-arg staging slots (Phase 11): a callback routine invoked via
             // $teko_invoke calls dom.* imports just like $main, so it needs $a0..$a2.
             fprintf(f, "    (local $a0 i32) (local $a1 i32) (local $a2 i32) (local $a3 i32) (local $a4 i32) (local $a5 i32) (local $a6 i32) (local $a7 i32)\n");
