@@ -113,6 +113,17 @@ false
 x = 42
 EXP
 )"
+# Phase 16 (16.B): auto-`to_string` on string concatenation (the core deliverable). `+` with a
+# string operand becomes culture-invariant concatenation; non-string operands auto-convert via
+# to_string (id 49) + str_concat (id 52). No explicit conversion call appears in the source.
+check concat.tks "$(cat <<'EXP'
+x = 42
+sum = 50
+42 items
+count: 42
+n=42
+EXP
+)"
 # Phase 15 (15.A): concrete class — fields + methods + STATIC dispatch, zero runtime reflection.
 # `Point()` -> OP_OBJ_NEW; `p.x = 3` -> OP_OBJ_SET; `p.sum()`/`p.scale(10)` -> OP_CALL_FUNC
 # (the method routine reads `self.x`/`self.y` via OP_OBJ_GET). Prints 7 (3+4) then 70 ((3+4)*10).
