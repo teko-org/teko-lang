@@ -130,6 +130,9 @@ extern void test_teko_broadcast_fanout_all_see_all(void);
 extern void test_teko_broadcast_subscribe_is_future_only(void);
 extern void test_teko_broadcast_lag_and_close(void);
 extern void test_teko_broadcast_badarg(void);
+extern void test_teko_atomic_cell_rmw(void);
+extern void test_teko_shared_critical_section(void);
+extern void test_teko_atomic_badarg(void);
 extern void test_teko_runtime_arena_thread_isolation_and_alignment(void);
 extern void test_teko_crypto_md5_rfc1321_vectors(void);
 extern void test_teko_crypto_md5_streaming_matches_oneshot(void);
@@ -336,6 +339,9 @@ int main(void) {
     RUN_TEST(test_teko_broadcast_subscribe_is_future_only);
     RUN_TEST(test_teko_broadcast_lag_and_close);
     RUN_TEST(test_teko_broadcast_badarg);
+    RUN_TEST(test_teko_atomic_cell_rmw);
+    RUN_TEST(test_teko_shared_critical_section);
+    RUN_TEST(test_teko_atomic_badarg);
     RUN_TEST(test_teko_runtime_arena_thread_isolation_and_alignment);
 
     RUN_TEST(test_teko_crypto_md5_rfc1321_vectors);
