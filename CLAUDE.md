@@ -336,6 +336,10 @@ DONE** (locally green both targets): primitive `to_string` + str_concat surface 
 + WASM reactor), proofs `runtime/{native,wasm}/samples/convert.tks` → `42/1000000/true/false/"x =
 42"` (byte-identical, NO digit grouping). 6 Unity KATs (223→229). **Float** formatting/parsing is
 its own later step (shortest-round-trip is large in freestanding C); the checked `parse_*` C core
-landed in 16.A but its surface is deferred to **16.F**. Order: 16.A → 16.B string-concat +
-auto-`to_string` on `+` → 16.C interpolation → 16.D user-type `to_string` dispatch + synth default
-→ 16.E explicit-format → 16.F checked inter-type conversions.
+landed in 16.A but its surface is deferred to **16.F**. Sub-block **16.B is DONE** (locally green,
+the core deliverable): auto-`to_string` on `+` — value-type tracking in the frontend makes `"a" + n`
+culture-invariant concatenation (int operand auto-converted via id 49 + `str_concat` id 52), string
+locals tracked, extern call args accept expressions; proofs `concat.tks` → `x = 42/sum = 50/42
+items/count: 42/n=42` (byte-identical). Order: 16.A ✅ → 16.B ✅ → 16.C interpolation → 16.D
+user-type `to_string` dispatch + synth default → 16.E explicit-format → 16.F checked inter-type
+conversions (+ a float-formatting step).

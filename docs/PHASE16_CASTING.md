@@ -69,10 +69,24 @@ surface; integer/float values are marshalled as their canonical string form into
     inter-type conversions) where fail-loud is the whole point — exposing a silent-failure single-
     value parse on the surface now would be the wrong shape. No dead tokens: only `convert.int_to_str`
     /`bool_to_str`/`str_concat` are surfaced, and all three have executable proofs.
-- **16.B — String-concat + auto-`to_string` on `+` for primitives.** Value-type tracking in
-  `frontend_interop.c` (each producer carries int/float/bool/char/string/object); `"a" + n`
-  auto-converts the non-string operand via the 16.A ids, then `teko_rt_str_concat`. Proof.
-  **MEDIUM** (new value-type plumbing in the frontend).
+- **16.B — String-concat + auto-`to_string` on `+` for primitives. ✅ DONE & locally green both
+  targets (the core deliverable).** Value-type tracking in `frontend_interop.c`: the expression
+  evaluators (`eval_primary`/`eval_expr_prec`) now return a value-type (`TEKO_VT_INT`/`VT_STR`);
+  string literals and codec/convert/hash calls are `VT_STR` primaries; a `+` with a string operand
+  lowers to `to_string` (id 49) on each int operand + `str_concat` (id 52), while all-int `+` and
+  every other operator stay integer arithmetic. String-typed named locals are tracked (`g_localstr`,
+  seeded from the init value-type, kept in sync on reassignment). Extern call arguments now accept
+  expressions (`try_lower_call_arg_expr` — a parenthesized expr, or a primary followed by a binary
+  operator — evaluated and spilled to a temp), wired into both the body and top-level call sites.
+  Proofs `runtime/{native,wasm}/samples/concat.tks` → `x = 42 / sum = 50 / 42 items / count: 42 /
+  n=42` (byte-identical). No new KATs (frontend lowering; the runtime is 16.A's). ASan+UBSan both
+  paths + 16 goldens intact; class/traits/generics/eventbus/hello WASM proofs intact.
+  - **Scope note:** the auto-converted operand is an *integer* today (id 49). Bool/char/float
+    operands auto-convert once their value-types are tracked (bool via id 51 is a small follow-on;
+    float waits on the float-formatting step). User-defined-type `to_string` dispatch in a concat is
+    **16.D**. Concatenating a *codec/convert call result* directly (`convert.int_to_str(x) + "y"`)
+    needs binding to a local first (`let s = …; "y" + s`) — the one-token-lookahead arg detector
+    can't see the operator past the call's `)`; documented, not a dead token.
 - **16.C — Interpolation auto-`to_string`.** `"pre{e}post"` (the lexer already tokenizes
   `TOKEN_STRING_INTERPOLATED` / `_RAW_INTERP`) lowers to nested concat + per-hole `to_string`.
   **MEDIUM** (size depends on how much interpolation parsing already exists — to be scoped at 16.C open).
