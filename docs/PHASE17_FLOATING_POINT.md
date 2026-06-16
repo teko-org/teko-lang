@@ -378,3 +378,7 @@ opcode file was touched, so the 16 native goldens and all prior native/WASM proo
 
 Next: **17.F.2** (decimal parse/format core, reusing the 17.C/17.E patterns) → **17.F.3/.4** (the
 opcodes + language surface + checked casts). 17.F.1 is the source of truth those build on.
+
+**Decimal literal suffix = `dec`** (owner correction, applies in 17.F.3): e.g. `9.99dec`, `1000dec`.
+NOT `m` — `m` collides with the Phase-14 time-range minutes suffix (`5m`). The lexer recognizes a
+numeric literal with a trailing `dec` as a decimal literal → `OP_DCONST` (decimal-constant pool).
