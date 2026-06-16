@@ -34,22 +34,23 @@ proof on **both** native and WASM (no dead tokens).
 ## Runtime id allocation (OP_CALL_RUNTIME)
 Used ids today: 0–12, 15–34, 37–48. Phase 16 conversion block starts at **49** (contiguous):
 
-| id | symbol                       | signature                         |
-|----|------------------------------|-----------------------------------|
-| 49 | `teko_rt_int_to_string`      | (i64 as str) → decimal str        |
-| 50 | `teko_rt_float_to_string`    | (f64 as str) → canonical decimal  |
-| 51 | `teko_rt_bool_to_string`     | (0/1 as str) → `"true"`/`"false"` |
-| 52 | `teko_rt_str_concat`         | (a, b) → `ab`                     |
-| 53 | `teko_rt_parse_int`          | (str) → i64 (checked)             |
-| 54 | `teko_rt_parse_float`        | (str) → f64 (checked)             |
-| 55 | `teko_rt_parse_bool`         | (str) → 0/1 (checked)             |
-| 56 | `teko_rt_int_to_string_radix`| (i64, radix) → str (explicit fmt) |
-| 57 | `teko_rt_float_to_string_fmt`| (f64, spec) → str (explicit fmt)  |
+| id | symbol                  | surface                  | signature                          |
+|----|-------------------------|--------------------------|------------------------------------|
+| 49 | `teko_rt_int_to_string` | `convert.int_to_str`     | (i32) → decimal str (16.A)         |
+| 51 | `teko_rt_bool_to_string`| `convert.bool_to_str`    | (0/1) → `"true"`/`"false"` (16.A)  |
+| 52 | `teko_rt_str_concat`    | `convert.str_concat`     | (a, b) → `ab` (16.A; also `+`/interp) |
+| 53 | `teko_rt_parse_int`     | `convert.parse_int`      | (str) → i32, checked, fail-loud (16.F) |
+| 55 | `teko_rt_parse_bool`    | `convert.parse_bool`     | (str) → 0/1, checked, fail-loud (16.F) |
+| 56 | `teko_rt_to_radix`      | `convert.to_radix`       | (i32, radix 2..36) → str (16.E)    |
+| 57 | `teko_rt_pad`           | `convert.pad`            | (i32, width) → zero-padded (16.E)  |
+| 58 | `teko_rt_group`         | `convert.group`          | (i32) → thousands-grouped (16.E)   |
 
-(ids extended as sub-blocks land; the table here is the contract.) All string args/results cross
-as NUL-terminated pointers through the shared linear memory on WASM, exactly like the crypto/time
-surface; integer/float values are marshalled as their canonical string form into the same ABI
-(keeps the uniform pointer-passing convention — the runtime parses/formats).
+Value-carrying params are **i32** to match the accumulator/reactor ABI (`$w0` is i32 on WASM;
+native truncates the 64-bit register); the full-range i64 *core* is exercised by the Unity KATs.
+String args/results cross as NUL-terminated pointers through the shared linear memory on WASM,
+exactly like the crypto/time surface. (Reserved-but-unallocated: **50** `float_to_string`, **54**
+`parse_float`, and a float `…_fmt` — gated on a frontend float value model; see "Float formatting"
+below.)
 
 ## Sub-blocks & dependency order
 - **16.A — Conversion runtime foundation + primitive `to_string` (explicit-call). ✅ DONE & locally
@@ -127,8 +128,31 @@ surface; integer/float values are marshalled as their canonical string form into
   - **Scope note:** integer-format spec (the common explicit cases). Float precision and custom
     date masks ride on the float-formatting step / Phase-14 time surface respectively; a
     custom-grouping-separator variant is a trivial follow-on (`group` fixes `,`).
-- **16.F — Checked inter-type conversions.** Primitive casts that fail loudly (narrowing range
-  checks, float→int truncation policy), complex/user-defined casts. **MEDIUM.**
+- **16.F — Checked string→primitive parse, fail-loud. ✅ DONE & locally green both targets.**
+  `convert.parse_int` (id 53) / `convert.parse_bool` (id 55) lower to the CHECKED `teko_convert.c`
+  core (KAT'd in 16.A). A malformed/overflowing input does NOT silently return 0 — it **fails
+  loudly**: native prints a stderr diagnostic + exits 70 (`teko_rt_die`), the wasm32 reactor calls
+  `__builtin_trap` (→ a `WebAssembly.RuntimeError`). The happy result is an int (`runtime_result_vt`
+  types ids 53/55 as `VT_INT`, so `"n=" + convert.parse_int(s)` concatenates correctly via
+  auto-`to_string`). Proofs: `parse.tks` → `n = 123 / neg = -42 / ws = 7 / true / false`
+  (byte-identical); `parse_fail.tks` → emits `before` then aborts non-zero (native, `check_fail`) /
+  traps (wasm, `run-parse.mjs` asserts the trap). Suite stays 232.
+  - **Note on "conversions between types":** for the frontend's value model the meaningful runtime-
+    checked conversion *is* string→number (overflow/format-checked here). int↔string is
+    `to_string`/`parse`; bool→string is id 51; string→bool is `parse_bool`. There is no silent
+    narrowing path to guard — the accumulator value model is uniform register-width.
+
+## Float formatting — the remaining step, and why it is gated
+The universal default for **floats** (`.`-decimal shortest round-trip) needs two things this phase
+does NOT have: (1) a correct freestanding shortest-round-trip formatter (Ryu/Grisu-class — the
+wasm32 reactor has no `snprintf`/`strtod`), and more fundamentally (2) **a float value model in the
+frontend**. `frontend_interop.c`'s expression evaluator is integer-only (`$w0` is i32 on WASM /
+a GPR on native; literals go through `atoi`); there is no way to carry an `f64` value, so a
+`convert.float_to_str` token today would have **no float value to convert — a dead token**, which
+the discipline forbids. Float formatting therefore belongs with a **numeric-types expansion**
+(float literals → f64 values, float locals/arithmetic, f64 in the accumulator model); the
+`teko_convert_f64_to_string` C core + KATs should land *with* that step so it can be exercised
+end-to-end. This is the designated next step, not part of Phase 16's casting surface.
 
 ## Discipline (unchanged, non-negotiable)
 One increment per commit; build + Unity suite; **ASan + UBSan on BOTH dispatch paths + TSan**
@@ -136,3 +160,12 @@ clean each commit; the **16 native emitter goldens never regress**; all four CI 
 (incl. Windows MSVC — guard POSIX/LLP64) before any sub-block is "done"; patient CI watch (≥90s);
 **no dead tokens** (executable `.tks` proof per surface, native + WASM); **no merge / force-push**
 — the human merges.
+
+## Status
+**16.A–16.F DONE** — the full casting/conversion/parsing/`to_string` surface for every type the
+frontend value model carries (int, bool, string, user-defined class), on **both targets**, no dead
+tokens, each with an executable `.tks` proof native + WASM. The **core deliverable** (auto-`to_string`
+on concatenation **and** interpolation, dispatching a user type's `to_string` or synthesizing the
+culture-invariant default) is shipped. Suite 223→232 (9 new conversion KATs). The single remaining
+owner item — **float** default/formatting — is gated on a frontend float value model (see above) and
+is the designated next step. Ready to leave draft once all four gates are green on the final push.
