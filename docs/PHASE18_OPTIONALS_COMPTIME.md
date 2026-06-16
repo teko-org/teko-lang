@@ -122,7 +122,20 @@ follow-up.
   `1`,`2`,`3` (registration emits `1`, then deferred `2` then `3` in LIFO). Byte-identical.
 - Risk: low (frontend statement-buffering + replay at scope close).
 
-### 18.D — `comptime` (compile-time execution)
+### 18.D — `comptime` (compile-time execution)  — ✅ DONE
+**Status (DONE, locally green both targets).** `comptime let NAME = <const-expr>;` makes
+`TOKEN_COMPTIME` LIVE. A precedence-climbing compile-time evaluator (`comptime_eval`: int literals,
+other comptime constants, `( )`, unary minus, `+ - * / %`) folds the expression AT COMPILE TIME and
+binds NAME in the `g_comptime` registry — **no IL arithmetic is emitted** for the expression; a read
+of NAME (in `eval_primary` and the codec-arg path `lower_codec_value`) lowers to a single
+`iconst(value)`, so the module carries only the folded constant. Comptime constants compose (`B = A +
+8`). No new opcode/runtime — comptime-free programs byte-identical. Proof `comptime.tks` (native +
+WASM, byte-identical) → `A=42` (`6*7`), `B=50` (`A+8`), `C=10` (`(A-2)/4`), `D=2` (`A%5`). Suite
+246/246; ASan/UBSan both paths + TSan clean; 16 goldens intact. **MVP = compile-time-constant integer
+folding** (the metaprogramming foundation); `comptime { … }` blocks / comptime-generated code are a
+documented follow-up.
+
+
 - **`comptime <expr>` / `comptime { … }`** — evaluated by the frontend at compile time and folded
   to a constant emitted into the IL (a literal `OP_ICONST`/`OP_FCONST`/string-pool entry). MVP:
   constant-foldable integer/float/decimal/string arithmetic over literals and other `comptime`

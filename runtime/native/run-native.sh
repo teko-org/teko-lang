@@ -298,6 +298,18 @@ last registered
 deferred n = 42
 EXP
 )"
+# Phase 18 (18.D): `comptime` — compile-time evaluation. `comptime let NAME = <const-expr>;` is folded
+# by the frontend's constant evaluator (int literals, other comptime constants, parens, + - * / %); no
+# IL arithmetic is emitted for the expression, so the runtime carries only the folded constant (a read
+# of NAME is a single iconst). Comptime constants compose (B references A). No new IL/runtime. Byte-
+# identical to the WASM proof (run-comptime.mjs).
+check comptime.tks "$(cat <<'EXP'
+A = 42
+B = 50
+C = 10
+D = 2
+EXP
+)"
 # Phase 15 (15.A): concrete class — fields + methods + STATIC dispatch, zero runtime reflection.
 # `Point()` -> OP_OBJ_NEW; `p.x = 3` -> OP_OBJ_SET; `p.sum()`/`p.scale(10)` -> OP_CALL_FUNC
 # (the method routine reads `self.x`/`self.y` via OP_OBJ_GET). Prints 7 (3+4) then 70 ((3+4)*10).

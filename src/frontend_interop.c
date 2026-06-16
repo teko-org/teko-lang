@@ -520,6 +520,65 @@ static int g_last_init_is_null = 0;
 static char g_defer[TEKO_MAX_DEFERS][1024];
 static int  g_ndefer;
 static void defer_reset(void) { g_ndefer = 0; }
+
+// Phase 18 (18.D): `comptime` — compile-time evaluation. A `comptime let NAME = <const-expr>;`
+// computes the value AT COMPILE TIME (a constant evaluator over int literals, other comptime
+// constants, and +/-/* / % with precedence + parens) and binds NAME as a COMPTIME CONSTANT. No
+// IL arithmetic is emitted for the expression — a read of NAME lowers to a single iconst(value), so
+// the runtime carries the folded constant, never the computation. This is the metaprogramming
+// foundation (compile-time-known values); comptime-free programs are byte-identical.
+typedef struct { char name[96]; long value; } ComptimeConst;
+static ComptimeConst g_comptime[TEKO_MAX_LOCALCLS];
+static int g_ncomptime;
+static void comptime_reset(void) { g_ncomptime = 0; }
+static int comptime_find(const char* n, long* out) {
+    if (!n || !n[0]) return 0;
+    for (int i = 0; i < g_ncomptime; i++)
+        if (strcmp(g_comptime[i].name, n) == 0) { if (out) *out = g_comptime[i].value; return 1; }
+    return 0;
+}
+static void comptime_set(const char* n, long v) {
+    for (int i = 0; i < g_ncomptime; i++)
+        if (strcmp(g_comptime[i].name, n) == 0) { g_comptime[i].value = v; return; }
+    if (g_ncomptime < TEKO_MAX_LOCALCLS) {
+        strncpy(g_comptime[g_ncomptime].name, n, 95); g_comptime[g_ncomptime].name[95] = '\0';
+        g_comptime[g_ncomptime].value = v; g_ncomptime++;
+    }
+}
+static int p12_tok_prec(TokenType t);   // fwd (defined with the expression evaluator below)
+static int is_compare_tok(TokenType t); // fwd
+// Compile-time constant expression evaluator (precedence-climbing, mirroring p12_tok_prec): int
+// literals, comptime-constant identifiers, `( … )`, and + - * / %. Returns the folded value and
+// consumes the tokens. Unknown identifiers / unsupported forms evaluate to 0 (a degenerate
+// compile-time constant, not a runtime fault).
+static long comptime_eval(Parser* p, int min_prec) {
+    long left;
+    if (p->current_token.type == TOKEN_LPAREN) {
+        fe_advance(p); left = comptime_eval(p, 1);
+        if (p->current_token.type == TOKEN_RPAREN) fe_advance(p);
+    } else if (p->current_token.type == TOKEN_MINUS) { // unary minus
+        fe_advance(p); left = -comptime_eval(p, 4);
+    } else if (p->current_token.type == TOKEN_LIT_INT) {
+        left = (long)literal_canonical_value(&p->current_token); fe_advance(p);
+    } else if (p->current_token.type == TOKEN_IDENTIFIER) {
+        long v = 0; comptime_find(p->current_token.lexeme, &v); left = v; fe_advance(p);
+    } else { left = 0; fe_advance(p); }
+    while (p12_tok_prec(p->current_token.type) >= min_prec && p12_tok_prec(p->current_token.type) > 0) {
+        TokenType op = p->current_token.type; int prec = p12_tok_prec(op);
+        if (is_compare_tok(op)) break; // comptime MVP folds arithmetic only (no compares)
+        fe_advance(p);
+        long right = comptime_eval(p, prec + 1);
+        switch (op) {
+            case TOKEN_PLUS:  left = left + right; break;
+            case TOKEN_MINUS: left = left - right; break;
+            case TOKEN_MUL:   left = left * right; break;
+            case TOKEN_DIV:   left = right != 0 ? left / right : 0; break;
+            case TOKEN_MOD:   left = right != 0 ? left % right : 0; break;
+            default: break;
+        }
+    }
+    return left;
+}
 // Capture the deferred statement at the parser (current token is just past `defer`) as a re-lexable
 // source string, advancing past the terminating `;`. Pushes onto the LIFO stack.
 static void defer_capture(Parser* p) {
@@ -872,6 +931,14 @@ static int eval_primary(BytecodeBuffer* b, Parser* p, const LowerCtx* ctx, TempA
         // claimed BEFORE the optional-local payload read below (which would consume `obj` alone).
         return lower_safe_nav(b, p, ctx);
     } else if (p->current_token.type == TOKEN_IDENTIFIER) {
+        long cv;
+        if (comptime_find(p->current_token.lexeme, &cv)) {
+            // Phase 18 (18.D): a comptime constant reads as its folded value — a single iconst, the
+            // computation never reaches the runtime.
+            codegen_li_emit_iconst(b, (int)cv);
+            fe_advance(p);
+            return TEKO_VT_INT;
+        }
         int s = ctx ? bind_lookup(ctx->locals, ctx->nlocals, p->current_token.lexeme) : -1;
         int isstr = localstr_get(p->current_token.lexeme);
         int isflt = localflt_get(p->current_token.lexeme); // Phase 17: a float-typed local?
@@ -1351,9 +1418,14 @@ static void lower_codec_value(BytecodeBuffer* b, Parser* p, const LowerCtx* ctx)
     } else if (is_codec_head(p)) {
         lower_base_codec(b, p, ctx); // nested: base64.decode(base64.encode(x))
     } else if (p->current_token.type == TOKEN_IDENTIFIER) {
-        int s = ctx ? bind_lookup(ctx->locals, ctx->nlocals, p->current_token.lexeme) : -1;
-        if (s >= 0) codegen_li_emit_load_local(b, s);
-        else codegen_li_emit_iconst(b, 0);
+        long cv;
+        if (comptime_find(p->current_token.lexeme, &cv)) {
+            codegen_li_emit_iconst(b, (int)cv);   // Phase 18 (18.D): comptime constant → folded value
+        } else {
+            int s = ctx ? bind_lookup(ctx->locals, ctx->nlocals, p->current_token.lexeme) : -1;
+            if (s >= 0) codegen_li_emit_load_local(b, s);
+            else codegen_li_emit_iconst(b, 0);
+        }
         fe_advance(p);
     } else {
         codegen_li_emit_iconst(b, 0); // unsupported arg in this subset
@@ -3233,7 +3305,8 @@ int teko_compile_interop(const char* source, BytecodeBuffer* buffer) {
     // The mapping is fixed at compile time; teko_vtable_set self-resets on its first call. Programs
     // with no trait-implementing class emit nothing here → byte-identical to 15.A.
     traitlocal_reset();
-    defer_reset(); // Phase 18 (18.C): no defers carried over from a prior compile
+    defer_reset();    // Phase 18 (18.C): no defers carried over from a prior compile
+    comptime_reset(); // Phase 18 (18.D): no comptime constants carried over
     {
         int any_dispatch = 0;
         for (int ci = 0; ci < g_nclass; ci++) if (g_class[ci].ntraits > 0) { any_dispatch = 1; break; }
@@ -3268,6 +3341,23 @@ int teko_compile_interop(const char* source, BytecodeBuffer* buffer) {
             // close). Capture its source now; it is re-lexed + lowered after the loop, before OP_HALT.
             fe_advance(&parser); // consume `defer`
             defer_capture(&parser);
+        } else if (parser.current_token.type == TOKEN_COMPTIME) {
+            // Phase 18 (18.D): `comptime let NAME = <const-expr>;` — fold the expression AT COMPILE
+            // TIME and bind NAME as a comptime constant (no IL arithmetic emitted; a read of NAME is a
+            // single iconst). MVP form: a `let`/`mut` binding of a constant integer expression.
+            fe_advance(&parser); // consume `comptime`
+            if (parser.current_token.type == TOKEN_LET || parser.current_token.type == TOKEN_MUT)
+                fe_advance(&parser);
+            char cname[96]; cname[0] = '\0';
+            if (parser.current_token.type == TOKEN_IDENTIFIER) {
+                strncpy(cname, parser.current_token.lexeme, sizeof(cname) - 1); cname[sizeof(cname) - 1] = '\0';
+                fe_advance(&parser);
+            }
+            if (parser.current_token.type == TOKEN_ASSIGN || parser.current_token.type == TOKEN_QUICK_ASSIGN)
+                fe_advance(&parser);
+            long cval = comptime_eval(&parser, 1);          // compile-time fold
+            if (cname[0]) comptime_set(cname, cval);
+            if (parser.current_token.type == TOKEN_SEMICOLON) fe_advance(&parser);
         } else if (parser.current_token.type == TOKEN_EVENT) {
             // Phase 15.D: `event E;` — a compile-time declaration (registered in collect_events);
             // emits no code. Skip to the statement end.
