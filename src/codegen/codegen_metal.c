@@ -209,7 +209,7 @@ static int count_routine_yields(const unsigned char* il, uint32_t start, uint32_
         if (op == OP_ICONST || op == OP_SCONST || op == OP_JMP || op == OP_JMP_IF_FALSE ||
             op == OP_FUNC_BEGIN || op == OP_CALL_IMPORT || op == OP_SETARG ||
             op == OP_LOAD_LOCAL || op == OP_STORE_LOCAL || op == OP_CALL_RUNTIME ||
-            op == OP_SPAWN_ASYNC_ARGS || op == OP_LOAD_SPAWN_ARG) p += 5;
+            op == OP_SPAWN_ASYNC_ARGS || op == OP_LOAD_SPAWN_ARG || op == OP_CALL_FUNC) p += 5;
         else p += 1;
     }
     return yields;
@@ -268,7 +268,7 @@ static void process_linear_il_bytes(MetalContext* ctx, const unsigned char* byte
         if (op == OP_ICONST || op == OP_SCONST || op == OP_JMP || op == OP_JMP_IF_FALSE ||
             op == OP_FUNC_BEGIN || op == OP_CALL_IMPORT || op == OP_SETARG ||
             op == OP_LOAD_LOCAL || op == OP_STORE_LOCAL || op == OP_CALL_RUNTIME ||
-            op == OP_SPAWN_ASYNC_ARGS || op == OP_LOAD_SPAWN_ARG) scan += 5;
+            op == OP_SPAWN_ASYNC_ARGS || op == OP_LOAD_SPAWN_ARG || op == OP_CALL_FUNC) scan += 5;
         else scan += 1;
     }
 
@@ -287,7 +287,7 @@ static void process_linear_il_bytes(MetalContext* ctx, const unsigned char* byte
         if (op == OP_ICONST || op == OP_SCONST || op == OP_JMP || op == OP_JMP_IF_FALSE ||
             op == OP_FUNC_BEGIN || op == OP_CALL_IMPORT || op == OP_SETARG ||
             op == OP_LOAD_LOCAL || op == OP_STORE_LOCAL || op == OP_CALL_RUNTIME ||
-            op == OP_SPAWN_ASYNC_ARGS || op == OP_LOAD_SPAWN_ARG) {
+            op == OP_SPAWN_ASYNC_ARGS || op == OP_LOAD_SPAWN_ARG || op == OP_CALL_FUNC) {
             arg = read_le_int32(local_il, current_op_index + 1);
             i += 4;
         }
@@ -348,7 +348,7 @@ static void process_linear_il_bytes(MetalContext* ctx, const unsigned char* byte
                      op == OP_RETRY_NEXT_DELAY || op == OP_CIRCUIT_NEW ||
                      op == OP_CIRCUIT_ALLOW || op == OP_CIRCUIT_RECORD ||
                      op == OP_OBJ_NEW || op == OP_OBJ_SET || op == OP_OBJ_GET ||
-                     op == OP_OBJ_FREE) {
+                     op == OP_OBJ_FREE || op == OP_CALL_FUNC) {
                 last_arith_op = (OpCode)0;
             }
 
@@ -385,7 +385,7 @@ static void process_linear_il_bytes(MetalContext* ctx, const unsigned char* byte
                 op == OP_RETRY_NEXT_DELAY || op == OP_CIRCUIT_NEW ||
                 op == OP_CIRCUIT_ALLOW || op == OP_CIRCUIT_RECORD ||
                 op == OP_OBJ_NEW || op == OP_OBJ_SET || op == OP_OBJ_GET ||
-                op == OP_OBJ_FREE) {
+                op == OP_OBJ_FREE || op == OP_CALL_FUNC) {
                 accum_has_value = false;
             }
         }

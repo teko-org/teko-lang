@@ -127,6 +127,11 @@ void teko_rt_run(void);
 void teko_rt_spawn_setarg(long idx, long val);
 void teko_rt_spawn_args(long slot);
 
+// Phase 15 (15.A) — SYNCHRONOUS routine call (method dispatch, lowered from OP_CALL_FUNC). Calls
+// teko_routine_table[slot] with the args staged via teko_rt_spawn_setarg and returns its result.
+// Lives in teko_rt_sched.c (the routine-table TU), so a class-with-methods program links it.
+long teko_rt_call(long slot);
+
 // Phase 14 (real-time clock) — a portable MONOTONIC nanosecond clock; the time base for the
 // cooperative waiters/delays/timeouts. Native: CLOCK_MONOTONIC / QueryPerformanceCounter; WASM:
 // imports env.teko_now_ns. Only differences are meaningful (arbitrary epoch).

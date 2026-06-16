@@ -261,6 +261,13 @@ void codegen_li_emit_object(BytecodeBuffer* buffer, OpCode op) {
     emit_byte(buffer, (unsigned char)op);
 }
 
+void codegen_li_emit_call_func(BytecodeBuffer* buffer, int argc) {
+    if (!buffer) return;
+    buffer->uses_spawn = 1; // needs the routine table + the scheduler TU (teko_rt_call lives there)
+    emit_byte(buffer, OP_CALL_FUNC);
+    emit_int(buffer, argc);
+}
+
 void codegen_li_emit_halt(BytecodeBuffer* buffer) {
     if (!buffer) return;
     emit_byte(buffer, OP_HALT);

@@ -432,6 +432,36 @@ void emit_native_hosted(MetalContext* ctx, OpCode op, int32_t arg) {
             break;
         }
 
+        // Phase 15 (15.A): SYNCHRONOUS table call (method dispatch). Same arg staging as
+        // OP_SPAWN_ASYNC_ARGS (slot in $w0, args in the staging slots), but instead of enqueuing
+        // we call teko_rt_call(slot), which invokes teko_routine_table[slot] with the staged args
+        // and RETURNS its result (in rax/x0 = $w0). The native routine epilogue leaves the body's
+        // last $w0 in rax across `ret`, so teko_rt_call propagates it back here.
+        case OP_CALL_FUNC: {
+            int argc = arg;
+            if (arm) fprintf(f, "    mov x19, x0\n");             // preserve slot across setarg calls
+            else     fprintf(f, "    movq %%rax, %%rbx\n");
+            for (int k = 0; k < argc; k++) {
+                if (arm) {
+                    fprintf(f, "    mov x0, #%d\n", k);
+                    fprintf(f, "    ldr x1, [x29, #%d]\n", stage_off_arm(ctx, k));
+                    fprintf(f, "    bl %steko_rt_spawn_setarg\n", pre);
+                } else {
+                    fprintf(f, "    movl $%d, %%edi\n", k);
+                    fprintf(f, "    movq %d(%%rbp), %%rsi\n", stage_off_x86(ctx, k));
+                    fprintf(f, "    call %steko_rt_spawn_setarg%s\n", pre, is_macho(ctx) ? "" : "@PLT");
+                }
+            }
+            if (arm) {
+                fprintf(f, "    mov x0, x19\n");                  // slot
+                fprintf(f, "    bl %steko_rt_call\n", pre);       // $w0 = result
+            } else {
+                fprintf(f, "    movq %%rbx, %%rdi\n");            // slot
+                fprintf(f, "    call %steko_rt_call%s\n", pre, is_macho(ctx) ? "" : "@PLT");
+            }
+            break;
+        }
+
         // Phase 14 (14.I): in a routine, $w0 = the idx-th spawn argument (args pointer is in the
         // reserved frame slot; each arg is a register-width long).
         case OP_LOAD_SPAWN_ARG:

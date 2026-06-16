@@ -1308,3 +1308,56 @@ void test_codegen_li_object_family(void) {
     remove(wat);
     codegen_li_free_context(buffer);
 }
+
+// Phase 15 (15.A): the synchronous table-call primitive (OP_CALL_FUNC) — method dispatch. Build
+// IL for a routine `fn add5(n) { return n + 5; }` and a $main that calls it synchronously with 7,
+// then assert (1) the OP_CALL_FUNC opcode + uses_spawn flag, and (2) the emitted .wat dispatches
+// via call_indirect against the $task table and emits the method body as a table routine.
+void test_codegen_li_call_func_sync(void) {
+    BytecodeBuffer* buffer = codegen_li_create_context();
+    TEST_ASSERT_NOT_NULL(buffer);
+    buffer->local_count = 1; // $v0 = the call result in $main
+
+    // $main: r = add5(7)  -> stage 7 in $a0, slot 0 in $w0, OP_CALL_FUNC argc=1
+    codegen_li_emit_iconst(buffer, 7);
+    codegen_li_emit_setarg(buffer, 0);              // $a0 = 7
+    codegen_li_emit_iconst(buffer, 0);              // $w0 = slot 0 (static dispatch)
+    codegen_li_emit_call_func(buffer, 1);           // $w0 = add5(7)
+    codegen_li_emit_store_local(buffer, 0);
+    codegen_li_emit_halt(buffer);
+    // fn add5(n) { n + 5 }  as routine slot 0
+    codegen_li_emit_func_begin(buffer, 0);
+    codegen_li_emit_load_spawn_arg(buffer, 0);      // $w0 = n
+    codegen_li_emit_store(buffer);                  // $w1 = n
+    codegen_li_emit_iconst(buffer, 5);              // $w0 = 5
+    codegen_li_emit_binop(buffer, OP_ADD);          // $w0 = 5 + n
+    codegen_li_emit_func_end(buffer);
+
+    TEST_ASSERT_EQUAL_INT(1, buffer->uses_spawn); // routine table + scheduler TU needed
+    int saw_call_func = 0;
+    for (int i = 0; i < buffer->size; i++)
+        if (buffer->code[i] == (unsigned char)OP_CALL_FUNC) saw_call_func = 1;
+    TEST_ASSERT_TRUE(saw_call_func);
+
+    TekoTarget target;
+    target.arch = ARCH_WASM32;
+    target.os = OS_WASI;
+    strncpy(target.target_string, "wasm32-wasi", sizeof(target.target_string) - 1);
+    const char* wat = "output_call_func.wat";
+    TEST_ASSERT_EQUAL_INT(0, codegen_li_emit_wasm(buffer, wat, target, NULL, NULL, NULL, NULL, 0));
+
+    FILE* f = fopen(wat, "r");
+    TEST_ASSERT_NOT_NULL(f);
+    char* out = (char*)malloc(65536);
+    TEST_ASSERT_NOT_NULL(out);
+    memset(out, 0, 65536);
+    size_t n = fread(out, 1, 65535, f); out[n] = '\0'; fclose(f);
+
+    TEST_ASSERT_NOT_NULL(strstr(out, "[WASM CallFunc]")); // the sync-call lowering ran
+    TEST_ASSERT_NOT_NULL(strstr(out, "call_indirect (type $task)"));
+    TEST_ASSERT_NOT_NULL(strstr(out, "(func $routine_0")); // method body emitted as a table routine
+
+    free(out);
+    remove(wat);
+    codegen_li_free_context(buffer);
+}

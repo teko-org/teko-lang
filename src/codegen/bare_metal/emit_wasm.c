@@ -1641,6 +1641,28 @@ void emit_wasm_pure(MetalContext* ctx, OpCode op, int32_t arg) {
             fprintf(f, "    local.get $frame\n    i32.load offset=%d\n    local.set $w0\n", 4 * arg);
             break;
 
+        // Phase 15 (15.A): SYNCHRONOUS table call (method dispatch). Allocate a fresh frame at
+        // $arena_sp, store the staged args $a0..$a(argc-1) into it (frame[4*k] — read by the
+        // callee via OP_LOAD_SPAWN_ARG), then call_indirect the $task table with slot=$w0. The
+        // callee runs to completion (methods don't suspend) and spills its result to frame[0]
+        // (see OP_FUNC_END), which we reload into $w0. The frame is bumped permanently (monotonic,
+        // like a spawn) so it never aliases a callee's own nested frames — no stack-discipline
+        // hazard if the method also spawns.
+        case OP_CALL_FUNC: {
+            int argc = arg;
+            fprintf(f, "    ;; [WASM CallFunc]: sync-call slot=$w0 with %d arg(s); result <- frame[0]\n", argc);
+            for (int k = 0; k < argc; k++)
+                fprintf(f, "    global.get $arena_sp\n    local.get $a%d\n    i32.store offset=%d\n", k, 4 * k);
+            fprintf(f, "    global.get $arena_sp\n");   // $arg (= frame base; methods ignore $cp)
+            fprintf(f, "    i32.const 0\n");            // $state = 0 (fresh entry)
+            fprintf(f, "    global.get $arena_sp\n");   // $frame
+            fprintf(f, "    local.get $w0\n");          // fn index (table slot)
+            fprintf(f, "    call_indirect (type $task)\n    drop\n"); // discard the returned state
+            fprintf(f, "    global.get $arena_sp\n    i32.load offset=0\n    local.set $w0\n"); // result
+            fprintf(f, "    global.get $arena_sp\n    i32.const %d\n    i32.add\n    global.set $arena_sp\n", TEKO_WASM_FRAME_BYTES);
+            break;
+        }
+
         case OP_AWAIT_INTENT:
             fprintf(f, "    ;; [WASM Await]: cooperative yield to the scheduler\n");
             fprintf(f, "    call $teko_sched_run\n");
@@ -1691,6 +1713,10 @@ void emit_wasm_pure(MetalContext* ctx, OpCode op, int32_t arg) {
 
         case OP_FUNC_END:
             if (ctx->wasm_open == 2) {
+                // Phase 15 (15.A): spill the body's last value ($w0) to frame[0] before returning,
+                // so a SYNCHRONOUS caller (OP_CALL_FUNC) can read the method's result from the
+                // frame it passed in. Harmless for spawned/fired routines (their frame is discarded).
+                fprintf(f, "    local.get $frame\n    local.get $w0\n    i32.store offset=0\n");
                 fprintf(f, "    i32.const 0\n  )\n");            // completed: return state 0, close routine
                 ctx->wasm_open = 0;
             }

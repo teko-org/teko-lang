@@ -162,6 +162,17 @@ typedef enum {
     OP_OBJ_GET  = 0x6C, // obj_get(handle, idx) -> value
     OP_OBJ_FREE = 0x6D, // obj_free(handle) -> 0
 
+    // Phase 15 (15.A): SYNCHRONOUS table call — invoke the routine whose table slot is in $w0,
+    // synchronously, and return its result in $w0 (distinct from OP_SPAWN_ASYNC*, which enqueue
+    // a background task and return nothing). This is the method-dispatch primitive: a method is
+    // a function-table routine taking `self` (+ params) via the spawn-arg ABI; a concrete-class
+    // call lowers to ICONST <slot> (static dispatch) + OP_CALL_FUNC, while 15.B dynamic dispatch
+    // will compute the slot from a compile-time vtable. Carries a 4-byte little-endian argc; args
+    // are staged in $a0..$a(argc-1) via OP_SETARG, exactly like OP_SPAWN_ASYNC_ARGS. Native lowers
+    // to teko_rt_call (result in rax); WASM call_indirects the $task table and reads the result
+    // the callee spilled to frame[0]. Sets uses_spawn (the routine table + scheduler TU are needed).
+    OP_CALL_FUNC = 0x6E, // 4-byte argc: $w0 = call slot=$w0 with args $a0..$a(argc-1)
+
     // Control Flow and Branches
     OP_JMP = 0x20,
     OP_JMP_IF_FALSE = 0x21,
@@ -314,6 +325,9 @@ void codegen_li_emit_cf(BytecodeBuffer* buffer, OpCode op);
 void codegen_li_emit_retry(BytecodeBuffer* buffer, OpCode op);
 // Phase 15 (15.A): emit an object op (one of OP_OBJ_*); sets buffer->uses_object.
 void codegen_li_emit_object(BytecodeBuffer* buffer, OpCode op);
+// Phase 15 (15.A): synchronously call the routine in $w0 with `argc` args staged in $a0..$a(argc-1)
+// (OP_CALL_FUNC); the result lands in $w0. Sets buffer->uses_spawn (routine table + scheduler).
+void codegen_li_emit_call_func(BytecodeBuffer* buffer, int argc);
 void codegen_li_emit_halt(BytecodeBuffer* buffer);
 
 #endif // CODEGEN_LI_H
