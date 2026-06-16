@@ -62,19 +62,29 @@ it. (14.F's routine-trampoline alternative avoids loop-IL, but the 14.H samples 
    (capstone: functions + threads + loops + channels + await/wait, showcasing 14.A–14.G). Also adopt
    timespan literals in the 14.C/14.F delay args (compile-time-normalized → runtimes unchanged).
 
-## ▶ RESUME POINT (read first)
-- **Branch:** `feat/phase-14-advanced-concurrency`; resume from its latest commit (this doc's
-  commit is the tip). Working tree is clean and fully pushed to `origin`. Suite **184/184**;
-  ASan+UBSan (both dispatch paths) + TSan green; 16 native goldens intact; all 4 CI gates green.
-- **Done & CI-green:** 14.A routines, 14.B duplex, 14.C delayed, 14.D broadcast, 14.E shared/atomic
-  (5 of 6). **14.F.1** (the `teko_retry.c` policy runtime + 6 KATs) is also done (CI pending).
-- **Next:** **14.F surface** — the `retry { } fallback { }` / `circuit` block grammar that makes the
-  remaining keyword tokens live. See "▶ 14.F STATUS" below for the recommended routine-trampoline
-  lowering. This is the only remaining work to close Phase 14.
+## ▶ RESUME POINT (read first) — for a FRESH session on this same branch/PR
+- **Branch:** `feat/phase-14-advanced-concurrency` (PR #7, draft); resume from its latest commit
+  (this doc's commit is the tip). Working tree clean, fully pushed to `origin`. Suite **194/194**;
+  ASan+UBSan (both dispatch paths) + TSan green; 16 native goldens intact; all 4 CI gates green on
+  the last code commit (`94f9cf5`, 14.F.1). **Continue ON THIS BRANCH/PR — do not open a new one.**
+- **Done & CI-green:** 14.A routines · 14.B duplex · 14.C delayed · 14.D broadcast · 14.E
+  shared/atomic (5 of 6) · **14.F.1** policy runtime (`teko_retry.c` + 6 KATs).
+- **Remaining (owner-agreed order):**
+  1. **14.G — `await`/`wait` timespan waiters** (build first; see "✚ NEW SCOPE → 14.G"). Lexer
+     already lexes `10ms` (Phase-12 unit) — add `await`/`wait` keywords + ms-normalization + the
+     sync sleep / async timed-yield runtimes.
+  2. **Control-flow foundation** (loops + branches in the frontend; see "✚ NEW SCOPE → foundation").
+  3. **14.F surface** — `retry { } fallback { }` / `circuit` block grammar (see "▶ 14.F STATUS";
+     easy once the foundation exists, or use the routine-trampoline) — makes the remaining keyword
+     tokens live; closes 14.F.
+  4. **14.H — real `.tks` samples** (capstone: functions + threads + loops + channels + waiters).
+  Owner recommended decisions (pre-noted): loop keywords `loop`/`while`+`break`; timespans canonical
+  in ms; adopt timespan literals in 14.C/14.F delay args. Phase 14 leaves draft only when 14.F
+  surface + 14.G + 14.H all land with `.tks` proofs (no dead tokens) and all 4 gates are green.
 - **Before starting:** `git fetch && git checkout feat/phase-14-advanced-concurrency && git pull --ff-only`,
-  rebuild (`cmake --build build`), run `./build/teko_tests` (expect 184/184), then follow the
-  sub-plan. The channel sub-blocks (14.B/C/D) are the template; **14.E/14.F are NOT channels** —
-  read their specifics below before reaching for the template.
+  rebuild (`cmake --build build`), run `./build/teko_tests` (expect 194/194), then follow the
+  sub-plans below. The channel sub-blocks (14.B/C/D) are the copy-me template; 14.E/14.F/14.G are NOT
+  channels — read their specifics first.
 - Local quirks: Ninja isn't installed → use the pre-configured `build/` (Unix Makefiles). The
   Write tool sometimes appends a stray `</content>` line — strip it before building. `wat2wasm`
   + `node` + LLVM `clang`/`wasm-ld` are available (the last two build the reactor).
