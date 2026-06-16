@@ -6,8 +6,10 @@
 > (delivered — merged via PR #3). Phase 11 is the Browser FFI / JS-DOM Interop
 > feature (merged via PR #4; `docs/PHASE_BROWSER_FFI.md`). Phase 12 (Frontend Grammar)
 > is current (PR #5). Phase 13 is the dedicated Native Cryptography phase (planned).
-> The memorandum-derived language phases are 12 and 14–21 (`TEKO_COMPILER_MEMORANDUM.txt`).
-> The Self-Containment (Self-Hosting) milestone is the final phase, 21.
+> The memorandum-derived language phases are 12 and 14–23 (`TEKO_COMPILER_MEMORANDUM.txt`).
+> Phase 16 (Casting / Type Conversions) is merged; **Phase 17 (Floating-Point & Numeric Types)**
+> was inserted next (owner-requested — it closes the float gap Phase 16 left gated), shifting the
+> old 17–22 to 18–23. The Self-Containment (Self-Hosting) milestone is the final phase, 23.
 
 ## 📚 Documentation Map
 
@@ -16,12 +18,14 @@ To stop the planning docs from drifting, here is the single source of truth for 
 | Document | Role | Status |
 |----------|------|--------|
 | [`README.md`](../README.md) | Project overview, features, quick start | Canonical (user-facing) |
-| **`docs/plan.md`** (this file) | The roadmap — phases 1–21, current status | **Canonical (roadmap)** |
+| **`docs/plan.md`** (this file) | The roadmap — phases 1–23, current status | **Canonical (roadmap)** |
 | [`docs/ARCHITECTURE.md`](./ARCHITECTURE.md) | Compiler pipeline & module/file map | **Canonical (architecture)** |
 | [`docs/PHASE10_WASM_CONCURRENCY.md`](./PHASE10_WASM_CONCURRENCY.md) | Phase 10 design & implementation (delivered) | Canonical (feature design) |
 | [`docs/PHASE_BROWSER_FFI.md`](./PHASE_BROWSER_FFI.md) | Phase 11 design & plan (Browser FFI / JS-DOM interop) | Canonical (feature design) |
+| [`docs/PHASE16_CASTING.md`](./PHASE16_CASTING.md) | Phase 16 design (Casting / conversions / parsing / auto-`to_string`) | Canonical (feature design) |
+| [`docs/PHASE17_FLOATING_POINT.md`](./PHASE17_FLOATING_POINT.md) | Phase 17 design (Floating-Point & Numeric Types) | Canonical (feature design) |
 | [`TECH_DEBT_BACKLOG.md`](../TECH_DEBT_BACKLOG.md) | Prioritized maintenance backlog | Canonical (tech debt) |
-| [`TEKO_COMPILER_MEMORANDUM.txt`](../TEKO_COMPILER_MEMORANDUM.txt) | Owner's checkpoint memorandum; source of phases 12 & 14–21 | Reference / historical |
+| [`TEKO_COMPILER_MEMORANDUM.txt`](../TEKO_COMPILER_MEMORANDUM.txt) | Owner's checkpoint memorandum; source of phases 12 & 14–23 | Reference / historical |
 | [`docs/vm_plan.md`](./vm_plan.md) | Phase 3 (VM & debugger) sprint detail | Reference / historical (phase delivered) |
 | [`docs/BACKEND_AOT_PLAN.md`](./BACKEND_AOT_PLAN.md) | Phase 5 AOT backend spec (target matrix, ABIs, per-opcode requirements) | Reference (backend spec) |
 | [`PITCH.md`](../PITCH.md) / [`PITCH-pt-br.md`](../PITCH-pt-br.md) | Marketing pitch (EN / PT-BR) | Reference |
@@ -218,12 +222,12 @@ This document establishes the definitive technical roadmap for the final develop
 └──────────────┬───────────────┘
                ▼
 ┌──────────────────────────────┐
-│  PHASES 14–21: LANG SURFACE   │ ➔ Concurrency, OOP, Casting/Conversions, Optionals,
-│  (from the Memorandum roadmap)│   Networking/Web, Parsers/Templates, Interop, Native Testing
+│  PHASES 14–22: LANG SURFACE   │ ➔ Concurrency, OOP, Casting/Conversions, Floating-Point/Numerics,
+│  (from the Memorandum roadmap)│   Optionals, Networking/Web, Parsers/Templates, Interop, Native Testing
 └──────────────┬───────────────┘
                ▼
 ┌──────────────────────────────┐
-│  PHASE 22: SELF-CONTAINMENT   │ ➔ Compiler Bootstrapping (Rewrite from C to Teko)
+│  PHASE 23: SELF-CONTAINMENT   │ ➔ Compiler Bootstrapping (Rewrite from C to Teko)
 └──────────────────────────────┘
 ```
 
@@ -336,7 +340,7 @@ intrinsics, strings, and `fn` event handlers compile from source. **Phase 11 com
 
 # 🧬 Roadmap from the Memorandum (Phases 12 & 14–22)
 
-These phases were lifted from the project owner's roadmap memorandum (`TEKO_COMPILER_MEMORANDUM.txt`, Sections 2–4 — the long-term conceptual requirements, the reserved keyword matrix, and the immediate next steps). They expand the **language surface** that sits on top of the now-validated backend/runtime, and must land before the Self-Hosting milestone. **Phase 13 (Native Cryptography)** is interleaved here as a dedicated, owner-requested phase (not from the memorandum) — it is sequenced after Phase 12 and owns all cipher/hash/KDF work formerly bundled into the networking phase.
+These phases were lifted from the project owner's roadmap memorandum (`TEKO_COMPILER_MEMORANDUM.txt`, Sections 2–4 — the long-term conceptual requirements, the reserved keyword matrix, and the immediate next steps). **Phase 17 (Floating-Point & Numeric Types)** is an owner-requested insertion that closes the float value-model gap Phase 16 deliberately gated; it shifted the old Optionals/Networking/Parsers/Interop/Testing/Self-Hosting phases up by one (now 18–23). They expand the **language surface** that sits on top of the now-validated backend/runtime, and must land before the Self-Hosting milestone. **Phase 13 (Native Cryptography)** is interleaved here as a dedicated, owner-requested phase (not from the memorandum) — it is sequenced after Phase 12 and owns all cipher/hash/KDF work formerly bundled into the networking phase.
 
 ---
 
@@ -370,7 +374,7 @@ Inject the full token table the Lexer and Parser must mandatorily process:
 ciphers natively — no external libraries, no OpenSSL. Pure Teko/C primitives that every
 backend (the 16 native emitters + WASM) can emit, with constant-time discipline where it
 matters and test-vector-driven proof (NIST/RFC KATs + round-trips). This phase owns the
-cryptography moved out of the old "Networking, Web & Cryptography" phase (now Phase 18,
+cryptography moved out of the old "Networking, Web & Cryptography" phase (now Phase 19,
 Networking & Web), which consumes these primitives for TLS 1.3.*
 
 > **Status: all sub-phases landed and CI-green.** 13.1 (SHA-2/3, SHAKE, BLAKE3, HMAC,
@@ -473,7 +477,42 @@ after Phase 12 is complete.*
 
 ---
 
-## 🎯 PHASE 17: Zero-Overhead Optionals & Compile-Time Metaprogramming
+## 🔢 PHASE 17: Floating-Point & Numeric Types Expansion — *In progress (branch `feat/phase-17-floating-point`, PR #10)*
+*The numeric-types expansion that Phase 16 deliberately gated: float formatting needs real `f64`
+values in the frontend first. Phase 16's expression evaluator is integer-only (`$w0` is i32 on
+WASM / a GPR on native; literals via `atoi`), so a `convert.float_to_str` token today would have no
+float value to convert — a dead token, which the discipline forbids. Phase 17 carries floating-point
+values end to end, then closes the gate. See [`docs/PHASE17_FLOATING_POINT.md`](./PHASE17_FLOATING_POINT.md).*
+
+### 1. f64 value model (the prerequisite — lands first)
+*   Float literals (`3.14`, `1.0`, exponent forms), float locals, float arithmetic (`+ - * / %`),
+    and float comparisons flow through the frontend value model alongside the existing integer path.
+*   A **parallel float accumulator** is added to both backends so the integer path (and the 16
+    native goldens) stays byte-identical: native uses an FP register (`xmm0/xmm1` on x86_64,
+    `d0/d1` on arm64); WASM declares `f64` locals (`$f0/$f1`) next to `$w0/$w1`. New, additive
+    opcodes (`OP_FCONST`, `OP_FADD/FSUB/FMUL/FDIV/FMOD`, `OP_F*` compares, `OP_I2F`/`OP_F2I`).
+*   Checked, fail-loud int↔float casts (no silent truncation/UB), consistent with Phase 16's
+    checked-conversion posture.
+
+### 2. Float formatting + parsing (closes the Phase 16 gate)
+*   `convert.float_to_str` (reserved runtime **id 50**) — shortest round-trip, culture-invariant
+    `.`-decimal (Ryu/Grisu-class core in the single C runtime, KAT-tested; freestanding-safe — no
+    `snprintf`/`setlocale`, so the canonical form is locale-INvariant like the rest of Phase 16).
+*   `convert.parse_float` (reserved runtime **id 54**) — checked, fail-loud string→f64.
+*   Auto-`to_string` for floats wired into `+` / interpolation, completing the Phase-16 core
+    deliverable for the float type, on native AND WASM.
+
+### Dependency order & discipline
+The **value model lands before** the formatting/parsing surface (a float runtime id is only surfaced
+once there is a float value to feed it — no dead tokens). Single C runtime as source of truth
+(`teko_convert.c` + a Ryu-class formatter) → native `teko_rt_*` + the WASM compiled-C reactor; one
+increment per commit; ASan+UBSan both dispatch paths + TSan; the 16 native goldens never regress;
+every surface proven by an executable `.tks` on both targets; all four CI gates green (incl. Windows
+MSVC) before "done".
+
+---
+
+## 🎯 PHASE 18: Zero-Overhead Optionals & Compile-Time Metaprogramming
 
 *   Nullability `?T` via packed Value Types. The Elvis operator (`??`) compiles directly to hardware conditional instructions (`je`/`cbz`).
 *   `comptime`: Code execution at build time. Metaprogramming happens during compilation.
@@ -482,7 +521,7 @@ after Phase 12 is complete.*
 
 ---
 
-## 🌐 PHASE 18: Native Networking & Web Architecture
+## 🌐 PHASE 19: Native Networking & Web Architecture
 *Comprehensive networking from OSI Layer 4 to Layer 7, plus the native web keyword surface. Cryptography is its own dedicated phase — see **Phase 13: Native Cryptography**; TLS 1.3 below consumes Phase 13's cipher/KDF/CSPRNG primitives.*
 
 ### 1. Networking Stack
@@ -495,7 +534,7 @@ after Phase 12 is complete.*
 
 ---
 
-## 🧩 PHASE 19: Enterprise Parsers & Embedded Template Compiler
+## 🧩 PHASE 20: Enterprise Parsers & Embedded Template Compiler
 
 *   Linear O(1), reflection-free execution: `parse.json`, `parse.csv`, `parse.xml`.
 *   Native Template Engine integrated via rich String Literals: `html"""..."""`.
@@ -512,7 +551,7 @@ after Phase 12 is complete.*
 
 ---
 
-## 🔗 PHASE 20: Interoperability & Rich Metadata (`.teko_meta`)
+## 🔗 PHASE 21: Interoperability & Rich Metadata (`.teko_meta`)
 
 *   Lookup via `include_paths`, `static_links`, and `dynamic_links` in the `.tkp`.
 *   Teko modules embed rich type metadata in the `.teko_meta` section.
@@ -521,18 +560,18 @@ after Phase 12 is complete.*
 
 ---
 
-## 🧪 PHASE 21: Native Testing (`.tkt`) & Code Coverage
+## 🧪 PHASE 22: Native Testing (`.tkt`) & Code Coverage
 
 *   `.tkt` extension for co-located test files (same tree as the object under test). The release build ignores these files automatically.
 *   Native Code Coverage via codegen-assisted instrumentation, injecting counters into RAM at the start of each Basic Block. The linker embeds the `.teko_cov_map` section associating counters with code lines. The runtime dumps the counters at process end in a binary format (`.tkcov`).
 
 ---
 
-# 🔄 Final Milestone (Phase 22)
+# 🔄 Final Milestone (Phase 23)
 
 ---
 
-## 🔄 PHASE 22: Self-Containment (Self-Hosting / Bootstrapping)
+## 🔄 PHASE 23: Self-Containment (Self-Hosting / Bootstrapping)
 *The final step that crowns the industrial maturity of a systems programming language: using the language itself to compile itself.*
 
 ### 1. Translating the Compiler Modules from C to Teko
