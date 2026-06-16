@@ -224,6 +224,36 @@ static int methodid_of(const char* name) {
     }
     return -1;
 }
+// A concrete class's dense type_id is its index in g_class (the static vtable row).
+static int class_type_id(int ci) { return ci; }
+
+// ---- Phase 15 (15.B): FAT trait-typed locals (dynamic dispatch) ---------------------------
+// A `let g: Trait = concrete;` reference is FAT — two $v slots: the instance handle, and the
+// concrete `type_id` (a COMPILE-TIME CONSTANT, since the RHS's static class is known at each
+// assignment). This keeps the object layout unchanged (15.A stays byte-identical). `g.method()`
+// loads the runtime type_id from `tid_slot`, does vtable_get(type_id, method_id) -> slot, and
+// dispatches via OP_CALL_FUNC with `g`'s handle as self. Per-function scope (reset like localcls).
+#define TEKO_MAX_TRAITLOCALS 128
+typedef struct { char name[96]; int trait; int handle_slot; int tid_slot; } TraitLocal;
+static TraitLocal g_traitlocal[TEKO_MAX_TRAITLOCALS];
+static int g_ntraitlocal;
+static void traitlocal_reset(void) { g_ntraitlocal = 0; }
+static int traitlocal_find(const char* n) {
+    for (int i = 0; i < g_ntraitlocal; i++) if (strcmp(g_traitlocal[i].name, n) == 0) return i;
+    return -1;
+}
+static void traitlocal_add(const char* n, int trait, int handle_slot, int tid_slot) {
+    int e = traitlocal_find(n);
+    if (e >= 0) { g_traitlocal[e].trait = trait; g_traitlocal[e].handle_slot = handle_slot;
+                  g_traitlocal[e].tid_slot = tid_slot; return; }
+    if (g_ntraitlocal < TEKO_MAX_TRAITLOCALS) {
+        strncpy(g_traitlocal[g_ntraitlocal].name, n, 95); g_traitlocal[g_ntraitlocal].name[95] = '\0';
+        g_traitlocal[g_ntraitlocal].trait = trait;
+        g_traitlocal[g_ntraitlocal].handle_slot = handle_slot;
+        g_traitlocal[g_ntraitlocal].tid_slot = tid_slot;
+        g_ntraitlocal++;
+    }
+}
 
 // local var name -> class index (-1 = not a class instance). Per-function scope (reset for $main
 // and for each method body), so a method's `self`/locals don't alias $main's instance names.
@@ -882,6 +912,7 @@ static void env_sync(LowerEnv* env) {
 // since they reuse lower_codec_value / eval_expr_prec).
 static void lower_instantiation(BytecodeBuffer* b, Parser* p);                      // ClassName(...)
 static int  lower_member_call(BytecodeBuffer* b, Parser* p, const LowerCtx* ctx);   // obj.method(...)
+static int  lower_trait_dispatch(BytecodeBuffer* b, Parser* p, LowerEnv* env);      // g.method(...) dynamic
 
 static void lower_init_value(BytecodeBuffer* b, Parser* p, LowerEnv* env) {
     LowerCtx* ctx = env->ctx;
@@ -893,6 +924,8 @@ static void lower_init_value(BytecodeBuffer* b, Parser* p, LowerEnv* env) {
                class_find(p->current_token.lexeme) >= 0) {
         // Phase 15 (15.A): `ClassName(...)` instantiation -> OP_OBJ_NEW -> handle in $w0.
         lower_instantiation(b, p);
+    } else if (lower_trait_dispatch(b, p, env)) {
+        // Phase 15 (15.B): `g.method(args)` dynamic dispatch as an RHS -> result in $w0.
     } else if (lower_member_call(b, p, ctx)) {
         // Phase 15 (15.A): `obj.method(args)` as an RHS -> OP_CALL_FUNC -> result in $w0.
     } else if (p->current_token.type == TOKEN_MACRO_IDENT && is_dom_macro(p->current_token.lexeme) &&
@@ -941,8 +974,14 @@ static void lower_let_stmt(BytecodeBuffer* b, Parser* p, LowerEnv* env) {
     char lname[96];
     strncpy(lname, p->current_token.lexeme, sizeof(lname) - 1); lname[sizeof(lname) - 1] = '\0';
     fe_advance(p); // NAME
+    // Phase 15.B: capture the FIRST identifier of a `: Type` annotation — a trait name makes this a
+    // dynamically-dispatched (fat) reference; anything else is a plain local.
+    char annot[96]; annot[0] = '\0';
     if (p->current_token.type == TOKEN_COLON) {
         fe_advance(p);
+        if (p->current_token.type == TOKEN_IDENTIFIER) {
+            strncpy(annot, p->current_token.lexeme, sizeof(annot) - 1); annot[sizeof(annot) - 1] = '\0';
+        }
         while (p->current_token.type != TOKEN_ASSIGN && p->current_token.type != TOKEN_QUICK_ASSIGN &&
                p->current_token.type != TOKEN_SEMICOLON && p->current_token.type != TOKEN_EOF)
             fe_advance(p);
@@ -951,14 +990,26 @@ static void lower_let_stmt(BytecodeBuffer* b, Parser* p, LowerEnv* env) {
         fe_advance(p);
     int s = bind_lookup(*env->locals, *env->nlocals, lname);
     if (s < 0) { s = *env->nlocals; bind_add(env->locals, env->nlocals, env->caplocals, lname, s); }
-    // Phase 15 (15.A): if the RHS is a `ClassName(...)` instantiation, remember this local's class
+    // Phase 15 (15.A): if the RHS is a `ClassName(...)`/concrete-instance, remember this local's class
     // so later `lname.field` / `lname.method(...)` resolve their compile-time index/slot.
     int rhs_class = (p->current_token.type == TOKEN_IDENTIFIER && p->peek_token.type == TOKEN_LPAREN)
-                    ? class_find(p->current_token.lexeme) : -1;
+                    ? class_find(p->current_token.lexeme)
+                    : (p->current_token.type == TOKEN_IDENTIFIER ? localcls_get(p->current_token.lexeme) : -1);
+    int annot_trait = (annot[0] && trait_find(annot) >= 0) ? trait_find(annot) : -1;
     env_sync(env);
     lower_init_value(b, p, env);
     codegen_li_emit_store_local(b, s);
-    if (rhs_class >= 0) localcls_set(lname, rhs_class);
+    if (annot_trait >= 0) {
+        // Phase 15.B: a FAT trait-typed reference — its concrete type_id (from the RHS) rides in a
+        // hidden tid slot as a compile-time constant; `lname.method()` dispatches dynamically.
+        char tname[120]; snprintf(tname, sizeof(tname), "%s#tid", lname);
+        int tid_slot = env_alloc_local(env, tname);
+        codegen_li_emit_iconst(b, rhs_class >= 0 ? class_type_id(rhs_class) : -1);
+        codegen_li_emit_store_local(b, tid_slot);
+        traitlocal_add(lname, annot_trait, s, tid_slot);
+    } else if (rhs_class >= 0) {
+        localcls_set(lname, rhs_class);
+    }
     if (p->current_token.type == TOKEN_SEMICOLON) fe_advance(p);
 }
 
@@ -966,13 +1017,26 @@ static void lower_let_stmt(BytecodeBuffer* b, Parser* p, LowerEnv* env) {
 // statement, 0 if NAME is not a known local (so the caller tries other forms).
 static int lower_reassign(BytecodeBuffer* b, Parser* p, LowerEnv* env) {
     if (p->current_token.type != TOKEN_IDENTIFIER || p->peek_token.type != TOKEN_ASSIGN) return 0;
-    int slot = bind_lookup(*env->locals, *env->nlocals, p->current_token.lexeme);
+    char nm[96]; strncpy(nm, p->current_token.lexeme, 95); nm[95] = '\0';
+    int slot = bind_lookup(*env->locals, *env->nlocals, nm);
     if (slot < 0) return 0;
     fe_advance(p); // NAME
     fe_advance(p); // '='
+    // Phase 15.B: reassigning a FAT trait local updates its tid slot too — the new concrete type_id
+    // (known from the RHS's static class) is a compile-time constant, so dynamic dispatch on the
+    // reassigned reference picks the new implementation.
+    int tl = traitlocal_find(nm);
+    int rhs_class = (tl >= 0 && p->current_token.type == TOKEN_IDENTIFIER)
+        ? (p->peek_token.type == TOKEN_LPAREN ? class_find(p->current_token.lexeme)
+                                              : localcls_get(p->current_token.lexeme))
+        : -1;
     env_sync(env);
     lower_init_value(b, p, env);
     codegen_li_emit_store_local(b, slot);
+    if (tl >= 0) {
+        codegen_li_emit_iconst(b, rhs_class >= 0 ? class_type_id(rhs_class) : -1);
+        codegen_li_emit_store_local(b, g_traitlocal[tl].tid_slot);
+    }
     if (p->current_token.type == TOKEN_SEMICOLON) fe_advance(p);
     return 1;
 }
@@ -1100,8 +1164,54 @@ static int lower_member_write(BytecodeBuffer* b, Parser* p, LowerEnv* env) {
 
 // Phase 15 (15.A): a class member STATEMENT — `obj.field = expr;`, `obj.method(args);` (result
 // discarded). Returns 1 if consumed. Shared by the top-level loop and the block dispatcher.
+// Phase 15 (15.B): DYNAMIC dispatch `g.method(args)` where `g` is a FAT trait-typed local. Resolves
+// the routine slot at runtime via vtable_get(g.type_id, method_id), then OP_CALL_FUNC with g's handle
+// as self. Returns 1 if consumed (the receiver is a trait local + `method` is one of the trait's
+// methods), 0 otherwise (so a concrete receiver falls through to 15.A static dispatch). The slot is
+// parked in a temp because OP_CALL_FUNC needs $w0=slot while its args occupy $a0.. (and VTABLE_GET
+// itself clobbers $a0/$w0). Result in $w0.
+static int lower_trait_dispatch(BytecodeBuffer* b, Parser* p, LowerEnv* env) {
+    if (p->current_token.type != TOKEN_IDENTIFIER || p->peek_token.type != TOKEN_LPAREN) return 0;
+    char base[96], member[96];
+    if (!dotted_split(p->current_token.lexeme, base, member)) return 0;
+    int tl = traitlocal_find(base);
+    if (tl < 0) return 0;
+    int trait = g_traitlocal[tl].trait;
+    if (trait_method_idx(trait, member) < 0) return 0; // not a method of `g`'s trait
+    int mid = methodid_of(member);
+    int handle_slot = g_traitlocal[tl].handle_slot;
+    int tid_slot = g_traitlocal[tl].tid_slot;
+    fe_advance(p); // consume "g.method"
+    if (p->current_token.type == TOKEN_LPAREN) fe_advance(p);
+    env_sync(env);
+    // slot = vtable_get(type_id, method_id)  (type_id read at RUNTIME from the fat local)
+    codegen_li_emit_load_local(b, tid_slot); codegen_li_emit_setarg(b, 0); // $a0 = type_id
+    codegen_li_emit_iconst(b, mid);                                        // $w0 = method_id
+    codegen_li_emit_vtable(b, OP_VTABLE_GET);                              // $w0 = routine slot
+    int slot_tmp = env->ctx->ta->next_temp++;
+    if (env->ctx->ta->next_temp > env->ctx->ta->hw) env->ctx->ta->hw = env->ctx->ta->next_temp;
+    codegen_li_emit_store_local(b, slot_tmp);                             // park the slot
+    // stage self + explicit args, then call the resolved slot
+    codegen_li_emit_load_local(b, handle_slot); codegen_li_emit_setarg(b, 0); // $a0 = self
+    int argc = 1;
+    while (p->current_token.type != TOKEN_RPAREN && p->current_token.type != TOKEN_EOF && argc < 8) {
+        if (p->current_token.type == TOKEN_COMMA) { fe_advance(p); continue; }
+        lower_codec_value(b, p, env->ctx);   // arg -> $w0 (int / named local)
+        codegen_li_emit_setarg(b, argc); argc++;
+    }
+    if (p->current_token.type == TOKEN_RPAREN) fe_advance(p);
+    codegen_li_emit_load_local(b, slot_tmp); // $w0 = slot
+    codegen_li_emit_call_func(b, argc);      // $w0 = method result (dynamic dispatch)
+    env->ctx->ta->next_temp--;               // free the parked-slot temp
+    return 1;
+}
+
 static int lower_member_stmt(BytecodeBuffer* b, Parser* p, LowerEnv* env) {
     if (lower_member_write(b, p, env)) return 1;
+    if (lower_trait_dispatch(b, p, env)) { // Phase 15.B: `g.method(args);` dynamic call (discarded)
+        if (p->current_token.type == TOKEN_SEMICOLON) fe_advance(p);
+        return 1;
+    }
     if (p->current_token.type == TOKEN_IDENTIFIER && p->peek_token.type == TOKEN_LPAREN) {
         char base[96], member[96];
         if (dotted_split(p->current_token.lexeme, base, member) &&
@@ -1849,6 +1959,7 @@ static void emit_method_routines(const char* source, BytecodeBuffer* buffer,
             renv.binds = &binds; renv.nb = &nb; renv.ctx = &ctx;
 
             localcls_reset(); // method scope: self (+ any objects it instantiates) are class-typed
+            traitlocal_reset(); // method scope: trait-typed locals don't leak across method bodies
             for (int pi = 0; pi < nparams; pi++) {
                 int ps = env_alloc_local(&renv, params[pi]);
                 codegen_li_emit_load_spawn_arg(buffer, pi); // $w0 = args[pi]
@@ -1915,6 +2026,29 @@ int teko_compile_interop(const char* source, BytecodeBuffer* buffer) {
     LowerEnv top_env;
     top_env.locals = &locals; top_env.nlocals = &nlocals; top_env.caplocals = &caplocals;
     top_env.binds = &binds; top_env.nb = &nb; top_env.ctx = &top_ctx;
+
+    // Phase 15.B: populate the STATIC vtable at $main start — for every concrete class implementing
+    // a trait, vtable_set(type_id, method_id, slot) for each of its bodied methods (its abstract
+    // contract methods have slot -1 and are skipped; a subclass override re-points the same column).
+    // The mapping is fixed at compile time; teko_vtable_set self-resets on its first call. Programs
+    // with no trait-implementing class emit nothing here → byte-identical to 15.A.
+    traitlocal_reset();
+    {
+        int any_dispatch = 0;
+        for (int ci = 0; ci < g_nclass; ci++) if (g_class[ci].ntraits > 0) { any_dispatch = 1; break; }
+        if (any_dispatch) {
+            for (int ci = 0; ci < g_nclass; ci++) {
+                if (g_class[ci].ntraits == 0) continue;
+                for (int mi = 0; mi < g_class[ci].nmethods; mi++) {
+                    if (g_class[ci].method_slot[mi] < 0) continue; // abstract contract — no routine
+                    codegen_li_emit_iconst(buffer, class_type_id(ci));                 codegen_li_emit_setarg(buffer, 0);
+                    codegen_li_emit_iconst(buffer, methodid_of(g_class[ci].methods[mi])); codegen_li_emit_setarg(buffer, 1);
+                    codegen_li_emit_iconst(buffer, g_class[ci].method_slot[mi]);
+                    codegen_li_emit_vtable(buffer, OP_VTABLE_SET);
+                }
+            }
+        }
+    }
 
     while (parser.current_token.type != TOKEN_EOF) {
         // Keep the top-level lowering context's local view current, and start temp

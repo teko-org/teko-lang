@@ -110,6 +110,17 @@ check class.tks "$(cat <<'EXP'
 70
 EXP
 )"
+# Phase 15 (15.B): abstract/trait dynamic dispatch via a compile-time STATIC VTABLE. A Shape-typed
+# fat reference dispatches `area()`/`to_string()` to Circle then (after reassignment) Square by the
+# runtime type_id: vtable_get -> slot -> OP_CALL_FUNC. `to_string` rides the same vtable (Phase-16
+# hook). 12 (Circle.area), 112 (Circle.to_string), 9 (Square.area), 209 (Square.to_string).
+check traits.tks "$(cat <<'EXP'
+12
+112
+9
+209
+EXP
+)"
 # Phase 14 (14.A): `routines { worker(); worker(); }` fires two background tasks. The native
 # scheduler (teko_rt_run) drains them at $main exit, so they run AFTER main's body — the two
 # "worker ran" lines follow "main start"/"main end", proving deferred (not inline) execution.

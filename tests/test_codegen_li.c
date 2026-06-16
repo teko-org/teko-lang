@@ -1532,3 +1532,53 @@ void test_frontend_interop_trait_collision(void) {
     TEST_ASSERT_EQUAL_INT(0, teko_compile_interop(ok, b2)); // override resolves the ambiguity
     codegen_li_free_context(b2);
 }
+
+// Phase 15 (15.B): DYNAMIC dispatch through a FAT trait-typed local. A `Shape`-typed `g` reassigned
+// across two implementors dispatches `g.area()` via the static vtable: the program emits OP_VTABLE_SET
+// (population at $main start) + OP_VTABLE_GET (dispatch) + OP_CALL_FUNC (the resolved slot), and sets
+// uses_vtable + uses_object. Concrete `self.area()` inside a method stays static (OP_CALL_FUNC w/o GET).
+void test_frontend_interop_trait_dynamic_dispatch(void) {
+    const char* src =
+        "extern fn emit_int(n) from \"teko_rt\" as \"teko_rt_emit_int\";\n"
+        "trait Shape { fn area(self): i32; }\n"
+        "class Circle : Shape { let r; fn area(self): i32 { return self.r * self.r * 3; } }\n"
+        "class Square : Shape { let s; fn area(self): i32 { return self.s * self.s; } }\n"
+        "let c = Circle(); c.r = 2;\n"
+        "let sq = Square(); sq.s = 3;\n"
+        "let g: Shape = c;\n"
+        "let a1 = g.area(); emit_int(a1);\n"
+        "g = sq;\n"
+        "let a2 = g.area(); emit_int(a2);\n";
+    BytecodeBuffer* buffer = codegen_li_create_context();
+    TEST_ASSERT_NOT_NULL(buffer);
+    TEST_ASSERT_EQUAL_INT(0, teko_compile_interop(src, buffer));
+    TEST_ASSERT_EQUAL_INT(1, buffer->uses_vtable);
+    TEST_ASSERT_EQUAL_INT(1, buffer->uses_object);
+    int saw_set = 0, saw_get = 0, saw_call = 0;
+    for (int i = 0; i < buffer->size; i++) {
+        unsigned char op = buffer->code[i];
+        if (op == (unsigned char)OP_VTABLE_SET) saw_set = 1;  // vtable population at $main start
+        if (op == (unsigned char)OP_VTABLE_GET) saw_get = 1;  // dynamic dispatch resolution
+        if (op == (unsigned char)OP_CALL_FUNC)  saw_call = 1; // the resolved-slot call
+    }
+    TEST_ASSERT_TRUE(saw_set && saw_get && saw_call);
+
+    // Through the bridge: the .wat imports the vtable reactor entries + dispatches via call_indirect.
+    TekoTarget target;
+    target.arch = ARCH_WASM32; target.os = OS_WASI;
+    strncpy(target.target_string, "wasm32-wasi", sizeof(target.target_string) - 1);
+    const char* wat = "output_trait_dispatch.wat";
+    TEST_ASSERT_EQUAL_INT(0, codegen_li_emit_wasm(buffer, wat, target, NULL, NULL, NULL, NULL, 0));
+    FILE* f = fopen(wat, "r");
+    TEST_ASSERT_NOT_NULL(f);
+    char* out = (char*)malloc(131072);
+    TEST_ASSERT_NOT_NULL(out);
+    memset(out, 0, 131072);
+    size_t n = fread(out, 1, 131071, f); out[n] = '\0'; fclose(f);
+    TEST_ASSERT_NOT_NULL(strstr(out, "call $vtable_set"));
+    TEST_ASSERT_NOT_NULL(strstr(out, "call $vtable_get"));
+    TEST_ASSERT_NOT_NULL(strstr(out, "call_indirect (type $task)"));
+    free(out);
+    remove(wat);
+    codegen_li_free_context(buffer);
+}
