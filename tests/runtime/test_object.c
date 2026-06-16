@@ -40,8 +40,8 @@ void test_teko_object_holds_handle(void) {
     teko_object_set(inner, 0, 314);
     TekoObject* outer = teko_object_new(2);
     teko_object_set(outer, 0, 5);
-    teko_object_set(outer, 1, (long)(intptr_t)inner); // store the inner handle in a field
-    TekoObject* got = (TekoObject*)(intptr_t)teko_object_get(outer, 1);
+    teko_object_set(outer, 1, (intptr_t)inner); // store the inner handle in a field (no truncation)
+    TekoObject* got = (TekoObject*)teko_object_get(outer, 1);
     TEST_ASSERT_EQUAL_PTR(inner, got);
     TEST_ASSERT_EQUAL_INT32(314, (int)teko_object_get(got, 0));
     teko_object_free(inner);
