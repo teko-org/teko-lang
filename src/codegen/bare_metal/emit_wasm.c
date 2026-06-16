@@ -957,7 +957,7 @@ static void emit_wasm_threads(MetalContext* ctx, OpCode op, int32_t arg) {
             fprintf(f, "  (global $arena_sp (mut i32) (i32.const 2048))\n");
             fprintf(f, "  (type $task (func (param i32)))\n");
             fprintf(f, "  (func $main (result i32)\n");
-            fprintf(f, "    (local $w0 i32) (local $w1 i32) (local $cp i32) (local $spins i32) (local $tdl i64)\n");
+            fprintf(f, "    (local $w0 i32) (local $w1 i32) (local $cp i32) (local $spins i32) (local $tdl i64) (local $callfp i32)\n");
             ctx->wasm_open = 1;
             break;
 
@@ -1053,7 +1053,7 @@ static void emit_wasm_threads(MetalContext* ctx, OpCode op, int32_t arg) {
                 fprintf(f, "  )\n");
             }
             fprintf(f, "  (func $routine_%d (param $arg i32)\n", arg);
-            fprintf(f, "    (local $w0 i32) (local $w1 i32) (local $cp i32) (local $spins i32) (local $tdl i64)\n");
+            fprintf(f, "    (local $w0 i32) (local $w1 i32) (local $cp i32) (local $spins i32) (local $tdl i64) (local $callfp i32)\n");
             fprintf(f, "    local.get $arg\n    local.set $cp\n");
             ctx->wasm_open = 2;
             if (ctx->wasm_routine_count < 64) ctx->wasm_routine_ids[ctx->wasm_routine_count] = arg;
@@ -1147,6 +1147,20 @@ void emit_wasm_pure(MetalContext* ctx, OpCode op, int32_t arg) {
                 fprintf(f, "  (import \"crypto\" \"teko_rt_duplex_poll\" (func $duplex_poll (param i32) (param i32) (result i32)))\n");
                 fprintf(f, "  (import \"crypto\" \"teko_rt_duplex_close\" (func $duplex_close (param i32) (result i32)))\n");
             }
+            // Phase 15 (15.A): object instance-store entry points come from the SAME runtime
+            // reactor (namespace "crypto"). Pure i32-in/i32-out (handle/value) over the shared
+            // linear memory. Imported only when the program instantiates a `class`.
+            if (ctx->wasm_emit_object) {
+                fprintf(f, "  (import \"crypto\" \"teko_rt_object_new\" (func $object_new (param i32) (result i32)))\n");
+                fprintf(f, "  (import \"crypto\" \"teko_rt_object_set\" (func $object_set (param i32) (param i32) (param i32) (result i32)))\n");
+                fprintf(f, "  (import \"crypto\" \"teko_rt_object_get\" (func $object_get (param i32) (param i32) (result i32)))\n");
+                fprintf(f, "  (import \"crypto\" \"teko_rt_object_free\" (func $object_free (param i32) (result i32)))\n");
+            }
+            // Phase 15 (15.B): static-vtable dispatch entry points from the SAME runtime reactor.
+            if (ctx->wasm_emit_vtable) {
+                fprintf(f, "  (import \"crypto\" \"teko_rt_vtable_set\" (func $vtable_set (param i32) (param i32) (param i32) (result i32)))\n");
+                fprintf(f, "  (import \"crypto\" \"teko_rt_vtable_get\" (func $vtable_get (param i32) (param i32) (result i32)))\n");
+            }
             // Phase 14 (14.C): delayed (timed) channel entry points, also from the reactor.
             if (ctx->wasm_emit_delayed) {
                 fprintf(f, "  (import \"crypto\" \"teko_rt_delayed_open\" (func $delayed_open (param i32) (result i32)))\n");
@@ -1196,7 +1210,8 @@ void emit_wasm_pure(MetalContext* ctx, OpCode op, int32_t arg) {
             // shared) is in play it is host-owned and SHARED (imported from env), so both modules
             // address the same bytes. Re-export it either way so harnesses can read results.
             if (ctx->wasm_emit_crypto_ext || ctx->wasm_emit_duplex || ctx->wasm_emit_delayed ||
-                ctx->wasm_emit_bcast || ctx->wasm_emit_shared || ctx->wasm_emit_retry) {
+                ctx->wasm_emit_bcast || ctx->wasm_emit_shared || ctx->wasm_emit_retry ||
+                ctx->wasm_emit_object || ctx->wasm_emit_vtable) {
                 fprintf(f, "  (import \"env\" \"memory\" (memory 1))\n");
             } else {
                 fprintf(f, "  (memory 1)\n");
@@ -1218,7 +1233,7 @@ void emit_wasm_pure(MetalContext* ctx, OpCode op, int32_t arg) {
             fprintf(f, "  (func $main (result i32)\n");
             // $w0 accumulator, $w1 scratch, $cp channel ptr, $a0..$a2 import-arg
             // staging slots (Phase 11 multi-param imports — see OP_SETARG).
-            fprintf(f, "    (local $w0 i32) (local $w1 i32) (local $cp i32) (local $tdl i64)\n");
+            fprintf(f, "    (local $w0 i32) (local $w1 i32) (local $cp i32) (local $tdl i64) (local $callfp i32)\n");
             fprintf(f, "    (local $a0 i32) (local $a1 i32) (local $a2 i32) (local $a3 i32) (local $a4 i32) (local $a5 i32) (local $a6 i32) (local $a7 i32)\n");
             // Phase 12: named local variables ($v0..$v{n-1}) for `let`/`mut` bindings.
             for (int v = 0; v < ctx->wasm_local_count; v++) {
@@ -1307,6 +1322,32 @@ void emit_wasm_pure(MetalContext* ctx, OpCode op, int32_t arg) {
                              (op == OP_DUPLEX_POLL) ? "duplex_poll" : "duplex_close";
             int ar = (op == OP_DUPLEX_SEND) ? 3 :
                      (op == OP_DUPLEX_RECV || op == OP_DUPLEX_POLL) ? 2 : 1;
+            for (int p = 0; p + 1 < ar; p++) fprintf(f, "    local.get $a%d\n", p);
+            fprintf(f, "    local.get $w0\n    call $%s\n    local.set $w0\n", fn);
+            break;
+        }
+
+        // Phase 15 (15.A): object model ops — call the reactor's imported teko_rt_object_*.
+        // Same multi-arg ABI as OP_DUPLEX_*: args 0..n-2 from staging slots $a0.. (OP_SETARG),
+        // the last from $w0; the i32 result (handle/value) lands in $w0.
+        case OP_OBJ_NEW:
+        case OP_OBJ_SET:
+        case OP_OBJ_GET:
+        case OP_OBJ_FREE: {
+            const char* fn = (op == OP_OBJ_NEW) ? "object_new" :
+                             (op == OP_OBJ_SET) ? "object_set" :
+                             (op == OP_OBJ_GET) ? "object_get" : "object_free";
+            int ar = (op == OP_OBJ_SET) ? 3 : (op == OP_OBJ_GET) ? 2 : 1;
+            for (int p = 0; p + 1 < ar; p++) fprintf(f, "    local.get $a%d\n", p);
+            fprintf(f, "    local.get $w0\n    call $%s\n    local.set $w0\n", fn);
+            break;
+        }
+
+        // Phase 15 (15.B): static-vtable ops — call the reactor's imported teko_rt_vtable_*.
+        case OP_VTABLE_SET:
+        case OP_VTABLE_GET: {
+            const char* fn = (op == OP_VTABLE_SET) ? "vtable_set" : "vtable_get";
+            int ar = (op == OP_VTABLE_SET) ? 3 : 2;
             for (int p = 0; p + 1 < ar; p++) fprintf(f, "    local.get $a%d\n", p);
             fprintf(f, "    local.get $w0\n    call $%s\n    local.set $w0\n", fn);
             break;
@@ -1615,6 +1656,33 @@ void emit_wasm_pure(MetalContext* ctx, OpCode op, int32_t arg) {
             fprintf(f, "    local.get $frame\n    i32.load offset=%d\n    local.set $w0\n", 4 * arg);
             break;
 
+        // Phase 15 (15.A): SYNCHRONOUS table call (method dispatch). Allocate a fresh frame at
+        // $arena_sp, store the staged args $a0..$a(argc-1) into it (frame[4*k] — read by the
+        // callee via OP_LOAD_SPAWN_ARG), then call_indirect the $task table with slot=$w0. The
+        // callee runs to completion (methods don't suspend) and spills its result to frame[0]
+        // (see OP_FUNC_END), which we reload into $w0. STACK-DISCIPLINED so NESTED sync calls work
+        // (a method calling its own/another method): we save this call's frame pointer in $callfp,
+        // RESERVE it by bumping $arena_sp BEFORE the call (so the callee's own nested frames allocate
+        // strictly above and never alias ours), then after the call read the result from $callfp[0]
+        // and POP back to $callfp + FRAME (freeing this frame + any the callee left). A spawn inside
+        // the callee bumps monotonically from a higher base, so save/restore never frees a live task.
+        case OP_CALL_FUNC: {
+            int argc = arg;
+            fprintf(f, "    ;; [WASM CallFunc]: sync-call slot=$w0 with %d arg(s); nesting-safe frame\n", argc);
+            for (int k = 0; k < argc; k++)
+                fprintf(f, "    global.get $arena_sp\n    local.get $a%d\n    i32.store offset=%d\n", k, 4 * k);
+            fprintf(f, "    global.get $arena_sp\n    local.set $callfp\n");                 // save frame ptr
+            fprintf(f, "    global.get $arena_sp\n    i32.const %d\n    i32.add\n    global.set $arena_sp\n", TEKO_WASM_FRAME_BYTES); // reserve BEFORE the call
+            fprintf(f, "    local.get $callfp\n");      // $arg (= frame base; methods ignore $cp)
+            fprintf(f, "    i32.const 0\n");            // $state = 0 (fresh entry)
+            fprintf(f, "    local.get $callfp\n");      // $frame
+            fprintf(f, "    local.get $w0\n");          // fn index (table slot)
+            fprintf(f, "    call_indirect (type $task)\n    drop\n"); // discard the returned state
+            fprintf(f, "    local.get $callfp\n    i32.load offset=0\n    local.set $w0\n"); // result <- saved frame[0]
+            fprintf(f, "    local.get $callfp\n    i32.const %d\n    i32.add\n    global.set $arena_sp\n", TEKO_WASM_FRAME_BYTES); // pop back
+            break;
+        }
+
         case OP_AWAIT_INTENT:
             fprintf(f, "    ;; [WASM Await]: cooperative yield to the scheduler\n");
             fprintf(f, "    call $teko_sched_run\n");
@@ -1635,7 +1703,7 @@ void emit_wasm_pure(MetalContext* ctx, OpCode op, int32_t arg) {
             }
             int n = ctx->wasm_routine_yields;                    // yield points in this routine
             fprintf(f, "  (func $routine_%d (param $arg i32) (param $state i32) (param $frame i32) (result i32)\n", arg);
-            fprintf(f, "    (local $w0 i32) (local $w1 i32) (local $cp i32) (local $tdl i64)\n");
+            fprintf(f, "    (local $w0 i32) (local $w1 i32) (local $cp i32) (local $tdl i64) (local $callfp i32)\n");
             // Import-arg staging slots (Phase 11): a callback routine invoked via
             // $teko_invoke calls dom.* imports just like $main, so it needs $a0..$a2.
             fprintf(f, "    (local $a0 i32) (local $a1 i32) (local $a2 i32) (local $a3 i32) (local $a4 i32) (local $a5 i32) (local $a6 i32) (local $a7 i32)\n");
@@ -1665,6 +1733,10 @@ void emit_wasm_pure(MetalContext* ctx, OpCode op, int32_t arg) {
 
         case OP_FUNC_END:
             if (ctx->wasm_open == 2) {
+                // Phase 15 (15.A): spill the body's last value ($w0) to frame[0] before returning,
+                // so a SYNCHRONOUS caller (OP_CALL_FUNC) can read the method's result from the
+                // frame it passed in. Harmless for spawned/fired routines (their frame is discarded).
+                fprintf(f, "    local.get $frame\n    local.get $w0\n    i32.store offset=0\n");
                 fprintf(f, "    i32.const 0\n  )\n");            // completed: return state 0, close routine
                 ctx->wasm_open = 0;
             }

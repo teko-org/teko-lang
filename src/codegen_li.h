@@ -150,6 +150,38 @@ typedef enum {
     OP_CIRCUIT_ALLOW        = 0x66, // circuit_allow(handle, now) -> 0/1
     OP_CIRCUIT_RECORD       = 0x67, // circuit_record(handle, ok, now) -> 0
 
+    // Phase 15 (15.A): object model ops — the `class` surface's instance store. A dedicated
+    // opcode family (owner pattern, like the Phase 14 channel families): each lowers to a
+    // teko_rt_object_* call on the native runner and to the wasm32 runtime-reactor import on
+    // WASM (the teko_object C runtime is the single source of truth). Args are staged via
+    // OP_SETARG (0..n-2) with the last in the accumulator ($w0), exactly like OP_CALL_RUNTIME;
+    // a result (handle / value) lands in $w0. ZERO RUNTIME REFLECTION: field indices are
+    // compile-time constants the frontend emits — there is no runtime name lookup or type tag.
+    OP_OBJ_NEW  = 0x6A, // obj_new(nfields) -> handle
+    OP_OBJ_SET  = 0x6B, // obj_set(handle, idx, value) -> 0
+    OP_OBJ_GET  = 0x6C, // obj_get(handle, idx) -> value
+    OP_OBJ_FREE = 0x6D, // obj_free(handle) -> 0
+
+    // Phase 15 (15.A): SYNCHRONOUS table call — invoke the routine whose table slot is in $w0,
+    // synchronously, and return its result in $w0 (distinct from OP_SPAWN_ASYNC*, which enqueue
+    // a background task and return nothing). This is the method-dispatch primitive: a method is
+    // a function-table routine taking `self` (+ params) via the spawn-arg ABI; a concrete-class
+    // call lowers to ICONST <slot> (static dispatch) + OP_CALL_FUNC, while 15.B dynamic dispatch
+    // will compute the slot from a compile-time vtable. Carries a 4-byte little-endian argc; args
+    // are staged in $a0..$a(argc-1) via OP_SETARG, exactly like OP_SPAWN_ASYNC_ARGS. Native lowers
+    // to teko_rt_call (result in rax); WASM call_indirects the $task table and reads the result
+    // the callee spilled to frame[0]. Sets uses_spawn (the routine table + scheduler TU are needed).
+    OP_CALL_FUNC = 0x6E, // 4-byte argc: $w0 = call slot=$w0 with args $a0..$a(argc-1)
+
+    // Phase 15 (15.B): static vtable ops — the abstract/trait dynamic-dispatch table. Same
+    // dedicated-opcode + teko_rt_vtable_* (native) / wasm reactor-import lowering as the channel
+    // families (args staged via OP_SETARG 0..n-2, last in $w0; result in $w0). The teko_vtable C
+    // runtime is the single source of truth. VTABLE_SET populates an entry at $main start;
+    // VTABLE_GET resolves (type_id, method_id) -> routine slot at a dynamic call site, which then
+    // feeds OP_CALL_FUNC. Both are $w0-clobbering runtime calls (CSE barriers).
+    OP_VTABLE_SET = 0x6F, // vtable_set(type_id, method_id, slot) -> 0
+    OP_VTABLE_GET = 0x70, // vtable_get(type_id, method_id) -> slot
+
     // Control Flow and Branches
     OP_JMP = 0x20,
     OP_JMP_IF_FALSE = 0x21,
@@ -242,6 +274,14 @@ typedef struct {
     // OP_CIRCUIT_*). Native links teko_rt_retry_*/teko_rt_circuit_*; WASM imports them from the
     // runtime reactor + shares linear memory (same wiring as the channel families).
     int uses_retry;
+    // Phase 15 (15.A): 1 if the program uses an object op (OP_OBJ_*) — i.e. instantiates a
+    // `class`. Native links teko_rt_object_*; WASM imports them from the runtime reactor +
+    // shares linear memory (same wiring as the channel families). Object-free programs stay
+    // byte-identical.
+    int uses_object;
+    // Phase 15 (15.B): 1 if the program uses a static-vtable op (OP_VTABLE_*) — i.e. abstract/trait
+    // dynamic dispatch. Native links teko_rt_vtable_*; WASM imports from the reactor + shared memory.
+    int uses_vtable;
 } BytecodeBuffer;
 
 // Public functions of the IL Bytecode Emitter
@@ -295,6 +335,13 @@ void codegen_li_emit_await(BytecodeBuffer* buffer);
 void codegen_li_emit_cf(BytecodeBuffer* buffer, OpCode op);
 // Phase 14 (14.F): emit a resilience policy op (OP_RETRY_*/OP_CIRCUIT_*); sets buffer->uses_retry.
 void codegen_li_emit_retry(BytecodeBuffer* buffer, OpCode op);
+// Phase 15 (15.A): emit an object op (one of OP_OBJ_*); sets buffer->uses_object.
+void codegen_li_emit_object(BytecodeBuffer* buffer, OpCode op);
+// Phase 15 (15.A): synchronously call the routine in $w0 with `argc` args staged in $a0..$a(argc-1)
+// (OP_CALL_FUNC); the result lands in $w0. Sets buffer->uses_spawn (routine table + scheduler).
+void codegen_li_emit_call_func(BytecodeBuffer* buffer, int argc);
+// Phase 15 (15.B): emit a static-vtable op (OP_VTABLE_SET/GET); sets buffer->uses_vtable.
+void codegen_li_emit_vtable(BytecodeBuffer* buffer, OpCode op);
 void codegen_li_emit_halt(BytecodeBuffer* buffer);
 
 #endif // CODEGEN_LI_H

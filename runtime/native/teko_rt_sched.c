@@ -22,7 +22,11 @@
 #include "teko_rt.h"
 #include <stdint.h>
 
-typedef void (*teko_routine_fn)(long);
+// Phase 15 (15.A): routine functions RETURN a register-width value (their body's last $w0,
+// left in rax/x0 across `ret`). The spawn/run path ignores the return (background tasks); the
+// synchronous method-call path (teko_rt_call) propagates it. Before Phase 15 this was
+// `void (*)(long)`; widening the return type is ABI-compatible (the caller just reads rax/x0).
+typedef long (*teko_routine_fn)(long);
 
 // Provided by the emitted assembly of a `routines` program (see above). Only referenced
 // from this TU, which is only linked when teko_rt_spawn/teko_rt_run are referenced — so a
@@ -69,6 +73,22 @@ void teko_rt_spawn_args(long slot) {
         teko_rt_rq_tail++;
     }
     for (int i = 0; i < TEKO_RT_MAX_ARGS; i++) teko_rt_pending_args[i] = 0; // reset for the next spawn
+}
+
+// Phase 15 (15.A): SYNCHRONOUSLY call the routine at `slot` with the args staged via
+// teko_rt_spawn_setarg, and RETURN its result (method dispatch — lowered from OP_CALL_FUNC).
+// The staged args are copied to a STACK-LOCAL vector before the call so nested/recursive method
+// calls (which re-stage into the global pending buffer) don't corrupt this call's arguments.
+long teko_rt_call(long slot) {
+    long local_args[TEKO_RT_MAX_ARGS];
+    for (int i = 0; i < TEKO_RT_MAX_ARGS; i++) {
+        local_args[i] = teko_rt_pending_args[i];
+        teko_rt_pending_args[i] = 0; // consume (so a sibling spawn after the call starts clean)
+    }
+    if (slot >= 0 && slot < teko_routine_count && teko_routine_table[slot]) {
+        return teko_routine_table[slot]((long)(intptr_t)local_args);
+    }
+    return 0;
 }
 
 // Drain the run queue to completion. Called at `$main`'s exit so fired routines run

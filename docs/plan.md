@@ -218,12 +218,12 @@ This document establishes the definitive technical roadmap for the final develop
 └──────────────┬───────────────┘
                ▼
 ┌──────────────────────────────┐
-│  PHASES 14–20: LANG SURFACE   │ ➔ Concurrency, OOP, Optionals, Networking/Web,
-│  (from the Memorandum roadmap)│   Parsers/Templates, Interop, Native Testing
+│  PHASES 14–21: LANG SURFACE   │ ➔ Concurrency, OOP, Casting/Conversions, Optionals,
+│  (from the Memorandum roadmap)│   Networking/Web, Parsers/Templates, Interop, Native Testing
 └──────────────┬───────────────┘
                ▼
 ┌──────────────────────────────┐
-│  PHASE 21: SELF-CONTAINMENT   │ ➔ Compiler Bootstrapping (Rewrite from C to Teko)
+│  PHASE 22: SELF-CONTAINMENT   │ ➔ Compiler Bootstrapping (Rewrite from C to Teko)
 └──────────────────────────────┘
 ```
 
@@ -270,7 +270,7 @@ To support the native features of massive M:N concurrency, blocking channels, an
 ---
 
 ## 🧹 PHASE 9: Technical Debt Resolution
-*Promoted to the first post-runtime phase: harden what is already built before expanding the language surface in Phases 12–21. Source: `TECH_DEBT_BACKLOG.md`. To be tackled continuously alongside the feature phases. Priority = (Impact + Risk) × (6 − Effort).*
+*Promoted to the first post-runtime phase: harden what is already built before expanding the language surface in Phases 12–22. Source: `TECH_DEBT_BACKLOG.md`. To be tackled continuously alongside the feature phases. Priority = (Impact + Risk) × (6 − Effort).*
 
 > ✅ **Build blocker RESOLVED 2026-06-13:** the `teko` executable target in `CMakeLists.txt`
 > was missing `target_include_directories(teko PRIVATE src)` (only `teko_core` and `teko_tests`
@@ -334,7 +334,7 @@ intrinsics, strings, and `fn` event handlers compile from source. **Phase 11 com
 
 ---
 
-# 🧬 Roadmap from the Memorandum (Phases 12 & 14–21)
+# 🧬 Roadmap from the Memorandum (Phases 12 & 14–22)
 
 These phases were lifted from the project owner's roadmap memorandum (`TEKO_COMPILER_MEMORANDUM.txt`, Sections 2–4 — the long-term conceptual requirements, the reserved keyword matrix, and the immediate next steps). They expand the **language surface** that sits on top of the now-validated backend/runtime, and must land before the Self-Hosting milestone. **Phase 13 (Native Cryptography)** is interleaved here as a dedicated, owner-requested phase (not from the memorandum) — it is sequenced after Phase 12 and owns all cipher/hash/KDF work formerly bundled into the networking phase.
 
@@ -370,7 +370,7 @@ Inject the full token table the Lexer and Parser must mandatorily process:
 ciphers natively — no external libraries, no OpenSSL. Pure Teko/C primitives that every
 backend (the 16 native emitters + WASM) can emit, with constant-time discipline where it
 matters and test-vector-driven proof (NIST/RFC KATs + round-trips). This phase owns the
-cryptography moved out of the old "Networking, Web & Cryptography" phase (now Phase 17,
+cryptography moved out of the old "Networking, Web & Cryptography" phase (now Phase 18,
 Networking & Web), which consumes these primitives for TLS 1.3.*
 
 > **Status: all sub-phases landed and CI-green.** 13.1 (SHA-2/3, SHAKE, BLAKE3, HMAC,
@@ -456,7 +456,24 @@ after Phase 12 is complete.*
 
 ---
 
-## 🎯 PHASE 16: Zero-Overhead Optionals & Compile-Time Metaprogramming
+## 🔁 PHASE 16: Casting / Type Conversions & Parsing
+*Universal, culture-invariant conversions between types and to/from strings — the connective tissue between Phase 15's type model (primitives, complex types, user-defined classes) and every surface that serializes or displays a value.*
+
+### 1. Conversions between types
+*   Explicit and checked conversions across primitives, complex types, and user-defined classes — widening/narrowing, numeric ↔ boolean ↔ char, and type-to-type casts that fail loudly (no silent truncation/UB).
+
+### 2. Parsing to/from strings — WITH or WITHOUT formatting
+*   **Without a format → a UNIVERSAL, culture-invariant DEFAULT.** Parsing and stringification with no explicit format use ONE fixed canonical representation (e.g. `.`-decimal, ISO-8601 dates, unambiguous integer/float grammar) that **ignores the OS locale/format configuration entirely** — identical bytes on every machine, every region. (This is deliberately distinct from Phase 14's `time.format_local`, which is *explicitly* OS-locale/DST-aware; the default casting path is locale-INvariant.)
+*   **With an explicit format → the developer supplies it.** Specific outputs (currency, grouped digits, custom date masks, radices, precision) come from a format string/spec the developer passes; only then does formatting deviate from the universal default.
+
+### 3. Universal `to_string` (auto-called on concatenation / interpolation)
+*   **Every type — primitive, complex, and user-defined (class) — has an automatic `to_string`** producing the culture-invariant default representation. It is **auto-invoked when a value is concatenated with or interpolated into a string** (`"x = " + p`, `"{p}"`), so any value is printable without an explicit call.
+*   For **user-defined types**, `to_string` is the **built-in, overridable, inheritable convention method** defined by Phase 15's OOP model (a class may define or inherit `to_string`; a trait may provide a default). Phase 16 **discovers it by name through the OOP method table / vtable and auto-invokes it** — i.e. the auto-`to_string` machinery is Phase-16 work, but the *hook* (a conventional, dispatchable `to_string`) is established in **Phase 15** (see `docs/PHASE15_OOP.md`).
+*   Lowering follows the zero-runtime-reflection ethos: the auto-call resolves the concrete `to_string` at compile time (direct call for a concrete static type; a vtable slot for an abstract/trait-typed reference) — never a reflective runtime walk.
+
+---
+
+## 🎯 PHASE 17: Zero-Overhead Optionals & Compile-Time Metaprogramming
 
 *   Nullability `?T` via packed Value Types. The Elvis operator (`??`) compiles directly to hardware conditional instructions (`je`/`cbz`).
 *   `comptime`: Code execution at build time. Metaprogramming happens during compilation.
@@ -465,7 +482,7 @@ after Phase 12 is complete.*
 
 ---
 
-## 🌐 PHASE 17: Native Networking & Web Architecture
+## 🌐 PHASE 18: Native Networking & Web Architecture
 *Comprehensive networking from OSI Layer 4 to Layer 7, plus the native web keyword surface. Cryptography is its own dedicated phase — see **Phase 13: Native Cryptography**; TLS 1.3 below consumes Phase 13's cipher/KDF/CSPRNG primitives.*
 
 ### 1. Networking Stack
@@ -478,7 +495,7 @@ after Phase 12 is complete.*
 
 ---
 
-## 🧩 PHASE 18: Enterprise Parsers & Embedded Template Compiler
+## 🧩 PHASE 19: Enterprise Parsers & Embedded Template Compiler
 
 *   Linear O(1), reflection-free execution: `parse.json`, `parse.csv`, `parse.xml`.
 *   Native Template Engine integrated via rich String Literals: `html"""..."""`.
@@ -495,7 +512,7 @@ after Phase 12 is complete.*
 
 ---
 
-## 🔗 PHASE 19: Interoperability & Rich Metadata (`.teko_meta`)
+## 🔗 PHASE 20: Interoperability & Rich Metadata (`.teko_meta`)
 
 *   Lookup via `include_paths`, `static_links`, and `dynamic_links` in the `.tkp`.
 *   Teko modules embed rich type metadata in the `.teko_meta` section.
@@ -504,18 +521,18 @@ after Phase 12 is complete.*
 
 ---
 
-## 🧪 PHASE 20: Native Testing (`.tkt`) & Code Coverage
+## 🧪 PHASE 21: Native Testing (`.tkt`) & Code Coverage
 
 *   `.tkt` extension for co-located test files (same tree as the object under test). The release build ignores these files automatically.
 *   Native Code Coverage via codegen-assisted instrumentation, injecting counters into RAM at the start of each Basic Block. The linker embeds the `.teko_cov_map` section associating counters with code lines. The runtime dumps the counters at process end in a binary format (`.tkcov`).
 
 ---
 
-# 🔄 Final Milestone (Phase 21)
+# 🔄 Final Milestone (Phase 22)
 
 ---
 
-## 🔄 PHASE 21: Self-Containment (Self-Hosting / Bootstrapping)
+## 🔄 PHASE 22: Self-Containment (Self-Hosting / Bootstrapping)
 *The final step that crowns the industrial maturity of a systems programming language: using the language itself to compile itself.*
 
 ### 1. Translating the Compiler Modules from C to Teko

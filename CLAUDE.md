@@ -97,7 +97,9 @@ output locally (the goldens only `strstr`; always *assemble + run*, never trust 
   **Phase 12** (Frontend Grammar & Lexer Extension) is the **current phase** (PR #5;
   `docs/PHASE12_FRONTEND_GRAMMAR.md`). **Phase 13 = Native Cryptography** (dedicated,
   owner-requested, **functionally complete & CI-green** on `feat/phase-13-native-crypto`,
-  PR #6); the old 13–20 shifted to 14–21 (Self-Hosting = 21).
+  PR #6); the old 13–20 shifted to 14–21. A later **Phase 16 = Casting / Type Conversions &
+  Parsing** was inserted (owner-requested), shifting 16–21 → 17–22 (Self-Hosting = **22**); see
+  `docs/plan.md`.
 - **Phase 13 (Native Cryptography) decisions.** Every primitive is **portable C23 in the
   embedded native runtime** (`src/runtime/teko_crypto_*.c`) — the single source of truth,
   KAT-tested in the Unity suite against NIST/RFC vectors; it is *intended* to be linked into
@@ -153,7 +155,7 @@ output locally (the goldens only `strstr`; always *assemble + run*, never trust 
   is generated at compile time as a specialized, monomorphized (de)serializer **per concrete type**,
   emitted directly — Go-style generated marshalers, never a runtime reflective walker — consistent with
   the language's zero-runtime-reflection ethos. `serialize`/`stringify` (and `parse.json`/`.csv`/`.xml`)
-  lower this way in **Phase 18** (Enterprise Parsers); the tokens are reserved in Phase 12 with that destination.
+  lower this way in **Phase 19** (Enterprise Parsers); the tokens are reserved in Phase 12 with that destination.
 - **Browser FFI backend AND a real `.tks` frontend are built.** The WASM backend lowers the
   full Browser FFI surface (imports, DOM, events, allocator, facade), and the frontend now
   compiles real source for it: `teko build <f>.tks --target=wasm` lexes/parses/lowers the
@@ -271,3 +273,54 @@ gates; no dead tokens (every reserved concurrency/resilience keyword is live wit
 timing on the real monotonic clock. Suite 200/200; ASan/UBSan (both dispatch paths) + TSan green;
 16 native goldens intact. **Ready to leave draft** (PR #7; the human merges — no merge/force-push
 from the agent). Continuation/history: `docs/HANDOFF_PHASE14.md`.
+
+**Phase 15 (Bare-Metal Object-Oriented Paradigm) is IN PROGRESS** on `feat/phase-15-oop` (PR #8,
+draft) — `docs/PHASE15_OOP.md`. Object orientation with **zero runtime reflection** (compile-time
+field indices + method slots; no RTTI/attribute bags). Sub-block **15.A `class` (concrete) is DONE**
+on both targets (LIVE token, executable `.tks` proofs):
+- **Object model** = a handle-based register-width field-cell store (`src/runtime/teko_object.c`, 5
+  KATs) — the Phase-14 "C runtime = source of truth → opcode family → native `teko_rt_*` + WASM
+  reactor → `.tks` proof" pattern. Opcodes `OP_OBJ_NEW/SET/GET/FREE` (0x6A-0x6D); native
+  `teko_rt_object_*`, WASM reactor import (`teko_object.c` added to the reactor + EXPORTS).
+- **Methods** = function-table routines taking `self`; **static dispatch** via a NEW synchronous
+  table-call primitive `OP_CALL_FUNC` (0x6E) — native `teko_rt_call` (routine fn typedef widened
+  `void→long`; the body's last `$w0` survives `ret`), WASM `call_indirect (type $task)` + a
+  `FUNC_END` `$w0`→`frame[0]` spill so the caller reads the result. Sets `uses_spawn`.
+- **Frontend** (`frontend_interop.c`): `collect_classes` layout/method pre-pass (method slots
+  continue after `nfns`, dense table); member access via the **dotted-identifier lexeme**
+  (`obj.field` read/write, `obj.method(args)` static call with `self`=arg0); `ClassName()`
+  instantiation → `OP_OBJ_NEW`; `emit_method_routines` (bodies as routines, `self` class-bound);
+  `return <expr>;`. Decision: `routines`/methods share the routine table + scheduler TU.
+- Proofs: `runtime/{native,wasm}/samples/class.tks` → `7`,`70` (native run-native.sh /
+  WASM run-class.mjs `[7,70]`). Suite 213/213; ASan/UBSan (both paths) + TSan green; 16 goldens
+  intact; existing routine WASM proofs still pass after the FUNC_END spill.
+Sub-block **15.B `abstract` + `trait` is DONE** on both targets — dynamic dispatch via a
+**compile-time static vtable**, trait composition with **collision = compile error**, `to_string`
+dispatched through the vtable like any method (the Phase-16 hook). Runtime `src/runtime/teko_vtable.c`
+(`vtable[type_id][method_id] → routine slot`) → `OP_VTABLE_SET/GET` (0x6F/0x70) → native
+`teko_rt_vtable_*` + WASM reactor import. Frontend: `trait`/`abstract` grammar + `class C : T1,T2`
+implements clause + bodyless (abstract, slot -1) methods + a global method-id space;
+**fat trait-typed locals** (`let g: Trait = c` = instance-handle slot + a hidden type-id slot
+holding the concrete type_id as a compile-time constant — object layout UNCHANGED, 15.A
+byte-identical); vtable populated at `$main` start; `g.method()` → `vtable_get` → `OP_CALL_FUNC`.
+Decision: indexed runtime vtable (not an inline branch chain); collision = two composed traits
+declaring the same method without a class override. WASM needed a **nesting-safe `OP_CALL_FUNC`**
+(stack-disciplined `$callfp` frame) so a method calling its own/another method works. Proofs
+`runtime/{native,wasm}/samples/traits.tks` → `12,112,9,209`. Suite 200→221; ASan/UBSan (both paths)
++ TSan green; 16 goldens intact; existing class/routines/producer/capstone WASM proofs intact.
+Sub-block **15.C `<T>` generics is DONE** — real per-type **monomorphization**: a generic
+`class Box<T>` is specialized into one concrete `Box$Arg` per instantiation (type-param substituted
+at compile time, zero runtime cost). `collect_generics` discovers templates + instantiations;
+`collect_classes` clones a concrete instance per type-arg (mono slots deferred after non-generic
+classes); `emit_mono_routines` re-lexes the template body per instance with `g_subst` (T→Arg) active,
+so `T()` makes `Arg` + a `T`-typed local is `Arg`-typed. Proof `generics.tks` → `11,22`
+(`Factory<Circle>`/`Factory<Square>`). Sub-block **15.D events is DONE** — `event`/`subscribe`/`raise`
++ `fanout`/`fire_and_forget` over the Phase-14 spawn runtime (frontend-only): static subscriptions
+(`collect_events`); `raise E(args)` fan-outs by spawning each subscriber (drained at exit). Proof
+`eventbus.tks` → `1,2,15,25`.
+**PHASE 15 IS COMPLETE** — 15.A–15.D done & CI-green on all four gates (incl. Windows). No dead
+tokens (every reserved OOP keyword LIVE with an executable `.tks` proof native AND WASM); zero
+runtime reflection (compile-time field indices/method slots/static vtables/monomorphization).
+Suite 223/223; ASan/UBSan (both paths) + TSan green; 16 goldens intact. **Ready to leave draft**
+(PR #8; the human merges — no merge/force-push). Deferred (owner): full async-method `intent<>`/
+`await` semantics (parsing accepted; bodies lower synchronously).

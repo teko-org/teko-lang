@@ -1241,3 +1241,413 @@ void test_frontend_interop_timespan_normalization(void) {
 
     codegen_li_free_context(buffer);
 }
+
+// Phase 15 (15.A): the object model IL family (OP_OBJ_*) lowers to teko_rt_object_* reactor
+// imports on WASM. Hand-build the IL for `obj = new(2); obj.f0 = 42; x = obj.f0` (the lowering
+// the `class` frontend will emit), and assert (1) the opcodes + uses_object flag, and (2) the
+// emitted .wat carries the reactor imports, the shared-memory import, and the call sites.
+void test_codegen_li_object_family(void) {
+    BytecodeBuffer* buffer = codegen_li_create_context();
+    TEST_ASSERT_NOT_NULL(buffer);
+    buffer->local_count = 2; // $v0 = handle, $v1 = read-back value
+
+    // obj = new(2)
+    codegen_li_emit_iconst(buffer, 2);
+    codegen_li_emit_object(buffer, OP_OBJ_NEW);     // $w0 = handle
+    codegen_li_emit_store_local(buffer, 0);         // $v0 = handle
+    // obj.f0 = 42   -> object_set(handle, 0, 42)
+    codegen_li_emit_load_local(buffer, 0);          // $w0 = handle
+    codegen_li_emit_setarg(buffer, 0);              // $a0 = handle
+    codegen_li_emit_iconst(buffer, 0);              // $w0 = idx 0
+    codegen_li_emit_setarg(buffer, 1);              // $a1 = idx
+    codegen_li_emit_iconst(buffer, 42);             // $w0 = value
+    codegen_li_emit_object(buffer, OP_OBJ_SET);     // object_set -> $w0 = 0
+    // x = obj.f0    -> object_get(handle, 0)
+    codegen_li_emit_load_local(buffer, 0);          // $w0 = handle
+    codegen_li_emit_setarg(buffer, 0);              // $a0 = handle
+    codegen_li_emit_iconst(buffer, 0);              // $w0 = idx 0
+    codegen_li_emit_object(buffer, OP_OBJ_GET);     // object_get -> $w0 = value
+    codegen_li_emit_store_local(buffer, 1);         // $v1 = value
+    codegen_li_emit_halt(buffer);
+
+    // The emit helper flips the runtime-link flag, so backends import/link teko_object.
+    TEST_ASSERT_EQUAL_INT(1, buffer->uses_object);
+    // The three object opcodes are present in the byte stream.
+    int saw_new = 0, saw_set = 0, saw_get = 0;
+    for (int i = 0; i < buffer->size; i++) {
+        if (buffer->code[i] == (unsigned char)OP_OBJ_NEW) saw_new = 1;
+        if (buffer->code[i] == (unsigned char)OP_OBJ_SET) saw_set = 1;
+        if (buffer->code[i] == (unsigned char)OP_OBJ_GET) saw_get = 1;
+    }
+    TEST_ASSERT_TRUE(saw_new && saw_set && saw_get);
+
+    // Through the bridge: a real .wat importing the reactor entry points + shared memory.
+    TekoTarget target;
+    target.arch = ARCH_WASM32;
+    target.os = OS_WASI;
+    strncpy(target.target_string, "wasm32-wasi", sizeof(target.target_string) - 1);
+    const char* wat = "output_object_family.wat";
+    TEST_ASSERT_EQUAL_INT(0, codegen_li_emit_wasm(buffer, wat, target, NULL, NULL, NULL, NULL, 0));
+
+    FILE* f = fopen(wat, "r");
+    TEST_ASSERT_NOT_NULL(f);
+    char* out = (char*)malloc(65536);
+    TEST_ASSERT_NOT_NULL(out);
+    memset(out, 0, 65536);
+    size_t n = fread(out, 1, 65535, f); out[n] = '\0'; fclose(f);
+
+    TEST_ASSERT_NOT_NULL(strstr(out, "(import \"crypto\" \"teko_rt_object_new\" (func $object_new (param i32) (result i32)))"));
+    TEST_ASSERT_NOT_NULL(strstr(out, "(import \"crypto\" \"teko_rt_object_set\" (func $object_set (param i32) (param i32) (param i32) (result i32)))"));
+    TEST_ASSERT_NOT_NULL(strstr(out, "(import \"crypto\" \"teko_rt_object_get\" (func $object_get (param i32) (param i32) (result i32)))"));
+    TEST_ASSERT_NOT_NULL(strstr(out, "(import \"env\" \"memory\" (memory 1))")); // host-owned shared memory
+    TEST_ASSERT_NOT_NULL(strstr(out, "call $object_new"));
+    TEST_ASSERT_NOT_NULL(strstr(out, "call $object_set"));
+    TEST_ASSERT_NOT_NULL(strstr(out, "call $object_get"));
+
+    free(out);
+    remove(wat);
+    codegen_li_free_context(buffer);
+}
+
+// Phase 15 (15.B): the static-vtable IL family (OP_VTABLE_*) lowers to teko_rt_vtable_* reactor
+// imports on WASM. Hand-build the IL for `vtable_set(1, 0, 7); slot = vtable_get(1, 0)` (a vtable
+// population + a dynamic-dispatch lookup) and assert the opcodes + uses_vtable + the emitted .wat
+// (reactor imports, shared memory, call sites).
+void test_codegen_li_vtable_family(void) {
+    BytecodeBuffer* buffer = codegen_li_create_context();
+    TEST_ASSERT_NOT_NULL(buffer);
+    buffer->local_count = 1;
+
+    // vtable_set(type=1, method=0, slot=7)
+    codegen_li_emit_iconst(buffer, 1); codegen_li_emit_setarg(buffer, 0); // $a0 = type_id
+    codegen_li_emit_iconst(buffer, 0); codegen_li_emit_setarg(buffer, 1); // $a1 = method_id
+    codegen_li_emit_iconst(buffer, 7);                                    // $w0 = slot
+    codegen_li_emit_vtable(buffer, OP_VTABLE_SET);
+    // slot = vtable_get(type=1, method=0)
+    codegen_li_emit_iconst(buffer, 1); codegen_li_emit_setarg(buffer, 0); // $a0 = type_id
+    codegen_li_emit_iconst(buffer, 0);                                    // $w0 = method_id
+    codegen_li_emit_vtable(buffer, OP_VTABLE_GET);                        // $w0 = slot
+    codegen_li_emit_store_local(buffer, 0);
+    codegen_li_emit_halt(buffer);
+
+    TEST_ASSERT_EQUAL_INT(1, buffer->uses_vtable);
+    int saw_set = 0, saw_get = 0;
+    for (int i = 0; i < buffer->size; i++) {
+        if (buffer->code[i] == (unsigned char)OP_VTABLE_SET) saw_set = 1;
+        if (buffer->code[i] == (unsigned char)OP_VTABLE_GET) saw_get = 1;
+    }
+    TEST_ASSERT_TRUE(saw_set && saw_get);
+
+    TekoTarget target;
+    target.arch = ARCH_WASM32; target.os = OS_WASI;
+    strncpy(target.target_string, "wasm32-wasi", sizeof(target.target_string) - 1);
+    const char* wat = "output_vtable_family.wat";
+    TEST_ASSERT_EQUAL_INT(0, codegen_li_emit_wasm(buffer, wat, target, NULL, NULL, NULL, NULL, 0));
+    FILE* f = fopen(wat, "r");
+    TEST_ASSERT_NOT_NULL(f);
+    char* out = (char*)malloc(65536);
+    TEST_ASSERT_NOT_NULL(out);
+    memset(out, 0, 65536);
+    size_t n = fread(out, 1, 65535, f); out[n] = '\0'; fclose(f);
+    TEST_ASSERT_NOT_NULL(strstr(out, "(import \"crypto\" \"teko_rt_vtable_set\" (func $vtable_set (param i32) (param i32) (param i32) (result i32)))"));
+    TEST_ASSERT_NOT_NULL(strstr(out, "(import \"crypto\" \"teko_rt_vtable_get\" (func $vtable_get (param i32) (param i32) (result i32)))"));
+    TEST_ASSERT_NOT_NULL(strstr(out, "(import \"env\" \"memory\" (memory 1))"));
+    TEST_ASSERT_NOT_NULL(strstr(out, "call $vtable_set"));
+    TEST_ASSERT_NOT_NULL(strstr(out, "call $vtable_get"));
+    free(out);
+    remove(wat);
+    codegen_li_free_context(buffer);
+}
+
+// Phase 15 (15.A): the synchronous table-call primitive (OP_CALL_FUNC) — method dispatch. Build
+// IL for a routine `fn add5(n) { return n + 5; }` and a $main that calls it synchronously with 7,
+// then assert (1) the OP_CALL_FUNC opcode + uses_spawn flag, and (2) the emitted .wat dispatches
+// via call_indirect against the $task table and emits the method body as a table routine.
+void test_codegen_li_call_func_sync(void) {
+    BytecodeBuffer* buffer = codegen_li_create_context();
+    TEST_ASSERT_NOT_NULL(buffer);
+    buffer->local_count = 1; // $v0 = the call result in $main
+
+    // $main: r = add5(7)  -> stage 7 in $a0, slot 0 in $w0, OP_CALL_FUNC argc=1
+    codegen_li_emit_iconst(buffer, 7);
+    codegen_li_emit_setarg(buffer, 0);              // $a0 = 7
+    codegen_li_emit_iconst(buffer, 0);              // $w0 = slot 0 (static dispatch)
+    codegen_li_emit_call_func(buffer, 1);           // $w0 = add5(7)
+    codegen_li_emit_store_local(buffer, 0);
+    codegen_li_emit_halt(buffer);
+    // fn add5(n) { n + 5 }  as routine slot 0
+    codegen_li_emit_func_begin(buffer, 0);
+    codegen_li_emit_load_spawn_arg(buffer, 0);      // $w0 = n
+    codegen_li_emit_store(buffer);                  // $w1 = n
+    codegen_li_emit_iconst(buffer, 5);              // $w0 = 5
+    codegen_li_emit_binop(buffer, OP_ADD);          // $w0 = 5 + n
+    codegen_li_emit_func_end(buffer);
+
+    TEST_ASSERT_EQUAL_INT(1, buffer->uses_spawn); // routine table + scheduler TU needed
+    int saw_call_func = 0;
+    for (int i = 0; i < buffer->size; i++)
+        if (buffer->code[i] == (unsigned char)OP_CALL_FUNC) saw_call_func = 1;
+    TEST_ASSERT_TRUE(saw_call_func);
+
+    TekoTarget target;
+    target.arch = ARCH_WASM32;
+    target.os = OS_WASI;
+    strncpy(target.target_string, "wasm32-wasi", sizeof(target.target_string) - 1);
+    const char* wat = "output_call_func.wat";
+    TEST_ASSERT_EQUAL_INT(0, codegen_li_emit_wasm(buffer, wat, target, NULL, NULL, NULL, NULL, 0));
+
+    FILE* f = fopen(wat, "r");
+    TEST_ASSERT_NOT_NULL(f);
+    char* out = (char*)malloc(65536);
+    TEST_ASSERT_NOT_NULL(out);
+    memset(out, 0, 65536);
+    size_t n = fread(out, 1, 65535, f); out[n] = '\0'; fclose(f);
+
+    TEST_ASSERT_NOT_NULL(strstr(out, "[WASM CallFunc]")); // the sync-call lowering ran
+    TEST_ASSERT_NOT_NULL(strstr(out, "call_indirect (type $task)"));
+    TEST_ASSERT_NOT_NULL(strstr(out, "(func $routine_0")); // method body emitted as a table routine
+
+    free(out);
+    remove(wat);
+    codegen_li_free_context(buffer);
+}
+
+// Phase 15 (15.A): compile a REAL class `.tks` (declaration + fields + method + instantiation +
+// field write + method call) through the interop frontend, and assert the lowering: OP_OBJ_NEW
+// (instantiation), OP_OBJ_SET (field writes), OP_OBJ_GET (field reads in the method), OP_CALL_FUNC
+// (static method dispatch), plus uses_object/uses_spawn and a method body emitted as a routine.
+void test_frontend_interop_class_concrete(void) {
+    // Methods mirror functions: COMPLETE signature with a return type, and may be GENERIC (`<T>`)
+    // or `async` (returns intent<>). The frontend must parse all three forms and still bind params
+    // + resolve members correctly (the `<T>` clause is skipped — uniform i32 model; 15.C adds
+    // per-type monomorphization; async parses, full intent/await semantics are a later sub-block).
+    const char* src =
+        "extern fn emit_int(n) from \"teko_rt\" as \"teko_rt_emit_int\";\n"
+        "class Point {\n"
+        "  let x;\n"
+        "  let y;\n"
+        "  fn sum(self): i32 { return self.x + self.y; }\n"
+        "  fn scale<T>(self, k): i32 { return (self.x + self.y) * k; }\n"
+        "  async fn deferred(self): intent<i32> { return self.x + 1; }\n"
+        "}\n"
+        "let p = Point();\n"
+        "p.x = 3;\n"
+        "p.y = 4;\n"
+        "let s = p.sum();\n"
+        "emit_int(s);\n"
+        "let t = p.scale(10);\n"
+        "emit_int(t);\n";
+
+    BytecodeBuffer* buffer = codegen_li_create_context();
+    TEST_ASSERT_NOT_NULL(buffer);
+    TEST_ASSERT_EQUAL_INT(0, teko_compile_interop(src, buffer));
+
+    TEST_ASSERT_EQUAL_INT(1, buffer->uses_object); // class instances -> teko_object runtime
+    TEST_ASSERT_EQUAL_INT(1, buffer->uses_spawn);  // method dispatch -> routine table + scheduler
+
+    int saw_new = 0, saw_set = 0, saw_get = 0, saw_call = 0, n_set = 0;
+    for (int i = 0; i < buffer->size; i++) {
+        unsigned char op = buffer->code[i];
+        if (op == (unsigned char)OP_OBJ_NEW)  saw_new = 1;
+        if (op == (unsigned char)OP_OBJ_SET){ saw_set = 1; n_set++; }
+        if (op == (unsigned char)OP_OBJ_GET)  saw_get = 1;
+        if (op == (unsigned char)OP_CALL_FUNC) saw_call = 1;
+    }
+    TEST_ASSERT_TRUE(saw_new);            // p = Point()
+    TEST_ASSERT_TRUE(saw_set && n_set >= 2); // p.x = 3; p.y = 4;
+    TEST_ASSERT_TRUE(saw_get);            // self.x / self.y inside sum()
+    TEST_ASSERT_TRUE(saw_call);           // p.sum() static dispatch
+
+    // Through the bridge: the method body is a table routine; the object runtime is imported.
+    TekoTarget target;
+    target.arch = ARCH_WASM32;
+    target.os = OS_WASI;
+    strncpy(target.target_string, "wasm32-wasi", sizeof(target.target_string) - 1);
+    const char* wat = "output_class_concrete.wat";
+    TEST_ASSERT_EQUAL_INT(0, codegen_li_emit_wasm(buffer, wat, target, NULL, NULL, NULL, NULL, 0));
+    FILE* f = fopen(wat, "r");
+    TEST_ASSERT_NOT_NULL(f);
+    char* out = (char*)malloc(65536);
+    TEST_ASSERT_NOT_NULL(out);
+    memset(out, 0, 65536);
+    size_t n = fread(out, 1, 65535, f); out[n] = '\0'; fclose(f);
+    TEST_ASSERT_NOT_NULL(strstr(out, "call $object_new"));
+    TEST_ASSERT_NOT_NULL(strstr(out, "call_indirect (type $task)")); // method dispatch
+    TEST_ASSERT_NOT_NULL(strstr(out, "(func $routine_0"));            // sum() emitted as a routine
+    free(out);
+    remove(wat);
+    codegen_li_free_context(buffer);
+}
+
+// Phase 15 (15.B): trait/abstract grammar — a `trait` contract + a `class C : Trait` that
+// implements it compiles (returns 0) and lowers the concrete instance + method (OBJ_NEW +
+// CALL_FUNC). Concrete-typed receivers keep 15.A static dispatch; the trait registry + method-id
+// space are built without disturbing the object lowering.
+void test_frontend_interop_trait_grammar(void) {
+    const char* src =
+        "extern fn emit_int(n) from \"teko_rt\" as \"teko_rt_emit_int\";\n"
+        "trait Shape { fn area(self): i32; }\n"
+        "class Circle : Shape {\n"
+        "  let r;\n"
+        "  fn area(self): i32 { return self.r * self.r * 3; }\n"
+        "}\n"
+        "let c = Circle();\n"
+        "c.r = 2;\n"
+        "let a = c.area();\n"
+        "emit_int(a);\n";
+    BytecodeBuffer* buffer = codegen_li_create_context();
+    TEST_ASSERT_NOT_NULL(buffer);
+    TEST_ASSERT_EQUAL_INT(0, teko_compile_interop(src, buffer)); // valid composition compiles
+    TEST_ASSERT_EQUAL_INT(1, buffer->uses_object);
+    int saw_new = 0, saw_call = 0;
+    for (int i = 0; i < buffer->size; i++) {
+        if (buffer->code[i] == (unsigned char)OP_OBJ_NEW)  saw_new = 1;
+        if (buffer->code[i] == (unsigned char)OP_CALL_FUNC) saw_call = 1;
+    }
+    TEST_ASSERT_TRUE(saw_new && saw_call);
+    codegen_li_free_context(buffer);
+}
+
+// Phase 15 (15.B): trait-composition COLLISION = compile error. A class composing two traits that
+// both declare `m`, without overriding it, is ambiguous -> teko_compile_interop fails (non-zero) and
+// emits no module. The same program with a class override compiles cleanly.
+void test_frontend_interop_trait_collision(void) {
+    const char* bad =
+        "trait A { fn m(self): i32; }\n"
+        "trait B { fn m(self): i32; }\n"
+        "class C : A, B { let v; fn other(self): i32 { return self.v; } }\n"
+        "let c = C();\n";
+    BytecodeBuffer* b1 = codegen_li_create_context();
+    TEST_ASSERT_NOT_NULL(b1);
+    TEST_ASSERT_NOT_EQUAL(0, teko_compile_interop(bad, b1)); // ambiguous -> compile error
+    codegen_li_free_context(b1);
+
+    const char* ok =
+        "trait A { fn m(self): i32; }\n"
+        "trait B { fn m(self): i32; }\n"
+        "class C : A, B { let v; fn m(self): i32 { return self.v + 1; } }\n"
+        "let c = C();\n";
+    BytecodeBuffer* b2 = codegen_li_create_context();
+    TEST_ASSERT_NOT_NULL(b2);
+    TEST_ASSERT_EQUAL_INT(0, teko_compile_interop(ok, b2)); // override resolves the ambiguity
+    codegen_li_free_context(b2);
+}
+
+// Phase 15 (15.B): DYNAMIC dispatch through a FAT trait-typed local. A `Shape`-typed `g` reassigned
+// across two implementors dispatches `g.area()` via the static vtable: the program emits OP_VTABLE_SET
+// (population at $main start) + OP_VTABLE_GET (dispatch) + OP_CALL_FUNC (the resolved slot), and sets
+// uses_vtable + uses_object. Concrete `self.area()` inside a method stays static (OP_CALL_FUNC w/o GET).
+void test_frontend_interop_trait_dynamic_dispatch(void) {
+    const char* src =
+        "extern fn emit_int(n) from \"teko_rt\" as \"teko_rt_emit_int\";\n"
+        "trait Shape { fn area(self): i32; }\n"
+        "class Circle : Shape { let r; fn area(self): i32 { return self.r * self.r * 3; } }\n"
+        "class Square : Shape { let s; fn area(self): i32 { return self.s * self.s; } }\n"
+        "let c = Circle(); c.r = 2;\n"
+        "let sq = Square(); sq.s = 3;\n"
+        "let g: Shape = c;\n"
+        "let a1 = g.area(); emit_int(a1);\n"
+        "g = sq;\n"
+        "let a2 = g.area(); emit_int(a2);\n";
+    BytecodeBuffer* buffer = codegen_li_create_context();
+    TEST_ASSERT_NOT_NULL(buffer);
+    TEST_ASSERT_EQUAL_INT(0, teko_compile_interop(src, buffer));
+    TEST_ASSERT_EQUAL_INT(1, buffer->uses_vtable);
+    TEST_ASSERT_EQUAL_INT(1, buffer->uses_object);
+    int saw_set = 0, saw_get = 0, saw_call = 0;
+    for (int i = 0; i < buffer->size; i++) {
+        unsigned char op = buffer->code[i];
+        if (op == (unsigned char)OP_VTABLE_SET) saw_set = 1;  // vtable population at $main start
+        if (op == (unsigned char)OP_VTABLE_GET) saw_get = 1;  // dynamic dispatch resolution
+        if (op == (unsigned char)OP_CALL_FUNC)  saw_call = 1; // the resolved-slot call
+    }
+    TEST_ASSERT_TRUE(saw_set && saw_get && saw_call);
+
+    // Through the bridge: the .wat imports the vtable reactor entries + dispatches via call_indirect.
+    TekoTarget target;
+    target.arch = ARCH_WASM32; target.os = OS_WASI;
+    strncpy(target.target_string, "wasm32-wasi", sizeof(target.target_string) - 1);
+    const char* wat = "output_trait_dispatch.wat";
+    TEST_ASSERT_EQUAL_INT(0, codegen_li_emit_wasm(buffer, wat, target, NULL, NULL, NULL, NULL, 0));
+    FILE* f = fopen(wat, "r");
+    TEST_ASSERT_NOT_NULL(f);
+    char* out = (char*)malloc(131072);
+    TEST_ASSERT_NOT_NULL(out);
+    memset(out, 0, 131072);
+    size_t n = fread(out, 1, 131071, f); out[n] = '\0'; fclose(f);
+    TEST_ASSERT_NOT_NULL(strstr(out, "call $vtable_set"));
+    TEST_ASSERT_NOT_NULL(strstr(out, "call $vtable_get"));
+    TEST_ASSERT_NOT_NULL(strstr(out, "call_indirect (type $task)"));
+    free(out);
+    remove(wat);
+    codegen_li_free_context(buffer);
+}
+
+// Phase 15 (15.C): generics via real per-type MONOMORPHIZATION. `Factory<T>` instantiated at two
+// concrete types generates two SPECIALIZED method bodies (Factory$Circle.make, Factory$Square.make),
+// each with `T()` substituted. Assert it compiles, lowers OBJ_NEW + CALL_FUNC, and the .wat carries
+// FOUR routines (Circle.tag, Square.tag, and the two specialized makes) — proving two distinct
+// specializations were emitted, not one shared generic body.
+void test_frontend_interop_generics_monomorphization(void) {
+    const char* src =
+        "extern fn emit_int(n) from \"teko_rt\" as \"teko_rt_emit_int\";\n"
+        "class Circle { let r; fn tag(self): i32 { return 11; } }\n"
+        "class Square { let s; fn tag(self): i32 { return 22; } }\n"
+        "class Factory<T> { let d; fn make(self): i32 { let t = T(); let r = t.tag(); return r; } }\n"
+        "let fc = Factory<Circle>(); let a = fc.make(); emit_int(a);\n"
+        "let fs = Factory<Square>(); let b = fs.make(); emit_int(b);\n";
+    BytecodeBuffer* buffer = codegen_li_create_context();
+    TEST_ASSERT_NOT_NULL(buffer);
+    TEST_ASSERT_EQUAL_INT(0, teko_compile_interop(src, buffer));
+    TEST_ASSERT_EQUAL_INT(1, buffer->uses_object);
+    int saw_new = 0, saw_call = 0;
+    for (int i = 0; i < buffer->size; i++) {
+        if (buffer->code[i] == (unsigned char)OP_OBJ_NEW)  saw_new = 1;
+        if (buffer->code[i] == (unsigned char)OP_CALL_FUNC) saw_call = 1;
+    }
+    TEST_ASSERT_TRUE(saw_new && saw_call);
+
+    TekoTarget target;
+    target.arch = ARCH_WASM32; target.os = OS_WASI;
+    strncpy(target.target_string, "wasm32-wasi", sizeof(target.target_string) - 1);
+    const char* wat = "output_generics.wat";
+    TEST_ASSERT_EQUAL_INT(0, codegen_li_emit_wasm(buffer, wat, target, NULL, NULL, NULL, NULL, 0));
+    FILE* f = fopen(wat, "r");
+    TEST_ASSERT_NOT_NULL(f);
+    char* out = (char*)malloc(131072);
+    TEST_ASSERT_NOT_NULL(out);
+    memset(out, 0, 131072);
+    size_t n = fread(out, 1, 131071, f); out[n] = '\0'; fclose(f);
+    // Circle.tag=$routine_0, Square.tag=$routine_1, Factory$Circle.make=$routine_2,
+    // Factory$Square.make=$routine_3 — the 4th routine proves two distinct specializations.
+    TEST_ASSERT_NOT_NULL(strstr(out, "(func $routine_3"));
+    free(out);
+    remove(wat);
+    codegen_li_free_context(buffer);
+}
+
+// Phase 15 (15.D): event subsystem. `event`/`subscribe`/`raise` — `raise Ping(5)` fan-outs to the
+// two subscribers (fanout + fire_and_forget) by SPAWNING each handler (compile-time-static
+// subscriber set). Assert it compiles, sets uses_spawn, and lowers TWO spawns (one per subscriber)
+// with the staged arg — i.e. the fan-out is materialized at compile time.
+void test_frontend_interop_event_fanout(void) {
+    const char* src =
+        "extern fn emit_int(n) from \"teko_rt\" as \"teko_rt_emit_int\";\n"
+        "event Ping;\n"
+        "fn onA(n) { let r = n + 10; emit_int(r); }\n"
+        "fn onB(n) { let r = n + 20; emit_int(r); }\n"
+        "subscribe Ping with onA fanout;\n"
+        "subscribe Ping with onB fire_and_forget;\n"
+        "emit_int(1);\n"
+        "raise Ping(5);\n"
+        "emit_int(2);\n";
+    BytecodeBuffer* buffer = codegen_li_create_context();
+    TEST_ASSERT_NOT_NULL(buffer);
+    TEST_ASSERT_EQUAL_INT(0, teko_compile_interop(src, buffer));
+    TEST_ASSERT_EQUAL_INT(1, buffer->uses_spawn); // raise -> spawn over the cooperative scheduler
+    int nspawn = 0;
+    for (int i = 0; i < buffer->size; i++)
+        if (buffer->code[i] == (unsigned char)OP_SPAWN_ASYNC_ARGS) nspawn++;
+    TEST_ASSERT_EQUAL_INT(2, nspawn); // one spawn per subscriber (fan-out materialized at compile time)
+    codegen_li_free_context(buffer);
+}

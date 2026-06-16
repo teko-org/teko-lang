@@ -102,6 +102,43 @@ check_uuid() {
 }
 
 check hello.tks "hello from teko native"
+# Phase 15 (15.A): concrete class — fields + methods + STATIC dispatch, zero runtime reflection.
+# `Point()` -> OP_OBJ_NEW; `p.x = 3` -> OP_OBJ_SET; `p.sum()`/`p.scale(10)` -> OP_CALL_FUNC
+# (the method routine reads `self.x`/`self.y` via OP_OBJ_GET). Prints 7 (3+4) then 70 ((3+4)*10).
+check class.tks "$(cat <<'EXP'
+7
+70
+EXP
+)"
+# Phase 15 (15.B): abstract/trait dynamic dispatch via a compile-time STATIC VTABLE. A Shape-typed
+# fat reference dispatches `area()`/`to_string()` to Circle then (after reassignment) Square by the
+# runtime type_id: vtable_get -> slot -> OP_CALL_FUNC. `to_string` rides the same vtable (Phase-16
+# hook). 12 (Circle.area), 112 (Circle.to_string), 9 (Square.area), 209 (Square.to_string).
+check traits.tks "$(cat <<'EXP'
+12
+112
+9
+209
+EXP
+)"
+# Phase 15 (15.C): generics via real per-type MONOMORPHIZATION. Factory<T> is specialized per
+# instantiation (Factory$Circle/Factory$Square); inside make(), T() instantiates the concrete type
+# and t.tag() statically dispatches — resolved at compile time, no runtime type param. 11, 22.
+check generics.tks "$(cat <<'EXP'
+11
+22
+EXP
+)"
+# Phase 15 (15.D): event subsystem — `event`/`subscribe`/`raise` with fanout + fire_and_forget.
+# `raise Ping(5)` fan-outs to both subscribers, spawned over the cooperative scheduler + drained at
+# exit, so handlers run AFTER the main body (deferred). 1, 2 (main), then 15 (onA), 25 (onB).
+check eventbus.tks "$(cat <<'EXP'
+1
+2
+15
+25
+EXP
+)"
 # Phase 14 (14.A): `routines { worker(); worker(); }` fires two background tasks. The native
 # scheduler (teko_rt_run) drains them at $main exit, so they run AFTER main's body — the two
 # "worker ran" lines follow "main start"/"main end", proving deferred (not inline) execution.

@@ -158,6 +158,215 @@ typedef struct {
 // 2=LOAD the handler param ($w0 <- $w1), 3=LOAD_LOCAL payload (a named local).
 typedef struct { int kind; int payload; } Prod;
 
+// ---- Phase 15 (15.A): class registry + member access -----------------------------
+// ZERO RUNTIME REFLECTION: a class is a COMPILE-TIME layout (ordered field list) + a method
+// table (each method -> a routine table slot, shared with `fn` handlers). Instances are
+// teko_object handles; `obj.field` resolves the field's index at compile time (OP_OBJ_GET/SET)
+// and `obj.method(args)` resolves the method's slot at compile time (static dispatch via
+// OP_CALL_FUNC, passing `self` as arg0). File-static state — one single-threaded compile per
+// teko_compile_interop call (reset at entry); avoids threading the registry through every helper.
+#define TEKO_MAX_CLASSES        64
+#define TEKO_CLASS_MAX_FIELDS   64
+#define TEKO_CLASS_MAX_METHODS  64
+#define TEKO_CLASS_MAX_TRAITS   8
+typedef struct {
+    char name[96];
+    char fields[TEKO_CLASS_MAX_FIELDS][96]; int nfields;
+    char methods[TEKO_CLASS_MAX_METHODS][96];
+    int  method_slot[TEKO_CLASS_MAX_METHODS];    // routine table slot (global, dense); -1 = abstract (bodyless)
+    int  method_nparams[TEKO_CLASS_MAX_METHODS]; // includes the implicit leading `self`
+    int  nmethods;
+    // Phase 15 (15.B): the traits/abstract bases this class composes (`class C : T1, T2`), and
+    // whether the class itself is `abstract` (a contract that cannot be instantiated directly).
+    char traits[TEKO_CLASS_MAX_TRAITS][96]; int ntraits;
+    int  is_abstract;
+    // The concrete class's dense type_id (= its index in g_class) is used as the vtable row id.
+    // Phase 15 (15.C): MONOMORPHIZATION. A generic template `class Box<T>` is NOT registered
+    // directly; instead one CONCRETE instance per used type-arg is registered as "Box$Arg" with the
+    // type-param substituted. For such an instance: typeparam = "T", mono_arg = "Arg" (the concrete
+    // type), tmpl_name = "Box" (the source template to re-lex its body from). Empty for a plain class.
+    char typeparam[96];
+    char mono_arg[96];
+    char tmpl_name[96];
+} ClassInfo;
+static ClassInfo g_class[TEKO_MAX_CLASSES];
+static int g_nclass;
+
+// ---- Phase 15 (15.B): trait registry + global method-id table -----------------------------
+// A `trait NAME { fn m(self): T; … }` is a pure CONTRACT — ordered bodyless method names, no
+// fields, no slots. A concrete class supplies the bodies. Dynamic dispatch through a trait-typed
+// reference resolves (concrete type_id, method_id) -> routine slot via the static vtable runtime.
+#define TEKO_MAX_TRAITS        64
+#define TEKO_MAX_METHOD_NAMES  256
+typedef struct {
+    char name[96];
+    char methods[TEKO_CLASS_MAX_METHODS][96]; int nmethods;
+} TraitInfo;
+static TraitInfo g_trait[TEKO_MAX_TRAITS];
+static int g_ntrait;
+
+// Global method-NAME -> dense method_id, shared across all classes/traits so a dynamic `g.m()`
+// resolves the SAME vtable column regardless of the concrete type behind `g`.
+static char g_methodname[TEKO_MAX_METHOD_NAMES][96];
+static int  g_nmethodname;
+
+// Set when the OOP surface has a hard compile error (e.g. an ambiguous trait-method collision);
+// teko_compile_interop returns non-zero so the CLI/driver reports failure instead of emitting.
+static int g_oop_error;
+
+static int trait_find(const char* n) {
+    for (int i = 0; i < g_ntrait; i++) if (strcmp(g_trait[i].name, n) == 0) return i;
+    return -1;
+}
+static int trait_method_idx(int ti, const char* m) {
+    if (ti < 0 || ti >= g_ntrait) return -1;
+    for (int i = 0; i < g_trait[ti].nmethods; i++) if (strcmp(g_trait[ti].methods[i], m) == 0) return i;
+    return -1;
+}
+static int methodid_of(const char* name) {
+    for (int i = 0; i < g_nmethodname; i++) if (strcmp(g_methodname[i], name) == 0) return i;
+    if (g_nmethodname < TEKO_MAX_METHOD_NAMES) {
+        strncpy(g_methodname[g_nmethodname], name, 95); g_methodname[g_nmethodname][95] = '\0';
+        return g_nmethodname++;
+    }
+    return -1;
+}
+// A concrete class's dense type_id is its index in g_class (the static vtable row).
+static int class_type_id(int ci) { return ci; }
+
+// ---- Phase 15 (15.C): generic monomorphization ---------------------------------------------
+// Generic templates and the concrete (template, type-arg) instantiations discovered in the source.
+// Each distinct pair yields a specialized concrete class "Template$Arg".
+#define TEKO_MAX_GENERICS  64
+#define TEKO_MAX_GENINST   128
+static char g_generic[TEKO_MAX_GENERICS][96]; static int g_ngeneric; // generic class template names
+typedef struct { char tmpl[96]; char arg[96]; } GenInst;
+static GenInst g_geninst[TEKO_MAX_GENINST];   static int g_ngeninst;
+static int is_generic_template(const char* n) {
+    for (int i = 0; i < g_ngeneric; i++) if (strcmp(g_generic[i], n) == 0) return 1;
+    return 0;
+}
+static void geninst_add(const char* tmpl, const char* arg) {
+    for (int i = 0; i < g_ngeninst; i++)
+        if (strcmp(g_geninst[i].tmpl, tmpl) == 0 && strcmp(g_geninst[i].arg, arg) == 0) return; // dedup
+    if (g_ngeninst < TEKO_MAX_GENINST) {
+        strncpy(g_geninst[g_ngeninst].tmpl, tmpl, 95); g_geninst[g_ngeninst].tmpl[95] = '\0';
+        strncpy(g_geninst[g_ngeninst].arg, arg, 95);   g_geninst[g_ngeninst].arg[95]  = '\0';
+        g_ngeninst++;
+    }
+}
+// The ACTIVE type-param substitution while a monomorphized method body is lowered/emitted: any
+// identifier equal to g_subst_param resolves to g_subst_arg (so `T()` -> `Arg()`, a `T`-typed local
+// is `Arg`-typed). Empty when not inside a monomorphized body.
+static char g_subst_param[96]; static char g_subst_arg[96];
+static const char* resolve_type_name(const char* n) {
+    if (g_subst_param[0] && n && strcmp(n, g_subst_param) == 0) return g_subst_arg;
+    return n;
+}
+// The concrete class name produced by the most recent lower_instantiation (so lower_let_stmt can
+// bind the local's class even for `Box<Arg>()`, whose type-arg is past the parser's 2-token
+// lookahead). Empty when the last RHS was not an instantiation.
+static char g_last_inst_class[200];
+static int class_find(const char* n); // defined just below (class registry)
+// Is the parser at a class instantiation head? `Class()` / `T()` (T substituted) or `Box<…>()`
+// (a generic template). The full `Box$Arg` name is resolved by lower_instantiation (it can read the
+// type-arg as it consumes it); here we only need to route to it.
+static int is_instantiation_head(const Parser* p) {
+    if (p->current_token.type != TOKEN_IDENTIFIER) return 0;
+    if (p->peek_token.type == TOKEN_LPAREN && class_find(resolve_type_name(p->current_token.lexeme)) >= 0) return 1;
+    if (p->peek_token.type == TOKEN_LT && is_generic_template(p->current_token.lexeme)) return 1;
+    return 0;
+}
+
+// ---- Phase 15 (15.B): FAT trait-typed locals (dynamic dispatch) ---------------------------
+// A `let g: Trait = concrete;` reference is FAT — two $v slots: the instance handle, and the
+// concrete `type_id` (a COMPILE-TIME CONSTANT, since the RHS's static class is known at each
+// assignment). This keeps the object layout unchanged (15.A stays byte-identical). `g.method()`
+// loads the runtime type_id from `tid_slot`, does vtable_get(type_id, method_id) -> slot, and
+// dispatches via OP_CALL_FUNC with `g`'s handle as self. Per-function scope (reset like localcls).
+#define TEKO_MAX_TRAITLOCALS 128
+typedef struct { char name[96]; int trait; int handle_slot; int tid_slot; } TraitLocal;
+static TraitLocal g_traitlocal[TEKO_MAX_TRAITLOCALS];
+static int g_ntraitlocal;
+static void traitlocal_reset(void) { g_ntraitlocal = 0; }
+static int traitlocal_find(const char* n) {
+    for (int i = 0; i < g_ntraitlocal; i++) if (strcmp(g_traitlocal[i].name, n) == 0) return i;
+    return -1;
+}
+static void traitlocal_add(const char* n, int trait, int handle_slot, int tid_slot) {
+    int e = traitlocal_find(n);
+    if (e >= 0) { g_traitlocal[e].trait = trait; g_traitlocal[e].handle_slot = handle_slot;
+                  g_traitlocal[e].tid_slot = tid_slot; return; }
+    if (g_ntraitlocal < TEKO_MAX_TRAITLOCALS) {
+        strncpy(g_traitlocal[g_ntraitlocal].name, n, 95); g_traitlocal[g_ntraitlocal].name[95] = '\0';
+        g_traitlocal[g_ntraitlocal].trait = trait;
+        g_traitlocal[g_ntraitlocal].handle_slot = handle_slot;
+        g_traitlocal[g_ntraitlocal].tid_slot = tid_slot;
+        g_ntraitlocal++;
+    }
+}
+
+// local var name -> class index (-1 = not a class instance). Per-function scope (reset for $main
+// and for each method body), so a method's `self`/locals don't alias $main's instance names.
+#define TEKO_MAX_LOCALCLS 256
+typedef struct { char name[96]; int cls; } LocalClass;
+static LocalClass g_localcls[TEKO_MAX_LOCALCLS];
+static int g_nlocalcls;
+
+static int class_find(const char* n) {
+    for (int i = 0; i < g_nclass; i++) if (strcmp(g_class[i].name, n) == 0) return i;
+    return -1;
+}
+static int class_field_idx(int ci, const char* f) {
+    if (ci < 0 || ci >= g_nclass) return -1;
+    ClassInfo* c = &g_class[ci];
+    for (int i = 0; i < c->nfields; i++) if (strcmp(c->fields[i], f) == 0) return i;
+    return -1;
+}
+static int class_method_idx(int ci, const char* m) {
+    if (ci < 0 || ci >= g_nclass) return -1;
+    ClassInfo* c = &g_class[ci];
+    for (int i = 0; i < c->nmethods; i++) if (strcmp(c->methods[i], m) == 0) return i;
+    return -1;
+}
+static void localcls_reset(void) { g_nlocalcls = 0; }
+static void localcls_set(const char* n, int ci) {
+    for (int i = 0; i < g_nlocalcls; i++)
+        if (strcmp(g_localcls[i].name, n) == 0) { g_localcls[i].cls = ci; return; }
+    if (g_nlocalcls < TEKO_MAX_LOCALCLS) {
+        strncpy(g_localcls[g_nlocalcls].name, n, 95); g_localcls[g_nlocalcls].name[95] = '\0';
+        g_localcls[g_nlocalcls].cls = ci; g_nlocalcls++;
+    }
+}
+static int localcls_get(const char* n) {
+    for (int i = 0; i < g_nlocalcls; i++) if (strcmp(g_localcls[i].name, n) == 0) return g_localcls[i].cls;
+    return -1;
+}
+// Split a dotted lexeme "base.member" into its two parts. Returns 1 on success (a dot present).
+static int dotted_split(const char* lex, char* base, char* member) {
+    const char* dot = lex ? strchr(lex, '.') : NULL;
+    if (!dot) return 0;
+    size_t bl = (size_t)(dot - lex); if (bl >= 96) bl = 95;
+    memcpy(base, lex, bl); base[bl] = '\0';
+    strncpy(member, dot + 1, 95); member[95] = '\0';
+    return 1;
+}
+
+// Phase 15 (15.A): skip a generic type-parameter clause `<T, U, …>` (balanced angle brackets,
+// nesting tolerated) between a method/fn name and its `(` param list. Methods mirror functions:
+// they may be GENERIC. The value model is uniform i32, so a generic method binds its params and
+// lowers exactly like a non-generic one in this MVP; per-type monomorphization (substituting T)
+// is Phase 15.C. Leaves the parser on the token after the matching `>` (typically `(`).
+static void skip_generic_clause(Parser* p) {
+    if (p->current_token.type != TOKEN_LT) return;
+    int d = 0;
+    while (p->current_token.type != TOKEN_EOF) {
+        if (p->current_token.type == TOKEN_LT) { d++; fe_advance(p); continue; }
+        if (p->current_token.type == TOKEN_GT) { d--; fe_advance(p); if (d <= 0) break; continue; }
+        fe_advance(p);
+    }
+}
+
 static int is_dom_macro(const char* lexeme); // defined below
 static void lower_intrinsic_call(BytecodeBuffer* buffer, Parser* p, const LowerCtx* ctx); // recursive
 
@@ -285,6 +494,28 @@ static OpCode p12_tok_op(TokenType t) {
 static void eval_expr_prec(BytecodeBuffer* b, Parser* p, const LowerCtx* ctx,
                            int min_prec, TempAlloc* ta);
 
+// Phase 15 (15.A): `obj.field` READ as an expression primary -> OP_OBJ_GET(handle, idx) -> $w0.
+// `obj` must be a class-typed local and `member` one of its fields (resolved at compile time).
+// Returns 1 if it consumed a member read, 0 otherwise (a method call `obj.method(` or a non-class
+// dotted ident — e.g. duplex.* — is left for the caller). Current token is the dotted IDENTIFIER.
+static int lower_member_read(BytecodeBuffer* b, Parser* p, const LowerCtx* ctx) {
+    if (p->current_token.type != TOKEN_IDENTIFIER) return 0;
+    char base[96], member[96];
+    if (!dotted_split(p->current_token.lexeme, base, member)) return 0;
+    int ci = localcls_get(base);
+    if (ci < 0) return 0;
+    int fidx = class_field_idx(ci, member);
+    if (fidx < 0) return 0; // not a field (could be a method — handled by the call path)
+    int hslot = ctx ? bind_lookup(ctx->locals, ctx->nlocals, base) : -1;
+    if (hslot < 0) return 0;
+    codegen_li_emit_load_local(b, hslot);  // $w0 = handle
+    codegen_li_emit_setarg(b, 0);          // $a0 = handle
+    codegen_li_emit_iconst(b, fidx);       // $w0 = field index (compile-time constant)
+    codegen_li_emit_object(b, OP_OBJ_GET); // $w0 = field value
+    fe_advance(p);
+    return 1;
+}
+
 static void eval_primary(BytecodeBuffer* b, Parser* p, const LowerCtx* ctx, TempAlloc* ta) {
     if (p->current_token.type == TOKEN_LIT_INT) {
         codegen_li_emit_iconst(b, atoi(p->current_token.lexeme));
@@ -293,6 +524,8 @@ static void eval_primary(BytecodeBuffer* b, Parser* p, const LowerCtx* ctx, Temp
         fe_advance(p);
         eval_expr_prec(b, p, ctx, 1, ta);
         if (p->current_token.type == TOKEN_RPAREN) fe_advance(p);
+    } else if (lower_member_read(b, p, ctx)) {
+        // `obj.field` read consumed (e.g. inside `self.x + self.y`).
     } else if (p->current_token.type == TOKEN_IDENTIFIER) {
         int s = ctx ? bind_lookup(ctx->locals, ctx->nlocals, p->current_token.lexeme) : -1;
         if (s >= 0) codegen_li_emit_load_local(b, s);
@@ -726,12 +959,26 @@ static void env_sync(LowerEnv* env) {
 
 // Lower an initializer / RHS value into $w0: string literal, @dom/@js intrinsic, codec/hash/crypto,
 // duplex/delayed/broadcast/atomic op, or an integer expression (literals/locals/parens/arith/cmp).
+// Phase 15 (15.A): forward decls for the class-surface value forms (defined after lower_call_stmt,
+// since they reuse lower_codec_value / eval_expr_prec).
+static void lower_instantiation(BytecodeBuffer* b, Parser* p);                      // ClassName(...)
+static int  lower_member_call(BytecodeBuffer* b, Parser* p, const LowerCtx* ctx);   // obj.method(...)
+static int  lower_trait_dispatch(BytecodeBuffer* b, Parser* p, LowerEnv* env);      // g.method(...) dynamic
+
 static void lower_init_value(BytecodeBuffer* b, Parser* p, LowerEnv* env) {
     LowerCtx* ctx = env->ctx;
     if (p->current_token.type == TOKEN_LIT_STR || p->current_token.type == TOKEN_STRING_LIT) {
         char* sv = strip_quotes(p->current_token.lexeme);
         codegen_li_emit_sconst(b, codegen_li_add_string_constant(b, sv));
         free(sv); fe_advance(p);
+    } else if (is_instantiation_head(p)) {
+        // Phase 15 (15.A/15.C): `ClassName(...)` / `T(...)` / `Box<Arg>(...)` instantiation ->
+        // OP_OBJ_NEW -> handle in $w0 (sets g_last_inst_class for the let binding).
+        lower_instantiation(b, p);
+    } else if (lower_trait_dispatch(b, p, env)) {
+        // Phase 15 (15.B): `g.method(args)` dynamic dispatch as an RHS -> result in $w0.
+    } else if (lower_member_call(b, p, ctx)) {
+        // Phase 15 (15.A): `obj.method(args)` as an RHS -> OP_CALL_FUNC -> result in $w0.
     } else if (p->current_token.type == TOKEN_MACRO_IDENT && is_dom_macro(p->current_token.lexeme) &&
                p->peek_token.type == TOKEN_LPAREN) {
         lower_intrinsic_call(b, p, ctx);
@@ -778,8 +1025,14 @@ static void lower_let_stmt(BytecodeBuffer* b, Parser* p, LowerEnv* env) {
     char lname[96];
     strncpy(lname, p->current_token.lexeme, sizeof(lname) - 1); lname[sizeof(lname) - 1] = '\0';
     fe_advance(p); // NAME
+    // Phase 15.B: capture the FIRST identifier of a `: Type` annotation — a trait name makes this a
+    // dynamically-dispatched (fat) reference; anything else is a plain local.
+    char annot[96]; annot[0] = '\0';
     if (p->current_token.type == TOKEN_COLON) {
         fe_advance(p);
+        if (p->current_token.type == TOKEN_IDENTIFIER) {
+            strncpy(annot, p->current_token.lexeme, sizeof(annot) - 1); annot[sizeof(annot) - 1] = '\0';
+        }
         while (p->current_token.type != TOKEN_ASSIGN && p->current_token.type != TOKEN_QUICK_ASSIGN &&
                p->current_token.type != TOKEN_SEMICOLON && p->current_token.type != TOKEN_EOF)
             fe_advance(p);
@@ -788,9 +1041,30 @@ static void lower_let_stmt(BytecodeBuffer* b, Parser* p, LowerEnv* env) {
         fe_advance(p);
     int s = bind_lookup(*env->locals, *env->nlocals, lname);
     if (s < 0) { s = *env->nlocals; bind_add(env->locals, env->nlocals, env->caplocals, lname, s); }
+    // Phase 15 (15.A/15.C): remember this local's class so later `lname.field`/`lname.method(...)`
+    // resolve their compile-time index/slot. A concrete-instance RHS (`let g = c`) is read here; an
+    // instantiation RHS (`ClassName()`/`T()`/`Box<Arg>()`) is read from g_last_inst_class AFTER
+    // lowering (its type-arg can be past the parser's lookahead).
+    int rhs_local_class = (p->current_token.type == TOKEN_IDENTIFIER &&
+                           p->peek_token.type != TOKEN_LPAREN && p->peek_token.type != TOKEN_LT)
+                          ? localcls_get(p->current_token.lexeme) : -1;
+    int annot_trait = (annot[0] && trait_find(annot) >= 0) ? trait_find(annot) : -1;
+    g_last_inst_class[0] = '\0';
     env_sync(env);
     lower_init_value(b, p, env);
+    int rhs_class = g_last_inst_class[0] ? class_find(g_last_inst_class) : rhs_local_class;
     codegen_li_emit_store_local(b, s);
+    if (annot_trait >= 0) {
+        // Phase 15.B: a FAT trait-typed reference — its concrete type_id (from the RHS) rides in a
+        // hidden tid slot as a compile-time constant; `lname.method()` dispatches dynamically.
+        char tname[120]; snprintf(tname, sizeof(tname), "%s#tid", lname);
+        int tid_slot = env_alloc_local(env, tname);
+        codegen_li_emit_iconst(b, rhs_class >= 0 ? class_type_id(rhs_class) : -1);
+        codegen_li_emit_store_local(b, tid_slot);
+        traitlocal_add(lname, annot_trait, s, tid_slot);
+    } else if (rhs_class >= 0) {
+        localcls_set(lname, rhs_class);
+    }
     if (p->current_token.type == TOKEN_SEMICOLON) fe_advance(p);
 }
 
@@ -798,13 +1072,26 @@ static void lower_let_stmt(BytecodeBuffer* b, Parser* p, LowerEnv* env) {
 // statement, 0 if NAME is not a known local (so the caller tries other forms).
 static int lower_reassign(BytecodeBuffer* b, Parser* p, LowerEnv* env) {
     if (p->current_token.type != TOKEN_IDENTIFIER || p->peek_token.type != TOKEN_ASSIGN) return 0;
-    int slot = bind_lookup(*env->locals, *env->nlocals, p->current_token.lexeme);
+    char nm[96]; strncpy(nm, p->current_token.lexeme, 95); nm[95] = '\0';
+    int slot = bind_lookup(*env->locals, *env->nlocals, nm);
     if (slot < 0) return 0;
     fe_advance(p); // NAME
     fe_advance(p); // '='
+    // Phase 15.B: reassigning a FAT trait local updates its tid slot too — the new concrete type_id
+    // (known from the RHS's static class) is a compile-time constant, so dynamic dispatch on the
+    // reassigned reference picks the new implementation.
+    int tl = traitlocal_find(nm);
+    int rhs_class = (tl >= 0 && p->current_token.type == TOKEN_IDENTIFIER)
+        ? (p->peek_token.type == TOKEN_LPAREN ? class_find(p->current_token.lexeme)
+                                              : localcls_get(p->current_token.lexeme))
+        : -1;
     env_sync(env);
     lower_init_value(b, p, env);
     codegen_li_emit_store_local(b, slot);
+    if (tl >= 0) {
+        codegen_li_emit_iconst(b, rhs_class >= 0 ? class_type_id(rhs_class) : -1);
+        codegen_li_emit_store_local(b, g_traitlocal[tl].tid_slot);
+    }
     if (p->current_token.type == TOKEN_SEMICOLON) fe_advance(p);
     return 1;
 }
@@ -848,6 +1135,170 @@ static int lower_call_stmt(BytecodeBuffer* b, Parser* p, LowerEnv* env) {
     lower_call(b, idx, args, nargs);
     for (int i = 0; i < nargs; i++) if (args[i].sval) free(args[i].sval);
     return 1;
+}
+
+// Phase 15 (15.A): `ClassName(...)` instantiation -> OP_OBJ_NEW(nfields) -> handle in $w0. Current
+// token is the class-name IDENTIFIER (peek '('). Constructor arguments are skipped in the MVP
+// (fields are assigned explicitly after construction); the field COUNT is the class's compile-time
+// layout size, so the instance has exactly the right number of zero-initialized cells.
+static void lower_instantiation(BytecodeBuffer* b, Parser* p) {
+    // Resolve the concrete class name. Three forms: `Class()`, `T()` (the active type-param, 15.C
+    // substitution), and `Box<Arg>()` (a generic template -> the monomorphized class "Box$Arg").
+    char cname[200];
+    if (p->peek_token.type == TOKEN_LT && is_generic_template(p->current_token.lexeme)) {
+        char base[96]; strncpy(base, p->current_token.lexeme, 95); base[95] = '\0';
+        fe_advance(p); // template name
+        fe_advance(p); // '<'
+        char arg[96]; arg[0] = '\0';
+        if (p->current_token.type == TOKEN_IDENTIFIER) {
+            strncpy(arg, resolve_type_name(p->current_token.lexeme), 95); arg[95] = '\0';
+        }
+        while (p->current_token.type != TOKEN_GT && p->current_token.type != TOKEN_LPAREN &&
+               p->current_token.type != TOKEN_EOF) fe_advance(p);
+        if (p->current_token.type == TOKEN_GT) fe_advance(p); // '>'
+        snprintf(cname, sizeof(cname), "%s$%s", base, arg);
+    } else {
+        strncpy(cname, resolve_type_name(p->current_token.lexeme), sizeof(cname) - 1);
+        cname[sizeof(cname) - 1] = '\0';
+        fe_advance(p); // ClassName / T
+    }
+    int ci = class_find(cname);
+    strncpy(g_last_inst_class, ci >= 0 ? cname : "", sizeof(g_last_inst_class) - 1);
+    g_last_inst_class[sizeof(g_last_inst_class) - 1] = '\0';
+    if (p->current_token.type == TOKEN_LPAREN) fe_advance(p);
+    int depth = 1; // skip the (possibly empty) constructor-arg list
+    while (p->current_token.type != TOKEN_EOF && depth > 0) {
+        if (p->current_token.type == TOKEN_LPAREN) depth++;
+        else if (p->current_token.type == TOKEN_RPAREN) depth--;
+        fe_advance(p); // consume incl. the closing ')'
+    }
+    int nf = (ci >= 0) ? g_class[ci].nfields : 0;
+    codegen_li_emit_iconst(b, nf);
+    codegen_li_emit_object(b, OP_OBJ_NEW); // $w0 = handle
+}
+
+// Phase 15 (15.A): `obj.method(args)` STATIC dispatch -> OP_CALL_FUNC. `obj` must be a class-typed
+// local; `member` one of its methods (slot resolved at compile time). `self` (the instance handle)
+// is passed as arg0, then each explicit arg (int / named local). The result lands in $w0. Returns
+// 1 if consumed, 0 if not a class method call (e.g. duplex.*/a non-class dotted ident).
+static int lower_member_call(BytecodeBuffer* b, Parser* p, const LowerCtx* ctx) {
+    if (p->current_token.type != TOKEN_IDENTIFIER || p->peek_token.type != TOKEN_LPAREN) return 0;
+    char base[96], member[96];
+    if (!dotted_split(p->current_token.lexeme, base, member)) return 0;
+    int ci = localcls_get(base);
+    if (ci < 0) return 0;
+    int midx = class_method_idx(ci, member);
+    if (midx < 0) return 0;
+    int hslot = ctx ? bind_lookup(ctx->locals, ctx->nlocals, base) : -1;
+    if (hslot < 0) return 0;
+    int slot = g_class[ci].method_slot[midx];
+    fe_advance(p);                                       // consume "obj.method"
+    if (p->current_token.type == TOKEN_LPAREN) fe_advance(p);
+    codegen_li_emit_load_local(b, hslot);               // $w0 = self handle
+    codegen_li_emit_setarg(b, 0);                       // $a0 = self
+    int argc = 1;
+    while (p->current_token.type != TOKEN_RPAREN && p->current_token.type != TOKEN_EOF && argc < 8) {
+        if (p->current_token.type == TOKEN_COMMA) { fe_advance(p); continue; }
+        lower_codec_value(b, p, ctx);                   // arg -> $w0 (int / named local)
+        codegen_li_emit_setarg(b, argc);                // $a{argc} = arg
+        argc++;
+    }
+    if (p->current_token.type == TOKEN_RPAREN) fe_advance(p);
+    codegen_li_emit_iconst(b, slot);                    // $w0 = method slot (static dispatch)
+    codegen_li_emit_call_func(b, argc);                 // $w0 = method result
+    return 1;
+}
+
+// Phase 15 (15.A): `obj.field = <expr>;` field WRITE -> OP_OBJ_SET(handle, idx, value). Returns 1
+// if consumed. The value is evaluated FIRST into a temp (it may itself read `obj.field` via
+// OP_OBJ_GET, which stages $a0 — so we must not have the SET's handle/idx staged yet).
+static int lower_member_write(BytecodeBuffer* b, Parser* p, LowerEnv* env) {
+    if (p->current_token.type != TOKEN_IDENTIFIER || p->peek_token.type != TOKEN_ASSIGN) return 0;
+    char base[96], member[96];
+    if (!dotted_split(p->current_token.lexeme, base, member)) return 0;
+    int ci = localcls_get(base);
+    if (ci < 0) return 0;
+    int fidx = class_field_idx(ci, member);
+    if (fidx < 0) return 0;
+    int hslot = bind_lookup(*env->locals, *env->nlocals, base);
+    if (hslot < 0) return 0;
+    fe_advance(p); // "obj.field"
+    fe_advance(p); // '='
+    env_sync(env);
+    lower_init_value(b, p, env);                        // value -> $w0 (may use $a0 via member reads)
+    int t = env->ctx->ta->next_temp++;
+    if (env->ctx->ta->next_temp > env->ctx->ta->hw) env->ctx->ta->hw = env->ctx->ta->next_temp;
+    codegen_li_emit_store_local(b, t);                  // temp = value
+    codegen_li_emit_load_local(b, hslot); codegen_li_emit_setarg(b, 0); // $a0 = handle
+    codegen_li_emit_iconst(b, fidx);      codegen_li_emit_setarg(b, 1); // $a1 = field index
+    codegen_li_emit_load_local(b, t);                  // $w0 = value
+    codegen_li_emit_object(b, OP_OBJ_SET);
+    env->ctx->ta->next_temp--;                          // free the temp
+    if (p->current_token.type == TOKEN_SEMICOLON) fe_advance(p);
+    return 1;
+}
+
+// Phase 15 (15.A): a class member STATEMENT — `obj.field = expr;`, `obj.method(args);` (result
+// discarded). Returns 1 if consumed. Shared by the top-level loop and the block dispatcher.
+// Phase 15 (15.B): DYNAMIC dispatch `g.method(args)` where `g` is a FAT trait-typed local. Resolves
+// the routine slot at runtime via vtable_get(g.type_id, method_id), then OP_CALL_FUNC with g's handle
+// as self. Returns 1 if consumed (the receiver is a trait local + `method` is one of the trait's
+// methods), 0 otherwise (so a concrete receiver falls through to 15.A static dispatch). The slot is
+// parked in a temp because OP_CALL_FUNC needs $w0=slot while its args occupy $a0.. (and VTABLE_GET
+// itself clobbers $a0/$w0). Result in $w0.
+static int lower_trait_dispatch(BytecodeBuffer* b, Parser* p, LowerEnv* env) {
+    if (p->current_token.type != TOKEN_IDENTIFIER || p->peek_token.type != TOKEN_LPAREN) return 0;
+    char base[96], member[96];
+    if (!dotted_split(p->current_token.lexeme, base, member)) return 0;
+    int tl = traitlocal_find(base);
+    if (tl < 0) return 0;
+    int trait = g_traitlocal[tl].trait;
+    if (trait_method_idx(trait, member) < 0) return 0; // not a method of `g`'s trait
+    int mid = methodid_of(member);
+    int handle_slot = g_traitlocal[tl].handle_slot;
+    int tid_slot = g_traitlocal[tl].tid_slot;
+    fe_advance(p); // consume "g.method"
+    if (p->current_token.type == TOKEN_LPAREN) fe_advance(p);
+    env_sync(env);
+    // slot = vtable_get(type_id, method_id)  (type_id read at RUNTIME from the fat local)
+    codegen_li_emit_load_local(b, tid_slot); codegen_li_emit_setarg(b, 0); // $a0 = type_id
+    codegen_li_emit_iconst(b, mid);                                        // $w0 = method_id
+    codegen_li_emit_vtable(b, OP_VTABLE_GET);                              // $w0 = routine slot
+    int slot_tmp = env->ctx->ta->next_temp++;
+    if (env->ctx->ta->next_temp > env->ctx->ta->hw) env->ctx->ta->hw = env->ctx->ta->next_temp;
+    codegen_li_emit_store_local(b, slot_tmp);                             // park the slot
+    // stage self + explicit args, then call the resolved slot
+    codegen_li_emit_load_local(b, handle_slot); codegen_li_emit_setarg(b, 0); // $a0 = self
+    int argc = 1;
+    while (p->current_token.type != TOKEN_RPAREN && p->current_token.type != TOKEN_EOF && argc < 8) {
+        if (p->current_token.type == TOKEN_COMMA) { fe_advance(p); continue; }
+        lower_codec_value(b, p, env->ctx);   // arg -> $w0 (int / named local)
+        codegen_li_emit_setarg(b, argc); argc++;
+    }
+    if (p->current_token.type == TOKEN_RPAREN) fe_advance(p);
+    codegen_li_emit_load_local(b, slot_tmp); // $w0 = slot
+    codegen_li_emit_call_func(b, argc);      // $w0 = method result (dynamic dispatch)
+    env->ctx->ta->next_temp--;               // free the parked-slot temp
+    return 1;
+}
+
+static int lower_member_stmt(BytecodeBuffer* b, Parser* p, LowerEnv* env) {
+    if (lower_member_write(b, p, env)) return 1;
+    if (lower_trait_dispatch(b, p, env)) { // Phase 15.B: `g.method(args);` dynamic call (discarded)
+        if (p->current_token.type == TOKEN_SEMICOLON) fe_advance(p);
+        return 1;
+    }
+    if (p->current_token.type == TOKEN_IDENTIFIER && p->peek_token.type == TOKEN_LPAREN) {
+        char base[96], member[96];
+        if (dotted_split(p->current_token.lexeme, base, member) &&
+            localcls_get(base) >= 0 && class_method_idx(localcls_get(base), member) >= 0) {
+            env_sync(env);
+            lower_member_call(b, p, env->ctx);          // result discarded
+            if (p->current_token.type == TOKEN_SEMICOLON) fe_advance(p);
+            return 1;
+        }
+    }
+    return 0;
 }
 
 // `while (cond) { body }` — LOOP_BEGIN; <cond→$w0>; BREAK_IF_FALSE; body; LOOP_END.
@@ -904,6 +1355,17 @@ static void lower_one_stmt(BytecodeBuffer* b, Parser* p, LowerEnv* env) {
     } else if (p->current_token.type == TOKEN_WAIT || p->current_token.type == TOKEN_AWAIT) {
         env_sync(env);
         lower_wait_await(b, p, ctx, p->current_token.type == TOKEN_AWAIT);
+    } else if (p->current_token.type == TOKEN_RETURN) {
+        // Phase 15 (15.A): `return <expr>;` — evaluate the expression into $w0 (the routine's
+        // result; a native routine leaves $w0 in rax across `ret`, WASM spills it at FUNC_END).
+        // MVP: no early-return control flow — `return` is expected as a method's last statement.
+        fe_advance(p);
+        if (p->current_token.type != TOKEN_SEMICOLON && p->current_token.type != TOKEN_RBRACE &&
+            p->current_token.type != TOKEN_EOF) {
+            env_sync(env);
+            lower_init_value(b, p, env); // value -> $w0 (member reads/calls, arithmetic, ints, locals)
+        }
+        if (p->current_token.type == TOKEN_SEMICOLON) fe_advance(p);
     } else if (p->current_token.type == TOKEN_MACRO_IDENT && is_dom_macro(p->current_token.lexeme) &&
                p->peek_token.type == TOKEN_LPAREN) {
         lower_intrinsic_call(b, p, ctx);
@@ -920,6 +1382,8 @@ static void lower_one_stmt(BytecodeBuffer* b, Parser* p, LowerEnv* env) {
     } else if (p->current_token.type == TOKEN_CIRCUIT &&
                p->peek_token.type == TOKEN_IDENTIFIER) {
         lower_circuit_block(b, p, env);   // 14.F: circuit cb { } fallback { }
+    } else if (lower_member_stmt(b, p, env)) {
+        /* Phase 15: obj.field = expr; / obj.method(args); consumed */
     } else if (lower_reassign(b, p, env)) {
         /* NAME = expr; consumed */
     } else if (lower_call_stmt(b, p, env)) {
@@ -1138,8 +1602,369 @@ static void skip_extern_decl(Parser* p) {
     }
 }
 
+// Phase 15 (15.A): skip a whole `class NAME [..] { … }` declaration (brace-matched). Current
+// token is TOKEN_CLASS. Used so the fn/handler passes don't treat a class's methods as top-level
+// routines, and so the main lowering pass doesn't emit a class declaration as a statement.
+static void skip_class_decl(Parser* p) {
+    fe_advance(p); // 'class'
+    while (p->current_token.type != TOKEN_LBRACE && p->current_token.type != TOKEN_EOF) fe_advance(p);
+    if (p->current_token.type == TOKEN_LBRACE) {
+        int d = 1; fe_advance(p);
+        while (p->current_token.type != TOKEN_EOF && d > 0) {
+            if (p->current_token.type == TOKEN_LBRACE) d++;
+            else if (p->current_token.type == TOKEN_RBRACE) d--;
+            fe_advance(p);
+        }
+    }
+}
+
+// Phase 15 (15.B): pre-pass that builds the trait registry (g_trait) — each `trait NAME { fn m(self):
+// T; … }` records its ordered (bodyless) contract method names and reserves a global method_id per
+// name. A concrete class supplies the bodies; dynamic dispatch resolves (type_id, method_id) via the
+// static vtable. Trait method names also seed the method-id space so a class method overriding a
+// trait method shares the same method_id (same vtable column).
+static void collect_traits(const char* source) {
+    g_ntrait = 0;
+    Lexer lx; lexer_init(&lx, source);
+    Parser p; parser_init(&p, &lx);
+    while (p.current_token.type != TOKEN_EOF) {
+        if (p.current_token.type != TOKEN_TRAIT || p.peek_token.type != TOKEN_IDENTIFIER) {
+            fe_advance(&p); continue;
+        }
+        if (g_ntrait >= TEKO_MAX_TRAITS) { skip_class_decl(&p); continue; } // skip_class_decl is keyword-generic
+        TraitInfo* t = &g_trait[g_ntrait];
+        memset(t, 0, sizeof(*t));
+        fe_advance(&p); // 'trait'
+        strncpy(t->name, p.current_token.lexeme, 95); t->name[95] = '\0';
+        fe_advance(&p); // trait name
+        while (p.current_token.type != TOKEN_LBRACE && p.current_token.type != TOKEN_EOF) fe_advance(&p);
+        if (p.current_token.type == TOKEN_LBRACE) fe_advance(&p);
+        int depth = 1;
+        while (p.current_token.type != TOKEN_EOF && depth > 0) {
+            if (p.current_token.type == TOKEN_LBRACE) { depth++; fe_advance(&p); continue; }
+            if (p.current_token.type == TOKEN_RBRACE) { depth--; fe_advance(&p); continue; }
+            if (depth == 1 && p.current_token.type == TOKEN_ASYNC && p.peek_token.type == TOKEN_FN) fe_advance(&p);
+            if (depth == 1 && p.current_token.type == TOKEN_FN && p.peek_token.type == TOKEN_IDENTIFIER) {
+                fe_advance(&p); // 'fn'
+                if (t->nmethods < TEKO_CLASS_MAX_METHODS) {
+                    strncpy(t->methods[t->nmethods], p.current_token.lexeme, 95);
+                    t->methods[t->nmethods][95] = '\0'; t->nmethods++;
+                    methodid_of(p.current_token.lexeme); // reserve the global method_id (shared vtable column)
+                }
+                fe_advance(&p); // method name
+                skip_generic_clause(&p);
+                // A contract method ends at ';'; tolerate an (unused-in-MVP) default body `{ … }`.
+                while (p.current_token.type != TOKEN_SEMICOLON && p.current_token.type != TOKEN_LBRACE &&
+                       p.current_token.type != TOKEN_RBRACE && p.current_token.type != TOKEN_EOF) fe_advance(&p);
+                if (p.current_token.type == TOKEN_SEMICOLON) fe_advance(&p);
+                else if (p.current_token.type == TOKEN_LBRACE) {
+                    int d2 = 1; fe_advance(&p);
+                    while (p.current_token.type != TOKEN_EOF && d2 > 0) {
+                        if (p.current_token.type == TOKEN_LBRACE) d2++;
+                        else if (p.current_token.type == TOKEN_RBRACE) d2--;
+                        fe_advance(&p);
+                    }
+                }
+                continue;
+            }
+            fe_advance(&p);
+        }
+        g_ntrait++;
+    }
+}
+
+// Phase 15 (15.B): trait-composition collision check. A class composing two traits that BOTH
+// declare a method of the same name, WITHOUT the class overriding it, is ambiguous — a hard
+// compile error (owner rule). Sets g_oop_error so teko_compile_interop fails instead of emitting.
+static void check_oop_collisions(void) {
+    for (int ci = 0; ci < g_nclass; ci++) {
+        ClassInfo* c = &g_class[ci];
+        for (int a = 0; a < c->ntraits; a++) {
+            int ta = trait_find(c->traits[a]);
+            if (ta < 0) continue;
+            for (int b = a + 1; b < c->ntraits; b++) {
+                int tb = trait_find(c->traits[b]);
+                if (tb < 0) continue;
+                for (int mi = 0; mi < g_trait[ta].nmethods; mi++) {
+                    const char* mn = g_trait[ta].methods[mi];
+                    if (trait_method_idx(tb, mn) >= 0 && class_method_idx(ci, mn) < 0) {
+                        fprintf(stderr,
+                          "[Teko OOP] error: class '%s' inherits method '%s' from both traits '%s' and '%s' "
+                          "without overriding it — ambiguous trait composition.\n",
+                          c->name, mn, c->traits[a], c->traits[b]);
+                        g_oop_error = 1;
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ---- Phase 15 (15.D): event subsystem ------------------------------------------------------
+// `event E;` declares an event; `subscribe E with H [fanout|fire_and_forget];` registers a handler
+// (a top-level `fn`) + a delivery mode AT SUBSCRIPTION TIME; `raise E(args);` fan-outs to every
+// subscriber. Subscriptions are STATIC (compile-time), so the subscriber set per event is known at
+// compile time — `raise` lowers to a spawn of each handler over the Phase-14 cooperative scheduler
+// (drained at program exit). `fanout` = parallel green threads (real parallelism on Layer B / wasm
+// -threads); `fire_and_forget` = enqueue, no result tracked. Both spawn in the cooperative MVP.
+#define TEKO_MAX_EVENTS      64
+#define TEKO_EVENT_MAX_SUBS  16
+typedef struct {
+    char name[96];
+    int  handler_slot[TEKO_EVENT_MAX_SUBS]; // routine table slot of each subscribed handler
+    int  mode[TEKO_EVENT_MAX_SUBS];         // 0 = fanout, 1 = fire_and_forget
+    int  nsubs;
+} EventInfo;
+static EventInfo g_event[TEKO_MAX_EVENTS];
+static int g_nevent;
+static int event_find(const char* n) {
+    for (int i = 0; i < g_nevent; i++) if (strcmp(g_event[i].name, n) == 0) return i;
+    return -1;
+}
+static int event_find_or_add(const char* n) {
+    int e = event_find(n);
+    if (e >= 0) return e;
+    if (g_nevent < TEKO_MAX_EVENTS) {
+        memset(&g_event[g_nevent], 0, sizeof(g_event[g_nevent]));
+        strncpy(g_event[g_nevent].name, n, 95); g_event[g_nevent].name[95] = '\0';
+        return g_nevent++;
+    }
+    return -1;
+}
+static void event_add_sub(int ei, int slot, int mode) {
+    if (ei < 0 || ei >= g_nevent || slot < 0) return;
+    EventInfo* e = &g_event[ei];
+    if (e->nsubs < TEKO_EVENT_MAX_SUBS) { e->handler_slot[e->nsubs] = slot; e->mode[e->nsubs] = mode; e->nsubs++; }
+}
+
+// Phase 15 (15.D): pre-pass that builds the event registry — `event E;` declarations and
+// `subscribe E with H [fanout|fire_and_forget];` registrations (H resolves to a top-level fn slot).
+// Parsing is permissive: after `subscribe`, the first identifier is the event, an identifier that
+// resolves to a known fn is the handler, and FANOUT/FIRE_AND_FORGET sets the mode (any connector
+// word like `with` is simply skipped).
+static void collect_events(const char* source, ImportBinding* fns, int nfns) {
+    g_nevent = 0;
+    Lexer lx; lexer_init(&lx, source);
+    Parser p; parser_init(&p, &lx);
+    while (p.current_token.type != TOKEN_EOF) {
+        if (p.current_token.type == TOKEN_EVENT && p.peek_token.type == TOKEN_IDENTIFIER) {
+            fe_advance(&p); // 'event'
+            event_find_or_add(p.current_token.lexeme);
+            fe_advance(&p); // event name
+            continue;
+        }
+        if (p.current_token.type == TOKEN_SUBSCRIBE) {
+            fe_advance(&p); // 'subscribe'
+            char ename[96] = ""; int slot = -1, mode = 0;
+            if (p.current_token.type == TOKEN_IDENTIFIER) {
+                strncpy(ename, p.current_token.lexeme, 95); ename[95] = '\0'; fe_advance(&p);
+            }
+            while (p.current_token.type != TOKEN_SEMICOLON && p.current_token.type != TOKEN_EOF) {
+                if (p.current_token.type == TOKEN_IDENTIFIER) {
+                    int s = bind_lookup(fns, nfns, p.current_token.lexeme);
+                    if (s >= 0) slot = s; // an identifier resolving to a fn is the handler
+                } else if (p.current_token.type == TOKEN_FANOUT) mode = 0;
+                else if (p.current_token.type == TOKEN_FIRE_AND_FORGET) mode = 1;
+                fe_advance(&p);
+            }
+            if (p.current_token.type == TOKEN_SEMICOLON) fe_advance(&p);
+            if (ename[0] && slot >= 0) event_add_sub(event_find_or_add(ename), slot, mode);
+            continue;
+        }
+        fe_advance(&p);
+    }
+}
+
+// Phase 15 (15.C): discover generic class templates + their concrete instantiations.
+// Pass 1: every `class NAME <` is a generic template (record NAME). Pass 2: every use
+// `Tmpl < Arg >` (where Tmpl is a template and the `<` is NOT the declaration's own clause —
+// guarded by prev != class) records a (Tmpl, Arg) instantiation to monomorphize.
+static void collect_generics(const char* source) {
+    g_ngeneric = 0; g_ngeninst = 0;
+    { Lexer lx; lexer_init(&lx, source); Parser p; parser_init(&p, &lx);
+      while (p.current_token.type != TOKEN_EOF) {
+        if (p.current_token.type == TOKEN_CLASS && p.peek_token.type == TOKEN_IDENTIFIER) {
+            char nm[96]; strncpy(nm, p.peek_token.lexeme, 95); nm[95] = '\0';
+            fe_advance(&p); fe_advance(&p); // 'class', NAME
+            if (p.current_token.type == TOKEN_LT && g_ngeneric < TEKO_MAX_GENERICS) {
+                strncpy(g_generic[g_ngeneric], nm, 95); g_generic[g_ngeneric][95] = '\0'; g_ngeneric++;
+            }
+        } else fe_advance(&p);
+      }
+    }
+    { Lexer lx; lexer_init(&lx, source); Parser p; parser_init(&p, &lx);
+      TokenType prev = TOKEN_EOF;
+      while (p.current_token.type != TOKEN_EOF) {
+        if (p.current_token.type == TOKEN_IDENTIFIER && p.peek_token.type == TOKEN_LT &&
+            prev != TOKEN_CLASS && is_generic_template(p.current_token.lexeme)) {
+            char tmpl[96]; strncpy(tmpl, p.current_token.lexeme, 95); tmpl[95] = '\0';
+            fe_advance(&p); // NAME -> '<'
+            fe_advance(&p); // '<' -> Arg
+            if (p.current_token.type == TOKEN_IDENTIFIER) geninst_add(tmpl, p.current_token.lexeme);
+            prev = TOKEN_IDENTIFIER; // the Arg (current); continue from here
+            continue;
+        }
+        prev = p.current_token.type;
+        fe_advance(&p);
+      }
+    }
+}
+
+// Phase 15 (15.A): pre-pass that builds the class registry (g_class) — each class's ordered field
+// list (compile-time layout) and method table (each method -> a routine slot, continuing the
+// global counter after the top-level `fn`s at base_slot). Method bodies are emitted later by
+// emit_method_routines in the SAME class/declaration order, so slots stay dense and consistent
+// with the backend's routine function table. Phase 15.B: also captures the `: Trait1, Trait2`
+// implements clause + the `abstract` modifier, and records bodyless (abstract) methods with no slot.
+// Phase 15.C: a generic `class Box<T>` template is monomorphized into one concrete `Box$Arg` per
+// discovered type-arg (collect_generics) instead of being registered directly.
+static void collect_classes(const char* source, int base_slot) {
+    g_nclass = 0;
+    Lexer lx; lexer_init(&lx, source);
+    Parser p; parser_init(&p, &lx);
+    int slot = base_slot;
+    while (p.current_token.type != TOKEN_EOF) {
+        int is_abstract = 0;
+        if (p.current_token.type == TOKEN_ABSTRACT && p.peek_token.type == TOKEN_CLASS) {
+            is_abstract = 1; fe_advance(&p); // consume 'abstract'; now at 'class'
+        }
+        if (p.current_token.type != TOKEN_CLASS || p.peek_token.type != TOKEN_IDENTIFIER) {
+            fe_advance(&p); continue;
+        }
+        if (g_nclass >= TEKO_MAX_CLASSES) { skip_class_decl(&p); continue; }
+        ClassInfo* c = &g_class[g_nclass];
+        memset(c, 0, sizeof(*c));
+        c->is_abstract = is_abstract;
+        fe_advance(&p); // 'class'
+        strncpy(c->name, p.current_token.lexeme, 95); c->name[95] = '\0';
+        fe_advance(&p); // class name
+        // Phase 15.C: optional `<T>` generic clause — a TEMPLATE (monomorphized per type-arg below).
+        char typeparam[96]; typeparam[0] = '\0'; int generic = 0;
+        if (p.current_token.type == TOKEN_LT) {
+            generic = 1; fe_advance(&p); // '<'
+            if (p.current_token.type == TOKEN_IDENTIFIER) {
+                strncpy(typeparam, p.current_token.lexeme, 95); typeparam[95] = '\0';
+            }
+            while (p.current_token.type != TOKEN_GT && p.current_token.type != TOKEN_LBRACE &&
+                   p.current_token.type != TOKEN_EOF) fe_advance(&p);
+            if (p.current_token.type == TOKEN_GT) fe_advance(&p); // '>'
+        }
+        // Phase 15.B: optional `: Trait1, Trait2` implements/extends clause (capture the names).
+        if (p.current_token.type == TOKEN_COLON) {
+            fe_advance(&p);
+            while (p.current_token.type != TOKEN_LBRACE && p.current_token.type != TOKEN_EOF) {
+                if (p.current_token.type == TOKEN_IDENTIFIER && c->ntraits < TEKO_CLASS_MAX_TRAITS) {
+                    strncpy(c->traits[c->ntraits], p.current_token.lexeme, 95);
+                    c->traits[c->ntraits][95] = '\0'; c->ntraits++;
+                }
+                fe_advance(&p);
+            }
+        } else {
+            while (p.current_token.type != TOKEN_LBRACE && p.current_token.type != TOKEN_EOF) fe_advance(&p);
+        }
+        if (p.current_token.type == TOKEN_LBRACE) fe_advance(&p); // '{'
+        int depth = 1;
+        while (p.current_token.type != TOKEN_EOF && depth > 0) {
+            if (p.current_token.type == TOKEN_LBRACE) { depth++; fe_advance(&p); continue; }
+            if (p.current_token.type == TOKEN_RBRACE) { depth--; fe_advance(&p); continue; }
+            if (depth == 1 && (p.current_token.type == TOKEN_LET || p.current_token.type == TOKEN_MUT) &&
+                p.peek_token.type == TOKEN_IDENTIFIER) {
+                fe_advance(&p); // let/mut
+                if (c->nfields < TEKO_CLASS_MAX_FIELDS) {
+                    strncpy(c->fields[c->nfields], p.current_token.lexeme, 95);
+                    c->fields[c->nfields][95] = '\0'; c->nfields++;
+                }
+                fe_advance(&p); // field name
+                while (p.current_token.type != TOKEN_SEMICOLON && p.current_token.type != TOKEN_RBRACE &&
+                       p.current_token.type != TOKEN_EOF) fe_advance(&p); // skip ': type'
+                if (p.current_token.type == TOKEN_SEMICOLON) fe_advance(&p);
+                continue;
+            }
+            // Methods mirror functions: an optional leading `async` (the method returns intent<>),
+            // an optional generic clause `<T>` after the name, and a `: ReturnType` before the body.
+            if (depth == 1 && p.current_token.type == TOKEN_ASYNC && p.peek_token.type == TOKEN_FN) {
+                fe_advance(&p); // consume 'async' (async method — intent<> return; MVP body is synchronous)
+            }
+            if (depth == 1 && p.current_token.type == TOKEN_FN && p.peek_token.type == TOKEN_IDENTIFIER) {
+                fe_advance(&p); // 'fn'
+                char mname[96]; strncpy(mname, p.current_token.lexeme, 95); mname[95] = '\0';
+                fe_advance(&p); // method name
+                skip_generic_clause(&p); // optional `<T>` generic params (uniform i32 model; 15.C)
+                int nparams = 0;
+                if (p.current_token.type == TOKEN_LPAREN) {
+                    fe_advance(&p);
+                    int expect = 1; // a param name follows '(' or ','
+                    while (p.current_token.type != TOKEN_RPAREN && p.current_token.type != TOKEN_EOF) {
+                        if (expect && p.current_token.type == TOKEN_IDENTIFIER) { nparams++; expect = 0; }
+                        else if (p.current_token.type == TOKEN_COMMA) expect = 1;
+                        fe_advance(&p);
+                    }
+                    if (p.current_token.type == TOKEN_RPAREN) fe_advance(&p);
+                }
+                while (p.current_token.type != TOKEN_LBRACE && p.current_token.type != TOKEN_SEMICOLON &&
+                       p.current_token.type != TOKEN_RBRACE && p.current_token.type != TOKEN_EOF) fe_advance(&p); // skip `: ReturnType`
+                // Phase 15.B: a bodied method gets a routine slot; a bodyless one (`fn m(self): T;`)
+                // is an abstract CONTRACT (slot -1, no routine) — a concrete subclass supplies it.
+                int bodied = (p.current_token.type == TOKEN_LBRACE);
+                int mi = c->nmethods;
+                if (mi < TEKO_CLASS_MAX_METHODS) {
+                    strncpy(c->methods[mi], mname, 95); c->methods[mi][95] = '\0';
+                    // -2 = bodied, slot assigned AFTER the header is known (a generic template's
+                    // bodied methods get slots only on its monomorphized instances). -1 = abstract.
+                    c->method_slot[mi] = bodied ? -2 : -1;
+                    c->method_nparams[mi] = nparams;
+                    c->nmethods++;
+                }
+                methodid_of(mname); // reserve/share the global method_id (vtable column)
+                if (bodied) {
+                    int d2 = 1; fe_advance(&p);
+                    while (p.current_token.type != TOKEN_EOF && d2 > 0) {
+                        if (p.current_token.type == TOKEN_LBRACE) d2++;
+                        else if (p.current_token.type == TOKEN_RBRACE) d2--;
+                        fe_advance(&p);
+                    }
+                } else if (p.current_token.type == TOKEN_SEMICOLON) {
+                    fe_advance(&p); // bodyless contract method
+                }
+                continue;
+            }
+            fe_advance(&p);
+        }
+        // Phase 15.C: finalize this class. A non-generic class gets its bodied-method slots assigned
+        // inline now (source order). A GENERIC template is NOT registered directly — instead one
+        // concrete instance "Name$Arg" is cloned per discovered (template, type-arg); their slots are
+        // assigned after the whole walk (so they sit after every non-generic class's slots).
+        if (!generic) {
+            for (int mi = 0; mi < c->nmethods; mi++)
+                if (c->method_slot[mi] == -2) c->method_slot[mi] = slot++;
+            g_nclass++;
+        } else {
+            ClassInfo tmpl = *c; // the parsed template (fields + methods, slots still -2)
+            for (int gi = 0; gi < g_ngeninst && g_nclass < TEKO_MAX_CLASSES; gi++) {
+                if (strcmp(g_geninst[gi].tmpl, tmpl.name) != 0) continue;
+                ClassInfo* inst = &g_class[g_nclass];
+                *inst = tmpl;
+                snprintf(inst->name, sizeof(inst->name), "%s$%s", tmpl.name, g_geninst[gi].arg);
+                strncpy(inst->typeparam, typeparam, 95);          inst->typeparam[95] = '\0';
+                strncpy(inst->mono_arg,  g_geninst[gi].arg, 95);  inst->mono_arg[95]  = '\0';
+                strncpy(inst->tmpl_name, tmpl.name, 95);          inst->tmpl_name[95] = '\0';
+                g_nclass++; // slots stay -2 — assigned in the finalize pass below
+            }
+        }
+    }
+    // Phase 15.C: assign routine slots to monomorphized instance methods — AFTER every non-generic
+    // class (so the global slot order is: fns, non-generic class methods, then mono-instance methods,
+    // matching the emission order emit_method_routines + emit_mono_routines).
+    for (int ci = 0; ci < g_nclass; ci++) {
+        if (g_class[ci].mono_arg[0] == '\0') continue;
+        for (int mi = 0; mi < g_class[ci].nmethods; mi++)
+            if (g_class[ci].method_slot[mi] == -2) g_class[ci].method_slot[mi] = slot++;
+    }
+}
+
 // Pre-pass: assign each top-level `fn NAME` a table slot (declaration order), so a
-// main-level @dom.on(…, NAME) can resolve the handler reference before its body.
+// main-level @dom.on(…, NAME) can resolve the handler reference before its body. Class bodies
+// are skipped (their methods get slots in collect_classes, continuing the same counter).
 static void collect_functions(const char* source, ImportBinding** fns, int* nfns, int* capfns) {
     Lexer lx; lexer_init(&lx, source);
     Parser p; parser_init(&p, &lx);
@@ -1147,6 +1972,9 @@ static void collect_functions(const char* source, ImportBinding** fns, int* nfns
     while (p.current_token.type != TOKEN_EOF) {
         if (p.current_token.type == TOKEN_EXTERN) {
             skip_extern_decl(&p); // do not treat `extern fn` as a handler
+        } else if (p.current_token.type == TOKEN_CLASS || p.current_token.type == TOKEN_ABSTRACT ||
+                   p.current_token.type == TOKEN_TRAIT) {
+            skip_class_decl(&p);  // class/abstract/trait bodies are not top-level routines (keyword-generic skip)
         } else if (p.current_token.type == TOKEN_FN && p.peek_token.type == TOKEN_IDENTIFIER) {
             bind_add(fns, nfns, capfns, p.peek_token.lexeme, slot++);
             fe_advance(&p); // consume 'fn'
@@ -1209,6 +2037,8 @@ static void emit_handler_routines(const char* source, BytecodeBuffer* buffer,
 
     while (p.current_token.type != TOKEN_EOF) {
         if (p.current_token.type == TOKEN_EXTERN) { skip_extern_decl(&p); continue; }
+        if (p.current_token.type == TOKEN_CLASS || p.current_token.type == TOKEN_ABSTRACT ||
+            p.current_token.type == TOKEN_TRAIT) { skip_class_decl(&p); continue; } // methods: emit_method_routines
         if (p.current_token.type != TOKEN_FN) { fe_advance(&p); continue; }
         fe_advance(&p); // consume 'fn'
         if (p.current_token.type != TOKEN_IDENTIFIER) continue;
@@ -1283,6 +2113,157 @@ static void emit_handler_routines(const char* source, BytecodeBuffer* buffer,
     }
 }
 
+// Phase 15 (15.A): emit each class method body as a table routine (slots assigned in
+// collect_classes, continuing after the top-level fns). A method takes its instance as the
+// leading `self` param (bound from spawn arg 0) plus any explicit params; `self`'s class is
+// recorded so `self.field` / `self.method(...)` resolve at compile time. Body lowering reuses
+// the SAME statement dispatcher as $main and `fn` handlers, so methods compose loops/branches/
+// field access/method calls. Walks classes/methods in the SAME order collect_classes assigned
+// slots, so the routine table stays dense and correct.
+// Emit every bodied method of class `ci` as a table routine. `p` MUST be positioned just after the
+// class's opening `{`; consumes through the matching `}`. Shared by the non-generic pass
+// (emit_method_routines) and the monomorphization pass (emit_mono_routines, with g_subst active).
+static void emit_class_body(Parser* p, BytecodeBuffer* buffer, int ci,
+                            ImportBinding* fns, int nfns, ImportBinding* binds, int nb, TempAlloc* ta) {
+    int depth = 1;
+    while (p->current_token.type != TOKEN_EOF && depth > 0) {
+        if (p->current_token.type == TOKEN_LBRACE) { depth++; fe_advance(p); continue; }
+        if (p->current_token.type == TOKEN_RBRACE) { depth--; fe_advance(p); continue; }
+        if (!(depth == 1 && p->current_token.type == TOKEN_FN &&
+              p->peek_token.type == TOKEN_IDENTIFIER)) { fe_advance(p); continue; }
+
+        fe_advance(p); // 'fn'  (an `async fn` reaches here with its `async` already skipped)
+        char mname[96]; strncpy(mname, p->current_token.lexeme, 95); mname[95] = '\0';
+        int midx = class_method_idx(ci, mname);
+        int slot = (ci >= 0 && midx >= 0) ? g_class[ci].method_slot[midx] : 0;
+        fe_advance(p); // method name
+        skip_generic_clause(p); // optional `<T>` generic params
+
+        char params[8][96]; int nparams = 0;
+        if (p->current_token.type == TOKEN_LPAREN) {
+            fe_advance(p);
+            int expect = 1;
+            while (p->current_token.type != TOKEN_RPAREN && p->current_token.type != TOKEN_EOF) {
+                if (expect && p->current_token.type == TOKEN_IDENTIFIER && nparams < 8) {
+                    strncpy(params[nparams], p->current_token.lexeme, 95); params[nparams][95] = '\0';
+                    nparams++; expect = 0;
+                } else if (p->current_token.type == TOKEN_COMMA) expect = 1;
+                fe_advance(p);
+            }
+            if (p->current_token.type == TOKEN_RPAREN) fe_advance(p);
+        }
+        while (p->current_token.type != TOKEN_LBRACE && p->current_token.type != TOKEN_SEMICOLON &&
+               p->current_token.type != TOKEN_EOF) fe_advance(p); // skip `: ReturnType`
+        // Phase 15.B: a bodyless (abstract) contract method has no routine — skip it (slot == -1).
+        if (p->current_token.type == TOKEN_SEMICOLON || slot < 0) {
+            if (p->current_token.type == TOKEN_SEMICOLON) fe_advance(p);
+            continue;
+        }
+        if (p->current_token.type == TOKEN_LBRACE) fe_advance(p);
+
+        codegen_li_emit_func_begin(buffer, slot);
+        if (nparams > 0) codegen_li_emit_store(buffer); // $w1 = arg0 (parity with the handler ABI)
+
+        LowerCtx ctx;
+        ctx.param_name = nparams > 0 ? params[0] : NULL;
+        ctx.fns = fns; ctx.nfns = nfns;
+        ctx.locals = NULL; ctx.nlocals = 0; ctx.ta = ta;
+        ta->next_temp = 0;
+        ImportBinding* rlocals = NULL; int rnlocals = 0, rcaplocals = 0;
+        LowerEnv renv;
+        renv.locals = &rlocals; renv.nlocals = &rnlocals; renv.caplocals = &rcaplocals;
+        renv.binds = &binds; renv.nb = &nb; renv.ctx = &ctx;
+
+        localcls_reset(); // method scope: self (+ any objects it instantiates) are class-typed
+        traitlocal_reset(); // method scope: trait-typed locals don't leak across method bodies
+        for (int pi = 0; pi < nparams; pi++) {
+            int ps = env_alloc_local(&renv, params[pi]);
+            codegen_li_emit_load_spawn_arg(buffer, pi); // $w0 = args[pi]
+            codegen_li_emit_store_local(buffer, ps);
+        }
+        // The leading param IS the instance: bind it to this method's class so member access inside
+        // the body resolves (`self.x` -> OP_OBJ_GET, `self.m()` -> OP_CALL_FUNC).
+        if (nparams > 0 && ci >= 0) localcls_set(params[0], ci);
+
+        while (p->current_token.type != TOKEN_RBRACE && p->current_token.type != TOKEN_EOF) {
+            lower_one_stmt(buffer, p, &renv);
+        }
+        if (p->current_token.type == TOKEN_RBRACE) fe_advance(p);
+
+        for (int i = 0; i < rnlocals; i++) free(rlocals[i].name);
+        free(rlocals);
+        codegen_li_emit_func_end(buffer);
+    }
+}
+
+static void emit_method_routines(const char* source, BytecodeBuffer* buffer,
+                                 ImportBinding* fns, int nfns,
+                                 ImportBinding* binds, int nb, TempAlloc* ta) {
+    Lexer lx; lexer_init(&lx, source);
+    Parser p; parser_init(&p, &lx);
+    while (p.current_token.type != TOKEN_EOF) {
+        // Phase 15.B: traits carry only bodyless contracts — never emit bodies for them.
+        if (p.current_token.type == TOKEN_TRAIT) { skip_class_decl(&p); continue; }
+        // `abstract class` reaches the class branch with `abstract` consumed by the skip below.
+        if (p.current_token.type != TOKEN_CLASS || p.peek_token.type != TOKEN_IDENTIFIER) {
+            fe_advance(&p); continue;
+        }
+        fe_advance(&p); // 'class'
+        int ci = class_find(p.current_token.lexeme);
+        fe_advance(&p); // class name
+        // Phase 15.C: a GENERIC template (`class NAME<T>`) is NOT emitted here — its monomorphized
+        // instances are emitted by emit_mono_routines. class_find returned -1 for it (never registered).
+        if (p.current_token.type == TOKEN_LT) {
+            while (p.current_token.type != TOKEN_LBRACE && p.current_token.type != TOKEN_EOF) fe_advance(&p);
+            if (p.current_token.type == TOKEN_LBRACE) {
+                int d = 1; fe_advance(&p);
+                while (p.current_token.type != TOKEN_EOF && d > 0) {
+                    if (p.current_token.type == TOKEN_LBRACE) d++;
+                    else if (p.current_token.type == TOKEN_RBRACE) d--;
+                    fe_advance(&p);
+                }
+            }
+            continue;
+        }
+        while (p.current_token.type != TOKEN_LBRACE && p.current_token.type != TOKEN_EOF) fe_advance(&p);
+        if (p.current_token.type == TOKEN_LBRACE) fe_advance(&p);
+        emit_class_body(&p, buffer, ci, fns, nfns, binds, nb, ta);
+    }
+    localcls_reset();
+}
+
+// Phase 15.C: emit each MONOMORPHIZED instance's methods. For each `Tmpl$Arg` concrete instance, set
+// the type-param substitution (T -> Arg), re-lex source to the generic template `class Tmpl<T>`, and
+// emit its body under the instance's slots — so `T()` instantiates Arg and a `T`-typed local is
+// Arg-typed (real per-type specialization, zero runtime cost). Runs AFTER emit_method_routines, so
+// the mono instances' (higher) slots are emitted in slot order → the routine table stays dense.
+static void emit_mono_routines(const char* source, BytecodeBuffer* buffer,
+                               ImportBinding* fns, int nfns,
+                               ImportBinding* binds, int nb, TempAlloc* ta) {
+    for (int ci = 0; ci < g_nclass; ci++) {
+        if (g_class[ci].mono_arg[0] == '\0') continue; // only monomorphized instances
+        strncpy(g_subst_param, g_class[ci].typeparam, 95); g_subst_param[95] = '\0';
+        strncpy(g_subst_arg,   g_class[ci].mono_arg, 95);  g_subst_arg[95]   = '\0';
+        Lexer lx; lexer_init(&lx, source);
+        Parser p; parser_init(&p, &lx);
+        int found = 0;
+        while (p.current_token.type != TOKEN_EOF) {
+            if (p.current_token.type == TOKEN_CLASS && p.peek_token.type == TOKEN_IDENTIFIER &&
+                strcmp(p.peek_token.lexeme, g_class[ci].tmpl_name) == 0) { found = 1; break; }
+            fe_advance(&p);
+        }
+        if (found) {
+            fe_advance(&p); // 'class'
+            fe_advance(&p); // template name
+            while (p.current_token.type != TOKEN_LBRACE && p.current_token.type != TOKEN_EOF) fe_advance(&p);
+            if (p.current_token.type == TOKEN_LBRACE) fe_advance(&p);
+            emit_class_body(&p, buffer, ci, fns, nfns, binds, nb, ta);
+        }
+        g_subst_param[0] = '\0'; g_subst_arg[0] = '\0';
+    }
+    localcls_reset();
+}
+
 int teko_compile_interop(const char* source, BytecodeBuffer* buffer) {
     if (!source || !buffer) return 1;
 
@@ -1300,6 +2281,21 @@ int teko_compile_interop(const char* source, BytecodeBuffer* buffer) {
     int nfns = 0, capfns = 0;
     collect_functions(source, &fns, &nfns, &capfns);
 
+    // Phase 15 (15.B): pre-pass the trait contracts (g_trait) + the global method-id space, then
+    // (15.A) the class layouts + method table. Method routine slots continue the global counter
+    // after the top-level fns (nfns), so the routine function table stays dense across handlers +
+    // methods. localcls is the per-scope instance->class map; reset for $main.
+    g_oop_error = 0;
+    g_nmethodname = 0;
+    g_subst_param[0] = '\0'; g_subst_arg[0] = '\0'; // no active monomorphization substitution
+    collect_traits(source);
+    collect_generics(source); // Phase 15.C: discover generic templates + their concrete instantiations
+    collect_events(source, fns, nfns); // Phase 15.D: events + their static subscriptions
+    collect_classes(source, nfns);
+    check_oop_collisions(); // ambiguous trait composition -> g_oop_error (compile failure below)
+    localcls_reset();
+    if (g_oop_error) return 1; // do not emit a module with an unresolved OOP compile error
+
     // Phase 12: named local variables ($v0..) declared with `let`/`mut` at top level.
     ImportBinding* locals = NULL;
     int nlocals = 0, caplocals = 0;
@@ -1316,6 +2312,29 @@ int teko_compile_interop(const char* source, BytecodeBuffer* buffer) {
     top_env.locals = &locals; top_env.nlocals = &nlocals; top_env.caplocals = &caplocals;
     top_env.binds = &binds; top_env.nb = &nb; top_env.ctx = &top_ctx;
 
+    // Phase 15.B: populate the STATIC vtable at $main start — for every concrete class implementing
+    // a trait, vtable_set(type_id, method_id, slot) for each of its bodied methods (its abstract
+    // contract methods have slot -1 and are skipped; a subclass override re-points the same column).
+    // The mapping is fixed at compile time; teko_vtable_set self-resets on its first call. Programs
+    // with no trait-implementing class emit nothing here → byte-identical to 15.A.
+    traitlocal_reset();
+    {
+        int any_dispatch = 0;
+        for (int ci = 0; ci < g_nclass; ci++) if (g_class[ci].ntraits > 0) { any_dispatch = 1; break; }
+        if (any_dispatch) {
+            for (int ci = 0; ci < g_nclass; ci++) {
+                if (g_class[ci].ntraits == 0) continue;
+                for (int mi = 0; mi < g_class[ci].nmethods; mi++) {
+                    if (g_class[ci].method_slot[mi] < 0) continue; // abstract contract — no routine
+                    codegen_li_emit_iconst(buffer, class_type_id(ci));                 codegen_li_emit_setarg(buffer, 0);
+                    codegen_li_emit_iconst(buffer, methodid_of(g_class[ci].methods[mi])); codegen_li_emit_setarg(buffer, 1);
+                    codegen_li_emit_iconst(buffer, g_class[ci].method_slot[mi]);
+                    codegen_li_emit_vtable(buffer, OP_VTABLE_SET);
+                }
+            }
+        }
+    }
+
     while (parser.current_token.type != TOKEN_EOF) {
         // Keep the top-level lowering context's local view current, and start temp
         // slots above the named locals so spills never clobber a `let` binding.
@@ -1328,6 +2347,60 @@ int teko_compile_interop(const char* source, BytecodeBuffer* buffer) {
             // `let`/`mut NAME [: type] = <initializer>` — a named local binding. Shared with block
             // bodies (lower_let_stmt → lower_init_value), so `let cb = circuit(...)` works here too.
             lower_let_stmt(buffer, &parser, &top_env);
+        } else if (parser.current_token.type == TOKEN_EVENT) {
+            // Phase 15.D: `event E;` — a compile-time declaration (registered in collect_events);
+            // emits no code. Skip to the statement end.
+            while (parser.current_token.type != TOKEN_SEMICOLON && parser.current_token.type != TOKEN_EOF)
+                fe_advance(&parser);
+            if (parser.current_token.type == TOKEN_SEMICOLON) fe_advance(&parser);
+        } else if (parser.current_token.type == TOKEN_SUBSCRIBE) {
+            // Phase 15.D: `subscribe E with H [fanout|fire_and_forget];` — registered statically in
+            // collect_events; emits no code at the subscription site.
+            while (parser.current_token.type != TOKEN_SEMICOLON && parser.current_token.type != TOKEN_EOF)
+                fe_advance(&parser);
+            if (parser.current_token.type == TOKEN_SEMICOLON) fe_advance(&parser);
+        } else if (parser.current_token.type == TOKEN_RAISE &&
+                   parser.peek_token.type == TOKEN_IDENTIFIER) {
+            // Phase 15.D: `raise E(args);` — fan-out to every subscriber of E. The subscriber set is
+            // compile-time static; each handler is spawned over the Phase-14 cooperative scheduler
+            // (drained at program exit, so handlers run AFTER the raise site — deferred fan-out).
+            // Args are parsed once (int literals / named locals) and RE-STAGED per subscriber (a
+            // spawn consumes the staged args). fanout + fire_and_forget both spawn in the MVP.
+            fe_advance(&parser); // 'raise'
+            int ei = event_find(parser.current_token.lexeme);
+            fe_advance(&parser); // event name
+            // Parse the args once.
+            int ev_is_local[8]; int ev_val[8]; int ev_argc = 0;
+            if (parser.current_token.type == TOKEN_LPAREN) {
+                fe_advance(&parser);
+                while (parser.current_token.type != TOKEN_RPAREN &&
+                       parser.current_token.type != TOKEN_EOF && ev_argc < 8) {
+                    if (parser.current_token.type == TOKEN_LIT_INT) {
+                        ev_is_local[ev_argc] = 0; ev_val[ev_argc] = (int)literal_canonical_value(&parser.current_token);
+                        ev_argc++; fe_advance(&parser);
+                    } else if (parser.current_token.type == TOKEN_IDENTIFIER) {
+                        int s = bind_lookup(locals, nlocals, parser.current_token.lexeme);
+                        ev_is_local[ev_argc] = (s >= 0) ? 1 : 0; ev_val[ev_argc] = (s >= 0) ? s : 0;
+                        ev_argc++; fe_advance(&parser);
+                    } else if (parser.current_token.type == TOKEN_COMMA) {
+                        fe_advance(&parser);
+                    } else fe_advance(&parser);
+                }
+                if (parser.current_token.type == TOKEN_RPAREN) fe_advance(&parser);
+            }
+            if (parser.current_token.type == TOKEN_SEMICOLON) fe_advance(&parser);
+            if (ei >= 0) {
+                for (int si = 0; si < g_event[ei].nsubs; si++) {
+                    for (int ai = 0; ai < ev_argc; ai++) {
+                        if (ev_is_local[ai]) codegen_li_emit_load_local(buffer, ev_val[ai]);
+                        else                 codegen_li_emit_iconst(buffer, ev_val[ai]);
+                        codegen_li_emit_setarg(buffer, ai);
+                    }
+                    codegen_li_emit_iconst(buffer, g_event[ei].handler_slot[si]); // $w0 = handler slot
+                    if (ev_argc > 0) codegen_li_emit_spawn_async_args(buffer, ev_argc);
+                    else             codegen_li_emit_spawn_async(buffer);
+                }
+            }
         } else if (parser.current_token.type == TOKEN_ROUTINES) {
             // Phase 14 (14.A): `routines { foo(); bar(); }` — fire each enclosed call as a
             // background task. Each `NAME(…)` resolves to a top-level `fn NAME`'s table slot
@@ -1388,6 +2461,14 @@ int teko_compile_interop(const char* source, BytecodeBuffer* buffer) {
                 register_extern(buffer, node, &binds, &nb, &capb);
                 free_ffi_ast_node(node);
             }
+        } else if (parser.current_token.type == TOKEN_CLASS || parser.current_token.type == TOKEN_ABSTRACT ||
+                   parser.current_token.type == TOKEN_TRAIT) {
+            // Phase 15 (15.A/15.B): class/abstract/trait declarations emit no top-level code; their
+            // layout/contracts were pre-collected, and method bodies are emitted after $main
+            // (emit_method_routines). Keyword-generic brace skip.
+            skip_class_decl(&parser);
+        } else if (lower_member_stmt(buffer, &parser, &top_env)) {
+            // Phase 15 (15.A): top-level `obj.field = expr;` / `obj.method(args);`.
         } else if (parser.current_token.type == TOKEN_FN) {
             // Handler declaration: skip its body in the main pass; it is emitted as a
             // table routine after main's HALT (emit_handler_routines).
@@ -1528,6 +2609,16 @@ int teko_compile_interop(const char* source, BytecodeBuffer* buffer) {
     // Emit handler bodies as table routines (after main), so @dom.on references resolve.
     // (May raise the temp high-water for nested args inside handler bodies.)
     emit_handler_routines(source, buffer, fns, nfns, binds, nb, &ta);
+
+    // Phase 15 (15.A): emit class method bodies as table routines (after the handlers; their
+    // slots continue past nfns, matching collect_classes). Methods may use named locals + temps,
+    // so this also feeds the shared $v high-water below.
+    emit_method_routines(source, buffer, fns, nfns, binds, nb, &ta);
+
+    // Phase 15.C: emit the MONOMORPHIZED instance method bodies (one specialized copy per generic
+    // type-arg, with the type-param substituted) — AFTER the non-generic methods so their (higher)
+    // slots are emitted in slot order, keeping the routine table dense.
+    emit_mono_routines(source, buffer, fns, nfns, binds, nb, &ta);
 
     // Phase 12: how many $v locals to declare per function — named locals plus the
     // expression/nested-arg temp high-water (across $main and the handler routines).

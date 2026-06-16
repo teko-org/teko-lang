@@ -3,7 +3,7 @@
 > Status: **current** (branch `feat/phase-13-native-crypto`). Dedicated, owner-requested
 > phase. Implements the widest practical set of **symmetric** and **asymmetric** ciphers
 > **fully native — no OpenSSL, no external libraries** — validated by known-answer test
-> vectors (NIST / RFC KATs) + round-trips. Phase 17 (Networking & Web) later consumes these
+> vectors (NIST / RFC KATs) + round-trips. Phase 18 (Networking & Web) later consumes these
 > primitives for TLS 1.3. See `docs/plan.md` → "PHASE 13: Native Cryptography".
 
 ## ▶ STATUS: FULLY COMPLETE — runtime + native surface + WASM surface (2026-06-15, PR #6)

@@ -22,6 +22,8 @@
 #include "teko_broadcast.h"
 #include "teko_retry.h"
 #include "teko_time.h"
+#include "teko_object.h"
+#include "teko_vtable.h"
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -778,3 +780,34 @@ char* teko_rt_uuid_v7(int ignored) {
     return teko_rt_uuid_str(u);
 }
 #endif // !__wasm__ (CSPRNG / UUID v4-v7 tail)
+
+// Phase 15 (15.A) — object model surface wrappers. The OP_OBJ_* opcodes lower to these
+// (SysV/AAPCS calls); the teko_object C runtime (src/runtime/teko_object.c) is the source of
+// truth. The handle is the TekoObject* carried through the surface as a register-width integer;
+// field cells are register-width (a field may hold another object's handle). Available on EVERY
+// target — native AND the wasm32 reactor (so this MUST sit outside the `!__wasm__` CSPRNG tail).
+long teko_rt_object_new(long nfields) {
+    return (long)(intptr_t)teko_object_new((int)nfields);
+}
+long teko_rt_object_set(long handle, long idx, long value) {
+    teko_object_set((TekoObject*)(intptr_t)handle, (int)idx, value);
+    return 0;
+}
+long teko_rt_object_get(long handle, long idx) {
+    return teko_object_get((TekoObject*)(intptr_t)handle, (int)idx);
+}
+long teko_rt_object_free(long handle) {
+    teko_object_free((TekoObject*)(intptr_t)handle);
+    return 0;
+}
+
+// Phase 15 (15.B) — static vtable surface wrappers. The OP_VTABLE_* opcodes lower to these; the
+// teko_vtable C runtime is the source of truth (compile-time-populated dispatch table). Available
+// on every target (native + the wasm32 reactor). Pure register-width integers (type/method/slot).
+long teko_rt_vtable_set(long type_id, long method_id, long slot) {
+    teko_vtable_set(type_id, method_id, slot);
+    return 0;
+}
+long teko_rt_vtable_get(long type_id, long method_id) {
+    return teko_vtable_get(type_id, method_id);
+}

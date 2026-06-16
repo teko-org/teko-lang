@@ -34,6 +34,8 @@ BytecodeBuffer* codegen_li_create_context(void) {
     buffer->uses_wait = 0;
     buffer->uses_await = 0;
     buffer->uses_retry = 0;
+    buffer->uses_object = 0;
+    buffer->uses_vtable = 0;
 
     return buffer;
 }
@@ -251,6 +253,25 @@ void codegen_li_emit_cf(BytecodeBuffer* buffer, OpCode op) {
 void codegen_li_emit_retry(BytecodeBuffer* buffer, OpCode op) {
     if (!buffer) return;
     buffer->uses_retry = 1; // backends link/import the teko_retry policy runtime
+    emit_byte(buffer, (unsigned char)op);
+}
+
+void codegen_li_emit_object(BytecodeBuffer* buffer, OpCode op) {
+    if (!buffer) return;
+    buffer->uses_object = 1; // backends link/import the teko_object instance-store runtime
+    emit_byte(buffer, (unsigned char)op);
+}
+
+void codegen_li_emit_call_func(BytecodeBuffer* buffer, int argc) {
+    if (!buffer) return;
+    buffer->uses_spawn = 1; // needs the routine table + the scheduler TU (teko_rt_call lives there)
+    emit_byte(buffer, OP_CALL_FUNC);
+    emit_int(buffer, argc);
+}
+
+void codegen_li_emit_vtable(BytecodeBuffer* buffer, OpCode op) {
+    if (!buffer) return;
+    buffer->uses_vtable = 1; // backends link/import the teko_vtable static-dispatch runtime
     emit_byte(buffer, (unsigned char)op);
 }
 

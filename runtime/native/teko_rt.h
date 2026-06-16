@@ -127,6 +127,11 @@ void teko_rt_run(void);
 void teko_rt_spawn_setarg(long idx, long val);
 void teko_rt_spawn_args(long slot);
 
+// Phase 15 (15.A) — SYNCHRONOUS routine call (method dispatch, lowered from OP_CALL_FUNC). Calls
+// teko_routine_table[slot] with the args staged via teko_rt_spawn_setarg and returns its result.
+// Lives in teko_rt_sched.c (the routine-table TU), so a class-with-methods program links it.
+long teko_rt_call(long slot);
+
 // Phase 14 (real-time clock) — a portable MONOTONIC nanosecond clock; the time base for the
 // cooperative waiters/delays/timeouts. Native: CLOCK_MONOTONIC / QueryPerformanceCounter; WASM:
 // imports env.teko_now_ns. Only differences are meaningful (arbitrary epoch).
@@ -185,5 +190,20 @@ char* teko_rt_time_now_utc(int ignored);           // "now" ISO-8601 UTC
 char* teko_rt_time_now_local(int ignored);         // "now" ISO-8601 system-local (DST-correct)
 char* teko_rt_time_format_utc(const char* epoch);  // a user epoch -> ISO-8601 UTC
 char* teko_rt_time_format_local(const char* epoch); // a user epoch -> ISO-8601 system-local
+
+// Phase 15 (15.A) — object model surface wrappers (OP_OBJ_* lower to these). The handle is a
+// TekoObject* as a register-width integer; field cells are register-width. The teko_object C
+// runtime (src/runtime/teko_object.c) is the source of truth (linked natively, compiled into the
+// wasm32 reactor). Field indices are compile-time constants — zero runtime reflection.
+long teko_rt_object_new(long nfields);                 // -> handle
+long teko_rt_object_set(long handle, long idx, long value); // -> 0
+long teko_rt_object_get(long handle, long idx);        // -> value
+long teko_rt_object_free(long handle);                 // -> 0
+
+// Phase 15 (15.B) — static vtable surface wrappers (OP_VTABLE_* lower to these). The teko_vtable
+// C runtime (src/runtime/teko_vtable.c) is the source of truth — a compile-time-populated
+// type_id × method_id -> routine-slot table backing abstract/trait dynamic dispatch.
+long teko_rt_vtable_set(long type_id, long method_id, long slot); // -> 0
+long teko_rt_vtable_get(long type_id, long method_id);            // -> slot (-1 if unset)
 
 #endif // TEKO_RT_H

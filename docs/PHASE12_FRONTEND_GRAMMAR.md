@@ -32,8 +32,8 @@ A pass over the matrix for transform pairs without a counterpart:
   the base-encoding surface `encode` / `decode` / `base64` / `base32` / `hex` (made
   functional in block C).
 - **Added as reserved-with-target** (no dead tokens): `sign`/`verify` → **Phase 13**
-  (crypto); `serialize`/`stringify` → **Phase 18** (parsers; static per-type generators,
-  Go-style, no runtime reflection); HTTP `patch`/`head`/`options` → **Phase 17** (web).
+  (crypto); `serialize`/`stringify` → **Phase 19** (parsers; static per-type generators,
+  Go-style, no runtime reflection); HTTP `patch`/`head`/`options` → **Phase 18** (web).
 - **Skipped:** `compress`/`decompress` — not on the roadmap, no target phase to reserve to.
 
 ### Governing rule (from this point on)
@@ -42,7 +42,7 @@ an executable test, **or** be explicitly marked *reserved — lowering in Phase 
 status table below. The existing recognition-only keywords are all **reserved** (post-renumber): crypto
 (`crypto`/`hash`/`encrypt`/`decrypt`, and `sign`/`verify` once added) → **Phase 13 (Native
 Cryptography)**; resilience/concurrency → Phase 14; OOP → Phase 15; comptime/soa → Phase 16;
-web → Phase 17. The base-encoding set (`encode`/`decode` over `base64`/`base32`/`hex`) is
+web → Phase 18. The base-encoding set (`encode`/`decode` over `base64`/`base32`/`hex`) is
 **not** cryptography and is the first group to become **functional** within Phase 12.
 
 ### 2. Native literal suffixes (zero runtime cost, captured in the lexer)
@@ -107,7 +107,7 @@ foundational pieces unblock a *real* expression frontend and belong early in Pha
 **Phase 12 is functionally complete** on the surface we defined: reserved keyword matrix +
 literal suffixes (lexer), the real `.tks → IL → WASM` foundational frontend (named locals,
 integer expressions, nested args), and functional base encoding. Cryptography (Phase 13),
-serialization (Phase 18), and web verbs (Phase 17) remain **reserved tokens with a target
+serialization (Phase 19), and web verbs (Phase 18) remain **reserved tokens with a target
 phase** — not dead, not implemented here.
 6. **Crypto (`encrypt`/`decrypt`) — GATED.** Needs a real cipher; scope (AES-256-GCM /
    ChaCha20-Poly1305 / …) to be proposed and signed off — likely its own phase (roadmap
