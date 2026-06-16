@@ -168,16 +168,62 @@ typedef struct { int kind; int payload; } Prod;
 #define TEKO_MAX_CLASSES        64
 #define TEKO_CLASS_MAX_FIELDS   64
 #define TEKO_CLASS_MAX_METHODS  64
+#define TEKO_CLASS_MAX_TRAITS   8
 typedef struct {
     char name[96];
     char fields[TEKO_CLASS_MAX_FIELDS][96]; int nfields;
     char methods[TEKO_CLASS_MAX_METHODS][96];
-    int  method_slot[TEKO_CLASS_MAX_METHODS];    // routine table slot (global, dense)
+    int  method_slot[TEKO_CLASS_MAX_METHODS];    // routine table slot (global, dense); -1 = abstract (bodyless)
     int  method_nparams[TEKO_CLASS_MAX_METHODS]; // includes the implicit leading `self`
     int  nmethods;
+    // Phase 15 (15.B): the traits/abstract bases this class composes (`class C : T1, T2`), and
+    // whether the class itself is `abstract` (a contract that cannot be instantiated directly).
+    char traits[TEKO_CLASS_MAX_TRAITS][96]; int ntraits;
+    int  is_abstract;
+    // The concrete class's dense type_id (= its index in g_class) is used as the vtable row id.
 } ClassInfo;
 static ClassInfo g_class[TEKO_MAX_CLASSES];
 static int g_nclass;
+
+// ---- Phase 15 (15.B): trait registry + global method-id table -----------------------------
+// A `trait NAME { fn m(self): T; … }` is a pure CONTRACT — ordered bodyless method names, no
+// fields, no slots. A concrete class supplies the bodies. Dynamic dispatch through a trait-typed
+// reference resolves (concrete type_id, method_id) -> routine slot via the static vtable runtime.
+#define TEKO_MAX_TRAITS        64
+#define TEKO_MAX_METHOD_NAMES  256
+typedef struct {
+    char name[96];
+    char methods[TEKO_CLASS_MAX_METHODS][96]; int nmethods;
+} TraitInfo;
+static TraitInfo g_trait[TEKO_MAX_TRAITS];
+static int g_ntrait;
+
+// Global method-NAME -> dense method_id, shared across all classes/traits so a dynamic `g.m()`
+// resolves the SAME vtable column regardless of the concrete type behind `g`.
+static char g_methodname[TEKO_MAX_METHOD_NAMES][96];
+static int  g_nmethodname;
+
+// Set when the OOP surface has a hard compile error (e.g. an ambiguous trait-method collision);
+// teko_compile_interop returns non-zero so the CLI/driver reports failure instead of emitting.
+static int g_oop_error;
+
+static int trait_find(const char* n) {
+    for (int i = 0; i < g_ntrait; i++) if (strcmp(g_trait[i].name, n) == 0) return i;
+    return -1;
+}
+static int trait_method_idx(int ti, const char* m) {
+    if (ti < 0 || ti >= g_ntrait) return -1;
+    for (int i = 0; i < g_trait[ti].nmethods; i++) if (strcmp(g_trait[ti].methods[i], m) == 0) return i;
+    return -1;
+}
+static int methodid_of(const char* name) {
+    for (int i = 0; i < g_nmethodname; i++) if (strcmp(g_methodname[i], name) == 0) return i;
+    if (g_nmethodname < TEKO_MAX_METHOD_NAMES) {
+        strncpy(g_methodname[g_nmethodname], name, 95); g_methodname[g_nmethodname][95] = '\0';
+        return g_nmethodname++;
+    }
+    return -1;
+}
 
 // local var name -> class index (-1 = not a class instance). Per-function scope (reset for $main
 // and for each method body), so a method's `self`/locals don't alias $main's instance names.
@@ -1386,27 +1432,127 @@ static void skip_class_decl(Parser* p) {
     }
 }
 
+// Phase 15 (15.B): pre-pass that builds the trait registry (g_trait) — each `trait NAME { fn m(self):
+// T; … }` records its ordered (bodyless) contract method names and reserves a global method_id per
+// name. A concrete class supplies the bodies; dynamic dispatch resolves (type_id, method_id) via the
+// static vtable. Trait method names also seed the method-id space so a class method overriding a
+// trait method shares the same method_id (same vtable column).
+static void collect_traits(const char* source) {
+    g_ntrait = 0;
+    Lexer lx; lexer_init(&lx, source);
+    Parser p; parser_init(&p, &lx);
+    while (p.current_token.type != TOKEN_EOF) {
+        if (p.current_token.type != TOKEN_TRAIT || p.peek_token.type != TOKEN_IDENTIFIER) {
+            fe_advance(&p); continue;
+        }
+        if (g_ntrait >= TEKO_MAX_TRAITS) { skip_class_decl(&p); continue; } // skip_class_decl is keyword-generic
+        TraitInfo* t = &g_trait[g_ntrait];
+        memset(t, 0, sizeof(*t));
+        fe_advance(&p); // 'trait'
+        strncpy(t->name, p.current_token.lexeme, 95); t->name[95] = '\0';
+        fe_advance(&p); // trait name
+        while (p.current_token.type != TOKEN_LBRACE && p.current_token.type != TOKEN_EOF) fe_advance(&p);
+        if (p.current_token.type == TOKEN_LBRACE) fe_advance(&p);
+        int depth = 1;
+        while (p.current_token.type != TOKEN_EOF && depth > 0) {
+            if (p.current_token.type == TOKEN_LBRACE) { depth++; fe_advance(&p); continue; }
+            if (p.current_token.type == TOKEN_RBRACE) { depth--; fe_advance(&p); continue; }
+            if (depth == 1 && p.current_token.type == TOKEN_ASYNC && p.peek_token.type == TOKEN_FN) fe_advance(&p);
+            if (depth == 1 && p.current_token.type == TOKEN_FN && p.peek_token.type == TOKEN_IDENTIFIER) {
+                fe_advance(&p); // 'fn'
+                if (t->nmethods < TEKO_CLASS_MAX_METHODS) {
+                    strncpy(t->methods[t->nmethods], p.current_token.lexeme, 95);
+                    t->methods[t->nmethods][95] = '\0'; t->nmethods++;
+                    methodid_of(p.current_token.lexeme); // reserve the global method_id (shared vtable column)
+                }
+                fe_advance(&p); // method name
+                skip_generic_clause(&p);
+                // A contract method ends at ';'; tolerate an (unused-in-MVP) default body `{ … }`.
+                while (p.current_token.type != TOKEN_SEMICOLON && p.current_token.type != TOKEN_LBRACE &&
+                       p.current_token.type != TOKEN_RBRACE && p.current_token.type != TOKEN_EOF) fe_advance(&p);
+                if (p.current_token.type == TOKEN_SEMICOLON) fe_advance(&p);
+                else if (p.current_token.type == TOKEN_LBRACE) {
+                    int d2 = 1; fe_advance(&p);
+                    while (p.current_token.type != TOKEN_EOF && d2 > 0) {
+                        if (p.current_token.type == TOKEN_LBRACE) d2++;
+                        else if (p.current_token.type == TOKEN_RBRACE) d2--;
+                        fe_advance(&p);
+                    }
+                }
+                continue;
+            }
+            fe_advance(&p);
+        }
+        g_ntrait++;
+    }
+}
+
+// Phase 15 (15.B): trait-composition collision check. A class composing two traits that BOTH
+// declare a method of the same name, WITHOUT the class overriding it, is ambiguous — a hard
+// compile error (owner rule). Sets g_oop_error so teko_compile_interop fails instead of emitting.
+static void check_oop_collisions(void) {
+    for (int ci = 0; ci < g_nclass; ci++) {
+        ClassInfo* c = &g_class[ci];
+        for (int a = 0; a < c->ntraits; a++) {
+            int ta = trait_find(c->traits[a]);
+            if (ta < 0) continue;
+            for (int b = a + 1; b < c->ntraits; b++) {
+                int tb = trait_find(c->traits[b]);
+                if (tb < 0) continue;
+                for (int mi = 0; mi < g_trait[ta].nmethods; mi++) {
+                    const char* mn = g_trait[ta].methods[mi];
+                    if (trait_method_idx(tb, mn) >= 0 && class_method_idx(ci, mn) < 0) {
+                        fprintf(stderr,
+                          "[Teko OOP] error: class '%s' inherits method '%s' from both traits '%s' and '%s' "
+                          "without overriding it — ambiguous trait composition.\n",
+                          c->name, mn, c->traits[a], c->traits[b]);
+                        g_oop_error = 1;
+                    }
+                }
+            }
+        }
+    }
+}
+
 // Phase 15 (15.A): pre-pass that builds the class registry (g_class) — each class's ordered field
 // list (compile-time layout) and method table (each method -> a routine slot, continuing the
 // global counter after the top-level `fn`s at base_slot). Method bodies are emitted later by
 // emit_method_routines in the SAME class/declaration order, so slots stay dense and consistent
-// with the backend's routine function table.
+// with the backend's routine function table. Phase 15.B: also captures the `: Trait1, Trait2`
+// implements clause + the `abstract` modifier, and records bodyless (abstract) methods with no slot.
 static void collect_classes(const char* source, int base_slot) {
     g_nclass = 0;
     Lexer lx; lexer_init(&lx, source);
     Parser p; parser_init(&p, &lx);
     int slot = base_slot;
     while (p.current_token.type != TOKEN_EOF) {
+        int is_abstract = 0;
+        if (p.current_token.type == TOKEN_ABSTRACT && p.peek_token.type == TOKEN_CLASS) {
+            is_abstract = 1; fe_advance(&p); // consume 'abstract'; now at 'class'
+        }
         if (p.current_token.type != TOKEN_CLASS || p.peek_token.type != TOKEN_IDENTIFIER) {
             fe_advance(&p); continue;
         }
         if (g_nclass >= TEKO_MAX_CLASSES) { skip_class_decl(&p); continue; }
         ClassInfo* c = &g_class[g_nclass];
         memset(c, 0, sizeof(*c));
+        c->is_abstract = is_abstract;
         fe_advance(&p); // 'class'
         strncpy(c->name, p.current_token.lexeme, 95); c->name[95] = '\0';
         fe_advance(&p); // class name
-        while (p.current_token.type != TOKEN_LBRACE && p.current_token.type != TOKEN_EOF) fe_advance(&p);
+        // Phase 15.B: optional `: Trait1, Trait2` implements/extends clause (capture the names).
+        if (p.current_token.type == TOKEN_COLON) {
+            fe_advance(&p);
+            while (p.current_token.type != TOKEN_LBRACE && p.current_token.type != TOKEN_EOF) {
+                if (p.current_token.type == TOKEN_IDENTIFIER && c->ntraits < TEKO_CLASS_MAX_TRAITS) {
+                    strncpy(c->traits[c->ntraits], p.current_token.lexeme, 95);
+                    c->traits[c->ntraits][95] = '\0'; c->ntraits++;
+                }
+                fe_advance(&p);
+            }
+        } else {
+            while (p.current_token.type != TOKEN_LBRACE && p.current_token.type != TOKEN_EOF) fe_advance(&p);
+        }
         if (p.current_token.type == TOKEN_LBRACE) fe_advance(&p); // '{'
         int depth = 1;
         while (p.current_token.type != TOKEN_EOF && depth > 0) {
@@ -1432,37 +1578,43 @@ static void collect_classes(const char* source, int base_slot) {
             }
             if (depth == 1 && p.current_token.type == TOKEN_FN && p.peek_token.type == TOKEN_IDENTIFIER) {
                 fe_advance(&p); // 'fn'
-                int mi = c->nmethods;
-                if (mi < TEKO_CLASS_MAX_METHODS) {
-                    strncpy(c->methods[mi], p.current_token.lexeme, 95); c->methods[mi][95] = '\0';
-                    c->method_slot[mi] = slot;
-                    c->method_nparams[mi] = 0;
-                    c->nmethods++;
-                }
-                slot++; // every method consumes a routine slot, even if the table is full
+                char mname[96]; strncpy(mname, p.current_token.lexeme, 95); mname[95] = '\0';
                 fe_advance(&p); // method name
                 skip_generic_clause(&p); // optional `<T>` generic params (uniform i32 model; 15.C)
+                int nparams = 0;
                 if (p.current_token.type == TOKEN_LPAREN) {
                     fe_advance(&p);
                     int expect = 1; // a param name follows '(' or ','
                     while (p.current_token.type != TOKEN_RPAREN && p.current_token.type != TOKEN_EOF) {
-                        if (expect && p.current_token.type == TOKEN_IDENTIFIER) {
-                            if (mi < TEKO_CLASS_MAX_METHODS) c->method_nparams[mi]++;
-                            expect = 0;
-                        } else if (p.current_token.type == TOKEN_COMMA) expect = 1;
+                        if (expect && p.current_token.type == TOKEN_IDENTIFIER) { nparams++; expect = 0; }
+                        else if (p.current_token.type == TOKEN_COMMA) expect = 1;
                         fe_advance(&p);
                     }
                     if (p.current_token.type == TOKEN_RPAREN) fe_advance(&p);
                 }
-                while (p.current_token.type != TOKEN_LBRACE && p.current_token.type != TOKEN_RBRACE &&
-                       p.current_token.type != TOKEN_EOF) fe_advance(&p); // skip return-type annotation
-                if (p.current_token.type == TOKEN_LBRACE) { // skip the method body
+                while (p.current_token.type != TOKEN_LBRACE && p.current_token.type != TOKEN_SEMICOLON &&
+                       p.current_token.type != TOKEN_RBRACE && p.current_token.type != TOKEN_EOF) fe_advance(&p); // skip `: ReturnType`
+                // Phase 15.B: a bodied method gets a routine slot; a bodyless one (`fn m(self): T;`)
+                // is an abstract CONTRACT (slot -1, no routine) — a concrete subclass supplies it.
+                int bodied = (p.current_token.type == TOKEN_LBRACE);
+                int mi = c->nmethods;
+                if (mi < TEKO_CLASS_MAX_METHODS) {
+                    strncpy(c->methods[mi], mname, 95); c->methods[mi][95] = '\0';
+                    c->method_slot[mi] = bodied ? slot : -1;
+                    c->method_nparams[mi] = nparams;
+                    c->nmethods++;
+                }
+                methodid_of(mname); // reserve/share the global method_id (vtable column)
+                if (bodied) {
+                    slot++; // only bodied methods consume a routine slot
                     int d2 = 1; fe_advance(&p);
                     while (p.current_token.type != TOKEN_EOF && d2 > 0) {
                         if (p.current_token.type == TOKEN_LBRACE) d2++;
                         else if (p.current_token.type == TOKEN_RBRACE) d2--;
                         fe_advance(&p);
                     }
+                } else if (p.current_token.type == TOKEN_SEMICOLON) {
+                    fe_advance(&p); // bodyless contract method
                 }
                 continue;
             }
@@ -1482,8 +1634,9 @@ static void collect_functions(const char* source, ImportBinding** fns, int* nfns
     while (p.current_token.type != TOKEN_EOF) {
         if (p.current_token.type == TOKEN_EXTERN) {
             skip_extern_decl(&p); // do not treat `extern fn` as a handler
-        } else if (p.current_token.type == TOKEN_CLASS) {
-            skip_class_decl(&p);  // methods are not top-level routines (see collect_classes)
+        } else if (p.current_token.type == TOKEN_CLASS || p.current_token.type == TOKEN_ABSTRACT ||
+                   p.current_token.type == TOKEN_TRAIT) {
+            skip_class_decl(&p);  // class/abstract/trait bodies are not top-level routines (keyword-generic skip)
         } else if (p.current_token.type == TOKEN_FN && p.peek_token.type == TOKEN_IDENTIFIER) {
             bind_add(fns, nfns, capfns, p.peek_token.lexeme, slot++);
             fe_advance(&p); // consume 'fn'
@@ -1546,7 +1699,8 @@ static void emit_handler_routines(const char* source, BytecodeBuffer* buffer,
 
     while (p.current_token.type != TOKEN_EOF) {
         if (p.current_token.type == TOKEN_EXTERN) { skip_extern_decl(&p); continue; }
-        if (p.current_token.type == TOKEN_CLASS) { skip_class_decl(&p); continue; } // methods: emit_method_routines
+        if (p.current_token.type == TOKEN_CLASS || p.current_token.type == TOKEN_ABSTRACT ||
+            p.current_token.type == TOKEN_TRAIT) { skip_class_decl(&p); continue; } // methods: emit_method_routines
         if (p.current_token.type != TOKEN_FN) { fe_advance(&p); continue; }
         fe_advance(&p); // consume 'fn'
         if (p.current_token.type != TOKEN_IDENTIFIER) continue;
@@ -1634,6 +1788,9 @@ static void emit_method_routines(const char* source, BytecodeBuffer* buffer,
     Lexer lx; lexer_init(&lx, source);
     Parser p; parser_init(&p, &lx);
     while (p.current_token.type != TOKEN_EOF) {
+        // Phase 15.B: traits carry only bodyless contracts — never emit bodies for them.
+        if (p.current_token.type == TOKEN_TRAIT) { skip_class_decl(&p); continue; }
+        // `abstract class` reaches the class branch with `abstract` consumed by the skip below.
         if (p.current_token.type != TOKEN_CLASS || p.peek_token.type != TOKEN_IDENTIFIER) {
             fe_advance(&p); continue;
         }
@@ -1669,7 +1826,13 @@ static void emit_method_routines(const char* source, BytecodeBuffer* buffer,
                 }
                 if (p.current_token.type == TOKEN_RPAREN) fe_advance(&p);
             }
-            while (p.current_token.type != TOKEN_LBRACE && p.current_token.type != TOKEN_EOF) fe_advance(&p);
+            while (p.current_token.type != TOKEN_LBRACE && p.current_token.type != TOKEN_SEMICOLON &&
+                   p.current_token.type != TOKEN_EOF) fe_advance(&p); // skip `: ReturnType`
+            // Phase 15.B: a bodyless (abstract) contract method has no routine — skip it (slot == -1).
+            if (p.current_token.type == TOKEN_SEMICOLON || slot < 0) {
+                if (p.current_token.type == TOKEN_SEMICOLON) fe_advance(&p);
+                continue;
+            }
             if (p.current_token.type == TOKEN_LBRACE) fe_advance(&p);
 
             codegen_li_emit_func_begin(buffer, slot);
@@ -1725,11 +1888,17 @@ int teko_compile_interop(const char* source, BytecodeBuffer* buffer) {
     int nfns = 0, capfns = 0;
     collect_functions(source, &fns, &nfns, &capfns);
 
-    // Phase 15 (15.A): pre-pass the class layouts + method table. Method routine slots continue
-    // the global counter after the top-level fns (nfns), so the routine function table stays dense
-    // across handlers + methods. localcls is the per-scope instance->class map; reset for $main.
+    // Phase 15 (15.B): pre-pass the trait contracts (g_trait) + the global method-id space, then
+    // (15.A) the class layouts + method table. Method routine slots continue the global counter
+    // after the top-level fns (nfns), so the routine function table stays dense across handlers +
+    // methods. localcls is the per-scope instance->class map; reset for $main.
+    g_oop_error = 0;
+    g_nmethodname = 0;
+    collect_traits(source);
     collect_classes(source, nfns);
+    check_oop_collisions(); // ambiguous trait composition -> g_oop_error (compile failure below)
     localcls_reset();
+    if (g_oop_error) return 1; // do not emit a module with an unresolved OOP compile error
 
     // Phase 12: named local variables ($v0..) declared with `let`/`mut` at top level.
     ImportBinding* locals = NULL;
@@ -1819,9 +1988,11 @@ int teko_compile_interop(const char* source, BytecodeBuffer* buffer) {
                 register_extern(buffer, node, &binds, &nb, &capb);
                 free_ffi_ast_node(node);
             }
-        } else if (parser.current_token.type == TOKEN_CLASS) {
-            // Phase 15 (15.A): a class declaration emits no top-level code; its layout/methods
-            // were pre-collected, and method bodies are emitted after $main (emit_method_routines).
+        } else if (parser.current_token.type == TOKEN_CLASS || parser.current_token.type == TOKEN_ABSTRACT ||
+                   parser.current_token.type == TOKEN_TRAIT) {
+            // Phase 15 (15.A/15.B): class/abstract/trait declarations emit no top-level code; their
+            // layout/contracts were pre-collected, and method bodies are emitted after $main
+            // (emit_method_routines). Keyword-generic brace skip.
             skip_class_decl(&parser);
         } else if (lower_member_stmt(buffer, &parser, &top_env)) {
             // Phase 15 (15.A): top-level `obj.field = expr;` / `obj.method(args);`.

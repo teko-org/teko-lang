@@ -1478,3 +1478,57 @@ void test_frontend_interop_class_concrete(void) {
     remove(wat);
     codegen_li_free_context(buffer);
 }
+
+// Phase 15 (15.B): trait/abstract grammar — a `trait` contract + a `class C : Trait` that
+// implements it compiles (returns 0) and lowers the concrete instance + method (OBJ_NEW +
+// CALL_FUNC). Concrete-typed receivers keep 15.A static dispatch; the trait registry + method-id
+// space are built without disturbing the object lowering.
+void test_frontend_interop_trait_grammar(void) {
+    const char* src =
+        "extern fn emit_int(n) from \"teko_rt\" as \"teko_rt_emit_int\";\n"
+        "trait Shape { fn area(self): i32; }\n"
+        "class Circle : Shape {\n"
+        "  let r;\n"
+        "  fn area(self): i32 { return self.r * self.r * 3; }\n"
+        "}\n"
+        "let c = Circle();\n"
+        "c.r = 2;\n"
+        "let a = c.area();\n"
+        "emit_int(a);\n";
+    BytecodeBuffer* buffer = codegen_li_create_context();
+    TEST_ASSERT_NOT_NULL(buffer);
+    TEST_ASSERT_EQUAL_INT(0, teko_compile_interop(src, buffer)); // valid composition compiles
+    TEST_ASSERT_EQUAL_INT(1, buffer->uses_object);
+    int saw_new = 0, saw_call = 0;
+    for (int i = 0; i < buffer->size; i++) {
+        if (buffer->code[i] == (unsigned char)OP_OBJ_NEW)  saw_new = 1;
+        if (buffer->code[i] == (unsigned char)OP_CALL_FUNC) saw_call = 1;
+    }
+    TEST_ASSERT_TRUE(saw_new && saw_call);
+    codegen_li_free_context(buffer);
+}
+
+// Phase 15 (15.B): trait-composition COLLISION = compile error. A class composing two traits that
+// both declare `m`, without overriding it, is ambiguous -> teko_compile_interop fails (non-zero) and
+// emits no module. The same program with a class override compiles cleanly.
+void test_frontend_interop_trait_collision(void) {
+    const char* bad =
+        "trait A { fn m(self): i32; }\n"
+        "trait B { fn m(self): i32; }\n"
+        "class C : A, B { let v; fn other(self): i32 { return self.v; } }\n"
+        "let c = C();\n";
+    BytecodeBuffer* b1 = codegen_li_create_context();
+    TEST_ASSERT_NOT_NULL(b1);
+    TEST_ASSERT_NOT_EQUAL(0, teko_compile_interop(bad, b1)); // ambiguous -> compile error
+    codegen_li_free_context(b1);
+
+    const char* ok =
+        "trait A { fn m(self): i32; }\n"
+        "trait B { fn m(self): i32; }\n"
+        "class C : A, B { let v; fn m(self): i32 { return self.v + 1; } }\n"
+        "let c = C();\n";
+    BytecodeBuffer* b2 = codegen_li_create_context();
+    TEST_ASSERT_NOT_NULL(b2);
+    TEST_ASSERT_EQUAL_INT(0, teko_compile_interop(ok, b2)); // override resolves the ambiguity
+    codegen_li_free_context(b2);
+}
