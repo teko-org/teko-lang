@@ -347,5 +347,7 @@ total/sum = 50/count: 42/braces { } kept/[42]`. Sub-block **16.D is DONE** (loca
 instance in a concat/`"{…}"` hole dispatches its (own/inherited) `to_string` via `OP_CALL_FUNC`
 (Phase-15 hook), else the synthesized default `ClassName(fields)`; value-type model gains
 `TEKO_VT_OBJ_BASE`; proofs `tostring.tks` → `temp is T=25/[T=25]/point = Point(3, 4)/p=Point(3, 4)`.
-Order: 16.A ✅ → 16.B ✅ → 16.C ✅ → 16.D ✅ → 16.E explicit-format → 16.F checked inter-type
-conversions (+ a float-formatting step).
+Sub-block **16.E is DONE** (locally green): explicit integer formats `convert.to_radix/pad/group`
+(ids 56/57/58, radix/zero-pad/grouping) over teko_convert.c (+3 KATs, 229→232); proofs
+`format.tks` → `ff/1010/100/00042/1,000,000/"hex = ff"`. Order: 16.A ✅ → 16.B ✅ → 16.C ✅ → 16.D ✅
+→ 16.E ✅ → 16.F checked inter-type conversions/parse (fail-loud) → a float-formatting step.

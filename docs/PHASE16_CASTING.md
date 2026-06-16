@@ -115,8 +115,18 @@ surface; integer/float values are marshalled as their canonical string form into
     (`vtable_get(tid_slot, methodid)`); that auto-coerce needs a `VT_TRAIT` encoding carrying the
     tid slot and is a small follow-on — explicit `g.to_string()` already works via the trait-dispatch
     path. Synthesized-default fields are rendered as integers (per-field typing is a follow-on).
-- **16.E — Explicit-format spec.** Radix (hex/oct/bin), float precision, grouped digits, custom
-  masks via a format string (ids 56/57+). **BOUNDED–MEDIUM.**
+- **16.E — Explicit-format spec. ✅ DONE & locally green both targets.** The developer-supplied
+  (explicit) integer formats — distinct from the culture-invariant default, still locale-free:
+  `convert.to_radix(v, base 2..36)` (id 56 — hex/oct/bin/…), `convert.pad(v, width)` (id 57 —
+  zero-pad, sign counts toward width), `convert.group(v)` (id 58 — thousands grouping with `,`).
+  `teko_convert.c` source of truth (3 new KATs: INT64_MIN radix, sign-aware padding, negative
+  grouping). Native `teko_rt_to_radix/pad/group` + WASM reactor; the `$crypto_<id>` import loop
+  bound moved 52→58. Composes with concat/interpolation (a format call is just an expression in a
+  hole). Proofs `runtime/{native,wasm}/samples/format.tks` → `ff / 1010 / 100 / 00042 / 1,000,000 /
+  "hex = ff"` (byte-identical). Suite 229→232.
+  - **Scope note:** integer-format spec (the common explicit cases). Float precision and custom
+    date masks ride on the float-formatting step / Phase-14 time surface respectively; a
+    custom-grouping-separator variant is a trivial follow-on (`group` fixes `,`).
 - **16.F — Checked inter-type conversions.** Primitive casts that fail loudly (narrowing range
   checks, float→int truncation policy), complex/user-defined casts. **MEDIUM.**
 
