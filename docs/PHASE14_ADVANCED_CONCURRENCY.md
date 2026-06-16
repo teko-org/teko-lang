@@ -212,5 +212,15 @@ merge/force-push** (the human merges).
   it (and makes the `fallback`/`exponential`/`logarithmic`/`attempts`/`timeout` keyword tokens
   live) is the remaining work — a recommended routine-trampoline lowering is specced in
   `docs/HANDOFF_PHASE14.md` (large/design-heavy → handed off).
+- **14.G — Timespan waiters: `await` (async) + `wait` (sync)** — *planned* (owner, 2026-06-16).
+  `await <ts>;` = cooperative timed yield (scheduler + 14.C timer); `wait <ts>;` = synchronous
+  sleep. Timespan literals (`10ms`) already lex (Phase 12 unit suffixes) → frontend normalizes to
+  canonical ms; literal/variable/expression timespans. Adopts timespans in 14.C/14.F delay args
+  (compile-time-normalized → runtimes unchanged). Plan in `docs/HANDOFF_PHASE14.md`.
+- **14.H — Real `.tks` samples (functions, threads, loops)** — *planned* (owner, 2026-06-16). The
+  capstone: real programs combining named functions, routines/threads (incl. a Layer-B threads
+  sample), channels, `await`/`wait`, and **loops**. Requires the shared **control-flow emission
+  foundation** (loops + branches: native asm labels + WASM structured block/loop) — which also
+  unblocks the 14.F `retry { }` surface. Plan + sequencing in `docs/HANDOFF_PHASE14.md`.
 </content>
 </invoke>

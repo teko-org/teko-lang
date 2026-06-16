@@ -5,6 +5,63 @@ what's done, the **exact reusable pattern** for the channel sub-blocks, and the 
 (14.E–14.F). Pair with `docs/PHASE14_ADVANCED_CONCURRENCY.md` (design) and the memory file
 `teko-phase14-advanced-concurrency`.
 
+## ✚ NEW SCOPE (owner, 2026-06-16): 14.G timespan waiters, 14.H real samples
+Owner added two sub-blocks (labels per owner: **14.G = await/wait waiters**, **14.H = real
+samples** — samples are the capstone that showcases everything). Captured here as the canonical plan.
+
+### Shared finding — control-flow emission is the missing foundation (a prerequisite, not a sub-block)
+The interop frontend (`teko_compile_interop`) emits NO loops/branches today. Both "loops in
+samples" (14.H) and the `retry { } fallback { }` block (14.F surface) need general control-flow
+emission: native = `.L` labels + `jmp`/`jcc` for `OP_JMP`/`OP_JMP_IF_FALSE` in
+`emit_native_hosted.c` (currently unhandled there); WASM = structured `(block $b)(loop $l … br/br_if)`
+in `emit_wasm.c` (the `br $label_N` ops exist but need the enclosing block/loop scaffolding emitted
+from the frontend). Build this ONCE (recommend `loop { }`+`break` and `while (cond) { }`, lowering
+the condition via the existing `eval_expr_prec`); the 14.F surface and the 14.H samples both consume
+it. (14.F's routine-trampoline alternative avoids loop-IL, but the 14.H samples need real loops.)
+
+### 14.H — Real `.tks` samples (functions, threads, loops) — the capstone (build last)
+- Real `.tks` combining named functions + routines/threads (`routines { … }`, and a Layer-B
+  `--target=wasm-threads` thread sample) + loops (e.g. a worker loop that pushes N values to a
+  channel; a fan-in loop draining a broadcast/duplex) + `await`/`wait` (14.G). Showcases 14.A–14.G.
+- Needs: the control-flow foundation above; richer routine/`fn` bodies (named locals, loops, stretch:
+  a return value — see the 14.F routine-trampoline note; keep 14.A's `void` routine path working).
+- Executable proof native + WASM per the usual pattern; loops MUST run (assert the accumulated
+  result), not just `strstr`.
+- Decisions (recommend, confirm): loop keywords `loop`/`while` (+ `break`/`continue`); `for` later.
+
+### 14.G — Timespan waiters: `await` (async) + `wait` (sync) (build first of the two)
+- Literals already lex: `10ms` → LIT_INT 10 + `literal_unit=LIT_UNIT_MS` (ms/s/m/h/d). Add a frontend
+  helper normalizing (value, unit) → **canonical milliseconds** (s×1000, m×60000, h×3.6e6, d×8.64e7);
+  a timespan arg may be a literal, a named local (already ms), or an int expression (already ms).
+- Add `await`/`wait` as keywords (TOKEN_AWAIT/TOKEN_WAIT — new; small lexer change).
+- `wait <timespan>;` (SYNCHRONOUS): block the current OS thread. Native → `teko_rt_sleep_ms`
+  (nanosleep / Win Sleep); WASM → host import `env.teko_sleep` (or a bounded busy-wait). New opcode
+  `OP_WAIT` (1 arg = ms in $w0).
+- `await <timespan>;` (ASYNCHRONOUS): cooperative timed yield — suspend the current routine on a
+  timer and let the scheduler run others; resume after the delay. Build on 14.A scheduler + the
+  14.C delayed/timer-queue mechanism (the logical clock / timer queue is exactly this). New opcode
+  `OP_AWAIT_FOR` (1 arg = ms). On native run-to-completion, MVP can register the resume on the run
+  queue after draining; on WASM Layer A, yield to `$teko_sched_run` with a deadline.
+- Proofs: `wait` — assert observable ordering/elapsed ≥ delay (deterministic via a stubbed clock on
+  WASM, real on native with a tight bound); `await` — two routines, one awaits while the other runs,
+  asserting interleave order.
+
+### How this changes prior approaches
+- **Canonical timespan = ms integer at compile time.** 14.C `delayed.send(d,v,delay)` and 14.F
+  backoff `base` should ACCEPT timespan literals (e.g. `delayed.send(d, v, 10ms)`), which normalize
+  to the existing integer args — so the runtimes are unchanged; only the frontend gains unit
+  normalization (apply it in `lower_codec_value` for LIT_INT args carrying a `literal_unit`). Low
+  disruption, big ergonomics win, and it unifies the time model across 14.C/14.F/14.H.
+- 14.C's logical clock + timer queue is the natural substrate for `await`'s timer; consider exposing
+  a `teko_delayed`-style timer the `await` lowering reuses rather than a parallel mechanism.
+
+### Recommended sequencing (labels per owner: 14.G = waiters, 14.H = samples)
+1) **14.G await/wait + timespan normalization** (independent-ish; lexer already carries the unit;
+   reuses 14.A scheduler + 14.C timer) → 2) **control-flow foundation** (labels/loops, native+WASM)
+   → 3) **14.F surface** (retry/fallback block, now easy on the foundation) → 4) **14.H real samples**
+   (capstone: functions + threads + loops + channels + await/wait, showcasing 14.A–14.G). Also adopt
+   timespan literals in the 14.C/14.F delay args (compile-time-normalized → runtimes unchanged).
+
 ## ▶ RESUME POINT (read first)
 - **Branch:** `feat/phase-14-advanced-concurrency`; resume from its latest commit (this doc's
   commit is the tip). Working tree is clean and fully pushed to `origin`. Suite **184/184**;
