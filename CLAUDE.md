@@ -221,5 +221,10 @@ critical section (NEW block grammar → `OP_SHARED_ENTER/LEAVE`) + `atomic.*` ce
 — C runtime `src/runtime/teko_shared.c` (3 KATs; portable atomics without `<stdatomic.h>` —
 `__atomic`/`_Interlocked`/plain-wasm, MSVC-safe + TSan-clean) called directly (register-width
 ABI). Proofs `runtime/native/samples/shared.tks` + `runtime/wasm/run-shared.mjs`. Suite 188/188.
-Remaining **14.F**: `circuit`+`retry` (backoff/attempts/timeout/fallback). Continuation guide:
-`docs/HANDOFF_PHASE14.md`.
+**14.F `circuit`+`retry`: policy runtime DONE, surface pending.** `src/runtime/teko_retry.c`
+(6 KATs) is the source of truth (exp/log backoff, attempts+timeout→fallback rule, breaker
+CLOSED/OPEN/HALF_OPEN). The `retry { } fallback { }` / `circuit` BLOCK grammar that makes the
+`fallback`/`exponential`/`logarithmic`/`attempts`/`timeout` keyword tokens live is the only
+remaining Phase 14 work — large/design-heavy, handed off with a recommended routine-trampoline
+lowering in `docs/HANDOFF_PHASE14.md`. So Phase 14 = 5.5 of 6 sub-blocks (14.A–14.E complete +
+CI-green; 14.F runtime complete). Continuation guide: `docs/HANDOFF_PHASE14.md`.

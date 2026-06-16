@@ -9,8 +9,11 @@ what's done, the **exact reusable pattern** for the channel sub-blocks, and the 
 - **Branch:** `feat/phase-14-advanced-concurrency`; resume from its latest commit (this doc's
   commit is the tip). Working tree is clean and fully pushed to `origin`. Suite **184/184**;
   ASan+UBSan (both dispatch paths) + TSan green; 16 native goldens intact; all 4 CI gates green.
-- **Done & CI-green:** 14.A routines, 14.B duplex, 14.C delayed, 14.D broadcast (4 of 6).
-- **Next:** **14.E `shared` block + `atomic`** (sub-plan below), then **14.F `circuit` + `retry`**.
+- **Done & CI-green:** 14.A routines, 14.B duplex, 14.C delayed, 14.D broadcast, 14.E shared/atomic
+  (5 of 6). **14.F.1** (the `teko_retry.c` policy runtime + 6 KATs) is also done (CI pending).
+- **Next:** **14.F surface** — the `retry { } fallback { }` / `circuit` block grammar that makes the
+  remaining keyword tokens live. See "▶ 14.F STATUS" below for the recommended routine-trampoline
+  lowering. This is the only remaining work to close Phase 14.
 - **Before starting:** `git fetch && git checkout feat/phase-14-advanced-concurrency && git pull --ff-only`,
   rebuild (`cmake --build build`), run `./build/teko_tests` (expect 184/184), then follow the
   sub-plan. The channel sub-blocks (14.B/C/D) are the template; **14.E/14.F are NOT channels** —
@@ -115,7 +118,38 @@ Design note: the coarse lock + atomics are runtime calls (handle/cell as a regis
 so they fit the existing OP_CALL-style marshalling. The novel part is the `shared { }` BLOCK
 grammar (open/close bracketing the inner statements) — design that first.
 
-## 14.F `circuit` + `retry` — sub-plan (resilience control-flow; NOT the channel template)
+## ▶ 14.F STATUS — policy runtime DONE; block surface is the remaining hand-off
+**14.F.1 DONE (CI pending):** `src/runtime/teko_retry.{h,c}` (6 Unity KATs) is the policy source of
+truth — exponential/logarithmic backoff, the `attempts` + `attempts+timeout→fallback` rule
+(incremental-relative-time), and the circuit breaker CLOSED/OPEN/HALF_OPEN machine. Deterministic
+(time passed in), portable C, in CORE_SOURCES + teko_rt. **No language surface yet** — so the
+`circuit`/`retry`/`fallback`/`exponential`/`logarithmic`/`attempts`/`timeout` keyword tokens are
+still reserved-but-unused; 14.F is NOT done until the surface below lands (no-dead-token gate).
+
+**Remaining 14.F (the large, design-heavy part — needs fresh context):** lower the
+`retry(attempts N, timeout T, exponential) { body } fallback { fb }` BLOCK + `circuit` so those
+keyword tokens become live, executable on native + WASM. Two viable lowerings (pick after a spike):
+- **(A) Routine-trampoline (RECOMMENDED — reuses 14.A machinery, avoids new IL control-flow):**
+  emit `body`/`fb` as table routines (the frontend already emits `fn` bodies as routines via
+  `emit_handler_routines` + the function table), then emit a call to a C driver
+  `teko_retry_run(retry_handle, body_slot, fallback_slot)` that loops: invoke the body routine
+  via the table, check ok/fail, back off + retry per the policy, else invoke fallback. The retry
+  LOOP lives in C — no new loop/branch emission. Sub-tasks: (1) give routines a RETURN VALUE
+  (today native `teko_routine_<n>` is `void(long)`, wasm routines return their state machine
+  state — extend to return an i32 ok/fail; this ripples to 14.A's `teko_rt_run`, keep it
+  compatible); (2) emit ANONYMOUS inline blocks as routines (synthetic slots) + capture the
+  body's result; (3) the `retry(...)`/`fallback`/`circuit` keyword block grammar in
+  `frontend_interop.c` (TOKEN_RETRY/FALLBACK/CIRCUIT/EXPONENTIAL/LOGARITHMIC/ATTEMPTS/TIMEOUT —
+  all reserved); (4) `teko_retry_run`/`teko_circuit_*` reactor exports + emitter wiring; (5) `.tks`
+  proofs native + WASM (a flaky call that succeeds on attempt K → retried; a permanently-failing
+  one → fallback ran; breaker opens after threshold).
+- **(B) Emitted loop/branch IL:** lower the block to an emitted attempt-loop using OP_JMP/
+  OP_JMP_IF_FALSE. Needs NEW general control-flow emission in the interop frontend AND hosted-
+  emitter support for OP_JMP/labels (asm `.L` labels) + WASM structured `(block)/(loop)/br`
+  wrappers — heavier and touches every backend. (A) is preferred.
+Design the chosen lowering + the keyword block grammar BEFORE coding; report the sub-plan.
+
+## 14.F `circuit` + `retry` — original notes (resilience control-flow; NOT the channel template)
 `retry { … } fallback { … }` with `attempts` and/or global `timeout` limits and
 `exponential`/`logarithmic` backoff between attempts; `circuit` = an open/half-open/closed
 breaker wrapping a call. Tokens TOKEN_CIRCUIT/RETRY/FALLBACK/EXPONENTIAL/LOGARITHMIC/ATTEMPTS/

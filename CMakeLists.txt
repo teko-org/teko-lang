@@ -94,6 +94,7 @@ set(CORE_SOURCES
         src/runtime/teko_delayed.c
         src/runtime/teko_broadcast.c
         src/runtime/teko_shared.c
+        src/runtime/teko_retry.c
         src/runtime/teko_mem_sys.c
         src/runtime/teko_thread.c
         # Native cryptography (Phase 13) — embedded runtime primitives (shared list)
@@ -155,7 +156,7 @@ target_include_directories(teko PRIVATE src)
 #     the surface ABI shims (teko_rt_emit, and the crypto wrappers added in Sub-phase B)
 #     over the portable C crypto runtime (the single source of truth). Self-contained so
 #     produced binaries need nothing else.
-add_library(teko_rt STATIC runtime/native/teko_rt.c runtime/native/teko_rt_sched.c src/runtime/teko_duplex.c src/runtime/teko_delayed.c src/runtime/teko_broadcast.c src/runtime/teko_shared.c ${TEKO_CRYPTO_SOURCES})
+add_library(teko_rt STATIC runtime/native/teko_rt.c runtime/native/teko_rt_sched.c src/runtime/teko_duplex.c src/runtime/teko_delayed.c src/runtime/teko_broadcast.c src/runtime/teko_shared.c src/runtime/teko_retry.c ${TEKO_CRYPTO_SOURCES})
 target_include_directories(teko_rt PRIVATE runtime/native src/runtime src)
 if (WIN32)
     target_link_libraries(teko_rt PRIVATE bcrypt) # CSPRNG: BCryptGenRandom
@@ -216,6 +217,7 @@ set(TEST_SOURCES
         tests/runtime/test_delayed.c
         tests/runtime/test_broadcast.c
         tests/runtime/test_shared.c
+        tests/runtime/test_retry.c
         tests/runtime/test_crypto_sha2.c
         tests/runtime/test_crypto_md5.c
         tests/runtime/test_crypto_sha1.c

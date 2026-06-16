@@ -205,6 +205,12 @@ merge/force-push** (the human merges).
   `runtime/native/samples/shared.tks` (8/10) + `runtime/wasm/run-shared.mjs`. CI-wired. *Coarse
   single global lock + no nested blocks is the MVP; per-block locks + real wasm-threads atomics
   are future refinements, not a correctness gate.*
-- **14.F** — not started (`circuit`+`retry`). See `docs/HANDOFF_PHASE14.md`.
+- **14.F — `circuit` + `retry`** — *runtime done, surface pending*. `src/runtime/teko_retry.{h,c}`
+  (6 Unity KATs) is the policy source of truth: exponential/logarithmic backoff, the
+  `attempts`+`timeout`→`fallback` incremental-relative-time rule, and the circuit breaker
+  CLOSED/OPEN/HALF_OPEN machine. The `retry { } fallback { }` / `circuit` BLOCK grammar that drives
+  it (and makes the `fallback`/`exponential`/`logarithmic`/`attempts`/`timeout` keyword tokens
+  live) is the remaining work — a recommended routine-trampoline lowering is specced in
+  `docs/HANDOFF_PHASE14.md` (large/design-heavy → handed off).
 </content>
 </invoke>

@@ -134,6 +134,12 @@ extern void test_teko_broadcast_badarg(void);
 extern void test_teko_atomic_cell_rmw(void);
 extern void test_teko_shared_critical_section(void);
 extern void test_teko_atomic_badarg(void);
+extern void test_teko_retry_exponential_backoff(void);
+extern void test_teko_retry_logarithmic_backoff(void);
+extern void test_teko_retry_attempts_limit(void);
+extern void test_teko_retry_timeout_branches_to_fallback(void);
+extern void test_teko_circuit_breaker_transitions(void);
+extern void test_teko_retry_badarg(void);
 extern void test_teko_runtime_arena_thread_isolation_and_alignment(void);
 extern void test_teko_crypto_md5_rfc1321_vectors(void);
 extern void test_teko_crypto_md5_streaming_matches_oneshot(void);
@@ -344,6 +350,12 @@ int main(void) {
     RUN_TEST(test_teko_atomic_cell_rmw);
     RUN_TEST(test_teko_shared_critical_section);
     RUN_TEST(test_teko_atomic_badarg);
+    RUN_TEST(test_teko_retry_exponential_backoff);
+    RUN_TEST(test_teko_retry_logarithmic_backoff);
+    RUN_TEST(test_teko_retry_attempts_limit);
+    RUN_TEST(test_teko_retry_timeout_branches_to_fallback);
+    RUN_TEST(test_teko_circuit_breaker_transitions);
+    RUN_TEST(test_teko_retry_badarg);
     RUN_TEST(test_teko_runtime_arena_thread_isolation_and_alignment);
 
     RUN_TEST(test_teko_crypto_md5_rfc1321_vectors);
