@@ -82,7 +82,17 @@ it. (14.F's routine-trampoline alternative avoids loop-IL, but the 14.H samples 
   real timer suspension (WASM Layer A mirrors it). Proofs `waiters.tks` native + WASM.
 - **Remaining (owner-agreed order):**
   1. ~~**14.G — `await`/`wait` timespan waiters**~~ ✅ DONE.
-  2. **Control-flow foundation** (loops + branches in the frontend; see "✚ NEW SCOPE → foundation").
+  2. ~~**Control-flow foundation**~~ ✅ DONE (commit `2554f8c`; all 4 gates green; suite 197/197).
+     `while`/`loop`/`if`/`break`/`continue` + local reassignment lower from source. IL: structured
+     single-byte opcodes `OP_LOOP_BEGIN/END` 0x5B/0x5C, `OP_BREAK` 0x5D, `OP_CONTINUE` 0x5E,
+     `OP_BREAK_IF_FALSE` 0x5F, `OP_IF_BEGIN/END` 0x60/0x61 (all in BOTH CSE invalidation sets).
+     Native = local asm labels `.Lcont_/.Lbrk_/.Lendif_` + a loop-id/if-id stack on MetalContext;
+     WASM = structured `(block $brk_N (loop $cont_N …))` + `(if … end)`. Frontend: a shared
+     block-body dispatcher `lower_one_stmt`/`lower_block` (LowerEnv) reused by while/loop/if bodies
+     — composes with let/reassignment/calls/channels/waiters, nests. **Hooked at TOP LEVEL only;
+     routine-body control flow (loops inside `fn`/routines) is NOT wired yet** — wire it in 14.H if
+     the capstone needs loops inside a routine (give emit_handler_routines a LowerEnv + per-routine
+     locals table and dispatch via lower_one_stmt). Proofs `controlflow.tks` native + WASM (10,5).
   3. **14.F surface** — `retry { } fallback { }` / `circuit` block grammar (see "▶ 14.F STATUS";
      easy once the foundation exists, or use the routine-trampoline) — makes the remaining keyword
      tokens live; closes 14.F.
