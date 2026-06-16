@@ -74,7 +74,21 @@ int (string works incidentally via `$w0`); float/decimal optional payloads + run
   → `7`; `let c: ?int = 5; let d = c ?? 7;` → `5`; observed via `emit("… " + convert.int_to_str(…))`.
 - Risk: low (frontend-only, reuses control flow). Covers int first; string-optional folds in if cheap.
 
-### 18.B — Safe navigation `?.` + optional propagation
+### 18.B — Safe navigation `?.` + optional propagation  — ✅ DONE
+**Status (DONE, locally green both targets).** `lower_safe_nav` in `src/frontend_interop.c`: claims
+the `IDENTIFIER ?. member` form in `eval_primary` (before the optional-local read); guards the member
+access (`OP_OBJ_GET` field / `OP_CALL_FUNC` method, reusing the 15.A emission) behind `OP_IF_BEGIN`
+on the receiver's present flag — present → the access runs, null → SKIPPED (no deref of a null
+handle); the result is itself optional (payload + a present-flag temp exposed via
+`g_prim_present_slot`), so a trailing Elvis `?? d` defaults on null. An optional object records its
+class from the `?Class` annotation (so a `null` receiver still resolves the field/method statically).
+Proof `safenav.tks` (native + WASM, byte-identical) → `a=21` (field via `?.`), `b=42` (method+arg via
+`?.`), `c=-1`/`d=-1` (null short-circuit). Suite 246/246; ASan/UBSan both paths + TSan clean; 16
+goldens intact. **Pre-existing bug found + filed as tech debt** (NOT 18.B): a method returning a bare
+`self.field` (terminal `OP_OBJ_GET`) yields 0 — `safenav.tks` uses an operator-return method
+(`self.v * k`) to avoid it; the bug is orthogonal to safe-nav (affects plain method calls too).
+
+
 - **`obj?.field` / `obj?.method()`** over Phase-15 objects: if the object optional is present,
   evaluate the member access; else short-circuit to `null` (present=0). Lowers as a guarded
   `OP_IF_BEGIN` around the existing `OP_OBJ_GET` / `OP_CALL_FUNC` member lowering, writing the

@@ -707,6 +707,11 @@ static int lower_floatcast(BytecodeBuffer* b, Parser* p, const LowerCtx* ctx); /
 // Phase 17.F.4: the decimal.to_string / decimal.parse surface (ids 59/60).
 static int is_decimalsurf_head(const Parser* p); // fwd
 static int lower_decimalsurf(BytecodeBuffer* b, Parser* p, const LowerCtx* ctx); // fwd
+// Phase 18 (18.B): safe-navigation `obj?.member` / `obj?.method(args)` — a null-propagating member
+// access over an optional object. Defined after the member-access helpers; forward-declared so
+// eval_primary can claim the `IDENTIFIER ?. …` form. Returns the member-result value-type and exposes
+// the chain's present flag (g_prim_present_slot) for a following Elvis `??`.
+static int lower_safe_nav(BytecodeBuffer* b, Parser* p, const LowerCtx* ctx); // fwd
 // Phase 16 (16.D): coerce the operand VALUE in $w0 (per its value-type `vt`) to a string pointer in
 // $w0 — int via to_string (id 49), string unchanged, object via its to_string / synthesized default.
 static void coerce_to_string_in_w0(BytecodeBuffer* b, const LowerCtx* ctx, int vt); // fwd (16.D)
@@ -827,6 +832,10 @@ static int eval_primary(BytecodeBuffer* b, Parser* p, const LowerCtx* ctx, TempA
     } else if (lower_member_read(b, p, ctx)) {
         // `obj.field` read consumed (e.g. inside `self.x + self.y`). Field cells are integers here.
         return TEKO_VT_INT;
+    } else if (p->current_token.type == TOKEN_IDENTIFIER && p->peek_token.type == TOKEN_SAFE_DOT) {
+        // Phase 18 (18.B): safe navigation `obj?.member` — null-propagating member access. Must be
+        // claimed BEFORE the optional-local payload read below (which would consume `obj` alone).
+        return lower_safe_nav(b, p, ctx);
     } else if (p->current_token.type == TOKEN_IDENTIFIER) {
         int s = ctx ? bind_lookup(ctx->locals, ctx->nlocals, p->current_token.lexeme) : -1;
         int isstr = localstr_get(p->current_token.lexeme);
@@ -1795,6 +1804,12 @@ static void lower_let_stmt(BytecodeBuffer* b, Parser* p, LowerEnv* env) {
         traitlocal_add(lname, annot_trait, s, tid_slot);
     } else if (rhs_class >= 0) {
         localcls_set(lname, rhs_class);
+    } else if (is_optional && annot[0] && class_find(annot) >= 0) {
+        // Phase 18 (18.B): an OPTIONAL object (`let q: ?Box = null;`) — record the class from the
+        // `?Class` ANNOTATION (the null RHS carries no class) so a later `q?.member` resolves the
+        // field index / method slot at compile time. The handle is null at runtime, but a `?.`
+        // access is guarded by the present flag, so the null handle is never dereferenced.
+        localcls_set(lname, class_find(annot));
     }
     // Phase 16 (16.B): remember a string-typed local so `s` reads as VT_STR in a later concat.
     localstr_set(lname, g_last_init_vt == TEKO_VT_STR);
@@ -2007,6 +2022,71 @@ static int lower_member_call(BytecodeBuffer* b, Parser* p, const LowerCtx* ctx) 
     codegen_li_emit_iconst(b, slot);                    // $w0 = method slot (static dispatch)
     codegen_li_emit_call_func(b, argc);                 // $w0 = method result
     return 1;
+}
+
+// Phase 18 (18.B): SAFE NAVIGATION `obj?.member` / `obj?.method(args)` — a null-propagating member
+// access over an OPTIONAL object. `obj` is an optional local (its class is known from the `?Class`
+// annotation even when its value is null); `member` is one of the class's fields or methods. The
+// result is itself an OPTIONAL: present iff `obj` is present, payload = the member access — so a
+// following Elvis (`obj?.m() ?? d`) supplies the default on null, and the access is SKIPPED entirely
+// when `obj` is null (no OP_OBJ_GET/CALL_FUNC on a null handle). Lowering reuses OP_IF (the present
+// guard → native je/cbz / WASM `(if)`) + the existing OBJ_GET / CALL_FUNC member emission — no new
+// IL/runtime. Current token is the receiver IDENTIFIER, peek is TOKEN_SAFE_DOT. The chain present
+// flag is parked in a temp and exposed via g_prim_present_slot for the caller's `??`.
+static int lower_safe_nav(BytecodeBuffer* b, Parser* p, const LowerCtx* ctx) {
+    char objname[96];
+    strncpy(objname, p->current_token.lexeme, sizeof(objname) - 1); objname[sizeof(objname) - 1] = '\0';
+    int hslot = ctx ? bind_lookup(ctx->locals, ctx->nlocals, objname) : -1;
+    int present_slot = localopt_present_slot(objname);   // -1 if not declared optional
+    int ci = localcls_get(objname);                       // the receiver's class (from `?Class`)
+    fe_advance(p); // consume the receiver identifier
+    fe_advance(p); // consume `?.`
+    char member[96];
+    strncpy(member, p->current_token.lexeme, sizeof(member) - 1); member[sizeof(member) - 1] = '\0';
+    int is_call = (p->peek_token.type == TOKEN_LPAREN);
+    TempAlloc* ta = ctx->ta;
+    // present_t — the chain's present flag (companion value, or 1 for a non-optional receiver). Kept
+    // allocated past this call so the caller's Elvis can read it (g_prim_present_slot).
+    int present_t = ta->next_temp++; if (ta->next_temp > ta->hw) ta->hw = ta->next_temp;
+    if (present_slot >= 0) codegen_li_emit_load_local(b, present_slot);
+    else                   codegen_li_emit_iconst(b, 1);
+    codegen_li_emit_store_local(b, present_t);
+    int payload_t = ta->next_temp++; if (ta->next_temp > ta->hw) ta->hw = ta->next_temp;
+    codegen_li_emit_iconst(b, 0);                          // default payload = 0 (absent)
+    codegen_li_emit_store_local(b, payload_t);
+    codegen_li_emit_load_local(b, present_t);
+    codegen_li_emit_cf(b, OP_IF_BEGIN);                    // if obj present … (skipped when null)
+    if (is_call) {
+        int midx = (ci >= 0) ? class_method_idx(ci, member) : -1;
+        int slot = (midx >= 0) ? g_class[ci].method_slot[midx] : 0;
+        fe_advance(p);                                     // consume member name
+        if (p->current_token.type == TOKEN_LPAREN) fe_advance(p);
+        if (hslot >= 0) codegen_li_emit_load_local(b, hslot); else codegen_li_emit_iconst(b, 0);
+        codegen_li_emit_setarg(b, 0);                      // $a0 = self
+        int argc = 1;
+        while (p->current_token.type != TOKEN_RPAREN && p->current_token.type != TOKEN_EOF && argc < 8) {
+            if (p->current_token.type == TOKEN_COMMA) { fe_advance(p); continue; }
+            lower_codec_value(b, p, ctx);                  // arg -> $w0
+            codegen_li_emit_setarg(b, argc);
+            argc++;
+        }
+        if (p->current_token.type == TOKEN_RPAREN) fe_advance(p);
+        codegen_li_emit_iconst(b, slot);                   // $w0 = method slot (static dispatch)
+        codegen_li_emit_call_func(b, argc);                // $w0 = method result
+    } else {
+        int fidx = (ci >= 0) ? class_field_idx(ci, member) : -1;
+        fe_advance(p);                                     // consume member name
+        if (hslot >= 0) codegen_li_emit_load_local(b, hslot); else codegen_li_emit_iconst(b, 0);
+        codegen_li_emit_setarg(b, 0);                      // $a0 = handle
+        codegen_li_emit_iconst(b, fidx >= 0 ? fidx : 0);   // $w0 = field index
+        codegen_li_emit_object(b, OP_OBJ_GET);             // $w0 = field value
+    }
+    codegen_li_emit_store_local(b, payload_t);             // payload_t = member result (when present)
+    codegen_li_emit_cf(b, OP_IF_END);
+    codegen_li_emit_load_local(b, payload_t);              // $w0 = result (or 0 when absent)
+    ta->next_temp--;                                       // free payload_t; KEEP present_t for Elvis
+    g_prim_present_slot = present_t;                       // expose the chain present flag to `??`
+    return TEKO_VT_INT;                                    // MVP: int member results (object/string later)
 }
 
 // Phase 15 (15.A): `obj.field = <expr>;` field WRITE -> OP_OBJ_SET(handle, idx, value). Returns 1

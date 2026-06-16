@@ -273,6 +273,18 @@ d = 5
 e = 5
 EXP
 )"
+# Phase 18 (18.B): SAFE NAVIGATION `?.` over optional objects — `obj?.field`/`obj?.method()` guarded
+# by OP_IF on the 18.A present flag: present → the member access runs; null → it is SKIPPED (no deref
+# of a null handle) and the empty-optional result lets a trailing `?? d` default. The optional's class
+# comes from the `?Box` annotation (so a null receiver still resolves the member statically). No new
+# IL/runtime. Byte-identical to the WASM proof (run-safenav.mjs).
+check safenav.tks "$(cat <<'EXP'
+a = 21
+b = 42
+c = -1
+d = -1
+EXP
+)"
 # Phase 15 (15.A): concrete class — fields + methods + STATIC dispatch, zero runtime reflection.
 # `Point()` -> OP_OBJ_NEW; `p.x = 3` -> OP_OBJ_SET; `p.sum()`/`p.scale(10)` -> OP_CALL_FUNC
 # (the method routine reads `self.x`/`self.y` via OP_OBJ_GET). Prints 7 (3+4) then 70 ((3+4)*10).
