@@ -308,6 +308,19 @@ declaring the same method without a class override. WASM needed a **nesting-safe
 (stack-disciplined `$callfp` frame) so a method calling its own/another method works. Proofs
 `runtime/{native,wasm}/samples/traits.tks` → `12,112,9,209`. Suite 200→221; ASan/UBSan (both paths)
 + TSan green; 16 goldens intact; existing class/routines/producer/capstone WASM proofs intact.
-- **Next:** 15.C (generics `<T>` — real per-type monomorphization, the deep one), 15.D
-  (`event`/`raise`/`subscribe` + `fanout`/`fire_and_forget` on the Phase-14 spawn runtime). The
-  human merges — no merge/force-push from the agent.
+Sub-block **15.C `<T>` generics is DONE** — real per-type **monomorphization**: a generic
+`class Box<T>` is specialized into one concrete `Box$Arg` per instantiation (type-param substituted
+at compile time, zero runtime cost). `collect_generics` discovers templates + instantiations;
+`collect_classes` clones a concrete instance per type-arg (mono slots deferred after non-generic
+classes); `emit_mono_routines` re-lexes the template body per instance with `g_subst` (T→Arg) active,
+so `T()` makes `Arg` + a `T`-typed local is `Arg`-typed. Proof `generics.tks` → `11,22`
+(`Factory<Circle>`/`Factory<Square>`). Sub-block **15.D events is DONE** — `event`/`subscribe`/`raise`
++ `fanout`/`fire_and_forget` over the Phase-14 spawn runtime (frontend-only): static subscriptions
+(`collect_events`); `raise E(args)` fan-outs by spawning each subscriber (drained at exit). Proof
+`eventbus.tks` → `1,2,15,25`.
+**PHASE 15 IS COMPLETE** — 15.A–15.D done & CI-green on all four gates (incl. Windows). No dead
+tokens (every reserved OOP keyword LIVE with an executable `.tks` proof native AND WASM); zero
+runtime reflection (compile-time field indices/method slots/static vtables/monomorphization).
+Suite 223/223; ASan/UBSan (both paths) + TSan green; 16 goldens intact. **Ready to leave draft**
+(PR #8; the human merges — no merge/force-push). Deferred (owner): full async-method `intent<>`/
+`await` semantics (parsing accepted; bodies lower synchronously).

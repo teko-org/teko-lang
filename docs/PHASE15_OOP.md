@@ -165,8 +165,26 @@ Suite 222/222.
 a name-substitution (`T`→`Arg`) — never a runtime type parameter. The uniform-i32 placeholder of
 15.A is replaced for instantiated generics; an un-instantiated generic template emits no code.
 
-**Next: 15.D (events: `event`/`raise`/`subscribe` + `fanout`/`fire_and_forget` on the Phase-14
-concurrency runtime).** That closes Phase 15.
+**15.D (event subsystem) is DONE** on both targets — a static-subscription event system over the
+Phase-14 cooperative runtime (frontend-only, no new C runtime). `event E;` declares; `subscribe E
+with H [fanout|fire_and_forget];` registers a handler (top-level `fn` → routine slot) + a delivery
+mode at subscription time (compile-time-static subscriber set, `collect_events`); `raise E(args);`
+fan-outs to every subscriber by spawning each handler over the scheduler (drained at exit — deferred
+fan-out). `fanout` = parallel green threads (real parallelism on Layer B), `fire_and_forget` =
+enqueue-no-join; both spawn in the cooperative MVP. Proof `runtime/{native,wasm}/samples/eventbus.tks`
+→ `1, 2, 15, 25` (main body, then the two handlers at exit). Suite 223/223.
+
+## PHASE 15 IS COMPLETE
+All four sub-blocks done & CI-green on all four gates (incl. Windows MSVC): 15.A concrete classes,
+15.B abstract + traits (static vtables, collision = compile error, `to_string`-via-vtable hook for
+Phase 16), 15.C generics (real per-type monomorphization), 15.D events. **No dead tokens** — every
+reserved OOP token (`class`/`abstract`/`trait`/`event`/`raise`/`subscribe`/`fanout`/
+`fire_and_forget`) is LIVE with an executable `.tks` proof on **native AND WASM**. Zero runtime
+reflection throughout (compile-time field indices, method slots, static vtables, monomorphization).
+Suite 223/223; ASan/UBSan (both dispatch paths) + TSan green; 16 native goldens intact. **Ready to
+leave draft** (PR #8; the human merges — no merge/force-push from the agent). Deferred to a dedicated
+later sub-block (owner): full `async`-method `intent<>`/`await` semantics on the Phase-14 engine
+(parsing is accepted today; bodies lower synchronously).
 
 ## The `to_string` convention hook (for Phase 16's auto-conversion)
 
