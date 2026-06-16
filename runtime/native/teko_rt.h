@@ -226,6 +226,10 @@ char* teko_rt_group(int v);                            // id 58: thousands group
 // Phase 16.F — CHECKED parse (fail-loud: aborts native / traps wasm on malformed input).
 int teko_rt_parse_int(const char* s);                  // id 53: string -> i32 (checked)
 int teko_rt_parse_bool(const char* s);                 // id 55: "true"/"false" -> 0/1 (checked)
+// Phase 17.E — CHECKED string -> f64 (id 54). The INVERSE of id 50's f64-arg ABI: a string arg
+// (i32 ptr in $w0) -> a `double` RESULT (returned in xmm0/d0 = $f0). Malformed/overflow (±Inf)
+// fails loudly via the same path as the 16.F parsers. The ONLY runtime id with an f64 *result*.
+double teko_rt_parse_float(const char* s);             // id 54: string -> f64 (checked, fail-loud)
 // Phase 17.B — CHECKED float->int (OP_F2I) fail-loud landing pad (called by the emitted inline
 // NaN/i32-range guard; aborts non-zero with a stderr diagnostic, like the 16.F parsers). No return.
 void teko_rt_f2i_fail(void);

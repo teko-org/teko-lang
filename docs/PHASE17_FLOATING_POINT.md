@@ -279,8 +279,38 @@ WASM), NOT the integer `$w0`; the result is a `char*` in `$w0` (VT_STR), like th
 
 Verification: suite 235/235 (17.D adds no runtime C → no new KATs); ASan/UBSan (both dispatch paths)
 + TSan clean; the 16 native goldens + all float-free native/WASM output byte-identical (id 50 only
-fires when a float is formatted; the `crypto_50` import is `wasm_emit_float`-gated). Implementation
-continues at **17.E** (`convert.parse_float`, id 54, checked fail-loud).
+fires when a float is formatted; the `crypto_50` import is `wasm_emit_float`-gated).
+
+Sub-block **17.E (`convert.parse_float`, id 54, checked fail-loud) is DONE** on both targets —
+**the f64 core (17.A–17.E) is COMPLETE.** id 54 is the INVERSE of id 50's ABI: a **string** arg
+(ptr in `$w0`) → a **double** result in the float accumulator `$f0` (VT_FLOAT). Native: the normal
+`emit_call` marshals the string `$w0`→arg-reg and the `double` return lands in xmm0/d0 = `$f0`
+automatically (no special emission). WASM: import `(func $crypto_54 (param i32) (result f64))`
+(`wasm_emit_float`-gated, the second non-i32 reactor import after id 50) + call
+`local.get $w0 / call $crypto_54 / local.set $f0`.
+- **Parser core** `teko_convert_parse_f64` (in `teko_convert_f64.c`, +373 LOC) — freestanding (no
+  `strtod`/`math.h`/`setlocale`, no `__int128`), **correctly rounded** (round-to-nearest-even) via
+  **simple decimal conversion** (decimal-digit buffer → binary mantissa by repeated multiply/divide-
+  by-2), so `parse(format(d)) == d` bit-for-bit. CHECKED/**fail-loud**: malformed input + overflow
+  (→±Inf) return 0 → `teko_rt_parse_float` calls the SAME `teko_rt_die` 16.F uses (native exit 70 +
+  stderr / wasm reactor `__builtin_trap`); underflow-to-subnormal/0 is representable (not an error).
+- **Surface** via the codec path (`codec_id_for` → 54; `runtime_result_vt(54)` → VT_FLOAT) so
+  `convert.parse_float(s) + 1.0` is float arithmetic and `"x=" + convert.parse_float(s)`
+  auto-`to_string`'s via id 50.
+- **KATs (+3 → 238/238):** parse-exact catalog (incl. subnormal `5e-324`, DBL_MAX, `2.5e-3`, `-0.0`),
+  the **format→parse→identity round-trip** over the 17.C vector (proves correct rounding), and reject
+  cases (`""`/`"abc"`/`"1.2.3"`/`"1e"`/overflow → 0).
+- **Proofs** `runtime/{native,wasm}/samples/parsefloat.tks` → `3.14 / got 0.5 / 3.0` (parse→format
+  round-trip, parse-result auto-`to_string`, float arithmetic on two parses) **byte-identical native
+  vs WASM**; `parsefloat_fail.tks` → emits `before` then native-aborts exit 70 / WASM-traps on
+  `"notafloat"`. `run-parsefloat.mjs` + run-native.sh + wasm.yml wired.
+
+Verification: suite 238/238; ASan/UBSan (both dispatch paths) + TSan clean; 16 native goldens + all
+float-free native/WASM output byte-identical. **The Phase-16 float gate is CLOSED** — floats now have
+a value model, arithmetic/compares, checked casts, culture-invariant shortest-round-trip
+formatting/parsing, and auto-`to_string` in concat/interpolation, on native AND WASM, no dead tokens.
+Next is **17.F** (the owner-approved exact base-10 `decimal`) — a sub-block plan + diff estimate +
+own-PR recommendation is reported to the owner BEFORE implementing.
 
 ## Phase 17.F — exact base-10 `decimal` type (owner-APPROVED; implemented AFTER 17.A–17.E)
 **Owner decision: APPROVED, C#-`System.Decimal` semantics.** An EXACT base-10 `decimal`, **128-bit /

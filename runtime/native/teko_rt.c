@@ -849,6 +849,17 @@ int teko_rt_parse_bool(const char* s) {
     if (!teko_convert_parse_bool(s, &v)) teko_rt_die("convert.parse_bool: invalid boolean");
     return v;
 }
+// Phase 17.E — CHECKED string -> f64 (id 54). The INVERSE of id 50's f64-arg ABI: the arg is a
+// string ($w0 -> rdi/x0), the result is a `double` returned in xmm0/d0 (= $f0). A malformed or
+// out-of-range (±Inf) input FAILS LOUDLY via the SAME teko_rt_die path as parse_int/parse_bool
+// (exit 70 + stderr native; __builtin_trap in the wasm reactor). The correctly-rounded freestanding
+// parser is the 17.E teko_convert_parse_f64 (src/runtime/teko_convert_f64.c) — the SAME C source
+// compiled into the wasm32 reactor, so native and WASM agree bit-for-bit.
+double teko_rt_parse_float(const char* s) {
+    double v;
+    if (!teko_convert_parse_f64(s, &v)) teko_rt_die("convert.parse_float: invalid float");
+    return v;
+}
 
 // Phase 17 (17.B) — CHECKED float->int (OP_F2I) FAIL-LOUD landing pad. The hosted emitter emits an
 // inline NaN + i32-range guard (matched to WASM's i32.trunc_f64_s valid open interval) and `call`s

@@ -378,6 +378,10 @@ static int localcls_get(const char* n) {
 // an integer (VT_INT) — so `"n=" + convert.parse_int(s)` concatenates correctly (the int is then
 // auto-`to_string`'d), not treated as a pointer.
 static int runtime_result_vt(int id) {
+    // Phase 17.E — parse_float (id 54) leaves a `double` in the float accumulator $f0 (VT_FLOAT), so
+    // `convert.parse_float(s) + 1.0` is FLOAT arithmetic and `"x=" + convert.parse_float(s)`
+    // auto-`to_string`s through id 50 — exactly the inverse of id 50's f64-arg surface.
+    if (id == 54) return TEKO_VT_FLOAT;
     return (id == 53 || id == 55) ? TEKO_VT_INT : TEKO_VT_STR; // parse_int / parse_bool
 }
 static int codec_id_for(const char* lex); // fwd (defined with the codec surface below)
@@ -1040,6 +1044,7 @@ static int codec_id_for(const char* lex) {
     // Phase 16.F — CHECKED parse (string -> primitive; fail-loud on malformed input).
     if (strcmp(lex, "convert.parse_int") == 0)   return 53; // (str) -> i32
     if (strcmp(lex, "convert.parse_bool") == 0)  return 55; // (str) -> 0/1
+    if (strcmp(lex, "convert.parse_float") == 0) return 54; // (str) -> f64 (checked, fail-loud)
     return -1;
 }
 

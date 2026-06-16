@@ -563,3 +563,376 @@ char* teko_convert_f64_to_string(double v) {
     memcpy(out, buf, (size_t)p + 1);
     return out;
 }
+
+// =====================================================================================
+// Phase 17.E — CHECKED, correctly-rounded, freestanding decimal string -> f64 parser.
+//
+// ALGORITHM: "simple decimal conversion" (David Gay / Go `strconv` decimal-shift style).
+//
+//   The input is parsed into a fixed-capacity DECIMAL-DIGIT buffer with a decimal-point
+//   position (`dp`) and a `truncated` flag (set if more than the buffer's worth of
+//   significant digits were seen). The arbitrary-precision decimal is then SHIFTED toward
+//   a binary value: while the value is too large for the f64 mantissa range we divide the
+//   decimal by 2 (incrementing the binary exponent), and while it is too small we multiply
+//   the decimal by 2 (decrementing it) — both implemented as exact decimal long-shift over
+//   the digit buffer (`decimal_shift`). Once the value is in [2^52, 2^53), we round the
+//   fractional bit off with ROUND-HALF-TO-EVEN, then assemble the IEEE-754 binary64 fields.
+//
+//   This is the SAME family as Go's `strconv/decimal.go` + `atof.go` slow path. It is
+//   self-contained (NO big power-of-5 / power-of-10 table — distinct from Ryu's tables and
+//   from an Eisel-Lemire/Clinger fast-path table), chosen for COMPACTNESS + obviously
+//   correct rounding. It is the source of truth: a Clinger-style fast path is NOT used
+//   here (the round-trip KAT against the 17.C formatter is the correctness safety net).
+//
+//   FREESTANDING (HARD constraint, identical to the formatter above): no `strtod`/`math.h`/
+//   `setlocale`/`__int128`, no FP arithmetic in the conversion (the result is built from
+//   the integer mantissa + a single `ldexp`-free bit assembly). Only mem*/plain integer ops.
+//
+//   ACCEPTED GRAMMAR (culture-invariant; matches the formatter's plain + scientific output):
+//     ws* [+|-] ( D+ [. D*] | . D+ ) ( [eE] [+|-] D+ )? ws*       (D = ASCII digit)
+//   REJECTED (returns 0, *out untouched): empty, non-numeric, trailing junk, lone '.'/'e',
+//   a sign with no digits, AND `NaN`/`Infinity` (strict numeric parse, matching 16.F). This
+//   means parse(format(x)) is NOT defined for x in {NaN, ±Inf} — by design (those are not
+//   finite values; a strict numeric input must reject them, fail-loud at the surface).
+//
+//   RANGE: overflow (|value| would round to +Inf, i.e. binary exponent past the f64 max)
+//   is FAIL-LOUD (return 0), exactly as 16.F rejects integer overflow. Underflow to a
+//   subnormal or to ±0.0 is representable and therefore SUCCEEDS (not an error). The sign of
+//   zero is preserved ("-0.0" -> -0.0) so it round-trips with the formatter.
+// =====================================================================================
+
+// Capacity: enough significant decimal digits to round any f64 correctly. A binary64 needs
+// at most 767 significant decimal digits to distinguish the hardest subnormal; Go uses 800.
+#define TEKO_DEC_DIGITS 800
+
+typedef struct teko_dec {
+    uint8_t d[TEKO_DEC_DIGITS]; // significant decimal digits, MSD first, value in 0..9
+    int     nd;                 // number of digits in d[]
+    int     dp;                 // decimal point: value = 0.d[0]d[1]... x 10^dp (d[0] is 10^(dp-1))
+    int     neg;                // sign
+    int     truncated;         // 1 if digits were dropped past TEKO_DEC_DIGITS (rounding hint)
+} teko_dec;
+
+// Maximum bits we shift per step. <= 60 keeps the digit-accumulator (`n*10 + d`, with
+// `n < 2^k * something`) inside u64 without overflow.
+#define TEKO_MAX_SHIFT 57
+
+// Trim trailing zero digits (they don't affect the value; keeps nd minimal).
+static void teko_dec_trim(teko_dec* a) {
+    while (a->nd > 0 && a->d[a->nd - 1] == 0) a->nd--;
+    if (a->nd == 0) a->dp = 0;
+}
+
+// Drop LEADING zero digits, lowering dp by one each (value unchanged: a leading 0 in
+// d[0].d[1]...x10^dp means the true leading digit is one place lower). Needed after a left
+// shift whose digit-growth upper bound over-allocated by one leading position.
+static void teko_dec_strip_leading(teko_dec* a) {
+    int z = 0;
+    while (z < a->nd && a->d[z] == 0) z++;
+    if (z == 0) return;
+    for (int i = z; i < a->nd; i++) a->d[i - z] = a->d[i];
+    a->nd -= z;
+    a->dp -= z;
+    if (a->nd == 0) a->dp = 0;
+}
+
+// value /= 2^k (right shift), 0 < k <= TEKO_MAX_SHIFT. Long-division of the decimal digit
+// string by 2^k (exact). Transcribed from Go's strconv/decimal.go rightShift (adapted to the
+// fixed buffer): reads digits MSD-first, carrying the remainder; result digits are written in
+// place. dp grows by however many leading quotient digits are zero (handled by re-trimming /
+// the read-ahead). Digits past the buffer set `truncated`.
+static void teko_dec_shift_right(teko_dec* a, uint32_t k) {
+    int r = 0;          // read index into a->d
+    int w = 0;          // write index
+    uint64_t n = 0;     // running dividend accumulator
+    // Pull leading digits until the first quotient digit (n >> k) is nonzero. (Transcribed
+    // verbatim from Go strconv/decimal.go rightShift; r counts consumed positions.)
+    for (; (n >> k) == 0; r++) {
+        if (r >= a->nd) {
+            if (n == 0) { a->nd = 0; return; } // exact zero
+            // Ran out of input digits but n != 0: keep multiplying (implicit trailing zeros)
+            // until a quotient digit appears, counting the consumed positions in r.
+            while ((n >> k) == 0) { n *= 10; r++; }
+            break;
+        }
+        n = n * 10 + a->d[r];
+    }
+    a->dp -= (r - 1);
+    uint64_t mask = ((uint64_t)1 << k) - 1;
+    // Pass 1: while real input digits remain.
+    for (; r < a->nd; r++) {
+        uint8_t dig = (uint8_t)(n >> k);
+        n &= mask;
+        if (w < TEKO_DEC_DIGITS) { a->d[w] = dig; w++; }
+        else if (dig != 0) { a->truncated = 1; }
+        n = n * 10 + a->d[r];
+    }
+    // Pass 2: drain the remaining fraction (implicit trailing zeros).
+    while (n > 0) {
+        uint8_t dig = (uint8_t)(n >> k);
+        n &= mask;
+        if (w < TEKO_DEC_DIGITS) { a->d[w] = dig; w++; }
+        else if (dig != 0) { a->truncated = 1; }
+        n = n * 10;
+    }
+    a->nd = w;
+    teko_dec_trim(a);
+}
+
+// value *= 2^k (left shift), 0 < k <= TEKO_MAX_SHIFT. Transcribed from Go's decimal.go
+// leftShift: process digits LSD-first with a carry; the result grows by `delta` leading
+// digits where delta = floor(k*log10(2)) or that+1 (decided by comparing the high digits to
+// the shift's prefix). We size by the upper bound ceil(k*log10(2)) and let leading zeros trim.
+static int teko_left_grow_ub(uint32_t k) {
+    long num = (long)k * 30103L;       // k * log10(2) * 1e5, slightly OVER the true value
+    int g = (int)(num / 100000L);
+    if (num % 100000L != 0) g++;       // ceil
+    return g;                          // strict upper bound on added leading digits
+}
+static void teko_dec_shift_left(teko_dec* a, uint32_t k) {
+    int delta = teko_left_grow_ub(k);
+    int rd = a->nd - 1;                 // read index (LSD-first)
+    int wr = a->nd - 1 + delta;         // write index (LSD-first), result is nd+delta wide
+    uint64_t n = 0;
+    while (rd >= 0) {
+        n += ((uint64_t)a->d[rd]) << k;
+        uint64_t quo = n / 10;
+        uint64_t rem = n - quo * 10;
+        if (wr < TEKO_DEC_DIGITS) {
+            a->d[wr] = (uint8_t)rem;
+        } else if (rem != 0) {
+            a->truncated = 1;
+        }
+        wr--; rd--;
+        n = quo;
+    }
+    while (n > 0) {
+        uint64_t quo = n / 10;
+        uint64_t rem = n - quo * 10;
+        if (wr < TEKO_DEC_DIGITS) {
+            a->d[wr] = (uint8_t)rem;
+        } else if (rem != 0) {
+            a->truncated = 1;
+        }
+        wr--;
+        n = quo;
+    }
+    // `delta` is an UPPER bound on the digit growth; if the actual growth was smaller, the
+    // top write positions [0..wr] were never filled (the carry ran out early). Zero those
+    // holes so strip_leading can drop them (Go computes the exact delta via a cutoff table;
+    // we zero-then-strip, which is equivalent and table-free).
+    for (int z = 0; z <= wr && z < TEKO_DEC_DIGITS; z++) a->d[z] = 0;
+    a->nd += delta;
+    if (a->nd > TEKO_DEC_DIGITS) a->nd = TEKO_DEC_DIGITS;
+    a->dp += delta;
+    teko_dec_strip_leading(a);         // the digit-growth bound may over-allocate by one
+    teko_dec_trim(a);
+}
+
+// Generic shift: positive = left (*2^k), negative = right (/2^|k|). Applies in MAX_SHIFT chunks.
+static void teko_dec_shift(teko_dec* a, int shift) {
+    if (a->nd == 0) return;            // 0 stays 0
+    while (shift > 0) {
+        int s = shift > TEKO_MAX_SHIFT ? TEKO_MAX_SHIFT : shift;
+        teko_dec_shift_left(a, (uint32_t)s);
+        shift -= s;
+        if (a->nd == 0) return;
+    }
+    while (shift < 0) {
+        int s = -shift > TEKO_MAX_SHIFT ? TEKO_MAX_SHIFT : -shift;
+        teko_dec_shift_right(a, (uint32_t)s);
+        shift += s;
+        if (a->nd == 0) return;
+    }
+}
+
+// Extract the rounded integer value of the decimal (digits d[0..dp), the integer part), with
+// round-half-to-even on the fractional tail. Transcribed from Go decimal.go RoundedInteger.
+// Caller guarantees dp is small enough that the integer part fits in u64 (<= ~19 digits).
+static uint64_t teko_dec_rounded_integer(const teko_dec* a) {
+    if (a->dp < 0) return 0;
+    uint64_t n = 0;
+    int i;
+    int id = a->dp; if (id > a->nd) id = a->nd;
+    for (i = 0; i < id; i++) n = n * 10 + a->d[i];
+    for (; i < a->dp; i++) n *= 10;          // integer digits past nd are implicit zeros
+    // Round-half-to-even on the fraction starting at index dp.
+    int roundup = 0;
+    if (a->dp < a->nd) {
+        if (a->d[a->dp] == 5 && a->dp + 1 == a->nd) {     // exactly halfway?
+            roundup = a->truncated ? 1 : (n & 1);          // sticky -> up; else to even
+        } else {
+            roundup = a->d[a->dp] >= 5;
+        }
+    }
+    if (roundup) n++;
+    return n;
+}
+
+// Acceleration table: a safe per-step binary shift for a given |dp|. Matches Go decimal.go
+// powtab (the number of bits 10^i needs, capped); using it makes the scaling loop O(log).
+static const int teko_powtab[] = {
+    1, 3, 6, 9, 13, 16, 19, 23, 26
+};
+#define TEKO_POWTAB_N ((int)(sizeof(teko_powtab) / sizeof(teko_powtab[0])))
+
+// f64 floatInfo: mantbits=52, expbits=11, bias = -1023 (Go convention).
+#define TEKO_F64_MANTBITS 52
+#define TEKO_F64_EXPBITS 11
+#define TEKO_F64_BIAS (-1023)
+
+// Convert the parsed decimal to f64 bits. Transcribed from Go strconv/atof.go
+// (*decimal).floatBits, specialized to binary64. Returns 1 on success (writes *out), 0 on
+// overflow to ±Inf (FAIL-LOUD). Underflow to a subnormal/±0.0 SUCCEEDS.
+static int teko_dec_to_f64(teko_dec* a, double* out) {
+    int exp;
+    uint64_t mant;
+    int overflow = 0;
+
+    if (a->nd == 0) {           // zero
+        mant = 0; exp = TEKO_F64_BIAS;
+        goto out;
+    }
+    if (a->dp > 310) goto overflow;          // obvious overflow
+    if (a->dp < -330) { mant = 0; exp = TEKO_F64_BIAS; goto out; } // obvious underflow -> 0
+
+    // Scale by powers of two until the value is in [0.5, 1).
+    exp = 0;
+    while (a->dp > 0) {
+        int n = (a->dp >= TEKO_POWTAB_N) ? 27 : teko_powtab[a->dp];
+        teko_dec_shift(a, -n); exp += n;
+    }
+    while (a->dp < 0 || (a->dp == 0 && a->nd > 0 && a->d[0] < 5)) {
+        int n = (-a->dp >= TEKO_POWTAB_N) ? 27 : teko_powtab[-a->dp];
+        teko_dec_shift(a, n); exp -= n;
+    }
+
+    // Our range is [0.5,1) but the IEEE significand range is [1,2): drop one.
+    exp--;
+
+    // Minimum representable exponent is bias+1.
+    if (exp < TEKO_F64_BIAS + 1) {
+        int n = TEKO_F64_BIAS + 1 - exp;
+        teko_dec_shift(a, -n); exp += n;
+    }
+
+    if (exp - TEKO_F64_BIAS >= (1 << TEKO_F64_EXPBITS) - 1) goto overflow;
+
+    // Extract 1 + mantbits = 53 bits.
+    teko_dec_shift(a, (int)(1 + TEKO_F64_MANTBITS));
+    mant = teko_dec_rounded_integer(a);
+
+    // Rounding may have produced 2^53; renormalize.
+    if (mant == (2ull << TEKO_F64_MANTBITS)) {
+        mant >>= 1; exp++;
+        if (exp - TEKO_F64_BIAS >= (1 << TEKO_F64_EXPBITS) - 1) goto overflow;
+    }
+
+    // Denormal: if the implicit leading bit is absent, force the subnormal exponent code.
+    if ((mant & (1ull << TEKO_F64_MANTBITS)) == 0) exp = TEKO_F64_BIAS;
+
+    goto out;
+
+overflow:
+    mant = 0;
+    exp = (1 << TEKO_F64_EXPBITS) - 1 + TEKO_F64_BIAS;
+    overflow = 1;
+
+out:;
+    if (overflow) return 0;   // FAIL-LOUD: leave *out UNTOUCHED (no ±Inf write on rejection)
+    uint64_t bits = mant & ((1ull << TEKO_F64_MANTBITS) - 1);
+    bits |= (uint64_t)((exp - TEKO_F64_BIAS) & ((1 << TEKO_F64_EXPBITS) - 1)) << TEKO_F64_MANTBITS;
+    if (a->neg) bits |= (1ull << TEKO_F64_MANTBITS) << TEKO_F64_EXPBITS;
+    double v; memcpy(&v, &bits, sizeof(double));
+    *out = v;
+    return overflow ? 0 : 1;   // overflow to ±Inf is FAIL-LOUD (return 0; *out is ±Inf)
+}
+
+static int teko_pf_is_ws(char c) {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v';
+}
+static int teko_pf_is_digit(char c) { return c >= '0' && c <= '9'; }
+
+// Public entry: checked, correctly-rounded, freestanding decimal-string -> f64.
+int teko_convert_parse_f64(const char* s, double* out) {
+    if (!s) return 0;
+    const char* p = s;
+    while (teko_pf_is_ws(*p)) p++;
+
+    teko_dec a;
+    memset(a.d, 0, sizeof(a.d));
+    a.nd = 0; a.dp = 0; a.neg = 0; a.truncated = 0;
+
+    if (*p == '+' || *p == '-') { a.neg = (*p == '-'); p++; }
+
+    // Parse the significand into Go's canonical decimal: d[0..nd) are the digits (with leading
+    // zeros dropped), and dp = number of digits to the LEFT of the decimal point, so
+    //   value = d[0].d[1]d[2]... x 10^dp   (i.e. d[i] has place 10^(dp-1-i)).
+    // We accumulate every digit (suppressing leading zeros, adjusting dp for those after the
+    // point), then trim. dp is set when the '.' is seen.
+    int sawdot = 0;
+    int sawdigit = 0;
+    int seen_nonzero = 0;
+    for (;;) {
+        char c = *p;
+        if (c == '.') {
+            if (sawdot) return 0;        // a second '.' is malformed
+            sawdot = 1;
+            a.dp = a.nd;                 // digits seen so far are the integer part
+            p++;
+            continue;
+        }
+        if (!teko_pf_is_digit(c)) break;
+        sawdigit = 1;
+        p++;
+        if (c == '0' && !seen_nonzero) {
+            // Leading zero: never stored. Before the point it contributes nothing; after the
+            // point each one lowers the exponent of the first significant digit by one.
+            if (sawdot) a.dp--;
+            continue;
+        }
+        seen_nonzero = 1;
+        if (a.nd < TEKO_DEC_DIGITS) {
+            a.d[a.nd++] = (uint8_t)(c - '0');
+        } else if (c != '0') {
+            a.truncated = 1;            // dropped a nonzero digit past the buffer
+        }
+    }
+    if (!sawdigit) return 0;            // need at least one digit (rejects "", "+", ".", "e1")
+    if (!sawdot) a.dp = a.nd;           // no '.' -> the point is after all integer digits
+
+    // Trim trailing zeros (e.g. "100" -> nd=1, dp=3): they don't change the value and keep
+    // the rounding logic clean. dp already encodes the magnitude.
+    teko_dec_trim(&a);
+
+    // Optional exponent.
+    if (*p == 'e' || *p == 'E') {
+        p++;
+        int esign = 1;
+        if (*p == '+' || *p == '-') { esign = (*p == '-') ? -1 : 1; p++; }
+        if (!teko_pf_is_digit(*p)) return 0; // lone 'e' / 'e+' is malformed
+        long exp = 0;
+        while (teko_pf_is_digit(*p)) {
+            exp = exp * 10 + (*p - '0');
+            if (exp > 100000000L) exp = 100000000L; // clamp; huge exponent -> over/underflow
+            p++;
+        }
+        a.dp += (int)(esign * exp);
+    }
+
+    while (teko_pf_is_ws(*p)) p++;
+    if (*p != '\0') return 0;         // trailing junk (rejects "1.2.3" via dot, "1.0x", etc.)
+
+    // Early range gates (avoid pathological shift loops on absurd exponents):
+    if (a.nd != 0) {
+        if (a.dp > 310)  return 0;    // > ~1.8e308 magnitude -> overflow, fail-loud
+        if (a.dp < -340) {            // < ~5e-324 magnitude -> underflow to ±0.0
+            uint64_t bits = a.neg ? (1ull << 63) : 0ull;
+            double v; memcpy(&v, &bits, sizeof(double));
+            *out = v;
+            return 1;
+        }
+    }
+
+    return teko_dec_to_f64(&a, out);
+}

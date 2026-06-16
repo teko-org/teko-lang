@@ -195,10 +195,11 @@ void codegen_li_emit_call_runtime(BytecodeBuffer* buffer, int codec_id) {
              codec_id == 8 || codec_id == 9) buffer->uses_hash = 1;       // in-module set
     else if (codec_id >= 4) buffer->uses_crypto_ext = 1;                  // reactor set
     else buffer->uses_codec = 1;
-    // Phase 17.D — id 50 (float->string) is the f64-ARG runtime call: it reads the float
-    // accumulator $f0, so the WASM float locals MUST be declared. Set uses_float defensively (the
-    // value-producing float ops already set it, but a future caller might emit id 50 in isolation).
-    if (codec_id == 50) buffer->uses_float = 1;
+    // Phase 17.D/17.E — id 50 (float->string, reads $f0) and id 54 (parse_float, WRITES $f0) are the
+    // two f64-ABI runtime calls: both touch the float accumulator, so the WASM float locals MUST be
+    // declared. Set uses_float (id 54 may be the SOLE float op in a module — e.g. a parse that only
+    // feeds an int via convert.to_int — so this is the load-bearing flag, not merely defensive).
+    if (codec_id == 50 || codec_id == 54) buffer->uses_float = 1;
     emit_byte(buffer, OP_CALL_RUNTIME);
     emit_int(buffer, codec_id);
 }

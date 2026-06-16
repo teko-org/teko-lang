@@ -108,6 +108,9 @@ EXPORTS=(teko_rt_sha512_hex teko_rt_sha384_hex teko_rt_sha3_256_hex teko_rt_sha3
          teko_rt_float_to_string
          # Phase 16.E: explicit integer formats (ids 56/57/58).
          teko_rt_to_radix teko_rt_pad teko_rt_group
+         # Phase 17.E: checked string->f64 (id 54; the f64-RESULT reactor entry, (char*)->double;
+         # traps on malformed/overflow input via teko_rt_die's __builtin_trap).
+         teko_rt_parse_float
          # Phase 16.F: checked parse (ids 53/55; traps on malformed input).
          teko_rt_parse_int teko_rt_parse_bool)
 LDEXPORTS=(); for e in "${EXPORTS[@]}"; do LDEXPORTS+=("--export=$e"); done

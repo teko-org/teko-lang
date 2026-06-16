@@ -28,6 +28,15 @@ char* teko_convert_str_concat(const char* a, const char* b);
 // `convert.float_to_str` surface (id 50) is wired in 17.D — this is the C core only.
 char* teko_convert_f64_to_string(double v);
 
+// Phase 17.E — CHECKED string -> f64 parse (the inverse of teko_convert_f64_to_string).
+// Freestanding (no strtod/math.h/setlocale/__int128) and CORRECTLY ROUNDED (round-to-nearest-even)
+// so parse(format(d)) == d bit-for-bit. Accepted grammar (culture-invariant): optional surrounding
+// ASCII whitespace, optional '+'/'-', decimal digits with an optional single '.', optional exponent
+// e/E[+/-]digits. Rejects empty/junk/lone '.'/lone 'e'/specials (NaN/Infinity), AND overflow to
+// ±Inf (fail-loud); underflow to a subnormal/0 is fine. Returns 1 + writes *out on success, else 0
+// (and does not write *out). The `convert.parse_float` surface (id 54) is wired in 17.E.
+int teko_convert_parse_f64(const char* s, double* out);
+
 // --- explicit format (developer-supplied spec; deviates from the default) ---------
 // Phase 16.E. These are the EXPLICIT formats a developer opts into — distinct from the universal
 // culture-invariant default (plain `.`-decimal, no grouping). Still locale-independent.

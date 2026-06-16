@@ -221,6 +221,17 @@ pi~ 3.14, dbl 6.28
 3.14 = pi
 EXP
 )"
+# Phase 17 (17.E): CHECKED `convert.parse_float` (id 54, str->f64, fail-loud). The INVERSE of id 50:
+# string arg in $w0, parsed double in $f0 (VT_FLOAT). The parser is the freestanding correctly-rounded
+# teko_convert_parse_f64 (same C as the reactor) — parse->format round-trips. Byte-identical to WASM
+# (run-parsefloat.mjs). `parsefloat_fail` proves fail-loud: malformed input aborts non-zero (not 0.0).
+check parsefloat.tks "$(cat <<'EXP'
+3.14
+got 0.5
+3.0
+EXP
+)"
+check_fail parsefloat_fail.tks "before" "convert.parse_float: invalid float"
 # Phase 15 (15.A): concrete class — fields + methods + STATIC dispatch, zero runtime reflection.
 # `Point()` -> OP_OBJ_NEW; `p.x = 3` -> OP_OBJ_SET; `p.sum()`/`p.scale(10)` -> OP_CALL_FUNC
 # (the method routine reads `self.x`/`self.y` via OP_OBJ_GET). Prints 7 (3+4) then 70 ((3+4)*10).

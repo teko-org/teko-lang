@@ -68,6 +68,12 @@ const char* teko_native_runtime_symbol(int32_t id, int* out_arity) {
         case 58: sym = "teko_rt_group";            arity = 1; break; // (v) -> "1,000,000"
         case 53: sym = "teko_rt_parse_int";        arity = 1; break; // (str) -> i32 (checked)
         case 55: sym = "teko_rt_parse_bool";       arity = 1; break; // (str) -> 0/1 (checked)
+        // Phase 17.E — string->f64. id 54 is the INVERSE of id 50's ABI: the arg is a STRING (i32 ptr
+        // in $w0 -> rdi/x0 via the normal emit_call marshal), and the `double` result is returned in
+        // xmm0/d0 (= $f0) AUTOMATICALLY by the SysV/AAPCS ABI. So unlike id 50 it needs NO special
+        // emission — the generic `emit_call(sym, 1)` is correct (rax/$w0 is clobbered but unused; the
+        // frontend reads the result from $f0 as VT_FLOAT).
+        case 54: sym = "teko_rt_parse_float";      arity = 1; break; // (str) -> f64 (checked)
         case 6: sym = "teko_rt_md5_hex";       break; // legacy
         case 7: sym = "teko_rt_sha1_hex";      break; // legacy
         case 8: sym = "teko_rt_uuid_v3";       break;

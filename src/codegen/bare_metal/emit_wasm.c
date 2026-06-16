@@ -22,6 +22,7 @@ static int wasm_is_crypto_ext_id(int id) {
         case 44: case 45: case 46: case 47: case 48:               // wall-clock / timezone surface
         case 49: case 51: case 52:                                  // Phase 16 conversion surface
         case 50:                                                    // Phase 17.D float->string (f64-arg)
+        case 54:                                                    // Phase 17.E parse_float (f64-result)
         case 53: case 55:                                           // Phase 16.F checked parse
         case 56: case 57: case 58:                                  // Phase 16.E explicit formats
             return 1;
@@ -1150,6 +1151,17 @@ void emit_wasm_pure(MetalContext* ctx, OpCode op, int32_t arg) {
                                 sym, id);
                         continue;
                     }
+                    // Phase 17.E — id 54 (teko_rt_parse_float) is the INVERSE non-i32 reactor import:
+                    // a string arg (i32 ptr) -> an f64 RESULT, so `(param i32) (result f64)`. Like id
+                    // 50 it is gated on wasm_emit_float (it can never appear without a float result)
+                    // so a float-free crypto-ext module stays BYTE-IDENTICAL. Getting the result type
+                    // wrong (e.g. `(result i32)`) makes the module fail to instantiate against the reactor.
+                    if (id == 54) {
+                        if (!ctx->wasm_emit_float) continue;
+                        fprintf(f, "  (import \"crypto\" \"%s\" (func $crypto_%d (param i32) (result f64)))\n",
+                                sym, id);
+                        continue;
+                    }
                     fprintf(f, "  (import \"crypto\" \"%s\" (func $crypto_%d", sym, id);
                     for (int p = 0; p < ar; p++) fprintf(f, " (param i32)");
                     fprintf(f, " (result i32)))\n");
@@ -1322,6 +1334,12 @@ void emit_wasm_pure(MetalContext* ctx, OpCode op, int32_t arg) {
                 // float accumulator $f0 (not $w0); push it as the f64 import param and store the
                 // resulting char* pointer into $w0 (VT_STR). Stack-neutral.
                 fprintf(f, "    local.get $f0\n    call $crypto_50\n    local.set $w0\n");
+            } else if (arg == 54) {
+                // Phase 17.E — string->f64: the f64-RESULT runtime call (the INVERSE of id 50). The
+                // string ptr arg lives in the integer accumulator $w0; push it as the i32 import
+                // param and store the resulting `f64` into the float accumulator $f0 (VT_FLOAT).
+                // Stack-neutral.
+                fprintf(f, "    local.get $w0\n    call $crypto_54\n    local.set $f0\n");
             } else if (wasm_is_crypto_ext_id(arg)) {
                 // Reactor-backed crypto: call the imported teko_rt_* entry point. Multi-arg
                 // ABI mirrors OP_CALL_IMPORT — args 0..n-2 come from the staging slots
