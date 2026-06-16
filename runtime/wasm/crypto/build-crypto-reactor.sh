@@ -102,7 +102,9 @@ EXPORTS=(teko_rt_sha512_hex teko_rt_sha384_hex teko_rt_sha3_256_hex teko_rt_sha3
          # Phase 15 (15.B): static-vtable dispatch ops (OP_VTABLE_* import these from the reactor).
          teko_rt_vtable_set teko_rt_vtable_get
          # Phase 16 (16.A): culture-invariant conversion surface (OP_CALL_RUNTIME ids 49/51/52).
-         teko_rt_int_to_string teko_rt_bool_to_string teko_rt_str_concat)
+         teko_rt_int_to_string teko_rt_bool_to_string teko_rt_str_concat
+         # Phase 16.E: explicit integer formats (ids 56/57/58).
+         teko_rt_to_radix teko_rt_pad teko_rt_group)
 LDEXPORTS=(); for e in "${EXPORTS[@]}"; do LDEXPORTS+=("--export=$e"); done
 
 # Layout: keep the whole reactor image (data + shadow stack + heap) ABOVE Teko's

@@ -51,6 +51,71 @@ char* teko_convert_str_concat(const char* a, const char* b) {
     return out;
 }
 
+// --- explicit format -------------------------------------------------------------
+
+char* teko_convert_i64_to_radix(long long v, int radix) {
+    if (radix < 2)  radix = 2;
+    if (radix > 36) radix = 36;
+    static const char digs[] = "0123456789abcdefghijklmnopqrstuvwxyz";
+    char tmp[72]; // worst case base-2 of 64 bits + sign + NUL
+    int i = (int)sizeof(tmp);
+    tmp[--i] = '\0';
+    int neg = (v < 0);
+    long long n = v;
+    if (!neg) n = -n;                 // accumulate on the negative side (INT64_MIN-safe)
+    do {
+        int d = (int)(-(n % radix));  // 0..radix-1
+        tmp[--i] = digs[d];
+        n /= radix;
+    } while (n != 0);
+    if (neg) tmp[--i] = '-';
+    size_t len = sizeof(tmp) - (size_t)i;
+    char* out = (char*)malloc(len);
+    if (!out) return NULL;
+    memcpy(out, tmp + i, len);
+    return out;
+}
+
+char* teko_convert_i64_pad(long long v, int width) {
+    if (width < 0) width = 0;
+    char* digits = teko_convert_i64_to_string(v); // signed decimal (handles '-')
+    if (!digits) return NULL;
+    size_t cur = strlen(digits);
+    if ((int)cur >= width) return digits;          // already wide enough
+    int neg = (digits[0] == '-');
+    size_t pad = (size_t)width - cur;
+    char* out = (char*)malloc((size_t)width + 1);
+    if (!out) { free(digits); return NULL; }
+    size_t w = 0;
+    if (neg) out[w++] = '-';                        // sign first
+    for (size_t k = 0; k < pad; k++) out[w++] = '0';
+    const char* body = digits + (neg ? 1 : 0);
+    while (*body) out[w++] = *body++;
+    out[w] = '\0';
+    free(digits);
+    return out;
+}
+
+char* teko_convert_i64_grouped(long long v, char sep) {
+    char* digits = teko_convert_i64_to_string(v);
+    if (!digits) return NULL;
+    int neg = (digits[0] == '-');
+    const char* d = digits + (neg ? 1 : 0);
+    size_t nd = strlen(d);
+    size_t ngroups = nd ? (nd - 1) / 3 : 0;         // separators to insert
+    char* out = (char*)malloc((neg ? 1 : 0) + nd + ngroups + 1);
+    if (!out) { free(digits); return NULL; }
+    size_t w = 0;
+    if (neg) out[w++] = '-';
+    for (size_t k = 0; k < nd; k++) {
+        if (k > 0 && ((nd - k) % 3) == 0) out[w++] = sep; // boundary before this digit
+        out[w++] = d[k];
+    }
+    out[w] = '\0';
+    free(digits);
+    return out;
+}
+
 // --- parse (checked) -------------------------------------------------------------
 
 static int is_ws(char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v'; }

@@ -21,6 +21,16 @@ char* teko_convert_bool_to_string(int v);
 // Concatenate two NUL-terminated strings into a fresh buffer. NULL is treated as "".
 char* teko_convert_str_concat(const char* a, const char* b);
 
+// --- explicit format (developer-supplied spec; deviates from the default) ---------
+// Phase 16.E. These are the EXPLICIT formats a developer opts into — distinct from the universal
+// culture-invariant default (plain `.`-decimal, no grouping). Still locale-independent.
+// Integer in an arbitrary radix 2..36 (lowercase digits, '-' for negatives, INT64_MIN-safe).
+char* teko_convert_i64_to_radix(long long v, int radix);
+// Decimal, zero-padded to a minimum total width (the '-' sign counts toward the width).
+char* teko_convert_i64_pad(long long v, int width);
+// Decimal with `sep` inserted every 3 digits from the right (e.g. ',' -> "1,000,000").
+char* teko_convert_i64_grouped(long long v, char sep);
+
 // --- parse (checked; 1 = valid, 0 = malformed/overflow) ---------------------------
 // Canonical signed decimal integer: optional surrounding ASCII whitespace, optional leading
 // '+'/'-', one or more digits, no digit grouping, nothing else. Overflow of int64 fails.

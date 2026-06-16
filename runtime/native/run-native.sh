@@ -145,6 +145,17 @@ point = Point(3, 4)
 p=Point(3, 4)
 EXP
 )"
+# Phase 16 (16.E): EXPLICIT integer formats (developer-supplied spec) — radix / zero-pad /
+# thousands grouping (ids 56/57/58). Distinct from the culture-invariant default; still locale-free.
+check format.tks "$(cat <<'EXP'
+ff
+1010
+100
+00042
+1,000,000
+hex = ff
+EXP
+)"
 # Phase 15 (15.A): concrete class — fields + methods + STATIC dispatch, zero runtime reflection.
 # `Point()` -> OP_OBJ_NEW; `p.x = 3` -> OP_OBJ_SET; `p.sum()`/`p.scale(10)` -> OP_CALL_FUNC
 # (the method routine reads `self.x`/`self.y` via OP_OBJ_GET). Prints 7 (3+4) then 70 ((3+4)*10).

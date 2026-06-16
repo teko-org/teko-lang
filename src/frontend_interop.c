@@ -896,6 +896,10 @@ static int codec_id_for(const char* lex) {
     if (strcmp(lex, "convert.int_to_str") == 0)  return 49;
     if (strcmp(lex, "convert.bool_to_str") == 0) return 51;
     if (strcmp(lex, "convert.str_concat") == 0)  return 52;
+    // Phase 16.E — explicit integer formats (developer-supplied spec; deviates from the default).
+    if (strcmp(lex, "convert.to_radix") == 0)    return 56; // (v, base 2..36)
+    if (strcmp(lex, "convert.pad") == 0)         return 57; // (v, width)
+    if (strcmp(lex, "convert.group") == 0)       return 58; // (v) -> thousands-grouped
     return -1;
 }
 
@@ -925,6 +929,8 @@ static int runtime_arity(int id) {
         case 39: return 3; // rsa_oaep_encrypt(n, e, msg)
         case 40: return 3; // rsa_oaep_decrypt(n, d, ct)
         case 52: return 2; // convert.str_concat(a, b)
+        case 56: return 2; // convert.to_radix(v, base)
+        case 57: return 2; // convert.pad(v, width)
         default: return 1;
     }
 }

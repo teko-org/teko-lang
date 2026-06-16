@@ -45,6 +45,38 @@ void test_teko_convert_str_concat(void) {
     s = teko_convert_str_concat("x = ", "42"); TEST_ASSERT_EQUAL_STRING("x = 42", s); free(s);
 }
 
+void test_teko_convert_to_radix(void) {
+    char* s;
+    s = teko_convert_i64_to_radix(255, 16); TEST_ASSERT_EQUAL_STRING("ff", s);   free(s);
+    s = teko_convert_i64_to_radix(10, 2);   TEST_ASSERT_EQUAL_STRING("1010", s); free(s);
+    s = teko_convert_i64_to_radix(64, 8);   TEST_ASSERT_EQUAL_STRING("100", s);  free(s);
+    s = teko_convert_i64_to_radix(0, 16);   TEST_ASSERT_EQUAL_STRING("0", s);    free(s);
+    s = teko_convert_i64_to_radix(-255, 16);TEST_ASSERT_EQUAL_STRING("-ff", s);  free(s);
+    s = teko_convert_i64_to_radix(35, 36);  TEST_ASSERT_EQUAL_STRING("z", s);    free(s);
+    // INT64_MIN in base 16 (magnitude on the negative side, no overflow).
+    s = teko_convert_i64_to_radix(-9223372036854775807LL - 1, 16);
+    TEST_ASSERT_EQUAL_STRING("-8000000000000000", s); free(s);
+}
+
+void test_teko_convert_pad(void) {
+    char* s;
+    s = teko_convert_i64_pad(42, 5);   TEST_ASSERT_EQUAL_STRING("00042", s);  free(s);
+    s = teko_convert_i64_pad(-42, 5);  TEST_ASSERT_EQUAL_STRING("-0042", s);  free(s); // sign counts
+    s = teko_convert_i64_pad(0, 3);    TEST_ASSERT_EQUAL_STRING("000", s);    free(s);
+    s = teko_convert_i64_pad(12345, 3);TEST_ASSERT_EQUAL_STRING("12345", s);  free(s); // already wider
+    s = teko_convert_i64_pad(7, 1);    TEST_ASSERT_EQUAL_STRING("7", s);      free(s);
+}
+
+void test_teko_convert_grouped(void) {
+    char* s;
+    s = teko_convert_i64_grouped(0, ',');        TEST_ASSERT_EQUAL_STRING("0", s);          free(s);
+    s = teko_convert_i64_grouped(100, ',');      TEST_ASSERT_EQUAL_STRING("100", s);        free(s);
+    s = teko_convert_i64_grouped(1000, ',');     TEST_ASSERT_EQUAL_STRING("1,000", s);      free(s);
+    s = teko_convert_i64_grouped(1000000, ',');  TEST_ASSERT_EQUAL_STRING("1,000,000", s);  free(s);
+    s = teko_convert_i64_grouped(-1234567, ','); TEST_ASSERT_EQUAL_STRING("-1,234,567", s); free(s);
+    s = teko_convert_i64_grouped(12, '.');       TEST_ASSERT_EQUAL_STRING("12", s);         free(s);
+}
+
 void test_teko_convert_parse_i64_valid(void) {
     long long v = 999;
     TEST_ASSERT_EQUAL_INT(1, teko_convert_parse_i64("0", &v));    TEST_ASSERT_EQUAL_INT64(0, v);

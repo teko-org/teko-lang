@@ -819,3 +819,7 @@ long teko_rt_vtable_get(long type_id, long method_id) {
 char* teko_rt_int_to_string(int v)  { return teko_convert_i64_to_string((long long)v); }
 char* teko_rt_bool_to_string(int v) { return teko_convert_bool_to_string(v); }
 char* teko_rt_str_concat(const char* a, const char* b) { return teko_convert_str_concat(a, b); }
+// Phase 16.E — explicit integer formats.
+char* teko_rt_to_radix(int v, int radix) { return teko_convert_i64_to_radix((long long)v, radix); }
+char* teko_rt_pad(int v, int width)      { return teko_convert_i64_pad((long long)v, width); }
+char* teko_rt_group(int v)               { return teko_convert_i64_grouped((long long)v, ','); }

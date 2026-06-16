@@ -214,5 +214,9 @@ long teko_rt_vtable_get(long type_id, long method_id);            // -> slot (-1
 char* teko_rt_int_to_string(int v);                    // id 49: signed decimal
 char* teko_rt_bool_to_string(int v);                   // id 51: "true"/"false"
 char* teko_rt_str_concat(const char* a, const char* b); // id 52: a ‖ b
+// Phase 16.E — explicit integer formats (developer-supplied spec).
+char* teko_rt_to_radix(int v, int radix);              // id 56: base 2..36 (hex/oct/bin/…)
+char* teko_rt_pad(int v, int width);                   // id 57: zero-pad to a min width
+char* teko_rt_group(int v);                            // id 58: thousands grouping with ','
 
 #endif // TEKO_RT_H
