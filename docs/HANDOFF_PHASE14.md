@@ -68,11 +68,20 @@ it. (14.F's routine-trampoline alternative avoids loop-IL, but the 14.H samples 
   ASan+UBSan (both dispatch paths) + TSan green; 16 native goldens intact; all 4 CI gates green on
   the last code commit (`94f9cf5`, 14.F.1). **Continue ON THIS BRANCH/PR — do not open a new one.**
 - **Done & CI-green:** 14.A routines · 14.B duplex · 14.C delayed · 14.D broadcast · 14.E
-  shared/atomic (5 of 6) · **14.F.1** policy runtime (`teko_retry.c` + 6 KATs).
+  shared/atomic · **14.F.1** policy runtime (`teko_retry.c` + 6 KATs) · **14.G** await/wait
+  timespan waiters (commits `de41118` 14.G.1 ms-normalization + `dbc75f8` 14.G.2 waiters; all 4
+  gates green). Suite **196/196**.
+- **14.G DONE (decisions, for reference):** `wait <ts>;` = synchronous sleep (native
+  `teko_rt_sleep_ms` real nanosleep/Win Sleep; WASM `env.teko_sleep` host import). `await <ts>;`
+  = cooperative timed yield (native `teko_rt_await_ms` advances a logical clock + drains the run
+  queue; WASM `env.teko_await` records ms + `$teko_sched_run` drain). Opcodes `OP_WAIT` 0x59 /
+  `OP_AWAIT_FOR` 0x5A (single-byte, ms in $w0, in BOTH CSE invalidation sets). Timespan literals
+  normalize to canonical ms at compile time (`literal_canonical_value` in `frontend_interop.c`),
+  adopted in `lower_codec_value` so channel delay args accept `2s`/`500ms`/etc. **MVP caveat:**
+  native routines are run-to-completion → `await` is a cooperative "let others run" yield, not
+  real timer suspension (WASM Layer A mirrors it). Proofs `waiters.tks` native + WASM.
 - **Remaining (owner-agreed order):**
-  1. **14.G — `await`/`wait` timespan waiters** (build first; see "✚ NEW SCOPE → 14.G"). Lexer
-     already lexes `10ms` (Phase-12 unit) — add `await`/`wait` keywords + ms-normalization + the
-     sync sleep / async timed-yield runtimes.
+  1. ~~**14.G — `await`/`wait` timespan waiters**~~ ✅ DONE.
   2. **Control-flow foundation** (loops + branches in the frontend; see "✚ NEW SCOPE → foundation").
   3. **14.F surface** — `retry { } fallback { }` / `circuit` block grammar (see "▶ 14.F STATUS";
      easy once the foundation exists, or use the routine-trampoline) — makes the remaining keyword
