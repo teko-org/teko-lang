@@ -25,6 +25,7 @@
 #include "teko_object.h"
 #include "teko_vtable.h"
 #include "teko_array.h"
+#include "teko_iarray.h"
 #include "teko_convert.h"
 #include "teko_decimal.h"
 #include <stdint.h>
@@ -893,6 +894,29 @@ long teko_rt_array_set(long handle, long i, long value) {
 }
 long teko_rt_array_len(long handle) {
     return (long)teko_array_len((const TekoArray*)(intptr_t)handle);
+}
+
+// Phase 18 (18.E.2) — TYPED `i32[]` PACKED numeric array surface wrappers (OP_IARR_* lower to these).
+// Mirrors teko_rt_array_* EXACTLY; the ONLY difference is the cell type (PACKED int32_t — the SIMD
+// substrate). Values are i32-range ints carried in `long` (truncated to int32 on store). get/set are
+// CHECKED FAIL-LOUD: an out-of-range index aborts via teko_rt_die (the SAME exit-70 + stderr path the
+// array surface uses), NOT a defensive no-op.
+long teko_rt_iarray_new(long n) {
+    return (long)(intptr_t)teko_iarray_new((int)n);
+}
+long teko_rt_iarray_get(long handle, long i) {
+    int32_t v = 0;
+    if (!teko_iarray_get((const TekoIArray*)(intptr_t)handle, (int)i, &v))
+        teko_rt_die("iarray: index out of bounds");
+    return (long)v;
+}
+long teko_rt_iarray_set(long handle, long i, long value) {
+    if (!teko_iarray_set((TekoIArray*)(intptr_t)handle, (int)i, (int32_t)value))
+        teko_rt_die("iarray: index out of bounds");
+    return 0;
+}
+long teko_rt_iarray_len(long handle) {
+    return (long)teko_iarray_len((const TekoIArray*)(intptr_t)handle);
 }
 
 // Phase 17.F.3 — the 256-byte `decimal` VALUE-MODEL runtime wrappers. The opcode family

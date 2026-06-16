@@ -523,6 +523,54 @@ static int localarr_get(const char* n) {
     for (int i = 0; i < g_nlocalarr; i++) if (strcmp(g_localarr[i], n) == 0) return 1;
     return 0;
 }
+// Phase 18 (18.E.2): names of TYPED `i32[]` packed-array locals — a SEPARATE registry from g_localarr.
+// A typed-array local's $w0 value is its handle (reads as VT_INT) just like a plain array; tracked
+// here so `a[i]` read/write, `a.len` and `for x in a` resolve to the OP_IARR_* family (vs OP_ARR_* for
+// g_localarr). A name is in AT MOST ONE registry. Same set semantics (demote-on-reassign tombstone).
+static char g_localiarr[TEKO_MAX_LOCALCLS][96];
+static int  g_nlocaliarr;
+static void localiarr_reset(void) { g_nlocaliarr = 0; }
+static void localiarr_set(const char* n, int is_arr) {
+    for (int i = 0; i < g_nlocaliarr; i++)
+        if (strcmp(g_localiarr[i], n) == 0) {
+            if (!is_arr) { g_localiarr[i][0] = g_localiarr[i][1] = '\0'; } // demote (tombstone)
+            return;
+        }
+    if (is_arr && g_nlocaliarr < TEKO_MAX_LOCALCLS) {
+        strncpy(g_localiarr[g_nlocaliarr], n, 95); g_localiarr[g_nlocaliarr][95] = '\0';
+        g_nlocaliarr++;
+    }
+}
+static int localiarr_get(const char* n) {
+    if (!n || !n[0]) return 0;
+    for (int i = 0; i < g_nlocaliarr; i++) if (strcmp(g_localiarr[i], n) == 0) return 1;
+    return 0;
+}
+// Phase 18 (18.E.2): pick the array op family for a base name — the TYPED OP_IARR_* family if the base
+// is a typed `i32[]` local, else the plain OP_ARR_* family. The two registries are disjoint, so a base
+// in neither defaults to OP_ARR_* (callers gate on membership first).
+static OpCode arr_op_for(const char* base, OpCode op_arr) {
+    if (localiarr_get(base)) {
+        switch (op_arr) {
+            case OP_ARR_NEW: return OP_IARR_NEW;
+            case OP_ARR_GET: return OP_IARR_GET;
+            case OP_ARR_SET: return OP_IARR_SET;
+            case OP_ARR_LEN: return OP_IARR_LEN;
+            default: break;
+        }
+    }
+    return op_arr;
+}
+// Emit one array op (OP_ARR_* OR the OP_IARR_* sibling) via the correct emit helper so the right
+// uses_array/uses_iarray gate is set. `op` is already resolved by arr_op_for.
+static void emit_arr_op(BytecodeBuffer* b, OpCode op) {
+    if (op == OP_IARR_NEW || op == OP_IARR_GET || op == OP_IARR_SET || op == OP_IARR_LEN)
+        codegen_li_emit_iarray(b, op);
+    else
+        codegen_li_emit_array(b, op);
+}
+// Phase 18 (18.E.2): true if `n` is ANY array local (plain i64 or typed i32) — used by `for x in a`.
+static int localanyarr_get(const char* n) { return localarr_get(n) || localiarr_get(n); }
 // Phase 18 (18.A): set by eval_primary to describe the OPTIONALITY of the primary it just lowered,
 // so eval_expr_prec's Elvis (`??`) can recover the left operand's present flag:
 //   -1 = not optional (a plain value → treated as always-present);
@@ -537,6 +585,13 @@ static int g_last_init_is_null = 0;
 // lower_reassign remember an ARRAY-typed local (so a later `a[i]`/`a.len` resolves to OP_ARR_*).
 // Cleared at the top of lower_init_value before each initializer.
 static int g_last_init_is_array = 0;
+// Phase 18 (18.E.2): set by lower_let_stmt when a `: i32[]` annotation forces the `[…]` RHS to lower
+// as a TYPED i32 packed array (OP_IARR_*) — so the local is recorded in g_localiarr (not g_localarr).
+// A plain `[…]` without the annotation stays the i64 array (g_last_init_is_array path, byte-identical).
+static int g_force_iarray_literal = 0;
+// Phase 18 (18.E.2): set by lower_array_literal when it lowered a TYPED i32 packed array, so
+// lower_let_stmt records the local in g_localiarr (vs g_localarr). Cleared in lower_init_value.
+static int g_last_init_is_iarray = 0;
 
 // Phase 18 (18.C): `defer <stmt>;` — registration of a scope-closing statement, run in LIFO order at
 // scope exit. MVP scope = the `$main` body: each deferred statement's SOURCE is captured (rebuilt
@@ -834,6 +889,43 @@ static int lower_decimalsurf(BytecodeBuffer* b, Parser* p, const LowerCtx* ctx);
 // eval_primary can claim the `IDENTIFIER ?. …` form. Returns the member-result value-type and exposes
 // the chain's present flag (g_prim_present_slot) for a following Elvis `??`.
 static int lower_safe_nav(BytecodeBuffer* b, Parser* p, const LowerCtx* ctx); // fwd
+// Phase 15 (15.A): `obj.method(args)` STATIC method call as a VALUE — defined far below with the
+// class surface, but forward-declared here so the shared expression evaluators (eval_primary, the
+// codec-arg + extern-arg argument paths) can claim a method-call sub-expression and lower it to
+// OP_CALL_FUNC -> result in $w0. Without this, a method call in any expression position (an extern
+// argument `emit(p.m())`, a sub-expression `p.m() + 1`, an interpolation hole `"{p.m()}"`) fell
+// through to the bare-identifier branch, which emitted iconst 0 and orphaned the `()`.
+static int lower_member_call(BytecodeBuffer* b, Parser* p, const LowerCtx* ctx); // fwd
+// True iff the current token is a class-typed `obj.method(` call head (a dotted identifier whose
+// base is a known class-typed local and whose member is one of that class's methods, peek `(`). A
+// pure predicate (no token consumption) used to route such a head to lower_member_call.
+static int is_member_call_head(const Parser* p) {
+    if (!p || p->current_token.type != TOKEN_IDENTIFIER || p->peek_token.type != TOKEN_LPAREN) return 0;
+    char base[96], member[96];
+    if (!dotted_split(p->current_token.lexeme, base, member)) return 0;
+    int ci = localcls_get(base);
+    if (ci < 0) return 0;
+    return class_method_idx(ci, member) >= 0;
+}
+// Phase 15 (15.B): `g.method(args)` DYNAMIC trait dispatch as a VALUE — the ctx-only core of
+// lower_trait_dispatch (forward-declared; defined far below with the class surface). The arg paths
+// already position ctx->locals before evaluating, so no env_sync is needed here — the LowerEnv*
+// wrapper lower_trait_dispatch adds only that sync. Forward-declared so the shared evaluators
+// (eval_primary, the codec-arg + extern-arg paths) can claim a trait-dispatch sub-expression and
+// lower it to vtable_get + OP_CALL_FUNC -> result in $w0, exactly like the static-method fix.
+static int lower_trait_dispatch_ctx(BytecodeBuffer* b, Parser* p, const LowerCtx* ctx); // fwd
+// True iff the current token is a fat trait-typed `g.method(` dispatch head (a dotted identifier
+// whose base is a known trait-typed local and whose member is one of that trait's methods, peek
+// `(`). A pure predicate (no consumption); mutually exclusive with is_member_call_head (a base is
+// either a class-typed local or a trait-typed local, never both).
+static int is_trait_dispatch_head(const Parser* p) {
+    if (!p || p->current_token.type != TOKEN_IDENTIFIER || p->peek_token.type != TOKEN_LPAREN) return 0;
+    char base[96], member[96];
+    if (!dotted_split(p->current_token.lexeme, base, member)) return 0;
+    int tl = traitlocal_find(base);
+    if (tl < 0) return 0;
+    return trait_method_idx(g_traitlocal[tl].trait, member) >= 0;
+}
 // Phase 16 (16.D): coerce the operand VALUE in $w0 (per its value-type `vt`) to a string pointer in
 // $w0 — int via to_string (id 49), string unchanged, object via its to_string / synthesized default.
 static void coerce_to_string_in_w0(BytecodeBuffer* b, const LowerCtx* ctx, int vt); // fwd (16.D)
@@ -865,11 +957,11 @@ static int lower_member_read(BytecodeBuffer* b, Parser* p, const LowerCtx* ctx) 
     if (!dotted_split(p->current_token.lexeme, base, member)) return 0;
     // Phase 18 (18.E.1): `a.len` on an array local -> OP_ARR_LEN (O(1) metadata) -> $w0. Claimed
     // BEFORE the class-field path (an array local is never a class local, so no ambiguity).
-    if (localarr_get(base) && strcmp(member, "len") == 0) {
+    if (localanyarr_get(base) && strcmp(member, "len") == 0) {
         int hslot = ctx ? bind_lookup(ctx->locals, ctx->nlocals, base) : -1;
         if (hslot < 0) return 0;
         codegen_li_emit_load_local(b, hslot);  // $w0 = handle
-        codegen_li_emit_array(b, OP_ARR_LEN);  // $w0 = length
+        emit_arr_op(b, arr_op_for(base, OP_ARR_LEN));  // $w0 = length (i64 OR typed-i32 family)
         fe_advance(p);
         return 1;
     }
@@ -894,7 +986,13 @@ static int lower_member_read(BytecodeBuffer* b, Parser* p, const LowerCtx* ctx) 
 // Current token is the `[`. Consumes through the matching `]`. Returns the handle in $w0.
 // (eval_expr_prec is forward-declared above; it is the element/index evaluator.)
 static void lower_array_literal(BytecodeBuffer* b, Parser* p, const LowerCtx* ctx, TempAlloc* ta) {
-    g_last_init_is_array = 1; // mark so a `let a = [...]` binding records the array local
+    // Phase 18 (18.E.2): a `: i32[]` annotation (g_force_iarray_literal, set by lower_let_stmt) makes
+    // this literal a TYPED i32 PACKED array (OP_IARR_*); otherwise it is the plain i64 array (OP_ARR_*,
+    // byte-identical to 18.E.1). The flag is consumed (one-shot) so nested literals don't inherit it.
+    int typed = g_force_iarray_literal; g_force_iarray_literal = 0;
+    OpCode op_new = typed ? OP_IARR_NEW : OP_ARR_NEW;
+    OpCode op_set = typed ? OP_IARR_SET : OP_ARR_SET;
+    if (typed) g_last_init_is_iarray = 1; else g_last_init_is_array = 1; // mark for the let binding
     fe_advance(p); // consume '['
     // Pre-scan to count the elements (ARR_NEW needs the exact length FIRST). The real parser shares a
     // heap Lexer* with everything else, so we snapshot the lexer STATE (source/cursor/line are plain
@@ -918,7 +1016,7 @@ static void lower_array_literal(BytecodeBuffer* b, Parser* p, const LowerCtx* ct
     if (seen) n++; // element_count = top-level commas + 1 when non-empty
     // ARR_NEW(n) -> handle; park it in a temp (it is reloaded between every element SET).
     codegen_li_emit_iconst(b, n);
-    codegen_li_emit_array(b, OP_ARR_NEW); // $w0 = handle
+    emit_arr_op(b, op_new); // $w0 = handle (i64 OR typed-i32 family)
     int ht = ta->next_temp++; if (ta->next_temp > ta->hw) ta->hw = ta->next_temp;
     codegen_li_emit_store_local(b, ht);   // temp = handle
     int i = 0;
@@ -931,7 +1029,7 @@ static void lower_array_literal(BytecodeBuffer* b, Parser* p, const LowerCtx* ct
         codegen_li_emit_load_local(b, ht); codegen_li_emit_setarg(b, 0); // $a0 = handle
         codegen_li_emit_iconst(b, i);      codegen_li_emit_setarg(b, 1); // $a1 = index
         codegen_li_emit_load_local(b, vt); // $w0 = element value
-        codegen_li_emit_array(b, OP_ARR_SET);
+        emit_arr_op(b, op_set);
         ta->next_temp--;                   // free the element scratch
         i++;
     }
@@ -945,8 +1043,9 @@ static void lower_array_literal(BytecodeBuffer* b, Parser* p, const LowerCtx* ct
 // Consumes `a [ <idx> ]`. Returns 1 if consumed. Out-of-range traps fail-loud in the runtime.
 static int lower_array_index_read(BytecodeBuffer* b, Parser* p, const LowerCtx* ctx, TempAlloc* ta) {
     if (p->current_token.type != TOKEN_IDENTIFIER || p->peek_token.type != TOKEN_LBRACKET) return 0;
-    if (!localarr_get(p->current_token.lexeme)) return 0;
-    int hslot = ctx ? bind_lookup(ctx->locals, ctx->nlocals, p->current_token.lexeme) : -1;
+    if (!localanyarr_get(p->current_token.lexeme)) return 0;
+    char base[96]; strncpy(base, p->current_token.lexeme, 95); base[95] = '\0';
+    int hslot = ctx ? bind_lookup(ctx->locals, ctx->nlocals, base) : -1;
     if (hslot < 0) return 0;
     fe_advance(p); // consume the array name
     fe_advance(p); // consume '['
@@ -954,7 +1053,7 @@ static int lower_array_index_read(BytecodeBuffer* b, Parser* p, const LowerCtx* 
     codegen_li_emit_setarg(b, 0);          // $a0 = handle
     eval_expr_prec(b, p, ctx, 1, ta);      // index -> $w0
     if (p->current_token.type == TOKEN_RBRACKET) fe_advance(p);
-    codegen_li_emit_array(b, OP_ARR_GET);  // $w0 = element value
+    emit_arr_op(b, arr_op_for(base, OP_ARR_GET));  // $w0 = element value (i64 OR typed-i32 family)
     return 1;
 }
 
@@ -1039,6 +1138,17 @@ static int eval_primary(BytecodeBuffer* b, Parser* p, const LowerCtx* ctx, TempA
         int vt = eval_expr_prec(b, p, ctx, 1, ta);
         if (p->current_token.type == TOKEN_RPAREN) fe_advance(p);
         return vt;
+    } else if (is_member_call_head(p) && lower_member_call(b, p, ctx)) {
+        // Phase 15 (15.A): a `obj.method(args)` static method call as a sub-expression -> OP_CALL_FUNC.
+        // Claimed BEFORE the field read (peek `(` disambiguates a call from a `obj.field` read) so a
+        // method call works in any expression position (extern arg, arithmetic operand, interp hole).
+        // The result is a register-width integer cell in $w0 (object results are ints in this model).
+        return TEKO_VT_INT;
+    } else if (is_trait_dispatch_head(p) && lower_trait_dispatch_ctx(b, p, ctx)) {
+        // Phase 15 (15.B): a `g.method(args)` DYNAMIC trait dispatch as a sub-expression -> vtable_get
+        // + OP_CALL_FUNC. Same argument/sub-expression reach as the static case; the receiver is a fat
+        // trait-typed local (mutually exclusive with the class-local member-call head above).
+        return TEKO_VT_INT;
     } else if (lower_member_read(b, p, ctx)) {
         // `obj.field` read consumed (e.g. inside `self.x + self.y`). Field cells are integers here.
         return TEKO_VT_INT;
@@ -1535,6 +1645,12 @@ static void lower_codec_value(BytecodeBuffer* b, Parser* p, const LowerCtx* ctx)
         lower_base_codec(b, p, ctx); // nested: base64.decode(base64.encode(x))
     } else if (lower_array_index_read(b, p, ctx, ctx ? ctx->ta : NULL)) {
         // Phase 18 (18.E.1): an array index READ `a[i]` as a codec/call argument -> OP_ARR_GET.
+    } else if (is_member_call_head(p) && lower_member_call(b, p, ctx)) {
+        // Phase 15 (15.A): a `obj.method(args)` static method call as a codec / nested-call argument
+        // -> OP_CALL_FUNC -> result in $w0 (claimed before the field read; peek `(` disambiguates).
+    } else if (is_trait_dispatch_head(p) && lower_trait_dispatch_ctx(b, p, ctx)) {
+        // Phase 15 (15.B): a `g.method(args)` DYNAMIC trait dispatch as a codec / nested-call argument
+        // -> vtable_get + OP_CALL_FUNC -> result in $w0 (receiver is a fat trait-typed local).
     } else if (lower_member_read(b, p, ctx)) {
         // Phase 18 (18.E.1): an array `.len` (or a class field) as a codec/call argument.
     } else if (p->current_token.type == TOKEN_IDENTIFIER) {
@@ -1912,6 +2028,7 @@ static void lower_init_value(BytecodeBuffer* b, Parser* p, LowerEnv* env) {
     g_last_init_vt = TEKO_VT_INT; // Phase 16 (16.B): default; the string-yielding cases set VT_STR
     g_last_init_is_null = 0;      // Phase 18 (18.A): set iff the initializer is the `null` literal
     g_last_init_is_array = 0;     // Phase 18 (18.E.1): set iff the initializer is an array literal
+    g_last_init_is_iarray = 0;    // Phase 18 (18.E.2): set iff it is a TYPED i32 packed-array literal
     if ((p->current_token.type == TOKEN_LIT_STR || p->current_token.type == TOKEN_STRING_LIT) &&
         p12_tok_prec(p->peek_token.type) == 0 && !strlit_is_interp(p->current_token.lexeme)) {
         // A LONE, NON-interpolated string literal. `"a" + x` and `"{x}"` fall through to
@@ -1924,10 +2041,6 @@ static void lower_init_value(BytecodeBuffer* b, Parser* p, LowerEnv* env) {
         // Phase 15 (15.A/15.C): `ClassName(...)` / `T(...)` / `Box<Arg>(...)` instantiation ->
         // OP_OBJ_NEW -> handle in $w0 (sets g_last_inst_class for the let binding).
         lower_instantiation(b, p);
-    } else if (lower_trait_dispatch(b, p, env)) {
-        // Phase 15 (15.B): `g.method(args)` dynamic dispatch as an RHS -> result in $w0.
-    } else if (lower_member_call(b, p, ctx)) {
-        // Phase 15 (15.A): `obj.method(args)` as an RHS -> OP_CALL_FUNC -> result in $w0.
     } else if (p->current_token.type == TOKEN_MACRO_IDENT && is_dom_macro(p->current_token.lexeme) &&
                p->peek_token.type == TOKEN_LPAREN) {
         lower_intrinsic_call(b, p, ctx);
@@ -1990,6 +2103,11 @@ static void lower_let_stmt(BytecodeBuffer* b, Parser* p, LowerEnv* env) {
     // carries a hidden present companion (emitted below). The `?` is consumed before the type name.
     char annot[96]; annot[0] = '\0';
     int is_optional = 0;
+    // Phase 18 (18.E.2): a `: i32[]` annotation forces the `[…]` RHS to lower as a TYPED i32 PACKED
+    // array (OP_IARR_*). The annot capture grabs the type name (`i32`); we then detect the trailing
+    // `[` `]` during the skip-to-`=` walk. (A plain `[…]` with no `i32[]` annotation stays the i64
+    // array — byte-identical to 18.E.1.)
+    int is_iarray_annot = 0;
     if (p->current_token.type == TOKEN_COLON) {
         fe_advance(p);
         if (p->current_token.type == TOKEN_QUESTION) { is_optional = 1; fe_advance(p); } // `?T`
@@ -1997,8 +2115,13 @@ static void lower_let_stmt(BytecodeBuffer* b, Parser* p, LowerEnv* env) {
             strncpy(annot, p->current_token.lexeme, sizeof(annot) - 1); annot[sizeof(annot) - 1] = '\0';
         }
         while (p->current_token.type != TOKEN_ASSIGN && p->current_token.type != TOKEN_QUICK_ASSIGN &&
-               p->current_token.type != TOKEN_SEMICOLON && p->current_token.type != TOKEN_EOF)
+               p->current_token.type != TOKEN_SEMICOLON && p->current_token.type != TOKEN_EOF) {
+            // `i32` immediately followed by `[` `]` is the typed-array annotation `i32[]`.
+            if (p->current_token.type == TOKEN_LBRACKET && p->peek_token.type == TOKEN_RBRACKET &&
+                strcmp(annot, "i32") == 0)
+                is_iarray_annot = 1;
             fe_advance(p);
+        }
     }
     if (p->current_token.type == TOKEN_ASSIGN || p->current_token.type == TOKEN_QUICK_ASSIGN)
         fe_advance(p);
@@ -2014,7 +2137,11 @@ static void lower_let_stmt(BytecodeBuffer* b, Parser* p, LowerEnv* env) {
     int annot_trait = (annot[0] && trait_find(annot) >= 0) ? trait_find(annot) : -1;
     g_last_inst_class[0] = '\0';
     env_sync(env);
+    // Phase 18 (18.E.2): a `: i32[]` annotation makes the `[…]` literal lower as a TYPED i32 packed
+    // array (lower_array_literal consumes this one-shot flag).
+    g_force_iarray_literal = is_iarray_annot;
     lower_init_value(b, p, env);
+    g_force_iarray_literal = 0;
     int rhs_class = g_last_inst_class[0] ? class_find(g_last_inst_class) : rhs_local_class;
     // Phase 17 (17.A / 17.F.3): a float initializer lives in $f0 (FSTORE_LOCAL), a decimal in the
     // 256-byte $d0 slot (DSTORE_LOCAL); both record the local so `lname` reads back with the right
@@ -2048,6 +2175,10 @@ static void lower_let_stmt(BytecodeBuffer* b, Parser* p, LowerEnv* env) {
     // Phase 18 (18.E.1): remember an array-typed local (handle in $w0, VT_INT) so a later
     // `lname[i]` / `lname.len` resolves to OP_ARR_*. The handle was STORE_LOCAL'd above (VT_INT).
     localarr_set(lname, g_last_init_is_array);
+    // Phase 18 (18.E.2): remember a TYPED i32 packed-array local so a later `lname[i]`/`lname.len`/
+    // `for x in lname` resolves to OP_IARR_* (disjoint from g_localarr). The two are mutually
+    // exclusive (lower_array_literal sets exactly one of g_last_init_is_array/_is_iarray).
+    localiarr_set(lname, g_last_init_is_iarray);
     // Phase 18 (18.A): an OPTIONAL local (`let x: ?T = …`) carries a hidden present companion slot
     // `x#opt` set to 0 when the initializer is `null`, else 1 (compile-time constant — runtime-null
     // propagation arrives with the `?.` safe-navigation in 18.B). The payload was stored above; the
@@ -2127,7 +2258,13 @@ static int try_lower_call_arg_expr(BytecodeBuffer* b, Parser* p, const LowerCtx*
                      bind_lookup(locals, nlocals, p->current_token.lexeme) >= 0));
     // Phase 16.C: a bare interpolated literal `"{n}"` (no trailing operator) is also an expression.
     int is_interp = is_str && strlit_is_interp(p->current_token.lexeme);
-    if (!is_paren && !is_interp && !(is_prim && p12_tok_prec(p->peek_token.type) > 0)) return 0;
+    // Phase 15 (15.A/15.B): a `obj.method(args)` static method call or a `g.method(args)` dynamic
+    // trait dispatch is an expression argument too (both were previously skipped, so `emit(p.m())` /
+    // `emit(g.m())` lowered the call to nothing and passed 0). eval_expr_prec -> eval_primary now
+    // claims either; route through here so it is spilled to a temp like any expression arg.
+    int is_member_call = is_member_call_head(p) || is_trait_dispatch_head(p);
+    if (!is_paren && !is_interp && !is_member_call &&
+        !(is_prim && p12_tok_prec(p->peek_token.type) > 0)) return 0;
     TempAlloc* ta = ctx->ta;
     eval_expr_prec(b, p, ctx, 1, ta);                 // expression → $w0 (string ptr or int)
     int t = ta->next_temp++;
@@ -2358,8 +2495,9 @@ static int lower_member_write(BytecodeBuffer* b, Parser* p, LowerEnv* env) {
 // Returns 1 if consumed, 0 if `a` is not an array local (so the caller tries other statement forms).
 static int lower_array_index_write(BytecodeBuffer* b, Parser* p, LowerEnv* env) {
     if (p->current_token.type != TOKEN_IDENTIFIER || p->peek_token.type != TOKEN_LBRACKET) return 0;
-    if (!localarr_get(p->current_token.lexeme)) return 0;
-    int hslot = bind_lookup(*env->locals, *env->nlocals, p->current_token.lexeme);
+    if (!localanyarr_get(p->current_token.lexeme)) return 0;
+    char base[96]; strncpy(base, p->current_token.lexeme, 95); base[95] = '\0';
+    int hslot = bind_lookup(*env->locals, *env->nlocals, base);
     if (hslot < 0) return 0;
     fe_advance(p); // consume the array name
     fe_advance(p); // consume '['
@@ -2383,7 +2521,7 @@ static int lower_array_index_write(BytecodeBuffer* b, Parser* p, LowerEnv* env) 
     codegen_li_emit_load_local(b, hslot); codegen_li_emit_setarg(b, 0); // $a0 = handle
     codegen_li_emit_load_local(b, it);    codegen_li_emit_setarg(b, 1); // $a1 = index
     codegen_li_emit_load_local(b, vt);                  // $w0 = value
-    codegen_li_emit_array(b, OP_ARR_SET);
+    emit_arr_op(b, arr_op_for(base, OP_ARR_SET));       // i64 OR typed-i32 family
     if (p->current_token.type == TOKEN_SEMICOLON) fe_advance(p);
     return 1;
 }
@@ -2396,7 +2534,11 @@ static int lower_array_index_write(BytecodeBuffer* b, Parser* p, LowerEnv* env) 
 // methods), 0 otherwise (so a concrete receiver falls through to 15.A static dispatch). The slot is
 // parked in a temp because OP_CALL_FUNC needs $w0=slot while its args occupy $a0.. (and VTABLE_GET
 // itself clobbers $a0/$w0). Result in $w0.
-static int lower_trait_dispatch(BytecodeBuffer* b, Parser* p, LowerEnv* env) {
+// The ctx-only core: assumes ctx->locals is already positioned (the LowerEnv* wrapper below syncs
+// first; the shared evaluators sync before they reach a primary). Reachable from eval_primary /
+// lower_codec_value / try_lower_call_arg_expr so a trait dispatch works in argument / sub-expression
+// position too — not only as a let-RHS or a discarded statement.
+static int lower_trait_dispatch_ctx(BytecodeBuffer* b, Parser* p, const LowerCtx* ctx) {
     if (p->current_token.type != TOKEN_IDENTIFIER || p->peek_token.type != TOKEN_LPAREN) return 0;
     char base[96], member[96];
     if (!dotted_split(p->current_token.lexeme, base, member)) return 0;
@@ -2409,27 +2551,33 @@ static int lower_trait_dispatch(BytecodeBuffer* b, Parser* p, LowerEnv* env) {
     int tid_slot = g_traitlocal[tl].tid_slot;
     fe_advance(p); // consume "g.method"
     if (p->current_token.type == TOKEN_LPAREN) fe_advance(p);
-    env_sync(env);
     // slot = vtable_get(type_id, method_id)  (type_id read at RUNTIME from the fat local)
     codegen_li_emit_load_local(b, tid_slot); codegen_li_emit_setarg(b, 0); // $a0 = type_id
     codegen_li_emit_iconst(b, mid);                                        // $w0 = method_id
     codegen_li_emit_vtable(b, OP_VTABLE_GET);                              // $w0 = routine slot
-    int slot_tmp = env->ctx->ta->next_temp++;
-    if (env->ctx->ta->next_temp > env->ctx->ta->hw) env->ctx->ta->hw = env->ctx->ta->next_temp;
+    int slot_tmp = ctx->ta->next_temp++;
+    if (ctx->ta->next_temp > ctx->ta->hw) ctx->ta->hw = ctx->ta->next_temp;
     codegen_li_emit_store_local(b, slot_tmp);                             // park the slot
     // stage self + explicit args, then call the resolved slot
     codegen_li_emit_load_local(b, handle_slot); codegen_li_emit_setarg(b, 0); // $a0 = self
     int argc = 1;
     while (p->current_token.type != TOKEN_RPAREN && p->current_token.type != TOKEN_EOF && argc < 8) {
         if (p->current_token.type == TOKEN_COMMA) { fe_advance(p); continue; }
-        lower_codec_value(b, p, env->ctx);   // arg -> $w0 (int / named local)
+        lower_codec_value(b, p, ctx);        // arg -> $w0 (int / named local)
         codegen_li_emit_setarg(b, argc); argc++;
     }
     if (p->current_token.type == TOKEN_RPAREN) fe_advance(p);
     codegen_li_emit_load_local(b, slot_tmp); // $w0 = slot
     codegen_li_emit_call_func(b, argc);      // $w0 = method result (dynamic dispatch)
-    env->ctx->ta->next_temp--;               // free the parked-slot temp
+    ctx->ta->next_temp--;                    // free the parked-slot temp
     return 1;
+}
+static int lower_trait_dispatch(BytecodeBuffer* b, Parser* p, LowerEnv* env) {
+    // The LowerEnv* entry point (let-RHS / statement): position ctx->locals, then delegate to the
+    // ctx-only core. Cheaply pre-checked so a non-trait head skips the env_sync and leaves `*p` intact.
+    if (p->current_token.type != TOKEN_IDENTIFIER || p->peek_token.type != TOKEN_LPAREN) return 0;
+    env_sync(env);
+    return lower_trait_dispatch_ctx(b, p, env->ctx);
 }
 
 static int lower_member_stmt(BytecodeBuffer* b, Parser* p, LowerEnv* env) {
@@ -2464,6 +2612,78 @@ static void lower_while(BytecodeBuffer* b, Parser* p, LowerEnv* env) {
     codegen_li_emit_cf(b, OP_LOOP_END);
 }
 
+// Phase 18 (18.E.2): `for NAME in ARR { body }` — index iteration over ANY array (plain i64 OR typed
+// i32). Reuses the control-flow foundation: a hidden index local walks `[0, ARR.len)`, binding NAME to
+// `ARR[i]` each pass, then the body lowers like any block.
+//   __for_i = 0
+//   LOOP_BEGIN
+//     $w0 = (__for_i < ARR.len)   ; BREAK_IF_FALSE
+//     NAME = ARR[__for_i]         ; (the right GET op family for ARR)
+//     <body>
+//     __for_i = __for_i + 1
+//   LOOP_END
+// `in` is a CONTEXTUAL keyword (there is no TOKEN_IN): an IDENTIFIER whose lexeme is "in".
+static void lower_for(BytecodeBuffer* b, Parser* p, LowerEnv* env) {
+    fe_advance(p); // 'for'
+    char vname[96]; vname[0] = '\0';
+    if (p->current_token.type == TOKEN_IDENTIFIER) {
+        strncpy(vname, p->current_token.lexeme, sizeof(vname) - 1); vname[sizeof(vname) - 1] = '\0';
+        fe_advance(p);
+    }
+    // Contextual `in`.
+    if (p->current_token.type == TOKEN_IDENTIFIER && strcmp(p->current_token.lexeme, "in") == 0)
+        fe_advance(p);
+    // Array base name — resolve its handle slot + op family (i64 vs typed-i32).
+    char aname[96]; aname[0] = '\0';
+    if (p->current_token.type == TOKEN_IDENTIFIER) {
+        strncpy(aname, p->current_token.lexeme, sizeof(aname) - 1); aname[sizeof(aname) - 1] = '\0';
+        fe_advance(p);
+    }
+    int hslot = bind_lookup(*env->locals, *env->nlocals, aname);
+    int is_arr = localanyarr_get(aname) && hslot >= 0;
+    OpCode op_get = arr_op_for(aname, OP_ARR_GET);
+    OpCode op_len = arr_op_for(aname, OP_ARR_LEN);
+    // Hidden index local + the loop var local (a plain int local the body reads). Each iteration's
+    // NAME = ARR[__for_i] is stored into the loop var's slot.
+    static int g_for_seq = 0;
+    char inm[120]; snprintf(inm, sizeof(inm), "__for_i_%d", g_for_seq); g_for_seq++;
+    int islot = env_alloc_local(env, inm);
+    int vslot = bind_lookup(*env->locals, *env->nlocals, vname);
+    if (vslot < 0) vslot = env_alloc_local(env, vname);
+    // __for_i = 0
+    codegen_li_emit_iconst(b, 0);
+    codegen_li_emit_store_local(b, islot);
+    codegen_li_emit_cf(b, OP_LOOP_BEGIN);
+    if (is_arr) {
+        // $w0 = (__for_i < ARR.len): len -> $w1, __for_i -> $w0, OP_LT ($w0 = $w0 < $w1).
+        codegen_li_emit_load_local(b, hslot);   // $w0 = handle
+        emit_arr_op(b, op_len);                 // $w0 = len
+        codegen_li_emit_store(b);               // $w1 = len
+        codegen_li_emit_load_local(b, islot);   // $w0 = __for_i
+        codegen_li_emit_binop(b, OP_LT);        // $w0 = (__for_i < len)
+    } else {
+        // Not an array (a well-typed program never hits this) — never enter the loop.
+        codegen_li_emit_iconst(b, 0);
+    }
+    codegen_li_emit_cf(b, OP_BREAK_IF_FALSE);
+    if (is_arr) {
+        // NAME = ARR[__for_i]
+        codegen_li_emit_load_local(b, hslot);   // $w0 = handle
+        codegen_li_emit_setarg(b, 0);           // $a0 = handle
+        codegen_li_emit_load_local(b, islot);   // $w0 = __for_i (index)
+        emit_arr_op(b, op_get);                 // $w0 = element
+        codegen_li_emit_store_local(b, vslot);  // NAME = element
+    }
+    lower_block(b, p, env);                      // body
+    // __for_i = __for_i + 1  (__for_i -> $w1, 1 -> $w0, OP_ADD)
+    codegen_li_emit_load_local(b, islot);
+    codegen_li_emit_store(b);                    // $w1 = __for_i
+    codegen_li_emit_iconst(b, 1);                // $w0 = 1
+    codegen_li_emit_binop(b, OP_ADD);            // $w0 = __for_i + 1
+    codegen_li_emit_store_local(b, islot);
+    codegen_li_emit_cf(b, OP_LOOP_END);
+}
+
 // `loop { body }` — an infinite loop exited only by `break` (LOOP_BEGIN; body; LOOP_END).
 static void lower_loop(BytecodeBuffer* b, Parser* p, LowerEnv* env) {
     fe_advance(p); // 'loop'
@@ -2492,6 +2712,8 @@ static void lower_one_stmt(BytecodeBuffer* b, Parser* p, LowerEnv* env) {
         lower_let_stmt(b, p, env);
     } else if (p->current_token.type == TOKEN_WHILE) {
         lower_while(b, p, env);
+    } else if (p->current_token.type == TOKEN_FOR) {
+        lower_for(b, p, env);                     // Phase 18 (18.E.2): for NAME in ARR { }
     } else if (p->current_token.type == TOKEN_LOOP) {
         lower_loop(b, p, env);
     } else if (p->current_token.type == TOKEN_IF) {
@@ -3326,7 +3548,7 @@ static void emit_class_body(Parser* p, BytecodeBuffer* buffer, int ci,
         renv.locals = &rlocals; renv.nlocals = &rnlocals; renv.caplocals = &rcaplocals;
         renv.binds = &binds; renv.nb = &nb; renv.ctx = &ctx;
 
-        localcls_reset(); localstr_reset(); localflt_reset(); localdec_reset(); localopt_reset(); localarr_reset(); // method scope: self (+ any objects it instantiates) are class-typed
+        localcls_reset(); localstr_reset(); localflt_reset(); localdec_reset(); localopt_reset(); localarr_reset(); localiarr_reset(); // method scope: self (+ any objects it instantiates) are class-typed
         traitlocal_reset(); // method scope: trait-typed locals don't leak across method bodies
         for (int pi = 0; pi < nparams; pi++) {
             int ps = env_alloc_local(&renv, params[pi]);
@@ -3381,7 +3603,7 @@ static void emit_method_routines(const char* source, BytecodeBuffer* buffer,
         if (p.current_token.type == TOKEN_LBRACE) fe_advance(&p);
         emit_class_body(&p, buffer, ci, fns, nfns, binds, nb, ta);
     }
-    localcls_reset(); localstr_reset(); localflt_reset(); localdec_reset(); localopt_reset(); localarr_reset();
+    localcls_reset(); localstr_reset(); localflt_reset(); localdec_reset(); localopt_reset(); localarr_reset(); localiarr_reset();
 }
 
 // Phase 15.C: emit each MONOMORPHIZED instance's methods. For each `Tmpl$Arg` concrete instance, set
@@ -3413,7 +3635,7 @@ static void emit_mono_routines(const char* source, BytecodeBuffer* buffer,
         }
         g_subst_param[0] = '\0'; g_subst_arg[0] = '\0';
     }
-    localcls_reset(); localstr_reset(); localflt_reset(); localdec_reset(); localopt_reset(); localarr_reset();
+    localcls_reset(); localstr_reset(); localflt_reset(); localdec_reset(); localopt_reset(); localarr_reset(); localiarr_reset();
 }
 
 int teko_compile_interop(const char* source, BytecodeBuffer* buffer) {
@@ -3445,7 +3667,7 @@ int teko_compile_interop(const char* source, BytecodeBuffer* buffer) {
     collect_events(source, fns, nfns); // Phase 15.D: events + their static subscriptions
     collect_classes(source, nfns);
     check_oop_collisions(); // ambiguous trait composition -> g_oop_error (compile failure below)
-    localcls_reset(); localstr_reset(); localflt_reset(); localdec_reset(); localopt_reset(); localarr_reset();
+    localcls_reset(); localstr_reset(); localflt_reset(); localdec_reset(); localopt_reset(); localarr_reset(); localiarr_reset();
     if (g_oop_error) return 1; // do not emit a module with an unresolved OOP compile error
 
     // Phase 12: named local variables ($v0..) declared with `let`/`mut` at top level.
@@ -3645,9 +3867,9 @@ int teko_compile_interop(const char* source, BytecodeBuffer* buffer) {
             skip_class_decl(&parser);
         } else if (parser.current_token.type == TOKEN_IDENTIFIER &&
                    parser.peek_token.type == TOKEN_LBRACKET &&
-                   localarr_get(parser.current_token.lexeme) &&
+                   localanyarr_get(parser.current_token.lexeme) &&
                    lower_array_index_write(buffer, &parser, &top_env)) {
-            // Phase 18 (18.E.1): top-level `a[i] = expr;` index write on an array local.
+            // Phase 18 (18.E.1/18.E.2): top-level `a[i] = expr;` index write on an i64 OR typed-i32 array.
         } else if (lower_member_stmt(buffer, &parser, &top_env)) {
             // Phase 15 (15.A): top-level `obj.field = expr;` / `obj.method(args);`.
         } else if (parser.current_token.type == TOKEN_FN) {
@@ -3693,6 +3915,8 @@ int teko_compile_interop(const char* source, BytecodeBuffer* buffer) {
                              parser.current_token.type == TOKEN_AWAIT);
         } else if (parser.current_token.type == TOKEN_WHILE) {
             lower_while(buffer, &parser, &top_env);   // control-flow foundation
+        } else if (parser.current_token.type == TOKEN_FOR) {
+            lower_for(buffer, &parser, &top_env);     // Phase 18 (18.E.2): for NAME in ARR { }
         } else if (parser.current_token.type == TOKEN_LOOP) {
             lower_loop(buffer, &parser, &top_env);
         } else if (parser.current_token.type == TOKEN_IF) {

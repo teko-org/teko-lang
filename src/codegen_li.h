@@ -281,6 +281,16 @@ typedef enum {
     OP_ARR_SET = 0x99, // arr_set(handle, idx, value) -> 0  (fail-loud on OOB)
     OP_ARR_LEN = 0x9A, // arr_len(handle) -> length (O(1) metadata)
 
+    // Phase 18 (18.E.2): TYPED `i32[]` PACKED numeric array ops — a SEPARATE collection from OP_ARR_*
+    // (cells are PACKED int32, the SIMD substrate). Identical runtime-call family + ABI; lower to
+    // teko_rt_iarray_* (native) / the wasm32 reactor import. get/set are CHECKED FAIL-LOUD on an
+    // out-of-range index. Gated on uses_iarray so iarray-free output (incl. the 16 freestanding
+    // goldens) stays byte-identical.
+    OP_IARR_NEW = 0x9B, // iarray_new(n) -> handle (n zero-initialized packed i32 cells)
+    OP_IARR_GET = 0x9C, // iarray_get(handle, idx) -> value  (fail-loud on OOB)
+    OP_IARR_SET = 0x9D, // iarray_set(handle, idx, value) -> 0  (fail-loud on OOB)
+    OP_IARR_LEN = 0x9E, // iarray_len(handle) -> length (O(1) metadata)
+
     // Control Flow and Branches
     OP_JMP = 0x20,
     OP_JMP_IF_FALSE = 0x21,
@@ -386,6 +396,10 @@ typedef struct {
     // wiring as OP_OBJ_*). Array-free programs (incl. the 16 freestanding goldens) stay
     // byte-identical.
     int uses_array;
+    // Phase 18 (18.E.2): 1 if the program uses a TYPED `i32[]` packed-array op (OP_IARR_*). Native
+    // links teko_rt_iarray_*; WASM imports them from the runtime reactor + shares linear memory (same
+    // wiring as OP_ARR_*). iarray-free programs (incl. the 16 freestanding goldens) stay byte-identical.
+    int uses_iarray;
     // Phase 17 (17.A): the float-constant pool — f64 bit patterns indexed by OP_FCONST's 4-byte
     // arg. Mirrors the string pool (codegen_li_add_float_constant dedups by bit-equality). Threaded
     // to the backend via teko_metal_set_floats. `uses_float` is 1 once any float opcode is emitted,
@@ -467,6 +481,8 @@ void codegen_li_emit_retry(BytecodeBuffer* buffer, OpCode op);
 void codegen_li_emit_object(BytecodeBuffer* buffer, OpCode op);
 // Phase 18 (18.E.1): emit a fixed-size array op (one of OP_ARR_*); sets buffer->uses_array.
 void codegen_li_emit_array(BytecodeBuffer* buffer, OpCode op);
+// Phase 18 (18.E.2): emit a typed `i32[]` packed-array op (one of OP_IARR_*); sets buffer->uses_iarray.
+void codegen_li_emit_iarray(BytecodeBuffer* buffer, OpCode op);
 // Phase 15 (15.A): synchronously call the routine in $w0 with `argc` args staged in $a0..$a(argc-1)
 // (OP_CALL_FUNC); the result lands in $w0. Sets buffer->uses_spawn (routine table + scheduler).
 void codegen_li_emit_call_func(BytecodeBuffer* buffer, int argc);

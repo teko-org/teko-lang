@@ -34,6 +34,7 @@ MetalContext* teko_metal_create(const char* output_asm_path, TekoTarget target) 
     ctx->wasm_emit_object = 0;
     ctx->wasm_emit_vtable = 0;
     ctx->wasm_emit_array = 0;
+    ctx->wasm_emit_iarray = 0;
     ctx->wasm_emit_delayed = 0;
     ctx->wasm_emit_bcast = 0;
     ctx->wasm_emit_shared = 0;
@@ -148,6 +149,11 @@ void teko_metal_set_emit_vtable(MetalContext* ctx, int enabled) {
 void teko_metal_set_emit_array(MetalContext* ctx, int enabled) {
     if (!ctx) return;
     ctx->wasm_emit_array = enabled ? 1 : 0;
+}
+
+void teko_metal_set_emit_iarray(MetalContext* ctx, int enabled) {
+    if (!ctx) return;
+    ctx->wasm_emit_iarray = enabled ? 1 : 0;
 }
 
 void teko_metal_set_hosted(MetalContext* ctx, int enabled) {
@@ -399,6 +405,9 @@ static void process_linear_il_bytes(MetalContext* ctx, const unsigned char* byte
                      // Phase 18 (18.E.1): array ops are $w0-clobbering runtime calls like OP_OBJ_*.
                      op == OP_ARR_NEW || op == OP_ARR_GET || op == OP_ARR_SET ||
                      op == OP_ARR_LEN ||
+                     // Phase 18 (18.E.2): typed `i32[]` packed-array ops, same runtime-call family.
+                     op == OP_IARR_NEW || op == OP_IARR_GET || op == OP_IARR_SET ||
+                     op == OP_IARR_LEN ||
                      // Phase 17 (17.A): ALL float ops are an integer-CSE BARRIER — they are not
                      // integer arith, so they must reset last_arith_op (they must never be folded
                      // against an integer ADD/SUB/etc.). FCONST/FADD/etc. write $f0/$f1 only (native
@@ -465,6 +474,9 @@ static void process_linear_il_bytes(MetalContext* ctx, const unsigned char* byte
                 // Phase 18 (18.E.1): array ops clobber $w0 (handle/value/len) — reset the cache.
                 op == OP_ARR_NEW || op == OP_ARR_GET || op == OP_ARR_SET ||
                 op == OP_ARR_LEN ||
+                // Phase 18 (18.E.2): typed `i32[]` packed-array ops also clobber $w0 — reset.
+                op == OP_IARR_NEW || op == OP_IARR_GET || op == OP_IARR_SET ||
+                op == OP_IARR_LEN ||
                 // Phase 17 (17.A): the float COMPARES write $w0 with a non-constant (0/1), so they
                 // invalidate the ICONST reuse cache exactly like an integer compare / runtime call.
                 // (FCONST/FADD/etc. write $f0/$f1 only — they don't clobber $w0, so they need only

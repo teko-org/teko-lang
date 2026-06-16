@@ -55,6 +55,7 @@ SRCS=("$HERE/libc_shim.c" "$ROOT/runtime/native/teko_rt.c" "$ROOT/src/runtime/te
       "$ROOT/src/runtime/teko_time.c"      # Phase 14: civil time formatter (wall-clock/timezone)
       "$ROOT/src/runtime/teko_object.c"    # Phase 15: object instance store (class field cells)
       "$ROOT/src/runtime/teko_array.c"     # Phase 18.E.1: fixed-size contiguous array (checked)
+      "$ROOT/src/runtime/teko_iarray.c"    # Phase 18.E.2: typed i32[] packed array (checked, SIMD substrate)
       "$ROOT/src/runtime/teko_vtable.c"    # Phase 15.B: static vtable (abstract/trait dispatch)
       "$ROOT/src/runtime/teko_convert.c"   # Phase 16: culture-invariant conversion runtime
       "$ROOT/src/runtime/teko_convert_f64.c" # Phase 17.C: Ryu f64->string (17.D EXPORTS teko_rt_float_to_string)
@@ -113,6 +114,8 @@ EXPORTS=(teko_rt_sha512_hex teko_rt_sha384_hex teko_rt_sha3_256_hex teko_rt_sha3
          teko_rt_object_new teko_rt_object_set teko_rt_object_get teko_rt_object_free
          # Phase 18 (18.E.1): fixed-size array ops (OP_ARR_* import these; get/set trap on OOB).
          teko_rt_array_new teko_rt_array_get teko_rt_array_set teko_rt_array_len
+         # Phase 18 (18.E.2): typed i32[] packed-array ops (OP_IARR_* import these; get/set trap on OOB).
+         teko_rt_iarray_new teko_rt_iarray_get teko_rt_iarray_set teko_rt_iarray_len
          # Phase 15 (15.B): static-vtable dispatch ops (OP_VTABLE_* import these from the reactor).
          teko_rt_vtable_set teko_rt_vtable_get
          # Phase 16 (16.A): culture-invariant conversion surface (OP_CALL_RUNTIME ids 49/51/52).

@@ -64,7 +64,29 @@ register-width i64 (ints/handles); typed numeric element arrays for SIMD land in
 - Proof `arrays.tks` (native + WASM, BYTE-IDENTICAL): build, index r/w, `.len`, + a fail-loud
   out-of-bounds case (`arrays_fail.tks`).
 
-### 18.E.2 — `list` (dynamic, non-contiguous, chunked) + `for` iteration
+### 18.E.2 — `for … in` iteration + typed `i32[]` packed arrays  — ✅ DONE
+**(Owner reordered: 18.E.2 is `for…in` + typed numeric arrays; the dynamic `list` type is DEFERRED
+off the critical path to SIMD — it can land as a later sub-block.)**
+**Status (DONE, locally green both targets).** (A) `for NAME in ARR { }` iteration over any array
+(`lower_for`, contextual `in` keyword, hidden index local, `< .len` guard via the control-flow
+foundation, binds the loop var to `ARR[i]`; wired into the block dispatcher + top-level loop). (B) a
+typed **`i32[]` packed numeric array** (the SIMD substrate): `src/runtime/teko_iarray.{c,h}` (packed
+`int32_t` cells, O(1) len, bounds-RETURNING get/set), `teko_rt_iarray_*` fail-loud, opcodes
+`OP_IARR_NEW/GET/SET/LEN` (0x9B–0x9E) mirroring `OP_ARR_*`, reactor import gated on `wasm_emit_iarray`;
+frontend `g_localiarr` + the `: i32[]` annotation → typed literal, with index r/w / `.len` / `for…in`
+dispatching the IARR op family (plain `[…]` stays the i64 array, byte-identical). Proofs `foreach.tks`
+(sum 60), `iarray.tks` (typed i32: a[2]=6/len=3/sum=15/a[0]=40), `iarray_fail.tks` (fail-loud) — all
+byte-identical native+WASM. Suite 246/246; ASan/UBSan both paths + TSan clean; native 55 OK/0 FAIL;
+16 goldens byte-identical. **f64-typed arrays deferred** (avoids float-accumulator plumbing here;
+i32x4 is a complete SIMD demo for 18.E.4). **BUNDLED FIX (disclosed):** the implementing agent also
+fixed a PRE-EXISTING Phase-15 bug (resolves the filed tech-debt) — a class method / trait dispatch
+used as an expression ARGUMENT or arithmetic operand, and a method returning a bare `self.<field>`,
+were mis-lowered to iconst 0; now they lower to `OP_CALL_FUNC` / `vtable_get`+`OP_CALL_FUNC`. Entangled
+in frontend_interop.c with the 18.E.2 changes (clean split unsafe), so committed together with
+regression proofs `method_arg.tks` (42/42/47/142) + `trait_arg.tks` (12/112/25), byte-identical
+native+WASM.
+
+
 - C runtime `src/runtime/teko_list.c`: chunked/segmented list — `new()`, `append(h,v)`, `get(h,i)`,
   `set(h,i,v)`, `len(h)` (O(1) metadata). Opcodes `OP_LIST_NEW/APPEND/GET/SET/LEN` → native + reactor.
 - `for x in a { }` iteration over both `array` and `list` (add `in` as a contextual keyword — there

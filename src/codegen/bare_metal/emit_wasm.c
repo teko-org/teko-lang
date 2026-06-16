@@ -1240,6 +1240,16 @@ void emit_wasm_pure(MetalContext* ctx, OpCode op, int32_t arg) {
                 fprintf(f, "  (import \"crypto\" \"teko_rt_array_set\" (func $array_set (param i32) (param i32) (param i32) (result i32)))\n");
                 fprintf(f, "  (import \"crypto\" \"teko_rt_array_len\" (func $array_len (param i32) (result i32)))\n");
             }
+            // Phase 18 (18.E.2): TYPED `i32[]` packed-array entry points from the SAME runtime reactor
+            // (namespace "crypto"). Pure i32-in/i32-out (handle/value/len) over the shared linear
+            // memory; cells are PACKED int32 (the SIMD substrate). get/set TRAP on an out-of-range
+            // index. Imported only when the program uses a typed `i32[]`.
+            if (ctx->wasm_emit_iarray) {
+                fprintf(f, "  (import \"crypto\" \"teko_rt_iarray_new\" (func $iarray_new (param i32) (result i32)))\n");
+                fprintf(f, "  (import \"crypto\" \"teko_rt_iarray_get\" (func $iarray_get (param i32) (param i32) (result i32)))\n");
+                fprintf(f, "  (import \"crypto\" \"teko_rt_iarray_set\" (func $iarray_set (param i32) (param i32) (param i32) (result i32)))\n");
+                fprintf(f, "  (import \"crypto\" \"teko_rt_iarray_len\" (func $iarray_len (param i32) (result i32)))\n");
+            }
             // Phase 14 (14.C): delayed (timed) channel entry points, also from the reactor.
             if (ctx->wasm_emit_delayed) {
                 fprintf(f, "  (import \"crypto\" \"teko_rt_delayed_open\" (func $delayed_open (param i32) (result i32)))\n");
@@ -1314,7 +1324,7 @@ void emit_wasm_pure(MetalContext* ctx, OpCode op, int32_t arg) {
             if (ctx->wasm_emit_crypto_ext || ctx->wasm_emit_duplex || ctx->wasm_emit_delayed ||
                 ctx->wasm_emit_bcast || ctx->wasm_emit_shared || ctx->wasm_emit_retry ||
                 ctx->wasm_emit_object || ctx->wasm_emit_vtable || ctx->wasm_emit_decimal ||
-                ctx->wasm_emit_array) {
+                ctx->wasm_emit_array || ctx->wasm_emit_iarray) {
                 fprintf(f, "  (import \"env\" \"memory\" (memory 1))\n");
             } else {
                 fprintf(f, "  (memory 1)\n");
@@ -1498,6 +1508,22 @@ void emit_wasm_pure(MetalContext* ctx, OpCode op, int32_t arg) {
                              (op == OP_ARR_GET) ? "array_get" :
                              (op == OP_ARR_SET) ? "array_set" : "array_len";
             int ar = (op == OP_ARR_SET) ? 3 : (op == OP_ARR_GET) ? 2 : 1;
+            for (int p = 0; p + 1 < ar; p++) fprintf(f, "    local.get $a%d\n", p);
+            fprintf(f, "    local.get $w0\n    call $%s\n    local.set $w0\n", fn);
+            break;
+        }
+
+        // Phase 18 (18.E.2): typed `i32[]` packed-array ops — call the reactor's imported
+        // teko_rt_iarray_*. Same multi-arg ABI as OP_ARR_*; iarray_get/set TRAP on OOB inside the
+        // reactor (teko_rt_die __builtin_trap) — the host sees a WebAssembly.RuntimeError.
+        case OP_IARR_NEW:
+        case OP_IARR_GET:
+        case OP_IARR_SET:
+        case OP_IARR_LEN: {
+            const char* fn = (op == OP_IARR_NEW) ? "iarray_new" :
+                             (op == OP_IARR_GET) ? "iarray_get" :
+                             (op == OP_IARR_SET) ? "iarray_set" : "iarray_len";
+            int ar = (op == OP_IARR_SET) ? 3 : (op == OP_IARR_GET) ? 2 : 1;
             for (int p = 0; p + 1 < ar; p++) fprintf(f, "    local.get $a%d\n", p);
             fprintf(f, "    local.get $w0\n    call $%s\n    local.set $w0\n", fn);
             break;

@@ -209,6 +209,24 @@ const char* teko_native_array_symbol(OpCode op, int* out_arity) {
     return sym;
 }
 
+// Phase 18 (18.E.2): OP_IARR_* -> teko_rt_iarray_* symbol + arity (mirrors the WASM reactor import
+// table). The teko_iarray C runtime (PACKED int32 cells, the SIMD substrate) is the single source of
+// truth (linked from libteko_rt.a); the get/set wrappers are CHECKED FAIL-LOUD on an out-of-range
+// index (the wrapper aborts).
+const char* teko_native_iarray_symbol(OpCode op, int* out_arity) {
+    int arity = 1;
+    const char* sym = NULL;
+    switch (op) {
+        case OP_IARR_NEW: sym = "teko_rt_iarray_new"; arity = 1; break; // (n)
+        case OP_IARR_GET: sym = "teko_rt_iarray_get"; arity = 2; break; // (handle, idx)
+        case OP_IARR_SET: sym = "teko_rt_iarray_set"; arity = 3; break; // (handle, idx, value)
+        case OP_IARR_LEN: sym = "teko_rt_iarray_len"; arity = 1; break; // (handle)
+        default: break;
+    }
+    if (out_arity) *out_arity = arity;
+    return sym;
+}
+
 // Phase 15 (15.B): OP_VTABLE_* -> teko_rt_vtable_* symbol + arity (mirrors the WASM reactor import
 // table). The teko_vtable C runtime is the single source of truth (linked from libteko_rt.a).
 const char* teko_native_vtable_symbol(OpCode op, int* out_arity) {
@@ -816,6 +834,19 @@ void emit_native_hosted(MetalContext* ctx, OpCode op, int32_t arg) {
         case OP_ARR_LEN: {
             int arity = 1;
             const char* sym = teko_native_array_symbol(op, &arity);
+            if (sym) emit_call(ctx, sym, arity);
+            break;
+        }
+
+        // Phase 18 (18.E.2): typed `i32[]` packed-array ops -> teko_rt_iarray_* runtime calls (same
+        // staging/ABI as OP_ARR_*; PACKED int32 cells). get/set are CHECKED FAIL-LOUD: the wrapper
+        // aborts (exit 70 + stderr "iarray: index out of bounds") on an out-of-range index.
+        case OP_IARR_NEW:
+        case OP_IARR_GET:
+        case OP_IARR_SET:
+        case OP_IARR_LEN: {
+            int arity = 1;
+            const char* sym = teko_native_iarray_symbol(op, &arity);
             if (sym) emit_call(ctx, sym, arity);
             break;
         }

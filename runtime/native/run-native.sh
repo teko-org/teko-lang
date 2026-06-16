@@ -275,6 +275,22 @@ EXP
 # Fail-loud: an out-of-range index aborts non-zero (exit 70 + stderr) — no silent zero / corruption.
 # WASM traps on the same access (run-arrays-fail.mjs), identical behavior on both targets.
 check_fail arrays_fail.tks "before" "array: index out of bounds"
+# Phase 18 (18.E.2): `for NAME in ARR { }` iteration over an i64 array (control-flow foundation).
+# Byte-identical to the WASM proof (run-foreach.mjs).
+check foreach.tks "sum = 60"
+# Phase 18 (18.E.2): the TYPED `i32[]` PACKED numeric array (the SIMD substrate) — `: i32[]` literal,
+# index read/write, `.len`, and `for x in a`. Byte-identical to the WASM proof (run-iarray.mjs). The
+# packed-i32 store is the SAME teko_iarray.c source of truth (linked here, in the wasm32 reactor there).
+check iarray.tks "$(cat <<'EXP'
+a[2] = 6
+len = 3
+sum = 15
+a[0] = 40
+EXP
+)"
+# Fail-loud: an out-of-range index on a typed `i32[]` aborts non-zero (exit 70 + stderr). WASM traps on
+# the same access (run-iarray-fail.mjs), identical behavior on both targets.
+check_fail iarray_fail.tks "before" "iarray: index out of bounds"
 # Phase 18 (18.A): Zero-Overhead Optionals — `?T` nullability + `null` + the Elvis `??`. An optional
 # local is compacted (payload slot + a hidden 1-word present companion); `a ?? d` branches on the
 # present flag via OP_IF (→ native je/cbz), choosing the payload when present else the default. No new
@@ -330,6 +346,17 @@ check class.tks "$(cat <<'EXP'
 70
 EXP
 )"
+# Phase 15 (15.A) regression: a class METHOD CALL used directly as an EXPRESSION ARGUMENT
+# (`emit_int(p.raw())`) and as an arithmetic operand (`p.raw() + 100`), plus a method returning a
+# bare `self.<field>`. Before the fix the call was dropped in argument/sub-expression position (the
+# evaluator emitted iconst 0); now each `obj.method(args)` head lowers to OP_CALL_FUNC. 42,42,47,142.
+check method_arg.tks "$(cat <<'EXP'
+42
+42
+47
+142
+EXP
+)"
 # Phase 15 (15.B): abstract/trait dynamic dispatch via a compile-time STATIC VTABLE. A Shape-typed
 # fat reference dispatches `area()`/`to_string()` to Circle then (after reassignment) Square by the
 # runtime type_id: vtable_get -> slot -> OP_CALL_FUNC. `to_string` rides the same vtable (Phase-16
@@ -339,6 +366,17 @@ check traits.tks "$(cat <<'EXP'
 112
 9
 209
+EXP
+)"
+# Phase 15 (15.B) regression: a DYNAMIC trait dispatch `g.method(...)` used directly as an EXPRESSION
+# ARGUMENT (`emit_int(g.area())`) and as an arithmetic operand (`g.area() + 100`). Before the fix the
+# fat trait-typed `g.method()` head was unhandled in argument/sub-expression position (only static
+# `obj.method()` was), so the call was dropped (iconst 0); now it lowers to vtable_get + OP_CALL_FUNC.
+# 12 (Circle.area), 112 (Circle.area+100), 25 (Square.area after reassignment).
+check trait_arg.tks "$(cat <<'EXP'
+12
+112
+25
 EXP
 )"
 # Phase 15 (15.C): generics via real per-type MONOMORPHIZATION. Factory<T> is specialized per

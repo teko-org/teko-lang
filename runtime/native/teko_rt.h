@@ -220,6 +220,17 @@ long teko_rt_array_get(long handle, long i); // -> cell value (fail-loud on OOB)
 long teko_rt_array_set(long handle, long i, long value); // -> 0 (fail-loud on OOB)
 long teko_rt_array_len(long handle);         // -> length (O(1) metadata)
 
+// Phase 18 (18.E.2) — TYPED `i32[]` PACKED numeric array surface wrappers (OP_IARR_* lower to these).
+// A SEPARATE collection from the i64 `array` above: cells are PACKED int32_t (the SIMD substrate).
+// The teko_iarray C runtime (src/runtime/teko_iarray.c) is the source of truth; the handle is a
+// TekoIArray* as a register-width integer. Values are i32-range ints carried in `long`. Same CHECKED,
+// FAIL-LOUD posture as teko_rt_array_*: an out-of-range index aborts via teko_rt_die (native exit 70
+// + stderr "iarray: index out of bounds"; wasm32 reactor __builtin_trap), NOT a defensive no-op.
+long teko_rt_iarray_new(long n);              // -> handle (n zero-initialized packed i32 cells)
+long teko_rt_iarray_get(long handle, long i); // -> cell value (fail-loud on OOB)
+long teko_rt_iarray_set(long handle, long i, long value); // -> 0 (fail-loud on OOB)
+long teko_rt_iarray_len(long handle);         // -> length (O(1) metadata)
+
 // Phase 16 (Casting / Type Conversions & Parsing) — culture-invariant conversion surface
 // (OP_CALL_RUNTIME ids 49/51/52). String-returning, like the crypto/time surface; the teko_convert
 // C runtime (src/runtime/teko_convert.c) is the source of truth (linked natively, compiled into the
