@@ -260,6 +260,26 @@ extern void test_teko_rsa_pkcs1v15_encrypt_roundtrip(void);
 extern void test_teko_rsa_oaep_sha256_kat(void);
 extern void test_teko_rsa_pss_sha256_kat(void);
 
+/* Phase 19 — FFI-CORE: manifest parser, resolver, lockfile, marshalling helpers. */
+extern void test_teko_ffi_manifest_parse_full(void);
+extern void test_teko_ffi_manifest_unknown_cap_skipped(void);
+extern void test_teko_ffi_manifest_empty_input(void);
+extern void test_teko_ffi_manifest_malformed_ignored(void);
+extern void test_teko_ffi_manifest_outside_section_ignored(void);
+extern void test_teko_ffi_resolver_wasm_orthogonal(void);
+extern void test_teko_ffi_resolver_bundled_always_resolves(void);
+extern void test_teko_ffi_resolver_native_deflate_only(void);
+extern void test_teko_ffi_resolver_unused_is_warning(void);
+extern void test_teko_ffi_lockfile_roundtrip(void);
+extern void test_teko_ffi_lockfile_read_nonexistent(void);
+extern void test_teko_ffi_str_copy_bounds(void);
+extern void test_teko_ffi_narrow_i32_happy(void);
+extern void test_teko_ffi_probe_nonexistent_returns_zero(void);
+extern void test_teko_ffi_probe_null_empty(void);
+extern void test_teko_ffi_lib_open_nonexistent(void);
+extern void test_teko_ffi_lib_close_null_safe(void);
+extern void test_teko_ffi_cap_names_table(void);
+
 int main(void) {
     // Unbuffered output: stream every line live so a crash on a CI runner shows
     // exactly how far the suite got (Windows pipes are otherwise fully buffered).
@@ -528,6 +548,26 @@ int main(void) {
     RUN_TEST(test_teko_rsa_pkcs1v15_encrypt_roundtrip);
     RUN_TEST(test_teko_rsa_oaep_sha256_kat);
     RUN_TEST(test_teko_rsa_pss_sha256_kat);
+
+    /* Phase 19 — FFI-CORE */
+    RUN_TEST(test_teko_ffi_manifest_parse_full);
+    RUN_TEST(test_teko_ffi_manifest_unknown_cap_skipped);
+    RUN_TEST(test_teko_ffi_manifest_empty_input);
+    RUN_TEST(test_teko_ffi_manifest_malformed_ignored);
+    RUN_TEST(test_teko_ffi_manifest_outside_section_ignored);
+    RUN_TEST(test_teko_ffi_resolver_wasm_orthogonal);
+    RUN_TEST(test_teko_ffi_resolver_bundled_always_resolves);
+    RUN_TEST(test_teko_ffi_resolver_native_deflate_only);
+    RUN_TEST(test_teko_ffi_resolver_unused_is_warning);
+    RUN_TEST(test_teko_ffi_lockfile_roundtrip);
+    RUN_TEST(test_teko_ffi_lockfile_read_nonexistent);
+    RUN_TEST(test_teko_ffi_str_copy_bounds);
+    RUN_TEST(test_teko_ffi_narrow_i32_happy);
+    RUN_TEST(test_teko_ffi_probe_nonexistent_returns_zero);
+    RUN_TEST(test_teko_ffi_probe_null_empty);
+    RUN_TEST(test_teko_ffi_lib_open_nonexistent);
+    RUN_TEST(test_teko_ffi_lib_close_null_safe);
+    RUN_TEST(test_teko_ffi_cap_names_table);
 
     return UNITY_END();
 }

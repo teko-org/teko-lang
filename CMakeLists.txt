@@ -105,6 +105,9 @@ set(CORE_SOURCES
         src/runtime/teko_decimal.c
         src/runtime/teko_mem_sys.c
         src/runtime/teko_thread.c
+        # Phase 19 — FFI-CORE: manifest [deps] parser, deterministic resolver, lockfile,
+        #             marshalling/error-mapping helpers. Native-only (WASM short-circuits).
+        src/runtime/teko_ffi_core.c
         # Native cryptography (Phase 13) — embedded runtime primitives (shared list)
         ${TEKO_CRYPTO_SOURCES}
         # Tooling: target detection, SDK, LSP, project manager
@@ -258,6 +261,8 @@ set(TEST_SOURCES
         tests/runtime/test_crypto_p256.c
         tests/runtime/test_crypto_p384.c
         tests/runtime/test_crypto_rsa.c
+        # Phase 19 — FFI-CORE KAT suite
+        tests/runtime/test_ffi_core.c
 )
 add_executable(teko_tests ${TEST_SOURCES})
 target_link_libraries(teko_tests PRIVATE teko_core unity)
@@ -268,4 +273,12 @@ target_include_directories(teko_tests PRIVATE src)
 if (WIN32)
     target_link_libraries(teko PRIVATE bcrypt)
     target_link_libraries(teko_tests PRIVATE bcrypt)
+endif()
+
+# Phase 19 — FFI-CORE uses dlopen/dlsym/dlclose on Linux (libdl).
+# macOS: dlopen is in the default linker search path (no extra -ldl needed).
+# Windows: LoadLibrary/FreeLibrary are in kernel32 (always linked).
+if (UNIX AND NOT APPLE)
+    target_link_libraries(teko_core PRIVATE dl)
+    target_link_libraries(teko_tests PRIVATE dl)
 endif()
