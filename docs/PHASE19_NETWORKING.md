@@ -43,7 +43,7 @@ Linux **glibc** (x86_64 / arm64 / riscv64), **macOS** Intel + Apple Silicon (Dar
 | HTTP/1.1 request/response codec | **brotli / zstd / lzma** heavy compressors (`compress.*`) |
 | WebSocket framing (RFC 6455) | **QUIC / HTTP-3** — quiche / msquic |
 | The router (AOT static radix tree + middleware) | **HTTP/2** — nghttp2 (gRPC transport) |
-| **Small native DEFLATE/gzip/zlib core** (Windows ships no system zlib; low risk) | (zlib itself: we use our native core uniformly instead of per-OS system zlib) |
+| **Small native DEFLATE/gzip/zlib core** = teko's optional `native` backend (§0.3) | deflate default fallback = **bundled zlib-ng**; `system` zlib if probed |
 | Protobuf wire codec (small, no system dep) | |
 | **FFI-CORE** marshalling/lifetime/error-mapping layer (the SAST-critical boundary) | |
 
@@ -51,6 +51,36 @@ Linux **glibc** (x86_64 / arm64 / riscv64), **macOS** Intel + Apple Silicon (Dar
 **TLS/crypto for the network stack is FFI-ONLY** — we do **not** roll our own TLS. (The from-scratch
 native TLS 1.3/1.2 + the crypto-for-TLS only existed to justify a static/musl mode — now a Future
 target, §5.)
+
+### 0.3 FFI-CORE dependency model (LOCKED)
+Every FFI capability resolves through a **declared backend hierarchy** (highest preference first),
+**lazily by use**, recorded deterministically in a lockfile. This is the contract FFI-CORE implements.
+
+- **Backend hierarchy per capability** (declared in the manifest):
+  1. **`system`** — the developer OS's library via FFI, found by a **build-time probe** (e.g. system
+     OpenSSL, system libzstd). Zero shipped dependency when present.
+  2. **`bundled`** — a **teko-DESIGNATED DEFAULT/standard library, pinned + vendored** (reproducible).
+     This is the **primary fallback** — **NOT** a from-scratch native impl. Designated defaults:
+     **TLS = BoringSSL/OpenSSL (vendored)**, **deflate = zlib-ng**, **brotli = brotli reference**,
+     **zstd = libzstd**, **lzma = xz/liblzma**.
+  3. **`native`** — teko's **own** implementation, **OPTIONAL**, only where it exists today:
+     **DEFLATE/gzip now**. Never the default fallback; an explicit opt-in where present.
+- **Lazy by use** — a library (system or bundled) is **required/linked ONLY if a used surface** (in
+  code or a transitive dep) needs it. A declared-but-unused dependency is a **warning, not an error**.
+  A program that never touches `tls.*` links **no** TLS library into the binary.
+- **Manifest is the source of truth** — **no silent auto-detection**. Resolution is deterministic and
+  recorded in a **lockfile (`.tkp.lock`)** (which backend + version won per capability).
+- **Build-time assertion, FAIL-LOUD** — if **nothing** in a capability's chain resolves, the build
+  **fails with an actionable message**: which library, how to install it per-OS, or how to switch to
+  `bundled`/`native`. **Never a silent stub.**
+- **WASM is orthogonal** — WASM always uses the host-import / WASI backend; the FFI backend hierarchy
+  applies to **native only**.
+
+### 0.4 Manifest unification (`.tkp` ≡ the Phase-21 `.teko_meta`) — LOCKED
+There is **ONE** manifest format: **`.tkp` is unified with the planned `.teko_meta` (Phase 21)** — we
+do **not** invent two formats. **Phase 19 defines ONLY the FFI/deps section** (the backend hierarchy +
+fallback chain + lazy-by-use, §0.3) and the `.tkp.lock` lockfile; the **full manifest schema is
+refined in Phase 21**. FFI-CORE owns the FFI/deps section + the resolver + the lockfile writer.
 
 ---
 
@@ -193,14 +223,16 @@ WASM client/synthetic) = **ROUTER-NATIVE + WS-SRV (Wave 2) + RPC/UNITS (Wave 1)*
 
 ---
 
-## 4. Compression tiering (FFI posture)
-- **Native DEFLATE core (Phase 19):** DEFLATE (RFC 1951) + gzip (RFC 1952) + zlib (RFC 1950) +
-  CRC32/Adler-32 — small, low-risk, uniform across OSes (**Windows ships no system zlib**), compiled
-  into the reactor for WASM too. Drives Content-Encoding/Transfer-Encoding + permessage-deflate.
-- **FFI compressors:** `compress.brotli` (libbrotli), `compress.zstd` (libzstd), `compress.lzma`
-  (liblzma) — thin FFI bindings via FFI-CORE; on WASM, host-import where available (Node has brotli),
-  else a documented gap. `compress.*` is a **free dotted surface** (verified: no reserved compression
-  token; `bundle`/`minify` are Phase-20 asset tooling).
+## 4. Compression tiering (FFI posture + the §0.3 backend hierarchy)
+- **`compress.deflate/gzip/zlib`** — resolves `system` zlib → **bundled zlib-ng** (default fallback)
+  → **`native` teko DEFLATE core** (the optional native backend that exists today). The native core
+  (DEFLATE RFC 1951 + gzip RFC 1952 + zlib RFC 1950 + CRC32/Adler-32) is **also what compiles into
+  the WASM reactor** (no FFI on WASM), so DEFLATE-CORE remains a Wave-0 native track. Drives
+  Content-Encoding/Transfer-Encoding + permessage-deflate.
+- **`compress.brotli/zstd/lzma`** — resolve `system` → **bundled** (brotli reference / libzstd /
+  liblzma) via FFI-CORE; **no `native` backend**. On WASM, host-import where available (Node has
+  brotli), else a documented gap. `compress.*` is a **free dotted surface** (verified: no reserved
+  compression token; `bundle`/`minify` are Phase-20 asset tooling).
 
 ### SAST / security
 Compression + encryption → **CRIME/BREACH** oracle risk: compression is a **separate, opt-in layer**,

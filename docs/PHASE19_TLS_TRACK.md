@@ -56,6 +56,12 @@ system backend is chosen (§2). Everything ≤ TLS 1.1 and all SSL is disabled a
 the TLS track makes. Everything else in this doc is backend-agnostic (one `tls.*` surface; the
 version contract in §1 applies to whichever backend wins).
 
+This fork is the **`system`-backend strategy** within the locked FFI-CORE backend hierarchy
+(`docs/PHASE19_NETWORKING.md` §0.3): the **`bundled` default fallback for TLS = BoringSSL/OpenSSL
+(vendored)** regardless of the fork; the fork only decides what the **`system`** tier probes for per
+OS (platform-native SChannel/Secure-Transport/OpenSSL vs OpenSSL-everywhere). TLS is **lazy by use** —
+a program that never calls `tls.*` links no TLS library at all.
+
 ---
 
 ## 3. TLS-FFI breadcrumbs (Wave 1, once FFI-CORE lands)
