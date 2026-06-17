@@ -259,6 +259,17 @@ typedef enum {
     OP_F2D          = 0x95, // $d0 = (decimal)$f0   (f64 -> decimal via shortest string)
     OP_D2F          = 0x96, // $f0 = (f64)$d0       (decimal -> f64 via shortest string)
 
+    // Phase 19 (ROUTER-CORE Wave 0 — RESERVED; see teko_router.h): OP_CALL_RUNTIME id range
+    // 175–179 are pre-allocated for the static radix-tree router surface. Frontend wiring
+    // (lowering `api`/`middleware`/verbs to these ids) is deferred to ROUTER-NATIVE (Wave 2).
+    // The engine itself (teko_router.c) is target-agnostic and already compiles into the WASM
+    // reactor. No opcodes are allocated here — this comment reserves the id space only.
+    //   175 = teko_router_new     (Wave 2)
+    //   176 = teko_router_add     (Wave 2)
+    //   177 = teko_router_dispatch (Wave 2)
+    //   178 = teko_router_reset   (Wave 2)
+    //   179 = (reserved / future)
+
     // Phase 17.F (RESERVED — owner-APPROVED, implemented after 17.A–17.E): an EXACT base-10
     // `decimal` type — a FIXED-WIDTH 256-BYTE value (~8B metadata: sign + decimal scale/exponent;
     // ~248B base-10 coefficient → ~590 significant digits, fraction ~128 bits ≈ ~38 places), banker's

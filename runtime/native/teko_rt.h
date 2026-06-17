@@ -298,4 +298,37 @@ double teko_rt_decimal_to_f64(const teko_decimal* d);          // OP_D2F: decima
 char* teko_rt_decimal_to_string(const teko_decimal* d);        // id 59: decimal -> string
 void  teko_rt_decimal_parse(const char* s, teko_decimal* out); // id 60: string -> decimal (checked)
 
+// Phase 19 (T1a) — client socket surface wrappers (register-width ABI; handle = TekoSocket* as long).
+// OP_CALL_RUNTIME id range 60-69 is RESERVED for net-client (see PHASE19_NETWORKING.md §2.1).
+// Emission / frontend wiring is NOT done in this wave — it comes in T2 (Wave 1).
+// On native these call teko_socket.c; teko_socket.c provides WASM stubs that return 0/BADARG.
+long teko_rt_socket_tcp_connect(const char* host, long port); // -> handle (0 = failure)
+long teko_rt_socket_udp_open(const char* host, long port);    // -> handle (0 = failure)
+long teko_rt_socket_send(long handle, const char* data, long len);          // -> TekoSocketStatus
+long teko_rt_socket_recv(long handle, char* buf, long buf_len,
+                         long* out_received);                               // -> TekoSocketStatus
+long teko_rt_socket_close(long handle);                                     // -> TekoSocketStatus
+void teko_rt_socket_free(long handle);
+long teko_rt_socket_state(long handle);                                     // -> TekoSocketState
+// Phase 19 (T1b, Wave 0) — server socket surface wrappers (NATIVE-ONLY; no WASM reactor).
+// OP_CALL_RUNTIME id range 70-79 RESERVED for net-server; NO opcodes emitted this wave
+// (emission deferred to T2). These wrappers bridge the register-width ABI (long) to the
+// typed teko_socket_server API. Guarded with #if !defined(__wasm__) in teko_rt.c.
+//
+// teko_rt_server_open(port, backlog, max_conns) -> TekoServer* handle as long (0 = failure).
+long teko_rt_server_open(long port, long backlog, long max_conns);
+// teko_rt_server_free(handle) -> 0. Closes the listening socket + all tracked conn fds.
+long teko_rt_server_free(long handle);
+// teko_rt_server_accept(handle, &out_conn_fd) -> TekoServerStatus. Non-blocking: returns
+// TEKO_SRV_AGAIN (1) immediately if no connection is pending (cooperative yield posture).
+long teko_rt_server_accept(long handle, long* out_conn_fd);
+// teko_rt_server_recv(conn_fd, buf, len, &out_n) -> TekoServerStatus. Non-blocking recv.
+long teko_rt_server_recv(long conn_fd, void* buf, long len, long* out_n);
+// teko_rt_server_send(conn_fd, buf, len) -> TekoServerStatus. Bounded-retry send (complete).
+long teko_rt_server_send(long conn_fd, const void* buf, long len);
+// teko_rt_server_conn_close(handle, conn_fd) -> 0. Closes one accepted fd; updates counter.
+long teko_rt_server_conn_close(long handle, long conn_fd);
+// teko_rt_server_conn_count(handle) -> current open connection count.
+long teko_rt_server_conn_count(long handle);
+
 #endif // TEKO_RT_H

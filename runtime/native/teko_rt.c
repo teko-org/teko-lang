@@ -28,6 +28,9 @@
 #include "teko_iarray.h"
 #include "teko_convert.h"
 #include "teko_decimal.h"
+#include "teko_socket.h"
+// Phase 19 (T1b) — server socket runtime (NATIVE-ONLY; guarded in the header).
+#include "teko_socket_server.h"
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -998,3 +1001,108 @@ char* teko_rt_decimal_to_string(const teko_decimal* d) {
 void teko_rt_decimal_parse(const char* s, teko_decimal* out) {
     if (!teko_decimal_parse(s, out)) teko_rt_die("decimal.parse: invalid decimal");
 }
+
+// Phase 19 (T1a) — client socket surface wrappers (OP_CALL_RUNTIME ids 60-69 RESERVED,
+// emission NOT wired yet — that comes in T2/Wave-1). The handle is a TekoSocket* carried
+// as a register-width integer (intptr_t cast). Values are i32 at the surface (ports,
+// lengths, statuses). POSIX/Winsock guarded in teko_socket.c; stubs on WASM.
+//
+// ABI note: the integer handle the surface will pass is an INDEX into the internal
+// g_handles table (cast to intptr_t via teko_socket_handle_to_ptr / ptr_to_handle).
+// For now the wrappers accept the opaque TekoSocket* cast directly from intptr_t —
+// the index indirection will be added in T2 when emission is wired.
+
+long teko_rt_socket_tcp_connect(const char* host, long port) {
+    if (!host || port <= 0 || port > 65535) return 0;
+    TekoSocket* s = teko_socket_tcp_connect(host, (uint16_t)port);
+    return (long)(intptr_t)s; // 0 on failure (NULL)
+}
+
+long teko_rt_socket_udp_open(const char* host, long port) {
+    if (!host || port <= 0 || port > 65535) return 0;
+    TekoSocket* s = teko_socket_udp_open(host, (uint16_t)port);
+    return (long)(intptr_t)s;
+}
+
+long teko_rt_socket_send(long handle, const char* data, long len) {
+    TekoSocket* s = (TekoSocket*)(intptr_t)handle;
+    if (!s || !data || len <= 0) return (long)TEKO_SOCK_ERR_BADARG;
+    return (long)teko_socket_send(s, data, (uint32_t)len);
+}
+
+long teko_rt_socket_recv(long handle, char* buf, long buf_len, long* out_received) {
+    TekoSocket* s = (TekoSocket*)(intptr_t)handle;
+    if (!s || !buf || buf_len <= 0 || !out_received) return (long)TEKO_SOCK_ERR_BADARG;
+    uint32_t got = 0;
+    TekoSocketStatus st = teko_socket_recv(s, buf, (uint32_t)buf_len, &got);
+    *out_received = (long)got;
+    return (long)st;
+}
+
+long teko_rt_socket_close(long handle) {
+    TekoSocket* s = (TekoSocket*)(intptr_t)handle;
+    return (long)teko_socket_close(s);
+}
+
+void teko_rt_socket_free(long handle) {
+    TekoSocket* s = (TekoSocket*)(intptr_t)handle;
+    teko_socket_free(s);
+}
+
+long teko_rt_socket_state(long handle) {
+    TekoSocket* s = (TekoSocket*)(intptr_t)handle;
+    return (long)teko_socket_state(s);
+}
+// Phase 19 (T1b, Wave 0) — server socket surface wrappers.
+// OP_CALL_RUNTIME id range 70-79 RESERVED for net-server; NO opcodes are emitted this
+// wave — emission is deferred to Track T2 (Wave 1). These thin wrappers bridge the
+// register-width ABI (long arguments/results) to the typed teko_socket_server C API.
+// NATIVE-ONLY: the entire block is inside #if !defined(__wasm__) (inherited from the
+// teko_socket_server.h guard and the surrounding #if !defined(__wasm__) in this file).
+#if !defined(__wasm__)
+// teko_rt_server_open(port, backlog, max_conns) -> handle (TekoServer* as long)
+long teko_rt_server_open(long port, long backlog, long max_conns) {
+    return (long)(intptr_t)teko_server_open(
+        (uint16_t)(unsigned long)port,
+        (uint32_t)(unsigned long)backlog,
+        (uint32_t)(unsigned long)max_conns);
+}
+// teko_rt_server_free(handle) -> 0
+long teko_rt_server_free(long handle) {
+    teko_server_free((TekoServer*)(intptr_t)handle);
+    return 0;
+}
+// teko_rt_server_accept(handle, out_conn_fd_ptr) -> TekoServerStatus as long.
+// The accepted conn fd (intptr_t) is written through out_conn_fd_ptr (also long*).
+long teko_rt_server_accept(long handle, long* out_conn_fd) {
+    intptr_t fd = -1;
+    TekoServerStatus st = teko_server_accept((TekoServer*)(intptr_t)handle, &fd);
+    if (out_conn_fd) *out_conn_fd = (long)fd;
+    return (long)st;
+}
+// teko_rt_server_recv(conn_fd, buf_ptr, len, out_n_ptr) -> TekoServerStatus as long.
+long teko_rt_server_recv(long conn_fd, void* buf, long len, long* out_n) {
+    uint32_t n = 0;
+    TekoServerStatus st = teko_server_recv(
+        (intptr_t)conn_fd, buf,
+        (len > 0) ? (uint32_t)(unsigned long)len : 0u,
+        &n);
+    if (out_n) *out_n = (long)n;
+    return (long)st;
+}
+// teko_rt_server_send(conn_fd, buf_ptr, len) -> TekoServerStatus as long.
+long teko_rt_server_send(long conn_fd, const void* buf, long len) {
+    return (long)teko_server_send(
+        (intptr_t)conn_fd, buf,
+        (len > 0) ? (uint32_t)(unsigned long)len : 0u);
+}
+// teko_rt_server_conn_close(handle, conn_fd) -> 0.
+long teko_rt_server_conn_close(long handle, long conn_fd) {
+    teko_server_conn_close((TekoServer*)(intptr_t)handle, (intptr_t)conn_fd);
+    return 0;
+}
+// teko_rt_server_conn_count(handle) -> current connection count.
+long teko_rt_server_conn_count(long handle) {
+    return (long)teko_server_conn_count((const TekoServer*)(intptr_t)handle);
+}
+#endif // !defined(__wasm__)
