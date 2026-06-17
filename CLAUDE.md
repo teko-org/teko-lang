@@ -61,6 +61,30 @@ output locally (the goldens only `strstr`; always *assemble + run*, never trust 
   root cause, don't mask with timeouts or non-blocking.
 - No `git merge`/force-push from the agent; the human merges. New phase ⇒ branch + **draft PR** up front.
 
+## Orchestration Doctrine (Project-wide)
+**Standing and effective immediately for ALL work** (every phase, every task, every session — not
+tied to any one phase), work is planned/decomposed/delegated/reviewed per
+`docs/ORCHESTRATION_DOCTRINE.md` (owner-authored; the two canonical blocks live there). It is a
+*meta-process* layer **on top of** the discipline above — it relaxes nothing.
+- **Role hierarchy:** **PO** (human owner; the only one who merges to `main`) → **PM** (Dispatch
+  orchestrator) → **BA / Master Agent** (an **Opus** session per phase — plans & manages, decomposes
+  into "breadcrumbs", **never writes massive code itself**) → **Tech Lead** (**Sonnet** subagents —
+  take medium tasks, subdivide into breadcrumbs, write focused sub-prompts, review the developers) →
+  **Developer** (**Haiku** subagents — execute one tightly-scoped low-context breadcrumb in the exact
+  return format; no scope creep).
+- **Per-breadcrumb review gate (mandatory before releasing the next breadcrumb):** review for errors →
+  consolidate → **SECURITY + SAST evaluation** (injection; C-runtime memory-safety — buffer
+  overflow/OOB, UAF/double-free, integer overflow, unsafe casts; confirm new emission stays gated +
+  byte-identical) → **bounce back to the executor** if any rule/best-practice is violated, instead of
+  patching over it.
+- **PR hierarchy (LEAN, PR-only):** the **phase PR → `main`** is merged ONLY by the **PO (human)** at
+  the end; **breadcrumb sub-PRs → the PHASE branch** are merged by the **PM** after review + SAST + CI.
+  The breadcrumb spec (the BLOCK 2 `<current_task>`) lives **in the sub-PR body**, NOT in an Issue. No
+  agent merges to `main`; no `git merge`/force-push; no destructive delete. **Issues/Projects are NOT
+  used today** — a future option (mirror breadcrumbs as Issues + a Projects V2 board) when in production.
+- Executor subagent profiles: `.claude/agents/teko-tech-lead.md` (Sonnet) and
+  `.claude/agents/teko-developer.md` (Haiku); `teko-engineer.md` remains for direct senior work.
+
 ## MSVC / Windows portability rules (hard-won)
 - **No computed-goto** in the VM — guarded portable `switch` fallback (`TEKO_VM_PORTABLE_DISPATCH`,
   the path MSVC uses). No C23 `auto`/`nullptr` in shared code or tests.
