@@ -1,70 +1,83 @@
-# Phase 19 — TLS / SSL Track (parallel; native client+server, WASM client-only)
+# Phase 19 — TLS / SSL Track (FFI to system TLS; native client+server, WASM client-first)
 
-> Parallel track under Phase 19 (`docs/PHASE19_NETWORKING.md`). TLS is **not** on the MVP critical
-> path but runs as an **independent, KAT-driven track** (TLS-RT) that can start immediately — the
-> handshake/key-schedule/record state machine is exercised with **RFC 8448 test vectors and no
-> socket**; integration (TLS-INT, `tls.*` over the socket) joins at Wave 1. **Target split (matches
-> the phase decision):** TLS-RT implements **both** the client and server halves of the handshake
-> (shared key schedule + record layer); **native** wires both `tls.client` and `tls.server` (the
-> latter over the native accept loop); **WASM** wires `tls.client` only (host-import; no listening
-> server on WASM). Built entirely on the **CT-clean Phase-13 primitives** — this track adds **no** new
-> crypto and does **not** modify Phase 13.
+> Parallel track under Phase 19 (`docs/PHASE19_NETWORKING.md`). **Under the NativeAOT/FFI posture,
+> Phase-19 TLS is FFI-ONLY — we bind the OS's audited system TLS library; we do NOT roll our own
+> TLS.** The from-scratch native TLS 1.3/1.2 stack (RFC 8448) is moved to **Future targets** (it only
+> existed to justify a static/musl mode — also deferred). **The Phase-13 crypto primitives are kept
+> as-is, unchanged — they are not TLS** and this track does not touch them.
+
+**Target split:** native wires `tls.client` **and** `tls.server` (the latter over the native accept
+loop, T1b) through the system TLS lib; **WASM** wires `tls.client` via host-import (Node TLS) — and
+WASI-TLS where the runtime provides it. Browser = client only.
+
+---
 
 ## 1. All SSL/TLS versions — enumerated, with posture
 
+Even though we FFI a system library, we **configure** it to negotiate only the secure versions and
+**disable** the rest. This table is the configuration contract for every backend.
+
 | Protocol | Year / RFC | Posture in Teko | Rationale |
 |---|---|---|---|
-| **SSL 2.0** | 1995 | **PROHIBITED — never implement** | Catastrophically broken; **RFC 6176 prohibits** negotiating SSLv2. No client support. |
-| **SSL 3.0** | 1996 / RFC 6101 | **INSECURE — never implement** | **POODLE** (CVE-2014-3566); **RFC 7568 prohibits** SSLv3. No client support. |
-| **TLS 1.0** | 1999 / RFC 2246 | **LEGACY/INSECURE — do not implement** | BEAST; CBC/MAC-then-encrypt; **deprecated by RFC 8996**. Not offered. |
-| **TLS 1.1** | 2006 / RFC 4346 | **LEGACY/INSECURE — do not implement** | Superseded; **deprecated by RFC 8996**. Not offered. |
-| **TLS 1.2** | 2008 / RFC 5246 | **TARGET (secondary)** | Still widely required by servers. Implement **client** with **AEAD-only** suites (ECDHE + AES-GCM / ChaCha20-Poly1305); **exclude** CBC, RC4, static-RSA key exchange, and compression. |
-| **TLS 1.3** | 2018 / RFC 8446 | **TARGET (primary)** | Preferred. 1-RTT handshake, HKDF key schedule, AEAD-only, **no record compression** (anti-CRIME by design). Built on Phase-13 X25519/P-256 ECDHE, AES-GCM/ChaCha20-Poly1305, HKDF, Ed25519/ECDSA verify. |
+| **SSL 2.0** | 1995 | **DISABLED — never negotiated** | Broken; **RFC 6176 prohibits**. |
+| **SSL 3.0** | 1996 / RFC 6101 | **DISABLED — never negotiated** | **POODLE**; **RFC 7568 prohibits**. |
+| **TLS 1.0** | 1999 / RFC 2246 | **DISABLED** | BEAST; **deprecated by RFC 8996**. |
+| **TLS 1.1** | 2006 / RFC 4346 | **DISABLED** | Superseded; **deprecated by RFC 8996**. |
+| **TLS 1.2** | 2008 / RFC 5246 | **ENABLED (secondary)** | Still widely required. Configure **AEAD-only** suites (ECDHE + AES-GCM / ChaCha20-Poly1305); no CBC/RC4/static-RSA. |
+| **TLS 1.3** | 2018 / RFC 8446 | **ENABLED (primary)** | Preferred. AEAD-only; **no record compression** (anti-CRIME). |
 
-### Datagram TLS (relevant to the UDP/QUIC tracks — noted, not MVP)
+### Datagram TLS (for the UDP/QUIC FFI track — noted)
 | Protocol | Year / RFC | Posture |
 |---|---|---|
-| **DTLS 1.0** | 2006 / RFC 4347 | **INSECURE — do not implement** (maps to TLS 1.1). |
-| **DTLS 1.2** | 2012 / RFC 6347 | Optional future (UDP security), AEAD-only if ever added. |
-| **DTLS 1.3** | 2022 / RFC 9147 | Optional future; relevant adjacent to the QUIC track. **QUIC itself uses the TLS 1.3 handshake (RFC 9001), not DTLS.** |
+| **DTLS 1.0** | 2006 / RFC 4347 | DISABLED (maps to TLS 1.1). |
+| **DTLS 1.2** | 2012 / RFC 6347 | Optional future (UDP), AEAD-only. |
+| **DTLS 1.3** | 2022 / RFC 9147 | Optional future. **QUIC uses the TLS 1.3 handshake (RFC 9001)**, supplied by the QUIC FFI lib (quiche/msquic), not by this track. |
 
-**Net target set:** **TLS 1.3 (primary) + TLS 1.2 (secondary), client-only, AEAD-only.** Everything
-≤ TLS 1.1 and all SSL is explicitly **not implemented** and never negotiated (downgrade-safe: we
-simply never offer them).
+**Target set:** **TLS 1.3 (primary) + TLS 1.2 (secondary), AEAD-only**, configured on whichever
+system backend is chosen (§2). Everything ≤ TLS 1.1 and all SSL is disabled at config time.
 
-## 2. Cipher-suite posture (CT-clean Phase-13 primitives only)
-- **Key exchange:** ECDHE over **X25519** / **P-256** (Phase-13 CT scalarmult). No static RSA kex.
-- **AEAD:** **AES-128/256-GCM**, **ChaCha20-Poly1305** (Phase-13, CT).
-- **Signatures (cert verify):** **Ed25519**, **ECDSA P-256/P-384** (Phase-13). **RSA PKCS#1 v1.5 /
-  PSS** used **only for certificate signature *verification*** (public-key op — acceptable); we do
-  **not** use RSA key exchange or RSA decryption (Phase-13 RSA private ops are non-CT /
-  padding-oracle-prone — documented; verify-only avoids that surface).
-- **KDF:** HKDF-SHA-256/384 (Phase-13). HKDF-Expand-Label per RFC 8446 §7.1.
+---
 
-## 3. TLS-RT breadcrumbs (KAT-driven, no socket — Wave 0, parallel)
-1. **Key schedule** — HKDF-Expand-Label + the TLS 1.3 secret tree (early/handshake/master,
-   traffic keys), KAT'd against **RFC 8448**.
-2. **Handshake transcript + state machine** — ClientHello/ServerHello, EncryptedExtensions,
-   Certificate, CertificateVerify, Finished; transcript hash. **Both halves** (client + server) share
-   this machine; the server half drives the same messages from the responder side.
-3. **Record layer** — AEAD record protection/deprotection, nonce construction, key update.
-4. **Certificate-chain verification** — signature verify via Phase-13 (Ed25519/ECDSA/RSA-verify);
-   validity/name checks. (Trust-store policy is a documented sub-decision.) The native server half
-   additionally needs a configured cert+key (server-side signing uses Phase-13 Ed25519/ECDSA;
-   RSA-PSS server signing is allowed since signing is the private op the server owns locally.)
-5. **TLS 1.2** — AEAD-only suites, ECDHE; shares the cert-verify + record plumbing.
+## 2. PENDING SUB-DECISION (record now — DO NOT resolve until the TLS track starts)
 
-## 4. TLS-INT (Wave 1) — `tls.*` over the socket layer
-- **`tls.client(host, port)`** (native + WASM) → handshake over `net.tcp_connect` →
-  `tls.send`/`tls.recv` (AEAD records). `https` client = HTTP-INT over `tls.client`.
-- **`tls.server(...)`** (**native only**) → TLS over the native accept loop (T1b) → an `https`
-  server = HTTP-SRV over `tls.server`. No WASM server (platform reality, honestly marked).
-- **Proofs.** Native: `tls.client` handshake against a replayed **RFC 8448** transcript and/or a
-  local `tls.server` loopback; `tls.server` accept+handshake loopback. WASM: `tls.client` via
-  host-import TLS (Node TLS) or replayed transcript through the reactor.
+**Which system-TLS backend strategy?** (the owner **leans platform-native**)
 
-## 5. SAST notes (gate)
-TLS records and certificates are **attacker-controlled** parse surfaces: bounds-check every record/
-extension/certificate field; integer-overflow-safe length arithmetic; constant-time tag/Finished
-comparison; reject all ≤TLS-1.1/SSL versions and non-AEAD suites at parse time (no downgrade); **no
-record compression** (anti-CRIME). `calloc` zero-init + clear ownership across the handshake state.
+- **Option P — platform-native (3 thin backends, ZERO extra dependency):**
+  **SChannel** (Windows) · **Secure Transport / Network.framework** (macOS/Darwin) · **OpenSSL**
+  (Linux glibc). Each is already present on its OS → no shipped dependency. Cost: three thin FFI
+  backends behind the one `tls.*` surface (the clock-pattern, ×3).
+  *Note: Apple has deprecated Secure Transport in favour of Network.framework — to evaluate when the
+  track starts.*
+- **Option O — OpenSSL-everywhere (1 backend):** one OpenSSL FFI binding for all targets. Cost: needs
+  **OpenSSL present on macOS and Windows** (a shipped/managed dependency), contradicting the
+  "dynamically link what each OS already provides" posture on mac/Windows.
+
+**Owner lean:** Option P (platform-native). **Status: NOT resolved** — recorded as the first decision
+the TLS track makes. Everything else in this doc is backend-agnostic (one `tls.*` surface; the
+version contract in §1 applies to whichever backend wins).
+
+---
+
+## 3. TLS-FFI breadcrumbs (Wave 1, once FFI-CORE lands)
+1. **`tls.client`** — connect over `net.tcp_connect`, hand the fd to the system TLS lib, configure
+   the §1 version/suite contract, verify the server cert chain (the lib's verifier + a trust-store
+   policy sub-decision), then `tls.send`/`tls.recv`.
+2. **`tls.server` (native)** — TLS over the native accept loop (T1b) with a configured cert+key;
+   `https` server = HTTP-SRV over `tls.server`. No browser server (WASI where supported).
+3. **`https` client** = HTTP-INT over `tls.client`.
+4. **Marshalling/lifetime/error mapping** through **FFI-CORE** (see networking doc §7): buffer+length
+   correctness, ownership of lib-allocated handles (no UAF/double-free), every return code mapped to
+   a teko fail-loud error.
+
+**Proofs.** Native: `tls.client` against a local `tls.server` loopback (and/or a known endpoint);
+`tls.server` accept+handshake loopback. WASM: `tls.client` via host-import TLS (Node TLS).
+
+---
+
+## 4. SAST notes (gate — FFI boundary + records)
+The system TLS lib is audited, so our risk is the **binding**: correct buffer/length marshalling,
+ownership of lib-allocated SSL/context handles (**no UAF/double-free** — the prior wild-free was in
+`parser_ffi.c`; keep TSan), every `SSL_*`/SChannel/Secure-Transport return code checked and mapped,
+constant-time-agnostic (the lib owns CT). Configure: reject ≤TLS-1.1/SSL and non-AEAD suites; enable
+cert + hostname verification by default; **no record compression** (anti-CRIME). `calloc` zero-init +
+clear ownership across the handshake/session state we hold.

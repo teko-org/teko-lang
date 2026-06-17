@@ -1,4 +1,4 @@
-# Phase 19 — Native Networking & Web Architecture (native server + client; WASM client-only)
+# Phase 19 — Native Networking & Web Architecture (NativeAOT/FFI posture)
 
 > **Status:** IN PROGRESS — branch `feat/phase-19-networking` (principal Draft PR #13 → `main`).
 > Planned/managed under the **Orchestration Doctrine** (`docs/ORCHESTRATION_DOCTRINE.md`): the Master
@@ -11,237 +11,252 @@ TLS-track doc `docs/PHASE19_TLS_TRACK.md`.
 
 ---
 
-## 0. Owner-locked decisions (current revision)
+## 0. Owner-locked architecture: the C#/.NET NativeAOT posture
 
-- **A1 — pragmatic MVP.** Make every reserved web token live with native+WASM proofs; advanced
-  protocols become **parallel tracks**, not blanket deferrals.
-- **C1 — cooperative async.** I/O integrates with the Phase-14 green-thread scheduler (a routine
-  blocked on `accept`/`recv` yields). Real async backends (io_uring/kqueue/IOCP) are a later perf
-  track behind the *same* surface — no new tokens.
-- **B — split by target (corrected):**
-  - **NATIVE = full SERVER + CLIENT, at every layer (TCP/UDP → HTTP → WebSocket → router).** The
-    socket foundation includes **both** the **server path** (`bind`/`listen`/`accept` loop) **and**
-    the **client path** (`connect`/`send`/`recv`/`close`). The web router runs a **real listening
-    server** with AOT static radix-tree dispatch.
-  - **WASM = CLIENT-ONLY.** Host-import client (`fetch`/`ws`); **no listening server** — a platform
-    reality, **honestly marked**. Server socket I/O (`bind`/`listen`/`accept`) is **NATIVE-ONLY**.
-- **CI-trigger fix** kept in the setup commit (owner-approved).
-- **TLS** deferred from the MVP critical path but runs as a **parallel track** with all SSL/TLS
-  versions enumerated — see `docs/PHASE19_TLS_TRACK.md`.
-- **Compression** folded in (owner request) as a tiered track — see §4.
+Phase 19 produces a **ready-to-run native binary that dynamically links what each OS already
+provides**, **FFI**s to **audited system libraries** for heavy/security-critical capabilities, and
+writes **native code ONLY for teko's value-add**. This is the decisive simplification: we are **not**
+building a fully-static, dependency-free stack in Phase 19.
 
-## 1. Token / surface semantics (server vs client, and how each is proven on BOTH targets)
+- **A1** pragmatic MVP · **C1** cooperative async (Phase-14 scheduler; a routine blocked on
+  `accept`/`recv` yields). Real async backends (io_uring/kqueue/IOCP) remain a later perf track.
+- **B — target split:** **NATIVE = full SERVER + CLIENT** at every layer (TCP/UDP → HTTP → WebSocket
+  → router); `bind`/`listen`/`accept` **and** `connect`/`send`/`recv`/`close` are **required** on
+  native. **WASM = client-first** (host-import `fetch`/`ws`); **server/listen surfaces are still
+  emitted for WASM** but run over **WASI `wasi-sockets`** where the runtime supports it and
+  **fall back to host-import client in the browser**, documented explicitly (§1.2).
+- **One teko surface per capability, per-OS backend** — the **same pattern as the real
+  monotonic/wall clock** (`clock_gettime` / `QueryPerformanceCounter` behind one surface). Now
+  `tls.*` and the heavy `compress.*` codecs sit on **OpenSSL / SChannel / Secure Transport / zlib /
+  brotli / …** behind one teko surface each.
+- **Dynamic-link + FFI on all native targets** (no static constraint) — removes the biggest source
+  of complexity.
+
+### 0.1 Native matrix = exactly what CI already covers
+Linux **glibc** (x86_64 / arm64 / riscv64), **macOS** Intel + Apple Silicon (Darwin), **Windows**
+(x86_64 / arm64). Other Unix/BSD only via POSIX **where it comes for free**. No new platforms.
+
+### 0.2 What is NATIVE (teko's value-add) vs FFI (audited system libs)
+| Native in teko (we write it) | FFI to system/audited lib (we bind it) |
+|---|---|
+| Sockets — BSD sockets + Winsock (client **and** native server) | **TLS** — OpenSSL / SChannel / Secure Transport (`tls.*`) |
+| HTTP/1.1 request/response codec | **brotli / zstd / lzma** heavy compressors (`compress.*`) |
+| WebSocket framing (RFC 6455) | **QUIC / HTTP-3** — quiche / msquic |
+| The router (AOT static radix tree + middleware) | **HTTP/2** — nghttp2 (gRPC transport) |
+| **Small native DEFLATE/gzip/zlib core** (Windows ships no system zlib; low risk) | (zlib itself: we use our native core uniformly instead of per-OS system zlib) |
+| Protobuf wire codec (small, no system dep) | |
+| **FFI-CORE** marshalling/lifetime/error-mapping layer (the SAST-critical boundary) | |
+
+**Crypto:** Phase-13 primitives are **kept as-is, unchanged** (they are not TLS). In Phase 19,
+**TLS/crypto for the network stack is FFI-ONLY** — we do **not** roll our own TLS. (The from-scratch
+native TLS 1.3/1.2 + the crypto-for-TLS only existed to justify a static/musl mode — now a Future
+target, §5.)
+
+---
+
+## 1. Token / surface semantics (server vs client; how each is proven on BOTH targets)
 
 The "no dead tokens" bar binds the reserved lexer tokens
 `api middleware get post put delete patch head options rpc websocket` (+ bandwidth units
 `kbps`/`mbps`/`gbps`). The reserved **web router tokens are SERVER route-definition constructs**;
-client HTTP/WS/RPC usage rides **dotted-identifier surfaces** (not tokens). Both must satisfy the
-**no-dead-token bar AND the native+WASM proof bar**, resolved as follows:
+client HTTP/WS/RPC usage rides **dotted-identifier surfaces** (not tokens). Resolution per surface:
 
-| Token / surface | Kind | Native | WASM | Proof strategy |
-|---|---|---|---|---|
-| `api`, `middleware`, `get/post/put/delete/patch/head/options` | **SERVER route-definition tokens** | **real listening server** (`bind/listen/accept`) + AOT static **radix-tree** dispatch; `middleware` = server interceptor chain | WASM only (the lone client-restricted target): no listening server | **Target-agnostic routing:** build the radix tree and dispatch a **SYNTHETIC in-module request** (method+path+headers, no real socket) on BOTH targets → proves grammar + emission + routing everywhere; real `bind/listen/accept` is **native-only**, honestly marked |
-| `websocket` | **SERVER WS endpoint** token | real server WS endpoint (accept + RFC 6455) | synthetic | same target-agnostic proof (handshake/route built in-module; real accept native-only) |
-| `rpc` | RPC | native: server **and** client; minimal length-prefixed | client (host-import) | native server+client `.tks`; WASM client `.mjs` + synthetic server-route proof |
-| `http.*` (`http.get/post/...`) | **client** dotted surface | real client over socket | real client (host-import `fetch`) | live on BOTH (native socket / WASM host) |
-| `net.*` (`tcp_connect/...` + native `tcp_listen/accept`) | dotted surface | client **and** server primitives (`connect/send/recv/close` **and** `bind/listen/accept`) | WASM only: connect/send/recv; listen/accept **absent**, marked native-only | native server+client `.tks`; WASM client `.mjs` |
-| `ws.*` (client WebSocket) | **client** dotted surface | real client | host-import client | live on BOTH |
-| `kbps/mbps/gbps` | client/server throttle | `limit(10mbps)` | same | normalized bps literal consumed by a throttle surface |
+| Token / surface | Kind | Backend | Native | WASM | Proof |
+|---|---|---|---|---|---|
+| `api`, `middleware`, `get/post/put/delete/patch/head/options` | **SERVER route-definition tokens** | native code | **real listening server** (`bind/listen/accept`) + AOT static **radix-tree** dispatch; `middleware` = server interceptor chain | WASI server where supported; **browser: no listen** → synthetic | **Target-agnostic routing:** build the radix tree + dispatch a **SYNTHETIC in-module request** (no socket) on BOTH targets; real `bind/listen/accept` native (+ WASI), honestly marked |
+| `websocket` | **SERVER WS endpoint** token | native code | real server WS endpoint (accept + RFC 6455) | WASI / synthetic | same target-agnostic proof |
+| `rpc` | RPC | native code | server **and** client (length-prefixed) | client (host-import) + synthetic server route | native `.tks`; WASM client `.mjs` + synthetic |
+| `http.*` | **client** dotted surface | native code | real client over socket | host-import `fetch` | live on BOTH |
+| `net.*` (`tcp_connect/…` + native `tcp_listen/accept`) | dotted surface | native code | client **and** server primitives | WASM: connect/send/recv (+ WASI listen); browser listen absent, marked | native `.tks`; WASM `.mjs` |
+| `ws.*` (client WebSocket) | **client** dotted surface | native code | real client | host-import client | live on BOTH |
+| `tls.*` (`tls.client`/native `tls.server`) | dotted surface | **FFI** (system TLS) | OpenSSL/SChannel/Secure Transport | host-import TLS (Node TLS); WASI-TLS where present | native `.tks` over FFI; WASM host-import |
+| `compress.deflate/gzip/zlib` | dotted surface | **native DEFLATE core** | in-process | in-reactor | KAT vs RFC/zlib vectors, both targets |
+| `compress.brotli/zstd/lzma` | dotted surface | **FFI** (system lib) | libbrotli/libzstd/liblzma | host-import where available (Node has brotli) | native `.tks` over FFI; WASM host where present, else documented gap |
+| `kbps/mbps/gbps` | throttle | native | `limit(10mbps)` | same | normalized bps literal |
 
-`net`/`http`/`tls`/`compress`/`ws` are **dotted surfaces, not tokens** — so QUIC/HTTP-2/3/4/full-gRPC
-sequence as later tracks with **no dead tokens**. Greenfield: no socket/IO code exists today.
-
-House pattern per feature: **portable C runtime (single source of truth + Unity KATs) →
-`OP_CALL_RUNTIME` id → native `teko_rt_*` wrapper + WASM reactor import → `.tks` proof native AND
-WASM** (server-token surfaces additionally use the synthetic-request proof on WASM).
+`net`/`http`/`tls`/`compress`/`ws` are **dotted surfaces, not tokens** — QUIC/HTTP-2/3/4/full-gRPC
+sequence as later FFI tracks with **no dead tokens**.
 
 ### 1.1 Why the synthetic-request proof is legitimate (not a stubbed token)
 The server tokens emit two separable things: (a) the **AOT radix tree + middleware chain + handler
-dispatch** (target-agnostic compiler/runtime logic), and (b) the **socket accept loop** (native OS
-syscalls). The WASM proof exercises (a) end-to-end with a real in-module request value and asserts
-the correct handler/middleware run and response is produced — the token is **fully lowered and
-executed**, only the OS accept syscall (b) is native-only. This keeps the token live and proven on
-WASM without pretending WASM can listen.
+dispatch** (target-agnostic logic) and (b) the **socket accept loop** (native/WASI syscalls). The
+WASM proof exercises (a) end-to-end with a real in-module request value and asserts the correct
+handler/middleware run and the right response — the token is **fully lowered and executed**; only the
+OS accept syscall (b) is native/WASI-only.
+
+### 1.2 WASM server posture (honest)
+WASM **server/listen surfaces are emitted** so the grammar/emission is identical across targets, and
+run for real over **WASI `wasi-sockets`** where the host supports it. In a **browser** there are no
+listening sockets — `listen` there **fails/falls back to the host-import client**, and this is
+**documented explicitly** at the surface (not silently stubbed).
 
 ---
 
-## 2. Parallelization — the dependency DAG (owner priority: MAXIMIZE concurrency)
+## 2. Parallelization DAG (FFI posture — fewer, thinner tracks)
 
-Every codec / protocol state machine is a pure, KAT-testable C runtime with **zero socket
-dependency**; only *integration* (wiring onto live sockets / the accept loop) serializes, funnelling
-through **T2** (socket wiring). The native server path adds one enabler node (**T1b**, the
-accept-loop primitives) parallel to the client foundation.
+Native codecs/runtimes are pure + KAT-testable with zero socket dependency; FFI tracks are thin
+bindings gated by **FFI-CORE**. Integration funnels through **T2** (socket wiring).
 
-### Legend: ⟂ independent (concurrent now) · → depends on · ⏸ deferred (reason)
+### Legend: ⟂ independent (now) · → depends on · ⏸ deferred (§5)
 
-### Wave 0 — start NOW, fully parallel (separate `teko_*.c` + KAT files)
-- **T1a — socket CLIENT foundation** `teko_socket.c`: `tcp_connect`/`udp_connect`/`send`/`recv`/
-  `close`, handle table (calloc, fail-loud bounds), state machine, POSIX + Winsock. ⟂ *(enabler)*
-- **T1b — socket SERVER foundation (NATIVE-ONLY)** `teko_socket_server.c`: `bind`/`listen`/`accept`
-  loop, connection handles, integrated with the Phase-14 scheduler (accept/recv yield). Guarded so
-  WASM never references it. ⟂ *(enabler; native-only TU)*
-- **HTTP-CODEC** — request **and** response build/parse (status/headers/body, chunked) as pure
-  byte↔struct functions, KAT'd. Serves both client (build req / parse resp) and server (parse req /
-  build resp). ⟂
-- **WS-CODEC** — RFC 6455 frame encode/decode + masking + UTF-8 validate (client and server
-  masking rules), KAT'd. ⟂
-- **ROUTER-CORE** — AOT static **radix-tree** builder + middleware chain + handler dispatch over a
-  **synthetic request struct** (no socket), KAT'd. Target-agnostic — this is what proves the server
-  tokens on WASM. ⟂
-- **C-CORE compression** — DEFLATE (RFC 1951) + zlib (RFC 1950) + gzip (RFC 1952) + CRC32/Adler-32,
-  KAT'd. Lands the `compress.*` surface plumbing. ⟂
-- **C-BR / C-ZSTD / C-LZMA / C-LZ4** — brotli (RFC 7932), zstd (RFC 8878), lzma/lzma2 (xz), lz4 —
-  four independent codec tracks, each KAT'd. ⟂
-- **TLS-RT** — TLS 1.3 (+1.2) key schedule + handshake state machine + record AEAD, driven by
-  **RFC 8448 vectors with no socket**. ⟂
+### Wave 0 — start NOW, fully parallel (separate files)
+**Native value-add:**
+- **T1a — socket CLIENT** `teko_socket.c` (`tcp_connect`/`udp_connect`/`send`/`recv`/`close`; POSIX +
+  Winsock; calloc handle table, fail-loud bounds). ⟂
+- **T1b — socket SERVER (native)** `teko_socket_server.c` (`bind`/`listen`/`accept` loop;
+  scheduler-integrated; native + WASI-gated). ⟂
+- **HTTP-CODEC** — request/response build+parse (headers/body/chunked), KAT'd. ⟂
+- **WS-CODEC** — RFC 6455 frame encode/decode/mask/UTF-8, KAT'd. ⟂
+- **ROUTER-CORE** — AOT static radix-tree builder + middleware chain + handler dispatch over a
+  **synthetic request** (no socket), KAT'd; target-agnostic — proves the server tokens on WASM. ⟂
+- **DEFLATE-CORE** — small native DEFLATE (RFC 1951) + gzip (RFC 1952) + zlib (RFC 1950) +
+  CRC32/Adler-32, KAT'd vs zlib vectors. ⟂
 - **PROTOBUF-CODEC** — protobuf wire encode/decode (for gRPC), KAT'd. ⟂
-- **H2-CODEC** — HTTP/2 framing + HPACK (RFC 7541), KAT'd. ⟂
-- **QUIC-CODEC** — QUIC packet/frame codec (RFC 9000), KAT'd. ⟂
 
-### Wave 1 — after **T1a/T1b → T2**; parallel among themselves
-- **T2 — socket wiring**: CMake + `teko_rt_socket_*` (client) + `teko_rt_server_*` (native-only) +
-  reactor SRCS/EXPORTS (client subset only) + frontend `net.*` surface + native/WASM emit + proofs.
-  → T1a, T1b
-- **HTTP-INT (client)** `http.get/post/...` over the socket client.  → T2 + HTTP-CODEC
-- **HTTP-SRV (native)** HTTP/1.1 server: accept → parse request → router → build response → send.
-  → T2(T1b) + HTTP-CODEC + ROUTER-CORE
-- **WS-INT (client)** client `ws.*` connect/send/recv.  → T2 + HTTP-CODEC + WS-CODEC
-- **RPC** native server+client + WASM client.  → T2
-- **UNITS** `limit(10mbps)` throttle.  → T2
-- **TLS-INT** `tls.client` (+ native `tls.server`) over socket.  → T2 + TLS-RT
-- **COMPRESS-INT** Content-Encoding/Transfer-Encoding (client+server) + permessage-deflate.
-  → HTTP-INT/HTTP-SRV + WS-INT + C-CORE
+**FFI foundation:**
+- **FFI-CORE** — the marshalling / lifetime / error-mapping layer + per-OS library resolution
+  (link-time or `dlopen`/`LoadLibrary`) for calling audited system libs safely. The SAST-critical
+  enabler for every FFI track. ⟂
+
+### Wave 1 — after **T1a/T1b → T2** (+ FFI-CORE for the FFI tracks); parallel
+- **T2 — socket wiring**: CMake + `teko_rt_socket_*` (client) + `teko_rt_server_*` (native/WASI) +
+  reactor SRCS/EXPORTS (client subset) + frontend `net.*` + native/WASM emit + proofs. → T1a,T1b
+- **HTTP-INT (client)** `http.*` over socket. → T2 + HTTP-CODEC
+- **HTTP-SRV (server)** accept → parse → router → response → send (native + WASI). → T2 + HTTP-CODEC + ROUTER-CORE
+- **WS-INT (client)** `ws.*` connect/send/recv. → T2 + HTTP-CODEC + WS-CODEC
+- **RPC** native server+client + WASM client. → T2
+- **UNITS** `limit(10mbps)` throttle. → T2
+- **COMPRESS-INT** Content-Encoding/Transfer-Encoding (DEFLATE core) + permessage-deflate. → HTTP/WS-INT + DEFLATE-CORE
+- **TLS-FFI** `tls.client` (+ native `tls.server`) via system TLS. → FFI-CORE  *(FFI track)*
+- **COMPRESS-FFI** `compress.brotli/zstd/lzma` via system libs. → FFI-CORE + DEFLATE-CORE surface  *(FFI track)*
 
 ### Wave 2 — after Wave-1 deps; parallel
-- **ROUTER-NATIVE** — `api`/`middleware`/verbs as a **real listening server** (ROUTER-CORE over
-  HTTP-SRV); **WASM proof = ROUTER-CORE synthetic request**.  → HTTP-SRV (native) / ROUTER-CORE (WASM)
-- **WS-SRV (native)** — `websocket` server endpoint (accept + handshake + RFC 6455); **WASM proof =
-  synthetic**.  → HTTP-SRV + WS-CODEC
-- **H2-INT** — HTTP/2 (client; native server optional).  → TLS-INT + H2-CODEC
-- **QUIC-INT** — QUIC (client; native server optional).  → T1(UDP) + TLS-RT + QUIC-CODEC
+- **ROUTER-NATIVE** — `api`/`middleware`/verbs as a real server (WASM = synthetic/WASI). → HTTP-SRV/ROUTER-CORE
+- **WS-SRV** — `websocket` server endpoint (WASM = synthetic/WASI). → HTTP-SRV + WS-CODEC
+- **TLS-INT** — `https` = HTTP over TLS-FFI. → TLS-FFI + HTTP-INT/SRV
+- **H2-FFI** — HTTP/2 via nghttp2. → FFI-CORE + TLS-FFI  *(FFI track)*
+- **QUIC-FFI** — QUIC via quiche/msquic. → FFI-CORE + TLS-FFI  *(FFI track)*
 
 ### Wave 3 — after Wave-2; parallel
-- **GRPC** (full) — gRPC.  → H2-INT + PROTOBUF-CODEC   *(minimal `rpc` already live in Wave 1)*
-- **H3-INT** — HTTP/3.  → QUIC-INT + QPACK-CODEC
-
-### ⏸ Truly deferred (cannot be meaningfully parallelized now)
-- **HTTP/4** — **no published standard / RFC exists.** Hard defer (spec gap, not effort).
-- **Async io_uring/kqueue/IOCP backends** — C1 locks cooperative-over-scheduler; the async backend
-  only replaces the blocking syscalls behind the same surface, adds **no token/surface** → perf
-  follow-up.
-- **WASM listening server** — platform impossibility (no sockets); honestly marked, never attempted.
+- **GRPC** — gRPC over H2-FFI + PROTOBUF-CODEC. *(minimal `rpc` already live in Wave 1)*
+- **H3-FFI** — HTTP/3 over QUIC-FFI.
 
 ### Capstone
-- **CAPSTONE** — NATIVE: a real routed `api` server + a `websocket` endpoint + an outbound `http.get`
-  client + a `compress.gzip` round-trip in one program. WASM: the same client calls + the
-  synthetic-request routing proof. Both green. → Wave 0–2.
+- **CAPSTONE** — NATIVE: a routed `api` server + a `websocket` endpoint + an outbound `http.get`
+  client + a `compress.gzip` round-trip + a `tls.client` FFI call, one program. WASM: the client
+  calls + the synthetic-request routing proof. Both green. → Wave 0–2.
 
 ### 2.1 Concurrency hygiene
-Shared files: `CMakeLists.txt` (`CORE_SOURCES` + `teko_rt` lib), `build-crypto-reactor.sh`
-(`SRCS`/`EXPORTS` — **client subset only**, server TUs excluded), and the runtime-id→symbol table
-(`emit_native_hosted.c`). Mitigations set up front by the Master:
-- **Pre-allocated `OP_CALL_RUNTIME` id ranges per track:** net-client 60–69 · net-server(native)
-  70–79 · http 80–99 · ws 100–109 · rpc 110–119 · compress-core 120–139 · brotli 140–149 ·
-  zstd 150–159 · lzma 160–169 · lz4 170–179 · router 175–179 *(see note)* · TLS 180–219 ·
-  H2/HPACK 220–239 · QUIC 240–259 · H3/QPACK 260–279 · gRPC/protobuf 280–299.
-  *(router/throttle ids finalized at T2; ranges are reserved, not yet emitted.)*
-- **Append-only** edits to the CMake lists and reactor `SRCS`/`EXPORTS` at distinct anchors;
-  **native-only server TUs are added to `teko_rt`/`CORE` but NOT to the reactor `SRCS`** (gated
-  `#if !defined(__wasm__)` as a second guard).
-- Prefer `OP_CALL_RUNTIME` ids over new `OP_*` opcodes (less shared-file contention).
+Shared files: `CMakeLists.txt`, `build-crypto-reactor.sh` (`SRCS`/`EXPORTS` — client subset; native
+server + FFI TUs excluded, `#if !defined(__wasm__)` guarded), and the runtime-id→symbol table.
+Pre-allocated `OP_CALL_RUNTIME` id ranges: net-client 60–69 · net-server 70–79 · http 80–99 ·
+ws 100–109 · rpc 110–119 · deflate-core 120–139 · compress-ffi(brotli/zstd/lzma) 140–169 ·
+router/throttle 175–179 · tls-ffi 180–199 · h2-ffi 220–239 · quic-ffi 240–259 · h3-ffi 260–279 ·
+grpc/protobuf 280–299. Append-only edits at distinct anchors; FFI bindings go through FFI-CORE, not
+ad-hoc `extern`.
 
 ---
 
 ## 3. Breadcrumb table (medium → Tech Lead; small → Developer)
 
-| Track | Wave | Role | Native | WASM | Makes live | Deps |
-|---|---|---|---|---|---|---|
-| T1a socket client | 0 | Tech Lead | ✓ | ✓ | enabler | — |
-| T1b socket server (native-only) | 0 | Tech Lead | ✓ | ✗ (marked) | enabler | — |
-| HTTP-CODEC | 0 | Tech Lead | ✓ | ✓ | (codec) | — |
-| WS-CODEC | 0 | Developer | ✓ | ✓ | (codec) | — |
-| ROUTER-CORE (radix + synthetic dispatch) | 0 | Tech Lead | ✓ | ✓ | (router engine) | — |
-| C-CORE compression | 0 | Tech Lead | ✓ | ✓ | `compress.*` core | — |
-| C-BR / C-ZSTD / C-LZMA / C-LZ4 | 0 | TL×3 + Dev | ✓ | ✓ | `compress.{brotli,zstd,lzma,lz4}` | C-CORE surface |
-| TLS-RT | 0 | Tech Lead | ✓ | ✓ | (runtime) | — |
-| PROTOBUF-CODEC | 0 | Developer | ✓ | ✓ | (codec) | — |
-| H2-CODEC | 0 | Tech Lead | ✓ | ✓ | (codec) | — |
-| QUIC-CODEC | 0 | Tech Lead | ✓ | ✓ | (codec) | — |
-| T2 socket wiring | 1 | Tech Lead | client+server | client | `net.*` | T1a,T1b |
-| HTTP-INT (client) | 1 | Tech Lead | ✓ | ✓ | `http.*` | T2,HTTP-CODEC |
-| HTTP-SRV (native server) | 1 | Tech Lead | ✓ | synthetic | (server engine) | T2,HTTP-CODEC,ROUTER-CORE |
-| WS-INT (client) | 1 | Tech Lead | ✓ | ✓ | `ws.*` client | T2,HTTP-CODEC,WS-CODEC |
-| RPC | 1 | Developer | server+client | client | `rpc` | T2 |
-| UNITS throttle | 1 | Developer | ✓ | ✓ | `kbps/mbps/gbps` | T2 |
-| TLS-INT | 1 | Tech Lead | client+server | client | `tls.*` | T2,TLS-RT |
-| COMPRESS-INT | 1 | Tech Lead | ✓ | ✓ | Content-Encoding/permessage-deflate | HTTP/WS-INT,C-CORE |
-| ROUTER-NATIVE (api/middleware/verbs) | 2 | Tech Lead | real server | synthetic | `api middleware get post put delete patch head options` | HTTP-SRV/ROUTER-CORE |
-| WS-SRV (native) | 2 | Tech Lead | real server | synthetic | `websocket` | HTTP-SRV,WS-CODEC |
-| H2-INT | 2 | Tech Lead | ✓ | client | `http2.*` | TLS-INT,H2-CODEC |
-| QUIC-INT | 2 | Tech Lead | ✓ | client | `quic.*` | T1(UDP),TLS-RT,QUIC-CODEC |
-| GRPC full | 3 | Tech Lead | ✓ | client | `grpc.*` | H2-INT,PROTOBUF |
-| H3-INT | 3 | Tech Lead | ✓ | client | `http3.*` | QUIC-INT,QPACK |
-| CAPSTONE | — | Master | ✓ | ✓ | — | 0–2 |
+| Track | Wave | Kind | Role | Native | WASM | Makes live | Deps |
+|---|---|---|---|---|---|---|---|
+| T1a socket client | 0 | native | Tech Lead | ✓ | ✓ | enabler | — |
+| T1b socket server | 0 | native | Tech Lead | ✓ | WASI/synthetic | enabler | — |
+| HTTP-CODEC | 0 | native | Tech Lead | ✓ | ✓ | (codec) | — |
+| WS-CODEC | 0 | native | Developer | ✓ | ✓ | (codec) | — |
+| ROUTER-CORE | 0 | native | Tech Lead | ✓ | ✓ | (router engine) | — |
+| DEFLATE-CORE | 0 | native | Tech Lead | ✓ | ✓ | `compress.deflate/gzip/zlib` | — |
+| PROTOBUF-CODEC | 0 | native | Developer | ✓ | ✓ | (codec) | — |
+| FFI-CORE | 0 | FFI infra | Tech Lead | ✓ | n/a (host-import) | (FFI boundary) | — |
+| T2 socket wiring | 1 | native | Tech Lead | c+s | client+WASI | `net.*` | T1a,T1b |
+| HTTP-INT (client) | 1 | native | Tech Lead | ✓ | ✓ | `http.*` | T2,HTTP-CODEC |
+| HTTP-SRV (server) | 1 | native | Tech Lead | ✓ | WASI/synthetic | (server engine) | T2,HTTP-CODEC,ROUTER-CORE |
+| WS-INT (client) | 1 | native | Tech Lead | ✓ | ✓ | `ws.*` | T2,HTTP-CODEC,WS-CODEC |
+| RPC | 1 | native | Developer | s+c | client | `rpc` | T2 |
+| UNITS throttle | 1 | native | Developer | ✓ | ✓ | `kbps/mbps/gbps` | T2 |
+| COMPRESS-INT | 1 | native | Tech Lead | ✓ | ✓ | Content-Encoding/permessage-deflate | HTTP/WS-INT,DEFLATE-CORE |
+| **TLS-FFI** | 1 | **FFI** | Tech Lead | ✓ | host-import | `tls.*` | FFI-CORE |
+| **COMPRESS-FFI** | 1 | **FFI** | Tech Lead | ✓ | host where avail | `compress.brotli/zstd/lzma` | FFI-CORE,DEFLATE-CORE |
+| ROUTER-NATIVE | 2 | native | Tech Lead | real server | synthetic/WASI | `api middleware get post put delete patch head options` | HTTP-SRV/ROUTER-CORE |
+| WS-SRV | 2 | native | Tech Lead | real server | synthetic/WASI | `websocket` | HTTP-SRV,WS-CODEC |
+| TLS-INT | 2 | FFI | Tech Lead | ✓ | host | `https` | TLS-FFI |
+| **H2-FFI** | 2 | **FFI** | Tech Lead | ✓ | client | `http2.*` | FFI-CORE,TLS-FFI |
+| **QUIC-FFI** | 2 | **FFI** | Tech Lead | ✓ | client | `quic.*` | FFI-CORE,TLS-FFI |
+| GRPC | 3 | FFI+native | Tech Lead | ✓ | client | `grpc.*` | H2-FFI,PROTOBUF |
+| H3-FFI | 3 | FFI | Tech Lead | ✓ | client | `http3.*` | QUIC-FFI |
+| CAPSTONE | — | both | Master | ✓ | ✓ | — | 0–2 |
 
-**Token-completeness milestone** (every reserved web token + units live, native real + WASM
-synthetic/host proof) = **ROUTER-NATIVE + WS-SRV (Wave 2) + RPC/UNITS (Wave 1)** — reachable without
-TLS/H2/QUIC/H3/gRPC.
-
----
-
-## 4. Compression tiering (owner request)
-
-`src/runtime/teko_compress.c` (+ siblings) = single C source of truth, KAT'd vs RFC/zlib/reference
-vectors. **`compress.*` is a free dotted surface** (verified: no reserved compression token —
-`bundle`/`minify` are Phase-20 asset tooling, unrelated).
-
-- **CORE (Phase 19, Wave 0):** DEFLATE (RFC 1951 inflate+deflate) + zlib (RFC 1950) + gzip
-  (RFC 1952) + CRC32 + Adler-32 — needed for a credible HTTP/WS client AND server (Content-Encoding,
-  Transfer-Encoding, permessage-deflate).
-- **PARALLEL tracks:** brotli (RFC 7932, HTTP `br`), zstd (RFC 8878), lzma/lzma2 (xz), lz4.
-
-### SAST / security (gate + docs)
-Compression + encryption enables **CRIME/BREACH** compression-oracle attacks. Therefore: (1) **never
-auto-compress secret/encrypted payloads by default** — compression is a **separate, opt-in layer**;
-(2) **TLS 1.3 carries no record compression** (anti-CRIME) and we keep it so; (3) **safe composition
-only — does NOT change the Phase-13 crypto primitives.** Decompression is the highest-risk
-untrusted-input surface: enforce output size caps (**decompression-bomb** guard), bounds-checked
-window/dictionary access, and integer-overflow-safe length arithmetic in every inflate path.
+**Token-completeness milestone** (every reserved web token + units live: native real server/client +
+WASM client/synthetic) = **ROUTER-NATIVE + WS-SRV (Wave 2) + RPC/UNITS (Wave 1)** — reachable with
+**only native tracks**; needs no FFI (TLS/compress-heavy/QUIC/H2 are dotted surfaces).
 
 ---
 
-## 5. Size estimate (revised — native server adds ~1.5–2.5k)
+## 4. Compression tiering (FFI posture)
+- **Native DEFLATE core (Phase 19):** DEFLATE (RFC 1951) + gzip (RFC 1952) + zlib (RFC 1950) +
+  CRC32/Adler-32 — small, low-risk, uniform across OSes (**Windows ships no system zlib**), compiled
+  into the reactor for WASM too. Drives Content-Encoding/Transfer-Encoding + permessage-deflate.
+- **FFI compressors:** `compress.brotli` (libbrotli), `compress.zstd` (libzstd), `compress.lzma`
+  (liblzma) — thin FFI bindings via FFI-CORE; on WASM, host-import where available (Node has brotli),
+  else a documented gap. `compress.*` is a **free dotted surface** (verified: no reserved compression
+  token; `bundle`/`minify` are Phase-20 asset tooling).
 
-- **A1 token-completeness core** (T1a+T1b+T2, HTTP codec, HTTP client+native server, ROUTER core +
-  native, WS codec+client+native server, RPC, UNITS, compression CORE): **~7,000–9,500 LOC** — the
-  milestone where every reserved web token + units is live (native real server/client + WASM
-  client/synthetic).
-- **Compression parallel codecs** (brotli/zstd/lzma/lz4 + KATs): **~6,000–9,000 LOC**.
-- **TLS track** (TLS-RT + TLS-INT, 1.3 primary + 1.2 secondary, client + native server):
-  **~3,000–4,500 LOC**.
-- **Advanced protocol tracks** (protobuf, H2+HPACK, gRPC, QUIC, H3+QPACK): **~10,000–14,000 LOC**.
-- **Full parallel ambition** (everything except truly-deferred HTTP/4 + async backends + WASM
-  server): **~26,000–37,000 LOC** across ~12 concurrent Wave-0 tracks + downstream waves.
-
-Max-parallelism holds: the ~12 Wave-0 tracks have no inter-dependencies; serialization is confined
-to the integration nodes (T2 and the `*-INT`/`*-SRV` steps).
+### SAST / security
+Compression + encryption → **CRIME/BREACH** oracle risk: compression is a **separate, opt-in layer**,
+**never** auto-applied to encrypted/secret payloads; TLS carries **no record compression**. This is
+**safe composition only — Phase-13 crypto primitives are unchanged.** Decompression (native DEFLATE +
+any FFI lib output) gets **output size caps** (decompression-bomb guard), bounds-checked window
+access, overflow-safe length math.
 
 ---
 
-## 6. Bars (unchanged) + per-breadcrumb SAST gate
-One increment/commit; ASan+UBSan **both** dispatch paths + TSan; **16 native goldens byte-identical**
-(all new emission gated behind `uses_*`; native-only server TUs additionally `#if !defined(__wasm__)`
-guarded and excluded from the reactor); 4 CI gates green incl. Windows MSVC (x86_64+arm64);
-executable `.tks` proof per surface on **native AND WASM** (server tokens: native real + WASM
-synthetic-request); no dead tokens; the human merges the principal PR; **English only**.
+## 5. Future targets (explicitly deferred — out of Phase 19 scope)
+- **musl / 100% static, dependency-free binary** — the static-link target. Dropped from Phase 19;
+  documented future work.
+- **From-scratch native TLS 1.3/1.2 + crypto-for-TLS** (RFC 8448 stack) — only needed for the
+  static/musl mode; deferred with it. (Phase-13 crypto primitives stay as-is, unchanged.)
+- **HTTP/4** — no published standard / RFC exists. Hard defer (spec gap).
+- **Async io_uring/kqueue/IOCP backends** — perf-only; behind the same `net.*` surface; no new token.
+- **WASM browser listening server** — platform impossibility; honestly marked (browser falls back to
+  host-import client; WASI server is supported where the runtime provides `wasi-sockets`).
 
-**SAST focus for this phase:** both the **server** (accepted connections, parsed requests) and the
-**client** (server responses) handle **attacker-controlled** bytes; compressed input too. Every
-parser (HTTP request/response, WS frame, every inflate path, TLS records, protobuf, HPACK/QPACK,
-QUIC packets, the router's path/method match) is an injection/overflow surface. Enforce: bounds/
-length checks before every copy; decompression output caps (bomb guard); integer-overflow-safe size
-arithmetic; `calloc` zero-init + clear ownership (no UAF/double-free); width-correct casts incl.
-Windows LLP64 `intptr_t`/`int32_t`; no format-string/path-traversal on URLs/headers/routes; the
-accept loop hardened against fd exhaustion / slowloris (timeouts, caps); new emission gated +
-feature-free output byte-identical; compression kept opt-in, never auto-applied to encrypted/secret
-payloads.
+---
+
+## 6. Size estimate (FFI posture — well below the prior ~26–37k)
+Replacing from-scratch TLS (~3–4.5k), from-scratch brotli/zstd/lzma (~6–9k), and from-scratch QUIC
+(large) with **thin FFI bindings (~300–800 LOC each incl. marshalling + KAT/proof)** collapses the
+estimate:
+
+- **A1 token-completeness core** (T1a/T1b/T2, HTTP codec+int+srv, WS codec+int+srv, router core+
+  native, RPC, UNITS, DEFLATE core, FFI-CORE, protobuf): **~8,000–11,000 LOC**.
+- **FFI binding tracks** (TLS, brotli, zstd, lzma, H2/nghttp2, QUIC/quiche, gRPC, H3): **~3,000–5,000
+  LOC** total (thin bindings + proofs).
+- **Full Phase-19 ambition under the FFI posture:** **~11,000–16,000 LOC** — roughly **half** the
+  prior from-scratch estimate, and most of it the native value-add (sockets/HTTP1/WS/router/DEFLATE).
+
+---
+
+## 7. Bars (unchanged) + per-breadcrumb SAST gate
+One increment/commit; ASan+UBSan **both** dispatch paths + **TSan** (the FFI boundary is exactly
+where the prior wild-free hid — see below); **16 native goldens byte-identical** (all new emission
+gated; native server + FFI TUs `#if !defined(__wasm__)` guarded, excluded from the reactor); 4 CI
+gates green incl. Windows MSVC; executable `.tks` proof per surface on **native AND WASM** (server
+tokens: native real + WASM synthetic/WASI); no dead tokens; the human merges the principal PR;
+**English only**.
+
+**SAST focus (now centred on the FFI boundary):**
+- **Marshalling** — teko value ↔ C ABI: buffer pointer+length correctness, NUL-termination, no
+  reading past a returned buffer, width-correct casts (`intptr_t`/`int32_t`, Windows LLP64),
+  signed/unsigned at the boundary.
+- **Lifetimes / ownership** — who frees (the lib vs teko); **`calloc` zero-init + clear ownership; no
+  UAF/double-free.** The prior **~50% Windows crash was a wild-free in `src/parser_ffi.c`** that only
+  **TSan** caught — keep the TSan gate and treat every new FFI binding as that class of risk.
+- **Error mapping** — every system-lib return code is checked and mapped to a teko fail-loud error;
+  never ignore a negative/NULL return; no silent partial reads/writes.
+- **Native parser bounds** — HTTP request/response, WS frames, the router's path/method match, and
+  the DEFLATE core are **attacker-controlled** surfaces: bounds/length checks before every copy;
+  decompression-bomb caps; integer-overflow-safe sizing; accept loop hardened vs fd-exhaustion/
+  slowloris (timeouts, caps). No format-string/path-traversal on URLs/headers/routes.
+- Compression kept opt-in, never auto-applied to encrypted/secret payloads; new emission gated +
+  feature-free output byte-identical.
