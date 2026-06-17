@@ -151,11 +151,12 @@ EXPORTS=(teko_rt_sha512_hex teko_rt_sha384_hex teko_rt_sha3_256_hex teko_rt_sha3
          teko_deflate_compress teko_deflate_decompress
          teko_zlib_compress teko_zlib_decompress
          teko_gzip_compress teko_gzip_decompress
-         # Phase 19 (ROUTER-CORE Wave 0, ids 175-179 RESERVED): target-agnostic radix-tree router.
-         # The dispatch entry point is exported so the emitted WASM module can call it from the reactor.
-         # Frontend wiring (OP_CALL_RUNTIME ids) is deferred to ROUTER-NATIVE (Wave 2).
-         teko_router_new teko_router_free teko_router_reset
-         teko_router_add teko_router_dispatch)
+         # Phase 19 (ROUTER-NATIVE Wave 2): teko_rt_router_* wrappers over teko_router.c —
+         # the emitted WASM module imports these from the "crypto" (reactor) namespace,
+         # same pattern as duplex/delayed/broadcast. The raw teko_router_* symbols are NOT
+         # exported directly; the _rt_ wrappers collapse handles/ptrs to register-width i32.
+         teko_rt_router_new teko_rt_router_add teko_rt_router_dispatch
+         teko_rt_router_free teko_rt_router_status)
 LDEXPORTS=(); for e in "${EXPORTS[@]}"; do LDEXPORTS+=("--export=$e"); done
 
 # Layout: keep the whole reactor image (data + shadow stack + heap) ABOVE Teko's

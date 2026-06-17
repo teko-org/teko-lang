@@ -437,6 +437,13 @@ typedef struct {
     // native programs always link libteko_rt.a which carries teko_rt_http_get/post.
     // HTTP-free programs (incl. the 16 freestanding goldens) stay byte-identical.
     int uses_http;
+    // Phase 19 (ROUTER-NATIVE): set to 1 when any api{} block (OP_CALL_RUNTIME ids 175-178) is
+    // emitted. Gates wasm_emit_router on the WASM backend (reactor imports teko_router_*); native
+    // links teko_rt_router_* via libteko_rt.a. Router-free programs stay byte-identical.
+    int uses_router;
+    // Phase 19 (ROUTER-NATIVE): set to 1 when a native HTTP server accept loop is needed (api{})
+    // block on a native target). WASM never sets this (synthetic dispatch only on WASM).
+    int uses_httpsrv;
     // Phase 17 (17.A): the float-constant pool — f64 bit patterns indexed by OP_FCONST's 4-byte
     // arg. Mirrors the string pool (codegen_li_add_float_constant dedups by bit-equality). Threaded
     // to the backend via teko_metal_set_floats. `uses_float` is 1 once any float opcode is emitted,

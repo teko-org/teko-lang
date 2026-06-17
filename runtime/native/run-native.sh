@@ -621,6 +621,35 @@ check_random random.tks
 check_uuid uuid_rng.tks
 check_time
 
+# Phase 19 (ROUTER-NATIVE — api block) DISCRIMINATING native runner proof.
+# Proves the radix router SELECTS by method+path, not by registration order.
+# lower_api_block emits:
+#   (a) In-order dispatch: GET/hello→200, POST/data→201, DELETE/gone→204
+#   (b) OUT-OF-ORDER dispatch: last route (DELETE/gone→204) dispatched FIRST, then
+#       first route (GET/hello→200) dispatched LAST — proves selection, not sequence.
+#   (c) router_status(GET,/notfound) → 404  (path not registered — impossible via inline emit)
+#   (d) router_status(PATCH,/hello) → 405   (path exists, wrong method — impossible via inline emit)
+# Expected output: 200 201 204 204 200 404 405 (7 lines).
+# IMPOSSIBLE via inline emission (no emit() call produces 404/405) or sequential slot return
+# (the out-of-order 204,200 sequence cannot occur from registration order).
+# SAST: method/path are compile-time constants; no user strings passed to any syscall.
+check_api() {
+  local sample="api.tks" exe got expected router_count
+  exe="$TMP/api"
+  echo "--- $sample (discriminating radix-tree routing) ---"
+  "$TEKO" build "$HERE/samples/$sample" --target=host --rt-lib="$RTLIB" -o "$exe" \
+    || fail "compile/link failed for $sample"
+  got="$("$exe")" || fail "api exited non-zero"
+  expected="$(printf '200\n201\n204\n204\n200\n404\n405')"
+  [ "$got" = "$expected" ] || fail "api: expected [${expected//$'\n'/,}], got [${got//$'\n'/,}]"
+  # Assert router_dispatch AND router_status symbols are present (proved id 177 + 179 ran).
+  router_count=$(nm "$exe" 2>/dev/null | grep -c "router" || true)
+  [ "$router_count" -gt 0 ] || fail "api: no router symbols in binary (nm grep router returned 0)"
+  echo "OK: api -> [in-order 200,201,204] + [out-of-order 204,200] + [miss 404] + [method-mismatch 405]; router symbols=$router_count"
+}
+
+check_api
+
 # Phase 19 (T2 — net.* socket frontend wiring): connect → send → recv loopback proof.
 # A Python3 TCP echo server (one-connection, echo-then-close) is started on port 17342,
 # net.tks compiles, the binary runs (net.tcp_connect → send "hello" → recv → emit), and

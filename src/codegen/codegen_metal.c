@@ -38,6 +38,8 @@ MetalContext* teko_metal_create(const char* output_asm_path, TekoTarget target) 
     ctx->wasm_emit_simd = 0;
     ctx->wasm_emit_net  = 0; // Phase 19 (T2): default OFF — malloc'd ctx, must zero-init like its siblings
     ctx->wasm_emit_http = 0; // Phase 19 (HTTP-INT): default OFF — CRITICAL: must zero-init (T2 bug lesson)
+    ctx->wasm_emit_router  = 0; // Phase 19 (ROUTER-NATIVE): default OFF — zero-init required (malloc'd)
+    ctx->wasm_emit_httpsrv = 0; // Phase 19 (ROUTER-NATIVE HTTP-SRV): default OFF — zero-init required
     ctx->wasm_emit_delayed = 0;
     ctx->wasm_emit_bcast = 0;
     ctx->wasm_emit_shared = 0;
@@ -172,6 +174,12 @@ void teko_metal_set_emit_net(MetalContext* ctx, int enabled) {
 void teko_metal_set_emit_http(MetalContext* ctx, int enabled) {
     if (!ctx) return;
     ctx->wasm_emit_http = enabled ? 1 : 0;
+}
+void teko_metal_set_emit_router(MetalContext* ctx, int enabled) {
+    if (ctx) ctx->wasm_emit_router = enabled ? 1 : 0;
+}
+void teko_metal_set_emit_httpsrv(MetalContext* ctx, int enabled) {
+    if (ctx) ctx->wasm_emit_httpsrv = enabled ? 1 : 0;
 }
 
 void teko_metal_set_hosted(MetalContext* ctx, int enabled) {

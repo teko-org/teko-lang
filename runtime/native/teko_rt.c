@@ -32,6 +32,7 @@
 #include "teko_http.h"         // Phase 19 (HTTP-INT): HTTP/1.1 codec (pure; used by teko_rt_http_*)
 // Phase 19 (T1b) — server socket runtime (NATIVE-ONLY; guarded in the header).
 #include "teko_socket_server.h"
+#include "teko_router.h"           // Phase 19 (ROUTER-NATIVE): target-agnostic radix-tree router
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1366,3 +1367,51 @@ long teko_rt_server_conn_count(long handle) {
     return (long)teko_server_conn_count((const TekoServer*)(intptr_t)handle);
 }
 #endif // !defined(__wasm__)
+
+// Phase 19 (ROUTER-NATIVE — Wave 2): register-width ABI wrappers over teko_router.c.
+// OP_CALL_RUNTIME id range 175-178: router_new/add/dispatch/free.
+// NOT wasm-guarded — teko_router.c is target-agnostic (no OS calls, no sockets).
+// The wasm_emit_router flag gates WASM IMPORT emission; native links unconditionally.
+// SAST: method/path args are teko compile-time string constants (no format-string/traversal);
+// teko_router_add validates every segment (rejects '.'/'..'/empty/NUL/'/'); dispatch is
+// bounds-checked; integer-overflow-safe sizing; no attacker-controlled input at this level.
+
+// id 175: teko_rt_router_new(unused) -> handle (TekoRouter* as long); arg ignored.
+long teko_rt_router_new(long unused) {
+    (void)unused;
+    return (long)(intptr_t)teko_router_new();
+}
+// id 176: teko_rt_router_add(method_ptr, path_ptr, handler_id, handle) -> 0 on success, -1 on error.
+// ABI: $a0=method_ptr, $a1=path_ptr, $a2=handler_id, $w0=handle (last arg). Middleware=future.
+long teko_rt_router_add(long method_ptr, long path_ptr, long handler_id, long handle) {
+    TekoRouter*  r      = (TekoRouter*)(intptr_t)handle;
+    const char*  method = (const char*)(intptr_t)method_ptr;
+    const char*  path   = (const char*)(intptr_t)path_ptr;
+    return (long)teko_router_add(r, method, path, (int)handler_id, NULL, 0);
+}
+// id 177: teko_rt_router_dispatch(handle, method_ptr, path_ptr) -> handler_id (-1 on 404/405).
+// ABI: $a0=handle, $a1=method_ptr, $w0=path_ptr (last arg).
+long teko_rt_router_dispatch(long handle, long method_ptr, long path_ptr) {
+    TekoRouter*  r      = (TekoRouter*)(intptr_t)handle;
+    const char*  method = (const char*)(intptr_t)method_ptr;
+    const char*  path   = (const char*)(intptr_t)path_ptr;
+    TekoRouteMatch m = teko_router_dispatch(r, method, path, NULL);
+    return (long)m.handler_id; // -1 on 404/405
+}
+// id 178: teko_rt_router_free(handle) -> 0.
+long teko_rt_router_free(long handle) {
+    teko_router_free((TekoRouter*)(intptr_t)handle);
+    return 0;
+}
+// id 179: teko_rt_router_status(handle, method_ptr, path_ptr) -> status (200/404/405).
+// ABI: $a0=handle, $a1=method_ptr, $w0=path_ptr (last arg).
+// Returns TEKO_ROUTE_OK(200), TEKO_ROUTE_404(404), or TEKO_ROUTE_405(405).
+// SAST: method/path are compile-time string constants (same posture as id 177);
+// teko_router_dispatch validates all input; status is an int (no overflow).
+long teko_rt_router_status(long handle, long method_ptr, long path_ptr) {
+    TekoRouter*  r      = (TekoRouter*)(intptr_t)handle;
+    const char*  method = (const char*)(intptr_t)method_ptr;
+    const char*  path   = (const char*)(intptr_t)path_ptr;
+    TekoRouteMatch m = teko_router_dispatch(r, method, path, NULL);
+    return (long)m.status; // 200, 404, or 405
+}

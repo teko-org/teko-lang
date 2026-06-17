@@ -40,7 +40,9 @@ BytecodeBuffer* codegen_li_create_context(void) {
     buffer->uses_simd = 0;
     buffer->uses_vtable = 0;
     buffer->uses_net  = 0;
-    buffer->uses_http = 0; // Phase 19 (HTTP-INT): default OFF — zero-init so the 16 goldens stay byte-identical
+    buffer->uses_http = 0;   // Phase 19 (HTTP-INT): default OFF — zero-init so the 16 goldens stay byte-identical
+    buffer->uses_router   = 0; // Phase 19 (ROUTER-NATIVE): default OFF — zero-init required
+    buffer->uses_httpsrv  = 0; // Phase 19 (ROUTER-NATIVE): default OFF — zero-init required
 
     // Phase 17 (17.A): the float-constant pool starts empty; uses_float gates the WASM float locals.
     buffer->float_capacity = 8;
@@ -244,6 +246,10 @@ void codegen_li_emit_call_runtime(BytecodeBuffer* buffer, int codec_id) {
     // is in libteko_rt.a. Set uses_http so the WASM emitter gates the import declarations —
     // HTTP-free programs stay byte-identical.
     if (codec_id == 80 || codec_id == 81) buffer->uses_http = 1;
+    // Phase 19 (ROUTER-NATIVE): ids 175-178 are the router surface (router_new/add/dispatch/free).
+    // On WASM the backend imports teko_router_* from the reactor; on native teko_rt_router_* is
+    // linked unconditionally in libteko_rt.a. Set uses_router so the WASM emitter gates imports.
+    if (codec_id >= 175 && codec_id <= 178) buffer->uses_router = 1;
     emit_byte(buffer, OP_CALL_RUNTIME);
     emit_int(buffer, codec_id);
 }
