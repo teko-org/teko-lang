@@ -544,7 +544,9 @@ int teko_ffi_lockfile_write(const TekoFfiLockfile* lf, const char* path) {
     int n = snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
     if (n < 0 || (size_t)n >= sizeof(tmp_path)) { errno = ENAMETOOLONG; return -1; }
 
-    FILE* f = fopen(tmp_path, "w");
+    /* Open in binary mode on all platforms for deterministic byte output
+     * (no CRLF translation on Windows). */
+    FILE* f = fopen(tmp_path, "wb");
     if (!f) return -1;
 
     fprintf(f, "# teko ffi lockfile v1\n");
@@ -596,7 +598,9 @@ TekoFfiLockfile* teko_ffi_lockfile_read(const char* path,
         return NULL;
     }
 
-    FILE* f = fopen(path, "r");
+    /* Open in binary mode on all platforms for consistent byte reading
+     * (no CRLF translation on Windows). */
+    FILE* f = fopen(path, "rb");
     if (!f) return NULL; /* File does not exist: not an error. */
 
     TekoFfiLockfile* lf = (TekoFfiLockfile*)calloc(1, sizeof(TekoFfiLockfile));
