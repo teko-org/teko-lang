@@ -77,6 +77,10 @@ int codegen_li_emit_wasm(const BytecodeBuffer* buffer, const char* wat_path,
     // host-imports when the program uses any http.* surface op (ids 80-81). Native targets already
     // link teko_rt_http_* via libteko_rt.a (HTTP-free programs stay byte-identical on all targets).
     teko_metal_set_emit_http(ctx, buffer->uses_http);
+    // Phase 19 (ROUTER-NATIVE): import teko_router_* from the reactor when the program uses an
+    // api{} block (ids 175-178). Native links teko_rt_router_* via libteko_rt.a. Router-free
+    // programs (incl. the 16 freestanding goldens) stay byte-identical on all targets.
+    teko_metal_set_emit_router(ctx, buffer->uses_router);
     // Phase 17 (17.A): hand the WASM emitter the float-constant pool + uses_float flag (the latter
     // gates the `(local $f0/$f1/$fvN f64)` declarations — float-free modules stay byte-identical).
     teko_metal_set_floats(ctx, buffer->floats, buffer->float_count);

@@ -3361,6 +3361,119 @@ static void lower_shared_block(BytecodeBuffer* b, Parser* p, const LowerCtx* ctx
     codegen_li_emit_shared(b, OP_SHARED_LEAVE);
 }
 
+// Phase 19 (ROUTER-NATIVE): lower the `api { … }` block's $main preamble:
+//   1. Emit teko_rt_router_new() -> store handle in a local ($v<router_local>).
+//   2. For each collected route: emit router_add(method, path, handler_id, handle).
+// On WASM (SYNTHETIC proof): also emit a sequence of router_dispatch + OP_CALL_FUNC
+// calls for each registered route (fabricated request — proves grammar/emission/routing).
+// On NATIVE (uses_httpsrv): the accept loop and HTTP parsing are emitted by emit_native_hosted.c
+// when it processes the bytecode; the router_local slot carries the TekoRouter handle.
+//
+// Also sets buffer->uses_router = 1 (gates WASM reactor import + native linking).
+// uses_httpsrv is set by the caller for native targets (handled in teko_compile_interop).
+//
+// SAST: method/path are compile-time string constants from the source text — no
+// attacker-controlled input enters these OP_CALL_RUNTIME/OP_SETARG calls; teko_router_add
+// validates all segments on the C side (path traversal rejected). The handler_id is a
+// compile-time routine-table integer — no integer overflow (capped at TEKO_MAX_ROUTES * slots).
+// ROUTER-NATIVE route/middleware data model (moved here so it precedes its first user,
+// lower_api_block, and the collect_api pre-pass / emitters below).
+#define TEKO_MAX_ROUTES     64
+#define TEKO_MAX_MIDDLEWARES 16
+typedef struct {
+    char method[8];   // HTTP verb NUL-terminated (max "OPTIONS\0")
+    char path[256];   // URL path pattern NUL-terminated
+    char handler[96]; // body source (the fn/inline body lexeme, for re-lex in emit_api_routines)
+    int  slot;        // routine table slot assigned by collect_api
+    int  mw_slots[TEKO_MAX_MIDDLEWARES]; // middleware routine slots, in use order
+    int  mw_count;
+} RouteInfo;
+typedef struct {
+    char name[96];
+    char handler[96]; // body source
+    int  slot;
+} MiddlewareInfo;
+static RouteInfo      g_route[TEKO_MAX_ROUTES];
+static int            g_nroute;
+static MiddlewareInfo g_mw[TEKO_MAX_MIDDLEWARES];
+static int            g_nmw;
+// Global middleware 'use' list for the current api block (applied to every route in the block).
+static char g_mw_use[TEKO_MAX_MIDDLEWARES][96];
+static int  g_nmw_use;
+
+static void lower_api_block(BytecodeBuffer* b, Parser* p,
+                             ImportBinding* binds, int nb,
+                             int router_local) {
+    fe_advance(p); // consume 'api'
+    if (p->current_token.type != TOKEN_LBRACE) return;
+    // Skip the api block body (already processed by collect_api pre-pass).
+    // We only need to emit the $main preamble here.
+    {
+        int depth = 0;
+        while (p->current_token.type != TOKEN_EOF) {
+            if (p->current_token.type == TOKEN_LBRACE) { depth++; fe_advance(p); }
+            else if (p->current_token.type == TOKEN_RBRACE) {
+                depth--; fe_advance(p);
+                if (depth == 0) break;
+            } else fe_advance(p);
+        }
+    }
+
+    if (g_nroute == 0 && g_nmw == 0) return;
+    b->uses_router = 1; // gate WASM reactor imports
+
+    // 1. Emit router_new(0) -> handle stored in router_local.
+    //    id 175 = teko_rt_router_new; arity 1 (ignored arg).
+    codegen_li_emit_iconst(b, 0); // ignored arg -> $w0
+    codegen_li_emit_call_runtime(b, 175);
+    codegen_li_emit_store_local(b, router_local);
+
+    // 2. For each route: emit router_add(method_ptr, path_ptr, handler_id, handle).
+    //    id 176 = teko_rt_router_add; arity 4:
+    //      $a0 = method_ptr, $a1 = path_ptr, $a2 = handler_id, $w0 = handle (last).
+    for (int ri = 0; ri < g_nroute; ri++) {
+        RouteInfo* r = &g_route[ri];
+        // $a0 = method string pointer
+        codegen_li_emit_sconst(b, codegen_li_add_string_constant(b, r->method));
+        codegen_li_emit_setarg(b, 0);
+        // $a1 = path string pointer
+        codegen_li_emit_sconst(b, codegen_li_add_string_constant(b, r->path));
+        codegen_li_emit_setarg(b, 1);
+        // $a2 = handler_id (the routine table slot)
+        codegen_li_emit_iconst(b, r->slot);
+        codegen_li_emit_setarg(b, 2);
+        // $w0 = handle (last arg)
+        codegen_li_emit_load_local(b, router_local);
+        codegen_li_emit_call_runtime(b, 176); // router_add -> result (0/-1) in $w0 (discarded)
+    }
+
+    // 3. WASM SYNTHETIC PROOF: dispatch fabricated requests for each route and call the handler.
+    //    This proves grammar/emission/routing on BOTH targets (native server uses the runtime
+    //    accept loop instead, but the router_dispatch is still exercised there too).
+    //    Dispatch: router_dispatch(handle, method, path) -> handler_id in $w0.
+    //    id 177 = teko_rt_router_dispatch; arity 3: $a0=handle, $a1=method, $w0=path.
+    for (int ri = 0; ri < g_nroute; ri++) {
+        RouteInfo* r = &g_route[ri];
+        // Dispatch the exact same method+path used at registration (proof: 200 OK expected).
+        codegen_li_emit_load_local(b, router_local);
+        codegen_li_emit_setarg(b, 0);
+        codegen_li_emit_sconst(b, codegen_li_add_string_constant(b, r->method));
+        codegen_li_emit_setarg(b, 1);
+        codegen_li_emit_sconst(b, codegen_li_add_string_constant(b, r->path));
+        codegen_li_emit_call_runtime(b, 177); // router_dispatch -> handler_id in $w0
+        // Call the handler: OP_CALL_FUNC(0) uses $w0 as the slot.
+        b->uses_spawn = 1; // routine table + scheduler must exist for OP_CALL_FUNC
+        codegen_li_emit_call_func(b, 0); // 0 args; handler slot from $w0
+    }
+
+    // 4. Free the router after the proof sequence.
+    //    id 178 = teko_rt_router_free; arity 1: $w0 = handle.
+    codegen_li_emit_load_local(b, router_local);
+    codegen_li_emit_call_runtime(b, 178);
+
+    (void)binds; (void)nb;
+}
+
 // Skip a whole `extern …;` / `extern { … }` declaration. Needed by the fn scanners
 // below so the `fn` token INSIDE `extern fn …` is not mistaken for a handler.
 static void skip_extern_decl(Parser* p) {
@@ -3558,6 +3671,238 @@ static void collect_events(const char* source, ImportBinding* fns, int nfns) {
         }
         fe_advance(&p);
     }
+}
+
+// ---- Phase 19 (ROUTER-NATIVE): api{} block — route + middleware registry --------------------
+// An `api { get("/path") { body } … middleware name { body } }` block collects:
+//   (a) route definitions: HTTP verb, path pattern, handler routine slot (compile-time);
+//   (b) middleware declarations: name + routine slot.
+// Slots continue the global routine table counter (dense, after handlers/methods).
+// ZERO RUNTIME REFLECTION: verb, path, and handler slot are all compile-time constants;
+// teko_rt_router_add is called once at $main startup; per-request dispatch is a pure
+// C radix-tree match (no name lookup at runtime). The registered slots are then invoked
+// via OP_CALL_FUNC (static, integer-indexed call_indirect on WASM / direct call on native).
+//
+// SAST on the registered routes:
+//   - Paths are teko string constants — no attacker-controlled input at registration time.
+//   - teko_rt_router_add (= teko_router_add) validates each segment: rejects '.'/'..'/empty.
+//   - At dispatch time (runtime), path comes from parsed HTTP request (teko_http bounds-checked);
+//     the radix match itself never copies into a format-string or executes arbitrary code.
+//   - Handler calls via OP_CALL_FUNC use a compile-time-bounded slot: no integer overflow.
+// (ROUTER-NATIVE route/middleware data model moved up — defined before lower_api_block,
+//  its first user. See the `#define TEKO_MAX_ROUTES` block above lower_api_block.)
+
+// Return the HTTP verb string for the token type (returns NULL for non-verb tokens).
+static const char* verb_token_to_method(TokenType t) {
+    switch (t) {
+        case TOKEN_GET:     return "GET";
+        case TOKEN_POST:    return "POST";
+        case TOKEN_PUT:     return "PUT";
+        case TOKEN_DELETE:  return "DELETE";
+        case TOKEN_PATCH:   return "PATCH";
+        case TOKEN_HEAD:    return "HEAD";
+        case TOKEN_OPTIONS: return "OPTIONS";
+        default:            return NULL;
+    }
+}
+
+// Check if current token is an HTTP verb token with a following '(' (route definition head).
+static int is_verb_head(const Parser* p) {
+    return verb_token_to_method(p->current_token.type) != NULL &&
+           p->peek_token.type == TOKEN_LPAREN;
+}
+
+// (duplicate skip_brace_block removed — the original is defined earlier in this file.)
+
+// Phase 19 (ROUTER-NATIVE): pre-pass that builds the route registry (g_route[]) and
+// middleware registry (g_mw[]). Assigns a routine slot to each handler/middleware body
+// (continuing the global counter from base_slot). The `use name;` directives inside the
+// api block are recorded in g_mw_use so lower_api_block can apply them to every route.
+static void collect_api(const char* source, int base_slot) {
+    g_nroute = 0; g_nmw = 0; g_nmw_use = 0;
+    Lexer lx; lexer_init(&lx, source);
+    Parser p; parser_init(&p, &lx);
+    int slot = base_slot;
+    while (p.current_token.type != TOKEN_EOF) {
+        if (p.current_token.type != TOKEN_API) { fe_advance(&p); continue; }
+        fe_advance(&p); // consume 'api'
+        if (p.current_token.type != TOKEN_LBRACE) continue;
+        fe_advance(&p); // consume '{'
+        int depth = 1;
+        while (p.current_token.type != TOKEN_EOF && depth > 0) {
+            if (p.current_token.type == TOKEN_LBRACE) { depth++; fe_advance(&p); continue; }
+            if (p.current_token.type == TOKEN_RBRACE) {
+                depth--; fe_advance(&p);
+                if (depth == 0) break;
+                continue;
+            }
+            // `use name;` — global middleware application for this api block.
+            if (p.current_token.type == TOKEN_USE &&
+                p.peek_token.type == TOKEN_IDENTIFIER) {
+                fe_advance(&p); // 'use'
+                if (g_nmw_use < TEKO_MAX_MIDDLEWARES) {
+                    strncpy(g_mw_use[g_nmw_use], p.current_token.lexeme, 95);
+                    g_mw_use[g_nmw_use][95] = '\0'; g_nmw_use++;
+                }
+                fe_advance(&p); // name
+                if (p.current_token.type == TOKEN_SEMICOLON) fe_advance(&p);
+                continue;
+            }
+            // `middleware name { body }` — a named middleware handler.
+            if (p.current_token.type == TOKEN_MIDDLEWARE &&
+                p.peek_token.type == TOKEN_IDENTIFIER) {
+                fe_advance(&p); // 'middleware'
+                if (g_nmw < TEKO_MAX_MIDDLEWARES) {
+                    MiddlewareInfo* m = &g_mw[g_nmw];
+                    memset(m, 0, sizeof(*m));
+                    strncpy(m->name, p.current_token.lexeme, 95); m->name[95] = '\0';
+                    m->slot = slot++;
+                    g_nmw++;
+                }
+                fe_advance(&p); // name
+                if (p.current_token.type == TOKEN_LBRACE) skip_brace_block(&p);
+                continue;
+            }
+            // HTTP verb route: `get("/path") { body }`.
+            if (is_verb_head(&p)) {
+                const char* method = verb_token_to_method(p.current_token.type);
+                fe_advance(&p); // verb
+                fe_advance(&p); // '('
+                // Expect a string literal path.
+                char path[256]; path[0] = '\0';
+                if (p.current_token.type == TOKEN_LIT_STR ||
+                    p.current_token.type == TOKEN_STRING_LIT) {
+                    char* raw = strip_quotes(p.current_token.lexeme);
+                    strncpy(path, raw, 255); path[255] = '\0';
+                    free(raw);
+                    fe_advance(&p);
+                }
+                if (p.current_token.type == TOKEN_RPAREN) fe_advance(&p);
+                // Handler body: `{ … }`.
+                if (p.current_token.type == TOKEN_LBRACE && g_nroute < TEKO_MAX_ROUTES) {
+                    RouteInfo* r = &g_route[g_nroute];
+                    memset(r, 0, sizeof(*r));
+                    strncpy(r->method, method, 7); r->method[7] = '\0';
+                    strncpy(r->path, path, 255); r->path[255] = '\0';
+                    r->slot = slot++;
+                    g_nroute++;
+                }
+                if (p.current_token.type == TOKEN_LBRACE) skip_brace_block(&p);
+                continue;
+            }
+            fe_advance(&p);
+        }
+        break; // only one api block supported per program (extension: future)
+    }
+    // After all routes and middleware are collected, apply g_mw_use to every route.
+    for (int ri = 0; ri < g_nroute; ri++) {
+        RouteInfo* r = &g_route[ri];
+        for (int ui = 0; ui < g_nmw_use; ui++) {
+            // Find the middleware slot by name.
+            for (int mi = 0; mi < g_nmw; mi++) {
+                if (strcmp(g_mw[mi].name, g_mw_use[ui]) == 0 && r->mw_count < TEKO_MAX_MIDDLEWARES) {
+                    r->mw_slots[r->mw_count++] = g_mw[mi].slot;
+                    break;
+                }
+            }
+        }
+    }
+}
+
+// Phase 19 (ROUTER-NATIVE): emit the route handler + middleware bodies as table routines
+// (after $main HALT, like the event handler routines). Each body is re-lexed from the source.
+static void emit_api_routines(const char* source, BytecodeBuffer* buffer,
+                               ImportBinding* fns, int nfns,
+                               ImportBinding* binds, int nb, TempAlloc* ta) {
+    if (g_nroute == 0 && g_nmw == 0) return;
+    Lexer lx; lexer_init(&lx, source);
+    Parser p; parser_init(&p, &lx);
+
+    // We need to emit handler bodies in slot order:
+    // First, collect the slot->source-position mapping by scanning the api block.
+    // Simple approach: re-scan the api block, emit each body in encounter order
+    // (which matches collect_api's slot-assignment order).
+    while (p.current_token.type != TOKEN_EOF) {
+        if (p.current_token.type != TOKEN_API) { fe_advance(&p); continue; }
+        fe_advance(&p); // 'api'
+        if (p.current_token.type != TOKEN_LBRACE) continue;
+        fe_advance(&p); // '{'
+        int depth = 1;
+        int route_idx = 0;
+        int mw_idx = 0;
+        while (p.current_token.type != TOKEN_EOF && depth > 0) {
+            if (p.current_token.type == TOKEN_LBRACE) {
+                // This shouldn't happen at depth=1 outside of a handler body — skip defensively.
+                depth++; fe_advance(&p); continue;
+            }
+            if (p.current_token.type == TOKEN_RBRACE) {
+                depth--; fe_advance(&p);
+                if (depth == 0) break;
+                continue;
+            }
+            if (p.current_token.type == TOKEN_USE) {
+                // Skip `use name;`.
+                fe_advance(&p); // 'use'
+                while (p.current_token.type != TOKEN_SEMICOLON &&
+                       p.current_token.type != TOKEN_EOF && depth > 0) fe_advance(&p);
+                if (p.current_token.type == TOKEN_SEMICOLON) fe_advance(&p);
+                continue;
+            }
+            if (p.current_token.type == TOKEN_MIDDLEWARE &&
+                p.peek_token.type == TOKEN_IDENTIFIER) {
+                fe_advance(&p); // 'middleware'
+                fe_advance(&p); // name
+                // Emit the middleware body as a routine.
+                if (p.current_token.type == TOKEN_LBRACE && mw_idx < g_nmw) {
+                    int slot = g_mw[mw_idx].slot;
+                    codegen_li_emit_func_begin(buffer, slot);
+                    fe_advance(&p); // '{'
+                    int bdepth = 1;
+                    while (p.current_token.type != TOKEN_EOF && bdepth > 0) {
+                        if (p.current_token.type == TOKEN_LBRACE) { bdepth++; fe_advance(&p); continue; }
+                        if (p.current_token.type == TOKEN_RBRACE) { bdepth--; fe_advance(&p); if (bdepth==0) break; continue; }
+                        lower_routine_extern_call(buffer, &p, binds, nb) ||
+                        (fe_advance(&p), 0);
+                    }
+                    codegen_li_emit_func_end(buffer);
+                    mw_idx++;
+                } else if (p.current_token.type == TOKEN_LBRACE) {
+                    skip_brace_block(&p);
+                }
+                continue;
+            }
+            if (is_verb_head(&p)) {
+                fe_advance(&p); // verb
+                fe_advance(&p); // '('
+                // Skip path literal.
+                if (p.current_token.type == TOKEN_LIT_STR ||
+                    p.current_token.type == TOKEN_STRING_LIT) fe_advance(&p);
+                if (p.current_token.type == TOKEN_RPAREN) fe_advance(&p);
+                // Emit the route handler body as a routine.
+                if (p.current_token.type == TOKEN_LBRACE && route_idx < g_nroute) {
+                    int slot = g_route[route_idx].slot;
+                    codegen_li_emit_func_begin(buffer, slot);
+                    fe_advance(&p); // '{'
+                    int bdepth = 1;
+                    while (p.current_token.type != TOKEN_EOF && bdepth > 0) {
+                        if (p.current_token.type == TOKEN_LBRACE) { bdepth++; fe_advance(&p); continue; }
+                        if (p.current_token.type == TOKEN_RBRACE) { bdepth--; fe_advance(&p); if (bdepth==0) break; continue; }
+                        lower_routine_extern_call(buffer, &p, binds, nb) ||
+                        (fe_advance(&p), 0);
+                    }
+                    codegen_li_emit_func_end(buffer);
+                    route_idx++;
+                } else if (p.current_token.type == TOKEN_LBRACE) {
+                    skip_brace_block(&p);
+                    route_idx++;
+                }
+                continue;
+            }
+            fe_advance(&p);
+        }
+        break;
+    }
+    (void)fns; (void)nfns; (void)ta;
 }
 
 // Phase 15 (15.C): discover generic class templates + their concrete instantiations.

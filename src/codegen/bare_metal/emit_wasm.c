@@ -1350,13 +1350,24 @@ void emit_wasm_pure(MetalContext* ctx, OpCode op, int32_t arg) {
                 fprintf(f, "  (import \"env\" \"teko_http_get\"  (func $http_get  (param i32) (result i32)))\n");
                 fprintf(f, "  (import \"env\" \"teko_http_post\" (func $http_post (param i32) (param i32) (result i32)))\n");
             }
+            // Phase 19 (ROUTER-NATIVE): import the teko_router_* entry points from the reactor
+            // so the module-owned radix-tree router runs on WASM (target-agnostic C code, same
+            // binary as native). The module SHARES reactor memory (wasm_emit_router is included
+            // in the memory-sharing guard above). Gated on wasm_emit_router — router-free programs
+            // stay byte-identical.
+            if (ctx->wasm_emit_router) {
+                fprintf(f, "  (import \"env\" \"teko_rt_router_new\"       (func $router_new       (param i32) (result i32)))\n");
+                fprintf(f, "  (import \"env\" \"teko_rt_router_add\"        (func $router_add       (param i32) (param i32) (param i32) (param i32) (result i32)))\n");
+                fprintf(f, "  (import \"env\" \"teko_rt_router_dispatch\"   (func $router_dispatch  (param i32) (param i32) (param i32) (result i32)))\n");
+                fprintf(f, "  (import \"env\" \"teko_rt_router_free\"       (func $router_free      (param i32) (result i32)))\n");
+            }
             // Memory: module-owned by default; when a reactor (crypto/duplex/delayed/broadcast/
             // shared) is in play it is host-owned and SHARED (imported from env), so both modules
             // address the same bytes. Re-export it either way so harnesses can read results.
             if (ctx->wasm_emit_crypto_ext || ctx->wasm_emit_duplex || ctx->wasm_emit_delayed ||
                 ctx->wasm_emit_bcast || ctx->wasm_emit_shared || ctx->wasm_emit_retry ||
                 ctx->wasm_emit_object || ctx->wasm_emit_vtable || ctx->wasm_emit_decimal ||
-                ctx->wasm_emit_array || ctx->wasm_emit_iarray) {
+                ctx->wasm_emit_array || ctx->wasm_emit_iarray || ctx->wasm_emit_router) {
                 fprintf(f, "  (import \"env\" \"memory\" (memory 1))\n");
             } else {
                 fprintf(f, "  (memory 1)\n");
@@ -1497,6 +1508,28 @@ void emit_wasm_pure(MetalContext* ctx, OpCode op, int32_t arg) {
                     // http.get: url from $w0
                     fprintf(f, "    local.get $w0\n    call $http_get\n    local.set $w0\n");
                 }
+            } else if (arg >= 175 && arg <= 178) {
+                // Phase 19 (ROUTER-NATIVE): call the reactor-imported teko_router_* entry points.
+                // ABI mirrors OP_CALL_IMPORT:
+                //   175 router_new(unused=0)   -> handle                       [1-arg: $w0=0]
+                //   176 router_add($a0=method,$a1=path,$a2=handler_id,$w0=handle) -> 0 [4-arg]
+                //   177 router_dispatch($a0=handle,$a1=method,$w0=path) -> handler_id  [3-arg]
+                //   178 router_free($w0=handle) -> 0                           [1-arg]
+                // All results land in $w0. Stack-neutral (n pushes consumed by call, 1 result).
+                // SAST: method/path are teko string constants (compile-time); teko_router_add
+                // validates segments; dispatch is bounds-checked; no attacker-controlled input
+                // on the WASM side of the synthetic dispatch proof.
+                static const char* router_fns[] = {
+                    "router_new",      // 175: (0) -> handle
+                    "router_add",      // 176: (method, path, handler_id, handle) -> 0/-1
+                    "router_dispatch", // 177: (handle, method, path) -> handler_id
+                    "router_free",     // 178: (handle) -> 0
+                };
+                static const int router_arities[] = { 1, 4, 3, 1 };
+                int idx = arg - 175;
+                int ar  = router_arities[idx];
+                for (int p = 0; p + 1 < ar; p++) fprintf(f, "    local.get $a%d\n", p);
+                fprintf(f, "    local.get $w0\n    call $%s\n    local.set $w0\n", router_fns[idx]);
             } else if (wasm_is_crypto_ext_id(arg)) {
                 // Reactor-backed crypto: call the imported teko_rt_* entry point. Multi-arg
                 // ABI mirrors OP_CALL_IMPORT — args 0..n-2 come from the staging slots
