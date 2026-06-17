@@ -97,6 +97,13 @@ const char* teko_native_runtime_symbol(int32_t id, int* out_arity) {
         // are extracted by bounded scanners in parse_http_url; recv capped at TEKO_HTTP_RESP_MAX.
         case 80: sym = "teko_rt_http_get";  arity = 1; break; // (url) -> char* body (0=err)
         case 81: sym = "teko_rt_http_post"; arity = 2; break; // (url, body) -> char* body (0=err)
+        // Phase 19 (ROUTER-NATIVE — Wave 2): ids 175-178 map to the teko_rt_router_* wrappers.
+        // SAST: method/path are teko string constants at compile time (no format-string/traversal);
+        // teko_router_add validates segments (rejects '.'/'..'/empty); dispatch is bounds-checked.
+        case 175: sym = "teko_rt_router_new";      arity = 1; break; // ignored arg -> handle
+        case 176: sym = "teko_rt_router_add";      arity = 4; break; // (method, path, handler_id, handle)
+        case 177: sym = "teko_rt_router_dispatch"; arity = 3; break; // (handle, method, path) -> handler_id
+        case 178: sym = "teko_rt_router_free";     arity = 1; break; // (handle) -> 0
         case 6: sym = "teko_rt_md5_hex";       break; // legacy
         case 7: sym = "teko_rt_sha1_hex";      break; // legacy
         case 8: sym = "teko_rt_uuid_v3";       break;

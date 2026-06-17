@@ -133,6 +133,15 @@ typedef struct {
     // host provides the HTTP request (WASM cannot open raw TCP sockets). HTTP-free programs (incl.
     // the 16 freestanding goldens) stay byte-identical. Must be zero-initialized in teko_metal_create.
     int wasm_emit_http;
+    // Phase 19 (ROUTER-NATIVE — api.*/route dispatch): 1 when the program uses an api{} block
+    // (OP_CALL_RUNTIME ids 175-179). The WASM backend imports the teko_router_* entry points from
+    // the runtime reactor + shares its linear memory (same wiring as wasm_emit_object). Native
+    // links teko_rt_router_* via libteko_rt.a. Router-free programs stay byte-identical.
+    int wasm_emit_router;
+    // Phase 19 (ROUTER-NATIVE — HTTP server wiring): 1 when a native server accept loop should be
+    // emitted (api{} block on native). WASM: the synthetic dispatch proof uses wasm_emit_router
+    // only; no listen socket on WASM. Server-free programs stay byte-identical.
+    int wasm_emit_httpsrv;
     // Phase 14 (control-flow foundation): structured loop/if lowering state, shared by the native
     // hosted emitter and the WASM emitter. cf_id_next assigns a fresh monotonic id to each
     // LOOP_BEGIN/IF_BEGIN; cf_loop_stack/cf_if_stack track the active (nesting) ids so
@@ -202,6 +211,10 @@ void teko_metal_set_emit_simd(MetalContext* ctx, int enabled);
 void teko_metal_set_emit_net(MetalContext* ctx, int enabled);
 // Phase 19 (HTTP-INT): request http.* host-import emission (WASM only; native links teko_rt_http_*).
 void teko_metal_set_emit_http(MetalContext* ctx, int enabled);
+// Phase 19 (ROUTER-NATIVE): request router emission (WASM imports; native links teko_rt_router_*).
+void teko_metal_set_emit_router(MetalContext* ctx, int enabled);
+// Phase 19 (ROUTER-NATIVE): request native HTTP server emission (api{} block on native).
+void teko_metal_set_emit_httpsrv(MetalContext* ctx, int enabled);
 
 // Phase 17 (17.A): hand the backend the float-constant pool (OP_FCONST's index space). `floats`
 // must outlive teko_metal_emit_program. teko_metal_set_emit_float gates the WASM float locals.
