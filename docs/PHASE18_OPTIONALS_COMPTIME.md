@@ -1,5 +1,18 @@
 # Phase 18 — Zero-Overhead Optionals & Compile-Time Metaprogramming
 
+> **✅ PHASE 18 COMPLETE & CI-GREEN (all 4 gates incl. Windows MSVC).** Sub-blocks: 18.A optionals
+> `?T`/`null`/`??` (`5b02baf`) · 18.B safe-nav `?.` (`5bd420a`) · 18.C `defer` (`29ade54`) · 18.D
+> `comptime` (`fa0efa0`) · 18.E full-scope collections+SIMD (design `e4adfbf`; 18.E.1 array `cc32c4d`,
+> 18.E.2 for-in+`i32[]` `2553ade`, 18.E.3 AoS↔SoA `6dc2e94`, CI-yaml-fix `8af85ca`, 18.E.4 real
+> per-ISA SIMD `81ca284`). Every Phase-12-reserved token LIVE, no dead tokens, executable `.tks` proof
+> native+WASM per surface (byte-identical; output-identical for the vectorized SIMD op). Suite 246/246;
+> ASan/UBSan both dispatch paths + TSan clean; **16 native emitter goldens byte-identical**
+> (`test_codegen_emitters_arithmetic_per_target` PASS). Also fixed a bundled Phase-15 tech-debt
+> (method/trait dispatch in argument position + bare `self.field` return) with regression proofs.
+> Deferred by owner reorder (off the SIMD critical path): dynamic non-contiguous `list`, f64 numeric
+> arrays, AVX2/RVV opportunistic upgrades. PR #11 stays **draft** — the human merges. SoA/SIMD detail:
+> `docs/PHASE18E_ARRAYS_COLLECTIONS_SIMD.md`.
+
 Branch `feat/phase-18-optionals-comptime`, **PR #11** (draft — the human merges). Follows Phase 17
 (Floating-Point & Numeric Types, merged via PR #10). This phase expands the **language surface** on
 top of the now-validated backend/runtime: nullability, compile-time execution, scope-exit
