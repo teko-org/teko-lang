@@ -260,6 +260,16 @@ extern void test_teko_rsa_pkcs1v15_encrypt_roundtrip(void);
 extern void test_teko_rsa_oaep_sha256_kat(void);
 extern void test_teko_rsa_pss_sha256_kat(void);
 
+/* Phase 19 (ROUTER-CORE Wave 0) */
+extern void test_teko_router_build(void);
+extern void test_teko_router_exact_match(void);
+extern void test_teko_router_param_match(void);
+extern void test_teko_router_literal_beats_param(void);
+extern void test_teko_router_method_mismatch_405(void);
+extern void test_teko_router_no_match_404(void);
+extern void test_teko_router_middleware_order(void);
+extern void test_teko_router_synthetic_e2e(void);
+extern void test_teko_router_badarg_hardening(void);
 // Phase 19 (T1a) — client socket runtime KATs
 extern void test_teko_socket_null_args(void);
 extern void test_teko_socket_recv_bounds_constant(void);
@@ -546,6 +556,16 @@ int main(void) {
     RUN_TEST(test_teko_rsa_oaep_sha256_kat);
     RUN_TEST(test_teko_rsa_pss_sha256_kat);
 
+    /* Phase 19 (ROUTER-CORE Wave 0) -- target-agnostic radix-tree router KATs */
+    RUN_TEST(test_teko_router_build);
+    RUN_TEST(test_teko_router_exact_match);
+    RUN_TEST(test_teko_router_param_match);
+    RUN_TEST(test_teko_router_literal_beats_param);
+    RUN_TEST(test_teko_router_method_mismatch_405);
+    RUN_TEST(test_teko_router_no_match_404);
+    RUN_TEST(test_teko_router_middleware_order);
+    RUN_TEST(test_teko_router_synthetic_e2e);
+    RUN_TEST(test_teko_router_badarg_hardening);
     // Phase 19 (T1a) — client socket runtime KATs
     RUN_TEST(test_teko_socket_null_args);
     RUN_TEST(test_teko_socket_recv_bounds_constant);
