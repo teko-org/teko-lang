@@ -260,6 +260,38 @@ extern void test_teko_rsa_pkcs1v15_encrypt_roundtrip(void);
 extern void test_teko_rsa_oaep_sha256_kat(void);
 extern void test_teko_rsa_pss_sha256_kat(void);
 
+/* Phase 19: HTTP/1.1 codec KATs */
+extern void test_http_build_request_get(void);
+extern void test_http_build_request_post_with_body(void);
+extern void test_http_build_request_no_auto_cl_when_cl_provided(void);
+extern void test_http_build_request_null_args(void);
+extern void test_http_build_request_method_too_long(void);
+extern void test_http_build_response_200_with_body(void);
+extern void test_http_build_response_404_no_body(void);
+extern void test_http_build_response_null_reason(void);
+extern void test_http_parse_request_get(void);
+extern void test_http_parse_request_post_with_body(void);
+extern void test_http_parse_request_missing_crlf(void);
+extern void test_http_parse_request_obs_fold_rejected(void);
+extern void test_http_parse_request_duplicate_content_length(void);
+extern void test_http_parse_request_null_args(void);
+extern void test_http_parse_request_chunked_body(void);
+extern void test_http_parse_request_header_lws_trim(void);
+extern void test_http_parse_response_200_with_body(void);
+extern void test_http_parse_response_no_body(void);
+extern void test_http_parse_response_null_args(void);
+extern void test_http_parse_response_chunked_body(void);
+extern void test_http_request_round_trip(void);
+extern void test_http_response_round_trip(void);
+extern void test_http_chunked_encode_decode_round_trip(void);
+extern void test_http_chunked_encode_empty(void);
+extern void test_http_chunked_decode_multi_chunk(void);
+extern void test_http_chunked_decode_missing_crlf(void);
+extern void test_http_chunked_decode_bad_hex_digit(void);
+extern void test_http_chunked_decode_oversized_hex(void);
+extern void test_http_chunked_decode_chunk_overflow(void);
+extern void test_http_find_header_case_insensitive(void);
+extern void test_http_find_header_null_args(void);
 /* Phase 19 (ROUTER-CORE Wave 0) */
 extern void test_teko_router_build(void);
 extern void test_teko_router_exact_match(void);
@@ -556,6 +588,38 @@ int main(void) {
     RUN_TEST(test_teko_rsa_oaep_sha256_kat);
     RUN_TEST(test_teko_rsa_pss_sha256_kat);
 
+    /* Phase 19: HTTP/1.1 codec KATs */
+    RUN_TEST(test_http_build_request_get);
+    RUN_TEST(test_http_build_request_post_with_body);
+    RUN_TEST(test_http_build_request_no_auto_cl_when_cl_provided);
+    RUN_TEST(test_http_build_request_null_args);
+    RUN_TEST(test_http_build_request_method_too_long);
+    RUN_TEST(test_http_build_response_200_with_body);
+    RUN_TEST(test_http_build_response_404_no_body);
+    RUN_TEST(test_http_build_response_null_reason);
+    RUN_TEST(test_http_parse_request_get);
+    RUN_TEST(test_http_parse_request_post_with_body);
+    RUN_TEST(test_http_parse_request_missing_crlf);
+    RUN_TEST(test_http_parse_request_obs_fold_rejected);
+    RUN_TEST(test_http_parse_request_duplicate_content_length);
+    RUN_TEST(test_http_parse_request_null_args);
+    RUN_TEST(test_http_parse_request_chunked_body);
+    RUN_TEST(test_http_parse_request_header_lws_trim);
+    RUN_TEST(test_http_parse_response_200_with_body);
+    RUN_TEST(test_http_parse_response_no_body);
+    RUN_TEST(test_http_parse_response_null_args);
+    RUN_TEST(test_http_parse_response_chunked_body);
+    RUN_TEST(test_http_request_round_trip);
+    RUN_TEST(test_http_response_round_trip);
+    RUN_TEST(test_http_chunked_encode_decode_round_trip);
+    RUN_TEST(test_http_chunked_encode_empty);
+    RUN_TEST(test_http_chunked_decode_multi_chunk);
+    RUN_TEST(test_http_chunked_decode_missing_crlf);
+    RUN_TEST(test_http_chunked_decode_bad_hex_digit);
+    RUN_TEST(test_http_chunked_decode_oversized_hex);
+    RUN_TEST(test_http_chunked_decode_chunk_overflow);
+    RUN_TEST(test_http_find_header_case_insensitive);
+    RUN_TEST(test_http_find_header_null_args);
     /* Phase 19 (ROUTER-CORE Wave 0) -- target-agnostic radix-tree router KATs */
     RUN_TEST(test_teko_router_build);
     RUN_TEST(test_teko_router_exact_match);

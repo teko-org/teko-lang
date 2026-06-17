@@ -60,6 +60,7 @@ SRCS=("$HERE/libc_shim.c" "$ROOT/runtime/native/teko_rt.c" "$ROOT/src/runtime/te
       "$ROOT/src/runtime/teko_convert.c"   # Phase 16: culture-invariant conversion runtime
       "$ROOT/src/runtime/teko_convert_f64.c" # Phase 17.C: Ryu f64->string (17.D EXPORTS teko_rt_float_to_string)
       "$ROOT/src/runtime/teko_decimal.c" # Phase 17.F.1: exact base-10 decimal core (17.F.3 EXPORTS the teko_rt_decimal_* wrappers)
+      "$ROOT/src/runtime/teko_http.c"    # Phase 19: HTTP/1.1 codec (pure byte-buffer, no sockets; client subset used by HTTP-INT Wave 1)
       "$ROOT/src/runtime/teko_router.c") # Phase 19 (ROUTER-CORE Wave 0): target-agnostic radix-tree router
 for f in "$ROOT"/src/runtime/teko_crypto_*.c; do SRCS+=("$f"); done
 
