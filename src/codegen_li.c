@@ -39,6 +39,7 @@ BytecodeBuffer* codegen_li_create_context(void) {
     buffer->uses_iarray = 0;
     buffer->uses_simd = 0;
     buffer->uses_vtable = 0;
+    buffer->uses_net = 0;
 
     // Phase 17 (17.A): the float-constant pool starts empty; uses_float gates the WASM float locals.
     buffer->float_capacity = 8;
@@ -232,6 +233,11 @@ void codegen_li_emit_call_runtime(BytecodeBuffer* buffer, int codec_id) {
     // reactor teko_rt_decimal_* imports MUST be emitted. Set uses_decimal (id 59 may be the SOLE
     // decimal op in a module — e.g. an auto-to_string of a parsed decimal — so this is load-bearing).
     if (codec_id == 59 || codec_id == 60) buffer->uses_decimal = 1;
+    // Phase 19 (T2 — net.* socket wiring): ids 61-67 are the net-client surface. On WASM the
+    // backend emits env host-imports (env.teko_net_*); on native teko_rt_socket_* is already
+    // in libteko_rt.a (unconditionally linked). Set uses_net so the WASM emitter gates the
+    // host-import declarations — socket-free programs stay byte-identical.
+    if (codec_id >= 61 && codec_id <= 67) buffer->uses_net = 1;
     emit_byte(buffer, OP_CALL_RUNTIME);
     emit_int(buffer, codec_id);
 }

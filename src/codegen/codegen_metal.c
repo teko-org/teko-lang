@@ -162,6 +162,12 @@ void teko_metal_set_emit_simd(MetalContext* ctx, int enabled) {
     ctx->wasm_emit_simd = enabled ? 1 : 0;
 }
 
+// Phase 19 (T2): net.* host-import emission (WASM-only flag).
+void teko_metal_set_emit_net(MetalContext* ctx, int enabled) {
+    if (!ctx) return;
+    ctx->wasm_emit_net = enabled ? 1 : 0;
+}
+
 void teko_metal_set_hosted(MetalContext* ctx, int enabled) {
     if (!ctx) return;
     ctx->hosted = enabled ? 1 : 0;

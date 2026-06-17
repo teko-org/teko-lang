@@ -299,8 +299,8 @@ char* teko_rt_decimal_to_string(const teko_decimal* d);        // id 59: decimal
 void  teko_rt_decimal_parse(const char* s, teko_decimal* out); // id 60: string -> decimal (checked)
 
 // Phase 19 (T1a) — client socket surface wrappers (register-width ABI; handle = TekoSocket* as long).
-// OP_CALL_RUNTIME id range 60-69 is RESERVED for net-client (see PHASE19_NETWORKING.md §2.1).
-// Emission / frontend wiring is NOT done in this wave — it comes in T2 (Wave 1).
+// OP_CALL_RUNTIME id range 61-67 (net-client) — id 60 is decimal.parse (Phase 17.F.4).
+// Emission / frontend wiring is in T2 (Wave 1).
 // On native these call teko_socket.c; teko_socket.c provides WASM stubs that return 0/BADARG.
 long teko_rt_socket_tcp_connect(const char* host, long port); // -> handle (0 = failure)
 long teko_rt_socket_udp_open(const char* host, long port);    // -> handle (0 = failure)
@@ -310,6 +310,15 @@ long teko_rt_socket_recv(long handle, char* buf, long buf_len,
 long teko_rt_socket_close(long handle);                                     // -> TekoSocketStatus
 void teko_rt_socket_free(long handle);
 long teko_rt_socket_state(long handle);                                     // -> TekoSocketState
+// Phase 19 (T2 — net.* surface wrappers): OP_CALL_RUNTIME-friendly shims.
+//   recv_str: allocates a max_len-byte buffer, calls recv, NUL-terminates, returns the string
+//             pointer (caller-owned; leaked like other short-lived runtime strings); returns 0
+//             on would-block / error / bounds-exceeded (buf_len > TEKO_SOCKET_MAX_BUF).
+//   free_h:   thin wrapper over teko_rt_socket_free returning 0 (the IL needs a long result).
+// SAST: recv_str bounds-checks max_len against TEKO_SOCKET_MAX_BUF BEFORE the alloc/syscall
+// (mirrors teko_socket_recv's own pre-syscall guard). No format-string, no path traversal.
+long teko_rt_socket_recv_str(long handle, long max_len);   // id 64 -> char* (0 = no data)
+long teko_rt_socket_free_h(long handle);                   // id 66 -> 0
 // Phase 19 (T1b, Wave 0) — server socket surface wrappers (NATIVE-ONLY; no WASM reactor).
 // OP_CALL_RUNTIME id range 70-79 RESERVED for net-server; NO opcodes emitted this wave
 // (emission deferred to T2). These wrappers bridge the register-width ABI (long) to the

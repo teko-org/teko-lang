@@ -1053,6 +1053,50 @@ long teko_rt_socket_state(long handle) {
     TekoSocket* s = (TekoSocket*)(intptr_t)handle;
     return (long)teko_socket_state(s);
 }
+
+// Phase 19 (T2 — net.* surface wrappers): OP_CALL_RUNTIME-friendly shims (ids 64, 66).
+//
+// teko_rt_socket_recv_str (id 64): wait up to 2 s for data to arrive (via
+//   teko_socket_wait_readable — a clean select(2) on the internal fd, no struct hacks),
+//   allocate a buffer of max_len bytes (capped at TEKO_SOCKET_MAX_BUF via the bounds gate),
+//   call teko_socket_recv, NUL-terminate the received bytes, and return the buffer pointer
+//   (caller-owned; leaked like other short-lived runtime strings). Returns 0 on timeout,
+//   error, closed, NULL handle, or bad max_len.
+//   SAST: max_len is attacker-influenced; the bounds gate (> TEKO_SOCKET_MAX_BUF) runs
+//   BEFORE calloc and the recv syscall — not after — matching teko_socket_recv's posture.
+//   calloc zero-initialises so the buffer is always NUL-terminated even if recv writes 0.
+//   The 2000 ms wait is a compile-time constant — not externally controllable.
+long teko_rt_socket_recv_str(long handle, long max_len) {
+    TekoSocket* s = (TekoSocket*)(intptr_t)handle;
+    if (!s) return 0;
+    // Bounds gate — must match the TEKO_SOCKET_MAX_BUF pre-syscall guard in teko_socket.c.
+    if (max_len <= 0 || (unsigned long)max_len > TEKO_SOCKET_MAX_BUF) return 0;
+    uint32_t buf_len = (uint32_t)(unsigned long)max_len;
+    // Wait up to 2 s for data to arrive before the non-blocking recv.
+    // teko_socket_wait_readable uses select(2)/WSAPoll internally — no private struct access.
+    // The 2000 ms is a fixed runtime constant, not derived from any external input.
+    (void)teko_socket_wait_readable(s, 2000);
+    // +1 for NUL terminator; calloc zero-init guarantees NUL-termination even on partial recv.
+    char* buf = (char*)calloc(buf_len + 1u, 1u);
+    if (!buf) return 0;
+    uint32_t received = 0;
+    TekoSocketStatus st = teko_socket_recv(s, buf, buf_len, &received);
+    if (st != TEKO_SOCK_OK || received == 0) {
+        free(buf);
+        return 0;
+    }
+    // NUL-terminate at the exact received length (calloc already zeroed the rest).
+    buf[received] = '\0';
+    return (long)(intptr_t)buf;
+}
+
+// teko_rt_socket_free_h (id 66): thin wrapper over teko_socket_free returning 0 so the IL
+// accumulator ($w0) always carries a defined long result after a void call.
+long teko_rt_socket_free_h(long handle) {
+    teko_socket_free((TekoSocket*)(intptr_t)handle);
+    return 0;
+}
+
 // Phase 19 (T1b, Wave 0) — server socket surface wrappers.
 // OP_CALL_RUNTIME id range 70-79 RESERVED for net-server; NO opcodes are emitted this
 // wave — emission is deferred to Track T2 (Wave 1). These thin wrappers bridge the

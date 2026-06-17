@@ -312,6 +312,32 @@ TekoSocketState teko_socket_state(const TekoSocket* s) {
     return s->state;
 }
 
+// Wait up to timeout_ms for the socket fd to become readable.
+// Uses select(2) on POSIX; WSAPoll / select on Windows.
+// Returns 1 = readable, 0 = timeout, -1 = error/invalid.
+// SAST: timeout_ms is caller-controlled (runtime wrapper passes 2000 ms); no external input.
+int teko_socket_wait_readable(TekoSocket* s, int timeout_ms) {
+    if (!s || s->state != TEKO_SOCK_OPEN) return -1;
+    if (s->fd == TEKO_INVALID_FD) return -1;
+#if defined(_WIN32)
+    WSAPOLLFD pfd;
+    pfd.fd      = s->fd;
+    pfd.events  = POLLRDNORM;
+    pfd.revents = 0;
+    int r = WSAPoll(&pfd, 1, timeout_ms);
+    return (r > 0) ? 1 : 0;
+#else
+    fd_set rfds;
+    FD_ZERO(&rfds);
+    FD_SET(s->fd, &rfds);
+    struct timeval tv;
+    tv.tv_sec  = (long)(timeout_ms / 1000);
+    tv.tv_usec = (long)((timeout_ms % 1000) * 1000);
+    int r = select(s->fd + 1, &rfds, NULL, NULL, &tv);
+    return (r > 0) ? 1 : 0;
+#endif
+}
+
 #else // __wasm__ — freestanding stubs so the header resolves on WASM builds
 
 TekoSocket* teko_socket_tcp_connect(const char* host, uint16_t port) {
@@ -335,6 +361,9 @@ TekoSocketStatus teko_socket_close(TekoSocket* s) {
 void teko_socket_free(TekoSocket* s) { (void)s; }
 TekoSocketState  teko_socket_state(const TekoSocket* s) {
     (void)s; return TEKO_SOCK_ERROR;
+}
+int teko_socket_wait_readable(TekoSocket* s, int timeout_ms) {
+    (void)s; (void)timeout_ms; return -1;
 }
 
 #endif // !__wasm__

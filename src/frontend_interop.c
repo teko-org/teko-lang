@@ -1780,6 +1780,17 @@ static int codec_id_for(const char* lex) {
     if (strcmp(lex, "convert.parse_int") == 0)   return 53; // (str) -> i32
     if (strcmp(lex, "convert.parse_bool") == 0)  return 55; // (str) -> 0/1
     if (strcmp(lex, "convert.parse_float") == 0) return 54; // (str) -> f64 (checked, fail-loud)
+    // Phase 19 (T2 — net.* socket wiring): dotted-identifier surface. id 60 is already
+    // decimal.parse (Phase 17.F.4); net-client starts at 61. WASM: env host-imports;
+    // native: teko_rt_socket_* wrappers (via libteko_rt.a). SAST: host/data are
+    // attacker-influenced — bounds-checking is in teko_socket.c and teko_rt_socket_recv_str.
+    if (strcmp(lex, "net.tcp_connect") == 0) return 61; // (host, port) -> handle
+    if (strcmp(lex, "net.udp_open")    == 0) return 62; // (host, port) -> handle
+    if (strcmp(lex, "net.send")        == 0) return 63; // (handle, data, len) -> status
+    if (strcmp(lex, "net.recv")        == 0) return 64; // (handle, max_len)   -> str (0=no data)
+    if (strcmp(lex, "net.close")       == 0) return 65; // (handle)            -> status
+    if (strcmp(lex, "net.free")        == 0) return 66; // (handle)            -> 0
+    if (strcmp(lex, "net.state")       == 0) return 67; // (handle)            -> state
     return -1;
 }
 
@@ -1811,7 +1822,13 @@ static int runtime_arity(int id) {
         case 52: return 2; // convert.str_concat(a, b)
         case 56: return 2; // convert.to_radix(v, base)
         case 57: return 2; // convert.pad(v, width)
-        default: return 1;
+        // Phase 19 (T2 — net.* surface): register-width ABI; multi-arg ops match the wrapper
+        // arities. net.send(handle, data, len)=3; tcp_connect/udp_open(host,port)/recv=2; 1 for the rest.
+        case 61: return 2; // net.tcp_connect(host, port)
+        case 62: return 2; // net.udp_open(host, port)
+        case 63: return 3; // net.send(handle, data, len)
+        case 64: return 2; // net.recv(handle, max_len)
+        default: return 1; // net.close/free/state=1; all single-arg defaults
     }
 }
 
@@ -4302,6 +4319,13 @@ int teko_compile_interop(const char* source, BytecodeBuffer* buffer) {
         } else if (is_atomic_head(&parser)) {
             // Top-level atomic statement: atomic.add/store/… ( args ).
             lower_atomic_call(buffer, &parser, &top_ctx);
+            if (parser.current_token.type == TOKEN_SEMICOLON) fe_advance(&parser);
+        } else if (is_codec_head(&parser)) {
+            // Phase 19 (T2): top-level BARE codec/net call statement whose result is
+            // discarded — e.g. `net.send(h, "hi", 2);`, `net.close(h);`, `net.free(h);`.
+            // (The `let x = net.*` value forms go through the assignment path.) Without
+            // this branch such statements fell through and were silently dropped.
+            lower_base_codec(buffer, &parser, &top_ctx);
             if (parser.current_token.type == TOKEN_SEMICOLON) fe_advance(&parser);
         } else if (parser.current_token.type == TOKEN_WAIT ||
                    parser.current_token.type == TOKEN_AWAIT) {

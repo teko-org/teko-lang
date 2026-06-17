@@ -84,4 +84,10 @@ void teko_socket_free(TekoSocket* s);
 // Query the current connection state. NULL input -> TEKO_SOCK_ERROR.
 TekoSocketState teko_socket_state(const TekoSocket* s);
 
+// Wait up to timeout_ms for the socket to become readable (data available or EOF).
+// Returns 1 if readable, 0 on timeout or error, -1 on NULL/invalid handle.
+// On WASM builds (no BSD sockets) always returns -1.
+// Used by teko_rt_socket_recv_str to avoid the non-blocking EAGAIN race in proofs.
+int teko_socket_wait_readable(TekoSocket* s, int timeout_ms);
+
 #endif // TEKO_SOCKET_H

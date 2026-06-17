@@ -621,4 +621,48 @@ check_random random.tks
 check_uuid uuid_rng.tks
 check_time
 
+# Phase 19 (T2 — net.* socket frontend wiring): connect → send → recv loopback proof.
+# A Python3 TCP echo server (one-connection, echo-then-close) is started on port 17342,
+# net.tks compiles, the binary runs (net.tcp_connect → send "hello" → recv → emit), and
+# the harness asserts the echoed string is "hello".
+# SAST (harness side): port 17342 is a fixed literal; Python server reads exactly one
+# connection and echoes up to 4096 bytes; no external data flows into shell commands
+# (the echo server is a self-contained Python3 one-liner).
+check_net() {
+  local sample="net.tks" exe got
+  exe="$TMP/net"
+  local NET_PORT=17342
+  echo "--- $sample (loopback echo, port ${NET_PORT}) ---"
+
+  # Start a minimal TCP echo server: accept one connection, echo all received bytes, close.
+  python3 -c "
+import socket, sys, os
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(('127.0.0.1', ${NET_PORT}))
+s.listen(1)
+sys.stdout.write('ready\n'); sys.stdout.flush()
+conn, _ = s.accept()
+data = conn.recv(4096)
+conn.sendall(data)
+conn.close(); s.close()
+" >"$TMP/net_echo.log" 2>&1 &
+  ECHO_PID=$!
+  # Wait until the server signals readiness (up to 5 s).
+  local waited=0
+  until grep -q 'ready' "$TMP/net_echo.log" 2>/dev/null || [ $waited -ge 50 ]; do
+    sleep 0.1; waited=$((waited + 1))
+  done
+  grep -q 'ready' "$TMP/net_echo.log" 2>/dev/null || fail "echo server did not start in time"
+
+  "$TEKO" build "$HERE/samples/$sample" --target=host --rt-lib="$RTLIB" -o "$exe" \
+    || { kill "$ECHO_PID" 2>/dev/null; fail "compile/link failed for $sample"; }
+  got="$("$exe")" || { kill "$ECHO_PID" 2>/dev/null; fail "net exited non-zero"; }
+  wait "$ECHO_PID" 2>/dev/null || true  # reap echo server (already exited after one conn)
+  [ "$got" = "hello" ] || fail "net: expected [hello], got [$got]"
+  echo "OK: net -> loopback echo [$got]"
+}
+
+check_net
+
 echo "All native runner proofs passed."
