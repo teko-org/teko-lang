@@ -1,7 +1,9 @@
-# Orchestration Doctrine — Phase 19 onward
+# Orchestration Doctrine — Project-wide (standing, effective immediately for all current and future work)
 
 > **Scope.** This doctrine governs how work is **planned, decomposed, delegated, and reviewed**
-> from **Phase 19 onward**. It is a *meta-process* layer that sits **on top of** — and never
+> across the **entire project** — it is **standing and effective immediately for all current and
+> future work** (every phase, every task, every session), not tied to any one phase. It is a
+> *meta-process* layer that sits **on top of** — and never
 > relaxes — the existing non-negotiable engineering bars in `CLAUDE.md` (one increment per commit;
 > ASan + UBSan on both VM dispatch paths + TSan; 16 native emitter goldens byte-identical;
 > executable `.tks` proof native + WASM per surface; four CI gates green incl. Windows MSVC; no
@@ -87,6 +89,37 @@ tarefas médias) executa, **antes** de liberar a próxima migalha:
    com o defeito apontado, em vez de consertar por cima — o executor refaz no formato correto.
 
 Só depois de o gate passar é que o Agente Mestre **determina a próxima migalha** e a distribui.
+
+## Hierarquia de PRs (PR hierarchy)
+
+A entrega de uma fase usa **dois níveis de PR**, espelhando a cadeia de papéis:
+
+- **PR principal da fase → `main`.** No início da fase, o Agente Mestre (Opus) abre **um Draft PR
+  da fase** (`feat/phase-NN-…` → `main`). Este PR agrega o trabalho da fase inteira e **só o PO
+  (owner humano) faz o merge na `main`** — depois dos quatro gates de CI verdes (incl. Windows
+  MSVC). **Nenhum agente faz merge na `main`.**
+- **Sub-PRs por migalha → a branch DA FASE (não a `main`).** Cada migalha/tarefa média vira um
+  **sub-PR** que mira a **branch da fase** (ex.: `feat/phase-NN-crumb-xyz` → `feat/phase-NN-…`),
+  com **`Closes #N`** referenciando a Issue-migalha. Após **review + SAST + CI pertinente**, o
+  **PM** (orquestrador) faz o merge do sub-PR **na branch da fase** (fechando a Issue). Assim a
+  branch da fase acumula migalhas revisadas, e o PR principal sobe pra `main` pelo PO.
+- **Invariantes (nunca):** nenhum agente faz merge na `main`; **sem `git merge`/force-push**;
+  **sem delete destrutivo** (nada de apagar branch/histórico/tags de forma irreversível pelo
+  agente). O merge de sub-PR na branch da fase pelo PM **só** acontece após o gate de revisão+SAST
+  passar e a Issue correspondente poder ser fechada.
+
+## Integração com GitHub Issues / Projects
+
+- O **Tech Lead (Sonnet)** materializa cada migalha como uma **Issue do GitHub** *especificada* —
+  título claro, descrição com `<contexto_minimo>` + `<formato_esperado>` (BLOCO 2), critérios de
+  aceite e as barras/SAST aplicáveis — e a coloca no **Project** da fase (acompanhamento de
+  estado: To do → In progress → In review → Done).
+- O **Developer (Haiku)** executa a migalha e abre um **sub-PR** que **`Closes #N`** (a
+  Issue-migalha), mirando a branch da fase, no formato exato pedido.
+- O **gate de revisão+SAST** roda no sub-PR; ao passar, o **PM** faz o merge na branch da fase, o
+  GitHub **fecha a Issue** automaticamente (via `Closes #N`) e move o cartão no Project para Done.
+- O **PR principal da fase** referencia as Issues/migalhas que agrega; o **PO** o mergeia na `main`
+  quando a fase fecha verde.
 
 ## Como isto compõe com a disciplina existente
 - As **barras inegociáveis do `CLAUDE.md` continuam valendo integralmente** — a doutrina adiciona

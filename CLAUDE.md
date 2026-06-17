@@ -61,8 +61,9 @@ output locally (the goldens only `strstr`; always *assemble + run*, never trust 
   root cause, don't mask with timeouts or non-blocking.
 - No `git merge`/force-push from the agent; the human merges. New phase ⇒ branch + **draft PR** up front.
 
-## Orchestration Doctrine — Phase 19+
-From **Phase 19 onward**, work is planned/decomposed/delegated/reviewed per
+## Orchestration Doctrine (Project-wide)
+**Standing and effective immediately for ALL work** (every phase, every task, every session — not
+tied to any one phase), work is planned/decomposed/delegated/reviewed per
 `docs/ORCHESTRATION_DOCTRINE.md` (owner-authored; reproduced verbatim there). It is a *meta-process*
 layer **on top of** the discipline above — it relaxes nothing.
 - **Role hierarchy:** **PO** (human owner; the only merger) → **PM** (Dispatch orchestrator) →
@@ -75,6 +76,10 @@ layer **on top of** the discipline above — it relaxes nothing.
   overflow/OOB, UAF/double-free, integer overflow, unsafe casts; confirm new emission stays gated +
   byte-identical) → **bounce back to the executor** if any rule/best-practice is violated, instead of
   patching over it.
+- **PR hierarchy:** the **phase PR → `main`** is merged ONLY by the **PO (human)**; **crumb sub-PRs →
+  the PHASE branch** (`Closes #N` the crumb Issue) are merged by the **PM** after review + SAST + CI.
+  No agent merges to `main`; no `git merge`/force-push; no destructive delete. Tech Leads file
+  specified crumb **Issues** (in the phase Project); Developers open `Closes #N` sub-PRs.
 - Executor subagent profiles: `.claude/agents/teko-tech-lead.md` (Sonnet) and
   `.claude/agents/teko-developer.md` (Haiku); `teko-engineer.md` remains for direct senior work.
 
