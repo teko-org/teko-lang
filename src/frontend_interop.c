@@ -4426,6 +4426,21 @@ int teko_compile_interop(const char* source, BytecodeBuffer* buffer) {
     localcls_reset(); localstr_reset(); localflt_reset(); localdec_reset(); localopt_reset(); localarr_reset(); localiarr_reset(); localsoa_reset(); localaos_reset();
     if (g_oop_error) return 1; // do not emit a module with an unresolved OOP compile error
 
+    // Phase 19 (ROUTER-NATIVE): compute first free routine-table slot AFTER class methods, then
+    // pre-pass the api{} block. Slots 0..nfns-1 = top-level fn handlers (collect_functions);
+    // collect_classes continues from nfns and owns all bodied methods. The highest method_slot
+    // across all classes gives the last slot used; api handlers start from max_slot+1.
+    {
+        int api_base = nfns; // start AFTER top-level fn handlers
+        for (int ci = 0; ci < g_nclass; ci++) {
+            for (int mi = 0; mi < g_class[ci].nmethods; mi++) {
+                if (g_class[ci].method_slot[mi] >= api_base)
+                    api_base = g_class[ci].method_slot[mi] + 1; // +1: first free slot
+            }
+        }
+        collect_api(source, api_base);
+    }
+
     // Phase 12: named local variables ($v0..) declared with `let`/`mut` at top level.
     ImportBinding* locals = NULL;
     int nlocals = 0, caplocals = 0;
@@ -4465,6 +4480,15 @@ int teko_compile_interop(const char* source, BytecodeBuffer* buffer) {
                 }
             }
         }
+    }
+
+    // Phase 19 (ROUTER-NATIVE): if an api{} block was found, pre-allocate a hidden local slot
+    // for the TekoRouter handle so lower_api_block can store/load it. This must happen before
+    // the main parse loop so the slot index is known to the TOKEN_API branch.
+    int api_router_local = -1;
+    if (g_nroute > 0 || g_nmw > 0) {
+        api_router_local = nlocals; // next free local slot
+        bind_add(&locals, &nlocals, &caplocals, "__router__", api_router_local);
     }
 
     while (parser.current_token.type != TOKEN_EOF) {
@@ -4609,6 +4633,15 @@ int teko_compile_interop(const char* source, BytecodeBuffer* buffer) {
                     }
                 }
             }
+        } else if (parser.current_token.type == TOKEN_API) {
+            // Phase 19 (ROUTER-NATIVE): `api { … }` block — registers routes + middleware at
+            // $main startup (router_new + router_add for each route) then performs a
+            // TARGET-AGNOSTIC synthetic dispatch proof (router_dispatch → OP_CALL_FUNC for each
+            // route), proving the radix router actually ran. Both native and WASM use this path;
+            // native additionally runs a real accept loop in teko_rt_server_*. The api{} block body
+            // was already scanned by collect_api (pre-pass above); lower_api_block skips the body
+            // text here and emits the IL preamble (router_new/add/dispatch/call sequence).
+            lower_api_block(buffer, &parser, binds, nb, api_router_local);
         } else if (parser.current_token.type == TOKEN_EXTERN) {
             FFIASTNode* node = parse_extern_declaration(&parser);
             if (node) {
@@ -4849,6 +4882,11 @@ int teko_compile_interop(const char* source, BytecodeBuffer* buffer) {
     // type-arg, with the type-param substituted) — AFTER the non-generic methods so their (higher)
     // slots are emitted in slot order, keeping the routine table dense.
     emit_mono_routines(source, buffer, fns, nfns, binds, nb, &ta);
+
+    // Phase 19 (ROUTER-NATIVE): emit route handler + middleware bodies as table routines AFTER
+    // all class methods and mono bodies (so api slots stay above the class method range).
+    // api_router_local scope: it's a local slot for the handle; no re-use hazard here.
+    emit_api_routines(source, buffer, fns, nfns, binds, nb, &ta);
 
     // Phase 12: how many $v locals to declare per function — named locals plus the
     // expression/nested-arg temp high-water (across $main and the handler routines).
