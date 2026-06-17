@@ -242,7 +242,7 @@ int teko_http_build_request(
     if (!buf_append(&buf, &pos, &cap, method, mlen)) { free(buf); return TEKO_HTTP_ERR_ALLOC; }
     if (!buf_append(&buf, &pos, &cap, " ", 1))       { free(buf); return TEKO_HTTP_ERR_ALLOC; }
     if (!buf_append(&buf, &pos, &cap, path, plen))   { free(buf); return TEKO_HTTP_ERR_ALLOC; }
-    if (!buf_append(&buf, &pos, &cap, " HTTP/1.1\r\n", 10)) { free(buf); return TEKO_HTTP_ERR_ALLOC; }
+    if (!buf_append(&buf, &pos, &cap, " HTTP/1.1\r\n", 11)) { free(buf); return TEKO_HTTP_ERR_ALLOC; }
 
     rc = build_headers_and_body(&buf, &pos, &cap, headers, header_count, body, body_len);
     if (rc != TEKO_HTTP_OK) { free(buf); return rc; }
@@ -729,9 +729,11 @@ int teko_http_chunked_encode(
     out[pos++] = '\r'; out[pos++] = '\n';
     if (src_len > 0) { memcpy(out + pos, src, src_len); pos += src_len; }
     out[pos++] = '\r'; out[pos++] = '\n';
-    out[pos++] = '0';
-    out[pos++] = '\r'; out[pos++] = '\n';
-    out[pos++] = '\r'; out[pos++] = '\n';
+    if (src_len > 0) {
+        out[pos++] = '0';
+        out[pos++] = '\r'; out[pos++] = '\n';
+        out[pos++] = '\r'; out[pos++] = '\n';
+    }
     out[pos]   = '\0';
 
     *out_buf = out;
