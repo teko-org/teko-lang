@@ -298,6 +298,18 @@ double teko_rt_decimal_to_f64(const teko_decimal* d);          // OP_D2F: decima
 char* teko_rt_decimal_to_string(const teko_decimal* d);        // id 59: decimal -> string
 void  teko_rt_decimal_parse(const char* s, teko_decimal* out); // id 60: string -> decimal (checked)
 
+// Phase 19 (T1a) — client socket surface wrappers (register-width ABI; handle = TekoSocket* as long).
+// OP_CALL_RUNTIME id range 60-69 is RESERVED for net-client (see PHASE19_NETWORKING.md §2.1).
+// Emission / frontend wiring is NOT done in this wave — it comes in T2 (Wave 1).
+// On native these call teko_socket.c; teko_socket.c provides WASM stubs that return 0/BADARG.
+long teko_rt_socket_tcp_connect(const char* host, long port); // -> handle (0 = failure)
+long teko_rt_socket_udp_open(const char* host, long port);    // -> handle (0 = failure)
+long teko_rt_socket_send(long handle, const char* data, long len);          // -> TekoSocketStatus
+long teko_rt_socket_recv(long handle, char* buf, long buf_len,
+                         long* out_received);                               // -> TekoSocketStatus
+long teko_rt_socket_close(long handle);                                     // -> TekoSocketStatus
+void teko_rt_socket_free(long handle);
+long teko_rt_socket_state(long handle);                                     // -> TekoSocketState
 // Phase 19 (T1b, Wave 0) — server socket surface wrappers (NATIVE-ONLY; no WASM reactor).
 // OP_CALL_RUNTIME id range 70-79 RESERVED for net-server; NO opcodes emitted this wave
 // (emission deferred to T2). These wrappers bridge the register-width ABI (long) to the

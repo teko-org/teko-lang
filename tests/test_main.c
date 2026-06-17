@@ -260,6 +260,14 @@ extern void test_teko_rsa_pkcs1v15_encrypt_roundtrip(void);
 extern void test_teko_rsa_oaep_sha256_kat(void);
 extern void test_teko_rsa_pss_sha256_kat(void);
 
+// Phase 19 (T1a) — client socket runtime KATs
+extern void test_teko_socket_null_args(void);
+extern void test_teko_socket_recv_bounds_constant(void);
+extern void test_teko_socket_handle_table_constant(void);
+extern void test_teko_socket_state_machine(void);
+extern void test_teko_socket_loopback_roundtrip(void);
+extern void test_teko_socket_recv_bounds_gate(void);
+extern void test_teko_socket_send_on_closed(void);
 // Phase 19 (T1b, Wave 0) — server socket KATs (NATIVE-ONLY; compiled only when !defined(__wasm__)).
 #if !defined(__wasm__)
 extern void test_teko_server_alloc_free(void);
@@ -538,6 +546,14 @@ int main(void) {
     RUN_TEST(test_teko_rsa_oaep_sha256_kat);
     RUN_TEST(test_teko_rsa_pss_sha256_kat);
 
+    // Phase 19 (T1a) — client socket runtime KATs
+    RUN_TEST(test_teko_socket_null_args);
+    RUN_TEST(test_teko_socket_recv_bounds_constant);
+    RUN_TEST(test_teko_socket_handle_table_constant);
+    RUN_TEST(test_teko_socket_state_machine);
+    RUN_TEST(test_teko_socket_loopback_roundtrip);
+    RUN_TEST(test_teko_socket_recv_bounds_gate);
+    RUN_TEST(test_teko_socket_send_on_closed);
     // Phase 19 (T1b, Wave 0) — server socket KATs (NATIVE-ONLY).
 #if !defined(__wasm__)
     RUN_TEST(test_teko_server_alloc_free);
