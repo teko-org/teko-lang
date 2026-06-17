@@ -1403,3 +1403,15 @@ long teko_rt_router_free(long handle) {
     teko_router_free((TekoRouter*)(intptr_t)handle);
     return 0;
 }
+// id 179: teko_rt_router_status(handle, method_ptr, path_ptr) -> status (200/404/405).
+// ABI: $a0=handle, $a1=method_ptr, $w0=path_ptr (last arg).
+// Returns TEKO_ROUTE_OK(200), TEKO_ROUTE_404(404), or TEKO_ROUTE_405(405).
+// SAST: method/path are compile-time string constants (same posture as id 177);
+// teko_router_dispatch validates all input; status is an int (no overflow).
+long teko_rt_router_status(long handle, long method_ptr, long path_ptr) {
+    TekoRouter*  r      = (TekoRouter*)(intptr_t)handle;
+    const char*  method = (const char*)(intptr_t)method_ptr;
+    const char*  path   = (const char*)(intptr_t)path_ptr;
+    TekoRouteMatch m = teko_router_dispatch(r, method, path, NULL);
+    return (long)m.status; // 200, 404, or 405
+}

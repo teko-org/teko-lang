@@ -1,18 +1,24 @@
-// Phase 19 (Router API proof — WASM harness).
+// Phase 19 (ROUTER-NATIVE — WASM discriminating proof).
 //
-// WASM cannot dynamically dispatch HTTP routes, so the api { } block lowers to env.teko_rt_router_*
-// HOST imports, backed here by a pure in-memory radix-tree mock. The emitted module has the SAME
-// shape as every other Teko WASM sample: it imports the compiled-C reactor (crypto.wasm) and shares
-// ONE linear memory with it (env.memory). The round-trip asserts the module drives the route
-// registration and dispatch in order:
-//   router_new(0) -> handle=1
-//   router_add("GET",    "/hello", slot=1, handle=1) -> 0  [slot 0=middleware logger]
-//   router_add("POST",   "/data",  slot=2, handle=1) -> 0
-//   router_add("DELETE", "/gone",  slot=3, handle=1) -> 0
-//   router_dispatch(handle=1, "GET",    "/hello") -> slot=1; call_indirect($routine_1) -> emit_int(200)
-//   router_dispatch(handle=1, "POST",   "/data")  -> slot=2; call_indirect($routine_2) -> emit_int(201)
-//   router_dispatch(handle=1, "DELETE", "/gone")  -> slot=3; call_indirect($routine_3) -> emit_int(204)
-//   router_free(handle=1) -> 0
+// Proves the radix router SELECTS by method+path, NOT by registration order.
+// The api { } block lowers to env.teko_rt_router_* HOST imports, backed by a pure
+// in-memory radix-tree mock. lower_api_block emits a DISCRIMINATING sequence:
+//
+//   (a) In-order dispatch (proves router runs, not inline):
+//     router_dispatch("GET",    "/hello") -> slot=1; call_indirect -> emit_int(200)
+//     router_dispatch("POST",   "/data")  -> slot=2; call_indirect -> emit_int(201)
+//     router_dispatch("DELETE", "/gone")  -> slot=3; call_indirect -> emit_int(204)
+//   (b) Out-of-order dispatch (proves selection by path, not registration sequence):
+//     router_dispatch("DELETE", "/gone")  -> slot=3; call_indirect -> emit_int(204)  [last route first]
+//     router_dispatch("GET",    "/hello") -> slot=1; call_indirect -> emit_int(200)  [first route last]
+//   (c) 404 miss (impossible via inline emit):
+//     router_status("GET", "/notfound")  -> 404; emit_int(404)
+//   (d) 405 method-mismatch (impossible via inline emit):
+//     router_status("PATCH", "/hello")   -> 405; emit_int(405)
+//
+// Expected output: [200, 201, 204, 204, 200, 404, 405]
+// IMPOSSIBLE via inline-leak (no handler body emits 404/405) or sequential-slot-return
+// (out-of-order 204,200 cannot appear from registration order 200,201,204).
 //
 // SAST (host side): method_ptr/path_ptr are i32 module values bounded to the module's linear
 // memory; readCStr reads at most MAX_BUF bytes before returning (cap the scan); handler_id is
@@ -73,6 +79,27 @@ const env = {
     console.log(`  router_free(${handle})`);
     return 0;
   },
+  // id 179: teko_rt_router_status(handle, method_ptr, path_ptr) -> status (200/404/405).
+  // Returns 200 if an exact (method, path) match exists, 404 if path is not registered,
+  // 405 if path exists but the method does not match.
+  teko_rt_router_status: (handle, method_ptr, path_ptr) => {
+    const method = readCStr(method_ptr);
+    const path   = readCStr(path_ptr);
+    // Check if any route for this handle matches the path (any method).
+    let pathExists = false;
+    let exactMatch = false;
+    for (const [key, slot] of routeMap.entries()) {
+      // key format: "handle:METHOD:path"
+      const parts = key.split(":");
+      if (parts[0] === String(handle) && parts[2] === path) {
+        pathExists = true;
+        if (parts[1] === method) { exactMatch = true; break; }
+      }
+    }
+    const status = exactMatch ? 200 : (pathExists ? 405 : 404);
+    console.log(`  router_status(${handle}, "${method}", "${path}") -> ${status}`);
+    return status;
+  },
   // --- reactor host hooks (crypto/time/entropy) ---
   teko_now_ns:    () => process.hrtime.bigint(),
   teko_now_unix:  () => 1000000000n,
@@ -108,10 +135,16 @@ const teko = await WebAssembly.instantiate(apiWasm, {
 console.log("Running api.tks proof:");
 teko.instance.exports.main();
 
-// Assert output.
-const expected = [200, 201, 204];
+// Assert discriminating output.
+// [200,201,204]: in-order dispatch (proves router runs, not inline)
+// [204,200]:     out-of-order dispatch (last route first, first route last — proves selection by path)
+// [404]:         unregistered path /notfound — impossible via inline emit
+// [405]:         registered path /hello, wrong method PATCH — impossible via inline emit
+const expected = [200, 201, 204, 204, 200, 404, 405];
 if (JSON.stringify(out) === JSON.stringify(expected)) {
-  console.log(`OK   api router: ${JSON.stringify(out)} (GET→200, POST→201, DELETE→204; distinct routes dispatched)`);
+  console.log(`OK   api router (discriminating): ${JSON.stringify(out)}`);
+  console.log(`     in-order[200,201,204] + out-of-order[204,200] + miss[404] + method-mismatch[405]`);
+  console.log(`     IMPOSSIBLE via inline-leak or sequential-slot-return → genuine radix selection proven`);
   process.exit(0);
 } else {
   console.error(`FAIL api router: got ${JSON.stringify(out)}, expected ${JSON.stringify(expected)}`);

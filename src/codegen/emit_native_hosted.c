@@ -104,6 +104,7 @@ const char* teko_native_runtime_symbol(int32_t id, int* out_arity) {
         case 176: sym = "teko_rt_router_add";      arity = 4; break; // (method, path, handler_id, handle)
         case 177: sym = "teko_rt_router_dispatch"; arity = 3; break; // (handle, method, path) -> handler_id
         case 178: sym = "teko_rt_router_free";     arity = 1; break; // (handle) -> 0
+        case 179: sym = "teko_rt_router_status";   arity = 3; break; // (handle, method, path) -> status (200/404/405)
         case 6: sym = "teko_rt_md5_hex";       break; // legacy
         case 7: sym = "teko_rt_sha1_hex";      break; // legacy
         case 8: sym = "teko_rt_uuid_v3";       break;

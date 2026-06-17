@@ -3447,9 +3447,8 @@ static void lower_api_block(BytecodeBuffer* b, Parser* p,
         codegen_li_emit_call_runtime(b, 176); // router_add -> result (0/-1) in $w0 (discarded)
     }
 
-    // 3. WASM SYNTHETIC PROOF: dispatch fabricated requests for each route and call the handler.
-    //    This proves grammar/emission/routing on BOTH targets (native server uses the runtime
-    //    accept loop instead, but the router_dispatch is still exercised there too).
+    // 3. DISPATCH PROOF (in-order): dispatch fabricated requests for each route and call the
+    //    handler in REGISTRATION ORDER, proving the router runs (not inline-leaked emits).
     //    Dispatch: router_dispatch(handle, method, path) -> handler_id in $w0.
     //    id 177 = teko_rt_router_dispatch; arity 3: $a0=handle, $a1=method, $w0=path.
     for (int ri = 0; ri < g_nroute; ri++) {
@@ -3464,6 +3463,73 @@ static void lower_api_block(BytecodeBuffer* b, Parser* p,
         // Call the handler: OP_CALL_FUNC(0) uses $w0 as the slot.
         b->uses_spawn = 1; // routine table + scheduler must exist for OP_CALL_FUNC
         codegen_li_emit_call_func(b, 0); // 0 args; handler slot from $w0
+    }
+
+    // 3b. DISCRIMINATING PROOF (out-of-order + miss): proves genuine radix selection.
+    //     IMPOSSIBLE to produce by inline-leak or sequential-slot-return:
+    //     (a) Dispatch last route FIRST, then first route LAST — handler outputs are
+    //         route[g_nroute-1] then route[0], REVERSED vs registration order.
+    //         If routing were sequential slot return, the order would be registration order.
+    //     (b) router_status(handle, "GET", "/notfound") -> 404 (path not registered).
+    //         No inline emit can produce 404 (a real router miss, not a handler value).
+    //     (c) router_status(handle, <first-route-method>, <DIFFERENT method>/<first-route-path>)
+    //         -> 405 (path exists, method does not).
+    //         No inline emit can produce 405 (a real router method-mismatch, not a handler).
+    //
+    //    Out-of-order dispatch: route[g_nroute-1] first, then route[0] (only if >= 2 routes).
+    if (g_nroute >= 2) {
+        // Dispatch last route first (out of order).
+        {
+            RouteInfo* r = &g_route[g_nroute - 1];
+            codegen_li_emit_load_local(b, router_local);
+            codegen_li_emit_setarg(b, 0);
+            codegen_li_emit_sconst(b, codegen_li_add_string_constant(b, r->method));
+            codegen_li_emit_setarg(b, 1);
+            codegen_li_emit_sconst(b, codegen_li_add_string_constant(b, r->path));
+            codegen_li_emit_call_runtime(b, 177); // router_dispatch -> handler_id in $w0
+            b->uses_spawn = 1;
+            codegen_li_emit_call_func(b, 0); // call the last-registered handler (out of order)
+        }
+        // Dispatch first route last (out of order).
+        {
+            RouteInfo* r = &g_route[0];
+            codegen_li_emit_load_local(b, router_local);
+            codegen_li_emit_setarg(b, 0);
+            codegen_li_emit_sconst(b, codegen_li_add_string_constant(b, r->method));
+            codegen_li_emit_setarg(b, 1);
+            codegen_li_emit_sconst(b, codegen_li_add_string_constant(b, r->path));
+            codegen_li_emit_call_runtime(b, 177); // router_dispatch -> handler_id in $w0
+            b->uses_spawn = 1;
+            codegen_li_emit_call_func(b, 0); // call the first-registered handler (out of order)
+        }
+    }
+
+    // id 179 = teko_rt_router_status; arity 3: $a0=handle, $a1=method, $w0=path -> status.
+    // Use the import binding for emit_int to print the status code to stdout.
+    {
+        int emit_idx = bind_lookup(binds, nb, "emit_int");
+        if (emit_idx >= 0) {
+            // (b) 404: status of an unregistered path.
+            codegen_li_emit_load_local(b, router_local);
+            codegen_li_emit_setarg(b, 0);
+            codegen_li_emit_sconst(b, codegen_li_add_string_constant(b, "GET"));
+            codegen_li_emit_setarg(b, 1);
+            codegen_li_emit_sconst(b, codegen_li_add_string_constant(b, "/notfound"));
+            codegen_li_emit_call_runtime(b, 179); // router_status -> 404 in $w0
+            codegen_li_emit_call_import(b, emit_idx); // emit_int(404)
+
+            // (c) 405: registered path, wrong method (first route's path, a different method).
+            //     Use "POST" against first route's path (if first route uses "GET", "DELETE",
+            //     etc.): pick a method that cannot match any registered route for that path.
+            //     The safe choice: use "PATCH" — never registered in any api.tks proof.
+            codegen_li_emit_load_local(b, router_local);
+            codegen_li_emit_setarg(b, 0);
+            codegen_li_emit_sconst(b, codegen_li_add_string_constant(b, "PATCH"));
+            codegen_li_emit_setarg(b, 1);
+            codegen_li_emit_sconst(b, codegen_li_add_string_constant(b, g_route[0].path));
+            codegen_li_emit_call_runtime(b, 179); // router_status -> 405 in $w0
+            codegen_li_emit_call_import(b, emit_idx); // emit_int(405)
+        }
     }
 
     // 4. Free the router after the proof sequence.

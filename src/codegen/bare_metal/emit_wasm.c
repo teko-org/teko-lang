@@ -1360,6 +1360,7 @@ void emit_wasm_pure(MetalContext* ctx, OpCode op, int32_t arg) {
                 fprintf(f, "  (import \"env\" \"teko_rt_router_add\"        (func $router_add       (param i32) (param i32) (param i32) (param i32) (result i32)))\n");
                 fprintf(f, "  (import \"env\" \"teko_rt_router_dispatch\"   (func $router_dispatch  (param i32) (param i32) (param i32) (result i32)))\n");
                 fprintf(f, "  (import \"env\" \"teko_rt_router_free\"       (func $router_free      (param i32) (result i32)))\n");
+                fprintf(f, "  (import \"env\" \"teko_rt_router_status\"     (func $router_status    (param i32) (param i32) (param i32) (result i32)))\n");
             }
             // Memory: module-owned by default; when a reactor (crypto/duplex/delayed/broadcast/
             // shared) is in play it is host-owned and SHARED (imported from env), so both modules
@@ -1508,13 +1509,14 @@ void emit_wasm_pure(MetalContext* ctx, OpCode op, int32_t arg) {
                     // http.get: url from $w0
                     fprintf(f, "    local.get $w0\n    call $http_get\n    local.set $w0\n");
                 }
-            } else if (arg >= 175 && arg <= 178) {
+            } else if (arg >= 175 && arg <= 179) {
                 // Phase 19 (ROUTER-NATIVE): call the reactor-imported teko_router_* entry points.
                 // ABI mirrors OP_CALL_IMPORT:
                 //   175 router_new(unused=0)   -> handle                       [1-arg: $w0=0]
                 //   176 router_add($a0=method,$a1=path,$a2=handler_id,$w0=handle) -> 0 [4-arg]
                 //   177 router_dispatch($a0=handle,$a1=method,$w0=path) -> handler_id  [3-arg]
                 //   178 router_free($w0=handle) -> 0                           [1-arg]
+                //   179 router_status($a0=handle,$a1=method,$w0=path) -> status(200/404/405) [3-arg]
                 // All results land in $w0. Stack-neutral (n pushes consumed by call, 1 result).
                 // SAST: method/path are teko string constants (compile-time); teko_router_add
                 // validates segments; dispatch is bounds-checked; no attacker-controlled input
@@ -1524,8 +1526,9 @@ void emit_wasm_pure(MetalContext* ctx, OpCode op, int32_t arg) {
                     "router_add",      // 176: (method, path, handler_id, handle) -> 0/-1
                     "router_dispatch", // 177: (handle, method, path) -> handler_id
                     "router_free",     // 178: (handle) -> 0
+                    "router_status",   // 179: (handle, method, path) -> status (200/404/405)
                 };
-                static const int router_arities[] = { 1, 4, 3, 1 };
+                static const int router_arities[] = { 1, 4, 3, 1, 3 };
                 int idx = arg - 175;
                 int ar  = router_arities[idx];
                 for (int p = 0; p + 1 < ar; p++) fprintf(f, "    local.get $a%d\n", p);
