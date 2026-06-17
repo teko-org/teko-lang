@@ -39,7 +39,8 @@ BytecodeBuffer* codegen_li_create_context(void) {
     buffer->uses_iarray = 0;
     buffer->uses_simd = 0;
     buffer->uses_vtable = 0;
-    buffer->uses_net = 0;
+    buffer->uses_net  = 0;
+    buffer->uses_http = 0; // Phase 19 (HTTP-INT): default OFF — zero-init so the 16 goldens stay byte-identical
 
     // Phase 17 (17.A): the float-constant pool starts empty; uses_float gates the WASM float locals.
     buffer->float_capacity = 8;
@@ -237,7 +238,12 @@ void codegen_li_emit_call_runtime(BytecodeBuffer* buffer, int codec_id) {
     // backend emits env host-imports (env.teko_net_*); on native teko_rt_socket_* is already
     // in libteko_rt.a (unconditionally linked). Set uses_net so the WASM emitter gates the
     // host-import declarations — socket-free programs stay byte-identical.
-    if (codec_id >= 61 && codec_id <= 67) buffer->uses_net = 1;
+    if (codec_id >= 61 && codec_id <= 67) buffer->uses_net  = 1;
+    // Phase 19 (HTTP-INT — http.* surface): ids 80-81 (http.get/post). On WASM the backend
+    // emits env.teko_http_get / env.teko_http_post host-imports; on native teko_rt_http_get/post
+    // is in libteko_rt.a. Set uses_http so the WASM emitter gates the import declarations —
+    // HTTP-free programs stay byte-identical.
+    if (codec_id == 80 || codec_id == 81) buffer->uses_http = 1;
     emit_byte(buffer, OP_CALL_RUNTIME);
     emit_int(buffer, codec_id);
 }

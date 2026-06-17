@@ -1339,6 +1339,17 @@ void emit_wasm_pure(MetalContext* ctx, OpCode op, int32_t arg) {
                 fprintf(f, "  (import \"env\" \"teko_net_free\"          (func $net_free         (param i32) (result i32)))\n");
                 fprintf(f, "  (import \"env\" \"teko_net_state\"         (func $net_state        (param i32) (result i32)))\n");
             }
+            // Phase 19 (HTTP-INT — http.* client surface): host-import teko_http_get / teko_http_post.
+            // Gated on wasm_emit_http so HTTP-free programs stay byte-identical. The host (run-http.mjs)
+            // provides the actual HTTP request and writes a NUL-terminated body string into linear memory,
+            // returning a pointer. ABI: (url_ptr i32) -> i32 body_ptr; (url_ptr i32, body_ptr i32) -> i32.
+            // SAST: url_ptr / body_ptr are i32 module pointers (bounded to the module's linear memory by
+            // the host mock); the host caps read/write at MAX_BUF before touching memory; no untrusted
+            // data escapes the memory region; no format-string / path-traversal on the module side.
+            if (ctx->wasm_emit_http) {
+                fprintf(f, "  (import \"env\" \"teko_http_get\"  (func $http_get  (param i32) (result i32)))\n");
+                fprintf(f, "  (import \"env\" \"teko_http_post\" (func $http_post (param i32) (param i32) (result i32)))\n");
+            }
             // Memory: module-owned by default; when a reactor (crypto/duplex/delayed/broadcast/
             // shared) is in play it is host-owned and SHARED (imported from env), so both modules
             // address the same bytes. Re-export it either way so harnesses can read results.
@@ -1473,6 +1484,19 @@ void emit_wasm_pure(MetalContext* ctx, OpCode op, int32_t arg) {
                 int ar  = net_arities[idx];
                 for (int p = 0; p + 1 < ar; p++) fprintf(f, "    local.get $a%d\n", p);
                 fprintf(f, "    local.get $w0\n    call $%s\n    local.set $w0\n", net_fns[idx]);
+            } else if (arg == 80 || arg == 81) {
+                // Phase 19 (HTTP-INT — http.* client surface): call the env host-imports.
+                // ABI mirrors OP_CALL_IMPORT: args 0..n-2 from staging slots $a0.. (set by
+                // OP_SETARG), the last from $w0; the i32 result (body_ptr, 0=err) lands in $w0.
+                // http.get(url)=1-arg (url in $w0); http.post(url,body)=2-arg ($a0=url, $w0=body).
+                // WASM cannot open raw sockets; the host (run-http.mjs) performs the HTTP request.
+                if (arg == 81) {
+                    // http.post: url from $a0, body from $w0
+                    fprintf(f, "    local.get $a0\n    local.get $w0\n    call $http_post\n    local.set $w0\n");
+                } else {
+                    // http.get: url from $w0
+                    fprintf(f, "    local.get $w0\n    call $http_get\n    local.set $w0\n");
+                }
             } else if (wasm_is_crypto_ext_id(arg)) {
                 // Reactor-backed crypto: call the imported teko_rt_* entry point. Multi-arg
                 // ABI mirrors OP_CALL_IMPORT — args 0..n-2 come from the staging slots

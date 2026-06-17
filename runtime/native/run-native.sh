@@ -665,4 +665,52 @@ conn.close(); s.close()
 
 check_net
 
+# Phase 19 (HTTP-INT — http.* client surface): http.get loopback proof.
+# A minimal Python3 HTTP/1.1 server is started on port 17343; it responds to any
+# GET request with body "hello-http" and then exits. http.tks compiles, runs, and
+# the harness asserts the emitted string is "hello-http".
+# SAST (harness side): port 17343 is a fixed literal; Python server handles exactly
+# one request and exits; no external data flows into shell commands (the URL in http.tks
+# is a compile-time constant: "http://127.0.0.1:17343/"); the server is a self-contained
+# Python3 one-liner; no shell injection vector exists.
+check_http() {
+  local sample="http.tks" exe got
+  exe="$TMP/http"
+  local HTTP_PORT=17343
+  echo "--- $sample (HTTP GET loopback, port ${HTTP_PORT}) ---"
+
+  # Start a minimal HTTP/1.1 server: serve one GET request with body "hello-http", then exit.
+  python3 -c "
+import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(('127.0.0.1', ${HTTP_PORT}))
+s.listen(1)
+sys.stdout.write('ready\n'); sys.stdout.flush()
+conn, _ = s.accept()
+conn.recv(4096)  # consume the request
+body = b'hello-http'
+resp = (b'HTTP/1.1 200 OK\r\nContent-Length: ' + str(len(body)).encode() +
+        b'\r\nConnection: close\r\n\r\n' + body)
+conn.sendall(resp)
+conn.close(); s.close()
+" >"$TMP/http_server.log" 2>&1 &
+  HTTP_PID=$!
+  # Wait until the server signals readiness (up to 5 s).
+  local waited=0
+  until grep -q 'ready' "$TMP/http_server.log" 2>/dev/null || [ $waited -ge 50 ]; do
+    sleep 0.1; waited=$((waited + 1))
+  done
+  grep -q 'ready' "$TMP/http_server.log" 2>/dev/null || fail "HTTP server did not start in time"
+
+  "$TEKO" build "$HERE/samples/$sample" --target=host --rt-lib="$RTLIB" -o "$exe" \
+    || { kill "$HTTP_PID" 2>/dev/null; fail "compile/link failed for $sample"; }
+  got="$("$exe")" || { kill "$HTTP_PID" 2>/dev/null; fail "http exited non-zero"; }
+  wait "$HTTP_PID" 2>/dev/null || true  # reap server (already exited after one request)
+  [ "$got" = "hello-http" ] || fail "http: expected [hello-http], got [$got]"
+  echo "OK: http -> loopback GET [$got]"
+}
+
+check_http
+
 echo "All native runner proofs passed."
