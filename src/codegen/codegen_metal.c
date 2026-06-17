@@ -36,6 +36,7 @@ MetalContext* teko_metal_create(const char* output_asm_path, TekoTarget target) 
     ctx->wasm_emit_array = 0;
     ctx->wasm_emit_iarray = 0;
     ctx->wasm_emit_simd = 0;
+    ctx->wasm_emit_net = 0; // Phase 19 (T2): default OFF — malloc'd ctx, must zero-init like its siblings
     ctx->wasm_emit_delayed = 0;
     ctx->wasm_emit_bcast = 0;
     ctx->wasm_emit_shared = 0;
