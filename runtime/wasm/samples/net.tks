@@ -1,0 +1,27 @@
+// Phase 19 (T2 — net.* client socket surface) native runner proof.
+// Connects to a loopback echo server (started by the harness), sends "hello",
+// receives the echoed reply, and emits it. Lowers to OP_CALL_RUNTIME ids 61-67
+// -> teko_rt_socket_tcp_connect / teko_rt_socket_send / teko_rt_socket_recv_str /
+// teko_rt_socket_close / teko_rt_socket_free_h over teko_socket.c (POSIX/Winsock).
+// SAST: host is a string constant (no format-string, no path traversal); recv
+// buffer is bounded by TEKO_SOCKET_MAX_BUF in teko_rt_socket_recv_str before alloc/syscall.
+extern fn emit(s) from "teko_rt" as "teko_rt_emit";
+
+// PORT is injected as a comptime constant by the harness (replaced before compile).
+// During a real run: let h = net.tcp_connect("127.0.0.1", <PORT>);
+// We use port 17342 as the proof port (harness picks an ephemeral port and replaces).
+let h = net.tcp_connect("127.0.0.1", 17342);
+
+// Send "hello" (5 bytes) to the echo server.
+net.send(h, "hello", 5);
+
+// Receive up to 64 bytes; the echo server mirrors the sent bytes back.
+// net.recv returns a fresh string pointer (0 on would-block/error).
+let r = net.recv(h, 64);
+
+// Emit the echoed string (should be "hello").
+emit(r);
+
+// Graceful teardown.
+net.close(h);
+net.free(h);

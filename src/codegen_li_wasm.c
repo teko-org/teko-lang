@@ -69,6 +69,10 @@ int codegen_li_emit_wasm(const BytecodeBuffer* buffer, const char* wat_path,
     teko_metal_set_emit_iarray(ctx, buffer->uses_iarray);
     // Phase 18 (18.E.4): emit the REAL simd128 vector kernel (teko_simd_sum_i32) + import iarray_data.
     teko_metal_set_emit_simd(ctx, buffer->uses_simd);
+    // Phase 19 (T2 — net.* socket wiring): declare env.teko_net_* host-imports when the program
+    // uses any net.* surface op (ids 61-67). Native targets already link teko_rt_socket_* via
+    // libteko_rt.a (socket-free programs stay byte-identical on all targets).
+    teko_metal_set_emit_net(ctx, buffer->uses_net);
     // Phase 17 (17.A): hand the WASM emitter the float-constant pool + uses_float flag (the latter
     // gates the `(local $f0/$f1/$fvN f64)` declarations — float-free modules stay byte-identical).
     teko_metal_set_floats(ctx, buffer->floats, buffer->float_count);

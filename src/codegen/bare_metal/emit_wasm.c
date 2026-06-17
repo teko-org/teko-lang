@@ -1324,6 +1324,21 @@ void emit_wasm_pure(MetalContext* ctx, OpCode op, int32_t arg) {
                 fprintf(f, "  (import \"crypto\" \"teko_rt_decimal_to_string\" (func $decimal_to_string (param i32) (result i32)))\n");
                 fprintf(f, "  (import \"crypto\" \"teko_rt_decimal_parse\" (func $decimal_parse (param i32) (param i32)))\n");
             }
+            // Phase 19 (T2 — net.* socket wiring): host-imports from the "env" namespace.
+            // WASM cannot open raw sockets; the host (Node.js / browser) provides TCP/UDP.
+            // ABI: all-i32 (handle = opaque i32, port = i32, string pointers = i32 linear-memory
+            // offsets). teko_net_recv allocates a buffer internally and returns a string pointer
+            // (0 on would-block or error — caller checks state). teko_net_free returns 0 (void).
+            // Gated on wasm_emit_net: socket-free programs stay byte-identical.
+            if (ctx->wasm_emit_net) {
+                fprintf(f, "  (import \"env\" \"teko_net_tcp_connect\" (func $net_tcp_connect (param i32) (param i32) (result i32)))\n");
+                fprintf(f, "  (import \"env\" \"teko_net_udp_open\"     (func $net_udp_open     (param i32) (param i32) (result i32)))\n");
+                fprintf(f, "  (import \"env\" \"teko_net_send\"          (func $net_send         (param i32) (param i32) (param i32) (result i32)))\n");
+                fprintf(f, "  (import \"env\" \"teko_net_recv\"          (func $net_recv         (param i32) (param i32) (result i32)))\n");
+                fprintf(f, "  (import \"env\" \"teko_net_close\"         (func $net_close        (param i32) (result i32)))\n");
+                fprintf(f, "  (import \"env\" \"teko_net_free\"          (func $net_free         (param i32) (result i32)))\n");
+                fprintf(f, "  (import \"env\" \"teko_net_state\"         (func $net_state        (param i32) (result i32)))\n");
+            }
             // Memory: module-owned by default; when a reactor (crypto/duplex/delayed/broadcast/
             // shared) is in play it is host-owned and SHARED (imported from env), so both modules
             // address the same bytes. Re-export it either way so harnesses can read results.
@@ -1439,6 +1454,25 @@ void emit_wasm_pure(MetalContext* ctx, OpCode op, int32_t arg) {
                 // is written into the $d0 slot (arg1 = &$d0). Checked/fail-loud (reactor traps).
                 fprintf(f, "    local.get $w0\n    i32.const %d\n    call $decimal_parse\n",
                         teko_wasm_decimal_slot_off(ctx, 0));
+            } else if (arg >= 61 && arg <= 67) {
+                // Phase 19 (T2 — net.* socket wiring): call the env host-imports. Multi-arg ABI
+                // mirrors OP_CALL_IMPORT — args 0..n-2 from staging slots $a0.. (set by OP_SETARG),
+                // the last from $w0; the i32 result (handle/status/state/ptr) lands in $w0.
+                // WASM cannot open raw sockets; the host provides the real I/O.
+                static const char* net_fns[] = {
+                    "net_tcp_connect", // 61: (host_ptr, port) -> handle
+                    "net_udp_open",    // 62: (host_ptr, port) -> handle
+                    "net_send",        // 63: (handle, data_ptr, len) -> status
+                    "net_recv",        // 64: (handle, max_len) -> result_ptr (0 = would-block/err)
+                    "net_close",       // 65: (handle) -> status
+                    "net_free",        // 66: (handle) -> 0
+                    "net_state",       // 67: (handle) -> state
+                };
+                static const int net_arities[] = { 2, 2, 3, 2, 1, 1, 1 };
+                int idx = arg - 61;
+                int ar  = net_arities[idx];
+                for (int p = 0; p + 1 < ar; p++) fprintf(f, "    local.get $a%d\n", p);
+                fprintf(f, "    local.get $w0\n    call $%s\n    local.set $w0\n", net_fns[idx]);
             } else if (wasm_is_crypto_ext_id(arg)) {
                 // Reactor-backed crypto: call the imported teko_rt_* entry point. Multi-arg
                 // ABI mirrors OP_CALL_IMPORT — args 0..n-2 come from the staging slots

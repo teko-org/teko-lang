@@ -78,6 +78,19 @@ const char* teko_native_runtime_symbol(int32_t id, int* out_arity) {
         // emission, but the symbol/arity feed the WASM import declaration).
         case 59: sym = "teko_rt_decimal_to_string"; arity = 1; break; // (&decimal) -> str
         case 60: sym = "teko_rt_decimal_parse";     arity = 1; break; // (str, &decimal) checked
+        // Phase 19 (T2 — net.* socket wiring): ids 61-67 map to the teko_rt_socket_* wrappers
+        // (the register-width ABI shims over the typed teko_socket.c API in libteko_rt.a).
+        // id 60 is decimal.parse (above); net-client starts at 61 to avoid the collision.
+        // SAST: host/data strings are attacker-influenced — bounds-checked in teko_socket.c
+        // (buf_len > TEKO_SOCKET_MAX_BUF guarded BEFORE the recv syscall; host passed only to
+        // getaddrinfo; no format-string path; port is uint16_t-range-checked in the wrapper).
+        case 61: sym = "teko_rt_socket_tcp_connect"; arity = 2; break; // (host, port) -> handle
+        case 62: sym = "teko_rt_socket_udp_open";    arity = 2; break; // (host, port) -> handle
+        case 63: sym = "teko_rt_socket_send";        arity = 3; break; // (handle, data, len) -> status
+        case 64: sym = "teko_rt_socket_recv_str";    arity = 2; break; // (handle, max_len) -> str (new wrapper)
+        case 65: sym = "teko_rt_socket_close";       arity = 1; break; // (handle) -> status
+        case 66: sym = "teko_rt_socket_free_h";      arity = 1; break; // (handle) -> 0
+        case 67: sym = "teko_rt_socket_state";       arity = 1; break; // (handle) -> state
         case 6: sym = "teko_rt_md5_hex";       break; // legacy
         case 7: sym = "teko_rt_sha1_hex";      break; // legacy
         case 8: sym = "teko_rt_uuid_v3";       break;

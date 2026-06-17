@@ -122,6 +122,12 @@ typedef struct {
     // the run's data pointer + length. WASM additionally imports teko_rt_iarray_data from the reactor.
     // Gating ALL SIMD emission on this keeps simd-free output byte-identical (the 16 goldens never see it).
     int wasm_emit_simd;
+    // Phase 19 (T2 — net.* socket wiring): 1 when the program uses a net.* op (OP_CALL_RUNTIME
+    // ids 61-67). The WASM backend then emits host-imports from the "env" namespace
+    // (env.teko_net_tcp_connect, env.teko_net_udp_open, env.teko_net_send, env.teko_net_recv,
+    // env.teko_net_close, env.teko_net_free, env.teko_net_state) so the host provides TCP/UDP
+    // primitives (WASM cannot open raw sockets). Socket-free programs stay byte-identical.
+    int wasm_emit_net;
     // Phase 14 (control-flow foundation): structured loop/if lowering state, shared by the native
     // hosted emitter and the WASM emitter. cf_id_next assigns a fresh monotonic id to each
     // LOOP_BEGIN/IF_BEGIN; cf_loop_stack/cf_if_stack track the active (nesting) ids so
@@ -187,6 +193,8 @@ void teko_metal_set_emit_vtable(MetalContext* ctx, int enabled);
 void teko_metal_set_emit_array(MetalContext* ctx, int enabled);
 void teko_metal_set_emit_iarray(MetalContext* ctx, int enabled);
 void teko_metal_set_emit_simd(MetalContext* ctx, int enabled);
+// Phase 19 (T2): request net.* host-import emission (WASM only; native links teko_rt_socket_*).
+void teko_metal_set_emit_net(MetalContext* ctx, int enabled);
 
 // Phase 17 (17.A): hand the backend the float-constant pool (OP_FCONST's index space). `floats`
 // must outlive teko_metal_emit_program. teko_metal_set_emit_float gates the WASM float locals.
