@@ -1,0 +1,37 @@
+// Phase 18 (18.E.3) WASM runner — SoA (structure-of-arrays) layout. Identical body to the native proof
+// (runtime/native/samples/soa.tks) except the emit extern is the WASM host import; the emitted stdout is
+// BYTE-IDENTICAL to native. The k contiguous typed-i32 field runs are the SAME teko_iarray.c source of
+// truth (compiled into the wasm32 reactor, imported over shared memory) — `s[i].field` r/w and the
+// whole-run accessor `s.field` lower entirely in the frontend (no new opcode/runtime), so a SoA-free
+// module stays byte-identical.
+extern fn emit(s) from "env" as "emit";
+
+class Point {
+  let x;
+  let y;
+}
+
+let s = soa Point[3];      // two contiguous i32 runs of length 3: x=[_,_,_], y=[_,_,_]
+
+s[0].x = 10;  s[0].y = 1;
+s[1].x = 20;  s[1].y = 2;
+s[2].x = 30;  s[2].y = 3;
+
+emit("s[1].x = " + convert.int_to_str(s[1].x));   // 20 (read a field cell)
+emit("s[2].y = " + convert.int_to_str(s[2].y));   // 3
+emit("len = " + convert.int_to_str(s.len));        // 3 (element count)
+
+// Sum the x field across the 3 elements via an index loop — the field run is CONTIGUOUS.
+let sum = 0;
+let i = 0;
+while (i < s.len) {
+  sum = sum + s[i].x;                               // 10 + 20 + 30
+  i = i + 1;
+}
+emit("sum_x = " + convert.int_to_str(sum));        // 60
+
+// Whole-run accessor: `s.x` yields the contiguous i32[] handle (the SIMD hook). `col` is a usable
+// typed array referencing the SAME field run — `col.len` and `col[i]` work like any i32[] local.
+let col = s.x;
+emit("col.len = " + convert.int_to_str(col.len));  // 3
+emit("col[1] = " + convert.int_to_str(col[1]));    // 20

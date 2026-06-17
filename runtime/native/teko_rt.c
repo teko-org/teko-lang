@@ -24,6 +24,8 @@
 #include "teko_time.h"
 #include "teko_object.h"
 #include "teko_vtable.h"
+#include "teko_array.h"
+#include "teko_iarray.h"
 #include "teko_convert.h"
 #include "teko_decimal.h"
 #include <stdint.h>
@@ -869,6 +871,61 @@ double teko_rt_parse_float(const char* s) {
 // already decided); never returns.
 void teko_rt_f2i_fail(void) {
     teko_rt_die("convert.to_int: float out of i32 range or not finite");
+}
+
+// Phase 18 (18.E.1) — FIXED-size CONTIGUOUS array surface wrappers (OP_ARR_* lower to these). The
+// teko_array C runtime (src/runtime/teko_array.c) is the source of truth. UNLIKE the object store,
+// get/set are CHECKED FAIL-LOUD: an out-of-range index aborts via teko_rt_die (the SAME exit-70 +
+// stderr path / wasm __builtin_trap the 16.F/17 checked surface uses), NOT a defensive no-op. Placed
+// AFTER teko_rt_die (a static) so it is in scope. Available on every target (native + wasm reactor).
+long teko_rt_array_new(long n) {
+    return (long)(intptr_t)teko_array_new((int)n);
+}
+long teko_rt_array_get(long handle, long i) {
+    intptr_t v = 0;
+    if (!teko_array_get((const TekoArray*)(intptr_t)handle, (int)i, &v))
+        teko_rt_die("array: index out of bounds");
+    return (long)v;
+}
+long teko_rt_array_set(long handle, long i, long value) {
+    if (!teko_array_set((TekoArray*)(intptr_t)handle, (int)i, (intptr_t)value))
+        teko_rt_die("array: index out of bounds");
+    return 0;
+}
+long teko_rt_array_len(long handle) {
+    return (long)teko_array_len((const TekoArray*)(intptr_t)handle);
+}
+
+// Phase 18 (18.E.2) — TYPED `i32[]` PACKED numeric array surface wrappers (OP_IARR_* lower to these).
+// Mirrors teko_rt_array_* EXACTLY; the ONLY difference is the cell type (PACKED int32_t — the SIMD
+// substrate). Values are i32-range ints carried in `long` (truncated to int32 on store). get/set are
+// CHECKED FAIL-LOUD: an out-of-range index aborts via teko_rt_die (the SAME exit-70 + stderr path the
+// array surface uses), NOT a defensive no-op.
+long teko_rt_iarray_new(long n) {
+    return (long)(intptr_t)teko_iarray_new((int)n);
+}
+long teko_rt_iarray_get(long handle, long i) {
+    int32_t v = 0;
+    if (!teko_iarray_get((const TekoIArray*)(intptr_t)handle, (int)i, &v))
+        teko_rt_die("iarray: index out of bounds");
+    return (long)v;
+}
+long teko_rt_iarray_set(long handle, long i, long value) {
+    if (!teko_iarray_set((TekoIArray*)(intptr_t)handle, (int)i, (int32_t)value))
+        teko_rt_die("iarray: index out of bounds");
+    return 0;
+}
+long teko_rt_iarray_len(long handle) {
+    return (long)teko_iarray_len((const TekoIArray*)(intptr_t)handle);
+}
+// Phase 18 (18.E.4) — SIMD substrate access. data returns the packed int32 cell-buffer pointer as a
+// register-width integer (the run the BACKEND-emitted teko_simd_sum_i32 kernel walks); sum is the
+// SCALAR reference reduction (the self-check oracle + the honest fallback for non-vector targets).
+long teko_rt_iarray_data(long handle) {
+    return (long)(intptr_t)teko_iarray_data((TekoIArray*)(intptr_t)handle);
+}
+long teko_rt_iarray_sum(long handle) {
+    return (long)teko_iarray_sum((const TekoIArray*)(intptr_t)handle);
 }
 
 // Phase 17.F.3 — the 256-byte `decimal` VALUE-MODEL runtime wrappers. The opcode family

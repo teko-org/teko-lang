@@ -97,6 +97,8 @@ set(CORE_SOURCES
         src/runtime/teko_retry.c
         src/runtime/teko_time.c
         src/runtime/teko_object.c
+        src/runtime/teko_array.c
+        src/runtime/teko_iarray.c
         src/runtime/teko_vtable.c
         src/runtime/teko_convert.c
         src/runtime/teko_convert_f64.c
@@ -162,7 +164,7 @@ target_include_directories(teko PRIVATE src)
 #     the surface ABI shims (teko_rt_emit, and the crypto wrappers added in Sub-phase B)
 #     over the portable C crypto runtime (the single source of truth). Self-contained so
 #     produced binaries need nothing else.
-add_library(teko_rt STATIC runtime/native/teko_rt.c runtime/native/teko_rt_sched.c src/runtime/teko_duplex.c src/runtime/teko_delayed.c src/runtime/teko_broadcast.c src/runtime/teko_shared.c src/runtime/teko_retry.c src/runtime/teko_time.c src/runtime/teko_object.c src/runtime/teko_vtable.c src/runtime/teko_convert.c src/runtime/teko_convert_f64.c src/runtime/teko_decimal.c ${TEKO_CRYPTO_SOURCES})
+add_library(teko_rt STATIC runtime/native/teko_rt.c runtime/native/teko_rt_sched.c src/runtime/teko_duplex.c src/runtime/teko_delayed.c src/runtime/teko_broadcast.c src/runtime/teko_shared.c src/runtime/teko_retry.c src/runtime/teko_time.c src/runtime/teko_object.c src/runtime/teko_array.c src/runtime/teko_iarray.c src/runtime/teko_vtable.c src/runtime/teko_convert.c src/runtime/teko_convert_f64.c src/runtime/teko_decimal.c ${TEKO_CRYPTO_SOURCES})
 target_include_directories(teko_rt PRIVATE runtime/native src/runtime src)
 if (WIN32)
     target_link_libraries(teko_rt PRIVATE bcrypt) # CSPRNG: BCryptGenRandom

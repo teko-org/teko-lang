@@ -1230,6 +1230,32 @@ void emit_wasm_pure(MetalContext* ctx, OpCode op, int32_t arg) {
                 fprintf(f, "  (import \"crypto\" \"teko_rt_vtable_set\" (func $vtable_set (param i32) (param i32) (param i32) (result i32)))\n");
                 fprintf(f, "  (import \"crypto\" \"teko_rt_vtable_get\" (func $vtable_get (param i32) (param i32) (result i32)))\n");
             }
+            // Phase 18 (18.E.1): fixed-size array entry points from the SAME runtime reactor
+            // (namespace "crypto"). Pure i32-in/i32-out (handle/value/len) over the shared linear
+            // memory. get/set TRAP on an out-of-range index (the reactor's teko_rt_die __builtin_trap)
+            // — the WASM fail-loud posture. Imported only when the program uses an `array`.
+            if (ctx->wasm_emit_array) {
+                fprintf(f, "  (import \"crypto\" \"teko_rt_array_new\" (func $array_new (param i32) (result i32)))\n");
+                fprintf(f, "  (import \"crypto\" \"teko_rt_array_get\" (func $array_get (param i32) (param i32) (result i32)))\n");
+                fprintf(f, "  (import \"crypto\" \"teko_rt_array_set\" (func $array_set (param i32) (param i32) (param i32) (result i32)))\n");
+                fprintf(f, "  (import \"crypto\" \"teko_rt_array_len\" (func $array_len (param i32) (result i32)))\n");
+            }
+            // Phase 18 (18.E.2): TYPED `i32[]` packed-array entry points from the SAME runtime reactor
+            // (namespace "crypto"). Pure i32-in/i32-out (handle/value/len) over the shared linear
+            // memory; cells are PACKED int32 (the SIMD substrate). get/set TRAP on an out-of-range
+            // index. Imported only when the program uses a typed `i32[]`.
+            if (ctx->wasm_emit_iarray) {
+                fprintf(f, "  (import \"crypto\" \"teko_rt_iarray_new\" (func $iarray_new (param i32) (result i32)))\n");
+                fprintf(f, "  (import \"crypto\" \"teko_rt_iarray_get\" (func $iarray_get (param i32) (param i32) (result i32)))\n");
+                fprintf(f, "  (import \"crypto\" \"teko_rt_iarray_set\" (func $iarray_set (param i32) (param i32) (param i32) (result i32)))\n");
+                fprintf(f, "  (import \"crypto\" \"teko_rt_iarray_len\" (func $iarray_len (param i32) (result i32)))\n");
+            }
+            // Phase 18 (18.E.4): the SIMD reduction additionally needs the run's DATA POINTER (an i32
+            // offset into the SHARED linear memory) — the in-module simd128 kernel ($teko_simd_sum_i32)
+            // does `v128.load` directly from it. Imported from the SAME reactor, only when uses_simd.
+            if (ctx->wasm_emit_simd) {
+                fprintf(f, "  (import \"crypto\" \"teko_rt_iarray_data\" (func $iarray_data (param i32) (result i32)))\n");
+            }
             // Phase 14 (14.C): delayed (timed) channel entry points, also from the reactor.
             if (ctx->wasm_emit_delayed) {
                 fprintf(f, "  (import \"crypto\" \"teko_rt_delayed_open\" (func $delayed_open (param i32) (result i32)))\n");
@@ -1303,7 +1329,8 @@ void emit_wasm_pure(MetalContext* ctx, OpCode op, int32_t arg) {
             // address the same bytes. Re-export it either way so harnesses can read results.
             if (ctx->wasm_emit_crypto_ext || ctx->wasm_emit_duplex || ctx->wasm_emit_delayed ||
                 ctx->wasm_emit_bcast || ctx->wasm_emit_shared || ctx->wasm_emit_retry ||
-                ctx->wasm_emit_object || ctx->wasm_emit_vtable || ctx->wasm_emit_decimal) {
+                ctx->wasm_emit_object || ctx->wasm_emit_vtable || ctx->wasm_emit_decimal ||
+                ctx->wasm_emit_array || ctx->wasm_emit_iarray) {
                 fprintf(f, "  (import \"env\" \"memory\" (memory 1))\n");
             } else {
                 fprintf(f, "  (memory 1)\n");
@@ -1474,6 +1501,50 @@ void emit_wasm_pure(MetalContext* ctx, OpCode op, int32_t arg) {
             fprintf(f, "    local.get $w0\n    call $%s\n    local.set $w0\n", fn);
             break;
         }
+
+        // Phase 18 (18.E.1): fixed-size array ops — call the reactor's imported teko_rt_array_*.
+        // Same multi-arg ABI as OP_OBJ_*: args 0..n-2 from staging slots $a0.. (OP_SETARG), the last
+        // from $w0; the i32 result (handle/value/len) lands in $w0. array_get/set TRAP on OOB inside
+        // the reactor (teko_rt_die __builtin_trap) — the host sees a WebAssembly.RuntimeError.
+        case OP_ARR_NEW:
+        case OP_ARR_GET:
+        case OP_ARR_SET:
+        case OP_ARR_LEN: {
+            const char* fn = (op == OP_ARR_NEW) ? "array_new" :
+                             (op == OP_ARR_GET) ? "array_get" :
+                             (op == OP_ARR_SET) ? "array_set" : "array_len";
+            int ar = (op == OP_ARR_SET) ? 3 : (op == OP_ARR_GET) ? 2 : 1;
+            for (int p = 0; p + 1 < ar; p++) fprintf(f, "    local.get $a%d\n", p);
+            fprintf(f, "    local.get $w0\n    call $%s\n    local.set $w0\n", fn);
+            break;
+        }
+
+        // Phase 18 (18.E.2): typed `i32[]` packed-array ops — call the reactor's imported
+        // teko_rt_iarray_*. Same multi-arg ABI as OP_ARR_*; iarray_get/set TRAP on OOB inside the
+        // reactor (teko_rt_die __builtin_trap) — the host sees a WebAssembly.RuntimeError.
+        case OP_IARR_NEW:
+        case OP_IARR_GET:
+        case OP_IARR_SET:
+        case OP_IARR_LEN: {
+            const char* fn = (op == OP_IARR_NEW) ? "iarray_new" :
+                             (op == OP_IARR_GET) ? "iarray_get" :
+                             (op == OP_IARR_SET) ? "iarray_set" : "iarray_len";
+            int ar = (op == OP_IARR_SET) ? 3 : (op == OP_IARR_GET) ? 2 : 1;
+            for (int p = 0; p + 1 < ar; p++) fprintf(f, "    local.get $a%d\n", p);
+            fprintf(f, "    local.get $w0\n    call $%s\n    local.set $w0\n", fn);
+            break;
+        }
+
+        // Phase 18 (18.E.4): the REAL SIMD reduction. The run HANDLE is in $w0; fetch its data ptr
+        // (an i32 offset into the SHARED memory) + length, then call the in-module simd128 kernel
+        // $teko_simd_sum_i32(ptr, n) -> the scalar sum, left in $w0. $w1 holds the length across the
+        // ptr fetch (both args are pushed before the kernel call). The kernel is a separate self-
+        // contained func (its own locals) — stack-disciplined, leaving exactly the sum on the stack.
+        case OP_SIMD_SUM:
+            fprintf(f, "    local.get $w0\n    call $iarray_len\n    local.set $w1\n"); // $w1 = length
+            fprintf(f, "    local.get $w0\n    call $iarray_data\n");                   // push data ptr
+            fprintf(f, "    local.get $w1\n    call $teko_simd_sum_i32\n    local.set $w0\n"); // sum
+            break;
 
         // Phase 14 (14.C): delayed (timed) channel ops — imported reactor calls, same ABI.
         case OP_DELAYED_OPEN:
@@ -2017,6 +2088,38 @@ void emit_wasm_pure(MetalContext* ctx, OpCode op, int32_t arg) {
                     fprintf(f, " $routine_%d", ctx->wasm_routine_ids[k]);
                 }
                 fprintf(f, ")\n");
+            }
+            // Phase 18 (18.E.4): the REAL simd128 vector reduction kernel — a separate self-contained
+            // func emitted ONCE per module (gated on wasm_emit_simd → simd-free modules byte-identical).
+            // 4-wide i32x4.add accumulate over v128.load -> 4-lane collapse -> scalar tail (N % 4).
+            // Stack-disciplined: own locals, returns exactly the i32 sum. wat2wasm enables simd by
+            // default; Node/wasmtime run it. ptr is an i32 offset into the SHARED linear memory.
+            if (ctx->wasm_emit_simd) {
+                fprintf(f, "  (func $teko_simd_sum_i32 (param $ptr i32) (param $n i32) (result i32)\n");
+                fprintf(f, "    (local $acc v128) (local $i i32) (local $vend i32) (local $sum i32)\n");
+                fprintf(f, "    (local.set $acc (v128.const i32x4 0 0 0 0))\n");
+                fprintf(f, "    (local.set $vend (i32.and (local.get $n) (i32.const -4)))\n");
+                // vector loop: while (i < vend) { acc += load(ptr + i*4); i += 4 }
+                fprintf(f, "    (block $bv (loop $lv\n");
+                fprintf(f, "      (br_if $bv (i32.ge_s (local.get $i) (local.get $vend)))\n");
+                fprintf(f, "      (local.set $acc (i32x4.add (local.get $acc)\n");
+                fprintf(f, "        (v128.load (i32.add (local.get $ptr) (i32.mul (local.get $i) (i32.const 4))))))\n");
+                fprintf(f, "      (local.set $i (i32.add (local.get $i) (i32.const 4)))\n");
+                fprintf(f, "      (br $lv)))\n");
+                // collapse the 4 lanes into the scalar accumulator.
+                fprintf(f, "    (local.set $sum (i32.add (i32.add\n");
+                fprintf(f, "      (i32x4.extract_lane 0 (local.get $acc)) (i32x4.extract_lane 1 (local.get $acc)))\n");
+                fprintf(f, "      (i32.add\n");
+                fprintf(f, "      (i32x4.extract_lane 2 (local.get $acc)) (i32x4.extract_lane 3 (local.get $acc)))))\n");
+                // scalar tail: while (i < n) { sum += load(ptr + i*4); i += 1 }
+                fprintf(f, "    (block $bt (loop $lt\n");
+                fprintf(f, "      (br_if $bt (i32.ge_s (local.get $i) (local.get $n)))\n");
+                fprintf(f, "      (local.set $sum (i32.add (local.get $sum)\n");
+                fprintf(f, "        (i32.load (i32.add (local.get $ptr) (i32.mul (local.get $i) (i32.const 4))))))\n");
+                fprintf(f, "      (local.set $i (i32.add (local.get $i) (i32.const 1)))\n");
+                fprintf(f, "      (br $lt)))\n");
+                fprintf(f, "    (local.get $sum)\n");
+                fprintf(f, "  )\n");
             }
             fprintf(f, "  (export \"main\" (func $main))\n");
             // String constant pool → a real (data ...) segment: each pool string laid

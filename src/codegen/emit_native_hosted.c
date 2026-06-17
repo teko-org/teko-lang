@@ -192,6 +192,41 @@ const char* teko_native_object_symbol(OpCode op, int* out_arity) {
     return sym;
 }
 
+// Phase 18 (18.E.1): OP_ARR_* -> teko_rt_array_* symbol + arity (mirrors the WASM reactor import
+// table). The teko_array C runtime is the single source of truth (linked from libteko_rt.a); the
+// get/set wrappers are CHECKED FAIL-LOUD on an out-of-range index (the wrapper aborts).
+const char* teko_native_array_symbol(OpCode op, int* out_arity) {
+    int arity = 1;
+    const char* sym = NULL;
+    switch (op) {
+        case OP_ARR_NEW: sym = "teko_rt_array_new"; arity = 1; break; // (n)
+        case OP_ARR_GET: sym = "teko_rt_array_get"; arity = 2; break; // (handle, idx)
+        case OP_ARR_SET: sym = "teko_rt_array_set"; arity = 3; break; // (handle, idx, value)
+        case OP_ARR_LEN: sym = "teko_rt_array_len"; arity = 1; break; // (handle)
+        default: break;
+    }
+    if (out_arity) *out_arity = arity;
+    return sym;
+}
+
+// Phase 18 (18.E.2): OP_IARR_* -> teko_rt_iarray_* symbol + arity (mirrors the WASM reactor import
+// table). The teko_iarray C runtime (PACKED int32 cells, the SIMD substrate) is the single source of
+// truth (linked from libteko_rt.a); the get/set wrappers are CHECKED FAIL-LOUD on an out-of-range
+// index (the wrapper aborts).
+const char* teko_native_iarray_symbol(OpCode op, int* out_arity) {
+    int arity = 1;
+    const char* sym = NULL;
+    switch (op) {
+        case OP_IARR_NEW: sym = "teko_rt_iarray_new"; arity = 1; break; // (n)
+        case OP_IARR_GET: sym = "teko_rt_iarray_get"; arity = 2; break; // (handle, idx)
+        case OP_IARR_SET: sym = "teko_rt_iarray_set"; arity = 3; break; // (handle, idx, value)
+        case OP_IARR_LEN: sym = "teko_rt_iarray_len"; arity = 1; break; // (handle)
+        default: break;
+    }
+    if (out_arity) *out_arity = arity;
+    return sym;
+}
+
 // Phase 15 (15.B): OP_VTABLE_* -> teko_rt_vtable_* symbol + arity (mirrors the WASM reactor import
 // table). The teko_vtable C runtime is the single source of truth (linked from libteko_rt.a).
 const char* teko_native_vtable_symbol(OpCode op, int* out_arity) {
@@ -390,6 +425,134 @@ static void emit_routine_table(MetalContext* ctx) {
     fprintf(f, "    .quad %d\n", n);
 }
 
+// Phase 18 (18.E.4): lower OP_SIMD_SUM. On entry $w0 (rax/x0) holds the typed i32[] run HANDLE.
+// Three steps, minding register clobbering across the helper calls (handle + data ptr are saved on
+// the frame stage slots — callee-saved across calls): (1) data ptr = teko_rt_iarray_data(handle);
+// (2) len = teko_rt_iarray_len(handle); (3) sum = teko_simd_sum_i32(ptr, len) -> $w0. The kernel is
+// the REAL per-ISA vector loop emitted ONCE per module (emit_simd_kernel).
+static void emit_simd_sum_lowering(MetalContext* ctx) {
+    FILE* f = ctx->file;
+    const char* pre = sym_prefix(ctx);
+    // Reuse two staging slots as callee-saved scratch (no OP_SETARG is live during this lowering):
+    // slot 0 = handle, slot 1 = data ptr. They survive the helper calls (frame-relative, not regs).
+    if (is_arm64(ctx)) {
+        fprintf(f, "    str x0, [x29, #%d]\n", stage_off_arm(ctx, 0));   // save handle
+        fprintf(f, "    bl %steko_rt_iarray_data\n", pre);               // x0 = data ptr
+        fprintf(f, "    str x0, [x29, #%d]\n", stage_off_arm(ctx, 1));   // save data ptr
+        fprintf(f, "    ldr x0, [x29, #%d]\n", stage_off_arm(ctx, 0));   // reload handle
+        fprintf(f, "    bl %steko_rt_iarray_len\n", pre);                // x0 = length
+        fprintf(f, "    mov x1, x0\n");                                  // arg1 = length
+        fprintf(f, "    ldr x0, [x29, #%d]\n", stage_off_arm(ctx, 1));   // arg0 = data ptr
+        fprintf(f, "    bl %steko_simd_sum_i32\n", pre);                 // x0 = sum
+    } else {
+        fprintf(f, "    movq %%rax, %d(%%rbp)\n", stage_off_x86(ctx, 0));         // save handle
+        fprintf(f, "    movq %%rax, %%rdi\n");
+        fprintf(f, "    call %steko_rt_iarray_data%s\n", pre, is_macho(ctx) ? "" : "@PLT"); // rax = data ptr
+        fprintf(f, "    movq %%rax, %d(%%rbp)\n", stage_off_x86(ctx, 1));         // save data ptr
+        fprintf(f, "    movq %d(%%rbp), %%rdi\n", stage_off_x86(ctx, 0));         // reload handle
+        fprintf(f, "    call %steko_rt_iarray_len%s\n", pre, is_macho(ctx) ? "" : "@PLT");  // rax = length
+        fprintf(f, "    movq %%rax, %%rsi\n");                                    // arg1 = length
+        fprintf(f, "    movq %d(%%rbp), %%rdi\n", stage_off_x86(ctx, 1));         // arg0 = data ptr
+        fprintf(f, "    call %steko_simd_sum_i32%s\n", pre, is_macho(ctx) ? "" : "@PLT");   // rax = sum
+    }
+}
+
+// Phase 18 (18.E.4): emit the REAL per-ISA vector reduction kernel `teko_simd_sum_i32(ptr, n) -> sum`
+// ONCE per module (gated on wasm_emit_simd). 4-wide vector accumulate -> collapse 4 partials ->
+// scalar tail (N not a multiple of 4). x86_64 = SSE2 (movdqu/paddd); arm64 = NEON (ld1/add v.4s/addv);
+// EVERY OTHER hosted arch (riscv64, …) = an HONEST SCALAR loop under the same symbol (RVV is documented
+// future work). All three are LEAF functions (no calls; the x86 path balances its own subq/addq $16),
+// so no frame is needed. The kernel is correctness-checked by the in-program scalar self-check + CI on
+// both ISAs (the x86 SSE2 path is validated on CI Linux x86_64, the arm64 NEON path on macOS arm64).
+static int hosted_is_x86_64(const MetalContext* ctx) {
+    return ctx->target.arch == ARCH_X86_64;
+}
+static void emit_simd_kernel(MetalContext* ctx) {
+    FILE* f = ctx->file;
+    const char* pre = sym_prefix(ctx);
+    int arm = is_arm64(ctx);
+    int x86 = hosted_is_x86_64(ctx);
+    fprintf(f, "\n    .p2align %d\n", arm ? 2 : 4);
+    fprintf(f, "    .globl %steko_simd_sum_i32\n", pre);
+    fprintf(f, "%steko_simd_sum_i32:\n", pre);
+    if (x86) {
+        // SSE2 (AT&T): rdi=ptr, rsi=n -> rax. 4-wide paddd accumulate, collapse via stack, scalar tail.
+        fprintf(f, "    pxor    %%xmm0, %%xmm0\n");
+        fprintf(f, "    xorq    %%rax, %%rax\n");
+        fprintf(f, "    xorq    %%r8, %%r8\n");
+        fprintf(f, "    movq    %%rsi, %%r9\n");
+        fprintf(f, "    andq    $-4, %%r9\n");
+        fprintf(f, ".Lsimdv_0:\n");
+        fprintf(f, "    cmpq    %%r9, %%r8\n");
+        fprintf(f, "    jge     .Lsimdve_0\n");
+        fprintf(f, "    movdqu  (%%rdi,%%r8,4), %%xmm1\n");
+        fprintf(f, "    paddd   %%xmm1, %%xmm0\n");
+        fprintf(f, "    addq    $4, %%r8\n");
+        fprintf(f, "    jmp     .Lsimdv_0\n");
+        fprintf(f, ".Lsimdve_0:\n");
+        fprintf(f, "    subq    $16, %%rsp\n");
+        fprintf(f, "    movdqu  %%xmm0, (%%rsp)\n");
+        fprintf(f, "    movl    (%%rsp), %%eax\n");
+        fprintf(f, "    addl    4(%%rsp), %%eax\n");
+        fprintf(f, "    addl    8(%%rsp), %%eax\n");
+        fprintf(f, "    addl    12(%%rsp), %%eax\n");
+        fprintf(f, "    addq    $16, %%rsp\n");
+        fprintf(f, ".Lsimdt_0:\n");
+        fprintf(f, "    cmpq    %%rsi, %%r8\n");
+        fprintf(f, "    jge     .Lsimdte_0\n");
+        fprintf(f, "    addl    (%%rdi,%%r8,4), %%eax\n");
+        fprintf(f, "    addq    $1, %%r8\n");
+        fprintf(f, "    jmp     .Lsimdt_0\n");
+        fprintf(f, ".Lsimdte_0:\n");
+        fprintf(f, "    ret\n");
+    } else if (arm) {
+        // NEON (GAS): x0=ptr, x1=n -> w0. 4-wide add v.4s accumulate, addv collapse, scalar tail.
+        fprintf(f, "    movi    v0.4s, #0\n");
+        fprintf(f, "    mov     x2, #0\n");
+        fprintf(f, "    and     x3, x1, #-4\n");
+        fprintf(f, ".Lsimdv_0:\n");
+        fprintf(f, "    cmp     x2, x3\n");
+        fprintf(f, "    b.ge    .Lsimdve_0\n");
+        fprintf(f, "    add     x4, x0, x2, lsl #2\n");
+        fprintf(f, "    ld1     {v1.4s}, [x4]\n");
+        fprintf(f, "    add     v0.4s, v0.4s, v1.4s\n");
+        fprintf(f, "    add     x2, x2, #4\n");
+        fprintf(f, "    b       .Lsimdv_0\n");
+        fprintf(f, ".Lsimdve_0:\n");
+        fprintf(f, "    addv    s0, v0.4s\n");
+        fprintf(f, "    fmov    w5, s0\n");
+        fprintf(f, ".Lsimdt_0:\n");
+        fprintf(f, "    cmp     x2, x1\n");
+        fprintf(f, "    b.ge    .Lsimdte_0\n");
+        fprintf(f, "    add     x4, x0, x2, lsl #2\n");
+        fprintf(f, "    ldr     w6, [x4]\n");
+        fprintf(f, "    add     w5, w5, w6\n");
+        fprintf(f, "    add     x2, x2, #1\n");
+        fprintf(f, "    b       .Lsimdt_0\n");
+        fprintf(f, ".Lsimdte_0:\n");
+        fprintf(f, "    mov     w0, w5\n");
+        fprintf(f, "    ret\n");
+    } else {
+        // HONEST SCALAR fallback (riscv64, any non-x86/arm64 hosted arch): plain summing loop under the
+        // SAME symbol. RVV is documented future work — this keeps the surface correct everywhere. The
+        // riscv64 ABI (a0=ptr, a1=n -> a0) is the System V LP64 convention emit_native_hosted targets.
+        // t0=ptr (preserved), t1=i, t2=&cell/cell; the result accumulates in a0.
+        fprintf(f, "    mv      t0, a0\n");        // t0 = ptr
+        fprintf(f, "    li      a0, 0\n");         // sum = 0
+        fprintf(f, "    li      t1, 0\n");         // i = 0
+        fprintf(f, ".Lsimds_0:\n");
+        fprintf(f, "    bge     t1, a1, .Lsimdse_0\n");
+        fprintf(f, "    slli    t2, t1, 2\n");     // t2 = i*4
+        fprintf(f, "    add     t2, t0, t2\n");    // t2 = &cell[i]
+        fprintf(f, "    lw      t2, 0(t2)\n");     // t2 = cell[i]
+        fprintf(f, "    addw    a0, a0, t2\n");    // sum += cell[i] (32-bit add)
+        fprintf(f, "    addi    t1, t1, 1\n");
+        fprintf(f, "    j       .Lsimds_0\n");
+        fprintf(f, ".Lsimdse_0:\n");
+        fprintf(f, "    ret\n");
+    }
+}
+
 // Phase 17.F.3: inline 256-byte copy between two decimal STACK slots (a decimal is a 256-byte
 // VALUE TYPE — copy on store/assign). Uses ONLY scratch registers (x86 r8/r9/r10/r11; arm64
 // x9/x10/x11/x12) so it never clobbers $w0/$w1 (rax/rbx, x0/x19) — the integer accumulator and the
@@ -528,6 +691,10 @@ void emit_native_hosted(MetalContext* ctx, OpCode op, int32_t arg) {
             if (ctx->wasm_open != 0) { emit_frame_leave(ctx); ctx->wasm_open = 0; }
             // Phase 14: emit the routine function-pointer table the scheduler walks.
             if (ctx->wasm_emit_spawn) emit_routine_table(ctx);
+            // Phase 18 (18.E.4): emit the REAL per-ISA vector reduction kernel ONCE per module (a leaf
+            // text-section function after $main + the routine bodies), gated on wasm_emit_simd so
+            // simd-free output stays byte-identical.
+            if (ctx->wasm_emit_simd) emit_simd_kernel(ctx);
             break;
 
         // Phase 14 (14.A): fire the routine whose table slot is in $w0 as a background task.
@@ -789,6 +956,39 @@ void emit_native_hosted(MetalContext* ctx, OpCode op, int32_t arg) {
             if (sym) emit_call(ctx, sym, arity);
             break;
         }
+
+        // Phase 18 (18.E.1): fixed-size array ops -> teko_rt_array_* runtime calls (the `array`
+        // store; staging slots + $w0 marshalled by emit_call, like OP_OBJ_*). get/set are CHECKED
+        // FAIL-LOUD: the wrapper aborts (exit 70 + stderr) on an out-of-range index.
+        case OP_ARR_NEW:
+        case OP_ARR_GET:
+        case OP_ARR_SET:
+        case OP_ARR_LEN: {
+            int arity = 1;
+            const char* sym = teko_native_array_symbol(op, &arity);
+            if (sym) emit_call(ctx, sym, arity);
+            break;
+        }
+
+        // Phase 18 (18.E.2): typed `i32[]` packed-array ops -> teko_rt_iarray_* runtime calls (same
+        // staging/ABI as OP_ARR_*; PACKED int32 cells). get/set are CHECKED FAIL-LOUD: the wrapper
+        // aborts (exit 70 + stderr "iarray: index out of bounds") on an out-of-range index.
+        case OP_IARR_NEW:
+        case OP_IARR_GET:
+        case OP_IARR_SET:
+        case OP_IARR_LEN: {
+            int arity = 1;
+            const char* sym = teko_native_iarray_symbol(op, &arity);
+            if (sym) emit_call(ctx, sym, arity);
+            break;
+        }
+
+        // Phase 18 (18.E.4): the REAL SIMD reduction. The run HANDLE is in $w0; fetch its data ptr +
+        // length, then call the per-ISA vector kernel teko_simd_sum_i32 (emitted once at module close).
+        // The scalar sum lands in $w0. The kernel is the REAL SSE2/NEON vector loop (scalar elsewhere).
+        case OP_SIMD_SUM:
+            emit_simd_sum_lowering(ctx);
+            break;
 
         // Phase 15 (15.B): static-vtable ops -> teko_rt_vtable_* runtime calls (abstract/trait
         // dynamic dispatch — VTABLE_GET feeds the resolved slot to a following OP_CALL_FUNC).

@@ -263,12 +263,134 @@ EXP
 # Fail-loud: decimal.parse("abc") aborts non-zero (exit 70 + stderr) — no silent zero. WASM traps on
 # the same value (run-decimal-surface.mjs), so the behavior is identical on both targets.
 check_fail decimal_fail.tks "before" "decimal.parse: invalid decimal"
+# Phase 18 (18.E.1): the FIXED-size CONTIGUOUS `array` substrate — literal build, index read/write,
+# and `.len` (O(1) metadata). Byte-identical to the WASM proof (run-arrays.mjs). The array store is
+# the SAME teko_array.c source of truth (linked here, compiled into the wasm32 reactor there).
+check arrays.tks "$(cat <<'EXP'
+a[1] = 20
+a[0] = 99
+len = 3
+EXP
+)"
+# Fail-loud: an out-of-range index aborts non-zero (exit 70 + stderr) — no silent zero / corruption.
+# WASM traps on the same access (run-arrays-fail.mjs), identical behavior on both targets.
+check_fail arrays_fail.tks "before" "array: index out of bounds"
+# Phase 18 (18.E.2): `for NAME in ARR { }` iteration over an i64 array (control-flow foundation).
+# Byte-identical to the WASM proof (run-foreach.mjs).
+check foreach.tks "sum = 60"
+# Phase 18 (18.E.2): the TYPED `i32[]` PACKED numeric array (the SIMD substrate) — `: i32[]` literal,
+# index read/write, `.len`, and `for x in a`. Byte-identical to the WASM proof (run-iarray.mjs). The
+# packed-i32 store is the SAME teko_iarray.c source of truth (linked here, in the wasm32 reactor there).
+check iarray.tks "$(cat <<'EXP'
+a[2] = 6
+len = 3
+sum = 15
+a[0] = 40
+EXP
+)"
+# Fail-loud: an out-of-range index on a typed `i32[]` aborts non-zero (exit 70 + stderr). WASM traps on
+# the same access (run-iarray-fail.mjs), identical behavior on both targets.
+check_fail iarray_fail.tks "before" "iarray: index out of bounds"
+# Phase 18 (18.E.3): SoA (structure-of-arrays) layout — `soa Point[N]` = k CONTIGUOUS typed-i32 field
+# runs; `s[i].field` r/w, `s.len`, and the whole-run accessor `s.field` (the i32[] SIMD hook, usable as
+# a typed array). FRONTEND-only over the iarray runtime (NO new opcode/runtime) — byte-identical to the
+# WASM proof (run-soa.mjs).
+check soa.tks "$(cat <<'EXP'
+s[1].x = 20
+s[2].y = 3
+len = 3
+sum_x = 60
+col.len = 3
+col[1] = 20
+EXP
+)"
+# Phase 18 (18.E.3): AoS (array-of-objects) layout, the contrast to SoA — `[Point(), …]` is an `array`
+# of object handles, `a[i].field` is index-then-member (ARR_GET then OBJ_GET; fields interleaved per
+# object). Same logical result as SoA (sum of x = 60), AoS layout. Byte-identical to the WASM proof
+# (run-aos.mjs).
+check aos.tks "$(cat <<'EXP'
+a[1].x = 20
+a[2].y = 3
+len = 3
+sum_x = 60
+EXP
+)"
+# Phase 18 (18.E.4): REAL per-ISA SIMD reduction — `simd.sum(run)` over a contiguous typed i32[] run,
+# the vector loop emitted as REAL backend instructions (this machine is arm64 → the NEON kernel;
+# CI Linux x86_64 → SSE2). The proof self-checks: the vectorized sum MUST equal an in-program scalar
+# reference loop (a mis-emitted vector kernel diverges and fails HERE). N=10 (8+2) and the SoA field
+# run N=6 (4+2) both exercise the scalar TAIL. Byte-identical stdout to the WASM proof (run-simd.mjs).
+check simd.tks "$(cat <<'EXP'
+simd = 55
+scalar = 55
+soa_simd = 210
+soa_scalar = 210
+EXP
+)"
+# Phase 18 (18.A): Zero-Overhead Optionals — `?T` nullability + `null` + the Elvis `??`. An optional
+# local is compacted (payload slot + a hidden 1-word present companion); `a ?? d` branches on the
+# present flag via OP_IF (→ native je/cbz), choosing the payload when present else the default. No new
+# IL/runtime (reuses OP_IF + load/store-local). Byte-identical to the WASM proof (run-optionals.mjs).
+check optionals.tks "$(cat <<'EXP'
+b = 7
+d = 5
+e = 5
+EXP
+)"
+# Phase 18 (18.B): SAFE NAVIGATION `?.` over optional objects — `obj?.field`/`obj?.method()` guarded
+# by OP_IF on the 18.A present flag: present → the member access runs; null → it is SKIPPED (no deref
+# of a null handle) and the empty-optional result lets a trailing `?? d` default. The optional's class
+# comes from the `?Box` annotation (so a null receiver still resolves the member statically). No new
+# IL/runtime. Byte-identical to the WASM proof (run-safenav.mjs).
+check safenav.tks "$(cat <<'EXP'
+a = 21
+b = 42
+c = -1
+d = -1
+EXP
+)"
+# Phase 18 (18.C): `defer <stmt>;` — scope-closing registration, run in LIFO (reverse) order at $main
+# close. The frontend captures each deferred statement's source and re-lexes + lowers it just before
+# OP_HALT; deferred statements may reference locals (still live) incl. auto-to_string concat. No new
+# IL/runtime (the statements lower to ordinary IL, relocated to scope end). Byte-identical to WASM
+# (run-defer.mjs): immediate start/middle/end, then LIFO "last registered" then "deferred n = 42".
+check defer.tks "$(cat <<'EXP'
+start
+middle
+end
+last registered
+deferred n = 42
+EXP
+)"
+# Phase 18 (18.D): `comptime` — compile-time evaluation. `comptime let NAME = <const-expr>;` is folded
+# by the frontend's constant evaluator (int literals, other comptime constants, parens, + - * / %); no
+# IL arithmetic is emitted for the expression, so the runtime carries only the folded constant (a read
+# of NAME is a single iconst). Comptime constants compose (B references A). No new IL/runtime. Byte-
+# identical to the WASM proof (run-comptime.mjs).
+check comptime.tks "$(cat <<'EXP'
+A = 42
+B = 50
+C = 10
+D = 2
+EXP
+)"
 # Phase 15 (15.A): concrete class — fields + methods + STATIC dispatch, zero runtime reflection.
 # `Point()` -> OP_OBJ_NEW; `p.x = 3` -> OP_OBJ_SET; `p.sum()`/`p.scale(10)` -> OP_CALL_FUNC
 # (the method routine reads `self.x`/`self.y` via OP_OBJ_GET). Prints 7 (3+4) then 70 ((3+4)*10).
 check class.tks "$(cat <<'EXP'
 7
 70
+EXP
+)"
+# Phase 15 (15.A) regression: a class METHOD CALL used directly as an EXPRESSION ARGUMENT
+# (`emit_int(p.raw())`) and as an arithmetic operand (`p.raw() + 100`), plus a method returning a
+# bare `self.<field>`. Before the fix the call was dropped in argument/sub-expression position (the
+# evaluator emitted iconst 0); now each `obj.method(args)` head lowers to OP_CALL_FUNC. 42,42,47,142.
+check method_arg.tks "$(cat <<'EXP'
+42
+42
+47
+142
 EXP
 )"
 # Phase 15 (15.B): abstract/trait dynamic dispatch via a compile-time STATIC VTABLE. A Shape-typed
@@ -280,6 +402,17 @@ check traits.tks "$(cat <<'EXP'
 112
 9
 209
+EXP
+)"
+# Phase 15 (15.B) regression: a DYNAMIC trait dispatch `g.method(...)` used directly as an EXPRESSION
+# ARGUMENT (`emit_int(g.area())`) and as an arithmetic operand (`g.area() + 100`). Before the fix the
+# fat trait-typed `g.method()` head was unhandled in argument/sub-expression position (only static
+# `obj.method()` was), so the call was dropped (iconst 0); now it lowers to vtable_get + OP_CALL_FUNC.
+# 12 (Circle.area), 112 (Circle.area+100), 25 (Square.area after reassignment).
+check trait_arg.tks "$(cat <<'EXP'
+12
+112
+25
 EXP
 )"
 # Phase 15 (15.C): generics via real per-type MONOMORPHIZATION. Factory<T> is specialized per

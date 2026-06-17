@@ -151,6 +151,10 @@ static int compile_native_source(const char* input_path, const char* out_path,
     // emitted assembly byte-identical to before 17.F.3.
     teko_metal_set_decimals(ctx, buffer->decimals, buffer->decimal_count);
     teko_metal_set_emit_decimal(ctx, buffer->uses_decimal);
+    // Phase 18 (18.E.4): emit the REAL per-ISA SIMD reduction kernel (teko_simd_sum_i32) once when
+    // the program uses simd.sum. Native gates the KERNEL emission on this (the OP_SIMD_SUM lowering
+    // itself routes unconditionally, like OP_IARR_*); simd-free programs leave it 0 → byte-identical.
+    teko_metal_set_emit_simd(ctx, buffer->uses_simd);
 
     teko_metal_emit_program(ctx, buffer->code, (uint32_t)buffer->size);
     teko_metal_close(ctx);

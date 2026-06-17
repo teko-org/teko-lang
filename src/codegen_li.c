@@ -35,6 +35,9 @@ BytecodeBuffer* codegen_li_create_context(void) {
     buffer->uses_await = 0;
     buffer->uses_retry = 0;
     buffer->uses_object = 0;
+    buffer->uses_array = 0;
+    buffer->uses_iarray = 0;
+    buffer->uses_simd = 0;
     buffer->uses_vtable = 0;
 
     // Phase 17 (17.A): the float-constant pool starts empty; uses_float gates the WASM float locals.
@@ -320,6 +323,25 @@ void codegen_li_emit_retry(BytecodeBuffer* buffer, OpCode op) {
 void codegen_li_emit_object(BytecodeBuffer* buffer, OpCode op) {
     if (!buffer) return;
     buffer->uses_object = 1; // backends link/import the teko_object instance-store runtime
+    emit_byte(buffer, (unsigned char)op);
+}
+
+void codegen_li_emit_array(BytecodeBuffer* buffer, OpCode op) {
+    if (!buffer) return;
+    buffer->uses_array = 1; // backends link/import the teko_array fixed-size-array runtime
+    emit_byte(buffer, (unsigned char)op);
+}
+
+void codegen_li_emit_iarray(BytecodeBuffer* buffer, OpCode op) {
+    if (!buffer) return;
+    buffer->uses_iarray = 1; // backends link/import the teko_iarray packed-i32-array runtime
+    emit_byte(buffer, (unsigned char)op);
+}
+
+void codegen_li_emit_simd(BytecodeBuffer* buffer, OpCode op) {
+    if (!buffer) return;
+    buffer->uses_simd = 1;   // backend emits the per-ISA vector kernel (teko_simd_sum_i32) once
+    buffer->uses_iarray = 1; // the run is a typed i32[]: the data/len/scalar wrappers come from there
     emit_byte(buffer, (unsigned char)op);
 }
 

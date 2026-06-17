@@ -63,6 +63,12 @@ int codegen_li_emit_wasm(const BytecodeBuffer* buffer, const char* wat_path,
     teko_metal_set_emit_object(ctx, buffer->uses_object);
     // Phase 15 (15.B): import the static-vtable dispatch entry points from the reactor + share memory.
     teko_metal_set_emit_vtable(ctx, buffer->uses_vtable);
+    // Phase 18 (18.E.1): import the fixed-size array entry points from the reactor + share memory.
+    teko_metal_set_emit_array(ctx, buffer->uses_array);
+    // Phase 18 (18.E.2): import the typed `i32[]` packed-array entry points from the reactor + share memory.
+    teko_metal_set_emit_iarray(ctx, buffer->uses_iarray);
+    // Phase 18 (18.E.4): emit the REAL simd128 vector kernel (teko_simd_sum_i32) + import iarray_data.
+    teko_metal_set_emit_simd(ctx, buffer->uses_simd);
     // Phase 17 (17.A): hand the WASM emitter the float-constant pool + uses_float flag (the latter
     // gates the `(local $f0/$f1/$fvN f64)` declarations — float-free modules stay byte-identical).
     teko_metal_set_floats(ctx, buffer->floats, buffer->float_count);
