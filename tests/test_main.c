@@ -260,6 +260,15 @@ extern void test_teko_rsa_pkcs1v15_encrypt_roundtrip(void);
 extern void test_teko_rsa_oaep_sha256_kat(void);
 extern void test_teko_rsa_pss_sha256_kat(void);
 
+// Phase 19 (T1b, Wave 0) — server socket KATs (NATIVE-ONLY; compiled only when !defined(__wasm__)).
+#if !defined(__wasm__)
+extern void test_teko_server_alloc_free(void);
+extern void test_teko_server_badarg(void);
+extern void test_teko_server_accept_again_when_idle(void);
+extern void test_teko_server_cap_enforcement(void);
+extern void test_teko_server_loopback_roundtrip(void);
+#endif
+
 int main(void) {
     // Unbuffered output: stream every line live so a crash on a CI runner shows
     // exactly how far the suite got (Windows pipes are otherwise fully buffered).
@@ -528,6 +537,15 @@ int main(void) {
     RUN_TEST(test_teko_rsa_pkcs1v15_encrypt_roundtrip);
     RUN_TEST(test_teko_rsa_oaep_sha256_kat);
     RUN_TEST(test_teko_rsa_pss_sha256_kat);
+
+    // Phase 19 (T1b, Wave 0) — server socket KATs (NATIVE-ONLY).
+#if !defined(__wasm__)
+    RUN_TEST(test_teko_server_alloc_free);
+    RUN_TEST(test_teko_server_badarg);
+    RUN_TEST(test_teko_server_accept_again_when_idle);
+    RUN_TEST(test_teko_server_cap_enforcement);
+    RUN_TEST(test_teko_server_loopback_roundtrip);
+#endif
 
     return UNITY_END();
 }
