@@ -29,6 +29,7 @@
 #include "teko_convert.h"
 #include "teko_decimal.h"
 #include "teko_socket.h"
+#include "teko_http.h"         // Phase 19 (HTTP-INT): HTTP/1.1 codec (pure; used by teko_rt_http_*)
 // Phase 19 (T1b) — server socket runtime (NATIVE-ONLY; guarded in the header).
 #include "teko_socket_server.h"
 #include <stdint.h>
@@ -1095,6 +1096,221 @@ long teko_rt_socket_recv_str(long handle, long max_len) {
 long teko_rt_socket_free_h(long handle) {
     teko_socket_free((TekoSocket*)(intptr_t)handle);
     return 0;
+}
+
+// Phase 19 (HTTP-INT — http.* client surface): OP_CALL_RUNTIME ids 80-81.
+// Synchronous HTTP/1.1 client: parse url -> connect -> build + send request -> recv all ->
+// parse response -> return body as char* (heap; leaks like other runtime strings).
+//
+// URL format: http://host[:port]/path  (only http:// scheme; no TLS — tls.* is FFI).
+//   host: bounded scan of up to TEKO_HTTP_MAX_HOST chars (reject others → 0)
+//   port: decimal parser (no strtol; rejects non-digit, overflow)
+//   path: remainder after host[:port]; defaults to "/" if absent
+//
+// SAST notes:
+//   - url is a teko string constant (no shell exec, no format-string path).
+//   - host/port/path are extracted by bounded scanners; no buffer can overflow the fixed
+//     local arrays (declared at exact TEKO_HTTP_MAX_HOST+1 / TEKO_HTTP_MAX_PATH+1).
+//   - The recv loop accumulates into a heap buffer grown with realloc; the total cap is
+//     TEKO_HTTP_RESP_MAX (1 MiB) checked before each realloc to prevent allocation bombs.
+//     Integer arithmetic for sizing uses overflow-safe patterns (sz + chunk <= cap).
+//   - teko_http_parse_response already guards against duplicate Content-Length (smuggling),
+//     obs-fold, body > 64 MiB, and chunked-decode overflow.
+//   - Response body pointer points into the parse buffer; both are returned together (body_copy)
+//     so the caller gets a NUL-terminated, independently-owned string.
+//   - No path traversal: path is passed as an opaque HTTP request-line string (not used as
+//     a filesystem path anywhere).
+
+// Maximum host length (bytes; excluding NUL).
+#define TEKO_HTTP_MAX_HOST 253
+
+// Maximum incoming HTTP response buffer (1 MiB; decompression-bomb / allocation-bomb guard).
+#define TEKO_HTTP_RESP_MAX (1u * 1024u * 1024u)
+
+// Recv one HTTP response from a connected socket into a heap buffer.
+// Reads until the socket closes or TEKO_HTTP_RESP_MAX bytes are consumed.
+// Returns a NUL-terminated heap buffer on success (caller frees), NULL on error.
+// SAST: total cap enforced before each realloc; recv chunk size is TEKO_SOCKET_MAX_BUF.
+static char* http_recv_response(TekoSocket* s, size_t* out_len) {
+    if (!s || !out_len) return NULL;
+    const uint32_t chunk = 4096u;
+    size_t cap = 8192u, pos = 0u;
+    char* buf = (char*)malloc(cap);
+    if (!buf) return NULL;
+
+    for (;;) {
+        // Ensure there is room for at least `chunk` more bytes.
+        if (pos + chunk + 1u > cap) {
+            if (cap >= TEKO_HTTP_RESP_MAX) break; // cap exceeded
+            size_t newcap = cap * 2u;
+            if (newcap > TEKO_HTTP_RESP_MAX) newcap = TEKO_HTTP_RESP_MAX;
+            if (newcap < pos + chunk + 1u) { free(buf); return NULL; } // overflow
+            char* nb = (char*)malloc(newcap);
+            if (!nb) break;
+            memcpy(nb, buf, pos);
+            free(buf);
+            buf = nb;
+            cap = newcap;
+        }
+        // Wait up to 5 s for more data.
+        int rdy = teko_socket_wait_readable(s, 5000);
+        if (rdy <= 0) break; // timeout or error — stop reading
+        uint32_t got = 0u;
+        TekoSocketStatus st = teko_socket_recv(s, buf + pos, chunk, &got);
+        if (st == TEKO_SOCK_OK && got > 0u) {
+            pos += got;
+        } else {
+            break; // closed or error
+        }
+    }
+    if (pos == 0u) { free(buf); return NULL; }
+    buf[pos] = '\0';
+    *out_len = pos;
+    return buf;
+}
+
+// Parse a URL of the form "http://host[:port]/path" (scheme must be "http://").
+// Returns 1 on success, 0 on error.
+// host_out: filled with NUL-terminated host (max TEKO_HTTP_MAX_HOST chars).
+// port_out: filled with port (defaults to 80 if absent).
+// path_out: filled with NUL-terminated path (defaults to "/").
+// path_out_size: size of the path_out buffer in bytes.
+// SAST: scanners are bounded; no buffer can exceed the declared sizes.
+static int parse_http_url(const char* url,
+                           char* host_out, size_t host_out_size,
+                           uint16_t* port_out,
+                           char* path_out, size_t path_out_size)
+{
+    if (!url || !host_out || !port_out || !path_out) return 0;
+    // Must start with "http://".
+    const char prefix[] = "http://";
+    size_t plen = sizeof(prefix) - 1u;
+    for (size_t i = 0u; i < plen; i++) {
+        if (url[i] == '\0' || url[i] != prefix[i]) return 0;
+    }
+    const char* p = url + plen;
+
+    // Extract host (up to ':' or '/' or NUL).
+    size_t hi = 0u;
+    while (*p && *p != ':' && *p != '/') {
+        if (hi >= host_out_size - 1u) return 0; // host too long
+        host_out[hi++] = *p++;
+    }
+    if (hi == 0u) return 0; // empty host
+    host_out[hi] = '\0';
+
+    // Optional port.
+    *port_out = 80u;
+    if (*p == ':') {
+        p++;
+        uint32_t port_val = 0u;
+        int digits = 0;
+        while (*p >= '0' && *p <= '9') {
+            port_val = port_val * 10u + (uint32_t)(*p - '0');
+            if (port_val > 65535u) return 0; // port overflow
+            p++;
+            digits++;
+            if (digits > 5) return 0;
+        }
+        if (digits == 0) return 0; // bare colon with no digits
+        *port_out = (uint16_t)port_val;
+    }
+
+    // Path (remainder; default to "/").
+    if (*p == '\0' || (*p == '/' && *(p + 1u) == '\0')) {
+        if (path_out_size < 2u) return 0;
+        path_out[0] = '/'; path_out[1] = '\0';
+    } else {
+        if (*p == '/') {
+            // Copy path verbatim (bounded by path_out_size - 1).
+            size_t qi = 0u;
+            while (*p && qi < path_out_size - 1u) { path_out[qi++] = *p++; }
+            path_out[qi] = '\0';
+        } else {
+            if (path_out_size < 2u) return 0;
+            path_out[0] = '/'; path_out[1] = '\0';
+        }
+    }
+    return 1;
+}
+
+// Common logic for http.get and http.post: connect, send, recv, parse, return body copy.
+// method: "GET" or "POST". body/body_len: 0 for GET.
+// Returns heap char* (caller-owned) or 0 on any error.
+// SAST: all allocations via malloc/calloc with explicit size checks; recv capped at
+// TEKO_HTTP_RESP_MAX; parse_response guarded by teko_http.c KAT-hardened parser.
+static long do_http_request(const char* url, const char* method,
+                             const char* body, size_t body_len)
+{
+    if (!url || !method) return 0;
+
+    char host[TEKO_HTTP_MAX_HOST + 1u];
+    char path[TEKO_HTTP_MAX_PATH + 1u];
+    uint16_t port = 80u;
+
+    if (!parse_http_url(url, host, sizeof(host), &port, path, sizeof(path))) return 0;
+
+    TekoSocket* s = teko_socket_tcp_connect(host, port);
+    if (!s) return 0;
+
+    // Build the request.
+    // Host header: bounded — host is at most TEKO_HTTP_MAX_HOST chars (already validated).
+    TekoHttpHeader hdrs[2];
+    size_t hcount = 0u;
+    hdrs[hcount].name  = "Host";
+    hdrs[hcount].value = host;
+    hcount++;
+    if (body && body_len > 0u) {
+        hdrs[hcount].name  = "Content-Type";
+        hdrs[hcount].value = "application/octet-stream";
+        hcount++;
+    }
+
+    char* req_buf = NULL;
+    size_t req_len = 0u;
+    int rc = teko_http_build_request(method, path, hdrs, hcount, body, body_len,
+                                     &req_buf, &req_len);
+    if (rc != TEKO_HTTP_OK) { teko_socket_free(s); return 0; }
+
+    // Send the request.
+    // req_len is bounded by TEKO_HTTP_BODY_MAX + fixed header framing.
+    // uint32_t is sufficient since TEKO_HTTP_BODY_MAX = 64 MiB < UINT32_MAX.
+    if (req_len > (uint32_t)-1u) { free(req_buf); teko_socket_free(s); return 0; }
+    TekoSocketStatus sst = teko_socket_send(s, req_buf, (uint32_t)req_len);
+    free(req_buf);
+    if (sst != TEKO_SOCK_OK) { teko_socket_free(s); return 0; }
+
+    // Receive all response bytes.
+    size_t resp_raw_len = 0u;
+    char* resp_raw = http_recv_response(s, &resp_raw_len);
+    teko_socket_free(s);
+    if (!resp_raw) return 0;
+
+    // Parse the response (teko_http_parse_response NUL-terminates tokens in-place).
+    TekoHttpResponse resp;
+    memset(&resp, 0, sizeof(resp));
+    rc = teko_http_parse_response(resp_raw, resp_raw_len, &resp);
+    if (rc != TEKO_HTTP_OK) { free(resp_raw); return 0; }
+
+    // Copy the body out as a standalone heap string.
+    size_t blen = resp.body ? resp.body_len : 0u;
+    char* body_copy = (char*)calloc(blen + 1u, 1u);
+    if (!body_copy) { free(resp_raw); return 0; }
+    if (blen > 0u && resp.body) memcpy(body_copy, resp.body, blen);
+    body_copy[blen] = '\0';
+    free(resp_raw);
+    return (long)(intptr_t)body_copy;
+}
+
+// id 80: http.get(url) -> char* body (0 on error)
+long teko_rt_http_get(const char* url) {
+    return do_http_request(url, "GET", NULL, 0u);
+}
+
+// id 81: http.post(url, body) -> char* body (0 on error)
+long teko_rt_http_post(const char* url, const char* body) {
+    size_t blen = body ? strlen(body) : 0u;
+    return do_http_request(url, "POST", body, blen);
 }
 
 // Phase 19 (T1b, Wave 0) — server socket surface wrappers.

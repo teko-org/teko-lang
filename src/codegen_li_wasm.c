@@ -73,6 +73,10 @@ int codegen_li_emit_wasm(const BytecodeBuffer* buffer, const char* wat_path,
     // uses any net.* surface op (ids 61-67). Native targets already link teko_rt_socket_* via
     // libteko_rt.a (socket-free programs stay byte-identical on all targets).
     teko_metal_set_emit_net(ctx, buffer->uses_net);
+    // Phase 19 (HTTP-INT — http.* client surface): declare env.teko_http_get / env.teko_http_post
+    // host-imports when the program uses any http.* surface op (ids 80-81). Native targets already
+    // link teko_rt_http_* via libteko_rt.a (HTTP-free programs stay byte-identical on all targets).
+    teko_metal_set_emit_http(ctx, buffer->uses_http);
     // Phase 17 (17.A): hand the WASM emitter the float-constant pool + uses_float flag (the latter
     // gates the `(local $f0/$f1/$fvN f64)` declarations — float-free modules stay byte-identical).
     teko_metal_set_floats(ctx, buffer->floats, buffer->float_count);

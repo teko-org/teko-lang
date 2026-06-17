@@ -1,0 +1,25 @@
+// Phase 19 (HTTP-INT — http.* client surface) native runner proof.
+// Performs an HTTP GET against a loopback HTTP echo server (started by the harness
+// in run-native.sh on port HTTP_PORT, e.g. 17343) and emits the response body.
+// The harness starts a minimal Python3 HTTP server that responds to any GET with
+// "hello-http", asserts the emitted output is "hello-http", then tears down the server.
+//
+// Lowers to OP_CALL_RUNTIME id 80 -> teko_rt_http_get (teko_rt.c), which calls:
+//   parse_http_url  -> host="127.0.0.1", port=HTTP_PORT, path="/"
+//   teko_socket_tcp_connect(host, port)
+//   teko_http_build_request("GET", "/", [Host: 127.0.0.1], ...)
+//   teko_socket_send  -> send the request
+//   http_recv_response -> recv all bytes until socket close
+//   teko_http_parse_response -> parse status/headers/body
+//   return body as a NUL-terminated heap string
+//
+// SAST: url is a compile-time string constant (no format-string, no path traversal);
+// host/port/path are bounded-parsed in parse_http_url; recv is capped at TEKO_HTTP_RESP_MAX.
+extern fn emit(s) from "teko_rt" as "teko_rt_emit";
+
+// PORT is replaced by the harness before compile (e.g. 17343).
+// During normal source reading, this compiles as a literal URL.
+let body = http.get("http://127.0.0.1:17343/");
+
+// Emit the response body (should be "hello-http").
+emit(body);

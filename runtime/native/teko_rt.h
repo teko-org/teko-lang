@@ -319,6 +319,27 @@ long teko_rt_socket_state(long handle);                                     // -
 // (mirrors teko_socket_recv's own pre-syscall guard). No format-string, no path traversal.
 long teko_rt_socket_recv_str(long handle, long max_len);   // id 64 -> char* (0 = no data)
 long teko_rt_socket_free_h(long handle);                   // id 66 -> 0
+// Phase 19 (HTTP-INT — http.* client surface): OP_CALL_RUNTIME ids 80-81.
+// Synchronous HTTP/1.1 client: parse url -> connect -> build request -> send -> recv ->
+// parse response -> return body as char* (0 on any error). The returned pointer is heap-
+// allocated; it leaks like other short-lived runtime strings (acceptable for a proof surface).
+//
+// SAST: URL is caller-supplied (teko string constant in the proof), treated as data only —
+// no format-string path; host extracted by a bounded scan, port from a decimal parser (no
+// strtol), path from the remainder. All buffer arithmetic uses overflow-safe sizing. The
+// recv buffer (TEKO_HTTP_RESP_MAX bytes) is allocated via calloc before the socket recv.
+// The response is parsed by teko_http_parse_response (already KAT-hardened for adversarial
+// input: duplicate Content-Length -> SMUGGLING, obs-fold -> OBS_FOLD, body cap 64 MiB,
+// chunked-decode hex overflow guards). Body pointer points into the parse buffer owned by
+// the wrapper; both freed together.
+// WASM surface: host-import env.teko_http_get / env.teko_http_post (the host performs the
+// real HTTP request and writes the NUL-terminated body into a fixed linear-memory offset).
+//
+// id 80: http.get(url)          -> char* body (0 on error)
+// id 81: http.post(url, body)   -> char* body (0 on error)
+long teko_rt_http_get(const char* url);             // id 80
+long teko_rt_http_post(const char* url, const char* body); // id 81
+
 // Phase 19 (T1b, Wave 0) — server socket surface wrappers (NATIVE-ONLY; no WASM reactor).
 // OP_CALL_RUNTIME id range 70-79 RESERVED for net-server; NO opcodes emitted this wave
 // (emission deferred to T2). These wrappers bridge the register-width ABI (long) to the

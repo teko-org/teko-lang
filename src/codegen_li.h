@@ -432,6 +432,11 @@ typedef struct {
     // so the Node/browser host provides the TCP/UDP primitives (WASM cannot open raw sockets).
     // Socket-free programs (incl. the 16 freestanding goldens) stay byte-identical.
     int uses_net;
+    // Phase 19 (HTTP-INT — http.* client surface): set to 1 when any http.get/post (ids 80-81)
+    // is emitted. Gates wasm_emit_http on the WASM backend (host-import teko_http_get/post);
+    // native programs always link libteko_rt.a which carries teko_rt_http_get/post.
+    // HTTP-free programs (incl. the 16 freestanding goldens) stay byte-identical.
+    int uses_http;
     // Phase 17 (17.A): the float-constant pool — f64 bit patterns indexed by OP_FCONST's 4-byte
     // arg. Mirrors the string pool (codegen_li_add_float_constant dedups by bit-equality). Threaded
     // to the backend via teko_metal_set_floats. `uses_float` is 1 once any float opcode is emitted,

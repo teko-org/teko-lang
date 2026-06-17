@@ -91,6 +91,12 @@ const char* teko_native_runtime_symbol(int32_t id, int* out_arity) {
         case 65: sym = "teko_rt_socket_close";       arity = 1; break; // (handle) -> status
         case 66: sym = "teko_rt_socket_free_h";      arity = 1; break; // (handle) -> 0
         case 67: sym = "teko_rt_socket_state";       arity = 1; break; // (handle) -> state
+        // Phase 19 (HTTP-INT — http.* client surface): ids 80-81 map to the teko_rt_http_*
+        // wrappers (register-width ABI; URL parsing + socket + codec composition in teko_rt.c).
+        // SAST: URL is a teko string constant (no shell exec, no format-string path); host/port/path
+        // are extracted by bounded scanners in parse_http_url; recv capped at TEKO_HTTP_RESP_MAX.
+        case 80: sym = "teko_rt_http_get";  arity = 1; break; // (url) -> char* body (0=err)
+        case 81: sym = "teko_rt_http_post"; arity = 2; break; // (url, body) -> char* body (0=err)
         case 6: sym = "teko_rt_md5_hex";       break; // legacy
         case 7: sym = "teko_rt_sha1_hex";      break; // legacy
         case 8: sym = "teko_rt_uuid_v3";       break;

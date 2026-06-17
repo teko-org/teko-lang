@@ -1791,6 +1791,13 @@ static int codec_id_for(const char* lex) {
     if (strcmp(lex, "net.close")       == 0) return 65; // (handle)            -> status
     if (strcmp(lex, "net.free")        == 0) return 66; // (handle)            -> 0
     if (strcmp(lex, "net.state")       == 0) return 67; // (handle)            -> state
+    // Phase 19 (HTTP-INT — http.* client surface): dotted-identifier surface. ids 80-81.
+    // WASM: env host-imports (teko_http_get/post); native: teko_rt_http_get/post wrappers
+    // (via libteko_rt.a) that compose the existing teko_http codec + teko_socket client.
+    // SAST: url/body are teko string constants (data-only; no format-string, no path traversal);
+    // URL parsing is bounded (host, port, path); recv capped at TEKO_HTTP_RESP_MAX in the wrapper.
+    if (strcmp(lex, "http.get")  == 0) return 80; // (url)        -> char* body (0=err)
+    if (strcmp(lex, "http.post") == 0) return 81; // (url, body)  -> char* body (0=err)
     return -1;
 }
 
@@ -1828,7 +1835,9 @@ static int runtime_arity(int id) {
         case 62: return 2; // net.udp_open(host, port)
         case 63: return 3; // net.send(handle, data, len)
         case 64: return 2; // net.recv(handle, max_len)
-        default: return 1; // net.close/free/state=1; all single-arg defaults
+        // Phase 19 (HTTP-INT — http.* surface): arity for ids 80-81.
+        case 81: return 2; // http.post(url, body)
+        default: return 1; // net.close/free/state=1; http.get(url)=1; all single-arg defaults
     }
 }
 
