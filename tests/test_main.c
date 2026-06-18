@@ -354,6 +354,19 @@ extern void test_teko_router_no_match_404(void);
 extern void test_teko_router_middleware_order(void);
 extern void test_teko_router_synthetic_e2e(void);
 extern void test_teko_router_badarg_hardening(void);
+/* Phase 19 (WS-SRV Wave 0): RFC 6455 frame codec + handshake */
+extern void test_teko_ws_handshake_accept_rfc6455(void);
+extern void test_teko_ws_frame_encode_text_hello(void);
+extern void test_teko_ws_frame_encode_close_empty(void);
+extern void test_teko_ws_frame_encode_payload_too_large(void);
+extern void test_teko_ws_frame_decode_masked_hello(void);
+extern void test_teko_ws_frame_decode_text_utf8_valid(void);
+extern void test_teko_ws_frame_decode_payload_too_large(void);
+extern void test_teko_ws_frame_decode_truncated_header(void);
+extern void test_teko_ws_frame_decode_truncated_payload(void);
+extern void test_teko_ws_frame_decode_invalid_utf8(void);
+extern void test_teko_ws_frame_decode_binary_no_utf8_validation(void);
+extern void test_teko_ws_frame_decode_fragmented_rejected(void);
 // Phase 19 (T1a) — client socket runtime KATs
 extern void test_teko_socket_null_args(void);
 extern void test_teko_socket_recv_bounds_constant(void);
@@ -734,6 +747,19 @@ int main(void) {
     RUN_TEST(test_teko_router_middleware_order);
     RUN_TEST(test_teko_router_synthetic_e2e);
     RUN_TEST(test_teko_router_badarg_hardening);
+    /* Phase 19 (WS-SRV Wave 0): RFC 6455 frame codec + handshake KATs */
+    RUN_TEST(test_teko_ws_handshake_accept_rfc6455);
+    RUN_TEST(test_teko_ws_frame_encode_text_hello);
+    RUN_TEST(test_teko_ws_frame_encode_close_empty);
+    RUN_TEST(test_teko_ws_frame_encode_payload_too_large);
+    RUN_TEST(test_teko_ws_frame_decode_masked_hello);
+    RUN_TEST(test_teko_ws_frame_decode_text_utf8_valid);
+    RUN_TEST(test_teko_ws_frame_decode_payload_too_large);
+    RUN_TEST(test_teko_ws_frame_decode_truncated_header);
+    RUN_TEST(test_teko_ws_frame_decode_truncated_payload);
+    RUN_TEST(test_teko_ws_frame_decode_invalid_utf8);
+    RUN_TEST(test_teko_ws_frame_decode_binary_no_utf8_validation);
+    RUN_TEST(test_teko_ws_frame_decode_fragmented_rejected);
     // Phase 19 (T1a) — client socket runtime KATs
     RUN_TEST(test_teko_socket_null_args);
     RUN_TEST(test_teko_socket_recv_bounds_constant);

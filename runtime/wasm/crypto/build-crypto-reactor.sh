@@ -62,7 +62,8 @@ SRCS=("$HERE/libc_shim.c" "$ROOT/runtime/native/teko_rt.c" "$ROOT/src/runtime/te
       "$ROOT/src/runtime/teko_decimal.c"  # Phase 17.F.1: exact base-10 decimal core (17.F.3 EXPORTS the teko_rt_decimal_* wrappers)
       "$ROOT/src/runtime/teko_deflate.c"  # Phase 19 (DEFLATE-CORE): portable DEFLATE/gzip/zlib codec (native backend + WASM reactor impl)
       "$ROOT/src/runtime/teko_http.c"     # Phase 19: HTTP/1.1 codec (pure byte-buffer, no sockets; client subset used by HTTP-INT Wave 1)
-      "$ROOT/src/runtime/teko_router.c")  # Phase 19 (ROUTER-CORE Wave 0): target-agnostic radix-tree router
+      "$ROOT/src/runtime/teko_router.c"   # Phase 19 (ROUTER-CORE Wave 0): target-agnostic radix-tree router
+      "$ROOT/src/runtime/teko_websocket.c") # Phase 19 (WS-SRV Wave 0): RFC 6455 frame codec + handshake
 for f in "$ROOT"/src/runtime/teko_crypto_*.c; do SRCS+=("$f"); done
 
 OBJS=()
@@ -156,7 +157,10 @@ EXPORTS=(teko_rt_sha512_hex teko_rt_sha384_hex teko_rt_sha3_256_hex teko_rt_sha3
          # same pattern as duplex/delayed/broadcast. The raw teko_router_* symbols are NOT
          # exported directly; the _rt_ wrappers collapse handles/ptrs to register-width i32.
          teko_rt_router_new teko_rt_router_add teko_rt_router_dispatch
-         teko_rt_router_free teko_rt_router_status)
+         teko_rt_router_free teko_rt_router_status
+         # Phase 19 (WS-SRV Wave 0): WebSocket frame codec + handshake accept (OP_CALL_RUNTIME ids 100-109).
+         teko_rt_ws_handshake_accept teko_rt_ws_frame_encode
+         teko_rt_ws_frame_decode teko_rt_ws_frame_free)
 LDEXPORTS=(); for e in "${EXPORTS[@]}"; do LDEXPORTS+=("--export=$e"); done
 
 # Layout: keep the whole reactor image (data + shadow stack + heap) ABOVE Teko's
