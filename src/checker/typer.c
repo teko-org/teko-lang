@@ -466,7 +466,19 @@ tk_tprogram_result tk_type_program(tk_program program) {
     tk_collected_result c = tk_collect(program);
     if (!c.ok) return (tk_tprogram_result){ .ok = false, .as.error = c.as.error };
     tk_titem_list items = tk_titem_list_empty();
+    // Thread the env across LOOSE top-level statements (the virtual-main): a `let a`
+    // must enter scope for the statements that follow it (mirrors type_block's env
+    // threading). Non-statement items (functions/types/uses) are typed against the
+    // collected env and do not advance it.
+    tk_env cur = c.as.value.env;
     for (size_t i = 0; i < program.len; i += 1) {
+        if (program.items[i].tag == TK_ITEM_STATEMENT) {
+            tk_typed_stmt_result ts = tk_type_statement(program.items[i].as.statement, cur, c.as.value.types);
+            if (!ts.ok) return (tk_tprogram_result){ .ok = false, .as.error = ts.as.error };
+            cur = ts.as.value.env;   // advance scope for subsequent statements
+            items = tk_titem_list_push(items, (tk_titem){ .tag = TK_TITEM_STATEMENT, .as.statement = ts.as.value.node });
+            continue;
+        }
         tk_titem_result ti = tk_type_item(program.items[i], c.as.value.env, c.as.value.types);
         if (!ti.ok) return (tk_tprogram_result){ .ok = false, .as.error = ti.as.error };
         items = tk_titem_list_push(items, ti.as.value);

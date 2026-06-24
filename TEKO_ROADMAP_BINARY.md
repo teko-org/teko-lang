@@ -89,13 +89,14 @@ ast.h/result.h como headers reais + `tk_expr`/helpers/corpos → B0d `tk_str_eq`
 
 | # | Entrega | Lei | Esf. |
 |---|---|---|---|
-| B2a | **Emissor C (esqueleto)** — `TProgram` → texto C (um writer `tkc_*`); baixar `Type`→tipo C (`u8..u64`/`i8..i64`→`stdint`, `bool`, `byte`, `str`→struct do runtime) | M.0 | M |
-| B2b | **Baixar expressões** — `TExpr`→C: literais, var, binário/unário/comparação (sign-check B.22 + overflow **panic-debug/wrap-release**), call, **cast (pânico de runtime na impossibilidade)**, field-access | M.0+M.1 | M |
-| B2c | **Baixar statements/blocos** — `TStatement`→C: binding, assign (`mut`), return, loop/break/continue, exprstmt, `if`, `match` (discriminação → `switch`/cadeia; exaustividade já checada) | M.0 | M |
-| B2d | **Baixar funções + programa** — `TFunction`→função C; o *virtual-main*→`main` C | M.0 | P |
-| B2e | **Chamar o `cc` do host** — o driver invoca o `cc` sobre o C emitido → binário nativo (M.5 — reusa a toolchain) | M.5 | P |
+| B2a ✓ | **Emissor C** — **feito**: `src/codegen/codegen_c.{c,h}` `tk_emit_c(tk_tprogram)`; `Type`→C (`u8..u64`/`i8..i64`→`stdint`, `bool`, byte→`uint8_t`, Unit→`void`). str/named/slice/variant → erro honesto "not yet supported" | M.0 | M |
+| B2b ✓ | **Baixar expressões** — **feito**: Number/Var/Binary/Unary/Compare/Cast/Call/FieldAccess. (sign-check + cast-pânico = refinamento F3; if/match-como-valor diferido) | M.0 | M |
+| B2c ✓ | **Baixar statements** — **feito**: Binding(simple)/Assign/Return/ExprStmt/Loop/Break/Continue. (if/match-stmt, destructure → diferidos) | M.0 | M |
+| B2d ✓ | **Funções + programa** — **feito**: `tk_tfunction`→função C (sem params, por ora); virtual-main→`main` C, **`return n`=exit n / default 0** (early exit, decisão do legislador) | M.0 | P |
+| B2e ✓ | **Chamar o `cc`** — **feito**: driver emite `<stem>.c` → `cc -std=c23 … -o <stem>` → binário nativo | M.5 | P |
 
-**Marco F2:** `tekoc main.tks` emite C; `cc` compila; `./a.out` existe.
+> **Marco F2 ✅ + correção:** `tk_type_program` agora fia o env entre statements top-level (espelha `type_block`) —
+> o virtual-main compartilha escopo (bug F1 descoberto na verificação do M0).
 
 ## Fase 3 — Runtime mínimo de execução (`libteko_rt` em C)
 
@@ -106,7 +107,13 @@ ast.h/result.h como headers reais + `tk_expr`/helpers/corpos → B0d `tk_str_eq`
 | B3c | **IO** — `print`/`println` mínimo (→ `write`/`fputs`); a superfície IO do prelúdio | M.1 | P |
 | B3d | **Entry + saída** — virtual-main → `main` C; exit codes; pânico → `abort`/trap com mensagem | M.1 | P |
 
-**Marco F3 = MARCO ZERO (M0):** `main.tks` (aritmética inteira + `print`) → `tekoc` → C → `cc` → `./a.out` imprime o resultado; um pânico sai **alto**.
+> **MARCO ZERO (M0) ✅ ALCANÇADO no F2** — via **exit-code** (não precisou de runtime): `main.tks` de aritmética
+> inteira → `tekoc` → C → `cc` → binário nativo que **roda** (`return n`=exit n, default 0). Verificado:
+> `1+2`→3, `6*7`→42, `(1<<4)|2`→18, fall-through→0; nó não-suportado → erro honesto.
+>
+> **F3 = M1 (próximo nível — runtime de verdade):** o que destrava programas além de aritmética-com-exit-code —
+> **B3c `print`/IO** (saída real), **B3b pânicos** (÷0/OOB/cast-impossível/overflow), **B3a runtime de valor**
+> (`str`/`list`) e **funções com params** + str/byte literais no codegen. Cada um habilita mais do escopo M1.
 
 ---
 

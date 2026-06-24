@@ -9,10 +9,11 @@
 #include "parser/parser.h"   // tk_parse_main_file, tk_parse_module
 #include "parser/result.h"   // tk_parsed_main_file_result, tk_parsed_module_result
 #include "checker/typer.h"   // tk_type_program, tk_tprogram_result
+#include "codegen/codegen_c.h" // tk_emit_c, tk_cstr_result (F2 backend)
 
 #include <stdio.h>           // fopen/fread/fclose, fprintf, printf
 #include <stdlib.h>          // malloc, realloc, free
-#include <string.h>          // strrchr, strcmp
+#include <string.h>          // strrchr, strcmp, memcpy
 
 // =========================================================================
 // B1a — the IO boundary (the bootstrap's ONE host-IO function — M.1, contained).
@@ -107,6 +108,66 @@ static int fail(const char *path, const char *message) {
     return 1;
 }
 
+// =========================================================================
+// B2 — the BACKEND wiring (F2): write the emitted C next to the input, invoke the
+// host `cc`, produce the native binary. The output stem drops a trailing ".tks".
+// =========================================================================
+
+// Derive "<dir>/<stem>" (no extension) from the input path — heap-allocated.
+static char *output_stem(const char *path) {
+    size_t n = strlen(path);
+    // strip a trailing ".tks" if present.
+    size_t base = n;
+    if (n >= 4 && strcmp(path + n - 4, ".tks") == 0) base = n - 4;
+    char *out = malloc(base + 1);
+    if (out == NULL) abort();
+    memcpy(out, path, base);
+    out[base] = '\0';
+    return out;
+}
+
+// Run the host C compiler over `cfile`, producing `binary`. Returns 0 on success.
+static int run_cc(const char *cfile, const char *binary) {
+    // cc -std=c23 <file.c> -o <binary>  — quote paths to tolerate spaces.
+    size_t cap = strlen(cfile) + strlen(binary) + 64;
+    char *cmd = malloc(cap);
+    if (cmd == NULL) abort();
+    snprintf(cmd, cap, "cc -std=c23 \"%s\" -o \"%s\"", cfile, binary);
+    int rc = system(cmd);
+    free(cmd);
+    return rc;
+}
+
+// Lower → write .c → invoke cc → report. Returns 0 on success.
+static int tk_backend(const char *path, tk_tprogram prog) {
+    tk_cstr_result emitted = tk_emit_c(prog);
+    if (!emitted.ok) return fail(path, emitted.as.error.message);
+
+    char *stem = output_stem(path);
+
+    // The emitted C goes to "<stem>.c".
+    size_t clen = strlen(stem) + 3;
+    char *cfile = malloc(clen);
+    if (cfile == NULL) abort();
+    snprintf(cfile, clen, "%s.c", stem);
+
+    FILE *f = fopen(cfile, "wb");
+    if (f == NULL) { free(emitted.as.value); free(stem); free(cfile); return fail(path, "cannot write generated C"); }
+    size_t srclen = strlen(emitted.as.value);
+    size_t wrote = fwrite(emitted.as.value, 1, srclen, f);
+    fclose(f);
+    free(emitted.as.value);
+    if (wrote != srclen) { free(stem); free(cfile); return fail(path, "short write on generated C"); }
+
+    int rc = run_cc(cfile, stem);
+    free(cfile);
+    if (rc != 0) { free(stem); return fail(path, "cc failed to build the generated C"); }
+
+    printf("tekoc: %s: built %s\n", path, stem);
+    free(stem);
+    return 0;
+}
+
 int tk_compile(const char *path) {
     // --- read (B1a) ---
     tk_str_result src = tk_read_file(path);
@@ -134,6 +195,6 @@ int tk_compile(const char *path) {
     tk_tprogram_result checked = tk_type_program(program);
     if (!checked.ok) return fail(path, checked.as.error.message);
 
-    printf("tekoc: %s: checked OK (%zu items)\n", path, checked.as.value.nitems);
-    return 0;
+    // --- backend (F2): lower the checked typed program to C, build it natively ---
+    return tk_backend(path, checked.as.value);
 }

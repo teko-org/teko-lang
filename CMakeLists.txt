@@ -56,6 +56,10 @@ set(TEKO_EMIT_SOURCES
     src/emit/tkh.c
     src/emit/header.c)
 
+# --- F2: the C backend (codegen) — lowers the checked typed tree to C source ---
+set(TEKO_CODEGEN_SOURCES
+    src/codegen/codegen_c.c)
+
 # The bootstrap mirror as one static library. The whole C front-end + checker + emit
 # compiles (F0 done); the default build now archives it, guarding the mirror against
 # compile regressions. It is not yet linked into an executable — the driver (F1) will
@@ -65,7 +69,8 @@ add_library(teko_bootstrap STATIC
     ${TEKO_LEXER_SOURCES}
     ${TEKO_PARSER_SOURCES}
     ${TEKO_CHECKER_SOURCES}
-    ${TEKO_EMIT_SOURCES})
+    ${TEKO_EMIT_SOURCES}
+    ${TEKO_CODEGEN_SOURCES})
 
 # --- F1: the driver — path-to-first-binary -----------------------------------
 # `tekoc` is now the REAL driver: read -> lex -> parse -> reconcile -> check, wired in
