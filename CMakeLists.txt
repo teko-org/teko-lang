@@ -9,8 +9,9 @@
 #
 # NOTE (M.4 — do not build on the incomplete): the C mirror is NOT yet a complete,
 # linkable program — the pipeline (read→lex→parse→check→codegen) is not wired, there
-# is no main, the lexer C mirror is a delta only (src/lexer/token.h), and the parser
-# C mirror is partial (headers). This file establishes the PROJECT STRUCTURE; it is
+# is no main, and the parser C mirror is partial (headers). (The lexer C mirror is
+# now materialized — token.h/lexer.h/lexer.c — and compiles clean.) This file
+# establishes the PROJECT STRUCTURE; it is
 # intentionally not expected to compile/link as-is. Targets are listed so the tree is
 # navigable and ready to be wired incrementally.
 
@@ -26,11 +27,14 @@ set(CMAKE_C_EXTENSIONS OFF)
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/src)
 
 # --- C mirror translation units, grouped by module ---------------------------
-# (Header-only modules — core, lexer (delta), parser (ast.h/result.h) — contribute
-#  include paths only; they have no .c yet.)
+# (Header-only modules — core, parser (ast.h/result.h) — contribute include paths
+#  only; they have no .c yet.)
 
 set(TEKO_TEXT_SOURCES
     src/text/text.c)
+
+set(TEKO_LEXER_SOURCES
+    src/lexer/lexer.c)
 
 set(TEKO_CHECKER_SOURCES
     src/checker/type.c
@@ -53,8 +57,13 @@ set(TEKO_EMIT_SOURCES
 # ALL so a plain `cmake --build` does not attempt the not-yet-linkable mirror.
 add_library(teko_bootstrap STATIC EXCLUDE_FROM_ALL
     ${TEKO_TEXT_SOURCES}
+    ${TEKO_LEXER_SOURCES}
     ${TEKO_CHECKER_SOURCES}
     ${TEKO_EMIT_SOURCES})
 
-# Future entry point (the wired pipeline) will live here:
-#   add_executable(tekoc src/main.c ...)   # when the driver is written (post-S2)
+# --- F-1: build smoke / driver skeleton --------------------------------------
+# A standalone, ALWAYS-built entry that proves the toolchain + CMake configure/compile/
+# link/run end-to-end, independent of the (still-incomplete) mirror library above. F1
+# grows this into the real driver (read->lex->parse->check->emit-C) once F0 makes the
+# mirror compile and it can be linked in.
+add_executable(tekoc src/main.c)

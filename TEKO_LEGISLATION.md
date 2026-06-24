@@ -261,6 +261,12 @@ because redefinition is a legislative act.)*
   aspiration↔reality gap is named, not hidden) **+ M.4** (the stages are layers; build-order applied to the
   runtime) **+ M.5** (the minimal runtime that works — no bare-metal drivers when AOT-on-host serves). *(→
   CONSTITUTION M.0; HISTORY §B.34.)*
+  - **First-binary realization = TRANSPILE-TO-C.** Stage 2 (AOT-native) is first realized by **lowering the
+    typed tree to C** and letting the host `cc` produce the binary — reusing the toolchain (**M.5**), not a
+    bespoke native codegen. **Both execution modes are planned:** transpile-to-C/AOT (first) and the **stage-1
+    `.tkb` VM/interpreter** — the VM is a **future mode** (not dropped), it just does not gate the first binary
+    (it needs the statement/program `.tkb` codec, today expression-only). The path is TEKO_ROADMAP_BINARY.md.
+    *(legislator's choice — → HISTORY first-binary backend.)*
 - **IO is slurp (whole-file `[]byte`), not streams — for the seed.** `read_file(path) -> []byte | Error`
   (open, read all, close), `write_file(path, []byte) -> () | Error`, `write_err([]byte)` (stderr).
   **Streams are deferred** (they enter when large inputs justify the weight). `read_file` returns **raw

@@ -4,6 +4,9 @@
 > ou uma regra + seus testes feliz/barreira, par Teko+C), no padrão que funcionou no P2.
 > Esforço: **P** pequeno / **M** médio. Ordem = M.4. `tkb`/emissor só recebem dados
 > **validados** (checados).
+>
+> **Sucessor:** front-end + checker + emissores concluídos; o caminho até o PRIMEIRO
+> binário executável (via transpile-para-C) está em **TEKO_ROADMAP_BINARY.md**.
 
 ---
 

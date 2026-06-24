@@ -5632,6 +5632,19 @@ to be audited. A **closed system, without gaps.**
   honestly (a typed-tree package, not a native object); **M.1**: static whole-program merge means deps are
   checked together, no dynamic-boundary surprises. The off-plumb code comment in `src/emit/tkh.tks` was fixed;
   the package/pre-linker model is recorded in LEGISLATION. (The pre-linker + loader are future — pipeline phase.)
+- **First-binary backend = TRANSPILE-TO-C (legislator's choice).** *WAS* — the materialization stages
+  (LEGISLATION) named stage 1 = `.tkb` *interpreted* (the bootstrap step) and stage 2 = AOT-native (what ships),
+  implying the first runnable would be an interpreter over the typed tree / `.tkb`. *IS* — for the FIRST
+  executable, the legislator chose to **skip the stage-1 interpreter** and go straight to **transpiling the
+  typed tree to C**, letting the host `cc` produce a native binary. *WHY* — **M.5** (reuse the host toolchain;
+  do not write a native codegen — or even an interpreter VM — when lowering to C reaches a real binary fastest)
+  **+ M.0** (the metal mapping is direct: Teko ints→stdint, the operators→C operators) **+ M.4** (it still rests
+  on the completed checker/typed-AST). Transpile-to-C is thus a *realization of stage 2* (AOT-native via C), not
+  a new stage. **Teko targets BOTH execution modes:** (1) transpile-to-C / AOT (this, first) and (2) the
+  `.tkb` VM/interpreter (stage 1) — the VM is a **planned future mode**, not dropped; it just does not gate the
+  first binary (its real prerequisite is the statement/program-level `.tkb` codec, today expression-only). The full path is defined in
+  TEKO_ROADMAP_BINARY.md (F0 compile the C mirror → F1 wire the pipeline → F2 emit C + call cc → F3 minimal
+  runtime; M0 = a `main.tks` of integer arithmetic + print runs as a native binary).
 - **Arithmetic overflow (`+ - *`) — metal operates, debug catches:**
   - **Operator:** **panic in debug** (catches accidental overflow while testing),
     **wrap in release** (the metal's native modular result — a *defined* value, not
