@@ -9,7 +9,7 @@
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        fputs("usage: tekoc <file.tks>\n", stderr);
+        fputs("usage: teko <file.tks>\n", stderr);
         return 2;
     }
     return tk_compile(argv[1]);

@@ -63,7 +63,7 @@ set(TEKO_CODEGEN_SOURCES
 # The bootstrap mirror as one static library. The whole C front-end + checker + emit
 # compiles (F0 done); the default build now archives it, guarding the mirror against
 # compile regressions. It is not yet linked into an executable — the driver (F1) will
-# link `tekoc` against it once the pipeline is wired.
+# link `teko` against it once the pipeline is wired.
 add_library(teko_bootstrap STATIC
     ${TEKO_TEXT_SOURCES}
     ${TEKO_LEXER_SOURCES}
@@ -73,12 +73,12 @@ add_library(teko_bootstrap STATIC
     ${TEKO_CODEGEN_SOURCES})
 
 # --- F1: the driver — path-to-first-binary -----------------------------------
-# `tekoc` is now the REAL driver: read -> lex -> parse -> reconcile -> check, wired in
+# `teko` is now the REAL driver: read -> lex -> parse -> reconcile -> check, wired in
 # src/driver.c and linked against the bootstrap mirror library. (Codegen/emit is F2;
 # success here means the front-end pipeline ran and the program type-checked.)
-add_executable(tekoc src/main.c src/driver.c)
-target_link_libraries(tekoc PRIVATE teko_bootstrap)
+add_executable(teko src/main.c src/driver.c)
+target_link_libraries(teko PRIVATE teko_bootstrap)
 
 # F3: the generated programs link the minimal execution runtime (libteko_rt).
-# tekoc needs the runtime's location to pass -I and the runtime source to the host cc.
-target_compile_definitions(tekoc PRIVATE TK_RT_DIR="${CMAKE_CURRENT_SOURCE_DIR}/runtime")
+# teko needs the runtime's location to pass -I and the runtime source to the host cc.
+target_compile_definitions(teko PRIVATE TK_RT_DIR="${CMAKE_CURRENT_SOURCE_DIR}/runtime")
