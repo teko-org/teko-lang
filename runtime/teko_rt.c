@@ -22,6 +22,23 @@ _Noreturn void tk_panic(const char *msg) {
     abort();
 }
 
+// --- teko::assert — fail loud on a false assertion (M.1). Canonical: src/assert/assert.tks. ---
+void teko__assert__is_true(bool c)  { if (!c) tk_panic("assertion failed: is_true"); }
+void teko__assert__is_false(bool c) { if ( c) tk_panic("assertion failed: is_false"); }
+
+void teko__assert__str_contains(tk_str hay, tk_str needle) {
+    // Plain byte-substring scan over the spans; no allocation. Empty needle ⊆ any hay.
+    if (needle.len == 0) return;
+    if (needle.len <= hay.len) {
+        for (size_t i = 0; i + needle.len <= hay.len; i += 1) {
+            size_t j = 0;
+            while (j < needle.len && hay.ptr[i + j] == needle.ptr[j]) j += 1;
+            if (j == needle.len) return;   // found
+        }
+    }
+    tk_panic("assertion failed: str_contains");
+}
+
 _Noreturn void tk_panic_div0(void)     { tk_panic("division by zero"); }
 _Noreturn void tk_panic_oob(void)      { tk_panic("index out of bounds"); }
 _Noreturn void tk_panic_cast(void)     { tk_panic("impossible conversion"); }

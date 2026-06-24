@@ -33,6 +33,10 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR}/src)
 set(TEKO_TEXT_SOURCES
     src/text/text.c)
 
+# teko::build — the `.tkp` manifest reader (crumb A1). The FIRST .c under src/build.
+set(TEKO_BUILD_SOURCES
+    src/build/manifest.c)
+
 set(TEKO_LEXER_SOURCES
     src/lexer/lexer.c)
 
@@ -80,6 +84,7 @@ set(TEKO_CODEGEN_SOURCES
 # link `teko` against it once the pipeline is wired.
 add_library(teko_bootstrap STATIC
     ${TEKO_TEXT_SOURCES}
+    ${TEKO_BUILD_SOURCES}
     ${TEKO_LEXER_SOURCES}
     ${TEKO_PARSER_SOURCES}
     ${TEKO_CHECKER_SOURCES}

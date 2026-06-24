@@ -17,7 +17,7 @@ tk_env            tk_env_define(tk_env env, tk_str name, tk_type t, bool is_mut)
 tk_binding_result tk_env_lookup_binding(tk_env env, tk_str name);  // the whole binding (mut guard)
 tk_type_result    tk_env_lookup(tk_env env, tk_str name);          // the type (thin wrapper)
 tk_type_result    tk_builtin_type(tk_str name);
-tk_type_result    tk_builtin_fn(tk_str name);       // injected, non-shadowable stdlib fns (print/println)
+tk_type_result    tk_builtin_fn(tk_str name);       // injected, non-shadowable stdlib fns (print/println, teko::assert::*)
 bool              tk_bind_is_mut(tk_bind_kind k);   // k == TK_BIND_MUT (Let/Const immutable — B.21)
 
 #endif // TK_CHECK_SCOPE_H

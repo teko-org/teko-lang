@@ -1,0 +1,655 @@
+// src/codegen/codegen.tks   (namespace 'teko::codegen')
+//
+// THE CANONICAL ORIGINAL of the C backend: lower a CHECKED typed program (TProgram)
+// to C source text. The host `cc` then compiles that text to the first native Teko
+// binary (M0). This is the Teko pair of src/codegen/codegen_c.{c,h} — the only
+// namespace that was C-only; this file closes the gap (it feeds self-hosting).
+//
+// Lowering design (M0 = integer arithmetic + let + return -> running native binary):
+//   * types  : Type -> C type text (U8..U64 -> uintN_t, I8..I64 -> intN_t,
+//              Bool -> bool, byte -> uint8_t, Unit -> void, Str -> tk_str). Everything
+//              else = "not yet supported".
+//   * exprs  : TNumber -> literal; TVar -> identifier; TBinary -> (L op R);
+//              TUnary -> (op X); TCompare -> chained && of adjacent C comparisons;
+//              TCast -> ((Ctype)(inner)); TCall -> name(args…); TFieldAccess ->
+//              (recv.field); TStrLit -> tk_str compound literal (explicit length);
+//              TByteLit -> decimal octet. TIfExpr/TMatchExpr AS A VALUE = not yet supported.
+//   * stmts  : TBinding -> Ctype x = v; TAssign -> x op= v; TReturn -> early exit in
+//              main / `return v;` in a fn; TExprStmt -> expr; TLoopStmt -> while(1){…};
+//              TBreakStmt/TContinueStmt -> break;/continue;.
+//   * program: each TFunction -> a C function; the loose top-level statements (the
+//              VIRTUAL-MAIN) -> int main(void){ … return 0; } with early-return.
+//
+// COVERAGE RULE (M.3 — honesty): every unsupported node FAILS with a clear message;
+// codegen never emits broken C, never crashes. The barrier is named, not silent (M.1).
+//
+// HOW THIS DIFFERS FROM THE C (faithful, not literal — Teko is cleaner):
+//   * The C growable `cbuf` (malloc/realloc + NUL, abort-on-OOM) is SCAFFOLDING for
+//     what Teko does natively: the C-source under construction is a `[]byte` grown by
+//     `teko::list::push` (the one true intrinsic — core.tks). The append helpers take a
+//     buffer and RETURN the grown buffer (the emit/* functional convention — tkb_buf.tks),
+//     instead of mutating a `cbuf*` through a pointer.
+//   * The C `bool ok + const char **err` plumbing collapses into `[]byte | error`
+//     (native variant — B.14): the FIRST error short-circuits via `return e`, exactly
+//     as the C's `if (!…) return false` chain did. `T | error` IS the C's TK_RESULT.
+//   * The C `seg_is(span, lit)` (memcmp a non-NUL span) is just `==` on `str` here.
+//   * The C operator lookup tables that return `const char *` (NULL == unsupported) are
+//     `str | error` here — the NULL sentinel becomes an honest error case.
+
+// ---------------------------------------------------------------------------
+// The growable C-source buffer == a `[]byte`. These mirror cbuf's cb/cb_str/cb_i64/
+// cb_cstr_escaped. Each APPENDS to `buf` and returns the grown buffer (functional).
+// ---------------------------------------------------------------------------
+
+// cb — append a str (its UTF-8 bytes) to the C-source buffer. (C: `cb`.)
+fn cb(buf: []byte, s: str) -> []byte {
+    mut b = buf
+    mut i = 0
+    loop {
+        if i >= s.len { break }
+        b = teko::list::push(b, s[i])
+        i++
+    }
+    b
+}
+
+// cb_str — append a str span. In C this appended a tk_str's raw bytes (no NUL); in
+// Teko a str IS already a {ptr,len} view, so this is identical to `cb`. (C: `cb_str`.)
+fn cb_str(buf: []byte, s: str) -> []byte { cb(buf, s) }
+
+// cb_byte — append a single byte. (No direct C name — folds the C `tmp[0]=c; cb(b,tmp)`
+// one-char path into a native byte push.)
+fn cb_byte(buf: []byte, x: byte) -> []byte { teko::list::push(buf, x) }
+
+// cb_i64 — append an i64 as decimal text. (C: `cb_i64`, which used snprintf("%PRId64").)
+// Teko has no snprintf, so the decimal render is spelled out: emit the sign, then the
+// digits high-to-low. Self-contained — no dependency on the lexer's number path.
+fn cb_i64(buf: []byte, v: i64) -> []byte {
+    if v == 0 { return cb_byte(buf, b'0') }
+    mut b = buf
+    mut n = v
+    if n < 0 { b = cb_byte(b, b'-'); n = -n }   // -n is safe for the M0 magnitudes codegen emits
+    // collect digits low-to-high into a scratch list, then emit reversed.
+    mut digits = teko::list::empty()
+    loop {
+        if n == 0 { break }
+        let d = (n % 10) to byte                 // 0..9
+        digits = teko::list::push(digits, (b'0' to i64 + (d to i64)) to byte)
+        n = n / 10
+    }
+    mut i = digits.len
+    loop {
+        if i == 0 { break }
+        b = cb_byte(b, digits[i - 1])            // reverse: most-significant first
+        i--
+    }
+    b
+}
+
+// cb_cstr_escaped — append `s` C-escaped, INSIDE an already-open C string literal. The
+// bytes are raw (may contain NUL, quotes, newlines) — see TStrLit. We never rely on
+// length here; the caller emits the explicit byte count separately (M.1).
+// (C: `cb_cstr_escaped`.)
+fn cb_cstr_escaped(buf: []byte, s: str) -> []byte {
+    mut b = buf
+    mut i = 0
+    loop {
+        if i >= s.len { break }
+        let c = s[i]
+        if      c == b'\\' { b = cb(b, "\\\\") }
+        else if c == b'"'  { b = cb(b, "\\\"") }
+        else if c == b'\n' { b = cb(b, "\\n") }
+        else if c == b'\t' { b = cb(b, "\\t") }
+        else if c == b'\r' { b = cb(b, "\\r") }
+        else if c < 0x20 || c >= 0x7F {
+            // 3-digit octal — fixed width dodges the hex "run-on digit" hazard.
+            b = cb_byte(b, b'\\')
+            b = cb_byte(b, (b'0' to i64 + ((c to i64 / 64) % 8)) to byte)   // octal hundreds
+            b = cb_byte(b, (b'0' to i64 + ((c to i64 / 8)  % 8)) to byte)   // octal tens
+            b = cb_byte(b, (b'0' to i64 + ( c to i64        % 8)) to byte)   // octal ones
+        }
+        else { b = cb_byte(b, c) }
+        i++
+    }
+    b
+}
+
+// ---------------------------------------------------------------------------
+// Types -> C type text.
+// ---------------------------------------------------------------------------
+
+// emit_prim — a PrimKind -> its C fixed-width type name. (C: `emit_prim`.)
+fn emit_prim(buf: []byte, k: PrimKind) -> []byte | error {
+    match k {
+        PrimKind::U8   => cb(buf, "uint8_t")
+        PrimKind::U16  => cb(buf, "uint16_t")
+        PrimKind::U32  => cb(buf, "uint32_t")
+        PrimKind::U64  => cb(buf, "uint64_t")
+        PrimKind::I8   => cb(buf, "int8_t")
+        PrimKind::I16  => cb(buf, "int16_t")
+        PrimKind::I32  => cb(buf, "int32_t")
+        PrimKind::I64  => cb(buf, "int64_t")
+        PrimKind::Bool => cb(buf, "bool")
+    }
+}
+
+// emit_type — a resolved Type -> C type text. STR -> tk_str; the structured types are
+// the honest "not yet supported" barrier (M.3). (C: `emit_type`.)
+fn emit_type(buf: []byte, t: Type) -> []byte | error {
+    match t {
+        Prim as p => emit_prim(buf, p.kind)
+        Byte      => cb(buf, "uint8_t")
+        Unit      => cb(buf, "void")
+        Str       => cb(buf, "tk_str")
+        Slice     => error { message = "codegen: slice type not yet supported" }
+        Named     => error { message = "codegen: named type not yet supported" }
+        Variant   => error { message = "codegen: variant type not yet supported" }
+        Func      => error { message = "codegen: function type not yet supported" }
+        Error     => error { message = "codegen: error type not yet supported" }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Operator token kind -> C operator text. The C returned `const char *` with NULL ==
+// unsupported; here the NULL sentinel is an honest `str | error` (M.3).
+// ---------------------------------------------------------------------------
+
+// binop_c — a binary operator token -> its C spelling. (C: `binop_c`.)
+fn binop_c(op: lexer::TokenKind) -> str | error {
+    match op {
+        lexer::TokenKind::Plus    => "+"
+        lexer::TokenKind::Minus   => "-"
+        lexer::TokenKind::Star    => "*"
+        lexer::TokenKind::Slash   => "/"
+        lexer::TokenKind::Percent => "%"
+        lexer::TokenKind::Amp     => "&"
+        lexer::TokenKind::Pipe    => "|"
+        lexer::TokenKind::Caret   => "^"
+        lexer::TokenKind::Shl     => "<<"
+        lexer::TokenKind::Shr     => ">>"
+        lexer::TokenKind::AndAnd  => "&&"
+        lexer::TokenKind::OrOr    => "||"
+        _                         => error { message = "codegen: binary operator not yet supported" }
+    }
+}
+
+// unop_c — a unary prefix operator token -> its C spelling. (C: `unop_c`.)
+fn unop_c(op: lexer::TokenKind) -> str | error {
+    match op {
+        lexer::TokenKind::Minus => "-"
+        lexer::TokenKind::Tilde => "~"
+        lexer::TokenKind::Bang  => "!"
+        _                       => error { message = "codegen: unary operator not yet supported" }
+    }
+}
+
+// cmpop_c — a comparison operator token -> its C spelling. (C: `cmpop_c`.)
+fn cmpop_c(op: lexer::TokenKind) -> str | error {
+    match op {
+        lexer::TokenKind::EqEq => "=="
+        lexer::TokenKind::Ne   => "!="
+        lexer::TokenKind::Lt   => "<"
+        lexer::TokenKind::Le   => "<="
+        lexer::TokenKind::Gt   => ">"
+        lexer::TokenKind::Ge   => ">="
+        _                      => error { message = "codegen: comparison operator not yet supported" }
+    }
+}
+
+// assignop_c — an assignment operator token -> its C spelling. (C: `assignop_c`.)
+fn assignop_c(op: lexer::TokenKind) -> str | error {
+    match op {
+        lexer::TokenKind::Assign    => "="
+        lexer::TokenKind::PlusEq    => "+="
+        lexer::TokenKind::MinusEq   => "-="
+        lexer::TokenKind::StarEq    => "*="
+        lexer::TokenKind::SlashEq   => "/="
+        lexer::TokenKind::PercentEq => "%="
+        lexer::TokenKind::AmpEq     => "&="
+        lexer::TokenKind::PipeEq    => "|="
+        lexer::TokenKind::CaretEq   => "^="
+        lexer::TokenKind::ShlEq     => "<<="
+        lexer::TokenKind::ShrEq     => ">>="
+        _                           => error { message = "codegen: assignment operator not yet supported" }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// F3 GUARDS (M.1 — fail loud): the prim helpers that pick the right runtime guard.
+// Integer prims only; bool is never a guard target.
+// ---------------------------------------------------------------------------
+
+// prim_is_int — every Prim but Bool is an integer. (C: `prim_is_int`.)
+fn prim_is_int(k: PrimKind) -> bool { k != PrimKind::Bool }
+
+// prim_is_signed — the signed prims are I8..I64. (C: `prim_is_signed`.)
+fn prim_is_signed(k: PrimKind) -> bool {
+    match k {
+        PrimKind::I8  => true
+        PrimKind::I16 => true
+        PrimKind::I32 => true
+        PrimKind::I64 => true
+        _                      => false
+    }
+}
+
+// prim_width — bit-width ordinal (8/16/32/64) for narrowing analysis; Bool == 1. (C: `prim_width`.)
+fn prim_width(k: PrimKind) -> i64 {
+    match k {
+        PrimKind::U8   => 8
+        PrimKind::I8   => 8
+        PrimKind::U16  => 16
+        PrimKind::I16  => 16
+        PrimKind::U32  => 32
+        PrimKind::I32  => 32
+        PrimKind::U64  => 64
+        PrimKind::I64  => 64
+        PrimKind::Bool => 1
+    }
+}
+
+// prim_div_tag — the "u8".."i64" tag used to NAME a div/mod (or cast) helper, e.g.
+// tk_div_u32 / tk_to_i16. Bool has no tag (it is never a guard target). The C returned
+// NULL for Bool; here that is an honest `str | error`. (C: `prim_div_tag`.)
+fn prim_div_tag(k: PrimKind) -> str | error {
+    match k {
+        PrimKind::U8   => "u8"
+        PrimKind::U16  => "u16"
+        PrimKind::U32  => "u32"
+        PrimKind::U64  => "u64"
+        PrimKind::I8   => "i8"
+        PrimKind::I16  => "i16"
+        PrimKind::I32  => "i32"
+        PrimKind::I64  => "i64"
+        PrimKind::Bool => error { message = "codegen: bool has no div/cast helper tag" }
+    }
+}
+
+// cast_may_lose — a cast src->dst may lose data (needs a runtime guard) when SOME value
+// of the source type falls outside the destination's representable range. Conservative:
+// if we cannot prove source range ⊆ dest range, guard. (C: `cast_may_lose`.)
+fn cast_may_lose(src: PrimKind, dst: PrimKind) -> bool {
+    let ss = prim_is_signed(src)
+    let ds = prim_is_signed(dst)
+    let sw = prim_width(src)
+    let dw = prim_width(dst)
+    if ss == ds { return sw > dw }          // same signedness: only true narrowing loses
+    if !ss && ds { return sw >= dw }        // u->i: dest loses one bit of magnitude at equal width
+    true                                    // i->u: negatives never fit
+}
+
+// ---------------------------------------------------------------------------
+// Expressions -> C expression text. The C threaded `cbuf *b` + `const char **err` and
+// returned bool; here each helper takes `buf` and returns the grown `[]byte | error`
+// (the buffer carries the result; the error short-circuits the walk).
+// ---------------------------------------------------------------------------
+
+// emit_div_mod — the F3 (M.1) `/` and `%` path: a checked runtime helper (tk_div_*/
+// tk_mod_*) that PANICS on a zero divisor instead of UB/SIGFPE. Single-eval — each
+// operand emitted once, passed by value. The helper width comes from the node's result
+// prim. (C: inlined inside emit_expr's TK_TEXPR_BINARY `/` `%` branch.)
+fn emit_div_mod(buf: []byte, e: TExpr, b: TBinary) -> []byte | error {
+    let prim = match e.type {
+        Prim as p => p
+        _                  => return error { message = "codegen: division/modulo on a non-primitive type not yet supported" }
+    }
+    let tag = match prim_div_tag(prim.kind) {
+        str as t     => t
+        error        => return error { message = "codegen: division/modulo on a non-integer type not yet supported" }
+    }
+    mut out = buf
+    if b.op == lexer::TokenKind::Slash { out = cb(out, "tk_div_") } else { out = cb(out, "tk_mod_") }
+    out = cb(out, tag)
+    out = cb(out, "(")
+    out = match emit_expr(out, b.left)  { []byte as o => o; error as err => return err }
+    out = cb(out, ", ")
+    out = match emit_expr(out, b.right) { []byte as o => o; error as err => return err }
+    cb(out, ")")
+}
+
+// emit_binary — a TBinary. `/` and `%` go through the checked helper (emit_div_mod);
+// everything else is plain C `(L op R)`. (C: TK_TEXPR_BINARY branch of emit_expr.)
+// NOTE (out of scope): +,-,* stay plain C — overflow guarding is DEFERRED to build
+// profiles (panic-debug / wrap-release), which do not exist yet.
+fn emit_binary(buf: []byte, e: TExpr, b: TBinary) -> []byte | error {
+    if b.op == lexer::TokenKind::Slash || b.op == lexer::TokenKind::Percent {
+        return emit_div_mod(buf, e, b)
+    }
+    let op = match binop_c(b.op) { str as s => s; error as err => return err }
+    mut out = cb(buf, "(")
+    out = match emit_expr(out, b.left) { []byte as o => o; error as err => return err }
+    out = cb(out, " ")
+    out = cb(out, op)
+    out = cb(out, " ")
+    out = match emit_expr(out, b.right) { []byte as o => o; error as err => return err }
+    cb(out, ")")
+}
+
+// emit_unary — a TUnary -> `(op X)`. (C: TK_TEXPR_UNARY branch.)
+fn emit_unary(buf: []byte, u: TUnary) -> []byte | error {
+    let op = match unop_c(u.op) { str as s => s; error as err => return err }
+    mut out = cb(buf, "(")
+    out = cb(out, op)
+    out = match emit_expr(out, u.operand) { []byte as o => o; error as err => return err }
+    cb(out, ")")
+}
+
+// emit_compare — a TCompare -> chained `a<b<c` => `((a<b) && (b<c))` over ADJACENT
+// operands. A lone subject (no rest) is degenerate: emit it bare. (C: TK_TEXPR_COMPARE.)
+fn emit_compare(buf: []byte, c: TCompare) -> []byte | error {
+    if c.rest.len == 0 { return emit_expr(buf, c.first) }
+    mut out = cb(buf, "(")
+    mut prev = c.first
+    mut i = 0
+    loop {
+        if i >= c.rest.len { break }
+        let term = c.rest[i]
+        let op = match cmpop_c(term.op) { str as s => s; error as err => return err }
+        if i > 0 { out = cb(out, " && ") }
+        out = cb(out, "(")
+        out = match emit_expr(out, prev) { []byte as o => o; error as err => return err }
+        out = cb(out, " ")
+        out = cb(out, op)
+        out = cb(out, " ")
+        out = match emit_expr(out, term.operand) { []byte as o => o; error as err => return err }
+        out = cb(out, ")")
+        prev = term.operand
+        i++
+    }
+    cb(out, ")")
+}
+
+// emit_cast — a TCast. F3 (M.1): a narrowing `x to T` is range-checked at runtime via
+// tk_to_<dst>_<carrier> and PANICS if the value doesn't fit T. Widening / same-type
+// casts where no loss is possible emit the plain C cast (no needless guard). Single-eval:
+// the operand is emitted once. The carrier is picked by SOURCE signedness so it holds
+// the source losslessly: signed -> int64_t carrier ("_s"); unsigned -> uint64_t ("_u").
+// (C: TK_TEXPR_CAST branch.)
+fn emit_cast(buf: []byte, e: TExpr, c: TCast) -> []byte | error {
+    let inner = c.expr
+    let guard = match e.type {
+        Prim as dp => match inner.type {
+            Prim as sp => prim_is_int(dp.kind) && prim_is_int(sp.kind)
+                                   && cast_may_lose(sp.kind, dp.kind)
+            _                   => false
+        }
+        _                   => false
+    }
+    if guard {
+        // both sides are Prim here (the guard predicate proved it).
+        let dst = match e.type     { Prim as p => p.kind; _ => return error { message = "codegen: cast guard on a non-primitive (unreachable)" } }
+        let src = match inner.type { Prim as p => p.kind; _ => return error { message = "codegen: cast guard on a non-primitive (unreachable)" } }
+        let dtag = match prim_div_tag(dst) {           // reuse the "u8".."i64" tag table
+            str as t => t
+            error    => return error { message = "codegen: cast to a non-integer type not yet supported" }
+        }
+        mut out = cb(buf, "tk_to_")
+        out = cb(out, dtag)
+        if prim_is_signed(src) { out = cb(out, "_s(") } else { out = cb(out, "_u(") }
+        out = match emit_expr(out, inner) { []byte as o => o; error as err => return err }
+        return cb(out, ")")
+    }
+    mut out = cb(buf, "((")
+    out = match emit_type(out, e.type) { []byte as o => o; error as err => return err }   // target rides the node's .type
+    out = cb(out, ")(")
+    out = match emit_expr(out, inner) { []byte as o => o; error as err => return err }
+    cb(out, "))")
+}
+
+// emit_call — a TCall. The callee path -> a C identifier joined by "__" (single-segment
+// in M0). Non-shadowable built-ins `print`/`println` (bare, or under `teko`) map to
+// tk_print/tk_println. (C: TK_TEXPR_CALL branch.)
+fn emit_call(buf: []byte, c: TCall) -> []byte | error {
+    let p = c.callee
+    // Non-shadowable built-ins: `print`/`println`, either bare or under `teko`.
+    mut builtin = ""
+    mut has_builtin = false
+    if p.segments.len >= 1 {
+        let last = p.segments[p.segments.len - 1].name
+        let addressable = (p.segments.len == 1) || (p.segments[0].name == "teko")
+        if addressable {
+            if      last == "print"   { builtin = "tk_print";   has_builtin = true }
+            else if last == "println" { builtin = "tk_println"; has_builtin = true }
+        }
+    }
+    mut out = buf
+    if has_builtin {
+        out = cb(out, builtin)
+    } else {
+        mut i = 0
+        loop {
+            if i >= p.segments.len { break }
+            if i > 0 { out = cb(out, "__") }
+            out = cb_str(out, p.segments[i].name)
+            i++
+        }
+    }
+    out = cb(out, "(")
+    mut j = 0
+    loop {
+        if j >= c.args.len { break }
+        if j > 0 { out = cb(out, ", ") }
+        out = match emit_expr(out, c.args[j]) { []byte as o => o; error as err => return err }
+        j++
+    }
+    cb(out, ")")
+}
+
+// emit_field_access — a TFieldAccess -> `(recv.field)`. (C: TK_TEXPR_FIELD_ACCESS branch.)
+fn emit_field_access(buf: []byte, fa: TFieldAccess) -> []byte | error {
+    mut out = cb(buf, "(")
+    out = match emit_expr(out, fa.receiver) { []byte as o => o; error as err => return err }
+    out = cb(out, ".")
+    out = cb_str(out, fa.field)
+    cb(out, ")")
+}
+
+// emit_strlit — a TStrLit -> a tk_str compound literal with an EXPLICIT length. The
+// decoded bytes may contain NUL, so we never lean on strlen/sizeof (M.1). (C: TK_TEXPR_STR.)
+fn emit_strlit(buf: []byte, s: TStrLit) -> []byte | error {
+    mut out = cb(buf, "(tk_str){ (const tk_byte *)\"")
+    out = cb_cstr_escaped(out, s.text)
+    out = cb(out, "\", ")
+    out = cb_i64(out, s.text.len to i64)
+    cb(out, " }")
+}
+
+// emit_expr — the expression dispatch (the C's emit_expr switch). Unsupported value
+// nodes (if/match-as-a-value) fail with an honest message (M.3). (C: `emit_expr`.)
+fn emit_expr(buf: []byte, e: TExpr) -> []byte | error {
+    match e.kind {
+        TNumber as n      => cb_i64(buf, n.value)
+        TVar as v         => cb_str(buf, v.name)
+        TBinary as b      => emit_binary(buf, e, b)
+        TUnary as u       => emit_unary(buf, u)
+        TCompare as c     => emit_compare(buf, c)
+        TCast as c        => emit_cast(buf, e, c)
+        TCall as cl       => emit_call(buf, cl)
+        TFieldAccess as fa => emit_field_access(buf, fa)
+        TStrLit as s      => emit_strlit(buf, s)
+        TByteLit as by    => cb_i64(buf, by.value to i64)   // byte == uint8_t; emit its decimal value (0..255)
+        TIfExpr           => error { message = "codegen: if-expression not yet supported" }
+        TMatchExpr        => error { message = "codegen: match-expression not yet supported" }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Statements -> C. `in_main` selects the return lowering:
+//   * in main : `return n` -> `return (int)(n);`  (early process exit)
+//   * in a fn : `return n` -> `return n;`
+// ---------------------------------------------------------------------------
+
+// emit_block — emit each statement in order; the first error short-circuits. (C: `emit_block`.)
+fn emit_block(buf: []byte, body: []TStatement, in_main: bool, indent: str) -> []byte | error {
+    mut out = buf
+    mut i = 0
+    loop {
+        if i >= body.len { break }
+        out = match emit_stmt(out, body[i], in_main, indent) { []byte as o => o; error as err => return err }
+        i++
+    }
+    out
+}
+
+// emit_binding — a TBinding. BindTarget: only SimpleName is lowered for M0 (destructuring
+// is the honest barrier). `const` prefix for a const binding; the type rides `.bound`.
+// (C: TK_TSTMT_BINDING branch.)
+fn emit_binding(buf: []byte, b: TBinding, indent: str) -> []byte | error {
+    let name = match b.target {
+        SimpleName as sn   => sn.name
+        DestructurePattern => return error { message = "codegen: destructuring binding not yet supported" }
+    }
+    mut out = cb(buf, indent)
+    if b.kind == BindKind::Const { out = cb(out, "const ") }
+    out = match emit_type(out, b.bound) { []byte as o => o; error as err => return err }
+    out = cb(out, " ")
+    out = cb_str(out, name)
+    out = cb(out, " = ")
+    out = match emit_expr(out, b.value) { []byte as o => o; error as err => return err }
+    cb(out, ";\n")
+}
+
+// emit_assign — a TAssign -> `x op= v;`. (C: TK_TSTMT_ASSIGN branch.)
+fn emit_assign(buf: []byte, a: TAssign, indent: str) -> []byte | error {
+    let op = match assignop_c(a.op) { str as s => s; error as err => return err }
+    mut out = cb(buf, indent)
+    out = cb_str(out, a.name)
+    out = cb(out, " ")
+    out = cb(out, op)
+    out = cb(out, " ")
+    out = match emit_expr(out, a.value) { []byte as o => o; error as err => return err }
+    cb(out, ";\n")
+}
+
+// emit_return — a TReturn. In main, `return n` -> `return (int)(n);` (early process
+// exit) and a bare `return` -> `return 0;`; in a fn, the plain `return [v];`.
+// (C: TK_TSTMT_RETURN branch.)
+fn emit_return(buf: []byte, r: TReturn, in_main: bool, indent: str) -> []byte | error {
+    mut out = cb(buf, indent)
+    if !r.has_value {
+        if in_main { return cb(out, "return 0;\n") }
+        return cb(out, "return;\n")
+    }
+    if in_main {
+        out = cb(out, "return (int)(")
+        out = match emit_expr(out, r.value) { []byte as o => o; error as err => return err }
+        return cb(out, ");\n")
+    }
+    out = cb(out, "return ")
+    out = match emit_expr(out, r.value) { []byte as o => o; error as err => return err }
+    cb(out, ";\n")
+}
+
+// emit_loop — a TLoopStmt -> `while (1) { … }`, nesting one indent level deeper.
+// (C: TK_TSTMT_LOOP branch; C grew the inner indent with snprintf.)
+fn emit_loop(buf: []byte, l: TLoopStmt, in_main: bool, indent: str) -> []byte | error {
+    mut out = cb(buf, indent)
+    out = cb(out, "while (1) {\n")
+    let inner = cb_indent_deeper(indent)
+    out = match emit_block(out, l.body, in_main, inner) { []byte as o => o; error as err => return err }
+    out = cb(out, indent)
+    cb(out, "}\n")
+}
+
+// cb_indent_deeper — `indent` + four spaces (the C did `snprintf(inner, "%s    ", indent)`).
+fn cb_indent_deeper(indent: str) -> str {
+    mut xs = teko::list::empty()
+    mut i = 0
+    loop {
+        if i >= indent.len { break }
+        xs = teko::list::push(xs, indent[i])
+        i++
+    }
+    xs = teko::list::push(xs, b' ')
+    xs = teko::list::push(xs, b' ')
+    xs = teko::list::push(xs, b' ')
+    xs = teko::list::push(xs, b' ')
+    str(xs)
+}
+
+// emit_stmt — the statement dispatch (the C's emit_stmt switch). (C: `emit_stmt`.)
+fn emit_stmt(buf: []byte, s: TStatement, in_main: bool, indent: str) -> []byte | error {
+    match s {
+        TBinding as b      => emit_binding(buf, b, indent)
+        TAssign as a       => emit_assign(buf, a, indent)
+        TReturn as r       => emit_return(buf, r, in_main, indent)
+        TExprStmt as es    => {
+            mut out = cb(buf, indent)
+            out = match emit_expr(out, es.expr) { []byte as o => o; error as err => return err }
+            cb(out, ";\n")
+        }
+        TLoopStmt as l     => emit_loop(buf, l, in_main, indent)
+        TBreakStmt         => { mut out = cb(buf, indent); cb(out, "break;\n") }
+        TContinueStmt      => { mut out = cb(buf, indent); cb(out, "continue;\n") }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A top-level function -> a C function.
+// ---------------------------------------------------------------------------
+
+// emit_function — a TFunction -> a C function definition. M0 has no params (a param
+// would require resolving its annotation), so any param is the honest barrier.
+// (C: `emit_function`.)
+fn emit_function(buf: []byte, f: TFunction) -> []byte | error {
+    mut out = match emit_type(buf, f.return_type) { []byte as o => o; error as err => return err }
+    out = cb(out, " ")
+    out = cb_str(out, f.name)
+    out = cb(out, "(")
+    if f.params.len == 0 {
+        out = cb(out, "void")
+    } else {
+        return error { message = "codegen: function parameters not yet supported" }
+    }
+    out = cb(out, ") {\n")
+    out = match emit_block(out, f.body, false, "    ") { []byte as o => o; error as err => return err }
+    cb(out, "}\n\n")
+}
+
+// ---------------------------------------------------------------------------
+// The program -> a full C translation unit. Two passes:
+//   1. every top-level TFunction -> a C function (use-decls no-op; type-decls rejected).
+//   2. the loose top-level statements (the VIRTUAL-MAIN) -> int main(void){ … return 0; }.
+// The C's `cg_err` (build a tk_cstr_result error) folds away: here the function simply
+// `return error { … }`, since `str | error` IS the C's TK_RESULT. (C: `tk_emit_c` + `cg_err`.)
+// ---------------------------------------------------------------------------
+fn tk_emit_c(prog: TProgram) -> str | error {
+    mut b = teko::list::empty()
+    b = cb(b, "// generated by teko (F2 backend) — do not edit\n")
+    b = cb(b, "#include <stdint.h>\n")
+    b = cb(b, "#include <stdbool.h>\n")
+    b = cb(b, "#include \"teko_rt.h\"\n\n")
+
+    // First pass: emit every top-level function. Reject type-decls (not M0); use-decls
+    // are a no-op at the C level (imports); loose statements are the second pass.
+    mut i = 0
+    loop {
+        if i >= prog.items.len { break }
+        match prog.items[i] {
+            TFunction as f => { b = match emit_function(b, f) { []byte as o => o; error as err => return err } }
+            TypeDecl       => return error { message = "codegen: type declaration not yet supported" }
+            UseDecl        => { }   // imports are a no-op at the C level (M0)
+            TStatement     => { }   // a loose Statement → virtual-main, second pass
+        }
+        i++
+    }
+
+    // Second pass: the VIRTUAL-MAIN — the loose top-level statements, in order, become the
+    // body of C main(); falling off the end -> `return 0;` (default exit 0).
+    b = cb(b, "int main(void) {\n")
+    mut j = 0
+    loop {
+        if j >= prog.items.len { break }
+        match prog.items[j] {
+            TFunction => { }   // handled in pass 1
+            TypeDecl  => { }   // handled (rejected) in pass 1
+            UseDecl   => { }   // no-op
+            TStatement as s    => { b = match emit_stmt(b, s, true, "    ") { []byte as o => o; error as err => return err } }
+        }
+        j++
+    }
+    b = cb(b, "    return 0;\n")
+    b = cb(b, "}\n")
+
+    str(b)
+}

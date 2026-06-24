@@ -56,11 +56,27 @@ tk_type_result tk_builtin_type(tk_str name) {
 // Both are (str) -> Unit. The func type's params/ret are pointers, so they point at
 // immutable static singletons (whole-compile lifetime — they are never mutated).
 tk_type_result tk_builtin_fn(tk_str name) {
-    static tk_type str_t  = { .tag = TK_TYPE_STR };   // the single (str) parameter
-    static tk_type unit_t = { .tag = TK_TYPE_UNIT };  // the Unit return
+    static tk_type str_t  = { .tag = TK_TYPE_STR };       // a (str) parameter
+    static tk_type bool_t = { .tag = TK_TYPE_PRIM, .as.prim = TK_PRIM_BOOL };  // a (bool) parameter
+    static tk_type unit_t = { .tag = TK_TYPE_UNIT };      // the Unit return
+    static tk_type str2_t[2] = { { .tag = TK_TYPE_STR }, { .tag = TK_TYPE_STR } };  // (str, str)
     if (name_is(name, "print") || name_is(name, "println")) {
         tk_type ft = { .tag = TK_TYPE_FUNC,
                        .as.func = { .params = &str_t, .nparams = 1, .ret = &unit_t } };
+        return (tk_type_result){ .ok = true, .as.value = ft };
+    }
+    // teko::assert — injected testing assertions (canonical: src/assert/assert.tks).
+    // Resolved by last segment, like print (type_call looks up the LAST path seg). The
+    // seed subset is NON-generic: equals/not_equals/is_error/is_ok from the roadmap need
+    // GENERICS or the result/error types and are NOT expressible yet — DEFERRED (M.3).
+    if (name_is(name, "is_true") || name_is(name, "is_false")) {  // (bool) -> Unit
+        tk_type ft = { .tag = TK_TYPE_FUNC,
+                       .as.func = { .params = &bool_t, .nparams = 1, .ret = &unit_t } };
+        return (tk_type_result){ .ok = true, .as.value = ft };
+    }
+    if (name_is(name, "str_contains")) {                          // (str, str) -> Unit
+        tk_type ft = { .tag = TK_TYPE_FUNC,
+                       .as.func = { .params = str2_t, .nparams = 2, .ret = &unit_t } };
         return (tk_type_result){ .ok = true, .as.value = ft };
     }
     return (tk_type_result){ .ok = false, .as.error = tk_error_make("not a built-in function") };

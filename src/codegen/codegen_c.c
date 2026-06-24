@@ -155,6 +155,51 @@ static const char *binop_c(tk_token_kind op) {
     }
 }
 
+// =========================================================================
+// F3 GUARDS (M.1 — fail loud): the prim helpers that pick the right runtime
+// guard. Integer prims only; bool is never a guard target.
+// =========================================================================
+static bool prim_is_int(tk_prim_kind k) { return k != TK_PRIM_BOOL; }
+static bool prim_is_signed(tk_prim_kind k) {
+    switch (k) {
+        case TK_PRIM_I8: case TK_PRIM_I16: case TK_PRIM_I32: case TK_PRIM_I64: return true;
+        default: return false;
+    }
+}
+// rank: bit-width ordinal (8/16/32/64) for narrowing analysis.
+static int prim_width(tk_prim_kind k) {
+    switch (k) {
+        case TK_PRIM_U8:  case TK_PRIM_I8:  return 8;
+        case TK_PRIM_U16: case TK_PRIM_I16: return 16;
+        case TK_PRIM_U32: case TK_PRIM_I32: return 32;
+        case TK_PRIM_U64: case TK_PRIM_I64: return 64;
+        case TK_PRIM_BOOL: return 1;
+    }
+    return 0;
+}
+// The width tag ("u8".."i64") used to name a div/mod helper, e.g. tk_div_u32.
+static const char *prim_div_tag(tk_prim_kind k) {
+    switch (k) {
+        case TK_PRIM_U8:  return "u8";  case TK_PRIM_U16: return "u16";
+        case TK_PRIM_U32: return "u32"; case TK_PRIM_U64: return "u64";
+        case TK_PRIM_I8:  return "i8";  case TK_PRIM_I16: return "i16";
+        case TK_PRIM_I32: return "i32"; case TK_PRIM_I64: return "i64";
+        case TK_PRIM_BOOL: return NULL;
+    }
+    return NULL;
+}
+
+// A cast src->dst may lose data (needs a runtime guard) when SOME value of the
+// source type falls outside the destination's representable range. Conservative:
+// if we can't prove the source range ⊆ dest range, guard.
+static bool cast_may_lose(tk_prim_kind src, tk_prim_kind dst) {
+    bool ss = prim_is_signed(src), ds = prim_is_signed(dst);
+    int sw = prim_width(src), dw = prim_width(dst);
+    if (ss == ds)          return sw > dw;          // same signedness: only true narrowing loses
+    if (!ss && ds)         return sw >= dw;         // u->i: dest loses one bit of magnitude at equal width
+    /* ss && !ds */        return true;             // i->u: negatives never fit
+}
+
 static const char *unop_c(tk_token_kind op) {
     switch (op) {
         case TK_TOKEN_MINUS: return "-";
@@ -207,7 +252,28 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
             return true;
 
         case TK_TEXPR_BINARY: {
-            const char *op = binop_c(e->as.binary.op);
+            tk_token_kind bop = e->as.binary.op;
+            // F3 (M.1): `/` and `%` go through a checked runtime helper that PANICS on a
+            // zero divisor instead of UB/SIGFPE. Single-eval: each operand emitted once,
+            // passed by value. The helper width comes from the node's result prim.
+            if (bop == TK_TOKEN_SLASH || bop == TK_TOKEN_PERCENT) {
+                if (e->type.tag != TK_TYPE_PRIM)
+                    return fail_node(err, "codegen: division/modulo on a non-primitive type not yet supported");
+                const char *tag = prim_div_tag(e->type.as.prim);
+                if (tag == NULL)
+                    return fail_node(err, "codegen: division/modulo on a non-integer type not yet supported");
+                cb(b, bop == TK_TOKEN_SLASH ? "tk_div_" : "tk_mod_");
+                cb(b, tag);
+                cb(b, "(");
+                if (!emit_expr(b, e->as.binary.left, err)) return false;
+                cb(b, ", ");
+                if (!emit_expr(b, e->as.binary.right, err)) return false;
+                cb(b, ")");
+                return true;
+            }
+            // NOTE (out of scope): +,-,* stay plain C — overflow guarding is DEFERRED to
+            // build profiles (panic-debug / wrap-release), which don't exist yet.
+            const char *op = binop_c(bop);
             if (op == NULL) return fail_node(err, "codegen: binary operator not yet supported");
             cb(b, "(");
             if (!emit_expr(b, e->as.binary.left, err)) return false;
@@ -251,10 +317,30 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
         }
 
         case TK_TEXPR_CAST: {
+            // F3 (M.1): a narrowing `x to T` is range-checked at runtime and PANICS if the
+            // value doesn't fit T. Widening / same-type casts where no loss is possible
+            // emit the plain C cast (no needless guard). Single-eval: operand emitted once.
+            const tk_texpr *inner = e->as.cast.expr;
+            bool guard = e->type.tag == TK_TYPE_PRIM && inner->type.tag == TK_TYPE_PRIM
+                      && prim_is_int(e->type.as.prim) && prim_is_int(inner->type.as.prim)
+                      && cast_may_lose(inner->type.as.prim, e->type.as.prim);
+            if (guard) {
+                tk_prim_kind dst = e->type.as.prim, src = inner->type.as.prim;
+                const char *dtag = prim_div_tag(dst);   // reuse the "u8".."i64" tag table
+                if (dtag == NULL) return fail_node(err, "codegen: cast to a non-integer type not yet supported");
+                // Carrier picked by SOURCE signedness so it holds the source losslessly:
+                //   signed source -> int64_t carrier ("_s"); unsigned -> uint64_t ("_u").
+                cb(b, "tk_to_");
+                cb(b, dtag);
+                cb(b, prim_is_signed(src) ? "_s(" : "_u(");
+                if (!emit_expr(b, inner, err)) return false;
+                cb(b, ")");
+                return true;
+            }
             cb(b, "((");
             if (!emit_type(b, e->type, err)) return false;   // target rides the node's .type
             cb(b, ")(");
-            if (!emit_expr(b, e->as.cast.expr, err)) return false;
+            if (!emit_expr(b, inner, err)) return false;
             cb(b, "))");
             return true;
         }
