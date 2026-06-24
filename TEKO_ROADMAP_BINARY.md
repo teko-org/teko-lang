@@ -76,12 +76,14 @@ ast.h/result.h como headers reais + `tk_expr`/helpers/corpos → B0d `tk_str_eq`
 
 | # | Entrega | Lei | Esf. |
 |---|---|---|---|
-| B1a | **IO** — ler um arquivo do disco → `str` (a fronteira **insegura** do host; o único `unsafe`/FFI do bootstrap) | M.1 (contida) | P |
-| B1b | **`.tkp` reader** — parser TOML → `Artifact`/`source`/`[dependencies]`; fiar `check_main_file_rule` (executável exige `main.tks`) | M.3 | M |
-| B1c | **R-main** — reconciliar `MainFile`/`Module` (parser) ↔ o driver do checker (`Program`/`Item`): montar o *virtual-main* e checar o AST real (fecha o gap nomeado) | M.4 | M |
-| B1d | **Driver** — `compile(path)` = read→lex→parse→check; `main()` C fia tudo (erros → stderr + exit code) | M.4 | M |
+| B1a ✓ | **IO** — **feito**: `tk_read_file` (host `fopen`/`fread` → `tk_str_from_utf8`, a única IO contida do bootstrap, M.1) em `src/driver.c` | M.1 | P |
+| B1b | **`.tkp` reader** — parser TOML → `Artifact`/`source`/`[dependencies]`; fiar `check_main_file_rule`. **Deferido** (hoje o driver escolhe `parse_main_file`/`parse_module` pelo basename `main.tks`) | M.3 | M |
+| B1c ✓ | **R-main** — **feito**: `tk_main_file_to_program`/`tk_module_to_program` achatam `MainFile`/`Module` em `tk_program` de `tk_item` (uses→USE, body→STATEMENT, decls→FUNCTION/TYPE_DECL). Sem tensão (flatten fiel) | M.4 | M |
+| B1d ✓ | **Driver** — **feito**: `tk_compile(path)` = read→lex→parse→reconcile→`tk_type_program`; `main()` mínimo (`tekoc <file>`); erros→stderr+exit 1, OK→stdout+exit 0. `tekoc` linkado contra `libteko_bootstrap.a` | M.4 | M |
 
-**Marco F1:** `tekoc main.tks` lexa+parseia+checa um arquivo trivial e reporta erros (ainda sem saída executável).
+> **F1 CONCLUÍDO ✅:** `tekoc` é um **front-end real** — `read→lex→parse→reconcile→check` end-to-end, verificado:
+> `let x: u32 = 1` / `200 to u8` → `checked OK`; `let y: u8 = 999` (fora de faixa, M.1) e erro de parse →
+> reportados com mensagem + exit 1; `main.tks` vazio → OK (0 items). *(`.tkp` reader = B1b, deferido.)*
 
 ## Fase 2 — Backend: transpile-para-C (TC)
 

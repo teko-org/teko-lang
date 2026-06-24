@@ -67,9 +67,9 @@ add_library(teko_bootstrap STATIC
     ${TEKO_CHECKER_SOURCES}
     ${TEKO_EMIT_SOURCES})
 
-# --- F-1: build smoke / driver skeleton --------------------------------------
-# A standalone, ALWAYS-built entry that proves the toolchain + CMake configure/compile/
-# link/run end-to-end, independent of the (still-incomplete) mirror library above. F1
-# grows this into the real driver (read->lex->parse->check->emit-C) once F0 makes the
-# mirror compile and it can be linked in.
-add_executable(tekoc src/main.c)
+# --- F1: the driver — path-to-first-binary -----------------------------------
+# `tekoc` is now the REAL driver: read -> lex -> parse -> reconcile -> check, wired in
+# src/driver.c and linked against the bootstrap mirror library. (Codegen/emit is F2;
+# success here means the front-end pipeline ran and the program type-checked.)
+add_executable(tekoc src/main.c src/driver.c)
+target_link_libraries(tekoc PRIVATE teko_bootstrap)
