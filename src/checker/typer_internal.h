@@ -21,6 +21,7 @@ tk_type tk_tblock_type(tk_tstatement *stmts, size_t n);
 // trailing if/match whose every branch/arm diverges.) Match-as-value unification skips
 // diverging arms (B.20). Defined in expr.c.
 bool tk_tblock_diverges(const tk_tstatement *stmts, size_t n);
+bool tk_texpr_diverges(const tk_texpr *e);   // a panic/exit call (diverges — legislator's ruling: no `never` type)
 
 // one typed match arm (pattern extends env; `when` guard bool; body typed).
 // Defined in expr.c (helper of the match VALUE form); typer.c's match STATEMENT

@@ -183,6 +183,28 @@ static tk_texpr_result type_call(tk_call c, tk_env env, tk_type_table table) {
     tk_texpr_result lb;
     if (type_list_builtin(c, env, table, &lb)) return lb;   // teko::list::empty / push (generic)
     tk_str name = c.callee.segments[c.callee.len - 1].name;
+    // panic / exit — injected GLOBAL diverging builtins (legislator's ruling — NO `never` type).
+    // panic(error | str) = the message; exit(<integer>) = the status code. Both terminate the
+    // program; the call's STATIC type is void, but tk_texpr_diverges accepts it in any value
+    // position (type_coalesce / tk_tblock_diverges). Unqualified, and not shadowed by a local.
+    if (c.callee.len == 1 && !tk_env_lookup(env, name).ok) {
+        bool is_panic = seg_lit(name, "panic");
+        if (is_panic || seg_lit(name, "exit")) {
+            if (c.nargs != 1) return xerr(is_panic ? "panic expects one argument (an `error` or a `str`)"
+                                                    : "exit expects one argument (an integer status code)");
+            tk_texpr_result a = tk_typer_expr(c.args[0], env, table); if (!a.ok) return a;
+            if (is_panic) {
+                if (a.as.value.type.tag != TK_TYPE_STR && a.as.value.type.tag != TK_TYPE_ERROR)
+                    return xerr("panic's argument must be an `error` or a `str`");
+            } else {
+                if (!(a.as.value.type.tag == TK_TYPE_PRIM && tk_prim_is_int(a.as.value.type.as.prim)))
+                    return xerr("exit's argument must be an integer status code");
+            }
+            tk_texpr_list args = tk_texpr_list_empty(); args = tk_texpr_list_push(args, a.as.value);
+            return xok((tk_texpr){ .tag = TK_TEXPR_CALL, .type = (tk_type){ .tag = TK_TYPE_VOID },
+                                   .as.call = { c.callee, args.ptr, args.len } });
+        }
+    }
     tk_type_result ftr = tk_env_lookup(env, name);   // user functions resolve first;
     if (!ftr.ok) ftr = tk_builtin_fn(name);          // injected, non-shadowable stdlib is the fallback
     if (!ftr.ok) return xferr(ftr.as.error);
@@ -409,6 +431,11 @@ static tk_texpr_result type_coalesce(tk_coalesce co, tk_env env, tk_type_table t
     }
     tk_texpr_result r = tk_typer_expr(*co.right, env, table); if (!r.ok) return r;
     tk_type rt = r.as.value.type;
+    // A DIVERGING fallback (panic/exit) never produces a value — accept it for any left type;
+    // the result is the unwrapped `T` (the present-case value). (No `never` type — legislator.)
+    if (tk_texpr_diverges(&r.as.value))
+        return xok((tk_texpr){ .tag = TK_TEXPR_COALESCE, .type = unwrapped,
+                               .as.coalesce = { box(l.as.value), box(r.as.value) } });
     if (tk_type_is_void(&rt)) return xerr("a `void` expression cannot be the `??` fallback (M.1)");
     if (tk_type_eq(&rt, &unwrapped))   // `T? ?? T` ⇒ T (the common, unwrapping case)
         return xok((tk_texpr){ .tag = TK_TEXPR_COALESCE, .type = unwrapped,
@@ -567,10 +594,22 @@ tk_type tk_tblock_type(tk_tstatement *stmts, size_t n) {
     return tk_void_t();
 }
 
+// ---- a DIVERGING expression: a call to the injected global builtins `panic` / `exit` ----
+// (legislator's ruling — NO `never` type). Such a call terminates the whole program, so it
+// produces no value and may stand in for ANY type at a value position (`x ?? panic(…)`, a
+// return, a binding RHS). Recognized structurally: an unqualified `panic`/`exit` call.
+bool tk_texpr_diverges(const tk_texpr *e) {
+    if (e->tag != TK_TEXPR_CALL) return false;
+    if (e->as.call.callee.len != 1) return false;   // the GLOBAL builtins are unqualified
+    tk_str last = e->as.call.callee.segments[0].name;
+    return seg_lit(last, "panic") || seg_lit(last, "exit");
+}
+
 // ---- does a typed block DIVERGE (exit via return/break/continue on every path)? ----
-// A block diverges when its trailing statement is a return/break/continue, OR a trailing
-// `if` (with else) / `match` whose every branch / arm diverges. Such a block yields no
-// trailing value, so match-as-value unification (and the if value form) skips it (B.20).
+// A block diverges when its trailing statement is a return/break/continue, a trailing
+// panic/exit call, OR a trailing `if` (with else) / `match` whose every branch / arm diverges.
+// Such a block yields no trailing value, so match-as-value unification (and the if value form)
+// skips it (B.20).
 bool tk_tblock_diverges(const tk_tstatement *stmts, size_t n) {
     if (n == 0) return false;
     const tk_tstatement *last = &stmts[n - 1];
@@ -581,6 +620,7 @@ bool tk_tblock_diverges(const tk_tstatement *stmts, size_t n) {
             return true;
         case TK_TSTMT_EXPR: {
             const tk_texpr *x = &last->as.expr_stmt.expr;
+            if (tk_texpr_diverges(x)) return true;   // a trailing panic/exit call diverges
             if (x->tag == TK_TEXPR_IF) {
                 if (!x->as.if_expr.has_else) return false;   // the false path falls through
                 return tk_tblock_diverges(x->as.if_expr.then_blk, x->as.if_expr.nthen)

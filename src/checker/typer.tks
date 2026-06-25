@@ -150,6 +150,28 @@ fn type_call(c: parser::Call, env: Env, table: TypeTable) -> TExpr | error {
         NotListBuiltin => { }                  // not a list builtin → fall through to the ordinary call
     }
     let name = c.callee.segments[c.callee.segments.len - 1].name
+    // panic / exit — injected GLOBAL diverging builtins (legislator's ruling — NO `never` type).
+    // panic(error | str) = the message; exit(<integer>) = the status code. Both terminate the
+    // program; the call's STATIC type is void, but texpr_diverges accepts it in any value position.
+    let in_env = match lookup(env, name) { Type => true; error => false }
+    if c.callee.segments.len == 1 && !in_env {
+        if name == "panic" {
+            if c.args.len != 1 { return error { message = "panic expects one argument (an `error` or a `str`)" } }
+            let a = match type_expr(c.args[0], env, table) { TExpr as te => te; error as e => return e }
+            let ok = match a.type { Str => true; Error => true; _ => false }
+            if !ok { return error { message = "panic's argument must be an `error` or a `str`" } }
+            mut pargs = teko::list::push(teko::list::empty(), a)
+            return TExpr { kind = TCall { callee = c.callee; args = pargs }; type = Void { } }
+        }
+        if name == "exit" {
+            if c.args.len != 1 { return error { message = "exit expects one argument (an integer status code)" } }
+            let a = match type_expr(c.args[0], env, table) { TExpr as te => te; error as e => return e }
+            let ok = match a.type { Prim as p => prim_is_int(p.kind); _ => false }
+            if !ok { return error { message = "exit's argument must be an integer status code" } }
+            mut eargs = teko::list::push(teko::list::empty(), a)
+            return TExpr { kind = TCall { callee = c.callee; args = eargs }; type = Void { } }
+        }
+    }
     let ft = match lookup(env, name) { Type as t => t; error as e => return e }
     match ft {
         Func as f => {
@@ -378,6 +400,9 @@ fn type_coalesce(co: parser::Coalesce, env: Env, table: TypeTable) -> TExpr | er
         _ => {}
     }
     let r = match type_expr(co.right, env, table) { TExpr as te => te; error as e => return e }
+    // A DIVERGING fallback (panic/exit) never produces a value — accept it for any left type; the
+    // result is the unwrapped `T` (the present-case value). (No `never` type — legislator's ruling.)
+    if texpr_diverges(r) { return TExpr { kind = TCoalesce { left = l; right = r }; type = unwrapped } }
     if type_eq(r.type, unwrapped) {   // `T? ?? T` ⇒ T (the unwrapping case)
         return TExpr { kind = TCoalesce { left = l; right = r }; type = unwrapped }
     }
@@ -538,13 +563,25 @@ fn tblock_type(stmts: []TStatement) -> Type {
 // True when its trailing statement is a return/break/continue, OR a trailing `if`-with-else
 // / `match` whose every branch / arm diverges. Such a block yields NO trailing value, so
 // match-as-value unification (type_match) skips it (B.20).
+// A panic/exit call DIVERGES (terminates the program — legislator's ruling: no `never` type), so
+// its result may stand in for ANY type at a value position. Recognized structurally (the injected
+// global builtins panic/exit, unqualified).
+fn texpr_diverges(e: TExpr) -> bool {
+    match e.kind {
+        TCall as c => c.callee.segments.len == 1 && (c.callee.segments[0].name == "panic" || c.callee.segments[0].name == "exit")
+        _          => false
+    }
+}
+
 fn tblock_diverges(stmts: []TStatement) -> bool {
     if stmts.len == 0 { return false }
     match stmts[stmts.len - 1] {
         TReturn        => true
         TBreakStmt     => true
         TContinueStmt  => true
-        TExprStmt as es => match es.expr.kind {
+        TExprStmt as es => {
+            if texpr_diverges(es.expr) { return true }   // a trailing panic/exit call diverges
+            match es.expr.kind {
             TIfExpr as f    => f.has_else && tblock_diverges(f.then_blk) && tblock_diverges(f.else_blk)
             TMatchExpr as m => {
                 if m.arms.len == 0 { return false }
@@ -557,6 +594,7 @@ fn tblock_diverges(stmts: []TStatement) -> bool {
                 true
             }
             _ => false
+            }
         }
         _ => false
     }
