@@ -533,6 +533,33 @@ fn type_interp(in: parser::Interp, env: Env, table: TypeTable) -> TExpr | error 
 }
 
 // ---- the expression dispatch (the evolved check_expr) ----
+// `Enum::Member` as a VALUE — the enum type (path minus the member) resolved to an `enum` decl,
+// the member checked, the node typed NAMED(enum) carrying enum name + member ORDINAL (so both
+// backends lower without re-lookup). C twin: type_path_expr in expr.c.
+fn type_path_expr(pe: parser::PathExpr, table: TypeTable) -> TExpr | error {
+    let p = pe.path
+    if p.segments.len < 2 { return error { message = "a path expression must name an enum member (`Enum::Member`)" } }
+    let member = p.segments[p.segments.len - 1].name
+    mut segs = teko::list::empty()                  // the enum type = the path minus its last segment
+    mut i: u64 = 0
+    loop {
+        if i >= p.segments.len - 1 { break }
+        segs = teko::list::push(segs, p.segments[i])
+        i++
+    }
+    let et = match resolve_named(parser::Path { segments = segs }, table) { Type as t => t; error as e => return e }
+    let ename = match et { Named as n => n.name; _ => return error { message = "`Enum::Member` requires a named enum type" } }
+    let decl = match type_table_find(table, ename) { parser::TypeDecl as td => td; error => return error { message = $"unknown type in an `Enum::Member` path: {ename}" } }
+    let eb = match decl.body { parser::EnumBody as e => e; _ => return error { message = $"`{ename}::{member}` requires an `enum` type" } }
+    mut j: u64 = 0
+    loop {
+        if j >= eb.members.len { break }
+        if eb.members[j] == member { return TExpr { kind = TPathExpr { enum_name = ename; member = member; ordinal = j }; type = et } }
+        j++
+    }
+    error { message = $"no member `{member}` in enum `{ename}`" }
+}
+
 fn type_expr(e: parser::Expr, env: Env, table: TypeTable) -> TExpr | error {
     match e {
         parser::Number as n    => type_number(n)
@@ -552,7 +579,7 @@ fn type_expr(e: parser::Expr, env: Env, table: TypeTable) -> TExpr | error {
         parser::Coalesce as co => type_coalesce(co, env, table)
         parser::Cast as c      => type_cast(c, env, table)
         parser::MethodCall     => error { message = "method typing is deferred (B.29 / M.4)" }
-        parser::PathExpr       => error { message = "path-expr typing pending (Enum::Member)" }
+        parser::PathExpr as pe => type_path_expr(pe, table)   // Enum::Member as a value
         parser::StructLit as sl => type_struct_lit(sl, env, table)   // W4a
         parser::Index as ix    => type_index(ix, env, table)        // W5-idx
         parser::Interp as in   => type_interp(in, env, table)       // $"…{expr}…"

@@ -1046,6 +1046,15 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
             return true;
         }
 
+        case TK_TEXPR_PATH:
+            // Enum::Member as a VALUE → the C enum constant `TK_E_<UPPER enum>_<UPPER member>`
+            // (the SAME spelling codegen's enum-decl emitter gives each member).
+            cb(b, "TK_E_");
+            cb_upper(b, e->as.path.enum_name);
+            cb(b, "_");
+            cb_upper(b, e->as.path.member);
+            return true;
+
         case TK_TEXPR_INDEX: {
             // W5-idx — `recv[index]`. A `str` receiver lowers to a BOUNDS-CHECKED byte access
             // as a GNU statement-expression (single-eval of recv + idx, then the guard):

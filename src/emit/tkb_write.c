@@ -109,6 +109,11 @@ tk_bytes tk_write_texpr(tk_bytes b, tk_strtable t, const tk_texpr *te) {
             for (size_t i = 0; i < te->as.interp.nholes; i += 1)
                 b = tk_write_texpr(b, t, &te->as.interp.holes[i]);            // hole value
             return b;
+        case TK_TEXPR_PATH:                                                  // value-level Enum::Member — enum name, member, ordinal
+            b = tk_write_u8(b, 19);
+            b = tk_write_u32(b, tk_st_find(t, te->as.path.enum_name));
+            b = tk_write_u32(b, tk_st_find(t, te->as.path.member));
+            return tk_write_u64(b, (uint64_t)te->as.path.ordinal);
     }
     return b;
 }

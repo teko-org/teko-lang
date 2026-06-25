@@ -561,6 +561,29 @@ static tk_texpr_result type_if(tk_if_expr f, tk_env env, tk_type_table table);
 static tk_texpr_result type_match(tk_match_expr m, tk_env env, tk_type_table table);
 
 // ---- the expression dispatch (the evolved check_expr) ----
+// ---- `Enum::Member` as a VALUE (value-level enum paths) ----
+// The path is the enum type (all but the last segment) + the member (last segment). Resolve the
+// enum decl, verify it is an `enum` and the member exists, and type the node as the NAMED enum —
+// carrying the resolved enum name + member ordinal so both backends lower without re-lookup.
+static tk_texpr_result type_path_expr(tk_path_expr pe, tk_type_table table) {
+    tk_path p = pe.path;
+    if (p.len < 2) return xerr("a path expression must name an enum member (`Enum::Member`)");
+    tk_str member = p.segments[p.len - 1].name;
+    tk_path enum_path = { .segments = p.segments, .len = p.len - 1 };   // the enum type = path minus the member
+    tk_type_result et = resolve_named(enum_path, table);
+    if (!et.ok) return xferr(et.as.error);
+    if (et.as.value.tag != TK_TYPE_NAMED) return xerr("`Enum::Member` requires a named enum type");
+    tk_decl_result decl = tk_type_table_find(table, et.as.value.as.named.name);
+    if (!decl.ok) return xerr("unknown type in an `Enum::Member` path");
+    if (decl.as.value.body.tag != TK_BODY_ENUM) return xerr("`Type::Member` requires an `enum` type");
+    tk_enum_body eb = decl.as.value.body.as.enum_body;
+    for (size_t i = 0; i < eb.n_members; i += 1)
+        if (tk_str_eq(eb.members[i], member))
+            return xok((tk_texpr){ .tag = TK_TEXPR_PATH, .type = et.as.value,
+                                   .as.path = { et.as.value.as.named.name, member, (uint64_t)i } });
+    return xerr("no such member in the enum");
+}
+
 tk_texpr_result tk_typer_expr(tk_expr e, tk_env env, tk_type_table table) {
     switch (e.tag) {
         case TK_EXPR_NUMBER: {
@@ -601,7 +624,7 @@ tk_texpr_result tk_typer_expr(tk_expr e, tk_env env, tk_type_table table) {
         case TK_EXPR_COALESCE:     return type_coalesce(e.as.coalesce, env, table);
         case TK_EXPR_CAST:         return type_cast(e.as.cast, env, table);
         case TK_EXPR_METHOD_CALL:  return xerr("method typing is deferred (B.29 / M.4)");
-        case TK_EXPR_PATH:         return xerr("path-expr typing pending (Enum::Member)");
+        case TK_EXPR_PATH:         return type_path_expr(e.as.path, table);   // Enum::Member as a value
         case TK_EXPR_STRUCT_LIT:   return type_struct_lit(e.as.struct_lit, env, table);   // W4a
         case TK_EXPR_INDEX:        return type_index(e.as.index, env, table);            // W5-idx
         case TK_EXPR_INTERP:       return type_interp(e.as.interp, env, table);          // $"…{expr}…"

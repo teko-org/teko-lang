@@ -166,6 +166,12 @@ tk_texpr tk_read_texpr(tk_reader *r, tk_strs t) {
             e.as.interp.holes  = holes;  e.as.interp.nholes  = nh;
             return e;
         }
+        case 19:                                                                /* value-level Enum::Member — enum name, member, ordinal */
+            e.tag = TK_TEXPR_PATH;
+            e.as.path.enum_name = tk_read_str(r, t);
+            e.as.path.member    = tk_read_str(r, t);
+            e.as.path.ordinal   = tk_read_u64(r);
+            return e;
     }
     r->ok = false; return e;
 }

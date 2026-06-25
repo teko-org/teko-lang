@@ -37,6 +37,7 @@ tk_check_result tk_validate_texpr(const tk_texpr *te) {
             if (te->type.tag != TK_TYPE_OPTIONAL) return cfail("corrupt: `null` typed as a non-optional");
             return cok();
         case TK_TEXPR_VAR:    return cok();                          // env-dependent → trust
+        case TK_TEXPR_PATH:   return cok();                          // Enum::Member — enum/ordinal resolved by the checker → trust
         case TK_TEXPR_CALL: {
             for (size_t i = 0; i < te->as.call.nargs; i += 1) {
                 tk_check_result r = tk_validate_texpr(&te->as.call.args[i]);

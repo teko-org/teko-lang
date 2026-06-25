@@ -972,6 +972,8 @@ static tk_value tk_vm_eval_expr(const tk_texpr *e, tk_venv *env) {
         }
         case TK_TEXPR_STR:  return v_str(e->as.str.text);
         case TK_TEXPR_BYTE: return v_int((uint64_t)e->as.byte.value, false, 8);   // byte == u8 rep
+        case TK_TEXPR_PATH: return v_int((unsigned __int128)e->as.path.ordinal, false, 64);   // Enum::Member → its ordinal (u64); codegen's C enum auto-numbers identically
+
         // bool literal (W2) — FULL support (bool already flows through the value model).
         case TK_TEXPR_BOOL: return v_bool(e->as.boolean.value);
         case TK_TEXPR_BINARY:       return eval_binary(e, env);
