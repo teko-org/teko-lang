@@ -25,5 +25,8 @@ tk_texpr_result tk_xferr(tk_error e);
 // C6 — an annotated binding whose value type ≠ T (reuses value_fits). NULL = ok.
 // Lives with the cast/range machinery in expr.c; consumed by typer.c's type_binding.
 const char *annotated_literal_reason(tk_expr value, tk_type ann);
+// C6 (extended) — a fitting numeric literal adopts the destination type (return/trailing/binding);
+// int-literal → a prim it fits or `byte` (=u8); float-literal → a fitting float prim. Over the TYPED node.
+bool tk_literal_adopts(tk_texpr e, tk_type to);
 
 #endif // TK_CHECK_EXPR_H

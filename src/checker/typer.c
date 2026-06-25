@@ -194,7 +194,8 @@ static const char *check_return_stmt(const tk_tstatement *s, tk_type ret, tk_typ
     switch (s->tag) {
         case TK_TSTMT_RETURN:
             if (s->as.ret.has_value)
-                return assignable_to(s->as.ret.value.type, ret, table) ? NULL
+                return (assignable_to(s->as.ret.value.type, ret, table)
+                        || tk_literal_adopts(s->as.ret.value, ret)) ? NULL   // a fitting int/float/byte literal adopts the return type (C6)
                      : "return value does not match the function's declared return type";
             return tk_type_is_void(&ret) ? NULL
                  : "bare `return` in a function that declares a value-returning (non-void) return type";
@@ -211,7 +212,8 @@ static const char *check_trailing_value(const tk_tstatement *stmts, size_t n, tk
     if (n == 0) return NULL;
     const tk_tstatement *last = &stmts[n - 1];
     if (last->tag != TK_TSTMT_EXPR) return NULL;   // trailing loop/if/match → no claim (guard)
-    return assignable_to(last->as.expr_stmt.expr.type, ret, table) ? NULL
+    return (assignable_to(last->as.expr_stmt.expr.type, ret, table)
+            || tk_literal_adopts(last->as.expr_stmt.expr, ret)) ? NULL   // a fitting trailing literal adopts the return type (C6)
          : "the function's final expression does not match its declared return type";
 }
 

@@ -854,11 +854,27 @@ fn check_returns(stmts: []TStatement, ret: Type, table: TypeTable) -> error? {
     null
 }
 
+// C6 (extended) — a fitting numeric LITERAL adopts the destination type (return value / trailing
+// expr): int-literal → an int prim it fits OR `byte` (=u8, B.36); float-literal → a fitting float
+// prim. Reuses cast_kind (byte AS u8) + value_fits / float_fits — the same range rules as a binding.
+fn literal_adopts(e: TExpr, to: Type) -> bool {
+    match e.kind {
+        TNumber as n => match cast_kind(to) {
+            PrimKind as k => {
+                if n.is_float { prim_is_float(k) && float_fits(n.fval, k) }
+                else { prim_is_int(k) && value_fits(n.value, k) }
+            }
+            error => false
+        }
+        _ => false
+    }
+}
+
 fn check_return_stmt(s: TStatement, ret: Type, table: TypeTable) -> error? {
     match s {
         TReturn as r => {
             if r.has_value {
-                if assignable_to(r.value.type, ret, table) { null }
+                if assignable_to(r.value.type, ret, table) || literal_adopts(r.value, ret) { null }   // a fitting int/float/byte literal adopts the return type (C6)
                 else { error { message = "return value does not match the function's declared return type" } }
             } else {
                 if type_is_void(ret) { null }   // a bare `return` is legal iff the function returns no value (M.3)
@@ -898,7 +914,7 @@ fn check_trailing_value(stmts: []TStatement, ret: Type, table: TypeTable) -> err
     if stmts.len == 0 { return null }
     match stmts[stmts.len - 1] {
         TExprStmt as es => {
-            if assignable_to(es.expr.type, ret, table) { null }
+            if assignable_to(es.expr.type, ret, table) || literal_adopts(es.expr, ret) { null }   // a fitting trailing literal adopts the return type (C6)
             else { error { message = "the function's final expression does not match its declared return type" } }
         }
         _ => null

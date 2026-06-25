@@ -314,6 +314,18 @@ static const char *cast_reason(tk_type from, tk_type to) {
 }
 bool tk_cast_ok(tk_type from, tk_type to) { return cast_reason(from, to) == NULL; }
 
+// C6 (extended) — a fitting numeric LITERAL adopts the destination type at a value position
+// (return value / trailing expr / binding): an int literal → an int prim it fits, OR `byte`
+// (byte = u8, B.36); a float literal → a float prim it fits. Reuses cast_kind (byte AS u8) +
+// value_fits / float_fits — the same range rules as a binding annotation or a `… to T` target.
+bool tk_literal_adopts(tk_texpr e, tk_type to) {
+    if (e.tag != TK_TEXPR_NUMBER) return false;
+    tk_prim_kind k;
+    if (!cast_kind(to, &k)) return false;   // `to` must be numeric (a prim, or byte→u8)
+    if (e.as.number.is_float) return tk_prim_is_float(k) && float_fits(e.as.number.fval, k);
+    return tk_prim_is_int(k) && value_fits(e.as.number.value, k);
+}
+
 static tk_texpr_result type_cast(tk_cast c, tk_env env, tk_type_table table) {
     tk_texpr_result inner = tk_typer_expr(*c.expr, env, table); if (!inner.ok) return inner;
     if (tk_type_is_void(&inner.as.value.type)) return xerr("a `void` expression cannot be cast (M.1)");
