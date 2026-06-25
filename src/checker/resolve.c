@@ -2,6 +2,15 @@
 #include "resolve.h"
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>     // snprintf — named error messages
+
+// Build a checker error "<msg>: <name>" — names the offending symbol (M.3 — clarify, never vague).
+tk_error tk_error_named(const char *msg, tk_str name) {
+    size_t len = strlen(msg) + name.len + 4;
+    char *buf = tk_alloc(len); if (!buf) abort();
+    snprintf(buf, len, "%s: %.*s", msg, (int)name.len, (const char *)name.ptr);
+    return tk_error_make(buf);
+}
 
 static bool name_eq(tk_str a, tk_str b) {
     return a.len == b.len && memcmp(a.ptr, b.ptr, a.len) == 0;
@@ -49,7 +58,7 @@ tk_type_result resolve_named(tk_path path, tk_type_table table) {
         tk_type t = { .tag = TK_TYPE_NAMED, .as.named.name = name };
         return (tk_type_result){ .ok = true, .as.value = t };
     }
-    return (tk_type_result){ .ok = false, .as.error = tk_error_make("unknown type") };
+    return (tk_type_result){ .ok = false, .as.error = tk_error_named("unknown type", name) };
 }
 
 // A NAMED type referring to a `variant` decl → its expanded TK_TYPE_VARIANT. A variant decl's

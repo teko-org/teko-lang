@@ -15,6 +15,28 @@
 
 #include <stdio.h>
 #include <string.h>     // strlen, strcmp, strrchr, memcpy
+#include <signal.h>     // signal — fatal-signal handler (crash stack traces)
+#include <execinfo.h>   // backtrace, backtrace_symbols_fd
+#include <stdlib.h>     // _Exit (async-signal-safe)
+
+// CRASH STACK TRACE (M.1/M.3 — fail loud, be honest about WHERE). On a fatal signal (a genuine
+// internal compiler bug — a NULL/OOB deref, a bad arithmetic), print a C stack trace to stderr and
+// exit 128+signo, instead of dying silently with a bare exit code. NOT SIGABRT: abort() is the
+// INTENTIONAL honest-barrier path (tk_panic / *_unsupported already printed their message). Uses
+// backtrace_symbols_fd (async-signal-safe; no malloc).
+static void tk_crash_handler(int sig) {
+    void *frames[64];
+    int n = backtrace(frames, 64);
+    fputs("\nteko: FATAL signal — internal compiler crash (M.1). C stack trace:\n", stderr);
+    backtrace_symbols_fd(frames, n, 2 /* stderr */);
+    _Exit(128 + sig);
+}
+static void tk_install_crash_handler(void) {
+    signal(SIGSEGV, tk_crash_handler);
+    signal(SIGBUS,  tk_crash_handler);
+    signal(SIGILL,  tk_crash_handler);
+    signal(SIGFPE,  tk_crash_handler);
+}
 
 static void usage(void) {
     fputs("usage: teko build <projdir>   build the project to a native binary\n"
@@ -64,6 +86,7 @@ static int reject_file_arg(void) {
 }
 
 int main(int argc, char **argv) {
+    tk_install_crash_handler();   // a crash prints a C stack trace, not a silent exit (M.1)
     if (argc < 2) { usage(); return 2; }
 
     const char *cmd = argv[1];

@@ -14,6 +14,9 @@ TK_LIST(tk_type_reg, tk_type_table);
 
 TK_RESULT(tk_type_decl, tk_decl_result);   // TypeDecl | error
 
+// Build a checker error "<msg>: <name>" — names the offending symbol (M.3 — clarify, never vague).
+tk_error tk_error_named(const char *msg, tk_str name);
+
 tk_decl_result tk_type_table_find(tk_type_table table, tk_str name);
 tk_type_result tk_resolve_type(tk_type_expr te, tk_type_table table);
 tk_type_result resolve_named(tk_path path, tk_type_table table);   // shared with match.c (C7)
