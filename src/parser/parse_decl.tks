@@ -1,5 +1,7 @@
 // src/parser/parse_decl.tks   (namespace 'teko::parser')
 
+use teko::lexer
+
 // `( name: T, name: T, … )` — comma-separated params; empty `()` allowed; params are
 // immutable (B.21). `pos` is at `(`.
 fn parse_params(tokens: []lexer::Token, pos: u64) -> ParsedParams | error {
@@ -10,11 +12,11 @@ fn parse_params(tokens: []lexer::Token, pos: u64) -> ParsedParams | error {
     }
     loop {
         if !is_kind_at(tokens, p, lexer::TokenKind::Ident) {
-            return error { message = "expected a parameter name" }
+            return err_at(tokens, p, "expected a parameter name")
         }
         let name = tokens[p].text
         if !is_kind_at(tokens, p + 1, lexer::TokenKind::Colon) {
-            return error { message = "expected ':' after a parameter name" }
+            return err_at(tokens, p + 1, "expected ':' after a parameter name")
         }
         let ty = match parse_type(tokens, p + 2) { ParsedType as x => x; error as e => return e }
         params = teko::list::push(params, Param { name = name, type_ann = ty.node })
@@ -23,13 +25,13 @@ fn parse_params(tokens: []lexer::Token, pos: u64) -> ParsedParams | error {
         p = p + 1                                    // consume `,`
     }
     if !is_kind_at(tokens, p, lexer::TokenKind::RParen) {
-        return error { message = "expected ')' to close the parameter list" }
+        return err_at(tokens, p, "expected ')' to close the parameter list")
     }
     ParsedParams { params = params, next = p + 1 }
 }
 
-// `[doc] [exp] fn name(params) -> ret { body }` (B.21, B.29). Doc + `exp` optional and
-// precede `fn`; `-> ret` optional (absent = Unit). `pos` is at the doc, `exp`, or `fn`.
+// `[doc] [pub|exp] fn name(params) -> ret { body }` (B.21, B.29). Doc + visibility optional
+// and precede `fn`; `-> ret` optional (absent = Unit). `pos` is at the doc, `pub`/`exp`, or `fn`.
 fn parse_function(tokens: []lexer::Token, pos: u64) -> ParsedDecl | error {
     mut p = pos
     mut has_doc = false
@@ -39,22 +41,27 @@ fn parse_function(tokens: []lexer::Token, pos: u64) -> ParsedDecl | error {
         doc = tokens[p].text
         p = p + 1
     }
-    mut is_exp = false
-    if is_kind_at(tokens, p, lexer::TokenKind::Exp) {
-        is_exp = true
+    mut vis = Visibility::Private                        // default: own-namespace only
+    if is_kind_at(tokens, p, lexer::TokenKind::Pub) {
+        vis = Visibility::Pub
+        p = p + 1
+    } else if is_kind_at(tokens, p, lexer::TokenKind::Exp) {
+        vis = Visibility::Exp
         p = p + 1
     }
     if !is_kind_at(tokens, p, lexer::TokenKind::Fn) {
-        return error { message = "expected `fn`" }
+        return err_at(tokens, p, "expected `fn`")
     }
     p = p + 1
     if !is_kind_at(tokens, p, lexer::TokenKind::Ident) {
-        return error { message = "expected a function name" }
+        return err_at(tokens, p, "expected a function name")
     }
     let name = tokens[p].text
+    let name_line: u32 = tokens[p].line
+    let name_col: u32 = tokens[p].col   // W-loc-2: the fn's source position
     p = p + 1
     if !is_kind_at(tokens, p, lexer::TokenKind::LParen) {
-        return error { message = "expected '(' for the parameter list" }
+        return err_at(tokens, p, "expected '(' for the parameter list")
     }
     let params = match parse_params(tokens, p) { ParsedParams as x => x; error as e => return e }
     p = params.next
@@ -67,10 +74,10 @@ fn parse_function(tokens: []lexer::Token, pos: u64) -> ParsedDecl | error {
         p = ret.next
     }
     if !is_kind_at(tokens, p, lexer::TokenKind::LBrace) {
-        return error { message = "expected '{' for the function body" }
+        return err_at(tokens, p, "expected '{' for the function body")
     }
     let blk = match parse_block(tokens, p) { ParsedBlock as x => x; error as e => return e }
-    ParsedDecl { node = Function { name = name, params = params.params, has_return = has_return, return_type = return_type, body = blk.statements, is_exp = is_exp, has_doc = has_doc, doc = doc }, next = blk.next }
+    ParsedDecl { node = Function { name = name, params = params.params, has_return = has_return, return_type = return_type, body = blk.statements, vis = vis, has_doc = has_doc, doc = doc, line = name_line, col = name_col }, next = blk.next }
 }
 
 // `{ name: T; name: T; … }` — field list; `;`/newline separates; empty `{ }` allowed;
@@ -82,19 +89,19 @@ fn parse_fields(tokens: []lexer::Token, pos: u64) -> ParsedFields | error {
         return ParsedFields { fields = fields, next = p + 1 }
     }
     loop {
-        if !is_kind_at(tokens, p, lexer::TokenKind::Ident) {
-            return error { message = "expected a field name" }
+        if !is_name_at(tokens, p) {
+            return err_at(tokens, p, "expected a field name")
         }
         let name = tokens[p].text
         if !is_kind_at(tokens, p + 1, lexer::TokenKind::Colon) {
-            return error { message = "expected ':' after a field name" }
+            return err_at(tokens, p + 1, "expected ':' after a field name")
         }
         let ty = match parse_type(tokens, p + 2) { ParsedType as x => x; error as e => return e }
         fields = teko::list::push(fields, Field { name = name, type_ann = ty.node })
         p = ty.next
         if is_kind_at(tokens, p, lexer::TokenKind::RBrace) { break }
         if !is_sep(tokens, p) {
-            return error { message = "expected ';', a newline, or '}' after a field" }
+            return err_at(tokens, p, "expected ';', a newline, or '}' after a field")
         }
         p = skip_seps(tokens, p)
         if is_kind_at(tokens, p, lexer::TokenKind::RBrace) { break }   // trailing separator
@@ -107,14 +114,14 @@ fn parse_fields(tokens: []lexer::Token, pos: u64) -> ParsedFields | error {
 fn parse_type_body(tokens: []lexer::Token, pos: u64) -> ParsedBody | error {
     if is_kind_at(tokens, pos, lexer::TokenKind::Struct) {
         if !is_kind_at(tokens, pos + 1, lexer::TokenKind::LBrace) {
-            return error { message = "expected '{' after `struct`" }
+            return err_at(tokens, pos + 1, "expected '{' after `struct`")
         }
         let fs = match parse_fields(tokens, pos + 1) { ParsedFields as x => x; error as e => return e }
         return ParsedBody { node = StructBody { fields = fs.fields }, next = fs.next }
     }
     if is_kind_at(tokens, pos, lexer::TokenKind::Enum) {
         if !is_kind_at(tokens, pos + 1, lexer::TokenKind::LBrace) {
-            return error { message = "expected '{' after `enum`" }
+            return err_at(tokens, pos + 1, "expected '{' after `enum`")
         }
         let ms = match parse_field_names(tokens, pos + 1) { ParsedNames as x => x; error as e => return e }
         return ParsedBody { node = EnumBody { members = ms.names }, next = ms.next }
@@ -123,11 +130,11 @@ fn parse_type_body(tokens: []lexer::Token, pos: u64) -> ParsedBody | error {
         let ty = match parse_type(tokens, pos + 1) { ParsedType as x => x; error as e => return e }
         return ParsedBody { node = VariantBody { type_expr = ty.node }, next = ty.next }
     }
-    error { message = "expected `struct`, `enum`, or `variant`" }
+    err_at(tokens, pos, "expected `struct`, `enum`, or `variant`")
 }
 
-// `[doc] [exp] type Name = <body>` (B.13, nominal). Doc + `exp` precede `type`. `pos` is at
-// the doc, `exp`, or `type`.
+// `[doc] [pub|exp] type Name = <body>` (B.13, nominal). Doc + visibility precede `type`.
+// `pos` is at the doc, `pub`/`exp`, or `type`.
 fn parse_type_decl(tokens: []lexer::Token, pos: u64) -> ParsedDecl | error {
     mut p = pos
     mut has_doc = false
@@ -137,49 +144,58 @@ fn parse_type_decl(tokens: []lexer::Token, pos: u64) -> ParsedDecl | error {
         doc = tokens[p].text
         p = p + 1
     }
-    mut is_exp = false
-    if is_kind_at(tokens, p, lexer::TokenKind::Exp) {
-        is_exp = true
+    mut vis = Visibility::Private                        // default: own-namespace only
+    if is_kind_at(tokens, p, lexer::TokenKind::Pub) {
+        vis = Visibility::Pub
+        p = p + 1
+    } else if is_kind_at(tokens, p, lexer::TokenKind::Exp) {
+        vis = Visibility::Exp
         p = p + 1
     }
     if !is_kind_at(tokens, p, lexer::TokenKind::Type) {
-        return error { message = "expected `type`" }
+        return err_at(tokens, p, "expected `type`")
     }
     p = p + 1
     if !is_kind_at(tokens, p, lexer::TokenKind::Ident) {
-        return error { message = "expected a type name" }
+        return err_at(tokens, p, "expected a type name")
     }
     let name = tokens[p].text
+    let name_line: u32 = tokens[p].line
+    let name_col: u32 = tokens[p].col   // W-loc-2: the type's source position
     p = p + 1
     if !is_kind_at(tokens, p, lexer::TokenKind::Assign) {
-        return error { message = "expected '=' in a type declaration" }
+        return err_at(tokens, p, "expected '=' in a type declaration")
     }
     let body = match parse_type_body(tokens, p + 1) { ParsedBody as x => x; error as e => return e }
-    ParsedDecl { node = TypeDecl { name = name, body = body.node, is_exp = is_exp, has_doc = has_doc, doc = doc }, next = body.next }
+    ParsedDecl { node = TypeDecl { name = name, body = body.node, vis = vis, has_doc = has_doc, doc = doc, line = name_line, col = name_col }, next = body.next }
 }
 
 // extends the Parsed* family.
-type ParsedModule = struct { node: Module; next: u64 }   // a parsed module file
+pub type ParsedModule = struct { node: Module; next: u64 }   // a parsed module file
 
 // dispatch a top-level declaration: a function or a type decl (each may be preceded by a
-// doc comment and/or `exp`). Peeks past the doc/exp prefix to choose. `pos` is at the
-// doc, `exp`, `fn`, or `type`.
+// doc comment and/or `pub`/`exp`). Peeks past the doc/visibility prefix to choose. `pos` is
+// at the doc, `pub`/`exp`, `fn`, or `type`.
 fn parse_decl(tokens: []lexer::Token, pos: u64) -> ParsedDecl | error {
     mut k = pos
     if is_kind_at(tokens, k, lexer::TokenKind::Doc) { k = k + 1 }
-    if is_kind_at(tokens, k, lexer::TokenKind::Exp) { k = k + 1 }
+    if is_kind_at(tokens, k, lexer::TokenKind::Pub) {
+        k = k + 1
+    } else if is_kind_at(tokens, k, lexer::TokenKind::Exp) {
+        k = k + 1
+    }
     if is_kind_at(tokens, k, lexer::TokenKind::Fn) {
         return parse_function(tokens, pos)
     }
     if is_kind_at(tokens, k, lexer::TokenKind::Type) {
         return parse_type_decl(tokens, pos)
     }
-    error { message = "expected a declaration (`fn`/`type`, optionally `exp`/doc); loose statements belong in main.tks" }
+    err_at(tokens, k, "expected a declaration (`fn`/`type`, optionally `pub`/`exp`/doc); loose statements belong in main.tks")
 }
 
 // a module file: the `use` header, then a loop of declarations. Rejects loose statements.
 // `pos` is 0 (file start).
-fn parse_module(tokens: []lexer::Token, pos: u64) -> ParsedModule | error {
+pub fn parse_module(tokens: []lexer::Token, pos: u64) -> ParsedModule | error {
     let hdr = match parse_use_header(tokens, pos) { ParsedUses as x => x; error as e => return e }
     mut p = skip_seps(tokens, hdr.next)
     mut decls = teko::list::empty()
@@ -190,7 +206,7 @@ fn parse_module(tokens: []lexer::Token, pos: u64) -> ParsedModule | error {
         p = d.next
         if !has_token(tokens, p) { break }
         if !is_sep(tokens, p) {
-            return error { message = "expected ';' or a newline after a declaration" }
+            return err_at(tokens, p, "expected ';' or a newline after a declaration")
         }
         p = skip_seps(tokens, p)
     }

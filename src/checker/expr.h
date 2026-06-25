@@ -16,7 +16,7 @@ bool tk_cast_ok(tk_type from, tk_type to);
 // ---- shared small helpers (one definition, in expr.c) — used by BOTH TUs (M.5) ----
 tk_texpr      *tk_box(tk_texpr t);       // heap-copy a TExpr (children)
 tk_type        tk_prim_t(tk_prim_kind k);
-tk_type        tk_unit_t(void);
+tk_type        tk_void_t(void);   // the `void` return marker (M.3 — no value)
 bool           tk_is_bool(tk_type t);
 tk_texpr_result tk_xok(tk_texpr t);
 tk_texpr_result tk_xerr(const char *m);

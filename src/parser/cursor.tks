@@ -1,4 +1,6 @@
 // Is there a token at `pos`? Position/index are always u64.
+use teko::lexer
+
 fn has_token(tokens: []lexer::Token, pos: u64) -> bool {
     pos < tokens.len
 }
@@ -33,9 +35,29 @@ fn skip_terminators(tokens: []lexer::Token, pos: u64) -> u64 {
     p
 }
 
+// a parse error located at token `pos`: "line:col: msg" from the token's stamped position.
+// At/past end-of-input, use the last token's location. Unstamped (line 0) → bare message.
+// The .tks mirror of cursor.c's tk_err_at — this is how parse errors carry file:line:col.
+fn err_at(tokens: []lexer::Token, pos: u64, msg: str) -> error {
+    if tokens.len == 0 { return error { message = msg } }
+    let i = if pos < tokens.len { pos } else { tokens.len - 1 }
+    let line = tokens[i].line
+    let col = tokens[i].col
+    if line == 0 { return error { message = msg } }
+    error { message = $"{line}:{col}: {msg}" }
+}
+
 // is there a separator at `pos` — `;` or a newline? (B.17 — inside `{}`)
 fn is_sep(tokens: []lexer::Token, pos: u64) -> bool {
     is_kind_at(tokens, pos, lexer::TokenKind::Semicolon) || is_kind_at(tokens, pos, lexer::TokenKind::Newline)
+}
+
+// a NAME position: an identifier, OR a CONTEXTUAL keyword usable as a field/member name.
+// `type` is a keyword only in declaration position (`type Name = …`); as a field name
+// (`.type`, `type: T`, `Foo { type = … }`) it is an ordinary name — the corpus relies on
+// this (162+ `.type` accesses). The token's `.text` carries the name in either case.
+fn is_name_at(tokens: []lexer::Token, pos: u64) -> bool {
+    is_kind_at(tokens, pos, lexer::TokenKind::Ident) || is_kind_at(tokens, pos, lexer::TokenKind::Type)
 }
 
 // skip a run of separators (`;` and newlines). Shared by field lists, arms (P3d), blocks (P4).

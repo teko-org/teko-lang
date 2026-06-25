@@ -12,6 +12,13 @@ tk_bytes tk_write_u32(tk_bytes b, uint32_t x) {
     return b;
 }
 
+// LE u64 = low u32 then high u32 — the exact inverse of tk_read_u64 (lo | hi<<32).
+tk_bytes tk_write_u64(tk_bytes b, uint64_t x) {
+    b = tk_write_u32(b, (uint32_t)(x & 0xFFFFFFFFu));
+    b = tk_write_u32(b, (uint32_t)(x >> 32));
+    return b;
+}
+
 tk_bytes tk_write_i64(tk_bytes b, int64_t x) {
     uint64_t bits = (uint64_t)x;                 // reinterpret two's-complement bits
     for (int k = 0; k < 8; k += 1) { b = tk_bytes_push(b, (tk_byte)(bits & 0xFF)); bits >>= 8; }

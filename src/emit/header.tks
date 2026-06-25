@@ -1,21 +1,24 @@
 // src/emit/header.tks  (namespace 'teko::emit')
 //
 // E-emit-a — the `.tkh` HEADER-BUILDING DRIVER. Given a CHECKED typed program, keep
-// only the EXPORTED (`is_exp`) items, build their export signatures, assemble a
+// only the EXPORTED (`vis == exp`) items, build their export signatures, assemble a
 // `Header`, and emit it. This is the check → header → `.tkh` emission path; the full
 // read → lex → parse → check pipeline + codegen stays deferred (M.4 — nothing is
 // built on the incomplete). The Header model + `emit_tkh`/`read_tkh` live in tkh.tks;
 // `resolve_type` (turning syntactic annotations into resolved semantic `Type`) is the
 // checker's. M.5 — this module ADDS no codec primitive; it only walks + collects.
 
+use teko::checker
+use teko::parser
+
 // --- a function's export signature: each Param's annotation resolved (M.3 — exact) ---
-fn build_fnsig(f: TFunction, table: TypeTable) -> FnSig | error {
+fn build_fnsig(f: checker::TFunction, table: checker::TypeTable) -> FnSig | error {
     mut params = teko::list::empty()
     mut i = 0
     loop {
         if i >= f.params.len { break }
-        let pt = match resolve_type(f.params[i].type_ann, table) {
-            Type as t  => t
+        let pt = match checker::resolve_type(f.params[i].type_ann, table) {
+            checker::Type as t  => t
             error as e => return e
         }
         params = teko::list::push(params, SigParam { name = f.params[i].name; type = pt })
@@ -26,13 +29,13 @@ fn build_fnsig(f: TFunction, table: TypeTable) -> FnSig | error {
 }
 
 // --- a struct's export fields: each Field's annotation resolved (M.3 — exact) ---
-fn build_sigfields(fields: []Field, table: TypeTable) -> []SigField | error {
+fn build_sigfields(fields: []parser::Field, table: checker::TypeTable) -> []SigField | error {
     mut out = teko::list::empty()
     mut i = 0
     loop {
         if i >= fields.len { break }
-        let ft = match resolve_type(fields[i].type_ann, table) {
-            Type as t  => t
+        let ft = match checker::resolve_type(fields[i].type_ann, table) {
+            checker::Type as t  => t
             error as e => return e
         }
         out = teko::list::push(out, SigField { name = fields[i].name; type = ft })
@@ -43,9 +46,9 @@ fn build_sigfields(fields: []Field, table: TypeTable) -> []SigField | error {
 
 // --- a type's export interface, by shape (B.14 — struct/enum/variant) ---
 // Per `shape`, exactly one of fields/members/cases is meaningful; the others are empty.
-fn build_tyexport(d: TypeDecl, table: TypeTable) -> TyExport | error {
+fn build_tyexport(d: parser::TypeDecl, table: checker::TypeTable) -> TyExport | error {
     match d.body {
-        StructBody as sb => {
+        parser::StructBody as sb => {
             let fields = match build_sigfields(sb.fields, table) {
                 fs: []SigField => fs
                 error as e     => return e
@@ -56,21 +59,21 @@ fn build_tyexport(d: TypeDecl, table: TypeTable) -> TyExport | error {
                 has_doc = d.has_doc; doc = d.doc
             }
         }
-        EnumBody as eb => {
+        parser::EnumBody as eb => {
             TyExport {
                 name = d.name; shape = TyShape::Enum
                 fields = teko::list::empty(); members = eb.members; cases = teko::list::empty()
                 has_doc = d.has_doc; doc = d.doc
             }
         }
-        VariantBody as vb => {
+        parser::VariantBody as vb => {
             // resolve the union's syntactic type_expr → a semantic Variant; its members are the cases.
-            let rt = match resolve_type(vb.type_expr, table) {
-                Type as t  => t
+            let rt = match checker::resolve_type(vb.type_expr, table) {
+                checker::Type as t  => t
                 error as e => return e
             }
             let cases = match rt {
-                Variant as v => v.members
+                checker::Variant as v => v.members
                 _            => return error { message = "an exported variant's body did not resolve to a union" }
             }
             TyExport {
@@ -82,16 +85,16 @@ fn build_tyexport(d: TypeDecl, table: TypeTable) -> TyExport | error {
     }
 }
 
-// --- THE DRIVER: walk the typed program, keep only `is_exp` items, build the Header ---
-fn build_header(prog: TProgram, table: TypeTable) -> Header | error {
+// --- THE DRIVER: walk the typed program, keep only `exp` items, build the Header ---
+fn build_header(prog: checker::TProgram, table: checker::TypeTable) -> Header | error {
     mut types = teko::list::empty()
     mut fns = teko::list::empty()
     mut i = 0
     loop {
         if i >= prog.items.len { break }
         match prog.items[i] {
-            TFunction as f => {
-                if f.is_exp {
+            checker::TFunction as f => {
+                if f.vis == parser::Visibility::Exp {   // only `exp` reaches the .tkh (pub is project-internal)
                     let sig = match build_fnsig(f, table) {
                         FnSig as s => s
                         error as e => return e
@@ -99,8 +102,8 @@ fn build_header(prog: TProgram, table: TypeTable) -> Header | error {
                     fns = teko::list::push(fns, sig)
                 }
             }
-            TypeDecl as d => {
-                if d.is_exp {
+            parser::TypeDecl as d => {
+                if d.vis == parser::Visibility::Exp {   // only `exp` reaches the .tkh
                     let te = match build_tyexport(d, table) {
                         TyExport as t => t
                         error as e    => return e
@@ -108,8 +111,8 @@ fn build_header(prog: TProgram, table: TypeTable) -> Header | error {
                     types = teko::list::push(types, te)
                 }
             }
-            UseDecl   => {}    // not part of the exported surface — skip
-            TStatement => {}   // a loose top-level statement is never exported — skip
+            parser::UseDecl   => {}    // not part of the exported surface — skip
+            checker::TStatement => {}   // a loose top-level statement is never exported — skip
         }
         i++
     }
@@ -120,7 +123,7 @@ fn build_header(prog: TProgram, table: TypeTable) -> Header | error {
 // A header is ALWAYS emitted, even with NO exports: an empty surface yields an empty Header
 // (0 types, 0 fns) and a well-formed `.tkh` that honestly states "nothing is exported" —
 // never nothing at all (a consumer must always find a readable interface, M.3).
-fn emit_program(prog: TProgram, table: TypeTable) -> []byte | error {
+fn emit_program(prog: checker::TProgram, table: checker::TypeTable) -> []byte | error {
     let header = match build_header(prog, table) {
         Header as h => h
         error as e  => return e

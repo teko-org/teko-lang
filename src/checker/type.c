@@ -23,9 +23,11 @@ bool tk_type_eq(const tk_type *a, const tk_type *b) {
         case TK_TYPE_PRIM:  return a->as.prim == b->as.prim;
         case TK_TYPE_BYTE:  return true;
         case TK_TYPE_STR:   return true;
-        case TK_TYPE_ERROR: return true;
-        case TK_TYPE_UNIT:  return true;
+        case TK_TYPE_ERROR: return true;   // the native `error` (lowercase in Teko)
+        case TK_TYPE_VOID:  return true;   // return-only marker (M.3); legal only as Func.ret
         case TK_TYPE_SLICE: return tk_type_eq(a->as.slice.element, b->as.slice.element);
+        // T? == U? iff their inners are equal (built-in unary former, like Slice).
+        case TK_TYPE_OPTIONAL: return tk_type_eq(a->as.optional.inner, b->as.optional.inner);
         case TK_TYPE_NAMED: return tk_str_eq(a->as.named.name, b->as.named.name);   // nominal
         case TK_TYPE_VARIANT:
             return tk_types_eq(a->as.variant.members, a->as.variant.len,

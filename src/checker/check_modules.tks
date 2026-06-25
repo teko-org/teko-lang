@@ -1,0 +1,210 @@
+// src/checker/check_modules.tks  (namespace 'teko::checker') — W-vis-enforce.
+//
+// The MODULE-SYSTEM enforcement pass. A dedicated walk over the flattened program: it reads
+// each item's source namespace (A3 provenance) directly, so it threads NO namespace context
+// through the typing chain. It builds the `use` alias map from the use-items and checks every
+// decl's TYPE references, enforcing:
+//   * a BARE reference to a type in ANOTHER namespace is an error (qualify it, M.3/M.2);
+//   * a QUALIFIED reference to a PRIVATE type (not pub/exp) in another namespace is an error (B.9);
+//   * a qualified reference with an unbound alias, or naming the wrong namespace, is an error.
+// Same-namespace refs stay bare; builtins are never namespaced. (Value-level refs — call
+// callees, enum-member paths — are a follow-on increment; this covers the dominant TYPE surface.)
+
+use teko::parser
+
+// an alias binding: within namespace `ns`, the name `alias` refers to namespace `target`.
+type AliasBind = struct { ns: str; alias: str; target: str }
+
+// "file:line:col: msg" with absent parts omitted (M.3 — show what we know). W-loc-2.
+fn diag_at(file: str, line: u32, col: u32, msg: str) -> str {
+    if file != "" && line > 0 { return $"{file}:{line}:{col}: {msg}" }
+    if file != "" { return $"{file}: {msg}" }
+    if line > 0 { return $"{line}:{col}: {msg}" }
+    msg
+}
+
+// join the first `n` segments of a path with "::" (n = segments.len → the full namespace;
+// n = segments.len - 1 → the prefix before the final symbol).
+fn join_n(p: parser::Path, n: u64) -> str {
+    if n == 0 { return "" }
+    mut s = ""
+    mut i = 0
+    loop {
+        if i >= n { break }
+        s = teko::str::concat(s, p.segments[i].name)
+        if i + 1 < n { s = teko::str::concat(s, "::") }
+        i++
+    }
+    s
+}
+
+// build the alias map from every use-item (file-local `use`, B.32).
+fn build_aliases(prog: parser::Program) -> []AliasBind {
+    mut a = teko::list::empty()
+    mut i = 0
+    loop {
+        if i >= prog.items.len { break }
+        match prog.items[i].content {
+            parser::UseDecl as u => {
+                if u.path.segments.len > 0 {
+                    let alias = if u.has_alias { u.alias } else { u.path.segments[u.path.segments.len - 1].name }
+                    a = teko::list::push(a, AliasBind { ns = prog.items[i].namespace; alias = alias; target = join_n(u.path, u.path.segments.len) })
+                }
+            }
+            _ => {}
+        }
+        i++
+    }
+    a
+}
+
+// resolve an alias used in `ref_ns` → its target namespace ("" if unbound).
+fn alias_target(a: []AliasBind, ref_ns: str, alias: str) -> str {
+    mut i = 0
+    loop {
+        if i >= a.len { break }
+        if a[i].ns == ref_ns && a[i].alias == alias { return a[i].target }
+        i++
+    }
+    ""
+}
+
+// find a type reg named `name` declared in namespace `ns` (null if none).
+fn find_in_ns(table: TypeTable, name: str, ns: str) -> TypeReg? {
+    mut i = 0
+    loop {
+        if i >= table.len { break }
+        if table[i].name == name && table[i].namespace == ns { return table[i] }
+        i++
+    }
+    null
+}
+
+fn name_exists_anywhere(table: TypeTable, name: str) -> bool {
+    mut i = 0
+    loop {
+        if i >= table.len { break }
+        if table[i].name == name { return true }
+        i++
+    }
+    false
+}
+
+// check ONE Named type reference (its path) used inside namespace `ref_ns`.
+fn check_named(path: parser::Path, ref_ns: str, table: TypeTable, al: []AliasBind) -> error? {
+    if path.segments.len == 0 { return null }
+    let last = path.segments[path.segments.len - 1].name
+    match builtin_type(last) { Type => return null; error => {} }   // u8…/str/byte/error: never namespaced
+
+    if path.segments.len == 1 {                                     // BARE
+        match find_in_ns(table, last, ref_ns) { TypeReg => return null; null => {} }   // same-ns: bare is correct
+        if name_exists_anywhere(table, last) {
+            return error { message = "bare cross-namespace type reference — qualify it (`ns::Type`, with `use teko::ns`) or use the absolute path" }
+        }
+        return null                                                // unknown name → the normal resolver reports it
+    }
+
+    // QUALIFIED / ABSOLUTE: resolve the target namespace.
+    mut target_ns = ""
+    if path.segments.len == 2 {                                    // single-segment prefix = a `use` alias
+        target_ns = alias_target(al, ref_ns, path.segments[0].name)
+        if target_ns == "" {
+            return error { message = "qualified type reference with an unbound alias — add `use teko::<ns>` (the prefix binds nothing)" }
+        }
+    } else {
+        target_ns = join_n(path, path.segments.len - 1)           // absolute: teko::a::b::Type → "teko::a::b"
+    }
+
+    match find_in_ns(table, last, target_ns) {
+        TypeReg as reg => {
+            if target_ns != ref_ns && reg.vis == parser::Visibility::Private {   // cross-ns requires pub/exp (B.9)
+                return error { message = "cross-namespace reference to a private type — mark the type `pub` (or `exp`)" }
+            }
+            return null
+        }
+        null => {}
+    }
+    if name_exists_anywhere(table, last) {
+        return error { message = "qualified type reference names the wrong namespace — the type is declared elsewhere" }
+    }
+    null                                                           // unknown → the normal resolver reports it
+}
+
+// walk a type expression, checking every Named leaf.
+fn check_texpr(te: parser::TypeExpr, ref_ns: str, table: TypeTable, al: []AliasBind) -> error? {
+    match te {
+        parser::NamedType as n    => check_named(n.path, ref_ns, table, al)
+        parser::SliceType as s    => check_texpr(s.element, ref_ns, table, al)
+        parser::OptionalType as o => check_texpr(o.inner, ref_ns, table, al)
+        parser::UnionType as u    => {
+            mut i = 0
+            loop {
+                if i >= u.members.len { break }
+                match check_texpr(u.members[i], ref_ns, table, al) { null => {}; error as e => return e }
+                i++
+            }
+            null
+        }
+    }
+}
+
+// the pass: check every decl's type-references (params/return for fns; fields/variant member
+// for type decls). Returns null on success or the first error.
+fn check_modules(prog: parser::Program, table: TypeTable) -> error? {
+    let al = build_aliases(prog)
+    mut i = 0
+    loop {
+        if i >= prog.items.len { break }
+        let it = prog.items[i]
+        mut e: error? = null
+        mut line: u32 = 0
+        mut col: u32 = 0
+        match it.content {
+            parser::Function as f => {
+                line = f.line
+                col = f.col
+                mut p = 0
+                loop {
+                    if p >= f.params.len { break }
+                    match e { error => break; null => {} }
+                    e = check_texpr(f.params[p].type_ann, it.namespace, table, al)
+                    p++
+                }
+                match e {
+                    null => {
+                        if f.has_return {
+                            e = check_texpr(f.return_type, it.namespace, table, al)
+                        }
+                    }
+                    error => {}
+                }
+            }
+            parser::TypeDecl as d => {
+                line = d.line
+                col = d.col
+                match d.body {
+                    parser::StructBody as sb => {
+                        mut k = 0
+                        loop {
+                            if k >= sb.fields.len { break }
+                            match e { error => break; null => {} }
+                            e = check_texpr(sb.fields[k].type_ann, it.namespace, table, al)
+                            k++
+                        }
+                    }
+                    parser::VariantBody as vb => {
+                        e = check_texpr(vb.type_expr, it.namespace, table, al)
+                    }
+                    parser::EnumBody => {}
+                }
+            }
+            _ => {}
+        }
+        match e {
+            error as err => return error { message = diag_at(it.file, line, col, err.message) }   // W-loc-2: file:line:col
+            null => {}
+        }
+        i++
+    }
+    null
+}

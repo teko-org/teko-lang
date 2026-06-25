@@ -101,6 +101,9 @@ their top.
 
 | Numeric conversions (`to`/`as`) | early conversion rule + E.1 example | **forbid every lossy conversion at compile time** (`i32 as i8` = compile error; "silent loss is a design-fault bug"), justified as "M.1 modulating M.0, same as opaque pointers" | **conversions block (§5456)** — M.1 "silently" + M.0 + §II homeostasis (five-judge tribunal) | **Any DEFINED numeric→numeric conversion is ALLOWED** incl. narrowing/sign (`i32 to i8`, `i32 to u32`); loss is **caught, never silent** — constant-out-of-range = **compile error**, runtime = **PANIC on impossibility** (the value doesn't fit; debug AND release — parity with ÷0/OOB, ↺ refined from the earlier "defined-release" overflow-parity). `bool`↔num and non-numeric = **error** (undefined). Cast spelled **`to`** (renamed from `as`). The opaque-pointer analogy fails (loss is *reducible* by a guard). |
 | `AltPattern` axis (`\|`) | A.14 | **Alt = value axis only** (literals/ranges); parse dispatched axis-exclusively (Ident-led → variant pattern, no `\|` branch), so `RED \| GREEN` was inexpressible | **C7 Alt-axis block** — tribunal verdict + legislator (chose B) | **An `Alt` option may be a value pattern OR a bare variant case** (`BindPattern`, `has_binding=false`): `RED \| GREEN` is legal and **counts toward variant-axis exhaustiveness** (C7b expands it). **Bindings inside an `Alt` are forbidden** (`Foo as x \| Bar`, `FieldPattern` in `\|`) → error. The current SOURCE parser (which already builds variant-case Alts) is ratified; the canonical axis-exclusive parse is retired. Law basis **M.0 + M.2 + M.5** (with **M.1** kept by Alt-expansion + forbid-bindings). |
+| `Unit` / "value-less" type | `TEKO_CHECKER.md` drift (`type Unit = struct {}`, `Type = … \| Unit`, `-> Unit`) | a value-less **type** (empty struct) used as a variant member and "no value" return/binding | **B.37** | **`Unit` ceases to exist.** "Returns no value" is **`-> void`**, a return **marker** — never a type, value, variant member, or binding. A fallible-no-value fn is **`-> error?`**, never `void \| error`. *(Drift to excise: `TEKO_CHECKER.md:78,81,90,1095,1245–1278`, in code-phases Z1+.)* |
+| Error type spelling | B.1 / early entries (`Error`, `teko::Error`, `Valor \| Error`) | the failure case spelled with a **capital** `Error` | **B.37** | **`error` is the NATIVE lowercase type** (already in `src/core.tks`), superseding `Error`/`teko::Error`/`Valor \| Error`. Fallible-with-value = `T \| error`; fallible-no-value = `error?`. Variant members are **complete declared types** with **no constructors** and **no nullable/`void` member** (`Value? \| i32` illegal → lift to `-> Val?`). |
+| Native numeric set + floats | seed inventory (`u8…u64`/`i8…i64`) + the roadmap "float … deferred"; `bigint` a library type (B.30) | the seed named only `u8…u64`/`i8…i64` as live and **deferred floats** (and `dec`); `bigint` was reverted to a **library** type | **B.38** | **The native numeric set is `u8 u16 u32 u64 u128` / `i8 i16 i32 i64 i128` + `f16 f32 f64` + `dec` (512-bit) + `bigint` (arbitrary precision), plus `bool`/`byte`.** **Floats are UN-DEFERRED**; `bigint` becomes a **named native, deferred** type (↺ B.30). **Staging:** Tier 1 (`u128`/`i128` + `f16`/`f32`/`f64`) now; `dec`/`bigint` named-but-deferred (runtime-backed). Float rulings: literal `3.14`/`1.5e3` defaults to **`f64`** (f16/f32 by annotation); float ÷0 **PANICS**; `float↔int` via `to` is **runtime-guarded** (truncate toward zero; doesn't-fit/NaN/∞ → panic). |
 
 *When this index and an individual entry disagree, the index's "Current state" (and
 the entry it points to) wins. Keep this index updated whenever a decision is
@@ -6595,6 +6598,168 @@ the struct's namespace, method = sugar), adapted to Teko (value-semantics, no `r
   language has it though the bootstrap does not use it; foreign-codepage **transcoding** is
   evolution; **never** detect an encoding — validate UTF-8 (always) or transcode from a
   *declared* codepage.
+
+### B.37 — Doctrinal correction: `void` supersedes `Unit`; `error` (native) supersedes `Error`; variant = complete types (no constructors); nullability is `T?` (never a variant member)
+> ⚠️ **Supersession + drift excision.** Four rulings the legislator gave, ratified together, that
+> contain (stop the bleeding) and correct (excise) constructions that entered without judgment or by
+> drift between frozen documents. Each was already latent in the canon (the "is" below cites where);
+> this entry records the supersession and flags the drift source so the code-correction phases excise
+> it. *(Full plan: `TEKO_CORRECTION_PLAN.md` §1; the legislation's distilled form is the new
+> "Doctrinal correction" subsection in `TEKO_LEGISLATION.md`, dated alongside this entry.)*
+
+- **Was (the drift / the rejected forms):**
+  - **`Unit`** — an empty-struct "value-less" type (`type Unit = struct {}`), used as a variant member
+    and as a "no value" binding/return (`Type = … | Unit`, `-> Unit`, `Unit {}`). It was a *value* that
+    meant "no value" — a type pretending to be the absence of one.
+  - **`Error` / `teko::Error` / `Valor | Error`** — the failure case spelled with a **capital** `Error`
+    (a special, almost-keyword type), threaded as `Valor | Error` through the early entries.
+  - **Variant with constructors** — the Rust `Case(payload)` form (an inline case wrapping a payload),
+    "the Rust casts shadow."
+  - **Nullable variant members** — `Value? | i32`, a `?`-marked member *inside* a variant.
+
+- **Is (the four rulings, each already in the canon):**
+  1. **`void` = "returns no value" — a return marker, never a type.** A function **either** has a return
+     type **or** `-> void`; `->` is always present (no "absence of `->`"). `void` is **never** a value,
+     **never** a variant member, **never** a binding type. **This supersedes `Unit`** — `Unit` ceases to
+     exist. *(Already canon: §5829–5833 "`void` — return type for 'returns no value'… every fn declares
+     its return type"; §5971 "Every fn has `-> Type` (or `-> void`).")*
+  2. **`variant` = a sum of COMPLETE declared types.** Each member is a real, separately-declared type:
+     any native (`u8`, `i32`, `error`, `str`, `byte`, `[]f64`, …), an `enum`, a `struct`, or another
+     `variant`. **No constructors** (the `Case(payload)` form is forbidden). **No `void`. No nullable
+     members.** *(Already canon: B.14; `LEGISLATION §109` "each case is a real, separately-declared
+     type… no special constructor"; `src/checker/type.tks` models `Variant = members: []Type`.)*
+  3. **Nullability = the `?` suffix on a whole type — `T?`, `?.`, `??`.** `T?` is a **built-in
+     type-former** (not generics), with safe access `?.` and Elvis `??`. **A variant member cannot be
+     nullable**: `Value? | i32` is illegal → the dev declares `type Val = Value | i32` and marks the
+     *return* `-> Val?`. The two failure domains are **disjoint**: value-absence flows through
+     `?.`/`??`; recoverable error flows through `match`. The seed implements `T?` **fully** (model +
+     parser + checker + codegen + VM). *(Already canon: `REBOOT_PLAN §202–203`; `LEGISLATION §75` "`?`
+     is reserved strictly for nullability"; B.2.)*
+  4. **`error` is the NATIVE lowercase type.** It **supersedes** `Error` / `teko::Error` / `Valor |
+     Error`. *(Already lowercase in `src/core.tks`.)*
+  - **Composite consequence:** a fallible function with **no value** is **`-> error?`** (null = ok, an
+    `error` value = failure) — **never** `void | error` (void-in-variant is illegal). A fallible
+    function **with** a value is **`T | error`**. (The C `tk_check_result {ok, error}` *is* exactly an
+    `error?`.)
+
+- **Why:** **M.3** (honest) — a value that means "no value" lies (`Unit`); `void` names the absence
+  *as* a return marker, carrying nothing. **M.1** (fail-loud / exclusion-by-construction) — making
+  `void` un-representable as a value/member/binding, and forbidding nullable variant members, removes
+  whole classes of invalid states *by construction* rather than by check; the two failure domains
+  (null vs error) stay disjoint and each fully handled. **M.2** (explicit) — `->` is always written;
+  `T?` marks nullability at the type; `error` is a plain named type, not a magic capital. **M.5**
+  (austere) — one absence-marker (`void`), one nullability form (`T?`), one error type (`error`); no
+  parallel `Unit`, no constructor sugar in variants, no second spelling of the failure case. The
+  lowercase `error` (M.3 + M.5) refuses the special-cased capital `Error`.
+
+- **Drift source flagged (must be excised in code-correction, NOT here):** `TEKO_CHECKER.md`
+  introduced `Unit` **as a type** — `:78`, `:81`, `:90`, `:1095`, and `:1245–1278` (`type Unit =
+  struct {}`, `Type = … | Unit`, `Unit {}`, `-> Unit`). This is **frozen-doc drift**: it entered the
+  spec without judgment and contradicts the `void` ruling above. It is recorded here so phases **Z1+**
+  (the type-model and checker corrections, `TEKO_CORRECTION_PLAN.md` §3) **excise it**; `TEKO_CHECKER.md`
+  is corrected under crumb **Z2e**, not in this amendment.
+
+- **Guard (the rule-of-thumb, usable as a one-line check):** *no `Unit`, no `variant { Case(...) }`, no
+  `void`/nullable inside a variant, no capital `Error` — `void` is a return marker, `error` is native,
+  nullability is `T?`.* No new code may introduce any of these forms.
+
+- **Agent rule:** write `-> Type` or `-> void` on every fn (never `-> Unit`, never omit `->`); make a
+  variant a union of complete declared types only (no `Case(payload)`, no `void`, no `?` member);
+  spell nullability `T?` / `?.` / `??` (and lift a would-be-nullable member to the whole type:
+  `-> Val?`); spell the error type lowercase `error`; a fallible-no-value fn is `-> error?`, a
+  fallible-with-value fn is `T | error` — **never** `void | error`.
+
+---
+
+### B.38 — The native numeric type set: `u8…u128`/`i8…i128` + `f16`/`f32`/`f64` + `dec` + `bigint`; floats UN-DEFERRED (three rulings)
+> The legislator fixes Teko's full native numeric inventory, **stages** it (Tier 1 now vs `dec`/`bigint`
+> deferred), and **un-defers floats** with three ratified rulings. The set was always *implied* (the metal
+> has these widths); this entry legislates it as the canon and removes the float deferral. *(Full plan:
+> `TEKO_CORRECTION_PLAN.md` §5; the legislation's distilled form is the new "native numeric type set + the
+> float rulings" subsection in `TEKO_LEGISLATION.md`, dated alongside this entry.)*
+
+- **Was (the seed's narrower set + the deferrals):**
+  - The **live** seed inventory was integers **`u8…u64`** / **`i8…i64`** — widths up to 128 were not yet
+    native, and **floats were deferred** ("float … deferred" in the roadmap; `dec` named but not built).
+  - **`bigint`** had been reverted to a **library** type (B.30) once the sign-check (B.22) removed the
+    comparison ceiling that briefly justified making it native.
+
+- **Is (the legislated native numeric set):**
+  - **Integers:** `u8 u16 u32 u64 u128` and `i8 i16 i32 i64 i128`.
+  - **Floats:** `f16 f32 f64` — **un-deferred** (the roadmap's "float … deferred" is lifted).
+  - **`dec`** — a decimal, **256×256 = 512 bits**.
+  - **`bigint`** — **arbitrary / variable precision** (↺ now a **named native** type, superseding B.30's
+    "library, not native"; staged behind its runtime).
+  - Plus the existing **`bool`** (two values, boolean algebra) and **`byte`** (an octet, newtype over `u8` —
+    B.36). **This supersedes the seed's narrower `u8…u64`/`i8…i64` set.**
+  - **Staging:** **Tier 1** (`u128`/`i128` + `f16`/`f32`/`f64`) is implemented **now** (lexer → checker →
+    codegen → VM, end-to-end); **`dec`** and **`bigint`** are **named-but-deferred** — larger,
+    **runtime-backed** types (a 512-bit decimal; a heap-limb bignum) that land when their runtime is built.
+
+- **Is (the three float rulings, ratified):**
+  1. **Float literal syntax + `f64` default.** A float literal is `3.14` / `1.5e3`; an **un-annotated**
+     float literal **defaults to `f64`**. `f16`/`f32` require an **annotation** (`let x: f32 = 3.14`).
+  2. **Float ÷0 PANICS** — the same as integer ÷0 (`tk_panic_div0`): Teko **intercepts at the origin**, so
+     IEEE `∞`/`NaN` never surface as Teko values in the normal flow ("the NaN coffin stays shut" — B.24).
+     **Not** IEEE `∞`/`NaN` in the normal flow.
+  3. **`float↔int` via `to` is allowed with a RUNTIME guard.** It **truncates toward zero**; a value that
+     does **not fit** the target (overflow / `NaN` / `∞`) **PANICS** (parity with the integer cast guard).
+     `int→float` and `float→float` width changes likewise go through **`to`**.
+
+- **Why:** **M.0** (metal) — the widths *exist* on the silicon; a systems language names what the hardware
+  carries (8…128-bit integers, IEEE 16/32/64-bit floats), so legislating them native is honoring the metal,
+  not adding weight. **M.1** (fail-loud, no silent loss) — float ÷0 **panics** like integer ÷0 (no poison
+  `∞`/`NaN` leaking as a value), and `float↔int` conversion is **runtime-guarded** (doesn't-fit/NaN/∞ →
+  panic), the same panic-guard doctrine as the integer cast (the numeric-conversions block) — loss is caught,
+  never silent. **M.3** (honest, explicit) — the **literal default is documented** (`f64`) and a narrower
+  width is *asked for* by **annotation**, not silently chosen; each type names exactly what it is (`dec` is
+  decimal, not binary float; `byte` is an octet, not a number). **M.4** (build order) — Tier 1 enters because
+  lexer/checker/codegen/VM carry it; `dec`/`bigint` are **deferred behind their runtime**, named now so the
+  spelling is reserved without building ahead of the layer. **M.5** (austere) — naming the deferred types
+  costs nothing; only Tier 1 carries implementation weight in the seed.
+
+- **Clause extended (NOT a new Law):** the existing **numeric-conversions** clause (Redefinitions Index,
+  *Numeric conversions (`to`)*) — "any defined numeric→numeric conversion … impossible → panic" — is
+  **extended to include `float↔int` / `int→float` / `float→float`** under the **same panic-guard doctrine**
+  (truncate toward zero, panic on impossibility; constants out of range stay a compile error). No new M-law
+  is invented; this is the integer-cast guard applied to floats.
+
+- **Agent rule:** treat `u8…u128`/`i8…i128`, `f16`/`f32`/`f64`, `dec`, `bigint`, `bool`, `byte` as the
+  native numeric set; **implement Tier 1** (`u128`/`i128` + the three floats) now and leave `dec`/`bigint`
+  as named-but-deferred (runtime-backed); write a bare float literal as `f64`-typed and require an annotation
+  for `f16`/`f32`; make float ÷0 **panic** (`tk_panic_div0`); route `float↔int` through `to` with the runtime
+  guard (truncate toward zero, panic on doesn't-fit/NaN/∞). Never emit IEEE `∞`/`NaN` as a value in the
+  normal flow.
+
+### B.39 — Backend reversal: Teko's OWN native backend (transpile-to-C revoked); conclude all first
+
+- **Was:** the AOT backend was **transpile-to-C** — the codegen lowered the typed tree to **C**, and the host
+  **`cc`** compiled it to a native binary (the legislator's original choice — §B.34/§B.35; TEKO_ROADMAP_BINARY
+  Fase 2 "TC"). *Why then:* **M.5** (reuse the host toolchain; realize stage-2 AOT-native without writing a
+  native code generator). Two execution modes were planned: (1) transpile-to-C/AOT, (2) the `.tkb` VM.
+
+- **Is (legislator, 2026-06-24):** **transpile-to-C is REVOKED** as the destination architecture. Teko will
+  build its **OWN native backend** — a direct native code generator (typed tree / `.tkb` → native object/binary),
+  realizing the Constitution's **stage-2 (AOT-native on a host OS)** *without* `cc` as an intermediary.
+  **Sequencing:** *conclude ALL current work FIRST*; the native backend is **not started** until the rest is
+  done. The **`.tkb` VM (stage-1)** is **unaffected** and stays (debug/test + differential-correctness anchor).
+
+- **Why:** **M.0** (the *ethos* is the metal — native code with no C middleman is closer to the silicon than
+  "native via a transpiled C intermediary"). **M.4** (build order — the front end + checker + middle must be
+  concluded before the back end is replaced; don't build the new back on an unfinished middle). **M.3** (the path
+  becomes honestly *native*, not "native through C"). The earlier M.5 shortcut (reuse `cc`) served the bootstrap;
+  the legislator now spends the implementation weight on a true native backend for what ships.
+
+- **Resolved (operational, legislator 2026-06-24):** transpile-to-C is **revoked as PRIMARY but RETAINED — kept
+  fully equalized — as a permanent FALLBACK and DIFFERENTIAL-CORRECTNESS COMPARATIVE.** *Why:* "we need to keep a
+  fallback and comparative." So **three** execution paths must agree: the `.tkb` **VM**, the **transpile-to-C/`cc`**
+  path (fallback + comparative), and the future **native backend** (primary). **Every wave lands in ALL active
+  paths — codegen is NOT frozen** (W4/W5 etc. go into VM *and* codegen now; the native backend later).
+
+- **Agent rule:** do **not** start the native backend yet; **conclude the current equalization** first, applying
+  each wave to **both** the VM and the transpile-to-C codegen (they + the future native backend are the differential
+  anchor — M.1). Do not delete the C path. The Constitution's three materialization stages are unchanged (only
+  stage-2's *shipping implementation* moves from C-transpile to a native codegen; C-transpile lives on as fallback).
 
 ---
 

@@ -8,6 +8,7 @@
 #define TK_LEXER_TOKEN_H
 
 #include "../text/text.h"   // tk_str (DAG: lexer → text → core)
+#include <stdint.h>         // uint32_t (token line/col)
 
 // tk_token_kind — mirrors token.tks `TokenKind`, in the SAME order.
 typedef enum {
@@ -37,6 +38,9 @@ typedef enum {
     TK_TOKEN_AS,
     TK_TOKEN_USE,
     TK_TOKEN_EXP,
+    TK_TOKEN_TRUE,          // `true`  — bool literal (LEGISLATION §75)
+    TK_TOKEN_FALSE,         // `false` — bool literal (LEGISLATION §75)
+    TK_TOKEN_NULL,          // `null`  — the null literal (REBOOT_PLAN §202)
 
     // --- arithmetic & bitwise operators ---
     TK_TOKEN_PLUS,          // +
@@ -100,13 +104,42 @@ typedef enum {
     TK_TOKEN_DOT,           // `.` — postfix field/method access (P2/F2)
     TK_TOKEN_SEMICOLON,     // `;` — statement/field separator (B.17)
     TK_TOKEN_VARIANT,       // `variant` — variant type-body keyword (B.14)
+
+    // --- nullability (`?` is EXCLUSIVE to nullability — LEGISLATION §75; REBOOT_PLAN
+    //     §202–203). APPENDED LAST, same ordinal-stability reason as the word-ops.
+    TK_TOKEN_QUESTION,      // `?`  — type suffix: `T?` is an OPTIONAL type
+    TK_TOKEN_QDOT,          // `?.` — safe field access (null-propagating)
+    TK_TOKEN_QQ,            // `??` — Elvis / null-coalescing
+
+    // --- visibility (LEGISLATION "Visibility — pub vs exp"; B.9). `pub` APPENDED LAST,
+    //     same ordinal-stability reason as the word-ops/`variant` above: operator kinds
+    //     serialize by enum ordinal (E7's kind_byte), so a mid-table insert would shift
+    //     them. `exp` predates this rule and sits in the keyword block; `pub` joins here
+    //     (it is never a stored op, so its ordinal is never serialized).
+    TK_TOKEN_PUB,           // `pub` — public within the project (visible cross-namespace)
+
+    // --- increment/decrement (W5-idx self-host). APPENDED LAST (ordinal stability). These
+    //     are STATEMENT sugar: `i++` desugars to `i += 1`, `i--` to `i -= 1` at parse time,
+    //     so they need no checker/codegen/VM node (they reuse compound assignment).
+    TK_TOKEN_PLUSPLUS,      // `++` — postfix increment (statement)
+    TK_TOKEN_MINUSMINUS,    // `--` — postfix decrement (statement)
+
+    // --- string interpolation `$"…{expr}…"` (self-host parity). APPENDED LAST
+    //     (ordinal stability — operator kinds serialize by enum ordinal; INTERP is never a
+    //     stored op, so its ordinal is never serialized). The token's `.text` is the RAW
+    //     inner content between the quotes (holes + escapes still encoded); the PARSER
+    //     splits it into literal pieces + hole expressions (parse_expr's INTERP case).
+    TK_TOKEN_INTERP,        // `$"…{expr}…"` — an interpolated string (raw inner text)
 } tk_token_kind;
 
 // tk_token — mirrors token.tks `Token`: a kind + the source text span (a str VIEW
-// for most kinds; a FRESH decoded str for Str/Byte literals).
+// for most kinds; a FRESH decoded str for Str/Byte literals) + its 1-based source
+// LINE/COLUMN (stamped by the lexer — drives file:line:col diagnostics; M.3 honest).
 typedef struct {
     tk_token_kind kind;
     tk_str        text;
+    uint32_t      line;   // 1-based source line  (0 = unstamped)
+    uint32_t      col;    // 1-based source column
 } tk_token;
 
 #endif // TK_LEXER_TOKEN_H

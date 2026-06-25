@@ -1,15 +1,24 @@
 // src/checker/expr.tks  (namespace 'teko::checker')
 
+use teko::lexer
+
 // --- type predicates ---
 fn is_bool(t: Type) -> bool {
     match t { Prim as p => p.kind == PrimKind::Bool; _ => false }
 }
 fn is_integer(t: Type) -> bool {
-    match t { Prim as p => p.kind != PrimKind::Bool; _ => false }   // every Prim but Bool
+    match t { Prim as p => prim_is_int(p.kind); _ => false }        // U8..U128, I8..I128 (B.38)
 }
-// sign-check (B.22): two numerics compare regardless of sign/width; else same type.
+fn is_float(t: Type) -> bool {
+    match t { Prim as p => prim_is_float(p.kind); _ => false }      // F16/F32/F64 (B.38)
+}
+// the native numeric set (B.38): an int OR a float — bool is NOT numeric.
+fn is_numeric(t: Type) -> bool { is_integer(t) || is_float(t) }
+// sign-check (B.22): two integers compare regardless of sign/width; two floats compare only
+// at the same width; else same type. Mixed int/float is not comparable (needs a `to`).
 fn is_comparable(a: Type, b: Type) -> bool {
     if is_integer(a) && is_integer(b) { return true }
+    if is_float(a) && is_float(b) { return type_eq(a, b) }
     type_eq(a, b)
 }
 
@@ -17,9 +26,13 @@ fn is_comparable(a: Type, b: Type) -> bool {
 fn op_is_shift(op: lexer::TokenKind) -> bool {
     op == lexer::TokenKind::Shl || op == lexer::TokenKind::Shr
 }
+// + - * / — the strictly-arithmetic ops, legal on floats AND ints (B.38).
+fn op_is_arith(op: lexer::TokenKind) -> bool {
+    op == lexer::TokenKind::Plus || op == lexer::TokenKind::Minus ||
+    op == lexer::TokenKind::Star || op == lexer::TokenKind::Slash
+}
+// %, & | ^ — the remainder/bitwise ops, integer-only (no float bit-twiddling — B.38).
 fn op_is_arith_bitwise(op: lexer::TokenKind) -> bool {
-    op == lexer::TokenKind::Plus  || op == lexer::TokenKind::Minus ||
-    op == lexer::TokenKind::Star  || op == lexer::TokenKind::Slash ||
     op == lexer::TokenKind::Percent ||
     op == lexer::TokenKind::Amp || op == lexer::TokenKind::Pipe || op == lexer::TokenKind::Caret
 }

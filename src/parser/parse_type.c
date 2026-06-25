@@ -17,7 +17,7 @@ static tk_parsed_type_result parse_named(const tk_token *t, size_t n, size_t pos
 static tk_parsed_type_result parse_slice(const tk_token *t, size_t n, size_t pos) {
     if (!tk_is_kind_at(t, n, pos + 1, TK_TOKEN_RBRACKET)) {
         return (tk_parsed_type_result){ .ok = false,
-            .as.error = tk_error_make("expected ']' to close '[' in a slice type '[]T'") };
+            .as.error = tk_err_at(t, n, pos + 1, "expected ']' to close '[' in a slice type '[]T'") };
     }
     tk_parsed_type_result e = parse_type_primary(t, n, pos + 2);
     if (!e.ok) { return e; }
@@ -28,8 +28,20 @@ static tk_parsed_type_result parse_slice(const tk_token *t, size_t n, size_t pos
 }
 
 tk_parsed_type_result parse_type_primary(const tk_token *t, size_t n, size_t pos) {
-    if (tk_is_kind_at(t, n, pos, TK_TOKEN_LBRACKET)) { return parse_slice(t, n, pos); }
-    return parse_named(t, n, pos);
+    tk_parsed_type_result base =
+        tk_is_kind_at(t, n, pos, TK_TOKEN_LBRACKET) ? parse_slice(t, n, pos)
+                                                    : parse_named(t, n, pos);
+    if (!base.ok) { return base; }
+    // postfix `?` → an OPTIONAL type (T?  — REBOOT_PLAN §202; nullability only).
+    // Binds tighter than `|`, so `T? | U` is `(T?) | U`; doubled `T??` nests (T?)?.
+    size_t p = base.as.value.next;
+    tk_type_expr node = base.as.value.node;
+    while (tk_is_kind_at(t, n, p, TK_TOKEN_QUESTION)) {
+        tk_type_expr *inner = tk_box_type(node);
+        node = (tk_type_expr){ .tag = TK_TEXPR_OPTIONAL, .as.optional = { .inner = inner } };
+        p += 1;
+    }
+    return (tk_parsed_type_result){ .ok = true, .as.value = { .node = node, .next = p } };
 }
 
 tk_parsed_type_result tk_parse_type(const tk_token *t, size_t n, size_t pos) {

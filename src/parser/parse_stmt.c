@@ -15,7 +15,7 @@ static tk_parsed_stmt_result parse_assign (const tk_token *t, size_t n, size_t p
 
 tk_parsed_stmt_result tk_parse_statement(const tk_token *t, size_t n, size_t pos) {
     if (!tk_has_token(t, n, pos)) {
-        return (tk_parsed_stmt_result){ .ok = false, .as.error = tk_error_make("expected a statement") };
+        return (tk_parsed_stmt_result){ .ok = false, .as.error = tk_err_at(t, n, pos, "expected a statement") };
     }
     if (tk_is_kind_at(t, n, pos, TK_TOKEN_RETURN)) {
         size_t after = pos + 1;
@@ -30,27 +30,45 @@ tk_parsed_stmt_result tk_parse_statement(const tk_token *t, size_t n, size_t pos
         return (tk_parsed_stmt_result){ .ok = true, .as.value = { .node = s, .next = v.as.value.next } };
     }
     if (tk_is_kind_at(t, n, pos, TK_TOKEN_LOOP)) {
-        if (!tk_is_kind_at(t, n, pos + 1, TK_TOKEN_LBRACE)) {
-            return (tk_parsed_stmt_result){ .ok = false, .as.error = tk_error_make("expected '{' after `loop`") };
+        // optional label: `loop NAME { … }` (an IDENT right after `loop`, before the brace)
+        tk_str label = { .ptr = NULL, .len = 0 };
+        size_t lbrace = pos + 1;
+        if (tk_is_kind_at(t, n, pos + 1, TK_TOKEN_IDENT)) { label = t[pos + 1].text; lbrace = pos + 2; }
+        if (!tk_is_kind_at(t, n, lbrace, TK_TOKEN_LBRACE)) {
+            return (tk_parsed_stmt_result){ .ok = false, .as.error = tk_err_at(t, n, lbrace, "expected '{' after `loop`") };
         }
-        tk_parsed_block_result blk = tk_parse_block(t, n, pos + 1);
+        tk_parsed_block_result blk = tk_parse_block(t, n, lbrace);
         if (!blk.ok) { return (tk_parsed_stmt_result){ .ok = false, .as.error = blk.as.error }; }
-        tk_statement s = { .tag = TK_STMT_LOOP, .as.loop_stmt = { .body = blk.as.value.statements, .nbody = blk.as.value.n } };
+        tk_statement s = { .tag = TK_STMT_LOOP, .as.loop_stmt = { .label = label, .body = blk.as.value.statements, .nbody = blk.as.value.n } };
         return (tk_parsed_stmt_result){ .ok = true, .as.value = { .node = s, .next = blk.as.value.next } };
     }
     if (tk_is_kind_at(t, n, pos, TK_TOKEN_BREAK)) {
-        tk_statement s = { .tag = TK_STMT_BREAK };
-        return (tk_parsed_stmt_result){ .ok = true, .as.value = { .node = s, .next = pos + 1 } };
+        // optional label on the SAME line: `break NAME` (a separator would tokenize between)
+        tk_str label = { .ptr = NULL, .len = 0 }; size_t next = pos + 1;
+        if (tk_is_kind_at(t, n, pos + 1, TK_TOKEN_IDENT)) { label = t[pos + 1].text; next = pos + 2; }
+        tk_statement s = { .tag = TK_STMT_BREAK, .as.jump = { .label = label } };
+        return (tk_parsed_stmt_result){ .ok = true, .as.value = { .node = s, .next = next } };
     }
     if (tk_is_kind_at(t, n, pos, TK_TOKEN_CONTINUE)) {
-        tk_statement s = { .tag = TK_STMT_CONTINUE };
-        return (tk_parsed_stmt_result){ .ok = true, .as.value = { .node = s, .next = pos + 1 } };
+        tk_str label = { .ptr = NULL, .len = 0 }; size_t next = pos + 1;
+        if (tk_is_kind_at(t, n, pos + 1, TK_TOKEN_IDENT)) { label = t[pos + 1].text; next = pos + 2; }
+        tk_statement s = { .tag = TK_STMT_CONTINUE, .as.jump = { .label = label } };
+        return (tk_parsed_stmt_result){ .ok = true, .as.value = { .node = s, .next = next } };
     }
     if (tk_is_kind_at(t, n, pos, TK_TOKEN_LET) || tk_is_kind_at(t, n, pos, TK_TOKEN_MUT) || tk_is_kind_at(t, n, pos, TK_TOKEN_CONST)) {
         return parse_binding(t, n, pos);
     }
     if (tk_is_kind_at(t, n, pos, TK_TOKEN_IDENT) && tk_is_assign_op(t, n, pos + 1)) {
         return parse_assign(t, n, pos);
+    }
+    // `i++` / `i--` — postfix increment/decrement STATEMENT sugar: desugar to the compound
+    // assignment `i += 1` / `i -= 1` (reuses assign typing/codegen/VM; mut-guard included).
+    if (tk_is_kind_at(t, n, pos, TK_TOKEN_IDENT) &&
+        (tk_is_kind_at(t, n, pos + 1, TK_TOKEN_PLUSPLUS) || tk_is_kind_at(t, n, pos + 1, TK_TOKEN_MINUSMINUS))) {
+        tk_token_kind op = tk_is_kind_at(t, n, pos + 1, TK_TOKEN_PLUSPLUS) ? TK_TOKEN_PLUSEQ : TK_TOKEN_MINUSEQ;
+        tk_expr one = { .tag = TK_EXPR_NUMBER, .as.number = { .is_float = false, .value = 1 } };
+        tk_statement s = { .tag = TK_STMT_ASSIGN, .as.assign = { .name = t[pos].text, .op = op, .value = one } };
+        return (tk_parsed_stmt_result){ .ok = true, .as.value = { .node = s, .next = pos + 2 } };
     }
     tk_parsed_result e = tk_parse_expr(t, n, pos);
     if (!e.ok) { return (tk_parsed_stmt_result){ .ok = false, .as.error = e.as.error }; }
@@ -69,7 +87,7 @@ tk_parsed_block_result tk_parse_block(const tk_token *t, size_t n, size_t pos) {
         p = s.as.value.next;
         if (tk_is_kind_at(t, n, p, TK_TOKEN_RBRACE)) { break; }
         if (!tk_is_sep(t, n, p)) {
-            return (tk_parsed_block_result){ .ok = false, .as.error = tk_error_make("expected ';', a newline, or '}' after a statement") };
+            return (tk_parsed_block_result){ .ok = false, .as.error = tk_err_at(t, n, p, "expected ';', a newline, or '}' after a statement") };
         }
         p = tk_skip_seps(t, n, p);
     }
@@ -97,7 +115,7 @@ static tk_parsed_target_result parse_bind_target(const tk_token *t, size_t n, si
         return (tk_parsed_target_result){ .ok = true, .as.value = { .node = tgt, .next = names.as.value.next } };
     }
     if (!tk_is_kind_at(t, n, pos, TK_TOKEN_IDENT)) {
-        return (tk_parsed_target_result){ .ok = false, .as.error = tk_error_make("expected a name or `{ … }` after `let`/`mut`/`const`") };
+        return (tk_parsed_target_result){ .ok = false, .as.error = tk_err_at(t, n, pos, "expected a name or `{ … }` after `let`/`mut`/`const`") };
     }
     tk_bind_target tgt = { .tag = TK_BIND_SIMPLE, .as.simple = { .name = t[pos].text } };
     return (tk_parsed_target_result){ .ok = true, .as.value = { .node = tgt, .next = pos + 1 } };
@@ -112,7 +130,7 @@ static tk_parsed_stmt_result parse_binding(const tk_token *t, size_t n, size_t p
     tk_annotation_result ann = parse_annotation(t, n, tgt.as.value.next);
     if (!ann.ok) { return (tk_parsed_stmt_result){ .ok = false, .as.error = ann.as.error }; }
     if (!tk_is_kind_at(t, n, ann.as.value.next, TK_TOKEN_ASSIGN)) {
-        return (tk_parsed_stmt_result){ .ok = false, .as.error = tk_error_make("expected '=' in a binding") };
+        return (tk_parsed_stmt_result){ .ok = false, .as.error = tk_err_at(t, n, ann.as.value.next, "expected '=' in a binding") };
     }
     tk_parsed_result v = tk_parse_expr(t, n, ann.as.value.next + 1);
     if (!v.ok) { return (tk_parsed_stmt_result){ .ok = false, .as.error = v.as.error }; }

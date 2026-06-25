@@ -1,5 +1,5 @@
 // src/emit/header.c — E-emit-a, the `.tkh` HEADER-BUILDING DRIVER. Mirrors header.tks.
-// Walk a CHECKED typed program, keep only the EXPORTED (`is_exp`) items, build their
+// Walk a CHECKED typed program, keep only the EXPORTED (`vis == exp`) items, build their
 // export signatures, assemble a tk_header, then (emit_program) emit it via tk_emit_tkh.
 // Reuses tk_resolve_type; adds no codec primitive (M.5).
 #include "header.h"
@@ -73,7 +73,7 @@ static tyexport_result build_tyexport(tk_type_decl d, tk_type_table table) {
     return (tyexport_result){ .ok = false, .as.error = tk_error_make("unknown type body shape") };
 }
 
-// --- THE DRIVER: walk the typed program, keep only `is_exp` items, build the Header ---
+// --- THE DRIVER: walk the typed program, keep only `exp` items, build the Header ---
 tk_header_result tk_build_header(tk_tprogram prog, tk_type_table table) {
     tk_tyexport_list types = tk_tyexport_list_empty();
     tk_fnsig_list    fns   = tk_fnsig_list_empty();
@@ -81,14 +81,14 @@ tk_header_result tk_build_header(tk_tprogram prog, tk_type_table table) {
         tk_titem it = prog.items[i];
         switch (it.tag) {
             case TK_TITEM_FUNCTION:
-                if (it.as.function.is_exp) {
+                if (it.as.function.vis == TK_VIS_EXP) {   // only `exp` reaches the .tkh (pub is project-internal)
                     fnsig_result s = build_fnsig(it.as.function, table);
                     if (!s.ok) return hdr_err(s.as.error.message);
                     fns = tk_fnsig_list_push(fns, s.as.value);
                 }
                 break;
             case TK_TITEM_TYPE_DECL:
-                if (it.as.type_decl.is_exp) {
+                if (it.as.type_decl.vis == TK_VIS_EXP) {   // only `exp` reaches the .tkh
                     tyexport_result t = build_tyexport(it.as.type_decl, table);
                     if (!t.ok) return hdr_err(t.as.error.message);
                     types = tk_tyexport_list_push(types, t.as.value);

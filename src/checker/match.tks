@@ -1,19 +1,21 @@
 // src/checker/match.tks  (namespace 'teko::checker')
 
+use teko::parser
+
 // validate a pattern against the subject; return the env extended with bindings.
-fn check_pattern(p: Pattern, subject: Type, env: Env, table: TypeTable) -> Env | error {
+fn check_pattern(p: parser::Pattern, subject: Type, env: Env, table: TypeTable) -> Env | error {
     match p {
-        WildcardPattern   => env
-        BindPattern as bp => {
+        parser::WildcardPattern   => env
+        parser::BindPattern as bp => {
             let ct = match resolve_named(bp.type_name, table) { Type as t => t; error as e => return e }
             define(env, bp.binding, ct, false)     // `Type as name` → name : the case type (match-binding immutable — B.21)
         }
-        LiteralPattern as lp => {
+        parser::LiteralPattern as lp => {
             let lt = match type_expr(lp.value, env, table) { TExpr as te => te.type; error as e => return e }
             if !type_eq(lt, subject) { return error { message = "literal pattern does not match the subject type" } }
             env
         }
-        FieldPattern as fp => {
+        parser::FieldPattern as fp => {
             // C7a: variant axis `Type { f; g }` — resolve to a struct, bind each field IMMUTABLE (B.21).
             let nt = match resolve_named(fp.type_name, table) { Type as t => t; error as e => return e }
             let name = match nt {
@@ -21,11 +23,11 @@ fn check_pattern(p: Pattern, subject: Type, env: Env, table: TypeTable) -> Env |
                 _          => return error { message = "field pattern requires a struct type" }
             }
             let decl = match type_table_find(table, name) {
-                TypeDecl as td => td
+                parser::TypeDecl as td => td
                 error          => return error { message = $"unknown type in field pattern: {name}" }
             }
             let sb = match decl.body {
-                StructBody as s => s
+                parser::StructBody as s => s
                 _               => return error { message = $"type {name} is not a struct (no fields)" }
             }
             mut e2 = env
@@ -38,24 +40,24 @@ fn check_pattern(p: Pattern, subject: Type, env: Env, table: TypeTable) -> Env |
             }
             e2
         }
-        RangePattern as rp => {
+        parser::RangePattern as rp => {
             // C7a: `lo ..= hi` — both bounds type_eq the subject, AND the subject is an integer (M.1/M.2).
             let lo = match type_expr(rp.lo, env, table) { TExpr as te => te.type; error as e => return e }
             let hi = match type_expr(rp.hi, env, table) { TExpr as te => te.type; error as e => return e }
             if !type_eq(lo, subject) { return error { message = "range lower bound does not match the subject type" } }
             if !type_eq(hi, subject) { return error { message = "range upper bound does not match the subject type" } }
-            if !is_integer(subject) { return error { message = "range pattern requires an integer subject" } }
+            if !is_integer(subject) { return error { message = "range pattern requires an integer subject (B.38 — not a float)" } }
             env       // binds nothing
         }
-        AltPattern as ap => {
+        parser::AltPattern as ap => {
             // C7a: `a | b | …` — each option checked against the subject; NO option may bind (settled axis rule).
             mut i = 0
             loop {
                 if i >= ap.options.len { break }
                 let opt = ap.options[i]
                 match opt {
-                    BindPattern as bp => { if bp.has_binding { return error { message = "an alternative (`|`) cannot bind; use a separate arm" } } }
-                    FieldPattern      => return error { message = "an alternative (`|`) cannot bind; use a separate arm" }
+                    parser::BindPattern as bp => { if bp.has_binding { return error { message = "an alternative (`|`) cannot bind; use a separate arm" } } }
+                    parser::FieldPattern      => return error { message = "an alternative (`|`) cannot bind; use a separate arm" }
                     _                 => {}
                 }
                 // recurse for validation (the subject must accept each option); discard the env — Alt binds nothing.
@@ -70,12 +72,12 @@ fn check_pattern(p: Pattern, subject: Type, env: Env, table: TypeTable) -> Env |
 // --- exhaustiveness (B.15) ---
 
 // an UNGUARDED `_` covers everything; a guarded `_ when g` does NOT (B.15 — `when` excluded).
-fn has_wildcard(arms: []Arm) -> bool {
+fn has_wildcard(arms: []parser::Arm) -> bool {
     mut i = 0
     loop {
         if i >= arms.len { break }
         if !arms[i].has_when {
-            match arms[i].pattern { WildcardPattern => return true; _ => {} }
+            match arms[i].pattern { parser::WildcardPattern => return true; _ => {} }
         }
         i++
     }
@@ -83,18 +85,18 @@ fn has_wildcard(arms: []Arm) -> bool {
 }
 
 // the case-name(s) a variant pattern selects: a single Bind/Field, or EACH bare option of an Alt.
-fn arm_case_names(p: Pattern) -> []str {
+fn arm_case_names(p: parser::Pattern) -> []str {
     match p {
-        BindPattern as bp  => teko::list::push(teko::list::empty(), bp.type_name.segments[bp.type_name.segments.len - 1].name)
-        FieldPattern as fp => teko::list::push(teko::list::empty(), fp.type_name.segments[fp.type_name.segments.len - 1].name)
-        AltPattern as ap   => {
+        parser::BindPattern as bp  => teko::list::push(teko::list::empty(), bp.type_name.segments[bp.type_name.segments.len - 1].name)
+        parser::FieldPattern as fp => teko::list::push(teko::list::empty(), fp.type_name.segments[fp.type_name.segments.len - 1].name)
+        parser::AltPattern as ap   => {
             mut names = teko::list::empty()
             mut i = 0
             loop {
                 if i >= ap.options.len { break }
                 match ap.options[i] {
-                    BindPattern as bp  => { names = teko::list::push(names, bp.type_name.segments[bp.type_name.segments.len - 1].name) }
-                    FieldPattern as fp => { names = teko::list::push(names, fp.type_name.segments[fp.type_name.segments.len - 1].name) }
+                    parser::BindPattern as bp  => { names = teko::list::push(names, bp.type_name.segments[bp.type_name.segments.len - 1].name) }
+                    parser::FieldPattern as fp => { names = teko::list::push(names, fp.type_name.segments[fp.type_name.segments.len - 1].name) }
                     _                  => {}
                 }
                 i++
@@ -106,7 +108,7 @@ fn arm_case_names(p: Pattern) -> []str {
 }
 
 // is `name` covered by some UNGUARDED arm (directly via Bind/Field, or via an Alt option)?
-fn some_arm_names(arms: []Arm, name: str) -> bool {
+fn some_arm_names(arms: []parser::Arm, name: str) -> bool {
     mut i = 0
     loop {
         if i >= arms.len { break }
@@ -125,7 +127,7 @@ fn some_arm_names(arms: []Arm, name: str) -> bool {
 }
 
 // every member of the variant must be named by some unguarded arm.
-fn variant_covered(arms: []Arm, members: []Type) -> bool {
+fn variant_covered(arms: []parser::Arm, members: []Type) -> bool {
     mut i = 0
     loop {
         if i >= members.len { break }
@@ -138,10 +140,12 @@ fn variant_covered(arms: []Arm, members: []Type) -> bool {
     true
 }
 
-// a `_` covers all; otherwise a Variant subject must have every case named.
-fn exhaustive(arms: []Arm, subject: Type) -> bool {
+// a `_` covers all; otherwise a Variant subject must have every case named. A NAMED variant
+// subject is first expanded to its Variant cases (B.14/B.15) so `match s { Circle … }` over a
+// `Shape = Circle | …` covers exhaustively.
+fn exhaustive(arms: []parser::Arm, subject: Type, table: TypeTable) -> bool {
     if has_wildcard(arms) { return true }
-    match subject {
+    match expand_variant(subject, table) {       // a NAMED variant → its Variant cases (B.14/B.15)
         Variant as v => variant_covered(arms, v.members)
         _            => false
     }

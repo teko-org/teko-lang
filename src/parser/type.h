@@ -22,13 +22,14 @@ typedef struct {                                     // Path = struct { segments
 // =========================================================================
 // Type expressions (parser/type.tks: NamedType, SliceType, UnionType, TypeExpr)
 // =========================================================================
-typedef struct tk_type_expr tk_type_expr;            // recursive (Slice/Union hold TypeExpr)
+typedef struct tk_type_expr tk_type_expr;            // recursive (Slice/Union/Optional hold TypeExpr)
 struct tk_type_expr {
-    enum { TK_TEXPR_NAMED, TK_TEXPR_SLICE, TK_TEXPR_UNION } tag;
+    enum { TK_TEXPR_NAMED, TK_TEXPR_SLICE, TK_TEXPR_UNION, TK_TEXPR_OPTIONAL } tag;
     union {
-        struct { tk_path path; }                       named;   // NamedType (u64 | lexer::Token)
-        struct { tk_type_expr *element; }              slice;   // SliceType ([]T)
-        struct { tk_type_expr *members; size_t len; }  uni;     // UnionType (A | B | …)  ('union' is reserved)
+        struct { tk_path path; }                       named;    // NamedType (u64 | lexer::Token)
+        struct { tk_type_expr *element; }              slice;    // SliceType ([]T)
+        struct { tk_type_expr *members; size_t len; }  uni;      // UnionType (A | B | …)  ('union' is reserved)
+        struct { tk_type_expr *inner; }                optional; // OptionalType (T?) — REBOOT_PLAN §202; checker maps to TK_TYPE_OPTIONAL
     } as;
 };
 

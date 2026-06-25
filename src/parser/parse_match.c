@@ -18,21 +18,21 @@ static tk_parsed_arms_result parse_arms(const tk_token *t, size_t n, size_t pos)
         p = a.as.value.next;
         if (tk_is_kind_at(t, n, p, TK_TOKEN_RBRACE)) { break; }
         if (!tk_is_sep(t, n, p)) {
-            return (tk_parsed_arms_result){ .ok = false, .as.error = tk_error_make("expected ';', a newline, or '}' after a match arm") };
+            return (tk_parsed_arms_result){ .ok = false, .as.error = tk_err_at(t, n, p, "expected ';', a newline, or '}' after a match arm") };
         }
         p = tk_skip_seps(t, n, p);
     }
     if (na == 0) {
-        return (tk_parsed_arms_result){ .ok = false, .as.error = tk_error_make("a `match` needs at least one arm") };
+        return (tk_parsed_arms_result){ .ok = false, .as.error = tk_err_at(t, n, p, "a `match` needs at least one arm") };
     }
     return (tk_parsed_arms_result){ .ok = true, .as.value = { .arms = arms, .n_arms = na, .next = p + 1 } };
 }
 
 tk_parsed_result parse_match(const tk_token *t, size_t n, size_t pos) {
-    tk_parsed_result subj = tk_parse_expr(t, n, pos + 1);
+    tk_parsed_result subj = tk_parse_expr_no_struct(t, n, pos + 1);   // trailing `{` opens the arms, not a struct literal (W4a)
     if (!subj.ok) { return subj; }
     if (!tk_is_kind_at(t, n, subj.as.value.next, TK_TOKEN_LBRACE)) {
-        return (tk_parsed_result){ .ok = false, .as.error = tk_error_make("expected '{' after the `match` subject") };
+        return (tk_parsed_result){ .ok = false, .as.error = tk_err_at(t, n, subj.as.value.next, "expected '{' after the `match` subject") };
     }
     tk_parsed_arms_result arms = parse_arms(t, n, subj.as.value.next);
     if (!arms.ok) { return (tk_parsed_result){ .ok = false, .as.error = arms.as.error }; }

@@ -1,5 +1,15 @@
 # Teko — O Checker (`src/checker/*`), em Teko + C23
 
+> **Correção doutrinária (alinhada a TEKO_HISTORY §B.37).** Este snapshot congelado
+> introduziu, por deriva, o tipo `Unit` (struct vazio "value-less") e usava as formas
+> superadas `Error` / `Unit | error` / `-> Unit`. Conforme as quatro regras de §B.37:
+> `Unit` **deixa de existir** — "não retorna valor" é `void`, um **marcador de retorno**
+> (nunca tipo/valor/membro/binding); `error` é o tipo **nativo minúsculo** (supera
+> `Error`); um check falível-sem-valor é `-> error?` (null = ok), nunca `Unit | error`
+> nem `void | error`. As ocorrências abaixo foram corrigidas para espelhar o
+> `src/checker/type.tks` reconstruído; a lógica é preservada — só as formas que violavam
+> as regras mudaram.
+
 O **checker** roda entre o parser e o backend: recebe a **AST** e devolve a **AST
 tipada** (anota tipos resolvidos + valida). *"O parser registra estrutura, o checker
 dá semântica."* Ele **não desugar** (isso é do codegen) e **não muda a estrutura**.
@@ -65,20 +75,29 @@ type PrimKind = enum {
     Bool
 }
 
+// Doctrinal correction (TEKO_HISTORY §B.37; mirrors src/checker/type.tks):
+//   - `Unit` (the value-less struct) is EXCISED. "Returns no value" is `void`.
+//   - `void` is a RETURN-ONLY marker: legal ONLY as `Func.ret`. It is never a
+//     value, never a binding type, never a variant member.
+//   - `error` is the native lowercase type — it SUPERSEDES the old capitalized `Error`.
+//   - `Optional` (`T?`) is the built-in unary type-former for nullability; a variant
+//     member may NOT be optional.
+
 // the cases that carry data (Teko has no payload on a bare enum — a variant case
-// is a struct). Byte/Str/Error are markers (no payload).
-type Prim    = struct { kind: PrimKind }
-type Slice   = struct { element: Type }        // []T — recursive (B.8)
-type Named   = struct { name: str }            // a user type, equal by NAME (nominal)
-type Variant = struct { members: []Type }      // A | B | … (two or more)
-type Func    = struct { params: []Type; ret: Type }   // (params) -> ret
-type Byte    = struct { }                      // the octet type
-type Str     = struct { }                      // validated UTF-8
-type Error  = struct { }                      // the injected error
-type Unit   = struct { }                      // value-less (a block with no trailing expr)
+// is a struct). Byte/Str/error/void are markers (no payload).
+type Prim     = struct { kind: PrimKind }
+type Slice    = struct { element: Type }       // []T — recursive (B.8)
+type Optional = struct { inner: Type }         // T? — built-in nullable former (like Slice)
+type Named    = struct { name: str }           // a user type, equal by NAME (nominal)
+type Variant  = struct { members: []Type }     // A | B | … (two or more); members are COMPLETE types
+type Func     = struct { params: []Type; ret: Type }   // (params) -> ret  (ret may be void)
+type Byte     = struct { }                     // the octet type
+type Str      = struct { }                     // validated UTF-8
+type Error    = struct { }                     // the native `error` (lowercase; supersedes `Error`)
+type Void     = struct { }                     // return-only marker; legal ONLY as Func.ret
 
 // a semantic type. (Compiler-managed indirection for the recursive cases.)
-type Type = Prim | Byte | Str | Slice | Named | Variant | Func | Error | Unit
+type Type = Prim | Byte | Str | Slice | Optional | Named | Variant | Func | Error | Void
 
 // nominal type equality (B.13): structural over the shape, but Named is by name.
 fn type_eq(a: Type, b: Type) -> bool {
@@ -86,9 +105,10 @@ fn type_eq(a: Type, b: Type) -> bool {
         Prim as pa    => match b { Prim as pb    => pa.kind == pb.kind;             _ => false }
         Byte          => match b { Byte          => true;                           _ => false }
         Str           => match b { Str           => true;                           _ => false }
-        Error        => match b { Error        => true;                           _ => false }
-        Unit         => match b { Unit         => true;                           _ => false }
+        Error         => match b { Error         => true;                           _ => false }  // native `error`
+        Void          => match b { Void          => true;                           _ => false }  // return-only marker
         Slice as sa   => match b { Slice as sb   => type_eq(sa.element, sb.element); _ => false }
+        Optional as oa => match b { Optional as ob => type_eq(oa.inner, ob.inner);  _ => false }
         Named as na   => match b { Named as nb   => na.name == nb.name;             _ => false }
         Variant as va => match b { Variant as vb => types_eq(va.members, vb.members); _ => false }
         Func as fa    => match b {
@@ -130,8 +150,10 @@ typedef enum {
 } tk_prim_kind;
 
 typedef enum {
-    TK_TYPE_PRIM, TK_TYPE_BYTE, TK_TYPE_STR, TK_TYPE_SLICE,
-    TK_TYPE_NAMED, TK_TYPE_VARIANT, TK_TYPE_FUNC, TK_TYPE_ERROR, TK_TYPE_UNIT,
+    TK_TYPE_PRIM, TK_TYPE_BYTE, TK_TYPE_STR, TK_TYPE_SLICE, TK_TYPE_OPTIONAL,
+    TK_TYPE_NAMED, TK_TYPE_VARIANT, TK_TYPE_FUNC, TK_TYPE_ERROR, TK_TYPE_VOID,
+    // TK_TYPE_VOID is the return-only marker (supersedes the excised TK_TYPE_UNIT);
+    // TK_TYPE_ERROR is the native lowercase `error`. (TEKO_HISTORY §B.37.)
 } tk_type_tag;
 
 // recursive (the Slice/Variant/Func cases hold tk_type) — the indirection the Teko
@@ -143,10 +165,11 @@ struct tk_type {
     union {
         tk_prim_kind prim;                                   // TK_TYPE_PRIM
         struct { tk_type *element; }            slice;       // TK_TYPE_SLICE
+        struct { tk_type *inner; }              optional;    // TK_TYPE_OPTIONAL (T?)
         struct { tk_str name; }                 named;       // TK_TYPE_NAMED (nominal)
         struct { tk_type *members; size_t len; } variant;    // TK_TYPE_VARIANT
         struct { tk_type *params; size_t nparams; tk_type *ret; } func;  // TK_TYPE_FUNC
-        // BYTE, STR, ERROR carry no payload
+        // BYTE, STR, ERROR, VOID carry no payload
     } as;
 };
 
@@ -184,8 +207,9 @@ bool tk_type_eq(const tk_type *a, const tk_type *b) {
         case TK_TYPE_BYTE:  return true;
         case TK_TYPE_STR:   return true;
         case TK_TYPE_ERROR: return true;
-        case TK_TYPE_UNIT:  return true;
+        case TK_TYPE_VOID:  return true;
         case TK_TYPE_SLICE: return tk_type_eq(a->as.slice.element, b->as.slice.element);
+        case TK_TYPE_OPTIONAL: return tk_type_eq(a->as.optional.inner, b->as.optional.inner);
         case TK_TYPE_NAMED: return tk_str_eq(a->as.named.name, b->as.named.name);   // nominal
         case TK_TYPE_VARIANT:
             return tk_types_eq(a->as.variant.members, a->as.variant.len,
@@ -1007,7 +1031,7 @@ bool tk_exhaustive(tk_arm *arms, size_t n, tk_type subject) {
 ### C23 — `src/checker/check.h`
 
 ```c
-// src/checker/check.h — the shared checker result type (Unit | error).
+// src/checker/check.h — the shared checker result type (an `error?`: null = ok).
 // (The legacy tk_check_function/item/program driver was retired; the typed
 //  layer's tk_type_program is the entry point. revalidate.c still uses this type.)
 #ifndef TK_CHECK_H
@@ -1015,7 +1039,8 @@ bool tk_exhaustive(tk_arm *arms, size_t n, tk_type subject) {
 
 #include "collect.h"   // pulls resolve.h → tk_error, bool
 
-// Unit | error — `ok` on success; `error` is valid iff `!ok`.
+// `error?` — `ok` (no error) on success; `error` is valid iff `!ok`. The C struct
+// is the tagged scaffolding for an `error?` (null when ok).
 typedef struct { bool ok; tk_error error; } tk_check_result;
 
 #endif // TK_CHECK_H
@@ -1092,7 +1117,7 @@ type TStatement = TBinding | TAssign | TReturn | TLoopStmt | TBreakStmt | TConti
 type TFunction = struct {
     name:        str
     params:      []Param          // immutable params (B.21) — carried from the parser unchanged
-    return_type: Type             // resolved (Unit when the function has no `-> ret`)
+    return_type: Type             // resolved (void when the function returns no value, `-> void`)
     body:        []TStatement
     is_exp:      bool             // exported? (filtered into the `.tkh` later — M.4)
 }
@@ -1242,25 +1267,25 @@ fn cast_kind(t: Type) -> PrimKind | error {
 // is `from -> to` a DEFINED conversion? Any integer/byte ↔ integer/byte is (the loss is
 // runtime/codegen's — B; byte casts AS u8 — B.36). Only Bool and non-numeric ends are rejected.
 // Reused by the counter-validation (E6-2) — ONE source of truth (M.5).
-fn cast_check(from: Type, to: Type) -> Unit | error {
-    if type_eq(from, to) { return Unit { } }                     // same type — a no-op
+fn cast_check(from: Type, to: Type) -> error? {                  // fallible-no-value: null = ok, error = failure
+    if type_eq(from, to) { return null }                         // same type — a no-op
     let _ = match cast_kind(from) { PrimKind as k => k; error as e => return e }
     let _ = match cast_kind(to)   { PrimKind as k => k; error as e => return e }
-    Unit { }                                                     // any numeric/byte → any numeric/byte is defined (B; byte AS u8)
+    null                                                          // any numeric/byte → any numeric/byte is defined (B; byte AS u8)
 }
 
 // a CONSTANT literal already out of the target's range is a compile error (M.1 — fail early);
 // non-constant operands are guarded at runtime by codegen. Direct literals only (comptime folding deferred).
-fn const_range_check(e: Expr, target: Type) -> Unit | error {
+fn const_range_check(e: Expr, target: Type) -> error? {          // fallible-no-value: null = ok, error = failure
     match e {
         Number as n => match cast_kind(target) {                 // byte target → U8 range (0..255)
             PrimKind as k => {
-                if value_fits(n.value, k) { Unit { } }
+                if value_fits(n.value, k) { null }
                 else { error { message = "constant out of range for the cast target (M.1 — fail early)" } }
             }
-            error         => Unit { }                            // non-numeric target: cast_check already rejected it
+            error         => null                                // non-numeric target: cast_check already rejected it
         }
-        _ => Unit { }                                            // not a constant literal → runtime-guarded (codegen)
+        _ => null                                                // not a constant literal → runtime-guarded (codegen)
     }
 }
 
@@ -1271,11 +1296,11 @@ fn const_range_check(e: Expr, target: Type) -> Unit | error {
 // NOTE: the counter-validation does NOT yet re-prove the binding-level fit — a forged typed tree
 // `bound=u8, value=300` would currently pass revalidate. That re-proof lands with `validate_statement`
 // (deferred; named gap — §VI). The front-line type check above already rejects such source.
-fn annotated_literal_ok(value: Expr, ann: Type) -> Unit | error {
+fn annotated_literal_ok(value: Expr, ann: Type) -> error? {      // fallible-no-value: null = ok, error = failure
     match value {
         Number as n => match ann {
             Prim as p => {
-                if value_fits(n.value, p.kind) { Unit { } }
+                if value_fits(n.value, p.kind) { null }
                 else { error { message = "literal out of range for the annotated type (M.1 — fail early)" } }
             }
             _ => error { message = "value type does not match annotation" }
@@ -1290,8 +1315,8 @@ fn annotated_literal_ok(value: Expr, ann: Type) -> Unit | error {
 fn type_cast(c: Cast, env: Env, table: TypeTable) -> TExpr | error {
     let inner = match type_expr(c.expr, env, table) { TExpr as te => te; error as e => return e }
     let target = match resolve_type(c.target, table) { Type as t => t; error as e => return e }
-    let _ = match cast_check(inner.type, target) { Unit as u => u; error as e => return e }
-    let _ = match const_range_check(c.expr, target) { Unit as u => u; error as e => return e }
+    match cast_check(inner.type, target) { null => {}; error as e => return e }
+    match const_range_check(c.expr, target) { null => {}; error as e => return e }
     TExpr { kind = TCast { expr = inner }; type = target }        // the cast's type IS the resolved target
 }
 
@@ -1347,12 +1372,12 @@ fn type_expr(e: Expr, env: Env, table: TypeTable) -> TExpr | error {
     }
 }
 
-// ---- the value-type a TYPED block yields: the last stmt's, if an ExprStmt; else Unit ----
+// ---- the value-type a TYPED block yields: the last stmt's, if an ExprStmt; else void (no value) ----
 fn tblock_type(stmts: []TStatement) -> Type {
-    if stmts.len == 0 { return Unit { } }
+    if stmts.len == 0 { return Void { } }
     match stmts[stmts.len - 1] {
         TExprStmt as es => es.expr.type
-        _               => Unit { }
+        _               => Void { }
     }
 }
 
@@ -1384,16 +1409,16 @@ fn type_if(f: IfExpr, env: Env, table: TypeTable) -> TExpr | error {
     TExpr { kind = TIfExpr { cond = c; then_blk = tb.stmts; has_else = true; else_blk = eb.stmts }; type = tt }
 }
 
-// ---- if as a STATEMENT: cond bool; branches validated; no `else`; value discarded → Unit ----
+// ---- if as a STATEMENT: cond bool; branches validated; no `else`; value discarded → void ----
 fn type_if_stmt(f: IfExpr, env: Env, table: TypeTable) -> TExpr | error {
     let c = match type_expr(f.cond, env, table) { TExpr as te => te; error as e => return e }
     if !is_bool(c.type) { return error { message = "an `if` condition must be a bool" } }
     let tb = match type_block(f.then_blk, env, table) { TypedBlock as bk => bk; error as e => return e }
     if f.has_else {
         let eb = match type_block(f.else_blk, env, table) { TypedBlock as bk => bk; error as e => return e }
-        return TExpr { kind = TIfExpr { cond = c; then_blk = tb.stmts; has_else = true; else_blk = eb.stmts }; type = Unit { } }
+        return TExpr { kind = TIfExpr { cond = c; then_blk = tb.stmts; has_else = true; else_blk = eb.stmts }; type = Void { } }
     }
-    TExpr { kind = TIfExpr { cond = c; then_blk = tb.stmts; has_else = false; else_blk = tb.stmts }; type = Unit { } }   // else_blk gated by has_else
+    TExpr { kind = TIfExpr { cond = c; then_blk = tb.stmts; has_else = false; else_blk = tb.stmts }; type = Void { } }   // else_blk gated by has_else
 }
 
 // ---- one typed arm: pattern extends env; `when` guard bool; body typed in that env ----
@@ -1429,7 +1454,7 @@ fn type_match(m: MatchExpr, env: Env, table: TypeTable) -> TExpr | error {
     TExpr { kind = TMatchExpr { subject = s; arms = arms }; type = first }
 }
 
-// ---- match as a STATEMENT: validate the arms; exhaustiveness forced; value discarded → Unit ----
+// ---- match as a STATEMENT: validate the arms; exhaustiveness forced; value discarded → void ----
 fn type_match_stmt(m: MatchExpr, env: Env, table: TypeTable) -> TExpr | error {
     let s = match type_expr(m.subject, env, table) { TExpr as te => te; error as e => return e }
     mut arms = teko::list::empty()
@@ -1441,7 +1466,7 @@ fn type_match_stmt(m: MatchExpr, env: Env, table: TypeTable) -> TExpr | error {
         i++
     }
     if !exhaustive(m.arms, s.type) { return error { message = "non-exhaustive `match` (cover all cases or add `_`)" } }
-    TExpr { kind = TMatchExpr { subject = s; arms = arms }; type = Unit { } }
+    TExpr { kind = TMatchExpr { subject = s; arms = arms }; type = Void { } }
 }
 
 // ---- statements (the evolved check_* — produce the typed node + advance the env) ----
@@ -1452,7 +1477,7 @@ fn type_binding(b: Binding, env: Env, table: TypeTable) -> TypedStmt | error {
     if b.has_type {
         let at = match resolve_type(b.type_ann, table) { Type as t => t; error as e => return e }
         if !type_eq(v.type, at) {
-            let _ = match annotated_literal_ok(b.value, at) { Unit as u => u; error as e => return e }   // C6: a fitting literal adopts T (leaf stays i64)
+            match annotated_literal_ok(b.value, at) { null => {}; error as e => return e }   // C6: a fitting literal adopts T (leaf stays i64)
         }
         bound = at
     }
@@ -1513,9 +1538,9 @@ fn type_statement(s: Statement, env: Env, table: TypeTable) -> TypedStmt | error
 
 // ---- items + program (the evolved check_function/check_item/check_program — E5c) ----
 
-// the resolved return type: the annotation if present, else Unit (no `-> ret`).
+// the resolved return type: the annotation if present, else void (the `-> void` marker — no value).
 fn function_return(f: Function, table: TypeTable) -> Type | error {
-    if !f.has_return { return Unit { } }
+    if !f.has_return { return Void { } }
     resolve_type(f.return_type, table)
 }
 
@@ -1548,54 +1573,54 @@ fn assignable_to(from: Type, to: Type) -> bool {
 
 // check every `return` reachable as a statement (descend into loop bodies and `if`-blocks;
 // match-arm returns await the divergence item — arm bodies are expressions, not statements).
-fn check_returns(stmts: []TStatement, ret: Type) -> Unit | error {
+fn check_returns(stmts: []TStatement, ret: Type) -> error? {     // fallible-no-value: null = ok, error = failure
     mut i = 0
     loop {
         if i >= stmts.len { break }
-        let _ = match check_return_stmt(stmts[i], ret) { Unit as u => u; error as e => return e }
+        match check_return_stmt(stmts[i], ret) { null => {}; error as e => return e }
         i++
     }
-    Unit { }
+    null
 }
 
-fn check_return_stmt(s: TStatement, ret: Type) -> Unit | error {
+fn check_return_stmt(s: TStatement, ret: Type) -> error? {       // fallible-no-value: null = ok, error = failure
     match s {
         TReturn as r => {
             if r.has_value {
-                if assignable_to(r.value.type, ret) { Unit { } }
+                if assignable_to(r.value.type, ret) { null }
                 else { error { message = "return value does not match the function's declared return type" } }
             } else {
-                if assignable_to(Unit { }, ret) { Unit { } }
-                else { error { message = "bare `return` in a function that declares a non-Unit return type" } }
+                if assignable_to(Void { }, ret) { null }
+                else { error { message = "bare `return` in a function that declares a non-void return type" } }
             }
         }
         TLoopStmt as l  => check_returns(l.body, ret)
         TExprStmt as es => check_returns_inexpr(es.expr, ret)
-        _               => Unit { }
+        _               => null
     }
 }
 
 // returns can also live inside a top-level `if`'s blocks (`if c { return e }`).
-fn check_returns_inexpr(e: TExpr, ret: Type) -> Unit | error {
+fn check_returns_inexpr(e: TExpr, ret: Type) -> error? {         // fallible-no-value: null = ok, error = failure
     match e.kind {
         TIfExpr as f => {
-            let _ = match check_returns(f.then_blk, ret) { Unit as u => u; error as e => return e }
+            match check_returns(f.then_blk, ret) { null => {}; error as e => return e }
             check_returns(f.else_blk, ret)
         }
-        _ => Unit { }
+        _ => null
     }
 }
 
 // the trailing-value check — ONLY when the last statement is an expression (else: NO claim, the
 // guard against false-rejecting a body that ends in a diverging loop/if/match — the every-path item).
-fn check_trailing_value(stmts: []TStatement, ret: Type) -> Unit | error {
-    if stmts.len == 0 { return Unit { } }
+fn check_trailing_value(stmts: []TStatement, ret: Type) -> error? {   // fallible-no-value: null = ok, error = failure
+    if stmts.len == 0 { return null }
     match stmts[stmts.len - 1] {
         TExprStmt as es => {
-            if assignable_to(es.expr.type, ret) { Unit { } }
+            if assignable_to(es.expr.type, ret) { null }
             else { error { message = "the function's final expression does not match its declared return type" } }
         }
-        _ => Unit { }
+        _ => null
     }
 }
 
@@ -1610,8 +1635,8 @@ fn type_function(f: Function, env: Env, table: TypeTable) -> TFunction | error {
     }
     let ret = match function_return(f, table) { Type as t => t; error as e => return e }
     let tb = match type_block(f.body, local, table) { TypedBlock as bk => bk; error as e => return e }
-    let _ = match check_returns(tb.stmts, ret)       { Unit as u => u; error as e => return e }   // C5: each `return e` matches `ret`
-    let _ = match check_trailing_value(tb.stmts, ret) { Unit as u => u; error as e => return e }  // C5: trailing value (when present) matches
+    match check_returns(tb.stmts, ret)       { null => {}; error as e => return e }   // C5: each `return e` matches `ret`
+    match check_trailing_value(tb.stmts, ret) { null => {}; error as e => return e }  // C5: trailing value (when present) matches
     TFunction { name = f.name; params = f.params; return_type = ret; body = tb.stmts; is_exp = f.is_exp }
 }
 
@@ -1719,7 +1744,7 @@ struct tk_tstatement {
 typedef struct {
     tk_str         name;
     tk_param      *params; size_t nparams;   // immutable (B.21), carried unchanged
-    tk_type        return_type;              // Unit when there is no `-> ret`
+    tk_type        return_type;              // void when the function returns no value (`-> void`)
     tk_tstatement *body;   size_t nbody;
     bool           is_exp;
 } tk_tfunction;
@@ -1789,7 +1814,7 @@ bool          tk_exhaustive(tk_arm *arms, size_t n, tk_type subject);
 
 static tk_texpr *box(tk_texpr t) { tk_texpr *p = malloc(sizeof *p); if (!p) abort(); *p = t; return p; }
 static tk_type prim(tk_prim_kind k) { return (tk_type){ .tag = TK_TYPE_PRIM, .as.prim = k }; }
-static tk_type unit_t(void)         { return (tk_type){ .tag = TK_TYPE_UNIT }; }
+static tk_type void_t(void)         { return (tk_type){ .tag = TK_TYPE_VOID }; }   // return-only marker (no value)
 static bool is_bool(tk_type t)      { return t.tag == TK_TYPE_PRIM && t.as.prim == TK_PRIM_BOOL; }
 static bool is_integer(tk_type t)   { return t.tag == TK_TYPE_PRIM && t.as.prim != TK_PRIM_BOOL; }
 static bool is_comparable(tk_type a, tk_type b) { if (is_integer(a) && is_integer(b)) return true; return tk_type_eq(&a, &b); }
@@ -1995,9 +2020,9 @@ tk_texpr_result tk_type_expr(tk_expr e, tk_env env, tk_type_table table) {
 
 // ---- the value-type a typed block yields ----
 static tk_type tblock_type(tk_tstatement *stmts, size_t n) {
-    if (n == 0) return unit_t();
+    if (n == 0) return void_t();
     if (stmts[n - 1].tag == TK_TSTMT_EXPR) return stmts[n - 1].as.expr_stmt.expr.type;
-    return unit_t();
+    return void_t();
 }
 
 // ---- a typed block: thread the env, collect typed statements ----
@@ -2027,7 +2052,7 @@ static tk_texpr_result type_if(tk_if_expr f, tk_env env, tk_type_table table) {
         box(c.as.value), tb.as.value.stmts, tb.as.value.n, true, eb.as.value.stmts, eb.as.value.n } });
 }
 
-// ---- if as a STATEMENT (value discarded → Unit) ----
+// ---- if as a STATEMENT (value discarded → void) ----
 static tk_texpr_result type_if_stmt(tk_if_expr f, tk_env env, tk_type_table table) {
     tk_texpr_result c = tk_type_expr(*f.cond, env, table); if (!c.ok) return c;
     if (!is_bool(c.as.value.type)) return xerr("an `if` condition must be a bool");
@@ -2037,7 +2062,7 @@ static tk_texpr_result type_if_stmt(tk_if_expr f, tk_env env, tk_type_table tabl
         tk_typed_block_result eb = type_block(f.else_blk, f.nelse, env, table); if (!eb.ok) return xferr(eb.as.error);
         eb_stmts = eb.as.value.stmts; eb_n = eb.as.value.n;
     }
-    return xok((tk_texpr){ .tag = TK_TEXPR_IF, .type = unit_t(), .as.if_expr = {
+    return xok((tk_texpr){ .tag = TK_TEXPR_IF, .type = void_t(), .as.if_expr = {
         box(c.as.value), tb.as.value.stmts, tb.as.value.n, f.has_else, eb_stmts, eb_n } });
 }
 
@@ -2075,7 +2100,7 @@ static tk_texpr_result type_match(tk_match_expr m, tk_env env, tk_type_table tab
     return xok((tk_texpr){ .tag = TK_TEXPR_MATCH, .type = first, .as.match_expr = { box(s.as.value), arms.ptr, arms.len } });
 }
 
-// ---- match as a STATEMENT (value discarded → Unit) ----
+// ---- match as a STATEMENT (value discarded → void) ----
 static tk_texpr_result type_match_stmt(tk_match_expr m, tk_env env, tk_type_table table) {
     tk_texpr_result s = tk_type_expr(*m.subject, env, table); if (!s.ok) return s;
     tk_tarm_list arms = tk_tarm_list_empty();
@@ -2084,7 +2109,7 @@ static tk_texpr_result type_match_stmt(tk_match_expr m, tk_env env, tk_type_tabl
         arms = tk_tarm_list_push(arms, ai.as.value);
     }
     if (!tk_exhaustive(m.arms, m.narms, s.as.value.type)) return xerr("non-exhaustive `match` (cover all cases or add `_`)");
-    return xok((tk_texpr){ .tag = TK_TEXPR_MATCH, .type = unit_t(), .as.match_expr = { box(s.as.value), arms.ptr, arms.len } });
+    return xok((tk_texpr){ .tag = TK_TEXPR_MATCH, .type = void_t(), .as.match_expr = { box(s.as.value), arms.ptr, arms.len } });
 }
 
 // ---- statements ----
@@ -2155,9 +2180,9 @@ tk_typed_stmt_result tk_type_statement(tk_statement s, tk_env env, tk_type_table
 
 // ---- items + program ----
 static tk_type function_return(tk_function f, tk_type_table table) {
-    if (!f.has_return) return unit_t();
+    if (!f.has_return) return void_t();    // returns no value → the `-> void` marker
     tk_type_result r = tk_resolve_type(f.return_type, table);
-    return r.ok ? r.as.value : unit_t();   // collect validated signatures; a bad annotation surfaces there
+    return r.ok ? r.as.value : void_t();   // collect validated signatures; a bad annotation surfaces there
 }
 
 // ---- C5: return / final-expr vs the declared return type (see the Teko twin; NULL = ok) ----
@@ -2182,8 +2207,8 @@ static const char *check_return_stmt(const tk_tstatement *s, tk_type ret) {
             if (s->as.ret.has_value)
                 return assignable_to(s->as.ret.value.type, ret) ? NULL
                      : "return value does not match the function's declared return type";
-            return assignable_to(unit_t(), ret) ? NULL
-                 : "bare `return` in a function that declares a non-Unit return type";
+            return assignable_to(void_t(), ret) ? NULL
+                 : "bare `return` in a function that declares a non-void return type";
         case TK_TSTMT_LOOP: return check_returns(s->as.loop_stmt.body, s->as.loop_stmt.nbody, ret);
         case TK_TSTMT_EXPR: return check_returns_inexpr(&s->as.expr_stmt.expr, ret);
         default:            return NULL;
@@ -2472,11 +2497,11 @@ fn revalidate_rederives_casts() {
     // the counter-validation RE-PROVES the conversion is DEFINED (M.3 — not a rubber stamp).
     let goodinner = TExpr { kind = TVar { name = "y" }; type = i32t() }
     let good = TExpr { kind = TCast { expr = goodinner }; type = i8t() }    // i32 → i8 is a DEFINED cast (B)
-    match validate_texpr(good) { Unit => assert true; error => assert false }
+    match validate_texpr(good) { null => assert true; error => assert false }
 
     let badinner = TExpr { kind = TVar { name = "s" }; type = strt() }
     let bad = TExpr { kind = TCast { expr = badinner }; type = i32t() }     // str → i32 is UNDEFINED
-    match validate_texpr(bad) { Unit => assert false; error => assert true }
+    match validate_texpr(bad) { null => assert false; error => assert true }
 }
 
 // --- byte↔int cast helpers (byte casts AS u8 — B.36) ---
@@ -2520,13 +2545,13 @@ fn revalidate_rederives_byte_casts() {
     // the counter-validation RE-PROVES byte↔int is DEFINED (M.3).
     let gi  = TExpr { kind = TVar { name = "b" }; type = bytet() }
     let g   = TExpr { kind = TCast { expr = gi }; type = u32t() }    // byte → u32 DEFINED (B; byte AS u8)
-    match validate_texpr(g) { Unit => assert true; error => assert false }
+    match validate_texpr(g) { null => assert true; error => assert false }
     let gi2 = TExpr { kind = TVar { name = "x" }; type = u8t() }
     let g2  = TExpr { kind = TCast { expr = gi2 }; type = bytet() }  // u8 → byte DEFINED
-    match validate_texpr(g2) { Unit => assert true; error => assert false }
+    match validate_texpr(g2) { null => assert true; error => assert false }
     let bi  = TExpr { kind = TVar { name = "b" }; type = bytet() }
     let bad = TExpr { kind = TCast { expr = bi }; type = boolt() }   // byte → bool UNDEFINED
-    match validate_texpr(bad) { Unit => assert false; error => assert true }
+    match validate_texpr(bad) { null => assert false; error => assert true }
 }
 
 // --- C3 field-access helpers (reuse path1/empty_env/define/prim_is from above) ---
@@ -2569,11 +2594,11 @@ fn revalidate_rederives_field_access() {
     // a well-formed field access over a Named receiver re-validates …
     let recv = TExpr { kind = TVar { name = "s" }; type = Named { name = "Foo" } }
     let good = TExpr { kind = TFieldAccess { receiver = recv; field = "token" }; type = Prim { kind = PrimKind::U8 } }
-    match validate_texpr(good) { Unit => assert true; error => assert false }
+    match validate_texpr(good) { null => assert true; error => assert false }
     // … a forged field access over a non-Named receiver is corruption (struct-receiver invariant).
     let badrecv = TExpr { kind = TVar { name = "n" }; type = Prim { kind = PrimKind::I32 } }
     let bad = TExpr { kind = TFieldAccess { receiver = badrecv; field = "token" }; type = Prim { kind = PrimKind::U8 } }
-    match validate_texpr(bad) { Unit => assert false; error => assert true }
+    match validate_texpr(bad) { null => assert false; error => assert true }
 }
 
 #test
@@ -2791,8 +2816,8 @@ fn is_bool(t: Type) -> bool    { match t { Prim as p => p.kind == PrimKind::Bool
 fn is_integer(t: Type) -> bool { match t { Prim as p => p.kind != PrimKind::Bool; _ => false } }
 
 // the stored type must equal the type derived independently here.
-fn check_node_type(stored: Type, expected: Type) -> Unit | error {
-    if type_eq(stored, expected) { return Unit { } }
+fn check_node_type(stored: Type, expected: Type) -> error? {     // fallible-no-value: null = ok, error = failure
+    if type_eq(stored, expected) { return null }
     error { message = "corrupt typed tree: a node's type does not match its derivation" }
 }
 
@@ -2810,33 +2835,33 @@ fn rederive_binary(lt: Type, rt: Type, op: lexer::TokenKind) -> Type | error {
     error { message = "corrupt: unknown binary operator" }
 }
 
-fn validate_each(xs: []TExpr) -> Unit | error {
+fn validate_each(xs: []TExpr) -> error? {                        // fallible-no-value: null = ok, error = failure
     mut i = 0
     loop {
         if i >= xs.len { break }
-        let _ = match validate_texpr(xs[i]) { Unit as u => u; error as e => return e }
+        match validate_texpr(xs[i]) { null => {}; error as e => return e }
         i++
     }
-    Unit { }
+    null
 }
 
 // COUNTER-VALIDATE a typed expression: re-derive its type and confirm it matches
 // the stored one (operators/literals), or check it structurally (env-dependent).
-fn validate_texpr(te: TExpr) -> Unit | error {
+fn validate_texpr(te: TExpr) -> error? {                         // fallible-no-value: null = ok, error = failure
     match te.kind {
         TNumber  => check_node_type(te.type, Prim { kind = PrimKind::I64 })
         TStrLit  => check_node_type(te.type, Str { })
         TByteLit => check_node_type(te.type, Byte { })
-        TVar     => Unit { }                       // env-dependent → trust (type is present)
+        TVar     => null                           // env-dependent → trust (type is present)
         TCall as c => validate_each(c.args)        // [callee re-derivation is env-dependent]
         TBinary as b => {
-            let _ = match validate_texpr(b.left)  { Unit as u => u; error as e => return e }
-            let _ = match validate_texpr(b.right) { Unit as u => u; error as e => return e }
+            match validate_texpr(b.left)  { null => {}; error as e => return e }
+            match validate_texpr(b.right) { null => {}; error as e => return e }
             let d = match rederive_binary(b.left.type, b.right.type, b.op) { Type as t => t; error as e => return e }
             check_node_type(te.type, d)
         }
         TUnary as u => {
-            let _ = match validate_texpr(u.operand) { Unit as u2 => u2; error as e => return e }
+            match validate_texpr(u.operand) { null => {}; error as e => return e }
             if u.op == lexer::TokenKind::Bang {
                 if !is_bool(u.operand.type) { return error { message = "corrupt: `!` operand not bool" } }
                 return check_node_type(te.type, Prim { kind = PrimKind::Bool })
@@ -2845,28 +2870,28 @@ fn validate_texpr(te: TExpr) -> Unit | error {
             check_node_type(te.type, u.operand.type)
         }
         TCompare as cmp => {
-            let _ = match validate_texpr(cmp.first) { Unit as u => u; error as e => return e }
+            match validate_texpr(cmp.first) { null => {}; error as e => return e }
             mut i = 0
             loop {
                 if i >= cmp.rest.len { break }
-                let _ = match validate_texpr(cmp.rest[i].operand) { Unit as u => u; error as e => return e }
+                match validate_texpr(cmp.rest[i].operand) { null => {}; error as e => return e }
                 i++
             }
             check_node_type(te.type, Prim { kind = PrimKind::Bool })   // a comparison is bool
         }
-        TIfExpr    => Unit { }    // [block-bearing: deep revalidation lands with program-level — E6-2]
-        TMatchExpr => Unit { }    // [idem — typed blocks/arms validate once validate_statement exists]
+        TIfExpr    => null    // [block-bearing: deep revalidation lands with program-level — E6-2]
+        TMatchExpr => null    // [idem — typed blocks/arms validate once validate_statement exists]
         TCast as c => {
-            let _ = match validate_texpr(c.expr) { Unit as u => u; error as e => return e }
+            match validate_texpr(c.expr) { null => {}; error as e => return e }
             match cast_check(c.expr.type, te.type) {           // RE-PROVE the cast independently (M.3 — not a rubber stamp)
-                Unit  => Unit { }
+                null  => null
                 error => error { message = "corrupt: illegal cast in typed tree" }
             }
         }
         TFieldAccess as f => {
-            let _ = match validate_texpr(f.receiver) { Unit as u => u; error as e => return e }
+            match validate_texpr(f.receiver) { null => {}; error as e => return e }
             match f.receiver.type {                            // struct-receiver invariant (field type is table-dependent → trust, as TVar/TCall)
-                Named => Unit { }
+                Named => null
                 _     => error { message = "corrupt: field access on a non-struct receiver" }
             }
         }
@@ -2884,7 +2909,7 @@ fn validate_texpr(te: TExpr) -> Unit | error {
 #include "tast.h"
 #include "scope.h"   // tk_type_result (we reuse the error machinery)
 
-// Unit | error: ok if the subtree's stored types match their derivations.
+// `error?` (null = ok): ok if the subtree's stored types match their derivations.
 tk_check_result tk_validate_texpr(const tk_texpr *te);
 
 #endif // TK_CHECK_REVALIDATE_H
@@ -3214,12 +3239,13 @@ fn write_type(buf: []byte, t: StrTable, ty: Type) -> []byte {
         Prim as p    => write_u8(write_u8(buf, 0), prim_byte(p.kind))
         Byte         => write_u8(buf, 1)
         Str          => write_u8(buf, 2)
-        Error        => write_u8(buf, 3)
-        Unit         => write_u8(buf, 4)
+        Error        => write_u8(buf, 3)                  // native `error`
+        Void         => write_u8(buf, 4)                  // return-only marker (was Unit, excised)
         Slice as s   => write_type(write_u8(buf, 5), t, s.element)
         Named as n   => write_u32(write_u8(buf, 6), st_find(t, n.name))
         Variant as v => write_types(write_u8(buf, 7), t, v.members)
         Func as f    => write_type(write_types(write_u8(buf, 8), t, f.params), t, f.ret)
+        Optional as o => write_type(write_u8(buf, 9), t, o.inner)   // T?
     }
 }
 
@@ -3327,14 +3353,15 @@ tk_bytes tk_write_type(tk_bytes b, tk_strtable t, tk_type ty) {
         case TK_TYPE_PRIM:    return tk_write_u8(tk_write_u8(b, 0), prim_byte(ty.as.prim));
         case TK_TYPE_BYTE:    return tk_write_u8(b, 1);
         case TK_TYPE_STR:     return tk_write_u8(b, 2);
-        case TK_TYPE_ERROR:   return tk_write_u8(b, 3);
-        case TK_TYPE_UNIT:    return tk_write_u8(b, 4);
+        case TK_TYPE_ERROR:   return tk_write_u8(b, 3);   // native `error`
+        case TK_TYPE_VOID:    return tk_write_u8(b, 4);   // return-only marker (was UNIT, excised)
         case TK_TYPE_SLICE:   return tk_write_type(tk_write_u8(b, 5), t, *ty.as.slice.element);
         case TK_TYPE_NAMED:   return tk_write_u32(tk_write_u8(b, 6), tk_st_find(t, ty.as.named.name));
         case TK_TYPE_VARIANT: return write_types(tk_write_u8(b, 7), t, ty.as.variant.members, ty.as.variant.len);
         case TK_TYPE_FUNC:
             b = write_types(tk_write_u8(b, 8), t, ty.as.func.params, ty.as.func.nparams);
             return tk_write_type(b, t, *ty.as.func.ret);
+        case TK_TYPE_OPTIONAL: return tk_write_type(tk_write_u8(b, 9), t, *ty.as.optional.inner);   // T?
     }
     return b;
 }
@@ -3548,6 +3575,7 @@ static void collect_type(tk_strtable *t, tk_type ty) {
     switch (ty.tag) {
         case TK_TYPE_NAMED:   tk_st_intern(t, ty.as.named.name); break;
         case TK_TYPE_SLICE:   collect_type(t, *ty.as.slice.element); break;
+        case TK_TYPE_OPTIONAL: collect_type(t, *ty.as.optional.inner); break;
         case TK_TYPE_VARIANT: collect_type_list(t, ty.as.variant.members, ty.as.variant.len); break;
         case TK_TYPE_FUNC:    collect_type_list(t, ty.as.func.params, ty.as.func.nparams);
                               collect_type(t, *ty.as.func.ret); break;
@@ -3694,7 +3722,7 @@ fn read_types(r: Reader, table: []str) -> RTypes | error {
     RTypes { r = rr; value = xs }
 }
 
-// inverse of write_type — tags 0=Prim 1=Byte 2=Str 3=error 4=Unit 5=Slice 6=Named 7=Variant 8=Func.
+// inverse of write_type — tags 0=Prim 1=Byte 2=Str 3=error 4=void 5=Slice 6=Named 7=Variant 8=Func 9=Optional.
 fn read_type(r: Reader, table: []str) -> RType | error {
     let tag = match read_u8(r) { RByte as x => x; error as e => return e }
     if tag.value == 0 {
@@ -3704,7 +3732,7 @@ fn read_type(r: Reader, table: []str) -> RType | error {
     if tag.value == 1 { return RType { r = tag.r; value = Byte { } } }
     if tag.value == 2 { return RType { r = tag.r; value = Str { } } }
     if tag.value == 3 { return RType { r = tag.r; value = Error { } } }
-    if tag.value == 4 { return RType { r = tag.r; value = Unit { } } }
+    if tag.value == 4 { return RType { r = tag.r; value = Void { } } }
     if tag.value == 5 {
         let el = match read_type(tag.r, table) { RType as x => x; error as e => return e }
         return RType { r = el.r; value = Slice { element = el.value } }
@@ -3721,6 +3749,10 @@ fn read_type(r: Reader, table: []str) -> RType | error {
         let ps = match read_types(tag.r, table) { RTypes as x => x; error as e => return e }
         let rt = match read_type(ps.r, table) { RType as x => x; error as e => return e }
         return RType { r = rt.r; value = Func { params = ps.value; ret = rt.value } }
+    }
+    if tag.value == 9 {
+        let inr = match read_type(tag.r, table) { RType as x => x; error as e => return e }
+        return RType { r = inr.r; value = Optional { inner = inr.value } }
     }
     error { message = "bad type tag in .tkb" }
 }
@@ -3795,7 +3827,7 @@ tk_type tk_read_type(tk_reader *r, tk_strs t) {
         case 1: return (tk_type){ .tag = TK_TYPE_BYTE };
         case 2: return (tk_type){ .tag = TK_TYPE_STR };
         case 3: return (tk_type){ .tag = TK_TYPE_ERROR };
-        case 4: return (tk_type){ .tag = TK_TYPE_UNIT };
+        case 4: return (tk_type){ .tag = TK_TYPE_VOID };
         case 5: return (tk_type){ .tag = TK_TYPE_SLICE, .as.slice.element = box(tk_read_type(r, t)) };
         case 6: return (tk_type){ .tag = TK_TYPE_NAMED, .as.named.name = tk_read_str(r, t) };
         case 7: {
@@ -3809,8 +3841,9 @@ tk_type tk_read_type(tk_reader *r, tk_strs t) {
             tk_type ret = tk_read_type(r, t);
             return (tk_type){ .tag = TK_TYPE_FUNC, .as.func = { p, n, box(ret) } };
         }
+        case 9: return (tk_type){ .tag = TK_TYPE_OPTIONAL, .as.optional.inner = box(tk_read_type(r, t)) };
     }
-    r->ok = false; return (tk_type){ .tag = TK_TYPE_UNIT };
+    r->ok = false; return (tk_type){ .tag = TK_TYPE_VOID };
 }
 ```
 
@@ -4622,6 +4655,7 @@ static void th_collect_type(tk_strtable *t, tk_type ty) {
     switch (ty.tag) {
         case TK_TYPE_NAMED:   tk_st_intern(t, ty.as.named.name); break;
         case TK_TYPE_SLICE:   th_collect_type(t, *ty.as.slice.element); break;
+        case TK_TYPE_OPTIONAL: th_collect_type(t, *ty.as.optional.inner); break;
         case TK_TYPE_VARIANT: th_collect_type_list(t, ty.as.variant.members, ty.as.variant.len); break;
         case TK_TYPE_FUNC:    th_collect_type_list(t, ty.as.func.params, ty.as.func.nparams);
                               th_collect_type(t, *ty.as.func.ret); break;

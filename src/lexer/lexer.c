@@ -7,6 +7,8 @@
 
 #include <stdint.h>
 #include <stdlib.h>   // malloc, abort
+#include <string.h>   // strlen
+#include <stdio.h>    // sprintf
 
 // a private growable byte buffer for decoded string literals — teko::list over
 // byte. Local to the lexer (the DAG is lexer → text → core; we must NOT depend on
@@ -33,8 +35,34 @@ static tk_byte at(tk_str source, size_t p) {
     return source.ptr[p];
 }
 
+// --- source LOCATION: the 1-based (line, col) of byte `pos` (for token stamping +
+//     file:line:col diagnostics — M.3 honest about WHERE). O(pos) scan; the bootstrap
+//     files are small (M.5 — a line table is a later optimization, not needed now). ---
+static void compute_loc(tk_str source, size_t pos, uint32_t *line, uint32_t *col) {
+    uint32_t l = 1, c = 1;
+    size_t limit = pos < source.len ? pos : source.len;
+    for (size_t i = 0; i < limit; i += 1) {
+        if (source.ptr[i] == '\n') { l += 1; c = 1; } else { c += 1; }
+    }
+    *line = l; *col = c;
+}
+// stamp a token with the 1-based location of its start byte `pos`.
+static tk_token stamp(tk_token tok, tk_str source, size_t pos) {
+    compute_loc(source, pos, &tok.line, &tok.col);
+    return tok;
+}
+// a LOCATED lexer error: "line:col: msg" at byte `pos` (the file is prepended later by the
+// driver/assemble — same shape as parse errors, so lexer errors carry file:line:col too — M.3).
+static tk_scan_result scan_err_at(tk_str source, size_t pos, const char *msg) {
+    uint32_t line, col; compute_loc(source, pos, &line, &col);
+    char *buf = malloc(strlen(msg) + 32); if (!buf) abort();
+    sprintf(buf, "%u:%u: %s", line, col, msg);
+    return (tk_scan_result){ .ok = false, .as.error = tk_error_make(buf) };
+}
+
 // --- predicates (pure, over a single byte) ---
 static bool is_digit(tk_byte c) { return c >= '0' && c <= '9'; }
+static bool is_hex_digit(tk_byte c) { return is_digit(c) || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'); }
 static bool is_alpha(tk_byte c) {
     return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
 }
@@ -109,8 +137,8 @@ static tk_scan_result read_doc_comment(tk_str source, size_t pos) {
 
 // --- numbers & identifiers ---
 
-// digits, allowing `_` as a separator BETWEEN digits (B.28): `1_000`.
-static tk_scan read_number(tk_str source, size_t pos) {
+// a run of digits, allowing `_` as a separator BETWEEN digits (B.28): `1_000`.
+static size_t scan_digits(tk_str source, size_t pos) {
     size_t p = pos;
     for (;;) {
         if (p >= source.len) break;
@@ -121,6 +149,45 @@ static tk_scan read_number(tk_str source, size_t pos) {
         }
         break;
     }
+    return p;
+}
+
+// a Number token — integer (`123`, `1_000`) OR float (`3.14`, `1.5e3`, `1e9`) (N1 —
+// TEKO_CORRECTION_PLAN §5). The token stays TK_TOKEN_NUMBER carrying the raw text;
+// the int-vs-float decision is made by the literal decoders (tk_lit_is_float). No
+// float SUFFIXES (`1.5f`): the default is f64, an annotation picks f16/f32.
+static tk_scan read_number(tk_str source, size_t pos) {
+    // hex `0x…` / binary `0b…` integer literals (B.28; no fraction/exponent). `_` may
+    // separate digits. The raw text (incl the prefix) rides the token; tk_lit_int decodes.
+    if (at(source, pos) == '0' && (at(source, pos + 1) == 'x' || at(source, pos + 1) == 'X')) {
+        size_t h = pos + 2;
+        while (h < source.len && (is_hex_digit(source.ptr[h]) ||
+               (source.ptr[h] == '_' && h + 1 < source.len && is_hex_digit(at(source, h + 1))))) h++;
+        return (tk_scan){ .token = (tk_token){ .kind = TK_TOKEN_NUMBER, .text = tk_str_slice(source, pos, h) }, .next = h };
+    }
+    if (at(source, pos) == '0' && (at(source, pos + 1) == 'b' || at(source, pos + 1) == 'B')) {
+        size_t bp = pos + 2;
+        while (bp < source.len && (source.ptr[bp] == '0' || source.ptr[bp] == '1' ||
+               (source.ptr[bp] == '_' && bp + 1 < source.len && (at(source, bp + 1) == '0' || at(source, bp + 1) == '1')))) bp++;
+        return (tk_scan){ .token = (tk_token){ .kind = TK_TOKEN_NUMBER, .text = tk_str_slice(source, pos, bp) }, .next = bp };
+    }
+    size_t p = scan_digits(source, pos);          // integer part
+
+    // fractional part: a `.` FOLLOWED BY a digit (so `1.method` / `1..=` stay ints).
+    if (at(source, p) == '.' && is_digit(at(source, p + 1))) {
+        p = scan_digits(source, p + 1);
+    }
+
+    // exponent: `[eE][+-]?<digits>` — only consume `e` if a valid exponent follows
+    // (so a stray `e` is left for the identifier/operator path).
+    if (at(source, p) == 'e' || at(source, p) == 'E') {
+        size_t q = p + 1;
+        if (at(source, q) == '+' || at(source, q) == '-') q += 1;
+        if (is_digit(at(source, q))) {
+            p = scan_digits(source, q);
+        }
+    }
+
     return (tk_scan){
         .token = (tk_token){ .kind = TK_TOKEN_NUMBER, .text = tk_str_slice(source, pos, p) },
         .next  = p,
@@ -188,7 +255,11 @@ static tk_token_kind keyword_kind(tk_str text) {
     if (tk_str_eq_lit(text, "as"))       return TK_TOKEN_AS;
     if (tk_str_eq_lit(text, "to"))       return TK_TOKEN_TO;   // the cast operator (x to T) — F1/E7
     if (tk_str_eq_lit(text, "use"))      return TK_TOKEN_USE;
+    if (tk_str_eq_lit(text, "pub"))      return TK_TOKEN_PUB;   // public within the project (B.9)
     if (tk_str_eq_lit(text, "exp"))      return TK_TOKEN_EXP;
+    if (tk_str_eq_lit(text, "true"))     return TK_TOKEN_TRUE;   // bool literal (LEGISLATION §75)
+    if (tk_str_eq_lit(text, "false"))    return TK_TOKEN_FALSE;  // bool literal (LEGISLATION §75)
+    if (tk_str_eq_lit(text, "null"))     return TK_TOKEN_NULL;   // null literal (REBOOT_PLAN §202)
     return TK_TOKEN_IDENT;
 }
 
@@ -297,6 +368,37 @@ static tk_scan_result read_str(tk_str source, size_t pos) {
     }
 }
 
+// `$"…"` at pos (`$` at pos, `"` at pos+1). Scan the RAW inner text between the quotes —
+// holes `{…}` and escapes are LEFT ENCODED; the parser splits the raw span into literal
+// pieces + hole expressions (parse_expr's INTERP case). The token's `.text` is a VIEW into
+// the source (like Str's span before decode; the parser decodes each literal piece). A `"`
+// terminates ONLY at brace-depth 0 (so a string literal inside a hole would not end it),
+// and `\"` is skipped (an escaped quote stays inside the content). Mirrors lexer.tks
+// `read_interp`.
+static tk_scan_result read_interp(tk_str source, size_t pos) {
+    size_t start = pos + 2;                       // past `$"` — the first inner byte
+    size_t p = start;
+    size_t depth = 0;                             // brace nesting inside holes
+    for (;;) {
+        if (p >= source.len) return scan_err_at(source, pos, "unterminated interpolated string");
+        tk_byte c = source.ptr[p];
+        if (c == '\\') {                          // an escape — skip the next byte too
+            if (p + 1 >= source.len) return scan_err_at(source, pos, "unterminated escape in interpolated string");
+            p += 2;
+            continue;
+        }
+        if (c == '{') { depth += 1; p += 1; continue; }
+        if (c == '}') { if (depth > 0) depth -= 1; p += 1; continue; }
+        if (c == '"' && depth == 0) {             // the closing quote (outside any hole)
+            return scan_ok((tk_scan){
+                .token = (tk_token){ .kind = TK_TOKEN_INTERP, .text = tk_str_slice(source, start, p) },
+                .next  = p + 1,
+            });
+        }
+        p += 1;
+    }
+}
+
 // `b'…'`: pos points at `b`, `'` at pos+1. One byte (raw or escaped) then a closing `'`.
 static tk_scan_result read_byte_lit(tk_str source, size_t pos) {
     size_t inner = pos + 2;                       // past `b'`
@@ -336,6 +438,8 @@ static tk_scan_result read_symbol(tk_str source, size_t pos) {
     if (c == ':' && c1 == ':') return scan_ok(sym(source, pos, 2, TK_TOKEN_COLONCOLON));
     if (c == '&' && c1 == '&') return scan_ok(sym(source, pos, 2, TK_TOKEN_ANDAND));
     if (c == '|' && c1 == '|') return scan_ok(sym(source, pos, 2, TK_TOKEN_OROR));
+    if (c == '+' && c1 == '+') return scan_ok(sym(source, pos, 2, TK_TOKEN_PLUSPLUS));     // ++ (maximal munch, before +/+=)
+    if (c == '-' && c1 == '-') return scan_ok(sym(source, pos, 2, TK_TOKEN_MINUSMINUS));   // -- (before -/-=/->)
     if (c == '+' && c1 == '=') return scan_ok(sym(source, pos, 2, TK_TOKEN_PLUSEQ));
     if (c == '-' && c1 == '=') return scan_ok(sym(source, pos, 2, TK_TOKEN_MINUSEQ));
     if (c == '*' && c1 == '=') return scan_ok(sym(source, pos, 2, TK_TOKEN_STAREQ));
@@ -344,6 +448,11 @@ static tk_scan_result read_symbol(tk_str source, size_t pos) {
     if (c == '&' && c1 == '=') return scan_ok(sym(source, pos, 2, TK_TOKEN_AMPEQ));
     if (c == '|' && c1 == '=') return scan_ok(sym(source, pos, 2, TK_TOKEN_PIPEEQ));
     if (c == '^' && c1 == '=') return scan_ok(sym(source, pos, 2, TK_TOKEN_CARETEQ));
+
+    // nullability composites (maximal munch — `??`/`?.` before a lone `?`).
+    // `?` is EXCLUSIVE to nullability (LEGISLATION §75; REBOOT_PLAN §202–203).
+    if (c == '?' && c1 == '?') return scan_ok(sym(source, pos, 2, TK_TOKEN_QQ));
+    if (c == '?' && c1 == '.') return scan_ok(sym(source, pos, 2, TK_TOKEN_QDOT));
 
     // `..` exists ONLY as `..=` (handled above); a lone `..` is an error
     if (c == '.' && c1 == '.') return scan_err("expected '=' to close range '..='");
@@ -374,7 +483,8 @@ static tk_scan_result read_symbol(tk_str source, size_t pos) {
         case '}': one = TK_TOKEN_RBRACE;    break;
         case '[': one = TK_TOKEN_LBRACKET;  break;
         case ']': one = TK_TOKEN_RBRACKET;  break;
-        default:  return scan_err("unexpected character");
+        case '?': one = TK_TOKEN_QUESTION;  break;   // lone `?` — the type-suffix (T?)
+        default:  return scan_err_at(source, pos, "unexpected character");
     }
     return scan_ok(sym(source, pos, 1, one));
 }
@@ -385,6 +495,8 @@ static tk_scan_result next_token(tk_str source, size_t pos) {
     tk_byte c = source.ptr[pos];
     // a byte literal `b'…'` — `b` would otherwise begin an identifier
     if (c == 'b' && at(source, pos + 1) == '\'') return read_byte_lit(source, pos);
+    // an interpolated string `$"…"` — `$` is otherwise an unexpected character
+    if (c == '$' && at(source, pos + 1) == '"') return read_interp(source, pos);
     if (is_digit(c)) return scan_ok(read_number(source, pos));
     if (is_alpha(c)) return scan_ok(keyword_or_ident(source, pos));
     if (c == '_')    return scan_ok(read_underscore(source, pos));
@@ -416,7 +528,7 @@ tk_tokens_result tk_tokenize(tk_str source) {
             if (at(source, pos + 2) == '*' && at(source, pos + 3) != '/') {
                 tk_scan_result sc = read_doc_comment(source, pos);
                 if (!sc.ok) { tk_tokens_free(tokens); return (tk_tokens_result){ .ok = false, .as.error = sc.as.error }; }
-                tokens = tk_tokens_push(tokens, sc.as.value.token);
+                tokens = tk_tokens_push(tokens, stamp(sc.as.value.token, source, pos));
                 pos = sc.as.value.next;
                 continue;
             }
@@ -427,14 +539,14 @@ tk_tokens_result tk_tokenize(tk_str source) {
         }
         // a significant newline (B.26) is a token
         if (c == '\n') {
-            tokens = tk_tokens_push(tokens, sym(source, pos, 1, TK_TOKEN_NEWLINE).token);
+            tokens = tk_tokens_push(tokens, stamp(sym(source, pos, 1, TK_TOKEN_NEWLINE).token, source, pos));
             pos = pos + 1;
             continue;
         }
 
         tk_scan_result sc = next_token(source, pos);
         if (!sc.ok) { tk_tokens_free(tokens); return (tk_tokens_result){ .ok = false, .as.error = sc.as.error }; }
-        tokens = tk_tokens_push(tokens, sc.as.value.token);
+        tokens = tk_tokens_push(tokens, stamp(sc.as.value.token, source, pos));
         pos    = sc.as.value.next;
     }
 

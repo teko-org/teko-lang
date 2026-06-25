@@ -1,5 +1,7 @@
 // src/parser/parse_arm.tks   (namespace 'teko::parser')
 
+use teko::lexer
+
 // an optional `when guard` before `=>`. Absent → has_when=false (guard is a placeholder
 // Number 0, never read — gated by has_when). `pos` is right after the pattern.
 fn parse_guard(tokens: []lexer::Token, pos: u64) -> Guard | error {
@@ -10,14 +12,26 @@ fn parse_guard(tokens: []lexer::Token, pos: u64) -> Guard | error {
     Guard { has_when = true, guard = g.node, next = g.next }
 }
 
-// a match arm: `pattern [when guard] => body`. The body is an expression (B.15); the
-// `when` guard does NOT count for exhaustiveness (M.1).
+// a match arm: `pattern [when guard] => body`. The body is a STATEMENT BLOCK, exactly like
+// an `if` then/else branch (B.20): a `{ … }` block, or one bracketless statement right after
+// `=>` (`=> expr`, `=> return x`, `=> break`, `=> continue`). The `when` guard does NOT
+// count for exhaustiveness (M.1).
 fn parse_arm(tokens: []lexer::Token, pos: u64) -> ParsedArm | error {
     let pat = match parse_pattern(tokens, pos) { ParsedPattern as x => x; error as e => return e }
     let g = match parse_guard(tokens, pat.next) { Guard as x => x; error as e => return e }
     if !is_kind_at(tokens, g.next, lexer::TokenKind::FatArrow) {
-        return error { message = "expected '=>' after a match pattern" }
+        return err_at(tokens, g.next, "expected '=>' after a match pattern")
     }
-    let body = match parse_expr(tokens, g.next + 1) { Parsed as x => x; error as e => return e }
-    ParsedArm { node = Arm { pattern = pat.node, has_when = g.has_when, guard = g.guard, body = body.node }, next = body.next }
+    let bpos = g.next + 1
+    // REUSE parse_if_body for the braced / next-line form; a same-line bracketless body
+    // (`=> expr`) parses one statement directly (an `if` branch's bracketless body sits on
+    // the NEXT line, but an arm's follows `=>` on the SAME line).
+    let body = match is_kind_at(tokens, bpos, lexer::TokenKind::LBrace) || is_sep(tokens, bpos) {
+        true  => match parse_if_body(tokens, bpos, "expected '{' or a body after '=>'") { ParsedBlock as x => x; error as e => return e }
+        false => {
+            let s = match parse_statement(tokens, bpos) { ParsedStmt as x => x; error as e => return e }
+            ParsedBlock { statements = teko::list::push(teko::list::empty(), s.node), next = s.next }
+        }
+    }
+    ParsedArm { node = Arm { pattern = pat.node, has_when = g.has_when, guard = g.guard, body = body.statements }, next = body.next }
 }

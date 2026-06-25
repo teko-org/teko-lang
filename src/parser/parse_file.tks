@@ -1,9 +1,10 @@
 // src/parser/parse_file.tks   (namespace 'teko::parser')
 
 // extends the Parsed* family (result.tks).
+use teko::lexer
 type ParsedUse      = struct { node: UseDecl;       next: u64 }   // one `use`
 type ParsedUses     = struct { uses: []UseDecl;     next: u64 }   // a `use` header
-type ParsedMainFile = struct { node: MainFile;      next: u64 }   // a parsed main.tks
+pub type ParsedMainFile = struct { node: MainFile;      next: u64 }   // a parsed main.tks
 
 // does the token at `pos` start a top-level declaration (`fn` or `type`)? (Shared with
 // parse_module — R-main-c.)
@@ -19,7 +20,7 @@ fn parse_use(tokens: []lexer::Token, pos: u64) -> ParsedUse | error {
     mut p = pp.next
     if is_kind_at(tokens, p, lexer::TokenKind::As) {
         if !is_kind_at(tokens, p + 1, lexer::TokenKind::Ident) {
-            return error { message = "expected a name after `as` in a `use`" }
+            return err_at(tokens, p + 1, "expected a name after `as` in a `use`")
         }
         has_alias = true
         alias = tokens[p + 1].text
@@ -40,7 +41,7 @@ fn parse_use_header(tokens: []lexer::Token, pos: u64) -> ParsedUses | error {
         p = u.next
         if !has_token(tokens, p) { break }
         if !is_sep(tokens, p) {
-            return error { message = "expected ';' or a newline after a `use`" }
+            return err_at(tokens, p, "expected ';' or a newline after a `use`")
         }
         p = skip_seps(tokens, p)
     }
@@ -49,21 +50,21 @@ fn parse_use_header(tokens: []lexer::Token, pos: u64) -> ParsedUses | error {
 
 // main.tks: the `use` header, then the VIRTUAL MAIN's body (statements). Rejects any
 // type/function declaration. `pos` is 0 (file start).
-fn parse_main_file(tokens: []lexer::Token, pos: u64) -> ParsedMainFile | error {
+pub fn parse_main_file(tokens: []lexer::Token, pos: u64) -> ParsedMainFile | error {
     let hdr = match parse_use_header(tokens, pos) { ParsedUses as x => x; error as e => return e }
     mut p = skip_seps(tokens, hdr.next)
     mut body = teko::list::empty()
     loop {
         if !has_token(tokens, p) { break }
         if is_decl_start(tokens, p) {
-            return error { message = "main.tks is a virtual main: it may not declare types or functions (only `use` + statements)" }
+            return err_at(tokens, p, "main.tks is a virtual main: it may not declare types or functions (only `use` + statements)")
         }
         let s = match parse_statement(tokens, p) { ParsedStmt as x => x; error as e => return e }
         body = teko::list::push(body, s.node)
         p = s.next
         if !has_token(tokens, p) { break }
         if !is_sep(tokens, p) {
-            return error { message = "expected ';' or a newline after a statement" }
+            return err_at(tokens, p, "expected ';' or a newline after a statement")
         }
         p = skip_seps(tokens, p)
     }

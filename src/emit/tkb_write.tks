@@ -1,21 +1,25 @@
 // src/emit/tkb_write.tks  (namespace 'teko::emit')
 
+use teko::checker
+use teko::parser
+
 // a Type → tag byte + payload. (prim_byte/kind_byte = the enum's ordinal — E7.)
-fn write_type(buf: []byte, t: StrTable, ty: Type) -> []byte {
+fn write_type(buf: []byte, t: StrTable, ty: checker::Type) -> []byte {
     match ty {
-        Prim as p    => write_u8(write_u8(buf, 0), prim_byte(p.kind))
-        Byte         => write_u8(buf, 1)
-        Str          => write_u8(buf, 2)
-        Error        => write_u8(buf, 3)
-        Unit         => write_u8(buf, 4)
-        Slice as s   => write_type(write_u8(buf, 5), t, s.element)
-        Named as n   => write_u32(write_u8(buf, 6), st_find(t, n.name))
-        Variant as v => write_types(write_u8(buf, 7), t, v.members)
-        Func as f    => write_type(write_types(write_u8(buf, 8), t, f.params), t, f.ret)
+        checker::Prim as p    => write_u8(write_u8(buf, 0), prim_byte(p.kind))
+        checker::Byte         => write_u8(buf, 1)
+        checker::Str          => write_u8(buf, 2)
+        checker::Error        => write_u8(buf, 3)
+        checker::Void         => write_u8(buf, 4)                                  // tag 4 = void (was Unit — B.37)
+        checker::Slice as s   => write_type(write_u8(buf, 5), t, s.element)
+        checker::Named as n   => write_u32(write_u8(buf, 6), st_find(t, n.name))
+        checker::Variant as v => write_types(write_u8(buf, 7), t, v.members)
+        checker::Func as f    => write_type(write_types(write_u8(buf, 8), t, f.params), t, f.ret)
+        checker::Optional as o => write_type(write_u8(buf, 9), t, o.inner)         // tag 9 = T? (B.37)
     }
 }
 
-fn write_types(buf: []byte, t: StrTable, xs: []Type) -> []byte {
+fn write_types(buf: []byte, t: StrTable, xs: []checker::Type) -> []byte {
     mut b = write_u32(buf, xs.len to u32)
     mut i = 0
     loop {
@@ -27,7 +31,7 @@ fn write_types(buf: []byte, t: StrTable, xs: []Type) -> []byte {
 }
 
 // a path (callee) → count + each segment's name index.
-fn write_path(buf: []byte, t: StrTable, p: Path) -> []byte {
+fn write_path(buf: []byte, t: StrTable, p: parser::Path) -> []byte {
     mut b = write_u32(buf, p.segments.len to u32)
     mut i = 0
     loop {
@@ -39,7 +43,7 @@ fn write_path(buf: []byte, t: StrTable, p: Path) -> []byte {
 }
 
 // a list of typed expressions (call args) → count + each.
-fn write_texprs(buf: []byte, t: StrTable, xs: []TExpr) -> []byte {
+fn write_texprs(buf: []byte, t: StrTable, xs: []checker::TExpr) -> []byte {
     mut b = write_u32(buf, xs.len to u32)
     mut i = 0
     loop {
@@ -51,7 +55,7 @@ fn write_texprs(buf: []byte, t: StrTable, xs: []TExpr) -> []byte {
 }
 
 // the comparison terms → count + each (op byte + operand).
-fn write_terms(buf: []byte, t: StrTable, ts: []TCmpTerm) -> []byte {
+fn write_terms(buf: []byte, t: StrTable, ts: []checker::TCmpTerm) -> []byte {
     mut b = write_u32(buf, ts.len to u32)
     mut i = 0
     loop {
@@ -63,25 +67,74 @@ fn write_terms(buf: []byte, t: StrTable, ts: []TCmpTerm) -> []byte {
 }
 
 // a TExpr → its type, then a tag + payload (children recursive).
-fn write_texpr(buf: []byte, t: StrTable, te: TExpr) -> []byte {
+fn write_texpr(buf: []byte, t: StrTable, te: checker::TExpr) -> []byte {
     let b = write_type(buf, t, te.type)        // every node carries its type
     match te.kind {
-        TNumber as n   => write_i64(write_u8(b, 0), n.value)
-        TVar as v      => write_u32(write_u8(b, 1), st_find(t, v.name))
-        TStrLit as s   => write_u32(write_u8(b, 2), st_find(t, s.text))
-        TByteLit as bl => write_u8(write_u8(b, 3), bl.value)
-        TBinary as bn  => write_texpr(write_texpr(write_u8(write_u8(b, 4), kind_byte(bn.op)), t, bn.left), t, bn.right)
-        TUnary as u    => write_texpr(write_u8(write_u8(b, 5), kind_byte(u.op)), t, u.operand)
-        TCompare as c  => write_terms(write_texpr(write_u8(b, 6), t, c.first), t, c.rest)
-        TCall as cl    => write_texprs(write_path(write_u8(b, 7), t, cl.callee), t, cl.args)
+        // N1/N2: the number node carries { is_float, value: i128, fval: f64 }. Serialize:
+        // tag, is_float (u8), the 128-bit value as two u64 (hi then lo), then the f64's
+        // IEEE-754 bits as a u64. read_texpr reads the exact inverse.
+        checker::TNumber as n   => write_u64(
+                              write_u64(
+                                  write_u64(
+                                      write_u8(write_u8(b, 0), (if n.is_float { 1 } else { 0 }) to byte),
+                                      (n.value >> 64) to u64),          // hi
+                                  (n.value & 0xFFFFFFFFFFFFFFFF) to u64),// lo
+                              teko::f64_bits(n.fval))                    // f64 -> u64 bit pattern
+        checker::TVar as v      => write_u32(write_u8(b, 1), st_find(t, v.name))
+        checker::TStrLit as s   => write_u32(write_u8(b, 2), st_find(t, s.text))
+        checker::TByteLit as bl => write_u8(write_u8(b, 3), bl.value)
+        checker::TBinary as bn  => write_texpr(write_texpr(write_u8(write_u8(b, 4), kind_byte(bn.op)), t, bn.left), t, bn.right)
+        checker::TUnary as u    => write_texpr(write_u8(write_u8(b, 5), kind_byte(u.op)), t, u.operand)
+        checker::TCompare as c  => write_terms(write_texpr(write_u8(b, 6), t, c.first), t, c.rest)
+        checker::TCall as cl    => write_texprs(write_path(write_u8(b, 7), t, cl.callee), t, cl.args)
         // typed if/match: reserved tags 8/9. Full (de)serialization needs a typed-STATEMENT
         // serializer ([]TStatement) — a separate later item; read rejects tags 8/9 as
         // "bad texpr tag" (visible — M.1). (MethodCall has no typed node — typing deferred.)
-        TIfExpr        => write_u8(b, 8)
-        TMatchExpr     => write_u8(b, 9)
+        checker::TIfExpr        => write_u8(b, 8)
+        checker::TMatchExpr     => write_u8(b, 9)
         // S1a — Cast: the target type IS te.type (already written by the leading write_type); payload is just the inner expr.
-        TCast as c     => write_texpr(write_u8(b, 10), t, c.expr)
+        checker::TCast as c     => write_texpr(write_u8(b, 10), t, c.expr)
         // S1b — FieldAccess: receiver THEN the interned field-name index (write order = read order).
-        TFieldAccess as f => write_u32(write_texpr(write_u8(b, 11), t, f.receiver), st_find(t, f.field))
+        checker::TFieldAccess as f => write_u32(write_texpr(write_u8(b, 11), t, f.receiver), st_find(t, f.field))
+        // W2 — BoolLit: tag 12 + the bool value as a u8 (1/0).
+        checker::TBoolLit as bo => write_u8(write_u8(b, 12), (if bo.value { 1 } else { 0 }) to byte)
+        // W2 — NullLit: tag 13, no payload.
+        checker::TNullLit => write_u8(b, 13)
+        // W2 — SafeFieldAccess (recv?.field): receiver THEN the interned field-name index (mirrors tag 11).
+        checker::TSafeFieldAccess as sf => write_u32(write_texpr(write_u8(b, 14), t, sf.receiver), st_find(t, sf.field))
+        // W2 — Coalesce (left ?? right): left texpr THEN right texpr.
+        checker::TCoalesce as co => write_texpr(write_texpr(write_u8(b, 15), t, co.left), t, co.right)
+        // W4a — StructInit: Name { f = v, … } → tag 16, field count (u32), then for each field
+        // the interned field-name index (u32) + the field value texpr (write order = read order).
+        checker::TStructInit as si => {
+            mut sb = write_u32(write_u8(b, 16), si.field_names.len to u32)
+            mut i = 0
+            loop {
+                if i >= si.field_names.len { break }
+                sb = write_texpr(write_u32(sb, st_find(t, si.field_names[i])), t, si.field_vals[i])
+                i++
+            }
+            sb
+        }
+        // W5-idx — Index (recv[index]): tag 17, receiver texpr THEN index texpr (write order = read order).
+        checker::TIndex as ix => write_texpr(write_texpr(write_u8(b, 17), t, ix.receiver), t, ix.index)
+        // $"…{expr}…" — Interp: tag 18, npieces (u32), each piece (interned u32), nholes (u32), each hole texpr.
+        checker::TInterp as in => {
+            mut sb = write_u32(write_u8(b, 18), in.pieces.len to u32)
+            mut i = 0
+            loop {
+                if i >= in.pieces.len { break }
+                sb = write_u32(sb, st_find(t, in.pieces[i]))
+                i++
+            }
+            sb = write_u32(sb, in.holes.len to u32)
+            mut j = 0
+            loop {
+                if j >= in.holes.len { break }
+                sb = write_texpr(sb, t, in.holes[j])
+                j++
+            }
+            sb
+        }
     }
 }

@@ -46,15 +46,19 @@ because redefinition is a legislative act.)*
 
 | Topic | Current norm (in force) | Governing Law | History |
 |---|---|---|---|
-| Error propagation | Error is always handled with `match`; **no `?` propagation operator** in the seed. | **M.4** (don't build sugar on the transitional `Valor\|Error` shape) | → HISTORY §B.1, §B.16 |
+| Error propagation | Error is always handled with `match`; **no `?` propagation operator** in the seed. The failure case is the **native lowercase `error`** (↺ superseded `Error`/`Valor\|Error` — B.37): fallible-with-value = `valor \| error`, fallible-no-value = `error?` (never `void\|error`). | **M.4** (don't build sugar on the transitional `valor\|error` shape) **+ M.3/M.5** (B.37 — lowercase native `error`) | → HISTORY §B.1, §B.16, §B.37 |
 | Nominal typing | `type X = Y` is a **distinct** type (no aliases); identity is the name. | **M.3** (the type *is* its identity, not a transparent proxy) | → HISTORY §B.13 |
 | String prefixes (seed) | Seed = `"` delimiter + `$"..."` one-level interpolation (literal brace `{{`). `$`-count trick **removed**; raw `@"..."` and multi-line `"""..."""` → evolution. | **M.5** (austerity; aesthetic ≠ weight) | → HISTORY §B.5 |
-| `bigint` | A **library** type (evolution), not native — the sign-check comparison removed the ceiling that briefly justified native. | **M.5** + **M.0** | → HISTORY §B.30 |
+| `bigint` | **A NAMED NATIVE numeric type, deferred** (runtime-backed, heap-limb bignum) — it enters the native set when its runtime is built. ↺ **Supersedes B.30's "library type (evolution), not native"**: the legislator's B.38 numeric set names `bigint` as native-but-deferred; the sign-check (B.22) still removes the comparison ceiling, so `bigint` is not *needed* for ordering, but it is legislated as a named native type, staged behind its runtime. | **M.0** (native arbitrary-precision is metal-adjacent) **+ M.4** (deferred behind its runtime) **+ M.5** | → HISTORY §B.30, §B.38 |
+| Native numeric set / floats | **The native set is `u8…u128`/`i8…i128` + `f16`/`f32`/`f64` + `dec` + `bigint`, plus `bool`/`byte`.** ↺ **Supersedes the seed's narrower `u8…u64`/`i8…i64` set and UN-DEFERS floats** (the roadmap's "float … deferred"). **Staging:** Tier 1 (`u128`/`i128` + the three floats) now; `dec`/`bigint` named-but-deferred. Float rulings: literal `3.14`/`1.5e3` defaults to **`f64`** (f16/f32 by annotation); float ÷0 **PANICS**; `float↔int` via `to` is **runtime-guarded** (truncates toward zero; doesn't-fit/NaN/∞ → panic). | **M.0** (the widths exist on the metal) **+ M.1** (÷0 + conversion panic — no silent loss/poison) **+ M.3** (explicit literal default + annotation; each type names what it is) | → HISTORY §B.38 |
 | Three-way comparison | `compare → Ordering`, an **`enum`** `{ Less=-1; Equal=0; Greater=1 }` (i8-backed). | **M.0 ≺ M.3 ≺ M.5** | → HISTORY §B.31 |
 | Closures | **Magic closures banned** (M.3 — they lie); **stateless function passing is SEED** (`fn(args)->ret` type, bare-name passing, no `&`, top-level only); stateful forms `use`/`inject` are evolution; DI lifetimes are `#` directives. | **M.3** (primary) | → HISTORY §B.10 |
 | `static` | **Banned** (disguised global state). Replacement: DI (`inject`) + singleton — evolution. `static` distinct from `inject`. | **M.1** + **M.5** | → HISTORY §B.25, §B.10 |
-| Numeric conversions (`to`) | **Any defined numeric→numeric conversion is allowed** (incl. byte↔int — byte AS u8, B.36), incl. narrowing/sign (`i32 to i8`, `i32 to u32`); loss is **caught, never silent**. **Validating whether a conversion is possible lives at RUNTIME** — an impossible conversion (the value doesn't fit) **PANICS** (debug AND release; parity with ÷0/OOB). **Constants are the exception**: a constant out of range is a **compile error** (fail early, static). `bool`↔num and non-numeric = undefined → compile error. **Supersedes** the early "forbid every lossy conversion at compile time" *and* the interim "defined-release truncation" (↺ refined: conversions panic, they do not wrap). | **M.1** (forbids *silent* loss; the panic-guard cures it — fail loudly) **+ M.0** (keep the metal conversion attempt) **+ §II** (parity with ÷0/OOB) | → HISTORY conversions block |
+| Numeric conversions (`to`) | **Any defined numeric→numeric conversion is allowed** (incl. byte↔int — byte AS u8, B.36; **and `float↔int`, `int→float`, `float→float` widths — B.38**), incl. narrowing/sign (`i32 to i8`, `i32 to u32`); loss is **caught, never silent**. **Validating whether a conversion is possible lives at RUNTIME** — an impossible conversion (the value doesn't fit; `float→int` overflow / `NaN` / `∞`, which truncates toward zero else **PANICS** — B.38) **PANICS** (debug AND release; parity with ÷0/OOB). **Constants are the exception**: a constant out of range is a **compile error** (fail early, static). `bool`↔num and non-numeric = undefined → compile error. **Supersedes** the early "forbid every lossy conversion at compile time" *and* the interim "defined-release truncation" (↺ refined: conversions panic, they do not wrap); **extended to `float↔int` — B.38**. | **M.1** (forbids *silent* loss; the panic-guard cures it — fail loudly) **+ M.0** (keep the metal conversion attempt) **+ §II** (parity with ÷0/OOB) | → HISTORY conversions block, §B.38 |
 | `AltPattern` axis (`\|` in `match`) | An `Alt` option may be a **value pattern** (literal/range) **or a bare variant case** (`BindPattern`, `has_binding=false`) — so `RED \| GREEN` against a variant subject is legal and **counts toward variant-axis exhaustiveness** (C7b expands it). **Bindings inside an `Alt` option are forbidden** (`Foo as x \| Bar`, or a `FieldPattern` inside `\|`) → error. **Supersedes** A.14's "Alt = value axis only" annotation (the canonical axis-exclusive parse). | **M.0** (alternation is generous; `\|` already means "one of these" in the type grammar) **+ M.2** (legible at the call site) **+ M.5** (one unified parse path) **+ M.1** (exhaustiveness stays sound: Alt expands, bindings excluded by construction) | → HISTORY §A.14 (↺ Alt axis) |
+| `void` vs `Unit` | **`void` = "returns no value", a return marker — never a type, value, variant member, or binding.** A fn writes `-> Type` **or** `-> void`. **`Unit` ceases to exist** (the empty-struct value-less type is abolished). | **M.3** (a value meaning "no value" lies; `void` names the absence honestly) **+ M.1** (un-representable as value/member/binding — exclusion-by-construction) **+ M.5** (one absence-marker, no parallel `Unit`) | → HISTORY §B.37 |
+| Error type spelling | **`error` is the NATIVE lowercase type** — supersedes `Error` / `teko::Error` / `Valor \| Error`. Fallible-with-value = `T \| error`; fallible-no-value = **`error?`** (never `void \| error`). | **M.3** (no special-cased capital `Error`) **+ M.5** (one spelling of the failure case) **+ M.1** (failure visible in the return type) | → HISTORY §B.37 |
+| Nullable variant members | **Forbidden.** Nullability is the `?` suffix on a **whole type** (`T?`/`?.`/`??`), never a variant member; `Value? \| i32` is illegal → declare `type Val = Value \| i32`, mark `-> Val?`. | **M.1** (exclusion-by-construction; null vs error domains stay disjoint) **+ M.2** (`?` marks nullability at the type) | → HISTORY §B.37 |
 
 ---
 
@@ -63,22 +67,107 @@ because redefinition is a legislative act.)*
 > Each entry is either a **distilled rule** (norm + governing Law) or a **pointer** to history awaiting
 > distillation. Anchors like **M.3** refer up to `TEKO_CONSTITUTION.md`.
 
+### Doctrinal correction — `void` / `error` / `variant` / nullability (2026-06-24)
+
+> A normative amendment ratifying four rulings (the legislator's, recorded in **HISTORY §B.37**). Each
+> was already latent in the canon; this subsection distils them as norms in force and the in-place edits
+> below correct the deprecated forms they supersede. **One-line guard:** *no `Unit`, no `variant {
+> Case(...) }`, no `void`/nullable inside a variant, no capital `Error` — `void` is a return marker,
+> `error` is native, nullability is `T?`.*
+
+- **`void` = "returns no value" — a return marker, never a type.** Every function writes **`-> Type`**
+  or **`-> void`** (`->` is always present). `void` is **never** a value, **never** a variant member,
+  **never** a binding type. **This supersedes `Unit`** (the empty-struct value-less type) — `Unit`
+  ceases to exist. **Governing Law: M.3** (a value that means "no value" *lies*; `void` names the
+  absence honestly, carrying nothing) **+ M.1** (un-representable as value/member/binding —
+  *exclusion-by-construction*) **+ M.5** (one absence-marker, no parallel `Unit`). *(Corrective canon
+  already present: HISTORY §5829–5833, §5971. → HISTORY §B.37.)*
+- **`variant` = a sum of COMPLETE declared types — no constructors, no `void`, no nullable member.**
+  Each member is a real, separately-declared type: any native (`u8`, `i32`, `error`, `str`, `byte`,
+  `[]f64`, …), an `enum`, a `struct`, or another `variant`. The Rust `Case(payload)` constructor form
+  is **forbidden** ("the Rust casts shadow"). **Governing Law: M.3** (honest about what each case
+  carries — no synthetic wrapper) **+ M.1** (exactly one case; no `void`/nullable member to leave an
+  invalid state) **+ M.5** (no constructor sugar). *(Canon: §109 below; `src/checker/type.tks` models
+  `Variant = members: []Type`. → HISTORY §B.14, §B.37.)*
+- **Nullability = the `?` suffix on a WHOLE type — `T?`, `?.`, `??` (a built-in type-former, not
+  generics).** `T?` in type position, `?.` safe access, `??` Elvis. **A variant member cannot be
+  nullable**: `Value? | i32` is illegal → declare `type Val = Value | i32` and mark the *return*
+  `-> Val?`. The two failure domains are **disjoint**: value-absence → `?.`/`??`; recoverable error →
+  `match`. The seed implements `T?` **fully** (model + parser + checker + codegen + VM). **Governing
+  Law: M.1** (disjoint domains, each fully handled; nullable-member excluded by construction) **+ M.2**
+  (`?` marks nullability at the type). *(Canon: REBOOT_PLAN §202–203; §75 below. → HISTORY §B.2, §B.37.)*
+- **`error` is the NATIVE lowercase type.** It **supersedes** `Error` / `teko::Error` / `Valor |
+  Error`. A fallible function **with a value** is **`T | error`**; a fallible function with **no value**
+  is **`-> error?`** (null = ok, an `error` value = failure) — **never** `void | error` (void-in-variant
+  is illegal). **Governing Law: M.3** (no special-cased capital `Error`) **+ M.5** (one spelling of the
+  failure case) **+ M.1** (failure visible in the return type). *(Already lowercase in `src/core.tks`.
+  → HISTORY §B.37.)*
+
+### The native numeric type set + the float rulings (2026-06-24)
+
+> A normative amendment legislating Teko's full native numeric inventory (the legislator's, recorded in
+> **HISTORY §B.38**). It **fixes the set**, **stages** what is implemented now versus named-but-deferred,
+> and **un-defers floats** (the roadmap had "float … deferred") with three ratified float rulings. Each
+> ruling is already governed by the M-laws (cited below); none invents a new Law. **One-line guard:** *the
+> native numbers are `u8…u128`/`i8…i128` + `f16`/`f32`/`f64` + `dec` + `bigint`, plus `bool` and `byte`;
+> an un-annotated float literal is `f64`; float ÷0 PANICS; `float↔int` via `to` is runtime-guarded (panic
+> on impossibility).*
+
+- **The native numeric type set.** Teko's native numbers are: integers **`u8 u16 u32 u64 u128`** and
+  **`i8 i16 i32 i64 i128`**; floats **`f16 f32 f64`**; **`dec`** (a decimal, 256×256 = 512 bits); and
+  **`bigint`** (arbitrary / variable precision). Plus the existing **`bool`** (two values, boolean
+  algebra, not arithmetic) and **`byte`** (an octet, newtype over `u8` — B.36). **This supersedes the
+  seed's narrower set** (only `u8…u64`/`i8…i64`) — ↺ widths up to 128 are now native, and floats are
+  **un-deferred**. **Governing Law: M.0** (the widths exist on the metal — a systems language names them)
+  **+ M.3** (each type names exactly what it is; `dec` is decimal, not binary float; `byte` ≠ number).
+  *(Canon: CORRECTION_PLAN §5. → HISTORY §B.38.)*
+- **Staging — Tier 1 now; `dec`/`bigint` named-but-deferred.** **Tier 1** (`u128`/`i128` + `f16`/`f32`/`f64`)
+  is implemented **now**, end-to-end (lexer → checker → codegen → VM). **`dec`** and **`bigint`** are
+  **named** in the type set but **deferred** — they are larger, **runtime-backed** types (a 512-bit decimal
+  and a heap-limb bignum) that enter when their runtime is built; naming them now reserves the spelling
+  without building ahead of the layer. **Governing Law: M.4** (build order — a width enters only when
+  lexer/checker/codegen/VM carry it; the runtime-backed types follow their runtime) **+ M.5** (no
+  unimplemented weight in the seed; the names cost nothing). *(→ HISTORY §B.38.)*
+- **Float literal syntax + the `f64` default.** A float literal is written `3.14` / `1.5e3`; an
+  **un-annotated** float literal **defaults to `f64`**. `f16` and `f32` require an **annotation**
+  (`let x: f32 = 3.14`). **Governing Law: M.3** (the default is explicit and documented — the literal does
+  not silently pick a narrow width; a narrower type is *asked for* by annotation) **+ M.2** (the annotation
+  is the explicit marker of intent). *(→ HISTORY §B.38.)*
+- **Float ÷0 PANICS — no IEEE ∞/NaN in the normal flow.** Floating-point division by zero **panics**,
+  exactly as integer ÷0 does — Teko **intercepts at the origin** (the metal stores IEEE ∞/NaN, but they
+  never surface as Teko values in the normal flow; "the NaN coffin stays shut"). Recoverable division is
+  `teko::math::div → T | error`. **Governing Law: M.1** (no silent poison value — ∞/NaN are intercepted at
+  the origin; the failure is loud, not a contaminating value). *(Extends the existing ÷0 norm under Safety
+  & determinism to floats. → HISTORY §B.24, §B.38.)*
+- **`float↔int` conversion via `to` — allowed, with a RUNTIME guard (panic on impossibility).** A
+  `float↔int` conversion through **`to`** is **allowed**: it **truncates toward zero**; a value that does
+  **not fit** the target (overflow / `NaN` / `∞`) **PANICS** (parity with the integer cast guard). `int→float`
+  and `float→float` width changes likewise go through **`to`**. This is the **same panic-guard doctrine** as
+  the numeric-conversions clause (see the Redefinitions Index, *Numeric conversions (`to`)*): any defined
+  numeric→numeric conversion is allowed, loss is caught-never-silent, and an impossible conversion **panics**
+  at runtime (constants out of range remain a compile error). **Governing Law: M.1** (forbids *silent* loss;
+  the panic-guard cures it — fail loudly) **+ M.0** (keep the metal conversion attempt). *(The
+  numeric-conversions clause is hereby **extended to include `float↔int`** under the same doctrine. → HISTORY
+  §B.38.)*
+
 ### Error model
-- **Error is a value, not an effect** — a recoverable failure is the `Error` case of a variant
-  (`Valor | Error`), returned normally and handled with `match`; propagated by returning it. No
-  `raise`/`throw`/`on error`, no exceptions, no stack unwinding. **Governing Law: M.1** (failure visible
-  in the return type, no hidden control flow) **+ M.3** (the variant honestly carries either a value or
-  a reason). The both-set/neither-set invalid states are impossible by construction (a variant is
-  exactly one case) — *exclusion-by-construction*, the strong mode of **M.1**.
-  *(→ HISTORY §B.1, §B.2 for was→is→why.)*
+- **Error is a value, not an effect** — a recoverable failure is the **native lowercase `error`** case
+  of a variant (`valor | error`; ↺ superseded `Error`/`Valor | Error` — B.37), returned normally and
+  handled with `match`; propagated by returning it. A fallible function with **no value** is `-> error?`
+  (null = ok, an `error` value = failure), **never** `void | error` (void-in-variant is illegal — B.37).
+  No `raise`/`throw`/`on error`, no exceptions, no stack unwinding. **Governing Law: M.1** (failure
+  visible in the return type, no hidden control flow) **+ M.3** (the variant honestly carries either a
+  value or a reason; lowercase `error`, no special-cased capital). The both-set/neither-set invalid
+  states are impossible by construction (a variant is exactly one case) — *exclusion-by-construction*,
+  the strong mode of **M.1**. *(→ HISTORY §B.1, §B.2, §B.37 for was→is→why.)*
 - **No `?` error-propagation in the seed** — error is *always* `match`; `?` is reserved strictly for
   nullability (`T?`, `?.`, `??`). **Governing Law: M.4** (do not build dedicated sugar over the
-  transitional `Valor | Error` shape; `match` is the general mechanism that survives the shape's
+  transitional `valor | error` shape; `match` is the general mechanism that survives the shape's
   evolution). *(→ HISTORY §B.16.)*
-- **Guard over nest — flatten the fallible chain (code-style norm).** When a `match` on `Valor | Error`
+- **Guard over nest — flatten the fallible chain (code-style norm).** When a `match` on `valor | error`
   exists only to extract the value and continue, write it as a **guard line** that extracts-or-returns,
-  then keep the following code at the **top level** — do **not** nest the rest inside the `Parsed`/`Valor`
-  arm. The approved form (exactly B.16's): `let p = match call() { Error as e => return e; Valor as v => v }`,
+  then keep the following code at the **top level** — do **not** nest the rest inside the `Parsed`/`valor`
+  arm. The approved form (exactly B.16's): `let p = match call() { error as e => return e; valor as v => v }`,
   then use `p` at the same level. Chaining N fallible calls this way stays **flat** (N guard lines),
   instead of the "Hadouken" staircase (N levels of nesting with a triangle of closing braces). The
   early-return in the error arm + the final value as the function's last expression is the honest shape
@@ -106,10 +195,13 @@ because redefinition is a legislative act.)*
   is **rejected** — it would *lie* about a **variable** (1–4-byte) UTF-8 codepoint; the honest codepoint
   type is the **variable `char = []byte`** (keeps its name; alpha-native). **Governing Law: M.3** (a fixed
   char lies; the distinctions byte/number/codepoint are real) **+ B.12/B.13.** *(→ HISTORY §B.12, §B.36.)*
-- **Variant = a union of declared types** — each case is a real, separately-declared type (struct/enum/
-  primitive) unioned with `|`; no inline cases, no special constructor; the inner type is reachable only
-  through `match` (the proof C's `union` lacks). **Governing Law: M.3** (honest about what it carries) **+
-  M.1** (exclusion-by-construction: exactly one case). *(→ HISTORY §B.14.)*
+- **Variant = a union of COMPLETE declared types** — each case is a real, separately-declared type (any
+  native, `enum`, `struct`, or another `variant`) unioned with `|`; no inline cases, **no constructor**
+  (the Rust `Case(payload)` form is forbidden — B.37), **no `void`, no nullable member** (`Value? | i32`
+  is illegal → lift to `type Val = Value | i32` and a `-> Val?` return — B.37); the inner type is
+  reachable only through `match` (the proof C's `union` lacks). **Governing Law: M.3** (honest about what
+  it carries) **+ M.1** (exclusion-by-construction: exactly one case; no void/nullable member to leave an
+  invalid state) **+ M.5** (no constructor sugar). *(→ HISTORY §B.14, §B.37.)*
 
 ### Text & encoding
 - **Bootstrap text is `byte` + `str`; UTF-8 is the (validated) codepage.** **`byte = u8`** (newtype) is one
@@ -118,7 +210,7 @@ because redefinition is a legislative act.)*
   literals are **`str` (`"…"`)** and **`byte` (`b'+'`)**; the lexer is **byte-level** (matches ASCII syntax
   with byte literals, collects string bytes). `str` **always validates** — UTF-8 is **forced**: a `str`
   *means* valid UTF-8, so it *is* (the invariant), guaranteed from the bootstrap via the always-on
-  `str_from_utf8(bytes) -> str | Error`. **Governing Law: M.3** (UTF-8 named; `str` cannot lie about being
+  `str_from_utf8(bytes) -> str | error` (↺ `error` lowercase native — B.37). **Governing Law: M.3** (UTF-8 named; `str` cannot lie about being
   valid) **+ M.1** (valid by construction) **+ B.12/B.13.** *(→ HISTORY §B.36.)*
 - **A *fixed* `char` is rejected; the *variable* `char = []byte` is alpha-native.** A UTF-8 codepoint is
   variable (1–4 bytes), so a fixed `char = [4]byte` would lie; the honest **`char = []byte`** (the variable
@@ -132,7 +224,8 @@ because redefinition is a legislative act.)*
   The same octets are different text in different codepages, so heuristic detection is *guessing* (forbidden).
   Two honest paths: **validate** UTF-8 (the **always-on, bootstrap** `str_from_utf8` — the honest substitute
   for detection: guarantees the invariant, not the file's intent) and **transcode** from/to a **declared**
-  codepage (`from_<cp>` / `to_<cp> -> []byte | Error`, the caller declares; never guesses — **evolution**).
+  codepage (`from_<cp>` / `to_<cp> -> []byte | error`, the caller declares; never guesses — **evolution**;
+  ↺ `error` lowercase native — B.37).
   **Governing Law: M.3** (never guess an encoding) **+ M.1** (validated / `from_`/`to_` fail explicitly) **+
   M.5** (foreign-codepage transcoding is evolution). *(→ HISTORY §B.36.)*
 
@@ -173,7 +266,7 @@ because redefinition is a legislative act.)*
 
 ### Modules & files
 - **The stdlib is injected, not imported; `teko::` is the reserved native root** — `teko::` (e.g.
-  `teko::print`, `teko::Error`) is non-shadowable, not aliasable, never a dependency; writing native code
+  `teko::print`, `teko::error` — ↺ lowercase native, superseding `teko::Error`, B.37) is non-shadowable, not aliasable, never a dependency; writing native code
   is gated by repo governance, not cryptography. **The canonical root *is* the project's name** (declared
   in `.tkp`): the language's own project is canonically **`teko`**, so its modules are `teko::lexer`,
   `teko::parser`, …, and the injected stdlib emanates from the same root (compiler + stdlib are one `teko`
@@ -212,9 +305,11 @@ because redefinition is a legislative act.)*
   parser). YAML rejected (lies — the "Norway problem"), JSON weak (no comments), INI weak (no nesting).
   **Governing Law: M.3** (typed, no coercion) **+ M.2** (commentable) **+ M.5** (minimal, reuse not bespoke)
   **+ M.1/M.0** (unambiguous, simple grammar). *(→ HISTORY §B.33.)*
-- **A Teko package = `.tkh` (interface) + `.tkb` (typed-tree payload); deps are STATICALLY pre-linked, not
-  FFI.** When a `.tkp` declares `artifact = library`, the compiler emits a **package**: the `.tkh` (the `exp`
-  interface a consumer type-checks against) and the `.tkb` (the full serialized **typed tree** — Teko IL).
+- **A Teko package is a `.tkl` (Teko Library) = `.tkh` (interface) + `.tkb` (typed-tree payload); deps are
+  STATICALLY pre-linked, not FFI.** When a `.tkp` declares `artifact = library`, the compiler emits a
+  **package — a `.tkl`** carrying the `.tkh` (the `exp` interface a consumer type-checks against) and the
+  `.tkb` (the full serialized **typed tree** — Teko IL). *(The `.tkl` internal layout — one bundled file vs
+  co-located `.tkh`/`.tkb` — is a forward design point; see TEKO_CORRECTION_PLAN §11.)*
   The **`.tkb` is binary but is NOT a native object (`.o`)** — it is Teko's own typed-tree serialization. When
   compiling the dev's code against dependencies, the compiler **loads the dependency packages into memory and
   acts as a PRE-LINKER, statically merging** their typed trees with the dev's into one program before codegen.
@@ -224,6 +319,29 @@ because redefinition is a legislative act.)*
   is honest static inclusion, not a pretend-foreign call) **+ M.4** (the consuming compile is built on already-
   checked packages). *(Forward-looking: the pre-linker + package loader land with the pipeline driver; today only
   the emitters — `.tkb` codec and `.tkh` `build_header`/`emit_tkh` — exist.)*
+- **The Teko file-extension registry (legislator, 2026-06-24).** The canonical set, each name one role:
+  - **`.tks`** — *Teko Source* (a source file; namespace = its directory).
+  - **`.tkt`** — *Teko Test* (a test file; runs on the VM in the test sub-profile, beside its `.tks`, never an artifact).
+  - **`.tkp`** — *Teko Project* (the TOML manifest: name/source/artifact/dependencies/aliases — B.33).
+  - **`.tkb`** — *Teko Binary* (the serialized **typed tree** / Teko IL — NOT a native `.o`; the pre-linker's unit).
+  - **`.tkh`** — *Teko Header* (the `exp` **interface** a consumer type-checks against — the `pub`/`exp` surface).
+  - **`.tsym`** — *Teko Symbols* (debug symbols: file:line + names for the debugger + stack traces — Eixo E).
+  - **`.tkl`** — *Teko Library* (a **package**: the distributable dependency unit = `.tkh` interface + `.tkb` payload).
+  **Governing Law: M.3** (each extension names its role honestly) **+ M.5** (one extension per role, no overlap).
+- **Teko's own native backend — transpile-to-C is REVOKED (legislator, 2026-06-24).** The AOT path will be
+  **Teko's OWN native code generator** (typed tree / `.tkb` → native object/binary directly), realizing the
+  Constitution's **stage-2 (AOT-native on a host OS)** *without* the host `cc` as an intermediary. ↺ This
+  **supersedes the original transpile-to-C backend decision** (the codegen lowered the typed tree to C, host
+  `cc` produced the binary — HISTORY §B.34/§B.35; TEKO_ROADMAP_BINARY Fase 2 "TC"). **Sequencing (M.4):
+  conclude ALL current work FIRST**, then build the native backend — it is not started until the rest is done.
+  **Transpile-to-C is REVOKED as the PRIMARY/shipping backend but RETAINED — kept fully equalized — as a
+  permanent FALLBACK and a DIFFERENTIAL-CORRECTNESS COMPARATIVE** (legislator, 2026-06-24). So THREE execution
+  paths must stay behaviorally equivalent: the **VM (`.tkb` interpreter, stage-1)**, the **transpile-to-C/`cc`
+  path** (fallback + comparative), and the future **native backend** (primary). **Every wave (value layer,
+  execution, …) lands in ALL active paths** — codegen is NOT frozen. **Governing Law: M.0** (native code is the
+  metal *ethos*, no C middleman) **+ M.4** (build order — finish the front/middle before the new back) **+ M.1**
+  (three agreeing paths = differential-correctness safety net) **+ M.3** (the shipping path is honestly native).
+  *(→ HISTORY §B.34/§B.35, superseded as primary; §B.39.)*
 - **Recursive types allowed; cyclic namespace dependencies forbidden** — mutually recursive *types* are
   fine (compiler-managed indirection, no exposed pointer — the AST needs it); a namespace import **cycle
   is a compile error** (modules form a DAG, one-directional, matching the compiler's own pipeline flow).
@@ -267,13 +385,15 @@ because redefinition is a legislative act.)*
     `.tkb` VM/interpreter** — the VM is a **future mode** (not dropped), it just does not gate the first binary
     (it needs the statement/program `.tkb` codec, today expression-only). The path is TEKO_ROADMAP_BINARY.md.
     *(legislator's choice — → HISTORY first-binary backend.)*
-- **IO is slurp (whole-file `[]byte`), not streams — for the seed.** `read_file(path) -> []byte | Error`
-  (open, read all, close), `write_file(path, []byte) -> () | Error`, `write_err([]byte)` (stderr).
-  **Streams are deferred** (they enter when large inputs justify the weight). `read_file` returns **raw
-  `[]byte`** (octets), not `[]u8` — a file *is* bytes; interpreting them as text (UTF-8 → `char` → `str`)
-  is a separate step (`byte` is distinct from `u8` — B.12). **Governing Law: M.5** (small files don't
-  justify stream weight) **+ M.3** (one open/read-all/close, no hidden buffering; data vs interpretation
-  kept distinct) **+ M.1** (`-> []byte | Error`, explicit failure). *(→ HISTORY §B.35.)*
+- **IO is slurp (whole-file `[]byte`), not streams — for the seed.** `read_file(path) -> []byte | error`,
+  (open, read all, close), `write_file(path, []byte) -> error?` (↺ superseded the **illegal**
+  `-> () | Error` void-in-variant — a fallible-no-value fn is `error?`, null = ok / `error` = failure,
+  B.37), `write_err([]byte) -> void` (stderr; ↺ `-> void` return marker, B.37). **Streams are deferred**
+  (they enter when large inputs justify the weight). `read_file` returns **raw `[]byte`** (octets), not
+  `[]u8` — a file *is* bytes; interpreting them as text (UTF-8 → `char` → `str`) is a separate step
+  (`byte` is distinct from `u8` — B.12). **Governing Law: M.5** (small files don't justify stream weight)
+  **+ M.3** (one open/read-all/close, no hidden buffering; data vs interpretation kept distinct) **+ M.1**
+  (`-> []byte | error` / `-> error?`, explicit failure — never void-in-variant). *(→ HISTORY §B.35, §B.37.)*
 - **The IO boundary (`teko::io`) is the thin, named, swappable host edge.** The stdlib module doing
   file/console IO is the isolated boundary between Teko and the host; its **interface** (`read_file`,
   `write_file`) is **stable across the stages**, while its **implementation** descends the stack
@@ -334,7 +454,8 @@ because redefinition is a legislative act.)*
 
 ### Safety & determinism
 - **∞/NaN never exist as values; ÷0 panics (runtime) / is a compile error (literal)** — the metal stores
-  IEEE ∞/NaN, but Teko intercepts at the origin; recoverable division is `teko::math::div → T | Error`.
+  IEEE ∞/NaN, but Teko intercepts at the origin; recoverable division is `teko::math::div → T | error`
+  (↺ `error` lowercase native — B.37).
   **Governing Law: M.1** (no silent poison; "the NaN coffin stays shut"). *(→ HISTORY §B.24.)*
 - **Costly safety checks are debug/test-only; release is metal-pure (defined behavior)** — overflow
   panics in debug, wraps (defined) in release; the build profile decides. Division's ÷0 check is the

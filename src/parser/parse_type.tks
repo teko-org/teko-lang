@@ -1,12 +1,25 @@
 // src/parser/parse_type.tks   (namespace 'teko::parser')
 
+use teko::lexer
+
 // A primary type: a slice `[]T` or a named path. (Members of a `|` union and a
 // slice's element are primaries — the union level is `parse_type` below.)
 fn parse_primary(tokens: []lexer::Token, pos: u64) -> ParsedType | error {
-    if is_kind_at(tokens, pos, lexer::TokenKind::LBracket) {
-        return parse_slice(tokens, pos)
+    let base = if is_kind_at(tokens, pos, lexer::TokenKind::LBracket) {
+        match parse_slice(tokens, pos) { ParsedType as x => x; error as e => return e }
+    } else {
+        match parse_named(tokens, pos) { ParsedType as x => x; error as e => return e }
     }
-    parse_named(tokens, pos)
+    // postfix `?` → an OPTIONAL type (T? — REBOOT_PLAN §202; nullability only). Binds
+    // tighter than `|`, so `T? | U` is `(T?) | U`; doubled `T??` nests (T?)?.
+    mut node = base.node
+    mut p = base.next
+    loop {
+        if !is_kind_at(tokens, p, lexer::TokenKind::Question) { break }
+        node = OptionalType { inner = node }
+        p = p + 1
+    }
+    ParsedType { node = node, next = p }
 }
 
 // A named type is a path: `u64`, `lexer::Token` (nominal — B.13).
@@ -19,7 +32,7 @@ fn parse_named(tokens: []lexer::Token, pos: u64) -> ParsedType | error {
 // `[]A | B` is `([]A) | B`; nested slices recurse (`[][]T`). Recursive — B.8.
 fn parse_slice(tokens: []lexer::Token, pos: u64) -> ParsedType | error {
     if !is_kind_at(tokens, pos + 1, lexer::TokenKind::RBracket) {
-        return error { message = "expected ']' to close '[' in a slice type '[]T'" }
+        return err_at(tokens, pos + 1, "expected ']' to close '[' in a slice type '[]T'")
     }
     let elem = match parse_primary(tokens, pos + 2) { ParsedType as x => x; error as e => return e }
     ParsedType { node = SliceType { element = elem.node }, next = elem.next }

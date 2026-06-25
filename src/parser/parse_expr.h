@@ -12,5 +12,8 @@
 #include <stddef.h>
 
 tk_parsed_result tk_parse_expr(const tk_token *t, size_t n, size_t pos);
+// the if/match SCRUTINEE form: a trailing `{` opens the block, not a struct literal, so
+// top-level struct literals are suppressed (W4a — the struct-literal/block disambiguation).
+tk_parsed_result tk_parse_expr_no_struct(const tk_token *t, size_t n, size_t pos);
 
 #endif // TK_PARSER_PARSE_EXPR_H

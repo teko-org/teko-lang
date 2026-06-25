@@ -47,6 +47,10 @@ static void collect(tk_strtable *t, const tk_texpr *te) {
             collect(t, te->as.field_access.receiver);
             tk_st_intern(t, te->as.field_access.field);                          // CRITICAL: intern the field name
             break;
+        case TK_TEXPR_INTERP:                                                   // $"…{expr}…": intern each piece, recurse holes
+            for (size_t i = 0; i < te->as.interp.npieces; i += 1) tk_st_intern(t, te->as.interp.pieces[i]);
+            for (size_t i = 0; i < te->as.interp.nholes; i += 1) collect(t, &te->as.interp.holes[i]);
+            break;
         default: break;
     }
 }

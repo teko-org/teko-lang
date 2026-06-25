@@ -14,7 +14,20 @@ static tk_type prim(tk_prim_kind k) {
 }
 
 tk_env tk_env_define(tk_env env, tk_str name, tk_type t, bool is_mut) {
-    return tk_env_push(env, (tk_val_binding){ .name = name, .type = t, .is_mut = is_mut });
+    // PERSISTENT extend (NOT the linear TK_LIST push, which reallocs/writes the buffer
+    // IN PLACE): copy into a FRESH buffer so the caller's env is never mutated, moved, or
+    // freed. The checker reuses one env value NON-LINEARLY — sibling `match` arms each
+    // extend the same base env (tk_check_pattern), and sibling functions each extend the
+    // same collected env (tk_type_function) — so a mutating push would dangle every other
+    // holder's `.ptr` after a realloc → heap corruption ("pointer being freed was not
+    // allocated"). Copy-on-extend keeps each branch's env independent. O(n) per define;
+    // the bootstrap stays small (M.5), and this matches the functional `.tks` env twin.
+    size_t n = env.len;
+    tk_val_binding *buf = malloc((n + 1) * sizeof *buf);
+    if (buf == NULL) { abort(); }
+    if (n != 0) { memcpy(buf, env.ptr, n * sizeof *buf); }
+    buf[n] = (tk_val_binding){ .name = name, .type = t, .is_mut = is_mut };
+    return (tk_env){ .ptr = buf, .len = n + 1, .cap = n + 1 };
 }
 
 bool tk_bind_is_mut(tk_bind_kind k) { return k == TK_BIND_MUT; }   // Let/Const immutable (B.21)
@@ -39,10 +52,15 @@ tk_type_result tk_builtin_type(tk_str name) {
     else if (name_is(name, "u16"))   t = prim(TK_PRIM_U16);
     else if (name_is(name, "u32"))   t = prim(TK_PRIM_U32);
     else if (name_is(name, "u64"))   t = prim(TK_PRIM_U64);
+    else if (name_is(name, "u128"))  t = prim(TK_PRIM_U128);   // native set (B.38)
     else if (name_is(name, "i8"))    t = prim(TK_PRIM_I8);
     else if (name_is(name, "i16"))   t = prim(TK_PRIM_I16);
     else if (name_is(name, "i32"))   t = prim(TK_PRIM_I32);
     else if (name_is(name, "i64"))   t = prim(TK_PRIM_I64);
+    else if (name_is(name, "i128"))  t = prim(TK_PRIM_I128);   // native set (B.38)
+    else if (name_is(name, "f16"))   t = prim(TK_PRIM_F16);    // native floats (B.38)
+    else if (name_is(name, "f32"))   t = prim(TK_PRIM_F32);    // native floats (B.38)
+    else if (name_is(name, "f64"))   t = prim(TK_PRIM_F64);    // native floats (B.38)
     else if (name_is(name, "bool"))  t = prim(TK_PRIM_BOOL);
     else if (name_is(name, "byte"))  t = (tk_type){ .tag = TK_TYPE_BYTE };
     else if (name_is(name, "str"))   t = (tk_type){ .tag = TK_TYPE_STR };
@@ -53,30 +71,30 @@ tk_type_result tk_builtin_type(tk_str name) {
 
 // The injected stdlib (non-shadowable): teko::print / teko::println are part of the
 // language surface, not imported — so type_call falls back here when env lookup fails.
-// Both are (str) -> Unit. The func type's params/ret are pointers, so they point at
+// Both are (str) -> void. The func type's params/ret are pointers, so they point at
 // immutable static singletons (whole-compile lifetime — they are never mutated).
 tk_type_result tk_builtin_fn(tk_str name) {
     static tk_type str_t  = { .tag = TK_TYPE_STR };       // a (str) parameter
     static tk_type bool_t = { .tag = TK_TYPE_PRIM, .as.prim = TK_PRIM_BOOL };  // a (bool) parameter
-    static tk_type unit_t = { .tag = TK_TYPE_UNIT };      // the Unit return
+    static tk_type void_t = { .tag = TK_TYPE_VOID };      // the void return (M.3 — no value)
     static tk_type str2_t[2] = { { .tag = TK_TYPE_STR }, { .tag = TK_TYPE_STR } };  // (str, str)
     if (name_is(name, "print") || name_is(name, "println")) {
         tk_type ft = { .tag = TK_TYPE_FUNC,
-                       .as.func = { .params = &str_t, .nparams = 1, .ret = &unit_t } };
+                       .as.func = { .params = &str_t, .nparams = 1, .ret = &void_t } };
         return (tk_type_result){ .ok = true, .as.value = ft };
     }
     // teko::assert — injected testing assertions (canonical: src/assert/assert.tks).
     // Resolved by last segment, like print (type_call looks up the LAST path seg). The
     // seed subset is NON-generic: equals/not_equals/is_error/is_ok from the roadmap need
     // GENERICS or the result/error types and are NOT expressible yet — DEFERRED (M.3).
-    if (name_is(name, "is_true") || name_is(name, "is_false")) {  // (bool) -> Unit
+    if (name_is(name, "is_true") || name_is(name, "is_false")) {  // (bool) -> void
         tk_type ft = { .tag = TK_TYPE_FUNC,
-                       .as.func = { .params = &bool_t, .nparams = 1, .ret = &unit_t } };
+                       .as.func = { .params = &bool_t, .nparams = 1, .ret = &void_t } };
         return (tk_type_result){ .ok = true, .as.value = ft };
     }
-    if (name_is(name, "str_contains")) {                          // (str, str) -> Unit
+    if (name_is(name, "str_contains")) {                          // (str, str) -> void
         tk_type ft = { .tag = TK_TYPE_FUNC,
-                       .as.func = { .params = str2_t, .nparams = 2, .ret = &unit_t } };
+                       .as.func = { .params = str2_t, .nparams = 2, .ret = &void_t } };
         return (tk_type_result){ .ok = true, .as.value = ft };
     }
     return (tk_type_result){ .ok = false, .as.error = tk_error_make("not a built-in function") };

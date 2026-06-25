@@ -9,6 +9,7 @@ TK_LIST(tk_byte, tk_bytes);        // the growable output buffer
 
 tk_bytes tk_write_u8(tk_bytes b, tk_byte x);
 tk_bytes tk_write_u32(tk_bytes b, uint32_t x);
+tk_bytes tk_write_u64(tk_bytes b, uint64_t x);   // LE: low u32 then high u32 (inverse of tk_read_u64)
 tk_bytes tk_write_i64(tk_bytes b, int64_t x);
 tk_bytes tk_write_bytes(tk_bytes b, tk_str s);
 

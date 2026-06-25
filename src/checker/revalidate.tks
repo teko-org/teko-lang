@@ -1,11 +1,16 @@
 // src/checker/revalidate.tks  (namespace 'teko::checker')
 
+use teko::lexer
+
 fn is_bool(t: Type) -> bool    { match t { Prim as p => p.kind == PrimKind::Bool; _ => false } }
-fn is_integer(t: Type) -> bool { match t { Prim as p => p.kind != PrimKind::Bool; _ => false } }
+fn is_integer(t: Type) -> bool { match t { Prim as p => prim_is_int(p.kind); _ => false } }
+fn is_float(t: Type) -> bool   { match t { Prim as p => prim_is_float(p.kind); _ => false } }
+fn is_numeric(t: Type) -> bool { is_integer(t) || is_float(t) }   // B.38 — int or float
 
 // the stored type must equal the type derived independently here.
-fn check_node_type(stored: Type, expected: Type) -> Unit | error {
-    if type_eq(stored, expected) { return Unit { } }
+// `error?`: null ⇒ ok; an `error` ⇒ the mismatch.
+fn check_node_type(stored: Type, expected: Type) -> error? {
+    if type_eq(stored, expected) { return null }
     error { message = "corrupt typed tree: a node's type does not match its derivation" }
 }
 
@@ -15,73 +20,126 @@ fn rederive_binary(lt: Type, rt: Type, op: lexer::TokenKind) -> Type | error {
         if !is_integer(lt) || !is_integer(rt) { return error { message = "corrupt: shift operands not integer" } }
         return lt
     }
-    if op_is_arith_bitwise(op) {
-        if !is_integer(lt) { return error { message = "corrupt: arith/bitwise operand not integer" } }
+    if op_is_arith(op) {   // + - * / — numeric (int or float), same-type (B.22/B.38)
+        if !is_numeric(lt) { return error { message = "corrupt: arithmetic operand not numeric" } }
+        if !type_eq(lt, rt) { return error { message = "corrupt: binary operands differ (no promotion)" } }
+        return lt
+    }
+    if op_is_arith_bitwise(op) {   // %, & | ^ — integer-only
+        if !is_integer(lt) { return error { message = "corrupt: bitwise/remainder operand not integer" } }
         if !type_eq(lt, rt) { return error { message = "corrupt: binary operands differ (no promotion)" } }
         return lt
     }
     error { message = "corrupt: unknown binary operator" }
 }
 
-fn validate_each(xs: []TExpr) -> Unit | error {
+fn validate_each(xs: []TExpr) -> error? {
     mut i = 0
     loop {
         if i >= xs.len { break }
-        let _ = match validate_texpr(xs[i]) { Unit as u => u; error as e => return e }
+        match validate_texpr(xs[i]) { null => {}; error as e => return e }
         i++
     }
-    Unit { }
+    null
 }
 
 // COUNTER-VALIDATE a typed expression: re-derive its type and confirm it matches
 // the stored one (operators/literals), or check it structurally (env-dependent).
-fn validate_texpr(te: TExpr) -> Unit | error {
+// `error?`: null ⇒ the subtree is sound; an `error` ⇒ the corruption.
+fn validate_texpr(te: TExpr) -> error? {
     match te.kind {
-        TNumber  => check_node_type(te.type, Prim { kind = PrimKind::I64 })
+        TNumber as n => check_node_type(te.type, Prim { kind = if n.is_float { PrimKind::F64 } else { PrimKind::I64 } })   // default leaf type (B.38)
         TStrLit  => check_node_type(te.type, Str { })
         TByteLit => check_node_type(te.type, Byte { })
-        TVar     => Unit { }                       // env-dependent → trust (type is present)
+        TBoolLit => check_node_type(te.type, Prim { kind = PrimKind::Bool })   // true/false (LEGISLATION §75)
+        TNullLit => match te.type { Optional => null; _ => error { message = "corrupt: `null` typed as a non-optional" } }   // null is `T?` (REBOOT §202)
+        TVar     => null                           // env-dependent → trust (type is present)
         TCall as c => validate_each(c.args)        // [callee re-derivation is env-dependent]
         TBinary as b => {
-            let _ = match validate_texpr(b.left)  { Unit as u => u; error as e => return e }
-            let _ = match validate_texpr(b.right) { Unit as u => u; error as e => return e }
+            match validate_texpr(b.left)  { null => {}; error as e => return e }
+            match validate_texpr(b.right) { null => {}; error as e => return e }
             let d = match rederive_binary(b.left.type, b.right.type, b.op) { Type as t => t; error as e => return e }
             check_node_type(te.type, d)
         }
         TUnary as u => {
-            let _ = match validate_texpr(u.operand) { Unit as u2 => u2; error as e => return e }
+            match validate_texpr(u.operand) { null => {}; error as e => return e }
             if u.op == lexer::TokenKind::Bang {
                 if !is_bool(u.operand.type) { return error { message = "corrupt: `!` operand not bool" } }
                 return check_node_type(te.type, Prim { kind = PrimKind::Bool })
             }
-            if !is_integer(u.operand.type) { return error { message = "corrupt: `-`/`~` operand not integer" } }
+            if u.op == lexer::TokenKind::Minus {   // negation: numeric (int or float — B.38)
+                if !is_numeric(u.operand.type) { return error { message = "corrupt: `-` operand not numeric" } }
+                return check_node_type(te.type, u.operand.type)
+            }
+            if !is_integer(u.operand.type) { return error { message = "corrupt: `~` operand not integer" } }   // bitwise NOT — int-only
             check_node_type(te.type, u.operand.type)
         }
         TCompare as cmp => {
-            let _ = match validate_texpr(cmp.first) { Unit as u => u; error as e => return e }
+            match validate_texpr(cmp.first) { null => {}; error as e => return e }
             mut i = 0
             loop {
                 if i >= cmp.rest.len { break }
-                let _ = match validate_texpr(cmp.rest[i].operand) { Unit as u => u; error as e => return e }
+                match validate_texpr(cmp.rest[i].operand) { null => {}; error as e => return e }
                 i++
             }
             check_node_type(te.type, Prim { kind = PrimKind::Bool })   // a comparison is bool
         }
-        TIfExpr    => Unit { }    // [block-bearing: deep revalidation lands with program-level — E6-2]
-        TMatchExpr => Unit { }    // [idem — typed blocks/arms validate once validate_statement exists]
+        TIfExpr    => null        // [block-bearing: deep revalidation lands with program-level — E6-2]
+        TMatchExpr => null        // [idem — typed blocks/arms validate once validate_statement exists]
         TCast as c => {
-            let _ = match validate_texpr(c.expr) { Unit as u => u; error as e => return e }
+            match validate_texpr(c.expr) { null => {}; error as e => return e }
             match cast_check(c.expr.type, te.type) {           // RE-PROVE the cast independently (M.3 — not a rubber stamp)
-                Unit  => Unit { }
+                null  => null
                 error => error { message = "corrupt: illegal cast in typed tree" }
             }
         }
         TFieldAccess as f => {
-            let _ = match validate_texpr(f.receiver) { Unit as u => u; error as e => return e }
+            match validate_texpr(f.receiver) { null => {}; error as e => return e }
             match f.receiver.type {                            // struct-receiver invariant (field type is table-dependent → trust, as TVar/TCall)
-                Named => Unit { }
+                Named => null
                 _     => error { message = "corrupt: field access on a non-struct receiver" }
             }
+        }
+        TSafeFieldAccess as f => {   // recv?.field (REBOOT §203): optional receiver, optional result
+            match validate_texpr(f.receiver) { null => {}; error as e => return e }
+            match f.receiver.type {                            // optional-receiver invariant
+                Optional => match te.type { Optional => null; _ => error { message = "corrupt: safe field access result is not optional" } }
+                _        => error { message = "corrupt: safe field access on a non-optional receiver" }
+            }
+        }
+        TCoalesce as c => {   // a ?? b (REBOOT §203): optional left; result is the unwrapped/optional type
+            match validate_texpr(c.left)  { null => {}; error as e => return e }
+            match validate_texpr(c.right) { null => {}; error as e => return e }
+            match c.left.type {                                // optional-left invariant (result type re-derived in the typer)
+                Optional => null
+                _        => error { message = "corrupt: `??` left operand is not optional" }
+            }
+        }
+        TStructInit as s => {   // Name { f = v, … } (W4a): named-struct type + each field value valid
+            match te.type {                                    // named-struct invariant (field-type matching re-derived in the typer)
+                Named => validate_each(s.field_vals)
+                _     => error { message = "corrupt: struct literal not typed as a named type" }
+            }
+        }
+        TIndex as ix => {   // recv[index] (W5-idx): str/slice receiver, integer index (element type re-derived in the typer)
+            match validate_texpr(ix.receiver) { null => {}; error as e => return e }
+            match validate_texpr(ix.index)    { null => {}; error as e => return e }
+            let ok_recv = match ix.receiver.type { Str => true; Slice => true; _ => false }
+            if !ok_recv { return error { message = "corrupt: subscript on a non-indexable receiver" } }
+            if !is_integer(ix.index.type) { return error { message = "corrupt: subscript index is not an integer" } }
+            null
+        }
+        TInterp as in => {   // $"…{expr}…": str result; each hole valid + str/integer-typed
+            match te.type { Str => {}; _ => return error { message = "corrupt: interpolation not typed as a str" } }
+            mut i = 0
+            loop {
+                if i >= in.holes.len { break }
+                match validate_texpr(in.holes[i]) { null => {}; error as e => return e }
+                let ok = match in.holes[i].type { Str => true; _ => is_integer(in.holes[i].type) }
+                if !ok { return error { message = "corrupt: interpolation hole is not a str or an integer" } }
+                i++
+            }
+            null
         }
     }
 }

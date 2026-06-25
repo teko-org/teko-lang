@@ -37,10 +37,18 @@ typedef struct { tk_token_kind op; tk_expr *operand; } tk_cmp_term;   // one cmp
 // Each non-leaf Expr node is a named typedef (the checker passes them by value to
 // helpers — e.g. type_binary(tk_binary), type_if(tk_if_expr)). The leaf nodes
 // (Number/Var/StrLit/ByteLit/PathExpr) stay inline in the union.
-typedef struct { int64_t value; }                            tk_number;        // a literal number leaf
+// A literal number leaf (N1/N2 — TEKO_CORRECTION_PLAN §5). The node carries the RAW
+// value; its resolved `.type` (set by the typer) decides width/signedness/float-kind.
+//  - integer literal (any width, incl u128/i128): is_float=false, `value` holds it.
+//  - float literal (f16/f32/f64): is_float=true, `fval` holds it (default f64).
+// (C bootstrap uses __int128 for the integer carrier; the canonical Teko spelling uses
+//  the appropriate native int.)
+typedef struct { bool is_float; __int128 value; double fval; } tk_number;        // a literal number leaf
 typedef struct { tk_str name; }                              tk_var;           // a variable reference
 typedef struct { tk_str text; }                              tk_str_lit;       // "…"
 typedef struct { tk_byte value; }                            tk_byte_lit;      // b'x'
+typedef struct { bool value; }                               tk_bool_lit;      // true / false (LEGISLATION §75)
+typedef struct { char _unused; }                             tk_null_lit;      // null (REBOOT_PLAN §202) — no payload; typed `T?` by the checker
 typedef struct { tk_token_kind op; tk_expr *left, *right; }  tk_binary;        // any binary op
 typedef struct { tk_token_kind op; tk_expr *operand; }       tk_unary;         // - ~ ! (prefix)
 typedef struct { tk_expr *first; tk_cmp_term *rest; size_t nrest; } tk_compare; // a<b<c chain (M.3)
@@ -49,16 +57,31 @@ typedef struct { tk_expr *cond; tk_statement *then_blk; size_t nthen;          /
                  bool has_else; tk_statement *else_blk; size_t nelse; } tk_if_expr;
 typedef struct { tk_expr *subject; tk_arm *arms; size_t narms; }    tk_match_expr; // match IS an expression
 typedef struct { tk_expr *receiver; tk_str field; }          tk_field_access;  // x.field
+typedef struct { tk_expr *receiver; tk_str field; }          tk_safe_field_access; // x?.field — null-propagating (REBOOT_PLAN §203)
+typedef struct { tk_expr *left, *right; }                    tk_coalesce;      // x ?? y — Elvis/null-coalescing (REBOOT_PLAN §203)
 typedef struct { tk_expr *receiver; tk_str method;                            // recv.method(a, …)
                  tk_expr *args; size_t nargs; }              tk_method_call;
 typedef struct { tk_expr *expr; tk_type_expr target; }       tk_cast;          // x to T
 typedef struct { tk_path path; }                             tk_path_expr;     // Enum::Member as a VALUE
+// Name { field = value, … } — a struct VALUE constructor (W4a). Parallel arrays (field_vals is a
+// flat tk_expr array like tk_call.args — by-value tk_expr is incomplete here, so pointer fields).
+typedef struct { tk_path type_path; tk_str *field_names; tk_expr *field_vals; size_t nfields; } tk_struct_lit;
+typedef struct { tk_expr *receiver; tk_expr *index; }       tk_index;         // recv[index] — str→byte, []T→T (W5-idx)
+// `$"pre {a} mid {b} post"` — string interpolation (self-host parity). The string is
+// pieces[0] ++ str(holes[0]) ++ pieces[1] ++ … ++ pieces[nholes] — so npieces == nholes + 1.
+// Pieces are DECODED literal str spans (escapes resolved, like StrLit); each hole is a full
+// Teko expression (parsed from the hole's source span). A `str` hole passes through; an
+// integer hole converts to its decimal text; any other hole type is a clean checker error.
+typedef struct { tk_str *pieces; size_t npieces; tk_expr *holes; size_t nholes; } tk_interp;
 
 typedef enum {
     TK_EXPR_NUMBER, TK_EXPR_VAR, TK_EXPR_STR, TK_EXPR_BYTE,
+    TK_EXPR_BOOL, TK_EXPR_NULL,
     TK_EXPR_BINARY, TK_EXPR_UNARY, TK_EXPR_COMPARE, TK_EXPR_CALL,
     TK_EXPR_IF, TK_EXPR_MATCH, TK_EXPR_FIELD_ACCESS, TK_EXPR_METHOD_CALL,
-    TK_EXPR_CAST, TK_EXPR_PATH,
+    TK_EXPR_SAFE_FIELD_ACCESS, TK_EXPR_COALESCE,
+    TK_EXPR_CAST, TK_EXPR_PATH, TK_EXPR_STRUCT_LIT, TK_EXPR_INDEX,
+    TK_EXPR_INTERP,   // $"…{expr}…" — string interpolation (self-host parity)
 } tk_expr_kind;
 
 struct tk_expr {
@@ -68,6 +91,8 @@ struct tk_expr {
         tk_var          var;           // TK_EXPR_VAR
         tk_str_lit      str;           // TK_EXPR_STR
         tk_byte_lit     byte;          // TK_EXPR_BYTE
+        tk_bool_lit     boolean;       // TK_EXPR_BOOL
+        tk_null_lit     null_lit;      // TK_EXPR_NULL
         tk_binary       binary;        // TK_EXPR_BINARY
         tk_unary        unary;         // TK_EXPR_UNARY
         tk_compare      compare;       // TK_EXPR_COMPARE
@@ -75,9 +100,14 @@ struct tk_expr {
         tk_if_expr      if_expr;       // TK_EXPR_IF
         tk_match_expr   match_expr;    // TK_EXPR_MATCH
         tk_field_access field_access;  // TK_EXPR_FIELD_ACCESS
+        tk_safe_field_access safe_field_access; // TK_EXPR_SAFE_FIELD_ACCESS
+        tk_coalesce     coalesce;      // TK_EXPR_COALESCE
         tk_method_call  method_call;   // TK_EXPR_METHOD_CALL
         tk_cast         cast;          // TK_EXPR_CAST
         tk_path_expr    path;          // TK_EXPR_PATH
+        tk_struct_lit   struct_lit;    // TK_EXPR_STRUCT_LIT
+        tk_index        index;         // TK_EXPR_INDEX
+        tk_interp       interp;        // TK_EXPR_INTERP
     } as;
 };
 
@@ -110,7 +140,8 @@ typedef struct {                                                          // let
 } tk_binding;
 typedef struct { tk_str name; tk_token_kind op; tk_expr value; } tk_assign;   // x = / += / … (B.4)
 typedef struct { bool has_value; tk_expr value; }               tk_return;    // return [expr] (value gated by has_value)
-typedef struct { tk_statement *body; size_t nbody; }            tk_loop_stmt; // loop { … } (M.5)
+typedef struct { tk_str label; tk_statement *body; size_t nbody; } tk_loop_stmt; // loop [NAME] { … } (M.5); label empty (len 0) = unlabeled
+typedef struct { tk_str label; }                                tk_jump;      // break [NAME] / continue [NAME]; label empty = innermost loop
 typedef struct { tk_expr expr; }                                tk_expr_stmt; // a bare expression on its own line
 
 struct tk_statement {
@@ -122,7 +153,7 @@ struct tk_statement {
         tk_return    ret;
         tk_loop_stmt loop_stmt;
         tk_expr_stmt expr_stmt;
-        // BREAK, CONTINUE carry no payload
+        tk_jump      jump;          // BREAK, CONTINUE — optional loop label
     } as;
 };
 
@@ -132,15 +163,24 @@ struct tk_statement {
 // =========================================================================
 typedef struct { tk_str name; tk_type_expr type_ann; } tk_param;   // immutable (B.21)
 
+// tk_visibility — a declaration's REACH (LEGISLATION "Visibility — pub vs exp"; B.9).
+// PRIVATE (default, no keyword) = own namespace only; PUB = visible across the project's
+// namespaces (but NOT in the binary header); EXP = exported in the `.tkh` (the library's
+// public ABI) — public by definition. Ordered by increasing reach: PRIVATE < PUB < EXP,
+// so `vis >= TK_VIS_PUB` = "reachable cross-namespace" and `vis == TK_VIS_EXP` = "in the
+// header". Governing Law: M.2 (the boundary is explicit) + M.3 (the mark is honest).
+typedef enum { TK_VIS_PRIVATE = 0, TK_VIS_PUB, TK_VIS_EXP } tk_visibility;
+
 typedef struct {                                                   // Function (parser/ast.tks)
     tk_str       name;
     tk_param    *params; size_t nparams;
     bool         has_return;                                       // `-> ret` present? (absent = Unit)
     tk_type_expr return_type;                                      // valid iff has_return
     tk_statement *body;  size_t nbody;
-    bool         is_exp;                                           // marked `exp` → exported (.tkh)
+    tk_visibility vis;                                             // private (default) / pub / exp
     bool         has_doc;                                          // a `/** … */` doc precedes it?
     tk_str       doc;                                              // the doc span (valid iff has_doc)
+    uint32_t     line, col;                                        // the name's 1-based source position (W-loc-2 diagnostics)
 } tk_function;
 
 typedef struct { tk_str name; tk_type_expr type_ann; } tk_field;
@@ -154,9 +194,10 @@ typedef struct {                                                        // TypeB
 typedef struct {                                                        // TypeDecl (nominal — B.13)
     tk_str        name;
     tk_type_body  body;
-    bool          is_exp;
+    tk_visibility vis;                                                  // private (default) / pub / exp
     bool          has_doc;
     tk_str        doc;                                                  // valid iff has_doc
+    uint32_t      line, col;                                            // the name's 1-based source position (W-loc-2 diagnostics)
 } tk_type_decl;
 
 typedef struct {                                                        // UseDecl = struct { path; has_alias; alias }
@@ -177,9 +218,11 @@ typedef struct {                                                        // File 
     union { tk_main_file main_file; tk_module module; } as;
 } tk_file;
 
-// --- legacy Item/Program model — RETIRED in the Teko AST (parser/ast.tks), but the
-//     checker C code (typer.c, collect.c) still consumes it; mirrored here so those
-//     translation units compile. `src` is canonical for code. ---
+// --- the FLATTENED Item/Program model — the checker's input view. The parser produces
+//     File/Module/Decl; the driver flattens them into this Program of Items, which the
+//     checker (typer.c, collect.c) consumes. Mirrored in parser/ast.tks (ItemKind/Item/
+//     Program). The tk_item tag+union = Teko's ItemKind variant; `namespace` = the A3
+//     provenance field (resolution/typing ignore it). ---
 typedef struct {                                                        // a top-level item (function/type/use/loose stmt)
     enum { TK_ITEM_FUNCTION, TK_ITEM_TYPE_DECL, TK_ITEM_USE, TK_ITEM_STATEMENT } tag;
     union {
@@ -193,6 +236,10 @@ typedef struct {                                                        // a top
     // with its SourceFile namespace; the bare root main.tks items carry the project's
     // canonical root name. Resolution/typing IGNORE this — it carries provenance only.
     tk_str namespace;
+    // W-loc-2 — the source FILE this item came from (assemble tags it from the SourceFile
+    // path), so a flattened-program checker error resolves to file:line:col. Empty for the
+    // single-file (compile/run) path, where the driver already knows the path.
+    tk_str file;
 } tk_item;
 typedef struct { tk_item *items; size_t len; } tk_program;              // a flat item list
 

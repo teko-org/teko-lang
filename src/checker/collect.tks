@@ -1,16 +1,18 @@
 // src/checker/collect.tks  (namespace 'teko::checker') — pass 1 (forward refs).
 
+use teko::parser
+
 // the top-level environment after collecting: user types + function signatures.
 type Collected = struct { types: TypeTable; env: Env }
 
 // gather ALL user type declarations first (so a forward reference resolves).
-fn collect_types(items: []Item) -> TypeTable {
+fn collect_types(items: []parser::Item) -> TypeTable {
     mut table = teko::list::empty()
     mut i = 0
     loop {
         if i >= items.len { break }
-        match items[i] {
-            TypeDecl as td => { table = teko::list::push(table, TypeReg { name = td.name; decl = td }) }
+        match items[i].content {
+            parser::TypeDecl as td => { table = teko::list::push(table, TypeReg { name = td.name; namespace = items[i].namespace; vis = td.vis; decl = td }) }
             _              => {}
         }
         i++
@@ -19,7 +21,7 @@ fn collect_types(items: []Item) -> TypeTable {
 }
 
 // a function's signature as a FuncType (resolve its param + return types).
-fn func_type(f: Function, table: TypeTable) -> Type | error {
+fn func_type(f: parser::Function, table: TypeTable) -> Type | error {
     mut params = teko::list::empty()
     mut i = 0
     loop {
@@ -39,13 +41,13 @@ fn func_type(f: Function, table: TypeTable) -> Type | error {
 }
 
 // register every top-level function's signature (now that all type names exist).
-fn collect_funcs(items: []Item, table: TypeTable) -> Env | error {
+fn collect_funcs(items: []parser::Item, table: TypeTable) -> Env | error {
     mut env = teko::list::empty()
     mut i = 0
     loop {
         if i >= items.len { break }
-        match items[i] {
-            Function as f => {
+        match items[i].content {
+            parser::Function as f => {
                 let ft = match func_type(f, table) {
                     Type as t  => t
                     error as e => return e
@@ -60,7 +62,7 @@ fn collect_funcs(items: []Item, table: TypeTable) -> Env | error {
 }
 
 // pass 1: types first, then function signatures — the top-level environment.
-fn collect(program: Program) -> Collected | error {
+fn collect(program: parser::Program) -> Collected | error {
     let table = collect_types(program.items)
     let env = match collect_funcs(program.items, table) {
         Env as e     => e

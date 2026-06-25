@@ -15,8 +15,13 @@ typedef struct tk_tstatement tk_tstatement;  // recursive (blocks are tk_tstatem
 // --- typed expressions ---
 typedef enum {
     TK_TEXPR_NUMBER, TK_TEXPR_VAR, TK_TEXPR_STR, TK_TEXPR_BYTE,
+    TK_TEXPR_BOOL, TK_TEXPR_NULL,                          // true/false (LEGISLATION §75); null (REBOOT §202)
     TK_TEXPR_BINARY, TK_TEXPR_UNARY, TK_TEXPR_COMPARE, TK_TEXPR_CALL,
     TK_TEXPR_IF, TK_TEXPR_MATCH, TK_TEXPR_CAST, TK_TEXPR_FIELD_ACCESS,
+    TK_TEXPR_SAFE_FIELD_ACCESS, TK_TEXPR_COALESCE,         // recv?.field / a ?? b (REBOOT §203)
+    TK_TEXPR_STRUCT_INIT,                                  // Name { f = v, … } — struct value constructor (W4a)
+    TK_TEXPR_INDEX,                                        // recv[index] — str→byte / []T→T (W5-idx)
+    TK_TEXPR_INTERP,                                       // $"…{expr}…" — string interpolation (self-host parity)
 } tk_texpr_tag;
 
 typedef struct { tk_token_kind op; tk_texpr *operand; } tk_tcmp_term;
@@ -25,17 +30,22 @@ typedef struct {
     tk_pattern pattern;       // syntactic (binds; its own typing is C7a)
     bool       has_when;
     tk_texpr  *guard;         // valid iff has_when
-    tk_texpr  *body;
+    // The typed arm body is a STATEMENT BLOCK, exactly like a typed `if` then/else branch
+    // (B.20): the block's trailing-value type is the arm's value (tk_tblock_type), OR the
+    // block DIVERGES (return/break/continue) and contributes no value.
+    tk_tstatement *body; size_t nbody;
 } tk_tarm;
 
 struct tk_texpr {
     tk_texpr_tag tag;
     tk_type      type;        // this node's resolved type
     union {
-        struct { int64_t value; }                                    number;
+        struct { bool is_float; __int128 value; double fval; }       number;  // raw literal value; `.type` decides width/float-kind (N1/N2). C bootstrap uses __int128.
         struct { tk_str name; }                                      var;
         struct { tk_str text; }                                      str;
         struct { tk_byte value; }                                    byte;
+        struct { bool value; }                                       boolean; // TK_TEXPR_BOOL — `.type` is bool prim (LEGISLATION §75)
+        struct { char _unused; }                                     null_lit; // TK_TEXPR_NULL — `.type` is the inferred TK_TYPE_OPTIONAL (REBOOT §202)
         struct { tk_token_kind op; tk_texpr *left, *right; }         binary;
         struct { tk_token_kind op; tk_texpr *operand; }             unary;
         struct { tk_texpr *first; tk_tcmp_term *rest; size_t nrest; } compare;
@@ -45,6 +55,19 @@ struct tk_texpr {
         struct { tk_texpr *subject; tk_tarm *arms; size_t narms; }    match_expr;
         struct { tk_texpr *expr; }                                    cast;   // `x to T` — target rides the node's `type`
         struct { tk_texpr *receiver; tk_str field; }                  field_access; // `x.field` (C3) — `.type` is the field's type
+        struct { tk_texpr *receiver; tk_str field; }                  safe_field_access; // `recv?.field` (REBOOT §203) — `.type` is `(field)?`
+        struct { tk_texpr *left, *right; }                            coalesce; // `a ?? b` (REBOOT §203) — `.type` is the unwrapped/result type
+        // Name { f = v, … } (W4a) — `.type` is the named struct type; field_names/field_vals are
+        // in the struct's DECLARED order (the checker reorders), so both backends lower identically.
+        struct { tk_str *field_names; tk_texpr *field_vals; size_t nfields; } struct_init;
+        // recv[index] (W5-idx) — `.type` is the element type: byte for a `str` receiver, the
+        // slice's element type for a `[]T` receiver. The index is an integer-typed texpr.
+        struct { tk_texpr *receiver; tk_texpr *index; }              index;
+        // $"…{expr}…" (self-host parity) — `.type` is `str`. The string is pieces[0] ++
+        // str(holes[0]) ++ pieces[1] ++ … ++ pieces[nholes] (npieces == nholes + 1). Each
+        // hole carries its OWN resolved type (str passthrough vs integer→decimal text), so
+        // both backends lower it identically (differential equivalence).
+        struct { tk_str *pieces; size_t npieces; tk_texpr *holes; size_t nholes; } interp;
     } as;
 };
 
@@ -60,7 +83,8 @@ struct tk_tstatement {
         struct { tk_bind_kind kind; tk_bind_target target; tk_type bound; tk_texpr value; } binding;
         struct { tk_str name; tk_token_kind op; tk_texpr value; }                            assign;
         struct { bool has_value; tk_texpr value; }                                           ret;   // value gated by has_value
-        struct { tk_tstatement *body; size_t nbody; }                                        loop_stmt;
+        struct { tk_str label; tk_tstatement *body; size_t nbody; }                          loop_stmt;   // label empty = unlabeled
+        struct { tk_str label; }                                                             jump;        // BREAK/CONTINUE — label empty = innermost
         struct { tk_texpr expr; }                                                            expr_stmt;
     } as;
 };
@@ -69,9 +93,9 @@ struct tk_tstatement {
 typedef struct {
     tk_str         name;
     tk_param      *params; size_t nparams;   // immutable (B.21), carried unchanged
-    tk_type        return_type;              // Unit when there is no `-> ret`
+    tk_type        return_type;              // void when there is no `-> ret` (M.3)
     tk_tstatement *body;   size_t nbody;
-    bool           is_exp;
+    tk_visibility  vis;                      // private / pub / exp (carried from the parsed decl)
     bool           has_doc;                  // a `/** … */` doc precedes it? (carried for the `.tkh`)
     tk_str         doc;                      // the doc span (valid iff has_doc)
 } tk_tfunction;

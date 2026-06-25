@@ -1,5 +1,8 @@
 // src/emit/tkb_frame.tks  (namespace 'teko::emit')
 
+use teko::checker
+use teko::parser
+
 fn write_u64(buf: []byte, x: u64) -> []byte {
     mut b = buf
     mut v = x
@@ -26,7 +29,7 @@ fn append_bytes(dst: []byte, src: []byte) -> []byte {
 
 // --- collect every string into the table (pre-pass; mirrors the write helpers) ---
 
-fn collect_type_list(t: StrTable, xs: []Type) -> StrTable {
+fn collect_type_list(t: StrTable, xs: []checker::Type) -> StrTable {
     mut tab = t
     mut i = 0
     loop {
@@ -37,17 +40,17 @@ fn collect_type_list(t: StrTable, xs: []Type) -> StrTable {
     tab
 }
 
-fn collect_type_strings(t: StrTable, ty: Type) -> StrTable {
+fn collect_type_strings(t: StrTable, ty: checker::Type) -> StrTable {
     match ty {
-        Named as n   => st_intern(t, n.name).table
-        Slice as s   => collect_type_strings(t, s.element)
-        Variant as v => collect_type_list(t, v.members)
-        Func as f    => collect_type_strings(collect_type_list(t, f.params), f.ret)
+        checker::Named as n   => st_intern(t, n.name).table
+        checker::Slice as s   => collect_type_strings(t, s.element)
+        checker::Variant as v => collect_type_list(t, v.members)
+        checker::Func as f    => collect_type_strings(collect_type_list(t, f.params), f.ret)
         _            => t
     }
 }
 
-fn collect_path(t: StrTable, p: Path) -> StrTable {
+fn collect_path(t: StrTable, p: parser::Path) -> StrTable {
     mut tab = t
     mut i = 0
     loop {
@@ -58,7 +61,7 @@ fn collect_path(t: StrTable, p: Path) -> StrTable {
     tab
 }
 
-fn collect_texprs(t: StrTable, xs: []TExpr) -> StrTable {
+fn collect_texprs(t: StrTable, xs: []checker::TExpr) -> StrTable {
     mut tab = t
     mut i = 0
     loop {
@@ -69,7 +72,7 @@ fn collect_texprs(t: StrTable, xs: []TExpr) -> StrTable {
     tab
 }
 
-fn collect_terms(t: StrTable, ts: []TCmpTerm) -> StrTable {
+fn collect_terms(t: StrTable, ts: []checker::TCmpTerm) -> StrTable {
     mut tab = t
     mut i = 0
     loop {
@@ -80,24 +83,37 @@ fn collect_terms(t: StrTable, ts: []TCmpTerm) -> StrTable {
     tab
 }
 
-fn collect_strings(t: StrTable, te: TExpr) -> StrTable {
+// intern each interpolation piece (a literal str), in order. ($"…{expr}…" — frame collect.)
+fn collect_pieces(t: StrTable, ps: []str) -> StrTable {
+    mut tab = t
+    mut i = 0
+    loop {
+        if i >= ps.len { break }
+        tab = st_intern(tab, ps[i]).table
+        i++
+    }
+    tab
+}
+
+fn collect_strings(t: StrTable, te: checker::TExpr) -> StrTable {
     let t1 = collect_type_strings(t, te.type)        // the node's type may name things
     match te.kind {
-        TVar as v     => st_intern(t1, v.name).table
-        TStrLit as s  => st_intern(t1, s.text).table
-        TBinary as b  => collect_strings(collect_strings(t1, b.left), b.right)
-        TUnary as u   => collect_strings(t1, u.operand)
-        TCompare as c => collect_terms(collect_strings(t1, c.first), c.rest)
-        TCall as cl   => collect_texprs(collect_path(t1, cl.callee), cl.args)
-        TCast as c    => collect_strings(t1, c.expr)                                    // S1a — recurse into the inner expr
-        TFieldAccess as f => st_intern(collect_strings(t1, f.receiver), f.field).table  // S1b — receiver AND the field name (must intern)
+        checker::TVar as v     => st_intern(t1, v.name).table
+        checker::TStrLit as s  => st_intern(t1, s.text).table
+        checker::TBinary as b  => collect_strings(collect_strings(t1, b.left), b.right)
+        checker::TUnary as u   => collect_strings(t1, u.operand)
+        checker::TCompare as c => collect_terms(collect_strings(t1, c.first), c.rest)
+        checker::TCall as cl   => collect_texprs(collect_path(t1, cl.callee), cl.args)
+        checker::TCast as c    => collect_strings(t1, c.expr)                                    // S1a — recurse into the inner expr
+        checker::TFieldAccess as f => st_intern(collect_strings(t1, f.receiver), f.field).table  // S1b — receiver AND the field name (must intern)
+        checker::TInterp as in => collect_texprs(collect_pieces(t1, in.pieces), in.holes)        // $"…{expr}…" — intern pieces, recurse holes
         _             => t1
     }
 }
 
 // --- the frame: header (magic + version + hash) + the body ---
 
-fn serialize(te: TExpr) -> []byte {
+fn serialize(te: checker::TExpr) -> []byte {
     let table = collect_strings(st_empty(), te)
     let body = write_texpr(write_strtable(teko::list::empty(), table), table, te)
     let h = fnv1a(body)

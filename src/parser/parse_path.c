@@ -7,14 +7,14 @@
 
 tk_parsed_path_result parse_path(const tk_token *t, size_t n, size_t pos) {
     if (!tk_is_kind_at(t, n, pos, TK_TOKEN_IDENT)) {
-        return (tk_parsed_path_result){ .ok = false, .as.error = tk_error_make("expected a name") };
+        return (tk_parsed_path_result){ .ok = false, .as.error = tk_err_at(t, n, pos, "expected a name") };
     }
     tk_segment *segs = NULL; size_t ns = 0;
     tk_segs_push(&segs, &ns, (tk_segment){ .name = t[pos].text });
     size_t p = pos + 1;
     while (tk_is_kind_at(t, n, p, TK_TOKEN_COLONCOLON)) {
         if (!tk_is_kind_at(t, n, p + 1, TK_TOKEN_IDENT)) {
-            return (tk_parsed_path_result){ .ok = false, .as.error = tk_error_make("expected a name after '::'") };
+            return (tk_parsed_path_result){ .ok = false, .as.error = tk_err_at(t, n, p + 1, "expected a name after '::'") };
         }
         tk_segs_push(&segs, &ns, (tk_segment){ .name = t[p + 1].text });
         p += 2;

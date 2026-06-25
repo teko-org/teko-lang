@@ -31,10 +31,19 @@ tk_strs tk_read_strtable(tk_reader *r) {
     }
     return (tk_strs){ xs, n };
 }
+// inverse of prim_byte (= the prim's ENUM ORDINAL, written by tkb_write.c's prim_byte).
+// Tier-1 (plan §5 [N1/N2]): the ordinals match type.h's tk_prim_kind exactly —
+// U8..U128 (0..4), I8..I128 (5..9), F16/F32/F64 (10..12), BOOL (13). New tags were
+// APPENDED within their family so older .tkb prim bytes stay stable.
 static tk_prim_kind prim_of(uint8_t b) {
-    switch (b) { case 0: return TK_PRIM_U8; case 1: return TK_PRIM_U16; case 2: return TK_PRIM_U32;
-        case 3: return TK_PRIM_U64; case 4: return TK_PRIM_I8; case 5: return TK_PRIM_I16;
-        case 6: return TK_PRIM_I32; case 7: return TK_PRIM_I64; default: return TK_PRIM_BOOL; }
+    switch (b) {
+        case 0:  return TK_PRIM_U8;   case 1:  return TK_PRIM_U16;  case 2:  return TK_PRIM_U32;
+        case 3:  return TK_PRIM_U64;  case 4:  return TK_PRIM_U128;
+        case 5:  return TK_PRIM_I8;   case 6:  return TK_PRIM_I16;  case 7:  return TK_PRIM_I32;
+        case 8:  return TK_PRIM_I64;  case 9:  return TK_PRIM_I128;
+        case 10: return TK_PRIM_F16;  case 11: return TK_PRIM_F32;  case 12: return TK_PRIM_F64;
+        default: return TK_PRIM_BOOL;
+    }
 }
 static tk_type *box(tk_type t) { tk_type *p = malloc(sizeof *p); if (!p) abort(); *p = t; return p; }
 
@@ -45,7 +54,7 @@ tk_type tk_read_type(tk_reader *r, tk_strs t) {
         case 1: return (tk_type){ .tag = TK_TYPE_BYTE };
         case 2: return (tk_type){ .tag = TK_TYPE_STR };
         case 3: return (tk_type){ .tag = TK_TYPE_ERROR };
-        case 4: return (tk_type){ .tag = TK_TYPE_UNIT };
+        case 4: return (tk_type){ .tag = TK_TYPE_VOID };   // tag 4 = void (was Unit — B.37)
         case 5: return (tk_type){ .tag = TK_TYPE_SLICE, .as.slice.element = box(tk_read_type(r, t)) };
         case 6: return (tk_type){ .tag = TK_TYPE_NAMED, .as.named.name = tk_read_str(r, t) };
         case 7: {
@@ -59,8 +68,9 @@ tk_type tk_read_type(tk_reader *r, tk_strs t) {
             tk_type ret = tk_read_type(r, t);
             return (tk_type){ .tag = TK_TYPE_FUNC, .as.func = { p, n, box(ret) } };
         }
+        case 9: return (tk_type){ .tag = TK_TYPE_OPTIONAL, .as.optional.inner = box(tk_read_type(r, t)) };  // tag 9 = T? (B.37)
     }
-    r->ok = false; return (tk_type){ .tag = TK_TYPE_UNIT };
+    r->ok = false; return (tk_type){ .tag = TK_TYPE_VOID };
 }
 
 // tk_texpr_result now provided by checker/tast.h (the canonical home — C1).
@@ -75,7 +85,17 @@ tk_texpr tk_read_texpr(tk_reader *r, tk_strs t) {
     uint8_t tag = tk_read_u8(r);
     tk_texpr e = { .type = ty };
     switch (tag) {
-        case 0: e.tag = TK_TEXPR_NUMBER; e.as.number.value = (int64_t)tk_read_u64(r); return e;
+        case 0: {
+            // N1/N2 inverse of tk_write_texpr's NUMBER: is_float (u8), the 128-bit value
+            // as two u64 (hi then lo), then the double's IEEE-754 bits as a u64.
+            e.tag = TK_TEXPR_NUMBER;
+            e.as.number.is_float = (tk_read_u8(r) != 0);
+            uint64_t hi = tk_read_u64(r), lo = tk_read_u64(r);
+            e.as.number.value = (__int128)(((unsigned __int128)hi << 64) | (unsigned __int128)lo);
+            uint64_t fbits = tk_read_u64(r);
+            __builtin_memcpy(&e.as.number.fval, &fbits, sizeof fbits);
+            return e;
+        }
         case 1: e.tag = TK_TEXPR_VAR;    e.as.var.name  = tk_read_str(r, t); return e;
         case 2: e.tag = TK_TEXPR_STR;    e.as.str.text  = tk_read_str(r, t); return e;
         case 3: e.tag = TK_TEXPR_BYTE;   e.as.byte.value = tk_read_u8(r); return e;
@@ -106,6 +126,44 @@ tk_texpr tk_read_texpr(tk_reader *r, tk_strs t) {
             e.tag = TK_TEXPR_FIELD_ACCESS;
             e.as.field_access.receiver = boxe(tk_read_texpr(r, t));
             e.as.field_access.field    = tk_read_str(r, t);
+            return e;
+        }
+        case 12: e.tag = TK_TEXPR_BOOL; e.as.boolean.value = (tk_read_u8(r) != 0); return e;   // W2 — bool literal
+        case 13: e.tag = TK_TEXPR_NULL; return e;                                               // W2 — null literal
+        case 14:                                                                /* W2 — recv?.field */
+            e.tag = TK_TEXPR_SAFE_FIELD_ACCESS;
+            e.as.safe_field_access.receiver = boxe(tk_read_texpr(r, t));
+            e.as.safe_field_access.field    = tk_read_str(r, t);
+            return e;
+        case 15:                                                                /* W2 — left ?? right */
+            e.tag = TK_TEXPR_COALESCE;
+            e.as.coalesce.left  = boxe(tk_read_texpr(r, t));
+            e.as.coalesce.right = boxe(tk_read_texpr(r, t));
+            return e;
+        case 16: {                                                              /* W4a — Name { f = v, … } */
+            e.tag = TK_TEXPR_STRUCT_INIT;
+            uint32_t nf = tk_read_u32(r);
+            tk_str   *names = malloc((nf ? nf : 1) * sizeof *names); if (!names) abort();
+            tk_texpr *vals  = malloc((nf ? nf : 1) * sizeof *vals);  if (!vals)  abort();
+            for (uint32_t i = 0; i < nf; i += 1) { names[i] = tk_read_str(r, t); vals[i] = tk_read_texpr(r, t); }
+            e.as.struct_init.field_names = names; e.as.struct_init.field_vals = vals; e.as.struct_init.nfields = nf;
+            return e;
+        }
+        case 17:                                                                /* W5-idx — recv[index]: receiver THEN index */
+            e.tag = TK_TEXPR_INDEX;
+            e.as.index.receiver = boxe(tk_read_texpr(r, t));
+            e.as.index.index    = boxe(tk_read_texpr(r, t));
+            return e;
+        case 18: {                                                              /* $"…{expr}…": npieces, each piece, then nholes, each hole */
+            e.tag = TK_TEXPR_INTERP;
+            uint32_t np = tk_read_u32(r);
+            tk_str *pieces = malloc((np ? np : 1) * sizeof *pieces); if (!pieces) abort();
+            for (uint32_t i = 0; i < np; i += 1) pieces[i] = tk_read_str(r, t);
+            uint32_t nh = tk_read_u32(r);
+            tk_texpr *holes = malloc((nh ? nh : 1) * sizeof *holes); if (!holes) abort();
+            for (uint32_t i = 0; i < nh; i += 1) holes[i] = tk_read_texpr(r, t);
+            e.as.interp.pieces = pieces; e.as.interp.npieces = np;
+            e.as.interp.holes  = holes;  e.as.interp.nholes  = nh;
             return e;
         }
     }

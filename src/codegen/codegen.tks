@@ -7,7 +7,7 @@
 //
 // Lowering design (M0 = integer arithmetic + let + return -> running native binary):
 //   * types  : Type -> C type text (U8..U64 -> uintN_t, I8..I64 -> intN_t,
-//              Bool -> bool, byte -> uint8_t, Unit -> void, Str -> tk_str). Everything
+//              Bool -> bool, byte -> uint8_t, void -> void, Str -> tk_str). Everything
 //              else = "not yet supported".
 //   * exprs  : TNumber -> literal; TVar -> identifier; TBinary -> (L op R);
 //              TUnary -> (op X); TCompare -> chained && of adjacent C comparisons;
@@ -15,8 +15,9 @@
 //              (recv.field); TStrLit -> tk_str compound literal (explicit length);
 //              TByteLit -> decimal octet. TIfExpr/TMatchExpr AS A VALUE = not yet supported.
 //   * stmts  : TBinding -> Ctype x = v; TAssign -> x op= v; TReturn -> early exit in
-//              main / `return v;` in a fn; TExprStmt -> expr; TLoopStmt -> while(1){…};
-//              TBreakStmt/TContinueStmt -> break;/continue;.
+//              main / `return v;` in a fn; TExprStmt -> expr; TLoopStmt -> while(1){…}
+//              (labeled: + tk_lbl_<NAME>_cont/_break goto-targets — M.5);
+//              TBreakStmt/TContinueStmt -> break;/continue; (labeled: goto tk_lbl_<NAME>_break/_cont;).
 //   * program: each TFunction -> a C function; the loose top-level statements (the
 //              VIRTUAL-MAIN) -> int main(void){ … return 0; } with early-return.
 //
@@ -35,6 +36,10 @@
 //   * The C `seg_is(span, lit)` (memcmp a non-NUL span) is just `==` on `str` here.
 //   * The C operator lookup tables that return `const char *` (NULL == unsupported) are
 //     `str | error` here — the NULL sentinel becomes an honest error case.
+
+use teko::checker
+use teko::lexer
+use teko::parser
 
 // ---------------------------------------------------------------------------
 // The growable C-source buffer == a `[]byte`. These mirror cbuf's cb/cb_str/cb_i64/
@@ -86,6 +91,45 @@ fn cb_i64(buf: []byte, v: i64) -> []byte {
     b
 }
 
+// cb_u128_digits — append the decimal MAGNITUDE of an unsigned 128-bit value (no sign).
+// __int128 has no printf specifier in the C backend, so the digits are spelled out
+// high-to-low (collect low-to-high, emit reversed) — the C twin is `cb_u128_digits`.
+fn cb_u128_digits(buf: []byte, v: u128) -> []byte {
+    if v == 0 { return cb_byte(buf, b'0') }
+    mut b = buf
+    mut n = v
+    mut digits = teko::list::empty()
+    loop {
+        if n == 0 { break }
+        let d = (n % 10) to byte                 // 0..9
+        digits = teko::list::push(digits, (b'0' to i64 + (d to i64)) to byte)
+        n = n / 10
+    }
+    mut i = digits.len
+    loop {
+        if i == 0 { break }
+        b = cb_byte(b, digits[i - 1])            // reverse: most-significant first
+        i--
+    }
+    b
+}
+
+// cb_i128 — append a signed 128-bit value as a decimal literal (sign + magnitude). For
+// the most-negative value, negating in i128 overflows, so the magnitude is derived via
+// unsigned wrap: `-(v to u128)` yields the exact magnitude in all cases. (C: `cb_i128`.)
+fn cb_i128(buf: []byte, v: i128) -> []byte {
+    if v < 0 {
+        mut b = cb_byte(buf, b'-')
+        return cb_u128_digits(b, (0 to u128) - (v to u128))
+    }
+    cb_u128_digits(buf, v to u128)
+}
+
+// cb_f64_literal — append a f64 as a round-trippable decimal literal. The C twin used
+// snprintf("%.17g"); Teko has no snprintf, so this defers to the runtime float renderer
+// (teko::ftoa) which guarantees an exact binary64 round-trip. (C: `cb_f64_literal`.)
+fn cb_f64_literal(buf: []byte, v: f64) -> []byte { cb(buf, teko::ftoa(v)) }
+
 // cb_cstr_escaped — append `s` C-escaped, INSIDE an already-open C string literal. The
 // bytes are raw (may contain NUL, quotes, newlines) — see TStrLit. We never rely on
 // length here; the caller emits the explicit byte count separately (M.1).
@@ -119,33 +163,179 @@ fn cb_cstr_escaped(buf: []byte, s: str) -> []byte {
 // ---------------------------------------------------------------------------
 
 // emit_prim — a PrimKind -> its C fixed-width type name. (C: `emit_prim`.)
-fn emit_prim(buf: []byte, k: PrimKind) -> []byte | error {
+fn emit_prim(buf: []byte, k: checker::PrimKind) -> []byte | error {
     match k {
-        PrimKind::U8   => cb(buf, "uint8_t")
-        PrimKind::U16  => cb(buf, "uint16_t")
-        PrimKind::U32  => cb(buf, "uint32_t")
-        PrimKind::U64  => cb(buf, "uint64_t")
-        PrimKind::I8   => cb(buf, "int8_t")
-        PrimKind::I16  => cb(buf, "int16_t")
-        PrimKind::I32  => cb(buf, "int32_t")
-        PrimKind::I64  => cb(buf, "int64_t")
-        PrimKind::Bool => cb(buf, "bool")
+        checker::PrimKind::U8   => cb(buf, "uint8_t")
+        checker::PrimKind::U16  => cb(buf, "uint16_t")
+        checker::PrimKind::U32  => cb(buf, "uint32_t")
+        checker::PrimKind::U64  => cb(buf, "uint64_t")
+        checker::PrimKind::U128 => cb(buf, "unsigned __int128")
+        checker::PrimKind::I8   => cb(buf, "int8_t")
+        checker::PrimKind::I16  => cb(buf, "int16_t")
+        checker::PrimKind::I32  => cb(buf, "int32_t")
+        checker::PrimKind::I64  => cb(buf, "int64_t")
+        checker::PrimKind::I128 => cb(buf, "__int128")
+        checker::PrimKind::F16  => cb(buf, "_Float16")
+        checker::PrimKind::F32  => cb(buf, "float")
+        checker::PrimKind::F64  => cb(buf, "double")
+        checker::PrimKind::Bool => cb(buf, "bool")
     }
 }
 
-// emit_type — a resolved Type -> C type text. STR -> tk_str; the structured types are
-// the honest "not yet supported" barrier (M.3). (C: `emit_type`.)
-fn emit_type(buf: []byte, t: Type) -> []byte | error {
+// ---------------------------------------------------------------------------
+// W4c — NAME MANGLING for named aggregate types.
+// A named aggregate `T` in namespace `N` -> the C identifier
+//   tk_t_<N with :: -> __>__<T>      (for the bare root ns, just tk_t_<T>).
+// ONE helper used by BOTH the type-decl emitter and emit_type's Named case so a
+// declaration and its references always agree. NOTE: the semantic Named carries only the
+// BARE name (resolve.tks drops the namespace) and the typed item carries no namespace
+// either, so both call sites pass an EMPTY namespace and mangle by bare name alone —
+// consistent for decl + ref (the "keep it simple and consistent" rule). The namespace
+// parameter is honored (`::` -> `__`) for the day the typed item carries provenance.
+// (C: `mangle_type_name`.)
+// ---------------------------------------------------------------------------
+fn mangle_type_name(buf: []byte, namespace: str, name: str) -> []byte {
+    mut out = cb(buf, "tk_t_")
+    if namespace.len > 0 {
+        mut i = 0
+        loop {
+            if i >= namespace.len { break }
+            // collapse a "::" pair into "__"; copy any other byte verbatim.
+            if i + 1 < namespace.len && namespace[i] == b':' && namespace[i + 1] == b':' {
+                out = cb(out, "__")
+                i = i + 2
+            } else {
+                out = cb_byte(out, namespace[i])
+                i++
+            }
+        }
+        out = cb(out, "__")
+    }
+    cb_str(out, name)
+}
+
+// ---------------------------------------------------------------------------
+// W5b — VARIANT-DECL lookup (the .tks twin of the C's g_cg_prog static + scans).
+//
+// The C stashes the program in a file-scope `static tk_tprogram g_cg_prog` and scans its
+// TYPE_DECL items. Teko has NO module-level mutable state (modules hold only `use` + decls;
+// loose statements live only in main.tks), so the FUNCTIONAL mirror THREADS the program
+// `prog` into the helpers that need it — the same functional-vs-static divergence the file
+// header already notes (cbuf*→[]byte, err**→|error). The scans use the SAME tag/field
+// spellings as emit_type_decl so wrap + decl agree byte-for-byte.
+// ---------------------------------------------------------------------------
+
+// cg_path_last — the bare last segment of a path (cases/types match by their final
+// identifier, like the VM's path_last). (C: `cg_path_last`.)
+fn cg_path_last(p: parser::Path) -> str {
+    if p.segments.len == 0 { "" } else { p.segments[p.segments.len - 1].name }
+}
+
+// cg_find_variant_decl — the TypeDecl for a VARIANT named `name` (its body is a union of
+// named members), or a `not found` error. (C: `cg_find_variant_decl`, which returned NULL.)
+fn cg_find_variant_decl(prog: checker::TProgram, name: str) -> parser::TypeDecl | error {
+    mut i = 0
+    loop {
+        if i >= prog.items.len { break }
+        match prog.items[i] {
+            parser::TypeDecl as d => {
+                match d.body {
+                    parser::VariantBody => { if d.name == name { return d } }
+                    _ => { }
+                }
+            }
+            _ => { }
+        }
+        i++
+    }
+    error { message = "codegen: not a declared variant" }
+}
+
+// cg_named_is_variant — is the NAMED type `name` a (declared) variant? (C: `cg_named_is_variant`.)
+fn cg_named_is_variant(prog: checker::TProgram, name: str) -> bool {
+    match cg_find_variant_decl(prog, name) { parser::TypeDecl => true; error => false }
+}
+
+// cg_variant_has_member — does variant decl `d` have a member whose bare name is `member`?
+// (The member name is the union FIELD name and the UPPERCASE tag suffix.) (C: `cg_variant_has_member`.)
+fn cg_variant_has_member(d: parser::TypeDecl, member: str) -> bool {
+    let members = match d.body {
+        parser::VariantBody as vb => match vb.type_expr {
+            parser::UnionType as u => u.members
+            _             => return false
+        }
+        _ => return false
+    }
+    mut i = 0
+    loop {
+        if i >= members.len { break }
+        match variant_member_name(members[i]) {
+            str as mn => { if mn == member { return true } }
+            error     => { }
+        }
+        i++
+    }
+    false
+}
+
+// emit_type — a resolved Type -> C type text. STR -> tk_str; a Named aggregate references
+// its mangled typedef (decl + ref agree via mangle_type_name). The remaining structured
+// types stay the honest "not yet supported" barrier (M.3). (C: `emit_type`.)
+fn emit_type(buf: []byte, t: checker::Type) -> []byte | error {
     match t {
-        Prim as p => emit_prim(buf, p.kind)
-        Byte      => cb(buf, "uint8_t")
-        Unit      => cb(buf, "void")
-        Str       => cb(buf, "tk_str")
-        Slice     => error { message = "codegen: slice type not yet supported" }
-        Named     => error { message = "codegen: named type not yet supported" }
-        Variant   => error { message = "codegen: variant type not yet supported" }
-        Func      => error { message = "codegen: function type not yet supported" }
-        Error     => error { message = "codegen: error type not yet supported" }
+        checker::Prim as p => emit_prim(buf, p.kind)
+        checker::Byte      => cb(buf, "uint8_t")
+        // VOID is the return-only marker (M.3): a `-> void` function lowers to C `void`.
+        // The checker (Z2a) forbids void as a value/binding/variant member, so reaching
+        // here is always a Func.ret position.
+        checker::Void      => cb(buf, "void")
+        checker::Str       => cb(buf, "tk_str")
+        // OPTIONAL (T?) — the parser doesn't emit it yet; full lowering is Z3-codegen.
+        // Be honest now rather than mis-emit (M.3).
+        checker::Optional  => error { message = "codegen: optional type not yet supported" }
+        checker::Slice     => error { message = "codegen: slice type not yet supported" }
+        // W4c — a Named aggregate -> its mangled typedef name (the bare name; resolve
+        // drops the namespace). decl + ref agree via mangle_type_name.
+        checker::Named as nm => mangle_type_name(buf, "", nm.name)
+        checker::Variant   => error { message = "codegen: variant type not yet supported" }
+        checker::Func      => error { message = "codegen: function type not yet supported" }
+        checker::Error     => error { message = "codegen: error type not yet supported" }
+    }
+}
+
+// emit_type_expr — a SYNTACTIC type-expr (parser TypeExpr) -> C type text. Needed for
+// type-decl member positions (struct field annotations, variant member types), where the
+// typed item carries the SYNTACTIC body, not the resolved Type. A NamedType's last path
+// segment is either a built-in name (u8..f64/bool/byte/str -> its C type) or a user type
+// (-> its mangled typedef). Slice/union/optional members are honest barriers (later
+// waves). (C: `emit_type_expr`.)
+fn emit_type_expr(buf: []byte, te: parser::TypeExpr) -> []byte | error {
+    match te {
+        parser::NamedType as nt => {
+            let last = nt.path.segments[nt.path.segments.len - 1].name
+            if      last == "u8"    { return cb(buf, "uint8_t") }
+            else if last == "u16"   { return cb(buf, "uint16_t") }
+            else if last == "u32"   { return cb(buf, "uint32_t") }
+            else if last == "u64"   { return cb(buf, "uint64_t") }
+            else if last == "u128"  { return cb(buf, "unsigned __int128") }
+            else if last == "i8"    { return cb(buf, "int8_t") }
+            else if last == "i16"   { return cb(buf, "int16_t") }
+            else if last == "i32"   { return cb(buf, "int32_t") }
+            else if last == "i64"   { return cb(buf, "int64_t") }
+            else if last == "i128"  { return cb(buf, "__int128") }
+            else if last == "f16"   { return cb(buf, "_Float16") }
+            else if last == "f32"   { return cb(buf, "float") }
+            else if last == "f64"   { return cb(buf, "double") }
+            else if last == "bool"  { return cb(buf, "bool") }
+            else if last == "byte"  { return cb(buf, "uint8_t") }
+            else if last == "str"   { return cb(buf, "tk_str") }
+            else if last == "error" { return error { message = "codegen: error type not yet supported" } }
+            // a user-defined named aggregate -> its mangled typedef name (matches emit_type).
+            mangle_type_name(buf, "", last)
+        }
+        parser::SliceType    => error { message = "codegen: slice type not yet supported" }
+        parser::UnionType    => error { message = "codegen: inline union type not yet supported" }
+        parser::OptionalType => error { message = "codegen: optional type not yet supported" }
     }
 }
 
@@ -219,60 +409,85 @@ fn assignop_c(op: lexer::TokenKind) -> str | error {
 // Integer prims only; bool is never a guard target.
 // ---------------------------------------------------------------------------
 
-// prim_is_int — every Prim but Bool is an integer. (C: `prim_is_int`.)
-fn prim_is_int(k: PrimKind) -> bool { k != PrimKind::Bool }
+// These mirror the type.tks predicates (prim_is_float/prim_is_int/…) but stay local so
+// the F3 logic is self-contained; they are now exhaustive over the Tier-1 prim set
+// (incl. U128/I128 + the floats F16/F32/F64). (C twins: cg_prim_is_*.)
 
-// prim_is_signed — the signed prims are I8..I64. (C: `prim_is_signed`.)
-fn prim_is_signed(k: PrimKind) -> bool {
+// cg_prim_is_float — the IEEE float prims (F16/F32/F64). (type.tks: prim_is_float.)
+fn cg_prim_is_float(k: checker::PrimKind) -> bool { checker::prim_is_float(k) }
+
+// cg_prim_is_int — the integer prims (U8..U128, I8..I128). NOT bool, NOT float.
+fn cg_prim_is_int(k: checker::PrimKind) -> bool { checker::prim_is_int(k) }
+
+// cg_prim_is_signed_int — the SIGNED integer prims (I8..I128). (type.tks: prim_is_signed.)
+fn cg_prim_is_signed_int(k: checker::PrimKind) -> bool { checker::prim_is_signed(k) }
+
+// cg_int_width — bit-width ordinal (8/16/32/64/128) for narrowing analysis; ints only.
+fn cg_int_width(k: checker::PrimKind) -> i64 {
     match k {
-        PrimKind::I8  => true
-        PrimKind::I16 => true
-        PrimKind::I32 => true
-        PrimKind::I64 => true
-        _                      => false
+        checker::PrimKind::U8   => 8
+        checker::PrimKind::I8   => 8
+        checker::PrimKind::U16  => 16
+        checker::PrimKind::I16  => 16
+        checker::PrimKind::U32  => 32
+        checker::PrimKind::I32  => 32
+        checker::PrimKind::U64  => 64
+        checker::PrimKind::I64  => 64
+        checker::PrimKind::U128 => 128
+        checker::PrimKind::I128 => 128
+        _              => 0
     }
 }
 
-// prim_width — bit-width ordinal (8/16/32/64) for narrowing analysis; Bool == 1. (C: `prim_width`.)
-fn prim_width(k: PrimKind) -> i64 {
+// prim_div_tag — the tag ("u8".."i128", "f16".."f64") naming a div/mod (or cast) helper,
+// e.g. tk_div_u32 / tk_div_f64 / tk_to_i16. Bool has no tag (never a guard target); the
+// C returned NULL for Bool, here that is an honest `str | error`. (C: `prim_div_tag`.)
+fn prim_div_tag(k: checker::PrimKind) -> str | error {
     match k {
-        PrimKind::U8   => 8
-        PrimKind::I8   => 8
-        PrimKind::U16  => 16
-        PrimKind::I16  => 16
-        PrimKind::U32  => 32
-        PrimKind::I32  => 32
-        PrimKind::U64  => 64
-        PrimKind::I64  => 64
-        PrimKind::Bool => 1
+        checker::PrimKind::U8   => "u8"
+        checker::PrimKind::U16  => "u16"
+        checker::PrimKind::U32  => "u32"
+        checker::PrimKind::U64  => "u64"
+        checker::PrimKind::U128 => "u128"
+        checker::PrimKind::I8   => "i8"
+        checker::PrimKind::I16  => "i16"
+        checker::PrimKind::I32  => "i32"
+        checker::PrimKind::I64  => "i64"
+        checker::PrimKind::I128 => "i128"
+        checker::PrimKind::F16  => "f16"
+        checker::PrimKind::F32  => "f32"
+        checker::PrimKind::F64  => "f64"
+        checker::PrimKind::Bool => error { message = "codegen: bool has no div/cast helper tag" }
     }
 }
 
-// prim_div_tag — the "u8".."i64" tag used to NAME a div/mod (or cast) helper, e.g.
-// tk_div_u32 / tk_to_i16. Bool has no tag (it is never a guard target). The C returned
-// NULL for Bool; here that is an honest `str | error`. (C: `prim_div_tag`.)
-fn prim_div_tag(k: PrimKind) -> str | error {
+// prim_int_tag — the integer-target tag ("u8".."i128") naming a cast helper; error for
+// non-ints (float/bool). Reuses prim_div_tag once integer-ness is established.
+fn prim_int_tag(k: checker::PrimKind) -> str | error {
+    if cg_prim_is_int(k) { return prim_div_tag(k) }
+    error { message = "codegen: cast to a non-integer type not yet supported" }
+}
+
+// prim_float_tag — the float-source suffix ("f16"/"f32"/"f64") for a float->int cast
+// helper (tk_to_<dst>_from_<fsrc>); error for non-floats.
+fn prim_float_tag(k: checker::PrimKind) -> str | error {
     match k {
-        PrimKind::U8   => "u8"
-        PrimKind::U16  => "u16"
-        PrimKind::U32  => "u32"
-        PrimKind::U64  => "u64"
-        PrimKind::I8   => "i8"
-        PrimKind::I16  => "i16"
-        PrimKind::I32  => "i32"
-        PrimKind::I64  => "i64"
-        PrimKind::Bool => error { message = "codegen: bool has no div/cast helper tag" }
+        checker::PrimKind::F16 => "f16"
+        checker::PrimKind::F32 => "f32"
+        checker::PrimKind::F64 => "f64"
+        _             => error { message = "codegen: not a float source type" }
     }
 }
 
-// cast_may_lose — a cast src->dst may lose data (needs a runtime guard) when SOME value
-// of the source type falls outside the destination's representable range. Conservative:
-// if we cannot prove source range ⊆ dest range, guard. (C: `cast_may_lose`.)
-fn cast_may_lose(src: PrimKind, dst: PrimKind) -> bool {
-    let ss = prim_is_signed(src)
-    let ds = prim_is_signed(dst)
-    let sw = prim_width(src)
-    let dw = prim_width(dst)
+// cast_may_lose — an INT->INT cast src->dst may lose data (needs a runtime guard) when
+// SOME value of the source type falls outside the destination's representable range.
+// Conservative: if we cannot prove source range ⊆ dest range, guard. Floats are handled
+// separately (float->int always guards). (C: `cast_may_lose`.)
+pub fn cast_may_lose(src: checker::PrimKind, dst: checker::PrimKind) -> bool {
+    let ss = cg_prim_is_signed_int(src)
+    let ds = cg_prim_is_signed_int(dst)
+    let sw = cg_int_width(src)
+    let dw = cg_int_width(dst)
     if ss == ds { return sw > dw }          // same signedness: only true narrowing loses
     if !ss && ds { return sw >= dw }        // u->i: dest loses one bit of magnitude at equal width
     true                                    // i->u: negatives never fit
@@ -288,22 +503,33 @@ fn cast_may_lose(src: PrimKind, dst: PrimKind) -> bool {
 // tk_mod_*) that PANICS on a zero divisor instead of UB/SIGFPE. Single-eval — each
 // operand emitted once, passed by value. The helper width comes from the node's result
 // prim. (C: inlined inside emit_expr's TK_TEXPR_BINARY `/` `%` branch.)
-fn emit_div_mod(buf: []byte, e: TExpr, b: TBinary) -> []byte | error {
+// NOTE (W5b threading): the C reaches the stashed program via a file-scope `static
+// g_cg_prog`; Teko has no module-level mutable state, so the FUNCTIONAL mirror THREADS the
+// read-only `prog` through the expr/stmt chain (the same functional-vs-static divergence the
+// file header notes for cbuf*→[]byte and err**→|error). It is needed only at the variant
+// frontier (emit_as / the match emitters), but the chain that can reach those carries it.
+fn emit_div_mod(buf: []byte, prog: checker::TProgram, e: checker::TExpr, b: checker::TBinary) -> []byte | error {
     let prim = match e.type {
-        Prim as p => p
+        checker::Prim as p => p
         _                  => return error { message = "codegen: division/modulo on a non-primitive type not yet supported" }
     }
-    let tag = match prim_div_tag(prim.kind) {
-        str as t     => t
-        error        => return error { message = "codegen: division/modulo on a non-integer type not yet supported" }
+    // `%` is invalid on floats (no C float modulo operator). Ruling §5: error.
+    if b.op == lexer::TokenKind::Percent && cg_prim_is_float(prim.kind) {
+        return error { message = "codegen: modulo on a float type is not allowed" }
     }
+    let tag = match prim_div_tag(prim.kind) {
+        str as t     => t                          // covers u8..i128 AND f16..f64
+        error        => return error { message = "codegen: division/modulo on a non-numeric type not yet supported" }
+    }
+    // Float `/` -> tk_div_f64/f32/f16 (ruling §5: float ÷0 PANICS, parity with int).
+    // Int `/`,`%` -> tk_div_*/tk_mod_* as before. Single-eval (each operand emitted once).
     mut out = buf
     if b.op == lexer::TokenKind::Slash { out = cb(out, "tk_div_") } else { out = cb(out, "tk_mod_") }
     out = cb(out, tag)
     out = cb(out, "(")
-    out = match emit_expr(out, b.left)  { []byte as o => o; error as err => return err }
+    out = match emit_expr(out, prog, b.left)  { []byte as o => o; error as err => return err }
     out = cb(out, ", ")
-    out = match emit_expr(out, b.right) { []byte as o => o; error as err => return err }
+    out = match emit_expr(out, prog, b.right) { []byte as o => o; error as err => return err }
     cb(out, ")")
 }
 
@@ -311,33 +537,33 @@ fn emit_div_mod(buf: []byte, e: TExpr, b: TBinary) -> []byte | error {
 // everything else is plain C `(L op R)`. (C: TK_TEXPR_BINARY branch of emit_expr.)
 // NOTE (out of scope): +,-,* stay plain C — overflow guarding is DEFERRED to build
 // profiles (panic-debug / wrap-release), which do not exist yet.
-fn emit_binary(buf: []byte, e: TExpr, b: TBinary) -> []byte | error {
+fn emit_binary(buf: []byte, prog: checker::TProgram, e: checker::TExpr, b: checker::TBinary) -> []byte | error {
     if b.op == lexer::TokenKind::Slash || b.op == lexer::TokenKind::Percent {
-        return emit_div_mod(buf, e, b)
+        return emit_div_mod(buf, prog, e, b)
     }
     let op = match binop_c(b.op) { str as s => s; error as err => return err }
     mut out = cb(buf, "(")
-    out = match emit_expr(out, b.left) { []byte as o => o; error as err => return err }
+    out = match emit_expr(out, prog, b.left) { []byte as o => o; error as err => return err }
     out = cb(out, " ")
     out = cb(out, op)
     out = cb(out, " ")
-    out = match emit_expr(out, b.right) { []byte as o => o; error as err => return err }
+    out = match emit_expr(out, prog, b.right) { []byte as o => o; error as err => return err }
     cb(out, ")")
 }
 
 // emit_unary — a TUnary -> `(op X)`. (C: TK_TEXPR_UNARY branch.)
-fn emit_unary(buf: []byte, u: TUnary) -> []byte | error {
+fn emit_unary(buf: []byte, prog: checker::TProgram, u: checker::TUnary) -> []byte | error {
     let op = match unop_c(u.op) { str as s => s; error as err => return err }
     mut out = cb(buf, "(")
     out = cb(out, op)
-    out = match emit_expr(out, u.operand) { []byte as o => o; error as err => return err }
+    out = match emit_expr(out, prog, u.operand) { []byte as o => o; error as err => return err }
     cb(out, ")")
 }
 
 // emit_compare — a TCompare -> chained `a<b<c` => `((a<b) && (b<c))` over ADJACENT
 // operands. A lone subject (no rest) is degenerate: emit it bare. (C: TK_TEXPR_COMPARE.)
-fn emit_compare(buf: []byte, c: TCompare) -> []byte | error {
-    if c.rest.len == 0 { return emit_expr(buf, c.first) }
+fn emit_compare(buf: []byte, prog: checker::TProgram, c: checker::TCompare) -> []byte | error {
+    if c.rest.len == 0 { return emit_expr(buf, prog, c.first) }
     mut out = cb(buf, "(")
     mut prev = c.first
     mut i = 0
@@ -347,11 +573,11 @@ fn emit_compare(buf: []byte, c: TCompare) -> []byte | error {
         let op = match cmpop_c(term.op) { str as s => s; error as err => return err }
         if i > 0 { out = cb(out, " && ") }
         out = cb(out, "(")
-        out = match emit_expr(out, prev) { []byte as o => o; error as err => return err }
+        out = match emit_expr(out, prog, prev) { []byte as o => o; error as err => return err }
         out = cb(out, " ")
         out = cb(out, op)
         out = cb(out, " ")
-        out = match emit_expr(out, term.operand) { []byte as o => o; error as err => return err }
+        out = match emit_expr(out, prog, term.operand) { []byte as o => o; error as err => return err }
         out = cb(out, ")")
         prev = term.operand
         i++
@@ -365,41 +591,55 @@ fn emit_compare(buf: []byte, c: TCompare) -> []byte | error {
 // the operand is emitted once. The carrier is picked by SOURCE signedness so it holds
 // the source losslessly: signed -> int64_t carrier ("_s"); unsigned -> uint64_t ("_u").
 // (C: TK_TEXPR_CAST branch.)
-fn emit_cast(buf: []byte, e: TExpr, c: TCast) -> []byte | error {
+fn emit_cast(buf: []byte, prog: checker::TProgram, e: checker::TExpr, c: checker::TCast) -> []byte | error {
     let inner = c.expr
-    let guard = match e.type {
-        Prim as dp => match inner.type {
-            Prim as sp => prim_is_int(dp.kind) && prim_is_int(sp.kind)
-                                   && cast_may_lose(sp.kind, dp.kind)
-            _                   => false
-        }
-        _                   => false
+    // Extract source/dest prims when both sides are primitive (else: a plain C cast).
+    let dst_opt = match e.type     { checker::Prim as p => p.kind; _ => checker::PrimKind::Bool }
+    let src_opt = match inner.type { checker::Prim as p => p.kind; _ => checker::PrimKind::Bool }
+    let prim_both = match e.type {
+        checker::Prim => match inner.type { checker::Prim => true; _ => false }
+        _    => false
     }
-    if guard {
-        // both sides are Prim here (the guard predicate proved it).
-        let dst = match e.type     { Prim as p => p.kind; _ => return error { message = "codegen: cast guard on a non-primitive (unreachable)" } }
-        let src = match inner.type { Prim as p => p.kind; _ => return error { message = "codegen: cast guard on a non-primitive (unreachable)" } }
-        let dtag = match prim_div_tag(dst) {           // reuse the "u8".."i64" tag table
-            str as t => t
-            error    => return error { message = "codegen: cast to a non-integer type not yet supported" }
-        }
+    let dst = dst_opt
+    let src = src_opt
+
+    // float -> int: ALWAYS guarded (ruling §5: truncate toward zero; panic on
+    // NaN/inf/out-of-range). Helper: tk_to_<dst>_from_<fsrc>. Single-eval.
+    if prim_both && cg_prim_is_float(src) && cg_prim_is_int(dst) {
+        let dtag = match prim_int_tag(dst)   { str as t => t; error as err => return err }
+        let fsrc = match prim_float_tag(src) { str as t => t; error as err => return err }
         mut out = cb(buf, "tk_to_")
         out = cb(out, dtag)
-        if prim_is_signed(src) { out = cb(out, "_s(") } else { out = cb(out, "_u(") }
-        out = match emit_expr(out, inner) { []byte as o => o; error as err => return err }
+        out = cb(out, "_from_")
+        out = cb(out, fsrc)
+        out = cb(out, "(")
+        out = match emit_expr(out, prog, inner) { []byte as o => o; error as err => return err }
         return cb(out, ")")
     }
+    // int -> int: range-checked IFF it may narrow. The carrier is picked by SOURCE
+    // signedness so it holds the source losslessly: signed -> i128 carrier ("_s");
+    // unsigned -> u128 carrier ("_u"). Single-eval.
+    if prim_both && cg_prim_is_int(src) && cg_prim_is_int(dst) && cast_may_lose(src, dst) {
+        let dtag = match prim_int_tag(dst) { str as t => t; error as err => return err }
+        mut out = cb(buf, "tk_to_")
+        out = cb(out, dtag)
+        if cg_prim_is_signed_int(src) { out = cb(out, "_s(") } else { out = cb(out, "_u(") }
+        out = match emit_expr(out, prog, inner) { []byte as o => o; error as err => return err }
+        return cb(out, ")")
+    }
+    // Everything else (int->float widen, float->float narrow, widening int->int,
+    // same-type) is a lossless-or-precision-allowed plain C cast.
     mut out = cb(buf, "((")
     out = match emit_type(out, e.type) { []byte as o => o; error as err => return err }   // target rides the node's .type
     out = cb(out, ")(")
-    out = match emit_expr(out, inner) { []byte as o => o; error as err => return err }
+    out = match emit_expr(out, prog, inner) { []byte as o => o; error as err => return err }
     cb(out, "))")
 }
 
 // emit_call — a TCall. The callee path -> a C identifier joined by "__" (single-segment
 // in M0). Non-shadowable built-ins `print`/`println` (bare, or under `teko`) map to
 // tk_print/tk_println. (C: TK_TEXPR_CALL branch.)
-fn emit_call(buf: []byte, c: TCall) -> []byte | error {
+fn emit_call(buf: []byte, prog: checker::TProgram, c: checker::TCall) -> []byte | error {
     let p = c.callee
     // Non-shadowable built-ins: `print`/`println`, either bare or under `teko`.
     mut builtin = ""
@@ -416,37 +656,151 @@ fn emit_call(buf: []byte, c: TCall) -> []byte | error {
     if has_builtin {
         out = cb(out, builtin)
     } else {
-        mut i = 0
-        loop {
-            if i >= p.segments.len { break }
-            if i > 0 { out = cb(out, "__") }
-            out = cb_str(out, p.segments[i].name)
-            i++
-        }
+        // A user call lowers to the callee's BARE name (its LAST path segment) — the SAME
+        // key the VM's find_function matches on, and the SAME name emit_function gives the
+        // decl (f.name is the bare function name). So a cross-namespace call `ns::fn()` and
+        // the decl `fn` agree, and both backends call identically.
+        out = cb_str(out, p.segments[p.segments.len - 1].name)
     }
     out = cb(out, "(")
     mut j = 0
     loop {
         if j >= c.args.len { break }
         if j > 0 { out = cb(out, ", ") }
-        out = match emit_expr(out, c.args[j]) { []byte as o => o; error as err => return err }
+        out = match emit_expr(out, prog, c.args[j]) { []byte as o => o; error as err => return err }
         j++
     }
     cb(out, ")")
 }
 
 // emit_field_access — a TFieldAccess -> `(recv.field)`. (C: TK_TEXPR_FIELD_ACCESS branch.)
-fn emit_field_access(buf: []byte, fa: TFieldAccess) -> []byte | error {
+// W5-idx — `.len`: a `str` lowers to the runtime tk_str's `.len` member (`(recv).len`); a
+// slice is an honest barrier (slice VALUES are the next feature).
+fn emit_field_access(buf: []byte, prog: checker::TProgram, fa: checker::TFieldAccess) -> []byte | error {
+    let is_slice = match fa.receiver.type { checker::Slice => true; _ => false }
+    if is_slice && fa.field == "len" {
+        return error { message = "codegen: slice .len not yet supported (slice value layer pending)" }
+    }
     mut out = cb(buf, "(")
-    out = match emit_expr(out, fa.receiver) { []byte as o => o; error as err => return err }
+    out = match emit_expr(out, prog, fa.receiver) { []byte as o => o; error as err => return err }
     out = cb(out, ".")
     out = cb_str(out, fa.field)
     cb(out, ")")
 }
 
+// emit_index — W5-idx `recv[index]`. A `str` receiver lowers to a BOUNDS-CHECKED byte access
+// as a GNU statement-expression (single-eval of recv + idx, then the guard):
+//   ({ tk_str _sN = <recv>; uint64_t _iN = <idx>; _iN < _sN.len ? _sN.ptr[_iN]
+//                                              : (tk_panic_oob(), (tk_byte)0); })
+// tk_panic_oob is declared in teko_rt.h (the generated TU's runtime header) — an out-of-bounds
+// index PANICS with the SAME message as the VM's eval_index (M.1). A slice receiver is an
+// honest barrier (slice VALUES are the next feature). (C: the TK_TEXPR_INDEX branch.)
+fn emit_index(buf: []byte, prog: checker::TProgram, e: checker::TExpr, ix: checker::TIndex) -> []byte | error {
+    match ix.receiver.type {
+        checker::Slice => return error { message = "codegen: slice indexing not yet supported (slice value layer pending)" }
+        checker::Str   => { }
+        _              => return error { message = "codegen: indexing a non-string value not yet supported" }
+    }
+    // Unique temp names (the buffer length is the functional uniquifier — see emit_if_value).
+    let stmp = $"_s{buf.len}"
+    let itmp = $"_i{buf.len + 1}"   // +1 so it differs from stmp
+    mut out = cb(buf, "({ tk_str ")
+    out = cb(out, stmp)
+    out = cb(out, " = ")
+    out = match emit_expr(out, prog, ix.receiver) { []byte as o => o; error as err => return err }
+    out = cb(out, "; uint64_t ")
+    out = cb(out, itmp)
+    out = cb(out, " = (uint64_t)(")
+    out = match emit_expr(out, prog, ix.index) { []byte as o => o; error as err => return err }
+    out = cb(out, "); ")
+    out = cb(out, itmp)
+    out = cb(out, " < ")
+    out = cb(out, stmp)
+    out = cb(out, ".len ? ")
+    out = cb(out, stmp)
+    out = cb(out, ".ptr[")
+    out = cb(out, itmp)
+    out = cb(out, "]")
+    cb(out, " : (tk_panic_oob(), (tk_byte)0); })")
+}
+
+// emit_interp — $"…{expr}…" (self-host parity). Lower to nested tk_str_concat over the piece
+// literals and the holes: pieces[0] ++ str(holes[0]) ++ pieces[1] ++ … . A piece literal is the
+// SAME (tk_str){…} emission as TStrLit. A `str` hole is the str expr directly; an INTEGER hole is
+// wrapped in i64_to_str/u64_to_str (by the hole's signedness) — the SAME runtime builders the VM
+// calls, so VM==codegen byte-for-byte. Concats nest left-to-right (matching the VM's accumulator).
+fn emit_piece_lit(buf: []byte, piece: str) -> []byte {
+    mut out = cb(buf, "(tk_str){ (const tk_byte *)\"")
+    out = cb_cstr_escaped(out, piece)
+    out = cb(out, "\", ")
+    out = cb_i64(out, piece.len to i64)
+    cb(out, " }")
+}
+fn emit_interp(buf: []byte, prog: checker::TProgram, in: checker::TInterp) -> []byte | error {
+    let nsegs = in.pieces.len + in.holes.len      // total segments (pieces interleaved with holes)
+    mut out = buf
+    // open one tk_str_concat( for each segment after the first (nsegs - 1 of them).
+    mut s = 1
+    loop { if s >= nsegs { break }; out = cb(out, "tk_str_concat("); s++ }
+    mut k = 0
+    loop {
+        if k >= nsegs { break }
+        if k >= 1 { out = cb(out, ", ") }         // the second arg of this segment's concat(
+        if k % 2 == 0 {                           // a PIECE literal (segment 2*i → piece i)
+            out = emit_piece_lit(out, in.pieces[k / 2])
+        } else {                                  // a HOLE (segment 2*i+1 → hole i)
+            let h = in.holes[k / 2]
+            match h.type {
+                checker::Str => { out = match emit_expr(out, prog, h) { []byte as o => o; error as err => return err } }
+                checker::Prim as p => {
+                    if !cg_prim_is_int(p.kind) { return error { message = "codegen: interpolation hole must be a str or an integer" } }
+                    if cg_prim_is_signed_int(p.kind) { out = cb(out, "tk_i64_to_str((int64_t)(") }
+                    else { out = cb(out, "tk_u64_to_str((uint64_t)(") }
+                    out = match emit_expr(out, prog, h) { []byte as o => o; error as err => return err }
+                    out = cb(out, "))")
+                }
+                _ => return error { message = "codegen: interpolation hole must be a str or an integer" }
+            }
+        }
+        if k >= 1 { out = cb(out, ")") }          // close this segment's tk_str_concat(
+        k++
+    }
+    out
+}
+
+// emit_struct_init — W4c `Name { f = v, … }` -> a C compound literal in DECLARED field
+// order:  (tk_t_<MANGLE>){ .<field> = <val>, … }. The checker already reordered
+// field_names/field_vals into the struct's declared order (expr.tks), so both backends
+// lower identically (differential equivalence with the VM, which stores fields in the
+// same order). The node's `.type` is Named (a user struct -> mangle its name) or Error
+// (`error { message = … }`). `error` has NO C value representation in the generated TU
+// yet (teko_rt.h defines no error value type), so that case is an honest barrier —
+// named-struct construction works. (C: TK_TEXPR_STRUCT_INIT branch.)
+fn emit_struct_init(buf: []byte, prog: checker::TProgram, e: checker::TExpr, si: checker::TStructInit) -> []byte | error {
+    let name = match e.type {
+        checker::Named as nm => nm.name
+        checker::Error       => return error { message = "codegen: error value construction not yet supported (error has no C value repr yet)" }
+        _           => return error { message = "codegen: struct literal with a non-named type not yet supported" }
+    }
+    mut out = cb(buf, "(")
+    out = mangle_type_name(out, "", name)
+    out = cb(out, "){ ")
+    mut i = 0
+    loop {
+        if i >= si.field_names.len { break }
+        if i > 0 { out = cb(out, ", ") }
+        out = cb(out, ".")
+        out = cb_str(out, si.field_names[i])
+        out = cb(out, " = ")
+        out = match emit_expr(out, prog, si.field_vals[i]) { []byte as o => o; error as err => return err }
+        i++
+    }
+    cb(out, " }")
+}
+
 // emit_strlit — a TStrLit -> a tk_str compound literal with an EXPLICIT length. The
 // decoded bytes may contain NUL, so we never lean on strlen/sizeof (M.1). (C: TK_TEXPR_STR.)
-fn emit_strlit(buf: []byte, s: TStrLit) -> []byte | error {
+fn emit_strlit(buf: []byte, s: checker::TStrLit) -> []byte | error {
     mut out = cb(buf, "(tk_str){ (const tk_byte *)\"")
     out = cb_cstr_escaped(out, s.text)
     out = cb(out, "\", ")
@@ -454,22 +808,591 @@ fn emit_strlit(buf: []byte, s: TStrLit) -> []byte | error {
     cb(out, " }")
 }
 
-// emit_expr — the expression dispatch (the C's emit_expr switch). Unsupported value
-// nodes (if/match-as-a-value) fail with an honest message (M.3). (C: `emit_expr`.)
-fn emit_expr(buf: []byte, e: TExpr) -> []byte | error {
+// ---------------------------------------------------------------------------
+// W5a — `if`-as-a-VALUE + IMPLICIT trailing-return (differential parity with the VM).
+// ---------------------------------------------------------------------------
+
+// is_void_type — true iff a resolved Type is `void`. (C: `e->type.tag == TK_TYPE_VOID`.)
+fn is_void_type(t: checker::Type) -> bool {
+    match t { checker::Void => true; _ => false }
+}
+
+// fresh_tmp_name — a fresh, UNIQUE temp name `_tk<len>` as its OWN bytes, where `len` is the
+// CURRENT length of the C-source buffer. Using the buffer length as the uniquifier is purely
+// functional (no global counter) and guaranteed distinct: every append grows the buffer, and
+// a NESTED statement-expr is emitted only after the outer one has appended bytes, so its name
+// strictly differs. The name is returned standalone (not appended) so it can be spelled at
+// BOTH the declaration and the trailing read. (C: `snprintf(tmp, "_tk%zu", b->len)`.)
+fn fresh_tmp_name(buf_len: i64) -> str {
+    mut nm = cb(teko::list::empty(), "_tk")
+    nm = cb_i64(nm, buf_len)
+    str(nm)
+}
+
+// emit_stmt_value — emit ONE branch statement in VALUE position: its trailing value is
+// assigned to `sink`. A RETURN/break/continue inside a branch DIVERGES, but an `if` used as a
+// SUB-expression cannot express that as a value, so it is an honest barrier here — EXACTLY
+// matching the VM (eval_expr's TIfExpr stops on a divergent branch). A value-carrying expr
+// statement -> `<sink> = <expr>;`. Anything else (void expr-stmt, loop, binding, assign) ->
+// emitted normally (no value). (C: `emit_stmt_value`.)
+fn emit_stmt_value(buf: []byte, prog: checker::TProgram, s: checker::TStatement, sink: str, indent: str) -> []byte | error {
+    match s {
+        checker::TReturn       => error { message = "codegen: control flow inside an `if` used as a sub-expression not yet supported" }
+        checker::TBreakStmt    => error { message = "codegen: control flow inside an `if` used as a sub-expression not yet supported" }
+        checker::TContinueStmt => error { message = "codegen: control flow inside an `if` used as a sub-expression not yet supported" }
+        checker::TExprStmt as es => {
+            if is_void_type(es.expr.type) {
+                // A non-value statement in an if-value branch has no variant return slot:
+                // pass void ret_type (emit_as never wraps for void).
+                return emit_stmt(buf, s, false, prog, checker::Void { }, indent)
+            }
+            mut out = cb(buf, indent)
+            out = cb(out, sink)
+            out = cb(out, " = ")
+            out = match emit_expr(out, prog, es.expr) { []byte as o => o; error as err => return err }
+            cb(out, ";\n")
+        }
+        _ => emit_stmt(buf, s, false, prog, checker::Void { }, indent)
+    }
+}
+
+// emit_branch_value — emit a BRANCH block (the `if`-value then/else): all but the last
+// statement normally, the LAST via emit_stmt_value (its trailing value -> `sink`). An empty
+// branch yields nothing (the checker forbids a value-typed empty branch). (C: `emit_branch_value`.)
+fn emit_branch_value(buf: []byte, prog: checker::TProgram, body: []checker::TStatement, sink: str, indent: str) -> []byte | error {
+    mut out = buf
+    mut i = 0
+    loop {
+        if i + 1 >= body.len { break }
+        out = match emit_stmt(out, body[i], false, prog, checker::Void { }, indent) { []byte as o => o; error as err => return err }
+        i++
+    }
+    if body.len > 0 {
+        out = match emit_stmt_value(out, prog, body[body.len - 1], sink, indent) { []byte as o => o; error as err => return err }
+    }
+    out
+}
+
+// emit_if_value — lower an `if` USED AS A SUB-VALUE to a GNU statement-expression:
+//   ({ <Ctype> _tkN; if (<cond>) { <then…> } else { <else…> } _tkN; })
+// Each branch assigns its trailing value to `_tkN`; `<Ctype>` is the if-node's resolved
+// branch type. clang/gcc accept stmt-exprs under the host cc (the codebase already targets
+// cc -std=c23). (VM parity: eval_expr's TIfExpr runs exec_if and yields the taken branch's
+// trailing NORMAL value; a divergent branch is an honest stop — see emit_stmt_value.)
+// (C: `emit_if_value`.)
+fn emit_if_value(buf: []byte, prog: checker::TProgram, e: checker::TExpr, f: checker::TIfExpr) -> []byte | error {
+    if !f.has_else { return error { message = "codegen: if-without-else used as a value not yet supported" } }
+    // The temp name is `_tk<buflen>` frozen at the CURRENT length (the buffer is about to
+    // grow). Capture it once and reuse it for the declaration AND the trailing read, so both
+    // spell the same identifier.
+    let tmp = fresh_tmp_name(buf.len to i64)
+    mut out = cb(buf, "({ ")
+    out = match emit_type(out, e.type) { []byte as o => o; error as err => return err }
+    out = cb(out, " ")
+    out = cb(out, tmp)
+    out = cb(out, "; if (")
+    out = match emit_expr(out, prog, f.cond) { []byte as o => o; error as err => return err }
+    out = cb(out, ") {\n")
+    out = match emit_branch_value(out, prog, f.then_blk, tmp, "    ") { []byte as o => o; error as err => return err }
+    out = cb(out, "} else {\n")
+    out = match emit_branch_value(out, prog, f.else_blk, tmp, "    ") { []byte as o => o; error as err => return err }
+    out = cb(out, "} ")
+    out = cb(out, tmp)
+    cb(out, "; })")
+}
+
+// ---------------------------------------------------------------------------
+// W5b — VARIANT-VALUE WRAPPING + MATCH lowering (differential parity with the VM).
+// ---------------------------------------------------------------------------
+
+// fresh_named — a fresh temp `<prefix><len>` (a sibling of fresh_tmp_name for the match
+// subject/result temps `_s<len>` / `_r<len>`). (C: `snprintf(subj, "_s%zu", b->len)`.)
+fn fresh_named(prefix: str, n: i64) -> str {
+    mut nm = cb(teko::list::empty(), prefix)
+    nm = cb_i64(nm, n)
+    str(nm)
+}
+
+// emit_as — emit `value` into a slot whose EXPECTED type is `expected`. When `expected` is
+// a (named) variant and `value`'s type is one of its case members, WRAP the value into the
+// variant's `tag + union` representation:
+//   (tk_t_<Variant>){ .tag = TK_TAG_<UPPER Variant>_<UPPER member>, .as.<member> = <value> }
+// else emit the value plainly. The tag suffix + union field are spelled EXACTLY as
+// emit_type_decl spells them (cb_upper tag; the member's bare name field), so wrap + decl
+// agree. The VM needs no wrap (its struct value already carries the case name); this
+// synthesizes the C equivalent — the W4c-deferred variant-value layer. (C: `emit_as`.)
+fn emit_as(buf: []byte, prog: checker::TProgram, expected: checker::Type, value: checker::TExpr) -> []byte | error {
+    // Wrap only when expected is a NAMED variant, value's type is a NAMED case, and that
+    // case is one of the variant's members. (If value's type IS the variant already — a var
+    // of the variant type — it is not a bare member, so no wrap.)
+    let exp_name = match expected { checker::Named as nm => nm.name; _ => return emit_expr(buf, value) }
+    let val_name = match value.type { checker::Named as nm => nm.name; _ => return emit_expr(buf, value) }
+    let vd = match cg_find_variant_decl(prog, exp_name) { parser::TypeDecl as d => d; error => return emit_expr(buf, value) }
+    if !cg_variant_has_member(vd, val_name) { return emit_expr(buf, value) }
+    mut out = cb(buf, "(")
+    out = mangle_type_name(out, "", exp_name)
+    out = cb(out, "){ .tag = TK_TAG_")
+    out = cb_upper(out, exp_name)
+    out = cb(out, "_")
+    out = cb_upper(out, val_name)
+    out = cb(out, ", .as.")
+    out = cb_str(out, val_name)            // union field == the member's bare name
+    out = cb(out, " = ")
+    out = match emit_expr(out, value) { []byte as o => o; error as err => return err }
+    cb(out, " }")
+}
+
+// cg_emit_lit_pattern — emit an AST LITERAL pattern bound as a C constant comparable to the
+// subject temp `_s` (which already has the subject's C type, so a bare C literal compares
+// correctly — the VM's lit_as borrows the subject's width/sign for the same reason). A
+// str-literal pattern has NO C value-comparison helper in the runtime (no tk_str eq), so it
+// is an honest barrier — the VM DOES support str patterns (name_eq), so this is a true
+// codegen-only gap (M.3). (C: `cg_emit_lit_pattern`.)
+fn cg_emit_lit_pattern(buf: []byte, lit: parser::Expr) -> []byte | error {
+    match lit {
+        parser::Number as n => {
+            if n.is_float { return cb_f64_literal(buf, n.fval) }
+            cb_i128(buf, n.value)
+        }
+        parser::ByteLit as b => cb_i64(buf, b.value to i64)
+        parser::StrLit       => error { message = "codegen: string-literal patterns not yet supported (no tk_str equality helper in the runtime)" }
+        _                    => error { message = "codegen: unsupported literal in a pattern (parser emits only number/byte/str)" }
+    }
+}
+
+// emit_pat_test — emit the boolean TEST that `_s` (`subj`) matches `pat`. `variant_name` is
+// the subject's variant name (its NAMED type), needed to spell a case's tag constant; it is
+// empty for a scalar subject. Mirrors pat_match's decisions (binds are separate). (C: `emit_pat_test`.)
+fn emit_pat_test(buf: []byte, pat: parser::Pattern, subj: str, variant_name: str) -> []byte | error {
+    match pat {
+        parser::WildcardPattern => cb(buf, "1")
+        parser::LiteralPattern as lp => {
+            mut out = cb(buf, "(")
+            out = cb(out, subj)
+            out = cb(out, " == ")
+            out = match cg_emit_lit_pattern(out, lp.value) { []byte as o => o; error as err => return err }
+            cb(out, ")")
+        }
+        parser::RangePattern as rp => {
+            mut out = cb(buf, "(")
+            out = cb(out, subj)
+            out = cb(out, " >= ")
+            out = match cg_emit_lit_pattern(out, rp.lo) { []byte as o => o; error as err => return err }
+            out = cb(out, " && ")
+            out = cb(out, subj)
+            out = cb(out, " <= ")
+            out = match cg_emit_lit_pattern(out, rp.hi) { []byte as o => o; error as err => return err }
+            cb(out, ")")
+        }
+        parser::AltPattern as ap => {
+            mut out = cb(buf, "(")
+            mut i = 0
+            loop {
+                if i >= ap.options.len { break }
+                if i > 0 { out = cb(out, " || ") }
+                out = match emit_pat_test(out, ap.options[i], subj, variant_name) { []byte as o => o; error as err => return err }
+                i++
+            }
+            cb(out, ")")
+        }
+        parser::BindPattern as bp => {
+            mut out = cb(buf, "(")
+            out = cb(out, subj)
+            out = cb(out, ".tag == TK_TAG_")
+            out = cb_upper(out, variant_name)
+            out = cb(out, "_")
+            out = cb_upper(out, cg_path_last(bp.type_name))
+            cb(out, ")")
+        }
+        parser::FieldPattern as fp => {
+            mut out = cb(buf, "(")
+            out = cb(out, subj)
+            out = cb(out, ".tag == TK_TAG_")
+            out = cb_upper(out, variant_name)
+            out = cb(out, "_")
+            out = cb_upper(out, cg_path_last(fp.type_name))
+            cb(out, ")")
+        }
+    }
+}
+
+// emit_pat_binds — emit the BINDINGS a pattern introduces (BIND `as x`, FIELD fields), at
+// the top of the arm block (in scope for the guard and the body). Mirrors pat_match's
+// env_define calls; scalar/Alt/Wildcard patterns bind nothing. C23 `auto` gives each binding
+// the exact C type without a field-type lookup (`_s.as.<Type>.f` already carries it).
+// (C: `emit_pat_binds`.)
+fn emit_pat_binds(buf: []byte, pat: parser::Pattern, subj: str, indent: str) -> []byte | error {
+    match pat {
+        parser::BindPattern as bp => {
+            if bp.has_binding {
+                // `Foo as x` binds the WHOLE case value (the union member struct).
+                mut out = cb(buf, indent)
+                out = cb(out, "auto ")
+                out = cb_str(out, bp.binding)
+                out = cb(out, " = ")
+                out = cb(out, subj)
+                out = cb(out, ".as.")
+                out = cb_str(out, cg_path_last(bp.type_name))
+                cb(out, ";\n")
+            } else { buf }
+        }
+        parser::FieldPattern as fp => {
+            mut out = buf
+            mut i = 0
+            loop {
+                if i >= fp.fields.len { break }
+                out = cb(out, indent)
+                out = cb(out, "auto ")
+                out = cb_str(out, fp.fields[i])
+                out = cb(out, " = ")
+                out = cb(out, subj)
+                out = cb(out, ".as.")
+                out = cb_str(out, cg_path_last(fp.type_name))
+                out = cb(out, ".")
+                out = cb_str(out, fp.fields[i])
+                out = cb(out, ";\n")
+                i++
+            }
+            out
+        }
+        _ => buf   // WILDCARD/LITERAL/RANGE/ALT bind nothing
+    }
+}
+
+// cg_match_variant_name — the subject's variant name (its NAMED type), or empty for a
+// scalar subject. The tag constant needs the VARIANT name; the case comes from the pattern.
+// (C: `cg_match_variant_name`.)
+fn cg_match_variant_name(e: checker::TExpr) -> str {
     match e.kind {
-        TNumber as n      => cb_i64(buf, n.value)
-        TVar as v         => cb_str(buf, v.name)
-        TBinary as b      => emit_binary(buf, e, b)
-        TUnary as u       => emit_unary(buf, u)
-        TCompare as c     => emit_compare(buf, c)
-        TCast as c        => emit_cast(buf, e, c)
-        TCall as cl       => emit_call(buf, cl)
-        TFieldAccess as fa => emit_field_access(buf, fa)
-        TStrLit as s      => emit_strlit(buf, s)
-        TByteLit as by    => cb_i64(buf, by.value to i64)   // byte == uint8_t; emit its decimal value (0..255)
-        TIfExpr           => error { message = "codegen: if-expression not yet supported" }
-        TMatchExpr        => error { message = "codegen: match-expression not yet supported" }
+        checker::TMatchExpr as m => match m.subject.type { checker::Named as nm => nm.name; _ => "" }
+        _ => ""
+    }
+}
+
+// cg_block_diverges — does a typed block DIVERGE (exit via return/break/continue on every
+// path)? True when its trailing statement is a return/break/continue, or a trailing if-with-
+// else / match whose every branch / arm diverges. Mirrors the checker's tblock_diverges so a
+// diverging arm body lowers as real control flow, not a value commit. (C: `cg_block_diverges`.)
+fn cg_block_diverges(stmts: []checker::TStatement) -> bool {
+    if stmts.len == 0 { return false }
+    match stmts[stmts.len - 1] {
+        checker::TReturn        => true
+        checker::TBreakStmt     => true
+        checker::TContinueStmt  => true
+        checker::TExprStmt as es => match es.expr.kind {
+            checker::TIfExpr as f    => f.has_else && cg_block_diverges(f.then_blk) && cg_block_diverges(f.else_blk)
+            checker::TMatchExpr as m => {
+                if m.arms.len == 0 { return false }
+                mut i = 0
+                loop {
+                    if i >= m.arms.len { break }
+                    if !cg_block_diverges(m.arms[i].body) { return false }
+                    i++
+                }
+                true
+            }
+            _ => false
+        }
+        _ => false
+    }
+}
+
+// cg_block_diverges_jump — does a block diverge via a `break`/`continue` (NOT a `return`)? Such
+// a jump can't escape a GNU stmt-expr, so a match used as a SUB-expression honest-stops on it —
+// the same frontier the VM enforces (eval_match). A `return` divergence is fine. (C: `cg_block_diverges_jump`.)
+fn cg_block_diverges_jump(stmts: []checker::TStatement) -> bool {
+    if stmts.len == 0 { return false }
+    match stmts[stmts.len - 1] {
+        checker::TBreakStmt     => true
+        checker::TContinueStmt  => true
+        checker::TExprStmt as es => match es.expr.kind {
+            checker::TIfExpr as f    => f.has_else && (cg_block_diverges_jump(f.then_blk) || cg_block_diverges_jump(f.else_blk))
+            checker::TMatchExpr as m => {
+                mut i = 0
+                loop {
+                    if i >= m.arms.len { break }
+                    if cg_block_diverges_jump(m.arms[i].body) { return true }
+                    i++
+                }
+                false
+            }
+            _ => false
+        }
+        _ => false
+    }
+}
+
+// emit_arm_value — emit an arm body BLOCK in VALUE position. All-but-last statements emit
+// normally; the trailing value flows into `sink`, wrapped to the match result type via emit_as,
+// then `break` commits. A `return`-DIVERGING arm (`=> return e` — THE dominant idiom) emits real
+// control flow (a `return …;` leaves the whole function) and never commits to `sink`. A break/
+// continue divergence is an HONEST STOP (it can't escape a stmt-expr), the same frontier the VM
+// enforces (eval_match). (C: `emit_arm_value`.)
+fn emit_arm_value(buf: []byte, prog: checker::TProgram, match_e: checker::TExpr, body: []checker::TStatement, sink: str, ci: str) -> []byte | error {
+    if cg_block_diverges_jump(body) {
+        return error { message = "codegen: break/continue inside a `match` used as a sub-expression not yet supported" }
+    }
+    if cg_block_diverges(body) {
+        // `return`-divergence: emit every statement as-is; the trailing return (or a diverging
+        // trailing if/match) leaves the enclosing function. No `sink =` / `break`.
+        mut out = buf
+        mut i = 0
+        loop {
+            if i + 1 >= body.len { break }
+            out = match emit_stmt(out, body[i], false, prog, Void { }, ci) { []byte as o => o; error as err => return err }
+            i++
+        }
+        let last = body[body.len - 1]
+        return match last {
+            checker::TExprStmt as es => match es.expr.kind {
+                checker::TIfExpr as _    => emit_exprstmt_tail(out, es.expr, false, prog, match_e.type, ci)
+                checker::TMatchExpr as _ => emit_exprstmt_tail(out, es.expr, false, prog, match_e.type, ci)
+                _              => emit_stmt(out, last, false, prog, match_e.type, ci)
+            }
+            _ => emit_stmt(out, last, false, prog, match_e.type, ci)
+        }
+    }
+    // Value form: all-but-last normally; the trailing value → `sink` (wrapped), then `break`.
+    mut out = buf
+    mut i = 0
+    loop {
+        if i + 1 >= body.len { break }
+        out = match emit_stmt(out, body[i], false, prog, Void { }, ci) { []byte as o => o; error as err => return err }
+        i++
+    }
+    if body.len == 0 { return error { message = "codegen: empty match arm body in value position" } }
+    let last = body[body.len - 1]
+    match last {
+        checker::TExprStmt as es => {
+            out = cb(out, ci)
+            out = cb(out, sink)
+            out = cb(out, " = (")
+            out = match emit_as(out, prog, match_e.type, es.expr) { []byte as o => o; error as err => return err }
+            cb(out, "); break;\n")
+        }
+        _ => error { message = "codegen: non-value trailing statement in a match arm used as a value" }
+    }
+}
+
+// emit_match_value — VALUE form: a GNU statement-expression yielding the matched arm's body
+// value (the SAME selection structure as the tail/stmt forms, but committing the trailing value
+// with `_r = <body>; break;` inside a `do {…} while (0)`):
+//   ({ <SubjCType> _sN = (<subject>); <ResultCType> _rN; do {
+//        if (<test0>) { <binds0> [if (<guard0>)] { <arm body → _rN; break;> } } … } while (0); _rN; })
+// The non-`else` `if` chain gives the VM's first-match-with-guard order; a failed guard
+// falls through to the next arm. Exhaustiveness (checker-guaranteed) means the chain always
+// commits before the `while (0)` exits. (C: `emit_match_value`.)
+fn emit_match_value(buf: []byte, prog: checker::TProgram, e: checker::TExpr, m: checker::TMatchExpr) -> []byte | error {
+    let subj = fresh_named("_s", buf.len to i64)
+    let res  = fresh_named("_r", buf.len to i64 + 1)   // +1 so it differs from subj
+    let vn = cg_match_variant_name(e)
+    mut out = cb(buf, "({ ")
+    out = match emit_type(out, m.subject.type) { []byte as o => o; error as err => return err }
+    out = cb(out, " ")
+    out = cb(out, subj)
+    out = cb(out, " = (")
+    out = match emit_expr(out, prog, m.subject) { []byte as o => o; error as err => return err }
+    out = cb(out, "); ")
+    out = match emit_type(out, e.type) { []byte as o => o; error as err => return err }
+    out = cb(out, " ")
+    out = cb(out, res)
+    out = cb(out, "; do {\n")
+    mut i = 0
+    loop {
+        if i >= m.arms.len { break }
+        let arm = m.arms[i]
+        out = cb(out, "    if (")
+        out = match emit_pat_test(out, arm.pattern, subj, vn) { []byte as o => o; error as err => return err }
+        out = cb(out, ") {\n")
+        out = match emit_pat_binds(out, arm.pattern, subj, "        ") { []byte as o => o; error as err => return err }
+        mut ci = "        "
+        if arm.has_when {
+            out = cb(out, "        if (")
+            out = match emit_expr(out, prog, arm.guard) { []byte as o => o; error as err => return err }
+            out = cb(out, ") {\n")
+            ci = "            "
+        }
+        // the arm body is a BLOCK (B.20): its trailing value flows into _r (wrapped to the
+        // match result type), or a diverging arm (`=> return e`) emits real control flow.
+        out = match emit_arm_value(out, prog, e, arm.body, res, ci) { []byte as o => o; error as err => return err }
+        if arm.has_when { out = cb(out, "        }\n") }
+        out = cb(out, "    }\n")
+        i++
+    }
+    out = cb(out, "    } while (0); ")
+    out = cb(out, res)
+    cb(out, "; })")
+}
+
+// emit_match_tail — TAIL form: each winning arm `return`s its body, as a straight `if` chain
+// inside a brace block holding the subject temp. The first matching arm with a holding guard
+// returns and exits; a failed guard falls through. `ret_type` threads the fn return type so
+// a tail arm body that yields a case value into a variant return slot is wrapped (emit_as).
+// (C: `emit_match_tail`.)
+fn emit_match_tail(buf: []byte, prog: checker::TProgram, e: checker::TExpr, m: checker::TMatchExpr, in_main: bool, ret_type: checker::Type, indent: str) -> []byte | error {
+    let subj = fresh_named("_s", buf.len to i64)
+    let vn = cg_match_variant_name(e)
+    let inner = cb_indent_deeper(indent)
+    let inner2 = cb_indent_deeper(inner)
+    mut out = cb(buf, indent)
+    out = cb(out, "{\n")
+    out = cb(out, inner)
+    out = match emit_type(out, m.subject.type) { []byte as o => o; error as err => return err }
+    out = cb(out, " ")
+    out = cb(out, subj)
+    out = cb(out, " = (")
+    out = match emit_expr(out, prog, m.subject) { []byte as o => o; error as err => return err }
+    out = cb(out, ");\n")
+    mut i = 0
+    loop {
+        if i >= m.arms.len { break }
+        let arm = m.arms[i]
+        out = cb(out, inner)
+        out = cb(out, "if (")
+        out = match emit_pat_test(out, arm.pattern, subj, vn) { []byte as o => o; error as err => return err }
+        out = cb(out, ") {\n")
+        out = match emit_pat_binds(out, arm.pattern, subj, inner2) { []byte as o => o; error as err => return err }
+        mut ci = inner2
+        if arm.has_when {
+            out = cb(out, inner2)
+            out = cb(out, "if (")
+            out = match emit_expr(out, prog, arm.guard) { []byte as o => o; error as err => return err }
+            out = cb(out, ") {\n")
+            ci = cb_indent_deeper(inner2)
+        }
+        // the arm body is a BLOCK in TAIL position (B.20): emit it as a tail block — its
+        // trailing value becomes a `return`, and an explicit return/break/continue inside it
+        // emits real C control flow (mirrors the VM running the arm block flow-aware).
+        out = match emit_block_tail(out, arm.body, in_main, prog, ret_type, ci) { []byte as o => o; error as err => return err }
+        if arm.has_when { out = cb(out, inner2); out = cb(out, "}\n") }
+        out = cb(out, inner)
+        out = cb(out, "}\n")
+        i++
+    }
+    out = cb(out, indent)
+    cb(out, "}\n")
+}
+
+// emit_match_stmt — STATEMENT form: a match whose result is DISCARDED (run each winning arm
+// body for effect). An `if` chain inside a brace block; the FIRST winning arm runs its block and
+// then `goto`s a unique commit label past the chain. The commit uses a GOTO (not a `do {…}
+// while(0)` + break) precisely because an arm body is a BLOCK that may contain `break`/`continue`
+// targeting an ENCLOSING loop — those must be real C break/continue, never swallowed by a wrapper
+// (mirrors the VM propagating the arm's flow). (C: `emit_match_stmt`.)
+fn emit_match_stmt(buf: []byte, prog: checker::TProgram, e: checker::TExpr, m: checker::TMatchExpr, indent: str) -> []byte | error {
+    let subj = fresh_named("_s", buf.len to i64)
+    let done = fresh_named("tk_m", buf.len to i64 + 1) + "_done"   // unique commit label
+    let vn = cg_match_variant_name(e)
+    let inner = cb_indent_deeper(indent)
+    let inner2 = cb_indent_deeper(inner)
+    mut out = cb(buf, indent)
+    out = cb(out, "{\n")
+    out = cb(out, inner)
+    out = match emit_type(out, m.subject.type) { []byte as o => o; error as err => return err }
+    out = cb(out, " ")
+    out = cb(out, subj)
+    out = cb(out, " = (")
+    out = match emit_expr(out, prog, m.subject) { []byte as o => o; error as err => return err }
+    out = cb(out, ");\n")
+    mut i = 0
+    loop {
+        if i >= m.arms.len { break }
+        let arm = m.arms[i]
+        out = cb(out, inner)
+        out = cb(out, "if (")
+        out = match emit_pat_test(out, arm.pattern, subj, vn) { []byte as o => o; error as err => return err }
+        out = cb(out, ") {\n")
+        out = match emit_pat_binds(out, arm.pattern, subj, inner2) { []byte as o => o; error as err => return err }
+        mut ci = inner2
+        if arm.has_when {
+            out = cb(out, inner2)
+            out = cb(out, "if (")
+            out = match emit_expr(out, prog, arm.guard) { []byte as o => o; error as err => return err }
+            out = cb(out, ") {\n")
+            ci = cb_indent_deeper(inner2)
+        }
+        // run the arm body BLOCK for effect (value discarded); break/continue/return inside it
+        // propagate via C's own semantics. Then goto the commit label (first match wins).
+        out = match emit_block(out, arm.body, false, prog, Void { }, ci) { []byte as o => o; error as err => return err }
+        out = cb(out, ci)
+        out = cb(out, "goto ")
+        out = cb(out, done)
+        out = cb(out, ";\n")
+        if arm.has_when { out = cb(out, inner2); out = cb(out, "}\n") }
+        out = cb(out, inner)
+        out = cb(out, "}\n")
+        i++
+    }
+    out = cb(out, inner)
+    out = cb(out, done)
+    out = cb(out, ": ;\n")
+    out = cb(out, indent)
+    cb(out, "}\n")
+}
+
+// emit_expr — the expression dispatch (the C's emit_expr switch). Unsupported value
+// nodes fail with an honest message (M.3). (C: `emit_expr`.)
+// emit_number — a TNumber literal. The node's resolved prim (e.type) decides width and
+// float-kind (N1/N2). Float literals emit a round-trippable double, cast to the right C
+// float type (f64 plain; f32 `(float)`; f16 `(_Float16)`). Integer literals emit the
+// decimal value cast to the prim's C type, so the literal carries the right width — a
+// u128/i128 literal is wider than any C integer literal can spell on its own.
+// (C: the TK_TEXPR_NUMBER branch of emit_expr.)
+fn emit_number(buf: []byte, e: checker::TExpr, n: checker::TNumber) -> []byte | error {
+    let k = match e.type {
+        checker::Prim as p => p.kind
+        _         => return error { message = "codegen: numeric literal with a non-primitive type not yet supported" }
+    }
+    if n.is_float {
+        match k {
+            checker::PrimKind::F64 => return cb_f64_literal(buf, n.fval)
+            checker::PrimKind::F32 => {
+                mut o = cb(buf, "(float)(")
+                o = cb_f64_literal(o, n.fval)
+                return cb(o, ")")
+            }
+            checker::PrimKind::F16 => {
+                mut o = cb(buf, "(_Float16)(")
+                o = cb_f64_literal(o, n.fval)
+                return cb(o, ")")
+            }
+            _ => return error { message = "codegen: float literal with a non-float type not yet supported" }
+        }
+    }
+    // integer literal: `((Ctype)<decimal>)`.
+    mut out = cb(buf, "((")
+    out = match emit_prim(out, k) { []byte as o => o; error as err => return err }
+    out = cb(out, ")")
+    out = cb_i128(out, n.value)
+    cb(out, ")")
+}
+
+fn emit_expr(buf: []byte, prog: checker::TProgram, e: checker::TExpr) -> []byte | error {
+    match e.kind {
+        checker::TNumber as n      => emit_number(buf, e, n)
+        checker::TVar as v         => cb_str(buf, v.name)
+        checker::TBinary as b      => emit_binary(buf, prog, e, b)
+        checker::TUnary as u       => emit_unary(buf, prog, u)
+        checker::TCompare as c     => emit_compare(buf, prog, c)
+        checker::TCast as c        => emit_cast(buf, prog, e, c)
+        checker::TCall as cl       => emit_call(buf, prog, cl)
+        checker::TFieldAccess as fa => emit_field_access(buf, prog, fa)
+        checker::TStructInit as si  => emit_struct_init(buf, prog, e, si)
+        checker::TStrLit as s      => emit_strlit(buf, s)
+        checker::TByteLit as by    => cb_i64(buf, by.value to i64)   // byte == uint8_t; emit its decimal value (0..255)
+        // bool literal (W2) — FULL support: bool already flows through both backends, so
+        // emit the C `true`/`false` keyword (C type is `bool`). (C: TK_TEXPR_BOOL branch.)
+        checker::TBoolLit as bl    => cb(buf, if bl.value { "true" } else { "false" })
+        checker::TIfExpr as f      => emit_if_value(buf, prog, e, f)   // W5a — `if` as a value (GNU stmt-expr)
+        checker::TMatchExpr as m   => emit_match_value(buf, prog, e, m)   // W5b — `match` as a value (GNU stmt-expr)
+        // null literal + safe-field-access (x?.field) + coalesce (x ?? y) (W2 surface) all
+        // need the OPTIONAL value representation (presence+value) — a later wave (W6). Be
+        // honest now rather than mis-emit (M.3), exactly like the if/match frontier above.
+        checker::TNullLit          => error { message = "codegen: null literal not yet supported (optional value repr is a later wave)" }
+        checker::TSafeFieldAccess  => error { message = "codegen: safe field access (x?.field) not yet supported (optional value repr is a later wave)" }
+        checker::TCoalesce         => error { message = "codegen: coalesce (x ?? y) not yet supported (optional value repr is a later wave)" }
+        checker::TIndex as ix      => emit_index(buf, prog, e, ix)   // W5-idx — subscript recv[index] (str; slice = honest barrier)
+        checker::TInterp as in     => emit_interp(buf, prog, in)     // $"…{expr}…" — nested tk_str_concat over pieces + holes
     }
 }
 
@@ -479,52 +1402,146 @@ fn emit_expr(buf: []byte, e: TExpr) -> []byte | error {
 //   * in a fn : `return n` -> `return n;`
 // ---------------------------------------------------------------------------
 
-// emit_block — emit each statement in order; the first error short-circuits. (C: `emit_block`.)
-fn emit_block(buf: []byte, body: []TStatement, in_main: bool, indent: str) -> []byte | error {
+// emit_block — emit each statement in order; the first error short-circuits. `prog`/`ret_type`
+// are threaded so a binding/return/match inside can wrap a case value into a variant slot
+// (emit_as). (C: `emit_block`.)
+fn emit_block(buf: []byte, body: []checker::TStatement, in_main: bool, prog: checker::TProgram, ret_type: checker::Type, indent: str) -> []byte | error {
     mut out = buf
     mut i = 0
     loop {
         if i >= body.len { break }
-        out = match emit_stmt(out, body[i], in_main, indent) { []byte as o => o; error as err => return err }
+        out = match emit_stmt(out, body[i], in_main, prog, ret_type, indent) { []byte as o => o; error as err => return err }
         i++
     }
     out
 }
 
+// emit_exprstmt_tail — W5a: emit a TRAILING expr-statement (a block's last statement) as an
+// IMPLICIT RETURN of its value (mirrors the VM: a block's trailing NORMAL value is the
+// function's/main's value — B.20). A trailing `if` is lowered as DIRECT control flow (each
+// branch recursively tail-emitted), so `return`/`break`/`continue` inside a branch propagate
+// via C's own semantics — exactly like the VM's exec_if. This direct form works whether the
+// trailing `if` is typed as a value (a function-body tail) or as `void` (a virtual-main tail,
+// which the checker types as a statement but the VM still drains for its branch value). A void
+// expr-statement, or any non-expr trailing statement, emits normally (no value).
+// (C: `emit_exprstmt_tail`.)
+fn emit_exprstmt_tail(buf: []byte, x: checker::TExpr, in_main: bool, prog: checker::TProgram, ret_type: checker::Type, indent: str) -> []byte | error {
+    match x.kind {
+        checker::TIfExpr as f => {
+            if !f.has_else { return error { message = "codegen: if-without-else in tail position not yet supported" } }
+            mut out = cb(buf, indent)
+            out = cb(out, "if (")
+            out = match emit_expr(out, prog, f.cond) { []byte as o => o; error as err => return err }
+            out = cb(out, ") {\n")
+            let inner = cb_indent_deeper(indent)
+            out = match emit_block_tail(out, f.then_blk, in_main, prog, ret_type, inner) { []byte as o => o; error as err => return err }
+            out = cb(out, indent)
+            out = cb(out, "} else {\n")
+            out = match emit_block_tail(out, f.else_blk, in_main, prog, ret_type, inner) { []byte as o => o; error as err => return err }
+            out = cb(out, indent)
+            cb(out, "}\n")
+        }
+        // W5b — a trailing `match` lowers as a control-flow `if` chain whose arms `return`
+        // (mirrors the trailing `if`); each arm body is wrapped to the return slot via emit_as.
+        checker::TMatchExpr as m => emit_match_tail(buf, prog, x, m, in_main, ret_type, indent)
+        _ => {
+            if is_void_type(x.type) {   // a void expr-statement carries no value → run for effect
+                mut out = cb(buf, indent)
+                out = match emit_expr(out, prog, x) { []byte as o => o; error as err => return err }
+                return cb(out, ";\n")
+            }
+            mut out = cb(buf, indent)
+            if in_main {
+                out = cb(out, "return (int)(")
+                out = match emit_expr(out, prog, x) { []byte as o => o; error as err => return err }
+                return cb(out, ");\n")
+            }
+            out = cb(out, "return ")
+            out = match emit_as(out, prog, ret_type, x) { []byte as o => o; error as err => return err }   // W5b — wrap a case value into a variant return slot
+            cb(out, ";\n")
+        }
+    }
+}
+
+// emit_block_tail — W5a: emit a FUNCTION/MAIN/branch body where the LAST statement, if it is
+// an expr-statement carrying a value, `return`s that value (via emit_exprstmt_tail). All but
+// the last statement emit normally. An explicit RETURN already yields the value; this adds the
+// implicit tail-return that mirrors the VM. (C: `emit_block_tail`.)
+fn emit_block_tail(buf: []byte, body: []checker::TStatement, in_main: bool, prog: checker::TProgram, ret_type: checker::Type, indent: str) -> []byte | error {
+    mut out = buf
+    mut i = 0
+    loop {
+        if i + 1 >= body.len { break }
+        out = match emit_stmt(out, body[i], in_main, prog, ret_type, indent) { []byte as o => o; error as err => return err }
+        i++
+    }
+    if body.len == 0 { return out }
+    let last = body[body.len - 1]
+    match last {
+        checker::TExprStmt as es => emit_exprstmt_tail(out, es.expr, in_main, prog, ret_type, indent)
+        _ => emit_stmt(out, last, in_main, prog, ret_type, indent)
+    }
+}
+
+// emit_if_stmt — W5a: emit an `if` in STATEMENT position as plain C control flow:
+//   if (<cond>) { <then…> } [else { <else…> }]
+// Each branch is emitted via emit_block (NON-tail, value discarded), so `break`/`continue`/
+// `return` inside a branch propagate via C's own semantics. This mirrors the VM, which routes
+// a statement-position `if` (an expr-statement whose expr is an `if`) to exec_if as CONTROL
+// FLOW — never to the value path. (The TAIL `if` takes emit_exprstmt_tail; a SUB-expression
+// `if` takes emit_if_value; this is the INTERIOR statement case.) (C: `emit_if_stmt`.)
+fn emit_if_stmt(buf: []byte, f: checker::TIfExpr, in_main: bool, prog: checker::TProgram, ret_type: checker::Type, indent: str) -> []byte | error {
+    mut out = cb(buf, indent)
+    out = cb(out, "if (")
+    out = match emit_expr(out, prog, f.cond) { []byte as o => o; error as err => return err }
+    out = cb(out, ") {\n")
+    let inner = cb_indent_deeper(indent)
+    out = match emit_block(out, f.then_blk, in_main, prog, ret_type, inner) { []byte as o => o; error as err => return err }
+    if f.has_else {
+        out = cb(out, indent)
+        out = cb(out, "} else {\n")
+        out = match emit_block(out, f.else_blk, in_main, prog, ret_type, inner) { []byte as o => o; error as err => return err }
+    }
+    out = cb(out, indent)
+    cb(out, "}\n")
+}
+
 // emit_binding — a TBinding. BindTarget: only SimpleName is lowered for M0 (destructuring
 // is the honest barrier). `const` prefix for a const binding; the type rides `.bound`.
 // (C: TK_TSTMT_BINDING branch.)
-fn emit_binding(buf: []byte, b: TBinding, indent: str) -> []byte | error {
+fn emit_binding(buf: []byte, prog: checker::TProgram, b: checker::TBinding, indent: str) -> []byte | error {
     let name = match b.target {
-        SimpleName as sn   => sn.name
-        DestructurePattern => return error { message = "codegen: destructuring binding not yet supported" }
+        parser::SimpleName as sn   => sn.name
+        parser::DestructurePattern => return error { message = "codegen: destructuring binding not yet supported" }
     }
     mut out = cb(buf, indent)
-    if b.kind == BindKind::Const { out = cb(out, "const ") }
+    if b.kind == parser::BindKind::Const { out = cb(out, "const ") }
     out = match emit_type(out, b.bound) { []byte as o => o; error as err => return err }
     out = cb(out, " ")
     out = cb_str(out, name)
     out = cb(out, " = ")
-    out = match emit_expr(out, b.value) { []byte as o => o; error as err => return err }
+    // W5b — if the binding's declared type is a variant and the value is a case member,
+    // WRAP it into the variant repr (e.g. `let s: Shape = Circle { … }`). (C: emit_as.)
+    out = match emit_as(out, prog, b.bound, b.value) { []byte as o => o; error as err => return err }
     cb(out, ";\n")
 }
 
 // emit_assign — a TAssign -> `x op= v;`. (C: TK_TSTMT_ASSIGN branch.)
-fn emit_assign(buf: []byte, a: TAssign, indent: str) -> []byte | error {
+fn emit_assign(buf: []byte, prog: checker::TProgram, a: checker::TAssign, indent: str) -> []byte | error {
     let op = match assignop_c(a.op) { str as s => s; error as err => return err }
     mut out = cb(buf, indent)
     out = cb_str(out, a.name)
     out = cb(out, " ")
     out = cb(out, op)
     out = cb(out, " ")
-    out = match emit_expr(out, a.value) { []byte as o => o; error as err => return err }
+    out = match emit_expr(out, prog, a.value) { []byte as o => o; error as err => return err }
     cb(out, ";\n")
 }
 
 // emit_return — a TReturn. In main, `return n` -> `return (int)(n);` (early process
 // exit) and a bare `return` -> `return 0;`; in a fn, the plain `return [v];`.
 // (C: TK_TSTMT_RETURN branch.)
-fn emit_return(buf: []byte, r: TReturn, in_main: bool, indent: str) -> []byte | error {
+fn emit_return(buf: []byte, prog: checker::TProgram, r: checker::TReturn, in_main: bool, ret_type: checker::Type, indent: str) -> []byte | error {
     mut out = cb(buf, indent)
     if !r.has_value {
         if in_main { return cb(out, "return 0;\n") }
@@ -532,23 +1549,33 @@ fn emit_return(buf: []byte, r: TReturn, in_main: bool, indent: str) -> []byte | 
     }
     if in_main {
         out = cb(out, "return (int)(")
-        out = match emit_expr(out, r.value) { []byte as o => o; error as err => return err }
+        out = match emit_expr(out, prog, r.value) { []byte as o => o; error as err => return err }
         return cb(out, ");\n")
     }
     out = cb(out, "return ")
-    out = match emit_expr(out, r.value) { []byte as o => o; error as err => return err }
+    // W5b — wrap a case value into a variant return slot.
+    out = match emit_as(out, prog, ret_type, r.value) { []byte as o => o; error as err => return err }
     cb(out, ";\n")
 }
 
-// emit_loop — a TLoopStmt -> `while (1) { … }`, nesting one indent level deeper.
-// (C: TK_TSTMT_LOOP branch; C grew the inner indent with snprintf.)
-fn emit_loop(buf: []byte, l: TLoopStmt, in_main: bool, indent: str) -> []byte | error {
+// emit_loop — a TLoopStmt -> `while (1) { … }`, nesting one indent level deeper. A LABELED loop
+// (M.5) gets a continue-target `tk_lbl_<NAME>_cont: ;` at the TOP of its body (so `continue L`
+// lowers to `goto tk_lbl_<NAME>_cont;`, re-running the body == the next while(1) iteration) and a
+// break-target `tk_lbl_<NAME>_break: ;` AFTER the loop (so `break L` lowers to `goto …_break;`).
+// A bare loop is unchanged. (C: TK_TSTMT_LOOP branch; C grew the inner indent with snprintf.)
+fn emit_loop(buf: []byte, l: checker::TLoopStmt, in_main: bool, prog: checker::TProgram, ret_type: checker::Type, indent: str) -> []byte | error {
+    let labeled = l.label.len > 0
     mut out = cb(buf, indent)
     out = cb(out, "while (1) {\n")
     let inner = cb_indent_deeper(indent)
-    out = match emit_block(out, l.body, in_main, inner) { []byte as o => o; error as err => return err }
+    // a labeled loop gets a continue-target at the TOP of its body.
+    if labeled { out = cb(out, inner); out = cb(out, "tk_lbl_"); out = cb_str(out, l.label); out = cb(out, "_cont: ;\n") }
+    out = match emit_block(out, l.body, in_main, prog, ret_type, inner) { []byte as o => o; error as err => return err }
     out = cb(out, indent)
-    cb(out, "}\n")
+    out = cb(out, "}\n")
+    // …and a break-target AFTER the loop.
+    if labeled { out = cb(out, indent); out = cb(out, "tk_lbl_"); out = cb_str(out, l.label); out = cb(out, "_break: ;\n") }
+    out
 }
 
 // cb_indent_deeper — `indent` + four spaces (the C did `snprintf(inner, "%s    ", indent)`).
@@ -568,19 +1595,38 @@ fn cb_indent_deeper(indent: str) -> str {
 }
 
 // emit_stmt — the statement dispatch (the C's emit_stmt switch). (C: `emit_stmt`.)
-fn emit_stmt(buf: []byte, s: TStatement, in_main: bool, indent: str) -> []byte | error {
+fn emit_stmt(buf: []byte, s: checker::TStatement, in_main: bool, prog: checker::TProgram, ret_type: checker::Type, indent: str) -> []byte | error {
     match s {
-        TBinding as b      => emit_binding(buf, b, indent)
-        TAssign as a       => emit_assign(buf, a, indent)
-        TReturn as r       => emit_return(buf, r, in_main, indent)
-        TExprStmt as es    => {
-            mut out = cb(buf, indent)
-            out = match emit_expr(out, es.expr) { []byte as o => o; error as err => return err }
-            cb(out, ";\n")
+        checker::TBinding as b      => emit_binding(buf, prog, b, indent)
+        checker::TAssign as a       => emit_assign(buf, prog, a, indent)
+        checker::TReturn as r       => emit_return(buf, prog, r, in_main, ret_type, indent)
+        checker::TExprStmt as es    => {
+            // W5a — an `if` in statement position runs as CONTROL FLOW (mirrors the VM's
+            // exec_stmt → exec_if), so break/continue/return inside a branch propagate. W5b —
+            // a `match` in statement position runs each winning arm body for effect.
+            match es.expr.kind {
+                checker::TIfExpr as f    => emit_if_stmt(buf, f, in_main, prog, ret_type, indent)
+                checker::TMatchExpr as m => emit_match_stmt(buf, prog, es.expr, m, indent)
+                _ => {
+                    mut out = cb(buf, indent)
+                    out = match emit_expr(out, prog, es.expr) { []byte as o => o; error as err => return err }
+                    cb(out, ";\n")
+                }
+            }
         }
-        TLoopStmt as l     => emit_loop(buf, l, in_main, indent)
-        TBreakStmt         => { mut out = cb(buf, indent); cb(out, "break;\n") }
-        TContinueStmt      => { mut out = cb(buf, indent); cb(out, "continue;\n") }
+        checker::TLoopStmt as l     => emit_loop(buf, l, in_main, prog, ret_type, indent)
+        checker::TBreakStmt as b    => {
+            // `break NAME` -> `goto tk_lbl_<NAME>_break;`; bare `break` -> `break;` (M.5).
+            mut out = cb(buf, indent)
+            if b.label.len > 0 { out = cb(out, "goto tk_lbl_"); out = cb_str(out, b.label); cb(out, "_break;\n") }
+            else { cb(out, "break;\n") }
+        }
+        checker::TContinueStmt as c => {
+            // `continue NAME` -> `goto tk_lbl_<NAME>_cont;`; bare `continue` -> `continue;` (M.5).
+            mut out = cb(buf, indent)
+            if c.label.len > 0 { out = cb(out, "goto tk_lbl_"); out = cb_str(out, c.label); cb(out, "_cont;\n") }
+            else { cb(out, "continue;\n") }
+        }
     }
 }
 
@@ -591,7 +1637,7 @@ fn emit_stmt(buf: []byte, s: TStatement, in_main: bool, indent: str) -> []byte |
 // emit_function — a TFunction -> a C function definition. M0 has no params (a param
 // would require resolving its annotation), so any param is the honest barrier.
 // (C: `emit_function`.)
-fn emit_function(buf: []byte, f: TFunction) -> []byte | error {
+fn emit_function(buf: []byte, prog: checker::TProgram, f: checker::TFunction) -> []byte | error {
     mut out = match emit_type(buf, f.return_type) { []byte as o => o; error as err => return err }
     out = cb(out, " ")
     out = cb_str(out, f.name)
@@ -602,18 +1648,153 @@ fn emit_function(buf: []byte, f: TFunction) -> []byte | error {
         return error { message = "codegen: function parameters not yet supported" }
     }
     out = cb(out, ") {\n")
-    out = match emit_block(out, f.body, false, "    ") { []byte as o => o; error as err => return err }
+    // W5a — a fn body's trailing expr-statement carrying a value implicitly returns it.
+    // W5b — thread the fn's return type so a tail/return case value is wrapped into a variant
+    // return slot (emit_as).
+    out = match emit_block_tail(out, f.body, false, prog, f.return_type, "    ") { []byte as o => o; error as err => return err }
     cb(out, "}\n\n")
 }
 
 // ---------------------------------------------------------------------------
-// The program -> a full C translation unit. Two passes:
-//   1. every top-level TFunction -> a C function (use-decls no-op; type-decls rejected).
+// W4c — TYPE DECLARATIONS -> C type declarations.
+//   struct { f: T; … }    -> typedef struct tk_t_<M> { <Ctype> <f>; … } tk_t_<M>;
+//   variant A | B | …     -> a tag enum tk_tag_<M> (one TK_TAG_<M>_<memberM> per member),
+//                            then typedef struct tk_t_<M> { tk_tag_<M> tag;
+//                            union { <memberCtype> <memberField>; … } as; } tk_t_<M>;
+//   enum { A; B }         -> a C enum (typedef enum tk_t_<M> { TK_E_<M>_A, … } tk_t_<M>;)
+// The `tag + union as` idiom is exactly what the bootstrap C itself uses (Type/TExpr).
+// ---------------------------------------------------------------------------
+
+// cb_upper — append the UPPERCASE form of a name's bytes (for enum/tag constants). Non
+// lowercase bytes pass through verbatim (identifiers are alnum/underscore). (C: `cb_upper`.)
+fn cb_upper(buf: []byte, s: str) -> []byte {
+    mut out = buf
+    mut i = 0
+    loop {
+        if i >= s.len { break }
+        let c = s[i]
+        if c >= b'a' && c <= b'z' {
+            out = cb_byte(out, (c to i64 - b'a' to i64 + b'A' to i64) to byte)
+        } else {
+            out = cb_byte(out, c)
+        }
+        i++
+    }
+    out
+}
+
+// variant_member_name — a variant member's bare last path segment (the union field name;
+// the TAG constant uses its uppercase form). (C: `variant_member_name`.)
+fn variant_member_name(m: parser::TypeExpr) -> str | error {
+    match m {
+        parser::NamedType as nt => nt.path.segments[nt.path.segments.len - 1].name
+        _              => error { message = "codegen: a variant member must be a named type" }
+    }
+}
+
+// emit_type_decl — emit ONE type declaration. `d.name` is the bare name; the namespace is
+// empty (the typed item carries no provenance) so decl + ref mangle identically.
+// (C: `emit_type_decl`.)
+fn emit_type_decl(buf: []byte, d: parser::TypeDecl) -> []byte | error {
+    match d.body {
+        parser::StructBody as sb => {
+            mut out = cb(buf, "typedef struct ")
+            out = mangle_type_name(out, "", d.name)
+            out = cb(out, " {\n")
+            mut i = 0
+            loop {
+                if i >= sb.fields.len { break }
+                out = cb(out, "    ")
+                out = match emit_type_expr(out, sb.fields[i].type_ann) { []byte as o => o; error as err => return err }
+                out = cb(out, " ")
+                out = cb_str(out, sb.fields[i].name)
+                out = cb(out, ";\n")
+                i++
+            }
+            out = cb(out, "} ")
+            out = mangle_type_name(out, "", d.name)
+            cb(out, ";\n\n")
+        }
+        parser::VariantBody as vb => {
+            // A variant body is a UnionType (A | B | …). Its members are NamedTypes.
+            let members = match vb.type_expr {
+                parser::UnionType as u => u.members
+                _             => return error { message = "codegen: a variant body must be a union of named members" }
+            }
+            // 1) the tag enum.
+            mut out = cb(buf, "typedef enum tk_tag_")
+            out = cb_str(out, d.name)
+            out = cb(out, " {\n")
+            mut i = 0
+            loop {
+                if i >= members.len { break }
+                let mn = match variant_member_name(members[i]) { str as s => s; error as err => return err }
+                out = cb(out, "    TK_TAG_")
+                out = cb_upper(out, d.name)
+                out = cb(out, "_")
+                out = cb_upper(out, mn)
+                if i + 1 < members.len { out = cb(out, ",") }
+                out = cb(out, "\n")
+                i++
+            }
+            out = cb(out, "} tk_tag_")
+            out = cb_str(out, d.name)
+            out = cb(out, ";\n\n")
+            // 2) the value: tag + union as.
+            out = cb(out, "typedef struct ")
+            out = mangle_type_name(out, "", d.name)
+            out = cb(out, " {\n    tk_tag_")
+            out = cb_str(out, d.name)
+            out = cb(out, " tag;\n    union {\n")
+            mut j = 0
+            loop {
+                if j >= members.len { break }
+                let mem = members[j]
+                let mn = match variant_member_name(mem) { str as s => s; error as err => return err }
+                out = cb(out, "        ")
+                out = match emit_type_expr(out, mem) { []byte as o => o; error as err => return err }
+                out = cb(out, " ")
+                out = cb_str(out, mn)   // the member's bare name is the union field name
+                out = cb(out, ";\n")
+                j++
+            }
+            out = cb(out, "    } as;\n} ")
+            out = mangle_type_name(out, "", d.name)
+            cb(out, ";\n\n")
+        }
+        parser::EnumBody as eb => {
+            mut out = cb(buf, "typedef enum ")
+            out = mangle_type_name(out, "", d.name)
+            out = cb(out, " {\n")
+            mut i = 0
+            loop {
+                if i >= eb.members.len { break }
+                out = cb(out, "    TK_E_")
+                out = cb_upper(out, d.name)
+                out = cb(out, "_")
+                out = cb_upper(out, eb.members[i])
+                if i + 1 < eb.members.len { out = cb(out, ",") }
+                out = cb(out, "\n")
+                i++
+            }
+            out = cb(out, "} ")
+            out = mangle_type_name(out, "", d.name)
+            cb(out, ";\n\n")
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The program -> a full C translation unit. Passes:
+//   0. (W4c) every TYPE DECL -> a C type declaration, BEFORE the functions (forward
+//      order): first a forward `typedef struct tk_t_<M> tk_t_<M>;` for each struct/variant
+//      (so recursive/out-of-order aggregate references compile), then the full decls.
+//   1. every top-level TFunction -> a C function (use-decls no-op; type-decls done above).
 //   2. the loose top-level statements (the VIRTUAL-MAIN) -> int main(void){ … return 0; }.
 // The C's `cg_err` (build a tk_cstr_result error) folds away: here the function simply
 // `return error { … }`, since `str | error` IS the C's TK_RESULT. (C: `tk_emit_c` + `cg_err`.)
 // ---------------------------------------------------------------------------
-fn tk_emit_c(prog: TProgram) -> str | error {
+fn tk_emit_c(prog: checker::TProgram) -> str | error {
     mut b = teko::list::empty()
     b = cb(b, "// generated by teko (F2 backend) — do not edit\n")
     b = cb(b, "#include <stdint.h>\n")
@@ -621,31 +1802,93 @@ fn tk_emit_c(prog: TProgram) -> str | error {
     b = cb(b, "#include \"teko_rt.h\"\n")
     b = cb(b, "#include \"assert.h\"\n\n")   // teko::assert seed decls (driver adds its -I)
 
-    // First pass: emit every top-level function. Reject type-decls (not M0); use-decls
+    // W4c — TYPE DECLS come FIRST (before any function that uses them). Two sub-passes:
+    //   a) a forward `typedef struct tk_t_<M> tk_t_<M>;` for every struct/variant decl, so
+    //      a field/member that references a not-yet-defined aggregate (recursive or
+    //      out-of-order types) still compiles.
+    //   b) the full type declarations (struct bodies, variant tag+union, enums).
+    // (enums need no forward typedef — they carry no aggregate self-reference.)
+    mut fw = 0
+    loop {
+        if fw >= prog.items.len { break }
+        match prog.items[fw] {
+            parser::TypeDecl as d => {
+                match d.body {
+                    parser::EnumBody => { }   // no forward typedef needed
+                    _ => {
+                        b = cb(b, "typedef struct ")
+                        b = mangle_type_name(b, "", d.name)
+                        b = cb(b, " ")
+                        b = mangle_type_name(b, "", d.name)
+                        b = cb(b, ";\n")
+                    }
+                }
+            }
+            _ => { }
+        }
+        fw++
+    }
+    b = cb(b, "\n")
+    mut td = 0
+    loop {
+        if td >= prog.items.len { break }
+        match prog.items[td] {
+            parser::TypeDecl as d => { b = match emit_type_decl(b, d) { []byte as o => o; error as err => return err } }
+            _ => { }
+        }
+        td++
+    }
+
+    // First pass: emit every top-level function. Type-decls are handled above; use-decls
     // are a no-op at the C level (imports); loose statements are the second pass.
     mut i = 0
     loop {
         if i >= prog.items.len { break }
         match prog.items[i] {
-            TFunction as f => { b = match emit_function(b, f) { []byte as o => o; error as err => return err } }
-            TypeDecl       => return error { message = "codegen: type declaration not yet supported" }
-            UseDecl        => { }   // imports are a no-op at the C level (M0)
-            TStatement     => { }   // a loose Statement → virtual-main, second pass
+            checker::TFunction as f => { b = match emit_function(b, prog, f) { []byte as o => o; error as err => return err } }
+            parser::TypeDecl       => { }   // emitted in the type-decl passes above
+            parser::UseDecl        => { }   // imports are a no-op at the C level (M0)
+            checker::TStatement     => { }   // a loose Statement → virtual-main, second pass
         }
         i++
     }
 
     // Second pass: the VIRTUAL-MAIN — the loose top-level statements, in order, become the
     // body of C main(); falling off the end -> `return 0;` (default exit 0).
+    // W5a — the LAST loose statement, if it is a value-carrying expr-statement, becomes the
+    // process exit code via `return (int)(…)` (mirrors tk_vm_run: the virtual-main's trailing
+    // value is the exit code — B.20). emit_block_tail (with in_main=true) lowers a tail `if`'s
+    // branch returns to `return (int)(…)`.
+    // Find the LAST loose statement's index (the tail); prog.items.len means "no loose stmt".
+    mut last_stmt = prog.items.len
+    mut li = 0
+    loop {
+        if li >= prog.items.len { break }
+        match prog.items[li] {
+            checker::TStatement => { last_stmt = li }
+            _ => { }
+        }
+        li++
+    }
     b = cb(b, "int main(void) {\n")
     mut j = 0
     loop {
         if j >= prog.items.len { break }
         match prog.items[j] {
-            TFunction => { }   // handled in pass 1
-            TypeDecl  => { }   // handled (rejected) in pass 1
-            UseDecl   => { }   // no-op
-            TStatement as s    => { b = match emit_stmt(b, s, true, "    ") { []byte as o => o; error as err => return err } }
+            checker::TFunction => { }   // handled in pass 1
+            parser::TypeDecl  => { }   // handled in the type-decl passes
+            parser::UseDecl   => { }   // no-op
+            checker::TStatement as s    => {
+                // The virtual-main has no variant return slot (its tail value is the int exit
+                // code), so ret_type is void — emit_as never wraps for void.
+                if j == last_stmt {
+                    // the tail loose statement → implicit-return path (a one-statement block).
+                    let tail = teko::list::push(teko::list::empty(), s)
+                    b = match emit_block_tail(b, tail, true, prog, checker::Void { }, "    ") { []byte as o => o; error as err => return err }
+                } else {
+                    b = match emit_stmt(b, s, true, prog, checker::Void { }, "    ") { []byte as o => o; error as err => return err }
+                }
+            }
         }
         j++
     }

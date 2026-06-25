@@ -1,19 +1,77 @@
 // src/parser/parse_lit.tks   (namespace 'teko::parser')
 
-// a Number token's text (decimal digits with `_` separators) → i64. (Other bases and
-// overflow are not in the seed's literal path.) Dogfooding `to`: byte→i64 widens (ok).
-fn lit_int(text: str) -> i64 {
-    mut acc = 0
+// a Number token's text (decimal digits with `_` separators) → the raw integer (N1 —
+// TEKO_CORRECTION_PLAN §5). The literal node carries the raw value; its resolved type
+// (set by the typer) decides the real width/signedness. The canonical Teko carrier is
+// the widest native int (i128); the C bootstrap uses __int128. Dogfooding `to`:
+// byte→i128 widens (ok).
+fn lit_int(text: str) -> i128 {
+    // hex `0x…` / binary `0b…` (B.28) decode by radix; `_` separators ignored.
+    if text.len >= 2 && text[0] == b'0' && (text[1] == b'x' || text[1] == b'X') {
+        mut acc: i128 = 0
+        mut i = 2
+        loop {
+            if i >= text.len { break }
+            let c = text[i]
+            if c == b'_' { i++; continue }
+            mut d: i128 = -1
+            if c >= b'0' && c <= b'9' { d = (c to i128) - (b'0' to i128) }
+            else if c >= b'a' && c <= b'f' { d = (c to i128) - (b'a' to i128) + 10 }
+            else if c >= b'A' && c <= b'F' { d = (c to i128) - (b'A' to i128) + 10 }
+            if d < 0 { break }
+            acc = acc * 16 + d
+            i++
+        }
+        return acc
+    }
+    if text.len >= 2 && text[0] == b'0' && (text[1] == b'b' || text[1] == b'B') {
+        mut acc: i128 = 0
+        mut i = 2
+        loop {
+            if i >= text.len { break }
+            let c = text[i]
+            if c == b'_' { i++; continue }
+            if c != b'0' && c != b'1' { break }
+            acc = acc * 2 + (c to i128) - (b'0' to i128)
+            i++
+        }
+        return acc
+    }
+    mut acc: i128 = 0
     mut i = 0
     loop {
         if i >= text.len { break }
         let c = text[i]
         if c != b'_' {
-            acc = acc * 10 + (c to i64) - (b'0' to i64)
+            acc = acc * 10 + (c to i128) - (b'0' to i128)
         }
         i++
     }
     acc
+}
+
+// a FLOAT Number token's text (`3.14`, `1.5e3`) → f64 (the default; an annotation picks
+// f16/f32 later). `_` separators are stripped before the host float parse. Contained:
+// no token suffixes (`1.5f` is NOT a thing — N1). (Host strtod in the C bootstrap.)
+fn lit_float(text: str) -> f64 {
+    teko::float::parse(text)
+}
+
+// predicate: does this Number token's text denote a FLOAT? (contains `.` or `e`/`E`).
+// The parser/typer uses this to choose the integer vs float carrier (N1).
+fn lit_is_float(text: str) -> bool {
+    // a hex/binary literal is ALWAYS an integer — its digits may include 'e'/'E' (hex E)
+    // which must NOT be mistaken for a float exponent.
+    if text.len >= 2 && text[0] == b'0' &&
+       (text[1] == b'x' || text[1] == b'X' || text[1] == b'b' || text[1] == b'B') { return false }
+    mut i = 0
+    loop {
+        if i >= text.len { break }
+        let c = text[i]
+        if c == b'.' || c == b'e' || c == b'E' { return true }
+        i++
+    }
+    false
 }
 
 // a Byte token's text is the already-decoded octet (the lexer resolved escapes/quotes).

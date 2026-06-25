@@ -1,80 +1,117 @@
 // --- expressions ---
-type Number  = struct { value: i64 }                  // a literal number leaf
-type Var     = struct { name: str }                   // a variable reference (reading)
-type StrLit  = struct { text: str }                   // "…"  (B.36)
-type ByteLit = struct { value: byte }                 // b'x' (B.36)
-type Binary  = struct { op: lexer::TokenKind; left: Expr; right: Expr }   // any binary op
-type Unary   = struct { op: lexer::TokenKind; operand: Expr }             // - ~ ! (prefix)
+// a literal number leaf (N1 — TEKO_CORRECTION_PLAN §5). Carries the RAW value; the
+// resolved type (set by the typer) decides width/signedness/float-kind.
+//  - integer literal (any width, incl u128/i128): is_float=false, `value` holds it.
+//  - float literal (f16/f32/f64): is_float=true, `fval` holds it (default f64).
+// (`value` is the integer carrier — canonical Teko uses i128; C bootstrap uses __int128.)
+
+use teko::lexer
+
+pub type Number  = struct { is_float: bool; value: i128; fval: f64 }   // a literal number leaf
+pub type Var     = struct { name: str }                   // a variable reference (reading)
+pub type StrLit  = struct { text: str }                   // "…"  (B.36)
+pub type ByteLit = struct { value: byte }                 // b'x' (B.36)
+pub type BoolLit = struct { value: bool }                 // true / false (LEGISLATION §75)
+pub type NullLit = struct { }                             // null (REBOOT_PLAN §202) — no payload; typed `T?` by the checker
+pub type Binary  = struct { op: lexer::TokenKind; left: Expr; right: Expr }   // any binary op
+pub type Unary   = struct { op: lexer::TokenKind; operand: Expr }             // - ~ ! (prefix)
 type CmpTerm = struct { op: lexer::TokenKind; operand: Expr }             // one cmp continuation
-type Compare = struct { first: Expr; rest: []CmpTerm }  // a<b<c chain, kept as written (M.3)
-type Call    = struct { callee: Path; args: []Expr }    // f(x), lexer::foo(x)
-type IfExpr  = struct {                                  // if/else is an EXPRESSION (B.20)
+pub type Compare = struct { first: Expr; rest: []CmpTerm }  // a<b<c chain, kept as written (M.3)
+pub type Call    = struct { callee: Path; args: []Expr }    // f(x), lexer::foo(x)
+pub type IfExpr  = struct {                                  // if/else is an EXPRESSION (B.20)
     cond:     Expr
     then_blk: []Statement
     has_else: bool
     else_blk: []Statement
 }
-type MatchExpr = struct { subject: Expr; arms: []Arm }  // match is an EXPRESSION (B.15)
+pub type MatchExpr = struct { subject: Expr; arms: []Arm }  // match is an EXPRESSION (B.15)
 
 // --- postfix access & cast (F2) — recursive over Expr (compiler-managed indirection) ---
-type FieldAccess = struct { receiver: Expr; field: str }                 // x.field — read a struct field (the checker's own `s.token`/`b.left` shape; B.29)
-type MethodCall  = struct { receiver: Expr; method: str; args: []Expr }  // recv.method(a, …) — B.29 instance call via `.`; method *checking* is deferred (M.4)
-type Cast        = struct { expr: Expr; target: TypeExpr }               // x to T — explicit conversion; preserves→ok / loses→compile-error (E7; M.0+M.1)
-type PathExpr    = struct { path: Path }                                 // a qualified path as a VALUE — Enum::Member (e.g. PrimKind::U32), module statics (P2; the F2/Part-1 AST had only single-name Var)
+pub type FieldAccess = struct { receiver: Expr; field: str }                 // x.field — read a struct field (the checker's own `s.token`/`b.left` shape; B.29)
+pub type SafeFieldAccess = struct { receiver: Expr; field: str }             // x?.field — null-propagating access (REBOOT_PLAN §203)
+pub type Coalesce    = struct { left: Expr; right: Expr }                    // x ?? y — Elvis / null-coalescing (REBOOT_PLAN §203)
+pub type MethodCall  = struct { receiver: Expr; method: str; args: []Expr }  // recv.method(a, …) — B.29 instance call via `.`; method *checking* is deferred (M.4)
+pub type Cast        = struct { expr: Expr; target: TypeExpr }               // x to T — explicit conversion; preserves→ok / loses→compile-error (E7; M.0+M.1)
+pub type PathExpr    = struct { path: Path }                                 // a qualified path as a VALUE — Enum::Member (e.g. PrimKind::U32), module statics (P2; the F2/Part-1 AST had only single-name Var)
+pub type StructLit   = struct { type_path: Path; field_names: []str; field_vals: []Expr }   // Name { field = value, … } — a struct VALUE constructor (W4a); parallel slices (.len replaces nfields)
+pub type Index       = struct { receiver: Expr; index: Expr }                // recv[index] — str→byte, []T→T (W5-idx)
+// `$"pre {a} mid {b} post"` — string interpolation (self-host parity). The string is
+// pieces[0] ++ str(holes[0]) ++ pieces[1] ++ … ++ pieces[nholes] — so pieces.len == holes.len + 1.
+// Pieces are DECODED literal str spans (escapes resolved, like StrLit); each hole is a full Expr.
+pub type Interp      = struct { pieces: []str; holes: []Expr }               // $"…{expr}…" (self-host parity)
 
-type Expr = Number | Var | Call | IfExpr | MatchExpr | StrLit | ByteLit | Binary | Unary | Compare | FieldAccess | MethodCall | Cast | PathExpr
+pub type Expr = variant Number | Var | Call | IfExpr | MatchExpr | StrLit | ByteLit | BoolLit | NullLit | Binary | Unary | Compare | FieldAccess | SafeFieldAccess | Coalesce | MethodCall | Cast | PathExpr | StructLit | Index | Interp
 
 // --- statements ---
-type BindKind = enum { Let; Mut; Const }
-type SimpleName = struct { name: str }
-type DestructurePattern = struct { names: []str }       // let { x; y } = … (B.13 partial)
-type BindTarget = SimpleName | DestructurePattern
+pub type BindKind = enum { Let; Mut; Const }
+pub type SimpleName = struct { name: str }
+pub type DestructurePattern = struct { names: []str }       // let { x; y } = … (B.13 partial)
+pub type BindTarget = variant SimpleName | DestructurePattern
 
-type Binding = struct {                                 // let/mut/const TARGET [: T] = value
+pub type Binding = struct {                                 // let/mut/const TARGET [: T] = value
     kind:     BindKind
     target:   BindTarget
     has_type: bool
     type_ann: TypeExpr                                  // the parsed annotation (A.8)
     value:    Expr
 }
-type Assign  = struct { name: str; op: lexer::TokenKind; value: Expr }  // x = / += / … (B.4)
-type Return  = struct { has_value: bool; value: Expr }   // `return [expr]` — bare `return` (no value) has has_value=false, value a placeholder (B.20; P4a)
-type LoopStmt = struct { body: []Statement }            // the only primitive loop (M.5)
-type BreakStmt    = struct { }
-type ContinueStmt = struct { }
-type ExprStmt = struct { expr: Expr }                   // a bare expression on its own line
+pub type Assign  = struct { name: str; op: lexer::TokenKind; value: Expr }  // x = / += / … (B.4)
+pub type Return  = struct { has_value: bool; value: Expr }   // `return [expr]` — bare `return` (no value) has has_value=false, value a placeholder (B.20; P4a)
+pub type LoopStmt = struct { label: str; body: []Statement }   // loop [NAME] { … } (M.5); label empty (len 0) = unlabeled
+pub type BreakStmt    = struct { label: str }               // break [NAME] — label empty = innermost loop
+pub type ContinueStmt = struct { label: str }               // continue [NAME] — label empty = innermost loop
+pub type ExprStmt = struct { expr: Expr }                   // a bare expression on its own line
 
-type Statement = Binding | Assign | Return | LoopStmt | BreakStmt | ContinueStmt | ExprStmt
+pub type Statement = variant Binding | Assign | Return | LoopStmt | BreakStmt | ContinueStmt | ExprStmt
 
 // --- top-level items ---
-type Param    = struct { name: str; type_ann: TypeExpr }   // immutable (B.21)
-type Function = struct {
+pub type Param    = struct { name: str; type_ann: TypeExpr }   // immutable (B.21)
+
+// Visibility — a declaration's REACH (LEGISLATION "Visibility — pub vs exp"; B.9).
+// Private (default, no keyword) = own namespace only; Pub = across the project's
+// namespaces (not in the binary header); Exp = exported in the `.tkh` (the public ABI),
+// pub by definition. Ordered by increasing reach: Private < Pub < Exp.
+type Visibility = enum { Private; Pub; Exp }
+
+pub type Function = struct {
     name:        str
     params:      []Param
     has_return:  bool                                   // `-> ret` present? (absent = Unit return; P5a)
     return_type: TypeExpr                               // the return type (valid iff has_return)
     body:        []Statement
-    is_exp:      bool                                   // marked `exp` → exported (.tkh)
+    vis:         Visibility                             // private (default) / pub / exp
     has_doc:     bool                                   // a `/** … */` doc precedes it?
     doc:         str                                    // the doc span (valid iff has_doc)
+    line:        u32                                    // the name's 1-based source line (W-loc-2 diagnostics)
+    col:         u32                                    // the name's 1-based source column (W-loc-2 diagnostics)
 }
-type Field       = struct { name: str; type_ann: TypeExpr }
-type StructBody  = struct { fields: []Field }
-type EnumBody    = struct { members: []str }            // member names, in order
-type VariantBody = struct { type_expr: TypeExpr }       // a union (A.8)
-type TypeBody    = StructBody | EnumBody | VariantBody
-type TypeDecl    = struct {                             // nominal (B.13)
+pub type Field       = struct { name: str; type_ann: TypeExpr }
+pub type StructBody  = struct { fields: []Field }
+pub type EnumBody    = struct { members: []str }            // member names, in order
+pub type VariantBody = struct { type_expr: TypeExpr }       // a union (A.8)
+type TypeBody    = variant StructBody | EnumBody | VariantBody
+pub type TypeDecl    = struct {                             // nominal (B.13)
     name:    str
     body:    TypeBody
-    is_exp:  bool                                       // marked `exp` → exported (.tkh)
+    vis:     Visibility                                 // private (default) / pub / exp
     has_doc: bool
     doc:     str                                        // the doc span (valid iff has_doc)
+    line:    u32                                        // the name's 1-based source line (W-loc-2 diagnostics)
+    col:     u32                                        // the name's 1-based source column (W-loc-2 diagnostics)
 }
-type UseDecl     = struct { path: Path; has_alias: bool; alias: str }   // use a::b [as c]
+pub type UseDecl     = struct { path: Path; has_alias: bool; alias: str }   // use a::b [as c]
 
-// --- R-main: a `.tks` file is a MAIN (executable entry) or a MODULE. The old `Item`
-//     (which mixed declarations and loose statements) is RETIRED. ---
-type Decl     = Function | TypeDecl                              // a top-level declaration (a module's content)
-type MainFile = struct { uses: []UseDecl; body: []Statement }    // main.tks: the `use` header + the VIRTUAL MAIN's body (statements only — no type/fn decls)
-type Module   = struct { uses: []UseDecl; decls: []Decl }        // a module: the `use` header + declarations (no loose statements)
-type File     = MainFile | Module                                // a `.tks` is exactly one; the file's role decides (main.tks ⇔ an executable `.tkp`)
+// --- R-main: a `.tks` file is a MAIN (executable entry) or a MODULE. ---
+pub type Decl     = variant Function | TypeDecl                             // a top-level declaration (a module's content)
+pub type MainFile = struct { uses: []UseDecl; body: []Statement }    // main.tks: the `use` header + the VIRTUAL MAIN's body (statements only — no type/fn decls)
+pub type Module   = struct { uses: []UseDecl; decls: []Decl }        // a module: the `use` header + declarations (no loose statements)
+type File     = variant MainFile | Module                               // a `.tks` is exactly one; the file's role decides (main.tks ⇔ an executable `.tkp`)
+
+// --- the FLATTENED item/program — the CHECKER's input view (mirror of the C tk_item /
+//     tk_program in ast.h). The parser produces File/Module/Decl; the DRIVER flattens
+//     them into this `Program` of `Item`s, which the checker (collect/typer) consumes.
+//     Each `Item` is a tagged payload (the C union) PLUS the namespace it came from (A3
+//     provenance for codegen name-mangling; resolution/typing IGNORE it). ---
+pub type ItemKind = variant UseDecl | Statement | Function | TypeDecl   // the C tk_item tag+union, as a Teko variant
+pub type Item     = struct { content: ItemKind; namespace: str; file: str }  // a flattened top-level item + its source namespace (A3) + source file (W-loc-2: assemble tags it so a flattened-program error resolves to file:line:col; empty on the single-file compile/run path)
+pub type Program  = struct { items: []Item }                            // the flat item list the checker consumes

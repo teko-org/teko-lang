@@ -1,9 +1,11 @@
 // src/parser/parse_pattern.tks   (namespace 'teko::parser')
 
+use teko::lexer
+
 // the BASE pattern: wildcard or a scalar literal. (Bind/field added in P3b; range/alt
 // wrap this in parse_pattern at P3c.)
 fn parse_pattern_primary(tokens: []lexer::Token, pos: u64) -> ParsedPattern | error {
-    if !has_token(tokens, pos) { return error { message = "expected a pattern" } }
+    if !has_token(tokens, pos) { return err_at(tokens, pos, "expected a pattern") }
     let k = kind_at(tokens, pos)
     if k == lexer::TokenKind::Underscore {
         return ParsedPattern { node = WildcardPattern { }, next = pos + 1 }
@@ -23,7 +25,7 @@ fn parse_pattern_primary(tokens: []lexer::Token, pos: u64) -> ParsedPattern | er
         let pp = match parse_path(tokens, pos) { ParsedPath as x => x; error as e => return e }
         if is_kind_at(tokens, pp.next, lexer::TokenKind::As) {
             if !is_kind_at(tokens, pp.next + 1, lexer::TokenKind::Ident) {
-                return error { message = "expected a name after `as` in a pattern" }
+                return err_at(tokens, pp.next + 1, "expected a name after `as` in a pattern")
             }
             return ParsedPattern { node = BindPattern { type_name = pp.node, has_binding = true, binding = tokens[pp.next + 1].text }, next = pp.next + 2 }
         }
@@ -33,7 +35,7 @@ fn parse_pattern_primary(tokens: []lexer::Token, pos: u64) -> ParsedPattern | er
         }
         return ParsedPattern { node = BindPattern { type_name = pp.node, has_binding = false, binding = "" }, next = pp.next }
     }
-    error { message = "expected a pattern" }
+    err_at(tokens, pos, "expected a pattern")
 }
 
 // a primary pattern, optionally a range `lo ..= hi` (inclusive; both bounds must be
@@ -43,9 +45,9 @@ fn parse_pattern_range(tokens: []lexer::Token, pos: u64) -> ParsedPattern | erro
     if !is_kind_at(tokens, lo_pat.next, lexer::TokenKind::DotDotEq) {
         return lo_pat
     }
-    let lo = match lo_pat.node { LiteralPattern as lp => lp.value; _ => return error { message = "a range bound must be a literal" } }
+    let lo = match lo_pat.node { LiteralPattern as lp => lp.value; _ => return err_at(tokens, pos, "a range bound must be a literal") }
     let hi_pat = match parse_pattern_primary(tokens, lo_pat.next + 1) { ParsedPattern as x => x; error as e => return e }
-    let hi = match hi_pat.node { LiteralPattern as lp => lp.value; _ => return error { message = "a range bound must be a literal" } }
+    let hi = match hi_pat.node { LiteralPattern as lp => lp.value; _ => return err_at(tokens, lo_pat.next + 1, "a range bound must be a literal") }
     ParsedPattern { node = RangePattern { lo = lo, hi = hi }, next = hi_pat.next }
 }
 
@@ -75,14 +77,14 @@ fn parse_field_names(tokens: []lexer::Token, pos: u64) -> ParsedNames | error {
         return ParsedNames { names = names, next = p + 1 }
     }
     loop {
-        if !is_kind_at(tokens, p, lexer::TokenKind::Ident) {
-            return error { message = "expected a field name in `Type { … }`" }
+        if !is_name_at(tokens, p) {
+            return err_at(tokens, p, "expected a field name in `Type { … }`")
         }
         names = teko::list::push(names, tokens[p].text)
         p = p + 1
         if is_kind_at(tokens, p, lexer::TokenKind::RBrace) { break }
         if !is_sep(tokens, p) {
-            return error { message = "expected ';', a newline, or '}' after a field name" }
+            return err_at(tokens, p, "expected ';', a newline, or '}' after a field name")
         }
         p = skip_seps(tokens, p)
         if is_kind_at(tokens, p, lexer::TokenKind::RBrace) { break }   // trailing separator

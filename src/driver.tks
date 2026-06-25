@@ -35,17 +35,18 @@ fn read_file(path: str) -> str | error {
 
 // =========================================================================
 // B1c — R-main reconciliation. Flatten the parsed file model into a flat `Item` list
-// (`Program`) that the checker consumes.
-//   * MainFile: each `use` → an Item::Use; each virtual-main statement → Item::Statement.
-//   * Module:   each `use` → an Item::Use; each decl → Item::Function | Item::TypeDecl.
+// (`Program`) that the checker consumes. Each `Item` wraps the payload in `content` (a
+// `parser::ItemKind` variant) + the source `namespace` (A3 provenance; "" pre-assemble).
+//   * MainFile: each `use` → Item{content=UseDecl}; each statement → Item{content=Statement}.
+//   * Module:   each `use` → Item{content=UseDecl}; each decl → Item{content=Function|TypeDecl}.
 // =========================================================================
 fn main_file_to_program(mf: parser::MainFile) -> parser::Program {
     mut items = teko::list::empty()
     for u in mf.uses {
-        items = teko::list::push(items, parser::Item::Use(u))
+        items = teko::list::push(items, parser::Item { content = u, namespace = "" })
     }
     for s in mf.body {
-        items = teko::list::push(items, parser::Item::Statement(s))
+        items = teko::list::push(items, parser::Item { content = s, namespace = "" })
     }
     parser::Program { items = items }
 }
@@ -53,12 +54,12 @@ fn main_file_to_program(mf: parser::MainFile) -> parser::Program {
 fn module_to_program(m: parser::Module) -> parser::Program {
     mut items = teko::list::empty()
     for u in m.uses {
-        items = teko::list::push(items, parser::Item::Use(u))
+        items = teko::list::push(items, parser::Item { content = u, namespace = "" })
     }
     for d in m.decls {
         items = match d {
-            parser::Decl::Function as f => teko::list::push(items, parser::Item::Function(f))
-            parser::Decl::Type as t     => teko::list::push(items, parser::Item::TypeDecl(t))
+            parser::Function as f => teko::list::push(items, parser::Item { content = f, namespace = "" })
+            parser::TypeDecl as t => teko::list::push(items, parser::Item { content = t, namespace = "" })
         }
     }
     parser::Program { items = items }
@@ -130,7 +131,7 @@ fn run_cc(cfile: str, binary: str) -> i32 {
 
 // Lower → write .c → invoke cc → report. Returns 0 on success.
 fn backend(path: str, prog: checker::TProgram) -> i32 {
-    let csrc = match codegen::emit_c(prog) { str as s => s; error as e => return fail(path, e.message) }
+    let csrc = match codegen::tk_emit_c(prog) { str as s => s; error as e => return fail(path, e.message) }
 
     let stem  = output_stem(path)
     let cfile = teko::str::concat(stem, ".c")
@@ -184,13 +185,13 @@ fn compile_project(dir: str) -> i32 {
     let m = match build::parse_manifest(mtext) { build::Manifest as x => x; error as e => return fail(dir, e.message) }
 
     // --- discover the source tree (A2) ---
-    mut files = match build::discover(m.name, m.source) { build::SourceFiles as f => f; error as e => return fail(dir, e.message) }
+    mut files = match build::discover(m.name, m.source) { []build::SourceFile as f => f; error as e => return fail(dir, e.message) }
 
     // The entry MainFile lives at the PROJECT ROOT, not under `source` (discover walks only
     // `source`). Inject it into the file set so the merged program has an entry, tagged with
     // the bare root namespace (provenance). Skip it if absent (a library).
     match read_file("main.tks") {
-        str => files = build::source_files_push(files, build::SourceFile { path = "main.tks", namespace = m.name })
+        str => files = teko::list::push(files, build::SourceFile { path = "main.tks", namespace = m.name })
         error => {}
     }
 
@@ -201,18 +202,26 @@ fn compile_project(dir: str) -> i32 {
     }
 
     // --- assemble: read+parse every file, MERGE into ONE program (A3) ---
-    let program = match build::assemble(files) { parser::Program as p => p; error as e => return fail(dir, e.message) }
+    // assemble bakes file:line:col into the message, so report with an empty path (W-loc).
+    let program = match build::assemble(files) { parser::Program as p => p; error as e => return fail("", e.message) }
 
     // --- check the WHOLE merged program (M.1 — whole program checked together) ---
-    match checker::type_program(program) { checker::TProgram => {}; error as e => return fail(dir, e.message) }
+    // the checker bakes file:line:col into the message (W-loc-2), so report with an empty path.
+    match checker::type_program(program) { checker::TProgram => {}; error as e => return fail("", e.message) }
 
     teko::io::print(teko::str::concat3("teko: ", dir, ": project assembled and type-checked OK"))
     0
 }
 
 // Report a stage failure to stderr in the driver's canonical form and return status 1.
+// An empty path means the message already carries its own file:line:col (e.g. a per-file
+// assemble diagnostic) — print it bare, don't prefix a redundant location.
 fn fail(path: str, message: str) -> i32 {
-    teko::io::eprint(teko::str::concat3("teko: ", path, teko::str::concat(": ", message)))
+    if path == "" {
+        teko::io::eprint(teko::str::concat("teko: ", message))
+    } else {
+        teko::io::eprint(teko::str::concat3("teko: ", path, teko::str::concat(": ", message)))
+    }
     1
 }
 

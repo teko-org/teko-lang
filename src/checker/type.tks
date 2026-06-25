@@ -1,26 +1,90 @@
 // src/checker/type.tks  (namespace 'teko::checker')
 
 // the injected scalar primitives (B.19) — distinct real types.
+// Native numeric set, Tier 1 (B.38 / TEKO_CORRECTION_PLAN §5): the unsigned and
+// signed integers now include the 128-bit widths, and the three IEEE floats are
+// native (no longer deferred). `dec`/`bigint` remain deferred (runtime-backed).
+// Placement note: the new prims are APPENDED within their family (U128 after U64,
+// I128 after I64, the floats F16/F32/F64 as a new contiguous block) and Bool stays
+// LAST — this perturbs no existing ordinal (U8..I64, then floats, then Bool); the
+// .tkb prim serialization (emit) is updated in the cascade, not here.
 type PrimKind = enum {
-    U8; U16; U32; U64
-    I8; I16; I32; I64
+    U8; U16; U32; U64; U128
+    I8; I16; I32; I64; I128
+    F16; F32; F64
     Bool
 }
 
+// --- PrimKind predicates / helpers (B.38) -----------------------------------
+// The cascade (checker / codegen / VM) depends on these; defined here so the
+// model is the single source of truth (kept aligned with type.h).
+
+// true for the IEEE float prims (F16/F32/F64).
+fn prim_is_float(k: PrimKind) -> bool {
+    match k { F16 => true; F32 => true; F64 => true; _ => false }
+}
+
+// true for the integer prims (U8..U128, I8..I128). NOT bool, NOT float.
+fn prim_is_int(k: PrimKind) -> bool {
+    match k {
+        U8 => true; U16 => true; U32 => true; U64 => true; U128 => true
+        I8 => true; I16 => true; I32 => true; I64 => true; I128 => true
+        _ => false
+    }
+}
+
+// true for the SIGNED integer prims (I8..I128). Floats are signed by nature, but
+// this predicate is about INTEGER signedness — call it only for ints (it returns
+// false for floats and bool, which carry no integer-signedness concept).
+fn prim_is_signed(k: PrimKind) -> bool {
+    match k {
+        I8 => true; I16 => true; I32 => true; I64 => true; I128 => true
+        _ => false
+    }
+}
+
+// bit width of a prim: ints 8/16/32/64/128, floats 16/32/64, bool 1.
+fn prim_width(k: PrimKind) -> u32 {
+    match k {
+        U8 => 8; U16 => 16; U32 => 32; U64 => 64; U128 => 128
+        I8 => 8; I16 => 16; I32 => 32; I64 => 64; I128 => 128
+        F16 => 16; F32 => 32; F64 => 64
+        Bool => 1
+    }
+}
+
+// Doctrinal correction (TEKO_CORRECTION_PLAN §3 [Z1]; Laws M.0/M.1/M.3):
+//   - `Unit` (the value-less struct) is EXCISED. "Returns no value" is `void`.
+//   - `void` is a RETURN-ONLY marker: legal ONLY as `Func.ret`. It is never a
+//     value, never a binding type, never a variant member. (Enforced in the
+//     checker, Z2a — the model only needs to REPRESENT it.)
+//   - `error` is the native lowercase type — it SUPERSEDES the old capitalized
+//     `Error` / `teko::Error`.
+//   - `Optional` (`T?`) is the built-in unary type-former for nullability
+//     (complete in the seed, Z3=a). A variant member may NOT be optional
+//     (enforced in the checker, Z2a).
+
 // the cases that carry data (Teko has no payload on a bare enum — a variant case
-// is a struct). Byte/Str/Error are markers (no payload).
-type Prim    = struct { kind: PrimKind }
-type Slice   = struct { element: Type }        // []T — recursive (B.8)
-type Named   = struct { name: str }            // a user type, equal by NAME (nominal)
-type Variant = struct { members: []Type }      // A | B | … (two or more)
-type Func    = struct { params: []Type; ret: Type }   // (params) -> ret
-type Byte    = struct { }                      // the octet type
-type Str     = struct { }                      // validated UTF-8
-type Error  = struct { }                      // the injected error
-type Unit   = struct { }                      // value-less (a block with no trailing expr)
+// is a struct). Byte/Str/error/void are markers (no payload).
+type Prim     = struct { kind: PrimKind }
+type Slice    = struct { element: Type }       // []T — recursive (B.8)
+type Optional = struct { inner: Type }         // T? — built-in nullable former (like Slice)
+type Named    = struct { name: str }           // a user type, equal by NAME (nominal)
+type Variant  = struct { members: []Type }     // A | B | … (two or more); members are COMPLETE types
+type Func     = struct { params: []Type; ret: Type }   // (params) -> ret  (ret may be void)
+type Byte     = struct { }                     // the octet type
+type Str      = struct { }                     // validated UTF-8
+type Error    = struct { }                     // the native `error` (lowercase; supersedes `Error`)
+type Void     = struct { }                     // return-only marker; legal ONLY as Func.ret
 
 // a semantic type. (Compiler-managed indirection for the recursive cases.)
-type Type = Prim | Byte | Str | Slice | Named | Variant | Func | Error | Unit
+type Type = variant Prim | Byte | Str | Slice | Optional | Named | Variant | Func | Error | Void
+
+// `void` recognition (M.3): the checker (Z2a) calls this to admit void in a
+// `Func.ret` position and to reject it everywhere else (value / binding / member).
+fn type_is_void(t: Type) -> bool {
+    match t { Void => true; _ => false }
+}
 
 // nominal type equality (B.13): structural over the shape, but Named is by name.
 fn type_eq(a: Type, b: Type) -> bool {
@@ -28,9 +92,11 @@ fn type_eq(a: Type, b: Type) -> bool {
         Prim as pa    => match b { Prim as pb    => pa.kind == pb.kind;             _ => false }
         Byte          => match b { Byte          => true;                           _ => false }
         Str           => match b { Str           => true;                           _ => false }
-        Error        => match b { Error        => true;                           _ => false }
-        Unit         => match b { Unit         => true;                           _ => false }
+        Error         => match b { Error         => true;                           _ => false }  // native `error`
+        Void          => match b { Void          => true;                           _ => false }  // return-only marker
         Slice as sa   => match b { Slice as sb   => type_eq(sa.element, sb.element); _ => false }
+        // T? == U? iff inners equal (built-in unary former, like Slice).
+        Optional as oa => match b { Optional as ob => type_eq(oa.inner, ob.inner);  _ => false }
         Named as na   => match b { Named as nb   => na.name == nb.name;             _ => false }
         Variant as va => match b { Variant as vb => types_eq(va.members, vb.members); _ => false }
         Func as fa    => match b {

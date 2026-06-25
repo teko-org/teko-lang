@@ -119,7 +119,10 @@ tk_program tk_module_to_program(tk_module m) {
 // B1d — the driver. Shared diagnostics helper.
 // =========================================================================
 static int fail(const char *path, const char *message) {
-    fprintf(stderr, "teko: %s: %s\n", path, message);
+    // An empty path means the message already carries its own file:line:col (e.g. a
+    // per-file assemble diagnostic) — print it bare, don't prefix a redundant location.
+    if (path == NULL || path[0] == '\0') fprintf(stderr, "teko: %s\n", message);
+    else fprintf(stderr, "teko: %s: %s\n", path, message);
     return 1;
 }
 
@@ -249,12 +252,12 @@ static int project_frontend(const char *dir, tk_tprogram *out, tk_manifest *mani
 
     // --- assemble: read+parse every file, MERGE into ONE program (A3) ---
     tk_program_result asm_r = tk_assemble(files);
-    if (!asm_r.ok) return fail(dir, asm_r.as.error.message);
+    if (!asm_r.ok) return fail("", asm_r.as.error.message);   // assemble bakes file:line:col into the message
     tk_program program = asm_r.as.value;
 
     // --- check the WHOLE merged program (M.1 — whole program checked together) ---
     tk_tprogram_result checked = tk_type_program(program);
-    if (!checked.ok) return fail(dir, checked.as.error.message);
+    if (!checked.ok) return fail("", checked.as.error.message);   // message already carries file:line:col (W-loc-2)
 
     printf("teko: %s: project assembled (%zu items) and type-checked OK\n",
            dir, program.len);

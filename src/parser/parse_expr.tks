@@ -1,8 +1,11 @@
 // src/parser/parse_expr.tks   (namespace 'teko::parser')
 
+use teko::lexer
+
 // `( e, e, … )` — `pos` is at `(`. Empty `()` allowed; comma-separated; no trailing
 // comma (strict — M.2). Returns the args and the position after `)`. Used by Call (here)
-// and by MethodCall (P2b).
+// and by MethodCall (P2b). Args parse with struct literals ALLOWED (W4a): a comma/paren
+// delimiter makes a trailing `{` unambiguous again, so each arg uses parse_expr.
 fn parse_call_args(tokens: []lexer::Token, pos: u64) -> ParsedArgs | error {
     mut p = pos + 1                                  // consume `(`
     mut args = teko::list::empty()
@@ -10,21 +13,124 @@ fn parse_call_args(tokens: []lexer::Token, pos: u64) -> ParsedArgs | error {
         return ParsedArgs { args = args, next = p + 1 }
     }
     loop {
-        let a = match parse_expr(tokens, p) { Parsed as x => x; error as e => return e }
+        let a = match parse_expr(tokens, p) { Parsed as x => x; error as e => return e }   // inside `(` … `)` — struct literals allowed
         args = teko::list::push(args, a.node)
         p = a.next
         if !is_kind_at(tokens, p, lexer::TokenKind::Comma) { break }
         p = p + 1                                    // consume `,`
     }
     if !is_kind_at(tokens, p, lexer::TokenKind::RParen) {
-        return error { message = "expected ')' to close the argument list" }
+        return err_at(tokens, p, "expected ')' to close the argument list")
     }
     ParsedArgs { args = args, next = p + 1 }
 }
 
+// `Name { field = value (, | ; | newline)* }` — a struct VALUE literal (W4a). `pos` is at `{`.
+// Field VALUES parse with struct allowed (they sit inside the literal's braces).
+fn parse_struct_lit(tokens: []lexer::Token, pos: u64, type_path: Path) -> Parsed | error {
+    mut p = skip_seps(tokens, pos + 1)             // consume `{`, skip leading separators
+    if is_kind_at(tokens, p, lexer::TokenKind::RBrace) {     // empty literal `Name { }`
+        return Parsed { node = StructLit { type_path = type_path, field_names = teko::list::empty(), field_vals = teko::list::empty() }, next = p + 1 }
+    }
+    mut names = teko::list::empty()
+    mut vals = teko::list::empty()
+    loop {
+        if !is_name_at(tokens, p) {
+            return err_at(tokens, p, "expected a field name in a struct literal")
+        }
+        let fname = tokens[p].text
+        if !is_kind_at(tokens, p + 1, lexer::TokenKind::Assign) {
+            return err_at(tokens, p + 1, "expected '=' after a field name in a struct literal")
+        }
+        let v = match parse_expr(tokens, p + 2) { Parsed as x => x; error as e => return e }
+        names = teko::list::push(names, fname)
+        vals = teko::list::push(vals, v.node)
+        p = v.next
+        if is_kind_at(tokens, p, lexer::TokenKind::Comma) {
+            p = skip_seps(tokens, p + 1)           // `,` (+ optional newlines)
+        } else if is_sep(tokens, p) {
+            p = skip_seps(tokens, p)               // `;` / newline
+        } else if is_kind_at(tokens, p, lexer::TokenKind::RBrace) {
+            break
+        } else {
+            return err_at(tokens, p, "expected ',', ';', a newline, or '}' after a struct-literal field")
+        }
+        if is_kind_at(tokens, p, lexer::TokenKind::RBrace) { break }   // trailing separator
+    }
+    Parsed { node = StructLit { type_path = type_path, field_names = names, field_vals = vals }, next = p + 1 }
+}
+
+// ---- string interpolation `$"…{expr}…"` (self-host parity) ----
+// decode `\` + one byte (the same escape set lexer::read_str decodes), appending the decoded
+// byte to `bytes`; returns the bytes + the index AFTER the escape. A malformed escape errors.
+type EscPiece = struct { bytes: []byte; next: u64 }
+fn piece_escape(raw: str, i: u64, bytes: []byte) -> EscPiece | error {
+    if i + 1 >= raw.len { return error { message = "unknown escape in interpolated string" } }
+    let v = match raw[i + 1] {
+        b'n'  => 0x0A
+        b't'  => 0x09
+        b'r'  => 0x0D
+        b'\\' => 0x5C
+        b'"'  => 0x22
+        b'\'' => 0x27
+        b'0'  => 0x00
+        _     => return error { message = "unknown escape in interpolated string" }
+    }
+    EscPiece { bytes = teko::list::push(bytes, v), next = i + 2 }
+}
+
+// Parse a `$"…"` Interp token's RAW inner text into the Interp node: literal pieces (escapes
+// decoded) interleaved with hole expressions. Each `{…}` hole is RE-LEXED (lexer::tokenize on
+// the hole's source substring) and parsed as a FULL expression. pieces.len == holes.len + 1.
+fn parse_interp(tokens: []lexer::Token, pos: u64) -> Parsed | error {
+    let raw = tokens[pos].text
+    mut pieces = teko::list::empty()
+    mut holes = teko::list::empty()
+    mut cur = teko::list::empty()           // the current literal piece's bytes
+    mut i: u64 = 0
+    loop {
+        if i >= raw.len { break }
+        let c = raw[i]
+        if c == b'\\' {
+            let ep = match piece_escape(raw, i, cur) { EscPiece as x => x; error as e => return e }
+            cur = ep.bytes
+            i = ep.next
+            continue
+        }
+        if c == b'{' {
+            pieces = teko::list::push(pieces, str(cur))   // close the piece BEFORE the hole
+            cur = teko::list::empty()
+            let hs = i + 1                                // scan to the matching `}` (depth)
+            mut depth: u64 = 1
+            mut j = hs
+            loop {
+                if j >= raw.len { break }
+                let hc = raw[j]
+                if hc == b'{' { depth = depth + 1 }
+                else if hc == b'}' { depth = depth - 1; if depth == 0 { break } }
+                j++
+            }
+            if j >= raw.len { return err_at(tokens, pos, "unterminated `{` in interpolated string") }
+            let hole_src = slice(raw, hs, j)
+            let toks = match lexer::tokenize(hole_src) { []lexer::Token as ts => ts; error as e => return e }
+            let he = match parse_expr(toks, 0) { Parsed as x => x; error as e => return e }
+            holes = teko::list::push(holes, he.node)
+            i = j + 1                                     // past the `}`
+            continue
+        }
+        if c == b'}' { return err_at(tokens, pos, "unexpected `}` in interpolated string") }
+        cur = teko::list::push(cur, c)
+        i++
+    }
+    pieces = teko::list::push(pieces, str(cur))           // the trailing literal piece
+    Parsed { node = Interp { pieces = pieces, holes = holes }, next = pos + 1 }
+}
+
 // the LEAF: a literal, a name/path/call, `( expr )`, or an `if`/`match` expression (B.20/B.15).
-fn parse_atom(tokens: []lexer::Token, pos: u64) -> Parsed | error {
-    if !has_token(tokens, pos) { return error { message = "expected an expression" } }
+// `allow_struct` (W4a): when true, a `Name { … }` after a path is a struct literal; when false
+// (if/match scrutinee), the `{` opens the block instead. Threaded down from parse_expr.
+fn parse_atom(tokens: []lexer::Token, pos: u64, allow_struct: bool) -> Parsed | error {
+    if !has_token(tokens, pos) { return err_at(tokens, pos, "expected an expression") }
     let k = kind_at(tokens, pos)
     if k == lexer::TokenKind::Number {
         return Parsed { node = Number { value = lit_int(tokens[pos].text) }, next = pos + 1 }
@@ -32,13 +138,25 @@ fn parse_atom(tokens: []lexer::Token, pos: u64) -> Parsed | error {
     if k == lexer::TokenKind::Str {
         return Parsed { node = StrLit { text = tokens[pos].text }, next = pos + 1 }
     }
+    if k == lexer::TokenKind::Interp {
+        return parse_interp(tokens, pos)   // $"…{expr}…" — split the raw text into pieces + hole exprs
+    }
     if k == lexer::TokenKind::Byte {
         return Parsed { node = ByteLit { value = lit_byte(tokens[pos].text) }, next = pos + 1 }
     }
+    if k == lexer::TokenKind::True {
+        return Parsed { node = BoolLit { value = true }, next = pos + 1 }
+    }
+    if k == lexer::TokenKind::False {
+        return Parsed { node = BoolLit { value = false }, next = pos + 1 }
+    }
+    if k == lexer::TokenKind::Null {
+        return Parsed { node = NullLit { }, next = pos + 1 }
+    }
     if k == lexer::TokenKind::LParen {
-        let inner = match parse_expr(tokens, pos + 1) { Parsed as x => x; error as e => return e }
+        let inner = match parse_expr(tokens, pos + 1) { Parsed as x => x; error as e => return e }   // inside `(` … `)` — struct literals allowed
         if !is_kind_at(tokens, inner.next, lexer::TokenKind::RParen) {
-            return error { message = "expected ')' to close a parenthesized expression" }
+            return err_at(tokens, inner.next, "expected ')' to close a parenthesized expression")
         }
         return Parsed { node = inner.node, next = inner.next + 1 }    // grouping is transparent
     }
@@ -54,30 +172,75 @@ fn parse_atom(tokens: []lexer::Token, pos: u64) -> Parsed | error {
             let ca = match parse_call_args(tokens, pp.next) { ParsedArgs as x => x; error as e => return e }
             return Parsed { node = Call { callee = pp.node, args = ca.args }, next = ca.next }
         }
+        // W4a — a struct literal `Name { … }` (only when allowed: not in an if/match scrutinee).
+        if allow_struct && is_kind_at(tokens, pp.next, lexer::TokenKind::LBrace) {
+            return parse_struct_lit(tokens, pp.next, pp.node)
+        }
         if pp.node.segments.len == 1 {
             return Parsed { node = Var { name = pp.node.segments[0].name }, next = pp.next }
         }
         return Parsed { node = PathExpr { path = pp.node }, next = pp.next }
     }
-    error { message = "expected an expression" }
+    err_at(tokens, pos, "expected an expression")
 }
 
-// THE EXPRESSION ENTRY — descends the whole ladder (P2 complete: or → and → comparison
-// → additive → multiplicative → shift → cast → unary → postfix → atom).
+// THE EXPRESSION ENTRY — descends the whole ladder (P2 complete: coalesce → or → and →
+// comparison → additive → multiplicative → shift → cast → unary → postfix → atom). The whole
+// ladder threads `allow_struct` (W4a): the default entry allows struct literals.
 fn parse_expr(tokens: []lexer::Token, pos: u64) -> Parsed | error {
-    parse_or(tokens, pos)
+    parse_coalesce(tokens, pos, true)            // default: struct literals allowed
+}
+
+// the scrutinee form (B.20/B.15): a trailing `{` opens the if/match block, NOT a struct
+// literal — so struct literals are suppressed at the top level of the condition/subject.
+fn parse_expr_no_struct(tokens: []lexer::Token, pos: u64) -> Parsed | error {
+    parse_coalesce(tokens, pos, false)
+}
+
+// level 9 (the loosest) — `??` Elvis / null-coalescing (REBOOT_PLAN §203). Below `||`.
+// Right-associative: `a ?? b ?? c` is `a ?? (b ?? c)`.
+fn parse_coalesce(tokens: []lexer::Token, pos: u64, allow_struct: bool) -> Parsed | error {
+    let first = match parse_or(tokens, pos, allow_struct) { Parsed as x => x; error as e => return e }
+    if is_kind_at(tokens, first.next, lexer::TokenKind::QQ) {
+        let rhs = match parse_coalesce(tokens, skip_seps(tokens, first.next + 1), allow_struct) { Parsed as x => x; error as e => return e }   // skip newlines after a trailing infix operator (line continuation)   // right-assoc → recurse
+        return Parsed { node = Coalesce { left = first.node, right = rhs.node }, next = rhs.next }
+    }
+    Parsed { node = first.node, next = first.next }
 }
 
 // postfix: a chain of `.field` and `.method(args)` after an atom (tightest after the
 // leaf). Left-assoc. `a.b`, `a.b().c`, `f(x).g`.
-fn parse_postfix(tokens: []lexer::Token, pos: u64) -> Parsed | error {
-    let prim = match parse_atom(tokens, pos) { Parsed as x => x; error as e => return e }
+fn parse_postfix(tokens: []lexer::Token, pos: u64, allow_struct: bool) -> Parsed | error {
+    let prim = match parse_atom(tokens, pos, allow_struct) { Parsed as x => x; error as e => return e }
     mut node = prim.node
     mut p = prim.next
     loop {
+        // `[index]` subscript (W5-idx). The index is a FULL expression (struct literals
+        // allowed inside the brackets — a delimiter makes the `{` unambiguous). Wraps the
+        // current node as the receiver and continues the loop, so `a[i][j]`, `a[i].f`,
+        // `a.f[i]` all chain. str→byte / []T→T (typed in the checker).
+        if is_kind_at(tokens, p, lexer::TokenKind::LBracket) {
+            let idx = match parse_expr(tokens, p + 1) { Parsed as x => x; error as e => return e }   // inside `[` … `]` — struct literals allowed
+            if !is_kind_at(tokens, idx.next, lexer::TokenKind::RBracket) {
+                return err_at(tokens, idx.next, "expected ']' to close a subscript index")
+            }
+            node = Index { receiver = node, index = idx.node }
+            p = idx.next + 1
+            continue
+        }
+        // `?.` safe field access (null-propagating — REBOOT_PLAN §203). Field-only.
+        if is_kind_at(tokens, p, lexer::TokenKind::QDot) {
+            if !is_name_at(tokens, p + 1) {
+                return err_at(tokens, p + 1, "expected a field name after '?.'")
+            }
+            let name = tokens[p + 1].text
+            node = SafeFieldAccess { receiver = node, field = name }
+            p = p + 2
+            continue
+        }
         if !is_kind_at(tokens, p, lexer::TokenKind::Dot) { break }
-        if !is_kind_at(tokens, p + 1, lexer::TokenKind::Ident) {
-            return error { message = "expected a field or method name after '.'" }
+        if !is_name_at(tokens, p + 1) {
+            return err_at(tokens, p + 1, "expected a field or method name after '.'")
         }
         let name = tokens[p + 1].text
         if is_kind_at(tokens, p + 2, lexer::TokenKind::LParen) {
@@ -93,19 +256,19 @@ fn parse_postfix(tokens: []lexer::Token, pos: u64) -> Parsed | error {
 }
 
 // prefix unary `- ~ !` (right-assoc: `!!a` is `!(!a)`). Below `to`.
-fn parse_unary(tokens: []lexer::Token, pos: u64) -> Parsed | error {
+fn parse_unary(tokens: []lexer::Token, pos: u64, allow_struct: bool) -> Parsed | error {
     if is_unary(tokens, pos) {
         let op = kind_at(tokens, pos)
-        let operand = match parse_unary(tokens, pos + 1) { Parsed as x => x; error as e => return e }
+        let operand = match parse_unary(tokens, pos + 1, allow_struct) { Parsed as x => x; error as e => return e }
         return Parsed { node = Unary { op = op, operand = operand.node }, next = operand.next }
     }
-    parse_postfix(tokens, pos)
+    parse_postfix(tokens, pos, allow_struct)
 }
 
 // cast `x to T` (F2) — below unary, above all binary. Left-assoc. The target is a
 // type-PRIMARY (parse_primary, P1): `x to u32`, `x to []u8`, `x to lexer::Token`.
-fn parse_cast(tokens: []lexer::Token, pos: u64) -> Parsed | error {
-    let first = match parse_unary(tokens, pos) { Parsed as x => x; error as e => return e }
+fn parse_cast(tokens: []lexer::Token, pos: u64, allow_struct: bool) -> Parsed | error {
+    let first = match parse_unary(tokens, pos, allow_struct) { Parsed as x => x; error as e => return e }
     mut node = first.node
     mut p = first.next
     loop {
@@ -118,14 +281,14 @@ fn parse_cast(tokens: []lexer::Token, pos: u64) -> Parsed | error {
 }
 
 // level 3 — shift `<< >>` (left-assoc; the tightest binary, just above cast).
-fn parse_shift(tokens: []lexer::Token, pos: u64) -> Parsed | error {
-    let first = match parse_cast(tokens, pos) { Parsed as x => x; error as e => return e }
+fn parse_shift(tokens: []lexer::Token, pos: u64, allow_struct: bool) -> Parsed | error {
+    let first = match parse_cast(tokens, pos, allow_struct) { Parsed as x => x; error as e => return e }
     mut node = first.node
     mut p = first.next
     loop {
         if !is_shift(tokens, p) { break }
         let op = kind_at(tokens, p)
-        let rhs = match parse_cast(tokens, p + 1) { Parsed as x => x; error as e => return e }
+        let rhs = match parse_cast(tokens, skip_seps(tokens, p + 1), allow_struct) { Parsed as x => x; error as e => return e }   // skip newlines after a trailing infix operator (line continuation)
         node = Binary { op = op, left = node, right = rhs.node }
         p = rhs.next
     }
@@ -133,14 +296,14 @@ fn parse_shift(tokens: []lexer::Token, pos: u64) -> Parsed | error {
 }
 
 // level 4 — multiplicative `* / %` and bitwise `&` (left-assoc).
-fn parse_multiplicative(tokens: []lexer::Token, pos: u64) -> Parsed | error {
-    let first = match parse_shift(tokens, pos) { Parsed as x => x; error as e => return e }
+fn parse_multiplicative(tokens: []lexer::Token, pos: u64, allow_struct: bool) -> Parsed | error {
+    let first = match parse_shift(tokens, pos, allow_struct) { Parsed as x => x; error as e => return e }
     mut node = first.node
     mut p = first.next
     loop {
         if !is_multiplicative(tokens, p) { break }
         let op = kind_at(tokens, p)
-        let rhs = match parse_shift(tokens, p + 1) { Parsed as x => x; error as e => return e }
+        let rhs = match parse_shift(tokens, skip_seps(tokens, p + 1), allow_struct) { Parsed as x => x; error as e => return e }   // skip newlines after a trailing infix operator (line continuation)
         node = Binary { op = op, left = node, right = rhs.node }
         p = rhs.next
     }
@@ -148,14 +311,14 @@ fn parse_multiplicative(tokens: []lexer::Token, pos: u64) -> Parsed | error {
 }
 
 // level 5 — additive `+ -` and bitwise `| ^` (left-assoc).
-fn parse_additive(tokens: []lexer::Token, pos: u64) -> Parsed | error {
-    let first = match parse_multiplicative(tokens, pos) { Parsed as x => x; error as e => return e }
+fn parse_additive(tokens: []lexer::Token, pos: u64, allow_struct: bool) -> Parsed | error {
+    let first = match parse_multiplicative(tokens, pos, allow_struct) { Parsed as x => x; error as e => return e }
     mut node = first.node
     mut p = first.next
     loop {
         if !is_additive(tokens, p) { break }
         let op = kind_at(tokens, p)
-        let rhs = match parse_multiplicative(tokens, p + 1) { Parsed as x => x; error as e => return e }
+        let rhs = match parse_multiplicative(tokens, skip_seps(tokens, p + 1), allow_struct) { Parsed as x => x; error as e => return e }   // skip newlines after a trailing infix operator (line continuation)
         node = Binary { op = op, left = node, right = rhs.node }
         p = rhs.next
     }
@@ -164,14 +327,14 @@ fn parse_additive(tokens: []lexer::Token, pos: u64) -> Parsed | error {
 
 // level 6 — comparison. A CHAIN `a < b < c` is kept as written (M.3): a first + a list
 // of (op, operand) terms; no term → the bare first.
-fn parse_comparison(tokens: []lexer::Token, pos: u64) -> Parsed | error {
-    let first = match parse_additive(tokens, pos) { Parsed as x => x; error as e => return e }
+fn parse_comparison(tokens: []lexer::Token, pos: u64, allow_struct: bool) -> Parsed | error {
+    let first = match parse_additive(tokens, pos, allow_struct) { Parsed as x => x; error as e => return e }
     mut terms = teko::list::empty()
     mut p = first.next
     loop {
         if !is_comparison(tokens, p) { break }
         let op = kind_at(tokens, p)
-        let rhs = match parse_additive(tokens, p + 1) { Parsed as x => x; error as e => return e }
+        let rhs = match parse_additive(tokens, skip_seps(tokens, p + 1), allow_struct) { Parsed as x => x; error as e => return e }   // skip newlines after a trailing infix operator (line continuation)
         terms = teko::list::push(terms, CmpTerm { op = op, operand = rhs.node })
         p = rhs.next
     }
@@ -180,13 +343,13 @@ fn parse_comparison(tokens: []lexer::Token, pos: u64) -> Parsed | error {
 }
 
 // level 7 — logical AND `&&` (left-assoc).
-fn parse_and(tokens: []lexer::Token, pos: u64) -> Parsed | error {
-    let first = match parse_comparison(tokens, pos) { Parsed as x => x; error as e => return e }
+fn parse_and(tokens: []lexer::Token, pos: u64, allow_struct: bool) -> Parsed | error {
+    let first = match parse_comparison(tokens, pos, allow_struct) { Parsed as x => x; error as e => return e }
     mut node = first.node
     mut p = first.next
     loop {
         if !is_andand(tokens, p) { break }
-        let rhs = match parse_comparison(tokens, p + 1) { Parsed as x => x; error as e => return e }
+        let rhs = match parse_comparison(tokens, skip_seps(tokens, p + 1), allow_struct) { Parsed as x => x; error as e => return e }   // skip newlines after a trailing infix operator (line continuation)
         node = Binary { op = lexer::TokenKind::AndAnd, left = node, right = rhs.node }
         p = rhs.next
     }
@@ -194,13 +357,13 @@ fn parse_and(tokens: []lexer::Token, pos: u64) -> Parsed | error {
 }
 
 // level 8 — logical OR `||` (left-assoc, the loosest; the ladder's top).
-fn parse_or(tokens: []lexer::Token, pos: u64) -> Parsed | error {
-    let first = match parse_and(tokens, pos) { Parsed as x => x; error as e => return e }
+fn parse_or(tokens: []lexer::Token, pos: u64, allow_struct: bool) -> Parsed | error {
+    let first = match parse_and(tokens, pos, allow_struct) { Parsed as x => x; error as e => return e }
     mut node = first.node
     mut p = first.next
     loop {
         if !is_oror(tokens, p) { break }
-        let rhs = match parse_and(tokens, p + 1) { Parsed as x => x; error as e => return e }
+        let rhs = match parse_and(tokens, skip_seps(tokens, p + 1), allow_struct) { Parsed as x => x; error as e => return e }   // skip newlines after a trailing infix operator (line continuation)
         node = Binary { op = lexer::TokenKind::OrOr, left = node, right = rhs.node }
         p = rhs.next
     }

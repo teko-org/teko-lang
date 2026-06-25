@@ -6,7 +6,10 @@ static tk_type_table collect_types(tk_item *items, size_t n) {
     for (size_t i = 0; i < n; i += 1) {
         if (items[i].tag == TK_ITEM_TYPE_DECL) {
             tk_type_decl td = items[i].as.type_decl;
-            table = tk_type_table_push(table, (tk_type_reg){ .name = td.name, .decl = td });
+            // tag the reg with the declaring namespace (A3 provenance on the item) + the
+            // decl's visibility — the inputs to W-vis-enforce's module-system pass.
+            table = tk_type_table_push(table, (tk_type_reg){
+                .name = td.name, .namespace = items[i].namespace, .vis = td.vis, .decl = td });
         }
     }
     return table;

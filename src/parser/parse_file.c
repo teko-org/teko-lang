@@ -17,7 +17,7 @@ static tk_parsed_use_result parse_use(const tk_token *t, size_t n, size_t pos) {
     bool has_alias = false; tk_str alias = (tk_str){0}; size_t p = pp.as.value.next;
     if (tk_is_kind_at(t, n, p, TK_TOKEN_AS)) {
         if (!tk_is_kind_at(t, n, p + 1, TK_TOKEN_IDENT)) {
-            return (tk_parsed_use_result){ .ok = false, .as.error = tk_error_make("expected a name after `as` in a `use`") };
+            return (tk_parsed_use_result){ .ok = false, .as.error = tk_err_at(t, n, p + 1, "expected a name after `as` in a `use`") };
         }
         has_alias = true; alias = t[p + 1].text; p += 2;
     }
@@ -35,7 +35,7 @@ tk_parsed_uses_result parse_use_header(const tk_token *t, size_t n, size_t pos) 
         p = u.as.value.next;
         if (!tk_has_token(t, n, p)) { break; }
         if (!tk_is_sep(t, n, p)) {
-            return (tk_parsed_uses_result){ .ok = false, .as.error = tk_error_make("expected ';' or a newline after a `use`") };
+            return (tk_parsed_uses_result){ .ok = false, .as.error = tk_err_at(t, n, p, "expected ';' or a newline after a `use`") };
         }
         p = tk_skip_seps(t, n, p);
     }
@@ -50,7 +50,7 @@ tk_parsed_main_file_result tk_parse_main_file(const tk_token *t, size_t n, size_
     for (;;) {
         if (!tk_has_token(t, n, p)) { break; }
         if (is_decl_start(t, n, p)) {
-            return (tk_parsed_main_file_result){ .ok = false, .as.error = tk_error_make("main.tks is a virtual main: it may not declare types or functions (only `use` + statements)") };
+            return (tk_parsed_main_file_result){ .ok = false, .as.error = tk_err_at(t, n, p, "main.tks is a virtual main: it may not declare types or functions (only `use` + statements)") };
         }
         tk_parsed_stmt_result s = tk_parse_statement(t, n, p);
         if (!s.ok) { return (tk_parsed_main_file_result){ .ok = false, .as.error = s.as.error }; }
@@ -58,7 +58,7 @@ tk_parsed_main_file_result tk_parse_main_file(const tk_token *t, size_t n, size_
         p = s.as.value.next;
         if (!tk_has_token(t, n, p)) { break; }
         if (!tk_is_sep(t, n, p)) {
-            return (tk_parsed_main_file_result){ .ok = false, .as.error = tk_error_make("expected ';' or a newline after a statement") };
+            return (tk_parsed_main_file_result){ .ok = false, .as.error = tk_err_at(t, n, p, "expected ';' or a newline after a statement") };
         }
         p = tk_skip_seps(t, n, p);
     }

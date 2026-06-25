@@ -50,7 +50,7 @@ tk_env_result tk_check_pattern(tk_pattern p, tk_type subject, tk_env env, tk_typ
             if (!hi.ok) return efail(hi.as.error);
             if (!tk_type_eq(&lo.as.value.type, &subject)) return efail(tk_error_make("range lower bound does not match the subject type"));
             if (!tk_type_eq(&hi.as.value.type, &subject)) return efail(tk_error_make("range upper bound does not match the subject type"));
-            if (!(subject.tag == TK_TYPE_PRIM && subject.as.prim != TK_PRIM_BOOL)) return efail(tk_error_make("range pattern requires an integer subject"));
+            if (!(subject.tag == TK_TYPE_PRIM && tk_prim_is_int(subject.as.prim))) return efail(tk_error_make("range pattern requires an integer subject (B.38 — not a float)"));
             return eok(env);   // binds nothing
         }
         case TK_PAT_ALT: {
@@ -100,11 +100,12 @@ static bool some_arm_names(tk_arm *arms, size_t n, tk_str name) {
         if (!arms[i].has_when && pattern_names(arms[i].pattern, name)) return true;
     return false;
 }
-bool tk_exhaustive(tk_arm *arms, size_t n, tk_type subject) {
+bool tk_exhaustive(tk_arm *arms, size_t n, tk_type subject, tk_type_table table) {
     if (has_wildcard(arms, n)) return true;
-    if (subject.tag != TK_TYPE_VARIANT) return false;
-    for (size_t i = 0; i < subject.as.variant.len; i += 1) {
-        tk_type mem = subject.as.variant.members[i];
+    tk_type sv = tk_expand_variant(subject, table);   // a NAMED variant → its TK_TYPE_VARIANT cases (B.14/B.15)
+    if (sv.tag != TK_TYPE_VARIANT) return false;
+    for (size_t i = 0; i < sv.as.variant.len; i += 1) {
+        tk_type mem = sv.as.variant.members[i];
         if (mem.tag != TK_TYPE_NAMED) return false;
         if (!some_arm_names(arms, n, mem.as.named.name)) return false;
     }

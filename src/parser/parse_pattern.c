@@ -9,7 +9,7 @@
 
 static tk_parsed_pattern_result parse_pattern_primary(const tk_token *t, size_t n, size_t pos) {
     if (!tk_has_token(t, n, pos)) {
-        return (tk_parsed_pattern_result){ .ok = false, .as.error = tk_error_make("expected a pattern") };
+        return (tk_parsed_pattern_result){ .ok = false, .as.error = tk_err_at(t, n, pos, "expected a pattern") };
     }
     tk_token_kind k = t[pos].kind;
     if (k == TK_TOKEN_UNDERSCORE) {
@@ -17,7 +17,13 @@ static tk_parsed_pattern_result parse_pattern_primary(const tk_token *t, size_t 
         return (tk_parsed_pattern_result){ .ok = true, .as.value = { .node = p, .next = pos + 1 } };
     }
     if (k == TK_TOKEN_NUMBER) {
-        tk_expr v = { .tag = TK_EXPR_NUMBER, .as.number = { .value = tk_lit_int(t[pos].text) } };
+        tk_str txt = t[pos].text;
+        tk_expr v;
+        if (tk_lit_is_float(txt)) {
+            v = (tk_expr){ .tag = TK_EXPR_NUMBER, .as.number = { .is_float = true, .fval = tk_lit_float(txt) } };
+        } else {
+            v = (tk_expr){ .tag = TK_EXPR_NUMBER, .as.number = { .is_float = false, .value = tk_lit_int(txt) } };
+        }
         tk_pattern p = { .tag = TK_PAT_LITERAL, .as.literal = { .value = v } };
         return (tk_parsed_pattern_result){ .ok = true, .as.value = { .node = p, .next = pos + 1 } };
     }
@@ -37,7 +43,7 @@ static tk_parsed_pattern_result parse_pattern_primary(const tk_token *t, size_t 
         size_t after = pp.as.value.next;
         if (tk_is_kind_at(t, n, after, TK_TOKEN_AS)) {
             if (!tk_is_kind_at(t, n, after + 1, TK_TOKEN_IDENT)) {
-                return (tk_parsed_pattern_result){ .ok = false, .as.error = tk_error_make("expected a name after `as` in a pattern") };
+                return (tk_parsed_pattern_result){ .ok = false, .as.error = tk_err_at(t, n, after + 1, "expected a name after `as` in a pattern") };
             }
             tk_pattern p = { .tag = TK_PAT_BIND, .as.bind = { .type_name = pp.as.value.node, .has_binding = true, .binding = t[after + 1].text } };
             return (tk_parsed_pattern_result){ .ok = true, .as.value = { .node = p, .next = after + 2 } };
@@ -51,7 +57,7 @@ static tk_parsed_pattern_result parse_pattern_primary(const tk_token *t, size_t 
         tk_pattern p = { .tag = TK_PAT_BIND, .as.bind = { .type_name = pp.as.value.node, .has_binding = false, .binding = (tk_str){0} } };
         return (tk_parsed_pattern_result){ .ok = true, .as.value = { .node = p, .next = after } };
     }
-    return (tk_parsed_pattern_result){ .ok = false, .as.error = tk_error_make("expected a pattern") };
+    return (tk_parsed_pattern_result){ .ok = false, .as.error = tk_err_at(t, n, pos, "expected a pattern") };
 }
 
 static tk_parsed_pattern_result parse_pattern_range(const tk_token *t, size_t n, size_t pos) {
@@ -59,13 +65,13 @@ static tk_parsed_pattern_result parse_pattern_range(const tk_token *t, size_t n,
     if (!lo.ok) { return lo; }
     if (!tk_is_kind_at(t, n, lo.as.value.next, TK_TOKEN_DOTDOTEQ)) { return lo; }
     if (lo.as.value.node.tag != TK_PAT_LITERAL) {
-        return (tk_parsed_pattern_result){ .ok = false, .as.error = tk_error_make("a range bound must be a literal") };
+        return (tk_parsed_pattern_result){ .ok = false, .as.error = tk_err_at(t, n, pos, "a range bound must be a literal") };
     }
     tk_expr lo_e = lo.as.value.node.as.literal.value;
     tk_parsed_pattern_result hi = parse_pattern_primary(t, n, lo.as.value.next + 1);
     if (!hi.ok) { return hi; }
     if (hi.as.value.node.tag != TK_PAT_LITERAL) {
-        return (tk_parsed_pattern_result){ .ok = false, .as.error = tk_error_make("a range bound must be a literal") };
+        return (tk_parsed_pattern_result){ .ok = false, .as.error = tk_err_at(t, n, lo.as.value.next + 1, "a range bound must be a literal") };
     }
     tk_pattern p = { .tag = TK_PAT_RANGE, .as.range = { .lo = lo_e, .hi = hi.as.value.node.as.literal.value } };
     return (tk_parsed_pattern_result){ .ok = true, .as.value = { .node = p, .next = hi.as.value.next } };
@@ -98,14 +104,14 @@ tk_parsed_names_result parse_field_names(const tk_token *t, size_t n, size_t pos
         return (tk_parsed_names_result){ .ok = true, .as.value = { .names = names, .n_names = 0, .next = p + 1 } };
     }
     for (;;) {
-        if (!tk_is_kind_at(t, n, p, TK_TOKEN_IDENT)) {
-            return (tk_parsed_names_result){ .ok = false, .as.error = tk_error_make("expected a field name in `Type { … }`") };
+        if (!tk_is_name_at(t, n, p)) {
+            return (tk_parsed_names_result){ .ok = false, .as.error = tk_err_at(t, n, p, "expected a field name in `Type { … }`") };
         }
         tk_strvec_push(&names, &nn, t[p].text);
         p += 1;
         if (tk_is_kind_at(t, n, p, TK_TOKEN_RBRACE)) { break; }
         if (!tk_is_sep(t, n, p)) {
-            return (tk_parsed_names_result){ .ok = false, .as.error = tk_error_make("expected ';', a newline, or '}' after a field name") };
+            return (tk_parsed_names_result){ .ok = false, .as.error = tk_err_at(t, n, p, "expected ';', a newline, or '}' after a field name") };
         }
         p = tk_skip_seps(t, n, p);
         if (tk_is_kind_at(t, n, p, TK_TOKEN_RBRACE)) { break; }   // trailing separator

@@ -25,8 +25,9 @@
 #include "../parser/parser.h" // tk_parse_main_file, tk_parse_module
 #include "../parser/result.h" // tk_parsed_main_file_result, tk_parsed_module_result
 
-#include <string.h>           // strrchr, strcmp, memcpy
+#include <string.h>           // strrchr, strcmp, memcpy, strlen
 #include <stdlib.h>           // malloc, realloc, free, abort
+#include <stdio.h>            // snprintf (file-prefixed diagnostics)
 
 // --- a local grow-append over tk_item (the AST header offers no tk_items_push; the
 //     driver uses the same local pattern — driver.c::items_push). push CONSUMES/RETURNS.
@@ -47,6 +48,15 @@ static items_buf items_push(items_buf b, tk_item it) {
 
 static tk_program_result fail(const char *msg) {
     return (tk_program_result){ .ok = false, .as.error = tk_error_make(msg) };
+}
+
+// prefix a per-file diagnostic with its source-file path → "path:msg" (M.3 — name WHERE the
+// error is). For a located error msg is "line:col: text", yielding "path:line:col: text".
+static const char *diag_file(tk_str path, const char *msg) {
+    size_t len = path.len + strlen(msg) + 2;
+    char *buf = malloc(len); if (!buf) abort();
+    snprintf(buf, len, "%.*s:%s", (int)path.len, (const char *)path.ptr, msg);
+    return buf;
 }
 
 // Is this file the project ENTRY point? (path basename == "main.tks".) The SourceFile
@@ -97,7 +107,7 @@ tk_program_result tk_assemble(tk_source_files files) {
 
         // --- lex ---
         tk_tokens_result toks = tk_tokenize(src.as.value);
-        if (!toks.ok) { free(merged.ptr); return fail(toks.as.error.message); }
+        if (!toks.ok) { free(merged.ptr); return fail(diag_file(sf.path, toks.as.error.message)); }
         const tk_token *t = toks.as.value.ptr;
         size_t n = toks.as.value.len;
 
@@ -105,11 +115,11 @@ tk_program_result tk_assemble(tk_source_files files) {
         tk_program one;
         if (is_main_file(sf.path)) {
             tk_parsed_main_file_result pr = tk_parse_main_file(t, n, 0);
-            if (!pr.ok) { free(merged.ptr); return fail(pr.as.error.message); }
+            if (!pr.ok) { free(merged.ptr); return fail(diag_file(sf.path, pr.as.error.message)); }
             one = tk_main_file_to_program(pr.as.value.node);
         } else {
             tk_parsed_module_result pr = tk_parse_module(t, n, 0);
-            if (!pr.ok) { free(merged.ptr); return fail(pr.as.error.message); }
+            if (!pr.ok) { free(merged.ptr); return fail(diag_file(sf.path, pr.as.error.message)); }
             one = tk_module_to_program(pr.as.value.node);
         }
 
@@ -117,6 +127,7 @@ tk_program_result tk_assemble(tk_source_files files) {
         for (size_t k = 0; k < one.len; k += 1) {
             tk_item it = one.items[k];
             it.namespace = sf.namespace;
+            it.file      = sf.path;        // W-loc-2: tag the source file for checker diagnostics
             merged = items_push(merged, it);
         }
         free(one.items);   // the per-file program's backing array is copied out

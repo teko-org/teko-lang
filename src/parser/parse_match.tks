@@ -2,6 +2,8 @@
 
 // the arm list of a `match`: `{ arm; arm; … }` — `;`/newline separates; ≥1 arm (a match
 // needs a branch — M.1). `pos` is at `{`.
+use teko::lexer
+
 fn parse_arms(tokens: []lexer::Token, pos: u64) -> ParsedArms | error {
     mut p = skip_seps(tokens, pos + 1)   // consume `{`, skip leading separators
     mut arms = teko::list::empty()
@@ -12,21 +14,21 @@ fn parse_arms(tokens: []lexer::Token, pos: u64) -> ParsedArms | error {
         p = a.next
         if is_kind_at(tokens, p, lexer::TokenKind::RBrace) { break }
         if !is_sep(tokens, p) {
-            return error { message = "expected ';', a newline, or '}' after a match arm" }
+            return err_at(tokens, p, "expected ';', a newline, or '}' after a match arm")
         }
         p = skip_seps(tokens, p)
     }
     if arms.len == 0 {
-        return error { message = "a `match` needs at least one arm" }
+        return err_at(tokens, p, "a `match` needs at least one arm")
     }
     ParsedArms { arms = arms, next = p + 1 }
 }
 
 // `match subject { arms }` — match is an EXPRESSION (B.15). `pos` is at `match`.
 fn parse_match(tokens: []lexer::Token, pos: u64) -> Parsed | error {
-    let subj = match parse_expr(tokens, pos + 1) { Parsed as x => x; error as e => return e }
+    let subj = match parse_expr_no_struct(tokens, pos + 1) { Parsed as x => x; error as e => return e }   // trailing `{` opens the arms, not a struct literal (W4a)
     if !is_kind_at(tokens, subj.next, lexer::TokenKind::LBrace) {
-        return error { message = "expected '{' after the `match` subject" }
+        return err_at(tokens, subj.next, "expected '{' after the `match` subject")
     }
     let arms = match parse_arms(tokens, subj.next) { ParsedArms as x => x; error as e => return e }
     Parsed { node = MatchExpr { subject = subj.node, arms = arms.arms }, next = arms.next }

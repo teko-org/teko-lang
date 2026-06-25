@@ -2,26 +2,48 @@
 
 // `if cond { then } [else { else } | else if …]` — if/else is an EXPRESSION (B.20).
 // `pos` is at `if`. `else if` is the else-block holding the nested if as one statement.
+//
+// A branch body is EITHER a braced block `{ … }` OR a single bracketless statement that
+// begins on the next line (separator-gated): `if cond <newline> <one stmt>` and
+// `else <newline> <one stmt>`. The bracketless form lowers to a 1-element block, so the
+// checker / VM / codegen treat it exactly like a braced block.
+
+use teko::lexer
+
+// A branch body beginning at `pos`: `{ … }`, or one bracketless statement on the next
+// line. `ctx` is the error shown when `pos` is neither a brace nor a separator.
+fn parse_if_body(tokens: []lexer::Token, pos: u64, ctx: str) -> ParsedBlock | error {
+    if is_kind_at(tokens, pos, lexer::TokenKind::LBrace) {
+        let blk = match parse_block(tokens, pos) { ParsedBlock as x => x; error as e => return e }
+        return blk
+    }
+    if !is_sep(tokens, pos) {   // bracketless requires the body on the NEXT line
+        return err_at(tokens, pos, ctx)
+    }
+    let p = skip_seps(tokens, pos)
+    let s = match parse_statement(tokens, p) { ParsedStmt as x => x; error as e => return e }
+    let one = teko::list::push(teko::list::empty(), s.node)
+    ParsedBlock { statements = one, next = s.next }
+}
+
 fn parse_if(tokens: []lexer::Token, pos: u64) -> Parsed | error {
-    let cond = match parse_expr(tokens, pos + 1) { Parsed as x => x; error as e => return e }
-    if !is_kind_at(tokens, cond.next, lexer::TokenKind::LBrace) {
-        return error { message = "expected '{' after the `if` condition" }
+    let cond = match parse_expr_no_struct(tokens, pos + 1) { Parsed as x => x; error as e => return e }   // trailing `{` is the then-block, not a struct literal (W4a)
+    let then_blk = match parse_if_body(tokens, cond.next, "expected '{' or a newline after the `if` condition") { ParsedBlock as x => x; error as e => return e }
+    let then_next = then_blk.next
+
+    // Peek for `else` across separators, so `else` may sit on its own line. With no
+    // `else`, do NOT consume the separators — they belong to the enclosing block.
+    let q = skip_seps(tokens, then_next)
+    if !is_kind_at(tokens, q, lexer::TokenKind::Else) {
+        return Parsed { node = IfExpr { cond = cond.node, then_blk = then_blk.statements, has_else = false, else_blk = teko::list::empty() }, next = then_next }
     }
-    let then_blk = match parse_block(tokens, cond.next) { ParsedBlock as x => x; error as e => return e }
-    let p = then_blk.next
-    if !is_kind_at(tokens, p, lexer::TokenKind::Else) {
-        return Parsed { node = IfExpr { cond = cond.node, then_blk = then_blk.statements, has_else = false, else_blk = teko::list::empty() }, next = p }
-    }
-    // `else if …` — the else branch is another if-expression, wrapped as one statement.
-    if is_kind_at(tokens, p + 1, lexer::TokenKind::If) {
-        let elif = match parse_if(tokens, p + 1) { Parsed as x => x; error as e => return e }
+    // `else if …` (same line) — the else branch is another if-expression, one statement.
+    if is_kind_at(tokens, q + 1, lexer::TokenKind::If) {
+        let elif = match parse_if(tokens, q + 1) { Parsed as x => x; error as e => return e }
         let eb = teko::list::push(teko::list::empty(), ExprStmt { expr = elif.node })
         return Parsed { node = IfExpr { cond = cond.node, then_blk = then_blk.statements, has_else = true, else_blk = eb }, next = elif.next }
     }
-    // `else { … }`
-    if !is_kind_at(tokens, p + 1, lexer::TokenKind::LBrace) {
-        return error { message = "expected '{' or `if` after `else`" }
-    }
-    let else_blk = match parse_block(tokens, p + 1) { ParsedBlock as x => x; error as e => return e }
+    // `else { … }` or bracketless `else <newline> <stmt>`.
+    let else_blk = match parse_if_body(tokens, q + 1, "expected '{', `if`, or a newline after `else`") { ParsedBlock as x => x; error as e => return e }
     Parsed { node = IfExpr { cond = cond.node, then_blk = then_blk.statements, has_else = true, else_blk = else_blk.statements }, next = else_blk.next }
 }

@@ -1,12 +1,16 @@
 // src/emit/tkb_read.tks  (namespace 'teko::emit')
 
+use teko::checker
+use teko::lexer
+use teko::parser
+
 type Reader  = struct { data: []byte; pos: u64 }
 type RByte   = struct { r: Reader; value: byte }
 type RU32    = struct { r: Reader; value: u32 }
 type RU64    = struct { r: Reader; value: u64 }
 type RStr    = struct { r: Reader; value: str }
-type RType   = struct { r: Reader; value: Type }
-type RTypes  = struct { r: Reader; value: []Type }
+type RType   = struct { r: Reader; value: checker::Type }
+type RTypes  = struct { r: Reader; value: []checker::Type }
 type RTable  = struct { r: Reader; value: []str }
 
 fn read_u8(r: Reader) -> RByte | error {
@@ -29,7 +33,7 @@ fn read_u64(r: Reader) -> RU64 | error {
 }
 
 // a string reference = a u32 index into the (already-read) table.
-fn read_str(r: Reader, table: []str) -> RStr | error {
+pub fn read_str(r: Reader, table: []str) -> RStr | error {
     let idx = match read_u32(r) { RU32 as x => x; error as e => return e }
     if (idx.value to u64) >= table.len { return error { message = "bad string index in .tkb" } }
     RStr { r = idx.r; value = table[idx.value] }
@@ -61,17 +65,24 @@ fn read_strtable(r: Reader) -> RTable | error {
     RTable { r = rr; value = table }
 }
 
-// inverse of prim_byte (PrimKind ↔ byte).
-fn prim_of(b: byte) -> PrimKind {
-    if b == 0 { return PrimKind::U8 }
-    if b == 1 { return PrimKind::U16 }
-    if b == 2 { return PrimKind::U32 }
-    if b == 3 { return PrimKind::U64 }
-    if b == 4 { return PrimKind::I8 }
-    if b == 5 { return PrimKind::I16 }
-    if b == 6 { return PrimKind::I32 }
-    if b == 7 { return PrimKind::I64 }
-    PrimKind::Bool
+// inverse of prim_byte (PrimKind ↔ byte = the prim's ENUM ORDINAL). Tier-1 (plan §5
+// [N1/N2]): ordinals match PrimKind exactly — U8..U128 (0..4), I8..I128 (5..9),
+// F16/F32/F64 (10..12), Bool (13). New tags APPENDED within their family (old tags stable).
+fn prim_of(b: byte) -> checker::PrimKind {
+    if b == 0  { return checker::PrimKind::U8 }
+    if b == 1  { return checker::PrimKind::U16 }
+    if b == 2  { return checker::PrimKind::U32 }
+    if b == 3  { return checker::PrimKind::U64 }
+    if b == 4  { return checker::PrimKind::U128 }
+    if b == 5  { return checker::PrimKind::I8 }
+    if b == 6  { return checker::PrimKind::I16 }
+    if b == 7  { return checker::PrimKind::I32 }
+    if b == 8  { return checker::PrimKind::I64 }
+    if b == 9  { return checker::PrimKind::I128 }
+    if b == 10 { return checker::PrimKind::F16 }
+    if b == 11 { return checker::PrimKind::F32 }
+    if b == 12 { return checker::PrimKind::F64 }
+    checker::PrimKind::Bool
 }
 
 fn read_types(r: Reader, table: []str) -> RTypes | error {
@@ -89,42 +100,42 @@ fn read_types(r: Reader, table: []str) -> RTypes | error {
     RTypes { r = rr; value = xs }
 }
 
-// inverse of write_type — tags 0=Prim 1=Byte 2=Str 3=error 4=Unit 5=Slice 6=Named 7=Variant 8=Func.
+// inverse of write_type — tags 0=Prim 1=Byte 2=Str 3=error 4=void 5=Slice 6=Named 7=Variant 8=Func 9=Optional (B.37).
 fn read_type(r: Reader, table: []str) -> RType | error {
     let tag = match read_u8(r) { RByte as x => x; error as e => return e }
     if tag.value == 0 {
         let k = match read_u8(tag.r) { RByte as x => x; error as e => return e }
-        return RType { r = k.r; value = Prim { kind = prim_of(k.value) } }
+        return RType { r = k.r; value = checker::Prim { kind = prim_of(k.value) } }
     }
-    if tag.value == 1 { return RType { r = tag.r; value = Byte { } } }
-    if tag.value == 2 { return RType { r = tag.r; value = Str { } } }
-    if tag.value == 3 { return RType { r = tag.r; value = Error { } } }
-    if tag.value == 4 { return RType { r = tag.r; value = Unit { } } }
+    if tag.value == 1 { return RType { r = tag.r; value = checker::Byte { } } }
+    if tag.value == 2 { return RType { r = tag.r; value = checker::Str { } } }
+    if tag.value == 3 { return RType { r = tag.r; value = checker::Error { } } }
+    if tag.value == 4 { return RType { r = tag.r; value = checker::Void { } } }   // tag 4 = void (was Unit — B.37)
     if tag.value == 5 {
         let el = match read_type(tag.r, table) { RType as x => x; error as e => return e }
-        return RType { r = el.r; value = Slice { element = el.value } }
+        return RType { r = el.r; value = checker::Slice { element = el.value } }
     }
     if tag.value == 6 {
         let nm = match read_str(tag.r, table) { RStr as x => x; error as e => return e }
-        return RType { r = nm.r; value = Named { name = nm.value } }
+        return RType { r = nm.r; value = checker::Named { name = nm.value } }
     }
     if tag.value == 7 {
         let ms = match read_types(tag.r, table) { RTypes as x => x; error as e => return e }
-        return RType { r = ms.r; value = Variant { members = ms.value } }
+        return RType { r = ms.r; value = checker::Variant { members = ms.value } }
     }
     if tag.value == 8 {
         let ps = match read_types(tag.r, table) { RTypes as x => x; error as e => return e }
         let rt = match read_type(ps.r, table) { RType as x => x; error as e => return e }
-        return RType { r = rt.r; value = Func { params = ps.value; ret = rt.value } }
+        return RType { r = rt.r; value = checker::Func { params = ps.value; ret = rt.value } }
     }
     error { message = "bad type tag in .tkb" }
 }
 
 type RI64    = struct { r: Reader; value: i64 }
-type RTExpr  = struct { r: Reader; value: TExpr }
-type RTExprs = struct { r: Reader; value: []TExpr }
-type RTerms  = struct { r: Reader; value: []TCmpTerm }
-type RPath   = struct { r: Reader; value: Path }
+type RTExpr  = struct { r: Reader; value: checker::TExpr }
+type RTExprs = struct { r: Reader; value: []checker::TExpr }
+type RTerms  = struct { r: Reader; value: []checker::TCmpTerm }
+type RPath   = struct { r: Reader; value: parser::Path }
 
 fn read_i64(r: Reader) -> RI64 | error {
     let u = match read_u64(r) { RU64 as x => x; error as e => return e }
@@ -142,11 +153,11 @@ fn read_path(r: Reader, table: []str) -> RPath | error {
     loop {
         if i >= (n.value to u64) { break }
         let nm = match read_str(rr, table) { RStr as x => x; error as e => return e }
-        segs = teko::list::push(segs, Segment { name = nm.value })
+        segs = teko::list::push(segs, parser::Segment { name = nm.value })
         rr = nm.r
         i++
     }
-    RPath { r = rr; value = Path { segments = segs } }
+    RPath { r = rr; value = parser::Path { segments = segs } }
 }
 
 fn read_texprs(r: Reader, table: []str) -> RTExprs | error {
@@ -173,7 +184,7 @@ fn read_terms(r: Reader, table: []str) -> RTerms | error {
         if i >= (n.value to u64) { break }
         let op = match read_u8(rr) { RByte as x => x; error as e => return e }
         let o = match read_texpr(op.r, table) { RTExpr as x => x; error as e => return e }
-        ts = teko::list::push(ts, TCmpTerm { op = kind_of(op.value); operand = o.value })
+        ts = teko::list::push(ts, checker::TCmpTerm { op = kind_of(op.value); operand = o.value })
         rr = o.r
         i++
     }
@@ -185,58 +196,139 @@ fn read_texpr(r: Reader, table: []str) -> RTExpr | error {
     let ty = match read_type(r, table) { RType as x => x; error as e => return e }
     let tag = match read_u8(ty.r) { RByte as x => x; error as e => return e }
     if tag.value == 0 {
-        let v = match read_i64(tag.r) { RI64 as x => x; error as e => return e }
-        return RTExpr { r = v.r; value = TExpr { kind = TNumber { value = v.value }; type = ty.value } }
+        // N1/N2 inverse of write_texpr's TNumber: is_float (u8), the 128-bit value as two
+        // u64 (hi then lo), then the f64's IEEE-754 bits as a u64.
+        let isf = match read_u8(tag.r)  { RByte as x => x; error as e => return e }
+        let hi  = match read_u64(isf.r) { RU64 as x => x; error as e => return e }
+        let lo  = match read_u64(hi.r)  { RU64 as x => x; error as e => return e }
+        let fb  = match read_u64(lo.r)  { RU64 as x => x; error as e => return e }
+        let v128 = (((hi.value to u128) << 64) | (lo.value to u128)) to i128
+        return RTExpr { r = fb.r; value = checker::TExpr {
+            kind = checker::TNumber { is_float = isf.value != 0; value = v128; fval = teko::f64_from_bits(fb.value) }
+            type = ty.value
+        } }
     }
     if tag.value == 1 {
         let nm = match read_str(tag.r, table) { RStr as x => x; error as e => return e }
-        return RTExpr { r = nm.r; value = TExpr { kind = TVar { name = nm.value }; type = ty.value } }
+        return RTExpr { r = nm.r; value = checker::TExpr { kind = checker::TVar { name = nm.value }; type = ty.value } }
     }
     if tag.value == 2 {
         let s = match read_str(tag.r, table) { RStr as x => x; error as e => return e }
-        return RTExpr { r = s.r; value = TExpr { kind = TStrLit { text = s.value }; type = ty.value } }
+        return RTExpr { r = s.r; value = checker::TExpr { kind = checker::TStrLit { text = s.value }; type = ty.value } }
     }
     if tag.value == 3 {
         let bl = match read_u8(tag.r) { RByte as x => x; error as e => return e }
-        return RTExpr { r = bl.r; value = TExpr { kind = TByteLit { value = bl.value }; type = ty.value } }
+        return RTExpr { r = bl.r; value = checker::TExpr { kind = checker::TByteLit { value = bl.value }; type = ty.value } }
     }
     if tag.value == 4 {
         let op = match read_u8(tag.r) { RByte as x => x; error as e => return e }
         let l  = match read_texpr(op.r, table) { RTExpr as x => x; error as e => return e }
         let rt = match read_texpr(l.r, table)  { RTExpr as x => x; error as e => return e }
-        return RTExpr { r = rt.r; value = TExpr { kind = TBinary { op = kind_of(op.value); left = l.value; right = rt.value }; type = ty.value } }
+        return RTExpr { r = rt.r; value = checker::TExpr { kind = checker::TBinary { op = kind_of(op.value); left = l.value; right = rt.value }; type = ty.value } }
     }
     if tag.value == 5 {
         let op = match read_u8(tag.r) { RByte as x => x; error as e => return e }
         let o  = match read_texpr(op.r, table) { RTExpr as x => x; error as e => return e }
-        return RTExpr { r = o.r; value = TExpr { kind = TUnary { op = kind_of(op.value); operand = o.value }; type = ty.value } }
+        return RTExpr { r = o.r; value = checker::TExpr { kind = checker::TUnary { op = kind_of(op.value); operand = o.value }; type = ty.value } }
     }
     if tag.value == 6 {
         let f  = match read_texpr(tag.r, table) { RTExpr as x => x; error as e => return e }
         let ts = match read_terms(f.r, table)   { RTerms as x => x; error as e => return e }
-        return RTExpr { r = ts.r; value = TExpr { kind = TCompare { first = f.value; rest = ts.value }; type = ty.value } }
+        return RTExpr { r = ts.r; value = checker::TExpr { kind = checker::TCompare { first = f.value; rest = ts.value }; type = ty.value } }
     }
     if tag.value == 7 {
         let cal = match read_path(tag.r, table)   { RPath as x => x; error as e => return e }
         let ar  = match read_texprs(cal.r, table) { RTExprs as x => x; error as e => return e }
-        return RTExpr { r = ar.r; value = TExpr { kind = TCall { callee = cal.value; args = ar.value }; type = ty.value } }
+        return RTExpr { r = ar.r; value = checker::TExpr { kind = checker::TCall { callee = cal.value; args = ar.value }; type = ty.value } }
     }
     if tag.value == 10 {
         // S1a — Cast: target type is ty.value (already read); read just the inner expr.
         let inner = match read_texpr(tag.r, table) { RTExpr as x => x; error as e => return e }
-        return RTExpr { r = inner.r; value = TExpr { kind = TCast { expr = inner.value }; type = ty.value } }
+        return RTExpr { r = inner.r; value = checker::TExpr { kind = checker::TCast { expr = inner.value }; type = ty.value } }
     }
     if tag.value == 11 {
         // S1b — FieldAccess: receiver THEN field (inverse of write order).
         let rc  = match read_texpr(tag.r, table) { RTExpr as x => x; error as e => return e }
         let fld = match read_str(rc.r, table)    { RStr as x => x; error as e => return e }
-        return RTExpr { r = fld.r; value = TExpr { kind = TFieldAccess { receiver = rc.value; field = fld.value }; type = ty.value } }
+        return RTExpr { r = fld.r; value = checker::TExpr { kind = checker::TFieldAccess { receiver = rc.value; field = fld.value }; type = ty.value } }
+    }
+    if tag.value == 12 {
+        // W2 — BoolLit: the bool value as a u8 (1/0).
+        let bv = match read_u8(tag.r) { RByte as x => x; error as e => return e }
+        return RTExpr { r = bv.r; value = checker::TExpr { kind = checker::TBoolLit { value = bv.value != 0 }; type = ty.value } }
+    }
+    if tag.value == 13 {
+        // W2 — NullLit: no payload.
+        return RTExpr { r = tag.r; value = checker::TExpr { kind = checker::TNullLit { }; type = ty.value } }
+    }
+    if tag.value == 14 {
+        // W2 — SafeFieldAccess (recv?.field): receiver THEN field (inverse of write order; mirrors tag 11).
+        let rc  = match read_texpr(tag.r, table) { RTExpr as x => x; error as e => return e }
+        let fld = match read_str(rc.r, table)    { RStr as x => x; error as e => return e }
+        return RTExpr { r = fld.r; value = checker::TExpr { kind = checker::TSafeFieldAccess { receiver = rc.value; field = fld.value }; type = ty.value } }
+    }
+    if tag.value == 15 {
+        // W2 — Coalesce (left ?? right): left texpr THEN right texpr.
+        let l  = match read_texpr(tag.r, table) { RTExpr as x => x; error as e => return e }
+        let rt = match read_texpr(l.r, table)   { RTExpr as x => x; error as e => return e }
+        return RTExpr { r = rt.r; value = checker::TExpr { kind = checker::TCoalesce { left = l.value; right = rt.value }; type = ty.value } }
+    }
+    if tag.value == 16 {
+        // W4a — StructInit: Name { f = v, … }. Inverse of write tag 16: field count (u32),
+        // then for each field the interned field-name index (u32) + the field value texpr.
+        let nf = match read_u32(tag.r) { RU32 as x => x; error as e => return e }
+        mut rr = nf.r
+        mut names = teko::list::empty()
+        mut vals = teko::list::empty()
+        mut i = 0
+        loop {
+            if i >= (nf.value to u64) { break }
+            let nm = match read_str(rr, table) { RStr as x => x; error as e => return e }
+            let vl = match read_texpr(nm.r, table) { RTExpr as x => x; error as e => return e }
+            names = teko::list::push(names, nm.value)
+            vals = teko::list::push(vals, vl.value)
+            rr = vl.r
+            i++
+        }
+        return RTExpr { r = rr; value = checker::TExpr { kind = checker::TStructInit { field_names = names; field_vals = vals }; type = ty.value } }
+    }
+    if tag.value == 17 {
+        // W5-idx — Index (recv[index]): inverse of write tag 17 — receiver texpr THEN index texpr.
+        let rc = match read_texpr(tag.r, table) { RTExpr as x => x; error as e => return e }
+        let ix = match read_texpr(rc.r, table)  { RTExpr as x => x; error as e => return e }
+        return RTExpr { r = ix.r; value = checker::TExpr { kind = checker::TIndex { receiver = rc.value; index = ix.value }; type = ty.value } }
+    }
+    if tag.value == 18 {
+        // $"…{expr}…" — Interp: inverse of write tag 18 — npieces (u32), each piece, nholes (u32), each hole.
+        let np = match read_u32(tag.r) { RU32 as x => x; error as e => return e }
+        mut rr = np.r
+        mut pieces = teko::list::empty()
+        mut i = 0
+        loop {
+            if i >= (np.value to u64) { break }
+            let pc = match read_str(rr, table) { RStr as x => x; error as e => return e }
+            pieces = teko::list::push(pieces, pc.value)
+            rr = pc.r
+            i++
+        }
+        let nh = match read_u32(rr) { RU32 as x => x; error as e => return e }
+        rr = nh.r
+        mut holes = teko::list::empty()
+        mut j = 0
+        loop {
+            if j >= (nh.value to u64) { break }
+            let hl = match read_texpr(rr, table) { RTExpr as x => x; error as e => return e }
+            holes = teko::list::push(holes, hl.value)
+            rr = hl.r
+            j++
+        }
+        return RTExpr { r = rr; value = checker::TExpr { kind = checker::TInterp { pieces = pieces; holes = holes }; type = ty.value } }
     }
     error { message = "bad texpr tag in .tkb" }
 }
 
 // THE ENTRY: verify the header + hash, then read the table and the typed tree.
-fn deserialize(data: []byte) -> TExpr | error {
+fn deserialize(data: []byte) -> checker::TExpr | error {
     let r0 = Reader { data = data; pos = 0 }
     let m0 = match read_u8(r0)   { RByte as x => x; error as e => return e }
     let m1 = match read_u8(m0.r) { RByte as x => x; error as e => return e }

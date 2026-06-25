@@ -1,11 +1,14 @@
 // src/checker/resolve.tks  (namespace 'teko::checker')
 
-// a registered user type: its name + its parsed declaration (for later lookup).
-type TypeReg   = struct { name: str; decl: TypeDecl }   // TypeDecl from the parser
-type TypeTable = []TypeReg
+use teko::parser
+
+// a registered user type: name + the NAMESPACE it was declared in (A3 provenance) + its
+// VISIBILITY (private/pub/exp) + its parsed declaration. namespace/vis drive W-vis-enforce.
+type TypeReg   = struct { name: str; namespace: str; vis: parser::Visibility; decl: parser::TypeDecl }
+pub type TypeTable = []TypeReg
 
 // find a user type by name; error if not registered.
-fn type_table_find(table: TypeTable, name: str) -> TypeDecl | error {
+fn type_table_find(table: TypeTable, name: str) -> parser::TypeDecl | error {
     mut i = 0
     loop {
         if i >= table.len { break }
@@ -16,31 +19,55 @@ fn type_table_find(table: TypeTable, name: str) -> TypeDecl | error {
 }
 
 // resolve a NAMED type (a path) to a semantic Type: built-in or user type.
-fn resolve_named(path: Path, table: TypeTable) -> Type | error {
+fn resolve_named(path: parser::Path, table: TypeTable) -> Type | error {
     let name = path.segments[path.segments.len - 1].name   // seed: last segment
     match builtin_type(name) {                  // u8…u64, byte, str, error, …
         Type as t => return t
         error     => {}
     }
     match type_table_find(table, name) {        // a user struct/enum/variant
-        TypeDecl => return Named { name = name }
+        parser::TypeDecl => return Named { name = name }
         error    => {}
     }
     error { message = $"unknown type: {name}" }
 }
 
+// A NAMED type referring to a `variant` decl → its expanded Variant. A variant decl's body IS
+// a union type-expr (A | B | …), so resolve_type on it yields the Variant with its members; the
+// members resolve to Named (resolve_named keeps user types nominal), so this terminates and does
+// NOT recurse into nested named variants. Anything else returns unchanged.
+fn expand_variant(t: Type, table: TypeTable) -> Type {
+    let name = match t {
+        Named as n => n.name
+        _          => return t          // not a named type → unchanged
+    }
+    let decl = match type_table_find(table, name) {
+        parser::TypeDecl as td => td
+        error          => return t      // not a user type → unchanged
+    }
+    match decl.body {
+        parser::VariantBody as vb => {
+            match resolve_type(vb.type_expr, table) {
+                Type as ex => ex            // the variant body's union → its Variant
+                error      => t             // unresolvable → unchanged (honest fallback, like the C `ex.ok ? … : t`)
+            }
+        }
+        _ => t                          // a struct/enum decl, not a variant → unchanged
+    }
+}
+
 // resolve a syntactic TypeExpr to a pure semantic Type (recursive — B.8).
-fn resolve_type(te: TypeExpr, table: TypeTable) -> Type | error {
+pub fn resolve_type(te: parser::TypeExpr, table: TypeTable) -> Type | error {
     match te {
-        NamedType as nt => resolve_named(nt.path, table)
-        SliceType as st => {
+        parser::NamedType as nt => resolve_named(nt.path, table)
+        parser::SliceType as st => {
             let el = match resolve_type(st.element, table) {
                 Type as t  => t
                 error as e => return e
             }
             Slice { element = el }
         }
-        UnionType as ut => {
+        parser::UnionType as ut => {
             mut members = teko::list::empty()
             mut i = 0
             loop {
@@ -49,10 +76,31 @@ fn resolve_type(te: TypeExpr, table: TypeTable) -> Type | error {
                     Type as t  => t
                     error as e => return e
                 }
+                // M.1/rules 2 & 3: a variant member must be a COMPLETE type — never
+                // `void` (not a value) and never nullable (`T?` — disjoint domain).
+                match m {
+                    Void     => return error { message = "a variant member may not be `void`" }
+                    Optional => return error { message = "a variant member may not be nullable (`T?`) — use `T | …` and mark the whole type `?`" }
+                    _        => {}
+                }
                 members = teko::list::push(members, m)
                 i++
             }
             Variant { members = members }
+        }
+        parser::OptionalType as ot => {
+            // OptionalType `T?` → Optional { inner } (REBOOT_PLAN §202). The variant case
+            // above already rejects an optional as a variant member; here we just build it.
+            let in = match resolve_type(ot.inner, table) {
+                Type as t  => t
+                error as e => return e
+            }
+            // `void?` is illegal (void is not a value — M.3); `T??` collapses to `T?`.
+            match in {
+                Void     => return error { message = "`void` cannot be made optional (`void?`) — void is not a value (M.3)" }
+                Optional => return in    // `T??` collapses to `T?`
+                _        => Optional { inner = in }
+            }
         }
     }
 }

@@ -43,10 +43,14 @@ struct tk_pattern {
 };
 
 struct tk_arm {                              // Arm = struct { pattern; has_when; guard; body }
-    tk_pattern pattern;
-    bool       has_when;                     // a `when` guard present? (NOT counted for exhaustiveness)
-    tk_expr    guard;                        // the guard condition (valid iff has_when)
-    tk_expr    body;                         // the arm's value (match is an expression)
+    tk_pattern    pattern;
+    bool          has_when;                  // a `when` guard present? (NOT counted for exhaustiveness)
+    tk_expr       guard;                     // the guard condition (valid iff has_when)
+    // The arm body is a STATEMENT BLOCK, exactly like an `if` then/else branch (B.20): a
+    // `{ … }` block, OR one bracketless statement (`=> expr`, `=> return x`, `=> break`,
+    // `=> continue`). A bracketless body lowers to a 1-element block, so checker / VM /
+    // codegen treat every arm body like a braced block.
+    tk_statement *body; size_t nbody;
 };
 
 #endif // TK_PARSER_PATTERN_H

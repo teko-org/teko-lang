@@ -3,12 +3,19 @@
 > Sucede o roadmap E7 (front-end + checker + emissores `.tkb`/`.tkh`, concluídos).
 > **Alvo:** o bootstrap `teko` (o espelho **C** compilado pelo `cc` do host) compila um
 > `main.tks` mínimo e produz um **binário nativo que roda**.
-> **Backend (decidido pelo legislador):** **transpile-para-C** — o codegen baixa a árvore
-> tipada para **C**, e o `cc` do host compila → binário. Reusa a toolchain (M.5); é a forma
-> de realizar o **estágio-2 (AOT-nativo)** sem escrever codegen nativo.
-> **Dois modos de execução são planejados:** (1) **transpile-para-C / AOT** — este, o primeiro;
-> (2) **VM / interpretador do `.tkb`** (o estágio-1 da doutrina) — **também virá, é futuro**, só
-> não no primeiro binário. A VM não foi descartada; está adiada.
+> **Backend — ⚠️ REVOGADO pelo legislador (2026-06-24):** o **transpile-para-C** deixa de ser
+> a arquitetura-destino. Teko terá seu **PRÓPRIO backend nativo** (codegen nativo direto,
+> realizando o **estágio-2 (AOT-nativo)** da Constituição sem o `cc` como intermediário).
+> **Sequenciamento (ordem do legislador):** *concluir TODO o trabalho atual ANTES* de construir o
+> backend nativo. O transpile-para-C é **revogado como backend PRIMÁRIO/de release, porém RETIDO —
+> mantido equalizado — como FALLBACK permanente e COMPARATIVO de corretude diferencial** ("we need to
+> keep a fallback and comparative"). Logo **três** caminhos devem concordar: a **VM `.tkb`**, o
+> **transpile-para-C/`cc`** (fallback+comparativo) e o futuro **backend nativo** (primário). **Cada onda
+> (W4/W5/…) entra em TODOS os caminhos ativos — o codegen NÃO é congelado.**
+> *(↺ supersede a decisão original transpile-para-C — HISTORY §B.34/§B.35; ver LEGISLATION "Backend nativo próprio".)*
+>
+> _(histórico, superado)_ ~~**Backend (decidido pelo legislador):** transpile-para-C — o codegen baixa a
+> árvore tipada para C, e o `cc` do host compila → binário. Reusa a toolchain (M.5).~~
 > Ordem = **M.4** (cada fase repousa na anterior). `src/` é canônico para código.
 
 ## Escopo do PRIMEIRO binário (mínimo — M.4/M.5)

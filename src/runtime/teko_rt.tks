@@ -33,6 +33,44 @@ exp fn println(s: str) {
     teko::io::write("\n")
 }
 
+// --- string interpolation `$"…{expr}…"` builders (self-host parity) ---
+// concat — a fresh str holding a's bytes then b's bytes; the result OWNS the buffer.
+// Leak-tolerant (M.5 — short-lived). Used by the lowering of `$"…"` (each piece/hole
+// concatenated). str(holes are stringified by int_to_str / passed through for str holes).
+exp fn str_concat(a: str, b: str) -> str {
+    mut xs = teko::list::empty()
+    mut i: u64 = 0
+    loop { if i >= a.len { break }; xs = teko::list::push(xs, a[i]); i++ }
+    mut j: u64 = 0
+    loop { if j >= b.len { break }; xs = teko::list::push(xs, b[j]); j++ }
+    str(xs)
+}
+
+// u64_to_str / i64_to_str — the integer's DECIMAL text in a fresh str. The interp lowering
+// widens every signed int hole to i64 and every unsigned hole to u64 (every Teko integer
+// prim except u128/i128 fits; the checker scopes holes to what the corpus needs).
+exp fn u64_to_str(v: u64) -> str {
+    if v == 0 { return "0" }
+    mut digits = teko::list::empty()
+    mut n = v
+    loop {
+        if n == 0 { break }
+        digits = teko::list::push(digits, (b'0' to u64 + n % 10) to byte)
+        n = n / 10
+    }
+    // digits are least-significant first — reverse into the result.
+    mut xs = teko::list::empty()
+    mut k = digits.len
+    loop { if k == 0 { break }; k = k - 1; xs = teko::list::push(xs, digits[k]) }
+    str(xs)
+}
+
+exp fn i64_to_str(v: i64) -> str {
+    if v >= 0 { return u64_to_str(v to u64) }
+    let mag = ((-(v + 1)) to u64) + 1   // |i64::MIN| without overflow
+    str_concat("-", u64_to_str(mag))
+}
+
 // --- panics: fail loud (M.1) — message to stderr, then non-zero exit ---
 
 // panic — "teko: panic: <msg>\n" to stderr, then abort (non-zero exit; conventional 134).

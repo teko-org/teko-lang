@@ -17,11 +17,11 @@ static tk_parsed_params_result parse_params(const tk_token *t, size_t n, size_t 
     }
     for (;;) {
         if (!tk_is_kind_at(t, n, p, TK_TOKEN_IDENT)) {
-            return (tk_parsed_params_result){ .ok = false, .as.error = tk_error_make("expected a parameter name") };
+            return (tk_parsed_params_result){ .ok = false, .as.error = tk_err_at(t, n, p, "expected a parameter name") };
         }
         tk_str name = t[p].text;
         if (!tk_is_kind_at(t, n, p + 1, TK_TOKEN_COLON)) {
-            return (tk_parsed_params_result){ .ok = false, .as.error = tk_error_make("expected ':' after a parameter name") };
+            return (tk_parsed_params_result){ .ok = false, .as.error = tk_err_at(t, n, p + 1, "expected ':' after a parameter name") };
         }
         tk_parsed_type_result ty = tk_parse_type(t, n, p + 2);
         if (!ty.ok) { return (tk_parsed_params_result){ .ok = false, .as.error = ty.as.error }; }
@@ -31,7 +31,7 @@ static tk_parsed_params_result parse_params(const tk_token *t, size_t n, size_t 
         p += 1;                                          // consume `,`
     }
     if (!tk_is_kind_at(t, n, p, TK_TOKEN_RPAREN)) {
-        return (tk_parsed_params_result){ .ok = false, .as.error = tk_error_make("expected ')' to close the parameter list") };
+        return (tk_parsed_params_result){ .ok = false, .as.error = tk_err_at(t, n, p, "expected ')' to close the parameter list") };
     }
     return (tk_parsed_params_result){ .ok = true, .as.value = { .params = params, .n_params = np, .next = p + 1 } };
 }
@@ -40,18 +40,19 @@ tk_parsed_decl_result tk_parse_function(const tk_token *t, size_t n, size_t pos)
     size_t p = pos;
     bool has_doc = false; tk_str doc = (tk_str){0};
     if (tk_is_kind_at(t, n, p, TK_TOKEN_DOC)) { has_doc = true; doc = t[p].text; p += 1; }
-    bool is_exp = false;
-    if (tk_is_kind_at(t, n, p, TK_TOKEN_EXP)) { is_exp = true; p += 1; }
+    tk_visibility vis = TK_VIS_PRIVATE;                              // default: own-namespace only
+    if (tk_is_kind_at(t, n, p, TK_TOKEN_PUB))      { vis = TK_VIS_PUB; p += 1; }
+    else if (tk_is_kind_at(t, n, p, TK_TOKEN_EXP)) { vis = TK_VIS_EXP; p += 1; }
     if (!tk_is_kind_at(t, n, p, TK_TOKEN_FN)) {
-        return (tk_parsed_decl_result){ .ok = false, .as.error = tk_error_make("expected `fn`") };
+        return (tk_parsed_decl_result){ .ok = false, .as.error = tk_err_at(t, n, p, "expected `fn`") };
     }
     p += 1;
     if (!tk_is_kind_at(t, n, p, TK_TOKEN_IDENT)) {
-        return (tk_parsed_decl_result){ .ok = false, .as.error = tk_error_make("expected a function name") };
+        return (tk_parsed_decl_result){ .ok = false, .as.error = tk_err_at(t, n, p, "expected a function name") };
     }
-    tk_str name = t[p].text; p += 1;
+    tk_str name = t[p].text; uint32_t name_line = t[p].line, name_col = t[p].col; p += 1;   // W-loc-2: the fn's source position
     if (!tk_is_kind_at(t, n, p, TK_TOKEN_LPAREN)) {
-        return (tk_parsed_decl_result){ .ok = false, .as.error = tk_error_make("expected '(' for the parameter list") };
+        return (tk_parsed_decl_result){ .ok = false, .as.error = tk_err_at(t, n, p, "expected '(' for the parameter list") };
     }
     tk_parsed_params_result ps = parse_params(t, n, p);
     if (!ps.ok) { return (tk_parsed_decl_result){ .ok = false, .as.error = ps.as.error }; }
@@ -63,14 +64,14 @@ tk_parsed_decl_result tk_parse_function(const tk_token *t, size_t n, size_t pos)
         has_return = true; ret = r.as.value.node; p = r.as.value.next;
     }
     if (!tk_is_kind_at(t, n, p, TK_TOKEN_LBRACE)) {
-        return (tk_parsed_decl_result){ .ok = false, .as.error = tk_error_make("expected '{' for the function body") };
+        return (tk_parsed_decl_result){ .ok = false, .as.error = tk_err_at(t, n, p, "expected '{' for the function body") };
     }
     tk_parsed_block_result blk = tk_parse_block(t, n, p);
     if (!blk.ok) { return (tk_parsed_decl_result){ .ok = false, .as.error = blk.as.error }; }
     tk_function f = { .name = name, .params = ps.as.value.params, .nparams = ps.as.value.n_params,
         .has_return = has_return, .return_type = ret,
         .body = blk.as.value.statements, .nbody = blk.as.value.n,
-        .is_exp = is_exp, .has_doc = has_doc, .doc = doc };
+        .vis = vis, .has_doc = has_doc, .doc = doc, .line = name_line, .col = name_col };
     tk_decl d = { .tag = TK_DECL_FUNCTION, .as.function = f };
     return (tk_parsed_decl_result){ .ok = true, .as.value = { .node = d, .next = blk.as.value.next } };
 }
@@ -82,12 +83,12 @@ static tk_parsed_fields_result parse_fields(const tk_token *t, size_t n, size_t 
         return (tk_parsed_fields_result){ .ok = true, .as.value = { .fields = fields, .n_fields = 0, .next = p + 1 } };
     }
     for (;;) {
-        if (!tk_is_kind_at(t, n, p, TK_TOKEN_IDENT)) {
-            return (tk_parsed_fields_result){ .ok = false, .as.error = tk_error_make("expected a field name") };
+        if (!tk_is_name_at(t, n, p)) {
+            return (tk_parsed_fields_result){ .ok = false, .as.error = tk_err_at(t, n, p, "expected a field name") };
         }
         tk_str name = t[p].text;
         if (!tk_is_kind_at(t, n, p + 1, TK_TOKEN_COLON)) {
-            return (tk_parsed_fields_result){ .ok = false, .as.error = tk_error_make("expected ':' after a field name") };
+            return (tk_parsed_fields_result){ .ok = false, .as.error = tk_err_at(t, n, p + 1, "expected ':' after a field name") };
         }
         tk_parsed_type_result ty = tk_parse_type(t, n, p + 2);
         if (!ty.ok) { return (tk_parsed_fields_result){ .ok = false, .as.error = ty.as.error }; }
@@ -95,7 +96,7 @@ static tk_parsed_fields_result parse_fields(const tk_token *t, size_t n, size_t 
         p = ty.as.value.next;
         if (tk_is_kind_at(t, n, p, TK_TOKEN_RBRACE)) { break; }
         if (!tk_is_sep(t, n, p)) {
-            return (tk_parsed_fields_result){ .ok = false, .as.error = tk_error_make("expected ';', a newline, or '}' after a field") };
+            return (tk_parsed_fields_result){ .ok = false, .as.error = tk_err_at(t, n, p, "expected ';', a newline, or '}' after a field") };
         }
         p = tk_skip_seps(t, n, p);
         if (tk_is_kind_at(t, n, p, TK_TOKEN_RBRACE)) { break; }   // trailing separator
@@ -106,7 +107,7 @@ static tk_parsed_fields_result parse_fields(const tk_token *t, size_t n, size_t 
 static tk_parsed_body_result parse_type_body(const tk_token *t, size_t n, size_t pos) {
     if (tk_is_kind_at(t, n, pos, TK_TOKEN_STRUCT)) {
         if (!tk_is_kind_at(t, n, pos + 1, TK_TOKEN_LBRACE)) {
-            return (tk_parsed_body_result){ .ok = false, .as.error = tk_error_make("expected '{' after `struct`") };
+            return (tk_parsed_body_result){ .ok = false, .as.error = tk_err_at(t, n, pos + 1, "expected '{' after `struct`") };
         }
         tk_parsed_fields_result fs = parse_fields(t, n, pos + 1);
         if (!fs.ok) { return (tk_parsed_body_result){ .ok = false, .as.error = fs.as.error }; }
@@ -115,7 +116,7 @@ static tk_parsed_body_result parse_type_body(const tk_token *t, size_t n, size_t
     }
     if (tk_is_kind_at(t, n, pos, TK_TOKEN_ENUM)) {
         if (!tk_is_kind_at(t, n, pos + 1, TK_TOKEN_LBRACE)) {
-            return (tk_parsed_body_result){ .ok = false, .as.error = tk_error_make("expected '{' after `enum`") };
+            return (tk_parsed_body_result){ .ok = false, .as.error = tk_err_at(t, n, pos + 1, "expected '{' after `enum`") };
         }
         tk_parsed_names_result ms = parse_field_names(t, n, pos + 1);
         if (!ms.ok) { return (tk_parsed_body_result){ .ok = false, .as.error = ms.as.error }; }
@@ -128,29 +129,30 @@ static tk_parsed_body_result parse_type_body(const tk_token *t, size_t n, size_t
         tk_type_body b = { .tag = TK_BODY_VARIANT, .as.variant_body = { .type_expr = ty.as.value.node } };
         return (tk_parsed_body_result){ .ok = true, .as.value = { .node = b, .next = ty.as.value.next } };
     }
-    return (tk_parsed_body_result){ .ok = false, .as.error = tk_error_make("expected `struct`, `enum`, or `variant`") };
+    return (tk_parsed_body_result){ .ok = false, .as.error = tk_err_at(t, n, pos, "expected `struct`, `enum`, or `variant`") };
 }
 
 tk_parsed_decl_result tk_parse_type_decl(const tk_token *t, size_t n, size_t pos) {
     size_t p = pos;
     bool has_doc = false; tk_str doc = (tk_str){0};
     if (tk_is_kind_at(t, n, p, TK_TOKEN_DOC)) { has_doc = true; doc = t[p].text; p += 1; }
-    bool is_exp = false;
-    if (tk_is_kind_at(t, n, p, TK_TOKEN_EXP)) { is_exp = true; p += 1; }
+    tk_visibility vis = TK_VIS_PRIVATE;                              // default: own-namespace only
+    if (tk_is_kind_at(t, n, p, TK_TOKEN_PUB))      { vis = TK_VIS_PUB; p += 1; }
+    else if (tk_is_kind_at(t, n, p, TK_TOKEN_EXP)) { vis = TK_VIS_EXP; p += 1; }
     if (!tk_is_kind_at(t, n, p, TK_TOKEN_TYPE)) {
-        return (tk_parsed_decl_result){ .ok = false, .as.error = tk_error_make("expected `type`") };
+        return (tk_parsed_decl_result){ .ok = false, .as.error = tk_err_at(t, n, p, "expected `type`") };
     }
     p += 1;
     if (!tk_is_kind_at(t, n, p, TK_TOKEN_IDENT)) {
-        return (tk_parsed_decl_result){ .ok = false, .as.error = tk_error_make("expected a type name") };
+        return (tk_parsed_decl_result){ .ok = false, .as.error = tk_err_at(t, n, p, "expected a type name") };
     }
-    tk_str name = t[p].text; p += 1;
+    tk_str name = t[p].text; uint32_t name_line = t[p].line, name_col = t[p].col; p += 1;   // W-loc-2: the type's source position
     if (!tk_is_kind_at(t, n, p, TK_TOKEN_ASSIGN)) {
-        return (tk_parsed_decl_result){ .ok = false, .as.error = tk_error_make("expected '=' in a type declaration") };
+        return (tk_parsed_decl_result){ .ok = false, .as.error = tk_err_at(t, n, p, "expected '=' in a type declaration") };
     }
     tk_parsed_body_result body = parse_type_body(t, n, p + 1);
     if (!body.ok) { return (tk_parsed_decl_result){ .ok = false, .as.error = body.as.error }; }
-    tk_type_decl td = { .name = name, .body = body.as.value.node, .is_exp = is_exp, .has_doc = has_doc, .doc = doc };
+    tk_type_decl td = { .name = name, .body = body.as.value.node, .vis = vis, .has_doc = has_doc, .doc = doc, .line = name_line, .col = name_col };
     tk_decl d = { .tag = TK_DECL_TYPE, .as.type_decl = td };
     return (tk_parsed_decl_result){ .ok = true, .as.value = { .node = d, .next = body.as.value.next } };
 }
@@ -158,10 +160,10 @@ tk_parsed_decl_result tk_parse_type_decl(const tk_token *t, size_t n, size_t pos
 static tk_parsed_decl_result parse_decl(const tk_token *t, size_t n, size_t pos) {
     size_t k = pos;
     if (tk_is_kind_at(t, n, k, TK_TOKEN_DOC)) { k += 1; }
-    if (tk_is_kind_at(t, n, k, TK_TOKEN_EXP)) { k += 1; }
+    if (tk_is_kind_at(t, n, k, TK_TOKEN_PUB) || tk_is_kind_at(t, n, k, TK_TOKEN_EXP)) { k += 1; }
     if (tk_is_kind_at(t, n, k, TK_TOKEN_FN))   { return tk_parse_function(t, n, pos); }
     if (tk_is_kind_at(t, n, k, TK_TOKEN_TYPE)) { return tk_parse_type_decl(t, n, pos); }
-    return (tk_parsed_decl_result){ .ok = false, .as.error = tk_error_make("expected a declaration (`fn`/`type`, optionally `exp`/doc); loose statements belong in main.tks") };
+    return (tk_parsed_decl_result){ .ok = false, .as.error = tk_err_at(t, n, k, "expected a declaration (`fn`/`type`, optionally `pub`/`exp`/doc); loose statements belong in main.tks") };
 }
 
 tk_parsed_module_result tk_parse_module(const tk_token *t, size_t n, size_t pos) {
@@ -177,7 +179,7 @@ tk_parsed_module_result tk_parse_module(const tk_token *t, size_t n, size_t pos)
         p = d.as.value.next;
         if (!tk_has_token(t, n, p)) { break; }
         if (!tk_is_sep(t, n, p)) {
-            return (tk_parsed_module_result){ .ok = false, .as.error = tk_error_make("expected ';' or a newline after a declaration") };
+            return (tk_parsed_module_result){ .ok = false, .as.error = tk_err_at(t, n, p, "expected ';' or a newline after a declaration") };
         }
         p = tk_skip_seps(t, n, p);
     }

@@ -1,5 +1,11 @@
 # Teko — Fonte canônica (`.tkp` / `.tks` / `.tkt`)
 
+> **Correção doutrinária (alinhada a TEKO_HISTORY §B.37).** Este snapshot congelado
+> referia, na prosa/comentários, um "retorno Unit" para "não retorna valor". Conforme
+> §B.37, `Unit` **deixa de existir** — "não retorna valor" é `void`, um **marcador de
+> retorno** (`-> void`), nunca um tipo/valor/membro/binding. As menções a "Unit return"
+> abaixo foram trocadas por "void return"; só essas formas mudaram.
+
 Toda a fonte Teko do compilador, num documento só — na ordem de build (M.4). É o
 fonte do compilador **auto-hospedado** (o destino); o C23 é o andaime do bootstrap,
 que você converte a partir daqui. O build C ignora `.tkp`/`.tks`/`.tkt`.
@@ -1061,7 +1067,7 @@ type Param    = struct { name: str; type_ann: TypeExpr }   // immutable (B.21)
 type Function = struct {
     name:        str
     params:      []Param
-    has_return:  bool                                   // `-> ret` present? (absent = Unit return; P5a)
+    has_return:  bool                                   // `-> ret` present? (absent = void return; P5a)
     return_type: TypeExpr                               // the return type (valid iff has_return)
     body:        []Statement
     is_exp:      bool                                   // marked `exp` → exported (.tkh)
@@ -2630,7 +2636,7 @@ fn rejects_non_patterns() {
 
 Um `Ident` inicia um caminho-tipo; depois dele, `as nome` → `BindPattern` que **liga** o
 valor (`has_binding = true`); sem `as`, é o **caso nu** `Foo` — casa a case sem ligar
-(`has_binding = false`), a forma que o próprio checker usa (`Byte =>`, `Unit =>`). O
+(`has_binding = false`), a forma que o próprio checker usa (`Byte =>`, `null =>`). O
 `parse_pattern_primary` (acima, na P3a) ganhou o ramo `Ident`. **Refinamento da AST:**
 `BindPattern` ganhou `has_binding` (a forma F2/Parte-1 supunha ligação sempre) — gap
 real, pois o caso nu não tinha representação.
@@ -2993,7 +2999,7 @@ itera `parse_statement`), com o separador `;`/newline (B.17, reusa `is_sep`/`ski
 `parse_statement`: `return [expr]` (valor opcional — `return` nu termina num separador ou
 `}`) ou, por omissão, uma **expressão nua** (`ExprStmt`). `parse_block`: sequência de
 statements em `{ … }`, vazio e separador final permitidos. **Refinamento da AST:** `Return`
-ganhou `has_value` — o `return` nu (`error => return`, usado em funções Unit) não tinha
+ganhou `has_value` — o `return` nu (`error => return`, usado em funções void) não tinha
 representação.
 
 #### `src/parser/parse_stmt.tks` — dispatch + bloco (P4a)
@@ -3974,7 +3980,7 @@ de R-main.
 `[doc] [exp] fn nome(params) -> ret { corpo }` (B.21, B.29). Doc (`/** */`, token `Doc`) e
 `exp` são opcionais e precedem `fn`. Os params são `nome: T` separados por **vírgula**
 (B.17 — vírgula em `()`), imutáveis (B.21). O **`-> ret` é opcional** — ausente = retorno
-Unit (como nas `#test fn …() {}`); por isso `Function` ganhou `has_return` (com `return_type`
+void (como nas `#test fn …() {}`); por isso `Function` ganhou `has_return` (com `return_type`
 placeholder via `no_type()`). O corpo é um bloco (P4a).
 
 #### `src/parser/parse_decl.tks` — params + função (P5a)
@@ -4011,7 +4017,7 @@ fn parse_params(tokens: []lexer::Token, pos: u64) -> ParsedParams | error {
 }
 
 // `[doc] [exp] fn name(params) -> ret { body }` (B.21, B.29). Doc + `exp` optional and
-// precede `fn`; `-> ret` optional (absent = Unit). `pos` is at the doc, `exp`, or `fn`.
+// precede `fn`; `-> ret` optional (absent = void). `pos` is at the doc, `exp`, or `fn`.
 fn parse_function(tokens: []lexer::Token, pos: u64) -> ParsedDecl | error {
     mut p = pos
     mut has_doc = false
@@ -4157,7 +4163,7 @@ fn parses_functions() {
         }
         _ => assert false
     }
-    // exp fn g(x: u8, y: str) { }  — params, exported, Unit return (no `-> ret`).
+    // exp fn g(x: u8, y: str) { }  — params, exported, void return (no `-> ret`).
     match func_of("exp fn g(x: u8, y: str) { }") {
         Function as f => {
             assert f.is_exp
@@ -4183,7 +4189,7 @@ fn rejects_malformed_functions() {
 
 > **C mirror dos testes (harness `main`, alpha).** Mesmos casos: feliz —
 > `fn f() -> u8 { return 1 }` (com retorno), `exp fn g(x: u8, y: str) { }` (exp, 2 params,
-> Unit), `/** hi */ fn h() { }` (doc); barreira — `fn { }`, `fn f { }`, `fn f() -> { }`,
+> void), `/** hi */ fn h() { }` (doc); barreira — `fn { }`, `fn f { }`, `fn f() -> { }`,
 > `fn f() -> u8`, `fn f(x) { }`. (Asserts sobre `.as.function.name`, `.n_params`,
 > `.has_return`, `.is_exp`, `.has_doc`.)
 
