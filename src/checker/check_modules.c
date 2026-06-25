@@ -156,6 +156,8 @@ const char *tk_check_modules(tk_program prog, tk_type_table table) {
                     e = check_texpr(d.body.as.struct_body.fields[k].type_ann, ns, table, al);
             } else if (d.body.tag == TK_BODY_VARIANT) {
                 e = check_texpr(d.body.as.variant_body.type_expr, ns, table, al);
+            } else if (d.body.tag == TK_BODY_ALIAS) {
+                e = check_texpr(d.body.as.alias_body.alias, ns, table, al);   // an alias's RHS type-expr
             }
             // enum body: member names only — no type references to check
         }

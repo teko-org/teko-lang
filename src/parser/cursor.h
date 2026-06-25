@@ -15,10 +15,10 @@ bool   tk_has_token (const tk_token *t, size_t n, size_t pos);                  
 bool   tk_is_kind_at(const tk_token *t, size_t n, size_t pos, tk_token_kind k); // has_token + kind compare
 bool   tk_is_sep    (const tk_token *t, size_t n, size_t pos);                  // `;` or a newline (B.17)
 size_t tk_skip_seps (const tk_token *t, size_t n, size_t pos);                  // skip a run of separators
-// a NAME position: an identifier, OR a CONTEXTUAL keyword usable as a field/member name.
-// `type` is a keyword only in declaration position (`type Name = …`); as a field name
-// (`.type`, `type: T`, `Foo { type = … }`) it is an ordinary name — the corpus relies on
-// this (162+ `.type` accesses). The token's `.text` carries the name in either case.
+// a NAME position: an identifier, OR a CONTEXTUAL keyword (`type`/`to`) usable as a
+// field/param/binding name or a value/path. These are keywords only in their own slot
+// (`type Name = …`, `x to T`); as a name they are ordinary identifiers — the corpus relies
+// on this (`.type` 162+, `cast_check(from, to)`). The token's `.text` carries the name.
 bool   tk_is_name_at(const tk_token *t, size_t n, size_t pos);
 
 // a parse error LOCATED at token `pos` — formats "line:col: msg" from the token's stamped

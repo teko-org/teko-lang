@@ -6,7 +6,7 @@
 #include "ast.h"      // tk_segs_push
 
 tk_parsed_path_result parse_path(const tk_token *t, size_t n, size_t pos) {
-    if (!tk_is_kind_at(t, n, pos, TK_TOKEN_IDENT)) {
+    if (!tk_is_name_at(t, n, pos)) {   // a path's first segment may be a contextual keyword (`type`/`to`) used as a name
         return (tk_parsed_path_result){ .ok = false, .as.error = tk_err_at(t, n, pos, "expected a name") };
     }
     tk_segment *segs = NULL; size_t ns = 0;

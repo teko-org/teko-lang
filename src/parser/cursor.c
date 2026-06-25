@@ -39,10 +39,14 @@ bool tk_is_sep(const tk_token *t, size_t n, size_t pos) {
     return tk_is_kind_at(t, n, pos, TK_TOKEN_SEMICOLON) || tk_is_kind_at(t, n, pos, TK_TOKEN_NEWLINE);
 }
 
-// a name position: an identifier OR the `type` contextual keyword (a keyword only in
-// declaration position; an ordinary name as a field/member). Both carry the name in `.text`.
+// a name position: an identifier OR a CONTEXTUAL keyword (`type`/`to`) usable as a
+// field/param/binding name. These are keywords only in their own syntactic slot (`type X = …`,
+// `x to T`); as a name they are ordinary identifiers — the corpus relies on this (`.type`,
+// `cast_check(from, to)`). The token's `.text` carries the name in every case.
 bool tk_is_name_at(const tk_token *t, size_t n, size_t pos) {
-    return tk_is_kind_at(t, n, pos, TK_TOKEN_IDENT) || tk_is_kind_at(t, n, pos, TK_TOKEN_TYPE);
+    return tk_is_kind_at(t, n, pos, TK_TOKEN_IDENT)
+        || tk_is_kind_at(t, n, pos, TK_TOKEN_TYPE)
+        || tk_is_kind_at(t, n, pos, TK_TOKEN_TO);
 }
 
 size_t tk_skip_seps(const tk_token *t, size_t n, size_t pos) {

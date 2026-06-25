@@ -1394,6 +1394,14 @@ static bool emit_stmt(cbuf *b, const tk_tstatement *s, bool in_main,
             tk_bind_target tgt = s->as.binding.target;
             if (tgt.tag != TK_BIND_SIMPLE)
                 return fail_node(err, "codegen: destructuring binding not yet supported");
+            // `let _ = expr` — DISCARD: evaluate for effect, no C variable (so repeated `let _`
+            // never collide). A `return`/divergence inside the value still propagates via C.
+            if (tgt.as.simple.name.len == 1 && tgt.as.simple.name.ptr[0] == '_') {
+                cb(b, indent); cb(b, "(void)(");
+                if (!emit_as(b, s->as.binding.bound, &s->as.binding.value, err)) return false;
+                cb(b, ");\n");
+                return true;
+            }
             cb(b, indent);
             if (s->as.binding.kind == TK_BIND_CONST) cb(b, "const ");
             if (!emit_type(b, s->as.binding.bound, err)) return false;
@@ -1624,6 +1632,10 @@ static bool emit_type_decl(cbuf *b, tk_type_decl d, const char **err) {
             cb(b, ";\n\n");
             return true;
         }
+        case TK_BODY_ALIAS:
+            // A TRANSPARENT alias emits NO C type — references resolve through to the aliased
+            // type at the checker, and codegen emits that resolved type at every use site.
+            return true;
     }
     return fail_node(err, "codegen: unknown type body not yet supported");
 }

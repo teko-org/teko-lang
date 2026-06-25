@@ -30,6 +30,20 @@ tk_type_result resolve_named(tk_path path, tk_type_table table) {
     if (bt.ok) return bt;
     tk_decl_result ut = tk_type_table_find(table, name);  // a user type
     if (ut.ok) {
+        // A TRANSPARENT alias `type Name = <type-expr>` resolves THROUGH to the aliased type
+        // (self-host parity): `TypeTable = []TypeReg` → a SLICE, `Foo = Circle` → its NAMED
+        // struct, etc. struct/enum/variant decls stay NOMINAL (a bare NAMED of `name`).
+        // A trivial self-alias chain (`type A = B; type B = A`) is broken by a depth bound:
+        // tk_resolve_type → resolve_named re-enters here, so a runaway chain is finite-bounded.
+        if (ut.as.value.body.tag == TK_BODY_ALIAS) {
+            static int alias_depth = 0;
+            if (alias_depth > 64)
+                return (tk_type_result){ .ok = false, .as.error = tk_error_make("type alias resolves cyclically (self-referential alias chain)") };
+            alias_depth += 1;
+            tk_type_result r = tk_resolve_type(ut.as.value.body.as.alias_body.alias, table);
+            alias_depth -= 1;
+            return r;
+        }
         tk_type t = { .tag = TK_TYPE_NAMED, .as.named.name = name };
         return (tk_type_result){ .ok = true, .as.value = t };
     }

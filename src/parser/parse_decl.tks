@@ -11,7 +11,7 @@ fn parse_params(tokens: []lexer::Token, pos: u64) -> ParsedParams | error {
         return ParsedParams { params = params, next = p + 1 }
     }
     loop {
-        if !is_kind_at(tokens, p, lexer::TokenKind::Ident) {
+        if !is_name_at(tokens, p) {
             return err_at(tokens, p, "expected a parameter name")
         }
         let name = tokens[p].text
@@ -109,8 +109,9 @@ fn parse_fields(tokens: []lexer::Token, pos: u64) -> ParsedFields | error {
     ParsedFields { fields = fields, next = p + 1 }
 }
 
-// the body of a type declaration. P5b: `struct { fields }`. (enum/variant → P5c.) `pos` is
-// at `struct`/`enum`/`variant`.
+// the body of a type declaration. `struct { fields }`, `enum { … }`, `variant A | B`, or
+// ELSE a TRANSPARENT alias `= <type-expr>` (self-host parity). `pos` is at the body's first
+// token (`struct`/`enum`/`variant` or the alias's type-expression).
 fn parse_type_body(tokens: []lexer::Token, pos: u64) -> ParsedBody | error {
     if is_kind_at(tokens, pos, lexer::TokenKind::Struct) {
         if !is_kind_at(tokens, pos + 1, lexer::TokenKind::LBrace) {
@@ -130,7 +131,10 @@ fn parse_type_body(tokens: []lexer::Token, pos: u64) -> ParsedBody | error {
         let ty = match parse_type(tokens, pos + 1) { ParsedType as x => x; error as e => return e }
         return ParsedBody { node = VariantBody { type_expr = ty.node }, next = ty.next }
     }
-    err_at(tokens, pos, "expected `struct`, `enum`, or `variant`")
+    // ELSE: `type Name = <type-expr>` — a TRANSPARENT alias (slice `[]T`, a named type, a
+    // union `A | B`, an optional `T?`, …). Parse a full type-expression (self-host parity).
+    let al = match parse_type(tokens, pos) { ParsedType as x => x; error as e => return e }
+    ParsedBody { node = AliasBody { alias = al.node }, next = al.next }
 }
 
 // `[doc] [pub|exp] type Name = <body>` (B.13, nominal). Doc + visibility precede `type`.

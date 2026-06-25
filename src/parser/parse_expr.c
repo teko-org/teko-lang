@@ -223,7 +223,7 @@ static tk_parsed_result parse_atom(const tk_token *t, size_t n, size_t pos, bool
     }
     if (k == TK_TOKEN_IF)    { return parse_if(t, n, pos); }
     if (k == TK_TOKEN_MATCH) { return parse_match(t, n, pos); }
-    if (k == TK_TOKEN_IDENT) {
+    if (tk_is_name_at(t, n, pos)) {   // IDENT or a contextual keyword (`type`/`to`) used as a value/path
         tk_parsed_path_result pp = parse_path(t, n, pos);
         if (!pp.ok) { return (tk_parsed_result){ .ok = false, .as.error = pp.as.error }; }
         if (tk_is_kind_at(t, n, pp.as.value.next, TK_TOKEN_LPAREN)) {

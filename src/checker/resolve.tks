@@ -25,8 +25,16 @@ fn resolve_named(path: parser::Path, table: TypeTable) -> Type | error {
         Type as t => return t
         error     => {}
     }
-    match type_table_find(table, name) {        // a user struct/enum/variant
-        parser::TypeDecl => return Named { name = name }
+    match type_table_find(table, name) {        // a user struct/enum/variant/alias
+        // A TRANSPARENT alias `type Name = <type-expr>` resolves THROUGH to the aliased type
+        // (self-host parity): `TypeTable = []TypeReg` → a Slice, `Foo = Circle` → its Named
+        // struct, etc. struct/enum/variant decls stay NOMINAL (a bare Named of `name`).
+        parser::TypeDecl as td => {
+            match td.body {
+                parser::AliasBody as ab => return resolve_type(ab.alias, table)
+                _                       => return Named { name = name }
+            }
+        }
         error    => {}
     }
     error { message = $"unknown type: {name}" }

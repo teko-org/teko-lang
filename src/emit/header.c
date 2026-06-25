@@ -69,6 +69,10 @@ static tyexport_result build_tyexport(tk_type_decl d, tk_type_table table) {
                               .has_doc = d.has_doc, .doc = d.doc };
             return (tyexport_result){ .ok = true, .as.value = e };
         }
+        case TK_BODY_ALIAS:
+            // Exporting a TRANSPARENT alias in the `.tkh` is a LATER gap (the header has no
+            // alias shape yet). An honest stop — never reached by the pub-only validation path.
+            return (tyexport_result){ .ok = false, .as.error = tk_error_make("exporting a type alias in the header is not yet supported") };
     }
     return (tyexport_result){ .ok = false, .as.error = tk_error_make("unknown type body shape") };
 }

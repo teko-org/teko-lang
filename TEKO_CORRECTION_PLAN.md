@@ -366,4 +366,18 @@ Descartado "depois dos tokens" (tokens são do dev, por-arquivo). "Antes do chec
 
 **Escopo grande restante (backend):** o subsistema **slice/list/`teko::list` stdlib** (codegen tem ZERO suporte a slice) e **parâmetros de função no codegen+VM** (toda fn do corpus tem params; ambos backends honest-stop em params hoje). São features multi-camada grandes — o front-end (parse+check) avança bem mais fácil que o backend (codegen/exec).
 
-> **Recomendação de checkpoint:** as correções W5 + estes 8 gaps de front-end + o fix de heap são um corpo validado e um limite natural de commit. Sugiro commitar isso agora e seguir o self-host de backend (slices/params/stdlib) como campanha rastreada (task #55), em vez de um único mega-commit.
+**Gaps fechados (cont.) — todos diferenciais VM==binário:**
+9. **interpolação `$"…{expr}…"`** — lexer token + parser (re-lexa/parseia cada hole) + checker (holes str/int) + runtime (`tk_str_concat`/`tk_i64_to_str`/`tk_u64_to_str`) + VM + codegen + tkb (tag 18).
+10. **type aliases `type X = <type-expr>`** (82 usos; `[]TypeReg`, `str`, named) — body ALIAS no AST; `resolve_named` resolve THROUGH; guard de ciclo.
+11. **discard binding `let _ = expr`** — alvo `_`; codegen `(void)(expr);` (sem var C, repetições não colidem).
+12. **keywords contextuais `type`/`to` como nome** — `tk_is_name_at` (IDENT|type|to) em campo/param/binding + **valor/path** (parse_atom/parse_path).
+
+**PAREDE atual do march (gap #13): `typer.tks:249` — `null` como PADRÃO de match** (`match err? { null => {} ; error as e => return e }`) → entra no **subsistema de OPTIONALS** (`T?`/`null`/`?.`/`??`), que VM/codegen ainda honest-stop.
+
+**Três grandes subsistemas de BACKEND restantes (cada um multi-feature):**
+- **slices/lists/`teko::list` stdlib** — codegen tem ZERO suporte a slice; precisa repr + literais + push/empty + .len + indexação em codegen/VM.
+- **parâmetros de função em codegen+VM** — toda fn do corpus tem params; ambos honest-stop hoje.
+- **optionals `T?`/`null`/`?.`/`??`** — repr de valor opcional + null-pattern + safe-field + coalesce em codegen/VM.
+> O front-end (parse+check) está perto da paridade; o BACKEND (codegen/exec destes 3) é a montanha — campanha multi-sessão.
+
+> **Recomendação de checkpoint:** as correções W5 + 12 gaps de front-end + o fix de heap são um corpo validado e um limite natural de commit. Sugiro commitar isso agora e seguir o self-host de backend (slices/params/optionals/stdlib) como campanha rastreada (task #55), em vez de um único mega-commit. Dívida de mirror `.tks` do último lote (discard-binding + contextual-`to`) em andamento (agente).

@@ -1514,6 +1514,14 @@ fn emit_binding(buf: []byte, prog: checker::TProgram, b: checker::TBinding, inde
         parser::SimpleName as sn   => sn.name
         parser::DestructurePattern => return error { message = "codegen: destructuring binding not yet supported" }
     }
+    // `let _ = expr` — DISCARD: evaluate for effect, no C variable (so repeated `let _`
+    // never collide). A `return`/divergence inside the value still propagates via C.
+    if name == "_" {
+        mut dout = cb(buf, indent)
+        dout = cb(dout, "(void)(")
+        dout = match emit_as(dout, prog, b.bound, b.value) { []byte as o => o; error as err => return err }
+        return cb(dout, ");\n")
+    }
     mut out = cb(buf, indent)
     if b.kind == parser::BindKind::Const { out = cb(out, "const ") }
     out = match emit_type(out, b.bound) { []byte as o => o; error as err => return err }
@@ -1781,6 +1789,11 @@ fn emit_type_decl(buf: []byte, d: parser::TypeDecl) -> []byte | error {
             out = mangle_type_name(out, "", d.name)
             cb(out, ";\n\n")
         }
+        parser::AliasBody => {
+            // A TRANSPARENT alias emits NO C type — references resolve through to the aliased
+            // type at the checker, and codegen emits that resolved type at every use site.
+            buf
+        }
     }
 }
 
@@ -1813,15 +1826,24 @@ fn tk_emit_c(prog: checker::TProgram) -> str | error {
         if fw >= prog.items.len { break }
         match prog.items[fw] {
             parser::TypeDecl as d => {
+                // only STRUCT/VARIANT decls need a forward `typedef struct …;` (an aggregate
+                // self-reference). enums carry none; a TRANSPARENT alias emits no C type at all.
                 match d.body {
-                    parser::EnumBody => { }   // no forward typedef needed
-                    _ => {
+                    parser::StructBody => {
                         b = cb(b, "typedef struct ")
                         b = mangle_type_name(b, "", d.name)
                         b = cb(b, " ")
                         b = mangle_type_name(b, "", d.name)
                         b = cb(b, ";\n")
                     }
+                    parser::VariantBody => {
+                        b = cb(b, "typedef struct ")
+                        b = mangle_type_name(b, "", d.name)
+                        b = cb(b, " ")
+                        b = mangle_type_name(b, "", d.name)
+                        b = cb(b, ";\n")
+                    }
+                    _ => { }   // enum / alias: no forward typedef
                 }
             }
             _ => { }

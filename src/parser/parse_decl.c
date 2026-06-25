@@ -16,7 +16,7 @@ static tk_parsed_params_result parse_params(const tk_token *t, size_t n, size_t 
         return (tk_parsed_params_result){ .ok = true, .as.value = { .params = params, .n_params = 0, .next = p + 1 } };
     }
     for (;;) {
-        if (!tk_is_kind_at(t, n, p, TK_TOKEN_IDENT)) {
+        if (!tk_is_name_at(t, n, p)) {
             return (tk_parsed_params_result){ .ok = false, .as.error = tk_err_at(t, n, p, "expected a parameter name") };
         }
         tk_str name = t[p].text;
@@ -129,7 +129,12 @@ static tk_parsed_body_result parse_type_body(const tk_token *t, size_t n, size_t
         tk_type_body b = { .tag = TK_BODY_VARIANT, .as.variant_body = { .type_expr = ty.as.value.node } };
         return (tk_parsed_body_result){ .ok = true, .as.value = { .node = b, .next = ty.as.value.next } };
     }
-    return (tk_parsed_body_result){ .ok = false, .as.error = tk_err_at(t, n, pos, "expected `struct`, `enum`, or `variant`") };
+    // ELSE: `type Name = <type-expr>` — a TRANSPARENT alias (slice `[]T`, a named type, a
+    // union `A | B`, an optional `T?`, …). Parse a full type-expression (self-host parity).
+    tk_parsed_type_result al = tk_parse_type(t, n, pos);
+    if (!al.ok) { return (tk_parsed_body_result){ .ok = false, .as.error = al.as.error }; }
+    tk_type_body b = { .tag = TK_BODY_ALIAS, .as.alias_body = { .alias = al.as.value.node } };
+    return (tk_parsed_body_result){ .ok = true, .as.value = { .node = b, .next = al.as.value.next } };
 }
 
 tk_parsed_decl_result tk_parse_type_decl(const tk_token *t, size_t n, size_t pos) {

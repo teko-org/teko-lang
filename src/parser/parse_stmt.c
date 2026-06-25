@@ -114,8 +114,11 @@ static tk_parsed_target_result parse_bind_target(const tk_token *t, size_t n, si
         tk_bind_target tgt = { .tag = TK_BIND_DESTRUCTURE, .as.destructure = { .names = names.as.value.names, .nnames = names.as.value.n_names } };
         return (tk_parsed_target_result){ .ok = true, .as.value = { .node = tgt, .next = names.as.value.next } };
     }
-    if (!tk_is_kind_at(t, n, pos, TK_TOKEN_IDENT)) {
-        return (tk_parsed_target_result){ .ok = false, .as.error = tk_err_at(t, n, pos, "expected a name or `{ … }` after `let`/`mut`/`const`") };
+    // `let _ = expr` — DISCARD binding: evaluate the value for effect, bind nothing. A SIMPLE
+    // target named "_" (the wildcard); codegen lowers it to `(void)(expr);` (no C variable, so
+    // repeated `let _` never collides), and it is never read. (B.21 — explicit ignore.)
+    if (!tk_is_name_at(t, n, pos) && !tk_is_kind_at(t, n, pos, TK_TOKEN_UNDERSCORE)) {
+        return (tk_parsed_target_result){ .ok = false, .as.error = tk_err_at(t, n, pos, "expected a name, `_`, or `{ … }` after `let`/`mut`/`const`") };
     }
     tk_bind_target tgt = { .tag = TK_BIND_SIMPLE, .as.simple = { .name = t[pos].text } };
     return (tk_parsed_target_result){ .ok = true, .as.value = { .node = tgt, .next = pos + 1 } };
