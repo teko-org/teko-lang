@@ -78,6 +78,27 @@ tk_type_result tk_builtin_fn(tk_str name) {
     static tk_type bool_t = { .tag = TK_TYPE_PRIM, .as.prim = TK_PRIM_BOOL };  // a (bool) parameter
     static tk_type void_t = { .tag = TK_TYPE_VOID };      // the void return (M.3 — no value)
     static tk_type str2_t[2] = { { .tag = TK_TYPE_STR }, { .tag = TK_TYPE_STR } };  // (str, str)
+    // self-host str/byte STDLIB surface — the unqualified helpers the corpus calls (the C twins are
+    // tk_str_slice/tk_str_concat/… in text.h + teko_rt). All return `str`; recognized like print
+    // (resolved by last path segment). NON-generic, fixed signatures (M.5).
+    static tk_type byte_t = { .tag = TK_TYPE_BYTE };
+    static tk_type u64_t  = { .tag = TK_TYPE_PRIM, .as.prim = TK_PRIM_U64 };
+    static tk_type i64_t  = { .tag = TK_TYPE_PRIM, .as.prim = TK_PRIM_I64 };
+    static tk_type f64_t  = { .tag = TK_TYPE_PRIM, .as.prim = TK_PRIM_F64 };
+    static tk_type byte_elem = { .tag = TK_TYPE_BYTE };
+    static tk_type bytes_t = { .tag = TK_TYPE_SLICE, .as.slice.element = &byte_elem };  // []byte
+    static tk_type slice_p[3] = { { .tag = TK_TYPE_STR }, { .tag = TK_TYPE_PRIM, .as.prim = TK_PRIM_U64 }, { .tag = TK_TYPE_PRIM, .as.prim = TK_PRIM_U64 } };
+    static tk_type str3_t[3]  = { { .tag = TK_TYPE_STR }, { .tag = TK_TYPE_STR }, { .tag = TK_TYPE_STR } };
+    #define TK_BFN(P, N) (tk_type_result){ .ok = true, .as.value = (tk_type){ .tag = TK_TYPE_FUNC, .as.func = { .params = (P), .nparams = (N), .ret = &str_t } } }
+    if (name_is(name, "slice"))        return TK_BFN(slice_p, 3);   // slice(str, u64, u64) -> str
+    if (name_is(name, "str") || name_is(name, "str_of_bytes")) return TK_BFN(&bytes_t, 1);   // ([]byte) -> str
+    if (name_is(name, "one_byte"))     return TK_BFN(&byte_t, 1);   // (byte) -> str
+    if (name_is(name, "str_concat"))   return TK_BFN(str2_t, 2);    // (str, str) -> str
+    if (name_is(name, "str_concat3"))  return TK_BFN(str3_t, 3);    // (str, str, str) -> str
+    if (name_is(name, "i64_to_str"))   return TK_BFN(&i64_t, 1);    // (i64) -> str
+    if (name_is(name, "u64_to_str"))   return TK_BFN(&u64_t, 1);    // (u64) -> str
+    if (name_is(name, "ftoa"))         return TK_BFN(&f64_t, 1);    // (f64) -> str
+    #undef TK_BFN
     if (name_is(name, "print") || name_is(name, "println")) {
         tk_type ft = { .tag = TK_TYPE_FUNC,
                        .as.func = { .params = &str_t, .nparams = 1, .ret = &void_t } };
