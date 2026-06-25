@@ -785,6 +785,8 @@ fn emit_call(buf: []byte, prog: checker::TProgram, e: checker::TExpr, c: checker
         if addressable {
             if      last == "print"   { builtin = "tk_print";   has_builtin = true }
             else if last == "println" { builtin = "tk_println"; has_builtin = true }
+            else if last == "panic"   { builtin = "tk_panic_str"; has_builtin = true }   // panic(str) — diverges (no `never` type)
+            else if last == "exit"    { builtin = "tk_exit";      has_builtin = true }   // exit(<int>) — diverges
         }
     }
     mut out = buf
@@ -847,6 +849,16 @@ fn emit_safe_field_access(buf: []byte, prog: checker::TProgram, e: checker::TExp
 // emit_coalesce — `a ?? b` (REBOOT §203). ({ <optTy> _cN = (a); _cN.present ? <a.value as result>
 //   : <b as result>; }). Short-circuits b (only evaluated on NONE). The result type (node `.type`)
 // is `T` (unwrap) or `T?` (b itself optional); both arms wrapped to it. (C: TK_TEXPR_COALESCE.)
+// a diverging call (the global `panic`/`exit`) — unqualified; mirrors the checker's texpr_diverges.
+// In a VALUE position it lowers to `(<call>, (T){0})`: the call is _Noreturn (tk_panic_str/tk_exit),
+// so the zero-of-T is unreachable but keeps the C `?:`/expr well-typed.
+fn cg_expr_diverges(e: checker::TExpr) -> bool {
+    match e.kind {
+        checker::TCall as c => c.callee.segments.len == 1 && (c.callee.segments[0].name == "panic" || c.callee.segments[0].name == "exit")
+        _ => false
+    }
+}
+
 fn emit_coalesce(buf: []byte, prog: checker::TProgram, e: checker::TExpr, co: checker::TCoalesce) -> []byte | error {
     let tmp = fresh_named("_c", buf.len to i64)
     mut out = cb(buf, "({ ")
@@ -869,7 +881,17 @@ fn emit_coalesce(buf: []byte, prog: checker::TProgram, e: checker::TExpr, co: ch
         _ => { out = cb(out, tmp); out = cb(out, ".value") }
     }
     out = cb(out, " : ")
-    out = match emit_as(out, prog, e.type, co.right) { []byte as o => o; error as err => return err }
+    if cg_expr_diverges(co.right) {
+        // a diverging fallback (panic/exit) yields no value — emit the _Noreturn call then a
+        // zero-of-result so the C `?:` type-checks (the zero is unreachable).
+        out = cb(out, "(")
+        out = match emit_expr(out, prog, co.right) { []byte as o => o; error as err => return err }
+        out = cb(out, ", (")
+        out = match emit_type(out, e.type) { []byte as o => o; error as err => return err }
+        out = cb(out, "){0})")
+    } else {
+        out = match emit_as(out, prog, e.type, co.right) { []byte as o => o; error as err => return err }
+    }
     out = cb(out, "; })")
     out
 }

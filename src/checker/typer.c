@@ -215,6 +215,7 @@ static const char *check_trailing_value(const tk_tstatement *stmts, size_t n, tk
     if (n == 0) return NULL;
     const tk_tstatement *last = &stmts[n - 1];
     if (last->tag != TK_TSTMT_EXPR) return NULL;   // trailing loop/if/match → no claim (guard)
+    if (tk_texpr_diverges(&last->as.expr_stmt.expr)) return NULL;   // a trailing panic/exit yields no value (M.3)
     return (assignable_to(last->as.expr_stmt.expr.type, ret, table)
             || tk_literal_adopts(last->as.expr_stmt.expr, ret)) ? NULL   // a fitting trailing literal adopts the return type (C6)
          : "the function's final expression does not match its declared return type";

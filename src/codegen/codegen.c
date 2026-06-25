@@ -529,6 +529,14 @@ static const char *assignop_c(tk_token_kind op) {
 // `ret_type` is the ENCLOSING function's return type (W5b): it lets a `return`/implicit
 // tail-return WRAP a case value into a variant-typed return slot (emit_as). It is `void`
 // in contexts where no variant wrap can apply (virtual-main, if-value sub-expressions).
+// a diverging call (the global `panic`/`exit`) — unqualified; mirrors the checker's
+// tk_texpr_diverges. In a VALUE position it lowers to `(<call>, (T){0})`: the call is _Noreturn
+// (tk_panic_str/tk_exit), so the zero-of-T is unreachable but keeps the C `?:`/expr well-typed.
+static bool cg_expr_diverges(const tk_texpr *e) {
+    if (e->tag != TK_TEXPR_CALL || e->as.call.callee.len != 1) return false;
+    tk_str last = e->as.call.callee.segments[0].name;
+    return seg_is(last, "panic") || seg_is(last, "exit");
+}
 static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err);
 static bool emit_stmt(cbuf *b, const tk_tstatement *s, bool in_main,
                       tk_type ret_type, const char *indent, const char **err);
@@ -836,6 +844,8 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
                 if (addressable) {
                     if      (seg_is(last, "print"))   builtin = "tk_print";
                     else if (seg_is(last, "println")) builtin = "tk_println";
+                    else if (seg_is(last, "panic"))   builtin = "tk_panic_str";   // panic(str) — diverges (no `never` type)
+                    else if (seg_is(last, "exit"))    builtin = "tk_exit";        // exit(<int>) — diverges
                 }
             }
             if (builtin != NULL) {
@@ -950,7 +960,15 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
                 cb(b, tmp); cb(b, ".value");
             }
             cb(b, " : ");
-            if (!emit_as(b, e->type, e->as.coalesce.right, err)) return false;   // fallback, wrapped to result
+            if (cg_expr_diverges(e->as.coalesce.right)) {
+                // a diverging fallback (panic/exit) yields no value — emit the _Noreturn call, then a
+                // zero-of-result so the C `?:` type-checks (the zero is unreachable).
+                cb(b, "(");
+                if (!emit_expr(b, e->as.coalesce.right, err)) return false;
+                cb(b, ", ("); if (!emit_type(b, e->type, err)) return false; cb(b, "){0})");
+            } else {
+                if (!emit_as(b, e->type, e->as.coalesce.right, err)) return false;   // fallback, wrapped to result
+            }
             cb(b, "; })");
             return true;
         }

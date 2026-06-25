@@ -38,6 +38,10 @@ tk_str tk_u64_to_str(uint64_t v);
 
 // tk_panic — fail loud (M.1): "teko: panic: <msg>\n" to stderr, then non-zero exit.
 _Noreturn void tk_panic(const char *msg);
+// the Teko-level globals `panic(str)` / `exit(<int>)` (legislator's ruling — no `never` type).
+// tk_panic_str takes a tk_str (ptr+len, tolerates embedded NUL); tk_exit ends with a status code.
+_Noreturn void tk_panic_str(tk_str msg);
+_Noreturn void tk_exit(int32_t code);
 _Noreturn void tk_panic_div0(void);       // "division by zero"
 _Noreturn void tk_panic_oob(void);        // "index out of bounds"
 _Noreturn void tk_panic_cast(void);       // "impossible conversion" (the `x to T` guard — B.36 / M.1)

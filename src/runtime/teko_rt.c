@@ -65,6 +65,18 @@ _Noreturn void tk_panic(const char *msg) {
 // teko::assert lives in its own C seed now (src/assert/assert.{c,h}); driver.c::run_cc
 // compiles that source alongside this one so generated programs still link the symbols.
 
+// the Teko-level `panic(str)` — same loud abort (M.1) but the message is a tk_str (ptr+len),
+// tolerating embedded NUL (exactly msg.len bytes to stderr). The error case `panic(error)` lowers
+// to its `.message` str at the call site.
+_Noreturn void tk_panic_str(tk_str msg) {
+    fputs("teko: panic: ", stderr);
+    fwrite(msg.ptr, 1, msg.len, stderr);
+    fputc('\n', stderr);
+    abort();
+}
+// the Teko-level `exit(<int>)` — end the program with a status code (no panic message).
+_Noreturn void tk_exit(int32_t code) { exit(code); }
+
 _Noreturn void tk_panic_div0(void)     { tk_panic("division by zero"); }
 _Noreturn void tk_panic_oob(void)      { tk_panic("index out of bounds"); }
 _Noreturn void tk_panic_cast(void)     { tk_panic("impossible conversion"); }
