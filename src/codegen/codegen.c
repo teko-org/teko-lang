@@ -1082,7 +1082,8 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
                 cb(b, itmp); cb(b, " < (");
                 if (!emit_expr(b, e->as.index.receiver, err)) return false; cb(b, ").len ? ");
                 cb(b, stmp); cb(b, "["); cb(b, itmp); cb(b, "]");
-                cb(b, " : (tk_panic_oob(), ("); if (!emit_type(b, elem, err)) return false; cb(b, "){0}); })");
+                cb(b, " : (tk_panic_oob_at("); cb_u64_dec(b, e->line); cb(b, ", "); cb_u64_dec(b, e->col); cb(b, "), (");
+                if (!emit_type(b, elem, err)) return false; cb(b, "){0}); })");
                 return true;
             }
             if (rt.tag != TK_TYPE_STR)
@@ -1098,7 +1099,7 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
             cb(b, "); ");
             cb(b, itmp); cb(b, " < "); cb(b, stmp); cb(b, ".len ? ");
             cb(b, stmp); cb(b, ".ptr["); cb(b, itmp); cb(b, "]");
-            cb(b, " : (tk_panic_oob(), (tk_byte)0); })");
+            cb(b, " : (tk_panic_oob_at("); cb_u64_dec(b, e->line); cb(b, ", "); cb_u64_dec(b, e->col); cb(b, "), (tk_byte)0); })");
             return true;
         }
     }

@@ -81,3 +81,12 @@ _Noreturn void tk_panic_div0(void)     { tk_panic("division by zero"); }
 _Noreturn void tk_panic_oob(void)      { tk_panic("index out of bounds"); }
 _Noreturn void tk_panic_cast(void)     { tk_panic("impossible conversion"); }
 _Noreturn void tk_panic_overflow(void) { tk_panic("integer overflow"); }
+
+// (C1.7) positioned OOB — print "line:col: " (same shape as the VM's vm_panic_pos), then the
+// canonical "teko: panic: index out of bounds\n", so VM and native locate identically.
+_Noreturn void tk_panic_oob_at(uint32_t line, uint32_t col) {
+    char buf[32];
+    snprintf(buf, sizeof buf, "%u:%u: ", (unsigned)line, (unsigned)col);
+    fputs(buf, stderr);
+    tk_panic_oob();
+}
