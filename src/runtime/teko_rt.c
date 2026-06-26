@@ -3,8 +3,35 @@
 // Distinct from the compiler's own src/core.h; self-contained, libc-only.
 #include "teko_rt.h"
 #include <stdio.h>    // fwrite, fputc, fputs, stdout, stderr
-#include <stdlib.h>   // abort, malloc
+#include <stdlib.h>   // abort, malloc, _Exit
 #include <string.h>   // memcpy
+#include <signal.h>   // signal — native crash backtraces (C1.9)
+#include <execinfo.h> // backtrace, backtrace_symbols_fd (C1.9)
+
+// (C1.9) NATIVE STACK TRACES. A generated Teko program links this runtime; on a panic (M.1)
+// or a fatal signal (a bug in generated code), print a C backtrace to stderr — the frames carry
+// the generated function symbols (the mangled Teko names), so a native crash is debuggable
+// without a debugger. (Per-frame Teko file:line via `.tsym` is a later enhancement — Eixo E3;
+// this delivers the call stack now.) In the bootstrap (which also links this runtime via the VM),
+// main.c installs ITS OWN handler INSIDE main(), AFTER this constructor runs — so it wins there;
+// this handler is the active one only in generated programs (which have no such main).
+static void tk_backtrace(void) {
+    void *frames[64];
+    int n = backtrace(frames, 64);
+    fputs("teko: stack trace:\n", stderr);
+    backtrace_symbols_fd(frames, n, 2 /* stderr */);
+}
+static void tk_rt_crash_handler(int sig) {
+    fputs("\nteko: FATAL signal — a generated program crashed (M.1).\n", stderr);
+    tk_backtrace();
+    _Exit(128 + sig);   // async-signal-safe
+}
+__attribute__((constructor)) static void tk_rt_install_crash_handler(void) {
+    signal(SIGSEGV, tk_rt_crash_handler);
+    signal(SIGBUS,  tk_rt_crash_handler);
+    signal(SIGILL,  tk_rt_crash_handler);
+    signal(SIGFPE,  tk_rt_crash_handler);
+}
 
 // --- string interpolation builders (self-host parity) ---
 // tk_str_concat — a fresh buffer = a.ptr[0..a.len] ++ b.ptr[0..b.len]; the result OWNS it.
@@ -59,6 +86,7 @@ _Noreturn void tk_panic(const char *msg) {
     fputs("teko: panic: ", stderr);
     fputs(msg, stderr);
     fputc('\n', stderr);
+    tk_backtrace();   // (C1.9) show the call stack
     abort();
 }
 
@@ -72,6 +100,7 @@ _Noreturn void tk_panic_str(tk_str msg) {
     fputs("teko: panic: ", stderr);
     fwrite(msg.ptr, 1, msg.len, stderr);
     fputc('\n', stderr);
+    tk_backtrace();   // (C1.9) show the call stack
     abort();
 }
 // the Teko-level `exit(<int>)` — end the program with a status code (no panic message).
