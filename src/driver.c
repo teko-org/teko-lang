@@ -233,13 +233,18 @@ static int tk_backend(const char *label, const char *stem, tk_tprogram prog, con
     // Native build artifacts go to `out_dir` (default "bin", or the `-o <dir>` argument), created
     // at the project root — cwd is the project after the front-end chdir'd. The generated C is
     // "<out_dir>/<stem>.c"; the binary is "<out_dir>/<stem>".
-    mkdir(out_dir, 0755);   // ignore EEXIST — only a hard mkdir failure surfaces below via fopen
-    size_t blen = strlen(out_dir) + strlen(stem) + 4;   // "<out>/" + stem + ".c" + NUL
+    // trim a trailing `/` so `-o ./bin/build/` doesn't yield `./bin/build//teko`.
+    size_t odlen = strlen(out_dir);
+    char od[4096];
+    if (odlen > 0 && odlen < sizeof od) { memcpy(od, out_dir, odlen); if (od[odlen - 1] == '/') odlen -= 1; od[odlen] = '\0'; }
+    else { snprintf(od, sizeof od, "%s", out_dir); }
+    mkdir(od, 0755);   // ignore EEXIST — only a hard mkdir failure surfaces below via fopen
+    size_t blen = strlen(od) + strlen(stem) + 4;   // "<out>/" + stem + ".c" + NUL
     char *cfile = tk_alloc(blen);
     char *binp  = tk_alloc(blen);
     if (cfile == NULL || binp == NULL) abort();
-    snprintf(cfile, blen, "%s/%s.c", out_dir, stem);
-    snprintf(binp,  blen, "%s/%s", out_dir, stem);
+    snprintf(cfile, blen, "%s/%s.c", od, stem);
+    snprintf(binp,  blen, "%s/%s", od, stem);
 
     FILE *f = fopen(cfile, "wb");
     if (f == NULL) { tk_free0(emitted.as.value); tk_free0(cfile); tk_free0(binp); return fail(label, "cannot write generated C to the output directory"); }
