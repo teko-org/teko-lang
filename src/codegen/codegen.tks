@@ -214,6 +214,24 @@ fn mangle_type_name(buf: []byte, namespace: str, name: str) -> []byte {
     cb_str(out, name)
 }
 
+// (#49) a top-level user FUNCTION's C name = its namespace mangled (each `:` -> `_`) + `__` + the
+// bare (keyword-escaped) name, so same-named functions across namespaces (and libc clashes like
+// `div`) never collide. An empty namespace (a local/builtin) -> the bare name. Def and call agree by
+// using this for BOTH the definition/prototype and the resolved call (TCall.call_ns). (C: cb_fn_name.)
+fn cb_fn_name(buf: []byte, ns: str, name: str) -> []byte {
+    mut out = buf
+    if ns.len != 0 {
+        mut i = 0
+        loop {
+            if i >= ns.len { break }
+            if ns[i] == b':' { out = cb_byte(out, b'_') } else { out = cb_byte(out, ns[i]) }
+            i++
+        }
+        out = cb(out, "__")
+    }
+    cb_ident(out, name)
+}
+
 // ---------------------------------------------------------------------------
 // W5b — VARIANT-DECL lookup (the .tks twin of the C's g_cg_prog static + scans).
 //
@@ -254,6 +272,24 @@ fn cg_find_variant_decl(prog: checker::TProgram, name: str) -> parser::TypeDecl 
 // cg_named_is_variant — is the NAMED type `name` a (declared) variant? (C: `cg_named_is_variant`.)
 fn cg_named_is_variant(prog: checker::TProgram, name: str) -> bool {
     match cg_find_variant_decl(prog, name) { parser::TypeDecl => true; error => false }
+}
+
+// cg_named_is_enum — is the NAMED type `name` a (declared) enum? (C: `cg_named_is_enum`.)
+fn cg_named_is_enum(prog: checker::TProgram, name: str) -> bool {
+    mut i = 0
+    loop {
+        if i >= prog.items.len { break }
+        match prog.items[i] {
+            parser::TypeDecl as d => {
+                if d.name == name {
+                    match d.body { parser::EnumBody => return true; _ => return false }
+                }
+            }
+            _ => { }
+        }
+        i++
+    }
+    false
 }
 
 // cg_find_decl — any TYPE_DECL (struct/variant/enum/alias) named `name`, or a `not found`
@@ -1124,12 +1160,15 @@ fn emit_call(buf: []byte, prog: checker::TProgram, e: checker::TExpr, c: checker
     mut out = buf
     if has_builtin {
         out = cb(out, builtin)
+    } else if c.call_ns.len != 0 {
+        // (#49) a resolved USER call -> the SAME namespace-mangled C name emit_function_sig gives
+        // the definition (teko::checker::type_eq -> teko__checker__type_eq), so def + call agree
+        // and same-named functions across namespaces never collide.
+        out = cb_fn_name(out, c.call_ns, p.segments[p.segments.len - 1].name)
     } else {
-        // A user call lowers to the callee's BARE name (its LAST path segment) — the SAME
-        // key the VM's find_function matches on, and the SAME name emit_function gives the
-        // decl (f.name is the bare function name). So a cross-namespace call `ns::fn()` and
-        // the decl `fn` agree, and both backends call identically.
-        out = cb_str(out, p.segments[p.segments.len - 1].name)
+        // No resolved namespace (a local fn-value, or a name not carried) -> the bare
+        // (keyword-escaped) last segment.
+        out = cb_ident(out, p.segments[p.segments.len - 1].name)
     }
     out = cb(out, "(")
     mut j = 0
@@ -1508,7 +1547,15 @@ fn emit_struct_init(buf: []byte, prog: checker::TProgram, e: checker::TExpr, si:
             _ => false
         }
         if !emitted {
-            out = match emit_expr(out, prog, fv) { []byte as o => o; error as err => return err }
+            // A NAMED field WRAPS a bare case value into its variant rep (emit_as): build the expected
+            // resolved type from the field's NAMED type-expr (its last path segment); emit_as passes a
+            // non-variant named (struct/enum/alias) through. Other field types keep the plain emit.
+            let named_field = match fte_opt { parser::TypeExpr as fte => match fte { parser::NamedType as nt => nt.path.segments[nt.path.segments.len - 1].name; _ => "" }; null => "" }
+            if named_field.len != 0 {
+                out = match emit_as(out, prog, checker::Named { name = named_field }, fv) { []byte as o => o; error as err => return err }
+            } else {
+                out = match emit_expr(out, prog, fv) { []byte as o => o; error as err => return err }
+            }
         }
         if boxed { out = cb(out, "; "); out = cb(out, bxN); out = cb(out, "; })") }
         i++
@@ -1827,7 +1874,7 @@ fn cg_emit_case_key_str(pat: parser::Pattern) -> str | error {
 // subject's variant type (a Named variant decl or an inline Variant), needed to spell a case's
 // tag constant; it is a scalar/void type for a non-variant subject. Mirrors pat_match's
 // decisions (binds are separate). (C: `emit_pat_test`.)
-fn emit_pat_test(buf: []byte, pat: parser::Pattern, subj: str, variantT: checker::Type) -> []byte | error {
+fn emit_pat_test(buf: []byte, prog: checker::TProgram, pat: parser::Pattern, subj: str, variantT: checker::Type) -> []byte | error {
     match pat {
         parser::WildcardPattern => cb(buf, "1")
         parser::LiteralPattern as lp => {
@@ -1854,12 +1901,26 @@ fn emit_pat_test(buf: []byte, pat: parser::Pattern, subj: str, variantT: checker
             loop {
                 if i >= ap.options.len { break }
                 if i > 0 { out = cb(out, " || ") }
-                out = match emit_pat_test(out, ap.options[i], subj, variantT) { []byte as o => o; error as err => return err }
+                out = match emit_pat_test(out, prog, ap.options[i], subj, variantT) { []byte as o => o; error as err => return err }
                 i++
             }
             cb(out, ")")
         }
         parser::BindPattern => {
+            // An ENUM subject has no tag+union: a member pattern tests value equality against the
+            // enum constant `TK_E_<ENUM>_<MEMBER>` (matches emit_type_decl's enum emission).
+            let is_enum = match variantT { checker::Named as nm => cg_named_is_enum(prog, nm.name); _ => false }
+            if is_enum {
+                let ename = match variantT { checker::Named as nm => nm.name; _ => "" }
+                mut oe = cb(buf, "(")
+                oe = cb(oe, subj)
+                oe = cb(oe, " == TK_E_")
+                oe = cb_upper(oe, ename)
+                oe = cb(oe, "_")
+                let cke = match cg_emit_case_key_str(pat) { str as s => s; error as err => return err }
+                oe = cb_upper(oe, cke)
+                return cb(oe, ")")
+            }
             mut out = cb(buf, "(")
             out = cb(out, subj)
             out = cb(out, ".tag == ")
@@ -1913,14 +1974,14 @@ fn cg_emit_pat_test(buf: []byte, prog: checker::TProgram, pat: parser::Pattern, 
                     mut o2 = cb(buf, "(")
                     o2 = cb(o2, subj)
                     o2 = cb(o2, ".present && ")
-                    o2 = match emit_pat_test(o2, pat, val, opt.inner) { []byte as o => o; error as err => return err }
+                    o2 = match emit_pat_test(o2, prog, pat, val, opt.inner) { []byte as o => o; error as err => return err }
                     return cb(o2, ")")
                 }
             }
         }
         _ => { }
     }
-    emit_pat_test(buf, pat, subj, subjT)
+    emit_pat_test(buf, prog, pat, subj, subjT)
 }
 
 // cb_to_str — `<a><b>` as a fresh str (the `_s.value` accessor for an optional present subject).
@@ -2640,7 +2701,7 @@ fn emit_stmt(buf: []byte, s: checker::TStatement, in_main: bool, prog: checker::
 fn emit_function_sig(buf: []byte, prog: checker::TProgram, f: checker::TFunction) -> []byte | error {
     mut out = match emit_type(buf, f.return_type) { []byte as o => o; error as err => return err }
     out = cb(out, " ")
-    out = cb_str(out, f.name)
+    out = cb_fn_name(out, f.namespace, f.name)   // (#49) namespace-mangled C name (def + prototype agree)
     out = cb(out, "(")
     if f.params.len == 0 {
         out = cb(out, "void")

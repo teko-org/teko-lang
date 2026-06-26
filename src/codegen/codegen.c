@@ -251,6 +251,17 @@ static const tk_type_decl *cg_find_variant_decl(tk_str name) {
 // Is the NAMED type `name` a (declared) variant?
 static bool cg_named_is_variant(tk_str name) { return cg_find_variant_decl(name) != NULL; }
 
+// Is the NAMED type `name` a (declared) ENUM? An enum value is a plain C enum constant (no tag +
+// union), so a `match` over it tests `subj == TK_E_<ENUM>_<MEMBER>`, not the variant `.tag` scheme.
+static bool cg_named_is_enum(tk_str name) {
+    for (size_t i = 0; i < g_cg_prog.nitems; i += 1) {
+        if (g_cg_prog.items[i].tag != TK_TITEM_TYPE_DECL) continue;
+        const tk_type_decl *dd = &g_cg_prog.items[i].as.type_decl;
+        if (cg_name_eq(dd->name, name)) return dd->body.tag == TK_BODY_ENUM;
+    }
+    return false;
+}
+
 // Any TYPE_DECL (struct/variant/enum/alias) named `name`, or NULL.
 static const tk_type_decl *cg_find_decl(tk_str name) {
     for (size_t i = 0; i < g_cg_prog.nitems; i += 1) {
@@ -490,6 +501,21 @@ static bool cg_is_c_keyword(tk_str s) {
 static void cb_ident(cbuf *b, tk_str name) {
     cb_str(b, name);
     if (cg_is_c_keyword(name)) cb(b, "_");
+}
+
+// (#49) a top-level user FUNCTION's C name = its namespace mangled (`::` → `_`) + `__` + the bare
+// name, so same-named functions across namespaces (and libc clashes like `div`) never collide.
+// An empty namespace (a local/builtin) → the bare (keyword-escaped) name. Def and call agree by
+// using this for BOTH the definition/prototype and the resolved call (TCall.call_ns).
+static void cb_fn_name(cbuf *b, tk_str ns, tk_str name) {
+    if (ns.len != 0) {
+        for (size_t i = 0; i < ns.len; i += 1) {
+            char one[2] = { ns.ptr[i] == ':' ? '_' : (char)ns.ptr[i], '\0' };
+            cb(b, one);
+        }
+        cb(b, "__");
+    }
+    cb_ident(b, name);
 }
 
 static bool cg_member_key(cbuf *b, tk_type m, const char **err) {
@@ -1164,12 +1190,15 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
             }
             if (builtin != NULL) {
                 cb(b, builtin);
+            } else if (e->as.call.call_ns.len != 0) {
+                // (#49) a resolved USER call → the SAME namespace-mangled C name emit_function_sig
+                // gives the definition (teko::checker::type_eq → teko__checker__type_eq), so def +
+                // call agree and same-named functions across namespaces never collide.
+                cb_fn_name(b, e->as.call.call_ns, p.segments[p.len - 1].name);
             } else {
-                // A user call lowers to the callee's BARE name (its LAST path segment) — the
-                // SAME key the VM's find_function matches on, and the SAME name emit_function
-                // gives the decl (tf.name is the bare function name). So a cross-namespace
-                // call `ns::fn()` and the decl `fn` agree, and both backends call identically.
-                cb_str(b, p.segments[p.len - 1].name);
+                // No resolved namespace (a local fn-value, or a name not carried) → the bare
+                // (keyword-escaped) last segment.
+                cb_ident(b, p.segments[p.len - 1].name);
             }
             cb(b, "(");
             for (size_t i = 0; i < e->as.call.nargs; i += 1) {
@@ -1371,7 +1400,16 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
                         emitted = true;
                     }
                 }
-                if (!emitted && !emit_expr(b, fv, err)) return false;
+                if (!emitted) {
+                    // A NAMED field WRAPS a bare case value into its variant rep (emit_as): `.kind =
+                    // <TExprKind-wrap of TNumber>`. Build the expected resolved type from the field's
+                    // NAMED type-expr; emit_as passes a non-variant named (struct/enum/alias) through.
+                    if (have_fte && fte.tag == TK_TEXPR_NAMED) {
+                        tk_str fn = fte.as.named.path.segments[fte.as.named.path.len - 1].name;
+                        tk_type exp = { .tag = TK_TYPE_NAMED, .as.named.name = fn };
+                        if (!emit_as(b, exp, fv, err)) return false;
+                    } else if (!emit_expr(b, fv, err)) return false;
+                }
                 if (boxed) { cb(b, "; _bx"); cb_i64(b, (int64_t)bxid); cb(b, "; })"); }
             }
             cb(b, " }");
@@ -1736,6 +1774,17 @@ static bool emit_pat_test(cbuf *b, const tk_pattern *pat, const char *subj,
             cb(b, ")");
             return true;
         case TK_PAT_BIND:
+            // An ENUM subject has no tag+union: a member pattern tests value equality against the
+            // enum constant `TK_E_<ENUM>_<MEMBER>` (matches emit_type_decl's enum emission).
+            if (variantT.tag == TK_TYPE_NAMED && cg_named_is_enum(variantT.as.named.name)) {
+                cb(b, "("); cb(b, subj); cb(b, " == TK_E_");
+                cb_upper(b, variantT.as.named.name); cb(b, "_");
+                { cbuf k = { NULL, 0, 0 };
+                  if (!cg_emit_case_key(&k, pat, err)) { tk_free0(k.ptr); return false; }
+                  cb_upper(b, (tk_str){ (const tk_byte *)k.ptr, k.len }); tk_free0(k.ptr); }
+                cb(b, ")");
+                return true;
+            }
             cb(b, "("); cb(b, subj); cb(b, ".tag == ");
             if (!cg_emit_tag_prefix(b, variantT, err)) return false;
             { cbuf k = { NULL, 0, 0 };
@@ -2303,7 +2352,7 @@ static bool emit_stmt(cbuf *b, const tk_tstatement *s, bool in_main,
 static bool emit_function_sig(cbuf *b, tk_tfunction f, const char **err) {
     if (!emit_type(b, f.return_type, err)) return false;
     cb(b, " ");
-    cb_str(b, f.name);
+    cb_fn_name(b, f.namespace, f.name);   // (#49) namespace-mangled C name
     cb(b, "(");
     if (f.nparams == 0) {
         cb(b, "void");

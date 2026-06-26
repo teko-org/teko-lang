@@ -72,6 +72,25 @@ tk_type_result tk_env_lookup_call(tk_env env, tk_path callee) {
     return (tk_type_result){ .ok = false, .as.error = tk_error_make("undefined name") };
 }
 
+// (#49) the resolved target's declaring NAMESPACE for a call (same scan as tk_env_lookup_call),
+// or the empty str if the callee is a LOCAL (ns empty) or resolves to nothing (a builtin). Codegen
+// mangles a user call by this namespace; an empty ns means "use the builtin call-map / bare name".
+tk_str tk_env_call_ns(tk_env env, tk_path callee) {
+    tk_str name = callee.segments[callee.len - 1].name;
+    bool qualified = callee.len > 1;
+    tk_str qual = qualified ? callee.segments[callee.len - 2].name : (tk_str){0};
+    for (size_t i = env.len; i > 0; i -= 1) {
+        tk_val_binding b = env.ptr[i - 1];
+        if (!name_eq(b.name, name)) continue;
+        if (!qualified) {
+            if (b.ns.len == 0 || name_eq(b.ns, env.cur_ns)) return b.ns;
+        } else {
+            if (b.ns.len != 0 && name_eq(ns_last_seg(b.ns), qual)) return b.ns;
+        }
+    }
+    return (tk_str){0};
+}
+
 tk_binding_result tk_env_lookup_binding(tk_env env, tk_str name) {
     for (size_t i = env.len; i > 0; i -= 1) {        // innermost (most recent) first
         tk_val_binding b = env.ptr[i - 1];

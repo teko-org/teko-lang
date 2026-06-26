@@ -18,6 +18,11 @@ typedef struct {
     size_t         len;   // length in BYTES
 } tk_str;
 
+// tk_alloc — the allocation seam (S0). malloc(n) (n→1 when 0 so the result is unique); tk_panic
+// on OOM (M.1). Generated code allocates through this: slice copy-append AND the auto-boxed
+// recursive-value-type back-edges (tk_alloc(sizeof *p)). The S2 arena campaign swaps this seam.
+void *tk_alloc(size_t n);
+
 // tk_print — write exactly s.len bytes from s.ptr to stdout; no newline, no NUL.
 void tk_print(tk_str s);
 // tk_println — tk_print(s) then a single '\n' (0x0A).

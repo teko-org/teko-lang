@@ -52,7 +52,7 @@ struct tk_texpr {
         struct { tk_token_kind op; tk_texpr *left, *right; }         binary;
         struct { tk_token_kind op; tk_texpr *operand; }             unary;
         struct { tk_texpr *first; tk_tcmp_term *rest; size_t nrest; } compare;
-        struct { tk_path callee; tk_texpr *args; size_t nargs; }      call;
+        struct { tk_path callee; tk_texpr *args; size_t nargs; tk_str call_ns; } call;  // call_ns: resolved target's namespace ("" = builtin/local → no mangle) (#41/#49)
         struct { tk_texpr *cond; tk_tstatement *then_blk; size_t nthen;
                  bool has_else; tk_tstatement *else_blk; size_t nelse; } if_expr;
         struct { tk_texpr *subject; tk_tarm *arms; size_t narms; }    match_expr;
@@ -109,6 +109,7 @@ typedef struct {
     tk_visibility  vis;                      // private / pub / exp (carried from the parsed decl)
     bool           has_doc;                  // a `/** … */` doc precedes it? (carried for the `.tkh`)
     tk_str         doc;                      // the doc span (valid iff has_doc)
+    tk_str         namespace;                // (#41/#49) the declaring namespace — drives the mangled C name
 } tk_tfunction;
 
 typedef enum { TK_TITEM_FUNCTION, TK_TITEM_TYPE_DECL, TK_TITEM_USE, TK_TITEM_STATEMENT } tk_titem_tag;

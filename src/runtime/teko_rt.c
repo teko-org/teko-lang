@@ -182,6 +182,12 @@ tk_str tk_f64_g17(double x) {
     return (tk_str){ buf, len };
 }
 
+void *tk_alloc(size_t n) {
+    void *p = malloc(n ? n : 1);   // n→1 so a zero-size alloc still yields a unique pointer
+    if (p == NULL) tk_panic("out of memory");
+    return p;
+}
+
 void tk_print(tk_str s) {
     // Exactly s.len bytes; tolerate embedded NUL; no strlen/puts.
     fwrite(s.ptr, 1, s.len, stdout);

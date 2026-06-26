@@ -144,7 +144,7 @@ fn type_list_builtin(c: parser::Call, env: Env, table: TypeTable) -> TExpr | Not
     if last == "empty" {
         if c.args.len != 0 { return error { message = "teko::list::empty expects no arguments" } }
         // SENTINEL slice: element is the Void marker (unifies with any concrete slice — type_eq).
-        TExpr { kind = TCall { callee = c.callee; args = teko::list::empty() }; type = Slice { element = Void { } }; line = 0; col = 0 }
+        TExpr { kind = TCall { callee = c.callee; args = teko::list::empty(); call_ns = "" }; type = Slice { element = Void { } }; line = 0; col = 0 }
     } else if last == "push" {
         if c.args.len != 2 { return error { message = "teko::list::push expects two arguments (slice, item)" } }
         let s = match type_expr(c.args[0], env, table) { TExpr as te => te; error as e => return e }
@@ -165,7 +165,7 @@ fn type_list_builtin(c: parser::Call, env: Env, table: TypeTable) -> TExpr | Not
         // ignores a slice's element type but codegen's emit_list_empty REQUIRES it. (Mirror expr.c.)
         let base = match elem { Void => TExpr { kind = s.kind; type = Slice { element = result_elem }; line = s.line; col = s.col }; _ => s }
         mut args = teko::list::push(teko::list::push(teko::list::empty(), base), x)
-        TExpr { kind = TCall { callee = c.callee; args = args }; type = Slice { element = result_elem }; line = 0; col = 0 }
+        TExpr { kind = TCall { callee = c.callee; args = args; call_ns = "" }; type = Slice { element = result_elem }; line = 0; col = 0 }
     } else {
         NotListBuiltin { }
     }
@@ -192,7 +192,7 @@ fn type_call(c: parser::Call, env: Env, table: TypeTable) -> TExpr | error {
             let ok = match a.type { Str => true; Error => true; _ => false }
             if !ok { return error { message = "panic's argument must be an `error` or a `str`" } }
             mut pargs = teko::list::push(teko::list::empty(), a)
-            return TExpr { kind = TCall { callee = c.callee; args = pargs }; type = Void { }; line = 0; col = 0 }
+            return TExpr { kind = TCall { callee = c.callee; args = pargs; call_ns = "" }; type = Void { }; line = 0; col = 0 }
         }
         if name == "exit" {
             if c.args.len != 1 { return error { message = "exit expects one argument (an integer status code)" } }
@@ -200,9 +200,12 @@ fn type_call(c: parser::Call, env: Env, table: TypeTable) -> TExpr | error {
             let ok = match a.type { Prim as p => prim_is_int(p.kind); _ => false }
             if !ok { return error { message = "exit's argument must be an integer status code" } }
             mut eargs = teko::list::push(teko::list::empty(), a)
-            return TExpr { kind = TCall { callee = c.callee; args = eargs }; type = Void { }; line = 0; col = 0 }
+            return TExpr { kind = TCall { callee = c.callee; args = eargs; call_ns = "" }; type = Void { }; line = 0; col = 0 }
         }
     }
+    // (#49) the resolved target's namespace drives the mangled C name. Only a USER function (found
+    // in the env) carries one; a builtin (fallback below) leaves it empty → codegen's call-map path.
+    let resolved_ns = match lookup_call(env, c.callee) { Type => call_ns(env, c.callee); error => "" }
     let ft = match lookup_call(env, c.callee) {                         // (#41) namespace-aware: a local or
         Type as t => t                                                 // a same-namespace fn (unqualified) / the qualified ns;
         error => match builtin_fn(name) { Type as t => t; error => return error { message = $"unknown function: {name}" } }   // …then the injected builtins; else name the symbol (M.3)
@@ -227,7 +230,7 @@ fn type_call(c: parser::Call, env: Env, table: TypeTable) -> TExpr | error {
                 args = teko::list::push(args, a)
                 i++
             }
-            TExpr { kind = TCall { callee = c.callee; args = args }; type = f.ret; line = 0; col = 0 }
+            TExpr { kind = TCall { callee = c.callee; args = args; call_ns = resolved_ns }; type = f.ret; line = 0; col = 0 }
         }
         _ => error { message = $"not a function: {name}" }
     }
@@ -1206,14 +1209,15 @@ fn type_function(f: parser::Function, env: Env, table: TypeTable) -> TFunction |
     match check_trailing_value(tb.stmts, ret, table) { null => {}; error as e => return e }  // C5: trailing value (when present) matches
     let lc = check_labels(tb.stmts, teko::list::empty(), false, teko::list::empty())  // W5-cf-2: loop labels resolve + are unique
     if lc.failed { return error { message = lc.message } }
-    TFunction { name = f.name; params = f.params; return_type = ret; body = tb.stmts; vis = f.vis; has_doc = f.has_doc; doc = f.doc }
+    TFunction { name = f.name; params = f.params; return_type = ret; body = tb.stmts; vis = f.vis; has_doc = f.has_doc; doc = f.doc; namespace = "" }   // (#49) namespace stamped by type_item from the parsed item's namespace
 }
 
 fn type_item(item: parser::Item, env: Env, table: TypeTable) -> TItem | error {
     match item.content {
         parser::Function as f  => {
             let tf = match type_function(f, env, table) { TFunction as x => x; error as e => return e }
-            tf
+            // (#49) stamp the declaring namespace from the parsed item so codegen mangles the C name.
+            TFunction { name = tf.name; params = tf.params; return_type = tf.return_type; body = tf.body; vis = tf.vis; has_doc = tf.has_doc; doc = tf.doc; namespace = item.namespace }
         }
         parser::TypeDecl as td => td       // carries no expr → passes through (collect resolved its fields)
         parser::UseDecl as ud  => ud       // seed no-op (alias resolution is the checker's, later)

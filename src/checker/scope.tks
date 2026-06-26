@@ -87,6 +87,29 @@ fn lookup_call(env: Env, callee: parser::Path) -> Type | error {
     error { message = $"undefined name: {name}" }
 }
 
+// (#49) the resolved target's declaring NAMESPACE for a call (same scan as lookup_call), or the
+// empty str if the callee is a LOCAL (ns empty) or resolves to nothing (a builtin). Codegen mangles
+// a user call by this namespace; an empty ns means "use the builtin call-map / bare name".
+fn call_ns(env: Env, callee: parser::Path) -> str {
+    let name = callee.segments[callee.segments.len - 1].name
+    let qualified = callee.segments.len > 1
+    let qual = if qualified { callee.segments[callee.segments.len - 2].name } else { "" }
+    mut i = env.bindings.len
+    loop {
+        if i == 0 { break }
+        i = i - 1
+        let b = env.bindings[i]
+        if b.name == name {
+            if !qualified {
+                if b.ns.len == 0 || b.ns == env.cur_ns { return b.ns }
+            } else {
+                if b.ns.len != 0 && ns_last_seg(b.ns) == qual { return b.ns }
+            }
+        }
+    }
+    ""
+}
+
 // resolve an INJECTED built-in type name to its Type (B.19). User types
 // (struct/enum/variant) resolve against the collected registry (Etapa 3).
 fn builtin_type(name: str) -> Type | error {

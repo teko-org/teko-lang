@@ -329,6 +329,7 @@ tk_titem_result tk_type_item(tk_item item, tk_env env, tk_type_table table) {
         case TK_ITEM_FUNCTION: {
             tk_tfunction_result tf = tk_type_function(item.as.function, env, table);
             if (!tf.ok) return (tk_titem_result){ .ok = false, .as.error = tf.as.error };
+            tf.as.value.namespace = item.namespace;   // (#49) carry the declaring ns for codegen name mangling
             return (tk_titem_result){ .ok = true, .as.value = { .tag = TK_TITEM_FUNCTION, .as.function = tf.as.value } };
         }
         case TK_ITEM_TYPE_DECL: return (tk_titem_result){ .ok = true, .as.value = { .tag = TK_TITEM_TYPE_DECL, .as.type_decl = item.as.type_decl } };

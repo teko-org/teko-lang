@@ -241,6 +241,9 @@ static tk_texpr_result type_call(tk_call c, tk_env env, tk_type_table table) {
     }
     tk_type_result ftr = tk_env_lookup_call(env, c.callee);   // (#41) namespace-aware: a local or a
                                                               // same-namespace fn (unqualified) / the qualified ns
+    // (#49) the resolved target's namespace drives the mangled C name. Only a USER function (found
+    // in the env) carries one; a builtin (fallback below) leaves it empty → codegen's call-map path.
+    tk_str call_ns = ftr.ok ? tk_env_call_ns(env, c.callee) : (tk_str){0};
     if (!ftr.ok) ftr = tk_builtin_fn(name);          // injected, non-shadowable stdlib is the fallback
     if (!ftr.ok) return (tk_texpr_result){ .ok = false, .as.error = tk_error_named("unknown function", name) };
     tk_type ft = ftr.as.value;
@@ -264,7 +267,7 @@ static tk_texpr_result type_call(tk_call c, tk_env env, tk_type_table table) {
         args = tk_texpr_list_push(args, a.as.value);
     }
     return xok((tk_texpr){ .tag = TK_TEXPR_CALL, .type = *ft.as.func.ret,
-                           .as.call = { c.callee, args.ptr, args.len } });
+                           .as.call = { c.callee, args.ptr, args.len, call_ns } });
 }
 
 // ---- cast `to` (C2): a DEFINED conversion is allowed; loss is caught, never silent (M.1) ----

@@ -24,6 +24,7 @@ tk_env            tk_env_define_fn(tk_env env, tk_str name, tk_type t, tk_str ns
 tk_binding_result tk_env_lookup_binding(tk_env env, tk_str name);  // the whole binding (mut guard)
 tk_type_result    tk_env_lookup(tk_env env, tk_str name);          // the type (thin wrapper)
 tk_type_result    tk_env_lookup_call(tk_env env, tk_path callee);  // namespace-aware CALL resolution (#41)
+tk_str            tk_env_call_ns(tk_env env, tk_path callee);      // the resolved target's namespace ("" if none) — for codegen name mangling (#49)
 tk_type_result    tk_builtin_type(tk_str name);
 tk_type_result    tk_builtin_fn(tk_str name);       // injected, non-shadowable stdlib fns (print/println, teko::assert::*)
 bool              tk_bind_is_mut(tk_bind_kind k);   // k == TK_BIND_MUT (Let/Const immutable — B.21)
