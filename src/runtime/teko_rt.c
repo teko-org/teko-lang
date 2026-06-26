@@ -385,6 +385,40 @@ tk_str *tk_rt_args(uint64_t *n) {
     return out;
 }
 
+// --- amortized growable push (the teko::list::push lowering — see teko_rt.h) ---
+// A small cache of recent live tails. Codegen threads ONE big output buffer linearly, so its tail
+// stays cached and every append is in-place; a few interleaved small temp buffers keep their own
+// slots. Value-correct because a push to anything that is not a recorded live tail copy-grows.
+#define TK_PUSH_SLOTS 16
+static struct { const void *ptr; uint64_t len, cap, esz; } tk_push_cache[TK_PUSH_SLOTS];
+static unsigned tk_push_rr = 0;
+
+void *tk_slice_push(const void *ptr, uint64_t len, const void *elem, uint64_t esz, uint64_t *out_len) {
+    int slot = -1;
+    if (ptr != NULL)
+        for (unsigned s = 0; s < TK_PUSH_SLOTS; s += 1)
+            if (tk_push_cache[s].ptr == ptr) { slot = (int)s; break; }
+    // in-place ONLY when this is the live tail (same length witness + element size) with spare cap.
+    if (slot >= 0 && tk_push_cache[slot].len == len && tk_push_cache[slot].esz == esz
+        && len < tk_push_cache[slot].cap) {
+        memcpy((char *)ptr + len * esz, elem, esz);
+        tk_push_cache[slot].len = len + 1;
+        *out_len = len + 1;
+        return (void *)ptr;
+    }
+    // copy-grow geometrically into a fresh buffer (the old one is left intact — value semantics).
+    uint64_t cap = (len < 4) ? 8 : (len * 2);
+    void *buf = tk_alloc(cap * esz);
+    if (len) memcpy(buf, ptr, len * esz);
+    memcpy((char *)buf + len * esz, elem, esz);
+    // reuse this buffer's slot if it was tracked (so a doubling buffer keeps ONE slot), else round-robin.
+    int dst = (slot >= 0) ? slot : (int)(tk_push_rr++ % TK_PUSH_SLOTS);
+    tk_push_cache[dst].ptr = buf; tk_push_cache[dst].len = len + 1;
+    tk_push_cache[dst].cap = cap; tk_push_cache[dst].esz = esz;
+    *out_len = len + 1;
+    return buf;
+}
+
 // --- arithmetic FFI over the i128 carrier (sign-aware) + float bit patterns ---
 __int128 tk_div(__int128 a, __int128 b, bool sgn) {
     if (b == 0) tk_panic_div0();

@@ -132,6 +132,18 @@ int32_t tk_rt_run(const tk_str *argv, uint64_t n);
 void    tk_set_args(int argc, char **argv);
 tk_str *tk_rt_args(uint64_t *n);
 
+// tk_slice_push — the AMORTIZED lowering of `teko::list::push` (a `[]T` grow-by-one). The
+// language keeps value semantics (fixed slices, copy-to-grow — collections #2); this is purely a
+// codegen optimization so a LINEAR `b = push(b, x)` chain (the codegen output buffer is 1.4MB+
+// built this way) is O(1) amortized instead of O(n) copy-every-push → O(n²). A small cache of
+// recent "live tails" lets an in-place append happen when `ptr` is the current end of a buffer
+// this function grew (matched by ptr + length witness + element size, with spare capacity); ANY
+// other slice — a stale/shorter version, a different or untracked buffer, or a full one — COPIES
+// (geometric growth), so aliased/branched buffers never observe each other's appends (value-safe).
+// `elem` points at one element of `esz` bytes; `*out_len` receives the new length; returns the
+// (possibly same) data pointer.
+void *tk_slice_push(const void *ptr, uint64_t len, const void *elem, uint64_t esz, uint64_t *out_len);
+
 // --- arithmetic FFI over the i128 carrier (sign-aware) + float bit-patterns ---
 // div/rem: truncated division/remainder; sgn selects signed vs unsigned interpretation.
 __int128 tk_div(__int128 a, __int128 b, bool sgn);

@@ -1146,11 +1146,17 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
                     if (st.as.slice.element == NULL)
                         return fail_node(err, "codegen: teko::list::push result is not a concrete slice (internal)");
                     tk_type elem = *st.as.slice.element;
-                    char bN[40], iN[40], pN[40], jN[40];
+                    // `teko::list::push(base, item)` → the AMORTIZED runtime grow (tk_slice_push):
+                    //   ({ tk_slice_T _sb = <base>; T _si = <item>; uint64_t _sl;
+                    //      T *_sp = (T*)tk_slice_push(_sb.ptr, _sb.len, &_si, sizeof(T), &_sl);
+                    //      (tk_slice_T){ .ptr = _sp, .len = _sl }; })
+                    // Geometric growth with an alias-safe live-tail cache (value semantics preserved)
+                    // — O(1) amortized vs the old malloc+copy-every-push O(n) (→ O(n²) on a buffer).
+                    char bN[40], iN[40], pN[40], lN[40];
                     snprintf(bN, sizeof bN, "_sb%zu", (size_t)b->len);
                     snprintf(iN, sizeof iN, "_si%zu", (size_t)b->len + 1);
                     snprintf(pN, sizeof pN, "_sp%zu", (size_t)b->len + 2);
-                    snprintf(jN, sizeof jN, "_sj%zu", (size_t)b->len + 3);
+                    snprintf(lN, sizeof lN, "_sl%zu", (size_t)b->len + 3);
                     cb(b, "({ ");
                     if (!cg_slice_typename(b, elem, err)) return false; cb(b, " "); cb(b, bN); cb(b, " = ");
                     // Use emit_as so a sentinel empty() arg is lowered to the concrete empty literal.
@@ -1158,14 +1164,13 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
                       if (!emit_as(b, base_t, &e->as.call.args[0], err)) return false; } cb(b, "; ");
                     if (!emit_type(b, elem, err)) return false; cb(b, " "); cb(b, iN); cb(b, " = ");
                     if (!emit_as(b, elem, &e->as.call.args[1], err)) return false; cb(b, "; ");
-                    if (!emit_type(b, elem, err)) return false; cb(b, " *"); cb(b, pN); cb(b, " = (");
-                    if (!emit_type(b, elem, err)) return false; cb(b, " *)malloc(("); cb(b, bN);
-                    cb(b, ".len + 1) * sizeof("); if (!emit_type(b, elem, err)) return false; cb(b, ")); if ("); cb(b, pN); cb(b, " == 0) abort(); ");
-                    cb(b, "for (uint64_t "); cb(b, jN); cb(b, " = 0; "); cb(b, jN); cb(b, " < "); cb(b, bN); cb(b, ".len; "); cb(b, jN); cb(b, " += 1) { ");
-                    cb(b, pN); cb(b, "["); cb(b, jN); cb(b, "] = "); cb(b, bN); cb(b, ".ptr["); cb(b, jN); cb(b, "]; } ");
-                    cb(b, pN); cb(b, "["); cb(b, bN); cb(b, ".len] = "); cb(b, iN); cb(b, "; (");
+                    cb(b, "uint64_t "); cb(b, lN); cb(b, "; ");
+                    if (!emit_type(b, elem, err)) return false; cb(b, " *"); cb(b, pN);
+                    cb(b, " = ("); if (!emit_type(b, elem, err)) return false;
+                    cb(b, " *)tk_slice_push("); cb(b, bN); cb(b, ".ptr, "); cb(b, bN); cb(b, ".len, &"); cb(b, iN);
+                    cb(b, ", sizeof("); if (!emit_type(b, elem, err)) return false; cb(b, "), &"); cb(b, lN); cb(b, "); (");
                     if (!cg_slice_typename(b, elem, err)) return false;
-                    cb(b, "){ .ptr = "); cb(b, pN); cb(b, ", .len = "); cb(b, bN); cb(b, ".len + 1 }; })");
+                    cb(b, "){ .ptr = "); cb(b, pN); cb(b, ", .len = "); cb(b, lN); cb(b, " }; })");
                     return true;
                 }
                 return fail_node(err, "codegen: this teko::list builtin not yet supported (only empty/push — fixed+copy)");

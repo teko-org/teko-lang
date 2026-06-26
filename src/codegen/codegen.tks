@@ -1061,7 +1061,10 @@ fn emit_list_push(buf: []byte, prog: checker::TProgram, e: checker::TExpr, c: ch
     let bN = $"_sb{buf.len}"
     let iN = $"_si{buf.len + 1}"
     let pN = $"_sp{buf.len + 2}"
-    let jN = $"_sj{buf.len + 3}"
+    let lN = $"_sl{buf.len + 3}"
+    // `teko::list::push(base, item)` → the AMORTIZED runtime grow (tk_slice_push): geometric growth
+    // with an alias-safe live-tail cache so a linear `b = push(b, x)` chain is O(1) amortized (value
+    // semantics preserved). Replaces the old malloc+copy-every-push (O(n) per push → O(n²) on a buffer).
     mut out = cb(buf, "({ ")
     out = match cg_slice_typename(out, elem) { []byte as o => o; error as err => return err }
     out = cb(out, " "); out = cb(out, bN); out = cb(out, " = ")
@@ -1071,21 +1074,16 @@ fn emit_list_push(buf: []byte, prog: checker::TProgram, e: checker::TExpr, c: ch
     out = match emit_type(out, elem) { []byte as o => o; error as err => return err }
     out = cb(out, " "); out = cb(out, iN); out = cb(out, " = ")
     out = match emit_as(out, prog, elem, c.args[1]) { []byte as o => o; error as err => return err }
-    out = cb(out, "; ")
+    out = cb(out, "; uint64_t "); out = cb(out, lN); out = cb(out, "; ")
     out = match emit_type(out, elem) { []byte as o => o; error as err => return err }
     out = cb(out, " *"); out = cb(out, pN); out = cb(out, " = (")
     out = match emit_type(out, elem) { []byte as o => o; error as err => return err }
-    out = cb(out, " *)malloc(("); out = cb(out, bN)
-    out = cb(out, ".len + 1) * sizeof(")
+    out = cb(out, " *)tk_slice_push("); out = cb(out, bN); out = cb(out, ".ptr, "); out = cb(out, bN); out = cb(out, ".len, &"); out = cb(out, iN)
+    out = cb(out, ", sizeof(")
     out = match emit_type(out, elem) { []byte as o => o; error as err => return err }
-    out = cb(out, ")); if ("); out = cb(out, pN); out = cb(out, " == 0) abort(); ")
-    out = cb(out, "for (uint64_t "); out = cb(out, jN); out = cb(out, " = 0; "); out = cb(out, jN)
-    out = cb(out, " < "); out = cb(out, bN); out = cb(out, ".len; "); out = cb(out, jN); out = cb(out, " += 1) { ")
-    out = cb(out, pN); out = cb(out, "["); out = cb(out, jN); out = cb(out, "] = ")
-    out = cb(out, bN); out = cb(out, ".ptr["); out = cb(out, jN); out = cb(out, "]; } ")
-    out = cb(out, pN); out = cb(out, "["); out = cb(out, bN); out = cb(out, ".len] = "); out = cb(out, iN); out = cb(out, "; (")
+    out = cb(out, "), &"); out = cb(out, lN); out = cb(out, "); (")
     out = match cg_slice_typename(out, elem) { []byte as o => o; error as err => return err }
-    out = cb(out, "){ .ptr = "); out = cb(out, pN); out = cb(out, ", .len = "); out = cb(out, bN); out = cb(out, ".len + 1 }; })")
+    out = cb(out, "){ .ptr = "); out = cb(out, pN); out = cb(out, ", .len = "); out = cb(out, lN); out = cb(out, " }; })")
     out
 }
 
@@ -1605,27 +1603,42 @@ fn emit_struct_init(buf: []byte, prog: checker::TProgram, e: checker::TExpr, si:
             out = cb(out, " *"); out = cb(out, bxN)
             out = cb(out, " = tk_alloc(sizeof *"); out = cb(out, bxN); out = cb(out, "); *"); out = cb(out, bxN); out = cb(out, " = ")
         }
-        // Sentinel empty() field: emit a concrete empty literal so emit_expr doesn't fail on the
-        // unknown element. (C: emit_struct_init fix.)
-        let emitted: bool = match fv.type {
-            checker::Slice as sl => match sl.element {
-                checker::Void => {
-                    match fte_opt {
-                        parser::TypeExpr as fte => match fte {
-                            parser::SliceType as st => {
-                                out = cb(out, "(")
-                                out = match emit_type_expr(out, prog, fte) { []byte as o => o; error as err => return err }
-                                out = cb(out, "){ .ptr = 0, .len = 0 }")
-                                true
-                            }
-                            _ => false
-                        }
-                        null => false
+        // Sentinel fields emit a concrete literal directly (emit_expr can't, the type being unknown):
+        //   * a bare `null` into a `T?` field → (tk_opt_<inner>){ .present = false }   (C: TEXPR_NULL branch)
+        //   * an empty() into a `[]T` field   → (tk_slice_<elem>){ .ptr = 0, .len = 0 }
+        let emitted: bool = match fv.kind {
+            checker::TNullLit => match fte_opt {
+                parser::TypeExpr as fte => match fte {
+                    parser::OptionalType => {
+                        out = cb(out, "(")
+                        out = match emit_type_expr(out, prog, fte) { []byte as o => o; error as err => return err }
+                        out = cb(out, "){ .present = false }")
+                        true
                     }
+                    _ => false
+                }
+                null => false
+            }
+            _ => match fv.type {
+                checker::Slice as sl => match sl.element {
+                    checker::Void => {
+                        match fte_opt {
+                            parser::TypeExpr as fte => match fte {
+                                parser::SliceType as st => {
+                                    out = cb(out, "(")
+                                    out = match emit_type_expr(out, prog, fte) { []byte as o => o; error as err => return err }
+                                    out = cb(out, "){ .ptr = 0, .len = 0 }")
+                                    true
+                                }
+                                _ => false
+                            }
+                            null => false
+                        }
+                    }
+                    _ => false
                 }
                 _ => false
             }
-            _ => false
         }
         if !emitted {
             // Build the expected resolved type from the field's type-expr and route through emit_as so a
@@ -2106,7 +2119,15 @@ fn cg_type_mangle_eq(a: checker::Type, c: checker::Type) -> bool {
 // emit_type_decl spells them (cb_upper tag; the member's bare name field), so wrap + decl
 // agree. The VM needs no wrap (its struct value already carries the case name); this
 // synthesizes the C equivalent — the W4c-deferred variant-value layer. (C: `emit_as`.)
+// emit_as — wrap `value` into `expected` (the ret_type-less convenience form: most callers are not
+// in a return context, so a diverging value-form-match arm inside `value` cannot occur). The C uses
+// a `g_cg_ret_type` STATIC for that; here ret_type is THREADED (Teko has no module-mutable), so a
+// return-context caller (binding/assign/return/tail/arm sink) uses emit_as_r to pass it down.
 fn emit_as(buf: []byte, prog: checker::TProgram, expected: checker::Type, value: checker::TExpr) -> []byte | error {
+    emit_as_r(buf, prog, checker::Void { }, expected, value)
+}
+
+fn emit_as_r(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, expected: checker::Type, value: checker::TExpr) -> []byte | error {
     // OPTIONAL slot (REBOOT_PLAN §202): wrap the value into the slot's tk_opt_<inner> struct.
     //   * a bare `null`           → (tk_opt_<inner>){ .present = false }
     //   * an already-optional val → emitted plainly (it IS a tk_opt_<inner>)
@@ -2125,12 +2146,12 @@ fn emit_as(buf: []byte, prog: checker::TProgram, expected: checker::Type, value:
                         _ => { }
                     }
                     match value.type {
-                        checker::Optional => return emit_expr(buf, prog, value)   // already optional → pass through
+                        checker::Optional => return emit_expr_ret(buf, prog, ret_type, value)   // already optional → pass through
                         _ => {
                             mut o1 = cb(buf, "(")
                             o1 = match cg_opt_typename(o1, opt.inner) { []byte as o => o; error as err => return err }
                             o1 = cb(o1, "){ .present = true, .value = ")
-                            o1 = match emit_as(o1, prog, opt.inner, value) { []byte as o => o; error as err => return err }
+                            o1 = match emit_as_r(o1, prog, ret_type, opt.inner, value) { []byte as o => o; error as err => return err }
                             return cb(o1, " }")
                         }
                     }
@@ -2178,7 +2199,7 @@ fn emit_as(buf: []byte, prog: checker::TProgram, expected: checker::Type, value:
                         mut o = cb(buf, "({ ")
                         o = match cg_slice_typename(o, U) { []byte as r => r; error as err => return err }
                         o = cb(o, " "); o = cb(o, sv); o = cb(o, " = ")
-                        o = match emit_expr(o, prog, value) { []byte as r => r; error as err => return err }
+                        o = match emit_expr_ret(o, prog, ret_type, value) { []byte as r => r; error as err => return err }
                         o = cb(o, "; ")
                         o = match emit_type(o, T) { []byte as r => r; error as err => return err }
                         o = cb(o, " *"); o = cb(o, rp); o = cb(o, " = (")
@@ -2208,7 +2229,7 @@ fn emit_as(buf: []byte, prog: checker::TProgram, expected: checker::Type, value:
                         o = cb(o, "){ .ptr = "); o = cb(o, rp); o = cb(o, ", .len = "); o = cb(o, sv); o = cb(o, ".len }; })")
                         return o
                     }
-                    return emit_expr(buf, prog, value)
+                    return emit_expr_ret(buf, prog, ret_type, value)
                 }
             }
         }
@@ -2220,14 +2241,14 @@ fn emit_as(buf: []byte, prog: checker::TProgram, expected: checker::Type, value:
     // `expected` (it IS the whole variant, or `expected` isn't a variant), the value is emitted
     // plainly. (C: the variant arm of emit_as via emit_variant_wrap.)
     let vkey = match cg_member_key_str(value.type) { str as s => s; error => "" }
-    if vkey == "" { return emit_expr(buf, prog, value) }
+    if vkey == "" { return emit_expr_ret(buf, prog, ret_type, value) }
     let is_variant_slot = match expected { checker::Variant => true; checker::Named => true; _ => false }
     if is_variant_slot {
         if cg_var_reaches(prog, expected, vkey, 16) {
             return emit_variant_wrap(buf, prog, expected, value)
         }
     }
-    emit_expr(buf, prog, value)
+    emit_expr_ret(buf, prog, ret_type, value)
 }
 
 // cg_emit_lit_pattern — emit an AST LITERAL pattern bound as a C constant comparable to the
@@ -2732,7 +2753,7 @@ fn emit_arm_value(buf: []byte, prog: checker::TProgram, ret_type: checker::Type,
                 out = match emit_type(out, match_e.type) { []byte as o => o; error as err => return err }
                 out = cb(out, "){0}")             // sink's `( … )` closes it
             } else {
-                out = match emit_as(out, prog, match_e.type, es.expr) { []byte as o => o; error as err => return err }
+                out = match emit_as_r(out, prog, ret_type, match_e.type, es.expr) { []byte as o => o; error as err => return err }
             }
             cb(out, "); break;\n")
         }
@@ -3052,7 +3073,7 @@ fn emit_exprstmt_tail(buf: []byte, x: checker::TExpr, in_main: bool, prog: check
                 return cb(out, ");\n")
             }
             out = cb(out, "return ")
-            out = match emit_as(out, prog, ret_type, x) { []byte as o => o; error as err => return err }   // W5b — wrap a case value into a variant return slot
+            out = match emit_as_r(out, prog, ret_type, ret_type, x) { []byte as o => o; error as err => return err }   // W5b — wrap a case value into a variant return slot (ret_type threaded for diverging arms)
             cb(out, ";\n")
         }
     }
@@ -3104,7 +3125,7 @@ fn emit_if_stmt(buf: []byte, f: checker::TIfExpr, in_main: bool, prog: checker::
 // emit_binding — a TBinding. BindTarget: only SimpleName is lowered for M0 (destructuring
 // is the honest barrier). `const` prefix for a const binding; the type rides `.bound`.
 // (C: TK_TSTMT_BINDING branch.)
-fn emit_binding(buf: []byte, prog: checker::TProgram, b: checker::TBinding, indent: str) -> []byte | error {
+fn emit_binding(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, b: checker::TBinding, indent: str) -> []byte | error {
     let name = match b.target {
         parser::SimpleName as sn   => sn.name
         parser::DestructurePattern => return error { message = "codegen: destructuring binding not yet supported" }
@@ -3114,7 +3135,7 @@ fn emit_binding(buf: []byte, prog: checker::TProgram, b: checker::TBinding, inde
     if name == "_" {
         mut dout = cb(buf, indent)
         dout = cb(dout, "(void)(")
-        dout = match emit_as(dout, prog, b.bound, b.value) { []byte as o => o; error as err => return err }
+        dout = match emit_as_r(dout, prog, ret_type, b.bound, b.value) { []byte as o => o; error as err => return err }
         return cb(dout, ");\n")
     }
     mut out = cb(buf, indent)
@@ -3123,14 +3144,15 @@ fn emit_binding(buf: []byte, prog: checker::TProgram, b: checker::TBinding, inde
     out = cb(out, " ")
     out = cb_ident(out, name)
     out = cb(out, " = ")
-    // W5b — if the binding's declared type is a variant and the value is a case member,
-    // WRAP it into the variant repr (e.g. `let s: Shape = Circle { … }`). (C: emit_as.)
-    out = match emit_as(out, prog, b.bound, b.value) { []byte as o => o; error as err => return err }
+    // W5b — if the binding's declared type is a variant and the value is a case member, WRAP it into
+    // the variant repr (`let s: Shape = Circle { … }`). emit_as_r threads ret_type so a value-form
+    // `match`/`if` value with a diverging `return` arm wraps that return into the FUNCTION's slot.
+    out = match emit_as_r(out, prog, ret_type, b.bound, b.value) { []byte as o => o; error as err => return err }
     cb(out, ";\n")
 }
 
 // emit_assign — a TAssign -> `x op= v;`. (C: TK_TSTMT_ASSIGN branch.)
-fn emit_assign(buf: []byte, prog: checker::TProgram, a: checker::TAssign, indent: str) -> []byte | error {
+fn emit_assign(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, a: checker::TAssign, indent: str) -> []byte | error {
     let op = match assignop_c(a.op) { str as s => s; error as err => return err }
     mut out = cb(buf, indent)
     out = cb_ident(out, a.name)
@@ -3138,10 +3160,10 @@ fn emit_assign(buf: []byte, prog: checker::TProgram, a: checker::TAssign, indent
     out = cb(out, op)
     out = cb(out, " ")
     // Wrap the value into the target's declared type (`bound`) — a case → its variant, a `T` →
-    // `T?`, a fitting literal — exactly like a binding. (Plain numerics emit as-is; `+=` etc.
-    // preserve the op.) Without this, `node = OptionalType { … }` (node: TypeExpr, a variant)
+    // `T?`, a fitting literal — exactly like a binding (emit_as_r threads ret_type for a diverging
+    // value-form arm). Without this, `node = OptionalType { … }` (node: TypeExpr, a variant)
     // emitted the case's fields under the variant's C type → a field-designator error.
-    out = match emit_as(out, prog, a.bound, a.value) { []byte as o => o; error as err => return err }
+    out = match emit_as_r(out, prog, ret_type, a.bound, a.value) { []byte as o => o; error as err => return err }
     cb(out, ";\n")
 }
 
@@ -3161,7 +3183,7 @@ fn emit_return(buf: []byte, prog: checker::TProgram, r: checker::TReturn, in_mai
     }
     out = cb(out, "return ")
     // W5b — wrap a case value into a variant return slot.
-    out = match emit_as(out, prog, ret_type, r.value) { []byte as o => o; error as err => return err }
+    out = match emit_as_r(out, prog, ret_type, ret_type, r.value) { []byte as o => o; error as err => return err }
     cb(out, ";\n")
 }
 
@@ -3204,8 +3226,8 @@ fn cb_indent_deeper(indent: str) -> str {
 // emit_stmt — the statement dispatch (the C's emit_stmt switch). (C: `emit_stmt`.)
 fn emit_stmt(buf: []byte, s: checker::TStatement, in_main: bool, prog: checker::TProgram, ret_type: checker::Type, indent: str) -> []byte | error {
     match s {
-        checker::TBinding as b      => emit_binding(buf, prog, b, indent)
-        checker::TAssign as a       => emit_assign(buf, prog, a, indent)
+        checker::TBinding as b      => emit_binding(buf, prog, ret_type, b, indent)
+        checker::TAssign as a       => emit_assign(buf, prog, ret_type, a, indent)
         checker::TReturn as r       => emit_return(buf, prog, r, in_main, ret_type, indent)
         checker::TExprStmt as es    => {
             // W5a — an `if` in statement position runs as CONTROL FLOW (mirrors the VM's
