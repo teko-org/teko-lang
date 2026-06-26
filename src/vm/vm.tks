@@ -50,6 +50,7 @@
 
 use teko::checker
 use teko::parser
+use teko::lexer
 
 // ---------------------------------------------------------------------------
 // The VALUE model (M.0). The legal variant = the sum of the CONCRETE types a runtime
@@ -171,7 +172,10 @@ fn vm_float_to_int(f: f64, dst: checker::PrimKind, line: u32, col: u32) -> i128 
 // codegen's C functions).
 // ---------------------------------------------------------------------------
 type Slot = struct { name: str; val: Value }
-pub type Venv  = struct { slots: []Slot }
+// `prog` carries the typed program so `find_function` can resolve user calls. The C twin uses a
+// file-global `g_prog`; Teko has NO mutable globals (M.0), so the program rides the env (threaded
+// through every frame, exactly like codegen threads its emit context).
+pub type Venv  = struct { slots: []Slot; prog: checker::TProgram }
 
 // find — newest-first scan so a later binding SHADOWS an earlier one (the checker's rule). The
 // checker guarantees every read binds, so a miss is an internal invariant break → panic (M.1),
@@ -188,7 +192,7 @@ fn find(env: Venv, name: str) -> Slot {
 
 // define — push a fresh slot (shadowing). Returns the grown env (functional, like emit/*).
 pub fn define(env: Venv, name: str, val: Value) -> Venv {
-    Venv { slots= teko::list::push(env.slots, Slot { name= name, val= val }) }
+    Venv { slots= teko::list::push(env.slots, Slot { name= name, val= val }); prog= env.prog }
 }
 
 // ---------------------------------------------------------------------------
@@ -895,7 +899,7 @@ fn eval_expr(e: checker::TExpr, env: Venv) -> Value {
         checker::Void          => panic("vm: void expression has no value (internal: checker should reject in value position)")
         _             => {}   // a real value type — evaluate below
     }
-    match e {
+    match e.kind {
         checker::TNumber as n   => num_of_prim(n, e.type)            // a concrete u8…i128 / f16…f64 from the node's type (float iff n.is_float)
         checker::TVar as v      => find(env, v.name).val              // checker guarantees it binds
         checker::TStrLit as s   => s.text                    // a `str` member of Value
@@ -988,6 +992,207 @@ fn coerce_to(v: Value, t: checker::Type) -> Value {
     }
 }
 
+// num_prim_of — the EFFECTIVE numeric prim of a type endpoint: a Prim is itself; a `byte` is U8
+// (B.36 — byte is a u8 newtype, the same effective kind the checker's cast_kind uses). Any other
+// type (str/named/…) is the honest non-numeric frontier — a loud internal stop (M.3). Mirrors
+// vm.c's `cast_prim_of` (which returns false there; here a non-numeric reaching arithmetic/cast
+// is an invariant break the checker should have rejected, so we panic).
+fn num_prim_of(t: checker::Type) -> checker::PrimKind {
+    match t {
+        checker::Prim as p => p.kind
+        checker::Byte      => checker::PrimKind::U8
+        _                  => panic("vm: arithmetic/cast on a non-numeric type not yet supported")
+    }
+}
+
+// apply_int_op — the plain fixed-width integer ops (+,-,*,&,|,^,<<,>>) on the i128 carriers, the
+// .tks twin of the +,-,*,&,|,^,<<,>> arm of vm.c's eval_binary (div/mod are handled by the caller
+// through the CHECKED runtime helpers). Everything computes on the i128 carrier and the caller
+// truncates via norm_int, so the carrier's extension is irrelevant for +,-,*,&,|,^,<< (only the
+// low `width` bits survive). For `>>`, `as_int` already sign/zero-extended the operand to i128, so
+// an arithmetic shift on that carrier reproduces both the signed (arithmetic) and unsigned
+// (logical) C shift. Shift counts are masked `& 127` exactly like the C twin.
+fn apply_int_op(op: lexer::TokenKind, l: i128, r: i128, sgn: bool, w: u8) -> i128 {
+    match op {
+        Plus  => l + r
+        Minus => l - r
+        Star  => l * r
+        Amp   => l & r
+        Pipe  => l | r
+        Caret => l ^ r
+        Shl   => l << (r & 127)
+        Shr   => l >> (r & 127)
+        _     => panic("vm: binary operator not yet supported")
+    }
+}
+
+// eval_unary — `!x` / `-x` / `~x`, the .tks twin of vm.c's eval_unary. `!` negates a bool; `-`
+// negates a numeric (float in the f64 carrier, int via norm_int at the node's prim); `~` flips an
+// integer's bits (norm_int re-truncates). The node's `.type` (passed as `t`) selects the result
+// prim, exactly as codegen's fixed-width C unary ops do.
+fn eval_unary(u: checker::TUnary, t: checker::Type, env: Venv) -> Value {
+    let x = eval_expr(u.operand, env)
+    match u.op {
+        Bang  => !as_bool(x)
+        Minus => {
+            let prim = num_prim_of(t)
+            if prim_float(prim) {
+                float_val(-as_float(x), prim_width(prim))
+            } else {
+                norm_int(-as_int(x), prim_signed(prim), prim_width(prim))
+            }
+        }
+        Tilde => {
+            let prim = num_prim_of(t)
+            norm_int(~as_int(x), prim_signed(prim), prim_width(prim))
+        }
+        _ => panic("vm: unary operator not yet supported")
+    }
+}
+
+// cmp_pair — one adjacent comparison `l <op> r`, the .tks twin of vm.c's cmp_pair. INT compares on
+// the i128 carriers (sign comes from the operand's member — checker-typed, operands share sign);
+// FLOAT compares in f64 (IEEE, matching codegen's double ops); BOOL compares ==/!= only. Codegen
+// lowers a chain to `&&` of these pairs (see eval_compare).
+fn cmp_pair(l: Value, op: lexer::TokenKind, r: Value) -> bool {
+    if val_is_int(l) && val_is_int(r) {
+        let a = as_int(l); let b = as_int(r)
+        match op {
+            EqEq => a == b
+            Ne   => a != b
+            Lt   => a < b
+            Le   => a <= b
+            Gt   => a > b
+            Ge   => a >= b
+            _    => panic("vm: comparison operator not yet supported")
+        }
+    } else if val_is_float(l) && val_is_float(r) {
+        let a = as_float(l); let b = as_float(r)
+        match op {
+            EqEq => a == b
+            Ne   => a != b
+            Lt   => a < b
+            Le   => a <= b
+            Gt   => a > b
+            Ge   => a >= b
+            _    => panic("vm: comparison operator not yet supported")
+        }
+    } else {
+        let a = as_bool(l); let b = as_bool(r)
+        match op {
+            EqEq => a == b
+            Ne   => a != b
+            _    => panic("vm: ordered comparison on bool not yet supported")
+        }
+    }
+}
+
+// eval_compare — a comparison chain `first (op operand)*`, the .tks twin of vm.c's eval_compare.
+// A degenerate chain (no rest terms) is just `first` (matches codegen). Otherwise codegen lowers
+// `a<b<c` to AND over adjacent pairs; we fold left, re-using each operand's value once (operands
+// are checker-pure leaves in M0, so the value-equivalence to codegen's twice-emitted form holds).
+fn eval_compare(c: checker::TCompare, env: Venv) -> Value {
+    if c.rest.len == 0 { return eval_expr(c.first, env) }   // degenerate (matches codegen)
+    mut prev = eval_expr(c.first, env)
+    mut acc = true
+    mut i = 0
+    loop {
+        if i >= c.rest.len { break }
+        let term = c.rest[i]
+        let rv = eval_expr(term.operand, env)
+        acc = acc && cmp_pair(prev, term.op, rv)
+        prev = rv
+        i++
+    }
+    acc
+}
+
+// find_function — resolve a user call by its callee Path, the .tks twin of vm.c's find_function.
+// The C twin scans a file-global `g_prog`; here the typed program rides the env (M.0 — no mutable
+// globals), so we scan `env.prog.items`. Match by the LAST path segment (a cross-namespace call
+// `ns::fn` qualifies; the seed resolves names by last segment, like resolve_named for types). A
+// miss is the honest "unknown function" frontier — a loud stop (M.3).
+fn find_function(env: Venv, callee: parser::Path) -> checker::TFunction {
+    let name = callee.segments[callee.segments.len - 1].name
+    mut i = 0
+    loop {
+        if i >= env.prog.items.len { break }
+        match env.prog.items[i] {
+            checker::TFunction as f => { if f.name == name { return f } }
+            _              => {}
+        }
+        i++
+    }
+    panic("vm: unknown function (internal: checker should reject)")
+}
+
+// mutate_slot — a compound/plain assignment to the NEWEST slot named `name`, the .tks twin of
+// vm.c's TK_TSTMT_ASSIGN compound-assign body. The C twin mutates the slot in place; the .tks env
+// is IMMUTABLE, so this rebuilds `env.slots` with that one slot replaced and returns the grown
+// env (functional, like define). A plain `=` stores the rhs; a compound `+=`/…/`>>=` applies the
+// int op at the slot's own width/signedness via apply_int_op + norm_int (div/mod route through the
+// CHECKED runtime so ÷0 panics, mirroring the C; the caller already positioned the ÷0 locator).
+fn mutate_slot(env: Venv, name: str, op: lexer::TokenKind, rhs: Value) -> Venv {
+    // find the NEWEST slot named `name` (newest-first, like `find`); the checker guarantees it binds.
+    mut idx = env.slots.len
+    mut found = false
+    loop {
+        if idx == 0 { break }
+        idx--
+        if env.slots[idx].name == name { found = true; break }
+    }
+    if !found { panic("vm: assignment to an unbound variable (internal: checker should reject)") }
+    let old = env.slots[idx].val
+    let newval = match op {
+        Assign => rhs
+        _      => {
+            // compound assign: int op at the slot's own width/signedness (M0 — ints only).
+            let sgn = int_sign_of(old); let w = int_width_of(old)
+            let a = as_int(old); let b = as_int(rhs)
+            match op {
+                SlashEq   => norm_int(teko::div(a, b, sgn), sgn, w)   // CHECKED: ÷0 panics
+                PercentEq => norm_int(teko::rem(a, b, sgn), sgn, w)   // CHECKED: %0 panics
+                PlusEq    => norm_int(apply_int_op(lexer::TokenKind::Plus,  a, b, sgn, w), sgn, w)
+                MinusEq   => norm_int(apply_int_op(lexer::TokenKind::Minus, a, b, sgn, w), sgn, w)
+                StarEq    => norm_int(apply_int_op(lexer::TokenKind::Star,  a, b, sgn, w), sgn, w)
+                AmpEq     => norm_int(apply_int_op(lexer::TokenKind::Amp,   a, b, sgn, w), sgn, w)
+                PipeEq    => norm_int(apply_int_op(lexer::TokenKind::Pipe,  a, b, sgn, w), sgn, w)
+                CaretEq   => norm_int(apply_int_op(lexer::TokenKind::Caret, a, b, sgn, w), sgn, w)
+                ShlEq     => norm_int(apply_int_op(lexer::TokenKind::Shl,   a, b, sgn, w), sgn, w)
+                ShrEq     => norm_int(apply_int_op(lexer::TokenKind::Shr,   a, b, sgn, w), sgn, w)
+                _         => panic("vm: assignment operator not yet supported")
+            }
+        }
+    }
+    // rebuild the slots, replacing the one at `idx` with the new value (functional update).
+    mut rebuilt: []Slot = teko::list::empty()
+    mut j = 0
+    loop {
+        if j >= env.slots.len { break }
+        if j == idx { rebuilt = teko::list::push(rebuilt, Slot { name= name; val= newval }) }
+        else        { rebuilt = teko::list::push(rebuilt, env.slots[j]) }
+        j++
+    }
+    Venv { slots= rebuilt; prog= env.prog }
+}
+
+// exit_code_of — the process exit code from the virtual-main's final value, the .tks twin of
+// vm.c's run-tail extraction: an int Value -> its value as i32 (mask the low 32 bits then cast,
+// matching the C `(int)(int64_t)`); a bool -> 1/0; anything else (incl null) -> 0.
+fn exit_code_of(v: Value?) -> i32 {
+    match v {
+        Value as val => {
+            if val_is_int(val) {
+                let raw = as_int(val) & 0xFFFFFFFF
+                if raw >= 0x80000000 { (raw - 0x100000000) to i32 } else { raw to i32 }
+            } else {
+                match val { bool as b => if b { 1 to i32 } else { 0 to i32 }; _ => 0 to i32 }
+            }
+        }
+        null => 0 to i32
+    }
+}
+
 // eval_binary — numeric arithmetic at the node's result prim (width/signedness/float-kind
 // from the node's type, exactly as codegen selects tk_div_<width> / fixed-width C ops).
 // Logical &&/|| short-circuit on bool. INT `/` and `%` route through the runtime's CHECKED
@@ -995,10 +1200,10 @@ fn coerce_to(v: Value, t: checker::Type) -> Value {
 // `f64` (the VM-debug carrier for all float widths); float ÷0 PANICS too (plan §5, same as
 // int). `%` / bitwise / shift on a float is honest-unsupported (the checker rejects them).
 fn eval_binary(b: checker::TBinary, ty: checker::Type, line: u32, col: u32, env: Venv) -> Value {
-    if b.op == AndAnd || b.op == OrOr {
+    if b.op == lexer::TokenKind::AndAnd || b.op == lexer::TokenKind::OrOr {
         let l = as_bool(eval_expr(b.left, env))
-        if b.op == AndAnd && !l { return false }
-        if b.op == OrOr  &&  l { return true }
+        if b.op == lexer::TokenKind::AndAnd && !l { return false }
+        if b.op == lexer::TokenKind::OrOr  &&  l { return true }
         return as_bool(eval_expr(b.right, env))
     }
     let prim = num_prim_of(ty)                 // honest stop if non-numeric (mirrors codegen)
@@ -1087,8 +1292,8 @@ fn eval_call(c: checker::TCall, env: Venv) -> Value {
     // str/byte STDLIB — value-producing str-returning builtins (str/str_of_bytes/one_byte/
     // str_concat3/ftoa). Recognized before user-fn resolution; null == not a str builtin, fall through.
     match try_str_builtin(c.callee, c.args, env) { Value as v => return v; null => {} }
-    let f = find_function(c.callee)        // resolved by LAST segment (cross-ns ok); honest stop if unknown / params
-    let fenv = Venv { slots = teko::list::empty() }
+    let f = find_function(env, c.callee)   // resolved by LAST segment (cross-ns ok); honest stop if unknown / params
+    let fenv = Venv { slots = teko::list::empty(); prog = env.prog }
     // Coerce the returned value into the declared return type: a `T` from a `-> T?` fn
     // present-wraps (REBOOT §202), mirroring codegen's emit_as on the return slot.
     match exec_block(f.body, fenv) {
@@ -1142,7 +1347,10 @@ fn exec_stmt(s: checker::TStatement, env: Venv) -> Step {
                     match eval_rhs_flow(b.value, env) {
                         // present-wrap into a `T?` slot (REBOOT §202) via coerce_to(b.bound).
                         Normal as nm => Stepped { env= define(env, sn.name, coerce_to(nm.value ?? panic("vm: binding RHS produced no value (internal: checker should reject)"), b.bound)); value= null }
-                        other        => Exit { flow= other }   // diverged → propagate, no bind
+                        // diverged (return/break/continue inside the RHS) → propagate, no bind.
+                        VmReturn as f => Exit { flow= f }
+                        Break as f    => Exit { flow= f }
+                        Continue as f => Exit { flow= f }
                     }
                 }
                 _                => { panic("vm: destructuring binding not yet supported") }
@@ -1156,10 +1364,10 @@ fn exec_stmt(s: checker::TStatement, env: Venv) -> Step {
         // message (M.1); we only prefix line:col first.
         checker::TAssign as a   => {
             let rhs = eval_expr(a.value, env)
-            if (a.op == SlashEq || a.op == PercentEq) && val_is_int(rhs) && as_int(rhs) == 0 {
+            if (a.op == lexer::TokenKind::SlashEq || a.op == lexer::TokenKind::PercentEq) && val_is_int(rhs) && as_int(rhs) == 0 {
                 vm_panic_div0_at(a.value.line, a.value.col)
             }
-            mutate_slot(env, a.name, a.op, rhs); Stepped { env= env; value= null }
+            let env2 = mutate_slot(env, a.name, a.op, rhs); Stepped { env= env2; value= null }
         }
         // `return e` rides a present value; a bare `return` carries null. The value may itself be
         // an `if`/`match` whose arm DIVERGES — run it flow-aware so an inner return propagates.
@@ -1167,7 +1375,10 @@ fn exec_stmt(s: checker::TStatement, env: Venv) -> Step {
             if r.has_value {
                 match eval_rhs_flow(r.value, env) {
                     Normal as nm => Exit { flow= VmReturn { value= nm.value } }
-                    other        => Exit { flow= other }   // inner return/break/continue
+                    // inner return/break/continue inside the returned value → propagate.
+                    VmReturn as f => Exit { flow= f }
+                    Break as f    => Exit { flow= f }
+                    Continue as f => Exit { flow= f }
                 }
             } else {
                 Exit { flow= VmReturn { value= null } }
@@ -1237,8 +1448,8 @@ fn call_value(c: checker::TCall, env: Venv) -> Value? {
         bool as ran => if ran { return null }
         error       => {}
     }
-    let f = find_function(c.callee)
-    let fenv = Venv { slots = teko::list::empty() }
+    let f = find_function(env, c.callee)
+    let fenv = Venv { slots = teko::list::empty(); prog = env.prog }
     match exec_block(f.body, fenv) {
         VmReturn as ret => ret.value                      // explicit `return e` (or bare return -> null)
         Normal as nm  => nm.value                       // W5a — implicit trailing value (B.20); null if none
@@ -1292,7 +1503,7 @@ fn exec_if(e: checker::TExpr, env: Venv) -> Flow {
 // the end -> 0. Top-level functions are callable (run only when called, never on their own).
 // ---------------------------------------------------------------------------
 exp fn run(prog: checker::TProgram) -> i32 {
-    mut env = Venv { slots = teko::list::empty() }
+    mut env = Venv { slots = teko::list::empty(); prog = prog }
     mut last: Value? = null      // W5a — the last NORMAL top-level statement's trailing value (B.20)
     mut i = 0
     loop {

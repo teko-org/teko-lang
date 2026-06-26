@@ -6,6 +6,7 @@
 // (forward-declared, both non-static, to avoid a match↔typer cycle).
 tk_texpr_result tk_typer_expr(tk_expr e, tk_env env, tk_type_table table);
 tk_type_result  field_type(tk_struct_body sb, tk_str field, tk_type_table table);
+bool tk_literal_adopts(tk_texpr e, tk_type to);   // from expr.c — numeric-literal adoption (byte/int)
 
 static tk_env_result eok(tk_env e)     { return (tk_env_result){ .ok = true,  .as.value = e }; }
 static tk_env_result efail(tk_error e) { return (tk_env_result){ .ok = false, .as.error = e }; }
@@ -75,7 +76,10 @@ tk_env_result tk_check_pattern(tk_pattern p, tk_type subject, tk_env env, tk_typ
         case TK_PAT_LITERAL: {
             tk_texpr_result lt = tk_typer_expr(p.as.literal.value, env, table);
             if (!lt.ok) return efail(lt.as.error);
-            if (!tk_type_eq(&lt.as.value.type, &subject)) return efail(tk_error_make("literal pattern does not match the subject type"));
+            // a numeric literal pattern adopts the subject's numeric type, so `match b { 0xE0 => … }`
+            // matches a `byte` subject (byte = u8) — parity with the value-position literal adoption.
+            if (!tk_type_eq(&lt.as.value.type, &subject) && !tk_literal_adopts(lt.as.value, subject))
+                return efail(tk_error_make("literal pattern does not match the subject type"));
             return eok(env);
         }
         case TK_PAT_FIELD: {
@@ -101,9 +105,12 @@ tk_env_result tk_check_pattern(tk_pattern p, tk_type subject, tk_env env, tk_typ
             if (!lo.ok) return efail(lo.as.error);
             tk_texpr_result hi = tk_typer_expr(p.as.range.hi, env, table);
             if (!hi.ok) return efail(hi.as.error);
-            if (!tk_type_eq(&lo.as.value.type, &subject)) return efail(tk_error_make("range lower bound does not match the subject type"));
-            if (!tk_type_eq(&hi.as.value.type, &subject)) return efail(tk_error_make("range upper bound does not match the subject type"));
-            if (!(subject.tag == TK_TYPE_PRIM && tk_prim_is_int(subject.as.prim))) return efail(tk_error_make("range pattern requires an integer subject (B.38 — not a float)"));
+            // bounds adopt the subject's numeric type (so `0xC2..=0xDF` matches a `byte` subject).
+            if (!tk_type_eq(&lo.as.value.type, &subject) && !tk_literal_adopts(lo.as.value, subject)) return efail(tk_error_make("range lower bound does not match the subject type"));
+            if (!tk_type_eq(&hi.as.value.type, &subject) && !tk_literal_adopts(hi.as.value, subject)) return efail(tk_error_make("range upper bound does not match the subject type"));
+            // an integer subject — an int prim OR `byte` (= u8); a float range is rejected (B.38).
+            if (!((subject.tag == TK_TYPE_PRIM && tk_prim_is_int(subject.as.prim)) || subject.tag == TK_TYPE_BYTE))
+                return efail(tk_error_make("range pattern requires an integer subject (B.38 — not a float)"));
             return eok(env);   // binds nothing
         }
         case TK_PAT_ALT: {

@@ -216,11 +216,12 @@ static tk_texpr_result type_call(tk_call c, tk_env env, tk_type_table table) {
     // panic / exit — injected GLOBAL diverging builtins (legislator's ruling — NO `never` type).
     // panic(error | str) = the message; exit(<integer>) = the status code. Both terminate the
     // program; the call's STATIC type is void, but tk_texpr_diverges accepts it in any value
-    // position (type_coalesce / tk_tblock_diverges). Unqualified, and only when the namespace-aware
-    // lookup finds NOTHING — so a same-namespace `fn panic` (the runtime's own) resolves to ITSELF
-    // (below), while every other namespace gets the injected global (the runtime defines `panic`,
-    // so #41's env now contains it; the old `tk_env_lookup` by-name guard wrongly suppressed this).
-    if (c.callee.len == 1 && !tk_env_lookup_call(env, c.callee).ok) {
+    // position (type_coalesce / tk_tblock_diverges). Recognized UNQUALIFIED (`exit`) OR via the
+    // reserved root (`teko::exit`), and only when the namespace-aware lookup finds NOTHING — so a
+    // same-namespace `fn panic` (the runtime's own) resolves to ITSELF (below), while every other
+    // namespace gets the injected global (the runtime defines `panic`, so #41's env contains it).
+    bool teko_rooted = c.callee.len == 2 && seg_lit(c.callee.segments[0].name, "teko");
+    if ((c.callee.len == 1 || teko_rooted) && !tk_env_lookup_call(env, c.callee).ok) {
         bool is_panic = seg_lit(name, "panic");
         if (is_panic || seg_lit(name, "exit")) {
             if (c.nargs != 1) return xerr(is_panic ? "panic expects one argument (an `error` or a `str`)"
@@ -423,12 +424,33 @@ bool tk_literal_adopts(tk_texpr e, tk_type to) {
     return false;
 }
 
+// (E7) is `t` a NAMED type whose declaration is an `enum`?
+static bool is_enum_named(tk_type t, tk_type_table table) {
+    if (t.tag != TK_TYPE_NAMED) return false;
+    tk_decl_result d = tk_type_table_find(table, t.as.named.name);
+    return d.ok && d.as.value.body.tag == TK_BODY_ENUM;
+}
+// (E7) an INTEGER cast endpoint: an int prim, or `byte` (= u8). Floats/bool excluded.
+static bool is_int_cast_end(tk_type t) {
+    if (t.tag == TK_TYPE_BYTE) return true;
+    return t.tag == TK_TYPE_PRIM && tk_prim_is_int(t.as.prim);
+}
+
 static tk_texpr_result type_cast(tk_cast c, tk_env env, tk_type_table table) {
     tk_texpr_result inner = tk_typer_expr(*c.expr, env, table); if (!inner.ok) return inner;
     if (tk_type_is_void(&inner.as.value.type)) return xerr("a `void` expression cannot be cast (M.1)");
     tk_type_result tgt = tk_resolve_type(c.target, table);     if (!tgt.ok) return xferr(tgt.as.error);
-    const char *why = cast_reason(inner.as.value.type, tgt.as.value);
-    if (why != NULL) return xerr(why);
+    // (E7) enum ↔ integer ORDINAL cast: an enum value → its ordinal integer, and an integer → the
+    // enum member (the `(tk_byte)k` / `(tk_token_kind)b` the .tkb serializer relies on). cast_reason
+    // is prim-only, so handle this pair here (it has the type table to detect an enum); the result
+    // type is the target. Any OTHER enum cast stays rejected by cast_reason below.
+    tk_type ft = inner.as.value.type, tt = tgt.as.value;
+    bool e7 = (is_enum_named(ft, table) && is_int_cast_end(tt))
+           || (is_int_cast_end(ft) && is_enum_named(tt, table));
+    if (!e7) {
+        const char *why = cast_reason(ft, tt);
+        if (why != NULL) return xerr(why);
+    }
     // fail early (M.1): a constant literal already out of the target's range is a compile error.
     // The target's effective kind comes from cast_kind, so `… to byte` checks the U8 range (0..255).
     // Only the int-literal → int-target case is statically range-checkable here: an integer
@@ -617,17 +639,15 @@ static tk_texpr_result type_struct_lit(tk_struct_lit sl, tk_env env, tk_type_tab
         tk_texpr_result vt = tk_typer_expr(sl.field_vals[found], env, table);
         if (!vt.ok) { tk_free0(names); tk_free0(vals); return vt; }
         tk_texpr val = vt.as.value;
-        // literal adaptation: a fitting numeric literal adopts the field's prim type.
-        if (val.tag == TK_TEXPR_NUMBER && ft.as.value.tag == TK_TYPE_PRIM && !tk_type_eq(&val.type, &ft.as.value)) {
-            bool fits = val.as.number.is_float
-                ? tk_prim_is_float(ft.as.value.as.prim)
-                : (tk_prim_is_int(ft.as.value.as.prim) && value_fits(val.as.number.value, ft.as.value.as.prim));
-            if (fits) val.type = ft.as.value;
-        }
-        // The field value must WIDEN into the field's declared type: exact, a variant CASE into a
-        // variant-typed field (`TExpr.kind = TNumber{…}` where kind: TExprKind), or `T` into a `T?`
-        // field. Same rule as return/arm widening (the single source of truth, resolve.c).
-        if (!tk_widens_into(val.type, ft.as.value, table)) {
+        // The field value must WIDEN into the field's declared type (exact, a variant CASE into a
+        // variant-typed field — keep the case type so codegen's emit_as wraps it — or `T` into a
+        // `T?`); OR be a fitting numeric LITERAL that ADOPTS the field type (incl a `byte` field =
+        // u8 — `lo = 0x80`), in which case the leaf is retyped. Same rules as binding/arg adoption.
+        if (tk_widens_into(val.type, ft.as.value, table)) {
+            /* widened — keep val.type (the case) for codegen wrapping */
+        } else if (tk_literal_adopts(val, ft.as.value)) {
+            val.type = ft.as.value;   // a fitting literal adopts the field's type (leaf retyped)
+        } else {
             tk_free0(names); tk_free0(vals);
             // (C1.8) expected = the field's declared type, actual = the provided value's type
             return xferr(tk_error_types(tk_error_make("a struct-literal field value does not match the field's declared type"),

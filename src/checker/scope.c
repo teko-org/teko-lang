@@ -138,6 +138,10 @@ tk_type_result tk_builtin_fn(tk_str name) {
     static tk_type str_or_err = { .tag = TK_TYPE_VARIANT, .as.variant = { str_or_err_m, 2 } };
     static tk_type error_inner = { .tag = TK_TYPE_ERROR };
     static tk_type err_opt = { .tag = TK_TYPE_OPTIONAL, .as.optional.inner = &error_inner };
+    // driver host FFI: process::run([]str)->i32 (cc spawn), env::var(str)->str|error, env::chdir(str)->error?.
+    static tk_type str_el = { .tag = TK_TYPE_STR };
+    static tk_type str_slice_t = { .tag = TK_TYPE_SLICE, .as.slice.element = &str_el };
+    static tk_type i32_t = { .tag = TK_TYPE_PRIM, .as.prim = TK_PRIM_I32 };
     // VM-internal arithmetic FFI: sign-aware int div/rem over the i128 carrier, float div.
     static tk_type i128_t = { .tag = TK_TYPE_PRIM, .as.prim = TK_PRIM_I128 };
     static tk_type divrem_p[3] = { { .tag = TK_TYPE_PRIM, .as.prim = TK_PRIM_I128 }, { .tag = TK_TYPE_PRIM, .as.prim = TK_PRIM_I128 }, { .tag = TK_TYPE_PRIM, .as.prim = TK_PRIM_BOOL } };
@@ -198,9 +202,25 @@ tk_type_result tk_builtin_fn(tk_str name) {
         tk_type ft = { .tag = TK_TYPE_FUNC, .as.func = { .params = str2_t, .nparams = 2, .ret = &err_opt } };
         return (tk_type_result){ .ok = true, .as.value = ft };
     }
+    if (name_is(name, "run")) {                                       // teko::process::run([]str) -> i32 (cc spawn)
+        tk_type ft = { .tag = TK_TYPE_FUNC, .as.func = { .params = &str_slice_t, .nparams = 1, .ret = &i32_t } };
+        return (tk_type_result){ .ok = true, .as.value = ft };
+    }
+    if (name_is(name, "var")) {                                       // teko::env::var(str) -> str | error
+        tk_type ft = { .tag = TK_TYPE_FUNC, .as.func = { .params = &str_t, .nparams = 1, .ret = &str_or_err } };
+        return (tk_type_result){ .ok = true, .as.value = ft };
+    }
+    if (name_is(name, "chdir")) {                                     // teko::env::chdir(str) -> error?
+        tk_type ft = { .tag = TK_TYPE_FUNC, .as.func = { .params = &str_t, .nparams = 1, .ret = &err_opt } };
+        return (tk_type_result){ .ok = true, .as.value = ft };
+    }
     // print/println + teko::io::write/ewrite — the host output bottom (write/ewrite are the FFI
     // primitives the runtime's print/println/panic lower to; ewrite is stderr). All (str) -> void.
-    if (name_is(name, "print") || name_is(name, "println") || name_is(name, "write") || name_is(name, "ewrite") || name_is(name, "eprint")) {
+    if (name_is(name, "args")) {                                      // teko::env::args() -> []str (argv)
+        tk_type ft = { .tag = TK_TYPE_FUNC, .as.func = { .params = NULL, .nparams = 0, .ret = &str_slice_t } };
+        return (tk_type_result){ .ok = true, .as.value = ft };
+    }
+    if (name_is(name, "print") || name_is(name, "println") || name_is(name, "write") || name_is(name, "ewrite") || name_is(name, "eprint") || name_is(name, "eprintln")) {
         tk_type ft = { .tag = TK_TYPE_FUNC,
                        .as.func = { .params = &str_t, .nparams = 1, .ret = &void_t } };
         return (tk_type_result){ .ok = true, .as.value = ft };
