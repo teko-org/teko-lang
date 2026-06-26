@@ -1138,6 +1138,24 @@ fn emit_call(buf: []byte, prog: checker::TProgram, e: checker::TExpr, c: checker
             return cb(o, ".len }); })")
         }
     }
+    // Host-FFI bottoms with a VARIANT/OPTIONAL or argv return: lifted from a fixed-ABI runtime
+    // result into the program's result type (the runtime can't name the generated sum/optional
+    // structs — teko_rt.h). Intercepted BY NAME (these names are not user-shadowed: the only
+    // definitions are pure FFI forwarders), ahead of the plain map. (C: emit_host_ffi dispatch.)
+    if p.segments.len >= 1 {
+        let l = p.segments[p.segments.len - 1].name
+        let addr2 = (p.segments.len == 1) || (p.segments[0].name == "teko")
+        if addr2 {
+            if l == "read_file"     { return emit_host_ffi(buf, prog, e, c, "sres",   "tk_rt_read_file") }
+            if l == "var"           { return emit_host_ffi(buf, prog, e, c, "sres",   "tk_rt_getenv") }
+            if l == "write_file"    { return emit_host_ffi(buf, prog, e, c, "ures",   "tk_rt_write_file") }
+            if l == "chdir"         { return emit_host_ffi(buf, prog, e, c, "ures",   "tk_rt_chdir") }
+            if l == "list_dir"      { return emit_host_ffi(buf, prog, e, c, "slres",  "tk_rt_list_dir") }
+            if l == "last_index_of" { return emit_host_ffi(buf, prog, e, c, "u64res", "tk_rt_last_index_of") }
+            if l == "args"          { return emit_host_ffi(buf, prog, e, c, "args",   "tk_rt_args") }
+            if l == "run"           { return emit_host_ffi(buf, prog, e, c, "run",    "tk_rt_run") }
+        }
+    }
     // Non-shadowable built-ins: `print`/`println`, either bare or under `teko`.
     mut builtin = ""
     mut has_builtin = false
@@ -1155,6 +1173,14 @@ fn emit_call(buf: []byte, prog: checker::TProgram, e: checker::TExpr, c: checker
             else if last == "eprint"   { builtin = "tk_eprint";      has_builtin = true }   // (str) -> void (stderr)
             else if last == "eprintln" { builtin = "tk_eprintln";    has_builtin = true }   // (str) -> void (stderr + '\n')
             else if last == "parse"    { builtin = "tk_float_parse"; has_builtin = true }   // teko::float::parse(str) -> f64
+            // arithmetic FFI over the i128 carrier (sign-aware) + float bit-patterns. (`div`/`rem`
+            // mangle to tk_* so they never clash with libc's div/rem.)
+            else if last == "div"          { builtin = "tk_div";          has_builtin = true }   // (i128,i128,bool) -> i128
+            else if last == "rem"          { builtin = "tk_rem";          has_builtin = true }   // (i128,i128,bool) -> i128
+            else if last == "fdiv"         { builtin = "tk_fdiv";         has_builtin = true }   // (f64,f64) -> f64
+            else if last == "int_to_float" { builtin = "tk_int_to_float"; has_builtin = true }   // (i128,bool) -> f64
+            else if last == "f64_bits"     { builtin = "tk_f64_bits";     has_builtin = true }   // (f64) -> u64
+            else if last == "f64_from_bits" { builtin = "tk_f64_from_bits"; has_builtin = true } // (u64) -> f64
             // diverging runtime panic helpers (the corpus calls these by bare name)
             else if last == "panic_div0"     { builtin = "tk_panic_div0";     has_builtin = true }
             else if last == "panic_oob"      { builtin = "tk_panic_oob";      has_builtin = true }
@@ -1175,7 +1201,7 @@ fn emit_call(buf: []byte, prog: checker::TProgram, e: checker::TExpr, c: checker
             else if last == "len"          { builtin = "tk_str_len";      has_builtin = true }   // (str) -> u64
             else if last == "ends_with"    { builtin = "tk_str_ends_with"; has_builtin = true }  // (str,str) -> bool
             else if last == "contains"     { builtin = "tk_str_contains"; has_builtin = true }   // (str,str) -> bool
-            else if last == "last_index_of" { builtin = "tk_str_last_index_of"; has_builtin = true } // (str,str) -> u64|error
+            // (last_index_of returns u64|error → lifted by emit_host_ffi above, not here)
             else if last == "i64_to_str"   { builtin = "tk_i64_to_str";   has_builtin = true }   // (i64) -> str
             else if last == "u64_to_str"   { builtin = "tk_u64_to_str";   has_builtin = true }   // (u64) -> str
             else if last == "ftoa"         { builtin = "tk_ftoa";         has_builtin = true }   // (f64) -> str
@@ -1952,6 +1978,104 @@ fn emit_variant_wrap_str(buf: []byte, prog: checker::TProgram, expected: checker
     }
     // unreachable given the caller's cg_var_reaches guard.
     error { message = "codegen: emit_variant_wrap_str on an unreachable case (internal — caller must guard with cg_var_reaches)" }
+}
+
+// emit_host_ffi — lift a host-FFI primitive's fixed-ABI result (teko_rt.h) into the program's
+// result type. The runtime can't name the generated sum/optional/slice structs (its header is
+// included before them), so codegen builds them here: call the primitive, then construct
+// `e.type` from the result's header-knowable fields (`error` is its message str). Single-eval —
+// the result struct is bound to one temp, then both arms read it. `kind` selects the shape:
+// "sres"(str|error) "ures"(error?) "slres"([]str|error) "u64res"(u64|error) "args" "run".
+// (C: `emit_host_ffi`.)
+fn emit_host_ffi(buf: []byte, prog: checker::TProgram, e: checker::TExpr, c: checker::TCall, kind: str, rtfn: str) -> []byte | error {
+    let t = $"_h{buf.len}"                  // unique temp per call site
+    let str_t = checker::Str { }
+    let err_t = checker::Error { }
+
+    // args() -> []str : ({ uint64_t _hNn; tk_str *_hNp = tk_rt_args(&_hNn); (tk_slice_str){…}; })
+    if kind == "args" {
+        mut o = cb(buf, "({ uint64_t ")
+        o = cb(o, t)
+        o = cb(o, "n; tk_str *")
+        o = cb(o, t)
+        o = cb(o, "p = ")
+        o = cb(o, rtfn)
+        o = cb(o, "(&")
+        o = cb(o, t)
+        o = cb(o, "n); (")
+        o = match cg_slice_typename(o, str_t) { []byte as r => r; error as err => return err }
+        o = cb(o, "){ .ptr = ")
+        o = cb(o, t)
+        o = cb(o, "p, .len = ")
+        o = cb(o, t)
+        return cb(o, "n }; })")
+    }
+    // run([]str) -> i32 : the primitive takes ptr+len (no generated slice type). Single-eval argv.
+    if kind == "run" {
+        mut o = cb(buf, "({ ")
+        o = match cg_slice_typename(o, str_t) { []byte as r => r; error as err => return err }
+        o = cb(o, " ")
+        o = cb(o, t)
+        o = cb(o, " = ")
+        o = match emit_expr(o, prog, c.args[0]) { []byte as r => r; error as err => return err }
+        o = cb(o, "; ")
+        o = cb(o, rtfn)
+        o = cb(o, "(")
+        o = cb(o, t)
+        o = cb(o, ".ptr, ")
+        o = cb(o, t)
+        return cb(o, ".len); })")
+    }
+
+    // The struct-returning host FFI: bind the fixed-ABI result, then lift per result shape.
+    let resty = if kind == "sres" { "tk_ffi_sres" } else if kind == "ures" { "tk_ffi_ures" } else if kind == "slres" { "tk_ffi_slres" } else { "tk_ffi_u64res" }
+    mut o = cb(buf, "({ ")
+    o = cb(o, resty)
+    o = cb(o, " ")
+    o = cb(o, t)
+    o = cb(o, " = ")
+    o = cb(o, rtfn)
+    o = cb(o, "(")
+    mut i: u64 = 0
+    loop {
+        if i >= c.args.len { break }
+        if i > 0 { o = cb(o, ", ") }
+        o = match emit_expr(o, prog, c.args[i]) { []byte as r => r; error as err => return err }
+        i++
+    }
+    o = cb(o, "); ")
+
+    // error? : ok → present=false (success) ; !ok → present=true, value=<message>.
+    if kind == "ures" {
+        o = cb(o, t)
+        o = cb(o, ".ok ? (")
+        o = match emit_type(o, e.type) { []byte as r => r; error as err => return err }
+        o = cb(o, "){ .present = false } : (")
+        o = match emit_type(o, e.type) { []byte as r => r; error as err => return err }
+        o = cb(o, "){ .present = true, .value = ")
+        o = cb(o, t)
+        return cb(o, ".err }; })")
+    }
+
+    // VARIANT results: ok → wrap the value arm ; !ok → wrap the error arm (its message str).
+    o = cb(o, t)
+    o = cb(o, ".ok ? ")
+    if kind == "sres" {
+        o = match emit_variant_wrap_str(o, prog, e.type, str_t, $"{t}.value") { []byte as r => r; error as err => return err }
+    } else if kind == "u64res" {
+        o = match emit_variant_wrap_str(o, prog, e.type, checker::Prim { kind = checker::PrimKind::U64 }, $"{t}.value") { []byte as r => r; error as err => return err }
+    } else {
+        let slice_t = checker::Slice { element = checker::Str { } }
+        // cexpr has literal braces → built via concat ($-interpolation has no brace escape).
+        let sx = teko::str::concat3("(tk_slice_str){ .ptr = ", t, teko::str::concat3(".ptr, .len = ", t, ".len }"))
+        o = match emit_variant_wrap_str(o, prog, e.type, slice_t, sx) { []byte as r => r; error as err => return err }
+    }
+    o = cb(o, " : ")
+    // u64res carries no message (not-found is the only failure) → an empty error str; the others
+    // surface the primitive's `.err` message.
+    let eexpr = if kind == "u64res" { "(tk_str){0}" } else { $"{t}.err" }
+    o = match emit_variant_wrap_str(o, prog, e.type, err_t, eexpr) { []byte as r => r; error as err => return err }
+    return cb(o, "; })")
 }
 
 // cg_type_mangle_eq — do two resolved types mangle to the SAME generated C type name (→ same
@@ -3867,7 +3991,9 @@ fn tk_emit_c(prog: checker::TProgram) -> str | error {
         }
         li++
     }
-    b = cb(b, "int main(void) {\n")
+    // main captures argv so teko::env::args() (tk_rt_args) can return it; tk_set_args first.
+    b = cb(b, "int main(int argc, char **argv) {\n")
+    b = cb(b, "    tk_set_args(argc, argv);\n")
     mut j = 0
     loop {
         if j >= prog.items.len { break }

@@ -91,6 +91,58 @@ bool tk_str_contains(tk_str s, tk_str needle);
 // renderer as tk_ftoa, exposed under the `f64_g17` name the checker/codegen reference).
 tk_str tk_f64_g17(double x);
 
+// =========================================================================
+// Host-FFI + arithmetic bottoms (Phase 7 / scope.c builtin_fn surface).
+//
+// THE LIFTING SEAM. The host I/O builtins return Teko `T | error` / `error?`
+// sums and `[]str`. Those are GENERATED struct types (tk_u_str_error,
+// tk_opt_error, tk_slice_str, …) defined in the emitted C, AFTER this header is
+// #included — so the runtime CANNOT name them. Instead each primitive returns a
+// FIXED-ABI result struct over header-knowable types only (tk_str + scalars +
+// tk_str*), and codegen lifts that into the program's result type (the
+// emit_host_ffi statement-expression). `error` lowers to its message tk_str.
+// =========================================================================
+
+// str | error  (read_file, var): ok → value; !ok → err (the message).
+typedef struct { bool ok; tk_str value; tk_str err; } tk_ffi_sres;
+// error?  (write_file, chdir): ok → success (no error); !ok → err present.
+typedef struct { bool ok; tk_str err; } tk_ffi_ures;
+// []str | error  (list_dir): ok → {ptr,len} entries; !ok → err.
+typedef struct { bool ok; tk_str *ptr; uint64_t len; tk_str err; } tk_ffi_slres;
+// u64 | error  (last_index_of): ok → value; !ok → not found.
+typedef struct { bool ok; uint64_t value; } tk_ffi_u64res;
+
+// teko::io::read_file(path) — slurp the whole file as UTF-8 bytes (owned copy).
+tk_ffi_sres tk_rt_read_file(tk_str path);
+// teko::env::var(name) — the environment value, or error when unset.
+tk_ffi_sres tk_rt_getenv(tk_str name);
+// teko::io::write_file(path, content) — (over)write the file; error on failure.
+tk_ffi_ures tk_rt_write_file(tk_str path, tk_str content);
+// teko::env::chdir(path) — change the process working directory; error on failure.
+tk_ffi_ures tk_rt_chdir(tk_str path);
+// teko::fs::list_dir(path) — the directory entries (excluding "." / ".."), or error.
+tk_ffi_slres tk_rt_list_dir(tk_str path);
+// teko::str::last_index_of(hay, needle) — byte index of the LAST occurrence, or not-found.
+tk_ffi_u64res tk_rt_last_index_of(tk_str hay, tk_str needle);
+// teko::process::run(argv) — fork/exec argv[0] with argv, wait, return its exit status
+// (127 when argv is empty / exec fails). Takes the slice as ptr+len (no generated type).
+int32_t tk_rt_run(const tk_str *argv, uint64_t n);
+// teko::env::args() — the captured process argv as owned tk_str's; *n receives the count.
+// tk_set_args must run first (the generated `main` calls it before the virtual-main body).
+void    tk_set_args(int argc, char **argv);
+tk_str *tk_rt_args(uint64_t *n);
+
+// --- arithmetic FFI over the i128 carrier (sign-aware) + float bit-patterns ---
+// div/rem: truncated division/remainder; sgn selects signed vs unsigned interpretation.
+__int128 tk_div(__int128 a, __int128 b, bool sgn);
+__int128 tk_rem(__int128 a, __int128 b, bool sgn);
+// fdiv: float division (the VM's f64 `/`); int_to_float: i128 (sgn-aware) → f64.
+double   tk_fdiv(double a, double b);
+double   tk_int_to_float(__int128 v, bool sgn);
+// f64 ↔ raw IEEE-754 bit pattern (the .tkb float (de)serialization edge).
+uint64_t tk_f64_bits(double x);
+double   tk_f64_from_bits(uint64_t bits);
+
 // tk_panic — fail loud (M.1): "teko: panic: <msg>\n" to stderr, then non-zero exit.
 _Noreturn void tk_panic(const char *msg);
 // the Teko-level globals `panic(str)` / `exit(<int>)` (legislator's ruling — no `never` type).

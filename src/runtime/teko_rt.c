@@ -7,6 +7,9 @@
 #include <string.h>   // memcpy
 #include <signal.h>   // signal — native crash backtraces (C1.9)
 #include <execinfo.h> // backtrace, backtrace_symbols_fd (C1.9)
+#include <unistd.h>   // chdir, fork, execvp, _exit (host FFI bottoms)
+#include <sys/wait.h> // waitpid — teko::process::run
+#include <dirent.h>   // opendir/readdir — teko::fs::list_dir
 
 // (C1.9) NATIVE STACK TRACES. A generated Teko program links this runtime; on a panic (M.1)
 // or a fatal signal (a bug in generated code), print a C backtrace to stderr — the frames carry
@@ -253,3 +256,150 @@ _Noreturn void tk_panic_oob_at(uint32_t line, uint32_t col) {
     fputs(buf, stderr);
     tk_panic_oob();
 }
+
+// =========================================================================
+// Host-FFI + arithmetic bottoms (the lifting seam — see teko_rt.h). The
+// codegen-side emit_host_ffi turns each fixed-ABI result struct into the
+// program's `T | error` / `error?` / `[]str` value. `error` is its message str.
+// =========================================================================
+
+// NUL-terminate a tk_str into a fresh owned C string (callers pass it to libc).
+static char *tk_cstr(tk_str s) {
+    char *c = (char *)tk_alloc(s.len + 1);
+    if (s.len) memcpy(c, s.ptr, s.len);
+    c[s.len] = '\0';
+    return c;
+}
+// A fresh owned tk_str holding the bytes of a C string (the message / value carrier).
+static tk_str tk_str_of_cstr(const char *c) {
+    size_t n = strlen(c);
+    tk_byte *buf = (tk_byte *)tk_alloc(n ? n : 1);
+    if (n) memcpy(buf, c, n);
+    return (tk_str){ buf, n };
+}
+
+tk_ffi_sres tk_rt_read_file(tk_str path) {
+    char *p = tk_cstr(path);
+    FILE *f = fopen(p, "rb");
+    if (f == NULL) return (tk_ffi_sres){ .ok = false, .err = tk_str_of_cstr("cannot open file") };
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return (tk_ffi_sres){ .ok = false, .err = tk_str_of_cstr("cannot seek file") }; }
+    long sz = ftell(f);
+    if (sz < 0) { fclose(f); return (tk_ffi_sres){ .ok = false, .err = tk_str_of_cstr("cannot size file") }; }
+    if (fseek(f, 0, SEEK_SET) != 0) { fclose(f); return (tk_ffi_sres){ .ok = false, .err = tk_str_of_cstr("cannot rewind file") }; }
+    size_t n = (size_t)sz;
+    tk_byte *buf = (tk_byte *)tk_alloc(n ? n : 1);
+    size_t got = fread(buf, 1, n, f);
+    fclose(f);
+    if (got != n) return (tk_ffi_sres){ .ok = false, .err = tk_str_of_cstr("short read on file") };
+    return (tk_ffi_sres){ .ok = true, .value = (tk_str){ buf, n } };
+}
+
+tk_ffi_sres tk_rt_getenv(tk_str name) {
+    char *n = tk_cstr(name);
+    const char *v = getenv(n);
+    if (v == NULL) return (tk_ffi_sres){ .ok = false, .err = tk_str_of_cstr("environment variable not set") };
+    return (tk_ffi_sres){ .ok = true, .value = tk_str_of_cstr(v) };
+}
+
+tk_ffi_ures tk_rt_write_file(tk_str path, tk_str content) {
+    char *p = tk_cstr(path);
+    FILE *f = fopen(p, "wb");
+    if (f == NULL) return (tk_ffi_ures){ .ok = false, .err = tk_str_of_cstr("cannot open file for writing") };
+    size_t put = content.len ? fwrite(content.ptr, 1, content.len, f) : 0;
+    int rc = fclose(f);
+    if (put != content.len || rc != 0) return (tk_ffi_ures){ .ok = false, .err = tk_str_of_cstr("short write on file") };
+    return (tk_ffi_ures){ .ok = true };
+}
+
+tk_ffi_ures tk_rt_chdir(tk_str path) {
+    char *p = tk_cstr(path);
+    if (chdir(p) != 0) return (tk_ffi_ures){ .ok = false, .err = tk_str_of_cstr("cannot change directory") };
+    return (tk_ffi_ures){ .ok = true };
+}
+
+tk_ffi_slres tk_rt_list_dir(tk_str path) {
+    char *p = tk_cstr(path);
+    DIR *d = opendir(p);
+    if (d == NULL) return (tk_ffi_slres){ .ok = false, .err = tk_str_of_cstr("cannot open directory") };
+    // Grow-append the entry names (skip "." / "..") into an owned tk_str array.
+    size_t cap = 8, n = 0;
+    tk_str *out = (tk_str *)tk_alloc(cap * sizeof *out);
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (e->d_name[0] == '.' && (e->d_name[1] == '\0' || (e->d_name[1] == '.' && e->d_name[2] == '\0'))) continue;
+        if (n == cap) {
+            size_t ncap = cap * 2;
+            tk_str *grown = (tk_str *)tk_alloc(ncap * sizeof *grown);
+            memcpy(grown, out, n * sizeof *out);
+            out = grown; cap = ncap;
+        }
+        out[n] = tk_str_of_cstr(e->d_name);
+        n += 1;
+    }
+    closedir(d);
+    return (tk_ffi_slres){ .ok = true, .ptr = out, .len = (uint64_t)n };
+}
+
+tk_ffi_u64res tk_rt_last_index_of(tk_str hay, tk_str needle) {
+    // Byte index of the LAST occurrence of needle in hay (an empty needle → hay.len).
+    if (needle.len == 0) return (tk_ffi_u64res){ .ok = true, .value = (uint64_t)hay.len };
+    if (needle.len > hay.len) return (tk_ffi_u64res){ .ok = false };
+    for (size_t i = hay.len - needle.len + 1; i-- > 0; ) {
+        if (memcmp(hay.ptr + i, needle.ptr, needle.len) == 0)
+            return (tk_ffi_u64res){ .ok = true, .value = (uint64_t)i };
+        if (i == 0) break;
+    }
+    return (tk_ffi_u64res){ .ok = false };
+}
+
+int32_t tk_rt_run(const tk_str *argv, uint64_t n) {
+    if (n == 0) return 127;
+    // Build a NUL-terminated argv (each arg NUL-terminated; the vector NULL-terminated).
+    char **cargv = (char **)tk_alloc((n + 1) * sizeof *cargv);
+    for (uint64_t i = 0; i < n; i += 1) cargv[i] = tk_cstr(argv[i]);
+    cargv[n] = NULL;
+    pid_t pid = fork();
+    if (pid < 0) return 127;
+    if (pid == 0) {                      // child: exec; on failure exit 127 (POSIX convention)
+        execvp(cargv[0], cargv);
+        _exit(127);
+    }
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) return 127;
+    if (WIFEXITED(status)) return (int32_t)(int8_t)WEXITSTATUS(status);
+    return 127;
+}
+
+// Captured process argv (the generated `main` calls tk_set_args before the virtual-main body).
+static int    tk_g_argc = 0;
+static char **tk_g_argv = NULL;
+void tk_set_args(int argc, char **argv) { tk_g_argc = argc; tk_g_argv = argv; }
+tk_str *tk_rt_args(uint64_t *n) {
+    uint64_t c = (uint64_t)(tk_g_argc < 0 ? 0 : tk_g_argc);
+    tk_str *out = (tk_str *)tk_alloc((c ? c : 1) * sizeof *out);
+    for (uint64_t i = 0; i < c; i += 1) {
+        size_t len = strlen(tk_g_argv[i]);
+        out[i] = (tk_str){ (const tk_byte *)tk_g_argv[i], len };   // argv lives for the process
+    }
+    *n = c;
+    return out;
+}
+
+// --- arithmetic FFI over the i128 carrier (sign-aware) + float bit patterns ---
+__int128 tk_div(__int128 a, __int128 b, bool sgn) {
+    if (b == 0) tk_panic_div0();
+    if (sgn) return a / b;
+    return (__int128)((unsigned __int128)a / (unsigned __int128)b);
+}
+__int128 tk_rem(__int128 a, __int128 b, bool sgn) {
+    if (b == 0) tk_panic_div0();
+    if (sgn) return a % b;
+    return (__int128)((unsigned __int128)a % (unsigned __int128)b);
+}
+double tk_fdiv(double a, double b) { if (b == 0.0) tk_panic_div0(); return a / b; }
+double tk_int_to_float(__int128 v, bool sgn) {
+    if (sgn) return (double)v;
+    return (double)(unsigned __int128)v;
+}
+uint64_t tk_f64_bits(double x)      { uint64_t b; memcpy(&b, &x, sizeof b); return b; }
+double   tk_f64_from_bits(uint64_t bits) { double x; memcpy(&x, &bits, sizeof x); return x; }

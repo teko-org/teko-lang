@@ -803,6 +803,12 @@ static bool emit_stmt(cbuf *b, const tk_tstatement *s, bool in_main,
 // no wrap because its struct value already carries the case name — this synthesizes the
 // C wrap, completing the W4c-deferred variant-value layer.)
 static bool emit_as(cbuf *b, tk_type expected, const tk_texpr *value, const char **err);
+// Host-FFI lifting (Phase 7): a builtin whose Teko return is `T|error` / `error?` / `[]str`
+// is emitted as a statement-expression that calls a fixed-ABI runtime primitive (teko_rt.h)
+// and lifts the result into the program's generated result type (e->type). Defined after the
+// variant-wrap helpers it leans on; the CALL case dispatches to it by builtin name.
+enum cg_ffi_kind { CG_FFI_SRES, CG_FFI_URES, CG_FFI_SLRES, CG_FFI_U64RES, CG_FFI_ARGS, CG_FFI_RUN };
+static bool emit_host_ffi(cbuf *b, int kind, const char *rtfn, const tk_texpr *e, const char **err);
 // W5b — a `match` lowered to a GNU statement-expression (the VALUE form).
 static bool emit_match_value(cbuf *b, const tk_texpr *e, const char **err);
 // W5b — a `match` in TAIL position (each arm body `return`s) and in STATEMENT position
@@ -1164,6 +1170,24 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
                 }
                 return fail_node(err, "codegen: this teko::list builtin not yet supported (only empty/push — fixed+copy)");
             }
+            // Host-FFI bottoms with a VARIANT/OPTIONAL or argv return: lifted from a fixed-ABI
+            // runtime result into the program's result type (the runtime can't name the generated
+            // sum/optional structs — teko_rt.h). Intercepted BY NAME (these names are not user-
+            // shadowed: the only definitions are pure FFI forwarders), ahead of the plain map.
+            if (p.len >= 1) {
+                tk_str l = p.segments[p.len - 1].name;
+                bool addr = (p.len == 1) || seg_is(p.segments[0].name, "teko");
+                if (addr) {
+                    if (seg_is(l, "read_file"))     return emit_host_ffi(b, CG_FFI_SRES,   "tk_rt_read_file",     e, err);
+                    if (seg_is(l, "var"))           return emit_host_ffi(b, CG_FFI_SRES,   "tk_rt_getenv",        e, err);
+                    if (seg_is(l, "write_file"))    return emit_host_ffi(b, CG_FFI_URES,   "tk_rt_write_file",    e, err);
+                    if (seg_is(l, "chdir"))         return emit_host_ffi(b, CG_FFI_URES,   "tk_rt_chdir",         e, err);
+                    if (seg_is(l, "list_dir"))      return emit_host_ffi(b, CG_FFI_SLRES,  "tk_rt_list_dir",      e, err);
+                    if (seg_is(l, "last_index_of")) return emit_host_ffi(b, CG_FFI_U64RES, "tk_rt_last_index_of", e, err);
+                    if (seg_is(l, "args"))          return emit_host_ffi(b, CG_FFI_ARGS,   "tk_rt_args",          e, err);
+                    if (seg_is(l, "run"))           return emit_host_ffi(b, CG_FFI_RUN,    "tk_rt_run",           e, err);
+                }
+            }
             // Non-shadowable built-ins: `print`/`println`, either bare or under `teko`.
             const char *builtin = NULL;
             if (p.len >= 1) {
@@ -1180,6 +1204,15 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
                     else if (seg_is(last, "eprint"))   builtin = "tk_eprint";
                     else if (seg_is(last, "eprintln")) builtin = "tk_eprintln";
                     else if (seg_is(last, "parse"))    builtin = "tk_float_parse"; // teko::float::parse(str) -> f64
+                    // arithmetic FFI over the i128 carrier (sign-aware) + float bit-patterns — args
+                    // flow through the generic loop; these have plain scalar returns. (`div`/`rem`
+                    // mangle to tk_* so they never clash with libc's div/rem.)
+                    else if (seg_is(last, "div"))          builtin = "tk_div";          // (i128,i128,bool) -> i128
+                    else if (seg_is(last, "rem"))          builtin = "tk_rem";          // (i128,i128,bool) -> i128
+                    else if (seg_is(last, "fdiv"))         builtin = "tk_fdiv";         // (f64,f64) -> f64
+                    else if (seg_is(last, "int_to_float")) builtin = "tk_int_to_float"; // (i128,bool) -> f64
+                    else if (seg_is(last, "f64_bits"))     builtin = "tk_f64_bits";     // (f64) -> u64
+                    else if (seg_is(last, "f64_from_bits"))builtin = "tk_f64_from_bits";// (u64) -> f64
                     // diverging runtime panic helpers (the corpus calls these by bare name)
                     else if (seg_is(last, "panic_div0"))     builtin = "tk_panic_div0";
                     else if (seg_is(last, "panic_oob"))      builtin = "tk_panic_oob";
@@ -1203,7 +1236,7 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
                     else if (seg_is(last, "len"))         builtin = "tk_str_len";        // (str) -> u64
                     else if (seg_is(last, "ends_with"))   builtin = "tk_str_ends_with";  // (str,str) -> bool
                     else if (seg_is(last, "contains"))    builtin = "tk_str_contains";   // (str,str) -> bool
-                    else if (seg_is(last, "last_index_of")) builtin = "tk_str_last_index_of"; // (str,str) -> u64|error
+                    // (last_index_of returns u64|error → lifted by emit_host_ffi above, not here)
                     else if (seg_is(last, "i64_to_str"))  builtin = "tk_i64_to_str";     // (i64) -> str
                     else if (seg_is(last, "u64_to_str"))  builtin = "tk_u64_to_str";     // (u64) -> str
                     else if (seg_is(last, "ftoa"))        builtin = "tk_ftoa";           // (f64) -> str
@@ -1740,6 +1773,81 @@ static bool emit_variant_wrap_str(cbuf *b, tk_type expected, tk_type vtype, cons
     }
     tk_free0(vkey.ptr); return false;
 }
+
+// Lift a host-FFI primitive's fixed-ABI result (teko_rt.h) into the program's result type.
+// The runtime can't name the generated sum/optional/slice structs (this header is included
+// before them), so codegen builds them here: call the primitive, then construct `e->type`
+// from the result's header-knowable fields (`error` is its message str). Single-evaluation —
+// the result struct is bound to one temp, then both arms read it.
+static bool emit_host_ffi(cbuf *b, int kind, const char *rtfn, const tk_texpr *e, const char **err) {
+    char t[40]; snprintf(t, sizeof t, "_h%zu", (size_t)b->len);   // unique temp per call site
+    tk_type str_t = { .tag = TK_TYPE_STR };
+    tk_type err_t = { .tag = TK_TYPE_ERROR };
+
+    // args() -> []str : ({ uint64_t _hNn; tk_str *_hNp = tk_rt_args(&_hNn); (tk_slice_str){…}; })
+    if (kind == CG_FFI_ARGS) {
+        cb(b, "({ uint64_t "); cb(b, t); cb(b, "n; tk_str *"); cb(b, t); cb(b, "p = ");
+        cb(b, rtfn); cb(b, "(&"); cb(b, t); cb(b, "n); (");
+        if (!cg_slice_typename(b, str_t, err)) return false;   // tk_slice_str
+        cb(b, "){ .ptr = "); cb(b, t); cb(b, "p, .len = "); cb(b, t); cb(b, "n }; })");
+        return true;
+    }
+    // run([]str) -> i32 : the primitive takes ptr+len (no generated slice type). Single-eval argv.
+    if (kind == CG_FFI_RUN) {
+        cb(b, "({ "); if (!cg_slice_typename(b, str_t, err)) return false;
+        cb(b, " "); cb(b, t); cb(b, " = ");
+        if (!emit_expr(b, &e->as.call.args[0], err)) return false;
+        cb(b, "; "); cb(b, rtfn); cb(b, "("); cb(b, t); cb(b, ".ptr, "); cb(b, t); cb(b, ".len); })");
+        return true;
+    }
+
+    // The struct-returning host FFI: bind the fixed-ABI result, then lift per result shape.
+    const char *resty = (kind == CG_FFI_SRES)  ? "tk_ffi_sres"
+                      : (kind == CG_FFI_URES)  ? "tk_ffi_ures"
+                      : (kind == CG_FFI_SLRES) ? "tk_ffi_slres"
+                      :                          "tk_ffi_u64res";
+    cb(b, "({ "); cb(b, resty); cb(b, " "); cb(b, t); cb(b, " = "); cb(b, rtfn); cb(b, "(");
+    for (size_t i = 0; i < e->as.call.nargs; i += 1) {
+        if (i > 0) cb(b, ", ");
+        if (!emit_expr(b, &e->as.call.args[i], err)) return false;
+    }
+    cb(b, "); ");
+
+    if (kind == CG_FFI_URES) {
+        // error? : ok → present=false (success) ; !ok → present=true, value=<message>.
+        cb(b, t); cb(b, ".ok ? ("); if (!emit_type(b, e->type, err)) return false;
+        cb(b, "){ .present = false } : ("); if (!emit_type(b, e->type, err)) return false;
+        cb(b, "){ .present = true, .value = "); cb(b, t); cb(b, ".err }; })");
+        return true;
+    }
+
+    // VARIANT results: ok → wrap the value arm ; !ok → wrap the error arm (its message str).
+    cb(b, t); cb(b, ".ok ? ");
+    char vexpr[64];
+    if (kind == CG_FFI_SRES) {
+        snprintf(vexpr, sizeof vexpr, "%s.value", t);
+        if (!emit_variant_wrap_str(b, e->type, str_t, vexpr, err)) return false;
+    } else if (kind == CG_FFI_U64RES) {
+        tk_type u64_t = { .tag = TK_TYPE_PRIM, .as.prim = TK_PRIM_U64 };
+        snprintf(vexpr, sizeof vexpr, "%s.value", t);
+        if (!emit_variant_wrap_str(b, e->type, u64_t, vexpr, err)) return false;
+    } else {   // CG_FFI_SLRES — []str
+        tk_type selem = { .tag = TK_TYPE_STR };
+        tk_type slice_t = { .tag = TK_TYPE_SLICE, .as.slice.element = &selem };
+        char sx[96]; snprintf(sx, sizeof sx, "(tk_slice_str){ .ptr = %s.ptr, .len = %s.len }", t, t);
+        if (!emit_variant_wrap_str(b, e->type, slice_t, sx, err)) return false;
+    }
+    cb(b, " : ");
+    // u64res carries no message (not-found is the only failure) → an empty error str; the
+    // others surface the primitive's `.err` message.
+    char eexpr[64];
+    if (kind == CG_FFI_U64RES) snprintf(eexpr, sizeof eexpr, "(tk_str){0}");
+    else                       snprintf(eexpr, sizeof eexpr, "%s.err", t);
+    if (!emit_variant_wrap_str(b, e->type, err_t, eexpr, err)) return false;
+    cb(b, "; })");
+    return true;
+}
+
 // Do two types mangle to the SAME generated C type name (→ same C struct/typedef)?
 static bool cg_type_mangle_eq(tk_type a, tk_type c) {
     cbuf ka = { NULL, 0, 0 }, kb = { NULL, 0, 0 }; const char *e = NULL;
@@ -3258,7 +3366,9 @@ tk_cstr_result tk_emit_c(tk_tprogram prog) {
     size_t last_stmt = prog.nitems;   // sentinel: no loose statements
     for (size_t i = 0; i < prog.nitems; i += 1)
         if (prog.items[i].tag == TK_TITEM_STATEMENT) last_stmt = i;
-    cb(&b, "int main(void) {\n");
+    // main captures argv so teko::env::args() (tk_rt_args) can return it; tk_set_args first.
+    cb(&b, "int main(int argc, char **argv) {\n");
+    cb(&b, "    tk_set_args(argc, argv);\n");
     for (size_t i = 0; i < prog.nitems; i += 1) {
         tk_titem it = prog.items[i];
         if (it.tag != TK_TITEM_STATEMENT) continue;
