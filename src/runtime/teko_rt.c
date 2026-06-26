@@ -327,6 +327,21 @@ tk_ffi_ures tk_rt_mkdir(tk_str path) {
     return (tk_ffi_ures){ .ok = true };
 }
 
+tk_ffi_sres tk_rt_getcwd(void) {
+    char buf[4096];
+    if (getcwd(buf, sizeof buf) == NULL)
+        return (tk_ffi_sres){ .ok = false, .err = tk_str_of_cstr("cannot read the working directory") };
+    return (tk_ffi_sres){ .ok = true, .value = tk_str_of_cstr(buf) };
+}
+
+tk_ffi_ures tk_rt_setenv(tk_str name, tk_str value) {
+    char *n = tk_cstr(name);
+    char *v = tk_cstr(value);
+    if (setenv(n, v, 1) != 0)
+        return (tk_ffi_ures){ .ok = false, .err = tk_str_of_cstr("cannot set environment variable") };
+    return (tk_ffi_ures){ .ok = true };
+}
+
 tk_ffi_slres tk_rt_list_dir(tk_str path) {
     char *p = tk_cstr(path);
     DIR *d = opendir(p);

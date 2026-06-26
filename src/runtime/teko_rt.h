@@ -122,6 +122,10 @@ tk_ffi_ures tk_rt_write_file(tk_str path, tk_str content);
 tk_ffi_ures tk_rt_chdir(tk_str path);
 // teko::fs::mkdir(path) — create a directory (mode 0755); SUCCESS if it already exists.
 tk_ffi_ures tk_rt_mkdir(tk_str path);
+// teko::env::cwd() — the current working directory as an owned absolute path, or error.
+tk_ffi_sres tk_rt_getcwd(void);
+// teko::env::set_var(name, value) — set an environment variable; error on failure.
+tk_ffi_ures tk_rt_setenv(tk_str name, tk_str value);
 // teko::fs::list_dir(path) — the directory entries (excluding "." / ".."), or error.
 tk_ffi_slres tk_rt_list_dir(tk_str path);
 // teko::str::last_index_of(hay, needle) — byte index of the LAST occurrence, or not-found.

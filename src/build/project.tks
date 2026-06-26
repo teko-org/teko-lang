@@ -134,24 +134,50 @@ fn project_frontend(dir: str) -> Frontend | error {
 // the manifest `name`.
 // =========================================================================
 
-// F3 — where the minimal execution runtime (teko_rt) lives. An environment lookup
-// (teko::env::var), defaulting to the in-tree dir.
+// F3 — where the minimal execution runtime (teko_rt.{h,c}) lives. Resolution order: the
+// TK_RT_DIR env override (what CMake bakes into the C bootstrap), else probe the in-tree
+// candidates by reading their `teko_rt.h` — `src/runtime` (the teko project layout) then
+// `runtime`. (A general install resolves via TK_RT_DIR; bundling the runtime is Phase 7.)
 fn rt_dir() -> str {
-    match teko::env::var("TK_RT_DIR") { str as d => d; error => "runtime" }
+    match teko::env::var("TK_RT_DIR") {
+        str as d => d
+        error    => {
+            match teko::io::read_file("src/runtime/teko_rt.h") { str => return "src/runtime"; error => {} }
+            match teko::io::read_file("runtime/teko_rt.h")     { str => return "runtime"; error => {} }
+            "src/runtime"   // best-effort default
+        }
+    }
 }
 
-// Run the host C compiler over `cfile`, producing `binary`. cc must see the runtime dir
-// (-I) and compile its source (one reuse-the-host-toolchain invocation — M.5). Returns the
-// cc exit code. The spawn is the deferred teko::process::run surface.
+// The teko::assert C SEED lives beside the runtime (sibling dir `<parent of rt>/assert`); the
+// generated C does `#include "assert.h"` and may reference teko__assert__* (the seed is WEAK, so
+// it is harmless when the program self-defines teko::assert). Mirror driver.c's `-I <src>/assert`.
+fn assert_dir(rt: str) -> str {
+    match teko::str::last_index_of(rt, "/") {
+        u64 as i => teko::str::concat(teko::str::slice_to(rt, i), "/assert")   // <parent>/assert
+        error    => "assert"
+    }
+}
+
+// Run the host C compiler over `cfile`, producing `binary`. Full parity with driver.c::run_cc: cc
+// sees the runtime + assert dirs (-I) and compiles BOTH seed sources (teko_rt.c + assert.c) plus
+// -lm, in one reuse-the-host-toolchain invocation (M.5). Returns the cc exit code.
 fn run_cc(cfile: str, binary: str) -> i32 {
+    let rt = rt_dir()
+    let asrt = assert_dir(rt)
     mut argv: []str = teko::list::empty()
     argv = teko::list::push(argv, "cc")
     argv = teko::list::push(argv, "-std=c23")
-    argv = teko::list::push(argv, "-w")        // silence warnings on generated C (machine output — mirrors driver.c)
+    argv = teko::list::push(argv, "-w")               // silence warnings on generated C (machine output)
+    argv = teko::list::push(argv, "-ferror-limit=0")  // show every genuine error (clang)
     argv = teko::list::push(argv, "-I")
-    argv = teko::list::push(argv, rt_dir())
+    argv = teko::list::push(argv, rt)
+    argv = teko::list::push(argv, "-I")
+    argv = teko::list::push(argv, asrt)
     argv = teko::list::push(argv, cfile)
-    argv = teko::list::push(argv, teko::str::concat(rt_dir(), "/teko_rt.c"))
+    argv = teko::list::push(argv, teko::str::concat(rt, "/teko_rt.c"))
+    argv = teko::list::push(argv, teko::str::concat(asrt, "/assert.c"))
+    argv = teko::list::push(argv, "-lm")
     argv = teko::list::push(argv, "-o")
     argv = teko::list::push(argv, binary)
     teko::process::run(argv)
@@ -181,7 +207,24 @@ fn backend(dir: str, stem: str, out_dir: str, prog: checker::TProgram) -> i32 {
 // Front-end (manifest → discover → assemble → check), then the native backend over the
 // merged program. The output binary stem is the manifest `name`.
 // =========================================================================
+// If TK_RT_DIR is unset, probe the in-tree runtime relative to the CURRENT cwd (before any chdir)
+// and pin TK_RT_DIR to its ABSOLUTE path, so run_cc still finds teko_rt.c after the front-end
+// chdir's into the target project (which may live anywhere). A general install pre-sets TK_RT_DIR;
+// runtime BUNDLING is Phase 7.
+fn ensure_rt_dir_abs() {
+    match teko::env::var("TK_RT_DIR") { str => return; error => {} }   // already set — honor it
+    let cwd = match teko::env::cwd() { str as c => c; error => return }
+    mut rel = ""
+    match teko::io::read_file(teko::str::concat(cwd, "/src/runtime/teko_rt.h")) { str => rel = "src/runtime"; error => {} }
+    if rel == "" {
+        match teko::io::read_file(teko::str::concat(cwd, "/runtime/teko_rt.h")) { str => rel = "runtime"; error => {} }
+    }
+    if rel == "" { return }                                           // not found — run_cc surfaces a clear cc error
+    match teko::env::set_var("TK_RT_DIR", teko::str::concat3(cwd, "/", rel)) { error => {}; null => {} }
+}
+
 fn compile_project(dir: str, out_dir: str) -> i32 {
+    ensure_rt_dir_abs()   // pin the runtime to an absolute path BEFORE the front-end chdir's
     let fe = match project_frontend(dir) { Frontend as x => x; error as e => return fail(dir, e.message) }
     backend(dir, fe.manifest.name, out_dir, fe.prog)
 }
