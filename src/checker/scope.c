@@ -240,6 +240,10 @@ tk_type_result tk_builtin_fn(tk_str name) {
         tk_type ft = { .tag = TK_TYPE_FUNC, .as.func = { .params = &str_t, .nparams = 1, .ret = &err_opt } };
         return (tk_type_result){ .ok = true, .as.value = ft };
     }
+    if (name_is(name, "mkdir")) {                                     // teko::fs::mkdir(str) -> error?
+        tk_type ft = { .tag = TK_TYPE_FUNC, .as.func = { .params = &str_t, .nparams = 1, .ret = &err_opt } };
+        return (tk_type_result){ .ok = true, .as.value = ft };
+    }
     // print/println + teko::io::write/ewrite — the host output bottom (write/ewrite are the FFI
     // primitives the runtime's print/println/panic lower to; ewrite is stderr). All (str) -> void.
     if (name_is(name, "args")) {                                      // teko::env::args() -> []str (argv)

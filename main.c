@@ -85,6 +85,22 @@ static int reject_file_arg(void) {
     return 2;
 }
 
+// Scan argv for `-o <dir>` (the build OUTPUT directory). Returns the dir (or "bin" by default)
+// and writes the FIRST non-flag positional after the command into *proj (NULL if none). Keeps the
+// CLI flat (no getopt): `-o` may appear anywhere after the subcommand (`teko . -o ./out`).
+static const char *parse_out_dir(int argc, char **argv, int start, const char **proj) {
+    const char *out_dir = "bin";
+    *proj = NULL;
+    for (int i = start; i < argc; i += 1) {
+        if (strcmp(argv[i], "-o") == 0) {
+            if (i + 1 < argc) { out_dir = argv[i + 1]; i += 1; }   // the dir is the next token
+            continue;
+        }
+        if (*proj == NULL) *proj = argv[i];   // the first non-flag positional is the project
+    }
+    return out_dir;
+}
+
 int main(int argc, char **argv) {
     tk_install_crash_handler();   // a crash prints a C stack trace, not a silent exit (M.1)
     if (argc < 2) { usage(); return 2; }
@@ -93,17 +109,22 @@ int main(int argc, char **argv) {
 
     char buf[4096];
 
-    // Explicit subcommands take a project (directory or `.tkp`).
+    // Explicit subcommands take a project (directory or `.tkp`) + optional `-o <dir>`.
     if (strcmp(cmd, "build") == 0 || strcmp(cmd, "run") == 0 || strcmp(cmd, "test") == 0) {
-        if (argc < 3) { usage(); return 2; }
-        if (looks_like_file_arg(argv[2])) return reject_file_arg();
-        const char *dir = project_dir_of(argv[2], buf, sizeof(buf));
-        if (strcmp(cmd, "build") == 0) return tk_compile_project(dir);
+        const char *proj;
+        const char *out_dir = parse_out_dir(argc, argv, 2, &proj);
+        if (proj == NULL) { usage(); return 2; }
+        if (looks_like_file_arg(proj)) return reject_file_arg();
+        const char *dir = project_dir_of(proj, buf, sizeof(buf));
+        if (strcmp(cmd, "build") == 0) return tk_compile_project(dir, out_dir);
         if (strcmp(cmd, "run") == 0)   return tk_run_project(dir);
         return test_stub(dir);
     }
 
-    // Bare argument: a project (directory or `.tkp`) ≡ build. A file/`.tks` is rejected.
-    if (looks_like_file_arg(cmd)) return reject_file_arg();
-    return tk_compile_project(project_dir_of(cmd, buf, sizeof(buf)));
+    // Bare argument: a project (directory or `.tkp`) ≡ build (also honors `-o <dir>`). A file is rejected.
+    const char *proj;
+    const char *out_dir = parse_out_dir(argc, argv, 1, &proj);
+    if (proj == NULL) { usage(); return 2; }
+    if (looks_like_file_arg(proj)) return reject_file_arg();
+    return tk_compile_project(project_dir_of(proj, buf, sizeof(buf)), out_dir);
 }

@@ -226,22 +226,23 @@ static int run_cc(const char *cfile, const char *binary) {
 
 // Lower → write .c → invoke cc → report. `stem` is the output path (no extension);
 // `label` is what the diagnostics name (the project dir/name). Returns 0 on success.
-static int tk_backend(const char *label, const char *stem, tk_tprogram prog) {
+static int tk_backend(const char *label, const char *stem, tk_tprogram prog, const char *out_dir) {
     tk_cstr_result emitted = tk_emit_c(prog);
     if (!emitted.ok) return fail(label, emitted.as.error.message);
 
-    // Native build artifacts go to ./bin (created at the project root — cwd is the project after
-    // the front-end chdir'd). The generated C is "bin/<stem>.c"; the binary is "bin/<stem>".
-    mkdir("bin", 0755);   // ignore EEXIST — only a hard mkdir failure surfaces below via fopen
-    size_t blen = strlen(stem) + 8;   // "bin/" + stem + ".c" + NUL
+    // Native build artifacts go to `out_dir` (default "bin", or the `-o <dir>` argument), created
+    // at the project root — cwd is the project after the front-end chdir'd. The generated C is
+    // "<out_dir>/<stem>.c"; the binary is "<out_dir>/<stem>".
+    mkdir(out_dir, 0755);   // ignore EEXIST — only a hard mkdir failure surfaces below via fopen
+    size_t blen = strlen(out_dir) + strlen(stem) + 4;   // "<out>/" + stem + ".c" + NUL
     char *cfile = tk_alloc(blen);
     char *binp  = tk_alloc(blen);
     if (cfile == NULL || binp == NULL) abort();
-    snprintf(cfile, blen, "bin/%s.c", stem);
-    snprintf(binp,  blen, "bin/%s", stem);
+    snprintf(cfile, blen, "%s/%s.c", out_dir, stem);
+    snprintf(binp,  blen, "%s/%s", out_dir, stem);
 
     FILE *f = fopen(cfile, "wb");
-    if (f == NULL) { tk_free0(emitted.as.value); tk_free0(cfile); tk_free0(binp); return fail(label, "cannot write generated C to ./bin"); }
+    if (f == NULL) { tk_free0(emitted.as.value); tk_free0(cfile); tk_free0(binp); return fail(label, "cannot write generated C to the output directory"); }
     size_t srclen = strlen(emitted.as.value);
     size_t wrote = fwrite(emitted.as.value, 1, srclen, f);
     fclose(f);
@@ -356,7 +357,7 @@ static char *cstr_of(tk_str s) {
 // chdir'd there). Single-namespace projects lower; an unsupported multi-namespace
 // mangling case fails with codegen's honest message (no silent mis-emit).
 // =========================================================================
-int tk_compile_project(const char *dir) {
+int tk_compile_project(const char *dir, const char *out_dir) {
     tk_tprogram prog;
     tk_manifest m;
     int rc = project_frontend(dir, &prog, &m);
@@ -364,7 +365,7 @@ int tk_compile_project(const char *dir) {
 
     // --- backend (F2): lower the checked merged program to C, build it natively ---
     char *stem = cstr_of(m.name);
-    rc = tk_backend(dir, stem, prog);
+    rc = tk_backend(dir, stem, prog, out_dir);
     tk_free0(stem);
     return rc;
 }

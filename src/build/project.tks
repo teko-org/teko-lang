@@ -157,19 +157,22 @@ fn run_cc(cfile: str, binary: str) -> i32 {
     teko::process::run(argv)
 }
 
-// Lower → write .c → invoke cc → report. Returns 0 on success. `stem` is the output binary
-// name (the manifest `name`); the .c is written beside it.
-fn backend(dir: str, stem: str, prog: checker::TProgram) -> i32 {
+// Lower → write .c → invoke cc → report. Returns 0 on success. `stem` is the output binary name
+// (the manifest `name`); artifacts go to `out_dir`/<stem>{.c,} (default "bin", or the `-o <dir>`
+// argument), created at the project root (cwd after the front-end chdir'd). Mirrors driver.c.
+fn backend(dir: str, stem: str, out_dir: str, prog: checker::TProgram) -> i32 {
     let csrc = match codegen::tk_emit_c(prog) { str as s => s; error as e => return fail(dir, e.message) }
-    let cfile = teko::str::concat(stem, ".c")
+    match teko::fs::mkdir(out_dir) { error => return fail(dir, "cannot create the output directory"); null => {} }   // idempotent — error? null = success
+    let cfile = teko::str::concat3(out_dir, "/", teko::str::concat(stem, ".c"))   // <out_dir>/<stem>.c
+    let binp = teko::str::concat3(out_dir, "/", stem)                             // <out_dir>/<stem>
     match teko::io::write_file(cfile, csrc) {
         error as e => return fail(dir, e.message)
         null       => {}                              // error? — null = success
     }
-    if run_cc(cfile, stem) != 0 {
+    if run_cc(cfile, binp) != 0 {
         return fail(dir, "cc failed to build the generated C")
     }
-    teko::io::print(teko::str::concat3("teko: ", dir, teko::str::concat3(": built ", stem, "")))
+    teko::io::print(teko::str::concat3("teko: ", dir, teko::str::concat3(": built ", binp, "")))
     0
 }
 
@@ -178,9 +181,36 @@ fn backend(dir: str, stem: str, prog: checker::TProgram) -> i32 {
 // Front-end (manifest → discover → assemble → check), then the native backend over the
 // merged program. The output binary stem is the manifest `name`.
 // =========================================================================
-fn compile_project(dir: str) -> i32 {
+fn compile_project(dir: str, out_dir: str) -> i32 {
     let fe = match project_frontend(dir) { Frontend as x => x; error as e => return fail(dir, e.message) }
-    backend(dir, fe.manifest.name, fe.prog)
+    backend(dir, fe.manifest.name, out_dir, fe.prog)
+}
+
+// CLI helpers (mirror main.c::parse_out_dir; here because main.tks is the virtual-main and holds no
+// `fn`s). `-o <dir>` may appear anywhere after the subcommand: `teko . -o ./out`.
+
+// the build OUTPUT directory from the args (`-o <dir>`), or "bin" by default.
+fn out_dir_of(args: []str, start: u64) -> str {
+    mut i = start
+    loop {
+        if i >= args.len { break }
+        if args[i] == "-o" {
+            if i + 1 < args.len { return args[i + 1] }
+        }
+        i = i + 1
+    }
+    "bin"
+}
+
+// the FIRST non-flag positional (the project) from `start`, or "" if none (the caller reports).
+fn project_arg_of(args: []str, start: u64) -> str {
+    mut i = start
+    loop {
+        if i >= args.len { break }
+        if args[i] == "-o" { i = i + 2 }        // skip `-o` and its value
+        else { return args[i] }
+    }
+    ""
 }
 
 // =========================================================================

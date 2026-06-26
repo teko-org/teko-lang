@@ -33,7 +33,8 @@ tk_program tk_module_to_program(tk_module m);
 // lowering works; if codegen hits an unsupported multi-namespace mangling case it fails
 // with the honest existing message (no silent mis-emit). Output binary stem = manifest
 // `name`. Returns 0 on a clean build. main() dispatches here for `teko build <dir>`.
-int tk_compile_project(const char *dir);
+// `out_dir` is the build output directory (default "bin", or the CLI `-o <dir>` argument).
+int tk_compile_project(const char *dir, const char *out_dir);
 
 // Eixo D — the PROJECT RUN entry (debug profile). Mirrors tk_compile_project's front
 // (manifest → discover → assemble → check) but ends in the VM: INTERPRET the checked

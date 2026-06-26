@@ -10,6 +10,8 @@
 #include <unistd.h>   // chdir, fork, execvp, _exit (host FFI bottoms)
 #include <sys/wait.h> // waitpid — teko::process::run
 #include <dirent.h>   // opendir/readdir — teko::fs::list_dir
+#include <sys/stat.h> // mkdir — teko::fs::mkdir (build output dir)
+#include <errno.h>    // errno/EEXIST — mkdir idempotence
 
 // (C1.9) NATIVE STACK TRACES. A generated Teko program links this runtime; on a panic (M.1)
 // or a fatal signal (a bug in generated code), print a C backtrace to stderr — the frames carry
@@ -314,6 +316,14 @@ tk_ffi_ures tk_rt_write_file(tk_str path, tk_str content) {
 tk_ffi_ures tk_rt_chdir(tk_str path) {
     char *p = tk_cstr(path);
     if (chdir(p) != 0) return (tk_ffi_ures){ .ok = false, .err = tk_str_of_cstr("cannot change directory") };
+    return (tk_ffi_ures){ .ok = true };
+}
+
+tk_ffi_ures tk_rt_mkdir(tk_str path) {
+    char *p = tk_cstr(path);
+    // already-exists is success (idempotent — the build output dir may persist between builds).
+    if (mkdir(p, 0755) != 0 && errno != EEXIST)
+        return (tk_ffi_ures){ .ok = false, .err = tk_str_of_cstr("cannot create directory") };
     return (tk_ffi_ures){ .ok = true };
 }
 

@@ -120,6 +120,8 @@ tk_ffi_sres tk_rt_getenv(tk_str name);
 tk_ffi_ures tk_rt_write_file(tk_str path, tk_str content);
 // teko::env::chdir(path) — change the process working directory; error on failure.
 tk_ffi_ures tk_rt_chdir(tk_str path);
+// teko::fs::mkdir(path) — create a directory (mode 0755); SUCCESS if it already exists.
+tk_ffi_ures tk_rt_mkdir(tk_str path);
 // teko::fs::list_dir(path) — the directory entries (excluding "." / ".."), or error.
 tk_ffi_slres tk_rt_list_dir(tk_str path);
 // teko::str::last_index_of(hay, needle) — byte index of the LAST occurrence, or not-found.
