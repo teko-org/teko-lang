@@ -338,6 +338,9 @@ tk_titem_result tk_type_item(tk_item item, tk_env env, tk_type_table table) {
             tk_tfunction_result tf = tk_type_function(item.as.function, env, table);
             if (!tf.ok) return (tk_titem_result){ .ok = false, .as.error = tf.as.error };
             tf.as.value.namespace = item.namespace;   // (#49) carry the declaring ns for codegen name mangling
+            tf.as.value.file = item.file;             // (E3) source provenance for the .tsym symbol map
+            tf.as.value.line = item.as.function.line;
+            tf.as.value.col  = item.as.function.col;
             return (tk_titem_result){ .ok = true, .as.value = { .tag = TK_TITEM_FUNCTION, .as.function = tf.as.value } };
         }
         case TK_ITEM_TYPE_DECL: return (tk_titem_result){ .ok = true, .as.value = { .tag = TK_TITEM_TYPE_DECL, .as.type_decl = item.as.type_decl } };

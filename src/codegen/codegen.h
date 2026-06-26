@@ -26,4 +26,8 @@ TK_RESULT(char *, tk_cstr_result);
 // bare `return` -> `return 0;`). Returns heap C-source on success.
 tk_cstr_result tk_emit_c(tk_tprogram prog);
 
+// E3 — the `.tsym` symbol map (one line per function: mangled C symbol → Teko name + file:line),
+// written beside the binary so the native stack-trace (E4) resolves each frame to its Teko origin.
+tk_cstr_result tk_emit_tsym(tk_tprogram prog);
+
 #endif // TK_CODEGEN_H

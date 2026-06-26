@@ -110,6 +110,8 @@ typedef struct {
     bool           has_doc;                  // a `/** … */` doc precedes it? (carried for the `.tkh`)
     tk_str         doc;                      // the doc span (valid iff has_doc)
     tk_str         namespace;                // (#41/#49) the declaring namespace — drives the mangled C name
+    tk_str         file;                     // (E3) the source file the fn was declared in (for the .tsym symbol map)
+    uint32_t       line, col;                // (E3) the fn name's 1-based source position (for the .tsym symbol map)
 } tk_tfunction;
 
 typedef enum { TK_TITEM_FUNCTION, TK_TITEM_TYPE_DECL, TK_TITEM_USE, TK_TITEM_STATEMENT } tk_titem_tag;

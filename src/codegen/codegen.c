@@ -3519,3 +3519,26 @@ tk_cstr_result tk_emit_c(tk_tprogram prog) {
     tk_free0(b.ptr);
     return (tk_cstr_result){ .ok = true, .as.value = formatted };
 }
+
+// E3 — the `.tsym` symbol map: one line per emitted function mapping its mangled C symbol to the
+// Teko qualified name and source `file:line`. Written beside the binary so a native stack-trace
+// (E4 — teko_rt's panic/crash backtrace) can resolve each C frame to its Teko origin.
+//   <c-symbol>\t<teko-name>\t<file>:<line>
+tk_cstr_result tk_emit_tsym(tk_tprogram prog) {
+    cbuf b = { NULL, 0, 0 };
+    cb(&b, "# teko symbol map (.tsym v1): <c-symbol>\\t<teko-name>\\t<file>:<line>\n");
+    for (size_t i = 0; i < prog.nitems; i += 1) {
+        if (prog.items[i].tag != TK_TITEM_FUNCTION) continue;
+        tk_tfunction f = prog.items[i].as.function;
+        cb_fn_name(&b, f.namespace, f.name);   // the mangled C symbol (matches the definition)
+        cb(&b, "\t");
+        if (f.namespace.len != 0) { cb_str(&b, f.namespace); cb(&b, "::"); }
+        cb_str(&b, f.name);                    // the Teko qualified name
+        cb(&b, "\t");
+        cb_str(&b, f.file);
+        cb(&b, ":");
+        cb_u64_dec(&b, (uint64_t)f.line);
+        cb(&b, "\n");
+    }
+    return (tk_cstr_result){ .ok = true, .as.value = b.ptr };
+}

@@ -13,18 +13,73 @@
 #include <sys/stat.h> // mkdir — teko::fs::mkdir (build output dir)
 #include <errno.h>    // errno/EEXIST — mkdir idempotence
 
-// (C1.9) NATIVE STACK TRACES. A generated Teko program links this runtime; on a panic (M.1)
-// or a fatal signal (a bug in generated code), print a C backtrace to stderr — the frames carry
-// the generated function symbols (the mangled Teko names), so a native crash is debuggable
-// without a debugger. (Per-frame Teko file:line via `.tsym` is a later enhancement — Eixo E3;
-// this delivers the call stack now.) In the bootstrap (which also links this runtime via the VM),
-// main.c installs ITS OWN handler INSIDE main(), AFTER this constructor runs — so it wins there;
-// this handler is the active one only in generated programs (which have no such main).
+// (C1.9 / E4) NATIVE STACK TRACES. A generated Teko program links this runtime; on a panic (M.1)
+// or a fatal signal (a bug in generated code), print a backtrace to stderr — the frames carry the
+// generated function symbols (the mangled Teko names). E4: each frame is RESOLVED to its Teko
+// `name (file:line)` via the `.tsym` map emitted beside the binary (E3), loaded as `<argv0>.tsym`.
+// Without the map (or argv) it degrades to the raw C symbols. In the bootstrap (which also links
+// this runtime via the VM), main.c installs ITS OWN handler INSIDE main() — so it wins there; this
+// handler is active only in generated programs (which have no such main).
+static int    tk_g_argc;   // captured argv (defined below; used here to locate <argv0>.tsym)
+static char **tk_g_argv;
+static char  *tk_tsym_buf; // the loaded .tsym contents, or NULL (process-lifetime)
+
+// Load `<argv0>.tsym` once (best-effort — missing/unreadable is fine).
+static void tk_tsym_load(void) {
+    if (tk_tsym_buf != NULL || tk_g_argv == NULL || tk_g_argc < 1) return;
+    char path[4096];
+    snprintf(path, sizeof path, "%s.tsym", tk_g_argv[0]);
+    FILE *f = fopen(path, "rb");
+    if (f == NULL) return;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return; }
+    long sz = ftell(f);
+    if (sz <= 0 || fseek(f, 0, SEEK_SET) != 0) { fclose(f); return; }
+    char *buf = malloc((size_t)sz + 1);
+    if (buf == NULL) { fclose(f); return; }
+    size_t got = fread(buf, 1, (size_t)sz, f);
+    fclose(f);
+    buf[got] = '\0';
+    tk_tsym_buf = buf;
+}
+
+// If a .tsym c-symbol (a line's first \t-field) occurs in `frame`, print "=> <teko> (<file:line>)".
+static void tk_tsym_resolve(const char *frame) {
+    if (tk_tsym_buf == NULL) return;
+    char *p = tk_tsym_buf;
+    while (*p != '\0') {
+        char *eol = strchr(p, '\n'); if (eol == NULL) eol = p + strlen(p);
+        if (*p != '#') {
+            char *tab = memchr(p, '\t', (size_t)(eol - p));
+            if (tab != NULL) {
+                size_t clen = (size_t)(tab - p);
+                char csym[256];
+                if (clen > 0 && clen < sizeof csym) {
+                    memcpy(csym, p, clen); csym[clen] = '\0';
+                    if (strstr(frame, csym) != NULL) {
+                        fputs("        => ", stderr);
+                        fwrite(tab + 1, 1, (size_t)(eol - (tab + 1)), stderr);   // <teko-name>\t<file:line>
+                        fputc('\n', stderr);
+                        return;
+                    }
+                }
+            }
+        }
+        p = (*eol == '\0') ? eol : eol + 1;
+    }
+}
+
 static void tk_backtrace(void) {
     void *frames[64];
     int n = backtrace(frames, 64);
     fputs("teko: stack trace:\n", stderr);
-    backtrace_symbols_fd(frames, n, 2 /* stderr */);
+    char **syms = backtrace_symbols(frames, n);
+    if (syms == NULL) { backtrace_symbols_fd(frames, n, 2 /* stderr */); return; }
+    tk_tsym_load();
+    for (int i = 0; i < n; i += 1) {
+        fputs(syms[i], stderr); fputc('\n', stderr);
+        tk_tsym_resolve(syms[i]);   // E4: append the Teko name + file:line, if known
+    }
+    free(syms);
 }
 static void tk_rt_crash_handler(int sig) {
     fputs("\nteko: FATAL signal — a generated program crashed (M.1).\n", stderr);
@@ -396,8 +451,7 @@ int32_t tk_rt_run(const tk_str *argv, uint64_t n) {
 }
 
 // Captured process argv (the generated `main` calls tk_set_args before the virtual-main body).
-static int    tk_g_argc = 0;
-static char **tk_g_argv = NULL;
+// tk_g_argc / tk_g_argv are declared near the top (the stack-trace's .tsym loader uses them).
 void tk_set_args(int argc, char **argv) { tk_g_argc = argc; tk_g_argv = argv; }
 tk_str *tk_rt_args(uint64_t *n) {
     uint64_t c = (uint64_t)(tk_g_argc < 0 ? 0 : tk_g_argc);

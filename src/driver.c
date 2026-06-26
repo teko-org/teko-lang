@@ -258,6 +258,21 @@ static int tk_backend(const char *label, const char *stem, tk_tprogram prog, con
     tk_free0(cfile);
     if (rc != 0) { tk_free0(binp); return fail(label, "cc failed to build the generated C"); }
 
+    // E3 — write the symbol map alongside the binary (best-effort; a write failure never fails the
+    // build — the .tsym is debug metadata for the E4 native stack-trace, not the artifact).
+    tk_cstr_result tsym = tk_emit_tsym(prog);
+    if (tsym.ok) {
+        size_t tlen = strlen(binp) + 6;   // binp + ".tsym" + NUL
+        char *tsymf = tk_alloc(tlen);
+        if (tsymf != NULL) {
+            snprintf(tsymf, tlen, "%s.tsym", binp);
+            FILE *tf = fopen(tsymf, "wb");
+            if (tf != NULL) { fwrite(tsym.as.value, 1, strlen(tsym.as.value), tf); fclose(tf); }
+            tk_free0(tsymf);
+        }
+        tk_free0(tsym.as.value);
+    }
+
     printf("teko: %s: built %s\n", label, binp);
     tk_free0(binp);
     return 0;
