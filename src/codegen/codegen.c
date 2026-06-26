@@ -1992,8 +1992,46 @@ static bool emit_pat_binds(cbuf *b, const tk_pattern *pat, const char *subj,
 // `(_s.present && <test over _s.value>)`. The inner test reuses emit_pat_test with the
 // value-accessor `_s.value` as the subject and the inner's variant name. For a non-optional
 // subject it delegates straight to emit_pat_test.
+// AST struct-vs-kind DESCEND. The .tks parser/typed AST models `Expr`/`TExpr`/… as
+// `struct { kind: <variant>; … }`, but the corpus matches such a value DIRECTLY against the
+// variant's cases (`match e { Number => … }`). If `subjT` is a NAMED struct with a `kind` field
+// of a VARIANT type and `pat` selects a CASE of that variant, return true + the variant type and
+// whether the kind field is boxed, so the match lowers on `<subj>.kind` (deref if boxed). (The C
+// twin's tk_expr is a tagged union, so the C codegen never descends — a model divergence.)
+static bool cg_kind_descend(tk_type subjT, const tk_pattern *pat, tk_type *outV, bool *outBoxed, const char **err) {
+    if (subjT.tag != TK_TYPE_NAMED) return false;
+    if (pat->tag != TK_PAT_BIND && pat->tag != TK_PAT_FIELD) return false;
+    const tk_type_decl *d = cg_find_decl(subjT.as.named.name);
+    if (d == NULL || d->body.tag != TK_BODY_STRUCT) return false;
+    tk_type_expr kfte; bool found = false;
+    tk_struct_body sb = d->body.as.struct_body;
+    for (size_t i = 0; i < sb.n_fields; i += 1)
+        if (seg_is(sb.fields[i].name, "kind")) { kfte = sb.fields[i].type_ann; found = true; break; }
+    if (!found || kfte.tag != TK_TEXPR_NAMED) return false;
+    tk_str vname = kfte.as.named.path.segments[kfte.as.named.path.len - 1].name;
+    if (!cg_named_is_variant(vname)) return false;
+    tk_type V = { .tag = TK_TYPE_NAMED, .as.named.name = vname };
+    // the pattern must select a CASE of V (not a field-destructure of the struct itself).
+    cbuf ck = { NULL, 0, 0 }; const char *e = NULL;
+    if (!cg_emit_case_key(&ck, pat, &e)) { tk_free0(ck.ptr); return false; }
+    bool ismem = cg_var_reaches(V, (tk_str){ (const tk_byte *)ck.ptr, ck.len }, 2);
+    tk_free0(ck.ptr);
+    if (!ismem) return false;
+    *outV = V;
+    *outBoxed = cg_field_boxed(subjT.as.named.name, kfte);
+    (void)err;
+    return true;
+}
+
 static bool cg_emit_pat_test(cbuf *b, const tk_pattern *pat, const char *subj,
                              tk_type subjT, const char **err) {
+    // AST descend: `match e { Number => }` over `e: Expr = struct{kind: ExprKind}` lowers on e.kind.
+    tk_type kv; bool kboxed;
+    if (cg_kind_descend(subjT, pat, &kv, &kboxed, err)) {
+        char ds[96];
+        snprintf(ds, sizeof ds, "%s(%s).kind%s", kboxed ? "(*" : "", subj, kboxed ? ")" : "");
+        return cg_emit_pat_test(b, pat, ds, kv, err);
+    }
     if (subjT.tag == TK_TYPE_OPTIONAL && subjT.as.optional.inner != NULL) {
         if (pat->tag == TK_PAT_NULL) { cb(b, "(!"); cb(b, subj); cb(b, ".present)"); return true; }
         tk_type inner = *subjT.as.optional.inner;
@@ -2019,6 +2057,13 @@ static bool cg_emit_pat_test(cbuf *b, const tk_pattern *pat, const char *subj,
 // inner value is `_s.value`; for a non-optional subject it delegates straight to emit_pat_binds.
 static bool cg_emit_pat_binds(cbuf *b, const tk_pattern *pat, const char *subj,
                               tk_type subjT, const char *indent, const char **err) {
+    // AST descend (mirror cg_emit_pat_test): a case pattern over `Expr`/`TExpr` binds off `.kind`.
+    tk_type kv; bool kboxed;
+    if (cg_kind_descend(subjT, pat, &kv, &kboxed, err)) {
+        char ds[96];
+        snprintf(ds, sizeof ds, "%s(%s).kind%s", kboxed ? "(*" : "", subj, kboxed ? ")" : "");
+        return cg_emit_pat_binds(b, pat, ds, kv, indent, err);
+    }
     if (subjT.tag == TK_TYPE_OPTIONAL && subjT.as.optional.inner != NULL) {
         if (pat->tag == TK_PAT_NULL) return true;   // NONE binds nothing
         tk_type inner = *subjT.as.optional.inner;

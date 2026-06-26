@@ -2246,12 +2246,68 @@ fn emit_pat_test(buf: []byte, prog: checker::TProgram, pat: parser::Pattern, sub
     }
 }
 
+// AST struct-vs-kind DESCEND. The .tks parser/typed AST models `Expr`/`TExpr`/… as
+// `struct { kind: <variant>; … }`, but the corpus matches such a value DIRECTLY against the
+// variant's cases (`match e { Number => … }`). If `subjT` is a NAMED struct with a `kind` field
+// of a VARIANT type and `pat` selects a CASE of that variant, return the variant type V and
+// whether the kind field is boxed, so the match lowers on `<subj>.kind` (deref if boxed). The C
+// twin uses out-params + a bool; here we return `CgKindDescend?` — `null` means "do not descend".
+// (C: `cg_kind_descend`.)
+type CgKindDescend = struct { var_type: checker::Type; boxed: bool }
+
+fn cg_kind_descend(prog: checker::TProgram, subjT: checker::Type, pat: parser::Pattern) -> CgKindDescend? {
+    let sname = match subjT { checker::Named as nm => nm.name; _ => return null }
+    match pat {
+        parser::BindPattern => { }
+        parser::FieldPattern => { }
+        _ => return null
+    }
+    let d = match cg_find_decl(prog, sname) { parser::TypeDecl as dd => dd; error => return null }
+    let sb = match d.body { parser::StructBody as s => s; _ => return null }
+    // find a field named `kind` whose type-ann is a NAMED type.
+    mut kfte: parser::TypeExpr? = null
+    mut i = 0
+    loop {
+        if i >= sb.fields.len { break }
+        if sb.fields[i].name == "kind" { kfte = sb.fields[i].type_ann; break }
+        i++
+    }
+    let fte = match kfte { null => return null; parser::TypeExpr as t => t }
+    let vname = match fte { parser::NamedType as nt => cg_path_last(nt.path); _ => return null }
+    if !cg_named_is_variant(prog, vname) { return null }
+    let v = checker::Named { name = vname }
+    // the pattern must select a CASE of V (not a field-destructure of the struct itself).
+    let key = match cg_emit_case_key_str(pat) { str as s => s; error => return null }
+    if !cg_var_reaches(prog, v, key, 2) { return null }
+    CgKindDescend { var_type = v, boxed = cg_field_boxed(prog, sname, fte) }
+}
+
+// cg_kind_derived_subj — the descended subject string: boxed → `(*(SUBJ).kind)`, unboxed →
+// `(SUBJ).kind`. Mirrors the C snprintf `%s(%s).kind%s` with `(*`/`)` around when boxed.
+fn cg_kind_derived_subj(subj: str, boxed: bool) -> str {
+    mut o: []byte = teko::list::empty()
+    if boxed { o = cb(o, "(*") }
+    o = cb(o, "(")
+    o = cb(o, subj)
+    o = cb(o, ").kind")
+    if boxed { o = cb(o, ")") }
+    str(o)
+}
+
 // cg_emit_pat_test — TOP-LEVEL pattern test (handles an OPTIONAL subject — REBOOT_PLAN §202).
 // `subjT` is the subject's resolved type; `subj` is the subject temp name (a tk_opt_<inner>
 // struct when optional). For an optional subject: `null` ⇒ `(!_s.present)`; a bare bind/wildcard
 // over a NON-variant present value ⇒ `(_s.present)`; otherwise ⇒ `(_s.present && <inner test>)`.
 // For a non-optional subject it delegates to emit_pat_test. (C: `cg_emit_pat_test`.)
 fn cg_emit_pat_test(buf: []byte, prog: checker::TProgram, pat: parser::Pattern, subj: str, subjT: checker::Type) -> []byte | error {
+    // AST descend: `match e { Number => }` over `e: Expr = struct{kind: ExprKind}` lowers on e.kind.
+    match cg_kind_descend(prog, subjT, pat) {
+        CgKindDescend as kd => {
+            let ds = cg_kind_derived_subj(subj, kd.boxed)
+            return cg_emit_pat_test(buf, prog, pat, ds, kd.var_type)
+        }
+        null => { }
+    }
     match subjT {
         checker::Optional as opt => {
             match opt.inner {
@@ -2341,6 +2397,14 @@ fn emit_pat_binds(buf: []byte, pat: parser::Pattern, subj: str, indent: str) -> 
 // inner binds via the variant union. For a non-optional subject it delegates to emit_pat_binds.
 // (C: `cg_emit_pat_binds`.)
 fn cg_emit_pat_binds(buf: []byte, prog: checker::TProgram, pat: parser::Pattern, subj: str, subjT: checker::Type, indent: str) -> []byte | error {
+    // AST descend (mirror cg_emit_pat_test): a case pattern over `Expr`/`TExpr` binds off `.kind`.
+    match cg_kind_descend(prog, subjT, pat) {
+        CgKindDescend as kd => {
+            let ds = cg_kind_derived_subj(subj, kd.boxed)
+            return cg_emit_pat_binds(buf, prog, pat, ds, kd.var_type, indent)
+        }
+        null => { }
+    }
     match subjT {
         checker::Optional as opt => {
             match opt.inner {
