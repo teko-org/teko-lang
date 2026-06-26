@@ -87,9 +87,17 @@ static const char *parse_out_dir(int argc, char **argv, int start, const char **
             if (i + 1 < argc) { out_dir = argv[i + 1]; i += 1; }   // the dir is the next token
             continue;
         }
+        if (strcmp(argv[i], "--no-test") == 0) continue;   // a flag (D4 gate opt-out), not the project
         if (*proj == NULL) *proj = argv[i];   // the first non-flag positional is the project
     }
     return out_dir;
+}
+
+// does `--no-test` appear in the args? (D4 — skip the build-time test gate; the bootstrap
+// self-build uses it because the corpus's own tests are not yet VM-runnable.)
+static bool has_no_test(int argc, char **argv) {
+    for (int i = 1; i < argc; i += 1) if (strcmp(argv[i], "--no-test") == 0) return true;
+    return false;
 }
 
 int main(int argc, char **argv) {
@@ -107,7 +115,7 @@ int main(int argc, char **argv) {
         if (proj == NULL) { usage(); return 2; }
         if (looks_like_file_arg(proj)) return reject_file_arg();
         const char *dir = project_dir_of(proj, buf, sizeof(buf));
-        if (strcmp(cmd, "build") == 0) return tk_compile_project(dir, out_dir);
+        if (strcmp(cmd, "build") == 0) return tk_compile_project_g(dir, out_dir, !has_no_test(argc, argv));   // D4 gate (unless --no-test)
         if (strcmp(cmd, "run") == 0)   return tk_run_project(dir);
         return tk_test_project(dir);   // D2 — run the project's `#test` functions on the VM
     }
@@ -117,5 +125,5 @@ int main(int argc, char **argv) {
     const char *out_dir = parse_out_dir(argc, argv, 1, &proj);
     if (proj == NULL) { usage(); return 2; }
     if (looks_like_file_arg(proj)) return reject_file_arg();
-    return tk_compile_project(project_dir_of(proj, buf, sizeof(buf)), out_dir);
+    return tk_compile_project_g(project_dir_of(proj, buf, sizeof(buf)), out_dir, !has_no_test(argc, argv));   // D4 gate (unless --no-test)
 }

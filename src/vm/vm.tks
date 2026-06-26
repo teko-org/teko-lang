@@ -1299,6 +1299,7 @@ fn eval_call(c: checker::TCall, env: Venv) -> Value {
     // str_concat3/ftoa). Recognized before user-fn resolution; null == not a str builtin, fall through.
     match try_str_builtin(c.callee, c.args, env) { Value as v => return v; null => {} }
     let f = find_function(env, c.callee)   // resolved by LAST segment (cross-ns ok); honest stop if unknown
+    if !f.is_test { teko::cov_mark(f.line to u64) }   // D3 — record this production fn as executed (test runner reads it)
     // Bind each parameter to its evaluated argument in a FRESH root frame (no closure capture —
     // flat M0 functions, like codegen's C). Args evaluate in the CALLER's env, then enter the
     // callee's frame by the param's name (positional). (B-vm — VM function parameters.)
@@ -1560,6 +1561,7 @@ exp fn run(prog: checker::TProgram) -> i32 {
 // empty suite (no `#test`) is NOT a failure — the build gate skips when absent.
 // ---------------------------------------------------------------------------
 exp fn run_tests(prog: checker::TProgram) -> i32 {
+    teko::cov_reset()        // D3 — start a fresh coverage run; eval_call marks each production fn it enters
     mut passed: u64 = 0
     mut i = 0
     loop {
@@ -1583,6 +1585,35 @@ exp fn run_tests(prog: checker::TProgram) -> i32 {
         teko::io::println("teko: no tests (no `#test` functions)")
     } else {
         teko::io::println(teko::str::concat3("teko: ", teko::str::u64_to_str(passed), " test(s) passed"))
+        // D3 — function-level coverage: distinct production fns executed / total production fns.
+        let total = count_prod_fns(prog)
+        let executed = teko::cov_distinct()
+        let pct = if total == 0 { 100 } else { executed * 100 / total }
+        teko::io::println(teko::str::concat3("teko: coverage ", teko::str::u64_to_str(pct), teko::str::concat3("% (", teko::str::u64_to_str(executed), teko::str::concat3("/", teko::str::u64_to_str(total), " functions)"))))
     }
     0
+}
+
+// count_prod_fns — the coverage DENOMINATOR: production (non-`#test`) functions in the program.
+fn count_prod_fns(prog: checker::TProgram) -> u64 {
+    mut n: u64 = 0
+    mut i = 0
+    loop {
+        if i >= prog.items.len { break }
+        match prog.items[i] {
+            checker::TFunction as f => { if !f.is_test { n = n + 1 } }
+            _ => {}
+        }
+        i++
+    }
+    n
+}
+
+// coverage_pct — function-level coverage % from the LAST run (the cov sink still holds its marks):
+// distinct production fns executed * 100 / total production fns. The D4 gate reads this. 100 when
+// there are no production functions (vacuously covered).
+exp fn coverage_pct(prog: checker::TProgram) -> u64 {
+    let total = count_prod_fns(prog)
+    if total == 0 { return 100 }
+    teko::cov_distinct() * 100 / total
 }

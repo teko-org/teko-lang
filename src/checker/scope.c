@@ -268,6 +268,19 @@ tk_type_result tk_builtin_fn(tk_str name) {
         tk_type ft = { .tag = TK_TYPE_FUNC, .as.func = { .params = NULL, .nparams = 0, .ret = &void_t } };
         return (tk_type_result){ .ok = true, .as.value = ft };
     }
+    // D3 — test-coverage sink (host side-channel): cov_reset()/cov_mark(u64) -> void; cov_distinct() -> u64.
+    if (name_is(name, "cov_reset")) {
+        tk_type ft = { .tag = TK_TYPE_FUNC, .as.func = { .params = NULL, .nparams = 0, .ret = &void_t } };
+        return (tk_type_result){ .ok = true, .as.value = ft };
+    }
+    if (name_is(name, "cov_mark")) {
+        tk_type ft = { .tag = TK_TYPE_FUNC, .as.func = { .params = &u64_t, .nparams = 1, .ret = &void_t } };
+        return (tk_type_result){ .ok = true, .as.value = ft };
+    }
+    if (name_is(name, "cov_distinct")) {
+        tk_type ft = { .tag = TK_TYPE_FUNC, .as.func = { .params = NULL, .nparams = 0, .ret = &u64_t } };
+        return (tk_type_result){ .ok = true, .as.value = ft };
+    }
     // VM-internal arithmetic FFI (sign-aware over the i128 carrier) + the F3 panic helpers the VM
     // and runtime call via the reserved `teko::` root (teko::runtime mirrors these in Teko).
     if (name_is(name, "div") || name_is(name, "rem")) {              // (i128, i128, bool) -> i128

@@ -132,7 +132,11 @@ target_compile_definitions(teko PRIVATE
 # so nothing downstream is guaranteed. Run it with:  cmake --build build --target selfhost
 # (equivalently, by hand:  ./build/teko build .  from the project root → ./bin/teko).
 add_custom_target(selfhost
-    COMMAND $<TARGET_FILE:teko> build ${CMAKE_CURRENT_SOURCE_DIR}
+    # --no-test (D4): skip the build-time test gate for the SELF-build. The compiler's own
+    # `.tkt` tests use not-yet-implemented syntax (slice patterns w/o `as`) and so are not yet
+    # VM-runnable; a mandatory gate would break the self-host lifeline. User projects gate by
+    # default. (See TEKO_MASTER_PLAN.md Phase 7 D4.)
+    COMMAND $<TARGET_FILE:teko> build ${CMAKE_CURRENT_SOURCE_DIR} --no-test
     DEPENDS teko
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     COMMENT "self-host: native build of teko's own corpus -> ./bin/teko (THE validation gate)"

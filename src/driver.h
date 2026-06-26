@@ -36,6 +36,11 @@ tk_program tk_module_to_program(tk_module m);
 // `out_dir` is the build output directory (default "bin", or the CLI `-o <dir>` argument).
 int tk_compile_project(const char *dir, const char *out_dir);
 
+// tk_compile_project_g — build with the D4 test gate. gate=true runs the project's `#test`
+// functions on the VM before codegen (fail-fast, tests stripped from the binary); gate=false
+// (`--no-test`) is the plain production build. Mirrors project.tks compile_project_g.
+int tk_compile_project_g(const char *dir, const char *out_dir, bool gate);
+
 // Eixo D — the PROJECT RUN entry (debug profile). Mirrors tk_compile_project's front
 // (manifest → discover → assemble → check) but ends in the VM: INTERPRET the checked
 // merged tree (tk_vm_run) instead of codegen → cc. The process exit code is the

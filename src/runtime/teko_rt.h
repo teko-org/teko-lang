@@ -138,6 +138,14 @@ int32_t tk_rt_run(const tk_str *argv, uint64_t n);
 void    tk_set_args(int argc, char **argv);
 tk_str *tk_rt_args(uint64_t *n);
 
+// D3 — TEST-COVERAGE SINK. A host side-channel (like print's buffer / args), so the VM can
+// record which production functions executed during a `teko test` run WITHOUT a Teko
+// module-mutable (M.0). The VM marks a function's id (its source line) on entry; the runner
+// reads the distinct count afterward to compute function-level coverage.
+void     tk_cov_reset(void);        // clear the executed-id set (call before a test run)
+void     tk_cov_mark(uint64_t id);  // record an executed id (deduped)
+uint64_t tk_cov_distinct(void);     // how many distinct ids were marked
+
 // tk_slice_push — the AMORTIZED lowering of `teko::list::push` (a `[]T` grow-by-one). The
 // language keeps value semantics (fixed slices, copy-to-grow — collections #2); this is purely a
 // codegen optimization so a LINEAR `b = push(b, x)` chain (the codegen output buffer is 1.4MB+

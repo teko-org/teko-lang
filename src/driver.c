@@ -378,10 +378,45 @@ static char *cstr_of(tk_str s) {
 // mangling case fails with codegen's honest message (no silent mis-emit).
 // =========================================================================
 int tk_compile_project(const char *dir, const char *out_dir) {
+    return tk_compile_project_g(dir, out_dir, true);
+}
+
+// strip_tests — a copy of the program WITHOUT `#test` functions (D4): a release binary must not
+// carry test code. (Mirrors project.tks strip_tests.)
+static tk_tprogram strip_tests(tk_tprogram prog) {
+    tk_titem *kept = tk_alloc(prog.nitems ? prog.nitems * sizeof(tk_titem) : 1);
+    if (!kept) abort();
+    size_t k = 0;
+    for (size_t i = 0; i < prog.nitems; i += 1) {
+        if (prog.items[i].tag == TK_TITEM_FUNCTION && prog.items[i].as.function.is_test) continue;
+        kept[k++] = prog.items[i];
+    }
+    return (tk_tprogram){ .items = kept, .nitems = k };
+}
+
+// tk_compile_project_g — the build with the D4 TEST GATE. gate=true (default `teko build`):
+// assemble WITH the `.tkt` tests, run them on the VM FIRST (fail-fast — a failed assertion aborts
+// the build before emission), THEN codegen the production program (tests stripped). gate=false
+// (`teko build --no-test`, used by the bootstrap self-build whose corpus tests are not yet
+// VM-runnable) is the plain production front-end. (Mirrors project.tks compile_project_g.)
+int tk_compile_project_g(const char *dir, const char *out_dir, bool gate) {
     tk_tprogram prog;
     tk_manifest m;
-    int rc = project_frontend(dir, &prog, &m, false);
+    int rc = project_frontend(dir, &prog, &m, gate);   // gate ⇒ include the `.tkt` tests
     if (rc != 0) return rc;
+
+    if (gate) {
+        int trc = tk_vm_run_tests(prog);   // GATE: fail-fast — a failed assertion aborts here
+        if (trc != 0) return trc;
+        // D4 coverage floor (10%): bar the build if the tests exercise too little of the code.
+        uint64_t cov = tk_vm_coverage_pct(prog);
+        if (cov < 10) {
+            fprintf(stderr, "teko: %s: test coverage %llu%% is below the 10%% floor — add tests or build with `--no-test`\n",
+                    dir, (unsigned long long)cov);
+            return 1;
+        }
+        prog = strip_tests(prog);          // a release binary carries no test code
+    }
 
     // --- backend (F2): lower the checked merged program to C, build it natively ---
     char *stem = cstr_of(m.name);

@@ -34,4 +34,7 @@ int tk_vm_run(tk_tprogram prog);
 // failed assertion panics from inside the VM. All pass → 0. (Mirrors vm.tks run_tests.)
 int tk_vm_run_tests(tk_tprogram prog);
 
+// tk_vm_coverage_pct — function-level coverage % from the last run_tests (D3). (Mirrors vm.tks.)
+uint64_t tk_vm_coverage_pct(tk_tprogram prog);
+
 #endif // TK_VM_H

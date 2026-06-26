@@ -233,10 +233,48 @@ fn ensure_rt_dir_abs() {
     match teko::env::set_var("TK_RT_DIR", teko::str::concat3(cwd, "/", rel)) { error => {}; null => {} }
 }
 
-fn compile_project(dir: str, out_dir: str) -> i32 {
+fn compile_project(dir: str, out_dir: str) -> i32 { compile_project_g(dir, out_dir, true) }
+
+// strip_tests — the production program WITHOUT `#test` functions (D4): a release binary must
+// not carry test code. Tests are excluded from codegen; everything else passes through.
+fn strip_tests(prog: checker::TProgram) -> checker::TProgram {
+    mut kept: []checker::TItem = teko::list::empty()
+    mut i = 0
+    loop {
+        if i >= prog.items.len { break }
+        mut drop = false
+        match prog.items[i] {
+            checker::TFunction as f => { if f.is_test { drop = true } }
+            _ => {}
+        }
+        if !drop { kept = teko::list::push(kept, prog.items[i]) }
+        i++
+    }
+    checker::TProgram { items = kept }
+}
+
+// compile_project_g — the build with the D4 TEST GATE. `gate=true` (the default `teko build`):
+// assemble WITH the `.tkt` tests, run them on the VM FIRST (fail-fast — a failed assertion
+// panics, aborting the build before any emission), THEN codegen the production program (tests
+// stripped). An empty suite is not a failure. `gate=false` (`teko build --no-test`, used by the
+// bootstrap self-build whose own corpus tests are not yet VM-runnable) is the plain production
+// front-end with no test files assembled. (D4 — tests gate emission; release bars on fail.)
+fn compile_project_g(dir: str, out_dir: str, gate: bool) -> i32 {
     ensure_rt_dir_abs()   // pin the runtime to an absolute path BEFORE the front-end chdir's
-    let fe = match project_frontend(dir) { Frontend as x => x; error as e => return fail(dir, e.message) }
-    backend(dir, fe.manifest.name, out_dir, fe.prog)
+    if !gate {
+        let fe = match project_frontend(dir) { Frontend as x => x; error as e => return fail(dir, e.message) }
+        return backend(dir, fe.manifest.name, out_dir, fe.prog)
+    }
+    let fe = match project_frontend_sel(dir, true) { Frontend as x => x; error as e => return fail(dir, e.message) }
+    let trc = vm::run_tests(fe.prog)   // GATE: fail-fast — a failed assertion panics here, barring the build
+    if trc != 0 { return trc }
+    // D4 coverage floor (10%): bar the build if the tests exercise too little of the code. Skipped
+    // implicitly when there are no production functions (coverage_pct → 100).
+    let cov = vm::coverage_pct(fe.prog)
+    if cov < 10 {
+        return fail(dir, teko::str::concat3("test coverage ", teko::str::u64_to_str(cov), "% is below the 10% floor — add tests or build with `--no-test`"))
+    }
+    backend(dir, fe.manifest.name, out_dir, strip_tests(fe.prog))
 }
 
 // CLI helpers (mirror main.c::parse_out_dir; here because main.tks is the virtual-main and holds no
@@ -255,12 +293,25 @@ fn out_dir_of(args: []str, start: u64) -> str {
     "bin"
 }
 
+// does `--no-test` appear in the args? (D4 — skip the build-time test gate; used by the
+// bootstrap self-build, whose own corpus tests are not yet VM-runnable.)
+fn no_test_of(args: []str) -> bool {
+    mut i: u64 = 0
+    loop {
+        if i >= args.len { break }
+        if args[i] == "--no-test" { return true }
+        i = i + 1
+    }
+    false
+}
+
 // the FIRST non-flag positional (the project) from `start`, or "" if none (the caller reports).
 fn project_arg_of(args: []str, start: u64) -> str {
     mut i = start
     loop {
         if i >= args.len { break }
-        if args[i] == "-o" { i = i + 2 }        // skip `-o` and its value
+        if args[i] == "-o" { i = i + 2 }            // skip `-o` and its value
+        else if args[i] == "--no-test" { i = i + 1 }   // skip the gate flag (D4)
         else { return args[i] }
     }
     ""

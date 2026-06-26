@@ -464,6 +464,28 @@ tk_str *tk_rt_args(uint64_t *n) {
     return out;
 }
 
+// D3 — test-coverage sink (host side-channel; see teko_rt.h). A growable array of distinct ids,
+// deduped on insert (the id count is bounded by the project's function count, so linear dedup is
+// fine). tk_cov_reset starts a fresh run; tk_cov_mark records a function-entry id; tk_cov_distinct
+// reports how many distinct functions executed.
+static uint64_t *tk_cov_ids = NULL;
+static uint64_t  tk_cov_n   = 0;
+static uint64_t  tk_cov_cap = 0;
+void tk_cov_reset(void) { tk_cov_n = 0; }   // keep the buffer; just forget the marks
+void tk_cov_mark(uint64_t id) {
+    for (uint64_t i = 0; i < tk_cov_n; i += 1) if (tk_cov_ids[i] == id) return;   // dedup
+    if (tk_cov_n == tk_cov_cap) {
+        uint64_t ncap = tk_cov_cap ? tk_cov_cap * 2 : 64;
+        uint64_t *grown = (uint64_t *)tk_alloc(ncap * sizeof *grown);   // arena: alloc-new + copy
+        if (!grown) abort();
+        for (uint64_t i = 0; i < tk_cov_n; i += 1) grown[i] = tk_cov_ids[i];
+        tk_cov_ids = grown;
+        tk_cov_cap = ncap;
+    }
+    tk_cov_ids[tk_cov_n++] = id;
+}
+uint64_t tk_cov_distinct(void) { return tk_cov_n; }
+
 // --- amortized growable push (the teko::list::push lowering — see teko_rt.h) ---
 // A small cache of recent live tails. Codegen threads ONE big output buffer linearly, so its tail
 // stays cached and every append is in-place; a few interleaved small temp buffers keep their own

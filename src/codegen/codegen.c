@@ -1221,6 +1221,10 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
                     else if (seg_is(last, "int_to_float")) builtin = "tk_int_to_float"; // (i128,bool) -> f64
                     else if (seg_is(last, "f64_bits"))     builtin = "tk_f64_bits";     // (f64) -> u64
                     else if (seg_is(last, "f64_from_bits"))builtin = "tk_f64_from_bits";// (u64) -> f64
+                    // D3 — test-coverage sink (host side-channel): the VM marks executed production fns.
+                    else if (seg_is(last, "cov_reset"))    builtin = "tk_cov_reset";    // () -> void
+                    else if (seg_is(last, "cov_mark"))     builtin = "tk_cov_mark";     // (u64) -> void
+                    else if (seg_is(last, "cov_distinct")) builtin = "tk_cov_distinct"; // () -> u64
                     // diverging runtime panic helpers (the corpus calls these by bare name)
                     else if (seg_is(last, "panic_div0"))     builtin = "tk_panic_div0";
                     else if (seg_is(last, "panic_oob"))      builtin = "tk_panic_oob";

@@ -55,6 +55,12 @@ void teko__assert__str_contains(tk_str hay, tk_str needle);
 #include <stdio.h>            // fputs, stderr
 #include <string.h>           // memcmp
 
+// D3 — test-coverage sink (linked from teko_rt.c; see teko_rt.h). Declared here, after <stdint.h>,
+// because vm.c deliberately does not include teko_rt.h (it would re-typedef tk_str/tk_byte).
+void     tk_cov_reset(void);
+void     tk_cov_mark(uint64_t id);
+uint64_t tk_cov_distinct(void);
+
 // =========================================================================
 // M.3 honest barrier. A node the VM does not yet interpret is NOT silently
 // wrong — it aborts loud with a clear message. Distinct prefix ("vm:") from
@@ -920,6 +926,7 @@ static tk_value eval_call(const tk_texpr *e, tk_venv *env) {
                  (int)last.len, (const char *)last.ptr);
         vm_unsupported(buf);
     }
+    if (!fn->is_test) tk_cov_mark(fn->line);   // D3 — record this production fn as executed
     // A fresh root frame — no closure capture (flat functions, like codegen's C). Bind each
     // parameter to its evaluated argument (args evaluate in the CALLER's env, then enter the
     // callee's frame positionally by the param's name). (B-vm — VM function parameters.)
@@ -1455,8 +1462,25 @@ int tk_vm_run(tk_tprogram prog) {
 // void) in the merged program, fail-fast: a failed assertion panics (aborts) from inside the
 // VM after the running test's name was printed. All pass → print the count, return 0. An empty
 // suite is not a failure. (Mirrors vm.tks run_tests.)
+// count_prod_fns — coverage DENOMINATOR: production (non-`#test`) functions. (Mirrors vm.tks.)
+static uint64_t count_prod_fns(tk_tprogram prog) {
+    uint64_t n = 0;
+    for (size_t i = 0; i < prog.nitems; i += 1)
+        if (prog.items[i].tag == TK_TITEM_FUNCTION && !prog.items[i].as.function.is_test) n += 1;
+    return n;
+}
+
+// tk_vm_coverage_pct — function-level coverage % from the last run (the cov sink still holds its
+// marks). 100 when there are no production functions. (Mirrors vm.tks coverage_pct.)
+uint64_t tk_vm_coverage_pct(tk_tprogram prog) {
+    uint64_t total = count_prod_fns(prog);
+    if (total == 0) return 100;
+    return tk_cov_distinct() * 100 / total;
+}
+
 int tk_vm_run_tests(tk_tprogram prog) {
     g_prog = prog;
+    tk_cov_reset();          // D3 — start a fresh coverage run
     size_t passed = 0;
     for (size_t i = 0; i < prog.nitems; i += 1) {
         if (prog.items[i].tag != TK_TITEM_FUNCTION) continue;
@@ -1474,7 +1498,10 @@ int tk_vm_run_tests(tk_tprogram prog) {
         printf("ok\n");
         passed += 1;
     }
-    if (passed == 0) printf("teko: no tests (no `#test` functions)\n");
-    else             printf("teko: %zu test(s) passed\n", passed);
+    if (passed == 0) { printf("teko: no tests (no `#test` functions)\n"); return 0; }
+    printf("teko: %zu test(s) passed\n", passed);
+    printf("teko: coverage %llu%% (%llu/%llu functions)\n",
+           (unsigned long long)tk_vm_coverage_pct(prog),
+           (unsigned long long)tk_cov_distinct(), (unsigned long long)count_prod_fns(prog));
     return 0;
 }
