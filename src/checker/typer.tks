@@ -184,8 +184,8 @@ fn type_call(c: parser::Call, env: Env, table: TypeTable) -> TExpr | error {
             return TExpr { kind = TCall { callee = c.callee; args = eargs }; type = Void { }; line = 0; col = 0 }
         }
     }
-    let ft = match lookup(env, name) {                                  // user fns resolve first;
-        Type as t => t
+    let ft = match lookup_call(env, c.callee) {                         // (#41) namespace-aware: a local or
+        Type as t => t                                                 // a same-namespace fn (unqualified) / the qualified ns;
         error => match builtin_fn(name) { Type as t => t; error => return error { message = $"unknown function: {name}" } }   // …then the injected builtins; else name the symbol (M.3)
     }
     match ft {
@@ -1182,6 +1182,7 @@ pub fn type_program(program: parser::Program) -> TProgram | error {
     loop {
         if i >= program.items.len { break }
         let it = program.items[i]
+        let ienv = with_ns(c.env, it.namespace)   // (#41) resolve this item's calls in its namespace
         // W-loc-2: the item's source file + the decl's line:col, so a type error in the
         // flattened program resolves to file:line:col (loose statements carry no loc → file only).
         mut line: u32 = 0
@@ -1199,7 +1200,7 @@ pub fn type_program(program: parser::Program) -> TProgram | error {
         // surface_at. The error value now carries those adornments per the E2 contract.
         match it.content {
             parser::Statement as s => {
-                let ts = match type_statement(s, c.env, c.types) {
+                let ts = match type_statement(s, ienv, c.types) {
                     TypedStmt as x => x
                     error as e => return surface_at(it.file, line, col, e)
                 }
@@ -1207,7 +1208,7 @@ pub fn type_program(program: parser::Program) -> TProgram | error {
                 mainbody = teko::list::push(mainbody, ts.node)
             }
             _ => {
-                let ti = match type_item(it, c.env, c.types) {
+                let ti = match type_item(it, ienv, c.types) {
                     TItem as x => x
                     error as e => return surface_at(it.file, line, col, e)
                 }

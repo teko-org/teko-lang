@@ -2,23 +2,35 @@
 
 use teko::parser
 
-// a value binding visible in scope: a name and its type.
+// a value binding: a name, its type, and (for a top-level FUNCTION) the DEFINING namespace —
+// "" for locals/params/match-binds — used by namespace-aware CALL resolution (#41).
 type ValBinding = struct {
     name:   str
     type:   Type
     is_mut: bool      // (B.21): true ONLY for a `mut` local; let/const/params/match-bindings = false
+    ns:     str       // (#41) declaring namespace of a top-level fn; "" for locals
 }
 
-// the environment: a FLAT list of bindings. A later binding shadows an earlier of
-// the same name (lexical); block scoping is implicit (the caller keeps its prefix
-// when the recursion returns — the block's bindings were a local extension).
-pub type Env = []ValBinding
+// the environment: a FLAT list of bindings PLUS the namespace currently being type-checked, so an
+// UNQUALIFIED call resolves to a same-namespace function rather than a global bare-name collision
+// (#41). Later bindings shadow earlier (lexical); block scoping is implicit. (Mirror of C tk_env.)
+pub type Env = struct { bindings: []ValBinding; cur_ns: str }
 
-// define a name (append); returns the extended env (ref-less consume-return). `is_mut`
-// comes from the call site: a `mut` binding passes true; EVERYTHING else (let, const,
-// params, match-bindings, function signatures) passes false (B.21).
+// an empty env (no bindings, no current namespace).
+pub fn env_empty() -> Env { Env { bindings = teko::list::empty(); cur_ns = "" } }
+
+// (#41) set the namespace currently being type-checked — the typed pass sets it per item.
+pub fn with_ns(env: Env, ns: str) -> Env { Env { bindings = env.bindings; cur_ns = ns } }
+
+// define a LOCAL name (append). `is_mut`: a `mut` binding passes true; everything else false (B.21).
+// Locals carry no namespace ("").
 pub fn define(env: Env, name: str, t: Type, is_mut: bool) -> Env {
-    teko::list::push(env, ValBinding { name = name; type = t; is_mut = is_mut })
+    Env { bindings = teko::list::push(env.bindings, ValBinding { name = name; type = t; is_mut = is_mut; ns = "" }); cur_ns = env.cur_ns }
+}
+
+// (#41) define a TOP-LEVEL FUNCTION binding carrying its declaring namespace.
+pub fn define_fn(env: Env, name: str, t: Type, ns: str) -> Env {
+    Env { bindings = teko::list::push(env.bindings, ValBinding { name = name; type = t; is_mut = false; ns = ns }); cur_ns = env.cur_ns }
 }
 
 // a binding is mutable iff declared `mut` (Let and Const are immutable — B.21).
@@ -26,11 +38,11 @@ fn bind_is_mut(k: parser::BindKind) -> bool { k == parser::BindKind::Mut }
 
 // the WHOLE binding (type + mutability), innermost first — for the `mut` write-guard (B.21).
 fn lookup_binding(env: Env, name: str) -> ValBinding | error {
-    mut i = env.len
+    mut i = env.bindings.len
     loop {
         if i == 0 { break }
         i = i - 1
-        if env[i].name == name { return env[i] }
+        if env.bindings[i].name == name { return env.bindings[i] }
     }
     error { message = $"undefined name: {name}" }
 }
@@ -38,6 +50,41 @@ fn lookup_binding(env: Env, name: str) -> ValBinding | error {
 // the type of a name — the common case; a thin wrapper so existing callers are unchanged.
 fn lookup(env: Env, name: str) -> Type | error {
     match lookup_binding(env, name) { ValBinding as b => b.type; error as e => e }
+}
+
+// (#41) the LAST `::`-segment of a namespace ("teko::lexer" -> "lexer").
+fn ns_last_seg(ns: str) -> str {
+    mut cut: u64 = 0
+    mut i: u64 = 0
+    loop {
+        if i + 1 >= ns.len { break }
+        if ns[i] == b':' && ns[i + 1] == b':' { cut = i + 2 }
+        i++
+    }
+    slice(ns, cut, ns.len)
+}
+
+// (#41) NAMESPACE-AWARE call resolution (mirror of C tk_env_lookup_call). UNQUALIFIED `name`: a
+// LOCAL (ns empty) or a function in the CURRENT namespace. QUALIFIED `q::…::name`: a function whose
+// namespace's last segment == q. Innermost first (locals shadow). Returns the function/value type.
+fn lookup_call(env: Env, callee: parser::Path) -> Type | error {
+    let name = callee.segments[callee.segments.len - 1].name
+    let qualified = callee.segments.len > 1
+    let qual = if qualified { callee.segments[callee.segments.len - 2].name } else { "" }
+    mut i = env.bindings.len
+    loop {
+        if i == 0 { break }
+        i = i - 1
+        let b = env.bindings[i]
+        if b.name == name {
+            if !qualified {
+                if b.ns.len == 0 || b.ns == env.cur_ns { return b.type }
+            } else {
+                if b.ns.len != 0 && ns_last_seg(b.ns) == qual { return b.type }
+            }
+        }
+    }
+    error { message = $"undefined name: {name}" }
 }
 
 // resolve an INJECTED built-in type name to its Type (B.19). User types
