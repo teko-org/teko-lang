@@ -27,28 +27,32 @@ Type-model doctrine (void/error/variant/nullable; no `never`), 128-bit + float p
 layer, match/if-value execution, labeled loops, subscript indexing, the **S0 `tk_alloc()` allocation seam**,
 slice value-layer Increment A (fixed+copy), and the `panic`/`exit` global-diverging-fn ruling are **DONE**.
 
-**★ SELF-HOST CHECK GREEN + NATIVE CODEGEN NOW REACHES ITS LAST BLOCKER (2026-06-26):** `teko build .` →
-*"project assembled (822 items) and type-checked OK"*, zero `file:line:col` errors — teko's checker
-type-checks its ENTIRE own corpus. Two milestones landed this session (uncommitted, SUPREME-RULE-clean):
-(1) **Collections ruling #4** — `teko::list::empty()` / `[]` with no element type from context is now a
-type ERROR (checker `type_binding`/`type_struct_lit`); the element must come from a binding/field/return
-annotation. The whole sentinel-slice back-inference machinery (`find_slice_elem_in_stmts`, the `typeof`
-assign trick, the block fixups) was DELETED — simpler and more correct. The 76 untyped-empty corpus
-bindings were annotated `: []T`. (2) **Topological type-decl emission** (codegen `cg_emit_types_ordered`):
-slice typedefs first (pointers), then named/optional/inline-variant bodies in by-value dependency order —
-fixed the generated-C "incomplete type" / "unknown `tk_slice_`" ordering errors. The inline-union codegen
-barrier is PASSED. Regressions VM==native (5/6). **THE ONE REMAINING NATIVE BLOCKER = recursive value
-types**: the typed AST embeds recursion by value (`TBinary.left: TExpr`), an infinite-size C struct.
-DECISION (user): **auto-box back-edges in codegen** via the S0 `tk_alloc` seam (no language/corpus change;
-matches the C twin's `tk_texpr *`; S2 arena swap stays mechanical). Codegen stops honestly until then:
-`codegen: cyclic value-type dependency (must pass through a slice or a boxed reference)`. See memory
-`teko-collections-rulings.md` + `session-recovery-2026-06-25.md`.
+**★ SELF-HOST CHECK GREEN + NATIVE CODEGEN COMPILING DEEP (2026-06-26):** `teko build .` →
+*"project assembled (853 items) and type-checked OK"*; the native backend now generates C that compiles
+through almost the entire corpus, with a short tail of remaining walls. SIX milestones committed this
+session (each mirrored to `.tks`, regressions VM==native 5/6, bootstrap clean):
+- `916c568` **Collections ruling #4** (no untyped empty — element type required at decl; sentinel
+  back-inference machinery deleted) + **topological type-decl emission** (slice typedefs first, then
+  named/optional/inline-variant bodies in by-value dep order).
+- `b8d5106` **Auto-boxing of recursive value types** (`TBinary.left: TExpr` → `tk_alloc`'d heap back-edge
+  pointer; cycle broken; rides the S0 seam, S2 arena swap stays mechanical) + native-completeness fixes
+  (alias-in-field, keyword escaping, `str==`→`tk_str_eq`, str builtin call-map, function prototypes) +
+  native str runtime fns.
+- `1ac8b17` **Namespace-qualified function mangling** (`teko::checker::type_eq`→`teko__checker__type_eq`;
+  killed cross-namespace + libc collisions) + enum-subject match lowering + struct-init variant-field wrap.
+- `9170452` **Transitive case→variant wrapping** in emit_as (`Named`→`Type`→`Type|error`).
+- `32b3edd` **Call-argument** case→variant wrapping (param-type lookup + emit_as).
+- `8ae56d5` **Covariant `[]case`→`[]variant` slice rebuild** (element-wise wrap).
+
+**Remaining native walls** (short tail): host-FFI builtins (`write`/`ewrite`/`parse` + Phase-7
+file/process/env runtime), duplicate same-namespace helpers (`is_bool`/… in two checker files), one
+bind-whole-variant pattern. See memory `teko-collections-rulings.md` for the exact next-step list.
 
 ---
 
 ## THE SEQUENCE
 
-> **Status legend:** ✅ done · 🔶 in progress / partial · ⬜ not started. Updated 2026-06-26 (commit `048b4af`).
+> **Status legend:** ✅ done · 🔶 in progress / partial · ⬜ not started. Updated 2026-06-26 (commit `8ae56d5`).
 
 | # | Phase | Status | Why here |
 |---|-------|--------|----------|
@@ -57,8 +61,8 @@ matches the C twin's `tk_texpr *`; S2 arena swap stays mechanical). Codegen stop
 | 3 | str/byte stdlib as real mirrored fns | ✅ done (`teko::str::*` + host-FFI surface in scope.c/.tks) | Close a half-implemented layer; unblocks self-host CHECK |
 | 4 | C↔.tks mirroring audit | 🔶 ongoing (closed many gaps during the CHECK march; no dedicated sweep yet) | Pay down mirror debt before more code lands |
 | 5 | Definite-assignment / init analysis | ⬜ not started | Real checker gap; lands the warnings channel |
-| 6 | Finish self-host → working `teko .` | 🔶 **CHECK ✅ GREEN** (796 items type-check); native codegen + VM-run ⬜ | The gating milestone for everything downstream |
-| 7 | Host independence | ⬜ (FFI builtins typed in checker; runtime impls TODO) | FFI + host surfaces + VM test gate + project/output/pack |
+| 6 | Finish self-host → working `teko .` | 🔶 **CHECK ✅ GREEN** (853 items); **native codegen ✅ compiles deep** (auto-box, ns-mangling, case→variant wrap, slice rebuild — 6 commits); short tail (host-FFI builtins, dup helpers, 1 pattern) + VM-run ⬜ | The gating milestone for everything downstream |
+| 7 | Host independence | 🔶 FFI builtins typed in checker; native runtime: str surface + `tk_alloc` ✅; host I/O (`write`/`ewrite`/`parse`/file/process/env) runtime impls ⬜ | FFI + host surfaces + VM test gate + project/output/pack |
 | 8 | FLAGS | ⬜ not started | Bitflag enums (spec frozen) |
 | 9 | SEC | ⬜ not started | SAST + capability audit, after corrections |
 | 10 | Evolution S1–S9 | ⬜ not started | Post-self-host campaign (arenas→…→concurrency) |
@@ -106,7 +110,7 @@ matches the C twin's `tk_texpr *`; S2 arena swap stays mechanical). Codegen stop
 **Status (2026-06-26, commit `048b4af`):**
 - ✅ **CHECK GREEN** — `teko build .` type-checks the whole corpus (796 items, 0 errors). Delivered: the widening lattice (`tk_widens_into`/`tk_type_join`), enum-subject `match`, pervasive literal adoption, **E7 enum↔int casts**, the host-FFI builtin surface, the VM `.tks` value+eval cluster, `src/build/project.tks`. Regressions VM==native 5/6.
 - 🔶 **#41 partial** — namespace-aware *call* resolution (`tk_env_lookup_call`) ✅; namespace-aware *type* resolution (a `Named` carrying its namespace) ⬜ still deferred (sidestepped via the `vm::Env/Return`→`Venv/VmReturn` rename).
-- 🔶 **Native codegen** — slice value-layer, inline-union lowering, topological type-decl emission, **AND auto-boxing of recursive value types** (`tk_alloc` back-edge pointers, S0 seam) all DONE; the type cycle is fully broken and the generated C compiles deep into the corpus. Codegen-completeness fixes landed: alias-in-field resolution, C-keyword escaping (`bool`/`signed`), `str==`→`tk_str_eq`, the str builtin call-map, **function prototypes**, and value-form-match return wrapping. Native str runtime fns implemented (`tk_str_eq/slice/len/ends_with/contains/…`). ALL mirrored to `.tks` (corpus type-checks at 840 items; regressions VM==native 5/6). **Remaining blockers**: (1) cross-namespace function name collisions → needs namespace-qualified mangling threaded through tast→typer→codegen (the deferred #41/#49 — a checker-model change); (2) host-FFI runtime (file IO/process/env/dir — Phase 7) + `last_index_of`; (3) value-form-`if` return wrapping (small).
+- 🔶 **Native codegen** — generates C that compiles DEEP into the corpus (6 commits this session, all mirrored to `.tks`, regressions VM==native 5/6): slice value-layer, inline-union lowering, topological type-decl emission, **auto-boxing of recursive value types** (`tk_alloc` back-edge pointers, S0 seam — cycle fully broken), **namespace-qualified function mangling** (`teko::checker::type_eq`→`teko__checker__type_eq`, fixed #41/#49 collisions incl. libc `div`), **case→variant wrapping** at every site (bindings/struct-fields/call-args/returns — DIRECT, TRANSITIVE `Named`→`Type`→`Type|error`, and covariant `[]case`→`[]variant` element-wise slice rebuild), enum-subject match lowering, C-keyword escaping (`bool`/`signed`), alias-in-field resolution, `str==`→`tk_str_eq`, str builtin call-map, **function prototypes**. Native runtime: str surface (`tk_str_eq/slice/len/ends_with/contains/…`) + `tk_alloc` seam. **Remaining short tail**: host-FFI builtins (`write`/`ewrite`/`parse` — easy map+runtime; then Phase-7 file/process/env + `last_index_of`, variant returns); duplicate same-ns helpers (`is_bool`/… in expr.tks + revalidate.tks — structural dedup); one bind-whole-variant pattern (`TypeExpr as t` over optional); value-form-`if` diverging returns.
 - ⬜ **VM execution** — `teko run .` reaches `vm: call to an unknown function`: `.tks` `eval_call` doesn't bind params yet; `teko::fs::list_dir` is checker-only (no `tk_list_dir` runtime).
 - ⬜ **#19** X5 justification-header sweep.
 **Work remaining — native backend (W-backend #40), in order:**
