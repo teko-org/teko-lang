@@ -27,15 +27,22 @@ Type-model doctrine (void/error/variant/nullable; no `never`), 128-bit + float p
 layer, match/if-value execution, labeled loops, subscript indexing, the **S0 `tk_alloc()` allocation seam**,
 slice value-layer Increment A (fixed+copy), and the `panic`/`exit` global-diverging-fn ruling are **DONE**.
 
-**★ SELF-HOST CHECK IS GREEN (2026-06-26, commit `048b4af`):** `teko build .` →
-*"project assembled (796 items) and type-checked OK"*, zero `file:line:col` errors — teko's checker
-type-checks its ENTIRE own corpus (65 files). Regressions VM==native (5/6). The widening lattice
-(`tk_widens_into`/`tk_type_join`), enum-subject `match`, pervasive literal adoption, **E7 enum↔int casts**,
-the host-FFI builtin surface, the VM `.tks` value+eval cluster, and `src/build/project.tks` (project
-orchestration) landed across commits `6de0bcd`→`9cd1a83`→`048b4af`. Remaining for a full `teko .`:
-native codegen (inline-union lowering — `codegen: slice/inline union not yet supported`) and VM execution
-(eval_call param-binding + `list_dir` runtime). See `TEKO_HISTORY.md` + tasks #1–#58 + memory
-`session-recovery-2026-06-25.md`.
+**★ SELF-HOST CHECK GREEN + NATIVE CODEGEN NOW REACHES ITS LAST BLOCKER (2026-06-26):** `teko build .` →
+*"project assembled (822 items) and type-checked OK"*, zero `file:line:col` errors — teko's checker
+type-checks its ENTIRE own corpus. Two milestones landed this session (uncommitted, SUPREME-RULE-clean):
+(1) **Collections ruling #4** — `teko::list::empty()` / `[]` with no element type from context is now a
+type ERROR (checker `type_binding`/`type_struct_lit`); the element must come from a binding/field/return
+annotation. The whole sentinel-slice back-inference machinery (`find_slice_elem_in_stmts`, the `typeof`
+assign trick, the block fixups) was DELETED — simpler and more correct. The 76 untyped-empty corpus
+bindings were annotated `: []T`. (2) **Topological type-decl emission** (codegen `cg_emit_types_ordered`):
+slice typedefs first (pointers), then named/optional/inline-variant bodies in by-value dependency order —
+fixed the generated-C "incomplete type" / "unknown `tk_slice_`" ordering errors. The inline-union codegen
+barrier is PASSED. Regressions VM==native (5/6). **THE ONE REMAINING NATIVE BLOCKER = recursive value
+types**: the typed AST embeds recursion by value (`TBinary.left: TExpr`), an infinite-size C struct.
+DECISION (user): **auto-box back-edges in codegen** via the S0 `tk_alloc` seam (no language/corpus change;
+matches the C twin's `tk_texpr *`; S2 arena swap stays mechanical). Codegen stops honestly until then:
+`codegen: cyclic value-type dependency (must pass through a slice or a boxed reference)`. See memory
+`teko-collections-rulings.md` + `session-recovery-2026-06-25.md`.
 
 ---
 
@@ -99,7 +106,7 @@ native codegen (inline-union lowering — `codegen: slice/inline union not yet s
 **Status (2026-06-26, commit `048b4af`):**
 - ✅ **CHECK GREEN** — `teko build .` type-checks the whole corpus (796 items, 0 errors). Delivered: the widening lattice (`tk_widens_into`/`tk_type_join`), enum-subject `match`, pervasive literal adoption, **E7 enum↔int casts**, the host-FFI builtin surface, the VM `.tks` value+eval cluster, `src/build/project.tks`. Regressions VM==native 5/6.
 - 🔶 **#41 partial** — namespace-aware *call* resolution (`tk_env_lookup_call`) ✅; namespace-aware *type* resolution (a `Named` carrying its namespace) ⬜ still deferred (sidestepped via the `vm::Env/Return`→`Venv/VmReturn` rename).
-- ⬜ **Native codegen** — `teko build .` reaches `codegen: slice / inline union type not yet supported` (codegen.c:306/388) + the function-parameter barrier. Inline/anonymous-variant lowering (`T | error` returns) is the keystone (W-backend #40).
+- 🔶 **Native codegen** — slice value-layer, inline-union lowering, and **topological type-decl emission** (`cg_emit_types_ordered`) all DONE; collections ruling #4 removed the sentinel-slice hacks. `teko build .` now type-checks + codegens to its LAST blocker: **recursive value types** (`TBinary.left: TExpr` → infinite-size C struct). Decided fix: **auto-box back-edges** via the S0 `tk_alloc` seam (W-backend #40). Stops honestly: `codegen: cyclic value-type dependency`.
 - ⬜ **VM execution** — `teko run .` reaches `vm: call to an unknown function`: `.tks` `eval_call` doesn't bind params yet; `teko::fs::list_dir` is checker-only (no `tk_list_dir` runtime).
 - ⬜ **#19** X5 justification-header sweep.
 **Work remaining — native backend (W-backend #40), in order:**

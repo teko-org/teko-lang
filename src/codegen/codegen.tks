@@ -824,18 +824,35 @@ fn emit_list_empty(buf: []byte, e: checker::TExpr) -> []byte | error {
     }
 }
 
-// emit_list_push — `teko::list::push(base, item)`. The push result type (the node's `.type`) is
-// `[]elem`. Lower to an inline copy-append GNU stmt-expr: declare the base slice, a COPY of the
-// item (wrapped to elem via emit_as), malloc len+1 elements (abort on OOM — M.1), copy the old
-// elements, append the item, then yield the fresh tk_slice_<elem>. (C: the `push` arm.)
-fn emit_list_push(buf: []byte, prog: checker::TProgram, e: checker::TExpr, c: checker::TCall) -> []byte | error {
-    let elem = match e.type {
-        checker::Slice as sl => match sl.element {
-            checker::Void => return error { message = "codegen: teko::list::push result is not a concrete slice (internal)" }
-            _ => sl.element
+// get_push_elem — resolve the concrete element type of a push call, handling the
+// case where type_assign overwrote the call's `.type` to the sentinel. Tries e.type
+// first; falls back to args[0] (concretized base slice), then args[1] (item). (C: inline.)
+fn get_push_elem(e: checker::TExpr, c: checker::TCall) -> checker::Type | error {
+    match e.type {
+        checker::Slice as sl => {
+            match sl.element { checker::Void => { }; _ => return sl.element }
         }
-        _ => return error { message = "codegen: teko::list::push result is not a concrete slice (internal)" }
+        _ => return error { message = "codegen: teko::list::push result is not a slice (internal)" }
     }
+    if c.args.len != 2 { return error { message = "codegen: teko::list::push result is not a concrete slice (internal)" } }
+    match c.args[0].type {
+        checker::Slice as base_sl => match base_sl.element { checker::Void => { }; _ => return base_sl.element }
+        _ => { }
+    }
+    let it = c.args[1].type
+    match it {
+        checker::Slice as is_sl => match is_sl.element { checker::Void => return error { message = "codegen: teko::list::push result is not a concrete slice (internal)" }; _ => { } }
+        _ => { }
+    }
+    it
+}
+
+// emit_list_push — `teko::list::push(base, item)`. The push result type (the node's `.type`) is
+// `[]elem`. type_assign may overwrite the call's type to the sentinel when assigning push(xs,i)
+// back to a sentinel-typed xs; get_push_elem recovers the element. Lower to an inline
+// copy-append GNU stmt-expr. (C: the `push` arm.)
+fn emit_list_push(buf: []byte, prog: checker::TProgram, e: checker::TExpr, c: checker::TCall) -> []byte | error {
+    let elem = match get_push_elem(e, c) { checker::Type as t => t; error as err => return err }
     let bN = $"_sb{buf.len}"
     let iN = $"_si{buf.len + 1}"
     let pN = $"_sp{buf.len + 2}"
@@ -843,7 +860,8 @@ fn emit_list_push(buf: []byte, prog: checker::TProgram, e: checker::TExpr, c: ch
     mut out = cb(buf, "({ ")
     out = match cg_slice_typename(out, elem) { []byte as o => o; error as err => return err }
     out = cb(out, " "); out = cb(out, bN); out = cb(out, " = ")
-    out = match emit_expr(out, prog, c.args[0]) { []byte as o => o; error as err => return err }
+    // Use emit_as so a sentinel empty() base-arg is lowered to the concrete empty literal.
+    out = match emit_as(out, prog, checker::Slice { element = elem }, c.args[0]) { []byte as o => o; error as err => return err }
     out = cb(out, "; ")
     out = match emit_type(out, elem) { []byte as o => o; error as err => return err }
     out = cb(out, " "); out = cb(out, iN); out = cb(out, " = ")
@@ -1215,6 +1233,36 @@ fn emit_interp(buf: []byte, prog: checker::TProgram, in: checker::TInterp) -> []
     out
 }
 
+// cg_find_struct_field_type — look up the declared TypeExpr of field `fname` in the struct
+// named `sname` from the program's type declarations. Returns the TypeExpr? (null if absent).
+// (C: cg_find_struct_field_type.)
+fn cg_find_struct_field_type(prog: checker::TProgram, sname: str, fname: str) -> parser::TypeExpr? {
+    mut i = 0
+    loop {
+        if i >= prog.items.len { break }
+        match prog.items[i] {
+            parser::TypeDecl as d => {
+                match d.body {
+                    parser::StructBody as sb => {
+                        if d.name == sname {
+                            mut j = 0
+                            loop {
+                                if j >= sb.fields.len { break }
+                                if sb.fields[j].name == fname { return sb.fields[j].type_ann }
+                                j++
+                            }
+                        }
+                    }
+                    _ => { }
+                }
+            }
+            _ => { }
+        }
+        i++
+    }
+    null
+}
+
 // emit_struct_init — W4c `Name { f = v, … }` -> a C compound literal in DECLARED field
 // order:  (tk_t_<MANGLE>){ .<field> = <val>, … }. The checker already reordered
 // field_names/field_vals into the struct's declared order (expr.tks), so both backends
@@ -1244,7 +1292,32 @@ fn emit_struct_init(buf: []byte, prog: checker::TProgram, e: checker::TExpr, si:
         out = cb(out, ".")
         out = cb_str(out, si.field_names[i])
         out = cb(out, " = ")
-        out = match emit_expr(out, prog, si.field_vals[i]) { []byte as o => o; error as err => return err }
+        // Sentinel empty() field: look up the declared field type and emit a concrete empty
+        // literal so emit_expr doesn't fail on the unknown element. (C: emit_struct_init fix.)
+        let fv = si.field_vals[i]
+        let emitted: bool = match fv.type {
+            checker::Slice as sl => match sl.element {
+                checker::Void => {
+                    match cg_find_struct_field_type(prog, name, si.field_names[i]) {
+                        parser::TypeExpr as fte => match fte {
+                            parser::SliceType as st => {
+                                out = cb(out, "(")
+                                out = match emit_type_expr(out, fte) { []byte as o => o; error as err => return err }
+                                out = cb(out, "){ .ptr = 0, .len = 0 }")
+                                true
+                            }
+                            _ => false
+                        }
+                        null => false
+                    }
+                }
+                _ => false
+            }
+            _ => false
+        }
+        if !emitted {
+            out = match emit_expr(out, prog, fv) { []byte as o => o; error as err => return err }
+        }
         i++
     }
     cb(out, " }")
@@ -1969,7 +2042,7 @@ fn emit_match_tail(buf: []byte, prog: checker::TProgram, e: checker::TExpr, m: c
 // while(0)` + break) precisely because an arm body is a BLOCK that may contain `break`/`continue`
 // targeting an ENCLOSING loop — those must be real C break/continue, never swallowed by a wrapper
 // (mirrors the VM propagating the arm's flow). (C: `emit_match_stmt`.)
-fn emit_match_stmt(buf: []byte, prog: checker::TProgram, e: checker::TExpr, m: checker::TMatchExpr, indent: str) -> []byte | error {
+fn emit_match_stmt(buf: []byte, prog: checker::TProgram, e: checker::TExpr, m: checker::TMatchExpr, in_main: bool, ret_type: checker::Type, indent: str) -> []byte | error {
     let subj = fresh_named("_s", buf.len to i64)
     let done = teko::str::concat(fresh_named("tk_m", buf.len to i64 + 1), "_done")   // unique commit label (str concat — no `+` on str)
     let subjT = m.subject.type   // for optional / variant pattern lowering
@@ -2002,8 +2075,9 @@ fn emit_match_stmt(buf: []byte, prog: checker::TProgram, e: checker::TExpr, m: c
             ci = cb_indent_deeper(inner2)
         }
         // run the arm body BLOCK for effect (value discarded); break/continue/return inside it
-        // propagate via C's own semantics. Then goto the commit label (first match wins).
-        out = match emit_block(out, arm.body, false, prog, Void { }, ci) { []byte as o => o; error as err => return err }
+        // propagate via C's own semantics. Thread ret_type so `return null` inside an arm
+        // wraps null correctly into the enclosing function's return slot.
+        out = match emit_block(out, arm.body, in_main, prog, ret_type, ci) { []byte as o => o; error as err => return err }
         out = cb(out, ci)
         out = cb(out, "goto ")
         out = cb(out, done)
@@ -2029,6 +2103,15 @@ fn emit_match_stmt(buf: []byte, prog: checker::TProgram, e: checker::TExpr, m: c
 // u128/i128 literal is wider than any C integer literal can spell on its own.
 // (C: the TK_TEXPR_NUMBER branch of emit_expr.)
 fn emit_number(buf: []byte, e: checker::TExpr, n: checker::TNumber) -> []byte | error {
+    // A numeric literal adopted to `byte` via literal-adoption (e.g. `c < 0x20` where c: byte).
+    match e.type {
+        checker::Byte => {
+            mut o = cb(buf, "((uint8_t)")
+            o = cb_i128(o, n.value)
+            return cb(o, ")")
+        }
+        _ => { }
+    }
     let k = match e.type {
         checker::Prim as p => p.kind
         _         => return error { message = "codegen: numeric literal with a non-primitive type not yet supported" }
@@ -2104,10 +2187,11 @@ fn emit_expr(buf: []byte, prog: checker::TProgram, e: checker::TExpr) -> []byte 
 // (emit_as). (C: `emit_block`.)
 fn emit_block(buf: []byte, body: []checker::TStatement, in_main: bool, prog: checker::TProgram, ret_type: checker::Type, indent: str) -> []byte | error {
     mut out = buf
-    mut i = 0
+    mut i: u64 = 0
     loop {
         if i >= body.len { break }
-        out = match emit_stmt(out, body[i], in_main, prog, ret_type, indent) { []byte as o => o; error as err => return err }
+        let s = body[i]
+        out = match emit_stmt(out, s, in_main, prog, ret_type, indent) { []byte as o => o; error as err => return err }
         i++
     }
     out
@@ -2125,7 +2209,8 @@ fn emit_block(buf: []byte, body: []checker::TStatement, in_main: bool, prog: che
 fn emit_exprstmt_tail(buf: []byte, x: checker::TExpr, in_main: bool, prog: checker::TProgram, ret_type: checker::Type, indent: str) -> []byte | error {
     match x.kind {
         checker::TIfExpr as f => {
-            if !f.has_else { return error { message = "codegen: if-without-else in tail position not yet supported" } }
+            // No else branch: emit as a control-flow statement; fall-through handled by caller's default return.
+            if !f.has_else { return emit_if_stmt(buf, f, in_main, prog, ret_type, indent) }
             mut out = cb(buf, indent)
             out = cb(out, "if (")
             out = match emit_expr(out, prog, f.cond) { []byte as o => o; error as err => return err }
@@ -2162,14 +2247,14 @@ fn emit_exprstmt_tail(buf: []byte, x: checker::TExpr, in_main: bool, prog: check
 
 // emit_block_tail — W5a: emit a FUNCTION/MAIN/branch body where the LAST statement, if it is
 // an expr-statement carrying a value, `return`s that value (via emit_exprstmt_tail). All but
-// the last statement emit normally. An explicit RETURN already yields the value; this adds the
-// implicit tail-return that mirrors the VM. (C: `emit_block_tail`.)
+// the last statement emit normally. (C: `emit_block_tail`.)
 fn emit_block_tail(buf: []byte, body: []checker::TStatement, in_main: bool, prog: checker::TProgram, ret_type: checker::Type, indent: str) -> []byte | error {
     mut out = buf
-    mut i = 0
+    mut i: u64 = 0
     loop {
         if i + 1 >= body.len { break }
-        out = match emit_stmt(out, body[i], in_main, prog, ret_type, indent) { []byte as o => o; error as err => return err }
+        let s = body[i]
+        out = match emit_stmt(out, s, in_main, prog, ret_type, indent) { []byte as o => o; error as err => return err }
         i++
     }
     if body.len == 0 { return out }
@@ -2239,6 +2324,8 @@ fn emit_assign(buf: []byte, prog: checker::TProgram, a: checker::TAssign, indent
     out = cb(out, " ")
     out = cb(out, op)
     out = cb(out, " ")
+    // (#4) the RHS carries a concrete type (an annotated binding's element flows in via
+    // type_assign's target-adopt), so it emits directly — no sentinel back-inference.
     out = match emit_expr(out, prog, a.value) { []byte as o => o; error as err => return err }
     cb(out, ";\n")
 }
@@ -2285,7 +2372,7 @@ fn emit_loop(buf: []byte, l: checker::TLoopStmt, in_main: bool, prog: checker::T
 
 // cb_indent_deeper — `indent` + four spaces (the C did `snprintf(inner, "%s    ", indent)`).
 fn cb_indent_deeper(indent: str) -> str {
-    mut xs = teko::list::empty()
+    mut xs: []byte = teko::list::empty()
     mut i = 0
     loop {
         if i >= indent.len { break }
@@ -2311,7 +2398,7 @@ fn emit_stmt(buf: []byte, s: checker::TStatement, in_main: bool, prog: checker::
             // a `match` in statement position runs each winning arm body for effect.
             match es.expr.kind {
                 checker::TIfExpr as f    => emit_if_stmt(buf, f, in_main, prog, ret_type, indent)
-                checker::TMatchExpr as m => emit_match_stmt(buf, prog, es.expr, m, indent)
+                checker::TMatchExpr as m => emit_match_stmt(buf, prog, es.expr, m, in_main, ret_type, indent)
                 _ => {
                     mut out = cb(buf, indent)
                     out = match emit_expr(out, prog, es.expr) { []byte as o => o; error as err => return err }
@@ -2339,8 +2426,7 @@ fn emit_stmt(buf: []byte, s: checker::TStatement, in_main: bool, prog: checker::
 // A top-level function -> a C function.
 // ---------------------------------------------------------------------------
 
-// emit_function — a TFunction -> a C function definition. M0 has no params (a param
-// would require resolving its annotation), so any param is the honest barrier.
+// emit_function — a TFunction -> a C function definition.
 // (C: `emit_function`.)
 fn emit_function(buf: []byte, prog: checker::TProgram, f: checker::TFunction) -> []byte | error {
     mut out = match emit_type(buf, f.return_type) { []byte as o => o; error as err => return err }
@@ -2350,7 +2436,15 @@ fn emit_function(buf: []byte, prog: checker::TProgram, f: checker::TFunction) ->
     if f.params.len == 0 {
         out = cb(out, "void")
     } else {
-        return error { message = "codegen: function parameters not yet supported" }
+        mut i: u64 = 0
+        loop {
+            if i >= f.params.len { break }
+            if i > 0 { out = cb(out, ", ") }
+            out = match emit_type_expr(out, f.params[i].type_ann) { []byte as o => o; error as err => return err }
+            out = cb(out, " ")
+            out = cb_str(out, f.params[i].name)
+            i++
+        }
     }
     out = cb(out, ") {\n")
     // W5a — a fn body's trailing expr-statement carrying a value implicitly returns it.
@@ -2502,7 +2596,7 @@ fn emit_type_decl(buf: []byte, d: parser::TypeDecl) -> []byte | error {
 // emitted once in the prelude. We walk every type that flows through emit_type (function sigs,
 // bindings, every TExpr `.type`), collecting distinct inners (deduped by mangled name). Nested
 // optionals register the inner first so its typedef precedes the outer's reference. (C: the
-// cg_opt_set / cg_collect_* / cg_emit_optional_typedefs family.)
+// cg_opt_set / cg_collect_* family.)
 // ---------------------------------------------------------------------------
 // The per-type generated typedefs collected in ONE walk: optional inners (tk_opt_<i>) AND slice
 // element types (tk_slice_<e>). Mirrors the C's `cg_opt_set` struct (two parallel lists threaded
@@ -2713,10 +2807,134 @@ fn cg_emit_inline_variant_typedef(buf: []byte, v: checker::Variant) -> []byte | 
     cb(out, ";\n")
 }
 
-// walk the whole program; emit each distinct optional typedef once (registration order, so a
-// nested inner optional precedes the outer that references it), then the slice typedefs AFTER the
-// optionals (so a `[](T?)` element's tk_opt_<i> already exists). Same {ptr,len} shape as tk_str.
-fn cg_emit_optional_typedefs(buf: []byte, prog: checker::TProgram) -> []byte | error {
+// =========================================================================
+// SELF-HOST — TOPOLOGICAL type-declaration emission. A struct/variant body embeds named
+// aggregates, optionals (tk_opt_) and inline variants (tk_u_) BY VALUE, so each must be FULLY
+// defined BEFORE the body that embeds it. Slices (tk_slice_) are pointer-only (their named
+// elements have forward typedefs), so they are emitted up front. The remaining {named, opt,
+// inline-variant} typedefs are emitted in DEPENDENCY order by a fixpoint: each pass emits every
+// not-yet-emitted node whose by-value dependencies are already emitted, until none remain. The
+// value-type graph is a DAG (every Teko recursion passes through a slice = pointer), so the
+// fixpoint terminates; a residue means a genuine cyclic value type (an internal error).
+// (C: the cg_typenodes / cg_*_ready / cg_emit_types_ordered family.)
+// =========================================================================
+// The "already-emitted" tracking. C uses parallel bool arrays keyed by index; the functional
+// `.tks` idiom tracks the emitted KEYS in lists and checks membership (named decls by name,
+// optionals by inner mangle key, inline variants by tk_u_<keys> key).
+type CgEmitted = struct { names: []str; opt_keys: []str; uvar_keys: []str }
+
+fn cg_str_in(xs: []str, s: str) -> bool {
+    mut i = 0
+    loop { if i >= xs.len { break }; if xs[i] == s { return true }; i++ }
+    false
+}
+// Has the named decl `name` been emitted? (a builtin/scalar not in our set has no edge → ready.)
+fn cg_named_emitted(em: CgEmitted, name: str) -> bool { cg_str_in(em.names, name) }
+// Has the optional whose inner mangles to `key` been emitted? (no matching node → no edge.)
+fn cg_opt_emitted_key(em: CgEmitted, set: CgTypeSet, key: str) -> bool {
+    // an optional inner not present in the program's collected set carries no edge → ready.
+    mut i = 0
+    mut present = false
+    loop {
+        if i >= set.inners.len { break }
+        if cg_opt_key(set.inners[i]) == key { present = true; break }
+        i++
+    }
+    if !present { return true }
+    cg_str_in(em.opt_keys, key)
+}
+// Has the inline variant whose typename is `key` been emitted? (no matching node → no edge.)
+fn cg_uvar_emitted_key(em: CgEmitted, set: CgTypeSet, key: str) -> bool {
+    mut i = 0
+    mut present = false
+    loop {
+        if i >= set.variants.len { break }
+        if cg_variant_key(set.variants[i]) == key { present = true; break }
+        i++
+    }
+    if !present { return true }
+    cg_str_in(em.uvar_keys, key)
+}
+// By-value readiness of a resolved type (an opt inner / a variant member tk_type).
+fn cg_type_ready(em: CgEmitted, set: CgTypeSet, t: checker::Type) -> bool {
+    match t {
+        checker::Named as nm => cg_named_emitted(em, nm.name)
+        checker::Optional as opt => match opt.inner {
+            checker::Void => true
+            _ => cg_opt_emitted_key(em, set, cg_opt_key(opt.inner))
+        }
+        checker::Variant as va => cg_uvar_emitted_key(em, set, cg_variant_key(t))
+        checker::Slice => true   // pointer (slice typedef pre-emitted)
+        _ => true                // prim/byte/str/error/void/func — no aggregate edge
+    }
+}
+// is `last` a builtin scalar name (no aggregate edge → ready)?
+fn cg_is_builtin_scalar(last: str) -> bool {
+    last == "u8" || last == "u16" || last == "u32" || last == "u64" || last == "u128" ||
+    last == "i8" || last == "i16" || last == "i32" || last == "i64" || last == "i128" ||
+    last == "f16" || last == "f32" || last == "f64" || last == "bool" || last == "byte" ||
+    last == "str" || last == "error"
+}
+// By-value readiness of a field/member SYNTACTIC type-expr (struct field / variant member).
+fn cg_texpr_ready(em: CgEmitted, set: CgTypeSet, te: parser::TypeExpr) -> bool {
+    match te {
+        parser::NamedType as nt => {
+            let last = nt.path.segments[nt.path.segments.len - 1].name
+            if cg_is_builtin_scalar(last) { return true }   // builtin scalar → ready
+            cg_named_emitted(em, last)
+        }
+        parser::OptionalType as ot => cg_opt_emitted_key(em, set, match cg_opt_mangle_texpr_str(ot.inner) { str as s => s; error => "" })
+        parser::SliceType => true   // pointer (slice typedef pre-emitted)
+        parser::UnionType as ut => cg_uvar_emitted_key(em, set, match cg_variant_typename_texpr(teko::list::empty(), ut) { []byte as o => str(o); error => "" })
+    }
+}
+// Is a named decl's body emittable now (all its by-value field/member deps already emitted)?
+fn cg_named_ready(em: CgEmitted, set: CgTypeSet, d: parser::TypeDecl) -> bool {
+    match d.body {
+        parser::StructBody as sb => {
+            mut i = 0
+            loop {
+                if i >= sb.fields.len { break }
+                if !cg_texpr_ready(em, set, sb.fields[i].type_ann) { return false }
+                i++
+            }
+            true
+        }
+        parser::VariantBody as vb => match vb.type_expr {
+            parser::UnionType as u => {
+                mut i = 0
+                loop {
+                    if i >= u.members.len { break }
+                    if !cg_texpr_ready(em, set, u.members[i]) { return false }
+                    i++
+                }
+                true
+            }
+            _ => true
+        }
+        _ => true   // enum / alias — no by-value dependency
+    }
+}
+
+// gather the named TYPE_DECL nodes (struct/variant/enum; alias emits nothing but is harmless).
+fn cg_named_decls(prog: checker::TProgram) -> []parser::TypeDecl {
+    mut named: []parser::TypeDecl = teko::list::empty()
+    mut i = 0
+    loop {
+        if i >= prog.items.len { break }
+        match prog.items[i] {
+            parser::TypeDecl as d => { named = teko::list::push(named, d) }
+            _ => { }
+        }
+        i++
+    }
+    named
+}
+
+// Replaces the old program-order body emission + cg_emit_optional_typedefs: emit slices first
+// (pointers), then the named/opt/inline-variant typedefs in by-value dependency order.
+fn cg_emit_types_ordered(buf: []byte, prog: checker::TProgram) -> []byte | error {
+    // 1) collect every optional inner / slice element / inline variant used in the program.
     mut set = CgTypeSet { inners = teko::list::empty(); slices = teko::list::empty(); variants = teko::list::empty() }
     mut i = 0
     loop {
@@ -2731,20 +2949,10 @@ fn cg_emit_optional_typedefs(buf: []byte, prog: checker::TProgram) -> []byte | e
         }
         i++
     }
+    let named = cg_named_decls(prog)
+
     mut out = buf
-    mut j = 0
-    loop {
-        if j >= set.inners.len { break }
-        out = cb(out, "typedef struct { bool present; ")
-        out = match emit_type(out, set.inners[j]) { []byte as o => o; error as err => return err }
-        out = cb(out, " value; } ")
-        out = match cg_opt_typename(out, set.inners[j]) { []byte as o => o; error as err => return err }
-        out = cb(out, ";\n")
-        j++
-    }
-    if set.inners.len > 0 { out = cb(out, "\n") }
-    // SLICE TYPEDEFS — after optionals. Same {ptr,len} shape as tk_str; a non-const ptr (we
-    // build slices via copy-append).
+    // 2) SLICE typedefs first (pointer-only; their named elements already have forward typedefs).
     mut k = 0
     loop {
         if k >= set.slices.len { break }
@@ -2756,18 +2964,84 @@ fn cg_emit_optional_typedefs(buf: []byte, prog: checker::TProgram) -> []byte | e
         k++
     }
     if set.slices.len > 0 { out = cb(out, "\n") }
-    // VARIANT TYPEDEFS (B-cg2) — after slices/optionals (so a member that is `[]T` / `T?` already
-    // has its typedef). In registration order: each member was collected before the variant.
-    mut vi = 0
+
+    // 3) fixpoint: emit named bodies + optionals + inline variants in by-value dependency order.
+    mut em = CgEmitted { names = teko::list::empty(); opt_keys = teko::list::empty(); uvar_keys = teko::list::empty() }
+    mut remaining = named.len + set.inners.len + set.variants.len
+    mut progress = true
     loop {
-        if vi >= set.variants.len { break }
-        match set.variants[vi] {
-            checker::Variant as va => { out = match cg_emit_inline_variant_typedef(out, va) { []byte as o => o; error as err => return err } }
-            _ => { }
+        if remaining == 0 { break }
+        if !progress { break }
+        progress = false
+        // named decls
+        mut ni = 0
+        loop {
+            if ni >= named.len { break }
+            let d = named[ni]
+            if cg_named_emitted(em, d.name) { ni++ } else {
+                if !cg_named_ready(em, set, d) { ni++ } else {
+                    out = match emit_type_decl(out, d) { []byte as o => o; error as err => return err }
+                    em = CgEmitted { names = teko::list::push(em.names, d.name); opt_keys = em.opt_keys; uvar_keys = em.uvar_keys }
+                    remaining = remaining - 1
+                    progress = true
+                    ni++
+                }
+            }
         }
-        vi++
+        // optionals
+        mut oi = 0
+        loop {
+            if oi >= set.inners.len { break }
+            let inner = set.inners[oi]
+            let okey = cg_opt_key(inner)
+            if cg_str_in(em.opt_keys, okey) { oi++ } else {
+                if !cg_type_ready(em, set, inner) { oi++ } else {
+                    out = cb(out, "typedef struct { bool present; ")
+                    out = match emit_type(out, inner) { []byte as o => o; error as err => return err }
+                    out = cb(out, " value; } ")
+                    out = match cg_opt_typename(out, inner) { []byte as o => o; error as err => return err }
+                    out = cb(out, ";\n")
+                    em = CgEmitted { names = em.names; opt_keys = teko::list::push(em.opt_keys, okey); uvar_keys = em.uvar_keys }
+                    remaining = remaining - 1
+                    progress = true
+                    oi++
+                }
+            }
+        }
+        // inline variants
+        mut vi = 0
+        loop {
+            if vi >= set.variants.len { break }
+            let vt = set.variants[vi]
+            let vkey = cg_variant_key(vt)
+            if cg_str_in(em.uvar_keys, vkey) { vi++ } else {
+                // a tk_u_ embeds its members by value — all must be ready.
+                mut ready = true
+                match vt {
+                    checker::Variant as va => {
+                        mut m = 0
+                        loop {
+                            if m >= va.members.len { break }
+                            if !cg_type_ready(em, set, va.members[m]) { ready = false; break }
+                            m++
+                        }
+                    }
+                    _ => { }
+                }
+                if !ready { vi++ } else {
+                    match vt {
+                        checker::Variant as va => { out = match cg_emit_inline_variant_typedef(out, va) { []byte as o => o; error as err => return err } }
+                        _ => { }
+                    }
+                    em = CgEmitted { names = em.names; opt_keys = em.opt_keys; uvar_keys = teko::list::push(em.uvar_keys, vkey) }
+                    remaining = remaining - 1
+                    progress = true
+                    vi++
+                }
+            }
+        }
     }
-    if set.variants.len > 0 { out = cb(out, "\n") }
+    if remaining > 0 { return error { message = "codegen: cyclic value-type dependency (a recursive type must pass through a slice or a boxed reference)" } }
     out
 }
 
@@ -2782,7 +3056,7 @@ fn cg_emit_optional_typedefs(buf: []byte, prog: checker::TProgram) -> []byte | e
 // `return error { … }`, since `str | error` IS the C's TK_RESULT. (C: `tk_emit_c` + `cg_err`.)
 // ---------------------------------------------------------------------------
 fn tk_emit_c(prog: checker::TProgram) -> str | error {
-    mut b = teko::list::empty()
+    mut b: []byte = teko::list::empty()
     b = cb(b, "// generated by teko (F2 backend) — do not edit\n")
     b = cb(b, "#include <stdint.h>\n")
     b = cb(b, "#include <stdbool.h>\n")
@@ -2826,19 +3100,11 @@ fn tk_emit_c(prog: checker::TProgram) -> str | error {
         fw++
     }
     b = cb(b, "\n")
-    mut td = 0
-    loop {
-        if td >= prog.items.len { break }
-        match prog.items[td] {
-            parser::TypeDecl as d => { b = match emit_type_decl(b, d) { []byte as o => o; error as err => return err } }
-            _ => { }
-        }
-        td++
-    }
-
-    // OPTIONAL TYPEDEFS (REBOOT_PLAN §202) — after the named type decls (so a `Named?` inner's
-    // typedef precedes its reference) and before any function (so `T?` sigs resolve).
-    b = match cg_emit_optional_typedefs(b, prog) { []byte as o => o; error as err => return err }
+    // Full type declarations IN DEPENDENCY ORDER (self-host): slice typedefs first (pointers),
+    // then named bodies + optionals (REBOOT_PLAN §202) + inline variants topologically, so every
+    // by-value embed (`tk_t_Y`, `tk_opt_T`, `tk_u_…`) is fully defined before the body using it.
+    // This is also before any function (so `T?`/`[]T`/variant signatures resolve).
+    b = match cg_emit_types_ordered(b, prog) { []byte as o => o; error as err => return err }
 
     // First pass: emit every top-level function. Type-decls are handled above; use-decls
     // are a no-op at the C level (imports); loose statements are the second pass.

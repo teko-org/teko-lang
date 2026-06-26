@@ -100,7 +100,7 @@ fn type_compare(c: parser::Compare, env: Env, table: TypeTable) -> TExpr | error
     mut first = match type_expr(c.first, env, table) { TExpr as te => te; error as e => return e }
     mut prev = first.type
     if type_is_void(prev) { return error { message = "a `void` expression cannot be an operand (M.1)" } }
-    mut terms = teko::list::empty()
+    mut terms: []TCmpTerm = teko::list::empty()
     mut i = 0
     loop {
         if i >= c.rest.len { break }
@@ -210,7 +210,7 @@ fn type_call(c: parser::Call, env: Env, table: TypeTable) -> TExpr | error {
     match ft {
         Func as f => {
             if c.args.len != f.params.len { return error { message = "wrong number of arguments" } }
-            mut args = teko::list::empty()
+            mut args: []TExpr = teko::list::empty()
             mut i = 0
             loop {
                 if i >= c.args.len { break }
@@ -527,8 +527,8 @@ fn type_struct_lit(sl: parser::StructLit, env: Env, table: TypeTable) -> TExpr |
     }
     if sl.field_names.len != sb.fields.len { return error { message = "a struct literal must set exactly the declared fields (count mismatch)" } }
 
-    mut names = teko::list::empty()
-    mut vals = teko::list::empty()
+    mut names: []str = teko::list::empty()
+    mut vals: []TExpr = teko::list::empty()
     mut d = 0
     loop {
         if d >= sb.fields.len { break }
@@ -559,6 +559,15 @@ fn type_struct_lit(sl: parser::StructLit, env: Env, table: TypeTable) -> TExpr |
                 _ => {}
             }
             _ => {}
+        }
+        // (#4) a sentinel empty list ADOPTS the field's declared slice type (the field decl is the
+        // known element source), so codegen emits the concrete element — no back-inference.
+        let val_is_sentinel_slice = match val.type { Slice as vs => match vs.element { Void => true; _ => false }; _ => false }
+        let ft_is_concrete_slice = match ft { Slice as fs => match fs.element { Void => false; _ => true }; _ => false }
+        if val_is_sentinel_slice {
+            if ft_is_concrete_slice {
+                val = TExpr { kind = val.kind; type = ft; line = val.line; col = val.col }
+            }
         }
         // The field value must WIDEN into the field's declared type: exact, a variant CASE into a
         // variant-typed field (`TExpr.kind = TNumber{…}`), or `T` into a `T?` field. Same rule as
@@ -593,7 +602,7 @@ fn type_index(ix: parser::Index, env: Env, table: TypeTable) -> TExpr | error {
 // carried verbatim (already decoded by the parser); each typed hole carries its own type so
 // VM/codegen know str-passthrough vs int→str.
 fn type_interp(in: parser::Interp, env: Env, table: TypeTable) -> TExpr | error {
-    mut holes = teko::list::empty()
+    mut holes: []TExpr = teko::list::empty()
     mut i = 0
     loop {
         if i >= in.holes.len { break }
@@ -613,7 +622,7 @@ fn type_interp(in: parser::Interp, env: Env, table: TypeTable) -> TExpr | error 
 fn type_in(n: parser::InExpr, env: Env, table: TypeTable) -> TExpr | error {
     let lhs = match type_expr(n.lhs, env, table) { TExpr as te => te; error as e => return e }
     if type_is_void(lhs.type) { return error { message = "a `void` expression cannot be an operand (M.1)" } }
-    mut elems = teko::list::empty()
+    mut elems: []TExpr = teko::list::empty()
     mut i = 0
     loop {
         if i >= n.elems.len { break }
@@ -634,7 +643,7 @@ fn type_path_expr(pe: parser::PathExpr, table: TypeTable) -> TExpr | error {
     let p = pe.path
     if p.segments.len < 2 { return error { message = "a path expression must name an enum member (`Enum::Member`)" } }
     let member = p.segments[p.segments.len - 1].name
-    mut segs = teko::list::empty()                  // the enum type = the path minus its last segment
+    mut segs: []parser::Segment = teko::list::empty()                  // the enum type = the path minus its last segment
     mut i: u64 = 0
     loop {
         if i >= p.segments.len - 1 { break }
@@ -766,7 +775,7 @@ fn tblock_diverges(stmts: []TStatement) -> bool {
 // ---- a typed block: thread the env, collect the typed statements ----
 fn type_block(stmts: []parser::Statement, env: Env, table: TypeTable) -> TypedBlock | error {
     mut cur = env
-    mut out = teko::list::empty()
+    mut out: []TStatement = teko::list::empty()
     mut i = 0
     loop {
         if i >= stmts.len { break }
@@ -853,7 +862,7 @@ fn type_arm(a: parser::Arm, subject: Type, env: Env, table: TypeTable) -> TArm |
 fn type_match(m: parser::MatchExpr, env: Env, table: TypeTable) -> TExpr | error {
     let s = match type_expr(m.subject, env, table) { TExpr as te => te; error as e => return e }
     if m.arms.len == 0 { return error { message = "a `match` needs at least one arm" } }
-    mut arms = teko::list::empty()
+    mut arms: []TArm = teko::list::empty()
     mut have_type = false
     mut first: Type = Void { }     // Type-typed (so a case arm widens in); placeholder until first non-diverging arm
     mut i = 0
@@ -876,7 +885,7 @@ fn type_match(m: parser::MatchExpr, env: Env, table: TypeTable) -> TExpr | error
 // ---- match as a STATEMENT: validate the arms; exhaustiveness forced; value discarded → void ----
 fn type_match_stmt(m: parser::MatchExpr, env: Env, table: TypeTable) -> TExpr | error {
     let s = match type_expr(m.subject, env, table) { TExpr as te => te; error as e => return e }
-    mut arms = teko::list::empty()
+    mut arms: []TArm = teko::list::empty()
     mut i = 0
     loop {
         if i >= m.arms.len { break }
@@ -891,7 +900,7 @@ fn type_match_stmt(m: parser::MatchExpr, env: Env, table: TypeTable) -> TExpr | 
 // ---- statements (the evolved check_* — produce the typed node + advance the env) ----
 
 fn type_binding(b: parser::Binding, env: Env, table: TypeTable) -> TypedStmt | error {
-    let v = match type_expr(b.value, env, table) { TExpr as te => te; error as e => return e }
+    mut v = match type_expr(b.value, env, table) { TExpr as te => te; error as e => return e }
     mut bound = v.type
     if type_is_void(bound) { return error { message = "cannot bind a `void` expression — it yields no value (M.1)" } }
     if b.has_type {
@@ -902,6 +911,24 @@ fn type_binding(b: parser::Binding, env: Env, table: TypeTable) -> TypedStmt | e
             match annotated_literal_ok(b.value, at) { null => {}; error as e => return teko::error::err_typed(e, type_render(at), type_render(v.type)) }
         }
         bound = at
+        // (#4) annotation-directed element type: a sentinel empty list/array (`teko::list::empty()`
+        // / `[]`) ADOPTS the annotation's concrete slice type, so codegen sees the element WITHOUT
+        // back-inference. Mirrors type_assign's target-adopt and emit_as's wrap.
+        let v_is_sentinel_slice = match v.type { Slice as vs => match vs.element { Void => true; _ => false }; _ => false }
+        let bound_is_concrete_slice = match bound { Slice as bs => match bs.element { Void => false; _ => true }; _ => false }
+        if v_is_sentinel_slice {
+            if bound_is_concrete_slice {
+                v = TExpr { kind = v.kind; type = bound; line = v.line; col = v.col }
+            }
+        }
+    }
+    // (#4) REJECT an untyped empty collection. The element type MUST be fixed at the declaration —
+    // by the binding annotation (`: []T`) or by typed initial elements (a non-empty literal / a
+    // push that fixes the element). A bare `empty()`/`[]` whose element is still the sentinel is an
+    // error: no silent element-less slice, no codegen back-inference (collections ruling #4).
+    let bound_is_sentinel_slice = match bound { Slice as bs2 => match bs2.element { Void => true; _ => false }; _ => false }
+    if bound_is_sentinel_slice {
+        return error { message = "an empty list needs a known element type; annotate the binding (e.g. `mut xs: []i32 = teko::list::empty()`)" }
     }
     let node = TBinding { kind = b.kind; target = b.target; bound = bound; value = v }
     match b.target {
@@ -1217,8 +1244,8 @@ pub fn type_program(program: parser::Program) -> TProgram | error {
     // W-vis-enforce: enforce the module system (namespace qualification + pub/exp) over the
     // whole flattened program before typing — fail loud on any cross-namespace violation (M.1).
     match check_modules(program, c.types) { null => {}; error as e => return e }
-    mut items = teko::list::empty()
-    mut mainbody = teko::list::empty()   // the loose top-level statements (the virtual-main), for label validation
+    mut items: []TItem = teko::list::empty()
+    mut mainbody: []TStatement = teko::list::empty()   // the loose top-level statements (the virtual-main), for label validation
     mut i = 0
     loop {
         if i >= program.items.len { break }

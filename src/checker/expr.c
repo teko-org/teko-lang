@@ -645,6 +645,11 @@ static tk_texpr_result type_struct_lit(tk_struct_lit sl, tk_env env, tk_type_tab
         // u8 — `lo = 0x80`), in which case the leaf is retyped. Same rules as binding/arg adoption.
         if (tk_widens_into(val.type, ft.as.value, table)) {
             /* widened — keep val.type (the case) for codegen wrapping */
+            // (#4) a sentinel empty list ADOPTS the field's declared slice type (the field decl is
+            // the known element source), so codegen emits the concrete element — no back-inference.
+            if (val.type.tag == TK_TYPE_SLICE && val.type.as.slice.element == NULL
+                && ft.as.value.tag == TK_TYPE_SLICE && ft.as.value.as.slice.element != NULL)
+                val.type = ft.as.value;
         } else if (tk_literal_adopts(val, ft.as.value)) {
             val.type = ft.as.value;   // a fitting literal adopts the field's type (leaf retyped)
         } else {

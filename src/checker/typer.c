@@ -102,7 +102,19 @@ static tk_typed_stmt_result type_binding(tk_binding b, tk_env env, tk_type_table
                                             tk_type_render(a.as.value), tk_type_render(v.as.value.type)));
         }
         bound = a.as.value;
+        // (#4) annotation-directed element type: a sentinel empty list/array (`teko::list::empty()`
+        // / `[]`) ADOPTS the annotation's concrete slice type, so codegen sees the element WITHOUT
+        // back-inference. Mirrors type_assign's target-adopt and emit_as's wrap.
+        if (v.as.value.type.tag == TK_TYPE_SLICE && v.as.value.type.as.slice.element == NULL
+            && bound.tag == TK_TYPE_SLICE && bound.as.slice.element != NULL)
+            v.as.value.type = bound;
     }
+    // (#4) REJECT an untyped empty collection. The element type MUST be fixed at the declaration —
+    // by the binding annotation (`: []T`) or by typed initial elements (a non-empty literal / a
+    // push that fixes the element). A bare `empty()`/`[]` whose element is still the sentinel is an
+    // error: no silent element-less slice, no codegen back-inference (collections ruling #4).
+    if (bound.tag == TK_TYPE_SLICE && bound.as.slice.element == NULL)
+        return smsg("an empty list needs a known element type; annotate the binding (e.g. `mut xs: []i32 = teko::list::empty()`)");
     tk_tstatement node = { .tag = TK_TSTMT_BINDING, .as.binding = { b.kind, b.target, bound, v.as.value } };
     if (b.target.tag == TK_BIND_SIMPLE)
         return sok(node, tk_env_define(env, b.target.as.simple.name, bound, tk_bind_is_mut(b.kind)));
