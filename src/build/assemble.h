@@ -24,4 +24,8 @@ TK_RESULT(tk_program, tk_program_result);
 // failure aborts (M.5), mirroring the tree.
 tk_program_result tk_assemble(tk_source_files files);
 
+// tk_assemble_sel — assembly with a test selector: include_tests=true INCLUDES `.tkt` files
+// (their `#test` functions enter the program for the VM runner). (Mirrors assemble.tks.)
+tk_program_result tk_assemble_sel(tk_source_files files, bool include_tests);
+
 #endif // TK_BUILD_ASSEMBLE_H

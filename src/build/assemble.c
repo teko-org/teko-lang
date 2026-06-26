@@ -84,19 +84,23 @@ static char *path_cstr(tk_str path) {
     return buf;
 }
 
-tk_program_result tk_assemble(tk_source_files files) {
+tk_program_result tk_assemble(tk_source_files files) { return tk_assemble_sel(files, false); }
+
+// tk_assemble_sel — the assembly core with an `include_tests` selector. `false` (production
+// build/run) SKIPS `.tkt` test files; `true` (the `teko test` path — D2) INCLUDES them so their
+// `#test` functions enter the merged program for the VM runner. (Mirrors assemble.tks assemble_sel.)
+tk_program_result tk_assemble_sel(tk_source_files files, bool include_tests) {
     items_buf merged = { .ptr = NULL, .len = 0, .cap = 0 };
 
     for (size_t i = 0; i < files.len; i += 1) {
         tk_source_file sf = files.ptr[i];
 
-        // Tests are NOT production source: a `.tkt` is run on the VM in the test
-        // sub-profile (crumb D2), never assembled into the program (it carries `#test`
-        // attributes the module grammar rejects). Skip it here. (Legislator: tests are
-        // not artifacts — they run before emit/codegen and are discarded.)
-        if (sf.path.len >= 4 &&
+        // Tests are NOT production source: a `.tkt` is run on the VM in the test sub-profile
+        // (crumb D2). Skip it for a production build/run; include it only for `teko test`.
+        bool is_tkt = sf.path.len >= 4 &&
             sf.path.ptr[sf.path.len-4]=='.' && sf.path.ptr[sf.path.len-3]=='t' &&
-            sf.path.ptr[sf.path.len-2]=='k' && sf.path.ptr[sf.path.len-1]=='t') continue;
+            sf.path.ptr[sf.path.len-2]=='k' && sf.path.ptr[sf.path.len-1]=='t';
+        if (is_tkt && !include_tests) continue;
 
         char *cpath = path_cstr(sf.path);
 

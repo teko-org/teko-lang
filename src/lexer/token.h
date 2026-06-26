@@ -137,6 +137,7 @@ typedef enum {
     //     The `[ … ]` is a SPECIAL membership-set syntax valid ONLY as the `in` RHS (there is
     //     no general array literal). Comparison-precedence; does NOT chain.
     TK_TOKEN_IN,            // `in` — the membership operator (x in [ … ])
+    TK_TOKEN_HASH,          // `#` — attribute marker (`#test`) — D2 test gate
 } tk_token_kind;
 
 // tk_token — mirrors token.tks `Token`: a kind + the source text span (a str VIEW

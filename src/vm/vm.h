@@ -30,4 +30,8 @@
 // translation-unit-internal (vm.c) — this is the single public door for the driver.
 int tk_vm_run(tk_tprogram prog);
 
+// tk_vm_run_tests — run every `#test` function (D2 test runner; `teko test`). Fail-fast: a
+// failed assertion panics from inside the VM. All pass → 0. (Mirrors vm.tks run_tests.)
+int tk_vm_run_tests(tk_tprogram prog);
+
 #endif // TK_VM_H

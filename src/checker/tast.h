@@ -112,6 +112,7 @@ typedef struct {
     tk_str         namespace;                // (#41/#49) the declaring namespace — drives the mangled C name
     tk_str         file;                     // (E3) the source file the fn was declared in (for the .tsym symbol map)
     uint32_t       line, col;                // (E3) the fn name's 1-based source position (for the .tsym symbol map)
+    bool           is_test;                  // (D2) a `#test` attribute precedes it? (run by `teko test` / the build gate)
 } tk_tfunction;
 
 typedef enum { TK_TITEM_FUNCTION, TK_TITEM_TYPE_DECL, TK_TITEM_USE, TK_TITEM_STATEMENT } tk_titem_tag;

@@ -32,7 +32,7 @@ fn parse_params(tokens: []lexer::Token, pos: u64) -> ParsedParams | error {
 
 // `[doc] [pub|exp] fn name(params) -> ret { body }` (B.21, B.29). Doc + visibility optional
 // and precede `fn`; `-> ret` optional (absent = Unit). `pos` is at the doc, `pub`/`exp`, or `fn`.
-fn parse_function(tokens: []lexer::Token, pos: u64) -> ParsedDecl | error {
+fn parse_function(tokens: []lexer::Token, pos: u64, is_test: bool) -> ParsedDecl | error {
     mut p = pos
     mut has_doc = false
     mut doc = ""
@@ -77,7 +77,7 @@ fn parse_function(tokens: []lexer::Token, pos: u64) -> ParsedDecl | error {
         return err_at(tokens, p, "expected '{' for the function body")
     }
     let blk = match parse_block(tokens, p) { ParsedBlock as x => x; error as e => return e }
-    ParsedDecl { node = Function { name = name, params = params.params, has_return = has_return, return_type = return_type, body = blk.statements, vis = vis, has_doc = has_doc, doc = doc, line = name_line, col = name_col }, next = blk.next }
+    ParsedDecl { node = Function { name = name, params = params.params, has_return = has_return, return_type = return_type, body = blk.statements, vis = vis, has_doc = has_doc, doc = doc, line = name_line, col = name_col, is_test = is_test }, next = blk.next }
 }
 
 // `{ name: T; name: T; … }` — field list; `;`/newline separates; empty `{ }` allowed;
@@ -181,7 +181,18 @@ pub type ParsedModule = struct { node: Module; next: u64 }   // a parsed module 
 // doc comment and/or `pub`/`exp`). Peeks past the doc/visibility prefix to choose. `pos` is
 // at the doc, `pub`/`exp`, `fn`, or `type`.
 fn parse_decl(tokens: []lexer::Token, pos: u64) -> ParsedDecl | error {
-    mut k = pos
+    // an optional leading `#test` attribute (D2): `#` `test` then a function. Only `test` is
+    // recognized today, and only on a function — a `#test` on a type is rejected below.
+    mut start = pos
+    mut is_test = false
+    if is_kind_at(tokens, start, lexer::TokenKind::Hash) {
+        if !is_kind_at(tokens, start + 1, lexer::TokenKind::Ident) || tokens[start + 1].text != "test" {
+            return err_at(tokens, start + 1, "unknown attribute (only `#test` is recognized)")
+        }
+        is_test = true
+        start = skip_seps(tokens, start + 2)   // the attribute may sit on its own line, above the `fn`
+    }
+    mut k = start
     if is_kind_at(tokens, k, lexer::TokenKind::Doc) { k = k + 1 }
     if is_kind_at(tokens, k, lexer::TokenKind::Pub) {
         k = k + 1
@@ -189,10 +200,11 @@ fn parse_decl(tokens: []lexer::Token, pos: u64) -> ParsedDecl | error {
         k = k + 1
     }
     if is_kind_at(tokens, k, lexer::TokenKind::Fn) {
-        return parse_function(tokens, pos)
+        return parse_function(tokens, start, is_test)
     }
     if is_kind_at(tokens, k, lexer::TokenKind::Type) {
-        return parse_type_decl(tokens, pos)
+        if is_test { return err_at(tokens, k, "`#test` may only precede a function") }
+        return parse_type_decl(tokens, start)
     }
     err_at(tokens, k, "expected a declaration (`fn`/`type`, optionally `pub`/`exp`/doc); loose statements belong in main.tks")
 }

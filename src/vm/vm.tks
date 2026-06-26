@@ -1298,8 +1298,18 @@ fn eval_call(c: checker::TCall, env: Venv) -> Value {
     // str/byte STDLIB — value-producing str-returning builtins (str/str_of_bytes/one_byte/
     // str_concat3/ftoa). Recognized before user-fn resolution; null == not a str builtin, fall through.
     match try_str_builtin(c.callee, c.args, env) { Value as v => return v; null => {} }
-    let f = find_function(env, c.callee)   // resolved by LAST segment (cross-ns ok); honest stop if unknown / params
-    let fenv = Venv { slots = teko::list::empty(); prog = env.prog }
+    let f = find_function(env, c.callee)   // resolved by LAST segment (cross-ns ok); honest stop if unknown
+    // Bind each parameter to its evaluated argument in a FRESH root frame (no closure capture —
+    // flat M0 functions, like codegen's C). Args evaluate in the CALLER's env, then enter the
+    // callee's frame by the param's name (positional). (B-vm — VM function parameters.)
+    mut fenv = Venv { slots = teko::list::empty(); prog = env.prog }
+    mut ai = 0
+    loop {
+        if ai >= f.params.len { break }
+        let argval = eval_expr(c.args[ai], env)
+        fenv = define(fenv, f.params[ai].name, argval)
+        ai = ai + 1
+    }
     // Coerce the returned value into the declared return type: a `T` from a `-> T?` fn
     // present-wraps (REBOOT §202), mirroring codegen's emit_as on the return slot.
     match exec_block(f.body, fenv) {
@@ -1540,4 +1550,39 @@ exp fn run(prog: checker::TProgram) -> i32 {
     // fell off the end without an explicit `return` (B.20); else 0. Same extraction as a
     // `return n` (int -> (int)n, bool -> 1/0, otherwise 0).
     exit_code_of(last)
+}
+
+// ---------------------------------------------------------------------------
+// run_tests — the D2 TEST RUNNER (`teko test`). Execute every `#test` function (zero-arg,
+// void) in the merged program, fail-fast: a failed assertion PANICS (M.1) — aborting from
+// inside the VM with its "assertion failed: …" message, AFTER the running test's name was
+// printed (so the user sees which test failed). All pass → print the count, return 0. An
+// empty suite (no `#test`) is NOT a failure — the build gate skips when absent.
+// ---------------------------------------------------------------------------
+exp fn run_tests(prog: checker::TProgram) -> i32 {
+    mut passed: u64 = 0
+    mut i = 0
+    loop {
+        if i >= prog.items.len { break }
+        match prog.items[i] {
+            checker::TFunction as f => {
+                if f.is_test {
+                    let label = if f.namespace.len != 0 { teko::str::concat3(f.namespace, "::", f.name) } else { f.name }
+                    teko::io::print(teko::str::concat3("test ", label, " ... "))
+                    let fenv = Venv { slots = teko::list::empty(); prog = prog }
+                    let _ = exec_block(f.body, fenv)   // a failed assert panics here (fail-fast); normal completion = pass
+                    teko::io::println("ok")
+                    passed = passed + 1
+                }
+            }
+            _ => {}
+        }
+        i++
+    }
+    if passed == 0 {
+        teko::io::println("teko: no tests (no `#test` functions)")
+    } else {
+        teko::io::println(teko::str::concat3("teko: ", teko::str::u64_to_str(passed), " test(s) passed"))
+    }
+    0
 }

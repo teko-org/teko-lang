@@ -193,7 +193,8 @@ tk_error tk_analyze_program(tk_tprogram prog) {
             tk_tfunction f = it.as.function;
             tk_error r = check_locals(f.body, f.nbody, f.body, f.nbody, f.file);
             if (r.message) return r;
-            if (f.vis == TK_VIS_PRIVATE && !seq_cstr(f.name, "main") && !used_in_program(prog, f.name))
+            // `main` and `#test` functions are never source-called by design — exempt both.
+            if (f.vis == TK_VIS_PRIVATE && !seq_cstr(f.name, "main") && !f.is_test && !used_in_program(prog, f.name))
                 warn_unused_fn(f);
         }
     }

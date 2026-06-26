@@ -44,4 +44,8 @@ int tk_compile_project(const char *dir, const char *out_dir);
 // `teko run <dir>`.
 int tk_run_project(const char *dir);
 
+// D2 — the PROJECT TEST entry (`teko test <dir>`): assemble WITH `.tkt` tests, then run every
+// `#test` function on the VM (fail-fast). Mirrors project.tks test_project.
+int tk_test_project(const char *dir);
+
 #endif // TK_DRIVER_H

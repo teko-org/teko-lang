@@ -8,6 +8,13 @@
 #include "parse_file.h"   // parse_use_header (module `use` header)
 #include "cursor.h"       // tk_has_token, tk_is_kind_at, tk_is_sep, tk_skip_seps
 #include "ast.h"          // tk_params_push, tk_fields_push, tk_decls_push
+#include <string.h>       // memcmp, strlen (attribute-name compare)
+
+// does a token's text equal the C string `lit`? (the `#test` attribute-name check.)
+static bool text_is(tk_str text, const char *lit) {
+    size_t m = strlen(lit);
+    return text.len == m && (m == 0 || memcmp(text.ptr, lit, m) == 0);
+}
 
 static tk_parsed_params_result parse_params(const tk_token *t, size_t n, size_t pos) {
     size_t p = pos + 1;                                  // consume `(`
@@ -36,7 +43,7 @@ static tk_parsed_params_result parse_params(const tk_token *t, size_t n, size_t 
     return (tk_parsed_params_result){ .ok = true, .as.value = { .params = params, .n_params = np, .next = p + 1 } };
 }
 
-tk_parsed_decl_result tk_parse_function(const tk_token *t, size_t n, size_t pos) {
+tk_parsed_decl_result tk_parse_function(const tk_token *t, size_t n, size_t pos, bool is_test) {
     size_t p = pos;
     bool has_doc = false; tk_str doc = (tk_str){0};
     if (tk_is_kind_at(t, n, p, TK_TOKEN_DOC)) { has_doc = true; doc = t[p].text; p += 1; }
@@ -71,7 +78,7 @@ tk_parsed_decl_result tk_parse_function(const tk_token *t, size_t n, size_t pos)
     tk_function f = { .name = name, .params = ps.as.value.params, .nparams = ps.as.value.n_params,
         .has_return = has_return, .return_type = ret,
         .body = blk.as.value.statements, .nbody = blk.as.value.n,
-        .vis = vis, .has_doc = has_doc, .doc = doc, .line = name_line, .col = name_col };
+        .vis = vis, .has_doc = has_doc, .doc = doc, .line = name_line, .col = name_col, .is_test = is_test };
     tk_decl d = { .tag = TK_DECL_FUNCTION, .as.function = f };
     return (tk_parsed_decl_result){ .ok = true, .as.value = { .node = d, .next = blk.as.value.next } };
 }
@@ -163,11 +170,23 @@ tk_parsed_decl_result tk_parse_type_decl(const tk_token *t, size_t n, size_t pos
 }
 
 static tk_parsed_decl_result parse_decl(const tk_token *t, size_t n, size_t pos) {
-    size_t k = pos;
+    // optional leading `#test` attribute (D2): `#` `test` then a function (only on functions).
+    size_t start = pos;
+    bool is_test = false;
+    if (tk_is_kind_at(t, n, start, TK_TOKEN_HASH)) {
+        if (!tk_is_kind_at(t, n, start + 1, TK_TOKEN_IDENT) || !text_is(t[start + 1].text, "test")) {
+            return (tk_parsed_decl_result){ .ok = false, .as.error = tk_err_at(t, n, start + 1, "unknown attribute (only `#test` is recognized)") };
+        }
+        is_test = true; start = tk_skip_seps(t, n, start + 2);   // the attribute may sit on its own line, above the `fn`
+    }
+    size_t k = start;
     if (tk_is_kind_at(t, n, k, TK_TOKEN_DOC)) { k += 1; }
     if (tk_is_kind_at(t, n, k, TK_TOKEN_PUB) || tk_is_kind_at(t, n, k, TK_TOKEN_EXP)) { k += 1; }
-    if (tk_is_kind_at(t, n, k, TK_TOKEN_FN))   { return tk_parse_function(t, n, pos); }
-    if (tk_is_kind_at(t, n, k, TK_TOKEN_TYPE)) { return tk_parse_type_decl(t, n, pos); }
+    if (tk_is_kind_at(t, n, k, TK_TOKEN_FN))   { return tk_parse_function(t, n, start, is_test); }
+    if (tk_is_kind_at(t, n, k, TK_TOKEN_TYPE)) {
+        if (is_test) { return (tk_parsed_decl_result){ .ok = false, .as.error = tk_err_at(t, n, k, "`#test` may only precede a function") }; }
+        return tk_parse_type_decl(t, n, start);
+    }
     return (tk_parsed_decl_result){ .ok = false, .as.error = tk_err_at(t, n, k, "expected a declaration (`fn`/`type`, optionally `pub`/`exp`/doc); loose statements belong in main.tks") };
 }
 

@@ -189,6 +189,7 @@ typedef struct {                                                   // Function (
     bool         has_doc;                                          // a `/** … */` doc precedes it?
     tk_str       doc;                                              // the doc span (valid iff has_doc)
     uint32_t     line, col;                                        // the name's 1-based source position (W-loc-2 diagnostics)
+    bool         is_test;                                          // a `#test` attribute precedes it? (D2 — run by `teko test` / the build gate)
 } tk_function;
 
 typedef struct { tk_str name; tk_type_expr type_ann; } tk_field;

@@ -485,6 +485,7 @@ static tk_scan_result read_symbol(tk_str source, size_t pos) {
         case '[': one = TK_TOKEN_LBRACKET;  break;
         case ']': one = TK_TOKEN_RBRACKET;  break;
         case '?': one = TK_TOKEN_QUESTION;  break;   // lone `?` — the type-suffix (T?)
+        case '#': one = TK_TOKEN_HASH;      break;   // attribute marker (`#test`) — D2 test gate
         default:  return scan_err_at(source, pos, "unexpected character");
     }
     return scan_ok(sym(source, pos, 1, one));

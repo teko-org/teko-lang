@@ -90,13 +90,21 @@ fn asm_parse(path: str, tokens: []lexer::Token) -> []parser::Item | error {
 // path (W-loc-2 — the checker's file:line:col diagnostics). Per-file lex/parse errors are
 // prefixed with the file path → "path:line:col: text".
 fn assemble(files: []SourceFile) -> parser::Program | error {
+    assemble_sel(files, false)
+}
+
+// assemble_sel — the assembly core with a `include_tests` selector. `false` (the production
+// build/run path) SKIPS every `.tkt` test file. `true` (the `teko test` path — D2) INCLUDES
+// them, so their `#test` functions enter the merged program for the VM runner. `.tkt` files
+// parse as ordinary modules (parse_module → parse_decl now consumes the `#test` attribute).
+fn assemble_sel(files: []SourceFile, include_tests: bool) -> parser::Program | error {
     mut merged: []parser::Item = teko::list::empty()
     mut i: u64 = 0
     loop {
         if i >= files.len { break }
         let sf = files[i]
-        if teko::str::ends_with(sf.path, ".tkt") {
-            // a test file — never assembled into the program (it runs on the VM in crumb D2).
+        if teko::str::ends_with(sf.path, ".tkt") && !include_tests {
+            // a test file — excluded from a production build/run (included only by `teko test`).
         } else {
             let src = match teko::io::read_file(sf.path) { str as s => s; error as e => return e }
             let tokens = match lexer::tokenize(src) {

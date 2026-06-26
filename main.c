@@ -69,15 +69,6 @@ static const char *project_dir_of(const char *arg, char *buf, size_t buflen) {
     return buf;
 }
 
-// `teko test <projdir>` — honest stub. The project test runner is crumb D2 (not yet
-// built); wire the subcommand so it exists and fails loudly rather than silently.
-static int test_stub(const char *dir) {
-    fprintf(stderr,
-            "teko: %s: test not yet — the project test runner is crumb D2 (not built)\n",
-            dir);
-    return 1;
-}
-
 // Reject a file/`.tks` argument with the honest "projects only" message.
 static int reject_file_arg(void) {
     fputs("teko: teko compiles projects: pass a project directory or .tkp "
@@ -118,7 +109,7 @@ int main(int argc, char **argv) {
         const char *dir = project_dir_of(proj, buf, sizeof(buf));
         if (strcmp(cmd, "build") == 0) return tk_compile_project(dir, out_dir);
         if (strcmp(cmd, "run") == 0)   return tk_run_project(dir);
-        return test_stub(dir);
+        return tk_test_project(dir);   // D2 — run the project's `#test` functions on the VM
     }
 
     // Bare argument: a project (directory or `.tkp`) ≡ build (also honors `-o <dir>`). A file is rejected.

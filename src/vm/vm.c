@@ -920,12 +920,14 @@ static tk_value eval_call(const tk_texpr *e, tk_venv *env) {
                  (int)last.len, (const char *)last.ptr);
         vm_unsupported(buf);
     }
-    // M0/codegen: functions take NO params (codegen fails on params). Honest frontier.
-    if (fn->nparams != 0 || nargs != 0)
-        vm_unsupported("function parameters not yet supported");
-
-    // A fresh root frame — no closure capture (M0 functions are flat, like codegen's C).
+    // A fresh root frame — no closure capture (flat functions, like codegen's C). Bind each
+    // parameter to its evaluated argument (args evaluate in the CALLER's env, then enter the
+    // callee's frame positionally by the param's name). (B-vm — VM function parameters.)
     tk_venv fenv = { .head = NULL };
+    for (size_t i = 0; i < fn->nparams && i < nargs; i += 1) {
+        tk_value av = tk_vm_eval_expr(&args[i], env);
+        env_define(&fenv, fn->params[i].name, av);
+    }
     tk_flow fl = tk_vm_exec_block(fn->body, fn->nbody, &fenv);
     env_free(&fenv);
     // Coerce the returned value into the declared return type: a `T` returned from a `-> T?`
@@ -1447,4 +1449,32 @@ int tk_vm_run(tk_tprogram prog) {
     }
     env_free(&env);
     return code;
+}
+
+// tk_vm_run_tests — the D2 TEST RUNNER (`teko test`). Run every `#test` function (zero-arg,
+// void) in the merged program, fail-fast: a failed assertion panics (aborts) from inside the
+// VM after the running test's name was printed. All pass → print the count, return 0. An empty
+// suite is not a failure. (Mirrors vm.tks run_tests.)
+int tk_vm_run_tests(tk_tprogram prog) {
+    g_prog = prog;
+    size_t passed = 0;
+    for (size_t i = 0; i < prog.nitems; i += 1) {
+        if (prog.items[i].tag != TK_TITEM_FUNCTION) continue;
+        tk_tfunction f = prog.items[i].as.function;
+        if (!f.is_test) continue;
+        if (f.namespace.len)
+            printf("test %.*s::%.*s ... ", (int)f.namespace.len, (const char *)f.namespace.ptr,
+                   (int)f.name.len, (const char *)f.name.ptr);
+        else
+            printf("test %.*s ... ", (int)f.name.len, (const char *)f.name.ptr);
+        fflush(stdout);
+        tk_venv fenv = { .head = NULL };
+        tk_vm_exec_block(f.body, f.nbody, &fenv);   // a failed assert panics here (fail-fast)
+        env_free(&fenv);
+        printf("ok\n");
+        passed += 1;
+    }
+    if (passed == 0) printf("teko: no tests (no `#test` functions)\n");
+    else             printf("teko: %zu test(s) passed\n", passed);
+    return 0;
 }

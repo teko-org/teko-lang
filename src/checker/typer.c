@@ -329,7 +329,7 @@ tk_tfunction_result tk_type_function(tk_function f, tk_env env, tk_type_table ta
       if (why) return (tk_tfunction_result){ .ok = false, .as.error = tk_error_make(why) }; }
     tk_tfunction tf = { .name = f.name, .params = f.params, .nparams = f.nparams,
                         .return_type = ret, .body = tb.as.value.stmts, .nbody = tb.as.value.n,
-                        .vis = f.vis, .has_doc = f.has_doc, .doc = f.doc };
+                        .vis = f.vis, .has_doc = f.has_doc, .doc = f.doc, .is_test = f.is_test };
     return (tk_tfunction_result){ .ok = true, .as.value = tf };
 }
 

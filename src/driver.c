@@ -306,7 +306,7 @@ static int find_manifest(char *out, size_t cap) {
     return found == 1;
 }
 
-static int project_frontend(const char *dir, tk_tprogram *out, tk_manifest *manifest_out) {
+static int project_frontend(const char *dir, tk_tprogram *out, tk_manifest *manifest_out, bool include_tests) {
     // Enter the project root so relative source paths resolve (the contained host edge).
     if (chdir(dir) != 0) return fail(dir, "cannot enter project directory");
 
@@ -345,7 +345,7 @@ static int project_frontend(const char *dir, tk_tprogram *out, tk_manifest *mani
                (int)files.ptr[i].namespace.len, (const char *)files.ptr[i].namespace.ptr);
 
     // --- assemble: read+parse every file, MERGE into ONE program (A3) ---
-    tk_program_result asm_r = tk_assemble(files);
+    tk_program_result asm_r = tk_assemble_sel(files, include_tests);
     if (!asm_r.ok) return fail("", asm_r.as.error.message);   // assemble bakes file:line:col into the message
     tk_program program = asm_r.as.value;
 
@@ -380,7 +380,7 @@ static char *cstr_of(tk_str s) {
 int tk_compile_project(const char *dir, const char *out_dir) {
     tk_tprogram prog;
     tk_manifest m;
-    int rc = project_frontend(dir, &prog, &m);
+    int rc = project_frontend(dir, &prog, &m, false);
     if (rc != 0) return rc;
 
     // --- backend (F2): lower the checked merged program to C, build it natively ---
@@ -399,8 +399,23 @@ int tk_compile_project(const char *dir, const char *out_dir) {
 int tk_run_project(const char *dir) {
     tk_tprogram prog;
     tk_manifest m;
-    int rc = project_frontend(dir, &prog, &m);
+    int rc = project_frontend(dir, &prog, &m, false);
     if (rc != 0) return rc;
 
     return tk_vm_run(prog);
+}
+
+// =========================================================================
+// D2 — the PROJECT TEST entry (`teko test <dir>`). Same front-end as run, but ASSEMBLED WITH
+// the `.tkt` test files, then the VM runs every `#test` function (tk_vm_run_tests) instead of
+// the virtual-main. Fail-fast: a failed assertion panics from inside the VM (non-zero exit).
+// (Mirrors project.tks test_project.)
+// =========================================================================
+int tk_test_project(const char *dir) {
+    tk_tprogram prog;
+    tk_manifest m;
+    int rc = project_frontend(dir, &prog, &m, true);
+    if (rc != 0) return rc;
+
+    return tk_vm_run_tests(prog);
 }

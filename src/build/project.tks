@@ -87,7 +87,12 @@ fn find_manifest() -> str | error {
 // program, and type-check the WHOLE thing together (M.1). Returns the checked program +
 // the manifest, or the first error.
 // =========================================================================
-fn project_frontend(dir: str) -> Frontend | error {
+fn project_frontend(dir: str) -> Frontend | error { project_frontend_sel(dir, false) }
+
+// project_frontend_sel — the front-end with a test selector. `include_tests=true` (the `teko
+// test` path) assembles the `.tkt` test files INTO the merged program so their `#test` functions
+// are typed + available to the VM runner; `false` is the production build/run front-end.
+fn project_frontend_sel(dir: str, include_tests: bool) -> Frontend | error {
     // Enter the project root so relative source paths resolve (the contained host edge).
     match teko::env::chdir(dir) { error => return error { message = "cannot enter project directory" }; null => {} }   // error? — null = success
 
@@ -119,7 +124,7 @@ fn project_frontend(dir: str) -> Frontend | error {
 
     // --- assemble: read+parse every file, MERGE into ONE program (A3) ---
     // assemble bakes file:line:col into the message, so report with an empty path (W-loc).
-    let program = match assemble(files) { parser::Program as p => p; error as e => return e }
+    let program = match assemble_sel(files, include_tests) { parser::Program as p => p; error as e => return e }
 
     // --- check the WHOLE merged program (M.1 — whole program checked together) ---
     let checked = match checker::type_program(program) { checker::TProgram as c => c; error as e => return e }
@@ -270,4 +275,15 @@ fn project_arg_of(args: []str, start: u64) -> str {
 fn run_project(dir: str) -> i32 {
     let fe = match project_frontend(dir) { Frontend as x => x; error as e => return fail(dir, e.message) }
     vm::run(fe.prog)
+}
+
+// =========================================================================
+// test_project — the `teko test <dir>` entry (D2). Same front-end as run, but ASSEMBLED WITH
+// the `.tkt` test files, then the VM runs every `#test` function (vm::run_tests) instead of the
+// virtual-main. Fail-fast: a failed assertion panics from inside the VM (non-zero exit); all
+// pass → exit 0. An empty suite (no `#test`) is not a failure.
+// =========================================================================
+fn test_project(dir: str) -> i32 {
+    let fe = match project_frontend_sel(dir, true) { Frontend as x => x; error as e => return fail(dir, e.message) }
+    vm::run_tests(fe.prog)
 }
