@@ -26,29 +26,41 @@
 Type-model doctrine (void/error/variant/nullable; no `never`), 128-bit + float prims, struct/variant value
 layer, match/if-value execution, labeled loops, subscript indexing, the **S0 `tk_alloc()` allocation seam**,
 slice value-layer Increment A (fixed+copy), and the `panic`/`exit` global-diverging-fn ruling are **DONE**.
-The corpus fully **parses**; self-host is deep in the CHECK phase. See `TEKO_HISTORY.md` + tasks #1–#58.
+
+**★ SELF-HOST CHECK IS GREEN (2026-06-26, commit `048b4af`):** `teko build .` →
+*"project assembled (796 items) and type-checked OK"*, zero `file:line:col` errors — teko's checker
+type-checks its ENTIRE own corpus (65 files). Regressions VM==native (5/6). The widening lattice
+(`tk_widens_into`/`tk_type_join`), enum-subject `match`, pervasive literal adoption, **E7 enum↔int casts**,
+the host-FFI builtin surface, the VM `.tks` value+eval cluster, and `src/build/project.tks` (project
+orchestration) landed across commits `6de0bcd`→`9cd1a83`→`048b4af`. Remaining for a full `teko .`:
+native codegen (inline-union lowering — `codegen: slice/inline union not yet supported`) and VM execution
+(eval_call param-binding + `list_dir` runtime). See `TEKO_HISTORY.md` + tasks #1–#58 + memory
+`session-recovery-2026-06-25.md`.
 
 ---
 
 ## THE SEQUENCE
 
-| # | Phase | Why here |
-|---|-------|----------|
-| 1 | Diagnostics axis | Highest ROI; makes every later phase debuggable |
-| 2 | `in` operator | Build the tool the DRY sweep will use (feature only) |
-| 3 | str/byte stdlib as real mirrored fns | Close a half-implemented layer; unblocks self-host CHECK |
-| 4 | C↔.tks mirroring audit | Pay down mirror debt before more code lands |
-| 5 | Definite-assignment / init analysis | Real checker gap; lands the warnings channel |
-| 6 | Finish self-host → working `teko .` | The gating milestone for everything downstream |
-| 7 | Host independence | FFI + host surfaces + VM test gate + project/output/pack |
-| 8 | FLAGS | Bitflag enums (spec frozen) |
-| 9 | SEC | SAST + capability audit, after corrections |
-| 10 | Evolution S1–S9 | Post-self-host campaign (arenas→…→concurrency) |
-| 11 | **DRY sweep** | **LAST** — refactor the settled corpus |
+> **Status legend:** ✅ done · 🔶 in progress / partial · ⬜ not started. Updated 2026-06-26 (commit `048b4af`).
+
+| # | Phase | Status | Why here |
+|---|-------|--------|----------|
+| 1 | Diagnostics axis | 🔶 E1/snippet+caret/expected-actual/E2 ✅; E3/E4 `.tsym`+stack-trace ⬜ | Highest ROI; makes every later phase debuggable |
+| 2 | `in` operator | ✅ done (lexer→parser→checker→codegen→VM→tkb→.tks, single-eval) | Build the tool the DRY sweep will use (feature only) |
+| 3 | str/byte stdlib as real mirrored fns | ✅ done (`teko::str::*` + host-FFI surface in scope.c/.tks) | Close a half-implemented layer; unblocks self-host CHECK |
+| 4 | C↔.tks mirroring audit | 🔶 ongoing (closed many gaps during the CHECK march; no dedicated sweep yet) | Pay down mirror debt before more code lands |
+| 5 | Definite-assignment / init analysis | ⬜ not started | Real checker gap; lands the warnings channel |
+| 6 | Finish self-host → working `teko .` | 🔶 **CHECK ✅ GREEN** (796 items type-check); native codegen + VM-run ⬜ | The gating milestone for everything downstream |
+| 7 | Host independence | ⬜ (FFI builtins typed in checker; runtime impls TODO) | FFI + host surfaces + VM test gate + project/output/pack |
+| 8 | FLAGS | ⬜ not started | Bitflag enums (spec frozen) |
+| 9 | SEC | ⬜ not started | SAST + capability audit, after corrections |
+| 10 | Evolution S1–S9 | ⬜ not started | Post-self-host campaign (arenas→…→concurrency) |
+| 11 | **DRY sweep + comment hygiene** | ⬜ **LAST** | refactor the settled corpus + doc-comments-only |
 
 ---
 
-### Phase 1 — Diagnostics axis  *(§A.1 ∪ INDEPENDENCE Eixo E ∪ CORRECTION_PLAN §10 column-granularity)*
+### Phase 1 — Diagnostics axis  *(§A.1 ∪ INDEPENDENCE Eixo E ∪ CORRECTION_PLAN §10 column-granularity)*  🔶 PARTIAL
+**Status:** ✅ E1 (file:line:col threaded through tokens→AST→tast) · ✅ source snippet + caret · ✅ expected-vs-actual on every mismatch (type/arg/return/assign/field/struct-lit) · ✅ E2 (error fields/`err_loc`/`err_typed`; native degraded). ⬜ E3 `.tsym` symbol map · ⬜ E4 stack-trace · ⬜ cc-failure surfacing · ⬜ warnings channel (shared w/ Phase 5).
 **Goal:** compile-time messages stop being poor. Errors point at the failing **expression**, not the enclosing function.
 **Work:**
 - **E1** — thread `{file, line, col}` through the whole pipeline: lexer → tokens → parser → AST → `tast` (every node knows its origin). Root cause today: AST exprs carry no position; only decls do.
@@ -60,12 +72,14 @@ The corpus fully **parses**; self-host is deep in the CHECK phase. See `TEKO_HIS
 - **Warnings channel** — Teko has none today; introduce one (shared with Phase 5).
 **Exit:** a type error inside a function body reports the exact expr `file:line:col` + snippet + caret + expected/actual; panics print file:line; native build emits `.tsym`.
 
-### Phase 2 — `in` membership operator  *(§A.6; CORRECTION_PLAN W2c)*
+### Phase 2 — `in` membership operator  *(§A.6; CORRECTION_PLAN W2c)*  ✅ DONE
+**Status:** delivered — full pipeline (lexer→parser→AST→checker→codegen single-eval→VM→tkb→.tks mirrors); `in []` evaluates the LHS once and short-circuits, VM==native verified.
 **Goal:** `x in [a, b]` membership, evaluating the LHS **once**.
 **Work:** full pipeline — lexer `in` keyword → parser → AST → checker (value & options comparable → bool) → codegen (single-eval lowering, e.g. `({ T _v = x; _v==a || _v==b; })`) → VM → `.tkb` → ALL `.tks` mirrors. NOT the DRY sweep — just the tool it will use.
 **Exit:** `x in [..]` type-checks, runs VM==native, serializes; LHS evaluated once (verified).
 
-### Phase 3 — str/byte stdlib as REAL mirrored functions  *(§A.2)*
+### Phase 3 — str/byte stdlib as REAL mirrored functions  *(§A.2)*  ✅ DONE (checker + VM/runtime; native emit rides Phase 6 codegen)
+**Status:** the `teko::str::*` surface (concat/concat3/len/slice_to/slice_from/ends_with/contains/last_index_of) + str/byte builtins (str/str_of_bytes/one_byte/i64_to_str/u64_to_str/ftoa/slice) are wired in checker + scope.c/.tks, with C runtime twins (`tk_str_*`). The corpus's str/byte calls all type-check and run on the VM. (Native emission of the slice/str bridges rides the Phase-6 codegen frontier.)
 **Goal:** kill the "recognized-but-not-implemented" half-measure. Today slice/str/str_of_bytes/one_byte/str_concat/str_concat3/i64_to_str/u64_to_str/ftoa have checker signatures only.
 **Work:** make each a real, fully-wired function — checker + codegen + VM + `teko_rt` (real `teko::text` functions with C twins, or fully-wired builtins). No recognize-and-defer.
 **Exit:** every str/byte builtin the corpus calls compiles to native AND runs in the VM, equal results; current CHECK-phase walls past these clear.
@@ -82,11 +96,17 @@ The corpus fully **parses**; self-host is deep in the CHECK phase. See `TEKO_HIS
 
 ### Phase 6 — Finish self-host → working `teko .`  *(tasks #55/#57; CORRECTION_PLAN §15.1; #40/#41/#19)*
 **Goal:** the bootstrap compiles its own `src/` corpus to a native binary. The gating milestone.
-**Work:**
-- Slice **Increment B+**: full `[]T as x` pattern (needs codegen variant-member + `[]T | error` return); append `xs+[x]` / literal `[]`/`[a,b]` syntax.
+**Status (2026-06-26, commit `048b4af`):**
+- ✅ **CHECK GREEN** — `teko build .` type-checks the whole corpus (796 items, 0 errors). Delivered: the widening lattice (`tk_widens_into`/`tk_type_join`), enum-subject `match`, pervasive literal adoption, **E7 enum↔int casts**, the host-FFI builtin surface, the VM `.tks` value+eval cluster, `src/build/project.tks`. Regressions VM==native 5/6.
+- 🔶 **#41 partial** — namespace-aware *call* resolution (`tk_env_lookup_call`) ✅; namespace-aware *type* resolution (a `Named` carrying its namespace) ⬜ still deferred (sidestepped via the `vm::Env/Return`→`Venv/VmReturn` rename).
+- ⬜ **Native codegen** — `teko build .` reaches `codegen: slice / inline union type not yet supported` (codegen.c:306/388) + the function-parameter barrier. Inline/anonymous-variant lowering (`T | error` returns) is the keystone (W-backend #40).
+- ⬜ **VM execution** — `teko run .` reaches `vm: call to an unknown function`: `.tks` `eval_call` doesn't bind params yet; `teko::fs::list_dir` is checker-only (no `tk_list_dir` runtime).
+- ⬜ **#19** X5 justification-header sweep.
+**Work remaining:**
 - **Function parameters in codegen + VM** — the big W-backend barrier (#40 = INDEPENDENCE C3 partial); nearly every corpus fn has params; both backends honest-stop today.
-- **Copy-append collections** through codegen/VM (forward-compatible with Evolution S7).
-- **#41** W-vis-enforce-2 (value-level cross-ns: calls + enum-member paths).  **#19** X5 (justification-header sweep).
+- **Inline/anonymous-variant codegen** (`T | error`) — required to lower the corpus natively.
+- Slice **Increment B+**: append `xs+[x]` / literal `[]`/`[a,b]` syntax (the value layer is in; codegen slice/list emission pending).
+- **#41** namespace-aware type resolution.  **#19** X5 (justification-header sweep).  VM `list_dir`/param-binding runtime.
 **Exit:** `teko .` produces a working native binary of the compiler; VM==native across the corpus regression set.
 
 ### Phase 7 — Host independence  *(INDEPENDENCE Eixos A/C/D + BINARY cleanup)*
