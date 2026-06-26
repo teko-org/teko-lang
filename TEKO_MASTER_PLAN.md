@@ -47,6 +47,19 @@ to `.tks`):
 - `32b3edd` **Call-argument** case→variant wrapping (param-type lookup + emit_as).
 - `8ae56d5` **Covariant `[]case`→`[]variant` slice rebuild** (element-wise wrap).
 
+**★★★ FULL SELF-HOSTING — `./bin/teko .` COMPILES THE PROJECT TO A WORKING BINARY.** The self-hosted
+compiler (bin/teko, built by the bootstrap from the .tks corpus) now runs the ENTIRE pipeline on its
+own project: parse manifest → discover the source tree → assemble → type-check all 880 items → native
+codegen (1.45MB of C) → cc → a 606KB `teko` binary that itself runs and compiles other projects
+(gen-1 → gen-2 → projects). Got here by materializing the three build-pipeline stubs (manifest/
+discover/assemble) in real Teko, closing ~12 checker/codegen parity gaps the full corpus exposed
+(missing 128/float builtin types; literal adoption in return/if-join/struct-field/range/literal-
+pattern positions; E7 enum↔int cast; virtual-main env threading; the `[]T` type-expr barrier; the
+null-field and 128-bit-literal codegen; and full ret_type threading through the .tks codegen — the
+twin of the C's g_cg_ret_type global), and fixing the O(n²) OOM in the output buffer with an
+amortized growable `tk_slice_push` (geometric growth + alias-safe live-tail cache; value semantics
+preserved). 
+
 **SELF-HOST NATIVE BUILD LINKS — GATE GREEN (0 errors).** `cmake --build build --target selfhost`
 (the bootstrap `teko` compiling its own corpus → C → cc → link) now produces `bin/teko` end-to-end;
 `./build/teko build .` reaches "built bin/teko". The native cc tail went 62→0 this session via:
