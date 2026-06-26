@@ -26,11 +26,51 @@ tk_env tk_env_define(tk_env env, tk_str name, tk_type t, bool is_mut) {
     tk_val_binding *buf = tk_alloc((n + 1) * sizeof *buf);
     if (buf == NULL) { abort(); }
     if (n != 0) { memcpy(buf, env.ptr, n * sizeof *buf); }
-    buf[n] = (tk_val_binding){ .name = name, .type = t, .is_mut = is_mut };
-    return (tk_env){ .ptr = buf, .len = n + 1, .cap = n + 1 };
+    buf[n] = (tk_val_binding){ .name = name, .type = t, .is_mut = is_mut, .ns = (tk_str){0} };  // local: no ns (#41)
+    return (tk_env){ .ptr = buf, .len = n + 1, .cap = n + 1, .cur_ns = env.cur_ns };
+}
+
+// (#41) define a TOP-LEVEL FUNCTION binding carrying its declaring namespace, so an unqualified
+// call resolves to a same-namespace function (not a global bare-name collision). Same copy-on-extend.
+tk_env tk_env_define_fn(tk_env env, tk_str name, tk_type t, tk_str ns) {
+    size_t n = env.len;
+    tk_val_binding *buf = tk_alloc((n + 1) * sizeof *buf);
+    if (buf == NULL) { abort(); }
+    if (n != 0) { memcpy(buf, env.ptr, n * sizeof *buf); }
+    buf[n] = (tk_val_binding){ .name = name, .type = t, .is_mut = false, .ns = ns };
+    return (tk_env){ .ptr = buf, .len = n + 1, .cap = n + 1, .cur_ns = env.cur_ns };
 }
 
 bool tk_bind_is_mut(tk_bind_kind k) { return k == TK_BIND_MUT; }   // Let/Const immutable (B.21)
+
+// (#41) the LAST `::`-segment of a namespace ("teko::lexer" -> "lexer"), for matching a qualified
+// call's immediate qualifier against a binding's declaring namespace.
+static tk_str ns_last_seg(tk_str ns) {
+    size_t cut = 0;
+    for (size_t i = 0; i + 1 < ns.len; i += 1)
+        if (ns.ptr[i] == ':' && ns.ptr[i + 1] == ':') cut = i + 2;
+    return (tk_str){ ns.ptr + cut, ns.len - cut };
+}
+
+// (#41) NAMESPACE-AWARE call resolution. UNQUALIFIED call `name`: a LOCAL (ns empty) or a function
+// in the CURRENT namespace; never another namespace's same-named function. QUALIFIED `q::…::name`:
+// a function whose declaring namespace's last segment equals the immediate qualifier `q`. Innermost
+// first (locals shadow). Returns the function/value type.
+tk_type_result tk_env_lookup_call(tk_env env, tk_path callee) {
+    tk_str name = callee.segments[callee.len - 1].name;
+    bool qualified = callee.len > 1;
+    tk_str qual = qualified ? callee.segments[callee.len - 2].name : (tk_str){0};
+    for (size_t i = env.len; i > 0; i -= 1) {
+        tk_val_binding b = env.ptr[i - 1];
+        if (!name_eq(b.name, name)) continue;
+        if (!qualified) {
+            if (b.ns.len == 0 || name_eq(b.ns, env.cur_ns)) return (tk_type_result){ .ok = true, .as.value = b.type };
+        } else {
+            if (b.ns.len != 0 && name_eq(ns_last_seg(b.ns), qual)) return (tk_type_result){ .ok = true, .as.value = b.type };
+        }
+    }
+    return (tk_type_result){ .ok = false, .as.error = tk_error_make("undefined name") };
+}
 
 tk_binding_result tk_env_lookup_binding(tk_env env, tk_str name) {
     for (size_t i = env.len; i > 0; i -= 1) {        // innermost (most recent) first

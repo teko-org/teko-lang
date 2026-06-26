@@ -221,7 +221,8 @@ static tk_texpr_result type_call(tk_call c, tk_env env, tk_type_table table) {
                                    .as.call = { c.callee, args.ptr, args.len } });
         }
     }
-    tk_type_result ftr = tk_env_lookup(env, name);   // user functions resolve first;
+    tk_type_result ftr = tk_env_lookup_call(env, c.callee);   // (#41) namespace-aware: a local or a
+                                                              // same-namespace fn (unqualified) / the qualified ns
     if (!ftr.ok) ftr = tk_builtin_fn(name);          // injected, non-shadowable stdlib is the fallback
     if (!ftr.ok) return (tk_texpr_result){ .ok = false, .as.error = tk_error_named("unknown function", name) };
     tk_type ft = ftr.as.value;

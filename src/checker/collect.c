@@ -44,7 +44,7 @@ tk_collected_result tk_collect(tk_program program) {
             tk_function f = program.items[i].as.function;
             tk_type_result ft = func_type(f, table);
             if (!ft.ok) return (tk_collected_result){ .ok = false, .as.error = ft.as.error };
-            env = tk_env_define(env, f.name, ft.as.value, false);
+            env = tk_env_define_fn(env, f.name, ft.as.value, program.items[i].namespace);   // #41: carry the fn's ns
         }
     }
     tk_collected c = { .types = table, .env = env };

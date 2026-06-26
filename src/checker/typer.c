@@ -367,6 +367,7 @@ tk_tprogram_result tk_type_program(tk_program program) {
     tk_env cur = c.as.value.env;
     for (size_t i = 0; i < program.len; i += 1) {
         tk_item it = program.items[i];
+        cur.cur_ns = it.namespace;   // (#41) the namespace being type-checked — drives same-ns call resolution
         // W-loc-2: the item's source file + the decl's line:col, so a type error in the
         // flattened program resolves to file:line:col (loose statements carry no loc → file only).
         uint32_t line = it.tag == TK_ITEM_FUNCTION  ? it.as.function.line
@@ -386,7 +387,8 @@ tk_tprogram_result tk_type_program(tk_program program) {
             mainbody = tk_tstmt_list_push(mainbody, ts.as.value.node);
             continue;
         }
-        tk_titem_result ti = tk_type_item(it, c.as.value.env, c.as.value.types);
+        tk_env ienv = c.as.value.env; ienv.cur_ns = it.namespace;   // (#41) resolve the body's calls in the item's ns
+        tk_titem_result ti = tk_type_item(it, ienv, c.as.value.types);
         if (!ti.ok) {   // (C1-POS) prefer the failing expr's own position; the item's is the fallback
             uint32_t el = ti.as.error.line ? ti.as.error.line : line;
             uint32_t ec = ti.as.error.line ? ti.as.error.col  : col;
