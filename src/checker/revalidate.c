@@ -1,16 +1,13 @@
 // src/checker/revalidate.c
 #include "revalidate.h"
 #include "check.h"   // tk_check_result
+#include "expr.h"    // is_bool/is_integer/is_float/is_numeric — single defn shared (no dup; #self-host)
 
 bool tk_cast_ok(tk_type from, tk_type to);   // from typer.c — re-derive cast legality (C2)
 
 static tk_check_result cok(void)         { return (tk_check_result){ .ok = true }; }
 static tk_check_result cfail(const char *m) { return (tk_check_result){ .ok = false, .error = tk_error_make(m) }; }
 static tk_type         prim(tk_prim_kind k) { return (tk_type){ .tag = TK_TYPE_PRIM, .as.prim = k }; }
-static bool is_bool(tk_type t)    { return t.tag == TK_TYPE_PRIM && t.as.prim == TK_PRIM_BOOL; }
-static bool is_integer(tk_type t) { return t.tag == TK_TYPE_PRIM && tk_prim_is_int(t.as.prim); }
-static bool is_float(tk_type t)   { return t.tag == TK_TYPE_PRIM && tk_prim_is_float(t.as.prim); }
-static bool is_numeric(tk_type t) { return is_integer(t) || is_float(t); }   // B.38 — int or float
 static bool op_is_shift(tk_token_kind op) { return op == TK_TOKEN_SHL || op == TK_TOKEN_SHR; }
 static bool op_is_arith(tk_token_kind op) {   // + - * / — legal on floats AND ints (B.38)
     return op == TK_TOKEN_PLUS || op == TK_TOKEN_MINUS ||

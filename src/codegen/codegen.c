@@ -1172,6 +1172,12 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
                     else if (seg_is(last, "println")) builtin = "tk_println";
                     else if (seg_is(last, "panic"))   builtin = "tk_panic_str";   // panic(str) — diverges (no `never` type)
                     else if (seg_is(last, "exit"))    builtin = "tk_exit";        // exit(<int>) — diverges
+                    // host output FFI bottoms (scope.c) — (str) -> void. write=stdout; e*=stderr.
+                    else if (seg_is(last, "write"))    builtin = "tk_write";
+                    else if (seg_is(last, "ewrite"))   builtin = "tk_ewrite";
+                    else if (seg_is(last, "eprint"))   builtin = "tk_eprint";
+                    else if (seg_is(last, "eprintln")) builtin = "tk_eprintln";
+                    else if (seg_is(last, "parse"))    builtin = "tk_float_parse"; // teko::float::parse(str) -> f64
                     // str/byte STDLIB surface (Phase 3) — the unqualified helpers the corpus calls,
                     // recognized by the checker (scope.c tk_builtin_fn) and lowered to their tk_ runtime
                     // twins (teko_rt). These return a fresh tk_str (malloc + tk_panic on OOM, M.1) and
@@ -1923,6 +1929,15 @@ static bool emit_pat_test(cbuf *b, const tk_pattern *pat, const char *subj,
             cb(b, ")");
             return true;
         case TK_PAT_BIND:
+            // Binding the WHOLE variant value (`TypeExpr as t` where the subject IS the TypeExpr
+            // variant — common over an optional `TypeExpr?`): NOT a case-select. The value already
+            // IS that variant, so the test is unconditionally true (any gating .present check is
+            // upstream); the bind copies the whole value (emit_pat_binds).
+            if (variantT.tag == TK_TYPE_NAMED && !pat->as.bind.is_slice
+                && cg_name_eq(cg_path_last(pat->as.bind.type_name), variantT.as.named.name)) {
+                cb(b, "1");
+                return true;
+            }
             // An ENUM subject has no tag+union: a member pattern tests value equality against the
             // enum constant `TK_E_<ENUM>_<MEMBER>` (matches emit_type_decl's enum emission).
             if (variantT.tag == TK_TYPE_NAMED && cg_named_is_enum(variantT.as.named.name)) {
@@ -2020,8 +2035,28 @@ static bool cg_emit_pat_binds(cbuf *b, const tk_pattern *pat, const char *subj,
             }
             return true;
         }
+        // A bind whose type IS the inner variant itself (`TypeExpr as t` over `TypeExpr?`) binds
+        // the WHOLE present value, not a `.as.<case>` member.
+        if (pat->tag == TK_PAT_BIND && !pat->as.bind.is_slice && inner.tag == TK_TYPE_NAMED
+            && cg_name_eq(cg_path_last(pat->as.bind.type_name), inner.as.named.name)) {
+            if (pat->as.bind.has_binding) {
+                cb(b, indent); cb(b, "auto "); cb_str(b, pat->as.bind.binding);
+                cb(b, " = "); cb(b, val); cb(b, ";\n");
+            }
+            return true;
+        }
         // A variant inner: bind via the variant union over `_s.value`.
         return emit_pat_binds(b, pat, val, indent, err);
+    }
+    // Non-optional bind-WHOLE-variant (`TypeExpr as t` where the subject IS the TypeExpr variant)
+    // binds the whole value, not a `.as.<case>`.
+    if (pat->tag == TK_PAT_BIND && !pat->as.bind.is_slice && subjT.tag == TK_TYPE_NAMED
+        && cg_name_eq(cg_path_last(pat->as.bind.type_name), subjT.as.named.name)) {
+        if (pat->as.bind.has_binding) {
+            cb(b, indent); cb(b, "auto "); cb_str(b, pat->as.bind.binding);
+            cb(b, " = "); cb(b, subj); cb(b, ";\n");
+        }
+        return true;
     }
     return emit_pat_binds(b, pat, subj, indent, err);
 }

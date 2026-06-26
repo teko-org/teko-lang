@@ -28,13 +28,13 @@ tk_texpr_result tk_xferr(tk_error e)   { return (tk_texpr_result){ .ok = false, 
 #define xferr tk_xferr
 
 // ---- file-local predicates (B.22 core — see expr.tks) ----
-static bool is_bool(tk_type t)      { return t.tag == TK_TYPE_PRIM && t.as.prim == TK_PRIM_BOOL; }
-static bool is_integer(tk_type t)   { return t.tag == TK_TYPE_PRIM && tk_prim_is_int(t.as.prim); }
-static bool is_float(tk_type t)     { return t.tag == TK_TYPE_PRIM && tk_prim_is_float(t.as.prim); }
+bool is_bool(tk_type t)      { return t.tag == TK_TYPE_PRIM && t.as.prim == TK_PRIM_BOOL; }
+bool is_integer(tk_type t)   { return t.tag == TK_TYPE_PRIM && tk_prim_is_int(t.as.prim); }
+bool is_float(tk_type t)     { return t.tag == TK_TYPE_PRIM && tk_prim_is_float(t.as.prim); }
 // B.38 / §5: floats join ints in the native numeric set. "numeric" = int OR float
 // (bool is NOT numeric). Arithmetic (+ - * /) and comparisons accept either family;
 // bitwise/shift stay integer-only (no float bit-twiddling — see type_binary).
-static bool is_numeric(tk_type t)   { return is_integer(t) || is_float(t); }
+bool is_numeric(tk_type t)   { return is_integer(t) || is_float(t); }
 static bool is_comparable(tk_type a, tk_type b) {
     if (is_integer(a) && is_integer(b)) return true;   // any int ⋚ any int (B.22 compare)
     if (is_float(a)   && is_float(b))   return tk_type_eq(&a, &b);   // floats: same width only

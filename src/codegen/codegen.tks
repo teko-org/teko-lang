@@ -1149,6 +1149,12 @@ fn emit_call(buf: []byte, prog: checker::TProgram, e: checker::TExpr, c: checker
             else if last == "println" { builtin = "tk_println"; has_builtin = true }
             else if last == "panic"   { builtin = "tk_panic_str"; has_builtin = true }   // panic(str) — diverges (no `never` type)
             else if last == "exit"    { builtin = "tk_exit";      has_builtin = true }   // exit(<int>) — diverges
+            // host output FFI bottoms (scope.c) — (str) -> void. write=stdout; e*=stderr.
+            else if last == "write"    { builtin = "tk_write";       has_builtin = true }   // (str) -> void (stdout)
+            else if last == "ewrite"   { builtin = "tk_ewrite";      has_builtin = true }   // (str) -> void (stderr)
+            else if last == "eprint"   { builtin = "tk_eprint";      has_builtin = true }   // (str) -> void (stderr)
+            else if last == "eprintln" { builtin = "tk_eprintln";    has_builtin = true }   // (str) -> void (stderr + '\n')
+            else if last == "parse"    { builtin = "tk_float_parse"; has_builtin = true }   // teko::float::parse(str) -> f64
             // str/byte STDLIB surface (Phase 3) — the unqualified helpers the corpus calls, recognized
             // by the checker and lowered to their tk_ runtime twins (a fresh tk_str; OOM-panics, M.1).
             // (`str`/`str_of_bytes` are bridged specially ABOVE — a []byte lowers to tk_slice_byte, a
@@ -2175,7 +2181,16 @@ fn emit_pat_test(buf: []byte, prog: checker::TProgram, pat: parser::Pattern, sub
             }
             cb(out, ")")
         }
-        parser::BindPattern => {
+        parser::BindPattern as bp0 => {
+            // Binding the WHOLE variant value (`TypeExpr as t` where the subject IS the TypeExpr
+            // variant — common over an optional `TypeExpr?`): NOT a case-select. The value already
+            // IS that variant, so the test is unconditionally true (any gating .present check is
+            // upstream); the bind copies the whole value (cg_emit_pat_binds).
+            let bind_whole = match variantT {
+                checker::Named as nm => (!bp0.is_slice) && (cg_path_last(bp0.type_name) == nm.name)
+                _ => false
+            }
+            if bind_whole { return cb(buf, "1") }
             // An ENUM subject has no tag+union: a member pattern tests value equality against the
             // enum constant `TK_E_<ENUM>_<MEMBER>` (matches emit_type_decl's enum emission).
             let is_enum = match variantT { checker::Named as nm => cg_named_is_enum(prog, nm.name); _ => false }
@@ -2330,6 +2345,19 @@ fn cg_emit_pat_binds(buf: []byte, prog: checker::TProgram, pat: parser::Pattern,
                                 }
                                 return buf
                             }
+                            // A bind whose type IS the inner variant itself (`TypeExpr as t` over
+                            // `TypeExpr?`) binds the WHOLE present value, not a `.as.<case>` member.
+                            let bind_whole = match opt.inner {
+                                checker::Named as nm => (!bp.is_slice) && (cg_path_last(bp.type_name) == nm.name)
+                                _ => false
+                            }
+                            if bind_whole {
+                                if bp.has_binding {
+                                    mut o = cb(buf, indent); o = cb(o, "auto "); o = cb_str(o, bp.binding)
+                                    o = cb(o, " = "); o = cb(o, val); return cb(o, ";\n")
+                                }
+                                return buf
+                            }
                         }
                         parser::FieldPattern as fp => {
                             if !inner_is_variant {
@@ -2348,6 +2376,24 @@ fn cg_emit_pat_binds(buf: []byte, prog: checker::TProgram, pat: parser::Pattern,
                     }
                     return emit_pat_binds(buf, pat, val, indent)   // variant inner: bind via the union over _s.value
                 }
+            }
+        }
+        _ => { }
+    }
+    // Non-optional bind-WHOLE-variant (`TypeExpr as t` where the subject IS the TypeExpr variant)
+    // binds the whole value, not a `.as.<case>`.
+    match pat {
+        parser::BindPattern as bp => {
+            let bind_whole = match subjT {
+                checker::Named as nm => (!bp.is_slice) && (cg_path_last(bp.type_name) == nm.name)
+                _ => false
+            }
+            if bind_whole {
+                if bp.has_binding {
+                    mut o = cb(buf, indent); o = cb(o, "auto "); o = cb_str(o, bp.binding)
+                    o = cb(o, " = "); o = cb(o, subj); return cb(o, ";\n")
+                }
+                return buf
             }
         }
         _ => { }

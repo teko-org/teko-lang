@@ -18,6 +18,12 @@ tk_texpr      *tk_box(tk_texpr t);       // heap-copy a TExpr (children)
 tk_type        tk_prim_t(tk_prim_kind k);
 tk_type        tk_void_t(void);   // the `void` return marker (M.3 — no value)
 bool           tk_is_bool(tk_type t);
+// numeric-class predicates (B.38) — single definition in expr.c, shared across the checker
+// (revalidate.c reuses them; the `.tks` twin defines them once in teko::checker, in expr.tks).
+bool           is_bool(tk_type t);
+bool           is_integer(tk_type t);
+bool           is_float(tk_type t);
+bool           is_numeric(tk_type t);
 tk_texpr_result tk_xok(tk_texpr t);
 tk_texpr_result tk_xerr(const char *m);
 tk_texpr_result tk_xferr(tk_error e);

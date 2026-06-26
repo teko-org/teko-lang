@@ -198,6 +198,23 @@ void tk_println(tk_str s) {
     fputc('\n', stdout);   // single 0x0A
 }
 
+// Host output FFI bottoms (scope.c: write/ewrite/eprint/eprintln) — exactly s.len bytes, tolerate
+// embedded NUL. write → stdout; ewrite/eprint → stderr; eprintln → stderr + '\n'.
+void tk_write(tk_str s)    { fwrite(s.ptr, 1, s.len, stdout); }
+void tk_ewrite(tk_str s)   { fwrite(s.ptr, 1, s.len, stderr); }
+void tk_eprint(tk_str s)   { fwrite(s.ptr, 1, s.len, stderr); }
+void tk_eprintln(tk_str s) { fwrite(s.ptr, 1, s.len, stderr); fputc('\n', stderr); }
+
+// teko::float::parse(str) -> f64 — strtod over a NUL-terminated copy (s may contain no NUL and is
+// not NUL-terminated). A non-numeric / empty string yields 0.0 (strtod's no-conversion result).
+double tk_float_parse(tk_str s) {
+    char *buf = (char *)tk_alloc(s.len + 1);
+    if (s.len) memcpy(buf, s.ptr, s.len);
+    buf[s.len] = '\0';
+    double v = strtod(buf, NULL);
+    return v;
+}
+
 _Noreturn void tk_panic(const char *msg) {
     // Loud + non-zero (M.1): SIGABRT via abort() (conventional 134).
     fputs("teko: panic: ", stderr);

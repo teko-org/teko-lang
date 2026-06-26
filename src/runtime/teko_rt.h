@@ -27,6 +27,14 @@ void *tk_alloc(size_t n);
 void tk_print(tk_str s);
 // tk_println — tk_print(s) then a single '\n' (0x0A).
 void tk_println(tk_str s);
+// Host output FFI bottoms (scope.c write/ewrite/eprint/eprintln) — s.len bytes, NUL-tolerant.
+// write → stdout; ewrite/eprint → stderr; eprintln → stderr + '\n'.
+void tk_write(tk_str s);
+void tk_ewrite(tk_str s);
+void tk_eprint(tk_str s);
+void tk_eprintln(tk_str s);
+// teko::float::parse(str) -> f64 (strtod over a NUL-terminated copy; non-numeric → 0.0).
+double tk_float_parse(tk_str s);
 
 // --- string interpolation `$"…{expr}…"` builders (self-host parity) ---
 // These are EXTERN (linked from teko_rt.c), NOT static inline — both the generated C and
