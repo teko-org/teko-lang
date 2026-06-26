@@ -1678,6 +1678,169 @@ fn fresh_named(prefix: str, n: i64) -> str {
     str(nm)
 }
 
+// ---- variant-wrap helpers (uniform over an INLINE `tk_u_…` and a NAMED variant decl) ----
+// cg_var_nmem — member COUNT of a variant slot (inline Variant OR a named variant decl).
+// (C: `cg_var_nmem`.)
+fn cg_var_nmem(prog: checker::TProgram, v: checker::Type) -> i64 {
+    match v {
+        checker::Variant as va => va.members.len to i64
+        checker::Named as nm => match cg_find_variant_decl(prog, nm.name) {
+            parser::TypeDecl as d => match d.body {
+                parser::VariantBody as vb => match vb.type_expr {
+                    parser::UnionType as u => u.members.len to i64
+                    _ => 0
+                }
+                _ => 0
+            }
+            error => 0
+        }
+        _ => 0
+    }
+}
+
+// cg_var_mkey — member i's KEY (str). Inline → cg_member_key_str; named → cg_member_key_texpr_str.
+// (C: `cg_var_mkey`.)
+fn cg_var_mkey(prog: checker::TProgram, v: checker::Type, i: i64) -> str | error {
+    match v {
+        checker::Variant as va => cg_member_key_str(va.members[i])
+        checker::Named as nm => {
+            let vd = match cg_find_variant_decl(prog, nm.name) { parser::TypeDecl as d => d; error as e => return e }
+            let members = match vd.body {
+                parser::VariantBody as vb => match vb.type_expr { parser::UnionType as u => u.members; _ => return error { message = "codegen: cg_var_mkey on a non-union variant body (internal)" } }
+                _ => return error { message = "codegen: cg_var_mkey on a non-variant decl (internal)" }
+            }
+            cg_member_key_texpr_str(members[i])
+        }
+        _ => error { message = "codegen: cg_var_mkey on a non-variant type (internal)" }
+    }
+}
+
+// cg_var_mtype — member i AS a Type for recursion: an inline member passes through; a NAMED
+// member → a Named type (its last path segment); anything else → a Void sentinel (not a
+// recursable variant). (C: `cg_var_mtype`.)
+fn cg_var_mtype(prog: checker::TProgram, v: checker::Type, i: i64) -> checker::Type {
+    match v {
+        checker::Variant as va => va.members[i]
+        checker::Named as nm => {
+            let vd = match cg_find_variant_decl(prog, nm.name) { parser::TypeDecl as d => d; error => return checker::Void { } }
+            let members = match vd.body {
+                parser::VariantBody as vb => match vb.type_expr { parser::UnionType as u => u.members; _ => return checker::Void { } }
+                _ => return checker::Void { }
+            }
+            match members[i] {
+                parser::NamedType as nt => checker::Named { name = nt.path.segments[nt.path.segments.len - 1].name }
+                _ => checker::Void { }
+            }
+        }
+        _ => checker::Void { }
+    }
+}
+
+// cg_is_variant_type — is `mt` a (named or inline) variant? (C: `cg_is_variant_type`.)
+fn cg_is_variant_type(prog: checker::TProgram, mt: checker::Type) -> bool {
+    match mt {
+        checker::Variant => true
+        checker::Named as nm => cg_named_is_variant(prog, nm.name)
+        _ => false
+    }
+}
+
+// cg_var_reaches — does variant `v` (TRANSITIVELY, depth bound 16) contain a member whose key
+// == vkey? (C: `cg_var_reaches`.)
+fn cg_var_reaches(prog: checker::TProgram, v: checker::Type, vkey: str, depth: i64) -> bool {
+    if depth <= 0 { return false }
+    let n = cg_var_nmem(prog, v)
+    mut i = 0
+    loop {
+        if i >= n { break }
+        let k = match cg_var_mkey(prog, v, i) { str as s => s; error => "" }
+        if k == vkey { return true }
+        let mt = cg_var_mtype(prog, v, i)
+        if cg_is_variant_type(prog, mt) {
+            if cg_var_reaches(prog, mt, vkey, depth - 1) { return true }
+        }
+        i++
+    }
+    false
+}
+
+// cg_wrap_open — emit `(<variantCType>){ .tag = <TAG for member key `mkey`>, .as.<mkey> = `
+// (no closing `}`). Inline `tk_u_…` vs named-decl tag spelling. (C: `cg_wrap_open`.)
+fn cg_wrap_open(buf: []byte, v: checker::Type, mkey: str) -> []byte | error {
+    match v {
+        checker::Variant as va => {
+            mut out = cb(buf, "(")
+            out = match cg_variant_typename(out, va) { []byte as o => o; error as err => return err }
+            out = cb(out, "){ .tag = TK_TAG_U")
+            mut j = 0
+            loop {
+                if j >= va.members.len { break }
+                out = cb(out, "_")
+                let kj = match cg_member_key_str(va.members[j]) { str as s => s; error as err => return err }
+                out = cb_upper(out, kj)
+                j++
+            }
+            out = cb(out, "_")
+            out = cb_upper(out, mkey)
+            out = cb(out, ", .as.")
+            out = cb_str(out, mkey)
+            return cb(out, " = ")
+        }
+        checker::Named as nm => {
+            mut out = cb(buf, "(")
+            out = mangle_type_name(out, "", nm.name)
+            out = cb(out, "){ .tag = TK_TAG_")
+            out = cb_upper(out, nm.name)
+            out = cb(out, "_")
+            out = cb_upper(out, mkey)
+            out = cb(out, ", .as.")
+            out = cb_str(out, mkey)
+            return cb(out, " = ")
+        }
+        _ => error { message = "codegen: cg_wrap_open on a non-variant type (internal)" }
+    }
+}
+
+// emit_variant_wrap — wrap `value` (a bare case) into the variant `expected`, DIRECTLY or
+// TRANSITIVELY. A value that is a case of a NESTED variant member is routed through that member
+// (Named → (Type){…} → (Type|error){…}), recursing. PRECONDITION: value's key is reachable in
+// `expected` (the caller guards with cg_var_reaches and otherwise emits plainly); `T? | error`
+// is an illegal type here, so reachability is a separate predicate rather than a `null` result.
+// (C: `emit_variant_wrap`.)
+fn emit_variant_wrap(buf: []byte, prog: checker::TProgram, expected: checker::Type, value: checker::TExpr) -> []byte | error {
+    let vkey = match cg_member_key_str(value.type) { str as s => s; error => "" }
+    let n = cg_var_nmem(prog, expected)
+    // pass 1 — DIRECT: value's key matches a member of `expected`.
+    mut i = 0
+    loop {
+        if i >= n { break }
+        let mk = match cg_var_mkey(prog, expected, i) { str as s => s; error => "" }
+        if mk == vkey {
+            mut out = match cg_wrap_open(buf, expected, vkey) { []byte as o => o; error as err => return err }
+            out = match emit_expr(out, prog, value) { []byte as o => o; error as err => return err }
+            return cb(out, " }")
+        }
+        i++
+    }
+    // pass 2 — TRANSITIVE: route through a member variant that reaches vkey.
+    mut j = 0
+    loop {
+        if j >= n { break }
+        let mt = cg_var_mtype(prog, expected, j)
+        if cg_is_variant_type(prog, mt) {
+            if cg_var_reaches(prog, mt, vkey, 16) {
+                let mk = match cg_var_mkey(prog, expected, j) { str as s => s; error => "" }
+                mut out = match cg_wrap_open(buf, expected, mk) { []byte as o => o; error as err => return err }
+                out = match emit_variant_wrap(out, prog, mt, value) { []byte as o => o; error as err => return err }   // recurse into the member variant
+                return cb(out, " }")
+            }
+        }
+        j++
+    }
+    // unreachable given the caller's cg_var_reaches guard.
+    error { message = "codegen: emit_variant_wrap on an unreachable case (internal — caller must guard with cg_var_reaches)" }
+}
+
 // emit_as — emit `value` into a slot whose EXPECTED type is `expected`. When `expected` is
 // a (named) variant and `value`'s type is one of its case members, WRAP the value into the
 // variant's `tag + union` representation:
@@ -1741,74 +1904,20 @@ fn emit_as(buf: []byte, prog: checker::TProgram, expected: checker::Type, value:
         }
         _ => { }
     }
-    // VARIANT slot wrap (B-cg2). Wrap a bare MEMBER value into the variant's tag+union rep:
-    //   (<variantCType>){ .tag = TK_TAG_<V|U…>_<UPPER memberKey>, .as.<memberKey> = <value> }
-    // The member is identified by RESOLVED-TYPE equality (the value's KEY == one member's key),
-    // so a non-named member (error/prim/slice) wraps too. If the value is ALREADY the whole
-    // variant (its key matches no member), it passes through. (C: the variant arm of emit_as.)
+    // VARIANT slot wrap (B-cg2) — DIRECT or TRANSITIVE (case→variant→variant). The member is
+    // identified by RESOLVED-TYPE equality (the value's KEY == a reachable member's key), so a
+    // non-named member (error/prim/slice) wraps too. When the value's key isn't reachable in
+    // `expected` (it IS the whole variant, or `expected` isn't a variant), the value is emitted
+    // plainly. (C: the variant arm of emit_as via emit_variant_wrap.)
     let vkey = match cg_member_key_str(value.type) { str as s => s; error => "" }
     if vkey == "" { return emit_expr(buf, prog, value) }
-    match expected {
-        checker::Variant as va => {
-            // INLINE union slot: members are resolved Types.
-            mut i = 0
-            loop {
-                if i >= va.members.len { break }
-                let mk = match cg_member_key_str(va.members[i]) { str as s => s; error => "" }
-                if mk == vkey {
-                    mut out = cb(buf, "(")
-                    out = match cg_variant_typename(out, va) { []byte as o => o; error as err => return err }
-                    out = cb(out, "){ .tag = TK_TAG_U")
-                    mut j = 0
-                    loop {
-                        if j >= va.members.len { break }
-                        out = cb(out, "_")
-                        let kj = match cg_member_key_str(va.members[j]) { str as s => s; error => "" }
-                        out = cb_upper(out, kj)
-                        j++
-                    }
-                    out = cb(out, "_")
-                    out = cb_upper(out, vkey)
-                    out = cb(out, ", .as.")
-                    out = cb_str(out, vkey)
-                    out = cb(out, " = ")
-                    out = match emit_expr(out, prog, value) { []byte as o => o; error as err => return err }
-                    return cb(out, " }")
-                }
-                i++
-            }
-            return emit_expr(buf, prog, value)
+    let is_variant_slot = match expected { checker::Variant => true; checker::Named => true; _ => false }
+    if is_variant_slot {
+        if cg_var_reaches(prog, expected, vkey, 16) {
+            return emit_variant_wrap(buf, prog, expected, value)
         }
-        checker::Named as nm => {
-            // NAMED variant decl slot: members are SYNTACTIC type-exprs; match by KEY.
-            let vd = match cg_find_variant_decl(prog, nm.name) { parser::TypeDecl as d => d; error => return emit_expr(buf, prog, value) }
-            let members = match vd.body {
-                parser::VariantBody as vb => match vb.type_expr { parser::UnionType as u => u.members; _ => return emit_expr(buf, prog, value) }
-                _ => return emit_expr(buf, prog, value)
-            }
-            mut i = 0
-            loop {
-                if i >= members.len { break }
-                let mk = match cg_member_key_texpr_str(members[i]) { str as s => s; error => "" }
-                if mk == vkey {
-                    mut out = cb(buf, "(")
-                    out = mangle_type_name(out, "", nm.name)
-                    out = cb(out, "){ .tag = TK_TAG_")
-                    out = cb_upper(out, nm.name)
-                    out = cb(out, "_")
-                    out = cb_upper(out, vkey)
-                    out = cb(out, ", .as.")
-                    out = cb_str(out, vkey)
-                    out = cb(out, " = ")
-                    out = match emit_expr(out, prog, value) { []byte as o => o; error as err => return err }
-                    return cb(out, " }")
-                }
-                i++
-            }
-            return emit_expr(buf, prog, value)
-        }
-        _ => emit_expr(buf, prog, value)
     }
+    emit_expr(buf, prog, value)
 }
 
 // cg_emit_lit_pattern — emit an AST LITERAL pattern bound as a C constant comparable to the

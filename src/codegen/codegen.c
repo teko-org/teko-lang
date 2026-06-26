@@ -1563,6 +1563,111 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
 // the C equivalent. When `expected` is not a variant, or `value` is already the variant
 // (not a bare member), the value is emitted plainly.
 // =========================================================================
+// ---- variant-wrap helpers (uniform over an INLINE `tk_u_…` and a NAMED variant decl) ----
+// Member COUNT of a variant slot.
+static size_t cg_var_nmem(tk_type v) {
+    if (v.tag == TK_TYPE_VARIANT) return v.as.variant.len;
+    if (v.tag == TK_TYPE_NAMED) {
+        const tk_type_decl *d = cg_find_variant_decl(v.as.named.name);
+        if (d && d->body.tag == TK_BODY_VARIANT && d->body.as.variant_body.type_expr.tag == TK_TEXPR_UNION)
+            return d->body.as.variant_body.type_expr.as.uni.len;
+    }
+    return 0;
+}
+// Member i's KEY → out (caller frees out->ptr).
+static bool cg_var_mkey(tk_type v, size_t i, cbuf *out, const char **err) {
+    if (v.tag == TK_TYPE_VARIANT) return cg_member_key(out, v.as.variant.members[i], err);
+    const tk_type_decl *d = cg_find_variant_decl(v.as.named.name);
+    return cg_member_key_texpr(out, d->body.as.variant_body.type_expr.as.uni.members[i], err);
+}
+// Member i AS a tk_type for recursion: an inline member passes through; a NAMED member →
+// {NAMED,name}; anything else → VOID (not a recursable variant).
+static tk_type cg_var_mtype(tk_type v, size_t i) {
+    if (v.tag == TK_TYPE_VARIANT) return v.as.variant.members[i];
+    const tk_type_decl *d = cg_find_variant_decl(v.as.named.name);
+    tk_type_expr te = d->body.as.variant_body.type_expr.as.uni.members[i];
+    if (te.tag == TK_TEXPR_NAMED) {
+        tk_str last = te.as.named.path.segments[te.as.named.path.len - 1].name;
+        return (tk_type){ .tag = TK_TYPE_NAMED, .as.named.name = last };
+    }
+    return (tk_type){ .tag = TK_TYPE_VOID };
+}
+// Is `mt` a (named or inline) variant?
+static bool cg_is_variant_type(tk_type mt) {
+    return mt.tag == TK_TYPE_VARIANT || (mt.tag == TK_TYPE_NAMED && cg_named_is_variant(mt.as.named.name));
+}
+// Does variant `v` (TRANSITIVELY) contain a member whose key == vkey?
+static bool cg_var_reaches(tk_type v, tk_str vkey, int depth) {
+    if (depth <= 0) return false;
+    size_t n = cg_var_nmem(v);
+    for (size_t i = 0; i < n; i += 1) {
+        cbuf k = { NULL, 0, 0 }; const char *e = NULL;
+        if (!cg_var_mkey(v, i, &k, &e)) { tk_free0(k.ptr); continue; }
+        bool match = k.len == vkey.len && (vkey.len == 0 || memcmp(k.ptr, vkey.ptr, vkey.len) == 0);
+        tk_free0(k.ptr);
+        if (match) return true;
+        tk_type mt = cg_var_mtype(v, i);
+        if (cg_is_variant_type(mt) && cg_var_reaches(mt, vkey, depth - 1)) return true;
+    }
+    return false;
+}
+// Emit `(<variantCType>){ .tag = <TAG for member key `mkey`>, .as.<mkey> = ` (no closing `}`).
+static bool cg_wrap_open(cbuf *b, tk_type v, tk_str mkey, const char **err) {
+    if (v.tag == TK_TYPE_VARIANT) {
+        cb(b, "("); if (!cg_variant_typename(b, v, err)) return false;
+        cb(b, "){ .tag = TK_TAG_U");
+        for (size_t j = 0; j < v.as.variant.len; j += 1) {
+            cb(b, "_"); cbuf k = { NULL, 0, 0 }; const char *e2 = NULL;
+            cg_member_key(&k, v.as.variant.members[j], &e2);
+            cb_upper(b, (tk_str){ (const tk_byte *)k.ptr, k.len }); tk_free0(k.ptr);
+        }
+        cb(b, "_"); cb_upper(b, mkey);
+    } else {
+        cb(b, "("); mangle_type_name(b, (tk_str){ NULL, 0 }, v.as.named.name);
+        cb(b, "){ .tag = TK_TAG_"); cb_upper(b, v.as.named.name);
+        cb(b, "_"); cb_upper(b, mkey);
+    }
+    cb(b, ", .as."); cb_str(b, mkey); cb(b, " = ");
+    return true;
+}
+static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err);
+// Wrap `value` (a bare case) into the variant `expected`, DIRECTLY or TRANSITIVELY (a value that
+// is a case of a NESTED variant member is routed through that member: Named → (Type){…} →
+// (Type|error){…}). Returns false if value's key isn't reachable (caller emits plainly).
+static bool emit_variant_wrap(cbuf *b, tk_type expected, const tk_texpr *value, const char **err) {
+    cbuf vkey = { NULL, 0, 0 }; const char *ke = NULL;
+    if (!cg_member_key(&vkey, value->type, &ke)) { tk_free0(vkey.ptr); return false; }
+    size_t n = cg_var_nmem(expected);
+    // pass 1 — DIRECT: value's key matches a member of `expected`.
+    for (size_t i = 0; i < n; i += 1) {
+        cbuf mk = { NULL, 0, 0 }; const char *e = NULL;
+        if (!cg_var_mkey(expected, i, &mk, &e)) { tk_free0(mk.ptr); continue; }
+        bool same = mk.len == vkey.len && (vkey.len == 0 || memcmp(mk.ptr, vkey.ptr, vkey.len) == 0);
+        tk_free0(mk.ptr);
+        if (!same) continue;
+        bool ok = cg_wrap_open(b, expected, (tk_str){ (const tk_byte *)vkey.ptr, vkey.len }, err)
+               && emit_expr(b, value, err);
+        if (ok) cb(b, " }");
+        tk_free0(vkey.ptr);
+        return ok;
+    }
+    // pass 2 — TRANSITIVE: route through a member variant that reaches vkey.
+    for (size_t i = 0; i < n; i += 1) {
+        tk_type mt = cg_var_mtype(expected, i);
+        if (!cg_is_variant_type(mt) || !cg_var_reaches(mt, (tk_str){ (const tk_byte *)vkey.ptr, vkey.len }, 16)) continue;
+        cbuf mk = { NULL, 0, 0 }; const char *e = NULL;
+        if (!cg_var_mkey(expected, i, &mk, &e)) { tk_free0(mk.ptr); continue; }
+        bool ok = cg_wrap_open(b, expected, (tk_str){ (const tk_byte *)mk.ptr, mk.len }, err);
+        tk_free0(mk.ptr);
+        if (ok) ok = emit_variant_wrap(b, mt, value, err);   // recurse into the member variant
+        if (ok) cb(b, " }");
+        tk_free0(vkey.ptr);
+        return ok;
+    }
+    tk_free0(vkey.ptr);
+    return false;
+}
+
 static bool emit_as(cbuf *b, tk_type expected, const tk_texpr *value, const char **err) {
     // OPTIONAL slot (REBOOT_PLAN §202): wrap the value into the slot's tk_opt_<inner> struct.
     //   * a bare `null`           → (tk_opt_<inner>){ .present = false }
@@ -1598,62 +1703,15 @@ static bool emit_as(cbuf *b, tk_type expected, const tk_texpr *value, const char
     // so a non-named member (error/prim/slice) wraps too, not just a named case. If the value
     // is ALREADY the whole variant (its key matches no member — e.g. a var of the variant type),
     // no wrap: it passes through.
+    // VARIANT slot wrap (B-cg2) — DIRECT or TRANSITIVE (case→variant→variant). When the value's
+    // key isn't reachable in `expected` (it IS the whole variant, or `expected` isn't a variant),
+    // emit_variant_wrap returns false and the value is emitted plainly.
     if (expected.tag == TK_TYPE_NAMED || expected.tag == TK_TYPE_VARIANT) {
-        // The value's member KEY (rendered once). A value whose type can't form a key (e.g. it
-        // IS a variant) yields no key → no match → pass-through.
-        cbuf vkey = { NULL, 0, 0 }; const char *ke = NULL;
-        bool have_vkey = cg_member_key(&vkey, value->type, &ke);
-        if (have_vkey) {
-            if (expected.tag == TK_TYPE_VARIANT) {
-                // INLINE union slot: members are resolved tk_types.
-                for (size_t i = 0; i < expected.as.variant.len; i += 1) {
-                    cbuf mk = { NULL, 0, 0 }; const char *me = NULL;
-                    if (!cg_member_key(&mk, expected.as.variant.members[i], &me)) { tk_free0(mk.ptr); continue; }
-                    bool same = mk.len == vkey.len && (vkey.len == 0 || memcmp(mk.ptr, vkey.ptr, vkey.len) == 0);
-                    tk_free0(mk.ptr);
-                    if (!same) continue;
-                    cb(b, "("); if (!cg_variant_typename(b, expected, err)) { tk_free0(vkey.ptr); return false; }
-                    cb(b, "){ .tag = TK_TAG_U");
-                    for (size_t j = 0; j < expected.as.variant.len; j += 1) {
-                        cb(b, "_"); cbuf k = { NULL, 0, 0 }; const char *e2 = NULL;
-                        cg_member_key(&k, expected.as.variant.members[j], &e2);
-                        cb_upper(b, (tk_str){ (const tk_byte *)k.ptr, k.len }); tk_free0(k.ptr);
-                    }
-                    cb(b, "_"); cb_upper(b, (tk_str){ (const tk_byte *)vkey.ptr, vkey.len });
-                    cb(b, ", .as."); cb_str(b, (tk_str){ (const tk_byte *)vkey.ptr, vkey.len }); cb(b, " = ");
-                    bool ok = emit_expr(b, value, err); tk_free0(vkey.ptr);
-                    if (!ok) return false;
-                    cb(b, " }");
-                    return true;
-                }
-            } else {
-                // NAMED variant decl slot: members are SYNTACTIC type-exprs; match by key.
-                const tk_type_decl *vd = cg_find_variant_decl(expected.as.named.name);
-                if (vd != NULL && vd->body.tag == TK_BODY_VARIANT) {
-                    tk_type_expr vt = vd->body.as.variant_body.type_expr;
-                    if (vt.tag == TK_TEXPR_UNION) {
-                        for (size_t i = 0; i < vt.as.uni.len; i += 1) {
-                            cbuf mk = { NULL, 0, 0 }; const char *me = NULL;
-                            if (!cg_member_key_texpr(&mk, vt.as.uni.members[i], &me)) { tk_free0(mk.ptr); continue; }
-                            bool same = mk.len == vkey.len && (vkey.len == 0 || memcmp(mk.ptr, vkey.ptr, vkey.len) == 0);
-                            tk_free0(mk.ptr);
-                            if (!same) continue;
-                            cb(b, "(");
-                            mangle_type_name(b, (tk_str){ NULL, 0 }, expected.as.named.name);
-                            cb(b, "){ .tag = TK_TAG_");
-                            cb_upper(b, expected.as.named.name);
-                            cb(b, "_"); cb_upper(b, (tk_str){ (const tk_byte *)vkey.ptr, vkey.len });
-                            cb(b, ", .as."); cb_str(b, (tk_str){ (const tk_byte *)vkey.ptr, vkey.len }); cb(b, " = ");
-                            bool ok = emit_expr(b, value, err); tk_free0(vkey.ptr);
-                            if (!ok) return false;
-                            cb(b, " }");
-                            return true;
-                        }
-                    }
-                }
-            }
-        }
-        tk_free0(vkey.ptr);
+        size_t before = b->len;
+        bool wrapped = emit_variant_wrap(b, expected, value, err);
+        if (*err != NULL) return false;
+        if (wrapped) return true;
+        (void)before;
     }
     return emit_expr(b, value, err);
 }
