@@ -272,6 +272,17 @@ static const tk_type_decl *cg_find_decl(tk_str name) {
     return NULL;
 }
 
+// The top-level FUNCTION `name` in namespace `ns` (for call-arg wrapping — emit_call needs the
+// callee's parameter types to wrap a bare case arg into a variant param via emit_as).
+static const tk_tfunction *cg_find_function(tk_str ns, tk_str name) {
+    for (size_t i = 0; i < g_cg_prog.nitems; i += 1) {
+        if (g_cg_prog.items[i].tag != TK_TITEM_FUNCTION) continue;
+        const tk_tfunction *f = &g_cg_prog.items[i].as.function;
+        if (cg_name_eq(f->name, name) && cg_name_eq(f->namespace, ns)) return f;
+    }
+    return NULL;
+}
+
 // Is `name` a builtin scalar (prim/byte/str/error), i.e. carries no user decl?
 static bool cg_is_prim_name(tk_str name) {
     static const char *prims[] = { "u8","u16","u32","u64","u128","i8","i16","i32","i64",
@@ -1200,10 +1211,20 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
                 // (keyword-escaped) last segment.
                 cb_ident(b, p.segments[p.len - 1].name);
             }
+            // A resolved USER call: wrap each arg into its parameter type (emit_as) so a bare case
+            // value (e.g. `Prim{…}` passed where a `Type` variant is expected) lands in the variant
+            // rep — the arg keeps its case type (type_call no longer clobbers widened args). For a
+            // NAMED param only (variant/struct/enum); other param shapes emit plainly, as before.
+            const tk_tfunction *cf = (e->as.call.call_ns.len != 0)
+                ? cg_find_function(e->as.call.call_ns, p.segments[p.len - 1].name) : NULL;
             cb(b, "(");
             for (size_t i = 0; i < e->as.call.nargs; i += 1) {
                 if (i > 0) cb(b, ", ");
-                if (!emit_expr(b, &e->as.call.args[i], err)) return false;
+                if (cf != NULL && i < cf->nparams && cf->params[i].type_ann.tag == TK_TEXPR_NAMED) {
+                    tk_path pp = cf->params[i].type_ann.as.named.path;
+                    tk_type exp = { .tag = TK_TYPE_NAMED, .as.named.name = pp.segments[pp.len - 1].name };
+                    if (!emit_as(b, exp, &e->as.call.args[i], err)) return false;
+                } else if (!emit_expr(b, &e->as.call.args[i], err)) return false;
             }
             cb(b, ")");
             return true;

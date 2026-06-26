@@ -225,8 +225,18 @@ fn type_call(c: parser::Call, env: Env, table: TypeTable) -> TExpr | error {
                     // (C1.8/E2) attach expected=type_render(f.params[i]), actual=type_render(a.type) — THE
                     // user's reported mismatch. Mirrors expr.c type_call's tk_error_types wrap.
                     if !literal_adopts(a, f.params[i]) { return teko::error::err_typed(error { message = "argument type mismatch" }, type_render(f.params[i]), type_render(a.type)) }
+                    // a fitting numeric literal ADOPTS the param type (leaf retyped) — C6
+                    a = TExpr { kind = a.kind; type = f.params[i]; line = a.line; col = a.col }
+                } else {
+                    // A non-variant widen (T→T?, empty()→[]T, exact) ADOPTS the param type as before, so a
+                    // sentinel empty()/null is concretized to the param's slice/optional slot at codegen.
+                    // A case→VARIANT widen KEEPS its case type so codegen's emit_call wraps it into the
+                    // parameter's variant rep (emit_as) — mirrors type_struct_lit keeping the field's case type.
+                    let pt_is_variant = match expand_variant(f.params[i], table) { Variant => true; _ => false }
+                    if !pt_is_variant {
+                        a = TExpr { kind = a.kind; type = f.params[i]; line = a.line; col = a.col }
+                    }
                 }
-                a = TExpr { kind = a.kind; type = f.params[i]; line = a.line; col = a.col }   // adopt the parameter type (a fitting literal C6, or a widened case/value)
                 args = teko::list::push(args, a)
                 i++
             }

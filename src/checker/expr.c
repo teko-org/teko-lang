@@ -262,8 +262,14 @@ static tk_texpr_result type_call(tk_call c, tk_env env, tk_type_table table) {
             if (!tk_literal_adopts(a.as.value, pt))
                 return xferr(tk_error_types(tk_error_make("argument type mismatch"),
                                             tk_type_render(pt), tk_type_render(a.as.value.type)));
+            a.as.value.type = pt;   // a fitting numeric literal ADOPTS the param type (leaf retyped) — C6
+        } else if (tk_expand_variant(pt, table).tag != TK_TYPE_VARIANT) {
+            // A non-variant widen (T→T?, empty()→[]T, exact) ADOPTS the param type as before, so a
+            // sentinel empty()/null is concretized to the param's slice/optional slot at codegen.
+            a.as.value.type = pt;
         }
-        a.as.value.type = pt;   // adopt the parameter type (a fitting literal C6, or a widened case/value)
+        // Else: a case→VARIANT widen KEEPS its case type so codegen's emit_call wraps it into the
+        // parameter's variant rep (emit_as) — mirrors type_struct_lit keeping the field's case type.
         args = tk_texpr_list_push(args, a.as.value);
     }
     return xok((tk_texpr){ .tag = TK_TEXPR_CALL, .type = *ft.as.func.ret,

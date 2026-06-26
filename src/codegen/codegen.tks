@@ -307,6 +307,22 @@ fn cg_find_decl(prog: checker::TProgram, name: str) -> parser::TypeDecl | error 
     error { message = "codegen: no such type decl" }
 }
 
+// cg_find_function — the top-level FUNCTION `name` in namespace `ns`, or a `not found` error.
+// (For call-arg wrapping — emit_call needs the callee's parameter types to wrap a bare case arg
+// into a variant param via emit_as.) (C: `cg_find_function`, which returned NULL.)
+fn cg_find_function(prog: checker::TProgram, ns: str, name: str) -> checker::TFunction | error {
+    mut i = 0
+    loop {
+        if i >= prog.items.len { break }
+        match prog.items[i] {
+            checker::TFunction as f => { if f.name == name && f.namespace == ns { return f } }
+            _ => { }
+        }
+        i++
+    }
+    error { message = "codegen: no such function" }
+}
+
 // cg_is_prim_name — is `name` a builtin scalar (prim/byte/str/error), i.e. carries no user
 // decl? (C: `cg_is_prim_name`; same set as cg_is_builtin_scalar.)
 fn cg_is_prim_name(name: str) -> bool { cg_is_builtin_scalar(name) }
@@ -1170,12 +1186,38 @@ fn emit_call(buf: []byte, prog: checker::TProgram, e: checker::TExpr, c: checker
         // (keyword-escaped) last segment.
         out = cb_ident(out, p.segments[p.segments.len - 1].name)
     }
+    // A resolved USER call: wrap each arg into its parameter type (emit_as) so a bare case value
+    // (e.g. `Prim{…}` passed where a `Type` variant is expected) lands in the variant rep — the arg
+    // keeps its case type (type_call no longer clobbers widened args). For a NAMED param only
+    // (variant/struct/enum); other param shapes emit plainly, as before. When there's no resolved
+    // function (builtins / call_ns empty), emit all args plainly.
+    let cf_res = if c.call_ns.len != 0 {
+        cg_find_function(prog, c.call_ns, p.segments[p.segments.len - 1].name)
+    } else { error { message = "codegen: no resolved namespace" } }
     out = cb(out, "(")
     mut j = 0
     loop {
         if j >= c.args.len { break }
         if j > 0 { out = cb(out, ", ") }
-        out = match emit_expr(out, prog, c.args[j]) { []byte as o => o; error as err => return err }
+        mut wrapped = false
+        match cf_res {
+            checker::TFunction as cf => {
+                if j < cf.params.len {
+                    match cf.params[j].type_ann {
+                        parser::NamedType as nt => {
+                            let pn = nt.path.segments[nt.path.segments.len - 1].name
+                            out = match emit_as(out, prog, checker::Named { name = pn }, c.args[j]) { []byte as o => o; error as err => return err }
+                            wrapped = true
+                        }
+                        _ => { }
+                    }
+                }
+            }
+            error => { }
+        }
+        if !wrapped {
+            out = match emit_expr(out, prog, c.args[j]) { []byte as o => o; error as err => return err }
+        }
         j++
     }
     cb(out, ")")
