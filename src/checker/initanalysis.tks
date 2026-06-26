@@ -1,0 +1,256 @@
+// src/checker/initanalysis.tks  (namespace 'teko::checker')
+//
+// Phase 5 — definite-assignment / init analysis.
+//
+// LAW-FIRST NOTE (why there is no use-before-init check here). Teko has NO uninitialized
+// binding form: `let`/`mut`/`const` ALWAYS carry a value (parser::Binding.value is
+// mandatory — ast.tks), and that value is typed in the PRE-binding env (typer.tks
+// type_binding — the name is defined AFTER its value types), so a self/forward reference
+// fails as an unknown name. Definite assignment is therefore STRUCTURAL: a use-before-init
+// cannot be written. This pass delivers the REMAINING Phase-5 diagnostics:
+//   * unused LOCAL  (`let`/`mut`/`const` simple-name never read in its function) -> ERROR
+//   * unused PRIVATE function (declared private, never called anywhere)          -> WARNING
+// Both report with Phase-1-quality locations (the binding value's line:col / the fn's line).
+//
+// THE WARNINGS CHANNEL. Teko has no module-mutable state, so the pass cannot accumulate a
+// warning list into a global. Instead it PRINTS each warning to stderr (teko::io::eprintln)
+// as it is found and returns only the first hard ERROR via `error?`. A warning never fails
+// the build; an error does — consistent with the fail-fast checker (check.tks).
+//
+// CONSERVATISM (keeps the self-host gate green). "Used" is over-approximated by a NAME
+// occurrence anywhere in the relevant scope (a var read, a call's last segment, or a
+// COMPOUND-assign target). Shadowing therefore masks at worst → a missed unused (a false
+// NEGATIVE), never a false positive. The dominant real bug — a `let x = …` whose name never
+// appears again — is caught exactly.
+
+use teko::parser
+use teko::lexer
+
+// ---- occurrence predicates: does `name` appear as a READ in this expr/stmt/block? ----
+// A read = a TVar, a call's resolved last segment (calls resolve by last segment — #41), or a
+// COMPOUND-assign target (`x += …` reads x; a plain `x = …` does not). Used for BOTH the
+// per-function unused-local test and the program-wide unused-private-fn test.
+
+fn occurs_expr(e: TExpr, name: str) -> bool {
+    match e.kind {
+        TVar as v       => v.name == name
+        TBinary as b    => occurs_expr(b.left, name) || occurs_expr(b.right, name)
+        TUnary as u     => occurs_expr(u.operand, name)
+        TCompare as c   => {
+            if occurs_expr(c.first, name) { return true }
+            mut i = 0
+            loop {
+                if i >= c.rest.len { break }
+                if occurs_expr(c.rest[i].operand, name) { return true }
+                i++
+            }
+            false
+        }
+        TCall as call   => {
+            if call.callee.segments[call.callee.segments.len - 1].name == name { return true }
+            mut i = 0
+            loop {
+                if i >= call.args.len { break }
+                if occurs_expr(call.args[i], name) { return true }
+                i++
+            }
+            false
+        }
+        TIfExpr as f    => {
+            if occurs_expr(f.cond, name) { return true }
+            if occurs_block(f.then_blk, name) { return true }
+            if f.has_else { if occurs_block(f.else_blk, name) { return true } }
+            false
+        }
+        TMatchExpr as m => {
+            if occurs_expr(m.subject, name) { return true }
+            mut i = 0
+            loop {
+                if i >= m.arms.len { break }
+                let a = m.arms[i]
+                if a.has_when { if occurs_expr(a.guard, name) { return true } }
+                if occurs_block(a.body, name) { return true }
+                i++
+            }
+            false
+        }
+        TCast as cst            => occurs_expr(cst.expr, name)
+        TFieldAccess as fa      => occurs_expr(fa.receiver, name)
+        TSafeFieldAccess as sfa => occurs_expr(sfa.receiver, name)
+        TCoalesce as co         => occurs_expr(co.left, name) || occurs_expr(co.right, name)
+        TStructInit as si       => {
+            mut i = 0
+            loop {
+                if i >= si.field_vals.len { break }
+                if occurs_expr(si.field_vals[i], name) { return true }
+                i++
+            }
+            false
+        }
+        TIndex as ix    => occurs_expr(ix.receiver, name) || occurs_expr(ix.index, name)
+        TInterp as it   => {
+            mut i = 0
+            loop {
+                if i >= it.holes.len { break }
+                if occurs_expr(it.holes[i], name) { return true }
+                i++
+            }
+            false
+        }
+        TInExpr as ie   => {
+            if occurs_expr(ie.lhs, name) { return true }
+            mut i = 0
+            loop {
+                if i >= ie.elems.len { break }
+                if occurs_expr(ie.elems[i], name) { return true }
+                i++
+            }
+            false
+        }
+        _ => false   // TNumber / TStrLit / TByteLit / TBoolLit / TNullLit / TPathExpr — no reads
+    }
+}
+
+fn occurs_stmt(s: TStatement, name: str) -> bool {
+    match s {
+        TBinding as b   => occurs_expr(b.value, name)
+        TAssign as a    => {
+            // a COMPOUND assign (`x += …`) READS the target; a plain `=` does not.
+            if a.op != lexer::TokenKind::Assign { if a.name == name { return true } }
+            occurs_expr(a.value, name)
+        }
+        TReturn as r    => { if r.has_value { return occurs_expr(r.value, name) }; false }
+        TLoopStmt as l  => occurs_block(l.body, name)
+        TExprStmt as es => occurs_expr(es.expr, name)
+        _ => false   // TBreakStmt / TContinueStmt — no reads
+    }
+}
+
+fn occurs_block(stmts: []TStatement, name: str) -> bool {
+    mut i = 0
+    loop {
+        if i >= stmts.len { break }
+        if occurs_stmt(stmts[i], name) { return true }
+        i++
+    }
+    false
+}
+
+// ---- (C5.1) unused-local ERROR: every `let`/`mut`/`const` simple-name local in a function
+// must be read somewhere in that function's body. Walks the body (and value-form if/match
+// blocks, which can declare their own locals); returns the FIRST unused as a located error. ----
+
+fn check_locals(stmts: []TStatement, fbody: []TStatement, file: str) -> error? {
+    mut i = 0
+    loop {
+        if i >= stmts.len { break }
+        match check_local_stmt(stmts[i], fbody, file) { null => {}; error as e => return e }
+        i++
+    }
+    null
+}
+
+fn check_local_stmt(s: TStatement, fbody: []TStatement, file: str) -> error? {
+    match s {
+        TBinding as b => {
+            match b.target {
+                parser::SimpleName as sn => {
+                    // `_` is the explicit DISCARD binding (`let _ = expr` evaluates and drops) — exempt it.
+                    if sn.name != "_" {
+                        if !occurs_block(fbody, sn.name) {
+                            let msg = diag_at(file, b.value.line, b.value.col, $"unused local `{sn.name}` — it is declared but never read")
+                            return teko::error::err_loc(error { message = msg }, b.value.line, b.value.col)
+                        }
+                    }
+                }
+                parser::DestructurePattern => {}   // destructure targets aren't tracked (type_binding doesn't define them)
+            }
+            check_locals_expr(b.value, fbody, file)
+        }
+        TLoopStmt as l  => check_locals(l.body, fbody, file)
+        TExprStmt as es => check_locals_expr(es.expr, fbody, file)
+        TReturn as r    => { if r.has_value { return check_locals_expr(r.value, fbody, file) }; null }
+        TAssign as a    => check_locals_expr(a.value, fbody, file)
+        _ => null
+    }
+}
+
+fn check_locals_expr(e: TExpr, fbody: []TStatement, file: str) -> error? {
+    match e.kind {
+        TIfExpr as f    => {
+            match check_locals(f.then_blk, fbody, file) { null => {}; error as er => return er }
+            if f.has_else { return check_locals(f.else_blk, fbody, file) }
+            null
+        }
+        TMatchExpr as m => {
+            mut i = 0
+            loop {
+                if i >= m.arms.len { break }
+                match check_locals(m.arms[i].body, fbody, file) { null => {}; error as er => return er }
+                i++
+            }
+            null
+        }
+        _ => null   // locals buried inside an operand are rare → a missed unused (safe)
+    }
+}
+
+// ---- (C5.2) unused-private-function WARNING: a private (file-local) function never called
+// anywhere in the merged program is dead. `main` (the entry, never source-called) is exempt. ----
+
+fn used_in_program(prog: TProgram, name: str) -> bool {
+    mut i = 0
+    loop {
+        if i >= prog.items.len { break }
+        match prog.items[i] {
+            TFunction as f  => { if occurs_block(f.body, name) { return true } }
+            TStatement as s => { if occurs_stmt(s, name) { return true } }
+            _ => {}
+        }
+        i++
+    }
+    false
+}
+
+fn warn_unused_fn(f: TFunction) {
+    teko::io::eprintln($"{f.file}:{f.line}: warning: unused private function `{f.name}`")
+}
+
+// gather the program's LOOSE top-level statements (the virtual-main) into one scope, so an
+// unused loose `let` is checked against the other loose statements (not a function body).
+fn loose_body(prog: TProgram) -> []TStatement {
+    mut out: []TStatement = teko::list::empty()
+    mut i = 0
+    loop {
+        if i >= prog.items.len { break }
+        match prog.items[i] {
+            TStatement as s => { out = teko::list::push(out, s) }
+            _ => {}
+        }
+        i++
+    }
+    out
+}
+
+// ---- the pass entry: run over the typed program; prints warnings, returns the first error. ----
+pub fn analyze_program(prog: TProgram) -> error? {
+    mut i = 0
+    loop {
+        if i >= prog.items.len { break }
+        match prog.items[i] {
+            TFunction as f => {
+                match check_locals(f.body, f.body, f.file) { null => {}; error as e => return e }
+                if f.vis == parser::Visibility::Private {
+                    if f.name != "main" {
+                        if !used_in_program(prog, f.name) { warn_unused_fn(f) }
+                    }
+                }
+            }
+            _ => {}
+        }
+        i++
+    }
+    let loose = loose_body(prog)
+    match check_locals(loose, loose, "") { null => {}; error as e => return e }
+    null
+}

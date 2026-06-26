@@ -10,6 +10,7 @@
 #include "typer_internal.h"  // tk_type_block (this TU defines it), tk_type_arm, tk_tblock_type, tk_exhaustive
 #include "collect.h"         // tk_collect, tk_collected_result
 #include "check_modules.h"   // tk_check_modules (W-vis-enforce — module-system pass)
+#include "initanalysis.h"    // tk_analyze_program (Phase 5 — init analysis)
 #include <string.h>          // memcmp (loop-label comparison)
 
 // short aliases for local use (terse, matches the original site spellings).
@@ -416,5 +417,10 @@ tk_tprogram_result tk_type_program(tk_program program) {
     { tk_str seen[TK_MAX_LABELS]; size_t nseen = 0;   // W5-cf-2: validate labels in the virtual-main
       const char *why = check_labels(mainbody.ptr, mainbody.len, NULL, false, seen, &nseen);
       if (why) return (tk_tprogram_result){ .ok = false, .as.error = tk_error_make(why) }; }
-    return (tk_tprogram_result){ .ok = true, .as.value = { .items = items.ptr, .nitems = items.len } };
+    tk_tprogram tp = { .items = items.ptr, .nitems = items.len };
+    // Phase 5 — init analysis: unused-local ERROR + unused-private-fn WARNING (initanalysis.c).
+    // Runs last, over the fully typed program; prints warnings, returns the first hard error.
+    { tk_error ae = tk_analyze_program(tp);
+      if (ae.message) return (tk_tprogram_result){ .ok = false, .as.error = ae }; }
+    return (tk_tprogram_result){ .ok = true, .as.value = tp };
 }
