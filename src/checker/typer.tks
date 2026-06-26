@@ -390,11 +390,39 @@ fn annotated_literal_ok(value: parser::Expr, ann: Type) -> error? {
 // `x to T` — type the inner, resolve the target, demand the conversion is DEFINED, then reject a
 // CONSTANT literal already out of range (fail early — M.1). The runtime fit-check for non-constant
 // operands is codegen's (debug-panic / release-defined) — deferred (M.4).
+// (E7) is `t` a NAMED type whose declaration is an `enum`? (C: is_enum_named.)
+fn is_enum_named(t: Type, table: TypeTable) -> bool {
+    match t {
+        Named as n => match type_table_find(table, n.name) {
+            parser::TypeDecl as td => match td.body { parser::EnumBody => true; _ => false }
+            error                  => false
+        }
+        _ => false
+    }
+}
+
+// (E7) an INTEGER cast endpoint: an int prim, or `byte` (= u8). Floats/bool excluded. (C: is_int_cast_end.)
+fn is_int_cast_end(t: Type) -> bool {
+    match t {
+        Byte      => true
+        Prim as p => prim_is_int(p.kind)
+        _         => false
+    }
+}
+
 fn type_cast(c: parser::Cast, env: Env, table: TypeTable) -> TExpr | error {
     let inner = match type_expr(c.expr, env, table) { TExpr as te => te; error as e => return e }
     if type_is_void(inner.type) { return error { message = "a `void` expression cannot be cast (M.1)" } }
     let target = match resolve_type(c.target, table) { Type as t => t; error as e => return e }
-    match cast_check(inner.type, target) { null => {}; error as e => return e }
+    // (E7) enum ↔ integer ORDINAL cast: an enum value → its ordinal integer, an integer → the enum
+    // member (the `(byte)k` / `(TokenKind)b` the .tkb serializer relies on). cast_check is prim-only,
+    // so handle this pair here (it has the type table to detect an enum); the result type is the
+    // target. Any OTHER enum cast stays rejected by cast_check. (Mirrors expr.c type_cast's e7.)
+    let e7 = (is_enum_named(inner.type, table) && is_int_cast_end(target)) ||
+             (is_int_cast_end(inner.type) && is_enum_named(target, table))
+    if !e7 {
+        match cast_check(inner.type, target) { null => {}; error as e => return e }
+    }
     match const_range_check(c.expr, target) { null => {}; error as e => return e }
     TExpr { kind = TCast { expr = inner }; type = target; line = 0; col = 0 }        // the cast's type IS the resolved target
 }
@@ -582,10 +610,17 @@ fn type_struct_lit(sl: parser::StructLit, env: Env, table: TypeTable) -> TExpr |
                 val = TExpr { kind = val.kind; type = ft; line = val.line; col = val.col }
             }
         }
-        // The field value must WIDEN into the field's declared type: exact, a variant CASE into a
-        // variant-typed field (`TExpr.kind = TNumber{…}`), or `T` into a `T?` field. Same rule as
-        // return/arm widening (the single source of truth, resolve.tks).
-        if !widens_into(val.type, ft, table) { return error { message = "a struct-literal field value does not match the field's declared type" } }
+        // The field value must WIDEN into the field's declared type (exact, a variant CASE into a
+        // variant-typed field — keep the case type so codegen's emit_as wraps it — or `T` into a
+        // `T?`); OR be a fitting numeric LITERAL that ADOPTS the field type (incl a `byte` field = u8,
+        // `lo = 0x80`), in which case the leaf is retyped. Same rules as binding/arg adoption.
+        if !widens_into(val.type, ft, table) {
+            if literal_adopts(val, ft) {
+                val = TExpr { kind = val.kind; type = ft; line = val.line; col = val.col }   // a fitting literal adopts the field's type
+            } else {
+                return error { message = "a struct-literal field value does not match the field's declared type" }
+            }
+        }
         names = teko::list::push(names, fname)
         vals = teko::list::push(vals, val)
         d++
@@ -836,8 +871,18 @@ fn type_if(f: parser::IfExpr, env: Env, table: TypeTable) -> TExpr | error {
     if !f.has_else { return error { message = "an `if` used as a value needs an `else`" } }
     let tb = match type_block(f.then_blk, env, table) { TypedBlock as bk => bk; error as e => return e }
     let eb = match type_block(f.else_blk, env, table) { TypedBlock as bk => bk; error as e => return e }
-    let tt = tblock_type(tb.stmts)
-    let et = tblock_type(eb.stmts)
+    mut tt = tblock_type(tb.stmts)
+    mut et = tblock_type(eb.stmts)
+    // literal cross-adoption (mirrors expr.c type_if): a numeric-literal branch adopts the OTHER
+    // branch's numeric type, so `if c { u32_expr } else { 64 }` is u32, not the union u32 | i64.
+    let tl = trailing_number(tb.stmts)
+    let el = trailing_number(eb.stmts)
+    let then_adopts = match tl { TExpr as t => literal_adopts(t, et); null => false }
+    if then_adopts { tt = et }
+    else {
+        let else_adopts = match el { TExpr as t => literal_adopts(t, tt); null => false }
+        if else_adopts { et = tt }
+    }
     let joined = type_join(tt, et, table)   // widen (a case joins into its variant; siblings → their union)
     TExpr { kind = TIfExpr { cond = c; then_blk = tb.stmts; has_else = true; else_blk = eb.stmts }; type = joined; line = 0; col = 0 }
 }
@@ -1053,9 +1098,30 @@ fn check_returns(stmts: []TStatement, ret: Type, table: TypeTable) -> error? {
     null
 }
 
+// the trailing value-expr of a block (its last statement, when that is an expr-statement),
+// or null. (C: tblock_trailing.)
+fn tblock_trailing(stmts: []TStatement) -> TExpr? {
+    if stmts.len == 0 { return null }
+    match stmts[stmts.len - 1] {
+        TExprStmt as es => es.expr
+        _               => null
+    }
+}
+
+// the block's trailing value-expr IF it is a numeric literal (else null) — for the if/match
+// literal cross-adoption (a `64` branch adopts a sibling's numeric type). (C: tl/el + NUMBER tag.)
+fn trailing_number(stmts: []TStatement) -> TExpr? {
+    match tblock_trailing(stmts) {
+        TExpr as t => match t.kind { TNumber => t; _ => null }
+        null       => null
+    }
+}
+
 // C6 (extended) — a fitting numeric LITERAL adopts the destination type (return value / trailing
 // expr): int-literal → an int prim it fits OR `byte` (=u8, B.36); float-literal → a fitting float
 // prim. Reuses cast_kind (byte AS u8) + value_fits / float_fits — the same range rules as a binding.
+// RECURSES through a `match`/`if` whose every contributing arm trails an adopting literal (so
+// `match k { U8 => 8; … } : u32` adopts), mirroring tk_literal_adopts in expr.c.
 fn literal_adopts(e: TExpr, to: Type) -> bool {
     match e.kind {
         TNumber as n => match cast_kind(to) {
@@ -1064,6 +1130,38 @@ fn literal_adopts(e: TExpr, to: Type) -> bool {
                 else { prim_is_int(k) && value_fits(n.value, k) }
             }
             error => false
+        }
+        TMatchExpr as m => {
+            mut any = false
+            mut i = 0
+            loop {
+                if i >= m.arms.len { break }
+                if !tblock_diverges(m.arms[i].body) {       // a diverging arm yields no value (M.3)
+                    match tblock_trailing(m.arms[i].body) {
+                        TExpr as t => { if !literal_adopts(t, to) { return false }; any = true }
+                        null       => return false
+                    }
+                }
+                i++
+            }
+            any                                              // ≥1 contributing arm, all adopt
+        }
+        TIfExpr as f => {
+            if !f.has_else { return false }                  // a one-armed `if` has no value
+            mut any = false
+            if !tblock_diverges(f.then_blk) {
+                match tblock_trailing(f.then_blk) {
+                    TExpr as t => { if !literal_adopts(t, to) { return false }; any = true }
+                    null       => return false
+                }
+            }
+            if !tblock_diverges(f.else_blk) {
+                match tblock_trailing(f.else_blk) {
+                    TExpr as t => { if !literal_adopts(t, to) { return false }; any = true }
+                    null       => return false
+                }
+            }
+            any
         }
         _ => false
     }
@@ -1271,6 +1369,7 @@ pub fn type_program(program: parser::Program) -> TProgram | error {
     match check_modules(program, c.types) { null => {}; error as e => return e }
     mut items: []TItem = teko::list::empty()
     mut mainbody: []TStatement = teko::list::empty()   // the loose top-level statements (the virtual-main), for label validation
+    mut cur = c.env                                    // threaded virtual-main scope: each loose binding extends it for the next statement (mirrors typer.c's `cur`)
     mut i = 0
     loop {
         if i >= program.items.len { break }
@@ -1293,12 +1392,15 @@ pub fn type_program(program: parser::Program) -> TProgram | error {
         // surface_at. The error value now carries those adornments per the E2 contract.
         match it.content {
             parser::Statement as s => {
-                let ts = match type_statement(s, ienv, c.types) {
+                // type with the THREADED scope `cur` (not the base env) so a loose `let args = …`
+                // is visible to the following statements; advance `cur` to the binding's env.
+                let ts = match type_statement(s, cur, c.types) {
                     TypedStmt as x => x
                     error as e => return surface_at(it.file, line, col, e)
                 }
                 items = teko::list::push(items, ts.node)
                 mainbody = teko::list::push(mainbody, ts.node)
+                cur = ts.env
             }
             _ => {
                 let ti = match type_item(it, ienv, c.types) {

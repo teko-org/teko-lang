@@ -20,14 +20,102 @@
 // (the C23 seed's diag_file helper does exactly this "path:msg" prefix).
 
 use teko::parser
+use teko::lexer
 
+// Is this file the project ENTRY point? (basename == "main.tks".) Mirrors assemble.c::
+// is_main_file: a bare "main.tks", or one preceded by a path separator — so "domain.tks"
+// (which also ENDS with "main.tks") is NOT mistaken for the entry (it lives at the root).
+fn asm_is_main(path: str) -> bool {
+    if !teko::str::ends_with(path, "main.tks") { return false }
+    if path.len == 8 { return true }
+    path[path.len - 9] == b'/'
+}
+
+// reconcile a parsed MainFile into a flat item list (uses → UseDecl items; body statements →
+// Statement items). namespace/file are stamped by the caller (assemble). Mirrors driver.tks's
+// main_file_to_program, kept local to this step (M.5 — DRY consolidation is a later sweep).
+fn asm_main_items(mf: parser::MainFile) -> []parser::Item {
+    mut items: []parser::Item = teko::list::empty()
+    mut ui: u64 = 0
+    loop {
+        if ui >= mf.uses.len { break }
+        items = teko::list::push(items, parser::Item { content = mf.uses[ui]; namespace = ""; file = "" })
+        ui = ui + 1
+    }
+    mut si: u64 = 0
+    loop {
+        if si >= mf.body.len { break }
+        items = teko::list::push(items, parser::Item { content = mf.body[si]; namespace = ""; file = "" })
+        si = si + 1
+    }
+    items
+}
+
+// reconcile a parsed Module into a flat item list (uses → UseDecl; decls → Function/TypeDecl).
+fn asm_module_items(m: parser::Module) -> []parser::Item {
+    mut items: []parser::Item = teko::list::empty()
+    mut ui: u64 = 0
+    loop {
+        if ui >= m.uses.len { break }
+        items = teko::list::push(items, parser::Item { content = m.uses[ui]; namespace = ""; file = "" })
+        ui = ui + 1
+    }
+    mut di: u64 = 0
+    loop {
+        if di >= m.decls.len { break }
+        items = match m.decls[di] {
+            parser::Function as f => teko::list::push(items, parser::Item { content = f; namespace = ""; file = "" })
+            parser::TypeDecl as t => teko::list::push(items, parser::Item { content = t; namespace = ""; file = "" })
+        }
+        di = di + 1
+    }
+    items
+}
+
+// parse + reconcile ONE file's tokens to its item list (entry → main-file parser; else module).
+fn asm_parse(path: str, tokens: []lexer::Token) -> []parser::Item | error {
+    if asm_is_main(path) {
+        let mf = match parser::parse_main_file(tokens, 0) { parser::ParsedMainFile as x => x.node; error as e => return e }
+        asm_main_items(mf)
+    } else {
+        let m = match parser::parse_module(tokens, 0) { parser::ParsedModule as x => x.node; error as e => return e }
+        asm_module_items(m)
+    }
+}
+
+// .tks mirror of assemble.c::tk_assemble — read → lex → parse → reconcile → MERGE every file's
+// items into ONE program (M.1 — the whole program is seen before it is resolved). A `.tkt` test
+// is NOT production source (it carries `#test` attributes the module grammar rejects) — skip it.
+// Every merged item is re-stamped with its SourceFile's namespace (codegen provenance) AND file
+// path (W-loc-2 — the checker's file:line:col diagnostics). Per-file lex/parse errors are
+// prefixed with the file path → "path:line:col: text".
 fn assemble(files: []SourceFile) -> parser::Program | error {
-    // (the algorithm lives in the C23 seed — assemble.c, which drives read → lex →
-    //  parse → reconcile → merge over the discovered file set, prefixing each per-file
-    //  lex/parse error with `$"{sf.path}:{inner.message}"`. On merge, every Item is
-    //  stamped with its SourceFile's `namespace` AND its `file` path (`it.namespace =
-    //  sf.namespace`, `it.file = sf.path` — W-loc-2: the file tag feeds the checker's
-    //  file:line:col diagnostics). This is the canonical signature + flow the Teko
-    //  toolchain will compile; M.4 — wired incrementally.)
-    error { message = "assemble: materialized in the C23 seed (assemble.c)" }
+    mut merged: []parser::Item = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= files.len { break }
+        let sf = files[i]
+        if teko::str::ends_with(sf.path, ".tkt") {
+            // a test file — never assembled into the program (it runs on the VM in crumb D2).
+        } else {
+            let src = match teko::io::read_file(sf.path) { str as s => s; error as e => return e }
+            let tokens = match lexer::tokenize(src) {
+                []lexer::Token as t => t
+                error as e          => return error { message = teko::str::concat3(sf.path, ":", e.message) }
+            }
+            let one = match asm_parse(sf.path, tokens) {
+                []parser::Item as items => items
+                error as e              => return error { message = teko::str::concat3(sf.path, ":", e.message) }
+            }
+            // merge, stamping every item with this file's namespace + path (A3 provenance + W-loc-2).
+            mut k: u64 = 0
+            loop {
+                if k >= one.len { break }
+                merged = teko::list::push(merged, parser::Item { content = one[k].content; namespace = sf.namespace; file = sf.path })
+                k = k + 1
+            }
+        }
+        i = i + 1
+    }
+    parser::Program { items = merged }
 }

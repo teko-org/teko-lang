@@ -26,8 +26,133 @@ pub type Manifest = struct {
 //   * keys under [aliases]           → aliases
 //   * arrays     `key = ["a", "b"]`  → recognized (a value form)
 // Missing required fields (name, source) or malformed lines → error.
+// --- line/byte cursor helpers (zero-copy views into the source bytes) --------
+
+// the byte at p, or 0 past the end (a safe peek, like the lexer's `at`).
+fn mf_at(s: str, p: u64) -> byte {
+    if p >= s.len { return 0 }
+    s[p]
+}
+
+fn mf_is_space(c: byte) -> bool { c == b' ' || c == b'\t' || c == b'\r' }
+
+// advance past spaces/tabs/CR (NOT newlines — a line is the unit of work).
+fn mf_skip_spaces(s: str, p: u64) -> u64 {
+    mut q = p
+    loop {
+        if q >= s.len { break }
+        if !mf_is_space(s[q]) { break }
+        q = q + 1
+    }
+    q
+}
+
+// a key byte: letters, digits, `_`, `-`, `.` (TOML bare-key set + `.` for dotted deps).
+fn mf_is_key_byte(c: byte) -> bool {
+    (c >= b'a' && c <= b'z') || (c >= b'A' && c <= b'Z') || (c >= b'0' && c <= b'9') ||
+        c == b'_' || c == b'-' || c == b'.'
+}
+
+// the position just past the bare key at p (== p if none).
+fn mf_key_end(s: str, p: u64) -> u64 {
+    mut q = p
+    loop {
+        if q >= s.len { break }
+        if !mf_is_key_byte(s[q]) { break }
+        q = q + 1
+    }
+    q
+}
+
+// a `"…"` quoted scalar: the bytes between the quotes (escapes NOT interpreted — M.5)
+// plus the position just past the closing quote.
+type MfQuoted = struct { text: str; next: u64 }
+fn mf_read_quoted(s: str, p: u64) -> MfQuoted | error {
+    if mf_at(s, p) != b'"' { return error { message = "expected a quoted string value" } }
+    let start = p + 1
+    mut q = start
+    loop {
+        if q >= s.len { break }
+        if s[q] == b'"' { break }
+        q = q + 1
+    }
+    if q >= s.len { return error { message = "unterminated string value" } }
+    MfQuoted { text = teko::str::slice(s, start, q); next = q + 1 }
+}
+
+// .tks mirror of manifest.c::tk_parse_manifest — the minimal TOML subset, one line at a
+// time; every malformed line is an honest error (M.3 — no coercion). `section` is tracked
+// as a tag string ("root"/"artifact"/"deps"/"aliases"/"other").
 fn parse_manifest(src: str) -> Manifest | error {
-    // (the algorithm lives in the C23 seed — manifest.c. This is the canonical
-    //  signature + type the Teko toolchain will compile; M.4 — wired incrementally.)
-    error { message = "parse_manifest: materialized in the C23 seed (manifest.c)" }
+    mut name = ""
+    mut source = ""
+    mut artifact = Artifact::Library          // default until `[artifact] kind = "binary"`
+    mut deps: []str = teko::list::empty()
+    mut aliases: []str = teko::list::empty()
+    mut have_name = false
+    mut have_source = false
+    mut sec = "root"
+
+    mut p: u64 = 0
+    loop {
+        if p >= src.len { break }
+        // slice the current line [p, eol); leave p past the newline for the next turn.
+        mut eol = p
+        loop {
+            if eol >= src.len { break }
+            if src[eol] == b'\n' { break }
+            eol = eol + 1
+        }
+        let line = teko::str::slice(src, p, eol)
+        if eol < src.len { p = eol + 1 } else { p = eol }
+
+        let i = mf_skip_spaces(line, 0)
+        let c = mf_at(line, i)
+
+        if c == 0 || c == b'#' {
+            // blank or comment line — skip
+        } else if c == b'[' {
+            // a table header `[name]`
+            let ke = mf_key_end(line, i + 1)
+            let nm = teko::str::slice(line, i + 1, ke)
+            let j = mf_skip_spaces(line, ke)
+            if mf_at(line, j) != b']' { return error { message = "malformed table header (expected ']')" } }
+            if nm == "artifact"          { sec = "artifact" }
+            else if nm == "dependencies" { sec = "deps" }
+            else if nm == "aliases"      { sec = "aliases" }
+            else                         { sec = "other" }
+        } else {
+            // a `key = value` pair
+            let ke = mf_key_end(line, i)
+            if ke == i { return error { message = "malformed line (expected a key or '[table]')" } }
+            let key = teko::str::slice(line, i, ke)
+            let eq = mf_skip_spaces(line, ke)
+            if mf_at(line, eq) != b'=' { return error { message = "malformed key/value (expected '=')" } }
+            let v = mf_skip_spaces(line, eq + 1)
+
+            if sec == "root" {
+                // name / source are top-level quoted strings.
+                let q = match mf_read_quoted(line, v) { MfQuoted as x => x; error as e => return e }
+                if key == "name"        { name = q.text; have_name = true }
+                else if key == "source" { source = q.text; have_source = true }
+                // unknown top-level keys are ignored (forward-compatible — M.5).
+            } else if sec == "artifact" {
+                // `kind = "binary"` → Executable; anything else → Library.
+                if key == "kind" {
+                    let q = match mf_read_quoted(line, v) { MfQuoted as x => x; error as e => return e }
+                    if q.text == "binary" { artifact = Artifact::Executable } else { artifact = Artifact::Library }
+                }
+            } else if sec == "deps" {
+                deps = teko::list::push(deps, key)
+            } else if sec == "aliases" {
+                aliases = teko::list::push(aliases, key)
+            }
+            // "other" → keys ignored (M.5)
+        }
+    }
+
+    if !have_name   { return error { message = "manifest missing required field 'name'" } }
+    if !have_source { return error { message = "manifest missing required field 'source'" } }
+
+    Manifest { name = name; artifact = artifact; source = source; deps = deps; aliases = aliases }
 }

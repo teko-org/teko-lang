@@ -83,8 +83,10 @@ fn check_pattern(p: parser::Pattern, subject: Type, env: Env, table: TypeTable) 
             define(env, bp.binding, ct, false)     // `Type as name` → name : the case type (match-binding immutable — B.21)
         }
         parser::LiteralPattern as lp => {
-            let lt = match type_expr(lp.value, env, table) { TExpr as te => te.type; error as e => return e }
-            if !type_eq(lt, subject) { return error { message = "literal pattern does not match the subject type" } }
+            // a numeric literal pattern adopts the subject's numeric type, so `match b { 0xE0 => … }`
+            // matches a `byte` subject (byte = u8) — parity with value-position literal adoption.
+            let lt = match type_expr(lp.value, env, table) { TExpr as te => te; error as e => return e }
+            if !type_eq(lt.type, subject) && !literal_adopts(lt, subject) { return error { message = "literal pattern does not match the subject type" } }
             env
         }
         parser::FieldPattern as fp => {
@@ -113,12 +115,16 @@ fn check_pattern(p: parser::Pattern, subject: Type, env: Env, table: TypeTable) 
             e2
         }
         parser::RangePattern as rp => {
-            // C7a: `lo ..= hi` — both bounds type_eq the subject, AND the subject is an integer (M.1/M.2).
-            let lo = match type_expr(rp.lo, env, table) { TExpr as te => te.type; error as e => return e }
-            let hi = match type_expr(rp.hi, env, table) { TExpr as te => te.type; error as e => return e }
-            if !type_eq(lo, subject) { return error { message = "range lower bound does not match the subject type" } }
-            if !type_eq(hi, subject) { return error { message = "range upper bound does not match the subject type" } }
-            if !is_integer(subject) { return error { message = "range pattern requires an integer subject (B.38 — not a float)" } }
+            // C7a: `lo ..= hi` — each bound type_eq's the subject OR is a fitting literal that adopts
+            // it (so `0x80 ..= 0xBF` over a `byte` subject is fine), AND the subject is an integer
+            // (M.1/M.2). Mirrors match.c's `!type_eq && !literal_adopts` bound check.
+            let lo = match type_expr(rp.lo, env, table) { TExpr as te => te; error as e => return e }
+            let hi = match type_expr(rp.hi, env, table) { TExpr as te => te; error as e => return e }
+            if !type_eq(lo.type, subject) && !literal_adopts(lo, subject) { return error { message = "range lower bound does not match the subject type" } }
+            if !type_eq(hi.type, subject) && !literal_adopts(hi, subject) { return error { message = "range upper bound does not match the subject type" } }
+            // an integer subject — an int prim OR `byte` (= u8); a float range is rejected (B.38).
+            let int_subject = match subject { Byte => true; _ => is_integer(subject) }
+            if !int_subject { return error { message = "range pattern requires an integer subject (B.38 — not a float)" } }
             env       // binds nothing
         }
         parser::AltPattern as ap => {

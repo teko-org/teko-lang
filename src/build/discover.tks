@@ -23,9 +23,61 @@ pub type SourceFile = struct {
 //   src/core.tks           → teko          (bare root)
 // (main.tks lives at the PROJECT root, NOT under source — out of scope; discover
 //  walks only `source`.)
+// does `name` end with `.tks` or `.tkt`? (the Teko source/test extensions.)
+fn dsc_is_teko_source(name: str) -> bool {
+    teko::str::ends_with(name, ".tks") || teko::str::ends_with(name, ".tkt")
+}
+
+// append every element of `b` onto `a` (slices are fixed; grow by copy — collections #2).
+fn dsc_append(a: []SourceFile, b: []SourceFile) -> []SourceFile {
+    mut out = a
+    mut i: u64 = 0
+    loop {
+        if i >= b.len { break }
+        out = teko::list::push(out, b[i])
+        i = i + 1
+    }
+    out
+}
+
+// the recursive walk (mirrors discover.c::walk). `dir` is the directory on disk; `ns` is the
+// namespace for files DIRECTLY in it (the source root already stripped). An entry is CLASSIFIED
+// by trying to list it: list_dir succeeds on a directory (→ recurse with ns + "::" + name),
+// fails on a regular file (→ collect a .tks/.tkt under THIS namespace). This mirrors the C
+// seed's opendir-to-classify (no d_type — M.1, one contained host edge: teko::fs::list_dir).
+fn dsc_walk(dir: str, ns: str) -> []SourceFile | error {
+    let entries = match teko::fs::list_dir(dir) {
+        []str as e => e
+        error      => return error { message = teko::str::concat("discover: cannot open source directory: ", dir) }
+    }
+    mut out: []SourceFile = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= entries.len { break }
+        let nm = entries[i]
+        let child = teko::str::concat3(dir, "/", nm)        // child path on disk
+        match teko::fs::list_dir(child) {
+            []str as _ => {
+                // a directory → recurse with the extended namespace ns + "::" + name.
+                let cns = teko::str::concat3(ns, "::", nm)
+                let sub = match dsc_walk(child, cns) { []SourceFile as s => s; error as e => return e }
+                out = dsc_append(out, sub)
+            }
+            error => {
+                // a regular file → keep only .tks/.tkt, mapped to THIS dir's namespace.
+                if dsc_is_teko_source(nm) {
+                    out = teko::list::push(out, SourceFile { path = child; namespace = ns })
+                }
+            }
+        }
+        i = i + 1
+    }
+    out
+}
+
+// discover — seed the walk at `source` with the bare root `name`, so files directly under
+// `source` get the bare root namespace and the source root is invisible (never a segment).
+// (.tks mirror of discover.c::tk_discover.)
 fn discover(name: str, source: str) -> []SourceFile | error {
-    // (the algorithm lives in the C23 seed — discover.c, which walks the host
-    //  filesystem via <dirent.h>. This is the canonical signature + types the Teko
-    //  toolchain will compile; M.4 — wired incrementally.)
-    error { message = "discover: materialized in the C23 seed (discover.c)" }
+    dsc_walk(source, name)
 }
