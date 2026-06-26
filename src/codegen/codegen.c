@@ -2347,7 +2347,13 @@ static bool emit_arm_value(cbuf *b, const tk_texpr *match_e, const tk_tstatement
     if (last->tag != TK_TSTMT_EXPR)
         return fail_node(err, "codegen: non-value trailing statement in a match arm used as a value");
     cb(b, commit_indent); cb(b, sink); cb(b, " = (");
-    if (!emit_as(b, match_e->type, &last->as.expr_stmt.expr, err)) return false;
+    // A trailing diverging expr (`=> panic(…)` / `exit(…)` — _Noreturn void, not a `return`) can't
+    // be assigned to the sink. Emit it as `(panic(…), (T){0})`: the call diverges, the zero-of-T
+    // makes the assignment type-check (unreachable). Mirrors the `??` diverging-fallback lowering.
+    if (cg_expr_diverges(&last->as.expr_stmt.expr)) {
+        if (!emit_expr(b, &last->as.expr_stmt.expr, err)) return false;
+        cb(b, ", ("); if (!emit_type(b, match_e->type, err)) return false; cb(b, "){0}");   // sink's `( … )` closes it
+    } else if (!emit_as(b, match_e->type, &last->as.expr_stmt.expr, err)) return false;
     cb(b, "); break;\n");
     return true;
 }

@@ -2713,7 +2713,17 @@ fn emit_arm_value(buf: []byte, prog: checker::TProgram, ret_type: checker::Type,
             out = cb(out, ci)
             out = cb(out, sink)
             out = cb(out, " = (")
-            out = match emit_as(out, prog, match_e.type, es.expr) { []byte as o => o; error as err => return err }
+            // A trailing diverging expr (`=> panic(…)` / `exit(…)` — _Noreturn void, not a `return`)
+            // can't be assigned to the sink. Emit `(panic(…), (T){0})`: the call diverges, the
+            // zero-of-T makes the assignment type-check (unreachable). Mirrors the `??` fallback.
+            if cg_expr_diverges(es.expr) {
+                out = match emit_expr(out, prog, es.expr) { []byte as o => o; error as err => return err }
+                out = cb(out, ", (")
+                out = match emit_type(out, match_e.type) { []byte as o => o; error as err => return err }
+                out = cb(out, "){0}")             // sink's `( … )` closes it
+            } else {
+                out = match emit_as(out, prog, match_e.type, es.expr) { []byte as o => o; error as err => return err }
+            }
             cb(out, "); break;\n")
         }
         _ => error { message = "codegen: non-value trailing statement in a match arm used as a value" }
