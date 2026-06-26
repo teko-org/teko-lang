@@ -1589,14 +1589,32 @@ fn emit_struct_init(buf: []byte, prog: checker::TProgram, e: checker::TExpr, si:
             _ => false
         }
         if !emitted {
-            // A NAMED field WRAPS a bare case value into its variant rep (emit_as): build the expected
-            // resolved type from the field's NAMED type-expr (its last path segment); emit_as passes a
-            // non-variant named (struct/enum/alias) through. Other field types keep the plain emit.
-            let named_field = match fte_opt { parser::TypeExpr as fte => match fte { parser::NamedType as nt => nt.path.segments[nt.path.segments.len - 1].name; _ => "" }; null => "" }
-            if named_field.len != 0 {
-                out = match emit_as(out, prog, checker::Named { name = named_field }, fv) { []byte as o => o; error as err => return err }
-            } else {
-                out = match emit_expr(out, prog, fv) { []byte as o => o; error as err => return err }
+            // Build the expected resolved type from the field's type-expr and route through emit_as so a
+            // bare case value WRAPS into a variant field (`.kind = <wrap>`), and a `[]case` slice REBUILDS
+            // into a `[]variant` field (covariant). emit_as passes a non-variant slot (struct/enum/alias,
+            // matching slice) straight through.
+            //   * NAMED field          → expected = Named{last segment}
+            //   * SLICE-of-user-named  → expected = Slice{element = Named{elem last segment}} (NOT a prim)
+            // Other field shapes keep the plain emit.
+            // `Void` is the "no expected slot" sentinel (mirrors the C `tk_type exp = {.tag = VOID}`):
+            // emit plainly when nothing was built.
+            let exp_t = match fte_opt {
+                parser::TypeExpr as fte => match fte {
+                    parser::NamedType as nt => checker::Named { name = nt.path.segments[nt.path.segments.len - 1].name }
+                    parser::SliceType as st => match st.element {
+                        parser::NamedType as ent => {
+                            let elem = ent.path.segments[ent.path.segments.len - 1].name
+                            if cg_is_prim_name(elem) { checker::Void { } } else { checker::Slice { element = checker::Named { name = elem } } }
+                        }
+                        _ => checker::Void { }
+                    }
+                    _ => checker::Void { }
+                }
+                null => checker::Void { }
+            }
+            match exp_t {
+                checker::Void => { out = match emit_expr(out, prog, fv) { []byte as o => o; error as err => return err } }
+                _ => { out = match emit_as(out, prog, exp_t, fv) { []byte as o => o; error as err => return err } }
             }
         }
         if boxed { out = cb(out, "; "); out = cb(out, bxN); out = cb(out, "; })") }
@@ -1883,6 +1901,53 @@ fn emit_variant_wrap(buf: []byte, prog: checker::TProgram, expected: checker::Ty
     error { message = "codegen: emit_variant_wrap on an unreachable case (internal — caller must guard with cg_var_reaches)" }
 }
 
+// emit_variant_wrap_str — like emit_variant_wrap but wraps a C-EXPRESSION STRING `cexpr` of
+// resolved type `vtype` (the []U→[]T element-wise slice rebuild wraps each element, a C lvalue,
+// not an AST node). IDENTICAL pass-1-direct / pass-2-transitive structure; where emit_variant_wrap
+// emits the value AST node, this emits the literal string `cexpr`. PRECONDITION: vtype's key is
+// reachable in `expected` (caller guards with cg_var_reaches, otherwise emits the bare element —
+// `T? | error` is illegal here, so reachability is a separate predicate). (C: `emit_variant_wrap_str`.)
+fn emit_variant_wrap_str(buf: []byte, prog: checker::TProgram, expected: checker::Type, vtype: checker::Type, cexpr: str) -> []byte | error {
+    let vkey = match cg_member_key_str(vtype) { str as s => s; error => "" }
+    let n = cg_var_nmem(prog, expected)
+    // pass 1 — DIRECT: vtype's key matches a member of `expected`.
+    mut i = 0
+    loop {
+        if i >= n { break }
+        let mk = match cg_var_mkey(prog, expected, i) { str as s => s; error => "" }
+        if mk == vkey {
+            mut out = match cg_wrap_open(buf, expected, vkey) { []byte as o => o; error as err => return err }
+            out = cb(out, cexpr)
+            return cb(out, " }")
+        }
+        i++
+    }
+    // pass 2 — TRANSITIVE: route through a member variant that reaches vkey.
+    mut j = 0
+    loop {
+        if j >= n { break }
+        let mt = cg_var_mtype(prog, expected, j)
+        if cg_is_variant_type(prog, mt) {
+            if cg_var_reaches(prog, mt, vkey, 16) {
+                let mk = match cg_var_mkey(prog, expected, j) { str as s => s; error => "" }
+                mut out = match cg_wrap_open(buf, expected, mk) { []byte as o => o; error as err => return err }
+                out = match emit_variant_wrap_str(out, prog, mt, vtype, cexpr) { []byte as o => o; error as err => return err }   // recurse into the member variant
+                return cb(out, " }")
+            }
+        }
+        j++
+    }
+    // unreachable given the caller's cg_var_reaches guard.
+    error { message = "codegen: emit_variant_wrap_str on an unreachable case (internal — caller must guard with cg_var_reaches)" }
+}
+
+// cg_type_mangle_eq — do two resolved types mangle to the SAME generated C type name (→ same
+// C struct/typedef)? Renders both via the optional-mangle to scratch strings and compares.
+// (C: `cg_type_mangle_eq`.)
+fn cg_type_mangle_eq(a: checker::Type, c: checker::Type) -> bool {
+    cg_opt_key(a) == cg_opt_key(c)
+}
+
 // emit_as — emit `value` into a slot whose EXPECTED type is `expected`. When `expected` is
 // a (named) variant and `value`'s type is one of its case members, WRAP the value into the
 // variant's `tag + union` representation:
@@ -1939,6 +2004,59 @@ fn emit_as(buf: []byte, prog: checker::TProgram, expected: checker::Type, value:
                         mut so = cb(buf, "(")
                         so = match cg_slice_typename(so, sexp.element) { []byte as o => o; error as err => return err }
                         return cb(so, "){ .ptr = 0, .len = 0 }")
+                    }
+                    // COVARIANT `[]U` → `[]T` (e.g. `push(empty(), Prim)` = []Prim flowing into a []Type
+                    // slot): tk_slice_U and tk_slice_T are DISTINCT C structs, so REBUILD element-wise,
+                    // wrapping each U into T (the same case→variant wrap emit_variant_wrap_str does, on
+                    // each C element lvalue). A same-mangle element passes straight through.
+                    let concrete_diff = match value.type {
+                        checker::Slice as svt => match svt.element {
+                            checker::Void => false   // sentinel handled above
+                            _ => !cg_type_mangle_eq(sexp.element, svt.element)
+                        }
+                        _ => false
+                    }
+                    if concrete_diff {
+                        let elemU = match value.type { checker::Slice as svt => svt.element; _ => checker::Void { } }
+                        let T = sexp.element
+                        let U = elemU
+                        // unique temp names from the buffer length (the functional uniquifier).
+                        let baseN = buf.len to i64
+                        let sv = fresh_named("_cv", baseN)
+                        let rp = fresh_named("_cp", baseN + 1)
+                        let ri = fresh_named("_ci", baseN + 2)
+                        mut o = cb(buf, "({ ")
+                        o = match cg_slice_typename(o, U) { []byte as r => r; error as err => return err }
+                        o = cb(o, " "); o = cb(o, sv); o = cb(o, " = ")
+                        o = match emit_expr(o, prog, value) { []byte as r => r; error as err => return err }
+                        o = cb(o, "; ")
+                        o = match emit_type(o, T) { []byte as r => r; error as err => return err }
+                        o = cb(o, " *"); o = cb(o, rp); o = cb(o, " = (")
+                        o = match emit_type(o, T) { []byte as r => r; error as err => return err }
+                        o = cb(o, " *)malloc("); o = cb(o, sv); o = cb(o, ".len * sizeof(")
+                        o = match emit_type(o, T) { []byte as r => r; error as err => return err }
+                        o = cb(o, ")); if ("); o = cb(o, rp); o = cb(o, " == 0 && "); o = cb(o, sv); o = cb(o, ".len) abort(); ")
+                        o = cb(o, "for (uint64_t "); o = cb(o, ri); o = cb(o, " = 0; "); o = cb(o, ri); o = cb(o, " < "); o = cb(o, sv); o = cb(o, ".len; "); o = cb(o, ri); o = cb(o, " += 1) { ")
+                        o = cb(o, rp); o = cb(o, "["); o = cb(o, ri); o = cb(o, "] = ")
+                        let elem = teko::str::concat(sv, teko::str::concat(".ptr[", teko::str::concat(ri, "]")))
+                        // guard exactly as emit_variant_wrap's callers do: wrap only when U's key is
+                        // reachable in the T variant; otherwise emit the bare element (`T? | error` is
+                        // illegal, so reachability is a separate predicate — mirrors the C `*err` check).
+                        let ukey = match cg_member_key_str(U) { str as s => s; error => "" }
+                        let wrappable = match T {
+                            checker::Variant => ukey != "" && cg_var_reaches(prog, T, ukey, 16)
+                            checker::Named => ukey != "" && cg_var_reaches(prog, T, ukey, 16)
+                            _ => false
+                        }
+                        if wrappable {
+                            o = match emit_variant_wrap_str(o, prog, T, U, elem) { []byte as r => r; error as err => return err }
+                        } else {
+                            o = cb(o, elem)   // not wrapped — bare element
+                        }
+                        o = cb(o, "; } (")
+                        o = match cg_slice_typename(o, T) { []byte as r => r; error as err => return err }
+                        o = cb(o, "){ .ptr = "); o = cb(o, rp); o = cb(o, ", .len = "); o = cb(o, sv); o = cb(o, ".len }; })")
+                        return o
                     }
                     return emit_expr(buf, prog, value)
                 }

@@ -1422,14 +1422,23 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
                     }
                 }
                 if (!emitted) {
-                    // A NAMED field WRAPS a bare case value into its variant rep (emit_as): `.kind =
-                    // <TExprKind-wrap of TNumber>`. Build the expected resolved type from the field's
-                    // NAMED type-expr; emit_as passes a non-variant named (struct/enum/alias) through.
+                    // Build the expected resolved type from the field's type-expr and route through
+                    // emit_as so a bare case value WRAPS into a variant field (`.kind = <wrap>`), and
+                    // a `[]case` slice REBUILDS into a `[]variant` field (covariant). emit_as passes a
+                    // non-variant slot (struct/enum/alias, matching slice) straight through.
+                    tk_type exp = { .tag = TK_TYPE_VOID }; tk_type elemT;
                     if (have_fte && fte.tag == TK_TEXPR_NAMED) {
                         tk_str fn = fte.as.named.path.segments[fte.as.named.path.len - 1].name;
-                        tk_type exp = { .tag = TK_TYPE_NAMED, .as.named.name = fn };
-                        if (!emit_as(b, exp, fv, err)) return false;
-                    } else if (!emit_expr(b, fv, err)) return false;
+                        exp = (tk_type){ .tag = TK_TYPE_NAMED, .as.named.name = fn };
+                    } else if (have_fte && fte.tag == TK_TEXPR_SLICE
+                               && fte.as.slice.element->tag == TK_TEXPR_NAMED
+                               && !cg_is_prim_name(fte.as.slice.element->as.named.path.segments[fte.as.slice.element->as.named.path.len - 1].name)) {
+                        tk_path ep = fte.as.slice.element->as.named.path;
+                        elemT = (tk_type){ .tag = TK_TYPE_NAMED, .as.named.name = ep.segments[ep.len - 1].name };
+                        exp = (tk_type){ .tag = TK_TYPE_SLICE, .as.slice.element = &elemT };
+                    }
+                    if (exp.tag != TK_TYPE_VOID) { if (!emit_as(b, exp, fv, err)) return false; }
+                    else if (!emit_expr(b, fv, err)) return false;
                 }
                 if (boxed) { cb(b, "; _bx"); cb_i64(b, (int64_t)bxid); cb(b, "; })"); }
             }
@@ -1689,6 +1698,44 @@ static bool emit_variant_wrap(cbuf *b, tk_type expected, const tk_texpr *value, 
     return false;
 }
 
+// Like emit_variant_wrap but wraps a C-EXPRESSION STRING `cexpr` of resolved type `vtype` (the
+// []U→[]T element-wise slice rebuild wraps each element, a C lvalue, not an AST node).
+static bool emit_variant_wrap_str(cbuf *b, tk_type expected, tk_type vtype, const char *cexpr, const char **err) {
+    cbuf vkey = { NULL, 0, 0 }; const char *ke = NULL;
+    if (!cg_member_key(&vkey, vtype, &ke)) { tk_free0(vkey.ptr); return false; }
+    size_t n = cg_var_nmem(expected);
+    for (size_t i = 0; i < n; i += 1) {   // DIRECT member match
+        cbuf mk = { NULL, 0, 0 }; const char *e = NULL;
+        if (!cg_var_mkey(expected, i, &mk, &e)) { tk_free0(mk.ptr); continue; }
+        bool same = mk.len == vkey.len && (vkey.len == 0 || memcmp(mk.ptr, vkey.ptr, vkey.len) == 0);
+        tk_free0(mk.ptr);
+        if (!same) continue;
+        bool ok = cg_wrap_open(b, expected, (tk_str){ (const tk_byte *)vkey.ptr, vkey.len }, err);
+        if (ok) { cb(b, cexpr); cb(b, " }"); }
+        tk_free0(vkey.ptr); return ok;
+    }
+    for (size_t i = 0; i < n; i += 1) {   // TRANSITIVE
+        tk_type mt = cg_var_mtype(expected, i);
+        if (!cg_is_variant_type(mt) || !cg_var_reaches(mt, (tk_str){ (const tk_byte *)vkey.ptr, vkey.len }, 16)) continue;
+        cbuf mk = { NULL, 0, 0 }; const char *e = NULL;
+        if (!cg_var_mkey(expected, i, &mk, &e)) { tk_free0(mk.ptr); continue; }
+        bool ok = cg_wrap_open(b, expected, (tk_str){ (const tk_byte *)mk.ptr, mk.len }, err);
+        tk_free0(mk.ptr);
+        if (ok) ok = emit_variant_wrap_str(b, mt, vtype, cexpr, err);
+        if (ok) cb(b, " }");
+        tk_free0(vkey.ptr); return ok;
+    }
+    tk_free0(vkey.ptr); return false;
+}
+// Do two types mangle to the SAME generated C type name (→ same C struct/typedef)?
+static bool cg_type_mangle_eq(tk_type a, tk_type c) {
+    cbuf ka = { NULL, 0, 0 }, kb = { NULL, 0, 0 }; const char *e = NULL;
+    bool oka = cg_opt_mangle(&ka, a, &e), okb = cg_opt_mangle(&kb, c, &e);
+    bool same = oka && okb && ka.len == kb.len && (ka.len == 0 || memcmp(ka.ptr, kb.ptr, ka.len) == 0);
+    tk_free0(ka.ptr); tk_free0(kb.ptr);
+    return same;
+}
+
 static bool emit_as(cbuf *b, tk_type expected, const tk_texpr *value, const char **err) {
     // OPTIONAL slot (REBOOT_PLAN §202): wrap the value into the slot's tk_opt_<inner> struct.
     //   * a bare `null`           → (tk_opt_<inner>){ .present = false }
@@ -1714,6 +1761,29 @@ static bool emit_as(cbuf *b, tk_type expected, const tk_texpr *value, const char
         if (value->type.tag == TK_TYPE_SLICE && value->type.as.slice.element == NULL) {
             cb(b, "("); if (!cg_slice_typename(b, *expected.as.slice.element, err)) return false;
             cb(b, "){ .ptr = 0, .len = 0 }");
+            return true;
+        }
+        // COVARIANT `[]U` → `[]T` (e.g. `push(empty(), Prim)` = []Prim flowing into a []Type slot):
+        // tk_slice_U and tk_slice_T are DISTINCT C structs, so REBUILD element-wise, wrapping each
+        // U into T (the same case→variant wrap emit_variant_wrap does, on each C element lvalue).
+        if (value->type.tag == TK_TYPE_SLICE && value->type.as.slice.element != NULL
+            && !cg_type_mangle_eq(*expected.as.slice.element, *value->type.as.slice.element)) {
+            tk_type T = *expected.as.slice.element, U = *value->type.as.slice.element;
+            char sv[40], rp[40], ri[40];
+            snprintf(sv, sizeof sv, "_cv%zu", (size_t)b->len);
+            snprintf(rp, sizeof rp, "_cp%zu", (size_t)b->len + 1);
+            snprintf(ri, sizeof ri, "_ci%zu", (size_t)b->len + 2);
+            cb(b, "({ "); if (!cg_slice_typename(b, U, err)) return false;
+            cb(b, " "); cb(b, sv); cb(b, " = "); if (!emit_expr(b, value, err)) return false; cb(b, "; ");
+            if (!emit_type(b, T, err)) return false; cb(b, " *"); cb(b, rp); cb(b, " = (");
+            if (!emit_type(b, T, err)) return false; cb(b, " *)malloc("); cb(b, sv); cb(b, ".len * sizeof(");
+            if (!emit_type(b, T, err)) return false; cb(b, ")); if ("); cb(b, rp); cb(b, " == 0 && "); cb(b, sv); cb(b, ".len) abort(); ");
+            cb(b, "for (uint64_t "); cb(b, ri); cb(b, " = 0; "); cb(b, ri); cb(b, " < "); cb(b, sv); cb(b, ".len; "); cb(b, ri); cb(b, " += 1) { ");
+            cb(b, rp); cb(b, "["); cb(b, ri); cb(b, "] = ");
+            char elem[96]; snprintf(elem, sizeof elem, "%s.ptr[%s]", sv, ri);
+            if (!emit_variant_wrap_str(b, T, U, elem, err)) { if (*err) return false; cb(b, elem); }
+            cb(b, "; } ("); if (!cg_slice_typename(b, T, err)) return false;
+            cb(b, "){ .ptr = "); cb(b, rp); cb(b, ", .len = "); cb(b, sv); cb(b, ".len }; })");
             return true;
         }
         return emit_expr(b, value, err);
