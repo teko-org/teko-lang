@@ -27,6 +27,8 @@ typedef struct {
     uint64_t    cov_lines;     // [coverage] lines     — the D4 LINE-coverage floor %     (default 80)
     uint64_t    cov_branches;  // [coverage] branches  — the D4 BRANCH-coverage floor %   (default 80)
     tk_strs     link_flags;    // [extern.libs] resolved cc link flags (C7.1e; `-l<name>` / paths / raw)
+    tk_strs     os_lib_os;     // [extern.libs.<os>] — the OS each DEFERRED per-OS flag belongs to (C7.1f)
+    tk_strs     os_lib_flag;   // [extern.libs.<os>] — the resolved flag (parallel to os_lib_os; link-time selected)
     tk_str      cc;            // [extern] cc — the C driver ("" = default `cc`) (C7.1f)
     tk_str      target;        // [extern] target — cross target triple for `-target` ("" = host)
     tk_str      sysroot;       // [extern] sysroot — `--sysroot` for cross builds ("" = none)

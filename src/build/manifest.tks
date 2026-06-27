@@ -21,6 +21,8 @@ pub type Manifest = struct {
     cov_lines:     u64      // [coverage] lines     — the D4 LINE-coverage floor %     (default 80)
     cov_branches:  u64      // [coverage] branches  — the D4 BRANCH-coverage floor %   (default 80)
     link_flags:    []str    // [extern.libs] resolved cc link flags (C7.1e; `-l<name>` / paths / raw flags)
+    os_lib_os:     []str    // [extern.libs.<os>] — the OS each DEFERRED per-OS flag belongs to (C7.1f)
+    os_lib_flag:   []str    // [extern.libs.<os>] — the resolved flag (parallel to os_lib_os; selected at link time)
     cc:            str       // [extern] cc — the C driver to invoke ("" = the default `cc`) (C7.1f)
     target:        str       // [extern] target — a cross target triple for `-target` ("" = host)
     sysroot:       str       // [extern] sysroot — `--sysroot` for cross builds ("" = none)
@@ -146,15 +148,6 @@ fn mf_has_path(s: str) -> bool {
 //   path / *.a/.so/… → verbatim direct file
 //   `static:`/`shared:` prefix → stripped (the linkage MODE is deferred — the Linux increment)
 //   bare name        → `-l<name>` (a leading `lib` stripped)
-// (C7.1f) the OS named by a `[extern] target` triple (substring), else the host `teko::os()`.
-// Used to SELECT `[extern.libs.<os>]` sections. `[extern]` must precede the per-OS sections.
-fn mf_derive_os(target: str) -> str {
-    if teko::str::contains(target, "linux") { return "linux" }
-    if teko::str::contains(target, "darwin") || teko::str::contains(target, "macos") || teko::str::contains(target, "apple") { return "macos" }
-    if teko::str::contains(target, "windows") || teko::str::contains(target, "mingw") || teko::str::contains(target, "w64") { return "windows" }
-    teko::os()
-}
-
 fn mf_extern_flag(s: str) -> str {
     if s.len > 0 && s[0] == b'-' { return s }
     if mf_has_path(s) { return s }
@@ -179,11 +172,12 @@ fn parse_manifest(src: str) -> Manifest | error {
     mut cov_lines: u64 = 80
     mut cov_branches: u64 = 80
     mut link_flags: []str = teko::list::empty()    // [extern.libs] resolved cc link flags (C7.1e)
+    mut os_lib_os: []str = teko::list::empty()      // [extern.libs.<os>] — deferred per-OS flags, keyed by OS (C7.1f)
+    mut os_lib_flag: []str = teko::list::empty()    // [extern.libs.<os>] — the resolved flag (parallel to os_lib_os)
     mut cc = ""                                    // [extern] scalars (C7.1f) — cross/driver knobs
     mut target = ""
     mut sysroot = ""
     mut freestanding = false
-    mut cur_os = teko::os()                         // C7.1f: target OS for [extern.libs.<os>] selection (host, or `[extern] target`)
     mut sec_os = ""                                 // the OS of the current `[extern.libs.<os>]` section
     mut have_name = false
     mut have_source = false
@@ -257,23 +251,30 @@ fn parse_manifest(src: str) -> Manifest | error {
                 // [extern] scalars (C7.1f): cc/target/sysroot are quoted strings; freestanding is a bool.
                 if key == "cc" || key == "target" || key == "sysroot" {
                     let q = match mf_read_quoted(line, v) { MfQuoted as x => x; error as e => return e }
-                    if key == "cc" { cc = q.text } else if key == "target" { target = q.text; cur_os = mf_derive_os(q.text) } else { sysroot = q.text }
+                    if key == "cc" { cc = q.text } else if key == "target" { target = q.text } else { sysroot = q.text }
                 } else if key == "freestanding" {
                     freestanding = mf_at(line, v) == b't'   // `true` → true, anything else → false
                 }
                 // `prefer` and other [extern] keys are ignored for now (static/shared mode deferred).
-            } else if sec == "extern.libs" || (sec == "extern.libs.os" && sec_os == cur_os) {
+            } else if sec == "extern.libs" || sec == "extern.libs.os" {
                 // `name = [ <spec…> ]` → resolved cc link flags. Empty `[]` → `-l<name>`; each element
                 // resolves via mf_extern_flag (bare → `-l`, path/`*.a` → file, `-flag` → verbatim).
-                // A `[extern.libs.<os>]` section contributes only when <os> matches the target OS (C7.1f).
+                // A global `[extern.libs]` flag links on every OS; a `[extern.libs.<os>]` flag is DEFERRED
+                // with its OS (os_lib_os/os_lib_flag) and selected at link time by target_os (C7.1f) — so
+                // parse stays host-independent (the VM never calls the host `os()`).
                 let arr = match mf_read_array(line, v) { MfArray as a => a; error as e => return e }
+                let is_os = sec == "extern.libs.os"
                 if arr.items.len == 0 {
-                    link_flags = teko::list::push(link_flags, mf_extern_flag(key))
+                    let f = mf_extern_flag(key)
+                    if is_os { os_lib_os = teko::list::push(os_lib_os, sec_os); os_lib_flag = teko::list::push(os_lib_flag, f) }
+                    else { link_flags = teko::list::push(link_flags, f) }
                 } else {
                     mut ai = 0
                     loop {
                         if ai >= arr.items.len { break }
-                        link_flags = teko::list::push(link_flags, mf_extern_flag(arr.items[ai]))
+                        let f = mf_extern_flag(arr.items[ai])
+                        if is_os { os_lib_os = teko::list::push(os_lib_os, sec_os); os_lib_flag = teko::list::push(os_lib_flag, f) }
+                        else { link_flags = teko::list::push(link_flags, f) }
                         ai = ai + 1
                     }
                 }
@@ -285,5 +286,5 @@ fn parse_manifest(src: str) -> Manifest | error {
     if !have_name   { return error { message = "manifest missing required field 'name'" } }
     if !have_source { return error { message = "manifest missing required field 'source'" } }
 
-    Manifest { name = name; artifact = artifact; source = source; deps = deps; aliases = aliases; version = version; suffix = suffix; cov_functions = cov_functions; cov_lines = cov_lines; cov_branches = cov_branches; link_flags = link_flags; cc = cc; target = target; sysroot = sysroot; freestanding = freestanding }
+    Manifest { name = name; artifact = artifact; source = source; deps = deps; aliases = aliases; version = version; suffix = suffix; cov_functions = cov_functions; cov_lines = cov_lines; cov_branches = cov_branches; link_flags = link_flags; os_lib_os = os_lib_os; os_lib_flag = os_lib_flag; cc = cc; target = target; sysroot = sysroot; freestanding = freestanding }
 }

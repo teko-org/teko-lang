@@ -199,6 +199,8 @@ static int fail_diag(tk_error e) {
 // =========================================================================
 
 static char *cstr_of(tk_str s);   // (defined below — used by run_cc for the [extern] cc/target/sysroot knobs)
+static tk_str target_os_of(tk_manifest m);   // (defined below — C7.1f: target OS for [extern.libs.<os>] selection)
+static bool   os_str_eq(tk_str a, tk_str b); // (defined below — os name equality)
 
 // Run the host C compiler over `cfile`, producing `binary`. Returns 0 on success.
 static int run_cc(const char *cfile, const char *binary, tk_manifest m) {
@@ -215,14 +217,23 @@ static int run_cc(const char *cfile, const char *binary, tk_manifest m) {
     const char *libm  = m.freestanding ? "" : " -lm";
     // C7.1e: the [extern.libs] RESOLVED link flags (`-l<name>` / paths / raw), already produced by
     // the manifest. Appended verbatim AFTER the sources so the linker resolves them (link order).
+    // C7.1f: the DEFERRED per-OS [extern.libs.<os>] flags — appended only when their OS matches the
+    // target (host, or `[extern] target`). Resolved HERE (native), so manifest parse stays host-independent.
+    tk_str tos = target_os_of(m);
     size_t libcap = 1;
     for (size_t i = 0; i < m.link_flags.len; i++) libcap += m.link_flags.ptr[i].len + 2;   // " " + flag
+    for (size_t i = 0; i < m.os_lib_flag.len; i++) if (os_str_eq(m.os_lib_os.ptr[i], tos)) libcap += m.os_lib_flag.ptr[i].len + 2;
     char *libflags = tk_alloc(libcap);
     libflags[0] = '\0';
     size_t lo = 0;
     for (size_t i = 0; i < m.link_flags.len; i++) {
         lo += (size_t)snprintf(libflags + lo, libcap - lo, " %.*s",
                                (int)m.link_flags.ptr[i].len, (const char *)m.link_flags.ptr[i].ptr);
+    }
+    for (size_t i = 0; i < m.os_lib_flag.len; i++) {
+        if (!os_str_eq(m.os_lib_os.ptr[i], tos)) continue;
+        lo += (size_t)snprintf(libflags + lo, libcap - lo, " %.*s",
+                               (int)m.os_lib_flag.ptr[i].len, (const char *)m.os_lib_flag.ptr[i].ptr);
     }
     size_t cap = strlen(cc) + strlen(xflags) + strlen(nostd) + strlen(libm) + strlen(cfile) + strlen(binary)
                + 2 * strlen(TK_RT_DIR) + 2 * strlen(TK_SRC_DIR) + strlen("/assert") + strlen("/teko_rt.c")

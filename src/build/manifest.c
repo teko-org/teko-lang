@@ -108,22 +108,6 @@ static tk_str extern_flag(tk_str s) {
     return (tk_str){ buf, n + 2 };
 }
 
-// (C7.1f) per-OS [extern.libs.<os>] selection: the OS named by a target triple (substring) else host.
-tk_str tk_rt_os(void);   // teko_rt.c — host OS (tk_str is from text.h)
-static bool ct_has(tk_str s, const char *lit) {
-    size_t m = strlen(lit);
-    if (s.len < m) return false;
-    for (size_t i = 0; i + m <= s.len; i += 1) if (memcmp(s.ptr + i, lit, m) == 0) return true;
-    return false;
-}
-static tk_str derive_os(tk_str target) {
-    if (ct_has(target, "linux"))  return (tk_str){ (const tk_byte *)"linux", 5 };
-    if (ct_has(target, "darwin") || ct_has(target, "macos") || ct_has(target, "apple")) return (tk_str){ (const tk_byte *)"macos", 5 };
-    if (ct_has(target, "windows") || ct_has(target, "mingw") || ct_has(target, "w64")) return (tk_str){ (const tk_byte *)"windows", 7 };
-    return tk_rt_os();
-}
-static bool os_eq(tk_str a, tk_str b) { return a.len == b.len && (a.len == 0 || memcmp(a.ptr, b.ptr, a.len) == 0); }
-
 tk_manifest_result tk_parse_manifest(tk_str src) {
     tk_manifest m = {
         .name     = (tk_str){ NULL, 0 },
@@ -137,6 +121,8 @@ tk_manifest_result tk_parse_manifest(tk_str src) {
         .cov_lines    = 80,
         .cov_branches = 80,
         .link_flags   = tk_strs_empty(),   // [extern.libs] resolved cc link flags (C7.1e)
+        .os_lib_os    = tk_strs_empty(),   // [extern.libs.<os>] — deferred per-OS flags, keyed by OS (C7.1f)
+        .os_lib_flag  = tk_strs_empty(),   // [extern.libs.<os>] — the resolved flag (parallel to os_lib_os)
         .cc           = (tk_str){ NULL, 0 },   // [extern] scalars (C7.1f) — cross/driver knobs
         .target       = (tk_str){ NULL, 0 },
         .sysroot      = (tk_str){ NULL, 0 },
@@ -144,7 +130,6 @@ tk_manifest_result tk_parse_manifest(tk_str src) {
     };
     bool have_name = false, have_source = false;
     section sec = SEC_ROOT;
-    tk_str cur_os = tk_rt_os();        // C7.1f: target OS for [extern.libs.<os>] selection (host, or `[extern] target`)
     tk_str sec_os = (tk_str){ NULL, 0 };   // the OS of the current `[extern.libs.<os>]` section
 
     size_t p = 0;
@@ -221,7 +206,7 @@ tk_manifest_result tk_parse_manifest(tk_str src) {
                 tk_str val; size_t ve;
                 if (!read_quoted(line, v, &val, &ve)) { tk_strs_free(m.deps); tk_strs_free(m.aliases); tk_strs_free(m.link_flags); return fail("expected a quoted string value"); }
                 if      (key_is(key, "cc"))     m.cc = val;
-                else if (key_is(key, "target")) { m.target = val; cur_os = derive_os(val); }
+                else if (key_is(key, "target")) m.target = val;
                 else                            m.sysroot = val;
             } else if (key_is(key, "freestanding")) {
                 m.freestanding = (at(line, v) == 't');   // `true` → true, else false
@@ -229,18 +214,26 @@ tk_manifest_result tk_parse_manifest(tk_str src) {
             break;
         }
         case SEC_EXTERN_LIBS_OS:
-            if (!os_eq(sec_os, cur_os)) break;   // C7.1f: a per-OS section contributes only on its OS
-            /* fallthrough — same resolution as the global [extern.libs] */
         case SEC_EXTERN_LIBS: {
             // `name = [ <spec…> ]` → resolved cc link flags. Empty `[]` → `-l<name>`; each element via
             // extern_flag (bare → `-l`, path/`*.a` → file, `-flag` → verbatim). Mirrors manifest.tks.
+            // A global [extern.libs] flag links on every OS; a [extern.libs.<os>] flag is DEFERRED with
+            // its OS (os_lib_os/os_lib_flag) and selected at link time by target_os (C7.1f).
+            bool is_os = (sec == SEC_EXTERN_LIBS_OS);
             if (at(line, v) != '[') { tk_strs_free(m.deps); tk_strs_free(m.aliases); tk_strs_free(m.link_flags); return fail("expected '[' for an [extern.libs] value (e.g. `z = []`)"); }
             size_t q = skip_spaces(line, v + 1);
-            if (at(line, q) == ']') { m.link_flags = tk_strs_push(m.link_flags, extern_flag(key)); break; }   // [] → -l<key>
+            if (at(line, q) == ']') {   // [] → -l<key>
+                tk_str f = extern_flag(key);
+                if (is_os) { m.os_lib_os = tk_strs_push(m.os_lib_os, sec_os); m.os_lib_flag = tk_strs_push(m.os_lib_flag, f); }
+                else m.link_flags = tk_strs_push(m.link_flags, f);
+                break;
+            }
             for (;;) {
                 tk_str val; size_t ve;
                 if (!read_quoted(line, q, &val, &ve)) { tk_strs_free(m.deps); tk_strs_free(m.aliases); tk_strs_free(m.link_flags); return fail("expected a quoted string in an [extern.libs] array"); }
-                m.link_flags = tk_strs_push(m.link_flags, extern_flag(val));
+                tk_str f = extern_flag(val);
+                if (is_os) { m.os_lib_os = tk_strs_push(m.os_lib_os, sec_os); m.os_lib_flag = tk_strs_push(m.os_lib_flag, f); }
+                else m.link_flags = tk_strs_push(m.link_flags, f);
                 q = skip_spaces(line, ve);
                 tk_byte ac = at(line, q);
                 if (ac == ']') break;

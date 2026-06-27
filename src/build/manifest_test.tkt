@@ -46,6 +46,56 @@ fn parses_deps_and_aliases() {
 }
 
 #test
+fn parses_metadata_and_coverage() {
+    // version / suffix (root keys), [coverage] integer floors, and an unknown section (ignored — M.5).
+    let src = "name = \"app\"\nsource = \"src\"\nversion = \"1.2.3.0\"\nsuffix = \"rc1\"\n[coverage]\nfunctions = 70\nlines = 60\nbranches = 55\n[whatever]\nignored = \"yes\"\n"
+    match parse_manifest(src) {
+        Manifest as m => {
+            teko::assert::is_true(m.version == "1.2.3.0")
+            teko::assert::is_true(m.suffix == "rc1")
+            teko::assert::is_true(m.cov_functions == 70)
+            teko::assert::is_true(m.cov_lines == 60)
+            teko::assert::is_true(m.cov_branches == 55)
+        }
+        error => teko::assert::is_true(false)
+    }
+}
+
+#test
+fn parses_extern_libs_and_per_os() {
+    // [extern] cc/target/sysroot/freestanding scalars; [extern.libs] links on every OS (link_flags);
+    // [extern.libs.<os>] is DEFERRED, keyed by OS (os_lib_os/os_lib_flag) and selected at link time —
+    // so parse stays host-independent (the VM never calls the host `os()`). (C7.1e/C7.1f)
+    let src = "name = \"app\"\nsource = \"src\"\n[extern]\ncc = \"clang\"\ntarget = \"x86_64-linux-gnu\"\nsysroot = \"/opt/sys\"\nfreestanding = true\n[extern.libs]\nz = []\nfw = [\"-framework\", \"Security\", \"static:foo\", \"shared:bar\", \"/usr/lib/libbaz.a\", \"libcurl\"]\n[extern.libs.linux]\ndl = []\n[extern.libs.macos]\nm = [\"libssl.so\"]\n"
+    match parse_manifest(src) {
+        Manifest as m => {
+            teko::assert::is_true(m.cc == "clang")
+            teko::assert::is_true(m.target == "x86_64-linux-gnu")
+            teko::assert::is_true(m.sysroot == "/opt/sys")
+            teko::assert::is_true(m.freestanding)
+            // global [extern.libs] → link_flags, in source order. Each element resolves via mf_extern_flag:
+            // `[]`→`-l<key>`, `-flag`→verbatim, bare→`-l`, `static:`/`shared:`→stripped, path/`*.a`→file.
+            teko::assert::is_true(m.link_flags.len == 7)
+            teko::assert::is_true(m.link_flags[0] == "-lz")
+            teko::assert::is_true(m.link_flags[1] == "-framework")
+            teko::assert::is_true(m.link_flags[2] == "-lSecurity")
+            teko::assert::is_true(m.link_flags[3] == "-lfoo")
+            teko::assert::is_true(m.link_flags[4] == "-lbar")
+            teko::assert::is_true(m.link_flags[5] == "/usr/lib/libbaz.a")
+            teko::assert::is_true(m.link_flags[6] == "-lcurl")
+            // per-OS [extern.libs.<os>] → deferred, in source order (NOT filtered by host at parse time).
+            teko::assert::is_true(m.os_lib_os.len == 2)
+            teko::assert::is_true(m.os_lib_flag.len == 2)
+            teko::assert::is_true(m.os_lib_os[0] == "linux")
+            teko::assert::is_true(m.os_lib_flag[0] == "-ldl")
+            teko::assert::is_true(m.os_lib_os[1] == "macos")
+            teko::assert::is_true(m.os_lib_flag[1] == "libssl.so")
+        }
+        error => teko::assert::is_true(false)
+    }
+}
+
+#test
 fn rejects_malformed() {
     // a missing required field → honest error (M.3).
     teko::assert::is_false(parses("source = \"src\"\n"))              // no name
