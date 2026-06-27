@@ -391,7 +391,7 @@ into **rounds** (parallel waves). The goal is **maximum agent concurrency** with
 | **C7.13** B0d promote `tk_str_eq`→text.h (+panic wrapper) | `rt`(text.h), `chk` | — |
 | **C7.14** B3a `TK_LIST` runtime list | `rt` | — |
 | **C7.15** B3b overflow-debug panic guard wiring | `cg` | — |
-| **C7.16** `.tkb` statement/program codec (today only `TExpr`) — **THE KEYSTONE for packaging**: extend the expression-only `serialize`/`deserialize` to whole `TProgram`/`TFunction`/`TStatement`/`TypeDecl` (writer + reader + round-trip tests), reusing the existing `write_*`/StrTable/frame helpers. Unblocks C7.10 (pre-linker load) + C7.12 (`.tkl` payload) | `tkb` | — |
+| **C7.16** `.tkb` statement/program codec — **THE KEYSTONE for packaging**. ⏳ **EXPRESSION codec now COMPLETE + corrected** (2026-06-27): fixed the collect-pass gaps (TStructInit/TSafeFieldAccess/TCoalesce/TIndex/TInExpr/TArrayLit/TPathExpr strings were dropped → write `st_find` sentinel → broken round-trip) + the reader's missing tag 21 (TArrayLit); +4 round-trip tests; twins (tkb_frame/.c + tkb_read/.c); 166 tests, byte-identical. **REMAINING:** the `[]TStatement` codec (7 kinds) + complete TIfExpr/TMatchExpr (tags 8/9, today tag-only) + TFunction/TypeDecl/UseDecl/TItem/TProgram framing + `serialize_program`/`deserialize_program` (patterns needed for TMatchExpr arms). Unblocks C7.10 (pre-linker load) + C7.12 (`.tkl` payload) | `tkb` | — |
 | **C7.17** M2 `driver.tks` materialized | *(driver)* | C7.2–C7.5 |
 
 **Rounds:**

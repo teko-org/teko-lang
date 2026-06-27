@@ -50,6 +50,34 @@ static void collect(tk_strtable *t, const tk_texpr *te) {
             for (size_t i = 0; i < te->as.interp.npieces; i += 1) tk_st_intern(t, te->as.interp.pieces[i]);
             for (size_t i = 0; i < te->as.interp.nholes; i += 1) collect(t, &te->as.interp.holes[i]);
             break;
+        // (C7.16) the kinds previously dropped to `default` — their strings/sub-exprs MUST be interned
+        // or the writer's st_find returns the not-found sentinel and the node fails to round-trip.
+        case TK_TEXPR_SAFE_FIELD_ACCESS:
+            collect(t, te->as.safe_field_access.receiver);
+            tk_st_intern(t, te->as.safe_field_access.field);
+            break;
+        case TK_TEXPR_COALESCE:
+            collect(t, te->as.coalesce.left); collect(t, te->as.coalesce.right);
+            break;
+        case TK_TEXPR_STRUCT_INIT:
+            for (size_t i = 0; i < te->as.struct_init.nfields; i += 1) {
+                tk_st_intern(t, te->as.struct_init.field_names[i]);
+                collect(t, &te->as.struct_init.field_vals[i]);
+            }
+            break;
+        case TK_TEXPR_INDEX:
+            collect(t, te->as.index.receiver); collect(t, te->as.index.index);
+            break;
+        case TK_TEXPR_IN:
+            collect(t, te->as.in_expr.lhs);
+            for (size_t i = 0; i < te->as.in_expr.nelems; i += 1) collect(t, &te->as.in_expr.elems[i]);
+            break;
+        case TK_TEXPR_ARRAY:
+            for (size_t i = 0; i < te->as.array.nelements; i += 1) collect(t, &te->as.array.elements[i]);
+            break;
+        case TK_TEXPR_PATH:
+            tk_st_intern(t, te->as.path.enum_name); tk_st_intern(t, te->as.path.member);
+            break;
         default: break;
     }
 }

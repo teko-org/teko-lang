@@ -54,6 +54,77 @@ fn tkb_roundtrip_field_access() {
 }
 
 #test
+fn tkb_roundtrip_arraylit() {
+    // C7.16: ArrayLit [1, 2] round-trips (reader tag 21 was missing; collect recurses elements).
+    let elems = teko::list::push(teko::list::push(teko::list::empty(), tnum(1)), tnum(2))
+    let orig = checker::TExpr { kind = checker::TArrayLit { elements = elems }; type = i64ty(); line = 0; col = 0 }
+    match deserialize(serialize(orig)) {
+        checker::TExpr as got => match got.kind {
+            checker::TArrayLit as a => {
+                teko::assert::is_true(a.elements.len == 2)
+                match a.elements[0].kind { checker::TNumber as n => teko::assert::is_true(n.value == 1); _ => teko::assert::is_true(false) }
+                match a.elements[1].kind { checker::TNumber as n => teko::assert::is_true(n.value == 2); _ => teko::assert::is_true(false) }
+            }
+            _ => teko::assert::is_true(false)
+        }
+        error => teko::assert::is_true(false)
+    }
+}
+
+#test
+fn tkb_roundtrip_structinit() {
+    // C7.16: StructInit P { x = 5 } round-trips (collect now interns field names + recurses values).
+    let names = teko::list::push(teko::list::empty(), "x")
+    let vals  = teko::list::push(teko::list::empty(), tnum(5))
+    let orig = checker::TExpr { kind = checker::TStructInit { field_names = names; field_vals = vals }; type = checker::Named { name = "P" }; line = 0; col = 0 }
+    match deserialize(serialize(orig)) {
+        checker::TExpr as got => match got.kind {
+            checker::TStructInit as si => {
+                teko::assert::is_true(si.field_names.len == 1)
+                teko::assert::is_true(si.field_names[0] == "x")
+                match si.field_vals[0].kind { checker::TNumber as n => teko::assert::is_true(n.value == 5); _ => teko::assert::is_true(false) }
+            }
+            _ => teko::assert::is_true(false)
+        }
+        error => teko::assert::is_true(false)
+    }
+}
+
+#test
+fn tkb_roundtrip_coalesce() {
+    // C7.16: (a ?? 0) round-trips (collect now recurses left + right).
+    let left = checker::TExpr { kind = checker::TVar { name = "a" }; type = i64ty(); line = 0; col = 0 }
+    let orig = checker::TExpr { kind = checker::TCoalesce { left = left; right = tnum(0) }; type = i64ty(); line = 0; col = 0 }
+    match deserialize(serialize(orig)) {
+        checker::TExpr as got => match got.kind {
+            checker::TCoalesce as co => {
+                match co.left.kind  { checker::TVar as v    => teko::assert::is_true(v.name == "a"); _ => teko::assert::is_true(false) }
+                match co.right.kind { checker::TNumber as n => teko::assert::is_true(n.value == 0); _ => teko::assert::is_true(false) }
+            }
+            _ => teko::assert::is_true(false)
+        }
+        error => teko::assert::is_true(false)
+    }
+}
+
+#test
+fn tkb_roundtrip_pathexpr() {
+    // C7.16: Color::Red round-trips (collect now interns enum_name + member; ordinal u64).
+    let orig = checker::TExpr { kind = checker::TPathExpr { enum_name = "Color"; member = "Red"; ordinal = 2 }; type = checker::Named { name = "Color" }; line = 0; col = 0 }
+    match deserialize(serialize(orig)) {
+        checker::TExpr as got => match got.kind {
+            checker::TPathExpr as pe => {
+                teko::assert::is_true(pe.enum_name == "Color")
+                teko::assert::is_true(pe.member == "Red")
+                teko::assert::is_true(pe.ordinal == 2)
+            }
+            _ => teko::assert::is_true(false)
+        }
+        error => teko::assert::is_true(false)
+    }
+}
+
+#test
 fn tkb_tamper_caught() {
     // barrier (M.1): a corrupted body (last byte dropped) fails the FNV-1a hash check → error.
     let orig  = checker::TExpr { kind = checker::TCast { expr = tnum(7) }; type = u8ty(); line = 0; col = 0 }

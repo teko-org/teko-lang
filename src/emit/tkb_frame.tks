@@ -86,6 +86,19 @@ fn collect_pieces(t: StrTable, ps: []str) -> StrTable {
     tab
 }
 
+// (C7.16) intern a struct-init's field names AND recurse each field value (write order = this order).
+fn collect_structinit(t: StrTable, si: checker::TStructInit) -> StrTable {
+    mut tab = t
+    mut i = 0
+    loop {
+        if i >= si.field_names.len { break }
+        tab = st_intern(tab, si.field_names[i]).table
+        tab = collect_strings(tab, si.field_vals[i])
+        i++
+    }
+    tab
+}
+
 fn collect_strings(t: StrTable, te: checker::TExpr) -> StrTable {
     let t1 = collect_type_strings(t, te.type)        // the node's type may name things
     match te.kind {
@@ -98,6 +111,17 @@ fn collect_strings(t: StrTable, te: checker::TExpr) -> StrTable {
         checker::TCast as c    => collect_strings(t1, c.expr)                                    // S1a — recurse into the inner expr
         checker::TFieldAccess as f => st_intern(collect_strings(t1, f.receiver), f.field).table  // S1b — receiver AND the field name (must intern)
         checker::TInterp as in => collect_texprs(collect_pieces(t1, in.pieces), in.holes)        // $"…{expr}…" — intern pieces, recurse holes
+        // (C7.16) the kinds previously dropped to `_` — their strings/sub-exprs MUST be interned or the
+        // writer's st_find returns the not-found sentinel and the node fails to round-trip.
+        checker::TSafeFieldAccess as sf => st_intern(collect_strings(t1, sf.receiver), sf.field).table
+        checker::TCoalesce as co => collect_strings(collect_strings(t1, co.left), co.right)
+        checker::TStructInit as si => collect_structinit(t1, si)
+        checker::TIndex as ix => collect_strings(collect_strings(t1, ix.receiver), ix.index)
+        checker::TInExpr as ie => collect_texprs(collect_strings(t1, ie.lhs), ie.elems)
+        checker::TArrayLit as a => collect_texprs(t1, a.elements)
+        checker::TPathExpr as pe => st_intern(st_intern(t1, pe.enum_name).table, pe.member).table
+        // TIfExpr/TMatchExpr (block-bearing) are still tag-only in the writer — collected with the
+        // statement codec (C7.16 follow-on). TNumber/TByteLit/TBoolLit/TNullLit carry no strings.
         _             => t1
     }
 }

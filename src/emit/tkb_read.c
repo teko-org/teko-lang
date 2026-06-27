@@ -182,6 +182,13 @@ tk_texpr tk_read_texpr(tk_reader *r, tk_strs t) {
             e.as.in_expr.elems = es; e.as.in_expr.nelems = (size_t)ne;
             return e;
         }
+        case 21: {                                                              /* Increment B+ — [ e0, e1, … ]: nelements (u64) THEN each elem */
+            e.tag = TK_TEXPR_ARRAY;
+            uint64_t na = tk_read_u64(r); tk_texpr *es = tk_alloc((na ? na : 1) * sizeof *es); if (!es) abort();
+            for (uint64_t i = 0; i < na; i += 1) es[i] = tk_read_texpr(r, t);
+            e.as.array.elements = es; e.as.array.nelements = (size_t)na;
+            return e;
+        }
     }
     r->ok = false; return e;
 }
