@@ -369,7 +369,7 @@ into **rounds** (parallel waves). The goal is **maximum agent concurrency** with
 | **C7.1b** `extern` checker typing (prims+`ptr`/`uptr`/`void` only) | `chk` | C7.1a |
 | **C7.1c** `extern` codegen emit (C extern proto + call; Teko-name→C-symbol) | `cg` | C7.1a |
 | **C7.1d** `extern` VM handling (defer/stub like the other host bottoms) | `vm` | C7.1a |
-| **C7.1e** `.tkp` parser: array values + nested sub-tables + `[extern]`/`[extern.libs]`/`search`/`prefer` | `build`(manifest) | C7.0 |
+| **C7.1e** `.tkp` `[extern.libs] name = []` → driver `-l<name>` (✅ macOS); full array vocab + `search`/`prefer`/`cc`/`target`/`sysroot` deferred | `build`(manifest), `driver`/`build` | C7.0 |
 | **C7.1f** per-OS symbol/lib resolution + `#os(...)` conditional-compile guard *(Linux/Windows)* | `build`, `L`, `P`, `chk`, `cg` | C7.1a–e · **follow-on** |
 | **C7.1g** `ptr`/`uptr` opaque transport types (✅) + `extern type` opaque handle (→ `void*`) (✅) | `chk`, `cg`, `ast`, `P` | C7.1a–c |
 | **C7.1i** marshalling primitives `teko::mem::as_ptr`/`as_cstr`/`str_from_cstr` (✅); `bytes_from_ptr` deferred (slice-lift) | `chk`, `cg`, `rt` | C7.1g |

@@ -20,6 +20,7 @@ pub type Manifest = struct {
     cov_functions: u64      // [coverage] functions — the D4 FUNCTION-coverage floor % (default 80)
     cov_lines:     u64      // [coverage] lines     — the D4 LINE-coverage floor %     (default 80)
     cov_branches:  u64      // [coverage] branches  — the D4 BRANCH-coverage floor %   (default 80)
+    extern_libs:   []str    // [extern.libs] keys — libraries to link (C7.1e; each → `-l<name>`)
 }
 
 // parse_manifest — read a `.tkp` source into a Manifest, or fail honestly (M.3 — no
@@ -113,6 +114,7 @@ fn parse_manifest(src: str) -> Manifest | error {
     mut cov_functions: u64 = 80                // D4 floors — default 80 when [coverage] / its keys are absent
     mut cov_lines: u64 = 80
     mut cov_branches: u64 = 80
+    mut extern_libs: []str = teko::list::empty()   // [extern.libs] keys — libraries to link (C7.1e)
     mut have_name = false
     mut have_source = false
     mut sec = "root"
@@ -145,7 +147,8 @@ fn parse_manifest(src: str) -> Manifest | error {
             else if nm == "dependencies" { sec = "deps" }
             else if nm == "aliases"      { sec = "aliases" }
             else if nm == "coverage"     { sec = "coverage" }
-            else                         { sec = "other" }
+            else if nm == "extern.libs"  { sec = "extern.libs" }   // C7.1e: libraries to link
+            else                         { sec = "other" }         // [extern] scalars (search/prefer/…) — deferred
         } else {
             // a `key = value` pair
             let ke = mf_key_end(line, i)
@@ -178,6 +181,13 @@ fn parse_manifest(src: str) -> Manifest | error {
                 deps = teko::list::push(deps, key)
             } else if sec == "aliases" {
                 aliases = teko::list::push(aliases, key)
+            } else if sec == "extern.libs" {
+                // `name = []` — link `-l<name>`. A non-empty link-spec array (multi-lib / paths /
+                // static:/shared:) is a LATER gap (C7.1e+): declare each library as its own key.
+                if mf_at(line, v) != b'[' { return error { message = "expected '[' for an [extern.libs] value (e.g. `z = []`)" } }
+                let after = mf_skip_spaces(line, v + 1)
+                if mf_at(line, after) != b']' { return error { message = "non-empty [extern.libs] link-spec not yet supported — declare each library as its own `name = []` key (C7.1e)" } }
+                extern_libs = teko::list::push(extern_libs, key)
             }
             // "other" → keys ignored (M.5)
         }
@@ -186,5 +196,5 @@ fn parse_manifest(src: str) -> Manifest | error {
     if !have_name   { return error { message = "manifest missing required field 'name'" } }
     if !have_source { return error { message = "manifest missing required field 'source'" } }
 
-    Manifest { name = name; artifact = artifact; source = source; deps = deps; aliases = aliases; version = version; suffix = suffix; cov_functions = cov_functions; cov_lines = cov_lines; cov_branches = cov_branches }
+    Manifest { name = name; artifact = artifact; source = source; deps = deps; aliases = aliases; version = version; suffix = suffix; cov_functions = cov_functions; cov_lines = cov_lines; cov_branches = cov_branches; extern_libs = extern_libs }
 }

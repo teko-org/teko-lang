@@ -26,6 +26,7 @@ typedef struct {
     uint64_t    cov_functions; // [coverage] functions — the D4 FUNCTION-coverage floor % (default 80)
     uint64_t    cov_lines;     // [coverage] lines     — the D4 LINE-coverage floor %     (default 80)
     uint64_t    cov_branches;  // [coverage] branches  — the D4 BRANCH-coverage floor %   (default 80)
+    tk_strs     extern_libs;   // [extern.libs] keys — libraries to link (C7.1e; each → `-l<name>`)
 } tk_manifest;
 
 // `Manifest | error` — the result of parse_manifest.

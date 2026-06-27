@@ -176,7 +176,12 @@ fn assert_dir(rt: str) -> str {
 // Run the host C compiler over `cfile`, producing `binary`. Full parity with driver.c::run_cc: cc
 // sees the runtime + assert dirs (-I) and compiles BOTH seed sources (teko_rt.c + assert.c) plus
 // -lm, in one reuse-the-host-toolchain invocation (M.5). Returns the cc exit code.
-fn run_cc(cfile: str, binary: str) -> i32 {
+// strip a leading `lib` from a library name for the `-l` flag (`libc` -> `c`; `z` stays `z`). (C7.1e)
+fn strip_lib(name: str) -> str {
+    if name.len > 3 && name[0] == b'l' && name[1] == b'i' && name[2] == b'b' { teko::str::slice_from(name, 3) } else { name }
+}
+
+fn run_cc(cfile: str, binary: str, libs: []str) -> i32 {
     let rt = rt_dir()
     let asrt = assert_dir(rt)
     mut argv: []str = teko::list::empty()
@@ -192,6 +197,14 @@ fn run_cc(cfile: str, binary: str) -> i32 {
     argv = teko::list::push(argv, teko::str::concat(rt, "/teko_rt.c"))
     argv = teko::list::push(argv, teko::str::concat(asrt, "/assert.c"))
     argv = teko::list::push(argv, "-lm")
+    // C7.1e: link the [extern.libs] libraries (each `-l<name>`, a leading `lib` stripped). Placed
+    // AFTER the sources so the linker resolves their symbols (link order).
+    mut li = 0
+    loop {
+        if li >= libs.len { break }
+        argv = teko::list::push(argv, teko::str::concat("-l", strip_lib(libs[li])))
+        li = li + 1
+    }
     argv = teko::list::push(argv, "-o")
     argv = teko::list::push(argv, binary)
     teko::process::run(argv)
@@ -200,7 +213,7 @@ fn run_cc(cfile: str, binary: str) -> i32 {
 // Lower → write .c → invoke cc → report. Returns 0 on success. `stem` is the output binary name
 // (the manifest `name`); artifacts go to `out_dir`/<stem>{.c,} (default "bin", or the `-o <dir>`
 // argument), created at the project root (cwd after the front-end chdir'd). Mirrors driver.c.
-fn backend(dir: str, stem: str, out_dir: str, prog: checker::TProgram) -> i32 {
+fn backend(dir: str, stem: str, out_dir: str, prog: checker::TProgram, libs: []str) -> i32 {
     let csrc = match codegen::tk_emit_c(prog) { str as s => s; error as e => return fail(dir, e.message) }
     // trim a trailing `/` from the output dir so `-o ./bin/build/` doesn't yield `./bin/build//teko`.
     let od = if out_dir.len > 0 && out_dir[out_dir.len - 1] == b'/' { teko::str::slice_to(out_dir, out_dir.len - 1) } else { out_dir }
@@ -211,7 +224,7 @@ fn backend(dir: str, stem: str, out_dir: str, prog: checker::TProgram) -> i32 {
         error as e => return fail(dir, e.message)
         null       => {}                              // error? — null = success
     }
-    if run_cc(cfile, binp) != 0 {
+    if run_cc(cfile, binp, libs) != 0 {
         return fail(dir, "cc failed to build the generated C")
     }
     // E3 — write the symbol map beside the binary (best-effort; a write error never fails the build —
@@ -272,7 +285,7 @@ fn compile_project_g(dir: str, out_dir: str, gate: bool, gen_cov: bool) -> i32 {
     ensure_rt_dir_abs()   // pin the runtime to an absolute path BEFORE the front-end chdir's
     if !gate {
         let fe = match project_frontend(dir) { Frontend as x => x; error as e => return fail(dir, e.message) }
-        return backend(dir, fe.manifest.name, out_dir, fe.prog)
+        return backend(dir, fe.manifest.name, out_dir, fe.prog, fe.manifest.extern_libs)
     }
     // D4 gate (STRICT): enter the project ONCE, assemble WITH the tests. If `.tkt` tests exist they
     // MUST assemble, RUN, all pass, AND meet the coverage threshold — otherwise the build is BLOCKED.
@@ -282,7 +295,7 @@ fn compile_project_g(dir: str, out_dir: str, gate: bool, gen_cov: bool) -> i32 {
         Frontend as fe => {
             if !has_tests(fe.prog) {
                 // No tests at all → ignore the gate, build the production program (no test code present).
-                return backend(dir, fe.manifest.name, out_dir, fe.prog)
+                return backend(dir, fe.manifest.name, out_dir, fe.prog, fe.manifest.extern_libs)
             }
             // The gate ALWAYS records lines+branches (for the floors); `--coverage` additionally emits
             // <out_dir>/cobertura.xml (mkdir the dir first — idempotent). A failed assert panics here
@@ -304,7 +317,7 @@ fn compile_project_g(dir: str, out_dir: str, gate: bool, gen_cov: bool) -> i32 {
             if bcov < fe.manifest.cov_branches {
                 return fail(dir, $"branch coverage {bcov}% is below the {fe.manifest.cov_branches}% floor ([coverage] branches) — add tests (or `--no-test`)")
             }
-            backend(dir, fe.manifest.name, out_dir, strip_tests(fe.prog))
+            backend(dir, fe.manifest.name, out_dir, strip_tests(fe.prog), fe.manifest.extern_libs)
         }
         // `.tkt` tests (or the production code) could not be ASSEMBLED/typechecked. With tests present,
         // that is a hard BUILD FAILURE — no graceful degradation (the gate is strict; only a project
