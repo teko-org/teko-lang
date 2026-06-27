@@ -430,6 +430,14 @@ bool tk_literal_adopts(tk_texpr e, tk_type to) {
         }
         return any;
     }
+    // an ARRAY LITERAL adopts a `[]E` slot when EVERY element adopts E (element-wise; `[0x68,…]`
+    // adopts `[]byte`). An empty `[]` adopts any slice.
+    if (e.tag == TK_TEXPR_ARRAY) {
+        if (to.tag != TK_TYPE_SLICE || to.as.slice.element == NULL) return false;
+        for (size_t i = 0; i < e.as.array.nelements; i += 1)
+            if (!tk_literal_adopts(e.as.array.elements[i], *to.as.slice.element)) return false;
+        return true;
+    }
     return false;
 }
 
@@ -742,8 +750,15 @@ static tk_texpr_result type_array_lit(tk_array_lit a, tk_env env, tk_type_table 
         else { tk_type j; if (!tk_type_join(et, e.as.value.type, table, &j)) { tk_free0(elems); return xerr("array elements have different types"); } et = j; }
         elems[i] = e.as.value;
     }
-    tk_type *ep = tk_alloc(sizeof *ep); if (!ep) abort(); *ep = et;
-    tk_type st = { .tag = TK_TYPE_SLICE, .as.slice.element = ep };
+    // an EMPTY `[]` is the SENTINEL slice (element == NULL, like teko::list::empty()) — it unifies
+    // with any concrete slice via a binding annotation. A non-empty array carries its joined element.
+    tk_type st;
+    if (a.nelements == 0) {
+        st = (tk_type){ .tag = TK_TYPE_SLICE, .as.slice.element = NULL };
+    } else {
+        tk_type *ep = tk_alloc(sizeof *ep); if (!ep) abort(); *ep = et;
+        st = (tk_type){ .tag = TK_TYPE_SLICE, .as.slice.element = ep };
+    }
     return xok((tk_texpr){ .tag = TK_TEXPR_ARRAY, .type = st, .as.array = { elems, a.nelements } });
 }
 
