@@ -395,8 +395,8 @@ into **rounds** (parallel waves). The goal is **maximum agent concurrency** with
 | **C7.17** M2 `driver.tks` fully materialized — replace seed scope-lookup paths with real `use teko::env`/`teko::io`/`teko::fs`/`teko::process` calls | *(driver)* | C7.2–C7.5 | ⬜ TODO |
 | **C7.1h** `ptr<T>` (deref behind `#repr(C)`) + `ptr ≡ ptr<void>` | — | **S4 generics** | ⬜ deferred to S4 |
 | **C7.1j** multi-OS/arch CI pipelines *(LAST in phase)* — Linux arm64+x86_64, Windows arm64+x86_64, macOS arm64 | CI | C7.1* | ⬜ TODO (LAST) |
-| **C6.7** *(carried from Phase 6)* spread-into-literal `[..xs, x]` — frontend (`L`+`ast`+`P`+`chk`) | `L`, `ast`, `P`, `chk` | C6.5 ✅ | ⬜ NOT DONE — `..` token, tagged array elements, spread type-checking; see Phase 6 C6.7 for full spec |
-| **C6.8** *(carried from Phase 6)* spread-into-literal `[..xs, x]` — backend (`cg`+`vm`+`tkb`) | `cg`, `vm`, `tkb` | C6.7 | ⬜ NOT DONE — codegen+VM emit/eval spread; tkb codec for tagged elements |
+| **C6.7** *(carried from Phase 6)* spread-into-literal `[..xs, x]` — frontend (`L`+`ast`+`P`+`chk`) | `L`, `ast`, `P`, `chk` | C6.5 ✅ | ✅ DONE (R7.6) — `TK_TOKEN_DOTDOT`/`DotDot` token; `tk_array_elem {is_spread, expr*}` + `tk_array_elems_push`; `parse_array_elems` with spread prefix; checker `type_array_lit` handles `..xs: []T → T`; `TArrayElem` in tast. |
+| **C6.8** *(carried from Phase 6)* spread-into-literal `[..xs, x]` — backend (`cg`+`vm`+`tkb`) | `cg`, `vm`, `tkb` | C6.7 | ✅ DONE (R7.6) — VM flattens spread slices; codegen emits `tk_slice_push` loops; TKB codec carries `is_spread` u8 per element + round-trip test. |
 
 **Completed rounds (for reference):**
 - R7.1 ✅ `{C7.1a ✅, C7.6 ✅, C7.16 ✅}` — extern front + test-runner + .tkb codec done; C7.9/C7.13/C7.14 carried forward
@@ -406,8 +406,7 @@ into **rounds** (parallel waves). The goal is **maximum agent concurrency** with
 
 **Remaining rounds (ordered, no deferral):**
 - **R7.5** ✅ `{C7.9, C7.13, C7.14}` — main-rule wired into build pipeline (`check_main_file_rule` called in both `project.tks`+`driver.c`); `tk_str_eq` declared in `text.h` + panic wrapper `tk_str_require_eq`; `TK_RT_LIST` macro + `tk_byte_list`/`tk_str_list`/`tk_i64_list` in `teko_rt.h`. 171 tests, both builds green.
-- **R7.6** `{C6.7}` (w1) — spread-into-literal frontend (`..` lexer token + tagged AST element + parser + checker). Serial: C6.8 needs C6.7's AST shape.
-- **R7.6b** `{C6.8, C7.15}` (w2) — spread backend (codegen+VM+tkb) + overflow guard (disjoint: `cg`/`vm`/`tkb` vs `cg` overflow — note overflow guard is a separate codegen pass, can be done in parallel with C6.8 if disjoint from spread emit path).
+- **R7.6** ✅ `{C6.7, C6.8}` — spread-into-literal `[..xs, x]` complete: lexer `TK_TOKEN_DOTDOT`, tagged `tk_array_elem` AST, `parse_array_elems`, checker `type_array_lit` with spread type-check, VM flatten, codegen `tk_slice_push` loops, TKB `is_spread` u8 codec. 172 tests, both builds green.
 - **R7.7** `{C7.2, C7.3, C7.4, C7.5}` (w4) — host surfaces as real `extern fn` namespace files; scope.tks seed paths removed after.
 - **R7.8** `{C7.12}` (w1) — package output → `.tkl` ZIP (unblocked by C7.16).
 - **R7.9** `{C7.10}` (w1) — pre-linker (depends on C7.12 for .tkl loading).
