@@ -606,6 +606,35 @@ fn int_width_of(v: Value) -> u8 {
 }
 fn float_width_of(v: Value) -> u8 { match v { f16 => 16; f32 => 32; f64 => 64; _ => 64 } }
 
+// val_type_matches — does a value's TYPE match a bare type-pattern name (a union member named by
+// its type)? A prim member matches by its exact prim type; bool/byte/str by kind; a named case or
+// `error` by the StructVal's type_name. This is what lets a `match` arm name a member by TYPE with
+// NO destructure and NO alias — `match x { i64 => …; error => … }` — in the VM, mirroring the
+// native tagged-union discrimination. (Slices are handled by the is_slice branch; `null` above.)
+fn val_type_matches(subj: Value, name: str) -> bool {
+    match subj {
+        u8   => name == "u8"
+        u16  => name == "u16"
+        u32  => name == "u32"
+        u64  => name == "u64"
+        u128 => name == "u128"
+        i8   => name == "i8"
+        i16  => name == "i16"
+        i32  => name == "i32"
+        i64  => name == "i64"
+        i128 => name == "i128"
+        f16  => name == "f16"
+        f32  => name == "f32"
+        f64  => name == "f64"
+        bool => name == "bool"
+        byte => name == "byte"
+        str  => name == "str"
+        []Value => false                          // a slice member is matched by the is_slice branch
+        StructVal as sv => sv.type_name == name    // a named case / `error`
+        OptVal => false
+    }
+}
+
 // Value accessors — extract the carried scalar (the .tks stand-in for the C `.as.*` union read).
 // as_int: any INT member (incl byte=u8) → the i128 carrier (the C exposes ONE signed accessor;
 // the width/sign live in the member). as_float: any FLOAT → f64. as_bool/as_str: the lone member.
@@ -793,17 +822,17 @@ fn pat_match(pat: parser::Pattern, subj: Value, env: Venv) -> PatMatch {
                     _ => PatMatch { matched = false; env = env }
                 }
             } else {
-                // a case value is a StructVal whose type_name IS the case (the path's last segment).
-                match subj {
-                    StructVal as sv => {
-                        if sv.type_name != path_last(bp.type_name) { return PatMatch { matched = false; env = env } }
-                        if bp.has_binding {
-                            PatMatch { matched = true; env = define(env, bp.binding, subj) }   // `Foo as x` binds the whole value
-                        } else {
-                            PatMatch { matched = true; env = env }
-                        }
+                // a member matched by TYPE: a named case is a StructVal whose type_name IS the case;
+                // a PRIM/bool/byte/str member matches by the value's kind (val_type_matches). This
+                // supports `Type =>` with NO destructure and NO alias, for EVERY member kind.
+                if val_type_matches(subj, path_last(bp.type_name)) {
+                    if bp.has_binding {
+                        PatMatch { matched = true; env = define(env, bp.binding, subj) }   // `Type as x` binds the whole value
+                    } else {
+                        PatMatch { matched = true; env = env }
                     }
-                    _ => PatMatch { matched = false; env = env }
+                } else {
+                    PatMatch { matched = false; env = env }
                 }
             }
         }

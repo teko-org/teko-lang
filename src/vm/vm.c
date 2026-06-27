@@ -994,6 +994,29 @@ static void env_pop_to(tk_venv *env, tk_slot *stop) {
     env->head = stop;
 }
 
+// val_type_matches — does a value's TYPE match a bare type-pattern name (a union member named by
+// its type)? A prim member matches by tag + width/sign; bool/str by tag; a named case / `error` by
+// the struct's type_name. Lets a `match` arm name a member by TYPE with NO destructure and NO
+// alias — `match x { i64 => …; error => … }` — mirroring the native tagged-union discrimination.
+// (Slices are handled by the is_slice branch; `null`/optionals above.) (Mirrors vm.tks.)
+static bool val_type_matches(tk_value subj, tk_str name) {
+    switch (subj.tag) {
+        case TK_VAL_INT: {
+            int w = subj.as.i.width; bool s = subj.as.i.is_signed;
+            const char *nm = s ? (w==8?"i8":w==16?"i16":w==32?"i32":w==128?"i128":"i64")
+                               : (w==8?"u8":w==16?"u16":w==32?"u32":w==128?"u128":"u64");
+            if (seg_is(name, nm)) return true;
+            if (!s && w == 8 && seg_is(name, "byte")) return true;   // byte ≈ unsigned 8-bit in the C model
+            return false;
+        }
+        case TK_VAL_FLOAT: { int w = subj.as.fl.width; return seg_is(name, w==16?"f16":w==32?"f32":"f64"); }
+        case TK_VAL_BOOL:  return seg_is(name, "bool");
+        case TK_VAL_STR:   return seg_is(name, "str");
+        case TK_VAL_STRUCT:return name_eq(subj.as.st.type_name, name);   // a named case / `error`
+        default:           return false;   // LIST → is_slice branch; OPT → handled above
+    }
+}
+
 // Does `subj` match `pat`? On match, defines the pattern's bindings into `env`.
 static bool pat_match(const tk_pattern *pat, tk_value subj, tk_venv *env) {
     // OPTIONAL subject (REBOOT_PLAN §202): `null` matches NONE; any other pattern matches the
@@ -1034,9 +1057,11 @@ static bool pat_match(const tk_pattern *pat, tk_value subj, tk_venv *env) {
                 if (pat->as.bind.has_binding) env_define(env, pat->as.bind.binding, subj);
                 return true;
             }
-            if (subj.tag != TK_VAL_STRUCT) return false;                          // a case value is a struct
-            if (!name_eq(subj.as.st.type_name, path_last(pat->as.bind.type_name))) return false;
-            if (pat->as.bind.has_binding) env_define(env, pat->as.bind.binding, subj);   // `Foo as x` binds the whole value
+            // a member matched by TYPE: a named case is a struct whose type_name IS the case; a
+            // PRIM/bool/str member matches by the value's kind (val_type_matches). Supports `Type =>`
+            // with NO destructure and NO alias, for every member kind.
+            if (!val_type_matches(subj, path_last(pat->as.bind.type_name))) return false;
+            if (pat->as.bind.has_binding) env_define(env, pat->as.bind.binding, subj);   // `Type as x` binds the whole value
             return true;
         }
         case TK_PAT_FIELD: {
