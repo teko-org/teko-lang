@@ -84,11 +84,11 @@ compile+link gate which is now the milestone reached.
 | 4 | C↔.tks mirroring | ✅ MAINTAINED continuously — every commit mirrors its `.c`/`.h` change to the `.tks` twin (SUPREME RULE); a standing per-commit discipline, not a pending sweep | Pay down mirror debt before more code lands |
 | 5 | Definite-assignment / init analysis | ✅ **CLOSED** — `src/checker/initanalysis.{tks,c,h}` runs last in `type_program`: **use-before-init is STRUCTURAL**; **unused-local → ERROR** (snippet+caret); **unused-private-fn → WARNING** via stderr warnings channel. Both twins lockstep; gate GREEN. | Real checker gap; lands the warnings channel |
 | 6 | Finish self-host → working `teko .` | ✅ **COMPLETE** — exit criteria met: (1) FULL SELF-HOSTING (`selfhost` gate → `bin/teko`, 0 cc errors, 902 items); (2) VM==native regression set (5/6/106); (3) C6.7+C6.8 spread-into-literal `[..xs, x]` ✅ (carried into Phase 7, completed R7.6). | The gating milestone for everything downstream |
-| 7 | Host independence | 🔶 **ACTIVE** — extern/FFI (C7.1a–i, C7.1k, C7.1m) ✅; D2/D3/D4 test gate ✅; `.tkb` program codec C7.16 ✅; `-o <dir>` ✅; main-rule C7.9 ✅; tk_str_eq C7.13 ✅; TK_RT_LIST C7.14 ✅; spread C6.7+C6.8 ✅. **Remaining (ordered): C7.2–5** (host ns files), **C7.15** (overflow guard), **C7.12** (.tkl ZIP), **C7.10** (pre-linker), **C7.17** (driver.tks), **C7.1j** (CI — LAST). | FFI + host surfaces + VM test gate + project/output/pack |
+| 7 | Host independence | 🔶 **ACTIVE** — extern/FFI (C7.1a–i, C7.1k, C7.1m) ✅; D2/D3/D4 test gate ✅; `.tkb` program codec C7.16 ✅; `-o <dir>` ✅; main-rule C7.9 ✅; tk_str_eq C7.13 ✅; TK_RT_LIST C7.14 ✅; spread C6.7+C6.8 ✅; host ns files C7.2–5 ✅; `.tkl` ZIP C7.12 ✅. **Remaining (ordered): C7.15** (W1), **C7.10** (W1), **C7.17** (W1), **E2-NATIVE** (W2), **C1.7-CAST** (W3), **`defer` C7.18** (W5), **C7.1j** (W6 CI — LAST in Phase 7). | FFI + host surfaces + VM test gate + project/output/pack |
 | 8 | FLAGS | ⬜ not started | Bitflag enums (spec frozen) |
 | 9 | SEC | ⬜ not started | SAST + capability audit, after corrections |
-| 10 | Evolution S1–S9 | ⬜ not started | Post-self-host campaign (arenas→…→concurrency) |
-| 11 | **DRY sweep + comment hygiene** | ⬜ **LAST** | refactor the settled corpus + doc-comments-only |
+| 10 | Evolution S1–S10 | ⬜ not started | Post-self-host campaign (arenas → generics → closures → scope/ref → collections → concurrency+sync+routines → async/await) |
+| 11 | **Code quality sweep** | ⬜ **LAST** | DRY + KISS + SOLID + YAGNI + 12-Factor (III/V/IX/XI/XII) + comment hygiene — applied once to settled code |
 
 ---
 
@@ -100,7 +100,7 @@ compile+link gate which is now the milestone reached.
 - **Source snippet + caret** — print the offending line with a `^` under the column (clang/rust style); driver holds source text at report time.
 - **Expected-vs-actual** types in every mismatch error (type / arg / return / assign / field).
 - **cc-failure surfacing** — relate generated-C `cc` errors back to Teko.
-- **E2** — `teko::Error` / panics carry file+line (VM and native). ✅ DONE (VM full; native degraded). The Teko `error` value gained accessible diagnostic fields (message/file/line/col/expected/actual) + `err_loc`/`err_typed` builtins (mirroring C `tk_error_loc`/`tk_error_types`); the `error { message }` literal stayed special-cased (NO 434-site ripple). Checker types them; VM carries them in full (`err_loc(...).line` == 7); the `.tks` checker wiring (typer.tks/check_modules.tks) prefers the expr position. **Native is DEGRADED** (error is still lowered to its message `tk_str`: `err_loc`/`err_typed` are no-ops, `error.line/col`→0, `error.file/expected/actual`→empty) so native compiles + self-host stays unblocked, but native diagnostics fall back to the item position. **Phase-6 follow-on:** represent native `error` as a struct (tk_str fields + runtime helpers) so native matches VM. (4-track workflow `e2-error-position`; codegen track HALTed on the error→tk_str representation, resolved via the degraded path.)
+- **E2** — `teko::Error` / panics carry file+line (VM and native). ✅ DONE (VM full; native degraded). The Teko `error` value gained accessible diagnostic fields (message/file/line/col/expected/actual) + `err_loc`/`err_typed` builtins (mirroring C `tk_error_loc`/`tk_error_types`); the `error { message }` literal stayed special-cased (NO 434-site ripple). Checker types them; VM carries them in full (`err_loc(...).line` == 7); the `.tks` checker wiring (typer.tks/check_modules.tks) prefers the expr position. **Native is DEGRADED** (error is still lowered to its message `tk_str`: `err_loc`/`err_typed` are no-ops, `error.line/col`→0, `error.file/expected/actual`→empty) so native compiles + self-host stays unblocked, but native diagnostics fall back to the item position. **Follow-on: Phase 7 crumb E2-NATIVE (R7.11)** materializes the native struct path once Phase 7 codegen infrastructure is complete. (4-track workflow `e2-error-position`; codegen track HALTed on the error→tk_str representation, resolved via the degraded path.)
 - **E3** — emit `.tsym` symbol map alongside the artifact.  **E4** — stack-trace (frames carry origin; native via `.tsym`).
 - **Warnings channel** — Teko has none today; introduce one (shared with Phase 5).
 **Exit:** a type error inside a function body reports the exact expr `file:line:col` + snippet + caret + expected/actual; panics print file:line; native build emits `.tsym`.
@@ -199,17 +199,53 @@ compile+link gate which is now the milestone reached.
 - **S8** concurrency CAPSTONE (`scope{}`/`spawn`/`channel<T>`/`send`/`recv`→`T|error`; 1:1 OS threads first).
 - **S9** LTS cleanup (collapse `Parsed<T> ×14` → `Result<T>`; unify per-type `parse`/`to_string`).
 **Reserved (don't freeze syntax until parser + real duplication data exist):** arena/scope surface, the three `ref` positions, the five concurrency primitives.
-**Deferred ceilings (keep deferred):** borrow-solver / lifetime-variable system; region-polymorphism; async/await (conditional); M:N green-thread scheduler. **Tribunal micro-decision:** implicit copy-out of a very small escaping value (default lean: NO implicit copy).
+**Deferred ceilings (keep deferred):** borrow-solver / lifetime-variable system; region-polymorphism. **Tribunal micro-decision:** implicit copy-out of a very small escaping value (default lean: NO implicit copy). *(async/await → S10/W14; M:N scheduler → S8/W13 — both removed from deferred and scheduled.)*
 
-### Phase 11 — DRY sweep + comment hygiene  *(§A.5 — LAST)*
-**Goal:** kill repeated identical calls with no variance across the WHOLE codebase (C AND Teko), e.g. `if at(source, p) == b'e' || at(source, p) == b'E'`.
-**Work:** whole-corpus refactor using the tools now in place — the `in` operator (Phase 2), hoisting (`let ch = at(source, p)`), or `match`.
-**COMMENT HYGIENE (legislator, 2026-06-26):** as part of this final settling pass, normalize ALL comments across the corpus (C AND Teko):
-  - **Doc comments only** — every retained comment becomes a `/** … */` doc comment (block form), attached to the declaration/section it documents.
-  - **Drop inline comments** — trailing/inline `// …` and `/* … */` mid-code comments are REMOVED; if a line genuinely needs explanation, the logic is hoisted/renamed so it reads without one, or the rationale moves into the preceding `/** … */`.
-  - **Why last:** comments churn with the code through every prior phase; normalizing earlier would re-touch the same lines repeatedly. Do it once, on settled code.
-**Why last:** it is a settling pass; running it earlier would refactor code that later phases still churn.
-**Exit:** no remaining no-variance repeated-call patterns; every comment is a `/** … */` doc comment with NO inline comments remaining; corpus still green + VM==native.
+### Phase 11 — Code quality sweep  *(§A.5 — LAST)*
+**Goal:** settle the corpus permanently: kill redundancy, enforce simplicity, validate architectural boundaries, and normalize documentation. Every principle below is applied once, to stable code, so it never has to be re-applied.
+
+**Principles (applied in order within each file, then comment hygiene last):**
+
+**DRY (Don't Repeat Yourself)**
+Kill no-variance repeated-call patterns across the whole codebase (C AND Teko). Tools: `in` operator (Phase 2), hoisting (`let ch = at(source, p)`), `match`, helper extraction. Example wall: `if at(source, p) == b'e' || at(source, p) == b'E'` → `if at(source, p) in [b'e', b'E']`.
+
+**KISS (Keep It Simple, Stupid)**
+Eliminate accidental complexity. Concrete checks:
+- No multi-step conditional where a single `match` arm suffices.
+- No helper function that wraps a single expression with no branching.
+- No intermediate variable that is used exactly once with no naming value.
+- Prefer the shorter of two semantically-equivalent Teko forms (law-first — `x != 0` over `x to bool`; `[..xs, x]` over repeated push chains).
+- Remove any `honest-stop` stubs whose condition can never be reached now that Phase 7–10 are complete (dead code by construction, not by accident).
+
+**SOLID (where applicable to a functional/procedural compiler)**
+- **SRP** — each `.tks` file owns exactly ONE namespace; each function does ONE thing. Split any function that has more than one distinct responsibility (e.g. parses AND validates).
+- **OCP** — adding a new AST node, expr kind, or statement kind should only require adding a new arm/case, not modifying existing logic. Sweep match/switch exhaustiveness; add `[[noreturn]]` / `_Noreturn` guards where appropriate.
+- **LSP** — not applicable (Teko has no subtype inheritance by design).
+- **ISP** — no function exposes parameters it doesn't use; no struct field that is only set but never read gets to live (YAGNI overlap). Narrow public surfaces in `.h` / `pub` in `.tks`.
+- **DIP** — `driver.c`/`driver.tks` must depend on module interfaces (`checker.h`, `codegen.h`), never on internal helpers. Verify no cross-module `#include` of a non-header file. In `.tks`: `use teko::checker` not `use teko::checker::collect::internal_helper`.
+
+**YAGNI (You Aren't Gonna Need It)**
+Delete anything added "for the future" that has no current caller:
+- `driver.tks::compile` (confirmed dead — only caller `compile` is unused; flagged in `selfhost-vm-perf.md`).
+- Any `pub` function in a namespace file with zero call sites across the whole corpus.
+- Any struct field never read after being set.
+- Any `honest-stop` path that is structurally unreachable post-Phase 10.
+
+**12-Factor (factors applicable to a CLI compiler tool)**
+- **III Config** — `TK_RT_DIR` and `TK_SRC_DIR` must be injectable via environment variables (already partially done in CMake); verify that `bin/teko` (non-cmake build) respects them; no path is baked into the binary string literals.
+- **V Build / run / test separation** — `teko build`, `teko run`, `teko test` must be strictly separate code paths with no side-effects leaking across (e.g. `build` never runs the VM; `run` never emits `.tkl`; `test` strips `#test` fns from the native artifact). Audit `driver.c`/`project.tks` command dispatch.
+- **IX Disposability** — fast startup (no global init beyond argv); clean exit on every error path (no half-written output files on failure — use a temp path + atomic rename or explicit cleanup); all OS resources released before exit.
+- **XI Logs as streams** — ALL diagnostics (errors, warnings, coverage reports) → `stderr`; the generated artifact (`.c` source, `.tkl` bytes, `.tsym`) → file only, never mixed into `stdout`. Audit every `printf`/`io::print` call in driver/project paths.
+- **XII Admin processes** — `teko test`, `teko pack`, `teko run` are proper first-class sub-commands (already true); verify each is idempotent (running twice with the same input produces the same output with no leftover state).
+
+**COMMENT HYGIENE (legislator, 2026-06-26)**
+Normalize ALL comments across the corpus (C AND Teko), applied LAST so comments settle on already-refactored code:
+- **Doc comments only** — every retained comment becomes a `/** … */` doc comment attached to the declaration/section it documents.
+- **Drop inline comments** — trailing `// …` and mid-code `/* … */` are REMOVED; if a line needs explanation, hoist/rename so it reads without one, or move the rationale into the preceding `/** … */`.
+
+**Why last:** every prior phase churns code; applying any of the above earlier would re-touch the same lines repeatedly. Do it once, on settled code.
+
+**Exit:** no no-variance repeated calls; no KISS violation (single-use helpers, dead stubs); SOLID boundaries hold; no YAGNI survivors; 12-Factor III/V/IX/XI/XII pass; every comment is `/** … */`; zero inline comments; corpus green + VM==native.
 
 ---
 
@@ -227,7 +263,7 @@ compile+link gate which is now the milestone reached.
 | 8 | session ruling (flags spec) |
 | 9 | `TEKO_CORRECTION_PLAN.md` §14; `TEKO_ROADMAP_INDEPENDENCE.md` C5; task #53 |
 | 10 | `TEKO_EVOLUTION_DESIGN.md` / `TEKO_EVOLUTION_JUSTIFICATION.md` S1–S9 |
-| 11 | session directive (DRY) |
+| 11 | session directive (DRY + KISS + SOLID + YAGNI + 12-Factor) |
 
 ---
 
@@ -287,8 +323,8 @@ into **rounds** (parallel waves). The goal is **maximum agent concurrency** with
 | **C1-POS** expr-position plumbing | `ast`,`tast`,`P`,`chk`,`tkb` (C: +`expr.c`,`typer.c`) | — | ✅ DONE — **C-side** (tk_expr/tk_texpr line,col; parser `tk_at` stamps every node; `tk_typer_expr` wrapper copies position onto the typed node + attaches it to errors innermost-wins; `tk_type_program` prefers the expr position). Proof: body type-error → **expr** `3:15`; self-host wall `lexer.tks:451:4`→`460:29`. **.tks mirror** (ast.tks `Expr`→struct-wrapper `{kind,line,col}`; tast.tks `TExpr` +line,col; parse_*/typer/tkb_read reshaped via agent fan-out): parses all 64. Build green; regressions 5/6. **CARVE-OUT → E2:** the C checker attaches positions to error VALUES (via tk_error's C1.3 fields); the `.tks` `error` is `{message}` and gaining line/col ripples EVERY `error {}` under exact-fields → that is **E2** ("teko::Error carry file:line"), done corpus-wide there. C-side error-position is a forward-compatible down payment (delivers the win now); `.tks` error-position lands in E2. |
 | **C1.8** driver renderer: source line + `^` caret + expected/actual (type→string `tk_type_render`) | `res`(render),`chk`,`typer`,`driver` (+`.tks` mirror) | C1.3 ✅, C1-POS | ✅ DONE (workflow `diag-enrich-r13`) — `tk_type_render` (resolve.c/.tks, all 10 tags); expected/actual set at call/binary/binding/assign/return mismatch sites; `tk_type_program` threads structured file/line/col; driver prints source line + caret (1-based, tab=1col) + "expected X, found Y". Proof: `work.tks:3:15` + caret + "expected i64, found str"; self-host wall now `lexer:460:29 — expected Reader, found str`. Build green; regressions 5/6; parses all 64. *Residual:* cc-failure surfacing not yet done; return/trailing-value mismatch under-locates (line=0 → fn header) — diagnostics refinement. |
 | **C1.6** VM runtime panics carry line:col | `vm` | C1-POS | ✅ DONE (workflow) — positioned wrappers (`vm_panic_div0/cast/oob_at`) prefix `line:col` from the offending typed node; C+vm.tks mirrored. *File-threading deferred* (VM program carries no per-node file → line:col only for now). |
-| **C1.7** native panics carry line:col | `rt`, `cg` (+ `.tks`) | C1.3 ✅ | ✅ DONE (OOB) — `tk_panic_oob_at(line,col)` (teko_rt) + codegen emits the index node's position; native index-OOB now prints `line:col: teko: panic: index out of bounds`, **identical to the VM**. *Deferred:* native CAST positioning (48 inline `tk_to_*` helpers — needs a global panic-loc) and DIV0 (codegen guard unwired, B3b) — a later "native panic positioning" pass. |
-| **C1.9** native stack traces (+ `.tsym` per-frame later) | `rt` (+`.tks` note) | C1-POS | ✅ DONE (core) — teko_rt prints a `backtrace` on panic + installs a fatal-signal handler (SIGSEGV/BUS/ILL/FPE) for generated programs; a native crash/panic shows the Teko call stack (frames `g`, `f`, …). main.c's own handler still wins in the bootstrap. *Deferred:* per-frame Teko `file:line` via `.tsym` emission (Eixo E3) — backtrace_symbols gives C symbols now; some frames mis-symbolize at +0 without it. |
+| **C1.7** native panics carry line:col | `rt`, `cg` (+ `.tks`) | C1.3 ✅ | ✅ DONE (OOB) — `tk_panic_oob_at(line,col)` (teko_rt) + codegen emits the index node's position; native index-OOB now prints `line:col: teko: panic: index out of bounds`, **identical to the VM**. *Deferred:* native CAST positioning (48 inline `tk_to_*` helpers — needs a global panic-loc) → **Phase 7 crumb C1.7-CAST** (R7.11); native DIV0 guard (B3b) → **Phase 7 crumb C7.15** (R7.8b). |
+| **C1.9** native stack traces (+ `.tsym` per-frame later) | `rt` (+`.tks` note) | C1-POS | ✅ DONE — teko_rt prints a `backtrace` on panic + installs a fatal-signal handler (SIGSEGV/BUS/ILL/FPE); the **E4 native stack-trace resolution** (teko_rt loads `<argv0>.tsym` → appends `=> <teko-name> <file:line>` per frame) is also DONE (see Phase 1 header). Both parts complete; no remaining deferred work in this crumb. |
 
 **Revised rounds:** R1.1 `{C1.2, C1.3}` ✅ → **R1.2 `{C1-POS, C1.7}`** (C1-POS dominates; C1.7 parallel on `rt`) → R1.3 `{C1.6, C1.8, C1.9}` (w3, after C1-POS).
 
@@ -318,23 +354,23 @@ into **rounds** (parallel waves). The goal is **maximum agent concurrency** with
 
 ## Phase 4 — C↔.tks mirroring audit *(read-mostly; partitioned by directory → fully parallel)*
 
-| Crumb | Owns | Dep |
-|-------|------|-----|
-| **C4.1** audit + reconcile lexer + parser pairs | `L`, `ast`, `P` | — |
-| **C4.2** audit + reconcile checker pairs | `chk`, `match`, `collect`, `res`, `scope`, `tast` | — |
-| **C4.3** audit + reconcile codegen + vm pairs | `cg`, `vm` | — |
-| **C4.4** audit + reconcile emit + runtime + build + assert + main | `tkb`, `rt`, `build`, `assert`, `main` | — |
+| Crumb | Owns | Dep | Status |
+|-------|------|-----|--------|
+| **C4.1** audit + reconcile lexer + parser pairs | `L`, `ast`, `P` | — | ✅ MAINTAINED (SUPREME RULE — every commit that touches a `.c`/`.h` mirrors the change to the `.tks` twin atomically; no divergence has been allowed to accumulate; a discrete audit sweep is superseded by the standing per-commit discipline) |
+| **C4.2** audit + reconcile checker pairs | `chk`, `match`, `collect`, `res`, `scope`, `tast` | — | ✅ MAINTAINED |
+| **C4.3** audit + reconcile codegen + vm pairs | `cg`, `vm` | — | ✅ MAINTAINED |
+| **C4.4** audit + reconcile emit + runtime + build + assert + main | `tkb`, `rt`, `build`, `assert`, `main` | — | ✅ MAINTAINED |
 
-**Rounds:** R4.1 `{C4.1, C4.2, C4.3, C4.4}` (w4).
+**Rounds:** R4.1 ✅ MAINTAINED — continuous per-commit discipline (SUPREME RULE); no pending discrete sweep.
 
 ## Phase 5 — Definite-assignment / init analysis *(single subsystem → mostly serial)*
 
-| Crumb | Owns | Dep |
-|-------|------|-----|
-| **C5.1** definite-assignment pass (mandatory init, use-before-init error) | `chk` (new flow module) | C1.1 (positions) |
-| **C5.2** unused-local error / unused-private warning → warnings channel | same flow module | C5.1, C1.3 |
+| Crumb | Owns | Dep | Status |
+|-------|------|-----|--------|
+| **C5.1** definite-assignment pass (mandatory init, use-before-init error) | `chk` (new flow module) | C1.1 (positions) | ✅ DONE — use-before-init proven impossible by construction (parser `Binding.value` mandatory; typed in pre-binding env); unused-local → ERROR with Phase-1-quality caret via `diag_at`+`err_loc`. Both twins lockstep. |
+| **C5.2** unused-local error / unused-private warning → warnings channel | same flow module | C5.1, C1.3 | ✅ DONE — unused-private-fn → WARNING to stderr; 14 dead private fns surfaced in corpus; `#test` fns exempt; warnings channel live. |
 
-**Rounds:** R5.1 `{C5.1}` (w1) → R5.2 `{C5.2}` (w1).
+**Rounds:** R5.1 ✅ `{C5.1}` → R5.2 ✅ `{C5.2}` — `src/checker/initanalysis.{tks,c,h}` delivered; gate GREEN; both twins byte-identical in behavior.
 
 ## Phase 6 — Finish self-host → working `teko .` *(milestone; `cg`/`vm` serialize across rounds)*
 
@@ -393,6 +429,9 @@ into **rounds** (parallel waves). The goal is **maximum agent concurrency** with
 | **C7.12** A8 `package` output → `.tkl` (ZIP-STORE of `.tkh`+`.tkb`+`.tsym`, named `<name>-<version>[-suffix].tkl`) + pure-Teko ZIP-STORE writer (CRC32 + local/central/EOCD headers, deterministic timestamp, twins). C7.16 ✅ unblocks the real `.tkb` payload; update the honest-stop message in project.tks/driver.c | `build`, `tkb` | C7.16 ✅, C7.1m ✅ | ✅ DONE (R7.8) — `src/compress/compress.tks` + `compress.c` (namespace `teko::compress`; reusable by any Teko project); `write_zip(entries: []ZipEntry) -> []byte`; CRC-32 table-driven; deterministic. Backend wired: `emit_program` → `.tkh`, `serialize_program` → `.tkb`, `tk_emit_tsym` → `.tsym`; all three ZIPped into `<out>/<name>-<version>.tkl`. `write_file_bytes(path, []byte)` added to `teko::io` + `teko_rt`. `type_table_of` added to checker/collect. Smoke-tested: valid ZIP, `['pkg.tkh','pkg.tkb','pkg.tsym']`. 172 tests. |
 | **C7.10** A6 pre-linker — load each dep (native `.a`/`.so` OR `.tkl`'s `.tkb`) → merge typed trees → check app BEFORE emit; the merged `.tkb` is the dep's OWN tree (never re-inline deps) | `tkb`, `build`, `res` | C7.12, C7.16 ✅, C7.1m ✅ | ⬜ TODO |
 | **C7.17** M2 `driver.tks` fully materialized — replace seed scope-lookup paths with real `use teko::env`/`teko::io`/`teko::fs`/`teko::process` calls | *(driver)* | C7.2–C7.5 | ⬜ TODO |
+| **E2-NATIVE** native `error` struct in codegen — codegen currently lowers `error` to its message `tk_str`; `err_loc`/`err_typed` builtins are no-ops in native (`error.line/col`→0, `error.file/expected/actual`→empty). Goal: represent native `error` as a C struct with all C1.3 fields (`message/file/line/col/expected/actual`); emit struct init in codegen; `err_loc`/`err_typed` return the real fields so native matches VM. Deferred from Phase 1 E2 native-degraded carve-out; now has Phase 7 codegen infrastructure to land on. | `rt`, `cg` (+ `.tks`) | C7.15, C1.3 ✅ | ⬜ TODO |
+| **C1.7-CAST** native CAST positioning — the 48 `tk_to_*` helpers in `teko_rt` don't carry position; a cast panic prints no `file:line`. Thread a global panic-loc (set by codegen at the call site) so a native cast panic is identical to the VM. Deferred from C1.7. | `rt`, `cg` (+ `.tks`) | E2-NATIVE | ⬜ TODO |
+| **C7.18** `defer` — scoped deferred cleanup. Syntax: `defer { stmts }` (Zig-style; executes LIFO at ANY scope exit — normal return, early `break`, or panic). Full pipeline: lexer `defer` keyword; AST `DeferStmt { block }`; parser in `parse_stmt`; checker types the block (void context, no value); codegen inserts the block at ALL scope-exit points of the enclosing function body (C `__attribute__((cleanup))` or manual label+goto pattern); VM maintains a deferred-stack per call frame, pops+executes on frame exit; TKB serializes `DeferStmt`. | `L`, `ast`, `P`, `chk`, `cg`, `vm`, `tkb` (+ all `.tks`) | C1.7-CAST ✅ (codegen stable) | ⬜ TODO |
 | **C7.1h** `ptr<T>` (deref behind `#repr(C)`) + `ptr ≡ ptr<void>` | — | **S4 generics** | ⬜ deferred to S4 |
 | **C7.1j** multi-OS/arch CI pipelines *(LAST in phase)* — Linux arm64+x86_64, Windows arm64+x86_64, macOS arm64 | CI | C7.1* | ⬜ TODO (LAST) |
 | **C6.7** *(carried from Phase 6)* spread-into-literal `[..xs, x]` — frontend (`L`+`ast`+`P`+`chk`) | `L`, `ast`, `P`, `chk` | C6.5 ✅ | ✅ DONE (R7.6) — `TK_TOKEN_DOTDOT`/`DotDot` token; `tk_array_elem {is_spread, expr*}` + `tk_array_elems_push`; `parse_array_elems` with spread prefix; checker `type_array_lit` handles `..xs: []T → T`; `TArrayElem` in tast. |
@@ -404,14 +443,20 @@ into **rounds** (parallel waves). The goal is **maximum agent concurrency** with
 - R7.3 ✅ `{C7.1e ✅, C7.1f ✅, C7.1g ✅, C7.1i ✅, C7.7 ✅}` — extern libs + os + marshalling + coverage done
 - R7.4 partial `{C7.8 ✅, C7.11 ✅, C7.1k ✅, C7.1m ✅}` — gate + output + metadata + artifact kinds done
 
-**Remaining rounds (ordered, no deferral):**
-- **R7.5** ✅ `{C7.9, C7.13, C7.14}` — main-rule wired into build pipeline (`check_main_file_rule` called in both `project.tks`+`driver.c`); `tk_str_eq` declared in `text.h` + panic wrapper `tk_str_require_eq`; `TK_RT_LIST` macro + `tk_byte_list`/`tk_str_list`/`tk_i64_list` in `teko_rt.h`. 171 tests, both builds green.
-- **R7.6** ✅ `{C6.7, C6.8}` — spread-into-literal `[..xs, x]` complete: lexer `TK_TOKEN_DOTDOT`, tagged `tk_array_elem` AST, `parse_array_elems`, checker `type_array_lit` with spread type-check, VM flatten, codegen `tk_slice_push` loops, TKB `is_spread` u8 codec. 172 tests, both builds green.
-- **R7.7** ✅ `{C7.2, C7.3, C7.4, C7.5}` — host namespace files done + seeds fully removed. `src/env/env.tks`, `src/io/io.tks`, `src/fs/fs.tks`, `src/process/process.tks` with `pub extern fn`; `void` added to `builtin_type`; `tk_env_lookup_call` (ns_last_seg match) finds extern fn before seed fallback; all host-surface seeds + dead statics removed from `scope.c`/`scope.tks`. 172 tests, both builds green.
-- **R7.8** ✅ `{C7.12}` — `.tkl` ZIP-STORE output done; `teko::compress` namespace (`src/compress/compress.tks`+`.c`) reusable; backend wired for Package artifact; `teko::io::write_file_bytes` added. 172 tests, both builds green.
-- **R7.9** `{C7.10}` (w1) — pre-linker (depends on C7.12 for .tkl loading).
-- **R7.10** `{C7.17}` (w1) — driver.tks fully materialized (depends on C7.2–C7.5).
-- **R7.11** `{C7.1j}` (w1) — multi-OS/arch CI (LAST).
+**Completed rounds (for reference):**
+- **R7.5** ✅ `{C7.9, C7.13, C7.14}` — main-rule + tk_str_eq + TK_RT_LIST. 171 tests, both builds green.
+- **R7.6** ✅ `{C6.7, C6.8}` — spread-into-literal `[..xs, x]` complete. 172 tests, both builds green.
+- **R7.7** ✅ `{C7.2, C7.3, C7.4, C7.5}` — host namespace files + seeds removed. 172 tests, both builds green.
+- **R7.8** ✅ `{C7.12}` — `.tkl` ZIP-STORE output; `teko::compress` reusable; `write_file_bytes` added. 172 tests.
+
+**Remaining Phase 7 crumbs — now scheduled in the cross-phase master sequence (see below):**
+- **C7.15** → cross-phase **W1** (parallel with C7.10, C7.17, C8.1)
+- **C7.10** → cross-phase **W1** (parallel with C7.15, C7.17, C8.1)
+- **C7.17** → cross-phase **W1** (parallel with C7.15, C7.10, C8.1)
+- **E2-NATIVE** → cross-phase **W2** (after C7.15; parallel with C8.2)
+- **C1.7-CAST** → cross-phase **W3** (after E2-NATIVE; parallel with C8.3/C8.5/C8.6)
+- **C7.18** (`defer`) → cross-phase **W5** (solo wave — owns all single-owner files; after C1.7-CAST ✅)
+- **C7.1j** (CI — LAST) → cross-phase **W6** (after Phase 8 ✅ + C9.2 ✅ + defer ✅)
 
 ## Phase 8 — FLAGS
 
@@ -424,7 +469,7 @@ into **rounds** (parallel waves). The goal is **maximum agent concurrency** with
 | **C8.5** VM: flags values + bitwise + helpers | `vm` | C8.2 |
 | **C8.6** `.tkb` serialize flags | `tkb` | C8.2 |
 
-**Rounds:** R8.1 `{C8.1}` (w1) → R8.2 `{C8.2}` (w1) → R8.3 `{C8.3, C8.4, C8.5, C8.6}` (w4).
+**Rounds (cross-phase wave schedule):** C8.1 → **W1** · C8.2 → **W2** · C8.3/C8.5/C8.6 → **W3** · C8.4 → **W4** (see master sequence table).
 
 ## Phase 9 — SEC
 
@@ -433,61 +478,105 @@ into **rounds** (parallel waves). The goal is **maximum agent concurrency** with
 | **C9.1** SAST gate (CI checks) | *(CI/build scripts)* | — |
 | **C9.2** capability/sandbox audit of `exp`/`extern`/syscall surface | `res`/`scope` + report | — |
 
-**Rounds:** R9.1 `{C9.1, C9.2}` (w2).
+**Rounds (cross-phase wave schedule):** C9.2 → **W4** · C9.1 → **W6** (see master sequence table).
 
-## Phase 10 — Evolution S1–S9 *(POST-SELF-HOST; each S-stage is its own sub-project — detailed crumbs are drafted AT stage start against real data, M.4)*
+## Phase 10 — Evolution S1–S10 *(POST-SELF-HOST; each S-stage is its own sub-project — detailed crumbs are drafted AT stage start against real data, M.4)*
 
-Stage-level dependency waves (the hard-ordering invariant). Generics (S4) runs parallel to arenas (S1–S3).
+Stage-level dependency waves (the hard-ordering invariant). Generics (S4) runs parallel to arenas (S1–S3); closures (S4c) unlock after S4; async/await (S10) is the capstone.
 
 | Stage-crumb | Dep |
 |-------------|-----|
 | **C10.S1** arena primitive + root region | S0 seam (done) |
 | **C10.S4** generics (unconstrained, monomorphization) | — |
+| **C10.S4c** closures — `fn` literals with lexical capture; value-capturing first (environment struct + fn-ptr pair); reference-capturing after S3 `ref`. Full pipeline: parser `\|params\| body` syntax; checker captures types + infer; codegen closure struct emission; VM closure values. | S4 |
 | **C10.S2 ★** scope regions + escape check *(tribunal ratifies one-depth-compare)* | S1 |
 | **C10.S3** `ref` (mutable-target only, R2) | S2 |
 | **C10.S5** DI lifetimes → arenas | S2 (+S3) |
 | **C10.S6** constraints (positive; `!` only prims/sealed) | S4 + real Map need |
 | **C10.S7** dynamic collections (append, Map, Set; out-region param) | S4, S6, S2/S3 |
-| **C10.S8** concurrency capstone (scope/spawn/channel/send/recv) | S2, S3 |
+| **C10.S8** concurrency capstone — `scope{}`/`spawn` (routine launch); `channel<T>`/`send`/`recv`; **`Mutex<T>`** (lock/unlock, poisoning on panic); **`Semaphore`** (acquire/release, counting); **`RWMutex`** (concurrent reads, exclusive write); **`WaitGroup`** (add/done/wait); **thread-control** (`thread::spawn` → `JoinHandle`, join, detach, park/unpark); **M:N scheduler** (lightweight routine → OS thread fan-out; work-stealing queue) | S2, S3 |
 | **C10.S9** LTS cleanup (Parsed×14→Result<T>; unify parse/to_string) | S4 |
+| **C10.S10** async/await — coroutine-based non-blocking I/O; `async fn`/`await expr`; Teko runtime event loop (epoll/kqueue/IOCP); cancellation via scope; composable with channels + Mutex | S8 |
 
-**Waves:** W10.A `{S1, S4}` → W10.B `{S2 ★}` → W10.C `{S3, S5}` → W10.D `{S6 → S7}` → W10.E `{S8, S9}`.
-*(Keep deferred ceilings deferred: borrow-solver, region-poly, async, M:N. Implicit-copy-on-escape micro-decision → tribunal.)*
+**Waves (cross-phase schedule):** S1+S4 → **W7** · S4c → **W8** · S2 ★ → **W9** · S3+S5 → **W10** · S6 → **W11** · S7 → **W12** · S8+S9 → **W13** · S10 → **W14** (see master sequence table).
+*(Keep deferred ceilings deferred: borrow-solver / lifetime-variable system; region-polymorphism. Implicit-copy-on-escape → tribunal (lean: NO). M:N scheduler and async/await are NOW IN SEQUENCE — no longer deferred.)*
 
-## Phase 11 — DRY sweep + comment hygiene *(LAST; read-mostly; partitioned by directory → fully parallel)*
+## Phase 11 — Code quality sweep *(LAST; read-mostly; partitioned by directory → fully parallel)*
 
-Each crumb does BOTH on its partition: (a) DRY (kill no-variance repeated calls), and (b) **comment hygiene** — convert every retained comment to a `/** … */` doc comment and DROP all inline `//` / mid-code `/* */` comments (hoist/rename so the line reads without one, or fold the rationale into the preceding doc comment). Partitioned by directory → fully parallel; do (a) then (b) per file so comments settle on the already-DRY'd code.
+Each crumb applies the full principle stack (DRY + KISS + SOLID + YAGNI + 12-Factor + comment hygiene) to its file partition. Order within a file: DRY → KISS → SOLID/ISP/DIP → YAGNI → 12-Factor checks → comment hygiene. Files within a crumb are disjoint → all four crumbs run in parallel.
 
-| Crumb | Owns | Dep |
-|-------|------|-----|
-| **C11.1** DRY + comment-hygiene lexer + parser | `L`, `ast`, `P` | — |
-| **C11.2** DRY + comment-hygiene checker | `chk`, `match`, `collect`, `res`, `scope`, `tast` | — |
-| **C11.3** DRY + comment-hygiene codegen + vm | `cg`, `vm` | — |
-| **C11.4** DRY + comment-hygiene emit + runtime + build + assert + main | `tkb`, `rt`, `build`, `assert`, `main` | — |
+| Crumb | Owns | Dep | Principle focus within partition |
+|-------|------|-----|----------------------------------|
+| **C11.1** quality sweep — lexer + parser | `L`, `ast`, `P` | all W1–W14 ✅ | DRY: `in` for char sets; KISS: flatten multi-step token checks; SRP: parser fns parse exactly one construct; YAGNI: remove unused parse helpers; 12F-XI: no diagnostic mixed into token stream |
+| **C11.2** quality sweep — checker | `chk`, `match`, `collect`, `res`, `scope`, `tast` | all W1–W14 ✅ | DRY: hoisting repeated `tk_env_lookup` patterns; KISS: single-pass resolution where two passes exist with no benefit; ISP: narrow `scope.h` pub surface; DIP: `res` depends on `scope.h` interface only; YAGNI: remove any `pub` checker fn with zero corpus call sites |
+| **C11.3** quality sweep — codegen + vm | `cg`, `vm` | all W1–W14 ✅ | DRY: deduplicate emit helpers that differ only in type name; KISS: merge any codegen case that reduces to the same C template; OCP: new expr kinds are additive arms — audit `-Wswitch` coverage; YAGNI: `driver.tks::compile` dead fn removal + any unreachable honest-stop arms |
+| **C11.4** quality sweep — emit + runtime + build + assert + main | `tkb`, `rt`, `build`, `assert`, `main` | all W1–W14 ✅ | DRY: TKB tag handlers; KISS: `project.tks` command dispatch simplification; 12F-III: `TK_RT_DIR`/`TK_SRC_DIR` env-var paths verified; 12F-V: build/run/test path isolation audit; 12F-IX: atomic output (temp+rename); 12F-XI: stderr-only diagnostics; 12F-XII: sub-command idempotency |
 
-**Rounds:** R11.1 `{C11.1, C11.2, C11.3, C11.4}` (w4). Exit: no no-variance repeats; every comment is `/** … */`; zero inline comments; corpus green + VM==native.
+**Rounds (cross-phase schedule):** C11.1/C11.2/C11.3/C11.4 → **W15** (all parallel — see master sequence table). Exit: DRY ✓ · KISS ✓ · SOLID ✓ · YAGNI ✓ · 12-Factor III/V/IX/XI/XII ✓ · every comment `/** … */` · zero inline comments · corpus green + VM==native.
 
 ---
 
-## Round-by-round agent matrix (max concurrency width)
+## Round-by-round agent matrix — completed phases
+
+Phases 1–7 (partial) are done; this table is kept for historical reference.
 
 | Phase | Rounds → width | Peak agents | Notes |
 |-------|----------------|-------------|-------|
-| 1 Diagnostics | R1.1=2 ✅, R1.2=2, R1.3=3 | **3** | C1-POS (R1.2) is a serial foundation — exact-fields + Expr reshape; width resumes at R1.3 |
-| 2 `in` | R2.1=1, R2.2=1, R2.3=4 | **4** | fan-out after the AST node lands |
-| 3 stdlib | R3.1=2, R3.2=2 | **2** | runtime-first, then cg/vm |
-| 4 mirror audit | R4.1=4 | **4** | one agent per directory cluster |
-| 5 init-analysis | R5.1=1, R5.2=1 | **1** | single subsystem, serial |
-| 6 self-host | R6.1=4, R6.2=3, R6.3=2, R6.4=1 | **4** | `cg`/`vm` serialize R6.1→R6.2→R6.3 |
-| 7 host-independence | R7.1=6, R7.2=3, R7.3=6, R7.4=5 | **6** | widest phase; 4 independent tracks |
-| 8 FLAGS | R8.1=1, R8.2=1, R8.3=4 | **4** | fan-out after the decl AST lands |
-| 9 SEC | R9.1=2 | **2** | CI + audit in parallel |
-| 10 evolution | 5 stage-waves (≤2 each) | **2** | per-stage crumbs expand at stage start |
-| 11 DRY | R11.1=4 | **4** | one agent per directory cluster |
+| 1 Diagnostics | R1.1=2 ✅, R1.2=2 ✅, R1.3=3 ✅ | **3** | C1-POS serial foundation; E2-NATIVE/C1.7-CAST deferred to cross-phase wave 2/3 below |
+| 2 `in` | R2.1=1 ✅, R2.2=1 ✅, R2.3=4 ✅ | **4** | — |
+| 3 stdlib | R3.1=2 ✅, R3.2=2 ✅ | **2** | — |
+| 4 mirror audit | R4.1=4 ✅ (continuous SUPREME RULE) | **4** | standing discipline, not a discrete sweep |
+| 5 init-analysis | R5.1=1 ✅, R5.2=1 ✅ | **1** | initanalysis.{tks,c,h} delivered |
+| 6 self-host | R6.1=4 ✅, R6.2=3 ✅, R6.3=2 ✅, R6.4=1 ✅ | **4** | FULL SELF-HOSTING — exit criteria met |
+| 7 host-independence | R7.1=6 ✅, R7.2=3 ✅, R7.3=6 ✅, R7.4=5 ✅, R7.5=3 ✅, R7.6=2 ✅, R7.7=4 ✅, R7.8=1 ✅ | **6** | R7.8b–R7.12 remain — folded into cross-phase waves below |
 
-**Bottlenecks to respect:** `cg` and `vm` are single-owner files — they cap real concurrency whenever a
-phase touches the backends (1, 6, 7, 8). New-file work (host surfaces, `diag`, `tsym`, namespace stdlib)
-and per-directory audits/sweeps are where width is cheapest. **Cross-phase parallel option:** Phase 2
-(`in`), Phase 3 (stdlib), and Phase 5 (init-analysis) are mutually independent and *could* run as one
-combined fan-out if agent budget allows — but Phase 1 must land first (everything reports through it) and
-Phase 6 must not start until 1–5 are integrated (it builds on settled front-end + diagnostics).
+---
+
+## Master execution sequence — all remaining work (cross-phase waves)
+
+Items within a wave are **parallel** (disjoint file-owners, all dependencies met). A wave cannot
+start until the previous wave's integration gate passes: **build green + VM==native + regressions**.
+
+**Parallelism constraints:**
+- `cg` and `vm` are single-owner: only ONE crumb per wave may own each.
+- `rt` (`teko_rt.h`/`.c`): single-owner.
+- `tkb` (`tkb_write`/`tkb_read`): single-owner.
+- `chk`/`collect`/`res`/`scope`: logically single-owner (tightly coupled checker files).
+- New files (`src/arena/`, `src/generics/`, …): no constraint on count.
+
+| Wave | Crumbs (parallel within wave) | Files owned | Width | Gate before next wave |
+|------|-------------------------------|-------------|-------|----------------------|
+| **W1** | **C7.15** overflow-debug panic guard (codegen) | `cg` | | |
+| | **C7.10** pre-linker — load dep `.tkl`/`.tkb` → merge typed trees → check app pre-emit | `tkb`, `build`, `res` | | |
+| | **C7.17** driver.tks materialized — replace seed lookups with `use teko::env/io/fs/process` | `driver` | | |
+| | **C8.1** `flags` keyword (lexer) | `L` | **4** | build green + VM==native |
+| **W2** | **E2-NATIVE** native `error` as C struct — `err_loc`/`err_typed` work in native; `error.line/col` → real values *(deps: C7.15 ✅)* | `rt`, `cg` | | |
+| | **C8.2** `flags` decl + AST + parser *(deps: C8.1 ✅)* | `ast`, `P` | **2** | build green + VM==native |
+| **W3** | **C1.7-CAST** native CAST positioning — global panic-loc in `tk_to_*` helpers *(deps: E2-NATIVE ✅)* | `rt`, `cg` | | |
+| | **C8.3** `flags` checker — power-of-2 auto-assign, u128 guard, bitwise typing, helpers *(deps: C8.2 ✅)* | `chk`, `collect`, `res` | | |
+| | **C8.5** `flags` VM — flags values + bitwise + helpers *(deps: C8.2 ✅)* | `vm` | | |
+| | **C8.6** `flags` TKB serialize *(deps: C8.2 ✅)* | `tkb` | **4** | build green + VM==native |
+| **W4** | **C8.4** `flags` codegen — emit u128-fitting uint + bitwise + helpers *(deps: C8.3 ✅, C1.7-CAST frees `cg`)* | `cg` | | |
+| | **C9.2** capability/sandbox audit — `exp`/`extern`/syscall surface *(deps: Phase 7 ✅, C8.3 ✅)* | `res`, `scope` + report | **2** | build green + audit report |
+| **W5** | **C7.18** `defer` — full pipeline: lexer keyword; AST `DeferStmt`; parser in `parse_stmt`; checker (void-context block); codegen (cleanup at ALL exit points of the enclosing fn); VM (deferred-stack per frame, LIFO on exit); TKB serialize *(deps: C1.7-CAST ✅ — codegen stable)* | `L`, `ast`, `P`, `chk`, `cg`, `vm`, `tkb` | **1** | build green + VM==native |
+| **W6** | **C7.1j** multi-OS/arch CI pipelines — Linux arm64+x86, Windows arm64+x86, macOS arm64 *(deps: all Phase 7 ✅, Phase 8 ✅, defer ✅)* | CI scripts | | |
+| | **C9.1** SAST gate (CI checks) *(deps: C9.2 ✅, C7.1j CI infra)* | CI scripts | **2** | CI green on all platforms |
+| **W7** | **S1** arena primitive + root region *(deps: S0 seam ✅)* | `src/arena/` (new) | | |
+| | **S4** generics — unconstrained, monomorphization *(deps: —)* | `src/generics/` (new) | **2** | build green + VM==native |
+| **W8** | **S4c** closures — `fn` literals with lexical capture: parser `\|params\| body` syntax; checker infers captured-variable types + emits environment struct; codegen closure = `{env_ptr, fn_ptr}` C struct pair; VM closure value; value-capturing first (no escape), reference-capturing deferred to after S3 *(deps: S4 ✅)* | `ast`, `P`, `chk`, `cg`, `vm`, `tkb` | **1** | build green + VM==native |
+| **W9** | **S2 ★** scope regions + escape check — tribunal: one-depth-compare *(deps: S1 ✅)* | `src/region/` (new), `chk` | **1** | build green + VM==native (serial — S2 is the linchpin; its crumbs gate S3, S5, S8) |
+| **W10** | **S3** `ref` — mutable-target only, R2 *(deps: S2 ✅)* | `src/ref/` (new), `chk`, `cg`, `vm` | | |
+| | **S5** DI lifetimes → arenas *(deps: S2 ✅, S3 ✅)* | `chk` (DI wiring) | **2** | build green + VM==native *(S3+S5 share `chk`; internal crumbs serialize; stage-start parallel — crumbs at M.4)* |
+| **W11** | **S6** constraints — positive; `!` only prims/sealed; forced by Map *(deps: S4 ✅, S3 ✅)* | `chk`, `cg`, `vm` | **1** | build green + VM==native |
+| **W12** | **S7** real dynamic collections — amortized append, Map, Set; out-region param *(deps: S4 ✅, S6 ✅, S2 ✅, S3 ✅)* | `chk`, `cg`, `vm`, `src/collections/` (new) | **1** | build green + VM==native |
+| **W13** | **S8** concurrency capstone — `scope{}`/`spawn` (routine launch, M:N scheduler); `channel<T>`/`send`/`recv`; **`Mutex<T>`** (lock/unlock, panic-poisoning); **`Semaphore`** (counting acquire/release); **`RWMutex`** (concurrent reads + exclusive write); **`WaitGroup`** (add/done/wait); **thread-control** (`thread::spawn`→`JoinHandle`, join, detach, park/unpark); **M:N work-stealing scheduler** *(deps: S2 ✅, S3 ✅)* | `chk`, `cg`, `vm`, `src/concurrency/` (new) | | |
+| | **S9** LTS cleanup — `Parsed<T>×14`→`Result<T>`; unify `parse`/`to_string` *(deps: S4 ✅)* | `ast`, `P`, `chk` (widespread) | **2** | build green + VM==native *(S8+S9 share `chk`; internal crumbs serialize; detailed at M.4)* |
+| **W14** | **S10** async/await — `async fn` + `await expr`; coroutine-based non-blocking I/O; Teko runtime event loop (epoll/kqueue/IOCP per OS); cancellation via `scope{}`; composable with `channel<T>` + `Mutex<T>` *(deps: S8 ✅)* | `chk`, `cg`, `vm`, `rt`, `src/async/` (new) | **1** | build green + VM==native |
+| **W15** | **C11.1** quality sweep (DRY+KISS+SOLID+YAGNI+12F+comments) — lexer + parser | `L`, `ast`, `P` | | |
+| | **C11.2** quality sweep — checker | `chk`, `match`, `collect`, `res`, `scope`, `tast` | | |
+| | **C11.3** quality sweep — codegen + vm | `cg`, `vm` | | |
+| | **C11.4** quality sweep — emit + runtime + build + assert + main | `tkb`, `rt`, `build`, `assert`, `main` | **4** | DRY ✓ · KISS ✓ · SOLID ✓ · YAGNI ✓ · 12F-III/V/IX/XI/XII ✓ · comments `/** */` · VM==native |
+
+**Deferred ceilings (never enter the sequence):** borrow-solver / lifetime-variable system; region-polymorphism. Implicit-copy-on-escape → tribunal (lean: NO). *(async/await → W14; M:N scheduler → W13 — both removed from deferred.)*
+
+**Bottlenecks:** `cg`/`vm`/`rt`/`tkb`/`chk` serialize across waves (single-owner). New-namespace files (W7–W14) have no concurrency constraint. Wave widths 1–5 are capped by these bottlenecks, not by agent count. Total: **15 waves**.
