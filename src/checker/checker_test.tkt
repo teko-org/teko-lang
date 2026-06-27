@@ -1,37 +1,46 @@
-// src/checker/checker_test.tkt — tests for the typer (C1). NO main: PUBLIC #test
-// functions the compiler collects (a runner — ALPHA). C mirror: a `main` harness.
-// The typer is unit-tested on HAND-BUILT AST (the parser is tested elsewhere): each
-// type_* must produce a fully typed node (happy) or refuse an ill-typed one (barrier).
+// src/checker/checker_test.tkt — tests for the typer (C1). #test functions the runner collects.
+// The typer is unit-tested on HAND-BUILT AST: each type_* must produce a fully typed node (happy)
+// or refuse an ill-typed one (barrier). Rewritten to current Teko (the `Expr` node-wrapper C1-POS,
+// all-fields struct literals, `Function`/`Arm`/`TypeDecl`/`Item` shapes) and module-qualified.
 
-// --- small Type/AST constructors (keep the tests legible — M.2) ---
+use teko::parser
+
+// --- AST constructors (every expression is wrapped in a positioned `parser::Expr`) ---
+fn ek(k: parser::ExprKind) -> parser::Expr { parser::Expr { kind = k; line = 0; col = 0 } }
+fn e_num(v: i128) -> parser::Expr { ek(parser::Number { is_float = false; value = v; fval = 0.0 }) }
+fn e_var(name: str) -> parser::Expr { ek(parser::Var { name = name }) }
+fn e_str(t: str)    -> parser::Expr { ek(parser::StrLit { text = t }) }
+fn st(e: parser::Expr) -> parser::Statement { parser::ExprStmt { expr = e } }   // an expr-statement
+fn one_stmt(e: parser::Expr) -> []parser::Statement { teko::list::push(teko::list::empty(), st(e)) }
+fn path1(name: str) -> parser::Path { parser::Path { segments = teko::list::push(teko::list::empty(), parser::Segment { name = name }) } }
+fn named_t(name: str) -> parser::TypeExpr { parser::NamedType { path = path1(name) } }
+
+// --- Type/env constructors ---
 fn u32t()  -> Type { Prim { kind = PrimKind::U32 } }
 fn u8t()   -> Type { Prim { kind = PrimKind::U8 } }
 fn i64t()  -> Type { Prim { kind = PrimKind::I64 } }
 fn boolt() -> Type { Prim { kind = PrimKind::Bool } }
-fn empty_env()   -> Env       { teko::list::empty() }
+fn empty_env()   -> Env       { Env { bindings = teko::list::empty(); cur_ns = "" } }
 fn empty_table() -> TypeTable { teko::list::empty() }
-fn path1(name: str) -> Path { Path { segments = teko::list::push(teko::list::empty(), Segment { name = name }) } }
 fn prim_is(t: Type, k: PrimKind) -> bool { match t { Prim as p => p.kind == k; _ => false } }
 
 #test
 fn types_leaves() {
-    // happy: each literal leaf carries its type.
-    let n = type_number(Number { value = 5 })
+    let n = type_number(parser::Number { is_float = false; value = 5; fval = 0.0 })
     teko::assert::is_true(prim_is(n.type, PrimKind::I64))
     match n.kind { TNumber as tn => teko::assert::is_true(tn.value == 5); _ => teko::assert::is_true(false) }
-    let s = type_strlit(StrLit { text = "hi" })
+    let s = type_strlit(parser::StrLit { text = "hi" })
     match s.type { Str => teko::assert::is_true(true); _ => teko::assert::is_true(false) }
-    let b = type_bytelit(ByteLit { value = b'A' })
+    let b = type_bytelit(parser::ByteLit { value = b'A' })
     match b.type { Byte => teko::assert::is_true(true); _ => teko::assert::is_true(false) }
 }
 
 #test
 fn types_var_and_binary() {
-    // happy: a var resolves via the env; a same-type binary yields that type (B.22).
     let env = define(empty_env(), "x", u32t(), false)
-    let vx = match type_var(Var { name = "x" }, env) { TExpr as e => e; error => { teko::assert::is_true(false); return } }
+    let vx = match type_var(parser::Var { name = "x" }, env) { TExpr as e => e; error => { teko::assert::is_true(false); return } }
     teko::assert::is_true(prim_is(vx.type, PrimKind::U32))
-    let bin = Binary { op = lexer::TokenKind::Plus; left = Var { name = "x" }; right = Var { name = "x" } }
+    let bin = parser::Binary { op = lexer::TokenKind::Plus; left = e_var("x"); right = e_var("x") }
     let tb = match type_binary(bin, env, empty_table()) { TExpr as e => e; error => { teko::assert::is_true(false); return } }
     teko::assert::is_true(prim_is(tb.type, PrimKind::U32))
     match tb.kind {
@@ -45,108 +54,94 @@ fn types_var_and_binary() {
 
 #test
 fn types_compare_and_unary() {
-    // happy: a comparison chain is bool; `!` on a bool is bool.
     let env = define(empty_env(), "x", u32t(), false)
-    let crest = teko::list::push(teko::list::empty(), CmpTerm { op = lexer::TokenKind::Lt; operand = Var { name = "x" } })
-    let cmp = Compare { first = Var { name = "x" }; rest = crest }
+    let crest = teko::list::push(teko::list::empty(), parser::CmpTerm { op = lexer::TokenKind::Lt; operand = e_var("x") })
+    let cmp = parser::Compare { first = e_var("x"); rest = crest }
     let tc = match type_compare(cmp, env, empty_table()) { TExpr as e => e; error => { teko::assert::is_true(false); return } }
     teko::assert::is_true(prim_is(tc.type, PrimKind::Bool))
-    let un = Unary { op = lexer::TokenKind::Bang; operand = cmp }   // !(x < x) — operand is bool
+    let un = parser::Unary { op = lexer::TokenKind::Bang; operand = ek(cmp) }   // !(x < x) — operand is bool
     let tu = match type_unary(un, env, empty_table()) { TExpr as e => e; error => { teko::assert::is_true(false); return } }
     teko::assert::is_true(prim_is(tu.type, PrimKind::Bool))
 }
 
 #test
 fn types_call() {
-    // happy: a call checks args against the signature and yields the return type.
     let env0 = define(empty_env(), "x", u32t(), false)
     let params: []Type = teko::list::push(teko::list::empty(), u32t())
     let env = define(env0, "f", Func { params = params; ret = boolt() }, false)
-    let args: []Expr = teko::list::push(teko::list::empty(), Var { name = "x" })
-    let tcall = match type_call(Call { callee = path1("f"); args = args }, env, empty_table()) { TExpr as e => e; error => { teko::assert::is_true(false); return } }
+    let args: []parser::Expr = teko::list::push(teko::list::empty(), e_var("x"))
+    let tcall = match type_call(parser::Call { callee = path1("f"); args = args }, env, empty_table()) { TExpr as e => e; error => { teko::assert::is_true(false); return } }
     teko::assert::is_true(prim_is(tcall.type, PrimKind::Bool))
     match tcall.kind { TCall as cc => teko::assert::is_true(cc.args.len == 1); _ => teko::assert::is_true(false) }
 }
 
 #test
 fn types_if_value() {
-    // happy: an `if` value — cond bool, both branches i64 → i64.
     let env = define(empty_env(), "x", u32t(), false)
-    let crest = teko::list::push(teko::list::empty(), CmpTerm { op = lexer::TokenKind::Lt; operand = Var { name = "x" } })
-    let cond = Compare { first = Var { name = "x" }; rest = crest }
-    let thenb: []Statement = teko::list::push(teko::list::empty(), ExprStmt { expr = Number { value = 1 } })
-    let elseb: []Statement = teko::list::push(teko::list::empty(), ExprStmt { expr = Number { value = 2 } })
-    let iff = IfExpr { cond = cond; then_blk = thenb; has_else = true; else_blk = elseb }
+    let crest = teko::list::push(teko::list::empty(), parser::CmpTerm { op = lexer::TokenKind::Lt; operand = e_var("x") })
+    let cond = ek(parser::Compare { first = e_var("x"); rest = crest })
+    let iff = parser::IfExpr { cond = cond; then_blk = one_stmt(e_num(1)); has_else = true; else_blk = one_stmt(e_num(2)) }
     let ti = match type_if(iff, env, empty_table()) { TExpr as e => e; error => { teko::assert::is_true(false); return } }
     teko::assert::is_true(prim_is(ti.type, PrimKind::I64))
     match ti.kind { TIfExpr as tif => teko::assert::is_true(tif.has_else); _ => teko::assert::is_true(false) }
 }
 
+// a bare (non-binding) literal arm / wildcard arm with the given body value.
+fn lit_arm(v: i128, body: i128) -> parser::Arm {
+    parser::Arm { pattern = parser::LiteralPattern { value = e_num(v) }; has_when = false; guard = e_num(0); body = one_stmt(e_num(body)) }
+}
+fn wild_arm(body: i128) -> parser::Arm {
+    parser::Arm { pattern = parser::WildcardPattern { }; has_when = false; guard = e_num(0); body = one_stmt(e_num(body)) }
+}
+
 #test
 fn types_match() {
-    // happy: a `match` over an integer — a literal arm + a `_` valve (exhaustive via `_`).
     let env = define(empty_env(), "n", i64t(), false)
-    let lit  = Arm { pattern = LiteralPattern { value = Number { value = 0 } }; has_when = false; guard = Number { value = 0 }; body = Number { value = 10 } }
-    let wild = Arm { pattern = WildcardPattern { };                              has_when = false; guard = Number { value = 0 }; body = Number { value = 20 } }
-    let arms: []Arm = teko::list::push(teko::list::push(teko::list::empty(), lit), wild)
-    let m = MatchExpr { subject = Var { name = "n" }; arms = arms }
+    let arms: []parser::Arm = teko::list::push(teko::list::push(teko::list::empty(), lit_arm(0, 10)), wild_arm(20))
+    let m = parser::MatchExpr { subject = e_var("n"); arms = arms }
     let tm = match type_match(m, env, empty_table()) { TExpr as e => e; error => { teko::assert::is_true(false); return } }
     teko::assert::is_true(prim_is(tm.type, PrimKind::I64))
     match tm.kind { TMatchExpr as tmm => teko::assert::is_true(tmm.arms.len == 2); _ => teko::assert::is_true(false) }
 }
 
+// build a `fn NAME(x: u32) -> <ret> { body }` for the function/return tests.
+fn mk_fn(name: str, ret: parser::TypeExpr, body: []parser::Statement) -> parser::Function {
+    let p = parser::Param { name = "x"; type_ann = named_t("u32") }
+    let params = teko::list::push(teko::list::empty(), p)
+    parser::Function { name = name; params = params; has_return = true; return_type = ret; body = body; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; is_test = false }
+}
+
 #test
 fn types_function_and_program() {
-    // happy: a whole function types into a fully typed body; the program driver runs
-    // collect (pass 1) + type each item (pass 2).
-    let p = Param { name = "x"; type_ann = NamedType { path = path1("u32") } }
-    let params: []Param = teko::list::push(teko::list::empty(), p)
-    let body: []Statement = teko::list::push(teko::list::empty(), ExprStmt { expr = Var { name = "x" } })
-    let f = Function {
-        name = "id"
-        params = params
-        has_return = true
-        return_type = NamedType { path = path1("u32") }
-        body = body
-        is_exp = false
-        has_doc = false
-        doc = ""
-    }
+    let f = mk_fn("id", named_t("u32"), one_stmt(e_var("x")))
     let tf = match type_function(f, empty_env(), empty_table()) { TFunction as x => x; error => { teko::assert::is_true(false); return } }
     teko::assert::is_true(prim_is(tf.return_type, PrimKind::U32))
     teko::assert::is_true(tf.body.len == 1)
     match tf.body[0] { TExprStmt as es => teko::assert::is_true(prim_is(es.expr.type, PrimKind::U32)); _ => teko::assert::is_true(false) }
 
-    let items: []Item = teko::list::push(teko::list::empty(), f)
-    let tp = match type_program(Program { items = items }) { TProgram as x => x; error => { teko::assert::is_true(false); return } }
+    let items: []parser::Item = teko::list::push(teko::list::empty(), parser::Item { content = f; namespace = ""; file = "" })
+    let tp = match type_program(parser::Program { items = items }) { TProgram as x => x; error => { teko::assert::is_true(false); return } }
     teko::assert::is_true(tp.items.len == 1)
     match tp.items[0] { TFunction as ff => teko::assert::is_true(prim_is(ff.return_type, PrimKind::U32)); _ => teko::assert::is_true(false) }
 }
 
 #test
 fn rejects_ill_typed() {
-    // barrier: no untyped node escapes (M.1/M.3) — each of these MUST fail to type.
     let env2 = define(define(empty_env(), "x", u32t(), false), "y", u8t(), false)
-
     // mixed-width arithmetic — no promotion (B.22).
-    let mix = Binary { op = lexer::TokenKind::Plus; left = Var { name = "x" }; right = Var { name = "y" } }
+    let mix = parser::Binary { op = lexer::TokenKind::Plus; left = e_var("x"); right = e_var("y") }
     match type_binary(mix, env2, empty_table()) { TExpr => teko::assert::is_true(false); error => teko::assert::is_true(true) }
-
     // an undefined name has no type.
-    match type_var(Var { name = "z" }, empty_env()) { TExpr => teko::assert::is_true(false); error => teko::assert::is_true(true) }
-
+    match type_var(parser::Var { name = "z" }, empty_env()) { TExpr => teko::assert::is_true(false); error => teko::assert::is_true(true) }
     // an `if` used as a VALUE needs an `else` (B.20).
-    let crest = teko::list::push(teko::list::empty(), CmpTerm { op = lexer::TokenKind::Lt; operand = Var { name = "x" } })
-    let cond  = Compare { first = Var { name = "x" }; rest = crest }
-    let thenb: []Statement = teko::list::push(teko::list::empty(), ExprStmt { expr = Number { value = 1 } })
-    let noelse = IfExpr { cond = cond; then_blk = thenb; has_else = false; else_blk = thenb }
+    let crest = teko::list::push(teko::list::empty(), parser::CmpTerm { op = lexer::TokenKind::Lt; operand = e_var("x") })
+    let cond  = ek(parser::Compare { first = e_var("x"); rest = crest })
+    let noelse = parser::IfExpr { cond = cond; then_blk = one_stmt(e_num(1)); has_else = false; else_blk = one_stmt(e_num(1)) }
     match type_if(noelse, env2, empty_table()) { TExpr => teko::assert::is_true(false); error => teko::assert::is_true(true) }
-
     // a non-exhaustive `match` (integer subject, only a literal arm, no `_`).
     let envi = define(empty_env(), "n", i64t(), false)
-    let lit  = Arm { pattern = LiteralPattern { value = Number { value = 0 } }; has_when = false; guard = Number { value = 0 }; body = Number { value = 1 } }
-    let arms: []Arm = teko::list::push(teko::list::empty(), lit)
-    match type_match(MatchExpr { subject = Var { name = "n" }; arms = arms }, envi, empty_table()) { TExpr => teko::assert::is_true(false); error => teko::assert::is_true(true) }
+    let arms: []parser::Arm = teko::list::push(teko::list::empty(), lit_arm(0, 1))
+    match type_match(parser::MatchExpr { subject = e_var("n"); arms = arms }, envi, empty_table()) { TExpr => teko::assert::is_true(false); error => teko::assert::is_true(true) }
 }
 
 // --- C2 cast helpers ---
@@ -154,247 +149,197 @@ fn i8t()  -> Type { Prim { kind = PrimKind::I8 } }
 fn i16t() -> Type { Prim { kind = PrimKind::I16 } }
 fn i32t() -> Type { Prim { kind = PrimKind::I32 } }
 fn strt() -> Type { Str { } }
-// a `varname to target_name` cast over the parser AST.
-fn cast_of(varname: str, target_name: str) -> Cast {
-    Cast { expr = Var { name = varname }; target = NamedType { path = path1(target_name) } }
+fn cast_of(varname: str, target_name: str) -> parser::Cast {
+    parser::Cast { expr = e_var(varname); target = named_t(target_name) }
 }
-// `varname: src` cast to `target_name` — true iff it types to the primitive `want`.
 fn cast_types_to(varname: str, src: Type, target_name: str, want: PrimKind) -> bool {
     let env = define(empty_env(), varname, src, false)
-    match type_cast(cast_of(varname, target_name), env, empty_table()) {
-        TExpr as te => prim_is(te.type, want)
-        error       => false
-    }
+    match type_cast(cast_of(varname, target_name), env, empty_table()) { TExpr as te => prim_is(te.type, want); error => false }
 }
-// does the cast fail to type (the barrier)?
 fn cast_errors(varname: str, src: Type, target_name: str) -> bool {
     let env = define(empty_env(), varname, src, false)
-    match type_cast(cast_of(varname, target_name), env, empty_table()) {
-        TExpr => false
-        error => true
-    }
+    match type_cast(cast_of(varname, target_name), env, empty_table()) { TExpr => false; error => true }
 }
-// a CONSTANT literal `v to target_name` — true iff it types to `want`.
 fn cast_const_types_to(v: i64, target_name: str, want: PrimKind) -> bool {
-    let c = Cast { expr = Number { value = v }; target = NamedType { path = path1(target_name) } }
+    let c = parser::Cast { expr = e_num(v to i128); target = named_t(target_name) }
     match type_cast(c, empty_env(), empty_table()) { TExpr as te => prim_is(te.type, want); error => false }
 }
-// does a CONSTANT cast fail (out of range — the fail-early barrier)?
 fn cast_const_errors(v: i64, target_name: str) -> bool {
-    let c = Cast { expr = Number { value = v }; target = NamedType { path = path1(target_name) } }
+    let c = parser::Cast { expr = e_num(v to i128); target = named_t(target_name) }
     match type_cast(c, empty_env(), empty_table()) { TExpr => false; error => true }
 }
 
 #test
 fn casts_allowed() {
-    // C2a (B) — every DEFINED numeric conversion type-checks; loss (if any) is a RUNTIME guard
-    // (codegen), not a type error. The value might fit, so the metal conversion is kept (M.0).
-    teko::assert::is_true(cast_types_to("a", i8t(),  "i32", PrimKind::I32))   // widening
-    teko::assert::is_true(cast_types_to("c", i32t(), "i8",  PrimKind::I8))    // NARROWING — allowed (runtime-guarded), not a compile error
-    teko::assert::is_true(cast_types_to("d", i32t(), "u32", PrimKind::U32))   // signed → unsigned — allowed (runtime-guarded)
-    teko::assert::is_true(cast_types_to("e", u32t(), "i8",  PrimKind::I8))    // unsigned → narrower signed — allowed
-    teko::assert::is_true(cast_types_to("f", i32t(), "i32", PrimKind::I32))   // same-type no-op
-    // a CONSTANT that FITS the (narrower) target types fine — no fail-early trip.
+    teko::assert::is_true(cast_types_to("a", i8t(),  "i32", PrimKind::I32))
+    teko::assert::is_true(cast_types_to("c", i32t(), "i8",  PrimKind::I8))
+    teko::assert::is_true(cast_types_to("d", i32t(), "u32", PrimKind::U32))
+    teko::assert::is_true(cast_types_to("e", u32t(), "i8",  PrimKind::I8))
+    teko::assert::is_true(cast_types_to("f", i32t(), "i32", PrimKind::I32))
     teko::assert::is_true(cast_const_types_to(200, "u8",  PrimKind::U8))
     teko::assert::is_true(cast_const_types_to(5,   "i8",  PrimKind::I8))
 }
 
 #test
 fn casts_forbidden() {
-    // C2b (B) — only UNDEFINED conversions and COMPILE-TIME-KNOWN out-of-range constants error.
-    teko::assert::is_true(cast_errors("a", boolt(), "i32"))    // bool casts undefined in the seed …
-    teko::assert::is_true(cast_errors("b", i32t(),  "bool"))   // … either direction
-    teko::assert::is_true(cast_errors("c", strt(),  "i32"))    // non-numeric source
-    // a CONSTANT the compiler can see out of range → compile error (fail early — M.1).
-    teko::assert::is_true(cast_const_errors(300, "i8"))          // 300 ∉ [-128, 127]
-    teko::assert::is_true(cast_const_errors(-1,  "u8"))          // -1 ∉ [0, 255]
-    teko::assert::is_true(cast_const_errors(5000000000, "i32"))  // > i32 max
+    teko::assert::is_true(cast_errors("a", boolt(), "i32"))
+    teko::assert::is_true(cast_errors("b", i32t(),  "bool"))
+    teko::assert::is_true(cast_errors("c", strt(),  "i32"))
+    teko::assert::is_true(cast_const_errors(300, "i8"))
+    teko::assert::is_true(cast_const_errors(-1,  "u8"))
+    teko::assert::is_true(cast_const_errors(5000000000, "i32"))
 }
 
 #test
 fn revalidate_rederives_casts() {
-    // the counter-validation RE-PROVES the conversion is DEFINED (M.3 — not a rubber stamp).
-    let goodinner = TExpr { kind = TVar { name = "y" }; type = i32t() }
-    let good = TExpr { kind = TCast { expr = goodinner }; type = i8t() }    // i32 → i8 is a DEFINED cast (B)
+    let goodinner = TExpr { kind = TVar { name = "y" }; type = i32t(); line = 0; col = 0 }
+    let good = TExpr { kind = TCast { expr = goodinner }; type = i8t(); line = 0; col = 0 }
     match validate_texpr(good) { null => teko::assert::is_true(true); error => teko::assert::is_true(false) }
-
-    let badinner = TExpr { kind = TVar { name = "s" }; type = strt() }
-    let bad = TExpr { kind = TCast { expr = badinner }; type = i32t() }     // str → i32 is UNDEFINED
+    let badinner = TExpr { kind = TVar { name = "s" }; type = strt(); line = 0; col = 0 }
+    let bad = TExpr { kind = TCast { expr = badinner }; type = i32t(); line = 0; col = 0 }
     match validate_texpr(bad) { null => teko::assert::is_true(false); error => teko::assert::is_true(true) }
 }
 
 // --- byte↔int cast helpers (byte casts AS u8 — B.36) ---
 fn bytet() -> Type { Byte { } }
-// byte is the cast TARGET: the result type is Byte{} (not a Prim), so teko::assert::is_true(via type_eq.)
 fn cast_types_to_byte(varname: str, src: Type) -> bool {
     let env = define(empty_env(), varname, src, false)
-    match type_cast(cast_of(varname, "byte"), env, empty_table()) {
-        TExpr as te => type_eq(te.type, Byte { })
-        error       => false
-    }
+    match type_cast(cast_of(varname, "byte"), env, empty_table()) { TExpr as te => type_eq(te.type, Byte { }); error => false }
 }
-// a CONSTANT `v to byte` — true iff it types (result is Byte{}).
 fn cast_const_types_to_byte(v: i64) -> bool {
-    let c = Cast { expr = Number { value = v }; target = NamedType { path = path1("byte") } }
+    let c = parser::Cast { expr = e_num(v to i128); target = named_t("byte") }
     match type_cast(c, empty_env(), empty_table()) { TExpr as te => type_eq(te.type, Byte { }); error => false }
 }
 
 #test
 fn byte_int_casts_allowed() {
-    // byte casts AS u8 (B.36): byte ↔ any integer is DEFINED, both directions.
-    teko::assert::is_true(cast_types_to("a", bytet(), "u32", PrimKind::U32))   // byte → wider unsigned (lossless — M.1)
-    teko::assert::is_true(cast_types_to("b", bytet(), "u8",  PrimKind::U8))    // byte → u8 (its own values)
-    teko::assert::is_true(cast_types_to("c", bytet(), "i64", PrimKind::I64))   // byte → wide signed
-    teko::assert::is_true(cast_types_to_byte("d", u8t()))                      // u8  → byte
-    teko::assert::is_true(cast_types_to_byte("e", u32t()))                     // u32 → byte (narrowing — runtime-guarded)
-    teko::assert::is_true(cast_const_types_to_byte(200))                       // constant 200 ∈ [0, 255]
+    teko::assert::is_true(cast_types_to("a", bytet(), "u32", PrimKind::U32))
+    teko::assert::is_true(cast_types_to("b", bytet(), "u8",  PrimKind::U8))
+    teko::assert::is_true(cast_types_to("c", bytet(), "i64", PrimKind::I64))
+    teko::assert::is_true(cast_types_to_byte("d", u8t()))
+    teko::assert::is_true(cast_types_to_byte("e", u32t()))
+    teko::assert::is_true(cast_const_types_to_byte(200))
 }
 
 #test
 fn byte_int_casts_forbidden() {
-    teko::assert::is_true(cast_const_errors(300, "byte"))     // 300 ∉ [0, 255] — fail early (M.1)
-    teko::assert::is_true(cast_const_errors(-1,  "byte"))     // -1  ∉ [0, 255]
-    teko::assert::is_true(cast_errors("a", boolt(), "byte"))  // bool → byte undefined (bool has no cast kind)
-    teko::assert::is_true(cast_errors("b", bytet(), "bool"))  // byte → bool undefined (either direction)
-    teko::assert::is_true(cast_errors("c", bytet(), "str"))   // byte → non-numeric undefined
+    teko::assert::is_true(cast_const_errors(300, "byte"))
+    teko::assert::is_true(cast_const_errors(-1,  "byte"))
+    teko::assert::is_true(cast_errors("a", boolt(), "byte"))
+    teko::assert::is_true(cast_errors("b", bytet(), "bool"))
+    teko::assert::is_true(cast_errors("c", bytet(), "str"))
 }
 
 #test
 fn revalidate_rederives_byte_casts() {
-    // the counter-validation RE-PROVES byte↔int is DEFINED (M.3).
-    let gi  = TExpr { kind = TVar { name = "b" }; type = bytet() }
-    let g   = TExpr { kind = TCast { expr = gi }; type = u32t() }    // byte → u32 DEFINED (B; byte AS u8)
+    let gi  = TExpr { kind = TVar { name = "b" }; type = bytet(); line = 0; col = 0 }
+    let g   = TExpr { kind = TCast { expr = gi }; type = u32t(); line = 0; col = 0 }
     match validate_texpr(g) { null => teko::assert::is_true(true); error => teko::assert::is_true(false) }
-    let gi2 = TExpr { kind = TVar { name = "x" }; type = u8t() }
-    let g2  = TExpr { kind = TCast { expr = gi2 }; type = bytet() }  // u8 → byte DEFINED
+    let gi2 = TExpr { kind = TVar { name = "x" }; type = u8t(); line = 0; col = 0 }
+    let g2  = TExpr { kind = TCast { expr = gi2 }; type = bytet(); line = 0; col = 0 }
     match validate_texpr(g2) { null => teko::assert::is_true(true); error => teko::assert::is_true(false) }
-    let bi  = TExpr { kind = TVar { name = "b" }; type = bytet() }
-    let bad = TExpr { kind = TCast { expr = bi }; type = boolt() }   // byte → bool UNDEFINED
+    let bi  = TExpr { kind = TVar { name = "b" }; type = bytet(); line = 0; col = 0 }
+    let bad = TExpr { kind = TCast { expr = bi }; type = boolt(); line = 0; col = 0 }
     match validate_texpr(bad) { null => teko::assert::is_true(false); error => teko::assert::is_true(true) }
 }
 
-// --- C3 field-access helpers (reuse path1/empty_env/define/prim_is from above) ---
-// a TypeTable with one struct `Foo { token: u8 }`.
-fn foo_table() -> TypeTable {
-    let fld = Field { name = "token"; type_ann = NamedType { path = path1("u8") } }
+// --- C3 field-access: a TypeTable with one struct `Foo { token: u8 }` ---
+fn foo_decl() -> parser::TypeDecl {
+    let fld = parser::Field { name = "token"; type_ann = named_t("u8") }
     let fields = teko::list::push(teko::list::empty(), fld)
-    let td = TypeDecl { name = "Foo"; body = StructBody { fields = fields }; is_exp = false; has_doc = false; doc = "" }
-    teko::list::push(teko::list::empty(), TypeReg { name = "Foo"; decl = td })
+    parser::TypeDecl { name = "Foo"; body = parser::StructBody { fields = fields }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }
 }
-fn foo_env() -> Env { define(empty_env(), "s", Named { name = "Foo" }, false) }   // s : Foo
+fn foo_table() -> TypeTable {
+    teko::list::push(teko::list::empty(), TypeReg { name = "Foo"; namespace = ""; vis = parser::Visibility::Private; decl = foo_decl() })
+}
+fn foo_env() -> Env { define(empty_env(), "s", Named { name = "Foo" }, false) }
 
 #test
 fn field_read_types_to_field_type() {
-    // happy: s: Foo, Foo = struct { token: u8 } ⇒ s.token : u8.
-    let fa = FieldAccess { receiver = Var { name = "s" }; field = "token" }
-    match type_field_access(fa, foo_env(), foo_table()) {
-        TExpr as te => teko::assert::is_true(prim_is(te.type, PrimKind::U8))
-        error       => teko::assert::is_true(false)
-    }
+    let fa = parser::FieldAccess { receiver = e_var("s"); field = "token" }
+    match type_field_access(fa, foo_env(), foo_table()) { TExpr as te => teko::assert::is_true(prim_is(te.type, PrimKind::U8)); error => teko::assert::is_true(false) }
 }
 
 #test
 fn field_not_found_errors() {
-    // barrier: a field absent from the struct.
-    let fa = FieldAccess { receiver = Var { name = "s" }; field = "nope" }
+    let fa = parser::FieldAccess { receiver = e_var("s"); field = "nope" }
     match type_field_access(fa, foo_env(), foo_table()) { TExpr => teko::assert::is_true(false); error => teko::assert::is_true(true) }
 }
 
 #test
 fn field_on_non_struct_errors() {
-    // barrier: receiver is not a struct (a plain integer var).
     let env = define(empty_env(), "n", Prim { kind = PrimKind::I32 }, false)
-    let fa = FieldAccess { receiver = Var { name = "n" }; field = "token" }
+    let fa = parser::FieldAccess { receiver = e_var("n"); field = "token" }
     match type_field_access(fa, env, foo_table()) { TExpr => teko::assert::is_true(false); error => teko::assert::is_true(true) }
 }
 
 #test
 fn revalidate_rederives_field_access() {
-    // a well-formed field access over a Named receiver re-validates …
-    let recv = TExpr { kind = TVar { name = "s" }; type = Named { name = "Foo" } }
-    let good = TExpr { kind = TFieldAccess { receiver = recv; field = "token" }; type = Prim { kind = PrimKind::U8 } }
+    let recv = TExpr { kind = TVar { name = "s" }; type = Named { name = "Foo" }; line = 0; col = 0 }
+    let good = TExpr { kind = TFieldAccess { receiver = recv; field = "token" }; type = Prim { kind = PrimKind::U8 }; line = 0; col = 0 }
     match validate_texpr(good) { null => teko::assert::is_true(true); error => teko::assert::is_true(false) }
-    // … a forged field access over a non-Named receiver is corruption (struct-receiver invariant).
-    let badrecv = TExpr { kind = TVar { name = "n" }; type = Prim { kind = PrimKind::I32 } }
-    let bad = TExpr { kind = TFieldAccess { receiver = badrecv; field = "token" }; type = Prim { kind = PrimKind::U8 } }
+    let badrecv = TExpr { kind = TVar { name = "n" }; type = Prim { kind = PrimKind::I32 }; line = 0; col = 0 }
+    let bad = TExpr { kind = TFieldAccess { receiver = badrecv; field = "token" }; type = Prim { kind = PrimKind::U8 }; line = 0; col = 0 }
     match validate_texpr(bad) { null => teko::assert::is_true(false); error => teko::assert::is_true(true) }
 }
 
 #test
 fn mut_rule_assign() {
-    // C4 (B.21): a write to a `mut` binding type-checks; a write to an immutable one errors.
-    let menv = define(empty_env(), "m", u32t(), true)    // mut m: u32
-    let ok = Assign { name = "m"; op = lexer::TokenKind::Assign; value = Var { name = "m" } }
+    let menv = define(empty_env(), "m", u32t(), true)
+    let ok = parser::Assign { name = "m"; op = lexer::TokenKind::Assign; value = e_var("m") }
     match type_assign(ok, menv, empty_table()) { TypedStmt => teko::assert::is_true(true); error => teko::assert::is_true(false) }
-
-    let lenv = define(empty_env(), "l", u32t(), false)   // let l: u32 (immutable)
-    let bad = Assign { name = "l"; op = lexer::TokenKind::Assign; value = Var { name = "l" } }
+    let lenv = define(empty_env(), "l", u32t(), false)
+    let bad = parser::Assign { name = "l"; op = lexer::TokenKind::Assign; value = e_var("l") }
     match type_assign(bad, lenv, empty_table()) { TypedStmt => teko::assert::is_true(false); error => teko::assert::is_true(true) }
+}
+
+fn binding_of(name: str, ann: str, value: parser::Expr) -> parser::Binding {
+    parser::Binding { kind = parser::BindKind::Let; target = parser::SimpleName { name = name }; has_type = true; type_ann = named_t(ann); value = value }
 }
 
 #test
 fn annotated_literal() {
-    // C6 (Side D): `let x: u8 = 1` — the binding adopts u8; the leaf stays i64 (stored as-is).
-    let b = Binding { kind = BindKind::Let; target = SimpleName { name = "x" }; has_type = true; type_ann = NamedType { path = path1("u8") }; value = Number { value = 1 } }
+    let b = binding_of("x", "u8", e_num(1))
     match type_binding(b, empty_env(), empty_table()) {
         TypedStmt as ts => match ts.node {
             TBinding as tb => {
-                teko::assert::is_true(prim_is(tb.bound, PrimKind::U8))         // binding adopts u8
-                teko::assert::is_true(prim_is(tb.value.type, PrimKind::I64))  // leaf stored AS-IS — i64 (Side D)
+                teko::assert::is_true(prim_is(tb.bound, PrimKind::U8))
+                teko::assert::is_true(prim_is(tb.value.type, PrimKind::I64))
             }
             _ => teko::assert::is_true(false)
         }
         error => teko::assert::is_true(false)
     }
-    // barrier: a constant out of range fails EARLY (M.1).
-    let b2 = Binding { kind = BindKind::Let; target = SimpleName { name = "y" }; has_type = true; type_ann = NamedType { path = path1("u8") }; value = Number { value = 999 } }
+    let b2 = binding_of("y", "u8", e_num(999))
     match type_binding(b2, empty_env(), empty_table()) { TypedStmt => teko::assert::is_true(false); error => teko::assert::is_true(true) }
-    // barrier: a NON-literal mismatch — no implicit conversion (M.2; use `to`).
     let env = define(empty_env(), "w", i32t(), false)
-    let b3 = Binding { kind = BindKind::Let; target = SimpleName { name = "z" }; has_type = true; type_ann = NamedType { path = path1("u8") }; value = Var { name = "w" } }
+    let b3 = binding_of("z", "u8", e_var("w"))
     match type_binding(b3, env, empty_table()) { TypedStmt => teko::assert::is_true(false); error => teko::assert::is_true(true) }
-}
-
-// build `fn f(x: u32) -> <ret> { body }` for the C5 return-checking tests.
-fn fn_x_u32(ret: TypeExpr, body: []Statement) -> Function {
-    let p = Param { name = "x"; type_ann = NamedType { path = path1("u32") } }
-    let params = teko::list::push(teko::list::empty(), p)
-    Function { name = "f"; params = params; has_return = true; return_type = ret; body = body; is_exp = false; has_doc = false; doc = "" }
 }
 
 #test
 fn return_type_checks() {
-    // happy: trailing expression matches the declared return type.
-    let body1: []Statement = teko::list::push(teko::list::empty(), ExprStmt { expr = Var { name = "x" } })
-    match type_function(fn_x_u32(NamedType { path = path1("u32") }, body1), empty_env(), empty_table()) { TFunction => teko::assert::is_true(true); error => teko::assert::is_true(false) }
-
-    // happy: an explicit `return x` matching (trailing is the return → no extra claim).
-    let body2: []Statement = teko::list::push(teko::list::empty(), Return { has_value = true; value = Var { name = "x" } })
-    match type_function(fn_x_u32(NamedType { path = path1("u32") }, body2), empty_env(), empty_table()) { TFunction => teko::assert::is_true(true); error => teko::assert::is_true(false) }
-
-    // happy: body ENDS in a diverging `loop` whose inner `return` matches — NOT false-rejected (M.4 guard).
-    let loopbody: []Statement = teko::list::push(teko::list::empty(), Return { has_value = true; value = Var { name = "x" } })
-    let body3: []Statement = teko::list::push(teko::list::empty(), LoopStmt { body = loopbody })
-    match type_function(fn_x_u32(NamedType { path = path1("u32") }, body3), empty_env(), empty_table()) { TFunction => teko::assert::is_true(true); error => teko::assert::is_true(false) }
-
-    // happy: `return <u32>` into a `u32 | error` return — variant member inclusion (B.14).
-    let umembers: []TypeExpr = teko::list::push(teko::list::push(teko::list::empty(), NamedType { path = path1("u32") }), NamedType { path = path1("error") })
-    let body4: []Statement = teko::list::push(teko::list::empty(), Return { has_value = true; value = Var { name = "x" } })
-    match type_function(fn_x_u32(UnionType { members = umembers }, body4), empty_env(), empty_table()) { TFunction => teko::assert::is_true(true); error => teko::assert::is_true(false) }
+    let body1 = one_stmt(e_var("x"))
+    match type_function(mk_fn("f", named_t("u32"), body1), empty_env(), empty_table()) { TFunction => teko::assert::is_true(true); error => teko::assert::is_true(false) }
+    let body2: []parser::Statement = teko::list::push(teko::list::empty(), parser::Return { has_value = true; value = e_var("x") })
+    match type_function(mk_fn("f", named_t("u32"), body2), empty_env(), empty_table()) { TFunction => teko::assert::is_true(true); error => teko::assert::is_true(false) }
+    let loopbody: []parser::Statement = teko::list::push(teko::list::empty(), parser::Return { has_value = true; value = e_var("x") })
+    let body3: []parser::Statement = teko::list::push(teko::list::empty(), parser::LoopStmt { label = ""; body = loopbody })
+    match type_function(mk_fn("f", named_t("u32"), body3), empty_env(), empty_table()) { TFunction => teko::assert::is_true(true); error => teko::assert::is_true(false) }
+    let umembers: []parser::TypeExpr = teko::list::push(teko::list::push(teko::list::empty(), named_t("u32")), named_t("error"))
+    let body4: []parser::Statement = teko::list::push(teko::list::empty(), parser::Return { has_value = true; value = e_var("x") })
+    match type_function(mk_fn("f", parser::UnionType { members = umembers }, body4), empty_env(), empty_table()) { TFunction => teko::assert::is_true(true); error => teko::assert::is_true(false) }
 }
 
 #test
 fn return_type_mismatch_errors() {
-    // barrier: trailing expression's type ≠ declared return.
-    let body1: []Statement = teko::list::push(teko::list::empty(), ExprStmt { expr = Var { name = "x" } })
-    match type_function(fn_x_u32(NamedType { path = path1("u8") }, body1), empty_env(), empty_table()) { TFunction => teko::assert::is_true(false); error => teko::assert::is_true(true) }
-    // barrier: `return x` (u32) in a function declaring u8.
-    let body2: []Statement = teko::list::push(teko::list::empty(), Return { has_value = true; value = Var { name = "x" } })
-    match type_function(fn_x_u32(NamedType { path = path1("u8") }, body2), empty_env(), empty_table()) { TFunction => teko::assert::is_true(false); error => teko::assert::is_true(true) }
+    let body1 = one_stmt(e_var("x"))
+    match type_function(mk_fn("f", named_t("u8"), body1), empty_env(), empty_table()) { TFunction => teko::assert::is_true(false); error => teko::assert::is_true(true) }
+    let body2: []parser::Statement = teko::list::push(teko::list::empty(), parser::Return { has_value = true; value = e_var("x") })
+    match type_function(mk_fn("f", named_t("u8"), body2), empty_env(), empty_table()) { TFunction => teko::assert::is_true(false); error => teko::assert::is_true(true) }
 }
 
-// --- C7: pattern checking (Field/Range/Alt) + exhaustiveness helpers ---
-// a variant Color = RED | GREEN | BLUE.
+// --- C7: pattern checking + exhaustiveness over a variant Color = RED | GREEN | BLUE ---
 fn color_subject() -> Type {
     mut members: []Type = teko::list::empty()
     members = teko::list::push(members, Named { name = "RED" })
@@ -402,94 +347,79 @@ fn color_subject() -> Type {
     members = teko::list::push(members, Named { name = "BLUE" })
     Variant { members = members }
 }
-// register RED/GREEN/BLUE as (bodyless) user types so `resolve_named` finds them.
 fn color_table() -> TypeTable {
     mut t: TypeTable = teko::list::empty()
     mut i = 0
     let names = teko::list::push(teko::list::push(teko::list::push(teko::list::empty(), "RED"), "GREEN"), "BLUE")
     loop {
         if i >= names.len { break }
-        let td = TypeDecl { name = names[i]; body = StructBody { fields = teko::list::empty() }; is_exp = false; has_doc = false; doc = "" }
-        t = teko::list::push(t, TypeReg { name = names[i]; decl = td })
+        let td = parser::TypeDecl { name = names[i]; body = parser::StructBody { fields = teko::list::empty() }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }
+        t = teko::list::push(t, TypeReg { name = names[i]; namespace = ""; vis = parser::Visibility::Private; decl = td })
         i++
     }
     t
 }
-// a bare (non-binding) case pattern `CASE`.
-fn case_pat(name: str) -> Pattern { BindPattern { type_name = path1(name); has_binding = false; binding = ""; is_slice = false; slice_type = null } }
-// an unguarded / guarded arm with the given pattern.
-fn arm_of(p: Pattern) -> Arm { Arm { pattern = p; has_when = false; guard = Number { value = 0 }; body = Number { value = 0 } } }
-fn guarded_arm_of(p: Pattern) -> Arm { Arm { pattern = p; has_when = true; guard = Number { value = 1 }; body = Number { value = 0 } } }
+fn case_pat(name: str) -> parser::Pattern { parser::BindPattern { type_name = path1(name); has_binding = false; binding = ""; is_slice = false; slice_type = null } }
+fn arm_of(p: parser::Pattern) -> parser::Arm { parser::Arm { pattern = p; has_when = false; guard = e_num(0); body = one_stmt(e_num(0)) } }
+fn guarded_arm_of(p: parser::Pattern) -> parser::Arm { parser::Arm { pattern = p; has_when = true; guard = ek(parser::BoolLit { value = true }); body = one_stmt(e_num(0)) } }
 
 #test
 fn field_pattern_binds_fields() {
-    // happy: `Foo { token }` binds `token : u8` (B.21 immutable).
-    let fp = FieldPattern { type_name = path1("Foo"); fields = teko::list::push(teko::list::empty(), "token") }
+    let fp = parser::FieldPattern { type_name = path1("Foo"); fields = teko::list::push(teko::list::empty(), "token") }
     let e2 = match check_pattern(fp, Named { name = "Foo" }, foo_env(), foo_table()) { Env as e => e; error => { teko::assert::is_true(false); return } }
     match lookup(e2, "token") { Type as t => teko::assert::is_true(prim_is(t, PrimKind::U8)); error => teko::assert::is_true(false) }
 }
 
 #test
 fn field_pattern_barriers() {
-    // barrier: an unknown field on a real struct → error (M.1).
-    let badfield = FieldPattern { type_name = path1("Foo"); fields = teko::list::push(teko::list::empty(), "nope") }
+    let badfield = parser::FieldPattern { type_name = path1("Foo"); fields = teko::list::push(teko::list::empty(), "nope") }
     match check_pattern(badfield, Named { name = "Foo" }, foo_env(), foo_table()) { Env => teko::assert::is_true(false); error => teko::assert::is_true(true) }
-    // barrier: a field pattern over a non-struct (a primitive) → error.
-    let prim = FieldPattern { type_name = path1("u8"); fields = teko::list::empty() }
+    let prim = parser::FieldPattern { type_name = path1("u8"); fields = teko::list::empty() }
     match check_pattern(prim, Named { name = "Foo" }, foo_env(), foo_table()) { Env => teko::assert::is_true(false); error => teko::assert::is_true(true) }
 }
 
 #test
 fn range_pattern_check() {
-    // happy: `0 ..= 9` against i64 — both bounds i64, subject integer; binds nothing.
     let env = define(empty_env(), "n", i64t(), false)
-    let rp = RangePattern { lo = Number { value = 0 }; hi = Number { value = 9 } }
+    let rp = parser::RangePattern { lo = e_num(0); hi = e_num(9) }
     match check_pattern(rp, i64t(), env, empty_table()) { Env => teko::assert::is_true(true); error => teko::assert::is_true(false) }
-    // barrier: a range over bool → error (not an integer subject — M.2).
-    let rpb = RangePattern { lo = Number { value = 0 }; hi = Number { value = 1 } }
+    let rpb = parser::RangePattern { lo = e_num(0); hi = e_num(1) }
     match check_pattern(rpb, boolt(), env, empty_table()) { Env => teko::assert::is_true(false); error => teko::assert::is_true(true) }
-    // barrier: a mistyped bound (a str literal) against i64 → error.
-    let rps = RangePattern { lo = StrLit { text = "a" }; hi = Number { value = 9 } }
+    let rps = parser::RangePattern { lo = e_str("a"); hi = e_num(9) }
     match check_pattern(rps, i64t(), env, empty_table()) { Env => teko::assert::is_true(false); error => teko::assert::is_true(true) }
 }
 
 #test
 fn alt_pattern_check() {
-    // happy: `RED | GREEN` against Color — each a bare case; binds nothing.
-    mut opts: []Pattern = teko::list::push(teko::list::empty(), case_pat("RED"))
+    mut opts: []parser::Pattern = teko::list::push(teko::list::empty(), case_pat("RED"))
     opts = teko::list::push(opts, case_pat("GREEN"))
-    let alt = AltPattern { options = opts }
+    let alt = parser::AltPattern { options = opts }
     match check_pattern(alt, color_subject(), empty_env(), color_table()) { Env => teko::assert::is_true(true); error => teko::assert::is_true(false) }
-    // barrier: a BINDING option inside an Alt → error (settled axis rule, M.1+M.2).
-    mut bopts: []Pattern = teko::list::push(teko::list::empty(), case_pat("RED"))
-    bopts = teko::list::push(bopts, BindPattern { type_name = path1("GREEN"); has_binding = true; binding = "g"; is_slice = false; slice_type = null })
-    let balt = AltPattern { options = bopts }
+    mut bopts: []parser::Pattern = teko::list::push(teko::list::empty(), case_pat("RED"))
+    bopts = teko::list::push(bopts, parser::BindPattern { type_name = path1("GREEN"); has_binding = true; binding = "g"; is_slice = false; slice_type = null })
+    let balt = parser::AltPattern { options = bopts }
     match check_pattern(balt, color_subject(), empty_env(), color_table()) { Env => teko::assert::is_true(false); error => teko::assert::is_true(true) }
 }
 
 #test
 fn exhaustive_with_alt() {
-    // happy: `RED | GREEN` + `BLUE` covers the whole variant (Alt expansion + B.14).
-    mut opts: []Pattern = teko::list::push(teko::list::empty(), case_pat("RED"))
+    mut opts: []parser::Pattern = teko::list::push(teko::list::empty(), case_pat("RED"))
     opts = teko::list::push(opts, case_pat("GREEN"))
-    mut arms: []Arm = teko::list::push(teko::list::empty(), arm_of(AltPattern { options = opts }))
+    mut arms: []parser::Arm = teko::list::push(teko::list::empty(), arm_of(parser::AltPattern { options = opts }))
     arms = teko::list::push(arms, arm_of(case_pat("BLUE")))
-    teko::assert::is_true(exhaustive(arms, color_subject()))
+    teko::assert::is_true(exhaustive(arms, color_subject(), color_table()))
 }
 
 #test
 fn exhaustive_barriers() {
-    // barrier: missing BLUE → non-exhaustive.
-    mut opts: []Pattern = teko::list::push(teko::list::empty(), case_pat("RED"))
+    mut opts: []parser::Pattern = teko::list::push(teko::list::empty(), case_pat("RED"))
     opts = teko::list::push(opts, case_pat("GREEN"))
-    let arms1: []Arm = teko::list::push(teko::list::empty(), arm_of(AltPattern { options = opts }))
-    teko::assert::is_false(exhaustive(arms1, color_subject()))
-    // barrier: a `when`-guarded last case does NOT complete coverage (B.15 — `when` excluded).
-    mut arms2: []Arm = teko::list::push(teko::list::empty(), arm_of(case_pat("RED")))
+    let arms1: []parser::Arm = teko::list::push(teko::list::empty(), arm_of(parser::AltPattern { options = opts }))
+    teko::assert::is_false(exhaustive(arms1, color_subject(), color_table()))
+    mut arms2: []parser::Arm = teko::list::push(teko::list::empty(), arm_of(case_pat("RED")))
     arms2 = teko::list::push(arms2, arm_of(case_pat("GREEN")))
     arms2 = teko::list::push(arms2, guarded_arm_of(case_pat("BLUE")))
-    teko::assert::is_false(exhaustive(arms2, color_subject()))
-    // barrier: a `when`-guarded `_` does NOT make a match total.
-    let arms3: []Arm = teko::list::push(teko::list::empty(), guarded_arm_of(WildcardPattern { }))
-    teko::assert::is_false(exhaustive(arms3, color_subject()))
+    teko::assert::is_false(exhaustive(arms2, color_subject(), color_table()))
+    let arms3: []parser::Arm = teko::list::push(teko::list::empty(), guarded_arm_of(parser::WildcardPattern { }))
+    teko::assert::is_false(exhaustive(arms3, color_subject(), color_table()))
 }

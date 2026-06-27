@@ -1,20 +1,23 @@
-// src/emit/tkb_test.tkt — tests for the .tkb codec (S1a/S1b). NO main: PUBLIC #test
+// src/emit/tkb_test.tkt — tests for the .tkb codec (S1a/S1b). #test functions (no main).
+// Current Teko: typed nodes are module-qualified (`checker::`) and carry all fields (line/col).
 
-fn u8ty()  -> Type { Prim { kind = PrimKind::U8 } }
-fn i64ty() -> Type { Prim { kind = PrimKind::I64 } }
+use teko::checker
+
+fn u8ty()  -> checker::Type { checker::Prim { kind = checker::PrimKind::U8 } }
+fn i64ty() -> checker::Type { checker::Prim { kind = checker::PrimKind::I64 } }
+fn tnum(v: i128) -> checker::TExpr { checker::TExpr { kind = checker::TNumber { is_float = false; value = v; fval = 0.0 }; type = i64ty(); line = 0; col = 0 } }
 
 #test
 fn tkb_roundtrip_cast() {
     // S1a: TCast { expr = (TNumber : i64) } : u8 — exact round-trip (tag 10 + type + inner).
-    let inner = TExpr { kind = TNumber { value = 7 }; type = i64ty() }
-    let orig  = TExpr { kind = TCast { expr = inner }; type = u8ty() }
+    let orig = checker::TExpr { kind = checker::TCast { expr = tnum(7) }; type = u8ty(); line = 0; col = 0 }
     match deserialize(serialize(orig)) {
-        TExpr as got => match got.type {
-            Prim as p => {
-                teko::assert::is_true(p.kind == PrimKind::U8)                  // target type carried via ty.value
+        checker::TExpr as got => match got.type {
+            checker::Prim as p => {
+                teko::assert::is_true(p.kind == checker::PrimKind::U8)
                 match got.kind {
-                    TCast as c => match c.expr.kind {
-                        TNumber as n => teko::assert::is_true(n.value == 7)
+                    checker::TCast as c => match c.expr.kind {
+                        checker::TNumber as n => teko::assert::is_true(n.value == 7)
                         _ => teko::assert::is_true(false)
                     }
                     _ => teko::assert::is_true(false)
@@ -29,13 +32,13 @@ fn tkb_roundtrip_cast() {
 #test
 fn tkb_roundtrip_field_access() {
     // S1b: TFieldAccess { receiver = (TVar s : Named Foo); field = "token" } : u8 — round-trips exactly.
-    let recv = TExpr { kind = TVar { name = "s" }; type = Named { name = "Foo" } }
-    let orig = TExpr { kind = TFieldAccess { receiver = recv; field = "token" }; type = u8ty() }
+    let recv = checker::TExpr { kind = checker::TVar { name = "s" }; type = checker::Named { name = "Foo" }; line = 0; col = 0 }
+    let orig = checker::TExpr { kind = checker::TFieldAccess { receiver = recv; field = "token" }; type = u8ty(); line = 0; col = 0 }
     match deserialize(serialize(orig)) {
-        TExpr as got => match got.kind {
-            TFieldAccess as f => {
-                teko::assert::is_true(f.field == "token")                       // interned + read back (collect_strings fix)
-                match f.receiver.kind { TVar as v => teko::assert::is_true(v.name == "s"); _ => teko::assert::is_true(false) }
+        checker::TExpr as got => match got.kind {
+            checker::TFieldAccess as f => {
+                teko::assert::is_true(f.field == "token")
+                match f.receiver.kind { checker::TVar as v => teko::assert::is_true(v.name == "s"); _ => teko::assert::is_true(false) }
             }
             _ => teko::assert::is_true(false)
         }
@@ -46,9 +49,8 @@ fn tkb_roundtrip_field_access() {
 #test
 fn tkb_tamper_caught() {
     // barrier (M.1): a corrupted body (last byte dropped) fails the FNV-1a hash check → error.
-    let inner = TExpr { kind = TNumber { value = 7 }; type = i64ty() }
-    let orig  = TExpr { kind = TCast { expr = inner }; type = u8ty() }
+    let orig  = checker::TExpr { kind = checker::TCast { expr = tnum(7) }; type = u8ty(); line = 0; col = 0 }
     let bytes = serialize(orig)
     let short = slice(bytes, 0, bytes.len - 1)
-    match deserialize(short) { TExpr => teko::assert::is_true(false); error => teko::assert::is_true(true) }
+    match deserialize(short) { checker::TExpr => teko::assert::is_true(false); error => teko::assert::is_true(true) }
 }

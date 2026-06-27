@@ -1,118 +1,97 @@
-// src/emit/header_test.tkt — tests for the `.tkh` header-building driver (E-emit-a).
-// NO main: PUBLIC #test functions the compiler collects (a runner — ALPHA).
-// The driver is unit-tested on a HAND-BUILT typed program: build_header keeps only
-// EXPORTED items, resolves their signatures, and carries docs; emit_program round-trips
-// through read_tkh; a tampered byte fails the FNV-1a hash (the M.1 barrier).
+// src/emit/header_test.tkt — tests for the `.tkh` header-building driver (E-emit-a). #test fns.
+// build_header keeps only EXPORTED (`exp`) items, resolves signatures, carries docs; emit_program
+// round-trips through read_tkh; a tampered byte fails the FNV-1a hash (the M.1 barrier).
+// Current Teko: module-qualified types; `exp` is `vis = parser::Visibility::Exp`; all fields set.
 
-// --- small Type / AST constructors (keep the tests legible — M.2) ---
-fn u32t() -> Type { Prim { kind = PrimKind::U32 } }
-fn u8t()  -> Type { Prim { kind = PrimKind::U8 } }
-fn path1(name: str) -> Path { Path { segments = teko::list::push(teko::list::empty(), Segment { name = name }) } }
-fn prim_is(t: Type, k: PrimKind) -> bool { match t { Prim as p => p.kind == k; _ => false } }
+use teko::checker
+use teko::parser
 
-// a TypeTable that registers `Foo` (so resolve_type of the field annotations works — mirrors foo_table).
-fn foo_table() -> TypeTable {
-    let fld = Field { name = "token"; type_ann = NamedType { path = path1("u8") } }
+fn u32t() -> checker::Type { checker::Prim { kind = checker::PrimKind::U32 } }
+fn u8t()  -> checker::Type { checker::Prim { kind = checker::PrimKind::U8 } }
+fn path1(name: str) -> parser::Path { parser::Path { segments = teko::list::push(teko::list::empty(), parser::Segment { name = name }) } }
+fn named_t(name: str) -> parser::TypeExpr { parser::NamedType { path = path1(name) } }
+fn prim_is(t: checker::Type, k: checker::PrimKind) -> bool { match t { checker::Prim as p => p.kind == k; _ => false } }
+
+// a struct decl `Foo { token: u8 }` (vis controls export).
+fn foo_decl(vis: parser::Visibility, doc: str) -> parser::TypeDecl {
+    let fld = parser::Field { name = "token"; type_ann = named_t("u8") }
     let fields = teko::list::push(teko::list::empty(), fld)
-    let td = TypeDecl { name = "Foo"; body = StructBody { fields = fields }; is_exp = false; has_doc = false; doc = "" }
-    teko::list::push(teko::list::empty(), TypeReg { name = "Foo"; decl = td })
+    parser::TypeDecl { name = "Foo"; body = parser::StructBody { fields = fields }; vis = vis; has_doc = doc != ""; doc = doc; line = 0; col = 0 }
 }
 
-// `exp fn f(x: u32) -> u32` (typed) with a doc.
-fn exp_fn_f() -> TFunction {
-    let p = Param { name = "x"; type_ann = NamedType { path = path1("u32") } }
+// a TypeTable that registers `Foo` (so resolve_type of the field annotations works).
+fn foo_table() -> checker::TypeTable {
+    teko::list::push(teko::list::empty(), checker::TypeReg { name = "Foo"; namespace = ""; vis = parser::Visibility::Private; decl = foo_decl(parser::Visibility::Private, "") })
+}
+
+// a typed function `NAME(p: u32) -> u32` with the given visibility/doc.
+fn fn_of(name: str, pname: str, vis: parser::Visibility, doc: str) -> checker::TFunction {
+    let p = parser::Param { name = pname; type_ann = named_t("u32") }
     let params = teko::list::push(teko::list::empty(), p)
-    TFunction {
-        name = "f"; params = params; return_type = u32t(); body = teko::list::empty()
-        is_exp = true; has_doc = true; doc = "the f function"
-    }
+    checker::TFunction { name = name; params = params; return_type = u32t(); body = teko::list::empty(); vis = vis; has_doc = doc != ""; doc = doc; namespace = ""; file = ""; line = 0; col = 0; is_test = false }
 }
-
-// a NON-exported typed function `g(y: u32) -> u32` (must be excluded).
-fn nonexp_fn_g() -> TFunction {
-    let p = Param { name = "y"; type_ann = NamedType { path = path1("u32") } }
-    let params = teko::list::push(teko::list::empty(), p)
-    TFunction {
-        name = "g"; params = params; return_type = u32t(); body = teko::list::empty()
-        is_exp = false; has_doc = false; doc = ""
-    }
-}
-
-// `exp type Foo { token: u8 }` with a doc.
-fn exp_type_foo() -> TypeDecl {
-    let fld = Field { name = "token"; type_ann = NamedType { path = path1("u8") } }
+fn exp_fn_f()    -> checker::TFunction { fn_of("f", "x", parser::Visibility::Exp, "the f function") }
+fn nonexp_fn_g() -> checker::TFunction { fn_of("g", "y", parser::Visibility::Private, "") }
+fn exp_type_foo()    -> parser::TypeDecl { foo_decl(parser::Visibility::Exp, "the Foo struct") }
+fn nonexp_type_bar() -> parser::TypeDecl {
+    let fld = parser::Field { name = "z"; type_ann = named_t("u8") }
     let fields = teko::list::push(teko::list::empty(), fld)
-    TypeDecl { name = "Foo"; body = StructBody { fields = fields }; is_exp = true; has_doc = true; doc = "the Foo struct" }
-}
-
-// a NON-exported type `Bar { z: u8 }` (must be excluded).
-fn nonexp_type_bar() -> TypeDecl {
-    let fld = Field { name = "z"; type_ann = NamedType { path = path1("u8") } }
-    let fields = teko::list::push(teko::list::empty(), fld)
-    TypeDecl { name = "Bar"; body = StructBody { fields = fields }; is_exp = false; has_doc = false; doc = "" }
+    parser::TypeDecl { name = "Bar"; body = parser::StructBody { fields = fields }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }
 }
 
 // the typed program: exported fn, non-exported fn, exported struct, non-exported struct.
-fn sample_program() -> TProgram {
-    mut items: []TItem = teko::list::empty()
+fn sample_program() -> checker::TProgram {
+    mut items: []checker::TItem = teko::list::empty()
     items = teko::list::push(items, exp_fn_f())
     items = teko::list::push(items, nonexp_fn_g())
     items = teko::list::push(items, exp_type_foo())
     items = teko::list::push(items, nonexp_type_bar())
-    TProgram { items = items }
+    checker::TProgram { items = items }
 }
 
 #test
 fn build_header_keeps_only_exports() {
-    // happy: only the EXPORTED items become exports; signatures resolved; docs carried.
     let h = match build_header(sample_program(), foo_table()) { Header as x => x; error => { teko::assert::is_true(false); return } }
-
-    // exactly one fn (f) — g is excluded.
     teko::assert::is_true(h.fns.len == 1)
     let f = h.fns[0]
     teko::assert::is_true(f.name == "f")
     teko::assert::is_true(f.params.len == 1)
     teko::assert::is_true(f.params[0].name == "x")
-    teko::assert::is_true(prim_is(f.params[0].type, PrimKind::U32))
-    teko::assert::is_true(prim_is(f.ret, PrimKind::U32))
+    teko::assert::is_true(prim_is(f.params[0].type, checker::PrimKind::U32))
+    teko::assert::is_true(prim_is(f.ret, checker::PrimKind::U32))
     teko::assert::is_true(f.has_doc)
     teko::assert::is_true(f.doc == "the f function")
-
-    // exactly one type (Foo) — Bar is excluded.
     teko::assert::is_true(h.types.len == 1)
     let foo = h.types[0]
     teko::assert::is_true(foo.name == "Foo")
     match foo.shape { TyShape::Struct => teko::assert::is_true(true); _ => teko::assert::is_true(false) }
     teko::assert::is_true(foo.fields.len == 1)
     teko::assert::is_true(foo.fields[0].name == "token")
-    teko::assert::is_true(prim_is(foo.fields[0].type, PrimKind::U8))
+    teko::assert::is_true(prim_is(foo.fields[0].type, checker::PrimKind::U8))
     teko::assert::is_true(foo.has_doc)
     teko::assert::is_true(foo.doc == "the Foo struct")
 }
 
 #test
 fn emit_program_round_trips() {
-    // happy: emit_program → read_tkh recovers the Header (fn name, param type, type name/shape/field).
     let bytes = match emit_program(sample_program(), foo_table()) { []byte as b => b; error => { teko::assert::is_true(false); return } }
     let h = match read_tkh(bytes) { Header as x => x; error => { teko::assert::is_true(false); return } }
     teko::assert::is_true(h.fns.len == 1)
     teko::assert::is_true(h.fns[0].name == "f")
     teko::assert::is_true(h.fns[0].params.len == 1)
-    teko::assert::is_true(prim_is(h.fns[0].params[0].type, PrimKind::U32))
-    teko::assert::is_true(prim_is(h.fns[0].ret, PrimKind::U32))
+    teko::assert::is_true(prim_is(h.fns[0].params[0].type, checker::PrimKind::U32))
+    teko::assert::is_true(prim_is(h.fns[0].ret, checker::PrimKind::U32))
     teko::assert::is_true(h.fns[0].doc == "the f function")
     teko::assert::is_true(h.types.len == 1)
     teko::assert::is_true(h.types[0].name == "Foo")
     match h.types[0].shape { TyShape::Struct => teko::assert::is_true(true); _ => teko::assert::is_true(false) }
     teko::assert::is_true(h.types[0].fields.len == 1)
     teko::assert::is_true(h.types[0].fields[0].name == "token")
-    teko::assert::is_true(prim_is(h.types[0].fields[0].type, PrimKind::U8))
+    teko::assert::is_true(prim_is(h.types[0].fields[0].type, checker::PrimKind::U8))
 }
 
 #test
 fn emit_program_tamper_caught() {
-    // barrier (M.1): a corrupted body (last byte dropped) fails the FNV-1a hash → error.
-    // (indexed byte assignment is NOT supported in Teko — truncate via slice, as tkb_test does.)
     let bytes = match emit_program(sample_program(), foo_table()) { []byte as b => b; error => { teko::assert::is_true(false); return } }
     let short = slice(bytes, 0, bytes.len - 1)
     match read_tkh(short) { Header => teko::assert::is_true(false); error => teko::assert::is_true(true) }
@@ -120,19 +99,13 @@ fn emit_program_tamper_caught() {
 
 #test
 fn empty_program_still_emits_header() {
-    // A program with NO exported code STILL emits a valid `.tkh` — an EMPTY header (0 types,
-    // 0 fns) that honestly says "nothing is exported", never nothing at all. build_header must
-    // NOT error on the empty surface; emit_program must produce a well-formed, round-trippable
-    // header (magic + version + hash + both counts = 0).
-    mut items: []TItem = teko::list::empty()
-    items = teko::list::push(items, nonexp_fn_g())       // present but NOT exported
-    items = teko::list::push(items, nonexp_type_bar())   // present but NOT exported
-    let prog = TProgram { items = items }
-    // build_header succeeds with an EMPTY header (not an error).
+    mut items: []checker::TItem = teko::list::empty()
+    items = teko::list::push(items, nonexp_fn_g())
+    items = teko::list::push(items, nonexp_type_bar())
+    let prog = checker::TProgram { items = items }
     let h0 = match build_header(prog, foo_table()) { Header as x => x; error => { teko::assert::is_true(false); return } }
     teko::assert::is_true(h0.fns.len == 0)
     teko::assert::is_true(h0.types.len == 0)
-    // emit_program still emits bytes (a header IS produced), and they round-trip to an empty header.
     let bytes = match emit_program(prog, foo_table()) { []byte as b => b; error => { teko::assert::is_true(false); return } }
     teko::assert::is_true(bytes.len > 0)
     let h = match read_tkh(bytes) { Header as x => x; error => { teko::assert::is_true(false); return } }
