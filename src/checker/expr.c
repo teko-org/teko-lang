@@ -483,7 +483,7 @@ static tk_texpr_result type_cast(tk_cast c, tk_env env, tk_type_table table) {
 }
 
 // ---- field access `x.field` (C3): read a struct field; `.type` is the field's resolved type ----
-static bool tk_str_eq(tk_str a, tk_str b) { return a.len == b.len && (a.len == 0 || memcmp(a.ptr, b.ptr, a.len) == 0); }
+// tk_str_eq is declared in text.h (via type.h) and implemented in teko_rt.c.
 
 // non-static: shared with match.c (the FieldPattern case forward-declares it — C7a).
 tk_type_result field_type(tk_struct_body sb, tk_str field, tk_type_table table) {

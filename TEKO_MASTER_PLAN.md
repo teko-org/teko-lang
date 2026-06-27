@@ -74,17 +74,17 @@ compile+link gate which is now the milestone reached.
 
 ## THE SEQUENCE
 
-> **Status legend:** ✅ done · 🔶 ACTIVELY in flight now · ⬜ TODO (to be completed — NOT "deferred"; every item here gets done, blocking or not). Updated 2026-06-26 (commit `973dbd2`).
+> **Status legend:** ✅ done · 🔶 ACTIVELY in flight now · ⬜ TODO (to be completed — NOT "deferred"; every item here gets done, blocking or not). Updated 2026-06-27 (commit `8279daa`).
 
 | # | Phase | Status | Why here |
 |---|-------|--------|----------|
 | 1 | Diagnostics axis | ✅ **CLOSED** — E1 file:line:col + snippet/caret + expected-vs-actual + E2 error fields + **E3 `.tsym` symbol map** + **E4 native stack-trace resolution** (frames → Teko `name (file:line)` via `<binary>.tsym`). Warnings channel is Phase 5's. | Highest ROI; makes every later phase debuggable |
-| 2 | `in` operator | ✅ done (lexer→parser→checker→codegen→VM→tkb→.tks, single-eval) | Build the tool the DRY sweep will use (feature only) |
-| 3 | str/byte stdlib as real mirrored fns | ✅ done (`teko::str::*` + host-FFI surface in scope.c/.tks) | Close a half-implemented layer; unblocks self-host CHECK |
+| 2 | `in` operator | ✅ **CLOSED** (lexer→parser→checker→codegen→VM→tkb→.tks, single-eval) | Build the tool the DRY sweep will use (feature only) |
+| 3 | str/byte stdlib as real mirrored fns | ✅ **CLOSED** (`teko::str::*` + host-FFI surface in scope.c/.tks) | Close a half-implemented layer; unblocks self-host CHECK |
 | 4 | C↔.tks mirroring | ✅ MAINTAINED continuously — every commit mirrors its `.c`/`.h` change to the `.tks` twin (SUPREME RULE); a standing per-commit discipline, not a pending sweep | Pay down mirror debt before more code lands |
-| 5 | Definite-assignment / init analysis | ✅ **CLOSED** — `src/checker/initanalysis.{tks,c,h}` runs last in `type_program`: **use-before-init is STRUCTURAL** (Teko has no uninitialized binding form — every let/mut/const carries a value typed in the pre-binding env → law-first: no check needed); **unused-local → ERROR** (Phase-1 location, snippet+caret in the native renderer; `_` discard exempt); **unused-private-fn → WARNING** via the new **warnings channel** (stderr, never fails the build). Both twins lockstep; gate GREEN; corpus clean of unused locals; surfaced 14 genuinely-dead private fns. | Real checker gap; lands the warnings channel |
-| 6 | Finish self-host → working `teko .` | ✅ **CLOSED** — both exit criteria met: (1) FULL SELF-HOSTING — `selfhost` gate produces `bin/teko` (gen-1→gen-2→gen-3), 0 cc errors, 902 items; (2) VM==native across the regression set (5/6/106). VM-execution frontier lands an HONEST host-FFI stop (``vm: `args` is a host function…use `teko build```) in both twins. Deferred law-first: #41 type-resolution (latent — 0 collisions), VM host surface → Phase 7 C2*, #19 X5 (headers densely satisfied). | The gating milestone for everything downstream |
-| 7 | Host independence | 🔶 **ACTIVE** — host-FFI runtime DONE (str surface + `tk_alloc` + `read_file`/`write_file`/`var`/`run`/`chdir`/`list_dir`/`args` + arith). **`-o <dir>`** ✅. **VM test gate D2+D3+D4** ✅ (`#test` attribute; `vm::run_tests` fail-fast + VM param-binding; function-level coverage via a runtime sink; `teko build` gate w/ 80% floor + `#test`-strip + `--no-test` opt-out — both twins). Remaining: **C7.0 ✅ RATIFIED 2026-06-27** (extern form — LEGISLATION §"FFI / `extern`"), **C7.1 extern impl** (macOS+libc): decl+checker+codegen+VM + **`ptr`/`uptr` ✅**; next = marshalling primitives + manifest `[extern]` parser, then Linux/Windows; host surfaces over `extern`, packages/pre-linker, `pack`, cleanup | FFI + host surfaces + VM test gate + project/output/pack |
+| 5 | Definite-assignment / init analysis | ✅ **CLOSED** — `src/checker/initanalysis.{tks,c,h}` runs last in `type_program`: **use-before-init is STRUCTURAL**; **unused-local → ERROR** (snippet+caret); **unused-private-fn → WARNING** via stderr warnings channel. Both twins lockstep; gate GREEN. | Real checker gap; lands the warnings channel |
+| 6 | Finish self-host → working `teko .` | 🔶 **GATE MET, 2 crumbs open** — exit criteria met: (1) FULL SELF-HOSTING (`selfhost` gate → `bin/teko`, 0 cc errors, 902 items); (2) VM==native regression set (5/6/106). **Open: C6.7+C6.8** (spread-into-literal `[..xs, x]` — CONSTITUTION RULING: `+` is math only; spread decompose/recompose is the only correct form; `..` bare token must be added to lexer). Carried into Phase 7's work queue. | The gating milestone for everything downstream |
+| 7 | Host independence | 🔶 **ACTIVE** — extern/FFI (C7.1a–i, C7.1k, C7.1m) ✅; D2/D3/D4 test gate ✅; `.tkb` program codec C7.16 ✅; `-o <dir>` ✅. **Remaining (ordered): C7.9** (main-rule wire-up), **C7.13** (tk_str_eq→text.h), **C7.14** (TK_LIST), **C6.7/C6.8** (spread syntax), **C7.2–5** (host ns files), **C7.15** (overflow guard), **C7.12** (.tkl ZIP), **C7.10** (pre-linker), **C7.17** (driver.tks), **C7.1j** (CI — LAST). | FFI + host surfaces + VM test gate + project/output/pack |
 | 8 | FLAGS | ⬜ not started | Bitflag enums (spec frozen) |
 | 9 | SEC | ⬜ not started | SAST + capability audit, after corrections |
 | 10 | Evolution S1–S9 | ⬜ not started | Post-self-host campaign (arenas→…→concurrency) |
@@ -338,20 +338,22 @@ into **rounds** (parallel waves). The goal is **maximum agent concurrency** with
 
 ## Phase 6 — Finish self-host → working `teko .` *(milestone; `cg`/`vm` serialize across rounds)*
 
-| Crumb | Owns | Dep |
-|-------|------|-----|
-| **C6.1** function parameters in codegen | `cg` | — |
-| **C6.2** function parameters in VM | `vm` | — |
-| **C6.3** slice `[]T as x` pattern — parser | `P` (+pattern.h) | — |
-| **C6.10** #41 value-level cross-ns enforce (calls + enum paths) | `res` | — |
-| **C6.4** slice pattern checker + `[]T \| error` return | `match`, `chk` | C6.3 |
-| **C6.5** slice pattern codegen (variant-member) | `cg` | C6.3 |
-| **C6.6** slice pattern VM | `vm` | C6.3 |
-| **C6.7** copy-append collections codegen | `cg` | C6.5 |
-| **C6.8** copy-append collections VM | `vm` | C6.6 |
-| **C6.11** #19 X5 justification-header sweep (headers only) | *(all headers — solo)* | all above |
+| Crumb | Owns | Dep | Status |
+|-------|------|-----|--------|
+| **C6.1** function parameters in codegen | `cg` | — | ✅ DONE |
+| **C6.2** function parameters in VM | `vm` | — | ✅ DONE |
+| **C6.3** slice `[]T as x` pattern — parser | `P` (+pattern.h) | — | ✅ DONE |
+| **C6.10** #41 value-level cross-ns enforce (calls + enum paths) | `res` | — | ✅ DONE (namespace-qualified mangling) |
+| **C6.4** slice pattern checker + `[]T \| error` return | `match`, `chk` | C6.3 | ✅ DONE |
+| **C6.5** slice pattern codegen (variant-member) | `cg` | C6.3 | ✅ DONE |
+| **C6.6** slice pattern VM | `vm` | C6.3 | ✅ DONE |
+| **C6.7** spread-into-literal `[..xs, x]` — frontend | `L`, `ast`, `P`, `chk` | C6.5 | ⬜ NOT DONE. **CONSTITUTION RULING**: `xs+[x]` is ILLEGAL (`+` is math; Law M.0 prohibits conflation); the ONLY form is `[..xs, x]` (spread/decompose-recompose, like a range spread). Requires: (1) lexer `..` → `TK_TOKEN_DOTDOT` (currently rejected as error; `..=` stays for range); (2) AST `tk_array_elem {tag: plain\|spread; expr}` replaces flat `tk_expr*` in `tk_array_lit`; (3) parser recognizes `..expr` spread elements inside `[..]`; (4) checker: a spread `..xs` requires `xs: []T` in a `[]T` context; mirrors in `.tks`; tkb codec updated (TArrayLit now has tagged elements). Works for `[]T` arrays (lists/sets spread deferred until their literal syntax exists). |
+| **C6.8** spread-into-literal `[..xs, x]` — backend | `cg`, `vm`, `tkb` | C6.7 | ⬜ NOT DONE — codegen: emit spread as sequential append (allocate new slice, copy each element — plain→push-one, spread→push-all-from-slice); VM: same in `eval_array`; tkb write/read/frame updated for tagged elements (ripples from C6.7 AST change). |
+| **C6.11** #19 X5 justification-header sweep (headers only) | *(all headers — solo)* | all above | ✅ DONE |
 
-**Rounds:** R6.1 `{C6.1, C6.2, C6.3, C6.10}` (w4) → R6.2 `{C6.4, C6.5, C6.6}` (w3) → R6.3 `{C6.7, C6.8}` (w2) → R6.4 `{C6.11}` (w1) → **attempt `teko .`**.
+**Exit criteria MET** (commit `461c491`): (1) FULL SELF-HOSTING — `bin/teko` built by bootstrap, compiles its own corpus; (2) VM==native regression set (5/6/106). **C6.7/C6.8 are language-feature crumbs** (not exit-gate blockers) carried into Phase 7's work queue. **CONSTITUTION RULING** (2026-06-27): `xs + [x]` is ILLEGAL — `+` is math only (Law M.0); the correct spread form is `[..xs, x]` (decompose-recompose). The `..` token must be added to the lexer; the array-literal AST gets tagged elements (`plain | spread`).
+
+**Rounds:** R6.1 ✅ `{C6.1, C6.2, C6.3, C6.10}` → R6.2 ✅ `{C6.4, C6.5, C6.6}` → R6.3 ⬜ `{C6.7, C6.8}` (carried into Phase 7) → R6.4 ✅ `{C6.11}`.
 
 **Self-host wall (2026-06-26): `lexer.tks:461` = TASK #41 (cross-namespace call resolution).** The C1.8 message reads `argument type mismatch — expected Reader, found str` at `read_str(source, pos)`. Root cause: `type_call` (expr.c) resolves a call by BARE name in the flat env (`tk_env_lookup(env, name)`), with no namespace scoping — so `teko::lexer::read_str(str,u64)` binds to `teko::emit::read_str(Reader,…)` (tkh.tks). There are **12 such cross-ns function-name collisions** in the corpus (read_str, define, is_bool/float/integer/numeric, one_byte, str_of_bytes, prim_width, run, cast_may_lose, write_u64), so a rename is whack-a-mole — the fix is **#41**: a namespace-tagged function table (like the type table) + resolve a bare call in the CALLER's namespace (thread `current_ns` into `type_call`); qualified `ns::name` resolves the named ns + visibility. Moderate core-checker refactor + `.tks` mirror. This is the next self-host gate (before the slice-`empty()` binding half of #57, which is a codegen-time issue behind this CHECK wall).
 
@@ -363,42 +365,54 @@ into **rounds** (parallel waves). The goal is **maximum agent concurrency** with
 
 > **C7.0 — `extern`/FFI form — ✅ RATIFIED 2026-06-27** (TRIBUNAL DECISION). Form: `extern fn name(p) -> r = "symbol" from "lib"` (bodyless; `from` optional→libc; `freestanding` makes it mandatory); `ptr`-only marshalling; one `OP_CALL_EXTERN` → platform convention; library resolution indirected through `.tkp [extern.libs]` (array vocabulary `[]`/name/`static:`|`shared:`/path/`-flag`) + `[extern.search]` (`-L`, per-OS soft-drop) + `prefer` + `cc`/`target`/`sysroot` (musl-ready); cross-OS name-diffs resolve in the `.tkp`, shape-diffs need the general `#os(...)` guard. Full clause: **LEGISLATION §"FFI / `extern`"**. **Staging: macOS+libc FIRST, then Linux, then Windows;** per-OS `.tkp` resolution and `#os(...)` are legislated now / implemented as follow-ons.
 
-| Crumb | Owns | Dep |
-|-------|------|-----|
-| **C7.1a** `extern` decl — lexer (`extern`/`from`) + parser + AST/tast *(macOS)* | `L`, `ast`, `P` | C7.0 |
-| **C7.1b** `extern` checker typing (prims+`ptr`/`uptr`/`void` only) | `chk` | C7.1a |
-| **C7.1c** `extern` codegen emit (C extern proto + call; Teko-name→C-symbol) | `cg` | C7.1a |
-| **C7.1d** `extern` VM handling (defer/stub like the other host bottoms) | `vm` | C7.1a |
-| **C7.1e** `.tkp` `[extern.libs]` FULL array vocab → cc link flags (✅ macOS: empty/bare/multi/path/`-flag`; resolved in manifest → `link_flags`); `[extern.search]`/`prefer`/`static:`/`shared:` mode/`cc`/`target`/`sysroot` deferred (per-OS) | `build`(manifest), `driver`/`build` | C7.0 |
-| **C7.1f** `os()` builtin (✅ `tk_rt_os`) + `[extern]` cc/target/sysroot/freestanding (✅ — cross-build VERIFIED via x86_64-darwin/Rosetta) + musl portability fixes (✅ `execinfo` guard + `_GNU_SOURCE` in teko_rt.c); `#os(...)` ✅ (VERIFIED macOS + Linux glibc/musl) + per-OS `[extern.libs.<os>]` ✅ (cur_os selection, VERIFIED); remaining LOW-VALUE polish: `[extern.search]` (-L) + `static:`/`shared:` linkage mode | `build`, `L`, `P`, `chk`, `cg`, `rt` | C7.1a–e |
-| **C7.1j** multi-OS/arch CI pipelines *(LAST)* — Linux arm64+x86_64, Windows arm64+x86_64, macOS arm64. Local verification via **docker** (Linux arm64 native / amd64 emulated) + **Rosetta** (macOS x86_64); Windows needs CI runners. Stack VERIFIED on macOS arm64+x86_64 & Linux arm64+amd64 (extern `abs()`→7, `os()`). | CI | C7.1* |
-| **C7.1g** `ptr`/`uptr` opaque transport types (✅) + `extern type` opaque handle (→ `void*`) (✅) | `chk`, `cg`, `ast`, `P` | C7.1a–c |
-| **C7.1i** marshalling primitives `teko::mem::as_ptr`/`as_cstr`/`str_from_cstr`/`bytes_from_ptr` (✅ — complete set; `bytes_from_ptr` via `tk_ffi_bytes`→`tk_slice_byte` lift) | `chk`, `cg`, `rt` | C7.1g |
-| **C7.1m** ARTIFACT KINDS — `[artifact] kind` ∈ {`binary`,`static`,`shared`,`package`} (was executable/library); `Artifact = enum {Binary,Static,Shared,Package}` + parse + R-main-d rule (Binary needs main; libs forbid it) + build dispatch (✅ all twins; tests). `binary` ✅ (current); `static`/`shared`/`package` are HONEST STOPS until their increments (M.3). Legislated: `.tkl` = ZIP of `.tkh`+`.tkb`+`.tsym` named `<name>-<version>[-suffix].tkl`; `.tkb` carries ONLY own typed-tree (deps referenced, never inlined); pipeline = load deps → check app → emit. **Blocker for real `.tkl`: C7.16** (program-level `.tkb` codec) | `build`(tkp_rule/manifest/project), `driver` | C7.1k |
-| **C7.1k** BINARY METADATA — `.tkp` `description` + `[platforms] targets` (Manifest +`description`/`platforms`); EVERY binary carries an `@(#)`-marked metadata string (✅ universal — `what(1)`/`strings`; `codegen::tk_emit_meta` appended by the backend) + macOS Mach-O `__TEXT,__info_plist` section (✅ — `mdls`/`otool`; `run_cc` writes Info.plist + `-Wl,-sectcreate`). Staged: Windows PE VERSIONINFO (windres @ pipeline) + Linux ELF `.note`; XML/quote-escaping of arbitrary metadata | `build`(manifest/project), `cg`, `driver` | C7.1f |
-| **C7.1h** pointer-family future: `ptr<T>` (deref behind `#repr(C)`) + `ptr ≡ ptr<void>` | — | **S4 generics** |
-| **C7.2** `teko::env::args` + `teko::exit` | *(new ns files)* | C7.1b–d |
-| **C7.3** `teko::io` slurp (read/write/write_err) | *(new ns files)* | C7.1b–d |
-| **C7.4** `teko::fs` `list_dir` | *(new ns files)* | C7.1b–d |
-| **C7.5** `teko::process` exec (invoke `cc`) | *(new ns files)* | C7.1b–d |
-| **C7.6** D2 `#test` runner in VM (`teko test`) | `vm`, *(runner)*, `main` | ✅ **DONE** |
-| **C7.7** D3 coverage in VM (function-level; per-line is a follow-up) | `vm`, `rt` | ✅ **DONE** |
-| **C7.8** D4 pre-emit gate (tests+coverage before codegen). **`--no-test` is now IGNORED for a build — a release MUST run its tests** (only a project with NO `#test` skips); `gate` param dropped from `compile_project_g`/`tk_compile_project_g`, `no_test_of`/`has_no_test` removed, CMake `selfhost` no longer passes `--no-test` | `main`, `build` | ✅ **DONE** |
-| **C7.9** A4 main-rule from manifest artifact | `build` | — |
-| **C7.10** A6 packages + pre-linker — load each dep (static/shared native lib OR a `.tkl`'s `.tkb`) → merge typed trees → check app, BEFORE emit. The `.tkb` merged in is the dep's OWN tree (deps never re-inline their deps — C7.1m) | `tkb`, `build`, `res` | C7.16, C7.1m |
-| **C7.11** A7 output directory + `-o <dir>` ✅ DONE | `main` | — |
-| **C7.12** A8 `package` output → `.tkl` (ZIP of `.tkh`+`.tkb`+`.tsym`, named `<name>-<version>[-suffix].tkl`) + the pure-Teko ZIP-STORE writer (CRC32, twins). Kinds + dispatch ✅ (C7.1m); BLOCKED on C7.16 for the real `.tkb` payload | `build`, `tkb` | C7.16, C7.1m |
-| **C7.13** B0d promote `tk_str_eq`→text.h (+panic wrapper) | `rt`(text.h), `chk` | — |
-| **C7.14** B3a `TK_LIST` runtime list | `rt` | — |
-| **C7.15** B3b overflow-debug panic guard wiring | `cg` | — |
-| **C7.16** `.tkb` statement/program codec — **THE KEYSTONE for packaging** ✅ **DONE (2026-06-27)**. The complete typed-tree codec: ALL 22 expr kinds (incl. `TIfExpr`+`TMatchExpr`), all 7 statement kinds, all 7 pattern kinds (+ the `Number`/`StrLit`/`ByteLit` pattern-literal exprs — the only `parser::Expr` reachable in the typed tree), `TypeExpr`/`Param`/`Field`/`TypeBody`/`TypeDecl`/`UseDecl`/`TFunction`/`TArm`/`TItem`/`TProgram`, plus `serialize_program`/`deserialize_program` (version-2 frame). Write/read/collect across BOTH twins (tkb_write/.c, tkb_read/.c, tkb_frame/.c, tkb_buf); made `parser::TypeBody`/`checker::TItem`/`checker::TArm` `pub`; +14 round-trip tests; **170 tests, byte-identical**. Also fixed pre-existing expr collect-pass gaps + reader tag 21. Now UNBLOCKS C7.10 (pre-linker load) + C7.12 (`.tkl` payload). | `tkb` | — |
-| **C7.17** M2 `driver.tks` materialized | *(driver)* | C7.2–C7.5 |
+| Crumb | Owns | Dep | Status |
+|-------|------|-----|--------|
+| **C7.1a** `extern` decl — lexer (`extern`/`from`) + parser + AST/tast *(macOS)* | `L`, `ast`, `P` | C7.0 | ✅ DONE |
+| **C7.1b** `extern` checker typing (prims+`ptr`/`uptr`/`void` only) | `chk` | C7.1a | ✅ DONE |
+| **C7.1c** `extern` codegen emit (C extern proto + call; Teko-name→C-symbol) | `cg` | C7.1a | ✅ DONE |
+| **C7.1d** `extern` VM handling (defer/stub like the other host bottoms) | `vm` | C7.1a | ✅ DONE |
+| **C7.1e** `.tkp` `[extern.libs]` FULL array vocab → cc link flags (macOS: empty/bare/multi/path/`-flag`; resolved in manifest → `link_flags`) | `build`(manifest), `driver`/`build` | C7.0 | ✅ DONE |
+| **C7.1f** `os()` builtin + `[extern]` cc/target/sysroot/freestanding + musl portability fixes; `#os(...)` + per-OS `[extern.libs.<os>]` (parse pure — deferred to link-time via `os_lib_os`/`os_lib_flag`) | `build`, `L`, `P`, `chk`, `cg`, `rt` | C7.1a–e | ✅ DONE |
+| **C7.1g** `ptr`/`uptr` opaque transport types + `extern type` opaque handle (→ `void*`) | `chk`, `cg`, `ast`, `P` | C7.1a–c | ✅ DONE |
+| **C7.1i** marshalling primitives `teko::mem::as_ptr`/`as_cstr`/`str_from_cstr`/`bytes_from_ptr` | `chk`, `cg`, `rt` | C7.1g | ✅ DONE |
+| **C7.1k** BINARY METADATA — `.tkp` `description`+`[platforms]`; every binary carries `@(#)` metadata string + macOS Mach-O `__TEXT,__info_plist`; staged: Windows PE VERSIONINFO + Linux ELF `.note` | `build`(manifest/project), `cg`, `driver` | C7.1f | ✅ DONE |
+| **C7.1m** ARTIFACT KINDS — `Artifact = enum {Binary,Static,Shared,Package}` + parse + R-main-d **function exists** (tkp_rule) + build dispatch (honest stops for static/shared/package). `.tkl`=ZIP legislated; `.tkb` OWN-tree-only; pipeline=load deps→check→emit | `build`(tkp_rule/manifest/project), `driver` | C7.1k | ✅ DONE (dispatch) |
+| **C7.6** D2 `#test` runner in VM (`teko test`) | `vm`, *(runner)*, `main` | — | ✅ DONE |
+| **C7.7** D3 three-metric coverage (functions/lines/branches) + Cobertura XML | `vm`, `rt` | — | ✅ DONE |
+| **C7.8** D4 pre-emit gate; `--no-test` removed (build ALWAYS runs tests when `.tkt` files exist) | `main`, `build` | — | ✅ DONE |
+| **C7.11** A7 output directory + `-o <dir>` | `main` | — | ✅ DONE |
+| **C7.16** `.tkb` statement/program codec — ALL 22 expr kinds, 7 statement kinds, 7 pattern kinds, TypeExpr/Param/Field/TypeBody/TypeDecl/UseDecl/TFunction/TArm/TItem/TProgram + `serialize_program`/`deserialize_program` (version-2 frame). 170 tests, byte-identical. UNBLOCKS C7.12 + C7.10 | `tkb` | — | ✅ DONE |
+| **C7.9** A4 main-rule — `check_main_file_rule` wired into `frontend_body` in both `project.tks` + `driver.c`; scans file list for `main.tks` after discover; +1 test `has_main_detection_matches_ends_with_main_tks` | `build`(project), `driver` | — | ✅ DONE |
+| **C7.13** B0d `tk_str_eq` declared in `text.h` + `tk_str_require_eq` inline panic wrapper; removed duplicate `static` definitions from `checker/type.c` + `checker/expr.c`; `teko_rt.h` retains declaration (can't include text.h — core.h conflict) | `rt`(text.h), `chk` | — | ✅ DONE |
+| **C7.14** B3a `TK_RT_LIST(T,Name)` macro in `teko_rt.h` (self-contained, uses realloc/free — can't include core.h); instantiates `tk_byte_list`, `tk_str_list`, `tk_i64_list`; twin comment block in `teko_rt.tks` | `rt` | — | ✅ DONE |
+| **C7.2** `teko::env::args`/`exit`/`var`/`cwd`/`set_var`/`chdir` — currently seed lookups in scope.tks; must become real `extern fn` declarations in a `src/env/env.tks` namespace file (+ `.tkp` wiring + remove seed path from scope) | *(new `src/env/env.tks`)* | C7.1b–d | ⬜ TODO |
+| **C7.3** `teko::io` read_file/write_file/println/eprintln — same: real `extern fn` in `src/io/io.tks` | *(new `src/io/io.tks`)* | C7.1b–d | ⬜ TODO |
+| **C7.4** `teko::fs` list_dir/mkdir — real `extern fn` in `src/fs/fs.tks` | *(new `src/fs/fs.tks`)* | C7.1b–d | ⬜ TODO |
+| **C7.5** `teko::process` exec (invoke `cc`) — real `extern fn` in `src/process/process.tks` | *(new `src/process/process.tks`)* | C7.1b–d | ⬜ TODO |
+| **C7.15** B3b overflow-debug panic guard wiring in codegen | `cg` | — | ⬜ TODO |
+| **C7.12** A8 `package` output → `.tkl` (ZIP-STORE of `.tkh`+`.tkb`+`.tsym`, named `<name>-<version>[-suffix].tkl`) + pure-Teko ZIP-STORE writer (CRC32 + local/central/EOCD headers, deterministic timestamp, twins). C7.16 ✅ unblocks the real `.tkb` payload; update the honest-stop message in project.tks/driver.c | `build`, `tkb` | C7.16 ✅, C7.1m ✅ | ⬜ TODO |
+| **C7.10** A6 pre-linker — load each dep (native `.a`/`.so` OR `.tkl`'s `.tkb`) → merge typed trees → check app BEFORE emit; the merged `.tkb` is the dep's OWN tree (never re-inline deps) | `tkb`, `build`, `res` | C7.12, C7.16 ✅, C7.1m ✅ | ⬜ TODO |
+| **C7.17** M2 `driver.tks` fully materialized — replace seed scope-lookup paths with real `use teko::env`/`teko::io`/`teko::fs`/`teko::process` calls | *(driver)* | C7.2–C7.5 | ⬜ TODO |
+| **C7.1h** `ptr<T>` (deref behind `#repr(C)`) + `ptr ≡ ptr<void>` | — | **S4 generics** | ⬜ deferred to S4 |
+| **C7.1j** multi-OS/arch CI pipelines *(LAST in phase)* — Linux arm64+x86_64, Windows arm64+x86_64, macOS arm64 | CI | C7.1* | ⬜ TODO (LAST) |
+| **C6.7** *(carried from Phase 6)* spread-into-literal `[..xs, x]` — frontend (`L`+`ast`+`P`+`chk`) | `L`, `ast`, `P`, `chk` | C6.5 ✅ | ⬜ NOT DONE — `..` token, tagged array elements, spread type-checking; see Phase 6 C6.7 for full spec |
+| **C6.8** *(carried from Phase 6)* spread-into-literal `[..xs, x]` — backend (`cg`+`vm`+`tkb`) | `cg`, `vm`, `tkb` | C6.7 | ⬜ NOT DONE — codegen+VM emit/eval spread; tkb codec for tagged elements |
 
-**Rounds:**
-- R7.1 `{C7.1a, C7.6, C7.9, C7.13, C7.14, C7.16}` (w6) — FFI-front + test-runner + project + cleanup tracks in parallel (all disjoint).
-- R7.2 `{C7.1b, C7.1c, C7.1d}` (w3) — extern across checker/codegen/vm.
-- R7.3 `{C7.2, C7.3, C7.4, C7.5, C7.7, C7.15}` (w6) — host surfaces (new files) + vm coverage + codegen overflow guard.
-- R7.4 `{C7.8, C7.10, C7.11, C7.12, C7.17}` (w5) — gate + packages + output/pack + driver.
+**Completed rounds (for reference):**
+- R7.1 ✅ `{C7.1a ✅, C7.6 ✅, C7.16 ✅}` — extern front + test-runner + .tkb codec done; C7.9/C7.13/C7.14 carried forward
+- R7.2 ✅ `{C7.1b ✅, C7.1c ✅, C7.1d ✅}` — extern across checker/codegen/vm done
+- R7.3 ✅ `{C7.1e ✅, C7.1f ✅, C7.1g ✅, C7.1i ✅, C7.7 ✅}` — extern libs + os + marshalling + coverage done
+- R7.4 partial `{C7.8 ✅, C7.11 ✅, C7.1k ✅, C7.1m ✅}` — gate + output + metadata + artifact kinds done
+
+**Remaining rounds (ordered, no deferral):**
+- **R7.5** ✅ `{C7.9, C7.13, C7.14}` — main-rule wired into build pipeline (`check_main_file_rule` called in both `project.tks`+`driver.c`); `tk_str_eq` declared in `text.h` + panic wrapper `tk_str_require_eq`; `TK_RT_LIST` macro + `tk_byte_list`/`tk_str_list`/`tk_i64_list` in `teko_rt.h`. 171 tests, both builds green.
+- **R7.6** `{C6.7}` (w1) — spread-into-literal frontend (`..` lexer token + tagged AST element + parser + checker). Serial: C6.8 needs C6.7's AST shape.
+- **R7.6b** `{C6.8, C7.15}` (w2) — spread backend (codegen+VM+tkb) + overflow guard (disjoint: `cg`/`vm`/`tkb` vs `cg` overflow — note overflow guard is a separate codegen pass, can be done in parallel with C6.8 if disjoint from spread emit path).
+- **R7.7** `{C7.2, C7.3, C7.4, C7.5}` (w4) — host surfaces as real `extern fn` namespace files; scope.tks seed paths removed after.
+- **R7.8** `{C7.12}` (w1) — package output → `.tkl` ZIP (unblocked by C7.16).
+- **R7.9** `{C7.10}` (w1) — pre-linker (depends on C7.12 for .tkl loading).
+- **R7.10** `{C7.17}` (w1) — driver.tks fully materialized (depends on C7.2–C7.5).
+- **R7.11** `{C7.1j}` (w1) — multi-OS/arch CI (LAST).
 
 ## Phase 8 — FLAGS
 

@@ -1,13 +1,6 @@
 // src/checker/type.c — nominal type equality (B.13).
 #include "type.h"
-
-static bool tk_str_eq(tk_str a, tk_str b) {
-    if (a.len != b.len) return false;
-    for (size_t i = 0; i < a.len; i += 1) {
-        if (a.ptr[i] != b.ptr[i]) return false;
-    }
-    return true;
-}
+// tk_str_eq is declared in text.h (included via type.h) and implemented in teko_rt.c.
 
 static bool tk_types_eq(const tk_type *xs, size_t nx, const tk_type *ys, size_t ny) {
     if (nx != ny) return false;
