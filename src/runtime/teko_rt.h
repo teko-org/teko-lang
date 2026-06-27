@@ -49,6 +49,7 @@ tk_str tk_str_concat(tk_str a, tk_str b);
 void *tk_as_ptr(tk_str s);
 void *tk_cstr_dup(tk_str s);
 tk_str tk_str_from_cstr(const void *p);
+// (tk_bytes_from_ptr is declared after tk_ffi_bytes, below — its return type is defined there.)
 // tk_i64_to_str / tk_u64_to_str — the integer's DECIMAL text in a fresh str. The interp
 // lowering widens every signed int hole to i64 and every unsigned hole to u64 (every Teko
 // integer prim except u128/i128 fits; the checker scopes holes to what the corpus needs).
@@ -117,6 +118,10 @@ typedef struct { bool ok; tk_str err; } tk_ffi_ures;
 typedef struct { bool ok; tk_str *ptr; uint64_t len; tk_str err; } tk_ffi_slres;
 // u64 | error  (last_index_of): ok → value; !ok → not found.
 typedef struct { bool ok; uint64_t value; } tk_ffi_u64res;
+// []byte  (bytes_from_ptr): a {ptr,len} the codegen lifts to the generated tk_slice_byte (C7.1a).
+typedef struct { tk_byte *ptr; uint64_t len; } tk_ffi_bytes;
+// (C7.1a) copy n octets from a foreign pointer into a fresh []byte (teko::mem::bytes_from_ptr).
+tk_ffi_bytes tk_bytes_from_ptr(const void *p, uint64_t n);
 
 // teko::io::read_file(path) — slurp the whole file as UTF-8 bytes (owned copy).
 tk_ffi_sres tk_rt_read_file(tk_str path);

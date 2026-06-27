@@ -132,6 +132,16 @@ tk_str tk_str_from_cstr(const void *p) {
     return (tk_str){ buf, n };
 }
 
+// (C7.1a) marshalling — copy n octets from a foreign pointer into a fresh Teko []byte. A NULL
+// pointer or n==0 yields an empty slice (a 1-byte buffer so the pointer is distinct). The codegen
+// lifts the returned {ptr,len} to the program's tk_slice_byte. [teko::mem::bytes_from_ptr]
+tk_ffi_bytes tk_bytes_from_ptr(const void *p, uint64_t n) {
+    tk_byte *buf = malloc(n ? n : 1);
+    if (buf == NULL) tk_panic("out of memory (bytes from ptr)");
+    if (n && p) memcpy(buf, p, (size_t)n);
+    return (tk_ffi_bytes){ buf, (n && p) ? n : 0 };
+}
+
 // decimal text of an unsigned 64-bit value into a fresh str (no leading zeros; "0" for 0).
 tk_str tk_u64_to_str(uint64_t v) {
     char tmp[20];                 // u64 max = 20 digits

@@ -384,5 +384,10 @@ tk_type_result tk_builtin_fn(tk_str name) {
         tk_type ft = { .tag = TK_TYPE_FUNC, .as.func = { .params = &ptr_t, .nparams = 1, .ret = &str_t } };
         return (tk_type_result){ .ok = true, .as.value = ft };
     }
+    if (name_is(name, "bytes_from_ptr")) {                         // (ptr, u64) -> []byte
+        static tk_type bfp_p[2] = { { .tag = TK_TYPE_PTR }, { .tag = TK_TYPE_PRIM, .as.prim = TK_PRIM_U64 } };
+        tk_type ft = { .tag = TK_TYPE_FUNC, .as.func = { .params = bfp_p, .nparams = 2, .ret = &bytes_t } };
+        return (tk_type_result){ .ok = true, .as.value = ft };
+    }
     return (tk_type_result){ .ok = false, .as.error = tk_error_make("not a built-in function") };
 }

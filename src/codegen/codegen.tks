@@ -1184,6 +1184,7 @@ fn emit_call(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, e: c
             if l == "last_index_of" { return emit_host_ffi(buf, prog, e, c, "u64res", "tk_rt_last_index_of") }
             if l == "args"          { return emit_host_ffi(buf, prog, e, c, "args",   "tk_rt_args") }
             if l == "run"           { return emit_host_ffi(buf, prog, e, c, "run",    "tk_rt_run") }
+            if l == "bytes_from_ptr" { return emit_host_ffi(buf, prog, e, c, "bytes", "tk_bytes_from_ptr") }   // (C7.1a) ptr+len -> []byte (slice-lift)
         }
     }
     // Non-shadowable built-ins: `print`/`println`, either bare or under `teko`.
@@ -2132,6 +2133,26 @@ fn emit_host_ffi(buf: []byte, prog: checker::TProgram, e: checker::TExpr, c: che
         o = cb(o, "p, .len = ")
         o = cb(o, t)
         return cb(o, "n }; })")
+    }
+    // (C7.1a) bytes_from_ptr(ptr,u64) -> []byte : a fixed-ABI tk_ffi_bytes {ptr,len} lifted to the
+    // generated tk_slice_byte (same {ptr,len} layout; the runtime can't name the generated slice).
+    if kind == "bytes" {
+        let byte_t = checker::Byte { }
+        mut o = cb(buf, "({ tk_ffi_bytes ")
+        o = cb(o, t)
+        o = cb(o, " = ")
+        o = cb(o, rtfn)
+        o = cb(o, "(")
+        o = match emit_expr(o, prog, c.args[0]) { []byte as r => r; error as err => return err }
+        o = cb(o, ", ")
+        o = match emit_expr(o, prog, c.args[1]) { []byte as r => r; error as err => return err }
+        o = cb(o, "); (")
+        o = match cg_slice_typename(o, byte_t) { []byte as r => r; error as err => return err }
+        o = cb(o, "){ .ptr = ")
+        o = cb(o, t)
+        o = cb(o, ".ptr, .len = ")
+        o = cb(o, t)
+        return cb(o, ".len }; })")
     }
     // run([]str) -> i32 : the primitive takes ptr+len (no generated slice type). Single-eval argv.
     if kind == "run" {

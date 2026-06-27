@@ -814,7 +814,7 @@ static bool emit_as(cbuf *b, tk_type expected, const tk_texpr *value, const char
 // is emitted as a statement-expression that calls a fixed-ABI runtime primitive (teko_rt.h)
 // and lifts the result into the program's generated result type (e->type). Defined after the
 // variant-wrap helpers it leans on; the CALL case dispatches to it by builtin name.
-enum cg_ffi_kind { CG_FFI_SRES, CG_FFI_URES, CG_FFI_SLRES, CG_FFI_U64RES, CG_FFI_ARGS, CG_FFI_RUN };
+enum cg_ffi_kind { CG_FFI_SRES, CG_FFI_URES, CG_FFI_SLRES, CG_FFI_U64RES, CG_FFI_ARGS, CG_FFI_RUN, CG_FFI_BYTES };
 static bool emit_host_ffi(cbuf *b, int kind, const char *rtfn, const tk_texpr *e, const char **err);
 // W5b — a `match` lowered to a GNU statement-expression (the VALUE form).
 static bool emit_match_value(cbuf *b, const tk_texpr *e, const char **err);
@@ -1201,6 +1201,7 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
                     if (seg_is(l, "last_index_of")) return emit_host_ffi(b, CG_FFI_U64RES, "tk_rt_last_index_of", e, err);
                     if (seg_is(l, "args"))          return emit_host_ffi(b, CG_FFI_ARGS,   "tk_rt_args",          e, err);
                     if (seg_is(l, "run"))           return emit_host_ffi(b, CG_FFI_RUN,    "tk_rt_run",           e, err);
+                    if (seg_is(l, "bytes_from_ptr")) return emit_host_ffi(b, CG_FFI_BYTES, "tk_bytes_from_ptr",   e, err);   // (C7.1a) ptr+len -> []byte (slice-lift)
                 }
             }
             // Non-shadowable built-ins: `print`/`println`, either bare or under `teko`.
@@ -1874,6 +1875,19 @@ static bool emit_host_ffi(cbuf *b, int kind, const char *rtfn, const tk_texpr *e
         cb(b, " "); cb(b, t); cb(b, " = ");
         if (!emit_expr(b, &e->as.call.args[0], err)) return false;
         cb(b, "; "); cb(b, rtfn); cb(b, "("); cb(b, t); cb(b, ".ptr, "); cb(b, t); cb(b, ".len); })");
+        return true;
+    }
+    // (C7.1a) bytes_from_ptr(ptr,u64) -> []byte : a fixed-ABI tk_ffi_bytes {ptr,len} lifted to the
+    // generated tk_slice_byte (same {ptr,len} layout; the runtime can't name the generated slice).
+    if (kind == CG_FFI_BYTES) {
+        tk_type byte_t = { .tag = TK_TYPE_BYTE };
+        cb(b, "({ tk_ffi_bytes "); cb(b, t); cb(b, " = "); cb(b, rtfn); cb(b, "(");
+        if (!emit_expr(b, &e->as.call.args[0], err)) return false;
+        cb(b, ", ");
+        if (!emit_expr(b, &e->as.call.args[1], err)) return false;
+        cb(b, "); (");
+        if (!cg_slice_typename(b, byte_t, err)) return false;   // tk_slice_byte
+        cb(b, "){ .ptr = "); cb(b, t); cb(b, ".ptr, .len = "); cb(b, t); cb(b, ".len }; })");
         return true;
     }
 

@@ -372,7 +372,7 @@ into **rounds** (parallel waves). The goal is **maximum agent concurrency** with
 | **C7.1e** `.tkp` `[extern.libs] name = []` → driver `-l<name>` (✅ macOS); full array vocab + `search`/`prefer`/`cc`/`target`/`sysroot` deferred | `build`(manifest), `driver`/`build` | C7.0 |
 | **C7.1f** per-OS symbol/lib resolution + `#os(...)` conditional-compile guard *(Linux/Windows)* | `build`, `L`, `P`, `chk`, `cg` | C7.1a–e · **follow-on** |
 | **C7.1g** `ptr`/`uptr` opaque transport types (✅) + `extern type` opaque handle (→ `void*`) (✅) | `chk`, `cg`, `ast`, `P` | C7.1a–c |
-| **C7.1i** marshalling primitives `teko::mem::as_ptr`/`as_cstr`/`str_from_cstr` (✅); `bytes_from_ptr` deferred (slice-lift) | `chk`, `cg`, `rt` | C7.1g |
+| **C7.1i** marshalling primitives `teko::mem::as_ptr`/`as_cstr`/`str_from_cstr`/`bytes_from_ptr` (✅ — complete set; `bytes_from_ptr` via `tk_ffi_bytes`→`tk_slice_byte` lift) | `chk`, `cg`, `rt` | C7.1g |
 | **C7.1h** pointer-family future: `ptr<T>` (deref behind `#repr(C)`) + `ptr ≡ ptr<void>` | — | **S4 generics** |
 | **C7.2** `teko::env::args` + `teko::exit` | *(new ns files)* | C7.1b–d |
 | **C7.3** `teko::io` slurp (read/write/write_err) | *(new ns files)* | C7.1b–d |
