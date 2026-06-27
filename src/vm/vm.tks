@@ -771,6 +771,44 @@ fn lit_as(lit: parser::Expr, subj: Value) -> Value {
 // place and is unwound by `env_pop_to`.
 type PatMatch = struct { matched: bool; env: Venv }
 
+// vm_case_in_variant — is `cname` a MEMBER of the variant type `vname`? A match arm may name a
+// VARIANT (e.g. `Type`) and the value's case is one of its members (e.g. `Prim`): the VM has no
+// wrapper (the value IS the member struct), so resolve the variant decl in the program and check
+// membership. (Mirrors vm.c case_in_variant; native codegen discriminates the tagged union.)
+fn vm_case_in_variant(prog: checker::TProgram, vname: str, cname: str) -> bool {
+    mut i = 0
+    loop {
+        if i >= prog.items.len { break }
+        match prog.items[i] {
+            parser::TypeDecl as td => {
+                if td.name == vname {
+                    match td.body {
+                        parser::VariantBody as vb => match vb.type_expr {
+                            parser::UnionType as u => {
+                                mut j = 0
+                                loop {
+                                    if j >= u.members.len { break }
+                                    match u.members[j] {
+                                        parser::NamedType as nt => { if nt.path.segments[nt.path.segments.len - 1].name == cname { return true } }
+                                        _ => {}
+                                    }
+                                    j = j + 1
+                                }
+                                return false
+                            }
+                            _ => return false
+                        }
+                        _ => return false
+                    }
+                }
+            }
+            _ => {}
+        }
+        i = i + 1
+    }
+    false
+}
+
 fn pat_match(pat: parser::Pattern, subj: Value, env: Venv) -> PatMatch {
     // OPTIONAL subject (REBOOT_PLAN §202): `null` matches NONE; any other pattern matches the
     // PRESENT case. A bare bind/wildcard over a present NON-struct inner binds the inner directly;
@@ -836,9 +874,17 @@ fn pat_match(pat: parser::Pattern, subj: Value, env: Venv) -> PatMatch {
                 }
             } else {
                 // a member matched by TYPE: a named case is a StructVal whose type_name IS the case;
-                // a PRIM/bool/byte/str member matches by the value's kind (val_type_matches). This
-                // supports `Type =>` with NO destructure and NO alias, for EVERY member kind.
-                if val_type_matches(subj, path_last(bp.type_name)) {
+                // a PRIM/bool/byte/str member matches by the value's kind (val_type_matches); AND a
+                // pattern that names a VARIANT (`Type`) matches a value whose case is one of its
+                // members (vm_case_in_variant). Supports `Type =>` with NO destructure and NO alias.
+                mut hit = val_type_matches(subj, path_last(bp.type_name))
+                if !hit {
+                    match subj {
+                        StructVal as sv => { if vm_case_in_variant(env.prog, path_last(bp.type_name), sv.type_name) { hit = true } }
+                        _ => {}
+                    }
+                }
+                if hit {
                     if bp.has_binding {
                         PatMatch { matched = true; env = define(env, bp.binding, subj) }   // `Type as x` binds the whole value
                     } else {

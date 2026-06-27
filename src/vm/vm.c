@@ -1013,6 +1013,29 @@ static tk_value eval_call(const tk_texpr *e, tk_venv *env) {
 // last path segment name (cases/types match by their final identifier, like find_function).
 static tk_str path_last(tk_path p) { return p.len ? p.segments[p.len - 1].name : (tk_str){ NULL, 0 }; }
 
+// case_in_variant — is `cname` a MEMBER of the variant type `vname`? A match arm pattern may name
+// a VARIANT (e.g. `Type`) and the value's case is one of its members (e.g. `Prim`): native codegen
+// discriminates the tagged union; the VM has no wrapper (the value IS the member struct), so it
+// must resolve the variant decl in the program and check membership. (Mirrors vm.tks.)
+static bool case_in_variant(tk_str vname, tk_str cname) {
+    for (size_t i = 0; i < g_prog.nitems; i += 1) {
+        if (g_prog.items[i].tag != TK_TITEM_TYPE_DECL) continue;
+        tk_type_decl td = g_prog.items[i].as.type_decl;
+        if (!name_eq(td.name, vname)) continue;
+        if (td.body.tag != TK_BODY_VARIANT) return false;
+        tk_type_expr te = td.body.as.variant_body.type_expr;
+        if (te.tag != TK_TEXPR_UNION) return false;
+        for (size_t j = 0; j < te.as.uni.len; j += 1) {
+            tk_type_expr m = te.as.uni.members[j];
+            if (m.tag == TK_TEXPR_NAMED && m.as.named.path.len > 0
+                && name_eq(m.as.named.path.segments[m.as.named.path.len - 1].name, cname))
+                return true;
+        }
+        return false;
+    }
+    return false;
+}
+
 // value equality (literal patterns) — same-tag scalar compare.
 static bool value_eq(tk_value a, tk_value b) {
     if (a.tag != b.tag) return false;
@@ -1114,8 +1137,11 @@ static bool pat_match(const tk_pattern *pat, tk_value subj, tk_venv *env) {
             }
             // a member matched by TYPE: a named case is a struct whose type_name IS the case; a
             // PRIM/bool/str member matches by the value's kind (val_type_matches). Supports `Type =>`
-            // with NO destructure and NO alias, for every member kind.
-            if (!val_type_matches(subj, path_last(pat->as.bind.type_name))) return false;
+            // with NO destructure and NO alias, for every member kind. ALSO a pattern that names a
+            // VARIANT (e.g. `Type`) matches a value whose case is one of its members (case_in_variant).
+            if (!val_type_matches(subj, path_last(pat->as.bind.type_name))
+                && !(subj.tag == TK_VAL_STRUCT && case_in_variant(path_last(pat->as.bind.type_name), subj.as.st.type_name)))
+                return false;
             if (pat->as.bind.has_binding) env_define(env, pat->as.bind.binding, subj);   // `Type as x` binds the whole value
             return true;
         }
