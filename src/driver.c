@@ -450,6 +450,15 @@ static int frontend_body(const char *dir, tk_tprogram *out, tk_manifest *manifes
               (tk_source_file){ .path = mainp, .namespace = m.name });
       } }
 
+    // --- C7.9: A4 main-file rule — Binary REQUIRES main.tks; library kinds FORBID it ---
+    { bool has_main = false;
+      for (size_t i = 0; i < files.len; i++) {
+          tk_str p = files.ptr[i].path;
+          if (p.len >= 8 && memcmp(p.ptr + p.len - 8, "main.tks", 8) == 0) { has_main = true; break; }
+      }
+      tk_artifact_result arule = tk_check_main_file_rule(m.artifact, has_main);
+      if (!arule.ok) return quiet ? 1 : fail(dir, arule.as.error.message); }
+
     // --- report the discovered file → namespace map (the project's surface) ---
     if (!quiet) {
         printf("teko: project '%.*s' (source=%.*s) — %zu file(s):\n",
