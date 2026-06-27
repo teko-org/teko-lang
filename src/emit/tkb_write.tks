@@ -104,9 +104,8 @@ fn write_texpr(buf: []byte, t: StrTable, te: checker::TExpr) -> []byte {
             sb = write_u8(sb, (if iff.has_else { 1 } else { 0 }) to byte)
             write_tstatements(sb, t, iff.else_blk)
         }
-        // typed MATCH: reserved tag 9. Full (de)serialization needs the parser::Pattern codec
-        // (TArm carries a pattern) — the next C7.16 slice; read still rejects tag 9 (visible — M.1).
-        checker::TMatchExpr     => write_u8(b, 9)
+        // (C7.16) typed MATCH: tag 9 + subject (texpr) + arms ([]TArm).
+        checker::TMatchExpr as m => write_tarms(write_texpr(write_u8(b, 9), t, m.subject), t, m.arms)
         // S1a — Cast: the target type IS te.type (already written by the leading write_type); payload is just the inner expr.
         checker::TCast as c     => write_texpr(write_u8(b, 10), t, c.expr)
         // S1b — FieldAccess: receiver THEN the interned field-name index (write order = read order).
@@ -346,4 +345,64 @@ fn write_program(buf: []byte, t: StrTable, prog: checker::TProgram) -> []byte {
     mut i = 0
     loop { if i >= prog.items.len { break }; b = write_titem(b, t, prog.items[i]); i++ }
     b
+}
+
+// ============================================================================
+// (C7.16) MATCH FRAMING — parser::Expr (pattern-literal subset) / Pattern / TArm. parser::Expr
+// appears in the typed tree ONLY inside patterns, and parse_pattern only ever puts Number/StrLit/
+// ByteLit there, so the pattern-expr codec covers exactly those three leaves.
+// ============================================================================
+
+// a parser::Expr in a pattern (Number/StrLit/ByteLit only): u8 tag + payload.
+fn write_pexpr(buf: []byte, t: StrTable, e: parser::Expr) -> []byte {
+    match e.kind {
+        parser::Number as n  => write_u64(write_u64(write_u64(write_u8(write_u8(buf, 0), (if n.is_float { 1 } else { 0 }) to byte), (n.value >> 64) to u64), (n.value & 0xFFFFFFFFFFFFFFFF) to u64), teko::f64_bits(n.fval))
+        parser::StrLit as s  => write_u32(write_u8(buf, 1), st_find(t, s.text))
+        parser::ByteLit as bl => write_u8(write_u8(buf, 2), bl.value)
+        _ => write_u8(buf, 255)   // a non-literal pattern expr (does not occur — patterns hold only Number/Str/Byte); read rejects 255
+    }
+}
+
+fn write_patterns(buf: []byte, t: StrTable, xs: []parser::Pattern) -> []byte {
+    mut b = write_u64(buf, xs.len to u64)
+    mut i = 0
+    loop { if i >= xs.len { break }; b = write_pattern(b, t, xs[i]); i++ }
+    b
+}
+
+// a Pattern: u8 tag. Literal(0)/Range(1)/Alt(2)/Bind(3)/Field(4)/Wildcard(5)/Null(6).
+fn write_pattern(buf: []byte, t: StrTable, p: parser::Pattern) -> []byte {
+    match p {
+        parser::LiteralPattern as l => write_pexpr(write_u8(buf, 0), t, l.value)
+        parser::RangePattern as r   => write_pexpr(write_pexpr(write_u8(buf, 1), t, r.lo), t, r.hi)
+        parser::AltPattern as a     => write_patterns(write_u8(buf, 2), t, a.options)
+        parser::BindPattern as bp => {
+            mut b = write_path(write_u8(buf, 3), t, bp.type_name)
+            b = write_u8(b, (if bp.has_binding { 1 } else { 0 }) to byte)
+            b = write_u32(b, st_find(t, bp.binding))
+            b = write_u8(b, (if bp.is_slice { 1 } else { 0 }) to byte)
+            match bp.slice_type {                                     // slice_type: TypeExpr? — flag + (if Some) the type
+                parser::TypeExpr as st => write_typeexpr(write_u8(b, 1), t, st)
+                null                   => write_u8(b, 0)
+            }
+        }
+        parser::FieldPattern as f   => write_strs(write_path(write_u8(buf, 4), t, f.type_name), t, f.fields)
+        parser::WildcardPattern     => write_u8(buf, 5)
+        parser::NullPattern         => write_u8(buf, 6)
+    }
+}
+
+fn write_tarms(buf: []byte, t: StrTable, xs: []checker::TArm) -> []byte {
+    mut b = write_u64(buf, xs.len to u64)
+    mut i = 0
+    loop { if i >= xs.len { break }; b = write_tarm(b, t, xs[i]); i++ }
+    b
+}
+
+// a TArm: pattern + has_when (u8) + guard (texpr, only when has_when) + body ([]TStatement).
+fn write_tarm(buf: []byte, t: StrTable, a: checker::TArm) -> []byte {
+    mut b = write_pattern(buf, t, a.pattern)
+    b = write_u8(b, (if a.has_when { 1 } else { 0 }) to byte)
+    if a.has_when { b = write_texpr(b, t, a.guard) }
+    write_tstatements(b, t, a.body)
 }

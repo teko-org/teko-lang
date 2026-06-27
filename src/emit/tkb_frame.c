@@ -14,6 +14,7 @@ static tk_bytes append_bytes(tk_bytes dst, tk_bytes src) {
 
 static void collect_type(tk_strtable *t, tk_type ty);
 static void collect_tstmts(tk_strtable *t, const tk_tstatement *xs, size_t n);   // (C7.16) fwd (mutual with collect)
+static void collect_tarms(tk_strtable *t, const tk_tarm *xs, size_t n);          // (C7.16) fwd (mutual with collect — match arms)
 static void collect_type_list(tk_strtable *t, const tk_type *xs, size_t n) {
     for (size_t i = 0; i < n; i += 1) collect_type(t, xs[i]);
 }
@@ -83,6 +84,10 @@ static void collect(tk_strtable *t, const tk_texpr *te) {
             collect(t, te->as.if_expr.cond);
             collect_tstmts(t, te->as.if_expr.then_blk, te->as.if_expr.nthen);
             collect_tstmts(t, te->as.if_expr.else_blk, te->as.if_expr.nelse);
+            break;
+        case TK_TEXPR_MATCH:                                                    // (C7.16) subject + arms
+            collect(t, te->as.match_expr.subject);
+            collect_tarms(t, te->as.match_expr.arms, te->as.match_expr.narms);
             break;
         default: break;
     }
@@ -167,6 +172,40 @@ static void collect_titem(tk_strtable *t, const tk_titem *it) {
 }
 static void collect_program(tk_strtable *t, const tk_tprogram *prog) {
     for (size_t i = 0; i < prog->nitems; i += 1) collect_titem(t, &prog->items[i]);
+}
+
+// (C7.16) MATCH FRAMING collect — pattern-expr / Pattern / TArm.
+static void collect_pexpr(tk_strtable *t, const tk_expr *e) {
+    if (e->tag == TK_EXPR_STR) tk_st_intern(t, e->as.str.text);   // Number/ByteLit carry no string
+}
+static void collect_pattern(tk_strtable *t, const tk_pattern *p);   // fwd (recursive via Alt)
+static void collect_patterns(tk_strtable *t, const tk_pattern *xs, size_t n) {
+    for (size_t i = 0; i < n; i += 1) collect_pattern(t, &xs[i]);
+}
+static void collect_pattern(tk_strtable *t, const tk_pattern *p) {
+    switch (p->tag) {
+        case TK_PAT_LITERAL: collect_pexpr(t, &p->as.literal.value); break;
+        case TK_PAT_RANGE:   collect_pexpr(t, &p->as.range.lo); collect_pexpr(t, &p->as.range.hi); break;
+        case TK_PAT_ALT:     collect_patterns(t, p->as.alt.options, p->as.alt.n_options); break;
+        case TK_PAT_BIND:
+            for (size_t i = 0; i < p->as.bind.type_name.len; i += 1) tk_st_intern(t, p->as.bind.type_name.segments[i].name);
+            tk_st_intern(t, p->as.bind.binding);
+            if (p->as.bind.slice_type != NULL) collect_typeexpr(t, *p->as.bind.slice_type);
+            break;
+        case TK_PAT_FIELD:
+            for (size_t i = 0; i < p->as.field.type_name.len; i += 1) tk_st_intern(t, p->as.field.type_name.segments[i].name);
+            for (size_t i = 0; i < p->as.field.n_fields; i += 1) tk_st_intern(t, p->as.field.fields[i]);
+            break;
+        case TK_PAT_WILDCARD: case TK_PAT_NULL: break;
+    }
+}
+static void collect_tarm(tk_strtable *t, const tk_tarm *a) {
+    collect_pattern(t, &a->pattern);
+    if (a->has_when) collect(t, a->guard);
+    collect_tstmts(t, a->body, a->nbody);
+}
+static void collect_tarms(tk_strtable *t, const tk_tarm *xs, size_t n) {
+    for (size_t i = 0; i < n; i += 1) collect_tarm(t, &xs[i]);
 }
 
 tk_bytes tk_serialize(const tk_texpr *te) {

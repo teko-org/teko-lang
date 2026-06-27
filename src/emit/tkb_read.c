@@ -82,6 +82,7 @@ static tk_texpr_result texpr_err(const char *m) { return (tk_texpr_result){ .ok 
 static tk_token_kind kind_of(uint8_t b) { return (tk_token_kind)b; }   // [E7: byte→enum]
 static tk_texpr *boxe(tk_texpr t) { tk_texpr *p = tk_alloc(sizeof *p); if (!p) abort(); *p = t; return p; }
 static tk_tstatement *read_tstmts(tk_reader *r, tk_strs t, size_t *out_n);   // (C7.16) fwd (mutual with tk_read_texpr)
+static tk_tarm *read_tarms(tk_reader *r, tk_strs t, size_t *out_n);          // (C7.16) fwd (mutual with tk_read_texpr — match arms)
 
 tk_texpr tk_read_texpr(tk_reader *r, tk_strs t) {
     tk_type ty = tk_read_type(r, t);
@@ -127,6 +128,11 @@ tk_texpr tk_read_texpr(tk_reader *r, tk_strs t) {
             e.as.if_expr.then_blk = read_tstmts(r, t, &e.as.if_expr.nthen);
             e.as.if_expr.has_else = (tk_read_u8(r) != 0);
             e.as.if_expr.else_blk = read_tstmts(r, t, &e.as.if_expr.nelse);
+            return e;
+        case 9:                                                                 /* (C7.16) MATCH: subject + arms */
+            e.tag = TK_TEXPR_MATCH;
+            e.as.match_expr.subject = boxe(tk_read_texpr(r, t));
+            e.as.match_expr.arms = read_tarms(r, t, &e.as.match_expr.narms);
             return e;
         case 10:                                                                /* S1a — Cast: target rides ty; read inner */
             e.tag = TK_TEXPR_CAST;
@@ -368,6 +374,74 @@ static tk_titem *read_titems(tk_reader *r, tk_strs t, size_t *out_n) {
     uint64_t n = tk_read_u64(r);
     tk_titem *xs = tk_alloc((n ? n : 1) * sizeof *xs); if (!xs) abort();
     for (uint64_t i = 0; i < n; i += 1) xs[i] = read_titem(r, t);
+    *out_n = (size_t)n; return xs;
+}
+
+// ============================================================================
+// (C7.16) MATCH FRAMING readers — pattern-expr / Pattern / TArm.
+// ============================================================================
+static tk_expr read_pexpr(tk_reader *r, tk_strs t) {
+    uint8_t tag = tk_read_u8(r);
+    tk_expr e = {0};
+    switch (tag) {
+        case 0:
+            e.tag = TK_EXPR_NUMBER;
+            e.as.number.is_float = (tk_read_u8(r) != 0);
+            { uint64_t hi = tk_read_u64(r), lo = tk_read_u64(r);
+              e.as.number.value = (__int128)(((unsigned __int128)hi << 64) | (unsigned __int128)lo);
+              uint64_t fb = tk_read_u64(r); __builtin_memcpy(&e.as.number.fval, &fb, sizeof fb); }
+            return e;
+        case 1: e.tag = TK_EXPR_STR;  e.as.str.text = tk_read_str(r, t); return e;
+        case 2: e.tag = TK_EXPR_BYTE; e.as.byte.value = tk_read_u8(r); return e;
+    }
+    r->ok = false; return e;
+}
+static tk_pattern read_pattern(tk_reader *r, tk_strs t);   // fwd (recursive via Alt)
+static tk_pattern *read_patterns(tk_reader *r, tk_strs t, size_t *out_n) {
+    uint64_t n = tk_read_u64(r);
+    tk_pattern *xs = tk_alloc((n ? n : 1) * sizeof *xs); if (!xs) abort();
+    for (uint64_t i = 0; i < n; i += 1) xs[i] = read_pattern(r, t);
+    *out_n = (size_t)n; return xs;
+}
+static tk_pattern read_pattern(tk_reader *r, tk_strs t) {
+    uint8_t tag = tk_read_u8(r);
+    tk_pattern p = {0};
+    switch (tag) {
+        case 0: p.tag = TK_PAT_LITERAL; p.as.literal.value = read_pexpr(r, t); return p;
+        case 1: p.tag = TK_PAT_RANGE;   p.as.range.lo = read_pexpr(r, t); p.as.range.hi = read_pexpr(r, t); return p;
+        case 2: p.tag = TK_PAT_ALT;     p.as.alt.options = read_patterns(r, t, &p.as.alt.n_options); return p;
+        case 3:
+            p.tag = TK_PAT_BIND;
+            p.as.bind.type_name = read_path_c(r, t);
+            p.as.bind.has_binding = (tk_read_u8(r) != 0);
+            p.as.bind.binding = tk_read_str(r, t);
+            p.as.bind.is_slice = (tk_read_u8(r) != 0);
+            if (tk_read_u8(r) != 0) p.as.bind.slice_type = tk_box_type(read_typeexpr(r, t));
+            else p.as.bind.slice_type = NULL;
+            return p;
+        case 4:
+            p.tag = TK_PAT_FIELD;
+            p.as.field.type_name = read_path_c(r, t);
+            p.as.field.fields = read_strs(r, t, &p.as.field.n_fields);
+            return p;
+        case 5: p.tag = TK_PAT_WILDCARD; return p;
+        case 6: p.tag = TK_PAT_NULL; return p;
+    }
+    r->ok = false; return p;
+}
+static tk_tarm read_tarm(tk_reader *r, tk_strs t) {
+    tk_tarm a = {0};
+    a.pattern = read_pattern(r, t);
+    a.has_when = (tk_read_u8(r) != 0);
+    if (a.has_when) a.guard = boxe(tk_read_texpr(r, t));
+    else a.guard = NULL;
+    a.body = read_tstmts(r, t, &a.nbody);
+    return a;
+}
+static tk_tarm *read_tarms(tk_reader *r, tk_strs t, size_t *out_n) {
+    uint64_t n = tk_read_u64(r);
+    tk_tarm *xs = tk_alloc((n ? n : 1) * sizeof *xs); if (!xs) abort();
+    for (uint64_t i = 0; i < n; i += 1) xs[i] = read_tarm(r, t);
     *out_n = (size_t)n; return xs;
 }
 

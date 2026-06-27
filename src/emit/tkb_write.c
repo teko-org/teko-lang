@@ -7,6 +7,7 @@ static tk_byte kind_byte(tk_token_kind k) { return (tk_byte)k; }  // [E7]
 static tk_byte bindkind_byte(tk_bind_kind k) { return (tk_byte)k; }  // (C7.16) Let/Mut/Const → ordinal byte
 
 static tk_bytes write_tstatements(tk_bytes b, tk_strtable t, const tk_tstatement *xs, size_t n);  // (C7.16) fwd (mutual with tk_write_texpr)
+static tk_bytes write_tarms(tk_bytes b, tk_strtable t, const tk_tarm *xs, size_t n);              // (C7.16) fwd (mutual with tk_write_texpr — match arms)
 
 static tk_bytes write_types(tk_bytes b, tk_strtable t, const tk_type *xs, size_t n) {
     b = tk_write_u32(b, (uint32_t)n);
@@ -85,7 +86,9 @@ tk_bytes tk_write_texpr(tk_bytes b, tk_strtable t, const tk_texpr *te) {
             b = write_tstatements(b, t, te->as.if_expr.then_blk, te->as.if_expr.nthen);
             b = tk_write_u8(b, (tk_byte)(te->as.if_expr.has_else ? 1 : 0));
             return write_tstatements(b, t, te->as.if_expr.else_blk, te->as.if_expr.nelse);
-        case TK_TEXPR_MATCH: return tk_write_u8(b, 9);   // reserved — TMatchExpr arms need the pattern codec (next C7.16 slice); read rejects (M.1)
+        case TK_TEXPR_MATCH:                                                     // (C7.16) subject + arms ([]TArm)
+            b = tk_write_texpr(tk_write_u8(b, 9), t, te->as.match_expr.subject);
+            return write_tarms(b, t, te->as.match_expr.arms, te->as.match_expr.narms);
         case TK_TEXPR_CAST:                                                      // S1a — payload = inner expr (target rides te->type)
             return tk_write_texpr(tk_write_u8(b, 10), t, te->as.cast.expr);
         case TK_TEXPR_FIELD_ACCESS:                                             // S1b — receiver THEN field index
@@ -261,5 +264,59 @@ static tk_bytes write_titem(tk_bytes b, tk_strtable t, const tk_titem *it) {
 tk_bytes tk_write_program(tk_bytes b, tk_strtable t, const tk_tprogram *prog) {
     b = tk_write_u64(b, (uint64_t)prog->nitems);
     for (size_t i = 0; i < prog->nitems; i += 1) b = write_titem(b, t, &prog->items[i]);
+    return b;
+}
+
+// ============================================================================
+// (C7.16) MATCH FRAMING writers — parser::Expr (Number/StrLit/ByteLit only) / Pattern / TArm.
+// ============================================================================
+static tk_bytes write_pexpr(tk_bytes b, tk_strtable t, const tk_expr *e) {
+    switch (e->tag) {
+        case TK_EXPR_NUMBER: {
+            b = tk_write_u8(tk_write_u8(b, 0), (tk_byte)(e->as.number.is_float ? 1 : 0));
+            unsigned __int128 uv = (unsigned __int128)e->as.number.value;
+            b = tk_write_u64(b, (uint64_t)(uv >> 64));
+            b = tk_write_u64(b, (uint64_t)uv);
+            uint64_t fbits; __builtin_memcpy(&fbits, &e->as.number.fval, sizeof fbits);
+            return tk_write_u64(b, fbits);
+        }
+        case TK_EXPR_STR:  return tk_write_u32(tk_write_u8(b, 1), tk_st_find(t, e->as.str.text));
+        case TK_EXPR_BYTE: return tk_write_u8(tk_write_u8(b, 2), e->as.byte.value);
+        default:           return tk_write_u8(b, 255);   // not a literal pattern expr (does not occur); read rejects
+    }
+}
+static tk_bytes write_pattern(tk_bytes b, tk_strtable t, const tk_pattern *p);   // fwd (recursive via Alt)
+static tk_bytes write_patterns(tk_bytes b, tk_strtable t, const tk_pattern *xs, size_t n) {
+    b = tk_write_u64(b, (uint64_t)n);
+    for (size_t i = 0; i < n; i += 1) b = write_pattern(b, t, &xs[i]);
+    return b;
+}
+static tk_bytes write_pattern(tk_bytes b, tk_strtable t, const tk_pattern *p) {
+    switch (p->tag) {
+        case TK_PAT_LITERAL: return write_pexpr(tk_write_u8(b, 0), t, &p->as.literal.value);
+        case TK_PAT_RANGE:   b = write_pexpr(tk_write_u8(b, 1), t, &p->as.range.lo); return write_pexpr(b, t, &p->as.range.hi);
+        case TK_PAT_ALT:     return write_patterns(tk_write_u8(b, 2), t, p->as.alt.options, p->as.alt.n_options);
+        case TK_PAT_BIND:
+            b = write_path(tk_write_u8(b, 3), t, p->as.bind.type_name);
+            b = tk_write_u8(b, (tk_byte)(p->as.bind.has_binding ? 1 : 0));
+            b = tk_write_u32(b, tk_st_find(t, p->as.bind.binding));
+            b = tk_write_u8(b, (tk_byte)(p->as.bind.is_slice ? 1 : 0));
+            if (p->as.bind.slice_type != NULL) return write_typeexpr(tk_write_u8(b, 1), t, *p->as.bind.slice_type);
+            return tk_write_u8(b, 0);
+        case TK_PAT_FIELD:    return write_strs(write_path(tk_write_u8(b, 4), t, p->as.field.type_name), t, p->as.field.fields, p->as.field.n_fields);
+        case TK_PAT_WILDCARD: return tk_write_u8(b, 5);
+        case TK_PAT_NULL:     return tk_write_u8(b, 6);
+    }
+    return b;
+}
+static tk_bytes write_tarm(tk_bytes b, tk_strtable t, const tk_tarm *a) {
+    b = write_pattern(b, t, &a->pattern);
+    b = tk_write_u8(b, (tk_byte)(a->has_when ? 1 : 0));
+    if (a->has_when) b = tk_write_texpr(b, t, a->guard);
+    return write_tstatements(b, t, a->body, a->nbody);
+}
+static tk_bytes write_tarms(tk_bytes b, tk_strtable t, const tk_tarm *xs, size_t n) {
+    b = tk_write_u64(b, (uint64_t)n);
+    for (size_t i = 0; i < n; i += 1) b = write_tarm(b, t, &xs[i]);
     return b;
 }

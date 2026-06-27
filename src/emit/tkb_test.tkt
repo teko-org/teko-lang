@@ -245,6 +245,46 @@ fn tkb_roundtrip_program() {
 }
 
 #test
+fn tkb_roundtrip_matchexpr() {
+    // C7.16: `match x { 0 => return 1; Foo as y => return 2; _ => return 3 }` round-trips (match + 3 pattern kinds).
+    let voidx = checker::TExpr { kind = checker::TNullLit { }; type = checker::Void { }; line = 0; col = 0 }   // placeholder guard (has_when=false)
+    let subj = checker::TExpr { kind = checker::TVar { name = "x" }; type = i64ty(); line = 0; col = 0 }
+    let lit0 = parser::Expr { kind = parser::Number { is_float = false; value = 0; fval = 0.0 }; line = 0; col = 0 }
+    mut body0: []checker::TStatement = teko::list::push(teko::list::empty(), checker::TReturn { has_value = true; value = tnum(1) })
+    let arm0 = checker::TArm { pattern = parser::LiteralPattern { value = lit0 }; has_when = false; guard = voidx; body = body0 }
+    let foopath = parser::Path { segments = teko::list::push(teko::list::empty(), parser::Segment { name = "Foo" }) }
+    mut body1: []checker::TStatement = teko::list::push(teko::list::empty(), checker::TReturn { has_value = true; value = tnum(2) })
+    let arm1 = checker::TArm { pattern = parser::BindPattern { type_name = foopath; has_binding = true; binding = "y"; is_slice = false; slice_type = null }; has_when = false; guard = voidx; body = body1 }
+    mut body2: []checker::TStatement = teko::list::push(teko::list::empty(), checker::TReturn { has_value = true; value = tnum(3) })
+    let arm2 = checker::TArm { pattern = parser::WildcardPattern { }; has_when = false; guard = voidx; body = body2 }
+    mut arms: []checker::TArm = teko::list::empty()
+    arms = teko::list::push(arms, arm0)
+    arms = teko::list::push(arms, arm1)
+    arms = teko::list::push(arms, arm2)
+    let m = checker::TExpr { kind = checker::TMatchExpr { subject = subj; arms = arms }; type = i64ty(); line = 0; col = 0 }
+    match deserialize(serialize(m)) {
+        checker::TExpr as got => match got.kind {
+            checker::TMatchExpr as mm => {
+                teko::assert::is_true(mm.arms.len == 3)
+                match mm.subject.kind { checker::TVar as v => teko::assert::is_true(v.name == "x"); _ => teko::assert::is_true(false) }
+                match mm.arms[0].pattern { parser::LiteralPattern as l => match l.value.kind { parser::Number as n => teko::assert::is_true(n.value == 0); _ => teko::assert::is_true(false) }; _ => teko::assert::is_true(false) }
+                match mm.arms[1].pattern {
+                    parser::BindPattern as bp => {
+                        teko::assert::is_true(bp.has_binding)
+                        teko::assert::is_true(bp.binding == "y")
+                        teko::assert::is_true(bp.type_name.segments[0].name == "Foo")
+                    }
+                    _ => teko::assert::is_true(false)
+                }
+                match mm.arms[2].pattern { parser::WildcardPattern => teko::assert::is_true(true); _ => teko::assert::is_true(false) }
+            }
+            _ => teko::assert::is_true(false)
+        }
+        error => teko::assert::is_true(false)
+    }
+}
+
+#test
 fn tkb_tamper_caught() {
     // barrier (M.1): a corrupted body (last byte dropped) fails the FNV-1a hash check → error.
     let orig  = checker::TExpr { kind = checker::TCast { expr = tnum(7) }; type = u8ty(); line = 0; col = 0 }
