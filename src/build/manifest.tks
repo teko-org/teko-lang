@@ -146,6 +146,15 @@ fn mf_has_path(s: str) -> bool {
 //   path / *.a/.so/… → verbatim direct file
 //   `static:`/`shared:` prefix → stripped (the linkage MODE is deferred — the Linux increment)
 //   bare name        → `-l<name>` (a leading `lib` stripped)
+// (C7.1f) the OS named by a `[extern] target` triple (substring), else the host `teko::os()`.
+// Used to SELECT `[extern.libs.<os>]` sections. `[extern]` must precede the per-OS sections.
+fn mf_derive_os(target: str) -> str {
+    if teko::str::contains(target, "linux") { return "linux" }
+    if teko::str::contains(target, "darwin") || teko::str::contains(target, "macos") || teko::str::contains(target, "apple") { return "macos" }
+    if teko::str::contains(target, "windows") || teko::str::contains(target, "mingw") || teko::str::contains(target, "w64") { return "windows" }
+    teko::os()
+}
+
 fn mf_extern_flag(s: str) -> str {
     if s.len > 0 && s[0] == b'-' { return s }
     if mf_has_path(s) { return s }
@@ -174,6 +183,8 @@ fn parse_manifest(src: str) -> Manifest | error {
     mut target = ""
     mut sysroot = ""
     mut freestanding = false
+    mut cur_os = teko::os()                         // C7.1f: target OS for [extern.libs.<os>] selection (host, or `[extern] target`)
+    mut sec_os = ""                                 // the OS of the current `[extern.libs.<os>]` section
     mut have_name = false
     mut have_source = false
     mut sec = "root"
@@ -206,7 +217,8 @@ fn parse_manifest(src: str) -> Manifest | error {
             else if nm == "dependencies" { sec = "deps" }
             else if nm == "aliases"      { sec = "aliases" }
             else if nm == "coverage"     { sec = "coverage" }
-            else if nm == "extern.libs"  { sec = "extern.libs" }   // C7.1e: libraries to link
+            else if nm == "extern.libs"  { sec = "extern.libs" }   // C7.1e: libraries to link (all OSes)
+            else if mf_starts_with(nm, "extern.libs.") { sec = "extern.libs.os"; sec_os = teko::str::slice_from(nm, 12) }   // C7.1f: per-OS libs
             else if nm == "extern"       { sec = "extern" }        // C7.1f: cc/target/sysroot/freestanding scalars
             else                         { sec = "other" }         // [extern.search] / unknown — deferred
         } else {
@@ -245,14 +257,15 @@ fn parse_manifest(src: str) -> Manifest | error {
                 // [extern] scalars (C7.1f): cc/target/sysroot are quoted strings; freestanding is a bool.
                 if key == "cc" || key == "target" || key == "sysroot" {
                     let q = match mf_read_quoted(line, v) { MfQuoted as x => x; error as e => return e }
-                    if key == "cc" { cc = q.text } else if key == "target" { target = q.text } else { sysroot = q.text }
+                    if key == "cc" { cc = q.text } else if key == "target" { target = q.text; cur_os = mf_derive_os(q.text) } else { sysroot = q.text }
                 } else if key == "freestanding" {
                     freestanding = mf_at(line, v) == b't'   // `true` → true, anything else → false
                 }
                 // `prefer` and other [extern] keys are ignored for now (static/shared mode deferred).
-            } else if sec == "extern.libs" {
+            } else if sec == "extern.libs" || (sec == "extern.libs.os" && sec_os == cur_os) {
                 // `name = [ <spec…> ]` → resolved cc link flags. Empty `[]` → `-l<name>`; each element
                 // resolves via mf_extern_flag (bare → `-l`, path/`*.a` → file, `-flag` → verbatim).
+                // A `[extern.libs.<os>]` section contributes only when <os> matches the target OS (C7.1f).
                 let arr = match mf_read_array(line, v) { MfArray as a => a; error as e => return e }
                 if arr.items.len == 0 {
                     link_flags = teko::list::push(link_flags, mf_extern_flag(key))

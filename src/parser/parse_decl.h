@@ -12,7 +12,7 @@
 
 #include <stddef.h>
 
-tk_parsed_decl_result   tk_parse_function (const tk_token *t, size_t n, size_t pos, bool is_test);
+tk_parsed_decl_result   tk_parse_function (const tk_token *t, size_t n, size_t pos, bool is_test, tk_str os_guard);
 tk_parsed_decl_result   tk_parse_type_decl(const tk_token *t, size_t n, size_t pos);
 tk_parsed_module_result tk_parse_module   (const tk_token *t, size_t n, size_t pos);
 

@@ -196,6 +196,7 @@ typedef struct {                                                   // Function (
     bool         is_extern;                                        // an `extern` foreign-function declaration? (C7.1a — no body)
     tk_str       c_symbol;                                         // the C symbol it binds (valid iff is_extern)
     tk_str       from_lib;                                         // the providing library ("" = implicit libc; valid iff is_extern)
+    tk_str       os_guard;                                         // a `#os("…")` conditional-compile guard ("" = all OSes; C7.1f)
 } tk_function;
 
 typedef struct { tk_str name; tk_type_expr type_ann; } tk_field;

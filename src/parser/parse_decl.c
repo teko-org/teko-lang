@@ -43,7 +43,7 @@ static tk_parsed_params_result parse_params(const tk_token *t, size_t n, size_t 
     return (tk_parsed_params_result){ .ok = true, .as.value = { .params = params, .n_params = np, .next = p + 1 } };
 }
 
-tk_parsed_decl_result tk_parse_function(const tk_token *t, size_t n, size_t pos, bool is_test) {
+tk_parsed_decl_result tk_parse_function(const tk_token *t, size_t n, size_t pos, bool is_test, tk_str os_guard) {
     size_t p = pos;
     bool has_doc = false; tk_str doc = (tk_str){0};
     if (tk_is_kind_at(t, n, p, TK_TOKEN_DOC)) { has_doc = true; doc = t[p].text; p += 1; }
@@ -96,7 +96,7 @@ tk_parsed_decl_result tk_parse_function(const tk_token *t, size_t n, size_t pos,
             .has_return = has_return, .return_type = ret,
             .body = NULL, .nbody = 0,
             .vis = vis, .has_doc = has_doc, .doc = doc, .line = name_line, .col = name_col, .is_test = is_test,
-            .is_extern = true, .c_symbol = c_symbol, .from_lib = from_lib };
+            .is_extern = true, .c_symbol = c_symbol, .from_lib = from_lib, .os_guard = os_guard };
         tk_decl ed = { .tag = TK_DECL_FUNCTION, .as.function = ef };
         return (tk_parsed_decl_result){ .ok = true, .as.value = { .node = ed, .next = p } };
     }
@@ -109,7 +109,7 @@ tk_parsed_decl_result tk_parse_function(const tk_token *t, size_t n, size_t pos,
         .has_return = has_return, .return_type = ret,
         .body = blk.as.value.statements, .nbody = blk.as.value.n,
         .vis = vis, .has_doc = has_doc, .doc = doc, .line = name_line, .col = name_col, .is_test = is_test,
-        .is_extern = false, .c_symbol = (tk_str){0}, .from_lib = (tk_str){0} };
+        .is_extern = false, .c_symbol = (tk_str){0}, .from_lib = (tk_str){0}, .os_guard = os_guard };
     tk_decl d = { .tag = TK_DECL_FUNCTION, .as.function = f };
     return (tk_parsed_decl_result){ .ok = true, .as.value = { .node = d, .next = blk.as.value.next } };
 }
@@ -213,20 +213,35 @@ static tk_parsed_decl_result parse_decl(const tk_token *t, size_t n, size_t pos)
     // optional leading `#test` attribute (D2): `#` `test` then a function (only on functions).
     size_t start = pos;
     bool is_test = false;
-    if (tk_is_kind_at(t, n, start, TK_TOKEN_HASH)) {
-        if (!tk_is_kind_at(t, n, start + 1, TK_TOKEN_IDENT) || !text_is(t[start + 1].text, "test")) {
-            return (tk_parsed_decl_result){ .ok = false, .as.error = tk_err_at(t, n, start + 1, "unknown attribute (only `#test` is recognized)") };
+    tk_str os_guard = (tk_str){0};
+    // optional leading attributes: `#test` (D2) and `#os("…")` (C7.1f) — both function-only.
+    for (;;) {
+        if (!tk_is_kind_at(t, n, start, TK_TOKEN_HASH)) break;
+        if (!tk_is_kind_at(t, n, start + 1, TK_TOKEN_IDENT)) {
+            return (tk_parsed_decl_result){ .ok = false, .as.error = tk_err_at(t, n, start + 1, "expected an attribute name after `#`") };
         }
-        is_test = true; start = tk_skip_seps(t, n, start + 2);   // the attribute may sit on its own line, above the `fn`
+        if (text_is(t[start + 1].text, "test")) {
+            is_test = true; start = tk_skip_seps(t, n, start + 2);
+        } else if (text_is(t[start + 1].text, "os")) {
+            // `#os("linux")` — Hash Ident '(' Str ')'.
+            if (!tk_is_kind_at(t, n, start + 2, TK_TOKEN_LPAREN)) return (tk_parsed_decl_result){ .ok = false, .as.error = tk_err_at(t, n, start + 2, "expected '(' after `#os`") };
+            if (!tk_is_kind_at(t, n, start + 3, TK_TOKEN_STR))    return (tk_parsed_decl_result){ .ok = false, .as.error = tk_err_at(t, n, start + 3, "expected a quoted OS name in `#os(\"…\")`") };
+            os_guard = t[start + 3].text;
+            if (!tk_is_kind_at(t, n, start + 4, TK_TOKEN_RPAREN)) return (tk_parsed_decl_result){ .ok = false, .as.error = tk_err_at(t, n, start + 4, "expected ')' to close `#os(…)`") };
+            start = tk_skip_seps(t, n, start + 5);
+        } else {
+            return (tk_parsed_decl_result){ .ok = false, .as.error = tk_err_at(t, n, start + 1, "unknown attribute (only `#test` and `#os(\"…\")` are recognized)") };
+        }
     }
     size_t k = start;
     if (tk_is_kind_at(t, n, k, TK_TOKEN_DOC)) { k += 1; }
     if (tk_is_kind_at(t, n, k, TK_TOKEN_PUB) || tk_is_kind_at(t, n, k, TK_TOKEN_EXP)) { k += 1; }
     bool saw_extern = false;                                        // C7.1a: peek past `extern` to reach `fn`/`type`
     if (tk_is_kind_at(t, n, k, TK_TOKEN_EXTERN)) { saw_extern = true; k += 1; }
-    if (tk_is_kind_at(t, n, k, TK_TOKEN_FN))   { return tk_parse_function(t, n, start, is_test); }
+    if (tk_is_kind_at(t, n, k, TK_TOKEN_FN))   { return tk_parse_function(t, n, start, is_test, os_guard); }
     if (tk_is_kind_at(t, n, k, TK_TOKEN_TYPE)) {
         if (is_test) { return (tk_parsed_decl_result){ .ok = false, .as.error = tk_err_at(t, n, k, "`#test` may only precede a function") }; }
+        if (os_guard.len) { return (tk_parsed_decl_result){ .ok = false, .as.error = tk_err_at(t, n, k, "`#os(\"…\")` may only precede a function") }; }
         return tk_parse_type_decl(t, n, start);   // handles the optional `extern` (→ opaque handle)
     }
     if (saw_extern) {

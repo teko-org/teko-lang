@@ -98,6 +98,36 @@ fn project_frontend_sel(dir: str, include_tests: bool) -> Frontend | error {
     frontend_body(include_tests, false)
 }
 
+// (C7.1f) #os conditional compilation — the TARGET OS for guard selection: derived from the
+// `[extern] target` triple when set, else the host `teko::os()`.
+fn target_os(m: Manifest) -> str {
+    if m.target.len > 0 {
+        if teko::str::contains(m.target, "linux") { return "linux" }
+        if teko::str::contains(m.target, "darwin") || teko::str::contains(m.target, "macos") || teko::str::contains(m.target, "apple") { return "macos" }
+        if teko::str::contains(m.target, "windows") || teko::str::contains(m.target, "mingw") || teko::str::contains(m.target, "w64") { return "windows" }
+    }
+    teko::os()
+}
+
+// (C7.1f) drop every `#os("…")`-guarded function whose guard ≠ the target OS, so only the current
+// platform's variant compiles. Unguarded items (os_guard == "") always pass through.
+fn prune_os(program: parser::Program, tos: str) -> parser::Program {
+    mut kept: []parser::Item = teko::list::empty()
+    mut i = 0
+    loop {
+        if i >= program.items.len { break }
+        let it = program.items[i]
+        mut keep = true
+        match it.content {
+            parser::Function as f => { if f.os_guard != "" && f.os_guard != tos { keep = false } }
+            _ => {}
+        }
+        if keep { kept = teko::list::push(kept, it) }
+        i++
+    }
+    parser::Program { items = kept }
+}
+
 // frontend_body — the front-end AFTER the chdir (manifest → discover → assemble → check),
 // operating in the CURRENT directory. Split out so the D4 gate can retry it WITHOUT tests after a
 // test-assembly failure, on the SAME chdir (no second `teko::env::chdir`, which would fail for a
@@ -135,8 +165,11 @@ fn frontend_body(include_tests: bool, quiet: bool) -> Frontend | error {
     // assemble bakes file:line:col into the message, so report with an empty path (W-loc).
     let program = match assemble_sel(files, include_tests) { parser::Program as p => p; error as e => return e }
 
+    // --- C7.1f: keep only the target OS's `#os("…")` function variants (conditional compilation) ---
+    let selected = prune_os(program, target_os(m))
+
     // --- check the WHOLE merged program (M.1 — whole program checked together) ---
-    let checked = match checker::type_program(program) { checker::TProgram as c => c; error as e => return e }
+    let checked = match checker::type_program(selected) { checker::TProgram as c => c; error as e => return e }
 
     Frontend { prog = checked, manifest = m }
 }

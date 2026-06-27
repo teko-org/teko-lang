@@ -64,7 +64,7 @@ static bool key_is(tk_str k, const char *lit) {
 }
 
 // --- which table are we in? --------------------------------------------------
-typedef enum { SEC_ROOT, SEC_ARTIFACT, SEC_DEPS, SEC_ALIASES, SEC_COVERAGE, SEC_EXTERN, SEC_EXTERN_LIBS, SEC_OTHER } section;
+typedef enum { SEC_ROOT, SEC_ARTIFACT, SEC_DEPS, SEC_ALIASES, SEC_COVERAGE, SEC_EXTERN, SEC_EXTERN_LIBS, SEC_EXTERN_LIBS_OS, SEC_OTHER } section;
 
 static tk_manifest_result fail(const char *msg) {
     return (tk_manifest_result){ .ok = false, .as.error = tk_error_make(msg) };
@@ -108,6 +108,22 @@ static tk_str extern_flag(tk_str s) {
     return (tk_str){ buf, n + 2 };
 }
 
+// (C7.1f) per-OS [extern.libs.<os>] selection: the OS named by a target triple (substring) else host.
+tk_str tk_rt_os(void);   // teko_rt.c — host OS (tk_str is from text.h)
+static bool ct_has(tk_str s, const char *lit) {
+    size_t m = strlen(lit);
+    if (s.len < m) return false;
+    for (size_t i = 0; i + m <= s.len; i += 1) if (memcmp(s.ptr + i, lit, m) == 0) return true;
+    return false;
+}
+static tk_str derive_os(tk_str target) {
+    if (ct_has(target, "linux"))  return (tk_str){ (const tk_byte *)"linux", 5 };
+    if (ct_has(target, "darwin") || ct_has(target, "macos") || ct_has(target, "apple")) return (tk_str){ (const tk_byte *)"macos", 5 };
+    if (ct_has(target, "windows") || ct_has(target, "mingw") || ct_has(target, "w64")) return (tk_str){ (const tk_byte *)"windows", 7 };
+    return tk_rt_os();
+}
+static bool os_eq(tk_str a, tk_str b) { return a.len == b.len && (a.len == 0 || memcmp(a.ptr, b.ptr, a.len) == 0); }
+
 tk_manifest_result tk_parse_manifest(tk_str src) {
     tk_manifest m = {
         .name     = (tk_str){ NULL, 0 },
@@ -128,6 +144,8 @@ tk_manifest_result tk_parse_manifest(tk_str src) {
     };
     bool have_name = false, have_source = false;
     section sec = SEC_ROOT;
+    tk_str cur_os = tk_rt_os();        // C7.1f: target OS for [extern.libs.<os>] selection (host, or `[extern] target`)
+    tk_str sec_os = (tk_str){ NULL, 0 };   // the OS of the current `[extern.libs.<os>]` section
 
     size_t p = 0;
     while (p < src.len) {
@@ -152,7 +170,8 @@ tk_manifest_result tk_parse_manifest(tk_str src) {
             else if (key_is(name, "dependencies")) sec = SEC_DEPS;
             else if (key_is(name, "aliases"))      sec = SEC_ALIASES;
             else if (key_is(name, "coverage"))     sec = SEC_COVERAGE;
-            else if (key_is(name, "extern.libs"))  sec = SEC_EXTERN_LIBS;   // C7.1e: libraries to link
+            else if (key_is(name, "extern.libs"))  sec = SEC_EXTERN_LIBS;   // C7.1e: libraries to link (all OSes)
+            else if (name.len > 12 && memcmp(name.ptr, "extern.libs.", 12) == 0) { sec = SEC_EXTERN_LIBS_OS; sec_os = tk_str_slice(name, 12, name.len); }   // C7.1f: per-OS libs
             else if (key_is(name, "extern"))       sec = SEC_EXTERN;        // C7.1f: cc/target/sysroot/freestanding
             else                                   sec = SEC_OTHER;         // [extern.search] / unknown — deferred
             continue;
@@ -202,13 +221,16 @@ tk_manifest_result tk_parse_manifest(tk_str src) {
                 tk_str val; size_t ve;
                 if (!read_quoted(line, v, &val, &ve)) { tk_strs_free(m.deps); tk_strs_free(m.aliases); tk_strs_free(m.link_flags); return fail("expected a quoted string value"); }
                 if      (key_is(key, "cc"))     m.cc = val;
-                else if (key_is(key, "target")) m.target = val;
+                else if (key_is(key, "target")) { m.target = val; cur_os = derive_os(val); }
                 else                            m.sysroot = val;
             } else if (key_is(key, "freestanding")) {
                 m.freestanding = (at(line, v) == 't');   // `true` → true, else false
             }
             break;
         }
+        case SEC_EXTERN_LIBS_OS:
+            if (!os_eq(sec_os, cur_os)) break;   // C7.1f: a per-OS section contributes only on its OS
+            /* fallthrough — same resolution as the global [extern.libs] */
         case SEC_EXTERN_LIBS: {
             // `name = [ <spec…> ]` → resolved cc link flags. Empty `[]` → `-l<name>`; each element via
             // extern_flag (bare → `-l`, path/`*.a` → file, `-flag` → verbatim). Mirrors manifest.tks.

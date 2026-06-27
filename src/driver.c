@@ -326,6 +326,39 @@ static int find_manifest(char *out, size_t cap) {
 // test-assembly failure on the SAME chdir (a second chdir to a relative project dir would fail).
 // `quiet` suppresses the failure prints (the caller decides whether it's a hard error or a
 // degrade-to-warning). (Mirrors project.tks frontend_body.)
+// (C7.1f) #os conditional compilation — target-OS selection + the prune. Mirrors project.tks.
+tk_str tk_rt_os(void);   // teko_rt.c — host OS (tk_str is from text.h)
+static bool os_has_lit(tk_str s, const char *lit) {
+    size_t m = strlen(lit);
+    if (s.len < m) return false;
+    for (size_t i = 0; i + m <= s.len; i++) if (memcmp(s.ptr + i, lit, m) == 0) return true;
+    return false;
+}
+static tk_str target_os_of(tk_manifest m) {
+    if (m.target.len) {
+        if (os_has_lit(m.target, "linux")) return (tk_str){ (const tk_byte *)"linux", 5 };
+        if (os_has_lit(m.target, "darwin") || os_has_lit(m.target, "macos") || os_has_lit(m.target, "apple")) return (tk_str){ (const tk_byte *)"macos", 5 };
+        if (os_has_lit(m.target, "windows") || os_has_lit(m.target, "mingw") || os_has_lit(m.target, "w64")) return (tk_str){ (const tk_byte *)"windows", 7 };
+    }
+    return tk_rt_os();
+}
+static bool os_str_eq(tk_str a, tk_str b) { return a.len == b.len && (a.len == 0 || memcmp(a.ptr, b.ptr, a.len) == 0); }
+// drop every `#os("…")`-guarded function whose guard ≠ the target OS (in place; preserves order).
+static tk_program prune_os(tk_program program, tk_str tos) {
+    size_t w = 0;
+    for (size_t i = 0; i < program.len; i += 1) {
+        tk_item it = program.items[i];
+        bool keep = true;
+        if (it.tag == TK_ITEM_FUNCTION) {
+            tk_str g = it.as.function.os_guard;
+            if (g.len != 0 && !os_str_eq(g, tos)) keep = false;
+        }
+        if (keep) program.items[w++] = it;
+    }
+    program.len = w;
+    return program;
+}
+
 static int frontend_body(const char *dir, tk_tprogram *out, tk_manifest *manifest_out,
                          bool include_tests, bool quiet) {
     // --- find + read + parse the manifest (the single <name>.tkp at the root — A1) ---
@@ -368,6 +401,9 @@ static int frontend_body(const char *dir, tk_tprogram *out, tk_manifest *manifes
     tk_program_result asm_r = tk_assemble_sel(files, include_tests);
     if (!asm_r.ok) return quiet ? 1 : fail("", asm_r.as.error.message);   // assemble bakes file:line:col in
     tk_program program = asm_r.as.value;
+
+    // --- C7.1f: keep only the target OS's `#os("…")` function variants (conditional compilation) ---
+    program = prune_os(program, target_os_of(m));
 
     // --- check the WHOLE merged program (M.1 — whole program checked together) ---
     tk_tprogram_result checked = tk_type_program(program);
