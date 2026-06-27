@@ -238,6 +238,15 @@ tk_type_result tk_builtin_fn(tk_str name) {
         tk_type ft = { .tag = TK_TYPE_FUNC, .as.func = { .params = str2_t, .nparams = 2, .ret = &err_opt } };
         return (tk_type_result){ .ok = true, .as.value = ft };
     }
+    if (name_is(name, "write_file_bytes")) {                          // C7.12: teko::io::write_file_bytes(str, []byte) -> error?
+        static tk_type byte_el2  = { .tag = TK_TYPE_BYTE };
+        static tk_type byte_slice = { .tag = TK_TYPE_SLICE, .as.slice.element = &byte_el2 };
+        static tk_type str_bytes_p[2] = { { .tag = TK_TYPE_STR }, { .tag = TK_TYPE_SLICE } };
+        str_bytes_p[1].as.slice.element = &byte_el2;
+        tk_type ft = { .tag = TK_TYPE_FUNC, .as.func = { .params = str_bytes_p, .nparams = 2, .ret = &err_opt } };
+        (void)byte_slice;   // referenced via str_bytes_p
+        return (tk_type_result){ .ok = true, .as.value = ft };
+    }
     if (name_is(name, "run")) {                                       // teko::process::run([]str) -> i32 (cc spawn)
         tk_type ft = { .tag = TK_TYPE_FUNC, .as.func = { .params = &str_slice_t, .nparams = 1, .ret = &i32_t } };
         return (tk_type_result){ .ok = true, .as.value = ft };

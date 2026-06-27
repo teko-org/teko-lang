@@ -455,6 +455,29 @@ fn try_fs_builtin(callee: parser::Path, args: []checker::TExpr, env: Venv) -> Va
             }
         }
     }
+    // C7.12: write_file_bytes(path: str, data: []byte) -> error?
+    // The VM represents []byte as []Value (each element is a byte or int). Build a str from the
+    // byte values (same approach as str_of_bytes), then call the existing write_file runtime fn.
+    if last == "write_file_bytes" {
+        let path = as_str(eval_expr(args[0], env))
+        let data_val = eval_expr(args[1], env)
+        let xs = match data_val { []Value as b => b; _ => teko::list::empty() }
+        mut content = ""
+        mut i = 0
+        loop {
+            if i >= xs.len { break }
+            let elem = xs[i]
+            if val_is_byte(elem) || val_is_int(elem) {
+                content = teko::str_concat(content, teko::one_byte(as_int(elem) to byte))
+            }
+            i++
+        }
+        let base = StructVal { type_name = "error"; field_names = teko::list::empty(); field_vals = teko::list::empty() }
+        match teko::io::write_file(path, content) {
+            error as e => return err_set(base, "message", e.message)
+            null => return null
+        }
+    }
     null
 }
 

@@ -90,6 +90,8 @@ typedef struct { bool ok; tk_str err; } tk_ffi_ures;
 tk_ffi_slres tk_rt_list_dir(tk_str path);
 tk_ffi_sres  tk_rt_read_file(tk_str path);
 tk_ffi_ures  tk_rt_write_file(tk_str path, tk_str content);   // D3-branch — write the cobertura report
+// C7.12: write_file_bytes(path, ptr, len) — write a raw byte slice to a file ([]byte VM path).
+tk_ffi_ures  tk_rt_write_file_bytes(tk_str path, const uint8_t *ptr, uint64_t len);
 tk_ffi_ures  tk_rt_mkdir(tk_str path);
 
 // =========================================================================
@@ -734,6 +736,38 @@ static bool try_builtin_call(tk_path p, const tk_texpr *args, size_t nargs,
         for (uint64_t i = 0; i < res.len; i += 1)
             list = v_list_push(list.as.list, v_str(res.ptr[i]));
         *out = list;
+        return true;
+    }
+    // C7.12: write_file_bytes(path: str, data: []byte) -> error? — write raw bytes to a file.
+    // The VM represents []byte as a TK_VAL_LIST where each element is TK_VAL_INT (u8 bits).
+    // We build a contiguous byte buffer, call the runtime directly, and return null (= success)
+    // or an error struct. The error? result is TK_VAL_OPT: present=false (null) or present=true.
+    if (seg_is(last, "write_file_bytes")) {
+        if (nargs != 2) vm_unsupported("write_file_bytes expects exactly two arguments (str path, []byte data)");
+        tk_value path_val = tk_vm_eval_expr(&args[0], env);
+        tk_value data_val = tk_vm_eval_expr(&args[1], env);
+        if (path_val.tag != TK_VAL_STR) vm_unsupported("write_file_bytes: path is not a str (internal: checker should reject)");
+        // An empty []byte may arrive as an empty TK_VAL_LIST; normalise either case.
+        if (data_val.tag != TK_VAL_LIST) {
+            if (data_val.tag == TK_VAL_OPT && !data_val.as.opt.present) { data_val = v_list_empty(); }
+            else vm_unsupported("write_file_bytes: data is not a []byte list (internal: checker should reject)");
+        }
+        // Build a heap buffer from the VM's integer-element byte list.
+        tk_value_list lst = data_val.as.list;
+        uint8_t *buf = lst.len ? (uint8_t *)tk_alloc(lst.len) : NULL;
+        for (uint64_t i = 0; i < lst.len; i += 1) {
+            tk_value elem = lst.ptr[i];
+            if (elem.tag != TK_VAL_INT) vm_unsupported("write_file_bytes: []byte element is not an integer (internal: checker should reject)");
+            buf[i] = (uint8_t)(elem.as.i.bits & 0xFF);
+        }
+        tk_ffi_ures res = tk_rt_write_file_bytes(path_val.as.s, buf, (uint64_t)lst.len);
+        if (buf) tk_free0(buf);
+        if (!res.ok) {
+            tk_value base = v_struct(ERR_LIT("error"), (tk_value_fields){ NULL, NULL, 0 });
+            *out = v_error_set(base, ERR_LIT("message"), v_str(res.err));
+            return true;
+        }
+        *out = v_none();   // error? success = null (TK_VAL_OPT present=false)
         return true;
     }
     return false;

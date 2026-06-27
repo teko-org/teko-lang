@@ -1,5 +1,6 @@
 // src/checker/collect.c
 #include "collect.h"
+#include "tast.h"   // tk_tprogram, tk_titem, TK_TITEM_TYPE_DECL (C7.12)
 
 static tk_type_table collect_types(tk_item *items, size_t n) {
     tk_type_table table = tk_type_table_empty();
@@ -34,6 +35,22 @@ static tk_type_result func_type(tk_function f, tk_type_table table) {
     tk_type *rp = tk_alloc(sizeof *rp); if (!rp) abort(); *rp = ret.as.value;
     tk_type t = { .tag = TK_TYPE_FUNC, .as.func = { params, n, rp } };
     return (tk_type_result){ .ok = true, .as.value = t };
+}
+
+// C7.12 — reconstruct a TypeTable from a typed program's pass-through TypeDecl items.
+// Used by the package backend in driver.c. The namespace is set to "" — sufficient for
+// resolve_type; W-vis-enforce is not invoked by the header emitter.
+tk_type_table tk_type_table_of(tk_tprogram prog) {
+    tk_type_table table = tk_type_table_empty();
+    for (size_t i = 0; i < prog.nitems; i += 1) {
+        if (prog.items[i].tag == TK_TITEM_TYPE_DECL) {
+            tk_type_decl td = prog.items[i].as.type_decl;
+            tk_str empty = { .ptr = (const unsigned char *)"", .len = 0 };
+            table = tk_type_table_push(table, (tk_type_reg){
+                .name = td.name, .namespace = empty, .vis = td.vis, .decl = td });
+        }
+    }
+    return table;
 }
 
 tk_collected_result tk_collect(tk_program program) {

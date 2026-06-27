@@ -1193,7 +1193,8 @@ fn emit_call(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, e: c
         if addr2 {
             if l == "read_file"     { return emit_host_ffi(buf, prog, e, c, "sres",   "tk_rt_read_file") }
             if l == "var"           { return emit_host_ffi(buf, prog, e, c, "sres",   "tk_rt_getenv") }
-            if l == "write_file"    { return emit_host_ffi(buf, prog, e, c, "ures",   "tk_rt_write_file") }
+            if l == "write_file"       { return emit_host_ffi(buf, prog, e, c, "ures",           "tk_rt_write_file") }
+            if l == "write_file_bytes" { return emit_host_ffi(buf, prog, e, c, "ures_byteslice", "tk_rt_write_file_bytes") }   // C7.12: []byte → file
             if l == "chdir"         { return emit_host_ffi(buf, prog, e, c, "ures",   "tk_rt_chdir") }
             if l == "mkdir"         { return emit_host_ffi(buf, prog, e, c, "ures",   "tk_rt_mkdir") }
             if l == "cwd"           { return emit_host_ffi(buf, prog, e, c, "sres",   "tk_rt_getcwd") }
@@ -2255,6 +2256,38 @@ fn emit_host_ffi(buf: []byte, prog: checker::TProgram, e: checker::TExpr, c: che
         o = cb(o, ".ptr, ")
         o = cb(o, t)
         return cb(o, ".len); })")
+    }
+
+    // C7.12 — ures_byteslice: write_file_bytes(path: str, data: []byte) -> error?.
+    // The C function takes (path, ptr, len); the Teko []byte slice carries both in a struct,
+    // so we bind the slice to a temp and pass .ptr + .len separately.
+    if kind == "ures_byteslice" {
+        let byte_t = checker::Byte { }
+        mut o = cb(buf, "({ ")
+        o = match cg_slice_typename(o, byte_t) { []byte as r => r; error as err => return err }
+        o = cb(o, " ")
+        o = cb(o, t)
+        o = cb(o, "s = ")
+        o = match emit_expr(o, prog, c.args[1]) { []byte as r => r; error as err => return err }
+        o = cb(o, "; tk_ffi_ures ")
+        o = cb(o, t)
+        o = cb(o, "r = ")
+        o = cb(o, rtfn)
+        o = cb(o, "(")
+        o = match emit_expr(o, prog, c.args[0]) { []byte as r => r; error as err => return err }
+        o = cb(o, ", ")
+        o = cb(o, t)
+        o = cb(o, "s.ptr, (uint64_t)")
+        o = cb(o, t)
+        o = cb(o, "s.len); ")
+        o = cb(o, t)
+        o = cb(o, "r.ok ? (")
+        o = match emit_type(o, e.type) { []byte as r => r; error as err => return err }
+        o = cb(o, "){ .present = false } : (")
+        o = match emit_type(o, e.type) { []byte as r => r; error as err => return err }
+        o = cb(o, "){ .present = true, .value = ")
+        o = cb(o, t)
+        return cb(o, "r.err }; })")
     }
 
     // The struct-returning host FFI: bind the fixed-ABI result, then lift per result shape.

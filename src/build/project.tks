@@ -16,6 +16,8 @@
 use teko::parser
 use teko::checker
 use teko::codegen
+use teko::emit
+use teko::compress
 use teko::vm
 
 // =========================================================================
@@ -304,7 +306,43 @@ fn backend(dir: str, stem: str, out_dir: str, prog: checker::TProgram, m: Manife
         return fail(dir, "shared library output (.dylib/.so/.dll) is not yet implemented — planned (C7.1m)")
     }
     if m.artifact == Artifact::Package {
-        return fail(dir, "package output (.tkl) needs the program-level .tkb typed-tree codec (C7.16; the .tkb is currently expression-only) — not yet implemented")
+        // C7.12: emit .tkh + .tkb (+ best-effort .tsym) → ZIP-STORE → <out_dir>/<name>-<version>.tkl
+        // trim a trailing `/` from the output dir (mirrors the Binary path below).
+        let od = if out_dir.len > 0 && out_dir[out_dir.len - 1] == b'/' { teko::str::slice_to(out_dir, out_dir.len - 1) } else { out_dir }
+        match teko::fs::mkdir(od) { error => return fail(dir, "cannot create the output directory"); null => {} }
+        // .tkh — exported interface (type signatures + docs for `exp` items)
+        let table = checker::type_table_of(prog)
+        let tkh_bytes = match emit::emit_program(prog, table) {
+            []byte as b => b
+            error as e  => return fail(dir, e.message)
+        }
+        // .tkb — whole-program typed tree (C7.16 codec)
+        let tkb_bytes = emit::serialize_program(prog)
+        // .tsym — symbol map (best-effort; always added when available)
+        let tsym_str = codegen::tk_emit_tsym(prog)
+        mut tsym_bytes: []byte = teko::list::empty()
+        mut k = 0
+        loop {
+            if k >= tsym_str.len { break }
+            tsym_bytes = teko::list::push(tsym_bytes, tsym_str[k])
+            k++
+        }
+        // assemble the archive entries: <name>.tkh, <name>.tkb, <name>.tsym
+        mut entries: []compress::ZipEntry = teko::list::empty()
+        entries = teko::list::push(entries, compress::ZipEntry { name = teko::str::concat(m.name, ".tkh"); data = tkh_bytes })
+        entries = teko::list::push(entries, compress::ZipEntry { name = teko::str::concat(m.name, ".tkb"); data = tkb_bytes })
+        entries = teko::list::push(entries, compress::ZipEntry { name = teko::str::concat(m.name, ".tsym"); data = tsym_bytes })
+        let zip_bytes = compress::write_zip(entries)
+        // <out_dir>/<name>-<version>.tkl
+        let ver = if m.version == "" { "0.0.0" } else { m.version }
+        let tkl_name = teko::str::concat3(m.name, "-", teko::str::concat(ver, ".tkl"))
+        let tkl_path = teko::str::concat3(od, "/", tkl_name)
+        match teko::io::write_file_bytes(tkl_path, zip_bytes) {
+            error as e => return fail(dir, e.message)
+            null       => {}
+        }
+        teko::io::println(teko::str::concat3("teko: ", dir, teko::str::concat3(": packaged ", tkl_path, "")))
+        return 0
     }
     let emitted = match codegen::tk_emit_c(prog) { str as s => s; error as e => return fail(dir, e.message) }
     // C7.1k — append the build-metadata C so every binary carries its identity (what(1)/strings).

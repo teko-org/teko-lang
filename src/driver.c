@@ -16,6 +16,16 @@
 #include "build/assemble.h"  // tk_assemble, tk_program_result (A3)
 #include "vm/vm.h"           // tk_vm_run (Eixo D — the debug/test VM)
 #include "text/text.h"       // tk_str_from_utf8 (manifest source view)
+// C7.12 package backend: tkb_frame.h, zip.h, and collect.h are compatible with the
+// includes above. emit/header.h conflicts via tkb_read.h (tk_strs typedef clash with
+// manifest.h) — forward-declare tk_emit_program and tk_bytes_result directly instead.
+#include "emit/tkb_buf.h"    // tk_bytes — needed by zip.h and the package emitters
+#include "emit/tkb_frame.h"  // tk_serialize_program — .tkb whole-program codec (C7.12/C7.16)
+#include "compress/compress.h"   // tk_write_zip — ZIP-STORE .tkl writer (C7.12, teko::compress)
+#include "checker/collect.h" // tk_type_table_of — rebuild TypeTable from TProgram (C7.12)
+// Forward-declare tk_emit_program to avoid pulling in header.h → tkb_read.h → tk_strs clash.
+TK_RESULT(tk_bytes, tk_bytes_result);   // []byte | error — tk_emit_program's result type
+tk_bytes_result tk_emit_program(tk_tprogram prog, tk_type_table table);
 
 #include <stdio.h>           // fopen/fread/fclose, fprintf, printf
 #include <stdlib.h>          // malloc, realloc, free
@@ -301,8 +311,76 @@ static int tk_backend(const char *label, const char *stem, tk_tprogram prog, con
         return fail(label, "static library output (.a) is not yet implemented — planned (C7.1m)");
     if (m.artifact == TK_ARTIFACT_SHARED)
         return fail(label, "shared library output (.dylib/.so/.dll) is not yet implemented — planned (C7.1m)");
-    if (m.artifact == TK_ARTIFACT_PACKAGE)
-        return fail(label, "package output (.tkl) needs the program-level .tkb typed-tree codec (C7.16; the .tkb is currently expression-only) — not yet implemented");
+    if (m.artifact == TK_ARTIFACT_PACKAGE) {
+        // C7.12: emit .tkh + .tkb (+ best-effort .tsym) → ZIP-STORE → <out_dir>/<name>-<version>.tkl
+        // trim a trailing `/` from the output dir (mirrors the Binary path below).
+        size_t odlen = strlen(out_dir);
+        char od[4096];
+        if (odlen > 0 && odlen < sizeof od) {
+            memcpy(od, out_dir, odlen);
+            if (od[odlen - 1] == '/') odlen -= 1;
+            od[odlen] = '\0';
+        } else {
+            snprintf(od, sizeof od, "%s", out_dir);
+        }
+        mkdir(od, 0755);   // idempotent
+
+        // .tkh — exported interface (type signatures + docs for `exp` items)
+        tk_type_table table = tk_type_table_of(prog);
+        tk_bytes_result tkh_r = tk_emit_program(prog, table);
+        if (!tkh_r.ok) return fail(label, tkh_r.as.error.message);
+        tk_bytes tkh_bytes = tkh_r.as.value;
+
+        // .tkb — whole-program typed tree (C7.16 codec)
+        tk_bytes tkb_bytes = tk_serialize_program(&prog);
+
+        // .tsym — symbol map (best-effort; always included)
+        tk_cstr_result tsym_r = tk_emit_tsym(prog);
+        tk_bytes tsym_bytes = tk_bytes_empty();
+        if (tsym_r.ok && tsym_r.as.value) {
+            size_t tsym_len = strlen(tsym_r.as.value);
+            for (size_t i = 0; i < tsym_len; i += 1)
+                tsym_bytes = tk_bytes_push(tsym_bytes, (tk_byte)tsym_r.as.value[i]);
+            tk_free0(tsym_r.as.value);
+        }
+
+        // Assemble the ZIP entries: <name>.tkh, <name>.tkb, <name>.tsym
+        char tkh_name[256], tkb_name[256], tsym_name[256];
+        snprintf(tkh_name,  sizeof tkh_name,  "%.*s.tkh",  (int)m.name.len, (const char *)m.name.ptr);
+        snprintf(tkb_name,  sizeof tkb_name,  "%.*s.tkb",  (int)m.name.len, (const char *)m.name.ptr);
+        snprintf(tsym_name, sizeof tsym_name, "%.*s.tsym", (int)m.name.len, (const char *)m.name.ptr);
+#define CSTR(s) ((tk_str){ .ptr = (const unsigned char *)(s), .len = strlen(s) })
+        tk_zip_entry entries[3] = {
+            { .name = CSTR(tkh_name),  .data = tkh_bytes  },
+            { .name = CSTR(tkb_name),  .data = tkb_bytes  },
+            { .name = CSTR(tsym_name), .data = tsym_bytes },
+        };
+#undef CSTR
+        tk_bytes zip_bytes = tk_write_zip(entries, 3);
+
+        // <out_dir>/<name>-<version>.tkl
+        const char *ver = (m.version.len > 0) ? NULL : "0.0.0";   // sentinel; real below
+        char ver_buf[256];
+        if (m.version.len > 0)
+            snprintf(ver_buf, sizeof ver_buf, "%.*s", (int)m.version.len, (const char *)m.version.ptr);
+        else
+            snprintf(ver_buf, sizeof ver_buf, "0.0.0");
+        (void)ver;
+        char tkl_name[512];
+        snprintf(tkl_name, sizeof tkl_name, "%.*s-%s.tkl",
+                 (int)m.name.len, (const char *)m.name.ptr, ver_buf);
+        char tkl_path[4096];
+        snprintf(tkl_path, sizeof tkl_path, "%s/%s", od, tkl_name);
+
+        FILE *fp = fopen(tkl_path, "wb");
+        if (fp == NULL) { tk_free0(zip_bytes.ptr); return fail(label, "cannot write .tkl to the output directory"); }
+        fwrite(zip_bytes.ptr, 1, zip_bytes.len, fp);
+        fclose(fp);
+        tk_free0(zip_bytes.ptr);
+
+        printf("teko: %s: packaged %s\n", label, tkl_path);
+        return 0;
+    }
     tk_cstr_result emitted = tk_emit_c(prog);
     if (!emitted.ok) return fail(label, emitted.as.error.message);
 

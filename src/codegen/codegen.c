@@ -831,7 +831,7 @@ static bool emit_as(cbuf *b, tk_type expected, const tk_texpr *value, const char
 // is emitted as a statement-expression that calls a fixed-ABI runtime primitive (teko_rt.h)
 // and lifts the result into the program's generated result type (e->type). Defined after the
 // variant-wrap helpers it leans on; the CALL case dispatches to it by builtin name.
-enum cg_ffi_kind { CG_FFI_SRES, CG_FFI_URES, CG_FFI_SLRES, CG_FFI_U64RES, CG_FFI_ARGS, CG_FFI_RUN, CG_FFI_BYTES };
+enum cg_ffi_kind { CG_FFI_SRES, CG_FFI_URES, CG_FFI_SLRES, CG_FFI_U64RES, CG_FFI_ARGS, CG_FFI_RUN, CG_FFI_BYTES, CG_FFI_URES_BYTESLICE };   // C7.12: URES_BYTESLICE = write_file_bytes(str, []byte)
 static bool emit_host_ffi(cbuf *b, int kind, const char *rtfn, const tk_texpr *e, const char **err);
 // W5b — a `match` lowered to a GNU statement-expression (the VALUE form).
 static bool emit_match_value(cbuf *b, const tk_texpr *e, const char **err);
@@ -1218,7 +1218,8 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
                     if (seg_is(l, "last_index_of")) return emit_host_ffi(b, CG_FFI_U64RES, "tk_rt_last_index_of", e, err);
                     if (seg_is(l, "args"))          return emit_host_ffi(b, CG_FFI_ARGS,   "tk_rt_args",          e, err);
                     if (seg_is(l, "run"))           return emit_host_ffi(b, CG_FFI_RUN,    "tk_rt_run",           e, err);
-                    if (seg_is(l, "bytes_from_ptr")) return emit_host_ffi(b, CG_FFI_BYTES, "tk_bytes_from_ptr",   e, err);   // (C7.1a) ptr+len -> []byte (slice-lift)
+                    if (seg_is(l, "bytes_from_ptr"))   return emit_host_ffi(b, CG_FFI_BYTES,            "tk_bytes_from_ptr",       e, err);   // (C7.1a) ptr+len -> []byte (slice-lift)
+                    if (seg_is(l, "write_file_bytes")) return emit_host_ffi(b, CG_FFI_URES_BYTESLICE, "tk_rt_write_file_bytes",  e, err);   // C7.12: (str, []byte) -> error?
                 }
             }
             // Non-shadowable built-ins: `print`/`println`, either bare or under `teko`.
@@ -1974,6 +1975,25 @@ static bool emit_host_ffi(cbuf *b, int kind, const char *rtfn, const tk_texpr *e
         cb(b, "); (");
         if (!cg_slice_typename(b, byte_t, err)) return false;   // tk_slice_byte
         cb(b, "){ .ptr = "); cb(b, t); cb(b, ".ptr, .len = "); cb(b, t); cb(b, ".len }; })");
+        return true;
+    }
+
+    // C7.12 — ures_byteslice: write_file_bytes(path: str, data: []byte) -> error?.
+    // The C function takes (path, ptr, len); the Teko []byte slice carries both in a struct.
+    if (kind == CG_FFI_URES_BYTESLICE) {
+        tk_type byte_t = { .tag = TK_TYPE_BYTE };
+        char ts[44]; snprintf(ts, sizeof ts, "%ss", t);   // <t>s = the slice temp
+        char tr[44]; snprintf(tr, sizeof tr, "%sr", t);   // <t>r = the result temp
+        cb(b, "({ ");
+        if (!cg_slice_typename(b, byte_t, err)) return false;   // tk_slice_byte
+        cb(b, " "); cb(b, ts); cb(b, " = ");
+        if (!emit_expr(b, &e->as.call.args[1], err)) return false;   // the []byte arg
+        cb(b, "; tk_ffi_ures "); cb(b, tr); cb(b, " = "); cb(b, rtfn); cb(b, "(");
+        if (!emit_expr(b, &e->as.call.args[0], err)) return false;   // the str path arg
+        cb(b, ", "); cb(b, ts); cb(b, ".ptr, (uint64_t)"); cb(b, ts); cb(b, ".len); ");
+        cb(b, tr); cb(b, ".ok ? ("); if (!emit_type(b, e->type, err)) return false;
+        cb(b, "){ .present = false } : ("); if (!emit_type(b, e->type, err)) return false;
+        cb(b, "){ .present = true, .value = "); cb(b, tr); cb(b, ".err }; })");
         return true;
     }
 

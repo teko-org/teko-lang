@@ -82,7 +82,8 @@ set(TEKO_EMIT_SOURCES
     src/emit/tkb_write.c
     src/emit/tkb_read.c
     src/emit/tkh.c
-    src/emit/header.c)
+    src/emit/header.c
+    src/compress/compress.c)   # C7.12: ZIP-STORE .tkl writer (teko::compress)
 
 # --- F2: the C backend (codegen) — lowers the checked typed tree to C source ---
 set(TEKO_CODEGEN_SOURCES

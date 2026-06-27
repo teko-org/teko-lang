@@ -166,6 +166,10 @@ tk_ffi_sres tk_rt_read_file(tk_str path);
 tk_ffi_sres tk_rt_getenv(tk_str name);
 // teko::io::write_file(path, content) — (over)write the file; error on failure.
 tk_ffi_ures tk_rt_write_file(tk_str path, tk_str content);
+// teko::io::write_file_bytes(path, data) — write a raw []byte slice to the file; error on failure.
+// Takes the byte list as a ptr+len pair (the C7.14 tk_byte_list ABI). Shares the same
+// write-path as tk_rt_write_file; accepts binary data (not UTF-8-restricted).
+tk_ffi_ures tk_rt_write_file_bytes(tk_str path, const tk_byte *ptr, uint64_t len);
 // teko::env::chdir(path) — change the process working directory; error on failure.
 tk_ffi_ures tk_rt_chdir(tk_str path);
 // teko::fs::mkdir(path) — create a directory (mode 0755); SUCCESS if it already exists.

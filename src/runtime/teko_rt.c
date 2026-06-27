@@ -419,6 +419,18 @@ tk_ffi_ures tk_rt_write_file(tk_str path, tk_str content) {
     return (tk_ffi_ures){ .ok = true };
 }
 
+// C7.12 — write raw bytes to a file (the .tkl package output path; binary, not UTF-8).
+// Mirrors tk_rt_write_file but accepts a []byte ptr+len pair instead of a tk_str.
+tk_ffi_ures tk_rt_write_file_bytes(tk_str path, const tk_byte *ptr, uint64_t len) {
+    char *p = tk_cstr(path);
+    FILE *f = fopen(p, "wb");
+    if (f == NULL) return (tk_ffi_ures){ .ok = false, .err = tk_str_of_cstr("cannot open file for writing") };
+    size_t put = len ? fwrite(ptr, 1, (size_t)len, f) : 0;
+    int rc = fclose(f);
+    if (put != (size_t)len || rc != 0) return (tk_ffi_ures){ .ok = false, .err = tk_str_of_cstr("short write on file") };
+    return (tk_ffi_ures){ .ok = true };
+}
+
 tk_ffi_ures tk_rt_chdir(tk_str path) {
     char *p = tk_cstr(path);
     if (chdir(p) != 0) return (tk_ffi_ures){ .ok = false, .err = tk_str_of_cstr("cannot change directory") };
