@@ -313,9 +313,17 @@ static const char *check_labels(const tk_tstatement *stmts, size_t n, const lbl_
 // C7.1a: an `extern` param/return type must be a primitive (int/float/bool) or `byte` — the
 // only shapes that marshal 1:1 across the C ABI. `ptr`/`uptr` join next; `void` is allowed for
 // the RETURN only (handled by the caller). Mirrors typer.tks extern_type_ok.
-static bool extern_type_ok(tk_type t) {
-    return t.tag == TK_TYPE_PRIM || t.tag == TK_TYPE_BYTE
-        || t.tag == TK_TYPE_PTR  || t.tag == TK_TYPE_UPTR;   // C7.1a: prims+byte+ptr/uptr
+// C7.1a: is `t` legal across the extern boundary? prims/byte/ptr/uptr, OR an `extern type`
+// opaque handle (a Named whose decl is an ExternBody) — but NOT an ordinary Teko struct/enum/
+// variant (those would be unsupported by-value aggregate FFI). `void` handled by the caller.
+static bool extern_type_ok(tk_type t, tk_type_table table) {
+    if (t.tag == TK_TYPE_PRIM || t.tag == TK_TYPE_BYTE
+        || t.tag == TK_TYPE_PTR  || t.tag == TK_TYPE_UPTR) return true;
+    if (t.tag == TK_TYPE_NAMED) {
+        tk_decl_result d = tk_type_table_find(table, t.as.named.name);
+        return d.ok && d.as.value.body.tag == TK_BODY_EXTERN;
+    }
+    return false;
 }
 
 tk_tfunction_result tk_type_function(tk_function f, tk_env env, tk_type_table table) {
@@ -323,8 +331,8 @@ tk_tfunction_result tk_type_function(tk_function f, tk_env env, tk_type_table ta
     for (size_t i = 0; i < f.nparams; i += 1) {           // params immutable (B.21)
         tk_type_result pt = tk_resolve_type(f.params[i].type_ann, table);
         if (!pt.ok) return (tk_tfunction_result){ .ok = false, .as.error = pt.as.error };
-        if (f.is_extern && !extern_type_ok(pt.as.value)) {
-            return (tk_tfunction_result){ .ok = false, .as.error = tk_error_make("an `extern` function parameter must be a primitive (int/float/bool), `byte`, `ptr`, or `uptr` (C7.1a)") };
+        if (f.is_extern && !extern_type_ok(pt.as.value, table)) {
+            return (tk_tfunction_result){ .ok = false, .as.error = tk_error_make("an `extern` function parameter must be a primitive (int/float/bool), `byte`, `ptr`, `uptr`, or an `extern type` handle (C7.1a)") };
         }
         local = tk_env_define(local, f.params[i].name, pt.as.value, false);
     }
@@ -332,9 +340,9 @@ tk_tfunction_result tk_type_function(tk_function f, tk_env env, tk_type_table ta
     if (f.is_extern) {
         // a bodyless foreign declaration: no body to check / return-analyze. Validate the
         // return marshals (void = no value is fine; else prim/byte only for now).
-        bool ret_ok = (ret.tag == TK_TYPE_VOID) || extern_type_ok(ret);
+        bool ret_ok = (ret.tag == TK_TYPE_VOID) || extern_type_ok(ret, table);
         if (!ret_ok) {
-            return (tk_tfunction_result){ .ok = false, .as.error = tk_error_make("an `extern` function return must be a primitive (int/float/bool), `byte`, `ptr`, `uptr`, or absent (C7.1a)") };
+            return (tk_tfunction_result){ .ok = false, .as.error = tk_error_make("an `extern` function return must be a primitive (int/float/bool), `byte`, `ptr`, `uptr`, an `extern type` handle, or absent (C7.1a)") };
         }
         tk_tfunction ef = { .name = f.name, .params = f.params, .nparams = f.nparams,
                             .return_type = ret, .body = NULL, .nbody = 0,

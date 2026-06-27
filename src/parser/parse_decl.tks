@@ -186,6 +186,11 @@ fn parse_type_decl(tokens: []lexer::Token, pos: u64) -> ParsedDecl | error {
         vis = Visibility::Exp
         p = p + 1
     }
+    mut is_extern = false                                // C7.1a: `extern type Name` (opaque foreign handle)
+    if is_kind_at(tokens, p, lexer::TokenKind::Extern) {
+        is_extern = true
+        p = p + 1
+    }
     if !is_kind_at(tokens, p, lexer::TokenKind::Type) {
         return err_at(tokens, p, "expected `type`")
     }
@@ -197,6 +202,10 @@ fn parse_type_decl(tokens: []lexer::Token, pos: u64) -> ParsedDecl | error {
     let name_line: u32 = tokens[p].line
     let name_col: u32 = tokens[p].col   // W-loc-2: the type's source position
     p = p + 1
+    if is_extern {
+        // `extern type Name` — an OPAQUE foreign handle: no `= <body>`, lowers to `void *`.
+        return ParsedDecl { node = TypeDecl { name = name, body = ExternBody { }, vis = vis, has_doc = has_doc, doc = doc, line = name_line, col = name_col }, next = p }
+    }
     if !is_kind_at(tokens, p, lexer::TokenKind::Assign) {
         return err_at(tokens, p, "expected '=' in a type declaration")
     }
@@ -229,7 +238,7 @@ fn parse_decl(tokens: []lexer::Token, pos: u64) -> ParsedDecl | error {
     } else if is_kind_at(tokens, k, lexer::TokenKind::Exp) {
         k = k + 1
     }
-    mut saw_extern = false                              // C7.1a: peek past `extern` to reach `fn`
+    mut saw_extern = false                              // C7.1a: peek past `extern` to reach `fn`/`type`
     if is_kind_at(tokens, k, lexer::TokenKind::Extern) {
         saw_extern = true
         k = k + 1
@@ -237,12 +246,12 @@ fn parse_decl(tokens: []lexer::Token, pos: u64) -> ParsedDecl | error {
     if is_kind_at(tokens, k, lexer::TokenKind::Fn) {
         return parse_function(tokens, start, is_test)
     }
-    if saw_extern {
-        return err_at(tokens, k, "expected `fn` after `extern` (only functions may be `extern`)")
-    }
     if is_kind_at(tokens, k, lexer::TokenKind::Type) {
         if is_test { return err_at(tokens, k, "`#test` may only precede a function") }
-        return parse_type_decl(tokens, start)
+        return parse_type_decl(tokens, start)   // handles the optional `extern` (→ opaque handle)
+    }
+    if saw_extern {
+        return err_at(tokens, k, "expected `fn` or `type` after `extern`")
     }
     err_at(tokens, k, "expected a declaration (`fn`/`type`, optionally `pub`/`exp`/doc); loose statements belong in main.tks")
 }

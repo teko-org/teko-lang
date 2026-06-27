@@ -371,6 +371,8 @@ into **rounds** (parallel waves). The goal is **maximum agent concurrency** with
 | **C7.1d** `extern` VM handling (defer/stub like the other host bottoms) | `vm` | C7.1a |
 | **C7.1e** `.tkp` parser: array values + nested sub-tables + `[extern]`/`[extern.libs]`/`search`/`prefer` | `build`(manifest) | C7.0 |
 | **C7.1f** per-OS symbol/lib resolution + `#os(...)` conditional-compile guard *(Linux/Windows)* | `build`, `L`, `P`, `chk`, `cg` | C7.1a–e · **follow-on** |
+| **C7.1g** `ptr`/`uptr` opaque transport types (✅) + `extern type` opaque handle (→ `void*`) | `chk`, `cg`, `ast`, `P` | C7.1a–c |
+| **C7.1h** pointer-family future: `ptr<T>` (deref behind `#repr(C)`) + `ptr ≡ ptr<void>` | — | **S4 generics** |
 | **C7.2** `teko::env::args` + `teko::exit` | *(new ns files)* | C7.1b–d |
 | **C7.3** `teko::io` slurp (read/write/write_err) | *(new ns files)* | C7.1b–d |
 | **C7.4** `teko::fs` `list_dir` | *(new ns files)* | C7.1b–d |

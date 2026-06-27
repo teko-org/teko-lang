@@ -73,6 +73,9 @@ static tyexport_result build_tyexport(tk_type_decl d, tk_type_table table) {
             // Exporting a TRANSPARENT alias in the `.tkh` is a LATER gap (the header has no
             // alias shape yet). An honest stop — never reached by the pub-only validation path.
             return (tyexport_result){ .ok = false, .as.error = tk_error_make("exporting a type alias in the header is not yet supported") };
+        case TK_BODY_EXTERN:
+            // (C7.1a) exporting an `extern type` opaque handle in the `.tkh` is a LATER gap. Honest stop.
+            return (tyexport_result){ .ok = false, .as.error = tk_error_make("exporting an extern type in the header is not yet supported") };
     }
     return (tyexport_result){ .ok = false, .as.error = tk_error_make("unknown type body shape") };
 }

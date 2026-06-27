@@ -159,7 +159,7 @@ const char *tk_check_modules(tk_program prog, tk_type_table table) {
             } else if (d.body.tag == TK_BODY_ALIAS) {
                 e = check_texpr(d.body.as.alias_body.alias, ns, table, al);   // an alias's RHS type-expr
             }
-            // enum body: member names only — no type references to check
+            // enum body: member names only; extern body (C7.1a): opaque handle — neither has type references to check
         }
         if (e) { tk_free0(al.ptr); return tk_diag_at(it.file, line, col, e); }   // W-loc-2: file:line:col
     }

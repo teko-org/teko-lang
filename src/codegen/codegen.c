@@ -2975,6 +2975,13 @@ static bool emit_type_decl(cbuf *b, tk_type_decl d, const char **err) {
             // A TRANSPARENT alias emits NO C type — references resolve through to the aliased
             // type at the checker, and codegen emits that resolved type at every use site.
             return true;
+        case TK_BODY_EXTERN:
+            // (C7.1a) an OPAQUE foreign handle → a C `void *` typedef, so the existing
+            // Named → tk_t_<Name> mangle resolves to it (distinct in Teko, plain `void *` in C).
+            cb(b, "typedef void *");
+            mangle_type_name(b, ns, d.name);
+            cb(b, ";\n\n");
+            return true;
     }
     return fail_node(err, "codegen: unknown type body not yet supported");
 }
