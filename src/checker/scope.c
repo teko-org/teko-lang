@@ -201,80 +201,15 @@ tk_type_result tk_builtin_fn(tk_str name) {
         tk_type ft = { .tag = TK_TYPE_FUNC, .as.func = { .params = str2_t, .nparams = 2, .ret = &bool_t } };
         return (tk_type_result){ .ok = true, .as.value = ft };
     }
-    // host FFI bottoms: teko::float::parse(str)->f64 ; teko::io::read_file(str)->str|error ;
-    // teko::io::write_file(str,str)->error? (null=success). The C twins live in driver.c/teko_rt.c.
-    // (C7.2) These remain here as SEED entries so that resolved-by-last-segment lookup works while
-    // the checker does not yet prefer namespace-file-declared externs over the hardcoded seed.
-    static tk_type str_or_err_m[2] = { { .tag = TK_TYPE_STR }, { .tag = TK_TYPE_ERROR } };
-    static tk_type str_or_err = { .tag = TK_TYPE_VARIANT, .as.variant = { str_or_err_m, 2 } };
-    static tk_type error_inner = { .tag = TK_TYPE_ERROR };
-    static tk_type err_opt = { .tag = TK_TYPE_OPTIONAL, .as.optional.inner = &error_inner };
-    // driver host FFI: process::run([]str)->i32 (cc spawn), env::var(str)->str|error, env::chdir(str)->error?.
-    static tk_type str_el = { .tag = TK_TYPE_STR };
-    static tk_type str_slice_t = { .tag = TK_TYPE_SLICE, .as.slice.element = &str_el };
-    static tk_type i32_t = { .tag = TK_TYPE_PRIM, .as.prim = TK_PRIM_I32 };
-    // host dir-listing FFI: teko::fs::list_dir(str) -> []str | error (the entries in a directory).
-    static tk_type strslice_or_err_m[2] = { { .tag = TK_TYPE_SLICE, .as.slice.element = &str_el }, { .tag = TK_TYPE_ERROR } };
-    static tk_type strslice_or_err = { .tag = TK_TYPE_VARIANT, .as.variant = { strslice_or_err_m, 2 } };
-    // print/println + teko::io::write/ewrite — the host output bottom (write/ewrite are the FFI
-    // primitives the runtime's print/println/panic lower to; ewrite is stderr). All (str) -> void.
-    if (name_is(name, "print") || name_is(name, "println") || name_is(name, "write") || name_is(name, "ewrite") || name_is(name, "eprint") || name_is(name, "eprintln")) {
-        tk_type ft = { .tag = TK_TYPE_FUNC, .as.func = { .params = &str_t, .nparams = 1, .ret = &void_t } };
-        return (tk_type_result){ .ok = true, .as.value = ft };
-    }
-    if (name_is(name, "args")) {                                      // teko::env::args() -> []str (argv)
-        tk_type ft = { .tag = TK_TYPE_FUNC, .as.func = { .params = NULL, .nparams = 0, .ret = &str_slice_t } };
-        return (tk_type_result){ .ok = true, .as.value = ft };
-    }
+    // teko::float::parse(str) -> f64 — no namespace file exists for teko::float; keep as seed.
     if (name_is(name, "parse")) {                                     // teko::float::parse(str) -> f64
         tk_type ft = { .tag = TK_TYPE_FUNC, .as.func = { .params = &str_t, .nparams = 1, .ret = &f64_t } };
         return (tk_type_result){ .ok = true, .as.value = ft };
     }
-    if (name_is(name, "read_file")) {                                 // teko::io::read_file(str) -> str | error
-        tk_type ft = { .tag = TK_TYPE_FUNC, .as.func = { .params = &str_t, .nparams = 1, .ret = &str_or_err } };
-        return (tk_type_result){ .ok = true, .as.value = ft };
-    }
-    if (name_is(name, "write_file")) {                                // teko::io::write_file(str, str) -> error?
-        tk_type ft = { .tag = TK_TYPE_FUNC, .as.func = { .params = str2_t, .nparams = 2, .ret = &err_opt } };
-        return (tk_type_result){ .ok = true, .as.value = ft };
-    }
-    if (name_is(name, "write_file_bytes")) {                          // C7.12: teko::io::write_file_bytes(str, []byte) -> error?
-        static tk_type byte_el2  = { .tag = TK_TYPE_BYTE };
-        static tk_type byte_slice = { .tag = TK_TYPE_SLICE, .as.slice.element = &byte_el2 };
-        static tk_type str_bytes_p[2] = { { .tag = TK_TYPE_STR }, { .tag = TK_TYPE_SLICE } };
-        str_bytes_p[1].as.slice.element = &byte_el2;
-        tk_type ft = { .tag = TK_TYPE_FUNC, .as.func = { .params = str_bytes_p, .nparams = 2, .ret = &err_opt } };
-        (void)byte_slice;   // referenced via str_bytes_p
-        return (tk_type_result){ .ok = true, .as.value = ft };
-    }
-    if (name_is(name, "run")) {                                       // teko::process::run([]str) -> i32 (cc spawn)
-        tk_type ft = { .tag = TK_TYPE_FUNC, .as.func = { .params = &str_slice_t, .nparams = 1, .ret = &i32_t } };
-        return (tk_type_result){ .ok = true, .as.value = ft };
-    }
-    if (name_is(name, "var")) {                                       // teko::env::var(str) -> str | error
-        tk_type ft = { .tag = TK_TYPE_FUNC, .as.func = { .params = &str_t, .nparams = 1, .ret = &str_or_err } };
-        return (tk_type_result){ .ok = true, .as.value = ft };
-    }
-    if (name_is(name, "list_dir")) {                                  // teko::fs::list_dir(str) -> []str | error (dir entries)
-        tk_type ft = { .tag = TK_TYPE_FUNC, .as.func = { .params = &str_t, .nparams = 1, .ret = &strslice_or_err } };
-        return (tk_type_result){ .ok = true, .as.value = ft };
-    }
-    if (name_is(name, "chdir")) {                                     // teko::env::chdir(str) -> error?
-        tk_type ft = { .tag = TK_TYPE_FUNC, .as.func = { .params = &str_t, .nparams = 1, .ret = &err_opt } };
-        return (tk_type_result){ .ok = true, .as.value = ft };
-    }
-    if (name_is(name, "mkdir")) {                                     // teko::fs::mkdir(str) -> error?
-        tk_type ft = { .tag = TK_TYPE_FUNC, .as.func = { .params = &str_t, .nparams = 1, .ret = &err_opt } };
-        return (tk_type_result){ .ok = true, .as.value = ft };
-    }
-    if (name_is(name, "cwd")) {                                       // teko::env::cwd() -> str | error
-        tk_type ft = { .tag = TK_TYPE_FUNC, .as.func = { .params = NULL, .nparams = 0, .ret = &str_or_err } };
-        return (tk_type_result){ .ok = true, .as.value = ft };
-    }
-    if (name_is(name, "set_var")) {                                   // teko::env::set_var(str,str) -> error?
-        tk_type ft = { .tag = TK_TYPE_FUNC, .as.func = { .params = str2_t, .nparams = 2, .ret = &err_opt } };
-        return (tk_type_result){ .ok = true, .as.value = ft };
-    }
+    // NOTE: teko::io::*, teko::env::*, teko::fs::*, teko::process::* seeds have been REMOVED (C7.3).
+    // Those host surfaces are declared in src/io/io.tks, src/env/env.tks, src/fs/fs.tks,
+    // src/process/process.tks and are collected into the checker env via the normal discover/collect
+    // pass. The env lookup at type_call (expr.c line 242) finds them BEFORE this fallback fires.
     if (name_is(name, "os")) {                                        // teko::os() -> str — C7.1f
         tk_type ft = { .tag = TK_TYPE_FUNC, .as.func = { .params = NULL, .nparams = 0, .ret = &str_t } };
         return (tk_type_result){ .ok = true, .as.value = ft };
