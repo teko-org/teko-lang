@@ -24,6 +24,7 @@ typedef enum {
     TK_TEXPR_INTERP,                                       // $"…{expr}…" — string interpolation (self-host parity)
     TK_TEXPR_IN,                                           // <expr> in [ … ] — membership test (Phase 2); `.type` is bool
     TK_TEXPR_PATH,                                         // Enum::Member as a VALUE — `.type` is the NAMED enum
+    TK_TEXPR_ARRAY,                                        // [ e0, e1, … ] — slice/array literal (Increment B+); `.type` is []T
 } tk_texpr_tag;
 
 typedef struct { tk_token_kind op; tk_texpr *operand; } tk_tcmp_term;
@@ -79,6 +80,9 @@ struct tk_texpr {
         // checker resolves the enum decl + member ORDINAL so both backends lower without re-lookup:
         // codegen → the C constant `TK_E_<UPPER enum_name>_<UPPER member>`; VM → the ordinal int.
         struct { tk_str enum_name; tk_str member; uint64_t ordinal; }  path;
+        // [ e0, e1, … ] (Increment B+) — `.type` is []T; each element is a typed texpr already
+        // adopted into the element type T, so both backends build the same `[]T` value.
+        struct { tk_texpr *elements; size_t nelements; }              array;
     } as;
 };
 

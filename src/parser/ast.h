@@ -78,6 +78,7 @@ typedef struct { tk_str *pieces; size_t npieces; tk_expr *holes; size_t nholes; 
 // array literal). Empty set `x in []` is allowed → always false. `elems` is a flat tk_expr
 // array (like tk_call.args — by-value tk_expr is incomplete here, so a pointer field).
 typedef struct { tk_expr *lhs; tk_expr *elems; size_t nelems; } tk_in;
+typedef struct { tk_expr *elements; size_t nelements; } tk_array_lit;   // [ e0, e1, … ] — slice/array literal (Increment B+)
 
 typedef enum {
     TK_EXPR_NUMBER, TK_EXPR_VAR, TK_EXPR_STR, TK_EXPR_BYTE,
@@ -88,6 +89,7 @@ typedef enum {
     TK_EXPR_CAST, TK_EXPR_PATH, TK_EXPR_STRUCT_LIT, TK_EXPR_INDEX,
     TK_EXPR_INTERP,   // $"…{expr}…" — string interpolation (self-host parity)
     TK_EXPR_IN,       // <expr> in [ … ] — membership test (Phase 2)
+    TK_EXPR_ARRAY,    // [ e0, e1, … ] — slice/array literal (Increment B+)
 } tk_expr_kind;
 
 struct tk_expr {
@@ -116,6 +118,7 @@ struct tk_expr {
         tk_index        index;         // TK_EXPR_INDEX
         tk_interp       interp;        // TK_EXPR_INTERP
         tk_in           in_expr;       // TK_EXPR_IN
+        tk_array_lit    array;         // TK_EXPR_ARRAY
     } as;
 };
 

@@ -119,6 +119,10 @@ tk_bytes tk_write_texpr(tk_bytes b, tk_strtable t, const tk_texpr *te) {
             b = tk_write_u64(b, (uint64_t)te->as.in_expr.nelems);
             for (size_t i = 0; i < te->as.in_expr.nelems; i += 1) b = tk_write_texpr(b, t, &te->as.in_expr.elems[i]);
             return b;
+        case TK_TEXPR_ARRAY:                                                 // Increment B+ — [ e0, … ]: nelements (u64) THEN each element
+            b = tk_write_u64(tk_write_u8(b, 21), (uint64_t)te->as.array.nelements);
+            for (size_t i = 0; i < te->as.array.nelements; i += 1) b = tk_write_texpr(b, t, &te->as.array.elements[i]);
+            return b;
     }
     return b;
 }

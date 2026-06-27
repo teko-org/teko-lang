@@ -683,6 +683,26 @@ fn type_in(n: parser::InExpr, env: Env, table: TypeTable) -> TExpr | error {
     TExpr { kind = TInExpr { lhs = lhs; elems = elems }; type = Prim { kind = PrimKind::Bool }; line = 0; col = 0 }
 }
 
+// `[ e0, e1, … ]` (Increment B+): type every element, UNIFY to a common element type T (widening —
+// a case joins into its variant; sibling cases → their union), result `[]T`. An empty `[]` yields
+// the SENTINEL `[]Void` — exactly like `teko::list::empty()` — so a binding annotation (`: []T`)
+// adopts it and a bare unannotated `[]` is rejected by type_binding (collections #4). C twin:
+// type_array_lit in expr.c.
+fn type_array_lit(a: parser::ArrayLit, env: Env, table: TypeTable) -> TExpr | error {
+    mut elems: []TExpr = teko::list::empty()
+    mut et: Type = Void { }                 // sentinel for an empty `[]` (no inferable element)
+    mut i = 0
+    loop {
+        if i >= a.elements.len { break }
+        let el = match type_expr(a.elements[i], env, table) { TExpr as te => te; error as e => return e }
+        if type_is_void(el.type) { return error { message = "a `void` expression cannot be an array element (M.1)" } }
+        if i == 0 { et = el.type } else { et = type_join(et, el.type, table) }   // widen across the elements
+        elems = teko::list::push(elems, el)
+        i++
+    }
+    TExpr { kind = TArrayLit { elements = elems }; type = Slice { element = et }; line = 0; col = 0 }
+}
+
 // ---- the expression dispatch (the evolved check_expr) ----
 // `Enum::Member` as a VALUE — the enum type (path minus the member) resolved to an `enum` decl,
 // the member checked, the node typed NAMED(enum) carrying enum name + member ORDINAL (so both
@@ -739,6 +759,7 @@ fn type_dispatch(e: parser::Expr, env: Env, table: TypeTable) -> TExpr | error {
         parser::Index as ix    => type_index(ix, env, table)        // W5-idx
         parser::Interp as in   => type_interp(in, env, table)       // $"…{expr}…"
         parser::InExpr as n    => type_in(n, env, table)            // <expr> in [ … ] (Phase 2)
+        parser::ArrayLit as a  => type_array_lit(a, env, table)     // [ e0, e1, … ] (Increment B+)
     }
 }
 

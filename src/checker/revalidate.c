@@ -152,6 +152,12 @@ tk_check_result tk_validate_texpr(const tk_texpr *te) {
             }
             return node_is(te->type, prim(TK_PRIM_BOOL));
         }
+        case TK_TEXPR_ARRAY: {   // [ e0, e1, … ] (Increment B+): []T result; each element valid
+            for (size_t i = 0; i < te->as.array.nelements; i += 1) {
+                tk_check_result r = tk_validate_texpr(&te->as.array.elements[i]); if (!r.ok) return r;
+            }
+            return cok();
+        }
     }
     return cfail("corrupt: unknown typed expression");
 }

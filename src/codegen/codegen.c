@@ -1640,6 +1640,34 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
             cb(b, "; })");
             return true;
         }
+        case TK_TEXPR_ARRAY: {
+            // [ e0, … ] (Increment B+) -> a tk_slice_<elem>. Empty [] -> the empty literal; non-empty
+            // allocates N elements (M.1 OOM-abort), stores each via emit_as, yields { .ptr, .len }.
+            tk_type elem = (e->type.tag == TK_TYPE_SLICE && e->type.as.slice.element)
+                         ? *e->type.as.slice.element : (tk_type){ .tag = TK_TYPE_VOID };
+            size_t nelem = e->as.array.nelements;
+            if (nelem == 0) {
+                cb(b, "("); if (!cg_slice_typename(b, elem, err)) return false;
+                cb(b, "){ .ptr = 0, .len = 0 }");
+                return true;
+            }
+            char pN[40]; snprintf(pN, sizeof pN, "_arr%zu", (size_t)b->len);
+            char cnt[24]; snprintf(cnt, sizeof cnt, "%zu", nelem);
+            cb(b, "({ ");
+            if (!emit_type(b, elem, err)) return false;
+            cb(b, " *"); cb(b, pN); cb(b, " = malloc("); cb(b, cnt); cb(b, " * sizeof(");
+            if (!emit_type(b, elem, err)) return false;
+            cb(b, ")); if (!"); cb(b, pN); cb(b, ") abort(); ");
+            for (size_t i = 0; i < nelem; i += 1) {
+                char idx[24]; snprintf(idx, sizeof idx, "%zu", i);
+                cb(b, pN); cb(b, "["); cb(b, idx); cb(b, "] = ");
+                if (!emit_as(b, elem, &e->as.array.elements[i], err)) return false;
+                cb(b, "; ");
+            }
+            cb(b, "("); if (!cg_slice_typename(b, elem, err)) return false;
+            cb(b, "){ .ptr = "); cb(b, pN); cb(b, ", .len = "); cb(b, cnt); cb(b, " }; })");
+            return true;
+        }
     }
     return fail_node(err, "codegen: unknown expression not yet supported");
 }

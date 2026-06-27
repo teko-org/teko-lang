@@ -1005,7 +1005,23 @@ fn eval_expr(e: checker::TExpr, env: Venv) -> Value {
                 _ => panic("vm: coalesce left operand is not optional (internal: checker should reject)")
             }
         }
+        // [ e0, e1, … ] (Increment B+) — build a `[]Value` (in a dedicated fn, like eval_in).
+        checker::TArrayLit as a => eval_array_lit(a, e.type, env)
     }
+}
+
+// eval_array_lit — `[ e0, e1, … ]` -> a `[]Value`; each element coerced into the slice's element
+// type (`slot`'s element — an optional element present-wraps; a case rides its StructVal tag).
+fn eval_array_lit(a: checker::TArrayLit, slot: checker::Type, env: Venv) -> Value {
+    let elem_t = match slot { checker::Slice as s => s.element; _ => checker::Void { } }
+    mut xs: []Value = teko::list::empty()
+    mut i = 0
+    loop {
+        if i >= a.elements.len { break }
+        xs = teko::list::push(xs, coerce_to(eval_expr(a.elements[i], env), elem_t))
+        i = i + 1
+    }
+    xs
 }
 
 // coerce a Value into the declared slot type `t`: if `t` is `T?` and the value is NOT already an
@@ -1441,7 +1457,17 @@ fn exec_stmt(s: checker::TStatement, env: Venv) -> Step {
                 _              => Stepped { env= env; value= eval_stmt_value(x.expr, env) }
             }
         }
-        checker::TLoopStmt as l     => Exit { flow= run_loop(l.label, l.body, env) }   // while(1){…} with break/continue; pass this loop's label
+        checker::TLoopStmt as l     => {
+            // while(1){…} with break/continue. run_loop returns the OUTER env after the last
+            // iteration (so outer-`mut` updates survive the loop — the functional twin of the C's
+            // in-place env). A NORMAL completion CONTINUES the block (Stepped); a return / labeled
+            // break-or-continue to an enclosing loop EXITS (Exit).
+            let lo = run_loop(l.label, l.body, env)
+            match lo.flow {
+                Normal => Stepped { env= lo.env; value= null }
+                _      => Exit { flow= lo.flow }
+            }
+        }
         checker::TBreakStmt as b    => Exit { flow= Break { label= b.label } }
         checker::TContinueStmt as c => Exit { flow= Continue { label= c.label } }
     }
@@ -1509,22 +1535,60 @@ fn call_value(c: checker::TCall, env: Venv) -> Value? {
 // loop; otherwise it propagates. VmReturn propagates. Normal re-iterates. A loop completing (via a
 // matching Break) produces NO trailing value — it yields a valueless NORMAL flow. (Mirrors the C
 // `TK_TSTMT_LOOP` exec.)
-fn run_loop(mylabel: str, body: []checker::TStatement, env: Venv) -> Flow {
+// keep the first `n` slots of an env (the OUTER scope) — drops per-iteration block-locals while
+// preserving outer-`mut` MUTATIONS (mutate_slot rebuilds an outer slot AT ITS INDEX, so it stays
+// in [0, n)). The functional twin of the C's env_pop_to after a loop-body block.
+fn loop_outer(slots: []Slot, n: u64) -> []Slot {
+    mut out: []Slot = teko::list::empty()
+    mut i: u64 = 0
     loop {
-        match exec_block(body, env) {
-            VmReturn as ret => return ret
-            Break as b    => {
-                if b.label.len == 0 || vm_str_eq(b.label, mylabel) { break }   // this loop
-                return b                                                        // propagate to outer
+        if i >= n { break }
+        out = teko::list::push(out, slots[i])
+        i = i + 1
+    }
+    out
+}
+
+// run_loop yields the loop's terminating FLOW plus the OUTER env after the last iteration (so an
+// outer-`mut` updated inside the loop survives it — the functional twin of the C's in-place env).
+type LoopOut = struct { flow: Flow; env: Venv }
+
+fn run_loop(mylabel: str, body: []checker::TStatement, env: Venv) -> LoopOut {
+    let base = env.slots.len     // outer scope size: per-iteration locals are appended ABOVE this
+    mut cur = env
+    loop {
+        // Run the body with PER-STATEMENT env threading (like exec_block), but CARRY the resulting
+        // env to the next iteration so an outer `mut i` updated by `i++` is seen (the functional VM
+        // has no in-place mutation — the C twin mutates env directly). Drop this iteration's locals.
+        mut e = cur
+        mut exited = false
+        mut exflow: Flow = Normal { value = null }
+        mut i: u64 = 0
+        loop {
+            if i >= body.len { break }
+            match exec_stmt(body[i], e) {
+                Stepped as st => { e = st.env }                 // thread the env forward
+                Exit as ex    => { exflow = ex.flow; exited = true; break }
             }
-            Continue as c => {
-                // not THIS loop's continue -> propagate to outer; else fall through and re-iterate.
-                if c.label.len > 0 && !vm_str_eq(c.label, mylabel) { return c }
+            i = i + 1
+        }
+        cur = Venv { slots = loop_outer(e.slots, base); prog = e.prog }   // keep outer mutations; drop locals
+        if exited {
+            match exflow {
+                VmReturn as ret => return LoopOut { flow = ret; env = cur }
+                Break as b    => {
+                    if b.label.len == 0 || vm_str_eq(b.label, mylabel) { break }   // this loop → done
+                    return LoopOut { flow = b; env = cur }                          // propagate to outer
+                }
+                Continue as c => {
+                    if c.label.len > 0 && !vm_str_eq(c.label, mylabel) { return LoopOut { flow = c; env = cur } }   // not ours → propagate
+                    // ours → fall through to re-iterate (outer mutations up to the `continue` are kept)
+                }
+                _ => {}
             }
-            _             => {}                  // Normal: loop again (trailing value discarded)
         }
     }
-    Normal { value= null }
+    LoopOut { flow = Normal { value = null }; env = cur }
 }
 
 // W5a — `if` as CONTROL FLOW (+ value): eval the cond (a bool), run the TAKEN branch's block,

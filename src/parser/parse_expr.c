@@ -27,6 +27,7 @@
 
 // the ladder is internal + flagged; the two public entries set the flag (bottom of file).
 static tk_parsed_result parse_expr_a(const tk_token *t, size_t n, size_t pos, bool as_);
+static tk_parsed_args_result parse_in_elems(const tk_token *t, size_t n, size_t pos);   // [ e0, … ] elements (array lit + `in` set)
 
 // (C1-POS/E1) stamp a freshly-built node with its FIRST-token source position. A node's
 // first token is always `t[pos]` at its parser function's ENTRY: atom leaves start there,
@@ -230,6 +231,15 @@ static tk_parsed_result parse_atom(const tk_token *t, size_t n, size_t pos, bool
             return (tk_parsed_result){ .ok = false, .as.error = tk_err_at(t, n, in.as.value.next, "expected ')' to close a parenthesized expression") };
         }
         return (tk_parsed_result){ .ok = true, .as.value = { .node = in.as.value.node, .next = in.as.value.next + 1 } };
+    }
+    if (k == TK_TOKEN_LBRACKET) {
+        // `[ e0, e1, … ]` — an array/slice literal (Increment B+). Reuses the bracket-element
+        // parser (same shape as the `in` set). The checker unifies the element type.
+        tk_parsed_args_result es = parse_in_elems(t, n, pos);
+        if (!es.ok) { return (tk_parsed_result){ .ok = false, .as.error = es.as.error }; }
+        tk_expr e = tk_at((tk_expr){ .tag = TK_EXPR_ARRAY, .as.array = {
+            .elements = es.as.value.args, .nelements = es.as.value.n_args } }, t, pos);
+        return (tk_parsed_result){ .ok = true, .as.value = { .node = e, .next = es.as.value.next } };
     }
     if (k == TK_TOKEN_IF)    { return parse_if(t, n, pos); }
     if (k == TK_TOKEN_MATCH) { return parse_match(t, n, pos); }

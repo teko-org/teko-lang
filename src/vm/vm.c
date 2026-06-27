@@ -1246,6 +1246,16 @@ static tk_value tk_vm_eval_expr(const tk_texpr *e, tk_venv *env) {
         case TK_TEXPR_INDEX: return eval_index(e, env);   // W5-idx — subscript recv[index] (str→byte; slice = honest stop)
         case TK_TEXPR_INTERP: return eval_interp(e, env); // $"…{expr}…" — string interpolation (pieces ++ str(holes))
         case TK_TEXPR_IN: return eval_in(e, env);         // Phase 2 — `<lhs> in [ … ]`: true iff lhs (single-eval) value_eq's any element
+        case TK_TEXPR_ARRAY: {                            // [ e0, … ] (Increment B+) — build a list value
+            tk_type elem_t = (e->type.tag == TK_TYPE_SLICE && e->type.as.slice.element)
+                           ? *e->type.as.slice.element : (tk_type){ .tag = TK_TYPE_VOID };
+            tk_value arr = v_list_empty();
+            for (size_t i = 0; i < e->as.array.nelements; i += 1) {
+                tk_value el = coerce_to(tk_vm_eval_expr(&e->as.array.elements[i], env), elem_t);
+                arr = v_list_push(arr.as.list, el);
+            }
+            return arr;
+        }
         // null / ?. / ?? (REBOOT_PLAN §202/§203) — the OPTIONAL value model (TK_VAL_OPT).
         case TK_TEXPR_NULL:
             return v_none();   // the `null` literal is NONE; the destination's wrap (coerce_to) makes it a concrete `T?`

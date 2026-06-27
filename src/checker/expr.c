@@ -727,6 +727,26 @@ static tk_texpr_result type_in(tk_in n, tk_env env, tk_type_table table) {
                            .as.in_expr = { box(lhs.as.value), elems, n.nelems } });
 }
 
+// `[ e0, e1, … ]` (Increment B+): type every element, UNIFY to a common element type T (widening),
+// result `[]T`. An empty `[]` yields the SENTINEL `[]void` (like teko::list::empty()) so a binding
+// annotation adopts it. C twin's mirror: type_array_lit in typer.tks.
+static tk_texpr_result type_array_lit(tk_array_lit a, tk_env env, tk_type_table table) {
+    tk_texpr *elems = NULL;
+    if (a.nelements > 0) { elems = tk_alloc(a.nelements * sizeof *elems); if (!elems) abort(); }
+    tk_type et = (tk_type){ .tag = TK_TYPE_VOID };   // sentinel for an empty `[]`
+    for (size_t i = 0; i < a.nelements; i += 1) {
+        tk_texpr_result e = tk_typer_expr(a.elements[i], env, table);
+        if (!e.ok) { tk_free0(elems); return e; }
+        if (tk_type_is_void(&e.as.value.type)) { tk_free0(elems); return xerr("a `void` expression cannot be an array element (M.1)"); }
+        if (i == 0) { et = e.as.value.type; }
+        else { tk_type j; if (!tk_type_join(et, e.as.value.type, table, &j)) { tk_free0(elems); return xerr("array elements have different types"); } et = j; }
+        elems[i] = e.as.value;
+    }
+    tk_type *ep = tk_alloc(sizeof *ep); if (!ep) abort(); *ep = et;
+    tk_type st = { .tag = TK_TYPE_SLICE, .as.slice.element = ep };
+    return xok((tk_texpr){ .tag = TK_TEXPR_ARRAY, .type = st, .as.array = { elems, a.nelements } });
+}
+
 // forward decls for the if/match VALUE forms (mutual recursion: expr ↔ block).
 static tk_texpr_result type_if(tk_if_expr f, tk_env env, tk_type_table table);
 static tk_texpr_result type_match(tk_match_expr m, tk_env env, tk_type_table table);
@@ -803,6 +823,7 @@ static tk_texpr_result type_dispatch(tk_expr e, tk_env env, tk_type_table table)
         case TK_EXPR_INDEX:        return type_index(e.as.index, env, table);            // W5-idx
         case TK_EXPR_INTERP:       return type_interp(e.as.interp, env, table);          // $"…{expr}…"
         case TK_EXPR_IN:           return type_in(e.as.in_expr, env, table);            // <expr> in [ … ] (Phase 2)
+        case TK_EXPR_ARRAY:        return type_array_lit(e.as.array, env, table);       // [ e0, e1, … ] (Increment B+)
     }
     return xerr("unknown expression");
 }

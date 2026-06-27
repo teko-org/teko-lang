@@ -1509,6 +1509,40 @@ fn emit_in(buf: []byte, prog: checker::TProgram, ie: checker::TInExpr) -> []byte
     cb(out, "; })")
 }
 
+// emit_array_lit — `[ e0, e1, … ]` (Increment B+) -> a `tk_slice_<elem>` value. Empty `[]` is the
+// concrete empty literal `(tk_slice_<elem>){ .ptr = 0, .len = 0 }`. Non-empty allocates an N-element
+// buffer (M.1 OOM-abort), stores each element via emit_as (so a case wraps into its variant / a
+// fitting literal adopts the element type), and yields the `{ .ptr, .len }` slice in a GNU stmt-expr.
+fn emit_array_lit(buf: []byte, prog: checker::TProgram, e: checker::TExpr, a: checker::TArrayLit) -> []byte | error {
+    let elem = match e.type { checker::Slice as s => s.element; _ => return error { message = "codegen: array literal is not a slice type (internal)" } }
+    if a.elements.len == 0 {
+        mut z = cb(buf, "(")
+        z = match cg_slice_typename(z, elem) { []byte as o => o; error as err => return err }
+        return cb(z, "){ .ptr = 0, .len = 0 }")
+    }
+    let pN = $"_arr{buf.len}"
+    mut out = cb(buf, "({ ")
+    out = match emit_type(out, elem) { []byte as o => o; error as err => return err }
+    out = cb(out, " *"); out = cb(out, pN); out = cb(out, " = malloc(")
+    out = cb_u128_digits(out, a.elements.len to u128)
+    out = cb(out, " * sizeof(")
+    out = match emit_type(out, elem) { []byte as o => o; error as err => return err }
+    out = cb(out, ")); if (!"); out = cb(out, pN); out = cb(out, ") abort(); ")
+    mut i = 0
+    loop {
+        if i >= a.elements.len { break }
+        out = cb(out, pN); out = cb(out, "["); out = cb_u128_digits(out, i to u128); out = cb(out, "] = ")
+        out = match emit_as(out, prog, elem, a.elements[i]) { []byte as o => o; error as err => return err }
+        out = cb(out, "; ")
+        i++
+    }
+    out = cb(out, "(")
+    out = match cg_slice_typename(out, elem) { []byte as o => o; error as err => return err }
+    out = cb(out, "){ .ptr = "); out = cb(out, pN); out = cb(out, ", .len = ")
+    out = cb_u128_digits(out, a.elements.len to u128)
+    cb(out, " }; })")
+}
+
 // emit_interp — $"…{expr}…" (self-host parity). Lower to nested tk_str_concat over the piece
 // literals and the holes: pieces[0] ++ str(holes[0]) ++ pieces[1] ++ … . A piece literal is the
 // SAME (tk_str){…} emission as TStrLit. A `str` hole is the str expr directly; an INTEGER hole is
@@ -3030,6 +3064,7 @@ fn emit_expr_ret(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, 
         checker::TIndex as ix      => emit_index(buf, prog, e, ix)   // W5-idx — subscript recv[index] (str + slice, bounds-checked)
         checker::TInterp as in     => emit_interp(buf, prog, in)     // $"…{expr}…" — nested tk_str_concat over pieces + holes
         checker::TInExpr as ie     => emit_in(buf, prog, ie)         // Phase 2 — `<lhs> in [ … ]` membership (single-eval, OR of `==`)
+        checker::TArrayLit as a    => emit_array_lit(buf, prog, e, a)   // [ e0, e1, … ] (Increment B+) — build a tk_slice_<elem>
         checker::TPathExpr as pe   => {                              // Enum::Member → C constant TK_E_<UPPER enum>_<UPPER member>
             mut out = cb(buf, "TK_E_")
             out = cb_upper(out, pe.enum_name)
