@@ -1476,6 +1476,80 @@ fn surface_at(file: str, item_line: u32, item_col: u32, inner: error) -> error {
     teko::error::err_typed(positioned, inner.expected, inner.actual)         // preserve expected/actual (C1.8)
 }
 
+// C7.10 — THE DEP-AWARE TYPED ENTRY POINT. Same as type_program but pre-seeds the
+// collection environment from an already-typed dep TProgram before collecting and typing
+// the project. The dep's items are NOT re-typed; only their signatures enter scope so
+// the project's code can call dep functions and reference dep types.
+// dep_prog.items is empty when there are no deps → degrades silently to type_program behavior.
+pub fn type_program_with_deps(program: parser::Program, dep_prog: TProgram) -> TProgram | error {
+    // Seed from dep first (build base table + env from dep's type decls + fn signatures).
+    let seed_empty = Collected { types = teko::list::empty(); env = env_empty() }
+    let seed = match seed_from_dep(dep_prog, seed_empty.types, seed_empty.env) {
+        Collected as s => s
+        error as e     => return e
+    }
+    // Collect from the project on top of the seed.
+    let c = match collect_with_seed(program, seed) { Collected as col => col; error as e => return e }
+    // W-vis-enforce: enforce the module system over the project's own items.
+    // We only check the project's items (not dep items — they were checked when the dep was built).
+    match check_modules(program, c.types) { null => {}; error as e => return e }
+    mut items: []TItem = teko::list::empty()
+    mut mainbody: []TStatement = teko::list::empty()
+    mut cur = c.env
+    mut i = 0
+    loop {
+        if i >= program.items.len { break }
+        let it = program.items[i]
+        let ienv = with_ns(c.env, it.namespace)
+        mut line: u32 = 0
+        mut col: u32 = 0
+        match it.content {
+            parser::Function as f  => { line = f.line;  col = f.col }
+            parser::TypeDecl as td => { line = td.line; col = td.col }
+            _                      => {}
+        }
+        match it.content {
+            parser::Statement as s => {
+                let ts = match type_statement(s, cur, c.types) {
+                    TypedStmt as x => x
+                    error as e => return surface_at(it.file, line, col, e)
+                }
+                items = teko::list::push(items, ts.node)
+                mainbody = teko::list::push(mainbody, ts.node)
+                cur = ts.env
+            }
+            _ => {
+                let ti = match type_item(it, ienv, c.types) {
+                    TItem as x => x
+                    error as e => return surface_at(it.file, line, col, e)
+                }
+                items = teko::list::push(items, ti)
+            }
+        }
+        i++
+    }
+    let lc = check_labels(mainbody, teko::list::empty(), false, teko::list::empty())
+    if lc.failed { return error { message = lc.message } }
+    // For the result, prepend dep items so the TProgram contains the full program (dep + project).
+    // This allows subsequent operations (codegen, VM, coverage) to see all items.
+    mut all_items: []TItem = teko::list::empty()
+    mut di: u64 = 0
+    loop {
+        if di >= dep_prog.items.len { break }
+        all_items = teko::list::push(all_items, dep_prog.items[di])
+        di++
+    }
+    mut pi: u64 = 0
+    loop {
+        if pi >= items.len { break }
+        all_items = teko::list::push(all_items, items[pi])
+        pi++
+    }
+    let tp = TProgram { items = all_items }
+    match analyze_program(tp) { null => {}; error as e => return e }
+    tp
+}
+
 // THE TYPED ENTRY POINT: pass 1 (collect top-level names) + pass 2 (type each item).
 pub fn type_program(program: parser::Program) -> TProgram | error {
     let c = match collect(program) { Collected as col => col; error as e => return e }

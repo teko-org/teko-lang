@@ -996,8 +996,26 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
                 cb(b, ")");
                 return true;
             }
-            // NOTE (out of scope): +,-,* stay plain C — overflow guarding is DEFERRED to
-            // build profiles (panic-debug / wrap-release), which don't exist yet.
+            // C7.15 — +,-,* on INTEGER prims route through tk_add_*/tk_sub_*/tk_mul_*
+            // helpers (defined in teko_rt.h). When TEKO_OVERFLOW_DEBUG is set these
+            // call tk_panic_overflow() on overflow; otherwise they compile to plain C.
+            // Float +,-,* are NOT routed here — float overflow is not a Teko panic.
+            if (bop == TK_TOKEN_PLUS || bop == TK_TOKEN_MINUS || bop == TK_TOKEN_STAR) {
+                if (e->type.tag == TK_TYPE_PRIM && cg_prim_is_int(e->type.as.prim)) {
+                    const char *tag = prim_int_tag(e->type.as.prim);
+                    if (tag != NULL) {
+                        const char *fn = (bop == TK_TOKEN_PLUS)  ? "tk_add_"
+                                       : (bop == TK_TOKEN_MINUS) ? "tk_sub_"
+                                       :                           "tk_mul_";
+                        cb(b, fn); cb(b, tag); cb(b, "(");
+                        if (!emit_expr(b, e->as.binary.left,  err)) return false;
+                        cb(b, ", ");
+                        if (!emit_expr(b, e->as.binary.right, err)) return false;
+                        cb(b, ")");
+                        return true;
+                    }
+                }
+            }
             const char *op = binop_c(bop);
             if (op == NULL) return fail_node(err, "codegen: binary operator not yet supported");
             cb(b, "(");

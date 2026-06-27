@@ -115,6 +115,72 @@ type ZipCDEntry = struct {
 // --- public types ---
 pub type ZipEntry = struct { name: str; data: []byte }
 
+// --- read_zip: parse a ZIP-STORE archive and return its entries as []ZipEntry ---
+//
+// Minimal PKZIP local-file-header walker. Reads only the local file headers (signature
+// 0x04034B50 = "PK\x03\x04") and their file data — enough to extract the entries in order.
+// Does NOT parse the central directory (that is the source-of-truth for a complete ZIP, but
+// STORE archives produced by write_zip are self-consistent: the local headers carry the full
+// filename, size, and CRC). Returns the list of extracted entries, or an error if the data
+// is malformed or not a ZIP archive.
+//
+// Usage: given the raw bytes of a .tkl package, extract its entries:
+//   let entries = match read_zip(data) { []ZipEntry as e => e; error as e => return e }
+pub fn read_zip(data: []byte) -> []ZipEntry | error {
+    mut pos: u64 = 0
+    mut result: []ZipEntry = teko::list::empty()
+
+    loop {
+        // Need at least 30 bytes for a local file header (without filename / extra).
+        if pos + 30 > data.len { break }
+
+        // Local file header signature: 0x50 0x4B 0x03 0x04 ("PK\x03\x04")
+        if data[pos] != 0x50 || data[pos + 1] != 0x4B || data[pos + 2] != 0x03 || data[pos + 3] != 0x04 {
+            // Not a local file header — may be central directory or end record; stop.
+            break
+        }
+
+        // Skip: version needed (2), flags (2), method (2), mod time (2), mod date (2),
+        //        CRC-32 (4), compressed size (4), uncompressed size (4)  = 22 bytes, offset from sig start = 4.
+        // Compressed size is at offset 18 from the signature (local header field offset 18).
+        let comp_size = (data[pos + 18] to u32) | ((data[pos + 19] to u32) << 8) | ((data[pos + 20] to u32) << 16) | ((data[pos + 21] to u32) << 24)
+
+        // Filename length at offset 26; extra field length at offset 28 (both u16 LE).
+        let fname_len = (data[pos + 26] to u64) | ((data[pos + 27] to u64) << 8)
+        let extra_len = (data[pos + 28] to u64) | ((data[pos + 29] to u64) << 8)
+
+        // Data begins after: 30-byte fixed header + fname_len + extra_len.
+        let header_end = pos + 30 + fname_len + extra_len
+        if header_end + (comp_size to u64) > data.len {
+            return error { message = "truncated ZIP entry data" }
+        }
+
+        // Extract the filename (bytes pos+30 .. pos+30+fname_len).
+        mut name_bytes: []byte = teko::list::empty()
+        mut fi: u64 = 0
+        loop {
+            if fi >= fname_len { break }
+            name_bytes = teko::list::push(name_bytes, data[pos + 30 + fi])
+            fi++
+        }
+        let entry_name = str(name_bytes)
+
+        // Extract the file data (bytes header_end .. header_end + comp_size).
+        mut entry_data: []byte = teko::list::empty()
+        mut di: u64 = 0
+        loop {
+            if di >= (comp_size to u64) { break }
+            entry_data = teko::list::push(entry_data, data[header_end + di])
+            di++
+        }
+
+        result = teko::list::push(result, ZipEntry { name = entry_name; data = entry_data })
+        pos = header_end + (comp_size to u64)
+    }
+
+    result
+}
+
 // --- write_zip: assemble a complete ZIP archive and return it as []byte ---
 pub fn write_zip(entries: []ZipEntry) -> []byte {
     mut buf: []byte = teko::list::empty()

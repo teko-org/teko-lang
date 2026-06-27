@@ -16,4 +16,9 @@ typedef struct {
 // heap-allocated tk_bytes. Caller owns the returned buffer. Never fails (OOM → abort).
 tk_bytes tk_write_zip(const tk_zip_entry *entries, size_t n);
 
+// Parse a ZIP-STORE archive (typically a .tkl package). Returns a heap-allocated array of
+// entries (caller frees with tk_free0; each entry's name.ptr and data.ptr are owned copies).
+// *out_n receives the entry count (0 on error or empty archive). Mirrors compress.tks::read_zip.
+tk_zip_entry *tk_read_zip(const tk_byte *data, size_t data_len, size_t *out_n);
+
 #endif // TK_COMPRESS_H

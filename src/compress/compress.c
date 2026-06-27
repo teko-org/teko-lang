@@ -65,6 +65,54 @@ TK_LIST(zip_cd_entry, zip_cd_list);
 #define ZIP_MOD_DATE 0x5A21u
 #define ZIP_VER      20u       // version 2.0
 
+// --- tk_read_zip: parse a ZIP-STORE archive and return its entries. ---
+// Mirrors compress.tks::read_zip exactly. Walks local file headers (PK\x03\x04), extracts
+// filename + raw file data for each entry. Returns a heap-allocated array (caller frees the
+// pointer, not the individual name/data buffers — those point into the input or owned copies).
+// On error *out_n is 0 and the returned pointer is NULL.
+tk_zip_entry *tk_read_zip(const tk_byte *data, size_t data_len, size_t *out_n) {
+    // Worst-case: all bytes could be one-byte entries. Use a simple grow-buffer.
+    size_t cap = 8, len = 0;
+    tk_zip_entry *result = (tk_zip_entry *)tk_alloc(cap * sizeof(tk_zip_entry));
+    size_t pos = 0;
+
+    while (pos + 30 <= data_len) {
+        // Local file header signature: PK\x03\x04
+        if (data[pos] != 0x50 || data[pos+1] != 0x4B ||
+            data[pos+2] != 0x03 || data[pos+3] != 0x04) break;
+
+        uint32_t comp_size = (uint32_t)data[pos+18]
+                           | ((uint32_t)data[pos+19] << 8)
+                           | ((uint32_t)data[pos+20] << 16)
+                           | ((uint32_t)data[pos+21] << 24);
+        uint16_t fname_len = (uint16_t)(data[pos+26] | (data[pos+27] << 8));
+        uint16_t extra_len = (uint16_t)(data[pos+28] | (data[pos+29] << 8));
+
+        size_t header_end = pos + 30 + (size_t)fname_len + (size_t)extra_len;
+        if (header_end + (size_t)comp_size > data_len) break;   // truncated — stop
+
+        // Copy filename bytes into a fresh owned buffer.
+        tk_byte *nbuf = (tk_byte *)tk_alloc(fname_len ? fname_len : 1);
+        for (uint16_t i = 0; i < fname_len; i += 1) nbuf[i] = data[pos + 30 + i];
+        tk_str name = { .ptr = nbuf, .len = fname_len };
+
+        // Copy entry data into a fresh owned buffer.
+        tk_byte *dbuf = (tk_byte *)tk_alloc(comp_size ? (size_t)comp_size : 1);
+        for (uint32_t i = 0; i < comp_size; i += 1) dbuf[i] = data[header_end + i];
+        tk_bytes edata = { .ptr = dbuf, .len = (size_t)comp_size, .cap = (size_t)comp_size };
+
+        if (len == cap) {
+            cap *= 2;
+            result = (tk_zip_entry *)tk_realloc0(result, cap * sizeof(tk_zip_entry));
+        }
+        result[len++] = (tk_zip_entry){ .name = name, .data = edata };
+        pos = header_end + (size_t)comp_size;
+    }
+
+    *out_n = len;
+    return result;
+}
+
 tk_bytes tk_write_zip(const tk_zip_entry *entries, size_t n) {
     tk_bytes buf = tk_bytes_empty();
     zip_cd_list cd = zip_cd_list_empty();

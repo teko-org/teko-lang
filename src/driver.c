@@ -26,6 +26,10 @@
 // Forward-declare tk_emit_program to avoid pulling in header.h → tkb_read.h → tk_strs clash.
 TK_RESULT(tk_bytes, tk_bytes_result);   // []byte | error — tk_emit_program's result type
 tk_bytes_result tk_emit_program(tk_tprogram prog, tk_type_table table);
+// C7.10: forward-declare tk_deserialize_program (from emit/tkb_read.h) to avoid pulling in
+// tkb_read.h which re-typedefs tk_strs (clashing with the local definition in manifest.c / this TU).
+// tk_tprogram_result is already defined via checker/tast.h (included by checker/typer.h above).
+tk_tprogram_result tk_deserialize_program(const tk_byte *data, size_t len);
 
 #include <stdio.h>           // fopen/fread/fclose, fprintf, printf
 #include <stdlib.h>          // malloc, realloc, free
@@ -139,8 +143,8 @@ static int fail(const char *path, const char *message) {
 }
 
 // =========================================================================
-// (C1.8/E2) RICH DIAGNOSTIC RENDERER — a host edge (its .tks mirror is driver.tks/main.tks,
-// both already noted as deferred host edges; the structured tk_error fields are the E2 carve-out,
+// (C1.8/E2) RICH DIAGNOSTIC RENDERER — the C-side of this logic; driver.tks mirrors
+// `fail` (the simpler path) because the structured tk_error fields are the E2 carve-out,
 // not yet on the Teko surface `error`). When the checker hands back a STRUCTURED error (file +
 // line + col set — C1-POS/C1.8), print the located header (unchanged behavior), then the offending
 // SOURCE LINE read from the file, then a caret '^' aligned under the column, and — when present —
@@ -463,6 +467,139 @@ static int find_manifest(char *out, size_t cap) {
     return found == 1;
 }
 
+// =========================================================================
+// C7.10 — DEP LOADING: load one dep's .tkl package, extract its .tkb, deserialize the
+// TProgram. Mirrors project.tks::load_dep_program. Returns ok=true on success.
+// =========================================================================
+
+// Read a file as raw bytes (binary, no UTF-8 check). Returns {ptr,len} or NULL on error.
+// Caller frees with tk_free0.
+static unsigned char *read_file_bytes(const char *path, size_t *out_len) {
+    FILE *f = fopen(path, "rb");
+    if (f == NULL) return NULL;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
+    long sz = ftell(f);
+    if (sz < 0) { fclose(f); return NULL; }
+    if (fseek(f, 0, SEEK_SET) != 0) { fclose(f); return NULL; }
+    size_t n = (size_t)sz;
+    unsigned char *buf = (unsigned char *)tk_alloc(n ? n : 1);
+    size_t got = fread(buf, 1, n, f);
+    fclose(f);
+    if (got != n) { tk_free0(buf); return NULL; }
+    *out_len = n;
+    return buf;
+}
+
+// Load one dep TProgram from its .tkl in packages/<dep>-*.tkl (mirrors project.tks::load_dep_program).
+// On success *out receives the deserialized TProgram and true is returned.
+// On failure a diagnostic is printed to stderr and false is returned.
+static bool load_dep_program(const char *dep, tk_tprogram *out) {
+    // List packages/ directory to find <dep>-*.tkl.
+    char pkgdir[256];
+    snprintf(pkgdir, sizeof pkgdir, "packages");
+    DIR *d = opendir(pkgdir);
+    if (d == NULL) {
+        fprintf(stderr, "teko: dep '%s': packages/ directory not found — place .tkl packages in packages/\n", dep);
+        return false;
+    }
+    size_t dlen = strlen(dep);
+    char tkl_path[4096]; tkl_path[0] = '\0';
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        size_t n = strlen(e->d_name);
+        // Must start with <dep>- and end with .tkl
+        if (n < dlen + 5) continue;   // at least "dep-x.tkl"
+        if (memcmp(e->d_name, dep, dlen) != 0) continue;
+        if (e->d_name[dlen] != '-') continue;
+        if (n < 4 || strcmp(e->d_name + n - 4, ".tkl") != 0) continue;
+        snprintf(tkl_path, sizeof tkl_path, "packages/%s", e->d_name);
+        break;
+    }
+    closedir(d);
+
+    if (tkl_path[0] == '\0') {
+        fprintf(stderr, "teko: dep '%s': package not found (looked in packages/)\n", dep);
+        return false;
+    }
+
+    // Read the .tkl as raw bytes.
+    size_t tkl_len = 0;
+    unsigned char *tkl_bytes = read_file_bytes(tkl_path, &tkl_len);
+    if (tkl_bytes == NULL) {
+        fprintf(stderr, "teko: dep '%s': cannot read .tkl file '%s'\n", dep, tkl_path);
+        return false;
+    }
+
+    // Unzip — find <dep>.tkb entry.
+    size_t nentries = 0;
+    tk_zip_entry *entries = tk_read_zip(tkl_bytes, tkl_len, &nentries);
+    tk_free0(tkl_bytes);
+
+    // Build the expected .tkb name: <dep>.tkb
+    char tkb_name[256];
+    snprintf(tkb_name, sizeof tkb_name, "%s.tkb", dep);
+
+    const tk_byte *tkb_data = NULL; size_t tkb_len = 0;
+    for (size_t i = 0; i < nentries; i += 1) {
+        size_t nn = entries[i].name.len;
+        if (nn == strlen(tkb_name) && memcmp(entries[i].name.ptr, tkb_name, nn) == 0) {
+            tkb_data = entries[i].data.ptr;
+            tkb_len  = entries[i].data.len;
+            break;
+        }
+    }
+    if (tkb_data == NULL) {
+        fprintf(stderr, "teko: dep '%s': .tkl does not contain %s\n", dep, tkb_name);
+        tk_free0(entries);
+        return false;
+    }
+
+    // Deserialize the TProgram from the .tkb bytes.
+    tk_tprogram_result pr = tk_deserialize_program(tkb_data, tkb_len);
+    tk_free0(entries);   // frees name+data copies
+    if (!pr.ok) {
+        fprintf(stderr, "teko: dep '%s': .tkb deserialization failed: %s\n", dep, pr.as.error.message);
+        return false;
+    }
+    *out = pr.as.value;
+    return true;
+}
+
+// A simple growable tk_titem buffer — local to driver.c, mirrors TK_LIST(tk_titem, …) logic.
+typedef struct { tk_titem *ptr; size_t len; size_t cap; } driver_titem_list;
+static driver_titem_list driver_titem_push(driver_titem_list b, tk_titem it) {
+    if (b.len == b.cap) {
+        size_t nc = b.cap ? b.cap * 2 : 8;
+        b.ptr = (tk_titem *)tk_realloc0(b.ptr, nc * sizeof(tk_titem));
+        b.cap = nc;
+    }
+    b.ptr[b.len++] = it;
+    return b;
+}
+
+// Load all deps listed in the manifest and return a TProgram with all their items concatenated.
+// Mirrors project.tks::load_deps_program. Returns ok=true (with empty program) when m.deps is empty.
+static bool load_deps_tprogram(tk_manifest m, tk_tprogram *out) {
+    driver_titem_list all = { .ptr = NULL, .len = 0, .cap = 0 };
+    for (size_t i = 0; i < m.deps.len; i += 1) {
+        char dep_cstr[256];
+        tk_str dep = m.deps.ptr[i];
+        if (dep.len >= sizeof dep_cstr) {
+            fprintf(stderr, "teko: dep name too long\n");
+            return false;
+        }
+        memcpy(dep_cstr, dep.ptr, dep.len);
+        dep_cstr[dep.len] = '\0';
+
+        tk_tprogram dep_prog;
+        if (!load_dep_program(dep_cstr, &dep_prog)) return false;
+        for (size_t j = 0; j < dep_prog.nitems; j += 1)
+            all = driver_titem_push(all, dep_prog.items[j]);
+    }
+    *out = (tk_tprogram){ .items = all.ptr, .nitems = all.len };
+    return true;
+}
+
 // frontend_body — the front-end AFTER the chdir (manifest → discover → assemble → check),
 // operating in the CURRENT directory. Split out so the D4 gate can retry it WITHOUT tests after a
 // test-assembly failure on the SAME chdir (a second chdir to a relative project dir would fail).
@@ -556,8 +693,17 @@ static int frontend_body(const char *dir, tk_tprogram *out, tk_manifest *manifes
     // --- C7.1f: keep only the target OS's `#os("…")` function variants (conditional compilation) ---
     program = prune_os(program, target_os_of(m));
 
+    // --- C7.10: load dep .tkl packages and build a dep TProgram (mirrors project.tks::load_deps_program) ---
+    tk_tprogram dep_prog = { .items = NULL, .nitems = 0 };
+    if (m.deps.len > 0) {
+        if (!load_deps_tprogram(m, &dep_prog))
+            return quiet ? 1 : 1;   // error already printed by load_dep_program
+    }
+
     // --- check the WHOLE merged program (M.1 — whole program checked together) ---
-    tk_tprogram_result checked = tk_type_program(program);
+    // With deps: use tk_type_program_with_deps to inject dep signatures before type-checking.
+    // Without deps (dep_prog.nitems == 0): falls back to standard type-checking.
+    tk_tprogram_result checked = tk_type_program_with_deps(program, dep_prog);
     if (!checked.ok) return quiet ? 1 : fail_diag(checked.as.error);   // (C1.8) located header + snippet/caret
 
     if (!quiet)

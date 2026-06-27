@@ -421,6 +421,64 @@ static tk_error surface_at(tk_str file, uint32_t line, uint32_t col, tk_error in
     return e;
 }
 
+// C7.10 — dep-aware variant of tk_type_program. Pre-seeds the collected environment from
+// dep_prog, then collects and type-checks `program`. Dep items are prepended to the result
+// TProgram so subsequent passes (codegen, VM) see the full program. Mirrors typer.tks::type_program_with_deps.
+tk_tprogram_result tk_type_program_with_deps(tk_program program, tk_tprogram dep_prog) {
+    // Seed from dep (adds dep type decls + fn signatures).
+    tk_collected_result seed_r = tk_seed_from_dep(dep_prog, tk_type_table_empty(), tk_env_empty());
+    if (!seed_r.ok) return (tk_tprogram_result){ .ok = false, .as.error = seed_r.as.error };
+
+    // Collect from the project on top of the seed.
+    tk_collected_result c = tk_collect_with_seed(program, seed_r.as.value);
+    if (!c.ok) return (tk_tprogram_result){ .ok = false, .as.error = c.as.error };
+
+    // W-vis-enforce: only the project's items (dep was checked when built).
+    { const char *why = tk_check_modules(program, c.as.value.types);
+      if (why) return (tk_tprogram_result){ .ok = false, .as.error = tk_error_make(why) }; }
+
+    tk_titem_list items = tk_titem_list_empty();
+    tk_tstmt_list mainbody = tk_tstmt_list_empty();
+    tk_env cur = c.as.value.env;
+
+    for (size_t i = 0; i < program.len; i += 1) {
+        tk_item it = program.items[i];
+        cur.cur_ns = it.namespace;
+        uint32_t line = it.tag == TK_ITEM_FUNCTION  ? it.as.function.line
+                      : it.tag == TK_ITEM_TYPE_DECL ? it.as.type_decl.line : 0;
+        uint32_t col  = it.tag == TK_ITEM_FUNCTION  ? it.as.function.col
+                      : it.tag == TK_ITEM_TYPE_DECL ? it.as.type_decl.col : 0;
+        if (it.tag == TK_ITEM_STATEMENT) {
+            tk_typed_stmt_result ts = tk_type_statement(it.as.statement, cur, c.as.value.types);
+            if (!ts.ok) return (tk_tprogram_result){ .ok = false, .as.error = surface_at(it.file, line, col, ts.as.error) };
+            cur = ts.as.value.env;
+            items = tk_titem_list_push(items, (tk_titem){ .tag = TK_TITEM_STATEMENT, .as.statement = ts.as.value.node });
+            mainbody = tk_tstmt_list_push(mainbody, ts.as.value.node);
+            continue;
+        }
+        tk_env ienv = c.as.value.env; ienv.cur_ns = it.namespace;
+        tk_titem_result ti = tk_type_item(it, ienv, c.as.value.types);
+        if (!ti.ok) return (tk_tprogram_result){ .ok = false, .as.error = surface_at(it.file, line, col, ti.as.error) };
+        items = tk_titem_list_push(items, ti.as.value);
+    }
+    { tk_str seen[TK_MAX_LABELS]; size_t nseen = 0;
+      const char *why = check_labels(mainbody.ptr, mainbody.len, NULL, false, seen, &nseen);
+      if (why) return (tk_tprogram_result){ .ok = false, .as.error = tk_error_make(why) }; }
+
+    // Prepend dep items to the result (dep + project together).
+    tk_titem_list all = tk_titem_list_empty();
+    for (size_t i = 0; i < dep_prog.nitems; i += 1)
+        all = tk_titem_list_push(all, dep_prog.items[i]);
+    for (size_t i = 0; i < items.len; i += 1)
+        all = tk_titem_list_push(all, items.ptr[i]);
+    tk_free0(items.ptr);
+
+    tk_tprogram tp = { .items = all.ptr, .nitems = all.len };
+    { tk_error ae = tk_analyze_program(tp);
+      if (ae.message) return (tk_tprogram_result){ .ok = false, .as.error = ae }; }
+    return (tk_tprogram_result){ .ok = true, .as.value = tp };
+}
+
 tk_tprogram_result tk_type_program(tk_program program) {
     tk_collected_result c = tk_collect(program);
     if (!c.ok) return (tk_tprogram_result){ .ok = false, .as.error = c.as.error };

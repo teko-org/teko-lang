@@ -130,6 +130,108 @@ fn prune_os(program: parser::Program, tos: str) -> parser::Program {
     parser::Program { items = kept }
 }
 
+// =========================================================================
+// C7.10 — DEP LOADING: load each dep's .tkl package, extract its .tkb, deserialize
+// the TProgram, and return all dep items concatenated. The dep items are prepended to
+// the project's own items so they land in scope before the main code is type-checked.
+// Search strategy: look for `<dep>-*.tkl` in a `packages/` subdirectory of the project
+// root (cwd after the front-end chdir). If not found, return an honest error.
+// =========================================================================
+
+// load_dep_program — load one dep by package name, returning its TProgram.
+// Searches `packages/<name>-*.tkl` (takes the first match) in the current directory.
+fn load_dep_program(dep: str) -> checker::TProgram | error {
+    // List the packages/ directory to find `<dep>-*.tkl`.
+    let entries = match teko::fs::list_dir("packages") {
+        []str as e => e
+        error      => return error { message = teko::str::concat3("teko: dep '", dep, "': packages/ directory not found — place .tkl packages in packages/") }
+    }
+    mut tkl_path = ""
+    mut ei: u64 = 0
+    loop {
+        if ei >= entries.len { break }
+        let e = entries[ei]
+        // Match `<dep>-*.tkl` — must start with `<dep>-` and end with `.tkl`.
+        let prefix = teko::str::concat(dep, "-")
+        let has_prefix = e.len >= prefix.len && teko::str::slice_to(e, prefix.len) == prefix
+        if has_prefix && teko::str::ends_with(e, ".tkl") {
+            tkl_path = teko::str::concat("packages/", e)
+            break
+        }
+        ei++
+    }
+    if tkl_path == "" {
+        return error { message = teko::str::concat3("teko: dep '", dep, "': package not found (looked in packages/)") }
+    }
+
+    // Read the .tkl bytes (the file is a ZIP archive — binary, not UTF-8, but read_file
+    // returns the raw bytes as a str; we treat each byte via s[i]).
+    let raw_str = match teko::io::read_file(tkl_path) {
+        str as s => s
+        error    => return error { message = teko::str::concat3("teko: dep '", dep, "': cannot read .tkl file") }
+    }
+    // Convert str → []byte (s[i] → byte).
+    mut raw: []byte = teko::list::empty()
+    mut ri: u64 = 0
+    loop {
+        if ri >= raw_str.len { break }
+        raw = teko::list::push(raw, raw_str[ri])
+        ri++
+    }
+
+    // Unzip — find the `<dep>.tkb` entry.
+    let zip_entries = match compress::read_zip(raw) {
+        []compress::ZipEntry as es => es
+        error as e                 => return error { message = teko::str::concat3("teko: dep '", dep, teko::str::concat("': bad .tkl (ZIP parse error): ", e.message)) }
+    }
+    let tkb_name = teko::str::concat(dep, ".tkb")
+    mut tkb_data: []byte = teko::list::empty()
+    mut found_tkb = false
+    mut zi: u64 = 0
+    loop {
+        if zi >= zip_entries.len { break }
+        if zip_entries[zi].name == tkb_name {
+            tkb_data = zip_entries[zi].data
+            found_tkb = true
+            break
+        }
+        zi++
+    }
+    if !found_tkb {
+        return error { message = teko::str::concat3("teko: dep '", dep, teko::str::concat("': .tkl does not contain ", teko::str::concat(tkb_name, ""))) }
+    }
+
+    // Deserialize the TProgram from the .tkb bytes.
+    match emit::deserialize_program(tkb_data) {
+        checker::TProgram as p => p
+        error as e             => return error { message = teko::str::concat3("teko: dep '", dep, teko::str::concat("': .tkb deserialization failed: ", e.message)) }
+    }
+}
+
+// load_deps_program — load all deps listed in the manifest and return a TProgram containing
+// all their items. Returns an empty TProgram if m.deps is empty (no [dependencies] → silent skip).
+// The dep items carry their own namespaces and are injected into the type-check environment
+// via type_program_with_deps (not re-typed).
+fn load_deps_program(m: Manifest) -> checker::TProgram | error {
+    mut all_items: []checker::TItem = teko::list::empty()
+    mut di: u64 = 0
+    loop {
+        if di >= m.deps.len { break }
+        let dep_prog = match load_dep_program(m.deps[di]) {
+            checker::TProgram as p => p
+            error as e             => return e
+        }
+        mut ii: u64 = 0
+        loop {
+            if ii >= dep_prog.items.len { break }
+            all_items = teko::list::push(all_items, dep_prog.items[ii])
+            ii++
+        }
+        di++
+    }
+    checker::TProgram { items = all_items }
+}
+
 // frontend_body — the front-end AFTER the chdir (manifest → discover → assemble → check),
 // operating in the CURRENT directory. Split out so the D4 gate can retry it WITHOUT tests after a
 // test-assembly failure, on the SAME chdir (no second `teko::env::chdir`, which would fail for a
@@ -180,8 +282,16 @@ fn frontend_body(include_tests: bool, quiet: bool) -> Frontend | error {
     // --- C7.1f: keep only the target OS's `#os("…")` function variants (conditional compilation) ---
     let selected = prune_os(program, target_os(m))
 
+    // --- C7.10: load dep .tkl packages and prepend their typed items before type-checking ---
+    // The dep's TProgram items carry their own namespaces (set when they were originally checked);
+    // we pre-seed the collection environment with them so the project's code can call dep functions
+    // and reference dep types. m.deps is empty when there is no [dependencies] section → no-op.
+    let dep_prog = match load_deps_program(m) { checker::TProgram as p => p; error as e => return e }
+
     // --- check the WHOLE merged program (M.1 — whole program checked together) ---
-    let checked = match checker::type_program(selected) { checker::TProgram as c => c; error as e => return e }
+    // With deps: use type_program_with_deps to inject dep signatures before type-checking.
+    // Without deps: falls back to the standard type_program (dep_prog.items is empty).
+    let checked = match checker::type_program_with_deps(selected, dep_prog) { checker::TProgram as c => c; error as e => return e }
 
     Frontend { prog = checked, manifest = m }
 }

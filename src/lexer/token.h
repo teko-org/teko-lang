@@ -24,6 +24,7 @@ typedef enum {
     TK_TOKEN_TYPE,
     TK_TOKEN_STRUCT,
     TK_TOKEN_ENUM,
+    TK_TOKEN_FLAGS,
     TK_TOKEN_LET,
     TK_TOKEN_MUT,
     TK_TOKEN_CONST,

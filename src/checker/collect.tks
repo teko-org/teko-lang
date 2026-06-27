@@ -93,3 +93,101 @@ fn collect(program: parser::Program) -> Collected | error {
     }
     Collected { types = table; env = env }
 }
+
+// C7.10 — collect with a pre-seeded (table, env). Adds the project's type decls on top of
+// the seeded table, then adds the project's function signatures on top of the seeded env.
+// Used by type_program_with_deps to inject dep items before type-checking the project.
+fn collect_with_seed(program: parser::Program, seed: Collected) -> Collected | error {
+    // Augment the table with the project's type decls (dep types already in seed.types).
+    mut table = seed.types
+    mut i = 0
+    loop {
+        if i >= program.items.len { break }
+        match program.items[i].content {
+            parser::TypeDecl as td => {
+                table = teko::list::push(table, TypeReg { name = td.name; namespace = program.items[i].namespace; vis = td.vis; decl = td })
+            }
+            _ => {}
+        }
+        i++
+    }
+    // Augment the env with the project's function signatures (dep fns already in seed.env).
+    mut env = seed.env
+    mut j = 0
+    loop {
+        if j >= program.items.len { break }
+        match program.items[j].content {
+            parser::Function as f => {
+                let ft = match func_type(f, table) {
+                    Type as t  => t
+                    error as e => return e
+                }
+                env = define_fn(env, f.name, ft, program.items[j].namespace)
+            }
+            _ => {}
+        }
+        j++
+    }
+    Collected { types = table; env = env }
+}
+
+// C7.10 — pre-seed the collection environment from an already-typed dep TProgram.
+// Adds the dep's type declarations to `table` and the dep's function signatures to `env`.
+// This gives the project's type_program access to dep types and functions without re-typing
+// the dep's bodies (which are already verified). The dep's namespace is preserved on each entry.
+fn seed_from_dep(dep: TProgram, table: TypeTable, env: Env) -> Collected | error {
+    mut t = table
+    mut e = env
+    // Pass 1: register type declarations (so function param types can resolve against them).
+    mut i: u64 = 0
+    loop {
+        if i >= dep.items.len { break }
+        match dep.items[i] {
+            parser::TypeDecl as td => {
+                // Carry the dep item's namespace (the dep's own module path — already set when packed).
+                // find_ns_of_titem extracts it from the dep's TItem.
+                let ns = dep_item_ns(dep.items[i])
+                t = teko::list::push(t, TypeReg { name = td.name; namespace = ns; vis = td.vis; decl = td })
+            }
+            _ => {}
+        }
+        i++
+    }
+    // Pass 2: register function signatures using the now-complete type table.
+    mut j: u64 = 0
+    loop {
+        if j >= dep.items.len { break }
+        match dep.items[j] {
+            TFunction as f => {
+                // Build the Func type from the resolved return_type + param type annotations.
+                // We resolve param types now (against the merged table `t`) just like collect_funcs.
+                mut params: []Type = teko::list::empty()
+                mut pi: u64 = 0
+                loop {
+                    if pi >= f.params.len { break }
+                    let pt = match resolve_type(f.params[pi].type_ann, t) { Type as ty => ty; error as err => return err }
+                    params = teko::list::push(params, pt)
+                    pi++
+                }
+                let ft = Func { params = params; ret = f.return_type }
+                e = define_fn(e, f.name, ft, f.namespace)
+            }
+            _ => {}
+        }
+        j++
+    }
+    Collected { types = t; env = e }
+}
+
+// dep_item_ns — extract the namespace string from a TItem. TFunction carries it directly;
+// TypeDecl and UseDecl items use "" (the dep's top-level namespace) since we do not have
+// a wrapping Item here. For C7.10, type decls are the dep's public types — namespace "" is
+// fine for resolve_type (which ignores namespace; W-vis-enforce is not re-run for deps).
+fn dep_item_ns(item: TItem) -> str {
+    match item {
+        TFunction as f       => f.namespace
+        parser::TypeDecl     => ""
+        parser::UseDecl      => ""
+        TStatement           => ""
+    }
+}

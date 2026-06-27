@@ -939,13 +939,50 @@ fn emit_div_mod(buf: []byte, prog: checker::TProgram, e: checker::TExpr, b: chec
     cb(out, ")")
 }
 
-// emit_binary — a TBinary. `/` and `%` go through the checked helper (emit_div_mod);
-// everything else is plain C `(L op R)`. (C: TK_TEXPR_BINARY branch of emit_expr.)
-// NOTE (out of scope): +,-,* stay plain C — overflow guarding is DEFERRED to build
-// profiles (panic-debug / wrap-release), which do not exist yet.
+// emit_arith — C7.15: the `+`, `-`, `*` path for INTEGER prims.
+// Routes through tk_add_*/tk_sub_*/tk_mul_* helpers (teko_rt.h C7.15 block).
+// When TEKO_OVERFLOW_DEBUG is set these call tk_panic_overflow() on overflow;
+// without it they compile to the plain C operator — zero overhead.
+// Float +,-,* fall through to emit_binary's plain-C path (float overflow ≠ panic).
+// (C: the `if (bop == TK_TOKEN_PLUS || …)` block inside TK_TEXPR_BINARY.)
+fn emit_arith(buf: []byte, prog: checker::TProgram, e: checker::TExpr, b: checker::TBinary) -> []byte | error {
+    let prim = match e.type {
+        checker::Prim as p => p
+        _                  => return error { message = "codegen: arithmetic on a non-primitive type not yet supported" }
+    }
+    if !cg_prim_is_int(prim.kind) {
+        return error { message = "codegen: emit_arith called on non-integer type" }
+    }
+    let tag = match prim_int_tag(prim.kind) {
+        str as t  => t
+        error     => return error { message = "codegen: arithmetic on a non-integer primitive" }
+    }
+    let fn_prefix = if b.op == lexer::TokenKind::Plus  { "tk_add_" }
+                    else if b.op == lexer::TokenKind::Minus { "tk_sub_" }
+                    else { "tk_mul_" }
+    mut out = cb(buf, fn_prefix)
+    out = cb(out, tag)
+    out = cb(out, "(")
+    out = match emit_expr(out, prog, b.left)  { []byte as o => o; error as err => return err }
+    out = cb(out, ", ")
+    out = match emit_expr(out, prog, b.right) { []byte as o => o; error as err => return err }
+    cb(out, ")")
+}
+
+// emit_binary — a TBinary. `/` and `%` go through emit_div_mod; `+`, `-`, `*`
+// on integer prims go through emit_arith (C7.15 overflow guards); everything
+// else emits plain C `(L op R)`. (C: TK_TEXPR_BINARY branch of emit_expr.)
 fn emit_binary(buf: []byte, prog: checker::TProgram, e: checker::TExpr, b: checker::TBinary) -> []byte | error {
     if b.op == lexer::TokenKind::Slash || b.op == lexer::TokenKind::Percent {
         return emit_div_mod(buf, prog, e, b)
+    }
+    // C7.15 — +,-,* on integer prims: route through overflow-guarded helpers.
+    if b.op == lexer::TokenKind::Plus || b.op == lexer::TokenKind::Minus || b.op == lexer::TokenKind::Star {
+        let is_int_prim = match e.type {
+            checker::Prim as p => cg_prim_is_int(p.kind)
+            _                  => false
+        }
+        if is_int_prim { return emit_arith(buf, prog, e, b) }
     }
     let op = match binop_c(b.op) { str as s => s; error as err => return err }
     mut out = cb(buf, "(")

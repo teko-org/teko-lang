@@ -243,6 +243,7 @@ static tk_token_kind keyword_kind(tk_str text) {
     if (tk_str_eq_lit(text, "type"))     return TK_TOKEN_TYPE;
     if (tk_str_eq_lit(text, "struct"))   return TK_TOKEN_STRUCT;
     if (tk_str_eq_lit(text, "enum"))     return TK_TOKEN_ENUM;
+    if (tk_str_eq_lit(text, "flags"))    return TK_TOKEN_FLAGS;
     if (tk_str_eq_lit(text, "variant"))  return TK_TOKEN_VARIANT;
     if (tk_str_eq_lit(text, "let"))      return TK_TOKEN_LET;
     if (tk_str_eq_lit(text, "mut"))      return TK_TOKEN_MUT;

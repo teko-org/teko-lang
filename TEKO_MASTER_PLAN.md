@@ -84,7 +84,7 @@ compile+link gate which is now the milestone reached.
 | 4 | C↔.tks mirroring | ✅ MAINTAINED continuously — every commit mirrors its `.c`/`.h` change to the `.tks` twin (SUPREME RULE); a standing per-commit discipline, not a pending sweep | Pay down mirror debt before more code lands |
 | 5 | Definite-assignment / init analysis | ✅ **CLOSED** — `src/checker/initanalysis.{tks,c,h}` runs last in `type_program`: **use-before-init is STRUCTURAL**; **unused-local → ERROR** (snippet+caret); **unused-private-fn → WARNING** via stderr warnings channel. Both twins lockstep; gate GREEN. | Real checker gap; lands the warnings channel |
 | 6 | Finish self-host → working `teko .` | ✅ **COMPLETE** — exit criteria met: (1) FULL SELF-HOSTING (`selfhost` gate → `bin/teko`, 0 cc errors, 902 items); (2) VM==native regression set (5/6/106); (3) C6.7+C6.8 spread-into-literal `[..xs, x]` ✅ (carried into Phase 7, completed R7.6). | The gating milestone for everything downstream |
-| 7 | Host independence | 🔶 **ACTIVE** — extern/FFI (C7.1a–i, C7.1k, C7.1m) ✅; D2/D3/D4 test gate ✅; `.tkb` program codec C7.16 ✅; `-o <dir>` ✅; main-rule C7.9 ✅; tk_str_eq C7.13 ✅; TK_RT_LIST C7.14 ✅; spread C6.7+C6.8 ✅; host ns files C7.2–5 ✅; `.tkl` ZIP C7.12 ✅. **Remaining (ordered): C7.15** (W1), **C7.10** (W1), **C7.17** (W1), **E2-NATIVE** (W2), **C1.7-CAST** (W3), **`defer` C7.18** (W5), **C7.1j** (W6 CI — LAST in Phase 7). | FFI + host surfaces + VM test gate + project/output/pack |
+| 7 | Host independence | 🔶 **ACTIVE** — extern/FFI (C7.1a–i, C7.1k, C7.1m) ✅; D2/D3/D4 test gate ✅; `.tkb` program codec C7.16 ✅; `-o <dir>` ✅; main-rule C7.9 ✅; tk_str_eq C7.13 ✅; TK_RT_LIST C7.14 ✅; spread C6.7+C6.8 ✅; host ns files C7.2–5 ✅; `.tkl` ZIP C7.12 ✅; overflow-debug C7.15 ✅; pre-linker C7.10 ✅; driver.tks C7.17 ✅; flags-kw C8.1 ✅. **Remaining (ordered): E2-NATIVE** (W2), **C1.7-CAST** (W3), **`defer` C7.18** (W5), **C7.1j** (W6 CI — LAST in Phase 7). | FFI + host surfaces + VM test gate + project/output/pack |
 | 8 | FLAGS | ⬜ not started | Bitflag enums (spec frozen) |
 | 9 | SEC | ⬜ not started | SAST + capability audit, after corrections |
 | 10 | Evolution S1–S10 | ⬜ not started | Post-self-host campaign (arenas → generics → closures → scope/ref → collections → concurrency+sync+routines → async/await) |
@@ -425,10 +425,10 @@ into **rounds** (parallel waves). The goal is **maximum agent concurrency** with
 | **C7.3** `teko::io` namespace file | *(new `src/io/io.tks`)* | C7.1b–d | ✅ DONE (R7.7) — `src/io/io.tks` with `pub extern fn println/eprintln/print/eprint/write/ewrite/read_file/write_file/write_file_bytes`; seeds removed. |
 | **C7.4** `teko::fs` namespace file | *(new `src/fs/fs.tks`)* | C7.1b–d | ✅ DONE (R7.7) — `src/fs/fs.tks` with `pub extern fn list_dir/mkdir`; seeds removed. |
 | **C7.5** `teko::process` namespace file | *(new `src/process/process.tks`)* | C7.1b–d | ✅ DONE (R7.7) — `src/process/process.tks` with `pub extern fn run`; seeds removed. |
-| **C7.15** B3b overflow-debug panic guard wiring in codegen | `cg` | — | ⬜ TODO |
+| **C7.15** B3b overflow-debug panic guard wiring in codegen | `cg` | — | ✅ DONE — `tk_add_*/tk_sub_*/tk_mul_*` inline helpers (u8..u128, i8..i128) added to `teko_rt.h`; `#ifdef TEKO_OVERFLOW_DEBUG` uses `__builtin_*_overflow` + `tk_panic_overflow()`; else plain C (zero overhead). Codegen (`codegen.c`+`codegen.tks`) routes `+`,`-`,`*` on integer prims through these helpers; float +,-,* unchanged. 172 tests pass; regressions match_pattern_bindings==5, optionals==6 hold. |
 | **C7.12** A8 `package` output → `.tkl` (ZIP-STORE of `.tkh`+`.tkb`+`.tsym`, named `<name>-<version>[-suffix].tkl`) + pure-Teko ZIP-STORE writer (CRC32 + local/central/EOCD headers, deterministic timestamp, twins). C7.16 ✅ unblocks the real `.tkb` payload; update the honest-stop message in project.tks/driver.c | `build`, `tkb` | C7.16 ✅, C7.1m ✅ | ✅ DONE (R7.8) — `src/compress/compress.tks` + `compress.c` (namespace `teko::compress`; reusable by any Teko project); `write_zip(entries: []ZipEntry) -> []byte`; CRC-32 table-driven; deterministic. Backend wired: `emit_program` → `.tkh`, `serialize_program` → `.tkb`, `tk_emit_tsym` → `.tsym`; all three ZIPped into `<out>/<name>-<version>.tkl`. `write_file_bytes(path, []byte)` added to `teko::io` + `teko_rt`. `type_table_of` added to checker/collect. Smoke-tested: valid ZIP, `['pkg.tkh','pkg.tkb','pkg.tsym']`. 172 tests. |
-| **C7.10** A6 pre-linker — load each dep (native `.a`/`.so` OR `.tkl`'s `.tkb`) → merge typed trees → check app BEFORE emit; the merged `.tkb` is the dep's OWN tree (never re-inline deps) | `tkb`, `build`, `res` | C7.12, C7.16 ✅, C7.1m ✅ | ⬜ TODO |
-| **C7.17** M2 `driver.tks` fully materialized — replace seed scope-lookup paths with real `use teko::env`/`teko::io`/`teko::fs`/`teko::process` calls | *(driver)* | C7.2–C7.5 | ⬜ TODO |
+| **C7.10** A6 pre-linker — load each dep (native `.a`/`.so` OR `.tkl`'s `.tkb`) → merge typed trees → check app BEFORE emit; the merged `.tkb` is the dep's OWN tree (never re-inline deps) | `tkb`, `build`, `res` | C7.12, C7.16 ✅, C7.1m ✅ | ✅ DONE (W1) — `read_zip` added to `teko::compress` (ZIP reader); `seed_from_dep`+`collect_with_seed` in `checker/collect`; `type_program_with_deps` in `checker/typer`; `load_dep_program`/`load_deps_program` in `project.tks`; `frontend_body` now seeds typed tree from dep `.tkb` before checking; honest error if `packages/<dep>-*.tkl` not found. All C+.tks twins. 172 tests green. |
+| **C7.17** M2 `driver.tks` fully materialized — replace seed scope-lookup paths with real `use teko::env`/`teko::io`/`teko::fs`/`teko::process` calls | *(driver)* | C7.2–C7.5 | ✅ DONE (W1) — stale "NOT YET SEED-COMPILABLE" header updated; `use teko::env/io/fs/process` added; thin `read_file` wrapper removed + 4 call sites updated to `teko::io::read_file` directly; stale "deferred"/"pending" comments fixed throughout driver.tks + driver.c. 172 tests green. |
 | **E2-NATIVE** native `error` struct in codegen — codegen currently lowers `error` to its message `tk_str`; `err_loc`/`err_typed` builtins are no-ops in native (`error.line/col`→0, `error.file/expected/actual`→empty). Goal: represent native `error` as a C struct with all C1.3 fields (`message/file/line/col/expected/actual`); emit struct init in codegen; `err_loc`/`err_typed` return the real fields so native matches VM. Deferred from Phase 1 E2 native-degraded carve-out; now has Phase 7 codegen infrastructure to land on. | `rt`, `cg` (+ `.tks`) | C7.15, C1.3 ✅ | ⬜ TODO |
 | **C1.7-CAST** native CAST positioning — the 48 `tk_to_*` helpers in `teko_rt` don't carry position; a cast panic prints no `file:line`. Thread a global panic-loc (set by codegen at the call site) so a native cast panic is identical to the VM. Deferred from C1.7. | `rt`, `cg` (+ `.tks`) | E2-NATIVE | ⬜ TODO |
 | **C7.18** `defer` — scoped deferred cleanup. Syntax: `defer { stmts }` (Zig-style; executes LIFO at ANY scope exit — normal return, early `break`, or panic). Full pipeline: lexer `defer` keyword; AST `DeferStmt { block }`; parser in `parse_stmt`; checker types the block (void context, no value); codegen inserts the block at ALL scope-exit points of the enclosing function body (C `__attribute__((cleanup))` or manual label+goto pattern); VM maintains a deferred-stack per call frame, pops+executes on frame exit; TKB serializes `DeferStmt`. | `L`, `ast`, `P`, `chk`, `cg`, `vm`, `tkb` (+ all `.tks`) | C1.7-CAST ✅ (codegen stable) | ⬜ TODO |
@@ -450,9 +450,9 @@ into **rounds** (parallel waves). The goal is **maximum agent concurrency** with
 - **R7.8** ✅ `{C7.12}` — `.tkl` ZIP-STORE output; `teko::compress` reusable; `write_file_bytes` added. 172 tests.
 
 **Remaining Phase 7 crumbs — now scheduled in the cross-phase master sequence (see below):**
-- **C7.15** → cross-phase **W1** (parallel with C7.10, C7.17, C8.1)
-- **C7.10** → cross-phase **W1** (parallel with C7.15, C7.17, C8.1)
-- **C7.17** → cross-phase **W1** (parallel with C7.15, C7.10, C8.1)
+- **C7.15** ✅ → cross-phase **W1** (parallel with C7.10, C7.17, C8.1)
+- **C7.10** ✅ → cross-phase **W1** (parallel with C7.15, C7.17, C8.1)
+- **C7.17** ✅ → cross-phase **W1** (parallel with C7.15, C7.10, C8.1)
 - **E2-NATIVE** → cross-phase **W2** (after C7.15; parallel with C8.2)
 - **C1.7-CAST** → cross-phase **W3** (after E2-NATIVE; parallel with C8.3/C8.5/C8.6)
 - **C7.18** (`defer`) → cross-phase **W5** (solo wave — owns all single-owner files; after C1.7-CAST ✅)
@@ -460,9 +460,9 @@ into **rounds** (parallel waves). The goal is **maximum agent concurrency** with
 
 ## Phase 8 — FLAGS
 
-| Crumb | Owns | Dep |
-|-------|------|-----|
-| **C8.1** `flags` keyword | `L` | — |
+| Crumb | Owns | Dep | Status |
+|-------|------|-----|--------|
+| **C8.1** `flags` keyword | `L` | — | ✅ DONE (W1) — `TK_TOKEN_FLAGS` added to `token.h`+`token.tks`; `"flags"` added to `keyword_kind()` in `lexer.c`+`lexer.tks`. 172 tests green. |
 | **C8.2** flags decl + AST | `ast`, `P` | C8.1 |
 | **C8.3** checker: power-of-2 auto-assign + u128 size guard + bitwise typing + helper resolve | `chk`, `collect`, `res` | C8.2 |
 | **C8.4** codegen: emit u128-fitting uint + bitwise (no shift) + helpers | `cg` | C8.2 |
@@ -546,10 +546,10 @@ start until the previous wave's integration gate passes: **build green + VM==nat
 
 | Wave | Crumbs (parallel within wave) | Files owned | Width | Gate before next wave |
 |------|-------------------------------|-------------|-------|----------------------|
-| **W1** | **C7.15** overflow-debug panic guard (codegen) | `cg` | | |
-| | **C7.10** pre-linker — load dep `.tkl`/`.tkb` → merge typed trees → check app pre-emit | `tkb`, `build`, `res` | | |
-| | **C7.17** driver.tks materialized — replace seed lookups with `use teko::env/io/fs/process` | `driver` | | |
-| | **C8.1** `flags` keyword (lexer) | `L` | **4** | build green + VM==native |
+| ~~**W1**~~ ✅ | ~~**C7.15** overflow-debug panic guard (codegen)~~ ✅ | `cg` | | |
+| | ~~**C7.10** pre-linker — load dep `.tkl`/`.tkb` → merge typed trees → check app pre-emit~~ ✅ | `tkb`, `build`, `res` | | |
+| | ~~**C7.17** driver.tks materialized — replace seed lookups with `use teko::env/io/fs/process`~~ ✅ | `driver` | | |
+| | ~~**C8.1** `flags` keyword (lexer)~~ ✅ | `L` | **4** | ✅ build green + VM==native (172 tests; regressions 5/6) |
 | **W2** | **E2-NATIVE** native `error` as C struct — `err_loc`/`err_typed` work in native; `error.line/col` → real values *(deps: C7.15 ✅)* | `rt`, `cg` | | |
 | | **C8.2** `flags` decl + AST + parser *(deps: C8.1 ✅)* | `ast`, `P` | **2** | build green + VM==native |
 | **W3** | **C1.7-CAST** native CAST positioning — global panic-loc in `tk_to_*` helpers *(deps: E2-NATIVE ✅)* | `rt`, `cg` | | |

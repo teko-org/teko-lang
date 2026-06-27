@@ -262,17 +262,21 @@ _Noreturn void tk_panic_oob_at(uint32_t line, uint32_t col);
 
 // =========================================================================
 // F3 runtime guards (M.1 — fail loud, never silent corruption / metal hazard):
-// the backend emits calls to these in place of raw C `/`, `%`, and narrowing
-// casts. All are SINGLE-EVALUATION (each argument is computed once by the caller
-// and passed by value), so codegen never duplicates an operand subtree.
+// the backend emits calls to these in place of raw C `/`, `%`, `+`, `-`, `*`
+// (integer only), and narrowing casts. All are SINGLE-EVALUATION (each argument
+// is computed once by the caller and passed by value), so codegen never
+// duplicates an operand subtree.
 //
 // COVERAGE RULE (M.3): conversion/division possibility is validated at RUNTIME;
 // impossibility -> PANIC. Constants out of range are the checker's job (compile
 // error) and are out of scope here.
 //
-// NOTE (out of scope): overflow guarding for +,-,* is DEFERRED — it is
-// profile-dependent (panic in debug / wrap in release) and build PROFILES do not
-// exist yet. tk_panic_overflow() above exists for that future wiring.
+// C7.15 — OVERFLOW GUARDS for +, -, * on INTEGER types:
+// When TEKO_OVERFLOW_DEBUG is defined the helpers use __builtin_*_overflow
+// (GCC/Clang) and call tk_panic_overflow() if overflow is detected.
+// Without the flag they reduce to the plain C operation — zero overhead,
+// identical to the old bare-operator path. Float +,-,* are NOT guarded
+// (float overflow is not a Teko panic; only int arithmetic is guarded here).
 // =========================================================================
 
 // --- checked integer division / modulo: panic on a zero divisor (no UB / SIGFPE) ---
@@ -299,6 +303,92 @@ static inline int16_t  tk_mod_i16(int16_t  a, int16_t  b){ if (b == 0) tk_panic_
 static inline int32_t  tk_mod_i32(int32_t  a, int32_t  b){ if (b == 0) tk_panic_div0(); return a % b; }
 static inline int64_t  tk_mod_i64(int64_t  a, int64_t  b){ if (b == 0) tk_panic_div0(); return a % b; }
 static inline __int128 tk_mod_i128(__int128 a, __int128 b){ if (b == 0) tk_panic_div0(); return a % b; }
+
+// --- C7.15 overflow-guarded integer +, -, *: panic when TEKO_OVERFLOW_DEBUG is set ---
+// One helper per signed/unsigned width (u8..u128, i8..i128). Float +,-,* are NOT here —
+// float overflow is not a Teko error. Bool is not an arithmetic target.
+// __builtin_add/sub/mul_overflow work on any integer type in GCC/Clang; the generic form
+// `__builtin_add_overflow(a, b, &r)` selects the right overflow semantics for the type.
+#ifdef TEKO_OVERFLOW_DEBUG
+static inline uint8_t  tk_add_u8 (uint8_t  a, uint8_t  b){ uint8_t  r; if (__builtin_add_overflow(a,b,&r)) tk_panic_overflow(); return r; }
+static inline uint16_t tk_add_u16(uint16_t a, uint16_t b){ uint16_t r; if (__builtin_add_overflow(a,b,&r)) tk_panic_overflow(); return r; }
+static inline uint32_t tk_add_u32(uint32_t a, uint32_t b){ uint32_t r; if (__builtin_add_overflow(a,b,&r)) tk_panic_overflow(); return r; }
+static inline uint64_t tk_add_u64(uint64_t a, uint64_t b){ uint64_t r; if (__builtin_add_overflow(a,b,&r)) tk_panic_overflow(); return r; }
+static inline int8_t   tk_add_i8 (int8_t   a, int8_t   b){ int8_t   r; if (__builtin_add_overflow(a,b,&r)) tk_panic_overflow(); return r; }
+static inline int16_t  tk_add_i16(int16_t  a, int16_t  b){ int16_t  r; if (__builtin_add_overflow(a,b,&r)) tk_panic_overflow(); return r; }
+static inline int32_t  tk_add_i32(int32_t  a, int32_t  b){ int32_t  r; if (__builtin_add_overflow(a,b,&r)) tk_panic_overflow(); return r; }
+static inline int64_t  tk_add_i64(int64_t  a, int64_t  b){ int64_t  r; if (__builtin_add_overflow(a,b,&r)) tk_panic_overflow(); return r; }
+// i128/u128: no standard builtin for 128-bit; use manual range-check.
+static inline unsigned __int128 tk_add_u128(unsigned __int128 a, unsigned __int128 b){ unsigned __int128 r = a + b; if (r < a) tk_panic_overflow(); return r; }
+static inline __int128 tk_add_i128(__int128 a, __int128 b){ __int128 r = a + b; if (((a ^ r) & (b ^ r)) < 0) tk_panic_overflow(); return r; }
+
+static inline uint8_t  tk_sub_u8 (uint8_t  a, uint8_t  b){ uint8_t  r; if (__builtin_sub_overflow(a,b,&r)) tk_panic_overflow(); return r; }
+static inline uint16_t tk_sub_u16(uint16_t a, uint16_t b){ uint16_t r; if (__builtin_sub_overflow(a,b,&r)) tk_panic_overflow(); return r; }
+static inline uint32_t tk_sub_u32(uint32_t a, uint32_t b){ uint32_t r; if (__builtin_sub_overflow(a,b,&r)) tk_panic_overflow(); return r; }
+static inline uint64_t tk_sub_u64(uint64_t a, uint64_t b){ uint64_t r; if (__builtin_sub_overflow(a,b,&r)) tk_panic_overflow(); return r; }
+static inline int8_t   tk_sub_i8 (int8_t   a, int8_t   b){ int8_t   r; if (__builtin_sub_overflow(a,b,&r)) tk_panic_overflow(); return r; }
+static inline int16_t  tk_sub_i16(int16_t  a, int16_t  b){ int16_t  r; if (__builtin_sub_overflow(a,b,&r)) tk_panic_overflow(); return r; }
+static inline int32_t  tk_sub_i32(int32_t  a, int32_t  b){ int32_t  r; if (__builtin_sub_overflow(a,b,&r)) tk_panic_overflow(); return r; }
+static inline int64_t  tk_sub_i64(int64_t  a, int64_t  b){ int64_t  r; if (__builtin_sub_overflow(a,b,&r)) tk_panic_overflow(); return r; }
+static inline unsigned __int128 tk_sub_u128(unsigned __int128 a, unsigned __int128 b){ if (a < b) tk_panic_overflow(); return a - b; }
+static inline __int128 tk_sub_i128(__int128 a, __int128 b){ __int128 r = a - b; if (((a ^ b) & (a ^ r)) < 0) tk_panic_overflow(); return r; }
+
+static inline uint8_t  tk_mul_u8 (uint8_t  a, uint8_t  b){ uint8_t  r; if (__builtin_mul_overflow(a,b,&r)) tk_panic_overflow(); return r; }
+static inline uint16_t tk_mul_u16(uint16_t a, uint16_t b){ uint16_t r; if (__builtin_mul_overflow(a,b,&r)) tk_panic_overflow(); return r; }
+static inline uint32_t tk_mul_u32(uint32_t a, uint32_t b){ uint32_t r; if (__builtin_mul_overflow(a,b,&r)) tk_panic_overflow(); return r; }
+static inline uint64_t tk_mul_u64(uint64_t a, uint64_t b){ uint64_t r; if (__builtin_mul_overflow(a,b,&r)) tk_panic_overflow(); return r; }
+static inline int8_t   tk_mul_i8 (int8_t   a, int8_t   b){ int8_t   r; if (__builtin_mul_overflow(a,b,&r)) tk_panic_overflow(); return r; }
+static inline int16_t  tk_mul_i16(int16_t  a, int16_t  b){ int16_t  r; if (__builtin_mul_overflow(a,b,&r)) tk_panic_overflow(); return r; }
+static inline int32_t  tk_mul_i32(int32_t  a, int32_t  b){ int32_t  r; if (__builtin_mul_overflow(a,b,&r)) tk_panic_overflow(); return r; }
+static inline int64_t  tk_mul_i64(int64_t  a, int64_t  b){ int64_t  r; if (__builtin_mul_overflow(a,b,&r)) tk_panic_overflow(); return r; }
+// u128 mul overflow: detect via division (no wider type available).
+static inline unsigned __int128 tk_mul_u128(unsigned __int128 a, unsigned __int128 b){ if (a != 0 && b > ((unsigned __int128)-1)/a) tk_panic_overflow(); return a * b; }
+// i128 mul overflow: unsigned-magnitude check with sign reconstruction.
+static inline __int128 tk_mul_i128(__int128 a, __int128 b){
+    unsigned __int128 ua = (a >= 0) ? (unsigned __int128)a : (unsigned __int128)(-a);
+    unsigned __int128 ub = (b >= 0) ? (unsigned __int128)b : (unsigned __int128)(-b);
+    // Signed max magnitude is 2^127-1 for same-sign and 2^127 for mixed-sign (INT128_MIN).
+    // Use 2^127 as the cap: if ua*ub > 2^127 it always overflows (mixed yields INT128_MIN at equality).
+    unsigned __int128 cap = (unsigned __int128)1 << 127;
+    if (ua != 0 && ub > cap / ua) tk_panic_overflow();
+    // Special case: ua==2^127 and ub==1 is valid only when result == INT128_MIN.
+    if (ua == cap && ub == 1 && (a > 0 || b > 0)) tk_panic_overflow();
+    return a * b;
+}
+#else  // !TEKO_OVERFLOW_DEBUG — plain C, zero overhead, identical to old bare-operator path
+static inline uint8_t  tk_add_u8 (uint8_t  a, uint8_t  b){ return (uint8_t )(a + b); }
+static inline uint16_t tk_add_u16(uint16_t a, uint16_t b){ return (uint16_t)(a + b); }
+static inline uint32_t tk_add_u32(uint32_t a, uint32_t b){ return a + b; }
+static inline uint64_t tk_add_u64(uint64_t a, uint64_t b){ return a + b; }
+static inline unsigned __int128 tk_add_u128(unsigned __int128 a, unsigned __int128 b){ return a + b; }
+static inline int8_t   tk_add_i8 (int8_t   a, int8_t   b){ return (int8_t )(a + b); }
+static inline int16_t  tk_add_i16(int16_t  a, int16_t  b){ return (int16_t)(a + b); }
+static inline int32_t  tk_add_i32(int32_t  a, int32_t  b){ return a + b; }
+static inline int64_t  tk_add_i64(int64_t  a, int64_t  b){ return a + b; }
+static inline __int128 tk_add_i128(__int128 a, __int128 b){ return a + b; }
+
+static inline uint8_t  tk_sub_u8 (uint8_t  a, uint8_t  b){ return (uint8_t )(a - b); }
+static inline uint16_t tk_sub_u16(uint16_t a, uint16_t b){ return (uint16_t)(a - b); }
+static inline uint32_t tk_sub_u32(uint32_t a, uint32_t b){ return a - b; }
+static inline uint64_t tk_sub_u64(uint64_t a, uint64_t b){ return a - b; }
+static inline unsigned __int128 tk_sub_u128(unsigned __int128 a, unsigned __int128 b){ return a - b; }
+static inline int8_t   tk_sub_i8 (int8_t   a, int8_t   b){ return (int8_t )(a - b); }
+static inline int16_t  tk_sub_i16(int16_t  a, int16_t  b){ return (int16_t)(a - b); }
+static inline int32_t  tk_sub_i32(int32_t  a, int32_t  b){ return a - b; }
+static inline int64_t  tk_sub_i64(int64_t  a, int64_t  b){ return a - b; }
+static inline __int128 tk_sub_i128(__int128 a, __int128 b){ return a - b; }
+
+static inline uint8_t  tk_mul_u8 (uint8_t  a, uint8_t  b){ return (uint8_t )(a * b); }
+static inline uint16_t tk_mul_u16(uint16_t a, uint16_t b){ return (uint16_t)(a * b); }
+static inline uint32_t tk_mul_u32(uint32_t a, uint32_t b){ return a * b; }
+static inline uint64_t tk_mul_u64(uint64_t a, uint64_t b){ return a * b; }
+static inline unsigned __int128 tk_mul_u128(unsigned __int128 a, unsigned __int128 b){ return a * b; }
+static inline int8_t   tk_mul_i8 (int8_t   a, int8_t   b){ return (int8_t )(a * b); }
+static inline int16_t  tk_mul_i16(int16_t  a, int16_t  b){ return (int16_t)(a * b); }
+static inline int32_t  tk_mul_i32(int32_t  a, int32_t  b){ return a * b; }
+static inline int64_t  tk_mul_i64(int64_t  a, int64_t  b){ return a * b; }
+static inline __int128 tk_mul_i128(__int128 a, __int128 b){ return a * b; }
+#endif // TEKO_OVERFLOW_DEBUG
 
 // --- checked FLOAT division: ruling (§5) — float ÷0 PANICS (parity with int, M.1) ---
 // `%` on floats is invalid (the backend rejects it); only `/` rides these. Single-eval.
