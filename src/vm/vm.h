@@ -33,6 +33,12 @@ int tk_vm_run(tk_tprogram prog);
 // tk_vm_run_tests — run every `#test` function (D2 test runner; `teko test`). Fail-fast: a
 // failed assertion panics from inside the VM. All pass → 0. (Mirrors vm.tks run_tests.)
 int tk_vm_run_tests(tk_tprogram prog);
+// `record_branches` enables branch recording (the gate's BRANCH floor reads it); `write_xml` writes
+// the Cobertura report to `cov_path`. (Mirrors vm.tks run_tests_cov.)
+int tk_vm_run_tests_cov(tk_tprogram prog, bool record_branches, bool write_xml, const char *cov_path);
+// aggregate LINE / BRANCH coverage % from the last recorded run (D4 line/branch floors). (Mirrors vm.tks.)
+uint64_t tk_vm_line_coverage_pct(tk_tprogram prog);
+uint64_t tk_vm_branch_coverage_pct(tk_tprogram prog);
 
 // tk_vm_coverage_pct — function-level coverage % from the last run_tests (D3). (Mirrors vm.tks.)
 uint64_t tk_vm_coverage_pct(tk_tprogram prog);

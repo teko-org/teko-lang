@@ -485,6 +485,101 @@ void tk_cov_mark(uint64_t id) {
     tk_cov_ids[tk_cov_n++] = id;
 }
 uint64_t tk_cov_distinct(void) { return tk_cov_n; }
+bool tk_cov_is_marked(uint64_t id) {
+    for (uint64_t i = 0; i < tk_cov_n; i += 1) if (tk_cov_ids[i] == id) return true;
+    return false;
+}
+
+// D3-branch — branch-coverage sink (a SEPARATE set, so it never perturbs the function-coverage
+// count above). Recorded only when tk_cov_branches_on(true) — a plain `teko test`/build pays one
+// flag check per branch and nothing else. A branch id packs (current-fn items-index, line, col,
+// outcome): the current fn is the TOP of a small enter/leave stack the VM pushes around each call,
+// which makes (line,col) unique per FILE globally unique (two files may share a line:col). The
+// report queries tk_cov_branch_hit(fn, line, col, outcome) walking the typed program.
+static uint64_t *tk_covb_ids = NULL;
+static uint64_t  tk_covb_n   = 0;
+static uint64_t  tk_covb_cap = 0;
+static int       tk_covb_on  = 0;
+static uint64_t *tk_fn_stack = NULL;
+static uint64_t  tk_fn_sp    = 0;
+static uint64_t  tk_fn_cap   = 0;
+static uint64_t tk_branch_id(uint64_t fn, uint32_t line, uint32_t col, uint64_t outcome) {
+    // [54]=base · [38..54)=fn(16b) · [14..38)=line(24b) · [6..14)=col(8b) · [0..6)=outcome(6b)
+    return ((uint64_t)1 << 54) + (fn << 38) + ((uint64_t)line << 14)
+         + (((uint64_t)col & 0xFF) << 6) + (outcome & 0x3F);
+}
+void tk_cov_branches_on(bool on) { tk_covb_on = on ? 1 : 0; }
+void tk_cov_branch_reset(void) { tk_covb_n = 0; tk_fn_sp = 0; }
+void tk_cov_enter(uint64_t fn) {
+    if (!tk_covb_on) return;
+    if (tk_fn_sp == tk_fn_cap) {
+        uint64_t ncap = tk_fn_cap ? tk_fn_cap * 2 : 256;
+        uint64_t *g = (uint64_t *)tk_alloc(ncap * sizeof *g); if (!g) abort();
+        for (uint64_t i = 0; i < tk_fn_sp; i += 1) g[i] = tk_fn_stack[i];
+        tk_fn_stack = g; tk_fn_cap = ncap;
+    }
+    tk_fn_stack[tk_fn_sp++] = fn;
+}
+void tk_cov_leave(void) { if (tk_covb_on && tk_fn_sp > 0) tk_fn_sp -= 1; }
+static void tk_covb_add(uint64_t id) {
+    for (uint64_t i = 0; i < tk_covb_n; i += 1) if (tk_covb_ids[i] == id) return;
+    if (tk_covb_n == tk_covb_cap) {
+        uint64_t ncap = tk_covb_cap ? tk_covb_cap * 2 : 256;
+        uint64_t *grown = (uint64_t *)tk_alloc(ncap * sizeof *grown); if (!grown) abort();
+        for (uint64_t i = 0; i < tk_covb_n; i += 1) grown[i] = tk_covb_ids[i];
+        tk_covb_ids = grown; tk_covb_cap = ncap;
+    }
+    tk_covb_ids[tk_covb_n++] = id;
+}
+void tk_cov_branch(uint32_t line, uint32_t col, uint64_t outcome) {
+    if (!tk_covb_on) return;
+    uint64_t fn = tk_fn_sp > 0 ? tk_fn_stack[tk_fn_sp - 1] : 0;
+    tk_covb_add(tk_branch_id(fn, line, col, outcome));
+}
+bool tk_cov_branch_hit(uint64_t fn, uint32_t line, uint32_t col, uint64_t outcome) {
+    uint64_t id = tk_branch_id(fn, line, col, outcome);
+    for (uint64_t i = 0; i < tk_covb_n; i += 1) if (tk_covb_ids[i] == id) return true;
+    return false;
+}
+
+// D3-line — LINE-coverage sink. Lines are marked on EVERY evaluated expression (far more often than
+// fns/branches), so this is an open-addressing HASH SET (O(1) insert/lookup) instead of the linear
+// dedup above. A line id packs (current-fn idx, line) via the same enter/leave fn stack; 0 = empty.
+static uint64_t *tk_line_ids = NULL;
+static uint64_t  tk_line_cap = 0;   // power of two
+static uint64_t  tk_line_n   = 0;
+static int       tk_lines_on = 0;
+static uint64_t tk_line_id(uint64_t fn, uint32_t line) { return ((fn << 24) | (uint64_t)line) + 1; }   // ≥1 (0 = empty slot)
+static void tk_line_rehash(uint64_t ncap) {
+    uint64_t *nt = (uint64_t *)tk_alloc(ncap * sizeof *nt); if (!nt) abort();
+    for (uint64_t i = 0; i < ncap; i += 1) nt[i] = 0;
+    for (uint64_t i = 0; i < tk_line_cap; i += 1) {
+        uint64_t id = tk_line_ids[i]; if (!id) continue;
+        uint64_t h = (id * 1099511628211ull) & (ncap - 1);
+        while (nt[h]) h = (h + 1) & (ncap - 1);
+        nt[h] = id;
+    }
+    tk_line_ids = nt; tk_line_cap = ncap;
+}
+void tk_cov_lines_on(bool on) { tk_lines_on = on ? 1 : 0; }
+void tk_cov_line_reset(void) { tk_line_n = 0; for (uint64_t i = 0; i < tk_line_cap; i += 1) tk_line_ids[i] = 0; }
+void tk_cov_line(uint32_t line) {
+    if (!tk_lines_on || line == 0) return;
+    uint64_t fn = tk_fn_sp > 0 ? tk_fn_stack[tk_fn_sp - 1] : 0;
+    uint64_t id = tk_line_id(fn, line);
+    if (tk_line_cap == 0) tk_line_rehash(1024);
+    else if (tk_line_n * 2 >= tk_line_cap) tk_line_rehash(tk_line_cap * 2);
+    uint64_t h = (id * 1099511628211ull) & (tk_line_cap - 1);
+    while (tk_line_ids[h]) { if (tk_line_ids[h] == id) return; h = (h + 1) & (tk_line_cap - 1); }
+    tk_line_ids[h] = id; tk_line_n += 1;
+}
+bool tk_cov_line_hit(uint64_t fn, uint32_t line) {
+    if (tk_line_cap == 0) return false;
+    uint64_t id = tk_line_id(fn, line);
+    uint64_t h = (id * 1099511628211ull) & (tk_line_cap - 1);
+    while (tk_line_ids[h]) { if (tk_line_ids[h] == id) return true; h = (h + 1) & (tk_line_cap - 1); }
+    return false;
+}
 
 // --- amortized growable push (the teko::list::push lowering — see teko_rt.h) ---
 // A small cache of recent live tails. Codegen threads ONE big output buffer linearly, so its tail

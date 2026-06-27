@@ -1225,6 +1225,18 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
                     else if (seg_is(last, "cov_reset"))    builtin = "tk_cov_reset";    // () -> void
                     else if (seg_is(last, "cov_mark"))     builtin = "tk_cov_mark";     // (u64) -> void
                     else if (seg_is(last, "cov_distinct")) builtin = "tk_cov_distinct"; // () -> u64
+                    else if (seg_is(last, "cov_is_marked"))   builtin = "tk_cov_is_marked";   // (u64) -> bool
+                    // D3-branch — branch-coverage sink (only records when ON; off by default).
+                    else if (seg_is(last, "cov_branches_on")) builtin = "tk_cov_branches_on"; // (bool) -> void
+                    else if (seg_is(last, "cov_branch_reset"))builtin = "tk_cov_branch_reset";// () -> void
+                    else if (seg_is(last, "cov_enter"))       builtin = "tk_cov_enter";       // (u64) -> void
+                    else if (seg_is(last, "cov_leave"))       builtin = "tk_cov_leave";       // () -> void
+                    else if (seg_is(last, "cov_branch"))      builtin = "tk_cov_branch";      // (u32,u32,u64) -> void
+                    else if (seg_is(last, "cov_branch_hit"))  builtin = "tk_cov_branch_hit";  // (u64,u32,u32,u64) -> bool
+                    else if (seg_is(last, "cov_lines_on"))    builtin = "tk_cov_lines_on";    // (bool) -> void
+                    else if (seg_is(last, "cov_line_reset"))  builtin = "tk_cov_line_reset";  // () -> void
+                    else if (seg_is(last, "cov_line"))        builtin = "tk_cov_line";        // (u32) -> void
+                    else if (seg_is(last, "cov_line_hit"))    builtin = "tk_cov_line_hit";    // (u64,u32) -> bool
                     // diverging runtime panic helpers (the corpus calls these by bare name)
                     else if (seg_is(last, "panic_div0"))     builtin = "tk_panic_div0";
                     else if (seg_is(last, "panic_oob"))      builtin = "tk_panic_oob";
@@ -3292,6 +3304,21 @@ static bool cg_emit_types_ordered(cbuf *b, tk_tprogram prog, const char **err) {
     #define CG_ORDERED_FREE() do { tk_free0(set.inners); tk_free0(set.slices); tk_free0(set.variants); \
         tk_free0(named); tk_free0(named_done); tk_free0(opt_done); tk_free0(uvar_done); } while (0)
 
+    // 1a) ENUMS FIRST — full typedefs. An enum carries NO by-value type dependency (its members are
+    //     plain int constants), so it can lead. Emitting it BEFORE the slice typedefs lets a `[]<enum>`
+    //     slice element type (`tk_t_<Enum> *ptr`) resolve — a struct/variant gets a forward `typedef
+    //     struct` instead, but a C enum can't be forward-declared as a struct, so we emit it complete
+    //     here. Mark each done so the step-3 fixpoint SKIPS it (no duplicate typedef) and any struct
+    //     embedding an enum sees it as ready. (Fixes `[]TokenKind` — tk_slice_TokenKind needs
+    //     tk_t_TokenKind, which the body pass would otherwise emit only AFTER the slice.)
+    size_t enum_count = 0;
+    for (size_t i = 0; i < nn; i += 1) {
+        if (named[i].body.tag != TK_BODY_ENUM) continue;
+        if (!emit_type_decl(b, named[i], err)) { CG_ORDERED_FREE(); return false; }
+        named_done[i] = true; enum_count += 1;
+    }
+    if (enum_count > 0) cb(b, "\n");
+
     // 1b) FORWARD typedefs for optionals + inline variants (named struct tags), so a boxed
     //     back-edge field (a POINTER to tk_opt_/tk_u_) and slices-of-opt/-uvar resolve before the
     //     bodies are emitted. A pointer needs a named, forward-declarable tag — an anonymous-struct
@@ -3323,7 +3350,9 @@ static bool cg_emit_types_ordered(cbuf *b, tk_tprogram prog, const char **err) {
     if (set.slen > 0) cb(b, "\n");
 
     // 3) fixpoint: emit named bodies + optionals + inline variants in by-value dependency order.
-    size_t remaining = nn + set.len + set.vlen;
+    //    Enums were ALREADY emitted in step 1a (named_done set), so exclude them from `remaining`;
+    //    the fixpoint skips them (named_done) and a struct embedding an enum is immediately ready.
+    size_t remaining = nn + set.len + set.vlen - enum_count;
     bool progress = true;
     while (remaining > 0 && progress) {
         progress = false;

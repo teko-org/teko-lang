@@ -21,6 +21,11 @@ typedef struct {
     tk_str      source;     // the invisible source root
     tk_strs     deps;       // [dependencies] keys
     tk_strs     aliases;    // [aliases] keys
+    tk_str      version;    // `version = "x.y.z.b"` (info; empty if unset)
+    tk_str      suffix;     // `suffix = "bootstrap"` (pre-release stage; empty if unset)
+    uint64_t    cov_functions; // [coverage] functions — the D4 FUNCTION-coverage floor % (default 80)
+    uint64_t    cov_lines;     // [coverage] lines     — the D4 LINE-coverage floor %     (default 80)
+    uint64_t    cov_branches;  // [coverage] branches  — the D4 BRANCH-coverage floor %   (default 80)
 } tk_manifest;
 
 // `Manifest | error` — the result of parse_manifest.

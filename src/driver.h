@@ -39,7 +39,7 @@ int tk_compile_project(const char *dir, const char *out_dir);
 // tk_compile_project_g — build with the D4 test gate. gate=true runs the project's `#test`
 // functions on the VM before codegen (fail-fast, tests stripped from the binary); gate=false
 // (`--no-test`) is the plain production build. Mirrors project.tks compile_project_g.
-int tk_compile_project_g(const char *dir, const char *out_dir, bool gate);
+int tk_compile_project_g(const char *dir, const char *out_dir, bool gate, bool gen_cov);
 
 // Eixo D — the PROJECT RUN entry (debug profile). Mirrors tk_compile_project's front
 // (manifest → discover → assemble → check) but ends in the VM: INTERPRET the checked
@@ -51,6 +51,6 @@ int tk_run_project(const char *dir);
 
 // D2 — the PROJECT TEST entry (`teko test <dir>`): assemble WITH `.tkt` tests, then run every
 // `#test` function on the VM (fail-fast). Mirrors project.tks test_project.
-int tk_test_project(const char *dir);
+int tk_test_project(const char *dir, bool gen_cov);
 
 #endif // TK_DRIVER_H

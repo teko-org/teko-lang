@@ -5,6 +5,7 @@
 // and reports its verdict. Codegen/emit (F2) is NOT here — success == "type-checked".
 #include "driver.h"
 
+#include <sys/stat.h>        // mkdir — ensure the -o dir exists for the --coverage report
 #include "lexer/lexer.h"     // tk_tokenize, tk_tokens_result
 #include "parser/parser.h"   // tk_parse_main_file, tk_parse_module
 #include "parser/result.h"   // tk_parsed_main_file_result, tk_parsed_module_result
@@ -389,7 +390,7 @@ static char *cstr_of(tk_str s) {
 // mangling case fails with codegen's honest message (no silent mis-emit).
 // =========================================================================
 int tk_compile_project(const char *dir, const char *out_dir) {
-    return tk_compile_project_g(dir, out_dir, true);
+    return tk_compile_project_g(dir, out_dir, true, false);
 }
 
 // strip_tests — a copy of the program WITHOUT `#test` functions (D4): a release binary must not
@@ -418,7 +419,7 @@ static bool has_tests(tk_tprogram prog) {
 // coverage threshold — else the build is BLOCKED (no graceful degradation). The ONLY skip is a
 // project with NO `#test` functions. gate=false (`--no-test`, the bootstrap self-build) is the
 // plain production front-end. (Mirrors project.tks compile_project_g.)
-int tk_compile_project_g(const char *dir, const char *out_dir, bool gate) {
+int tk_compile_project_g(const char *dir, const char *out_dir, bool gate, bool gen_cov) {
     tk_tprogram prog;
     tk_manifest m;
 
@@ -438,12 +439,31 @@ int tk_compile_project_g(const char *dir, const char *out_dir, bool gate) {
     if (frc != 0) return frc;   // assembly/typecheck failed → BLOCK (the diagnostic already printed)
 
     if (has_tests(prog)) {
-        int trc = tk_vm_run_tests(prog);   // a failed assertion aborts here (fail-fast) → BLOCKS the build
+        // The gate ALWAYS records branches (for the BRANCH floor); `--coverage` also writes the report
+        // to <out_dir>/cobertura.xml (mkdir the dir first — idempotent). A failed assert aborts here.
+        char cov_path[2048];
+        if (gen_cov) { mkdir(out_dir, 0755); snprintf(cov_path, sizeof cov_path, "%s/cobertura.xml", out_dir); }
+        else cov_path[0] = '\0';
+        int trc = tk_vm_run_tests_cov(prog, true, gen_cov, cov_path);
         if (trc != 0) return trc;
-        uint64_t cov = tk_vm_coverage_pct(prog);   // D4 coverage floor (80%)
-        if (cov < 80) {
-            fprintf(stderr, "teko: %s: test coverage %llu%% is below the 80%% floor — add tests (or `--no-test`)\n",
-                    dir, (unsigned long long)cov);
+        // D4 coverage floors (from the `.tkp` [coverage] section; default 80/80/80): BLOCK when
+        // FUNCTION, LINE, or BRANCH coverage is below its floor.
+        uint64_t fcov = tk_vm_coverage_pct(prog);
+        if (fcov < m.cov_functions) {
+            fprintf(stderr, "teko: %s: function coverage %llu%% is below the %llu%% floor ([coverage] functions) — add tests (or `--no-test`)\n",
+                    dir, (unsigned long long)fcov, (unsigned long long)m.cov_functions);
+            return 1;
+        }
+        uint64_t lcov = tk_vm_line_coverage_pct(prog);
+        if (lcov < m.cov_lines) {
+            fprintf(stderr, "teko: %s: line coverage %llu%% is below the %llu%% floor ([coverage] lines) — add tests (or `--no-test`)\n",
+                    dir, (unsigned long long)lcov, (unsigned long long)m.cov_lines);
+            return 1;
+        }
+        uint64_t bcov = tk_vm_branch_coverage_pct(prog);
+        if (bcov < m.cov_branches) {
+            fprintf(stderr, "teko: %s: branch coverage %llu%% is below the %llu%% floor ([coverage] branches) — add tests (or `--no-test`)\n",
+                    dir, (unsigned long long)bcov, (unsigned long long)m.cov_branches);
             return 1;
         }
         prog = strip_tests(prog);          // a release binary carries no test code
@@ -478,11 +498,12 @@ int tk_run_project(const char *dir) {
 // the virtual-main. Fail-fast: a failed assertion panics from inside the VM (non-zero exit).
 // (Mirrors project.tks test_project.)
 // =========================================================================
-int tk_test_project(const char *dir) {
+int tk_test_project(const char *dir, bool gen_cov) {
     tk_tprogram prog;
     tk_manifest m;
     int rc = project_frontend(dir, &prog, &m, true);
     if (rc != 0) return rc;
 
-    return tk_vm_run_tests(prog);
+    // `--coverage` → record branches + write <cwd>/cobertura.xml (project root; no `-o` for `teko test`).
+    return gen_cov ? tk_vm_run_tests_cov(prog, true, true, "cobertura.xml") : tk_vm_run_tests(prog);
 }

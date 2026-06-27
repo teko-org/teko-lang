@@ -64,10 +64,17 @@ static bool key_is(tk_str k, const char *lit) {
 }
 
 // --- which table are we in? --------------------------------------------------
-typedef enum { SEC_ROOT, SEC_ARTIFACT, SEC_DEPS, SEC_ALIASES, SEC_OTHER } section;
+typedef enum { SEC_ROOT, SEC_ARTIFACT, SEC_DEPS, SEC_ALIASES, SEC_COVERAGE, SEC_OTHER } section;
 
 static tk_manifest_result fail(const char *msg) {
     return (tk_manifest_result){ .ok = false, .as.error = tk_error_make(msg) };
+}
+
+// an UNQUOTED non-negative integer value (TOML `key = 80`): the digit run at p (0 if none).
+static uint64_t read_int(tk_str s, size_t p) {
+    uint64_t n = 0;
+    while (p < s.len && s.ptr[p] >= '0' && s.ptr[p] <= '9') { n = n * 10 + (uint64_t)(s.ptr[p] - '0'); p++; }
+    return n;
 }
 
 tk_manifest_result tk_parse_manifest(tk_str src) {
@@ -77,6 +84,11 @@ tk_manifest_result tk_parse_manifest(tk_str src) {
         .source   = (tk_str){ NULL, 0 },
         .deps     = tk_strs_empty(),
         .aliases  = tk_strs_empty(),
+        .version  = (tk_str){ NULL, 0 },
+        .suffix   = (tk_str){ NULL, 0 },
+        .cov_functions = 80,  // D4 floors — default 80 when [coverage] / its keys are absent
+        .cov_lines    = 80,
+        .cov_branches = 80,
     };
     bool have_name = false, have_source = false;
     section sec = SEC_ROOT;
@@ -103,6 +115,7 @@ tk_manifest_result tk_parse_manifest(tk_str src) {
             if      (key_is(name, "artifact"))     sec = SEC_ARTIFACT;
             else if (key_is(name, "dependencies")) sec = SEC_DEPS;
             else if (key_is(name, "aliases"))      sec = SEC_ALIASES;
+            else if (key_is(name, "coverage"))     sec = SEC_COVERAGE;
             else                                   sec = SEC_OTHER;
             continue;
         }
@@ -117,12 +130,21 @@ tk_manifest_result tk_parse_manifest(tk_str src) {
 
         switch (sec) {
         case SEC_ROOT: {
-            // name / source are top-level quoted strings.
+            // name / source / version / suffix are top-level quoted strings.
             tk_str val; size_t ve;
             if (!read_quoted(line, v, &val, &ve)) { tk_strs_free(m.deps); tk_strs_free(m.aliases); return fail("expected a quoted string value"); }
-            if      (key_is(key, "name"))   { m.name = val;   have_name = true; }
-            else if (key_is(key, "source")) { m.source = val; have_source = true; }
+            if      (key_is(key, "name"))    { m.name = val;   have_name = true; }
+            else if (key_is(key, "source"))  { m.source = val; have_source = true; }
+            else if (key_is(key, "version")) { m.version = val; }
+            else if (key_is(key, "suffix"))  { m.suffix = val; }
             // unknown top-level keys are ignored (forward-compatible — M.5).
+            break;
+        }
+        case SEC_COVERAGE: {
+            // [coverage] functions / lines / branches — UNQUOTED integer floors (default 80 each).
+            if      (key_is(key, "functions")) m.cov_functions = read_int(line, v);
+            else if (key_is(key, "lines"))     m.cov_lines     = read_int(line, v);
+            else if (key_is(key, "branches"))  m.cov_branches  = read_int(line, v);
             break;
         }
         case SEC_ARTIFACT: {

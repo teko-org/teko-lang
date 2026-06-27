@@ -1209,6 +1209,18 @@ fn emit_call(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, e: c
             else if last == "cov_reset"    { builtin = "tk_cov_reset";    has_builtin = true }   // () -> void
             else if last == "cov_mark"     { builtin = "tk_cov_mark";     has_builtin = true }   // (u64) -> void
             else if last == "cov_distinct" { builtin = "tk_cov_distinct"; has_builtin = true }   // () -> u64
+            else if last == "cov_is_marked"  { builtin = "tk_cov_is_marked";  has_builtin = true }   // (u64) -> bool
+            // D3-branch — branch-coverage sink (only records when ON; off by default).
+            else if last == "cov_branches_on" { builtin = "tk_cov_branches_on"; has_builtin = true }   // (bool) -> void
+            else if last == "cov_branch_reset"{ builtin = "tk_cov_branch_reset";has_builtin = true }   // () -> void
+            else if last == "cov_enter"       { builtin = "tk_cov_enter";       has_builtin = true }   // (u64) -> void
+            else if last == "cov_leave"       { builtin = "tk_cov_leave";       has_builtin = true }   // () -> void
+            else if last == "cov_branch"      { builtin = "tk_cov_branch";      has_builtin = true }   // (u32,u32,u64) -> void
+            else if last == "cov_branch_hit"  { builtin = "tk_cov_branch_hit";  has_builtin = true }   // (u64,u32,u32,u64) -> bool
+            else if last == "cov_lines_on"    { builtin = "tk_cov_lines_on";    has_builtin = true }   // (bool) -> void
+            else if last == "cov_line_reset"  { builtin = "tk_cov_line_reset";  has_builtin = true }   // () -> void
+            else if last == "cov_line"        { builtin = "tk_cov_line";        has_builtin = true }   // (u32) -> void
+            else if last == "cov_line_hit"    { builtin = "tk_cov_line_hit";    has_builtin = true }   // (u64,u32) -> bool
             // diverging runtime panic helpers (the corpus calls these by bare name)
             else if last == "panic_div0"     { builtin = "tk_panic_div0";     has_builtin = true }
             else if last == "panic_oob"      { builtin = "tk_panic_oob";      has_builtin = true }
@@ -3894,6 +3906,29 @@ fn cg_emit_types_ordered(buf: []byte, prog: checker::TProgram) -> []byte | error
     let named = cg_named_decls(prog)
 
     mut out = buf
+    // 1a) ENUMS FIRST — full typedefs. An enum carries NO by-value type dependency (its members are
+    //     plain int constants), so it can lead. Emitting it BEFORE the slice typedefs lets a `[]<enum>`
+    //     slice element type (`tk_t_<Enum> *ptr`) resolve — a struct/variant gets a forward `typedef
+    //     struct` instead, but a C enum can't be forward-declared as a struct, so we emit it complete
+    //     here. Mark each emitted (em0) so the step-3 fixpoint SKIPS it (no duplicate typedef) and any
+    //     struct embedding an enum sees it as ready. (Fixes `[]TokenKind`: tk_slice_TokenKind needs
+    //     tk_t_TokenKind, which the body pass would otherwise emit only AFTER the slice.)
+    mut em0 = CgEmitted { names = teko::list::empty(); opt_keys = teko::list::empty(); uvar_keys = teko::list::empty() }
+    mut enum_count: u64 = 0
+    mut ei = 0
+    loop {
+        if ei >= named.len { break }
+        match named[ei].body {
+            parser::EnumBody => {
+                out = match emit_type_decl(out, prog, named[ei]) { []byte as o => o; error as err => return err }
+                em0 = CgEmitted { names = teko::list::push(em0.names, named[ei].name); opt_keys = em0.opt_keys; uvar_keys = em0.uvar_keys }
+                enum_count = enum_count + 1
+            }
+            _ => { }
+        }
+        ei++
+    }
+    if enum_count > 0 { out = cb(out, "\n") }
     // 1b) FORWARD typedefs for optionals + inline variants (named struct tags), so a boxed
     //     back-edge field (a POINTER to tk_opt_/tk_u_) and slices-of-opt/-uvar resolve before the
     //     bodies are emitted. A pointer needs a named, forward-declarable tag — an anonymous-struct
@@ -3939,8 +3974,11 @@ fn cg_emit_types_ordered(buf: []byte, prog: checker::TProgram) -> []byte | error
     if set.slices.len > 0 { out = cb(out, "\n") }
 
     // 3) fixpoint: emit named bodies + optionals + inline variants in by-value dependency order.
-    mut em = CgEmitted { names = teko::list::empty(); opt_keys = teko::list::empty(); uvar_keys = teko::list::empty() }
-    mut remaining = named.len + set.inners.len + set.variants.len
+    //    Enums were ALREADY emitted in step 1a (tracked in em0), so seed `em` with them and exclude
+    //    them from `remaining` — the fixpoint then skips them (cg_named_emitted is true) and any
+    //    struct embedding an enum is immediately ready.
+    mut em = em0
+    mut remaining = named.len + set.inners.len + set.variants.len - enum_count
     mut progress = true
     loop {
         if remaining == 0 { break }

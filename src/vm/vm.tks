@@ -247,11 +247,18 @@ fn try_builtin(callee: parser::Path, args: []checker::TExpr, env: Venv) -> bool 
     let addressable = callee.segments.len == 1 || callee.segments[0].name == "teko"
     if !addressable { return error { message = "not a builtin" } }
 
-    if last == "print" || last == "println" {
+    if last == "print" || last == "println" || last == "write" {
         let a = eval_expr(args[0], env)
         match a {
-            str as s => { if last == "print" { teko::print(s) } else { teko::println(s) }; return true }
-            _        => return error { message = "vm: print/println on a non-str value not yet supported" }
+            str as s => { if last == "println" { teko::println(s) } else { teko::print(s) }; return true }
+            _        => return error { message = "vm: print/println/write on a non-str value not yet supported" }
+        }
+    }
+    if last == "ewrite" || last == "eprint" || last == "eprintln" {
+        let a = eval_expr(args[0], env)
+        match a {
+            str as s => { if last == "eprintln" { teko::io::eprintln(s) } else { teko::io::ewrite(s) }; return true }
+            _        => return error { message = "vm: ewrite/eprint/eprintln on a non-str value not yet supported" }
         }
     }
 
@@ -362,9 +369,13 @@ fn try_str_builtin(callee: parser::Path, args: []checker::TExpr, env: Venv) -> V
                 mut i = 0
                 loop {
                     if i >= xs.len { break }
-                    match xs[i] {
-                        byte as b => view = teko::str_concat(view, teko::one_byte(b))
-                        _         => panic("vm: str/str_of_bytes element is not a byte (internal: checker should reject)")
+                    let elem = xs[i]
+                    // byte == u8 rep (vm.c): a []byte element may be a byte Value OR a u8 int (e.g. an
+                    // arithmetic/cast result the checker typed as an int) — read it numerically either way.
+                    if val_is_byte(elem) || val_is_int(elem) {
+                        view = teko::str_concat(view, teko::one_byte(as_int(elem) to byte))
+                    } else {
+                        panic("vm: str/str_of_bytes element is not a byte (internal: checker should reject)")
                     }
                     i++
                 }
@@ -374,19 +385,20 @@ fn try_str_builtin(callee: parser::Path, args: []checker::TExpr, env: Venv) -> V
         }
     }
     if last == "one_byte" {
-        match eval_expr(args[0], env) {
-            byte as b => return teko::one_byte(b)
-            _         => panic("vm: one_byte on a non-byte value (internal: checker should reject)")
-        }
+        let a = eval_expr(args[0], env)
+        // byte == u8 rep (vm.c): accept a byte Value OR a u8 int.
+        if val_is_byte(a) || val_is_int(a) { return teko::one_byte(as_int(a) to byte) }
+        panic("vm: one_byte on a non-byte value (internal: checker should reject)")
     }
     if last == "str_concat3" {
         return teko::str_concat3(as_str(eval_expr(args[0], env)),
                                  as_str(eval_expr(args[1], env)),
                                  as_str(eval_expr(args[2], env)))
     }
-    if last == "ftoa" {
-        return teko::ftoa(as_float(eval_expr(args[0], env)))
-    }
+    if last == "parse"        { return teko::float::parse(as_str(eval_expr(args[0], env))) }
+    if last == "ftoa"         { return teko::ftoa(as_float(eval_expr(args[0], env))) }
+    if last == "f64_bits"     { return teko::f64_bits(as_float(eval_expr(args[0], env))) }
+    if last == "f64_from_bits" { return teko::f64_from_bits(as_int(eval_expr(args[0], env)) to u64) }
     // str STDLIB surface — the SAME runtime functions native codegen lowers to (tk_str_*), so the
     // VM matches the compiled output. (str, u64, …) args; a u64/bool result widens into Value.
     if last == "concat"      { return teko::str_concat(as_str(eval_expr(args[0], env)), as_str(eval_expr(args[1], env))) }
@@ -401,6 +413,49 @@ fn try_str_builtin(callee: parser::Path, args: []checker::TExpr, env: Venv) -> V
     if last == "i64_to_str"  { return teko::i64_to_str(as_int(eval_expr(args[0], env)) to i64) }
     if last == "u64_to_str"  { return teko::u64_to_str(as_int(eval_expr(args[0], env)) to u64) }
     null   // not a str builtin — fall through to user-fn resolution
+}
+
+// teko::fs::* host surface builtins — value-producing (like try_list/str/err_builtin). In the
+// native vm.tks binary, `teko::fs::list_dir(path)` is lowered by codegen to `tk_rt_list_dir`,
+// so calling it here goes directly to the POSIX opendir/readdir runtime (C2* host surface).
+// `null` == not a fs/io builtin → fall through to user-fn resolution. (Mirrors vm.c handlers.)
+fn try_fs_builtin(callee: parser::Path, args: []checker::TExpr, env: Venv) -> Value? {
+    let last = callee.segments[callee.segments.len - 1].name
+    let addressable = callee.segments.len == 1 || callee.segments[0].name == "teko"
+    if !addressable { return null }
+    // teko::io::read_file — slurp a file as UTF-8. Handled here to prevent infinite recursion:
+    // the last-segment lookup for "read_file" would otherwise match driver.tks's local wrapper
+    // which calls teko::io::read_file again (→ same wrapper → stack overflow).
+    if last == "read_file" {
+        let path = as_str(eval_expr(args[0], env))
+        match teko::io::read_file(path) {
+            str as s => return s
+            error as e => {
+                let base = StructVal { type_name = "error"; field_names = teko::list::empty(); field_vals = teko::list::empty() }
+                return err_set(base, "message", e.message)
+            }
+        }
+    }
+    if last == "list_dir" {
+        let path = as_str(eval_expr(args[0], env))
+        match teko::fs::list_dir(path) {
+            []str as entries => {
+                mut result: []Value = teko::list::empty()
+                mut i = 0
+                loop {
+                    if i >= entries.len { break }
+                    result = teko::list::push(result, entries[i])
+                    i++
+                }
+                return result
+            }
+            error as e => {
+                let base = StructVal { type_name = "error"; field_names = teko::list::empty(); field_vals = teko::list::empty() }
+                return err_set(base, "message", e.message)
+            }
+        }
+    }
+    null
 }
 
 // ---------------------------------------------------------------------------
@@ -612,6 +667,7 @@ fn val_is_int(v: Value) -> bool {
     match v { u8 | u16 | u32 | u64 | u128 | i8 | i16 | i32 | i64 | i128 => true; _ => false }
 }
 fn val_is_float(v: Value) -> bool { match v { f16 | f32 | f64 => true; _ => false } }
+fn val_is_byte(v: Value)  -> bool { match v { byte => true; _ => false } }   // byte == u8 rep (compares as int)
 // signedness/width of an INT Value (the member encodes both) — mirrors the C `subj.as.i.{is_signed,width}`.
 fn int_sign_of(v: Value)  -> bool { match v { i8 | i16 | i32 | i64 | i128 => true; _ => false } }
 fn int_width_of(v: Value) -> u8 {
@@ -717,6 +773,7 @@ fn float_val(f: f64, width: u8) -> Value {
 fn num_of_prim(n: checker::TNumber, t: checker::Type) -> Value {
     let k = match t {
         checker::Prim as p => p.kind
+        checker::Byte      => checker::PrimKind::U8   // `byte` literal → u8
         _                  => panic("vm: number literal with a non-primitive type not yet supported")
     }
     if n.is_float {
@@ -775,6 +832,37 @@ type PatMatch = struct { matched: bool; env: Venv }
 // VARIANT (e.g. `Type`) and the value's case is one of its members (e.g. `Prim`): the VM has no
 // wrapper (the value IS the member struct), so resolve the variant decl in the program and check
 // membership. (Mirrors vm.c case_in_variant; native codegen discriminates the tagged union.)
+// vm_match_as_enum_int — does `name` match an integer `ordinal` when the subject is an enum value?
+// Case A: `name` is an ENUM TYPE NAME (e.g., `PrimKind as k`) — any integer is a valid enum value
+//   of that type (the checker guarantees the subject came from a union like `PrimKind | error`).
+// Case B: `name` is an ENUM MEMBER NAME (e.g., `U8 =>`, `I64 =>`) — matches only at the right ordinal.
+// Mirrors vm.c match_as_enum_int.
+fn vm_match_as_enum_int(prog: checker::TProgram, name: str, ordinal: i128) -> bool {
+    mut i = 0
+    loop {
+        if i >= prog.items.len { break }
+        match prog.items[i] {
+            parser::TypeDecl as td => {
+                match td.body {
+                    parser::EnumBody as eb => {
+                        if td.name == name { return true }
+                        mut j = 0
+                        loop {
+                            if j >= eb.members.len { break }
+                            if eb.members[j] == name && (j to i128) == ordinal { return true }
+                            j++
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+        i++
+    }
+    false
+}
+
 fn vm_case_in_variant(prog: checker::TProgram, vname: str, cname: str) -> bool {
     mut i = 0
     loop {
@@ -877,22 +965,52 @@ fn pat_match(pat: parser::Pattern, subj: Value, env: Venv) -> PatMatch {
                 // a PRIM/bool/byte/str member matches by the value's kind (val_type_matches); AND a
                 // pattern that names a VARIANT (`Type`) matches a value whose case is one of its
                 // members (vm_case_in_variant). Supports `Type =>` with NO destructure and NO alias.
-                mut hit = val_type_matches(subj, path_last(bp.type_name))
+                let bname = path_last(bp.type_name)
+                mut hit = val_type_matches(subj, bname)
                 if !hit {
                     match subj {
-                        StructVal as sv => { if vm_case_in_variant(env.prog, path_last(bp.type_name), sv.type_name) { hit = true } }
-                        _ => {}
+                        StructVal as sv => { if vm_case_in_variant(env.prog, bname, sv.type_name) { hit = true } }
+                        _ => { if val_is_int(subj) { if vm_match_as_enum_int(env.prog, bname, as_int(subj)) { hit = true } } }
                     }
                 }
                 if hit {
                     if bp.has_binding {
-                        PatMatch { matched = true; env = define(env, bp.binding, subj) }   // `Type as x` binds the whole value
-                    } else {
-                        PatMatch { matched = true; env = env }
+                        return PatMatch { matched = true; env = define(env, bp.binding, subj) }
                     }
-                } else {
-                    PatMatch { matched = false; env = env }
+                    return PatMatch { matched = true; env = env }
                 }
+                // Transparent field descent: when the subject is a struct with no direct match,
+                // check each STRUCT field for a value that matches the pattern name (e.g. `Number as nn`
+                // on `Expr { kind = Number{…}; line; col }`). Bind to the first matching field.
+                // Only struct fields are eligible — int fields are excluded because vm_match_as_enum_int
+                // could match enum member names that coincidentally share the same ordinal value as an
+                // unrelated enum (e.g. TyShape::Variant=2 vs PrimKind::U32=2 causing false descent).
+                // Mirrors vm.c TK_PAT_BIND transparent-field-descent block.
+                match subj {
+                    StructVal as sv => {
+                        mut fi = 0
+                        loop {
+                            if fi >= sv.field_vals.len { break }
+                            let fv = sv.field_vals[fi]
+                            match fv {
+                                StructVal as fsv => {
+                                    mut fhit = val_type_matches(fv, bname)
+                                    if !fhit { if vm_case_in_variant(env.prog, bname, fsv.type_name) { fhit = true } }
+                                    if fhit {
+                                        if bp.has_binding {
+                                            return PatMatch { matched = true; env = define(env, bp.binding, fv) }
+                                        }
+                                        return PatMatch { matched = true; env = env }
+                                    }
+                                }
+                                _ => {}
+                            }
+                            fi++
+                        }
+                    }
+                    _ => {}
+                }
+                PatMatch { matched = false; env = env }
             }
         }
         parser::FieldPattern as fp => {
@@ -933,7 +1051,7 @@ fn pat_match(pat: parser::Pattern, subj: Value, env: Venv) -> PatMatch {
 // bindings ride its grown env (`pm.env`); a non-matching / guard-failing arm is discarded by NOT
 // threading that env forward (the functional stand-in for the C `env_pop_to`). Mirrors the C
 // `eval_match`.
-fn eval_match(m: checker::TMatchExpr, env: Venv) -> Value {
+fn eval_match(m: checker::TMatchExpr, line: u32, col: u32, env: Venv) -> Value {
     let subj = eval_expr(m.subject, env)
     mut i = 0
     loop {
@@ -943,7 +1061,8 @@ fn eval_match(m: checker::TMatchExpr, env: Venv) -> Value {
         if pm.matched {
             let guard_ok = if arm.has_when { as_bool(eval_expr(arm.guard, pm.env)) } else { true }
             if guard_ok {
-                match exec_block(arm.body, pm.env) {
+                teko::cov_branch(line, col, i to u64)   // D3-branch: value-position arm `i` taken
+                match exec_block(arm.body, pm.env).flow {
                     Normal as nm => return nm.value ?? panic("vm: a `match` used as a value produced no value (internal: checker requires a value arm)")
                     _            => panic("vm: control flow inside a `match` used as a sub-expression not yet supported")
                 }
@@ -959,9 +1078,10 @@ fn eval_match(m: checker::TMatchExpr, env: Venv) -> Value {
 // A `return`/`break`/`continue` inside the arm propagates out; a NORMAL trailing value rides the
 // flow (the match's value). Routed from a binding/return/loose-statement RHS, exactly as `if` RHS
 // routes through exec_if. Mirrors the C `exec_match`.
-fn exec_match(e: checker::TExpr, env: Venv) -> Flow {
+fn exec_match(e: checker::TExpr, env: Venv) -> FlowEnv {
     match e {
         checker::TMatchExpr as m => {
+            let base = env.slots.len      // outer scope size: the arm's pattern bindings + body locals sit above it
             let subj = eval_expr(m.subject, env)
             mut i = 0
             loop {
@@ -970,7 +1090,13 @@ fn exec_match(e: checker::TExpr, env: Venv) -> Flow {
                 let pm = pat_match(arm.pattern, subj, env)
                 if pm.matched {
                     let guard_ok = if arm.has_when { as_bool(eval_expr(arm.guard, pm.env)) } else { true }
-                    if guard_ok { return exec_block(arm.body, pm.env) }
+                    if guard_ok {
+                        teko::cov_branch(e.line, e.col, i to u64)   // D3-branch: arm `i` taken (no-op unless coverage on)
+                        // run the arm body; POP its bindings/locals back to the outer scope (keeping
+                        // outer-`mut` mutations, which mutate_slot writes at their index in [0, base)).
+                        let bo = exec_block(arm.body, pm.env)
+                        return FlowEnv { flow= bo.flow; env= Venv { slots= loop_outer(bo.env.slots, base); prog= bo.env.prog } }
+                    }
                 }
                 i++   // discard this arm's bindings and try the next
             }
@@ -981,6 +1107,7 @@ fn exec_match(e: checker::TExpr, env: Venv) -> Flow {
 }
 
 fn eval_expr(e: checker::TExpr, env: Venv) -> Value {
+    teko::cov_line(e.line)   // D3-line — mark this source line executed (no-op unless line recording is on)
     match e.type {
         // Optional `T?` values ARE supported now (OptVal — REBOOT_PLAN §202): null / ?. / ?? and
         // the present-wrap (coerce_to) produce them; they flow through the value model like any tag.
@@ -1006,13 +1133,13 @@ fn eval_expr(e: checker::TExpr, env: Venv) -> Value {
         // inside an `if` used as a SUB-expression can't be expressed as a value here — honest
         // stop (M.3); statement/tail position handles divergence via exec_if directly.
         checker::TIfExpr as _ => {
-            match exec_if(e, env) {
+            match exec_if(e, env).flow {
                 Normal as nm => nm.value ?? panic("vm: an `if` used as a value produced no value (internal: checker requires an `else` with a value)")
                 _            => panic("vm: control flow inside an `if` used as a sub-expression not yet supported")
             }
         }
         // W5b — `match` as a VALUE: pattern matching (literal/range/Alt/variant-case/destructure + `when`).
-        checker::TMatchExpr as m => eval_match(m, env)
+        checker::TMatchExpr as m => eval_match(m, e.line, e.col, env)
         // W5-idx — subscript `recv[index]` (str→byte; slice→element, bounds-checked — SLICE layer).
         checker::TIndex as ix => eval_index(ix, e.line, e.col, env)
         // $"…{expr}…" — string interpolation: pieces ++ str(holes) (self-host parity).
@@ -1105,6 +1232,7 @@ fn num_prim_of(t: checker::Type) -> checker::PrimKind {
     match t {
         checker::Prim as p => p.kind
         checker::Byte      => checker::PrimKind::U8
+        checker::Named     => checker::PrimKind::U64  // E7: enum ordinal — checker validated; stored as u64
         _                  => panic("vm: arithmetic/cast on a non-numeric type not yet supported")
     }
 }
@@ -1159,7 +1287,13 @@ fn eval_unary(u: checker::TUnary, t: checker::Type, env: Venv) -> Value {
 // FLOAT compares in f64 (IEEE, matching codegen's double ops); BOOL compares ==/!= only. Codegen
 // lowers a chain to `&&` of these pairs (see eval_compare).
 fn cmp_pair(l: Value, op: lexer::TokenKind, r: Value) -> bool {
-    if val_is_int(l) && val_is_int(r) {
+    // `byte` IS the u8 representation (vm.c: "byte == u8 rep") — it compares NUMERICALLY with bytes
+    // AND ints. Fold byte into the integer path: e.g. an out-of-bounds `at()` returns the int literal
+    // `0` (not coerced to byte by the checker), which then compares against a byte literal — both must
+    // be read as numbers (as_int handles byte). Without this a byte-vs-int compare fell to as_bool.
+    let l_num = val_is_int(l) || val_is_byte(l)
+    let r_num = val_is_int(r) || val_is_byte(r)
+    if l_num && r_num {
         let a = as_int(l); let b = as_int(r)
         match op {
             EqEq => a == b
@@ -1182,8 +1316,7 @@ fn cmp_pair(l: Value, op: lexer::TokenKind, r: Value) -> bool {
             _    => panic("vm: comparison operator not yet supported")
         }
     } else {
-        // str (byte-equality, the lexer/parser tests compare token text), byte (ordered, like an
-        // unsigned 8-bit int), else bool (==/!= only). Native lowers these to tk_str_eq / scalar ops.
+        // str (byte-equality, the lexer/parser tests compare token text), else bool (==/!= only).
         match l {
             str as ls => match r {
                 str as rs => match op {
@@ -1192,18 +1325,6 @@ fn cmp_pair(l: Value, op: lexer::TokenKind, r: Value) -> bool {
                     _    => panic("vm: ordered comparison on str not supported")
                 }
                 _ => panic("vm: comparing a str to a non-str (checker should reject)")
-            }
-            byte as lb => match r {
-                byte as rb => match op {
-                    EqEq => lb == rb
-                    Ne   => lb != rb
-                    Lt   => lb < rb
-                    Le   => lb <= rb
-                    Gt   => lb > rb
-                    Ge   => lb >= rb
-                    _    => panic("vm: comparison operator not yet supported")
-                }
-                _ => panic("vm: comparing a byte to a non-byte (checker should reject)")
             }
             _ => {
                 let a = as_bool(l); let b = as_bool(r)
@@ -1248,13 +1369,18 @@ fn eval_compare(c: checker::TCompare, env: Venv) -> Value {
 // is neither a VM builtin (try_builtin/try_list_builtin) nor a user function is a host call the VM
 // cannot run. Stop HONESTLY, naming it and pointing at `teko build` — never the misleading
 // "internal: checker should reject" (M.1 fail-loud, M.3 honest frontier).
-fn find_function(env: Venv, callee: parser::Path) -> checker::TFunction {
+// FnHit — a resolved function PLUS its `prog.items` index (a globally-unique coverage ID). The C
+// twin returns the index via an out-param (`find_function(p, &fn_idx)`); Teko has no out-params, so
+// the pair rides a struct. Using the ITEM INDEX (not f.line) for cov_mark avoids cross-FILE line
+// collisions (two functions at the same line in different files would otherwise share one ID).
+type FnHit = struct { func: checker::TFunction; idx: u64 }
+fn find_function(env: Venv, callee: parser::Path) -> FnHit {
     let name = callee.segments[callee.segments.len - 1].name
     mut i = 0
     loop {
         if i >= env.prog.items.len { break }
         match env.prog.items[i] {
-            checker::TFunction as f => { if f.name == name { return f } }
+            checker::TFunction as f => { if f.name == name { return FnHit { func = f; idx = i to u64 } } }
             _              => {}
         }
         i++
@@ -1428,8 +1554,12 @@ fn eval_call(c: checker::TCall, env: Venv) -> Value {
     // str/byte STDLIB — value-producing str-returning builtins (str/str_of_bytes/one_byte/
     // str_concat3/ftoa). Recognized before user-fn resolution; null == not a str builtin, fall through.
     match try_str_builtin(c.callee, c.args, env) { Value as v => return v; null => {} }
-    let f = find_function(env, c.callee)   // resolved by LAST segment (cross-ns ok); honest stop if unknown
-    if !f.is_test { teko::cov_mark(f.line to u64) }   // D3 — record this production fn as executed (test runner reads it)
+    // teko::fs::* host-surface builtins (list_dir). Recognized before user-fn resolution;
+    // null == not a fs builtin, fall through. (Mirrors vm.c's list_dir handler.)
+    match try_fs_builtin(c.callee, c.args, env) { Value as v => return v; null => {} }
+    let h = find_function(env, c.callee)   // resolved by LAST segment (cross-ns ok); honest stop if unknown
+    let f = h.func
+    if !f.is_test { teko::cov_mark(h.idx) }   // D3 — globally-unique items index (not line) avoids cross-file collisions
     // Bind each parameter to its evaluated argument in a FRESH root frame (no closure capture —
     // flat M0 functions, like codegen's C). Args evaluate in the CALLER's env, then enter the
     // callee's frame by the param's name (positional). (B-vm — VM function parameters.)
@@ -1443,7 +1573,11 @@ fn eval_call(c: checker::TCall, env: Venv) -> Value {
     }
     // Coerce the returned value into the declared return type: a `T` from a `-> T?` fn
     // present-wraps (REBOOT §202), mirroring codegen's emit_as on the return slot.
-    match exec_block(f.body, fenv) {
+    // D3-branch: push h.idx so branches inside f.body attribute to THIS fn (no-op unless coverage on).
+    teko::cov_enter(h.idx)
+    let fl = exec_block(f.body, fenv).flow
+    teko::cov_leave()
+    match fl {
         VmReturn as ret => coerce_to(ret.value ?? panic("vm: void fn call used as a value (internal: checker should reject)"), f.return_type)
         Normal as nm  => coerce_to(nm.value ?? panic("vm: void fn call used as a value (internal: checker should reject)"), f.return_type)  // W5a — implicit trailing value (B.20)
         _             => panic("vm: void fn call used as a value (internal: checker should reject)")
@@ -1457,7 +1591,7 @@ fn eval_call(c: checker::TCall, env: Venv) -> Value {
 // W5a — exec_block now YIELDS THE TRAILING VALUE: it returns the LAST statement's NORMAL flow
 // (keeping its value), so a block's last expression becomes the block's value (B.20). Mirrors
 // the C `tk_vm_exec_block` returning the last statement's flow. A non-local exit short-circuits.
-fn exec_block(body: []checker::TStatement, env: Venv) -> Flow {
+fn exec_block(body: []checker::TStatement, env: Venv) -> FlowEnv {
     mut e = env
     mut last: Value? = null      // the last NORMAL step's value — the block's trailing value (B.20)
     mut i = 0
@@ -1466,11 +1600,12 @@ fn exec_block(body: []checker::TStatement, env: Venv) -> Flow {
         match exec_stmt(body[i], e) {
             // A NORMAL step threads the env forward AND keeps its value as the block's trailing value.
             Stepped as st => { e = st.env; last = st.value }
-            Exit as ex    => return ex.flow      // VmReturn / Break / Continue escape
+            // VmReturn / Break / Continue escape — carry the env AT THE EXIT so mutations before it survive.
+            Exit as ex    => return FlowEnv { flow= ex.flow; env= ex.env }
         }
         i++
     }
-    Normal { value= last }       // the block's trailing value rides the NORMAL flow
+    FlowEnv { flow= Normal { value= last }; env= e }   // trailing value rides NORMAL; thread the final env out
 }
 
 // One statement. Returns either Stepped(env', value) — a NORMAL step that threads the env
@@ -1480,8 +1615,16 @@ fn exec_block(body: []checker::TStatement, env: Venv) -> Flow {
 // LAST Stepped's value as its trailing value (B.20). The functional env (threaded via
 // Stepped) is the faithful Teko stand-in for the C's in-place env mutation.
 type Stepped = struct { env: Venv; value: Value? }
-type Exit    = struct { flow: Flow }
+type Exit    = struct { flow: Flow; env: Venv }   // env at the exit point: outer-`mut` mutations made
+                                                  // BEFORE a return/break/continue must survive the exit
 type Step    = variant Stepped | Exit
+// FlowEnv — a Flow paired with the env AFTER running a block/if/match (block-locals already popped to
+// the enclosing scope; outer-`mut` mutations kept). The functional stand-in for the C's in-place env:
+// exec_block/exec_if/exec_match return it so a mutation INSIDE the block PROPAGATES to the caller (the
+// C twin mutates the shared env in place; here we thread the updated env back out). Without this an
+// `if cond { i = i + 1 }` would silently drop the mutation — and a `loop { if … { i++ } }` would spin
+// forever (the OOM cause for `bin/teko test`).
+type FlowEnv = struct { flow: Flow; env: Venv }
 
 fn exec_stmt(s: checker::TStatement, env: Venv) -> Step {
     match s {
@@ -1491,13 +1634,15 @@ fn exec_stmt(s: checker::TStatement, env: Venv) -> Step {
             // run it FLOW-AWARE so a return/break/continue propagates instead of binding.
             match b.target {
                 parser::SimpleName as sn => {
-                    match eval_rhs_flow(b.value, env) {
-                        // present-wrap into a `T?` slot (REBOOT §202) via coerce_to(b.bound).
-                        Normal as nm => Stepped { env= define(env, sn.name, coerce_to(nm.value ?? panic("vm: binding RHS produced no value (internal: checker should reject)"), b.bound)); value= null }
-                        // diverged (return/break/continue inside the RHS) → propagate, no bind.
-                        VmReturn as f => Exit { flow= f }
-                        Break as f    => Exit { flow= f }
-                        Continue as f => Exit { flow= f }
+                    let fe = eval_rhs_flow(b.value, env)   // FlowEnv: RHS if/match mutations rode .env
+                    match fe.flow {
+                        // present-wrap into a `T?` slot (REBOOT §202) via coerce_to(b.bound). Define on
+                        // fe.env so any mutation the RHS made to an outer `mut` is kept, then bind on top.
+                        Normal as nm => Stepped { env= define(fe.env, sn.name, coerce_to(nm.value ?? panic("vm: binding RHS produced no value (internal: checker should reject)"), b.bound)); value= null }
+                        // diverged (return/break/continue inside the RHS) → propagate WITH the env, no bind.
+                        VmReturn as f => Exit { flow= f; env= fe.env }
+                        Break as f    => Exit { flow= f; env= fe.env }
+                        Continue as f => Exit { flow= f; env= fe.env }
                     }
                 }
                 _                => { panic("vm: destructuring binding not yet supported") }
@@ -1520,15 +1665,16 @@ fn exec_stmt(s: checker::TStatement, env: Venv) -> Step {
         // an `if`/`match` whose arm DIVERGES — run it flow-aware so an inner return propagates.
         checker::TReturn as r   => {
             if r.has_value {
-                match eval_rhs_flow(r.value, env) {
-                    Normal as nm => Exit { flow= VmReturn { value= nm.value } }
+                let fe = eval_rhs_flow(r.value, env)
+                match fe.flow {
+                    Normal as nm => Exit { flow= VmReturn { value= nm.value }; env= fe.env }
                     // inner return/break/continue inside the returned value → propagate.
-                    VmReturn as f => Exit { flow= f }
-                    Break as f    => Exit { flow= f }
-                    Continue as f => Exit { flow= f }
+                    VmReturn as f => Exit { flow= f; env= fe.env }
+                    Break as f    => Exit { flow= f; env= fe.env }
+                    Continue as f => Exit { flow= f; env= fe.env }
                 }
             } else {
-                Exit { flow= VmReturn { value= null } }
+                Exit { flow= VmReturn { value= null }; env= env }
             }
         }
         // W5a — an `if`/`match` in statement/tail position runs as CONTROL FLOW (exec_if/exec_match),
@@ -1537,8 +1683,8 @@ fn exec_stmt(s: checker::TStatement, env: Venv) -> Step {
         // (a `-> void` call carries null — it produces no Value, run for effect).
         checker::TExprStmt as x => {
             match x.expr {
-                checker::TIfExpr as _    => step_of_flow(exec_if(x.expr, env), env)
-                checker::TMatchExpr as _ => step_of_flow(exec_match(x.expr, env), env)
+                checker::TIfExpr as _    => step_of_flow(exec_if(x.expr, env))
+                checker::TMatchExpr as _ => step_of_flow(exec_match(x.expr, env))
                 _              => Stepped { env= env; value= eval_stmt_value(x.expr, env) }
             }
         }
@@ -1546,15 +1692,15 @@ fn exec_stmt(s: checker::TStatement, env: Venv) -> Step {
             // while(1){…} with break/continue. run_loop returns the OUTER env after the last
             // iteration (so outer-`mut` updates survive the loop — the functional twin of the C's
             // in-place env). A NORMAL completion CONTINUES the block (Stepped); a return / labeled
-            // break-or-continue to an enclosing loop EXITS (Exit).
+            // break-or-continue to an enclosing loop EXITS (Exit, carrying the loop's outer env).
             let lo = run_loop(l.label, l.body, env)
             match lo.flow {
                 Normal => Stepped { env= lo.env; value= null }
-                _      => Exit { flow= lo.flow }
+                _      => Exit { flow= lo.flow; env= lo.env }
             }
         }
-        checker::TBreakStmt as b    => Exit { flow= Break { label= b.label } }
-        checker::TContinueStmt as c => Exit { flow= Continue { label= c.label } }
+        checker::TBreakStmt as b    => Exit { flow= Break { label= b.label }; env= env }
+        checker::TContinueStmt as c => Exit { flow= Continue { label= c.label }; env= env }
     }
 }
 
@@ -1562,11 +1708,11 @@ fn exec_stmt(s: checker::TStatement, env: Venv) -> Step {
 // `return`/`break`/`continue` inside a branch/arm propagates out (the dominant idiom
 // `let v = match r { i64 as x => x ; error as e => return e }`). Any other expr evaluates plainly
 // and rides a NORMAL flow carrying its value. Mirrors the C `eval_rhs_flow`.
-fn eval_rhs_flow(e: checker::TExpr, env: Venv) -> Flow {
+fn eval_rhs_flow(e: checker::TExpr, env: Venv) -> FlowEnv {
     match e {
-        checker::TIfExpr as _    => exec_if(e, env)
-        checker::TMatchExpr as _ => exec_match(e, env)
-        _              => Normal { value= eval_expr(e, env) }
+        checker::TIfExpr as _    => exec_if(e, env)        // FlowEnv — mutations inside the RHS branch propagate
+        checker::TMatchExpr as _ => exec_match(e, env)     // FlowEnv — same for a match RHS
+        _              => FlowEnv { flow= Normal { value= eval_expr(e, env) }; env= env }
     }
 }
 
@@ -1574,10 +1720,10 @@ fn eval_rhs_flow(e: checker::TExpr, env: Venv) -> Flow {
 // a NORMAL flow keeps stepping (Stepped, env threaded, carrying the branch's trailing value);
 // a VmReturn/Break/Continue escapes (Exit). Mirrors the C `exec_stmt` for a tail `if` directly
 // returning the `exec_if` flow (whose NORMAL value is the statement's value).
-fn step_of_flow(fl: Flow, env: Venv) -> Step {
-    match fl {
-        Normal as nm => Stepped { env= env; value= nm.value }   // branch's trailing value rides NORMAL
-        _            => Exit { flow= fl }                        // return/break/continue propagate
+fn step_of_flow(fe: FlowEnv) -> Step {
+    match fe.flow {
+        Normal as nm => Stepped { env= fe.env; value= nm.value }   // thread the branch's (mutated) env + value
+        _            => Exit { flow= fe.flow; env= fe.env }         // return/break/continue propagate WITH the env
     }
 }
 
@@ -1587,6 +1733,7 @@ fn step_of_flow(fl: Flow, env: Venv) -> Step {
 // runs purely for effect and yields NO Value (`null` — the Teko stand-in for the C's never-read
 // v_void() placeholder); any value-typed expression yields its evaluated value.
 fn eval_stmt_value(e: checker::TExpr, env: Venv) -> Value? {
+    teko::cov_line(e.line)   // D3-line — a statement-position CALL goes to call_value (bypassing eval_expr), so mark its line here (matches vm.c, which routes stmt calls through eval_expr)
     match e {
         checker::TCall as c => call_value(c, env)       // may be a void call — null; else the call's value
         _          => eval_expr(e, env)          // value expr in stmt position — carries its value
@@ -1605,9 +1752,33 @@ fn call_value(c: checker::TCall, env: Venv) -> Value? {
         bool as ran => if ran { return null }
         error       => {}
     }
-    let f = find_function(env, c.callee)
-    let fenv = Venv { slots = teko::list::empty(); prog = env.prog }
-    match exec_block(f.body, fenv) {
+    // VALUE-producing builtins — a statement-position call can be a function's TRAILING expression
+    // (B.20), e.g. `fn empty_table() -> TypeTable { teko::list::empty() }`. Route them exactly like
+    // eval_call (list/err/str/fs) BEFORE user-fn resolution; without this a trailing `teko::list::empty()`
+    // fell through to find_function("empty") → "host function the VM cannot run".
+    match try_list_builtin(c.callee, c.args, env) { Value as v => return v; null => {} }
+    match try_err_builtin(c.callee, c.args, env)  { Value as v => return v; null => {} }
+    match try_str_builtin(c.callee, c.args, env)  { Value as v => return v; null => {} }
+    match try_fs_builtin(c.callee, c.args, env)   { Value as v => return v; null => {} }
+    let h = find_function(env, c.callee)
+    let f = h.func
+    if !f.is_test { teko::cov_mark(h.idx) }   // D3 — globally-unique items index (parity with eval_call)
+    // A FRESH root frame with each parameter bound to its evaluated argument (args evaluate in the
+    // CALLER's env, then enter the callee's frame positionally) — the SAME setup as eval_call. Without
+    // this a statement-position call (e.g. `tokens = push(tokens, stamp(...))` reaching a helper) runs
+    // the body with NO params bound → `unbound variable` for the first param read.
+    mut fenv = Venv { slots = teko::list::empty(); prog = env.prog }
+    mut ai = 0
+    loop {
+        if ai >= f.params.len { break }
+        let argval = eval_expr(c.args[ai], env)
+        fenv = define(fenv, f.params[ai].name, argval)
+        ai = ai + 1
+    }
+    teko::cov_enter(h.idx)   // D3-branch — attribute body branches to this fn (no-op unless coverage on)
+    let fl = exec_block(f.body, fenv).flow
+    teko::cov_leave()
+    match fl {
         VmReturn as ret => ret.value                      // explicit `return e` (or bare return -> null)
         Normal as nm  => nm.value                       // W5a — implicit trailing value (B.20); null if none
         _             => null                            // break/continue can't escape a fn body
@@ -1653,7 +1824,7 @@ fn run_loop(mylabel: str, body: []checker::TStatement, env: Venv) -> LoopOut {
             if i >= body.len { break }
             match exec_stmt(body[i], e) {
                 Stepped as st => { e = st.env }                 // thread the env forward
-                Exit as ex    => { exflow = ex.flow; exited = true; break }
+                Exit as ex    => { exflow = ex.flow; e = ex.env; exited = true; break }   // keep mutations made before the exit
             }
             i = i + 1
         }
@@ -1680,13 +1851,26 @@ fn run_loop(mylabel: str, body: []checker::TStatement, env: Venv) -> LoopOut {
 // and return its flow. The branch's trailing value rides the NORMAL flow (the `if`'s value);
 // a `return`/`break`/`continue` inside the branch propagates out. An `if`-without-`else` taken
 // false yields a valueless NORMAL flow (no value). Mirrors the C `exec_if`.
-fn exec_if(e: checker::TExpr, env: Venv) -> Flow {
+fn exec_if(e: checker::TExpr, env: Venv) -> FlowEnv {
     match e {
         checker::TIfExpr as f => {
+            let base = env.slots.len      // outer scope size: the branch's block-locals sit above it
             let c = as_bool(eval_expr(f.cond, env))
-            if c { return exec_block(f.then_blk, env) }
-            if f.has_else { return exec_block(f.else_blk, env) }
-            Normal { value= null }    // if-without-else taken false: no value
+            // run the taken branch; POP its locals back to the outer scope (keeping outer-`mut`
+            // mutations, which mutate_slot writes at their index in [0, base)). This is what makes
+            // `if cond { x = 5 }` propagate x to the caller (the C twin mutates the env in place).
+            // D3-branch: outcome 0 = then taken, 1 = else/skip taken (no-op unless coverage on).
+            if c {
+                teko::cov_branch(e.line, e.col, 0)
+                let bo = exec_block(f.then_blk, env)
+                return FlowEnv { flow= bo.flow; env= Venv { slots= loop_outer(bo.env.slots, base); prog= bo.env.prog } }
+            }
+            teko::cov_branch(e.line, e.col, 1)
+            if f.has_else {
+                let bo = exec_block(f.else_blk, env)
+                return FlowEnv { flow= bo.flow; env= Venv { slots= loop_outer(bo.env.slots, base); prog= bo.env.prog } }
+            }
+            FlowEnv { flow= Normal { value= null }; env= env }    // if-without-else taken false: no value, env unchanged
         }
         _ => panic("vm: exec_if on a non-if expression (internal: checker should reject)")
     }
@@ -1732,14 +1916,229 @@ exp fn run(prog: checker::TProgram) -> i32 {
 }
 
 // ---------------------------------------------------------------------------
+// D3-branch — BRANCH COVERAGE report (`--coverage` → Cobertura XML). A branch SITE is one `if`
+// (2 outcomes: then/else) or `match` (arms.len outcomes). The VM marks the taken outcome of each
+// site during the run (cov_branch); here we STATICALLY enumerate every site (walk each production
+// fn body) and query cov_branch_hit per outcome to get taken/total. Function-level line coverage
+// reuses cov_is_marked (the same per-fn mark the % summary uses).
+// ---------------------------------------------------------------------------
+type BranchSite = struct { line: u32; col: u32; n: u64 }            // n = number of outcomes
+type CovWalk    = struct { sites: []BranchSite; lines: []u32 }      // branch sites + DISTINCT executable lines
+
+fn cov_walk_empty() -> CovWalk { CovWalk { sites = teko::list::empty(); lines = teko::list::empty() } }
+// add e.line to the distinct-line set (skip 0 = unpositioned; a fn has few lines, so linear dedup is fine).
+fn cov_addline(w: CovWalk, line: u32) -> CovWalk {
+    if line == 0 { return w }
+    mut i = 0
+    loop { if i >= w.lines.len { break }; if w.lines[i] == line { return w }; i = i + 1 }
+    CovWalk { sites = w.sites; lines = teko::list::push(w.lines, line) }
+}
+fn cov_addsite(w: CovWalk, line: u32, col: u32, n: u64) -> CovWalk {
+    CovWalk { sites = teko::list::push(w.sites, BranchSite { line = line; col = col; n = n }); lines = w.lines }
+}
+
+// recurse an EXPR, collecting its source line (line coverage) + every nested if/match site (branch
+// coverage) into `w`. ONE walk feeds both the line and branch metrics + the cobertura report.
+fn cov_walk_expr(e: checker::TExpr, w: CovWalk) -> CovWalk {
+    let w0 = cov_addline(w, e.line)
+    match e.kind {
+        checker::TIfExpr as f => {
+            let a1 = cov_addsite(w0, e.line, e.col, 2)
+            let a2 = cov_walk_expr(f.cond, a1)
+            let a3 = cov_walk_block(f.then_blk, a2)
+            if f.has_else { cov_walk_block(f.else_blk, a3) } else { a3 }
+        }
+        checker::TMatchExpr as m => {
+            let a1 = cov_addsite(w0, e.line, e.col, m.arms.len)
+            mut a = cov_walk_expr(m.subject, a1)
+            mut i = 0
+            loop {
+                if i >= m.arms.len { break }
+                if m.arms[i].has_when { a = cov_walk_expr(m.arms[i].guard, a) }
+                a = cov_walk_block(m.arms[i].body, a)
+                i++
+            }
+            a
+        }
+        checker::TBinary as b => cov_walk_expr(b.right, cov_walk_expr(b.left, w0))
+        checker::TUnary as u => cov_walk_expr(u.operand, w0)
+        checker::TCompare as c => {
+            mut a = cov_walk_expr(c.first, w0)
+            mut i = 0
+            loop { if i >= c.rest.len { break }; a = cov_walk_expr(c.rest[i].operand, a); i++ }
+            a
+        }
+        checker::TCall as c => {
+            mut a = w0
+            mut i = 0
+            loop { if i >= c.args.len { break }; a = cov_walk_expr(c.args[i], a); i++ }
+            a
+        }
+        checker::TCast as c => cov_walk_expr(c.expr, w0)
+        checker::TFieldAccess as fa => cov_walk_expr(fa.receiver, w0)
+        checker::TSafeFieldAccess as sfa => cov_walk_expr(sfa.receiver, w0)
+        checker::TCoalesce as co => cov_walk_expr(co.right, cov_walk_expr(co.left, w0))
+        checker::TIndex as ix => cov_walk_expr(ix.index, cov_walk_expr(ix.receiver, w0))
+        checker::TStructInit as si => {
+            mut a = w0
+            mut i = 0
+            loop { if i >= si.field_vals.len { break }; a = cov_walk_expr(si.field_vals[i], a); i++ }
+            a
+        }
+        checker::TInterp as in => {
+            mut a = w0
+            mut i = 0
+            loop { if i >= in.holes.len { break }; a = cov_walk_expr(in.holes[i], a); i++ }
+            a
+        }
+        checker::TInExpr as ie => {
+            mut a = cov_walk_expr(ie.lhs, w0)
+            mut i = 0
+            loop { if i >= ie.elems.len { break }; a = cov_walk_expr(ie.elems[i], a); i++ }
+            a
+        }
+        checker::TArrayLit as al => {
+            mut a = w0
+            mut i = 0
+            loop { if i >= al.elements.len { break }; a = cov_walk_expr(al.elements[i], a); i++ }
+            a
+        }
+        _ => w0   // leaves (number/var/strlit/bytelit/boollit/nulllit/pathexpr) — line already added
+    }
+}
+
+fn cov_walk_stmt(s: checker::TStatement, w: CovWalk) -> CovWalk {
+    match s {
+        checker::TBinding as b  => cov_walk_expr(b.value, w)
+        checker::TAssign as a   => cov_walk_expr(a.value, w)
+        checker::TReturn as r   => if r.has_value { cov_walk_expr(r.value, w) } else { w }
+        checker::TLoopStmt as l => cov_walk_block(l.body, w)
+        checker::TExprStmt as x => cov_walk_expr(x.expr, w)
+        _ => w   // break/continue — no expr
+    }
+}
+
+fn cov_walk_block(stmts: []checker::TStatement, w: CovWalk) -> CovWalk {
+    mut a = w
+    mut i = 0
+    loop { if i >= stmts.len { break }; a = cov_walk_stmt(stmts[i], a); i++ }
+    a
+}
+
+// a Cobertura rate decimal "0.000".."1.0" from covered/total (val==0 → vacuously "1.0").
+fn cov_rate_str(cov: u64, val: u64) -> str {
+    if val == 0 { return "1.0" }
+    let m = cov * 1000 / val
+    if m >= 1000 { return "1.0" }
+    mut fs = teko::str::u64_to_str(m)
+    loop { if fs.len >= 3 { break }; fs = teko::str::concat("0", fs) }
+    teko::str::concat("0.", fs)
+}
+
+// branch taken/total over the sites that sit on source line `ln` (a line may host >1 if/match).
+type LineBr = struct { taken: u64; total: u64 }
+fn cov_line_branch(sites: []BranchSite, fn_idx: u64, ln: u32) -> LineBr {
+    mut taken: u64 = 0; mut total: u64 = 0
+    mut s = 0
+    loop {
+        if s >= sites.len { break }
+        if sites[s].line == ln {
+            mut o: u64 = 0
+            loop { if o >= sites[s].n { break }; if teko::cov_branch_hit(fn_idx, sites[s].line, sites[s].col, o) { taken = taken + 1 }; o = o + 1 }
+            total = total + sites[s].n
+        }
+        s = s + 1
+    }
+    LineBr { taken = taken; total = total }
+}
+
+// cov_cobertura — build a Cobertura XML report from the LAST run's marks. ONE <class> per production
+// function (filename = its source file). The class <lines> are the REAL executable lines (every line
+// with an evaluated expression, hit via cov_line_hit); a line that hosts an if/match also carries the
+// branch condition-coverage. Single-quoted attributes (valid XML) so no `"`-escaping is needed.
+exp fn cov_cobertura(prog: checker::TProgram) -> str {
+    mut body = ""
+    mut lines_cov: u64 = 0; mut lines_val: u64 = 0
+    mut br_cov: u64 = 0;    mut br_val: u64 = 0
+    mut i = 0
+    loop {
+        if i >= prog.items.len { break }
+        match prog.items[i] {
+            checker::TFunction as f => {
+                if !f.is_test && f.namespace != "teko::vm" {
+                    let fnhit: u64 = if teko::cov_is_marked(i to u64) { 1 to u64 } else { 0 to u64 }
+                    let w = cov_walk_block(f.body, cov_walk_empty())
+                    // LINE coverage — one <line> per distinct executable body line.
+                    mut llines = ""
+                    mut flc: u64 = 0; mut flv: u64 = 0
+                    mut k = 0
+                    loop {
+                        if k >= w.lines.len { break }
+                        let ln = w.lines[k]
+                        let lhit: u64 = if teko::cov_line_hit(i to u64, ln) { 1 to u64 } else { 0 to u64 }
+                        flv = flv + 1; flc = flc + lhit
+                        let lb = cov_line_branch(w.sites, i to u64, ln)
+                        if lb.total > 0 {
+                            let pct = lb.taken * 100 / lb.total
+                            llines = teko::str::concat(llines, $"          <line number='{ln}' hits='{lhit}' branch='true' condition-coverage='{pct}% ({lb.taken}/{lb.total})'/>\n")
+                        } else {
+                            llines = teko::str::concat(llines, $"          <line number='{ln}' hits='{lhit}'/>\n")
+                        }
+                        k = k + 1
+                    }
+                    lines_cov = lines_cov + flc; lines_val = lines_val + flv
+                    // BRANCH coverage — taken/total over every site.
+                    mut fbc: u64 = 0; mut fbv: u64 = 0
+                    mut s = 0
+                    loop {
+                        if s >= w.sites.len { break }
+                        mut o: u64 = 0
+                        loop { if o >= w.sites[s].n { break }; if teko::cov_branch_hit(i to u64, w.sites[s].line, w.sites[s].col, o) { fbc = fbc + 1 }; o = o + 1 }
+                        fbv = fbv + w.sites[s].n
+                        s = s + 1
+                    }
+                    br_cov = br_cov + fbc; br_val = br_val + fbv
+                    let cname = if f.namespace.len != 0 { teko::str::concat3(f.namespace, "::", f.name) } else { f.name }
+                    let lrate = cov_rate_str(flc, flv)
+                    let brate = cov_rate_str(fbc, fbv)
+                    body = teko::str::concat(body, $"      <class name='{cname}' filename='{f.file}' line-rate='{lrate}' branch-rate='{brate}' complexity='0'>\n")
+                    body = teko::str::concat(body, $"        <methods><method name='{f.name}' signature='()V' line-rate='{lrate}' branch-rate='{brate}'><lines><line number='{f.line}' hits='{fnhit}'/></lines></method></methods>\n")
+                    body = teko::str::concat(body, "        <lines>\n")
+                    body = teko::str::concat(body, llines)
+                    body = teko::str::concat(body, "        </lines>\n      </class>\n")
+                }
+            }
+            _ => {}
+        }
+        i++
+    }
+    let lrate = cov_rate_str(lines_cov, lines_val)
+    let brate = cov_rate_str(br_cov, br_val)
+    mut out = "<?xml version='1.0' ?>\n"
+    out = teko::str::concat(out, $"<coverage line-rate='{lrate}' branch-rate='{brate}' lines-covered='{lines_cov}' lines-valid='{lines_val}' branches-covered='{br_cov}' branches-valid='{br_val}' complexity='0' version='teko' timestamp='0'>\n")
+    out = teko::str::concat(out, "  <sources><source>.</source></sources>\n  <packages>\n")
+    out = teko::str::concat(out, $"    <package name='teko' line-rate='{lrate}' branch-rate='{brate}' complexity='0'>\n      <classes>\n")
+    out = teko::str::concat(out, body)
+    out = teko::str::concat(out, "      </classes>\n    </package>\n  </packages>\n</coverage>\n")
+    out
+}
+
+// ---------------------------------------------------------------------------
 // run_tests — the D2 TEST RUNNER (`teko test`). Execute every `#test` function (zero-arg,
 // void) in the merged program, fail-fast: a failed assertion PANICS (M.1) — aborting from
 // inside the VM with its "assertion failed: …" message, AFTER the running test's name was
 // printed (so the user sees which test failed). All pass → print the count, return 0. An
 // empty suite (no `#test`) is NOT a failure — the build gate skips when absent.
 // ---------------------------------------------------------------------------
-exp fn run_tests(prog: checker::TProgram) -> i32 {
+exp fn run_tests(prog: checker::TProgram) -> i32 { run_tests_cov(prog, false, false, "") }
+
+// run_tests_cov — run_tests + optional Cobertura report. `gen_cov` enables BRANCH recording for the
+// run (off by default — a plain run pays only one flag-check per branch); afterward it writes the
+// XML to `cov_path` (the caller picks `<out>/cobertura.xml`). Mirrors vm.c's run_tests_cov.
+exp fn run_tests_cov(prog: checker::TProgram, record_branches: bool, write_xml: bool, cov_path: str) -> i32 {
     teko::cov_reset()        // D3 — start a fresh coverage run; eval_call marks each production fn it enters
+    // the GATE records lines+branches even without --coverage (for the floors).
+    if record_branches { teko::cov_branch_reset(); teko::cov_branches_on(true); teko::cov_line_reset(); teko::cov_lines_on(true) }
     mut passed: u64 = 0
     mut i = 0
     loop {
@@ -1750,7 +2149,9 @@ exp fn run_tests(prog: checker::TProgram) -> i32 {
                     let label = if f.namespace.len != 0 { teko::str::concat3(f.namespace, "::", f.name) } else { f.name }
                     teko::io::print(teko::str::concat3("test ", label, " ... "))
                     let fenv = Venv { slots = teko::list::empty(); prog = prog }
+                    teko::cov_enter(i to u64)   // attribute the test body's own lines/branches to the test (NOT prod fn 0)
                     let _ = exec_block(f.body, fenv)   // a failed assert panics here (fail-fast); normal completion = pass
+                    teko::cov_leave()
                     teko::io::println("ok")
                     passed = passed + 1
                 }
@@ -1759,18 +2160,96 @@ exp fn run_tests(prog: checker::TProgram) -> i32 {
         }
         i++
     }
+    if record_branches { teko::cov_branches_on(false); teko::cov_lines_on(false) }
     if passed == 0 {
         teko::io::println("teko: no tests (no `#test` functions)")
     } else {
         teko::io::println(teko::str::concat3("teko: ", teko::str::u64_to_str(passed), " test(s) passed"))
-        // D3 — function-level coverage: distinct production fns executed / total production fns.
-        let total = count_prod_fns(prog)
-        let executed = teko::cov_distinct()
-        let pct = if total == 0 { 100 } else { executed * 100 / total }
-        teko::io::println(teko::str::concat3("teko: coverage ", teko::str::u64_to_str(pct), teko::str::concat3("% (", teko::str::u64_to_str(executed), teko::str::concat3("/", teko::str::u64_to_str(total), " functions)"))))
+        // D3 — three coverage metrics: functions / lines / branches (lines+branches need recording).
+        let fc = functions_coverage(prog)
+        teko::io::println($"teko: coverage {cov_pct(fc)}% ({fc.cov}/{fc.val} functions)")
+        if record_branches {
+            let lc = line_coverage(prog)
+            let bc = branch_coverage(prog)
+            teko::io::println($"teko: coverage {cov_pct(lc)}% ({lc.cov}/{lc.val} lines)")
+            teko::io::println($"teko: coverage {cov_pct(bc)}% ({bc.cov}/{bc.val} branches)")
+        }
+    }
+    if write_xml {
+        let xml = cov_cobertura(prog)
+        let _ = teko::io::write_file(cov_path, xml)
+        teko::io::println(teko::str::concat("teko: wrote coverage report ", cov_path))
     }
     0
 }
+
+// CovCount — covered / valid (numerator / denominator) for a metric. cov_pct rounds DOWN; an empty
+// denominator is vacuously 100% (no code → nothing to cover).
+type CovCount = struct { cov: u64; val: u64 }
+fn cov_pct(c: CovCount) -> u64 { if c.val == 0 { 100 } else { c.cov * 100 / c.val } }
+
+// FUNCTIONS metric — distinct production fns executed / total production fns (the cov-mark sink).
+exp fn functions_coverage(prog: checker::TProgram) -> CovCount {
+    CovCount { cov = teko::cov_distinct(); val = count_prod_fns(prog) }
+}
+// LINES metric — distinct executable lines hit / total executable lines, over every production fn.
+exp fn line_coverage(prog: checker::TProgram) -> CovCount {
+    mut cov: u64 = 0; mut val: u64 = 0
+    mut i = 0
+    loop {
+        if i >= prog.items.len { break }
+        match prog.items[i] {
+            checker::TFunction as f => {
+                if !f.is_test && f.namespace != "teko::vm" {
+                    let w = cov_walk_block(f.body, cov_walk_empty())
+                    mut k = 0
+                    loop {
+                        if k >= w.lines.len { break }
+                        val = val + 1
+                        if teko::cov_line_hit(i to u64, w.lines[k]) { cov = cov + 1 }
+                        k = k + 1
+                    }
+                }
+            }
+            _ => {}
+        }
+        i++
+    }
+    CovCount { cov = cov; val = val }
+}
+// BRANCHES metric — taken outcomes / total outcomes over every production fn's if/match sites.
+exp fn branch_coverage(prog: checker::TProgram) -> CovCount {
+    mut cov: u64 = 0; mut val: u64 = 0
+    mut i = 0
+    loop {
+        if i >= prog.items.len { break }
+        match prog.items[i] {
+            checker::TFunction as f => {
+                if !f.is_test && f.namespace != "teko::vm" {
+                    let w = cov_walk_block(f.body, cov_walk_empty())
+                    mut s = 0
+                    loop {
+                        if s >= w.sites.len { break }
+                        mut o: u64 = 0
+                        loop {
+                            if o >= w.sites[s].n { break }
+                            if teko::cov_branch_hit(i to u64, w.sites[s].line, w.sites[s].col, o) { cov = cov + 1 }
+                            o = o + 1
+                        }
+                        val = val + w.sites[s].n
+                        s = s + 1
+                    }
+                }
+            }
+            _ => {}
+        }
+        i++
+    }
+    CovCount { cov = cov; val = val }
+}
+// %-only wrappers — the D4 gate floors read these (function / line / branch).
+exp fn branch_coverage_pct(prog: checker::TProgram) -> u64 { cov_pct(branch_coverage(prog)) }
+exp fn line_coverage_pct(prog: checker::TProgram) -> u64 { cov_pct(line_coverage(prog)) }
 
 // count_prod_fns — the coverage DENOMINATOR: production (non-`#test`) functions in the program.
 fn count_prod_fns(prog: checker::TProgram) -> u64 {
@@ -1779,7 +2258,10 @@ fn count_prod_fns(prog: checker::TProgram) -> u64 {
     loop {
         if i >= prog.items.len { break }
         match prog.items[i] {
-            checker::TFunction as f => { if !f.is_test { n = n + 1 } }
+            // exclude `#test` fns AND the vm.tks functions (namespace "teko::vm"): those implement the
+            // NATIVE VM and are never reached via find_function during interpretation, so counting them
+            // would permanently depress coverage. Mirrors vm.c's count_prod_fns (the vm_ns skip).
+            checker::TFunction as f => { if !f.is_test && f.namespace != "teko::vm" { n = n + 1 } }
             _ => {}
         }
         i++
@@ -1787,11 +2269,6 @@ fn count_prod_fns(prog: checker::TProgram) -> u64 {
     n
 }
 
-// coverage_pct — function-level coverage % from the LAST run (the cov sink still holds its marks):
-// distinct production fns executed * 100 / total production fns. The D4 gate reads this. 100 when
-// there are no production functions (vacuously covered).
-exp fn coverage_pct(prog: checker::TProgram) -> u64 {
-    let total = count_prod_fns(prog)
-    if total == 0 { return 100 }
-    teko::cov_distinct() * 100 / total
-}
+// coverage_pct — the FUNCTION-coverage % (the D4 `functions` floor reads this). 100 when there are
+// no production functions (vacuously covered).
+exp fn coverage_pct(prog: checker::TProgram) -> u64 { cov_pct(functions_coverage(prog)) }

@@ -145,6 +145,22 @@ tk_str *tk_rt_args(uint64_t *n);
 void     tk_cov_reset(void);        // clear the executed-id set (call before a test run)
 void     tk_cov_mark(uint64_t id);  // record an executed id (deduped)
 uint64_t tk_cov_distinct(void);     // how many distinct ids were marked
+bool     tk_cov_is_marked(uint64_t id);   // was this exact id marked?
+
+// D3-branch — branch coverage (only recorded when ON; off by default). enter/leave maintain the
+// current-fn stack so a branch id can pack (fn, line, col, outcome); the report queries hits.
+void     tk_cov_branches_on(bool on);     // enable/disable branch recording
+void     tk_cov_branch_reset(void);       // clear branch marks + fn stack
+void     tk_cov_enter(uint64_t fn);       // push the entered fn's items-index
+void     tk_cov_leave(void);              // pop it
+void     tk_cov_branch(uint32_t line, uint32_t col, uint64_t outcome);   // mark a taken branch outcome (current fn)
+bool     tk_cov_branch_hit(uint64_t fn, uint32_t line, uint32_t col, uint64_t outcome);  // report query
+
+// D3-line — LINE coverage (marked on every evaluated expression; a hash set, only when ON).
+void     tk_cov_lines_on(bool on);
+void     tk_cov_line_reset(void);
+void     tk_cov_line(uint32_t line);                       // mark a line as executed (current fn)
+bool     tk_cov_line_hit(uint64_t fn, uint32_t line);      // report query
 
 // tk_slice_push — the AMORTIZED lowering of `teko::list::push` (a `[]T` grow-by-one). The
 // language keeps value semantics (fixed slices, copy-to-grow — collections #2); this is purely a

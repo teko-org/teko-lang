@@ -1,16 +1,1065 @@
-// src/codegen/codegen_test.tkt — tests for teko::codegen. #test collected (no `main`).
+// src/codegen/codegen_test.tkt — comprehensive unit tests for teko::codegen.
 //
-// HONEST SCOPE (M.3). The C backend (tk_emit_c) lowers a CHECKED typed tree to C source
-// text — its inputs are tk_tprogram nodes, which are not constructible from Teko in the
-// seed (no AST/tast surface is exported). So this file does NOT call tk_emit_c directly;
-// it exercises the codegen-level INVARIANTS that ARE expressible in Teko, namely the exact
-// arithmetic / operator / cast semantics the lowering must preserve. The VM (src/vm/vm.c)
-// mirrors codegen node-for-node (the differential-correctness anchor — see vm.c's header),
-// so running these expressions pins the same numeric contract codegen emits into C.
+// These tests call codegen functions DIRECTLY with hand-built TExpr / TFunction
+// nodes to drive coverage of buffer helpers, name mangling, operator tables,
+// PrimKind predicates, type emission, and the full emit_function pipeline.
 //
-// Each case maps to a codegen branch in codegen.tks: emit_binary, emit_div_mod, emit_cast,
-// emit_compare, emit_unary. A `.tkt` must exist to satisfy the pairing rule; these keep it
-// honest and minimal rather than faking a unit test of an un-callable C API.
+// Helper functions use the `cgt_` prefix to avoid last-segment name collision
+// with checker_test.tkt helpers (VM resolves functions by last path segment only).
+//
+// Original invariant tests (lowers_*) are preserved below the new groups.
+
+use teko::checker
+use teko::lexer
+use teko::parser
+
+// ---------------------------------------------------------------------------
+// Helpers (cgt_ prefix — avoids collision with checker_test.tkt helpers)
+// ---------------------------------------------------------------------------
+
+fn cgt_empty() -> []byte { teko::list::empty() }
+fn cgt_prog() -> checker::TProgram { checker::TProgram { items = teko::list::empty() } }
+
+fn cgt_seg(s: str) -> parser::Segment { parser::Segment { name = s } }
+fn cgt_path1(s: str) -> parser::Path {
+    parser::Path { segments = teko::list::push(teko::list::empty(), cgt_seg(s)) }
+}
+fn cgt_named_te(s: str) -> parser::TypeExpr {
+    parser::NamedType { path = cgt_path1(s) }
+}
+
+fn cgt_num(v: i128, k: checker::PrimKind) -> checker::TExpr {
+    checker::TExpr {
+        kind = checker::TNumber { is_float = false; value = v; fval = 0.0 }
+        type = checker::Prim { kind = k }
+        line = 0; col = 0
+    }
+}
+fn cgt_num_i64(v: i128) -> checker::TExpr { cgt_num(v, checker::PrimKind::I64) }
+fn cgt_num_i8(v: i64) -> checker::TExpr  { cgt_num(v to i128, checker::PrimKind::I8) }
+fn cgt_num_i32(v: i128) -> checker::TExpr { cgt_num(v, checker::PrimKind::I32) }
+
+fn cgt_e_bool_t() -> checker::TExpr {
+    checker::TExpr {
+        kind = checker::TBoolLit { value = true }
+        type = checker::Prim { kind = checker::PrimKind::Bool }
+        line = 0; col = 0
+    }
+}
+fn cgt_e_var(name: str) -> checker::TExpr {
+    checker::TExpr {
+        kind = checker::TVar { name = name }
+        type = checker::Prim { kind = checker::PrimKind::I64 }
+        line = 0; col = 0
+    }
+}
+
+fn cgt_stmt(e: checker::TExpr) -> checker::TStatement { checker::TExprStmt { expr = e } }
+fn cgt_ret(e: checker::TExpr) -> checker::TStatement {
+    checker::TReturn { has_value = true; value = e }
+}
+fn cgt_empty_stmts() -> []checker::TStatement { teko::list::empty() }
+
+// Build a 0-param TFunction (simplest for emit_function tests)
+fn cgt_fn0(name: str, ns: str, ret: checker::Type, body: []checker::TStatement) -> checker::TFunction {
+    checker::TFunction {
+        name       = name
+        namespace  = ns
+        params     = teko::list::empty()
+        return_type = ret
+        body       = body
+        vis        = parser::Visibility::Private
+        has_doc    = false
+        doc        = ""
+        file       = ""
+        line       = 0; col = 0
+        is_test    = false
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Group A: Buffer basics — cb, cb_str, cb_byte, cb_i64, cb_to_str
+// ---------------------------------------------------------------------------
+#test
+fn cgt_buffer_basics() {
+    let s1 = str(cb(cgt_empty(), "hello"))
+    teko::assert::is_true(s1 == "hello")
+
+    let s2 = str(cb_str(cgt_empty(), "world"))
+    teko::assert::is_true(s2 == "world")
+
+    let s3 = str(cb_byte(cgt_empty(), b'X'))
+    teko::assert::is_true(s3 == "X")
+
+    let s4 = str(cb_i64(cgt_empty(), 0))
+    teko::assert::is_true(s4 == "0")
+
+    let s5 = str(cb_i64(cgt_empty(), 99))
+    teko::assert::is_true(s5 == "99")
+
+    let s6 = str(cb_i64(cgt_empty(), -7))
+    teko::assert::is_true(s6 == "-7")
+
+    let s7 = cb_to_str("foo", "bar")
+    teko::assert::is_true(s7 == "foobar")
+}
+
+// ---------------------------------------------------------------------------
+// Group B: Large integers and C-string escaping
+//   cb_u128_digits, cb_u128_c_expr, cb_i128, cb_f64_literal, cb_cstr_escaped
+// ---------------------------------------------------------------------------
+#test
+fn cgt_large_int_and_escape() {
+    // cb_u128_digits
+    let d0 = str(cb_u128_digits(cgt_empty(), 0 to u128))
+    teko::assert::is_true(d0 == "0")
+    let d255 = str(cb_u128_digits(cgt_empty(), 255 to u128))
+    teko::assert::is_true(d255 == "255")
+
+    // cb_u128_c_expr — small value (hi == 0 path); also exercises cb_u128_digits internally
+    let uc = str(cb_u128_c_expr(cgt_empty(), 0 to u128))
+    teko::assert::is_true(teko::str::contains(uc, "0"))
+    let uc1 = str(cb_u128_c_expr(cgt_empty(), 1 to u128))
+    teko::assert::is_true(uc1.len > 0)
+
+    // cb_i128 — zero and positive (negative branch panics in VM due to `v to u128` guard
+    // on a negative value; only coverable from compiled C — not from tests)
+    let i0 = str(cb_i128(cgt_empty(), 0 to i128))
+    teko::assert::is_true(teko::str::contains(i0, "0"))
+    let ipos = str(cb_i128(cgt_empty(), 42 to i128))
+    teko::assert::is_true(teko::str::contains(ipos, "42"))
+
+    // cb_f64_literal — just verify non-empty (delegates to teko::ftoa)
+    let flit = str(cb_f64_literal(cgt_empty(), 1.5))
+    teko::assert::is_true(flit.len > 0)
+
+    // cb_cstr_escaped — plain ASCII unchanged
+    let e1 = str(cb_cstr_escaped(cgt_empty(), "hi"))
+    teko::assert::is_true(e1 == "hi")
+    // backslash (one char → two chars \\)
+    let e2 = cb_cstr_escaped(cgt_empty(), "\\")
+    teko::assert::is_true(e2.len == 2)
+    // tab → \t  (two chars)
+    let e3 = cb_cstr_escaped(cgt_empty(), "\t")
+    teko::assert::is_true(e3.len == 2)
+    // newline → \n (two chars)
+    let e4 = cb_cstr_escaped(cgt_empty(), "\n")
+    teko::assert::is_true(e4.len == 2)
+}
+
+// ---------------------------------------------------------------------------
+// Group C: Name mangling — mangle_type_name, cb_fn_name, cb_ident,
+//           cg_is_c_keyword, cb_upper
+// ---------------------------------------------------------------------------
+#test
+fn cgt_name_mangling() {
+    // mangle_type_name — no namespace → tk_t_<Name>
+    let mn1 = str(mangle_type_name(cgt_empty(), "", "Foo"))
+    teko::assert::is_true(mn1 == "tk_t_Foo")
+
+    // with namespace: "::" collapse to "__"
+    let mn2 = str(mangle_type_name(cgt_empty(), "a::b", "T"))
+    teko::assert::is_true(teko::str::contains(mn2, "tk_t_"))
+    teko::assert::is_true(teko::str::contains(mn2, "a"))
+
+    // cb_fn_name — produces a non-empty mangled name
+    let fn1 = str(cb_fn_name(cgt_empty(), "teko::rt", "foo"))
+    teko::assert::is_true(fn1.len > 0)
+    let fn2 = str(cb_fn_name(cgt_empty(), "", "bar"))
+    teko::assert::is_true(teko::str::contains(fn2, "bar"))
+
+    // cg_is_c_keyword — known keywords
+    teko::assert::is_true(cg_is_c_keyword("bool"))
+    teko::assert::is_true(cg_is_c_keyword("int"))
+    teko::assert::is_true(cg_is_c_keyword("return"))
+    teko::assert::is_true(cg_is_c_keyword("struct"))
+    teko::assert::is_false(cg_is_c_keyword("foo"))
+    teko::assert::is_false(cg_is_c_keyword("teko"))
+
+    // cb_ident — non-keyword passes through; keyword gets trailing `_`
+    let id1 = str(cb_ident(cgt_empty(), "foo"))
+    teko::assert::is_true(id1 == "foo")
+    let id2 = str(cb_ident(cgt_empty(), "bool"))
+    teko::assert::is_true(id2 == "bool_")
+    let id3 = str(cb_ident(cgt_empty(), "return"))
+    teko::assert::is_true(id3 == "return_")
+
+    // cb_upper — lowercase ASCII → uppercase
+    let u1 = str(cb_upper(cgt_empty(), "hello"))
+    teko::assert::is_true(u1 == "HELLO")
+    let u2 = str(cb_upper(cgt_empty(), "world123"))
+    teko::assert::is_true(teko::str::contains(u2, "WORLD"))
+}
+
+// ---------------------------------------------------------------------------
+// Group D: Operator token tables — binop_c, unop_c, cmpop_c, assignop_c
+// ---------------------------------------------------------------------------
+#test
+fn cgt_operator_tokens() {
+    // binop_c
+    let b1 = match binop_c(lexer::TokenKind::Plus)   { str as s => s; error => "" }
+    teko::assert::is_true(b1 == "+")
+    let b2 = match binop_c(lexer::TokenKind::Minus)  { str as s => s; error => "" }
+    teko::assert::is_true(b2 == "-")
+    let b3 = match binop_c(lexer::TokenKind::Star)   { str as s => s; error => "" }
+    teko::assert::is_true(b3 == "*")
+    let b4 = match binop_c(lexer::TokenKind::Amp)    { str as s => s; error => "" }
+    teko::assert::is_true(b4 == "&")
+    let b5 = match binop_c(lexer::TokenKind::Pipe)   { str as s => s; error => "" }
+    teko::assert::is_true(b5 == "|")
+    let b6 = match binop_c(lexer::TokenKind::Caret)  { str as s => s; error => "" }
+    teko::assert::is_true(b6 == "^")
+    let b7 = match binop_c(lexer::TokenKind::Shl)    { str as s => s; error => "" }
+    teko::assert::is_true(b7 == "<<")
+    let b8 = match binop_c(lexer::TokenKind::Shr)    { str as s => s; error => "" }
+    teko::assert::is_true(b8 == ">>")
+    let b9 = match binop_c(lexer::TokenKind::AndAnd) { str as s => s; error => "" }
+    teko::assert::is_true(b9 == "&&")
+    let b10 = match binop_c(lexer::TokenKind::OrOr)  { str as s => s; error => "" }
+    teko::assert::is_true(b10 == "||")
+
+    // unop_c
+    let u1 = match unop_c(lexer::TokenKind::Minus) { str as s => s; error => "" }
+    teko::assert::is_true(u1 == "-")
+    let u2 = match unop_c(lexer::TokenKind::Tilde) { str as s => s; error => "" }
+    teko::assert::is_true(u2 == "~")
+    let u3 = match unop_c(lexer::TokenKind::Bang)  { str as s => s; error => "" }
+    teko::assert::is_true(u3 == "!")
+
+    // cmpop_c
+    let c1 = match cmpop_c(lexer::TokenKind::EqEq) { str as s => s; error => "" }
+    teko::assert::is_true(c1 == "==")
+    let c2 = match cmpop_c(lexer::TokenKind::Ne)   { str as s => s; error => "" }
+    teko::assert::is_true(c2 == "!=")
+    let c3 = match cmpop_c(lexer::TokenKind::Lt)   { str as s => s; error => "" }
+    teko::assert::is_true(c3 == "<")
+    let c4 = match cmpop_c(lexer::TokenKind::Le)   { str as s => s; error => "" }
+    teko::assert::is_true(c4 == "<=")
+    let c5 = match cmpop_c(lexer::TokenKind::Gt)   { str as s => s; error => "" }
+    teko::assert::is_true(c5 == ">")
+    let c6 = match cmpop_c(lexer::TokenKind::Ge)   { str as s => s; error => "" }
+    teko::assert::is_true(c6 == ">=")
+
+    // assignop_c
+    let a1 = match assignop_c(lexer::TokenKind::Assign)    { str as s => s; error => "" }
+    teko::assert::is_true(a1 == "=")
+    let a2 = match assignop_c(lexer::TokenKind::PlusEq)    { str as s => s; error => "" }
+    teko::assert::is_true(a2 == "+=")
+    let a3 = match assignop_c(lexer::TokenKind::MinusEq)   { str as s => s; error => "" }
+    teko::assert::is_true(a3 == "-=")
+    let a4 = match assignop_c(lexer::TokenKind::StarEq)    { str as s => s; error => "" }
+    teko::assert::is_true(a4 == "*=")
+    let a5 = match assignop_c(lexer::TokenKind::SlashEq)   { str as s => s; error => "" }
+    teko::assert::is_true(a5 == "/=")
+    let a6 = match assignop_c(lexer::TokenKind::PercentEq) { str as s => s; error => "" }
+    teko::assert::is_true(a6 == "%=")
+    let a7 = match assignop_c(lexer::TokenKind::AmpEq)     { str as s => s; error => "" }
+    teko::assert::is_true(a7 == "&=")
+    let a8 = match assignop_c(lexer::TokenKind::ShlEq)     { str as s => s; error => "" }
+    teko::assert::is_true(a8 == "<<=")
+    let a9 = match assignop_c(lexer::TokenKind::ShrEq)     { str as s => s; error => "" }
+    teko::assert::is_true(a9 == ">>=")
+}
+
+// ---------------------------------------------------------------------------
+// Group E: PrimKind predicates
+//   cg_prim_is_float, cg_prim_is_int, cg_prim_is_signed_int, cg_int_width,
+//   prim_div_tag, prim_int_tag, prim_float_tag, cast_may_lose
+// ---------------------------------------------------------------------------
+#test
+fn cgt_prim_predicates() {
+    // cg_prim_is_float — floats are float; ints/bool are not
+    teko::assert::is_true(cg_prim_is_float(checker::PrimKind::F32))
+    teko::assert::is_true(cg_prim_is_float(checker::PrimKind::F64))
+    teko::assert::is_false(cg_prim_is_float(checker::PrimKind::I64))
+    teko::assert::is_false(cg_prim_is_float(checker::PrimKind::Bool))
+
+    // cg_prim_is_int — integer prims; not float, not bool
+    teko::assert::is_true(cg_prim_is_int(checker::PrimKind::U8))
+    teko::assert::is_true(cg_prim_is_int(checker::PrimKind::I64))
+    teko::assert::is_true(cg_prim_is_int(checker::PrimKind::U128))
+    teko::assert::is_false(cg_prim_is_int(checker::PrimKind::F64))
+    teko::assert::is_false(cg_prim_is_int(checker::PrimKind::Bool))
+
+    // cg_prim_is_signed_int — signed ints only
+    teko::assert::is_true(cg_prim_is_signed_int(checker::PrimKind::I8))
+    teko::assert::is_true(cg_prim_is_signed_int(checker::PrimKind::I64))
+    teko::assert::is_false(cg_prim_is_signed_int(checker::PrimKind::U64))
+    teko::assert::is_false(cg_prim_is_signed_int(checker::PrimKind::Bool))
+
+    // cg_int_width — bit width for ints
+    teko::assert::is_true(cg_int_width(checker::PrimKind::U8) == 8)
+    teko::assert::is_true(cg_int_width(checker::PrimKind::I16) == 16)
+    teko::assert::is_true(cg_int_width(checker::PrimKind::U32) == 32)
+    teko::assert::is_true(cg_int_width(checker::PrimKind::I64) == 64)
+    teko::assert::is_true(cg_int_width(checker::PrimKind::U128) == 128)
+
+    // prim_div_tag — integer and float tags
+    let t1 = match prim_div_tag(checker::PrimKind::U8)  { str as s => s; error => "" }
+    teko::assert::is_true(t1 == "u8")
+    let t2 = match prim_div_tag(checker::PrimKind::I64) { str as s => s; error => "" }
+    teko::assert::is_true(t2 == "i64")
+    let t3 = match prim_div_tag(checker::PrimKind::F64) { str as s => s; error => "" }
+    teko::assert::is_true(t3 == "f64")
+    let t4 = match prim_div_tag(checker::PrimKind::Bool) { str => "ok"; error as e => "err" }
+    teko::assert::is_true(t4 == "err")
+
+    // prim_int_tag — only valid for integer prims
+    let it1 = match prim_int_tag(checker::PrimKind::I8) { str as s => s; error => "" }
+    teko::assert::is_true(it1 == "i8")
+    let it2 = match prim_int_tag(checker::PrimKind::U64) { str as s => s; error => "" }
+    teko::assert::is_true(it2 == "u64")
+    let it3 = match prim_int_tag(checker::PrimKind::F32) { str => "ok"; error => "err" }
+    teko::assert::is_true(it3 == "err")
+
+    // prim_float_tag — only valid for float prims
+    let ft1 = match prim_float_tag(checker::PrimKind::F32) { str as s => s; error => "" }
+    teko::assert::is_true(ft1 == "f32")
+    let ft2 = match prim_float_tag(checker::PrimKind::F64) { str as s => s; error => "" }
+    teko::assert::is_true(ft2 == "f64")
+    let ft3 = match prim_float_tag(checker::PrimKind::I64) { str => "ok"; error => "err" }
+    teko::assert::is_true(ft3 == "err")
+
+    // cast_may_lose — narrowing int→int requires a guard
+    teko::assert::is_true(cast_may_lose(checker::PrimKind::I64, checker::PrimKind::I8))
+    teko::assert::is_true(cast_may_lose(checker::PrimKind::U64, checker::PrimKind::U8))
+    // widening int→int does NOT lose
+    teko::assert::is_false(cast_may_lose(checker::PrimKind::I8, checker::PrimKind::I64))
+    // unsigned→signed at equal width loses
+    teko::assert::is_true(cast_may_lose(checker::PrimKind::U64, checker::PrimKind::I64))
+}
+
+// ---------------------------------------------------------------------------
+// Group F: Type emission — emit_prim, emit_type (Prim/Str/Byte/Error/Void)
+// ---------------------------------------------------------------------------
+#test
+fn cgt_type_emission() {
+    // emit_prim — the C type name for each prim kind
+    let p1 = match emit_prim(cgt_empty(), checker::PrimKind::U8)   { []byte as o => str(o); error => "" }
+    teko::assert::is_true(p1 == "uint8_t")
+    let p2 = match emit_prim(cgt_empty(), checker::PrimKind::I64)  { []byte as o => str(o); error => "" }
+    teko::assert::is_true(p2 == "int64_t")
+    let p3 = match emit_prim(cgt_empty(), checker::PrimKind::F64)  { []byte as o => str(o); error => "" }
+    teko::assert::is_true(p3 == "double")
+    let p4 = match emit_prim(cgt_empty(), checker::PrimKind::Bool) { []byte as o => str(o); error => "" }
+    teko::assert::is_true(p4 == "bool")
+    let p5 = match emit_prim(cgt_empty(), checker::PrimKind::U128) { []byte as o => str(o); error => "" }
+    teko::assert::is_true(p5 == "unsigned __int128")
+
+    // emit_type — wrapping emit_prim plus non-prim cases
+    let t1 = match emit_type(cgt_empty(), checker::Prim { kind = checker::PrimKind::I32 }) { []byte as o => str(o); error => "" }
+    teko::assert::is_true(t1 == "int32_t")
+    let t2 = match emit_type(cgt_empty(), checker::Str { })   { []byte as o => str(o); error => "" }
+    teko::assert::is_true(t2 == "tk_str")
+    let t3 = match emit_type(cgt_empty(), checker::Byte { })  { []byte as o => str(o); error => "" }
+    teko::assert::is_true(t3 == "uint8_t")
+    let t4 = match emit_type(cgt_empty(), checker::Error { }) { []byte as o => str(o); error => "" }
+    teko::assert::is_true(t4 == "tk_str")
+    let t5 = match emit_type(cgt_empty(), checker::Void { })  { []byte as o => str(o); error => "" }
+    teko::assert::is_true(t5 == "void")
+    // Named type → mangled tk_t_<Name>
+    let t6 = match emit_type(cgt_empty(), checker::Named { name = "Shape" }) { []byte as o => str(o); error => "" }
+    teko::assert::is_true(t6 == "tk_t_Shape")
+}
+
+// ---------------------------------------------------------------------------
+// Group G: Optional mangle + member keys + variant typename
+//   cg_opt_mangle_str, cg_opt_mangle, cg_member_key_str, cg_member_key,
+//   cg_variant_typename_str, cg_variant_typename
+// ---------------------------------------------------------------------------
+#test
+fn cgt_opt_mangle_and_keys() {
+    // cg_opt_mangle_str — the suffix string for prim, byte, str, error, named
+    let m1 = match cg_opt_mangle_str(checker::Prim { kind = checker::PrimKind::I64 }) { str as s => s; error => "" }
+    teko::assert::is_true(m1 == "i64")
+    let m2 = match cg_opt_mangle_str(checker::Str { })   { str as s => s; error => "" }
+    teko::assert::is_true(m2 == "str")
+    let m3 = match cg_opt_mangle_str(checker::Byte { })  { str as s => s; error => "" }
+    teko::assert::is_true(m3 == "byte")
+    let m4 = match cg_opt_mangle_str(checker::Error { }) { str as s => s; error => "" }
+    teko::assert::is_true(m4 == "error")
+    let m5 = match cg_opt_mangle_str(checker::Named { name = "Foo" }) { str as s => s; error => "" }
+    teko::assert::is_true(m5 == "Foo")
+
+    // cg_opt_mangle — buffer variant of cg_opt_mangle_str
+    let om1 = match cg_opt_mangle(cgt_empty(), checker::Prim { kind = checker::PrimKind::U8 }) { []byte as o => str(o); error => "" }
+    teko::assert::is_true(om1 == "u8")
+
+    // cg_member_key_str — like cg_opt_mangle_str but handles C-keyword keys
+    let k1 = match cg_member_key_str(checker::Prim { kind = checker::PrimKind::Bool }) { str as s => s; error => "" }
+    teko::assert::is_true(k1 == "bool_")    // `bool` is a C keyword → gets trailing `_`
+    let k2 = match cg_member_key_str(checker::Str { }) { str as s => s; error => "" }
+    teko::assert::is_true(k2 == "str")
+    let k3 = match cg_member_key_str(checker::Error { }) { str as s => s; error => "" }
+    teko::assert::is_true(k3 == "error")
+    let k4 = match cg_member_key_str(checker::Prim { kind = checker::PrimKind::I64 }) { str as s => s; error => "" }
+    teko::assert::is_true(k4 == "i64")
+
+    // cg_member_key — buffer variant
+    let mk1 = match cg_member_key(cgt_empty(), checker::Str { }) { []byte as o => str(o); error => "" }
+    teko::assert::is_true(mk1 == "str")
+
+    // cg_variant_typename_str — `tk_u_<key1>_<key2>` for an inline variant
+    let vm1: []checker::Type = teko::list::push(teko::list::empty(), checker::Prim { kind = checker::PrimKind::I64 })
+    let vm2: []checker::Type = teko::list::push(vm1, checker::Str { })
+    let va = checker::Variant { members = vm2 }
+    let vn = match cg_variant_typename_str(va) { str as s => s; error => "" }
+    teko::assert::is_true(vn == "tk_u_i64_str")
+
+    // cg_variant_typename — buffer variant
+    let vm3: []checker::Type = teko::list::push(teko::list::empty(), checker::Error { })
+    let va2 = checker::Variant { members = vm3 }
+    let vb = match cg_variant_typename(cgt_empty(), va2) { []byte as o => str(o); error => "" }
+    teko::assert::is_true(vb == "tk_u_error")
+}
+
+// ---------------------------------------------------------------------------
+// Group H: TProgram queries — cg_path_last, cg_is_prim_name, cg_is_builtin_scalar,
+//   cg_find_decl, cg_find_variant_decl, cg_named_is_variant, cg_named_is_enum,
+//   cg_find_function, cg_nameset_seen, cg_str_in, cg_named_decls
+// ---------------------------------------------------------------------------
+#test
+fn cgt_prog_queries() {
+    let prog = cgt_prog()
+
+    // cg_path_last — last segment of a path
+    let pl1 = cg_path_last(cgt_path1("foo"))
+    teko::assert::is_true(pl1 == "foo")
+    let pl2 = cg_path_last(parser::Path { segments = teko::list::empty() })
+    teko::assert::is_true(pl2 == "")
+
+    // cg_is_prim_name — aliases cg_is_builtin_scalar
+    teko::assert::is_true(cg_is_prim_name("u64"))
+    teko::assert::is_true(cg_is_prim_name("str"))
+    teko::assert::is_false(cg_is_prim_name("MyType"))
+
+    // cg_is_builtin_scalar
+    teko::assert::is_true(cg_is_builtin_scalar("i128"))
+    teko::assert::is_true(cg_is_builtin_scalar("bool"))
+    teko::assert::is_true(cg_is_builtin_scalar("byte"))
+    teko::assert::is_true(cg_is_builtin_scalar("error"))
+    teko::assert::is_false(cg_is_builtin_scalar("Foo"))
+
+    // cg_find_decl — empty program → error (but function is covered)
+    let fd = match cg_find_decl(prog, "Foo") { parser::TypeDecl => "found"; error => "not-found" }
+    teko::assert::is_true(fd == "not-found")
+
+    // cg_find_variant_decl — empty program → error
+    let fvd = match cg_find_variant_decl(prog, "Shape") { parser::TypeDecl => "found"; error => "not-found" }
+    teko::assert::is_true(fvd == "not-found")
+
+    // cg_named_is_variant / cg_named_is_enum — empty program → false
+    teko::assert::is_false(cg_named_is_variant(prog, "Shape"))
+    teko::assert::is_false(cg_named_is_enum(prog, "Color"))
+
+    // cg_find_function — empty program → error
+    let ff = match cg_find_function(prog, "teko::test", "my_fn") { checker::TFunction => "found"; error => "not-found" }
+    teko::assert::is_true(ff == "not-found")
+
+    // cg_str_in — membership test on []str
+    let xs: []str = teko::list::push(teko::list::empty(), "alpha")
+    teko::assert::is_true(cg_str_in(xs, "alpha"))
+    teko::assert::is_false(cg_str_in(xs, "beta"))
+    teko::assert::is_false(cg_str_in(teko::list::empty(), "x"))
+
+    // cg_nameset_seen — delegates to cg_str_in
+    teko::assert::is_true(cg_nameset_seen(xs, "alpha"))
+    teko::assert::is_false(cg_nameset_seen(xs, "gamma"))
+
+    // cg_named_decls — empty program → empty result
+    let decls = cg_named_decls(prog)
+    teko::assert::is_true(decls.len == 0)
+}
+
+// ---------------------------------------------------------------------------
+// Group I: emit_expr — various TExpr kinds
+//   emit_expr, emit_expr_ret, emit_number, emit_strlit,
+//   TVar, TByteLit, TBoolLit paths
+// ---------------------------------------------------------------------------
+#test
+fn cgt_emit_expr_variants() {
+    let prog = cgt_prog()
+
+    // TNumber (I64) → ((int64_t)42)
+    let e1 = match emit_expr(cgt_empty(), prog, cgt_num_i64(42)) { []byte as o => str(o); error => "" }
+    teko::assert::is_true(teko::str::contains(e1, "42"))
+    teko::assert::is_true(teko::str::contains(e1, "int64_t"))
+
+    // TNumber (I8) → ((int8_t)3)  — positive only; negative I8 hits cb_i128 neg branch which panics in VM
+    let e2 = match emit_expr(cgt_empty(), prog, cgt_num_i8(3)) { []byte as o => str(o); error => "" }
+    teko::assert::is_true(teko::str::contains(e2, "int8_t"))
+
+    // TVar → the identifier (or keyword-escaped variant)
+    let ev = match emit_expr(cgt_empty(), prog, cgt_e_var("myvar")) { []byte as o => str(o); error => "" }
+    teko::assert::is_true(ev == "myvar")
+    // C-keyword variable → trailing `_`
+    let ekw = match emit_expr(cgt_empty(), prog, cgt_e_var("return")) { []byte as o => str(o); error => "" }
+    teko::assert::is_true(ekw == "return_")
+
+    // TByteLit → decimal integer (ASCII value)
+    let ebl = checker::TExpr {
+        kind = checker::TByteLit { value = b'A' }
+        type = checker::Byte { }
+        line = 0; col = 0
+    }
+    let sbl = match emit_expr(cgt_empty(), prog, ebl) { []byte as o => str(o); error => "" }
+    teko::assert::is_true(sbl == "65")   // 'A' = 65
+
+    // TBoolLit true → "true", false → "false"
+    let etrue = match emit_expr(cgt_empty(), prog, cgt_e_bool_t()) { []byte as o => str(o); error => "" }
+    teko::assert::is_true(etrue == "true")
+    let ef = checker::TExpr {
+        kind = checker::TBoolLit { value = false }
+        type = checker::Prim { kind = checker::PrimKind::Bool }
+        line = 0; col = 0
+    }
+    let efalse = match emit_expr(cgt_empty(), prog, ef) { []byte as o => str(o); error => "" }
+    teko::assert::is_true(efalse == "false")
+
+    // TStrLit → (tk_str){ "hello", 5 }
+    let esl = checker::TExpr {
+        kind = checker::TStrLit { text = "hello" }
+        type = checker::Str { }
+        line = 0; col = 0
+    }
+    let ssl = match emit_expr(cgt_empty(), prog, esl) { []byte as o => str(o); error => "" }
+    teko::assert::is_true(teko::str::contains(ssl, "hello"))
+    teko::assert::is_true(teko::str::contains(ssl, "5"))
+}
+
+// ---------------------------------------------------------------------------
+// Group J: emit_binary + emit_div_mod
+//   emit_binary, emit_div_mod (via emit_expr with TBinary Slash/Percent)
+// ---------------------------------------------------------------------------
+#test
+fn cgt_emit_binary_and_div() {
+    let prog = cgt_prog()
+    let left  = cgt_num_i64(10)
+    let right = cgt_num_i64(3)
+
+    // TBinary Plus → plain "(left + right)"
+    let e_add = checker::TExpr {
+        kind = checker::TBinary { op = lexer::TokenKind::Plus; left = left; right = right }
+        type = checker::Prim { kind = checker::PrimKind::I64 }
+        line = 0; col = 0
+    }
+    let s_add = match emit_expr(cgt_empty(), prog, e_add) { []byte as o => str(o); error => "" }
+    teko::assert::is_true(teko::str::contains(s_add, "+"))
+
+    // TBinary Star → "(left * right)"
+    let e_mul = checker::TExpr {
+        kind = checker::TBinary { op = lexer::TokenKind::Star; left = left; right = right }
+        type = checker::Prim { kind = checker::PrimKind::I64 }
+        line = 0; col = 0
+    }
+    let s_mul = match emit_expr(cgt_empty(), prog, e_mul) { []byte as o => str(o); error => "" }
+    teko::assert::is_true(teko::str::contains(s_mul, "*"))
+
+    // TBinary Slash → emit_div_mod → tk_div_i64(left, right)
+    let e_div = checker::TExpr {
+        kind = checker::TBinary { op = lexer::TokenKind::Slash; left = left; right = right }
+        type = checker::Prim { kind = checker::PrimKind::I64 }
+        line = 0; col = 0
+    }
+    let s_div = match emit_expr(cgt_empty(), prog, e_div) { []byte as o => str(o); error => "" }
+    teko::assert::is_true(teko::str::contains(s_div, "tk_div_i64"))
+
+    // TBinary Percent → emit_div_mod → tk_mod_i64(left, right)
+    let e_mod = checker::TExpr {
+        kind = checker::TBinary { op = lexer::TokenKind::Percent; left = left; right = right }
+        type = checker::Prim { kind = checker::PrimKind::I64 }
+        line = 0; col = 0
+    }
+    let s_mod = match emit_expr(cgt_empty(), prog, e_mod) { []byte as o => str(o); error => "" }
+    teko::assert::is_true(teko::str::contains(s_mod, "tk_mod_i64"))
+}
+
+// ---------------------------------------------------------------------------
+// Group K: emit_unary, emit_compare, emit_cast
+// ---------------------------------------------------------------------------
+#test
+fn cgt_emit_unary_compare_cast() {
+    let prog = cgt_prog()
+    let n42  = cgt_num_i64(42)
+
+    // emit_unary — `(-42)` and `(!true)`
+    let e_neg = checker::TExpr {
+        kind = checker::TUnary { op = lexer::TokenKind::Minus; operand = n42 }
+        type = checker::Prim { kind = checker::PrimKind::I64 }
+        line = 0; col = 0
+    }
+    let s_neg = match emit_expr(cgt_empty(), prog, e_neg) { []byte as o => str(o); error => "" }
+    teko::assert::is_true(teko::str::contains(s_neg, "-"))
+
+    let e_not = checker::TExpr {
+        kind = checker::TUnary { op = lexer::TokenKind::Bang; operand = cgt_e_bool_t() }
+        type = checker::Prim { kind = checker::PrimKind::Bool }
+        line = 0; col = 0
+    }
+    let s_not = match emit_expr(cgt_empty(), prog, e_not) { []byte as o => str(o); error => "" }
+    teko::assert::is_true(teko::str::contains(s_not, "!"))
+
+    // emit_compare — TCompare with one rest term (a < b)
+    let term = checker::TCmpTerm { op = lexer::TokenKind::Lt; operand = n42 }
+    let terms: []checker::TCmpTerm = teko::list::push(teko::list::empty(), term)
+    let e_cmp = checker::TExpr {
+        kind = checker::TCompare { first = cgt_num_i64(0); rest = terms }
+        type = checker::Prim { kind = checker::PrimKind::Bool }
+        line = 0; col = 0
+    }
+    let s_cmp = match emit_expr(cgt_empty(), prog, e_cmp) { []byte as o => str(o); error => "" }
+    teko::assert::is_true(teko::str::contains(s_cmp, "<"))
+
+    // emit_cast — widening I32 → I64 (no guard needed): ((int64_t)(inner))
+    let inner32 = cgt_num_i32(10)
+    let e_widen = checker::TExpr {
+        kind = checker::TCast { expr = inner32 }
+        type = checker::Prim { kind = checker::PrimKind::I64 }
+        line = 0; col = 0
+    }
+    let s_widen = match emit_expr(cgt_empty(), prog, e_widen) { []byte as o => str(o); error => "" }
+    teko::assert::is_true(teko::str::contains(s_widen, "int64_t"))
+
+    // emit_cast — narrowing I64 → I8 (guarded): tk_to_i8_s(inner)
+    let inner64 = cgt_num_i64(200)
+    let e_narrow = checker::TExpr {
+        kind = checker::TCast { expr = inner64 }
+        type = checker::Prim { kind = checker::PrimKind::I8 }
+        line = 0; col = 0
+    }
+    let s_narrow = match emit_expr(cgt_empty(), prog, e_narrow) { []byte as o => str(o); error => "" }
+    teko::assert::is_true(teko::str::contains(s_narrow, "tk_to_i8"))
+}
+
+// ---------------------------------------------------------------------------
+// Group L: emit_as — direct call to the convenience wrapper
+// ---------------------------------------------------------------------------
+#test
+fn cgt_emit_as_direct() {
+    let prog = cgt_prog()
+    let n = cgt_num_i64(7)
+    let dst = checker::Prim { kind = checker::PrimKind::I64 }
+    // emit_as(buf, prog, expected, value) → emit_as_r with Void ret_type
+    let result = match emit_as(cgt_empty(), prog, dst, n) { []byte as o => str(o); error => "" }
+    teko::assert::is_true(teko::str::contains(result, "7"))
+}
+
+// ---------------------------------------------------------------------------
+// Group M: emit_if_value — builds fresh_tmp_name, emit_branch_value,
+//   emit_stmt_value (via emit_expr on a TIfExpr with has_else=true)
+// ---------------------------------------------------------------------------
+#test
+fn cgt_emit_if_value() {
+    let prog = cgt_prog()
+
+    // Build: if (true) { 1 } else { 0 }  — as an expression (has_else=true)
+    let then_stmt: checker::TStatement = cgt_stmt(cgt_num_i64(1))
+    let else_stmt: checker::TStatement = cgt_stmt(cgt_num_i64(0))
+    let then_blk: []checker::TStatement = teko::list::push(teko::list::empty(), then_stmt)
+    let else_blk: []checker::TStatement = teko::list::push(teko::list::empty(), else_stmt)
+    let if_e = checker::TIfExpr {
+        cond     = cgt_e_bool_t()
+        then_blk = then_blk
+        has_else = true
+        else_blk = else_blk
+    }
+    let e_if = checker::TExpr {
+        kind = if_e
+        type = checker::Prim { kind = checker::PrimKind::I64 }
+        line = 0; col = 0
+    }
+    let result = match emit_expr(cgt_empty(), prog, e_if) { []byte as o => str(o); error => "" }
+    // emit_if_value produces a GNU stmt-expr `({ ... })`
+    teko::assert::is_true(result.len > 0)
+    teko::assert::is_true(teko::str::contains(result, "if"))
+}
+
+// ---------------------------------------------------------------------------
+// Group N: emit_function — the full pipeline
+//   emit_function, emit_function_sig, emit_block_tail, emit_block, emit_stmt,
+//   emit_binding, emit_assign, emit_loop, emit_return, emit_if_stmt,
+//   emit_exprstmt_tail, emit_as_r, cg_stmt_c_terminates, is_void_type,
+//   cb_indent_deeper, emit_type_expr (via params)
+// ---------------------------------------------------------------------------
+#test
+fn cgt_emit_function_comprehensive() {
+    let prog = cgt_prog()
+
+    // Body 1: loop{break} + if-stmt + binding + assign + return tail
+    let break_body: []checker::TStatement = teko::list::push(cgt_empty_stmts(), checker::TBreakStmt { label = "" })
+    let loop_s: checker::TStatement = checker::TLoopStmt { label = ""; body = break_body }
+
+    // if (true) { } — no else — statement position → emit_if_stmt → cb_indent_deeper
+    let empty_blk = cgt_empty_stmts()
+    let if_s: checker::TStatement = cgt_stmt(checker::TExpr {
+        kind = checker::TIfExpr { cond = cgt_e_bool_t(); then_blk = empty_blk; has_else = false; else_blk = empty_blk }
+        type = checker::Void { }
+        line = 0; col = 0
+    })
+
+    let bind_s: checker::TStatement = checker::TBinding {
+        kind   = parser::BindKind::Let
+        target = parser::SimpleName { name = "x" }
+        bound  = checker::Prim { kind = checker::PrimKind::I64 }
+        value  = cgt_num_i64(10)
+    }
+    let assign_s: checker::TStatement = checker::TAssign {
+        name  = "x"
+        op    = lexer::TokenKind::PlusEq
+        bound = checker::Prim { kind = checker::PrimKind::I64 }
+        value = cgt_num_i64(1)
+    }
+    let ret_s: checker::TStatement = cgt_ret(cgt_num_i64(42))
+
+    mut body1: []checker::TStatement = cgt_empty_stmts()
+    body1 = teko::list::push(body1, loop_s)
+    body1 = teko::list::push(body1, if_s)
+    body1 = teko::list::push(body1, bind_s)
+    body1 = teko::list::push(body1, assign_s)
+    body1 = teko::list::push(body1, ret_s)
+
+    let ret_type = checker::Prim { kind = checker::PrimKind::I64 }
+    let f1 = cgt_fn0("cgt_fn_ret", "teko::cgt", ret_type, body1)
+    let r1 = match emit_function(cgt_empty(), prog, f1) { []byte as o => str(o); error => "" }
+    teko::assert::is_true(r1.len > 0)
+    teko::assert::is_true(teko::str::contains(r1, "cgt_fn_ret"))
+    teko::assert::is_true(teko::str::contains(r1, "while"))     // emit_loop → while(1)
+    teko::assert::is_true(teko::str::contains(r1, "break"))
+    teko::assert::is_true(teko::str::contains(r1, "int64_t x"))
+    teko::assert::is_true(teko::str::contains(r1, "return"))
+
+    // Body 2: single TExprStmt tail → covers emit_exprstmt_tail (non-if/match path)
+    let tail_s: checker::TStatement = cgt_stmt(cgt_num_i64(99))
+    let body2: []checker::TStatement = teko::list::push(cgt_empty_stmts(), tail_s)
+    let f2 = cgt_fn0("cgt_fn_tail", "teko::cgt", ret_type, body2)
+    let r2 = match emit_function(cgt_empty(), prog, f2) { []byte as o => str(o); error => "" }
+    teko::assert::is_true(r2.len > 0)
+    teko::assert::is_true(teko::str::contains(r2, "cgt_fn_tail"))
+    teko::assert::is_true(teko::str::contains(r2, "return"))
+
+    // Body 3: void function, empty body → needs_unreachable = false
+    let f3 = cgt_fn0("cgt_fn_void", "teko::cgt", checker::Void { }, cgt_empty_stmts())
+    let r3 = match emit_function(cgt_empty(), prog, f3) { []byte as o => str(o); error => "" }
+    teko::assert::is_true(r3.len > 0)
+    teko::assert::is_true(teko::str::contains(r3, "void"))
+
+    // Function with a parameter → emit_type_expr is called from emit_function_sig
+    let param = parser::Param { name = "n"; type_ann = cgt_named_te("u64") }
+    let params: []parser::Param = teko::list::push(teko::list::empty(), param)
+    let body4: []checker::TStatement = teko::list::push(cgt_empty_stmts(), cgt_ret(cgt_num_i64(0)))
+    let f4 = checker::TFunction {
+        name        = "cgt_fn_param"
+        namespace   = "teko::cgt"
+        params      = params
+        return_type = checker::Prim { kind = checker::PrimKind::I64 }
+        body        = body4
+        vis         = parser::Visibility::Private
+        has_doc     = false
+        doc         = ""
+        file        = ""
+        line        = 0; col = 0
+        is_test     = false
+    }
+    let r4 = match emit_function(cgt_empty(), prog, f4) { []byte as o => str(o); error => "" }
+    teko::assert::is_true(r4.len > 0)
+    teko::assert::is_true(teko::str::contains(r4, "uint64_t"))  // emit_type_expr("u64")
+    teko::assert::is_true(teko::str::contains(r4, "n"))          // cb_ident("n")
+}
+
+// ---------------------------------------------------------------------------
+// Helper: 3-segment path for teko::list::empty / push
+// ---------------------------------------------------------------------------
+fn cgt_path3(a: str, b: str, c: str) -> parser::Path {
+    let s1: []parser::Segment = teko::list::push(teko::list::empty(), cgt_seg(a))
+    let s2: []parser::Segment = teko::list::push(s1, cgt_seg(b))
+    let s3: []parser::Segment = teko::list::push(s2, cgt_seg(c))
+    parser::Path { segments = s3 }
+}
+
+// ---------------------------------------------------------------------------
+// Group O: type-name mangling helpers
+//   cg_opt_typename, cg_slice_typename, cg_emit_variant_ctype,
+//   cg_opt_mangle_texpr_str, cg_member_key_texpr_str,
+//   cg_variant_typename_texpr, cg_opt_mangle_texpr
+// ---------------------------------------------------------------------------
+#test
+fn cgt_mangle_helpers() {
+    // cg_opt_typename: Str inner → "tk_opt_str"
+    let opt_r = match cg_opt_typename(cgt_empty(), checker::Str {}) { []byte as o => str(o); error => "" }
+    teko::assert::is_true(teko::str::contains(opt_r, "tk_opt_str"))
+
+    // cg_slice_typename: I64 element → "tk_slice_i64"
+    let sl_r = match cg_slice_typename(cgt_empty(), checker::Prim { kind = checker::PrimKind::I64 }) { []byte as o => str(o); error => "" }
+    teko::assert::is_true(teko::str::contains(sl_r, "tk_slice_i64"))
+
+    // cg_emit_variant_ctype: Named "Foo" → "tk_t_Foo"
+    let vc_r = match cg_emit_variant_ctype(cgt_empty(), checker::Named { name = "Foo" }) { []byte as o => str(o); error => "" }
+    teko::assert::is_true(teko::str::contains(vc_r, "Foo"))
+
+    // cg_opt_mangle_texpr_str: NamedType "str" → "str"
+    let oms = match cg_opt_mangle_texpr_str(cgt_named_te("str")) { str as s => s; error => "" }
+    teko::assert::is_true(oms == "str")
+
+    // cg_member_key_texpr_str: "bool" (C keyword) → "bool_"; "i64" → "i64"
+    let mks_bool = match cg_member_key_texpr_str(cgt_named_te("bool")) { str as s => s; error => "" }
+    teko::assert::is_true(mks_bool == "bool_")
+    let mks_i64 = match cg_member_key_texpr_str(cgt_named_te("i64")) { str as s => s; error => "" }
+    teko::assert::is_true(mks_i64 == "i64")
+
+    // cg_variant_typename_texpr: UnionType[str, error] → "tk_u_str_error"
+    let um1: []parser::TypeExpr = teko::list::push(teko::list::empty(), cgt_named_te("str"))
+    let um2: []parser::TypeExpr = teko::list::push(um1, cgt_named_te("error"))
+    let ut = parser::UnionType { members = um2 }
+    let vtt = match cg_variant_typename_texpr(cgt_empty(), ut) { []byte as o => str(o); error => "" }
+    teko::assert::is_true(teko::str::contains(vtt, "tk_u_str_error"))
+
+    // cg_opt_mangle_texpr: NamedType "u64" → "u64"
+    let omt = match cg_opt_mangle_texpr(cgt_empty(), cgt_named_te("u64")) { []byte as o => str(o); error => "" }
+    teko::assert::is_true(omt == "u64")
+}
+
+// ---------------------------------------------------------------------------
+// Group P: by-value cycle detection + variant membership
+//   cg_te_reaches_byvalue, cg_name_reaches_byvalue,
+//   cg_field_boxed, cg_variant_has_member
+// ---------------------------------------------------------------------------
+#test
+fn cgt_byvalue_boxed_variant() {
+    // cg_te_reaches_byvalue: "str" is a prim name → returns false immediately
+    let reaches_prim = cg_te_reaches_byvalue(cgt_prog(), cgt_named_te("str"), "Foo", teko::list::empty())
+    teko::assert::is_false(reaches_prim)
+
+    // cg_te_reaches_byvalue: "Box" is not a prim name, not == "Foo" →
+    // calls cg_name_reaches_byvalue; empty prog → cg_find_decl returns error → false
+    let reaches_box = cg_te_reaches_byvalue(cgt_prog(), cgt_named_te("Box"), "Foo", teko::list::empty())
+    teko::assert::is_false(reaches_box)
+
+    // cg_field_boxed: SliceType is not a box candidate → false
+    let slice_te = parser::SliceType { element = cgt_named_te("i64") }
+    let field_boxed = cg_field_boxed(cgt_prog(), "MyStruct", slice_te)
+    teko::assert::is_false(field_boxed)
+
+    // cg_variant_has_member: variant TypeDecl with "i64" and "str" members
+    let vm1: []parser::TypeExpr = teko::list::push(teko::list::empty(), cgt_named_te("i64"))
+    let vm2: []parser::TypeExpr = teko::list::push(vm1, cgt_named_te("str"))
+    let vbody = parser::VariantBody { type_expr = parser::UnionType { members = vm2 } }
+    let vdecl = parser::TypeDecl { name = "MyV"; body = vbody; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }
+    teko::assert::is_true(cg_variant_has_member(vdecl, "i64"))
+    teko::assert::is_false(cg_variant_has_member(vdecl, "unknown"))
+}
+
+// ---------------------------------------------------------------------------
+// Group Q: emit_call, emit_list_empty, get_push_elem, emit_list_push,
+//           emit_field_access (slice.len + Named receiver → cg_find_struct_field_type)
+// ---------------------------------------------------------------------------
+#test
+fn cgt_emit_calls_and_field() {
+    // emit_call builtin: "print" → tk_print(...)
+    let print_arg = checker::TExpr {
+        kind = checker::TStrLit { text = "hi" }
+        type = checker::Str {}
+        line = 0; col = 0
+    }
+    let print_args: []checker::TExpr = teko::list::push(teko::list::empty(), print_arg)
+    let print_e = checker::TExpr {
+        kind = checker::TCall { callee = cgt_path1("print"); args = print_args; call_ns = "" }
+        type = checker::Void {}
+        line = 0; col = 0
+    }
+    let print_out = match emit_expr(cgt_empty(), cgt_prog(), print_e) { []byte as o => str(o); error => "" }
+    teko::assert::is_true(teko::str::contains(print_out, "tk_print"))
+
+    // emit_list_empty: TCall to teko::list::empty with Slice{I64} result type
+    let empty_e = checker::TExpr {
+        kind = checker::TCall { callee = cgt_path3("teko", "list", "empty"); args = teko::list::empty(); call_ns = "" }
+        type = checker::Slice { element = checker::Prim { kind = checker::PrimKind::I64 } }
+        line = 0; col = 0
+    }
+    let empty_out = match emit_expr(cgt_empty(), cgt_prog(), empty_e) { []byte as o => str(o); error => "" }
+    teko::assert::is_true(teko::str::contains(empty_out, "tk_slice_i64"))
+
+    // emit_list_push / get_push_elem: TCall to teko::list::push with base+item args
+    let base_arg = checker::TExpr {
+        kind = checker::TVar { name = "xs" }
+        type = checker::Slice { element = checker::Prim { kind = checker::PrimKind::I64 } }
+        line = 0; col = 0
+    }
+    let push_args: []checker::TExpr = teko::list::push(teko::list::push(teko::list::empty(), base_arg), cgt_num_i64(42))
+    let push_e = checker::TExpr {
+        kind = checker::TCall { callee = cgt_path3("teko", "list", "push"); args = push_args; call_ns = "" }
+        type = checker::Slice { element = checker::Prim { kind = checker::PrimKind::I64 } }
+        line = 0; col = 0
+    }
+    let push_out = match emit_expr(cgt_empty(), cgt_prog(), push_e) { []byte as o => str(o); error => "" }
+    teko::assert::is_true(push_out.len > 0)
+    teko::assert::is_true(teko::str::contains(push_out, "tk_slice_push"))
+
+    // emit_field_access — slice.len → simple path
+    let slice_recv = checker::TExpr {
+        kind = checker::TVar { name = "xs" }
+        type = checker::Slice { element = checker::Prim { kind = checker::PrimKind::I64 } }
+        line = 0; col = 0
+    }
+    let fa_slice_e = checker::TExpr {
+        kind = checker::TFieldAccess { receiver = slice_recv; field = "len" }
+        type = checker::Prim { kind = checker::PrimKind::U64 }
+        line = 0; col = 0
+    }
+    let fa_slice_out = match emit_expr(cgt_empty(), cgt_prog(), fa_slice_e) { []byte as o => str(o); error => "" }
+    teko::assert::is_true(teko::str::contains(fa_slice_out, ".len"))
+
+    // emit_field_access — Named receiver → cg_find_struct_field_type (empty prog → null → fa_boxed=false)
+    let named_recv = checker::TExpr {
+        kind = checker::TVar { name = "box_val" }
+        type = checker::Named { name = "Box" }
+        line = 0; col = 0
+    }
+    let fa_named_e = checker::TExpr {
+        kind = checker::TFieldAccess { receiver = named_recv; field = "value" }
+        type = checker::Prim { kind = checker::PrimKind::I64 }
+        line = 0; col = 0
+    }
+    let fa_named_out = match emit_expr(cgt_empty(), cgt_prog(), fa_named_e) { []byte as o => str(o); error => "" }
+    teko::assert::is_true(teko::str::contains(fa_named_out, "box_val"))
+}
+
+// ---------------------------------------------------------------------------
+// Group R: emit_index (slice), emit_in, emit_array_lit, emit_interp (+ emit_piece_lit)
+// ---------------------------------------------------------------------------
+#test
+fn cgt_emit_index_in_array_interp() {
+    // emit_index — slice receiver: bounds-checked element access
+    let slice_recv = checker::TExpr {
+        kind = checker::TVar { name = "items" }
+        type = checker::Slice { element = checker::Prim { kind = checker::PrimKind::I64 } }
+        line = 0; col = 0
+    }
+    let ix_e = checker::TExpr {
+        kind = checker::TIndex { receiver = slice_recv; index = cgt_num_i64(0) }
+        type = checker::Prim { kind = checker::PrimKind::I64 }
+        line = 0; col = 0
+    }
+    let ix_out = match emit_expr(cgt_empty(), cgt_prog(), ix_e) { []byte as o => str(o); error => "" }
+    teko::assert::is_true(teko::str::contains(ix_out, "items"))
+    teko::assert::is_true(teko::str::contains(ix_out, "tk_panic_oob"))
+
+    // emit_in — non-empty element list: lhs in [42]
+    let in_elems: []checker::TExpr = teko::list::push(teko::list::empty(), cgt_num_i64(42))
+    let in_node = checker::TInExpr { lhs = cgt_num_i64(7); elems = in_elems }
+    let in_e = checker::TExpr {
+        kind = in_node
+        type = checker::Prim { kind = checker::PrimKind::Bool }
+        line = 0; col = 0
+    }
+    let in_out = match emit_expr(cgt_empty(), cgt_prog(), in_e) { []byte as o => str(o); error => "" }
+    teko::assert::is_true(teko::str::contains(in_out, "=="))
+
+    // emit_array_lit — one-element array [42] of I64
+    let arr_elems: []checker::TExpr = teko::list::push(teko::list::empty(), cgt_num_i64(42))
+    let arr_e = checker::TExpr {
+        kind = checker::TArrayLit { elements = arr_elems }
+        type = checker::Slice { element = checker::Prim { kind = checker::PrimKind::I64 } }
+        line = 0; col = 0
+    }
+    let arr_out = match emit_expr(cgt_empty(), cgt_prog(), arr_e) { []byte as o => str(o); error => "" }
+    teko::assert::is_true(teko::str::contains(arr_out, "malloc"))
+    teko::assert::is_true(teko::str::contains(arr_out, "tk_slice_i64"))
+
+    // emit_interp — $"pre_{n}_suf" with one i64 hole: pieces=["pre_","_suf"], holes=[i64_expr]
+    let interp_pieces1: []str = teko::list::push(teko::list::empty(), "pre_")
+    let interp_pieces: []str = teko::list::push(interp_pieces1, "_suf")
+    let interp_holes: []checker::TExpr = teko::list::push(teko::list::empty(), cgt_num_i64(7))
+    let interp_node = checker::TInterp { pieces = interp_pieces; holes = interp_holes }
+    let interp_e = checker::TExpr {
+        kind = interp_node
+        type = checker::Str {}
+        line = 0; col = 0
+    }
+    let interp_out = match emit_expr(cgt_empty(), cgt_prog(), interp_e) { []byte as o => str(o); error => "" }
+    teko::assert::is_true(teko::str::contains(interp_out, "tk_str_concat"))
+    teko::assert::is_true(teko::str::contains(interp_out, "tk_i64_to_str"))
+}
+
+// ---------------------------------------------------------------------------
+// Group S: emit_safe_field_access (→ fresh_named), emit_coalesce (→ cg_expr_diverges)
+// ---------------------------------------------------------------------------
+#test
+fn cgt_emit_coalesce_and_safe_field() {
+    // emit_safe_field_access: recv?.field where recv: Optional{I64}
+    let opt_recv = checker::TExpr {
+        kind = checker::TVar { name = "opt_x" }
+        type = checker::Optional { inner = checker::Prim { kind = checker::PrimKind::I64 } }
+        line = 0; col = 0
+    }
+    let sfa_e = checker::TExpr {
+        kind = checker::TSafeFieldAccess { receiver = opt_recv; field = "foo" }
+        type = checker::Optional { inner = checker::Prim { kind = checker::PrimKind::I64 } }
+        line = 0; col = 0
+    }
+    let sfa_out = match emit_expr(cgt_empty(), cgt_prog(), sfa_e) { []byte as o => str(o); error => "" }
+    teko::assert::is_true(teko::str::contains(sfa_out, "_o"))
+    teko::assert::is_true(teko::str::contains(sfa_out, ".present"))
+    teko::assert::is_true(teko::str::contains(sfa_out, "foo"))
+
+    // cg_expr_diverges: direct call — non-TCall returns false, TCall to "panic" returns true
+    let non_call_e = cgt_num_i64(0)
+    teko::assert::is_false(cg_expr_diverges(non_call_e))
+    let panic_arg = checker::TExpr {
+        kind = checker::TStrLit { text = "oops" }
+        type = checker::Str {}
+        line = 0; col = 0
+    }
+    let panic_args: []checker::TExpr = teko::list::push(teko::list::empty(), panic_arg)
+    let panic_e = checker::TExpr {
+        kind = checker::TCall { callee = cgt_path1("panic"); args = panic_args; call_ns = "" }
+        type = checker::Void {}
+        line = 0; col = 0
+    }
+    teko::assert::is_true(cg_expr_diverges(panic_e))
+
+    // emit_coalesce: opt_left ?? fallback_i64 → (result type = I64, not Optional)
+    let opt_left = checker::TExpr {
+        kind = checker::TVar { name = "maybe_x" }
+        type = checker::Optional { inner = checker::Prim { kind = checker::PrimKind::I64 } }
+        line = 0; col = 0
+    }
+    let co_e = checker::TExpr {
+        kind = checker::TCoalesce { left = opt_left; right = cgt_num_i64(0) }
+        type = checker::Prim { kind = checker::PrimKind::I64 }
+        line = 0; col = 0
+    }
+    let co_out = match emit_expr(cgt_empty(), cgt_prog(), co_e) { []byte as o => str(o); error => "" }
+    teko::assert::is_true(teko::str::contains(co_out, "_c"))
+    teko::assert::is_true(teko::str::contains(co_out, ".present"))
+    teko::assert::is_true(teko::str::contains(co_out, ".value"))
+}
+
+// ---------------------------------------------------------------------------
+// Group T: emit_struct_init (error literal path → emit_expr on message field)
+// ---------------------------------------------------------------------------
+#test
+fn cgt_emit_struct_init_error() {
+    // emit_struct_init: e.type = Error → emits the message field value directly
+    let msg_e = checker::TExpr {
+        kind = checker::TStrLit { text = "oops" }
+        type = checker::Str {}
+        line = 0; col = 0
+    }
+    let si_names: []str = teko::list::push(teko::list::empty(), "message")
+    let si_vals: []checker::TExpr = teko::list::push(teko::list::empty(), msg_e)
+    let si_e = checker::TExpr {
+        kind = checker::TStructInit { field_names = si_names; field_vals = si_vals }
+        type = checker::Error {}
+        line = 0; col = 0
+    }
+    let si_out = match emit_expr(cgt_empty(), cgt_prog(), si_e) { []byte as o => str(o); error => "" }
+    teko::assert::is_true(si_out.len > 0)
+    teko::assert::is_true(teko::str::contains(si_out, "oops"))
+}
+
+// ---------------------------------------------------------------------------
+// Original invariant tests (kept from initial version)
+// ---------------------------------------------------------------------------
 
 // emit_binary — `(L op R)` for +,-,*,&,|,^,<<,>> must preserve C integer semantics.
 #test

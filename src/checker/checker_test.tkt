@@ -423,3 +423,303 @@ fn exhaustive_barriers() {
     let arms3: []parser::Arm = teko::list::push(teko::list::empty(), guarded_arm_of(parser::WildcardPattern { }))
     teko::assert::is_false(exhaustive(arms3, color_subject(), color_table()))
 }
+
+// ---------------------------------------------------------------------------
+// Helpers for extended coverage tests
+// ---------------------------------------------------------------------------
+fn color_enum_decl() -> parser::TypeDecl {
+    let members = teko::list::push(teko::list::push(teko::list::push(teko::list::empty(), "RED"), "GREEN"), "BLUE")
+    parser::TypeDecl { name = "Color"; body = parser::EnumBody { members = members }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }
+}
+fn color_enum_table() -> TypeTable {
+    teko::list::push(teko::list::empty(), TypeReg { name = "Color"; namespace = ""; vis = parser::Visibility::Private; decl = color_enum_decl() })
+}
+
+// ---------------------------------------------------------------------------
+// Group A: numeric predicates + type utilities
+// ---------------------------------------------------------------------------
+#test
+fn checker_basic_predicates() {
+    let _ = i16t()   // cover the unused i16t() helper
+    // is_float
+    teko::assert::is_true(is_float(Prim { kind = PrimKind::F64 }))
+    teko::assert::is_true(is_float(Prim { kind = PrimKind::F32 }))
+    teko::assert::is_false(is_float(Prim { kind = PrimKind::I64 }))
+    // op_is_arith_bitwise  (%, &, |, ^)
+    teko::assert::is_true(op_is_arith_bitwise(lexer::TokenKind::Percent))
+    teko::assert::is_true(op_is_arith_bitwise(lexer::TokenKind::Amp))
+    teko::assert::is_false(op_is_arith_bitwise(lexer::TokenKind::Plus))
+    // prim_width
+    teko::assert::is_true(prim_width(PrimKind::I32) == 32)
+    teko::assert::is_true(prim_width(PrimKind::U64) == 64)
+    teko::assert::is_true(prim_width(PrimKind::I8) == 8)
+    // types_eq
+    let ts1: []Type = teko::list::push(teko::list::empty(), i64t())
+    let ts2: []Type = teko::list::push(teko::list::empty(), i64t())
+    let ts3: []Type = teko::list::push(teko::list::empty(), u32t())
+    teko::assert::is_true(types_eq(teko::list::empty(), teko::list::empty()))
+    teko::assert::is_true(types_eq(ts1, ts2))
+    teko::assert::is_false(types_eq(ts1, ts3))
+    // float_fits
+    teko::assert::is_true(float_fits(3.14, PrimKind::F64))
+    teko::assert::is_true(float_fits(1.0, PrimKind::F32))
+    teko::assert::is_false(float_fits(1.0, PrimKind::I64))
+}
+
+// ---------------------------------------------------------------------------
+// Group B: type_boollit / type_nulllit
+// ---------------------------------------------------------------------------
+#test
+fn checker_boollit_nulllit() {
+    let bt = type_boollit(parser::BoolLit { value = true })
+    match bt.type { Prim as p => teko::assert::is_true(p.kind == PrimKind::Bool); _ => teko::assert::is_true(false) }
+    match bt.kind { TBoolLit as b => teko::assert::is_true(b.value); _ => teko::assert::is_true(false) }
+    let bf = type_boollit(parser::BoolLit { value = false })
+    match bf.kind { TBoolLit as b => teko::assert::is_false(b.value); _ => teko::assert::is_true(false) }
+    let nl = match type_nulllit(parser::NullLit { }) { TExpr as te => te; error => { teko::assert::is_true(false); return } }
+    match nl.type { Optional as o => match o.inner { Void => teko::assert::is_true(true); _ => teko::assert::is_true(false) }; _ => teko::assert::is_true(false) }
+}
+
+// ---------------------------------------------------------------------------
+// Group C: enum_has_member, check_enum_pattern, enum_covered, some_arm_is_null,
+//          some_arm_covers_type (via exhaustive on a non-Named variant), present_case_covered
+// ---------------------------------------------------------------------------
+#test
+fn checker_enum_and_optional_patterns() {
+    let eb = parser::EnumBody { members = teko::list::push(teko::list::push(teko::list::push(teko::list::empty(), "RED"), "GREEN"), "BLUE") }
+    // enum_has_member
+    teko::assert::is_true(enum_has_member(eb, "RED"))
+    teko::assert::is_false(enum_has_member(eb, "YELLOW"))
+    // some_arm_is_null
+    let null_arm = parser::Arm { pattern = parser::NullPattern { }; has_when = false; guard = e_num(0); body = one_stmt(e_num(0)) }
+    let with_null: []parser::Arm = teko::list::push(teko::list::empty(), null_arm)
+    teko::assert::is_true(some_arm_is_null(with_null))
+    let no_null: []parser::Arm = teko::list::push(teko::list::empty(), arm_of(parser::WildcardPattern { }))
+    teko::assert::is_false(some_arm_is_null(no_null))
+    // check_enum_pattern — wildcard matches any enum member
+    match check_enum_pattern(parser::WildcardPattern { }, Named { name = "Color" }, eb, empty_env(), empty_table()) {
+        Env => teko::assert::is_true(true)
+        error => teko::assert::is_true(false)
+    }
+    // enum_covered — all three covered vs partial
+    let ra = arm_of(case_pat("RED"))
+    let ga = arm_of(case_pat("GREEN"))
+    let ba = arm_of(case_pat("BLUE"))
+    mut all3: []parser::Arm = teko::list::push(teko::list::empty(), ra)
+    all3 = teko::list::push(all3, ga)
+    all3 = teko::list::push(all3, ba)
+    teko::assert::is_true(enum_covered(all3, eb))
+    teko::assert::is_false(enum_covered(teko::list::push(teko::list::empty(), ra), eb))
+    // some_arm_covers_type (called by variant_covered for non-Named members)
+    // build a Variant with prim members: i64 | error
+    let m1: []Type = teko::list::push(teko::list::empty(), i64t())
+    let m2: []Type = teko::list::push(m1, Error { })
+    let ie_var = Variant { members = m2 }
+    let i64_pat = parser::BindPattern { type_name = path1("i64"); has_binding = true; binding = "n"; is_slice = false; slice_type = null }
+    let err_pat = parser::BindPattern { type_name = path1("error"); has_binding = true; binding = "e"; is_slice = false; slice_type = null }
+    mut ie_arms: []parser::Arm = teko::list::push(teko::list::empty(), arm_of(i64_pat))
+    ie_arms = teko::list::push(ie_arms, arm_of(err_pat))
+    teko::assert::is_true(exhaustive(ie_arms, ie_var, empty_table()))
+    // present_case_covered (called by exhaustive for Optional subject)
+    let opt_i64 = Optional { inner = i64t() }
+    let bind_arm = arm_of(parser::BindPattern { type_name = path1("i64"); has_binding = true; binding = "v"; is_slice = false; slice_type = null })
+    mut opt_arms: []parser::Arm = teko::list::push(teko::list::empty(), null_arm)
+    opt_arms = teko::list::push(opt_arms, bind_arm)
+    teko::assert::is_true(exhaustive(opt_arms, opt_i64, empty_table()))
+}
+
+// ---------------------------------------------------------------------------
+// Group D: type_array_lit, type_index, type_interp, type_in
+// ---------------------------------------------------------------------------
+#test
+fn checker_array_index_interp_in() {
+    // type_array_lit [1, 2] → []i64
+    let arr = parser::ArrayLit { elements = teko::list::push(teko::list::push(teko::list::empty(), e_num(1)), e_num(2)) }
+    let ae = match type_array_lit(arr, empty_env(), empty_table()) { TExpr as te => te; error => { teko::assert::is_true(false); return } }
+    match ae.type { Slice as s => match s.element { Prim as p => teko::assert::is_true(p.kind == PrimKind::I64); _ => teko::assert::is_true(false) }; _ => teko::assert::is_true(false) }
+    // empty [] → []Void sentinel
+    let arr0 = parser::ArrayLit { elements = teko::list::empty() }
+    let ae0 = match type_array_lit(arr0, empty_env(), empty_table()) { TExpr as te => te; error => { teko::assert::is_true(false); return } }
+    match ae0.type { Slice as s => match s.element { Void => teko::assert::is_true(true); _ => teko::assert::is_true(false) }; _ => teko::assert::is_true(false) }
+    // type_index — str[0] → byte
+    let str_env = define(empty_env(), "s", Str { }, false)
+    let ix = parser::Index { receiver = e_var("s"); index = e_num(0) }
+    let ie2 = match type_index(ix, str_env, empty_table()) { TExpr as te => te; error => { teko::assert::is_true(false); return } }
+    match ie2.type { Byte => teko::assert::is_true(true); _ => teko::assert::is_true(false) }
+    // type_interp — $"val {n}" with n: i64 → str
+    let int_env = define(empty_env(), "n", i64t(), false)
+    let pieces: []str = teko::list::push(teko::list::push(teko::list::empty(), "val "), "")
+    let holes: []parser::Expr = teko::list::push(teko::list::empty(), e_var("n"))
+    let interp = parser::Interp { pieces = pieces; holes = holes }
+    let interpe = match type_interp(interp, int_env, empty_table()) { TExpr as te => te; error => { teko::assert::is_true(false); return } }
+    match interpe.type { Str => teko::assert::is_true(true); _ => teko::assert::is_true(false) }
+    // type_in — n in [1, 2] → bool
+    let elems: []parser::Expr = teko::list::push(teko::list::push(teko::list::empty(), e_num(1)), e_num(2))
+    let in_expr = parser::InExpr { lhs = e_var("n"); elems = elems }
+    let ine = match type_in(in_expr, int_env, empty_table()) { TExpr as te => te; error => { teko::assert::is_true(false); return } }
+    match ine.type { Prim as p => teko::assert::is_true(p.kind == PrimKind::Bool); _ => teko::assert::is_true(false) }
+}
+
+// ---------------------------------------------------------------------------
+// Group E: type_struct_lit (error literal — simplest case)
+// ---------------------------------------------------------------------------
+#test
+fn checker_struct_lit_error_builtin() {
+    let fn_names: []str = teko::list::push(teko::list::empty(), "message")
+    let fn_vals: []parser::Expr = teko::list::push(teko::list::empty(), e_str("oops"))
+    let sl = parser::StructLit { type_path = path1("error"); field_names = fn_names; field_vals = fn_vals }
+    let sr = match type_struct_lit(sl, empty_env(), empty_table()) { TExpr as te => te; error => { teko::assert::is_true(false); return } }
+    match sr.type { Error => teko::assert::is_true(true); _ => teko::assert::is_true(false) }
+}
+
+// ---------------------------------------------------------------------------
+// Group F: type_if_stmt, type_match_stmt
+// ---------------------------------------------------------------------------
+#test
+fn checker_if_match_stmt_forms() {
+    // type_if_stmt — if b { 1 } (no else) → void
+    let benv = define(empty_env(), "b", boolt(), false)
+    let if_ast = parser::IfExpr { cond = e_var("b"); then_blk = one_stmt(e_num(1)); has_else = false; else_blk = teko::list::empty() }
+    let ife = match type_if_stmt(if_ast, benv, empty_table()) { TExpr as te => te; error => { teko::assert::is_true(false); return } }
+    match ife.type { Void => teko::assert::is_true(true); _ => teko::assert::is_true(false) }
+    // type_match_stmt — exhaustive match over color variant → void
+    let c_env = define(empty_env(), "c", color_subject(), false)
+    let ra = arm_of(case_pat("RED"))
+    let ga = arm_of(case_pat("GREEN"))
+    let ba = arm_of(case_pat("BLUE"))
+    mut match_arms: []parser::Arm = teko::list::push(teko::list::empty(), ra)
+    match_arms = teko::list::push(match_arms, ga)
+    match_arms = teko::list::push(match_arms, ba)
+    let me = parser::MatchExpr { subject = e_var("c"); arms = match_arms }
+    let mer = match type_match_stmt(me, c_env, color_table()) { TExpr as te => te; error => { teko::assert::is_true(false); return } }
+    match mer.type { Void => teko::assert::is_true(true); _ => teko::assert::is_true(false) }
+}
+
+// ---------------------------------------------------------------------------
+// Group G: type_path_expr (enum PathExpr)
+// ---------------------------------------------------------------------------
+#test
+fn checker_type_path_expr() {
+    let ct = color_enum_table()
+    let segs: []parser::Segment = teko::list::push(teko::list::push(teko::list::empty(), parser::Segment { name = "Color" }), parser::Segment { name = "RED" })
+    let pe = parser::PathExpr { path = parser::Path { segments = segs } }
+    let per = match type_path_expr(pe, ct) { TExpr as te => te; error => { teko::assert::is_true(false); return } }
+    match per.type { Named as n => teko::assert::is_true(n.name == "Color"); _ => teko::assert::is_true(false) }
+}
+
+// ---------------------------------------------------------------------------
+// Group H: type_safe_field_access, type_coalesce
+// ---------------------------------------------------------------------------
+#test
+fn checker_safe_field_and_coalesce() {
+    // type_safe_field_access — ms?.token where ms: Foo? → u8?
+    let opt_foo_env = define(empty_env(), "ms", Optional { inner = Named { name = "Foo" } }, false)
+    let sfa = parser::SafeFieldAccess { receiver = e_var("ms"); field = "token" }
+    let sfar = match type_safe_field_access(sfa, opt_foo_env, foo_table()) { TExpr as te => te; error => { teko::assert::is_true(false); return } }
+    match sfar.type { Optional as o => match o.inner { Prim as p => teko::assert::is_true(p.kind == PrimKind::U8); _ => teko::assert::is_true(false) }; _ => teko::assert::is_true(false) }
+    // type_coalesce — os ?? "default" where os: str? → str
+    let opt_str_env = define(empty_env(), "os", Optional { inner = Str { } }, false)
+    let co = parser::Coalesce { left = e_var("os"); right = e_str("default") }
+    let cor = match type_coalesce(co, opt_str_env, empty_table()) { TExpr as te => te; error => { teko::assert::is_true(false); return } }
+    match cor.type { Str => teko::assert::is_true(true); _ => teko::assert::is_true(false) }
+}
+
+// ---------------------------------------------------------------------------
+// Group I: render_func, render_members, union_collect
+// ---------------------------------------------------------------------------
+#test
+fn checker_render_and_join() {
+    // render_members directly — two-member variant renders with " | "
+    let m1: []Type = teko::list::push(teko::list::empty(), i64t())
+    let m2: []Type = teko::list::push(m1, Str { })
+    let rms = render_members(m2)
+    teko::assert::is_true(teko::str::contains(rms, "|"))
+    // render_func directly — "(i64) -> str"
+    let fparams: []Type = teko::list::push(teko::list::empty(), i64t())
+    let rf = render_func(Func { params = fparams; ret = Str { } })
+    teko::assert::is_true(teko::str::contains(rf, "->"))
+    // union_collect directly — accumulate two types
+    let acc1 = union_collect(teko::list::empty(), i64t(), empty_table())
+    teko::assert::is_true(acc1.len == 1)
+    let acc2 = union_collect(acc1, Str { }, empty_table())
+    teko::assert::is_true(acc2.len == 2)
+    // dedup: same type twice → still length 1
+    let acc3 = union_collect(teko::list::empty(), i64t(), empty_table())
+    let acc4 = union_collect(acc3, i64t(), empty_table())
+    teko::assert::is_true(acc4.len == 1)
+}
+
+// ---------------------------------------------------------------------------
+// Group J: lbl_eq, lbl_enclosing, surface_at
+// ---------------------------------------------------------------------------
+#test
+fn checker_label_surface() {
+    // lbl_eq
+    teko::assert::is_true(lbl_eq("outer", "outer"))
+    teko::assert::is_false(lbl_eq("outer", "inner"))
+    // lbl_enclosing
+    let scope: []str = teko::list::push(teko::list::push(teko::list::empty(), "outer"), "inner")
+    teko::assert::is_true(lbl_enclosing(scope, "outer"))
+    teko::assert::is_true(lbl_enclosing(scope, "inner"))
+    teko::assert::is_false(lbl_enclosing(scope, "missing"))
+    // surface_at
+    let e = error { message = "test error" }
+    let surfaced = surface_at("test.tks", 3, 7, e)
+    teko::assert::is_true(teko::str::contains(surfaced.message, "test.tks"))
+}
+
+// ---------------------------------------------------------------------------
+// Group K: check_node_type, rederive_binary, validate_each (revalidate helpers)
+// ---------------------------------------------------------------------------
+#test
+fn checker_revalidate_helpers() {
+    // check_node_type — match/mismatch
+    match check_node_type(i64t(), i64t()) { null => teko::assert::is_true(true); error => teko::assert::is_true(false) }
+    match check_node_type(i64t(), u32t()) { null => teko::assert::is_true(false); error => teko::assert::is_true(true) }
+    // rederive_binary
+    match rederive_binary(i64t(), i64t(), lexer::TokenKind::Plus) { Type as t => teko::assert::is_true(type_eq(t, i64t())); error => teko::assert::is_true(false) }
+    match rederive_binary(i64t(), i64t(), lexer::TokenKind::Percent) { Type as t => teko::assert::is_true(type_eq(t, i64t())); error => teko::assert::is_true(false) }
+    match rederive_binary(boolt(), boolt(), lexer::TokenKind::Plus) { Type => teko::assert::is_true(false); error => teko::assert::is_true(true) }
+    // validate_each — list of valid TNumber nodes
+    let e1 = TExpr { kind = TNumber { is_float = false; value = 1; fval = 0.0 }; type = i64t(); line = 0; col = 0 }
+    let e2 = TExpr { kind = TNumber { is_float = false; value = 2; fval = 0.0 }; type = i64t(); line = 0; col = 0 }
+    let xs: []TExpr = teko::list::push(teko::list::push(teko::list::empty(), e1), e2)
+    match validate_each(xs) { null => teko::assert::is_true(true); error => teko::assert::is_true(false) }
+}
+
+// ---------------------------------------------------------------------------
+// Group L: ns_last_seg, builtin_fn, find_in_ns, name_exists_anywhere,
+//          alias_target, diag_at, join_n
+// ---------------------------------------------------------------------------
+#test
+fn checker_scope_module_helpers() {
+    // ns_last_seg
+    teko::assert::is_true(ns_last_seg("teko::checker") == "checker")
+    teko::assert::is_true(ns_last_seg("foo") == "foo")
+    teko::assert::is_true(ns_last_seg("a::b::c") == "c")
+    // builtin_fn — "print" → a Func type; unknown → error
+    match builtin_fn("print") { Type => teko::assert::is_true(true); error => teko::assert::is_true(false) }
+    match builtin_fn("__nonexistent__") { Type => teko::assert::is_true(false); error => teko::assert::is_true(true) }
+    // find_in_ns
+    let t = foo_table()
+    match find_in_ns(t, "Foo", "") { TypeReg as tr => teko::assert::is_true(tr.name == "Foo"); null => teko::assert::is_true(false) }
+    match find_in_ns(t, "Bar", "") { TypeReg => teko::assert::is_true(false); null => teko::assert::is_true(true) }
+    // name_exists_anywhere
+    teko::assert::is_true(name_exists_anywhere(t, "Foo"))
+    teko::assert::is_false(name_exists_anywhere(t, "Baz"))
+    // alias_target
+    let al: []AliasBind = teko::list::push(teko::list::empty(), AliasBind { ns = "teko::checker"; alias = "prs"; target = "teko::parser" })
+    teko::assert::is_true(alias_target(al, "teko::checker", "prs") == "teko::parser")
+    teko::assert::is_true(alias_target(al, "teko::checker", "nope") == "")
+    // diag_at
+    let m1 = diag_at("foo.tks", 3, 5, "err here")
+    teko::assert::is_true(teko::str::contains(m1, "foo.tks"))
+    teko::assert::is_true(teko::str::contains(m1, "err here"))
+    teko::assert::is_true(diag_at("", 0, 0, "bare") == "bare")
+    // join_n
+    let segs: []parser::Segment = teko::list::push(teko::list::push(teko::list::empty(), parser::Segment { name = "teko" }), parser::Segment { name = "checker" })
+    let p = parser::Path { segments = segs }
+    teko::assert::is_true(join_n(p, 0) == "")
+    teko::assert::is_true(join_n(p, 1) == "teko")
+    teko::assert::is_true(join_n(p, 2) == "teko::checker")
+}

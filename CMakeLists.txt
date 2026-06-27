@@ -119,6 +119,14 @@ add_library(teko_bootstrap STATIC
 # the lib) so it is never double-linked into the generated programs the driver builds.
 add_executable(teko main.c src/driver.c src/runtime/teko_rt.c)
 target_link_libraries(teko PRIVATE teko_bootstrap)
+# The VM interpreter uses deep C recursion when running the Teko parser/lexer during
+# `teko test` (each Teko function call adds ~4 C frames; parsing 66 files × recursive
+# descent easily exceeds the default 8MB main-thread stack). Set to 64MB to give enough room.
+if(APPLE)
+    target_link_options(teko PRIVATE "-Wl,-stack_size,0x4000000")
+elseif(UNIX)
+    target_link_options(teko PRIVATE "-Wl,-z,stacksize=67108864")
+endif()
 
 # F3: the generated programs link the minimal execution runtime (libteko_rt).
 # teko needs the runtime's location to pass -I and the runtime source to the host cc.

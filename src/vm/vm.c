@@ -27,6 +27,8 @@
 // (calling only the shared tk_panic_div0 / tk_panic_cast so the MESSAGES match — M.1).
 void tk_print(tk_str s);
 void tk_println(tk_str s);
+void tk_eprint(tk_str s);
+void tk_eprintln(tk_str s);
 _Noreturn void tk_panic_div0(void);
 _Noreturn void tk_panic_cast(void);
 _Noreturn void tk_panic_oob(void);    // "index out of bounds" (the subscript guard — W5-idx, M.1)
@@ -44,6 +46,9 @@ tk_str tk_str_of_bytes(tk_str bytes);
 tk_str tk_one_byte(tk_byte c);
 tk_str tk_str_concat3(tk_str a, tk_str b, tk_str c);
 tk_str tk_ftoa(double x);
+double tk_float_parse(tk_str s);  // teko::float::parse(str) -> f64
+uint64_t tk_f64_bits(double x);   // f64 → u64 IEEE-754 bit reinterpret (teko::f64_bits)
+double   tk_f64_from_bits(uint64_t bits);  // u64 → f64 IEEE-754 bit reinterpret (teko::f64_from_bits)
 // tk_str_slice is a static inline in text.h (included above); the rest link from teko_rt.c.
 tk_str tk_str_slice_to(tk_str s, uint64_t end);
 tk_str tk_str_slice_from(tk_str s, uint64_t start);
@@ -66,6 +71,26 @@ void teko__assert__str_contains(tk_str hay, tk_str needle);
 void     tk_cov_reset(void);
 void     tk_cov_mark(uint64_t id);
 uint64_t tk_cov_distinct(void);
+bool     tk_cov_is_marked(uint64_t id);
+void     tk_cov_branches_on(bool on);     // D3-branch — branch coverage (off by default)
+void     tk_cov_branch_reset(void);
+void     tk_cov_enter(uint64_t fn);
+void     tk_cov_leave(void);
+void     tk_cov_branch(uint32_t line, uint32_t col, uint64_t outcome);
+bool     tk_cov_branch_hit(uint64_t fn, uint32_t line, uint32_t col, uint64_t outcome);
+void     tk_cov_lines_on(bool on);        // D3-line — line coverage (off by default)
+void     tk_cov_line_reset(void);
+void     tk_cov_line(uint32_t line);
+bool     tk_cov_line_hit(uint64_t fn, uint32_t line);
+// teko::fs::list_dir / teko::io::read_file — host builtins. Forward-declared manually (we skip
+// teko_rt.h to avoid re-typedef clashes); the ABI matches the runtime struct bit-for-bit.
+typedef struct { bool ok; tk_str *ptr; uint64_t len; tk_str err; } tk_ffi_slres;
+typedef struct { bool ok; tk_str value; tk_str err; } tk_ffi_sres;
+typedef struct { bool ok; tk_str err; } tk_ffi_ures;
+tk_ffi_slres tk_rt_list_dir(tk_str path);
+tk_ffi_sres  tk_rt_read_file(tk_str path);
+tk_ffi_ures  tk_rt_write_file(tk_str path, tk_str content);   // D3-branch — write the cobertura report
+tk_ffi_ures  tk_rt_mkdir(tk_str path);
 
 // =========================================================================
 // M.3 honest barrier. A node the VM does not yet interpret is NOT silently
@@ -235,20 +260,26 @@ static tk_value v_error_field(tk_value e, tk_str field) {
     return v_str(ERR_LIT(""));   // any other field on an error → empty str (honest, never a crash)
 }
 // v_list_empty / v_list_push — the SLICE value model (teko::list::empty / push). The list is a
-// {ptr,len,cap} of tk_value (TK_VAL_LIST). push is FUNCTIONAL / persistent (copy-on-push,
-// mirroring tk_env_define's copy-on-extend): it returns a FRESH list holding the old elements
-// then `item`, so a list pushed-from is never mutated — `xs = push(xs, …)` and a captured `xs`
-// stay independent (the corpus reassigns through `mut`, but aliasing must not corrupt). Leak-
-// tolerant (M.5 — process-lifetime buffers).
+// {ptr,len,cap} of tk_value (TK_VAL_LIST). push is amortized O(1): when there is spare capacity
+// (len < cap) we extend in-place; otherwise we allocate a fresh buffer with 2× capacity and copy.
+// Teko's list usage is always linear (xs = list::push(xs, item) — the result replaces xs), so
+// sharing the backing buffer with the old value is safe. Leak-tolerant (M.5 — process-lifetime).
 static tk_value v_list_empty(void) {
     return (tk_value){ .tag = TK_VAL_LIST, .as.list = { .ptr = NULL, .len = 0, .cap = 0 } };
 }
 static tk_value v_list_push(tk_value_list base, tk_value item) {
-    size_t n = base.len;
-    tk_value *ptr = tk_alloc((n + 1) * sizeof *ptr); if (!ptr) abort();
-    for (size_t i = 0; i < n; i += 1) ptr[i] = base.ptr[i];   // copy-on-push (persistent)
+    size_t n = base.len, cap = base.cap;
+    tk_value *ptr;
+    if (n < cap) {
+        ptr = base.ptr;   // spare capacity — extend the existing buffer in place
+    } else {
+        size_t ncap = (cap < 8) ? 8 : (cap * 2);
+        ptr = tk_alloc(ncap * sizeof *ptr); if (!ptr) abort();
+        for (size_t i = 0; i < n; i += 1) ptr[i] = base.ptr[i];
+        cap = ncap;
+    }
     ptr[n] = item;
-    return (tk_value){ .tag = TK_VAL_LIST, .as.list = { .ptr = ptr, .len = n + 1, .cap = n + 1 } };
+    return (tk_value){ .tag = TK_VAL_LIST, .as.list = { .ptr = ptr, .len = n + 1, .cap = cap } };
 }
 // v_none / v_some (REBOOT_PLAN §202) — the optional `T?` value model. NONE is the `null`
 // literal; PRESENT(inner) heap-boxes the wrapped value. coerce_opt wraps a bare value into
@@ -446,14 +477,24 @@ static bool try_builtin_call(tk_path p, const tk_texpr *args, size_t nargs,
     bool addressable = (p.len == 1) || seg_is(p.segments[0].name, "teko");
     if (!addressable) return false;
 
-    // print / println — write a str arg to stdout via the runtime (SAME bytes/newline
-    // as the native path: tk_print writes exactly len bytes; tk_println adds one '\n').
-    if (seg_is(last, "print") || seg_is(last, "println")) {
-        if (nargs != 1) vm_unsupported("print/println expects exactly one argument");
+    // print / println / write — stdout output builtins.
+    // ewrite / eprint / eprintln — stderr output builtins (teko::io::e*).
+    // All have signature (str) -> void; the VM routes them to the same runtime symbols
+    // the native backend uses, so VM==native byte-for-byte.
+    if (seg_is(last, "print") || seg_is(last, "println") || seg_is(last, "write")) {
+        if (nargs != 1) vm_unsupported("print/println/write expects exactly one argument");
         tk_value a = tk_vm_eval_expr(&args[0], env);
-        if (a.tag != TK_VAL_STR) vm_unsupported("print/println on a non-str value not yet supported");
-        if (seg_is(last, "print")) tk_print(a.as.s); else tk_println(a.as.s);
-        *out = v_void();   // `-> void`: run for effect, the result is never read (statement)
+        if (a.tag != TK_VAL_STR) vm_unsupported("print/println/write on a non-str value not yet supported");
+        if (seg_is(last, "println")) tk_println(a.as.s); else tk_print(a.as.s);
+        *out = v_void();
+        return true;
+    }
+    if (seg_is(last, "ewrite") || seg_is(last, "eprint") || seg_is(last, "eprintln")) {
+        if (nargs != 1) vm_unsupported("ewrite/eprint/eprintln expects exactly one argument");
+        tk_value a = tk_vm_eval_expr(&args[0], env);
+        if (a.tag != TK_VAL_STR) vm_unsupported("ewrite/eprint/eprintln on a non-str value not yet supported");
+        if (seg_is(last, "eprintln")) tk_eprintln(a.as.s); else tk_eprint(a.as.s);
+        *out = v_void();
         return true;
     }
 
@@ -587,6 +628,14 @@ static bool try_builtin_call(tk_path p, const tk_texpr *args, size_t nargs,
         *out = v_str(tk_str_concat3(a.as.s, b.as.s, c.as.s));
         return true;
     }
+    // float::parse — (str) -> f64. Parse a decimal float string to a double.
+    if (seg_is(last, "parse")) {
+        if (nargs != 1) vm_unsupported("float::parse expects exactly one argument (a str)");
+        tk_value a = tk_vm_eval_expr(&args[0], env);
+        if (a.tag != TK_VAL_STR) vm_unsupported("float::parse on a non-str value (internal: checker should reject)");
+        *out = v_float(tk_float_parse(a.as.s), 64);
+        return true;
+    }
     // ftoa — (f64) -> str. The float rendered as %.17g text in a fresh owned str.
     if (seg_is(last, "ftoa")) {
         if (nargs != 1) vm_unsupported("ftoa expects exactly one argument (an f64)");
@@ -636,21 +685,75 @@ static bool try_builtin_call(tk_path p, const tk_texpr *args, size_t nargs,
         tk_value n = tk_vm_eval_expr(&args[0], env);
         *out = v_str(tk_u64_to_str((uint64_t)v_as_u128(n))); return true;
     }
+    // f64_bits — (f64) -> u64: reinterpret a float's IEEE-754 bits as a u64 integer.
+    if (seg_is(last, "f64_bits")) {
+        if (nargs != 1) vm_unsupported("f64_bits expects exactly one argument (an f64)");
+        tk_value a = tk_vm_eval_expr(&args[0], env);
+        if (a.tag != TK_VAL_FLOAT) vm_unsupported("f64_bits on a non-float value (internal: checker should reject)");
+        *out = v_int((unsigned __int128)tk_f64_bits(a.as.fl.f), false, 64);
+        return true;
+    }
+    // f64_from_bits — (u64) -> f64: reinterpret u64 bits as an IEEE-754 double.
+    if (seg_is(last, "f64_from_bits")) {
+        if (nargs != 1) vm_unsupported("f64_from_bits expects exactly one argument (a u64)");
+        tk_value a = tk_vm_eval_expr(&args[0], env);
+        if (a.tag != TK_VAL_INT) vm_unsupported("f64_from_bits on a non-integer value (internal: checker should reject)");
+        *out = v_float(tk_f64_from_bits((uint64_t)v_as_u128(a)), 64);
+        return true;
+    }
+    // teko::io::read_file — (str) -> str | error: slurp a whole file as UTF-8 (C2* host surface).
+    // The last-segment "read_file" also matches driver.tks's local wrapper fn of the same name;
+    // handling it here as a builtin prevents the infinite recursion that would otherwise occur
+    // (wrapper calls teko::io::read_file → find_function finds the wrapper again → recurse).
+    if (seg_is(last, "read_file")) {
+        if (nargs != 1) vm_unsupported("read_file expects exactly one argument (a str path)");
+        tk_value path_val = tk_vm_eval_expr(&args[0], env);
+        if (path_val.tag != TK_VAL_STR) vm_unsupported("read_file on a non-str path (internal: checker should reject)");
+        tk_ffi_sres res = tk_rt_read_file(path_val.as.s);
+        if (!res.ok) {
+            tk_value base = v_struct(ERR_LIT("error"), (tk_value_fields){ NULL, NULL, 0 });
+            *out = v_error_set(base, ERR_LIT("message"), v_str(res.err));
+            return true;
+        }
+        *out = v_str(res.value);
+        return true;
+    }
+    // teko::fs::list_dir — (str) -> []str | error: directory entries (C2* host surface in VM).
+    // Returns a list of entry-name strings on success, or an error struct on failure.
+    if (seg_is(last, "list_dir")) {
+        if (nargs != 1) vm_unsupported("list_dir expects exactly one argument (a str path)");
+        tk_value path_val = tk_vm_eval_expr(&args[0], env);
+        if (path_val.tag != TK_VAL_STR) vm_unsupported("list_dir on a non-str path (internal: checker should reject)");
+        tk_ffi_slres res = tk_rt_list_dir(path_val.as.s);
+        if (!res.ok) {
+            tk_value base = v_struct(ERR_LIT("error"), (tk_value_fields){ NULL, NULL, 0 });
+            *out = v_error_set(base, ERR_LIT("message"), v_str(res.err));
+            return true;
+        }
+        tk_value list = v_list_empty();
+        for (uint64_t i = 0; i < res.len; i += 1)
+            list = v_list_push(list.as.list, v_str(res.ptr[i]));
+        *out = list;
+        return true;
+    }
     return false;
 }
 
-// Find a top-level user function by (single-segment) name. M0 calls are single-segment
-// identifiers joined by "__" in codegen; here we match the joined path against a function
-// name. Single-segment is the common case; multi-segment user calls are honest-deferred.
-static const tk_tfunction *find_function(tk_path p) {
+// Find a top-level user function by (single-segment) name. Returns the function pointer and
+// sets *out_idx to the g_prog.items index (a globally unique coverage ID). M0 calls are
+// single-segment identifiers joined by "__" in codegen; here we match the joined path against
+// a function name. Single-segment is the common case; multi-segment user calls are honest-deferred.
+static const tk_tfunction *find_function(tk_path p, size_t *out_idx) {
     if (p.len == 0) return NULL;
     // Match by the LAST segment — a cross-namespace call qualifies (`ns::fn`), and the seed
     // resolves names by last segment (like resolve_named for types). W5 unblocks cross-ns calls.
     tk_str name = p.segments[p.len - 1].name;
     for (size_t i = 0; i < g_prog.nitems; i += 1) {
         if (g_prog.items[i].tag != TK_TITEM_FUNCTION) continue;
-        if (name_eq(g_prog.items[i].as.function.name, name))
+        if (name_eq(g_prog.items[i].as.function.name, name)) {
+            if (out_idx) *out_idx = i;
             return &g_prog.items[i].as.function;
+        }
     }
     return NULL;
 }
@@ -870,6 +973,8 @@ static unsigned __int128 u_max_of(int width) {
 static bool cast_prim_of(tk_type t, tk_prim_kind *out) {
     if (t.tag == TK_TYPE_PRIM) { *out = t.as.prim; return true; }
     if (t.tag == TK_TYPE_BYTE) { *out = TK_PRIM_U8; return true; }
+    // E7: enum→int/byte — checker already validated; enum ordinals are stored as u64 in the VM.
+    if (t.tag == TK_TYPE_NAMED) { *out = TK_PRIM_U64; return true; }
     return false;
 }
 
@@ -970,7 +1075,8 @@ static tk_value eval_call(const tk_texpr *e, tk_venv *env) {
     tk_value out;
     if (try_builtin_call(p, args, nargs, env, &out)) return out;
 
-    const tk_tfunction *fn = find_function(p);
+    size_t fn_idx;
+    const tk_tfunction *fn = find_function(p, &fn_idx);
     if (fn == NULL) {
         // HOST-FFI FRONTIER (not a checker bug): the checker accepts host-FFI/builtin calls
         // because the native backend lowers them; the VM has no host surface (Phase 7). Stop
@@ -981,7 +1087,7 @@ static tk_value eval_call(const tk_texpr *e, tk_venv *env) {
                  (int)last.len, (const char *)last.ptr);
         vm_unsupported(buf);
     }
-    if (!fn->is_test) tk_cov_mark(fn->line);   // D3 — record this production fn as executed
+    if (!fn->is_test) tk_cov_mark(fn_idx);   // D3 — globally unique index (not line) avoids cross-file collisions
     // A fresh root frame — no closure capture (flat functions, like codegen's C). Bind each
     // parameter to its evaluated argument (args evaluate in the CALLER's env, then enter the
     // callee's frame positionally by the param's name). (B-vm — VM function parameters.)
@@ -990,7 +1096,9 @@ static tk_value eval_call(const tk_texpr *e, tk_venv *env) {
         tk_value av = tk_vm_eval_expr(&args[i], env);
         env_define(&fenv, fn->params[i].name, av);
     }
+    tk_cov_enter(fn_idx);   // D3-branch — attribute body branches to this fn (no-op unless coverage on)
     tk_flow fl = tk_vm_exec_block(fn->body, fn->nbody, &fenv);
+    tk_cov_leave();
     env_free(&fenv);
     // Coerce the returned value into the declared return type: a `T` returned from a `-> T?`
     // fn present-wraps (REBOOT §202), mirroring codegen's emit_as on the return slot. A NONE
@@ -1032,6 +1140,29 @@ static bool case_in_variant(tk_str vname, tk_str cname) {
                 return true;
         }
         return false;
+    }
+    return false;
+}
+
+// match_as_enum_int — does `name` match an integer `ordinal` when the subject is an enum value?
+// Two cases:
+//   (A) `name` is an ENUM TYPE NAME (e.g., `PrimKind as k`): any integer is a valid enum value
+//       of that type — the checker guarantees the subject came from a `PrimKind | error` union.
+//   (B) `name` is an ENUM MEMBER NAME (e.g., `U8 =>`, `I64 =>`): matches only when the ordinal
+//       matches that member's position in the enum.
+// Scans all enum TypeDecls; both cases may coexist (a member name in one enum, type name in another).
+static bool match_as_enum_int(tk_str name, unsigned __int128 ordinal) {
+    for (size_t i = 0; i < g_prog.nitems; i += 1) {
+        if (g_prog.items[i].tag != TK_TITEM_TYPE_DECL) continue;
+        tk_type_decl td = g_prog.items[i].as.type_decl;
+        if (td.body.tag != TK_BODY_ENUM) continue;
+        // Case A: pattern names the whole enum type — any valid ordinal matches.
+        if (name_eq(td.name, name)) return true;
+        // Case B: pattern names a specific member — match only at the right ordinal.
+        tk_enum_body eb = td.body.as.enum_body;
+        for (size_t j = 0; j < eb.n_members; j += 1)
+            if (name_eq(eb.members[j], name) && (unsigned __int128)j == ordinal)
+                return true;
     }
     return false;
 }
@@ -1139,11 +1270,35 @@ static bool pat_match(const tk_pattern *pat, tk_value subj, tk_venv *env) {
             // PRIM/bool/str member matches by the value's kind (val_type_matches). Supports `Type =>`
             // with NO destructure and NO alias, for every member kind. ALSO a pattern that names a
             // VARIANT (e.g. `Type`) matches a value whose case is one of its members (case_in_variant).
-            if (!val_type_matches(subj, path_last(pat->as.bind.type_name))
-                && !(subj.tag == TK_VAL_STRUCT && case_in_variant(path_last(pat->as.bind.type_name), subj.as.st.type_name)))
+            {
+                tk_str bname = path_last(pat->as.bind.type_name);
+                bool direct = val_type_matches(subj, bname)
+                    || (subj.tag == TK_VAL_STRUCT && case_in_variant(bname, subj.as.st.type_name))
+                    || (subj.tag == TK_VAL_INT && match_as_enum_int(bname, v_as_u128(subj)));
+                if (direct) {
+                    if (pat->as.bind.has_binding) env_define(env, pat->as.bind.binding, subj);
+                    return true;
+                }
+                // Transparent field descent: when the subject is a struct whose fields contain
+                // a value that matches the pattern name (e.g. `Number as nn` on `Expr { kind =
+                // Number{…}; line; col }`), drill into the first matching STRUCT field and bind.
+                // Only struct fields are eligible — int fields are excluded because match_as_enum_int
+                // could match enum member names that coincidentally share the same ordinal value as an
+                // unrelated enum (e.g. TyShape::Variant=2 vs PrimKind::U32=2 causing false descent).
+                if (subj.tag == TK_VAL_STRUCT) {
+                    for (size_t fi = 0; fi < subj.as.st.fields.len; fi += 1) {
+                        tk_value fv = subj.as.st.fields.vals[fi];
+                        if (fv.tag != TK_VAL_STRUCT) continue;
+                        bool fhit = val_type_matches(fv, bname)
+                            || case_in_variant(bname, fv.as.st.type_name);
+                        if (fhit) {
+                            if (pat->as.bind.has_binding) env_define(env, pat->as.bind.binding, fv);
+                            return true;
+                        }
+                    }
+                }
                 return false;
-            if (pat->as.bind.has_binding) env_define(env, pat->as.bind.binding, subj);   // `Type as x` binds the whole value
-            return true;
+            }
         }
         case TK_PAT_FIELD: {
             if (subj.tag != TK_VAL_STRUCT) return false;
@@ -1175,6 +1330,7 @@ static tk_value eval_match(const tk_texpr *e, tk_venv *env) {
         if (pat_match(&arm->pattern, subj, &armenv)) {
             bool guard_ok = !arm->has_when || tk_vm_eval_expr(arm->guard, &armenv).as.b;
             if (guard_ok) {
+                tk_cov_branch(e->line, e->col, i);   // D3-branch: value-position arm `i` taken
                 tk_flow fl = tk_vm_exec_block(arm->body, arm->nbody, &armenv);
                 env_pop_to(&armenv, env->head);
                 if (fl.kind == TK_FLOW_NORMAL && fl.has_value) return fl.value;
@@ -1250,6 +1406,7 @@ static tk_value eval_in(const tk_texpr *e, tk_venv *env) {
 }
 
 static tk_value tk_vm_eval_expr(const tk_texpr *e, tk_venv *env) {
+    tk_cov_line(e->line);   // D3-line — mark this source line executed (no-op unless line recording is on)
     // New type tags (TEKO_CORRECTION_PLAN [Z1]). A value-position expression can never be
     // typed `void` (void is return-only, never a value — the checker rejects it elsewhere).
     // Optional `T?` values ARE supported now (TK_VAL_OPT — REBOOT_PLAN §202): null / ?. / ??
@@ -1264,6 +1421,9 @@ static tk_value tk_vm_eval_expr(const tk_texpr *e, tk_venv *env) {
     switch (e->tag) {
         case TK_TEXPR_NUMBER: {
             // The literal's prim comes from the node's type; bool literals don't reach here.
+            // TK_TYPE_BYTE (`byte` type) is like u8 — an unsigned 8-bit integer literal.
+            if (e->type.tag == TK_TYPE_BYTE)
+                return v_int((unsigned __int128)(uint8_t)e->as.number.value, false, 8);
             if (e->type.tag != TK_TYPE_PRIM)
                 vm_unsupported("number literal with a non-primitive type not yet supported");
             tk_prim_kind k = e->type.as.prim;
@@ -1521,7 +1681,9 @@ static tk_flow tk_vm_exec_block(const tk_tstatement *body, size_t n, tk_venv *en
 static tk_flow exec_if(const tk_texpr *e, tk_venv *env) {
     tk_value c = tk_vm_eval_expr(e->as.if_expr.cond, env);
     if (c.tag != TK_VAL_BOOL) vm_unsupported("if condition is not a bool (internal: checker should reject)");
-    if (c.as.b) return tk_vm_exec_block(e->as.if_expr.then_blk, e->as.if_expr.nthen, env);
+    // D3-branch: outcome 0 = then taken, 1 = else/skip taken (no-op unless coverage on).
+    if (c.as.b) { tk_cov_branch(e->line, e->col, 0); return tk_vm_exec_block(e->as.if_expr.then_blk, e->as.if_expr.nthen, env); }
+    tk_cov_branch(e->line, e->col, 1);
     if (e->as.if_expr.has_else) return tk_vm_exec_block(e->as.if_expr.else_blk, e->as.if_expr.nelse, env);
     return flow_normal();
 }
@@ -1539,6 +1701,7 @@ static tk_flow exec_match(const tk_texpr *e, tk_venv *env) {
         if (pat_match(&arm->pattern, subj, &armenv)) {
             bool guard_ok = !arm->has_when || tk_vm_eval_expr(arm->guard, &armenv).as.b;
             if (guard_ok) {
+                tk_cov_branch(e->line, e->col, i);   // D3-branch: arm `i` taken
                 tk_flow fl = tk_vm_exec_block(arm->body, arm->nbody, &armenv);
                 env_pop_to(&armenv, env->head);
                 return fl;
@@ -1578,11 +1741,22 @@ int tk_vm_run(tk_tprogram prog) {
 // void) in the merged program, fail-fast: a failed assertion panics (aborts) from inside the
 // VM after the running test's name was printed. All pass → print the count, return 0. An empty
 // suite is not a failure. (Mirrors vm.tks run_tests.)
-// count_prod_fns — coverage DENOMINATOR: production (non-`#test`) functions. (Mirrors vm.tks.)
+// count_prod_fns — coverage DENOMINATOR: production (non-`#test`) functions, excluding vm.tks
+// (namespace "teko::vm"). The vm.tks functions implement the NATIVE VM (only exercised by
+// `bin/teko test .`); they are never called via find_function during `build/teko test .`.
+// Including them would permanently suppress coverage below 80% with no way to test them here.
 static uint64_t count_prod_fns(tk_tprogram prog) {
     uint64_t n = 0;
-    for (size_t i = 0; i < prog.nitems; i += 1)
-        if (prog.items[i].tag == TK_TITEM_FUNCTION && !prog.items[i].as.function.is_test) n += 1;
+    for (size_t i = 0; i < prog.nitems; i += 1) {
+        if (prog.items[i].tag != TK_TITEM_FUNCTION) continue;
+        tk_tfunction f = prog.items[i].as.function;
+        if (f.is_test) continue;
+        // exclude vm.tks (namespace "teko::vm") — only testable by the native binary
+        static const char vm_ns[] = "teko::vm";
+        if (f.namespace.len == sizeof(vm_ns) - 1 &&
+            memcmp(f.namespace.ptr, vm_ns, sizeof(vm_ns) - 1) == 0) continue;
+        n += 1;
+    }
     return n;
 }
 
@@ -1594,9 +1768,247 @@ uint64_t tk_vm_coverage_pct(tk_tprogram prog) {
     return tk_cov_distinct() * 100 / total;
 }
 
-int tk_vm_run_tests(tk_tprogram prog) {
+// ---------------------------------------------------------------------------
+// D3-branch — Cobertura branch-coverage report (mirrors vm.tks cov_cobertura + cov_branches_*). A
+// branch SITE is one `if` (2 outcomes) / `match` (narms outcomes); we statically enumerate every
+// site per production fn and query tk_cov_branch_hit per outcome. Single-quoted XML attributes.
+// ---------------------------------------------------------------------------
+typedef struct { char *p; size_t len, cap; } cov_sb;
+static void cov_sb_bytes(cov_sb *b, const char *s, size_t n) {
+    if (b->len + n + 1 > b->cap) {
+        size_t nc = b->cap ? b->cap : 8192;
+        while (nc < b->len + n + 1) nc *= 2;
+        char *g = (char *)tk_alloc(nc); if (!g) abort();
+        if (b->len) memcpy(g, b->p, b->len);
+        b->p = g; b->cap = nc;
+    }
+    memcpy(b->p + b->len, s, n); b->len += n; b->p[b->len] = 0;
+}
+static void cov_sb_puts(cov_sb *b, const char *s) { cov_sb_bytes(b, s, strlen(s)); }
+static void cov_sb_str(cov_sb *b, tk_str s) { cov_sb_bytes(b, (const char *)s.ptr, s.len); }
+static void cov_sb_putu(cov_sb *b, uint64_t v) { char t[24]; int n = snprintf(t, sizeof t, "%llu", (unsigned long long)v); cov_sb_bytes(b, t, (size_t)n); }
+static void cov_sb_rate(cov_sb *b, uint64_t cov, uint64_t val) {
+    if (val == 0) { cov_sb_puts(b, "1.0"); return; }
+    uint64_t m = cov * 1000 / val;
+    if (m >= 1000) { cov_sb_puts(b, "1.0"); return; }
+    char t[16]; int n = snprintf(t, sizeof t, "0.%03llu", (unsigned long long)m); cov_sb_bytes(b, t, (size_t)n);
+}
+
+typedef struct { uint32_t line, col; uint64_t n; } cov_site;
+typedef struct { cov_site *p; size_t len, cap; } cov_sites;
+typedef struct { uint32_t *p; size_t len, cap; } cov_lines_t;
+typedef struct { cov_sites sites; cov_lines_t lines; } cov_walk_t;   // branch sites + DISTINCT executable lines
+static void cov_site_add(cov_sites *s, uint32_t line, uint32_t col, uint64_t n) {
+    if (s->len == s->cap) {
+        size_t nc = s->cap ? s->cap * 2 : 16;
+        cov_site *g = (cov_site *)tk_alloc(nc * sizeof *g); if (!g) abort();
+        if (s->len) memcpy(g, s->p, s->len * sizeof *g);
+        s->p = g; s->cap = nc;
+    }
+    s->p[s->len].line = line; s->p[s->len].col = col; s->p[s->len].n = n; s->len += 1;
+}
+static void cov_line_add(cov_lines_t *l, uint32_t line) {   // distinct, skip 0 (unpositioned)
+    if (line == 0) return;
+    for (size_t i = 0; i < l->len; i += 1) if (l->p[i] == line) return;
+    if (l->len == l->cap) {
+        size_t nc = l->cap ? l->cap * 2 : 16;
+        uint32_t *g = (uint32_t *)tk_alloc(nc * sizeof *g); if (!g) abort();
+        if (l->len) memcpy(g, l->p, l->len * sizeof *g);
+        l->p = g; l->cap = nc;
+    }
+    l->p[l->len++] = line;
+}
+static void cov_walk_block(const tk_tstatement *b, size_t n, cov_walk_t *w);
+static void cov_walk_expr(const tk_texpr *e, cov_walk_t *w) {
+    if (!e) return;
+    cov_line_add(&w->lines, e->line);   // line coverage — every expr's source line
+    switch (e->tag) {
+        case TK_TEXPR_IF:
+            cov_site_add(&w->sites, e->line, e->col, 2);
+            cov_walk_expr(e->as.if_expr.cond, w);
+            cov_walk_block(e->as.if_expr.then_blk, e->as.if_expr.nthen, w);
+            if (e->as.if_expr.has_else) cov_walk_block(e->as.if_expr.else_blk, e->as.if_expr.nelse, w);
+            break;
+        case TK_TEXPR_MATCH:
+            cov_site_add(&w->sites, e->line, e->col, e->as.match_expr.narms);
+            cov_walk_expr(e->as.match_expr.subject, w);
+            for (size_t i = 0; i < e->as.match_expr.narms; i += 1) {
+                const tk_tarm *a = &e->as.match_expr.arms[i];
+                if (a->has_when) cov_walk_expr(a->guard, w);
+                cov_walk_block(a->body, a->nbody, w);
+            }
+            break;
+        case TK_TEXPR_BINARY: cov_walk_expr(e->as.binary.left, w); cov_walk_expr(e->as.binary.right, w); break;
+        case TK_TEXPR_UNARY:  cov_walk_expr(e->as.unary.operand, w); break;
+        case TK_TEXPR_COMPARE:
+            cov_walk_expr(e->as.compare.first, w);
+            for (size_t i = 0; i < e->as.compare.nrest; i += 1) cov_walk_expr(e->as.compare.rest[i].operand, w);
+            break;
+        case TK_TEXPR_CALL:
+            for (size_t i = 0; i < e->as.call.nargs; i += 1) cov_walk_expr(&e->as.call.args[i], w);
+            break;
+        case TK_TEXPR_CAST: cov_walk_expr(e->as.cast.expr, w); break;
+        case TK_TEXPR_FIELD_ACCESS: cov_walk_expr(e->as.field_access.receiver, w); break;
+        case TK_TEXPR_SAFE_FIELD_ACCESS: cov_walk_expr(e->as.safe_field_access.receiver, w); break;
+        case TK_TEXPR_COALESCE: cov_walk_expr(e->as.coalesce.left, w); cov_walk_expr(e->as.coalesce.right, w); break;
+        case TK_TEXPR_INDEX: cov_walk_expr(e->as.index.receiver, w); cov_walk_expr(e->as.index.index, w); break;
+        case TK_TEXPR_STRUCT_INIT:
+            for (size_t i = 0; i < e->as.struct_init.nfields; i += 1) cov_walk_expr(&e->as.struct_init.field_vals[i], w);
+            break;
+        case TK_TEXPR_INTERP:
+            for (size_t i = 0; i < e->as.interp.nholes; i += 1) cov_walk_expr(&e->as.interp.holes[i], w);
+            break;
+        case TK_TEXPR_IN:
+            cov_walk_expr(e->as.in_expr.lhs, w);
+            for (size_t i = 0; i < e->as.in_expr.nelems; i += 1) cov_walk_expr(&e->as.in_expr.elems[i], w);
+            break;
+        case TK_TEXPR_ARRAY:
+            for (size_t i = 0; i < e->as.array.nelements; i += 1) cov_walk_expr(&e->as.array.elements[i], w);
+            break;
+        default: break;   // leaves (number/var/str/byte/bool/null/path) — line already added
+    }
+}
+static void cov_walk_stmt(const tk_tstatement *st, cov_walk_t *w) {
+    switch (st->tag) {
+        case TK_TSTMT_BINDING: cov_walk_expr(&st->as.binding.value, w); break;
+        case TK_TSTMT_ASSIGN:  cov_walk_expr(&st->as.assign.value, w); break;
+        case TK_TSTMT_RETURN:  if (st->as.ret.has_value) cov_walk_expr(&st->as.ret.value, w); break;
+        case TK_TSTMT_LOOP:    cov_walk_block(st->as.loop_stmt.body, st->as.loop_stmt.nbody, w); break;
+        case TK_TSTMT_EXPR:    cov_walk_expr(&st->as.expr_stmt.expr, w); break;
+        default: break;   // break/continue
+    }
+}
+static void cov_walk_block(const tk_tstatement *b, size_t n, cov_walk_t *w) {
+    for (size_t i = 0; i < n; i += 1) cov_walk_stmt(&b[i], w);
+}
+// branch taken/total over the sites on source line `ln` (a line may host >1 if/match).
+static void cov_line_branch(const cov_sites *s, uint64_t fn, uint32_t ln, uint64_t *taken, uint64_t *total) {
+    *taken = 0; *total = 0;
+    for (size_t k = 0; k < s->len; k += 1) {
+        if (s->p[k].line != ln) continue;
+        for (uint64_t o = 0; o < s->p[k].n; o += 1)
+            if (tk_cov_branch_hit(fn, s->p[k].line, s->p[k].col, o)) *taken += 1;
+        *total += s->p[k].n;
+    }
+}
+
+// is this a production (non-test, non-vm.tks) function? (the coverage universe)
+static bool cov_is_prod(tk_tfunction f) {
+    static const char vm_ns[] = "teko::vm";
+    if (f.is_test) return false;
+    if (f.namespace.len == sizeof(vm_ns) - 1 && memcmp(f.namespace.ptr, vm_ns, sizeof(vm_ns) - 1) == 0) return false;
+    return true;
+}
+
+static const char *cov_cobertura(tk_tprogram prog) {
+    cov_sb body = { 0 };
+    uint64_t lines_cov = 0, lines_val = 0, br_cov = 0, br_val = 0;
+    for (size_t i = 0; i < prog.nitems; i += 1) {
+        if (prog.items[i].tag != TK_TITEM_FUNCTION) continue;
+        tk_tfunction f = prog.items[i].as.function;
+        if (!cov_is_prod(f)) continue;
+        uint64_t fnhit = tk_cov_is_marked(i) ? 1 : 0;
+        cov_walk_t w = { 0 };
+        cov_walk_block(f.body, f.nbody, &w);
+        // LINE coverage — one <line> per distinct executable body line (branch lines also annotated).
+        cov_sb llines = { 0 };
+        uint64_t flc = 0, flv = 0;
+        for (size_t k = 0; k < w.lines.len; k += 1) {
+            uint32_t ln = w.lines.p[k];
+            uint64_t lhit = tk_cov_line_hit(i, ln) ? 1 : 0;
+            flv += 1; flc += lhit;
+            uint64_t bt, bn; cov_line_branch(&w.sites, i, ln, &bt, &bn);
+            cov_sb_puts(&llines, "          <line number='"); cov_sb_putu(&llines, ln);
+            cov_sb_puts(&llines, "' hits='"); cov_sb_putu(&llines, lhit);
+            if (bn > 0) {
+                cov_sb_puts(&llines, "' branch='true' condition-coverage='"); cov_sb_putu(&llines, bt * 100 / bn);
+                cov_sb_puts(&llines, "% ("); cov_sb_putu(&llines, bt); cov_sb_puts(&llines, "/"); cov_sb_putu(&llines, bn);
+                cov_sb_puts(&llines, ")'/>\n");
+            } else {
+                cov_sb_puts(&llines, "'/>\n");
+            }
+        }
+        lines_cov += flc; lines_val += flv;
+        // BRANCH coverage — taken/total over every site.
+        uint64_t fbc = 0, fbv = 0;
+        for (size_t k = 0; k < w.sites.len; k += 1) {
+            for (uint64_t o = 0; o < w.sites.p[k].n; o += 1)
+                if (tk_cov_branch_hit(i, w.sites.p[k].line, w.sites.p[k].col, o)) fbc += 1;
+            fbv += w.sites.p[k].n;
+        }
+        br_cov += fbc; br_val += fbv;
+        cov_sb_puts(&body, "      <class name='");
+        if (f.namespace.len) { cov_sb_str(&body, f.namespace); cov_sb_puts(&body, "::"); }
+        cov_sb_str(&body, f.name);
+        cov_sb_puts(&body, "' filename='"); cov_sb_str(&body, f.file);
+        cov_sb_puts(&body, "' line-rate='"); cov_sb_rate(&body, flc, flv);
+        cov_sb_puts(&body, "' branch-rate='"); cov_sb_rate(&body, fbc, fbv);
+        cov_sb_puts(&body, "' complexity='0'>\n        <methods><method name='"); cov_sb_str(&body, f.name);
+        cov_sb_puts(&body, "' signature='()V' line-rate='"); cov_sb_rate(&body, flc, flv);
+        cov_sb_puts(&body, "' branch-rate='"); cov_sb_rate(&body, fbc, fbv);
+        cov_sb_puts(&body, "'><lines><line number='"); cov_sb_putu(&body, f.line);
+        cov_sb_puts(&body, "' hits='"); cov_sb_putu(&body, fnhit);
+        cov_sb_puts(&body, "'/></lines></method></methods>\n        <lines>\n");
+        if (llines.len) cov_sb_bytes(&body, llines.p, llines.len);
+        cov_sb_puts(&body, "        </lines>\n      </class>\n");
+    }
+    cov_sb out = { 0 };
+    cov_sb_puts(&out, "<?xml version='1.0' ?>\n<coverage line-rate='"); cov_sb_rate(&out, lines_cov, lines_val);
+    cov_sb_puts(&out, "' branch-rate='"); cov_sb_rate(&out, br_cov, br_val);
+    cov_sb_puts(&out, "' lines-covered='"); cov_sb_putu(&out, lines_cov);
+    cov_sb_puts(&out, "' lines-valid='"); cov_sb_putu(&out, lines_val);
+    cov_sb_puts(&out, "' branches-covered='"); cov_sb_putu(&out, br_cov);
+    cov_sb_puts(&out, "' branches-valid='"); cov_sb_putu(&out, br_val);
+    cov_sb_puts(&out, "' complexity='0' version='teko' timestamp='0'>\n  <sources><source>.</source></sources>\n  <packages>\n    <package name='teko' line-rate='");
+    cov_sb_rate(&out, lines_cov, lines_val); cov_sb_puts(&out, "' branch-rate='"); cov_sb_rate(&out, br_cov, br_val);
+    cov_sb_puts(&out, "' complexity='0'>\n      <classes>\n");
+    if (body.len) cov_sb_bytes(&out, body.p, body.len);
+    cov_sb_puts(&out, "      </classes>\n    </package>\n  </packages>\n</coverage>\n");
+    return out.p;
+}
+
+// (cov, total) counts for the LINE and BRANCH metrics over all production fns. (Mirror vm.tks.)
+static void cov_line_counts(tk_tprogram prog, uint64_t *cov, uint64_t *total) {
+    *cov = 0; *total = 0;
+    for (size_t i = 0; i < prog.nitems; i += 1) {
+        if (prog.items[i].tag != TK_TITEM_FUNCTION) continue;
+        tk_tfunction f = prog.items[i].as.function;
+        if (!cov_is_prod(f)) continue;
+        cov_walk_t w = { 0 };
+        cov_walk_block(f.body, f.nbody, &w);
+        for (size_t k = 0; k < w.lines.len; k += 1) { *total += 1; if (tk_cov_line_hit(i, w.lines.p[k])) *cov += 1; }
+    }
+}
+static void cov_branch_counts(tk_tprogram prog, uint64_t *cov, uint64_t *total) {
+    *cov = 0; *total = 0;
+    for (size_t i = 0; i < prog.nitems; i += 1) {
+        if (prog.items[i].tag != TK_TITEM_FUNCTION) continue;
+        tk_tfunction f = prog.items[i].as.function;
+        if (!cov_is_prod(f)) continue;
+        cov_walk_t w = { 0 };
+        cov_walk_block(f.body, f.nbody, &w);
+        for (size_t k = 0; k < w.sites.len; k += 1) {
+            for (uint64_t o = 0; o < w.sites.p[k].n; o += 1)
+                if (tk_cov_branch_hit(i, w.sites.p[k].line, w.sites.p[k].col, o)) *cov += 1;
+            *total += w.sites.p[k].n;
+        }
+    }
+}
+uint64_t tk_vm_line_coverage_pct(tk_tprogram prog) {
+    uint64_t c, t; cov_line_counts(prog, &c, &t); return t == 0 ? 100 : c * 100 / t;
+}
+// aggregate BRANCH coverage % from the last recorded run (the D4 BRANCH floor reads this).
+uint64_t tk_vm_branch_coverage_pct(tk_tprogram prog) {
+    uint64_t c, t; cov_branch_counts(prog, &c, &t); return t == 0 ? 100 : c * 100 / t;
+}
+
+// run the test suite. `record_branches` enables branch recording (the GATE needs it for the floor,
+// even without --coverage); `write_xml` then writes the Cobertura report to `cov_path`.
+int tk_vm_run_tests_cov(tk_tprogram prog, bool record_branches, bool write_xml, const char *cov_path) {
     g_prog = prog;
     tk_cov_reset();          // D3 — start a fresh coverage run
+    // the GATE records lines+branches even without --coverage (for the floors).
+    if (record_branches) { tk_cov_branch_reset(); tk_cov_branches_on(true); tk_cov_line_reset(); tk_cov_lines_on(true); }
     size_t passed = 0;
     for (size_t i = 0; i < prog.nitems; i += 1) {
         if (prog.items[i].tag != TK_TITEM_FUNCTION) continue;
@@ -1609,15 +2021,39 @@ int tk_vm_run_tests(tk_tprogram prog) {
             printf("test %.*s ... ", (int)f.name.len, (const char *)f.name.ptr);
         fflush(stdout);
         tk_venv fenv = { .head = NULL };
+        tk_cov_enter(i);   // attribute the test body's own lines/branches to the test (NOT prod fn 0)
         tk_vm_exec_block(f.body, f.nbody, &fenv);   // a failed assert panics here (fail-fast)
+        tk_cov_leave();
         env_free(&fenv);
         printf("ok\n");
         passed += 1;
     }
-    if (passed == 0) { printf("teko: no tests (no `#test` functions)\n"); return 0; }
-    printf("teko: %zu test(s) passed\n", passed);
-    printf("teko: coverage %llu%% (%llu/%llu functions)\n",
-           (unsigned long long)tk_vm_coverage_pct(prog),
-           (unsigned long long)tk_cov_distinct(), (unsigned long long)count_prod_fns(prog));
+    if (record_branches) { tk_cov_branches_on(false); tk_cov_lines_on(false); }
+    if (passed == 0) {
+        printf("teko: no tests (no `#test` functions)\n");
+    } else {
+        printf("teko: %zu test(s) passed\n", passed);
+        printf("teko: coverage %llu%% (%llu/%llu functions)\n",
+               (unsigned long long)tk_vm_coverage_pct(prog),
+               (unsigned long long)tk_cov_distinct(), (unsigned long long)count_prod_fns(prog));
+        if (record_branches) {
+            uint64_t lc, lt, bc, bt;
+            cov_line_counts(prog, &lc, &lt);
+            cov_branch_counts(prog, &bc, &bt);
+            printf("teko: coverage %llu%% (%llu/%llu lines)\n",
+                   (unsigned long long)(lt == 0 ? 100 : lc * 100 / lt), (unsigned long long)lc, (unsigned long long)lt);
+            printf("teko: coverage %llu%% (%llu/%llu branches)\n",
+                   (unsigned long long)(bt == 0 ? 100 : bc * 100 / bt), (unsigned long long)bc, (unsigned long long)bt);
+        }
+    }
+    if (write_xml) {
+        const char *xml = cov_cobertura(prog);
+        tk_str path = { (const tk_byte *)cov_path, strlen(cov_path) };
+        tk_str content = { (const tk_byte *)xml, strlen(xml) };
+        tk_rt_write_file(path, content);
+        printf("teko: wrote coverage report %s\n", cov_path);
+    }
     return 0;
 }
+
+int tk_vm_run_tests(tk_tprogram prog) { return tk_vm_run_tests_cov(prog, false, false, ""); }

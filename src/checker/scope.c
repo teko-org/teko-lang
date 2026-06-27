@@ -281,6 +281,52 @@ tk_type_result tk_builtin_fn(tk_str name) {
         tk_type ft = { .tag = TK_TYPE_FUNC, .as.func = { .params = NULL, .nparams = 0, .ret = &u64_t } };
         return (tk_type_result){ .ok = true, .as.value = ft };
     }
+    if (name_is(name, "cov_is_marked")) {
+        tk_type ft = { .tag = TK_TYPE_FUNC, .as.func = { .params = &u64_t, .nparams = 1, .ret = &bool_t } };
+        return (tk_type_result){ .ok = true, .as.value = ft };
+    }
+    // D3-branch — branch-coverage sink.
+    if (name_is(name, "cov_branches_on")) {
+        tk_type ft = { .tag = TK_TYPE_FUNC, .as.func = { .params = &bool_t, .nparams = 1, .ret = &void_t } };
+        return (tk_type_result){ .ok = true, .as.value = ft };
+    }
+    if (name_is(name, "cov_branch_reset") || name_is(name, "cov_leave")) {
+        tk_type ft = { .tag = TK_TYPE_FUNC, .as.func = { .params = NULL, .nparams = 0, .ret = &void_t } };
+        return (tk_type_result){ .ok = true, .as.value = ft };
+    }
+    if (name_is(name, "cov_enter")) {
+        tk_type ft = { .tag = TK_TYPE_FUNC, .as.func = { .params = &u64_t, .nparams = 1, .ret = &void_t } };
+        return (tk_type_result){ .ok = true, .as.value = ft };
+    }
+    if (name_is(name, "cov_branch")) {
+        static tk_type covbr_p[3] = { { .tag = TK_TYPE_PRIM, .as.prim = TK_PRIM_U32 }, { .tag = TK_TYPE_PRIM, .as.prim = TK_PRIM_U32 }, { .tag = TK_TYPE_PRIM, .as.prim = TK_PRIM_U64 } };
+        tk_type ft = { .tag = TK_TYPE_FUNC, .as.func = { .params = covbr_p, .nparams = 3, .ret = &void_t } };
+        return (tk_type_result){ .ok = true, .as.value = ft };
+    }
+    if (name_is(name, "cov_branch_hit")) {
+        static tk_type covbh_p[4] = { { .tag = TK_TYPE_PRIM, .as.prim = TK_PRIM_U64 }, { .tag = TK_TYPE_PRIM, .as.prim = TK_PRIM_U32 }, { .tag = TK_TYPE_PRIM, .as.prim = TK_PRIM_U32 }, { .tag = TK_TYPE_PRIM, .as.prim = TK_PRIM_U64 } };
+        tk_type ft = { .tag = TK_TYPE_FUNC, .as.func = { .params = covbh_p, .nparams = 4, .ret = &bool_t } };
+        return (tk_type_result){ .ok = true, .as.value = ft };
+    }
+    // D3-line — line-coverage sink.
+    if (name_is(name, "cov_lines_on")) {
+        tk_type ft = { .tag = TK_TYPE_FUNC, .as.func = { .params = &bool_t, .nparams = 1, .ret = &void_t } };
+        return (tk_type_result){ .ok = true, .as.value = ft };
+    }
+    if (name_is(name, "cov_line_reset")) {
+        tk_type ft = { .tag = TK_TYPE_FUNC, .as.func = { .params = NULL, .nparams = 0, .ret = &void_t } };
+        return (tk_type_result){ .ok = true, .as.value = ft };
+    }
+    if (name_is(name, "cov_line")) {
+        static tk_type u32_t = { .tag = TK_TYPE_PRIM, .as.prim = TK_PRIM_U32 };
+        tk_type ft = { .tag = TK_TYPE_FUNC, .as.func = { .params = &u32_t, .nparams = 1, .ret = &void_t } };
+        return (tk_type_result){ .ok = true, .as.value = ft };
+    }
+    if (name_is(name, "cov_line_hit")) {
+        static tk_type covlh_p[2] = { { .tag = TK_TYPE_PRIM, .as.prim = TK_PRIM_U64 }, { .tag = TK_TYPE_PRIM, .as.prim = TK_PRIM_U32 } };
+        tk_type ft = { .tag = TK_TYPE_FUNC, .as.func = { .params = covlh_p, .nparams = 2, .ret = &bool_t } };
+        return (tk_type_result){ .ok = true, .as.value = ft };
+    }
     // VM-internal arithmetic FFI (sign-aware over the i128 carrier) + the F3 panic helpers the VM
     // and runtime call via the reserved `teko::` root (teko::runtime mirrors these in Teko).
     if (name_is(name, "div") || name_is(name, "rem")) {              // (i128, i128, bool) -> i128

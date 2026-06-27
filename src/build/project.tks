@@ -242,7 +242,7 @@ fn ensure_rt_dir_abs() {
     match teko::env::set_var("TK_RT_DIR", teko::str::concat3(cwd, "/", rel)) { error => {}; null => {} }
 }
 
-fn compile_project(dir: str, out_dir: str) -> i32 { compile_project_g(dir, out_dir, true) }
+fn compile_project(dir: str, out_dir: str) -> i32 { compile_project_g(dir, out_dir, true, false) }
 
 // strip_tests — the production program WITHOUT `#test` functions (D4): a release binary must
 // not carry test code. Tests are excluded from codegen; everything else passes through.
@@ -268,7 +268,7 @@ fn strip_tests(prog: checker::TProgram) -> checker::TProgram {
 // stripped). An empty suite is not a failure. `gate=false` (`teko build --no-test`, used by the
 // bootstrap self-build whose own corpus tests are not yet VM-runnable) is the plain production
 // front-end with no test files assembled. (D4 — tests gate emission; release bars on fail.)
-fn compile_project_g(dir: str, out_dir: str, gate: bool) -> i32 {
+fn compile_project_g(dir: str, out_dir: str, gate: bool, gen_cov: bool) -> i32 {
     ensure_rt_dir_abs()   // pin the runtime to an absolute path BEFORE the front-end chdir's
     if !gate {
         let fe = match project_frontend(dir) { Frontend as x => x; error as e => return fail(dir, e.message) }
@@ -284,12 +284,25 @@ fn compile_project_g(dir: str, out_dir: str, gate: bool) -> i32 {
                 // No tests at all → ignore the gate, build the production program (no test code present).
                 return backend(dir, fe.manifest.name, out_dir, fe.prog)
             }
-            let trc = vm::run_tests(fe.prog)   // a failed assertion panics here (fail-fast) → BLOCKS the build
+            // The gate ALWAYS records lines+branches (for the floors); `--coverage` additionally emits
+            // <out_dir>/cobertura.xml (mkdir the dir first — idempotent). A failed assert panics here
+            // (fail-fast) → BLOCKS the build.
+            let cov_path = if gen_cov { let _ = teko::fs::mkdir(out_dir); teko::str::concat(out_dir, "/cobertura.xml") } else { "" }
+            let trc = vm::run_tests_cov(fe.prog, true, gen_cov, cov_path)
             if trc != 0 { return trc }
-            // D4 coverage floor (80%): tests that cover < 80% of production functions BLOCK the build.
-            let cov = vm::coverage_pct(fe.prog)
-            if cov < 80 {
-                return fail(dir, teko::str::concat3("test coverage ", teko::str::u64_to_str(cov), "% is below the 80% floor — add tests (or `--no-test`)"))
+            // D4 coverage floors (from the `.tkp` [coverage] section; default 80/80/80): the build is
+            // BLOCKED when FUNCTION, LINE, or BRANCH coverage is below its floor.
+            let fcov = vm::coverage_pct(fe.prog)
+            if fcov < fe.manifest.cov_functions {
+                return fail(dir, $"function coverage {fcov}% is below the {fe.manifest.cov_functions}% floor ([coverage] functions) — add tests (or `--no-test`)")
+            }
+            let lcov = vm::line_coverage_pct(fe.prog)
+            if lcov < fe.manifest.cov_lines {
+                return fail(dir, $"line coverage {lcov}% is below the {fe.manifest.cov_lines}% floor ([coverage] lines) — add tests (or `--no-test`)")
+            }
+            let bcov = vm::branch_coverage_pct(fe.prog)
+            if bcov < fe.manifest.cov_branches {
+                return fail(dir, $"branch coverage {bcov}% is below the {fe.manifest.cov_branches}% floor ([coverage] branches) — add tests (or `--no-test`)")
             }
             backend(dir, fe.manifest.name, out_dir, strip_tests(fe.prog))
         }
@@ -343,6 +356,17 @@ fn no_test_of(args: []str) -> bool {
     false
 }
 
+// does `--coverage` appear in the args? (write a Cobertura `cobertura.xml` next to the build output.)
+fn coverage_of(args: []str) -> bool {
+    mut i: u64 = 0
+    loop {
+        if i >= args.len { break }
+        if args[i] == "--coverage" { return true }
+        i = i + 1
+    }
+    false
+}
+
 // the FIRST non-flag positional (the project) from `start`, or "" if none (the caller reports).
 fn project_arg_of(args: []str, start: u64) -> str {
     mut i = start
@@ -372,7 +396,9 @@ fn run_project(dir: str) -> i32 {
 // virtual-main. Fail-fast: a failed assertion panics from inside the VM (non-zero exit); all
 // pass → exit 0. An empty suite (no `#test`) is not a failure.
 // =========================================================================
-fn test_project(dir: str) -> i32 {
+// `gen_cov` (from `--coverage`) writes a Cobertura report to <cwd>/cobertura.xml (the project root,
+// since the front-end has chdir'd into the project; `teko test` has no `-o` output dir).
+fn test_project(dir: str, gen_cov: bool) -> i32 {
     let fe = match project_frontend_sel(dir, true) { Frontend as x => x; error as e => return fail(dir, e.message) }
-    vm::run_tests(fe.prog)
+    if gen_cov { vm::run_tests_cov(fe.prog, true, true, "cobertura.xml") } else { vm::run_tests(fe.prog) }
 }

@@ -46,9 +46,12 @@ static void compute_loc(tk_str source, size_t pos, uint32_t *line, uint32_t *col
     }
     *line = l; *col = c;
 }
-// stamp a token with the 1-based location of its start byte `pos`.
-static tk_token stamp(tk_token tok, tk_str source, size_t pos) {
-    compute_loc(source, pos, &tok.line, &tok.col);
+// stamp a token with an ALREADY-COMPUTED 1-based (line, col). tk_tokenize threads a location
+// cursor that advances MONOTONICALLY with the token-start position, so each source byte is
+// crossed exactly once across the whole file — O(1) amortized per token (a line table without
+// the table). The old per-token compute_loc rescan was O(pos), i.e. O(N²) over a file.
+static tk_token stamp_loc(tk_token tok, uint32_t line, uint32_t col) {
+    tok.line = line; tok.col = col;
     return tok;
 }
 // a LOCATED lexer error: "line:col: msg" at byte `pos` (the file is prepended later by the
@@ -511,10 +514,20 @@ static tk_scan_result next_token(tk_str source, size_t pos) {
 tk_tokens_result tk_tokenize(tk_str source) {
     size_t pos = 0;
     tk_tokens tokens = tk_tokens_empty();
+    // location cursor: (cur_line, cur_col) is the 1-based location of byte `cur_pos`. It
+    // advances forward to each token-start `pos`; since the token starts are monotonic, the
+    // total advance work is O(N) (each byte crossed once) — replacing the old O(N²) stamping.
+    size_t cur_pos = 0;
+    uint32_t cur_line = 1, cur_col = 1;
 
     for (;;) {
         pos = skip_spaces(source, pos);
         if (pos >= source.len) break;
+
+        // advance the cursor from cur_pos up to the token start `pos`, counting newlines.
+        for (; cur_pos < pos; cur_pos += 1) {
+            if (source.ptr[cur_pos] == '\n') { cur_line += 1; cur_col = 1; } else { cur_col += 1; }
+        }
 
         tk_byte c = source.ptr[pos];
 
@@ -530,7 +543,7 @@ tk_tokens_result tk_tokenize(tk_str source) {
             if (at(source, pos + 2) == '*' && at(source, pos + 3) != '/') {
                 tk_scan_result sc = read_doc_comment(source, pos);
                 if (!sc.ok) { tk_tokens_free(tokens); return (tk_tokens_result){ .ok = false, .as.error = sc.as.error }; }
-                tokens = tk_tokens_push(tokens, stamp(sc.as.value.token, source, pos));
+                tokens = tk_tokens_push(tokens, stamp_loc(sc.as.value.token, cur_line, cur_col));
                 pos = sc.as.value.next;
                 continue;
             }
@@ -541,14 +554,14 @@ tk_tokens_result tk_tokenize(tk_str source) {
         }
         // a significant newline (B.26) is a token
         if (c == '\n') {
-            tokens = tk_tokens_push(tokens, stamp(sym(source, pos, 1, TK_TOKEN_NEWLINE).token, source, pos));
+            tokens = tk_tokens_push(tokens, stamp_loc(sym(source, pos, 1, TK_TOKEN_NEWLINE).token, cur_line, cur_col));
             pos = pos + 1;
             continue;
         }
 
         tk_scan_result sc = next_token(source, pos);
         if (!sc.ok) { tk_tokens_free(tokens); return (tk_tokens_result){ .ok = false, .as.error = sc.as.error }; }
-        tokens = tk_tokens_push(tokens, stamp(sc.as.value.token, source, pos));
+        tokens = tk_tokens_push(tokens, stamp_loc(sc.as.value.token, cur_line, cur_col));
         pos    = sc.as.value.next;
     }
 

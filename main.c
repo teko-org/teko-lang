@@ -100,6 +100,12 @@ static bool has_no_test(int argc, char **argv) {
     return false;
 }
 
+// does `--coverage` appear in the args? (write a Cobertura `cobertura.xml` next to the build output.)
+static bool has_coverage(int argc, char **argv) {
+    for (int i = 1; i < argc; i += 1) if (strcmp(argv[i], "--coverage") == 0) return true;
+    return false;
+}
+
 int main(int argc, char **argv) {
     tk_install_crash_handler();   // a crash prints a C stack trace, not a silent exit (M.1)
     if (argc < 2) { usage(); return 2; }
@@ -115,9 +121,10 @@ int main(int argc, char **argv) {
         if (proj == NULL) { usage(); return 2; }
         if (looks_like_file_arg(proj)) return reject_file_arg();
         const char *dir = project_dir_of(proj, buf, sizeof(buf));
-        if (strcmp(cmd, "build") == 0) return tk_compile_project_g(dir, out_dir, !has_no_test(argc, argv));   // D4 gate (unless --no-test)
+        bool cov = has_coverage(argc, argv);   // `--coverage` → write <out>/cobertura.xml (test: project root)
+        if (strcmp(cmd, "build") == 0) return tk_compile_project_g(dir, out_dir, !has_no_test(argc, argv), cov);   // D4 gate (unless --no-test)
         if (strcmp(cmd, "run") == 0)   return tk_run_project(dir);
-        return tk_test_project(dir);   // D2 — run the project's `#test` functions on the VM
+        return tk_test_project(dir, cov);   // D2 — run the project's `#test` functions on the VM
     }
 
     // Bare argument: a project (directory or `.tkp`) ≡ build (also honors `-o <dir>`). A file is rejected.
@@ -125,5 +132,5 @@ int main(int argc, char **argv) {
     const char *out_dir = parse_out_dir(argc, argv, 1, &proj);
     if (proj == NULL) { usage(); return 2; }
     if (looks_like_file_arg(proj)) return reject_file_arg();
-    return tk_compile_project_g(project_dir_of(proj, buf, sizeof(buf)), out_dir, !has_no_test(argc, argv));   // D4 gate (unless --no-test)
+    return tk_compile_project_g(project_dir_of(proj, buf, sizeof(buf)), out_dir, !has_no_test(argc, argv), has_coverage(argc, argv));   // D4 gate (unless --no-test)
 }

@@ -49,10 +49,12 @@ fn compute_loc(source: str, pos: u64) -> Loc {
     Loc { line = line; col = col }
 }
 
-// stamp a token with the 1-based location of its start byte `pos`.
-fn stamp(tok: Token, source: str, pos: u64) -> Token {
-    let loc = compute_loc(source, pos)
-    Token { kind = tok.kind; text = tok.text; line = loc.line; col = loc.col }
+// stamp a token with an ALREADY-COMPUTED 1-based (line, col). `tokenize` threads a location
+// cursor that advances MONOTONICALLY with the token-start position, so each source byte is
+// crossed exactly once across the whole file — O(1) amortized per token (a line table without
+// the table). The old per-token compute_loc rescan was O(pos), i.e. O(N²) over a file.
+fn stamp_loc(tok: Token, line: u32, col: u32) -> Token {
+    Token { kind = tok.kind; text = tok.text; line = line; col = col }
 }
 
 // a LOCATED lexer error: "line:col: msg" at byte `pos` (the file is prepended later by the
@@ -468,10 +470,23 @@ fn next_token(source: str, pos: u64) -> Scan | error {
 pub fn tokenize(source: str) -> []Token | error {
     mut pos: u64 = 0
     mut tokens: []Token = teko::list::empty()
+    // location cursor: (cur_line, cur_col) is the 1-based location of byte `cur_pos`. It
+    // advances forward to each token-start `pos`; since the token starts are monotonic, the
+    // total advance work is O(N) (each byte crossed once) — replacing the old O(N²) stamping.
+    mut cur_pos:  u64 = 0
+    mut cur_line: u32 = 1
+    mut cur_col:  u32 = 1
 
     loop {
         pos = skip_spaces(source, pos)
         if pos >= source.len { break }
+
+        // advance the cursor from cur_pos up to the token start `pos`, counting newlines.
+        loop {
+            if cur_pos >= pos { break }
+            if source[cur_pos] == b'\n' { cur_line = cur_line + 1; cur_col = 1 } else { cur_col = cur_col + 1 }
+            cur_pos = cur_pos + 1
+        }
 
         let c = source[pos]
 
@@ -487,7 +502,7 @@ pub fn tokenize(source: str) -> []Token | error {
             // block comment is skipped.
             if at(source, pos + 2) == b'*' && at(source, pos + 3) != b'/' {
                 let scan = match read_doc_comment(source, pos) { Scan as sc => sc; error as e => return e }
-                tokens = teko::list::push(tokens, stamp(scan.token, source, pos))
+                tokens = teko::list::push(tokens, stamp_loc(scan.token, cur_line, cur_col))
                 pos = scan.next
                 continue
             }
@@ -496,7 +511,7 @@ pub fn tokenize(source: str) -> []Token | error {
         }
         // a significant newline (B.26) is a token
         if c == b'\n' {
-            tokens = teko::list::push(tokens, stamp(sym(source, pos, 1, TokenKind::Newline).token, source, pos))
+            tokens = teko::list::push(tokens, stamp_loc(sym(source, pos, 1, TokenKind::Newline).token, cur_line, cur_col))
             pos = pos + 1
             continue
         }
@@ -505,7 +520,7 @@ pub fn tokenize(source: str) -> []Token | error {
             Scan as sc => sc
             error as e => return e
         }
-        tokens = teko::list::push(tokens, stamp(scan.token, source, pos))
+        tokens = teko::list::push(tokens, stamp_loc(scan.token, cur_line, cur_col))
         pos    = scan.next
     }
 

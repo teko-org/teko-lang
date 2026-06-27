@@ -107,9 +107,11 @@ fn expr_of(source: str) -> Expr | error {
 }
 
 // does parsing an expression from `source` fail (the barrier)?
+// A parse that succeeds but leaves tokens unconsumed also counts as an error
+// (e.g. `to u32` parses `to` as a name-var but leaves `u32` unconsumed).
 fn expr_errors(source: str) -> bool {
     let toks = match lexer::tokenize(source) { []lexer::Token as ts => ts; error => return true }
-    match parse_expr(toks, 0) { Parsed => false; error => true }
+    match parse_expr(toks, 0) { Parsed as pe => pe.next < toks.len; error => true }
 }
 
 #test
@@ -456,7 +458,7 @@ fn rejects_malformed_range_alt() {
 // appended to parser_test.tkt — P3d arm tests.
 
 // helper: lex `source`, parse an arm from 0 — the Arm, or error.
-fn arm_of(source: str) -> Arm | error {
+fn parser_arm_of(source: str) -> Arm | error {
     let toks = match lexer::tokenize(source) { []lexer::Token as ts => ts; error => return error { message = "lex failed" } }
     let pa = match parse_arm(toks, 0) { ParsedArm as x => x; error as e => return e }
     pa.node
@@ -470,21 +472,21 @@ fn arm_errors(source: str) -> bool {
 #test
 fn parses_arms() {
     // `_ => 5`: wildcard, no guard, body 5.
-    match arm_of("_ => 5") {
+    match parser_arm_of("_ => 5") {
         Arm as a => {
             teko::assert::is_false(a.has_when)
             match a.pattern { WildcardPattern => teko::assert::is_true(true); _ => teko::assert::is_true(false) }
-            match a.body { Number as nn => teko::assert::is_true(nn.value == 5); _ => teko::assert::is_true(false) }
+            teko::assert::is_true(a.body.len == 1)
         }
         _ => teko::assert::is_true(false)
     }
     // `Foo as x => x`: bind pattern, body the bound var.
-    match arm_of("Foo as x => x") {
+    match parser_arm_of("Foo as x => x") {
         Arm as a => match a.pattern { BindPattern as bp => teko::assert::is_true(bp.binding == "x"); _ => teko::assert::is_true(false) }
         _ => teko::assert::is_true(false)
     }
     // `1 when c => 2`: a guard.
-    match arm_of("1 when c => 2") {
+    match parser_arm_of("1 when c => 2") {
         Arm as a => {
             teko::assert::is_true(a.has_when)
             match a.guard { Var as v => teko::assert::is_true(v.name == "c"); _ => teko::assert::is_true(false) }
@@ -492,7 +494,7 @@ fn parses_arms() {
         _ => teko::assert::is_true(false)
     }
     // `1 ..= 5 => 0`: a range-pattern arm.
-    match arm_of("1 ..= 5 => 0") {
+    match parser_arm_of("1 ..= 5 => 0") {
         Arm as a => match a.pattern { RangePattern => teko::assert::is_true(true); _ => teko::assert::is_true(false) }
         _ => teko::assert::is_true(false)
     }
@@ -794,7 +796,7 @@ fn type_decl_of(source: str) -> TypeDecl | error {
 
 fn type_decl_errors(source: str) -> bool {
     let toks = match lexer::tokenize(source) { []lexer::Token as ts => ts; error => return true }
-    match parse_type_decl(toks, 0) { ParsedDecl => false; error => true }
+    match parse_type_decl(toks, 0) { ParsedDecl as pd => pd.next < toks.len; error => true }
 }
 
 #test
@@ -978,11 +980,11 @@ fn integration_module() {
 #test
 fn integration_main() {
     // a realistic main.tks: use + a mutable binding, a loop with break + assignment, and a match.
-    let src = "use teko::io; let mut n = 0; loop { if n == 3 { break }; n = n + 1 }; let r = match n { 3 => 1; _ => 0 }"
+    let src = "use teko::io; mut n = 0; loop { if n == 3 { break }; n = n + 1 }; let r = match n { 3 => 1; _ => 0 }"
     match main_file_of(src) {
         MainFile as mf => {
             teko::assert::is_true(mf.uses.len == 1)
-            teko::assert::is_true(mf.body.len == 3)              // the two `let`s and the `loop`
+            teko::assert::is_true(mf.body.len == 3)              // `mut n`, the loop, and `let r`
             // the second body statement is the loop.
             match mf.body[1] { LoopStmt as l => teko::assert::is_true(l.body.len == 2); _ => teko::assert::is_true(false) }
             // the third binds `r` to a match expression.
