@@ -81,6 +81,7 @@ static tk_texpr_result texpr_err(const char *m) { return (tk_texpr_result){ .ok 
 
 static tk_token_kind kind_of(uint8_t b) { return (tk_token_kind)b; }   // [E7: byte→enum]
 static tk_texpr *boxe(tk_texpr t) { tk_texpr *p = tk_alloc(sizeof *p); if (!p) abort(); *p = t; return p; }
+static tk_tstatement *read_tstmts(tk_reader *r, tk_strs t, size_t *out_n);   // (C7.16) fwd (mutual with tk_read_texpr)
 
 tk_texpr tk_read_texpr(tk_reader *r, tk_strs t) {
     tk_type ty = tk_read_type(r, t);
@@ -120,6 +121,13 @@ tk_texpr tk_read_texpr(tk_reader *r, tk_strs t) {
             for (uint32_t i = 0; i < na; i += 1) as[i] = tk_read_texpr(r, t);
             e.as.call.args = as; e.as.call.nargs = na; return e;
         }
+        case 8:                                                                 /* (C7.16) IF: cond + then_blk + has_else + else_blk */
+            e.tag = TK_TEXPR_IF;
+            e.as.if_expr.cond     = boxe(tk_read_texpr(r, t));
+            e.as.if_expr.then_blk = read_tstmts(r, t, &e.as.if_expr.nthen);
+            e.as.if_expr.has_else = (tk_read_u8(r) != 0);
+            e.as.if_expr.else_blk = read_tstmts(r, t, &e.as.if_expr.nelse);
+            return e;
         case 10:                                                                /* S1a — Cast: target rides ty; read inner */
             e.tag = TK_TEXPR_CAST;
             e.as.cast.expr = boxe(tk_read_texpr(r, t));
@@ -191,6 +199,64 @@ tk_texpr tk_read_texpr(tk_reader *r, tk_strs t) {
         }
     }
     r->ok = false; return e;
+}
+
+// (C7.16) BindTarget: tag 0 SimpleName | tag 1 DestructurePattern. Inverse of write_bindtarget.
+static tk_bind_target read_bindtarget(tk_reader *r, tk_strs t) {
+    uint8_t tag = tk_read_u8(r);
+    tk_bind_target bt = {0};
+    if (tag == 0) { bt.tag = TK_BIND_SIMPLE; bt.as.simple.name = tk_read_str(r, t); return bt; }
+    bt.tag = TK_BIND_DESTRUCTURE;
+    uint32_t n = tk_read_u32(r);
+    tk_str *names = tk_alloc((n ? n : 1) * sizeof *names); if (!names) abort();
+    for (uint32_t i = 0; i < n; i += 1) names[i] = tk_read_str(r, t);
+    bt.as.destructure.names = names; bt.as.destructure.nnames = (size_t)n;
+    return bt;
+}
+
+// (C7.16) a TStatement: u8 tag + payload. Inverse of write_tstatement.
+static tk_tstatement read_tstmt(tk_reader *r, tk_strs t) {
+    uint8_t tag = tk_read_u8(r);
+    tk_tstatement s = {0};
+    switch (tag) {
+        case 0:
+            s.tag = TK_TSTMT_BINDING;
+            s.as.binding.kind   = (tk_bind_kind)tk_read_u8(r);
+            s.as.binding.target = read_bindtarget(r, t);
+            s.as.binding.bound  = tk_read_type(r, t);
+            s.as.binding.value  = tk_read_texpr(r, t);
+            return s;
+        case 1:
+            s.tag = TK_TSTMT_ASSIGN;
+            s.as.assign.name  = tk_read_str(r, t);
+            s.as.assign.op    = kind_of(tk_read_u8(r));
+            s.as.assign.bound = tk_read_type(r, t);
+            s.as.assign.value = tk_read_texpr(r, t);
+            return s;
+        case 2:
+            s.tag = TK_TSTMT_RETURN;
+            s.as.ret.has_value = (tk_read_u8(r) != 0);
+            s.as.ret.value     = tk_read_texpr(r, t);
+            return s;
+        case 3:
+            s.tag = TK_TSTMT_LOOP;
+            s.as.loop_stmt.label = tk_read_str(r, t);
+            s.as.loop_stmt.body  = read_tstmts(r, t, &s.as.loop_stmt.nbody);
+            return s;
+        case 4: s.tag = TK_TSTMT_BREAK;    s.as.jump.label = tk_read_str(r, t); return s;
+        case 5: s.tag = TK_TSTMT_CONTINUE; s.as.jump.label = tk_read_str(r, t); return s;
+        case 6: s.tag = TK_TSTMT_EXPR;     s.as.expr_stmt.expr = tk_read_texpr(r, t); return s;
+    }
+    r->ok = false; return s;
+}
+
+// (C7.16) a []TStatement: u64 count, then each. Inverse of write_tstatements.
+static tk_tstatement *read_tstmts(tk_reader *r, tk_strs t, size_t *out_n) {
+    uint64_t n = tk_read_u64(r);
+    tk_tstatement *xs = tk_alloc((n ? n : 1) * sizeof *xs); if (!xs) abort();
+    for (uint64_t i = 0; i < n; i += 1) xs[i] = read_tstmt(r, t);
+    *out_n = (size_t)n;
+    return xs;
 }
 
 tk_texpr_result tk_deserialize(const tk_byte *data, size_t len) {

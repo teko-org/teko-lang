@@ -86,6 +86,39 @@ fn collect_pieces(t: StrTable, ps: []str) -> StrTable {
     tab
 }
 
+// (C7.16) collect a BindTarget's name(s).
+fn collect_bindtarget(t: StrTable, bt: parser::BindTarget) -> StrTable {
+    match bt {
+        parser::SimpleName as s => st_intern(t, s.name).table
+        parser::DestructurePattern as d => collect_pieces(t, d.names)
+    }
+}
+
+// (C7.16) collect a []TStatement (mirrors write_tstatements).
+fn collect_tstatements(t: StrTable, xs: []checker::TStatement) -> StrTable {
+    mut tab = t
+    mut i = 0
+    loop {
+        if i >= xs.len { break }
+        tab = collect_tstatement(tab, xs[i])
+        i++
+    }
+    tab
+}
+
+// (C7.16) collect a TStatement's strings (mirrors write_tstatement).
+fn collect_tstatement(t: StrTable, s: checker::TStatement) -> StrTable {
+    match s {
+        checker::TBinding as bd     => collect_strings(collect_type_strings(collect_bindtarget(t, bd.target), bd.bound), bd.value)
+        checker::TAssign as a       => collect_strings(collect_type_strings(st_intern(t, a.name).table, a.bound), a.value)
+        checker::TReturn as r       => collect_strings(t, r.value)
+        checker::TLoopStmt as l      => collect_tstatements(st_intern(t, l.label).table, l.body)
+        checker::TBreakStmt as br    => st_intern(t, br.label).table
+        checker::TContinueStmt as c  => st_intern(t, c.label).table
+        checker::TExprStmt as e      => collect_strings(t, e.expr)
+    }
+}
+
 // (C7.16) intern a struct-init's field names AND recurse each field value (write order = this order).
 fn collect_structinit(t: StrTable, si: checker::TStructInit) -> StrTable {
     mut tab = t
@@ -120,8 +153,9 @@ fn collect_strings(t: StrTable, te: checker::TExpr) -> StrTable {
         checker::TInExpr as ie => collect_texprs(collect_strings(t1, ie.lhs), ie.elems)
         checker::TArrayLit as a => collect_texprs(t1, a.elements)
         checker::TPathExpr as pe => st_intern(st_intern(t1, pe.enum_name).table, pe.member).table
-        // TIfExpr/TMatchExpr (block-bearing) are still tag-only in the writer — collected with the
-        // statement codec (C7.16 follow-on). TNumber/TByteLit/TBoolLit/TNullLit carry no strings.
+        // (C7.16) IF: collect cond + both statement blocks. (TMatchExpr stays tag-only until the
+        // pattern codec lands.) TNumber/TByteLit/TBoolLit/TNullLit carry no strings → `_`.
+        checker::TIfExpr as iff => collect_tstatements(collect_tstatements(collect_strings(t1, iff.cond), iff.then_blk), iff.else_blk)
         _             => t1
     }
 }

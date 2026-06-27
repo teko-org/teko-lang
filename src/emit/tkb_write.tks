@@ -8,6 +8,7 @@ use teko::lexer
 // `(tk_byte)k`. The .tkb reader's prim_of / kind_of are the inverses (byte → enum ordinal).
 fn prim_byte(k: checker::PrimKind) -> byte { k to byte }
 fn kind_byte(k: lexer::TokenKind) -> byte { k to byte }
+fn bindkind_byte(k: parser::BindKind) -> byte { k to byte }   // (C7.16) Let/Mut/Const → ordinal byte
 
 // a Type → tag byte + payload. (prim_byte/kind_byte = the enum's ordinal — E7.)
 fn write_type(buf: []byte, t: StrTable, ty: checker::Type) -> []byte {
@@ -95,10 +96,15 @@ fn write_texpr(buf: []byte, t: StrTable, te: checker::TExpr) -> []byte {
         checker::TUnary as u    => write_texpr(write_u8(write_u8(b, 5), kind_byte(u.op)), t, u.operand)
         checker::TCompare as c  => write_terms(write_texpr(write_u8(b, 6), t, c.first), t, c.rest)
         checker::TCall as cl    => write_texprs(write_path(write_u8(b, 7), t, cl.callee), t, cl.args)
-        // typed if/match: reserved tags 8/9. Full (de)serialization needs a typed-STATEMENT
-        // serializer ([]TStatement) — a separate later item; read rejects tags 8/9 as
-        // "bad texpr tag" (visible — M.1). (MethodCall has no typed node — typing deferred.)
-        checker::TIfExpr        => write_u8(b, 8)
+        // (C7.16) typed IF: tag 8 + cond (texpr) + then_blk ([]TStatement) + has_else (u8) + else_blk.
+        checker::TIfExpr as iff => {
+            mut sb = write_texpr(write_u8(b, 8), t, iff.cond)
+            sb = write_tstatements(sb, t, iff.then_blk)
+            sb = write_u8(sb, (if iff.has_else { 1 } else { 0 }) to byte)
+            write_tstatements(sb, t, iff.else_blk)
+        }
+        // typed MATCH: reserved tag 9. Full (de)serialization needs the parser::Pattern codec
+        // (TArm carries a pattern) — the next C7.16 slice; read still rejects tag 9 (visible — M.1).
         checker::TMatchExpr     => write_u8(b, 9)
         // S1a — Cast: the target type IS te.type (already written by the leading write_type); payload is just the inner expr.
         checker::TCast as c     => write_texpr(write_u8(b, 10), t, c.expr)
@@ -169,5 +175,62 @@ fn write_texpr(buf: []byte, t: StrTable, te: checker::TExpr) -> []byte {
             }
             sb
         }
+    }
+}
+
+// (C7.16) BindTarget: tag 0 SimpleName (interned name) | tag 1 DestructurePattern (count + names).
+fn write_bindtarget(buf: []byte, t: StrTable, bt: parser::BindTarget) -> []byte {
+    match bt {
+        parser::SimpleName as s => write_u32(write_u8(buf, 0), st_find(t, s.name))
+        parser::DestructurePattern as d => {
+            mut b = write_u32(write_u8(buf, 1), d.names.len to u32)
+            mut i = 0
+            loop {
+                if i >= d.names.len { break }
+                b = write_u32(b, st_find(t, d.names[i]))
+                i++
+            }
+            b
+        }
+    }
+}
+
+// (C7.16) a []TStatement: u64 count, then each statement. The inverse of read_tstatements.
+fn write_tstatements(buf: []byte, t: StrTable, xs: []checker::TStatement) -> []byte {
+    mut b = write_u64(buf, xs.len to u64)
+    mut i = 0
+    loop {
+        if i >= xs.len { break }
+        b = write_tstatement(b, t, xs[i])
+        i++
+    }
+    b
+}
+
+// (C7.16) a TStatement: u8 tag + payload. Inverse of read_tstatement.
+fn write_tstatement(buf: []byte, t: StrTable, s: checker::TStatement) -> []byte {
+    match s {
+        // TBinding (0): bindkind (u8) + target (BindTarget) + bound (Type) + value (TExpr).
+        checker::TBinding as bd => {
+            mut b = write_u8(write_u8(buf, 0), bindkind_byte(bd.kind))
+            b = write_bindtarget(b, t, bd.target)
+            b = write_type(b, t, bd.bound)
+            write_texpr(b, t, bd.value)
+        }
+        // TAssign (1): name (interned u32) + op (TokenKind u8) + bound (Type) + value (TExpr).
+        checker::TAssign as a => {
+            mut b = write_u8(write_u32(write_u8(buf, 1), st_find(t, a.name)), kind_byte(a.op))
+            b = write_type(b, t, a.bound)
+            write_texpr(b, t, a.value)
+        }
+        // TReturn (2): has_value (u8) + value (TExpr).
+        checker::TReturn as r => write_texpr(write_u8(write_u8(buf, 2), (if r.has_value { 1 } else { 0 }) to byte), t, r.value)
+        // TLoopStmt (3): label (interned u32) + body ([]TStatement).
+        checker::TLoopStmt as l => write_tstatements(write_u32(write_u8(buf, 3), st_find(t, l.label)), t, l.body)
+        // TBreakStmt (4) / TContinueStmt (5): label (interned u32).
+        checker::TBreakStmt as br => write_u32(write_u8(buf, 4), st_find(t, br.label))
+        checker::TContinueStmt as c => write_u32(write_u8(buf, 5), st_find(t, c.label))
+        // TExprStmt (6): expr (TExpr).
+        checker::TExprStmt as e => write_texpr(write_u8(buf, 6), t, e.expr)
     }
 }

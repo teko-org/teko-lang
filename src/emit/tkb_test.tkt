@@ -2,9 +2,12 @@
 // Current Teko: typed nodes are module-qualified (`checker::`) and carry all fields (line/col).
 
 use teko::checker
+use teko::parser
+use teko::lexer
 
-fn u8ty()  -> checker::Type { checker::Prim { kind = checker::PrimKind::U8 } }
-fn i64ty() -> checker::Type { checker::Prim { kind = checker::PrimKind::I64 } }
+fn u8ty()   -> checker::Type { checker::Prim { kind = checker::PrimKind::U8 } }
+fn i64ty()  -> checker::Type { checker::Prim { kind = checker::PrimKind::I64 } }
+fn boolty() -> checker::Type { checker::Prim { kind = checker::PrimKind::Bool } }
 fn tnum(v: i128) -> checker::TExpr { checker::TExpr { kind = checker::TNumber { is_float = false; value = v; fval = 0.0 }; type = i64ty(); line = 0; col = 0 } }
 // drop the last byte of a `[]byte` (str's `slice` is text-only) — shared by header_test (same ns).
 fn drop_last(b: []byte) -> []byte {
@@ -117,6 +120,73 @@ fn tkb_roundtrip_pathexpr() {
                 teko::assert::is_true(pe.enum_name == "Color")
                 teko::assert::is_true(pe.member == "Red")
                 teko::assert::is_true(pe.ordinal == 2)
+            }
+            _ => teko::assert::is_true(false)
+        }
+        error => teko::assert::is_true(false)
+    }
+}
+
+#test
+fn tkb_roundtrip_ifexpr() {
+    // C7.16: `if true { let x: i64 = 1; x; return x } else { return 0 }` round-trips (statements + IF).
+    let cond = checker::TExpr { kind = checker::TBoolLit { value = true }; type = boolty(); line = 0; col = 0 }
+    let xref = checker::TExpr { kind = checker::TVar { name = "x" }; type = i64ty(); line = 0; col = 0 }
+    mut thenb: []checker::TStatement = teko::list::empty()
+    thenb = teko::list::push(thenb, checker::TBinding { kind = parser::BindKind::Let; target = parser::SimpleName { name = "x" }; bound = i64ty(); value = tnum(1) })
+    thenb = teko::list::push(thenb, checker::TExprStmt { expr = xref })
+    thenb = teko::list::push(thenb, checker::TReturn { has_value = true; value = xref })
+    mut elseb: []checker::TStatement = teko::list::empty()
+    elseb = teko::list::push(elseb, checker::TReturn { has_value = true; value = tnum(0) })
+    let iff = checker::TExpr { kind = checker::TIfExpr { cond = cond; then_blk = thenb; has_else = true; else_blk = elseb }; type = i64ty(); line = 0; col = 0 }
+    match deserialize(serialize(iff)) {
+        checker::TExpr as got => match got.kind {
+            checker::TIfExpr as f => {
+                teko::assert::is_true(f.has_else)
+                teko::assert::is_true(f.then_blk.len == 3)
+                teko::assert::is_true(f.else_blk.len == 1)
+                match f.then_blk[0] {
+                    checker::TBinding as bd => {
+                        teko::assert::is_true(bd.kind == parser::BindKind::Let)
+                        match bd.target { parser::SimpleName as sn => teko::assert::is_true(sn.name == "x"); _ => teko::assert::is_true(false) }
+                        match bd.value.kind { checker::TNumber as n => teko::assert::is_true(n.value == 1); _ => teko::assert::is_true(false) }
+                    }
+                    _ => teko::assert::is_true(false)
+                }
+                match f.then_blk[2] { checker::TReturn as r => teko::assert::is_true(r.has_value); _ => teko::assert::is_true(false) }
+            }
+            _ => teko::assert::is_true(false)
+        }
+        error => teko::assert::is_true(false)
+    }
+}
+
+#test
+fn tkb_roundtrip_loop_stmts() {
+    // C7.16: `if true { loop outer { a = 1; break; continue outer } }` — TLoopStmt/TAssign/TBreak/TContinue.
+    let cond = checker::TExpr { kind = checker::TBoolLit { value = true }; type = boolty(); line = 0; col = 0 }
+    mut body: []checker::TStatement = teko::list::empty()
+    body = teko::list::push(body, checker::TAssign { name = "a"; op = lexer::TokenKind::Assign; bound = i64ty(); value = tnum(1) })
+    body = teko::list::push(body, checker::TBreakStmt { label = "" })
+    body = teko::list::push(body, checker::TContinueStmt { label = "outer" })
+    mut thenb: []checker::TStatement = teko::list::empty()
+    thenb = teko::list::push(thenb, checker::TLoopStmt { label = "outer"; body = body })
+    let iff = checker::TExpr { kind = checker::TIfExpr { cond = cond; then_blk = thenb; has_else = false; else_blk = teko::list::empty() }; type = i64ty(); line = 0; col = 0 }
+    match deserialize(serialize(iff)) {
+        checker::TExpr as got => match got.kind {
+            checker::TIfExpr as f => {
+                teko::assert::is_true(!f.has_else)
+                teko::assert::is_true(f.then_blk.len == 1)
+                match f.then_blk[0] {
+                    checker::TLoopStmt as l => {
+                        teko::assert::is_true(l.label == "outer")
+                        teko::assert::is_true(l.body.len == 3)
+                        match l.body[0] { checker::TAssign as a => { teko::assert::is_true(a.name == "a"); teko::assert::is_true(a.op == lexer::TokenKind::Assign) }; _ => teko::assert::is_true(false) }
+                        match l.body[1] { checker::TBreakStmt as b => teko::assert::is_true(b.label == ""); _ => teko::assert::is_true(false) }
+                        match l.body[2] { checker::TContinueStmt as c => teko::assert::is_true(c.label == "outer"); _ => teko::assert::is_true(false) }
+                    }
+                    _ => teko::assert::is_true(false)
+                }
             }
             _ => teko::assert::is_true(false)
         }

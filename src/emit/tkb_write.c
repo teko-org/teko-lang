@@ -4,6 +4,9 @@
 // prim_byte / kind_byte: the enum's ordinal byte — E7 (the enum→int cast).
 static tk_byte prim_byte(tk_prim_kind k) { return (tk_byte)k; }   // [E7]
 static tk_byte kind_byte(tk_token_kind k) { return (tk_byte)k; }  // [E7]
+static tk_byte bindkind_byte(tk_bind_kind k) { return (tk_byte)k; }  // (C7.16) Let/Mut/Const → ordinal byte
+
+static tk_bytes write_tstatements(tk_bytes b, tk_strtable t, const tk_tstatement *xs, size_t n);  // (C7.16) fwd (mutual with tk_write_texpr)
 
 static tk_bytes write_types(tk_bytes b, tk_strtable t, const tk_type *xs, size_t n) {
     b = tk_write_u32(b, (uint32_t)n);
@@ -77,8 +80,12 @@ tk_bytes tk_write_texpr(tk_bytes b, tk_strtable t, const tk_texpr *te) {
             for (size_t i = 0; i < te->as.call.nargs; i += 1) b = tk_write_texpr(b, t, &te->as.call.args[i]);
             return b;
         }
-        case TK_TEXPR_IF:    return tk_write_u8(b, 8);   // reserved — typed if/match needs a stmt serializer (later); read rejects (M.1)
-        case TK_TEXPR_MATCH: return tk_write_u8(b, 9);   // reserved — idem (MethodCall has no typed node)
+        case TK_TEXPR_IF:                                                        // (C7.16) cond + then_blk + has_else + else_blk
+            b = tk_write_texpr(tk_write_u8(b, 8), t, te->as.if_expr.cond);
+            b = write_tstatements(b, t, te->as.if_expr.then_blk, te->as.if_expr.nthen);
+            b = tk_write_u8(b, (tk_byte)(te->as.if_expr.has_else ? 1 : 0));
+            return write_tstatements(b, t, te->as.if_expr.else_blk, te->as.if_expr.nelse);
+        case TK_TEXPR_MATCH: return tk_write_u8(b, 9);   // reserved — TMatchExpr arms need the pattern codec (next C7.16 slice); read rejects (M.1)
         case TK_TEXPR_CAST:                                                      // S1a — payload = inner expr (target rides te->type)
             return tk_write_texpr(tk_write_u8(b, 10), t, te->as.cast.expr);
         case TK_TEXPR_FIELD_ACCESS:                                             // S1b — receiver THEN field index
@@ -126,5 +133,42 @@ tk_bytes tk_write_texpr(tk_bytes b, tk_strtable t, const tk_texpr *te) {
             for (size_t i = 0; i < te->as.array.nelements; i += 1) b = tk_write_texpr(b, t, &te->as.array.elements[i]);
             return b;
     }
+    return b;
+}
+
+// (C7.16) BindTarget: tag 0 SimpleName (interned name) | tag 1 DestructurePattern (count + names).
+static tk_bytes write_bindtarget(tk_bytes b, tk_strtable t, tk_bind_target bt) {
+    if (bt.tag == TK_BIND_SIMPLE) return tk_write_u32(tk_write_u8(b, 0), tk_st_find(t, bt.as.simple.name));
+    b = tk_write_u32(tk_write_u8(b, 1), (uint32_t)bt.as.destructure.nnames);
+    for (size_t i = 0; i < bt.as.destructure.nnames; i += 1) b = tk_write_u32(b, tk_st_find(t, bt.as.destructure.names[i]));
+    return b;
+}
+
+// (C7.16) a TStatement: u8 tag + payload. Inverse of tk_read_tstmt.
+static tk_bytes write_tstatement(tk_bytes b, tk_strtable t, const tk_tstatement *s) {
+    switch (s->tag) {
+        case TK_TSTMT_BINDING:                                               // bindkind (u8) + target + bound (Type) + value (TExpr)
+            b = write_bindtarget(tk_write_u8(tk_write_u8(b, 0), bindkind_byte(s->as.binding.kind)), t, s->as.binding.target);
+            b = tk_write_type(b, t, s->as.binding.bound);
+            return tk_write_texpr(b, t, &s->as.binding.value);
+        case TK_TSTMT_ASSIGN:                                                // name (u32) + op (u8) + bound (Type) + value (TExpr)
+            b = tk_write_u8(tk_write_u32(tk_write_u8(b, 1), tk_st_find(t, s->as.assign.name)), kind_byte(s->as.assign.op));
+            b = tk_write_type(b, t, s->as.assign.bound);
+            return tk_write_texpr(b, t, &s->as.assign.value);
+        case TK_TSTMT_RETURN:                                                // has_value (u8) + value (TExpr)
+            return tk_write_texpr(tk_write_u8(tk_write_u8(b, 2), (tk_byte)(s->as.ret.has_value ? 1 : 0)), t, &s->as.ret.value);
+        case TK_TSTMT_LOOP:                                                  // label (u32) + body ([]TStatement)
+            return write_tstatements(tk_write_u32(tk_write_u8(b, 3), tk_st_find(t, s->as.loop_stmt.label)), t, s->as.loop_stmt.body, s->as.loop_stmt.nbody);
+        case TK_TSTMT_BREAK:    return tk_write_u32(tk_write_u8(b, 4), tk_st_find(t, s->as.jump.label));
+        case TK_TSTMT_CONTINUE: return tk_write_u32(tk_write_u8(b, 5), tk_st_find(t, s->as.jump.label));
+        case TK_TSTMT_EXPR:     return tk_write_texpr(tk_write_u8(b, 6), t, &s->as.expr_stmt.expr);
+    }
+    return b;
+}
+
+// (C7.16) a []TStatement: u64 count, then each. Inverse of tk_read_tstmts.
+static tk_bytes write_tstatements(tk_bytes b, tk_strtable t, const tk_tstatement *xs, size_t n) {
+    b = tk_write_u64(b, (uint64_t)n);
+    for (size_t i = 0; i < n; i += 1) b = write_tstatement(b, t, &xs[i]);
     return b;
 }

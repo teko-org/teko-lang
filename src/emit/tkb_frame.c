@@ -13,6 +13,7 @@ static tk_bytes append_bytes(tk_bytes dst, tk_bytes src) {
 // --- collect every string (mutates the table via intern) ---
 
 static void collect_type(tk_strtable *t, tk_type ty);
+static void collect_tstmts(tk_strtable *t, const tk_tstatement *xs, size_t n);   // (C7.16) fwd (mutual with collect)
 static void collect_type_list(tk_strtable *t, const tk_type *xs, size_t n) {
     for (size_t i = 0; i < n; i += 1) collect_type(t, xs[i]);
 }
@@ -78,8 +79,37 @@ static void collect(tk_strtable *t, const tk_texpr *te) {
         case TK_TEXPR_PATH:
             tk_st_intern(t, te->as.path.enum_name); tk_st_intern(t, te->as.path.member);
             break;
+        case TK_TEXPR_IF:                                                       // (C7.16) cond + both statement blocks
+            collect(t, te->as.if_expr.cond);
+            collect_tstmts(t, te->as.if_expr.then_blk, te->as.if_expr.nthen);
+            collect_tstmts(t, te->as.if_expr.else_blk, te->as.if_expr.nelse);
+            break;
         default: break;
     }
+}
+
+// (C7.16) collect a BindTarget's name(s).
+static void collect_bindtarget(tk_strtable *t, tk_bind_target bt) {
+    if (bt.tag == TK_BIND_SIMPLE) { tk_st_intern(t, bt.as.simple.name); return; }
+    for (size_t i = 0; i < bt.as.destructure.nnames; i += 1) tk_st_intern(t, bt.as.destructure.names[i]);
+}
+
+// (C7.16) collect a TStatement's strings (mirrors write_tstatement).
+static void collect_tstmt(tk_strtable *t, const tk_tstatement *s) {
+    switch (s->tag) {
+        case TK_TSTMT_BINDING:  collect_bindtarget(t, s->as.binding.target); collect_type(t, s->as.binding.bound); collect(t, &s->as.binding.value); break;
+        case TK_TSTMT_ASSIGN:   tk_st_intern(t, s->as.assign.name); collect_type(t, s->as.assign.bound); collect(t, &s->as.assign.value); break;
+        case TK_TSTMT_RETURN:   collect(t, &s->as.ret.value); break;
+        case TK_TSTMT_LOOP:     tk_st_intern(t, s->as.loop_stmt.label); collect_tstmts(t, s->as.loop_stmt.body, s->as.loop_stmt.nbody); break;
+        case TK_TSTMT_BREAK:
+        case TK_TSTMT_CONTINUE: tk_st_intern(t, s->as.jump.label); break;
+        case TK_TSTMT_EXPR:     collect(t, &s->as.expr_stmt.expr); break;
+    }
+}
+
+// (C7.16) collect a []TStatement.
+static void collect_tstmts(tk_strtable *t, const tk_tstatement *xs, size_t n) {
+    for (size_t i = 0; i < n; i += 1) collect_tstmt(t, &xs[i]);
 }
 
 tk_bytes tk_serialize(const tk_texpr *te) {

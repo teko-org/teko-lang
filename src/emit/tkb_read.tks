@@ -138,6 +138,9 @@ type RTExpr  = struct { r: Reader; value: checker::TExpr }
 type RTExprs = struct { r: Reader; value: []checker::TExpr }
 type RTerms  = struct { r: Reader; value: []checker::TCmpTerm }
 type RPath   = struct { r: Reader; value: parser::Path }
+type RTStmt      = struct { r: Reader; value: checker::TStatement }       // (C7.16)
+type RTStmts     = struct { r: Reader; value: []checker::TStatement }     // (C7.16)
+type RBindTarget = struct { r: Reader; value: parser::BindTarget }        // (C7.16)
 
 fn read_i64(r: Reader) -> RI64 | error {
     let u = match read_u64(r) { RU64 as x => x; error as e => return e }
@@ -244,6 +247,14 @@ fn read_texpr(r: Reader, table: []str) -> RTExpr | error {
         let cal = match read_path(tag.r, table)   { RPath as x => x; error as e => return e }
         let ar  = match read_texprs(cal.r, table) { RTExprs as x => x; error as e => return e }
         return RTExpr { r = ar.r; value = checker::TExpr { kind = checker::TCall { callee = cal.value; args = ar.value; call_ns = "" }; type = ty.value; line = 0; col = 0 } }
+    }
+    if tag.value == 8 {
+        // (C7.16) IF: inverse of write tag 8 — cond (texpr) + then_blk + has_else (u8) + else_blk.
+        let cond  = match read_texpr(tag.r, table)      { RTExpr as x => x; error as e => return e }
+        let thenb = match read_tstatements(cond.r, table) { RTStmts as x => x; error as e => return e }
+        let he    = match read_u8(thenb.r)              { RByte as x => x; error as e => return e }
+        let elseb = match read_tstatements(he.r, table)   { RTStmts as x => x; error as e => return e }
+        return RTExpr { r = elseb.r; value = checker::TExpr { kind = checker::TIfExpr { cond = cond.value; then_blk = thenb.value; has_else = he.value != 0; else_blk = elseb.value }; type = ty.value; line = 0; col = 0 } }
     }
     if tag.value == 10 {
         // S1a — Cast: target type is ty.value (already read); read just the inner expr.
@@ -367,6 +378,87 @@ fn read_texpr(r: Reader, table: []str) -> RTExpr | error {
         return RTExpr { r = rr; value = checker::TExpr { kind = checker::TArrayLit { elements = elems }; type = ty.value; line = 0; col = 0 } }
     }
     error { message = "bad texpr tag in .tkb" }
+}
+
+// (C7.16) BindTarget: inverse of write_bindtarget — tag 0 SimpleName | tag 1 DestructurePattern.
+fn read_bindtarget(r: Reader, table: []str) -> RBindTarget | error {
+    let tag = match read_u8(r) { RByte as x => x; error as e => return e }
+    if tag.value == 0 {
+        let nm = match tkb_read_str(tag.r, table) { RStr as x => x; error as e => return e }
+        return RBindTarget { r = nm.r; value = parser::SimpleName { name = nm.value } }
+    }
+    let n = match read_u32(tag.r) { RU32 as x => x; error as e => return e }   // tag 1 — DestructurePattern
+    mut rr = n.r
+    mut names: []str = teko::list::empty()
+    mut i = 0
+    loop {
+        if i >= (n.value to u64) { break }
+        let nm = match tkb_read_str(rr, table) { RStr as x => x; error as e => return e }
+        names = teko::list::push(names, nm.value)
+        rr = nm.r
+        i++
+    }
+    RBindTarget { r = rr; value = parser::DestructurePattern { names = names } }
+}
+
+// (C7.16) a []TStatement: u64 count, then each. Inverse of write_tstatements.
+fn read_tstatements(r: Reader, table: []str) -> RTStmts | error {
+    let n = match read_u64(r) { RU64 as x => x; error as e => return e }
+    mut rr = n.r
+    mut xs: []checker::TStatement = teko::list::empty()
+    mut i = 0
+    loop {
+        if i >= n.value { break }
+        let s = match read_tstatement(rr, table) { RTStmt as x => x; error as e => return e }
+        xs = teko::list::push(xs, s.value)
+        rr = s.r
+        i++
+    }
+    RTStmts { r = rr; value = xs }
+}
+
+// (C7.16) a TStatement: u8 tag + payload. Inverse of write_tstatement.
+fn read_tstatement(r: Reader, table: []str) -> RTStmt | error {
+    let tag = match read_u8(r) { RByte as x => x; error as e => return e }
+    if tag.value == 0 {
+        // TBinding: bindkind (u8) + target (BindTarget) + bound (Type) + value (TExpr).
+        let bk = match read_u8(tag.r)                 { RByte as x => x; error as e => return e }
+        let bt = match read_bindtarget(bk.r, table)   { RBindTarget as x => x; error as e => return e }
+        let bd = match read_type(bt.r, table)         { RType as x => x; error as e => return e }
+        let v  = match read_texpr(bd.r, table)        { RTExpr as x => x; error as e => return e }
+        return RTStmt { r = v.r; value = checker::TBinding { kind = bk.value to parser::BindKind; target = bt.value; bound = bd.value; value = v.value } }
+    }
+    if tag.value == 1 {
+        // TAssign: name (u32) + op (u8) + bound (Type) + value (TExpr).
+        let nm = match tkb_read_str(tag.r, table) { RStr as x => x; error as e => return e }
+        let op = match read_u8(nm.r)              { RByte as x => x; error as e => return e }
+        let bd = match read_type(op.r, table)     { RType as x => x; error as e => return e }
+        let v  = match read_texpr(bd.r, table)    { RTExpr as x => x; error as e => return e }
+        return RTStmt { r = v.r; value = checker::TAssign { name = nm.value; op = kind_of(op.value); bound = bd.value; value = v.value } }
+    }
+    if tag.value == 2 {
+        let hv = match read_u8(tag.r)          { RByte as x => x; error as e => return e }
+        let v  = match read_texpr(hv.r, table) { RTExpr as x => x; error as e => return e }
+        return RTStmt { r = v.r; value = checker::TReturn { has_value = hv.value != 0; value = v.value } }
+    }
+    if tag.value == 3 {
+        let lb = match tkb_read_str(tag.r, table)    { RStr as x => x; error as e => return e }
+        let bd = match read_tstatements(lb.r, table) { RTStmts as x => x; error as e => return e }
+        return RTStmt { r = bd.r; value = checker::TLoopStmt { label = lb.value; body = bd.value } }
+    }
+    if tag.value == 4 {
+        let lb = match tkb_read_str(tag.r, table) { RStr as x => x; error as e => return e }
+        return RTStmt { r = lb.r; value = checker::TBreakStmt { label = lb.value } }
+    }
+    if tag.value == 5 {
+        let lb = match tkb_read_str(tag.r, table) { RStr as x => x; error as e => return e }
+        return RTStmt { r = lb.r; value = checker::TContinueStmt { label = lb.value } }
+    }
+    if tag.value == 6 {
+        let e = match read_texpr(tag.r, table) { RTExpr as x => x; error as e => return e }
+        return RTStmt { r = e.r; value = checker::TExprStmt { expr = e.value } }
+    }
+    error { message = "bad tstatement tag in .tkb" }
 }
 
 // THE ENTRY: verify the header + hash, then read the table and the typed tree.
