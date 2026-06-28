@@ -635,7 +635,9 @@ fn type_struct_lit(sl: parser::StructLit, expected: Type, env: Env, table: TypeT
         if hits == 0 { return error { message = "a struct literal is missing a declared field" } }
         if hits > 1 { return error { message = "a struct literal sets a field more than once" } }
         let ft = match resolve_type(sb.fields[d].type_ann, table) { Type as t => t; error as e => return e }
-        mut val = match type_expr(sl.field_vals[found], env, table) { TExpr as te => te; error as e => return e }
+        // thread the field's type as EXPECTED so a nested generic constructor (`value = Box { … }`)
+        // targets its concrete instance (S4). Non-struct-lit values type exactly as before.
+        mut val = match type_value_expected(sl.field_vals[found], ft, env, table) { TExpr as te => te; error as e => return e }
         // literal adaptation: a fitting numeric literal adopts the field's prim type.
         match val.kind {
             TNumber as num => match ft {
@@ -1054,17 +1056,23 @@ fn type_match_stmt(m: parser::MatchExpr, env: Env, table: TypeTable) -> TExpr | 
 
 // ---- statements (the evolved check_* — produce the typed node + advance the env) ----
 
-// Type a binding's value, giving a struct-literal value its EXPECTED (annotation) type so a generic
-// constructor `Box { … }` under `: Box<i64>` targets the concrete instance (S4 annotation-driven).
+// Type an expression flowing into a known EXPECTED type: a struct-literal is given that type so a
+// generic constructor `Box { … }` targets the concrete instance; anything else types normally. Used
+// at the binding level AND for struct-literal field values, so NESTED `Box { value = Box { … } }`
+// threads the expected type all the way down (S4 annotation-driven).
+fn type_value_expected(e: parser::Expr, expected: Type, env: Env, table: TypeTable) -> TExpr | error {
+    match e.kind {
+        parser::StructLit as sl => type_struct_lit(sl, expected, env, table)
+        _                       => type_expr(e, env, table)
+    }
+}
+
+// Type a binding's value with the annotation as its expected type (so a generic constructor targets
+// the concrete instance from `: Box<i64>`).
 fn type_binding_value(b: parser::Binding, env: Env, table: TypeTable) -> TExpr | error {
     if b.has_type {
-        match b.value.kind {
-            parser::StructLit as sl => {
-                let at = match resolve_type(b.type_ann, table) { Type as t => t; error as e => return e }
-                return type_struct_lit(sl, at, env, table)
-            }
-            _ => {}
-        }
+        let at = match resolve_type(b.type_ann, table) { Type as t => t; error as e => return e }
+        return type_value_expected(b.value, at, env, table)
     }
     type_expr(b.value, env, table)
 }

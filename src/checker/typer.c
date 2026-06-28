@@ -95,9 +95,9 @@ static tk_typed_stmt_result type_binding(tk_binding b, tk_env env, tk_type_table
     // (S4) give a struct-literal value its EXPECTED (annotation) type so a generic constructor
     // `Box { … }` under `: Box<i64>` targets the concrete instance (annotation-driven).
     tk_texpr_result v;
-    if (b.has_type && b.value.tag == TK_EXPR_STRUCT_LIT) {
+    if (b.has_type) {
         tk_type_result at = tk_resolve_type(b.type_ann, table); if (!at.ok) return sfail(at.as.error);
-        v = tk_type_struct_lit(b.value.as.struct_lit, at.as.value, env, table);
+        v = tk_type_value_expected(b.value, at.as.value, env, table);
     } else {
         v = tk_typer_expr(b.value, env, table);
     }

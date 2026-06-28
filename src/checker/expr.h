@@ -15,6 +15,11 @@ tk_texpr_result tk_typer_expr(tk_expr e, tk_env env, tk_type_table table);
 // passes the annotation; the expr dispatch passes VOID. Mirror of typer.tks::type_struct_lit.
 tk_texpr_result tk_type_struct_lit(tk_struct_lit sl, tk_type expected, tk_env env, tk_type_table table);
 
+// (S4) type an expr flowing into an EXPECTED type — routes a struct literal through tk_type_struct_lit
+// with that expected type (generic constructor → concrete instance), else types normally. Mirror of
+// typer.tks::type_value_expected. Used by type_binding + struct-lit field values (nested generics).
+tk_texpr_result tk_type_value_expected(tk_expr e, tk_type expected, tk_env env, tk_type_table table);
+
 // cast legality (C2) — exposed so the counter-validation (revalidate.c) re-derives it.
 bool tk_cast_ok(tk_type from, tk_type to);
 

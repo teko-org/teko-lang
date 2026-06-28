@@ -716,7 +716,9 @@ tk_texpr_result tk_type_struct_lit(tk_struct_lit sl, tk_type expected, tk_env en
         if (hits > 1)  { tk_free0(names); tk_free0(vals); return xerr("a struct literal sets a field more than once"); }
         tk_type_result ft = tk_resolve_type(sb.fields[d].type_ann, table);
         if (!ft.ok) { tk_free0(names); tk_free0(vals); return xferr(ft.as.error); }
-        tk_texpr_result vt = tk_typer_expr(sl.field_vals[found], env, table);
+        // thread the field's type as EXPECTED so a nested generic constructor (`value = Box { … }`)
+        // targets its concrete instance (S4). Non-struct-lit values type exactly as before.
+        tk_texpr_result vt = tk_type_value_expected(sl.field_vals[found], ft.as.value, env, table);
         if (!vt.ok) { tk_free0(names); tk_free0(vals); return vt; }
         tk_texpr val = vt.as.value;
         // The field value must WIDEN into the field's declared type (exact, a variant CASE into a
@@ -743,6 +745,14 @@ tk_texpr_result tk_type_struct_lit(tk_struct_lit sl, tk_type expected, tk_env en
     return xok((tk_texpr){ .tag = TK_TEXPR_STRUCT_INIT,
                            .type = (tk_type){ .tag = TK_TYPE_NAMED, .as.named.name = name },
                            .as.struct_init = { names, vals, sb.n_fields } });
+}
+
+// Type an expression flowing into a known EXPECTED type: a struct literal is given that type (so a
+// generic constructor targets its concrete instance); anything else types normally. Mirror of
+// typer.tks::type_value_expected — used at the binding level AND for struct-lit field values (nested).
+tk_texpr_result tk_type_value_expected(tk_expr e, tk_type expected, tk_env env, tk_type_table table) {
+    if (e.tag == TK_EXPR_STRUCT_LIT) return tk_type_struct_lit(e.as.struct_lit, expected, env, table);
+    return tk_typer_expr(e, env, table);
 }
 
 // ---- string interpolation `$"…{expr}…"` (self-host parity) ----

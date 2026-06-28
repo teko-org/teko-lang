@@ -104,6 +104,32 @@ fn parses_generic_type_args() {
 }
 
 #test
+fn parses_nested_generic_type_args() {
+    // Box<Box<i64>> → Box with one arg = Box<i64> (the `>>` Shr close-split, S4 crumb 1b).
+    let t = match type_of("Box<Box<i64>>") { TypeExpr as x => x; error => return }
+    match t {
+        NamedType as n => {
+            teko::assert::is_true(n.path.segments[0].name == "Box")
+            teko::assert::is_true(n.args.len == 1)
+            match n.args[0] {
+                NamedType as inner => {
+                    teko::assert::is_true(inner.path.segments[0].name == "Box")
+                    teko::assert::is_true(inner.args.len == 1)
+                    teko::assert::is_true(named_is(inner.args[0], "i64"))
+                }
+                _ => teko::assert::is_true(false)
+            }
+        }
+        _ => teko::assert::is_true(false)
+    }
+    // triple nesting parses (`>>>` lexes as Shr+Gt; the pending-`>` thread closes all three levels).
+    teko::assert::is_true(!type_errors("Box<Box<Box<i64>>>"))
+    // a multi-arg whose LAST arg is nested: Result<i64, Box<str>>.
+    let r = match type_of("Result<i64, Box<str>>") { TypeExpr as x => x; error => return }
+    teko::assert::is_true(named_with_args(r, "Result", 2 to u64))
+}
+
+#test
 fn generic_lt_backtracks_to_comparison() {
     // `x to i64 < y` is a COMPARISON of a cast, NOT a generic on i64 — the speculative type-args
     // parse must backtrack and leave `<` to the comparison operator (cast target is a type-primary).

@@ -25,7 +25,7 @@
 // =========================================================================
 typedef struct { tk_expr      node;       size_t next; } tk_parsed;          // an expression
 typedef struct { tk_statement node;       size_t next; } tk_parsed_stmt;     // a statement
-typedef struct { tk_type_expr node;       size_t next; } tk_parsed_type;     // a type expression
+typedef struct { tk_type_expr node;       size_t next; size_t pending_gt; } tk_parsed_type;     // a type expr; pending_gt = extra `>` left by a compound `>>` close (S4 nested generics)
 typedef struct { tk_decl      node;       size_t next; } tk_parsed_decl;     // a top-level declaration (R-main)
 typedef struct { tk_statement *statements; size_t n; size_t next; } tk_parsed_block;  // a `{ … }` block
 typedef struct { tk_type_body node;       size_t next; } tk_parsed_body;     // a struct/enum/variant body

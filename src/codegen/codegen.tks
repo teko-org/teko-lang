@@ -404,8 +404,10 @@ fn cg_nameset_seen(seen: []str, n: str) -> bool { cg_str_in(seen, n) }
 fn cg_te_reaches_byvalue(prog: checker::TProgram, te: parser::TypeExpr, to: str, seen: []str) -> bool {
     match te {
         parser::NamedType as nt => {
-            let y = nt.path.segments[nt.path.segments.len - 1].name
-            if cg_is_prim_name(y) { return false }
+            let base = nt.path.segments[nt.path.segments.len - 1].name
+            if cg_is_prim_name(base) { return false }
+            // (S4) a generic-type USE reaches its concrete instance `Box__g__i64`, not the template.
+            let y = if nt.args.len == 0 { base } else { cg_texpr_inst_name(base, nt.args) }
             if y == to { return true }
             cg_name_reaches_byvalue(prog, y, to, seen)
         }
@@ -707,6 +709,33 @@ fn cg_variant_typename_texpr(buf: []byte, te: parser::UnionType) -> []byte | err
 // segment is either a built-in name (u8..f64/bool/byte/str -> its C type) or a user type
 // (-> its mangled typedef). Slice/union/optional members are honest barriers (later
 // waves). (C: `emit_type_expr`.)
+// (S4) a type-expr → its mangle fragment, matching checker::type_mangle (prim/str/byte/named → the
+// name, slice_/opt_ prefixes, a nested generic use → its own instance name). So the instance name a
+// generic USE emits agrees byte-for-byte with the stamped decl's name.
+fn cg_texpr_mangle(te: parser::TypeExpr) -> str {
+    match te {
+        parser::NamedType as nt => {
+            let last = nt.path.segments[nt.path.segments.len - 1].name
+            if nt.args.len == 0 { last } else { cg_texpr_inst_name(last, nt.args) }
+        }
+        parser::SliceType as st    => teko::str::concat("slice_", cg_texpr_mangle(st.element))
+        parser::OptionalType as ot => teko::str::concat("opt_", cg_texpr_mangle(ot.inner))
+        parser::UnionType          => "variant"
+    }
+}
+// `<base>__g__<arg0>[__<arg1>…]` over type-arg exprs (matches checker::generic_inst_name).
+fn cg_texpr_inst_name(base: str, args: []parser::TypeExpr) -> str {
+    mut out = teko::str::concat(base, "__g__")
+    mut i = 0
+    loop {
+        if i >= args.len { break }
+        if i > 0 { out = teko::str::concat(out, "__") }
+        out = teko::str::concat(out, cg_texpr_mangle(args[i]))
+        i++
+    }
+    out
+}
+
 fn emit_type_expr(buf: []byte, prog: checker::TProgram, te: parser::TypeExpr) -> []byte | error {
     match te {
         parser::NamedType as nt => {
@@ -740,6 +769,9 @@ fn emit_type_expr(buf: []byte, prog: checker::TProgram, te: parser::TypeExpr) ->
                 }
                 error => { }
             }
+            // (S4) a generic-type USE `Box<i64>` → the concrete instance typedef `tk_t_Box__g__i64`
+            // (the mangled name matches checker::generic_inst_name, so decl + ref agree).
+            if nt.args.len > 0 { return mangle_type_name(buf, "", cg_texpr_inst_name(last, nt.args)) }
             // a user-defined named aggregate -> its mangled typedef name (matches emit_type).
             mangle_type_name(buf, "", last)
         }
@@ -4259,8 +4291,11 @@ fn cg_is_builtin_scalar(last: str) -> bool {
 fn cg_texpr_ready(em: CgEmitted, set: CgTypeSet, te: parser::TypeExpr) -> bool {
     match te {
         parser::NamedType as nt => {
-            let last = nt.path.segments[nt.path.segments.len - 1].name
-            if cg_is_builtin_scalar(last) { return true }   // builtin scalar → ready
+            let base = nt.path.segments[nt.path.segments.len - 1].name
+            if cg_is_builtin_scalar(base) { return true }   // builtin scalar → ready
+            // (S4) a generic-type USE `Box<i64>` depends on the concrete instance `Box__g__i64`, not
+            // the (dropped) template `Box` — gate on the instance name.
+            let last = if nt.args.len == 0 { base } else { cg_texpr_inst_name(base, nt.args) }
             cg_named_emitted(em, last)
         }
         parser::OptionalType as ot => cg_opt_emitted_key(em, set, match cg_opt_mangle_texpr_str(ot.inner) { str as s => s; error => "" })

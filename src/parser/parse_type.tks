@@ -10,42 +10,57 @@ fn parse_type_primary(tokens: []lexer::Token, pos: u64) -> ParsedType | error {
     } else {
         match parse_named(tokens, pos) { ParsedType as x => x; error as e => return e }
     }
-    // postfix `?` → an OPTIONAL type (T? — REBOOT_PLAN §202; nullability only). Binds
-    // tighter than `|`, so `T? | U` is `(T?) | U`; doubled `T??` nests (T?)?.
     mut node = base.node
     mut p = base.next
+    // A pending compound-`>` close (`>>` from a nested generic) means we are mid-close: no postfix
+    // `?` can apply here — propagate the leftover up to the enclosing generic's close (S4).
+    if base.pending_gt > 0 {
+        return ParsedType { node = node, next = p, pending_gt = base.pending_gt }
+    }
+    // postfix `?` → an OPTIONAL type (T? — REBOOT_PLAN §202; nullability only). Binds
+    // tighter than `|`, so `T? | U` is `(T?) | U`; doubled `T??` nests (T?)?.
     loop {
         if !is_kind_at(tokens, p, lexer::TokenKind::Question) { break }
         node = OptionalType { inner = node }
         p = p + 1
     }
-    ParsedType { node = node, next = p }
+    ParsedType { node = node, next = p, pending_gt = 0 }
 }
 
 // A named type is a path: `u64`, `lexer::Token` (nominal — B.13). It may carry generic type
-// ARGUMENTS `<T1, T2, …>` (S4 type-generics — `Box<i64>`, `Result<i64, str>`). Inference-only:
-// type-args appear ONLY in a type position, never as a call turbofish.
+// ARGUMENTS `<T1, T2, …>` (S4 type-generics — `Box<i64>`, `Result<i64, str>`, nested `Box<Box<i64>>`).
+// Inference-only: type-args appear ONLY in a type position, never as a call turbofish.
 //
 // The `<…>` is parsed SPECULATIVELY and backtracks if it is not a closed argument list: the cast
 // target is a type-PRIMARY (`x to i64 < y`), so a bare `<` after a type name must stay available as
-// the comparison operator. Single-level only for now — a compound close (`>>`/`>=`/`>>=`, i.e.
-// NESTED generics like `Box<Box<i64>>`) does not close with a plain `>`, so it backtracks (nested
-// type-args are a later crumb — the close-split).
+// the comparison operator. The close handles the `>>` (Shr) compound: it closes THIS list with one
+// `>` and leaves the other for the enclosing generic (threaded via ParsedType.pending_gt), so
+// `Box<Box<i64>>` parses at any nesting depth. (A `>=`/`>>=` close — `>` immediately before `=`,
+// no space — still backtracks; write a space before `=`.)
 fn parse_named(tokens: []lexer::Token, pos: u64) -> ParsedType | error {
     let pp = match parse_path(tokens, pos) { ParsedPath as x => x; error as e => return e }
-    let plain = ParsedType { node = NamedType { path = pp.node, args = teko::list::empty() }, next = pp.next }
+    let plain = ParsedType { node = NamedType { path = pp.node, args = teko::list::empty() }, next = pp.next, pending_gt = 0 }
     if !is_kind_at(tokens, pp.next, lexer::TokenKind::Lt) { return plain }
     mut args: []TypeExpr = teko::list::empty()
     mut p = pp.next + 1
     loop {
         let a = match parse_type(tokens, p) { ParsedType as x => x; error => return plain }   // not a type → backtrack
         args = teko::list::push(args, a.node)
+        // A nested generic just closed with a compound `>>`: the arg carries a leftover `>` that
+        // closes THIS list. Consume one; pass any remainder (deeper nesting) up.
+        if a.pending_gt > 0 {
+            return ParsedType { node = NamedType { path = pp.node, args = args }, next = a.next, pending_gt = a.pending_gt - 1 }
+        }
         p = a.next
         if is_kind_at(tokens, p, lexer::TokenKind::Comma) { p = p + 1 }
         else if is_kind_at(tokens, p, lexer::TokenKind::Gt) {
-            return ParsedType { node = NamedType { path = pp.node, args = args }, next = p + 1 }
+            return ParsedType { node = NamedType { path = pp.node, args = args }, next = p + 1, pending_gt = 0 }
         }
-        else { return plain }   // no closing `>` (or a compound close) → backtrack
+        else if is_kind_at(tokens, p, lexer::TokenKind::Shr) {
+            // `>>` closes THIS list with its first `>` and leaves one `>` for an enclosing generic.
+            return ParsedType { node = NamedType { path = pp.node, args = args }, next = p + 1, pending_gt = 1 }
+        }
+        else { return plain }   // not a closed arg list → backtrack (e.g. `x to i64 < y`)
     }
 }
 
@@ -56,7 +71,7 @@ fn parse_slice(tokens: []lexer::Token, pos: u64) -> ParsedType | error {
         return err_at(tokens, pos + 1, "expected ']' to close '[' in a slice type '[]T'")
     }
     let elem = match parse_type_primary(tokens, pos + 2) { ParsedType as x => x; error as e => return e }
-    ParsedType { node = SliceType { element = elem.node }, next = elem.next }
+    ParsedType { node = SliceType { element = elem.node }, next = elem.next, pending_gt = elem.pending_gt }
 }
 
 // THE TYPE ENTRY — the union level (`|`, the lowest-precedence type operator, B.14):
@@ -67,17 +82,21 @@ fn parse_type(tokens: []lexer::Token, pos: u64) -> ParsedType | error {
     mut members: []TypeExpr = teko::list::empty()
     members = teko::list::push(members, first.node)
     mut p = first.next
+    mut pend = first.pending_gt
     // A `|` may be led by a newline (MULTI-LINE type union, e.g. a wide `variant` over many lines);
     // separators may also follow the `|`. We only advance `p` once a `|` is found, so a trailing
-    // newline that ENDS the type (no continuation `|`) is left intact for the caller.
+    // newline that ENDS the type (no continuation `|`) is left intact for the caller. A pending
+    // compound-`>` close (a nested generic mid-close) cannot be followed by `|` — stop and propagate.
     loop {
+        if pend > 0 { break }
         let q = skip_seps(tokens, p)
         if !is_kind_at(tokens, q, lexer::TokenKind::Pipe) { break }
         let mp = skip_seps(tokens, q + 1)
         let m = match parse_type_primary(tokens, mp) { ParsedType as x => x; error as e => return e }
         members = teko::list::push(members, m.node)
         p = m.next
+        pend = m.pending_gt
     }
-    if members.len == 1 { return ParsedType { node = first.node, next = p } }
-    ParsedType { node = UnionType { members = members }, next = p }
+    if members.len == 1 { return ParsedType { node = first.node, next = p, pending_gt = pend } }
+    ParsedType { node = UnionType { members = members }, next = p, pending_gt = pend }
 }

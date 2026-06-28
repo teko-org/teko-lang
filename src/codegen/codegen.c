@@ -318,6 +318,8 @@ static const tk_tfunction *cg_find_function(tk_str ns, tk_str name) {
     return NULL;
 }
 
+static void cg_texpr_mangle(cbuf *b, tk_type_expr te);   // (S4) fwd — appends a type-expr's mangle fragment
+
 // Is `name` a builtin scalar (prim/byte/str/error), i.e. carries no user decl?
 static bool cg_is_prim_name(tk_str name) {
     static const char *prims[] = { "u8","u16","u32","u64","u128","i8","i16","i32","i64",
@@ -353,10 +355,14 @@ static bool cg_name_reaches_byvalue(tk_str from, tk_str to, cg_nameset *seen);
 static bool cg_te_reaches_byvalue(tk_type_expr te, tk_str to, cg_nameset *seen) {
     switch (te.tag) {
         case TK_TEXPR_NAMED: {
-            tk_str y = te.as.named.path.segments[te.as.named.path.len - 1].name;
-            if (cg_is_prim_name(y)) return false;
-            if (cg_name_eq(y, to)) return true;
-            return cg_name_reaches_byvalue(y, to, seen);
+            tk_str base = te.as.named.path.segments[te.as.named.path.len - 1].name;
+            if (cg_is_prim_name(base)) return false;
+            // (S4) a generic-type USE reaches its concrete instance `Box__g__i64`, not the template.
+            tk_str y = base; cbuf k = { NULL, 0, 0 };
+            if (te.as.named.args_len > 0) { cg_texpr_mangle(&k, te); y = (tk_str){ (const tk_byte *)k.ptr, k.len }; }
+            bool res = cg_name_eq(y, to) ? true : cg_name_reaches_byvalue(y, to, seen);
+            if (k.ptr) tk_free0(k.ptr);
+            return res;
         }
         case TK_TEXPR_OPTIONAL: return cg_te_reaches_byvalue(*te.as.optional.inner, to, seen);   // opt embeds inner by value
         case TK_TEXPR_UNION:
@@ -641,6 +647,28 @@ static bool cg_variant_typename_texpr(cbuf *b, tk_type_expr te, const char **err
     return true;
 }
 
+// (S4) append a type-expr's mangle fragment to `b`, matching checker::type_mangle / the .tks
+// cg_texpr_mangle, so a generic USE's instance name agrees with the stamped decl's name.
+static void cg_texpr_mangle(cbuf *b, tk_type_expr te) {
+    switch (te.tag) {
+        case TK_TEXPR_NAMED: {
+            tk_str last = te.as.named.path.segments[te.as.named.path.len - 1].name;
+            cb_str(b, last);
+            if (te.as.named.args_len > 0) {
+                cb(b, "__g__");
+                for (size_t i = 0; i < te.as.named.args_len; i += 1) {
+                    if (i > 0) cb(b, "__");
+                    cg_texpr_mangle(b, te.as.named.args[i]);
+                }
+            }
+            return;
+        }
+        case TK_TEXPR_SLICE:    cb(b, "slice_"); cg_texpr_mangle(b, *te.as.slice.element); return;
+        case TK_TEXPR_OPTIONAL: cb(b, "opt_");   cg_texpr_mangle(b, *te.as.optional.inner); return;
+        case TK_TEXPR_UNION:    cb(b, "variant"); return;
+    }
+}
+
 static bool emit_type_expr(cbuf *b, tk_type_expr te, const char **err) {
     switch (te.tag) {
         case TK_TEXPR_NAMED: {
@@ -673,6 +701,9 @@ static bool emit_type_expr(cbuf *b, tk_type_expr te, const char **err) {
                 if (ad != NULL && ad->body.tag == TK_BODY_ALIAS)
                     return emit_type_expr(b, ad->body.as.alias_body.alias, err);
             }
+            // (S4) a generic-type USE `Box<i64>` → the concrete instance typedef `tk_t_Box__g__i64`
+            // (the mangled name matches checker::generic_inst_name, so decl + ref agree).
+            if (te.as.named.args_len > 0) { cb(b, "tk_t_"); cg_texpr_mangle(b, te); return true; }
             // a user-defined named aggregate -> its mangled typedef name (matches emit_type).
             mangle_type_name(b, (tk_str){ NULL, 0 }, last);
             return true;
@@ -3526,12 +3557,17 @@ static bool cg_type_ready(cg_typenodes *N, tk_type t) {
 static bool cg_texpr_ready(cg_typenodes *N, tk_type_expr te) {
     switch (te.tag) {
         case TK_TEXPR_NAMED: {
-            tk_str last = te.as.named.path.segments[te.as.named.path.len - 1].name;
+            tk_str base = te.as.named.path.segments[te.as.named.path.len - 1].name;
             static const char *prims[] = { "u8","u16","u32","u64","u128","i8","i16","i32","i64",
                                            "i128","f16","f32","f64","bool","byte","str","error" };
             for (size_t i = 0; i < sizeof prims / sizeof *prims; i += 1)
-                if (seg_is(last, prims[i])) return true;   // builtin scalar → ready
-            return cg_named_emitted(N, last);
+                if (seg_is(base, prims[i])) return true;   // builtin scalar → ready
+            // (S4) a generic-type USE `Box<i64>` depends on the concrete instance, not the template.
+            if (te.as.named.args_len == 0) return cg_named_emitted(N, base);
+            cbuf k = { NULL, 0, 0 }; cg_texpr_mangle(&k, te);
+            bool r = cg_named_emitted(N, (tk_str){ (const tk_byte *)k.ptr, k.len });
+            tk_free0(k.ptr);
+            return r;
         }
         case TK_TEXPR_OPTIONAL: {
             cbuf k = { NULL, 0, 0 }; cg_key_texpr(&k, *te.as.optional.inner);
