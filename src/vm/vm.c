@@ -688,6 +688,39 @@ static bool try_builtin_call(tk_path p, const tk_texpr *args, size_t nargs,
         tk_value a = tk_vm_eval_expr(&args[0], env), b = tk_vm_eval_expr(&args[1], env);
         *out = v_bool(tk_str_contains(a.as.s, b.as.s)); return true;
     }
+    // str_* prefixed aliases — the teko::runtime::str_* forms used by teko_rt.tks (last segment
+    // is "str_eq", "str_len", etc.). These must be builtins; the Teko interpreter path returns
+    // a non-bool on Windows for loop-based bool functions (str_eq, str_ends_with, str_contains).
+    if (seg_is(last, "str_eq")) {
+        tk_value a = tk_vm_eval_expr(&args[0], env), b = tk_vm_eval_expr(&args[1], env);
+        *out = v_bool(tk_str_eq(a.as.s, b.as.s)); return true;
+    }
+    if (seg_is(last, "str_len")) {
+        tk_value s = tk_vm_eval_expr(&args[0], env);
+        *out = v_int(tk_str_len(s.as.s), false, 64); return true;
+    }
+    if (seg_is(last, "str_slice")) {
+        tk_value s = tk_vm_eval_expr(&args[0], env),
+                 a = tk_vm_eval_expr(&args[1], env),
+                 b = tk_vm_eval_expr(&args[2], env);
+        *out = v_str(tk_str_slice(s.as.s, (size_t)v_as_u128(a), (size_t)v_as_u128(b))); return true;
+    }
+    if (seg_is(last, "str_slice_to")) {
+        tk_value s = tk_vm_eval_expr(&args[0], env), n = tk_vm_eval_expr(&args[1], env);
+        *out = v_str(tk_str_slice_to(s.as.s, (uint64_t)v_as_u128(n))); return true;
+    }
+    if (seg_is(last, "str_slice_from")) {
+        tk_value s = tk_vm_eval_expr(&args[0], env), n = tk_vm_eval_expr(&args[1], env);
+        *out = v_str(tk_str_slice_from(s.as.s, (uint64_t)v_as_u128(n))); return true;
+    }
+    if (seg_is(last, "str_ends_with")) {
+        tk_value a = tk_vm_eval_expr(&args[0], env), b = tk_vm_eval_expr(&args[1], env);
+        *out = v_bool(tk_str_ends_with(a.as.s, b.as.s)); return true;
+    }
+    if (seg_is(last, "str_contains")) {
+        tk_value a = tk_vm_eval_expr(&args[0], env), b = tk_vm_eval_expr(&args[1], env);
+        *out = v_bool(tk_str_contains(a.as.s, b.as.s)); return true;
+    }
     if (seg_is(last, "i64_to_str")) {
         tk_value n = tk_vm_eval_expr(&args[0], env);
         *out = v_str(tk_i64_to_str((int64_t)v_as_i128(n))); return true;
