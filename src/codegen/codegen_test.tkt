@@ -770,6 +770,52 @@ fn cgt_emit_function_comprehensive() {
 }
 
 // ---------------------------------------------------------------------------
+// Group N2: (C7.18) defer lowering — collect_defers + transform_defers splice the defer
+// body (LIFO) before every return, matching codegen.c's g_cg_defers/emit_defers OUTPUT.
+// ---------------------------------------------------------------------------
+#test
+fn cgt_emit_defer() {
+    let prog = cgt_prog()
+    let ret_type = checker::Prim { kind = checker::PrimKind::I64 }
+
+    // defer { let _c = 0 } — the with_defer() shape: [defer, return 42].
+    let defer_body: []checker::TStatement = teko::list::push(cgt_empty_stmts(), checker::TBinding {
+        kind   = parser::BindKind::Let
+        target = parser::SimpleName { name = "_c" }
+        bound  = checker::Prim { kind = checker::PrimKind::I64 }
+        value  = cgt_num_i64(0)
+    })
+    let defer_s: checker::TStatement = checker::TDeferStmt { body = defer_body }
+
+    mut body: []checker::TStatement = cgt_empty_stmts()
+    body = teko::list::push(body, defer_s)
+    body = teko::list::push(body, cgt_ret(cgt_num_i64(42)))
+    let f = cgt_fn0("cgt_fn_defer", "teko::cgt", ret_type, body)
+    let r = match emit_function(cgt_empty(), prog, f) { []byte as o => str(o); error => "" }
+    teko::assert::is_true(r.len > 0)
+    teko::assert::is_true(teko::str::contains(r, "cgt_fn_defer"))
+    teko::assert::is_true(teko::str::contains(r, "_c"))       // defer body emitted before the return
+    teko::assert::is_true(teko::str::contains(r, "return"))
+
+    // early_return_with_defer() shape: [defer, if true { return 1 }, return 2] — the defer body
+    // is drained before BOTH returns (the TIfExpr recursion + the trailing return).
+    let inner: []checker::TStatement = teko::list::push(cgt_empty_stmts(), cgt_ret(cgt_num_i64(1)))
+    let if_s: checker::TStatement = cgt_stmt(checker::TExpr {
+        kind = checker::TIfExpr { cond = cgt_e_bool_t(); then_blk = inner; has_else = false; else_blk = cgt_empty_stmts() }
+        type = checker::Void { }
+        line = 0; col = 0
+    })
+    mut body2: []checker::TStatement = cgt_empty_stmts()
+    body2 = teko::list::push(body2, defer_s)
+    body2 = teko::list::push(body2, if_s)
+    body2 = teko::list::push(body2, cgt_ret(cgt_num_i64(2)))
+    let f2 = cgt_fn0("cgt_fn_defer2", "teko::cgt", ret_type, body2)
+    let r2 = match emit_function(cgt_empty(), prog, f2) { []byte as o => str(o); error => "" }
+    teko::assert::is_true(teko::str::contains(r2, "cgt_fn_defer2"))
+    teko::assert::is_true(teko::str::contains(r2, "_c"))      // drained inside the if AND at the tail
+}
+
+// ---------------------------------------------------------------------------
 // Helper: 3-segment path for teko::list::empty / push
 // ---------------------------------------------------------------------------
 fn cgt_path3(a: str, b: str, c: str) -> parser::Path {

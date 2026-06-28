@@ -3669,20 +3669,124 @@ fn cg_stmt_c_terminates(s: checker::TStatement) -> bool {
     }
 }
 
+// (C7.18) collect_defers — the function-top-level defer bodies flattened in LIFO drain order
+// (last-registered runs first). The C twin keeps a mutable global stack (g_cg_defers) drained by
+// emit_defers; the functional Teko twin pre-collects here (no mutable global) so transform_defers
+// can splice them before every return. Same OUTPUT, different mechanism (the documented
+// functional-vs-static divergence; cf. the `prog`-threading note). (C: g_cg_defers / emit_defers.)
+fn collect_defers(body: []checker::TStatement) -> []checker::TStatement {
+    mut defers: []checker::TStatement = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= body.len { break }
+        match body[i] {
+            checker::TDeferStmt => { defers = teko::list::push(defers, body[i]) }
+            _ => {}
+        }
+        i++
+    }
+    // Flatten LIFO: reverse over the registered defers, each defer's body in source order.
+    mut drain: []checker::TStatement = teko::list::empty()
+    mut k: u64 = defers.len
+    loop {
+        if k == 0 { break }
+        k = k - 1
+        match defers[k] {
+            checker::TDeferStmt as d => {
+                mut j: u64 = 0
+                loop {
+                    if j >= d.body.len { break }
+                    drain = teko::list::push(drain, d.body[j])
+                    j++
+                }
+            }
+            _ => {}
+        }
+    }
+    drain
+}
+
+// (C7.18) transform_defers — splice `drain` before every `return`, recursing into if/match/loop
+// branches, and drop the (already-collected) top-level defer statements. Reuses the ordinary
+// statement emitters downstream, so the emitted bytes match codegen.c's emit_defers placement
+// exactly (the drain bodies go through emit_stmt at the return's indent, just as emit_defers does).
+// A nested defer (inside a branch) is an honest stop (M.3) — the corpus has only top-level defers.
+// (C: the emit_defers calls in emit_stmt's TK_TSTMT_RETURN + emit_block_tail's trailing exit.)
+fn transform_defers(body: []checker::TStatement, drain: []checker::TStatement, is_top: bool) -> []checker::TStatement | error {
+    mut out: []checker::TStatement = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= body.len { break }
+        match body[i] {
+            checker::TDeferStmt => {
+                if !is_top { return error { message = "codegen: nested defer not yet supported in the self-hosted codegen path (use the C backend)" } }
+            }
+            checker::TReturn => {
+                mut d: u64 = 0
+                loop { if d >= drain.len { break }; out = teko::list::push(out, drain[d]); d++ }
+                out = teko::list::push(out, body[i])
+            }
+            checker::TExprStmt as es => {
+                match es.expr.kind {
+                    checker::TIfExpr as f => {
+                        let nt = match transform_defers(f.then_blk, drain, false) { []checker::TStatement as x => x; error as e => return e }
+                        let ne = match transform_defers(f.else_blk, drain, false) { []checker::TStatement as x => x; error as e => return e }
+                        let nif = checker::TIfExpr { cond = f.cond; then_blk = nt; has_else = f.has_else; else_blk = ne }
+                        out = teko::list::push(out, checker::TExprStmt { expr = checker::TExpr { kind = nif; type = es.expr.type; line = es.expr.line; col = es.expr.col } })
+                    }
+                    checker::TMatchExpr as m => {
+                        mut narms: []checker::TArm = teko::list::empty()
+                        mut a: u64 = 0
+                        loop {
+                            if a >= m.arms.len { break }
+                            let arm = m.arms[a]
+                            let nb = match transform_defers(arm.body, drain, false) { []checker::TStatement as x => x; error as e => return e }
+                            narms = teko::list::push(narms, checker::TArm { pattern = arm.pattern; has_when = arm.has_when; guard = arm.guard; body = nb })
+                            a++
+                        }
+                        out = teko::list::push(out, checker::TExprStmt { expr = checker::TExpr { kind = checker::TMatchExpr { subject = m.subject; arms = narms }; type = es.expr.type; line = es.expr.line; col = es.expr.col } })
+                    }
+                    _ => { out = teko::list::push(out, body[i]) }
+                }
+            }
+            checker::TLoopStmt as l => {
+                let nb = match transform_defers(l.body, drain, false) { []checker::TStatement as x => x; error as e => return e }
+                out = teko::list::push(out, checker::TLoopStmt { label = l.label; body = nb })
+            }
+            _ => { out = teko::list::push(out, body[i]) }
+        }
+        i++
+    }
+    out
+}
+
 fn emit_function(buf: []byte, prog: checker::TProgram, f: checker::TFunction) -> []byte | error {
     mut out = match emit_function_sig(buf, prog, f) { []byte as o => o; error as err => return err }
     out = cb(out, " {\n")
+    // (C7.18) defer lowering: collect the function's top-level defers and splice their bodies (LIFO)
+    // before every return, matching codegen.c's g_cg_defers/emit_defers OUTPUT. A function whose body
+    // can fall off the end WITH defers pending is an honest stop (M.3) — not in the corpus (every
+    // defer-using function ends in an explicit `return`). No defers → body is unchanged (no impact).
+    let drain = collect_defers(f.body)
+    mut fbody = f.body
+    if drain.len > 0 {
+        match f.body[f.body.len - 1] {
+            checker::TReturn => {}
+            _ => return error { message = "codegen: defer in a fall-through function not yet supported in the self-hosted codegen path (use the C backend)" }
+        }
+        fbody = match transform_defers(f.body, drain, true) { []checker::TStatement as x => x; error as e => return e }
+    }
     // W5a — a fn body's trailing expr-statement carrying a value implicitly returns it.
     // W5b — thread the fn's return type so a tail/return case value is wrapped into a variant
     // return slot (emit_as).
-    out = match emit_block_tail(out, f.body, false, prog, f.return_type, "    ") { []byte as o => o; error as err => return err }
+    out = match emit_block_tail(out, fbody, false, prog, f.return_type, "    ") { []byte as o => o; error as err => return err }
     // A non-void function whose tail is a value-form `match`/`if` (or a loop) returns on every path
     // the CHECKER proved exhaustive — but C can't see that, so without a terminator it warns
     // -Wreturn-type and the fall-through is UB. The checker guarantees it is never reached: emit
     // `__builtin_unreachable()`. (Skip when the tail already C-terminates, and for void functions.)
     let needs_unreachable = match f.return_type {
         checker::Void => false
-        _ => if f.body.len > 0 { !cg_stmt_c_terminates(f.body[f.body.len - 1]) } else { true }
+        _ => if fbody.len > 0 { !cg_stmt_c_terminates(fbody[fbody.len - 1]) } else { true }
     }
     if needs_unreachable { out = cb(out, "    __builtin_unreachable();\n") }
     cb(out, "}\n\n")
