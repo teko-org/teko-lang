@@ -89,8 +89,10 @@ static bool occurs_stmt(const tk_tstatement *s, tk_str name) {
     switch (s->tag) {
         case TK_TSTMT_BINDING: return occurs_expr(&s->as.binding.value, name);
         case TK_TSTMT_ASSIGN:
-            // a COMPOUND assign (`x += …`) READS the target; a plain `=` does not.
+            // a COMPOUND assign (`x += …`) READS the target; a plain `=` does not. A deref-assign
+            // (`r.value = …`, MEM-1b-ii) always READS the ref handle `r` (to dereference it).
             if (s->as.assign.op != TK_TOKEN_ASSIGN && seq(s->as.assign.name, name)) return true;
+            if (s->as.assign.deref && seq(s->as.assign.name, name)) return true;
             return occurs_expr(&s->as.assign.value, name);
         case TK_TSTMT_RETURN:  return s->as.ret.has_value && occurs_expr(&s->as.ret.value, name);
         case TK_TSTMT_LOOP:    return occurs_block(s->as.loop_stmt.body, s->as.loop_stmt.nbody, name);

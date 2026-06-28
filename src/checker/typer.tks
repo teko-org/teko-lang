@@ -1152,6 +1152,21 @@ fn type_binding(b: parser::Binding, env: Env, table: TypeTable) -> TypedStmt | e
 
 fn type_assign(a: parser::Assign, env: Env, table: TypeTable) -> TypedStmt | error {
     let tb = match lookup_binding(env, a.name) { ValBinding as vb => vb; error as e => return e }
+    // (MEM-1b-ii) `r.value op= x` — write THROUGH a reference. The handle `r` need NOT be `mut`
+    // (a `Ref<T>` is a const handle that grants WRITE to its mutable target — R2 mutable-target).
+    // The assigned-to type is the ref's inner T; the value must widen/adopt into T.
+    if a.deref {
+        let inner = match tb.type {
+            Reference as rf => rf.inner
+            _               => return error { message = $"`{a.name}.value` requires a reference (`Ref<T>`) — `{a.name}` is not a reference" }
+        }
+        mut dv = match type_expr(a.value, env, table) { TExpr as te => te; error as e => return e }
+        if !assignable_to(dv.type, inner, table) {
+            if !literal_adopts(dv, inner) { return teko::error::err_typed(error { message = "assigned value does not match the referenced type" }, type_render(inner), type_render(dv.type)) }
+            dv = TExpr { kind = dv.kind; type = inner; line = dv.line; col = dv.col }   // a fitting literal adopts T
+        }
+        return TypedStmt { node = TAssign { name = a.name; op = a.op; bound = inner; value = dv; deref = true }; env = env }
+    }
     if !tb.is_mut { return error { message = $"cannot assign to immutable `{a.name}` — declare it `mut` (B.21)" } }
     mut v = match type_expr(a.value, env, table) { TExpr as te => te; error as e => return e }
     // The value must WIDEN into the target's type (B.14 case→variant, T→T?) OR be a fitting literal
@@ -1173,7 +1188,7 @@ fn type_assign(a: parser::Assign, env: Env, table: TypeTable) -> TypedStmt | err
             v = TExpr { kind = v.kind; type = tb.type; line = v.line; col = v.col }
         }
     }
-    TypedStmt { node = TAssign { name = a.name; op = a.op; bound = tb.type; value = v }; env = env }   // mut rule enforced (B.21)
+    TypedStmt { node = TAssign { name = a.name; op = a.op; bound = tb.type; value = v; deref = false }; env = env }   // mut rule enforced (B.21)
 }
 
 fn type_return(r: parser::Return, env: Env, table: TypeTable) -> TypedStmt | error {

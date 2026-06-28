@@ -150,7 +150,7 @@ typedef struct {                                                          // let
     tk_type_expr  type_ann;                                               // the parsed annotation (valid iff has_type)
     tk_expr       value;
 } tk_binding;
-typedef struct { tk_str name; tk_token_kind op; tk_expr value; } tk_assign;   // x = / += / … (B.4)
+typedef struct { tk_str name; tk_token_kind op; tk_expr value; bool deref; } tk_assign;   // x = / += / … (B.4); deref ⇒ `name.value op= …` writes THROUGH a Ref<T> (MEM-1b-ii)
 typedef struct { bool has_value; tk_expr value; }               tk_return;    // return [expr] (value gated by has_value)
 typedef struct { tk_str label; tk_statement *body; size_t nbody; } tk_loop_stmt; // loop [NAME] { … } (M.5); label empty (len 0) = unlabeled
 typedef struct { tk_str label; }                                tk_jump;      // break [NAME] / continue [NAME]; label empty = innermost loop

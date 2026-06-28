@@ -2985,7 +2985,10 @@ static bool emit_stmt(cbuf *b, const tk_tstatement *s, bool in_main,
             const char *op = assignop_c(s->as.assign.op);
             if (op == NULL) return fail_node(err, "codegen: assignment operator not yet supported");
             cb(b, indent);
-            cb_ident(b, s->as.assign.name);
+            // (MEM-1b-ii) `r.value op= v` — write THROUGH the reference: the handle IS the pointer, so
+            // the lvalue is `(*r)`. (`Ref<T>` lowers to `<T> *`; deref-assign is a plain pointer store.)
+            if (s->as.assign.deref) { cb(b, "(*"); cb_ident(b, s->as.assign.name); cb(b, ")"); }
+            else cb_ident(b, s->as.assign.name);
             cb(b, " "); cb(b, op); cb(b, " ");
             // Wrap the value into the target's declared type (`bound`) — a case → its variant,
             // a `T` → `T?`, a fitting literal — exactly like a binding. (Plain numerics emit as-is;

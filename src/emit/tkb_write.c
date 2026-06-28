@@ -159,10 +159,11 @@ static tk_bytes write_tstatement(tk_bytes b, tk_strtable t, const tk_tstatement 
             b = write_bindtarget(tk_write_u8(tk_write_u8(b, 0), bindkind_byte(s->as.binding.kind)), t, s->as.binding.target);
             b = tk_write_type(b, t, s->as.binding.bound);
             return tk_write_texpr(b, t, &s->as.binding.value);
-        case TK_TSTMT_ASSIGN:                                                // name (u32) + op (u8) + bound (Type) + value (TExpr)
+        case TK_TSTMT_ASSIGN:                                                // name (u32) + op (u8) + bound (Type) + value (TExpr) + deref (u8) (MEM-1b-ii)
             b = tk_write_u8(tk_write_u32(tk_write_u8(b, 1), tk_st_find(t, s->as.assign.name)), kind_byte(s->as.assign.op));
             b = tk_write_type(b, t, s->as.assign.bound);
-            return tk_write_texpr(b, t, &s->as.assign.value);
+            b = tk_write_texpr(b, t, &s->as.assign.value);
+            return tk_write_u8(b, (tk_byte)(s->as.assign.deref ? 1 : 0));
         case TK_TSTMT_RETURN:                                                // has_value (u8) + value (TExpr)
             return tk_write_texpr(tk_write_u8(tk_write_u8(b, 2), (tk_byte)(s->as.ret.has_value ? 1 : 0)), t, &s->as.ret.value);
         case TK_TSTMT_LOOP:                                                  // label (u32) + body ([]TStatement)

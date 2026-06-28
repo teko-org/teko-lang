@@ -54,12 +54,21 @@ fn parse_statement(tokens: []lexer::Token, pos: u64) -> ParsedStmt | error {
     if is_kind_at(tokens, pos, lexer::TokenKind::Ident) && is_assign_op(tokens, pos + 1) {
         return parse_assign(tokens, pos)
     }
+    // (MEM-1b-ii) `r.value op= x` — assign THROUGH a reference: `name . value <assign-op>`. The ONLY
+    // field-assignment target in value-functional Teko (a mutation goes through a `Ref<T>`). Matched
+    // before the expr-statement fallback; `.value` is the only assignable reference field.
+    if is_kind_at(tokens, pos, lexer::TokenKind::Ident) &&
+       is_kind_at(tokens, pos + 1, lexer::TokenKind::Dot) &&
+       is_name_at(tokens, pos + 2) && tokens[pos + 2].text == "value" &&
+       is_assign_op(tokens, pos + 3) {
+        return parse_ref_assign(tokens, pos)
+    }
     // `i++` / `i--` — postfix increment/decrement STATEMENT sugar: desugar to the compound
     // assignment `i += 1` / `i -= 1` (reuses assign typing/codegen/VM; mut-guard included).
     if is_kind_at(tokens, pos, lexer::TokenKind::Ident) &&
        (is_kind_at(tokens, pos + 1, lexer::TokenKind::PlusPlus) || is_kind_at(tokens, pos + 1, lexer::TokenKind::MinusMinus)) {
         let op = if is_kind_at(tokens, pos + 1, lexer::TokenKind::PlusPlus) { lexer::TokenKind::PlusEq } else { lexer::TokenKind::MinusEq }
-        return ParsedStmt { node = Assign { name = tokens[pos].text, op = op, value = Expr { kind = Number { is_float = false, value = 1, fval = 0.0 }, line = 0, col = 0 } }, next = pos + 2 }   // (C1-POS) synthesized `1` for the `i++`/`i--` desugar — not stamped in the C twin (position unknown, 0)
+        return ParsedStmt { node = Assign { name = tokens[pos].text, op = op, value = Expr { kind = Number { is_float = false, value = 1, fval = 0.0 }, line = 0, col = 0 }, deref = false }, next = pos + 2 }   // (C1-POS) synthesized `1` for the `i++`/`i--` desugar — not stamped in the C twin (position unknown, 0)
     }
     let e = match parse_expr(tokens, pos) { Parsed as x => x; error as e => return e }
     ParsedStmt { node = ExprStmt { expr = e.node }, next = e.next }
@@ -137,7 +146,17 @@ fn parse_assign(tokens: []lexer::Token, pos: u64) -> ParsedStmt | error {
     let name = tokens[pos].text
     let op = kind_at(tokens, pos + 1)
     let v = match parse_expr(tokens, pos + 2) { Parsed as x => x; error as e => return e }
-    ParsedStmt { node = Assign { name = name, op = op, value = v.node }, next = v.next }
+    ParsedStmt { node = Assign { name = name, op = op, value = v.node, deref = false }, next = v.next }
+}
+
+// (MEM-1b-ii) `name.value op= value` — write THROUGH a reference. `pos` is at the ref name; tokens
+// are `name . value <assign-op> value` (the `.value` shape was matched at dispatch). The ref handle
+// itself need not be `mut` (the checker verifies it is a `Ref<T>`; the ref grants write to its target).
+fn parse_ref_assign(tokens: []lexer::Token, pos: u64) -> ParsedStmt | error {
+    let name = tokens[pos].text
+    let op = kind_at(tokens, pos + 3)   // the assign op AFTER `.value`
+    let v = match parse_expr(tokens, pos + 4) { Parsed as x => x; error as e => return e }
+    ParsedStmt { node = Assign { name = name, op = op, value = v.node, deref = true }, next = v.next }
 }
 
 // (added to parse_statement, P4d; labels — M.5)

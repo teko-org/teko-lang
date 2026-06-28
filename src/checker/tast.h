@@ -98,7 +98,7 @@ struct tk_tstatement {
     tk_tstatement_tag tag;
     union {
         struct { tk_bind_kind kind; tk_bind_target target; tk_type bound; tk_texpr value; } binding;
-        struct { tk_str name; tk_token_kind op; tk_type bound; tk_texpr value; }             assign;   // bound = the target's declared type (codegen wraps the value into it — emit_as)
+        struct { tk_str name; tk_token_kind op; tk_type bound; tk_texpr value; bool deref; }  assign;   // bound = the target's declared type (codegen wraps the value into it — emit_as); deref ⇒ `name.value op= …` writes THROUGH a Ref<T> (MEM-1b-ii)
         struct { bool has_value; tk_texpr value; }                                           ret;   // value gated by has_value
         struct { tk_str label; tk_tstatement *body; size_t nbody; }                          loop_stmt;   // label empty = unlabeled
         struct { tk_str label; }                                                             jump;        // BREAK/CONTINUE — label empty = innermost

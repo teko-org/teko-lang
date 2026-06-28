@@ -245,6 +245,7 @@ static tk_tstatement read_tstmt(tk_reader *r, tk_strs t) {
             s.as.assign.op    = kind_of(tk_read_u8(r));
             s.as.assign.bound = tk_read_type(r, t);
             s.as.assign.value = tk_read_texpr(r, t);
+            s.as.assign.deref = (tk_read_u8(r) != 0);   // (MEM-1b-ii)
             return s;
         case 2:
             s.tag = TK_TSTMT_RETURN;

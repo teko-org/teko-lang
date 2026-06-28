@@ -1700,6 +1700,10 @@ static tk_flow exec_stmt(const tk_tstatement *s, tk_venv *env) {
             return flow_normal();
         }
         case TK_TSTMT_ASSIGN: {
+            // (MEM-1b-ii) `r.value op= x` writes THROUGH a reference; only occurs inside a `Ref<T>`-
+            // parameter function, which eval_call already honest-stops before the body runs — so this
+            // is unreachable today. Guard defensively (no VM aliasing cell); runs natively.
+            if (s->as.assign.deref) vm_unsupported("`Ref<T>` deref-assignment (`r.value = …`) is not yet executable in the VM — runs natively via `teko build`; VM support deferred");
             tk_slot *slot = env_find(env, s->as.assign.name);
             if (slot == NULL) vm_unsupported("assignment to an unbound variable (internal: checker should reject)");
             tk_token_kind op = s->as.assign.op;

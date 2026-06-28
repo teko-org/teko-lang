@@ -134,6 +134,22 @@ static tk_typed_stmt_result type_binding(tk_binding b, tk_env env, tk_type_table
 
 static tk_typed_stmt_result type_assign(tk_assign a, tk_env env, tk_type_table table) {
     tk_binding_result tb = tk_env_lookup_binding(env, a.name); if (!tb.ok) return sfail(tb.as.error);
+    // (MEM-1b-ii) `r.value op= x` — write THROUGH a reference. The handle `r` need NOT be `mut` (a
+    // `Ref<T>` is a const handle granting WRITE to its mutable target — R2); the type written is T.
+    if (a.deref) {
+        if (tb.as.value.type.tag != TK_TYPE_REF)
+            return smsg("`.value` assignment requires a reference (`Ref<T>`) on the left");
+        tk_type inner = *tb.as.value.type.as.ref.inner;
+        tk_texpr_result dv = tk_typer_expr(a.value, env, table); if (!dv.ok) return sfail(dv.as.error);
+        if (!assignable_to(dv.as.value.type, inner, table)) {
+            if (!tk_literal_adopts(dv.as.value, inner))
+                return sfail(tk_error_types(tk_error_make("assigned value does not match the referenced type"),
+                                            tk_type_render(inner), tk_type_render(dv.as.value.type)));
+            dv.as.value.type = inner;   // a fitting literal adopts T
+        }
+        tk_tstatement dn = { .tag = TK_TSTMT_ASSIGN, .as.assign = { a.name, a.op, inner, dv.as.value, true } };
+        return sok(dn, env);
+    }
     if (!tb.as.value.is_mut) return smsg("cannot assign to immutable binding — declare it `mut` (B.21)");
     tk_texpr_result v = tk_typer_expr(a.value, env, table); if (!v.ok) return sfail(v.as.error);
     // The value must WIDEN into the target's type (B.14 case→variant, T→T?) OR be a fitting literal
@@ -153,7 +169,7 @@ static tk_typed_stmt_result type_assign(tk_assign a, tk_env env, tk_type_table t
     if (v.as.value.type.tag == TK_TYPE_SLICE && v.as.value.type.as.slice.element == NULL
         && target.tag == TK_TYPE_SLICE && target.as.slice.element != NULL)
         v.as.value.type = target;
-    tk_tstatement node = { .tag = TK_TSTMT_ASSIGN, .as.assign = { a.name, a.op, target, v.as.value } };
+    tk_tstatement node = { .tag = TK_TSTMT_ASSIGN, .as.assign = { a.name, a.op, target, v.as.value, false } };
     return sok(node, env);   // mut rule enforced (B.21)
 }
 
