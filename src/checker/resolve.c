@@ -149,6 +149,13 @@ const char *tk_type_render(tk_type t) {
             return out;
         }
         case TK_TYPE_UPTR:  return dup_cstr("uptr");   // (C7.1a) opaque word-size unsigned
+        case TK_TYPE_REF: {   // (MEM-1b) ref<T> human render (inner never NULL)
+            const char *in = tk_type_render(*t.as.ref.inner);
+            size_t cap = strlen(in) + 6;   // "ref<" + in + ">" + NUL
+            char *out = tk_alloc(cap); if (!out) abort();
+            snprintf(out, cap, "ref<%s>", in);
+            return out;
+        }
     }
     return dup_cstr("<type>");
 }
@@ -216,6 +223,7 @@ tk_type tk_subst_type(tk_type t, tk_subst s) {
         // matters now that monomorph.c walks EVERY node's type, sentinels included (S4b).
         case TK_TYPE_SLICE: { if (!t.as.slice.element) return t; tk_type e = tk_subst_type(*t.as.slice.element, s); return (tk_type){ .tag = TK_TYPE_SLICE, .as.slice = { tk_clone_type(e) } }; }
         case TK_TYPE_OPTIONAL: { if (!t.as.optional.inner) return t; tk_type e = tk_subst_type(*t.as.optional.inner, s); return (tk_type){ .tag = TK_TYPE_OPTIONAL, .as.optional = { tk_clone_type(e) } }; }
+        case TK_TYPE_REF: { tk_type e = tk_subst_type(*t.as.ref.inner, s); return (tk_type){ .tag = TK_TYPE_REF, .as.ref = { tk_clone_type(e) } }; }   // (MEM-1b) ref<T> substitutes inner
         case TK_TYPE_VARIANT: {
             size_t n = t.as.variant.len; tk_type *ms = tk_alloc((n ? n : 1) * sizeof *ms);
             for (size_t i = 0; i < n; i += 1) ms[i] = tk_subst_type(t.as.variant.members[i], s);
@@ -259,6 +267,9 @@ tk_subst_result tk_unify(tk_type pattern, tk_type arg, tk_subst s, tk_type_table
         case TK_TYPE_OPTIONAL:
             if (arg.tag == TK_TYPE_OPTIONAL) return tk_unify(*pattern.as.optional.inner, *arg.as.optional.inner, s, table);
             return (tk_subst_result){ .ok = true, .as.value = s };
+        case TK_TYPE_REF:   // (MEM-1b)
+            if (arg.tag == TK_TYPE_REF) return tk_unify(*pattern.as.ref.inner, *arg.as.ref.inner, s, table);
+            return (tk_subst_result){ .ok = true, .as.value = s };
         default:
             return (tk_subst_result){ .ok = true, .as.value = s };
     }
@@ -275,6 +286,7 @@ void tk_collect_sig_type_params(tk_type t, tk_type_table table, tk_str **names, 
         }
         case TK_TYPE_SLICE:    tk_collect_sig_type_params(*t.as.slice.element, table, names, n); return;
         case TK_TYPE_OPTIONAL: tk_collect_sig_type_params(*t.as.optional.inner, table, names, n); return;
+        case TK_TYPE_REF:      tk_collect_sig_type_params(*t.as.ref.inner, table, names, n); return;   // (MEM-1b)
         case TK_TYPE_VARIANT:  for (size_t i = 0; i < t.as.variant.len; i += 1) tk_collect_sig_type_params(t.as.variant.members[i], table, names, n); return;
         case TK_TYPE_FUNC:
             for (size_t i = 0; i < t.as.func.nparams; i += 1) tk_collect_sig_type_params(t.as.func.params[i], table, names, n);
@@ -329,6 +341,7 @@ tk_str tk_type_mangle(tk_type t) {
         case TK_TYPE_VOID:     return rt_cstr("void");
         case TK_TYPE_PTR:      return t.as.ptr.inner ? rt_concat(rt_cstr("ptr_"), tk_type_mangle(*t.as.ptr.inner)) : rt_cstr("ptr");
         case TK_TYPE_UPTR:     return rt_cstr("uptr");
+        case TK_TYPE_REF:      return rt_concat(rt_cstr("ref_"), tk_type_mangle(*t.as.ref.inner));   // (MEM-1b)
         case TK_TYPE_VARIANT:  return rt_cstr("variant");
         case TK_TYPE_FUNC:     return rt_cstr("func");
     }
@@ -356,6 +369,16 @@ static tk_type_result resolve_generic_inst(tk_path path, tk_type_expr *args, siz
         tk_type_result in = tk_resolve_type(args[0], table);
         if (!in.ok) return in;
         tk_type t = { .tag = TK_TYPE_PTR, .as.ptr.inner = (in.as.value.tag == TK_TYPE_VOID) ? NULL : box(in.as.value) };
+        return (tk_type_result){ .ok = true, .as.value = t };
+    }
+    // (MEM-1b) builtin generic `ref<T>` → the safe reference `Ref{inner}`. Never null/opaque;
+    // `ref<void>` rejected (void is not a value), `ref` requires a type argument.
+    if (name.len == 3 && memcmp(name.ptr, "ref", 3) == 0) {
+        if (nargs != 1) return (tk_type_result){ .ok = false, .as.error = tk_error_make("`ref<T>` takes exactly one type argument") };
+        tk_type_result in = tk_resolve_type(args[0], table);
+        if (!in.ok) return in;
+        if (in.as.value.tag == TK_TYPE_VOID) return (tk_type_result){ .ok = false, .as.error = tk_error_make("`ref<void>` is invalid — void is not a value (M.3)") };
+        tk_type t = { .tag = TK_TYPE_REF, .as.ref.inner = box(in.as.value) };
         return (tk_type_result){ .ok = true, .as.value = t };
     }
     tk_type *argtypes = nargs ? tk_alloc(nargs * sizeof *argtypes) : NULL;

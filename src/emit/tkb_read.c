@@ -72,6 +72,7 @@ tk_type tk_read_type(tk_reader *r, tk_strs t) {
         case 10: return (tk_type){ .tag = TK_TYPE_PTR, .as.ptr.inner = NULL };   // tag 10 = opaque ptr (S-mem)
         case 11: return (tk_type){ .tag = TK_TYPE_UPTR };   // (C7.1a) tag 11 = uptr
         case 12: return (tk_type){ .tag = TK_TYPE_PTR, .as.ptr.inner = box(tk_read_type(r, t)) };   // tag 12 = ptr<T> (S-mem)
+        case 13: return (tk_type){ .tag = TK_TYPE_REF, .as.ref.inner = box(tk_read_type(r, t)) };   // (MEM-1b) tag 13 = ref<T>
     }
     r->ok = false; return (tk_type){ .tag = TK_TYPE_VOID };
 }

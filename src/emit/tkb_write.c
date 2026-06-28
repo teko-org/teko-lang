@@ -32,6 +32,7 @@ tk_bytes tk_write_type(tk_bytes b, tk_strtable t, tk_type ty) {
         case TK_TYPE_PTR:     return ty.as.ptr.inner ? tk_write_type(tk_write_u8(b, 12), t, *ty.as.ptr.inner)   // tag 12 = ptr<T>
                                                        : tk_write_u8(b, 10);                                    // tag 10 = opaque ptr (S-mem)
         case TK_TYPE_UPTR:    return tk_write_u8(b, 11);  // (C7.1a) tag 11 = uptr
+        case TK_TYPE_REF:     return tk_write_type(tk_write_u8(b, 13), t, *ty.as.ref.inner);   // (MEM-1b) tag 13 = ref<T>
     }
     return b;
 }

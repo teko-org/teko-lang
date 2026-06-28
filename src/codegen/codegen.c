@@ -324,7 +324,8 @@ static void cg_texpr_mangle(cbuf *b, tk_type_expr te);   // (S4) fwd — appends
 static bool cg_is_prim_name(tk_str name) {
     static const char *prims[] = { "u8","u16","u32","u64","u128","i8","i16","i32","i64",
                                    "i128","f16","f32","f64","bool","byte","str","error",
-                                   "ptr","uptr" };   // (C7.1a) opaque FFI transport types
+                                   "ptr","uptr",   // (C7.1a) opaque FFI transport types
+                                   "ref" };         // (MEM-1b) ref<T> lowers to a pointer (no by-value edge)
     for (size_t i = 0; i < sizeof prims / sizeof *prims; i += 1)
         if (seg_is(name, prims[i])) return true;
     return false;
@@ -498,6 +499,11 @@ static bool emit_type(cbuf *b, tk_type t, const char **err) {
             if (!emit_type(b, *t.as.ptr.inner, err)) return false;
             cb(b, " *"); return true;
         case TK_TYPE_UPTR:    cb(b, "uintptr_t"); return true;
+        // (MEM-1b) ref<T> — the safe reference lowers to a bare `<T> *` today (the {p, metadata}
+        // struct wrapper waits until regions/DI add metadata fields). "C pointer without `*`/`&`".
+        case TK_TYPE_REF:
+            if (!emit_type(b, *t.as.ref.inner, err)) return false;
+            cb(b, " *"); return true;
     }
     return fail_node(err, "codegen: unknown type not yet supported");
 }
@@ -700,6 +706,10 @@ static bool emit_type_expr(cbuf *b, tk_type_expr te, const char **err) {
                 cb(b, "void *"); return true;
             }
             else if (seg_is(last, "uptr"))  { cb(b, "uintptr_t");         return true; }   // (C7.1a) opaque word-size unsigned
+            else if (seg_is(last, "ref"))   {   // (MEM-1b) ref<T> → <T> *
+                if (te.as.named.args_len > 0) { if (!emit_type_expr(b, te.as.named.args[0], err)) return false; cb(b, " *"); return true; }
+                return fail_node(err, "`ref<T>` needs a type argument");
+            }
             // a TRANSPARENT alias (`type Name = <type-expr>`) emits NO C type of its own — resolve
             // through to the aliased type-expr at every use site (e.g. a `TypeTable` field = []TypeReg
             // → tk_slice_TypeReg). Matches the checker, which resolves aliases transparently.

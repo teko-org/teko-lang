@@ -78,9 +78,15 @@ pub type Error    = struct { }                     // the native `error` (lowerc
 pub type Void     = struct { }                     // return-only marker; legal ONLY as Func.ret
 pub type Ptr      = struct { inner: Type? }        // `ptr<T>` — a TYPED address; `inner = null` = the opaque `ptr` ≡ `ptr<void>` ≡ `*void` (pointer-only; NOT the value-`void`). The primitive inside Ref<T>.
 pub type Uptr     = struct { }                     // (C7.1a) opaque word-size unsigned — transport-only at the FFI boundary
+// (MEM-1b) `Ref<T>` — the SAFE reference: a compiler-known "C pointer WITHOUT `*`/`&`". Reuses
+// generics (no keyword). Mutable-target only and NEVER null (R2), so `inner` is a plain `Type`
+// (not optional) and there is no opaque/bare form (unlike `Ptr`). Deref/assign via `.value`+`mut`;
+// auto-ref when a `mut` lvalue is passed where `Ref<T>` is expected. C representation = bare `<T> *`
+// today (the `{p, metadata}` struct wrapper waits until regions/DI add metadata fields — W9+).
+pub type Ref      = struct { inner: Type }
 
 // a semantic type. (Compiler-managed indirection for the recursive cases.)
-pub type Type = variant Prim | Byte | Str | Slice | Optional | Named | Variant | Func | Error | Void | Ptr | Uptr
+pub type Type = variant Prim | Byte | Str | Slice | Optional | Named | Variant | Func | Error | Void | Ptr | Uptr | Ref
 
 // `void` recognition (M.3): the checker (Z2a) calls this to admit void in a
 // `Func.ret` position and to reject it everywhere else (value / binding / member).
@@ -133,6 +139,7 @@ fn type_eq(a: Type, b: Type) -> bool {
         }
         Ptr as pa     => match b { Ptr as pb => ptr_inner_eq(pa.inner, pb.inner); _ => false }   // ptr<T> equal by pointed type (null inner = opaque ptr)
         Uptr          => match b { Uptr          => true;                           _ => false }   // (C7.1a) opaque, same-kind only
+        Ref as ra     => match b { Ref as rb     => type_eq(ra.inner, rb.inner);    _ => false }   // (MEM-1b) ref<T> equal by referenced type (never null)
     }
 }
 

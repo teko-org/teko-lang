@@ -216,6 +216,7 @@ pub fn subst_type(t: Type, s: Subst) -> Type {
         Named as n    => match subst_find(s, n.name) { Type as ct => ct; null => t }
         Slice as sl   => Slice { element = subst_type(sl.element, s) }
         Optional as o => Optional { inner = subst_type(o.inner, s) }
+        Ref as r      => Ref { inner = subst_type(r.inner, s) }   // (MEM-1b) ref<T> substitutes its referenced type
         Variant as v  => {
             mut ms: []Type = teko::list::empty()
             mut i = 0
@@ -265,6 +266,7 @@ pub fn unify(pattern: Type, arg: Type, s: Subst, table: TypeTable) -> Subst | er
         }
         Slice as sl   => match arg { Slice as asl => unify(sl.element, asl.element, s, table); _ => s }
         Optional as o => match arg { Optional as ao => unify(o.inner, ao.inner, s, table); _ => s }
+        Ref as r      => match arg { Ref as ar => unify(r.inner, ar.inner, s, table); _ => s }   // (MEM-1b)
         _             => s
     }
 }
@@ -280,6 +282,7 @@ pub fn collect_sig_type_params(t: Type, table: TypeTable, acc: []str) -> []str {
         }
         Slice as sl   => collect_sig_type_params(sl.element, table, acc)
         Optional as o => collect_sig_type_params(o.inner, table, acc)
+        Ref as r      => collect_sig_type_params(r.inner, table, acc)   // (MEM-1b) ref<T> may carry a type-param
         Variant as v  => { mut a = acc; mut i = 0; loop { if i >= v.members.len { break }; a = collect_sig_type_params(v.members[i], table, a); i++ }; a }
         Func as f     => { mut a = acc; mut i = 0; loop { if i >= f.params.len { break }; a = collect_sig_type_params(f.params[i], table, a); i++ }; collect_sig_type_params(f.ret, table, a) }
         _             => acc
@@ -369,6 +372,7 @@ pub fn type_mangle(t: Type) -> str {
         Void          => "void"
         Ptr as p      => match p.inner { null => "ptr"; Type as t => teko::str::concat("ptr_", type_mangle(t)) }
         Uptr          => "uptr"
+        Ref as r      => teko::str::concat("ref_", type_mangle(r.inner))   // (MEM-1b)
         Variant       => "variant"
         Func          => "func"
     }
@@ -399,6 +403,14 @@ fn resolve_generic_inst(nt: parser::NamedType, table: TypeTable) -> Type | error
         if nt.args.len != 1 { return error { message = "`ptr<T>` takes exactly one type argument" } }
         let argt = match resolve_type(nt.args[0], table) { Type as t => t; error as e => return e }
         match argt { Void => return Ptr { inner = null }; _ => return Ptr { inner = argt } }
+    }
+    // (MEM-1b) the builtin generic `ref<T>` → the SAFE reference `Ref{inner}`. Unlike `ptr`, a ref is
+    // never null and never opaque, so `ref<void>` is rejected (void is not a value) and `ref` requires
+    // a type argument. Not a user decl, handled before the table lookup.
+    if name == "ref" {
+        if nt.args.len != 1 { return error { message = "`ref<T>` takes exactly one type argument" } }
+        let argt = match resolve_type(nt.args[0], table) { Type as t => t; error as e => return e }
+        match argt { Void => return error { message = "`ref<void>` is invalid — void is not a value (M.3)" }; _ => return Ref { inner = argt } }
     }
     mut argtypes: []Type = teko::list::empty()
     mut i = 0
@@ -443,6 +455,7 @@ pub fn type_render(t: Type) -> str {
         Func as f     => render_func(f)   // (C1.8) "(p0, …) -> ret" — full mirror of resolve.c (M.3, show what we know)
         Ptr as p      => match p.inner { null => "ptr"; Type as t => $"ptr<{type_render(t)}>" }   // ptr<T> human render
         Uptr          => "uptr"           // (C7.1a) opaque word-size unsigned
+        Ref as r      => $"ref<{type_render(r.inner)}>"   // (MEM-1b) ref<T> human render
     }
 }
 

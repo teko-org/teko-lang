@@ -82,6 +82,7 @@ typedef enum {
     TK_TYPE_VOID,      // return-only marker; legal ONLY as Func.ret
     TK_TYPE_PTR,       // (C7.1a) opaque pointer — transport-only at the FFI boundary, never dereferenced
     TK_TYPE_UPTR,      // (C7.1a) opaque word-size unsigned — transport-only at the FFI boundary
+    TK_TYPE_REF,       // (MEM-1b) ref<T> — the SAFE reference (compiler-known); never null, mutable-target only
 } tk_type_tag;
 
 // recursive (the Slice/Variant/Func cases hold tk_type) — the indirection the Teko
@@ -98,6 +99,7 @@ struct tk_type {
         struct { tk_type *params; size_t nparams; tk_type *ret; } func;  // TK_TYPE_FUNC
         struct { tk_type *inner; }              optional;    // TK_TYPE_OPTIONAL — T?
         struct { tk_type *inner; }              ptr;         // TK_TYPE_PTR — ptr<T> (inner NULL = opaque ptr ≡ ptr<void> ≡ *void)
+        struct { tk_type *inner; }              ref;         // TK_TYPE_REF — ref<T> — the referenced type (never NULL)
         // BYTE, STR, ERROR, VOID carry no payload
     } as;
 };

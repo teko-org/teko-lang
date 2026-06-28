@@ -45,6 +45,8 @@ bool tk_type_eq(const tk_type *a, const tk_type *b) {
             if (a->as.ptr.inner == NULL || b->as.ptr.inner == NULL) return a->as.ptr.inner == b->as.ptr.inner;
             return tk_type_eq(a->as.ptr.inner, b->as.ptr.inner);
         case TK_TYPE_UPTR:  return true;   // (C7.1a) opaque, same-kind only
+        case TK_TYPE_REF:   // (MEM-1b) ref<T> equal by referenced type (inner never NULL)
+            return tk_type_eq(a->as.ref.inner, b->as.ref.inner);
     }
     return false;
 }

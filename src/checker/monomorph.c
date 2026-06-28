@@ -66,6 +66,7 @@ static tk_str mono_type_mangle(tk_type t) {
         case TK_TYPE_VOID:     return mono_cstr("void");
         case TK_TYPE_PTR:      return t.as.ptr.inner ? mono_concat(mono_cstr("ptr_"), mono_type_mangle(*t.as.ptr.inner)) : mono_cstr("ptr");
         case TK_TYPE_UPTR:     return mono_cstr("uptr");
+        case TK_TYPE_REF:      return mono_concat(mono_cstr("ref_"), mono_type_mangle(*t.as.ref.inner));   // (MEM-1b)
         case TK_TYPE_VARIANT:  return mono_cstr("variant");
         case TK_TYPE_FUNC:     return mono_cstr("func");
     }
@@ -136,6 +137,13 @@ static tk_type_expr type_to_texpr(tk_type t) {
             return (tk_type_expr){ .tag = TK_TEXPR_NAMED, .as.named = { .path = { .segments = segs, .len = ns }, .args = args, .args_len = na } };
         }
         case TK_TYPE_UPTR:     return mono_named_texpr("uptr");
+        case TK_TYPE_REF: {   // (MEM-1b) ref<T> → NamedType{ ref, [inner] }
+            tk_segment *segs = NULL; size_t ns = 0;
+            tk_segs_push(&segs, &ns, (tk_segment){ .name = mono_cstr("ref") });
+            tk_type_expr *args = NULL; size_t na = 0;
+            tk_types_push(&args, &na, type_to_texpr(*t.as.ref.inner));
+            return (tk_type_expr){ .tag = TK_TEXPR_NAMED, .as.named = { .path = { .segments = segs, .len = ns }, .args = args, .args_len = na } };
+        }
         case TK_TYPE_VOID:     return mono_named_texpr("void");
         case TK_TYPE_VARIANT:  return mono_named_texpr("variant");
         case TK_TYPE_FUNC:     return mono_named_texpr("func");
