@@ -213,25 +213,54 @@ fn type_call(c: parser::Call, env: Env, table: TypeTable) -> TExpr | error {
     match ft {
         Func as f => {
             if c.args.len != f.params.len { return error { message = "wrong number of arguments" } }
+            // Type every argument first (void rejected); strict-check / generic-infer below.
+            mut targs: []TExpr = teko::list::empty()
+            mut ti = 0
+            loop {
+                if ti >= c.args.len { break }
+                let a = match type_expr(c.args[ti], env, table) { TExpr as te => te; error as e => return e }
+                if type_is_void(a.type) { return error { message = "a `void` expression cannot be passed as an argument (M.1)" } }
+                targs = teko::list::push(targs, a)
+                ti++
+            }
+            // (S4) GENERIC callee — the sig carries type-param Named's: INFER the type-params from the
+            // arg types and substitute into the return type for the call's result. The monomorph pass
+            // (post-typer) stamps the concrete instance and rewrites the callee. Type-params that appear
+            // only in the return type cannot be inferred from args (M.2 no-guessing) → honest error.
+            let all_tps = collect_sig_type_params(ft, table, teko::list::empty())
+            if all_tps.len > 0 {
+                mut param_tps: []str = teko::list::empty()
+                mut pp = 0
+                loop { if pp >= f.params.len { break }; param_tps = collect_sig_type_params(f.params[pp], table, param_tps); pp++ }
+                mut rk = 0
+                loop {
+                    if rk >= all_tps.len { break }
+                    if !is_type_param(all_tps[rk], param_tps) { return error { message = $"cannot infer type parameter {all_tps[rk]} — it appears only in the return type; annotate the call" } }
+                    rk++
+                }
+                mut s = Subst { params = param_tps; names = teko::list::empty(); types = teko::list::empty() }
+                mut gi = 0
+                loop {
+                    if gi >= f.params.len { break }
+                    s = match unify(f.params[gi], targs[gi].type, s, table) { Subst as x => x; error as e => return e }
+                    gi++
+                }
+                return TExpr { kind = TCall { callee = c.callee; args = targs; call_ns = resolved_ns }; type = subst_type(f.ret, s); line = 0; col = 0 }
+            }
+            // NON-generic: each argument must WIDEN into the parameter's type (B.14 case→variant, T→T?)
+            // OR be a fitting literal that adopts it (C6) — same rule as binding/return/assign.
             mut args: []TExpr = teko::list::empty()
             mut i = 0
             loop {
-                if i >= c.args.len { break }
-                mut a = match type_expr(c.args[i], env, table) { TExpr as te => te; error as e => return e }
-                if type_is_void(a.type) { return error { message = "a `void` expression cannot be passed as an argument (M.1)" } }
-                // The argument must WIDEN into the parameter's type (B.14 case→variant, T→T?) OR be a
-                // fitting literal that adopts it (C6) — same rule as binding/return/assign.
+                if i >= targs.len { break }
+                mut a = targs[i]
                 if !assignable_to(a.type, f.params[i], table) {
-                    // (C1.8/E2) attach expected=type_render(f.params[i]), actual=type_render(a.type) — THE
-                    // user's reported mismatch. Mirrors expr.c type_call's tk_error_types wrap.
+                    // (C1.8/E2) attach expected/actual — THE user's reported mismatch (mirrors expr.c).
                     if !literal_adopts(a, f.params[i]) { return teko::error::err_typed(error { message = "argument type mismatch" }, type_render(f.params[i]), type_render(a.type)) }
-                    // a fitting numeric literal ADOPTS the param type (leaf retyped) — C6
-                    a = TExpr { kind = a.kind; type = f.params[i]; line = a.line; col = a.col }
+                    a = TExpr { kind = a.kind; type = f.params[i]; line = a.line; col = a.col }   // C6 literal adopts the param type
                 } else {
-                    // A non-variant widen (T→T?, empty()→[]T, exact) ADOPTS the param type as before, so a
-                    // sentinel empty()/null is concretized to the param's slice/optional slot at codegen.
-                    // A case→VARIANT widen KEEPS its case type so codegen's emit_call wraps it into the
-                    // parameter's variant rep (emit_as) — mirrors type_struct_lit keeping the field's case type.
+                    // A non-variant widen (T→T?, empty()→[]T, exact) ADOPTS the param type; a case→VARIANT
+                    // widen KEEPS its case type so emit_call wraps it into the variant rep (emit_as).
                     let pt_is_variant = match expand_variant(f.params[i], table) { Variant => true; _ => false }
                     if !pt_is_variant {
                         a = TExpr { kind = a.kind; type = f.params[i]; line = a.line; col = a.col }

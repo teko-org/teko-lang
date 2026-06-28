@@ -261,28 +261,48 @@ static tk_texpr_result type_call(tk_call c, tk_env env, tk_type_table table) {
     tk_type ft = ftr.as.value;
     if (ft.tag != TK_TYPE_FUNC) return xerr("not a function");
     if (c.nargs != ft.as.func.nparams) return xerr("wrong number of arguments");
+    // Type every argument first (void rejected); strict-check / generic-infer below.
     tk_texpr_list args = tk_texpr_list_empty();
     for (size_t i = 0; i < c.nargs; i += 1) {
         tk_texpr_result a = tk_typer_expr(c.args[i], env, table); if (!a.ok) return a;
         if (tk_type_is_void(&a.as.value.type)) return xerr("a `void` expression cannot be passed as an argument (M.1)");
-        tk_type pt = ft.as.func.params[i];
-        // The argument must WIDEN into the parameter's type (B.14 case→variant, T→T?) OR be a fitting
-        // literal that adopts it (C6) — same rule as binding/return/assign (single source of truth).
-        if (!tk_widens_into(a.as.value.type, pt, table)) {
-            // (C1.8) attach expected (the parameter type) vs actual (the argument's type) so the
-            // driver renders "expected <pt>, found <arg>". The C1-POS wrapper adds the position.
-            if (!tk_literal_adopts(a.as.value, pt))
-                return xferr(tk_error_types(tk_error_make("argument type mismatch"),
-                                            tk_type_render(pt), tk_type_render(a.as.value.type)));
-            a.as.value.type = pt;   // a fitting numeric literal ADOPTS the param type (leaf retyped) — C6
-        } else if (tk_expand_variant(pt, table).tag != TK_TYPE_VARIANT) {
-            // A non-variant widen (T→T?, empty()→[]T, exact) ADOPTS the param type as before, so a
-            // sentinel empty()/null is concretized to the param's slice/optional slot at codegen.
-            a.as.value.type = pt;
-        }
-        // Else: a case→VARIANT widen KEEPS its case type so codegen's emit_call wraps it into the
-        // parameter's variant rep (emit_as) — mirrors type_struct_lit keeping the field's case type.
         args = tk_texpr_list_push(args, a.as.value);
+    }
+    // (S4) GENERIC callee — the sig carries type-param Named's: INFER them from the arg types and
+    // substitute into the return type for the call's result. The monomorph pass (post-typer) stamps
+    // the concrete instance + rewrites the callee. A type-param that appears only in the return type
+    // cannot be inferred from args (M.2 no-guessing) → honest error.
+    tk_str *all_tps = NULL; size_t n_all = 0;
+    tk_collect_sig_type_params(ft, table, &all_tps, &n_all);
+    if (n_all > 0) {
+        tk_str *param_tps = NULL; size_t n_pt = 0;
+        for (size_t i = 0; i < ft.as.func.nparams; i += 1) tk_collect_sig_type_params(ft.as.func.params[i], table, &param_tps, &n_pt);
+        for (size_t i = 0; i < n_all; i += 1)
+            if (!tk_is_type_param(all_tps[i], param_tps, n_pt))
+                return xferr(tk_error_named("cannot infer type parameter (it appears only in the return type; annotate the call)", all_tps[i]));
+        tk_subst s = { .params = param_tps, .n_params = n_pt, .names = NULL, .types = NULL, .n_bind = 0 };
+        for (size_t i = 0; i < ft.as.func.nparams; i += 1) {
+            tk_subst_result u = tk_unify(ft.as.func.params[i], args.ptr[i].type, s, table);
+            if (!u.ok) return xferr(u.as.error);
+            s = u.as.value;
+        }
+        tk_type result = tk_subst_type(*ft.as.func.ret, s);
+        return xok((tk_texpr){ .tag = TK_TEXPR_CALL, .type = result, .as.call = { c.callee, args.ptr, args.len, call_ns } });
+    }
+    // NON-generic: each argument must WIDEN into the parameter's type (B.14 case→variant, T→T?) OR be
+    // a fitting literal that adopts it (C6) — same rule as binding/return/assign (single source of truth).
+    for (size_t i = 0; i < args.len; i += 1) {
+        tk_type pt = ft.as.func.params[i];
+        if (!tk_widens_into(args.ptr[i].type, pt, table)) {
+            if (!tk_literal_adopts(args.ptr[i], pt))
+                return xferr(tk_error_types(tk_error_make("argument type mismatch"),
+                                            tk_type_render(pt), tk_type_render(args.ptr[i].type)));
+            args.ptr[i].type = pt;   // a fitting numeric literal ADOPTS the param type (leaf retyped) — C6
+        } else if (tk_expand_variant(pt, table).tag != TK_TYPE_VARIANT) {
+            // A non-variant widen (T→T?, empty()→[]T, exact) ADOPTS the param type; a case→VARIANT
+            // widen KEEPS its case type so emit_call wraps it into the variant rep (emit_as).
+            args.ptr[i].type = pt;
+        }
     }
     return xok((tk_texpr){ .tag = TK_TEXPR_CALL, .type = *ft.as.func.ret,
                            .as.call = { c.callee, args.ptr, args.len, call_ns } });

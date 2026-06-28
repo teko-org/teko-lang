@@ -170,7 +170,7 @@ tk_type_table tk_type_param_table(tk_str *type_params, size_t n_type_params, tk_
 
 // ── (S4) generics inference: subst + unify (resolve.tks twins) ───────────────────────────────────
 static tk_type *tk_clone_type(tk_type t) { tk_type *p = tk_alloc(sizeof *p); *p = t; return p; }
-static bool is_type_param_c(tk_str name, tk_str *params, size_t np) {
+bool tk_is_type_param(tk_str name, tk_str *params, size_t np) {
     for (size_t i = 0; i < np; i += 1) if (name_eq(params[i], name)) return true;
     return false;
 }
@@ -207,7 +207,7 @@ tk_subst_result tk_unify(tk_type pattern, tk_type arg, tk_subst s, tk_type_table
     (void)table;
     switch (pattern.tag) {
         case TK_TYPE_NAMED: {
-            if (!is_type_param_c(pattern.as.named.name, s.params, s.n_params)) return (tk_subst_result){ .ok = true, .as.value = s };
+            if (!tk_is_type_param(pattern.as.named.name, s.params, s.n_params)) return (tk_subst_result){ .ok = true, .as.value = s };
             if (type_has_void_sentinel_c(arg))
                 return (tk_subst_result){ .ok = false, .as.error = tk_error_named("cannot infer type parameter from an untyped empty slice / null — annotate the argument", pattern.as.named.name) };
             tk_type *ex = subst_find_c(s, pattern.as.named.name);
@@ -237,7 +237,7 @@ void tk_collect_sig_type_params(tk_type t, tk_type_table table, tk_str **names, 
         case TK_TYPE_NAMED: {
             tk_decl_result d = tk_type_table_find(table, t.as.named.name);
             if (d.ok) return;                                          // a user type
-            if (is_type_param_c(t.as.named.name, *names, *n)) return;  // dedup
+            if (tk_is_type_param(t.as.named.name, *names, *n)) return;  // dedup
             *names = tk_realloc0(*names, (*n + 1) * sizeof **names);
             (*names)[*n] = t.as.named.name; *n += 1;
             return;

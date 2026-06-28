@@ -30,6 +30,7 @@ TK_RESULT(tk_subst, tk_subst_result);
 tk_type tk_subst_type(tk_type t, tk_subst s);                                       // substitute bound type-params
 tk_subst_result tk_unify(tk_type pattern, tk_type arg, tk_subst s, tk_type_table table);  // bind type-params from args
 void tk_collect_sig_type_params(tk_type t, tk_type_table table, tk_str **names, size_t *n);  // type-param names in a sig
+bool tk_is_type_param(tk_str name, tk_str *params, size_t np);                               // membership in a name list
 tk_type_result resolve_named(tk_path path, tk_type_table table);   // shared with match.c (C7)
 // B.14 — a NAMED type that refers to a `variant` decl → its expanded TK_TYPE_VARIANT (members
 // stay NAMED, so it terminates); anything else is returned unchanged. Lets assignability and
