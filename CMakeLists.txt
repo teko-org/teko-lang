@@ -74,6 +74,7 @@ set(TEKO_CHECKER_SOURCES
     src/checker/typer.c
     src/checker/check_modules.c
     src/checker/initanalysis.c
+    src/checker/monomorph.c
     src/checker/revalidate.c)
 
 set(TEKO_EMIT_SOURCES

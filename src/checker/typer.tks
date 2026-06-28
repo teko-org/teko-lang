@@ -241,7 +241,7 @@ fn type_call(c: parser::Call, env: Env, table: TypeTable) -> TExpr | error {
                 mut s = Subst { params = param_tps; names = teko::list::empty(); types = teko::list::empty() }
                 mut gi = 0
                 loop {
-                    if gi >= f.params.len { break }
+                    if gi >= targs.len { break }   // targs.len == f.params.len (arity checked above); bound by the typed-arg list
                     s = match unify(f.params[gi], targs[gi].type, s, table) { Subst as x => x; error as e => return e }
                     gi++
                 }
@@ -1594,7 +1594,8 @@ pub fn type_program_with_deps(program: parser::Program, dep_prog: TProgram) -> T
     }
     let tp = TProgram { items = all_items }
     match analyze_program(tp) { null => {}; error as e => return e }
-    tp
+    // (S4b) MONOMORPHIZE the full (dep + project) tree — see type_program. No-op when no generics.
+    match monomorphize(tp, c.types) { TProgram as mp => mp; error as e => return e }
 }
 
 // THE TYPED ENTRY POINT: pass 1 (collect top-level names) + pass 2 (type each item).
@@ -1654,5 +1655,9 @@ pub fn type_program(program: parser::Program) -> TProgram | error {
     // Phase 5 — init analysis: unused-local ERROR + unused-private-fn WARNING (initanalysis.tks).
     // Runs last, over the fully typed program; prints warnings, returns the first hard error.
     match analyze_program(tp) { null => {}; error as e => return e }
-    tp
+    // (S4b) MONOMORPHIZE — stamp concrete copies of generic fns + rewrite generic calls, so
+    // codegen/VM/tests receive a tree with only concrete functions. No-op (byte-identical) when
+    // the program has no generic function. Runs AFTER analyze so the original generic fn + its
+    // call are seen by init analysis (no false unused-private-fn warning).
+    match monomorphize(tp, c.types) { TProgram as mp => mp; error as e => return e }
 }

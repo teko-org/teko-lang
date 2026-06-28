@@ -187,8 +187,12 @@ static bool type_has_void_sentinel_c(tk_type t) {
 tk_type tk_subst_type(tk_type t, tk_subst s) {
     switch (t.tag) {
         case TK_TYPE_NAMED: { tk_type *b = subst_find_c(s, t.as.named.name); return b ? *b : t; }
-        case TK_TYPE_SLICE: { tk_type e = tk_subst_type(*t.as.slice.element, s); return (tk_type){ .tag = TK_TYPE_SLICE, .as.slice = { tk_clone_type(e) } }; }
-        case TK_TYPE_OPTIONAL: { tk_type e = tk_subst_type(*t.as.optional.inner, s); return (tk_type){ .tag = TK_TYPE_OPTIONAL, .as.optional = { tk_clone_type(e) } }; }
+        // A SENTINEL slice/optional (the untyped `empty()` / bare `null`) carries a NULL element/
+        // inner pointer (the C twin of the Teko `Void` marker — type.tks). It substitutes to ITSELF
+        // (Void → Void on the Teko side); return it unchanged rather than dereferencing NULL. This
+        // matters now that monomorph.c walks EVERY node's type, sentinels included (S4b).
+        case TK_TYPE_SLICE: { if (!t.as.slice.element) return t; tk_type e = tk_subst_type(*t.as.slice.element, s); return (tk_type){ .tag = TK_TYPE_SLICE, .as.slice = { tk_clone_type(e) } }; }
+        case TK_TYPE_OPTIONAL: { if (!t.as.optional.inner) return t; tk_type e = tk_subst_type(*t.as.optional.inner, s); return (tk_type){ .tag = TK_TYPE_OPTIONAL, .as.optional = { tk_clone_type(e) } }; }
         case TK_TYPE_VARIANT: {
             size_t n = t.as.variant.len; tk_type *ms = tk_alloc((n ? n : 1) * sizeof *ms);
             for (size_t i = 0; i < n; i += 1) ms[i] = tk_subst_type(t.as.variant.members[i], s);
@@ -218,7 +222,11 @@ tk_subst_result tk_unify(tk_type pattern, tk_type arg, tk_subst s, tk_type_table
             size_t n = s.n_bind;
             tk_str  *nn = tk_alloc((n + 1) * sizeof *nn);
             tk_type *nt = tk_alloc((n + 1) * sizeof *nt);
-            for (size_t i = 0; i < n; i += 1) { nn[i] = s.names[i]; nt[i] = s.types[i]; }
+            // copy the existing bindings, then append. The list push on the .tks side handles this;
+            // here the explicit guard tells the analyzer that n>0 implies the arrays exist (a Subst
+            // with n_bind>0 always carries allocated names/types — empty() is the only NULL case).
+            if (s.names != NULL && s.types != NULL)
+                for (size_t i = 0; i < n; i += 1) { nn[i] = s.names[i]; nt[i] = s.types[i]; }
             nn[n] = pattern.as.named.name; nt[n] = arg;
             return (tk_subst_result){ .ok = true, .as.value = { .params = s.params, .n_params = s.n_params, .names = nn, .types = nt, .n_bind = n + 1 } };
         }

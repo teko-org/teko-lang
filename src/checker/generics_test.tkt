@@ -1,0 +1,58 @@
+// src/checker/generics_test.tkt — (S4b) end-to-end generics coverage. Generic functions whose
+// bodies span varied expression / statement kinds, called at several distinct instantiations, so
+// the monomorph pass (typer → monomorphize) is exercised broadly: it stamps idg__g__i64 /
+// idg__g__str / pickg__g__i64 / wrapg__g__i64 / firstg__g__i64 / … , rewrites the calls, and
+// drives the Phase-2 fixpoint (a generic fn that calls another generic fn → transitive insts).
+// Runs on the VM in BOTH engines (the build/test gate), so the pass must be wired before
+// run_tests — proving a generic program type-checks, STAMPS, and EXECUTES correctly.
+
+// A box struct so a generic body can exercise struct-init + field-access node rewrites.
+type GBox = struct { v: i64 }
+
+// the identity generic — one opaque type-param in param + return position.
+fn idg<T>(x: T) -> T { return x }
+
+// a generic body with a TIfExpr / TBinary / TCompare (the value the param flows into is concrete
+// after stamping; the param itself is opaque, so we branch on a separate concrete operand).
+fn pickg<T>(x: T, y: T, useFirst: bool) -> T {
+    let r = if useFirst { x } else { y }
+    return r
+}
+
+// a generic that CALLS another generic (idg) — drives the Phase-2 fixpoint (transitive insts).
+fn wrapg<T>(x: T) -> T {
+    let inner = idg(x)
+    return inner
+}
+
+// a generic over a SLICE type-param shape: `firstg([]T) -> T` (exercises the Slice unify +
+// the slice_<elem> mangle branch). Indexing a slice is an honest stop in codegen but the VM
+// constructs/reads it; keep this VM-only by not building it into the binary example.
+fn firstg<T>(xs: []T) -> T { return xs[0] }
+
+#test fn generic_id_i64_runs() {
+    teko::assert::is_true(idg(7) == 7)
+}
+
+#test fn generic_id_str_runs() {
+    teko::assert::is_true(teko::runtime::str_eq(idg("hi"), "hi"))
+}
+
+#test fn generic_id_box_runs() {
+    let b = idg(GBox { v = 5 })
+    teko::assert::is_true(b.v == 5)
+}
+
+#test fn generic_pick_runs() {
+    teko::assert::is_true(pickg(3, 9, true) == 3)
+    teko::assert::is_true(pickg(3, 9, false) == 9)
+}
+
+#test fn generic_wrap_runs() {
+    teko::assert::is_true(wrapg(11) == 11)
+}
+
+#test fn generic_first_runs() {
+    let xs = teko::list::push(teko::list::push(teko::list::empty(), 4), 8)
+    teko::assert::is_true(firstg(xs) == 4)
+}

@@ -1,0 +1,523 @@
+// src/checker/monomorph.tks  (namespace 'teko::checker')
+//
+// (S4b crumb 2c) THE MONOMORPHIZATION PASS — the final piece that makes a generic
+// function actually compile + run. The parser, type-param resolution and call-site
+// inference are already done (the typer infers T and substitutes it into the call's
+// RESULT type). But a generic `fn id<T>(x: T) -> T { return x }` still reaches codegen
+// as the un-stamped `tk_t_T id(tk_t_T x)`, which `cc` rejects. This pass:
+//   1. STAMPS a concrete copy of each generic fn per distinct instantiation, and
+//   2. REWRITES every generic call to the stamped instance's mangled name.
+// It runs LAST in the typer (over the fully-typed TProgram), so codegen, the VM and the
+// test runner all receive a tree that contains ONLY concrete, monomorphic functions.
+//
+// NO-OP GUARD (safety): a program with no generic function passes through BYTE-IDENTICAL
+// — the non-generic corpus must not perturb. The total rewrite walk only runs when at
+// least one TFunction carries type_params.
+//
+// (C twin: monomorph.c / monomorph.h — tk_monomorphize.)
+
+use teko::parser
+
+// A discovered instantiation: the generic fn's bare name, the mangled instance name, and
+// the Subst (type-param → concrete) that stamps it. The Subst's `names`/`types` are the
+// inferred bindings; `params` is the generic's type-param universe.
+type MonoInst = struct { fn_name: str; mangled: str; s: Subst }
+
+// rewrite-walk carriers: a rewritten node PLUS the instantiations it discovered. Teko has
+// no out-params, so the walk RETURNS both (the C twin threads an out-list pointer).
+type WExpr  = struct { expr: TExpr;          insts: []MonoInst }
+type WStmt  = struct { stmt: TStatement;     insts: []MonoInst }
+type WBlock = struct { stmts: []TStatement;  insts: []MonoInst }
+type WArm   = struct { arm: TArm;            insts: []MonoInst }
+
+// ── name mangling ──────────────────────────────────────────────────────────────────────
+// A type → its symbol fragment for the mangled instance name. Prim → its surface spelling
+// (i64/u8/f64/…), Str → "str", Byte → "byte", Named → the name, Slice → "slice_"+elem,
+// Optional → "opt_"+inner. Other shapes (Variant/Func/Error/Void/Ptr/Uptr) get a stable
+// fragment so a name is always produced (they cannot be a phase-1 type-arg, but we never
+// crash). (C: mono_type_mangle.)
+fn mono_type_mangle(t: Type) -> str {
+    match t {
+        Prim as p     => prim_name(p.kind)
+        Str           => "str"
+        Byte          => "byte"
+        Named as n    => n.name
+        Slice as sl   => { let e = mono_type_mangle(sl.element); teko::str::concat("slice_", e) }
+        Optional as o => { let e = mono_type_mangle(o.inner); teko::str::concat("opt_", e) }
+        Error         => "error"
+        Void          => "void"
+        Ptr           => "ptr"
+        Uptr          => "uptr"
+        Variant       => "variant"
+        Func          => "func"
+    }
+}
+
+// the mangled instance name: `<bare>__g__<arg0>[__<arg1>...]` over the generic's type-params
+// IN ORDER, each substituted to its concrete type. The `__g__` infix marks a stamped symbol
+// (a source identifier cannot contain it — `g` is fine, but `__g__` between two type names is
+// the synthetic marker). (C: mono_mangle_name.)
+fn mono_mangle_name(bare: str, type_params: []str, s: Subst) -> str {
+    mut out = teko::str::concat(bare, "__g__")
+    mut i = 0
+    loop {
+        if i >= type_params.len { break }
+        if i > 0 { out = teko::str::concat(out, "__") }
+        let ct = subst_type(Named { name = type_params[i] }, s)
+        out = teko::str::concat(out, mono_type_mangle(ct))
+        i++
+    }
+    out
+}
+
+// has this instance (by mangled name) already been stamped / queued? (C: mono_seen.)
+fn mono_seen(insts: []MonoInst, mangled: str) -> bool {
+    mut i = 0
+    loop {
+        if i >= insts.len { break }
+        if teko::runtime::str_eq(insts[i].mangled, mangled) { return true }
+        i++
+    }
+    false
+}
+
+// concat two MonoInst lists. (C: mono_inst_concat.)
+fn mono_inst_concat(a: []MonoInst, b: []MonoInst) -> []MonoInst {
+    mut out = a
+    mut i = 0
+    loop {
+        if i >= b.len { break }
+        out = teko::list::push(out, b[i])
+        i++
+    }
+    out
+}
+
+// ── semantic Type → syntactic TypeExpr ───────────────────────────────────────────────────
+// A stamped fn's params are SYNTACTIC (parser::Param.type_ann, resolved by codegen at emit),
+// so substituting the param `T` means rewriting the syntactic annotation to the concrete
+// type's TypeExpr. Prim → NamedType{[prim_name]}, Named → NamedType{[name]}, Str → NamedType,
+// Byte → NamedType, Slice → SliceType, Optional → OptionalType. Variant/Func are not
+// expressible as a single TypeExpr in phase-1 (a generic param can only bind to such via
+// a future S6) — they fall back to a Named placeholder so a TypeExpr is always produced.
+// (C: type_to_texpr.)
+fn type_to_texpr(t: Type) -> parser::TypeExpr {
+    match t {
+        Prim as p     => mono_named_texpr(prim_name(p.kind))
+        Str           => mono_named_texpr("str")
+        Byte          => mono_named_texpr("byte")
+        Error         => mono_named_texpr("error")
+        Named as n    => mono_named_texpr(n.name)
+        Slice as sl   => parser::SliceType { element = type_to_texpr(sl.element) }
+        Optional as o => parser::OptionalType { inner = type_to_texpr(o.inner) }
+        Ptr           => mono_named_texpr("ptr")
+        Uptr          => mono_named_texpr("uptr")
+        Void          => mono_named_texpr("void")
+        Variant       => mono_named_texpr("variant")
+        Func          => mono_named_texpr("func")
+    }
+}
+fn mono_named_texpr(name: str) -> parser::TypeExpr {
+    let seg = parser::Segment { name = name }
+    parser::NamedType { path = parser::Path { segments = teko::list::push(teko::list::empty(), seg) }; args = teko::list::empty() }
+}
+
+// substitute the type-params in a SYNTACTIC TypeExpr through a Subst: a NamedType whose last
+// segment is a bound type-param → that type's TypeExpr; otherwise recurse structurally. This
+// rewrites a stamped fn's param annotations (the `T` → the concrete spelling). (C: subst_typeexpr.)
+fn subst_typeexpr(te: parser::TypeExpr, s: Subst) -> parser::TypeExpr {
+    match te {
+        parser::NamedType as nt => {
+            if nt.path.segments.len == 1 {
+                let nm = nt.path.segments[0].name
+                if is_type_param(nm, s.params) {
+                    match subst_find_inst(s, nm) {
+                        Type as ct => return type_to_texpr(ct)
+                        null       => {}
+                    }
+                }
+            }
+            te
+        }
+        parser::SliceType as st => parser::SliceType { element = subst_typeexpr(st.element, s) }
+        parser::OptionalType as ot => parser::OptionalType { inner = subst_typeexpr(ot.inner, s) }
+        parser::UnionType as ut => {
+            mut ms: []parser::TypeExpr = teko::list::empty()
+            mut i = 0
+            loop { if i >= ut.members.len { break }; ms = teko::list::push(ms, subst_typeexpr(ut.members[i], s)); i++ }
+            parser::UnionType { members = ms }
+        }
+    }
+}
+
+// find a type-param's bound concrete type in a Subst (the Subst's parallel names/types arrays).
+// (resolve.tks keeps subst_find private; monomorph needs its own copy. C: subst_find_inst.)
+fn subst_find_inst(s: Subst, name: str) -> Type? {
+    mut i = 0
+    loop {
+        if i >= s.names.len { break }
+        if teko::runtime::str_eq(s.names[i], name) { return s.types[i] }
+        i++
+    }
+    null
+}
+
+// ── the lookup of a generic TFunction by bare name ──────────────────────────────────────
+// scan the program items for a generic TFunction (type_params.len > 0) whose name matches.
+// (C: find_generic_fn.)
+fn find_generic_fn(items: []TItem, name: str) -> TFunction? {
+    mut i = 0
+    loop {
+        if i >= items.len { break }
+        match items[i] {
+            TFunction as f => {
+                if f.type_params.len > 0 {
+                    if teko::runtime::str_eq(f.name, name) { return f }
+                }
+            }
+            _ => {}
+        }
+        i++
+    }
+    null
+}
+
+// ── the total rewrite walk ───────────────────────────────────────────────────────────────
+// For EVERY TExpr: set `.type = subst_type(e.type, s)` and recurse into ALL children. At a
+// TCall whose last-path-segment names a generic TFunction in `items`, INFER the Subst from the
+// (already-rewritten, concrete) arg types, mangle the instance name, rewrite the callee's LAST
+// segment to the mangled name (keep call_ns), and record the MonoInst. A non-generic call keeps
+// its callee (with rewritten args). The walk is TOTAL over every TExprKind / TStatement case —
+// a non-total walk would silently drop body rewrites and break the whole corpus.
+// (C: mono_texpr.)
+fn mono_texpr(e: TExpr, s: Subst, items: []TItem, table: TypeTable) -> WExpr | error {
+    let nt = subst_type(e.type, s)
+    match e.kind {
+        TNumber  => WExpr { expr = TExpr { kind = e.kind; type = nt; line = e.line; col = e.col }; insts = teko::list::empty() }
+        TVar     => WExpr { expr = TExpr { kind = e.kind; type = nt; line = e.line; col = e.col }; insts = teko::list::empty() }
+        TStrLit  => WExpr { expr = TExpr { kind = e.kind; type = nt; line = e.line; col = e.col }; insts = teko::list::empty() }
+        TByteLit => WExpr { expr = TExpr { kind = e.kind; type = nt; line = e.line; col = e.col }; insts = teko::list::empty() }
+        TBoolLit => WExpr { expr = TExpr { kind = e.kind; type = nt; line = e.line; col = e.col }; insts = teko::list::empty() }
+        TNullLit => WExpr { expr = TExpr { kind = e.kind; type = nt; line = e.line; col = e.col }; insts = teko::list::empty() }
+        TPathExpr => WExpr { expr = TExpr { kind = e.kind; type = nt; line = e.line; col = e.col }; insts = teko::list::empty() }
+        TBinary as b => {
+            let wl = match mono_texpr(b.left, s, items, table)  { WExpr as w => w; error as er => return er }
+            let wr = match mono_texpr(b.right, s, items, table) { WExpr as w => w; error as er => return er }
+            WExpr { expr = TExpr { kind = TBinary { op = b.op; left = wl.expr; right = wr.expr }; type = nt; line = e.line; col = e.col }; insts = mono_inst_concat(wl.insts, wr.insts) }
+        }
+        TUnary as u => {
+            let wo = match mono_texpr(u.operand, s, items, table) { WExpr as w => w; error as er => return er }
+            WExpr { expr = TExpr { kind = TUnary { op = u.op; operand = wo.expr }; type = nt; line = e.line; col = e.col }; insts = wo.insts }
+        }
+        TCompare as c => {
+            let wf = match mono_texpr(c.first, s, items, table) { WExpr as w => w; error as er => return er }
+            mut acc = wf.insts
+            mut terms: []TCmpTerm = teko::list::empty()
+            mut i = 0
+            loop {
+                if i >= c.rest.len { break }
+                let wt = match mono_texpr(c.rest[i].operand, s, items, table) { WExpr as w => w; error as er => return er }
+                terms = teko::list::push(terms, TCmpTerm { op = c.rest[i].op; operand = wt.expr })
+                acc = mono_inst_concat(acc, wt.insts)
+                i++
+            }
+            WExpr { expr = TExpr { kind = TCompare { first = wf.expr; rest = terms }; type = nt; line = e.line; col = e.col }; insts = acc }
+        }
+        TCall as cl => {
+            // rewrite the args FIRST (so each arg type is concrete before we infer the callee).
+            mut acc: []MonoInst = teko::list::empty()
+            mut args: []TExpr = teko::list::empty()
+            mut i = 0
+            loop {
+                if i >= cl.args.len { break }
+                let wa = match mono_texpr(cl.args[i], s, items, table) { WExpr as w => w; error as er => return er }
+                args = teko::list::push(args, wa.expr)
+                acc = mono_inst_concat(acc, wa.insts)
+                i++
+            }
+            let bare = if cl.callee.segments.len == 0 { "" } else { cl.callee.segments[cl.callee.segments.len - 1].name }
+            match find_generic_fn(items, bare) {
+                TFunction as gf => {
+                    // INFER the Subst from the rewritten arg types against the generic's param patterns.
+                    let ptable = type_param_table(gf.type_params, "", table)
+                    mut sub = Subst { params = gf.type_params; names = teko::list::empty(); types = teko::list::empty() }
+                    mut gi = 0
+                    loop {
+                        if gi >= args.len { break }   // args.len == gf.params.len (arity checked at typing); bound by the rewritten-arg list
+                        let pat = match resolve_type(gf.params[gi].type_ann, ptable) { Type as t => t; error as er => return er }
+                        sub = match unify(pat, args[gi].type, sub, table) { Subst as x => x; error as er => return er }
+                        gi++
+                    }
+                    let mangled = mono_mangle_name(bare, gf.type_params, sub)
+                    // rewrite the callee's LAST segment to the mangled name (keep the leading segments + call_ns).
+                    let newcallee = rewrite_last_segment(cl.callee, mangled)
+                    let rec = MonoInst { fn_name = bare; mangled = mangled; s = sub }
+                    WExpr { expr = TExpr { kind = TCall { callee = newcallee; args = args; call_ns = cl.call_ns }; type = nt; line = e.line; col = e.col }; insts = teko::list::push(acc, rec) }
+                }
+                null => WExpr { expr = TExpr { kind = TCall { callee = cl.callee; args = args; call_ns = cl.call_ns }; type = nt; line = e.line; col = e.col }; insts = acc }
+            }
+        }
+        TIfExpr as f => {
+            let wc = match mono_texpr(f.cond, s, items, table) { WExpr as w => w; error as er => return er }
+            let wtb = match mono_block(f.then_blk, s, items, table) { WBlock as w => w; error as er => return er }
+            mut acc = mono_inst_concat(wc.insts, wtb.insts)
+            mut eb: []TStatement = teko::list::empty()
+            if f.has_else {
+                let web = match mono_block(f.else_blk, s, items, table) { WBlock as w => w; error as er => return er }
+                eb = web.stmts
+                acc = mono_inst_concat(acc, web.insts)
+            }
+            WExpr { expr = TExpr { kind = TIfExpr { cond = wc.expr; then_blk = wtb.stmts; has_else = f.has_else; else_blk = eb }; type = nt; line = e.line; col = e.col }; insts = acc }
+        }
+        TMatchExpr as m => {
+            let ws = match mono_texpr(m.subject, s, items, table) { WExpr as w => w; error as er => return er }
+            mut acc = ws.insts
+            mut arms: []TArm = teko::list::empty()
+            mut i = 0
+            loop {
+                if i >= m.arms.len { break }
+                let wa = match mono_arm(m.arms[i], s, items, table) { WArm as w => w; error as er => return er }
+                arms = teko::list::push(arms, wa.arm)
+                acc = mono_inst_concat(acc, wa.insts)
+                i++
+            }
+            WExpr { expr = TExpr { kind = TMatchExpr { subject = ws.expr; arms = arms }; type = nt; line = e.line; col = e.col }; insts = acc }
+        }
+        TCast as c => {
+            let wi = match mono_texpr(c.expr, s, items, table) { WExpr as w => w; error as er => return er }
+            WExpr { expr = TExpr { kind = TCast { expr = wi.expr }; type = nt; line = e.line; col = e.col }; insts = wi.insts }
+        }
+        TFieldAccess as fa => {
+            let wr = match mono_texpr(fa.receiver, s, items, table) { WExpr as w => w; error as er => return er }
+            WExpr { expr = TExpr { kind = TFieldAccess { receiver = wr.expr; field = fa.field }; type = nt; line = e.line; col = e.col }; insts = wr.insts }
+        }
+        TSafeFieldAccess as sfa => {
+            let wr = match mono_texpr(sfa.receiver, s, items, table) { WExpr as w => w; error as er => return er }
+            WExpr { expr = TExpr { kind = TSafeFieldAccess { receiver = wr.expr; field = sfa.field }; type = nt; line = e.line; col = e.col }; insts = wr.insts }
+        }
+        TCoalesce as co => {
+            let wl = match mono_texpr(co.left, s, items, table)  { WExpr as w => w; error as er => return er }
+            let wr = match mono_texpr(co.right, s, items, table) { WExpr as w => w; error as er => return er }
+            WExpr { expr = TExpr { kind = TCoalesce { left = wl.expr; right = wr.expr }; type = nt; line = e.line; col = e.col }; insts = mono_inst_concat(wl.insts, wr.insts) }
+        }
+        TStructInit as si => {
+            mut acc: []MonoInst = teko::list::empty()
+            mut vals: []TExpr = teko::list::empty()
+            mut i = 0
+            loop {
+                if i >= si.field_vals.len { break }
+                let wv = match mono_texpr(si.field_vals[i], s, items, table) { WExpr as w => w; error as er => return er }
+                vals = teko::list::push(vals, wv.expr)
+                acc = mono_inst_concat(acc, wv.insts)
+                i++
+            }
+            WExpr { expr = TExpr { kind = TStructInit { field_names = si.field_names; field_vals = vals }; type = nt; line = e.line; col = e.col }; insts = acc }
+        }
+        TIndex as ix => {
+            let wr = match mono_texpr(ix.receiver, s, items, table) { WExpr as w => w; error as er => return er }
+            let wi = match mono_texpr(ix.index, s, items, table)    { WExpr as w => w; error as er => return er }
+            WExpr { expr = TExpr { kind = TIndex { receiver = wr.expr; index = wi.expr }; type = nt; line = e.line; col = e.col }; insts = mono_inst_concat(wr.insts, wi.insts) }
+        }
+        TInterp as in => {
+            mut acc: []MonoInst = teko::list::empty()
+            mut holes: []TExpr = teko::list::empty()
+            mut i = 0
+            loop {
+                if i >= in.holes.len { break }
+                let wh = match mono_texpr(in.holes[i], s, items, table) { WExpr as w => w; error as er => return er }
+                holes = teko::list::push(holes, wh.expr)
+                acc = mono_inst_concat(acc, wh.insts)
+                i++
+            }
+            WExpr { expr = TExpr { kind = TInterp { pieces = in.pieces; holes = holes }; type = nt; line = e.line; col = e.col }; insts = acc }
+        }
+        TInExpr as n => {
+            let wl = match mono_texpr(n.lhs, s, items, table) { WExpr as w => w; error as er => return er }
+            mut acc = wl.insts
+            mut elems: []TExpr = teko::list::empty()
+            mut i = 0
+            loop {
+                if i >= n.elems.len { break }
+                let we = match mono_texpr(n.elems[i], s, items, table) { WExpr as w => w; error as er => return er }
+                elems = teko::list::push(elems, we.expr)
+                acc = mono_inst_concat(acc, we.insts)
+                i++
+            }
+            WExpr { expr = TExpr { kind = TInExpr { lhs = wl.expr; elems = elems }; type = nt; line = e.line; col = e.col }; insts = acc }
+        }
+        TArrayLit as a => {
+            mut acc: []MonoInst = teko::list::empty()
+            mut elems: []TArrayElem = teko::list::empty()
+            mut i = 0
+            loop {
+                if i >= a.elements.len { break }
+                let we = match mono_texpr(a.elements[i].expr, s, items, table) { WExpr as w => w; error as er => return er }
+                elems = teko::list::push(elems, TArrayElem { is_spread = a.elements[i].is_spread; expr = we.expr })
+                acc = mono_inst_concat(acc, we.insts)
+                i++
+            }
+            WExpr { expr = TExpr { kind = TArrayLit { elements = elems }; type = nt; line = e.line; col = e.col }; insts = acc }
+        }
+    }
+}
+
+// rewrite a path's last segment to `name`, keeping the leading segments. (C: rewrite_last_segment.)
+fn rewrite_last_segment(p: parser::Path, name: str) -> parser::Path {
+    mut segs: []parser::Segment = teko::list::empty()
+    mut i = 0
+    loop {
+        if i >= p.segments.len { break }
+        if i == p.segments.len - 1 { segs = teko::list::push(segs, parser::Segment { name = name }) }
+        else { segs = teko::list::push(segs, p.segments[i]) }
+        i++
+    }
+    parser::Path { segments = segs }
+}
+
+// rewrite a match ARM (guard + body). The pattern is syntactic (binds; not type-bearing). (C: mono_arm.)
+fn mono_arm(arm: TArm, s: Subst, items: []TItem, table: TypeTable) -> WArm | error {
+    mut acc: []MonoInst = teko::list::empty()
+    mut guard = arm.guard
+    if arm.has_when {
+        let wg = match mono_texpr(arm.guard, s, items, table) { WExpr as w => w; error as er => return er }
+        guard = wg.expr
+        acc = wg.insts
+    }
+    let wb = match mono_block(arm.body, s, items, table) { WBlock as w => w; error as er => return er }
+    acc = mono_inst_concat(acc, wb.insts)
+    WArm { arm = TArm { pattern = arm.pattern; has_when = arm.has_when; guard = guard; body = wb.stmts }; insts = acc }
+}
+
+// rewrite a TStatement. TOTAL over every case; TAssign/TBinding substitute their `bound` type. (C: mono_tstmt.)
+fn mono_tstmt(st: TStatement, s: Subst, items: []TItem, table: TypeTable) -> WStmt | error {
+    match st {
+        TBinding as b => {
+            let wv = match mono_texpr(b.value, s, items, table) { WExpr as w => w; error as er => return er }
+            WStmt { stmt = TBinding { kind = b.kind; target = b.target; bound = subst_type(b.bound, s); value = wv.expr }; insts = wv.insts }
+        }
+        TAssign as a => {
+            let wv = match mono_texpr(a.value, s, items, table) { WExpr as w => w; error as er => return er }
+            WStmt { stmt = TAssign { name = a.name; op = a.op; bound = subst_type(a.bound, s); value = wv.expr }; insts = wv.insts }
+        }
+        TReturn as r => {
+            if r.has_value {
+                let wv = match mono_texpr(r.value, s, items, table) { WExpr as w => w; error as er => return er }
+                WStmt { stmt = TReturn { has_value = true; value = wv.expr }; insts = wv.insts }
+            } else {
+                WStmt { stmt = st; insts = teko::list::empty() }
+            }
+        }
+        TLoopStmt as l => {
+            let wb = match mono_block(l.body, s, items, table) { WBlock as w => w; error as er => return er }
+            WStmt { stmt = TLoopStmt { label = l.label; body = wb.stmts }; insts = wb.insts }
+        }
+        TBreakStmt    => WStmt { stmt = st; insts = teko::list::empty() }
+        TContinueStmt => WStmt { stmt = st; insts = teko::list::empty() }
+        TExprStmt as es => {
+            let wv = match mono_texpr(es.expr, s, items, table) { WExpr as w => w; error as er => return er }
+            WStmt { stmt = TExprStmt { expr = wv.expr }; insts = wv.insts }
+        }
+        TDeferStmt as d => {
+            let wb = match mono_block(d.body, s, items, table) { WBlock as w => w; error as er => return er }
+            WStmt { stmt = TDeferStmt { body = wb.stmts }; insts = wb.insts }
+        }
+    }
+}
+
+// rewrite a block (a []TStatement). (C: mono_block.)
+fn mono_block(stmts: []TStatement, s: Subst, items: []TItem, table: TypeTable) -> WBlock | error {
+    mut out: []TStatement = teko::list::empty()
+    mut acc: []MonoInst = teko::list::empty()
+    mut i = 0
+    loop {
+        if i >= stmts.len { break }
+        let ws = match mono_tstmt(stmts[i], s, items, table) { WStmt as w => w; error as er => return er }
+        out = teko::list::push(out, ws.stmt)
+        acc = mono_inst_concat(acc, ws.insts)
+        i++
+    }
+    WBlock { stmts = out; insts = acc }
+}
+
+// ── the driver ───────────────────────────────────────────────────────────────────────────
+// PHASE 1 — walk every NON-generic TFunction body and every loose top-level statement (with an
+// EMPTY subst) to collect SEED instantiations + rewritten bodies; DROP generic functions from the
+// output; pass TypeDecl/UseDecl through. PHASE 2 — fixpoint: for each queued MonoInst not yet
+// stamped, look up the generic fn and STAMP it (clone with concrete param annotations + return
+// type + body rewritten through the inst's Subst, name = mangled, type_params = []), collecting
+// transitively-needed insts. A total-instantiation CEILING bounds polymorphic recursion (M.1).
+pub fn monomorphize(prog: TProgram, table: TypeTable) -> TProgram | error {
+    // NO-OP GUARD: no generic function → return UNCHANGED (the non-generic corpus is byte-identical).
+    mut any_generic = false
+    mut g = 0
+    loop {
+        if g >= prog.items.len { break }
+        match prog.items[g] { TFunction as f => { if f.type_params.len > 0 { any_generic = true } }; _ => {} }
+        g++
+    }
+    if !any_generic { return prog }
+
+    let empty_s = Subst { params = teko::list::empty(); names = teko::list::empty(); types = teko::list::empty() }
+
+    // PHASE 1 — rewrite non-generic items; drop generic fns; collect seed insts.
+    mut kept: []TItem = teko::list::empty()
+    mut queue: []MonoInst = teko::list::empty()
+    mut i = 0
+    loop {
+        if i >= prog.items.len { break }
+        match prog.items[i] {
+            TFunction as f => {
+                if f.type_params.len > 0 {
+                    // drop the generic template from the output (stamped copies replace it)
+                } else {
+                    let wb = match mono_block(f.body, empty_s, prog.items, table) { WBlock as w => w; error as e => return e }
+                    let nf = TFunction { name = f.name; type_params = f.type_params; params = f.params; return_type = f.return_type; body = wb.stmts; vis = f.vis; has_doc = f.has_doc; doc = f.doc; namespace = f.namespace; file = f.file; line = f.line; col = f.col; is_test = f.is_test; is_extern = f.is_extern; c_symbol = f.c_symbol; from_lib = f.from_lib }
+                    kept = teko::list::push(kept, nf)
+                    queue = mono_inst_concat(queue, wb.insts)
+                }
+            }
+            TStatement as ts => {
+                let w = match mono_tstmt(ts, empty_s, prog.items, table) { WStmt as x => x; error as e => return e }
+                kept = teko::list::push(kept, w.stmt)
+                queue = mono_inst_concat(queue, w.insts)
+            }
+            _ => kept = teko::list::push(kept, prog.items[i])
+        }
+        i++
+    }
+
+    // PHASE 2 — fixpoint stamping. The queue grows as a stamped body discovers further insts;
+    // a `stamped` ledger (mangled names) dedups. The ceiling bounds polymorphic recursion (M.1).
+    let ceiling = 5000
+    mut stamped: []MonoInst = teko::list::empty()
+    mut qi = 0
+    loop {
+        if qi >= queue.len { break }
+        let inst = queue[qi]
+        qi++
+        if mono_seen(stamped, inst.mangled) { continue }   // already stamped → skip
+        if stamped.len >= ceiling {
+            return error { message = "monomorphization exceeded the instantiation ceiling (5000) — likely unbounded polymorphic recursion" }
+        }
+        stamped = teko::list::push(stamped, inst)
+        let gf = match find_generic_fn(prog.items, inst.fn_name) {
+            TFunction as f => f
+            null           => return error { message = teko::str::concat("internal: monomorph could not find generic fn ", inst.fn_name) }
+        }
+        // STAMP: concrete param annotations, substituted return type, body rewritten through the Subst.
+        mut nparams: []parser::Param = teko::list::empty()
+        mut pi = 0
+        loop {
+            if pi >= gf.params.len { break }
+            nparams = teko::list::push(nparams, parser::Param { name = gf.params[pi].name; type_ann = subst_typeexpr(gf.params[pi].type_ann, inst.s) })
+            pi++
+        }
+        let wb = match mono_block(gf.body, inst.s, prog.items, table) { WBlock as w => w; error as e => return e }
+        queue = mono_inst_concat(queue, wb.insts)
+        let no_tps: []str = teko::list::empty()
+        let sf = TFunction { name = inst.mangled; type_params = no_tps; params = nparams; return_type = subst_type(gf.return_type, inst.s); body = wb.stmts; vis = gf.vis; has_doc = gf.has_doc; doc = gf.doc; namespace = gf.namespace; file = gf.file; line = gf.line; col = gf.col; is_test = false; is_extern = false; c_symbol = ""; from_lib = "" }
+        kept = teko::list::push(kept, sf)
+    }
+
+    TProgram { items = kept }
+}

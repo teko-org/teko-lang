@@ -281,7 +281,7 @@ static tk_texpr_result type_call(tk_call c, tk_env env, tk_type_table table) {
             if (!tk_is_type_param(all_tps[i], param_tps, n_pt))
                 return xferr(tk_error_named("cannot infer type parameter (it appears only in the return type; annotate the call)", all_tps[i]));
         tk_subst s = { .params = param_tps, .n_params = n_pt, .names = NULL, .types = NULL, .n_bind = 0 };
-        for (size_t i = 0; i < ft.as.func.nparams; i += 1) {
+        for (size_t i = 0; i < args.len; i += 1) {   // args.len == nparams (arity checked above); bound by the list so args.ptr[i] is in range
             tk_subst_result u = tk_unify(ft.as.func.params[i], args.ptr[i].type, s, table);
             if (!u.ok) return xferr(u.as.error);
             s = u.as.value;

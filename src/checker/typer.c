@@ -11,6 +11,7 @@
 #include "collect.h"         // tk_collect, tk_collected_result
 #include "check_modules.h"   // tk_check_modules (W-vis-enforce — module-system pass)
 #include "initanalysis.h"    // tk_analyze_program (Phase 5 — init analysis)
+#include "monomorph.h"       // tk_monomorphize (S4b — generic instantiation, runs last)
 #include <string.h>          // memcmp (loop-label comparison)
 
 // short aliases for local use (terse, matches the original site spellings).
@@ -494,7 +495,8 @@ tk_tprogram_result tk_type_program_with_deps(tk_program program, tk_tprogram dep
     tk_tprogram tp = { .items = all.ptr, .nitems = all.len };
     { tk_error ae = tk_analyze_program(tp);
       if (ae.message) return (tk_tprogram_result){ .ok = false, .as.error = ae }; }
-    return (tk_tprogram_result){ .ok = true, .as.value = tp };
+    // (S4b) MONOMORPHIZE the full (dep + project) tree — see tk_type_program. No-op when no generics.
+    return tk_monomorphize(tp, c.as.value.types);
 }
 
 tk_tprogram_result tk_type_program(tk_program program) {
@@ -551,5 +553,9 @@ tk_tprogram_result tk_type_program(tk_program program) {
     // Runs last, over the fully typed program; prints warnings, returns the first hard error.
     { tk_error ae = tk_analyze_program(tp);
       if (ae.message) return (tk_tprogram_result){ .ok = false, .as.error = ae }; }
-    return (tk_tprogram_result){ .ok = true, .as.value = tp };
+    // (S4b) MONOMORPHIZE — stamp concrete copies of generic fns + rewrite generic calls, so
+    // codegen/VM/tests receive a tree with only concrete functions. No-op (byte-identical) when
+    // the program has no generic function. Runs AFTER analyze so the original generic fn + its
+    // call are seen by init analysis (no false unused-private-fn warning).
+    return tk_monomorphize(tp, c.as.value.types);
 }
