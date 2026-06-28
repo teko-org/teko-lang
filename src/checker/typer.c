@@ -92,7 +92,16 @@ static tk_typed_stmt_result smsg(const char *m) { return sfail(tk_error_make(m))
 static bool assignable_to(tk_type from, tk_type to, tk_type_table table);   // fwd (defined below; B.14)
 
 static tk_typed_stmt_result type_binding(tk_binding b, tk_env env, tk_type_table table) {
-    tk_texpr_result v = tk_typer_expr(b.value, env, table); if (!v.ok) return sfail(v.as.error);
+    // (S4) give a struct-literal value its EXPECTED (annotation) type so a generic constructor
+    // `Box { … }` under `: Box<i64>` targets the concrete instance (annotation-driven).
+    tk_texpr_result v;
+    if (b.has_type && b.value.tag == TK_EXPR_STRUCT_LIT) {
+        tk_type_result at = tk_resolve_type(b.type_ann, table); if (!at.ok) return sfail(at.as.error);
+        v = tk_type_struct_lit(b.value.as.struct_lit, at.as.value, env, table);
+    } else {
+        v = tk_typer_expr(b.value, env, table);
+    }
+    if (!v.ok) return sfail(v.as.error);
     tk_type bound = v.as.value.type;
     if (tk_type_is_void(&bound)) return smsg("cannot bind a `void` expression — it yields no value (M.1)");
     if (b.has_type) {

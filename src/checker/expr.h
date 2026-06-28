@@ -10,6 +10,11 @@
 // avoid clashing with the AST type tk_type_expr/TypeExpr).
 tk_texpr_result tk_typer_expr(tk_expr e, tk_env env, tk_type_table table);
 
+// (S4) type a struct literal with an EXPECTED type (a VOID-tag sentinel = none) so a generic
+// constructor `Box { … }` retargets to the concrete instance from the annotation. type_binding
+// passes the annotation; the expr dispatch passes VOID. Mirror of typer.tks::type_struct_lit.
+tk_texpr_result tk_type_struct_lit(tk_struct_lit sl, tk_type expected, tk_env env, tk_type_table table);
+
 // cast legality (C2) — exposed so the counter-validation (revalidate.c) re-derives it.
 bool tk_cast_ok(tk_type from, tk_type to);
 

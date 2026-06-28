@@ -567,7 +567,10 @@ fn type_coalesce(co: parser::Coalesce, env: Env, table: TypeTable) -> TExpr | er
 // per-field value types, and emit the typed children in the struct's DECLARED order (so the
 // VM and codegen lower identically). A numeric literal adopts a fitting field prim type
 // (parity with annotated bindings).
-fn type_struct_lit(sl: parser::StructLit, env: Env, table: TypeTable) -> TExpr | error {
+// `expected` is the binding/return/param type the literal flows into (a `Void` sentinel = none). It
+// retargets a GENERIC struct constructor `Box { … }` to the concrete instance named by the annotation
+// (`Box__g__i64`), so the fields type against i64 — annotation-driven (S4 type-generics, legislated).
+fn type_struct_lit(sl: parser::StructLit, expected: Type, env: Env, table: TypeTable) -> TExpr | error {
     let nt = match resolve_named(sl.type_path, table) { Type as t => t; error as e => return e }
     // The builtin `error` is the one non-Named constructible type — `error { message = <str> }` (B.1).
     match nt {
@@ -583,13 +586,30 @@ fn type_struct_lit(sl: parser::StructLit, env: Env, table: TypeTable) -> TExpr |
         }
         _ => {}
     }
-    let name = match nt {
+    let base_name = match nt {
         Named as n => n.name
         _          => return error { message = "a struct literal requires a named struct type" }
     }
-    let decl = match type_table_find(table, name) {
+    mut name = base_name
+    mut decl = match type_table_find(table, name) {
         parser::TypeDecl as td => td
         error          => return error { message = $"unknown type in a struct literal: {name}" }
+    }
+    // (S4) constructing a GENERIC struct → retarget to the concrete instance named by `expected` (the
+    // annotation), so `Box { … }` under `: Box<i64>` builds `Box__g__i64` (its fields are T→i64).
+    if decl.type_params.len > 0 {
+        let mname = match expected {
+            Named as en => en.name
+            _           => return error { message = $"cannot infer the type arguments of `{base_name}` here — annotate it (e.g. `let x: {base_name}<…> = …`)" }
+        }
+        if !name_has_generic_base(mname, base_name) {
+            return error { message = $"struct literal `{base_name}` does not match the annotated type" }
+        }
+        decl = match type_table_find(table, mname) {
+            parser::TypeDecl as td => td
+            error          => return error { message = $"internal: generic instance `{mname}` was not stamped" }
+        }
+        name = mname
     }
     let sb = match decl.body {
         parser::StructBody as s => s
@@ -654,7 +674,21 @@ fn type_struct_lit(sl: parser::StructLit, env: Env, table: TypeTable) -> TExpr |
         vals = teko::list::push(vals, val)
         d++
     }
-    TExpr { kind = TStructInit { field_names = names; field_vals = vals }; type = nt; line = 0; col = 0 }
+    TExpr { kind = TStructInit { field_names = names; field_vals = vals }; type = Named { name = name }; line = 0; col = 0 }
+}
+
+// is `mname` a generic INSTANCE of `base` (i.e. it begins with `base` + the `__g__` infix)? Used to
+// confirm a generic struct literal matches its annotated instance type before retargeting (S4).
+fn name_has_generic_base(mname: str, base: str) -> bool {
+    let pfx = teko::str::concat(base, "__g__")
+    if mname.len < pfx.len { return false }
+    mut i = 0
+    loop {
+        if i >= pfx.len { break }
+        if mname[i] != pfx[i] { return false }
+        i++
+    }
+    true
 }
 
 // ---- subscript index `recv[index]` (W5-idx) ----
@@ -797,7 +831,7 @@ fn type_dispatch(e: parser::Expr, env: Env, table: TypeTable) -> TExpr | error {
         parser::Cast as c      => type_cast(c, env, table)
         parser::MethodCall     => error { message = "method typing is deferred (B.29 / M.4)" }
         parser::PathExpr as pe => type_path_expr(pe, table)   // Enum::Member as a value
-        parser::StructLit as sl => type_struct_lit(sl, env, table)   // W4a
+        parser::StructLit as sl => type_struct_lit(sl, Void { }, env, table)   // W4a (no expected type in expr position)
         parser::Index as ix    => type_index(ix, env, table)        // W5-idx
         parser::Interp as in   => type_interp(in, env, table)       // $"…{expr}…"
         parser::InExpr as n    => type_in(n, env, table)            // <expr> in [ … ] (Phase 2)
@@ -1020,8 +1054,23 @@ fn type_match_stmt(m: parser::MatchExpr, env: Env, table: TypeTable) -> TExpr | 
 
 // ---- statements (the evolved check_* — produce the typed node + advance the env) ----
 
+// Type a binding's value, giving a struct-literal value its EXPECTED (annotation) type so a generic
+// constructor `Box { … }` under `: Box<i64>` targets the concrete instance (S4 annotation-driven).
+fn type_binding_value(b: parser::Binding, env: Env, table: TypeTable) -> TExpr | error {
+    if b.has_type {
+        match b.value.kind {
+            parser::StructLit as sl => {
+                let at = match resolve_type(b.type_ann, table) { Type as t => t; error as e => return e }
+                return type_struct_lit(sl, at, env, table)
+            }
+            _ => {}
+        }
+    }
+    type_expr(b.value, env, table)
+}
+
 fn type_binding(b: parser::Binding, env: Env, table: TypeTable) -> TypedStmt | error {
-    mut v = match type_expr(b.value, env, table) { TExpr as te => te; error as e => return e }
+    mut v = match type_binding_value(b, env, table) { TExpr as te => te; error as e => return e }
     mut bound = v.type
     if type_is_void(bound) { return error { message = "cannot bind a `void` expression — it yields no value (M.1)" } }
     if b.has_type {

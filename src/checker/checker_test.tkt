@@ -570,7 +570,7 @@ fn checker_struct_lit_error_builtin() {
     let fn_names: []str = teko::list::push(teko::list::empty(), "message")
     let fn_vals: []parser::Expr = teko::list::push(teko::list::empty(), e_str("oops"))
     let sl = parser::StructLit { type_path = path1("error"); field_names = fn_names; field_vals = fn_vals }
-    let sr = match type_struct_lit(sl, empty_env(), empty_table()) { TExpr as te => te; error => { teko::assert::is_true(false); return } }
+    let sr = match type_struct_lit(sl, Void { }, empty_env(), empty_table()) { TExpr as te => te; error => { teko::assert::is_true(false); return } }
     match sr.type { Error => teko::assert::is_true(true); _ => teko::assert::is_true(false) }
 }
 
@@ -814,6 +814,21 @@ fn instantiate_types_stamps_concrete_decl() {
         }
         error => teko::assert::is_true(false)
     }
+}
+
+// (S4 type-generics) a generic struct constructor `Box { value = 42 }` under expected `Box<i64>`
+// types as the concrete instance Box__g__i64, with the field value adopting i64 (annotation-driven).
+#test
+fn types_generic_struct_lit() {
+    // stamp Box__g__i64 into the table via the instantiation pass (as a `Box<i64>` annotation would).
+    let boxi64 = parser::NamedType { path = parser::Path { segments = teko::list::push(teko::list::empty(), parser::Segment { name = "Box" }) }; args = teko::list::push(teko::list::empty(), ttype_named("i64")) }
+    let node = parser::TypeDecl { name = "Node"; type_params = teko::list::empty(); body = parser::StructBody { fields = teko::list::push(teko::list::empty(), parser::Field { name = "b"; type_ann = boxi64 }) }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }
+    let items: []parser::Item = teko::list::push(teko::list::empty(), parser::Item { content = node; namespace = ""; file = "" })
+    let tbl = instantiate_types(parser::Program { items = items }, box_generic_table())
+    let sl = parser::StructLit { type_path = parser::Path { segments = teko::list::push(teko::list::empty(), parser::Segment { name = "Box" }) }; field_names = teko::list::push(teko::list::empty(), "value"); field_vals = teko::list::push(teko::list::empty(), e_num(42)) }
+    let r = match type_struct_lit(sl, Named { name = "Box__g__i64" }, empty_env(), tbl) { TExpr as te => te; error => { teko::assert::is_true(false); return } }
+    teko::assert::is_true(match r.type { Named as n => n.name == "Box__g__i64"; _ => false })
+    match r.kind { TStructInit as si => teko::assert::is_true(prim_is(si.field_vals[0].type, PrimKind::I64)); _ => teko::assert::is_true(false) }
 }
 
 // ---------------------------------------------------------------------------

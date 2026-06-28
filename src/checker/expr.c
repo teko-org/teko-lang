@@ -658,7 +658,17 @@ static tk_texpr_result type_coalesce(tk_coalesce co, tk_env env, tk_type_table t
 // per-field value types, and emit the typed children in the struct's DECLARED order (so the
 // VM and codegen lower identically). A numeric literal adopts a fitting field prim type
 // (parity with annotated bindings).
-static tk_texpr_result type_struct_lit(tk_struct_lit sl, tk_env env, tk_type_table table) {
+// is `mname` a generic INSTANCE of `base` (begins with base + the `__g__` infix)? Mirror of
+// typer.tks::name_has_generic_base — confirms a generic literal matches its annotated instance.
+static bool name_has_generic_base(tk_str mname, tk_str base) {
+    if (mname.len < base.len + 5) return false;
+    if (base.len && memcmp(mname.ptr, base.ptr, base.len) != 0) return false;
+    return memcmp(mname.ptr + base.len, "__g__", 5) == 0;
+}
+
+// `expected` is the binding/return type the literal flows into (a VOID sentinel = none). It retargets
+// a GENERIC constructor `Box { … }` to the concrete instance from the annotation (S4, annotation-driven).
+tk_texpr_result tk_type_struct_lit(tk_struct_lit sl, tk_type expected, tk_env env, tk_type_table table) {
     tk_type_result nt = resolve_named(sl.type_path, table);
     if (!nt.ok) return xferr(nt.as.error);
     // The builtin `error` is the one non-NAMED constructible type — `error { message = <str> }`
@@ -677,8 +687,20 @@ static tk_texpr_result type_struct_lit(tk_struct_lit sl, tk_env env, tk_type_tab
                                .as.struct_init = { names, vals, 1 } });
     }
     if (nt.as.value.tag != TK_TYPE_NAMED) return xerr("a struct literal requires a named struct type");
-    tk_decl_result decl = tk_type_table_find(table, nt.as.value.as.named.name);
+    tk_str name = nt.as.value.as.named.name;
+    tk_decl_result decl = tk_type_table_find(table, name);
     if (!decl.ok) return xerr("unknown type in a struct literal");
+    // (S4) constructing a GENERIC struct → retarget to the concrete instance named by `expected`
+    // (the annotation), so `Box { … }` under `: Box<i64>` builds `Box__g__i64` (fields T→i64).
+    if (decl.as.value.n_type_params > 0) {
+        if (expected.tag != TK_TYPE_NAMED)
+            return xerr("cannot infer the type arguments of a generic struct here — annotate it (e.g. `let x: Box<…> = …`)");
+        tk_str mname = expected.as.named.name;
+        if (!name_has_generic_base(mname, name)) return xerr("struct literal does not match the annotated type");
+        decl = tk_type_table_find(table, mname);
+        if (!decl.ok) return xerr("internal: generic instance was not stamped");
+        name = mname;
+    }
     if (decl.as.value.body.tag != TK_BODY_STRUCT) return xerr("struct-literal target is not a struct");
     tk_struct_body sb = decl.as.value.body.as.struct_body;
     if (sl.nfields != sb.n_fields) return xerr("a struct literal must set exactly the declared fields (count mismatch)");
@@ -718,7 +740,8 @@ static tk_texpr_result type_struct_lit(tk_struct_lit sl, tk_env env, tk_type_tab
         }
         names[d] = fname; vals[d] = val;
     }
-    return xok((tk_texpr){ .tag = TK_TEXPR_STRUCT_INIT, .type = nt.as.value,
+    return xok((tk_texpr){ .tag = TK_TEXPR_STRUCT_INIT,
+                           .type = (tk_type){ .tag = TK_TYPE_NAMED, .as.named.name = name },
                            .as.struct_init = { names, vals, sb.n_fields } });
 }
 
@@ -1010,7 +1033,7 @@ static tk_texpr_result type_dispatch(tk_expr e, tk_env env, tk_type_table table)
             return xerr("method typing is deferred (B.29 / M.4)");
         }
         case TK_EXPR_PATH:         return type_path_expr(e.as.path, table);   // Enum::Member as a value
-        case TK_EXPR_STRUCT_LIT:   return type_struct_lit(e.as.struct_lit, env, table);   // W4a
+        case TK_EXPR_STRUCT_LIT:   return tk_type_struct_lit(e.as.struct_lit, (tk_type){ .tag = TK_TYPE_VOID }, env, table);   // W4a (no expected in expr position)
         case TK_EXPR_INDEX:        return type_index(e.as.index, env, table);            // W5-idx
         case TK_EXPR_INTERP:       return type_interp(e.as.interp, env, table);          // $"…{expr}…"
         case TK_EXPR_IN:           return type_in(e.as.in_expr, env, table);            // <expr> in [ … ] (Phase 2)
