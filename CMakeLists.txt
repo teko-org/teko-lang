@@ -133,6 +133,10 @@ endif()
 # descent easily exceeds the default 8MB main-thread stack). Set to 64MB to give enough room.
 if(APPLE)
     target_link_options(teko PRIVATE "-Wl,-stack_size,0x4000000")
+elseif(WIN32)
+    # lld-link /STACK:reserve — 64 MB, matching Linux/macOS.  Without this the
+    # 1 MB Windows default overflows mid-test and the process exits with code 1.
+    target_link_options(teko PRIVATE "-Wl,/STACK:67108864")
 elseif(UNIX)
     target_link_options(teko PRIVATE "-Wl,-z,stacksize=67108864")
 endif()
