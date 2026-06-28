@@ -120,6 +120,10 @@ add_library(teko_bootstrap STATIC
 # the lib) so it is never double-linked into the generated programs the driver builds.
 add_executable(teko main.c src/driver.c src/runtime/teko_rt.c)
 target_link_libraries(teko PRIVATE teko_bootstrap)
+# vm.c calls floor() via the f64 arithmetic path; Linux requires explicit -lm linkage.
+if(UNIX AND NOT APPLE)
+    target_link_libraries(teko PRIVATE m)
+endif()
 # The VM interpreter uses deep C recursion when running the Teko parser/lexer during
 # `teko test` (each Teko function call adds ~4 C frames; parsing 66 files × recursive
 # descent easily exceeds the default 8MB main-thread stack). Set to 64MB to give enough room.
