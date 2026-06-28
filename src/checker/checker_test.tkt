@@ -792,6 +792,21 @@ fn resolves_generic_type_instantiation() {
     teko::assert::is_true(generic_inst_name("Box", at) == "Box__g__i64__str")
 }
 
+// (S-mem) `ptr<T>` — typed pointer: resolves to Ptr{inner}, opaque ptr = Ptr{null}, equal-by-inner.
+#test
+fn resolves_ptr_generic() {
+    let ptr_i64 = parser::NamedType { path = parser::Path { segments = teko::list::push(teko::list::empty(), parser::Segment { name = "ptr" }) }; args = teko::list::push(teko::list::empty(), ttype_named("i64")) }
+    let pi = match resolve_type(ptr_i64, empty_table()) { Type as t => t; error => { teko::assert::is_true(false); return } }
+    // STRUCTURE (VM-safe): ptr<i64> → Ptr{inner present = i64}; opaque ptr = Ptr{inner null}; distinct.
+    // (exact `ptr_i64`/`ptr<i64>` mangle/render is verified via real codegen, not here — the VM drops
+    // a self-recursive match arm's string prefix; see selfhost-vm-perf.)
+    teko::assert::is_true(match pi { Ptr as p => match p.inner { null => false; Type as t => match t { Prim => true; _ => false } }; _ => false })
+    teko::assert::is_true(type_eq(pi, pi))
+    let bare = match resolve_type(ttype_named("ptr"), empty_table()) { Type as t => t; error => { teko::assert::is_true(false); return } }
+    teko::assert::is_true(match bare { Ptr as p => match p.inner { null => true; Type => false }; _ => false })   // opaque ptr = null inner
+    teko::assert::is_true(!type_eq(bare, pi))   // opaque ptr ≠ ptr<i64>
+}
+
 // (S4 type-generics) the instantiation pass stamps a concrete decl for a written `Box<i64>` use.
 #test
 fn instantiate_types_stamps_concrete_decl() {
@@ -992,7 +1007,7 @@ fn mono_slice_and_optional_mangle() {
     teko::assert::is_true(teko::runtime::str_eq(mono_type_mangle(Byte { }), "byte"))
     teko::assert::is_true(teko::runtime::str_eq(mono_type_mangle(Error { }), "error"))
     teko::assert::is_true(teko::runtime::str_eq(mono_type_mangle(Void { }), "void"))
-    teko::assert::is_true(teko::runtime::str_eq(mono_type_mangle(Ptr { }), "ptr"))
+    teko::assert::is_true(teko::runtime::str_eq(mono_type_mangle(Ptr { inner = null }), "ptr"))
     teko::assert::is_true(teko::runtime::str_eq(mono_type_mangle(Uptr { }), "uptr"))
     teko::assert::is_true(teko::runtime::str_eq(mono_type_mangle(Named { name = "Foo" }), "Foo"))
 }

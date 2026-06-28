@@ -492,7 +492,11 @@ static bool emit_type(cbuf *b, tk_type t, const char **err) {
         case TK_TYPE_FUNC:    return fail_node(err, "codegen: function type not yet supported");
         // (C7.1a) opaque FFI transport types — `ptr` is a bare `void *`, `uptr` a word-size
         // unsigned. Never dereferenced in Teko; only crosses the extern boundary.
-        case TK_TYPE_PTR:     cb(b, "void *");    return true;
+        // (S-mem) `ptr<T>` → `<T> *`; opaque ptr (NULL inner) → `void *`.
+        case TK_TYPE_PTR:
+            if (t.as.ptr.inner == NULL) { cb(b, "void *"); return true; }
+            if (!emit_type(b, *t.as.ptr.inner, err)) return false;
+            cb(b, " *"); return true;
         case TK_TYPE_UPTR:    cb(b, "uintptr_t"); return true;
     }
     return fail_node(err, "codegen: unknown type not yet supported");
@@ -691,7 +695,10 @@ static bool emit_type_expr(cbuf *b, tk_type_expr te, const char **err) {
             else if (seg_is(last, "byte"))  { cb(b, "uint8_t");           return true; }
             else if (seg_is(last, "str"))   { cb(b, "tk_str");            return true; }
             else if (seg_is(last, "error")) { cb(b, "tk_error"); return true; }   // error → runtime tk_error struct (E2-NATIVE)
-            else if (seg_is(last, "ptr"))   { cb(b, "void *");            return true; }   // (C7.1a) opaque FFI pointer
+            else if (seg_is(last, "ptr"))   {   // ptr<T> → <T> * ; ptr → void *
+                if (te.as.named.args_len > 0) { if (!emit_type_expr(b, te.as.named.args[0], err)) return false; cb(b, " *"); return true; }
+                cb(b, "void *"); return true;
+            }
             else if (seg_is(last, "uptr"))  { cb(b, "uintptr_t");         return true; }   // (C7.1a) opaque word-size unsigned
             // a TRANSPARENT alias (`type Name = <type-expr>`) emits NO C type of its own — resolve
             // through to the aliased type-expr at every use site (e.g. a `TypeTable` field = []TypeReg

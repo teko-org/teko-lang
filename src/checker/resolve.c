@@ -140,7 +140,14 @@ const char *tk_type_render(tk_type t) {
             if (ps) tk_free0(ps);
             return out;
         }
-        case TK_TYPE_PTR:   return dup_cstr("ptr");    // (C7.1a) opaque FFI pointer
+        case TK_TYPE_PTR: {   // ptr<T> human render; NULL inner = opaque ptr → "ptr"
+            if (t.as.ptr.inner == NULL) return dup_cstr("ptr");
+            const char *in = tk_type_render(*t.as.ptr.inner);
+            size_t cap = strlen(in) + 6;   // "ptr<" + in + ">" + NUL
+            char *out = tk_alloc(cap); if (!out) abort();
+            snprintf(out, cap, "ptr<%s>", in);
+            return out;
+        }
         case TK_TYPE_UPTR:  return dup_cstr("uptr");   // (C7.1a) opaque word-size unsigned
     }
     return dup_cstr("<type>");
@@ -320,7 +327,7 @@ tk_str tk_type_mangle(tk_type t) {
                                    t.as.optional.inner ? tk_type_mangle(*t.as.optional.inner) : rt_cstr("void"));
         case TK_TYPE_ERROR:    return rt_cstr("error");
         case TK_TYPE_VOID:     return rt_cstr("void");
-        case TK_TYPE_PTR:      return rt_cstr("ptr");
+        case TK_TYPE_PTR:      return t.as.ptr.inner ? rt_concat(rt_cstr("ptr_"), tk_type_mangle(*t.as.ptr.inner)) : rt_cstr("ptr");
         case TK_TYPE_UPTR:     return rt_cstr("uptr");
         case TK_TYPE_VARIANT:  return rt_cstr("variant");
         case TK_TYPE_FUNC:     return rt_cstr("func");
@@ -343,6 +350,14 @@ tk_str tk_generic_inst_name(tk_str base, tk_type *args, size_t nargs) {
 // Mirror of resolve.tks::resolve_generic_inst.
 static tk_type_result resolve_generic_inst(tk_path path, tk_type_expr *args, size_t nargs, tk_type_table table) {
     tk_str name = path.segments[path.len - 1].name;
+    // (S-mem) builtin generic `ptr<T>` → `Ptr{inner}`; `ptr<void>` ≡ opaque ptr → NULL inner.
+    if (name.len == 3 && memcmp(name.ptr, "ptr", 3) == 0) {
+        if (nargs != 1) return (tk_type_result){ .ok = false, .as.error = tk_error_make("`ptr<T>` takes exactly one type argument") };
+        tk_type_result in = tk_resolve_type(args[0], table);
+        if (!in.ok) return in;
+        tk_type t = { .tag = TK_TYPE_PTR, .as.ptr.inner = (in.as.value.tag == TK_TYPE_VOID) ? NULL : box(in.as.value) };
+        return (tk_type_result){ .ok = true, .as.value = t };
+    }
     tk_type *argtypes = nargs ? tk_alloc(nargs * sizeof *argtypes) : NULL;
     for (size_t i = 0; i < nargs; i += 1) {
         tk_type_result a = tk_resolve_type(args[i], table);

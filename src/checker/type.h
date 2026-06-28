@@ -97,6 +97,7 @@ struct tk_type {
         struct { tk_type *members; size_t len; } variant;    // TK_TYPE_VARIANT
         struct { tk_type *params; size_t nparams; tk_type *ret; } func;  // TK_TYPE_FUNC
         struct { tk_type *inner; }              optional;    // TK_TYPE_OPTIONAL — T?
+        struct { tk_type *inner; }              ptr;         // TK_TYPE_PTR — ptr<T> (inner NULL = opaque ptr ≡ ptr<void> ≡ *void)
         // BYTE, STR, ERROR, VOID carry no payload
     } as;
 };

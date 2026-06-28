@@ -528,7 +528,11 @@ fn emit_type(buf: []byte, t: checker::Type) -> []byte | error {
         checker::Error     => cb(buf, "tk_error")
         // (C7.1a) opaque FFI transport types — `ptr` is a bare `void *`, `uptr` a word-size
         // unsigned. Never dereferenced in Teko; only crosses the extern boundary.
-        checker::Ptr       => cb(buf, "void *")
+        // (S-mem) `ptr<T>` → `<T> *`; opaque ptr (null inner) → `void *`.
+        checker::Ptr as p  => match p.inner {
+            null               => cb(buf, "void *")
+            checker::Type as t => cb(match emit_type(buf, t) { []byte as o => o; error as e => return e }, " *")
+        }
         checker::Uptr      => cb(buf, "uintptr_t")
     }
 }
@@ -757,7 +761,7 @@ fn emit_type_expr(buf: []byte, prog: checker::TProgram, te: parser::TypeExpr) ->
             else if last == "byte"  { return cb(buf, "uint8_t") }
             else if last == "str"   { return cb(buf, "tk_str") }
             else if last == "error" { return cb(buf, "tk_error") }   // error → runtime tk_error struct (E2-NATIVE)
-            else if last == "ptr"   { return cb(buf, "void *") }     // (C7.1a) opaque FFI pointer
+            else if last == "ptr"   { if nt.args.len > 0 { return cb(match emit_type_expr(buf, prog, nt.args[0]) { []byte as o => o; error as e => return e }, " *") } else { return cb(buf, "void *") } }   // ptr<T> → <T> * ; ptr → void *
             else if last == "uptr"  { return cb(buf, "uintptr_t") }  // (C7.1a) opaque word-size unsigned
             // a TRANSPARENT alias (`type Name = <type-expr>`) emits NO C type of its own —
             // resolve through to the aliased type-expr at every use site (e.g. a field `[]TypeReg`

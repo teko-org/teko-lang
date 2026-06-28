@@ -76,7 +76,7 @@ pub type Byte     = struct { }                     // the octet type
 pub type Str      = struct { }                     // validated UTF-8
 pub type Error    = struct { }                     // the native `error` (lowercase; supersedes `Error`)
 pub type Void     = struct { }                     // return-only marker; legal ONLY as Func.ret
-pub type Ptr      = struct { }                     // (C7.1a) opaque pointer — transport-only at the FFI boundary, NEVER dereferenced (LEGISLATION §"FFI / extern")
+pub type Ptr      = struct { inner: Type? }        // `ptr<T>` — a TYPED address; `inner = null` = the opaque `ptr` ≡ `ptr<void>` ≡ `*void` (pointer-only; NOT the value-`void`). The primitive inside Ref<T>.
 pub type Uptr     = struct { }                     // (C7.1a) opaque word-size unsigned — transport-only at the FFI boundary
 
 // a semantic type. (Compiler-managed indirection for the recursive cases.)
@@ -86,6 +86,14 @@ pub type Type = variant Prim | Byte | Str | Slice | Optional | Named | Variant |
 // `Func.ret` position and to reject it everywhere else (value / binding / member).
 fn type_is_void(t: Type) -> bool {
     match t { Void => true; _ => false }
+}
+
+// (S-mem) two ptr inners equal: both null (opaque ptr) → equal; one null → not; else by type.
+fn ptr_inner_eq(a: Type?, b: Type?) -> bool {
+    match a {
+        null       => match b { null => true; Type => false }
+        Type as ta => match b { null => false; Type as tb => type_eq(ta, tb) }
+    }
 }
 
 // nominal type equality (B.13): structural over the shape, but Named is by name.
@@ -123,7 +131,7 @@ fn type_eq(a: Type, b: Type) -> bool {
             Func as fb => type_eq(fa.ret, fb.ret) && types_eq(fa.params, fb.params)
             _          => false
         }
-        Ptr           => match b { Ptr           => true;                           _ => false }   // (C7.1a) opaque, same-kind only
+        Ptr as pa     => match b { Ptr as pb => ptr_inner_eq(pa.inner, pb.inner); _ => false }   // ptr<T> equal by pointed type (null inner = opaque ptr)
         Uptr          => match b { Uptr          => true;                           _ => false }   // (C7.1a) opaque, same-kind only
     }
 }

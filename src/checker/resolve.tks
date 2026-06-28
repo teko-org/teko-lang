@@ -367,7 +367,7 @@ pub fn type_mangle(t: Type) -> str {
         Optional as o => teko::str::concat("opt_", type_mangle(o.inner))
         Error         => "error"
         Void          => "void"
-        Ptr           => "ptr"
+        Ptr as p      => match p.inner { null => "ptr"; Type as t => teko::str::concat("ptr_", type_mangle(t)) }
         Uptr          => "uptr"
         Variant       => "variant"
         Func          => "func"
@@ -393,6 +393,13 @@ pub fn generic_inst_name(base: str, args: []Type) -> str {
 // concrete decl (fields with T→arg substituted) is stamped by the instantiation pass / mono.
 fn resolve_generic_inst(nt: parser::NamedType, table: TypeTable) -> Type | error {
     let name = nt.path.segments[nt.path.segments.len - 1].name
+    // (S-mem) the builtin generic `ptr<T>` → a typed pointer `Ptr{inner}`. `ptr<void>` ≡ the opaque
+    // `ptr` (void isn't a value type) → null inner. Not a user decl, handled before the table lookup.
+    if name == "ptr" {
+        if nt.args.len != 1 { return error { message = "`ptr<T>` takes exactly one type argument" } }
+        let argt = match resolve_type(nt.args[0], table) { Type as t => t; error as e => return e }
+        match argt { Void => return Ptr { inner = null }; _ => return Ptr { inner = argt } }
+    }
     mut argtypes: []Type = teko::list::empty()
     mut i = 0
     loop {
@@ -434,7 +441,7 @@ pub fn type_render(t: Type) -> str {
         Optional as o => match o.inner   { Void => "_?";  _ => $"{type_render(o.inner)}?" }
         Variant as v  => render_members(v.members)
         Func as f     => render_func(f)   // (C1.8) "(p0, …) -> ret" — full mirror of resolve.c (M.3, show what we know)
-        Ptr           => "ptr"            // (C7.1a) opaque FFI pointer
+        Ptr as p      => match p.inner { null => "ptr"; Type as t => $"ptr<{type_render(t)}>" }   // ptr<T> human render
         Uptr          => "uptr"           // (C7.1a) opaque word-size unsigned
     }
 }
