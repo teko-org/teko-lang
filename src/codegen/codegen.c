@@ -325,7 +325,7 @@ static bool cg_is_prim_name(tk_str name) {
     static const char *prims[] = { "u8","u16","u32","u64","u128","i8","i16","i32","i64",
                                    "i128","f16","f32","f64","bool","byte","str","error",
                                    "ptr","uptr",   // (C7.1a) opaque FFI transport types
-                                   "ref" };         // (MEM-1b) ref<T> lowers to a pointer (no by-value edge)
+                                   "Ref" };         // (MEM-1b) Ref<T> lowers to a pointer (no by-value edge)
     for (size_t i = 0; i < sizeof prims / sizeof *prims; i += 1)
         if (seg_is(name, prims[i])) return true;
     return false;
@@ -706,9 +706,9 @@ static bool emit_type_expr(cbuf *b, tk_type_expr te, const char **err) {
                 cb(b, "void *"); return true;
             }
             else if (seg_is(last, "uptr"))  { cb(b, "uintptr_t");         return true; }   // (C7.1a) opaque word-size unsigned
-            else if (seg_is(last, "ref"))   {   // (MEM-1b) ref<T> → <T> *
+            else if (seg_is(last, "Ref"))   {   // (MEM-1b) Ref<T> → <T> *
                 if (te.as.named.args_len > 0) { if (!emit_type_expr(b, te.as.named.args[0], err)) return false; cb(b, " *"); return true; }
-                return fail_node(err, "`ref<T>` needs a type argument");
+                return fail_node(err, "`Ref<T>` needs a type argument");
             }
             // a TRANSPARENT alias (`type Name = <type-expr>`) emits NO C type of its own — resolve
             // through to the aliased type-expr at every use site (e.g. a `TypeTable` field = []TypeReg

@@ -149,11 +149,11 @@ const char *tk_type_render(tk_type t) {
             return out;
         }
         case TK_TYPE_UPTR:  return dup_cstr("uptr");   // (C7.1a) opaque word-size unsigned
-        case TK_TYPE_REF: {   // (MEM-1b) ref<T> human render (inner never NULL)
+        case TK_TYPE_REF: {   // (MEM-1b) Ref<T> human render (inner never NULL)
             const char *in = tk_type_render(*t.as.ref.inner);
-            size_t cap = strlen(in) + 6;   // "ref<" + in + ">" + NUL
+            size_t cap = strlen(in) + 6;   // "Ref<" + in + ">" + NUL
             char *out = tk_alloc(cap); if (!out) abort();
-            snprintf(out, cap, "ref<%s>", in);
+            snprintf(out, cap, "Ref<%s>", in);
             return out;
         }
     }
@@ -371,13 +371,13 @@ static tk_type_result resolve_generic_inst(tk_path path, tk_type_expr *args, siz
         tk_type t = { .tag = TK_TYPE_PTR, .as.ptr.inner = (in.as.value.tag == TK_TYPE_VOID) ? NULL : box(in.as.value) };
         return (tk_type_result){ .ok = true, .as.value = t };
     }
-    // (MEM-1b) builtin generic `ref<T>` → the safe reference `Ref{inner}`. Never null/opaque;
-    // `ref<void>` rejected (void is not a value), `ref` requires a type argument.
-    if (name.len == 3 && memcmp(name.ptr, "ref", 3) == 0) {
-        if (nargs != 1) return (tk_type_result){ .ok = false, .as.error = tk_error_make("`ref<T>` takes exactly one type argument") };
+    // (MEM-1b) compiler-known generic struct `Ref<T>` → the safe reference `Ref{inner}` (the safe
+    // surface OVER raw `ptr<T>`). Capitalized. Never null/opaque; `Ref<void>` rejected, `Ref` needs an arg.
+    if (name.len == 3 && memcmp(name.ptr, "Ref", 3) == 0) {
+        if (nargs != 1) return (tk_type_result){ .ok = false, .as.error = tk_error_make("`Ref<T>` takes exactly one type argument") };
         tk_type_result in = tk_resolve_type(args[0], table);
         if (!in.ok) return in;
-        if (in.as.value.tag == TK_TYPE_VOID) return (tk_type_result){ .ok = false, .as.error = tk_error_make("`ref<void>` is invalid — void is not a value (M.3)") };
+        if (in.as.value.tag == TK_TYPE_VOID) return (tk_type_result){ .ok = false, .as.error = tk_error_make("`Ref<void>` is invalid — void is not a value (M.3)") };
         tk_type t = { .tag = TK_TYPE_REF, .as.ref.inner = box(in.as.value) };
         return (tk_type_result){ .ok = true, .as.value = t };
     }

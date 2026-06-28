@@ -137,9 +137,9 @@ static tk_type_expr type_to_texpr(tk_type t) {
             return (tk_type_expr){ .tag = TK_TEXPR_NAMED, .as.named = { .path = { .segments = segs, .len = ns }, .args = args, .args_len = na } };
         }
         case TK_TYPE_UPTR:     return mono_named_texpr("uptr");
-        case TK_TYPE_REF: {   // (MEM-1b) ref<T> → NamedType{ ref, [inner] }
+        case TK_TYPE_REF: {   // (MEM-1b) Ref<T> → NamedType{ Ref, [inner] }
             tk_segment *segs = NULL; size_t ns = 0;
-            tk_segs_push(&segs, &ns, (tk_segment){ .name = mono_cstr("ref") });
+            tk_segs_push(&segs, &ns, (tk_segment){ .name = mono_cstr("Ref") });
             tk_type_expr *args = NULL; size_t na = 0;
             tk_types_push(&args, &na, type_to_texpr(*t.as.ref.inner));
             return (tk_type_expr){ .tag = TK_TEXPR_NAMED, .as.named = { .path = { .segments = segs, .len = ns }, .args = args, .args_len = na } };
