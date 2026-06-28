@@ -279,6 +279,17 @@ static bool cg_named_is_enum(tk_str name) {
     return false;
 }
 
+// (C8.4) Is the NAMED type `name` a (declared) FLAGS? A flags member is a pre-emitted C constant
+// `tk_t_<Name>_<MEMBER>` (power-of-2 unsigned int), not a C enum constant.
+static bool cg_named_is_flags(tk_str name) {
+    for (size_t i = 0; i < g_cg_prog.nitems; i += 1) {
+        if (g_cg_prog.items[i].tag != TK_TITEM_TYPE_DECL) continue;
+        const tk_type_decl *dd = &g_cg_prog.items[i].as.type_decl;
+        if (cg_name_eq(dd->name, name)) return dd->body.tag == TK_BODY_FLAGS;
+    }
+    return false;
+}
+
 // Any TYPE_DECL (struct/variant/enum/alias) named `name`, or NULL.
 static const tk_type_decl *cg_find_decl(tk_str name) {
     for (size_t i = 0; i < g_cg_prog.nitems; i += 1) {
@@ -1653,12 +1664,19 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
         }
 
         case TK_TEXPR_PATH:
-            // Enum::Member as a VALUE → the C enum constant `TK_E_<UPPER enum>_<UPPER member>`
-            // (the SAME spelling codegen's enum-decl emitter gives each member).
-            cb(b, "TK_E_");
-            cb_upper(b, e->as.path.enum_name);
-            cb(b, "_");
-            cb_upper(b, e->as.path.member);
+            // Enum::Member → C enum constant `TK_E_<UPPER enum>_<UPPER member>`.
+            // Flags::Member → pre-emitted C constant `tk_t_<Name>_<UPPER member>` (power-of-2).
+            if (cg_named_is_flags(e->as.path.enum_name)) {
+                // (C8.4) flags member constant: tk_t_<Name>_<UPPER member>
+                mangle_type_name(b, (tk_str){ NULL, 0 }, e->as.path.enum_name);
+                cb(b, "_");
+                cb_upper(b, e->as.path.member);
+            } else {
+                cb(b, "TK_E_");
+                cb_upper(b, e->as.path.enum_name);
+                cb(b, "_");
+                cb_upper(b, e->as.path.member);
+            }
             return true;
 
         case TK_TEXPR_INDEX: {
@@ -3152,10 +3170,43 @@ static bool emit_type_decl(cbuf *b, tk_type_decl d, const char **err) {
             // A TRANSPARENT alias emits NO C type — references resolve through to the aliased
             // type at the checker, and codegen emits that resolved type at every use site.
             return true;
-        case TK_BODY_FLAGS:
-            // (C8.4) flags codegen (power-of-2 integer typedef) is deferred to C8.4.
-            // For now, emit nothing so the parser/AST crumb (C8.2) doesn't crash.
+        case TK_BODY_FLAGS: {
+            // (C8.4) A `flags Name { A; B; C; }` emits:
+            //   typedef <uint_type> tk_t_<Name>;
+            //   static const tk_t_<Name> tk_t_<Name>_<A> = (tk_t_<Name>)(((unsigned __int128)1) << 0);
+            //   …
+            // The uint_type is chosen by member count:
+            //   1–8 → uint8_t, 9–16 → uint16_t, 17–32 → uint32_t,
+            //   33–64 → uint64_t, 65–128 → unsigned __int128.
+            tk_flags_body fb = d.body.as.flags_body;
+            size_t n = fb.n_members;
+            const char *uint_type =
+                n <=  8 ? "uint8_t"           :
+                n <= 16 ? "uint16_t"          :
+                n <= 32 ? "uint32_t"          :
+                n <= 64 ? "uint64_t"          :
+                          "unsigned __int128";
+            cb(b, "typedef ");
+            cb(b, uint_type);
+            cb(b, " ");
+            mangle_type_name(b, ns, d.name);
+            cb(b, ";\n");
+            for (size_t i = 0; i < n; i += 1) {
+                cb(b, "static const ");
+                mangle_type_name(b, ns, d.name);
+                cb(b, " ");
+                mangle_type_name(b, ns, d.name);
+                cb(b, "_");
+                cb_upper(b, fb.members[i]);
+                cb(b, " = (");
+                mangle_type_name(b, ns, d.name);
+                cb(b, ")(((unsigned __int128)1) << ");
+                cb_u64_dec(b, (uint64_t)i);
+                cb(b, ");\n");
+            }
+            cb(b, "\n");
             return true;
+        }
         case TK_BODY_EXTERN:
             // (C7.1a) an OPAQUE foreign handle → a C `void *` typedef, so the existing
             // Named → tk_t_<Name> mangle resolves to it (distinct in Teko, plain `void *` in C).
@@ -3510,16 +3561,17 @@ static bool cg_emit_types_ordered(cbuf *b, tk_tprogram prog, const char **err) {
     #define CG_ORDERED_FREE() do { tk_free0(set.inners); tk_free0(set.slices); tk_free0(set.variants); \
         tk_free0(named); tk_free0(named_done); tk_free0(opt_done); tk_free0(uvar_done); } while (0)
 
-    // 1a) ENUMS FIRST — full typedefs. An enum carries NO by-value type dependency (its members are
-    //     plain int constants), so it can lead. Emitting it BEFORE the slice typedefs lets a `[]<enum>`
-    //     slice element type (`tk_t_<Enum> *ptr`) resolve — a struct/variant gets a forward `typedef
-    //     struct` instead, but a C enum can't be forward-declared as a struct, so we emit it complete
-    //     here. Mark each done so the step-3 fixpoint SKIPS it (no duplicate typedef) and any struct
-    //     embedding an enum sees it as ready. (Fixes `[]TokenKind` — tk_slice_TokenKind needs
-    //     tk_t_TokenKind, which the body pass would otherwise emit only AFTER the slice.)
+    // 1a) ENUMS + FLAGS FIRST — full typedefs. An enum or flags carries NO by-value type dependency
+    //     (members are plain int constants / uint constants), so they lead. Emitting before slice
+    //     typedefs lets `[]<enum>` / `[]<flags>` element type (`tk_t_<T> *ptr`) resolve — a
+    //     struct/variant gets a forward `typedef struct` instead, but a C enum can't be forward-
+    //     declared as a struct, so we emit it complete here. Mark each done so the step-3 fixpoint
+    //     SKIPS it (no duplicate typedef) and any struct embedding an enum/flags sees it as ready.
+    //     (C8.4) flags typedef is a `typedef <uint_type> tk_t_<Name>` — same no-dependency
+    //     property as enum, so it joins this pass.
     size_t enum_count = 0;
     for (size_t i = 0; i < nn; i += 1) {
-        if (named[i].body.tag != TK_BODY_ENUM) continue;
+        if (named[i].body.tag != TK_BODY_ENUM && named[i].body.tag != TK_BODY_FLAGS) continue;
         if (!emit_type_decl(b, named[i], err)) { CG_ORDERED_FREE(); return false; }
         named_done[i] = true; enum_count += 1;
     }
@@ -3556,8 +3608,9 @@ static bool cg_emit_types_ordered(cbuf *b, tk_tprogram prog, const char **err) {
     if (set.slen > 0) cb(b, "\n");
 
     // 3) fixpoint: emit named bodies + optionals + inline variants in by-value dependency order.
-    //    Enums were ALREADY emitted in step 1a (named_done set), so exclude them from `remaining`;
-    //    the fixpoint skips them (named_done) and a struct embedding an enum is immediately ready.
+    //    Enums and flags were ALREADY emitted in step 1a (named_done set), so exclude them from
+    //    `remaining`; the fixpoint skips them (named_done) and a struct embedding an enum/flags
+    //    is immediately ready.
     size_t remaining = nn + set.len + set.vlen - enum_count;
     bool progress = true;
     while (remaining > 0 && progress) {

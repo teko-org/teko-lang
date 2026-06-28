@@ -331,6 +331,26 @@ fn cg_named_is_enum(prog: checker::TProgram, name: str) -> bool {
     false
 }
 
+// (C8.4) cg_named_is_flags — is the NAMED type `name` a (declared) flags? A flags member is a
+// pre-emitted C constant `tk_t_<Name>_<MEMBER>` (power-of-2 unsigned int), not a C enum constant.
+// (C: `cg_named_is_flags`.)
+fn cg_named_is_flags(prog: checker::TProgram, name: str) -> bool {
+    mut i = 0
+    loop {
+        if i >= prog.items.len { break }
+        match prog.items[i] {
+            parser::TypeDecl as d => {
+                if d.name == name {
+                    match d.body { parser::FlagsBody => return true; _ => return false }
+                }
+            }
+            _ => { }
+        }
+        i++
+    }
+    false
+}
+
 // cg_find_decl — any TYPE_DECL (struct/variant/enum/alias) named `name`, or a `not found`
 // error. (C: `cg_find_decl`, which returned NULL.)
 fn cg_find_decl(prog: checker::TProgram, name: str) -> parser::TypeDecl | error {
@@ -3318,11 +3338,20 @@ fn emit_expr_ret(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, 
         checker::TInterp as in     => emit_interp(buf, prog, in)     // $"…{expr}…" — nested tk_str_concat over pieces + holes
         checker::TInExpr as ie     => emit_in(buf, prog, ie)         // Phase 2 — `<lhs> in [ … ]` membership (single-eval, OR of `==`)
         checker::TArrayLit as a    => emit_array_lit(buf, prog, e, a)   // [ e0, e1, … ] (Increment B+) — build a tk_slice_<elem>
-        checker::TPathExpr as pe   => {                              // Enum::Member → C constant TK_E_<UPPER enum>_<UPPER member>
-            mut out = cb(buf, "TK_E_")
-            out = cb_upper(out, pe.enum_name)
-            out = cb(out, "_")
-            cb_upper(out, pe.member)
+        checker::TPathExpr as pe   => {
+            // Enum::Member → C enum constant `TK_E_<UPPER enum>_<UPPER member>`.
+            // Flags::Member → pre-emitted C constant `tk_t_<Name>_<UPPER member>` (power-of-2).
+            if cg_named_is_flags(prog, pe.enum_name) {
+                // (C8.4) flags member: reference the pre-emitted constant tk_t_<Name>_<UPPER member>
+                mut out = mangle_type_name(buf, "", pe.enum_name)
+                out = cb(out, "_")
+                cb_upper(out, pe.member)
+            } else {
+                mut out = cb(buf, "TK_E_")
+                out = cb_upper(out, pe.enum_name)
+                out = cb(out, "_")
+                cb_upper(out, pe.member)
+            }
         }
     }
 }
@@ -3784,10 +3813,37 @@ fn emit_type_decl(buf: []byte, prog: checker::TProgram, d: parser::TypeDecl) -> 
             // type at the checker, and codegen emits that resolved type at every use site.
             buf
         }
-        parser::FlagsBody => {
-            // (C8.4) flags codegen (power-of-2 integer typedef) is deferred to C8.4.
-            // For now, emit nothing so the parser/AST crumb (C8.2) doesn't crash.
-            buf
+        parser::FlagsBody as fb => {
+            // (C8.4) A `flags Name { A; B; C; }` emits:
+            //   typedef <uint_type> tk_t_<Name>;
+            //   static const tk_t_<Name> tk_t_<Name>_<A> = (tk_t_<Name>)(((unsigned __int128)1) << 0);
+            //   …
+            // uint_type by member count: 1–8 → uint8_t, 9–16 → uint16_t,
+            //   17–32 → uint32_t, 33–64 → uint64_t, 65–128 → unsigned __int128.
+            let n = fb.members.len
+            let uint_type = if n <= 8 { "uint8_t" } else if n <= 16 { "uint16_t" } else if n <= 32 { "uint32_t" } else if n <= 64 { "uint64_t" } else { "unsigned __int128" }
+            mut out = cb(buf, "typedef ")
+            out = cb(out, uint_type)
+            out = cb(out, " ")
+            out = mangle_type_name(out, "", d.name)
+            out = cb(out, ";\n")
+            mut mi: u64 = 0
+            loop {
+                if mi >= n { break }
+                out = cb(out, "static const ")
+                out = mangle_type_name(out, "", d.name)
+                out = cb(out, " ")
+                out = mangle_type_name(out, "", d.name)
+                out = cb(out, "_")
+                out = cb_upper(out, fb.members[mi])
+                out = cb(out, " = (")
+                out = mangle_type_name(out, "", d.name)
+                out = cb(out, ")(((unsigned __int128)1) << ")
+                out = cb_i64(out, mi to i64)
+                out = cb(out, ");\n")
+                mi++
+            }
+            cb(out, "\n")
         }
         parser::ExternBody => {
             // (C7.1a) an OPAQUE foreign handle → a C `void *` typedef, so the existing
@@ -4165,25 +4221,28 @@ fn cg_emit_types_ordered(buf: []byte, prog: checker::TProgram) -> []byte | error
     let named = cg_named_decls(prog)
 
     mut out = buf
-    // 1a) ENUMS FIRST — full typedefs. An enum carries NO by-value type dependency (its members are
-    //     plain int constants), so it can lead. Emitting it BEFORE the slice typedefs lets a `[]<enum>`
-    //     slice element type (`tk_t_<Enum> *ptr`) resolve — a struct/variant gets a forward `typedef
-    //     struct` instead, but a C enum can't be forward-declared as a struct, so we emit it complete
-    //     here. Mark each emitted (em0) so the step-3 fixpoint SKIPS it (no duplicate typedef) and any
-    //     struct embedding an enum sees it as ready. (Fixes `[]TokenKind`: tk_slice_TokenKind needs
-    //     tk_t_TokenKind, which the body pass would otherwise emit only AFTER the slice.)
+    // 1a) ENUMS + FLAGS FIRST — full typedefs. An enum or flags carries NO by-value type dependency
+    //     (members are plain int constants / uint constants), so they lead. Emitting before slice
+    //     typedefs lets `[]<enum>`/`[]<flags>` element type (`tk_t_<T> *ptr`) resolve — a
+    //     struct/variant gets a forward `typedef struct` instead, but a C enum can't be forward-
+    //     declared as a struct, so we emit it complete here. Mark each emitted (em0) so the step-3
+    //     fixpoint SKIPS it (no duplicate typedef) and any struct embedding an enum/flags is ready.
+    //     (C8.4) flags typedef is a `typedef <uint_type> tk_t_<Name>` — same no-dependency
+    //     property as enum, so it joins this pass.
     mut em0 = CgEmitted { names = teko::list::empty(); opt_keys = teko::list::empty(); uvar_keys = teko::list::empty() }
     mut enum_count: u64 = 0
     mut ei = 0
     loop {
         if ei >= named.len { break }
-        match named[ei].body {
-            parser::EnumBody => {
-                out = match emit_type_decl(out, prog, named[ei]) { []byte as o => o; error as err => return err }
-                em0 = CgEmitted { names = teko::list::push(em0.names, named[ei].name); opt_keys = em0.opt_keys; uvar_keys = em0.uvar_keys }
-                enum_count = enum_count + 1
-            }
-            _ => { }
+        let is_enum_or_flags = match named[ei].body {
+            parser::EnumBody  => true
+            parser::FlagsBody => true
+            _                 => false
+        }
+        if is_enum_or_flags {
+            out = match emit_type_decl(out, prog, named[ei]) { []byte as o => o; error as err => return err }
+            em0 = CgEmitted { names = teko::list::push(em0.names, named[ei].name); opt_keys = em0.opt_keys; uvar_keys = em0.uvar_keys }
+            enum_count = enum_count + 1
         }
         ei++
     }
@@ -4233,9 +4292,9 @@ fn cg_emit_types_ordered(buf: []byte, prog: checker::TProgram) -> []byte | error
     if set.slices.len > 0 { out = cb(out, "\n") }
 
     // 3) fixpoint: emit named bodies + optionals + inline variants in by-value dependency order.
-    //    Enums were ALREADY emitted in step 1a (tracked in em0), so seed `em` with them and exclude
-    //    them from `remaining` — the fixpoint then skips them (cg_named_emitted is true) and any
-    //    struct embedding an enum is immediately ready.
+    //    Enums and flags were ALREADY emitted in step 1a (tracked in em0), so seed `em` with them
+    //    and exclude them from `remaining` — the fixpoint then skips them (cg_named_emitted is true)
+    //    and any struct embedding an enum/flags is immediately ready.
     mut em = em0
     mut remaining = named.len + set.inners.len + set.variants.len - enum_count
     mut progress = true

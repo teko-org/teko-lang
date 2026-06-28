@@ -465,7 +465,7 @@ into **rounds** (parallel waves). The goal is **maximum agent concurrency** with
 | **C8.1** `flags` keyword | `L` | — | ✅ DONE (W1) — `TK_TOKEN_FLAGS` added to `token.h`+`token.tks`; `"flags"` added to `keyword_kind()` in `lexer.c`+`lexer.tks`. 172 tests green. |
 | **C8.2** flags decl + AST | `ast`, `P` | C8.1 | ✅ DONE (W2) — `TK_BODY_FLAGS`/`FlagsBody` in ast.h+ast.tks; `parse_flags_decl` in parse_decl.c+.tks; tkb_write/read/frame updated; codegen+header honest-stop stubs; check_modules.tks case added. 172 tests green. |
 | **C8.3** checker: power-of-2 auto-assign + u128 size guard + bitwise typing + helper resolve | `chk`, `collect`, `res` | C8.2 | ✅ DONE (W3) — `is_flags_named` predicate in `expr.c`+`expr.tks`; `type_binary` allows `& \| ^` on same-flags NAMED types; `type_unary` allows `~` on flags; `type_path_expr` extended to accept `TK_BODY_FLAGS` (ordinal = bit index); `type_flags_method` lowers `has/all/any/none/add/remove` to synthetic TAST binary/compare nodes; `TK_EXPR_METHOD_CALL` dispatch tries flags before deferring. 172 tests green (native + VM). |
-| **C8.4** codegen: emit u128-fitting uint + bitwise (no shift) + helpers | `cg` | C8.2 |
+| **C8.4** codegen: emit u128-fitting uint + bitwise (no shift) + helpers | `cg` | C8.2 | ✅ DONE (W4) — `cg_named_is_flags` helper; `emit_type_decl` for `TK_BODY_FLAGS`: `typedef <uintN_t> tk_t_<Name>` (N=8/16/32/64/128 by member count) + `static const tk_t_<Name> tk_t_<Name>_<M> = (1<<i)`; `TK_TEXPR_PATH` for flags refs pre-emitted constant names; flags included in "ENUMS FIRST" emission pass. codegen.tks mirrored. 172 tests green; regressions 5/6. |
 | **C8.5** VM: flags values + bitwise + helpers | `vm` | C8.2 | ✅ DONE (W3) — flags stored as `v_int(…, false, 128)` (u128); bitwise `& | ^ ~` reuse existing integer paths; C8.3 lowered `.has/.all/.any/.none/.add/.remove` helpers to synthetic TAST binary/compare nodes so VM handles them automatically. Zero vm.c/vm.tks changes needed. 172 tests green. |
 | **C8.6** `.tkb` serialize flags | `tkb` | C8.2 | ✅ DONE (W3) — `tk_flags_body` extended with `values: unsigned __int128 *`; `FlagsBody` in ast.tks got `values: []u128`; tkb_write/read (C+.tks) updated: tag 5 now emits `n(u64)` then for each member: `name_idx(u32)+hi(u64)+lo(u64)`; parse_decl.tks literals fixed; forward-decl fix for `is_flags_named` in expr.c. 172 tests green (native + VM). |
 
@@ -476,7 +476,7 @@ into **rounds** (parallel waves). The goal is **maximum agent concurrency** with
 | Crumb | Owns | Dep |
 |-------|------|-----|
 | **C9.1** SAST gate (CI checks) | *(CI/build scripts)* | — |
-| **C9.2** capability/sandbox audit of `exp`/`extern`/syscall surface | `res`/`scope` + report | — |
+| **C9.2** capability/sandbox audit of `exp`/`extern`/syscall surface | `res`/`scope` + report | — | ✅ DONE (W4) — `src/checker/capability_audit.md` written; findings: varargs gap (MEDIUM), `exp fn` not ABI-exported, `process::run` unrestricted (documented intent), `teko::mem` unsafe-by-contract (documented). No exploitable bugs found; minor notes for future tightening. 172 tests green. |
 
 **Rounds (cross-phase wave schedule):** C9.2 → **W4** · C9.1 → **W6** (see master sequence table).
 
@@ -556,8 +556,8 @@ start until the previous wave's integration gate passes: **build green + VM==nat
 | | ~~**C8.3** `flags` checker — power-of-2 auto-assign, u128 guard, bitwise typing, helpers~~ ✅ | `chk`, `collect`, `res` | | |
 | | ~~**C8.5** `flags` VM — flags values + bitwise + helpers~~ ✅ | `vm` | | |
 | | ~~**C8.6** `flags` TKB serialize~~ ✅ | `tkb` | **4** | ✅ build green + VM==native (172 tests; regressions 5/6) |
-| **W4** | **C8.4** `flags` codegen — emit u128-fitting uint + bitwise + helpers *(deps: C8.3 ✅, C1.7-CAST frees `cg`)* | `cg` | | |
-| | **C9.2** capability/sandbox audit — `exp`/`extern`/syscall surface *(deps: Phase 7 ✅, C8.3 ✅)* | `res`, `scope` + report | **2** | build green + audit report |
+| ~~**W4**~~ ✅ | ~~**C8.4** `flags` codegen — emit u128-fitting uint + bitwise + helpers~~ ✅ | `cg` | | |
+| | ~~**C9.2** capability/sandbox audit — `exp`/`extern`/syscall surface~~ ✅ | `res`, `scope` + report | **2** | ✅ build green + audit report (172 tests; regressions 5/6) |
 | **W5** | **C7.18** `defer` — full pipeline: lexer keyword; AST `DeferStmt`; parser in `parse_stmt`; checker (void-context block); codegen (cleanup at ALL exit points of the enclosing fn); VM (deferred-stack per frame, LIFO on exit); TKB serialize *(deps: C1.7-CAST ✅ — codegen stable)* | `L`, `ast`, `P`, `chk`, `cg`, `vm`, `tkb` | **1** | build green + VM==native |
 | **W6** | **C7.1j** multi-OS/arch CI pipelines — Linux arm64+x86, Windows arm64+x86, macOS arm64 *(deps: all Phase 7 ✅, Phase 8 ✅, defer ✅)* | CI scripts | | |
 | | **C9.1** SAST gate (CI checks) *(deps: C9.2 ✅, C7.1j CI infra)* | CI scripts | **2** | CI green on all platforms |
