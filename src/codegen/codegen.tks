@@ -3204,13 +3204,17 @@ fn emit_match_value(buf: []byte, prog: checker::TProgram, ret_type: checker::Typ
     cb(out, "; })")
 }
 
-// emit_match_tail — TAIL form: each winning arm `return`s its body, as a straight `if` chain
-// inside a brace block holding the subject temp. The first matching arm with a holding guard
-// returns and exits; a failed guard falls through. `ret_type` threads the fn return type so
-// a tail arm body that yields a case value into a variant return slot is wrapped (emit_as).
-// (C: `emit_match_tail`.)
+// emit_match_tail — TAIL form: each winning arm `return`s its body, as an `if` chain inside a
+// brace block holding the subject temp. The FIRST winning arm runs its block and then `goto`s a
+// unique commit label past the chain (so the search stops at the first match — mirrors the VM).
+// The `goto` is essential: a tail match in a `-> void` fn has arm bodies that do NOT diverge
+// (no implicit `return`), so without the commit jump MULTIPLE arms would fall through and all
+// fire. A failed `when` guard naturally falls through to the next arm (the goto is INSIDE the
+// guard block). `ret_type` threads the fn return type so a tail arm body that yields a case value
+// into a variant return slot is wrapped (emit_as). (C: `emit_match_tail`.)
 fn emit_match_tail(buf: []byte, prog: checker::TProgram, e: checker::TExpr, m: checker::TMatchExpr, in_main: bool, ret_type: checker::Type, indent: str) -> []byte | error {
     let subj = fresh_named("_s", buf.len to i64)
+    let done = teko::str::concat(fresh_named("tk_mt", buf.len to i64 + 1), "_done")   // unique commit label (str concat — no `+` on str)
     let subjT = m.subject.type   // for optional / variant pattern lowering
     let inner = cb_indent_deeper(indent)
     let inner2 = cb_indent_deeper(inner)
@@ -3244,11 +3248,21 @@ fn emit_match_tail(buf: []byte, prog: checker::TProgram, e: checker::TExpr, m: c
         // trailing value becomes a `return`, and an explicit return/break/continue inside it
         // emits real C control flow (mirrors the VM running the arm block flow-aware).
         out = match emit_block_tail(out, arm.body, in_main, prog, ret_type, ci) { []byte as o => o; error as err => return err }
+        // FIRST match wins → jump past the remaining arms. After a diverging body (return/exit/
+        // panic) this is dead code (cc sees the generated C with `-w`); after a non-diverging
+        // void body it is the line that stops later arms from also firing.
+        out = cb(out, ci)
+        out = cb(out, "goto ")
+        out = cb(out, done)
+        out = cb(out, ";\n")
         if arm.has_when { out = cb(out, inner2); out = cb(out, "}\n") }
         out = cb(out, inner)
         out = cb(out, "}\n")
         i++
     }
+    out = cb(out, inner)
+    out = cb(out, done)
+    out = cb(out, ": ;\n")
     out = cb(out, indent)
     cb(out, "}\n")
 }

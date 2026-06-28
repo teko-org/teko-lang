@@ -2739,10 +2739,17 @@ static bool emit_match_value(cbuf *b, const tk_texpr *e, const char **err) {
 // TAIL form — each winning arm `return`s its body. Lowered as a straight `if` chain inside
 // a brace block holding the subject temp. The first matching arm with a holding guard
 // returns and exits; a failed guard falls through to the next arm.
+// TAIL form — each winning arm `return`s its body, as an `if` chain inside a brace block holding
+// the subject temp. The FIRST winning arm runs its block and then `goto`s a unique commit label
+// past the chain (so the search stops at the first match — mirrors the VM). The `goto` is
+// essential: a tail match in a `-> void` fn has arm bodies that do NOT diverge (no implicit
+// `return`), so without the commit jump MULTIPLE arms would fall through and all fire. A failed
+// `when` guard naturally falls through to the next arm (the goto is INSIDE the guard block).
 static bool emit_match_tail(cbuf *b, const tk_texpr *e, bool in_main,
                             tk_type ret_type, const char *indent, const char **err) {
-    char subj[40];
+    char subj[40], done[48];
     snprintf(subj, sizeof subj, "_s%zu", (size_t)b->len);
+    snprintf(done, sizeof done, "tk_mt%zu_done", (size_t)b->len + 1);   // unique commit label
     tk_type subjT = e->as.match_expr.subject->type;   // for optional / variant pattern lowering
     char inner[72]; snprintf(inner, sizeof inner, "%s    ", indent);
     char inner2[80]; snprintf(inner2, sizeof inner2, "%s    ", inner);
@@ -2771,9 +2778,14 @@ static bool emit_match_tail(cbuf *b, const tk_texpr *e, bool in_main,
         // trailing value becomes a `return`, and an explicit return/break/continue inside it
         // emits real C control flow (mirrors the VM running the arm block flow-aware).
         if (!emit_block_tail(b, arm->body, arm->nbody, in_main, ret_type, ci, err)) return false;
+        // FIRST match wins → jump past the remaining arms. After a diverging body (return/exit/
+        // panic) this is dead code (cc sees the generated C with `-w`); after a non-diverging
+        // void body it is the line that stops later arms from also firing.
+        cb(b, ci); cb(b, "goto "); cb(b, done); cb(b, ";\n");
         if (arm->has_when) { cb(b, inner2); cb(b, "}\n"); }
         cb(b, inner); cb(b, "}\n");
     }
+    cb(b, inner); cb(b, done); cb(b, ": ;\n");
     cb(b, indent); cb(b, "}\n");
     return true;
 }

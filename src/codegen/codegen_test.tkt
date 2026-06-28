@@ -773,6 +773,87 @@ fn cgt_emit_function_comprehensive() {
 }
 
 // ---------------------------------------------------------------------------
+// Group N1b: void TAIL match must CHAIN its arms with a commit jump (REGRESSION).
+//   A statement-position / tail `match` in a `-> void` fn has arm bodies that do NOT diverge
+//   (no implicit `return`). emit_match_tail must emit the FIRST winning arm's body then `goto`
+//   a unique commit label past the rest — otherwise the arms fall through as independent `if`s
+//   (`if(c){a} if(1){b}`) and MULTIPLE arms fire (the wildcard `if(1)` ALWAYS fires). The fix
+//   makes EXACTLY ONE arm run, matching the VM and the value-form match. This test asserts the
+//   emitted C carries the commit `goto …_done` chain (the structural guarantee).
+// ---------------------------------------------------------------------------
+fn cgt_lit_arm(v: i128, body_name: str) -> checker::TArm {
+    // arm: `v => { let <body_name> = <v> }` — a NON-diverging effect body (the bug trigger).
+    let lit: parser::Pattern = parser::LiteralPattern {
+        value = parser::Expr { kind = parser::Number { is_float = false; value = v; fval = 0.0 }; line = 0; col = 0 }
+    }
+    let eff: checker::TStatement = checker::TBinding {
+        kind   = parser::BindKind::Let
+        target = parser::SimpleName { name = body_name }
+        bound  = checker::Prim { kind = checker::PrimKind::I64 }
+        value  = cgt_num_i64(v)
+    }
+    checker::TArm { pattern = lit; has_when = false; guard = cgt_num_i64(0); body = teko::list::push(cgt_empty_stmts(), eff) }
+}
+fn cgt_wild_arm(body_name: str) -> checker::TArm {
+    let eff: checker::TStatement = checker::TBinding {
+        kind   = parser::BindKind::Let
+        target = parser::SimpleName { name = body_name }
+        bound  = checker::Prim { kind = checker::PrimKind::I64 }
+        value  = cgt_num_i64(99)
+    }
+    checker::TArm { pattern = parser::WildcardPattern { }; has_when = false; guard = cgt_num_i64(0); body = teko::list::push(cgt_empty_stmts(), eff) }
+}
+
+#test
+fn cgt_void_tail_match_chains_arms() {
+    let prog = cgt_prog()
+
+    // subject `k: i64`, two arms (1 => {effect}; _ => {effect}); the match is the void fn's tail.
+    let subj = cgt_e_var("k")
+    mut arms: []checker::TArm = teko::list::empty()
+    arms = teko::list::push(arms, cgt_lit_arm(1, "a1"))
+    arms = teko::list::push(arms, cgt_wild_arm("aw"))
+    let match_e = checker::TExpr {
+        kind = checker::TMatchExpr { subject = subj; arms = arms }
+        type = checker::Void { }
+        line = 0; col = 0
+    }
+    let tail: []checker::TStatement = teko::list::push(cgt_empty_stmts(), cgt_stmt(match_e))
+    let f = cgt_fn0("cgt_fn_void_match", "teko::cgt", checker::Void { }, tail)
+    let r = match emit_function(cgt_empty(), prog, f) { []byte as o => str(o); error => "" }
+
+    teko::assert::is_true(r.len > 0)
+    teko::assert::is_true(teko::str::contains(r, "cgt_fn_void_match"))
+    // Both arm bodies present...
+    teko::assert::is_true(teko::str::contains(r, "a1"))
+    teko::assert::is_true(teko::str::contains(r, "aw"))
+    // ...but chained with a commit jump so EXACTLY ONE arm runs (the regression guarantee).
+    // Before the fix the arms were independent `if`s with NO goto, so both fired.
+    teko::assert::is_true(teko::str::contains(r, "goto "))
+    teko::assert::is_true(teko::str::contains(r, "_done"))
+
+    // 3-arm shape (1 => ; 2 => ; _ =>) must likewise chain — assert TWO commit jumps reach the
+    // single shared label (one per non-final arm + the final wildcard = 3 gotos to one label).
+    mut arms3: []checker::TArm = teko::list::empty()
+    arms3 = teko::list::push(arms3, cgt_lit_arm(1, "b1"))
+    arms3 = teko::list::push(arms3, cgt_lit_arm(2, "b2"))
+    arms3 = teko::list::push(arms3, cgt_wild_arm("bw"))
+    let match3 = checker::TExpr {
+        kind = checker::TMatchExpr { subject = cgt_e_var("k"); arms = arms3 }
+        type = checker::Void { }
+        line = 0; col = 0
+    }
+    let tail3: []checker::TStatement = teko::list::push(cgt_empty_stmts(), cgt_stmt(match3))
+    let f3 = cgt_fn0("cgt_fn_void_match3", "teko::cgt", checker::Void { }, tail3)
+    let r3 = match emit_function(cgt_empty(), prog, f3) { []byte as o => str(o); error => "" }
+    teko::assert::is_true(teko::str::contains(r3, "b1"))
+    teko::assert::is_true(teko::str::contains(r3, "b2"))
+    teko::assert::is_true(teko::str::contains(r3, "bw"))
+    teko::assert::is_true(teko::str::contains(r3, "goto "))
+    teko::assert::is_true(teko::str::contains(r3, "_done"))
+}
+
+// ---------------------------------------------------------------------------
 // Group N2: (C7.18) defer lowering — collect_defers + transform_defers splice the defer
 // body (LIFO) before every return, matching codegen.c's g_cg_defers/emit_defers OUTPUT.
 // ---------------------------------------------------------------------------
