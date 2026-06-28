@@ -32,6 +32,29 @@ fn parse_params(tokens: []lexer::Token, pos: u64) -> ParsedParams | error {
 
 // `[doc] [pub|exp] fn name(params) -> ret { body }` (B.21, B.29). Doc + visibility optional
 // and precede `fn`; `-> ret` optional (absent = Unit). `pos` is at the doc, `pub`/`exp`, or `fn`.
+// (S4) An OPTIONAL generic type-parameter list `<T, U, …>` after a fn/type NAME. `pos` is at the
+// token AFTER the name. No `<` → empty list, pos unchanged. The decl-site `<` is UNAMBIGUOUS: the
+// `fn`/`type` keyword already committed the parse to a decl, so it is never a comparison. A decl
+// list never nests, so it closes with a single `>` (no `>>` split — that is parse_type_args' job).
+fn parse_type_params(tokens: []lexer::Token, pos: u64) -> ParsedNames | error {
+    if !is_kind_at(tokens, pos, lexer::TokenKind::Lt) {
+        return ParsedNames { names = teko::list::empty(), next = pos }
+    }
+    mut p = pos + 1
+    mut names: []str = teko::list::empty()
+    loop {
+        if !is_kind_at(tokens, p, lexer::TokenKind::Ident) {
+            return err_at(tokens, p, "expected a type-parameter name in '<…>'")
+        }
+        names = teko::list::push(names, tokens[p].text)
+        p = p + 1
+        if is_kind_at(tokens, p, lexer::TokenKind::Comma) { p = p + 1 }
+        else if is_kind_at(tokens, p, lexer::TokenKind::Gt) { p = p + 1; break }
+        else { return err_at(tokens, p, "expected ',' or '>' in a type-parameter list") }
+    }
+    ParsedNames { names = names, next = p }
+}
+
 fn parse_function(tokens: []lexer::Token, pos: u64, is_test: bool, os_guard: str) -> ParsedDecl | error {
     mut p = pos
     mut has_doc = false
@@ -65,6 +88,8 @@ fn parse_function(tokens: []lexer::Token, pos: u64, is_test: bool, os_guard: str
     let name_line: u32 = tokens[p].line
     let name_col: u32 = tokens[p].col   // W-loc-2: the fn's source position
     p = p + 1
+    let tps = match parse_type_params(tokens, p) { ParsedNames as x => x; error as e => return e }   // (S4) `<T, …>`
+    p = tps.next
     if !is_kind_at(tokens, p, lexer::TokenKind::LParen) {
         return err_at(tokens, p, "expected '(' for the parameter list")
     }
@@ -101,13 +126,13 @@ fn parse_function(tokens: []lexer::Token, pos: u64, is_test: bool, os_guard: str
             p = p + 1
         }
         let no_body: []Statement = teko::list::empty()
-        return ParsedDecl { node = Function { name = name, type_params = teko::list::empty(), params = params.params, has_return = has_return, return_type = return_type, body = no_body, vis = vis, has_doc = has_doc, doc = doc, line = name_line, col = name_col, is_test = is_test, is_extern = true, c_symbol = c_symbol, from_lib = from_lib, os_guard = os_guard }, next = p }
+        return ParsedDecl { node = Function { name = name, type_params = tps.names, params = params.params, has_return = has_return, return_type = return_type, body = no_body, vis = vis, has_doc = has_doc, doc = doc, line = name_line, col = name_col, is_test = is_test, is_extern = true, c_symbol = c_symbol, from_lib = from_lib, os_guard = os_guard }, next = p }
     }
     if !is_kind_at(tokens, p, lexer::TokenKind::LBrace) {
         return err_at(tokens, p, "expected '{' for the function body")
     }
     let blk = match parse_block(tokens, p) { ParsedBlock as x => x; error as e => return e }
-    ParsedDecl { node = Function { name = name, type_params = teko::list::empty(), params = params.params, has_return = has_return, return_type = return_type, body = blk.statements, vis = vis, has_doc = has_doc, doc = doc, line = name_line, col = name_col, is_test = is_test, is_extern = false, c_symbol = "", from_lib = "", os_guard = os_guard }, next = blk.next }
+    ParsedDecl { node = Function { name = name, type_params = tps.names, params = params.params, has_return = has_return, return_type = return_type, body = blk.statements, vis = vis, has_doc = has_doc, doc = doc, line = name_line, col = name_col, is_test = is_test, is_extern = false, c_symbol = "", from_lib = "", os_guard = os_guard }, next = blk.next }
 }
 
 // `{ name: T; name: T; … }` — field list; `;`/newline separates; empty `{ }` allowed;
@@ -247,15 +272,17 @@ fn parse_type_decl(tokens: []lexer::Token, pos: u64) -> ParsedDecl | error {
     let name_line: u32 = tokens[p].line
     let name_col: u32 = tokens[p].col   // W-loc-2: the type's source position
     p = p + 1
+    let tps = match parse_type_params(tokens, p) { ParsedNames as x => x; error as e => return e }   // (S4) `type Box<T> = …`
+    p = tps.next
     if is_extern {
         // `extern type Name` — an OPAQUE foreign handle: no `= <body>`, lowers to `void *`.
-        return ParsedDecl { node = TypeDecl { name = name, type_params = teko::list::empty(), body = ExternBody { }, vis = vis, has_doc = has_doc, doc = doc, line = name_line, col = name_col }, next = p }
+        return ParsedDecl { node = TypeDecl { name = name, type_params = tps.names, body = ExternBody { }, vis = vis, has_doc = has_doc, doc = doc, line = name_line, col = name_col }, next = p }
     }
     if !is_kind_at(tokens, p, lexer::TokenKind::Assign) {
         return err_at(tokens, p, "expected '=' in a type declaration")
     }
     let body = match parse_type_body(tokens, p + 1) { ParsedBody as x => x; error as e => return e }
-    ParsedDecl { node = TypeDecl { name = name, type_params = teko::list::empty(), body = body.node, vis = vis, has_doc = has_doc, doc = doc, line = name_line, col = name_col }, next = body.next }
+    ParsedDecl { node = TypeDecl { name = name, type_params = tps.names, body = body.node, vis = vis, has_doc = has_doc, doc = doc, line = name_line, col = name_col }, next = body.next }
 }
 
 // extends the Parsed* family.
