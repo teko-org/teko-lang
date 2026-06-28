@@ -1,0 +1,153 @@
+name: SAST Gate
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  # ── path filter ──────────────────────────────────────────────────────────────
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      run: ${{ steps.filter.outputs.run }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            run:
+              - 'src/**'
+              - 'CMakeLists.txt'
+              - '.github/workflows/sast.yml'
+
+  # ── CodeQL analysis ──────────────────────────────────────────────────────────
+  codeql:
+    needs: changes
+    if: needs.changes.outputs.run == 'true'
+    name: CodeQL (C/C++)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      security-events: write
+      actions: read
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: c-cpp
+
+      - name: Install build dependencies
+        run: |
+          sudo rm -f /etc/apt/sources.list.d/microsoft*.list /etc/apt/sources.list.d/azure*.list /etc/apt/sources.list.d/azure-cli*.list 2>/dev/null || true
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build clang
+
+      - name: Build for CodeQL
+        run: |
+          cmake -S . -B build-codeql -DCMAKE_BUILD_TYPE=Debug
+          cmake --build build-codeql --target teko --parallel 4
+
+      - name: Analyze with CodeQL
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: /language:c-cpp
+
+  # ── clang-tidy audit ─────────────────────────────────────────────────────────
+  clang-tidy-audit:
+    needs: changes
+    if: needs.changes.outputs.run == 'true'
+    name: clang-tidy audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo rm -f /etc/apt/sources.list.d/microsoft*.list /etc/apt/sources.list.d/azure*.list /etc/apt/sources.list.d/azure-cli*.list 2>/dev/null || true
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build clang clang-tidy
+
+      - name: Generate compile_commands.json
+        run: |
+          cmake -S . -B build-ct \
+            -G "Ninja" \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+          cmake --build build-ct --target teko --parallel 4
+
+      - name: Run clang-tidy
+        run: |
+          run-clang-tidy -p build-ct src/ \
+            -checks='-*,clang-analyzer-*,cert-*,bugprone-*' \
+            -warnings-as-errors='clang-analyzer-security.*,clang-analyzer-core.NullDereference' \
+            2>&1 | tee clang-tidy-results.txt || true
+
+      - name: Upload clang-tidy results
+        uses: actions/upload-artifact@v4
+        with:
+          name: clang-tidy-results
+          path: clang-tidy-results.txt
+
+      - name: Capability audit present
+        run: |
+          test -f src/checker/capability_audit.md \
+            && echo "Capability audit found" \
+            || (echo "Missing capability_audit.md — run C9.2 audit"; exit 1)
+
+      - name: Fail on security findings
+        run: |
+          if grep -qE 'clang-analyzer-security|NullDereference' clang-tidy-results.txt; then
+            echo "Security findings detected!"
+            grep -E 'clang-analyzer-security|NullDereference' clang-tidy-results.txt
+            exit 1
+          fi
+          echo "No security findings"
+
+  # ── gate: aggregates both SAST jobs ──────────────────────────────────────────
+  gate:
+    name: SAST gate
+    runs-on: ubuntu-latest
+    needs: [changes, codeql, clang-tidy-audit]
+    if: always()
+    steps:
+      - name: Evaluate results
+        run: |
+          CODEQL_RESULT="${{ needs.codeql.result }}"
+          TIDY_RESULT="${{ needs.clang-tidy-audit.result }}"
+          CHANGES="${{ needs.changes.outputs.run }}"
+
+          echo "changes.run        = $CHANGES"
+          echo "codeql             = $CODEQL_RESULT"
+          echo "clang-tidy-audit   = $TIDY_RESULT"
+
+          # If the paths filter said nothing relevant changed, everything skipped → OK
+          if [ "$CHANGES" != "true" ]; then
+            echo "No relevant files changed — gate passes."
+            exit 0
+          fi
+
+          # Both jobs must succeed
+          if [ "$CODEQL_RESULT" = "failure" ] || [ "$CODEQL_RESULT" = "cancelled" ]; then
+            echo "ERROR: codeql $CODEQL_RESULT"
+            exit 1
+          fi
+
+          if [ "$TIDY_RESULT" = "failure" ] || [ "$TIDY_RESULT" = "cancelled" ]; then
+            echo "ERROR: clang-tidy-audit $TIDY_RESULT"
+            exit 1
+          fi
+
+          echo "SAST gate passed."
+          exit 0

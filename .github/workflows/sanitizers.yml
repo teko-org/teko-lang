@@ -1,0 +1,199 @@
+name: Sanitizers & Stress
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  # ── path filter ──────────────────────────────────────────────────────────────
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      run: ${{ steps.filter.outputs.run }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            run:
+              - 'src/**'
+              - 'tests/**'
+              - 'CMakeLists.txt'
+              - '.github/workflows/sanitizers.yml'
+
+  # ── ASan + UBSan (default computed-goto dispatch) ────────────────────────────
+  asan-default:
+    name: ASan+UBSan / default dispatch
+    needs: changes
+    if: needs.changes.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y cmake ninja-build clang
+
+      - name: Configure CMake (ASan + UBSan)
+        run: |
+          cmake -S . -B build-asan \
+            -G "Ninja" \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
+
+      - name: Build teko
+        run: cmake --build build-asan --target teko --parallel 4
+
+      - name: Run tests (ASan + UBSan)
+        env:
+          ASAN_OPTIONS: halt_on_error=1:detect_leaks=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: ./build-asan/teko test .
+
+  # ── ASan + UBSan (portable switch dispatch) ──────────────────────────────────
+  asan-portable:
+    name: ASan+UBSan / portable switch dispatch
+    needs: changes
+    if: needs.changes.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y cmake ninja-build clang
+
+      - name: Configure CMake (ASan + UBSan, portable dispatch)
+        run: |
+          cmake -S . -B build-asan-portable \
+            -G "Ninja" \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g" \
+            -DTEKO_VM_PORTABLE_DISPATCH=ON
+
+      - name: Build teko
+        run: cmake --build build-asan-portable --target teko --parallel 4
+
+      - name: Run tests (ASan + UBSan, portable dispatch)
+        env:
+          ASAN_OPTIONS: halt_on_error=1:detect_leaks=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: ./build-asan-portable/teko test .
+
+  # ── TSan (Thread Sanitizer) ───────────────────────────────────────────────────
+  tsan:
+    name: TSan
+    needs: changes
+    if: needs.changes.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y cmake ninja-build clang
+
+      - name: Configure CMake (TSan)
+        run: |
+          cmake -S . -B build-tsan \
+            -G "Ninja" \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_C_FLAGS="-fsanitize=thread -fno-omit-frame-pointer -g"
+
+      - name: Build teko
+        run: cmake --build build-tsan --target teko --parallel 4
+
+      - name: Run tests (TSan)
+        env:
+          TSAN_OPTIONS: halt_on_error=1
+        run: ./build-tsan/teko test .
+
+  # ── Windows stress: run tests 20 times ───────────────────────────────────────
+  windows-stress:
+    name: Windows stress (20 runs)
+    needs: changes
+    if: needs.changes.outputs.run == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure CMake
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build teko
+        run: cmake --build build --config Release --target teko --parallel 4
+
+      - name: Run tests 20 times
+        shell: pwsh
+        run: |
+          for ($i = 1; $i -le 20; $i++) {
+            Write-Host "=== Run $i / 20 ==="
+            .\build\Release\teko.exe test .
+            if ($LASTEXITCODE -ne 0) {
+              Write-Error "Test run $i failed with exit code $LASTEXITCODE"
+              exit $LASTEXITCODE
+            }
+          }
+          Write-Host "All 20 stress runs passed."
+
+  # ── gate: aggregates all sanitizer + stress results ──────────────────────────
+  gate:
+    name: Sanitizer gate
+    runs-on: ubuntu-latest
+    needs: [changes, asan-default, asan-portable, tsan, windows-stress]
+    if: always()
+    steps:
+      - name: Evaluate results
+        run: |
+          ASAN_DEFAULT="${{ needs.asan-default.result }}"
+          ASAN_PORTABLE="${{ needs.asan-portable.result }}"
+          TSAN="${{ needs.tsan.result }}"
+          WINDOWS_STRESS="${{ needs.windows-stress.result }}"
+          CHANGES="${{ needs.changes.outputs.run }}"
+
+          echo "changes.run    = $CHANGES"
+          echo "asan-default   = $ASAN_DEFAULT"
+          echo "asan-portable  = $ASAN_PORTABLE"
+          echo "tsan           = $TSAN"
+          echo "windows-stress = $WINDOWS_STRESS"
+
+          if [ "$CHANGES" != "true" ]; then
+            echo "No relevant files changed — gate passes."
+            exit 0
+          fi
+
+          FAILED=0
+          for RESULT in "$ASAN_DEFAULT" "$ASAN_PORTABLE" "$TSAN" "$WINDOWS_STRESS"; do
+            if [ "$RESULT" = "failure" ] || [ "$RESULT" = "cancelled" ]; then
+              FAILED=1
+            fi
+          done
+
+          if [ "$FAILED" = "1" ]; then
+            echo "ERROR: one or more sanitizer/stress jobs failed or were cancelled."
+            exit 1
+          fi
+
+          echo "Sanitizer gate passed."
+          exit 0

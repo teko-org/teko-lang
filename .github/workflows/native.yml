@@ -1,0 +1,155 @@
+name: Native Build & Test
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  # ── path filter ──────────────────────────────────────────────────────────────
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      run: ${{ steps.filter.outputs.run }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            run:
+              - 'src/**'
+              - 'tests/**'
+              - 'CMakeLists.txt'
+              - '.github/workflows/native.yml'
+
+  # ── matrix: Linux x86_64 + arm64, macOS arm64, Windows x86_64 + arm64 ──────
+  build-test:
+    needs: changes
+    if: needs.changes.outputs.run == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            label: linux-x86_64
+            cmake_args: -G "Ninja" -DCMAKE_C_COMPILER=clang -DCMAKE_BUILD_TYPE=Release
+            test_cmd: ./build/teko test .
+            install_deps: |
+              sudo apt-get update -y
+              sudo apt-get install -y cmake ninja-build clang
+
+          - os: ubuntu-24.04-arm
+            label: linux-arm64
+            cmake_args: -G "Ninja" -DCMAKE_C_COMPILER=clang -DCMAKE_BUILD_TYPE=Release
+            test_cmd: ./build/teko test .
+            install_deps: |
+              sudo apt-get update -y
+              sudo apt-get install -y cmake ninja-build clang
+
+          - os: macos-latest
+            label: macos-arm64
+            cmake_args: -DCMAKE_BUILD_TYPE=Release
+            test_cmd: ./build/teko test .
+            install_deps: ""
+
+          - os: windows-latest
+            label: windows-x86_64
+            cmake_args: -DCMAKE_BUILD_TYPE=Release
+            test_cmd: .\build\Release\teko.exe test .
+            install_deps: ""
+
+          - os: windows-11-arm
+            label: windows-arm64
+            cmake_args: -DCMAKE_BUILD_TYPE=Release
+            test_cmd: .\build\Release\teko.exe test .
+            install_deps: ""
+
+    name: build-test / ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies (Linux)
+        if: matrix.install_deps != ''
+        run: ${{ matrix.install_deps }}
+
+      - name: Configure CMake
+        run: cmake -S . -B build ${{ matrix.cmake_args }}
+
+      - name: Build teko
+        run: cmake --build build --config Release --target teko --parallel 4
+
+      - name: Run tests
+        run: ${{ matrix.test_cmd }}
+
+  # ── RISC-V cross-compile + QEMU (non-blocking) ───────────────────────────────
+  riscv64-qemu:
+    needs: changes
+    if: needs.changes.outputs.run == 'true'
+    name: build-test / linux-riscv64 (qemu)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install cross-compilation tools and QEMU
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            cmake ninja-build \
+            gcc-riscv64-linux-gnu \
+            qemu-user qemu-user-static \
+            binfmt-support
+
+      - name: Configure CMake (RISC-V cross)
+        run: |
+          cmake -S . -B build \
+            -G "Ninja" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=riscv64-linux-gnu-gcc \
+            -DCMAKE_EXE_LINKER_FLAGS="-static"
+
+      - name: Build teko (RISC-V)
+        run: cmake --build build --config Release --target teko --parallel 4
+
+      - name: Run tests via QEMU user-mode
+        run: qemu-riscv64-static ./build/teko test .
+
+  # ── gate: aggregates all build-test + riscv results ──────────────────────────
+  gate:
+    name: CI gate
+    runs-on: ubuntu-latest
+    needs: [changes, build-test, riscv64-qemu]
+    if: always()
+    steps:
+      - name: Evaluate results
+        run: |
+          BUILD_RESULT="${{ needs.build-test.result }}"
+          RISCV_RESULT="${{ needs.riscv64-qemu.result }}"
+          CHANGES="${{ needs.changes.outputs.run }}"
+
+          echo "changes.run   = $CHANGES"
+          echo "build-test    = $BUILD_RESULT"
+          echo "riscv64-qemu  = $RISCV_RESULT"
+
+          # If the paths filter said nothing relevant changed, everything skipped → OK
+          if [ "$CHANGES" != "true" ]; then
+            echo "No relevant files changed — gate passes."
+            exit 0
+          fi
+
+          # build-test must be success (not failure, not cancelled)
+          if [ "$BUILD_RESULT" = "failure" ] || [ "$BUILD_RESULT" = "cancelled" ]; then
+            echo "ERROR: build-test $BUILD_RESULT"
+            exit 1
+          fi
+
+          # riscv64-qemu is non-blocking (continue-on-error), so any result is fine
+          echo "Gate passed."
+          exit 0
