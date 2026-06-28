@@ -192,6 +192,7 @@ typedef enum { TK_VIS_PRIVATE = 0, TK_VIS_PUB, TK_VIS_EXP } tk_visibility;
 
 typedef struct {                                                   // Function (parser/ast.tks)
     tk_str       name;
+    tk_str      *type_params; size_t n_type_params;                 // generic type-parameter names (S4 — n_type_params 0 for a non-generic fn)
     tk_param    *params; size_t nparams;
     bool         has_return;                                       // `-> ret` present? (absent = Unit)
     tk_type_expr return_type;                                      // valid iff has_return
@@ -224,6 +225,7 @@ typedef struct {                                                        // TypeB
 } tk_type_body;
 typedef struct {                                                        // TypeDecl (nominal — B.13)
     tk_str        name;
+    tk_str       *type_params; size_t n_type_params;                     // generic type-parameter names (S4 — n_type_params 0 for a non-generic type)
     tk_type_body  body;
     tk_visibility vis;                                                  // private (default) / pub / exp
     bool          has_doc;
