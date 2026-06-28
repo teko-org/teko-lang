@@ -12,6 +12,21 @@ tk_error tk_error_named(const char *msg, tk_str name) {
     return tk_error_make(buf);
 }
 
+// (S4) tiny string builders for name mangling (whole-compile-lifetime; tk_alloc — arena-style).
+static tk_str rt_cstr(const char *s) {
+    size_t n = strlen(s);
+    tk_byte *buf = tk_alloc(n ? n : 1); if (!buf) abort();
+    if (n) memcpy(buf, s, n);
+    return (tk_str){ .ptr = buf, .len = n };
+}
+static tk_str rt_concat(tk_str a, tk_str b) {
+    size_t n = a.len + b.len;
+    tk_byte *buf = tk_alloc(n ? n : 1); if (!buf) abort();
+    if (a.len) memcpy(buf, a.ptr, a.len);
+    if (b.len) memcpy(buf + a.len, b.ptr, b.len);
+    return (tk_str){ .ptr = buf, .len = n };
+}
+
 // (C1.8) the surface spelling of a prim kind — the same names tk_builtin_type accepts (scope.c),
 // so a rendered mismatch reads in the user's own vocabulary ("i32", "f64", "bool", …).
 static const char *prim_name(tk_prim_kind k) {
@@ -289,6 +304,61 @@ tk_type_result resolve_named(tk_path path, tk_type_table table) {
     return (tk_type_result){ .ok = false, .as.error = tk_error_named("unknown type", name) };
 }
 
+// (S4) a concrete type → its symbol fragment for a mangled generic-instance name. Mirror of
+// resolve.tks::type_mangle. A SENTINEL slice/optional (NULL element/inner) mangles its hole as
+// "void" (the C twin of the Teko `Void`-marker element), never dereferencing NULL.
+tk_str tk_type_mangle(tk_type t) {
+    switch (t.tag) {
+        case TK_TYPE_PRIM:     return rt_cstr(prim_name(t.as.prim));
+        case TK_TYPE_STR:      return rt_cstr("str");
+        case TK_TYPE_BYTE:     return rt_cstr("byte");
+        case TK_TYPE_NAMED:    return t.as.named.name;
+        case TK_TYPE_SLICE:    return rt_concat(rt_cstr("slice_"),
+                                   t.as.slice.element  ? tk_type_mangle(*t.as.slice.element)  : rt_cstr("void"));
+        case TK_TYPE_OPTIONAL: return rt_concat(rt_cstr("opt_"),
+                                   t.as.optional.inner ? tk_type_mangle(*t.as.optional.inner) : rt_cstr("void"));
+        case TK_TYPE_ERROR:    return rt_cstr("error");
+        case TK_TYPE_VOID:     return rt_cstr("void");
+        case TK_TYPE_PTR:      return rt_cstr("ptr");
+        case TK_TYPE_UPTR:     return rt_cstr("uptr");
+        case TK_TYPE_VARIANT:  return rt_cstr("variant");
+        case TK_TYPE_FUNC:     return rt_cstr("func");
+    }
+    return rt_cstr("type");
+}
+
+// (S4) the mangled name of a generic INSTANCE: `<base>__g__<arg0>[__<arg1>…]`. Mirror of
+// resolve.tks::generic_inst_name.
+tk_str tk_generic_inst_name(tk_str base, tk_type *args, size_t nargs) {
+    tk_str out = rt_concat(base, rt_cstr("__g__"));
+    for (size_t i = 0; i < nargs; i += 1) {
+        if (i > 0) out = rt_concat(out, rt_cstr("__"));
+        out = rt_concat(out, tk_type_mangle(args[i]));
+    }
+    return out;
+}
+
+// (S4) `Box<i64>` → `Named{Box__g__i64}`: resolve the args, validate the generic decl's arity.
+// Mirror of resolve.tks::resolve_generic_inst.
+static tk_type_result resolve_generic_inst(tk_path path, tk_type_expr *args, size_t nargs, tk_type_table table) {
+    tk_str name = path.segments[path.len - 1].name;
+    tk_type *argtypes = nargs ? tk_alloc(nargs * sizeof *argtypes) : NULL;
+    for (size_t i = 0; i < nargs; i += 1) {
+        tk_type_result a = tk_resolve_type(args[i], table);
+        if (!a.ok) return a;
+        argtypes[i] = a.as.value;
+    }
+    tk_decl_result d = tk_type_table_find(table, name);
+    if (!d.ok)
+        return (tk_type_result){ .ok = false, .as.error = tk_error_named("unknown generic type", name) };
+    if (d.as.value.n_type_params == 0)
+        return (tk_type_result){ .ok = false, .as.error = tk_error_named("type is not generic but was given type arguments", name) };
+    if (d.as.value.n_type_params != nargs)
+        return (tk_type_result){ .ok = false, .as.error = tk_error_named("generic type expects a different number of type arguments", name) };
+    tk_type t = { .tag = TK_TYPE_NAMED, .as.named.name = tk_generic_inst_name(name, argtypes, nargs) };
+    return (tk_type_result){ .ok = true, .as.value = t };
+}
+
 // A NAMED type referring to a `variant` decl → its expanded TK_TYPE_VARIANT. A variant decl's
 // body IS a union type-expr (A | B | …), so tk_resolve_type on it yields the VARIANT with its
 // members; the members resolve to NAMED (resolve_named keeps user types nominal), so this
@@ -383,7 +453,11 @@ bool tk_type_join(tk_type a, tk_type b, tk_type_table table, tk_type *out) {
 tk_type_result tk_resolve_type(tk_type_expr te, tk_type_table table) {
     switch (te.tag) {
         case TK_TEXPR_NAMED:
-            return resolve_named(te.as.named.path, table);
+            // A plain name resolves as before; generic type-ARGUMENTS `Box<i64>` (S4) resolve to the
+            // nominal instance `Named{Box__g__i64}` (the concrete decl is stamped by the pass / mono).
+            if (te.as.named.args_len == 0)
+                return resolve_named(te.as.named.path, table);
+            return resolve_generic_inst(te.as.named.path, te.as.named.args, te.as.named.args_len, table);
         case TK_TEXPR_SLICE: {
             tk_type_result el = tk_resolve_type(*te.as.slice.element, table);
             if (!el.ok) return el;

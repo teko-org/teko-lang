@@ -52,4 +52,10 @@ bool tk_type_join(tk_type a, tk_type b, tk_type_table table, tk_type *out);
 // variant builds it bottom-up). Never returns NULL (an unknown tag renders "<type>").
 const char *tk_type_render(tk_type t);
 
+// (S4) generic-instance name mangling — shared by resolve (type instantiation) and the mono pass
+// so a use and its stamped decl agree byte-for-byte. tk_type_mangle: a type → a symbol fragment;
+// tk_generic_inst_name: `<base>__g__<arg0>[__<arg1>…]`.
+tk_str tk_type_mangle(tk_type t);
+tk_str tk_generic_inst_name(tk_str base, tk_type *args, size_t nargs);
+
 #endif // TK_CHECK_RESOLVE_H

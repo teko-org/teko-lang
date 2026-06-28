@@ -755,6 +755,43 @@ fn subst_unify_inference() {
     teko::assert::is_true(tps[0] == "T")
 }
 
+// (S4 type-generics) a single-segment NamedType type-expr with no args.
+fn ttype_named(name: str) -> parser::TypeExpr {
+    parser::NamedType { path = parser::Path { segments = teko::list::push(teko::list::empty(), parser::Segment { name = name }) }; args = teko::list::empty() }
+}
+// a table with one GENERIC struct decl: `type Box<T> = struct { value: T }`.
+fn box_generic_table() -> TypeTable {
+    let fld = parser::Field { name = "value"; type_ann = ttype_named("T") }
+    let body = parser::StructBody { fields = teko::list::push(teko::list::empty(), fld) }
+    let decl = parser::TypeDecl { name = "Box"; type_params = teko::list::push(teko::list::empty(), "T"); body = body; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }
+    teko::list::push(teko::list::empty(), TypeReg { name = "Box"; namespace = ""; vis = parser::Visibility::Private; decl = decl })
+}
+
+// (S4 type-generics) resolve_type on `Box<i64>` → Named{Box__g__i64}; arity is validated; the
+// mangle helpers produce the shared instance name.
+#test
+fn resolves_generic_type_instantiation() {
+    let tbl = box_generic_table()
+    // Box<i64> → Named{"Box__g__i64"}
+    let one = teko::list::push(teko::list::empty(), ttype_named("i64"))
+    let inst = parser::NamedType { path = parser::Path { segments = teko::list::push(teko::list::empty(), parser::Segment { name = "Box" }) }; args = one }
+    teko::assert::is_true(match resolve_type(inst, tbl) { Named as n => n.name == "Box__g__i64"; error => false; _ => false })
+
+    // wrong arity Box<i64, str> → error
+    mut two: []parser::TypeExpr = teko::list::push(teko::list::empty(), ttype_named("i64"))
+    two = teko::list::push(two, ttype_named("str"))
+    let inst2 = parser::NamedType { path = parser::Path { segments = teko::list::push(teko::list::empty(), parser::Segment { name = "Box" }) }; args = two }
+    teko::assert::is_true(match resolve_type(inst2, tbl) { error => true; _ => false })
+
+    // a plain `Box` (no args) still resolves nominally — no regression.
+    teko::assert::is_true(match resolve_type(ttype_named("Box"), tbl) { Named as n => n.name == "Box"; error => false; _ => false })
+
+    // generic_inst_name / type_mangle directly: Box + [i64, str] → "Box__g__i64__str".
+    mut at: []Type = teko::list::push(teko::list::empty(), i64t())
+    at = teko::list::push(at, Str { })
+    teko::assert::is_true(generic_inst_name("Box", at) == "Box__g__i64__str")
+}
+
 // ---------------------------------------------------------------------------
 // Group K: monomorphize (S4b crumb 2c) — direct VM coverage of the mono walk.
 // Build typed programs by hand (a generic TFunction template + non-generic callers /

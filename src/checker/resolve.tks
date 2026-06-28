@@ -289,7 +289,13 @@ pub fn collect_sig_type_params(t: Type, table: TypeTable, acc: []str) -> []str {
 // resolve a syntactic TypeExpr to a pure semantic Type (recursive — B.8).
 pub fn resolve_type(te: parser::TypeExpr, table: TypeTable) -> Type | error {
     match te {
-        parser::NamedType as nt => resolve_named(nt.path, table)
+        // A plain name resolves as before; generic type-ARGUMENTS `Box<i64>` (S4 type-generics)
+        // resolve to the nominal instance `Named{Box__g__i64}` — the concrete decl is stamped by the
+        // instantiation pass / mono (blocker #1: reuse the Named case, no new Type variant).
+        parser::NamedType as nt => {
+            if nt.args.len == 0 { resolve_named(nt.path, table) }
+            else { resolve_generic_inst(nt, table) }
+        }
         parser::SliceType as st => {
             let el = match resolve_type(st.element, table) {
                 Type as t  => t
@@ -343,6 +349,69 @@ fn prim_name(k: PrimKind) -> str {
         I8 => "i8"; I16 => "i16"; I32 => "i32"; I64 => "i64"; I128 => "i128"
         F16 => "f16"; F32 => "f32"; F64 => "f64"
         Bool => "bool"
+    }
+}
+
+// (S4) a concrete type → its symbol fragment for a mangled generic-instance name. Prim → its
+// surface spelling (i64/…), Str/Byte/Error/Void/Ptr/Uptr → fixed words, Named → the name, Slice →
+// "slice_"+elem, Optional → "opt_"+inner. Total — always yields a symbol-safe fragment. Shared by
+// resolve (type instantiation) and the mono pass so a use and its stamped decl agree byte-for-byte.
+// (C: tk_type_mangle.)
+pub fn type_mangle(t: Type) -> str {
+    match t {
+        Prim as p     => prim_name(p.kind)
+        Str           => "str"
+        Byte          => "byte"
+        Named as n    => n.name
+        Slice as sl   => teko::str::concat("slice_", type_mangle(sl.element))
+        Optional as o => teko::str::concat("opt_", type_mangle(o.inner))
+        Error         => "error"
+        Void          => "void"
+        Ptr           => "ptr"
+        Uptr          => "uptr"
+        Variant       => "variant"
+        Func          => "func"
+    }
+}
+
+// (S4) the mangled name of a generic INSTANCE: `<base>__g__<arg0>[__<arg1>…]` over the args IN
+// ORDER. The `__g__` infix marks a stamped symbol (no user name may contain it). (C: tk_generic_inst_name.)
+pub fn generic_inst_name(base: str, args: []Type) -> str {
+    mut out = teko::str::concat(base, "__g__")
+    mut i = 0
+    loop {
+        if i >= args.len { break }
+        if i > 0 { out = teko::str::concat(out, "__") }
+        out = teko::str::concat(out, type_mangle(args[i]))
+        i++
+    }
+    out
+}
+
+// (S4) `Box<i64>` → the nominal instance `Named{Box__g__i64}`. Resolves every type-argument, then
+// validates against the generic decl's arity (the decl must exist, be generic, same count). The
+// concrete decl (fields with T→arg substituted) is stamped by the instantiation pass / mono.
+fn resolve_generic_inst(nt: parser::NamedType, table: TypeTable) -> Type | error {
+    let name = nt.path.segments[nt.path.segments.len - 1].name
+    mut argtypes: []Type = teko::list::empty()
+    mut i = 0
+    loop {
+        if i >= nt.args.len { break }
+        let a = match resolve_type(nt.args[i], table) { Type as t => t; error as e => return e }
+        argtypes = teko::list::push(argtypes, a)
+        i++
+    }
+    match type_table_find(table, name) {
+        parser::TypeDecl as td => {
+            if td.type_params.len == 0 {
+                return error { message = $"type `{name}` is not generic but was given type arguments" }
+            }
+            if td.type_params.len != nt.args.len {
+                return error { message = $"generic type `{name}` expects a different number of type arguments" }
+            }
+            Named { name = generic_inst_name(name, argtypes) }
+        }
+        error => error { message = $"unknown generic type: {name}" }
     }
 }
 
