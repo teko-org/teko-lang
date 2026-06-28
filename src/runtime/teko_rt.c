@@ -354,6 +354,7 @@ void *tk_region_alloc(tk_region *r, size_t n) {
 void tk_region_drop(tk_region *r) {
     if (r == NULL) return;                           // NULL-tolerant
     struct tk_chunk *c = r->head;
+    r->head = NULL;                                  // MEM Step-1 idempotency: clear before free so a re-entrant/second walk frees nothing
     while (c != NULL) { struct tk_chunk *next = c->next; free(c); c = next; }
     free(r);
 }

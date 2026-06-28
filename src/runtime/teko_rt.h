@@ -110,7 +110,7 @@ void *tk_alloc(size_t n);
 typedef struct tk_region tk_region;             // opaque — full struct lives in teko_rt.c
 tk_region *tk_region_new(void);                 // a fresh empty region (default chunk size)
 void      *tk_region_alloc(tk_region *r, size_t n);  // bump-allocate n (n→1), aligned; OOM→panic
-void       tk_region_drop(tk_region *r);        // bulk-free every chunk + the region (NULL-tolerant)
+void       tk_region_drop(tk_region *r);        // bulk-free every chunk + the region (NULL-tolerant; idempotent on a re-walk — head is cleared before free; callers MUST null their handle after, as the freed region must not be reused)
 tk_region *tk_region_root(void);                // the process root region (lazy; never dropped in S1)
 
 // tk_print — write exactly s.len bytes from s.ptr to stdout; no newline, no NUL.
