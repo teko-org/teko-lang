@@ -763,11 +763,14 @@ static bool try_builtin_call(tk_path p, const tk_texpr *args, size_t nargs,
         }
         // Build a heap buffer from the VM's integer-element byte list.
         tk_value_list lst = data_val.as.list;
-        uint8_t *buf = lst.len ? (uint8_t *)tk_alloc(lst.len) : NULL;
-        for (uint64_t i = 0; i < lst.len; i += 1) {
-            tk_value elem = lst.ptr[i];
-            if (elem.tag != TK_VAL_INT) vm_unsupported("write_file_bytes: []byte element is not an integer (internal: checker should reject)");
-            buf[i] = (uint8_t)(elem.as.i.bits & 0xFF);
+        uint8_t *buf = NULL;
+        if (lst.len > 0) {
+            buf = (uint8_t *)tk_alloc(lst.len); if (!buf) abort();
+            for (uint64_t i = 0; i < lst.len; i += 1) {
+                tk_value elem = lst.ptr[i];
+                if (elem.tag != TK_VAL_INT) vm_unsupported("write_file_bytes: []byte element is not an integer (internal: checker should reject)");
+                buf[i] = (uint8_t)(elem.as.i.bits & 0xFF);
+            }
         }
         tk_ffi_ures res = tk_rt_write_file_bytes(path_val.as.s, buf, (uint64_t)lst.len);
         if (buf) tk_free0(buf);

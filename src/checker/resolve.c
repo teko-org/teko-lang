@@ -85,11 +85,13 @@ const char *tk_type_render(tk_type t) {
                 if (i + 1 < t.as.variant.len) cap += seplen;
             }
             char *out = tk_alloc(cap); if (!out) abort();
-            out[0] = '\0';
+            char *p = out;
             for (size_t i = 0; i < t.as.variant.len; i += 1) {
-                strcat(out, parts[i]);
-                if (i + 1 < t.as.variant.len) strcat(out, sep);
+                size_t n = strlen(parts[i]);
+                memcpy(p, parts[i], n); p += n;
+                if (i + 1 < t.as.variant.len) { memcpy(p, sep, seplen); p += seplen; }
             }
+            *p = '\0';
             tk_free0(parts);
             return out;
         }
@@ -108,13 +110,17 @@ const char *tk_type_render(tk_type t) {
                 }
             }
             char *out = tk_alloc(cap); if (!out) abort();
-            out[0] = '\0';
-            strcat(out, "(");
+            char *p = out;
+            *p++ = '(';
             for (size_t i = 0; i < t.as.func.nparams; i += 1) {
-                strcat(out, ps[i]);
-                if (i + 1 < t.as.func.nparams) strcat(out, ", ");
+                size_t n = strlen(ps[i]);
+                memcpy(p, ps[i], n); p += n;
+                if (i + 1 < t.as.func.nparams) { memcpy(p, ", ", 2); p += 2; }
             }
-            strcat(out, ") -> "); strcat(out, ret);
+            memcpy(p, ") -> ", 5); p += 5;
+            size_t rlen = strlen(ret);
+            memcpy(p, ret, rlen); p += rlen;
+            *p = '\0';
             if (ps) tk_free0(ps);
             return out;
         }
