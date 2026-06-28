@@ -82,3 +82,111 @@ fn early_return_with_defer(flag: bool) -> i32 {
     if flag { return 1 }
     return 2
 }
+
+// ---------------------------------------------------------------------------
+// MEM Step 2/3 — `Ref<T>` EXECUTES in the VM (was an honest-stop). A `Ref<T>` param is an
+// auto-ref'd `mut` scalar lvalue: `bump(x)` PROMOTES `x` to the env cell store, `r.value = …`
+// writes through the cell, and the caller's `x` observes the write. Behaviour is IDENTICAL to
+// the native (`teko build`) path; only speed differs. These exercise the cell-store + RefVal
+// paths (cell_alloc/get/set, auto-ref promotion, deref read/write, the env cell threading).
+// ---------------------------------------------------------------------------
+
+// the canonical case (converted from the former honest-stop): bump(x) mutates x through a Ref.
+fn bump(r: Ref<i64>) { r.value = r.value + 1 }
+#test
+fn ref_bump_holds() {
+    mut x: i64 = 41
+    bump(x)
+    teko::assert::is_true(x == 42)        // the write through the ref reached the caller's `x`
+}
+
+// compound deref-assign (`r.value += …`) and a plain deref-assign through the same ref.
+fn add_through_ref(r: Ref<i64>, n: i64) { r.value += n }
+fn set_through_ref(r: Ref<i64>, n: i64) { r.value = n }
+#test
+fn ref_compound_and_set_hold() {
+    mut x: i64 = 10
+    add_through_ref(x, 5)
+    teko::assert::is_true(x == 15)        // 10 += 5
+    set_through_ref(x, 99)
+    teko::assert::is_true(x == 99)        // plain deref store
+}
+
+// reading `r.value` (the deref READ) inside a callee that mutates a DIFFERENT scalar through the
+// arithmetic of the read — exercises the deref READ path (cell_get) alongside a deref write.
+fn double_in_place(r: Ref<i64>) { r.value = r.value + r.value }   // reads .value twice, writes once
+#test
+fn ref_read_holds() {
+    mut x: i64 = 7
+    double_in_place(x)                     // 7 + 7
+    teko::assert::is_true(x == 14)
+}
+
+// FORWARDING a ref param to another ref param: the inner write reaches the original `x`.
+fn forward_then_bump(r: Ref<i64>) { bump(r) }     // pass the ref param straight through
+#test
+fn ref_forwarding_holds() {
+    mut x: i64 = 100
+    forward_then_bump(x)
+    teko::assert::is_true(x == 101)
+}
+
+// MULTIPLE refs in one call, each aliasing a distinct caller var — no cross-talk.
+fn swap_add(a: Ref<i64>, b: Ref<i64>) { a.value = a.value + 1; b.value = b.value + 10 }
+#test
+fn ref_multiple_holds() {
+    mut p: i64 = 1
+    mut q: i64 = 2
+    swap_add(p, q)
+    teko::assert::is_true(p == 2)
+    teko::assert::is_true(q == 12)
+}
+
+// the SAME var aliased twice (both params point at the one cell): writes compose on one storage.
+fn add_both(a: Ref<i64>, b: Ref<i64>) { a.value = a.value + 1; b.value = b.value + 1 }
+#test
+fn ref_same_var_aliased_holds() {
+    mut x: i64 = 0
+    add_both(x, x)                         // both refs alias x's one cell
+    teko::assert::is_true(x == 2)          // +1 then +1 on the shared cell
+}
+
+// a ref written inside an IF body (the cell threading must survive FlowEnv branch-merge).
+fn bump_if(r: Ref<i64>, cond: bool) { if cond { r.value = r.value + 1 } else { r.value = r.value - 1 } }
+#test
+fn ref_in_if_holds() {
+    mut x: i64 = 50
+    bump_if(x, true)
+    teko::assert::is_true(x == 51)
+    mut y: i64 = 50
+    bump_if(y, false)
+    teko::assert::is_true(y == 49)
+}
+
+// a ref written inside a LOOP body (cell threading must survive the loop's env rebuild).
+fn add_n_times(r: Ref<i64>, n: i64) {
+    mut i: i64 = 0
+    loop {
+        if i >= n { break }
+        r.value = r.value + 1
+        i = i + 1
+    }
+}
+#test
+fn ref_in_loop_holds() {
+    mut x: i64 = 0
+    add_n_times(x, 5)
+    teko::assert::is_true(x == 5)          // five increments through the ref inside the loop
+}
+
+// caller-side: the origin var is still a normal `mut` after the ref call — further plain
+// mutation continues from the ref-mutated value (the slot stays cell-backed, reads stay correct).
+#test
+fn ref_then_plain_mutation_holds() {
+    mut x: i64 = 0
+    bump(x)                                // x -> 1 (through the cell)
+    x = x + 40                             // plain assign on the cell-backed slot: 1 + 40
+    teko::assert::is_true(x == 41)
+    bump(x)                                // x -> 42 (still aliasable)
+    teko::assert::is_true(x == 42)
+}

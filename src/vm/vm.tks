@@ -71,10 +71,18 @@ type StructVal = struct { type_name: str; field_names: []str; field_vals: []Valu
 // over-`T?` read it unambiguously (the C twin is the TK_VAL_OPT tag).
 type OptVal = struct { present: bool; inner: Value? }
 
+// RefVal (MEM Step 2/3) — a `Ref<T>` VALUE: the index into the env's CELL STORE where the
+// referenced scalar lives. `Ref<T>` is escape-gated to a PARAM-ONLY, SCALAR-only borrow that
+// cannot escape (MEM Step 0), so a RefVal only ever aliases a `mut` scalar local of an ancestor
+// call frame: a `mut` lvalue arg is PROMOTED to a cell at the auto-ref site (cell_alloc), the
+// origin slot is rebound to that cell (slot.cell_id), and this RefVal carries the cell index.
+// `.value` read/write goes through `cell_get`/`cell_set`; the C twin is the TK_VAL_REF tag.
+type RefVal = struct { cell: u64 }
+
 type Value = variant u8 | u16 | u32 | u64 | u128
            | i8 | i16 | i32 | i64 | i128
            | f16 | f32 | f64
-           | bool | byte | str | []Value | StructVal | OptVal
+           | bool | byte | str | []Value | StructVal | OptVal | RefVal
 
 // ---------------------------------------------------------------------------
 // CONTROL FLOW. The exits a block can produce — mirrors the C `tk_flow`
@@ -171,7 +179,12 @@ fn vm_float_to_int(f: f64, dst: checker::PrimKind, line: u32, col: u32) -> i128 
 // call runs in a FRESH root frame (no closure capture — M0 functions are flat, matching
 // codegen's C functions).
 // ---------------------------------------------------------------------------
-type Slot = struct { name: str; val: Value }
+// (MEM Step 2/3) `cell_id` — when a slot is a `Ref<T>` aliasing TARGET (its `mut` value was
+// PROMOTED to the env cell store by an auto-ref at a call), the BINDING value lives at
+// `cells[cell_id]`, not in `val`. null == a plain by-value slot (today's behaviour). A
+// cell-backed slot's reads/writes route through the cell so the origin var and every RefVal
+// aliasing it observe the SAME storage (the C twin's `has_cell`+`cell_id`).
+type Slot = struct { name: str; val: Value; cell_id: u64? }
 // `prog` carries the typed program so `find_function` can resolve user calls. The C twin uses a
 // file-global `g_prog`; Teko has NO mutable globals (M.0), so the program rides the env (threaded
 // through every frame, exactly like codegen threads its emit context).
@@ -179,7 +192,15 @@ type Slot = struct { name: str; val: Value }
 pub type DeferBody = struct { body: []checker::TStatement }
 // (C7.18) Per-call-frame defer accumulator. Pushed as exec_stmt encounters TDeferStmt;
 // drained LIFO in eval_call after exec_block completes. Panic does NOT drain.
-pub type Venv  = struct { slots: []Slot; prog: checker::TProgram; defers: []DeferBody }
+// (MEM Step 2/3) `cells` — the program-wide CELL STORE of aliased scalars (a flat, grow-and-
+// mutate value array, threaded through the env exactly like `slots`). A `Ref<T>` value is a cell
+// INDEX into this store; a cell-backed slot (slot.cell_id) reads/writes here too. In the C twin
+// this is a global growable array shared by pointer (in-place set, O(1)); here a write is a
+// FUNCTIONAL REBUILD (copy the list with one element replaced, exactly like mutate_slot) — O(n),
+// fine for a test VM, and behaviourally identical. The store only GROWS (cell_alloc appends) and
+// MUTATES (cell_set), never shrinks/reorders, so a callee that inherits the caller's cells and
+// returns its own can merge back by REPLACEMENT.
+pub type Venv  = struct { slots: []Slot; prog: checker::TProgram; defers: []DeferBody; cells: []Value }
 
 // find — newest-first scan so a later binding SHADOWS an earlier one (the checker's rule). The
 // checker guarantees every read binds, so a miss is an internal invariant break → panic (M.1),
@@ -194,19 +215,100 @@ fn find(env: Venv, name: str) -> Slot {
     panic("vm: unbound variable (internal: checker should reject)")
 }
 
+// (MEM Step 2/3) read_var — read a binding's CURRENT value: a plain slot yields slot.val; a
+// CELL-BACKED slot (a `Ref<T>` aliasing target whose `mut` value was promoted to the cell store)
+// yields cell_get(cells, cell_id), so the origin var observes writes made through any RefVal that
+// aliases it. The C twin reads `slot->has_cell ? cell_get(slot->cell_id) : slot->val`.
+fn read_var(env: Venv, name: str) -> Value {
+    let slot = find(env, name)
+    match slot.cell_id { u64 as cid => cell_get(env.cells, cid); null => slot.val }
+}
+
 // define — push a fresh slot (shadowing). Returns the grown env (functional, like emit/*).
+// A freshly-defined slot is plain (cell_id= null); only an auto-ref PROMOTION (promote_to_cell)
+// rebinds a slot to a cell. `cells` threads through unchanged.
 pub fn define(env: Venv, name: str, val: Value) -> Venv {
-    Venv { slots= teko::list::push(env.slots, Slot { name= name, val= val }); prog= env.prog; defers= env.defers }
+    Venv { slots= teko::list::push(env.slots, Slot { name= name, val= val, cell_id= null }); prog= env.prog; defers= env.defers; cells= env.cells }
 }
 
 // (C7.18) push_defer — register a deferred body onto the env's defer stack.
 fn push_defer(env: Venv, body: []checker::TStatement) -> Venv {
-    Venv { slots= env.slots; prog= env.prog; defers= teko::list::push(env.defers, DeferBody { body= body }) }
+    Venv { slots= env.slots; prog= env.prog; defers= teko::list::push(env.defers, DeferBody { body= body }); cells= env.cells }
 }
 
 // (C7.18) fresh_env — a fresh call-frame env (no slots, no defers, same prog).
-fn fresh_env(prog: checker::TProgram) -> Venv {
-    Venv { slots= teko::list::empty(); prog= prog; defers= teko::list::empty() }
+// (MEM Step 2/3) `cells` is supplied by the CALLER so a `RefVal`'s cell index stays valid in the
+// callee frame (the cell store is program-wide, not per-frame); the caller passes its own cells in.
+fn fresh_env(prog: checker::TProgram, cells: []Value) -> Venv {
+    Venv { slots= teko::list::empty(); prog= prog; defers= teko::list::empty(); cells= cells }
+}
+
+// ---------------------------------------------------------------------------
+// (MEM Step 2/3) CELL STORE helpers — the program-wide aliasing store. cell_alloc appends a value
+// and returns the grown store + the new cell's index; cell_get reads; cell_set writes (a FUNCTIONAL
+// REBUILD here — copy with one element replaced, exactly like mutate_slot; the C twin sets in place,
+// O(1)). The escape-gate keeps cells scalar and bounded, so the O(n) rebuild is fine for a test VM.
+// ---------------------------------------------------------------------------
+type CellAlloc = struct { cells: []Value; id: u64 }
+fn cell_alloc(cells: []Value, v: Value) -> CellAlloc {
+    CellAlloc { cells= teko::list::push(cells, v); id= cells.len }
+}
+fn cell_get(cells: []Value, id: u64) -> Value {
+    if id >= cells.len { panic("vm: cell index out of range (internal: Ref<T> aliasing invariant break)") }
+    cells[id]
+}
+fn cell_set(cells: []Value, id: u64, v: Value) -> []Value {
+    if id >= cells.len { panic("vm: cell index out of range (internal: Ref<T> aliasing invariant break)") }
+    mut rebuilt: []Value = teko::list::empty()
+    mut j = 0
+    loop {
+        if j >= cells.len { break }
+        if j == id { rebuilt = teko::list::push(rebuilt, v) }
+        else       { rebuilt = teko::list::push(rebuilt, cells[j]) }
+        j++
+    }
+    rebuilt
+}
+
+// promote_to_cell — AUTO-REF a `mut` scalar lvalue named `name`: if its slot is already cell-backed
+// (a forwarded/re-referenced var), reuse that cell; otherwise cell_alloc its current value and rebind
+// the slot to the new cell (so the ORIGIN var's future reads/writes ALSO route through the cell). The
+// returned env carries the grown cells + the rebound slot; `id` is the cell to put in the RefVal.
+// The checker (auto-ref rule) guarantees `name` is a `mut` scalar binding, so this never fails.
+type Promotion = struct { env: Venv; id: u64 }
+fn promote_to_cell(env: Venv, name: str) -> Promotion {
+    // newest-first scan (shadowing), like find/mutate_slot.
+    mut idx = env.slots.len
+    mut found = false
+    loop {
+        if idx == 0 { break }
+        idx--
+        if env.slots[idx].name == name { found = true; break }
+    }
+    if !found { panic("vm: auto-ref of an unbound variable (internal: checker should reject)") }
+    let slot = env.slots[idx]
+    match slot.cell_id {
+        u64 as existing => return Promotion { env= env; id= existing }   // already aliased — reuse the cell
+        null            => {}
+    }
+    let alloc = cell_alloc(env.cells, slot.val)
+    // rebuild the slots, rebinding `idx` to the new cell (its value now lives in cells[alloc.id]).
+    mut rebuilt: []Slot = teko::list::empty()
+    mut j = 0
+    loop {
+        if j >= env.slots.len { break }
+        if j == idx { rebuilt = teko::list::push(rebuilt, Slot { name= name; val= slot.val; cell_id= alloc.id }) }
+        else        { rebuilt = teko::list::push(rebuilt, env.slots[j]) }
+        j++
+    }
+    Promotion { env= Venv { slots= rebuilt; prog= env.prog; defers= env.defers; cells= alloc.cells }; id= alloc.id }
+}
+
+// with_cells — replace an env's cell store (used to MERGE a callee's final cells back into the
+// caller after a call: the callee inherited the caller's cells and only grew/mutated them, so the
+// callee's final store is a superset-with-mutations and replaces the caller's wholesale).
+fn with_cells(env: Venv, cells: []Value) -> Venv {
+    Venv { slots= env.slots; prog= env.prog; defers= env.defers; cells= cells }
 }
 
 // ---------------------------------------------------------------------------
@@ -596,6 +698,13 @@ fn eval_struct_init(si: checker::TStructInit, ty: checker::Type, env: Venv) -> V
 // its element count as a u64 (the SLICE value layer — fixed+copy). Checker types `.len` as u64.
 fn eval_field_access(fa: checker::TFieldAccess, env: Venv) -> Value {
     match eval_expr(fa.receiver, env) {
+        // (MEM Step 2/3) `r.value` on a `Ref<T>` — the deref READ: the receiver evaluates to a
+        // RefVal (a cell index); `.value` reads the aliased storage (cell_get). The checker (typer)
+        // restricts a Reference receiver to ONLY the `.value` field, so any other field is impossible.
+        RefVal as rv => {
+            if fa.field == "value" { return cell_get(env.cells, rv.cell) }
+            panic("vm: a reference (`Ref<T>`) exposes only `.value` (internal: checker should reject)")
+        }
         str as s => {
             if fa.field == "len" { return s.len to u64 }
             panic("vm: only `.len` is defined on a str (internal: checker should reject)")
@@ -751,6 +860,7 @@ fn val_type_matches(subj: Value, name: str) -> bool {
         []Value => false                          // a slice member is matched by the is_slice branch
         StructVal as sv => sv.type_name == name    // a named case / `error`
         OptVal => false
+        RefVal => false                            // (MEM Step 2/3) a `Ref<T>` value is never pattern-matched (escape-gated, param-only)
     }
 }
 
@@ -1145,7 +1255,7 @@ fn exec_match(e: checker::TExpr, env: Venv) -> FlowEnv {
                         // run the arm body; POP its bindings/locals back to the outer scope (keeping
                         // outer-`mut` mutations, which mutate_slot writes at their index in [0, base)).
                         let bo = exec_block(arm.body, pm.env)
-                        return FlowEnv { flow= bo.flow; env= Venv { slots= loop_outer(bo.env.slots, base); prog= bo.env.prog; defers= bo.env.defers } }
+                        return FlowEnv { flow= bo.flow; env= Venv { slots= loop_outer(bo.env.slots, base); prog= bo.env.prog; defers= bo.env.defers; cells= bo.env.cells } }
                     }
                 }
                 i++   // discard this arm's bindings and try the next
@@ -1166,7 +1276,7 @@ fn eval_expr(e: checker::TExpr, env: Venv) -> Value {
     }
     match e.kind {
         checker::TNumber as n   => num_of_prim(n, e.type)            // a concrete u8…i128 / f16…f64 from the node's type (float iff n.is_float)
-        checker::TVar as v      => find(env, v.name).val              // checker guarantees it binds
+        checker::TVar as v      => read_var(env, v.name)             // checker guarantees it binds; cell-backed (Ref aliasing target) reads through the cell
         checker::TStrLit as s   => s.text                    // a `str` member of Value
         checker::TByteLit as b  => b.value                   // a `byte` member of Value
         checker::TBoolLit as bl => bl.value                           // bool literal (W2) — FULL: a `bool` member of Value
@@ -1468,11 +1578,39 @@ fn mutate_slot(env: Venv, name: str, op: lexer::TokenKind, rhs: Value) -> Venv {
         if env.slots[idx].name == name { found = true; break }
     }
     if !found { panic("vm: assignment to an unbound variable (internal: checker should reject)") }
-    let old = env.slots[idx].val
-    let newval = match op {
+    // (MEM Step 2/3) a cell-backed slot's value lives in the cell store, not in slot.val — read the
+    // OLD value from the cell so a compound op operates on the aliased storage, and write the result
+    // BACK to the cell (the slot stays cell-backed). A plain slot reads/writes slot.val as before.
+    let backing = env.slots[idx].cell_id
+    let old = match backing { u64 as cid => cell_get(env.cells, cid); null => env.slots[idx].val }
+    let newval = compound_apply(old, op, rhs)
+    match backing {
+        u64 as cid => {
+            // write through the cell; the slot list is unchanged (it still points at the cell).
+            return Venv { slots= env.slots; prog= env.prog; defers= env.defers; cells= cell_set(env.cells, cid, newval) }
+        }
+        null => {}
+    }
+    // rebuild the slots, replacing the one at `idx` with the new value (functional update).
+    mut rebuilt: []Slot = teko::list::empty()
+    mut j = 0
+    loop {
+        if j >= env.slots.len { break }
+        if j == idx { rebuilt = teko::list::push(rebuilt, Slot { name= name; val= newval; cell_id= null }) }
+        else        { rebuilt = teko::list::push(rebuilt, env.slots[j]) }
+        j++
+    }
+    Venv { slots= rebuilt; prog= env.prog; defers= env.defers; cells= env.cells }
+}
+
+// compound_apply — apply an assignment operator to `old` with `rhs`: a plain `=` stores rhs; a
+// compound op applies the int op at `old`'s own width/signedness (M0 — ints only; div/mod route
+// through the CHECKED runtime so ÷0 panics). Factored out so both a plain-slot and a cell-backed
+// assignment (and the `.value op= …` deref path) share the SAME arithmetic.
+fn compound_apply(old: Value, op: lexer::TokenKind, rhs: Value) -> Value {
+    match op {
         Assign => rhs
         _      => {
-            // compound assign: int op at the slot's own width/signedness (M0 — ints only).
             let sgn = int_sign_of(old); let w = int_width_of(old)
             let a = as_int(old); let b = as_int(rhs)
             match op {
@@ -1490,16 +1628,6 @@ fn mutate_slot(env: Venv, name: str, op: lexer::TokenKind, rhs: Value) -> Venv {
             }
         }
     }
-    // rebuild the slots, replacing the one at `idx` with the new value (functional update).
-    mut rebuilt: []Slot = teko::list::empty()
-    mut j = 0
-    loop {
-        if j >= env.slots.len { break }
-        if j == idx { rebuilt = teko::list::push(rebuilt, Slot { name= name; val= newval }) }
-        else        { rebuilt = teko::list::push(rebuilt, env.slots[j]) }
-        j++
-    }
-    Venv { slots= rebuilt; prog= env.prog; defers= env.defers }
 }
 
 // exit_code_of — the process exit code from the virtual-main's final value, the .tks twin of
@@ -1600,26 +1728,69 @@ fn eval_cast(c: checker::TCast, ty: checker::Type, line: u32, col: u32, env: Ven
 // explicit `return e` OR (NORMAL) the body's TRAILING value (B.20 — implicit return); a
 // `-> void` fn (or one that falls off the end without a value) produces NO Value: the call is
 // a statement whose result is discarded — there is no `Unit`.
-// (MEM-1b-ii) Honest-stop if a function takes a `Ref<T>` parameter. The value-semantic VM env binds
-// args BY VALUE — it has no aliasing cell — so a write through `r.value` would not reach the caller,
-// making VM ≠ native. Per the VM==native-BEHAVIOR mandate, stop HONESTLY (M.3) rather than give a
-// wrong answer: `Ref<T>` runs NATIVELY (`teko build`); the VM aliasing cell is DEFERRED to after the
-// native-byte backend. (The corpus uses no `Ref<T>`, so this never fires today.) Shared by both call
-// paths (eval_call value-position + call_value statement-position).
-fn ref_param_honest_stop(f: checker::TFunction) {
-    mut i = 0
+// (MEM Step 2/3) param_is_ref — does parameter `i` of `f` have a `Ref<T>` annotation (last path
+// segment "Ref")? The same surface-syntax detection codegen and the escape-gate use; `Ref<T>` is the
+// user surface for a Reference. Used to drive auto-ref at a call and to gate the value-position path.
+fn param_is_ref(f: checker::TFunction, i: u64) -> bool {
+    match f.params[i].type_ann {
+        parser::NamedType as nt => nt.path.segments[nt.path.segments.len - 1].name == "Ref"
+        _                       => false
+    }
+}
+fn fn_has_ref_param(f: checker::TFunction) -> bool {
+    mut i: u64 = 0
     loop {
         if i >= f.params.len { break }
-        match f.params[i].type_ann {
-            parser::NamedType as nt => {
-                if nt.path.segments[nt.path.segments.len - 1].name == "Ref" {
-                    panic("vm: `Ref<T>` is not yet executable in the VM (reference aliasing) — runs natively via `teko build`; VM support deferred to after the native-byte backend")
-                }
-            }
-            _ => {}
-        }
+        if param_is_ref(f, i) { return true }
         i = i + 1
     }
+    false
+}
+
+// (MEM Step 2/3) BoundArgs — the result of binding a call's arguments: the callee frame `fenv`
+// (args bound positionally, the callee inheriting the caller's cells so RefVal indices stay valid)
+// AND the (possibly mutated) CALLER env — auto-ref PROMOTES a `mut` lvalue arg to a cell, growing
+// the caller's cell store and rebinding the origin slot, so that env must thread back to the caller.
+type BoundArgs = struct { fenv: Venv; caller: Venv }
+
+// bind_call_args — bind `f`'s parameters to `c`'s arguments in a fresh callee frame. For a `Ref<T>`
+// parameter the checker guarantees the argument is either a `mut` scalar lvalue (a TVar — AUTO-REF:
+// promote it to a cell, pass RefVal{cell}) or a value already of reference type (FORWARD: a RefVal
+// from a ref param read — pass it through). All other params bind by value (eval_expr). The caller
+// env is threaded through promotion (cell store grows + origin slot rebinds), so it is returned too.
+fn bind_call_args(f: checker::TFunction, c: checker::TCall, env: Venv) -> BoundArgs {
+    mut caller = env
+    mut fenv = fresh_env(env.prog, env.cells)
+    mut ai: u64 = 0
+    loop {
+        if ai >= f.params.len { break }
+        mut argval: Value? = null
+        if param_is_ref(f, ai) {
+            // a `Ref<T>` param: AUTO-REF a `mut` lvalue (TVar) — promote it to a cell and pass the
+            // RefVal; FORWARD an arg that already evaluates to a RefVal (a forwarded ref param).
+            match c.args[ai].kind {
+                checker::TVar as v => {
+                    // could be the origin var (auto-ref) OR a `Ref<T>` param being forwarded. The
+                    // checker types a Ref-typed arg as Reference, an auto-ref arg as the pointed T.
+                    match c.args[ai].type {
+                        checker::Reference => argval = read_var(caller, v.name)   // forward the existing RefVal
+                        _                  => {
+                            let p = promote_to_cell(caller, v.name)              // auto-ref: promote the origin var
+                            caller = p.env
+                            fenv = with_cells(fenv, caller.cells)                // keep the callee's cells in sync with the grown store
+                            argval = RefVal { cell= p.id }
+                        }
+                    }
+                }
+                _ => panic("vm: a `Ref<T>` argument must be a mutable variable (internal: checker should reject)")
+            }
+        } else {
+            argval = eval_expr(c.args[ai], caller)
+        }
+        fenv = define(fenv, f.params[ai].name, argval ?? panic("vm: argument produced no value (internal)"))
+        ai = ai + 1
+    }
+    BoundArgs { fenv= fenv; caller= caller }
 }
 
 fn eval_call(c: checker::TCall, env: Venv) -> Value {
@@ -1649,19 +1820,21 @@ fn eval_call(c: checker::TCall, env: Venv) -> Value {
     // FFI surface (the same deferred host edge as the io/fs bottoms). Stop HONESTLY (M.3), never
     // synthesize a value, and point at the native path.
     if f.is_extern { panic("vm: an `extern` function cannot run in the VM (foreign C call) — use `teko build` to compile it natively (C7.1a)") }
-    ref_param_honest_stop(f)   // (MEM-1b-ii) Ref<T> runs natively; VM aliasing deferred
+    // (MEM Step 2/3) A `Ref<T>` call mutates an ALIASED caller cell; that mutation must thread BACK
+    // into the caller env after the call. This eval_call is the VALUE-position path (reached from
+    // eval_expr, which returns only a Value — there is NO env-return channel), so a ref-mutating
+    // callee's write could not reach the caller HERE. Statement-position ref calls (`bump(x)` — the
+    // idiom) go through call_value, which DOES thread the env out (BoundArgs.caller + the callee's
+    // final cells), and fully support aliasing. A ref call nested inside a larger VALUE expression is
+    // escape-gate-rare and is an honest stop (M.3), matching the C twin's value-position eval_call.
+    if fn_has_ref_param(f) { panic("vm: a `Ref<T>` call in value position is not executable in the tree-walking VM (no env-return channel) — call it in statement position (e.g. `bump(x)`), or use `teko build`") }
     if !f.is_test { teko::cov_mark(h.idx) }   // D3 — globally-unique items index (not line) avoids cross-file collisions
     // Bind each parameter to its evaluated argument in a FRESH root frame (no closure capture —
     // flat M0 functions, like codegen's C). Args evaluate in the CALLER's env, then enter the
     // callee's frame by the param's name (positional). (B-vm — VM function parameters.)
-    mut fenv = fresh_env(env.prog)
-    mut ai = 0
-    loop {
-        if ai >= f.params.len { break }
-        let argval = eval_expr(c.args[ai], env)
-        fenv = define(fenv, f.params[ai].name, argval)
-        ai = ai + 1
-    }
+    // No ref params here (gated above), so the caller env is unchanged by binding.
+    let bound = bind_call_args(f, c, env)
+    let fenv = bound.fenv
     // Coerce the returned value into the declared return type: a `T` from a `-> T?` fn
     // present-wraps (REBOOT §202), mirroring codegen's emit_as on the return slot.
     // D3-branch: push h.idx so branches inside f.body attribute to THIS fn (no-op unless coverage on).
@@ -1756,16 +1929,23 @@ fn exec_stmt(s: checker::TStatement, env: Venv) -> Step {
         // panics at `&s->as.assign.value`. The runtime div/rem still panic as the canonical
         // message (M.1); we only prefix line:col first.
         checker::TAssign as a   => {
-            // (MEM-1b-ii) `r.value op= x` writes THROUGH a reference. A deref-assign only occurs inside
-            // a `Ref<T>`-parameter function, which eval_call/call_value already honest-stop before the
-            // body runs — so this is unreachable today; guard defensively (the value-semantic VM has no
-            // aliasing cell). Runs natively; VM support deferred to after the native-byte backend.
-            if a.deref { panic("vm: `Ref<T>` deref-assignment (`r.value = …`) is not yet executable in the VM — runs natively via `teko build`; VM support deferred") }
             let rhs = eval_expr(a.value, env)
             if (a.op == lexer::TokenKind::SlashEq || a.op == lexer::TokenKind::PercentEq) && val_is_int(rhs) && as_int(rhs) == 0 {
                 vm_panic_div0_at(a.value.line, a.value.col)
             }
-            let env2 = mutate_slot(env, a.name, a.op, rhs); Stepped { env= env2; value= null }
+            // (MEM Step 2/3) `r.value op= x` writes THROUGH a reference: `a.name` names the `Ref<T>`
+            // binding (a RefVal cell index); a deref-assign reads the cell, applies the op, and writes
+            // BACK to the cell (cell_set) — so the caller's aliased var observes the write. A plain
+            // assign goes through mutate_slot (which itself routes a cell-backed origin slot to its cell).
+            if a.deref {
+                let rv = match read_var(env, a.name) { RefVal as r => r; _ => panic("vm: deref-assign target is not a reference (internal: checker should reject)") }
+                let cur = cell_get(env.cells, rv.cell)
+                let newval = compound_apply(cur, a.op, rhs)
+                let env2 = with_cells(env, cell_set(env.cells, rv.cell, newval))
+                Stepped { env= env2; value= null }
+            } else {
+                let env2 = mutate_slot(env, a.name, a.op, rhs); Stepped { env= env2; value= null }
+            }
         }
         // `return e` rides a present value; a bare `return` carries null. The value may itself be
         // an `if`/`match` whose arm DIVERGES — run it flow-aware so an inner return propagates.
@@ -1791,7 +1971,9 @@ fn exec_stmt(s: checker::TStatement, env: Venv) -> Step {
             match x.expr {
                 checker::TIfExpr as _    => step_of_flow(exec_if(x.expr, env))
                 checker::TMatchExpr as _ => step_of_flow(exec_match(x.expr, env))
-                _              => Stepped { env= env; value= eval_stmt_value(x.expr, env) }
+                // (MEM Step 2/3) thread the env out of eval_stmt_value: a statement-position call may
+                // write through a `Ref<T>` arg, growing/mutating the caller's cell store — keep it.
+                _              => { let sv = eval_stmt_value(x.expr, env); Stepped { env= sv.env; value= sv.value } }
             }
         }
         checker::TLoopStmt as l     => {
@@ -1837,58 +2019,55 @@ fn step_of_flow(fe: FlowEnv) -> Step {
     }
 }
 
-// eval_stmt_value — evaluate an expression in STATEMENT position, yielding its VALUE so the
-// statement (and thus a block's trailing expression) can carry it (B.20 — W5a). Mirrors the C
-// `tk_vm_eval_expr` in exec_stmt's EXPR case: a `-> void` call (print/println/assert/void fn)
-// runs purely for effect and yields NO Value (`null` — the Teko stand-in for the C's never-read
-// v_void() placeholder); any value-typed expression yields its evaluated value.
-fn eval_stmt_value(e: checker::TExpr, env: Venv) -> Value? {
+// eval_stmt_value — evaluate an expression in STATEMENT position, yielding its VALUE (B.20 — W5a)
+// AND the (possibly mutated) env: a statement-position call may write through a `Ref<T>` argument,
+// so the caller's cell store can change (MEM Step 2/3) — that env must thread back. Mirrors the C
+// `tk_vm_eval_expr` in exec_stmt's EXPR case (where the C env mutates in place). A `-> void` call
+// runs for effect and yields NO Value (`null`); any value-typed expression yields its value.
+type StmtVal = struct { value: Value?; env: Venv }
+fn eval_stmt_value(e: checker::TExpr, env: Venv) -> StmtVal {
     teko::cov_line(e.line)   // D3-line — a statement-position CALL goes to call_value (bypassing eval_expr), so mark its line here (matches vm.c, which routes stmt calls through eval_expr)
     match e {
-        checker::TCall as c => call_value(c, env)       // may be a void call — null; else the call's value
-        _          => eval_expr(e, env)          // value expr in stmt position — carries its value
+        checker::TCall as c => call_value(c, env)                          // threads the caller env out (Ref<T> writes)
+        _          => StmtVal { value= eval_expr(e, env); env= env }       // value expr in stmt position — no env change
     }
 }
 
-// call_value — a call in statement position. Builtins are `-> void`: run for effect, yield
-// `null` (no Value). A user fn runs; an explicit `return e` yields its value, an implicit
-// trailing value (NORMAL) yields that (W5a), else `null` (a `-> void` fn). Mirrors the C call
-// path (return value OR trailing NORMAL value OR void) — reused so a tail/non-tail call in
-// statement position carries the right value.
-fn call_value(c: checker::TCall, env: Venv) -> Value? {
+// call_value — a call in STATEMENT position. Builtins are `-> void`: run for effect, yield `null`
+// (no Value). A user fn runs; an explicit `return e` yields its value, an implicit trailing value
+// (NORMAL) yields that (W5a), else `null` (a `-> void` fn). (MEM Step 2/3) This is the path that
+// SUPPORTS `Ref<T>` aliasing: it threads the caller env (auto-ref PROMOTION grows the caller's cell
+// store + rebinds the origin slot) AND merges the callee's final cells back into the caller (the
+// callee inherited the caller's cells and only grew/mutated them — so a write through `r.value` in
+// the callee is visible at the caller after return). Returns the value AND the updated caller env.
+// (The C twin folds this into eval_call, where the cell store is a global shared by pointer.)
+fn call_value(c: checker::TCall, env: Venv) -> StmtVal {
     // A builtin that RAN (`true`) is `-> void` — yield null. A `false`/`error` result ==
-    // "not a builtin": run the user fn.
+    // "not a builtin": run the user fn. (Builtins do not take `Ref<T>` params — env unchanged.)
     match try_builtin(c.callee, c.args, env) {
-        bool as ran => if ran { return null }
+        bool as ran => if ran { return StmtVal { value= null; env= env } }
         error       => {}
     }
     // VALUE-producing builtins — a statement-position call can be a function's TRAILING expression
     // (B.20), e.g. `fn empty_table() -> TypeTable { teko::list::empty() }`. Route them exactly like
     // eval_call (list/err/str/fs) BEFORE user-fn resolution; without this a trailing `teko::list::empty()`
-    // fell through to find_function("empty") → "host function the VM cannot run".
-    match try_list_builtin(c.callee, c.args, env) { Value as v => return v; null => {} }
-    match try_err_builtin(c.callee, c.args, env)  { Value as v => return v; null => {} }
-    match try_str_builtin(c.callee, c.args, env)  { Value as v => return v; null => {} }
-    match try_fs_builtin(c.callee, c.args, env)   { Value as v => return v; null => {} }
+    // fell through to find_function("empty") → "host function the VM cannot run". (No ref args.)
+    match try_list_builtin(c.callee, c.args, env) { Value as v => return StmtVal { value= v; env= env }; null => {} }
+    match try_err_builtin(c.callee, c.args, env)  { Value as v => return StmtVal { value= v; env= env }; null => {} }
+    match try_str_builtin(c.callee, c.args, env)  { Value as v => return StmtVal { value= v; env= env }; null => {} }
+    match try_fs_builtin(c.callee, c.args, env)   { Value as v => return StmtVal { value= v; env= env }; null => {} }
     let h = find_function(env, c.callee)
     let f = h.func
     // C7.1a — extern has no Teko body; the VM has no FFI surface. Honest stop (M.3), same as
     // eval_call (this is the STATEMENT-position call path vm.c folds into its single eval_call).
     if f.is_extern { panic("vm: an `extern` function cannot run in the VM (foreign C call) — use `teko build` to compile it natively (C7.1a)") }
-    ref_param_honest_stop(f)   // (MEM-1b-ii) Ref<T> runs natively; VM aliasing deferred
     if !f.is_test { teko::cov_mark(h.idx) }   // D3 — globally-unique items index (parity with eval_call)
-    // A FRESH root frame with each parameter bound to its evaluated argument (args evaluate in the
-    // CALLER's env, then enter the callee's frame positionally) — the SAME setup as eval_call. Without
-    // this a statement-position call (e.g. `tokens = push(tokens, stamp(...))` reaching a helper) runs
-    // the body with NO params bound → `unbound variable` for the first param read.
-    mut fenv = fresh_env(env.prog)
-    mut ai = 0
-    loop {
-        if ai >= f.params.len { break }
-        let argval = eval_expr(c.args[ai], env)
-        fenv = define(fenv, f.params[ai].name, argval)
-        ai = ai + 1
-    }
+    // Bind args in a fresh callee frame; a `Ref<T>` arg AUTO-REFs (promotes the caller's `mut` lvalue
+    // to a cell) so the caller env may grow — bind_call_args returns BOTH the callee frame and the
+    // updated caller env. (Mirrors the C eval_call arg-binding + auto-ref, sharing cells by pointer.)
+    let bound = bind_call_args(f, c, env)
+    let fenv = bound.fenv
+    mut caller = bound.caller
     teko::cov_enter(h.idx)   // D3-branch — attribute body branches to this fn (no-op unless coverage on)
     let fe2 = exec_block(f.body, fenv)
     teko::cov_leave()
@@ -1900,10 +2079,16 @@ fn call_value(c: checker::TCall, env: Venv) -> Value? {
         di2--
         drained_env2 = exec_block(drained_env2.defers[di2].body, drained_env2).env
     }
+    // (MEM Step 2/3) MERGE the callee's final cells back into the caller: the callee inherited the
+    // caller's cell store and only appended/mutated it, so its final store is a superset-with-writes
+    // and replaces the caller's wholesale — making a `r.value = …` write in the callee visible at the
+    // caller's aliased var (whose slot is cell-backed). (In the C twin the cells array is global, so
+    // the write is already visible; this is the value-functional twin of that shared-pointer effect.)
+    caller = with_cells(caller, drained_env2.cells)
     match fe2.flow {
-        VmReturn as ret => ret.value                      // explicit `return e` (or bare return -> null)
-        Normal as nm  => nm.value                       // W5a — implicit trailing value (B.20); null if none
-        _             => null                            // break/continue can't escape a fn body
+        VmReturn as ret => StmtVal { value= ret.value; env= caller }      // explicit `return e` (or bare return -> null)
+        Normal as nm  => StmtVal { value= nm.value; env= caller }       // W5a — implicit trailing value (B.20); null if none
+        _             => StmtVal { value= null; env= caller }            // break/continue can't escape a fn body
     }
 }
 
@@ -1950,7 +2135,7 @@ fn run_loop(mylabel: str, body: []checker::TStatement, env: Venv) -> LoopOut {
             }
             i = i + 1
         }
-        cur = Venv { slots = loop_outer(e.slots, base); prog = e.prog; defers= cur.defers }   // keep outer mutations; drop locals
+        cur = Venv { slots = loop_outer(e.slots, base); prog = e.prog; defers= cur.defers; cells= e.cells }   // keep outer mutations (incl cell writes); drop locals
         if exited {
             match exflow {
                 VmReturn as ret => return LoopOut { flow = ret; env = cur }
@@ -1985,12 +2170,12 @@ fn exec_if(e: checker::TExpr, env: Venv) -> FlowEnv {
             if c {
                 teko::cov_branch(e.line, e.col, 0)
                 let bo = exec_block(f.then_blk, env)
-                return FlowEnv { flow= bo.flow; env= Venv { slots= loop_outer(bo.env.slots, base); prog= bo.env.prog; defers= bo.env.defers } }
+                return FlowEnv { flow= bo.flow; env= Venv { slots= loop_outer(bo.env.slots, base); prog= bo.env.prog; defers= bo.env.defers; cells= bo.env.cells } }
             }
             teko::cov_branch(e.line, e.col, 1)
             if f.has_else {
                 let bo = exec_block(f.else_blk, env)
-                return FlowEnv { flow= bo.flow; env= Venv { slots= loop_outer(bo.env.slots, base); prog= bo.env.prog; defers= bo.env.defers } }
+                return FlowEnv { flow= bo.flow; env= Venv { slots= loop_outer(bo.env.slots, base); prog= bo.env.prog; defers= bo.env.defers; cells= bo.env.cells } }
             }
             FlowEnv { flow= Normal { value= null }; env= env }    // if-without-else taken false: no value, env unchanged
         }
@@ -2004,7 +2189,7 @@ fn exec_if(e: checker::TExpr, env: Venv) -> FlowEnv {
 // the end -> 0. Top-level functions are callable (run only when called, never on their own).
 // ---------------------------------------------------------------------------
 exp fn run(prog: checker::TProgram) -> i32 {
-    mut env = fresh_env(prog)
+    mut env = fresh_env(prog, teko::list::empty())   // (MEM Step 2/3) the root frame starts with an empty cell store
     mut last: Value? = null      // W5a — the last NORMAL top-level statement's trailing value (B.20)
     mut i = 0
     loop {
@@ -2270,7 +2455,7 @@ exp fn run_tests_cov(prog: checker::TProgram, record_branches: bool, write_xml: 
                 if f.is_test {
                     let label = if f.namespace.len != 0 { teko::str::concat3(f.namespace, "::", f.name) } else { f.name }
                     teko::io::print(teko::str::concat3("test ", label, " ... "))
-                    let fenv = fresh_env(prog)
+                    let fenv = fresh_env(prog, teko::list::empty())   // (MEM Step 2/3) each test frame starts with an empty cell store
                     teko::cov_enter(i to u64)   // attribute the test body's own lines/branches to the test (NOT prod fn 0)
                     let _ = exec_block(f.body, fenv)   // a failed assert panics here (fail-fast); normal completion = pass
                     teko::cov_leave()

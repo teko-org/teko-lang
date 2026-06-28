@@ -153,7 +153,7 @@ _Noreturn static void vm_panic_oob_at (const tk_texpr *e) { vm_panic_pos(e->line
 // =========================================================================
 typedef struct tk_value tk_value;
 
-typedef enum { TK_VAL_INT, TK_VAL_FLOAT, TK_VAL_BOOL, TK_VAL_STR, TK_VAL_LIST, TK_VAL_STRUCT, TK_VAL_OPT } tk_value_tag;
+typedef enum { TK_VAL_INT, TK_VAL_FLOAT, TK_VAL_BOOL, TK_VAL_STR, TK_VAL_LIST, TK_VAL_STRUCT, TK_VAL_OPT, TK_VAL_REF } tk_value_tag;
 
 // the value list — TK_LIST over tk_value (core.h convention). Declared after tk_value.
 typedef struct { tk_value *ptr; size_t len; size_t cap; } tk_value_list;
@@ -185,6 +185,12 @@ struct tk_value {
         // (present=true, `inner` heap-boxed). NONE carries inner=NULL. Distinguishable from any
         // payload value, so `null`/`?.`/`??`/match-over-`T?` all read it unambiguously.
         struct { bool present; tk_value *inner; } opt;
+        // REF (MEM Step 2/3) — a `Ref<T>` value: the index into the global CELL STORE (g_cells)
+        // where the aliased scalar lives. `Ref<T>` is escape-gated to a PARAM-ONLY, SCALAR-only
+        // borrow (MEM Step 0), so this only ever aliases a `mut` scalar local of an ancestor frame:
+        // an auto-ref PROMOTES the origin var to a cell, this carries the cell index, and `.value`
+        // read/write goes through cell_get/cell_set (the .tks twin is the RefVal variant member).
+        struct { uint64_t cell; } ref;
     } as;
 };
 
@@ -411,8 +417,43 @@ static tk_prim_kind expr_num_prim(const tk_texpr *e, const char *ctx) {
 // existing slot; function calls run in a FRESH root frame (no closure capture — M0
 // has no captures, matching codegen's flat C functions).
 // =========================================================================
-typedef struct tk_slot { tk_str name; tk_value val; struct tk_slot *next; } tk_slot;
+// (MEM Step 2/3) `has_cell`/`cell_id` — when a slot is a `Ref<T>` aliasing TARGET (its `mut` value
+// was PROMOTED to the cell store by an auto-ref at a call), the BINDING value lives at
+// g_cells[cell_id], not in `val`; a cell-backed slot reads/writes through the cell so the origin var
+// and every RefVal aliasing it observe the SAME storage. (The .tks twin is slot.cell_id: u64?.)
+typedef struct tk_slot { tk_str name; tk_value val; bool has_cell; uint64_t cell_id; struct tk_slot *next; } tk_slot;
 typedef struct { tk_slot *head; } tk_venv;
+
+// (MEM Step 2/3) THE CELL STORE — the program-wide store of aliased scalars. A `Ref<T>` value is an
+// index here. A global growable array (in-place set, O(1)), shared by pointer across frames so a
+// callee's write through a ref is automatically visible at the caller (no env threading needed — the
+// value-functional .tks twin threads `cells` through the env to reproduce this shared-pointer effect).
+// The store only GROWS (cell_alloc appends) and MUTATES (cell_set), never shrinks/reorders.
+static tk_value *g_cells = NULL;
+static size_t g_cells_len = 0;
+static size_t g_cells_cap = 0;
+static uint64_t cell_alloc(tk_value v) {
+    if (g_cells_len == g_cells_cap) {
+        size_t ncap = g_cells_cap ? g_cells_cap * 2 : 8;
+        tk_value *nb = tk_alloc(ncap * sizeof *nb);
+        if (nb == NULL) abort();
+        for (size_t i = 0; i < g_cells_len; i += 1) nb[i] = g_cells[i];
+        g_cells = nb; g_cells_cap = ncap;
+    }
+    uint64_t id = (uint64_t)g_cells_len;
+    g_cells[g_cells_len] = v;
+    g_cells_len += 1;
+    return id;
+}
+static tk_value cell_get(uint64_t id) {
+    if (id >= g_cells_len) vm_unsupported("cell index out of range (internal: Ref<T> aliasing invariant break)");
+    return g_cells[id];
+}
+static void cell_set(uint64_t id, tk_value v) {
+    if (id >= g_cells_len) vm_unsupported("cell index out of range (internal: Ref<T> aliasing invariant break)");
+    g_cells[id] = v;
+}
+static tk_value v_ref(uint64_t cell) { return (tk_value){ .tag = TK_VAL_REF, .as.ref = { .cell = cell } }; }
 
 static bool name_eq(tk_str a, tk_str b) {
     return a.len == b.len && (a.len == 0 || memcmp(a.ptr, b.ptr, a.len) == 0);
@@ -425,7 +466,7 @@ static tk_slot *env_find(tk_venv *env, tk_str name) {
 static void env_define(tk_venv *env, tk_str name, tk_value val) {
     tk_slot *s = tk_alloc(sizeof *s);
     if (s == NULL) abort();
-    s->name = name; s->val = val; s->next = env->head;
+    s->name = name; s->val = val; s->has_cell = false; s->cell_id = 0; s->next = env->head;
     env->head = s;
 }
 static void env_free(tk_venv *env) {
@@ -469,6 +510,7 @@ static tk_value tk_vm_eval_expr(const tk_texpr *e, tk_venv *env);
 static tk_flow  tk_vm_exec_block(const tk_tstatement *body, size_t n, tk_venv *env);
 static tk_flow  exec_if(const tk_texpr *e, tk_venv *env);     // W5 — `if` as control flow (+ value)
 static tk_flow  exec_match(const tk_texpr *e, tk_venv *env);  // arm bodies are blocks (B.20) — run flow-aware
+static bool     call_value(const tk_texpr *e, tk_venv *env, tk_value *out);   // (MEM Step 2/3) statement-position call (Ref<T>-aware)
 
 // =========================================================================
 // BUILTIN call recognition — VERBATIM mirror of codegen_c.c's CALL lowering:
@@ -1146,6 +1188,108 @@ static tk_value eval_cast(const tk_texpr *e, tk_venv *env) {
     return norm_int(iv.as.i.bits, dsigned, dwidth);
 }
 
+// (MEM Step 2/3) param_is_ref — does parameter `i` of `fn` have a `Ref<T>` annotation (last path
+// segment "Ref")? The same surface-syntax detection codegen and the escape-gate use. fn_has_ref_param
+// folds it over all params. (Mirrors vm.tks param_is_ref / fn_has_ref_param.)
+static bool param_is_ref(const tk_tfunction *fn, size_t i) {
+    tk_type_expr ta = fn->params[i].type_ann;
+    return ta.tag == TK_TEXPR_NAMED && ta.as.named.path.len > 0
+        && seg_is(ta.as.named.path.segments[ta.as.named.path.len - 1].name, "Ref");
+}
+static bool fn_has_ref_param(const tk_tfunction *fn) {
+    for (size_t i = 0; i < fn->nparams; i += 1) if (param_is_ref(fn, i)) return true;
+    return false;
+}
+
+// (MEM Step 2/3) bind_call_args — bind `fn`'s parameters to the call's arguments in `fenv`. For a
+// `Ref<T>` parameter the checker guarantees the argument is either a `mut` scalar lvalue (a TVar —
+// AUTO-REF: promote it to a cell, pass v_ref(cell)) or a value already of reference type (FORWARD:
+// a RefVal from a ref param read — pass it through). Promotion sets the CALLER slot's has_cell so its
+// future reads/writes route through the cell too (the cell store is global, shared by pointer — so a
+// callee write through the ref is automatically visible at the caller). Mirrors vm.tks bind_call_args.
+static void bind_call_args(const tk_tfunction *fn, const tk_texpr *args, size_t nargs, tk_venv *env, tk_venv *fenv) {
+    for (size_t i = 0; i < fn->nparams && i < nargs; i += 1) {
+        if (param_is_ref(fn, i)) {
+            if (args[i].tag != TK_TEXPR_VAR)
+                vm_unsupported("a `Ref<T>` argument must be a mutable variable (internal: checker should reject)");
+            // A Reference-typed arg is a forwarded ref param (pass its RefVal through); any other
+            // type is an auto-ref of a `mut` lvalue (promote the origin var to a cell).
+            if (args[i].type.tag == TK_TYPE_REF) {
+                tk_value fwd = tk_vm_eval_expr(&args[i], env);   // reads the existing RefVal (cell-backed or RefVal slot)
+                env_define(fenv, fn->params[i].name, fwd);
+            } else {
+                tk_slot *s = env_find(env, args[i].as.var.name);
+                if (s == NULL) vm_unsupported("auto-ref of an unbound variable (internal: checker should reject)");
+                if (!s->has_cell) { s->cell_id = cell_alloc(s->val); s->has_cell = true; }  // promote: origin reads now go through the cell
+                env_define(fenv, fn->params[i].name, v_ref(s->cell_id));
+            }
+        } else {
+            tk_value av = tk_vm_eval_expr(&args[i], env);
+            env_define(fenv, fn->params[i].name, av);
+        }
+    }
+}
+
+// run_user_fn — the shared callee-frame run (cov, defer save/restore, body exec, defer drain, free).
+// Returns the callee's resulting flow (the caller coerces it). The cell store is global, so a write
+// through a `Ref<T>` arg is already visible at the caller (no merge needed) — the value-functional
+// .tks twin threads `cells` through the env to reproduce this. Used by both eval_call and call_value.
+static tk_flow run_user_fn(const tk_tfunction *fn, size_t fn_idx, tk_venv *fenv) {
+    tk_vm_defer_node *saved_defer_top = g_vm_defer_top;
+    g_vm_defer_top = NULL;
+    tk_cov_enter(fn_idx);   // D3-branch — attribute body branches to this fn (no-op unless coverage on)
+    tk_flow fl = tk_vm_exec_block(fn->body, fn->nbody, fenv);
+    tk_cov_leave();
+    // (C7.18) Drain the current frame's defer stack LIFO before exit.
+    // Panic does NOT drain (defers registered before panic don't run).
+    {
+        tk_vm_defer_node *d = g_vm_defer_top;
+        while (d != NULL) {
+            tk_vm_defer_node *next = d->next;
+            tk_vm_exec_block(d->stmt->as.defer_stmt.body, d->stmt->as.defer_stmt.nbody, fenv);
+            tk_free0(d);
+            d = next;
+        }
+    }
+    g_vm_defer_top = saved_defer_top;   // restore caller's defer stack
+    return fl;
+}
+
+// call_value — a call in STATEMENT position (the .tks twin's call_value). (MEM Step 2/3) This is the
+// path that SUPPORTS `Ref<T>` aliasing: auto-ref promotes the caller's `mut` lvalue to a (global) cell
+// and the callee writes through it, so `bump(x)` mutates `x`. The C cell store is global/shared, so
+// there is no env to thread back — the write is already visible at the caller. The .tks twin threads
+// the env out (StmtVal.env). eval_call (value position) REJECTS ref params (no caller-env channel in
+// the value-functional twin); they are only reachable in statement position. *out gets the call value.
+static bool call_value(const tk_texpr *e, tk_venv *env, tk_value *out) {
+    tk_path p = e->as.call.callee;
+    const tk_texpr *args = e->as.call.args;
+    size_t nargs = e->as.call.nargs;
+
+    if (try_builtin_call(p, args, nargs, env, out)) return true;   // `-> void` builtin (or value builtin) — no ref args
+
+    size_t fn_idx;
+    const tk_tfunction *fn = find_function(p, &fn_idx);
+    if (fn == NULL) {
+        static char buf[256];
+        tk_str last = p.segments[p.len - 1].name;
+        snprintf(buf, sizeof buf, "`%.*s` is a host function the VM cannot run (use `teko build` to compile natively)",
+                 (int)last.len, (const char *)last.ptr);
+        vm_unsupported(buf);
+    }
+    if (fn->is_extern) vm_unsupported("an `extern` function cannot run in the VM (foreign C call) — use `teko build` to compile it natively (C7.1a)");
+    if (!fn->is_test) tk_cov_mark(fn_idx);
+
+    tk_venv fenv = { .head = NULL };
+    bind_call_args(fn, args, nargs, env, &fenv);   // auto-ref `Ref<T>` args (promote caller lvalues to cells)
+    tk_flow fl = run_user_fn(fn, fn_idx, &fenv);
+    env_free(&fenv);
+    if (fl.kind == TK_FLOW_RETURN && fl.has_value) { *out = fl.value; return true; }   // explicit `return e`
+    if (fl.kind == TK_FLOW_NORMAL && fl.has_value) { *out = fl.value; return true; }   // W5 — implicit trailing value (B.20)
+    *out = v_void();   // `-> void` fn / falls off the end — no value
+    return true;
+}
+
 static tk_value eval_call(const tk_texpr *e, tk_venv *env) {
     tk_path p = e->as.call.callee;
     const tk_texpr *args = e->as.call.args;
@@ -1170,44 +1314,20 @@ static tk_value eval_call(const tk_texpr *e, tk_venv *env) {
     // FFI surface (the same deferred host edge as the io/fs bottoms). Stop HONESTLY (M.3), never
     // synthesize a value, and point at the native path. (Mirrors vm.tks eval_call.)
     if (fn->is_extern) vm_unsupported("an `extern` function cannot run in the VM (foreign C call) — use `teko build` to compile it natively (C7.1a)");
-    // (MEM-1b-ii) A `Ref<T>` parameter takes a reference (auto-ref `&x`). The value-semantic VM env
-    // binds args BY VALUE — no aliasing cell — so a write through `r.value` wouldn't reach the caller,
-    // making VM ≠ native. Per the VM==native-BEHAVIOR mandate, stop HONESTLY (M.3): Ref<T> runs
-    // natively (`teko build`); the VM aliasing cell is DEFERRED to after the native-byte backend.
-    for (size_t i = 0; i < fn->nparams; i += 1) {
-        tk_type_expr ta = fn->params[i].type_ann;
-        if (ta.tag == TK_TEXPR_NAMED && ta.as.named.path.len > 0
-            && seg_is(ta.as.named.path.segments[ta.as.named.path.len - 1].name, "Ref"))
-            vm_unsupported("`Ref<T>` is not yet executable in the VM (reference aliasing) — runs natively via `teko build`; VM support deferred to after the native-byte backend");
-    }
+    // (MEM Step 2/3) A `Ref<T>` call mutates an aliased caller cell; that mutation must be visible at
+    // the caller. The C cell store is global so it WOULD be — but to keep the two VM engines
+    // behaviourally IDENTICAL (the value-functional .tks twin has no env-return channel in value
+    // position), a ref call nested in a VALUE expression is an honest stop here too. Statement-position
+    // ref calls (`bump(x)` — the idiom) go through call_value, which supports aliasing in both twins.
+    if (fn_has_ref_param(fn))
+        vm_unsupported("a `Ref<T>` call in value position is not executable in the tree-walking VM (no env-return channel) — call it in statement position (e.g. `bump(x)`), or use `teko build`");
     if (!fn->is_test) tk_cov_mark(fn_idx);   // D3 — globally unique index (not line) avoids cross-file collisions
 
     // A fresh root frame — no closure capture (flat functions, like codegen's C). Bind each
-    // parameter to its evaluated argument (args evaluate in the CALLER's env, then enter the
-    // callee's frame positionally by the param's name). (B-vm — VM function parameters.)
+    // parameter to its evaluated argument (no ref params here — gated above). (B-vm — VM fn params.)
     tk_venv fenv = { .head = NULL };
-    for (size_t i = 0; i < fn->nparams && i < nargs; i += 1) {
-        tk_value av = tk_vm_eval_expr(&args[i], env);
-        env_define(&fenv, fn->params[i].name, av);
-    }
-    // (C7.18) Save the caller's defer stack; this call frame gets a fresh one.
-    tk_vm_defer_node *saved_defer_top = g_vm_defer_top;
-    g_vm_defer_top = NULL;
-    tk_cov_enter(fn_idx);   // D3-branch — attribute body branches to this fn (no-op unless coverage on)
-    tk_flow fl = tk_vm_exec_block(fn->body, fn->nbody, &fenv);
-    tk_cov_leave();
-    // (C7.18) Drain the current frame's defer stack LIFO before exit.
-    // Panic does NOT drain (simplifies implementation — defers registered before panic don't run).
-    {
-        tk_vm_defer_node *d = g_vm_defer_top;
-        while (d != NULL) {
-            tk_vm_defer_node *next = d->next;
-            tk_vm_exec_block(d->stmt->as.defer_stmt.body, d->stmt->as.defer_stmt.nbody, &fenv);
-            tk_free0(d);
-            d = next;
-        }
-    }
-    g_vm_defer_top = saved_defer_top;   // restore caller's defer stack
+    bind_call_args(fn, args, nargs, env, &fenv);
+    tk_flow fl = run_user_fn(fn, fn_idx, &fenv);
     env_free(&fenv);
     // Coerce the returned value into the declared return type: a `T` returned from a `-> T?`
     // fn present-wraps (REBOOT §202), mirroring codegen's emit_as on the return slot. A NONE
@@ -1551,7 +1671,10 @@ static tk_value tk_vm_eval_expr(const tk_texpr *e, tk_venv *env) {
         case TK_TEXPR_VAR: {
             tk_slot *s = env_find(env, e->as.var.name);
             if (s == NULL) vm_unsupported("reference to an unbound variable (internal: checker should reject)");
-            return s->val;
+            // (MEM Step 2/3) a CELL-BACKED slot (a `Ref<T>` aliasing target whose `mut` value was
+            // promoted to the cell store) reads its CURRENT value from the cell, so the origin var
+            // observes writes made through any RefVal aliasing it. A plain slot yields slot->val.
+            return s->has_cell ? cell_get(s->cell_id) : s->val;
         }
         case TK_TEXPR_STR:  return v_str(e->as.str.text);
         case TK_TEXPR_BYTE: return v_int((uint64_t)e->as.byte.value, false, 8);   // byte == u8 rep
@@ -1566,6 +1689,14 @@ static tk_value tk_vm_eval_expr(const tk_texpr *e, tk_venv *env) {
         case TK_TEXPR_CALL:         return eval_call(e, env);
         case TK_TEXPR_FIELD_ACCESS: {   // W4b — `x.field`: eval the struct receiver, read the field by name.
             tk_value recv = tk_vm_eval_expr(e->as.field_access.receiver, env);
+            // (MEM Step 2/3) `r.value` on a `Ref<T>` — the deref READ: the receiver is a RefVal (a
+            // cell index); `.value` reads the aliased storage (cell_get). The checker restricts a
+            // Reference receiver to ONLY `.value`, so any other field is impossible here.
+            if (recv.tag == TK_VAL_REF) {
+                if (name_eq(e->as.field_access.field, (tk_str){ (const tk_byte *)"value", 5 }))
+                    return cell_get(recv.as.ref.cell);
+                vm_unsupported("a reference (`Ref<T>`) exposes only `.value` (internal: checker should reject)");
+            }
             // W5-idx — `.len`: a `str` value yields its byte length as a u64. A list value
             // (slice) is an honest stop (slice VALUES are the next feature). The checker
             // already typed `.len` as u64 for str/slice receivers.
@@ -1683,6 +1814,40 @@ static tk_flow eval_rhs_flow(const tk_texpr *x, tk_venv *env, tk_value *out) {
     return (tk_flow){ .kind = TK_FLOW_NORMAL, .has_value = true, .value = *out };
 }
 
+// (MEM Step 2/3) compound_apply — apply an assignment operator to `old` with `rhs`: a plain `=`
+// stores rhs; a compound op applies the int op at `old`'s own width/signedness (M0 — ints only;
+// div/mod route through the checked guard so ÷0 PANICS like the native path, positioned at
+// `value_node`). Factored out so a plain-slot, a cell-backed, and a `.value op= …` deref assignment
+// all share the SAME arithmetic. (Mirrors vm.tks compound_apply.)
+static tk_value compound_apply(tk_value old, tk_token_kind op, tk_value rhs, const tk_texpr *value_node) {
+    if (op == TK_TOKEN_ASSIGN) return rhs;
+    if (old.tag != TK_VAL_INT || rhs.tag != TK_VAL_INT)
+        vm_unsupported("compound assignment on a non-integer value not yet supported");
+    bool sgn = old.as.i.is_signed; int w = old.as.i.width;
+    uint64_t a = old.as.i.bits, b = rhs.as.i.bits, raw;
+    switch (op) {
+        case TK_TOKEN_PLUSEQ:  raw = a + b; break;
+        case TK_TOKEN_MINUSEQ: raw = a - b; break;
+        case TK_TOKEN_STAREQ:  raw = a * b; break;
+        case TK_TOKEN_AMPEQ:   raw = a & b; break;
+        case TK_TOKEN_PIPEEQ:  raw = a | b; break;
+        case TK_TOKEN_CARETEQ: raw = a ^ b; break;
+        case TK_TOKEN_SHLEQ:   raw = a << (b & 63); break;
+        case TK_TOKEN_SHREQ:   raw = sgn ? (uint64_t)((int64_t)a >> (b & 63)) : (a >> (b & 63)); break;
+        case TK_TOKEN_SLASHEQ:
+        case TK_TOKEN_PERCENTEQ: {
+            bool isdiv = (op == TK_TOKEN_SLASHEQ);
+            if (b == 0) vm_panic_div0_at(value_node);
+            if (sgn) raw = (uint64_t)(isdiv ? checked_div_i((int64_t)a,(int64_t)b)
+                                            : checked_mod_i((int64_t)a,(int64_t)b));
+            else     raw = isdiv ? checked_div_u(a,b) : checked_mod_u(a,b);
+            break;
+        }
+        default: vm_unsupported("assignment operator not yet supported");
+    }
+    return norm_int(raw, sgn, w);
+}
+
 static tk_flow exec_stmt(const tk_tstatement *s, tk_venv *env) {
     switch (s->tag) {
         case TK_TSTMT_BINDING: {
@@ -1700,45 +1865,28 @@ static tk_flow exec_stmt(const tk_tstatement *s, tk_venv *env) {
             return flow_normal();
         }
         case TK_TSTMT_ASSIGN: {
-            // (MEM-1b-ii) `r.value op= x` writes THROUGH a reference; only occurs inside a `Ref<T>`-
-            // parameter function, which eval_call already honest-stops before the body runs — so this
-            // is unreachable today. Guard defensively (no VM aliasing cell); runs natively.
-            if (s->as.assign.deref) vm_unsupported("`Ref<T>` deref-assignment (`r.value = …`) is not yet executable in the VM — runs natively via `teko build`; VM support deferred");
-            tk_slot *slot = env_find(env, s->as.assign.name);
-            if (slot == NULL) vm_unsupported("assignment to an unbound variable (internal: checker should reject)");
             tk_token_kind op = s->as.assign.op;
             tk_value rhs = tk_vm_eval_expr(&s->as.assign.value, env);
-            if (op == TK_TOKEN_ASSIGN) { slot->val = rhs; return flow_normal(); }
-            // compound assign x op= v: only meaningful on ints in M0. Reproduce the op on
-            // the slot's int value at its own width/signedness.
-            if (slot->val.tag != TK_VAL_INT || rhs.tag != TK_VAL_INT)
-                vm_unsupported("compound assignment on a non-integer value not yet supported");
-            bool sgn = slot->val.as.i.is_signed; int w = slot->val.as.i.width;
-            uint64_t a = slot->val.as.i.bits, b = rhs.as.i.bits, raw;
-            switch (op) {
-                case TK_TOKEN_PLUSEQ:  raw = a + b; break;
-                case TK_TOKEN_MINUSEQ: raw = a - b; break;
-                case TK_TOKEN_STAREQ:  raw = a * b; break;
-                case TK_TOKEN_AMPEQ:   raw = a & b; break;
-                case TK_TOKEN_PIPEEQ:  raw = a | b; break;
-                case TK_TOKEN_CARETEQ: raw = a ^ b; break;
-                case TK_TOKEN_SHLEQ:   raw = a << (b & 63); break;
-                case TK_TOKEN_SHREQ:   raw = sgn ? (uint64_t)((int64_t)a >> (b & 63)) : (a >> (b & 63)); break;
-                case TK_TOKEN_SLASHEQ:
-                case TK_TOKEN_PERCENTEQ: {
-                    // checked: route through the guard so ÷0 PANICS like the native path.
-                    // C1.6 — POSITION the ÷0 panic at the RHS expr (the only positioned node
-                    // in a compound-assign; tk_tassign carries no line/col) before the helper.
-                    bool isdiv = (op == TK_TOKEN_SLASHEQ);
-                    if (b == 0) vm_panic_div0_at(&s->as.assign.value);
-                    if (sgn) raw = (uint64_t)(isdiv ? checked_div_i((int64_t)a,(int64_t)b)
-                                                    : checked_mod_i((int64_t)a,(int64_t)b));
-                    else     raw = isdiv ? checked_div_u(a,b) : checked_mod_u(a,b);
-                    break;
-                }
-                default: vm_unsupported("assignment operator not yet supported");
+            // (MEM Step 2/3) `r.value op= x` writes THROUGH a reference: `s->as.assign.name` names the
+            // `Ref<T>` binding (a RefVal cell index); a deref-assign reads the cell, applies the op, and
+            // writes BACK to the cell (cell_set) — so the caller's aliased var observes the write.
+            if (s->as.assign.deref) {
+                tk_slot *rslot = env_find(env, s->as.assign.name);
+                if (rslot == NULL) vm_unsupported("deref-assign to an unbound reference (internal: checker should reject)");
+                tk_value rv = rslot->has_cell ? cell_get(rslot->cell_id) : rslot->val;
+                if (rv.tag != TK_VAL_REF) vm_unsupported("deref-assign target is not a reference (internal: checker should reject)");
+                tk_value cur = cell_get(rv.as.ref.cell);
+                cell_set(rv.as.ref.cell, compound_apply(cur, op, rhs, &s->as.assign.value));
+                return flow_normal();
             }
-            slot->val = norm_int(raw, sgn, w);
+            tk_slot *slot = env_find(env, s->as.assign.name);
+            if (slot == NULL) vm_unsupported("assignment to an unbound variable (internal: checker should reject)");
+            // (MEM Step 2/3) a CELL-BACKED slot's value lives in the cell store — read OLD from the
+            // cell so a compound op operates on the aliased storage, and write the result BACK to the
+            // cell (the slot stays cell-backed). A plain slot reads/writes slot->val as before.
+            tk_value old = slot->has_cell ? cell_get(slot->cell_id) : slot->val;
+            tk_value nv = compound_apply(old, op, rhs, &s->as.assign.value);
+            if (slot->has_cell) cell_set(slot->cell_id, nv); else slot->val = nv;
             return flow_normal();
         }
         case TK_TSTMT_RETURN: {
@@ -1759,7 +1907,12 @@ static tk_flow exec_stmt(const tk_tstatement *s, tk_venv *env) {
             const tk_texpr *x = &s->as.expr_stmt.expr;
             if (x->tag == TK_TEXPR_IF)    return exec_if(x, env);
             if (x->tag == TK_TEXPR_MATCH) return exec_match(x, env);
-            tk_value v = tk_vm_eval_expr(x, env);
+            // (MEM Step 2/3) a statement-position CALL goes through call_value (the Ref<T>-aware path:
+            // auto-ref promotes a `mut` lvalue arg to a cell so the callee can mutate it). Other exprs
+            // evaluate plainly. (The .tks twin routes TCall → call_value via eval_stmt_value.)
+            tk_value v;
+            if (x->tag == TK_TEXPR_CALL) { call_value(x, env, &v); }
+            else                         { v = tk_vm_eval_expr(x, env); }
             return (tk_flow){ .kind = TK_FLOW_NORMAL, .has_value = true, .value = v };
         }
         case TK_TSTMT_LOOP: {
