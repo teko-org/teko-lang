@@ -455,6 +455,8 @@ tk_tprogram_result tk_type_program_with_deps(tk_program program, tk_tprogram dep
     // W-vis-enforce: only the project's items (dep was checked when built).
     { const char *why = tk_check_modules(program, c.as.value.types);
       if (why) return (tk_tprogram_result){ .ok = false, .as.error = tk_error_make(why) }; }
+    // (S4 type-generics) stamp concrete decls for written generic uses before typing (no-op when none).
+    tk_type_table types = tk_instantiate_types(program, c.as.value.types);
 
     tk_titem_list items = tk_titem_list_empty();
     tk_tstmt_list mainbody = tk_tstmt_list_empty();
@@ -468,7 +470,7 @@ tk_tprogram_result tk_type_program_with_deps(tk_program program, tk_tprogram dep
         uint32_t col  = it.tag == TK_ITEM_FUNCTION  ? it.as.function.col
                       : it.tag == TK_ITEM_TYPE_DECL ? it.as.type_decl.col : 0;
         if (it.tag == TK_ITEM_STATEMENT) {
-            tk_typed_stmt_result ts = tk_type_statement(it.as.statement, cur, c.as.value.types);
+            tk_typed_stmt_result ts = tk_type_statement(it.as.statement, cur, types);
             if (!ts.ok) return (tk_tprogram_result){ .ok = false, .as.error = surface_at(it.file, line, col, ts.as.error) };
             cur = ts.as.value.env;
             items = tk_titem_list_push(items, (tk_titem){ .tag = TK_TITEM_STATEMENT, .as.statement = ts.as.value.node });
@@ -476,7 +478,7 @@ tk_tprogram_result tk_type_program_with_deps(tk_program program, tk_tprogram dep
             continue;
         }
         tk_env ienv = c.as.value.env; ienv.cur_ns = it.namespace;
-        tk_titem_result ti = tk_type_item(it, ienv, c.as.value.types);
+        tk_titem_result ti = tk_type_item(it, ienv, types);
         if (!ti.ok) return (tk_tprogram_result){ .ok = false, .as.error = surface_at(it.file, line, col, ti.as.error) };
         items = tk_titem_list_push(items, ti.as.value);
     }
@@ -496,7 +498,7 @@ tk_tprogram_result tk_type_program_with_deps(tk_program program, tk_tprogram dep
     { tk_error ae = tk_analyze_program(tp);
       if (ae.message) return (tk_tprogram_result){ .ok = false, .as.error = ae }; }
     // (S4b) MONOMORPHIZE the full (dep + project) tree — see tk_type_program. No-op when no generics.
-    return tk_monomorphize(tp, c.as.value.types);
+    return tk_monomorphize(tp, types);
 }
 
 tk_tprogram_result tk_type_program(tk_program program) {
@@ -506,6 +508,8 @@ tk_tprogram_result tk_type_program(tk_program program) {
     // whole flattened program before typing — fail loud on any cross-namespace violation (M.1).
     { const char *why = tk_check_modules(program, c.as.value.types);
       if (why) return (tk_tprogram_result){ .ok = false, .as.error = tk_error_make(why) }; }
+    // (S4 type-generics) stamp concrete decls for written generic uses before typing (no-op when none).
+    tk_type_table types = tk_instantiate_types(program, c.as.value.types);
     tk_titem_list items = tk_titem_list_empty();
     tk_tstmt_list mainbody = tk_tstmt_list_empty();   // loose top-level statements (the virtual-main), for label validation
     // Thread the env across LOOSE top-level statements (the virtual-main): a `let a`
@@ -523,7 +527,7 @@ tk_tprogram_result tk_type_program(tk_program program) {
         uint32_t col  = it.tag == TK_ITEM_FUNCTION  ? it.as.function.col
                       : it.tag == TK_ITEM_TYPE_DECL ? it.as.type_decl.col : 0;
         if (it.tag == TK_ITEM_STATEMENT) {
-            tk_typed_stmt_result ts = tk_type_statement(it.as.statement, cur, c.as.value.types);
+            tk_typed_stmt_result ts = tk_type_statement(it.as.statement, cur, types);
             if (!ts.ok) {   // (C1-POS) prefer the failing expr's own position; the item's is the fallback
                 uint32_t el = ts.as.error.line ? ts.as.error.line : line;
                 uint32_t ec = ts.as.error.line ? ts.as.error.col  : col;
@@ -536,7 +540,7 @@ tk_tprogram_result tk_type_program(tk_program program) {
             continue;
         }
         tk_env ienv = c.as.value.env; ienv.cur_ns = it.namespace;   // (#41) resolve the body's calls in the item's ns
-        tk_titem_result ti = tk_type_item(it, ienv, c.as.value.types);
+        tk_titem_result ti = tk_type_item(it, ienv, types);
         if (!ti.ok) {   // (C1-POS) prefer the failing expr's own position; the item's is the fallback
             uint32_t el = ti.as.error.line ? ti.as.error.line : line;
             uint32_t ec = ti.as.error.line ? ti.as.error.col  : col;
@@ -557,5 +561,5 @@ tk_tprogram_result tk_type_program(tk_program program) {
     // codegen/VM/tests receive a tree with only concrete functions. No-op (byte-identical) when
     // the program has no generic function. Runs AFTER analyze so the original generic fn + its
     // call are seen by init analysis (no false unused-private-fn warning).
-    return tk_monomorphize(tp, c.as.value.types);
+    return tk_monomorphize(tp, types);
 }

@@ -792,6 +792,30 @@ fn resolves_generic_type_instantiation() {
     teko::assert::is_true(generic_inst_name("Box", at) == "Box__g__i64__str")
 }
 
+// (S4 type-generics) the instantiation pass stamps a concrete decl for a written `Box<i64>` use.
+#test
+fn instantiate_types_stamps_concrete_decl() {
+    let tbl = box_generic_table()   // generic `Box<T> = struct { value: T }`
+    // a program with `type Node = struct { b: Box<i64> }` — a written Box<i64> use site.
+    let boxi64 = parser::NamedType { path = parser::Path { segments = teko::list::push(teko::list::empty(), parser::Segment { name = "Box" }) }; args = teko::list::push(teko::list::empty(), ttype_named("i64")) }
+    let fld = parser::Field { name = "b"; type_ann = boxi64 }
+    let node = parser::TypeDecl { name = "Node"; type_params = teko::list::empty(); body = parser::StructBody { fields = teko::list::push(teko::list::empty(), fld) }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }
+    let items: []parser::Item = teko::list::push(teko::list::empty(), parser::Item { content = node; namespace = ""; file = "" })
+    let ext = instantiate_types(parser::Program { items = items }, tbl)
+    // Box__g__i64 = struct { value: i64 } is now in the table (T substituted to i64).
+    match type_table_find(ext, "Box__g__i64") {
+        parser::TypeDecl as d => match d.body {
+            parser::StructBody as sb => {
+                teko::assert::is_true(sb.fields.len == 1)
+                teko::assert::is_true(sb.fields[0].name == "value")
+                teko::assert::is_true(match sb.fields[0].type_ann { parser::NamedType as n => n.path.segments.len == 1 && n.path.segments[0].name == "i64"; _ => false })
+            }
+            _ => teko::assert::is_true(false)
+        }
+        error => teko::assert::is_true(false)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Group K: monomorphize (S4b crumb 2c) — direct VM coverage of the mono walk.
 // Build typed programs by hand (a generic TFunction template + non-generic callers /

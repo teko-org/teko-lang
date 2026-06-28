@@ -1,5 +1,6 @@
 // src/checker/resolve.c
 #include "resolve.h"
+#include "../parser/ast.h"   // tk_box_type, tk_types_push, tk_fields_push (instantiation pass)
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>     // snprintf — named error messages
@@ -357,6 +358,137 @@ static tk_type_result resolve_generic_inst(tk_path path, tk_type_expr *args, siz
         return (tk_type_result){ .ok = false, .as.error = tk_error_named("generic type expects a different number of type arguments", name) };
     tk_type t = { .tag = TK_TYPE_NAMED, .as.named.name = tk_generic_inst_name(name, argtypes, nargs) };
     return (tk_type_result){ .ok = true, .as.value = t };
+}
+
+// ── (S4) type-generic INSTANTIATION pass — mirror of resolve.tks ─────────────────────────────────
+// substitute type-parameter NAMES with their argument type-exprs throughout a (syntactic) type-expr.
+static tk_type_expr subst_texpr_names(tk_type_expr te, tk_str *params, size_t nparams, tk_type_expr *args, size_t nargs) {
+    switch (te.tag) {
+        case TK_TEXPR_NAMED: {
+            if (te.as.named.path.len == 1 && te.as.named.args_len == 0) {
+                tk_str nm = te.as.named.path.segments[0].name;
+                for (size_t k = 0; k < nparams; k += 1)
+                    if (k < nargs && name_eq(params[k], nm)) return args[k];
+            }
+            tk_type_expr *na = NULL; size_t n2 = 0;
+            for (size_t j = 0; j < te.as.named.args_len; j += 1)
+                tk_types_push(&na, &n2, subst_texpr_names(te.as.named.args[j], params, nparams, args, nargs));
+            return (tk_type_expr){ .tag = TK_TEXPR_NAMED, .as.named = { .path = te.as.named.path, .args = na, .args_len = n2 } };
+        }
+        case TK_TEXPR_SLICE:
+            if (!te.as.slice.element) return te;
+            return (tk_type_expr){ .tag = TK_TEXPR_SLICE, .as.slice = { .element = tk_box_type(subst_texpr_names(*te.as.slice.element, params, nparams, args, nargs)) } };
+        case TK_TEXPR_OPTIONAL:
+            if (!te.as.optional.inner) return te;
+            return (tk_type_expr){ .tag = TK_TEXPR_OPTIONAL, .as.optional = { .inner = tk_box_type(subst_texpr_names(*te.as.optional.inner, params, nparams, args, nargs)) } };
+        case TK_TEXPR_UNION: {
+            tk_type_expr *ms = NULL; size_t nm = 0;
+            for (size_t i = 0; i < te.as.uni.len; i += 1)
+                tk_types_push(&ms, &nm, subst_texpr_names(te.as.uni.members[i], params, nparams, args, nargs));
+            return (tk_type_expr){ .tag = TK_TEXPR_UNION, .as.uni = { .members = ms, .len = nm } };
+        }
+    }
+    return te;
+}
+
+// substitute the type-params throughout a type-decl BODY (struct fields / variant / alias).
+static tk_type_body subst_body_names(tk_type_body body, tk_str *params, size_t nparams, tk_type_expr *args, size_t nargs) {
+    switch (body.tag) {
+        case TK_BODY_STRUCT: {
+            tk_field *nf = NULL; size_t n = 0;
+            for (size_t i = 0; i < body.as.struct_body.n_fields; i += 1)
+                tk_fields_push(&nf, &n, (tk_field){ .name = body.as.struct_body.fields[i].name,
+                    .type_ann = subst_texpr_names(body.as.struct_body.fields[i].type_ann, params, nparams, args, nargs) });
+            return (tk_type_body){ .tag = TK_BODY_STRUCT, .as.struct_body = { .fields = nf, .n_fields = n } };
+        }
+        case TK_BODY_VARIANT:
+            return (tk_type_body){ .tag = TK_BODY_VARIANT, .as.variant_body = { .type_expr = subst_texpr_names(body.as.variant_body.type_expr, params, nparams, args, nargs) } };
+        case TK_BODY_ALIAS:
+            return (tk_type_body){ .tag = TK_BODY_ALIAS, .as.alias_body = { .alias = subst_texpr_names(body.as.alias_body.alias, params, nparams, args, nargs) } };
+        default: return body;
+    }
+}
+
+// collect every generic-type USE (a NamedType carrying args) reachable in a type-expr — innermost first.
+static void collect_texpr_insts(tk_type_expr te, tk_type_expr **acc, size_t *n) {
+    switch (te.tag) {
+        case TK_TEXPR_NAMED:
+            for (size_t i = 0; i < te.as.named.args_len; i += 1) collect_texpr_insts(te.as.named.args[i], acc, n);
+            if (te.as.named.args_len > 0) tk_types_push(acc, n, te);
+            break;
+        case TK_TEXPR_SLICE:    if (te.as.slice.element)  collect_texpr_insts(*te.as.slice.element, acc, n); break;
+        case TK_TEXPR_OPTIONAL: if (te.as.optional.inner) collect_texpr_insts(*te.as.optional.inner, acc, n); break;
+        case TK_TEXPR_UNION:    for (size_t i = 0; i < te.as.uni.len; i += 1) collect_texpr_insts(te.as.uni.members[i], acc, n); break;
+    }
+}
+static void collect_body_insts(tk_type_body body, tk_type_expr **acc, size_t *n) {
+    switch (body.tag) {
+        case TK_BODY_STRUCT:  for (size_t i = 0; i < body.as.struct_body.n_fields; i += 1) collect_texpr_insts(body.as.struct_body.fields[i].type_ann, acc, n); break;
+        case TK_BODY_VARIANT: collect_texpr_insts(body.as.variant_body.type_expr, acc, n); break;
+        case TK_BODY_ALIAS:   collect_texpr_insts(body.as.alias_body.alias, acc, n); break;
+        default: break;
+    }
+}
+static void collect_stmts_insts(tk_statement *stmts, size_t ns, tk_type_expr **acc, size_t *n);
+static void collect_stmt_insts(tk_statement s, tk_type_expr **acc, size_t *n) {
+    switch (s.tag) {
+        case TK_STMT_BINDING: if (s.as.binding.has_type) collect_texpr_insts(s.as.binding.type_ann, acc, n); break;
+        case TK_STMT_LOOP:    collect_stmts_insts(s.as.loop_stmt.body, s.as.loop_stmt.nbody, acc, n); break;
+        case TK_STMT_DEFER:   collect_stmts_insts(s.as.defer_stmt.body, s.as.defer_stmt.nbody, acc, n); break;
+        default: break;
+    }
+}
+static void collect_stmts_insts(tk_statement *stmts, size_t ns, tk_type_expr **acc, size_t *n) {
+    for (size_t i = 0; i < ns; i += 1) collect_stmt_insts(stmts[i], acc, n);
+}
+static void collect_item_insts(tk_item it, tk_type_expr **acc, size_t *n) {
+    switch (it.tag) {
+        case TK_ITEM_FUNCTION: {
+            tk_function f = it.as.function;
+            for (size_t i = 0; i < f.nparams; i += 1) collect_texpr_insts(f.params[i].type_ann, acc, n);
+            if (f.has_return) collect_texpr_insts(f.return_type, acc, n);
+            collect_stmts_insts(f.body, f.nbody, acc, n);
+            break;
+        }
+        case TK_ITEM_TYPE_DECL: collect_body_insts(it.as.type_decl.body, acc, n); break;
+        case TK_ITEM_STATEMENT: collect_stmt_insts(it.as.statement, acc, n); break;
+        default: break;
+    }
+}
+
+// THE PASS: stamp concrete decls for written generic uses into the table (dedup by mangled name),
+// scanning each stamped body for transitive instantiations until the worklist drains. No-op (the
+// table is returned unchanged) when no generic type is used. Mirror of resolve.tks::instantiate_types.
+tk_type_table tk_instantiate_types(tk_program program, tk_type_table table) {
+    tk_type_expr *work = NULL; size_t nwork = 0;
+    for (size_t i = 0; i < program.len; i += 1) collect_item_insts(program.items[i], &work, &nwork);
+    if (nwork == 0) return table;
+    tk_type_table tbl = table;
+    for (size_t wi = 0; wi < nwork; wi += 1) {
+        tk_type_expr te = work[wi];
+        if (te.tag != TK_TEXPR_NAMED || te.as.named.args_len == 0) continue;
+        tk_str name = te.as.named.path.segments[te.as.named.path.len - 1].name;
+        tk_type *argtypes = te.as.named.args_len ? tk_alloc(te.as.named.args_len * sizeof *argtypes) : NULL;
+        bool ok = true;
+        for (size_t a = 0; a < te.as.named.args_len; a += 1) {
+            tk_type_result r = tk_resolve_type(te.as.named.args[a], tbl);
+            if (!r.ok) { ok = false; break; }
+            argtypes[a] = r.as.value;
+        }
+        if (!ok) continue;
+        tk_str mangled = tk_generic_inst_name(name, argtypes, te.as.named.args_len);
+        if (tk_type_table_find(tbl, mangled).ok) continue;   // already stamped
+        tk_decl_result gd = tk_type_table_find(tbl, name);
+        if (!gd.ok) continue;                                // unknown base → reported at typing
+        tk_type_decl gen = gd.as.value;
+        if (gen.n_type_params != te.as.named.args_len) continue;   // arity error surfaces at resolve
+        tk_type_body nbody = subst_body_names(gen.body, gen.type_params, gen.n_type_params, te.as.named.args, te.as.named.args_len);
+        tk_type_decl stamped = { .name = mangled, .type_params = NULL, .n_type_params = 0, .body = nbody,
+                                 .vis = gen.vis, .has_doc = false, .doc = (tk_str){0}, .line = gen.line, .col = gen.col };
+        tbl = tk_type_table_push(tbl, (tk_type_reg){ .name = mangled, .namespace = (tk_str){0}, .vis = gen.vis, .decl = stamped });
+        collect_body_insts(nbody, &work, &nwork);   // transitive instantiations in the stamped body
+    }
+    return tbl;
 }
 
 // A NAMED type referring to a `variant` decl → its expanded TK_TYPE_VARIANT. A variant decl's

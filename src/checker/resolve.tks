@@ -466,3 +466,167 @@ fn render_members(members: []Type) -> str {
     }
     out
 }
+
+// ── (S4) type-generic INSTANTIATION pass ────────────────────────────────────────────────────────
+// Discover every WRITTEN generic-type use `Box<i64>` across the program and STAMP a concrete decl
+// `Box__g__i64 = struct { value: i64 }` into the TypeTable BEFORE typing, so field-access and
+// struct-init see concrete fields. No generic type used → the table is returned UNCHANGED (the
+// non-generic corpus is unperturbed). The stamped name reuses generic_inst_name, so a USE
+// (resolve_generic_inst) and its stamped decl agree byte-for-byte. (C: tk_instantiate_types.)
+//
+// SCOPE (this crumb): instantiation sites are fn params/returns, type-decl bodies (struct/variant/
+// alias), and binding ANNOTATIONS (recursing loop/defer blocks). Casts and if/match-nested bindings
+// are not yet walked (a later crumb) — those surface as an "unknown type" at typing, not silently.
+
+// substitute type-parameter NAMES with their argument type-exprs throughout a (syntactic) type-expr.
+fn subst_texpr_names(te: parser::TypeExpr, params: []str, args: []parser::TypeExpr) -> parser::TypeExpr {
+    match te {
+        parser::NamedType as nt => {
+            if nt.path.segments.len == 1 && nt.args.len == 0 {
+                let nm = nt.path.segments[0].name
+                mut k = 0
+                loop {
+                    if k >= params.len { break }
+                    if params[k] == nm { return args[k] }
+                    k++
+                }
+            }
+            mut nargs: []parser::TypeExpr = teko::list::empty()
+            mut j = 0
+            loop { if j >= nt.args.len { break }; nargs = teko::list::push(nargs, subst_texpr_names(nt.args[j], params, args)); j++ }
+            parser::NamedType { path = nt.path; args = nargs }
+        }
+        parser::SliceType as st    => parser::SliceType { element = subst_texpr_names(st.element, params, args) }
+        parser::OptionalType as ot => parser::OptionalType { inner = subst_texpr_names(ot.inner, params, args) }
+        parser::UnionType as ut    => {
+            mut ms: []parser::TypeExpr = teko::list::empty()
+            mut i = 0
+            loop { if i >= ut.members.len { break }; ms = teko::list::push(ms, subst_texpr_names(ut.members[i], params, args)); i++ }
+            parser::UnionType { members = ms }
+        }
+    }
+}
+
+// substitute the type-params throughout a type-decl BODY (struct fields / variant / alias).
+fn subst_body_names(body: parser::TypeBody, params: []str, args: []parser::TypeExpr) -> parser::TypeBody {
+    match body {
+        parser::StructBody as sb => {
+            mut nf: []parser::Field = teko::list::empty()
+            mut i = 0
+            loop { if i >= sb.fields.len { break }; nf = teko::list::push(nf, parser::Field { name = sb.fields[i].name; type_ann = subst_texpr_names(sb.fields[i].type_ann, params, args) }); i++ }
+            parser::StructBody { fields = nf }
+        }
+        parser::VariantBody as vb => parser::VariantBody { type_expr = subst_texpr_names(vb.type_expr, params, args) }
+        parser::AliasBody as ab   => parser::AliasBody { alias = subst_texpr_names(ab.alias, params, args) }
+        _                         => body   // enum / flags / extern carry no type-exprs
+    }
+}
+
+// collect every generic-type USE (a NamedType carrying args) reachable in a type-expr — innermost
+// first, so a nested `Box<i64>` inside `[]Box<i64>` is stamped before the enclosing use.
+fn collect_texpr_insts(te: parser::TypeExpr, acc: []parser::TypeExpr) -> []parser::TypeExpr {
+    mut out = acc
+    match te {
+        parser::NamedType as nt => {
+            mut i = 0
+            loop { if i >= nt.args.len { break }; out = collect_texpr_insts(nt.args[i], out); i++ }
+            if nt.args.len > 0 { out = teko::list::push(out, te) }
+        }
+        parser::SliceType as st    => out = collect_texpr_insts(st.element, out)
+        parser::OptionalType as ot => out = collect_texpr_insts(ot.inner, out)
+        parser::UnionType as ut    => { mut i = 0; loop { if i >= ut.members.len { break }; out = collect_texpr_insts(ut.members[i], out); i++ } }
+    }
+    out
+}
+
+fn collect_body_insts(body: parser::TypeBody, acc: []parser::TypeExpr) -> []parser::TypeExpr {
+    mut out = acc
+    match body {
+        parser::StructBody as sb  => { mut i = 0; loop { if i >= sb.fields.len { break }; out = collect_texpr_insts(sb.fields[i].type_ann, out); i++ } }
+        parser::VariantBody as vb => out = collect_texpr_insts(vb.type_expr, out)
+        parser::AliasBody as ab   => out = collect_texpr_insts(ab.alias, out)
+        _                         => {}
+    }
+    out
+}
+
+fn collect_stmts_insts(stmts: []parser::Statement, acc: []parser::TypeExpr) -> []parser::TypeExpr {
+    mut out = acc
+    mut i = 0
+    loop { if i >= stmts.len { break }; out = collect_stmt_insts(stmts[i], out); i++ }
+    out
+}
+fn collect_stmt_insts(s: parser::Statement, acc: []parser::TypeExpr) -> []parser::TypeExpr {
+    mut out = acc
+    match s {
+        parser::Binding as b   => { if b.has_type { out = collect_texpr_insts(b.type_ann, out) } }
+        parser::LoopStmt as l  => out = collect_stmts_insts(l.body, out)
+        parser::DeferStmt as d => out = collect_stmts_insts(d.body, out)
+        _                      => {}
+    }
+    out
+}
+
+fn collect_item_insts(it: parser::Item, acc: []parser::TypeExpr) -> []parser::TypeExpr {
+    mut out = acc
+    match it.content {
+        parser::Function as f => {
+            mut i = 0
+            loop { if i >= f.params.len { break }; out = collect_texpr_insts(f.params[i].type_ann, out); i++ }
+            if f.has_return { out = collect_texpr_insts(f.return_type, out) }
+            out = collect_stmts_insts(f.body, out)
+        }
+        parser::TypeDecl as td => out = collect_body_insts(td.body, out)
+        parser::Statement as s => out = collect_stmt_insts(s, out)
+        _                      => {}
+    }
+    out
+}
+
+// THE PASS: collect instantiation sites, then stamp each concrete decl into the table (dedup by
+// mangled name), scanning each stamped body for transitive instantiations until the worklist drains.
+pub fn instantiate_types(program: parser::Program, table: TypeTable) -> TypeTable {
+    mut work: []parser::TypeExpr = teko::list::empty()
+    mut i = 0
+    loop { if i >= program.items.len { break }; work = collect_item_insts(program.items[i], work); i++ }
+    if work.len == 0 { return table }   // no generic type used → unchanged (corpus-safe)
+    mut tbl = table
+    mut wi = 0
+    loop {
+        if wi >= work.len { break }
+        let te = work[wi]
+        wi++
+        match te {
+            parser::NamedType as nt => {
+                if nt.args.len == 0 { continue }
+                let name = nt.path.segments[nt.path.segments.len - 1].name
+                // resolve args → concrete types for the mangled name; an unresolved arg (e.g. a
+                // type-param inside a generic body) means this site concretizes only when the OUTER
+                // generic is instantiated — skip it here.
+                mut argtypes: []Type = teko::list::empty()
+                mut ok = true
+                mut a = 0
+                loop {
+                    if a >= nt.args.len { break }
+                    match resolve_type(nt.args[a], tbl) { Type as t => argtypes = teko::list::push(argtypes, t); error => { ok = false; break } }
+                    a++
+                }
+                if !ok { continue }
+                let mangled = generic_inst_name(name, argtypes)
+                match type_table_find(tbl, mangled) { parser::TypeDecl => continue; error => {} }   // already stamped
+                match type_table_find(tbl, name) {
+                    parser::TypeDecl as gen => {
+                        if gen.type_params.len != nt.args.len { continue }   // arity error surfaces at resolve
+                        let nbody = subst_body_names(gen.body, gen.type_params, nt.args)
+                        let stamped = parser::TypeDecl { name = mangled; type_params = teko::list::empty(); body = nbody; vis = gen.vis; has_doc = false; doc = ""; line = gen.line; col = gen.col }
+                        tbl = teko::list::push(tbl, TypeReg { name = mangled; namespace = ""; vis = gen.vis; decl = stamped })
+                        work = collect_body_insts(nbody, work)   // transitive instantiations in the stamped body
+                    }
+                    error => continue   // unknown base type → reported at typing
+                }
+            }
+            _ => continue
+        }
+    }
+    tbl
+}

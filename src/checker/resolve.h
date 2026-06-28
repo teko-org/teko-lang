@@ -58,4 +58,9 @@ const char *tk_type_render(tk_type t);
 tk_str tk_type_mangle(tk_type t);
 tk_str tk_generic_inst_name(tk_str base, tk_type *args, size_t nargs);
 
+// (S4) type-generic instantiation: stamp concrete decls for written generic uses (`Box<i64>`) into
+// the table before typing. Returns the table UNCHANGED when no generic type is used. Mirror of
+// resolve.tks::instantiate_types.
+tk_type_table tk_instantiate_types(tk_program program, tk_type_table table);
+
 #endif // TK_CHECK_RESOLVE_H

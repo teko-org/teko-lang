@@ -1540,6 +1540,8 @@ pub fn type_program_with_deps(program: parser::Program, dep_prog: TProgram) -> T
     // W-vis-enforce: enforce the module system over the project's own items.
     // We only check the project's items (not dep items — they were checked when the dep was built).
     match check_modules(program, c.types) { null => {}; error as e => return e }
+    // (S4 type-generics) stamp concrete decls for written generic uses before typing (no-op when none).
+    let types = instantiate_types(program, c.types)
     mut items: []TItem = teko::list::empty()
     mut mainbody: []TStatement = teko::list::empty()
     mut cur = c.env
@@ -1557,7 +1559,7 @@ pub fn type_program_with_deps(program: parser::Program, dep_prog: TProgram) -> T
         }
         match it.content {
             parser::Statement as s => {
-                let ts = match type_statement(s, cur, c.types) {
+                let ts = match type_statement(s, cur, types) {
                     TypedStmt as x => x
                     error as e => return surface_at(it.file, line, col, e)
                 }
@@ -1566,7 +1568,7 @@ pub fn type_program_with_deps(program: parser::Program, dep_prog: TProgram) -> T
                 cur = ts.env
             }
             _ => {
-                let ti = match type_item(it, ienv, c.types) {
+                let ti = match type_item(it, ienv, types) {
                     TItem as x => x
                     error as e => return surface_at(it.file, line, col, e)
                 }
@@ -1595,7 +1597,7 @@ pub fn type_program_with_deps(program: parser::Program, dep_prog: TProgram) -> T
     let tp = TProgram { items = all_items }
     match analyze_program(tp) { null => {}; error as e => return e }
     // (S4b) MONOMORPHIZE the full (dep + project) tree — see type_program. No-op when no generics.
-    match monomorphize(tp, c.types) { TProgram as mp => mp; error as e => return e }
+    match monomorphize(tp, types) { TProgram as mp => mp; error as e => return e }
 }
 
 // THE TYPED ENTRY POINT: pass 1 (collect top-level names) + pass 2 (type each item).
@@ -1604,6 +1606,9 @@ pub fn type_program(program: parser::Program) -> TProgram | error {
     // W-vis-enforce: enforce the module system (namespace qualification + pub/exp) over the
     // whole flattened program before typing — fail loud on any cross-namespace violation (M.1).
     match check_modules(program, c.types) { null => {}; error as e => return e }
+    // (S4 type-generics) STAMP concrete decls for written generic uses (`Box<i64>`) into the table
+    // before typing, so field-access / struct-init see concrete fields. No-op when none are used.
+    let types = instantiate_types(program, c.types)
     mut items: []TItem = teko::list::empty()
     mut mainbody: []TStatement = teko::list::empty()   // the loose top-level statements (the virtual-main), for label validation
     mut cur = c.env                                    // threaded virtual-main scope: each loose binding extends it for the next statement (mirrors typer.c's `cur`)
@@ -1631,7 +1636,7 @@ pub fn type_program(program: parser::Program) -> TProgram | error {
             parser::Statement as s => {
                 // type with the THREADED scope `cur` (not the base env) so a loose `let args = …`
                 // is visible to the following statements; advance `cur` to the binding's env.
-                let ts = match type_statement(s, cur, c.types) {
+                let ts = match type_statement(s, cur, types) {
                     TypedStmt as x => x
                     error as e => return surface_at(it.file, line, col, e)
                 }
@@ -1640,7 +1645,7 @@ pub fn type_program(program: parser::Program) -> TProgram | error {
                 cur = ts.env
             }
             _ => {
-                let ti = match type_item(it, ienv, c.types) {
+                let ti = match type_item(it, ienv, types) {
                     TItem as x => x
                     error as e => return surface_at(it.file, line, col, e)
                 }
@@ -1659,5 +1664,5 @@ pub fn type_program(program: parser::Program) -> TProgram | error {
     // codegen/VM/tests receive a tree with only concrete functions. No-op (byte-identical) when
     // the program has no generic function. Runs AFTER analyze so the original generic fn + its
     // call are seen by init analysis (no false unused-private-fn warning).
-    match monomorphize(tp, c.types) { TProgram as mp => mp; error as e => return e }
+    match monomorphize(tp, types) { TProgram as mp => mp; error as e => return e }
 }
