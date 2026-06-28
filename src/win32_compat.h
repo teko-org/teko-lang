@@ -18,10 +18,16 @@
 
 #ifdef _WIN32
 
+// Silence MSVC/CRT deprecation warnings for POSIX-name functions (fopen, getenv, …).
+// We intentionally use the portable names; the "safe" _s variants have different semantics.
+#ifndef _CRT_SECURE_NO_WARNINGS
+#define _CRT_SECURE_NO_WARNINGS
+#endif
+
 #include <windows.h>   // FindFirstFileA / FindNextFileA / FindClose
-#include <direct.h>    // _chdir, _mkdir
+#include <direct.h>    // _chdir, _mkdir, _getcwd
 #include <process.h>   // _spawnvp, _P_WAIT
-#include <stdlib.h>    // malloc, free
+#include <stdlib.h>    // malloc, free, _putenv_s
 #include <string.h>    // strlen, memcpy
 #include <errno.h>     // EEXIST (available on Windows CRT)
 

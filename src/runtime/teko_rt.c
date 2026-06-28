@@ -107,7 +107,9 @@ static void tk_rt_crash_handler(int sig) {
 }
 __attribute__((constructor)) static void tk_rt_install_crash_handler(void) {
     signal(SIGSEGV, tk_rt_crash_handler);
-    signal(SIGBUS,  tk_rt_crash_handler);
+#ifndef _WIN32
+    signal(SIGBUS,  tk_rt_crash_handler);   // not defined on Windows
+#endif
     signal(SIGILL,  tk_rt_crash_handler);
     signal(SIGFPE,  tk_rt_crash_handler);
 }
