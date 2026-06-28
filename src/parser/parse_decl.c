@@ -58,6 +58,11 @@ static tk_parsed_names_result parse_type_params(const tk_token *t, size_t n, siz
         }
         tk_strvec_push(&names, &nn, t[p].text);
         p += 1;
+        // Nullability `?` is NEVER allowed on a type-PARAMETER declaration (legislation 2026-06-28):
+        // `?` marks a USE of a type (`a: T?`, `-> T?`), never the param decl `<T?>` (nor a constraint).
+        if (tk_is_kind_at(t, n, p, TK_TOKEN_QUESTION)) {
+            return (tk_parsed_names_result){ .ok = false, .as.error = tk_err_at(t, n, p, "a nullability `?` is not allowed on a type parameter — use `T?` only in a parameter or return type") };
+        }
         if (tk_is_kind_at(t, n, p, TK_TOKEN_COMMA)) { p += 1; }
         else if (tk_is_kind_at(t, n, p, TK_TOKEN_GT)) { p += 1; break; }
         else { return (tk_parsed_names_result){ .ok = false, .as.error = tk_err_at(t, n, p, "expected ',' or '>' in a type-parameter list") }; }
