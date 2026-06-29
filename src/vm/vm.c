@@ -1355,17 +1355,16 @@ static tk_value eval_call(const tk_texpr *e, tk_venv *env) {
     // FFI surface (the same deferred host edge as the io/fs bottoms). Stop HONESTLY (M.3), never
     // synthesize a value, and point at the native path. (Mirrors vm.tks eval_call.)
     if (fn->is_extern) vm_unsupported("an `extern` function cannot run in the VM (foreign C call) — use `teko build` to compile it natively (C7.1a)");
-    // (MEM Step 2/3) A `Ref<T>` call mutates an aliased caller cell; that mutation must be visible at
-    // the caller. The C cell store is global so it WOULD be — but to keep the two VM engines
-    // behaviourally IDENTICAL (the value-functional .tks twin has no env-return channel in value
-    // position), a ref call nested in a VALUE expression is an honest stop here too. Statement-position
-    // ref calls (`bump(x)` — the idiom) go through call_value, which supports aliasing in both twins.
-    if (fn_has_ref_param(fn))
-        vm_unsupported("a `Ref<T>` call in value position is not executable in the tree-walking VM (no env-return channel) — call it in statement position (e.g. `bump(x)`), or use `teko build`");
+    // (MEM Step 2/3) A `Ref<T>` call in VALUE position (e.g. `let y = bump(x)`) mutates an aliased caller
+    // cell; that mutation must be visible at the caller. The C cell store is global/shared by pointer, so
+    // bind_call_args' auto-ref promotion of the caller's `mut` lvalue and the callee's writes through that
+    // cell are ALREADY visible at the caller — no env-return channel is needed (the value-functional .tks
+    // twin threads the env out of eval_expr to reproduce this same effect). So value-position ref calls
+    // run here exactly like statement-position ones (call_value), matching native. (NO honest-stop.)
     if (!fn->is_test) tk_cov_mark(fn_idx);   // D3 — globally unique index (not line) avoids cross-file collisions
 
-    // A fresh root frame — no closure capture (flat functions, like codegen's C). Bind each
-    // parameter to its evaluated argument (no ref params here — gated above). (B-vm — VM fn params.)
+    // A fresh root frame — no closure capture (flat functions, like codegen's C). Bind each parameter to
+    // its evaluated argument; a `Ref<T>` param auto-refs the caller's `mut` lvalue to a global cell. (B-vm.)
     tk_venv fenv = { .head = NULL };
     bind_call_args(fn, args, nargs, env, &fenv);
     tk_flow fl = run_user_fn(fn, fn_idx, &fenv);

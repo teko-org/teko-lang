@@ -405,14 +405,14 @@ fn try_builtin(callee: parser::Path, args: []checker::TExpr, env: Venv) -> bool 
     if !addressable { return error { message = "not a builtin" } }
 
     if last == "print" || last == "println" || last == "write" {
-        let a = eval_expr(args[0], env)
+        let a = ev_val(args[0], env)
         match a {
             str as s => { if last == "println" { teko::io::println(s) } else { teko::io::print(s) }; return true }
             _        => return error { message = "vm: print/println/write on a non-str value not yet supported" }
         }
     }
     if last == "ewrite" || last == "eprint" || last == "eprintln" {
-        let a = eval_expr(args[0], env)
+        let a = ev_val(args[0], env)
         match a {
             str as s => { if last == "eprintln" { teko::io::eprintln(s) } else { teko::io::ewrite(s) }; return true }
             _        => return error { message = "vm: ewrite/eprint/eprintln on a non-str value not yet supported" }
@@ -422,10 +422,10 @@ fn try_builtin(callee: parser::Path, args: []checker::TExpr, env: Venv) -> bool 
     let assert_ns = callee.segments.len >= 2 && callee.segments[0].name == "teko" &&
                  callee.segments[callee.segments.len - 2].name == "assert"
     if assert_ns {
-        if last == "is_true"  { teko::assert::is_true(as_bool(eval_expr(args[0], env)));  return true }
-        if last == "is_false" { teko::assert::is_false(as_bool(eval_expr(args[0], env))); return true }
+        if last == "is_true"  { teko::assert::is_true(as_bool(ev_val(args[0], env)));  return true }
+        if last == "is_false" { teko::assert::is_false(as_bool(ev_val(args[0], env))); return true }
         if last == "str_contains" {
-            teko::assert::str_contains(as_str(eval_expr(args[0], env)), as_str(eval_expr(args[1], env)))
+            teko::assert::str_contains(as_str(ev_val(args[0], env)), as_str(ev_val(args[1], env)))
             return true
         }
         // equals/is_ok/... need generics — DEFERRED (matches the seed). Honest stop (M.3).
@@ -453,8 +453,8 @@ fn try_list_builtin(callee: parser::Path, args: []checker::TExpr, env: Venv) -> 
         return xs
     }
     if last == "push" {
-        let base = eval_expr(args[0], env)
-        let item = eval_expr(args[1], env)
+        let base = ev_val(args[0], env)
+        let item = ev_val(args[1], env)
         match base {
             []Value as xs => return teko::list::push(xs, item)
             _             => panic("vm: teko::list::push on a non-list value (internal: checker should reject)")
@@ -475,12 +475,12 @@ fn try_err_builtin(callee: parser::Path, args: []checker::TExpr, env: Venv) -> V
     let addressable = callee.segments.len == 1 || callee.segments[0].name == "teko"
     if !addressable { return null }
     if last == "err_loc" {
-        match eval_expr(args[0], env) {
+        match ev_val(args[0], env) {
             // line/col are u32 (the contract's field types) — re-normalize the carriers to width 32.
             StructVal as e => {
-                let e1 = err_set(e, "line", as_int(eval_expr(args[1], env)) to u32)
+                let e1 = err_set(e, "line", as_int(ev_val(args[1], env)) to u32)
                 match e1 {
-                    StructVal as e1s => return err_set(e1s, "col", as_int(eval_expr(args[2], env)) to u32)
+                    StructVal as e1s => return err_set(e1s, "col", as_int(ev_val(args[2], env)) to u32)
                     _                => panic("vm: err_loc internal (err_set must yield an error struct)")
                 }
             }
@@ -488,11 +488,11 @@ fn try_err_builtin(callee: parser::Path, args: []checker::TExpr, env: Venv) -> V
         }
     }
     if last == "err_typed" {
-        match eval_expr(args[0], env) {
+        match ev_val(args[0], env) {
             StructVal as e => {
-                let e1 = err_set(e, "expected", as_str(eval_expr(args[1], env)))
+                let e1 = err_set(e, "expected", as_str(ev_val(args[1], env)))
                 match e1 {
-                    StructVal as e1s => return err_set(e1s, "actual", as_str(eval_expr(args[2], env)))
+                    StructVal as e1s => return err_set(e1s, "actual", as_str(ev_val(args[2], env)))
                     _                => panic("vm: err_typed internal (err_set must yield an error struct)")
                 }
             }
@@ -520,7 +520,7 @@ fn try_str_builtin(callee: parser::Path, args: []checker::TExpr, env: Venv) -> V
     let addressable = callee.segments.len == 1 || callee.segments[0].name == "teko"
     if !addressable { return null }
     if last == "str" || last == "str_of_bytes" {
-        match eval_expr(args[0], env) {
+        match ev_val(args[0], env) {
             []Value as xs => {
                 mut view = ""
                 mut i = 0
@@ -542,46 +542,46 @@ fn try_str_builtin(callee: parser::Path, args: []checker::TExpr, env: Venv) -> V
         }
     }
     if last == "one_byte" {
-        let a = eval_expr(args[0], env)
+        let a = ev_val(args[0], env)
         // byte == u8 rep (vm.c): accept a byte Value OR a u8 int.
         if val_is_byte(a) || val_is_int(a) { return teko::one_byte(as_int(a) to byte) }
         panic("vm: one_byte on a non-byte value (internal: checker should reject)")
     }
     if last == "str_concat3" {
-        return teko::str_concat3(as_str(eval_expr(args[0], env)),
-                                 as_str(eval_expr(args[1], env)),
-                                 as_str(eval_expr(args[2], env)))
+        return teko::str_concat3(as_str(ev_val(args[0], env)),
+                                 as_str(ev_val(args[1], env)),
+                                 as_str(ev_val(args[2], env)))
     }
-    if last == "parse"        { return teko::float::parse(as_str(eval_expr(args[0], env))) }
-    if last == "ftoa"         { return teko::ftoa(as_float(eval_expr(args[0], env))) }
-    if last == "f64_bits"     { return teko::f64_bits(as_float(eval_expr(args[0], env))) }
-    if last == "f64_from_bits" { return teko::f64_from_bits(as_int(eval_expr(args[0], env)) to u64) }
+    if last == "parse"        { return teko::float::parse(as_str(ev_val(args[0], env))) }
+    if last == "ftoa"         { return teko::ftoa(as_float(ev_val(args[0], env))) }
+    if last == "f64_bits"     { return teko::f64_bits(as_float(ev_val(args[0], env))) }
+    if last == "f64_from_bits" { return teko::f64_from_bits(as_int(ev_val(args[0], env)) to u64) }
     // str STDLIB surface — the SAME runtime functions native codegen lowers to (tk_str_*), so the
     // VM matches the compiled output. (str, u64, …) args; a u64/bool result widens into Value.
-    if last == "concat"      { return teko::str_concat(as_str(eval_expr(args[0], env)), as_str(eval_expr(args[1], env))) }
-    if last == "str_concat"  { return teko::str_concat(as_str(eval_expr(args[0], env)), as_str(eval_expr(args[1], env))) }
-    if last == "concat3"     { return teko::str_concat3(as_str(eval_expr(args[0], env)), as_str(eval_expr(args[1], env)), as_str(eval_expr(args[2], env))) }
-    if last == "slice"       { return teko::slice(as_str(eval_expr(args[0], env)), as_int(eval_expr(args[1], env)) to u64, as_int(eval_expr(args[2], env)) to u64) }
-    if last == "slice_to"    { return teko::slice_to(as_str(eval_expr(args[0], env)), as_int(eval_expr(args[1], env)) to u64) }
-    if last == "slice_from"  { return teko::slice_from(as_str(eval_expr(args[0], env)), as_int(eval_expr(args[1], env)) to u64) }
-    if last == "len"         { return teko::len(as_str(eval_expr(args[0], env))) }
-    if last == "ends_with"   { return teko::ends_with(as_str(eval_expr(args[0], env)), as_str(eval_expr(args[1], env))) }
-    if last == "contains"    { return teko::contains(as_str(eval_expr(args[0], env)), as_str(eval_expr(args[1], env))) }
+    if last == "concat"      { return teko::str_concat(as_str(ev_val(args[0], env)), as_str(ev_val(args[1], env))) }
+    if last == "str_concat"  { return teko::str_concat(as_str(ev_val(args[0], env)), as_str(ev_val(args[1], env))) }
+    if last == "concat3"     { return teko::str_concat3(as_str(ev_val(args[0], env)), as_str(ev_val(args[1], env)), as_str(ev_val(args[2], env))) }
+    if last == "slice"       { return teko::slice(as_str(ev_val(args[0], env)), as_int(ev_val(args[1], env)) to u64, as_int(ev_val(args[2], env)) to u64) }
+    if last == "slice_to"    { return teko::slice_to(as_str(ev_val(args[0], env)), as_int(ev_val(args[1], env)) to u64) }
+    if last == "slice_from"  { return teko::slice_from(as_str(ev_val(args[0], env)), as_int(ev_val(args[1], env)) to u64) }
+    if last == "len"         { return teko::len(as_str(ev_val(args[0], env))) }
+    if last == "ends_with"   { return teko::ends_with(as_str(ev_val(args[0], env)), as_str(ev_val(args[1], env))) }
+    if last == "contains"    { return teko::contains(as_str(ev_val(args[0], env)), as_str(ev_val(args[1], env))) }
     // str_* prefixed aliases — teko::runtime::str_* forms (last segment = "str_eq", "str_len", etc.).
     // Must be builtins so the self-hosted VM matches vm.c parity (SUPREME RULE).
     if last == "str_eq" {
-        let a = as_str(eval_expr(args[0], env))
-        let b = as_str(eval_expr(args[1], env))
+        let a = as_str(ev_val(args[0], env))
+        let b = as_str(ev_val(args[1], env))
         return a == b
     }
-    if last == "str_len"       { return teko::len(as_str(eval_expr(args[0], env))) }
-    if last == "str_slice"     { return teko::slice(as_str(eval_expr(args[0], env)), as_int(eval_expr(args[1], env)) to u64, as_int(eval_expr(args[2], env)) to u64) }
-    if last == "str_slice_to"  { return teko::slice_to(as_str(eval_expr(args[0], env)), as_int(eval_expr(args[1], env)) to u64) }
-    if last == "str_slice_from" { return teko::slice_from(as_str(eval_expr(args[0], env)), as_int(eval_expr(args[1], env)) to u64) }
-    if last == "str_ends_with" { return teko::ends_with(as_str(eval_expr(args[0], env)), as_str(eval_expr(args[1], env))) }
-    if last == "str_contains"  { return teko::contains(as_str(eval_expr(args[0], env)), as_str(eval_expr(args[1], env))) }
-    if last == "i64_to_str"  { return teko::i64_to_str(as_int(eval_expr(args[0], env)) to i64) }
-    if last == "u64_to_str"  { return teko::u64_to_str(as_int(eval_expr(args[0], env)) to u64) }
+    if last == "str_len"       { return teko::len(as_str(ev_val(args[0], env))) }
+    if last == "str_slice"     { return teko::slice(as_str(ev_val(args[0], env)), as_int(ev_val(args[1], env)) to u64, as_int(ev_val(args[2], env)) to u64) }
+    if last == "str_slice_to"  { return teko::slice_to(as_str(ev_val(args[0], env)), as_int(ev_val(args[1], env)) to u64) }
+    if last == "str_slice_from" { return teko::slice_from(as_str(ev_val(args[0], env)), as_int(ev_val(args[1], env)) to u64) }
+    if last == "str_ends_with" { return teko::ends_with(as_str(ev_val(args[0], env)), as_str(ev_val(args[1], env))) }
+    if last == "str_contains"  { return teko::contains(as_str(ev_val(args[0], env)), as_str(ev_val(args[1], env))) }
+    if last == "i64_to_str"  { return teko::i64_to_str(as_int(ev_val(args[0], env)) to i64) }
+    if last == "u64_to_str"  { return teko::u64_to_str(as_int(ev_val(args[0], env)) to u64) }
     null   // not a str builtin — fall through to user-fn resolution
 }
 
@@ -597,7 +597,7 @@ fn try_fs_builtin(callee: parser::Path, args: []checker::TExpr, env: Venv) -> Va
     // the last-segment lookup for "read_file" would otherwise match driver.tks's local wrapper
     // which calls teko::io::read_file again (→ same wrapper → stack overflow).
     if last == "read_file" {
-        let path = as_str(eval_expr(args[0], env))
+        let path = as_str(ev_val(args[0], env))
         match teko::io::read_file(path) {
             str as s => return s
             error as e => {
@@ -607,7 +607,7 @@ fn try_fs_builtin(callee: parser::Path, args: []checker::TExpr, env: Venv) -> Va
         }
     }
     if last == "list_dir" {
-        let path = as_str(eval_expr(args[0], env))
+        let path = as_str(ev_val(args[0], env))
         match teko::fs::list_dir(path) {
             []str as entries => {
                 mut result: []Value = teko::list::empty()
@@ -629,8 +629,8 @@ fn try_fs_builtin(callee: parser::Path, args: []checker::TExpr, env: Venv) -> Va
     // The VM represents []byte as []Value (each element is a byte or int). Build a str from the
     // byte values (same approach as str_of_bytes), then call the existing write_file runtime fn.
     if last == "write_file_bytes" {
-        let path = as_str(eval_expr(args[0], env))
-        let data_val = eval_expr(args[1], env)
+        let path = as_str(ev_val(args[0], env))
+        let data_val = ev_val(args[1], env)
         let xs = match data_val { []Value as b => b; _ => teko::list::empty() }
         mut content = ""
         mut i = 0
@@ -795,50 +795,54 @@ fn vm_param_coerce_type(ann: parser::TypeExpr) -> checker::Type {
 // emit_as. Without this a later `?? / ?.` over that field found a non-optional and stopped (a VM-only
 // divergence: native present-wraps at construction). The error-value (`tn == "error"`) path has no
 // declared-field table; its fields ride as stored (E2 adornments are read with defaults, never ??).
-fn eval_struct_init(si: checker::TStructInit, ty: checker::Type, env: Venv) -> Value {
+fn eval_struct_init(si: checker::TStructInit, ty: checker::Type, env: Venv) -> EvalRes {
     let tn = match ty { Named as n => n.name; Error => "error"; _ => "" }
+    mut cur = env                       // (MEM Step 4) thread the env across each field-value eval
     mut names: []str = teko::list::empty()
     mut vals: []Value = teko::list::empty()
     mut i = 0
     loop {
         if i >= si.field_names.len { break }
-        let raw = eval_expr(si.field_vals[i], env)
+        let fr = eval_expr(si.field_vals[i], cur)
+        cur = fr.env
         names = teko::list::push(names, si.field_names[i])
-        vals = teko::list::push(vals, coerce_to(raw, vm_field_coerce_type(env.prog, tn, si.field_names[i])))
+        vals = teko::list::push(vals, coerce_to(fr.value, vm_field_coerce_type(cur.prog, tn, si.field_names[i])))
         i++
     }
-    StructVal { type_name = tn; field_names = names; field_vals = vals }
+    EvalRes { value= StructVal { type_name = tn; field_names = names; field_vals = vals }; env= cur }
 }
 
 // W4b — read field `fa.field` from a struct value (the checker guarantees it exists).
 // W5-idx — `.len`: a `str` value yields its byte length as a u64; a list value (slice) yields
 // its element count as a u64 (the SLICE value layer — fixed+copy). Checker types `.len` as u64.
-fn eval_field_access(fa: checker::TFieldAccess, env: Venv) -> Value {
-    match eval_expr(fa.receiver, env) {
+fn eval_field_access(fa: checker::TFieldAccess, env: Venv) -> EvalRes {
+    let re = eval_expr(fa.receiver, env)   // (MEM Step 4) thread the receiver's env (a ref call there grows cells)
+    let renv = re.env
+    match re.value {
         // (MEM Step 2/3) `r.value` on a `Ref<T>` — the deref READ: the receiver evaluates to a
         // RefVal (a cell index); `.value` reads the aliased storage (cell_get). The checker (typer)
         // restricts a Reference receiver to ONLY the `.value` field, so any other field is impossible.
         RefVal as rv => {
-            if fa.field == "value" { return cell_get(env.cells, rv.cell) }
+            if fa.field == "value" { return EvalRes { value= cell_get(renv.cells, rv.cell); env= renv } }
             panic("vm: a reference (`Ref<T>`) exposes only `.value` (internal: checker should reject)")
         }
         str as s => {
-            if fa.field == "len" { return s.len to u64 }
+            if fa.field == "len" { return EvalRes { value= s.len to u64; env= renv } }
             panic("vm: only `.len` is defined on a str (internal: checker should reject)")
         }
         []Value as xs => {
-            if fa.field == "len" { return xs.len to u64 }
+            if fa.field == "len" { return EvalRes { value= xs.len to u64; env= renv } }
             panic("vm: field access on a slice value (internal: checker should reject)")
         }
         StructVal as s => {
             // E2 — an ERROR value's adornment field (message/file/line/col/expected/actual):
             // a present field rides as stored; an UNSET adornment reads its default (empty str /
             // 0:u32) rather than an honest stop, so `e.line` on a message-only error is 0 (C1.3).
-            if s.type_name == "error" { return err_field(s, fa.field) }
+            if s.type_name == "error" { return EvalRes { value= err_field(s, fa.field); env= renv } }
             mut i = 0
             loop {
                 if i >= s.field_names.len { break }
-                if s.field_names[i] == fa.field { return s.field_vals[i] }
+                if s.field_names[i] == fa.field { return EvalRes { value= s.field_vals[i]; env= renv } }
                 i++
             }
             panic("vm: field not found in struct value (internal: the checker guarantees the field)")
@@ -852,17 +856,19 @@ fn eval_field_access(fa: checker::TFieldAccess, env: Venv) -> Value {
 // ("index out of bounds" — M.1), else a `byte` Value. A list value (slice) yields the element
 // at `index`, bounds-checked through the SAME panic (the SLICE value layer — fixed+copy).
 // Mirrors codegen's stmt-expr guard.
-fn eval_index(ix: checker::TIndex, line: u32, col: u32, env: Venv) -> Value {
-    let recv = eval_expr(ix.receiver, env)
-    let i = as_int(eval_expr(ix.index, env))
-    match recv {
+fn eval_index(ix: checker::TIndex, line: u32, col: u32, env: Venv) -> EvalRes {
+    let re = eval_expr(ix.receiver, env)   // (MEM Step 4) thread receiver then index
+    let ie2 = eval_expr(ix.index, re.env)
+    let cur = ie2.env
+    let i = as_int(ie2.value)
+    match re.value {
         str as s => {
             if i >= s.len { vm_panic_oob_at(line, col) }   // C1.6 — positioned at the subscript node
-            s[i] to byte
+            EvalRes { value= s[i] to byte; env= cur }
         }
         []Value as xs => {
             if i >= xs.len { vm_panic_oob_at(line, col) }   // C1.6 — positioned at the subscript node
-            xs[i]
+            EvalRes { value= xs[i]; env= cur }
         }
         _            => panic("vm: subscript on a non-indexable value (internal: checker should reject)")
     }
@@ -873,14 +879,17 @@ fn eval_index(ix: checker::TIndex, line: u32, col: u32, env: Venv) -> Value {
 // builders codegen emits (i64_to_str / u64_to_str, selected by the value's own signedness), so
 // VM==codegen byte-for-byte. The result is pieces[0] ++ str(holes[0]) ++ … ++ pieces[nholes]
 // (pieces.len == holes.len + 1). The checker restricted hole types to str/integer.
-fn eval_interp(in: checker::TInterp, env: Venv) -> Value {
+fn eval_interp(in: checker::TInterp, env: Venv) -> EvalRes {
+    mut cur = env                       // (MEM Step 4) thread the env across each hole eval
     mut acc = ""
     mut i = 0
     loop {
         if i >= in.pieces.len { break }
         acc = teko::str_concat(acc, in.pieces[i])
         if i < in.holes.len {
-            let h = eval_expr(in.holes[i], env)
+            let he = eval_expr(in.holes[i], cur)
+            cur = he.env
+            let h = he.value
             let hs = match h {
                 str as s => s
                 _        => if int_sign_of(h) { teko::i64_to_str(as_int(h) to i64) }
@@ -890,7 +899,7 @@ fn eval_interp(in: checker::TInterp, env: Venv) -> Value {
         }
         i++
     }
-    acc
+    EvalRes { value= acc; env= cur }
 }
 
 // Phase 2 — `<lhs> in [ e0, e1, … ]` -> bool. The LHS is EVALUATED ONCE; then each element is
@@ -899,15 +908,19 @@ fn eval_interp(in: checker::TInterp, env: Venv) -> Value {
 // the empty set `x in []` -> false (the loop runs zero times). value_eq returns false for struct/list
 // operands, but the checker restricts `in` to scalar-comparable element types, so the honest frontier
 // matches `==`. Mirrors the C `eval_in` and codegen's fold of value_eq (single-eval lhs).
-fn eval_in(ie: checker::TInExpr, env: Venv) -> Value {
-    let lhs = eval_expr(ie.lhs, env)   // single-eval: the LHS once
+fn eval_in(ie: checker::TInExpr, env: Venv) -> EvalRes {
+    let le = eval_expr(ie.lhs, env)   // single-eval: the LHS once
+    let lhs = le.value
+    mut cur = le.env                  // (MEM Step 4) thread the env across each element eval
     mut i = 0
     loop {
         if i >= ie.elems.len { break }
-        if value_eq(lhs, eval_expr(ie.elems[i], env)) { return true }
+        let ee = eval_expr(ie.elems[i], cur)
+        cur = ee.env
+        if value_eq(lhs, ee.value) { return EvalRes { value= true; env= cur } }
         i++
     }
-    false   // empty set, or no element matched
+    EvalRes { value= false; env= cur }   // empty set, or no element matched
 }
 
 // ---------------------------------------------------------------------------
@@ -1360,19 +1373,25 @@ fn pat_match(pat: parser::Pattern, subj: Value, env: Venv) -> PatMatch {
 // bindings ride its grown env (`pm.env`); a non-matching / guard-failing arm is discarded by NOT
 // threading that env forward (the functional stand-in for the C `env_pop_to`). Mirrors the C
 // `eval_match`.
-fn eval_match(m: checker::TMatchExpr, line: u32, col: u32, env: Venv) -> Value {
-    let subj = eval_expr(m.subject, env)
+fn eval_match(m: checker::TMatchExpr, line: u32, col: u32, env: Venv) -> EvalRes {
+    let se = eval_expr(m.subject, env)   // (MEM Step 4) thread the subject's env (a ref call there grows cells)
+    let subj = se.value
+    let senv = se.env
     mut i = 0
     loop {
         if i >= m.arms.len { break }
         let arm = m.arms[i]
-        let pm = pat_match(arm.pattern, subj, env)
+        let pm = pat_match(arm.pattern, subj, senv)   // pattern bindings ride senv
         if pm.matched {
-            let guard_ok = if arm.has_when { as_bool(eval_expr(arm.guard, pm.env)) } else { true }
+            // A `when` guard may itself evaluate a ref call; thread its env into the body's env.
+            let ge = if arm.has_when { eval_expr(arm.guard, pm.env) } else { EvalRes { value= true; env= pm.env } }
+            let guard_ok = as_bool(ge.value)
             if guard_ok {
                 teko::cov_branch(line, col, i to u64)   // D3-branch: value-position arm `i` taken
-                match exec_block(arm.body, pm.env).flow {
-                    Normal as nm => return nm.value ?? panic("vm: a `match` used as a value produced no value (internal: checker requires a value arm)")
+                let bo = exec_block(arm.body, ge.env)
+                match bo.flow {
+                    // thread the arm body's final env out: an outer-`mut`/cell write inside the arm survives
+                    Normal as nm => return EvalRes { value= nm.value ?? panic("vm: a `match` used as a value produced no value (internal: checker requires a value arm)"); env= with_cells(senv, bo.env.cells) }
                     _            => panic("vm: control flow inside a `match` used as a sub-expression not yet supported")
                 }
             }
@@ -1391,19 +1410,22 @@ fn exec_match(e: checker::TExpr, env: Venv) -> FlowEnv {
     match e {
         checker::TMatchExpr as m => {
             let base = env.slots.len      // outer scope size: the arm's pattern bindings + body locals sit above it
-            let subj = eval_expr(m.subject, env)
+            let se = eval_expr(m.subject, env)   // (MEM Step 4) thread the subject's env
+            let subj = se.value
+            let senv = se.env
             mut i = 0
             loop {
                 if i >= m.arms.len { break }
                 let arm = m.arms[i]
-                let pm = pat_match(arm.pattern, subj, env)
+                let pm = pat_match(arm.pattern, subj, senv)
                 if pm.matched {
-                    let guard_ok = if arm.has_when { as_bool(eval_expr(arm.guard, pm.env)) } else { true }
+                    let ge = if arm.has_when { eval_expr(arm.guard, pm.env) } else { EvalRes { value= true; env= pm.env } }
+                    let guard_ok = as_bool(ge.value)
                     if guard_ok {
                         teko::cov_branch(e.line, e.col, i to u64)   // D3-branch: arm `i` taken (no-op unless coverage on)
                         // run the arm body; POP its bindings/locals back to the outer scope (keeping
                         // outer-`mut` mutations, which mutate_slot writes at their index in [0, base)).
-                        let bo = exec_block(arm.body, pm.env)
+                        let bo = exec_block(arm.body, ge.env)
                         return FlowEnv { flow= bo.flow; env= Venv { slots= loop_outer(bo.env.slots, base); prog= bo.env.prog; defers= bo.env.defers; cells= bo.env.cells } }
                     }
                 }
@@ -1415,7 +1437,27 @@ fn exec_match(e: checker::TExpr, env: Venv) -> FlowEnv {
     }
 }
 
-fn eval_expr(e: checker::TExpr, env: Venv) -> Value {
+// (MEM Step 4) EvalRes — the value AND the (possibly cell-mutated) env produced by evaluating an
+// expression. eval_expr is value-functional: its only env-changing case is a `Ref<T>` call in VALUE
+// position (e.g. `let y = bump(x)`, `f(bump(x))`, `bump(x) + 1`), which auto-refs the caller's `mut`
+// lvalue to a cell and writes through it. That cell write must thread BACK to the caller — but
+// eval_expr returns only a Value, so before MEM Step 4 a value-position ref call had no env-return
+// channel (it honest-stopped). EvalRes IS that channel. For EVERY non-ref expression the returned
+// env is the input env UNCHANGED (`env= env`), so the result is byte-identical to the old Value-only
+// path: the threading is pure plumbing. (The C twin needs no analogue — its cell store is a global
+// shared by pointer, so the write is already visible; this is the value-functional twin of that.)
+type EvalRes = struct { value: Value; env: Venv }
+
+// ev_val — evaluate an expression for its VALUE only, DISCARDING the threaded env. Sound ONLY where
+// the expression cannot be (or contain, in an env-mutating position) a `Ref<T>` value-position call:
+// the stdlib builtin arg slots (print/assert/str::*/fs::* — the checker forbids a `Ref<T>` there) and
+// other pure-leaf reads. For non-ref code the env is unchanged anyway, so discarding it is a no-op
+// (byte-identical). Never use this for a general operand that may carry a ref call — thread instead.
+fn ev_val(e: checker::TExpr, env: Venv) -> Value {
+    eval_expr(e, env).value
+}
+
+fn eval_expr(e: checker::TExpr, env: Venv) -> EvalRes {
     teko::cov_line(e.line)   // D3-line — mark this source line executed (no-op unless line recording is on)
     match e.type {
         // Optional `T?` values ARE supported now (OptVal — REBOOT_PLAN §202): null / ?. / ?? and
@@ -1424,16 +1466,17 @@ fn eval_expr(e: checker::TExpr, env: Venv) -> Value {
         _             => {}   // a real value type — evaluate below
     }
     match e.kind {
-        checker::TNumber as n   => num_of_prim(n, e.type)            // a concrete u8…i128 / f16…f64 from the node's type (float iff n.is_float)
-        checker::TVar as v      => read_var(env, v.name)             // checker guarantees it binds; cell-backed (Ref aliasing target) reads through the cell
-        checker::TStrLit as s   => s.text                    // a `str` member of Value
-        checker::TByteLit as b  => b.value                   // a `byte` member of Value
-        checker::TBoolLit as bl => bl.value                           // bool literal (W2) — FULL: a `bool` member of Value
+        // Leaf reads — pure, env unchanged. (MEM Step 4: every non-call leaf threads `env` back as-is.)
+        checker::TNumber as n   => EvalRes { value= num_of_prim(n, e.type); env= env }   // a concrete u8…i128 / f16…f64 from the node's type (float iff n.is_float)
+        checker::TVar as v      => EvalRes { value= read_var(env, v.name); env= env }     // checker guarantees it binds; cell-backed (Ref aliasing target) reads through the cell
+        checker::TStrLit as s   => EvalRes { value= s.text; env= env }            // a `str` member of Value
+        checker::TByteLit as b  => EvalRes { value= b.value; env= env }           // a `byte` member of Value
+        checker::TBoolLit as bl => EvalRes { value= bl.value; env= env }                  // bool literal (W2) — FULL: a `bool` member of Value
         checker::TBinary as b   => eval_binary(b, e.type, e.line, e.col, env)
         checker::TUnary as u    => eval_unary(u, e.type, env)
         checker::TCompare as c  => eval_compare(c, env)
         checker::TCast as c     => eval_cast(c, e.type, e.line, e.col, env)          // F3 narrowing guard inside (positioned — C1.6)
-        checker::TCall as c     => eval_call(c, env)
+        checker::TCall as c     => eval_call(c, env)                                 // (MEM Step 4) value-position call — threads the callee's cells back
         checker::TStructInit as si  => eval_struct_init(si, e.type, env)   // W4b — build a struct value (declared field order)
         checker::TFieldAccess as fa => eval_field_access(fa, env)          // W4b — read a field by name from a struct value
 
@@ -1442,8 +1485,9 @@ fn eval_expr(e: checker::TExpr, env: Venv) -> Value {
         // inside an `if` used as a SUB-expression can't be expressed as a value here — honest
         // stop (M.3); statement/tail position handles divergence via exec_if directly.
         checker::TIfExpr as _ => {
-            match exec_if(e, env).flow {
-                Normal as nm => nm.value ?? panic("vm: an `if` used as a value produced no value (internal: checker requires an `else` with a value)")
+            let fe = exec_if(e, env)   // FlowEnv — the taken branch's cell writes ride fe.env
+            match fe.flow {
+                Normal as nm => EvalRes { value= nm.value ?? panic("vm: an `if` used as a value produced no value (internal: checker requires an `else` with a value)"); env= fe.env }
                 _            => panic("vm: control flow inside an `if` used as a sub-expression not yet supported")
             }
         }
@@ -1456,16 +1500,17 @@ fn eval_expr(e: checker::TExpr, env: Venv) -> Value {
         // Phase 2 — `<lhs> in [ … ]`: true iff lhs (single-eval) value_eq's any element.
         checker::TInExpr as ie => eval_in(ie, env)
         // Enum::Member as a VALUE → its ordinal (u64); the C twin's C enum auto-numbers identically.
-        checker::TPathExpr as pe => pe.ordinal
+        checker::TPathExpr as pe => EvalRes { value= pe.ordinal; env= env }
         // null / ?. / ?? — the OPTIONAL value model (OptVal — REBOOT_PLAN §202/§203).
         // null is NONE; the destination's wrap (coerce_to) makes it a concrete `T?`.
-        checker::TNullLit            => OptVal { present = false; inner = null }
+        checker::TNullLit            => EvalRes { value= OptVal { present = false; inner = null }; env= env }
         checker::TSafeFieldAccess as sfa => {
             // `recv?.field`: NONE → NONE; PRESENT → the inner's field, re-wrapped PRESENT.
-            match eval_expr(sfa.receiver, env) {
+            let re = eval_expr(sfa.receiver, env)   // thread the receiver's env (a ref call there grows cells)
+            match re.value {
                 OptVal as o => {
-                    if !o.present { return OptVal { present = false; inner = null } }
-                    let inner = match o.inner { Value as iv => iv; null => return OptVal { present = false; inner = null } }
+                    if !o.present { return EvalRes { value= OptVal { present = false; inner = null }; env= re.env } }
+                    let inner = match o.inner { Value as iv => iv; null => return EvalRes { value= OptVal { present = false; inner = null }; env= re.env } }
                     match inner {
                         StructVal as sv => {
                             mut i = 0
@@ -1473,7 +1518,7 @@ fn eval_expr(e: checker::TExpr, env: Venv) -> Value {
                                 if i >= sv.field_names.len { break }
                                 if sv.field_names[i] == sfa.field {
                                     // result is `(field)?` — an already-optional field stays as-is.
-                                    match sv.field_vals[i] { OptVal as fo => return fo; _ => return OptVal { present = true; inner = sv.field_vals[i] } }
+                                    match sv.field_vals[i] { OptVal as fo => return EvalRes { value= fo; env= re.env }; _ => return EvalRes { value= OptVal { present = true; inner = sv.field_vals[i] }; env= re.env } }
                                 }
                                 i++
                             }
@@ -1488,13 +1533,15 @@ fn eval_expr(e: checker::TExpr, env: Venv) -> Value {
         checker::TCoalesce as co  => {
             // `a ?? b`: a's inner if PRESENT, else b (short-circuit b). Both arms coerced to the
             // result type (the node's `.type`): `T? ?? T` unwraps, `T? ?? T?` stays optional.
-            match eval_expr(co.left, env) {
+            let le = eval_expr(co.left, env)   // thread the left operand's env
+            match le.value {
                 OptVal as o => {
                     if o.present {
                         let inner = match o.inner { Value as iv => iv; null => panic("vm: present optional with no inner (internal)") }
-                        coerce_to(inner, e.type)
+                        EvalRes { value= coerce_to(inner, e.type); env= le.env }
                     } else {
-                        coerce_to(eval_expr(co.right, env), e.type)
+                        let re = eval_expr(co.right, le.env)   // short-circuit: only evaluated when absent; threads from le.env
+                        EvalRes { value= coerce_to(re.value, e.type); env= re.env }
                     }
                 }
                 _ => panic("vm: coalesce left operand is not optional (internal: checker should reject)")
@@ -1508,8 +1555,9 @@ fn eval_expr(e: checker::TExpr, env: Venv) -> Value {
 // eval_array_lit — `[ e0, e1, … ]` -> a `[]Value`; each plain element is coerced into the slice's
 // element type; each spread element (`..xs`) evaluates to a `[]Value` sub-slice and its items are
 // individually appended (flattening the spread into the result slice at runtime).
-fn eval_array_lit(a: checker::TArrayLit, slot: checker::Type, env: Venv) -> Value {
+fn eval_array_lit(a: checker::TArrayLit, slot: checker::Type, env: Venv) -> EvalRes {
     let elem_t = match slot { checker::Slice as s => s.element; _ => checker::Void { } }
+    mut cur = env                       // (MEM Step 4) thread the env across each element's eval
     mut xs: []Value = teko::list::empty()
     mut i = 0
     loop {
@@ -1517,8 +1565,9 @@ fn eval_array_lit(a: checker::TArrayLit, slot: checker::Type, env: Venv) -> Valu
         let ae = a.elements[i]
         if ae.is_spread {
             // spread: ae.expr evaluates to a []Value; flatten its items individually into xs
-            let sub = eval_expr(ae.expr, env)
-            let sub_list = match sub { []Value as lv => lv; _ => teko::list::empty() }
+            let se = eval_expr(ae.expr, cur)
+            cur = se.env
+            let sub_list = match se.value { []Value as lv => lv; _ => teko::list::empty() }
             mut j = 0
             loop {
                 if j >= sub_list.len { break }
@@ -1526,11 +1575,13 @@ fn eval_array_lit(a: checker::TArrayLit, slot: checker::Type, env: Venv) -> Valu
                 j = j + 1
             }
         } else {
-            xs = teko::list::push(xs, coerce_to(eval_expr(ae.expr, env), elem_t))
+            let ee = eval_expr(ae.expr, cur)
+            cur = ee.env
+            xs = teko::list::push(xs, coerce_to(ee.value, elem_t))
         }
         i = i + 1
     }
-    xs
+    EvalRes { value= xs; env= cur }
 }
 
 // coerce a Value into the declared slot type `t`: if `t` is `T?` and the value is NOT already an
@@ -1605,9 +1656,11 @@ fn apply_int_op(op: lexer::TokenKind, l: i128, r: i128, sgn: bool, w: u8) -> i12
 // negates a numeric (float in the f64 carrier, int via norm_int at the node's prim); `~` flips an
 // integer's bits (norm_int re-truncates). The node's `.type` (passed as `t`) selects the result
 // prim, exactly as codegen's fixed-width C unary ops do.
-fn eval_unary(u: checker::TUnary, t: checker::Type, env: Venv) -> Value {
-    let x = eval_expr(u.operand, env)
-    match u.op {
+fn eval_unary(u: checker::TUnary, t: checker::Type, env: Venv) -> EvalRes {
+    let xe = eval_expr(u.operand, env)   // (MEM Step 4) thread the operand's env
+    let x = xe.value
+    let cur = xe.env
+    let v = match u.op {
         Bang  => !as_bool(x)
         Minus => {
             let prim = num_prim_of(t)
@@ -1623,6 +1676,7 @@ fn eval_unary(u: checker::TUnary, t: checker::Type, env: Venv) -> Value {
         }
         _ => panic("vm: unary operator not yet supported")
     }
+    EvalRes { value= v; env= cur }
 }
 
 // cmp_pair — one adjacent comparison `l <op> r`, the .tks twin of vm.c's cmp_pair. INT compares on
@@ -1685,20 +1739,23 @@ fn cmp_pair(l: Value, op: lexer::TokenKind, r: Value) -> bool {
 // A degenerate chain (no rest terms) is just `first` (matches codegen). Otherwise codegen lowers
 // `a<b<c` to AND over adjacent pairs; we fold left, re-using each operand's value once (operands
 // are checker-pure leaves in M0, so the value-equivalence to codegen's twice-emitted form holds).
-fn eval_compare(c: checker::TCompare, env: Venv) -> Value {
-    if c.rest.len == 0 { return eval_expr(c.first, env) }   // degenerate (matches codegen)
-    mut prev = eval_expr(c.first, env)
+fn eval_compare(c: checker::TCompare, env: Venv) -> EvalRes {
+    if c.rest.len == 0 { return eval_expr(c.first, env) }   // degenerate (matches codegen) — threads its own env
+    let fe = eval_expr(c.first, env)   // (MEM Step 4) thread the env left-to-right across operands
+    mut prev = fe.value
+    mut cur = fe.env
     mut acc = true
     mut i = 0
     loop {
         if i >= c.rest.len { break }
         let term = c.rest[i]
-        let rv = eval_expr(term.operand, env)
-        acc = acc && cmp_pair(prev, term.op, rv)
-        prev = rv
+        let re = eval_expr(term.operand, cur)
+        cur = re.env
+        acc = acc && cmp_pair(prev, term.op, re.value)
+        prev = re.value
         i++
     }
-    acc
+    EvalRes { value= acc; env= cur }
 }
 
 // find_function — resolve a user call by its callee Path, the .tks twin of vm.c's find_function.
@@ -1822,18 +1879,22 @@ fn exit_code_of(v: Value?) -> i32 {
 // div/mod so a zero divisor PANICS "division by zero" (M.1). FLOAT + - * / honestly in
 // `f64` (the VM-debug carrier for all float widths); float ÷0 PANICS too (plan §5, same as
 // int). `%` / bitwise / shift on a float is honest-unsupported (the checker rejects them).
-fn eval_binary(b: checker::TBinary, ty: checker::Type, line: u32, col: u32, env: Venv) -> Value {
+fn eval_binary(b: checker::TBinary, ty: checker::Type, line: u32, col: u32, env: Venv) -> EvalRes {
     if b.op == lexer::TokenKind::AndAnd || b.op == lexer::TokenKind::OrOr {
-        let l = as_bool(eval_expr(b.left, env))
-        if b.op == lexer::TokenKind::AndAnd && !l { return false }
-        if b.op == lexer::TokenKind::OrOr  &&  l { return true }
-        return as_bool(eval_expr(b.right, env))
+        let le = eval_expr(b.left, env)   // (MEM Step 4) thread left, then SHORT-CIRCUIT right
+        let l = as_bool(le.value)
+        if b.op == lexer::TokenKind::AndAnd && !l { return EvalRes { value= false; env= le.env } }
+        if b.op == lexer::TokenKind::OrOr  &&  l { return EvalRes { value= true; env= le.env } }
+        let re = eval_expr(b.right, le.env)
+        return EvalRes { value= as_bool(re.value); env= re.env }
     }
     let prim = num_prim_of(ty)                 // honest stop if non-numeric (mirrors codegen)
     if prim_float(prim) {
         let w  = prim_width(prim)
-        let lf = as_float(eval_expr(b.left, env)); let rf = as_float(eval_expr(b.right, env))
-        match b.op {
+        let le = eval_expr(b.left, env); let re = eval_expr(b.right, le.env)   // thread left→right
+        let lf = as_float(le.value); let rf = as_float(re.value)
+        let cur = re.env
+        let fv = match b.op {
             Plus    => float_val(lf + rf, w)
             Minus   => float_val(lf - rf, w)
             Star    => float_val(lf * rf, w)
@@ -1842,12 +1903,15 @@ fn eval_binary(b: checker::TBinary, ty: checker::Type, line: u32, col: u32, env:
             Percent => panic("vm: '%' on a float value not supported (checker should reject)")
             _       => panic("vm: bitwise/shift on a float value not supported (checker should reject)")
         }
+        return EvalRes { value= fv; env= cur }
     }
     let sgn  = prim_signed(prim); let w = prim_width(prim)
-    let l = as_int(eval_expr(b.left, env)); let r = as_int(eval_expr(b.right, env))
+    let le = eval_expr(b.left, env); let re = eval_expr(b.right, le.env)   // thread left→right
+    let l = as_int(le.value); let r = as_int(re.value)
+    let cur = re.env
     // C1.6 — POSITION the int ÷0 / %0 panic at THIS node before the runtime helper fires (the
     // runtime div/rem still panic as the canonical message — M.1).
-    match b.op {
+    let iv = match b.op {
         Slash   => { if r == 0 { vm_panic_div0_at(line, col) }; norm_int(teko::div(l, r, sgn), sgn, w) }   // CHECKED: panics on /0
         Percent => { if r == 0 { vm_panic_div0_at(line, col) }; norm_int(teko::rem(l, r, sgn), sgn, w) }   // CHECKED: panics on %0
         // +,-,*,&,|,^,<<,>>: plain fixed-width arithmetic. Overflow guarding for +,-,* is
@@ -1855,6 +1919,7 @@ fn eval_binary(b: checker::TBinary, ty: checker::Type, line: u32, col: u32, env:
         // leaves +,-,* as plain C. norm_int truncates to the prim's width.
         _       => norm_int(apply_int_op(b.op, l, r, sgn, w), sgn, w)
     }
+    EvalRes { value= iv; env= cur }
 }
 
 // eval_cast — `x to T` over the Tier-1 numeric set (plan §5). Four cases:
@@ -1864,29 +1929,31 @@ fn eval_binary(b: checker::TBinary, ty: checker::Type, line: u32, col: u32, env:
 //                   conversion" (plan §5, parity with the integer cast guard, M.1).
 //   * int->int:     codegen's guard predicate — cast_may_lose -> CHECKED conversion
 //                   (PANIC out of range); else a plain reinterpret to the target width.
-fn eval_cast(c: checker::TCast, ty: checker::Type, line: u32, col: u32, env: Venv) -> Value {
+fn eval_cast(c: checker::TCast, ty: checker::Type, line: u32, col: u32, env: Venv) -> EvalRes {
     // num_prim_of maps a cast endpoint to its effective numeric prim: a Prim is itself, a
     // `byte` is U8 (B.36 — byte is a u8 newtype), so `s[i] to i32` (a byte source — W5-idx)
     // casts as u8->i32. Any other type (str/named/…) is the honest non-numeric cast frontier.
     let dst = num_prim_of(ty); let src = num_prim_of(c.expr.type)
     let sflt = prim_float(src); let dflt = prim_float(dst)
+    let xe = eval_expr(c.expr, env)   // (MEM Step 4) thread the operand's env once
+    let cur = xe.env
     if sflt && dflt {
-        return float_val(as_float(eval_expr(c.expr, env)), prim_width(dst))
+        return EvalRes { value= float_val(as_float(xe.value), prim_width(dst)); env= cur }
     }
     if !sflt && dflt {
-        return float_val(teko::int_to_float(as_int(eval_expr(c.expr, env)), prim_signed(src)), prim_width(dst))
+        return EvalRes { value= float_val(teko::int_to_float(as_int(xe.value), prim_signed(src)), prim_width(dst)); env= cur }
     }
     if sflt && !dflt {
         // C1.6 — truncate toward zero; NaN / ±∞ / out-of-range PANIC "impossible conversion",
         // POSITIONED at this node (vm_float_to_int re-derives the runtime check inline so it can
         // prefix line:col before the canonical panic — M.1).
-        return norm_int(vm_float_to_int(as_float(eval_expr(c.expr, env)), dst, line, col), prim_signed(dst), prim_width(dst))
+        return EvalRes { value= norm_int(vm_float_to_int(as_float(xe.value), dst, line, col), prim_signed(dst), prim_width(dst)); env= cur }
     }
-    let v = as_int(eval_expr(c.expr, env))
+    let v = as_int(xe.value)
     // C1.6 — int->int narrowing PANIC positioned at this node (vm_cast re-derives the runtime
     // range check inline so it can prefix line:col before the canonical panic — M.1).
-    if cast_may_lose(src, dst) { return norm_int(vm_cast(v, src, dst, line, col), prim_signed(dst), prim_width(dst)) }
-    norm_int(v, prim_signed(dst), prim_width(dst))
+    if cast_may_lose(src, dst) { return EvalRes { value= norm_int(vm_cast(v, src, dst, line, col), prim_signed(dst), prim_width(dst)); env= cur } }
+    EvalRes { value= norm_int(v, prim_signed(dst), prim_width(dst)); env= cur }
 }
 
 // eval_call — builtins first (print/println/assert — all `-> void`, run for effect, no
@@ -1954,7 +2021,12 @@ fn bind_call_args(f: checker::TFunction, c: checker::TCall, env: Venv) -> BoundA
                 _ => panic("vm: a `Ref<T>` argument must be a mutable variable (internal: checker should reject)")
             }
         } else {
-            argval = eval_expr(c.args[ai], caller)
+            // (MEM Step 4) a non-ref arg may ITSELF be a value-position ref call (`f(bump(x))`);
+            // thread the caller env across it so that nested ref write survives into the caller.
+            let ae = eval_expr(c.args[ai], caller)
+            caller = ae.env
+            fenv = with_cells(fenv, caller.cells)   // keep the callee frame's cells in sync with the grown store
+            argval = ae.value
         }
         // Present-wrap a bare `T` arg into a `T?` param (uniform with field/return — the VM twin of
         // codegen's call-arg emit_as). coerce_to reads only the type tag: an OptionalType param →
@@ -1967,48 +2039,47 @@ fn bind_call_args(f: checker::TFunction, c: checker::TCall, env: Venv) -> BoundA
     BoundArgs { fenv= fenv; caller= caller }
 }
 
-fn eval_call(c: checker::TCall, env: Venv) -> Value {
+fn eval_call(c: checker::TCall, env: Venv) -> EvalRes {
     // A builtin that RAN (`true`) is `-> void`, so there is no Value to yield: a void call
     // only appears in statement position, and reaching here in value position is an honest
     // stop (M.3), never a synthesized Unit. A `false`/`error` result == "not a builtin" —
-    // fall through to a user fn.
+    // fall through to a user fn. Builtins take no `Ref<T>` args → the env is unchanged.
     match try_builtin(c.callee, c.args, env) {
         bool as ran => if ran { panic("vm: void builtin call used as a value (internal: checker should reject)") }
         error       => {}                  // not a builtin — fall through to a user fn
     }
     // teko::list::empty / push — value-producing SLICE builtins (FIXED+COPY). Recognized
     // before user-fn resolution; null == not a list builtin, fall through.
-    match try_list_builtin(c.callee, c.args, env) { Value as v => return v; null => {} }
+    match try_list_builtin(c.callee, c.args, env) { Value as v => return EvalRes { value= v; env= env }; null => {} }
     // E2 — err_loc / err_typed — value-producing error-adornment builtins. Recognized before
     // user-fn resolution; null == not an err builtin, fall through.
-    match try_err_builtin(c.callee, c.args, env) { Value as v => return v; null => {} }
+    match try_err_builtin(c.callee, c.args, env) { Value as v => return EvalRes { value= v; env= env }; null => {} }
     // str/byte STDLIB — value-producing str-returning builtins (str/str_of_bytes/one_byte/
     // str_concat3/ftoa). Recognized before user-fn resolution; null == not a str builtin, fall through.
-    match try_str_builtin(c.callee, c.args, env) { Value as v => return v; null => {} }
+    match try_str_builtin(c.callee, c.args, env) { Value as v => return EvalRes { value= v; env= env }; null => {} }
     // teko::fs::* host-surface builtins (list_dir). Recognized before user-fn resolution;
     // null == not a fs builtin, fall through. (Mirrors vm.c's list_dir handler.)
-    match try_fs_builtin(c.callee, c.args, env) { Value as v => return v; null => {} }
+    match try_fs_builtin(c.callee, c.args, env) { Value as v => return EvalRes { value= v; env= env }; null => {} }
     let h = find_function(env, c.callee)   // resolved by LAST segment (cross-ns ok); honest stop if unknown
     let f = h.func
     // C7.1a — an `extern` is a foreign C function with NO Teko body; the tree-walking VM has no
     // FFI surface (the same deferred host edge as the io/fs bottoms). Stop HONESTLY (M.3), never
     // synthesize a value, and point at the native path.
     if f.is_extern { panic("vm: an `extern` function cannot run in the VM (foreign C call) — use `teko build` to compile it natively (C7.1a)") }
-    // (MEM Step 2/3) A `Ref<T>` call mutates an ALIASED caller cell; that mutation must thread BACK
-    // into the caller env after the call. This eval_call is the VALUE-position path (reached from
-    // eval_expr, which returns only a Value — there is NO env-return channel), so a ref-mutating
-    // callee's write could not reach the caller HERE. Statement-position ref calls (`bump(x)` — the
-    // idiom) go through call_value, which DOES thread the env out (BoundArgs.caller + the callee's
-    // final cells), and fully support aliasing. A ref call nested inside a larger VALUE expression is
-    // escape-gate-rare and is an honest stop (M.3), matching the C twin's value-position eval_call.
-    if fn_has_ref_param(f) { panic("vm: a `Ref<T>` call in value position is not executable in the tree-walking VM (no env-return channel) — call it in statement position (e.g. `bump(x)`), or use `teko build`") }
+    // (MEM Step 4) A `Ref<T>` call in VALUE position mutates an ALIASED caller cell; that mutation
+    // threads BACK into the caller env via EvalRes.env (the env-return channel eval_expr now carries):
+    // bind_call_args auto-refs the caller's `mut` lvalue (growing/rebinding the caller env) and the
+    // callee inherits + grows the cell store; we MERGE the callee's final cells back into the caller
+    // (with_cells), exactly as call_value does in statement position. So a value-position ref call runs
+    // == native — no honest stop. (The C twin needs no merge: its cell store is a global shared by
+    // pointer, so the write is already visible; this is the value-functional twin of that effect.)
     if !f.is_test { teko::cov_mark(h.idx) }   // D3 — globally-unique items index (not line) avoids cross-file collisions
     // Bind each parameter to its evaluated argument in a FRESH root frame (no closure capture —
-    // flat M0 functions, like codegen's C). Args evaluate in the CALLER's env, then enter the
-    // callee's frame by the param's name (positional). (B-vm — VM function parameters.)
-    // No ref params here (gated above), so the caller env is unchanged by binding.
+    // flat M0 functions, like codegen's C). Args evaluate in the CALLER's env (auto-ref promotion may
+    // grow it), then enter the callee's frame by the param's name (positional). (B-vm — VM params.)
     let bound = bind_call_args(f, c, env)
     let fenv = bound.fenv
+    mut caller = bound.caller   // post-binding caller env (auto-ref promotion may have grown its cells)
     // Coerce the returned value into the declared return type: a `T` from a `-> T?` fn
     // present-wraps (REBOOT §202), mirroring codegen's emit_as on the return slot.
     // D3-branch: push h.idx so branches inside f.body attribute to THIS fn (no-op unless coverage on).
@@ -2020,12 +2091,17 @@ fn eval_call(c: checker::TCall, env: Venv) -> Value {
     // (W9.3) The fn-body exec_block is itself a defer scope and already drained the body's own defers
     // at its exit; the caller's defers live in the caller env (not threaded into fenv), so they stay
     // isolated. No separate drain here. Panic still does NOT drain (it aborts).
+    // (MEM Step 4) MERGE the callee's final cells back into the caller — a `r.value = …` write in the
+    // callee (through an auto-ref'd arg) is then visible at the caller's aliased var. For a non-ref call
+    // the callee only inherited the caller's cells unchanged, so this is a no-op (byte-identical).
+    caller = with_cells(caller, fe.env.cells)
     let fl = fe.flow
-    match fl {
+    let rv = match fl {
         VmReturn as ret => coerce_to(ret.value ?? panic("vm: void fn call used as a value (internal: checker should reject)"), f.return_type)
         Normal as nm  => coerce_to(nm.value ?? panic("vm: void fn call used as a value (internal: checker should reject)"), f.return_type)  // W5a — implicit trailing value (B.20)
         _             => panic("vm: void fn call used as a value (internal: checker should reject)")
     }
+    EvalRes { value= rv; env= caller }
 }
 
 // ---------------------------------------------------------------------------
@@ -2145,7 +2221,9 @@ fn exec_stmt(s: checker::TStatement, env: Venv) -> Step {
         // panics at `&s->as.assign.value`. The runtime div/rem still panic as the canonical
         // message (M.1); we only prefix line:col first.
         checker::TAssign as a   => {
-            let rhs = eval_expr(a.value, env)
+            let re = eval_expr(a.value, env)   // (MEM Step 4) thread the RHS env (a value-position ref call there grows cells)
+            let rhs = re.value
+            let renv = re.env
             if (a.op == lexer::TokenKind::SlashEq || a.op == lexer::TokenKind::PercentEq) && val_is_int(rhs) && as_int(rhs) == 0 {
                 vm_panic_div0_at(a.value.line, a.value.col)
             }
@@ -2154,17 +2232,17 @@ fn exec_stmt(s: checker::TStatement, env: Venv) -> Step {
             // BACK to the cell (cell_set) — so the caller's aliased var observes the write. A plain
             // assign goes through mutate_slot (which itself routes a cell-backed origin slot to its cell).
             if a.deref {
-                let rv = match read_var(env, a.name) { RefVal as r => r; _ => panic("vm: deref-assign target is not a reference (internal: checker should reject)") }
-                let cur = cell_get(env.cells, rv.cell)
+                let rv = match read_var(renv, a.name) { RefVal as r => r; _ => panic("vm: deref-assign target is not a reference (internal: checker should reject)") }
+                let cur = cell_get(renv.cells, rv.cell)
                 // present-wrap the FINAL value into the ref's inner type (`a.bound`) before the cell
                 // write — same coercion the binding path uses (REBOOT §202). For a `Ref<T?>` this makes
                 // a deref-WRITE store a PRESENT optional, so a later `?? / ?.` read does not see a bare
                 // value (the VM==native divergence: native's deref-assign emit_as already wraps).
                 let newval = coerce_to(compound_apply(cur, a.op, rhs), a.bound)
-                let env2 = with_cells(env, cell_set(env.cells, rv.cell, newval))
+                let env2 = with_cells(renv, cell_set(renv.cells, rv.cell, newval))
                 Stepped { env= env2; value= null }
             } else {
-                let env2 = mutate_slot(env, a.name, a.op, rhs); Stepped { env= env2; value= null }
+                let env2 = mutate_slot(renv, a.name, a.op, rhs); Stepped { env= env2; value= null }
             }
         }
         // `return e` rides a present value; a bare `return` carries null. The value may itself be
@@ -2230,7 +2308,9 @@ fn eval_rhs_flow(e: checker::TExpr, env: Venv) -> FlowEnv {
     match e {
         checker::TIfExpr as _    => exec_if(e, env)        // FlowEnv — mutations inside the RHS branch propagate
         checker::TMatchExpr as _ => exec_match(e, env)     // FlowEnv — same for a match RHS
-        _              => FlowEnv { flow= Normal { value= eval_expr(e, env) }; env= env }
+        // (MEM Step 4) a plain RHS may be a value-position ref call (`let y = bump(x)`): thread its
+        // env out so the auto-ref'd cell write survives into the binding's env (then the bind defines on it).
+        _              => { let re = eval_expr(e, env); FlowEnv { flow= Normal { value= re.value }; env= re.env } }
     }
 }
 
@@ -2255,7 +2335,7 @@ fn eval_stmt_value(e: checker::TExpr, env: Venv) -> StmtVal {
     teko::cov_line(e.line)   // D3-line — a statement-position CALL goes to call_value (bypassing eval_expr), so mark its line here (matches vm.c, which routes stmt calls through eval_expr)
     match e {
         checker::TCall as c => call_value(c, env)                          // threads the caller env out (Ref<T> writes)
-        _          => StmtVal { value= eval_expr(e, env); env= env }       // value expr in stmt position — no env change
+        _          => { let re = eval_expr(e, env); StmtVal { value= re.value; env= re.env } }   // (MEM Step 4) thread env (a nested ref call grows cells)
     }
 }
 
@@ -2389,22 +2469,24 @@ fn exec_if(e: checker::TExpr, env: Venv) -> FlowEnv {
     match e {
         checker::TIfExpr as f => {
             let base = env.slots.len      // outer scope size: the branch's block-locals sit above it
-            let c = as_bool(eval_expr(f.cond, env))
+            let ce = eval_expr(f.cond, env)   // (MEM Step 4) thread the cond env (a ref call in the cond grows cells)
+            let c = as_bool(ce.value)
+            let cenv = ce.env
             // run the taken branch; POP its locals back to the outer scope (keeping outer-`mut`
             // mutations, which mutate_slot writes at their index in [0, base)). This is what makes
             // `if cond { x = 5 }` propagate x to the caller (the C twin mutates the env in place).
             // D3-branch: outcome 0 = then taken, 1 = else/skip taken (no-op unless coverage on).
             if c {
                 teko::cov_branch(e.line, e.col, 0)
-                let bo = exec_block(f.then_blk, env)
+                let bo = exec_block(f.then_blk, cenv)
                 return FlowEnv { flow= bo.flow; env= Venv { slots= loop_outer(bo.env.slots, base); prog= bo.env.prog; defers= bo.env.defers; cells= bo.env.cells } }
             }
             teko::cov_branch(e.line, e.col, 1)
             if f.has_else {
-                let bo = exec_block(f.else_blk, env)
+                let bo = exec_block(f.else_blk, cenv)
                 return FlowEnv { flow= bo.flow; env= Venv { slots= loop_outer(bo.env.slots, base); prog= bo.env.prog; defers= bo.env.defers; cells= bo.env.cells } }
             }
-            FlowEnv { flow= Normal { value= null }; env= env }    // if-without-else taken false: no value, env unchanged
+            FlowEnv { flow= Normal { value= null }; env= cenv }    // if-without-else taken false: no value, cells may have grown
         }
         _ => panic("vm: exec_if on a non-if expression (internal: checker should reject)")
     }

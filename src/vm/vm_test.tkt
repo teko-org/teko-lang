@@ -617,3 +617,81 @@ fn value_arm_defer_region(sel: i64) -> i64 {
     }
     r
 }
+
+// ---------------------------------------------------------------------------
+// MEM Step 4 — `Ref<T>` calls in VALUE POSITION execute in the VM == native (was an honest-stop:
+// the value-functional `eval_expr` had no env-return channel, so a value-position ref call's cell
+// writes were lost; MEM Step 4 threads the env out of eval_expr (EvalRes), so the auto-ref'd cell
+// write reaches the caller exactly as in statement position). The C twin runs these via its global
+// cell store. Each test runs on the VM (`teko test`) AND compiles native (`teko build`) — the
+// results MUST match (the native binary is the oracle: e.g. `let y=bumpr(x); y+x` → 84).
+// ---------------------------------------------------------------------------
+
+// the value-returning ref bump: writes through the ref AND yields the new value (the trailing expr).
+fn bumpr(r: Ref<i64>) -> i64 { r.value = r.value + 1; r.value }
+
+// (1) scalar Ref<i64> in value position: `let y = bumpr(x)` — y is the returned new value (42), and
+// x ALSO observes the write (42). y + x == 84. The headline native-oracle case.
+#test
+fn ref_value_position_let_holds() {
+    mut x: i64 = 41
+    let y = bumpr(x)                       // value-position ref call: mutates x AND yields the value
+    teko::assert::is_true(y == 42)         // the returned trailing value
+    teko::assert::is_true(x == 42)         // the write through the ref reached the caller's `x`
+    teko::assert::is_true(y + x == 84)     // native oracle: 84
+}
+
+// (2) a ref call nested as a CALL ARGUMENT: `add1(bumpr(x))`. The nested ref write must reach `x`.
+fn add1(n: i64) -> i64 { n + 1 }
+#test
+fn ref_value_position_nested_arg_holds() {
+    mut x: i64 = 41
+    let r = add1(bumpr(x))                 // bumpr(x): x→42, yields 42; add1(42)=43
+    teko::assert::is_true(r == 43)
+    teko::assert::is_true(x == 42)         // the nested ref write reached the caller
+}
+
+// (3) a ref call as a BINARY OPERAND: `bumpr(x) + 1`. The operand's write must reach `x`.
+#test
+fn ref_value_position_binary_operand_holds() {
+    mut x: i64 = 41
+    let r = bumpr(x) + 1                    // bumpr(x): x→42, yields 42; 42 + 1 = 43
+    teko::assert::is_true(r == 43)
+    teko::assert::is_true(x == 42)
+}
+
+// (4) TWO ref calls in one binary expression: `bumpr(x) + bumpr(x)`. Both alias x's one cell; the
+// mutations compose LEFT-then-RIGHT (matching native's left-to-right operand eval): 42 + 43 == 85,
+// and x ends at 43. This proves the env (cell store) THREADS between the two operand evals.
+#test
+fn ref_value_position_two_calls_order_holds() {
+    mut x: i64 = 41
+    let r = bumpr(x) + bumpr(x)            // left: x→42 yields 42; right: x→43 yields 43; 42+43=85
+    teko::assert::is_true(r == 85)
+    teko::assert::is_true(x == 43)         // two composed writes on the shared cell
+}
+
+// (5) a value-position ref call whose result is MATCHED, then a subsequent read of the mutated var:
+// both reflect the mutation. `match bumpr(x) { 42 => … }` and then `x == 42`.
+#test
+fn ref_value_position_match_subject_holds() {
+    mut x: i64 = 41
+    let tag = match bumpr(x) {            // bumpr(x): x→42, yields 42
+        42 => 1
+        _  => 0
+    }
+    teko::assert::is_true(tag == 1)        // the matched value was the new 42
+    teko::assert::is_true(x == 42)         // and the mutation is visible after the match
+}
+
+// (6) NON-SCALAR Ref<Point> in value position: a value-returning struct-ref fn used in `let`.
+// `setget(p, 42)` whole-replaces p.x with 42 and RETURNS the new p.x (42). p observes the write.
+fn setget(r: Ref<Point>, v: i64) -> i64 { r.value = Point { x = v; y = r.value.y }; r.value.x }
+#test
+fn ref_value_position_struct_holds() {
+    mut p = Point { x = 1; y = 2 }
+    let got = setget(p, 42)                // value-position non-scalar ref call
+    teko::assert::is_true(got == 42)       // the returned new x
+    teko::assert::is_true(p.x == 42)       // the whole-replace reached the caller's `p`
+    teko::assert::is_true(p.y == 2)        // y preserved
+}
