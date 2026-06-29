@@ -83,6 +83,33 @@ fn early_return_with_defer(flag: bool) -> i32 {
     return 2
 }
 
+// (W9.3 part 2) A `defer` that MUTATES the variable being RETURNED must run BEFORE the return value
+// is captured — VM must match native (RATIFIED). `return acc` after `defer { acc = acc + 9 }` is 9.
+#test
+fn defer_mutates_returned_var() {
+    teko::assert::is_true(defer_then_return() == 9)
+}
+
+fn defer_then_return() -> i64 {
+    mut acc = 0
+    defer { acc = acc + 9 }
+    return acc
+}
+
+// (W9.3 part 2) The TRAILING-value (implicit return) variant: the fn-body's defers fire BEFORE the
+// trailing expr is evaluated, so a defer that mutates the trailing var is observed. native == 6.
+#test
+fn defer_mutates_trailing_value() {
+    teko::assert::is_true(top_fn_defer() == 6)
+}
+
+fn top_fn_defer() -> i64 {
+    mut acc = 0
+    defer { acc = acc + 1 }
+    acc = acc + 5
+    acc
+}
+
 // ---------------------------------------------------------------------------
 // MEM Step 2/3 — `Ref<T>` EXECUTES in the VM (was an honest-stop). A `Ref<T>` param is an
 // auto-ref'd `mut` scalar lvalue: `bump(x)` PROMOTES `x` to the env cell store, `r.value = …`
@@ -417,4 +444,176 @@ fn slice_same_type_noop_copy_holds() {
     let copy: []i64 = pw_make_ints()
     teko::assert::is_true(copy[0] == 11)
     teko::assert::is_true(copy[1] == 22)
+}
+
+// ===========================================================================
+// W9.3 — SCOPE-SCOPED `defer { … }` (Zig/Swift-style, per-block, NOT Go's per-function).
+// A defer registered inside a block fires at THAT block's exit (loop body → per iteration; if/match
+// arm → arm exit), LIFO within a block, innermost-block-first across nesting, and on
+// return/break/continue crossing blocks each crossed block fires its own defers. Observed via an
+// outer `mut` the defer body assigns to (the env threads the write back out — the only side-effect a
+// defer body can carry, since it may not return/break/nest a defer). These run on the VM gate; the
+// SAME programs are compiled to native in the W9.3 reproducer projects and produce identical results
+// (VM == NATIVE — the headline gate). The self-hosted .tks codegen fully supports scope-level
+// (nested) defers — it emits byte-identical C to codegen.c (W9.3) — so a defer-using corpus program
+// would compile fine; these tests just keep their defers inline in `#test` fns for clarity.
+
+// (a) a defer in a LOOP body fires ONCE PER ITERATION — the count equals the iteration count.
+#test
+fn defer_in_loop_fires_per_iteration() {
+    mut c: i64 = 0
+    mut i = 0
+    loop {
+        if i >= 5 { break }
+        defer { c = c + 1 }   // fires at EACH iteration's end
+        i = i + 1
+    }
+    teko::assert::is_true(c == 5)   // 5 iterations → 5 defer firings
+}
+
+// (b) a defer in an IF arm fires at the ARM's exit (not the function's).
+#test
+fn defer_in_if_arm_fires_at_arm_exit() {
+    mut c: i64 = 0
+    if c == 0 {
+        defer { c = c + 1 }   // fires when the then-arm exits
+        c = c + 10            // ran BEFORE the defer
+    }
+    c = c + 100               // ran AFTER the arm (defer already fired)
+    teko::assert::is_true(c == 111)   // 10 (body) + 1 (defer at arm exit) + 100 (after)
+}
+
+// (c) LIFO within a block — the LAST-registered defer fires FIRST. Order is observable via mixing a
+// multiply and an add: 5 *10 (last-registered, fires first) → 50, then +1 (first-registered) → 51.
+#test
+fn defer_lifo_within_block() {
+    mut c: i64 = 0
+    if c == 0 {
+        defer { c = c + 1 }    // registered FIRST → fires LAST
+        defer { c = c * 10 }   // registered LAST  → fires FIRST
+        c = 5
+    }
+    teko::assert::is_true(c == 51)
+}
+
+// (d) a defer fires on BREAK …
+#test
+fn defer_fires_on_break() {
+    mut c: i64 = 0
+    loop {
+        defer { c = c + 1 }   // fires before the break leaves the loop body
+        break
+    }
+    teko::assert::is_true(c == 1)
+}
+
+// … on CONTINUE (the continue-path iteration still fires its defer) …
+#test
+fn defer_fires_on_continue() {
+    mut c: i64 = 0
+    mut i = 0
+    loop {
+        if i >= 3 { break }
+        i = i + 1
+        defer { c = c + 1 }       // fires at each iteration end, incl. via continue
+        if i == 2 { continue }    // this iteration ends via continue → defer still fires
+    }
+    teko::assert::is_true(c == 3)   // 3 iterations, defer fires every time
+}
+
+// … and a break crossing a NESTED loop scope fires the inner loop-body defer as that scope unwinds —
+// the SAME crossed-scope unwinding path a `return` from inside a loop takes (exec_block drains its
+// defers on ANY non-NORMAL flow). The return-VALUE-crossing-a-loop case is covered natively in the
+// W9.3 reproducer project (a Ref<T> return-from-loop is not VM-runnable in value position).
+#test
+fn defer_fires_on_return_from_loop() {
+    mut c: i64 = 0
+    loop {
+        loop {
+            defer { c = c + 1 }   // inner loop-body defer — fires as the inner break crosses this scope
+            break                 // exits the INNER loop (its body defer fires on the way out)
+        }
+        defer { c = c * 10 }      // outer loop-body defer — fires at the outer iteration's end
+        break
+    }
+    // inner break unwinds firing +1 → 1; the outer loop's exit fires *10 → 10.
+    teko::assert::is_true(c == 10)
+}
+
+// (e) a top-level FUNCTION defer still fires at fn exit (back-compat with the old function-scoped form).
+#test
+fn defer_fn_level_back_compat() {
+    mut c: i64 = 0
+    if c == 0 {
+        defer { c = c + 1 }
+        c = c + 10
+    }
+    teko::assert::is_true(c == 11)   // 10 (body) + 1 (block-exit defer)
+}
+
+// (f) NESTED blocks — the INNER defer fires before the OUTER. A loop body (outer scope) holds an if
+// arm (inner scope); each has a defer. The inner (arm) defer fires at the arm's exit, BEFORE the
+// outer (loop-body) defer fires at the iteration's end. Order is encoded multiplicatively:
+// value 3 → arm exit *2 = 6 → loop-body exit +1 = 7.
+#test
+fn defer_nested_inner_before_outer() {
+    mut c: i64 = 0
+    loop {
+        defer { c = c + 1 }       // OUTER (loop body) → fires at iteration end
+        if true {
+            defer { c = c * 2 }   // INNER (arm) → fires at arm exit FIRST
+            c = 3
+        }
+        break
+    }
+    teko::assert::is_true(c == 7)
+}
+
+// (g) NO-REGION value-position `match` arm with a defer that mutates an arm-local. The arm body needs
+// no heap region (the binding is a SCALAR, want_block==false), so this exercises the no-region value-
+// arm defer path: the tail value `a` (==10) is captured into the match sink FIRST, THEN the arm's
+// defer fires (a→13, discarded). RATIFIED: tail-then-defer, opposite of a fn return. native == VM == 10.
+// (Before the W9.3 no-region fix this emitted broken C — the defer landed outside the arm's stmt-expr.)
+#test
+fn defer_value_match_arm_no_region() {
+    teko::assert::is_true(value_arm_defer(0) == 10)
+}
+
+fn value_arm_defer(sel: i64) -> i64 {
+    let r = match sel { 0 => { mut a = 10; defer { a = a + 3 }; a }; _ => 0 }
+    r
+}
+
+// (h) A SIBLING defer-bearing function compiled AFTER the no-region value-arm fn must build correctly
+// and return its own value (proves the value-arm's registered defer did NOT leak forward / corrupt the
+// per-function defer count). `sib_after_value_arm` is a FUNCTION return: its defer fires BEFORE the
+// return value is captured (the ratified fn-return ordering — opposite of the value-arm), so acc==1.
+#test
+fn defer_value_arm_no_corruption_of_sibling() {
+    teko::assert::is_true(value_arm_defer(0) == 10)
+    teko::assert::is_true(sib_after_value_arm() == 1)
+}
+
+fn sib_after_value_arm() -> i64 {
+    mut acc = 0
+    defer { acc = acc + 1 }
+    return acc
+}
+
+// (i) WITH-REGION value-arm: the arm both initializes a block-local struct (forces want_block==true,
+// a `_tkbr` region) AND has a defer mutating a scalar tail-local. The region path already captured the
+// tail before firing the defer; this guards that path against regression. native == VM == 10.
+type VadBox = struct { v: i64 }
+
+#test
+fn defer_value_match_arm_with_region() {
+    teko::assert::is_true(value_arm_defer_region(0) == 10)
+}
+
+fn value_arm_defer_region(sel: i64) -> i64 {
+    let r = match sel {
+        0 => { let bx = VadBox { v = 99 }; mut a = 10; defer { a = a + bx.v }; a }
+        _ => 0
+    }
+    r
 }

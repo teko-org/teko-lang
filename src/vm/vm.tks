@@ -236,6 +236,47 @@ fn push_defer(env: Venv, body: []checker::TStatement) -> Venv {
     Venv { slots= env.slots; prog= env.prog; defers= teko::list::push(env.defers, DeferBody { body= body }); cells= env.cells }
 }
 
+// (W9.3) with_defers — replace an env's defer stack (used to pop a scope's defers back to its base
+// after that scope's defers have fired). Mirrors with_cells.
+fn with_defers(env: Venv, defers: []DeferBody) -> Venv {
+    Venv { slots= env.slots; prog= env.prog; defers= defers; cells= env.cells }
+}
+
+// (W9.3) defers_up_to — the first `base` deferred bodies of `ds` (rebuilt, since the list has no
+// truncate op). Used to pop a scope's own defers (those at index ≥ base) after they have fired.
+fn defers_up_to(ds: []DeferBody, base: u64) -> []DeferBody {
+    mut out: []DeferBody = teko::list::empty()
+    // (W9.3 part 2) Cap at the list length: a `return` may have ALREADY drained this scope's defers
+    // (emptied the list) before the unwinding exec_block reaches here with its higher `base` mark —
+    // "already drained below my mark" is a safe no-op, so never index past the end.
+    mut stop: u64 = base
+    if stop > ds.len { stop = ds.len }
+    mut i: u64 = 0
+    loop {
+        if i >= stop { break }
+        out = teko::list::push(out, ds[i])
+        i++
+    }
+    out
+}
+
+// (W9.3) drain_defers_to — fire every deferred body registered on top of `base` (i.e. at index ≥
+// base) in LIFO order (most-recent / innermost first), executing each via exec_block, then pop them
+// off the stack (defers truncated back to `base`). This is THE scope-defer drain: exec_block calls it
+// at every exit edge so a block's defers run before control leaves the block. A defer body is itself a
+// no-defer scope (the checker forbids nested defer), so running it via exec_block pushes nothing and
+// cannot re-enter. Panic does NOT reach here (it aborts).
+fn drain_defers_to(env: Venv, base: u64) -> Venv {
+    mut e = env
+    mut di: u64 = e.defers.len
+    loop {
+        if di <= base { break }
+        di--
+        e = exec_block(e.defers[di].body, e).env
+    }
+    with_defers(e, defers_up_to(e.defers, base))
+}
+
 // (C7.18) fresh_env — a fresh call-frame env (no slots, no defers, same prog).
 // (MEM Step 2/3) `cells` is supplied by the CALLER so a `RefVal`'s cell index stays valid in the
 // callee frame (the cell store is program-wide, not per-frame); the caller passes its own cells in.
@@ -1940,17 +1981,13 @@ fn eval_call(c: checker::TCall, env: Venv) -> Value {
     // present-wraps (REBOOT §202), mirroring codegen's emit_as on the return slot.
     // D3-branch: push h.idx so branches inside f.body attribute to THIS fn (no-op unless coverage on).
     teko::cov_enter(h.idx)
-    let fe = exec_block(f.body, fenv)
+    // (W9.3 part 2) is_fn_body=true: the body's trailing value-expr fires the body's defers BEFORE it
+    // is evaluated, mirroring native (emit_block_tail -> emit_exprstmt_tail drains base-0 defers first).
+    let fe = exec_block_ex(f.body, fenv, true)
     teko::cov_leave()
-    // (C7.18) Drain the call frame's defer stack LIFO before returning.
-    // Panic does NOT drain deferred blocks.
-    mut drained_env = fe.env
-    mut di = drained_env.defers.len
-    loop {
-        if di == 0 { break }
-        di--
-        drained_env = exec_block(drained_env.defers[di].body, drained_env).env
-    }
+    // (W9.3) The fn-body exec_block is itself a defer scope and already drained the body's own defers
+    // at its exit; the caller's defers live in the caller env (not threaded into fenv), so they stay
+    // isolated. No separate drain here. Panic still does NOT drain (it aborts).
     let fl = fe.flow
     match fl {
         VmReturn as ret => coerce_to(ret.value ?? panic("vm: void fn call used as a value (internal: checker should reject)"), f.return_type)
@@ -1966,21 +2003,67 @@ fn eval_call(c: checker::TCall, env: Venv) -> Value {
 // W5a — exec_block now YIELDS THE TRAILING VALUE: it returns the LAST statement's NORMAL flow
 // (keeping its value), so a block's last expression becomes the block's value (B.20). Mirrors
 // the C `tk_vm_exec_block` returning the last statement's flow. A non-local exit short-circuits.
+// (W9.3) exec_block is a SCOPE-DEFER frame: defers registered inside it fire at the block's exit
+// (LIFO), BEFORE control leaves it — per-iteration for a loop body, per-arm for an if/match arm,
+// per-call for a fn body. `base` is this scope's defer base; on EVERY exit edge (fall-through OR a
+// non-local Exit) we drain the defers pushed on top of `base` (innermost first) and pop them. A
+// non-local flow still fires THIS block's defers first, then propagates outward where each crossed
+// exec_block fires its own — innermost-block-first unwind.
 fn exec_block(body: []checker::TStatement, env: Venv) -> FlowEnv {
+    exec_block_ex(body, env, false)
+}
+
+// (W9.3 part 2) `is_fn_body` marks the FUNCTION-BODY scope: its trailing value-carrying expr-statement
+// is treated like `return <expr>` for ordering — the body's defers fire BEFORE the trailing expr is
+// evaluated (mirroring codegen's emit_block_tail -> emit_exprstmt_tail: emit_defers(base 0) BEFORE the
+// implicit trailing `return`). Inner scopes (loop body, statement-position arm) discard their trailing
+// value, so they keep the original "run all statements, THEN drain" order — unchanged, already matches.
+fn exec_block_ex(body: []checker::TStatement, env: Venv, is_fn_body: bool) -> FlowEnv {
+    let base = env.defers.len     // (W9.3) this scope's defer base
     mut e = env
     mut last: Value? = null      // the last NORMAL step's value — the block's trailing value (B.20)
     mut i = 0
     loop {
         if i >= body.len { break }
+        // (W9.3 part 2) Function-body TRAILING value: if the last statement is a value-carrying
+        // expr-statement (not an `if`/`match` taken as control flow — those self-route), fire this
+        // body's defers FIRST, then evaluate it as the return value. Matches native ordering.
+        let is_last = i + 1 == body.len
+        mut is_fn_tail = false
+        if is_fn_body { if is_last { if is_plain_expr_stmt(body[i]) { is_fn_tail = true } } }
+        if is_fn_tail {
+            let de = drain_defers_to(e, base)   // fire the body's defers BEFORE the trailing expr
+            match exec_stmt(body[i], de) {
+                Stepped as st => return FlowEnv { flow= Normal { value= st.value }; env= st.env }
+                Exit as ex    => return FlowEnv { flow= ex.flow; env= drain_defers_to(ex.env, base) }
+            }
+        }
         match exec_stmt(body[i], e) {
             // A NORMAL step threads the env forward AND keeps its value as the block's trailing value.
             Stepped as st => { e = st.env; last = st.value }
-            // VmReturn / Break / Continue escape — carry the env AT THE EXIT so mutations before it survive.
-            Exit as ex    => return FlowEnv { flow= ex.flow; env= ex.env }
+            // VmReturn / Break / Continue escape — carry the env AT THE EXIT so mutations before it
+            // survive. (W9.3) Fire THIS block's defers FIRST, then propagate the flow outward.
+            Exit as ex    => return FlowEnv { flow= ex.flow; env= drain_defers_to(ex.env, base) }
         }
         i++
     }
-    FlowEnv { flow= Normal { value= last }; env= e }   // trailing value rides NORMAL; thread the final env out
+    // (W9.3) normal fall-through: fire THIS block's defers LIFO, then thread the drained env out.
+    FlowEnv { flow= Normal { value= last }; env= drain_defers_to(e, base) }
+}
+
+// (W9.3 part 2) Is this statement a plain value-carrying expr-statement (NOT an `if`/`match`, which
+// run as control flow and self-route their own scope defers)? Used to detect a fn-body trailing value.
+fn is_plain_expr_stmt(s: checker::TStatement) -> bool {
+    match s {
+        checker::TExprStmt as x => {
+            match x.expr {
+                checker::TIfExpr as _    => false
+                checker::TMatchExpr as _ => false
+                _              => true
+            }
+        }
+        _ => false
+    }
 }
 
 // One statement. Returns either Stepped(env', value) — a NORMAL step that threads the env
@@ -2055,8 +2138,14 @@ fn exec_stmt(s: checker::TStatement, env: Venv) -> Step {
         // `return e` rides a present value; a bare `return` carries null. The value may itself be
         // an `if`/`match` whose arm DIVERGES — run it flow-aware so an inner return propagates.
         checker::TReturn as r   => {
+            // (W9.3 part 2) A `return` leaves EVERY enclosing scope: fire ALL in-scope frame defers
+            // (down to base 0) LIFO — innermost-block-first — BEFORE evaluating the return value, so a
+            // defer that mutates the variable being returned is observed. Mirrors codegen's
+            // emit_defers(base 0) emitted BEFORE the `return <expr>`. The unwinding exec_blocks then
+            // drain to their (≥0) marks over an EMPTY defer list → safe no-op (no re-fire).
+            let denv = drain_defers_to(env, 0)
             if r.has_value {
-                let fe = eval_rhs_flow(r.value, env)
+                let fe = eval_rhs_flow(r.value, denv)
                 match fe.flow {
                     Normal as nm => Exit { flow= VmReturn { value= nm.value }; env= fe.env }
                     // inner return/break/continue inside the returned value → propagate.
@@ -2065,7 +2154,7 @@ fn exec_stmt(s: checker::TStatement, env: Venv) -> Step {
                     Continue as f => Exit { flow= f; env= fe.env }
                 }
             } else {
-                Exit { flow= VmReturn { value= null }; env= env }
+                Exit { flow= VmReturn { value= null }; env= denv }
             }
         }
         // W5a — an `if`/`match` in statement/tail position runs as CONTROL FLOW (exec_if/exec_match),
@@ -2174,22 +2263,17 @@ fn call_value(c: checker::TCall, env: Venv) -> StmtVal {
     let fenv = bound.fenv
     mut caller = bound.caller
     teko::cov_enter(h.idx)   // D3-branch — attribute body branches to this fn (no-op unless coverage on)
-    let fe2 = exec_block(f.body, fenv)
+    // (W9.3 part 2) is_fn_body=true — trailing value-expr fires the body's defers before it is evaluated.
+    let fe2 = exec_block_ex(f.body, fenv, true)
     teko::cov_leave()
-    // (C7.18) Drain the call frame's defer stack LIFO before returning.
-    mut drained_env2 = fe2.env
-    mut di2 = drained_env2.defers.len
-    loop {
-        if di2 == 0 { break }
-        di2--
-        drained_env2 = exec_block(drained_env2.defers[di2].body, drained_env2).env
-    }
+    // (W9.3) The fn-body exec_block already drained the body's own defers at its exit (scope-defer);
+    // fe2.env is the post-drain callee env (defers popped, cells reflecting any defer-body writes).
     // (MEM Step 2/3) MERGE the callee's final cells back into the caller: the callee inherited the
     // caller's cell store and only appended/mutated it, so its final store is a superset-with-writes
     // and replaces the caller's wholesale — making a `r.value = …` write in the callee visible at the
     // caller's aliased var (whose slot is cell-backed). (In the C twin the cells array is global, so
     // the write is already visible; this is the value-functional twin of that shared-pointer effect.)
-    caller = with_cells(caller, drained_env2.cells)
+    caller = with_cells(caller, fe2.env.cells)
     match fe2.flow {
         VmReturn as ret => StmtVal { value= ret.value; env= caller }      // explicit `return e` (or bare return -> null)
         Normal as nm  => StmtVal { value= nm.value; env= caller }       // W5a — implicit trailing value (B.20); null if none
@@ -2228,6 +2312,11 @@ fn run_loop(mylabel: str, body: []checker::TStatement, env: Venv) -> LoopOut {
         // Run the body with PER-STATEMENT env threading (like exec_block), but CARRY the resulting
         // env to the next iteration so an outer `mut i` updated by `i++` is seen (the functional VM
         // has no in-place mutation — the C twin mutates env directly). Drop this iteration's locals.
+        // (W9.3) The loop body is a defer SCOPE: defers registered this iteration fire at the
+        // iteration's exit (fall-through OR break/continue/return), innermost-first, BEFORE the
+        // iteration's locals are dropped — mirroring the C twin, where the loop body is a
+        // tk_vm_exec_block (a scope-defer frame). `dbase` is this iteration's defer base.
+        let dbase = cur.defers.len
         mut e = cur
         mut exited = false
         mut exflow: Flow = Normal { value = null }
@@ -2240,6 +2329,7 @@ fn run_loop(mylabel: str, body: []checker::TStatement, env: Venv) -> LoopOut {
             }
             i = i + 1
         }
+        e = drain_defers_to(e, dbase)   // (W9.3) fire this iteration's defers LIFO, then pop them
         cur = Venv { slots = loop_outer(e.slots, base); prog = e.prog; defers= cur.defers; cells= e.cells }   // keep outer mutations (incl cell writes); drop locals
         if exited {
             match exflow {

@@ -97,6 +97,7 @@ static bool occurs_stmt(const tk_tstatement *s, tk_str name) {
         case TK_TSTMT_RETURN:  return s->as.ret.has_value && occurs_expr(&s->as.ret.value, name);
         case TK_TSTMT_LOOP:    return occurs_block(s->as.loop_stmt.body, s->as.loop_stmt.nbody, name);
         case TK_TSTMT_EXPR:    return occurs_expr(&s->as.expr_stmt.expr, name);
+        case TK_TSTMT_DEFER:   return occurs_block(s->as.defer_stmt.body, s->as.defer_stmt.nbody, name);   // (W9.3) a defer body READS its captured locals
         default: return false;   // BREAK/CONTINUE — no reads
     }
 }
@@ -158,6 +159,9 @@ static tk_error check_local_stmt(const tk_tstatement *s, const tk_tstatement *fb
         case TK_TSTMT_EXPR:   return check_locals_expr(&s->as.expr_stmt.expr, fbody, nbody, file);
         case TK_TSTMT_RETURN: return s->as.ret.has_value ? check_locals_expr(&s->as.ret.value, fbody, nbody, file) : ok();
         case TK_TSTMT_ASSIGN: return check_locals_expr(&s->as.assign.value, fbody, nbody, file);
+        // (W9.3) A defer BODY is not descended for unused-local errors (a defer's own bindings are
+        // cleanup scratch, often intentionally write-only) — the `occurs_stmt` defer case already
+        // counts a defer body's READS of OUTER locals as uses, which is what scope-defer requires.
         default: return ok();
     }
 }

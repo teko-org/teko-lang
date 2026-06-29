@@ -514,10 +514,19 @@ typedef struct tk_vm_defer_node {
     struct tk_vm_defer_node *next;  // older entry (toward the bottom of the stack)
 } tk_vm_defer_node;
 static tk_vm_defer_node *g_vm_defer_top = NULL;   // current call frame's defer stack top
+// (W9.3 part 2) Count of nodes currently on g_vm_defer_top — the defer-scope mark is a DEPTH, not a
+// raw pointer. A scope records the depth at its entry and drains down to that depth at exit; "already
+// drained below my mark" (current depth ≤ my mark) is a safe no-op — no dangling-pointer compare.
+// This lets a `return <expr>` pre-drain ALL frame defers (to depth 0) BEFORE evaluating the value
+// (mirroring codegen's emit_defers(base 0) before `return <expr>`), with the unwinding exec_blocks
+// then draining nothing.
+static size_t g_vm_defer_depth = 0;
 
 // forward decls
 static tk_value tk_vm_eval_expr(const tk_texpr *e, tk_venv *env);
 static tk_flow  tk_vm_exec_block(const tk_tstatement *body, size_t n, tk_venv *env);
+static tk_flow  tk_vm_exec_block_ex(const tk_tstatement *body, size_t n, tk_venv *env, bool is_fn_body);
+static void     vm_drain_defers_to_depth(size_t depth, tk_venv *env);  // (W9.3 part 2)
 static tk_flow  exec_if(const tk_texpr *e, tk_venv *env);     // W5 — `if` as control flow (+ value)
 static tk_flow  exec_match(const tk_texpr *e, tk_venv *env);  // arm bodies are blocks (B.20) — run flow-aware
 static bool     call_value(const tk_texpr *e, tk_venv *env, tk_value *out);   // (MEM Step 2/3) statement-position call (Ref<T>-aware)
@@ -1269,23 +1278,21 @@ static void bind_call_args(const tk_tfunction *fn, const tk_texpr *args, size_t 
 // through a `Ref<T>` arg is already visible at the caller (no merge needed) — the value-functional
 // .tks twin threads `cells` through the env to reproduce this. Used by both eval_call and call_value.
 static tk_flow run_user_fn(const tk_tfunction *fn, size_t fn_idx, tk_venv *fenv) {
+    // (W9.3) Save/clear/restore the defer stack across the call frame so a callee's defers never mix
+    // with the caller's. The fn-body exec_block is itself a defer scope (W9.3) and drains the body's
+    // own defers at its exit — so NO separate drain is needed here. Panic still does NOT drain (a
+    // panic aborts; defers registered before it don't run).
     tk_vm_defer_node *saved_defer_top = g_vm_defer_top;
+    size_t saved_defer_depth = g_vm_defer_depth;   // (W9.3 part 2) the count mark, restored with the top
     g_vm_defer_top = NULL;
+    g_vm_defer_depth = 0;
     tk_cov_enter(fn_idx);   // D3-branch — attribute body branches to this fn (no-op unless coverage on)
-    tk_flow fl = tk_vm_exec_block(fn->body, fn->nbody, fenv);
+    // (W9.3 part 2) is_fn_body=true: the body's trailing value-expr fires the body's defers BEFORE it is
+    // evaluated, mirroring native (emit_block_tail → emit_exprstmt_tail drains base-0 defers first).
+    tk_flow fl = tk_vm_exec_block_ex(fn->body, fn->nbody, fenv, /*is_fn_body=*/true);
     tk_cov_leave();
-    // (C7.18) Drain the current frame's defer stack LIFO before exit.
-    // Panic does NOT drain (defers registered before panic don't run).
-    {
-        tk_vm_defer_node *d = g_vm_defer_top;
-        while (d != NULL) {
-            tk_vm_defer_node *next = d->next;
-            tk_vm_exec_block(d->stmt->as.defer_stmt.body, d->stmt->as.defer_stmt.nbody, fenv);
-            tk_free0(d);
-            d = next;
-        }
-    }
     g_vm_defer_top = saved_defer_top;   // restore caller's defer stack
+    g_vm_defer_depth = saved_defer_depth;
     return fl;
 }
 
@@ -1963,6 +1970,12 @@ static tk_flow exec_stmt(const tk_tstatement *s, tk_venv *env) {
             return flow_normal();
         }
         case TK_TSTMT_RETURN: {
+            // (W9.3 part 2) A `return` leaves EVERY enclosing scope: fire ALL in-scope frame defers
+            // (down to depth 0) LIFO — innermost-block-first — BEFORE evaluating the return value, so
+            // a defer that mutates the variable being returned is observed. Mirrors codegen's
+            // emit_defers(base 0) emitted BEFORE the `return <expr>` text. The unwinding exec_blocks
+            // then drain to their (≥0) marks with depth already 0 → safe no-op (no re-fire, no dangle).
+            vm_drain_defers_to_depth(0, env);
             if (!s->as.ret.has_value) return (tk_flow){ .kind = TK_FLOW_RETURN, .has_value = false };
             // The returned value may itself be an `if`/`match` whose arm DIVERGES — run it
             // flow-aware so e.g. `return match r { … error as e => return e }` propagates.
@@ -2017,19 +2030,67 @@ static tk_flow exec_stmt(const tk_tstatement *s, tk_venv *env) {
             node->stmt = s;
             node->next = g_vm_defer_top;
             g_vm_defer_top = node;
+            g_vm_defer_depth += 1;
             return flow_normal();
         }
     }
     vm_unsupported("unknown statement not yet supported");
 }
 
+// (W9.3) EVERY exec_block is a SCOPE-DEFER frame: defers registered inside this block run at the
+// block's exit (LIFO), BEFORE control leaves it — for a loop body that is per-iteration, for an
+// if/match arm that is per-arm, for a fn body that is per-call. `saved` is this scope's defer base:
+// at exit we drain the nodes pushed on top of `saved` (the most-recent / innermost first), execute
+// each via exec_block (itself a no-defer scope — a defer body may not contain defers, so it pushes
+// nothing and cannot re-enter), free them, and restore `g_vm_defer_top = saved`. A non-NORMAL flow
+// (return/break/continue) crossing this block still drains THIS block's defers first, then the flow
+// propagates outward where each crossed exec_block drains its own — innermost-block-first unwind.
+// (W9.3 part 2) Drain every defer node above `depth` (i.e. those pushed after the scope whose mark is
+// `depth`) in LIFO order, executing each via exec_block, then leave g_vm_defer_depth == depth. If the
+// current depth is already ≤ `depth` (e.g. a `return` already pre-drained the whole frame), this is a
+// no-op — the safe "already drained below my mark" case.
+static void vm_drain_defers_to_depth(size_t depth, tk_venv *env) {
+    while (g_vm_defer_depth > depth && g_vm_defer_top != NULL) {
+        tk_vm_defer_node *d = g_vm_defer_top;
+        g_vm_defer_top = d->next;   // pop BEFORE running so the defer body's scope sees the right base
+        g_vm_defer_depth -= 1;
+        tk_vm_exec_block(d->stmt->as.defer_stmt.body, d->stmt->as.defer_stmt.nbody, env);
+        tk_free0(d);
+    }
+}
+
 static tk_flow tk_vm_exec_block(const tk_tstatement *body, size_t n, tk_venv *env) {
+    return tk_vm_exec_block_ex(body, n, env, /*is_fn_body=*/false);
+}
+
+// (W9.3 part 2) `is_fn_body` marks the FUNCTION-BODY scope: its trailing value-carrying expr-statement
+// is treated like `return <expr>` for ordering — the body's defers fire BEFORE the trailing expr is
+// evaluated (mirroring codegen's emit_block_tail → emit_exprstmt_tail: emit_defers(base 0) BEFORE the
+// implicit trailing `return`). Inner scopes (loop body, statement-position arm) discard their trailing
+// value, so they keep the original "run all statements, THEN drain" order — unchanged, already matches.
+static tk_flow tk_vm_exec_block_ex(const tk_tstatement *body, size_t n, tk_venv *env, bool is_fn_body) {
+    size_t base = g_vm_defer_depth;   // (W9.3 part 2) this scope's defer base (a DEPTH mark)
     tk_flow last = flow_normal();
     for (size_t i = 0; i < n; i += 1) {
+        // (W9.3 part 2) Function-body TRAILING value: if the last statement is a value-carrying
+        // expr-statement (not an `if`/`match` taken as control flow — those self-route), fire this
+        // body's defers FIRST, then evaluate it as the return value. This matches native ordering.
+        bool is_last = (i + 1 == n);
+        if (is_fn_body && is_last && body[i].tag == TK_TSTMT_EXPR
+            && body[i].as.expr_stmt.expr.tag != TK_TEXPR_IF
+            && body[i].as.expr_stmt.expr.tag != TK_TEXPR_MATCH) {
+            vm_drain_defers_to_depth(base, env);   // fire the body's defers BEFORE the trailing expr
+            tk_flow tl = exec_stmt(&body[i], env);
+            return tl;   // its value rides the NORMAL flow; defers already drained to `base`
+        }
         tk_flow fl = exec_stmt(&body[i], env);
-        if (fl.kind != TK_FLOW_NORMAL) return fl;   // non-local exit (return/break/continue) short-circuits
+        if (fl.kind != TK_FLOW_NORMAL) {            // non-local exit (return/break/continue)
+            vm_drain_defers_to_depth(base, env);    // (W9.3) fire THIS block's defers, then propagate
+            return fl;
+        }
         last = fl;   // W5 — keep the NORMAL value so the block's TRAILING expression is its value (B.20)
     }
+    vm_drain_defers_to_depth(base, env);   // (W9.3) normal fall-through: fire THIS block's defers LIFO
     return last;
 }
 

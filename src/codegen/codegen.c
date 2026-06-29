@@ -261,7 +261,12 @@ static const char   *g_cg_frame = "";
 // `is_loop` distinguishes a LOOP-body region (a valid break/continue target) from an ARM-body region
 // (an if-then/if-else/match-arm block region — S2 arms): a break/continue CROSSES an arm region (drops
 // it) but STOPS only AT the innermost matching loop region, never at an arm region.
-typedef struct { const char *name; tk_str label; bool is_loop; } cg_block_region;   // a block region on the stack
+// (W9.3) `defer_base` is g_cg_ndefers at this scope-block's entry — the boundary below which defers
+// belong to ENCLOSING scopes. A scope-block fires only the defers at index ≥ its defer_base, LIFO,
+// at its exit edge (before its region drops). EVERY scope-block (loop body / if-then / if-else /
+// match arm) pushes an entry — even one with NO S2 region (name="") — so defer scoping is tracked
+// independently of arena regions. The drop helpers skip empty `name`s (no region ⇒ no drop emitted).
+typedef struct { const char *name; tk_str label; bool is_loop; size_t defer_base; } cg_block_region;   // a block region on the stack
 static cg_block_region g_cg_block_stack[TK_CG_MAX_BLOCK_REGIONS];
 static size_t          g_cg_block_depth   = 0;   // active block-body regions, innermost last
 static char            g_cg_block_names[TK_CG_MAX_BLOCK_REGIONS][24];   // backing store for `_tkbr<len>`
@@ -279,7 +284,9 @@ static bool                 g_cg_cur_block_is_value = false;
 static void cg_drop_block_regions_to(cbuf *b, const char *indent, tk_str label) {
     for (size_t k = g_cg_block_depth; k > 0; k -= 1) {
         cg_block_region r = g_cg_block_stack[k - 1];
-        cb(b, indent); cb(b, "tk_region_drop("); cb(b, r.name); cb(b, "); "); cb(b, r.name); cb(b, " = NULL;\n");
+        // (W9.3) a scope-block with no S2 region (name="") is on the stack only for defer scoping —
+        // it owns no arena, so emit no drop for it (skip), but it is still a crossable scope.
+        if (r.name[0] != '\0') { cb(b, indent); cb(b, "tk_region_drop("); cb(b, r.name); cb(b, "); "); cb(b, r.name); cb(b, " = NULL;\n"); }
         // Stop only AT a LOOP region (arm regions are always crossed): bare label → the innermost
         // loop; a named label → that loop. An arm region is dropped but never the break/continue target.
         bool is_target = r.is_loop && ((label.len == 0) || (r.label.len == label.len
@@ -293,8 +300,23 @@ static void cg_drop_block_regions_to(cbuf *b, const char *indent, tk_str label) 
 static void cg_drop_all_block_regions(cbuf *b, const char *indent) {
     for (size_t k = g_cg_block_depth; k > 0; k -= 1) {
         cg_block_region r = g_cg_block_stack[k - 1];
-        cb(b, indent); cb(b, "tk_region_drop("); cb(b, r.name); cb(b, "); "); cb(b, r.name); cb(b, " = NULL;\n");
+        if (r.name[0] != '\0') { cb(b, indent); cb(b, "tk_region_drop("); cb(b, r.name); cb(b, "); "); cb(b, r.name); cb(b, " = NULL;\n"); }   // (W9.3) skip region-less scopes
     }
+}
+
+// (W9.3) cg_target_defer_base — the defer base of the break/continue TARGET loop (the innermost loop
+// whose label matches `label`; bare label → innermost loop). Defers at index ≥ this base belong to
+// scopes the jump crosses (the target loop body inclusive + any arms inside it), so a break/continue
+// fires exactly [base, g_cg_ndefers) LIFO. Falls back to 0 if no matching loop is on the stack (the
+// checker guarantees a break/continue is inside a loop, so this is defensive).
+static size_t cg_target_defer_base(tk_str label) {
+    for (size_t k = g_cg_block_depth; k > 0; k -= 1) {
+        cg_block_region r = g_cg_block_stack[k - 1];
+        bool is_target = r.is_loop && ((label.len == 0) || (r.label.len == label.len
+            && memcmp(r.label.ptr, label.ptr, label.len) == 0));
+        if (is_target) return r.defer_base;
+    }
+    return 0;
 }
 
 // cg_same_named_struct — are `a` and `b` the SAME Named type? Gates the frame-local binding
@@ -331,6 +353,16 @@ static bool cg_block_has_block_local(const tk_tstatement *block, size_t bn, bool
             && tk_binding_is_block_local(g_cg_escaping, g_cg_fn_body, g_cg_fn_nbody, block, bn, is_value, block[i]))
             return true;
     }
+    return false;
+}
+
+// cg_block_has_top_defer — (W9.3) does block B have a TOP-LEVEL `defer`? A value-position arm/branch
+// with a defer but NO block-local binding takes the no-region path (want_block==false): it still must
+// fire its OWN defers AFTER the tail value is captured into the sink, then RESET the defer base so the
+// registered defer never leaks into later functions. Drives that no-region defer-firing below.
+static bool cg_block_has_top_defer(const tk_tstatement *block, size_t bn) {
+    for (size_t i = 0; i < bn; i += 1)
+        if (block[i].tag == TK_TSTMT_DEFER) return true;
     return false;
 }
 
@@ -986,7 +1018,8 @@ static bool cg_expr_diverges(const tk_texpr *e) {
 static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err);
 static bool emit_stmt(cbuf *b, const tk_tstatement *s, bool in_main,
                       tk_type ret_type, const char *indent, const char **err);
-static bool emit_defers(cbuf *b, const char *indent, const char **err);  // (C7.18) fwd
+static bool emit_defers(cbuf *b, const char *indent, size_t base, const char **err);  // (C7.18/W9.3) fwd
+static bool cg_stmt_c_terminates(const tk_tstatement *s);  // (W9.3) fwd — used by tail arm defer firing
 // W5b — emit `value` into a slot whose EXPECTED type is `expected`. When `expected` is a
 // (named) variant and `value`'s type is one of its case members, WRAP the value into the
 // variant's `tag + union` representation; otherwise emit the value plainly. (The VM needs
@@ -1067,6 +1100,10 @@ static bool emit_branch_value(cbuf *b, const tk_tstatement *body, size_t n, tk_t
                               const char *sink, const char *indent, const char **err) {
     bool want_block = cg_block_has_block_local(body, n, /*is_value=*/true)
                       && g_cg_block_depth < TK_CG_MAX_BLOCK_REGIONS;
+    // (W9.3) No-region path: a value-branch with a `defer` but no block-local binding still must fire
+    // its OWN defers AFTER the tail is captured, then reset the base so the defer never leaks forward.
+    size_t noblk_defer_base = g_cg_ndefers;
+    bool noblk_has_defer = !want_block && cg_block_has_top_defer(body, n);
     const char *region = "";
     const tk_tstatement *saved_blk = g_cg_cur_block; size_t saved_bn = g_cg_cur_block_n; bool saved_bv = g_cg_cur_block_is_value;
     if (want_block) {
@@ -1078,6 +1115,7 @@ static bool emit_branch_value(cbuf *b, const tk_tstatement *body, size_t n, tk_t
         g_cg_block_stack[g_cg_block_depth].name  = region;
         g_cg_block_stack[g_cg_block_depth].label = (tk_str){ .ptr = NULL, .len = 0 };
         g_cg_block_stack[g_cg_block_depth].is_loop = false;   // an ARM region is never a break/continue target
+        g_cg_block_stack[g_cg_block_depth].defer_base = g_cg_ndefers;   // (W9.3) defer scope base for this value-arm
         g_cg_block_depth += 1;
         // is_value=TRUE: a binding flowing into the tail value is NOT block-local (routes to enclosing).
         g_cg_cur_block = body; g_cg_cur_block_n = n; g_cg_cur_block_is_value = true;
@@ -1094,10 +1132,22 @@ static bool emit_branch_value(cbuf *b, const tk_tstatement *body, size_t n, tk_t
             return false;
         }
     if (want_block) {
-        // Tail is materialized into the enclosing `sink`; now drop the arm region (idempotent + nulled).
+        // (W9.3) The tail value is materialized into `sink`; now fire THIS value-arm's defers (LIFO)
+        // BEFORE dropping its region, then pop the defer scope and drop the arm region.
+        size_t vbase = g_cg_block_stack[g_cg_block_depth - 1].defer_base;
+        if (!emit_defers(b, indent, vbase, err)) { g_cg_block_depth -= 1; g_cg_cur_block = saved_blk; g_cg_cur_block_n = saved_bn; g_cg_cur_block_is_value = saved_bv; return false; }
+        g_cg_ndefers = vbase;
         cb(b, indent); cb(b, "tk_region_drop("); cb(b, region); cb(b, "); "); cb(b, region); cb(b, " = NULL;\n");
         g_cg_block_depth -= 1;
         g_cg_cur_block = saved_blk; g_cg_cur_block_n = saved_bn; g_cg_cur_block_is_value = saved_bv;
+    } else if (noblk_has_defer) {
+        // (W9.3) No region, but this value-branch registered defers: the tail is now in `sink`, so
+        // fire the branch's defers (LIFO) INSIDE the branch's stmt-expr scope (where the arm-locals
+        // are still declared), then RESET the base so nothing leaks into later branches/functions.
+        if (g_cg_ndefers > noblk_defer_base) {
+            if (!emit_defers(b, indent, noblk_defer_base, err)) return false;
+            g_cg_ndefers = noblk_defer_base;
+        }
     }
     return true;
 }
@@ -2883,6 +2933,10 @@ static bool emit_arm_value(cbuf *b, const tk_texpr *match_e, const tk_tstatement
     // (never a UAF). No block-local binding ⇒ no region ⇒ byte-identical to the pre-W9 value-arm output.
     bool want_block = cg_block_has_block_local(body, n, /*is_value=*/true)
                       && g_cg_block_depth < TK_CG_MAX_BLOCK_REGIONS;
+    // (W9.3) No-region path: a value-arm with a `defer` but no block-local binding still must fire its
+    // OWN defers AFTER the tail is captured, then reset the base so the defer never leaks forward.
+    size_t noblk_defer_base = g_cg_ndefers;
+    bool noblk_has_defer = !want_block && cg_block_has_top_defer(body, n);
     const char *region = "";
     const tk_tstatement *saved_blk = g_cg_cur_block; size_t saved_bn = g_cg_cur_block_n; bool saved_bv = g_cg_cur_block_is_value;
     if (want_block) {
@@ -2892,6 +2946,7 @@ static bool emit_arm_value(cbuf *b, const tk_texpr *match_e, const tk_tstatement
         g_cg_block_stack[g_cg_block_depth].name  = region;
         g_cg_block_stack[g_cg_block_depth].label = (tk_str){ .ptr = NULL, .len = 0 };
         g_cg_block_stack[g_cg_block_depth].is_loop = false;   // an ARM region is never a break/continue target
+        g_cg_block_stack[g_cg_block_depth].defer_base = g_cg_ndefers;   // (W9.3) defer scope base for this value-arm
         g_cg_block_depth += 1;
         g_cg_cur_block = body; g_cg_cur_block_n = n; g_cg_cur_block_is_value = true;
     }
@@ -2916,11 +2971,30 @@ static bool emit_arm_value(cbuf *b, const tk_texpr *match_e, const tk_tstatement
     } else if (!emit_as(b, match_e->type, &last->as.expr_stmt.expr, err)) { if (want_block) { g_cg_block_depth -= 1; g_cg_cur_block = saved_blk; g_cg_cur_block_n = saved_bn; g_cg_cur_block_is_value = saved_bv; } return false; }
     cb(b, ");");
     if (want_block) {
-        // Tail is materialized into the enclosing `sink`; drop the arm region BEFORE the `break`
-        // (idempotent + nulled for overlap safety) so the per-arm allocations are freed on commit.
-        cb(b, " tk_region_drop("); cb(b, region); cb(b, "); "); cb(b, region); cb(b, " = NULL;");
+        // (W9.3) Tail is materialized into `sink`. Fire THIS value-arm's defers (LIFO) if any —
+        // emitted on their own lines (only when present, so the no-defer output stays byte-identical
+        // to the pre-W9.3 inline form) — BEFORE dropping the arm region on `break` (idempotent + nulled).
+        size_t mvbase = g_cg_block_stack[g_cg_block_depth - 1].defer_base;
+        if (g_cg_ndefers > mvbase) {
+            cb(b, "\n");
+            if (!emit_defers(b, commit_indent, mvbase, err)) { g_cg_block_depth -= 1; g_cg_cur_block = saved_blk; g_cg_cur_block_n = saved_bn; g_cg_cur_block_is_value = saved_bv; return false; }
+            g_cg_ndefers = mvbase;
+            cb(b, commit_indent); cb(b, "tk_region_drop("); cb(b, region); cb(b, "); "); cb(b, region); cb(b, " = NULL;");
+        } else {
+            // No defers: keep the original inline ` tk_region_drop(…)` form (byte-identical to pre-W9.3).
+            cb(b, " tk_region_drop("); cb(b, region); cb(b, "); "); cb(b, region); cb(b, " = NULL;");
+        }
         g_cg_block_depth -= 1;
         g_cg_cur_block = saved_blk; g_cg_cur_block_n = saved_bn; g_cg_cur_block_is_value = saved_bv;
+    } else if (noblk_has_defer && g_cg_ndefers > noblk_defer_base) {
+        // (W9.3) No region, but this value-arm registered defers: the tail is now in `sink`, so fire
+        // the arm's defers (LIFO) INSIDE the arm's `{ … }` scope (where the arm-locals are still
+        // declared), BEFORE the `break`, then RESET the base so nothing leaks into later arms/functions.
+        cb(b, "\n");
+        if (!emit_defers(b, commit_indent, noblk_defer_base, err)) return false;
+        g_cg_ndefers = noblk_defer_base;
+        cb(b, commit_indent); cb(b, "break;\n");
+        return true;
     }
     cb(b, " break;\n");
     return true;
@@ -3017,9 +3091,20 @@ static bool emit_match_tail(cbuf *b, const tk_texpr *e, bool in_main,
         // trailing value becomes a `return`, and an explicit return/break/continue inside it
         // emits real C control flow (mirrors the VM running the arm block flow-aware).
         // MEM Step 1: frameless (an arm return leaks the frame region — SAFE), mirroring the Teko twin.
+        // (W9.3) The arm is a DEFER SCOPE: defers registered in it fire at the arm's exit. Record the
+        // defer base, emit the body, then fire `[base, ndefers)` LIFO BEFORE the commit `goto` (a
+        // `return` inside the arm already drained base 0 on its edge; a void fall-through arm fires
+        // here). Reset ndefers so sibling arms don't see this arm's defers.
+        size_t tarm_base = g_cg_ndefers;
         { const char *saved = g_cg_frame; g_cg_frame = "";
           bool ok = emit_block_tail(b, arm->body, arm->nbody, in_main, ret_type, ci, err);
           g_cg_frame = saved; if (!ok) return false; }
+        // Fire the arm's defers at its fall-through exit, UNLESS the arm's tail already C-terminated
+        // (a return/break/continue tail drained on its own edge) — that avoids a dead double-emit.
+        bool tarm_terminates = arm->nbody > 0 && cg_stmt_c_terminates(&arm->body[arm->nbody - 1]);
+        if (!tarm_terminates)
+            if (!emit_defers(b, ci, tarm_base, err)) return false;
+        g_cg_ndefers = tarm_base;
         // FIRST match wins → jump past the remaining arms. After a diverging body (return/exit/
         // panic) this is dead code (cc sees the generated C with `-w`); after a non-diverging
         // void body it is the line that stops later arms from also firing.
@@ -3110,28 +3195,40 @@ static bool emit_block(cbuf *b, const tk_tstatement *body, size_t n, bool in_mai
 // block-local binding ⇒ no region ⇒ byte-identical to emit_block (the pre-S2 statement-arm path).
 static bool emit_block_region(cbuf *b, const tk_tstatement *body, size_t n, bool in_main,
                               tk_type ret_type, const char *indent, const char **err) {
-    bool want_block = cg_block_has_block_local(body, n, /*is_value=*/false)
-                      && g_cg_block_depth < TK_CG_MAX_BLOCK_REGIONS;
-    if (!want_block) return emit_block(b, body, n, in_main, ret_type, indent, err);
-    // Open the arm region. Name by the buffer length at the creation point (the deterministic
-    // `_tkbr<len>` uniquifier — matches the Teko twin's out.len read without a counter).
-    snprintf(g_cg_block_names[g_cg_block_depth], sizeof g_cg_block_names[g_cg_block_depth], "_tkbr%zu", (size_t)b->len);
-    const char *region = g_cg_block_names[g_cg_block_depth];
-    cb(b, indent); cb(b, "tk_region *"); cb(b, region); cb(b, " = tk_region_new();\n");
-    g_cg_block_stack[g_cg_block_depth].name  = region;
+    // (W9.3) EVERY statement-arm is a DEFER SCOPE — even with no S2 region — so a defer inside the
+    // arm fires at the arm's exit (before the arm's region, if any, is dropped). Push a scope entry
+    // (region-less when there is no block-local: name="" ⇒ no arena, emits nothing) and record this
+    // scope's defer base. The capacity guard keeps the depth in bounds (overflow ⇒ no scope tracking,
+    // same fallback as S2). No defers + no region ⇒ byte-identical to the pre-W9.3 emit_block path.
+    if (g_cg_block_depth >= TK_CG_MAX_BLOCK_REGIONS) return emit_block(b, body, n, in_main, ret_type, indent, err);
+    bool want_block = cg_block_has_block_local(body, n, /*is_value=*/false);
+    const char *region = "";
+    if (want_block) {
+        // Open the arm region. Name by the buffer length at the creation point (the deterministic
+        // `_tkbr<len>` uniquifier — matches the Teko twin's out.len read without a counter).
+        snprintf(g_cg_block_names[g_cg_block_depth], sizeof g_cg_block_names[g_cg_block_depth], "_tkbr%zu", (size_t)b->len);
+        region = g_cg_block_names[g_cg_block_depth];
+        cb(b, indent); cb(b, "tk_region *"); cb(b, region); cb(b, " = tk_region_new();\n");
+    }
+    g_cg_block_stack[g_cg_block_depth].name  = region;   // "" ⇒ a region-less defer-only scope
     g_cg_block_stack[g_cg_block_depth].label = (tk_str){ .ptr = NULL, .len = 0 };
-    g_cg_block_stack[g_cg_block_depth].is_loop = false;   // an ARM region is never a break/continue target
+    g_cg_block_stack[g_cg_block_depth].is_loop = false;   // an ARM scope is never a break/continue target
+    g_cg_block_stack[g_cg_block_depth].defer_base = g_cg_ndefers;   // (W9.3) defers below this belong to enclosing scopes
     g_cg_block_depth += 1;
     // Emit the body with THIS block as the current block context (so block-local bindings route to
     // `region`) and the augmented region stack. emit_block clears g_cg_frame (sub-scope leaks the
     // frame — SAFE). Save/restore the prior block context for nesting.
     const tk_tstatement *saved_blk = g_cg_cur_block; size_t saved_bn = g_cg_cur_block_n; bool saved_bv = g_cg_cur_block_is_value;
-    g_cg_cur_block = body; g_cg_cur_block_n = n; g_cg_cur_block_is_value = false;
+    if (want_block) { g_cg_cur_block = body; g_cg_cur_block_n = n; g_cg_cur_block_is_value = false; }
     bool ok = emit_block(b, body, n, in_main, ret_type, indent, err);
     g_cg_cur_block = saved_blk; g_cg_cur_block_n = saved_bn; g_cg_cur_block_is_value = saved_bv;
     if (!ok) { g_cg_block_depth -= 1; return false; }
-    // Normal fall-through exit edge: drop the arm region (idempotent + nulled for overlap safety).
-    cb(b, indent); cb(b, "tk_region_drop("); cb(b, region); cb(b, "); "); cb(b, region); cb(b, " = NULL;\n");
+    // (W9.3) Normal fall-through exit edge: fire THIS arm's defers (LIFO) FIRST, then drop its region
+    // (so a defer body can still read the arm's block-locals), then pop the scope.
+    size_t base = g_cg_block_stack[g_cg_block_depth - 1].defer_base;
+    if (!emit_defers(b, indent, base, err)) { g_cg_block_depth -= 1; return false; }
+    g_cg_ndefers = base;   // (W9.3) these defers are now out of lexical scope
+    if (region[0] != '\0') { cb(b, indent); cb(b, "tk_region_drop("); cb(b, region); cb(b, "); "); cb(b, region); cb(b, " = NULL;\n"); }
     g_cg_block_depth -= 1;
     return true;
 }
@@ -3162,11 +3259,21 @@ static bool emit_exprstmt_tail(cbuf *b, const tk_texpr *x, bool in_main,
         // mirroring the Teko twin (frame="" into the tail-if branches). Keeps the first cut's drop
         // routing confined to the linear top-level path.
         const char *saved = g_cg_frame; g_cg_frame = "";
+        // (W9.3) each tail branch is a DEFER SCOPE: fire its defers at the branch's fall-through exit
+        // (before the closing `}`), unless its tail already C-terminated (drained on that edge).
+        size_t then_base = g_cg_ndefers;
         if (!emit_block_tail(b, x->as.if_expr.then_blk, x->as.if_expr.nthen, in_main, ret_type, inner, err))
             { g_cg_frame = saved; return false; }
+        bool then_term = x->as.if_expr.nthen > 0 && cg_stmt_c_terminates(&x->as.if_expr.then_blk[x->as.if_expr.nthen - 1]);
+        if (!then_term) { if (!emit_defers(b, inner, then_base, err)) { g_cg_frame = saved; return false; } }
+        g_cg_ndefers = then_base;
         cb(b, indent); cb(b, "} else {\n");
+        size_t else_base = g_cg_ndefers;
         if (!emit_block_tail(b, x->as.if_expr.else_blk, x->as.if_expr.nelse, in_main, ret_type, inner, err))
             { g_cg_frame = saved; return false; }
+        bool else_term = x->as.if_expr.nelse > 0 && cg_stmt_c_terminates(&x->as.if_expr.else_blk[x->as.if_expr.nelse - 1]);
+        if (!else_term) { if (!emit_defers(b, inner, else_base, err)) { g_cg_frame = saved; return false; } }
+        g_cg_ndefers = else_base;
         g_cg_frame = saved;
         cb(b, indent); cb(b, "}\n");
         return true;
@@ -3179,12 +3286,14 @@ static bool emit_exprstmt_tail(cbuf *b, const tk_texpr *x, bool in_main,
         cb(b, indent);
         if (!emit_expr(b, x, err)) return false;
         cb(b, ";\n");
-        // (C7.18) Drain defers at the end of a void-returning function body.
-        if (!emit_defers(b, indent, err)) return false;
+        // (C7.18/W9.3) Drain the FUNCTION-BODY defers (base 0) at the end of a void-returning body.
+        // Inner-scope defers already fired+popped at their own scope exits, so g_cg_ndefers is now
+        // only the function-body-level defers here.
+        if (!emit_defers(b, indent, 0, err)) return false;
         return true;
     }
-    // (C7.18) Drain defers before the implicit trailing-value return.
-    if (!emit_defers(b, indent, err)) return false;
+    // (C7.18/W9.3) Drain function-body defers (base 0) before the implicit trailing-value return.
+    if (!emit_defers(b, indent, 0, err)) return false;
     // MEM Step 1: the tail value-return EDGE — drop the frame region before the implicit `return`
     // (a return value is escaping, so it never references a frame-local cell).
     if (g_cg_frame[0] != '\0' && !in_main) { cb(b, indent); cb(b, "tk_region_drop("); cb(b, g_cg_frame); cb(b, ");\n"); }
@@ -3244,12 +3353,14 @@ static bool emit_if_stmt(cbuf *b, const tk_texpr *e, bool in_main,
     return true;
 }
 
-// (C7.18) Emit all accumulated deferred blocks in LIFO order (last registered runs first).
-// Called before every `return` statement and before the implicit trailing-value exit.
-static bool emit_defers(cbuf *b, const char *indent, const char **err) {
-    if (g_cg_ndefers == 0) return true;
+// (C7.18/W9.3) Emit the deferred blocks at index ≥ `base` in LIFO order (most-recent / innermost
+// first). A SCOPE-block fires `[its defer_base, g_cg_ndefers)` at its exit edge (fall-through);
+// break/continue fires `[target-loop defer_base, g_cg_ndefers)`; `return` fires `[0, g_cg_ndefers)`
+// (all enclosing scopes, innermost-first — one LIFO sweep). Each defer body is emitted at the exit
+// edge's indent, exactly like the pre-W9.3 function-wide drain (base 0 reproduces it byte-for-byte).
+static bool emit_defers(cbuf *b, const char *indent, size_t base, const char **err) {
     size_t i = g_cg_ndefers;
-    while (i > 0) {
+    while (i > base) {
         i -= 1;
         const tk_tstatement *ds = g_cg_defers[i];
         for (size_t j = 0; j < ds->as.defer_stmt.nbody; j += 1) {
@@ -3333,10 +3444,11 @@ static bool emit_stmt(cbuf *b, const tk_tstatement *s, bool in_main,
         }
 
         case TK_TSTMT_RETURN: {
-            // (C7.18) Drain the defer stack LIFO before returning.
-            if (!emit_defers(b, indent, err)) return false;
-            // S2 — a `return` leaves EVERY enclosing loop, so drop all active block regions first
+            // (C7.18/W9.3) A `return` leaves EVERY enclosing scope: fire ALL in-scope defers
+            // (base 0) LIFO — one sweep = innermost-block-first across all nesting — BEFORE dropping
+            // any region, so a defer body can still read any block-local. THEN drop all block regions
             // (innermost-first), THEN the frame region. The return value is escaping ⇒ in root ⇒ safe.
+            if (!emit_defers(b, indent, 0, err)) return false;
             cg_drop_all_block_regions(b, indent);
             // MEM Step 1: drop the frame region on the return EDGE (before evaluating the value — a
             // return value is ESCAPING, so by the escape check it never references a frame-local
@@ -3362,7 +3474,12 @@ static bool emit_stmt(cbuf *b, const tk_tstatement *s, bool in_main,
         }
 
         case TK_TSTMT_DEFER: {
-            // (C7.18) Register the deferred block; execute it later (LIFO) before every exit.
+            // (C7.18/W9.3) Register the deferred block onto the per-function stack (emits nothing
+            // inline). It fires LIFO at its SCOPE's exit edge — the enclosing scope-block records its
+            // defer_base and fires `[base, ndefers)` at fall-through/break/continue, a return fires
+            // all `[0, ndefers)`. The .tks twin mirrors this per-block scheme (a threaded DeferCtx +
+            // per-block defer_base, firing the same `[base, ndefers)` at each exit edge) and emits
+            // byte-identical C — including nested (scope-level) defers in loops/arms.
             if (g_cg_ndefers >= TK_CG_MAX_DEFERS)
                 return fail_node(err, "codegen: too many defer blocks in a single function (limit 256)");
             g_cg_defers[g_cg_ndefers++] = s;
@@ -3398,18 +3515,27 @@ static bool emit_stmt(cbuf *b, const tk_tstatement *s, bool in_main,
             // `continue L`'s goto re-runs tk_region_new — a fresh region every iteration) and dropped
             // at every exit edge (fall-through below; break/continue/return via the drop helpers). A
             // loop with NO block-local binding opens no region → byte-identical to the pre-S2 output.
+            // (W9.3) The loop body is ALWAYS a DEFER SCOPE (and a break/continue target) — even with
+            // no S2 region — so a defer inside the loop fires at EACH iteration's end (fall-through),
+            // on break/continue, and on return. Push a scope entry (region-less ⇒ name="" ⇒ no arena,
+            // emits nothing) and record this iteration's defer base. The capacity guard preserves the
+            // S2 fallback (no scope tracking) on overflow. No defers + no region ⇒ byte-identical.
             bool want_block = cg_block_has_block_local(s->as.loop_stmt.body, s->as.loop_stmt.nbody, /*is_value=*/false);
             const char *region = "";
-            if (want_block && g_cg_block_depth < TK_CG_MAX_BLOCK_REGIONS) {
-                // Name the region by the buffer length at the creation point — the SAME deterministic
-                // uniquifier the `_bx<len>` boxes use, so the Teko twin (which reads out.len) produces
-                // byte-identical names without threading a counter through its functional emitter.
-                snprintf(g_cg_block_names[g_cg_block_depth], sizeof g_cg_block_names[g_cg_block_depth], "_tkbr%zu", (size_t)b->len);
-                region = g_cg_block_names[g_cg_block_depth];
-                cb(b, inner); cb(b, "tk_region *"); cb(b, region); cb(b, " = tk_region_new();\n");
-                g_cg_block_stack[g_cg_block_depth].name  = region;
+            bool pushed = g_cg_block_depth < TK_CG_MAX_BLOCK_REGIONS;
+            if (pushed) {
+                if (want_block) {
+                    // Name the region by the buffer length at the creation point — the SAME deterministic
+                    // uniquifier the `_bx<len>` boxes use, so the Teko twin (which reads out.len) produces
+                    // byte-identical names without threading a counter through its functional emitter.
+                    snprintf(g_cg_block_names[g_cg_block_depth], sizeof g_cg_block_names[g_cg_block_depth], "_tkbr%zu", (size_t)b->len);
+                    region = g_cg_block_names[g_cg_block_depth];
+                    cb(b, inner); cb(b, "tk_region *"); cb(b, region); cb(b, " = tk_region_new();\n");
+                }
+                g_cg_block_stack[g_cg_block_depth].name  = region;   // "" ⇒ a region-less defer-only loop scope
                 g_cg_block_stack[g_cg_block_depth].label = lbl;
-                g_cg_block_stack[g_cg_block_depth].is_loop = true;   // a loop region IS a break/continue target
+                g_cg_block_stack[g_cg_block_depth].is_loop = true;   // a loop scope IS a break/continue target
+                g_cg_block_stack[g_cg_block_depth].defer_base = g_cg_ndefers;   // (W9.3) per-iteration defer base
                 g_cg_block_depth += 1;
             }
             // Emit the body with THIS block as the current block context (so block-local bindings
@@ -3421,11 +3547,15 @@ static bool emit_stmt(cbuf *b, const tk_tstatement *s, bool in_main,
             // carries the per-block drops independently of g_cg_frame.
             bool ok = emit_block(b, s->as.loop_stmt.body, s->as.loop_stmt.nbody, in_main, ret_type, inner, err);
             g_cg_cur_block = saved_blk; g_cg_cur_block_n = saved_bn; g_cg_cur_block_is_value = saved_bv; g_cg_frame = saved_frame;
-            if (!ok) { if (region[0] != '\0') g_cg_block_depth -= 1; return false; }
-            // S2 — fall-through exit edge (end of an iteration): drop this loop body's region (the
-            // next iteration's tk_region_new opens a fresh one). Idempotent + nulled for overlap.
-            if (region[0] != '\0') {
-                cb(b, inner); cb(b, "tk_region_drop("); cb(b, region); cb(b, "); "); cb(b, region); cb(b, " = NULL;\n");
+            if (!ok) { if (pushed) g_cg_block_depth -= 1; return false; }
+            // (W9.3) Fall-through exit edge (end of an iteration): fire THIS iteration's defers (LIFO)
+            // FIRST, then drop the loop body's region (the next iteration opens a fresh one) — so a
+            // defer body can still read this iteration's block-locals. Then pop the scope.
+            if (pushed) {
+                size_t base = g_cg_block_stack[g_cg_block_depth - 1].defer_base;
+                if (!emit_defers(b, inner, base, err)) { g_cg_block_depth -= 1; return false; }
+                g_cg_ndefers = base;   // (W9.3) per-iteration defers go out of scope at the iteration's end
+                if (region[0] != '\0') { cb(b, inner); cb(b, "tk_region_drop("); cb(b, region); cb(b, "); "); cb(b, region); cb(b, " = NULL;\n"); }
                 g_cg_block_depth -= 1;
             }
             cb(b, indent); cb(b, "}\n");
@@ -3435,17 +3565,22 @@ static bool emit_stmt(cbuf *b, const tk_tstatement *s, bool in_main,
         }
 
         case TK_TSTMT_BREAK:
-            // S2 — `break` exits its target loop: drop every block region from the top of the stack
-            // down to & including that loop's region (innermost-first) BEFORE the jump. NOT the frame,
-            // NOT regions outside the target loop.
+            // (W9.3) `break` crosses every scope from here down to & including its target loop body:
+            // fire those scopes' defers (base = the target loop's defer_base) LIFO — one sweep =
+            // innermost-block-first — BEFORE dropping their regions. S2 — then drop every block region
+            // from the top down to & including that loop's region. NOT the frame, NOT outer regions.
+            if (!emit_defers(b, indent, cg_target_defer_base(s->as.jump.label), err)) return false;
             cg_drop_block_regions_to(b, indent, s->as.jump.label);
             cb(b, indent);
             if (s->as.jump.label.len > 0) { cb(b, "goto tk_lbl_"); cb_str(b, s->as.jump.label); cb(b, "_break;\n"); }
             else                          { cb(b, "break;\n"); }
             return true;
         case TK_TSTMT_CONTINUE:
-            // S2 — `continue` restarts its target loop's body: drop every block region from the top
-            // down to & including that loop's region (the next iteration opens a fresh one).
+            // (W9.3) `continue` ends THIS iteration of its target loop: fire every crossed scope's
+            // defers (base = the target loop's defer_base) LIFO BEFORE dropping their regions, so a
+            // loop-body defer fires at each iteration end (incl. on `continue`). S2 — then drop every
+            // block region from the top down to & including that loop's region (next iter opens fresh).
+            if (!emit_defers(b, indent, cg_target_defer_base(s->as.jump.label), err)) return false;
             cg_drop_block_regions_to(b, indent, s->as.jump.label);
             cb(b, indent);
             if (s->as.jump.label.len > 0) { cb(b, "goto tk_lbl_"); cb_str(b, s->as.jump.label); cb(b, "_cont;\n"); }
@@ -3519,6 +3654,18 @@ static bool emit_function(cbuf *b, tk_tfunction f, const char **err) {
     // W5b — thread the fn's return type so a tail/return case value is wrapped into a
     // variant return slot (emit_as).
     if (!emit_block_tail(b, f.body, f.nbody, /*in_main=*/false, f.return_type, "    ", err)) { g_cg_frame = ""; return false; }
+    // (W9.3) FN-BODY FALL-THROUGH defers. When control can fall off the function's end and the tail is
+    // NOT an expr-statement (a binding/assign/loop tail — an expr-stmt tail already drained via
+    // emit_exprstmt_tail; a return/break/continue tail already drained on its edge), fire the
+    // remaining fn-body-level defers (base 0) here, BEFORE the frame-region drop. Without this, a
+    // void function ending in an assign would never run its top-level defers (VM drains at the body's
+    // exec_block end → this restores VM==native). No defers ⇒ emits nothing.
+    {
+        bool tail_is_expr = f.nbody > 0 && f.body[f.nbody - 1].tag == TK_TSTMT_EXPR;
+        bool tail_terminates = f.nbody > 0 && cg_stmt_c_terminates(&f.body[f.nbody - 1]);
+        if (!tail_is_expr && !tail_terminates)
+            if (!emit_defers(b, "    ", 0, err)) { g_cg_frame = ""; return false; }
+    }
     // MEM Step 1 — the FALL-THROUGH exit edge. If control can reach the function's end (the tail did
     // not C-terminate), drop the frame region there too (tk_region_drop is idempotent — no double-free
     // against a return-edge drop on another path).
