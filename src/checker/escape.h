@@ -32,4 +32,13 @@ bool tk_escape_set_has(tk_escape_set set, tk_str name);
 // NOT frame-local (allocates in root, the safe default).
 bool tk_binding_is_frame_local(tk_escape_set set, tk_tstatement binding);
 
+// tk_binding_is_block_local — S2: may a binding declared at the TOP LEVEL of block B (whose
+// enclosing function body is fn_body, and which yields a value iff is_value) be freed at B's exit
+// edges? True iff tk_binding_is_frame_local holds AND every textual read of the name in the whole
+// function is a SAFE non-tail/non-assign read strictly inside B. CONSERVATIVE — any read outside B,
+// in B's tail value, or as an assignment RHS ⇒ false ⇒ route to the enclosing region (W8 default).
+bool tk_binding_is_block_local(tk_escape_set set, const tk_tstatement *fn_body, size_t fn_n,
+                               const tk_tstatement *block_body, size_t block_n, bool is_value,
+                               tk_tstatement binding);
+
 #endif // TK_CHECK_ESCAPE_H

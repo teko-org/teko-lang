@@ -1398,6 +1398,81 @@ fn escape_tail_safe_field_coalesce_is_escaping() {
     teko::assert::is_true(!binding_is_frame_local(esc, binding))
 }
 
+// =========================================================================
+// S2 — THE PER-BLOCK ESCAPE CHECK (escape.tks::binding_is_block_local). A binding declared in a
+// scope-introducing BLOCK may be freed at the block's exit edges ONLY when every read of it in the
+// whole function is a SAFE non-tail/non-assign read strictly inside that block. SECURITY-FIRST:
+// any read outside B, in B's tail value, or as an assignment RHS ⇒ NOT block-local (route to the
+// enclosing region — a leak is safe, a use-after-free is NEVER).
+// =========================================================================
+
+#test
+fn block_local_read_only_inside_block_is_block_local() {
+    // fn f() -> i64 { mut t=0; loop { let n = Node{val=5}; let g = n.val; t = t+g; break }; t }
+    // `n` is declared in the LOOP body and read ONLY via a scalar field copy inside it (non-tail,
+    // non-assign) ⇒ block-local ⇒ the loop body region may free it per-iteration.
+    let binding = t_let("n", t_node_init(tnum(5)))
+    mut loopbody: []TStatement = teko::list::push(teko::list::empty(), binding)
+    loopbody = teko::list::push(loopbody, t_let("g", t_field_i64("n", "val")))   // let g = n.val (scalar copy)
+    loopbody = teko::list::push(loopbody, TBreakStmt { label = "" })
+    let loopstmt = TLoopStmt { label = ""; body = loopbody }
+    mut body: []TStatement = teko::list::push(teko::list::empty(), t_let("t", t_node_init(tnum(0))))
+    body = teko::list::push(body, loopstmt)
+    body = teko::list::push(body, treturn(t_field_i64("t", "val")))
+    let f = plainfn("f", i64t(), body)
+    let esc = fn_escaping_vars(f)
+    // n is NOT function-escaping (only a scalar copy is read) AND only read inside the loop body.
+    teko::assert::is_true(binding_is_block_local(esc, f.body, loopbody, false, binding))
+}
+
+#test
+fn block_local_read_outside_block_is_not_block_local() {
+    // The SAME `n` binding, but read AGAIN OUTSIDE the loop body (a scalar copy in the fn tail).
+    // A read outside B ⇒ NOT block-local (must outlive the block) ⇒ route to the enclosing region.
+    let binding = t_let("n", t_node_init(tnum(5)))
+    mut loopbody: []TStatement = teko::list::push(teko::list::empty(), binding)
+    loopbody = teko::list::push(loopbody, t_let("g", t_field_i64("n", "val")))
+    loopbody = teko::list::push(loopbody, TBreakStmt { label = "" })
+    let loopstmt = TLoopStmt { label = ""; body = loopbody }
+    mut body: []TStatement = teko::list::push(teko::list::empty(), loopstmt)
+    body = teko::list::push(body, treturn(t_field_i64("n", "val")))   // reads `n` OUTSIDE the loop
+    let f = plainfn("f", i64t(), body)
+    let esc = fn_escaping_vars(f)
+    teko::assert::is_true(!binding_is_block_local(esc, f.body, loopbody, false, binding))
+}
+
+#test
+fn block_local_assigned_to_outer_var_is_not_block_local() {
+    // fn f() { mut acc=Node{…}; loop { let cur = Node{…}; acc = cur; break }; acc.val }
+    // `cur` is assigned to an OUTER-declared mut (`acc`) ⇒ it may outlive the loop body ⇒ NOT
+    // block-local (the assignment RHS is excluded from the safe-inside reads — UAF trap rule 4).
+    let cur = t_let("cur", t_node_init(tnum(1)))
+    mut loopbody: []TStatement = teko::list::push(teko::list::empty(), cur)
+    loopbody = teko::list::push(loopbody, TAssign { name = "acc"; op = lexer::TokenKind::Assign; bound = Named { name = "Node" }; value = tvar("cur", Named { name = "Node" }); deref = false })
+    loopbody = teko::list::push(loopbody, TBreakStmt { label = "" })
+    let loopstmt = TLoopStmt { label = ""; body = loopbody }
+    mut body: []TStatement = teko::list::push(teko::list::empty(), t_let("acc", t_node_init(tnum(0))))
+    body = teko::list::push(body, loopstmt)
+    body = teko::list::push(body, treturn(t_field_i64("acc", "val")))
+    let f = plainfn("f", i64t(), body)
+    let esc = fn_escaping_vars(f)
+    teko::assert::is_true(!binding_is_block_local(esc, f.body, loopbody, false, cur))
+}
+
+#test
+fn block_local_arm_tail_value_is_not_block_local() {
+    // A value-yielding block (is_value=true) whose TAIL value is the bare binding `p` — the value
+    // is used OUTSIDE the block (an if/match value) ⇒ NOT block-local (the UAF trap rule 3). Here
+    // the block IS the function body, so `p` is also function-escaping; either gate (frame-local or
+    // the tail-read exclusion) yields the correct, security-first answer: NOT block-local.
+    let binding = t_let("p", t_node_init(tnum(5)))
+    mut blk: []TStatement = teko::list::push(teko::list::empty(), binding)
+    blk = teko::list::push(blk, texpr_stmt(tvar("p", Named { name = "Node" })))   // tail value = p
+    let f = plainfn("f", i64t(), blk)
+    let esc = fn_escaping_vars(f)
+    teko::assert::is_true(!binding_is_block_local(esc, f.body, blk, true, binding))
+}
+
 #test
 fn escape_tail_scalar_implicit_return_stays_frame_local() {
     // fn f() -> i64 { let n = Node { val = 5; next = n }; n.val }

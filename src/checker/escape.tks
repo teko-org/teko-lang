@@ -312,3 +312,189 @@ pub fn binding_is_frame_local(escaping: []str, b: TBinding) -> bool {
         _           => false
     }
 }
+
+// ── S2 — PER-BLOCK escape (block-local freeing). ──────────────────────────────
+// W8 frees only a per-FUNCTION subset; S2 lets a scope-introducing BLOCK (a loop body, an
+// if-then/else block, a match arm) free its OWN provably-block-local allocations at the block's
+// every exit edge. The SAFETY INVARIANT is identical and absolute: when in ANY doubt route the
+// binding to the ENCLOSING region (behave as W8 — a leak is safe, a use-after-free is NEVER).
+//
+// THE BLOCK-ESCAPE CONDITION (security-first, conservative): a binding `x` declared directly in
+// block B may be freed at B's exit ONLY IF every textual READ of `x` in the whole function is a
+// read in a NON-TAIL position strictly inside B. We prove this by counting reads:
+//   total reads of `x` in the function body == non-tail reads of `x` inside B.
+// Any read OUTSIDE B, or a read in B's TAIL value (an arm/if value used outside B — the UAF trap),
+// makes the counts differ ⇒ x is treated as block-ESCAPING ⇒ routed to the enclosing region. This
+// single condition subsumes all four prompt rules: (2) function-escape (those reads sit in escaping
+// positions OUTSIDE B too — actually they may be inside B, but binding_is_frame_local already gates
+// (1)+(2)); (3) arm/if tail-value escape (the tail read is excluded from the inside count); (4)
+// `outerVar = x` (the read sits in an assignment whose statement is inside B but the WRITE escapes —
+// to stay sound we also treat a read flowing into ANY assignment RHS as escaping by NOT excluding
+// assignment statements from the "tail/escaping" reads). Shadowed/same-named siblings just lose the
+// optimization (counts differ) — never unsafe.
+
+// count_reads_expr — total count of bare-variable reads of `name` anywhere in `e` (every position;
+// no escaping refinement — a read is a read for reachability purposes).
+fn count_reads_expr(e: TExpr, name: str) -> i64 {
+    match e.kind {
+        TVar as v => if v.name == name { 1 } else { 0 }
+        TNumber  => 0
+        TStrLit  => 0
+        TByteLit => 0
+        TBoolLit => 0
+        TNullLit => 0
+        TPathExpr => 0
+        TBinary as b => count_reads_expr(b.left, name) + count_reads_expr(b.right, name)
+        TUnary as u  => count_reads_expr(u.operand, name)
+        TCompare as c => {
+            mut n = count_reads_expr(c.first, name)
+            mut i = 0
+            loop {
+                if i >= c.rest.len { break }
+                n = n + count_reads_expr(c.rest[i].operand, name)
+                i++
+            }
+            n
+        }
+        TCall as call => {
+            mut n: i64 = 0
+            mut i = 0
+            loop {
+                if i >= call.args.len { break }
+                n = n + count_reads_expr(call.args[i], name)
+                i++
+            }
+            n
+        }
+        TIfExpr as f => {
+            mut n = count_reads_expr(f.cond, name)
+            n = n + count_reads_block(f.then_blk, name)
+            if f.has_else { n = n + count_reads_block(f.else_blk, name) }
+            n
+        }
+        TMatchExpr as m => {
+            mut n = count_reads_expr(m.subject, name)
+            mut i = 0
+            loop {
+                if i >= m.arms.len { break }
+                if m.arms[i].has_when { n = n + count_reads_expr(m.arms[i].guard, name) }
+                n = n + count_reads_block(m.arms[i].body, name)
+                i++
+            }
+            n
+        }
+        TCast as ct => count_reads_expr(ct.expr, name)
+        TFieldAccess as fa => count_reads_expr(fa.receiver, name)
+        TSafeFieldAccess as sfa => count_reads_expr(sfa.receiver, name)
+        TCoalesce as co => count_reads_expr(co.left, name) + count_reads_expr(co.right, name)
+        TIndex as ix => count_reads_expr(ix.receiver, name) + count_reads_expr(ix.index, name)
+        TStructInit as si => {
+            mut n: i64 = 0
+            mut i = 0
+            loop {
+                if i >= si.field_vals.len { break }
+                n = n + count_reads_expr(si.field_vals[i], name)
+                i++
+            }
+            n
+        }
+        TArrayLit as al => {
+            mut n: i64 = 0
+            mut i = 0
+            loop {
+                if i >= al.elements.len { break }
+                n = n + count_reads_expr(al.elements[i].expr, name)
+                i++
+            }
+            n
+        }
+        TInterp as ip => {
+            mut n: i64 = 0
+            mut i = 0
+            loop {
+                if i >= ip.holes.len { break }
+                n = n + count_reads_expr(ip.holes[i], name)
+                i++
+            }
+            n
+        }
+        TInExpr as ine => {
+            mut n = count_reads_expr(ine.lhs, name)
+            mut i = 0
+            loop {
+                if i >= ine.elems.len { break }
+                n = n + count_reads_expr(ine.elems[i], name)
+                i++
+            }
+            n
+        }
+    }
+}
+
+// count_reads_stmt — total reads of `name` in one statement (all sub-positions).
+fn count_reads_stmt(s: TStatement, name: str) -> i64 {
+    match s {
+        TBinding as b   => count_reads_expr(b.value, name)
+        TAssign as a    => count_reads_expr(a.value, name)
+        TReturn as r    => if r.has_value { count_reads_expr(r.value, name) } else { 0 }
+        TExprStmt as es => count_reads_expr(es.expr, name)
+        TLoopStmt as l  => count_reads_block(l.body, name)
+        TBreakStmt      => 0
+        TContinueStmt   => 0
+        TDeferStmt as d => count_reads_block(d.body, name)
+    }
+}
+
+// count_reads_block — total reads of `name` across every statement of a block.
+fn count_reads_block(body: []TStatement, name: str) -> i64 {
+    mut n: i64 = 0
+    mut i = 0
+    loop {
+        if i >= body.len { break }
+        n = n + count_reads_stmt(body[i], name)
+        i++
+    }
+    n
+}
+
+// count_block_local_reads — reads of `name` strictly inside block B that are SAFE to free past:
+// every read EXCEPT (a) the block's TAIL value when B yields a value (an arm/if value used outside
+// B), and (b) any read that is the RHS of an ASSIGN statement (could write to an enclosing var).
+// A binding's own initializer never reads its own name, so the binding statement contributes 0.
+fn count_block_local_reads(body: []TStatement, name: str, is_value: bool) -> i64 {
+    mut n: i64 = 0
+    mut i = 0
+    loop {
+        if i >= body.len { break }
+        let is_last = i + 1 == body.len
+        match body[i] {
+            // an assignment RHS may flow into an ENCLOSING-scope variable → treat as escaping
+            // (do NOT count as a safe inside read), so `outerVar = x` blocks block-local freeing.
+            TAssign => { }
+            TExprStmt as es => {
+                // the block's TAIL expr-statement is the block VALUE when B yields one → escaping.
+                if is_value && is_last { } else { n = n + count_reads_expr(es.expr, name) }
+            }
+            _ => { n = n + count_reads_stmt(body[i], name) }
+        }
+        i++
+    }
+    n
+}
+
+// binding_is_block_local — may binding `b` (declared at the TOP LEVEL of block B, whose enclosing
+// function body is `fn_body`, and which yields a value iff `is_value`) be freed at B's exit edges?
+// True iff binding_is_frame_local holds (struct-init, simple non-escaping name) AND every textual
+// read of the name in the WHOLE function is a SAFE non-tail/non-assign read strictly inside B.
+// CONSERVATIVE: any read outside B, in B's tail value, or as an assignment RHS ⇒ false ⇒ route to
+// the enclosing region (the W8/leak-safe default). PUBLIC — both codegen engines read it.
+pub fn binding_is_block_local(escaping: []str, fn_body: []TStatement, block_body: []TStatement, is_value: bool, b: TBinding) -> bool {
+    if !binding_is_frame_local(escaping, b) { return false }
+    let name = match b.target {
+        parser::SimpleName as sn   => sn.name
+        parser::DestructurePattern => return false
+    }
+    let total = count_reads_block(fn_body, name)
+    let inside = count_block_local_reads(block_body, name, is_value)
+    total == inside
+}

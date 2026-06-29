@@ -240,3 +240,148 @@ bool tk_binding_is_frame_local(tk_escape_set set, tk_tstatement binding) {
     if (esc_set_has(set, name)) return false;
     return binding.as.binding.value.tag == TK_TEXPR_STRUCT_INIT;
 }
+
+// ── S2 — PER-BLOCK escape (block-local freeing). C twin of escape.tks. ──────────
+// A binding `x` declared at the top level of block B may be freed at B's every exit edge ONLY IF
+// every textual READ of `x` in the whole function is a SAFE non-tail/non-assign read strictly
+// inside B. Counting proves it: total reads in the fn == safe reads inside B. Any read outside B,
+// in B's tail value, or as an assignment RHS ⇒ block-ESCAPING ⇒ route to the enclosing region
+// (the W8/leak-safe default). SOUNDNESS IS ABSOLUTE — a leak is safe, a use-after-free is not.
+static bool name_eq_str(tk_str a, tk_str b) {
+    return a.len == b.len && (a.len == 0 || memcmp(a.ptr, b.ptr, a.len) == 0);
+}
+
+static size_t count_reads_block(const tk_tstatement *body, size_t n, tk_str name);
+
+// count_reads_expr — total bare-variable reads of `name` anywhere in `e` (every position).
+static size_t count_reads_expr(tk_texpr e, tk_str name) {
+    switch (e.tag) {
+        case TK_TEXPR_VAR:
+            return name_eq_str(e.as.var.name, name) ? 1 : 0;
+        case TK_TEXPR_NUMBER:
+        case TK_TEXPR_STR:
+        case TK_TEXPR_BYTE:
+        case TK_TEXPR_BOOL:
+        case TK_TEXPR_NULL:
+        case TK_TEXPR_PATH:
+            return 0;
+        case TK_TEXPR_BINARY:
+            return count_reads_expr(*e.as.binary.left, name) + count_reads_expr(*e.as.binary.right, name);
+        case TK_TEXPR_UNARY:
+            return count_reads_expr(*e.as.unary.operand, name);
+        case TK_TEXPR_COMPARE: {
+            size_t n = count_reads_expr(*e.as.compare.first, name);
+            for (size_t i = 0; i < e.as.compare.nrest; i += 1)
+                n += count_reads_expr(*e.as.compare.rest[i].operand, name);
+            return n;
+        }
+        case TK_TEXPR_CALL: {
+            size_t n = 0;
+            for (size_t i = 0; i < e.as.call.nargs; i += 1)
+                n += count_reads_expr(e.as.call.args[i], name);
+            return n;
+        }
+        case TK_TEXPR_IF: {
+            size_t n = count_reads_expr(*e.as.if_expr.cond, name);
+            n += count_reads_block(e.as.if_expr.then_blk, e.as.if_expr.nthen, name);
+            if (e.as.if_expr.has_else)
+                n += count_reads_block(e.as.if_expr.else_blk, e.as.if_expr.nelse, name);
+            return n;
+        }
+        case TK_TEXPR_MATCH: {
+            size_t n = count_reads_expr(*e.as.match_expr.subject, name);
+            for (size_t i = 0; i < e.as.match_expr.narms; i += 1) {
+                if (e.as.match_expr.arms[i].has_when)
+                    n += count_reads_expr(*e.as.match_expr.arms[i].guard, name);
+                n += count_reads_block(e.as.match_expr.arms[i].body, e.as.match_expr.arms[i].nbody, name);
+            }
+            return n;
+        }
+        case TK_TEXPR_CAST:
+            return count_reads_expr(*e.as.cast.expr, name);
+        case TK_TEXPR_FIELD_ACCESS:
+            return count_reads_expr(*e.as.field_access.receiver, name);
+        case TK_TEXPR_SAFE_FIELD_ACCESS:
+            return count_reads_expr(*e.as.safe_field_access.receiver, name);
+        case TK_TEXPR_COALESCE:
+            return count_reads_expr(*e.as.coalesce.left, name) + count_reads_expr(*e.as.coalesce.right, name);
+        case TK_TEXPR_INDEX:
+            return count_reads_expr(*e.as.index.receiver, name) + count_reads_expr(*e.as.index.index, name);
+        case TK_TEXPR_STRUCT_INIT: {
+            size_t n = 0;
+            for (size_t i = 0; i < e.as.struct_init.nfields; i += 1)
+                n += count_reads_expr(e.as.struct_init.field_vals[i], name);
+            return n;
+        }
+        case TK_TEXPR_ARRAY: {
+            size_t n = 0;
+            for (size_t i = 0; i < e.as.array.nelements; i += 1)
+                n += count_reads_expr(e.as.array.elements[i], name);
+            return n;
+        }
+        case TK_TEXPR_INTERP: {
+            size_t n = 0;
+            for (size_t i = 0; i < e.as.interp.nholes; i += 1)
+                n += count_reads_expr(e.as.interp.holes[i], name);
+            return n;
+        }
+        case TK_TEXPR_IN: {
+            size_t n = count_reads_expr(*e.as.in_expr.lhs, name);
+            for (size_t i = 0; i < e.as.in_expr.nelems; i += 1)
+                n += count_reads_expr(e.as.in_expr.elems[i], name);
+            return n;
+        }
+    }
+    return 0;
+}
+
+// count_reads_stmt — total reads of `name` in one statement (all sub-positions).
+static size_t count_reads_stmt(tk_tstatement s, tk_str name) {
+    switch (s.tag) {
+        case TK_TSTMT_BINDING:  return count_reads_expr(s.as.binding.value, name);
+        case TK_TSTMT_ASSIGN:   return count_reads_expr(s.as.assign.value, name);
+        case TK_TSTMT_RETURN:   return s.as.ret.has_value ? count_reads_expr(s.as.ret.value, name) : 0;
+        case TK_TSTMT_EXPR:     return count_reads_expr(s.as.expr_stmt.expr, name);
+        case TK_TSTMT_LOOP:     return count_reads_block(s.as.loop_stmt.body, s.as.loop_stmt.nbody, name);
+        case TK_TSTMT_BREAK:
+        case TK_TSTMT_CONTINUE: return 0;
+        case TK_TSTMT_DEFER:    return count_reads_block(s.as.defer_stmt.body, s.as.defer_stmt.nbody, name);
+    }
+    return 0;
+}
+
+static size_t count_reads_block(const tk_tstatement *body, size_t n, tk_str name) {
+    size_t total = 0;
+    for (size_t i = 0; i < n; i += 1) total += count_reads_stmt(body[i], name);
+    return total;
+}
+
+// count_block_local_reads — reads of `name` strictly inside B that are SAFE to free past: every
+// read EXCEPT (a) B's TAIL value when B yields one (an arm/if value used outside B), and (b) any
+// ASSIGN RHS (could write an enclosing var). A binding's own initializer never reads its own name.
+static size_t count_block_local_reads(const tk_tstatement *body, size_t n, tk_str name, bool is_value) {
+    size_t total = 0;
+    for (size_t i = 0; i < n; i += 1) {
+        bool is_last = (i + 1 == n);
+        if (body[i].tag == TK_TSTMT_ASSIGN) {
+            // escaping write target → do not count as a safe inside read.
+        } else if (body[i].tag == TK_TSTMT_EXPR) {
+            if (is_value && is_last) { /* tail value escapes B */ }
+            else total += count_reads_expr(body[i].as.expr_stmt.expr, name);
+        } else {
+            total += count_reads_stmt(body[i], name);
+        }
+    }
+    return total;
+}
+
+bool tk_binding_is_block_local(tk_escape_set set, const tk_tstatement *fn_body, size_t fn_n,
+                               const tk_tstatement *block_body, size_t block_n, bool is_value,
+                               tk_tstatement binding) {
+    if (!tk_binding_is_frame_local(set, binding)) return false;
+    if (binding.as.binding.target.tag != TK_BIND_SIMPLE) return false;
+    tk_str name = binding.as.binding.target.as.simple.name;
+    size_t total  = count_reads_block(fn_body, fn_n, name);
+    size_t inside = count_block_local_reads(block_body, block_n, name, is_value);
+    return total == inside;
+}

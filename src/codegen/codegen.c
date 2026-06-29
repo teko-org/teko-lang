@@ -253,6 +253,45 @@ static const char   *g_cg_box_frame = "";
 // which threads frame="" into the same positions. emit_binding/emit_return/emit_exprstmt_tail read it.
 static const char   *g_cg_frame = "";
 
+// ── S2 — PER-BLOCK arena regions. Each scope-introducing LOOP body opens its OWN region `_tkbrN`
+// (drop-on-every-exit-edge) for its provably-block-local allocations. State below; the public
+// per-block escape query is tk_binding_is_block_local (escape.h). SAFETY IS ABSOLUTE — a binding is
+// block-routed ONLY when proven block-local; otherwise it falls back to the frame/root (W8 = leak).
+#define TK_CG_MAX_BLOCK_REGIONS 64
+typedef struct { const char *name; tk_str label; } cg_block_region;   // a loop-body region on the stack
+static cg_block_region g_cg_block_stack[TK_CG_MAX_BLOCK_REGIONS];
+static size_t          g_cg_block_depth   = 0;   // active loop-body regions, innermost last
+static char            g_cg_block_names[TK_CG_MAX_BLOCK_REGIONS][24];   // backing store for `_tkbr<len>`
+// The function body + the CURRENT block being emitted — for tk_binding_is_block_local read counts.
+static const tk_tstatement *g_cg_fn_body  = NULL;
+static size_t               g_cg_fn_nbody = 0;
+static const tk_tstatement *g_cg_cur_block   = NULL;
+static size_t               g_cg_cur_block_n = 0;
+static bool                 g_cg_cur_block_is_value = false;
+
+// cg_drop_block_regions_to — emit drops (innermost-first) of every loop-body region from the top of
+// the stack DOWN TO (and including) the loop whose label matches `label` (empty = innermost loop).
+// Used on break/continue: the jump exits/continues that loop, so every region it crosses must drop.
+// Each handle is nulled after the drop so an overlapping edge re-drop is a no-op (NULL-tolerant).
+static void cg_drop_block_regions_to(cbuf *b, const char *indent, tk_str label) {
+    for (size_t k = g_cg_block_depth; k > 0; k -= 1) {
+        cg_block_region r = g_cg_block_stack[k - 1];
+        cb(b, indent); cb(b, "tk_region_drop("); cb(b, r.name); cb(b, "); "); cb(b, r.name); cb(b, " = NULL;\n");
+        bool is_target = (label.len == 0) || (r.label.len == label.len
+            && (label.len == 0 || memcmp(r.label.ptr, label.ptr, label.len) == 0));
+        if (is_target) return;   // stop AT the loop being exited/continued (inclusive)
+    }
+}
+
+// cg_drop_all_block_regions — emit drops of EVERY active loop-body region (innermost-first). Used on
+// a `return` edge (which leaves all enclosing loops) before the frame-region drop + the return value.
+static void cg_drop_all_block_regions(cbuf *b, const char *indent) {
+    for (size_t k = g_cg_block_depth; k > 0; k -= 1) {
+        cg_block_region r = g_cg_block_stack[k - 1];
+        cb(b, indent); cb(b, "tk_region_drop("); cb(b, r.name); cb(b, "); "); cb(b, r.name); cb(b, " = NULL;\n");
+    }
+}
+
 // cg_same_named_struct — are `a` and `b` the SAME Named type? Gates the frame-local binding
 // routing to the no-wrap case (declared type == struct-init's own type), so a variant/optional-
 // typed binding (which emit_as must wrap) is never emitted via the direct framed path.
@@ -271,6 +310,20 @@ static bool cg_body_has_frame_local(tk_escape_set esc, const tk_tstatement *body
         if (body[i].tag == TK_TSTMT_BINDING
             && tk_binding_is_frame_local(esc, body[i])
             && cg_same_named_struct(body[i].as.binding.bound, body[i].as.binding.value.type))
+            return true;
+    }
+    return false;
+}
+
+// cg_block_has_block_local — S2: does block B (a loop body) have any TOP-LEVEL binding that is
+// provably BLOCK-local (block-routable, no-wrap)? Drives whether emit_loop opens a `_tkbrN` region
+// at all — none ⇒ no region ⇒ zero output change for that loop (the fixpoint-preserving default).
+// `is_value` is whether B yields a value (loop bodies do NOT → false at the call site).
+static bool cg_block_has_block_local(const tk_tstatement *block, size_t bn, bool is_value) {
+    for (size_t i = 0; i < bn; i += 1) {
+        if (block[i].tag == TK_TSTMT_BINDING
+            && cg_same_named_struct(block[i].as.binding.bound, block[i].as.binding.value.type)
+            && tk_binding_is_block_local(g_cg_escaping, g_cg_fn_body, g_cg_fn_nbody, block, bn, is_value, block[i]))
             return true;
     }
     return false;
@@ -1016,22 +1069,30 @@ static bool emit_if_value(cbuf *b, const tk_texpr *e, const char **err) {
     // MEM Step 1: a value-form `if` is a SUB-EXPRESSION — emit its branch statements FRAMELESS
     // (the Teko twin's emit_branch_value/emit_stmt_value thread frame=""), so a binding inside a
     // value-branch never frame-routes. Save/restore the active frame around the whole expansion.
+    // S2: likewise clear the current block context (the Teko value-form emitters pass an empty
+    // cur_block) so a binding inside a value-form branch never block-routes — byte-identical twins.
     const char *saved = g_cg_frame; g_cg_frame = "";
+    // S2: a value-form sub-expression never participates in block regions (the Teko twin's
+    // emit_branch_value passes empty block context + empty fn_body). Clear/restore the whole block
+    // context so a loop inside a value-form branch opens no region in EITHER twin (byte-identical).
+    const tk_tstatement *saved_blk = g_cg_cur_block; g_cg_cur_block = NULL;
+    size_t saved_depth = g_cg_block_depth; g_cg_block_depth = 0;
+    const tk_tstatement *saved_fnb = g_cg_fn_body; size_t saved_fnn = g_cg_fn_nbody; g_cg_fn_body = NULL; g_cg_fn_nbody = 0;
     // Freeze a unique temp name (buffer length is about to change as we append).
     char tmp[32];
     snprintf(tmp, sizeof tmp, "_tk%zu", (size_t)b->len);
     cb(b, "({ ");
-    if (!emit_type(b, e->type, err)) { g_cg_frame = saved; return false; }
+    if (!emit_type(b, e->type, err)) { g_cg_frame = saved; g_cg_cur_block = saved_blk; g_cg_block_depth = saved_depth; g_cg_fn_body = saved_fnb; g_cg_fn_nbody = saved_fnn; return false; }
     cb(b, " "); cb(b, tmp); cb(b, "; if (");
-    if (!emit_expr(b, e->as.if_expr.cond, err)) { g_cg_frame = saved; return false; }
+    if (!emit_expr(b, e->as.if_expr.cond, err)) { g_cg_frame = saved; g_cg_cur_block = saved_blk; g_cg_block_depth = saved_depth; g_cg_fn_body = saved_fnb; g_cg_fn_nbody = saved_fnn; return false; }
     cb(b, ") {\n");
     if (!emit_branch_value(b, e->as.if_expr.then_blk, e->as.if_expr.nthen, e->type, tmp, "    ", err))
-        { g_cg_frame = saved; return false; }
+        { g_cg_frame = saved; g_cg_cur_block = saved_blk; g_cg_block_depth = saved_depth; g_cg_fn_body = saved_fnb; g_cg_fn_nbody = saved_fnn; return false; }
     cb(b, "} else {\n");
     if (!emit_branch_value(b, e->as.if_expr.else_blk, e->as.if_expr.nelse, e->type, tmp, "    ", err))
-        { g_cg_frame = saved; return false; }
+        { g_cg_frame = saved; g_cg_cur_block = saved_blk; g_cg_block_depth = saved_depth; g_cg_fn_body = saved_fnb; g_cg_fn_nbody = saved_fnn; return false; }
     cb(b, "} "); cb(b, tmp); cb(b, "; })");
-    g_cg_frame = saved;
+    g_cg_frame = saved; g_cg_cur_block = saved_blk; g_cg_block_depth = saved_depth; g_cg_fn_body = saved_fnb; g_cg_fn_nbody = saved_fnn;
     return true;
 }
 
@@ -2797,41 +2858,44 @@ static bool emit_match_value(cbuf *b, const tk_texpr *e, const char **err) {
     // MEM Step 1: a value-form `match` is a SUB-EXPRESSION — emit its arm statements FRAMELESS
     // (the Teko twin's emit_arm_value threads frame=""). Save/restore around the whole expansion.
     const char *saved = g_cg_frame; g_cg_frame = "";
+    const tk_tstatement *saved_blk = g_cg_cur_block; g_cg_cur_block = NULL;
+    size_t saved_depth = g_cg_block_depth; g_cg_block_depth = 0;
+    const tk_tstatement *saved_fnb = g_cg_fn_body; size_t saved_fnn = g_cg_fn_nbody; g_cg_fn_body = NULL; g_cg_fn_nbody = 0;
     // Freeze unique temp names (buffer length is the functional uniquifier — see emit_if_value).
     char subj[40], res[40];
     snprintf(subj, sizeof subj, "_s%zu", (size_t)b->len);
     snprintf(res,  sizeof res,  "_r%zu", (size_t)b->len + 1);   // +1 so it differs from subj
     tk_type subjT = e->as.match_expr.subject->type;   // for optional / variant pattern lowering
     cb(b, "({ ");
-    if (!emit_type(b, e->as.match_expr.subject->type, err)) { g_cg_frame = saved; return false; }
+    if (!emit_type(b, e->as.match_expr.subject->type, err)) { g_cg_frame = saved; g_cg_cur_block = saved_blk; g_cg_block_depth = saved_depth; g_cg_fn_body = saved_fnb; g_cg_fn_nbody = saved_fnn; return false; }
     cb(b, " "); cb(b, subj); cb(b, " = (");
-    if (!emit_expr(b, e->as.match_expr.subject, err)) { g_cg_frame = saved; return false; }
+    if (!emit_expr(b, e->as.match_expr.subject, err)) { g_cg_frame = saved; g_cg_cur_block = saved_blk; g_cg_block_depth = saved_depth; g_cg_fn_body = saved_fnb; g_cg_fn_nbody = saved_fnn; return false; }
     cb(b, "); ");
-    if (!emit_type(b, e->type, err)) { g_cg_frame = saved; return false; }
+    if (!emit_type(b, e->type, err)) { g_cg_frame = saved; g_cg_cur_block = saved_blk; g_cg_block_depth = saved_depth; g_cg_fn_body = saved_fnb; g_cg_fn_nbody = saved_fnn; return false; }
     cb(b, " "); cb(b, res); cb(b, "; do {\n");
     for (size_t i = 0; i < e->as.match_expr.narms; i += 1) {
         const tk_tarm *arm = &e->as.match_expr.arms[i];
         cb(b, "    if (");
-        if (!cg_emit_pat_test(b, &arm->pattern, subj, subjT, err)) { g_cg_frame = saved; return false; }
+        if (!cg_emit_pat_test(b, &arm->pattern, subj, subjT, err)) { g_cg_frame = saved; g_cg_cur_block = saved_blk; g_cg_block_depth = saved_depth; g_cg_fn_body = saved_fnb; g_cg_fn_nbody = saved_fnn; return false; }
         cb(b, ") {\n");
-        if (!cg_emit_pat_binds(b, &arm->pattern, subj, subjT, "        ", err)) { g_cg_frame = saved; return false; }
+        if (!cg_emit_pat_binds(b, &arm->pattern, subj, subjT, "        ", err)) { g_cg_frame = saved; g_cg_cur_block = saved_blk; g_cg_block_depth = saved_depth; g_cg_fn_body = saved_fnb; g_cg_fn_nbody = saved_fnn; return false; }
         const char *commit_indent = "        ";
         if (arm->has_when) {
             cb(b, "        if (");
-            if (!emit_expr(b, arm->guard, err)) { g_cg_frame = saved; return false; }
+            if (!emit_expr(b, arm->guard, err)) { g_cg_frame = saved; g_cg_cur_block = saved_blk; g_cg_block_depth = saved_depth; g_cg_fn_body = saved_fnb; g_cg_fn_nbody = saved_fnn; return false; }
             cb(b, ") {\n");
             commit_indent = "            ";
         }
         // The arm body is a BLOCK (B.20): its trailing value flows into _r (wrapped to the
         // match result type), or a diverging arm (`=> return e`) emits real control flow.
-        if (!emit_arm_value(b, e, arm->body, arm->nbody, res, commit_indent, err)) { g_cg_frame = saved; return false; }
+        if (!emit_arm_value(b, e, arm->body, arm->nbody, res, commit_indent, err)) { g_cg_frame = saved; g_cg_cur_block = saved_blk; g_cg_block_depth = saved_depth; g_cg_fn_body = saved_fnb; g_cg_fn_nbody = saved_fnn; return false; }
         if (arm->has_when) cb(b, "        }\n");
         cb(b, "    }\n");
     }
     // Exhaustiveness is guaranteed by the checker; the chain always commits before falling
     // through. (No default needed — a fall-through cannot happen for a well-typed program.)
     cb(b, "    } while (0); "); cb(b, res); cb(b, "; })");
-    g_cg_frame = saved;
+    g_cg_frame = saved; g_cg_cur_block = saved_blk; g_cg_block_depth = saved_depth; g_cg_fn_body = saved_fnb; g_cg_fn_nbody = saved_fnn;
     return true;
 }
 
@@ -3114,6 +3178,18 @@ static bool emit_stmt(cbuf *b, const tk_tstatement *s, bool in_main,
                 && s->as.binding.value.tag == TK_TEXPR_STRUCT_INIT;
             const char *saved_box = g_cg_box_frame;
             if (framed_bind) g_cg_box_frame = g_cg_frame;
+            // S2 — BLOCK-LOCAL routing TAKES PRECEDENCE: when this binding sits in a block that
+            // opened its own region AND the per-block escape check proved it block-local, route its
+            // auto-box to the INNERMOST block region (`_tkbrN`, freed at the block's exit edge)
+            // instead of the frame. The block region is tighter (per-iteration for a loop), so it
+            // is freed sooner; soundness is guaranteed by tk_binding_is_block_local being a subset.
+            if (g_cg_block_depth > 0 && g_cg_cur_block != NULL
+                && s->as.binding.value.tag == TK_TEXPR_STRUCT_INIT
+                && cg_same_named_struct(s->as.binding.bound, s->as.binding.value.type)
+                && tk_binding_is_block_local(g_cg_escaping, g_cg_fn_body, g_cg_fn_nbody,
+                                             g_cg_cur_block, g_cg_cur_block_n, g_cg_cur_block_is_value, *s)) {
+                g_cg_box_frame = g_cg_block_stack[g_cg_block_depth - 1].name;
+            }
             // W5b — if the binding's declared type is a variant and the value is a case
             // member, WRAP it into the variant repr (e.g. `let s: Shape = Circle { … }`).
             if (!emit_as(b, s->as.binding.bound, &s->as.binding.value, err)) { g_cg_box_frame = saved_box; return false; }
@@ -3143,6 +3219,9 @@ static bool emit_stmt(cbuf *b, const tk_tstatement *s, bool in_main,
         case TK_TSTMT_RETURN: {
             // (C7.18) Drain the defer stack LIFO before returning.
             if (!emit_defers(b, indent, err)) return false;
+            // S2 — a `return` leaves EVERY enclosing loop, so drop all active block regions first
+            // (innermost-first), THEN the frame region. The return value is escaping ⇒ in root ⇒ safe.
+            cg_drop_all_block_regions(b, indent);
             // MEM Step 1: drop the frame region on the return EDGE (before evaluating the value — a
             // return value is ESCAPING, so by the escape check it never references a frame-local
             // cell). tk_region_drop is idempotent + NULL-tolerant, so overlapping edge-drops free
@@ -3198,8 +3277,40 @@ static bool emit_stmt(cbuf *b, const tk_tstatement *s, bool in_main,
             // A labeled loop gets a continue-target at the TOP of its body: `continue L`
             // lowers to `goto tk_lbl_L_cont;`, re-running the body == next iteration of while(1).
             if (labeled) { cb(b, inner); cb(b, "tk_lbl_"); cb_str(b, lbl); cb(b, "_cont: ;\n"); }
-            if (!emit_block(b, s->as.loop_stmt.body, s->as.loop_stmt.nbody, in_main, ret_type, inner, err))
-                return false;
+            // S2 — open this loop body's OWN region when it has a provably block-local binding. The
+            // region var is created AT THE TOP OF THE BODY (after the continue-target, so a labeled
+            // `continue L`'s goto re-runs tk_region_new — a fresh region every iteration) and dropped
+            // at every exit edge (fall-through below; break/continue/return via the drop helpers). A
+            // loop with NO block-local binding opens no region → byte-identical to the pre-S2 output.
+            bool want_block = cg_block_has_block_local(s->as.loop_stmt.body, s->as.loop_stmt.nbody, /*is_value=*/false);
+            const char *region = "";
+            if (want_block && g_cg_block_depth < TK_CG_MAX_BLOCK_REGIONS) {
+                // Name the region by the buffer length at the creation point — the SAME deterministic
+                // uniquifier the `_bx<len>` boxes use, so the Teko twin (which reads out.len) produces
+                // byte-identical names without threading a counter through its functional emitter.
+                snprintf(g_cg_block_names[g_cg_block_depth], sizeof g_cg_block_names[g_cg_block_depth], "_tkbr%zu", (size_t)b->len);
+                region = g_cg_block_names[g_cg_block_depth];
+                cb(b, inner); cb(b, "tk_region *"); cb(b, region); cb(b, " = tk_region_new();\n");
+                g_cg_block_stack[g_cg_block_depth].name  = region;
+                g_cg_block_stack[g_cg_block_depth].label = lbl;
+                g_cg_block_depth += 1;
+            }
+            // Emit the body with THIS block as the current block context (so block-local bindings
+            // route to `region`). Save/restore the prior block context for nesting.
+            const tk_tstatement *saved_blk = g_cg_cur_block; size_t saved_bn = g_cg_cur_block_n; bool saved_bv = g_cg_cur_block_is_value;
+            const char *saved_frame = g_cg_frame;
+            if (region[0] != '\0') { g_cg_cur_block = s->as.loop_stmt.body; g_cg_cur_block_n = s->as.loop_stmt.nbody; g_cg_cur_block_is_value = false; }
+            // emit_block clears g_cg_frame (sub-scope leaks the frame — SAFE); the block region stack
+            // carries the per-block drops independently of g_cg_frame.
+            bool ok = emit_block(b, s->as.loop_stmt.body, s->as.loop_stmt.nbody, in_main, ret_type, inner, err);
+            g_cg_cur_block = saved_blk; g_cg_cur_block_n = saved_bn; g_cg_cur_block_is_value = saved_bv; g_cg_frame = saved_frame;
+            if (!ok) { if (region[0] != '\0') g_cg_block_depth -= 1; return false; }
+            // S2 — fall-through exit edge (end of an iteration): drop this loop body's region (the
+            // next iteration's tk_region_new opens a fresh one). Idempotent + nulled for overlap.
+            if (region[0] != '\0') {
+                cb(b, inner); cb(b, "tk_region_drop("); cb(b, region); cb(b, "); "); cb(b, region); cb(b, " = NULL;\n");
+                g_cg_block_depth -= 1;
+            }
             cb(b, indent); cb(b, "}\n");
             // …and a break-target AFTER the loop: `break L` lowers to `goto tk_lbl_L_break;`.
             if (labeled) { cb(b, indent); cb(b, "tk_lbl_"); cb_str(b, lbl); cb(b, "_break: ;\n"); }
@@ -3207,11 +3318,18 @@ static bool emit_stmt(cbuf *b, const tk_tstatement *s, bool in_main,
         }
 
         case TK_TSTMT_BREAK:
+            // S2 — `break` exits its target loop: drop every block region from the top of the stack
+            // down to & including that loop's region (innermost-first) BEFORE the jump. NOT the frame,
+            // NOT regions outside the target loop.
+            cg_drop_block_regions_to(b, indent, s->as.jump.label);
             cb(b, indent);
             if (s->as.jump.label.len > 0) { cb(b, "goto tk_lbl_"); cb_str(b, s->as.jump.label); cb(b, "_break;\n"); }
             else                          { cb(b, "break;\n"); }
             return true;
         case TK_TSTMT_CONTINUE:
+            // S2 — `continue` restarts its target loop's body: drop every block region from the top
+            // down to & including that loop's region (the next iteration opens a fresh one).
+            cg_drop_block_regions_to(b, indent, s->as.jump.label);
             cb(b, indent);
             if (s->as.jump.label.len > 0) { cb(b, "goto tk_lbl_"); cb_str(b, s->as.jump.label); cb(b, "_cont;\n"); }
             else                          { cb(b, "continue;\n"); }
@@ -3264,6 +3382,12 @@ static bool cg_stmt_c_terminates(const tk_tstatement *s) {
 static bool emit_function(cbuf *b, tk_tfunction f, const char **err) {
     g_cg_ret_type  = f.return_type;   // so a return inside a value-form match/if wraps correctly
     g_cg_ndefers   = 0;               // (C7.18) reset the per-function defer stack
+    // S2 — reset the per-function block-region state: empty stack; record the function body for the
+    // per-block read-count escape query (tk_binding_is_block_local). Region names are buffer-length
+    // based (`_tkbr<len>`), so no per-function counter is needed (fixpoint-safe across both twins).
+    g_cg_block_depth = 0;
+    g_cg_fn_body = f.body; g_cg_fn_nbody = f.nbody;
+    g_cg_cur_block = NULL; g_cg_cur_block_n = 0; g_cg_cur_block_is_value = false;
     if (!emit_function_sig(b, f, err)) return false;
     cb(b, " {\n");
     // MEM Step 1 — THE FRAME REGION (escape.h). Run the escape check; when a TOP-LEVEL binding is
