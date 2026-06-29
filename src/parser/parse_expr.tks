@@ -28,10 +28,12 @@ fn parse_call_args(tokens: []lexer::Token, pos: u64) -> ParsedArgs | error {
 
 // `Name { field = value (, | ; | newline)* }` — a struct VALUE literal (W4a). `pos` is at `{`.
 // Field VALUES parse with struct allowed (they sit inside the literal's braces).
-fn parse_struct_lit(tokens: []lexer::Token, pos: u64, type_path: Path) -> Parsed | error {
+// (W9.4) `type_args` are the explicit construction-site generic args (empty for the bare
+// `Name { … }` form). `pos` is at the `{`.
+fn parse_struct_lit(tokens: []lexer::Token, pos: u64, type_path: Path, type_args: []TypeExpr) -> Parsed | error {
     mut p = skip_seps(tokens, pos + 1)             // consume `{`, skip leading separators
     if is_kind_at(tokens, p, lexer::TokenKind::RBrace) {     // empty literal `Name { }`
-        return Parsed { node = Expr { kind = StructLit { type_path = type_path, field_names = teko::list::empty(), field_vals = teko::list::empty() }, line = tokens[pos].line, col = tokens[pos].col }, next = p + 1 }
+        return Parsed { node = Expr { kind = StructLit { type_path = type_path, type_args = type_args, field_names = teko::list::empty(), field_vals = teko::list::empty() }, line = tokens[pos].line, col = tokens[pos].col }, next = p + 1 }
     }
     mut names: []str = teko::list::empty()
     mut vals: []Expr = teko::list::empty()
@@ -58,7 +60,7 @@ fn parse_struct_lit(tokens: []lexer::Token, pos: u64, type_path: Path) -> Parsed
         }
         if is_kind_at(tokens, p, lexer::TokenKind::RBrace) { break }   // trailing separator
     }
-    Parsed { node = Expr { kind = StructLit { type_path = type_path, field_names = names, field_vals = vals }, line = tokens[pos].line, col = tokens[pos].col }, next = p + 1 }
+    Parsed { node = Expr { kind = StructLit { type_path = type_path, type_args = type_args, field_names = names, field_vals = vals }, line = tokens[pos].line, col = tokens[pos].col }, next = p + 1 }
 }
 
 // ---- string interpolation `$"…{expr}…"` (self-host parity) ----
@@ -184,9 +186,22 @@ fn parse_atom(tokens: []lexer::Token, pos: u64, allow_struct: bool) -> Parsed | 
             let ca = match parse_call_args(tokens, pp.next) { ParsedArgs as x => x; error as e => return e }
             return Parsed { node = Expr { kind = Call { callee = pp.node, args = ca.args }, line = tokens[pos].line, col = tokens[pos].col }, next = ca.next }
         }
+        // (W9.4) explicit type-args at construction `Name<i64> { … }` — SPECULATIVE: parse `<…>`,
+        // and commit to a typed struct literal ONLY when a `{` follows the closed list (so `a < b`
+        // and a pending `>>` mid-close still backtrack to comparison). Requires allow_struct like the bare form.
+        if allow_struct && is_kind_at(tokens, pp.next, lexer::TokenKind::Lt) {
+            match parse_type_args(tokens, pp.next) {
+                ParsedTypeArgs as ta => {
+                    if ta.pending_gt == 0 && is_kind_at(tokens, ta.next, lexer::TokenKind::LBrace) {
+                        return parse_struct_lit(tokens, ta.next, pp.node, ta.args)
+                    }
+                }
+                error => { }   // backtrack: `a < b` or a pending mid-close → fall through to comparison
+            }
+        }
         // W4a — a struct literal `Name { … }` (only when allowed: not in an if/match scrutinee).
         if allow_struct && is_kind_at(tokens, pp.next, lexer::TokenKind::LBrace) {
-            return parse_struct_lit(tokens, pp.next, pp.node)
+            return parse_struct_lit(tokens, pp.next, pp.node, teko::list::empty())
         }
         if pp.node.segments.len == 1 {
             return Parsed { node = Expr { kind = Var { name = pp.node.segments[0].name }, line = tokens[pos].line, col = tokens[pos].col }, next = pp.next }

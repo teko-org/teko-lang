@@ -68,24 +68,32 @@ static tk_parsed_pattern_result parse_pattern_primary(const tk_token *t, size_t 
         tk_parsed_path_result pp = parse_path(t, n, pos);
         if (!pp.ok) { return (tk_parsed_pattern_result){ .ok = false, .as.error = pp.as.error }; }
         size_t after = pp.as.value.next;
+        // (W9.4) explicit type-args in a bind pattern `Foo<i64> as x` — SPECULATIVE: parse `<…>` and
+        // adopt it ONLY when it is a fully closed list (no pending `>>`); else backtrack (the bare `<`
+        // is not a comparison in pattern position, but keeping `after` intact preserves all prior forms).
+        tk_type_expr *type_args = NULL; size_t nargs = 0;
+        if (tk_is_kind_at(t, n, after, TK_TOKEN_LT)) {
+            tk_parsed_type_args_result ta = tk_parse_type_args(t, n, after);
+            if (ta.ok && ta.as.value.pending_gt == 0) { type_args = ta.as.value.args; nargs = ta.as.value.nargs; after = ta.as.value.next; }
+        }
         if (tk_is_kind_at(t, n, after, TK_TOKEN_AS)) {
             if (tk_is_kind_at(t, n, after + 1, TK_TOKEN_UNDERSCORE)) {   // `Path as _` — match the case, discard the bind (≡ bare `Path`)
-                tk_pattern p = { .tag = TK_PAT_BIND, .as.bind = { .type_name = pp.as.value.node, .has_binding = false, .binding = (tk_str){0} } };
+                tk_pattern p = { .tag = TK_PAT_BIND, .as.bind = { .type_name = pp.as.value.node, .has_binding = false, .binding = (tk_str){0}, .type_args = type_args, .nargs = nargs } };
                 return (tk_parsed_pattern_result){ .ok = true, .as.value = { .node = p, .next = after + 2 } };
             }
             if (!tk_is_name_at(t, n, after + 1)) {   // a binding name may be a contextual keyword (`in`/`to`/`type`)
                 return (tk_parsed_pattern_result){ .ok = false, .as.error = tk_err_at(t, n, after + 1, "expected a name (or `_`) after `as` in a pattern") };
             }
-            tk_pattern p = { .tag = TK_PAT_BIND, .as.bind = { .type_name = pp.as.value.node, .has_binding = true, .binding = t[after + 1].text } };
+            tk_pattern p = { .tag = TK_PAT_BIND, .as.bind = { .type_name = pp.as.value.node, .has_binding = true, .binding = t[after + 1].text, .type_args = type_args, .nargs = nargs } };
             return (tk_parsed_pattern_result){ .ok = true, .as.value = { .node = p, .next = after + 2 } };
         }
-        if (tk_is_kind_at(t, n, after, TK_TOKEN_LBRACE)) {
+        if (nargs == 0 && tk_is_kind_at(t, n, after, TK_TOKEN_LBRACE)) {   // field destructure has no type-args (W9.4 scope = bind only)
             tk_parsed_names_result fns = parse_field_names(t, n, after);
             if (!fns.ok) { return (tk_parsed_pattern_result){ .ok = false, .as.error = fns.as.error }; }
             tk_pattern fp = { .tag = TK_PAT_FIELD, .as.field = { .type_name = pp.as.value.node, .fields = fns.as.value.names, .n_fields = fns.as.value.n_names } };
             return (tk_parsed_pattern_result){ .ok = true, .as.value = { .node = fp, .next = fns.as.value.next } };
         }
-        tk_pattern p = { .tag = TK_PAT_BIND, .as.bind = { .type_name = pp.as.value.node, .has_binding = false, .binding = (tk_str){0} } };
+        tk_pattern p = { .tag = TK_PAT_BIND, .as.bind = { .type_name = pp.as.value.node, .has_binding = false, .binding = (tk_str){0}, .type_args = type_args, .nargs = nargs } };
         return (tk_parsed_pattern_result){ .ok = true, .as.value = { .node = p, .next = after } };
     }
     return (tk_parsed_pattern_result){ .ok = false, .as.error = tk_err_at(t, n, pos, "expected a pattern") };

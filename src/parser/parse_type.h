@@ -13,5 +13,9 @@
 
 tk_parsed_type_result parse_type_primary(const tk_token *t, size_t n, size_t pos);  // a type PRIMARY (named or []T)
 tk_parsed_type_result tk_parse_type     (const tk_token *t, size_t n, size_t pos);  // a full type (unions via `|`)
+// (W9.4) parse a generic type-ARGUMENT list `<T1, T2, …>` — `pos` is at the `<`. Returns ok=false to
+// SIGNAL BACKTRACK when it is not a closed list (so a bare `<` stays available as comparison). Shared
+// by the struct-construction and match-bind-pattern sites; handles the `>>` (Shr) split via pending_gt.
+tk_parsed_type_args_result tk_parse_type_args(const tk_token *t, size_t n, size_t pos);
 
 #endif // TK_PARSER_PARSE_TYPE_H

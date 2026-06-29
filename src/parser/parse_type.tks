@@ -64,6 +64,34 @@ fn parse_named(tokens: []lexer::Token, pos: u64) -> ParsedType | error {
     }
 }
 
+// (W9.4) parse a `<T1, T2, …>` type-argument list — `pos` is at the `<`. Mirrors parse_named's `<…>`
+// loop, but standalone (shared by struct-construction `Foo<i64>{…}` and the `Foo<i64> as x` pattern).
+// Returns `error` to SIGNAL BACKTRACK when it is not a closed list (the caller swallows it, so a bare
+// `<` stays a comparison). The `>>` (Shr) compound closes THIS list with one `>` and leaves pending_gt.
+fn parse_type_args(tokens: []lexer::Token, pos: u64) -> ParsedTypeArgs | error {
+    if !is_kind_at(tokens, pos, lexer::TokenKind::Lt) { return err_at(tokens, pos, "expected '<' to open a type-argument list") }
+    mut args: []TypeExpr = teko::list::empty()
+    mut p = pos + 1
+    loop {
+        let a = match parse_type(tokens, p) { ParsedType as x => x; error as e => return e }   // not a type → backtrack
+        args = teko::list::push(args, a.node)
+        // A nested generic just closed with a compound `>>`: the arg carries a leftover `>` that
+        // closes THIS list. Consume one; pass any remainder (deeper nesting) up via pending_gt.
+        if a.pending_gt > 0 {
+            return ParsedTypeArgs { args = args, next = a.next, pending_gt = a.pending_gt - 1 }
+        }
+        p = a.next
+        if is_kind_at(tokens, p, lexer::TokenKind::Comma) { p = p + 1 }
+        else if is_kind_at(tokens, p, lexer::TokenKind::Gt) {
+            return ParsedTypeArgs { args = args, next = p + 1, pending_gt = 0 }
+        }
+        else if is_kind_at(tokens, p, lexer::TokenKind::Shr) {
+            return ParsedTypeArgs { args = args, next = p + 1, pending_gt = 1 }
+        }
+        else { return err_at(tokens, p, "not a closed type-argument list") }   // backtrack (e.g. `a < b`)
+    }
+}
+
 // `[]T` — `pos` is at `[` (parse_type_primary checked). The element is a PRIMARY, so
 // `[]A | B` is `([]A) | B`; nested slices recurse (`[][]T`). Recursive — B.8.
 fn parse_slice(tokens: []lexer::Token, pos: u64) -> ParsedType | error {

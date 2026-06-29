@@ -938,6 +938,38 @@ fn path_last(p: parser::Path) -> str {
     if p.segments.len == 0 { "" } else { p.segments[p.segments.len - 1].name }
 }
 
+// (W9.4) a SYNTACTIC type-expr → its mangle fragment, mirroring checker::type_mangle (prim/str/byte/
+// named → the segment name, slice_/opt_ prefixes, a nested generic use → its own instance name). So a
+// bind pattern's stamped case name agrees byte-for-byte with the value's stamped type_name. (vm.c: vm_texpr_mangle.)
+fn vm_texpr_mangle(te: parser::TypeExpr) -> str {
+    match te {
+        parser::NamedType as nt => {
+            let last = nt.path.segments[nt.path.segments.len - 1].name
+            if nt.args.len == 0 { last } else { vm_texpr_inst_name(last, nt.args) }
+        }
+        parser::SliceType as st    => teko::str::concat("slice_", vm_texpr_mangle(st.element))
+        parser::OptionalType as ot => teko::str::concat("opt_", vm_texpr_mangle(ot.inner))
+        parser::UnionType          => "variant"
+    }
+}
+fn vm_texpr_inst_name(base: str, args: []parser::TypeExpr) -> str {
+    mut out = teko::str::concat(base, "__g__")
+    mut i = 0
+    loop {
+        if i >= args.len { break }
+        if i > 0 { out = teko::str::concat(out, "__") }
+        out = teko::str::concat(out, vm_texpr_mangle(args[i]))
+        i++
+    }
+    out
+}
+
+// (W9.4) a bind pattern's CASE NAME: the STAMPED instance `Gen__g__i64` when it carries explicit
+// type-args (`Gen<i64> as x`), else the plain path-last identifier. Matches a stamped value's type_name.
+fn bind_case_name(bp: parser::BindPattern) -> str {
+    if bp.type_args.len > 0 { vm_texpr_inst_name(path_last(bp.type_name), bp.type_args) } else { path_last(bp.type_name) }
+}
+
 // Value classifiers — the .tks stand-in for the C `tag` switch (the member IS the tag).
 fn val_is_int(v: Value) -> bool {
     match v { u8 | u16 | u32 | u64 | u128 | i8 | i16 | i32 | i64 | i128 => true; _ => false }
@@ -1242,7 +1274,7 @@ fn pat_match(pat: parser::Pattern, subj: Value, env: Venv) -> PatMatch {
                 // a PRIM/bool/byte/str member matches by the value's kind (val_type_matches); AND a
                 // pattern that names a VARIANT (`Type`) matches a value whose case is one of its
                 // members (vm_case_in_variant). Supports `Type =>` with NO destructure and NO alias.
-                let bname = path_last(bp.type_name)
+                let bname = bind_case_name(bp)   // (W9.4) `Gen<i64> as x` → `Gen__g__i64`
                 mut hit = val_type_matches(subj, bname)
                 if !hit {
                     match subj {

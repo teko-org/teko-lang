@@ -1391,6 +1391,36 @@ static tk_value eval_call(const tk_texpr *e, tk_venv *env) {
 // last path segment name (cases/types match by their final identifier, like find_function).
 static tk_str path_last(tk_path p) { return p.len ? p.segments[p.len - 1].name : (tk_str){ NULL, 0 }; }
 
+// (W9.4) a SYNTACTIC type-expr → its mangle fragment, mirroring tk_type_mangle (prim/str/byte/named
+// → the segment name, slice_/opt_ prefixes, a nested generic use → its own instance name). Mirror of
+// vm.tks::vm_texpr_mangle / vm_texpr_inst_name.
+static tk_str vm_texpr_mangle(tk_type_expr te) {
+    switch (te.tag) {
+        case TK_TEXPR_NAMED: {
+            tk_str last = te.as.named.path.segments[te.as.named.path.len - 1].name;
+            if (te.as.named.args_len == 0) return last;
+            tk_str out = tk_str_concat(last, (tk_str){ (const tk_byte *)"__g__", 5 });
+            for (size_t i = 0; i < te.as.named.args_len; i += 1) {
+                if (i > 0) out = tk_str_concat(out, (tk_str){ (const tk_byte *)"__", 2 });
+                out = tk_str_concat(out, vm_texpr_mangle(te.as.named.args[i]));
+            }
+            return out;
+        }
+        case TK_TEXPR_SLICE:    return tk_str_concat((tk_str){ (const tk_byte *)"slice_", 6 }, vm_texpr_mangle(*te.as.slice.element));
+        case TK_TEXPR_OPTIONAL: return tk_str_concat((tk_str){ (const tk_byte *)"opt_", 4 }, vm_texpr_mangle(*te.as.optional.inner));
+        case TK_TEXPR_UNION:    return (tk_str){ (const tk_byte *)"variant", 7 };
+    }
+    return (tk_str){ NULL, 0 };
+}
+
+// (W9.4) a bind pattern's CASE NAME: the STAMPED instance `Gen__g__i64` when it carries explicit
+// type-args (`Gen<i64> as x`), else the plain path-last identifier. Mirror of vm.tks::bind_case_name.
+static tk_str bind_case_name(tk_bind_pattern bp) {
+    if (bp.nargs == 0) return path_last(bp.type_name);
+    tk_type_expr gte = { .tag = TK_TEXPR_NAMED, .as.named = { .path = bp.type_name, .args = bp.type_args, .args_len = bp.nargs } };
+    return vm_texpr_mangle(gte);
+}
+
 // case_in_variant — is `cname` a MEMBER of the variant type `vname`? A match arm pattern may name
 // a VARIANT (e.g. `Type`) and the value's case is one of its members (e.g. `Prim`): native codegen
 // discriminates the tagged union; the VM has no wrapper (the value IS the member struct), so it
@@ -1570,7 +1600,7 @@ static bool pat_match(const tk_pattern *pat, tk_value subj, tk_venv *env) {
             // with NO destructure and NO alias, for every member kind. ALSO a pattern that names a
             // VARIANT (e.g. `Type`) matches a value whose case is one of its members (case_in_variant).
             {
-                tk_str bname = path_last(pat->as.bind.type_name);
+                tk_str bname = bind_case_name(pat->as.bind);   // (W9.4) `Gen<i64> as x` → `Gen__g__i64`
                 bool direct = val_type_matches(subj, bname)
                     || (subj.tag == TK_VAL_STRUCT && case_in_variant(bname, subj.as.st.type_name))
                     || (subj.tag == TK_VAL_INT && match_as_enum_int(bname, v_as_u128(subj)));

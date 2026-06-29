@@ -165,11 +165,25 @@ fn has_wildcard(arms: []parser::Arm) -> bool {
 // the case-name(s) a variant pattern selects: a single Bind/Field, or EACH bare option of an Alt.
 // A slice bind (`[]T as x`) names NO nominal case (its type_name is empty) — it is skipped here
 // (and the empty-path read avoided); it is covered by some_arm_covers_type instead.
-fn arm_case_names(p: parser::Pattern) -> []str {
+// (W9.4) the case-name a single bind names: the resolved INSTANCE name `Gen__g__i64` when it carries
+// explicit type-args, else the bare last path segment. Mirrors bind_pattern_type's instance resolution
+// so exhaustiveness over a `variant Gen<i64> | …` covers the `Gen<i64> as x` arm by the member's name.
+fn bind_case_name(bp: parser::BindPattern, table: TypeTable) -> str {
+    if bp.type_args.len > 0 {
+        let ct = match bind_pattern_type(bp, table) { Type as t => t; error => Void { } }
+        match ct {
+            Named as n => return n.name
+            _          => {}
+        }
+    }
+    bp.type_name.segments[bp.type_name.segments.len - 1].name
+}
+
+fn arm_case_names(p: parser::Pattern, table: TypeTable) -> []str {
     match p {
         parser::BindPattern as bp  => {
             if bp.is_slice { teko::list::empty() }
-            else { teko::list::push(teko::list::empty(), bp.type_name.segments[bp.type_name.segments.len - 1].name) }
+            else { teko::list::push(teko::list::empty(), bind_case_name(bp, table)) }
         }
         parser::FieldPattern as fp => teko::list::push(teko::list::empty(), fp.type_name.segments[fp.type_name.segments.len - 1].name)
         parser::AltPattern as ap   => {
@@ -178,7 +192,7 @@ fn arm_case_names(p: parser::Pattern) -> []str {
             loop {
                 if i >= ap.options.len { break }
                 match ap.options[i] {
-                    parser::BindPattern as bp  => { if !bp.is_slice { names = teko::list::push(names, bp.type_name.segments[bp.type_name.segments.len - 1].name) } }
+                    parser::BindPattern as bp  => { if !bp.is_slice { names = teko::list::push(names, bind_case_name(bp, table)) } }
                     parser::FieldPattern as fp => { names = teko::list::push(names, fp.type_name.segments[fp.type_name.segments.len - 1].name) }
                     _                  => {}
                 }
@@ -191,12 +205,16 @@ fn arm_case_names(p: parser::Pattern) -> []str {
 }
 
 // Resolve the type a BIND pattern denotes: `[]T as x` → the slice type, else the named/builtin path.
+// (W9.4) `Foo<i64> as x` carries explicit type-args → resolve the concrete instance `Foo__g__i64`
+// (validates arity / rejects non-generic-with-args), so exhaustiveness/binding use the stamped type.
 fn bind_pattern_type(bp: parser::BindPattern, table: TypeTable) -> Type | error {
     if bp.is_slice {
         match bp.slice_type {
             parser::TypeExpr as st => resolve_type(st, table)
             null                   => error { message = "internal: slice pattern missing its slice type" }
         }
+    } else if bp.type_args.len > 0 {
+        resolve_type(parser::NamedType { path = bp.type_name; args = bp.type_args }, table)
     } else {
         resolve_named(bp.type_name, table)
     }
@@ -234,12 +252,12 @@ fn some_arm_covers_type(arms: []parser::Arm, mem: Type, table: TypeTable) -> boo
 }
 
 // is `name` covered by some UNGUARDED arm (directly via Bind/Field, or via an Alt option)?
-fn some_arm_names(arms: []parser::Arm, name: str) -> bool {
+fn some_arm_names(arms: []parser::Arm, name: str, table: TypeTable) -> bool {
     mut i = 0
     loop {
         if i >= arms.len { break }
         if !arms[i].has_when {
-            let names = arm_case_names(arms[i].pattern)
+            let names = arm_case_names(arms[i].pattern, table)
             mut j = 0
             loop {
                 if j >= names.len { break }
@@ -259,7 +277,7 @@ fn variant_covered(arms: []parser::Arm, members: []Type, table: TypeTable) -> bo
     loop {
         if i >= members.len { break }
         match members[i] {
-            Named as nm => { if !some_arm_names(arms, nm.name) { return false } }
+            Named as nm => { if !some_arm_names(arms, nm.name, table) { return false } }
             _           => { if !some_arm_covers_type(arms, members[i], table) { return false } }
         }
         i++
@@ -268,11 +286,11 @@ fn variant_covered(arms: []parser::Arm, members: []Type, table: TypeTable) -> bo
 }
 
 // (C7b) every member of the enum must be covered by some unguarded arm (by name).
-fn enum_covered(arms: []parser::Arm, eb: parser::EnumBody) -> bool {
+fn enum_covered(arms: []parser::Arm, eb: parser::EnumBody, table: TypeTable) -> bool {
     mut i = 0
     loop {
         if i >= eb.members.len { break }
-        if !some_arm_names(arms, eb.members[i]) { return false }
+        if !some_arm_names(arms, eb.members[i], table) { return false }
         i++
     }
     true
@@ -321,7 +339,7 @@ fn exhaustive(arms: []parser::Arm, subject: Type, table: TypeTable) -> bool {
             match type_table_find(table, n.name) {
                 parser::TypeDecl as td => {
                     match td.body {
-                        parser::EnumBody as eb => return enum_covered(arms, eb)
+                        parser::EnumBody as eb => return enum_covered(arms, eb, table)
                         _                      => {}
                     }
                 }

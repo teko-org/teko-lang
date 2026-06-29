@@ -65,7 +65,10 @@ typedef struct { tk_expr *expr; tk_type_expr target; }       tk_cast;          /
 typedef struct { tk_path path; }                             tk_path_expr;     // Enum::Member as a VALUE
 // Name { field = value, … } — a struct VALUE constructor (W4a). Parallel arrays (field_vals is a
 // flat tk_expr array like tk_call.args — by-value tk_expr is incomplete here, so pointer fields).
-typedef struct { tk_path type_path; tk_str *field_names; tk_expr *field_vals; size_t nfields; } tk_struct_lit;
+// (W9.4) `type_args` carries explicit generic type-arguments at the construction site —
+// `Foo<i64>{ … }` → type_args=[i64], so the literal targets the stamped instance `Foo__g__i64`
+// with NO `let x: Foo<i64> = …` annotation. NULL/0 for the bare `Foo { … }` form (unchanged).
+typedef struct { tk_path type_path; tk_type_expr *type_args; size_t nargs; tk_str *field_names; tk_expr *field_vals; size_t nfields; } tk_struct_lit;
 typedef struct { tk_expr *receiver; tk_expr *index; }       tk_index;         // recv[index] — str→byte, []T→T (W5-idx)
 // `$"pre {a} mid {b} post"` — string interpolation (self-host parity). The string is
 // pieces[0] ++ str(holes[0]) ++ pieces[1] ++ … ++ pieces[nholes] — so npieces == nholes + 1.

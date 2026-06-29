@@ -68,4 +68,9 @@ tk_type_table tk_instantiate_types(tk_program program, tk_type_table table);
 bool tk_name_is_g_instance(tk_str name);
 void tk_table_generic_instances(tk_type_table table, tk_type_decl **out, size_t *n);
 
+// (W9.4) NORMALIZE generic-INSTANCE references in a type-decl to the bare stamped name (`Gen<i64>`
+// member → `Gen__g__i64`), so the syntactic body codegen/VM/TKB read agrees with the resolved value
+// type. No-op when the body has no generic-instance reference. Mirror of resolve.tks::normalize_inst_decl.
+tk_type_decl tk_normalize_inst_decl(tk_type_decl d, tk_type_table table);
+
 #endif // TK_CHECK_RESOLVE_H

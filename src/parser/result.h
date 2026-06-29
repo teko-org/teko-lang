@@ -26,6 +26,7 @@
 typedef struct { tk_expr      node;       size_t next; } tk_parsed;          // an expression
 typedef struct { tk_statement node;       size_t next; } tk_parsed_stmt;     // a statement
 typedef struct { tk_type_expr node;       size_t next; size_t pending_gt; } tk_parsed_type;     // a type expr; pending_gt = extra `>` left by a compound `>>` close (S4 nested generics)
+typedef struct { tk_type_expr *args; size_t nargs; size_t next; size_t pending_gt; } tk_parsed_type_args; // (W9.4) a `<T1, T2, …>` arg list at a construction/pattern site; pending_gt = extra `>` left by a `>>` close
 typedef struct { tk_decl      node;       size_t next; } tk_parsed_decl;     // a top-level declaration (R-main)
 typedef struct { tk_statement *statements; size_t n; size_t next; } tk_parsed_block;  // a `{ … }` block
 typedef struct { tk_type_body node;       size_t next; } tk_parsed_body;     // a struct/enum/variant body
@@ -52,6 +53,7 @@ typedef struct { tk_module    node;  size_t next; }              tk_parsed_modul
 TK_RESULT(tk_parsed,            tk_parsed_result);
 TK_RESULT(tk_parsed_stmt,       tk_parsed_stmt_result);
 TK_RESULT(tk_parsed_type,       tk_parsed_type_result);
+TK_RESULT(tk_parsed_type_args,  tk_parsed_type_args_result);
 TK_RESULT(tk_parsed_decl,       tk_parsed_decl_result);
 TK_RESULT(tk_parsed_block,      tk_parsed_block_result);
 TK_RESULT(tk_parsed_body,       tk_parsed_body_result);

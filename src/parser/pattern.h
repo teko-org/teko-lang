@@ -27,7 +27,8 @@ typedef struct { tk_expr value; }                                   tk_literal_p
 typedef struct { tk_expr lo; tk_expr hi; }                          tk_range_pattern;    // lo ..= hi (inclusive)
 typedef struct { tk_pattern *options; size_t n_options; }           tk_alt_pattern;      // a | b | … (value axis)
 typedef struct { tk_path type_name; bool has_binding; tk_str binding;
-                 bool is_slice; tk_type_expr *slice_type; }            tk_bind_pattern; // `Foo` / `Foo as x` / `[]T as x` (is_slice: type_name unused, slice_type holds the `[]T`)
+                 bool is_slice; tk_type_expr *slice_type;
+                 tk_type_expr *type_args; size_t nargs; }              tk_bind_pattern; // `Foo` / `Foo as x` / `[]T as x` (is_slice: type_name unused, slice_type holds the `[]T`); (W9.4) type_args = explicit `Foo<i64> as x` generic args (NULL/0 otherwise, never with is_slice)
 typedef struct { tk_path type_name; tk_str *fields; size_t n_fields; }  tk_field_pattern; // Type { f; g }
 typedef struct { int _unused; }                                     tk_wildcard_pattern; // _ (no payload)
 typedef struct { int _unused; }                                     tk_null_pattern;     // null — matches the NONE of an optional `T?` (REBOOT_PLAN §202); no payload

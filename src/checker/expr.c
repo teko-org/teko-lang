@@ -716,8 +716,26 @@ tk_texpr_result tk_type_struct_lit(tk_struct_lit sl, tk_type expected, tk_env en
     tk_str name = nt.as.value.as.named.name;
     tk_decl_result decl = tk_type_table_find(table, name);
     if (!decl.ok) return xerr("unknown type in a struct literal");
+    // (W9.4) explicit construction-site type-args `Foo<i64>{ … }` resolve to the concrete instance
+    // `Foo__g__i64` directly — NO annotation required. This OVERRIDES `expected`: build the synthetic
+    // generic type-expr and resolve it (the same path as an annotation), which validates arity and
+    // rejects a non-generic-with-args. The instance decl is stamped by tk_instantiate_types (fed from
+    // the construction site). If the annotation is ANOTHER instance of the SAME generic base, the two
+    // must name the same instance; if it is a wider type (a variant the instance widens into), the
+    // ordinary binding-level widening check below handles it (so `let w: Wrap = Gen<i64>{…}` is fine).
+    if (sl.nargs > 0) {
+        tk_type_expr gte = { .tag = TK_TEXPR_NAMED, .as.named = { .path = sl.type_path, .args = sl.type_args, .args_len = sl.nargs } };
+        tk_type_result git = tk_resolve_type(gte, table);
+        if (!git.ok) return xferr(git.as.error);
+        if (git.as.value.tag != TK_TYPE_NAMED) return xerr("explicit type-arguments did not resolve to a struct instance");
+        if (expected.tag == TK_TYPE_NAMED && name_has_generic_base(expected.as.named.name, name)
+            && !tk_str_eq(expected.as.named.name, git.as.value.as.named.name))
+            return xerr("the explicit type-arguments at construction disagree with the annotated type");
+        expected = git.as.value;   // retarget below as if annotated
+    }
     // (S4) constructing a GENERIC struct → retarget to the concrete instance named by `expected`
-    // (the annotation), so `Box { … }` under `: Box<i64>` builds `Box__g__i64` (fields T→i64).
+    // (the annotation OR the W9.4 construction-site type-args), so `Box { … }` under `: Box<i64>`
+    // (or `Box<i64> { … }`) builds `Box__g__i64` (fields T→i64).
     if (decl.as.value.n_type_params > 0) {
         if (expected.tag != TK_TYPE_NAMED)
             return xerr("cannot infer the type arguments of a generic struct here — annotate it (e.g. `let x: Box<…> = …`)");

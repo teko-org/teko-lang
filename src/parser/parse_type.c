@@ -46,6 +46,38 @@ static tk_parsed_type_result parse_named(const tk_token *t, size_t n, size_t pos
     }
 }
 
+// (W9.4) parse a `<T1, T2, …>` type-argument list — `pos` is at the `<`. Mirrors parse_named's `<…>`
+// loop, but standalone (shared by struct-construction `Foo<i64>{…}` and the `Foo<i64> as x` pattern).
+// Returns ok=false to backtrack when it is not a closed list (so a bare `<` stays a comparison). The
+// `>>` (Shr) compound closes THIS list with one `>` and leaves a `pending_gt` for an enclosing close.
+tk_parsed_type_args_result tk_parse_type_args(const tk_token *t, size_t n, size_t pos) {
+    if (!tk_is_kind_at(t, n, pos, TK_TOKEN_LT)) { return (tk_parsed_type_args_result){ .ok = false }; }
+    tk_type_expr *args = NULL; size_t nargs = 0;
+    size_t p = pos + 1;
+    for (;;) {
+        tk_parsed_type_result a = tk_parse_type(t, n, p);
+        if (!a.ok) { return (tk_parsed_type_args_result){ .ok = false }; }   // not a type → backtrack
+        tk_types_push(&args, &nargs, a.as.value.node);
+        // a nested generic closed with a compound `>>`: the arg carries a leftover `>` that closes
+        // THIS list. Consume one; pass any remainder (deeper nesting) up via pending_gt.
+        if (a.as.value.pending_gt > 0) {
+            return (tk_parsed_type_args_result){ .ok = true,
+                .as.value = { .args = args, .nargs = nargs, .next = a.as.value.next, .pending_gt = a.as.value.pending_gt - 1 } };
+        }
+        p = a.as.value.next;
+        if (tk_is_kind_at(t, n, p, TK_TOKEN_COMMA)) { p += 1; continue; }
+        if (tk_is_kind_at(t, n, p, TK_TOKEN_GT)) {
+            return (tk_parsed_type_args_result){ .ok = true,
+                .as.value = { .args = args, .nargs = nargs, .next = p + 1, .pending_gt = 0 } };
+        }
+        if (tk_is_kind_at(t, n, p, TK_TOKEN_SHR)) {
+            return (tk_parsed_type_args_result){ .ok = true,
+                .as.value = { .args = args, .nargs = nargs, .next = p + 1, .pending_gt = 1 } };
+        }
+        return (tk_parsed_type_args_result){ .ok = false };   // not a closed arg list → backtrack
+    }
+}
+
 static tk_parsed_type_result parse_slice(const tk_token *t, size_t n, size_t pos) {
     if (!tk_is_kind_at(t, n, pos + 1, TK_TOKEN_RBRACKET)) {
         return (tk_parsed_type_result){ .ok = false,

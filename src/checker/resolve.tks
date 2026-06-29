@@ -609,10 +609,88 @@ fn collect_stmts_insts(stmts: []parser::Statement, acc: []parser::TypeExpr) -> [
     loop { if i >= stmts.len { break }; out = collect_stmt_insts(stmts[i], out); i++ }
     out
 }
+
+// (W9.4) collect the generic instance a construction-site / bind-pattern type-arg list names: synthesize
+// the NamedType `<path><args>` and run it through collect_texpr_insts (which pushes it AND recurses into
+// the args), so `Foo<i64>{…}` / `Foo<i64> as x` get `Foo__g__i64` stamped exactly like an annotation.
+fn collect_site_args(path: parser::Path, args: []parser::TypeExpr, acc: []parser::TypeExpr) -> []parser::TypeExpr {
+    if args.len == 0 { return acc }
+    collect_texpr_insts(parser::NamedType { path = path; args = args }, acc)
+}
+
+// (W9.4) walk an expression for construction-site type-args (`Foo<i64>{…}`) and nested patterns.
+fn collect_expr_insts(e: parser::Expr, acc: []parser::TypeExpr) -> []parser::TypeExpr {
+    mut out = acc
+    match e.kind {
+        parser::StructLit as sl => {
+            out = collect_site_args(sl.type_path, sl.type_args, out)
+            mut i = 0
+            loop { if i >= sl.field_vals.len { break }; out = collect_expr_insts(sl.field_vals[i], out); i++ }
+        }
+        parser::Binary as b  => { out = collect_expr_insts(b.left, out); out = collect_expr_insts(b.right, out) }
+        parser::Unary as u   => out = collect_expr_insts(u.operand, out)
+        parser::Compare as c => {
+            out = collect_expr_insts(c.first, out)
+            mut i = 0
+            loop { if i >= c.rest.len { break }; out = collect_expr_insts(c.rest[i].operand, out); i++ }
+        }
+        parser::Call as call => { mut i = 0; loop { if i >= call.args.len { break }; out = collect_expr_insts(call.args[i], out); i++ } }
+        parser::IfExpr as f  => {
+            out = collect_expr_insts(f.cond, out)
+            out = collect_stmts_insts(f.then_blk, out)
+            if f.has_else { out = collect_stmts_insts(f.else_blk, out) }
+        }
+        parser::MatchExpr as m => {
+            out = collect_expr_insts(m.subject, out)
+            mut i = 0
+            loop {
+                if i >= m.arms.len { break }
+                out = collect_pattern_insts(m.arms[i].pattern, out)
+                if m.arms[i].has_when { out = collect_expr_insts(m.arms[i].guard, out) }
+                out = collect_stmts_insts(m.arms[i].body, out)
+                i++
+            }
+        }
+        parser::FieldAccess as fa => out = collect_expr_insts(fa.receiver, out)
+        parser::SafeFieldAccess as sfa => out = collect_expr_insts(sfa.receiver, out)
+        parser::Coalesce as co => { out = collect_expr_insts(co.left, out); out = collect_expr_insts(co.right, out) }
+        parser::MethodCall as mc => {
+            out = collect_expr_insts(mc.receiver, out)
+            mut i = 0
+            loop { if i >= mc.args.len { break }; out = collect_expr_insts(mc.args[i], out); i++ }
+        }
+        parser::Cast as ct => out = collect_expr_insts(ct.expr, out)
+        parser::Index as ix => { out = collect_expr_insts(ix.receiver, out); out = collect_expr_insts(ix.index, out) }
+        parser::Interp as ip => { mut i = 0; loop { if i >= ip.holes.len { break }; out = collect_expr_insts(ip.holes[i], out); i++ } }
+        parser::InExpr as ie => {
+            out = collect_expr_insts(ie.lhs, out)
+            mut i = 0
+            loop { if i >= ie.elems.len { break }; out = collect_expr_insts(ie.elems[i], out); i++ }
+        }
+        parser::ArrayLit as al => { mut i = 0; loop { if i >= al.elements.len { break }; out = collect_expr_insts(al.elements[i].expr, out); i++ } }
+        _ => {}   // leaves (Number/Var/StrLit/ByteLit/BoolLit/NullLit/PathExpr) carry no type-args
+    }
+    out
+}
+
+// (W9.4) walk a pattern for bind-pattern type-args (`Foo<i64> as x`, incl alt options).
+fn collect_pattern_insts(p: parser::Pattern, acc: []parser::TypeExpr) -> []parser::TypeExpr {
+    mut out = acc
+    match p {
+        parser::BindPattern as bp => { if !bp.is_slice { out = collect_site_args(bp.type_name, bp.type_args, out) } }
+        parser::AltPattern as ap  => { mut i = 0; loop { if i >= ap.options.len { break }; out = collect_pattern_insts(ap.options[i], out); i++ } }
+        _ => {}
+    }
+    out
+}
+
 fn collect_stmt_insts(s: parser::Statement, acc: []parser::TypeExpr) -> []parser::TypeExpr {
     mut out = acc
     match s {
-        parser::Binding as b   => { if b.has_type { out = collect_texpr_insts(b.type_ann, out) } }
+        parser::Binding as b   => { if b.has_type { out = collect_texpr_insts(b.type_ann, out) }; out = collect_expr_insts(b.value, out) }
+        parser::Assign as a    => out = collect_expr_insts(a.value, out)
+        parser::Return as r    => { if r.has_value { out = collect_expr_insts(r.value, out) } }
+        parser::ExprStmt as es => out = collect_expr_insts(es.expr, out)
         parser::LoopStmt as l  => out = collect_stmts_insts(l.body, out)
         parser::DeferStmt as d => out = collect_stmts_insts(d.body, out)
         _                      => {}
@@ -681,7 +759,9 @@ pub fn instantiate_types(program: parser::Program, table: TypeTable) -> TypeTabl
             _ => continue
         }
     }
-    tbl
+    // (W9.4) normalize generic-INSTANCE references in the stamped bodies to bare stamped names, so
+    // codegen / VM / TKB (reading the syntactic body) agree with the resolved value types.
+    normalize_table_instances(tbl)
 }
 
 // does `name` carry the `__g__` generic-instance infix? (the collision-proof marker a stamped
@@ -707,6 +787,95 @@ pub fn table_generic_instances(table: TypeTable) -> []parser::TypeDecl {
         if i >= table.len { break }
         if name_is_g_instance(table[i].name) {
             if table[i].decl.type_params.len == 0 { out = teko::list::push(out, table[i].decl) }
+        }
+        i++
+    }
+    out
+}
+
+// (W9.4) NORMALIZE generic-INSTANCE references in a (syntactic) type-expr to the BARE stamped name.
+// A `Base<args>` reference where `Base` is a user-defined generic (so it resolves to a stamped
+// `Base__g__<mangle>` instance) is rewritten to a bare `NamedType{[Base__g__mangle]}` with NO args,
+// so codegen / VM / TKB (which read the SYNTACTIC declaration body) carry the SAME stamped name the
+// RESOLVED value type carries. A type-PARAMETER name (`T`, args_len == 0) is NOT rewritten; builtin
+// `ptr<T>`/`Ref<T>` (which resolve to Ptr/Ref, not a Named instance) keep their structural shape and
+// their args are normalized recursively. NO-OP when the expr carries no generic-instance reference.
+// (C: tk_normalize_inst_texpr.)
+fn normalize_inst_texpr(te: parser::TypeExpr, table: TypeTable) -> parser::TypeExpr {
+    match te {
+        parser::NamedType as nt => {
+            if nt.args.len > 0 {
+                // does this `Base<args>` resolve to a stamped user generic instance? (resolve_type
+                // → resolve_generic_inst yields Named{Base__g__mangle}; ptr/Ref yield Ptr/Ref.)
+                match resolve_type(te, table) {
+                    Type as rt => {
+                        match rt {
+                            Named as rn => {
+                                if name_is_g_instance(rn.name) {
+                                    let seg = parser::Segment { name = rn.name }
+                                    return parser::NamedType { path = parser::Path { segments = teko::list::push(teko::list::empty(), seg) }; args = teko::list::empty() }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    error => {}
+                }
+            }
+            // not a stamped instance (plain name, type-param, or builtin) → recurse into the args.
+            mut nargs: []parser::TypeExpr = teko::list::empty()
+            mut j = 0
+            loop { if j >= nt.args.len { break }; nargs = teko::list::push(nargs, normalize_inst_texpr(nt.args[j], table)); j++ }
+            parser::NamedType { path = nt.path; args = nargs }
+        }
+        parser::SliceType as st    => parser::SliceType { element = normalize_inst_texpr(st.element, table) }
+        parser::OptionalType as ot => parser::OptionalType { inner = normalize_inst_texpr(ot.inner, table) }
+        parser::UnionType as ut    => {
+            mut ms: []parser::TypeExpr = teko::list::empty()
+            mut i = 0
+            loop { if i >= ut.members.len { break }; ms = teko::list::push(ms, normalize_inst_texpr(ut.members[i], table)); i++ }
+            parser::UnionType { members = ms }
+        }
+    }
+}
+
+// (W9.4) normalize generic-instance references throughout a type-decl BODY. (C: normalize_inst_body.)
+fn normalize_inst_body(body: parser::TypeBody, table: TypeTable) -> parser::TypeBody {
+    match body {
+        parser::StructBody as sb => {
+            mut nf: []parser::Field = teko::list::empty()
+            mut i = 0
+            loop { if i >= sb.fields.len { break }; nf = teko::list::push(nf, parser::Field { name = sb.fields[i].name; type_ann = normalize_inst_texpr(sb.fields[i].type_ann, table) }); i++ }
+            parser::StructBody { fields = nf }
+        }
+        parser::VariantBody as vb => parser::VariantBody { type_expr = normalize_inst_texpr(vb.type_expr, table) }
+        parser::AliasBody as ab   => parser::AliasBody { alias = normalize_inst_texpr(ab.alias, table) }
+        _                         => body
+    }
+}
+
+// (W9.4) normalize generic-instance references throughout a type-decl. Used by the typer to rewrite
+// BOTH the stamped instances (in the table) AND every non-generic decl item (e.g. `Wrap` whose
+// variant member is `Gen<i64>`), so the syntactic body codegen/VM read agrees with the resolved
+// type. A NO-OP when the body has no generic-instance reference. (C: tk_normalize_inst_decl.)
+pub fn normalize_inst_decl(d: parser::TypeDecl, table: TypeTable) -> parser::TypeDecl {
+    parser::TypeDecl { name = d.name; type_params = d.type_params; body = normalize_inst_body(d.body, table); vis = d.vis; has_doc = d.has_doc; doc = d.doc; line = d.line; col = d.col }
+}
+
+// (W9.4) normalize EVERY stamped generic-instance decl's body in the table, so table_generic_instances
+// (which the mono pass emits as program items) carries bare stamped names. Non-`__g__` entries (the
+// templates + ordinary decls) pass through unchanged here; ordinary decls are normalized as program
+// ITEMS by the typer (their bodies do not live in the emitted table). (C: tk_normalize_table_instances.)
+pub fn normalize_table_instances(table: TypeTable) -> TypeTable {
+    mut out: TypeTable = teko::list::empty()
+    mut i = 0
+    loop {
+        if i >= table.len { break }
+        if name_is_g_instance(table[i].name) {
+            let nd = normalize_inst_decl(table[i].decl, table)
+            out = teko::list::push(out, TypeReg { name = table[i].name; namespace = table[i].namespace; vis = table[i].vis; decl = nd })
+        } else {
+            out = teko::list::push(out, table[i])
         }
         i++
     }

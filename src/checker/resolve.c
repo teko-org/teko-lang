@@ -495,9 +495,82 @@ static void collect_body_insts(tk_type_body body, tk_type_expr **acc, size_t *n)
     }
 }
 static void collect_stmts_insts(tk_statement *stmts, size_t ns, tk_type_expr **acc, size_t *n);
+static void collect_expr_insts(tk_expr e, tk_type_expr **acc, size_t *n);
+static void collect_pattern_insts(tk_pattern p, tk_type_expr **acc, size_t *n);
+
+// (W9.4) collect the generic instance a construction-site / bind-pattern type-arg list names: synthesize
+// the NamedType `<path><args>` and run it through collect_texpr_insts (which pushes it AND recurses into
+// the args), so `Foo<i64>{…}` / `Foo<i64> as x` get `Foo__g__i64` stamped exactly like an annotation.
+static void collect_site_args(tk_path path, tk_type_expr *args, size_t nargs, tk_type_expr **acc, size_t *n) {
+    if (nargs == 0) return;
+    tk_type_expr gte = { .tag = TK_TEXPR_NAMED, .as.named = { .path = path, .args = args, .args_len = nargs } };
+    collect_texpr_insts(gte, acc, n);
+}
+
+// (W9.4) walk an expression for construction-site type-args (`Foo<i64>{…}`) and nested patterns.
+static void collect_expr_insts(tk_expr e, tk_type_expr **acc, size_t *n) {
+    switch (e.tag) {
+        case TK_EXPR_STRUCT_LIT:
+            collect_site_args(e.as.struct_lit.type_path, e.as.struct_lit.type_args, e.as.struct_lit.nargs, acc, n);
+            for (size_t i = 0; i < e.as.struct_lit.nfields; i += 1) collect_expr_insts(e.as.struct_lit.field_vals[i], acc, n);
+            break;
+        case TK_EXPR_BINARY:   collect_expr_insts(*e.as.binary.left, acc, n); collect_expr_insts(*e.as.binary.right, acc, n); break;
+        case TK_EXPR_UNARY:    collect_expr_insts(*e.as.unary.operand, acc, n); break;
+        case TK_EXPR_COMPARE:
+            collect_expr_insts(*e.as.compare.first, acc, n);
+            for (size_t i = 0; i < e.as.compare.nrest; i += 1) collect_expr_insts(*e.as.compare.rest[i].operand, acc, n);
+            break;
+        case TK_EXPR_CALL:     for (size_t i = 0; i < e.as.call.nargs; i += 1) collect_expr_insts(e.as.call.args[i], acc, n); break;
+        case TK_EXPR_IF:
+            collect_expr_insts(*e.as.if_expr.cond, acc, n);
+            collect_stmts_insts(e.as.if_expr.then_blk, e.as.if_expr.nthen, acc, n);
+            if (e.as.if_expr.has_else) collect_stmts_insts(e.as.if_expr.else_blk, e.as.if_expr.nelse, acc, n);
+            break;
+        case TK_EXPR_MATCH:
+            collect_expr_insts(*e.as.match_expr.subject, acc, n);
+            for (size_t i = 0; i < e.as.match_expr.narms; i += 1) {
+                tk_arm a = e.as.match_expr.arms[i];
+                collect_pattern_insts(a.pattern, acc, n);
+                if (a.has_when) collect_expr_insts(a.guard, acc, n);
+                collect_stmts_insts(a.body, a.nbody, acc, n);
+            }
+            break;
+        case TK_EXPR_FIELD_ACCESS:      collect_expr_insts(*e.as.field_access.receiver, acc, n); break;
+        case TK_EXPR_SAFE_FIELD_ACCESS: collect_expr_insts(*e.as.safe_field_access.receiver, acc, n); break;
+        case TK_EXPR_COALESCE:          collect_expr_insts(*e.as.coalesce.left, acc, n); collect_expr_insts(*e.as.coalesce.right, acc, n); break;
+        case TK_EXPR_METHOD_CALL:
+            collect_expr_insts(*e.as.method_call.receiver, acc, n);
+            for (size_t i = 0; i < e.as.method_call.nargs; i += 1) collect_expr_insts(e.as.method_call.args[i], acc, n);
+            break;
+        case TK_EXPR_CAST:     collect_expr_insts(*e.as.cast.expr, acc, n); break;
+        case TK_EXPR_INDEX:    collect_expr_insts(*e.as.index.receiver, acc, n); collect_expr_insts(*e.as.index.index, acc, n); break;
+        case TK_EXPR_INTERP:   for (size_t i = 0; i < e.as.interp.nholes; i += 1) collect_expr_insts(e.as.interp.holes[i], acc, n); break;
+        case TK_EXPR_IN:
+            collect_expr_insts(*e.as.in_expr.lhs, acc, n);
+            for (size_t i = 0; i < e.as.in_expr.nelems; i += 1) collect_expr_insts(e.as.in_expr.elems[i], acc, n);
+            break;
+        case TK_EXPR_ARRAY:    for (size_t i = 0; i < e.as.array.nelements; i += 1) collect_expr_insts(*e.as.array.elements[i].expr, acc, n); break;
+        default: break;   // leaves (NUMBER/VAR/STR/BYTE/BOOL/NULL/PATH) carry no type-args
+    }
+}
+
+// (W9.4) walk a pattern for bind-pattern type-args (`Foo<i64> as x`, incl alt options).
+static void collect_pattern_insts(tk_pattern p, tk_type_expr **acc, size_t *n) {
+    if (p.tag == TK_PAT_BIND && !p.as.bind.is_slice)
+        collect_site_args(p.as.bind.type_name, p.as.bind.type_args, p.as.bind.nargs, acc, n);
+    else if (p.tag == TK_PAT_ALT)
+        for (size_t i = 0; i < p.as.alt.n_options; i += 1) collect_pattern_insts(p.as.alt.options[i], acc, n);
+}
+
 static void collect_stmt_insts(tk_statement s, tk_type_expr **acc, size_t *n) {
     switch (s.tag) {
-        case TK_STMT_BINDING: if (s.as.binding.has_type) collect_texpr_insts(s.as.binding.type_ann, acc, n); break;
+        case TK_STMT_BINDING:
+            if (s.as.binding.has_type) collect_texpr_insts(s.as.binding.type_ann, acc, n);
+            collect_expr_insts(s.as.binding.value, acc, n);
+            break;
+        case TK_STMT_ASSIGN:  collect_expr_insts(s.as.assign.value, acc, n); break;
+        case TK_STMT_RETURN:  if (s.as.ret.has_value) collect_expr_insts(s.as.ret.value, acc, n); break;
+        case TK_STMT_EXPR:    collect_expr_insts(s.as.expr_stmt.expr, acc, n); break;
         case TK_STMT_LOOP:    collect_stmts_insts(s.as.loop_stmt.body, s.as.loop_stmt.nbody, acc, n); break;
         case TK_STMT_DEFER:   collect_stmts_insts(s.as.defer_stmt.body, s.as.defer_stmt.nbody, acc, n); break;
         default: break;
@@ -524,6 +597,7 @@ static void collect_item_insts(tk_item it, tk_type_expr **acc, size_t *n) {
 // THE PASS: stamp concrete decls for written generic uses into the table (dedup by mangled name),
 // scanning each stamped body for transitive instantiations until the worklist drains. No-op (the
 // table is returned unchanged) when no generic type is used. Mirror of resolve.tks::instantiate_types.
+static tk_type_table normalize_table_instances(tk_type_table table);   // (W9.4) forward decl (defined below)
 tk_type_table tk_instantiate_types(tk_program program, tk_type_table table) {
     tk_type_expr *work = NULL; size_t nwork = 0;
     for (size_t i = 0; i < program.len; i += 1) collect_item_insts(program.items[i], &work, &nwork);
@@ -553,7 +627,9 @@ tk_type_table tk_instantiate_types(tk_program program, tk_type_table table) {
         tbl = tk_type_table_push(tbl, (tk_type_reg){ .name = mangled, .namespace = (tk_str){0}, .vis = gen.vis, .decl = stamped });
         collect_body_insts(nbody, &work, &nwork);   // transitive instantiations in the stamped body
     }
-    return tbl;
+    // (W9.4) normalize generic-INSTANCE references in the stamped bodies to bare stamped names, so
+    // codegen / VM / TKB (reading the syntactic body) agree with the resolved value types.
+    return normalize_table_instances(tbl);
 }
 
 // does `name` carry the `__g__` generic-instance infix? Mirror of resolve.tks::name_is_g_instance.
@@ -576,6 +652,90 @@ void tk_table_generic_instances(tk_type_table table, tk_type_decl **out, size_t 
             (*out)[*n] = table.ptr[i].decl; *n += 1;
         }
     }
+}
+
+// (W9.4) NORMALIZE generic-INSTANCE references in a (syntactic) type-expr to the BARE stamped name.
+// A `Base<args>` reference where `Base` resolves to a stamped `Base__g__<mangle>` user generic
+// instance is rewritten to a bare `NAMED{[Base__g__mangle]}` with NO args, so codegen / VM / TKB
+// (which read the SYNTACTIC declaration body) carry the SAME stamped name the RESOLVED value type
+// carries. A type-PARAMETER (`T`, args_len 0) is NOT rewritten; builtin `ptr<T>`/`Ref<T>` (which
+// resolve to PTR/REF, not a NAMED instance) keep their shape with args normalized recursively.
+// NO-OP when the expr has no generic-instance reference. Mirror of resolve.tks::normalize_inst_texpr.
+static tk_type_expr normalize_inst_texpr(tk_type_expr te, tk_type_table table) {
+    switch (te.tag) {
+        case TK_TEXPR_NAMED: {
+            if (te.as.named.args_len > 0) {
+                tk_type_result r = tk_resolve_type(te, table);
+                if (r.ok && r.as.value.tag == TK_TYPE_NAMED && tk_name_is_g_instance(r.as.value.as.named.name)) {
+                    tk_segment *segs = NULL; size_t ns = 0;
+                    tk_segs_push(&segs, &ns, (tk_segment){ .name = r.as.value.as.named.name });
+                    return (tk_type_expr){ .tag = TK_TEXPR_NAMED, .as.named = { .path = { .segments = segs, .len = ns }, .args = NULL, .args_len = 0 } };
+                }
+            }
+            tk_type_expr *na = NULL; size_t n2 = 0;
+            for (size_t j = 0; j < te.as.named.args_len; j += 1)
+                tk_types_push(&na, &n2, normalize_inst_texpr(te.as.named.args[j], table));
+            return (tk_type_expr){ .tag = TK_TEXPR_NAMED, .as.named = { .path = te.as.named.path, .args = na, .args_len = n2 } };
+        }
+        case TK_TEXPR_SLICE:
+            if (!te.as.slice.element) return te;
+            return (tk_type_expr){ .tag = TK_TEXPR_SLICE, .as.slice = { .element = tk_box_type(normalize_inst_texpr(*te.as.slice.element, table)) } };
+        case TK_TEXPR_OPTIONAL:
+            if (!te.as.optional.inner) return te;
+            return (tk_type_expr){ .tag = TK_TEXPR_OPTIONAL, .as.optional = { .inner = tk_box_type(normalize_inst_texpr(*te.as.optional.inner, table)) } };
+        case TK_TEXPR_UNION: {
+            tk_type_expr *ms = NULL; size_t nm = 0;
+            for (size_t i = 0; i < te.as.uni.len; i += 1)
+                tk_types_push(&ms, &nm, normalize_inst_texpr(te.as.uni.members[i], table));
+            return (tk_type_expr){ .tag = TK_TEXPR_UNION, .as.uni = { .members = ms, .len = nm } };
+        }
+    }
+    return te;
+}
+
+// (W9.4) normalize generic-instance references throughout a type-decl BODY. Mirror of normalize_inst_body.
+static tk_type_body normalize_inst_body(tk_type_body body, tk_type_table table) {
+    switch (body.tag) {
+        case TK_BODY_STRUCT: {
+            tk_field *nf = NULL; size_t n = 0;
+            for (size_t i = 0; i < body.as.struct_body.n_fields; i += 1)
+                tk_fields_push(&nf, &n, (tk_field){ .name = body.as.struct_body.fields[i].name,
+                    .type_ann = normalize_inst_texpr(body.as.struct_body.fields[i].type_ann, table) });
+            return (tk_type_body){ .tag = TK_BODY_STRUCT, .as.struct_body = { .fields = nf, .n_fields = n } };
+        }
+        case TK_BODY_VARIANT:
+            return (tk_type_body){ .tag = TK_BODY_VARIANT, .as.variant_body = { .type_expr = normalize_inst_texpr(body.as.variant_body.type_expr, table) } };
+        case TK_BODY_ALIAS:
+            return (tk_type_body){ .tag = TK_BODY_ALIAS, .as.alias_body = { .alias = normalize_inst_texpr(body.as.alias_body.alias, table) } };
+        default: return body;
+    }
+}
+
+// (W9.4) normalize generic-instance references throughout a type-decl. Used by the typer to rewrite
+// BOTH the stamped instances (in the table) AND every non-generic decl item (e.g. `Wrap` whose
+// variant member is `Gen<i64>`). NO-OP when the body has no generic-instance reference. Mirror of
+// resolve.tks::normalize_inst_decl.
+tk_type_decl tk_normalize_inst_decl(tk_type_decl d, tk_type_table table) {
+    return (tk_type_decl){ .name = d.name, .type_params = d.type_params, .n_type_params = d.n_type_params,
+                           .body = normalize_inst_body(d.body, table), .vis = d.vis,
+                           .has_doc = d.has_doc, .doc = d.doc, .line = d.line, .col = d.col };
+}
+
+// (W9.4) normalize EVERY stamped generic-instance decl's body in the table, so tk_table_generic_instances
+// (the mono pass emits these as program items) carries bare stamped names. Non-`__g__` entries pass
+// through unchanged (templates + ordinary decls; ordinary decls are normalized as program ITEMS by the
+// typer). Mirror of resolve.tks::normalize_table_instances.
+static tk_type_table normalize_table_instances(tk_type_table table) {
+    tk_type_table out = (tk_type_table){0};
+    for (size_t i = 0; i < table.len; i += 1) {
+        if (tk_name_is_g_instance(table.ptr[i].name)) {
+            tk_type_decl nd = tk_normalize_inst_decl(table.ptr[i].decl, table);
+            out = tk_type_table_push(out, (tk_type_reg){ .name = table.ptr[i].name, .namespace = table.ptr[i].namespace, .vis = table.ptr[i].vis, .decl = nd });
+        } else {
+            out = tk_type_table_push(out, table.ptr[i]);
+        }
+    }
+    return out;
 }
 
 // A NAMED type referring to a `variant` decl → its expanded TK_TYPE_VARIANT. A variant decl's

@@ -456,7 +456,7 @@ tk_titem_result tk_type_item(tk_item item, tk_env env, tk_type_table table) {
             tf.as.value.col  = item.as.function.col;
             return (tk_titem_result){ .ok = true, .as.value = { .tag = TK_TITEM_FUNCTION, .as.function = tf.as.value } };
         }
-        case TK_ITEM_TYPE_DECL: return (tk_titem_result){ .ok = true, .as.value = { .tag = TK_TITEM_TYPE_DECL, .as.type_decl = item.as.type_decl } };
+        case TK_ITEM_TYPE_DECL: return (tk_titem_result){ .ok = true, .as.value = { .tag = TK_TITEM_TYPE_DECL, .as.type_decl = tk_normalize_inst_decl(item.as.type_decl, table) } };   // (W9.4) `Gen<i64>` member refs → bare stamped `Gen__g__i64` (no-op when none)
         case TK_ITEM_USE:       return (tk_titem_result){ .ok = true, .as.value = { .tag = TK_TITEM_USE, .as.use_decl = item.as.use_decl } };
         case TK_ITEM_STATEMENT: {
             tk_typed_stmt_result ts = tk_type_statement(item.as.statement, env, table);

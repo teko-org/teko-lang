@@ -78,3 +78,69 @@ fn firstg<T>(xs: []T) -> T { return xs[0] }
     let g: Gen<Gen<i64>> = Gen { val = Gen { val = 7 } }
     teko::assert::is_true(g.val.val == 7)
 }
+
+// (W9.4) construct a generic struct via EXPLICIT type-args with NO annotation — the construction-site
+// `Gen<i64>{ … }` stamps + targets Gen__g__i64 by itself. Runs VM==native via the gate.
+#test fn generic_struct_explicit_type_args_runs() {
+    let g = Gen<i64>{ val = 42 }
+    teko::assert::is_true(g.val == 42)
+}
+
+#test fn generic_struct_explicit_type_args_str_runs() {
+    let s = Gen<str>{ val = "ok" }
+    teko::assert::is_true(teko::runtime::str_eq(s.val, "ok"))
+}
+
+// (W9.4) nested explicit type-args at BOTH levels with NO annotation — `Gen<Gen<i64>>{ … }` outer +
+// `Gen<i64>{ … }` inner; stamps Gen__g__i64 + Gen__g__Gen__g__i64 from the construction sites alone.
+#test fn generic_struct_explicit_nested_runs() {
+    let g = Gen<Gen<i64>>{ val = Gen<i64>{ val = 7 } }
+    teko::assert::is_true(g.val.val == 7)
+}
+
+// (W9.4) GENERIC INSTANCE AS A VARIANT MEMBER — end-to-end (construct → wrap → match → bind), run
+// VM==native by the gate. The normalization pass rewrites the syntactic `Gen<i64>` in the variant
+// decl body to the bare stamped `Gen__g__i64`, so the typedef member key, the wrap, the match tag
+// and the VM case-name all agree. A non-generic member (`GenOther`) is the reference path.
+type GenOther = struct { x: i64 }
+type GenWrap  = variant Gen<i64> | GenOther
+type GenMulti = variant Gen<i64> | Gen<str> | GenOther
+
+fn gw_mk_gen() -> GenWrap   { return Gen<i64>{ val = 7 } }       // W9.4 syntax — no annotation
+fn gw_mk_gen_ann() -> GenWrap { let g: Gen<i64> = Gen { val = 7 }; return g }   // bare annotated form
+fn gw_mk_other() -> GenWrap { return GenOther{ x = 42 } }
+fn gm_mk_i() -> GenMulti { return Gen<i64>{ val = 100 } }
+fn gm_mk_s() -> GenMulti { return Gen<str>{ val = "hi" } }
+fn gm_mk_o() -> GenMulti { return GenOther{ x = 9 } }
+
+// the reproducer (bare annotated form) → 7.
+#test fn generic_variant_member_annotated_runs() {
+    let r = match gw_mk_gen_ann() { Gen<i64> as gg => gg.val; GenOther as o => o.x }
+    teko::assert::is_true(r == 7)
+}
+
+// the W9.4-syntax form (construct `Gen<i64>{ … }` with no annotation, wrap, match) → 7.
+#test fn generic_variant_member_explicit_runs() {
+    let r = match gw_mk_gen() { Gen<i64> as gg => gg.val; GenOther as o => o.x }
+    teko::assert::is_true(r == 7)
+}
+
+// the OTHER (non-generic) arm → its value, the reference path that already worked.
+#test fn generic_variant_member_other_arm_runs() {
+    let r = match gw_mk_other() { Gen<i64> as gg => gg.val; GenOther as o => o.x }
+    teko::assert::is_true(r == 42)
+}
+
+// multi-instance: a variant with `Gen<i64>` AND `Gen<str>` (distinct stamped members) — match each.
+#test fn generic_variant_multi_instance_i_runs() {
+    let r = match gm_mk_i() { Gen<i64> as a => a.val; Gen<str> as b => 1; GenOther as c => c.x }
+    teko::assert::is_true(r == 100)
+}
+#test fn generic_variant_multi_instance_s_runs() {
+    let r = match gm_mk_s() { Gen<i64> as a => a.val; Gen<str> as b => 2; GenOther as c => c.x }
+    teko::assert::is_true(r == 2)
+}
+#test fn generic_variant_multi_instance_o_runs() {
+    let r = match gm_mk_o() { Gen<i64> as a => a.val; Gen<str> as b => 3; GenOther as c => c.x }
+    teko::assert::is_true(r == 9)
+}

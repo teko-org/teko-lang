@@ -140,6 +140,94 @@ fn generic_lt_backtracks_to_comparison() {
     }
 }
 
+// (W9.4) struct construction with explicit type-args parses into StructLit.type_args.
+#test
+fn parses_struct_lit_type_args() {
+    // `Box<i64>{ value = 1 }` → StructLit with type_path Box, one type-arg i64, one field.
+    match expr_of("Box<i64>{ value = 1 }") {
+        StructLit as sl => {
+            teko::assert::is_true(sl.type_path.segments[sl.type_path.segments.len - 1].name == "Box")
+            teko::assert::is_true(sl.type_args.len == 1)
+            teko::assert::is_true(named_is(sl.type_args[0], "i64"))
+            teko::assert::is_true(sl.field_names.len == 1)
+        }
+        _ => teko::assert::is_true(false)
+    }
+    // the bare form keeps zero type-args (no regression).
+    match expr_of("Box{ value = 1 }") {
+        StructLit as sl => teko::assert::is_true(sl.type_args.len == 0)
+        _ => teko::assert::is_true(false)
+    }
+    // empty literal with type-args: `Foo<str>{ }`.
+    match expr_of("Foo<str>{ }") {
+        StructLit as sl => { teko::assert::is_true(sl.type_args.len == 1); teko::assert::is_true(sl.field_names.len == 0) }
+        _ => teko::assert::is_true(false)
+    }
+}
+
+// (W9.4) the `>>` Shr close-split works at a construction site: `Box<Box<i64>>{ … }`.
+#test
+fn parses_nested_struct_lit_type_args() {
+    match expr_of("Box<Box<i64>>{ value = 1 }") {
+        StructLit as sl => {
+            teko::assert::is_true(sl.type_args.len == 1)
+            match sl.type_args[0] {
+                NamedType as inner => { teko::assert::is_true(inner.path.segments[0].name == "Box"); teko::assert::is_true(inner.args.len == 1) }
+                _ => teko::assert::is_true(false)
+            }
+        }
+        _ => teko::assert::is_true(false)
+    }
+}
+
+// (W9.4) a `<`-after-name that is NOT a struct construction still backtracks to comparison.
+#test
+fn struct_lit_type_args_backtrack_to_comparison() {
+    // `a < b` is a comparison — there is no `{` after a closed `<…>`, so the speculative parse must
+    // backtrack and leave `<` to the comparison operator (no struct literal).
+    teko::assert::is_true(!expr_errors("a < b"))
+    match expr_of("a < b") {
+        Compare as c => teko::assert::is_true(c.rest.len == 1)
+        _            => teko::assert::is_true(false)
+    }
+}
+
+// (W9.4) bind patterns carry explicit type-args (`Foo<i64> as x`, incl `>>` split).
+#test
+fn parses_bind_pattern_type_args() {
+    match pattern_of("Foo<str> as x") {
+        BindPattern as bp => {
+            teko::assert::is_true(!bp.is_slice)
+            teko::assert::is_true(bp.has_binding)
+            teko::assert::is_true(bp.binding == "x")
+            teko::assert::is_true(bp.type_args.len == 1)
+            teko::assert::is_true(named_is(bp.type_args[0], "str"))
+        }
+        _ => teko::assert::is_true(false)
+    }
+    // bare `Foo<i64>` (no `as`) keeps the type-args and binds nothing.
+    match pattern_of("Foo<i64>") {
+        BindPattern as bp => { teko::assert::is_true(bp.type_args.len == 1); teko::assert::is_false(bp.has_binding) }
+        _ => teko::assert::is_true(false)
+    }
+    // nested `Box<Box<i64>> as x` — the `>>` close-split in pattern position.
+    match pattern_of("Box<Box<i64>> as x") {
+        BindPattern as bp => {
+            teko::assert::is_true(bp.type_args.len == 1)
+            match bp.type_args[0] {
+                NamedType as inner => teko::assert::is_true(inner.path.segments[0].name == "Box")
+                _ => teko::assert::is_true(false)
+            }
+        }
+        _ => teko::assert::is_true(false)
+    }
+    // plain `Foo as x` keeps zero type-args (no regression).
+    match pattern_of("Foo as x") {
+        BindPattern as bp => teko::assert::is_true(bp.type_args.len == 0)
+        _ => teko::assert::is_true(false)
+    }
+}
+
 #test
 fn parses_union_and_single() {
     // happy: A | B (arity 2), A | B | C (arity 3); a single primary is NOT wrapped (M.5).

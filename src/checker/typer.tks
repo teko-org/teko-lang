@@ -635,10 +635,29 @@ fn type_struct_lit(sl: parser::StructLit, expected: Type, env: Env, table: TypeT
         parser::TypeDecl as td => td
         error          => return error { message = $"unknown type in a struct literal: {name}" }
     }
-    // (S4) constructing a GENERIC struct → retarget to the concrete instance named by `expected` (the
-    // annotation), so `Box { … }` under `: Box<i64>` builds `Box__g__i64` (its fields are T→i64).
+    mut tgt = expected
+    // (W9.4) explicit construction-site type-args `Foo<i64>{ … }` resolve to the concrete instance
+    // `Foo__g__i64` directly — NO annotation required. This OVERRIDES `expected`: resolve the synthetic
+    // generic type (the same path as an annotation), which validates arity and rejects non-generic-with-args.
+    // The instance decl is stamped by instantiate_types (fed from the construction site). If the annotation
+    // is ANOTHER instance of the SAME generic base, the two must name the same instance; if it is a wider
+    // type (a variant the instance widens into), the binding-level widening check below handles it (so
+    // `let w: Wrap = Gen<i64>{…}` is fine).
+    if sl.type_args.len > 0 {
+        let gte = parser::NamedType { path = sl.type_path, args = sl.type_args }
+        let git = match resolve_type(gte, table) { Type as t => t; error as e => return e }
+        let ginst = match git { Named as gn => gn.name; _ => return error { message = "explicit type-arguments did not resolve to a struct instance" } }
+        match tgt {
+            Named as en => { if name_has_generic_base(en.name, base_name) && en.name != ginst { return error { message = "the explicit type-arguments at construction disagree with the annotated type" } } }
+            _           => {}
+        }
+        tgt = git   // retarget below as if annotated
+    }
+    // (S4) constructing a GENERIC struct → retarget to the concrete instance named by `tgt` (the
+    // annotation OR the W9.4 construction-site type-args), so `Box { … }` under `: Box<i64>`
+    // (or `Box<i64> { … }`) builds `Box__g__i64` (its fields are T→i64).
     if decl.type_params.len > 0 {
-        let mname = match expected {
+        let mname = match tgt {
             Named as en => en.name
             _           => return error { message = $"cannot infer the type arguments of `{base_name}` here — annotate it (e.g. `let x: {base_name}<…> = …`)" }
         }
@@ -1633,7 +1652,7 @@ fn type_item(item: parser::Item, env: Env, table: TypeTable) -> TItem | error {
             // (#49) stamp the declaring namespace from the parsed item so codegen mangles the C name.
             TFunction { name = tf.name; type_params = tf.type_params; params = tf.params; return_type = tf.return_type; body = tf.body; vis = tf.vis; has_doc = tf.has_doc; doc = tf.doc; namespace = item.namespace; file = item.file; line = f.line; col = f.col; is_test = tf.is_test; is_extern = tf.is_extern; c_symbol = tf.c_symbol; from_lib = tf.from_lib }
         }
-        parser::TypeDecl as td => td       // carries no expr → passes through (collect resolved its fields)
+        parser::TypeDecl as td => normalize_inst_decl(td, table)   // (W9.4) rewrite `Gen<i64>` member refs to the bare stamped `Gen__g__i64` (no-op when none); else passes through (collect resolved its fields)
         parser::UseDecl as ud  => ud       // seed no-op (alias resolution is the checker's, later)
         parser::Statement as s => {
             let ts = match type_statement(s, env, table) { TypedStmt as x => x; error as e => return e }

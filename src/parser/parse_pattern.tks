@@ -31,34 +31,45 @@ fn parse_pattern_primary(tokens: []lexer::Token, pos: u64) -> ParsedPattern | er
         // `as <name>` is OPTIONAL — a bare `[]T` is the bindingless form (≡ `[]T as _`).
         let ty = match parse_type_primary(tokens, pos) { ParsedType as x => x; error as e => return e }
         if !is_kind_at(tokens, ty.next, lexer::TokenKind::As) {   // bare `[]T` — match the slice case, bind nothing
-            return ParsedPattern { node = BindPattern { type_name = Path { segments = teko::list::empty() }, has_binding = false, binding = "", is_slice = true, slice_type = ty.node }, next = ty.next }
+            return ParsedPattern { node = BindPattern { type_name = Path { segments = teko::list::empty() }, has_binding = false, binding = "", is_slice = true, slice_type = ty.node, type_args = teko::list::empty() }, next = ty.next }
         }
         if is_kind_at(tokens, ty.next + 1, lexer::TokenKind::Underscore) {   // `[]T as _` — match the slice case, bind nothing
-            return ParsedPattern { node = BindPattern { type_name = Path { segments = teko::list::empty() }, has_binding = false, binding = "", is_slice = true, slice_type = ty.node }, next = ty.next + 2 }
+            return ParsedPattern { node = BindPattern { type_name = Path { segments = teko::list::empty() }, has_binding = false, binding = "", is_slice = true, slice_type = ty.node, type_args = teko::list::empty() }, next = ty.next + 2 }
         }
         if !is_name_at(tokens, ty.next + 1) {   // a binding name may be a contextual keyword (`in`/`to`/`type`)
             return err_at(tokens, ty.next + 1, "expected a name (or `_`) after `as` in a slice pattern")
         }
-        return ParsedPattern { node = BindPattern { type_name = Path { segments = teko::list::empty() }, has_binding = true, binding = tokens[ty.next + 1].text, is_slice = true, slice_type = ty.node }, next = ty.next + 2 }
+        return ParsedPattern { node = BindPattern { type_name = Path { segments = teko::list::empty() }, has_binding = true, binding = tokens[ty.next + 1].text, is_slice = true, slice_type = ty.node, type_args = teko::list::empty() }, next = ty.next + 2 }
     }
     if k == lexer::TokenKind::Ident {
         // `Foo as x` (bind), `Foo { f; g }` (field destructure), or bare `Foo` (match the
-        // case, no binding). [P3b / P3b-field]
+        // case, no binding). [P3b / P3b-field]; (W9.4) `Foo<i64> as x` carries explicit type-args.
         let pp = match parse_path(tokens, pos) { ParsedPath as x => x; error as e => return e }
-        if is_kind_at(tokens, pp.next, lexer::TokenKind::As) {
-            if is_kind_at(tokens, pp.next + 1, lexer::TokenKind::Underscore) {   // `Path as _` — match the case, discard the bind (≡ bare `Path`)
-                return ParsedPattern { node = BindPattern { type_name = pp.node, has_binding = false, binding = "", is_slice = false, slice_type = null }, next = pp.next + 2 }
+        mut after = pp.next
+        mut type_args: []TypeExpr = teko::list::empty()
+        // (W9.4) SPECULATIVE type-args — adopt only when fully closed (no pending `>>`); else backtrack.
+        if is_kind_at(tokens, after, lexer::TokenKind::Lt) {
+            match parse_type_args(tokens, after) {
+                ParsedTypeArgs as ta => {
+                    if ta.pending_gt == 0 { type_args = ta.args; after = ta.next }
+                }
+                error => { }
             }
-            if !is_name_at(tokens, pp.next + 1) {   // a binding name may be a contextual keyword (`in`/`to`/`type`)
-                return err_at(tokens, pp.next + 1, "expected a name (or `_`) after `as` in a pattern")
-            }
-            return ParsedPattern { node = BindPattern { type_name = pp.node, has_binding = true, binding = tokens[pp.next + 1].text, is_slice = false, slice_type = null }, next = pp.next + 2 }
         }
-        if is_kind_at(tokens, pp.next, lexer::TokenKind::LBrace) {
-            let fns = match parse_field_names(tokens, pp.next) { ParsedNames as x => x; error as e => return e }
+        if is_kind_at(tokens, after, lexer::TokenKind::As) {
+            if is_kind_at(tokens, after + 1, lexer::TokenKind::Underscore) {   // `Path as _` — match the case, discard the bind (≡ bare `Path`)
+                return ParsedPattern { node = BindPattern { type_name = pp.node, has_binding = false, binding = "", is_slice = false, slice_type = null, type_args = type_args }, next = after + 2 }
+            }
+            if !is_name_at(tokens, after + 1) {   // a binding name may be a contextual keyword (`in`/`to`/`type`)
+                return err_at(tokens, after + 1, "expected a name (or `_`) after `as` in a pattern")
+            }
+            return ParsedPattern { node = BindPattern { type_name = pp.node, has_binding = true, binding = tokens[after + 1].text, is_slice = false, slice_type = null, type_args = type_args }, next = after + 2 }
+        }
+        if type_args.len == 0 && is_kind_at(tokens, after, lexer::TokenKind::LBrace) {   // field destructure has no type-args (W9.4 scope = bind only)
+            let fns = match parse_field_names(tokens, after) { ParsedNames as x => x; error as e => return e }
             return ParsedPattern { node = FieldPattern { type_name = pp.node, fields = fns.names }, next = fns.next }
         }
-        return ParsedPattern { node = BindPattern { type_name = pp.node, has_binding = false, binding = "", is_slice = false, slice_type = null }, next = pp.next }
+        return ParsedPattern { node = BindPattern { type_name = pp.node, has_binding = false, binding = "", is_slice = false, slice_type = null, type_args = type_args }, next = after }
     }
     err_at(tokens, pos, "expected a pattern")
 }

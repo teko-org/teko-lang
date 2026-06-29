@@ -2597,6 +2597,17 @@ static bool cg_emit_case_key(cbuf *b, const tk_pattern *pat, const char **err) {
             return fail_node(err, "codegen: slice pattern without a slice type (internal)");
         return cg_member_key_texpr(b, *pat->as.bind.slice_type, err);
     }
+    // (W9.4) `Gen<i64> as x` — the case is the STAMPED instance `Gen__g__i64`, matching the variant
+    // typedef's member key (the decl was normalized to the bare stamped name). Build the synthetic
+    // NamedType `<path><args>` and mangle it (cg_texpr_mangle), then keyword-escape.
+    if (pat->tag == TK_PAT_BIND && pat->as.bind.nargs > 0) {
+        tk_type_expr gte = { .tag = TK_TEXPR_NAMED, .as.named = { .path = pat->as.bind.type_name, .args = pat->as.bind.type_args, .args_len = pat->as.bind.nargs } };
+        cbuf k = { NULL, 0, 0 };
+        cg_texpr_mangle(&k, gte);
+        cb_ident(b, (tk_str){ (const tk_byte *)k.ptr, k.len });
+        if (k.ptr) tk_free0(k.ptr);
+        return true;
+    }
     tk_path tn = (pat->tag == TK_PAT_FIELD) ? pat->as.field.type_name : pat->as.bind.type_name;
     // keyword-escape (cb_ident) so a `bool` case's `.as.bool_` field / `TK_TAG_..._BOOL_` tag
     // match the definitions (cg_member_key escapes the field+tag; the pattern side must agree).

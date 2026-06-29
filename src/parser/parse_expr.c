@@ -62,10 +62,12 @@ static tk_parsed_args_result parse_call_args(const tk_token *t, size_t n, size_t
 
 // `Name { field = value (, | ; | newline)* }` — a struct VALUE literal (W4a). `pos` is at `{`.
 // Field VALUES parse with struct allowed (they sit inside the literal's braces).
-static tk_parsed_result parse_struct_lit(const tk_token *t, size_t n, size_t pos, tk_path type_path) {
+// (W9.4) `type_args`/`nargs` are the explicit construction-site generic args (NULL/0 for the bare
+// `Name { … }` form). `pos` is at the `{`.
+static tk_parsed_result parse_struct_lit(const tk_token *t, size_t n, size_t pos, tk_path type_path, tk_type_expr *type_args, size_t nargs) {
     size_t p = tk_skip_seps(t, n, pos + 1);             // consume `{`, skip leading separators
     if (tk_is_kind_at(t, n, p, TK_TOKEN_RBRACE)) {     // empty literal `Name { }`
-        tk_expr e = tk_at((tk_expr){ .tag = TK_EXPR_STRUCT_LIT, .as.struct_lit = { .type_path = type_path, .field_names = NULL, .field_vals = NULL, .nfields = 0 } }, t, pos);
+        tk_expr e = tk_at((tk_expr){ .tag = TK_EXPR_STRUCT_LIT, .as.struct_lit = { .type_path = type_path, .type_args = type_args, .nargs = nargs, .field_names = NULL, .field_vals = NULL, .nfields = 0 } }, t, pos);
         return (tk_parsed_result){ .ok = true, .as.value = { .node = e, .next = p + 1 } };
     }
     tk_str *names = NULL; size_t nn = 0;
@@ -89,7 +91,7 @@ static tk_parsed_result parse_struct_lit(const tk_token *t, size_t n, size_t pos
         else return (tk_parsed_result){ .ok = false, .as.error = tk_err_at(t, n, p, "expected ',', ';', a newline, or '}' after a struct-literal field") };
         if (tk_is_kind_at(t, n, p, TK_TOKEN_RBRACE)) { break; }                              // trailing separator
     }
-    tk_expr e = tk_at((tk_expr){ .tag = TK_EXPR_STRUCT_LIT, .as.struct_lit = { .type_path = type_path, .field_names = names, .field_vals = vals, .nfields = nn } }, t, pos);
+    tk_expr e = tk_at((tk_expr){ .tag = TK_EXPR_STRUCT_LIT, .as.struct_lit = { .type_path = type_path, .type_args = type_args, .nargs = nargs, .field_names = names, .field_vals = vals, .nfields = nn } }, t, pos);
     return (tk_parsed_result){ .ok = true, .as.value = { .node = e, .next = p + 1 } };
 }
 
@@ -255,9 +257,18 @@ static tk_parsed_result parse_atom(const tk_token *t, size_t n, size_t pos, bool
                 .args = ca.as.value.args, .nargs = ca.as.value.n_args } }, t, pos);
             return (tk_parsed_result){ .ok = true, .as.value = { .node = e, .next = ca.as.value.next } };
         }
+        // (W9.4) explicit type-args at construction `Name<i64> { … }` — SPECULATIVE: parse `<…>`,
+        // and commit to a typed struct literal ONLY when a `{` follows the closed list (so `a < b`
+        // and a pending `>>` mid-close still backtrack to comparison). Requires `as_` like the bare form.
+        if (as_ && tk_is_kind_at(t, n, pp.as.value.next, TK_TOKEN_LT)) {
+            tk_parsed_type_args_result ta = tk_parse_type_args(t, n, pp.as.value.next);
+            if (ta.ok && ta.as.value.pending_gt == 0 && tk_is_kind_at(t, n, ta.as.value.next, TK_TOKEN_LBRACE)) {
+                return parse_struct_lit(t, n, ta.as.value.next, pp.as.value.node, ta.as.value.args, ta.as.value.nargs);
+            }
+        }
         // W4a — a struct literal `Name { … }` (only when allowed: not in an if/match scrutinee).
         if (as_ && tk_is_kind_at(t, n, pp.as.value.next, TK_TOKEN_LBRACE)) {
-            return parse_struct_lit(t, n, pp.as.value.next, pp.as.value.node);
+            return parse_struct_lit(t, n, pp.as.value.next, pp.as.value.node, NULL, 0);
         }
         if (pp.as.value.node.len == 1) {
             tk_expr e = tk_at((tk_expr){ .tag = TK_EXPR_VAR, .as.var = { .name = pp.as.value.node.segments[0].name } }, t, pos);
