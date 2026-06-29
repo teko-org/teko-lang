@@ -280,3 +280,50 @@ fn ref_opt_struct_write_then_read_holds() {
     teko::assert::is_true((p?.x ?? 0) == 7)      // ?.x reaches into the PRESENT Point
     teko::assert::is_true((p?.y ?? 0) == 9)
 }
+
+// ---------------------------------------------------------------------------
+// Struct-literal present-wrap parity — a struct-LITERAL field whose declared type is `T?` set from
+// a BARE (non-optional) value must PRESENT-wrap at construction, so a later `?? / ?.` over that
+// field sees a PRESENT (not a non-optional → "coalesce left operand is not optional" stop). This is
+// native parity with emit_struct_init's per-field emit_as. Both engines run these (VM gate + `teko
+// build`); results must match. Covers the non-generic struct, the generic-stamped struct (Box<i64?>),
+// the bare null (stays NONE), and a VARIANT field set from a bare case (no VM wrapper — case IS the
+// variant value, discriminated by name at match).
+// ---------------------------------------------------------------------------
+
+// (a) NON-GENERIC struct, optional field set from a bare value → `??` sees PRESENT.
+type OptHolder = struct { value: i64? }
+#test
+fn struct_lit_opt_field_from_bare_present() {
+    let f = OptHolder { value = 7 }              // bare 7 into a `i64?` field → present-wrapped
+    teko::assert::is_true((f.value ?? 0) == 7)   // `??` unwraps PRESENT 7 (no panic)
+}
+
+// (b) the bare `null` sentinel stays NONE → `??` yields the default.
+#test
+fn struct_lit_opt_field_from_null_is_none() {
+    let f = OptHolder { value = null }           // null → NONE
+    teko::assert::is_true((f.value ?? 3) == 3)   // NONE → default 3
+}
+
+// (c) GENERIC struct stamped `Box<i64?>` — the stamped decl's `value` field is `i64?`; a bare 7
+//     must present-wrap exactly like the non-generic case (monomorph rewrites the field type).
+type OptBox<T> = struct { value: T }
+#test
+fn struct_lit_generic_opt_field_from_bare_present() {
+    let b: OptBox<i64?> = OptBox { value = 7 }   // bare 7 into the stamped `i64?` field
+    teko::assert::is_true((b.value ?? 0) == 7)   // `??` unwraps PRESENT 7 (no panic)
+}
+
+// (d) a VARIANT field set from a BARE case: the VM stores the case value directly (it IS the variant
+//     value, discriminated by type_name at match — no wrapper). Construct + read-back via `match`.
+type CaseA = struct { n: i64 }
+type CaseB = struct { m: i64 }
+type AorB  = variant CaseA | CaseB
+type VarHolder = struct { item: AorB }
+#test
+fn struct_lit_variant_field_from_bare_case() {
+    let h = VarHolder { item = CaseA { n = 5 } }     // bare case into a variant field
+    let got = match h.item { CaseA as a => a.n; CaseB as b => b.m }
+    teko::assert::is_true(got == 5)
+}

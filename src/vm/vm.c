@@ -1373,6 +1373,34 @@ static bool case_in_variant(tk_str vname, tk_str cname) {
     return false;
 }
 
+// field_coerce_type — the resolved Type to COERCE a field value into at struct construction, derived
+// from the field's declared TypeExpr in the program's type decls (the SAME table native's
+// cg_find_struct_field_type reads — the generic-stamped decl, e.g. `Box__g__opt_i64`, is rewritten
+// into g_prog by monomorph, so it resolves here too). An OptionalType field yields TK_TYPE_OPTIONAL
+// so coerce_to PRESENT-wraps a bare value (native's emit_as does the same for a `T?` field). Every
+// other shape (incl. an absent struct/field) yields TK_TYPE_VOID, coerce_to's no-op: a bare CASE
+// into a variant field needs no VM wrapper (the case value IS its variant value, discriminated at
+// match), and a `[]T?` field is an array literal whose elements eval_expr already coerces. The
+// returned OPTIONAL carries a NULL inner; coerce_to reads only the tag, never the inner. (Mirrors
+// vm.tks's vm_field_coerce_type.)
+static tk_type field_coerce_type(tk_str sname, tk_str fname) {
+    for (size_t i = 0; i < g_prog.nitems; i += 1) {
+        if (g_prog.items[i].tag != TK_TITEM_TYPE_DECL) continue;
+        tk_type_decl td = g_prog.items[i].as.type_decl;
+        if (!name_eq(td.name, sname)) continue;
+        if (td.body.tag != TK_BODY_STRUCT) return (tk_type){ .tag = TK_TYPE_VOID };
+        tk_struct_body sb = td.body.as.struct_body;
+        for (size_t j = 0; j < sb.n_fields; j += 1) {
+            if (!name_eq(sb.fields[j].name, fname)) continue;
+            if (sb.fields[j].type_ann.tag == TK_TEXPR_OPTIONAL)
+                return (tk_type){ .tag = TK_TYPE_OPTIONAL, .as.optional = { NULL } };
+            return (tk_type){ .tag = TK_TYPE_VOID };
+        }
+        return (tk_type){ .tag = TK_TYPE_VOID };
+    }
+    return (tk_type){ .tag = TK_TYPE_VOID };
+}
+
 // match_as_enum_int — does `name` match an integer `ordinal` when the subject is an enum value?
 // Two cases:
 //   (A) `name` is an ENUM TYPE NAME (e.g., `PrimKind as k`): any integer is a valid enum value
@@ -1783,13 +1811,19 @@ static tk_value tk_vm_eval_expr(const tk_texpr *e, tk_venv *env) {
             size_t nf = e->as.struct_init.nfields;
             tk_str   *names = tk_alloc((nf ? nf : 1) * sizeof *names); if (!names) abort();
             tk_value *vals  = tk_alloc((nf ? nf : 1) * sizeof *vals);  if (!vals)  abort();
-            for (size_t i = 0; i < nf; i += 1) {
-                names[i] = e->as.struct_init.field_names[i];
-                vals[i]  = tk_vm_eval_expr(&e->as.struct_init.field_vals[i], env);
-            }
             tk_str tn = e->type.tag == TK_TYPE_NAMED ? e->type.as.named.name
                       : e->type.tag == TK_TYPE_ERROR ? (tk_str){ (const tk_byte *)"error", 5 }
                       : (tk_str){ NULL, 0 };
+            // COERCE each field value into its declared field type (field_coerce_type → coerce_to), so
+            // a bare `T` supplied to a `T?` field PRESENT-wraps — native parity with emit_struct_init's
+            // per-field emit_as. Without this a later `?? / ?.` over that field found a non-optional and
+            // stopped (a VM-only divergence). The error path (tn == "error") has no struct decl, so
+            // field_coerce_type returns VOID and the adornments ride as stored (E2). (Mirrors vm.tks.)
+            for (size_t i = 0; i < nf; i += 1) {
+                names[i] = e->as.struct_init.field_names[i];
+                tk_value raw = tk_vm_eval_expr(&e->as.struct_init.field_vals[i], env);
+                vals[i]  = coerce_to(raw, field_coerce_type(tn, e->as.struct_init.field_names[i]));
+            }
             return v_struct(tn, (tk_value_fields){ names, vals, nf });
         }
     }

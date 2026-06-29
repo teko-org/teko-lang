@@ -677,19 +677,74 @@ fn err_field(e: StructVal, field: str) -> Value {
     ""                                                          // any other field on an error → empty str (honest)
 }
 
+// vm_struct_field_type — the declared TypeExpr of field `fname` in struct `sname`, looked up in
+// the program's type declarations (the SAME table native's cg_find_struct_field_type reads). The
+// generic-stamped case is identical: monomorph rewrites the stamped decl's field annotations into
+// the program (e.g. `Box__g__opt_i64` carries `value: i64?`), so a stamped name resolves here too.
+// Returns the field's parser TypeExpr, or null when the struct/field is absent. (C: parity helper.)
+fn vm_struct_field_type(prog: checker::TProgram, sname: str, fname: str) -> parser::TypeExpr? {
+    mut i = 0
+    loop {
+        if i >= prog.items.len { break }
+        match prog.items[i] {
+            parser::TypeDecl as d => {
+                match d.body {
+                    parser::StructBody as sb => {
+                        if d.name == sname {
+                            mut j = 0
+                            loop {
+                                if j >= sb.fields.len { break }
+                                if sb.fields[j].name == fname { return sb.fields[j].type_ann }
+                                j++
+                            }
+                        }
+                    }
+                    _ => { }
+                }
+            }
+            _ => { }
+        }
+        i++
+    }
+    null
+}
+
+// vm_field_coerce_type — the resolved Type to COERCE a field value into at struct construction,
+// derived from the field's declared TypeExpr. An OptionalType field yields `Optional` so coerce_to
+// PRESENT-wraps a bare value (the same thing native's emit_as does for a `T?` field — see
+// emit_struct_init_framed). Every other shape yields `Void` (coerce_to's no-op): a bare CASE into a
+// variant field needs no VM wrapper (a case value IS its variant value here, discriminated by
+// type_name at match — vm_case_in_variant), and a `[]T?` field is an array literal whose elements
+// are already coerced by eval_array. (C: mirrors native's per-field emit_as expected-slot.)
+fn vm_field_coerce_type(prog: checker::TProgram, sname: str, fname: str) -> checker::Type {
+    match vm_struct_field_type(prog, sname, fname) {
+        parser::TypeExpr as fte => match fte {
+            parser::OptionalType => checker::Optional { inner = checker::Void { } }
+            _ => checker::Void { }
+        }
+        null => checker::Void { }
+    }
+}
+
 // W4b — build a struct value `Name { f = v, … }` (declared field order). The nominal name
 // is the node's type (a named type, or "error"); a non-named/non-error type is unreachable.
+// Each field value is COERCED into its declared field type (vm_field_coerce_type → coerce_to), so a
+// bare `T` supplied to a `T?` field PRESENT-wraps — native parity with emit_struct_init's per-field
+// emit_as. Without this a later `?? / ?.` over that field found a non-optional and stopped (a VM-only
+// divergence: native present-wraps at construction). The error-value (`tn == "error"`) path has no
+// declared-field table; its fields ride as stored (E2 adornments are read with defaults, never ??).
 fn eval_struct_init(si: checker::TStructInit, ty: checker::Type, env: Venv) -> Value {
+    let tn = match ty { Named as n => n.name; Error => "error"; _ => "" }
     mut names: []str = teko::list::empty()
     mut vals: []Value = teko::list::empty()
     mut i = 0
     loop {
         if i >= si.field_names.len { break }
+        let raw = eval_expr(si.field_vals[i], env)
         names = teko::list::push(names, si.field_names[i])
-        vals = teko::list::push(vals, eval_expr(si.field_vals[i], env))
+        vals = teko::list::push(vals, coerce_to(raw, vm_field_coerce_type(env.prog, tn, si.field_names[i])))
         i++
     }
-    let tn = match ty { Named as n => n.name; Error => "error"; _ => "" }
     StructVal { type_name = tn; field_names = names; field_vals = vals }
 }
 
