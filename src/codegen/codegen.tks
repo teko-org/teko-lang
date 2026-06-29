@@ -1900,6 +1900,18 @@ fn cg_find_struct_field_type(prog: checker::TProgram, sname: str, fname: str) ->
 // (teko_rt.h); `error { message = s }` emits tk_error_make(s) which fills the other
 // diagnostic fields with zero defaults (C1.3 additive). (C: TK_TEXPR_STRUCT_INIT branch.)
 fn emit_struct_init(buf: []byte, prog: checker::TProgram, e: checker::TExpr, si: checker::TStructInit) -> []byte | error {
+    return emit_struct_init_framed(buf, prog, e, si, "")
+}
+
+// emit_struct_init_framed — emit_struct_init with the auto-box ALLOCATOR parameterized (MEM Step
+// 1). `frame` is the per-function frame-region variable name, or "" for the process root. When
+// `frame` is "" the DIRECT box of a recursive back-edge rides `tk_alloc` (root → leaked, the safe
+// default, byte-identical to the pre-MEM-Step-1 output). When `frame` is a region var the direct
+// box rides `tk_region_alloc(<frame>, …)` so it is BULK-FREED when the frame region drops at the
+// function's exit edge — used ONLY for a binding the escape check PROVED frame-local (escape.tks).
+// NESTED struct-inits (field values via emit_expr) stay on root: mixing frame + root in one value
+// is SAFE (root cells just leak), so soundness holds while the frame frees the provable subset.
+fn emit_struct_init_framed(buf: []byte, prog: checker::TProgram, e: checker::TExpr, si: checker::TStructInit, frame: str) -> []byte | error {
     let name = match e.type {
         checker::Named as nm => nm.name
         // E2-NATIVE: `error { message = s }` → tk_error_make(s); the checker ensures exactly
@@ -1939,7 +1951,13 @@ fn emit_struct_init(buf: []byte, prog: checker::TProgram, e: checker::TExpr, si:
             out = cb(out, "({ ")
             match fte_opt { parser::TypeExpr as fte => { out = match emit_type_expr(out, prog, fte) { []byte as o => o; error as err => return err } }; null => { } }
             out = cb(out, " *"); out = cb(out, bxN)
-            out = cb(out, " = tk_alloc(sizeof *"); out = cb(out, bxN); out = cb(out, "); *"); out = cb(out, bxN); out = cb(out, " = ")
+            // MEM Step 1: frame-local boxes ride the frame region (`tk_region_alloc(<frame>, …)`),
+            // freed at the function's exit edge; everything else rides root `tk_alloc` (safe leak).
+            if frame.len > 0 {
+                out = cb(out, " = tk_region_alloc("); out = cb(out, frame); out = cb(out, ", sizeof *"); out = cb(out, bxN); out = cb(out, "); *"); out = cb(out, bxN); out = cb(out, " = ")
+            } else {
+                out = cb(out, " = tk_alloc(sizeof *"); out = cb(out, bxN); out = cb(out, "); *"); out = cb(out, bxN); out = cb(out, " = ")
+            }
         }
         // Sentinel fields emit a concrete literal directly (emit_expr can't, the type being unknown):
         //   * a bare `null` into a `T?` field → (tk_opt_<inner>){ .present = false }   (C: TEXPR_NULL branch)
@@ -2069,7 +2087,8 @@ fn emit_stmt_value(buf: []byte, prog: checker::TProgram, ret_type: checker::Type
         checker::TExprStmt as es => {
             if is_void_type(es.expr.type) {
                 // A non-value statement in an if-value branch: thread ret_type so an embedded return wraps.
-                return emit_stmt(buf, s, false, prog, ret_type, indent)
+                // (Sub-expression context — frameless: no per-edge drop here, MEM Step 1 first cut.)
+                return emit_stmt(buf, s, false, prog, ret_type, indent, "", teko::list::empty())
             }
             mut out = cb(buf, indent)
             out = cb(out, sink)
@@ -2080,7 +2099,7 @@ fn emit_stmt_value(buf: []byte, prog: checker::TProgram, ret_type: checker::Type
             out = match emit_as_r(out, prog, ret_type, slot, es.expr) { []byte as o => o; error as err => return err }
             cb(out, ";\n")
         }
-        _ => emit_stmt(buf, s, false, prog, ret_type, indent)
+        _ => emit_stmt(buf, s, false, prog, ret_type, indent, "", teko::list::empty())
     }
 }
 
@@ -2093,7 +2112,7 @@ fn emit_branch_value(buf: []byte, prog: checker::TProgram, ret_type: checker::Ty
     loop {
         if i + 1 >= body.len { break }
         // ret_type (not Void) so a non-last `return e` in the branch wraps into the function's slot.
-        out = match emit_stmt(out, body[i], false, prog, ret_type, indent) { []byte as o => o; error as err => return err }
+        out = match emit_stmt(out, body[i], false, prog, ret_type, indent, "", teko::list::empty()) { []byte as o => o; error as err => return err }
         i++
     }
     if body.len > 0 {
@@ -3106,17 +3125,17 @@ fn emit_arm_value(buf: []byte, prog: checker::TProgram, ret_type: checker::Type,
         mut i = 0
         loop {
             if i + 1 >= body.len { break }
-            out = match emit_stmt(out, body[i], false, prog, ret_type, ci) { []byte as o => o; error as err => return err }
+            out = match emit_stmt(out, body[i], false, prog, ret_type, ci, "", teko::list::empty()) { []byte as o => o; error as err => return err }
             i++
         }
         let last = body[body.len - 1]
         return match last {
             checker::TExprStmt as es => match es.expr.kind {
-                checker::TIfExpr as _    => emit_exprstmt_tail(out, es.expr, false, prog, ret_type, ci)
-                checker::TMatchExpr as _ => emit_exprstmt_tail(out, es.expr, false, prog, ret_type, ci)
-                _              => emit_stmt(out, last, false, prog, ret_type, ci)
+                checker::TIfExpr as _    => emit_exprstmt_tail(out, es.expr, false, prog, ret_type, ci, "")
+                checker::TMatchExpr as _ => emit_exprstmt_tail(out, es.expr, false, prog, ret_type, ci, "")
+                _              => emit_stmt(out, last, false, prog, ret_type, ci, "", teko::list::empty())
             }
-            _ => emit_stmt(out, last, false, prog, ret_type, ci)
+            _ => emit_stmt(out, last, false, prog, ret_type, ci, "", teko::list::empty())
         }
     }
     // Value form: all-but-last normally; the trailing value → `sink` (wrapped), then `break`.
@@ -3127,7 +3146,7 @@ fn emit_arm_value(buf: []byte, prog: checker::TProgram, ret_type: checker::Type,
     mut i = 0
     loop {
         if i + 1 >= body.len { break }
-        out = match emit_stmt(out, body[i], false, prog, ret_type, ci) { []byte as o => o; error as err => return err }
+        out = match emit_stmt(out, body[i], false, prog, ret_type, ci, "", teko::list::empty()) { []byte as o => o; error as err => return err }
         i++
     }
     if body.len == 0 { return error { message = "codegen: empty match arm body in value position" } }
@@ -3247,7 +3266,8 @@ fn emit_match_tail(buf: []byte, prog: checker::TProgram, e: checker::TExpr, m: c
         // the arm body is a BLOCK in TAIL position (B.20): emit it as a tail block — its
         // trailing value becomes a `return`, and an explicit return/break/continue inside it
         // emits real C control flow (mirrors the VM running the arm block flow-aware).
-        out = match emit_block_tail(out, arm.body, in_main, prog, ret_type, ci) { []byte as o => o; error as err => return err }
+        // (Frameless first cut: a return inside an arm leaks the frame region — SAFE, M.5.)
+        out = match emit_block_tail(out, arm.body, in_main, prog, ret_type, ci, "", teko::list::empty()) { []byte as o => o; error as err => return err }
         // FIRST match wins → jump past the remaining arms. After a diverging body (return/exit/
         // panic) this is dead code (cc sees the generated C with `-w`); after a non-diverging
         // void body it is the line that stops later arms from also firing.
@@ -3442,7 +3462,10 @@ fn emit_block(buf: []byte, body: []checker::TStatement, in_main: bool, prog: che
     loop {
         if i >= body.len { break }
         let s = body[i]
-        out = match emit_stmt(out, s, in_main, prog, ret_type, indent) { []byte as o => o; error as err => return err }
+        // emit_block is only reached from SUB-SCOPE (if/match/loop) bodies — emitted FRAMELESS in
+        // this first cut (a return inside leaks the frame region — SAFE; a frame-local binding here
+        // falls back to root). The TOP-LEVEL path runs through emit_block_tail, which carries frame.
+        out = match emit_stmt(out, s, in_main, prog, ret_type, indent, "", teko::list::empty()) { []byte as o => o; error as err => return err }
         i++
     }
     out
@@ -3457,9 +3480,12 @@ fn emit_block(buf: []byte, body: []checker::TStatement, in_main: bool, prog: che
 // which the checker types as a statement but the VM still drains for its branch value). A void
 // expr-statement, or any non-expr trailing statement, emits normally (no value).
 // (C: `emit_exprstmt_tail`.)
-fn emit_exprstmt_tail(buf: []byte, x: checker::TExpr, in_main: bool, prog: checker::TProgram, ret_type: checker::Type, indent: str) -> []byte | error {
+fn emit_exprstmt_tail(buf: []byte, x: checker::TExpr, in_main: bool, prog: checker::TProgram, ret_type: checker::Type, indent: str, frame: str) -> []byte | error {
     match x.kind {
         checker::TIfExpr as f => {
+            // A trailing if/else returns on each branch; the frame region is NOT threaded into the
+            // branch tails (frame="" → those returns simply LEAK the region — SAFE, M.5), keeping
+            // this first cut's drop-routing confined to the linear top-level path.
             // No else branch: emit as a control-flow statement; fall-through handled by caller's default return.
             if !f.has_else { return emit_if_stmt(buf, f, in_main, prog, ret_type, indent) }
             mut out = cb(buf, indent)
@@ -3467,10 +3493,10 @@ fn emit_exprstmt_tail(buf: []byte, x: checker::TExpr, in_main: bool, prog: check
             out = match emit_expr(out, prog, f.cond) { []byte as o => o; error as err => return err }
             out = cb(out, ") {\n")
             let inner = cb_indent_deeper(indent)
-            out = match emit_block_tail(out, f.then_blk, in_main, prog, ret_type, inner) { []byte as o => o; error as err => return err }
+            out = match emit_block_tail(out, f.then_blk, in_main, prog, ret_type, inner, "", teko::list::empty()) { []byte as o => o; error as err => return err }
             out = cb(out, indent)
             out = cb(out, "} else {\n")
-            out = match emit_block_tail(out, f.else_blk, in_main, prog, ret_type, inner) { []byte as o => o; error as err => return err }
+            out = match emit_block_tail(out, f.else_blk, in_main, prog, ret_type, inner, "", teko::list::empty()) { []byte as o => o; error as err => return err }
             out = cb(out, indent)
             cb(out, "}\n")
         }
@@ -3483,7 +3509,11 @@ fn emit_exprstmt_tail(buf: []byte, x: checker::TExpr, in_main: bool, prog: check
                 out = match emit_expr(out, prog, x) { []byte as o => o; error as err => return err }
                 return cb(out, ";\n")
             }
-            mut out = cb(buf, indent)
+            // MEM Step 1: the tail value-return EDGE — drop the frame region before the implicit
+            // `return` (a return value is escaping, so it never references a frame-local cell).
+            mut out = buf
+            if frame.len > 0 && !in_main { out = cb(out, indent); out = cb(out, "tk_region_drop("); out = cb(out, frame); out = cb(out, ");\n") }
+            out = cb(out, indent)
             if in_main {
                 out = cb(out, "return (int)(")
                 out = match emit_expr(out, prog, x) { []byte as o => o; error as err => return err }
@@ -3499,20 +3529,20 @@ fn emit_exprstmt_tail(buf: []byte, x: checker::TExpr, in_main: bool, prog: check
 // emit_block_tail — W5a: emit a FUNCTION/MAIN/branch body where the LAST statement, if it is
 // an expr-statement carrying a value, `return`s that value (via emit_exprstmt_tail). All but
 // the last statement emit normally. (C: `emit_block_tail`.)
-fn emit_block_tail(buf: []byte, body: []checker::TStatement, in_main: bool, prog: checker::TProgram, ret_type: checker::Type, indent: str) -> []byte | error {
+fn emit_block_tail(buf: []byte, body: []checker::TStatement, in_main: bool, prog: checker::TProgram, ret_type: checker::Type, indent: str, frame: str, escaping: []str) -> []byte | error {
     mut out = buf
     mut i: u64 = 0
     loop {
         if i + 1 >= body.len { break }
         let s = body[i]
-        out = match emit_stmt(out, s, in_main, prog, ret_type, indent) { []byte as o => o; error as err => return err }
+        out = match emit_stmt(out, s, in_main, prog, ret_type, indent, frame, escaping) { []byte as o => o; error as err => return err }
         i++
     }
     if body.len == 0 { return out }
     let last = body[body.len - 1]
     match last {
-        checker::TExprStmt as es => emit_exprstmt_tail(out, es.expr, in_main, prog, ret_type, indent)
-        _ => emit_stmt(out, last, in_main, prog, ret_type, indent)
+        checker::TExprStmt as es => emit_exprstmt_tail(out, es.expr, in_main, prog, ret_type, indent, frame)
+        _ => emit_stmt(out, last, in_main, prog, ret_type, indent, frame, escaping)
     }
 }
 
@@ -3542,7 +3572,7 @@ fn emit_if_stmt(buf: []byte, f: checker::TIfExpr, in_main: bool, prog: checker::
 // emit_binding — a TBinding. BindTarget: only SimpleName is lowered for M0 (destructuring
 // is the honest barrier). `const` prefix for a const binding; the type rides `.bound`.
 // (C: TK_TSTMT_BINDING branch.)
-fn emit_binding(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, b: checker::TBinding, indent: str) -> []byte | error {
+fn emit_binding(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, b: checker::TBinding, indent: str, frame: str, escaping: []str) -> []byte | error {
     let name = match b.target {
         parser::SimpleName as sn   => sn.name
         parser::DestructurePattern => return error { message = "codegen: destructuring binding not yet supported" }
@@ -3561,6 +3591,23 @@ fn emit_binding(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, b
     out = cb(out, " ")
     out = cb_ident(out, name)
     out = cb(out, " = ")
+    // MEM Step 1 — FRAME-LOCAL routing. When a frame region is active AND the escape check proved
+    // this binding frame-local (a `let`/`mut` SimpleName, NOT escaping, value = a struct-init), emit
+    // the struct-init with its DIRECT auto-box routed to the frame region (freed at the exit edge),
+    // bypassing emit_as_r. We take this bypass ONLY when NO variant/optional wrapping is needed —
+    // the declared type `b.bound` is the SAME named STRUCT as the value's type (e.g. `let n = Node{…}`,
+    // not `let p: Pattern = LiteralPattern{…}`). When a wrap is needed we fall through to the generic
+    // emit_as_r path (root alloc — a SAFE leak), so a variant-typed binding is never mis-emitted.
+    // The value never escapes, so freeing it at function exit is safe.
+    if frame.len > 0 && checker::binding_is_frame_local(escaping, b) && cg_same_named_struct(b.bound, b.value.type) {
+        match b.value.kind {
+            checker::TStructInit as si => {
+                out = match emit_struct_init_framed(out, prog, b.value, si, frame) { []byte as o => o; error as err => return err }
+                return cb(out, ";\n")
+            }
+            _ => { }
+        }
+    }
     // W5b — if the binding's declared type is a variant and the value is a case member, WRAP it into
     // the variant repr (`let s: Shape = Circle { … }`). emit_as_r threads ret_type so a value-form
     // `match`/`if` value with a diverging `return` arm wraps that return into the FUNCTION's slot.
@@ -3595,8 +3642,14 @@ fn emit_assign(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, a:
 // emit_return — a TReturn. In main, `return n` -> `return (int)(n);` (early process
 // exit) and a bare `return` -> `return 0;`; in a fn, the plain `return [v];`.
 // (C: TK_TSTMT_RETURN branch.)
-fn emit_return(buf: []byte, prog: checker::TProgram, r: checker::TReturn, in_main: bool, ret_type: checker::Type, indent: str) -> []byte | error {
-    mut out = cb(buf, indent)
+fn emit_return(buf: []byte, prog: checker::TProgram, r: checker::TReturn, in_main: bool, ret_type: checker::Type, indent: str, frame: str) -> []byte | error {
+    // MEM Step 1: drop the frame region on the return EDGE (before evaluating the value — a return
+    // value is an ESCAPING position, so by the escape check it never references a frame-local cell;
+    // dropping first is therefore safe). tk_region_drop is idempotent + NULL-tolerant, so overlap
+    // with a later/other-edge drop frees nothing twice. No frame region ⇒ nothing emitted.
+    mut out = buf
+    if frame.len > 0 { out = cb(out, indent); out = cb(out, "tk_region_drop("); out = cb(out, frame); out = cb(out, ");\n") }
+    out = cb(out, indent)
     if !r.has_value {
         if in_main { return cb(out, "return 0;\n") }
         return cb(out, "return;\n")
@@ -3649,11 +3702,15 @@ fn cb_indent_deeper(indent: str) -> str {
 }
 
 // emit_stmt — the statement dispatch (the C's emit_stmt switch). (C: `emit_stmt`.)
-fn emit_stmt(buf: []byte, s: checker::TStatement, in_main: bool, prog: checker::TProgram, ret_type: checker::Type, indent: str) -> []byte | error {
+// MEM Step 1: `frame`/`escaping` ride the LINEAR top-level path — a TBinding may frame-route its
+// allocation, a TReturn drops the region on its edge. Statements that open a SUB-SCOPE (if/match/
+// loop bodies) are emitted FRAMELESS in this first cut: any return inside them simply leaks the
+// region (SAFE, M.5), and a frame-local binding only inside a branch falls back to root.
+fn emit_stmt(buf: []byte, s: checker::TStatement, in_main: bool, prog: checker::TProgram, ret_type: checker::Type, indent: str, frame: str, escaping: []str) -> []byte | error {
     match s {
-        checker::TBinding as b      => emit_binding(buf, prog, ret_type, b, indent)
+        checker::TBinding as b      => emit_binding(buf, prog, ret_type, b, indent, frame, escaping)
         checker::TAssign as a       => emit_assign(buf, prog, ret_type, a, indent)
-        checker::TReturn as r       => emit_return(buf, prog, r, in_main, ret_type, indent)
+        checker::TReturn as r       => emit_return(buf, prog, r, in_main, ret_type, indent, frame)
         checker::TExprStmt as es    => {
             // W5a — an `if` in statement position runs as CONTROL FLOW (mirrors the VM's
             // exec_stmt → exec_if), so break/continue/return inside a branch propagate. W5b —
@@ -3839,6 +3896,36 @@ fn transform_defers(body: []checker::TStatement, drain: []checker::TStatement, i
     out
 }
 
+// cg_same_named_struct — are `a` and `b` the SAME Named type? Used to gate the frame-local binding
+// bypass to the no-wrapping case (declared type == the struct-init's own type), so a variant/
+// optional-typed binding (which emit_as_r must wrap) is never emitted via the direct framed path.
+fn cg_same_named_struct(a: checker::Type, b: checker::Type) -> bool {
+    match a {
+        checker::Named as na => match b {
+            checker::Named as nb => teko::runtime::str_eq(na.name, nb.name)
+            _ => false
+        }
+        _ => false
+    }
+}
+
+// fn_body_has_frame_local — does this body have any TOP-LEVEL binding the escape check proved
+// frame-local AND routable (no-wrap, same-named-struct)? (MEM Step 1 routes only top-level
+// bindings; sub-scope bindings stay on root in this first cut.) Drives whether emit_function opens
+// a frame region at all — none ⇒ no region ⇒ zero output change (the fixpoint-preserving default).
+fn fn_body_has_frame_local(escaping: []str, body: []checker::TStatement) -> bool {
+    mut i: u64 = 0
+    loop {
+        if i >= body.len { break }
+        match body[i] {
+            checker::TBinding as b => { if checker::binding_is_frame_local(escaping, b) && cg_same_named_struct(b.bound, b.value.type) { return true } }
+            _ => { }
+        }
+        i++
+    }
+    false
+}
+
 fn emit_function(buf: []byte, prog: checker::TProgram, f: checker::TFunction) -> []byte | error {
     mut out = match emit_function_sig(buf, prog, f) { []byte as o => o; error as err => return err }
     out = cb(out, " {\n")
@@ -3855,10 +3942,26 @@ fn emit_function(buf: []byte, prog: checker::TProgram, f: checker::TFunction) ->
         }
         fbody = match transform_defers(f.body, drain, true) { []checker::TStatement as x => x; error as e => return e }
     }
+    // MEM Step 1 — THE FRAME REGION. Run the escape check (escape.tks). When a TOP-LEVEL binding is
+    // provably frame-local, open a per-function frame region `_tkfr` (a deterministic, per-fn-constant
+    // name → fixpoint-safe, NOT buf.len) at entry; its frame-local allocations are bulk-freed on the
+    // return edges (emit_return / emit_exprstmt_tail) and at the fall-through end. A function with NO
+    // frame-local binding gets NO region — zero bytes, byte-identical to the pre-Step-1 output.
+    let escaping = checker::fn_escaping_vars(f)
+    let want_frame = fn_body_has_frame_local(escaping, fbody)
+    let frame: str = if want_frame { "_tkfr" } else { "" }
+    if want_frame { out = cb(out, "    tk_region *_tkfr = tk_region_new();\n") }
     // W5a — a fn body's trailing expr-statement carrying a value implicitly returns it.
     // W5b — thread the fn's return type so a tail/return case value is wrapped into a variant
     // return slot (emit_as).
-    out = match emit_block_tail(out, fbody, false, prog, f.return_type, "    ") { []byte as o => o; error as err => return err }
+    out = match emit_block_tail(out, fbody, false, prog, f.return_type, "    ", frame, escaping) { []byte as o => o; error as err => return err }
+    // MEM Step 1 — the FALL-THROUGH exit edge. If control can reach the function's end (the tail did
+    // not C-terminate), drop the frame region there too. tk_region_drop is idempotent, so this never
+    // double-frees relative to a return-edge drop on another path.
+    if want_frame {
+        let tail_terminates = if fbody.len > 0 { cg_stmt_c_terminates(fbody[fbody.len - 1]) } else { false }
+        if !tail_terminates { out = cb(out, "    tk_region_drop(_tkfr);\n") }
+    }
     // A non-void function whose tail is a value-form `match`/`if` (or a loop) returns on every path
     // the CHECKER proved exhaustive — but C can't see that, so without a terminator it warns
     // -Wreturn-type and the fall-through is UB. The checker guarantees it is never reached: emit
@@ -4832,10 +4935,11 @@ fn tk_emit_c(prog: checker::TProgram) -> str | error {
                 // code), so ret_type is void — emit_as never wraps for void.
                 if j == last_stmt {
                     // the tail loose statement → implicit-return path (a one-statement block).
+                    // The virtual-main is FRAMELESS: its allocations live for the whole process (M.5).
                     let tail = teko::list::push(teko::list::empty(), s)
-                    b = match emit_block_tail(b, tail, true, prog, checker::Void { }, "    ") { []byte as o => o; error as err => return err }
+                    b = match emit_block_tail(b, tail, true, prog, checker::Void { }, "    ", "", teko::list::empty()) { []byte as o => o; error as err => return err }
                 } else {
-                    b = match emit_stmt(b, s, true, prog, checker::Void { }, "    ") { []byte as o => o; error as err => return err }
+                    b = match emit_stmt(b, s, true, prog, checker::Void { }, "    ", "", teko::list::empty()) { []byte as o => o; error as err => return err }
                 }
             }
         }

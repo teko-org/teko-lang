@@ -1,0 +1,314 @@
+// src/checker/escape.tks   (namespace 'teko::checker')
+//
+// THE ESCAPE CHECK (MEM Step 1 — the memory-model keystone). A conservative, ONE-DEPTH,
+// SECURITY-FIRST analysis over the typed AST: for one function it computes the set of LOCAL
+// variable names that ESCAPE the frame. The codegen reads this to decide whether a heap
+// allocation a function makes may be placed in a per-FUNCTION frame region (bulk-freed at
+// every exit edge) or must outlive the frame (allocated in root → leaked, which is SAFE).
+//
+// SOUNDNESS IS THE ABSOLUTE RULE (M.1/M.5): never classify an escaping allocation as
+// frame-local. When the analysis cannot PROVE an allocation is frame-local it is treated as
+// ESCAPING (a leak is safe; a use-after-free is a vulnerability). The analysis is therefore
+// intentionally INCOMPLETE — it frees only a provable subset.
+//
+// THE MODEL (no points-to graph — DEFERRED to a later, finer step):
+//   * A variable ESCAPES if any read of it (a `TVar`) appears in an ESCAPING position.
+//   * Escaping positions are: a `return` value; a TAIL expr-statement (an IMPLICIT RETURN — the
+//     trailing value of a function body or of an if/match branch whose value is returned, which
+//     codegen drop-then-returns: emit_block_tail/emit_exprstmt_tail); a call argument; a
+//     struct-init field value; an array / interpolation / `in` element; an assignment RHS; a
+//     binding RHS. (A call may retain its argument; a returned/stored value outlives the frame.)
+//     ALL of these propagate the escaping context DOWN into their sub-expressions.
+//   * The ONE refinement that lets a provable frame-local subset exist: reading a SCALAR field of
+//     a BARE LOCAL (`x.f` where `x` is a `TVar` AND `x.f`'s resolved type is `Prim`/`byte`/`bool`)
+//     yields a COPY of a STACK MEMBER — the struct local sits on the C stack and its scalar fields
+//     are stack members (boxed recursive back-edge fields are NEVER scalar), so the read embeds NO
+//     heap pointer and survives the frame-region drop. So `x` does NOT escape through that read.
+//     Any OTHER receiver — a nested field access (`a.b.y`: `.y` is scalar but `a.b` is a boxed heap
+//     hop), an index (`a[i]`: the element lives behind the slice's heap `.ptr`), a call result, a
+//     cast, … — conservatively inherits the OUTER (possibly escaping) context, because evaluating
+//     it dereferences an interior pointer (an auto-boxed back-edge / a heap-backed slice). The drop
+//     happens BEFORE the tail value is evaluated, so EVERY sub-read of the tail value runs post-drop
+//     — anything that derefs a frame-allocable cell must propagate escaping (UAF). When unsure,
+//     propagate escaping (a leak is SAFE; a use-after-free is a vulnerability).
+//
+// A `let`/`mut x = StructInit{…}` binding is FRAME-LOCAL iff `x` is NOT in the escaping set:
+// the struct value — and every heap cell auto-boxed inside it — dies with the frame, so the
+// allocation may go in the frame region. This is the only allocation the codegen frame-routes.
+
+use teko::parser
+use teko::lexer
+
+// str_set_has — membership in a name set (linear; sets are tiny — a function's locals).
+fn str_set_has(set: []str, name: str) -> bool {
+    mut i = 0
+    loop {
+        if i >= set.len { break }
+        if set[i] == name { return true }
+        i++
+    }
+    false
+}
+
+// str_set_add — add `name` if absent (kept deduped so codegen sees a stable set).
+fn str_set_add(set: []str, name: str) -> []str {
+    if str_set_has(set, name) { return set }
+    teko::list::push(set, name)
+}
+
+// type_is_scalar — a Prim / byte / bool. Reading a field of this type yields a pure value
+// COPY that carries NO interior heap pointer, so the receiver does not escape through it.
+// (str is a VIEW {ptr,len} that may alias — deliberately NOT scalar here, stays conservative.)
+fn type_is_scalar(t: Type) -> bool {
+    match t {
+        Prim => true
+        Byte => true
+        _    => false
+    }
+}
+
+// expr_is_bare_var — is `e` a DIRECT variable read (a `TVar`), with NO field-access / index /
+// call / cast / etc. wrapping it? The scalar-read non-escaping refinement is sound ONLY for a
+// scalar field of a BARE local: such a field is a STACK member of the struct value (boxed /
+// recursive back-edge fields are NEVER scalar), so it survives the frame-region drop and may be
+// read post-drop. For ANY non-bare receiver (a nested `a.b`, an index `a[i]`, a call result, …)
+// the receiver lives in the SAME (escaping) context — reading a scalar OFF it still derefs an
+// interior heap hop (e.g. `a.b.y`: `.y` is scalar but `a.b` is a boxed heap pointer into the
+// frame), so the refinement must NOT clear escaping there (MEM Step 1 UAF fix #2 — security).
+fn expr_is_bare_var(e: TExpr) -> bool {
+    match e.kind {
+        TVar => true
+        _    => false
+    }
+}
+
+// mark_expr — walk `e`, adding every variable read in an ESCAPING position to `acc`.
+// `escaping` is the context: true ⇒ a read here lets the variable outlive the frame.
+fn mark_expr(e: TExpr, escaping: bool, acc: []str) -> []str {
+    match e.kind {
+        // a bare variable read: it escapes only if read in an escaping context.
+        TVar as v => if escaping { str_set_add(acc, v.name) } else { acc }
+
+        // leaves with no variable reads.
+        TNumber  => acc
+        TStrLit  => acc
+        TByteLit => acc
+        TBoolLit => acc
+        TNullLit => acc
+        TPathExpr => acc
+
+        // operators: operands inherit the OUTER context (a returned `a + b` returns both).
+        TBinary as b => mark_expr(b.right, escaping, mark_expr(b.left, escaping, acc))
+        TUnary as u  => mark_expr(u.operand, escaping, acc)
+        TCompare as c => {
+            // a comparison RESULT is a bool (a pure copy), but the operands are EVALUATED in the
+            // outer context: when this comparison is the tail value (escaping=true) the operands
+            // run AFTER the frame-region drop, so a `a.b`-style operand dereferences a frame cell
+            // post-drop → propagate `escaping` (UAF audit). The bare-TVar scalar refinement still
+            // applies one level down (e.g. `a.val < b.val` keeps `a`/`b` frame-local).
+            mut a = mark_expr(c.first, escaping, acc)
+            mut i = 0
+            loop {
+                if i >= c.rest.len { break }
+                a = mark_expr(c.rest[i].operand, escaping, a)
+                i++
+            }
+            a
+        }
+
+        // a call: every argument may be RETAINED by the callee → escaping (one-depth, conservative).
+        TCall as call => {
+            mut a = acc
+            mut i = 0
+            loop {
+                if i >= call.args.len { break }
+                a = mark_expr(call.args[i], true, a)
+                i++
+            }
+            a
+        }
+
+        // control-flow expressions: the branch bodies are statement blocks whose TAIL value inherits
+        // the outer context — when this if/match is itself in an escaping position (escaping=true,
+        // e.g. it is the function-body tail value that codegen drop-then-returns) each branch's
+        // trailing value IS returned and therefore escaping (MEM Step 1 UAF fix #1). The COND/GUARD
+        // is a bool test, but when the if/match is a SUB-expression of a tail value it is EVALUATED
+        // post-drop too (the whole tail value is emitted after the region drop), so a `a.b`-style
+        // cond would deref a frame cell → propagate `escaping` (UAF audit; safe over-marking).
+        TIfExpr as f => {
+            mut a = mark_expr(f.cond, escaping, acc)
+            a = mark_block(f.then_blk, escaping, a)
+            if f.has_else { a = mark_block(f.else_blk, escaping, a) }
+            a
+        }
+        TMatchExpr as m => {
+            // the subject is read to discriminate (and, for `as x` binds, may alias the bound
+            // sub-value) — inherit the outer context so a returned arm that surfaces the subject
+            // keeps it escaping. The guard is likewise post-drop in a tail position → escaping.
+            mut a = mark_expr(m.subject, escaping, acc)
+            mut i = 0
+            loop {
+                if i >= m.arms.len { break }
+                if m.arms[i].has_when { a = mark_expr(m.arms[i].guard, escaping, a) }
+                a = mark_block(m.arms[i].body, escaping, a)
+                i++
+            }
+            a
+        }
+
+        // a cast yields a fresh scalar/value — but the operand may itself be a var; inherit context.
+        TCast as ct => mark_expr(ct.expr, escaping, acc)
+
+        // FIELD READ — the soundness-critical refinement. The scalar-read non-escaping refinement
+        // is SOUND ONLY for a scalar field of a BARE local (`x.f` where `x` is a TVar): that field
+        // is a STACK member of the struct value (recursive/boxed fields are never scalar), so it
+        // survives the frame-region drop. For ANY non-bare receiver (`a.b.y`, `a[i].y`, a call
+        // result, …) the receiver is in the SAME (escaping) context — reading a scalar OFF it still
+        // derefs an interior heap hop (`a.b` is a boxed frame pointer) → propagate escaping (UAF
+        // fix #2). Otherwise (non-scalar result, or non-bare receiver) inherit the outer context.
+        TFieldAccess as fa => {
+            let refine = type_is_scalar(e.type) && expr_is_bare_var(fa.receiver)
+            let recv_ctx = if refine { false } else { escaping }
+            mark_expr(fa.receiver, recv_ctx, acc)
+        }
+        TSafeFieldAccess as sfa => {
+            let refine = type_is_scalar(e.type) && expr_is_bare_var(sfa.receiver)
+            let recv_ctx = if refine { false } else { escaping }
+            mark_expr(sfa.receiver, recv_ctx, acc)
+        }
+        TCoalesce as co => mark_expr(co.right, escaping, mark_expr(co.left, escaping, acc))
+
+        // INDEX READ (`a[i]`) — a slice/array is ALWAYS heap-backed, so an index read DEREFERENCES a
+        // heap pointer. There is NO bare-local stack-member analogue (the elements live behind the
+        // slice's `.ptr`), so in an escaping context the receiver is ESCAPING — no scalar refinement
+        // for an index (UAF fix #2). The index sub-expression is also EVALUATED in the outer context
+        // (post-drop when escaping=true), so a `a.b`-style index dereferences a frame cell → it too
+        // propagates `escaping`; the bare-TVar scalar refinement still keeps `a[x.i]` ⇒ `x` local.
+        TIndex as ix => {
+            mark_expr(ix.index, escaping, mark_expr(ix.receiver, escaping, acc))
+        }
+
+        // aggregate constructors: every component is STORED into a value that takes the outer
+        // context (a returned struct/array carries its components out of the frame).
+        TStructInit as si => {
+            mut a = acc
+            mut i = 0
+            loop {
+                if i >= si.field_vals.len { break }
+                a = mark_expr(si.field_vals[i], escaping, a)
+                i++
+            }
+            a
+        }
+        TArrayLit as al => {
+            mut a = acc
+            mut i = 0
+            loop {
+                if i >= al.elements.len { break }
+                a = mark_expr(al.elements[i].expr, escaping, a)
+                i++
+            }
+            a
+        }
+        TInterp as ip => {
+            // an interpolation BUILDS a fresh str; its holes are rendered (copied) into it and never
+            // alias the result. But the holes are EVALUATED in the outer context: when the interp is
+            // the tail value (escaping=true) they render AFTER the frame-region drop, so a `a.b`-style
+            // hole dereferences a frame cell post-drop → propagate `escaping` (UAF audit). The
+            // bare-TVar scalar refinement still keeps `"{x.val}"` frame-local one level down.
+            mut a = acc
+            mut i = 0
+            loop {
+                if i >= ip.holes.len { break }
+                a = mark_expr(ip.holes[i], escaping, a)
+                i++
+            }
+            a
+        }
+        TInExpr as ine => {
+            // `x in [ … ]` yields a bool, but lhs/elems are EVALUATED (and compared) in the outer
+            // context: when the `in` is the tail value (escaping=true) they run AFTER the frame-region
+            // drop, so a `a.b`-style operand dereferences a frame cell post-drop → propagate
+            // `escaping` (UAF audit). The bare-TVar scalar refinement still applies one level down.
+            mut a = mark_expr(ine.lhs, escaping, acc)
+            mut i = 0
+            loop {
+                if i >= ine.elems.len { break }
+                a = mark_expr(ine.elems[i], escaping, a)
+                i++
+            }
+            a
+        }
+    }
+}
+
+// mark_block — walk a statement block, threading the escaping-var accumulator. `tail` is TRUE
+// when this block's TRAILING value is RETURNED (the function/branch tail) — codegen drops the
+// frame region BEFORE that value and `return`s it (emit_block_tail/emit_exprstmt_tail), so the
+// last statement, when it is a value-bearing expr-statement, must be analysed in an ESCAPING
+// context (MEM Step 1 UAF fix). All NON-last statements are interior (tail=false). A `tail=false`
+// block (a loop/defer body, or a discarded if/match branch) discards its trailing value.
+fn mark_block(body: []TStatement, tail: bool, acc: []str) -> []str {
+    mut a = acc
+    mut i = 0
+    loop {
+        if i >= body.len { break }
+        let is_last = i + 1 == body.len
+        a = mark_stmt(body[i], tail && is_last, a)
+        i++
+    }
+    a
+}
+
+// mark_stmt — walk one statement. Establishes the escaping context per position. `tail` is TRUE
+// only for the block's LAST statement when that block's trailing value is returned: an
+// expr-statement there is an IMPLICIT RETURN (B.20/W5a) whose value codegen produces AFTER
+// dropping the frame region, so it must be ESCAPING (not discarded).
+fn mark_stmt(s: TStatement, tail: bool, acc: []str) -> []str {
+    match s {
+        // a binding RHS escapes (the value lives on through the bound name; conservatively the
+        // name may itself later escape — we do not run a second fixpoint pass).
+        TBinding as b => mark_expr(b.value, true, acc)
+        // an assignment RHS escapes (it may be written into an outer/captured location).
+        TAssign as a  => mark_expr(a.value, true, acc)
+        // a return value escapes the frame entirely.
+        TReturn as r  => if r.has_value { mark_expr(r.value, true, acc) } else { acc }
+        // an expression-statement: DISCARDED (value unused → NON-escaping) UNLESS it is in TAIL
+        // position, where it is an implicit RETURN whose value escapes the frame (codegen
+        // drop-then-returns it). Nested calls/returns inside still escape via their own positions.
+        TExprStmt as es => mark_expr(es.expr, tail, acc)
+        // a loop body's trailing expr is NOT a return (a loop exits via break) → NON-tail.
+        TLoopStmt as l  => mark_block(l.body, false, acc)
+        TBreakStmt      => acc
+        TContinueStmt   => acc
+        // a defer body's trailing expr is run for effect, NOT a return → NON-tail.
+        TDeferStmt as d => mark_block(d.body, false, acc)
+    }
+}
+
+// fn_escaping_vars — the per-function escape set: every local that outlives the frame. PUBLIC:
+// the codegen (both engines) and the checker test read it. A function's PARAMETERS are immutable
+// inputs (B.21) and never frame-allocated here, so they need no entry. The body is analysed in
+// TAIL position: its trailing value-bearing expr-statement is an IMPLICIT RETURN (escaping).
+pub fn fn_escaping_vars(f: TFunction) -> []str {
+    mark_block(f.body, true, teko::list::empty())
+}
+
+// binding_is_frame_local — does this binding's value allocate into the frame region? True iff
+// it is a `let`/`mut` to a SIMPLE name that is NOT in the escaping set AND whose value is a
+// struct-init (the only codegen allocation site that can be frame-routed — the auto-boxed
+// recursive back-edge). A `const`, a destructure, a discard (`_`), an escaping name, or any
+// non-struct-init value is NOT frame-local (→ allocates in root, the safe default). PUBLIC.
+pub fn binding_is_frame_local(escaping: []str, b: TBinding) -> bool {
+    let name = match b.target {
+        parser::SimpleName as sn   => sn.name
+        parser::DestructurePattern => return false
+    }
+    if name == "_" { return false }
+    if b.kind == parser::BindKind::Const { return false }
+    if str_set_has(escaping, name) { return false }
+    match b.value.kind {
+        TStructInit => true
+        _           => false
+    }
+}

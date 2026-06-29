@@ -21,6 +21,7 @@
 
 #include "../lexer/token.h"   // tk_token_kind operator kinds
 #include "../parser/ast.h"    // tk_bind_kind, tk_bind_target, tk_path
+#include "../checker/escape.h" // MEM Step 1 — the escape check (frame-local classification)
 
 #include <stdlib.h>           // malloc/realloc/free
 #include <string.h>           // memcpy, strlen
@@ -234,6 +235,42 @@ static tk_tprogram g_cg_prog;   // set once at the top of tk_emit_c (mirror of v
 // ret_type) wraps its value into THIS type via emit_as, so `return error{…}` in a diverging arm
 // of a `T | error` function lands in the tk_u_ variant, not as a bare member.
 static tk_type g_cg_ret_type;
+
+// MEM Step 1 — THE FRAME REGION (escape.h). Set at the top of emit_function: g_cg_escaping is the
+// function's escape set; g_cg_box_frame names the frame-region variable when the auto-box of a
+// struct-init being emitted should ride `tk_region_alloc(<frame>, …)` instead of root `tk_alloc`.
+// emit_binding sets g_cg_box_frame transiently around a frame-local struct-init binding; the
+// TK_TEXPR_STRUCT_INIT box reads it. "" / {NULL,0} ⇒ root (the safe leak default).
+static tk_escape_set g_cg_escaping;
+static const char   *g_cg_box_frame = "";
+// g_cg_frame — the ACTIVE frame-region variable on the current emit path ("" ⇒ none). Set by
+// emit_function; CLEARED (save/restore) when descending into a SUB-SCOPE body (if/match/loop, a
+// tail-if/else, a match-tail arm) so those leak the region (SAFE, M.5) — mirroring the Teko twin,
+// which threads frame="" into the same positions. emit_binding/emit_return/emit_exprstmt_tail read it.
+static const char   *g_cg_frame = "";
+
+// cg_same_named_struct — are `a` and `b` the SAME Named type? Gates the frame-local binding
+// routing to the no-wrap case (declared type == struct-init's own type), so a variant/optional-
+// typed binding (which emit_as must wrap) is never emitted via the direct framed path.
+static bool cg_same_named_struct(tk_type a, tk_type b) {
+    return a.tag == TK_TYPE_NAMED && b.tag == TK_TYPE_NAMED
+        && a.as.named.name.len == b.as.named.name.len
+        && (a.as.named.name.len == 0
+            || memcmp(a.as.named.name.ptr, b.as.named.name.ptr, a.as.named.name.len) == 0);
+}
+
+// cg_body_has_frame_local — any TOP-LEVEL binding the escape check proved frame-local AND routable
+// (no-wrap)? Drives whether emit_function opens a frame region (none ⇒ no region ⇒ zero output
+// change — the fixpoint-preserving default).
+static bool cg_body_has_frame_local(tk_escape_set esc, const tk_tstatement *body, size_t n) {
+    for (size_t i = 0; i < n; i += 1) {
+        if (body[i].tag == TK_TSTMT_BINDING
+            && tk_binding_is_frame_local(esc, body[i])
+            && cg_same_named_struct(body[i].as.binding.bound, body[i].as.binding.value.type))
+            return true;
+    }
+    return false;
+}
 
 // (C7.18) Per-function defer stack: accumulated as emit_stmt encounters TK_TSTMT_DEFER nodes,
 // emitted LIFO before every `return` and at the function's trailing exit. Reset at the top of
@@ -972,20 +1009,25 @@ static bool emit_branch_value(cbuf *b, const tk_tstatement *body, size_t n, tk_t
 static bool emit_if_value(cbuf *b, const tk_texpr *e, const char **err) {
     if (!e->as.if_expr.has_else)
         return fail_node(err, "codegen: if-without-else used as a value not yet supported");
+    // MEM Step 1: a value-form `if` is a SUB-EXPRESSION — emit its branch statements FRAMELESS
+    // (the Teko twin's emit_branch_value/emit_stmt_value thread frame=""), so a binding inside a
+    // value-branch never frame-routes. Save/restore the active frame around the whole expansion.
+    const char *saved = g_cg_frame; g_cg_frame = "";
     // Freeze a unique temp name (buffer length is about to change as we append).
     char tmp[32];
     snprintf(tmp, sizeof tmp, "_tk%zu", (size_t)b->len);
     cb(b, "({ ");
-    if (!emit_type(b, e->type, err)) return false;
+    if (!emit_type(b, e->type, err)) { g_cg_frame = saved; return false; }
     cb(b, " "); cb(b, tmp); cb(b, "; if (");
-    if (!emit_expr(b, e->as.if_expr.cond, err)) return false;
+    if (!emit_expr(b, e->as.if_expr.cond, err)) { g_cg_frame = saved; return false; }
     cb(b, ") {\n");
     if (!emit_branch_value(b, e->as.if_expr.then_blk, e->as.if_expr.nthen, e->type, tmp, "    ", err))
-        return false;
+        { g_cg_frame = saved; return false; }
     cb(b, "} else {\n");
     if (!emit_branch_value(b, e->as.if_expr.else_blk, e->as.if_expr.nelse, e->type, tmp, "    ", err))
-        return false;
+        { g_cg_frame = saved; return false; }
     cb(b, "} "); cb(b, tmp); cb(b, "; })");
+    g_cg_frame = saved;
     return true;
 }
 
@@ -1643,7 +1685,14 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
                     cb(b, "({ ");
                     if (!emit_type_expr(b, fte, err)) return false;
                     cb(b, " *_bx"); cb_i64(b, (int64_t)bxid);
-                    cb(b, " = tk_alloc(sizeof *_bx"); cb_i64(b, (int64_t)bxid); cb(b, "); *_bx"); cb_i64(b, (int64_t)bxid); cb(b, " = ");
+                    // MEM Step 1: a frame-local box rides the frame region (freed at the exit edge);
+                    // everything else rides root `tk_alloc` (the safe leak). g_cg_box_frame is set by
+                    // emit_binding only for a struct-init the escape check proved frame-local.
+                    if (g_cg_box_frame != NULL && g_cg_box_frame[0] != '\0') {
+                        cb(b, " = tk_region_alloc("); cb(b, g_cg_box_frame); cb(b, ", sizeof *_bx"); cb_i64(b, (int64_t)bxid); cb(b, "); *_bx"); cb_i64(b, (int64_t)bxid); cb(b, " = ");
+                    } else {
+                        cb(b, " = tk_alloc(sizeof *_bx"); cb_i64(b, (int64_t)bxid); cb(b, "); *_bx"); cb_i64(b, (int64_t)bxid); cb(b, " = ");
+                    }
                 }
                 // Sentinel field: emit a concrete literal from the declared field type.
                 // Covers: empty-slice fields (element==NULL) and null/absent optional fields.
@@ -2699,40 +2748,44 @@ static bool emit_arm_value(cbuf *b, const tk_texpr *match_e, const tk_tstatement
 //        if (<test0>) { <binds0> [if (<guard0>)] { <arm body → _rN; break;> } }
 //        … } while (0); _rN; })
 static bool emit_match_value(cbuf *b, const tk_texpr *e, const char **err) {
+    // MEM Step 1: a value-form `match` is a SUB-EXPRESSION — emit its arm statements FRAMELESS
+    // (the Teko twin's emit_arm_value threads frame=""). Save/restore around the whole expansion.
+    const char *saved = g_cg_frame; g_cg_frame = "";
     // Freeze unique temp names (buffer length is the functional uniquifier — see emit_if_value).
     char subj[40], res[40];
     snprintf(subj, sizeof subj, "_s%zu", (size_t)b->len);
     snprintf(res,  sizeof res,  "_r%zu", (size_t)b->len + 1);   // +1 so it differs from subj
     tk_type subjT = e->as.match_expr.subject->type;   // for optional / variant pattern lowering
     cb(b, "({ ");
-    if (!emit_type(b, e->as.match_expr.subject->type, err)) return false;
+    if (!emit_type(b, e->as.match_expr.subject->type, err)) { g_cg_frame = saved; return false; }
     cb(b, " "); cb(b, subj); cb(b, " = (");
-    if (!emit_expr(b, e->as.match_expr.subject, err)) return false;
+    if (!emit_expr(b, e->as.match_expr.subject, err)) { g_cg_frame = saved; return false; }
     cb(b, "); ");
-    if (!emit_type(b, e->type, err)) return false;
+    if (!emit_type(b, e->type, err)) { g_cg_frame = saved; return false; }
     cb(b, " "); cb(b, res); cb(b, "; do {\n");
     for (size_t i = 0; i < e->as.match_expr.narms; i += 1) {
         const tk_tarm *arm = &e->as.match_expr.arms[i];
         cb(b, "    if (");
-        if (!cg_emit_pat_test(b, &arm->pattern, subj, subjT, err)) return false;
+        if (!cg_emit_pat_test(b, &arm->pattern, subj, subjT, err)) { g_cg_frame = saved; return false; }
         cb(b, ") {\n");
-        if (!cg_emit_pat_binds(b, &arm->pattern, subj, subjT, "        ", err)) return false;
+        if (!cg_emit_pat_binds(b, &arm->pattern, subj, subjT, "        ", err)) { g_cg_frame = saved; return false; }
         const char *commit_indent = "        ";
         if (arm->has_when) {
             cb(b, "        if (");
-            if (!emit_expr(b, arm->guard, err)) return false;
+            if (!emit_expr(b, arm->guard, err)) { g_cg_frame = saved; return false; }
             cb(b, ") {\n");
             commit_indent = "            ";
         }
         // The arm body is a BLOCK (B.20): its trailing value flows into _r (wrapped to the
         // match result type), or a diverging arm (`=> return e`) emits real control flow.
-        if (!emit_arm_value(b, e, arm->body, arm->nbody, res, commit_indent, err)) return false;
+        if (!emit_arm_value(b, e, arm->body, arm->nbody, res, commit_indent, err)) { g_cg_frame = saved; return false; }
         if (arm->has_when) cb(b, "        }\n");
         cb(b, "    }\n");
     }
     // Exhaustiveness is guaranteed by the checker; the chain always commits before falling
     // through. (No default needed — a fall-through cannot happen for a well-typed program.)
     cb(b, "    } while (0); "); cb(b, res); cb(b, "; })");
+    g_cg_frame = saved;
     return true;
 }
 
@@ -2777,7 +2830,10 @@ static bool emit_match_tail(cbuf *b, const tk_texpr *e, bool in_main,
         // The arm body is a BLOCK in TAIL position (B.20): emit it as a tail block — its
         // trailing value becomes a `return`, and an explicit return/break/continue inside it
         // emits real C control flow (mirrors the VM running the arm block flow-aware).
-        if (!emit_block_tail(b, arm->body, arm->nbody, in_main, ret_type, ci, err)) return false;
+        // MEM Step 1: frameless (an arm return leaks the frame region — SAFE), mirroring the Teko twin.
+        { const char *saved = g_cg_frame; g_cg_frame = "";
+          bool ok = emit_block_tail(b, arm->body, arm->nbody, in_main, ret_type, ci, err);
+          g_cg_frame = saved; if (!ok) return false; }
         // FIRST match wins → jump past the remaining arms. After a diverging body (return/exit/
         // panic) this is dead code (cc sees the generated C with `-w`); after a non-diverging
         // void body it is the line that stops later arms from also firing.
@@ -2845,9 +2901,15 @@ static bool emit_match_stmt(cbuf *b, const tk_texpr *e, bool in_main, tk_type re
 // =========================================================================
 static bool emit_block(cbuf *b, const tk_tstatement *body, size_t n, bool in_main,
                        tk_type ret_type, const char *indent, const char **err) {
+    // MEM Step 1: emit_block is only reached from SUB-SCOPE (if/match/loop) bodies — emit them
+    // FRAMELESS (a return inside leaks the frame region — SAFE; a frame-local binding here falls
+    // back to root), mirroring the Teko twin which threads frame="" into the same positions. The
+    // TOP-LEVEL path runs through emit_block_tail, which keeps the active frame.
+    const char *saved = g_cg_frame; g_cg_frame = "";
     for (size_t i = 0; i < n; i += 1) {
-        if (!emit_stmt(b, &body[i], in_main, ret_type, indent, err)) return false;
+        if (!emit_stmt(b, &body[i], in_main, ret_type, indent, err)) { g_cg_frame = saved; return false; }
     }
+    g_cg_frame = saved;
     return true;
 }
 
@@ -2873,11 +2935,16 @@ static bool emit_exprstmt_tail(cbuf *b, const tk_texpr *x, bool in_main,
         if (!emit_expr(b, x->as.if_expr.cond, err)) return false;
         cb(b, ") {\n");
         char inner[64]; snprintf(inner, sizeof inner, "%s    ", indent);
+        // MEM Step 1: the branch tails are FRAMELESS (their returns leak the region — SAFE),
+        // mirroring the Teko twin (frame="" into the tail-if branches). Keeps the first cut's drop
+        // routing confined to the linear top-level path.
+        const char *saved = g_cg_frame; g_cg_frame = "";
         if (!emit_block_tail(b, x->as.if_expr.then_blk, x->as.if_expr.nthen, in_main, ret_type, inner, err))
-            return false;
+            { g_cg_frame = saved; return false; }
         cb(b, indent); cb(b, "} else {\n");
         if (!emit_block_tail(b, x->as.if_expr.else_blk, x->as.if_expr.nelse, in_main, ret_type, inner, err))
-            return false;
+            { g_cg_frame = saved; return false; }
+        g_cg_frame = saved;
         cb(b, indent); cb(b, "}\n");
         return true;
     }
@@ -2895,6 +2962,9 @@ static bool emit_exprstmt_tail(cbuf *b, const tk_texpr *x, bool in_main,
     }
     // (C7.18) Drain defers before the implicit trailing-value return.
     if (!emit_defers(b, indent, err)) return false;
+    // MEM Step 1: the tail value-return EDGE — drop the frame region before the implicit `return`
+    // (a return value is escaping, so it never references a frame-local cell).
+    if (g_cg_frame[0] != '\0' && !in_main) { cb(b, indent); cb(b, "tk_region_drop("); cb(b, g_cg_frame); cb(b, ");\n"); }
     cb(b, indent);
     if (in_main) {
         cb(b, "return (int)(");
@@ -2986,9 +3056,22 @@ static bool emit_stmt(cbuf *b, const tk_tstatement *s, bool in_main,
             cb(b, " ");
             cb_ident(b, tgt.as.simple.name);
             cb(b, " = ");
+            // MEM Step 1 — FRAME-LOCAL routing. When a frame region is active AND the escape check
+            // proved this binding frame-local AND no variant/optional wrap is needed (declared type
+            // == the struct-init's own named struct), route its DIRECT auto-box through the frame
+            // region. emit_as is a pass-through in the no-wrap case, so setting g_cg_box_frame around
+            // it produces the same text as the Teko twin's direct framed struct-init emit. Otherwise
+            // everything stays on root (the safe leak), byte-identical to the pre-Step-1 output.
+            bool framed_bind = g_cg_frame[0] != '\0'
+                && tk_binding_is_frame_local(g_cg_escaping, *s)
+                && cg_same_named_struct(s->as.binding.bound, s->as.binding.value.type)
+                && s->as.binding.value.tag == TK_TEXPR_STRUCT_INIT;
+            const char *saved_box = g_cg_box_frame;
+            if (framed_bind) g_cg_box_frame = g_cg_frame;
             // W5b — if the binding's declared type is a variant and the value is a case
             // member, WRAP it into the variant repr (e.g. `let s: Shape = Circle { … }`).
-            if (!emit_as(b, s->as.binding.bound, &s->as.binding.value, err)) return false;
+            if (!emit_as(b, s->as.binding.bound, &s->as.binding.value, err)) { g_cg_box_frame = saved_box; return false; }
+            g_cg_box_frame = saved_box;
             cb(b, ";\n");
             return true;
         }
@@ -3014,6 +3097,11 @@ static bool emit_stmt(cbuf *b, const tk_tstatement *s, bool in_main,
         case TK_TSTMT_RETURN: {
             // (C7.18) Drain the defer stack LIFO before returning.
             if (!emit_defers(b, indent, err)) return false;
+            // MEM Step 1: drop the frame region on the return EDGE (before evaluating the value — a
+            // return value is ESCAPING, so by the escape check it never references a frame-local
+            // cell). tk_region_drop is idempotent + NULL-tolerant, so overlapping edge-drops free
+            // nothing twice. No frame ⇒ nothing emitted.
+            if (g_cg_frame[0] != '\0') { cb(b, indent); cb(b, "tk_region_drop("); cb(b, g_cg_frame); cb(b, ");\n"); }
             cb(b, indent);
             if (!s->as.ret.has_value) {
                 cb(b, in_main ? "return 0;\n" : "return;\n");
@@ -3132,10 +3220,26 @@ static bool emit_function(cbuf *b, tk_tfunction f, const char **err) {
     g_cg_ndefers   = 0;               // (C7.18) reset the per-function defer stack
     if (!emit_function_sig(b, f, err)) return false;
     cb(b, " {\n");
+    // MEM Step 1 — THE FRAME REGION (escape.h). Run the escape check; when a TOP-LEVEL binding is
+    // provably frame-local AND routable (no-wrap), open a per-function frame region `_tkfr` at entry.
+    // Its frame-local allocations are bulk-freed on the return edges (emit_return / emit_exprstmt_tail)
+    // and at the fall-through end. No frame-local binding ⇒ NO region — byte-identical to pre-Step-1.
+    g_cg_escaping = tk_fn_escaping_vars(f);
+    bool want_frame = cg_body_has_frame_local(g_cg_escaping, f.body, f.nbody);
+    g_cg_frame = want_frame ? "_tkfr" : "";
+    if (want_frame) cb(b, "    tk_region *_tkfr = tk_region_new();\n");
     // W5a — a fn body's trailing expr-statement carrying a value implicitly returns it.
     // W5b — thread the fn's return type so a tail/return case value is wrapped into a
     // variant return slot (emit_as).
-    if (!emit_block_tail(b, f.body, f.nbody, /*in_main=*/false, f.return_type, "    ", err)) return false;
+    if (!emit_block_tail(b, f.body, f.nbody, /*in_main=*/false, f.return_type, "    ", err)) { g_cg_frame = ""; return false; }
+    // MEM Step 1 — the FALL-THROUGH exit edge. If control can reach the function's end (the tail did
+    // not C-terminate), drop the frame region there too (tk_region_drop is idempotent — no double-free
+    // against a return-edge drop on another path).
+    if (want_frame) {
+        bool tail_terminates = f.nbody > 0 && cg_stmt_c_terminates(&f.body[f.nbody - 1]);
+        if (!tail_terminates) cb(b, "    tk_region_drop(_tkfr);\n");
+    }
+    g_cg_frame = "";   // leave the global clean for the next function / top-level emission
     // A non-void function whose body's tail is a value-form `match`/`if` (or a loop) returns on
     // every path the CHECKER proved exhaustive — but C's flow analysis can't see that, so without a
     // terminator it warns -Wreturn-type and the fall-through is UB. The checker guarantees it is

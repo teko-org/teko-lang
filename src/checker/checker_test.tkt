@@ -1251,3 +1251,192 @@ fn mono_walk_covers_node_kinds() {
     teko::assert::is_true(find_titem_fn(mp, "idg__g__i64"))
     teko::assert::is_true(find_titem_fn(mp, "caller"))
 }
+
+// =========================================================================
+// MEM Step 1 — THE ESCAPE CHECK (escape.tks). The classifier must (1) call a returned
+// allocation ESCAPING (never frame-local — a leak is safe, a UAF is a vulnerability) and
+// (2) call a purely-local allocation FRAME-LOCAL (read only through a scalar field copy).
+// =========================================================================
+
+// a typed `Node { val = <i64>; }` struct-init value (Node is the recursive value type).
+fn t_node_init(val: TExpr) -> TExpr {
+    let fnames = teko::list::push(teko::list::empty(), "val")
+    let fvals  = teko::list::push(teko::list::empty(), val)
+    TExpr { kind = TStructInit { field_names = fnames; field_vals = fvals }; type = Named { name = "Node" }; line = 0; col = 0 }
+}
+// a `let n = <value>` binding (not const, not discard) to a SimpleName — returned as the raw
+// TBinding (the codegen's emit_binding receives this same destructured node).
+fn t_let(name: str, value: TExpr) -> TBinding {
+    TBinding { kind = parser::BindKind::Let; target = parser::SimpleName { name = name }; bound = value.type; value = value }
+}
+// `n.val` typed as i64 (a SCALAR field read — a pure copy, so the receiver does not escape).
+fn t_field_i64(recv_name: str, field: str) -> TExpr {
+    let recv = tvar(recv_name, Named { name = "Node" })
+    TExpr { kind = TFieldAccess { receiver = recv; field = field }; type = i64t(); line = 0; col = 0 }
+}
+
+#test
+fn escape_returned_allocation_is_escaping() {
+    // fn f() -> Node { let n = Node { val = 5 }; return n }   — `n` is RETURNED ⇒ ESCAPING.
+    let binding = t_let("n", t_node_init(tnum(5)))
+    mut body: []TStatement = teko::list::push(teko::list::empty(), binding)
+    body = teko::list::push(body, treturn(tvar("n", Named { name = "Node" })))
+    let f = plainfn("f", Named { name = "Node" }, body)
+    let esc = fn_escaping_vars(f)
+    teko::assert::is_true(str_set_has(esc, "n"))                 // proven to escape
+    teko::assert::is_true(!binding_is_frame_local(esc, binding)) // ⇒ NOT frame-local (stays in root)
+}
+
+#test
+fn escape_local_scalar_read_is_frame_local() {
+    // fn f() -> i64 { let n = Node { val = 5 }; return n.val }   — `n` is read ONLY as a SCALAR
+    // field copy ⇒ it does NOT escape ⇒ the allocation is FRAME-LOCAL (region-freed at exit).
+    let binding = t_let("n", t_node_init(tnum(5)))
+    mut body: []TStatement = teko::list::push(teko::list::empty(), binding)
+    body = teko::list::push(body, treturn(t_field_i64("n", "val")))
+    let f = plainfn("f", i64t(), body)
+    let esc = fn_escaping_vars(f)
+    teko::assert::is_true(!str_set_has(esc, "n"))               // proven NOT to escape
+    teko::assert::is_true(binding_is_frame_local(esc, binding)) // ⇒ frame-local (provable subset)
+}
+
+#test
+fn escape_call_argument_is_escaping() {
+    // fn f() { let n = Node { val = 5 }; use(n) }   — `n` is passed to a call ⇒ may be retained
+    // ⇒ conservatively ESCAPING (one-depth: a callee could store the argument).
+    let binding = t_let("n", t_node_init(tnum(5)))
+    mut body: []TStatement = teko::list::push(teko::list::empty(), binding)
+    body = teko::list::push(body, texpr_stmt(tcall1("use", tvar("n", Named { name = "Node" }), i64t())))
+    let f = plainfn("f", i64t(), body)
+    let esc = fn_escaping_vars(f)
+    teko::assert::is_true(str_set_has(esc, "n"))
+    teko::assert::is_true(!binding_is_frame_local(esc, binding))
+}
+
+#test
+fn escape_const_binding_is_never_frame_local() {
+    // a `const` binding never goes in the frame region (it may be folded / outlive the frame).
+    let cbind = TBinding { kind = parser::BindKind::Const; target = parser::SimpleName { name = "k" }; bound = Named { name = "Node" }; value = t_node_init(tnum(1)) }
+    let body: []TStatement = teko::list::push(teko::list::empty(), cbind)
+    let f = plainfn("f", i64t(), body)
+    let esc = fn_escaping_vars(f)
+    teko::assert::is_true(!binding_is_frame_local(esc, cbind))   // const ⇒ never frame-local
+}
+
+// --- MEM Step 1 UAF FIX regression: a TAIL expr-statement is an IMPLICIT RETURN (escaping) ---
+// Codegen (emit_block_tail/emit_exprstmt_tail) drops the frame region BEFORE the implicit
+// trailing-value return, so a frame-local recursive-struct read in that tail value would be a
+// use-after-free. The escape check must AGREE with codegen and mark such a binding ESCAPING.
+
+// `Node { val = <i64>; next = <Node-typed> }` — the recursive back-edge carrying field.
+fn t_node_init2(val: TExpr, next: TExpr) -> TExpr {
+    mut fnames = teko::list::push(teko::list::empty(), "val")
+    fnames = teko::list::push(fnames, "next")
+    mut fvals = teko::list::push(teko::list::empty(), val)
+    fvals = teko::list::push(fvals, next)
+    TExpr { kind = TStructInit { field_names = fnames; field_vals = fvals }; type = Named { name = "Node" }; line = 0; col = 0 }
+}
+// `n.next` typed as Node (a NON-scalar field read — surfaces an interior pointer).
+fn t_field_node(recv_name: str, field: str) -> TExpr {
+    let recv = tvar(recv_name, Named { name = "Node" })
+    TExpr { kind = TFieldAccess { receiver = recv; field = field }; type = Named { name = "Node" }; line = 0; col = 0 }
+}
+
+#test
+fn escape_tail_implicit_return_rebox_is_escaping() {
+    // fn f() -> Node { let n = Node { val = 5; next = n }; Node { val = n.val; next = n.next } }
+    // The trailing struct-init is an IMPLICIT RETURN (no `return` keyword). It re-boxes `n.next`
+    // (a NON-scalar interior pointer) into the returned value — so `n` ESCAPES. Before the fix the
+    // tail expr-statement was DISCARDED (non-escaping) ⇒ `n` was wrongly frame-local ⇒ the frame
+    // region was dropped on the return edge, then the tail dereferenced the freed cell = UAF.
+    // The binding does NOT read `n` (no self-reference) — only the TAIL re-box does, so this test
+    // genuinely isolates the tail-position escape (not the binding RHS).
+    let binding = t_let("n", t_node_init(tnum(5)))
+    let tail = t_node_init2(t_field_i64("n", "val"), t_field_node("n", "next"))
+    mut body: []TStatement = teko::list::push(teko::list::empty(), binding)
+    body = teko::list::push(body, texpr_stmt(tail))           // implicit-return tail (no `return`)
+    let f = plainfn("f", Named { name = "Node" }, body)
+    let esc = fn_escaping_vars(f)
+    teko::assert::is_true(str_set_has(esc, "n"))               // tail value escapes ⇒ `n` escapes
+    teko::assert::is_true(!binding_is_frame_local(esc, binding)) // ⇒ NOT frame-local (routes to root)
+}
+
+#test
+fn escape_tail_safe_field_coalesce_is_escaping() {
+    // fn f() -> Node { let n = Node{…}; (n.next?.next) ?? other }
+    // The implicit-return tail reads `n.next` (a NON-scalar interior pointer) via a safe-field
+    // access whose receiver is a non-scalar field read, then COALESCES the (non-scalar) result —
+    // so `n` ESCAPES. (Reproducer A: `?.` + `??` in the implicit tail.) The safe-field RESULT type
+    // is kept NOMINAL (Node, not Optional) to dodge the VM single-field-wrapper-descent landmine
+    // [memory: VM conflates Ref/Ptr/Optional/Slice in `match`]; the native engine handles either,
+    // and what the escape check needs is only that the result is NON-scalar.
+    let binding = t_let("n", t_node_init(tnum(5)))           // binding does NOT read `n` — only the tail does
+    let nnext = t_field_node("n", "next")                    // n.next : Node (non-scalar interior pointer)
+    let sfa = TExpr { kind = TSafeFieldAccess { receiver = nnext; field = "next" }; type = Named { name = "Node" }; line = 0; col = 0 }
+    let tail = TExpr { kind = TCoalesce { left = sfa; right = tvar("other", Named { name = "Node" }) }; type = Named { name = "Node" }; line = 0; col = 0 }
+    mut body: []TStatement = teko::list::push(teko::list::empty(), binding)
+    body = teko::list::push(body, texpr_stmt(tail))           // implicit-return tail (no `return`)
+    let f = plainfn("f", Named { name = "Node" }, body)
+    let esc = fn_escaping_vars(f)
+    teko::assert::is_true(str_set_has(esc, "n"))               // tail value escapes ⇒ `n` escapes
+    teko::assert::is_true(!binding_is_frame_local(esc, binding))
+}
+
+#test
+fn escape_tail_scalar_implicit_return_stays_frame_local() {
+    // fn f() -> i64 { let n = Node { val = 5; next = n }; n.val }
+    // The implicit-return tail reads ONLY a SCALAR field (a pure copy carrying no interior
+    // pointer), so `n` does NOT escape and the allocation stays FRAME-LOCAL — the legitimate free
+    // the fix must PRESERVE (do not over-conservatively kill the provable frame-local subset).
+    let binding = t_let("n", t_node_init(tnum(5)))
+    mut body: []TStatement = teko::list::push(teko::list::empty(), binding)
+    body = teko::list::push(body, texpr_stmt(t_field_i64("n", "val")))   // implicit-return scalar tail
+    let f = plainfn("f", i64t(), body)
+    let esc = fn_escaping_vars(f)
+    teko::assert::is_true(!str_set_has(esc, "n"))             // scalar tail copy ⇒ does NOT escape
+    teko::assert::is_true(binding_is_frame_local(esc, binding)) // ⇒ STILL frame-local (free preserved)
+}
+
+// --- MEM Step 1 UAF FIX #2 regression: a SCALAR read through a BOXED HOP (`a.b.y`) escapes ---
+// The scalar non-escaping refinement is SOUND ONLY for a scalar field of a BARE local (a stack
+// member). `a.b.y` reads a scalar `.y` but THROUGH `a.b` — a boxed (recursive) field that is a
+// heap pointer into the frame region. The whole tail value is evaluated AFTER the region drop, so
+// dereferencing the freed `a.b` is a use-after-free. The refinement must route `a` to ESCAPING
+// because the field-access receiver (`a.b`) is NOT a bare TVar.
+
+#test
+fn escape_tail_scalar_through_boxed_hop_is_escaping() {
+    // fn f() -> i64 { let n = Node { val = 5 }; n.next.val }
+    // `.val` is scalar (i64) but its receiver `n.next` is a NON-scalar (boxed) interior pointer —
+    // a frame-region heap hop. The bare-TVar refinement must NOT fire (receiver is a field access,
+    // not a TVar) ⇒ `n` ESCAPES ⇒ NOT frame-local (the only sound choice — avoids the UAF).
+    let binding = t_let("n", t_node_init(tnum(5)))
+    let nnext = t_field_node("n", "next")                    // n.next : Node (boxed heap hop)
+    let deep  = TExpr { kind = TFieldAccess { receiver = nnext; field = "val" }; type = i64t(); line = 0; col = 0 }  // (n.next).val : i64 (scalar through a boxed hop)
+    mut body: []TStatement = teko::list::push(teko::list::empty(), binding)
+    body = teko::list::push(body, texpr_stmt(deep))          // implicit-return tail (no `return`)
+    let f = plainfn("f", i64t(), body)
+    let esc = fn_escaping_vars(f)
+    teko::assert::is_true(str_set_has(esc, "n"))             // scalar-through-boxed-hop ⇒ `n` escapes
+    teko::assert::is_true(!binding_is_frame_local(esc, binding)) // ⇒ NOT frame-local (UAF avoided)
+}
+
+#test
+fn escape_tail_index_receiver_is_escaping() {
+    // fn f() -> i64 { let n = Node { val = 5 }; arr[n.val] }
+    // An index read derefs a heap-backed slice. The index sub-expression `n.val` is evaluated
+    // post-drop too; `n.val` is a bare-TVar scalar (frame-local), but the receiver `arr` (a TVar)
+    // is read in an escaping context. This pins down that the index path propagates escaping to its
+    // receiver while still allowing a bare-TVar scalar index (`n.val`) to stay frame-local.
+    let binding = t_let("n", t_node_init(tnum(5)))
+    let arr = tvar("arr", Slice { element = i64t() })
+    let idx = t_field_i64("n", "val")                        // n.val : i64 (bare-TVar scalar)
+    let tail = TExpr { kind = TIndex { receiver = arr; index = idx }; type = i64t(); line = 0; col = 0 }
+    mut body: []TStatement = teko::list::push(teko::list::empty(), binding)
+    body = teko::list::push(body, texpr_stmt(tail))          // implicit-return tail (no `return`)
+    let f = plainfn("f", i64t(), body)
+    let esc = fn_escaping_vars(f)
+    teko::assert::is_true(str_set_has(esc, "arr"))          // index receiver (heap slice) escapes
+    teko::assert::is_true(!str_set_has(esc, "n"))           // bare-TVar scalar index stays frame-local
+    teko::assert::is_true(binding_is_frame_local(esc, binding))
+}
