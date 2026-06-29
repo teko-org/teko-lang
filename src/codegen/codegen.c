@@ -3826,15 +3826,18 @@ static bool cg_emit_types_ordered(cbuf *b, tk_tprogram prog, const char **err) {
     size_t nn = 0;
     for (size_t i = 0; i < prog.nitems; i += 1)
         if (prog.items[i].tag == TK_TITEM_TYPE_DECL) nn += 1;
-    tk_type_decl *named = nn ? tk_alloc(nn * sizeof *named) : NULL;
-    bool *named_done = nn ? tk_alloc(nn * sizeof *named_done) : NULL;
-    if (nn && (named == NULL || named_done == NULL)) abort();   // tk_alloc never returns NULL (OOM panics); tells the analyzer
+    // Allocate `count ? count : 1` so each pointer is UNCONDITIONALLY non-NULL after its abort
+    // guard (tk_alloc never returns NULL — OOM panics; the guard makes that visible to the static
+    // analyzer as a constraint on the pointer ITSELF, which intervening calls cannot invalidate —
+    // a `count && p==NULL` guard does NOT survive, since the analyzer drops the count constraint
+    // across calls that take `&N`). The extra 1-element alloc when a count is 0 is harmless.
+    tk_type_decl *named = tk_alloc((nn ? nn : 1) * sizeof *named); if (!named) abort();
+    bool *named_done = tk_alloc((nn ? nn : 1) * sizeof *named_done); if (!named_done) abort();
     { size_t j = 0;
       for (size_t i = 0; i < prog.nitems; i += 1)
           if (prog.items[i].tag == TK_TITEM_TYPE_DECL) { named[j] = prog.items[i].as.type_decl; named_done[j] = false; j += 1; } }
-    bool *opt_done  = set.len  ? tk_alloc(set.len  * sizeof *opt_done)  : NULL;
-    bool *uvar_done = set.vlen ? tk_alloc(set.vlen * sizeof *uvar_done) : NULL;
-    if ((set.len && opt_done == NULL) || (set.vlen && uvar_done == NULL)) abort();   // same: non-NULL when the count is > 0
+    bool *opt_done  = tk_alloc((set.len  ? set.len  : 1) * sizeof *opt_done);  if (!opt_done)  abort();
+    bool *uvar_done = tk_alloc((set.vlen ? set.vlen : 1) * sizeof *uvar_done); if (!uvar_done) abort();
     for (size_t i = 0; i < set.len;  i += 1) opt_done[i]  = false;
     for (size_t i = 0; i < set.vlen; i += 1) uvar_done[i] = false;
     cg_typenodes N = { named, nn, named_done, &set, opt_done, uvar_done };
