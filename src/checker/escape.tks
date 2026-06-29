@@ -82,23 +82,27 @@ fn expr_is_bare_var(e: TExpr) -> bool {
     }
 }
 
-// mark_expr — walk `e`, adding every variable read in an ESCAPING position to `acc`.
-// `escaping` is the context: true ⇒ a read here lets the variable outlive the frame.
-fn mark_expr(e: TExpr, escaping: bool, acc: []str) -> []str {
+// mark_expr — walk `e`, adding every variable read in an ESCAPING position to `acc` IN PLACE.
+// `acc` is a `Ref<[]str>`: a name is recorded via `acc.value = str_set_add(acc.value, name)`
+// (whole-`.value` replace — the only mutation a non-scalar ref admits), so the grown set is
+// visible to every caller through the one shared cell — no thread-and-return. `escaping` is the
+// context: true ⇒ a read here lets the variable outlive the frame. The ref param is FORWARDED
+// straight through to every recursive call (it is already a `Ref<[]str>`, no re-ref).
+fn mark_expr(e: TExpr, escaping: bool, acc: Ref<[]str>) -> void {
     match e.kind {
         // a bare variable read: it escapes only if read in an escaping context.
-        TVar as v => if escaping { str_set_add(acc, v.name) } else { acc }
+        TVar as v => if escaping { acc.value = str_set_add(acc.value, v.name) } else { }
 
         // leaves with no variable reads.
-        TNumber  => acc
-        TStrLit  => acc
-        TByteLit => acc
-        TBoolLit => acc
-        TNullLit => acc
-        TPathExpr => acc
+        TNumber  => { }
+        TStrLit  => { }
+        TByteLit => { }
+        TBoolLit => { }
+        TNullLit => { }
+        TPathExpr => { }
 
         // operators: operands inherit the OUTER context (a returned `a + b` returns both).
-        TBinary as b => mark_expr(b.right, escaping, mark_expr(b.left, escaping, acc))
+        TBinary as b => { mark_expr(b.left, escaping, acc); mark_expr(b.right, escaping, acc) }
         TUnary as u  => mark_expr(u.operand, escaping, acc)
         TCompare as c => {
             // a comparison RESULT is a bool (a pure copy), but the operands are EVALUATED in the
@@ -106,26 +110,23 @@ fn mark_expr(e: TExpr, escaping: bool, acc: []str) -> []str {
             // run AFTER the frame-region drop, so a `a.b`-style operand dereferences a frame cell
             // post-drop → propagate `escaping` (UAF audit). The bare-TVar scalar refinement still
             // applies one level down (e.g. `a.val < b.val` keeps `a`/`b` frame-local).
-            mut a = mark_expr(c.first, escaping, acc)
+            mark_expr(c.first, escaping, acc)
             mut i = 0
             loop {
                 if i >= c.rest.len { break }
-                a = mark_expr(c.rest[i].operand, escaping, a)
+                mark_expr(c.rest[i].operand, escaping, acc)
                 i++
             }
-            a
         }
 
         // a call: every argument may be RETAINED by the callee → escaping (one-depth, conservative).
         TCall as call => {
-            mut a = acc
             mut i = 0
             loop {
                 if i >= call.args.len { break }
-                a = mark_expr(call.args[i], true, a)
+                mark_expr(call.args[i], true, acc)
                 i++
             }
-            a
         }
 
         // control-flow expressions: the branch bodies are statement blocks whose TAIL value inherits
@@ -136,24 +137,22 @@ fn mark_expr(e: TExpr, escaping: bool, acc: []str) -> []str {
         // post-drop too (the whole tail value is emitted after the region drop), so a `a.b`-style
         // cond would deref a frame cell → propagate `escaping` (UAF audit; safe over-marking).
         TIfExpr as f => {
-            mut a = mark_expr(f.cond, escaping, acc)
-            a = mark_block(f.then_blk, escaping, a)
-            if f.has_else { a = mark_block(f.else_blk, escaping, a) }
-            a
+            mark_expr(f.cond, escaping, acc)
+            mark_block(f.then_blk, escaping, acc)
+            if f.has_else { mark_block(f.else_blk, escaping, acc) }
         }
         TMatchExpr as m => {
             // the subject is read to discriminate (and, for `as x` binds, may alias the bound
             // sub-value) — inherit the outer context so a returned arm that surfaces the subject
             // keeps it escaping. The guard is likewise post-drop in a tail position → escaping.
-            mut a = mark_expr(m.subject, escaping, acc)
+            mark_expr(m.subject, escaping, acc)
             mut i = 0
             loop {
                 if i >= m.arms.len { break }
-                if m.arms[i].has_when { a = mark_expr(m.arms[i].guard, escaping, a) }
-                a = mark_block(m.arms[i].body, escaping, a)
+                if m.arms[i].has_when { mark_expr(m.arms[i].guard, escaping, acc) }
+                mark_block(m.arms[i].body, escaping, acc)
                 i++
             }
-            a
         }
 
         // a cast yields a fresh scalar/value — but the operand may itself be a var; inherit context.
@@ -176,7 +175,7 @@ fn mark_expr(e: TExpr, escaping: bool, acc: []str) -> []str {
             let recv_ctx = if refine { false } else { escaping }
             mark_expr(sfa.receiver, recv_ctx, acc)
         }
-        TCoalesce as co => mark_expr(co.right, escaping, mark_expr(co.left, escaping, acc))
+        TCoalesce as co => { mark_expr(co.left, escaping, acc); mark_expr(co.right, escaping, acc) }
 
         // INDEX READ (`a[i]`) — a slice/array is ALWAYS heap-backed, so an index read DEREFERENCES a
         // heap pointer. There is NO bare-local stack-member analogue (the elements live behind the
@@ -185,30 +184,27 @@ fn mark_expr(e: TExpr, escaping: bool, acc: []str) -> []str {
         // (post-drop when escaping=true), so a `a.b`-style index dereferences a frame cell → it too
         // propagates `escaping`; the bare-TVar scalar refinement still keeps `a[x.i]` ⇒ `x` local.
         TIndex as ix => {
-            mark_expr(ix.index, escaping, mark_expr(ix.receiver, escaping, acc))
+            mark_expr(ix.receiver, escaping, acc)
+            mark_expr(ix.index, escaping, acc)
         }
 
         // aggregate constructors: every component is STORED into a value that takes the outer
         // context (a returned struct/array carries its components out of the frame).
         TStructInit as si => {
-            mut a = acc
             mut i = 0
             loop {
                 if i >= si.field_vals.len { break }
-                a = mark_expr(si.field_vals[i], escaping, a)
+                mark_expr(si.field_vals[i], escaping, acc)
                 i++
             }
-            a
         }
         TArrayLit as al => {
-            mut a = acc
             mut i = 0
             loop {
                 if i >= al.elements.len { break }
-                a = mark_expr(al.elements[i].expr, escaping, a)
+                mark_expr(al.elements[i].expr, escaping, acc)
                 i++
             }
-            a
         }
         TInterp as ip => {
             // an interpolation BUILDS a fresh str; its holes are rendered (copied) into it and never
@@ -216,28 +212,25 @@ fn mark_expr(e: TExpr, escaping: bool, acc: []str) -> []str {
             // the tail value (escaping=true) they render AFTER the frame-region drop, so a `a.b`-style
             // hole dereferences a frame cell post-drop → propagate `escaping` (UAF audit). The
             // bare-TVar scalar refinement still keeps `"{x.val}"` frame-local one level down.
-            mut a = acc
             mut i = 0
             loop {
                 if i >= ip.holes.len { break }
-                a = mark_expr(ip.holes[i], escaping, a)
+                mark_expr(ip.holes[i], escaping, acc)
                 i++
             }
-            a
         }
         TInExpr as ine => {
             // `x in [ … ]` yields a bool, but lhs/elems are EVALUATED (and compared) in the outer
             // context: when the `in` is the tail value (escaping=true) they run AFTER the frame-region
             // drop, so a `a.b`-style operand dereferences a frame cell post-drop → propagate
             // `escaping` (UAF audit). The bare-TVar scalar refinement still applies one level down.
-            mut a = mark_expr(ine.lhs, escaping, acc)
+            mark_expr(ine.lhs, escaping, acc)
             mut i = 0
             loop {
                 if i >= ine.elems.len { break }
-                a = mark_expr(ine.elems[i], escaping, a)
+                mark_expr(ine.elems[i], escaping, acc)
                 i++
             }
-            a
         }
     }
 }
@@ -248,23 +241,21 @@ fn mark_expr(e: TExpr, escaping: bool, acc: []str) -> []str {
 // last statement, when it is a value-bearing expr-statement, must be analysed in an ESCAPING
 // context (MEM Step 1 UAF fix). All NON-last statements are interior (tail=false). A `tail=false`
 // block (a loop/defer body, or a discarded if/match branch) discards its trailing value.
-fn mark_block(body: []TStatement, tail: bool, acc: []str) -> []str {
-    mut a = acc
+fn mark_block(body: []TStatement, tail: bool, acc: Ref<[]str>) -> void {
     mut i = 0
     loop {
         if i >= body.len { break }
         let is_last = i + 1 == body.len
-        a = mark_stmt(body[i], tail && is_last, a)
+        mark_stmt(body[i], tail && is_last, acc)
         i++
     }
-    a
 }
 
 // mark_stmt — walk one statement. Establishes the escaping context per position. `tail` is TRUE
 // only for the block's LAST statement when that block's trailing value is returned: an
 // expr-statement there is an IMPLICIT RETURN (B.20/W5a) whose value codegen produces AFTER
 // dropping the frame region, so it must be ESCAPING (not discarded).
-fn mark_stmt(s: TStatement, tail: bool, acc: []str) -> []str {
+fn mark_stmt(s: TStatement, tail: bool, acc: Ref<[]str>) -> void {
     match s {
         // a binding RHS escapes (the value lives on through the bound name; conservatively the
         // name may itself later escape — we do not run a second fixpoint pass).
@@ -272,15 +263,15 @@ fn mark_stmt(s: TStatement, tail: bool, acc: []str) -> []str {
         // an assignment RHS escapes (it may be written into an outer/captured location).
         TAssign as a  => mark_expr(a.value, true, acc)
         // a return value escapes the frame entirely.
-        TReturn as r  => if r.has_value { mark_expr(r.value, true, acc) } else { acc }
+        TReturn as r  => if r.has_value { mark_expr(r.value, true, acc) } else { }
         // an expression-statement: DISCARDED (value unused → NON-escaping) UNLESS it is in TAIL
         // position, where it is an implicit RETURN whose value escapes the frame (codegen
         // drop-then-returns it). Nested calls/returns inside still escape via their own positions.
         TExprStmt as es => mark_expr(es.expr, tail, acc)
         // a loop body's trailing expr is NOT a return (a loop exits via break) → NON-tail.
         TLoopStmt as l  => mark_block(l.body, false, acc)
-        TBreakStmt      => acc
-        TContinueStmt   => acc
+        TBreakStmt      => { }
+        TContinueStmt   => { }
         // a defer body's trailing expr is run for effect, NOT a return → NON-tail.
         TDeferStmt as d => mark_block(d.body, false, acc)
     }
@@ -291,7 +282,9 @@ fn mark_stmt(s: TStatement, tail: bool, acc: []str) -> []str {
 // inputs (B.21) and never frame-allocated here, so they need no entry. The body is analysed in
 // TAIL position: its trailing value-bearing expr-statement is an IMPLICIT RETURN (escaping).
 pub fn fn_escaping_vars(f: TFunction) -> []str {
-    mark_block(f.body, true, teko::list::empty())
+    mut acc: []str = teko::list::empty()
+    mark_block(f.body, true, acc)   // auto-ref the `mut acc` into the `Ref<[]str>` param (in-place)
+    acc
 }
 
 // binding_is_frame_local — does this binding's value allocate into the frame region? True iff

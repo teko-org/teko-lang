@@ -41,15 +41,19 @@ static bool expr_is_bare_var(tk_texpr e) {
     return e.tag == TK_TEXPR_VAR;
 }
 
-static tk_escape_set mark_block(const tk_tstatement *body, size_t n, bool tail, tk_escape_set acc);
-static tk_escape_set mark_stmt(tk_tstatement s, bool tail, tk_escape_set acc);
+static void mark_block(const tk_tstatement *body, size_t n, bool tail, tk_escape_set *acc);
+static void mark_stmt(tk_tstatement s, bool tail, tk_escape_set *acc);
 
-// mark_expr — walk `e`, adding every variable read in an ESCAPING position to `acc`. `escaping`
-// is the context: true ⇒ a read here lets the variable outlive the frame.
-static tk_escape_set mark_expr(tk_texpr e, bool escaping, tk_escape_set acc) {
+// mark_expr — walk `e`, adding every variable read in an ESCAPING position to `*acc` IN PLACE.
+// `acc` is the `Ref<[]str>` twin: a `tk_escape_set *` whose whole value is replaced on each add
+// (`*acc = esc_set_add(*acc, name)` — grow-by-copy), so the grown set is visible to every caller
+// through the one shared cell — no thread-and-return. `escaping` is the context: true ⇒ a read
+// here lets the variable outlive the frame. The ref is FORWARDED straight through every recursion.
+static void mark_expr(tk_texpr e, bool escaping, tk_escape_set *acc) {
     switch (e.tag) {
         case TK_TEXPR_VAR:
-            return escaping ? esc_set_add(acc, e.as.var.name) : acc;
+            if (escaping) *acc = esc_set_add(*acc, e.as.var.name);
+            return;
 
         case TK_TEXPR_NUMBER:
         case TK_TEXPR_STR:
@@ -57,29 +61,31 @@ static tk_escape_set mark_expr(tk_texpr e, bool escaping, tk_escape_set acc) {
         case TK_TEXPR_BOOL:
         case TK_TEXPR_NULL:
         case TK_TEXPR_PATH:
-            return acc;
+            return;
 
         case TK_TEXPR_BINARY:
-            return mark_expr(*e.as.binary.right, escaping, mark_expr(*e.as.binary.left, escaping, acc));
+            mark_expr(*e.as.binary.left, escaping, acc);
+            mark_expr(*e.as.binary.right, escaping, acc);
+            return;
         case TK_TEXPR_UNARY:
-            return mark_expr(*e.as.unary.operand, escaping, acc);
+            mark_expr(*e.as.unary.operand, escaping, acc);
+            return;
         case TK_TEXPR_COMPARE: {
             // a comparison RESULT is a bool (a pure copy), but the operands are EVALUATED in the
             // outer context: when this comparison is the tail value (escaping=true) the operands run
             // AFTER the frame-region drop, so a `a.b`-style operand dereferences a frame cell
             // post-drop → propagate `escaping` (UAF audit). The bare-TVar scalar refinement still
             // applies one level down (e.g. `a.val < b.val` keeps `a`/`b` frame-local).
-            tk_escape_set a = mark_expr(*e.as.compare.first, escaping, acc);
+            mark_expr(*e.as.compare.first, escaping, acc);
             for (size_t i = 0; i < e.as.compare.nrest; i += 1)
-                a = mark_expr(*e.as.compare.rest[i].operand, escaping, a);
-            return a;
+                mark_expr(*e.as.compare.rest[i].operand, escaping, acc);
+            return;
         }
         case TK_TEXPR_CALL: {
             // a call: every argument may be RETAINED by the callee → escaping (one-depth).
-            tk_escape_set a = acc;
             for (size_t i = 0; i < e.as.call.nargs; i += 1)
-                a = mark_expr(e.as.call.args[i], true, a);
-            return a;
+                mark_expr(e.as.call.args[i], true, acc);
+            return;
         }
         case TK_TEXPR_IF: {
             // The branch bodies are tail blocks whose trailing value IS this if's value: when this
@@ -89,25 +95,26 @@ static tk_escape_set mark_expr(tk_texpr e, bool escaping, tk_escape_set acc) {
             // is a SUB-expression of a tail value it is EVALUATED post-drop too (the whole tail
             // value is emitted after the region drop), so a `a.b`-style cond would deref a frame
             // cell → propagate `escaping` (UAF audit; safe over-marking).
-            tk_escape_set a = mark_expr(*e.as.if_expr.cond, escaping, acc);
-            a = mark_block(e.as.if_expr.then_blk, e.as.if_expr.nthen, escaping, a);
+            mark_expr(*e.as.if_expr.cond, escaping, acc);
+            mark_block(e.as.if_expr.then_blk, e.as.if_expr.nthen, escaping, acc);
             if (e.as.if_expr.has_else)
-                a = mark_block(e.as.if_expr.else_blk, e.as.if_expr.nelse, escaping, a);
-            return a;
+                mark_block(e.as.if_expr.else_blk, e.as.if_expr.nelse, escaping, acc);
+            return;
         }
         case TK_TEXPR_MATCH: {
-            tk_escape_set a = mark_expr(*e.as.match_expr.subject, escaping, acc);
+            mark_expr(*e.as.match_expr.subject, escaping, acc);
             for (size_t i = 0; i < e.as.match_expr.narms; i += 1) {
                 // the guard is likewise post-drop in a tail position → propagate escaping (UAF audit).
                 if (e.as.match_expr.arms[i].has_when)
-                    a = mark_expr(*e.as.match_expr.arms[i].guard, escaping, a);
+                    mark_expr(*e.as.match_expr.arms[i].guard, escaping, acc);
                 // arm tail value is this match's value → escaping iff the match escapes (tail = escaping).
-                a = mark_block(e.as.match_expr.arms[i].body, e.as.match_expr.arms[i].nbody, escaping, a);
+                mark_block(e.as.match_expr.arms[i].body, e.as.match_expr.arms[i].nbody, escaping, acc);
             }
-            return a;
+            return;
         }
         case TK_TEXPR_CAST:
-            return mark_expr(*e.as.cast.expr, escaping, acc);
+            mark_expr(*e.as.cast.expr, escaping, acc);
+            return;
 
         case TK_TEXPR_FIELD_ACCESS: {
             // the soundness-critical refinement: a SCALAR field read off a BARE local (`x.f`, x a
@@ -118,15 +125,19 @@ static tk_escape_set mark_expr(tk_texpr e, bool escaping, tk_escape_set acc) {
             // escaping (UAF fix #2). Otherwise (non-scalar, or non-bare receiver) inherit context.
             bool refine = type_is_scalar(e.type) && expr_is_bare_var(*e.as.field_access.receiver);
             bool recv_ctx = refine ? false : escaping;
-            return mark_expr(*e.as.field_access.receiver, recv_ctx, acc);
+            mark_expr(*e.as.field_access.receiver, recv_ctx, acc);
+            return;
         }
         case TK_TEXPR_SAFE_FIELD_ACCESS: {
             bool refine = type_is_scalar(e.type) && expr_is_bare_var(*e.as.safe_field_access.receiver);
             bool recv_ctx = refine ? false : escaping;
-            return mark_expr(*e.as.safe_field_access.receiver, recv_ctx, acc);
+            mark_expr(*e.as.safe_field_access.receiver, recv_ctx, acc);
+            return;
         }
         case TK_TEXPR_COALESCE:
-            return mark_expr(*e.as.coalesce.right, escaping, mark_expr(*e.as.coalesce.left, escaping, acc));
+            mark_expr(*e.as.coalesce.left, escaping, acc);
+            mark_expr(*e.as.coalesce.right, escaping, acc);
+            return;
 
         case TK_TEXPR_INDEX: {
             // a slice/array is ALWAYS heap-backed, so an index read DEREFERENCES a heap pointer.
@@ -135,21 +146,21 @@ static tk_escape_set mark_expr(tk_texpr e, bool escaping, tk_escape_set acc) {
             // (UAF fix #2). The index sub-expression is also EVALUATED in the outer context (post-drop
             // when escaping=true), so a `a.b`-style index derefs a frame cell → it too propagates
             // `escaping`; the bare-TVar scalar refinement still keeps `a[x.i]` ⇒ `x` frame-local.
-            return mark_expr(*e.as.index.index, escaping, mark_expr(*e.as.index.receiver, escaping, acc));
+            mark_expr(*e.as.index.receiver, escaping, acc);
+            mark_expr(*e.as.index.index, escaping, acc);
+            return;
         }
 
         case TK_TEXPR_STRUCT_INIT: {
             // every component is STORED into a value that takes the outer context.
-            tk_escape_set a = acc;
             for (size_t i = 0; i < e.as.struct_init.nfields; i += 1)
-                a = mark_expr(e.as.struct_init.field_vals[i], escaping, a);
-            return a;
+                mark_expr(e.as.struct_init.field_vals[i], escaping, acc);
+            return;
         }
         case TK_TEXPR_ARRAY: {
-            tk_escape_set a = acc;
             for (size_t i = 0; i < e.as.array.nelements; i += 1)
-                a = mark_expr(e.as.array.elements[i], escaping, a);
-            return a;
+                mark_expr(e.as.array.elements[i], escaping, acc);
+            return;
         }
         case TK_TEXPR_INTERP: {
             // an interpolation BUILDS a fresh str; its holes are rendered (copied), never aliased.
@@ -157,74 +168,77 @@ static tk_escape_set mark_expr(tk_texpr e, bool escaping, tk_escape_set acc) {
             // (escaping=true) they render AFTER the frame-region drop, so a `a.b`-style hole derefs
             // a frame cell post-drop → propagate `escaping` (UAF audit). The bare-TVar scalar
             // refinement still keeps `"{x.val}"` frame-local one level down.
-            tk_escape_set a = acc;
             for (size_t i = 0; i < e.as.interp.nholes; i += 1)
-                a = mark_expr(e.as.interp.holes[i], escaping, a);
-            return a;
+                mark_expr(e.as.interp.holes[i], escaping, acc);
+            return;
         }
         case TK_TEXPR_IN: {
             // `x in [ … ]` yields a bool, but lhs/elems are EVALUATED (and compared) in the outer
             // context: when the `in` is the tail value (escaping=true) they run AFTER the frame-region
             // drop, so a `a.b`-style operand derefs a frame cell post-drop → propagate `escaping`
             // (UAF audit). The bare-TVar scalar refinement still applies one level down.
-            tk_escape_set a = mark_expr(*e.as.in_expr.lhs, escaping, acc);
+            mark_expr(*e.as.in_expr.lhs, escaping, acc);
             for (size_t i = 0; i < e.as.in_expr.nelems; i += 1)
-                a = mark_expr(e.as.in_expr.elems[i], escaping, a);
-            return a;
+                mark_expr(e.as.in_expr.elems[i], escaping, acc);
+            return;
         }
     }
-    return acc;   // unreachable (all tags handled) — fail-soft to the safe (no-mark) result
+    return;   // unreachable (all tags handled) — fail-soft to the safe (no-mark) result
 }
 
-// mark_block — walk a statement block, threading the escaping-var accumulator. `tail` is TRUE
-// when this block's TRAILING value is RETURNED (the function/branch tail) — codegen drops the
+// mark_block — walk a statement block, mutating the escaping-var accumulator IN PLACE. `tail` is
+// TRUE when this block's TRAILING value is RETURNED (the function/branch tail) — codegen drops the
 // frame region BEFORE that value and `return`s it (emit_block_tail/emit_exprstmt_tail), so the
 // last statement, when it is a value-bearing expr-statement, must be analysed in an ESCAPING
 // context (MEM Step 1 UAF fix). All NON-last statements are interior (tail=false).
-static tk_escape_set mark_block(const tk_tstatement *body, size_t n, bool tail, tk_escape_set acc) {
-    tk_escape_set a = acc;
+static void mark_block(const tk_tstatement *body, size_t n, bool tail, tk_escape_set *acc) {
     for (size_t i = 0; i < n; i += 1) {
         bool is_last = (i + 1 == n);
-        a = mark_stmt(body[i], tail && is_last, a);
+        mark_stmt(body[i], tail && is_last, acc);
     }
-    return a;
 }
 
 // mark_stmt — walk one statement, establishing the escaping context per position. `tail` is TRUE
 // only for the block's LAST statement when that block's trailing value is returned: an
 // expr-statement there is an IMPLICIT RETURN (B.20/W5a) whose value codegen produces AFTER
 // dropping the frame region, so it must be ESCAPING (not discarded).
-static tk_escape_set mark_stmt(tk_tstatement s, bool tail, tk_escape_set acc) {
+static void mark_stmt(tk_tstatement s, bool tail, tk_escape_set *acc) {
     switch (s.tag) {
         case TK_TSTMT_BINDING:
-            return mark_expr(s.as.binding.value, true, acc);   // the bound value lives on
+            mark_expr(s.as.binding.value, true, acc);   // the bound value lives on
+            return;
         case TK_TSTMT_ASSIGN:
-            return mark_expr(s.as.assign.value, true, acc);    // may be written to an outer location
+            mark_expr(s.as.assign.value, true, acc);    // may be written to an outer location
+            return;
         case TK_TSTMT_RETURN:
-            return s.as.ret.has_value ? mark_expr(s.as.ret.value, true, acc) : acc;
+            if (s.as.ret.has_value) mark_expr(s.as.ret.value, true, acc);
+            return;
         case TK_TSTMT_EXPR:
             // DISCARDED (NON-escaping) UNLESS in TAIL position, where it is an implicit RETURN whose
             // value escapes (codegen drop-then-returns it). Nested calls/returns still escape via
             // their own positions.
-            return mark_expr(s.as.expr_stmt.expr, tail, acc);
+            mark_expr(s.as.expr_stmt.expr, tail, acc);
+            return;
         case TK_TSTMT_LOOP:
             // a loop body's trailing expr is NOT a return (a loop exits via break) → NON-tail.
-            return mark_block(s.as.loop_stmt.body, s.as.loop_stmt.nbody, false, acc);
+            mark_block(s.as.loop_stmt.body, s.as.loop_stmt.nbody, false, acc);
+            return;
         case TK_TSTMT_BREAK:
         case TK_TSTMT_CONTINUE:
-            return acc;
+            return;
         case TK_TSTMT_DEFER:
             // a defer body's trailing expr is run for effect, NOT a return → NON-tail.
-            return mark_block(s.as.defer_stmt.body, s.as.defer_stmt.nbody, false, acc);
+            mark_block(s.as.defer_stmt.body, s.as.defer_stmt.nbody, false, acc);
+            return;
     }
-    return acc;
 }
 
 tk_escape_set tk_fn_escaping_vars(tk_tfunction f) {
-    tk_escape_set empty = { .names = NULL, .n = 0 };
+    tk_escape_set acc = { .names = NULL, .n = 0 };
     // The body is analysed in TAIL position: its trailing value-bearing expr-statement is an
-    // IMPLICIT RETURN (escaping).
-    return mark_block(f.body, f.nbody, true, empty);
+    // IMPLICIT RETURN (escaping). `acc` is mutated in place through the shared `&acc` ref.
+    mark_block(f.body, f.nbody, true, &acc);
+    return acc;
 }
 
 bool tk_escape_set_has(tk_escape_set set, tk_str name) {
