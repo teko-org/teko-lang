@@ -3828,11 +3828,13 @@ static bool cg_emit_types_ordered(cbuf *b, tk_tprogram prog, const char **err) {
         if (prog.items[i].tag == TK_TITEM_TYPE_DECL) nn += 1;
     tk_type_decl *named = nn ? tk_alloc(nn * sizeof *named) : NULL;
     bool *named_done = nn ? tk_alloc(nn * sizeof *named_done) : NULL;
+    if (nn && (named == NULL || named_done == NULL)) abort();   // tk_alloc never returns NULL (OOM panics); tells the analyzer
     { size_t j = 0;
       for (size_t i = 0; i < prog.nitems; i += 1)
           if (prog.items[i].tag == TK_TITEM_TYPE_DECL) { named[j] = prog.items[i].as.type_decl; named_done[j] = false; j += 1; } }
     bool *opt_done  = set.len  ? tk_alloc(set.len  * sizeof *opt_done)  : NULL;
     bool *uvar_done = set.vlen ? tk_alloc(set.vlen * sizeof *uvar_done) : NULL;
+    if ((set.len && opt_done == NULL) || (set.vlen && uvar_done == NULL)) abort();   // same: non-NULL when the count is > 0
     for (size_t i = 0; i < set.len;  i += 1) opt_done[i]  = false;
     for (size_t i = 0; i < set.vlen; i += 1) uvar_done[i] = false;
     cg_typenodes N = { named, nn, named_done, &set, opt_done, uvar_done };
