@@ -4131,6 +4131,69 @@ static void cg_collect_block_opts(cg_opt_set *set, const tk_tstatement *stmts, s
     }
 }
 
+// (bugfix) Convert a SYNTACTIC type-expr to a resolved `tk_type` ONLY as far as the typedef
+// collector needs it (cg_collect_type_opts walks OPTIONAL/SLICE/VARIANT; everything else is a
+// no-op leaf). A struct/variant FIELD's optional/slice/variant whose type surfaces NOWHERE in any
+// expression (only in the declaration) would otherwise never feed the collector, so its tk_opt_/
+// tk_slice_/tk_u_ typedef is never emitted → `cc` fails with "unknown type name". This converter
+// lets cg_emit_types_ordered's second pass register those.
+//   Invariant: cg_opt_mangle(cg_te_to_type(te)) == cg_opt_mangle_texpr(te) for NAMED/OPTIONAL/
+//   SLICE — the typedef NAME (mangle of resolved type) must agree byte-for-byte with the syntactic
+//   mangle used when the field itself is emitted. The prim mapping mirrors emit_type_expr exactly,
+//   so a primitive `i64?` inner yields `int64_t value;` (NOT `tk_t_i64 value;`).
+static tk_type cg_te_to_type(tk_type_expr te) {
+    switch (te.tag) {
+        case TK_TEXPR_NAMED: {
+            tk_path p = te.as.named.path;
+            tk_str last = p.segments[p.len - 1].name;
+            tk_type r; r.tag = TK_TYPE_PRIM;
+            if      (seg_is(last, "u8"))   { r.as.prim = TK_PRIM_U8;   return r; }
+            else if (seg_is(last, "u16"))  { r.as.prim = TK_PRIM_U16;  return r; }
+            else if (seg_is(last, "u32"))  { r.as.prim = TK_PRIM_U32;  return r; }
+            else if (seg_is(last, "u64"))  { r.as.prim = TK_PRIM_U64;  return r; }
+            else if (seg_is(last, "u128")) { r.as.prim = TK_PRIM_U128; return r; }
+            else if (seg_is(last, "i8"))   { r.as.prim = TK_PRIM_I8;   return r; }
+            else if (seg_is(last, "i16"))  { r.as.prim = TK_PRIM_I16;  return r; }
+            else if (seg_is(last, "i32"))  { r.as.prim = TK_PRIM_I32;  return r; }
+            else if (seg_is(last, "i64"))  { r.as.prim = TK_PRIM_I64;  return r; }
+            else if (seg_is(last, "i128")) { r.as.prim = TK_PRIM_I128; return r; }
+            else if (seg_is(last, "f16"))  { r.as.prim = TK_PRIM_F16;  return r; }
+            else if (seg_is(last, "f32"))  { r.as.prim = TK_PRIM_F32;  return r; }
+            else if (seg_is(last, "f64"))  { r.as.prim = TK_PRIM_F64;  return r; }
+            else if (seg_is(last, "bool")) { r.as.prim = TK_PRIM_BOOL; return r; }
+            else if (seg_is(last, "byte")) { r.tag = TK_TYPE_BYTE;  return r; }
+            else if (seg_is(last, "str"))  { r.tag = TK_TYPE_STR;   return r; }
+            else if (seg_is(last, "error")){ r.tag = TK_TYPE_ERROR; return r; }
+            else if (seg_is(last, "void")) { r.tag = TK_TYPE_VOID;  return r; }
+            // otherwise a user-defined named aggregate (generic args ignored for collection).
+            r.tag = TK_TYPE_NAMED; r.as.named.name = last; return r;
+        }
+        case TK_TEXPR_SLICE: {
+            tk_type *elem = tk_alloc(sizeof *elem); if (!elem) abort();
+            *elem = cg_te_to_type(*te.as.slice.element);
+            tk_type r; r.tag = TK_TYPE_SLICE; r.as.slice.element = elem; return r;
+        }
+        case TK_TEXPR_OPTIONAL: {
+            tk_type *inner = tk_alloc(sizeof *inner); if (!inner) abort();
+            *inner = cg_te_to_type(*te.as.optional.inner);
+            tk_type r; r.tag = TK_TYPE_OPTIONAL; r.as.optional.inner = inner; return r;
+        }
+        case TK_TEXPR_UNION: {
+            size_t n = te.as.uni.len;
+            tk_type *mem = tk_alloc((n ? n : 1) * sizeof *mem); if (!mem) abort();
+            for (size_t i = 0; i < n; i += 1) mem[i] = cg_te_to_type(te.as.uni.members[i]);
+            tk_type r; r.tag = TK_TYPE_VARIANT; r.as.variant.members = mem; r.as.variant.len = n; return r;
+        }
+        case TK_TEXPR_FUNC: {
+            // func-optionals aren't supported; emit a TK_TYPE_FUNC whose mangle fails so
+            // cg_opt_set_add/cg_slice_add skip it (correct — same honest-stop as elsewhere).
+            tk_type r; r.tag = TK_TYPE_FUNC;
+            r.as.func.params = NULL; r.as.func.nparams = 0; r.as.func.ret = NULL; return r;
+        }
+    }
+    tk_type r; r.tag = TK_TYPE_VOID; return r;   // unreachable
+}
+
 // B-cg2 — emit ONE inline-variant typedef `tk_u_<keys>` (the SAME tag-enum + tag/union-struct
 // shape as a named variant decl, but named/keyed off the resolved member types). Members'
 // typedefs (slice/opt) precede it by registration order.
@@ -4310,6 +4373,42 @@ static bool cg_emit_types_ordered(cbuf *b, tk_tprogram prog, const char **err) {
                 break;
             case TK_TITEM_STATEMENT: cg_collect_block_opts(&set, &it.as.statement, 1); break;
             default: break;
+        }
+    }
+    // (bugfix) SECOND pass over TYPE_DECLs — register the generated typedefs a struct/variant/alias
+    // FIELD's type annotation needs (tk_opt_/tk_slice_/tk_u_). Placed AFTER the function/statement
+    // loop so the dedup makes it a STRICT NO-OP for the existing corpus (which already surfaces all
+    // its field types via expressions) — this preserves byte-identity. Without it, a field whose
+    // optional/slice/variant type appears ONLY in the declaration (never in any expression) loses
+    // its typedef and `cc` fails with "unknown type name".
+    for (size_t i = 0; i < prog.nitems; i += 1) {
+        if (prog.items[i].tag != TK_TITEM_TYPE_DECL) continue;
+        tk_type_decl d = prog.items[i].as.type_decl;
+        switch (d.body.tag) {
+            case TK_BODY_STRUCT: {
+                tk_struct_body sb = d.body.as.struct_body;
+                for (size_t f = 0; f < sb.n_fields; f += 1)
+                    cg_collect_type_opts(&set, cg_te_to_type(sb.fields[f].type_ann));
+                break;
+            }
+            case TK_BODY_VARIANT: {
+                // A NAMED variant decl gets its own `tk_t_<Name>` typedef via the named-decl path —
+                // do NOT register the whole union as an inline `tk_u_<keys>` (that would emit an
+                // UNUSED typedef and break corpus byte-identity). Only its MEMBERS' generated
+                // typedefs (a member that is `T?`/`[]T`/inline-union) need registering, so recurse
+                // per-member rather than on the variant as a whole.
+                tk_type_expr vt = d.body.as.variant_body.type_expr;
+                if (vt.tag == TK_TEXPR_UNION)
+                    for (size_t m = 0; m < vt.as.uni.len; m += 1)
+                        cg_collect_type_opts(&set, cg_te_to_type(vt.as.uni.members[m]));
+                else
+                    cg_collect_type_opts(&set, cg_te_to_type(vt));
+                break;
+            }
+            case TK_BODY_ALIAS:
+                cg_collect_type_opts(&set, cg_te_to_type(d.body.as.alias_body.alias));
+                break;
+            default: break;   // enum / flags / extern — no generated typedef to register
         }
     }
     // gather the named TYPE_DECL nodes (struct/variant/enum; alias emits nothing but is harmless).
