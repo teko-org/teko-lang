@@ -25,7 +25,20 @@ typedef enum {
     TK_TEXPR_IN,                                           // <expr> in [ … ] — membership test (Phase 2); `.type` is bool
     TK_TEXPR_PATH,                                         // Enum::Member as a VALUE — `.type` is the NAMED enum
     TK_TEXPR_ARRAY,                                        // [ e0, e1, … ] — slice/array literal (Increment B+); `.type` is []T
+    TK_TEXPR_LAMBDA,                                       // (W10) (params) => body — typed closure literal; `.type` is the Func type
 } tk_texpr_tag;
+
+// (W10) a typed closure literal. params/body/captures/ret as in tast.tks::TLambda; `lift_id` names
+// the lifted C function `__tkclo_<lift_id>` + its env struct. A capture is BY COPY unless `by_ref`.
+typedef struct { tk_str name; tk_type type; }                 tk_tlambda_param;
+typedef struct { tk_str name; tk_type type; bool by_ref; }    tk_tcapture;
+typedef struct {
+    tk_tlambda_param *params; size_t nparams;
+    tk_tstatement   *body;    size_t nbody;
+    tk_tcapture     *captures; size_t ncaptures;
+    tk_type          ret;
+    uint64_t         lift_id;
+} tk_tlambda;
 
 typedef struct { tk_token_kind op; tk_texpr *operand; } tk_tcmp_term;
 
@@ -85,6 +98,7 @@ struct tk_texpr {
         // A spread element (`..xs`) carries is_spread=true and was checked against []T; the spread
         // slice itself is stored as the typed expr (codegen flattens it at runtime).
         struct { tk_texpr *elements; size_t nelements; bool *is_spread; }  array;
+        tk_tlambda  lambda;   // TK_TEXPR_LAMBDA (W10)
     } as;
 };
 

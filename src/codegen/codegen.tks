@@ -546,17 +546,23 @@ fn emit_type(buf: []byte, t: checker::Type) -> []byte | error {
 
 // (W10a) the C function-pointer SIGNATURE for a closure call's cast: `R (*)(A, B)`. Built from the
 // callee's resolved Func type so `((R(*)(A,B))f.fn)(args)` invokes the code pointer with the right
-// ABI. Empty params → `(void)`. (C: `cg_emit_fnptr_sig`.)
-fn cg_emit_fnptr_sig(buf: []byte, t: checker::Type) -> []byte | error {
+// ABI. Empty params → `(void)`. `with_env` prepends a leading `void *` (the env-first ABI used by a
+// CAPTURING closure). (C: `cg_emit_fnptr_sig`.)
+fn cg_emit_fnptr_sig_ex(buf: []byte, t: checker::Type, with_env: bool) -> []byte | error {
     match t {
         checker::Func as f => {
             mut out = match emit_type(buf, f.ret) { []byte as o => o; error as e => return e }
             out = cb(out, " (*)(")
-            if f.params.len == 0 { out = cb(out, "void") } else {
+            mut first = true
+            if with_env { out = cb(out, "void *"); first = false }
+            if f.params.len == 0 {
+                if first { out = cb(out, "void") }
+            } else {
                 mut i = 0
                 loop {
                     if i >= f.params.len { break }
-                    if i > 0 { out = cb(out, ", ") }
+                    if !first { out = cb(out, ", ") }
+                    first = false
                     out = match emit_type(out, f.params[i]) { []byte as o => o; error as e => return e }
                     i++
                 }
@@ -565,6 +571,41 @@ fn cg_emit_fnptr_sig(buf: []byte, t: checker::Type) -> []byte | error {
         }
         _ => error { message = "codegen: closure call on a non-function type (internal)" }
     }
+}
+fn cg_emit_fnptr_sig(buf: []byte, t: checker::Type) -> []byte | error { cg_emit_fnptr_sig_ex(buf, t, false) }
+
+// (W10) emit a CLOSURE CALL through a `tk_closure` value as a GNU statement-expression that evaluates
+// each argument ONCE and DISPATCHES on `env`: a NON-capturing closure / named-fn value (env == NULL)
+// calls with the no-env ABI `R(params)`; a CAPTURING closure (env != NULL) calls with the env-first
+// ABI `R(void*, params)`. The callee is a local of function type (its name is the callee's last seg).
+fn emit_closure_call(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, c: checker::TCall, escaping: []str, regions: []RegionFrame, fn_body: []checker::TStatement, dctx: DeferCtx) -> []byte | error {
+    let nm = c.callee.segments[c.callee.segments.len - 1].name
+    mut out = cb(buf, "({ ")
+    // bind each argument to a temp (single evaluation, preserving side effects).
+    mut j = 0
+    loop {
+        if j >= c.args.len { break }
+        out = match emit_type(out, c.args[j].type) { []byte as o => o; error as e => return e }
+        out = cb(out, " ")
+        out = cb(out, teko::str::concat("_tca", teko::u64_to_str(j to u64)))
+        out = cb(out, " = ")
+        out = match emit_expr_ctx(out, prog, ret_type, c.args[j], escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
+        out = cb(out, "; ")
+        j++
+    }
+    out = cb(out, "tk_closure _tcf = ")
+    out = cb_ident(out, nm)
+    out = cb(out, "; _tcf.env ? ((")
+    out = match cg_emit_fnptr_sig_ex(out, c.callee_type, true) { []byte as o => o; error as e => return e }
+    out = cb(out, ")_tcf.fn)(_tcf.env")
+    mut k = 0
+    loop { if k >= c.args.len { break }; out = cb(out, ", "); out = cb(out, teko::str::concat("_tca", teko::u64_to_str(k to u64))); k++ }
+    out = cb(out, ") : ((")
+    out = match cg_emit_fnptr_sig_ex(out, c.callee_type, false) { []byte as o => o; error as e => return e }
+    out = cb(out, ")_tcf.fn)(")
+    mut m = 0
+    loop { if m >= c.args.len { break }; if m > 0 { out = cb(out, ", ") }; out = cb(out, teko::str::concat("_tca", teko::u64_to_str(m to u64))); m++ }
+    cb(out, "); })")
 }
 
 // OPTIONAL `T?` C REPRESENTATION (REBOOT_PLAN §202). Each distinct optional inner type maps to a
@@ -1473,13 +1514,9 @@ fn emit_call(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, e: c
             out = cb_fn_name(out, c.call_ns, p.segments[p.segments.len - 1].name)
         }
     } else if c.is_closure_call {
-        // (W10a) call THROUGH a tk_closure VALUE: `((R(*)(A,B))name.fn)` — the cast restores the
-        // statically-known ABI before invoking the code pointer. The arg list (`(…)`) follows below.
-        out = cb(out, "((")
-        out = match cg_emit_fnptr_sig(out, c.callee_type) { []byte as o => o; error as e => return e }
-        out = cb(out, ")")
-        out = cb_ident(out, p.segments[p.segments.len - 1].name)
-        out = cb(out, ".fn)")
+        // (W10) call THROUGH a tk_closure VALUE — a single-eval statement-expression that dispatches on
+        // `env` (no-env ABI for a named-fn/non-capturing closure; env-first ABI for a capturing one).
+        return emit_closure_call(out, prog, ret_type, c, escaping, regions, fn_body, dctx)
     } else {
         // No resolved namespace (a builtin, or a name not carried) -> the bare
         // (keyword-escaped) last segment.
@@ -3662,7 +3699,46 @@ fn emit_expr_ctx(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, 
                 cb_upper(out, pe.member)
             }
         }
+        // (W10) a closure LITERAL → a `tk_closure` value. The body was lifted to a top-level C
+        // function `__tkclo_<lift_id>` by the cg_stamp_lambdas pre-pass. A NON-capturing lambda has
+        // env = NULL and the lifted fn is `R(params)` (W10a-compatible call cast). A CAPTURING lambda
+        // allocates its env struct and uses the env-first ABI (handled below).
+        checker::TLambda as lam => emit_lambda(buf, prog, e, lam, escaping, regions, fn_body, dctx)
     }
+}
+
+// (W10) the lifted C function name for a lambda with the given stamp id: `__tkclo_<id>`.
+fn lam_fn_name(id: u64) -> str { teko::str::concat("__tkclo_", teko::u64_to_str(id)) }
+
+// (W10) emit a closure literal. Non-capturing → `(tk_closure){ &__tkclo_<id>, (void*)0 }`. Capturing
+// → allocate + fill the env struct, then `(tk_closure){ &__tkclo_<id>, env }` (env-first ABI).
+fn emit_lambda(buf: []byte, prog: checker::TProgram, e: checker::TExpr, lam: checker::TLambda, escaping: []str, regions: []RegionFrame, fn_body: []checker::TStatement, dctx: DeferCtx) -> []byte | error {
+    if lam.captures.len == 0 {
+        mut out = cb(buf, "(tk_closure){ (void*)&")
+        out = cb_fn_name(out, "", lam_fn_name(lam.lift_id))
+        return cb(out, ", (void*)0 }")
+    }
+    // CAPTURING: allocate the env (`__tkenv_<id>`), fill each capture (by-copy value, or the Ref cell
+    // for a by_ref capture), and build the closure. Uses a GNU statement-expression so the env pointer
+    // is materialized once. The env is region-allocated (root region — sound; escape promotes it).
+    mut out = cb(buf, "({ __tkenv_")
+    out = cb(out, teko::u64_to_str(lam.lift_id))
+    out = cb(out, " *_tke = tk_region_alloc(tk_region_root(), sizeof(__tkenv_")
+    out = cb(out, teko::u64_to_str(lam.lift_id))
+    out = cb(out, ")); ")
+    mut i = 0
+    loop {
+        if i >= lam.captures.len { break }
+        out = cb(out, "_tke->")
+        out = cb_ident(out, lam.captures[i].name)
+        out = cb(out, " = ")
+        out = cb_ident(out, lam.captures[i].name)   // by-copy snapshot, or the Ref pointer for a by_ref capture
+        out = cb(out, "; ")
+        i++
+    }
+    out = cb(out, "(tk_closure){ (void*)&")
+    out = cb_fn_name(out, "", lam_fn_name(lam.lift_id))
+    cb(out, ", (void*)_tke }; })")
 }
 
 // ---------------------------------------------------------------------------
@@ -5242,7 +5318,201 @@ fn cg_format_c(src: str) -> []byte {
     cb(out, "\n")
 }
 
-fn tk_emit_c(prog: checker::TProgram) -> str | error {
+// (W10) LAMBDA LIFTING — walk the program, STAMP each closure literal with a unique `lift_id`, and
+// SYNTHESIZE a top-level function `__tkclo_<id>` for each NON-capturing lambda (its params/body are
+// a plain function — emitted by the normal fn-emission, called via the W10a closure cast). Capturing
+// lambdas are stamped here too; their env-struct + env-first lifted fn are emitted by the capture
+// path (cg_emit_lambda_decls). The accumulator threads the id counter + the synthesized functions.
+type StampAcc = struct { next: u64; fns: []checker::TFunction; lams: []checker::TLambda }
+type LiftResult = struct { prog: checker::TProgram; lams: []checker::TLambda }
+
+fn cg_lift_lambdas(prog: checker::TProgram) -> LiftResult {
+    mut acc = StampAcc { next = 0; fns = teko::list::empty(); lams = teko::list::empty() }
+    mut items: []checker::TItem = teko::list::empty()
+    mut i = 0
+    loop {
+        if i >= prog.items.len { break }
+        match prog.items[i] {
+            checker::TFunction as f => {
+                let nb = cg_lift_block(f.body, acc)
+                items = teko::list::push(items, checker::TFunction { name = f.name; type_params = f.type_params; params = f.params; return_type = f.return_type; body = nb; vis = f.vis; has_doc = f.has_doc; doc = f.doc; namespace = f.namespace; file = f.file; line = f.line; col = f.col; is_test = f.is_test; is_extern = f.is_extern; c_symbol = f.c_symbol; from_lib = f.from_lib })
+            }
+            checker::TStatement as ts => {
+                let ns = cg_lift_stmt(ts, acc)
+                items = teko::list::push(items, ns)
+            }
+            _ => items = teko::list::push(items, prog.items[i])
+        }
+        i++
+    }
+    // append the synthesized lifted functions (non-capturing → a plain top-level fn).
+    mut j = 0
+    loop { if j >= acc.fns.len { break }; items = teko::list::push(items, acc.fns[j]); j++ }
+    LiftResult { prog = checker::TProgram { items = items }; lams = acc.lams }
+}
+fn cg_lift_block(stmts: []checker::TStatement, acc: Ref<StampAcc>) -> []checker::TStatement {
+    mut out: []checker::TStatement = teko::list::empty()
+    mut i = 0
+    loop { if i >= stmts.len { break }; out = teko::list::push(out, cg_lift_stmt(stmts[i], acc)); i++ }
+    out
+}
+fn cg_lift_stmt(s: checker::TStatement, acc: Ref<StampAcc>) -> checker::TStatement {
+    match s {
+        checker::TBinding as b   => checker::TBinding { kind = b.kind; target = b.target; bound = b.bound; value = cg_lift_expr(b.value, acc) }
+        checker::TAssign as a    => checker::TAssign { name = a.name; op = a.op; bound = a.bound; value = cg_lift_expr(a.value, acc); deref = a.deref }
+        checker::TReturn as r     => checker::TReturn { has_value = r.has_value; value = if r.has_value { cg_lift_expr(r.value, acc) } else { r.value } }
+        checker::TLoopStmt as l   => checker::TLoopStmt { label = l.label; body = cg_lift_block(l.body, acc) }
+        checker::TExprStmt as es  => checker::TExprStmt { expr = cg_lift_expr(es.expr, acc) }
+        checker::TDeferStmt as d  => checker::TDeferStmt { body = cg_lift_block(d.body, acc) }
+        checker::TBreakStmt       => s
+        checker::TContinueStmt    => s
+    }
+}
+fn cg_lift_expr(e: checker::TExpr, acc: Ref<StampAcc>) -> checker::TExpr {
+    match e.kind {
+        checker::TLambda as lam => {
+            let id = acc.value.next
+            let nbody = cg_lift_block(lam.body, acc)   // stamp nested lambdas first
+            // synthesize a plain top-level fn for a NON-capturing lambda; capturing → emitted by the
+            // capture path (recorded in `lams`).
+            mut newfns = acc.value.fns
+            mut newlams = acc.value.lams
+            let stamped = checker::TLambda { params = lam.params; body = nbody; captures = lam.captures; ret = lam.ret; lift_id = id }
+            if lam.captures.len == 0 {
+                mut ps: []parser::Param = teko::list::empty()
+                mut pi = 0
+                loop { if pi >= lam.params.len { break }; ps = teko::list::push(ps, parser::Param { name = lam.params[pi].name; type_ann = checker::type_to_texpr(lam.params[pi].type) }); pi++ }
+                newfns = teko::list::push(newfns, checker::TFunction { name = lam_fn_name(id); type_params = teko::list::empty(); params = ps; return_type = lam.ret; body = nbody; vis = parser::Visibility::Private; has_doc = false; doc = ""; namespace = ""; file = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = "" })
+            } else {
+                newlams = teko::list::push(newlams, stamped)
+            }
+            acc.value = StampAcc { next = id + 1; fns = newfns; lams = newlams }
+            checker::TExpr { kind = stamped; type = e.type; line = e.line; col = e.col }
+        }
+        checker::TBinary as b      => checker::TExpr { kind = checker::TBinary { op = b.op; left = cg_lift_expr(b.left, acc); right = cg_lift_expr(b.right, acc) }; type = e.type; line = e.line; col = e.col }
+        checker::TUnary as u       => checker::TExpr { kind = checker::TUnary { op = u.op; operand = cg_lift_expr(u.operand, acc) }; type = e.type; line = e.line; col = e.col }
+        checker::TCompare as c     => {
+            mut terms: []checker::TCmpTerm = teko::list::empty()
+            mut i = 0
+            loop { if i >= c.rest.len { break }; terms = teko::list::push(terms, checker::TCmpTerm { op = c.rest[i].op; operand = cg_lift_expr(c.rest[i].operand, acc) }); i++ }
+            checker::TExpr { kind = checker::TCompare { first = cg_lift_expr(c.first, acc); rest = terms }; type = e.type; line = e.line; col = e.col }
+        }
+        checker::TCall as cl       => {
+            mut args: []checker::TExpr = teko::list::empty()
+            mut i = 0
+            loop { if i >= cl.args.len { break }; args = teko::list::push(args, cg_lift_expr(cl.args[i], acc)); i++ }
+            checker::TExpr { kind = checker::TCall { callee = cl.callee; args = args; call_ns = cl.call_ns; is_closure_call = cl.is_closure_call; callee_type = cl.callee_type }; type = e.type; line = e.line; col = e.col }
+        }
+        checker::TIfExpr as f      => checker::TExpr { kind = checker::TIfExpr { cond = cg_lift_expr(f.cond, acc); then_blk = cg_lift_block(f.then_blk, acc); has_else = f.has_else; else_blk = cg_lift_block(f.else_blk, acc) }; type = e.type; line = e.line; col = e.col }
+        checker::TMatchExpr as m   => {
+            mut arms: []checker::TArm = teko::list::empty()
+            mut i = 0
+            loop { if i >= m.arms.len { break }; let a = m.arms[i]; arms = teko::list::push(arms, checker::TArm { pattern = a.pattern; has_when = a.has_when; guard = if a.has_when { cg_lift_expr(a.guard, acc) } else { a.guard }; body = cg_lift_block(a.body, acc) }); i++ }
+            checker::TExpr { kind = checker::TMatchExpr { subject = cg_lift_expr(m.subject, acc); arms = arms }; type = e.type; line = e.line; col = e.col }
+        }
+        checker::TCast as ct       => checker::TExpr { kind = checker::TCast { expr = cg_lift_expr(ct.expr, acc) }; type = e.type; line = e.line; col = e.col }
+        checker::TFieldAccess as fa => checker::TExpr { kind = checker::TFieldAccess { receiver = cg_lift_expr(fa.receiver, acc); field = fa.field }; type = e.type; line = e.line; col = e.col }
+        checker::TSafeFieldAccess as sfa => checker::TExpr { kind = checker::TSafeFieldAccess { receiver = cg_lift_expr(sfa.receiver, acc); field = sfa.field }; type = e.type; line = e.line; col = e.col }
+        checker::TCoalesce as co   => checker::TExpr { kind = checker::TCoalesce { left = cg_lift_expr(co.left, acc); right = cg_lift_expr(co.right, acc) }; type = e.type; line = e.line; col = e.col }
+        checker::TStructInit as si => {
+            mut vals: []checker::TExpr = teko::list::empty()
+            mut i = 0
+            loop { if i >= si.field_vals.len { break }; vals = teko::list::push(vals, cg_lift_expr(si.field_vals[i], acc)); i++ }
+            checker::TExpr { kind = checker::TStructInit { field_names = si.field_names; field_vals = vals }; type = e.type; line = e.line; col = e.col }
+        }
+        checker::TIndex as ix      => checker::TExpr { kind = checker::TIndex { receiver = cg_lift_expr(ix.receiver, acc); index = cg_lift_expr(ix.index, acc) }; type = e.type; line = e.line; col = e.col }
+        checker::TInterp as in     => {
+            mut holes: []checker::TExpr = teko::list::empty()
+            mut i = 0
+            loop { if i >= in.holes.len { break }; holes = teko::list::push(holes, cg_lift_expr(in.holes[i], acc)); i++ }
+            checker::TExpr { kind = checker::TInterp { pieces = in.pieces; holes = holes }; type = e.type; line = e.line; col = e.col }
+        }
+        checker::TInExpr as ie     => {
+            mut elems: []checker::TExpr = teko::list::empty()
+            mut i = 0
+            loop { if i >= ie.elems.len { break }; elems = teko::list::push(elems, cg_lift_expr(ie.elems[i], acc)); i++ }
+            checker::TExpr { kind = checker::TInExpr { lhs = cg_lift_expr(ie.lhs, acc); elems = elems }; type = e.type; line = e.line; col = e.col }
+        }
+        checker::TArrayLit as a    => {
+            mut elems: []checker::TArrayElem = teko::list::empty()
+            mut i = 0
+            loop { if i >= a.elements.len { break }; elems = teko::list::push(elems, checker::TArrayElem { is_spread = a.elements[i].is_spread; expr = cg_lift_expr(a.elements[i].expr, acc) }); i++ }
+            checker::TExpr { kind = checker::TArrayLit { elements = elems }; type = e.type; line = e.line; col = e.col }
+        }
+        _ => e   // leaves (TNumber/TVar/TStrLit/TByteLit/TBoolLit/TNullLit/TPathExpr) — no nested lambdas
+    }
+}
+
+// (W10) emit the env struct + lifted function for each CAPTURING lambda. The env struct holds one
+// field per capture (by-copy value, or the `T*` Ref for a by_ref capture). The lifted fn unpacks the
+// env into locals of the SAME names (so the body references captures with no rewrite) then runs the
+// body. ABI = env-first `R(void *envp, params)`. `protos_only` emits just the env typedefs + fn
+// forward declarations (prelude); else the full definitions.
+fn cg_emit_lambda_decls(buf: []byte, prog: checker::TProgram, lams: []checker::TLambda, protos_only: bool) -> []byte | error {
+    mut out = buf
+    mut li = 0
+    loop {
+        if li >= lams.len { break }
+        let lam = lams[li]
+        let ids = teko::u64_to_str(lam.lift_id)
+        // env struct typedef — emitted ONCE, in the protos pass only (re-emitting it in the defs pass
+        // is a typedef redefinition error).
+        if protos_only {
+            out = cb(out, "typedef struct { ")
+            mut ci = 0
+            loop {
+                if ci >= lam.captures.len { break }
+                out = match emit_type(out, lam.captures[ci].type) { []byte as o => o; error as e => return e }
+                out = cb(out, " ")
+                out = cb_ident(out, lam.captures[ci].name)
+                out = cb(out, "; ")
+                ci++
+            }
+            out = cb(out, teko::str::concat3("} __tkenv_", ids, ";\n"))
+        }
+        // lifted fn signature: R __tkclo_<id>(void *envp, params)
+        out = match emit_type(out, lam.ret) { []byte as o => o; error as e => return e }
+        out = cb(out, teko::str::concat3(" __tkclo_", ids, "(void *envp"))
+        mut pi = 0
+        loop {
+            if pi >= lam.params.len { break }
+            out = cb(out, ", ")
+            out = match emit_type(out, lam.params[pi].type) { []byte as o => o; error as e => return e }
+            out = cb(out, " ")
+            out = cb_ident(out, lam.params[pi].name)
+            pi++
+        }
+        out = cb(out, ")")
+        if protos_only {
+            out = cb(out, ";\n")
+        } else {
+            out = cb(out, " {\n")
+            out = cb(out, teko::str::concat3("    __tkenv_", ids, " *_e = envp;\n"))
+            mut ui = 0
+            loop {
+                if ui >= lam.captures.len { break }
+                out = cb(out, "    ")
+                out = match emit_type(out, lam.captures[ui].type) { []byte as o => o; error as e => return e }
+                out = cb(out, " ")
+                out = cb_ident(out, lam.captures[ui].name)
+                out = cb(out, " = _e->")
+                out = cb_ident(out, lam.captures[ui].name)
+                out = cb(out, ";\n")
+                ui++
+            }
+            // the body (reuse emit_block_tail; lifted fns route allocations to root — no frame region).
+            out = match emit_block_tail(out, lam.body, false, prog, lam.ret, "    ", "", teko::list::empty(), lam.body, dctx_empty()) { []byte as o => o; error as e => return e }
+            out = cb(out, "}\n")
+        }
+        li++
+    }
+    out
+}
+
+fn tk_emit_c(prog0: checker::TProgram) -> str | error {
+    let _lr = cg_lift_lambdas(prog0)   // (W10) stamp lambdas + synthesize lifted functions before emission
+    let prog = _lr.prog
+    let cap_lams = _lr.lams
     mut b: []byte = teko::list::empty()
     b = cb(b, "// generated by teko (F2 backend) — do not edit\n")
     b = cb(b, "#include <stdint.h>\n")
@@ -5315,6 +5585,10 @@ fn tk_emit_c(prog: checker::TProgram) -> str | error {
         pi++
     }
     b = cb(b, "\n")
+    // (W10) CAPTURING lambdas: env-struct typedefs + lifted-fn forward declarations (so a closure
+    // literal `&__tkclo_<id>` + `sizeof(__tkenv_<id>)` resolve before the user functions).
+    b = match cg_emit_lambda_decls(b, prog, cap_lams, true) { []byte as o => o; error as err => return err }
+    b = cb(b, "\n")
 
     // First pass: emit every top-level function. Type-decls are handled above; use-decls
     // are a no-op at the C level (imports); loose statements are the second pass.
@@ -5329,6 +5603,8 @@ fn tk_emit_c(prog: checker::TProgram) -> str | error {
         }
         i++
     }
+    // (W10) CAPTURING lambdas: the lifted-function DEFINITIONS (env unpack + body).
+    b = match cg_emit_lambda_decls(b, prog, cap_lams, false) { []byte as o => o; error as err => return err }
 
     // Second pass: the VIRTUAL-MAIN — the loose top-level statements, in order, become the
     // body of C main(); falling off the end -> `return 0;` (default exit 0).

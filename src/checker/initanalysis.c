@@ -80,6 +80,10 @@ static bool occurs_expr(const tk_texpr *e, tk_str name) {
                 if (occurs_expr(&e->as.in_expr.elems[i], name)) return true;
             return false;
         }
+        case TK_TEXPR_LAMBDA:   // (W10) a closure READS `name` if it captures it
+            for (size_t i = 0; i < e->as.lambda.ncaptures; i += 1)
+                if (tk_str_eq(e->as.lambda.captures[i].name, name)) return true;
+            return false;
         default: return false;   // NUMBER/STR/BYTE/BOOL/NULL/PATH — no reads
     }
 }

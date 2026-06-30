@@ -83,6 +83,12 @@ typedef struct { tk_str *pieces; size_t npieces; tk_expr *holes; size_t nholes; 
 typedef struct { tk_expr *lhs; tk_expr *elems; size_t nelems; } tk_in;
 typedef struct { bool is_spread; tk_expr *expr; } tk_array_elem;        // one element in an array literal: plain (is_spread=false) or spread (is_spread=true, ..expr)
 typedef struct { tk_array_elem *elements; size_t nelements; } tk_array_lit;   // [ e0, e1, … ] — slice/array literal (Increment B+)
+// (W10) a closure LITERAL `(params) => expr` / `(params) => { … }` — an anonymous function value
+// (NO `fn`). A param's type is OPTIONAL (`has_type` false ⇒ inferred from the target). The body is
+// a STATEMENT BLOCK (`=> expr` is stored as one trailing ExprStmt). Return type inferred. The
+// checker types it to a Func and lifts it to a top-level function + capture env.
+typedef struct { tk_str name; bool has_type; tk_type_expr type_ann; } tk_lambda_param;
+typedef struct { tk_lambda_param *params; size_t nparams; tk_statement *body; size_t nbody; } tk_lambda;
 
 typedef enum {
     TK_EXPR_NUMBER, TK_EXPR_VAR, TK_EXPR_STR, TK_EXPR_BYTE,
@@ -94,6 +100,7 @@ typedef enum {
     TK_EXPR_INTERP,   // $"…{expr}…" — string interpolation (self-host parity)
     TK_EXPR_IN,       // <expr> in [ … ] — membership test (Phase 2)
     TK_EXPR_ARRAY,    // [ e0, e1, … ] — slice/array literal (Increment B+)
+    TK_EXPR_LAMBDA,   // (W10) (params) => body — anonymous closure literal
 } tk_expr_kind;
 
 struct tk_expr {
@@ -123,6 +130,7 @@ struct tk_expr {
         tk_interp       interp;        // TK_EXPR_INTERP
         tk_in           in_expr;       // TK_EXPR_IN
         tk_array_lit    array;         // TK_EXPR_ARRAY
+        tk_lambda       lambda;        // TK_EXPR_LAMBDA (W10)
     } as;
 };
 
@@ -290,6 +298,7 @@ void tk_stmts_push (tk_statement **xs, size_t *n, tk_statement item);
 void tk_pats_push  (tk_pattern **xs,   size_t *n, tk_pattern   item);
 void tk_arms_push  (tk_arm **xs,       size_t *n, tk_arm       item);
 void tk_params_push(tk_param **xs,     size_t *n, tk_param     item);
+void tk_lambda_params_push(tk_lambda_param **xs, size_t *n, tk_lambda_param item);   // (W10)
 void tk_fields_push(tk_field **xs,     size_t *n, tk_field     item);
 void tk_segs_push  (tk_segment **xs,   size_t *n, tk_segment   item);
 void tk_strvec_push(tk_str **xs,       size_t *n, tk_str       item);   // (renamed from tk_strs_push to avoid the TK_LIST(tk_str, tk_strs) clash in TUs that also include build/manifest.h — A3)

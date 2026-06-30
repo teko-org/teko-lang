@@ -232,6 +232,19 @@ fn mark_expr(e: TExpr, escaping: bool, acc: Ref<[]str>) -> void {
                 i++
             }
         }
+        // (W10) a closure literal: its CAPTURES are vars of THIS function read into the closure's env.
+        // When the closure value escapes (escaping context), its captures escape with it — mark them so
+        // they allocate in the enclosing/root region (sound over-approximation; a by-copy capture is a
+        // snapshot, but over-marking only routes more to root, never a UAF). The body belongs to the
+        // LIFTED function, so it is NOT walked here.
+        TLambda as lam => {
+            mut i = 0
+            loop {
+                if i >= lam.captures.len { break }
+                if escaping { acc.value = str_set_add(acc.value, lam.captures[i].name) }
+                i++
+            }
+        }
     }
 }
 
@@ -420,6 +433,13 @@ fn count_reads_expr(e: TExpr, name: str) -> i64 {
                 i++
             }
             n
+        }
+        // (W10) a closure literal reads `name` ONCE if it captures it (the snapshot/alias at creation);
+        // the body's reads belong to the lifted function, not this one.
+        TLambda as lam => {
+            mut i = 0
+            loop { if i >= lam.captures.len { break }; if lam.captures[i].name == name { return 1 }; i++ }
+            0
         }
     }
 }

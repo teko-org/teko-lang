@@ -45,6 +45,127 @@ fn type_var(v: parser::Var, env: Env) -> TExpr | error {
     TExpr { kind = TVar { name = v.name; is_func = is_fn; func_ns = b.ns }; type = b.type; line = 0; col = 0 }
 }
 
+// ============================================================================
+// (W10) CLOSURE LITERALS — type a `(params) => body` lambda, analyse its captures.
+// ============================================================================
+
+// collect the NAMES a lambda body READS (`refs`) and the names it BINDS internally (`bound` —
+// inner `let`s + nested-lambda params), so the free variables are `refs − bound − <params>`.
+fn lam_collect_block(stmts: []parser::Statement, refs: Ref<[]str>, bound: Ref<[]str>) -> void {
+    mut i = 0
+    loop { if i >= stmts.len { break }; lam_collect_stmt(stmts[i], refs, bound); i++ }
+}
+fn lam_collect_stmt(s: parser::Statement, refs: Ref<[]str>, bound: Ref<[]str>) -> void {
+    match s {
+        parser::Binding as b => {
+            lam_collect_expr(b.value, refs, bound)
+            match b.target {
+                parser::SimpleName as sn => bound.value = str_set_add(bound.value, sn.name)
+                parser::DestructurePattern as dp => { mut j = 0; loop { if j >= dp.names.len { break }; bound.value = str_set_add(bound.value, dp.names[j]); j++ } }
+            }
+        }
+        parser::Assign as a       => lam_collect_expr(a.value, refs, bound)
+        parser::Return as r       => if r.has_value { lam_collect_expr(r.value, refs, bound) } else { }
+        parser::LoopStmt as l     => lam_collect_block(l.body, refs, bound)
+        parser::ExprStmt as es    => lam_collect_expr(es.expr, refs, bound)
+        parser::DeferStmt as d    => lam_collect_block(d.body, refs, bound)
+        parser::BreakStmt         => { }
+        parser::ContinueStmt      => { }
+    }
+}
+fn lam_collect_expr(e: parser::Expr, refs: Ref<[]str>, bound: Ref<[]str>) -> void {
+    match e.kind {
+        parser::Var as v          => refs.value = str_set_add(refs.value, v.name)
+        parser::Binary as b       => { lam_collect_expr(b.left, refs, bound); lam_collect_expr(b.right, refs, bound) }
+        parser::Unary as u        => lam_collect_expr(u.operand, refs, bound)
+        parser::Compare as c      => { lam_collect_expr(c.first, refs, bound); mut i = 0; loop { if i >= c.rest.len { break }; lam_collect_expr(c.rest[i].operand, refs, bound); i++ } }
+        parser::Call as cl        => { if cl.callee.segments.len == 1 { refs.value = str_set_add(refs.value, cl.callee.segments[0].name) }; mut i = 0; loop { if i >= cl.args.len { break }; lam_collect_expr(cl.args[i], refs, bound); i++ } }
+        parser::IfExpr as f       => { lam_collect_expr(f.cond, refs, bound); lam_collect_block(f.then_blk, refs, bound); if f.has_else { lam_collect_block(f.else_blk, refs, bound) } }
+        parser::MatchExpr as m    => { lam_collect_expr(m.subject, refs, bound); mut i = 0; loop { if i >= m.arms.len { break }; lam_collect_block(m.arms[i].body, refs, bound); i++ } }
+        parser::FieldAccess as fa => lam_collect_expr(fa.receiver, refs, bound)
+        parser::SafeFieldAccess as sfa => lam_collect_expr(sfa.receiver, refs, bound)
+        parser::Coalesce as co    => { lam_collect_expr(co.left, refs, bound); lam_collect_expr(co.right, refs, bound) }
+        parser::Cast as ct        => lam_collect_expr(ct.expr, refs, bound)
+        parser::MethodCall as mc  => { lam_collect_expr(mc.receiver, refs, bound); mut i = 0; loop { if i >= mc.args.len { break }; lam_collect_expr(mc.args[i], refs, bound); i++ } }
+        parser::StructLit as sl   => { mut i = 0; loop { if i >= sl.field_vals.len { break }; lam_collect_expr(sl.field_vals[i], refs, bound); i++ } }
+        parser::Index as ix       => { lam_collect_expr(ix.receiver, refs, bound); lam_collect_expr(ix.index, refs, bound) }
+        parser::Interp as in      => { mut i = 0; loop { if i >= in.holes.len { break }; lam_collect_expr(in.holes[i], refs, bound); i++ } }
+        parser::InExpr as n       => { lam_collect_expr(n.lhs, refs, bound); mut i = 0; loop { if i >= n.elems.len { break }; lam_collect_expr(n.elems[i], refs, bound); i++ } }
+        parser::ArrayLit as a     => { mut i = 0; loop { if i >= a.elements.len { break }; lam_collect_expr(a.elements[i].expr, refs, bound); i++ } }
+        parser::Lambda as lam     => { mut i = 0; loop { if i >= lam.params.len { break }; bound.value = str_set_add(bound.value, lam.params[i].name); i++ }; lam_collect_block(lam.body, refs, bound) }   // a NESTED lambda's params are bound; its free reads transit to the outer
+        parser::Number            => { }
+        parser::StrLit            => { }
+        parser::ByteLit           => { }
+        parser::BoolLit           => { }
+        parser::NullLit           => { }
+        parser::PathExpr          => { }
+    }
+}
+
+// type a closure literal. `expected` is the target type when known (a binding annotation / call-arg
+// param) so an un-annotated parameter infers from it (W10 ruling 3); Void = no target. On success the
+// TExpr.type is the closure's Func type. Captures = free vars resolving to ENCLOSING LOCALS (ns ""),
+// each by-copy unless it is a `Ref<T>` (by_ref — the only path to shared mutation).
+// resolve ONE closure parameter's type: its annotation, else the target's param type at `idx`
+// (W10 ruling 3 — inference from the target), else an honest error (annotate or give a target type).
+fn lam_param_type(p: parser::LambdaParam, idx: u64, exp_params: []Type, table: TypeTable) -> Type | error {
+    if p.has_type { return resolve_type(p.type_ann, table) }
+    if idx < exp_params.len { return exp_params[idx] }
+    error { message = $"cannot infer the type of closure parameter `{p.name}` — annotate it (`{p.name}: T`) or give the closure a target type" }
+}
+fn type_lambda(lam: parser::Lambda, expected: Type, env: Env, table: TypeTable) -> TExpr | error {
+    mut exp_params: []Type = teko::list::empty()
+    match expected { Func as ef => exp_params = ef.params; _ => {} }
+    // 1. resolve parameter types (annotation, else the target's param type — ruling 3)
+    mut tparams: []TLambdaParam = teko::list::empty()
+    mut cenv = env
+    mut i: u64 = 0
+    loop {
+        if i >= lam.params.len { break }
+        let p = lam.params[i]
+        let pt = match lam_param_type(p, i, exp_params, table) { Type as t => t; error as e => return e }
+        tparams = teko::list::push(tparams, TLambdaParam { name = p.name; type = pt })
+        cenv = define(cenv, p.name, pt, false)
+        i++
+    }
+    // 2. type the body in the child scope (params visible). The return type is the TARGET's ret when a
+    // target type is present (the annotation is authoritative — and handles a `return`-only body whose
+    // trailing value is void); otherwise it is inferred from the body's trailing value.
+    let tb = match type_block(lam.body, cenv, table) { TypedBlock as bk => bk; error as e => return e }
+    let ret = match expected { Func as ef => ef.ret; _ => tblock_type(tb.stmts) }
+    // 3. capture analysis — free vars (refs − bound − params) that resolve to an ENCLOSING LOCAL.
+    mut refs: []str = teko::list::empty()
+    mut bnd: []str = teko::list::empty()
+    mut j = 0
+    loop { if j >= lam.params.len { break }; bnd = str_set_add(bnd, lam.params[j].name); j++ }
+    lam_collect_block(lam.body, refs, bnd)
+    mut captures: []TCapture = teko::list::empty()
+    mut k = 0
+    loop {
+        if k >= refs.len { break }
+        let nm = refs[k]
+        if !str_set_has(bnd, nm) {
+            match lookup_binding(env, nm) {
+                ValBinding as b => {
+                    if b.ns.len == 0 {   // an enclosing LOCAL (a global/function has ns != "") → a capture
+                        let by_ref = match b.type { Reference => true; _ => false }
+                        captures = teko::list::push(captures, TCapture { name = nm; type = b.type; by_ref = by_ref })
+                    }
+                }
+                error => { }   // not a local (a global/builtin) or unresolved (body typing already reported it)
+            }
+        }
+        k++
+    }
+    TExpr { kind = TLambda { params = tparams; body = tb.stmts; captures = captures; ret = ret; lift_id = 0 }; type = Func { params = lam_param_types(tparams); ret = ret }; line = 0; col = 0 }
+}
+fn lam_param_types(ps: []TLambdaParam) -> []Type {
+    mut out: []Type = teko::list::empty()
+    mut i = 0
+    loop { if i >= ps.len { break }; out = teko::list::push(out, ps[i].type); i++ }
+    out
+}
+
 // ---- operators (the SAME B.22 regimes as check_binary/check_unary/check_compare) ----
 fn type_binary(b: parser::Binary, env: Env, table: TypeTable) -> TExpr | error {
     mut l = match type_expr(b.left, env, table)  { TExpr as te => te; error as e => return e }
@@ -222,7 +343,15 @@ fn type_call(c: parser::Call, env: Env, table: TypeTable) -> TExpr | error {
             mut ti = 0
             loop {
                 if ti >= c.args.len { break }
-                let a = match type_expr(c.args[ti], env, table) { TExpr as te => te; error as e => return e }
+                // (W10) a closure-literal ARG whose parameter is a concrete function type infers its
+                // un-annotated params from that target (ruling 3); other args type normally.
+                let is_lam = match c.args[ti].kind { parser::Lambda => true; _ => false }
+                let pt_is_func = match f.params[ti] { Func => true; _ => false }
+                let a = if is_lam && pt_is_func {
+                    match type_value_expected(c.args[ti], f.params[ti], env, table) { TExpr as te => te; error as e => return e }
+                } else {
+                    match type_expr(c.args[ti], env, table) { TExpr as te => te; error as e => return e }
+                }
                 if type_is_void(a.type) { return error { message = "a `void` expression cannot be passed as an argument (M.1)" } }
                 targs = teko::list::push(targs, a)
                 ti++
@@ -914,6 +1043,7 @@ fn type_dispatch(e: parser::Expr, env: Env, table: TypeTable) -> TExpr | error {
         parser::Interp as in   => type_interp(in, env, table)       // $"…{expr}…"
         parser::InExpr as n    => type_in(n, env, table)            // <expr> in [ … ] (Phase 2)
         parser::ArrayLit as a  => type_array_lit(a, env, table)     // [ e0, e1, … ] (Increment B+)
+        parser::Lambda as lam  => type_lambda(lam, Void { }, env, table)   // (W10) no target here → un-annotated params error (ruling 3); a binding/call-arg threads the target
     }
 }
 
@@ -1139,6 +1269,7 @@ fn type_match_stmt(m: parser::MatchExpr, env: Env, table: TypeTable) -> TExpr | 
 fn type_value_expected(e: parser::Expr, expected: Type, env: Env, table: TypeTable) -> TExpr | error {
     match e.kind {
         parser::StructLit as sl => type_struct_lit(sl, expected, env, table)
+        parser::Lambda as lam   => type_lambda(lam, expected, env, table)   // (W10) target type → un-annotated closure params infer (ruling 3)
         _                       => type_expr(e, env, table)
     }
 }

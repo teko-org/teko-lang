@@ -83,7 +83,11 @@ type RefVal = struct { cell: u64 }
 // fn used as a value carries no captured environment (the W10b capture env will extend this). A
 // closure call evaluates its callee to a FuncVal and invokes that function with the call's args.
 // The C twin is the TK_VAL_FUNC tag.
-type FuncVal = struct { ns: str; name: str }
+// FuncVal (W10) — a function/closure VALUE. A NAMED fn used as a value carries (ns, name) and
+// is_lambda=false. A closure LITERAL carries is_lambda=true + its typed params/body + a SNAPSHOT of
+// its captured variables (cap_names/cap_vals): a by-copy capture snapshots the value; a `Ref<T>`
+// capture snapshots the RefVal (the cell index — so the closure shares the cell → mutation works).
+type FuncVal = struct { is_lambda: bool; ns: str; name: str; params: []checker::TLambdaParam; body: []checker::TStatement; cap_names: []str; cap_vals: []Value }
 
 type Value = variant u8 | u16 | u32 | u64 | u128
            | i8 | i16 | i32 | i64 | i128
@@ -1478,7 +1482,21 @@ fn eval_expr(e: checker::TExpr, env: Venv) -> EvalRes {
         checker::TNumber as n   => EvalRes { value= num_of_prim(n, e.type); env= env }   // a concrete u8…i128 / f16…f64 from the node's type (float iff n.is_float)
         // (W10a) a bare top-level-fn reference used as a VALUE → a FuncVal (no captured env). A plain
         // local/param reads its bound value (cell-backed reads thread through the cell).
-        checker::TVar as v      => if v.is_func { EvalRes { value= FuncVal { ns= v.func_ns; name= v.name }; env= env } } else { EvalRes { value= read_var(env, v.name); env= env } }
+        checker::TVar as v      => if v.is_func { EvalRes { value= FuncVal { is_lambda= false; ns= v.func_ns; name= v.name; params= teko::list::empty(); body= teko::list::empty(); cap_names= teko::list::empty(); cap_vals= teko::list::empty() }; env= env } } else { EvalRes { value= read_var(env, v.name); env= env } }
+        // (W10) a closure LITERAL → a FuncVal carrying its params/body + a SNAPSHOT of its captures
+        // (read NOW from the enclosing scope; a RefVal snapshot shares the cell → by-ref mutation).
+        checker::TLambda as lam => {
+            mut cnames: []str = teko::list::empty()
+            mut cvals: []Value = teko::list::empty()
+            mut i = 0
+            loop {
+                if i >= lam.captures.len { break }
+                cnames = teko::list::push(cnames, lam.captures[i].name)
+                cvals = teko::list::push(cvals, read_var(env, lam.captures[i].name))
+                i++
+            }
+            EvalRes { value= FuncVal { is_lambda= true; ns= ""; name= ""; params= lam.params; body= lam.body; cap_names= cnames; cap_vals= cvals }; env= env }
+        }
         checker::TStrLit as s   => EvalRes { value= s.text; env= env }            // a `str` member of Value
         checker::TByteLit as b  => EvalRes { value= b.value; env= env }           // a `byte` member of Value
         checker::TBoolLit as bl => EvalRes { value= bl.value; env= env }                  // bool literal (W2) — FULL: a `bool` member of Value
@@ -2049,6 +2067,37 @@ fn bind_call_args(f: checker::TFunction, c: checker::TCall, env: Venv) -> BoundA
     BoundArgs { fenv= fenv; caller= caller }
 }
 
+// (W10) invoke a closure LITERAL value: bind its params to the evaluated args in a fresh frame, bind
+// its captured snapshot, exec the body, and yield the trailing/returned value. A captured RefVal
+// shares its cell, so a `Ref<T>` capture's writes are visible at the caller (cells threaded back).
+fn eval_lambda_call(fv: FuncVal, c: checker::TCall, env: Venv) -> EvalRes {
+    mut caller = env
+    mut fenv = fresh_env(env.prog, env.cells)
+    mut ai: u64 = 0
+    loop {
+        if ai >= fv.params.len { break }
+        let ae = eval_expr(c.args[ai], caller)
+        caller = ae.env
+        fenv = with_cells(fenv, caller.cells)
+        fenv = define(fenv, fv.params[ai].name, ae.value)
+        ai = ai + 1
+    }
+    mut ci: u64 = 0
+    loop {
+        if ci >= fv.cap_names.len { break }
+        fenv = define(fenv, fv.cap_names[ci], fv.cap_vals[ci])
+        ci = ci + 1
+    }
+    let fe = exec_block_ex(fv.body, fenv, true)
+    caller = with_cells(caller, fe.env.cells)
+    let rv = match fe.flow {
+        VmReturn as ret => ret.value ?? panic("vm: void closure call used as a value (internal: checker should reject)")
+        Normal as nm    => nm.value ?? panic("vm: void closure call used as a value (internal: checker should reject)")
+        _               => panic("vm: void closure call used as a value (internal: checker should reject)")
+    }
+    EvalRes { value= rv; env= caller }
+}
+
 fn eval_call(c: checker::TCall, env: Venv) -> EvalRes {
     // A builtin that RAN (`true`) is `-> void`, so there is no Value to yield: a void call
     // only appears in statement position, and reaching here in value position is an honest
@@ -2070,8 +2119,14 @@ fn eval_call(c: checker::TCall, env: Venv) -> EvalRes {
     // teko::fs::* host-surface builtins (list_dir). Recognized before user-fn resolution;
     // null == not a fs builtin, fall through. (Mirrors vm.c's list_dir handler.)
     match try_fs_builtin(c.callee, c.args, env) { Value as v => return EvalRes { value= v; env= env }; null => {} }
-    // (W10a) a CLOSURE call: the callee is a LOCAL bound to a FuncVal — resolve THAT function and
-    // invoke it with the call's args (no captured env in W10a). Otherwise resolve the callee path.
+    // (W10) a CLOSURE call: the callee is a LOCAL bound to a FuncVal. A LAMBDA value executes its own
+    // body+captures (eval_lambda_call); a NAMED-fn value resolves THAT function and invokes it (W10a).
+    if c.is_closure_call {
+        match read_var(env, c.callee.segments[c.callee.segments.len - 1].name) {
+            FuncVal as fv => if fv.is_lambda { return eval_lambda_call(fv, c, env) } else { }
+            _ => { }
+        }
+    }
     let h = if c.is_closure_call {
         match read_var(env, c.callee.segments[c.callee.segments.len - 1].name) {
             FuncVal as fv => find_function(env, parser::Path { segments = teko::list::push(teko::list::empty(), parser::Segment { name = fv.name }) })
@@ -2381,8 +2436,14 @@ fn call_value(c: checker::TCall, env: Venv) -> StmtVal {
     match try_err_builtin(c.callee, c.args, env)  { Value as v => return StmtVal { value= v; env= env }; null => {} }
     match try_str_builtin(c.callee, c.args, env)  { Value as v => return StmtVal { value= v; env= env }; null => {} }
     match try_fs_builtin(c.callee, c.args, env)   { Value as v => return StmtVal { value= v; env= env }; null => {} }
-    // (W10a) a CLOSURE call in statement position: callee is a LOCAL bound to a FuncVal — resolve THAT
-    // function (no captured env in W10a). Otherwise resolve the callee path.
+    // (W10) a CLOSURE call in statement position: a LAMBDA value executes its own body+captures; a
+    // NAMED-fn value resolves THAT function (W10a). Otherwise resolve the callee path.
+    if c.is_closure_call {
+        match read_var(env, c.callee.segments[c.callee.segments.len - 1].name) {
+            FuncVal as fv => if fv.is_lambda { let r = eval_lambda_call(fv, c, env); return StmtVal { value= r.value; env= r.env } } else { }
+            _ => { }
+        }
+    }
     let h = if c.is_closure_call {
         match read_var(env, c.callee.segments[c.callee.segments.len - 1].name) {
             FuncVal as fv => find_function(env, parser::Path { segments = teko::list::push(teko::list::empty(), parser::Segment { name = fv.name }) })

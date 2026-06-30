@@ -191,9 +191,16 @@ struct tk_value {
         // an auto-ref PROMOTES the origin var to a cell, this carries the cell index, and `.value`
         // read/write goes through cell_get/cell_set (the .tks twin is the RefVal variant member).
         struct { uint64_t cell; } ref;
-        // FUNC (W10a) — a function/closure value: the target function's (namespace, name). A named fn
-        // used as a value carries no captured env (W10b capture extends this). The .tks twin is FuncVal.
-        struct { tk_str ns; tk_str name; } func;
+        // FUNC (W10) — a function/closure value. A NAMED fn carries (ns, name) and is_lambda=false. A
+        // closure LITERAL carries is_lambda=true + its typed params/body + a SNAPSHOT of its captured
+        // variables (cap_names/cap_vals — a RefVal snapshot shares the cell → by-ref mutation). The
+        // .tks twin is FuncVal.
+        struct {
+            bool is_lambda; tk_str ns; tk_str name;
+            const tk_tlambda_param *params; size_t nparams;
+            const tk_tstatement *body; size_t nbody;
+            tk_str *cap_names; tk_value *cap_vals; size_t ncaps;
+        } func;
     } as;
 };
 
@@ -1302,6 +1309,26 @@ static tk_flow run_user_fn(const tk_tfunction *fn, size_t fn_idx, tk_venv *fenv)
 // (W10a) resolve a CLOSURE call's target function: the callee is a LOCAL bound to a TK_VAL_FUNC
 // value (a named fn used as a value). Read that local, then resolve the function by its name (no
 // captured env in W10a). Shared by call_value (statement) and eval_call (value). (Mirrors vm.tks.)
+// (W10) if the closure-call callee is a LAMBDA value, run it: bind params to the evaluated args and
+// the captured snapshot in a fresh frame, exec the body, and return true with the result in *out. A
+// captured RefVal shares its cell (global store) → by-ref mutation. Returns false for a named-fn
+// value (the caller falls through to closure_target/find_function — the W10a path).
+static bool try_lambda_call(const tk_texpr *e, tk_venv *env, tk_value *out) {
+    tk_path p = e->as.call.callee;
+    tk_slot *cs = env_find(env, p.segments[p.len - 1].name);
+    tk_value cv = (cs && cs->has_cell) ? cell_get(cs->cell_id) : (cs ? cs->val : (tk_value){0});
+    if (cs == NULL || cv.tag != TK_VAL_FUNC || !cv.as.func.is_lambda) return false;
+    tk_venv fenv = { .head = NULL };
+    for (size_t i = 0; i < cv.as.func.nparams; i += 1)
+        env_define(&fenv, cv.as.func.params[i].name, tk_vm_eval_expr(&e->as.call.args[i], env));
+    for (size_t i = 0; i < cv.as.func.ncaps; i += 1)
+        env_define(&fenv, cv.as.func.cap_names[i], cv.as.func.cap_vals[i]);
+    tk_flow fl = tk_vm_exec_block_ex(cv.as.func.body, cv.as.func.nbody, &fenv, true);
+    env_free(&fenv);
+    *out = ((fl.kind == TK_FLOW_RETURN || fl.kind == TK_FLOW_NORMAL) && fl.has_value) ? fl.value : v_void();
+    return true;
+}
+
 static const tk_tfunction *closure_target(const tk_texpr *e, tk_venv *env, size_t *out_idx) {
     tk_path p = e->as.call.callee;
     tk_slot *cs = env_find(env, p.segments[p.len - 1].name);
@@ -1324,6 +1351,7 @@ static bool call_value(const tk_texpr *e, tk_venv *env, tk_value *out) {
     size_t nargs = e->as.call.nargs;
 
     if (try_builtin_call(p, args, nargs, env, out)) return true;   // `-> void` builtin (or value builtin) — no ref args
+    if (e->as.call.is_closure_call && try_lambda_call(e, env, out)) return true;   // (W10) a lambda value runs its own body
 
     size_t fn_idx;
     const tk_tfunction *fn = e->as.call.is_closure_call ? closure_target(e, env, &fn_idx) : find_function(p, &fn_idx);   // (W10a) closure call → resolve through the local FuncVal
@@ -1354,6 +1382,7 @@ static tk_value eval_call(const tk_texpr *e, tk_venv *env) {
 
     tk_value out;
     if (try_builtin_call(p, args, nargs, env, &out)) return out;
+    if (e->as.call.is_closure_call && try_lambda_call(e, env, &out)) return out;   // (W10) a lambda value runs its own body
 
     size_t fn_idx;
     const tk_tfunction *fn = e->as.call.is_closure_call ? closure_target(e, env, &fn_idx) : find_function(p, &fn_idx);   // (W10a) closure call → resolve through the local FuncVal
@@ -1787,7 +1816,7 @@ static tk_value tk_vm_eval_expr(const tk_texpr *e, tk_venv *env) {
         case TK_TEXPR_VAR: {
             // (W10a) a bare top-level-fn reference used as a VALUE → a function value (no captured env).
             if (e->as.var.is_func)
-                return (tk_value){ .tag = TK_VAL_FUNC, .as.func = { e->as.var.func_ns, e->as.var.name } };
+                return (tk_value){ .tag = TK_VAL_FUNC, .as.func = { .is_lambda = false, .ns = e->as.var.func_ns, .name = e->as.var.name } };
             tk_slot *s = env_find(env, e->as.var.name);
             if (s == NULL) vm_unsupported("reference to an unbound variable (internal: checker should reject)");
             // (MEM Step 2/3) a CELL-BACKED slot (a `Ref<T>` aliasing target whose `mut` value was
@@ -1865,6 +1894,21 @@ static tk_value tk_vm_eval_expr(const tk_texpr *e, tk_venv *env) {
                 }
             }
             return arr;
+        }
+        // (W10) a closure LITERAL → a function value with a SNAPSHOT of its captures (a RefVal snapshot
+        // shares the cell → by-ref mutation). params/body point at the typed AST (lifetime = program).
+        case TK_TEXPR_LAMBDA: {
+            const tk_tlambda *lam = &e->as.lambda;
+            tk_str *cn = lam->ncaptures ? tk_alloc(lam->ncaptures * sizeof *cn) : NULL;
+            tk_value *cv = lam->ncaptures ? tk_alloc(lam->ncaptures * sizeof *cv) : NULL;
+            for (size_t i = 0; i < lam->ncaptures; i += 1) {
+                cn[i] = lam->captures[i].name;
+                tk_slot *s = env_find(env, lam->captures[i].name);
+                cv[i] = s ? (s->has_cell ? cell_get(s->cell_id) : s->val) : (tk_value){0};
+            }
+            return (tk_value){ .tag = TK_VAL_FUNC, .as.func = { .is_lambda = true, .ns = (tk_str){0}, .name = (tk_str){0},
+                .params = lam->params, .nparams = lam->nparams, .body = lam->body, .nbody = lam->nbody,
+                .cap_names = cn, .cap_vals = cv, .ncaps = lam->ncaptures } };
         }
         // null / ?. / ?? (REBOOT_PLAN §202/§203) — the OPTIONAL value model (TK_VAL_OPT).
         case TK_TEXPR_NULL:

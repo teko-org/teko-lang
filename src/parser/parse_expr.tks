@@ -132,9 +132,73 @@ fn parse_interp(tokens: []lexer::Token, pos: u64) -> Parsed<Expr> | error {
 // the LEAF: a literal, a name/path/call, `( expr )`, or an `if`/`match` expression (B.20/B.15).
 // `allow_struct` (W4a): when true, a `Name { … }` after a path is a struct literal; when false
 // (if/match scrutinee), the `{` opens the block instead. Threaded down from parse_expr.
+// (W10) lambda lookahead: with `pos` at `(`, scan to the MATCHING `)` (paren-balanced) and report
+// whether a `=>` follows. Distinguishes a closure literal `(x) => …` from a parenthesized expression
+// `(x)` or an arg list — pure parser lookahead (the lexer never needs to know).
+fn lambda_ahead(tokens: []lexer::Token, pos: u64) -> bool {
+    mut depth: u64 = 0
+    mut p = pos
+    loop {
+        if p >= tokens.len { return false }
+        let k = tokens[p].kind
+        if k == lexer::TokenKind::LParen { depth = depth + 1 }
+        else if k == lexer::TokenKind::RParen {
+            depth = depth - 1
+            if depth == 0 { return is_kind_at(tokens, p + 1, lexer::TokenKind::FatArrow) }
+        }
+        p = p + 1
+    }
+}
+
+// (W10) a closure literal `(params) => expr` / `(params) => { … }` — `pos` is at `(`. Each param is
+// `name` or `name: type` (type OPTIONAL — inferred from the target when absent). The body is a block
+// `{ … }` or a single expression (stored as one trailing ExprStmt). NO `fn`, NO `-> R` (ret inferred).
+fn parse_lambda(tokens: []lexer::Token, pos: u64) -> Parsed<Expr> | error {
+    mut params: []LambdaParam = teko::list::empty()
+    mut p = pos + 1
+    if is_kind_at(tokens, p, lexer::TokenKind::RParen) {
+        p = p + 1
+    } else {
+        loop {
+            if !is_name_at(tokens, p) { return err_at(tokens, p, "expected a closure parameter name") }
+            let nm = tokens[p].text
+            mut hasty = false
+            mut ty = no_type()
+            mut q = p + 1
+            if is_kind_at(tokens, q, lexer::TokenKind::Colon) {
+                let t = match parse_type(tokens, q + 1) { ParsedType as x => x; error as e => return e }
+                hasty = true; ty = t.node; q = t.next
+            }
+            params = teko::list::push(params, LambdaParam { name = nm; has_type = hasty; type_ann = ty })
+            p = q
+            if is_kind_at(tokens, p, lexer::TokenKind::Comma) { p = p + 1 }
+            else if is_kind_at(tokens, p, lexer::TokenKind::RParen) { p = p + 1; break }
+            else { return err_at(tokens, p, "expected ',' or ')' in a closure parameter list") }
+        }
+    }
+    if !is_kind_at(tokens, p, lexer::TokenKind::FatArrow) {
+        return err_at(tokens, p, "expected '=>' after a closure parameter list '(params) => …'")
+    }
+    p = p + 1
+    mut body: []Statement = teko::list::empty()
+    if is_kind_at(tokens, p, lexer::TokenKind::LBrace) {
+        let blk = match parse_block(tokens, p) { ParsedList<Statement> as x => x; error as e => return e }
+        body = blk.items
+        p = blk.next
+    } else {
+        let e = match parse_expr(tokens, p) { Parsed<Expr> as x => x; error as e => return e }
+        body = teko::list::push(teko::list::empty(), ExprStmt { expr = e.node })
+        p = e.next
+    }
+    Parsed<Expr> { node = Expr { kind = Lambda { params = params; body = body }; line = tokens[pos].line; col = tokens[pos].col }; next = p }
+}
+
 fn parse_atom(tokens: []lexer::Token, pos: u64, allow_struct: bool) -> Parsed<Expr> | error {
     if !has_token(tokens, pos) { return err_at(tokens, pos, "expected an expression") }
     let k = kind_at(tokens, pos)
+    if k == lexer::TokenKind::LParen && lambda_ahead(tokens, pos) {
+        return parse_lambda(tokens, pos)   // (W10) a closure literal beats the grouping branch below
+    }
     if k == lexer::TokenKind::Number {
         let txt = tokens[pos].text
         // a FLOAT token carries fval (via lit_float); an INT token carries value (via lit_int) — mirror parse_expr.c.

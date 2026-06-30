@@ -269,7 +269,12 @@ static tk_texpr_result type_call(tk_call c, tk_env env, tk_type_table table) {
     // Type every argument first (void rejected); strict-check / generic-infer below.
     tk_texpr_list args = tk_texpr_list_empty();
     for (size_t i = 0; i < c.nargs; i += 1) {
-        tk_texpr_result a = tk_typer_expr(c.args[i], env, table); if (!a.ok) return a;
+        // (W10) a closure-literal ARG whose parameter is a concrete function type infers its
+        // un-annotated params from that target (ruling 3); other args type normally.
+        bool lam_target = c.args[i].tag == TK_EXPR_LAMBDA && ft.as.func.params[i].tag == TK_TYPE_FUNC;
+        tk_texpr_result a = lam_target ? tk_type_value_expected(c.args[i], ft.as.func.params[i], env, table)
+                                       : tk_typer_expr(c.args[i], env, table);
+        if (!a.ok) return a;
         if (tk_type_is_void(&a.as.value.type)) return xerr("a `void` expression cannot be passed as an argument (M.1)");
         args = tk_texpr_list_push(args, a.as.value);
     }
@@ -800,11 +805,100 @@ tk_texpr_result tk_type_struct_lit(tk_struct_lit sl, tk_type expected, tk_env en
                            .as.struct_init = { names, vals, sb.n_fields } });
 }
 
+// (W10) free-variable collection for a closure body — mirror of typer.tks lam_collect_*. Collects the
+// names READ (`refs`) and BOUND internally (`bound` = inner lets + nested-lambda params).
+typedef struct { tk_str *p; size_t n; } tk_sset;
+static bool sset_has(const tk_sset *s, tk_str x) { for (size_t i = 0; i < s->n; i += 1) if (tk_str_eq(s->p[i], x)) return true; return false; }
+static void sset_add(tk_sset *s, tk_str x) { if (sset_has(s, x)) return; s->p = tk_realloc0(s->p, (s->n + 1) * sizeof *s->p); if (!s->p) abort(); s->p[s->n++] = x; }
+static void lam_collect_expr(const tk_expr *e, tk_sset *refs, tk_sset *bound);
+static void lam_collect_block(const tk_statement *stmts, size_t n, tk_sset *refs, tk_sset *bound);
+static void lam_collect_stmt(const tk_statement *s, tk_sset *refs, tk_sset *bound) {
+    switch (s->tag) {
+        case TK_STMT_BINDING:
+            lam_collect_expr(&s->as.binding.value, refs, bound);
+            if (s->as.binding.target.tag == TK_BIND_SIMPLE) sset_add(bound, s->as.binding.target.as.simple.name);
+            else for (size_t i = 0; i < s->as.binding.target.as.destructure.nnames; i += 1) sset_add(bound, s->as.binding.target.as.destructure.names[i]);
+            break;
+        case TK_STMT_ASSIGN: lam_collect_expr(&s->as.assign.value, refs, bound); break;
+        case TK_STMT_RETURN: if (s->as.ret.has_value) lam_collect_expr(&s->as.ret.value, refs, bound); break;
+        case TK_STMT_LOOP:   lam_collect_block(s->as.loop_stmt.body, s->as.loop_stmt.nbody, refs, bound); break;
+        case TK_STMT_EXPR:   lam_collect_expr(&s->as.expr_stmt.expr, refs, bound); break;
+        case TK_STMT_DEFER:  lam_collect_block(s->as.defer_stmt.body, s->as.defer_stmt.nbody, refs, bound); break;
+        default: break;   // BREAK / CONTINUE
+    }
+}
+static void lam_collect_block(const tk_statement *stmts, size_t n, tk_sset *refs, tk_sset *bound) {
+    for (size_t i = 0; i < n; i += 1) lam_collect_stmt(&stmts[i], refs, bound);
+}
+static void lam_collect_expr(const tk_expr *e, tk_sset *refs, tk_sset *bound) {
+    switch (e->tag) {
+        case TK_EXPR_VAR: sset_add(refs, e->as.var.name); break;
+        case TK_EXPR_BINARY: lam_collect_expr(e->as.binary.left, refs, bound); lam_collect_expr(e->as.binary.right, refs, bound); break;
+        case TK_EXPR_UNARY: lam_collect_expr(e->as.unary.operand, refs, bound); break;
+        case TK_EXPR_COMPARE: lam_collect_expr(e->as.compare.first, refs, bound); for (size_t i = 0; i < e->as.compare.nrest; i += 1) lam_collect_expr(e->as.compare.rest[i].operand, refs, bound); break;
+        case TK_EXPR_CALL: if (e->as.call.callee.len == 1) sset_add(refs, e->as.call.callee.segments[0].name); for (size_t i = 0; i < e->as.call.nargs; i += 1) lam_collect_expr(&e->as.call.args[i], refs, bound); break;
+        case TK_EXPR_IF: lam_collect_expr(e->as.if_expr.cond, refs, bound); lam_collect_block(e->as.if_expr.then_blk, e->as.if_expr.nthen, refs, bound); if (e->as.if_expr.has_else) lam_collect_block(e->as.if_expr.else_blk, e->as.if_expr.nelse, refs, bound); break;
+        case TK_EXPR_MATCH: lam_collect_expr(e->as.match_expr.subject, refs, bound); for (size_t i = 0; i < e->as.match_expr.narms; i += 1) lam_collect_block(e->as.match_expr.arms[i].body, e->as.match_expr.arms[i].nbody, refs, bound); break;
+        case TK_EXPR_FIELD_ACCESS: lam_collect_expr(e->as.field_access.receiver, refs, bound); break;
+        case TK_EXPR_SAFE_FIELD_ACCESS: lam_collect_expr(e->as.safe_field_access.receiver, refs, bound); break;
+        case TK_EXPR_COALESCE: lam_collect_expr(e->as.coalesce.left, refs, bound); lam_collect_expr(e->as.coalesce.right, refs, bound); break;
+        case TK_EXPR_METHOD_CALL: lam_collect_expr(e->as.method_call.receiver, refs, bound); for (size_t i = 0; i < e->as.method_call.nargs; i += 1) lam_collect_expr(&e->as.method_call.args[i], refs, bound); break;
+        case TK_EXPR_STRUCT_LIT: for (size_t i = 0; i < e->as.struct_lit.nfields; i += 1) lam_collect_expr(&e->as.struct_lit.field_vals[i], refs, bound); break;
+        case TK_EXPR_INDEX: lam_collect_expr(e->as.index.receiver, refs, bound); lam_collect_expr(e->as.index.index, refs, bound); break;
+        case TK_EXPR_INTERP: for (size_t i = 0; i < e->as.interp.nholes; i += 1) lam_collect_expr(&e->as.interp.holes[i], refs, bound); break;
+        case TK_EXPR_IN: lam_collect_expr(e->as.in_expr.lhs, refs, bound); for (size_t i = 0; i < e->as.in_expr.nelems; i += 1) lam_collect_expr(&e->as.in_expr.elems[i], refs, bound); break;
+        case TK_EXPR_ARRAY: for (size_t i = 0; i < e->as.array.nelements; i += 1) lam_collect_expr(e->as.array.elements[i].expr, refs, bound); break;
+        case TK_EXPR_LAMBDA: for (size_t i = 0; i < e->as.lambda.nparams; i += 1) sset_add(bound, e->as.lambda.params[i].name); lam_collect_block(e->as.lambda.body, e->as.lambda.nbody, refs, bound); break;
+        default: break;   // leaves
+    }
+}
+
+// (W10) type a closure literal — mirror of typer.tks::type_lambda. `expected` (a Func when known)
+// drives un-annotated param inference (ruling 3) and the return type; captures = free vars resolving
+// to enclosing LOCALS (ns ""), by-copy unless the captured var is a `Ref<T>` (by_ref).
+static tk_texpr_result type_lambda(tk_lambda lam, tk_type expected, tk_env env, tk_type_table table) {
+    tk_type *exp_params = NULL; size_t n_exp = 0;
+    if (expected.tag == TK_TYPE_FUNC) { exp_params = expected.as.func.params; n_exp = expected.as.func.nparams; }
+    tk_tlambda_param *tparams = NULL; size_t ntp = 0;
+    tk_env cenv = env;
+    for (size_t i = 0; i < lam.nparams; i += 1) {
+        tk_type pt;
+        if (lam.params[i].has_type) { tk_type_result r = tk_resolve_type(lam.params[i].type_ann, table); if (!r.ok) return xferr(r.as.error); pt = r.as.value; }
+        else if (i < n_exp) pt = exp_params[i];
+        else return xerr("cannot infer the type of a closure parameter — annotate it or give the closure a target type");
+        tparams = tk_realloc0(tparams, (ntp + 1) * sizeof *tparams); if (!tparams) abort();
+        tparams[ntp++] = (tk_tlambda_param){ lam.params[i].name, pt };
+        cenv = tk_env_define(cenv, lam.params[i].name, pt, false);
+    }
+    tk_typed_block_result tb = tk_type_block(lam.body, lam.nbody, cenv, table); if (!tb.ok) return xferr(tb.as.error);
+    tk_type ret = (expected.tag == TK_TYPE_FUNC) ? *expected.as.func.ret : tk_tblock_type(tb.as.value.stmts, tb.as.value.n);
+    tk_sset refs = {0}, bound = {0};
+    for (size_t i = 0; i < lam.nparams; i += 1) sset_add(&bound, lam.params[i].name);
+    lam_collect_block(lam.body, lam.nbody, &refs, &bound);
+    tk_tcapture *caps = NULL; size_t ncap = 0;
+    for (size_t k = 0; k < refs.n; k += 1) {
+        if (sset_has(&bound, refs.p[k])) continue;
+        tk_binding_result b = tk_env_lookup_binding(env, refs.p[k]);
+        if (b.ok && b.as.value.ns.len == 0) {
+            caps = tk_realloc0(caps, (ncap + 1) * sizeof *caps); if (!caps) abort();
+            caps[ncap++] = (tk_tcapture){ refs.p[k], b.as.value.type, b.as.value.type.tag == TK_TYPE_REF };
+        }
+    }
+    tk_free0(refs.p); tk_free0(bound.p);
+    tk_type *ftp = ntp ? tk_alloc(ntp * sizeof *ftp) : NULL;
+    for (size_t i = 0; i < ntp; i += 1) ftp[i] = tparams[i].type;
+    tk_type *rp = tk_alloc(sizeof *rp); if (!rp) abort(); *rp = ret;
+    tk_type ft = { .tag = TK_TYPE_FUNC, .as.func = { ftp, ntp, rp } };
+    tk_tlambda tl = { tparams, ntp, tb.as.value.stmts, tb.as.value.n, caps, ncap, ret, 0 };
+    return xok((tk_texpr){ .tag = TK_TEXPR_LAMBDA, .type = ft, .as.lambda = tl });
+}
+
 // Type an expression flowing into a known EXPECTED type: a struct literal is given that type (so a
 // generic constructor targets its concrete instance); anything else types normally. Mirror of
 // typer.tks::type_value_expected — used at the binding level AND for struct-lit field values (nested).
 tk_texpr_result tk_type_value_expected(tk_expr e, tk_type expected, tk_env env, tk_type_table table) {
     if (e.tag == TK_EXPR_STRUCT_LIT) return tk_type_struct_lit(e.as.struct_lit, expected, env, table);
+    if (e.tag == TK_EXPR_LAMBDA)     return type_lambda(e.as.lambda, expected, env, table);   // (W10) target → param inference
     return tk_typer_expr(e, env, table);
 }
 
@@ -1116,6 +1210,7 @@ static tk_texpr_result type_dispatch(tk_expr e, tk_env env, tk_type_table table)
         case TK_EXPR_INTERP:       return type_interp(e.as.interp, env, table);          // $"…{expr}…"
         case TK_EXPR_IN:           return type_in(e.as.in_expr, env, table);            // <expr> in [ … ] (Phase 2)
         case TK_EXPR_ARRAY:        return type_array_lit(e.as.array, env, table);       // [ e0, e1, … ] (Increment B+)
+        case TK_EXPR_LAMBDA:       return type_lambda(e.as.lambda, (tk_type){ .tag = TK_TYPE_VOID }, env, table);   // (W10) no target → un-annotated params error (ruling 3)
     }
     return xerr("unknown expression");
 }

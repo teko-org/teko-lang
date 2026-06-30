@@ -102,7 +102,7 @@ fn mono_inst_concat(a: []MonoInst, b: []MonoInst) -> []MonoInst {
 // expressible as a single TypeExpr in phase-1 (a generic param can only bind to such via
 // a future S6) — they fall back to a Named placeholder so a TypeExpr is always produced.
 // (C: type_to_texpr.)
-fn type_to_texpr(t: Type) -> parser::TypeExpr {
+pub fn type_to_texpr(t: Type) -> parser::TypeExpr {   // (W10) pub: codegen synthesizes lifted-lambda fn params from resolved Types
     match t {
         Prim as p     => mono_named_texpr(prim_name(p.kind))
         Str           => mono_named_texpr("str")
@@ -373,6 +373,16 @@ fn mono_texpr(e: TExpr, s: Subst, items: []TItem, table: TypeTable) -> WExpr | e
                 i++
             }
             WExpr { expr = TExpr { kind = TArrayLit { elements = elems }; type = nt; line = e.line; col = e.col }; insts = acc }
+        }
+        TLambda as lam => {   // (W10) substitute through param/capture/ret types + mono the body
+            let wb = match mono_block(lam.body, s, items, table) { WBlock as w => w; error as er => return er }
+            mut nps: []TLambdaParam = teko::list::empty()
+            mut pi = 0
+            loop { if pi >= lam.params.len { break }; nps = teko::list::push(nps, TLambdaParam { name = lam.params[pi].name; type = subst_type(lam.params[pi].type, s) }); pi++ }
+            mut ncaps: []TCapture = teko::list::empty()
+            mut ci = 0
+            loop { if ci >= lam.captures.len { break }; ncaps = teko::list::push(ncaps, TCapture { name = lam.captures[ci].name; type = subst_type(lam.captures[ci].type, s); by_ref = lam.captures[ci].by_ref }); ci++ }
+            WExpr { expr = TExpr { kind = TLambda { params = nps; body = wb.stmts; captures = ncaps; ret = subst_type(lam.ret, s); lift_id = lam.lift_id }; type = nt; line = e.line; col = e.col }; insts = wb.insts }
         }
     }
 }

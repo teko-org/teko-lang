@@ -17,6 +17,7 @@
 #include "parse_path.h"    // parse_path
 #include "parse_type.h"    // parse_type_primary (cast target)
 #include "parse_lit.h"     // tk_lit_int, tk_lit_byte
+#include "parse_stmt.h"    // (W10) no_type, tk_parse_block (closure params + body)
 #include "cursor.h"        // tk_has_token, tk_is_kind_at, tk_is_sep, tk_skip_seps
 #include "optokens.h"      // tk_is_unary, tk_is_shift, …
 #include "ast.h"           // tk_box_expr, tk_exprs_push, tk_strvec_push, tk_terms_push
@@ -193,11 +194,72 @@ static tk_parsed_result parse_interp(const tk_token *t, size_t n, size_t pos) {
     return (tk_parsed_result){ .ok = true, .as.value = { .node = e, .next = pos + 1 } };
 }
 
+// (W10) lambda lookahead: with `pos` at `(`, scan to the MATCHING `)` (paren-balanced) and report
+// whether a `=>` follows — distinguishes a closure literal `(x) => …` from a parenthesized expr.
+static bool lambda_ahead(const tk_token *t, size_t n, size_t pos) {
+    size_t depth = 0;
+    for (size_t p = pos; p < n; p += 1) {
+        tk_token_kind k = t[p].kind;
+        if (k == TK_TOKEN_LPAREN) depth += 1;
+        else if (k == TK_TOKEN_RPAREN) {
+            depth -= 1;
+            if (depth == 0) return tk_is_kind_at(t, n, p + 1, TK_TOKEN_FATARROW);
+        }
+    }
+    return false;
+}
+
+// (W10) a closure literal `(params) => expr` / `(params) => { … }` — `pos` is at `(`. Each param is
+// `name` or `name: type` (type OPTIONAL). The body is a block or a single expression (one ExprStmt).
+static tk_parsed_result parse_lambda(const tk_token *t, size_t n, size_t pos) {
+    tk_lambda_param *params = NULL; size_t nparams = 0;
+    size_t p = pos + 1;
+    if (tk_is_kind_at(t, n, p, TK_TOKEN_RPAREN)) {
+        p += 1;
+    } else {
+        for (;;) {
+            if (!tk_is_name_at(t, n, p))
+                return (tk_parsed_result){ .ok = false, .as.error = tk_err_at(t, n, p, "expected a closure parameter name") };
+            tk_str nm = t[p].text;
+            bool hasty = false; tk_type_expr ty = no_type(); size_t q = p + 1;
+            if (tk_is_kind_at(t, n, q, TK_TOKEN_COLON)) {
+                tk_parsed_type_result tr = tk_parse_type(t, n, q + 1);
+                if (!tr.ok) return (tk_parsed_result){ .ok = false, .as.error = tr.as.error };
+                hasty = true; ty = tr.as.value.node; q = tr.as.value.next;
+            }
+            tk_lambda_params_push(&params, &nparams, (tk_lambda_param){ .name = nm, .has_type = hasty, .type_ann = ty });
+            p = q;
+            if (tk_is_kind_at(t, n, p, TK_TOKEN_COMMA)) { p += 1; continue; }
+            if (tk_is_kind_at(t, n, p, TK_TOKEN_RPAREN)) { p += 1; break; }
+            return (tk_parsed_result){ .ok = false, .as.error = tk_err_at(t, n, p, "expected ',' or ')' in a closure parameter list") };
+        }
+    }
+    if (!tk_is_kind_at(t, n, p, TK_TOKEN_FATARROW))
+        return (tk_parsed_result){ .ok = false, .as.error = tk_err_at(t, n, p, "expected '=>' after a closure parameter list '(params) => …'") };
+    p += 1;
+    tk_statement *body = NULL; size_t nbody = 0;
+    if (tk_is_kind_at(t, n, p, TK_TOKEN_LBRACE)) {
+        tk_parsed_block_result blk = tk_parse_block(t, n, p);
+        if (!blk.ok) return (tk_parsed_result){ .ok = false, .as.error = blk.as.error };
+        body = blk.as.value.items; nbody = blk.as.value.n; p = blk.as.value.next;
+    } else {
+        tk_parsed_result e = parse_expr_a(t, n, p, true);
+        if (!e.ok) return e;
+        tk_stmts_push(&body, &nbody, (tk_statement){ .tag = TK_STMT_EXPR, .as.expr_stmt = { .expr = e.as.value.node } });
+        p = e.as.value.next;
+    }
+    tk_expr lam = tk_at((tk_expr){ .tag = TK_EXPR_LAMBDA, .as.lambda = { .params = params, .nparams = nparams, .body = body, .nbody = nbody } }, t, pos);
+    return (tk_parsed_result){ .ok = true, .as.value = { .node = lam, .next = p } };
+}
+
 static tk_parsed_result parse_atom(const tk_token *t, size_t n, size_t pos, bool as_) {
     if (!tk_has_token(t, n, pos)) {
         return (tk_parsed_result){ .ok = false, .as.error = tk_err_at(t, n, pos, "expected an expression") };
     }
     tk_token_kind k = t[pos].kind;
+    if (k == TK_TOKEN_LPAREN && lambda_ahead(t, n, pos)) {
+        return parse_lambda(t, n, pos);   // (W10) a closure literal beats the grouping branch below
+    }
     if (k == TK_TOKEN_NUMBER) {
         tk_str txt = t[pos].text;
         tk_expr e;
