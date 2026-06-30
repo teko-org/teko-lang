@@ -55,6 +55,11 @@ tk_str tk_str_slice_from(tk_str s, uint64_t start);
 uint64_t tk_str_len(tk_str s);
 bool tk_str_ends_with(tk_str s, tk_str suffix);
 bool tk_str_contains(tk_str s, tk_str needle);
+// chars/len_chars builtins (ROUND 0 UTF-8). tk_slice_char must be declared before tk_str_chars.
+typedef struct { uint8_t *ptr; uint64_t len; } tk_char;  // mirrors teko_rt.h
+typedef struct { tk_char *ptr; uint64_t len; } tk_slice_char;
+tk_slice_char tk_str_chars(tk_str s);
+uint64_t      tk_str_len_chars(tk_str s);
 void teko__assert__is_true(bool c);
 void teko__assert__is_false(bool c);
 void teko__assert__str_contains(tk_str hay, tk_str needle);
@@ -750,6 +755,35 @@ static bool try_builtin_call(tk_path p, const tk_texpr *args, size_t nargs,
     if (seg_is(last, "len")) {
         tk_value s = tk_vm_eval_expr(&args[0], env);
         *out = v_int(tk_str_len(s.as.s), false, 64); return true;
+    }
+    // chars — (str) -> []char. Split a str into a list of char values (each a tk_str slice into
+    // the source). In the VM, a char value is a TK_VAL_STR (mirrors TK_TEXPR_CHAR → v_str).
+    // Uses the same codepoint-boundary logic as tk_str_chars in the runtime.
+    if (seg_is(last, "chars")) {
+        if (nargs != 1) vm_unsupported("chars expects exactly one argument (a str)");
+        tk_value sv = tk_vm_eval_expr(&args[0], env);
+        if (sv.tag != TK_VAL_STR) vm_unsupported("chars on a non-str value (internal: checker should reject)");
+        tk_str s = sv.as.s;
+        tk_slice_char slc = tk_str_chars(s);
+        tk_value list = v_list_empty();
+        for (uint64_t i = 0; i < slc.len; i += 1) {
+            tk_char ch = slc.ptr[i];
+            // copy the codepoint bytes into a fresh owned str (borrowing into `s` is unsafe
+            // if `s` is a transient VM buffer; a copy keeps VM memory sound).
+            tk_byte *buf = tk_alloc(ch.len ? ch.len : 1);
+            if (ch.len) memcpy(buf, ch.ptr, ch.len);
+            list = v_list_push(list.as.list, v_str((tk_str){ buf, ch.len }));
+        }
+        free(slc.ptr);
+        *out = list; return true;
+    }
+    // len_chars — (str) -> i64. Count UTF-8 codepoints without allocation.
+    if (seg_is(last, "len_chars")) {
+        if (nargs != 1) vm_unsupported("len_chars expects exactly one argument (a str)");
+        tk_value sv = tk_vm_eval_expr(&args[0], env);
+        if (sv.tag != TK_VAL_STR) vm_unsupported("len_chars on a non-str value (internal: checker should reject)");
+        uint64_t n = tk_str_len_chars(sv.as.s);
+        *out = v_int((unsigned __int128)n, true, 64); return true;
     }
     if (seg_is(last, "ends_with")) {
         tk_value a = tk_vm_eval_expr(&args[0], env), b = tk_vm_eval_expr(&args[1], env);

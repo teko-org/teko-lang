@@ -1706,6 +1706,8 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
                     else if (seg_is(last, "slice_to"))    builtin = "tk_str_slice_to";   // (str,u64) -> str
                     else if (seg_is(last, "slice_from"))  builtin = "tk_str_slice_from"; // (str,u64) -> str
                     else if (seg_is(last, "len"))         builtin = "tk_str_len";        // (str) -> u64
+                    else if (seg_is(last, "chars"))       builtin = "tk_str_chars";      // (str) -> []char
+                    else if (seg_is(last, "len_chars"))   builtin = "tk_str_len_chars";  // (str) -> i64
                     else if (seg_is(last, "ends_with"))   builtin = "tk_str_ends_with";  // (str,str) -> bool
                     else if (seg_is(last, "contains"))    builtin = "tk_str_contains";   // (str,str) -> bool
                     // (last_index_of returns u64|error → lifted by emit_host_ffi above, not here)
@@ -4498,7 +4500,10 @@ static bool cg_emit_types_ordered(cbuf *b, tk_tprogram prog, const char **err) {
     if (set.len + set.vlen > 0) cb(b, "\n");
 
     // 2) SLICE typedefs first (pointer-only; their named elements already have forward typedefs).
+    // tk_slice_char is pre-declared in teko_rt.h (the `chars` builtin's return type) — skip it to
+    // avoid a duplicate-typedef compile error in generated programs that call chars().
     for (size_t i = 0; i < set.slen; i += 1) {
+        if (set.slices[i].tag == TK_TYPE_CHAR) continue;   // pre-declared in teko_rt.h as tk_slice_char
         cb(b, "typedef struct { ");
         if (!emit_type(b, set.slices[i], err)) { CG_ORDERED_FREE(); return false; }
         cb(b, " *ptr; uint64_t len; } ");

@@ -228,6 +228,46 @@ uint32_t tk_char_to_u32(tk_char c) {
          |  (uint32_t)(c.ptr[3] & 0x3F);
 }
 
+// utf8_lead_len — byte width of a UTF-8 sequence starting with lead byte b0.
+// Returns 1 for ASCII (b0 < 0x80), 2 for 0xC0–0xDF, 3 for 0xE0–0xEF, 4 for 0xF0–0xF7.
+// Any other byte (continuation or invalid) is treated as 1 (graceful degradation).
+static size_t utf8_lead_len(uint8_t b0) {
+    if (b0 < 0x80) return 1;
+    if (b0 < 0xC0) return 1;   // continuation byte — malformed; consume as 1
+    if (b0 < 0xE0) return 2;
+    if (b0 < 0xF0) return 3;
+    return 4;
+}
+
+// tk_str_len_chars — count UTF-8 codepoints in s (no allocation).
+uint64_t tk_str_len_chars(tk_str s) {
+    uint64_t count = 0;
+    size_t i = 0;
+    while (i < s.len) {
+        i += utf8_lead_len(s.ptr[i]);
+        count += 1;
+    }
+    return count;
+}
+
+// tk_str_chars — split s into a malloc'd array of tk_char, one per UTF-8 codepoint.
+// Each tk_char borrows INTO s.ptr (no copy of codepoint bytes).
+tk_slice_char tk_str_chars(tk_str s) {
+    uint64_t count = tk_str_len_chars(s);
+    tk_char *arr = malloc((count ? count : 1) * sizeof *arr);
+    if (arr == NULL) tk_panic("out of memory (chars)");
+    uint64_t ci = 0;
+    size_t i = 0;
+    while (i < s.len) {
+        size_t w = utf8_lead_len(s.ptr[i]);
+        if (i + w > s.len) w = s.len - i;   // clamp if bytes run short
+        arr[ci] = (tk_char){ (uint8_t *)(s.ptr + i), (uint64_t)w };
+        ci += 1;
+        i  += w;
+    }
+    return (tk_slice_char){ arr, count };
+}
+
 // tk_str_concat3 — a ++ b ++ c via two tk_str_concat steps. Each step allocates a fresh
 // owned buffer (the intermediate a++b is leaked — M.5 short-lived).
 tk_str tk_str_concat3(tk_str a, tk_str b, tk_str c) {

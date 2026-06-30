@@ -184,6 +184,15 @@ tk_str tk_one_byte(tk_byte c);
 // tk_char_to_u32 — decode a `char` (its 1–4 UTF-8 bytes) to the scalar codepoint value. The bytes
 // are valid UTF-8 by construction (the lexer validated the literal), so this is a pure decode.
 uint32_t tk_char_to_u32(tk_char c);
+// tk_str_len_chars — count UTF-8 codepoints in s. Walks the byte sequence using lead-byte widths;
+// no allocation, no copy. (The `len_chars` builtin lowers to this.)
+uint64_t tk_str_len_chars(tk_str s);
+// tk_str_chars — split s into a heap-allocated array of tk_char (one per UTF-8 codepoint).
+// Each tk_char.ptr borrows INTO s.ptr (no copy of the codepoint bytes); the outer array is
+// malloc'd. Returns {ptr, len} where len == tk_str_len_chars(s). OOM panics (M.1).
+// (The `chars` builtin lowers to this; the generated C holds the result as tk_slice_char.)
+typedef struct { tk_char *ptr; uint64_t len; } tk_slice_char;
+tk_slice_char tk_str_chars(tk_str s);
 // tk_str_concat3 — a ++ b ++ c in a fresh owned buffer (two tk_str_concat steps).
 tk_str tk_str_concat3(tk_str a, tk_str b, tk_str c);
 // tk_ftoa — x rendered as %.17g float text (exact binary64 round-trip) in a fresh str.

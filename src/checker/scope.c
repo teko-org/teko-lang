@@ -150,6 +150,8 @@ tk_type_result tk_builtin_fn(tk_str name) {
     static tk_type f64_t  = { .tag = TK_TYPE_PRIM, .as.prim = TK_PRIM_F64 };
     static tk_type byte_elem = { .tag = TK_TYPE_BYTE };
     static tk_type bytes_t = { .tag = TK_TYPE_SLICE, .as.slice.element = &byte_elem };  // []byte
+    static tk_type char_elem = { .tag = TK_TYPE_CHAR };
+    static tk_type char_slice_t = { .tag = TK_TYPE_SLICE, .as.slice.element = &char_elem };  // []char
     static tk_type slice_p[3] = { { .tag = TK_TYPE_STR }, { .tag = TK_TYPE_PRIM, .as.prim = TK_PRIM_U64 }, { .tag = TK_TYPE_PRIM, .as.prim = TK_PRIM_U64 } };
     static tk_type str3_t[3]  = { { .tag = TK_TYPE_STR }, { .tag = TK_TYPE_STR }, { .tag = TK_TYPE_STR } };
     static tk_type str_u64_p[2] = { { .tag = TK_TYPE_STR }, { .tag = TK_TYPE_PRIM, .as.prim = TK_PRIM_U64 } };  // (str, u64)
@@ -188,6 +190,14 @@ tk_type_result tk_builtin_fn(tk_str name) {
     #undef TK_BFN
     if (name_is(name, "len")) {                                       // str::len(str) -> u64
         tk_type ft = { .tag = TK_TYPE_FUNC, .as.func = { .params = &str_t, .nparams = 1, .ret = &u64_t } };
+        return (tk_type_result){ .ok = true, .as.value = ft };
+    }
+    if (name_is(name, "chars")) {                                     // str::chars(str) -> []char
+        tk_type ft = { .tag = TK_TYPE_FUNC, .as.func = { .params = &str_t, .nparams = 1, .ret = &char_slice_t } };
+        return (tk_type_result){ .ok = true, .as.value = ft };
+    }
+    if (name_is(name, "len_chars")) {                                 // str::len_chars(str) -> i64
+        tk_type ft = { .tag = TK_TYPE_FUNC, .as.func = { .params = &str_t, .nparams = 1, .ret = &i64_t } };
         return (tk_type_result){ .ok = true, .as.value = ft };
     }
     if (name_is(name, "ends_with")) {                                 // str::ends_with(str, str) -> bool

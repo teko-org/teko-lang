@@ -575,6 +575,49 @@ fn try_str_builtin(callee: parser::Path, args: []checker::TExpr, env: Venv) -> V
     if last == "slice_to"    { return teko::slice_to(as_str(ev_val(args[0], env)), as_int(ev_val(args[1], env)) to u64) }
     if last == "slice_from"  { return teko::slice_from(as_str(ev_val(args[0], env)), as_int(ev_val(args[1], env)) to u64) }
     if last == "len"         { return teko::len(as_str(ev_val(args[0], env))) }
+    // len_chars — (str) -> i64. Count UTF-8 codepoints. Computed inline (avoids a recursive
+    // builtin call; teko::len_chars is registered in scope.c but calling it here is circular
+    // in the .tks engine). Uses the same lead-byte heuristic as tk_str_len_chars.
+    if last == "len_chars" {
+        let lcs = as_str(ev_val(args[0], env))
+        let lc_slen = teko::len(lcs)
+        mut lc_count: u64 = 0
+        mut lc_i: u64 = 0
+        loop {
+            if lc_i >= lc_slen { break }
+            let lc_bb = lcs[lc_i] to u64
+            let lc_bw: u64 = if lc_bb < 0x80 to u64 { 1 to u64 } else if lc_bb < 0xC0 to u64 { 1 to u64 } else if lc_bb < 0xE0 to u64 { 2 to u64 } else if lc_bb < 0xF0 to u64 { 3 to u64 } else { 4 to u64 }
+            lc_i = if lc_i + lc_bw > lc_slen { lc_slen } else { lc_i + lc_bw }
+            lc_count = lc_count + 1
+        }
+        return lc_count to i64
+    }
+    // chars — (str) -> []char. Build a []Value of str (one per UTF-8 codepoint).
+    // Char values are represented as str in the VM (TK_TEXPR_CHAR → v_str in vm.c).
+    // We split inline on codepoint boundaries using the same lead-byte heuristic as
+    // tk_str_chars in the runtime. VM caveat: multibyte literals may arrive split;
+    // this degrades gracefully (each raw byte becomes a 1-element codepoint slice).
+    if last == "chars" {
+        let s = as_str(ev_val(args[0], env))
+        let slen = teko::len(s)
+        mut char_list: []Value = teko::list::empty()
+        mut ci: u64 = 0
+        loop {
+            if ci >= slen { break }
+            // determine lead-byte width
+            let b0 = s[ci] to u64
+            let w: u64 = if b0 < 0x80 to u64 { 1 to u64 }
+                         else if b0 < 0xC0 to u64 { 1 to u64 }   // continuation — degrade
+                         else if b0 < 0xE0 to u64 { 2 to u64 }
+                         else if b0 < 0xF0 to u64 { 3 to u64 }
+                         else { 4 to u64 }
+            let end = if ci + w > slen { slen } else { ci + w }
+            let cp_str: str = teko::slice(s, ci, end)
+            char_list = teko::list::push(char_list, cp_str)
+            ci = end
+        }
+        return char_list
+    }
     if last == "ends_with"   { return teko::ends_with(as_str(ev_val(args[0], env)), as_str(ev_val(args[1], env))) }
     if last == "contains"    { return teko::contains(as_str(ev_val(args[0], env)), as_str(ev_val(args[1], env))) }
     // str_* prefixed aliases — teko::runtime::str_* forms (last segment = "str_eq", "str_len", etc.).
