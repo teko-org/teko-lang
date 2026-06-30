@@ -386,6 +386,8 @@ static bool extern_type_ok(tk_type t, tk_type_table table) {
     return false;
 }
 // C7.2: teko_rt speaks Teko's own internal ABI — str/[]str/variant/optional are legal there.
+// Named is also allowed: user-defined structs in teko-native namespaces (e.g. teko::time's
+// DateTime/Date/…) are passed by value using their generated C struct layout (SUPREME RULE).
 static bool teko_rt_type_ok(tk_type t) {
     if (t.tag == TK_TYPE_STR || t.tag == TK_TYPE_VOID) return true;
     if (t.tag == TK_TYPE_PRIM || t.tag == TK_TYPE_BYTE
@@ -393,6 +395,7 @@ static bool teko_rt_type_ok(tk_type t) {
     if (t.tag == TK_TYPE_SLICE)    return true;   // []str, []byte, etc.
     if (t.tag == TK_TYPE_VARIANT)  return true;   // str | error
     if (t.tag == TK_TYPE_OPTIONAL) return true;   // error?
+    if (t.tag == TK_TYPE_NAMED)    return true;   // user struct (e.g. DateTime, Date) — layout-matched
     return false;
 }
 

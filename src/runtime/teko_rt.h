@@ -305,6 +305,32 @@ tk_str *tk_rt_args(uint64_t *n);
 // (C7.1f) the host OS name: "macos"/"linux"/"windows"/"unknown" (teko::os; per-OS resolution + `#os`).
 tk_str tk_rt_os(void);
 
+// ---- Date/Time placeholder types (ROUND 0) ----
+// Five value types: DateTime (signed ns since Unix epoch), TimeSpan (signed ns duration),
+// Time (ns since midnight), Date (days since 1970-01-01 = 0), DateTimeOffset (DateTime + offset).
+// DateTime.ticks is i128 (signed) so DateTime - DateTime always fits in TimeSpan (i128).
+typedef struct { __int128  ticks;                         } tk_datetime;
+typedef struct { __int128  ticks;                         } tk_timespan;
+typedef struct { uint64_t  ticks;                         } tk_time;
+typedef struct { int32_t   days;                          } tk_date;
+typedef struct { __int128  ticks; int16_t offset_minutes; } tk_datetimeoffset;
+
+tk_datetime       tk_rt_datetime_now(void);
+tk_datetimeoffset tk_rt_datetime_local_now(void);
+tk_date           tk_rt_date_today(void);
+tk_time           tk_rt_time_now_utc(void);
+tk_timespan       tk_rt_timespan_from_ns(int64_t ns);
+tk_date           tk_rt_date_from_days(int32_t days);
+
+__int128 tk_rt_datetime_to_unix_ns(tk_datetime dt);
+int32_t  tk_rt_date_year(tk_date d);
+int32_t  tk_rt_date_month(tk_date d);
+int32_t  tk_rt_date_day_of_month(tk_date d);
+int32_t  tk_rt_time_hour(tk_time t);
+int32_t  tk_rt_time_minute(tk_time t);
+int32_t  tk_rt_time_second(tk_time t);
+int16_t  tk_rt_dto_offset_minutes(tk_datetimeoffset dto);
+
 // D3 — TEST-COVERAGE SINK. A host side-channel (like print's buffer / args), so the VM can
 // record which production functions executed during a `teko test` run WITHOUT a Teko
 // module-mutable (M.0). The VM marks a function's id (its source line) on entry; the runner

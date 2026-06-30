@@ -28,6 +28,7 @@
 #include <sys/stat.h> // mkdir — teko::fs::mkdir (build output dir)
 #endif
 #include <errno.h>    // errno/EEXIST — mkdir idempotence
+#include <time.h>     // clock_gettime, localtime_r, CLOCK_REALTIME — teko::time ROUND 0
 
 // (C1.9 / E4) NATIVE STACK TRACES. A generated Teko program links this runtime; on a panic (M.1)
 // or a fatal signal (a bug in generated code), print a backtrace to stderr — the frames carry the
@@ -1039,3 +1040,141 @@ double tk_int_to_float(__int128 v, bool sgn) {
 }
 uint64_t tk_f64_bits(double x)      { uint64_t b; memcpy(&b, &x, sizeof b); return b; }
 double   tk_f64_from_bits(uint64_t bits) { double x; memcpy(&x, &bits, sizeof x); return x; }
+
+// ============================================================================
+// teko::time  ROUND 0 — Date/Time placeholder types
+// Five value structs:  DateTime / TimeSpan / Time / Date / DateTimeOffset.
+// All ticks in nanoseconds; Date in days since 1970-01-01 (= day 0).
+// DateTime.ticks is signed (__int128) so (dt_a - dt_b) always fits in TimeSpan.
+// ============================================================================
+
+// --- helpers ---
+
+// POSIX-only: return nanoseconds since Unix epoch as a signed i128.
+// Windows branch uses FILETIME (100-ns ticks since 1601-01-01).
+static __int128 tk_time_now_ns(void) {
+#if defined(_WIN32)
+    FILETIME ft;
+    GetSystemTimePreciseAsFileTime(&ft);
+    uint64_t w = ((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+    // Subtract Windows epoch offset (1601-01-01 → 1970-01-01 = 116444736000000000 × 100ns ticks).
+    w -= (uint64_t)116444736000000000ULL;
+    return (__int128)w * 100;  // 100-ns ticks → nanoseconds
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (__int128)(int64_t)ts.tv_sec * 1000000000LL + (int64_t)ts.tv_nsec;
+#endif
+}
+
+#define TK_NS_PER_DAY   ((uint64_t)86400ULL * 1000000000ULL)
+
+// Gregorian calendar from a days-since-epoch value (Julian Day Number algorithm).
+// Based on the Richards (2013) algorithm; handles negative days (pre-1970 dates).
+static void tk_jdn_to_ymd(int32_t days, int32_t *y, int32_t *m, int32_t *d_out) {
+    int64_t jdn = (int64_t)days + 2440588LL;  // JDN of 1970-01-01 = 2440588
+    int64_t f = jdn + 1401LL + (((4LL * jdn + 274277LL) / 146097LL) * 3LL / 4LL) - 38LL;
+    int64_t e = 4LL * f + 3LL;
+    int64_t g = (e % 1461LL) / 4LL;
+    int64_t h = 5LL * g + 2LL;
+    *d_out = (int32_t)((h % 153LL) / 5LL + 1LL);
+    *m     = (int32_t)((h / 153LL + 2LL) % 12LL + 1LL);
+    *y     = (int32_t)(e / 1461LL - 4716LL + (14LL - (int64_t)*m) / 12LL);
+}
+
+// --- constructors ---
+
+tk_datetime tk_rt_datetime_now(void) {
+    return (tk_datetime){ .ticks = tk_time_now_ns() };
+}
+
+tk_datetimeoffset tk_rt_datetime_local_now(void) {
+    __int128 ns = tk_time_now_ns();
+    int16_t offset_min = 0;
+#if defined(_WIN32)
+    TIME_ZONE_INFORMATION tzi;
+    GetTimeZoneInformation(&tzi);
+    // Windows Bias is minutes west of UTC; negate to get east (positive = ahead of UTC).
+    offset_min = -(int16_t)tzi.Bias;
+#else
+    time_t now = (time_t)(ns / 1000000000LL);
+    struct tm loc;
+    localtime_r(&now, &loc);
+    offset_min = (int16_t)(loc.tm_gmtoff / 60);
+#endif
+    return (tk_datetimeoffset){ .ticks = ns, .offset_minutes = offset_min };
+}
+
+tk_date tk_rt_date_today(void) {
+    __int128 ns = tk_time_now_ns();
+    // Days since epoch: divide signed ns by ns-per-day.
+    // Use floor division (towards -inf) so negative ns (pre-1970) maps correctly.
+    int64_t ns64 = (int64_t)(ns / 1000000000LL);  // seconds
+    int32_t days;
+    if (ns64 >= 0) {
+        days = (int32_t)((uint64_t)ns64 / 86400ULL);
+    } else {
+        // floor division for negative seconds
+        days = (int32_t)(((int64_t)ns64 - 86399LL) / 86400LL);
+    }
+    return (tk_date){ .days = days };
+}
+
+tk_time tk_rt_time_now_utc(void) {
+    __int128 ns = tk_time_now_ns();
+    // Time-of-day: ns modulo one day, always non-negative.
+    uint64_t day_ns = TK_NS_PER_DAY;
+    // For positive ns: straightforward modulo.
+    // For negative ns (pre-1970): C % is truncated, adjust to positive.
+    int64_t ns64 = (int64_t)(ns % (__int128)day_ns);
+    if (ns64 < 0) ns64 += (int64_t)day_ns;
+    return (tk_time){ .ticks = (uint64_t)ns64 };
+}
+
+tk_timespan tk_rt_timespan_from_ns(int64_t ns) {
+    return (tk_timespan){ .ticks = (__int128)ns };
+}
+
+tk_date tk_rt_date_from_days(int32_t days) {
+    return (tk_date){ .days = days };
+}
+
+// --- accessors ---
+
+__int128 tk_rt_datetime_to_unix_ns(tk_datetime dt) {
+    return dt.ticks;
+}
+
+int32_t tk_rt_date_year(tk_date d) {
+    int32_t y, m, dd;
+    tk_jdn_to_ymd(d.days, &y, &m, &dd);
+    return y;
+}
+
+int32_t tk_rt_date_month(tk_date d) {
+    int32_t y, m, dd;
+    tk_jdn_to_ymd(d.days, &y, &m, &dd);
+    return m;
+}
+
+int32_t tk_rt_date_day_of_month(tk_date d) {
+    int32_t y, m, dd;
+    tk_jdn_to_ymd(d.days, &y, &m, &dd);
+    return dd;
+}
+
+int32_t tk_rt_time_hour(tk_time t) {
+    return (int32_t)(t.ticks / 3600000000000ULL);
+}
+
+int32_t tk_rt_time_minute(tk_time t) {
+    return (int32_t)((t.ticks % 3600000000000ULL) / 60000000000ULL);
+}
+
+int32_t tk_rt_time_second(tk_time t) {
+    return (int32_t)((t.ticks % 60000000000ULL) / 1000000000ULL);
+}
+
+int16_t tk_rt_dto_offset_minutes(tk_datetimeoffset dto) {
+    return dto.offset_minutes;
+}
