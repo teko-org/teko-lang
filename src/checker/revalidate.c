@@ -158,6 +158,7 @@ tk_check_result tk_validate_texpr(const tk_texpr *te) {
             }
             return cok();
         }
+        case TK_TEXPR_LAMBDA: return cok();   // (W10) the closure body was checked at type_lambda; trust it here
     }
     return cfail("corrupt: unknown typed expression");
 }

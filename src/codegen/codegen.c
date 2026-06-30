@@ -22,6 +22,7 @@
 #include "../lexer/token.h"   // tk_token_kind operator kinds
 #include "../parser/ast.h"    // tk_bind_kind, tk_bind_target, tk_path
 #include "../checker/escape.h" // MEM Step 1 — the escape check (frame-local classification)
+#include "../checker/monomorph.h" // (W10) tk_type_to_texpr — synthesize lifted-lambda fn params
 
 #include <stdlib.h>           // malloc/realloc/free
 #include <string.h>           // memcpy, strlen
@@ -642,21 +643,74 @@ static bool emit_type(cbuf *b, tk_type t, const char **err) {
     return fail_node(err, "codegen: unknown type not yet supported");
 }
 
-// (W10a) the C function-pointer SIGNATURE for a closure call's cast: `R (*)(A, B)`. Built from the
-// callee's resolved Func type so `((R(*)(A,B))f.fn)(args)` invokes the code pointer with the right
-// ABI. Empty params → `(void)`. (Teko twin: cg_emit_fnptr_sig.)
-static bool cg_emit_fnptr_sig(cbuf *b, tk_type t, const char **err) {
+static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err);   // (W10) fwd — used by emit_closure_call
+static void cb_ident(cbuf *b, tk_str name);                            // (W10) fwd — used by emit_closure_call/emit_lambda
+
+// (W10) the C function-pointer SIGNATURE for a closure call's cast: `R (*)(A, B)`. Built from the
+// callee's resolved Func type. `with_env` prepends a leading `void *` (the env-first ABI of a
+// CAPTURING closure). Empty params → `(void)`. (Teko twin: cg_emit_fnptr_sig_ex.)
+static bool cg_emit_fnptr_sig_ex(cbuf *b, tk_type t, bool with_env, const char **err) {
     if (t.tag != TK_TYPE_FUNC) return fail_node(err, "codegen: closure call on a non-function type (internal)");
     if (!emit_type(b, *t.as.func.ret, err)) return false;
     cb(b, " (*)(");
-    if (t.as.func.nparams == 0) { cb(b, "void"); }
+    bool first = true;
+    if (with_env) { cb(b, "void *"); first = false; }
+    if (t.as.func.nparams == 0) { if (first) cb(b, "void"); }
     else {
         for (size_t i = 0; i < t.as.func.nparams; i += 1) {
-            if (i > 0) cb(b, ", ");
+            if (!first) cb(b, ", ");
+            first = false;
             if (!emit_type(b, t.as.func.params[i], err)) return false;
         }
     }
     cb(b, ")");
+    return true;
+}
+static bool cg_emit_fnptr_sig(cbuf *b, tk_type t, const char **err) { return cg_emit_fnptr_sig_ex(b, t, false, err); }
+
+// (W10) emit a CLOSURE CALL through a `tk_closure` value as a GNU statement-expression that evaluates
+// each argument ONCE and DISPATCHES on `env`: a NON-capturing/named-fn closure (env == NULL) uses the
+// no-env ABI `R(params)`; a CAPTURING closure (env != NULL) uses the env-first ABI `R(void*, params)`.
+static bool emit_closure_call(cbuf *b, const tk_texpr *e, const char **err) {
+    tk_path p = e->as.call.callee;
+    tk_str nm = p.segments[p.len - 1].name;
+    cb(b, "({ ");
+    for (size_t j = 0; j < e->as.call.nargs; j += 1) {
+        if (!emit_type(b, e->as.call.args[j].type, err)) return false;
+        char tmp[32]; snprintf(tmp, sizeof tmp, " _tca%zu = ", j); cb(b, tmp);
+        if (!emit_expr(b, &e->as.call.args[j], err)) return false;
+        cb(b, "; ");
+    }
+    cb(b, "tk_closure _tcf = ");
+    cb_ident(b, nm);
+    cb(b, "; _tcf.env ? ((");
+    if (!cg_emit_fnptr_sig_ex(b, e->as.call.callee_type, true, err)) return false;
+    cb(b, ")_tcf.fn)(_tcf.env");
+    for (size_t k = 0; k < e->as.call.nargs; k += 1) { char tmp[32]; snprintf(tmp, sizeof tmp, ", _tca%zu", k); cb(b, tmp); }
+    cb(b, ") : ((");
+    if (!cg_emit_fnptr_sig_ex(b, e->as.call.callee_type, false, err)) return false;
+    cb(b, ")_tcf.fn)(");
+    for (size_t m = 0; m < e->as.call.nargs; m += 1) { if (m > 0) cb(b, ", "); char tmp[32]; snprintf(tmp, sizeof tmp, "_tca%zu", m); cb(b, tmp); }
+    cb(b, "); })");
+    return true;
+}
+
+// (W10) emit a closure LITERAL → a `tk_closure` value. Non-capturing → `(tk_closure){&__tkclo_<id>,
+// NULL}` (the lifted fn is a plain `R(params)`, W10a-compatible). Capturing → allocate + fill the
+// `__tkenv_<id>` env (by-copy value / the Ref pointer for a by_ref capture), then the closure.
+static bool emit_lambda(cbuf *b, const tk_texpr *e, const char **err) {
+    (void)err;
+    const tk_tlambda *lam = &e->as.lambda;
+    char id[32]; snprintf(id, sizeof id, "%llu", (unsigned long long)lam->lift_id);
+    if (lam->ncaptures == 0) {
+        cb(b, "(tk_closure){ (void*)&__tkclo_"); cb(b, id); cb(b, ", (void*)0 }");
+        return true;
+    }
+    cb(b, "({ __tkenv_"); cb(b, id); cb(b, " *_tke = tk_region_alloc(tk_region_root(), sizeof(__tkenv_"); cb(b, id); cb(b, ")); ");
+    for (size_t i = 0; i < lam->ncaptures; i += 1) {
+        cb(b, "_tke->"); cb_ident(b, lam->captures[i].name); cb(b, " = "); cb_ident(b, lam->captures[i].name); cb(b, "; ");
+    }
+    cb(b, "(tk_closure){ (void*)&__tkclo_"); cb(b, id); cb(b, ", (void*)_tke }; })");
     return true;
 }
 
@@ -1668,13 +1722,9 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
                     cb_fn_name(b, e->as.call.call_ns, p.segments[p.len - 1].name);
                 }
             } else if (e->as.call.is_closure_call) {
-                // (W10a) call THROUGH a tk_closure VALUE: `((R(*)(A,B))name.fn)` — the cast restores
-                // the statically-known ABI before invoking the code pointer; the arg list follows.
-                cb(b, "((");
-                if (!cg_emit_fnptr_sig(b, e->as.call.callee_type, err)) return false;
-                cb(b, ")");
-                cb_ident(b, p.segments[p.len - 1].name);
-                cb(b, ".fn)");
+                // (W10) call THROUGH a tk_closure VALUE — a single-eval statement-expression that
+                // dispatches on `env` (no-env ABI for named/non-capturing; env-first for capturing).
+                return emit_closure_call(b, e, err);
             } else {
                 // No resolved namespace (a builtin, or a name not carried) → the bare
                 // (keyword-escaped) last segment.
@@ -2193,6 +2243,7 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
             cb(b, accN); cb(b, "; })");
             return true;
         }
+        case TK_TEXPR_LAMBDA: return emit_lambda(b, e, err);   // (W10) closure literal → tk_closure value
     }
     return fail_node(err, "codegen: unknown expression not yet supported");
 }
@@ -4462,6 +4513,121 @@ static char *cg_format_c(const char *src) {
     return out.ptr;
 }
 
+// (W10) LAMBDA LIFTING (C twin of codegen.tks cg_lift_lambdas). Walks the program, STAMPS each
+// closure literal's `lift_id` IN PLACE (pre-order, so ids match the self-hosted pass), synthesizes a
+// top-level `__tkclo_<id>` fn per NON-capturing lambda (appended to the program — emitted by the
+// normal fn passes), and records capturing lambdas (their env-struct + env-first lifted fn are
+// emitted by cg_emit_lambda_decls). File-static outputs, like g_cg_prog.
+static const tk_tlambda **g_cg_cap_lams = NULL; static size_t g_cg_n_cap_lams = 0;
+
+static tk_str lam_fn_name_c(uint64_t id) {
+    char buf[40]; int n = snprintf(buf, sizeof buf, "__tkclo_%llu", (unsigned long long)id);
+    tk_byte *p = tk_alloc((size_t)n); if (!p) abort(); memcpy(p, buf, (size_t)n);
+    return (tk_str){ p, (size_t)n };
+}
+static void cg_lift_expr(tk_texpr *e, uint64_t *next, tk_tfunction **fns, size_t *nfns);
+static void cg_lift_stmt(tk_tstatement *s, uint64_t *next, tk_tfunction **fns, size_t *nfns);
+static void cg_lift_block(tk_tstatement *stmts, size_t n, uint64_t *next, tk_tfunction **fns, size_t *nfns) {
+    for (size_t i = 0; i < n; i += 1) cg_lift_stmt(&stmts[i], next, fns, nfns);
+}
+static void cg_lift_stmt(tk_tstatement *s, uint64_t *next, tk_tfunction **fns, size_t *nfns) {
+    switch (s->tag) {
+        case TK_TSTMT_BINDING: cg_lift_expr(&s->as.binding.value, next, fns, nfns); break;
+        case TK_TSTMT_ASSIGN:  cg_lift_expr(&s->as.assign.value, next, fns, nfns); break;
+        case TK_TSTMT_RETURN:  if (s->as.ret.has_value) cg_lift_expr(&s->as.ret.value, next, fns, nfns); break;
+        case TK_TSTMT_LOOP:    cg_lift_block(s->as.loop_stmt.body, s->as.loop_stmt.nbody, next, fns, nfns); break;
+        case TK_TSTMT_EXPR:    cg_lift_expr(&s->as.expr_stmt.expr, next, fns, nfns); break;
+        case TK_TSTMT_DEFER:   cg_lift_block(s->as.defer_stmt.body, s->as.defer_stmt.nbody, next, fns, nfns); break;
+        default: break;
+    }
+}
+static void cg_lift_expr(tk_texpr *e, uint64_t *next, tk_tfunction **fns, size_t *nfns) {
+    switch (e->tag) {
+        case TK_TEXPR_LAMBDA: {
+            uint64_t id = (*next)++;
+            e->as.lambda.lift_id = id;
+            cg_lift_block(e->as.lambda.body, e->as.lambda.nbody, next, fns, nfns);   // nested lambdas
+            if (e->as.lambda.ncaptures == 0) {
+                tk_param *ps = NULL; size_t np = 0;
+                for (size_t i = 0; i < e->as.lambda.nparams; i += 1)
+                    tk_params_push(&ps, &np, (tk_param){ e->as.lambda.params[i].name, tk_type_to_texpr(e->as.lambda.params[i].type) });
+                tk_tfunction f = { .name = lam_fn_name_c(id), .params = ps, .nparams = np,
+                                   .return_type = e->as.lambda.ret, .body = e->as.lambda.body, .nbody = e->as.lambda.nbody,
+                                   .vis = TK_VIS_PRIVATE };
+                *fns = tk_realloc0(*fns, (*nfns + 1) * sizeof **fns); if (!*fns) abort();
+                (*fns)[(*nfns)++] = f;
+            } else {
+                g_cg_cap_lams = tk_realloc0(g_cg_cap_lams, (g_cg_n_cap_lams + 1) * sizeof *g_cg_cap_lams); if (!g_cg_cap_lams) abort();
+                g_cg_cap_lams[g_cg_n_cap_lams++] = &e->as.lambda;
+            }
+            break;
+        }
+        case TK_TEXPR_BINARY: cg_lift_expr(e->as.binary.left, next, fns, nfns); cg_lift_expr(e->as.binary.right, next, fns, nfns); break;
+        case TK_TEXPR_UNARY: cg_lift_expr(e->as.unary.operand, next, fns, nfns); break;
+        case TK_TEXPR_COMPARE: cg_lift_expr(e->as.compare.first, next, fns, nfns); for (size_t i = 0; i < e->as.compare.nrest; i += 1) cg_lift_expr(e->as.compare.rest[i].operand, next, fns, nfns); break;
+        case TK_TEXPR_CALL: for (size_t i = 0; i < e->as.call.nargs; i += 1) cg_lift_expr(&e->as.call.args[i], next, fns, nfns); break;
+        case TK_TEXPR_IF: cg_lift_expr(e->as.if_expr.cond, next, fns, nfns); cg_lift_block(e->as.if_expr.then_blk, e->as.if_expr.nthen, next, fns, nfns); if (e->as.if_expr.has_else) cg_lift_block(e->as.if_expr.else_blk, e->as.if_expr.nelse, next, fns, nfns); break;
+        case TK_TEXPR_MATCH: cg_lift_expr(e->as.match_expr.subject, next, fns, nfns); for (size_t i = 0; i < e->as.match_expr.narms; i += 1) cg_lift_block(e->as.match_expr.arms[i].body, e->as.match_expr.arms[i].nbody, next, fns, nfns); break;
+        case TK_TEXPR_CAST: cg_lift_expr(e->as.cast.expr, next, fns, nfns); break;
+        case TK_TEXPR_FIELD_ACCESS: cg_lift_expr(e->as.field_access.receiver, next, fns, nfns); break;
+        case TK_TEXPR_SAFE_FIELD_ACCESS: cg_lift_expr(e->as.safe_field_access.receiver, next, fns, nfns); break;
+        case TK_TEXPR_COALESCE: cg_lift_expr(e->as.coalesce.left, next, fns, nfns); cg_lift_expr(e->as.coalesce.right, next, fns, nfns); break;
+        case TK_TEXPR_STRUCT_INIT: for (size_t i = 0; i < e->as.struct_init.nfields; i += 1) cg_lift_expr(&e->as.struct_init.field_vals[i], next, fns, nfns); break;
+        case TK_TEXPR_INDEX: cg_lift_expr(e->as.index.receiver, next, fns, nfns); cg_lift_expr(e->as.index.index, next, fns, nfns); break;
+        case TK_TEXPR_INTERP: for (size_t i = 0; i < e->as.interp.nholes; i += 1) cg_lift_expr(&e->as.interp.holes[i], next, fns, nfns); break;
+        case TK_TEXPR_IN: cg_lift_expr(e->as.in_expr.lhs, next, fns, nfns); for (size_t i = 0; i < e->as.in_expr.nelems; i += 1) cg_lift_expr(&e->as.in_expr.elems[i], next, fns, nfns); break;
+        case TK_TEXPR_ARRAY: for (size_t i = 0; i < e->as.array.nelements; i += 1) cg_lift_expr(&e->as.array.elements[i], next, fns, nfns); break;
+        default: break;   // leaves
+    }
+}
+// run the lift pass over g_cg_prog: mutate lift_ids, append synthesized non-capturing fns.
+static void cg_lift_program(void) {
+    g_cg_cap_lams = NULL; g_cg_n_cap_lams = 0;
+    uint64_t next = 0; tk_tfunction *fns = NULL; size_t nfns = 0;
+    for (size_t i = 0; i < g_cg_prog.nitems; i += 1) {
+        if (g_cg_prog.items[i].tag == TK_TITEM_FUNCTION)
+            cg_lift_block(g_cg_prog.items[i].as.function.body, g_cg_prog.items[i].as.function.nbody, &next, &fns, &nfns);
+        else if (g_cg_prog.items[i].tag == TK_TITEM_STATEMENT)
+            cg_lift_stmt(&g_cg_prog.items[i].as.statement, &next, &fns, &nfns);
+    }
+    if (nfns == 0) return;
+    tk_titem *ni = tk_realloc0(g_cg_prog.items, (g_cg_prog.nitems + nfns) * sizeof *ni); if (!ni) abort();
+    g_cg_prog.items = ni;
+    for (size_t k = 0; k < nfns; k += 1)
+        g_cg_prog.items[g_cg_prog.nitems++] = (tk_titem){ .tag = TK_TITEM_FUNCTION, .as.function = fns[k] };
+}
+// (W10) emit the env struct + lifted function for each CAPTURING lambda (C twin of cg_emit_lambda_decls).
+// `protos_only` → env typedefs + fn forward declarations; else the full definitions.
+static bool cg_emit_lambda_decls(cbuf *b, bool protos_only, const char **err) {
+    for (size_t li = 0; li < g_cg_n_cap_lams; li += 1) {
+        const tk_tlambda *lam = g_cg_cap_lams[li];
+        char id[32]; snprintf(id, sizeof id, "%llu", (unsigned long long)lam->lift_id);
+        if (protos_only) {
+            cb(b, "typedef struct { ");
+            for (size_t ci = 0; ci < lam->ncaptures; ci += 1) {
+                if (!emit_type(b, lam->captures[ci].type, err)) return false;
+                cb(b, " "); cb_ident(b, lam->captures[ci].name); cb(b, "; ");
+            }
+            cb(b, "} __tkenv_"); cb(b, id); cb(b, ";\n");
+        }
+        if (!emit_type(b, lam->ret, err)) return false;
+        cb(b, " __tkclo_"); cb(b, id); cb(b, "(void *envp");
+        for (size_t pi = 0; pi < lam->nparams; pi += 1) {
+            cb(b, ", "); if (!emit_type(b, lam->params[pi].type, err)) return false; cb(b, " "); cb_ident(b, lam->params[pi].name);
+        }
+        cb(b, ")");
+        if (protos_only) { cb(b, ";\n"); continue; }
+        cb(b, " {\n    __tkenv_"); cb(b, id); cb(b, " *_e = envp;\n");
+        for (size_t ui = 0; ui < lam->ncaptures; ui += 1) {
+            cb(b, "    "); if (!emit_type(b, lam->captures[ui].type, err)) return false;
+            cb(b, " "); cb_ident(b, lam->captures[ui].name); cb(b, " = _e->"); cb_ident(b, lam->captures[ui].name); cb(b, ";\n");
+        }
+        if (!emit_block_tail(b, lam->body, lam->nbody, false, lam->ret, "    ", err)) return false;
+        cb(b, "}\n");
+    }
+    return true;
+}
+
 tk_cstr_result tk_emit_c(tk_tprogram prog) {
     cbuf b = { .ptr = NULL, .len = 0, .cap = 0 };
     const char *err = NULL;
@@ -4469,6 +4635,8 @@ tk_cstr_result tk_emit_c(tk_tprogram prog) {
     // W5b — stash the program so expr emission can find variant decls (the wrap scheme +
     // pattern tag/field computation), mirroring the VM's g_prog. Set once, read-only.
     g_cg_prog = prog;
+    cg_lift_program();   // (W10) stamp lambdas + synthesize lifted functions before emission (in place on g_cg_prog)
+    prog = g_cg_prog;    // pick up the appended lifted functions for the emission loops below
 
     cb(&b, "// generated by teko (F2 backend) — do not edit\n");
     cb(&b, "#include <stdint.h>\n");
@@ -4517,6 +4685,9 @@ tk_cstr_result tk_emit_c(tk_tprogram prog) {
         cb(&b, ";\n");
     }
     cb(&b, "\n");
+    // (W10) capturing lambdas: env-struct typedefs + lifted-fn forward declarations.
+    if (!cg_emit_lambda_decls(&b, true, &err)) { tk_free0(b.ptr); return cg_err(err); }
+    cb(&b, "\n");
 
     // First pass: emit every top-level function. Use-decls/type-decls are handled above.
     for (size_t i = 0; i < prog.nitems; i += 1) {
@@ -4534,6 +4705,8 @@ tk_cstr_result tk_emit_c(tk_tprogram prog) {
                 break;   // virtual-main statements handled in the second pass
         }
     }
+    // (W10) capturing lambdas: the lifted-function DEFINITIONS (env unpack + body).
+    if (!cg_emit_lambda_decls(&b, false, &err)) { tk_free0(b.ptr); return cg_err(err); }
 
     // Second pass: the VIRTUAL-MAIN — the loose top-level statements, in order, become
     // the body of C main(); falling off the end -> `return 0;` (default exit 0).

@@ -119,6 +119,8 @@ static tk_type_expr mono_named_texpr_str(tk_str name) {
     tk_segs_push(&segs, &n, (tk_segment){ .name = name });
     return (tk_type_expr){ .tag = TK_TEXPR_NAMED, .as.named = { .path = { .segments = segs, .len = n }, .args = NULL, .args_len = 0 } };
 }
+static tk_type_expr type_to_texpr(tk_type t);
+tk_type_expr tk_type_to_texpr(tk_type t) { return type_to_texpr(t); }
 static tk_type_expr type_to_texpr(tk_type t) {
     switch (t.tag) {
         case TK_TYPE_PRIM:     return mono_named_texpr(mono_prim_name(t.as.prim));
@@ -362,6 +364,17 @@ static bool mono_texpr(tk_texpr e, tk_subst s, tk_tprogram prog, tk_type_table t
                 if (!mono_texpr(e.as.array.elements[i], s, prog, table, &elems[i], insts, err)) return false;
             r.as.array.elements = elems;
             // is_spread carries over unchanged (already an array of the right length).
+            break;
+        }
+        case TK_TEXPR_LAMBDA: {   // (W10) substitute through param/capture/ret types + mono the body
+            tk_tlambda lam = e.as.lambda;
+            tk_tlambda_param *np = lam.nparams ? tk_alloc(lam.nparams * sizeof *np) : NULL;
+            for (size_t i = 0; i < lam.nparams; i += 1) np[i] = (tk_tlambda_param){ lam.params[i].name, tk_subst_type(lam.params[i].type, s) };
+            tk_tcapture *nc = lam.ncaptures ? tk_alloc(lam.ncaptures * sizeof *nc) : NULL;
+            for (size_t i = 0; i < lam.ncaptures; i += 1) nc[i] = (tk_tcapture){ lam.captures[i].name, tk_subst_type(lam.captures[i].type, s), lam.captures[i].by_ref };
+            tk_tstatement *nb = lam.nbody ? tk_alloc(lam.nbody * sizeof *nb) : NULL;
+            for (size_t i = 0; i < lam.nbody; i += 1) if (!mono_tstmt(lam.body[i], s, prog, table, &nb[i], insts, err)) return false;
+            r.as.lambda.params = np; r.as.lambda.captures = nc; r.as.lambda.body = nb; r.as.lambda.ret = tk_subst_type(lam.ret, s);
             break;
         }
     }

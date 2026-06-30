@@ -12,3 +12,5 @@
 tk_tprogram_result tk_monomorphize(tk_tprogram prog, tk_type_table table);
 
 #endif // TK_CHECK_MONOMORPH_H
+
+tk_type_expr tk_type_to_texpr(tk_type t);   // (W10) codegen synthesizes lifted-lambda fn params from resolved Types

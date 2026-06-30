@@ -182,6 +182,10 @@ static void mark_expr(tk_texpr e, bool escaping, tk_escape_set *acc) {
                 mark_expr(e.as.in_expr.elems[i], escaping, acc);
             return;
         }
+        case TK_TEXPR_LAMBDA:   // (W10) a closure's captures escape with it (sound over-approximation)
+            if (escaping) for (size_t i = 0; i < e.as.lambda.ncaptures; i += 1) *acc = esc_set_add(*acc, e.as.lambda.captures[i].name);
+            return;
+        default: return;
     }
     return;   // unreachable (all tags handled) — fail-soft to the safe (no-mark) result
 }
@@ -345,6 +349,11 @@ static size_t count_reads_expr(tk_texpr e, tk_str name) {
                 n += count_reads_expr(e.as.in_expr.elems[i], name);
             return n;
         }
+        case TK_TEXPR_LAMBDA:   // (W10) a closure reads `name` once if it captures it (body → lifted fn)
+            for (size_t i = 0; i < e.as.lambda.ncaptures; i += 1)
+                if (tk_str_eq(e.as.lambda.captures[i].name, name)) return 1;
+            return 0;
+        default: return 0;
     }
     return 0;
 }
