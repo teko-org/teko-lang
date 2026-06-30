@@ -606,18 +606,25 @@ start until the previous wave's integration gate passes: **build green + VM==nat
 
 ### ⚙️ IMPLEMENTATION PARALLELIZATION (re-derived 2026-06-30 — after the full OOP / DI / async / constraints design)
 
-All design is SETTLED: W10b OOP, DEFARGS, W10c DI, W11 constraints (sans `!`), collections-as-classes, flags, raw-strings, `in`-array, async+concurrency (S8/ASYNC). **Foundations DONE:** closures ✅, generics S4 ✅ (monomorphization), arenas/regions/`Ref`/escape S2 ✅. **Single-owner bottleneck files serialize WITHIN a round:** `lexer`/`cg`/`vm`/`chk`. Design memories: [[teko-oop-w10b-design]] · [[teko-default-args-named-call]] · [[teko-w10c-di-design]] · [[teko-generics-constraints-rules]] · [[teko-collections-rulings]] · [[teko-async-concurrency-design]].
+All design is SETTLED: W10b OOP, DEFARGS, W10c DI, W11 constraints (sans `!`), collections-as-classes, flags, complete strings (raw/multiline/`char`/UTF-8 — model in TEKO_LEGISLATION.md), `in`-array, async+concurrency (S8/ASYNC). **Foundations DONE:** closures ✅, generics S4 ✅ (monomorphization), arenas/regions/`Ref`/escape S2 ✅. **Single-owner bottleneck files serialize WITHIN a round:** `lexer`/`cg`/`vm`/`chk`. Design memories: [[teko-oop-w10b-design]] · [[teko-default-args-named-call]] · [[teko-w10c-di-design]] · [[teko-generics-constraints-rules]] · [[teko-collections-rulings]] · [[teko-async-concurrency-design]].
 
-**🚪 GATE (serial, FIRST) — Lexer + AST tokens.** New keywords `class abstract virtual override self base intern flags async await`; annotations `#inject #wire #singleton #scoped #transient`; `@` (DI key qualifier AND raw-string `@"…"`, disambiguated by lookahead). Compiler-known TYPES `LazyRef` `Intent` (NOT keywords). Everything below depends on this.
+**🚪 GATE (serial, FIRST) — Lexer + AST tokens.** New keywords `class abstract virtual override self base intern flags async await`; annotations `#inject #wire #singleton #scoped #transient`; string delimiters `@"…"` (raw/verbatim) + `"""…"""` (multi-line). **The `@` COLLISION (user 2026-06-30 — needs care):** `@` opens BOTH a raw string (`@"…"`) AND a DI key qualifier (`@DbRole::Primary`). The lexer disambiguates by the char AFTER `@`: `@` + `"` → raw string; `@` + identifier/path → DI key. Compiler-known TYPES `LazyRef` `Intent` (NOT keywords). Everything below depends on this.
 
 **🟢 ROUND 1 — independent features (PARALLEL; each its own lexer→checker→cg→vm pipeline):**
 - **DEFARGS** (default-args + named-call) — prereq for OOP "no overloading" (no new token, `=`).
 - **flags** — self-contained (`flags` kw).
-- **raw strings** `@"…"` — small, self-contained.
 - **`in` operator** (array-only) — self-contained.
 - **W11/S6 constraints** (positive + `(A&B)|C`, **NO `!`**) — checker/generics; independent of OOP.
 - **OOP A1** (method model: receiver = 1st untyped param; struct=value/immutable, class=auto-`Ref`) — the OOP foundation.
 - **arena-tree extension** (S2 parent-ptr + per-arena `type→instance` registry) — runtime/codegen; needed later by DI `#scoped`.
+
+**🟢 ROUND STR — COMPLETE STRING SUPPORT (independent; PARALLEL with Rounds 1–3; only needs the lexer GATE).** The string MODEL is already legislated — see **TEKO_LEGISLATION.md** (§51 string-prefixes seed/evolution; §195–221 UTF-8 / `char = []byte` / `str_from_utf8`); this round IMPLEMENTS the remaining surface, not re-designs it. Scope = everything string that is "→ evolution" in the legislation:
+- **Raw / verbatim string `@"…"`** (ignore escapes; `""` → one `"`). NOTE the `@` collision with the DI key qualifier (see GATE — `@"` = raw string, `@Ident` = DI key).
+- **Multi-line string `"""…"""`**.
+- **`char = []byte`** — the VARIABLE UTF-8 codepoint (alpha-native, a zero-copy view of one codepoint's bytes): codepoint **iteration**, **classification**, and the numeric codepoint via an **explicit** conversion (a fixed `char` is REJECTED — it would lie about a 1–4-byte codepoint).
+- **UTF-8 encoding / multibyte** — `str` as a sequence of codepoints over compact UTF-8 octets; `str_from_utf8(bytes) -> str | error`; codepoint-aware operations (length-in-codepoints vs bytes, indexing, slicing on codepoint boundaries).
+- *(interpolation `$"…"` one-level + literal `{{` are SEED-DONE — not in scope here.)*
+*(deps: lexer GATE for `@"`/`"""` delimiters; otherwise independent of OOP/DI/async)* | `lexer`,`P`,`ast`,`chk`,`cg`,`vm`,`src/text/`
 
 **🟢 ROUND 2 — OOP backbone (needs A1):** **B2** statics/factories · **CLASS** (kinds, inheritance, virtual/override/abstract, base-binding) · **IF** interfaces · **B5** composition (folds into A1). *(DEFARGS feeds CLASS factories.)*
 
@@ -634,7 +641,7 @@ All design is SETTLED: W10b OOP, DEFARGS, W10c DI, W11 constraints (sans `!`), c
 
 **🟢 ROUND 6 — finalize (LAST):** **quality sweep** (DRY/KISS/SOLID + comment-hygiene, whole corpus). *(W16 byte-identity DROPPED — obviated by the native backend; gen-2==gen-3 already holds.)*
 
-**Critical path:** GATE → A1 → CLASS/IF → C2 → DI → S8. W11 constraints join at D2; collections gate `env` and feed async types. **Widest parallelism:** Rounds 1, 3, 4, and the async sub-parts in Round 5.
+**Critical path:** GATE → A1 → CLASS/IF → C2 → DI → S8. W11 constraints join at D2; collections gate `env` and feed async types. **ROUND STR runs off to the side** (only needs the GATE; independent of the OOP/DI/async chain — can overlap Rounds 1–5 entirely). **Widest parallelism:** Rounds 1, STR, 3, 4, and the async sub-parts in Round 5.
 
 ### DEFERRED · BLOCKED · KNOWN LIMITATIONS (the single consolidated list — everything `⏸️`/`🚧`/`⚠️`)
 
