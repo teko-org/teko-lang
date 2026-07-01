@@ -240,6 +240,8 @@ static tk_bytes write_typebody(tk_bytes b, tk_strtable t, tk_type_body tb) {
             }
             return b;
         }
+        case TK_BODY_CLASS:   // (W10b.CLASS) fields only — methods not yet serialized (same gap as struct methods)
+            return write_fields(tk_write_u8(b, 6), t, tb.as.class_body.fields, tb.as.class_body.n_fields);
     }
     return b;
 }

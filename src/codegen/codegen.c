@@ -4159,6 +4159,26 @@ static bool emit_type_decl(cbuf *b, tk_type_decl d, const char **err) {
             mangle_type_name(b, ns, d.name);
             cb(b, ";\n\n");
             return true;
+        case TK_BODY_CLASS: {
+            // (W10b.CLASS increment 1) same C representation as a struct — same field layout,
+            // no inheritance/arena-per-object yet.
+            tk_class_body cb2 = d.body.as.class_body;
+            cb(b, "typedef struct ");
+            mangle_type_name(b, ns, d.name);
+            cb(b, " {\n");
+            for (size_t i = 0; i < cb2.n_fields; i += 1) {
+                cb(b, "    ");
+                if (!emit_type_expr(b, cb2.fields[i].type_ann, err)) return false;
+                cb(b, " ");
+                if (cg_field_boxed(d.name, cb2.fields[i].type_ann)) cb(b, "*");
+                cb_str(b, cb2.fields[i].name);
+                cb(b, ";\n");
+            }
+            cb(b, "} ");
+            mangle_type_name(b, ns, d.name);
+            cb(b, ";\n\n");
+            return true;
+        }
     }
     return fail_node(err, "codegen: unknown type body not yet supported");
 }

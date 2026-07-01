@@ -173,6 +173,22 @@ fn parse_function(tokens: []lexer::Token, pos: u64, is_test: bool, os_guard: str
         vis = Visibility::Exp
         p = p + 1
     }
+    // (W10b.CLASS, 2026-07-01) `intern` widens reach to "also visible to inheritors" — combines
+    // WITH the vis above, not a 4th tier; meaningful only inside a class body, but parsed
+    // universally (harmless elsewhere, matching how `pub`/`exp` parse even where meaningless).
+    mut is_intern = false
+    if is_kind_at(tokens, p, lexer::TokenKind::Intern) {
+        is_intern = true
+        p = p + 1
+    }
+    // Method modifiers — meaningful only inside a class body (inheritance, W10b.CLASS increment
+    // 2+); parsed universally here so a top-level `fn` grammar never needs to special-case them.
+    mut is_abstract = false
+    mut is_virtual = false
+    mut is_override = false
+    if is_kind_at(tokens, p, lexer::TokenKind::Abstract) { is_abstract = true; p = p + 1 }
+    else if is_kind_at(tokens, p, lexer::TokenKind::Virtual) { is_virtual = true; p = p + 1 }
+    else if is_kind_at(tokens, p, lexer::TokenKind::Override) { is_override = true; p = p + 1 }
     mut is_extern = false                                // C7.1a: `extern fn …` (foreign, no body)
     if is_kind_at(tokens, p, lexer::TokenKind::Extern) {
         is_extern = true
@@ -227,13 +243,13 @@ fn parse_function(tokens: []lexer::Token, pos: u64, is_test: bool, os_guard: str
             p = p + 1
         }
         let no_body: []Statement = teko::list::empty()
-        return Parsed<Decl> { node = Function { name = name; type_params = tps.names; type_constraints = tps.constraints; params = params.items; has_return = has_return; return_type = return_type; body = no_body; vis = vis; has_doc = has_doc; doc = doc; line = name_line; col = name_col; is_test = is_test; is_extern = true; c_symbol = c_symbol; from_lib = from_lib; os_guard = os_guard }; next = p }
+        return Parsed<Decl> { node = Function { name = name; type_params = tps.names; type_constraints = tps.constraints; params = params.items; has_return = has_return; return_type = return_type; body = no_body; vis = vis; has_doc = has_doc; doc = doc; line = name_line; col = name_col; is_test = is_test; is_extern = true; c_symbol = c_symbol; from_lib = from_lib; os_guard = os_guard; is_intern = is_intern; is_abstract = is_abstract; is_virtual = is_virtual; is_override = is_override }; next = p }
     }
     if !is_kind_at(tokens, p, lexer::TokenKind::LBrace) {
         return err_at(tokens, p, "expected '{' for the function body")
     }
     let blk = match parse_block(tokens, p) { ParsedList<Statement> as x => x; error as e => return e }
-    Parsed<Decl> { node = Function { name = name; type_params = tps.names; type_constraints = tps.constraints; params = params.items; has_return = has_return; return_type = return_type; body = blk.items; vis = vis; has_doc = has_doc; doc = doc; line = name_line; col = name_col; is_test = is_test; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = os_guard }; next = blk.next }
+    Parsed<Decl> { node = Function { name = name; type_params = tps.names; type_constraints = tps.constraints; params = params.items; has_return = has_return; return_type = return_type; body = blk.items; vis = vis; has_doc = has_doc; doc = doc; line = name_line; col = name_col; is_test = is_test; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = os_guard; is_intern = is_intern; is_abstract = is_abstract; is_virtual = is_virtual; is_override = is_override }; next = blk.next }
 }
 
 // `{ name: T; name: T; … }` — field list; `;`/newline separates; empty `{ }` allowed;
@@ -274,7 +290,7 @@ fn parse_fields(tokens: []lexer::Token, pos: u64) -> ParsedStructBody | error {
                 return err_at(tokens, p + 1, "expected ':' after a field name")
             }
             let ty = match parse_type(tokens, p + 2) { ParsedType as x => x; error as e => return e }
-            fields = teko::list::push(fields, Field { name = name; type_ann = ty.node })
+            fields = teko::list::push(fields, Field { name = name; type_ann = ty.node; vis = Visibility::Pub; is_intern = false })
             p = ty.next
         }
         if is_kind_at(tokens, p, lexer::TokenKind::RBrace) { break }

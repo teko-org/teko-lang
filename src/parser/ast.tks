@@ -143,19 +143,50 @@ pub type Function = struct {
     c_symbol:    str                                    // the C symbol it binds (valid iff is_extern)
     from_lib:    str                                    // the providing library ("" = implicit libc; valid iff is_extern)
     os_guard:    str                                    // a `#os("…")` conditional-compile guard ("" = all OSes; C7.1f)
+    is_intern:   bool                                   // (W10b.CLASS, 2026-07-01) visible to inheritors (combines WITH vis, not a 4th tier); struct members always false
+    is_abstract: bool                                   // `abstract fn` — signature only, no body (abstract classes only)
+    is_virtual:  bool                                   // `virtual fn` — overridable by a derived class
+    is_override: bool                                   // `override fn` — overrides a base virtual/abstract method
 }
-pub type Field       = struct { name: str; type_ann: TypeExpr }
 // (OOP A1, 2026-07-01) methods = interleaved `fn` decls in the struct body (unified method
 // model): each Function's 1st param has_type=false ⇒ an INSTANCE method (the receiver, name
 // free, by-value-copy immutable, type injected by the checker as the enclosing struct); no
 // untyped 1st param ⇒ STATIC (no receiver). Struct members (fields + methods) stay ALL PUBLIC.
 pub type StructBody  = struct { fields: []Field; methods: []Function }
+// (W10b.CLASS, 2026-07-01) a field's REACH: `vis` is the usual Private/Pub/Exp; `is_intern`
+// widens it to "also visible to inheritors" (orthogonal, not a 4th Visibility tier — see
+// Visibility's own doc). A struct's Field always carries vis=Pub/is_intern=false (struct members
+// stay all-public per W10b.0.A); only class-body fields actually vary these.
+pub type Field       = struct { name: str; type_ann: TypeExpr; vis: Visibility; is_intern: bool }
 pub type EnumBody    = struct { members: []str }            // member names, in order
 pub type FlagsBody   = struct { members: []str; values: []u128 }   // member names + power-of-2 values (C8.3 assigns member i → 1<<i; C8.6 serializes)
 pub type VariantBody = struct { type_expr: TypeExpr }       // a union (A.8)
 pub type AliasBody   = struct { alias: TypeExpr }           // `type Name = <type-expr>` — a TRANSPARENT alias (self-host parity)
 pub type ExternBody  = struct { }                           // `extern type Name` — an OPAQUE foreign handle (C7.1a; lowers to `void *`)
-pub type TypeBody    = variant StructBody | EnumBody | FlagsBody | VariantBody | AliasBody | ExternBody   // pub: TypeDecl.body surface + the .tkb codec (C7.16)
+// (W10b.CLASS, 2026-07-01) a class's KIND — Teko INVERTS the usual default: SEALED (final,
+// instantiable, NOT inheritable) is the DEFAULT (bare `class`); `abstract class` = inheritable,
+// NOT instantiable; `virtual class` = instantiable AND inheritable.
+pub type ClassKind = enum { Sealed; Abstract; Virtual }
+// `type C = <kind> [Base] [(binding)] [& I1 & I2 …] { fields; methods }`. `has_base`/`base_name`/
+// `has_base_binding`/`base_binding_name` — AT MOST one base class (must itself be Abstract or
+// Virtual — enforced by the checker, not the parser); the binding name is how INSTANCE methods
+// reach the base object (`parent.set_name(…)`), omitted when base access isn't needed; there is
+// NO reserved `base` keyword (the binding is just a normal name chosen by the author).
+// `implements: []str` — the `& I1 & I2` list (interface names OR, until W10b.IF lands, ANY
+// nominal TypeDecl — trusted, not conformance-checked yet; mirrors how W11/S6 constraints accept
+// any TypeDecl kind via `constraint_atom_satisfied`'s exact-name fallback). Members (fields +
+// methods) are PRIVATE BY DEFAULT (`pub`/`intern` widen) — the inverse of struct's all-public.
+pub type ClassBody = struct {
+    kind: ClassKind
+    has_base: bool
+    base_name: str
+    has_base_binding: bool
+    base_binding_name: str
+    implements: []str
+    fields: []Field
+    methods: []Function
+}
+pub type TypeBody    = variant StructBody | EnumBody | FlagsBody | VariantBody | AliasBody | ExternBody | ClassBody   // pub: TypeDecl.body surface + the .tkb codec (C7.16)
 pub type TypeDecl    = struct {                             // nominal (B.13)
     name:    str
     type_params: []str                                 // generic type-parameter names (S4 — empty for a non-generic type; e.g. `type Box<T>` → ["T"])

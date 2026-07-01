@@ -177,6 +177,14 @@ tk_parsed_decl_result tk_parse_function(const tk_token *t, size_t n, size_t pos,
     tk_visibility vis = TK_VIS_PRIVATE;                              // default: own-namespace only
     if (tk_is_kind_at(t, n, p, TK_TOKEN_PUB))      { vis = TK_VIS_PUB; p += 1; }
     else if (tk_is_kind_at(t, n, p, TK_TOKEN_EXP)) { vis = TK_VIS_EXP; p += 1; }
+    // (W10b.CLASS, 2026-07-01) `intern` widens reach; method modifiers are meaningful only inside
+    // a class body (inheritance) — parsed universally so a top-level `fn` never special-cases them.
+    bool is_intern = false;
+    if (tk_is_kind_at(t, n, p, TK_TOKEN_INTERN)) { is_intern = true; p += 1; }
+    bool is_abstract = false, is_virtual = false, is_override = false;
+    if (tk_is_kind_at(t, n, p, TK_TOKEN_ABSTRACT)) { is_abstract = true; p += 1; }
+    else if (tk_is_kind_at(t, n, p, TK_TOKEN_VIRTUAL)) { is_virtual = true; p += 1; }
+    else if (tk_is_kind_at(t, n, p, TK_TOKEN_OVERRIDE)) { is_override = true; p += 1; }
     bool is_extern = false;                                          // C7.1a: `extern fn …` (foreign, no body)
     if (tk_is_kind_at(t, n, p, TK_TOKEN_EXTERN)) { is_extern = true; p += 1; }
     if (!tk_is_kind_at(t, n, p, TK_TOKEN_FN)) {
@@ -226,7 +234,7 @@ tk_parsed_decl_result tk_parse_function(const tk_token *t, size_t n, size_t pos,
             .has_return = has_return, .return_type = ret,
             .body = NULL, .nbody = 0,
             .vis = vis, .has_doc = has_doc, .doc = doc, .line = name_line, .col = name_col, .is_test = is_test,
-            .is_extern = true, .c_symbol = c_symbol, .from_lib = from_lib, .os_guard = os_guard };
+            .is_extern = true, .c_symbol = c_symbol, .from_lib = from_lib, .os_guard = os_guard, .is_intern = is_intern, .is_abstract = is_abstract, .is_virtual = is_virtual, .is_override = is_override };
         tk_decl ed = { .tag = TK_DECL_FUNCTION, .as.function = ef };
         return (tk_parsed_decl_result){ .ok = true, .as.value = { .node = ed, .next = p } };
     }
@@ -239,7 +247,8 @@ tk_parsed_decl_result tk_parse_function(const tk_token *t, size_t n, size_t pos,
         .has_return = has_return, .return_type = ret,
         .body = blk.as.value.items, .nbody = blk.as.value.n,
         .vis = vis, .has_doc = has_doc, .doc = doc, .line = name_line, .col = name_col, .is_test = is_test,
-        .is_extern = false, .c_symbol = (tk_str){0}, .from_lib = (tk_str){0}, .os_guard = os_guard };
+        .is_extern = false, .c_symbol = (tk_str){0}, .from_lib = (tk_str){0}, .os_guard = os_guard,
+        .is_intern = is_intern, .is_abstract = is_abstract, .is_virtual = is_virtual, .is_override = is_override };
     tk_decl d = { .tag = TK_DECL_FUNCTION, .as.function = f };
     return (tk_parsed_decl_result){ .ok = true, .as.value = { .node = d, .next = blk.as.value.next } };
 }
@@ -282,7 +291,7 @@ static tk_parsed_struct_body_result parse_fields(const tk_token *t, size_t n, si
             }
             tk_parsed_type_result ty = tk_parse_type(t, n, p + 2);
             if (!ty.ok) { return (tk_parsed_struct_body_result){ .ok = false, .as.error = ty.as.error }; }
-            tk_fields_push(&fields, &nf, (tk_field){ .name = name, .type_ann = ty.as.value.node });
+            tk_fields_push(&fields, &nf, (tk_field){ .name = name, .type_ann = ty.as.value.node, .vis = TK_VIS_PUB, .is_intern = false });
             p = ty.as.value.next;
         }
         if (tk_is_kind_at(t, n, p, TK_TOKEN_RBRACE)) { break; }
