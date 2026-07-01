@@ -1304,8 +1304,12 @@ static tk_texpr_result type_in(tk_in n, tk_env env, tk_type_table table) {
     // so the literal-form gate doesn't reach it. A reference may not be an `in` operand (lhs or set
     // element): the [a, b] set is a value-position collection of refs. Mirror in typer.tks::type_in.
     if (tk_type_contains_ref(&lt)) return xerr("a reference cannot be stored in a struct/variant/collection");
-    tk_texpr *elems = NULL;
-    if (n.nelems > 0) { elems = tk_alloc(n.nelems * sizeof *elems); if (!elems) abort(); }
+    // Allocate `nelems ? nelems : 1` so `elems` is UNCONDITIONALLY non-NULL after the abort guard
+    // (tk_alloc never returns NULL — OOM panics). This makes the non-NULL-ness a constraint on the
+    // POINTER ITSELF that clang-analyzer can see, silencing a false-positive core.NullDereference on
+    // `elems[i]` below (the analyzer does not correlate `elems != NULL` with `i < nelems`). The extra
+    // 1-element alloc when nelems==0 is harmless (the loop never runs). No behavioral change.
+    tk_texpr *elems = tk_alloc((n.nelems ? n.nelems : 1) * sizeof *elems); if (!elems) abort();
     for (size_t i = 0; i < n.nelems; i += 1) {
         tk_texpr_result e = tk_typer_expr(n.elems[i], env, table);
         if (!e.ok) { tk_free0(elems); return e; }
@@ -1332,12 +1336,12 @@ static tk_texpr_result type_in(tk_in n, tk_env env, tk_type_table table) {
 // annotation adopts it. Spread elements (`..xs`) must type as `[]T`; their element type T is widened
 // into the array's unified element type. C twin's mirror: type_array_lit in typer.tks.
 static tk_texpr_result type_array_lit(tk_array_lit a, tk_env env, tk_type_table table) {
-    tk_texpr  *elems    = NULL;
-    bool      *spreads  = NULL;
-    if (a.nelements > 0) {
-        elems   = tk_alloc(a.nelements * sizeof *elems);   if (!elems)   abort();
-        spreads = tk_alloc(a.nelements * sizeof *spreads); if (!spreads) abort();
-    }
+    // `nelements ? nelements : 1` — unconditionally non-NULL after the abort guard, so clang-analyzer
+    // sees `elems`/`spreads` are non-NULL when indexed below (silences a false-positive
+    // core.NullDereference; the analyzer doesn't correlate the pointer with `i < nelements`). Harmless
+    // 1-elem alloc when nelements==0 (loop never runs). No behavioral change.
+    tk_texpr  *elems   = tk_alloc((a.nelements ? a.nelements : 1) * sizeof *elems);   if (!elems)   abort();
+    bool      *spreads = tk_alloc((a.nelements ? a.nelements : 1) * sizeof *spreads); if (!spreads) abort();
     tk_type et = (tk_type){ .tag = TK_TYPE_VOID };   // sentinel for an empty `[]`
     for (size_t i = 0; i < a.nelements; i += 1) {
         tk_texpr_result e = tk_typer_expr(*a.elements[i].expr, env, table);
