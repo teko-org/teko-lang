@@ -69,6 +69,97 @@ fn types_var_and_binary() {
     }
 }
 
+// (2026-07-01) `~` — chain flattening + adjacent-literal constant folding.
+#test
+fn types_tilde_all_literal_folds_to_one_literal() {
+    // "a" ~ "b" ~ "c" — every piece is a literal, so the whole chain collapses to ONE TStrLit
+    // ("abc"), NOT a TCall to concat — zero runtime concat calls.
+    let ab = parser::Binary { op = lexer::TokenKind::Tilde; left = e_str("a"); right = e_str("b") }
+    let abc = parser::Binary { op = lexer::TokenKind::Tilde; left = ek(ab); right = e_str("c") }
+    let t = match type_binary(abc, empty_env(), empty_table()) { TExpr as e => e; error => { teko::assert::is_true(false); return } }
+    match t.kind {
+        TStrLit as s => teko::assert::is_true(s.text == "abc")
+        _ => teko::assert::is_true(false)
+    }
+}
+
+#test
+fn types_tilde_mixed_chain_desugars_to_one_concat_call() {
+    // x ~ "a" ~ "b" ~ y — the middle literal run folds to "ab" FIRST, then the whole 3-piece
+    // chain (x, "ab", y) desugars to ONE concat call, not two nested 2-arg calls.
+    let env = define(empty_env(), "x", Str { }, false)
+    let env2 = define(env, "y", Str { }, false)
+    let xab = parser::Binary { op = lexer::TokenKind::Tilde; left = e_var("x"); right = e_str("a") }
+    let xabb = parser::Binary { op = lexer::TokenKind::Tilde; left = ek(xab); right = e_str("b") }
+    let full = parser::Binary { op = lexer::TokenKind::Tilde; left = ek(xabb); right = e_var("y") }
+    // `concat` (params-variadic) desugars ITS OWN call site too: 3 raw pieces pack into ONE
+    // []str argument (TCall.args.len == 1), whose ArrayLit holds all 3 folded pieces — so the
+    // WHOLE `~` chain still ends up as exactly one runtime concat call either way.
+    let t = match type_binary(full, env2, empty_table()) { TExpr as e => e; error as e => { teko::io::eprintln(e.message); teko::assert::is_true(false); return } }
+    match t.kind {
+        TCall as c => {
+            teko::assert::is_true(c.args.len == 1)
+            match c.args[0].kind {
+                TArrayLit as al => teko::assert::is_true(al.elements.len == 3)   // [x, "ab", y]
+                _ => teko::assert::is_true(false)
+            }
+        }
+        _ => teko::assert::is_true(false)
+    }
+}
+
+#test
+fn types_tilde_rejects_non_str_operand() {
+    let env = define(empty_env(), "n", u32t(), false)
+    let bad = parser::Binary { op = lexer::TokenKind::Tilde; left = e_str("x"); right = e_var("n") }
+    match type_binary(bad, env, empty_table()) {
+        TExpr => teko::assert::is_true(false)
+        error => teko::assert::is_true(true)
+    }
+}
+
+// (2026-07-01) `~` and the FULL string-literal-kind matrix — plain/verbatim/multi-line all
+// decode to a plain StrLit by parse time (no flag leaks), so they fold identically; an
+// interpolated string with a REAL hole cannot fold (runtime-dependent); an interpolated string
+// with ZERO holes ($"…" / $@"…" with nothing to interpolate) is a rare but foldable edge case.
+
+#test
+fn types_tilde_interp_with_a_hole_does_not_fold() {
+    // $"hi {n}" ~ "!" — the interp piece has a REAL hole, so it can't fold into a literal; the
+    // chain still desugars to exactly one concat call (this interp piece + the literal "!").
+    let env = define(empty_env(), "n", Str { }, false)
+    let pieces: []str = teko::list::push(teko::list::push(teko::list::empty(), "hi "), "")
+    let holes: []parser::Expr = teko::list::push(teko::list::empty(), e_var("n"))
+    let interp = ek(parser::Interp { pieces = pieces; holes = holes; specs = teko::list::empty() })
+    let chain = parser::Binary { op = lexer::TokenKind::Tilde; left = interp; right = e_str("!") }
+    let t = match type_binary(chain, env, empty_table()) { TExpr as e => e; error => { teko::assert::is_true(false); return } }
+    match t.kind {
+        TCall as c => {
+            teko::assert::is_true(c.args.len == 1)   // concat's own packing: one []str arg
+            match c.args[0].kind {
+                TArrayLit as al => teko::assert::is_true(al.elements.len == 2)   // [interp-piece, "!"] — NOT folded together
+                _ => teko::assert::is_true(false)
+            }
+        }
+        _ => teko::assert::is_true(false)
+    }
+}
+
+#test
+fn types_tilde_interp_with_zero_holes_folds() {
+    // $"no holes" ~ "-tail" — an interp with NO holes is foldable just like a plain literal:
+    // the whole chain collapses to ONE literal, "no holes-tail".
+    let pieces: []str = teko::list::push(teko::list::empty(), "no holes")
+    let holes: []parser::Expr = teko::list::empty()
+    let interp = ek(parser::Interp { pieces = pieces; holes = holes; specs = teko::list::empty() })
+    let chain = parser::Binary { op = lexer::TokenKind::Tilde; left = interp; right = e_str("-tail") }
+    let t = match type_binary(chain, empty_env(), empty_table()) { TExpr as e => e; error => { teko::assert::is_true(false); return } }
+    match t.kind {
+        TStrLit as s => teko::assert::is_true(s.text == "no holes-tail")
+        _ => teko::assert::is_true(false)
+    }
+}
+
 #test
 fn types_compare_and_unary() {
     let env = define(empty_env(), "x", u32t(), false)
