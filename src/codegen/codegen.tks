@@ -366,6 +366,16 @@ fn cg_find_decl(prog: checker::TProgram, name: str) -> parser::TypeDecl | error 
     error { message = "codegen: no such type decl" }
 }
 
+// (W10b.CLASS increment 3) is `name` a class (as opposed to a struct/enum/…)? A class is a
+// REFERENCE type — every use lowers to a pointer (emit_type_expr), so field access through one
+// needs a deref (`->`, i.e. `(*recv).field`) instead of a struct's plain `.field`.
+fn cg_is_class_named(prog: checker::TProgram, name: str) -> bool {
+    match cg_find_decl(prog, name) {
+        parser::TypeDecl as td => match td.body { parser::ClassBody => true; _ => false }
+        error => false
+    }
+}
+
 // cg_find_function — the top-level FUNCTION `name` in namespace `ns`, or a `not found` error.
 // (For call-arg wrapping — emit_call needs the callee's parameter types to wrap a bare case arg
 // into a variant param via emit_as.) (C: `cg_find_function`, which returned NULL.)
@@ -495,7 +505,7 @@ fn cg_variant_has_member(d: parser::TypeDecl, member: str) -> bool {
 // emit_type — a resolved Type -> C type text. STR -> tk_str; a Named aggregate references
 // its mangled typedef (decl + ref agree via mangle_type_name). The remaining structured
 // types stay the honest "not yet supported" barrier (M.3). (C: `emit_type`.)
-fn emit_type(buf: []byte, t: checker::Type) -> []byte | error {
+fn emit_type(buf: []byte, prog: checker::TProgram, t: checker::Type) -> []byte | error {
     match t {
         checker::Prim as p => emit_prim(buf, p.kind)
         checker::Byte      => cb(buf, "uint8_t")
@@ -523,7 +533,12 @@ fn emit_type(buf: []byte, t: checker::Type) -> []byte | error {
         }
         // W4c — a Named aggregate -> its mangled typedef name (the bare name; resolve
         // drops the namespace). decl + ref agree via mangle_type_name.
-        checker::Named as nm => mangle_type_name(buf, "", nm.name)
+        // (W10b.CLASS increment 3) a CLASS is a REFERENCE type — every use (locals, call-arg
+        // types read off .type, …) lowers to a pointer, same rule as emit_type_expr.
+        checker::Named as nm => {
+            if cg_is_class_named(prog, nm.name) { cb(mangle_type_name(buf, "", nm.name), " *") }
+            else { mangle_type_name(buf, "", nm.name) }
+        }
         // VARIANT (`A | B | …`) — the generated tk_u_<keys> tagged-union struct (B-cg2). Its
         // typedef is stamped in the prelude. A Named variant decl is reached via Named, not here.
         checker::Variant as va => cg_variant_typename(buf, va)
@@ -539,11 +554,11 @@ fn emit_type(buf: []byte, t: checker::Type) -> []byte | error {
         // (S-mem) `ptr<T>` → `<T> *`; opaque ptr (null inner) → `void *`.
         checker::Ptr as p  => match p.inner {
             null               => cb(buf, "void *")
-            checker::Type as t => cb(match emit_type(buf, t) { []byte as o => o; error as e => return e }, " *")
+            checker::Type as t => cb(match emit_type(buf, prog, t) { []byte as o => o; error as e => return e }, " *")
         }
         checker::Uptr      => cb(buf, "uintptr_t")
         // (MEM-1b) Ref<T> → a bare `<T> *` today ("C pointer without `*`/`&`"; struct wrapper waits for W9+ metadata).
-        checker::Reference as r => cb(match emit_type(buf, r.inner) { []byte as o => o; error as e => return e }, " *")
+        checker::Reference as r => cb(match emit_type(buf, prog, r.inner) { []byte as o => o; error as e => return e }, " *")
     }
 }
 
@@ -551,10 +566,10 @@ fn emit_type(buf: []byte, t: checker::Type) -> []byte | error {
 // callee's resolved Func type so `((R(*)(A,B))f.fn)(args)` invokes the code pointer with the right
 // ABI. Empty params → `(void)`. `with_env` prepends a leading `void *` (the env-first ABI used by a
 // CAPTURING closure). (C: `cg_emit_fnptr_sig`.)
-fn cg_emit_fnptr_sig_ex(buf: []byte, t: checker::Type, with_env: bool) -> []byte | error {
+fn cg_emit_fnptr_sig_ex(buf: []byte, prog: checker::TProgram, t: checker::Type, with_env: bool) -> []byte | error {
     match t {
         checker::Func as f => {
-            mut out = match emit_type(buf, f.ret) { []byte as o => o; error as e => return e }
+            mut out = match emit_type(buf, prog, f.ret) { []byte as o => o; error as e => return e }
             out = cb(out, " (*)(")
             mut first = true
             if with_env { out = cb(out, "void *"); first = false }
@@ -566,7 +581,7 @@ fn cg_emit_fnptr_sig_ex(buf: []byte, t: checker::Type, with_env: bool) -> []byte
                     if i >= f.params.len { break }
                     if !first { out = cb(out, ", ") }
                     first = false
-                    out = match emit_type(out, f.params[i]) { []byte as o => o; error as e => return e }
+                    out = match emit_type(out, prog, f.params[i]) { []byte as o => o; error as e => return e }
                     i++
                 }
             }
@@ -575,7 +590,7 @@ fn cg_emit_fnptr_sig_ex(buf: []byte, t: checker::Type, with_env: bool) -> []byte
         _ => error { message = "codegen: closure call on a non-function type (internal)" }
     }
 }
-fn cg_emit_fnptr_sig(buf: []byte, t: checker::Type) -> []byte | error { cg_emit_fnptr_sig_ex(buf, t, false) }
+fn cg_emit_fnptr_sig(buf: []byte, prog: checker::TProgram, t: checker::Type) -> []byte | error { cg_emit_fnptr_sig_ex(buf, prog, t, false) }
 
 // (W10) emit a CLOSURE CALL through a `tk_closure` value as a GNU statement-expression that evaluates
 // each argument ONCE and DISPATCHES on `env`: a NON-capturing closure / named-fn value (env == NULL)
@@ -588,7 +603,7 @@ fn emit_closure_call(buf: []byte, prog: checker::TProgram, ret_type: checker::Ty
     mut j = 0
     loop {
         if j >= c.args.len { break }
-        out = match emit_type(out, c.args[j].type) { []byte as o => o; error as e => return e }
+        out = match emit_type(out, prog, c.args[j].type) { []byte as o => o; error as e => return e }
         out = cb(out, " ")
         out = cb(out, teko::str::concat("_tca", teko::u64_to_str(j to u64)))
         out = cb(out, " = ")
@@ -599,12 +614,12 @@ fn emit_closure_call(buf: []byte, prog: checker::TProgram, ret_type: checker::Ty
     out = cb(out, "tk_closure _tcf = ")
     out = cb_ident(out, nm)
     out = cb(out, "; _tcf.env ? ((")
-    out = match cg_emit_fnptr_sig_ex(out, c.callee_type, true) { []byte as o => o; error as e => return e }
+    out = match cg_emit_fnptr_sig_ex(out, prog, c.callee_type, true) { []byte as o => o; error as e => return e }
     out = cb(out, ")_tcf.fn)(_tcf.env")
     mut k = 0
     loop { if k >= c.args.len { break }; out = cb(out, ", "); out = cb(out, teko::str::concat("_tca", teko::u64_to_str(k to u64))); k++ }
     out = cb(out, ") : ((")
-    out = match cg_emit_fnptr_sig_ex(out, c.callee_type, false) { []byte as o => o; error as e => return e }
+    out = match cg_emit_fnptr_sig_ex(out, prog, c.callee_type, false) { []byte as o => o; error as e => return e }
     out = cb(out, ")_tcf.fn)(")
     mut m = 0
     loop { if m >= c.args.len { break }; if m > 0 { out = cb(out, ", ") }; out = cb(out, teko::str::concat("_tca", teko::u64_to_str(m to u64))); m++ }
@@ -859,6 +874,19 @@ fn emit_type_expr(buf: []byte, prog: checker::TProgram, te: parser::TypeExpr) ->
             // (S4) a generic-type USE `Box<i64>` → the concrete instance typedef `tk_t_Box__g__i64`
             // (the mangled name matches checker::generic_inst_name, so decl + ref agree).
             if nt.args.len > 0 { return mangle_type_name(buf, "", cg_texpr_inst_name(last, nt.args)) }
+            // (W10b.CLASS increment 3) a CLASS is a REFERENCE type (shared identity, arena-per-
+            // object) — every use lowers to a POINTER, unconditionally (unlike a struct, which is
+            // value/by-copy and only boxed at cycle-breaking back-edges — cg_field_boxed). This is
+            // the ONE place that decision fans out from: params, returns, fields, locals all call
+            // emit_type_expr, so a class becomes `tk_t_Name *` everywhere with no special-casing
+            // at each call site.
+            match cg_find_decl(prog, last) {
+                parser::TypeDecl as cd => match cd.body {
+                    parser::ClassBody => return cb(mangle_type_name(buf, "", last), " *")
+                    _ => {}
+                }
+                error => {}
+            }
             // a user-defined named aggregate -> its mangled typedef name (matches emit_type).
             mangle_type_name(buf, "", last)
         }
@@ -1208,7 +1236,7 @@ fn emit_cast(buf: []byte, prog: checker::TProgram, e: checker::TExpr, c: checker
     match inner.type {
         checker::Char => {
             mut out = cb(buf, "((")
-            out = match emit_type(out, e.type) { []byte as o => o; error as err => return err }   // target rides the node's .type
+            out = match emit_type(out, prog, e.type) { []byte as o => o; error as err => return err }   // target rides the node's .type
             out = cb(out, ")tk_char_to_u32(")
             out = match emit_expr_ctx(out, prog, checker::Void { }, inner, escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
             return cb(out, "))")
@@ -1270,7 +1298,7 @@ fn emit_cast(buf: []byte, prog: checker::TProgram, e: checker::TExpr, c: checker
     // Everything else (int->float widen, float->float narrow, widening int->int,
     // same-type) is a lossless-or-precision-allowed plain C cast.
     mut out = cb(buf, "((")
-    out = match emit_type(out, e.type) { []byte as o => o; error as err => return err }   // target rides the node's .type
+    out = match emit_type(out, prog, e.type) { []byte as o => o; error as err => return err }   // target rides the node's .type
     out = cb(out, ")(")
     out = match emit_expr_ctx(out, prog, checker::Void { }, inner, escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
     cb(out, "))")
@@ -1335,16 +1363,16 @@ fn emit_list_push(buf: []byte, prog: checker::TProgram, e: checker::TExpr, c: ch
     // Use emit_as so a sentinel empty() base-arg is lowered to the concrete empty literal.
     out = match emit_as(out, prog, checker::Slice { element = elem }, c.args[0], escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
     out = cb(out, "; ")
-    out = match emit_type(out, elem) { []byte as o => o; error as err => return err }
+    out = match emit_type(out, prog, elem) { []byte as o => o; error as err => return err }
     out = cb(out, " "); out = cb(out, iN); out = cb(out, " = ")
     out = match emit_as(out, prog, elem, c.args[1], escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
     out = cb(out, "; uint64_t "); out = cb(out, lN); out = cb(out, "; ")
-    out = match emit_type(out, elem) { []byte as o => o; error as err => return err }
+    out = match emit_type(out, prog, elem) { []byte as o => o; error as err => return err }
     out = cb(out, " *"); out = cb(out, pN); out = cb(out, " = (")
-    out = match emit_type(out, elem) { []byte as o => o; error as err => return err }
+    out = match emit_type(out, prog, elem) { []byte as o => o; error as err => return err }
     out = cb(out, " *)tk_slice_push("); out = cb(out, bN); out = cb(out, ".ptr, "); out = cb(out, bN); out = cb(out, ".len, &"); out = cb(out, iN)
     out = cb(out, ", sizeof(")
-    out = match emit_type(out, elem) { []byte as o => o; error as err => return err }
+    out = match emit_type(out, prog, elem) { []byte as o => o; error as err => return err }
     out = cb(out, "), &"); out = cb(out, lN); out = cb(out, "); (")
     out = match cg_slice_typename(out, elem) { []byte as o => o; error as err => return err }
     out = cb(out, "){ .ptr = "); out = cb(out, pN); out = cb(out, ", .len = "); out = cb(out, lN); out = cb(out, " }; })")
@@ -1404,7 +1432,7 @@ fn emit_call(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, e: c
         if addr && (pe == "str" || pe == "str_of_bytes") && c.args.len == 1 {
             let sb = $"_sb{buf.len}"
             mut o = cb(buf, "({ ")
-            o = match emit_type(o, c.args[0].type) { []byte as r => r; error as err => return err }
+            o = match emit_type(o, prog, c.args[0].type) { []byte as r => r; error as err => return err }
             o = cb(o, " ")
             o = cb(o, sb)
             o = cb(o, " = ")
@@ -1426,7 +1454,7 @@ fn emit_call(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, e: c
             let ci = $"_ci{buf.len}"
             let ca = $"_ca{buf.len}"
             mut o = cb(buf, "({ ")
-            o = match emit_type(o, c.args[0].type) { []byte as r => r; error as err => return err }
+            o = match emit_type(o, prog, c.args[0].type) { []byte as r => r; error as err => return err }
             o = cb(o, $" {cs} = ")
             o = match emit_expr_ctx(o, prog, checker::Void { }, c.args[0], escaping, regions, fn_body, dctx) { []byte as r => r; error as err => return err }
             o = cb(o, $"; tk_str {ca} = (tk_str){{0,0}}; for (uint64_t {ci} = 0; {ci} < {cs}.len; {ci}++) {{ {ca} = tk_str_concat({ca}, {cs}.ptr[{ci}]); }} {ca}; }})")
@@ -1678,6 +1706,19 @@ fn emit_field_access(buf: []byte, prog: checker::TProgram, fa: checker::TFieldAc
         or = match emit_expr_ctx(or, prog, checker::Void { }, fa.receiver, escaping, regions, fn_body, dctx) { []byte as r => r; error as err => return err }
         return cb(or, "))")
     }
+    // (W10b.CLASS increment 3) a class receiver is ALWAYS a pointer (reference semantics) —
+    // `recv.field` needs a deref first (`(*recv).field`, i.e. C's `recv->field`).
+    let is_class_recv = match fa.receiver.type {
+        checker::Named as nm => cg_is_class_named(prog, nm.name)
+        _ => false
+    }
+    if is_class_recv {
+        mut oc = cb(buf, "((*(")
+        oc = match emit_expr_ctx(oc, prog, checker::Void { }, fa.receiver, escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
+        oc = cb(oc, ")).")
+        oc = cb_str(oc, fa.field)
+        return cb(oc, ")")
+    }
     // auto-box: reading a recursive back-edge field derefs the heap pointer.
     let fa_boxed = match fa.receiver.type {
         checker::Named as nm => match cg_find_struct_field_type(prog, nm.name, fa.field) {
@@ -1701,15 +1742,15 @@ fn emit_field_access(buf: []byte, prog: checker::TProgram, fa: checker::TFieldAc
 fn emit_safe_field_access(buf: []byte, prog: checker::TProgram, e: checker::TExpr, sfa: checker::TSafeFieldAccess, escaping: []str, regions: []RegionFrame, fn_body: []checker::TStatement, dctx: DeferCtx) -> []byte | error {
     let tmp = fresh_named("_o", buf.len to i64)
     mut out = cb(buf, "({ ")
-    out = match emit_type(out, sfa.receiver.type) { []byte as o => o; error as err => return err }
+    out = match emit_type(out, prog, sfa.receiver.type) { []byte as o => o; error as err => return err }
     out = cb(out, " "); out = cb(out, tmp); out = cb(out, " = (")
     out = match emit_expr_ctx(out, prog, checker::Void { }, sfa.receiver, escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
     out = cb(out, "); "); out = cb(out, tmp); out = cb(out, ".present ? (")
-    out = match emit_type(out, e.type) { []byte as o => o; error as err => return err }
+    out = match emit_type(out, prog, e.type) { []byte as o => o; error as err => return err }
     out = cb(out, "){ .present = true, .value = "); out = cb(out, tmp); out = cb(out, ".value.")
     out = cb_str(out, sfa.field)
     out = cb(out, " } : (")
-    out = match emit_type(out, e.type) { []byte as o => o; error as err => return err }
+    out = match emit_type(out, prog, e.type) { []byte as o => o; error as err => return err }
     out = cb(out, "){ .present = false }; })")
     out
 }
@@ -1730,7 +1771,7 @@ fn cg_expr_diverges(e: checker::TExpr) -> bool {
 fn emit_coalesce(buf: []byte, prog: checker::TProgram, e: checker::TExpr, co: checker::TCoalesce, escaping: []str, regions: []RegionFrame, fn_body: []checker::TStatement, dctx: DeferCtx) -> []byte | error {
     let tmp = fresh_named("_c", buf.len to i64)
     mut out = cb(buf, "({ ")
-    out = match emit_type(out, co.left.type) { []byte as o => o; error as err => return err }
+    out = match emit_type(out, prog, co.left.type) { []byte as o => o; error as err => return err }
     out = cb(out, " "); out = cb(out, tmp); out = cb(out, " = (")
     out = match emit_expr_ctx(out, prog, checker::Void { }, co.left, escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
     out = cb(out, "); "); out = cb(out, tmp); out = cb(out, ".present ? ")
@@ -1741,7 +1782,7 @@ fn emit_coalesce(buf: []byte, prog: checker::TProgram, e: checker::TExpr, co: ch
                 checker::Void => { out = cb(out, tmp); out = cb(out, ".value") }
                 _ => {
                     out = cb(out, "(")
-                    out = match emit_type(out, e.type) { []byte as o => o; error as err => return err }
+                    out = match emit_type(out, prog, e.type) { []byte as o => o; error as err => return err }
                     out = cb(out, "){ .present = true, .value = "); out = cb(out, tmp); out = cb(out, ".value }")
                 }
             }
@@ -1755,7 +1796,7 @@ fn emit_coalesce(buf: []byte, prog: checker::TProgram, e: checker::TExpr, co: ch
         out = cb(out, "(")
         out = match emit_expr_ctx(out, prog, checker::Void { }, co.right, escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
         out = cb(out, ", (")
-        out = match emit_type(out, e.type) { []byte as o => o; error as err => return err }
+        out = match emit_type(out, prog, e.type) { []byte as o => o; error as err => return err }
         out = cb(out, "){0})")
     } else {
         out = match emit_as(out, prog, e.type, co.right, escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
@@ -1784,7 +1825,7 @@ fn emit_index(buf: []byte, prog: checker::TProgram, e: checker::TExpr, ix: check
             let lstmp = $"_ls{buf.len}"
             let litmp = $"_li{buf.len + 1}"
             mut so = cb(buf, "({ ")
-            so = match emit_type(so, elem) { []byte as o => o; error as err => return err }
+            so = match emit_type(so, prog, elem) { []byte as o => o; error as err => return err }
             so = cb(so, " const *")
             so = cb(so, lstmp)
             so = cb(so, " = (")
@@ -1807,7 +1848,7 @@ fn emit_index(buf: []byte, prog: checker::TProgram, e: checker::TExpr, ix: check
             so = cb(so, ", ")
             so = cb(so, teko::u64_to_str(e.col to u64))
             so = cb(so, "), (")
-            so = match emit_type(so, elem) { []byte as o => o; error as err => return err }
+            so = match emit_type(so, prog, elem) { []byte as o => o; error as err => return err }
             return cb(so, "){0}); })")
         }
         checker::Str   => { }
@@ -1856,7 +1897,7 @@ fn emit_in(buf: []byte, prog: checker::TProgram, ie: checker::TInExpr, escaping:
     }
     let tmp = $"_inv{buf.len}"
     mut out = cb(buf, "({ ")
-    out = match emit_type(out, ie.lhs.type) { []byte as o => o; error as err => return err }   // the lhs's resolved C type
+    out = match emit_type(out, prog, ie.lhs.type) { []byte as o => o; error as err => return err }   // the lhs's resolved C type
     out = cb(out, " ")
     out = cb(out, tmp)
     out = cb(out, " = ")
@@ -1899,11 +1940,11 @@ fn emit_array_lit(buf: []byte, prog: checker::TProgram, e: checker::TExpr, a: ch
         // fast path: all plain elements — allocate once, fill by index
         let pN = $"_arr{buf.len}"
         mut out = cb(buf, "({ ")
-        out = match emit_type(out, elem) { []byte as o => o; error as err => return err }
+        out = match emit_type(out, prog, elem) { []byte as o => o; error as err => return err }
         out = cb(out, " *"); out = cb(out, pN); out = cb(out, " = malloc(")
         out = cb_u128_digits(out, a.elements.len to u128)
         out = cb(out, " * sizeof(")
-        out = match emit_type(out, elem) { []byte as o => o; error as err => return err }
+        out = match emit_type(out, prog, elem) { []byte as o => o; error as err => return err }
         out = cb(out, ")); if (!"); out = cb(out, pN); out = cb(out, ") abort(); ")
         mut i: u64 = 0
         loop {
@@ -1943,12 +1984,12 @@ fn emit_array_lit(buf: []byte, prog: checker::TProgram, e: checker::TExpr, a: ch
             out = cb(out, "for (uint64_t "); out = cb(out, jN); out = cb(out, " = 0; ")
             out = cb(out, jN); out = cb(out, " < "); out = cb(out, subN); out = cb(out, ".len; ")
             out = cb(out, jN); out = cb(out, "++) { ")
-            out = match emit_type(out, elem) { []byte as o => o; error as err => return err }
+            out = match emit_type(out, prog, elem) { []byte as o => o; error as err => return err }
             out = cb(out, " *"); out = cb(out, spN); out = cb(out, " = (")
-            out = match emit_type(out, elem) { []byte as o => o; error as err => return err }
+            out = match emit_type(out, prog, elem) { []byte as o => o; error as err => return err }
             out = cb(out, "*)tk_slice_push("); out = cb(out, accN); out = cb(out, ".ptr, "); out = cb(out, accN); out = cb(out, ".len, &")
             out = cb(out, subN); out = cb(out, ".ptr["); out = cb(out, jN); out = cb(out, "], sizeof(")
-            out = match emit_type(out, elem) { []byte as o => o; error as err => return err }
+            out = match emit_type(out, prog, elem) { []byte as o => o; error as err => return err }
             out = cb(out, "), &"); out = cb(out, capN); out = cb(out, "); if (!"); out = cb(out, spN); out = cb(out, ") abort(); ")
             out = cb(out, accN); out = cb(out, " = (")
             out = match cg_slice_typename(out, elem) { []byte as o => o; error as err => return err }
@@ -1956,16 +1997,16 @@ fn emit_array_lit(buf: []byte, prog: checker::TProgram, e: checker::TExpr, a: ch
         } else {
             // plain element: evaluate into a temp, push
             let tmpN = $"_sitm{tag}_{i}"
-            out = match emit_type(out, elem) { []byte as o => o; error as err => return err }
+            out = match emit_type(out, prog, elem) { []byte as o => o; error as err => return err }
             out = cb(out, " "); out = cb(out, tmpN); out = cb(out, " = ")
             out = match emit_as(out, prog, elem, ae.expr, escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
             out = cb(out, "; ")
-            out = match emit_type(out, elem) { []byte as o => o; error as err => return err }
+            out = match emit_type(out, prog, elem) { []byte as o => o; error as err => return err }
             out = cb(out, " *"); out = cb(out, spN); out = cb(out, " = (")
-            out = match emit_type(out, elem) { []byte as o => o; error as err => return err }
+            out = match emit_type(out, prog, elem) { []byte as o => o; error as err => return err }
             out = cb(out, "*)tk_slice_push("); out = cb(out, accN); out = cb(out, ".ptr, "); out = cb(out, accN); out = cb(out, ".len, &")
             out = cb(out, tmpN); out = cb(out, ", sizeof(")
-            out = match emit_type(out, elem) { []byte as o => o; error as err => return err }
+            out = match emit_type(out, prog, elem) { []byte as o => o; error as err => return err }
             out = cb(out, "), &"); out = cb(out, capN); out = cb(out, "); if (!"); out = cb(out, spN); out = cb(out, ") abort(); ")
             out = cb(out, accN); out = cb(out, " = (")
             out = match cg_slice_typename(out, elem) { []byte as o => o; error as err => return err }
@@ -2179,7 +2220,49 @@ fn emit_struct_init(buf: []byte, prog: checker::TProgram, e: checker::TExpr, si:
 // function's exit edge — used ONLY for a binding the escape check PROVED frame-local (escape.tks).
 // NESTED struct-inits (field values via emit_expr) stay on root: mixing frame + root in one value
 // is SAFE (root cells just leak), so soundness holds while the frame frees the provable subset.
+//
+// (W10b.CLASS increment 3) a CLASS instance is ARENA-PER-OBJECT: construction allocates a FRESH
+// child region (`tk_region_new`, parented to the enclosing region) and the object itself
+// (`tk_region_alloc`), then copies the ordinary compound-literal value into it — the whole
+// expression's VALUE is the resulting POINTER (reference semantics: shared identity, no copy on
+// bind/pass/return — matches emit_type_expr's unconditional class → pointer lowering). The
+// object's region is a genuine per-object arena; nothing yet drops it independently of whatever
+// ancestor region eventually drops (an honest, scoped-down deferral — see the PR notes).
 fn emit_struct_init_framed(buf: []byte, prog: checker::TProgram, e: checker::TExpr, si: checker::TStructInit, frame: str, escaping: []str, regions: []RegionFrame, fn_body: []checker::TStatement, dctx: DeferCtx) -> []byte | error {
+    let is_class = match e.type {
+        checker::Named as nm => cg_is_class_named(prog, nm.name)
+        _ => false
+    }
+    if is_class {
+        let id = buf.len to i64
+        let rN = fresh_named("_clsr", id)
+        let pN = fresh_named("_clsp", id)
+        mut out = cb(buf, "({ tk_region *")
+        out = cb(out, rN)
+        out = cb(out, " = tk_region_new(")
+        out = cb(out, cg_enclosing_region_expr_framed(regions, frame))
+        out = cb(out, "); ")
+        out = match e.type { checker::Named as nm => mangle_type_name(out, "", nm.name); _ => out }
+        out = cb(out, " *")
+        out = cb(out, pN)
+        out = cb(out, " = tk_region_alloc(")
+        out = cb(out, rN)
+        out = cb(out, ", sizeof(*")
+        out = cb(out, pN)
+        out = cb(out, ")); *")
+        out = cb(out, pN)
+        out = cb(out, " = ")
+        out = match emit_struct_init_literal(out, prog, e, si, frame, escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
+        out = cb(out, "; ")
+        out = cb(out, pN)
+        return cb(out, "; })")
+    }
+    emit_struct_init_literal(buf, prog, e, si, frame, escaping, regions, fn_body, dctx)
+}
+
+// emit_struct_init_literal — the RAW `(tk_t_<Name>){ .f = v, … }` compound literal (unwrapped;
+// used directly for a struct, and as the inner value copied into a class's arena-allocated box).
+fn emit_struct_init_literal(buf: []byte, prog: checker::TProgram, e: checker::TExpr, si: checker::TStructInit, frame: str, escaping: []str, regions: []RegionFrame, fn_body: []checker::TStatement, dctx: DeferCtx) -> []byte | error {
     let name = match e.type {
         checker::Named as nm => nm.name
         // E2-NATIVE: `error { message = s }` → tk_error_make(s); the checker ensures exactly
@@ -2470,7 +2553,7 @@ fn emit_if_value(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, 
     // twin reads the same from its live globals (g_cg_escaping/g_cg_block_stack/g_cg_fn_body).
     let tmp = fresh_tmp_name(buf.len to i64)
     mut out = cb(buf, "({ ")
-    out = match emit_type(out, e.type) { []byte as o => o; error as err => return err }
+    out = match emit_type(out, prog, e.type) { []byte as o => o; error as err => return err }
     out = cb(out, " ")
     out = cb(out, tmp)
     out = cb(out, "; if (")
@@ -2828,9 +2911,9 @@ fn emit_host_ffi(buf: []byte, prog: checker::TProgram, e: checker::TExpr, c: che
         o = cb(o, "s.len); ")
         o = cb(o, t)
         o = cb(o, "r.ok ? (")
-        o = match emit_type(o, e.type) { []byte as r => r; error as err => return err }
+        o = match emit_type(o, prog, e.type) { []byte as r => r; error as err => return err }
         o = cb(o, "){ .present = false } : (")
-        o = match emit_type(o, e.type) { []byte as r => r; error as err => return err }
+        o = match emit_type(o, prog, e.type) { []byte as r => r; error as err => return err }
         // E2-NATIVE: .value is now tk_error; wrap the tk_str .err message via tk_error_make.
         o = cb(o, "){ .present = true, .value = tk_error_make(")
         o = cb(o, t)
@@ -2889,9 +2972,9 @@ fn emit_host_ffi(buf: []byte, prog: checker::TProgram, e: checker::TExpr, c: che
     if kind == "ures" {
         o = cb(o, t)
         o = cb(o, ".ok ? (")
-        o = match emit_type(o, e.type) { []byte as r => r; error as err => return err }
+        o = match emit_type(o, prog, e.type) { []byte as r => r; error as err => return err }
         o = cb(o, "){ .present = false } : (")
-        o = match emit_type(o, e.type) { []byte as r => r; error as err => return err }
+        o = match emit_type(o, prog, e.type) { []byte as r => r; error as err => return err }
         o = cb(o, "){ .present = true, .value = tk_error_make(")
         o = cb(o, t)
         return cb(o, ".err) }; })")
@@ -3015,11 +3098,11 @@ fn emit_as_r(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, expe
                         o = cb(o, " "); o = cb(o, sv); o = cb(o, " = ")
                         o = match emit_expr_ctx(o, prog, ret_type, value, escaping, regions, fn_body, dctx) { []byte as r => r; error as err => return err }
                         o = cb(o, "; ")
-                        o = match emit_type(o, T) { []byte as r => r; error as err => return err }
+                        o = match emit_type(o, prog, T) { []byte as r => r; error as err => return err }
                         o = cb(o, " *"); o = cb(o, rp); o = cb(o, " = (")
-                        o = match emit_type(o, T) { []byte as r => r; error as err => return err }
+                        o = match emit_type(o, prog, T) { []byte as r => r; error as err => return err }
                         o = cb(o, " *)malloc("); o = cb(o, sv); o = cb(o, ".len * sizeof(")
-                        o = match emit_type(o, T) { []byte as r => r; error as err => return err }
+                        o = match emit_type(o, prog, T) { []byte as r => r; error as err => return err }
                         o = cb(o, ")); if ("); o = cb(o, rp); o = cb(o, " == 0 && "); o = cb(o, sv); o = cb(o, ".len) abort(); ")
                         o = cb(o, "for (uint64_t "); o = cb(o, ri); o = cb(o, " = 0; "); o = cb(o, ri); o = cb(o, " < "); o = cb(o, sv); o = cb(o, ".len; "); o = cb(o, ri); o = cb(o, " += 1) { ")
                         o = cb(o, rp); o = cb(o, "["); o = cb(o, ri); o = cb(o, "] = ")
@@ -3583,7 +3666,7 @@ fn emit_arm_value(buf: []byte, prog: checker::TProgram, ret_type: checker::Type,
             if cg_expr_diverges(es.expr) {
                 out = match emit_expr_ctx(out, prog, checker::Void { }, es.expr, escaping, regs2, fn_body, cur) { []byte as o => o; error as err => return err }
                 out = cb(out, ", (")
-                out = match emit_type(out, match_e.type) { []byte as o => o; error as err => return err }
+                out = match emit_type(out, prog, match_e.type) { []byte as o => o; error as err => return err }
                 out = cb(out, "){0}")             // sink's `( … )` closes it
             } else {
                 out = match emit_as_r(out, prog, ret_type, match_e.type, es.expr, escaping, regs2, fn_body, cur) { []byte as o => o; error as err => return err }
@@ -3634,13 +3717,13 @@ fn emit_match_value(buf: []byte, prog: checker::TProgram, ret_type: checker::Typ
     let res  = fresh_named("_r", buf.len to i64 + 1)   // +1 so it differs from subj
     let subjT = m.subject.type   // for optional / variant pattern lowering
     mut out = cb(buf, "({ ")
-    out = match emit_type(out, m.subject.type) { []byte as o => o; error as err => return err }
+    out = match emit_type(out, prog, m.subject.type) { []byte as o => o; error as err => return err }
     out = cb(out, " ")
     out = cb(out, subj)
     out = cb(out, " = (")
     out = match emit_expr_ctx(out, prog, checker::Void { }, m.subject, escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
     out = cb(out, "); ")
-    out = match emit_type(out, e.type) { []byte as o => o; error as err => return err }
+    out = match emit_type(out, prog, e.type) { []byte as o => o; error as err => return err }
     out = cb(out, " ")
     out = cb(out, res)
     out = cb(out, "; do {\n")
@@ -3688,7 +3771,7 @@ fn emit_match_tail(buf: []byte, prog: checker::TProgram, e: checker::TExpr, m: c
     mut out = cb(buf, indent)
     out = cb(out, "{\n")
     out = cb(out, inner)
-    out = match emit_type(out, m.subject.type) { []byte as o => o; error as err => return err }
+    out = match emit_type(out, prog, m.subject.type) { []byte as o => o; error as err => return err }
     out = cb(out, " ")
     out = cb(out, subj)
     out = cb(out, " = (")
@@ -3758,7 +3841,7 @@ fn emit_match_stmt(buf: []byte, prog: checker::TProgram, e: checker::TExpr, m: c
     mut out = cb(buf, indent)
     out = cb(out, "{\n")
     out = cb(out, inner)
-    out = match emit_type(out, m.subject.type) { []byte as o => o; error as err => return err }
+    out = match emit_type(out, prog, m.subject.type) { []byte as o => o; error as err => return err }
     out = cb(out, " ")
     out = cb(out, subj)
     out = cb(out, " = (")
@@ -4347,7 +4430,7 @@ fn emit_binding(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, b
     }
     mut out = cb(buf, indent)
     if b.kind == parser::BindKind::Const { out = cb(out, "const ") }
-    out = match emit_type(out, b.bound) { []byte as o => o; error as err => return err }
+    out = match emit_type(out, prog, b.bound) { []byte as o => o; error as err => return err }
     out = cb(out, " ")
     out = cb_ident(out, name)
     out = cb(out, " = ")
@@ -4580,7 +4663,7 @@ fn emit_stmt(buf: []byte, s: checker::TStatement, in_main: bool, prog: checker::
 fn emit_function_sig(buf: []byte, prog: checker::TProgram, f: checker::TFunction) -> []byte | error {
     mut out = buf
     if f.is_extern { out = cb(out, "extern ") }   // C7.1a: a foreign prototype (no body)
-    out = match emit_type(out, f.return_type) { []byte as o => o; error as err => return err }
+    out = match emit_type(out, prog, f.return_type) { []byte as o => o; error as err => return err }
     out = cb(out, " ")
     if f.is_extern {
         out = cb(out, f.c_symbol)                 // C7.1a: the raw foreign C symbol (NO namespace mangling)
@@ -5133,7 +5216,7 @@ fn cg_te_to_type(te: parser::TypeExpr) -> checker::Type {
 // B-cg2 — emit ONE inline-variant typedef tk_u_<keys> (the SAME tag-enum + tag/union-struct
 // shape as a named variant decl, but keyed off the resolved member types). Members' typedefs
 // (slice/opt) precede it by registration order. (C: `cg_emit_inline_variant_typedef`.)
-fn cg_emit_inline_variant_typedef(buf: []byte, v: checker::Variant) -> []byte | error {
+fn cg_emit_inline_variant_typedef(buf: []byte, prog: checker::TProgram, v: checker::Variant) -> []byte | error {
     // tag enum: typedef enum tk_tag_<keys> { TK_TAG_U_<UPPER keys…>_<UPPER key>, … } tk_tag_<keys>;
     mut out = cb(buf, "typedef enum tk_tag")
     mut a = 0
@@ -5188,7 +5271,7 @@ fn cg_emit_inline_variant_typedef(buf: []byte, v: checker::Variant) -> []byte | 
     loop {
         if m >= v.members.len { break }
         out = cb(out, "        ")
-        out = match emit_type(out, v.members[m]) { []byte as o => o; error as err => return err }
+        out = match emit_type(out, prog, v.members[m]) { []byte as o => o; error as err => return err }
         out = cb(out, " ")
         out = match cg_member_key(out, v.members[m]) { []byte as o => o; error as err => return err }
         out = cb(out, ";\n")
@@ -5460,7 +5543,7 @@ fn cg_emit_types_ordered(buf: []byte, prog: checker::TProgram) -> []byte | error
         match set.slices[k] { Char => { k++; continue }; _ => { } }                  // pre-declared in teko_rt.h as tk_slice_char
         match set.slices[k] { Byte => { k++; continue }; _ => { } }                   // tk_slice_byte pre-declared in teko_rt.h
         out = cb(out, "typedef struct { ")
-        out = match emit_type(out, set.slices[k]) { []byte as o => o; error as err => return err }
+        out = match emit_type(out, prog, set.slices[k]) { []byte as o => o; error as err => return err }
         out = cb(out, " *ptr; uint64_t len; } ")
         out = match cg_slice_typename(out, set.slices[k]) { []byte as o => o; error as err => return err }
         out = cb(out, ";\n")
@@ -5505,7 +5588,7 @@ fn cg_emit_types_ordered(buf: []byte, prog: checker::TProgram) -> []byte | error
                     out = cb(out, "typedef struct ")   // named tag (matches the forward decl) so a pointer to it resolves
                     out = match cg_opt_typename(out, inner) { []byte as o => o; error as err => return err }
                     out = cb(out, " { bool present; ")
-                    out = match emit_type(out, inner) { []byte as o => o; error as err => return err }
+                    out = match emit_type(out, prog, inner) { []byte as o => o; error as err => return err }
                     out = cb(out, " value; } ")
                     out = match cg_opt_typename(out, inner) { []byte as o => o; error as err => return err }
                     out = cb(out, ";\n")
@@ -5538,7 +5621,7 @@ fn cg_emit_types_ordered(buf: []byte, prog: checker::TProgram) -> []byte | error
                 }
                 if !ready { vi++ } else {
                     match vt {
-                        checker::Variant as va => { out = match cg_emit_inline_variant_typedef(out, va) { []byte as o => o; error as err => return err } }
+                        checker::Variant as va => { out = match cg_emit_inline_variant_typedef(out, prog, va) { []byte as o => o; error as err => return err } }
                         _ => { }
                     }
                     em = CgEmitted { names = em.names; opt_keys = em.opt_keys; uvar_keys = teko::list::push(em.uvar_keys, vkey) }
@@ -5853,7 +5936,7 @@ fn cg_emit_lambda_decls(buf: []byte, prog: checker::TProgram, lams: []checker::T
             mut ci = 0
             loop {
                 if ci >= lam.captures.len { break }
-                out = match emit_type(out, lam.captures[ci].type) { []byte as o => o; error as e => return e }
+                out = match emit_type(out, prog, lam.captures[ci].type) { []byte as o => o; error as e => return e }
                 out = cb(out, " ")
                 out = cb_ident(out, lam.captures[ci].name)
                 out = cb(out, "; ")
@@ -5862,13 +5945,13 @@ fn cg_emit_lambda_decls(buf: []byte, prog: checker::TProgram, lams: []checker::T
             out = cb(out, teko::str::concat("} __tkenv_", ids, ";\n"))
         }
         // lifted fn signature: R __tkclo_<id>(void *envp, params)
-        out = match emit_type(out, lam.ret) { []byte as o => o; error as e => return e }
+        out = match emit_type(out, prog, lam.ret) { []byte as o => o; error as e => return e }
         out = cb(out, teko::str::concat(" __tkclo_", ids, "(void *envp"))
         mut pi = 0
         loop {
             if pi >= lam.params.len { break }
             out = cb(out, ", ")
-            out = match emit_type(out, lam.params[pi].type) { []byte as o => o; error as e => return e }
+            out = match emit_type(out, prog, lam.params[pi].type) { []byte as o => o; error as e => return e }
             out = cb(out, " ")
             out = cb_ident(out, lam.params[pi].name)
             pi++
@@ -5883,7 +5966,7 @@ fn cg_emit_lambda_decls(buf: []byte, prog: checker::TProgram, lams: []checker::T
             loop {
                 if ui >= lam.captures.len { break }
                 out = cb(out, "    ")
-                out = match emit_type(out, lam.captures[ui].type) { []byte as o => o; error as e => return e }
+                out = match emit_type(out, prog, lam.captures[ui].type) { []byte as o => o; error as e => return e }
                 out = cb(out, " ")
                 out = cb_ident(out, lam.captures[ui].name)
                 out = cb(out, " = _e->")

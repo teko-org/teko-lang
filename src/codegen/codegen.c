@@ -449,6 +449,14 @@ static const tk_type_decl *cg_find_decl(tk_str name) {
     return NULL;
 }
 
+// (W10b.CLASS increment 3) is `name` a class (as opposed to a struct/enum/…)? A class is a
+// REFERENCE type — every use lowers to a pointer (emit_type_expr), so field access through one
+// needs a deref instead of a struct's plain `.field`.
+static bool cg_is_class_named(tk_str name) {
+    const tk_type_decl *d = cg_find_decl(name);
+    return d != NULL && d->body.tag == TK_BODY_CLASS;
+}
+
 // The top-level FUNCTION `name` in namespace `ns` (for call-arg wrapping — emit_call needs the
 // callee's parameter types to wrap a bare case arg into a variant param via emit_as).
 static const tk_tfunction *cg_find_function(tk_str ns, tk_str name) {
@@ -628,7 +636,12 @@ static bool emit_type(cbuf *b, tk_type t, const char **err) {
             return cg_slice_typename(b, *t.as.slice.element, err);
         // W4c — a named aggregate references its mangled typedef name (decl + ref agree
         // via mangle_type_name). The semantic NAMED carries only the bare name.
-        case TK_TYPE_NAMED:   mangle_type_name(b, (tk_str){ NULL, 0 }, t.as.named.name); return true;
+        // (W10b.CLASS increment 3) a CLASS is a REFERENCE type — every use (locals, call-arg
+        // types read off .type, …) lowers to a pointer, same rule as emit_type_expr.
+        case TK_TYPE_NAMED:
+            mangle_type_name(b, (tk_str){ NULL, 0 }, t.as.named.name);
+            if (cg_is_class_named(t.as.named.name)) cb(b, " *");
+            return true;
         // VARIANT (`A | B | …`) — the generated `tk_u_<keys>` tagged-union struct (B-cg2).
         // Its typedef is stamped in the prelude (cg_emit_optional_typedefs) from every distinct
         // variant the program uses. A NAMED variant decl is reached via TK_TYPE_NAMED, not here.
@@ -943,6 +956,13 @@ static bool emit_type_expr(cbuf *b, tk_type_expr te, const char **err) {
             // (S4) a generic-type USE `Box<i64>` → the concrete instance typedef `tk_t_Box__g__i64`
             // (the mangled name matches checker::generic_inst_name, so decl + ref agree).
             if (te.as.named.args_len > 0) { cb(b, "tk_t_"); cg_texpr_mangle(b, te); return true; }
+            // (W10b.CLASS increment 3) a CLASS is a REFERENCE type (shared identity, arena-per-
+            // object) — every use lowers to a POINTER, unconditionally (unlike a struct, which is
+            // value/by-copy and only boxed at cycle-breaking back-edges — cg_field_boxed). This is
+            // the ONE place that decision fans out from: params, returns, fields, locals all call
+            // emit_type_expr, so a class becomes `tk_t_Name *` everywhere with no special-casing
+            // at each call site.
+            if (cg_is_class_named(last)) { mangle_type_name(b, (tk_str){ NULL, 0 }, last); cb(b, " *"); return true; }
             // a user-defined named aggregate -> its mangled typedef name (matches emit_type).
             mangle_type_name(b, (tk_str){ NULL, 0 }, last);
             return true;
@@ -1884,6 +1904,16 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
                 cb(b, "))");
                 return true;
             }
+            // (W10b.CLASS increment 3) a class receiver is ALWAYS a pointer (reference semantics) —
+            // `recv.field` needs a deref first (`(*recv).field`, i.e. C's `recv->field`).
+            if (rt.tag == TK_TYPE_NAMED && cg_is_class_named(rt.as.named.name)) {
+                cb(b, "((*(");
+                if (!emit_expr(b, e->as.field_access.receiver, err)) return false;
+                cb(b, ")).");
+                cb_str(b, e->as.field_access.field);
+                cb(b, ")");
+                return true;
+            }
             // auto-box: reading a recursive back-edge field derefs the heap pointer.
             bool fa_boxed = false;
             if (rt.tag == TK_TYPE_NAMED) {
@@ -2020,6 +2050,25 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
             }
             if (e->type.tag != TK_TYPE_NAMED)
                 return fail_node(err, "codegen: struct literal with a non-named type not yet supported");
+            // (W10b.CLASS increment 3) a CLASS instance is ARENA-PER-OBJECT: construction
+            // allocates a FRESH child region (tk_region_new, parented to the enclosing region)
+            // and the object itself (tk_region_alloc), then the ordinary compound literal below
+            // is copied into it — the whole expression's VALUE is the resulting POINTER
+            // (reference semantics: shared identity, no copy on bind/pass/return — matches
+            // emit_type_expr's unconditional class → pointer lowering). The object's region is a
+            // genuine per-object arena; nothing yet drops it independently of whatever ancestor
+            // region eventually drops (an honest, scoped-down deferral — see the PR notes).
+            bool is_cls = cg_is_class_named(e->type.as.named.name);
+            size_t clsid = b->len;
+            if (is_cls) {
+                cb(b, "({ tk_region *_clsr"); cb_i64(b, (int64_t)clsid);
+                cb(b, " = tk_region_new("); cb(b, cg_enclosing_region_expr()); cb(b, "); ");
+                mangle_type_name(b, (tk_str){ NULL, 0 }, e->type.as.named.name);
+                cb(b, " *_clsp"); cb_i64(b, (int64_t)clsid);
+                cb(b, " = tk_region_alloc(_clsr"); cb_i64(b, (int64_t)clsid);
+                cb(b, ", sizeof(*_clsp"); cb_i64(b, (int64_t)clsid); cb(b, ")); *_clsp"); cb_i64(b, (int64_t)clsid);
+                cb(b, " = ");
+            }
             cb(b, "(");
             mangle_type_name(b, (tk_str){ NULL, 0 }, e->type.as.named.name);
             cb(b, "){ ");
@@ -2098,6 +2147,7 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
                 if (boxed) { cb(b, "; _bx"); cb_i64(b, (int64_t)bxid); cb(b, "; })"); }
             }
             cb(b, " }");
+            if (is_cls) { cb(b, "; _clsp"); cb_i64(b, (int64_t)clsid); cb(b, "; })"); }
             return true;
         }
 
