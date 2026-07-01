@@ -744,6 +744,7 @@ static tk_type_body normalize_inst_body(tk_type_body body, tk_type_table table) 
 // resolve.tks::normalize_inst_decl.
 tk_type_decl tk_normalize_inst_decl(tk_type_decl d, tk_type_table table) {
     return (tk_type_decl){ .name = d.name, .type_params = d.type_params, .n_type_params = d.n_type_params,
+                           .type_constraints = d.type_constraints,
                            .body = normalize_inst_body(d.body, table), .vis = d.vis,
                            .has_doc = d.has_doc, .doc = d.doc, .line = d.line, .col = d.col };
 }

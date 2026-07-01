@@ -43,6 +43,7 @@ typedef struct { tk_param    *items;  size_t n_params; size_t next; } tk_parsed_
 typedef struct { tk_str      *items;  size_t n_names;  size_t next; } tk_parsed_names;       // ParsedList<str> — a `{ … }` field-name list
 typedef struct { tk_field    *items;  size_t n_fields; size_t next; } tk_parsed_fields;      // ParsedList<Field> — a struct field list
 typedef struct { tk_array_elem *items; size_t n_elems; size_t next; } tk_parsed_array_elems; // ParsedList<ArrayElem> — array literal elements (with spread support)
+typedef struct { tk_str *names; tk_constraint_expr *constraints; size_t n; size_t next; } tk_parsed_type_params; // (W11/S6) a `<T, U: A & B, …>` list — names/constraints PARALLEL, same length
 // --- OUTLIERS (extra `pending_gt` / different fields — left concrete on both sides) ---
 typedef struct { tk_type_expr node;       size_t next; size_t pending_gt; } tk_parsed_type;     // a type expr; pending_gt = extra `>` left by a compound `>>` close (S4 nested generics)
 typedef struct { tk_type_expr *args; size_t nargs; size_t next; size_t pending_gt; } tk_parsed_type_args; // (W9.4) a `<T1, T2, …>` arg list at a construction/pattern site; pending_gt = extra `>` left by a `>>` close
@@ -74,6 +75,7 @@ TK_RESULT(tk_parsed_names,      tk_parsed_names_result);
 TK_RESULT(tk_parsed_path,       tk_parsed_path_result);
 TK_RESULT(tk_parsed_fields,     tk_parsed_fields_result);
 TK_RESULT(tk_parsed_array_elems, tk_parsed_array_elems_result);
+TK_RESULT(tk_parsed_type_params, tk_parsed_type_params_result);
 TK_RESULT(tk_guard,             tk_guard_result);
 TK_RESULT(tk_annotation,        tk_annotation_result);
 TK_RESULT(tk_parsed_call_args,  tk_parsed_call_args_result);

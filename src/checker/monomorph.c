@@ -109,6 +109,52 @@ static tk_type *mono_subst_find(tk_subst s, tk_str name) {
     return NULL;
 }
 
+// (W11/S6, 2026-07-01) CONSTRAINT CHECKING (monomorph.tks twin) — runs HERE, at
+// monomorphization, never at definition. NOMINAL membership: a `variant` atom's concrete type
+// must type_eq one of its declared MEMBER types; any other TypeDecl kind is an exact
+// nominal-name match. An atom naming no TypeDecl at all is unsatisfiable (M.1 fail-loud).
+static bool mono_constraint_atom_satisfied(tk_str atom_name, tk_type concrete, tk_type_table table) {
+    tk_decl_result td = tk_type_table_find(table, atom_name);
+    if (!td.ok) return false;
+    if (td.as.value.body.tag == TK_BODY_VARIANT) {
+        tk_type_result vt = tk_resolve_type(td.as.value.body.as.variant_body.type_expr, table);
+        if (!vt.ok) return false;
+        if (vt.as.value.tag == TK_TYPE_VARIANT) {
+            for (size_t i = 0; i < vt.as.value.as.variant.len; i += 1)
+                if (tk_type_eq(&concrete, &vt.as.value.as.variant.members[i])) return true;
+            return false;
+        }
+        return tk_type_eq(&concrete, &vt.as.value);   // a one-member variant widened to a bare type
+    }
+    return concrete.tag == TK_TYPE_NAMED && mono_name_eq(concrete.as.named.name, atom_name);
+}
+static bool mono_constraint_satisfied(tk_constraint_expr c, tk_type concrete, tk_type_table table) {
+    switch (c.tag) {
+        case TK_CONSTRAINT_NONE: return true;
+        case TK_CONSTRAINT_ATOM: return mono_constraint_atom_satisfied(c.as.atom.name, concrete, table);
+        case TK_CONSTRAINT_AND:  return mono_constraint_satisfied(*c.as.and_expr.left, concrete, table)
+                                      && mono_constraint_satisfied(*c.as.and_expr.right, concrete, table);
+        case TK_CONSTRAINT_OR:   return mono_constraint_satisfied(*c.as.or_expr.left, concrete, table)
+                                      || mono_constraint_satisfied(*c.as.or_expr.right, concrete, table);
+    }
+    return false;
+}
+// Gate a whole instantiation: type_params/type_constraints are PARALLEL; `s` bound each param
+// to a concrete type for THIS instantiation. NULL on success, else the diagnostic error.
+static bool mono_check_constraints(tk_str *type_params, tk_constraint_expr *type_constraints, size_t n,
+                                    tk_subst s, tk_type_table table, tk_error *out_err) {
+    for (size_t i = 0; i < n; i += 1) {
+        if (type_constraints[i].tag == TK_CONSTRAINT_NONE) continue;
+        tk_type *bound = mono_subst_find(s, type_params[i]);
+        if (!bound) { *out_err = tk_error_named("internal: monomorphization did not bind type parameter", type_params[i]); return false; }
+        if (!mono_constraint_satisfied(type_constraints[i], *bound, table)) {
+            *out_err = tk_error_named("type parameter does not satisfy its constraint at this instantiation", type_params[i]);
+            return false;
+        }
+    }
+    return true;
+}
+
 // ── semantic Type → syntactic TypeExpr ──────────────────────────────────────────────────
 static tk_type_expr mono_named_texpr(const char *name) {
     tk_segment *segs = NULL; size_t n = 0;
@@ -513,6 +559,12 @@ tk_tprogram_result tk_monomorphize(tk_tprogram prog, tk_type_table table) {
         mono_list_push(&stamped, inst);
         const tk_tfunction *gf = find_generic_fn(prog, inst.fn_name);
         if (!gf) return (tk_tprogram_result){ .ok = false, .as.error = tk_error_named("internal: monomorph could not find generic fn", inst.fn_name) };
+        // (W11/S6) CONSTRAINT CHECK — gate this instantiation's concrete bindings before stamping.
+        {
+            tk_error cerr;
+            if (!mono_check_constraints(gf->type_params, gf->type_constraints, gf->n_type_params, inst.s, table, &cerr))
+                return (tk_tprogram_result){ .ok = false, .as.error = cerr };
+        }
         // STAMP: concrete param annotations, substituted return type, body rewritten through the Subst.
         tk_param *nparams = gf->nparams ? tk_alloc(gf->nparams * sizeof *nparams) : NULL;
         for (size_t pi = 0; pi < gf->nparams; pi += 1)
@@ -523,6 +575,7 @@ tk_tprogram_result tk_monomorphize(tk_tprogram prog, tk_type_table table) {
         tk_tfunction sf = *gf;
         sf.name = inst.mangled;
         sf.type_params = NULL; sf.n_type_params = 0;
+        sf.type_constraints = NULL;
         sf.params = nparams;   // nparams count unchanged
         sf.return_type = tk_subst_type(gf->return_type, inst.s);
         sf.body = body; sf.nbody = nbody;
