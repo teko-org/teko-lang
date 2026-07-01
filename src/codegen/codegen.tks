@@ -376,6 +376,153 @@ fn cg_is_class_named(prog: checker::TProgram, name: str) -> bool {
     }
 }
 
+// (W10b.CLASS increment 4) SOUNDNESS GUARD: does expression `e` read `name` ANYWHERE, with NO
+// exemptions? This is DELIBERATELY NOT escape.tks's `mark_expr` — that walker's "a scalar field
+// off a bare local is a safe stack-member copy" refinement is sound for an ordinary STRUCT
+// (which lives ON THE C STACK, so the struct binding itself always survives a frame-region drop —
+// only ITS recursive-back-edge fields are heap pointers), but is UNSOUND for a CLASS instance
+// (which is ALWAYS heap/region-resident — `d.age` after `tk_region_drop(d->__region)` would read
+// FREED memory). So the destruction hook cannot reuse the escaping SET alone: it additionally
+// requires that the binding is not referenced ANYWHERE in the SPECIFIC tail/return expression
+// that runs immediately after the injected cleanup (earlier, non-tail statements are unaffected —
+// they execute in original order, BEFORE the function-exit cleanup). Unhandled/complex shapes
+// (TIfExpr/TMatchExpr/TLambda — nested blocks) conservatively answer `true` (assume referenced) —
+// always SAFE, it only means less aggressive cleanup, never a use-after-free.
+fn cg_expr_refs_name(e: checker::TExpr, name: str) -> bool {
+    match e.kind {
+        checker::TVar as v => v.name == name
+        checker::TNumber => false
+        checker::TStrLit => false
+        checker::TByteLit => false
+        checker::TCharLit => false
+        checker::TBoolLit => false
+        checker::TNullLit => false
+        checker::TPathExpr => false
+        checker::TBinary as b => cg_expr_refs_name(b.left, name) || cg_expr_refs_name(b.right, name)
+        checker::TUnary as u => cg_expr_refs_name(u.operand, name)
+        checker::TCompare as c => {
+            if cg_expr_refs_name(c.first, name) { true } else {
+                mut i = 0
+                mut found = false
+                loop { if i >= c.rest.len { break }; if cg_expr_refs_name(c.rest[i].operand, name) { found = true; break }; i++ }
+                found
+            }
+        }
+        checker::TCall as c => {
+            mut i = 0
+            mut found = false
+            loop { if i >= c.args.len { break }; if cg_expr_refs_name(c.args[i], name) { found = true; break }; i++ }
+            found
+        }
+        checker::TCast as ct => cg_expr_refs_name(ct.expr, name)
+        checker::TFieldAccess as fa => cg_expr_refs_name(fa.receiver, name)
+        checker::TSafeFieldAccess as sfa => cg_expr_refs_name(sfa.receiver, name)
+        checker::TCoalesce as co => cg_expr_refs_name(co.left, name) || cg_expr_refs_name(co.right, name)
+        checker::TIndex as ix => cg_expr_refs_name(ix.receiver, name) || cg_expr_refs_name(ix.index, name)
+        checker::TInterp as ip => {
+            mut i = 0
+            mut found = false
+            loop { if i >= ip.holes.len { break }; if cg_expr_refs_name(ip.holes[i], name) { found = true; break }; i++ }
+            found
+        }
+        checker::TInExpr as ie => {
+            if cg_expr_refs_name(ie.lhs, name) { true } else {
+                mut i = 0
+                mut found = false
+                loop { if i >= ie.elems.len { break }; if cg_expr_refs_name(ie.elems[i], name) { found = true; break }; i++ }
+                found
+            }
+        }
+        checker::TStructInit as si => {
+            mut i = 0
+            mut found = false
+            loop { if i >= si.field_vals.len { break }; if cg_expr_refs_name(si.field_vals[i], name) { found = true; break }; i++ }
+            found
+        }
+        checker::TArrayLit as al => {
+            mut i = 0
+            mut found = false
+            loop { if i >= al.elements.len { break }; if cg_expr_refs_name(al.elements[i].expr, name) { found = true; break }; i++ }
+            found
+        }
+        // TIfExpr / TMatchExpr / TLambda contain nested BLOCKS (statement lists), not just
+        // sub-expressions — conservatively assume referenced (safe: skips cleanup, never a UAF).
+        _ => true
+    }
+}
+
+// (W10b.CLASS increment 4) does `class_name` declare a `destruct(self) -> void` method (own or
+// inherited — `type_struct_methods` stamps EVERY effective method under the OWNING class's own
+// namespace, so searching for a TFunction named "destruct" whose namespace's last segment is
+// `class_name` finds it either way)? Returns that method's mangled NAMESPACE (for cb_fn_name) or
+// null if the class isn't destructible. Scoped assumption: one class of a given bare name per
+// program (a name collision across namespaces both with a `destruct` is not disambiguated here).
+fn cg_find_destruct_ns(prog: checker::TProgram, class_name: str) -> str? {
+    mut i = 0
+    loop {
+        if i >= prog.items.len { break }
+        match prog.items[i] {
+            checker::TFunction as tf => {
+                if tf.name == "destruct" {
+                    if tf.namespace == class_name { return tf.namespace }
+                    if teko::str::ends_with(tf.namespace, "::" ~ class_name) { return tf.namespace }
+                }
+            }
+            _ => {}
+        }
+        i++
+    }
+    null
+}
+
+// (W10b.CLASS increment 4) THE DESTRUCTION HOOK text: for every TOP-LEVEL `let`/`mut` binding in
+// `fn_body` that is a simple name, not `_`, not `const`, NOT in the escaping set (provably
+// frame-local — never returned/aliased outward), NOT referenced in `tail_expr` (the exit edge's
+// OWN return/tail value, evaluated AFTER this cleanup — `has_tail=false` when the exit edge has
+// no such expression, e.g. the fall-through path, where anything referencing the binding already
+// ran EARLIER, in original statement order), and of a CLASS type, emit a call to its `destruct()`
+// (if it declares one) followed by dropping its own per-object arena region (`__region`, set at
+// construction — emit_struct_init_framed). Scoped to TOP-LEVEL bindings only (a nested-block
+// local is a further extension, not yet covered). Called at every one of a function's exit edges
+// (emit_return / emit_exprstmt_tail's tail-value-return / emit_function's fall-through), mirroring
+// exactly where the frame region itself gets dropped.
+// (`has_tail`/`tail_expr` is a plain pair, NOT `checker::TExpr?` — an Optional wrapping the
+// compiler's own large recursive TExpr type hits a latent self-host codegen gap unrelated to this
+// feature; the has-flag pair sidesteps it, matching the codebase's existing has_X/X convention.)
+fn cg_class_cleanup_text(prog: checker::TProgram, escaping: []str, fn_body: []checker::TStatement, has_tail: bool, tail_expr: checker::TExpr) -> str | error {
+    mut out: []byte = teko::list::empty()
+    mut i = 0
+    loop {
+        if i >= fn_body.len { break }
+        match fn_body[i] {
+            checker::TBinding as b => {
+                let name = match b.target { parser::SimpleName as sn => sn.name; parser::DestructurePattern => "" }
+                let referenced_in_tail = has_tail && cg_expr_refs_name(tail_expr, name)
+                if name.len > 0 && name != "_" && b.kind != parser::BindKind::Const && !cg_str_in(escaping, name) && !referenced_in_tail {
+                    let cname = match b.bound { checker::Named as nm => nm.name; _ => "" }
+                    if cname.len > 0 && cg_is_class_named(prog, cname) {
+                        match cg_find_destruct_ns(prog, cname) {
+                            str as ns => {
+                                out = cb_fn_name(out, ns, "destruct")
+                                out = cb(out, "(")
+                                out = cb_ident(out, name)
+                                out = cb(out, "); ")
+                            }
+                            null => {}
+                        }
+                        out = cb(out, "tk_region_drop(")
+                        out = cb_ident(out, name)
+                        out = cb(out, "->__region); ")
+                    }
+                }
+            }
+            _ => {}
+        }
+        i++
+    }
+    str(out)
+}
+
 // cg_find_function — the top-level FUNCTION `name` in namespace `ns`, or a `not found` error.
 // (For call-arg wrapping — emit_call needs the callee's parameter types to wrap a bare case arg
 // into a variant param via emit_as.) (C: `cg_find_function`, which returned NULL.)
@@ -2253,6 +2400,10 @@ fn emit_struct_init_framed(buf: []byte, prog: checker::TProgram, e: checker::TEx
         out = cb(out, pN)
         out = cb(out, " = ")
         out = match emit_struct_init_literal(out, prog, e, si, frame, escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
+        out = cb(out, "; ")
+        out = cb(out, pN)
+        out = cb(out, "->__region = ")   // (W10b.CLASS increment 4) retain the region handle ON the object itself
+        out = cb(out, rN)
         out = cb(out, "; ")
         out = cb(out, pN)
         return cb(out, "; })")
@@ -4334,6 +4485,13 @@ fn emit_exprstmt_tail(buf: []byte, x: checker::TExpr, in_main: bool, prog: check
             }
             // (W9.3) Drain function-body defers (base 0) before the implicit trailing-value return.
             mut out = match emit_defers(buf, dctx.defers, 0, prog, indent, escaping, fn_body) { []byte as o => o; error as err => return err }
+            // (W10b.CLASS increment 4) DESTRUCTION HOOK — the implicit tail-value-return EDGE.
+            // Independent of `frame.len > 0`: a frame-local class instance needs this even when no
+            // OTHER struct auto-box makes the function open a frame region at all.
+            if !in_main {
+                let cleanup = match cg_class_cleanup_text(prog, escaping, fn_body, true, x) { str as c => c; error as e => return e }
+                if cleanup.len > 0 { out = cb(out, indent); out = cb(out, cleanup); out = cb(out, "\n") }
+            }
             // MEM Step 1: the tail value-return EDGE — drop the frame region before the implicit
             // `return` (a return value is escaping, so it never references a frame-local cell).
             if frame.len > 0 && !in_main { out = cb(out, indent); out = cb(out, "tk_region_drop("); out = cb(out, frame); out = cb(out, ");\n") }
@@ -4506,6 +4664,16 @@ fn emit_return(buf: []byte, prog: checker::TProgram, r: checker::TReturn, in_mai
     // S2 — a `return` leaves EVERY enclosing loop, so drop all active block regions (innermost-first),
     // THEN the frame region. The return value is escaping ⇒ in root ⇒ safe to read post-drop.
     out = cg_drop_all_regions(out, indent, regions)
+    // (W10b.CLASS increment 4) DESTRUCTION HOOK — an explicit `return` leaves every enclosing scope,
+    // same as the frame-region drop below; independent of `frame.len > 0` for the same reason as the
+    // other two edges (emit_exprstmt_tail / emit_function's fall-through).
+    let no_tail = checker::TExpr { kind = checker::TNullLit { }; type = checker::Void { }; line = 0; col = 0 }
+    let cleanup = if r.has_value {
+        match cg_class_cleanup_text(prog, escaping, fn_body, true, r.value) { str as c => c; error as e => return e }
+    } else {
+        match cg_class_cleanup_text(prog, escaping, fn_body, false, no_tail) { str as c => c; error as e => return e }
+    }
+    if cleanup.len > 0 { out = cb(out, indent); out = cb(out, cleanup); out = cb(out, "\n") }
     // MEM Step 1: drop the frame region on the return EDGE (before evaluating the value — a return
     // value is an ESCAPING position, so by the escape check it never references a frame-local cell;
     // dropping first is therefore safe). tk_region_drop is idempotent + NULL-tolerant, so overlap
@@ -4770,6 +4938,17 @@ fn emit_function(buf: []byte, prog: checker::TProgram, f: checker::TFunction) ->
         let fn_defers = cg_append_direct_defers(dctx.defers, fbody)
         out = match emit_defers(out, fn_defers, 0, prog, "    ", escaping, fbody) { []byte as o => o; error as err => return err }
     }
+    // (W10b.CLASS increment 4) DESTRUCTION HOOK — the FALL-THROUGH exit edge. Same reachability
+    // gate as the frame-region drop below (control must actually be able to reach here), but
+    // INDEPENDENT of `want_frame`: a function with a frame-local class instance and no OTHER
+    // frame-worthy struct auto-box still needs this edge (want_frame would otherwise be false).
+    if !tail_term {
+        // no tail/return expression here (the tail is a binding/assign/loop, not an expr-value) —
+        // anything that referenced a class binding already ran EARLIER, in original order.
+        let no_tail = checker::TExpr { kind = checker::TNullLit { }; type = checker::Void { }; line = 0; col = 0 }
+        let cleanup = match cg_class_cleanup_text(prog, escaping, fbody, false, no_tail) { str as c => c; error as e => return e }
+        if cleanup.len > 0 { out = cb(out, "    "); out = cb(out, cleanup); out = cb(out, "\n") }
+    }
     // MEM Step 1 — the FALL-THROUGH exit edge. If control can reach the function's end (the tail did
     // not C-terminate), drop the frame region there too. tk_region_drop is idempotent, so this never
     // double-frees relative to a return-edge drop on another path.
@@ -4871,6 +5050,14 @@ fn emit_type_decl(buf: []byte, prog: checker::TProgram, d: parser::TypeDecl) -> 
                 out = cb(out, ";\n")
                 i++
             }
+            // (W10b.CLASS increment 4) a HIDDEN field carrying the instance's OWN arena-per-object
+            // region handle — invisible to the Teko-level type system (the checker never sees it;
+            // no `Field` entry), set once at construction (emit_struct_init_framed) and read back
+            // at a frame-local binding's scope exit to drop the object's region (and, first, call
+            // `destruct()` if the class declares one) — the retention mechanism a per-object
+            // region needs to be reclaimed at ALL (increment 3 left this open: nothing tracked the
+            // region handle past the construction expression itself).
+            out = cb(out, "    tk_region *__region;\n")
             out = cb(out, "} ")
             out = mangle_type_name(out, "", d.name)
             cb(out, ";\n\n")

@@ -449,12 +449,135 @@ static const tk_type_decl *cg_find_decl(tk_str name) {
     return NULL;
 }
 
+static void cb_ident(cbuf *b, tk_str name);      // (W10b.CLASS increment 4) fwd — used by cg_class_cleanup_text
+static void cb_fn_name(cbuf *b, tk_str ns, tk_str name);   // (W10b.CLASS increment 4) fwd — used by cg_class_cleanup_text
+
 // (W10b.CLASS increment 3) is `name` a class (as opposed to a struct/enum/…)? A class is a
 // REFERENCE type — every use lowers to a pointer (emit_type_expr), so field access through one
 // needs a deref instead of a struct's plain `.field`.
 static bool cg_is_class_named(tk_str name) {
     const tk_type_decl *d = cg_find_decl(name);
     return d != NULL && d->body.tag == TK_BODY_CLASS;
+}
+
+// (W10b.CLASS increment 4) does `class_name` declare a `destruct(self) -> void` method (own or
+// inherited — tk_type_struct_methods stamps EVERY effective method under the OWNING class's own
+// namespace, so searching for a tk_tfunction named "destruct" whose namespace's last segment is
+// `class_name` finds it either way)? Returns that method's mangled NAMESPACE (for cb_fn_name) via
+// `*out`, true if found. Scoped assumption: one class of a given bare name per program (a name
+// collision across namespaces both with a `destruct` is not disambiguated here).
+static bool cg_find_destruct_ns(tk_str class_name, tk_str *out) {
+    for (size_t i = 0; i < g_cg_prog.nitems; i += 1) {
+        if (g_cg_prog.items[i].tag != TK_TITEM_FUNCTION) continue;
+        const tk_tfunction *tf = &g_cg_prog.items[i].as.function;
+        if (!cg_name_eq(tf->name, (tk_str){ (const tk_byte *)"destruct", 8 })) continue;
+        if (cg_name_eq(tf->namespace, class_name)) { *out = tf->namespace; return true; }
+        // namespace ends with "::" + class_name?
+        tk_byte sepbuf[2] = { ':', ':' };
+        size_t suffix_len = 2 + class_name.len;
+        if (tf->namespace.len >= suffix_len) {
+            tk_str tail = { tf->namespace.ptr + (tf->namespace.len - suffix_len), suffix_len };
+            if (tail.len >= 2 && tail.ptr[0] == sepbuf[0] && tail.ptr[1] == sepbuf[1]) {
+                tk_str name_part = { tail.ptr + 2, class_name.len };
+                if (cg_name_eq(name_part, class_name)) { *out = tf->namespace; return true; }
+            }
+        }
+    }
+    return false;
+}
+
+// (W10b.CLASS increment 4) THE DESTRUCTION HOOK text: for every TOP-LEVEL `let`/`mut` binding in
+// `fn_body` that is a simple name, not `_`, not `const`, NOT in the escaping set (provably
+// frame-local — never returned/aliased outward), and of a CLASS type, emit a call to its
+// `destruct()` (if it declares one) followed by dropping its own per-object arena region
+// (`__region`, set at construction). Scoped to TOP-LEVEL bindings only (a nested-block local is a
+// further extension, not yet covered). Called at every one of a function's exit edges (a `return`
+// statement / the tail-value-return edge / the fall-through edge), mirroring exactly where the
+// frame region itself gets dropped.
+// (W10b.CLASS increment 4) SOUNDNESS GUARD: does expression `e` read `name` ANYWHERE, with NO
+// exemptions? DELIBERATELY NOT tk_mark_expr (escape.c) — that walker's "a scalar field off a
+// bare local is a safe stack-member copy" refinement is sound for an ordinary STRUCT (which lives
+// ON THE C STACK), but UNSOUND for a CLASS instance (ALWAYS heap/region-resident — `d.age` after
+// `tk_region_drop(d->__region)` would read FREED memory). Unhandled/complex shapes (if/match/
+// lambda — nested blocks) conservatively answer true (assume referenced) — always safe, it only
+// means less aggressive cleanup, never a use-after-free.
+static bool cg_expr_refs_name(const tk_texpr *e, tk_str name) {
+    switch (e->tag) {
+        case TK_TEXPR_VAR: return cg_name_eq(e->as.var.name, name);
+        case TK_TEXPR_NUMBER: case TK_TEXPR_STR: case TK_TEXPR_BYTE:
+        case TK_TEXPR_BOOL: case TK_TEXPR_NULL: case TK_TEXPR_CHAR: case TK_TEXPR_PATH:
+            return false;
+        case TK_TEXPR_BINARY: return cg_expr_refs_name(e->as.binary.left, name) || cg_expr_refs_name(e->as.binary.right, name);
+        case TK_TEXPR_UNARY: return cg_expr_refs_name(e->as.unary.operand, name);
+        case TK_TEXPR_COMPARE: {
+            if (cg_expr_refs_name(e->as.compare.first, name)) return true;
+            for (size_t i = 0; i < e->as.compare.nrest; i += 1)
+                if (cg_expr_refs_name(e->as.compare.rest[i].operand, name)) return true;
+            return false;
+        }
+        case TK_TEXPR_CALL: {
+            for (size_t i = 0; i < e->as.call.nargs; i += 1)
+                if (cg_expr_refs_name(&e->as.call.args[i], name)) return true;
+            return false;
+        }
+        case TK_TEXPR_CAST: return cg_expr_refs_name(e->as.cast.expr, name);
+        case TK_TEXPR_FIELD_ACCESS: return cg_expr_refs_name(e->as.field_access.receiver, name);
+        case TK_TEXPR_SAFE_FIELD_ACCESS: return cg_expr_refs_name(e->as.safe_field_access.receiver, name);
+        case TK_TEXPR_COALESCE: return cg_expr_refs_name(e->as.coalesce.left, name) || cg_expr_refs_name(e->as.coalesce.right, name);
+        case TK_TEXPR_INDEX: return cg_expr_refs_name(e->as.index.receiver, name) || cg_expr_refs_name(e->as.index.index, name);
+        case TK_TEXPR_INTERP: {
+            for (size_t i = 0; i < e->as.interp.nholes; i += 1)
+                if (cg_expr_refs_name(&e->as.interp.holes[i], name)) return true;
+            return false;
+        }
+        case TK_TEXPR_IN: {
+            if (cg_expr_refs_name(e->as.in_expr.lhs, name)) return true;
+            for (size_t i = 0; i < e->as.in_expr.nelems; i += 1)
+                if (cg_expr_refs_name(&e->as.in_expr.elems[i], name)) return true;
+            return false;
+        }
+        case TK_TEXPR_STRUCT_INIT: {
+            for (size_t i = 0; i < e->as.struct_init.nfields; i += 1)
+                if (cg_expr_refs_name(&e->as.struct_init.field_vals[i], name)) return true;
+            return false;
+        }
+        case TK_TEXPR_ARRAY: {
+            for (size_t i = 0; i < e->as.array.nelements; i += 1)
+                if (cg_expr_refs_name(&e->as.array.elements[i], name)) return true;
+            return false;
+        }
+        // TK_TEXPR_IF / TK_TEXPR_MATCH / TK_TEXPR_LAMBDA contain nested BLOCKS (statement
+        // lists), not just sub-expressions — conservatively assume referenced.
+        default: return true;
+    }
+}
+
+static void cg_class_cleanup_text(cbuf *b, const tk_texpr *tail_expr) {
+    for (size_t i = 0; i < g_cg_fn_nbody; i += 1) {
+        if (g_cg_fn_body[i].tag != TK_TSTMT_BINDING) continue;
+        tk_bind_kind kind = g_cg_fn_body[i].as.binding.kind;
+        tk_bind_target target = g_cg_fn_body[i].as.binding.target;
+        tk_type bound = g_cg_fn_body[i].as.binding.bound;
+        if (target.tag != TK_BIND_SIMPLE) continue;
+        tk_str name = target.as.simple.name;
+        if (name.len == 0 || (name.len == 1 && name.ptr[0] == '_')) continue;
+        if (kind == TK_BIND_CONST) continue;
+        if (tk_escape_set_has(g_cg_escaping, name)) continue;
+        if (tail_expr != NULL && cg_expr_refs_name(tail_expr, name)) continue;
+        if (bound.tag != TK_TYPE_NAMED) continue;
+        tk_str cname = bound.as.named.name;
+        if (!cg_is_class_named(cname)) continue;
+        tk_str ns;
+        if (cg_find_destruct_ns(cname, &ns)) {
+            cb_fn_name(b, ns, (tk_str){ (const tk_byte *)"destruct", 8 });
+            cb(b, "(");
+            cb_ident(b, name);
+            cb(b, "); ");
+        }
+        cb(b, "tk_region_drop(");
+        cb_ident(b, name);
+        cb(b, "->__region); ");
+    }
 }
 
 // The top-level FUNCTION `name` in namespace `ns` (for call-arg wrapping — emit_call needs the
@@ -2147,7 +2270,12 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
                 if (boxed) { cb(b, "; _bx"); cb_i64(b, (int64_t)bxid); cb(b, "; })"); }
             }
             cb(b, " }");
-            if (is_cls) { cb(b, "; _clsp"); cb_i64(b, (int64_t)clsid); cb(b, "; })"); }
+            if (is_cls) {
+                // (W10b.CLASS increment 4) retain the region handle ON the object itself
+                cb(b, "; _clsp"); cb_i64(b, (int64_t)clsid);
+                cb(b, "->__region = _clsr"); cb_i64(b, (int64_t)clsid); cb(b, ";");
+                cb(b, " _clsp"); cb_i64(b, (int64_t)clsid); cb(b, "; })");
+            }
             return true;
         }
 
@@ -3633,6 +3761,10 @@ static bool emit_exprstmt_tail(cbuf *b, const tk_texpr *x, bool in_main,
     }
     // (C7.18/W9.3) Drain function-body defers (base 0) before the implicit trailing-value return.
     if (!emit_defers(b, indent, 0, err)) return false;
+    // (W10b.CLASS increment 4) DESTRUCTION HOOK — the implicit tail-value-return EDGE. Independent
+    // of g_cg_frame: a frame-local class instance needs this even when no OTHER struct auto-box
+    // makes the function open a frame region at all.
+    if (!in_main) { cb(b, indent); cg_class_cleanup_text(b, x); }
     // MEM Step 1: the tail value-return EDGE — drop the frame region before the implicit `return`
     // (a return value is escaping, so it never references a frame-local cell).
     if (g_cg_frame[0] != '\0' && !in_main) { cb(b, indent); cb(b, "tk_region_drop("); cb(b, g_cg_frame); cb(b, ");\n"); }
@@ -3789,6 +3921,10 @@ static bool emit_stmt(cbuf *b, const tk_tstatement *s, bool in_main,
             // (innermost-first), THEN the frame region. The return value is escaping ⇒ in root ⇒ safe.
             if (!emit_defers(b, indent, 0, err)) return false;
             cg_drop_all_block_regions(b, indent);
+            // (W10b.CLASS increment 4) DESTRUCTION HOOK — an explicit `return` leaves every
+            // enclosing scope, same as the frame-region drop below; independent of g_cg_frame for
+            // the same reason as the other two edges.
+            cb(b, indent); cg_class_cleanup_text(b, s->as.ret.has_value ? &s->as.ret.value : NULL);
             // MEM Step 1: drop the frame region on the return EDGE (before evaluating the value — a
             // return value is ESCAPING, so by the escape check it never references a frame-local
             // cell). tk_region_drop is idempotent + NULL-tolerant, so overlapping edge-drops free
@@ -4004,6 +4140,15 @@ static bool emit_function(cbuf *b, tk_tfunction f, const char **err) {
         bool tail_terminates = f.nbody > 0 && cg_stmt_c_terminates(&f.body[f.nbody - 1]);
         if (!tail_is_expr && !tail_terminates)
             if (!emit_defers(b, "    ", 0, err)) { g_cg_frame = ""; return false; }
+    }
+    // (W10b.CLASS increment 4) DESTRUCTION HOOK — the FALL-THROUGH exit edge. Same reachability
+    // gate as the frame-region drop below, but INDEPENDENT of want_frame: a function with a
+    // frame-local class instance and no OTHER frame-worthy struct auto-box still needs this edge.
+    {
+        bool tail_terminates_ft = f.nbody > 0 && cg_stmt_c_terminates(&f.body[f.nbody - 1]);
+        // no tail/return expression here (the tail is a binding/assign/loop, not an expr-value) —
+        // anything that referenced a class binding already ran EARLIER, in original order.
+        if (!tail_terminates_ft) { cb(b, "    "); cg_class_cleanup_text(b, NULL); }
     }
     // MEM Step 1 — the FALL-THROUGH exit edge. If control can reach the function's end (the tail did
     // not C-terminate), drop the frame region there too (tk_region_drop is idempotent — no double-free
@@ -4229,6 +4374,9 @@ static bool emit_type_decl(cbuf *b, tk_tprogram prog, tk_type_decl d, const char
                 cb_str(b, eff.as.value.ptr[i].name);
                 cb(b, ";\n");
             }
+            // (W10b.CLASS increment 4) a HIDDEN field carrying the instance's OWN arena-per-object
+            // region handle — see codegen.tks's twin comment for the full rationale.
+            cb(b, "    tk_region *__region;\n");
             cb(b, "} ");
             mangle_type_name(b, ns, d.name);
             cb(b, ";\n\n");
