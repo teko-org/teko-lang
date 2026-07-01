@@ -1726,6 +1726,19 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
                     else if (seg_is(last, "i64_to_str"))  builtin = "tk_i64_to_str";     // (i64) -> str
                     else if (seg_is(last, "u64_to_str"))  builtin = "tk_u64_to_str";     // (u64) -> str
                     else if (seg_is(last, "ftoa"))        builtin = "tk_ftoa";           // (f64) -> str
+                    else if (seg_is(last, "fmt_f"))        builtin = "tk_fmt_f";        // (f64, i64) -> str
+                    else if (seg_is(last, "fmt_e"))        builtin = "tk_fmt_e";        // (f64, i64) -> str
+                    else if (seg_is(last, "fmt_g"))        builtin = "tk_fmt_g";        // (f64, i64) -> str
+                    else if (seg_is(last, "fmt_p"))        builtin = "tk_fmt_p";        // (f64, i64) -> str
+                    else if (seg_is(last, "fmt_n_f"))      builtin = "tk_fmt_n_f";      // (f64, i64) -> str
+                    else if (seg_is(last, "fmt_d"))        builtin = "tk_fmt_d";        // (i64, i64) -> str
+                    else if (seg_is(last, "fmt_x_upper"))  builtin = "tk_fmt_x_upper";  // (u64) -> str
+                    else if (seg_is(last, "fmt_x_lower"))  builtin = "tk_fmt_x_lower";  // (u64) -> str
+                    else if (seg_is(last, "fmt_b"))        builtin = "tk_fmt_b";        // (u64) -> str
+                    else if (seg_is(last, "fmt_n_i"))      builtin = "tk_fmt_n_i";      // (i64) -> str
+                    else if (seg_is(last, "fmt_dyn_f64"))  builtin = "tk_fmt_dyn_f64";  // (f64, str) -> str
+                    else if (seg_is(last, "fmt_dyn_i64"))  builtin = "tk_fmt_dyn_i64";  // (i64, str) -> str
+                    else if (seg_is(last, "fmt_dyn_u64"))  builtin = "tk_fmt_dyn_u64";  // (u64, str) -> str
                     else if (seg_is(last, "f64_g17"))     builtin = "tk_f64_g17";        // (f64) -> str (host float renderer)
                     // (C7.1a) marshalling primitives — teko::mem: move aggregates across the FFI boundary.
                     else if (seg_is(last, "as_ptr"))        builtin = "tk_as_ptr";         // (str) -> ptr (raw bytes; borrows, pair with `.len`)
