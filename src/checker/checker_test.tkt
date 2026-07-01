@@ -1811,3 +1811,67 @@ fn ffi_teko_rt_named_struct_two_params() {
         error     => teko::assert::is_true(false)   // must NOT fail
     }
 }
+
+// --- DEFARGS (2026-07-01): call-site named-arg resolution + default-value fill ------------
+// `fn add(a: i64, b: i64 = 10) -> i64` — a: required (index 0), b: defaulted (n_required = 1,
+// defaults = [10]). Mirrors the .tkt Func literal env0/env pattern from types_call above.
+fn defargs_env() -> Env {
+    let params: []Type = teko::list::push(teko::list::push(teko::list::empty(), i64t()), i64t())
+    let names: []str = teko::list::push(teko::list::push(teko::list::empty(), "a"), "b")
+    let defaults: []parser::Expr = teko::list::push(teko::list::empty(), e_num(10))
+    define(empty_env(), "add", Func { params = params; ret = i64t(); variadic = false; param_names = names; n_required = 1; defaults = defaults }, false)
+}
+fn names1(a: str) -> []str { teko::list::push(teko::list::empty(), a) }
+fn names2(a: str, b: str) -> []str { teko::list::push(teko::list::push(teko::list::empty(), a), b) }
+
+#test
+fn defargs_positional_fill() {
+    // add(1) -- omitted `b` fills from the default (10).
+    let args: []parser::Expr = teko::list::push(teko::list::empty(), e_num(1))
+    let tcall = match type_call(parser::Call { callee = path1("add"); args = args; arg_names = names1("") }, defargs_env(), empty_table()) { TExpr as e => e; error => { teko::assert::is_true(false); return } }
+    match tcall.kind { TCall as cc => teko::assert::is_true(cc.args.len == 2); _ => teko::assert::is_true(false) }
+}
+
+#test
+fn defargs_named_call_all() {
+    // add(a = 1, b = 2) -- fully named, both provided.
+    let args: []parser::Expr = teko::list::push(teko::list::push(teko::list::empty(), e_num(1)), e_num(2))
+    let tcall = match type_call(parser::Call { callee = path1("add"); args = args; arg_names = names2("a", "b") }, defargs_env(), empty_table()) { TExpr as e => e; error => { teko::assert::is_true(false); return } }
+    match tcall.kind { TCall as cc => teko::assert::is_true(cc.args.len == 2); _ => teko::assert::is_true(false) }
+}
+
+#test
+fn defargs_named_out_of_order() {
+    // add(b = 2, a = 1) -- named-call may reorder freely.
+    let args: []parser::Expr = teko::list::push(teko::list::push(teko::list::empty(), e_num(2)), e_num(1))
+    let tcall = match type_call(parser::Call { callee = path1("add"); args = args; arg_names = names2("b", "a") }, defargs_env(), empty_table()) { TExpr as e => e; error => { teko::assert::is_true(false); return } }
+    match tcall.kind { TCall as cc => teko::assert::is_true(cc.args.len == 2); _ => teko::assert::is_true(false) }
+}
+
+#test
+fn defargs_mixed_positional_then_named() {
+    // add(1, b = 2) -- positional `a`, named `b` (named-last, rule D).
+    let args: []parser::Expr = teko::list::push(teko::list::push(teko::list::empty(), e_num(1)), e_num(2))
+    let tcall = match type_call(parser::Call { callee = path1("add"); args = args; arg_names = names2("", "b") }, defargs_env(), empty_table()) { TExpr as e => e; error => { teko::assert::is_true(false); return } }
+    match tcall.kind { TCall as cc => teko::assert::is_true(cc.args.len == 2); _ => teko::assert::is_true(false) }
+}
+
+#test
+fn defargs_missing_required_is_error() {
+    // add() -- `a` has no default -- must fail.
+    mut no_args: []parser::Expr = teko::list::empty()
+    match type_call(parser::Call { callee = path1("add"); args = no_args; arg_names = pos_names(0) }, defargs_env(), empty_table()) {
+        TExpr => teko::assert::is_true(false)   // must fail
+        error => teko::assert::is_true(true)
+    }
+}
+
+#test
+fn defargs_unknown_named_is_error() {
+    // add(a = 1, c = 2) -- `c` is not a param of add -- must fail.
+    let args: []parser::Expr = teko::list::push(teko::list::push(teko::list::empty(), e_num(1)), e_num(2))
+    match type_call(parser::Call { callee = path1("add"); args = args; arg_names = names2("a", "c") }, defargs_env(), empty_table()) {
+        TExpr => teko::assert::is_true(false)   // must fail
+        error => teko::assert::is_true(true)
+    }
+}
