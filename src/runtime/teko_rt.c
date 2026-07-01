@@ -1276,3 +1276,37 @@ int32_t tk_rt_time_second(tk_time t) {
 int16_t tk_rt_dto_offset_minutes(tk_datetimeoffset dto) {
     return dto.offset_minutes;
 }
+
+// --- arithmetic ---
+
+tk_datetime tk_rt_datetime_add(tk_datetime dt, tk_timespan span) {
+    return (tk_datetime){ .ticks = dt.ticks + span.ticks };
+}
+
+tk_datetime tk_rt_datetime_sub(tk_datetime dt, tk_timespan span) {
+    return (tk_datetime){ .ticks = dt.ticks - span.ticks };
+}
+
+tk_timespan tk_rt_datetime_diff(tk_datetime a, tk_datetime b) {
+    return (tk_timespan){ .ticks = a.ticks - b.ticks };
+}
+
+tk_timespan tk_rt_timespan_add(tk_timespan a, tk_timespan b) {
+    return (tk_timespan){ .ticks = a.ticks + b.ticks };
+}
+
+tk_timespan tk_rt_timespan_sub(tk_timespan a, tk_timespan b) {
+    return (tk_timespan){ .ticks = a.ticks - b.ticks };
+}
+
+__int128 tk_rt_timespan_to_ns(tk_timespan span) {
+    return span.ticks;
+}
+
+tk_date tk_rt_date_add_days(tk_date d, int32_t days) {
+    return (tk_date){ .days = d.days + days };
+}
+
+int32_t tk_rt_date_diff_days(tk_date a, tk_date b) {
+    return a.days - b.days;
+}

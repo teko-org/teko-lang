@@ -367,6 +367,20 @@ int32_t  tk_rt_time_minute(tk_time t);
 int32_t  tk_rt_time_second(tk_time t);
 int16_t  tk_rt_dto_offset_minutes(tk_datetimeoffset dto);
 
+// --- arithmetic (ROUND 0) ---
+// DateTime +/- TimeSpan = DateTime; DateTime - DateTime = TimeSpan (always fits, both i128).
+// TimeSpan +/- TimeSpan = TimeSpan. Date +/- (days: i32) = Date. Comparisons via raw ticks/days
+// (exposed already through the accessors above) — no dedicated compare fn needed (Teko can
+// compare the extracted i128/i32 with native `<`/`==`).
+tk_datetime tk_rt_datetime_add(tk_datetime dt, tk_timespan span);
+tk_datetime tk_rt_datetime_sub(tk_datetime dt, tk_timespan span);
+tk_timespan tk_rt_datetime_diff(tk_datetime a, tk_datetime b);      // a - b
+tk_timespan tk_rt_timespan_add(tk_timespan a, tk_timespan b);
+tk_timespan tk_rt_timespan_sub(tk_timespan a, tk_timespan b);
+__int128    tk_rt_timespan_to_ns(tk_timespan span);
+tk_date     tk_rt_date_add_days(tk_date d, int32_t days);
+int32_t     tk_rt_date_diff_days(tk_date a, tk_date b);             // a - b, in days
+
 // D3 — TEST-COVERAGE SINK. A host side-channel (like print's buffer / args), so the VM can
 // record which production functions executed during a `teko test` run WITHOUT a Teko
 // module-mutable (M.0). The VM marks a function's id (its source line) on entry; the runner
