@@ -1,0 +1,199 @@
+// src/regex/regex_test.tkt — tests for teko::regex (ROUND 0 minimal engine).
+// Covers: literal match, `.`, `*`/`+`/`?`, character classes, alternation, grouping,
+// anchors — both matching AND non-matching cases, plus a couple of bad-pattern cases.
+
+// helper (not a test): unwrap `bool | error` from is_match_pattern — a bad pattern in
+// these matching tests is itself a test failure (the pattern is meant to compile).
+fn matched(pattern: str, input: str) -> bool {
+    match teko::regex::is_match_pattern(pattern, input) {
+        bool as b => b
+        error     => { teko::assert::is_true(false); false }
+    }
+}
+
+// --- literals ---
+
+#test
+fn literal_matches() {
+    teko::assert::is_true(matched("cat", "cat"))
+    teko::assert::is_true(matched("cat", "concatenate"))   // search, not fullmatch
+}
+
+#test
+fn literal_rejects() {
+    teko::assert::is_false(matched("cat", "dog"))
+}
+
+// --- `.` any-codepoint ---
+
+#test
+fn dot_matches_any_char() {
+    teko::assert::is_true(matched("c.t", "cat"))
+    teko::assert::is_true(matched("c.t", "cot"))
+}
+
+#test
+fn dot_requires_a_char() {
+    teko::assert::is_false(matched("c.t", "ct"))
+}
+
+// --- `*` (zero or more) ---
+
+#test
+fn star_matches_zero_or_more() {
+    teko::assert::is_true(matched("ab*c", "ac"))      // zero b's
+    teko::assert::is_true(matched("ab*c", "abc"))     // one b
+    teko::assert::is_true(matched("ab*c", "abbbbc"))  // many b's
+}
+
+#test
+fn star_rejects_when_tail_missing() {
+    teko::assert::is_false(matched("ab*c", "abbbb"))  // no trailing c anywhere
+}
+
+// --- `+` (one or more) ---
+
+#test
+fn plus_requires_at_least_one() {
+    teko::assert::is_true(matched("ab+c", "abc"))
+    teko::assert::is_true(matched("ab+c", "abbbc"))
+}
+
+#test
+fn plus_rejects_zero() {
+    teko::assert::is_false(matched("ab+c", "ac"))
+}
+
+// --- `?` (zero or one) ---
+
+#test
+fn opt_matches_zero_or_one() {
+    teko::assert::is_true(matched("colou?r", "color"))
+    teko::assert::is_true(matched("colou?r", "colour"))
+}
+
+#test
+fn opt_rejects_two() {
+    teko::assert::is_false(matched("^colou?r$", "colouur"))
+}
+
+// --- character classes ---
+
+#test
+fn class_matches_listed_chars() {
+    teko::assert::is_true(matched("[abc]", "b"))
+    teko::assert::is_false(matched("[abc]", "d"))
+}
+
+#test
+fn class_range_matches() {
+    teko::assert::is_true(matched("^[a-z]+$", "hello"))
+    teko::assert::is_false(matched("^[a-z]+$", "Hello"))
+}
+
+#test
+fn class_negation_matches() {
+    teko::assert::is_true(matched("[^0-9]", "x"))
+    teko::assert::is_false(matched("^[^0-9]+$", "abc123"))
+}
+
+// --- alternation ---
+
+#test
+fn alternation_matches_either_branch() {
+    teko::assert::is_true(matched("cat|dog", "cat"))
+    teko::assert::is_true(matched("cat|dog", "dog"))
+}
+
+#test
+fn alternation_rejects_neither() {
+    teko::assert::is_false(matched("cat|dog", "bird"))
+}
+
+// --- grouping ---
+
+#test
+fn group_scopes_a_quantifier() {
+    teko::assert::is_true(matched("(ab)+", "ababab"))
+    teko::assert::is_false(matched("^(ab)+$", "aba"))
+}
+
+#test
+fn group_scopes_alternation() {
+    teko::assert::is_true(matched("^(cat|dog)s$", "cats"))
+    teko::assert::is_true(matched("^(cat|dog)s$", "dogs"))
+    teko::assert::is_false(matched("^(cat|dog)s$", "cows"))
+}
+
+// --- anchors ---
+
+#test
+fn start_anchor_pins_to_input_start() {
+    teko::assert::is_true(matched("^abc", "abcdef"))
+    teko::assert::is_false(matched("^abc", "xabcdef"))
+}
+
+#test
+fn end_anchor_pins_to_input_end() {
+    teko::assert::is_true(matched("def$", "abcdef"))
+    teko::assert::is_false(matched("def$", "abcdefx"))
+}
+
+#test
+fn full_anchors_match_the_whole_string() {
+    teko::assert::is_true(matched("^[0-9]+$", "12345"))
+    teko::assert::is_false(matched("^[0-9]+$", "123a45"))
+}
+
+// --- full_match (both ends anchored regardless of literal ^/$) ---
+
+#test
+fn full_match_requires_the_whole_input() {
+    let re = match teko::regex::compile("ab*c") {
+        teko::regex::Regex as r => r
+        error => { teko::assert::is_true(false); teko::regex::Regex { pattern = ""; ast = teko::regex::REmpty { } } }
+    }
+    teko::assert::is_true(teko::regex::full_match(re, "abbc"))
+    teko::assert::is_false(teko::regex::full_match(re, "xabbc"))
+}
+
+// --- compile errors (M.3 — a malformed pattern is a checked failure) ---
+
+#test
+fn rejects_unterminated_group() {
+    match teko::regex::compile("(abc") {
+        teko::regex::Regex => teko::assert::is_true(false)
+        error              => teko::assert::is_true(true)
+    }
+}
+
+#test
+fn rejects_unterminated_class() {
+    match teko::regex::compile("[abc") {
+        teko::regex::Regex => teko::assert::is_true(false)
+        error              => teko::assert::is_true(true)
+    }
+}
+
+#test
+fn rejects_dangling_quantifier() {
+    match teko::regex::compile("*abc") {
+        teko::regex::Regex => teko::assert::is_true(false)
+        error              => teko::assert::is_true(true)
+    }
+}
+
+#test
+fn rejects_unsupported_escape() {
+    match teko::regex::compile("a\\d") {
+        teko::regex::Regex => teko::assert::is_true(false)
+        error              => teko::assert::is_true(true)
+    }
+}
+
+// --- Unicode input (matcher walks CODEPOINTS, not raw bytes) ---
+
+#test
+fn dot_matches_a_multibyte_codepoint() {
+    teko::assert::is_true(matched("c.f", "café"))  // é: one codepoint, 2 bytes
+}
