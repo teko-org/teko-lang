@@ -224,7 +224,7 @@ struct tk_constraint_expr {
 // Top-level items (parser/ast.tks: Param/Function/Field/StructBody/EnumBody/
 //   VariantBody/TypeBody/TypeDecl/UseDecl/Decl + File model from parse_file.tks)
 // =========================================================================
-typedef struct { tk_str name; tk_type_expr type_ann; bool is_params; bool has_default; tk_expr default_expr; } tk_param;   // immutable (B.21); is_params = C#-style variadic modifier (2026-07-01), trailing-only, type_ann must be a Slice; has_default/default_expr = DEFARGS (2026-07-01) — TRAILING-ONLY, default_expr valid iff has_default
+typedef struct { tk_str name; bool has_type; tk_type_expr type_ann; bool is_params; bool has_default; tk_expr default_expr; } tk_param;   // immutable (B.21); is_params = C#-style variadic modifier (2026-07-01), trailing-only, type_ann must be a Slice; has_default/default_expr = DEFARGS (2026-07-01) — TRAILING-ONLY, default_expr valid iff has_default; has_type = OOP A1 (2026-07-01) — false ONLY for a struct method's 1st param (the receiver), type_ann valid iff has_type
 
 // tk_visibility — a declaration's REACH (LEGISLATION "Visibility — pub vs exp"; B.9).
 // PRIVATE (default, no keyword) = own namespace only; PUB = visible across the project's
@@ -254,7 +254,7 @@ typedef struct {                                                   // Function (
 } tk_function;
 
 typedef struct { tk_str name; tk_type_expr type_ann; } tk_field;
-typedef struct { tk_field *fields; size_t n_fields; }  tk_struct_body;
+typedef struct { tk_field *fields; size_t n_fields; tk_function *methods; size_t n_methods; }  tk_struct_body;   // (OOP A1, 2026-07-01) methods = interleaved `fn` decls; unified method model (see tk_param.has_type)
 typedef struct { tk_str  *members; size_t n_members; } tk_enum_body;    // member names, in order
 typedef struct {
     tk_str            *members;  // member names, in order
@@ -335,6 +335,7 @@ void tk_arms_push  (tk_arm **xs,       size_t *n, tk_arm       item);
 void tk_params_push(tk_param **xs,     size_t *n, tk_param     item);
 void tk_lambda_params_push(tk_lambda_param **xs, size_t *n, tk_lambda_param item);   // (W10)
 void tk_fields_push(tk_field **xs,     size_t *n, tk_field     item);
+void tk_functions_push(tk_function **xs, size_t *n, tk_function item);   // (OOP A1, 2026-07-01) struct-body methods
 void tk_segs_push  (tk_segment **xs,   size_t *n, tk_segment   item);
 void tk_strvec_push(tk_str **xs,       size_t *n, tk_str       item);   // (renamed from tk_strs_push to avoid the TK_LIST(tk_str, tk_strs) clash in TUs that also include build/manifest.h — A3)
 void tk_types_push (tk_type_expr **xs, size_t *n, tk_type_expr item);

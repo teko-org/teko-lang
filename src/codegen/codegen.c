@@ -4837,7 +4837,7 @@ static void cg_lift_expr(tk_texpr *e, uint64_t *next, tk_tfunction **fns, size_t
             if (e->as.lambda.ncaptures == 0) {
                 tk_param *ps = NULL; size_t np = 0;
                 for (size_t i = 0; i < e->as.lambda.nparams; i += 1)
-                    tk_params_push(&ps, &np, (tk_param){ e->as.lambda.params[i].name, tk_type_to_texpr(e->as.lambda.params[i].type) });
+                    tk_params_push(&ps, &np, (tk_param){ .name = e->as.lambda.params[i].name, .has_type = true, .type_ann = tk_type_to_texpr(e->as.lambda.params[i].type) });
                 tk_tfunction f = { .name = lam_fn_name_c(id), .params = ps, .nparams = np,
                                    .return_type = e->as.lambda.ret, .body = e->as.lambda.body, .nbody = e->as.lambda.nbody,
                                    .vis = TK_VIS_PRIVATE };

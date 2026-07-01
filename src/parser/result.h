@@ -50,6 +50,7 @@ typedef struct { tk_type_expr *args; size_t nargs; size_t next; size_t pending_g
 typedef struct { bool has_when; tk_expr guard;        size_t next; } tk_guard;          // an optional `when`
 typedef struct { bool has_type; tk_type_expr type_ann; size_t next; } tk_annotation;    // an optional `: T`
 typedef struct { tk_expr *args; tk_str *arg_names; size_t nargs; size_t next; } tk_parsed_call_args;   // DEFARGS (2026-07-01) — parse_call_args' result; arg_names[i] PARALLEL to args, {0} (empty) = positional else the named param
+typedef struct { tk_field *fields; size_t n_fields; tk_function *methods; size_t n_methods; size_t next; } tk_parsed_struct_body;   // OOP A1 (2026-07-01) — a struct body's INTERLEAVED fields + methods
 
 // --- file-level results (parse_file.tks) ---
 typedef struct { tk_use_decl  node;  size_t next; }              tk_parsed_use;        // Parsed<UseDecl> — one `use`
@@ -79,6 +80,7 @@ TK_RESULT(tk_parsed_type_params, tk_parsed_type_params_result);
 TK_RESULT(tk_guard,             tk_guard_result);
 TK_RESULT(tk_annotation,        tk_annotation_result);
 TK_RESULT(tk_parsed_call_args,  tk_parsed_call_args_result);
+TK_RESULT(tk_parsed_struct_body, tk_parsed_struct_body_result);
 TK_RESULT(tk_parsed_use,        tk_parsed_use_result);
 TK_RESULT(tk_parsed_uses,       tk_parsed_uses_result);
 TK_RESULT(tk_parsed_main_file,  tk_parsed_main_file_result);

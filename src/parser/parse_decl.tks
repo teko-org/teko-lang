@@ -3,11 +3,16 @@
 use teko::lexer
 
 // `( name: T, name: T, … )` — comma-separated params; empty `()` allowed; params are
-// immutable (B.21). `pos` is at `(`.
-fn parse_params(tokens: []lexer::Token, pos: u64) -> ParsedList<Param> | error {
+// immutable (B.21). `pos` is at `(`. `allow_untyped_first` (OOP A1, 2026-07-01) — true ONLY
+// for a struct method's param list: the 1st param may be a bare name with NO `: type` (the
+// unified-method-model RECEIVER, name free, type injected by the checker as the enclosing
+// struct); every other caller (a top-level/extern `fn`) passes false, where every param stays
+// mandatorily typed exactly as before (no behavior change for the non-method corpus).
+fn parse_params(tokens: []lexer::Token, pos: u64, allow_untyped_first: bool) -> ParsedList<Param> | error {
     mut p = pos + 1                                  // consume `(`
     mut params: []Param = teko::list::empty()
     mut seen_default = false   // DEFARGS (2026-07-01) — TRAILING-ONLY: once true, every later param must also default
+    mut first = true
     if is_kind_at(tokens, p, lexer::TokenKind::RParen) {
         return ParsedList<Param> { items = params; next = p + 1 }
     }
@@ -25,31 +30,40 @@ fn parse_params(tokens: []lexer::Token, pos: u64) -> ParsedList<Param> | error {
             return err_at(tokens, p, "expected a parameter name")
         }
         let name = tokens[p].text
-        if !is_kind_at(tokens, p + 1, lexer::TokenKind::Colon) {
-            return err_at(tokens, p + 1, "expected ':' after a parameter name")
+        // (OOP A1) the RECEIVER: only the very first param, only when the caller allows it, only
+        // when NOT immediately followed by `:` (a typed 1st param means the method is STATIC).
+        let is_receiver = first && allow_untyped_first && !has_params_kw && !is_kind_at(tokens, p + 1, lexer::TokenKind::Colon)
+        first = false
+        if is_receiver {
+            params = teko::list::push(params, Param { name = name; has_type = false; type_ann = no_type(); is_params = false; has_default = false; default_expr = no_expr() })
+            p = p + 1
+        } else {
+            if !is_kind_at(tokens, p + 1, lexer::TokenKind::Colon) {
+                return err_at(tokens, p + 1, "expected ':' after a parameter name")
+            }
+            let ty = match parse_type(tokens, p + 2) { ParsedType as x => x; error as e => return e }
+            if has_params_kw {
+                match ty.node { SliceType => { }; _ => return err_at(tokens, p + 2, "'params' parameter must have a slice type ([]T)") }
+            }
+            // DEFARGS (2026-07-01) — `= <expr>` right after the type: a default value, evaluated at
+            // the call site when the argument is omitted. TRAILING-ONLY (rule A): once ANY param
+            // defaults, every param after it must ALSO default — `=` uses Assign, consistent with
+            // struct-init `{f=v}` (not `:`, which is a type annotation).
+            mut ppos = ty.next
+            mut has_default = false
+            mut default_expr = no_expr()
+            if is_kind_at(tokens, ppos, lexer::TokenKind::Assign) {
+                let dv = match parse_expr(tokens, ppos + 1) { Parsed<Expr> as x => x; error as e => return e }
+                has_default = true
+                default_expr = dv.node
+                ppos = dv.next
+            } else if seen_default {
+                return err_at(tokens, ppos, "a default-valued parameter must be followed only by other defaulted parameters (defaults are trailing-only)")
+            }
+            if has_default { seen_default = true }
+            params = teko::list::push(params, Param { name = name; has_type = true; type_ann = ty.node; is_params = has_params_kw; has_default = has_default; default_expr = default_expr })
+            p = ppos
         }
-        let ty = match parse_type(tokens, p + 2) { ParsedType as x => x; error as e => return e }
-        if has_params_kw {
-            match ty.node { SliceType => { }; _ => return err_at(tokens, p + 2, "'params' parameter must have a slice type ([]T)") }
-        }
-        // DEFARGS (2026-07-01) — `= <expr>` right after the type: a default value, evaluated at
-        // the call site when the argument is omitted. TRAILING-ONLY (rule A): once ANY param
-        // defaults, every param after it must ALSO default — `=` uses Assign, consistent with
-        // struct-init `{f=v}` (not `:`, which is a type annotation).
-        mut ppos = ty.next
-        mut has_default = false
-        mut default_expr = no_expr()
-        if is_kind_at(tokens, ppos, lexer::TokenKind::Assign) {
-            let dv = match parse_expr(tokens, ppos + 1) { Parsed<Expr> as x => x; error as e => return e }
-            has_default = true
-            default_expr = dv.node
-            ppos = dv.next
-        } else if seen_default {
-            return err_at(tokens, ppos, "a default-valued parameter must be followed only by other defaulted parameters (defaults are trailing-only)")
-        }
-        if has_default { seen_default = true }
-        params = teko::list::push(params, Param { name = name; type_ann = ty.node; is_params = has_params_kw; has_default = has_default; default_expr = default_expr })
-        p = ppos
         if has_params_kw && is_kind_at(tokens, p, lexer::TokenKind::Comma) {
             return err_at(tokens, p, "'params' must be the last parameter")
         }
@@ -140,7 +154,9 @@ fn parse_type_params(tokens: []lexer::Token, pos: u64) -> ParsedTypeParams | err
     ParsedTypeParams { names = names; constraints = constraints; next = p }
 }
 
-fn parse_function(tokens: []lexer::Token, pos: u64, is_test: bool, os_guard: str) -> Parsed<Decl> | error {
+// `allow_receiver` (OOP A1, 2026-07-01) — true ONLY when called for a struct-body method: lets
+// the 1st param be a bare untyped name (the receiver). A top-level `fn` always passes false.
+fn parse_function(tokens: []lexer::Token, pos: u64, is_test: bool, os_guard: str, allow_receiver: bool) -> Parsed<Decl> | error {
     mut p = pos
     mut has_doc = false
     mut doc = ""
@@ -178,7 +194,7 @@ fn parse_function(tokens: []lexer::Token, pos: u64, is_test: bool, os_guard: str
     if !is_kind_at(tokens, p, lexer::TokenKind::LParen) {
         return err_at(tokens, p, "expected '(' for the parameter list")
     }
-    let params = match parse_params(tokens, p) { ParsedList<Param> as x => x; error as e => return e }
+    let params = match parse_params(tokens, p, allow_receiver) { ParsedList<Param> as x => x; error as e => return e }
     p = params.next
     mut has_return = false
     mut return_type = no_type()
@@ -222,31 +238,53 @@ fn parse_function(tokens: []lexer::Token, pos: u64, is_test: bool, os_guard: str
 
 // `{ name: T; name: T; … }` — field list; `;`/newline separates; empty `{ }` allowed;
 // trailing separator allowed. `pos` is at `{`. (Inside `{}` → `;`/newline, B.17.)
-fn parse_fields(tokens: []lexer::Token, pos: u64) -> ParsedList<Field> | error {
+// (OOP A1, 2026-07-01) A struct body's items are INTERLEAVED fields and methods (unified
+// method model): `type S = struct { s: str; fn a(self) -> str { self.s } ; fn b() -> void {} }`.
+// An item starting with `fn` (optionally preceded by a doc comment / `pub`/`exp`) is a METHOD,
+// parsed via `parse_function` with `allow_receiver = true`; anything else is a plain field
+// (`name: type`), exactly as before. Struct members (fields + methods) stay ALL PUBLIC per
+// W10b.0.A — a method's `pub`/`exp` marker is accepted (parses) but carries no extra reach
+// beyond the struct's own visibility (the checker does not special-case it further here).
+fn struct_item_is_method(tokens: []lexer::Token, pos: u64) -> bool {
+    mut k = pos
+    if is_kind_at(tokens, k, lexer::TokenKind::Doc) { k = k + 1 }
+    if is_kind_at(tokens, k, lexer::TokenKind::Pub) { k = k + 1 }
+    else if is_kind_at(tokens, k, lexer::TokenKind::Exp) { k = k + 1 }
+    is_kind_at(tokens, k, lexer::TokenKind::Fn)
+}
+fn parse_fields(tokens: []lexer::Token, pos: u64) -> ParsedStructBody | error {
     mut p = skip_seps(tokens, pos + 1)   // consume `{`, skip leading separators
     mut fields: []Field = teko::list::empty()
+    mut methods: []Function = teko::list::empty()
     if is_kind_at(tokens, p, lexer::TokenKind::RBrace) {
-        return ParsedList<Field> { items = fields; next = p + 1 }
+        return ParsedStructBody { fields = fields; methods = methods; next = p + 1 }
     }
     loop {
-        if !is_name_at(tokens, p) {
-            return err_at(tokens, p, "expected a field name")
+        if struct_item_is_method(tokens, p) {
+            let m = match parse_function(tokens, p, false, "", true) { Parsed<Decl> as x => x; error as e => return e }
+            let mf = match m.node { Function as f => f; _ => return err_at(tokens, p, "internal: a struct method must parse to a Function") }
+            methods = teko::list::push(methods, mf)
+            p = m.next
+        } else {
+            if !is_name_at(tokens, p) {
+                return err_at(tokens, p, "expected a field name or a method (`fn …`)")
+            }
+            let name = tokens[p].text
+            if !is_kind_at(tokens, p + 1, lexer::TokenKind::Colon) {
+                return err_at(tokens, p + 1, "expected ':' after a field name")
+            }
+            let ty = match parse_type(tokens, p + 2) { ParsedType as x => x; error as e => return e }
+            fields = teko::list::push(fields, Field { name = name; type_ann = ty.node })
+            p = ty.next
         }
-        let name = tokens[p].text
-        if !is_kind_at(tokens, p + 1, lexer::TokenKind::Colon) {
-            return err_at(tokens, p + 1, "expected ':' after a field name")
-        }
-        let ty = match parse_type(tokens, p + 2) { ParsedType as x => x; error as e => return e }
-        fields = teko::list::push(fields, Field { name = name; type_ann = ty.node })
-        p = ty.next
         if is_kind_at(tokens, p, lexer::TokenKind::RBrace) { break }
         if !is_sep(tokens, p) {
-            return err_at(tokens, p, "expected ';', a newline, or '}' after a field")
+            return err_at(tokens, p, "expected ';', a newline, or '}' after a struct member")
         }
         p = skip_seps(tokens, p)
         if is_kind_at(tokens, p, lexer::TokenKind::RBrace) { break }   // trailing separator
     }
-    ParsedList<Field> { items = fields; next = p + 1 }
+    ParsedStructBody { fields = fields; methods = methods; next = p + 1 }
 }
 
 // the body of a type declaration. `struct { fields }`, `enum { … }`, `variant A | B`, or
@@ -257,8 +295,8 @@ fn parse_type_body(tokens: []lexer::Token, pos: u64) -> Parsed<TypeBody> | error
         if !is_kind_at(tokens, pos + 1, lexer::TokenKind::LBrace) {
             return err_at(tokens, pos + 1, "expected '{' after `struct`")
         }
-        let fs = match parse_fields(tokens, pos + 1) { ParsedList<Field> as x => x; error as e => return e }
-        return Parsed<TypeBody> { node = StructBody { fields = fs.items }; next = fs.next }
+        let fs = match parse_fields(tokens, pos + 1) { ParsedStructBody as x => x; error as e => return e }
+        return Parsed<TypeBody> { node = StructBody { fields = fs.fields; methods = fs.methods }; next = fs.next }
     }
     if is_kind_at(tokens, pos, lexer::TokenKind::Enum) {
         if !is_kind_at(tokens, pos + 1, lexer::TokenKind::LBrace) {
@@ -415,7 +453,7 @@ fn parse_decl(tokens: []lexer::Token, pos: u64) -> Parsed<Decl> | error {
         k = k + 1
     }
     if is_kind_at(tokens, k, lexer::TokenKind::Fn) {
-        return parse_function(tokens, start, is_test, os_guard)
+        return parse_function(tokens, start, is_test, os_guard, false)
     }
     if is_kind_at(tokens, k, lexer::TokenKind::Type) {
         if is_test { return err_at(tokens, k, "`#test` may only precede a function") }

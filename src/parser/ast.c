@@ -34,6 +34,7 @@ void tk_arms_push  (tk_arm **xs,       size_t *n, tk_arm       item) { TK_PUSH_B
 void tk_params_push(tk_param **xs,     size_t *n, tk_param     item) { TK_PUSH_BODY(tk_param); }
 void tk_lambda_params_push(tk_lambda_param **xs, size_t *n, tk_lambda_param item) { TK_PUSH_BODY(tk_lambda_param); }   // (W10)
 void tk_fields_push(tk_field **xs,     size_t *n, tk_field     item) { TK_PUSH_BODY(tk_field); }
+void tk_functions_push(tk_function **xs, size_t *n, tk_function item) { TK_PUSH_BODY(tk_function); }   // (OOP A1, 2026-07-01) struct-body methods
 void tk_segs_push  (tk_segment **xs,   size_t *n, tk_segment   item) { TK_PUSH_BODY(tk_segment); }
 void tk_strvec_push(tk_str **xs,       size_t *n, tk_str       item) { TK_PUSH_BODY(tk_str); }
 void tk_types_push (tk_type_expr **xs, size_t *n, tk_type_expr item) { TK_PUSH_BODY(tk_type_expr); }

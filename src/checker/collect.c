@@ -1,6 +1,16 @@
 // src/checker/collect.c
 #include "collect.h"
 #include "tast.h"   // tk_tprogram, tk_titem, TK_TITEM_TYPE_DECL (C7.12)
+#include <string.h> // memcpy (collect_str_concat)
+
+// a ++ b — a fresh owned tk_str (local to keep the DAG tight; mirrors monomorph.c::mono_concat).
+static tk_str collect_str_concat(tk_str a, tk_str b) {
+    size_t len = a.len + b.len;
+    tk_byte *buf = tk_alloc(len ? len : 1); if (!buf) abort();
+    if (a.len) memcpy(buf, a.ptr, a.len);
+    if (b.len) memcpy(buf + a.len, b.ptr, b.len);
+    return (tk_str){ .ptr = buf, .len = len };
+}
 
 static tk_type_table collect_types(tk_item *items, size_t n) {
     tk_type_table table = tk_type_table_empty();
@@ -41,6 +51,48 @@ static tk_type_result func_type(tk_function f, tk_type_table table) {
     // No `-> ret` ⇒ a void return (M.3) — f.return_type is the empty `no_type()` placeholder
     // (a NAMED type-expr with an empty path), which must NOT be resolved (it is not a value type).
     // Mirrors typer.c's function typer (`if (!f.has_return) return void_t()`).
+    tk_type_result ret = f.has_return
+        ? tk_resolve_type(f.return_type, tbl)
+        : (tk_type_result){ .ok = true, .as.value = (tk_type){ .tag = TK_TYPE_VOID } };
+    if (!ret.ok) { tk_free0(params); return ret; }
+    tk_type *rp = tk_alloc(sizeof *rp); if (!rp) abort(); *rp = ret.as.value;
+    bool is_variadic = f.nparams > 0 && f.params[f.nparams - 1].is_params;
+    tk_type t = { .tag = TK_TYPE_FUNC, .as.func = { params, n, rp, is_variadic, param_names, n_required, defaults, ndefaults } };
+    return (tk_type_result){ .ok = true, .as.value = t };
+}
+
+// (OOP A1, 2026-07-01) a struct METHOD's signature as a FuncType. Mirrors func_type, except the
+// RECEIVER param (has_type=false, only ever index 0) resolves to Named{struct_name} — its type
+// is IMPLICIT (the enclosing struct), never written by the user, so it can't go through
+// tk_resolve_type like an ordinary annotated param.
+static tk_type_result method_func_type(tk_function f, tk_str struct_name, tk_type_table table) {
+    tk_type_table tbl = tk_type_param_table(f.type_params, f.n_type_params, (tk_str){0}, table);
+    tk_type *params = NULL; size_t n = 0;
+    tk_str *param_names = NULL;
+    tk_expr *defaults = NULL; size_t ndefaults = 0;
+    size_t n_required = f.nparams;
+    for (size_t i = 0; i < f.nparams; i += 1) {
+        tk_type pt;
+        if (!f.params[i].has_type) {
+            pt = (tk_type){ .tag = TK_TYPE_NAMED, .as.named = { struct_name } };
+        } else {
+            tk_type_result ptr = tk_resolve_type(f.params[i].type_ann, tbl);
+            if (!ptr.ok) { tk_free0(params); return ptr; }
+            pt = ptr.as.value;
+        }
+        params = tk_realloc0(params, (n + 1) * sizeof *params);
+        if (!params) abort();
+        params[n] = pt; n += 1;
+        param_names = tk_realloc0(param_names, n * sizeof *param_names);
+        if (!param_names) abort();
+        param_names[n - 1] = f.params[i].name;
+        if (f.params[i].has_default) {
+            if (n_required == f.nparams) { n_required = i; }
+            defaults = tk_realloc0(defaults, (ndefaults + 1) * sizeof *defaults);
+            if (!defaults) abort();
+            defaults[ndefaults] = f.params[i].default_expr; ndefaults += 1;
+        }
+    }
     tk_type_result ret = f.has_return
         ? tk_resolve_type(f.return_type, tbl)
         : (tk_type_result){ .ok = true, .as.value = (tk_type){ .tag = TK_TYPE_VOID } };
@@ -108,6 +160,20 @@ tk_collected_result tk_collect(tk_program program) {
             tk_type_result ft = func_type(f, table);
             if (!ft.ok) return (tk_collected_result){ .ok = false, .as.error = ft.as.error };
             env = tk_env_define_fn(env, f.name, ft.as.value, program.items[i].namespace);   // #41: carry the fn's ns
+        } else if (program.items[i].tag == TK_ITEM_TYPE_DECL && program.items[i].as.type_decl.body.tag == TK_BODY_STRUCT) {
+            // (OOP A1) register each struct's methods under "<owning-ns>::<StructName>" (bare
+            // StructName at the top level) — tk_env_lookup_call's qualifier match compares only
+            // the LAST segment, so `StructName::method(…)` resolves through the SAME #41
+            // machinery as any other qualified call, with zero new resolution code.
+            tk_type_decl td = program.items[i].as.type_decl;
+            tk_str owning_ns = program.items[i].namespace;
+            tk_str method_ns = owning_ns.len == 0 ? td.name : collect_str_concat(collect_str_concat(owning_ns, (tk_str){ .ptr = (const tk_byte *)"::", .len = 2 }), td.name);
+            for (size_t mi = 0; mi < td.body.as.struct_body.n_methods; mi += 1) {
+                tk_function mf = td.body.as.struct_body.methods[mi];
+                tk_type_result mft = method_func_type(mf, td.name, table);
+                if (!mft.ok) return (tk_collected_result){ .ok = false, .as.error = mft.as.error };
+                env = tk_env_define_fn(env, mf.name, mft.as.value, method_ns);
+            }
         }
     }
     tk_collected c = { .types = table, .env = env };
@@ -135,11 +201,23 @@ tk_collected_result tk_collect_with_seed(tk_program program, tk_collected seed) 
 
     // Pass 2: add project's function signatures to the env.
     for (size_t i = 0; i < program.len; i += 1) {
-        if (program.items[i].tag != TK_ITEM_FUNCTION) continue;
-        tk_function f = program.items[i].as.function;
-        tk_type_result ft = func_type(f, table);
-        if (!ft.ok) return (tk_collected_result){ .ok = false, .as.error = ft.as.error };
-        env = tk_env_define_fn(env, f.name, ft.as.value, program.items[i].namespace);
+        if (program.items[i].tag == TK_ITEM_FUNCTION) {
+            tk_function f = program.items[i].as.function;
+            tk_type_result ft = func_type(f, table);
+            if (!ft.ok) return (tk_collected_result){ .ok = false, .as.error = ft.as.error };
+            env = tk_env_define_fn(env, f.name, ft.as.value, program.items[i].namespace);
+        } else if (program.items[i].tag == TK_ITEM_TYPE_DECL && program.items[i].as.type_decl.body.tag == TK_BODY_STRUCT) {
+            // (OOP A1) mirror tk_collect's struct-method registration
+            tk_type_decl td = program.items[i].as.type_decl;
+            tk_str owning_ns = program.items[i].namespace;
+            tk_str method_ns = owning_ns.len == 0 ? td.name : collect_str_concat(collect_str_concat(owning_ns, (tk_str){ .ptr = (const tk_byte *)"::", .len = 2 }), td.name);
+            for (size_t mi = 0; mi < td.body.as.struct_body.n_methods; mi += 1) {
+                tk_function mf = td.body.as.struct_body.methods[mi];
+                tk_type_result mft = method_func_type(mf, td.name, table);
+                if (!mft.ok) return (tk_collected_result){ .ok = false, .as.error = mft.as.error };
+                env = tk_env_define_fn(env, mf.name, mft.as.value, method_ns);
+            }
+        }
     }
 
     return (tk_collected_result){ .ok = true, .as.value = (tk_collected){ .types = table, .env = env } };
