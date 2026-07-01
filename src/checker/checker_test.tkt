@@ -240,6 +240,33 @@ fn types_function_and_program() {
     match tp.items[0] { TFunction as ff => teko::assert::is_true(prim_is(ff.return_type, PrimKind::U32)); _ => teko::assert::is_true(false) }
 }
 
+// REGRESSION (self-hosted cross-file top-level fn call): a top-level function declared in a
+// namespace (a non-main source file) called UNQUALIFIED from a LOOSE top-level statement (the
+// virtual-main / main.tks) in the SAME namespace. type_program must set the threaded scope's
+// cur_ns to each item's namespace BEFORE typing a loose statement, so lookup_call's `b.ns ==
+// env.cur_ns` clause matches the fn (registered with ns="order_test"). Before the fix, the loose
+// statement was typed with cur_ns="" → "unknown function". The .c twin already set cur.cur_ns per
+// item; this guards the .tks parity so `./bin/teko <project>` matches `./build/teko <project>`.
+#test
+fn resolves_unqualified_cross_file_call_from_main() {
+    // fn use_counter(x: u32) -> u32 { x }  in namespace "order_test" (as if from counter.tks)
+    let f = mk_fn("use_counter", named_t("u32"), one_stmt(e_var("x")))
+    let fitem = parser::Item { content = f; namespace = "order_test"; file = "counter.tks" }
+    // a LOOSE top-level statement `let _ = use_counter(21)` in the SAME namespace (as if from
+    // main.tks): an UNQUALIFIED call to the cross-file fn. `_` is the discard binding (exempt from
+    // the unused-local check); the call resolving is the point under test.
+    let callargs = teko::list::push(teko::list::empty(), e_num(21))
+    let callexpr = ek(parser::Call { callee = path1("use_counter"); args = callargs; arg_names = pos_names(callargs.len) })
+    let discard = parser::Binding { kind = parser::BindKind::Let; target = parser::SimpleName { name = "_" }; has_type = false; type_ann = named_t("u32"); value = callexpr }
+    let sitem = parser::Item { content = discard; namespace = "order_test"; file = "main.tks" }
+    let items2 = teko::list::push(teko::list::push(teko::list::empty(), fitem), sitem)
+    // Before the fix this returns error "unknown function: use_counter"; after, it type-checks OK.
+    match type_program(parser::Program { items = items2 }) {
+        TProgram as tp2 => teko::assert::is_true(tp2.items.len == 2)
+        error => teko::assert::is_true(false)
+    }
+}
+
 #test
 fn rejects_ill_typed() {
     let env2 = define(define(empty_env(), "x", u32t(), false), "y", u8t(), false)
