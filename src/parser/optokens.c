@@ -22,10 +22,13 @@ bool tk_is_multiplicative(const tk_token *t, size_t n, size_t pos) {
     return k == TK_TOKEN_STAR || k == TK_TOKEN_SLASH || k == TK_TOKEN_PERCENT || k == TK_TOKEN_AMP;
 }
 
+// (2026-07-01) `~` joins additive precedence — arity-polymorphic like `-`: unary `~x` is
+// bitwise NOT, binary `a ~ b` is string concat (NOT commutative, honest at the same level as `-`).
 bool tk_is_additive(const tk_token *t, size_t n, size_t pos) {
     if (!tk_has_token(t, n, pos)) { return false; }
     tk_token_kind k = t[pos].kind;
-    return k == TK_TOKEN_PLUS || k == TK_TOKEN_MINUS || k == TK_TOKEN_PIPE || k == TK_TOKEN_CARET;
+    return k == TK_TOKEN_PLUS || k == TK_TOKEN_MINUS || k == TK_TOKEN_PIPE || k == TK_TOKEN_CARET ||
+           k == TK_TOKEN_TILDE;
 }
 
 bool tk_is_comparison(const tk_token *t, size_t n, size_t pos) {

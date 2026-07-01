@@ -71,7 +71,71 @@ static tk_texpr_result type_var(tk_var v, tk_env env) {
 }
 
 // ---- operators (same B.22 regimes as check_binary/unary/compare) ----
+static tk_texpr_result type_call(tk_call c, tk_env env, tk_type_table table);   // forward (defined below)
+
+// (2026-07-01) `~` — binary string concat, arity-polymorphic with unary `~` (bitwise NOT).
+// Additive precedence, NOT commutative (honest — Governing Law M.3, the same reasoning `+` was
+// rejected for concat: TEKO_LEGISLATION.md "`+` never concatenates").
+//
+// Flattens a LEFT-ASSOCIATIVE `~` chain (`a ~ b ~ c ~ …`) into a flat piece list, so `a ~ b ~ c`
+// desugars to ONE `teko::string::concat(a, b, c)` call — not nested 2-arg calls — reusing the
+// params-variadic `concat` (2026-07-01, PR #33).
+static void flatten_tilde_chain(tk_expr e, tk_expr **acc, size_t *nacc) {
+    if (e.tag == TK_EXPR_BINARY && e.as.binary.op == TK_TOKEN_TILDE) {
+        flatten_tilde_chain(*e.as.binary.left, acc, nacc);
+        flatten_tilde_chain(*e.as.binary.right, acc, nacc);
+        return;
+    }
+    tk_exprs_push(acc, nacc, e);
+}
+
+// Constant-fold adjacent STR-LITERAL pieces at compile time (e.g. `x ~ "a" ~ "b" ~ y` folds
+// `"a" ~ "b"` into ONE literal `"ab"` first). If EVERY piece folds into one literal, the whole
+// `~` chain collapses to that single literal — zero runtime concat calls.
+static tk_str tilde_concat_lit(tk_str a, tk_str b) {
+    size_t n = a.len + b.len;
+    tk_byte *buf = tk_alloc(n ? n : 1); if (!buf) abort();
+    if (a.len) memcpy(buf, a.ptr, a.len);
+    if (b.len) memcpy(buf + a.len, b.ptr, b.len);
+    return (tk_str){ buf, n };
+}
+static void fold_tilde_pieces(tk_expr *pieces, size_t npieces, tk_expr **out, size_t *nout) {
+    size_t i = 0;
+    while (i < npieces) {
+        if (pieces[i].tag == TK_EXPR_STR) {
+            tk_str merged = pieces[i].as.str.text;
+            size_t j = i + 1;
+            while (j < npieces && pieces[j].tag == TK_EXPR_STR) {
+                merged = tilde_concat_lit(merged, pieces[j].as.str.text);
+                j += 1;
+            }
+            tk_exprs_push(out, nout, (tk_expr){ .tag = TK_EXPR_STR, .line = pieces[i].line, .col = pieces[i].col, .as.str = { merged } });
+            i = j;
+        } else {
+            tk_exprs_push(out, nout, pieces[i]);
+            i += 1;
+        }
+    }
+}
+static tk_texpr_result type_tilde_chain(tk_binary b, tk_env env, tk_type_table table) {
+    tk_expr *raw = NULL; size_t nraw = 0;
+    flatten_tilde_chain((tk_expr){ .tag = TK_EXPR_BINARY, .as.binary = b }, &raw, &nraw);
+    tk_expr *folded = NULL; size_t nfolded = 0;
+    fold_tilde_pieces(raw, nraw, &folded, &nfolded);
+    if (nfolded == 1) { return tk_typer_expr(folded[0], env, table); }   // whole chain was literals — a single literal, no runtime call
+    tk_segment segs[3] = { { .name = { (const tk_byte *)"teko", 4 } }, { .name = { (const tk_byte *)"string", 6 } }, { .name = { (const tk_byte *)"concat", 6 } } };
+    tk_call call = { .callee = { .segments = segs, .len = 3 }, .args = folded, .nargs = nfolded };
+    // `concat`'s own arg-widening (type_call, below) already requires every piece to be `str` —
+    // a non-str `~` operand fails there with a clear message, no separate check needed here.
+    return type_call(call, env, table);
+}
+
 static tk_texpr_result type_binary(tk_binary b, tk_env env, tk_type_table table) {
+    // `~` is desugared WHOLESALE (chain-flattened + literal-folded) BEFORE the generic
+    // operand-typing below — it never reaches a plain TK_TEXPR_BINARY node (codegen/VM see an
+    // ordinary TCall or a str literal, nothing new to handle, mirroring how `params` needed no
+    // engine changes).
+    if (b.op == TK_TOKEN_TILDE) { return type_tilde_chain(b, env, table); }
     tk_texpr_result l = tk_typer_expr(*b.left,  env, table); if (!l.ok) return l;
     tk_texpr_result r = tk_typer_expr(*b.right, env, table); if (!r.ok) return r;
     tk_type lt = l.as.value.type, rt = r.as.value.type;
