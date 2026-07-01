@@ -642,7 +642,20 @@ tk_char tk_to_upper(tk_char c) {
 struct tk_chunk { struct tk_chunk *next; size_t cap; size_t used; max_align_t data[]; };
 // (W9.3b) `reg_next` is an INTRUSIVE link into the GLOBAL live-region registry (tk_g_regs) — no extra
 // allocation. tk_region_new prepends; tk_region_drop unlinks; tk_regions_free_all walks + frees all.
-struct tk_region { struct tk_chunk *head; struct tk_region *reg_next; };
+// (S2) `parent` is the arena TREE edge (NULL = no parent — the root, or a deliberately
+// parentless region); DISTINCT from `reg_next` (the flat global live-region list, unrelated to
+// tree shape). `entries`/`nentries`/`entries_cap` is the per-region type→instance registry: a
+// small realloc-array (no hashing — arena depths/entry counts are small; same growth pattern as
+// TK_RT_LIST). Lazy: NULL/0 until the first tk_region_register call.
+typedef struct { uint64_t type_id; void *instance; } tk_region_entry;
+struct tk_region {
+    struct tk_chunk  *head;
+    struct tk_region  *reg_next;
+    struct tk_region  *parent;
+    tk_region_entry   *entries;
+    size_t             nentries;
+    size_t             entries_cap;
+};
 _Static_assert(offsetof(struct tk_chunk, data) % _Alignof(max_align_t) == 0,
                "chunk payload base must be max_align_t-aligned");
 
@@ -658,13 +671,42 @@ static struct tk_chunk *tk_chunk_try(size_t payload) {
 static tk_region *tk_g_regs = NULL;
 static tk_region *tk_g_root = NULL;   // single-threaded seed (S8 revisit); lazy + idempotent (the root is also on tk_g_regs)
 
-tk_region *tk_region_new(void) {
+tk_region *tk_region_new(tk_region *parent) {
     tk_region *r = malloc(sizeof *r);          // the region header is itself a libc block
     if (r == NULL) tk_panic("out of memory");  // (so tk_region_drop can free() it)
     r->head = NULL;                            // lazy: the first alloc creates the head chunk
     r->reg_next = tk_g_regs;                   // (W9.3b) prepend onto the live-region registry
     tk_g_regs = r;
+    r->parent = parent;                        // (S2) the arena tree edge
+    r->entries = NULL; r->nentries = 0; r->entries_cap = 0;   // (S2) the per-region registry, lazy
     return r;
+}
+
+// (S2) bind type_id → instance in r's OWN table. A second registration of the same type_id
+// OVERWRITES (storage primitive only — true duplicate-registration errors belong to a higher
+// DI layer, not the arena).
+void tk_region_register(tk_region *r, uint64_t type_id, void *instance) {
+    if (r == NULL) return;
+    for (size_t i = 0; i < r->nentries; i += 1) {
+        if (r->entries[i].type_id == type_id) { r->entries[i].instance = instance; return; }
+    }
+    if (r->nentries == r->entries_cap) {
+        size_t ncap = r->entries_cap == 0 ? 4 : r->entries_cap * 2;
+        tk_region_entry *ne = realloc(r->entries, ncap * sizeof *ne);
+        if (ne == NULL) tk_panic("out of memory");
+        r->entries = ne; r->entries_cap = ncap;
+    }
+    r->entries[r->nentries++] = (tk_region_entry){ .type_id = type_id, .instance = instance };
+}
+
+// (S2) walk r, then r->parent, then r->parent->parent, … until type_id is found (else NULL).
+void *tk_region_lookup(tk_region *r, uint64_t type_id) {
+    for (; r != NULL; r = r->parent) {
+        for (size_t i = 0; i < r->nentries; i += 1) {
+            if (r->entries[i].type_id == type_id) return r->entries[i].instance;
+        }
+    }
+    return NULL;
 }
 
 void *tk_region_alloc(tk_region *r, size_t n) {
@@ -707,6 +749,7 @@ void tk_region_drop(tk_region *r) {
     struct tk_chunk *c = r->head;
     r->head = NULL;                                  // MEM Step-1 idempotency: clear before free so a re-entrant/second walk frees nothing
     while (c != NULL) { struct tk_chunk *next = c->next; free(c); c = next; }
+    free(r->entries); r->entries = NULL; r->nentries = 0; r->entries_cap = 0;   // (S2) the per-region registry — a separate malloc'd array, not chunk-backed
     free(r);
 }
 
@@ -725,6 +768,7 @@ void tk_regions_free_all(void) {
         tk_region *rnext = r->reg_next;
         struct tk_chunk *c = r->head;
         while (c != NULL) { struct tk_chunk *cnext = c->next; free(c); c = cnext; }
+        free(r->entries);   // (S2) the per-region registry — a separate malloc'd array, not chunk-backed
         free(r);
         r = rnext;
     }
@@ -732,7 +776,7 @@ void tk_regions_free_all(void) {
 
 tk_region *tk_region_root(void) {
     if (tk_g_root == NULL) {
-        tk_g_root = tk_region_new();
+        tk_g_root = tk_region_new(NULL);   // (S2) the tree root — no parent
         // (W9.3b) register the leak-clean termination hook ONCE (the root is created exactly once per
         // process, lazily). atexit fires on normal main return AND on libc exit() (tk_exit's path), so
         // a NORMALLY-terminating program is leak-clean too; tk_regions_free_all is idempotent, so the

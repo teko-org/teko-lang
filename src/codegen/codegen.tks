@@ -2428,7 +2428,7 @@ fn emit_branch_value(buf: []byte, prog: checker::TProgram, ret_type: checker::Ty
     let base = dctx.defers.len   // (W9.3) defer scope base for this value-arm
     let fall = cg_append_direct_defers(dctx.defers, body)
     let region = fresh_named("_tkbr", buf.len to i64)
-    mut out = cb(buf, indent); out = cb(out, "tk_region *"); out = cb(out, region); out = cb(out, " = tk_region_new();\n")
+    mut out = cb(buf, indent); out = cb(out, "tk_region *"); out = cb(out, region); out = cb(out, " = tk_region_new("); out = cb(out, cg_enclosing_region_expr(regions)); out = cb(out, ");\n")
     let regs2 = teko::list::push(regions, RegionFrame { name = region; label = ""; is_loop = false; defer_base = base })
     mut cur = dctx
     mut i = 0
@@ -3555,7 +3555,7 @@ fn emit_arm_value(buf: []byte, prog: checker::TProgram, ret_type: checker::Type,
     let cur_blk = if want_block { body } else { teko::list::empty() }
     mut out = buf
     if want_block {
-        out = cb(out, ci); out = cb(out, "tk_region *"); out = cb(out, region); out = cb(out, " = tk_region_new();\n")
+        out = cb(out, ci); out = cb(out, "tk_region *"); out = cb(out, region); out = cb(out, " = tk_region_new("); out = cb(out, cg_enclosing_region_expr(regions)); out = cb(out, ");\n")
     }
     mut cur = dctx
     mut i = 0
@@ -3749,7 +3749,7 @@ fn emit_match_tail(buf: []byte, prog: checker::TProgram, e: checker::TExpr, m: c
 // while(0)` + break) precisely because an arm body is a BLOCK that may contain `break`/`continue`
 // targeting an ENCLOSING loop — those must be real C break/continue, never swallowed by a wrapper
 // (mirrors the VM propagating the arm's flow). (C: `emit_match_stmt`.)
-fn emit_match_stmt(buf: []byte, prog: checker::TProgram, e: checker::TExpr, m: checker::TMatchExpr, in_main: bool, ret_type: checker::Type, indent: str, escaping: []str, regions: []RegionFrame, fn_body: []checker::TStatement, dctx: DeferCtx, cur_block: []checker::TStatement, cur_block_is_value: bool) -> []byte | error {
+fn emit_match_stmt(buf: []byte, prog: checker::TProgram, e: checker::TExpr, m: checker::TMatchExpr, in_main: bool, ret_type: checker::Type, indent: str, frame: str, escaping: []str, regions: []RegionFrame, fn_body: []checker::TStatement, dctx: DeferCtx, cur_block: []checker::TStatement, cur_block_is_value: bool) -> []byte | error {
     let subj = fresh_named("_s", buf.len to i64)
     let done = teko::str::concat(fresh_named("tk_m", buf.len to i64 + 1), "_done")   // unique commit label (str concat — no `+` on str)
     let subjT = m.subject.type   // for optional / variant pattern lowering
@@ -3786,7 +3786,7 @@ fn emit_match_stmt(buf: []byte, prog: checker::TProgram, e: checker::TExpr, m: c
         // wraps null correctly into the enclosing function's return slot.
         // S2 — the arm body gets its OWN arm region for its block-local bindings (emit_block_region),
         // dropped at the arm's fall-through / via the region stack on break/continue/return.
-        out = match emit_block_region(out, arm.body, in_main, prog, ret_type, ci, escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
+        out = match emit_block_region(out, arm.body, in_main, prog, ret_type, ci, frame, escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
         out = cb(out, ci)
         out = cb(out, "goto ")
         out = cb(out, done)
@@ -3979,6 +3979,22 @@ fn emit_lambda(buf: []byte, prog: checker::TProgram, e: checker::TExpr, lam: che
 // with the C twin (cg_block_region.defer_base); the Teko twin tracks the live count via `dctx.defers`.
 type RegionFrame = struct { name: str; label: str; is_loop: bool; defer_base: u64 }
 
+// (S2 — arena parent-ptr tree, 2026-07-01) the C EXPRESSION TEXT for the region a NEW
+// `tk_region_new(...)` call should name as its parent: the innermost open block region if any,
+// else the process root. Twin of the C `cg_enclosing_region_expr` for call sites that never see a
+// live frame (VALUE-form if/match arms — C clears g_cg_frame="" before descending into those, so
+// omitting the frame branch here is not a divergence, it is the SAME invariant expressed
+// functionally instead of via a cleared global).
+fn cg_enclosing_region_expr(regions: []RegionFrame) -> str {
+    if regions.len > 0 { regions[regions.len - 1].name } else { "tk_region_root()" }
+}
+// The STATEMENT-form twin (if-stmt/match-stmt arms, loop bodies): these run WITHOUT a frame-clear
+// in C (only the value-form arms clear it), so `frame` may still be live — fall back to it before
+// the process root.
+fn cg_enclosing_region_expr_framed(regions: []RegionFrame, frame: str) -> str {
+    if regions.len > 0 { regions[regions.len - 1].name } else if frame != "" { frame } else { "tk_region_root()" }
+}
+
 // (W9.3) LoopDeferFrame — one active LOOP scope's defer base (dctx.defers.len at the loop's body entry).
 // A break/continue fires every defer registered at index ≥ the TARGET loop's base (the scopes it
 // crosses), LIFO. The Teko twin opens a RegionFrame only when a loop has a block-local, so loop defer
@@ -4153,7 +4169,7 @@ fn emit_block(buf: []byte, body: []checker::TStatement, in_main: bool, prog: che
 // fall-through past the arm. break/continue/return inside the arm drop it via the region-stack
 // helpers (break/continue CROSS it down to the target loop; return drops everything). No block-local
 // binding ⇒ no region ⇒ byte-identical to emit_block (the pre-S2 statement-arm path). (C: emit_block_region.)
-fn emit_block_region(buf: []byte, body: []checker::TStatement, in_main: bool, prog: checker::TProgram, ret_type: checker::Type, indent: str, escaping: []str, regions: []RegionFrame, fn_body: []checker::TStatement, dctx: DeferCtx) -> []byte | error {
+fn emit_block_region(buf: []byte, body: []checker::TStatement, in_main: bool, prog: checker::TProgram, ret_type: checker::Type, indent: str, frame: str, escaping: []str, regions: []RegionFrame, fn_body: []checker::TStatement, dctx: DeferCtx) -> []byte | error {
     // (W9.3) EVERY statement-arm is a DEFER SCOPE — even with no S2 region — so a defer inside the arm
     // fires at the arm's fall-through (before the arm's region, if any, drops). `base` = the in-scope
     // defer count at arm entry; the fall-through fires `[base, base+direct)` LIFO.
@@ -4168,7 +4184,7 @@ fn emit_block_region(buf: []byte, body: []checker::TStatement, in_main: bool, pr
     // Open the arm region. Name by the buffer length at the creation point (the deterministic
     // `_tkbr<len>` uniquifier — matches the C twin's b->len read without a counter).
     let region = fresh_named("_tkbr", buf.len to i64)
-    mut out = cb(buf, indent); out = cb(out, "tk_region *"); out = cb(out, region); out = cb(out, " = tk_region_new();\n")
+    mut out = cb(buf, indent); out = cb(out, "tk_region *"); out = cb(out, region); out = cb(out, " = tk_region_new("); out = cb(out, cg_enclosing_region_expr_framed(regions, frame)); out = cb(out, ");\n")
     let regs2 = teko::list::push(regions, RegionFrame { name = region; label = ""; is_loop = false; defer_base = base })
     // Emit the body with THIS block as the current block context (so block-local bindings route to
     // `region`) and the augmented region stack.
@@ -4199,7 +4215,7 @@ fn emit_exprstmt_tail(buf: []byte, x: checker::TExpr, in_main: bool, prog: check
             // emit_if_stmt/emit_match_stmt) gets the correct block-locality (matches the C twin's global
             // g_cg_escaping — without it the predicate sees an empty set and false-positives a region).
             // No else branch: emit as a control-flow statement; fall-through handled by caller's default return.
-            if !f.has_else { return emit_if_stmt(buf, f, in_main, prog, ret_type, indent, escaping, teko::list::empty(), fn_body, dctx, teko::list::empty(), false) }
+            if !f.has_else { return emit_if_stmt(buf, f, in_main, prog, ret_type, indent, frame, escaping, teko::list::empty(), fn_body, dctx, teko::list::empty(), false) }
             mut out = cb(buf, indent)
             out = cb(out, "if (")
             out = match emit_expr_ctx(out, prog, checker::Void { }, f.cond, escaping, teko::list::empty(), fn_body, dctx) { []byte as o => o; error as err => return err }
@@ -4293,7 +4309,7 @@ fn emit_block_tail(buf: []byte, body: []checker::TStatement, in_main: bool, prog
 // a statement-position `if` (an expr-statement whose expr is an `if`) to exec_if as CONTROL
 // FLOW — never to the value path. (The TAIL `if` takes emit_exprstmt_tail; a SUB-expression
 // `if` takes emit_if_value; this is the INTERIOR statement case.) (C: `emit_if_stmt`.)
-fn emit_if_stmt(buf: []byte, f: checker::TIfExpr, in_main: bool, prog: checker::TProgram, ret_type: checker::Type, indent: str, escaping: []str, regions: []RegionFrame, fn_body: []checker::TStatement, dctx: DeferCtx, cur_block: []checker::TStatement, cur_block_is_value: bool) -> []byte | error {
+fn emit_if_stmt(buf: []byte, f: checker::TIfExpr, in_main: bool, prog: checker::TProgram, ret_type: checker::Type, indent: str, frame: str, escaping: []str, regions: []RegionFrame, fn_body: []checker::TStatement, dctx: DeferCtx, cur_block: []checker::TStatement, cur_block_is_value: bool) -> []byte | error {
     mut out = cb(buf, indent)
     out = cb(out, "if (")
     out = match emit_expr_ctx(out, prog, checker::Void { }, f.cond, escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
@@ -4303,11 +4319,11 @@ fn emit_if_stmt(buf: []byte, f: checker::TIfExpr, in_main: bool, prog: checker::
     // block-local bindings, dropped at the branch's fall-through / via the region stack on break/
     // continue/return. A branch with no block-local binding opens none → byte-identical. (The enclosing
     // `regions`/`fn_body` are threaded so a break/continue/return inside a branch drops the right regions.)
-    out = match emit_block_region(out, f.then_blk, in_main, prog, ret_type, inner, escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
+    out = match emit_block_region(out, f.then_blk, in_main, prog, ret_type, inner, frame, escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
     if f.has_else {
         out = cb(out, indent)
         out = cb(out, "} else {\n")
-        out = match emit_block_region(out, f.else_blk, in_main, prog, ret_type, inner, escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
+        out = match emit_block_region(out, f.else_blk, in_main, prog, ret_type, inner, frame, escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
     }
     out = cb(out, indent)
     cb(out, "}\n")
@@ -4433,7 +4449,7 @@ fn emit_return(buf: []byte, prog: checker::TProgram, r: checker::TReturn, in_mai
 // lowers to `goto tk_lbl_<NAME>_cont;`, re-running the body == the next while(1) iteration) and a
 // break-target `tk_lbl_<NAME>_break: ;` AFTER the loop (so `break L` lowers to `goto …_break;`).
 // A bare loop is unchanged. (C: TK_TSTMT_LOOP branch; C grew the inner indent with snprintf.)
-fn emit_loop(buf: []byte, l: checker::TLoopStmt, in_main: bool, prog: checker::TProgram, ret_type: checker::Type, indent: str, escaping: []str, regions: []RegionFrame, fn_body: []checker::TStatement, dctx: DeferCtx) -> []byte | error {
+fn emit_loop(buf: []byte, l: checker::TLoopStmt, in_main: bool, prog: checker::TProgram, ret_type: checker::Type, indent: str, frame: str, escaping: []str, regions: []RegionFrame, fn_body: []checker::TStatement, dctx: DeferCtx) -> []byte | error {
     let labeled = l.label.len > 0
     mut out = cb(buf, indent)
     out = cb(out, "while (1) {\n")
@@ -4458,7 +4474,7 @@ fn emit_loop(buf: []byte, l: checker::TLoopStmt, in_main: bool, prog: checker::T
     let region = if want_block { fresh_named("_tkbr", out.len to i64) } else { "" }
     mut regs2 = regions
     if want_block {
-        out = cb(out, inner); out = cb(out, "tk_region *"); out = cb(out, region); out = cb(out, " = tk_region_new();\n")
+        out = cb(out, inner); out = cb(out, "tk_region *"); out = cb(out, region); out = cb(out, " = tk_region_new("); out = cb(out, cg_enclosing_region_expr_framed(regions, frame)); out = cb(out, ");\n")
         regs2 = teko::list::push(regions, RegionFrame { name = region; label = l.label; is_loop = true; defer_base = base })
     }
     // emit the body with THIS block as the current block context (so a block-local binding routes to
@@ -4509,8 +4525,8 @@ fn emit_stmt(buf: []byte, s: checker::TStatement, in_main: bool, prog: checker::
             // exec_stmt → exec_if), so break/continue/return inside a branch propagate. W5b —
             // a `match` in statement position runs each winning arm body for effect.
             match es.expr.kind {
-                checker::TIfExpr as f    => emit_if_stmt(buf, f, in_main, prog, ret_type, indent, escaping, regions, fn_body, dctx, cur_block, cur_block_is_value)
-                checker::TMatchExpr as m => emit_match_stmt(buf, prog, es.expr, m, in_main, ret_type, indent, escaping, regions, fn_body, dctx, cur_block, cur_block_is_value)
+                checker::TIfExpr as f    => emit_if_stmt(buf, f, in_main, prog, ret_type, indent, frame, escaping, regions, fn_body, dctx, cur_block, cur_block_is_value)
+                checker::TMatchExpr as m => emit_match_stmt(buf, prog, es.expr, m, in_main, ret_type, indent, frame, escaping, regions, fn_body, dctx, cur_block, cur_block_is_value)
                 _ => {
                     mut out = cb(buf, indent)
                     out = match emit_expr_ctx(out, prog, checker::Void { }, es.expr, escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
@@ -4518,7 +4534,7 @@ fn emit_stmt(buf: []byte, s: checker::TStatement, in_main: bool, prog: checker::
                 }
             }
         }
-        checker::TLoopStmt as l     => emit_loop(buf, l, in_main, prog, ret_type, indent, escaping, regions, fn_body, dctx)
+        checker::TLoopStmt as l     => emit_loop(buf, l, in_main, prog, ret_type, indent, frame, escaping, regions, fn_body, dctx)
         checker::TBreakStmt as b    => {
             // (W9.3) `break` crosses every scope from here down to & including its target loop body:
             // fire those scopes' defers (base = the target loop's defer_base) LIFO — one sweep,
@@ -4654,7 +4670,7 @@ fn emit_function(buf: []byte, prog: checker::TProgram, f: checker::TFunction) ->
     let escaping = checker::fn_escaping_vars(f)
     let want_frame = fn_body_has_frame_local(escaping, fbody)
     let frame: str = if want_frame { "_tkfr" } else { "" }
-    if want_frame { out = cb(out, "    tk_region *_tkfr = tk_region_new();\n") }
+    if want_frame { out = cb(out, "    tk_region *_tkfr = tk_region_new(tk_region_root());\n") }
     // W5a — a fn body's trailing expr-statement carrying a value implicitly returns it.
     // W5b — thread the fn's return type so a tail/return case value is wrapped into a variant
     // return slot (emit_as).

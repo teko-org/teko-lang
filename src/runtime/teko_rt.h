@@ -135,10 +135,25 @@ void *tk_alloc(size_t n);
 // needs old-size threaded through TK_LIST — an S2-scope change).
 #define TK_REGION_DEFAULT_CHUNK (64u * 1024u)   // default chunk payload (bytes)
 typedef struct tk_region tk_region;             // opaque — full struct lives in teko_rt.c
-tk_region *tk_region_new(void);                 // a fresh empty region (default chunk size)
+// (S2 — arena PARENT-PTR TREE + per-arena type→instance registry) tk_region_new now takes the
+// enclosing region as its PARENT (NULL for a parentless/root region). Codegen threads the
+// currently-active region variable (the function frame, or the innermost block region) at every
+// call site, so the tree mirrors the LEXICAL nesting that used to be implicit in C scoping only.
+// This is the prerequisite for a future DI `#scoped` lifetime: tk_region_lookup walks UP the
+// parent chain to find an already-materialized ancestor instance before tk_region_register makes
+// a new one in the CURRENT arena (never an ancestor's — registration is always local).
+tk_region *tk_region_new(tk_region *parent);    // a fresh empty region (default chunk size), child of `parent` (NULL = no parent)
 void      *tk_region_alloc(tk_region *r, size_t n);  // bump-allocate n (n→1), aligned; OOM→panic
 void       tk_region_drop(tk_region *r);        // bulk-free every chunk + the region (NULL-tolerant; idempotent on a re-walk — head is cleared before free; callers MUST null their handle after, as the freed region must not be reused)
-tk_region *tk_region_root(void);                // the process root region (lazy; never dropped in S1)
+tk_region *tk_region_root(void);                // the process root region (lazy; never dropped in S1; parent = NULL — the tree root)
+// tk_region_register — bind `type_id` → `instance` in `r`'s OWN table (never an ancestor's; a
+// second registration of the same type_id in the same region OVERWRITES — the compiler is
+// expected to enforce true duplicate-registration errors at a higher DI layer; this is just the
+// storage primitive).
+void       tk_region_register(tk_region *r, uint64_t type_id, void *instance);
+// tk_region_lookup — find `type_id`'s instance in `r`, else its parent, else its parent's parent,
+// … until found or the chain ends (NULL). The #scoped walk-up primitive.
+void      *tk_region_lookup(tk_region *r, uint64_t type_id);
 // (W9.3b) tk_regions_free_all — free EVERY still-live region (the root + every live scoped frame/block
 // region) and empty the registry. Called at the termination choke points (tk_panic*, tk_exit, and an
 // atexit hook lazily registered in tk_region_root) so that an abnormal exit/panic does not leak the

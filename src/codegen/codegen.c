@@ -271,6 +271,15 @@ typedef struct { const char *name; tk_str label; bool is_loop; size_t defer_base
 static cg_block_region g_cg_block_stack[TK_CG_MAX_BLOCK_REGIONS];
 static size_t          g_cg_block_depth   = 0;   // active block-body regions, innermost last
 static char            g_cg_block_names[TK_CG_MAX_BLOCK_REGIONS][24];   // backing store for `_tkbr<len>`
+// (S2 — arena parent-ptr tree) the C EXPRESSION TEXT for the region a NEW `tk_region_new(...)` call
+// should name as its parent, at the CURRENT emit point: the innermost open block region if any is
+// open, else the active frame region if one exists, else the process root. Read BEFORE pushing the
+// new region onto g_cg_block_stack (so it never parents itself).
+static const char *cg_enclosing_region_expr(void) {
+    if (g_cg_block_depth > 0) return g_cg_block_stack[g_cg_block_depth - 1].name;
+    if (g_cg_frame[0] != '\0') return g_cg_frame;
+    return "tk_region_root()";
+}
 // The function body + the CURRENT block being emitted — for tk_binding_is_block_local read counts.
 static const tk_tstatement *g_cg_fn_body  = NULL;
 static size_t               g_cg_fn_nbody = 0;
@@ -1194,7 +1203,7 @@ static bool emit_branch_value(cbuf *b, const tk_tstatement *body, size_t n, tk_t
         // `_tkbr<len>` uniquifier — matches the Teko twin's out.len read without a counter).
         snprintf(g_cg_block_names[g_cg_block_depth], sizeof g_cg_block_names[g_cg_block_depth], "_tkbr%zu", (size_t)b->len);
         region = g_cg_block_names[g_cg_block_depth];
-        cb(b, indent); cb(b, "tk_region *"); cb(b, region); cb(b, " = tk_region_new();\n");
+        cb(b, indent); cb(b, "tk_region *"); cb(b, region); cb(b, " = tk_region_new("); cb(b, cg_enclosing_region_expr()); cb(b, ");\n");
         g_cg_block_stack[g_cg_block_depth].name  = region;
         g_cg_block_stack[g_cg_block_depth].label = (tk_str){ .ptr = NULL, .len = 0 };
         g_cg_block_stack[g_cg_block_depth].is_loop = false;   // an ARM region is never a break/continue target
@@ -3221,7 +3230,7 @@ static bool emit_arm_value(cbuf *b, const tk_texpr *match_e, const tk_tstatement
     if (want_block) {
         snprintf(g_cg_block_names[g_cg_block_depth], sizeof g_cg_block_names[g_cg_block_depth], "_tkbr%zu", (size_t)b->len);
         region = g_cg_block_names[g_cg_block_depth];
-        cb(b, commit_indent); cb(b, "tk_region *"); cb(b, region); cb(b, " = tk_region_new();\n");
+        cb(b, commit_indent); cb(b, "tk_region *"); cb(b, region); cb(b, " = tk_region_new("); cb(b, cg_enclosing_region_expr()); cb(b, ");\n");
         g_cg_block_stack[g_cg_block_depth].name  = region;
         g_cg_block_stack[g_cg_block_depth].label = (tk_str){ .ptr = NULL, .len = 0 };
         g_cg_block_stack[g_cg_block_depth].is_loop = false;   // an ARM region is never a break/continue target
@@ -3487,7 +3496,7 @@ static bool emit_block_region(cbuf *b, const tk_tstatement *body, size_t n, bool
         // `_tkbr<len>` uniquifier — matches the Teko twin's out.len read without a counter).
         snprintf(g_cg_block_names[g_cg_block_depth], sizeof g_cg_block_names[g_cg_block_depth], "_tkbr%zu", (size_t)b->len);
         region = g_cg_block_names[g_cg_block_depth];
-        cb(b, indent); cb(b, "tk_region *"); cb(b, region); cb(b, " = tk_region_new();\n");
+        cb(b, indent); cb(b, "tk_region *"); cb(b, region); cb(b, " = tk_region_new("); cb(b, cg_enclosing_region_expr()); cb(b, ");\n");
     }
     g_cg_block_stack[g_cg_block_depth].name  = region;   // "" ⇒ a region-less defer-only scope
     g_cg_block_stack[g_cg_block_depth].label = (tk_str){ .ptr = NULL, .len = 0 };
@@ -3809,7 +3818,7 @@ static bool emit_stmt(cbuf *b, const tk_tstatement *s, bool in_main,
                     // byte-identical names without threading a counter through its functional emitter.
                     snprintf(g_cg_block_names[g_cg_block_depth], sizeof g_cg_block_names[g_cg_block_depth], "_tkbr%zu", (size_t)b->len);
                     region = g_cg_block_names[g_cg_block_depth];
-                    cb(b, inner); cb(b, "tk_region *"); cb(b, region); cb(b, " = tk_region_new();\n");
+                    cb(b, inner); cb(b, "tk_region *"); cb(b, region); cb(b, " = tk_region_new("); cb(b, cg_enclosing_region_expr()); cb(b, ");\n");
                 }
                 g_cg_block_stack[g_cg_block_depth].name  = region;   // "" ⇒ a region-less defer-only loop scope
                 g_cg_block_stack[g_cg_block_depth].label = lbl;
@@ -3928,7 +3937,7 @@ static bool emit_function(cbuf *b, tk_tfunction f, const char **err) {
     g_cg_escaping = tk_fn_escaping_vars(f);
     bool want_frame = cg_body_has_frame_local(g_cg_escaping, f.body, f.nbody);
     g_cg_frame = want_frame ? "_tkfr" : "";
-    if (want_frame) cb(b, "    tk_region *_tkfr = tk_region_new();\n");
+    if (want_frame) cb(b, "    tk_region *_tkfr = tk_region_new(tk_region_root());\n");
     // W5a — a fn body's trailing expr-statement carrying a value implicitly returns it.
     // W5b — thread the fn's return type so a tail/return case value is wrapped into a
     // variant return slot (emit_as).
