@@ -191,8 +191,16 @@ tk_type_result tk_builtin_fn(tk_str name) {
     if (name_is(name, "f64_g17"))      return TK_BFN(&f64_t, 1);    // teko::fmt::f64_g17(f64) -> str (host float renderer FFI bottom)
     // teko::str::* — the self-host string stdlib the corpus calls namespaced (resolved by last
     // segment, like the underscored twins above; the C runtime twins are tk_str_concat/slice/…).
-    if (name_is(name, "concat"))       return TK_BFN(str2_t, 2);      // str::concat(str, str) -> str
-    if (name_is(name, "concat3"))      return TK_BFN(str3_t, 3);      // str::concat3(str, str, str) -> str
+    // "concat"/"concat3" are matched by BARE last-segment name (see the callers of
+    // scope_builtin_fn / tk_env_lookup_call), so ANY namespace prefix ending in these names
+    // resolves identically — this is what makes `teko::string::concat(a, b)` (the LEGISLATED
+    // public API per TEKO_LEGISLATION.md's "`+` never concatenates" rule: string building is
+    // `string::concat` / interpolation `$"..."`, never `+`) and `teko::str::concat(a, b)` (the
+    // spelling the corpus already uses pervasively) two names for the same builtin dispatch.
+    // No separate registration is needed for the `string::` spelling — this comment documents
+    // the mechanism so the legislated name is discoverable here, not just inferable.
+    if (name_is(name, "concat"))       return TK_BFN(str2_t, 2);      // str::concat(str, str) -> str ; == string::concat (legislated)
+    if (name_is(name, "concat3"))      return TK_BFN(str3_t, 3);      // str::concat3(str, str, str) -> str ; == string::concat3
     if (name_is(name, "slice_to"))     return TK_BFN(str_u64_p, 2);   // str::slice_to(str, u64) -> str
     if (name_is(name, "slice_from"))   return TK_BFN(str_u64_p, 2);   // str::slice_from(str, u64) -> str
     #undef TK_BFN

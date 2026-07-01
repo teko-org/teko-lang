@@ -824,6 +824,9 @@ static bool try_builtin_call(tk_path p, const tk_texpr *args, size_t nargs,
         *out = v_str(tk_fmt_dyn_u64((uint64_t)v_as_u128(v), s.as.s)); return true;
     }
     // str STDLIB surface — the SAME runtime symbols native codegen lowers to, so VM==native.
+    // Matched by BARE last segment (`last`, above) — teko::str::concat and the LEGISLATED
+    // teko::string::concat (TEKO_LEGISLATION.md "`+` never concatenates": string building is
+    // `string::concat` / interpolation `$"..."`, never `+`) are the SAME builtin dispatch.
     if (seg_is(last, "concat") || seg_is(last, "str_concat")) {
         tk_value a = tk_vm_eval_expr(&args[0], env), b = tk_vm_eval_expr(&args[1], env);
         *out = v_str(tk_str_concat(a.as.s, b.as.s)); return true;
