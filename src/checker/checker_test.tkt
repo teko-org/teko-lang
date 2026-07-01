@@ -1949,3 +1949,71 @@ fn constraint_no_constraint_always_satisfied() {
         error     => teko::assert::is_true(false)
     }
 }
+
+// --- OOP A1 (2026-07-01): unified method model -- struct instance + static methods ---------
+// `type Pt = struct { x: i64; fn sum(self) -> i64 { self.x }; fn origin() -> i64 { 0 } }` --
+// sum(self)=instance (1st param untyped, the receiver), origin()=static (no untyped 1st param).
+fn recv_param(name: str) -> parser::Param { parser::Param { name = name; has_type = false; type_ann = named_t("i64"); is_params = false; has_default = false; default_expr = e_num(0) } }
+fn mk_pt_struct() -> parser::TypeDecl {
+    let field_x = parser::Field { name = "x"; type_ann = named_t("i64") }
+    let sum_params = teko::list::push(teko::list::empty(), recv_param("self"))
+    let sum_body = one_stmt(ek(parser::FieldAccess { receiver = e_var("self"); field = "x" }))
+    let sum_fn = parser::Function { name = "sum"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = sum_params; has_return = true; return_type = named_t("i64"); body = sum_body; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = "" }
+    let origin_fn = parser::Function { name = "origin"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = teko::list::empty(); has_return = true; return_type = named_t("i64"); body = one_stmt(e_num(0)); vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = "" }
+    let methods = teko::list::push(teko::list::push(teko::list::empty(), sum_fn), origin_fn)
+    let body = parser::StructBody { fields = teko::list::push(teko::list::empty(), field_x); methods = methods }
+    parser::TypeDecl { name = "Pt"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = body; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }
+}
+fn pt_item() -> parser::Item { parser::Item { content = mk_pt_struct(); namespace = ""; file = "" } }
+fn pt_struct_lit(x: i128) -> parser::Expr {
+    ek(parser::StructLit { type_path = path1("Pt"); type_args = teko::list::empty(); field_names = teko::list::push(teko::list::empty(), "x"); field_vals = teko::list::push(teko::list::empty(), e_num(x)) })
+}
+
+#test
+fn oop_instance_method_call_type_checks() {
+    // `let p = Pt { x = 7 }; p.sum()` — the struct + a loose statement dot-calling its instance method.
+    let bind_p = parser::Binding { kind = parser::BindKind::Let; target = parser::SimpleName { name = "p" }; has_type = false; type_ann = named_t("i64"); value = pt_struct_lit(7) }
+    let call_sum = st(ek(parser::MethodCall { receiver = e_var("p"); method = "sum"; args = teko::list::empty() }))
+    let items = teko::list::push(teko::list::push(teko::list::empty(), pt_item()), parser::Item { content = bind_p; namespace = ""; file = "" })
+    let items2 = teko::list::push(items, parser::Item { content = call_sum; namespace = ""; file = "" })
+    match type_program(parser::Program { items = items2 }) {
+        TProgram as tp => teko::assert::is_true(tp.items.len >= 3)   // the struct decl + the 2 methods (stamped as extra TFunction items) + the 2 statements
+        error          => teko::assert::is_true(false)
+    }
+}
+
+#test
+fn oop_static_method_call_type_checks() {
+    // `Pt::origin()` -- resolves through the SAME namespace-qualified-call machinery as any other qualified call.
+    let call_origin = st(ek(parser::Call { callee = parser::Path { segments = teko::list::push(teko::list::push(teko::list::empty(), parser::Segment { name = "Pt" }), parser::Segment { name = "origin" }) }; args = teko::list::empty(); arg_names = teko::list::empty() }))
+    let items = teko::list::push(teko::list::push(teko::list::empty(), pt_item()), parser::Item { content = call_origin; namespace = ""; file = "" })
+    match type_program(parser::Program { items = items }) {
+        TProgram => teko::assert::is_true(true)
+        error    => teko::assert::is_true(false)
+    }
+}
+
+#test
+fn oop_dot_call_on_static_method_is_error() {
+    // `p.origin()` -- origin is STATIC (no untyped receiver) -- dot-call must be rejected.
+    let bind_p = parser::Binding { kind = parser::BindKind::Let; target = parser::SimpleName { name = "p" }; has_type = false; type_ann = named_t("i64"); value = pt_struct_lit(7) }
+    let call_bad = st(ek(parser::MethodCall { receiver = e_var("p"); method = "origin"; args = teko::list::empty() }))
+    let items = teko::list::push(teko::list::push(teko::list::empty(), pt_item()), parser::Item { content = bind_p; namespace = ""; file = "" })
+    let items2 = teko::list::push(items, parser::Item { content = call_bad; namespace = ""; file = "" })
+    match type_program(parser::Program { items = items2 }) {
+        TProgram => teko::assert::is_true(false)   // must fail
+        error    => teko::assert::is_true(true)
+    }
+}
+
+#test
+fn oop_unknown_method_is_error() {
+    let bind_p = parser::Binding { kind = parser::BindKind::Let; target = parser::SimpleName { name = "p" }; has_type = false; type_ann = named_t("i64"); value = pt_struct_lit(7) }
+    let call_bad = st(ek(parser::MethodCall { receiver = e_var("p"); method = "nope"; args = teko::list::empty() }))
+    let items = teko::list::push(teko::list::push(teko::list::empty(), pt_item()), parser::Item { content = bind_p; namespace = ""; file = "" })
+    let items2 = teko::list::push(items, parser::Item { content = call_bad; namespace = ""; file = "" })
+    match type_program(parser::Program { items = items2 }) {
+        TProgram => teko::assert::is_true(false)   // must fail
+        error    => teko::assert::is_true(true)
+    }
+}
