@@ -1701,8 +1701,12 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
                     else if (seg_is(last, "one_byte"))    builtin = "tk_one_byte";       // (byte) -> str
                     else if (seg_is(last, "str_concat"))  builtin = "tk_str_concat";     // (str, str) -> str
                     else if (seg_is(last, "str_concat3")) builtin = "tk_str_concat3";    // (str, str, str) -> str
-                    else if (seg_is(last, "concat"))      builtin = "tk_str_concat";     // teko::str::concat
-                    else if (seg_is(last, "concat3"))     builtin = "tk_str_concat3";    // teko::str::concat3
+                    // matched by BARE last segment (`last`, above) — teko::str::concat and the
+                    // LEGISLATED teko::string::concat (TEKO_LEGISLATION.md "`+` never
+                    // concatenates": string building is `string::concat` / interpolation
+                    // `$"..."`, never `+`) are the SAME builtin dispatch; no separate case needed.
+                    else if (seg_is(last, "concat"))      builtin = "tk_str_concat";     // teko::str::concat ; == teko::string::concat
+                    else if (seg_is(last, "concat3"))     builtin = "tk_str_concat3";    // teko::str::concat3 ; == teko::string::concat3
                     else if (seg_is(last, "slice"))       builtin = "tk_str_slice";      // str::slice(str,u64,u64) -> str
                     else if (seg_is(last, "slice_to"))    builtin = "tk_str_slice_to";   // (str,u64) -> str
                     else if (seg_is(last, "slice_from"))  builtin = "tk_str_slice_from"; // (str,u64) -> str
