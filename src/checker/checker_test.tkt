@@ -10,6 +10,13 @@ fn ek(k: parser::ExprKind) -> parser::Expr { parser::Expr { kind = k; line = 0; 
 fn e_num(v: i128) -> parser::Expr { ek(parser::Number { is_float = false; value = v; fval = 0.0 }) }
 fn e_var(name: str) -> parser::Expr { ek(parser::Var { name = name }) }
 fn e_str(t: str)    -> parser::Expr { ek(parser::StrLit { text = t }) }
+// DEFARGS (2026-07-01) — an all-positional arg_names array of length n, for tests unrelated to named-call.
+fn pos_names(n: u64) -> []str {
+    mut out: []str = teko::list::empty()
+    mut i: u64 = 0
+    loop { if i >= n { break }; out = teko::list::push(out, ""); i++ }
+    out
+}
 fn st(e: parser::Expr) -> parser::Statement { parser::ExprStmt { expr = e } }   // an expr-statement
 fn one_stmt(e: parser::Expr) -> []parser::Statement { teko::list::push(teko::list::empty(), st(e)) }
 fn path1(name: str) -> parser::Path { parser::Path { segments = teko::list::push(teko::list::empty(), parser::Segment { name = name }) } }
@@ -176,9 +183,9 @@ fn types_compare_and_unary() {
 fn types_call() {
     let env0 = define(empty_env(), "x", u32t(), false)
     let params: []Type = teko::list::push(teko::list::empty(), u32t())
-    let env = define(env0, "f", Func { params = params; ret = boolt() ; variadic = false }, false)
+    let env = define(env0, "f", Func { params = params; ret = boolt() ; variadic = false ; param_names = []; n_required = (params).len; defaults = [] }, false)
     let args: []parser::Expr = teko::list::push(teko::list::empty(), e_var("x"))
-    let tcall = match type_call(parser::Call { callee = path1("f"); args = args }, env, empty_table()) { TExpr as e => e; error => { teko::assert::is_true(false); return } }
+    let tcall = match type_call(parser::Call { callee = path1("f"); args = args; arg_names = pos_names(args.len) }, env, empty_table()) { TExpr as e => e; error => { teko::assert::is_true(false); return } }
     teko::assert::is_true(prim_is(tcall.type, PrimKind::Bool))
     match tcall.kind { TCall as cc => teko::assert::is_true(cc.args.len == 1); _ => teko::assert::is_true(false) }
 }
@@ -214,7 +221,7 @@ fn types_match() {
 
 // build a `fn NAME(x: u32) -> <ret> { body }` for the function/return tests.
 fn mk_fn(name: str, ret: parser::TypeExpr, body: []parser::Statement) -> parser::Function {
-    let p = parser::Param { name = "x"; type_ann = named_t("u32"); is_params = false }
+    let p = parser::Param { name = "x"; type_ann = named_t("u32"); is_params = false ; has_default = false; default_expr = e_num(0) }
     let params = teko::list::push(teko::list::empty(), p)
     parser::Function { name = name; type_params = teko::list::empty(); params = params; has_return = true; return_type = ret; body = body; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = "" }
 }
@@ -746,7 +753,7 @@ fn checker_render_and_join() {
     teko::assert::is_true(teko::str::contains(rms, "|"))
     // render_func directly — "(i64) -> str"
     let fparams: []Type = teko::list::push(teko::list::empty(), i64t())
-    let rf = render_func(Func { params = fparams; ret = Str { } ; variadic = false })
+    let rf = render_func(Func { params = fparams; ret = Str { } ; variadic = false ; param_names = []; n_required = (fparams).len; defaults = [] })
     teko::assert::is_true(teko::str::contains(rf, "->"))
     // union_collect directly — accumulate two types
     let acc1 = union_collect(teko::list::empty(), i64t(), empty_table())
@@ -844,14 +851,14 @@ fn types_chars_and_len_chars_builtins() {
     match builtin_fn("len_chars") { Type => teko::assert::is_true(true); error => teko::assert::is_true(false) }
     // type_call: chars("abc") must type as []char (Slice { element = Char {} }).
     let str_args: []parser::Expr = teko::list::push(teko::list::empty(), e_str("abc"))
-    let tc = match type_call(parser::Call { callee = path1("chars"); args = str_args }, empty_env(), empty_table()) {
+    let tc = match type_call(parser::Call { callee = path1("chars"); args = str_args; arg_names = pos_names(str_args.len) }, empty_env(), empty_table()) {
         TExpr as e => e
         error => { teko::assert::is_true(false); return }
     }
     match tc.type { Slice as sl => match sl.element { Char => teko::assert::is_true(true); _ => teko::assert::is_true(false) }; _ => teko::assert::is_true(false) }
     // type_call: len_chars("abc") must type as i64.
     let str_args2: []parser::Expr = teko::list::push(teko::list::empty(), e_str("abc"))
-    let tlc = match type_call(parser::Call { callee = path1("len_chars"); args = str_args2 }, empty_env(), empty_table()) {
+    let tlc = match type_call(parser::Call { callee = path1("len_chars"); args = str_args2; arg_names = pos_names(str_args2.len) }, empty_env(), empty_table()) {
         TExpr as e => e
         error => { teko::assert::is_true(false); return }
     }
@@ -873,7 +880,7 @@ fn types_round0_char_ops_builtins() {
 
     // type_call: char_at("hello", 1i64) must type as char.
     let str_i64_args: []parser::Expr = teko::list::push(teko::list::push(teko::list::empty(), e_str("hello")), e_num(1))
-    let tca = match type_call(parser::Call { callee = path1("char_at"); args = str_i64_args }, empty_env(), empty_table()) {
+    let tca = match type_call(parser::Call { callee = path1("char_at"); args = str_i64_args; arg_names = pos_names(str_i64_args.len) }, empty_env(), empty_table()) {
         TExpr as e => e
         error => { teko::assert::is_true(false); return }
     }
@@ -881,7 +888,7 @@ fn types_round0_char_ops_builtins() {
 
     // type_call: str_slice_chars("hello", 1i64, 3i64) must type as str.
     let ssc_args: []parser::Expr = teko::list::push(teko::list::push(teko::list::push(teko::list::empty(), e_str("hello")), e_num(1)), e_num(3))
-    let tssc = match type_call(parser::Call { callee = path1("str_slice_chars"); args = ssc_args }, empty_env(), empty_table()) {
+    let tssc = match type_call(parser::Call { callee = path1("str_slice_chars"); args = ssc_args; arg_names = pos_names(ssc_args.len) }, empty_env(), empty_table()) {
         TExpr as e => e
         error => { teko::assert::is_true(false); return }
     }
@@ -889,7 +896,7 @@ fn types_round0_char_ops_builtins() {
 
     // type_call: is_alpha(char_literal) must type as bool.
     let char_args: []parser::Expr = teko::list::push(teko::list::empty(), ek(parser::CharLit { bytes = "a" }))
-    let tia = match type_call(parser::Call { callee = path1("is_alpha"); args = char_args }, empty_env(), empty_table()) {
+    let tia = match type_call(parser::Call { callee = path1("is_alpha"); args = char_args; arg_names = pos_names(char_args.len) }, empty_env(), empty_table()) {
         TExpr as e => e
         error => { teko::assert::is_true(false); return }
     }
@@ -897,7 +904,7 @@ fn types_round0_char_ops_builtins() {
 
     // type_call: to_lower(char_literal) must type as char.
     let char_args2: []parser::Expr = teko::list::push(teko::list::empty(), ek(parser::CharLit { bytes = "A" }))
-    let ttl = match type_call(parser::Call { callee = path1("to_lower"); args = char_args2 }, empty_env(), empty_table()) {
+    let ttl = match type_call(parser::Call { callee = path1("to_lower"); args = char_args2; arg_names = pos_names(char_args2.len) }, empty_env(), empty_table()) {
         TExpr as e => e
         error => { teko::assert::is_true(false); return }
     }
@@ -905,7 +912,7 @@ fn types_round0_char_ops_builtins() {
 
     // type_call: to_upper(char_literal) must type as char.
     let char_args3: []parser::Expr = teko::list::push(teko::list::empty(), ek(parser::CharLit { bytes = "a" }))
-    let ttu = match type_call(parser::Call { callee = path1("to_upper"); args = char_args3 }, empty_env(), empty_table()) {
+    let ttu = match type_call(parser::Call { callee = path1("to_upper"); args = char_args3; arg_names = pos_names(char_args3.len) }, empty_env(), empty_table()) {
         TExpr as e => e
         error => { teko::assert::is_true(false); return }
     }
@@ -935,7 +942,7 @@ fn subst_unify_inference() {
     teko::assert::is_true(match unify(patSlice, Slice { element = Void { } }, s0, tbl) { Subst => false; error => true })
 
     // collect_sig_type_params over Func{(T) -> T} → ["T"] (deduped).
-    let sig: Type = Func { params = teko::list::push(teko::list::empty(), Named { name = "T" }); ret = Named { name = "T" } ; variadic = false }
+    let sig: Type = Func { params = teko::list::push(teko::list::empty(), Named { name = "T" }); ret = Named { name = "T" } ; variadic = false ; param_names = []; n_required = (teko::list::push(teko::list::empty(), Named { name = "T" })).len; defaults = [] }
     let tps = collect_sig_type_params(sig, tbl, teko::list::empty())
     teko::assert::is_true(tps.len == 1)
     teko::assert::is_true(tps[0] == "T")
@@ -1134,7 +1141,7 @@ fn mem_ref_not_binding_type() {
 // position (parameter pass-down). Build `fn f(r: Ref<i64>) -> i64 { 0 }` directly.
 #test
 fn mem_ref_param_allowed() {
-    let p = parser::Param { name = "r"; type_ann = ref_te("i64"); is_params = false }
+    let p = parser::Param { name = "r"; type_ann = ref_te("i64"); is_params = false ; has_default = false; default_expr = e_num(0) }
     let params = teko::list::push(teko::list::empty(), p)
     let body = teko::list::push(teko::list::empty(), parser::Return { has_value = true; value = e_num(0) })
     let f = parser::Function { name = "f"; type_params = teko::list::empty(); params = params; has_return = true; return_type = named_t("i64"); body = body; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = "" }
@@ -1291,7 +1298,7 @@ fn tnum(v: i128) -> TExpr { TExpr { kind = TNumber { is_float = false; value = v
 // a generic TFunction `fn NAME<T>(x: PARAMSPELL) -> RET { body }`.
 fn gfn(name: str, param_ann: parser::TypeExpr, ret: Type, body: []TStatement) -> TFunction {
     let tps: []str = teko::list::push(teko::list::empty(), "T")
-    let p = parser::Param { name = "x"; type_ann = param_ann; is_params = false }
+    let p = parser::Param { name = "x"; type_ann = param_ann; is_params = false ; has_default = false; default_expr = e_num(0) }
     let params = teko::list::push(teko::list::empty(), p)
     TFunction { name = name; type_params = tps; params = params; return_type = ret; body = body; vis = parser::Visibility::Private; has_doc = false; doc = ""; namespace = ""; file = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = "" }
 }
@@ -1768,7 +1775,7 @@ fn ffi_teko_rt_named_struct_return() {
     let date_struct = parser::TypeDecl { name = "Date"; type_params = teko::list::empty(); body = parser::StructBody { fields = date_fields }; vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 0; col = 0 }
     let tbl: TypeTable = teko::list::push(empty_table(), TypeReg { name = "Date"; namespace = ""; vis = parser::Visibility::Pub; decl = date_struct })
     // extern fn: one param d: i32, returns Date (a Named struct), from "teko_rt"
-    let param_d = parser::Param { name = "d"; type_ann = named_t("i32"); is_params = false }
+    let param_d = parser::Param { name = "d"; type_ann = named_t("i32"); is_params = false ; has_default = false; default_expr = e_num(0) }
     mut params: []parser::Param = teko::list::empty()
     params = teko::list::push(params, param_d)
     mut no_body: []parser::Statement = teko::list::empty()
@@ -1791,8 +1798,8 @@ fn ffi_teko_rt_named_struct_two_params() {
     span_fields = teko::list::push(span_fields, ticks_field)
     let span_struct = parser::TypeDecl { name = "TimeSpan"; type_params = teko::list::empty(); body = parser::StructBody { fields = span_fields }; vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 0; col = 0 }
     let tbl: TypeTable = teko::list::push(empty_table(), TypeReg { name = "TimeSpan"; namespace = ""; vis = parser::Visibility::Pub; decl = span_struct })
-    let param_a = parser::Param { name = "a"; type_ann = named_t("TimeSpan"); is_params = false }
-    let param_b = parser::Param { name = "b"; type_ann = named_t("TimeSpan"); is_params = false }
+    let param_a = parser::Param { name = "a"; type_ann = named_t("TimeSpan"); is_params = false ; has_default = false; default_expr = e_num(0) }
+    let param_b = parser::Param { name = "b"; type_ann = named_t("TimeSpan"); is_params = false ; has_default = false; default_expr = e_num(0) }
     mut params: []parser::Param = teko::list::empty()
     params = teko::list::push(params, param_a)
     params = teko::list::push(params, param_b)
@@ -1802,5 +1809,69 @@ fn ffi_teko_rt_named_struct_two_params() {
     match type_function(f, empty_env(), tbl) {
         TFunction => teko::assert::is_true(true)
         error     => teko::assert::is_true(false)   // must NOT fail
+    }
+}
+
+// --- DEFARGS (2026-07-01): call-site named-arg resolution + default-value fill ------------
+// `fn add(a: i64, b: i64 = 10) -> i64` — a: required (index 0), b: defaulted (n_required = 1,
+// defaults = [10]). Mirrors the .tkt Func literal env0/env pattern from types_call above.
+fn defargs_env() -> Env {
+    let params: []Type = teko::list::push(teko::list::push(teko::list::empty(), i64t()), i64t())
+    let names: []str = teko::list::push(teko::list::push(teko::list::empty(), "a"), "b")
+    let defaults: []parser::Expr = teko::list::push(teko::list::empty(), e_num(10))
+    define(empty_env(), "add", Func { params = params; ret = i64t(); variadic = false; param_names = names; n_required = 1; defaults = defaults }, false)
+}
+fn names1(a: str) -> []str { teko::list::push(teko::list::empty(), a) }
+fn names2(a: str, b: str) -> []str { teko::list::push(teko::list::push(teko::list::empty(), a), b) }
+
+#test
+fn defargs_positional_fill() {
+    // add(1) -- omitted `b` fills from the default (10).
+    let args: []parser::Expr = teko::list::push(teko::list::empty(), e_num(1))
+    let tcall = match type_call(parser::Call { callee = path1("add"); args = args; arg_names = names1("") }, defargs_env(), empty_table()) { TExpr as e => e; error => { teko::assert::is_true(false); return } }
+    match tcall.kind { TCall as cc => teko::assert::is_true(cc.args.len == 2); _ => teko::assert::is_true(false) }
+}
+
+#test
+fn defargs_named_call_all() {
+    // add(a = 1, b = 2) -- fully named, both provided.
+    let args: []parser::Expr = teko::list::push(teko::list::push(teko::list::empty(), e_num(1)), e_num(2))
+    let tcall = match type_call(parser::Call { callee = path1("add"); args = args; arg_names = names2("a", "b") }, defargs_env(), empty_table()) { TExpr as e => e; error => { teko::assert::is_true(false); return } }
+    match tcall.kind { TCall as cc => teko::assert::is_true(cc.args.len == 2); _ => teko::assert::is_true(false) }
+}
+
+#test
+fn defargs_named_out_of_order() {
+    // add(b = 2, a = 1) -- named-call may reorder freely.
+    let args: []parser::Expr = teko::list::push(teko::list::push(teko::list::empty(), e_num(2)), e_num(1))
+    let tcall = match type_call(parser::Call { callee = path1("add"); args = args; arg_names = names2("b", "a") }, defargs_env(), empty_table()) { TExpr as e => e; error => { teko::assert::is_true(false); return } }
+    match tcall.kind { TCall as cc => teko::assert::is_true(cc.args.len == 2); _ => teko::assert::is_true(false) }
+}
+
+#test
+fn defargs_mixed_positional_then_named() {
+    // add(1, b = 2) -- positional `a`, named `b` (named-last, rule D).
+    let args: []parser::Expr = teko::list::push(teko::list::push(teko::list::empty(), e_num(1)), e_num(2))
+    let tcall = match type_call(parser::Call { callee = path1("add"); args = args; arg_names = names2("", "b") }, defargs_env(), empty_table()) { TExpr as e => e; error => { teko::assert::is_true(false); return } }
+    match tcall.kind { TCall as cc => teko::assert::is_true(cc.args.len == 2); _ => teko::assert::is_true(false) }
+}
+
+#test
+fn defargs_missing_required_is_error() {
+    // add() -- `a` has no default -- must fail.
+    mut no_args: []parser::Expr = teko::list::empty()
+    match type_call(parser::Call { callee = path1("add"); args = no_args; arg_names = pos_names(0) }, defargs_env(), empty_table()) {
+        TExpr => teko::assert::is_true(false)   // must fail
+        error => teko::assert::is_true(true)
+    }
+}
+
+#test
+fn defargs_unknown_named_is_error() {
+    // add(a = 1, c = 2) -- `c` is not a param of add -- must fail.
+    let args: []parser::Expr = teko::list::push(teko::list::push(teko::list::empty(), e_num(1)), e_num(2))
+    match type_call(parser::Call { callee = path1("add"); args = args; arg_names = names2("a", "c") }, defargs_env(), empty_table()) {
+        TExpr => teko::assert::is_true(false)   // must fail
+        error => teko::assert::is_true(true)
     }
 }

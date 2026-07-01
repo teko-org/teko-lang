@@ -5,6 +5,7 @@
 // typers live in typer.c — the two TUs see each other via expr.h + typer_internal.h.
 #include "expr.h"
 #include "typer_internal.h"   // tk_type_block (statement side, for if/match bodies)
+#include "../parser/parse_stmt.h"   // no_expr (DEFARGS placeholder, 2026-07-01)
 #include <string.h>           // memcmp (string-span compares)
 
 // shared from match.c (E5b-2), promoted to non-static for reuse:
@@ -136,7 +137,14 @@ static tk_texpr_result type_tilde_chain(tk_binary b, tk_env env, tk_type_table t
     tk_expr *folded = NULL; size_t nfolded = 0;
     fold_tilde_pieces(raw, nraw, &folded, &nfolded);
     if (nfolded == 1) { return tk_typer_expr(folded[0], env, table); }   // whole chain was literals — a single literal, no runtime call
-    tk_segment segs[3] = { { .name = { (const tk_byte *)"teko", 4 } }, { .name = { (const tk_byte *)"string", 6 } }, { .name = { (const tk_byte *)"concat", 6 } } };
+    // (fix, 2026-07-01) `segs` MUST outlive this function: the returned tk_texpr's callee path
+    // keeps this pointer (type_call copies c.callee BY VALUE, but a tk_path's `.segments` stays a
+    // pointer) and is read much later at emit time. A stack-local array here dangles once this
+    // function returns -- undetected by earlier single-function tests, but corrupted by ANY
+    // further type-checking stack activity (e.g. a second function's calls), producing garbage
+    // segment names at codegen. Heap-allocate so the path survives past this call.
+    static const tk_segment tilde_segs_lit[3] = { { .name = { (const tk_byte *)"teko", 4 } }, { .name = { (const tk_byte *)"string", 6 } }, { .name = { (const tk_byte *)"concat", 6 } } };
+    tk_segment *segs = tk_alloc_copy(tilde_segs_lit, sizeof tilde_segs_lit);
     tk_call call = { .callee = { .segments = segs, .len = 3 }, .args = folded, .nargs = nfolded };
     // `concat`'s own arg-widening (type_call, below) already requires every piece to be `str` —
     // a non-str `~` operand fails there with a clear message, no separate check needed here.
@@ -330,6 +338,50 @@ static tk_pack_result pack_variadic_args(tk_type ft, tk_expr *args, size_t nargs
     return (tk_pack_result){ .ok = true, .args = out, .nargs = nfixed + 1 };
 }
 
+// (2026-07-01 DEFARGS) call-site resolution for a NON-variadic function `ft`: named-arg-to-index
+// lookup + default-fill for omitted trailing params. Produces a positional tk_expr array of
+// EXACTLY ft.as.func.nparams entries, in declaration order. NOTE: intentionally NOT composed
+// with params/variadic (pack_variadic_args, above) yet -- type_call only calls this for
+// !ft.as.func.variadic. Builds the result via a single forward pass (a plain C array with normal
+// index writes works fine in C, unlike the .tks mirror which has no index-assignment).
+static tk_pack_result resolve_defargs(tk_type ft, tk_expr *args, tk_str *arg_names, size_t nargs) {
+    bool any_named = false;
+    for (size_t ai = 0; ai < nargs; ai += 1) { if (arg_names && arg_names[ai].len != 0) { any_named = true; break; } }
+    if (!any_named && nargs == ft.as.func.nparams) return (tk_pack_result){ .ok = true, .args = args, .nargs = nargs };   // fast identity path
+    if (any_named && ft.as.func.param_names == NULL) {
+        return (tk_pack_result){ .ok = false, .error = tk_error_make("this function cannot be called with named arguments (only a plain, named fn declaration supports named-call -- not a closure value or builtin)") };
+    }
+    size_t npos = 0;
+    while (npos < nargs && (arg_names == NULL || arg_names[npos].len == 0)) { npos += 1; }
+    if (npos > ft.as.func.nparams) return (tk_pack_result){ .ok = false, .error = tk_error_make("wrong number of arguments") };
+    for (size_t vk = npos; vk < nargs; vk += 1) {
+        tk_str nm = arg_names[vk];
+        bool matched = false; size_t fidx = 0;
+        for (; fidx < ft.as.func.nparams; fidx += 1) { if (tk_str_eq(ft.as.func.param_names[fidx], nm)) { matched = true; break; } }
+        if (!matched) return (tk_pack_result){ .ok = false, .error = tk_error_named("unknown named argument", nm) };
+        if (fidx < npos) return (tk_pack_result){ .ok = false, .error = tk_error_named("named argument was already provided positionally", nm) };
+    }
+    tk_expr *resolved = tk_alloc(ft.as.func.nparams * sizeof *resolved); if (!resolved) abort();
+    for (size_t idx = 0; idx < ft.as.func.nparams; idx += 1) {
+        if (idx < npos) {
+            resolved[idx] = args[idx];
+        } else {
+            bool found = false; tk_expr found_expr = no_expr();
+            for (size_t k = npos; k < nargs; k += 1) {
+                if (tk_str_eq(arg_names[k], ft.as.func.param_names[idx])) { found = true; found_expr = args[k]; break; }
+            }
+            if (found) {
+                resolved[idx] = found_expr;
+            } else if (idx < ft.as.func.n_required) {
+                return (tk_pack_result){ .ok = false, .error = tk_error_named("missing required argument", ft.as.func.param_names[idx]) };
+            } else {
+                resolved[idx] = ft.as.func.defaults[idx - ft.as.func.n_required];
+            }
+        }
+    }
+    return (tk_pack_result){ .ok = true, .args = resolved, .nargs = ft.as.func.nparams };
+}
+
 static tk_texpr_result type_call(tk_call c, tk_env env, tk_type_table table) {
     tk_texpr_result lb;
     if (type_list_builtin(c, env, table, &lb)) return lb;   // teko::list::empty / push (generic)
@@ -373,6 +425,10 @@ static tk_texpr_result type_call(tk_call c, tk_env env, tk_type_table table) {
     tk_expr *dargs = c.args; size_t ndargs = c.nargs;
     if (ft.as.func.variadic) {
         tk_pack_result pr = pack_variadic_args(ft, c.args, c.nargs, env, table);
+        if (!pr.ok) return xferr(pr.error);
+        dargs = pr.args; ndargs = pr.nargs;
+    } else {
+        tk_pack_result pr = resolve_defargs(ft, c.args, c.arg_names, c.nargs);
         if (!pr.ok) return xferr(pr.error);
         dargs = pr.args; ndargs = pr.nargs;
     }

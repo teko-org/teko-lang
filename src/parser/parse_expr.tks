@@ -6,15 +6,31 @@ use teko::lexer
 // comma (strict — M.2). Returns the args and the position after `)`. Used by Call (here)
 // and by MethodCall (P2b). Args parse with struct literals ALLOWED (W4a): a comma/paren
 // delimiter makes a trailing `{` unambiguous again, so each arg uses parse_expr.
-fn parse_call_args(tokens: []lexer::Token, pos: u64) -> ParsedList<Expr> | error {
+fn parse_call_args(tokens: []lexer::Token, pos: u64) -> ParsedCallArgs | error {
     mut p = skip_seps(tokens, pos + 1)              // consume `(`, skip leading newlines (multi-line args)
     mut args: []Expr = teko::list::empty()
+    mut arg_names: []str = teko::list::empty()
+    mut seen_named = false   // DEFARGS (2026-07-01) — named-LAST ordering (rule D): once true, every later arg must also be named
     if is_kind_at(tokens, p, lexer::TokenKind::RParen) {
-        return ParsedList<Expr> { items = args; next = p + 1 }
+        return ParsedCallArgs { args = args; arg_names = arg_names; next = p + 1 }
     }
     loop {
-        let a = match parse_expr(tokens, p) { Parsed<Expr> as x => x; error as e => return e }   // inside `(` … `)` — struct literals allowed
+        // `name = expr` — a NAMED argument (DEFARGS rule D). Unambiguous: Teko assignment is
+        // statement-only (never an expression), so `Ident '=' …` at an arg position can only be
+        // a named arg, never a real assignment expression being passed as a value.
+        let is_named = is_kind_at(tokens, p, lexer::TokenKind::Ident) && is_kind_at(tokens, p + 1, lexer::TokenKind::Assign)
+        mut aname = ""
+        mut ap = p
+        if is_named {
+            aname = tokens[p].text
+            ap = p + 2
+            seen_named = true
+        } else if seen_named {
+            return err_at(tokens, p, "a named argument must be followed only by other named arguments (named args are trailing-only)")
+        }
+        let a = match parse_expr(tokens, ap) { Parsed<Expr> as x => x; error as e => return e }   // inside `(` … `)` — struct literals allowed
         args = teko::list::push(args, a.node)
+        arg_names = teko::list::push(arg_names, aname)
         p = skip_seps(tokens, a.next)               // a `,` / `)` may sit on the next line (multi-line args)
         if !is_kind_at(tokens, p, lexer::TokenKind::Comma) { break }
         p = skip_seps(tokens, p + 1)                // consume `,` (+ optional newlines before the next arg)
@@ -23,7 +39,7 @@ fn parse_call_args(tokens: []lexer::Token, pos: u64) -> ParsedList<Expr> | error
     if !is_kind_at(tokens, p, lexer::TokenKind::RParen) {
         return err_at(tokens, p, "expected ')' to close the argument list")
     }
-    ParsedList<Expr> { items = args; next = p + 1 }
+    ParsedCallArgs { args = args; arg_names = arg_names; next = p + 1 }
 }
 
 // `Name { field = value (; | newline)* }` — a struct VALUE literal (W4a). `pos` is at `{`.
@@ -309,8 +325,8 @@ fn parse_atom(tokens: []lexer::Token, pos: u64, allow_struct: bool) -> Parsed<Ex
     if is_name_at(tokens, pos) {   // IDENT or a contextual keyword (`type`/`to`) used as a value/path
         let pp = match parse_path(tokens, pos) { Parsed<Path> as x => x; error as e => return e }
         if is_kind_at(tokens, pp.next, lexer::TokenKind::LParen) {
-            let ca = match parse_call_args(tokens, pp.next) { ParsedList<Expr> as x => x; error as e => return e }
-            return Parsed<Expr> { node = Expr { kind = Call { callee = pp.node; args = ca.items }; line = tokens[pos].line; col = tokens[pos].col }; next = ca.next }
+            let ca = match parse_call_args(tokens, pp.next) { ParsedCallArgs as x => x; error as e => return e }
+            return Parsed<Expr> { node = Expr { kind = Call { callee = pp.node; args = ca.args; arg_names = ca.arg_names }; line = tokens[pos].line; col = tokens[pos].col }; next = ca.next }
         }
         // (W9.4) explicit type-args at construction `Name<i64> { … }` — SPECULATIVE: parse `<…>`,
         // and commit to a typed struct literal ONLY when a `{` follows the closed list (so `a < b`
@@ -397,8 +413,11 @@ fn parse_postfix(tokens: []lexer::Token, pos: u64, allow_struct: bool) -> Parsed
         }
         let name = tokens[p + 1].text
         if is_kind_at(tokens, p + 2, lexer::TokenKind::LParen) {
-            let ca = match parse_call_args(tokens, p + 2) { ParsedList<Expr> as x => x; error as e => return e }
-            node = Expr { kind = MethodCall { receiver = node; method = name; args = ca.items }; line = tokens[pos].line; col = tokens[pos].col }
+            // (2026-07-01) named-call (DEFARGS) is NOT yet supported through MethodCall's `.method()`
+            // postfix form (today only builtin/flags-helper dispatch, not real OOP methods) —
+            // ca.arg_names is intentionally discarded here; revisit once OOP methods land.
+            let ca = match parse_call_args(tokens, p + 2) { ParsedCallArgs as x => x; error as e => return e }
+            node = Expr { kind = MethodCall { receiver = node; method = name; args = ca.args }; line = tokens[pos].line; col = tokens[pos].col }
             p = ca.next
         } else {
             node = Expr { kind = FieldAccess { receiver = node; field = name }; line = tokens[pos].line; col = tokens[pos].col }

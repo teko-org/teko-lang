@@ -3,7 +3,8 @@
 // Declaration parsing, the C23 mirror of parser/parse_decl.tks.
 #include "parse_decl.h"
 #include "parse_type.h"   // tk_parse_type
-#include "parse_stmt.h"   // tk_parse_block, no_type
+#include "parse_expr.h"   // tk_parse_expr (DEFARGS default-value parsing, 2026-07-01)
+#include "parse_stmt.h"   // tk_parse_block, no_type, no_expr
 #include "parse_pattern.h"// parse_field_names (enum members)
 #include "parse_file.h"   // parse_use_header (module `use` header)
 #include "cursor.h"       // tk_has_token, tk_is_kind_at, tk_is_sep, tk_skip_seps
@@ -19,6 +20,7 @@ static bool text_is(tk_str text, const char *lit) {
 static tk_parsed_params_result parse_params(const tk_token *t, size_t n, size_t pos) {
     size_t p = pos + 1;                                  // consume `(`
     tk_param *params = NULL; size_t np = 0;
+    bool seen_default = false;   // DEFARGS (2026-07-01) — TRAILING-ONLY: once true, every later param must also default
     if (tk_is_kind_at(t, n, p, TK_TOKEN_RPAREN)) {
         return (tk_parsed_params_result){ .ok = true, .as.value = { .items = params, .n_params = 0, .next = p + 1 } };
     }
@@ -44,8 +46,25 @@ static tk_parsed_params_result parse_params(const tk_token *t, size_t n, size_t 
         if (has_params_kw && ty.as.value.node.tag != TK_TEXPR_SLICE) {
             return (tk_parsed_params_result){ .ok = false, .as.error = tk_err_at(t, n, p + 2, "'params' parameter must have a slice type ([]T)") };
         }
-        tk_params_push(&params, &np, (tk_param){ .name = name, .type_ann = ty.as.value.node, .is_params = has_params_kw });
-        p = ty.as.value.next;
+        // DEFARGS (2026-07-01) — `= <expr>` right after the type: a default value, evaluated at
+        // the call site when the argument is omitted. TRAILING-ONLY (rule A): once ANY param
+        // defaults, every param after it must ALSO default — `=` uses TK_TOKEN_ASSIGN, consistent
+        // with struct-init `{f=v}` (not `:`, which is a type annotation).
+        size_t ppos = ty.as.value.next;
+        bool has_default = false;
+        tk_expr default_expr = no_expr();
+        if (tk_is_kind_at(t, n, ppos, TK_TOKEN_ASSIGN)) {
+            tk_parsed_result dv = tk_parse_expr(t, n, ppos + 1);
+            if (!dv.ok) { return (tk_parsed_params_result){ .ok = false, .as.error = dv.as.error }; }
+            has_default = true;
+            default_expr = dv.as.value.node;
+            ppos = dv.as.value.next;
+        } else if (seen_default) {
+            return (tk_parsed_params_result){ .ok = false, .as.error = tk_err_at(t, n, ppos, "a default-valued parameter must be followed only by other defaulted parameters (defaults are trailing-only)") };
+        }
+        if (has_default) { seen_default = true; }
+        tk_params_push(&params, &np, (tk_param){ .name = name, .type_ann = ty.as.value.node, .is_params = has_params_kw, .has_default = has_default, .default_expr = default_expr });
+        p = ppos;
         if (has_params_kw && tk_is_kind_at(t, n, p, TK_TOKEN_COMMA)) {
             return (tk_parsed_params_result){ .ok = false, .as.error = tk_err_at(t, n, p, "'params' must be the last parameter") };
         }

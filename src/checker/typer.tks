@@ -163,7 +163,7 @@ fn type_lambda(lam: parser::Lambda, expected: Type, env: Env, table: TypeTable) 
         }
         k++
     }
-    TExpr { kind = TLambda { params = tparams; body = tb.stmts; captures = captures; ret = ret; lift_id = 0 }; type = Func { params = lam_param_types(tparams); ret = ret ; variadic = false }; line = 0; col = 0 }
+    TExpr { kind = TLambda { params = tparams; body = tb.stmts; captures = captures; ret = ret; lift_id = 0 }; type = Func { params = lam_param_types(tparams); ret = ret ; variadic = false ; param_names = []; n_required = (lam_param_types(tparams)).len; defaults = [] }; line = 0; col = 0 }
 }
 fn lam_param_types(ps: []TLambdaParam) -> []Type {
     mut out: []Type = teko::list::empty()
@@ -246,7 +246,10 @@ fn type_tilde_chain(b: parser::Binary, env: Env, table: TypeTable) -> TExpr | er
     mut segs: []parser::Segment = teko::list::push(teko::list::empty(), seg_teko)
     segs = teko::list::push(segs, seg_string)
     segs = teko::list::push(segs, seg_concat)
-    let call = parser::Call { callee = parser::Path { segments = segs }; args = folded }
+    mut pos_names: []str = teko::list::empty()   // DEFARGS (2026-07-01) — this synthetic call is always all-positional
+    mut ni: u64 = 0
+    loop { if ni >= folded.len { break }; pos_names = teko::list::push(pos_names, ""); ni++ }
+    let call = parser::Call { callee = parser::Path { segments = segs }; args = folded; arg_names = pos_names }
     // `concat`'s own arg-widening (type_call, below) already requires every piece to be `str` —
     // a non-str `~` operand fails there with a clear message, no separate check needed here.
     type_call(call, env, table)
@@ -416,6 +419,67 @@ fn pack_variadic_args(f: Func, args: []parser::Expr, env: Env, table: TypeTable)
     teko::list::push(out, synth)
 }
 
+// (2026-07-01 DEFARGS) call-site resolution for a NON-variadic function `f`: named-arg-to-index
+// lookup + default-fill for omitted trailing params. Produces a positional []parser::Expr of
+// EXACTLY f.params.len entries, in declaration order, ready for the ordinary typing loop below.
+// NOTE: intentionally NOT composed with `params`/variadic (pack_variadic_args, above) yet — a
+// function that is BOTH variadic AND has named/default params is an unsupported combination for
+// now (type_call only calls this for `!f.variadic`); Teko has no array index-assignment, so this
+// builds the result via a single forward pass (0..params.len), pushing whichever source (a
+// positional arg, a matching named arg, or the param's default) applies at each index.
+fn resolve_defargs(f: Func, args: []parser::Expr, arg_names: []str) -> []parser::Expr | error {
+    mut any_named = false
+    mut ai: u64 = 0
+    loop { if ai >= arg_names.len { break }; if arg_names[ai] != "" { any_named = true }; ai++ }
+    if !any_named && args.len == f.params.len { return args }   // fast identity path — the overwhelmingly common case, zero overhead
+    if any_named && f.param_names.len != f.params.len {
+        return error { message = "this function cannot be called with named arguments (only a plain, named `fn` declaration supports named-call — not a closure value or builtin)" }
+    }
+    // the positional PREFIX length (rule D: named-LAST — already enforced at parse time, so the
+    // first named arg marks where positional args end).
+    mut npos: u64 = 0
+    loop { if npos >= arg_names.len { break }; if arg_names[npos] != "" { break }; npos++ }
+    if npos > f.params.len { return error { message = "wrong number of arguments" } }
+    // validate every named arg targets a REAL, not-already-positionally-filled param.
+    mut vk: u64 = npos
+    loop {
+        if vk >= args.len { break }
+        let nm = arg_names[vk]
+        mut fidx: u64 = 0
+        mut matched = false
+        loop { if fidx >= f.param_names.len { break }; if f.param_names[fidx] == nm { matched = true; break }; fidx++ }
+        if !matched { return error { message = $"unknown named argument '{nm}'" } }
+        if fidx < npos { return error { message = $"named argument '{nm}' was already provided positionally" } }
+        vk++
+    }
+    mut resolved: []parser::Expr = teko::list::empty()
+    mut idx: u64 = 0
+    loop {
+        if idx >= f.params.len { break }
+        if idx < npos {
+            resolved = teko::list::push(resolved, args[idx])
+        } else {
+            mut found = false
+            mut found_expr = parser::no_expr()
+            mut k: u64 = npos
+            loop {
+                if k >= args.len { break }
+                if arg_names[k] == f.param_names[idx] { found = true; found_expr = args[k]; break }
+                k++
+            }
+            if found {
+                resolved = teko::list::push(resolved, found_expr)
+            } else if idx < f.n_required {
+                return error { message = $"missing required argument '{f.param_names[idx]}'" }
+            } else {
+                resolved = teko::list::push(resolved, f.defaults[idx - f.n_required])
+            }
+        }
+        idx++
+    }
+    resolved
+}
+
 fn type_call(c: parser::Call, env: Env, table: TypeTable) -> TExpr | error {
     match type_list_builtin(c, env, table) {   // teko::list::empty / push (generic)
         TExpr as te    => return te
@@ -457,7 +521,7 @@ fn type_call(c: parser::Call, env: Env, table: TypeTable) -> TExpr | error {
     }
     match ft {
         Func as f => {
-            let dargs = if f.variadic { match pack_variadic_args(f, c.args, env, table) { []parser::Expr as x => x; error as e => return e } } else { c.args }
+            let dargs = if f.variadic { match pack_variadic_args(f, c.args, env, table) { []parser::Expr as x => x; error as e => return e } } else { match resolve_defargs(f, c.args, c.arg_names) { []parser::Expr as x => x; error as e => return e } }
             if dargs.len != f.params.len { return error { message = "wrong number of arguments" } }
             // Type every argument first (void rejected); strict-check / generic-infer below.
             mut targs: []TExpr = teko::list::empty()

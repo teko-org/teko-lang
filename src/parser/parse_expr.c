@@ -40,25 +40,41 @@ static inline tk_expr tk_at(tk_expr e, const tk_token *t, size_t pos) {
     e.line = t[pos].line; e.col = t[pos].col; return e;
 }
 
-static tk_parsed_args_result parse_call_args(const tk_token *t, size_t n, size_t pos) {
+static tk_parsed_call_args_result parse_call_args(const tk_token *t, size_t n, size_t pos) {
     size_t p = tk_skip_seps(t, n, pos + 1);             // consume `(`, skip leading newlines (multi-line args)
     tk_expr *args = NULL; size_t na = 0;
+    tk_str *arg_names = NULL; size_t nn = 0;
+    bool seen_named = false;   // DEFARGS (2026-07-01) — named-LAST ordering (rule D)
     if (tk_is_kind_at(t, n, p, TK_TOKEN_RPAREN)) {
-        return (tk_parsed_args_result){ .ok = true, .as.value = { .items = args, .n_args = 0, .next = p + 1 } };
+        return (tk_parsed_call_args_result){ .ok = true, .as.value = { .args = args, .arg_names = arg_names, .nargs = 0, .next = p + 1 } };
     }
     for (;;) {
-        tk_parsed_result a = parse_expr_a(t, n, p, true);   // inside `(` … `)` — struct literals allowed
-        if (!a.ok) { return (tk_parsed_args_result){ .ok = false, .as.error = a.as.error }; }
+        // `name = expr` — a NAMED argument (DEFARGS rule D). Unambiguous: Teko assignment is
+        // statement-only (never an expression), so `Ident '=' …` at an arg position can only be
+        // a named arg, never a real assignment expression being passed as a value.
+        bool is_named = tk_is_kind_at(t, n, p, TK_TOKEN_IDENT) && tk_is_kind_at(t, n, p + 1, TK_TOKEN_ASSIGN);
+        tk_str aname = (tk_str){0};
+        size_t ap = p;
+        if (is_named) {
+            aname = t[p].text;
+            ap = p + 2;
+            seen_named = true;
+        } else if (seen_named) {
+            return (tk_parsed_call_args_result){ .ok = false, .as.error = tk_err_at(t, n, p, "a named argument must be followed only by other named arguments (named args are trailing-only)") };
+        }
+        tk_parsed_result a = parse_expr_a(t, n, ap, true);   // inside `(` … `)` — struct literals allowed
+        if (!a.ok) { return (tk_parsed_call_args_result){ .ok = false, .as.error = a.as.error }; }
         tk_exprs_push(&args, &na, a.as.value.node);
+        tk_strvec_push(&arg_names, &nn, aname);
         p = tk_skip_seps(t, n, a.as.value.next);         // a `,` / `)` may sit on the next line (multi-line args)
         if (!tk_is_kind_at(t, n, p, TK_TOKEN_COMMA)) { break; }
         p = tk_skip_seps(t, n, p + 1);                   // consume `,` (+ optional newlines before the next arg)
         if (tk_is_kind_at(t, n, p, TK_TOKEN_RPAREN)) { break; }   // trailing comma before `)`
     }
     if (!tk_is_kind_at(t, n, p, TK_TOKEN_RPAREN)) {
-        return (tk_parsed_args_result){ .ok = false, .as.error = tk_err_at(t, n, p, "expected ')' to close the argument list") };
+        return (tk_parsed_call_args_result){ .ok = false, .as.error = tk_err_at(t, n, p, "expected ')' to close the argument list") };
     }
-    return (tk_parsed_args_result){ .ok = true, .as.value = { .items = args, .n_args = na, .next = p + 1 } };
+    return (tk_parsed_call_args_result){ .ok = true, .as.value = { .args = args, .arg_names = arg_names, .nargs = na, .next = p + 1 } };
 }
 
 // `Name { field = value (; | newline)* }` — a struct VALUE literal (W4a). `pos` is at `{`.
@@ -408,10 +424,10 @@ static tk_parsed_result parse_atom(const tk_token *t, size_t n, size_t pos, bool
         tk_parsed_path_result pp = parse_path(t, n, pos);
         if (!pp.ok) { return (tk_parsed_result){ .ok = false, .as.error = pp.as.error }; }
         if (tk_is_kind_at(t, n, pp.as.value.next, TK_TOKEN_LPAREN)) {
-            tk_parsed_args_result ca = parse_call_args(t, n, pp.as.value.next);
+            tk_parsed_call_args_result ca = parse_call_args(t, n, pp.as.value.next);
             if (!ca.ok) { return (tk_parsed_result){ .ok = false, .as.error = ca.as.error }; }
             tk_expr e = tk_at((tk_expr){ .tag = TK_EXPR_CALL, .as.call = { .callee = pp.as.value.node,
-                .args = ca.as.value.items, .nargs = ca.as.value.n_args } }, t, pos);
+                .args = ca.as.value.args, .nargs = ca.as.value.nargs, .arg_names = ca.as.value.arg_names } }, t, pos);
             return (tk_parsed_result){ .ok = true, .as.value = { .node = e, .next = ca.as.value.next } };
         }
         // (W9.4) explicit type-args at construction `Name<i64> { … }` — SPECULATIVE: parse `<…>`,
@@ -476,10 +492,13 @@ static tk_parsed_result parse_postfix(const tk_token *t, size_t n, size_t pos, b
         }
         tk_str name = t[p + 1].text;
         if (tk_is_kind_at(t, n, p + 2, TK_TOKEN_LPAREN)) {
-            tk_parsed_args_result ca = parse_call_args(t, n, p + 2);
+            // (2026-07-01) named-call (DEFARGS) is NOT yet supported through MethodCall's
+            // `.method()` postfix form (today only builtin/flags-helper dispatch, not real OOP
+            // methods) -- ca.arg_names is intentionally discarded here; revisit once OOP lands.
+            tk_parsed_call_args_result ca = parse_call_args(t, n, p + 2);
             if (!ca.ok) { return (tk_parsed_result){ .ok = false, .as.error = ca.as.error }; }
             tk_expr m = tk_at((tk_expr){ .tag = TK_EXPR_METHOD_CALL, .as.method_call = { .receiver = tk_box_expr(node),
-                .method = name, .args = ca.as.value.items, .nargs = ca.as.value.n_args } }, t, pos);
+                .method = name, .args = ca.as.value.args, .nargs = ca.as.value.nargs } }, t, pos);
             node = m; p = ca.as.value.next;
         } else {
             tk_expr f = tk_at((tk_expr){ .tag = TK_EXPR_FIELD_ACCESS, .as.field_access = { .receiver = tk_box_expr(node), .field = name } }, t, pos);

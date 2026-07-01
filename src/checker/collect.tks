@@ -24,6 +24,9 @@ fn collect_types(items: []parser::Item) -> TypeTable {
 fn func_type(f: parser::Function, table: TypeTable) -> Type | error {
     let tbl = type_param_table(f.type_params, "", table)   // (S4) the fn's generic type-params, opaque, in scope
     mut params: []Type = teko::list::empty()
+    mut param_names: []str = teko::list::empty()
+    mut defaults: []parser::Expr = teko::list::empty()
+    mut n_required: u64 = f.params.len   // DEFARGS (2026-07-01) — the first has_default param's index; TRAILING-ONLY (rule A) means every param after it also defaults
     mut i = 0
     loop {
         if i >= f.params.len { break }
@@ -32,6 +35,11 @@ fn func_type(f: parser::Function, table: TypeTable) -> Type | error {
             error as e => return e
         }
         params = teko::list::push(params, pt)
+        param_names = teko::list::push(param_names, f.params[i].name)
+        if f.params[i].has_default {
+            if n_required == f.params.len { n_required = i to u64 }   // first defaulted param found
+            defaults = teko::list::push(defaults, f.params[i].default_expr)
+        }
         i++
     }
     // No `-> ret` ⇒ a void return (M.3) — f.return_type is the empty no_type() placeholder, NOT a
@@ -42,7 +50,7 @@ fn func_type(f: parser::Function, table: TypeTable) -> Type | error {
         Void { }
     }
     let is_variadic = f.params.len > 0 && f.params[f.params.len - 1].is_params
-    Func { params = params; ret = ret; variadic = is_variadic }
+    Func { params = params; ret = ret; variadic = is_variadic; param_names = param_names; n_required = n_required; defaults = defaults }
 }
 
 // register every top-level function's signature (now that all type names exist).
@@ -205,15 +213,23 @@ fn seed_from_dep(dep: TProgram, table: TypeTable, env: Env) -> Collected | error
                 // We resolve param types now (against the merged table `t`) just like collect_funcs.
                 let dtbl = type_param_table(f.type_params, "", t)   // (S4) no-op for concrete deps
                 mut params: []Type = teko::list::empty()
+                mut param_names: []str = teko::list::empty()
+                mut defaults: []parser::Expr = teko::list::empty()
+                mut n_required: u64 = f.params.len   // DEFARGS (2026-07-01) — see func_type
                 mut pi: u64 = 0
                 loop {
                     if pi >= f.params.len { break }
                     let pt = match resolve_type(f.params[pi].type_ann, dtbl) { Type as ty => ty; error as err => return err }
                     params = teko::list::push(params, pt)
+                    param_names = teko::list::push(param_names, f.params[pi].name)
+                    if f.params[pi].has_default {
+                        if n_required == f.params.len { n_required = pi }
+                        defaults = teko::list::push(defaults, f.params[pi].default_expr)
+                    }
                     pi++
                 }
                 let is_variadic = f.params.len > 0 && f.params[f.params.len - 1].is_params
-                let ft = Func { params = params; ret = f.return_type; variadic = is_variadic }
+                let ft = Func { params = params; ret = f.return_type; variadic = is_variadic; param_names = param_names; n_required = n_required; defaults = defaults }
                 e = define_fn(e, f.name, ft, f.namespace)
             }
             _ => {}

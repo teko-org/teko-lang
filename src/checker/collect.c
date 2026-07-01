@@ -19,12 +19,24 @@ static tk_type_table collect_types(tk_item *items, size_t n) {
 static tk_type_result func_type(tk_function f, tk_type_table table) {
     tk_type_table tbl = tk_type_param_table(f.type_params, f.n_type_params, (tk_str){0}, table);   // (S4) opaque type-params in scope
     tk_type *params = NULL; size_t n = 0;
+    tk_str *param_names = NULL;   // DEFARGS (2026-07-01)
+    tk_expr *defaults = NULL; size_t ndefaults = 0;
+    size_t n_required = f.nparams;   // the first has_default param's index; TRAILING-ONLY (rule A) means every param after it also defaults
     for (size_t i = 0; i < f.nparams; i += 1) {
         tk_type_result pt = tk_resolve_type(f.params[i].type_ann, tbl);
         if (!pt.ok) { tk_free0(params); return pt; }
         params = tk_realloc0(params, (n + 1) * sizeof *params);
         if (!params) abort();
         params[n] = pt.as.value; n += 1;
+        param_names = tk_realloc0(param_names, n * sizeof *param_names);
+        if (!param_names) abort();
+        param_names[n - 1] = f.params[i].name;
+        if (f.params[i].has_default) {
+            if (n_required == f.nparams) { n_required = i; }
+            defaults = tk_realloc0(defaults, (ndefaults + 1) * sizeof *defaults);
+            if (!defaults) abort();
+            defaults[ndefaults] = f.params[i].default_expr; ndefaults += 1;
+        }
     }
     // No `-> ret` ⇒ a void return (M.3) — f.return_type is the empty `no_type()` placeholder
     // (a NAMED type-expr with an empty path), which must NOT be resolved (it is not a value type).
@@ -35,7 +47,7 @@ static tk_type_result func_type(tk_function f, tk_type_table table) {
     if (!ret.ok) { tk_free0(params); return ret; }
     tk_type *rp = tk_alloc(sizeof *rp); if (!rp) abort(); *rp = ret.as.value;
     bool is_variadic = f.nparams > 0 && f.params[f.nparams - 1].is_params;
-    tk_type t = { .tag = TK_TYPE_FUNC, .as.func = { params, n, rp, is_variadic } };
+    tk_type t = { .tag = TK_TYPE_FUNC, .as.func = { params, n, rp, is_variadic, param_names, n_required, defaults, ndefaults } };
     return (tk_type_result){ .ok = true, .as.value = t };
 }
 
@@ -158,6 +170,9 @@ tk_collected_result tk_seed_from_dep(tk_tprogram dep, tk_type_table table, tk_en
         // Build param types by resolving the param type annotations against `table`.
         tk_type_table dtbl = tk_type_param_table(f.type_params, f.n_type_params, (tk_str){0}, table);   // (S4) no-op for concrete deps
         tk_type *params = NULL; size_t np = 0;
+        tk_str *param_names = NULL;   // DEFARGS (2026-07-01)
+        tk_expr *defaults = NULL; size_t ndefaults = 0;
+        size_t n_required = f.nparams;
         bool ok = true;
         tk_error err = {0};
         for (size_t k = 0; k < f.nparams; k += 1) {
@@ -165,6 +180,13 @@ tk_collected_result tk_seed_from_dep(tk_tprogram dep, tk_type_table table, tk_en
             if (!pt.ok) { ok = false; err = pt.as.error; break; }
             params = tk_realloc0(params, (np + 1) * sizeof *params);
             params[np++] = pt.as.value;
+            param_names = tk_realloc0(param_names, np * sizeof *param_names);
+            param_names[np - 1] = f.params[k].name;
+            if (f.params[k].has_default) {
+                if (n_required == f.nparams) { n_required = k; }
+                defaults = tk_realloc0(defaults, (ndefaults + 1) * sizeof *defaults);
+                defaults[ndefaults] = f.params[k].default_expr; ndefaults += 1;
+            }
         }
         if (!ok) { tk_free0(params); return (tk_collected_result){ .ok = false, .as.error = err }; }
 
@@ -172,7 +194,7 @@ tk_collected_result tk_seed_from_dep(tk_tprogram dep, tk_type_table table, tk_en
         tk_type *rp = tk_alloc(sizeof *rp); if (!rp) abort();
         *rp = f.return_type;
         bool is_variadic = f.nparams > 0 && f.params[f.nparams - 1].is_params;
-        tk_type ft = { .tag = TK_TYPE_FUNC, .as.func = { params, np, rp, is_variadic } };
+        tk_type ft = { .tag = TK_TYPE_FUNC, .as.func = { params, np, rp, is_variadic, param_names, n_required, defaults, ndefaults } };
         env = tk_env_define_fn(env, f.name, ft, f.namespace);
     }
 

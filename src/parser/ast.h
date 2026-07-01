@@ -53,7 +53,7 @@ typedef struct { char _unused; }                             tk_null_lit;      /
 typedef struct { tk_token_kind op; tk_expr *left, *right; }  tk_binary;        // any binary op
 typedef struct { tk_token_kind op; tk_expr *operand; }       tk_unary;         // - ~ ! (prefix)
 typedef struct { tk_expr *first; tk_cmp_term *rest; size_t nrest; } tk_compare; // a<b<c chain (M.3)
-typedef struct { tk_path callee; tk_expr *args; size_t nargs; }     tk_call;    // f(x), lexer::foo(x)
+typedef struct { tk_path callee; tk_expr *args; size_t nargs; tk_str *arg_names; }     tk_call;    // f(x), lexer::foo(x); arg_names[i] PARALLEL to args (DEFARGS 2026-07-01) — {0} (empty) = positional, else the NAMED param this arg targets
 typedef struct { tk_expr *cond; tk_statement *then_blk; size_t nthen;          // if/else IS an expression
                  bool has_else; tk_statement *else_blk; size_t nelse; } tk_if_expr;
 typedef struct { tk_expr *subject; tk_arm *arms; size_t narms; }    tk_match_expr; // match IS an expression
@@ -207,7 +207,7 @@ struct tk_statement {
 // Top-level items (parser/ast.tks: Param/Function/Field/StructBody/EnumBody/
 //   VariantBody/TypeBody/TypeDecl/UseDecl/Decl + File model from parse_file.tks)
 // =========================================================================
-typedef struct { tk_str name; tk_type_expr type_ann; bool is_params; } tk_param;   // immutable (B.21); is_params = C#-style variadic modifier (2026-07-01), trailing-only, type_ann must be a Slice
+typedef struct { tk_str name; tk_type_expr type_ann; bool is_params; bool has_default; tk_expr default_expr; } tk_param;   // immutable (B.21); is_params = C#-style variadic modifier (2026-07-01), trailing-only, type_ann must be a Slice; has_default/default_expr = DEFARGS (2026-07-01) — TRAILING-ONLY, default_expr valid iff has_default
 
 // tk_visibility — a declaration's REACH (LEGISLATION "Visibility — pub vs exp"; B.9).
 // PRIVATE (default, no keyword) = own namespace only; PUB = visible across the project's

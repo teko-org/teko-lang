@@ -48,6 +48,7 @@ typedef struct { tk_type_expr node;       size_t next; size_t pending_gt; } tk_p
 typedef struct { tk_type_expr *args; size_t nargs; size_t next; size_t pending_gt; } tk_parsed_type_args; // (W9.4) a `<T1, T2, …>` arg list at a construction/pattern site; pending_gt = extra `>` left by a `>>` close
 typedef struct { bool has_when; tk_expr guard;        size_t next; } tk_guard;          // an optional `when`
 typedef struct { bool has_type; tk_type_expr type_ann; size_t next; } tk_annotation;    // an optional `: T`
+typedef struct { tk_expr *args; tk_str *arg_names; size_t nargs; size_t next; } tk_parsed_call_args;   // DEFARGS (2026-07-01) — parse_call_args' result; arg_names[i] PARALLEL to args, {0} (empty) = positional else the named param
 
 // --- file-level results (parse_file.tks) ---
 typedef struct { tk_use_decl  node;  size_t next; }              tk_parsed_use;        // Parsed<UseDecl> — one `use`
@@ -75,6 +76,7 @@ TK_RESULT(tk_parsed_fields,     tk_parsed_fields_result);
 TK_RESULT(tk_parsed_array_elems, tk_parsed_array_elems_result);
 TK_RESULT(tk_guard,             tk_guard_result);
 TK_RESULT(tk_annotation,        tk_annotation_result);
+TK_RESULT(tk_parsed_call_args,  tk_parsed_call_args_result);
 TK_RESULT(tk_parsed_use,        tk_parsed_use_result);
 TK_RESULT(tk_parsed_uses,       tk_parsed_uses_result);
 TK_RESULT(tk_parsed_main_file,  tk_parsed_main_file_result);
