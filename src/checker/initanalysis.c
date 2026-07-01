@@ -88,6 +88,14 @@ static bool occurs_expr(const tk_texpr *e, tk_str name) {
             for (size_t i = 0; i < e->as.lambda.ncaptures; i += 1)
                 if (tk_str_eq(e->as.lambda.captures[i].name, name)) return true;
             return false;
+        // (2026-07-01) a fixed pre-existing gap: TK_TEXPR_ARRAY fell through to `default` (false
+        // negative) — a name used ONLY as an array-literal element (explicit `[a, b]` or the
+        // params call-site desugar's synthetic packed slice — see expr.c pack_variadic_args) was
+        // silently treated as unread. Recurse into every element.
+        case TK_TEXPR_ARRAY:
+            for (size_t i = 0; i < e->as.array.nelements; i += 1)
+                if (occurs_expr(&e->as.array.elements[i], name)) return true;
+            return false;
         default: return false;   // NUMBER/STR/BYTE/BOOL/NULL/PATH — no reads
     }
 }

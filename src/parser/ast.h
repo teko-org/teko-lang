@@ -207,7 +207,7 @@ struct tk_statement {
 // Top-level items (parser/ast.tks: Param/Function/Field/StructBody/EnumBody/
 //   VariantBody/TypeBody/TypeDecl/UseDecl/Decl + File model from parse_file.tks)
 // =========================================================================
-typedef struct { tk_str name; tk_type_expr type_ann; } tk_param;   // immutable (B.21)
+typedef struct { tk_str name; tk_type_expr type_ann; bool is_params; } tk_param;   // immutable (B.21); is_params = C#-style variadic modifier (2026-07-01), trailing-only, type_ann must be a Slice
 
 // tk_visibility — a declaration's REACH (LEGISLATION "Visibility — pub vs exp"; B.9).
 // PRIVATE (default, no keyword) = own namespace only; PUB = visible across the project's

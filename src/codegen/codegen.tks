@@ -673,7 +673,11 @@ fn cg_opt_mangle_str(inner: checker::Type) -> str | error {
         checker::Named as nm => nm.name
         checker::Optional as o => match o.inner {
             checker::Void => error { message = "codegen: nested bare-null optional (internal)" }
-            _ => teko::str::concat("opt_", match cg_opt_mangle_str(o.inner) { str as s => s; error as e => return e })
+            // (2026-07-01) bind the recursive result FIRST — `concat` is now variadic, so its 2nd
+            // arg packs into a synthetic array literal; an early `return` embedded directly inside
+            // an array-literal element trips a pre-existing codegen gap (the union-error wrap
+            // isn't threaded through nested array-element stmt-exprs). A plain TVar arg sidesteps it.
+            _ => { let inner_s = match cg_opt_mangle_str(o.inner) { str as s => s; error as e => return e }; teko::str::concat("opt_", inner_s) }
         }
         _ => error { message = "codegen: optional inner type not yet supported" }
     }
@@ -710,7 +714,7 @@ fn cg_member_key_str(m: checker::Type) -> str | error {
     let k = match m {
         checker::Slice as sl => match sl.element {
             checker::Void => return error { message = "codegen: an untyped slice variant member needs a known element type (internal)" }
-            _ => teko::str::concat("slice_", match cg_opt_mangle_str(sl.element) { str as s => s; error as e => return e })
+            _ => { let inner_s = match cg_opt_mangle_str(sl.element) { str as s => s; error as e => return e }; teko::str::concat("slice_", inner_s) }
         }
         _ => match cg_opt_mangle_str(m) { str as s => s; error as e => return e }
     }
@@ -730,7 +734,7 @@ fn cg_variant_typename_str(v: checker::Variant) -> str | error {
     loop {
         if i >= v.members.len { break }
         let k = match cg_member_key_str(v.members[i]) { str as s => s; error as e => return e }
-        name = teko::str::concat3(name, "_", k)
+        name = teko::str::concat(name, "_", k)
         i++
     }
     name
@@ -756,8 +760,8 @@ fn cg_emit_variant_ctype(buf: []byte, v: checker::Type) -> []byte | error {
 fn cg_opt_mangle_texpr_str(te: parser::TypeExpr) -> str | error {
     match te {
         parser::NamedType as nt => nt.path.segments[nt.path.segments.len - 1].name
-        parser::OptionalType as ot => teko::str::concat("opt_", match cg_opt_mangle_texpr_str(ot.inner) { str as s => s; error as e => return e })
-        parser::SliceType as st => teko::str::concat("slice_", match cg_opt_mangle_texpr_str(st.element) { str as s => s; error as e => return e })
+        parser::OptionalType as ot => { let inner_s = match cg_opt_mangle_texpr_str(ot.inner) { str as s => s; error as e => return e }; teko::str::concat("opt_", inner_s) }
+        parser::SliceType as st => { let inner_s = match cg_opt_mangle_texpr_str(st.element) { str as s => s; error as e => return e }; teko::str::concat("slice_", inner_s) }
         _ => error { message = "codegen: optional inner type-expr not yet supported" }
     }
 }
@@ -1411,6 +1415,23 @@ fn emit_call(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, e: c
             o = cb(o, sb)
             return cb(o, ".len }); })")
         }
+        // `concat(params pieces: []str) -> str` (== teko::string::concat, the LEGISLATED "+"
+        // never concatenates" primitive) — after the checker's params desugar, the call always
+        // arrives here with EXACTLY ONE arg (a []str, whether packed from N pieces or passed
+        // through). BRIDGE: fold the tk_slice_str via the existing 2-arg tk_str_concat primitive
+        // in an inline C loop (avoids needing a slice-taking runtime C signature — teko_rt.h
+        // can't reference tk_slice_str, a per-program generated typedef). Mirrors codegen.c.
+        if addr && pe == "concat" && c.args.len == 1 {
+            let cs = $"_cs{buf.len}"
+            let ci = $"_ci{buf.len}"
+            let ca = $"_ca{buf.len}"
+            mut o = cb(buf, "({ ")
+            o = match emit_type(o, c.args[0].type) { []byte as r => r; error as err => return err }
+            o = cb(o, $" {cs} = ")
+            o = match emit_expr_ctx(o, prog, checker::Void { }, c.args[0], escaping, regions, fn_body, dctx) { []byte as r => r; error as err => return err }
+            o = cb(o, $"; tk_str {ca} = (tk_str){{0,0}}; for (uint64_t {ci} = 0; {ci} < {cs}.len; {ci}++) {{ {ca} = tk_str_concat({ca}, {cs}.ptr[{ci}]); }} {ca}; }})")
+            return o
+        }
     }
     // Host-FFI bottoms with a VARIANT/OPTIONAL or argv return: lifted from a fixed-ABI runtime
     // result into the program's result type (the runtime can't name the generated sum/optional
@@ -1487,14 +1508,12 @@ fn emit_call(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, e: c
             // (`str`/`str_of_bytes` are bridged specially ABOVE — a []byte lowers to tk_slice_byte, a
             // DISTINCT C type from tk_str. In a CALL `str` is this builtin, not the str TYPE.)
             else if last == "one_byte"     { builtin = "tk_one_byte";     has_builtin = true }   // (byte) -> str
-            else if last == "str_concat"   { builtin = "tk_str_concat";   has_builtin = true }   // (str, str) -> str
-            else if last == "str_concat3"  { builtin = "tk_str_concat3";  has_builtin = true }   // (str, str, str) -> str
-            // matched by BARE last segment (`last`, above) — teko::str::concat and the LEGISLATED
-            // teko::string::concat (TEKO_LEGISLATION.md "`+` never concatenates": string building
-            // is `string::concat` / interpolation `$"..."`, never `+`) are the SAME builtin
-            // dispatch; no separate case needed.
-            else if last == "concat"       { builtin = "tk_str_concat";   has_builtin = true }   // teko::str::concat ; == teko::string::concat
-            else if last == "concat3"      { builtin = "tk_str_concat3";  has_builtin = true }   // teko::str::concat3 ; == teko::string::concat3
+            else if last == "str_concat"   { builtin = "tk_str_concat";   has_builtin = true }   // (str, str) -> str — internal 2-arg primitive, unchanged
+            // "concat"/"concat3" are NOT here — `concat3` REMOVED (2026-07-01); the PUBLIC
+            // variadic `concat(params pieces: []str)` (== `teko::string::concat`, the LEGISLATED
+            // "+` never concatenates" primitive — TEKO_LEGISLATION.md) is bridged specially
+            // ABOVE (folds a packed []str slice via tk_str_concat), since a builtin-dispatch
+            // name-substitution can't accept a slice argument directly.
             else if last == "slice"        { builtin = "tk_str_slice";    has_builtin = true }   // str::slice(str,u64,u64) -> str
             else if last == "slice_to"     { builtin = "tk_str_slice_to"; has_builtin = true }   // (str,u64) -> str
             else if last == "slice_from"   { builtin = "tk_str_slice_from"; has_builtin = true } // (str,u64) -> str
@@ -2843,7 +2862,7 @@ fn emit_host_ffi(buf: []byte, prog: checker::TProgram, e: checker::TExpr, c: che
         o = cb(o, "r.ok ? ")
         o = match emit_variant_wrap_str(o, prog, e.type, str_t, $"{t}r.value") { []byte as r => r; error as err => return err }
         o = cb(o, " : ")
-        o = match emit_variant_wrap_str(o, prog, e.type, err_t, teko::str::concat3("tk_error_make(", $"{t}r", ".err)")) { []byte as r => r; error as err => return err }
+        o = match emit_variant_wrap_str(o, prog, e.type, err_t, teko::str::concat("tk_error_make(", $"{t}r", ".err)")) { []byte as r => r; error as err => return err }
         return cb(o, "; })")
     }
 
@@ -2888,13 +2907,13 @@ fn emit_host_ffi(buf: []byte, prog: checker::TProgram, e: checker::TExpr, c: che
     } else {
         let slice_t = checker::Slice { element = checker::Str { } }
         // cexpr has literal braces → built via concat ($-interpolation has no brace escape).
-        let sx = teko::str::concat3("(tk_slice_str){ .ptr = ", t, teko::str::concat3(".ptr, .len = ", t, ".len }"))
+        let sx = teko::str::concat("(tk_slice_str){ .ptr = ", t, teko::str::concat(".ptr, .len = ", t, ".len }"))
         o = match emit_variant_wrap_str(o, prog, e.type, slice_t, sx) { []byte as r => r; error as err => return err }
     }
     o = cb(o, " : ")
     // E2-NATIVE: wrap the runtime's `.err` tk_str (message) into a full tk_error via tk_error_make.
     // u64res carries no message (not-found is the only failure) → empty message tk_error_make.
-    let eexpr = if kind == "u64res" { "tk_error_make((tk_str){0})" } else { teko::str::concat3("tk_error_make(", t, ".err)") }
+    let eexpr = if kind == "u64res" { "tk_error_make((tk_str){0})" } else { teko::str::concat("tk_error_make(", t, ".err)") }
     o = match emit_variant_wrap_str(o, prog, e.type, err_t, eexpr) { []byte as r => r; error as err => return err }
     return cb(o, "; })")
 }
@@ -5067,7 +5086,7 @@ fn cg_te_to_type(te: parser::TypeExpr) -> checker::Type {
         }
         // func-optionals aren't supported; a Func whose mangle fails so cg_opt_set_add/cg_slice_add
         // skip it (correct — same honest-stop as elsewhere).
-        parser::FunctionType => checker::Func { params = teko::list::empty(); ret = checker::Void { } }
+        parser::FunctionType => checker::Func { params = teko::list::empty(); ret = checker::Void { } ; variadic = false }
     }
 }
 
@@ -5695,7 +5714,7 @@ fn cg_lift_expr(e: checker::TExpr, acc: Ref<StampAcc>) -> checker::TExpr {
             if lam.captures.len == 0 {
                 mut ps: []parser::Param = teko::list::empty()
                 mut pi = 0
-                loop { if pi >= lam.params.len { break }; ps = teko::list::push(ps, parser::Param { name = lam.params[pi].name; type_ann = checker::type_to_texpr(lam.params[pi].type) }); pi++ }
+                loop { if pi >= lam.params.len { break }; ps = teko::list::push(ps, parser::Param { name = lam.params[pi].name; type_ann = checker::type_to_texpr(lam.params[pi].type); is_params = false }); pi++ }
                 newfns = teko::list::push(newfns, checker::TFunction { name = lam_fn_name(id); type_params = teko::list::empty(); params = ps; return_type = lam.ret; body = nbody; vis = parser::Visibility::Private; has_doc = false; doc = ""; namespace = ""; file = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = "" })
             } else {
                 newlams = teko::list::push(newlams, stamped)
@@ -5800,11 +5819,11 @@ fn cg_emit_lambda_decls(buf: []byte, prog: checker::TProgram, lams: []checker::T
                 out = cb(out, "; ")
                 ci++
             }
-            out = cb(out, teko::str::concat3("} __tkenv_", ids, ";\n"))
+            out = cb(out, teko::str::concat("} __tkenv_", ids, ";\n"))
         }
         // lifted fn signature: R __tkclo_<id>(void *envp, params)
         out = match emit_type(out, lam.ret) { []byte as o => o; error as e => return e }
-        out = cb(out, teko::str::concat3(" __tkclo_", ids, "(void *envp"))
+        out = cb(out, teko::str::concat(" __tkclo_", ids, "(void *envp"))
         mut pi = 0
         loop {
             if pi >= lam.params.len { break }
@@ -5819,7 +5838,7 @@ fn cg_emit_lambda_decls(buf: []byte, prog: checker::TProgram, lams: []checker::T
             out = cb(out, ";\n")
         } else {
             out = cb(out, " {\n")
-            out = cb(out, teko::str::concat3("    __tkenv_", ids, " *_e = envp;\n"))
+            out = cb(out, teko::str::concat("    __tkenv_", ids, " *_e = envp;\n"))
             mut ui = 0
             loop {
                 if ui >= lam.captures.len { break }

@@ -267,6 +267,7 @@ static tk_token_kind keyword_kind(tk_str text) {
     if (tk_str_eq_lit(text, "true"))     return TK_TOKEN_TRUE;   // bool literal (LEGISLATION §75)
     if (tk_str_eq_lit(text, "false"))    return TK_TOKEN_FALSE;  // bool literal (LEGISLATION §75)
     if (tk_str_eq_lit(text, "null"))     return TK_TOKEN_NULL;   // null literal (REBOOT_PLAN §202)
+    // `params` is deliberately NOT here — it's a contextual keyword like `from` (see token.h).
     return TK_TOKEN_IDENT;
 }
 

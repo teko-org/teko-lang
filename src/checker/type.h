@@ -96,7 +96,7 @@ struct tk_type {
         struct { tk_type *element; }            slice;       // TK_TYPE_SLICE
         struct { tk_str name; }                 named;       // TK_TYPE_NAMED (nominal)
         struct { tk_type *members; size_t len; } variant;    // TK_TYPE_VARIANT
-        struct { tk_type *params; size_t nparams; tk_type *ret; } func;  // TK_TYPE_FUNC
+        struct { tk_type *params; size_t nparams; tk_type *ret; bool variadic; } func;  // TK_TYPE_FUNC; variadic = the LAST param is a C#-style `params` slice (2026-07-01)
         struct { tk_type *inner; }              optional;    // TK_TYPE_OPTIONAL — T?
         struct { tk_type *inner; }              ptr;         // TK_TYPE_PTR — ptr<T> (inner NULL = opaque ptr ≡ ptr<void> ≡ *void)
         struct { tk_type *inner; }              ref;         // TK_TYPE_REF — ref<T> — the referenced type (never NULL)

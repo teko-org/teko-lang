@@ -225,6 +225,34 @@ static bool type_list_builtin(tk_call c, tk_env env, tk_type_table table, tk_tex
     return false;
 }
 
+// (2026-07-01) call-site desugar for a `params`-variadic function `ft`. Two shapes:
+//   passthrough — exactly nparams raw args AND the last one is already typed `[]T`
+//     (T = the params element type) → pass through unchanged, no re-wrapping.
+//   pack — otherwise, trailing args (0 or more) beyond the fixed prefix collapse into ONE
+//     synthetic array-literal `tk_expr` (reusing array-literal codegen), so the rest of
+//     type_call sees an ordinary nparams-arity call.
+typedef struct { bool ok; tk_expr *args; size_t nargs; tk_error error; } tk_pack_result;
+static tk_pack_result pack_variadic_args(tk_type ft, tk_expr *args, size_t nargs, tk_env env, tk_type_table table) {
+    size_t nfixed = ft.as.func.nparams - 1;
+    tk_type elem_ty = ft.as.func.params[nfixed].as.slice.element ? *ft.as.func.params[nfixed].as.slice.element : tk_void_t();
+    if (nargs == ft.as.func.nparams) {
+        tk_texpr_result last = tk_typer_expr(args[nfixed], env, table);
+        if (!last.ok) return (tk_pack_result){ .ok = false, .error = last.as.error };
+        tk_type wanted = (tk_type){ .tag = TK_TYPE_SLICE, .as.slice = { .element = &elem_ty } };
+        if (tk_type_eq(&last.as.value.type, &wanted)) return (tk_pack_result){ .ok = true, .args = args, .nargs = nargs };
+    }
+    if (nargs < nfixed) return (tk_pack_result){ .ok = false, .error = tk_error_make("wrong number of arguments") };
+    tk_array_elem *elems = NULL; size_t nelems = 0;
+    for (size_t i = nfixed; i < nargs; i += 1) {
+        tk_array_elems_push(&elems, &nelems, (tk_array_elem){ .is_spread = false, .expr = tk_box_expr(args[i]) });
+    }
+    tk_expr synth = { .tag = TK_EXPR_ARRAY, .as.array = { .elements = elems, .nelements = nelems } };
+    tk_expr *out = tk_alloc((nfixed + 1) * sizeof *out); if (!out) abort();
+    for (size_t j = 0; j < nfixed; j += 1) out[j] = args[j];
+    out[nfixed] = synth;
+    return (tk_pack_result){ .ok = true, .args = out, .nargs = nfixed + 1 };
+}
+
 static tk_texpr_result type_call(tk_call c, tk_env env, tk_type_table table) {
     tk_texpr_result lb;
     if (type_list_builtin(c, env, table, &lb)) return lb;   // teko::list::empty / push (generic)
@@ -265,15 +293,21 @@ static tk_texpr_result type_call(tk_call c, tk_env env, tk_type_table table) {
     if (!ftr.ok) return (tk_texpr_result){ .ok = false, .as.error = tk_error_named("unknown function", name) };
     tk_type ft = ftr.as.value;
     if (ft.tag != TK_TYPE_FUNC) return xerr("not a function");
-    if (c.nargs != ft.as.func.nparams) return xerr("wrong number of arguments");
+    tk_expr *dargs = c.args; size_t ndargs = c.nargs;
+    if (ft.as.func.variadic) {
+        tk_pack_result pr = pack_variadic_args(ft, c.args, c.nargs, env, table);
+        if (!pr.ok) return xferr(pr.error);
+        dargs = pr.args; ndargs = pr.nargs;
+    }
+    if (ndargs != ft.as.func.nparams) return xerr("wrong number of arguments");
     // Type every argument first (void rejected); strict-check / generic-infer below.
     tk_texpr_list args = tk_texpr_list_empty();
-    for (size_t i = 0; i < c.nargs; i += 1) {
+    for (size_t i = 0; i < ndargs; i += 1) {
         // (W10) a closure-literal ARG whose parameter is a concrete function type infers its
         // un-annotated params from that target (ruling 3); other args type normally.
-        bool lam_target = c.args[i].tag == TK_EXPR_LAMBDA && ft.as.func.params[i].tag == TK_TYPE_FUNC;
-        tk_texpr_result a = lam_target ? tk_type_value_expected(c.args[i], ft.as.func.params[i], env, table)
-                                       : tk_typer_expr(c.args[i], env, table);
+        bool lam_target = dargs[i].tag == TK_EXPR_LAMBDA && ft.as.func.params[i].tag == TK_TYPE_FUNC;
+        tk_texpr_result a = lam_target ? tk_type_value_expected(dargs[i], ft.as.func.params[i], env, table)
+                                       : tk_typer_expr(dargs[i], env, table);
         if (!a.ok) return a;
         if (tk_type_is_void(&a.as.value.type)) return xerr("a `void` expression cannot be passed as an argument (M.1)");
         args = tk_texpr_list_push(args, a.as.value);

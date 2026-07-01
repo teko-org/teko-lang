@@ -204,8 +204,8 @@ uint64_t tk_str_len_chars(tk_str s);
 // (The `chars` builtin lowers to this; the generated C holds the result as tk_slice_char.)
 typedef struct { tk_char *ptr; uint64_t len; } tk_slice_char;
 tk_slice_char tk_str_chars(tk_str s);
-// tk_str_concat3 — a ++ b ++ c in a fresh owned buffer (two tk_str_concat steps).
-tk_str tk_str_concat3(tk_str a, tk_str b, tk_str c);
+// tk_str_concat3 REMOVED (2026-07-01) — superseded by `concat(params pieces: []str)`, bridged
+// at the call site (codegen.c/.tks) by folding N pieces via tk_str_concat; no runtime symbol needed.
 // tk_ftoa — x rendered as %.17g float text (exact binary64 round-trip) in a fresh str.
 tk_str tk_ftoa(double x);
 

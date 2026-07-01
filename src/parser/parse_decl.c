@@ -23,6 +23,15 @@ static tk_parsed_params_result parse_params(const tk_token *t, size_t n, size_t 
         return (tk_parsed_params_result){ .ok = true, .as.value = { .items = params, .n_params = 0, .next = p + 1 } };
     }
     for (;;) {
+        // `params` — a CONTEXTUAL variadic-parameter modifier (2026-07-01), like `from` in the
+        // `extern` position: NOT a reserved word (295+ existing uses as a plain identifier/field
+        // name across the corpus), so it only triggers when `params` is immediately followed by
+        // ANOTHER name + `:` — i.e. `params pieces: []T`. A parameter *literally named* `params`
+        // (`params: []T`, colon right after) is unaffected. Trailing-only: rejected below if
+        // another param follows. The marked param's type must be a slice `[]T`.
+        bool has_params_kw = tk_is_kind_at(t, n, p, TK_TOKEN_IDENT) && text_is(t[p].text, "params")
+                              && tk_is_name_at(t, n, p + 1) && tk_is_kind_at(t, n, p + 2, TK_TOKEN_COLON);
+        if (has_params_kw) { p += 1; }
         if (!tk_is_name_at(t, n, p)) {
             return (tk_parsed_params_result){ .ok = false, .as.error = tk_err_at(t, n, p, "expected a parameter name") };
         }
@@ -32,8 +41,14 @@ static tk_parsed_params_result parse_params(const tk_token *t, size_t n, size_t 
         }
         tk_parsed_type_result ty = tk_parse_type(t, n, p + 2);
         if (!ty.ok) { return (tk_parsed_params_result){ .ok = false, .as.error = ty.as.error }; }
-        tk_params_push(&params, &np, (tk_param){ .name = name, .type_ann = ty.as.value.node });
+        if (has_params_kw && ty.as.value.node.tag != TK_TEXPR_SLICE) {
+            return (tk_parsed_params_result){ .ok = false, .as.error = tk_err_at(t, n, p + 2, "'params' parameter must have a slice type ([]T)") };
+        }
+        tk_params_push(&params, &np, (tk_param){ .name = name, .type_ann = ty.as.value.node, .is_params = has_params_kw });
         p = ty.as.value.next;
+        if (has_params_kw && tk_is_kind_at(t, n, p, TK_TOKEN_COMMA)) {
+            return (tk_parsed_params_result){ .ok = false, .as.error = tk_err_at(t, n, p, "'params' must be the last parameter") };
+        }
         if (!tk_is_kind_at(t, n, p, TK_TOKEN_COMMA)) { break; }
         p += 1;                                          // consume `,`
     }

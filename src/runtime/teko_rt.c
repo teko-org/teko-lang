@@ -326,11 +326,8 @@ tk_slice_char tk_str_chars(tk_str s) {
     return (tk_slice_char){ arr, count };
 }
 
-// tk_str_concat3 — a ++ b ++ c via two tk_str_concat steps. Each step allocates a fresh
-// owned buffer (the intermediate a++b is leaked — M.5 short-lived).
-tk_str tk_str_concat3(tk_str a, tk_str b, tk_str c) {
-    return tk_str_concat(tk_str_concat(a, b), c);
-}
+// tk_str_concat3 REMOVED (2026-07-01) — superseded by `concat(params pieces: []str)`, bridged
+// at the call site (codegen.c/.tks) by folding N pieces via tk_str_concat; no runtime symbol needed.
 
 // tk_ftoa — x rendered as %.17g (exact binary64 round-trip; same renderer as codegen's float
 // literal emission) into a temp, then COPIED into a fresh owned str.

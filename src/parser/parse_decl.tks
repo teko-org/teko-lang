@@ -11,6 +11,15 @@ fn parse_params(tokens: []lexer::Token, pos: u64) -> ParsedList<Param> | error {
         return ParsedList<Param> { items = params; next = p + 1 }
     }
     loop {
+        // `params` — a CONTEXTUAL variadic-parameter modifier (2026-07-01), like `from` in the
+        // `extern` position: NOT a reserved word (295+ existing uses as a plain identifier/field
+        // name across the corpus), so it only triggers when `params` is immediately followed by
+        // ANOTHER name + `:` — i.e. `params pieces: []T`. A parameter *literally named* `params`
+        // (`params: []T`, colon right after) is unaffected — ordinary parsing. Trailing-only:
+        // rejected below if another param follows. Type must be a slice `[]T` (checked once parsed).
+        let has_params_kw = is_kind_at(tokens, p, lexer::TokenKind::Ident) && tokens[p].text == "params" &&
+                             is_name_at(tokens, p + 1) && is_kind_at(tokens, p + 2, lexer::TokenKind::Colon)
+        if has_params_kw { p = p + 1 }
         if !is_name_at(tokens, p) {
             return err_at(tokens, p, "expected a parameter name")
         }
@@ -19,8 +28,14 @@ fn parse_params(tokens: []lexer::Token, pos: u64) -> ParsedList<Param> | error {
             return err_at(tokens, p + 1, "expected ':' after a parameter name")
         }
         let ty = match parse_type(tokens, p + 2) { ParsedType as x => x; error as e => return e }
-        params = teko::list::push(params, Param { name = name; type_ann = ty.node })
+        if has_params_kw {
+            match ty.node { SliceType => { }; _ => return err_at(tokens, p + 2, "'params' parameter must have a slice type ([]T)") }
+        }
+        params = teko::list::push(params, Param { name = name; type_ann = ty.node; is_params = has_params_kw })
         p = ty.next
+        if has_params_kw && is_kind_at(tokens, p, lexer::TokenKind::Comma) {
+            return err_at(tokens, p, "'params' must be the last parameter")
+        }
         if !is_kind_at(tokens, p, lexer::TokenKind::Comma) { break }
         p = p + 1                                    // consume `,`
     }

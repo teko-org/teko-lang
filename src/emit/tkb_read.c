@@ -315,7 +315,7 @@ static tk_type_expr read_typeexpr(tk_reader *r, tk_strs t) {
 static tk_param *read_params(tk_reader *r, tk_strs t, size_t *out_n) {
     uint64_t n = tk_read_u64(r);
     tk_param *xs = tk_alloc((n ? n : 1) * sizeof *xs); if (!xs) abort();
-    for (uint64_t i = 0; i < n; i += 1) { xs[i].name = tk_read_str(r, t); xs[i].type_ann = read_typeexpr(r, t); }
+    for (uint64_t i = 0; i < n; i += 1) { xs[i].name = tk_read_str(r, t); xs[i].type_ann = read_typeexpr(r, t); xs[i].is_params = false; }   // .tkb is FunctionType-only (closures) today — params is source-only, never serialized
     *out_n = (size_t)n; return xs;
 }
 static tk_field *read_fields(tk_reader *r, tk_strs t, size_t *out_n) {

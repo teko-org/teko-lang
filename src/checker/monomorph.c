@@ -516,7 +516,7 @@ tk_tprogram_result tk_monomorphize(tk_tprogram prog, tk_type_table table) {
         // STAMP: concrete param annotations, substituted return type, body rewritten through the Subst.
         tk_param *nparams = gf->nparams ? tk_alloc(gf->nparams * sizeof *nparams) : NULL;
         for (size_t pi = 0; pi < gf->nparams; pi += 1)
-            nparams[pi] = (tk_param){ .name = gf->params[pi].name, .type_ann = subst_typeexpr(gf->params[pi].type_ann, inst.s) };
+            nparams[pi] = (tk_param){ .name = gf->params[pi].name, .type_ann = subst_typeexpr(gf->params[pi].type_ann, inst.s), .is_params = gf->params[pi].is_params };
         tk_tstatement *body; size_t nbody;
         if (!mono_block(gf->body, gf->nbody, inst.s, prog, table, &body, &nbody, &queue, &err))
             return (tk_tprogram_result){ .ok = false, .as.error = err };

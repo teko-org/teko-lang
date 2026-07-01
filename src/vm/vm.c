@@ -41,10 +41,9 @@ tk_str tk_u64_to_str(uint64_t v);
 // str/byte STDLIB builtins (Phase 3) — the SAME runtime symbols codegen emits, so the
 // named-builtin calls run byte-for-byte the same in the VM as natively. EXTERN (linked
 // from teko_rt.c). str_of_bytes COPIES the []byte's bytes into a fresh str; one_byte
-// makes a fresh 1-byte str; str_concat3 is a ++ b ++ c; ftoa is %.17g float text.
+// makes a fresh 1-byte str; ftoa is %.17g float text. (str_concat3 REMOVED 2026-07-01.)
 tk_str tk_str_of_bytes(tk_str bytes);
 tk_str tk_one_byte(tk_byte c);
-tk_str tk_str_concat3(tk_str a, tk_str b, tk_str c);
 tk_str tk_ftoa(double x);
 // fmt_* — ROUND 0 format-spec helpers (teko_rt.c). Declared here so vm.c doesn't pull in teko_rt.h.
 tk_str tk_fmt_f(double val, int prec);
@@ -743,17 +742,7 @@ static bool try_builtin_call(tk_path p, const tk_texpr *args, size_t nargs,
         *out = v_str(tk_one_byte((tk_byte)v_as_u128(a)));
         return true;
     }
-    // str_concat3 — (str, str, str) -> str. a ++ b ++ c in a fresh owned buffer.
-    if (seg_is(last, "str_concat3")) {
-        if (nargs != 3) vm_unsupported("str_concat3 expects three arguments (str, str, str)");
-        tk_value a = tk_vm_eval_expr(&args[0], env);
-        tk_value b = tk_vm_eval_expr(&args[1], env);
-        tk_value c = tk_vm_eval_expr(&args[2], env);
-        if (a.tag != TK_VAL_STR || b.tag != TK_VAL_STR || c.tag != TK_VAL_STR)
-            vm_unsupported("str_concat3 on non-str args (internal: checker should reject)");
-        *out = v_str(tk_str_concat3(a.as.s, b.as.s, c.as.s));
-        return true;
-    }
+    // str_concat3 REMOVED (2026-07-01) — superseded by the variadic "concat" below.
     // float::parse — (str) -> f64. Parse a decimal float string to a double.
     if (seg_is(last, "parse")) {
         if (nargs != 1) vm_unsupported("float::parse expects exactly one argument (a str)");
@@ -823,17 +812,25 @@ static bool try_builtin_call(tk_path p, const tk_texpr *args, size_t nargs,
         tk_value v = tk_vm_eval_expr(&args[0], env), s = tk_vm_eval_expr(&args[1], env);
         *out = v_str(tk_fmt_dyn_u64((uint64_t)v_as_u128(v), s.as.s)); return true;
     }
-    // str STDLIB surface — the SAME runtime symbols native codegen lowers to, so VM==native.
-    // Matched by BARE last segment (`last`, above) — teko::str::concat and the LEGISLATED
-    // teko::string::concat (TEKO_LEGISLATION.md "`+` never concatenates": string building is
-    // `string::concat` / interpolation `$"..."`, never `+`) are the SAME builtin dispatch.
-    if (seg_is(last, "concat") || seg_is(last, "str_concat")) {
+    // str_concat — the internal 2-arg primitive, unchanged.
+    if (seg_is(last, "str_concat")) {
         tk_value a = tk_vm_eval_expr(&args[0], env), b = tk_vm_eval_expr(&args[1], env);
         *out = v_str(tk_str_concat(a.as.s, b.as.s)); return true;
     }
-    if (seg_is(last, "concat3")) {
-        tk_value a = tk_vm_eval_expr(&args[0], env), b = tk_vm_eval_expr(&args[1], env), c = tk_vm_eval_expr(&args[2], env);
-        *out = v_str(tk_str_concat3(a.as.s, b.as.s, c.as.s)); return true;
+    // "concat" (== the LEGISLATED string::concat, TEKO_LEGISLATION.md "`+` never concatenates")
+    // is the ONE public variadic form (2026-07-01, `concat3` removed). After the checker's params
+    // call-site desugar, the call always arrives here with EXACTLY ONE arg — a []str (TK_VAL_LIST
+    // of TK_VAL_STR), whether packed from N pieces or passed through. Fold it via tk_str_concat.
+    if (seg_is(last, "concat")) {
+        tk_value pieces = tk_vm_eval_expr(&args[0], env);
+        if (pieces.tag != TK_VAL_LIST) vm_unsupported("concat on a non-[]str value (internal: checker should reject)");
+        tk_str acc = (tk_str){0};
+        for (size_t i = 0; i < pieces.as.list.len; i += 1) {
+            tk_value p = pieces.as.list.ptr[i];
+            if (p.tag != TK_VAL_STR) vm_unsupported("concat element is not a str (internal: checker should reject)");
+            acc = tk_str_concat(acc, p.as.s);
+        }
+        *out = v_str(acc); return true;
     }
     if (seg_is(last, "slice")) {
         tk_value s = tk_vm_eval_expr(&args[0], env), a = tk_vm_eval_expr(&args[1], env), b = tk_vm_eval_expr(&args[2], env);

@@ -1553,6 +1553,29 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
                     cb(b, ".ptr, "); cb(b, sb); cb(b, ".len }); })");
                     return true;
                 }
+                // `concat(params pieces: []str) -> str` (== teko::string::concat, the LEGISLATED
+                // "+` never concatenates" primitive) — after the checker's params desugar, the
+                // call always arrives here with EXACTLY ONE arg (a []str, whether packed from N
+                // pieces or passed through). BRIDGE: fold the tk_slice_str via the existing 2-arg
+                // tk_str_concat primitive in an inline C loop (avoids needing a slice-taking
+                // runtime C signature — teko_rt.h can't reference tk_slice_str, a per-program
+                // generated typedef). Mirrors codegen.tks.
+                if ((p.len == 1 || seg_is(p.segments[0].name, "teko")) && seg_is(pe, "concat") && e->as.call.nargs == 1) {
+                    char cs[40], ci[40], ca[40];
+                    snprintf(cs, sizeof cs, "_cs%zu", (size_t)b->len);
+                    snprintf(ci, sizeof ci, "_ci%zu", (size_t)b->len);
+                    snprintf(ca, sizeof ca, "_ca%zu", (size_t)b->len);
+                    cb(b, "({ ");
+                    if (!emit_type(b, e->as.call.args[0].type, err)) return false;   // tk_slice_str
+                    cb(b, " "); cb(b, cs); cb(b, " = ");
+                    if (!emit_expr(b, &e->as.call.args[0], err)) return false;
+                    cb(b, "; tk_str "); cb(b, ca); cb(b, " = (tk_str){0,0}; for (uint64_t ");
+                    cb(b, ci); cb(b, " = 0; "); cb(b, ci); cb(b, " < "); cb(b, cs); cb(b, ".len; ");
+                    cb(b, ci); cb(b, "++) { "); cb(b, ca); cb(b, " = tk_str_concat("); cb(b, ca);
+                    cb(b, ", "); cb(b, cs); cb(b, ".ptr["); cb(b, ci); cb(b, "]); } "); cb(b, ca);
+                    cb(b, "; })");
+                    return true;
+                }
             }
             // teko::list::empty / push — the SLICE (collection) builtins, FIXED+COPY. `empty()`
             // (sentinel) is normally wrapped by emit_as into a concrete slot literal; reaching
@@ -1699,14 +1722,12 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
                     // type from tk_str, so they are bridged specially ABOVE. In a CALL `str` is this
                     // builtin, not the str TYPE — that's emit_type.)
                     else if (seg_is(last, "one_byte"))    builtin = "tk_one_byte";       // (byte) -> str
-                    else if (seg_is(last, "str_concat"))  builtin = "tk_str_concat";     // (str, str) -> str
-                    else if (seg_is(last, "str_concat3")) builtin = "tk_str_concat3";    // (str, str, str) -> str
-                    // matched by BARE last segment (`last`, above) — teko::str::concat and the
-                    // LEGISLATED teko::string::concat (TEKO_LEGISLATION.md "`+` never
-                    // concatenates": string building is `string::concat` / interpolation
-                    // `$"..."`, never `+`) are the SAME builtin dispatch; no separate case needed.
-                    else if (seg_is(last, "concat"))      builtin = "tk_str_concat";     // teko::str::concat ; == teko::string::concat
-                    else if (seg_is(last, "concat3"))     builtin = "tk_str_concat3";    // teko::str::concat3 ; == teko::string::concat3
+                    else if (seg_is(last, "str_concat"))  builtin = "tk_str_concat";     // (str, str) -> str — internal 2-arg primitive, unchanged
+                    // "concat"/"concat3" NOT here — concat3 REMOVED (2026-07-01); the PUBLIC
+                    // variadic `concat(params pieces: []str)` (== teko::string::concat, the
+                    // LEGISLATED "+` never concatenates" primitive) is bridged specially ABOVE
+                    // (folds a packed []str slice via tk_str_concat) — a name-substitution
+                    // builtin can't accept a slice argument directly.
                     else if (seg_is(last, "slice"))       builtin = "tk_str_slice";      // str::slice(str,u64,u64) -> str
                     else if (seg_is(last, "slice_to"))    builtin = "tk_str_slice_to";   // (str,u64) -> str
                     else if (seg_is(last, "slice_from"))  builtin = "tk_str_slice_from"; // (str,u64) -> str

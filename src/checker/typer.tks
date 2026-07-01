@@ -163,7 +163,7 @@ fn type_lambda(lam: parser::Lambda, expected: Type, env: Env, table: TypeTable) 
         }
         k++
     }
-    TExpr { kind = TLambda { params = tparams; body = tb.stmts; captures = captures; ret = ret; lift_id = 0 }; type = Func { params = lam_param_types(tparams); ret = ret }; line = 0; col = 0 }
+    TExpr { kind = TLambda { params = tparams; body = tb.stmts; captures = captures; ret = ret; lift_id = 0 }; type = Func { params = lam_param_types(tparams); ret = ret ; variadic = false }; line = 0; col = 0 }
 }
 fn lam_param_types(ps: []TLambdaParam) -> []Type {
     mut out: []Type = teko::list::empty()
@@ -302,6 +302,38 @@ fn type_list_builtin(c: parser::Call, env: Env, table: TypeTable) -> TExpr | Not
     }
 }
 
+// (2026-07-01) call-site desugar for a `params`-variadic function `f`. Two shapes:
+//   passthrough — exactly `f.params.len` raw args AND the last one is already typed `[]T`
+//     (T = the params element type) → pass through unchanged, no re-wrapping.
+//   pack — otherwise, the trailing args (0 or more) beyond the fixed prefix are collapsed into
+//     ONE synthetic array-literal `parser::Expr` (reusing array-literal codegen — Increment B+),
+//     so the rest of `type_call` sees an ordinary `f.params.len`-arity call.
+fn pack_variadic_args(f: Func, args: []parser::Expr, env: Env, table: TypeTable) -> []parser::Expr | error {
+    let nfixed = f.params.len - 1
+    let elem_ty = match f.params[nfixed] { Slice as s => s.element; _ => Void { } }   // parser already enforced the last param is a Slice
+    if args.len == f.params.len {
+        let last = match type_expr(args[nfixed], env, table) { TExpr as te => te; error as e => return e }
+        if type_eq(last.type, Slice { element = elem_ty }) { return args }   // passthrough
+    }
+    if args.len < nfixed { return error { message = "wrong number of arguments" } }
+    mut elems: []parser::ArrayElem = teko::list::empty()
+    mut i = nfixed
+    loop {
+        if i >= args.len { break }
+        elems = teko::list::push(elems, parser::ArrayElem { is_spread = false; expr = args[i] })
+        i++
+    }
+    let synth = parser::Expr { kind = parser::ArrayLit { elements = elems }; line = 0; col = 0 }
+    mut out: []parser::Expr = teko::list::empty()
+    mut j = 0
+    loop {
+        if j >= nfixed { break }
+        out = teko::list::push(out, args[j])
+        j++
+    }
+    teko::list::push(out, synth)
+}
+
 fn type_call(c: parser::Call, env: Env, table: TypeTable) -> TExpr | error {
     match type_list_builtin(c, env, table) {   // teko::list::empty / push (generic)
         TExpr as te    => return te
@@ -343,20 +375,21 @@ fn type_call(c: parser::Call, env: Env, table: TypeTable) -> TExpr | error {
     }
     match ft {
         Func as f => {
-            if c.args.len != f.params.len { return error { message = "wrong number of arguments" } }
+            let dargs = if f.variadic { match pack_variadic_args(f, c.args, env, table) { []parser::Expr as x => x; error as e => return e } } else { c.args }
+            if dargs.len != f.params.len { return error { message = "wrong number of arguments" } }
             // Type every argument first (void rejected); strict-check / generic-infer below.
             mut targs: []TExpr = teko::list::empty()
             mut ti = 0
             loop {
-                if ti >= c.args.len { break }
+                if ti >= dargs.len { break }
                 // (W10) a closure-literal ARG whose parameter is a concrete function type infers its
                 // un-annotated params from that target (ruling 3); other args type normally.
-                let is_lam = match c.args[ti].kind { parser::Lambda => true; _ => false }
+                let is_lam = match dargs[ti].kind { parser::Lambda => true; _ => false }
                 let pt_is_func = match f.params[ti] { Func => true; _ => false }
                 let a = if is_lam && pt_is_func {
-                    match type_value_expected(c.args[ti], f.params[ti], env, table) { TExpr as te => te; error as e => return e }
+                    match type_value_expected(dargs[ti], f.params[ti], env, table) { TExpr as te => te; error as e => return e }
                 } else {
-                    match type_expr(c.args[ti], env, table) { TExpr as te => te; error as e => return e }
+                    match type_expr(dargs[ti], env, table) { TExpr as te => te; error as e => return e }
                 }
                 if type_is_void(a.type) { return error { message = "a `void` expression cannot be passed as an argument (M.1)" } }
                 targs = teko::list::push(targs, a)

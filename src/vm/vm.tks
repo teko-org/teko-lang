@@ -130,7 +130,7 @@ fn vm_str_eq(a: str, b: str) -> bool { a == b }
 // crumb's scope — vm.c/vm.tks only). File-threading is DEFERRED; we emit the honest "line:col:".
 fn vm_panic_pos(line: u32, col: u32) {
     if line == 0 { return }   // no position recorded — fall through to the bare runtime panic
-    teko::io::ewrite(teko::str::concat3(teko::u64_to_str(line to u64), ":", teko::u64_to_str(col to u64)))
+    teko::io::ewrite(teko::str::concat(teko::u64_to_str(line to u64), ":", teko::u64_to_str(col to u64)))
     teko::io::ewrite(": ")
 }
 fn vm_panic_div0_at(line: u32, col: u32) { vm_panic_pos(line, col); teko::panic_div0() }
@@ -575,23 +575,29 @@ fn try_str_builtin(callee: parser::Path, args: []checker::TExpr, env: Venv) -> V
         if val_is_byte(a) || val_is_int(a) { return teko::one_byte(as_int(a) to byte) }
         panic("vm: one_byte on a non-byte value (internal: checker should reject)")
     }
-    if last == "str_concat3" {
-        return teko::str_concat3(as_str(ev_val(args[0], env)),
-                                 as_str(ev_val(args[1], env)),
-                                 as_str(ev_val(args[2], env)))
-    }
+    // str_concat3 REMOVED (2026-07-01) — superseded by the variadic "concat" below.
     if last == "parse"        { return teko::float::parse(as_str(ev_val(args[0], env))) }
     if last == "ftoa"         { return teko::ftoa(as_float(ev_val(args[0], env))) }
     if last == "f64_bits"     { return teko::f64_bits(as_float(ev_val(args[0], env))) }
     if last == "f64_from_bits" { return teko::f64_from_bits(as_int(ev_val(args[0], env)) to u64) }
     // str STDLIB surface — the SAME runtime functions native codegen lowers to (tk_str_*), so the
     // VM matches the compiled output. (str, u64, …) args; a u64/bool result widens into Value.
-    // Matched by BARE last segment (`last`, above) — teko::str::concat and the LEGISLATED
-    // teko::string::concat (TEKO_LEGISLATION.md "`+` never concatenates": string building is
-    // `string::concat` / interpolation `$"..."`, never `+`) are the SAME builtin dispatch.
-    if last == "concat"      { return teko::str_concat(as_str(ev_val(args[0], env)), as_str(ev_val(args[1], env))) }
     if last == "str_concat"  { return teko::str_concat(as_str(ev_val(args[0], env)), as_str(ev_val(args[1], env))) }
-    if last == "concat3"     { return teko::str_concat3(as_str(ev_val(args[0], env)), as_str(ev_val(args[1], env)), as_str(ev_val(args[2], env))) }
+    // "concat" (== the LEGISLATED string::concat, TEKO_LEGISLATION.md "`+` never concatenates")
+    // is the ONE public variadic form (2026-07-01, `concat3` removed). After the checker's params
+    // call-site desugar, the call always arrives here with EXACTLY ONE arg — a []str, whether
+    // packed from N pieces or passed through. Fold it via str_concat.
+    if last == "concat" {
+        match ev_val(args[0], env) {
+            []Value as xs => {
+                mut acc = ""
+                mut i: u64 = 0
+                loop { if i >= xs.len { break }; acc = teko::str_concat(acc, as_str(xs[i])); i++ }
+                return acc
+            }
+            _ => panic("vm: concat on a non-[]str value (internal: checker should reject)")
+        }
+    }
     if last == "slice"       { return teko::slice(as_str(ev_val(args[0], env)), as_int(ev_val(args[1], env)) to u64, as_int(ev_val(args[2], env)) to u64) }
     if last == "slice_to"    { return teko::slice_to(as_str(ev_val(args[0], env)), as_int(ev_val(args[1], env)) to u64) }
     if last == "slice_from"  { return teko::slice_from(as_str(ev_val(args[0], env)), as_int(ev_val(args[1], env)) to u64) }
@@ -2095,7 +2101,7 @@ fn find_function_ns(env: Venv, callee: parser::Path, call_ns: str) -> FnHit {
         }
         i++
     }
-    panic(teko::str::concat3("vm: `", name, "` is a host function the VM cannot run (use `teko build` to compile natively)"))
+    panic(teko::str::concat("vm: `", name, "` is a host function the VM cannot run (use `teko build` to compile natively)"))
 }
 // find_function — the no-namespace-hint convenience form (call_ns unknown/inapplicable): behaves
 // exactly like the OLD last-segment-anywhere scan.
@@ -3143,7 +3149,7 @@ exp fn cov_cobertura(prog: checker::TProgram) -> str {
                         s = s + 1
                     }
                     br_cov = br_cov + fbc; br_val = br_val + fbv
-                    let cname = if f.namespace.len != 0 { teko::str::concat3(f.namespace, "::", f.name) } else { f.name }
+                    let cname = if f.namespace.len != 0 { teko::str::concat(f.namespace, "::", f.name) } else { f.name }
                     let lrate = cov_rate_str(flc, flv)
                     let brate = cov_rate_str(fbc, fbv)
                     body = teko::str::concat(body, $"      <class name='{cname}' filename='{f.file}' line-rate='{lrate}' branch-rate='{brate}' complexity='0'>\n")
@@ -3191,8 +3197,8 @@ exp fn run_tests_cov(prog: checker::TProgram, record_branches: bool, write_xml: 
         match prog.items[i] {
             checker::TFunction as f => {
                 if f.is_test {
-                    let label = if f.namespace.len != 0 { teko::str::concat3(f.namespace, "::", f.name) } else { f.name }
-                    teko::io::print(teko::str::concat3("test ", label, " ... "))
+                    let label = if f.namespace.len != 0 { teko::str::concat(f.namespace, "::", f.name) } else { f.name }
+                    teko::io::print(teko::str::concat("test ", label, " ... "))
                     let fenv = fresh_env(prog, teko::list::empty())   // (MEM Step 2/3) each test frame starts with an empty cell store
                     teko::cov_enter(i to u64)   // attribute the test body's own lines/branches to the test (NOT prod fn 0)
                     let _ = exec_block(f.body, fenv)   // a failed assert panics here (fail-fast); normal completion = pass
@@ -3209,7 +3215,7 @@ exp fn run_tests_cov(prog: checker::TProgram, record_branches: bool, write_xml: 
     if passed == 0 {
         teko::io::println("teko: no tests (no `#test` functions)")
     } else {
-        teko::io::println(teko::str::concat3("teko: ", teko::str::u64_to_str(passed), " test(s) passed"))
+        teko::io::println(teko::str::concat("teko: ", teko::str::u64_to_str(passed), " test(s) passed"))
         // D3 — three coverage metrics: functions / lines / branches (lines+branches need recording).
         let fc = functions_coverage(prog)
         teko::io::println($"teko: coverage {cov_pct(fc)}% ({fc.cov}/{fc.val} functions)")

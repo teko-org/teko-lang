@@ -141,6 +141,7 @@ tk_type_result tk_builtin_fn(tk_str name) {
     static tk_type bool_t = { .tag = TK_TYPE_PRIM, .as.prim = TK_PRIM_BOOL };  // a (bool) parameter
     static tk_type void_t = { .tag = TK_TYPE_VOID };      // the void return (M.3 — no value)
     static tk_type str2_t[2] = { { .tag = TK_TYPE_STR }, { .tag = TK_TYPE_STR } };  // (str, str)
+    static tk_type slice_str_t = { .tag = TK_TYPE_SLICE, .as.slice = { .element = &str_t } };  // []str — `concat`'s single variadic param (2026-07-01)
     // self-host str/byte STDLIB surface — the unqualified helpers the corpus calls (the C twins are
     // tk_str_slice/tk_str_concat/… in text.h + teko_rt). All return `str`; recognized like print
     // (resolved by last path segment). NON-generic, fixed signatures (M.5).
@@ -158,7 +159,7 @@ tk_type_result tk_builtin_fn(tk_str name) {
     // (str, i64, i64) — str_slice_chars params
     static tk_type str_i64_i64_p[3] = { { .tag = TK_TYPE_STR }, { .tag = TK_TYPE_PRIM, .as.prim = TK_PRIM_I64 }, { .tag = TK_TYPE_PRIM, .as.prim = TK_PRIM_I64 } };
     static tk_type slice_p[3] = { { .tag = TK_TYPE_STR }, { .tag = TK_TYPE_PRIM, .as.prim = TK_PRIM_U64 }, { .tag = TK_TYPE_PRIM, .as.prim = TK_PRIM_U64 } };
-    static tk_type str3_t[3]  = { { .tag = TK_TYPE_STR }, { .tag = TK_TYPE_STR }, { .tag = TK_TYPE_STR } };
+    // str3_t REMOVED (2026-07-01) — was only used by str_concat3/concat3, both removed.
     static tk_type str_u64_p[2] = { { .tag = TK_TYPE_STR }, { .tag = TK_TYPE_PRIM, .as.prim = TK_PRIM_U64 } };  // (str, u64)
     // teko::str::last_index_of -> `u64 | error` (a found index, or error when absent)
     static tk_type u64_or_err_m[2] = { { .tag = TK_TYPE_PRIM, .as.prim = TK_PRIM_U64 }, { .tag = TK_TYPE_ERROR } };
@@ -183,8 +184,8 @@ tk_type_result tk_builtin_fn(tk_str name) {
     if (name_is(name, "slice"))        return TK_BFN(slice_p, 3);   // slice(str, u64, u64) -> str
     if (name_is(name, "str") || name_is(name, "str_of_bytes")) return TK_BFN(&bytes_t, 1);   // ([]byte) -> str
     if (name_is(name, "one_byte"))     return TK_BFN(&byte_t, 1);   // (byte) -> str
-    if (name_is(name, "str_concat"))   return TK_BFN(str2_t, 2);    // (str, str) -> str
-    if (name_is(name, "str_concat3"))  return TK_BFN(str3_t, 3);    // (str, str, str) -> str
+    if (name_is(name, "str_concat"))   return TK_BFN(str2_t, 2);    // (str, str) -> str — internal 2-arg primitive, unchanged
+    // "str_concat3" REMOVED (2026-07-01) — superseded by the variadic "concat" below.
     if (name_is(name, "i64_to_str"))   return TK_BFN(&i64_t, 1);    // (i64) -> str
     if (name_is(name, "u64_to_str"))   return TK_BFN(&u64_t, 1);    // (u64) -> str
     if (name_is(name, "ftoa"))         return TK_BFN(&f64_t, 1);    // (f64) -> str
@@ -199,8 +200,12 @@ tk_type_result tk_builtin_fn(tk_str name) {
     // spelling the corpus already uses pervasively) two names for the same builtin dispatch.
     // No separate registration is needed for the `string::` spelling — this comment documents
     // the mechanism so the legislated name is discoverable here, not just inferable.
-    if (name_is(name, "concat"))       return TK_BFN(str2_t, 2);      // str::concat(str, str) -> str ; == string::concat (legislated)
-    if (name_is(name, "concat3"))      return TK_BFN(str3_t, 3);      // str::concat3(str, str, str) -> str ; == string::concat3
+    // "concat" (== the LEGISLATED string::concat) is the ONE public variadic form (2026-07-01,
+    // `concat3` removed): `concat(params pieces: []str) -> str` — ONE param, itself a []str, and
+    // `.variadic = true` so the checker's params call-site desugar (expr.c/typer.tks) packs N
+    // trailing str args into a []str automatically, or passes an existing []str straight through.
+    if (name_is(name, "concat"))       return (tk_type_result){ .ok = true, .as.value = (tk_type){ .tag = TK_TYPE_FUNC,
+        .as.func = { .params = &slice_str_t, .nparams = 1, .ret = &str_t, .variadic = true } } };
     if (name_is(name, "slice_to"))     return TK_BFN(str_u64_p, 2);   // str::slice_to(str, u64) -> str
     if (name_is(name, "slice_from"))   return TK_BFN(str_u64_p, 2);   // str::slice_from(str, u64) -> str
     #undef TK_BFN

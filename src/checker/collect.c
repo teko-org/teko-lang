@@ -34,7 +34,8 @@ static tk_type_result func_type(tk_function f, tk_type_table table) {
         : (tk_type_result){ .ok = true, .as.value = (tk_type){ .tag = TK_TYPE_VOID } };
     if (!ret.ok) { tk_free0(params); return ret; }
     tk_type *rp = tk_alloc(sizeof *rp); if (!rp) abort(); *rp = ret.as.value;
-    tk_type t = { .tag = TK_TYPE_FUNC, .as.func = { params, n, rp } };
+    bool is_variadic = f.nparams > 0 && f.params[f.nparams - 1].is_params;
+    tk_type t = { .tag = TK_TYPE_FUNC, .as.func = { params, n, rp, is_variadic } };
     return (tk_type_result){ .ok = true, .as.value = t };
 }
 
@@ -170,7 +171,8 @@ tk_collected_result tk_seed_from_dep(tk_tprogram dep, tk_type_table table, tk_en
         // The return type is already resolved in TFunction.return_type — use it directly.
         tk_type *rp = tk_alloc(sizeof *rp); if (!rp) abort();
         *rp = f.return_type;
-        tk_type ft = { .tag = TK_TYPE_FUNC, .as.func = { params, np, rp } };
+        bool is_variadic = f.nparams > 0 && f.params[f.nparams - 1].is_params;
+        tk_type ft = { .tag = TK_TYPE_FUNC, .as.func = { params, np, rp, is_variadic } };
         env = tk_env_define_fn(env, f.name, ft, f.namespace);
     }
 

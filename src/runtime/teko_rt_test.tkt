@@ -33,11 +33,15 @@ fn str_view_contains() {
     teko::assert::is_false(teko::str::contains("hello", "xyz")) // absent → would be the panic side
 }
 
-// teko::string::concat / concat3 — the LEGISLATED public string-building API
-// (TEKO_LEGISLATION.md "`+` never concatenates": string building is `string::concat` /
-// interpolation `$"..."`, never `+`). Resolved by LAST PATH SEGMENT (same mechanism as
-// str_concat / teko::str::concat above) — `teko::string::concat` is simply another spelling
-// of the same builtin dispatch, proven here under its legislated namespace/name.
+// teko::string::concat — the LEGISLATED public string-building API (TEKO_LEGISLATION.md
+// "`+` never concatenates": string building is `string::concat` / interpolation `$"..."`,
+// never `+`). Resolved by LAST PATH SEGMENT (same mechanism as str_concat / teko::str::concat
+// above) — `teko::string::concat` is simply another spelling of the same builtin dispatch,
+// proven here under its legislated namespace/name. `concat` is now the ONE public form: a
+// C#-style `params` variadic parameter (2026-07-01, `concat3` REMOVED) — `concat(params
+// pieces: []str) -> str`. The checker's call-site desugar either PACKS N trailing str args
+// into a fresh []str (the "pack" tests below) or passes an existing []str straight through
+// (the "passthrough" test) — both paths exercised here.
 #test
 fn string_concat_two() {
     let s = teko::string::concat("hello", " world")
@@ -52,44 +56,44 @@ fn string_concat_empty_operands() {
     teko::assert::is_true(teko::string::concat("", "abc").len == 3)
 }
 
-// concat3 — the multi-arg (3-piece) answer. Teko has no variadic parameters (a fixed
-// `<T>`-generic or fixed-arity param list is the only function-declaration shape — see
-// TEKO_LEGISLATION.md's function grammar), so a fixed 3-ary overload is the ergonomic
-// form for a small, known number of pieces (see concat_all below for an ARBITRARY count).
+// pack path — zero args (no pieces at all) folds to an empty str.
 #test
-fn string_concat3_three() {
-    let s = teko::string::concat3("foo", "-", "bar")
-    teko::assert::is_true(teko::str::contains(s, "foo-bar"))
-    teko::assert::is_true(s.len == 7)
+fn string_concat_zero_args() {
+    teko::assert::is_true(teko::string::concat().len == 0)
 }
 
-// concat_all([]str) -> str — the loop-friendly many-piece answer: folds teko::string::concat
-// over a slice. NOT a new builtin (no checker/codegen/VM changes) — expressible entirely in
-// terms of the concat primitive, so it lives as an ordinary user-space fold, matching the
-// "no variadic params" constraint honestly (M.3) instead of inventing new call-syntax.
-fn concat_all(pieces: []str) -> str {
-    mut acc = ""
-    mut i: u64 = 0
-    loop {
-        if i >= pieces.len { break }
-        acc = teko::string::concat(acc, pieces[i])
-        i++
-    }
-    acc
+// pack path — a single bare str arg (not a []str) still packs into a one-element slice,
+// distinct from the passthrough case below (which requires the arg to ALREADY be []str).
+#test
+fn string_concat_one_arg() {
+    let s = teko::string::concat("solo")
+    teko::assert::is_true(s.len == 4)
+    teko::assert::is_true(teko::str::contains(s, "solo"))
 }
 
+// pack path — five individual str args collapse into ONE synthetic []str at the call site.
 #test
-fn string_concat_all_many_pieces() {
-    let parts: []str = teko::list::push(teko::list::push(teko::list::push(teko::list::push(teko::list::push(teko::list::empty(), "a"), "b"), "c"), "d"), "e")
-    let s = concat_all(parts)
+fn string_concat_many_pieces() {
+    let s = teko::string::concat("a", "b", "c", "d", "e")
     teko::assert::is_true(s.len == 5)
     teko::assert::is_true(teko::str::contains(s, "abcde"))
 }
 
+// passthrough path — the call site's SOLE arg is already typed []str (matching the params
+// element type exactly), so the checker passes it through unchanged (no re-wrapping).
 #test
-fn string_concat_all_empty_slice() {
+fn string_concat_passthrough_existing_slice() {
+    let parts: []str = teko::list::push(teko::list::push(teko::list::push(teko::list::push(teko::list::push(teko::list::empty(), "a"), "b"), "c"), "d"), "e")
+    let s = teko::string::concat(parts)
+    teko::assert::is_true(s.len == 5)
+    teko::assert::is_true(teko::str::contains(s, "abcde"))
+}
+
+// passthrough path — an EMPTY existing []str also passes through cleanly.
+#test
+fn string_concat_passthrough_empty_slice() {
     let none: []str = teko::list::empty()
-    teko::assert::is_true(concat_all(none).len == 0)
+    teko::assert::is_true(teko::string::concat(none).len == 0)
 }
 
 // Direct calls to teko::runtime functions that are coverable through find_function.
