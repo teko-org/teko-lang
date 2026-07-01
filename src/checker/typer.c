@@ -12,6 +12,7 @@
 #include "check_modules.h"   // tk_check_modules (W-vis-enforce — module-system pass)
 #include "initanalysis.h"    // tk_analyze_program (Phase 5 — init analysis)
 #include "monomorph.h"       // tk_monomorphize (S4b — generic instantiation, runs last)
+#include "../parser/parse_stmt.h"   // no_expr (OOP A1 receiver param placeholder, 2026-07-01)
 #include <string.h>          // memcmp (loop-label comparison)
 
 // short aliases for local use (terse, matches the original site spellings).
@@ -448,6 +449,104 @@ tk_tfunction_result tk_type_function(tk_function f, tk_env env, tk_type_table ta
     return (tk_tfunction_result){ .ok = true, .as.value = tf };
 }
 
+static tk_error surface_at(tk_str file, uint32_t line, uint32_t col, tk_error inner);   // forward (defined below)
+
+// (OOP A1, 2026-07-01) type-check a struct METHOD's BODY. Mirrors tk_type_function, except the
+// RECEIVER param (has_type=false, only ever index 0) binds to Named{struct_name} instead of
+// going through tk_resolve_type (its type is implicit, never written by the user).
+static tk_tfunction_result type_method(tk_function f, tk_str struct_name, tk_env env, tk_type_table table) {
+    tk_env local = env;
+    tk_type_table tbl = tk_type_param_table(f.type_params, f.n_type_params, (tk_str){0}, table);
+    bool is_teko_rt = f.is_extern && str_eq(f.from_lib, "teko_rt");
+    // codegen reads tk_tfunction.params[i].type_ann DIRECTLY (the syntactic node, not the checked
+    // tk_type) to emit a C signature — so the receiver's placeholder type_ann (no_type(), from
+    // parsing) must be REWRITTEN to a real Named(struct_name) tk_type_expr before it ever reaches
+    // codegen, or emit_function_sig recurses on an empty path (M.1 crash). Every other param's
+    // type_ann is already meaningful from parsing and passes through unchanged.
+    tk_param *fixed_params = f.nparams ? tk_alloc(f.nparams * sizeof *fixed_params) : NULL;
+    for (size_t i = 0; i < f.nparams; i += 1) {
+        tk_type pt;
+        if (!f.params[i].has_type) {
+            pt = (tk_type){ .tag = TK_TYPE_NAMED, .as.named = { struct_name } };
+        } else {
+            tk_type_result ptr = tk_resolve_type(f.params[i].type_ann, tbl);
+            if (!ptr.ok) return (tk_tfunction_result){ .ok = false, .as.error = ptr.as.error };
+            pt = ptr.as.value;
+        }
+        fixed_params[i] = f.params[i].has_type ? f.params[i]
+            : (tk_param){ .name = f.params[i].name, .has_type = true, .type_ann = tk_type_to_texpr(pt), .is_params = false, .has_default = false, .default_expr = no_expr() };
+        if (f.is_extern && !is_teko_rt && !extern_type_ok(pt, table)) {
+            return (tk_tfunction_result){ .ok = false, .as.error = tk_error_make("an `extern` function parameter must be a primitive (int/float/bool), `byte`, `ptr`, `uptr`, or an `extern type` handle (C7.1a)") };
+        }
+        if (f.is_extern && is_teko_rt && !teko_rt_type_ok(pt)) {
+            return (tk_tfunction_result){ .ok = false, .as.error = tk_error_make("a `teko_rt` extern function parameter must be a primitive, `str`, slice, variant, or optional (C7.2)") };
+        }
+        local = tk_env_define(local, f.params[i].name, pt, false);
+    }
+    tk_type ret = function_return(f, tbl);
+    if (ret.tag == TK_TYPE_REF)
+        return (tk_tfunction_result){ .ok = false, .as.error = tk_error_make("a function cannot return a reference (pass-down only)") };
+    if (f.is_extern) {
+        bool ret_ok = is_teko_rt ? teko_rt_type_ok(ret) || ret.tag == TK_TYPE_VOID
+                                 : (ret.tag == TK_TYPE_VOID) || extern_type_ok(ret, table);
+        if (!ret_ok) {
+            return (tk_tfunction_result){ .ok = false, .as.error = tk_error_make("an `extern` function return must be a primitive (int/float/bool), `byte`, `ptr`, `uptr`, an `extern type` handle, or absent (C7.1a)") };
+        }
+        tk_tfunction ef = { .name = f.name, .type_params = f.type_params, .n_type_params = f.n_type_params, .type_constraints = f.type_constraints, .params = fixed_params, .nparams = f.nparams,
+                            .return_type = ret, .body = NULL, .nbody = 0,
+                            .vis = f.vis, .has_doc = f.has_doc, .doc = f.doc, .is_test = f.is_test,
+                            .is_extern = true, .c_symbol = f.c_symbol, .from_lib = f.from_lib };
+        return (tk_tfunction_result){ .ok = true, .as.value = ef };
+    }
+    tk_typed_block_result tb = tk_type_block(f.body, f.nbody, local, tbl);
+    if (!tb.ok) return (tk_tfunction_result){ .ok = false, .as.error = tb.as.error };
+    { tk_error e = check_returns(tb.as.value.stmts, tb.as.value.n, ret, table);
+      if (!ret_is_ok(e)) return (tk_tfunction_result){ .ok = false, .as.error = e }; }
+    { tk_error e = check_trailing_value(tb.as.value.stmts, tb.as.value.n, ret, table);
+      if (!ret_is_ok(e)) return (tk_tfunction_result){ .ok = false, .as.error = e }; }
+    { tk_str seen[TK_MAX_LABELS]; size_t nseen = 0;
+      const char *why = check_labels(tb.as.value.stmts, tb.as.value.n, NULL, false, seen, &nseen);
+      if (why) return (tk_tfunction_result){ .ok = false, .as.error = tk_error_make(why) }; }
+    tk_tfunction tf = { .name = f.name, .type_params = f.type_params, .n_type_params = f.n_type_params, .type_constraints = f.type_constraints, .params = fixed_params, .nparams = f.nparams,
+                        .return_type = ret, .body = tb.as.value.stmts, .nbody = tb.as.value.n,
+                        .vis = f.vis, .has_doc = f.has_doc, .doc = f.doc, .is_test = f.is_test };
+    return (tk_tfunction_result){ .ok = true, .as.value = tf };
+}
+
+// a ++ b — a fresh owned tk_str (local to keep the DAG tight; mirrors collect.c::collect_str_concat).
+static tk_str type_str_concat(tk_str a, tk_str b) {
+    size_t len = a.len + b.len;
+    tk_byte *buf = tk_alloc(len ? len : 1); if (!buf) abort();
+    if (a.len) memcpy(buf, a.ptr, a.len);
+    if (b.len) memcpy(buf + a.len, b.ptr, b.len);
+    return (tk_str){ .ptr = buf, .len = len };
+}
+
+// (OOP A1) type-check EVERY method body on a struct TypeDecl and stamp each into a full
+// tk_titem (namespace = "<owning-ns>::<StructName>", mirroring collect.c's registration
+// exactly, so codegen/VM mangle+resolve method calls to these SAME items). A struct with
+// methods contributes MULTIPLE tk_titems, not one — pushed onto `items` by the caller.
+static bool type_struct_methods(tk_type_decl td, tk_str item_ns, tk_str file, tk_env env, tk_type_table table, tk_titem_list *items, tk_error *out_err) {
+    if (td.body.tag != TK_BODY_STRUCT) return true;
+    tk_struct_body sb = td.body.as.struct_body;
+    tk_str sep = { .ptr = (const tk_byte *)"::", .len = 2 };
+    tk_str method_ns = item_ns.len == 0 ? td.name : type_str_concat(type_str_concat(item_ns, sep), td.name);
+    for (size_t mi = 0; mi < sb.n_methods; mi += 1) {
+        tk_tfunction_result mf = type_method(sb.methods[mi], td.name, env, table);
+        if (!mf.ok) {
+            uint32_t el = mf.as.error.line ? mf.as.error.line : sb.methods[mi].line;
+            uint32_t ec = mf.as.error.line ? mf.as.error.col  : sb.methods[mi].col;
+            *out_err = surface_at(file, el, ec, mf.as.error);
+            return false;
+        }
+        tk_tfunction stamped = mf.as.value;
+        stamped.namespace = method_ns; stamped.file = file;
+        stamped.line = sb.methods[mi].line; stamped.col = sb.methods[mi].col;
+        *items = tk_titem_list_push(*items, (tk_titem){ .tag = TK_TITEM_FUNCTION, .as.function = stamped });
+    }
+    return true;
+}
+
 tk_titem_result tk_type_item(tk_item item, tk_env env, tk_type_table table) {
     switch (item.tag) {
         case TK_ITEM_FUNCTION: {
@@ -524,6 +623,11 @@ tk_tprogram_result tk_type_program_with_deps(tk_program program, tk_tprogram dep
         tk_titem_result ti = tk_type_item(it, ienv, types);
         if (!ti.ok) return (tk_tprogram_result){ .ok = false, .as.error = surface_at(it.file, line, col, ti.as.error) };
         items = tk_titem_list_push(items, ti.as.value);
+        if (it.tag == TK_ITEM_TYPE_DECL) {   // (OOP A1) a struct TypeDecl also contributes its METHOD bodies as extra items
+            tk_error mserr = {0};
+            if (!type_struct_methods(it.as.type_decl, it.namespace, it.file, ienv, types, &items, &mserr))
+                return (tk_tprogram_result){ .ok = false, .as.error = mserr };
+        }
     }
     { tk_str seen[TK_MAX_LABELS]; size_t nseen = 0;
       const char *why = check_labels(mainbody.ptr, mainbody.len, NULL, false, seen, &nseen);
@@ -591,6 +695,11 @@ tk_tprogram_result tk_type_program(tk_program program) {
             return (tk_tprogram_result){ .ok = false, .as.error = surface_at(it.file, el, ec, ti.as.error) };
         }
         items = tk_titem_list_push(items, ti.as.value);
+        if (it.tag == TK_ITEM_TYPE_DECL) {   // (OOP A1) a struct TypeDecl also contributes its METHOD bodies as extra items
+            tk_error mserr = {0};
+            if (!type_struct_methods(it.as.type_decl, it.namespace, it.file, ienv, types, &items, &mserr))
+                return (tk_tprogram_result){ .ok = false, .as.error = mserr };
+        }
     }
     { tk_str seen[TK_MAX_LABELS]; size_t nseen = 0;   // W5-cf-2: validate labels in the virtual-main
       const char *why = check_labels(mainbody.ptr, mainbody.len, NULL, false, seen, &nseen);

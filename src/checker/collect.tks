@@ -53,7 +53,47 @@ fn func_type(f: parser::Function, table: TypeTable) -> Type | error {
     Func { params = params; ret = ret; variadic = is_variadic; param_names = param_names; n_required = n_required; defaults = defaults }
 }
 
-// register every top-level function's signature (now that all type names exist).
+// (OOP A1, 2026-07-01) a struct METHOD's signature as a FuncType. Mirrors func_type, except the
+// RECEIVER param (has_type=false, only ever index 0) resolves to Named{struct_name} — its type
+// is IMPLICIT (the enclosing struct), never written by the user, so it can't go through
+// resolve_type like an ordinary annotated param.
+fn method_func_type(f: parser::Function, struct_name: str, table: TypeTable) -> Type | error {
+    let tbl = type_param_table(f.type_params, "", table)
+    mut params: []Type = teko::list::empty()
+    mut param_names: []str = teko::list::empty()
+    mut defaults: []parser::Expr = teko::list::empty()
+    mut n_required: u64 = f.params.len
+    mut i = 0
+    loop {
+        if i >= f.params.len { break }
+        let pt = if !f.params[i].has_type {
+            Named { name = struct_name }
+        } else {
+            match resolve_type(f.params[i].type_ann, tbl) { Type as t => t; error as e => return e }
+        }
+        params = teko::list::push(params, pt)
+        param_names = teko::list::push(param_names, f.params[i].name)
+        if f.params[i].has_default {
+            if n_required == f.params.len { n_required = i to u64 }
+            defaults = teko::list::push(defaults, f.params[i].default_expr)
+        }
+        i++
+    }
+    let ret = if f.has_return {
+        match resolve_type(f.return_type, tbl) { Type as t => t; error as e => return e }
+    } else {
+        Void { }
+    }
+    let is_variadic = f.params.len > 0 && f.params[f.params.len - 1].is_params
+    Func { params = params; ret = ret; variadic = is_variadic; param_names = param_names; n_required = n_required; defaults = defaults }
+}
+
+// register every top-level function's signature (now that all type names exist). (OOP A1) also
+// registers each struct's methods, under a namespace key of "<owning-ns>::<StructName>" (bare
+// StructName at the top level) — `lookup_call`'s qualifier match compares only the LAST segment,
+// so `StructName::method(…)` resolves through the SAME #41 machinery as any other qualified call,
+// with zero new resolution code. Instance dot-calls (`recv.method(…)`) desugar into exactly this
+// same qualified-call shape (see typer.tks::type_method_call) before ever reaching lookup_call.
 fn collect_funcs(items: []parser::Item, table: TypeTable) -> Env | error {
     mut env = env_empty()
     mut i = 0
@@ -66,6 +106,24 @@ fn collect_funcs(items: []parser::Item, table: TypeTable) -> Env | error {
                     error as e => return e
                 }
                 env = define_fn(env, f.name, ft, items[i].namespace)   // #41: carry the fn's ns
+            }
+            parser::TypeDecl as td => {
+                match td.body {
+                    parser::StructBody as sb => {
+                        let method_ns = if items[i].namespace == "" { td.name } else { items[i].namespace ~ "::" ~ td.name }
+                        mut mi = 0
+                        loop {
+                            if mi >= sb.methods.len { break }
+                            let mft = match method_func_type(sb.methods[mi], td.name, table) {
+                                Type as t  => t
+                                error as e => return e
+                            }
+                            env = define_fn(env, sb.methods[mi].name, mft, method_ns)
+                            mi++
+                        }
+                    }
+                    _ => {}
+                }
             }
             _ => {}
         }
@@ -173,6 +231,24 @@ fn collect_with_seed(program: parser::Program, seed: Collected) -> Collected | e
                     error as e => return e
                 }
                 env = define_fn(env, f.name, ft, program.items[j].namespace)
+            }
+            parser::TypeDecl as td => {
+                match td.body {   // (OOP A1) mirror collect_funcs' struct-method registration
+                    parser::StructBody as sb => {
+                        let method_ns = if program.items[j].namespace == "" { td.name } else { program.items[j].namespace ~ "::" ~ td.name }
+                        mut mi = 0
+                        loop {
+                            if mi >= sb.methods.len { break }
+                            let mft = match method_func_type(sb.methods[mi], td.name, table) {
+                                Type as t  => t
+                                error as e => return e
+                            }
+                            env = define_fn(env, sb.methods[mi].name, mft, method_ns)
+                            mi++
+                        }
+                    }
+                    _ => {}
+                }
             }
             _ => {}
         }

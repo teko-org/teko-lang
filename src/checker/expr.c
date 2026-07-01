@@ -382,6 +382,41 @@ static tk_pack_result resolve_defargs(tk_type ft, tk_expr *args, tk_str *arg_nam
     return (tk_pack_result){ .ok = true, .args = resolved, .nargs = ft.as.func.nparams };
 }
 
+// (OOP A1, 2026-07-01) `recv.method(args)` — an INSTANCE struct-method dot-call (type_method_call
+// twin). Desugars into an ordinary `StructName::method(recv, ...args)` tk_call and delegates to
+// type_call wholesale (reuses arity/defargs/generics/namespace-mangling for free). The receiver
+// is typed ONCE here just to discover which struct/method is targeted; type_call re-types it (and
+// every arg) as part of its normal argument pass. Flags-typed receivers keep the PRE-EXISTING
+// "deferred" error for anything type_flags_method doesn't itself already handle (unchanged).
+static tk_texpr_result type_method_call(tk_method_call mc, tk_env env, tk_type_table table) {
+    tk_texpr_result recv_r = tk_typer_expr(*mc.receiver, env, table);
+    if (!recv_r.ok) return recv_r;
+    tk_type recv_t = recv_r.as.value.type;
+    if (recv_t.tag != TK_TYPE_NAMED) return xerr("method typing is deferred (B.29 / M.4)");
+    tk_str struct_name = recv_t.as.named.name;
+    tk_decl_result td = tk_type_table_find(table, struct_name);
+    if (!td.ok) return xerr("method typing is deferred (B.29 / M.4)");
+    if (td.as.value.body.tag != TK_BODY_STRUCT) return xerr("method typing is deferred (B.29 / M.4)");
+    tk_struct_body sb = td.as.value.body.as.struct_body;
+    bool found = false; tk_function mfn = {0};
+    for (size_t i = 0; i < sb.n_methods; i += 1) {
+        if (tk_str_eq(sb.methods[i].name, mc.method)) { found = true; mfn = sb.methods[i]; break; }
+    }
+    if (!found) return xferr(tk_error_named("no such method on struct", mc.method));
+    bool is_instance = mfn.nparams > 0 && !mfn.params[0].has_type;
+    if (!is_instance) return xferr(tk_error_named("static method — call it as StructName::method(…), not recv.method(…)", mc.method));
+    tk_segment *segs = tk_alloc(2 * sizeof *segs); if (!segs) abort();
+    segs[0] = (tk_segment){ .name = struct_name };
+    segs[1] = (tk_segment){ .name = mc.method };
+    tk_expr *cargs = tk_alloc((mc.nargs + 1) * sizeof *cargs); if (!cargs) abort();
+    cargs[0] = *mc.receiver;
+    for (size_t i = 0; i < mc.nargs; i += 1) cargs[i + 1] = mc.args[i];
+    tk_str *cnames = tk_alloc((mc.nargs + 1) * sizeof *cnames); if (!cnames) abort();
+    for (size_t i = 0; i <= mc.nargs; i += 1) cnames[i] = (tk_str){0};   // an instance dot-call is always all-positional
+    tk_call synthetic = { .callee = { .segments = segs, .len = 2 }, .args = cargs, .nargs = mc.nargs + 1, .arg_names = cnames };
+    return type_call(synthetic, env, table);
+}
+
 static tk_texpr_result type_call(tk_call c, tk_env env, tk_type_table table) {
     tk_texpr_result lb;
     if (type_list_builtin(c, env, table, &lb)) return lb;   // teko::list::empty / push (generic)
@@ -1431,14 +1466,15 @@ static tk_texpr_result type_dispatch(tk_expr e, tk_env env, tk_type_table table)
         case TK_EXPR_COALESCE:     return type_coalesce(e.as.coalesce, env, table);
         case TK_EXPR_CAST:         return type_cast(e.as.cast, env, table);
         case TK_EXPR_METHOD_CALL:  {
-            // (C8.3) flags helper methods are typed here; all other method calls remain deferred.
+            // (C8.3) flags helper methods are typed here; (OOP A1, 2026-07-01) struct instance
+            // methods dispatch to type_method_call; anything else remains deferred.
             tk_method_call mc = e.as.method_call;
             if (mc.receiver) {
                 tk_texpr_result recv_probe = tk_typer_expr(*mc.receiver, env, table);
                 if (recv_probe.ok && is_flags_named(recv_probe.as.value.type, table))
                     return type_flags_method(mc, env, table);
             }
-            return xerr("method typing is deferred (B.29 / M.4)");
+            return type_method_call(mc, env, table);
         }
         case TK_EXPR_PATH:         return type_path_expr(e.as.path, table);   // Enum::Member as a value
         case TK_EXPR_STRUCT_LIT:   return tk_type_struct_lit(e.as.struct_lit, (tk_type){ .tag = TK_TYPE_VOID }, env, table);   // W4a (no expected in expr position)

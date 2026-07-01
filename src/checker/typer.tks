@@ -480,6 +480,44 @@ fn resolve_defargs(f: Func, args: []parser::Expr, arg_names: []str) -> []parser:
     resolved
 }
 
+// (OOP A1, 2026-07-01) `recv.method(args)` — an INSTANCE struct-method dot-call. Desugars into
+// an ordinary `StructName::method(recv, ...args)` Call and delegates to `type_call` wholesale
+// (reuses arity/defargs/generics/namespace-mangling for free — the same trick `~` used for
+// `teko::string::concat`). The receiver is typed ONCE here just to discover which struct/method
+// is targeted; `type_call` re-types it (and every arg) as part of its normal argument pass.
+// Flags-typed receivers keep the PRE-EXISTING (untouched) "deferred" error — flags-method
+// dispatch is a separate, already-known .tks/C divergence, out of scope here (see is_flags_named).
+fn type_method_call(mc: parser::MethodCall, env: Env, table: TypeTable) -> TExpr | error {
+    let recv_t = match type_expr(mc.receiver, env, table) { TExpr as te => te.type; error as e => return e }
+    if is_flags_named(recv_t, table) { return error { message = "method typing is deferred (B.29 / M.4)" } }
+    let struct_name = match recv_t { Named as n => n.name; _ => return error { message = "method typing is deferred (B.29 / M.4)" } }
+    let decl = match type_table_find(table, struct_name) { parser::TypeDecl as td => td; error => return error { message = "method typing is deferred (B.29 / M.4)" } }
+    let sb = match decl.body { parser::StructBody as sb => sb; _ => return error { message = "method typing is deferred (B.29 / M.4)" } }
+    if sb.methods.len == 0 { return error { message = $"no such method '{mc.method}' on struct '{struct_name}'" } }
+    mut mi: u64 = 0
+    mut found = false
+    mut mfn = sb.methods[0]   // placeholder; overwritten below iff `found` (Teko has no uninitialized values)
+    loop {
+        if mi >= sb.methods.len { break }
+        if sb.methods[mi].name == mc.method { found = true; mfn = sb.methods[mi]; break }
+        mi++
+    }
+    if !found { return error { message = $"no such method '{mc.method}' on struct '{struct_name}'" } }
+    let is_instance = mfn.params.len > 0 && !mfn.params[0].has_type
+    if !is_instance { return error { message = $"'{mc.method}' is a static method — call it as {struct_name}::{mc.method}(…)" } }
+    let seg_struct = parser::Segment { name = struct_name }
+    let seg_method = parser::Segment { name = mc.method }
+    mut segs: []parser::Segment = teko::list::push(teko::list::empty(), seg_struct)
+    segs = teko::list::push(segs, seg_method)
+    mut cargs: []parser::Expr = teko::list::push(teko::list::empty(), mc.receiver)
+    mut ai: u64 = 0
+    loop { if ai >= mc.args.len { break }; cargs = teko::list::push(cargs, mc.args[ai]); ai++ }
+    mut cnames: []str = teko::list::empty()   // an instance dot-call is always all-positional (named-call not yet threaded through MethodCall — see parse_expr.tks)
+    mut ni: u64 = 0
+    loop { if ni >= cargs.len { break }; cnames = teko::list::push(cnames, ""); ni++ }
+    type_call(parser::Call { callee = parser::Path { segments = segs }; args = cargs; arg_names = cnames }, env, table)
+}
+
 fn type_call(c: parser::Call, env: Env, table: TypeTable) -> TExpr | error {
     match type_list_builtin(c, env, table) {   // teko::list::empty / push (generic)
         TExpr as te    => return te
@@ -1290,7 +1328,7 @@ fn type_dispatch(e: parser::Expr, env: Env, table: TypeTable) -> TExpr | error {
         parser::SafeFieldAccess as sfa => type_safe_field_access(sfa, env, table)
         parser::Coalesce as co => type_coalesce(co, env, table)
         parser::Cast as c      => type_cast(c, env, table)
-        parser::MethodCall     => error { message = "method typing is deferred (B.29 / M.4)" }
+        parser::MethodCall as mc => type_method_call(mc, env, table)   // OOP A1 (2026-07-01)
         parser::PathExpr as pe => type_path_expr(pe, table)   // Enum::Member as a value
         parser::StructLit as sl => type_struct_lit(sl, Void { }, env, table)   // W4a (no expected type in expr position)
         parser::Index as ix    => type_index(ix, env, table)        // W5-idx
@@ -1994,6 +2032,68 @@ fn teko_rt_type_ok(t: Type) -> bool {
     }
 }
 
+// (OOP A1, 2026-07-01) type-check a struct METHOD's BODY. Mirrors type_function, except the
+// RECEIVER param (has_type=false, only ever index 0) binds to Named{struct_name} instead of
+// going through resolve_type (its type is implicit, never written by the user).
+fn type_method(f: parser::Function, struct_name: str, env: Env, table: TypeTable) -> TFunction | error {
+    mut local = env
+    let tbl = type_param_table(f.type_params, "", table)
+    let is_teko_rt = f.is_extern && f.from_lib == "teko_rt"
+    // codegen reads TFunction.params[i].type_ann DIRECTLY (the syntactic node, not the checked
+    // Type) to emit a C signature — so the receiver's placeholder type_ann (no_type(), from
+    // parsing) must be REWRITTEN to a real Named(struct_name) TypeExpr before it ever reaches
+    // codegen, or emit_function_sig recurses on an empty path (M.1 crash). Every other param's
+    // type_ann is already meaningful from parsing and passes through unchanged.
+    mut fixed_params: []parser::Param = teko::list::empty()
+    mut i = 0
+    loop {
+        if i >= f.params.len { break }
+        let pt = if !f.params[i].has_type {
+            Named { name = struct_name }
+        } else {
+            match resolve_type(f.params[i].type_ann, tbl) { Type as t => t; error as e => return e }
+        }
+        fixed_params = teko::list::push(fixed_params, if !f.params[i].has_type {
+            parser::Param { name = f.params[i].name; has_type = true; type_ann = type_to_texpr(pt); is_params = false; has_default = false; default_expr = parser::no_expr() }
+        } else {
+            f.params[i]
+        })
+        if f.is_extern {
+            if is_teko_rt {
+                if !teko_rt_type_ok(pt) {
+                    return error { message = "a `teko_rt` extern function parameter must be a primitive, `str`, slice, variant, or optional (C7.2)" }
+                }
+            } else {
+                if !extern_type_ok(pt, table) {
+                    return error { message = "an `extern` function parameter must be a primitive (int/float/bool), `byte`, `ptr`, `uptr`, or an `extern type` handle (C7.1a)" }
+                }
+            }
+        }
+        local = define(local, f.params[i].name, pt, false)
+        i++
+    }
+    let ret = match function_return(f, tbl) { Type as t => t; error as e => return e }
+    match ret { Reference => return error { message = "a function cannot return a reference (pass-down only)" }; _ => {} }
+    if f.is_extern {
+        let ret_ok = if is_teko_rt {
+            teko_rt_type_ok(ret)
+        } else {
+            match ret { Void => true; _ => extern_type_ok(ret, table) }
+        }
+        if !ret_ok {
+            return error { message = "an `extern` function return must be a primitive (int/float/bool), `byte`, `ptr`, `uptr`, an `extern type` handle, or absent (C7.1a)" }
+        }
+        let no_body: []TStatement = teko::list::empty()
+        return TFunction { name = f.name; type_params = f.type_params; type_constraints = f.type_constraints; params = fixed_params; return_type = ret; body = no_body; vis = f.vis; has_doc = f.has_doc; doc = f.doc; namespace = ""; file = ""; line = 0; col = 0; is_test = f.is_test; is_extern = true; c_symbol = f.c_symbol; from_lib = f.from_lib }
+    }
+    let tb = match type_block(f.body, local, tbl) { TypedBlock as bk => bk; error as e => return e }
+    match check_returns(tb.stmts, ret, table)        { null => {}; error as e => return e }
+    match check_trailing_value(tb.stmts, ret, table) { null => {}; error as e => return e }
+    let lc = check_labels(tb.stmts, teko::list::empty(), false, teko::list::empty())
+    if lc.failed { return error { message = lc.message } }
+    TFunction { name = f.name; type_params = f.type_params; type_constraints = f.type_constraints; params = fixed_params; return_type = ret; body = tb.stmts; vis = f.vis; has_doc = f.has_doc; doc = f.doc; namespace = ""; file = ""; line = 0; col = 0; is_test = f.is_test; is_extern = false; c_symbol = ""; from_lib = "" }
+}
+
 fn type_function(f: parser::Function, env: Env, table: TypeTable) -> TFunction | error {
     mut local = env
     let tbl = type_param_table(f.type_params, "", table)   // (S4) the fn's generic type-params, opaque, in scope
@@ -2040,6 +2140,33 @@ fn type_function(f: parser::Function, env: Env, table: TypeTable) -> TFunction |
     let lc = check_labels(tb.stmts, teko::list::empty(), false, teko::list::empty())  // W5-cf-2: loop labels resolve + are unique
     if lc.failed { return error { message = lc.message } }
     TFunction { name = f.name; type_params = f.type_params; type_constraints = f.type_constraints; params = f.params; return_type = ret; body = tb.stmts; vis = f.vis; has_doc = f.has_doc; doc = f.doc; namespace = ""; file = ""; line = 0; col = 0; is_test = f.is_test; is_extern = false; c_symbol = ""; from_lib = "" }   // (#49/E3) namespace/file/line stamped by type_item from the parsed item
+}
+
+// (OOP A1, 2026-07-01) type-check EVERY method body on a struct TypeDecl and stamp each into a
+// full TFunction item (namespace = "<owning-ns>::<StructName>", mirroring collect_funcs'
+// registration exactly, so codegen/VM mangle+resolve method calls to these SAME items). Called
+// from both type_program and type_program_with_deps' main loops, alongside the ordinary
+// TypeDecl pass-through — a struct with methods contributes MULTIPLE TItems, not one.
+fn type_struct_methods(td: parser::TypeDecl, item_ns: str, file: str, env: Env, table: TypeTable) -> []TItem | error {
+    mut out: []TItem = teko::list::empty()
+    match td.body {
+        parser::StructBody as sb => {
+            let method_ns = if item_ns == "" { td.name } else { item_ns ~ "::" ~ td.name }
+            mut mi = 0
+            loop {
+                if mi >= sb.methods.len { break }
+                let mf = match type_method(sb.methods[mi], td.name, env, table) {
+                    TFunction as x => x
+                    error as e => return surface_at(file, sb.methods[mi].line, sb.methods[mi].col, e)
+                }
+                let stamped = TFunction { name = mf.name; type_params = mf.type_params; type_constraints = mf.type_constraints; params = mf.params; return_type = mf.return_type; body = mf.body; vis = mf.vis; has_doc = mf.has_doc; doc = mf.doc; namespace = method_ns; file = file; line = sb.methods[mi].line; col = sb.methods[mi].col; is_test = mf.is_test; is_extern = mf.is_extern; c_symbol = mf.c_symbol; from_lib = mf.from_lib }
+                out = teko::list::push(out, stamped)
+                mi++
+            }
+        }
+        _ => {}
+    }
+    out
 }
 
 fn type_item(item: parser::Item, env: Env, table: TypeTable) -> TItem | error {
@@ -2122,6 +2249,15 @@ pub fn type_program_with_deps(program: parser::Program, dep_prog: TProgram) -> T
                     error as e => return surface_at(it.file, line, col, e)
                 }
                 items = teko::list::push(items, ti)
+                // (OOP A1) a struct TypeDecl also contributes its METHOD bodies as extra items.
+                match it.content {
+                    parser::TypeDecl as td => {
+                        let mitems = match type_struct_methods(td, it.namespace, it.file, ienv, types) { []TItem as x => x; error as e => return e }
+                        mut mi2 = 0
+                        loop { if mi2 >= mitems.len { break }; items = teko::list::push(items, mitems[mi2]); mi2++ }
+                    }
+                    _ => {}
+                }
             }
         }
         i++
@@ -2199,6 +2335,15 @@ pub fn type_program(program: parser::Program) -> TProgram | error {
                     error as e => return surface_at(it.file, line, col, e)
                 }
                 items = teko::list::push(items, ti)
+                // (OOP A1) a struct TypeDecl also contributes its METHOD bodies as extra items.
+                match it.content {
+                    parser::TypeDecl as td => {
+                        let mitems = match type_struct_methods(td, it.namespace, it.file, ienv, types) { []TItem as x => x; error as e => return e }
+                        mut mi2 = 0
+                        loop { if mi2 >= mitems.len { break }; items = teko::list::push(items, mitems[mi2]); mi2++ }
+                    }
+                    _ => {}
+                }
             }
         }
         i++
