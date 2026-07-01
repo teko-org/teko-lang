@@ -166,6 +166,13 @@ typedef enum {
     // never a stored operator, so its ordinal is never serialized to `.tkb`). Its `.text` is the
     // codepoint's raw UTF-8 bytes (1–4), already validated by the lexer.
     TK_TOKEN_CHAR,          // `c'x'` — one UTF-8 codepoint (1–4 bytes)
+    // W10b.CLASS (2026-07-01) — the class construct. Appended LAST (ordinal stability). `self`/
+    // `base` deliberately NOT reserved — see token.tks's matching note.
+    TK_TOKEN_CLASS,         // `class` — the class construct (sealed/final by default)
+    TK_TOKEN_ABSTRACT,      // `abstract class` — inheritable, NOT instantiable
+    TK_TOKEN_VIRTUAL,       // `virtual class` / `virtual fn` — instantiable+inheritable class / an overridable method
+    TK_TOKEN_OVERRIDE,      // `override fn` — overrides a base virtual/abstract method
+    TK_TOKEN_INTERN,        // `intern` — visibility: visible to inheritors
 } tk_token_kind;
 // `params` — variadic-parameter modifier (2026-07-01 ruling) is NOT a reserved token: like `from`
 // (FFI `extern` position), it stays a normal TK_TOKEN_IDENT and is matched CONTEXTUALLY by the

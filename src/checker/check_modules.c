@@ -165,6 +165,10 @@ const char *tk_check_modules(tk_program prog, tk_type_table table) {
                 e = check_texpr(d.body.as.variant_body.type_expr, ns, table, al);
             } else if (d.body.tag == TK_BODY_ALIAS) {
                 e = check_texpr(d.body.as.alias_body.alias, ns, table, al);   // an alias's RHS type-expr
+            } else if (d.body.tag == TK_BODY_CLASS) {
+                // (W10b.CLASS) mirrors struct's field-only scope (methods unchecked here, same as struct methods today)
+                for (size_t k = 0; k < d.body.as.class_body.n_fields && !e; k += 1)
+                    e = check_texpr(d.body.as.class_body.fields[k].type_ann, ns, table, al);
             }
             // enum body: member names only; extern body (C7.1a): opaque handle — neither has type references to check
         }

@@ -267,7 +267,13 @@ static tk_token_kind keyword_kind(tk_str text) {
     if (tk_str_eq_lit(text, "true"))     return TK_TOKEN_TRUE;   // bool literal (LEGISLATION §75)
     if (tk_str_eq_lit(text, "false"))    return TK_TOKEN_FALSE;  // bool literal (LEGISLATION §75)
     if (tk_str_eq_lit(text, "null"))     return TK_TOKEN_NULL;   // null literal (REBOOT_PLAN §202)
+    if (tk_str_eq_lit(text, "class"))    return TK_TOKEN_CLASS;      // W10b.CLASS (2026-07-01)
+    if (tk_str_eq_lit(text, "abstract")) return TK_TOKEN_ABSTRACT;
+    if (tk_str_eq_lit(text, "virtual"))  return TK_TOKEN_VIRTUAL;
+    if (tk_str_eq_lit(text, "override")) return TK_TOKEN_OVERRIDE;
+    if (tk_str_eq_lit(text, "intern"))   return TK_TOKEN_INTERN;
     // `params` is deliberately NOT here — it's a contextual keyword like `from` (see token.h).
+    // `self`/`base` are likewise deliberately NOT here — see token.h's W10b.CLASS note.
     return TK_TOKEN_IDENT;
 }
 

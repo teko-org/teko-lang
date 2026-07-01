@@ -354,6 +354,18 @@ static tk_type_body read_typebody(tk_reader *r, tk_strs t) {
             tb.as.flags_body.values = values;
             return tb;
         }
+        case 6: {   // (W10b.CLASS) fields only — methods not yet serialized (same gap as struct methods)
+            tb.tag = TK_BODY_CLASS;
+            tb.as.class_body.kind = TK_CLASS_SEALED;
+            tb.as.class_body.has_base = false;
+            tb.as.class_body.base_name = (tk_str){0};
+            tb.as.class_body.has_base_binding = false;
+            tb.as.class_body.base_binding_name = (tk_str){0};
+            tb.as.class_body.implements = NULL; tb.as.class_body.n_implements = 0;
+            tb.as.class_body.fields = read_fields(r, t, &tb.as.class_body.n_fields);
+            tb.as.class_body.methods = NULL; tb.as.class_body.n_methods = 0;
+            return tb;
+        }
     }
     r->ok = false; return tb;
 }

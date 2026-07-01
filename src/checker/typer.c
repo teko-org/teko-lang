@@ -454,10 +454,24 @@ static tk_error surface_at(tk_str file, uint32_t line, uint32_t col, tk_error in
 // (OOP A1, 2026-07-01) type-check a struct METHOD's BODY. Mirrors tk_type_function, except the
 // RECEIVER param (has_type=false, only ever index 0) binds to Named{struct_name} instead of
 // going through tk_resolve_type (its type is implicit, never written by the user).
-static tk_tfunction_result type_method(tk_function f, tk_str struct_name, tk_env env, tk_type_table table) {
-    tk_env local = env;
+static tk_tfunction_result type_method(tk_function f, tk_str struct_name, tk_env env, tk_type_table table,
+                                        bool has_base_binding, tk_str base_binding_name, tk_str base_name,
+                                        tk_str declaring_class) {
+    // (W10b.CLASS residual — intern visibility) this body's OWN field/method accesses are
+    // checked against `declaring_class` (see type_struct_methods's own comment on why this can
+    // differ from `struct_name`), NOT `struct_name` — set before typing the body below.
+    tk_env local = tk_env_with_owner(env, declaring_class);
     tk_type_table tbl = tk_type_param_table(f.type_params, f.n_type_params, (tk_str){0}, table);
     bool is_teko_rt = f.is_extern && str_eq(f.from_lib, "teko_rt");
+    // (W10b.CLASS) `class Base(parent) { … }` — the NAMED BINDING an instance method uses to
+    // reach the base object. Only meaningful for an INSTANCE method (has a receiver); a class's
+    // static methods never chain/inherit, so there is no base object to bind there. The binding
+    // is a REINTERPRET of the SAME receiver pointer as the base type — sound because
+    // tk_effective_class_fields lays out the base's fields as a PREFIX of the derived struct
+    // (field-flattening composition, increment 2), so a `tk_t_Derived *` and a `tk_t_Base *`
+    // pointing at the SAME address read identical bytes for every base field.
+    bool is_instance_method = f.nparams > 0 && !f.params[0].has_type;
+    bool inject_base_binding = has_base_binding && is_instance_method;
     // codegen reads tk_tfunction.params[i].type_ann DIRECTLY (the syntactic node, not the checked
     // tk_type) to emit a C signature — so the receiver's placeholder type_ann (no_type(), from
     // parsing) must be REWRITTEN to a real Named(struct_name) tk_type_expr before it ever reaches
@@ -483,6 +497,8 @@ static tk_tfunction_result type_method(tk_function f, tk_str struct_name, tk_env
         }
         local = tk_env_define(local, f.params[i].name, pt, false);
     }
+    if (inject_base_binding)
+        local = tk_env_define(local, base_binding_name, (tk_type){ .tag = TK_TYPE_NAMED, .as.named = { base_name } }, false);
     tk_type ret = function_return(f, tbl);
     if (ret.tag == TK_TYPE_REF)
         return (tk_tfunction_result){ .ok = false, .as.error = tk_error_make("a function cannot return a reference (pass-down only)") };
@@ -507,8 +523,33 @@ static tk_tfunction_result type_method(tk_function f, tk_str struct_name, tk_env
     { tk_str seen[TK_MAX_LABELS]; size_t nseen = 0;
       const char *why = check_labels(tb.as.value.stmts, tb.as.value.n, NULL, false, seen, &nseen);
       if (why) return (tk_tfunction_result){ .ok = false, .as.error = tk_error_make(why) }; }
+    // (W10b.CLASS) PREPEND the base-binding as the method body's FIRST statement (a synthetic
+    // `let <binding> = (<self> to <Base>)` — a plain reinterpret-cast the checker's own `to`
+    // syntax would never allow between two unrelated Named types, but this node bypasses that
+    // source-level restriction entirely; codegen's cast fallback just emits the C pointer cast).
+    // Checked ABOVE (check_returns/check_trailing_value/check_labels all read the ORIGINAL body)
+    // since it changes nothing about return/trailing-value/label semantics.
+    tk_tstatement *body = tb.as.value.stmts;
+    size_t nbody = tb.as.value.n;
+    if (inject_base_binding) {
+        tk_texpr *self_var = tk_alloc(sizeof *self_var);
+        *self_var = (tk_texpr){ .tag = TK_TEXPR_VAR, .type = (tk_type){ .tag = TK_TYPE_NAMED, .as.named = { struct_name } }, .line = 0, .col = 0 };
+        self_var->as.var = (typeof(self_var->as.var)){ .name = f.params[0].name, .is_func = false, .func_ns = (tk_str){0} };
+        tk_texpr cast_val = { .tag = TK_TEXPR_CAST, .type = (tk_type){ .tag = TK_TYPE_NAMED, .as.named = { base_name } }, .line = 0, .col = 0 };
+        cast_val.as.cast.expr = self_var;
+        tk_tstatement bind_stmt = { .tag = TK_TSTMT_BINDING };
+        bind_stmt.as.binding.kind = TK_BIND_LET;
+        bind_stmt.as.binding.target.tag = TK_BIND_SIMPLE;
+        bind_stmt.as.binding.target.as.simple.name = base_binding_name;
+        bind_stmt.as.binding.bound = (tk_type){ .tag = TK_TYPE_NAMED, .as.named = { base_name } };
+        bind_stmt.as.binding.value = cast_val;
+        tk_tstatement *new_body = tk_alloc((nbody + 1) * sizeof *new_body);
+        new_body[0] = bind_stmt;
+        for (size_t i = 0; i < nbody; i += 1) new_body[i + 1] = body[i];
+        body = new_body; nbody = nbody + 1;
+    }
     tk_tfunction tf = { .name = f.name, .type_params = f.type_params, .n_type_params = f.n_type_params, .type_constraints = f.type_constraints, .params = fixed_params, .nparams = f.nparams,
-                        .return_type = ret, .body = tb.as.value.stmts, .nbody = tb.as.value.n,
+                        .return_type = ret, .body = body, .nbody = nbody,
                         .vis = f.vis, .has_doc = f.has_doc, .doc = f.doc, .is_test = f.is_test };
     return (tk_tfunction_result){ .ok = true, .as.value = tf };
 }
@@ -527,21 +568,60 @@ static tk_str type_str_concat(tk_str a, tk_str b) {
 // exactly, so codegen/VM mangle+resolve method calls to these SAME items). A struct with
 // methods contributes MULTIPLE tk_titems, not one — pushed onto `items` by the caller.
 static bool type_struct_methods(tk_type_decl td, tk_str item_ns, tk_str file, tk_env env, tk_type_table table, tk_titem_list *items, tk_error *out_err) {
-    if (td.body.tag != TK_BODY_STRUCT) return true;
-    tk_struct_body sb = td.body.as.struct_body;
+    // (W10b.CLASS) a class's methods are typed/stamped by this SAME pass — only the methods
+    // list's source differs; a class method is otherwise identical to a struct method.
+    // Increment 2: stamps the EFFECTIVE (base-inherited + overridden) methods against THIS
+    // class's own name (re-typed/re-emitted per owning class, no vtable/dispatch yet). An
+    // `abstract fn` (no body, never overridden by THIS class) has nothing to emit — skipped.
+    tk_function *methods; size_t n_methods;
+    bool has_base_binding = false; tk_str base_binding_name = {0}; tk_str base_name = {0};
+    tk_function *own_methods = NULL; size_t n_own_methods = 0;   // (W10b.CLASS) methods declared DIRECTLY on td
+    bool is_class = false;
+    if (td.body.tag == TK_BODY_STRUCT) {
+        methods = td.body.as.struct_body.methods; n_methods = td.body.as.struct_body.n_methods;
+    } else if (td.body.tag == TK_BODY_CLASS) {
+        tk_methodsvec_result eff = tk_effective_class_methods(td.body.as.class_body, table);
+        if (!eff.ok) { *out_err = eff.as.error; return false; }
+        methods = eff.as.value.ptr; n_methods = eff.as.value.len;
+        has_base_binding = td.body.as.class_body.has_base_binding;
+        base_binding_name = td.body.as.class_body.base_binding_name;
+        base_name = td.body.as.class_body.base_name;
+        own_methods = td.body.as.class_body.methods; n_own_methods = td.body.as.class_body.n_methods;
+        is_class = true;
+    } else {
+        return true;
+    }
     tk_str sep = { .ptr = (const tk_byte *)"::", .len = 2 };
     tk_str method_ns = item_ns.len == 0 ? td.name : type_str_concat(type_str_concat(item_ns, sep), td.name);
-    for (size_t mi = 0; mi < sb.n_methods; mi += 1) {
-        tk_tfunction_result mf = type_method(sb.methods[mi], td.name, env, table);
+    for (size_t mi = 0; mi < n_methods; mi += 1) {
+        if (methods[mi].is_abstract) continue;
+        // (W10b.CLASS) the base-binding is injected ONLY for a method DECLARED DIRECTLY on THIS
+        // class (own or an override) — a PURELY inherited method (never touched by this class)
+        // keeps its ORIGINAL declaring class's own context; re-typing it under a DIFFERENT
+        // derived class must NOT inject a binding that method's body never asked for (it would
+        // either be spuriously unused, or — worse — silently shadow an ancestor's OWN binding of
+        // the same name in a 3+-level chain).
+        bool is_own = false;
+        for (size_t oi = 0; oi < n_own_methods; oi += 1) if (tk_str_eq(own_methods[oi].name, methods[mi].name)) { is_own = true; break; }
+        bool use_base_binding = has_base_binding && is_own;
+        // (W10b.CLASS residual — intern visibility) the ACCESSOR context for THIS method body's
+        // OWN field/method accesses: the class that ORIGINALLY DECLARED it — NEVER td.name when
+        // the two differ, for the exact same reason as the base-binding fix above.
+        tk_str declaring_class = td.name;
+        if (is_class) {
+            tk_member_owner_result mo = tk_find_method_owner(td.name, table, methods[mi].name);
+            if (mo.ok) declaring_class = mo.as.value.declaring_class;
+        }
+        tk_tfunction_result mf = type_method(methods[mi], td.name, env, table, use_base_binding, base_binding_name, base_name, declaring_class);
         if (!mf.ok) {
-            uint32_t el = mf.as.error.line ? mf.as.error.line : sb.methods[mi].line;
-            uint32_t ec = mf.as.error.line ? mf.as.error.col  : sb.methods[mi].col;
+            uint32_t el = mf.as.error.line ? mf.as.error.line : methods[mi].line;
+            uint32_t ec = mf.as.error.line ? mf.as.error.col  : methods[mi].col;
             *out_err = surface_at(file, el, ec, mf.as.error);
             return false;
         }
         tk_tfunction stamped = mf.as.value;
         stamped.namespace = method_ns; stamped.file = file;
-        stamped.line = sb.methods[mi].line; stamped.col = sb.methods[mi].col;
+        stamped.line = methods[mi].line; stamped.col = methods[mi].col;
         *items = tk_titem_list_push(*items, (tk_titem){ .tag = TK_TITEM_FUNCTION, .as.function = stamped });
     }
     return true;

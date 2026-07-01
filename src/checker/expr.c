@@ -6,6 +6,7 @@
 #include "expr.h"
 #include "typer_internal.h"   // tk_type_block (statement side, for if/match bodies)
 #include "../parser/parse_stmt.h"   // no_expr (DEFARGS placeholder, 2026-07-01)
+#include "collect.h"          // tk_effective_class_fields/methods (W10b.CLASS increment 2)
 #include <string.h>           // memcmp (string-span compares)
 
 // shared from match.c (E5b-2), promoted to non-static for reuse:
@@ -397,15 +398,37 @@ static tk_texpr_result type_method_call(tk_method_call mc, tk_env env, tk_type_t
     tk_str struct_name = recv_t.as.named.name;
     tk_decl_result td = tk_type_table_find(table, struct_name);
     if (!td.ok) return xerr("method typing is deferred (B.29 / M.4)");
-    if (td.as.value.body.tag != TK_BODY_STRUCT) return xerr("method typing is deferred (B.29 / M.4)");
-    tk_struct_body sb = td.as.value.body.as.struct_body;
+    // (W10b.CLASS) a class's instance dot-call reuses this SAME desugar — only the methods
+    // list's source differs; a class's methods are otherwise typed exactly like a struct's.
+    // Increment 2: the EFFECTIVE (base-inherited + overridden) methods, so an inherited method
+    // is callable through a derived instance too.
+    tk_function *methods; size_t n_methods;
+    if (td.as.value.body.tag == TK_BODY_STRUCT) {
+        methods = td.as.value.body.as.struct_body.methods;
+        n_methods = td.as.value.body.as.struct_body.n_methods;
+    } else if (td.as.value.body.tag == TK_BODY_CLASS) {
+        tk_methodsvec_result eff = tk_effective_class_methods(td.as.value.body.as.class_body, table);
+        if (!eff.ok) return xferr(eff.as.error);
+        methods = eff.as.value.ptr; n_methods = eff.as.value.len;
+    } else {
+        return xerr("method typing is deferred (B.29 / M.4)");
+    }
     bool found = false; tk_function mfn = {0};
-    for (size_t i = 0; i < sb.n_methods; i += 1) {
-        if (tk_str_eq(sb.methods[i].name, mc.method)) { found = true; mfn = sb.methods[i]; break; }
+    for (size_t i = 0; i < n_methods; i += 1) {
+        if (tk_str_eq(methods[i].name, mc.method)) { found = true; mfn = methods[i]; break; }
     }
     if (!found) return xferr(tk_error_named("no such method on struct", mc.method));
     bool is_instance = mfn.nparams > 0 && !mfn.params[0].has_type;
     if (!is_instance) return xferr(tk_error_named("static method — call it as StructName::method(…), not recv.method(…)", mc.method));
+    // (W10b.CLASS residual — intern visibility) a private (default) method is reachable only
+    // from its OWN declaring class's code, or — if `intern` — a subclass's too. Struct methods
+    // stay all-public (W10b.0.A) — this check only fires for a class receiver.
+    if (td.as.value.body.tag == TK_BODY_CLASS) {
+        tk_member_owner_result owner = tk_find_method_owner(struct_name, table, mc.method);
+        if (!owner.ok) return xferr(owner.as.error);
+        if (!tk_member_accessible(owner.as.value, env.owner_type, table))
+            return xferr(tk_error_named("method is private to its declaring class", mc.method));
+    }
     tk_segment *segs = tk_alloc(2 * sizeof *segs); if (!segs) abort();
     segs[0] = (tk_segment){ .name = struct_name };
     segs[1] = (tk_segment){ .name = mc.method };
@@ -458,6 +481,21 @@ static tk_texpr_result type_call(tk_call c, tk_env env, tk_type_table table) {
     if (!ftr.ok) return (tk_texpr_result){ .ok = false, .as.error = tk_error_named("unknown function", name) };
     tk_type ft = ftr.as.value;
     if (ft.tag != TK_TYPE_FUNC) return xerr("not a function");
+    // (W10b.CLASS residual — intern visibility) a STATIC call (`ClassName::method(…)`) is
+    // reachable under the SAME rule as an instance dot-call — check it here too, routed through
+    // the resolved call namespace. `call_ns` names a real class only for a class method; any
+    // other qualified/unqualified call (an ordinary namespaced function) is a silent no-op
+    // (tk_find_class_body errors → skipped).
+    if (call_ns.len > 0) {
+        tk_str cls = tk_class_name_from_method_ns(call_ns);
+        tk_classbody_result cbr = tk_find_class_body(cls, table);
+        if (cbr.ok) {
+            tk_member_owner_result owner = tk_find_method_owner(cls, table, name);
+            if (!owner.ok) return xferr(owner.as.error);
+            if (!tk_member_accessible(owner.as.value, env.owner_type, table))
+                return xferr(tk_error_named("method is private to its declaring class", name));
+        }
+    }
     tk_expr *dargs = c.args; size_t ndargs = c.nargs;
     if (ft.as.func.variadic) {
         tk_pack_result pr = pack_variadic_args(ft, c.args, c.nargs, env, table);
@@ -822,9 +860,29 @@ static tk_texpr_result type_field_access(tk_field_access fa, tk_env env, tk_type
     if (recv.as.value.type.tag != TK_TYPE_NAMED) return xerr("field access requires a struct receiver");
     tk_decl_result decl = tk_type_table_find(table, recv.as.value.type.as.named.name);
     if (!decl.ok) return xerr("unknown type for field access");
-    if (decl.as.value.body.tag != TK_BODY_STRUCT) return xerr("type is not a struct (no fields)");
-    tk_type_result ft = field_type(decl.as.value.body.as.struct_body, fa.field, table);
+    // (W10b.CLASS) a class's fields are read exactly like a struct's; increment 2 uses the
+    // EFFECTIVE (base-inherited) field set.
+    tk_struct_body fa_sb;
+    bool fa_is_class = decl.as.value.body.tag == TK_BODY_CLASS;
+    if (decl.as.value.body.tag == TK_BODY_STRUCT) {
+        fa_sb = decl.as.value.body.as.struct_body;
+    } else if (fa_is_class) {
+        tk_fieldsvec_result eff = tk_effective_class_fields(decl.as.value.body.as.class_body, table);
+        if (!eff.ok) return xferr(eff.as.error);
+        fa_sb = (tk_struct_body){ .fields = eff.as.value.ptr, .n_fields = eff.as.value.len, .methods = NULL, .n_methods = 0 };
+    } else {
+        return xerr("type is not a struct (no fields)");
+    }
+    tk_type_result ft = field_type(fa_sb, fa.field, table);
     if (!ft.ok) return xerr("no such field");
+    // (W10b.CLASS residual — intern visibility) a private (default) field is reachable only
+    // from its OWN declaring class's code, or — if `intern` — a subclass's too.
+    if (fa_is_class) {
+        tk_member_owner_result owner = tk_find_field_owner(recv.as.value.type.as.named.name, table, fa.field);
+        if (!owner.ok) return xferr(owner.as.error);
+        if (!tk_member_accessible(owner.as.value, env.owner_type, table))
+            return xferr(tk_error_named("field is private to its declaring class", fa.field));
+    }
     return xok((tk_texpr){ .tag = TK_TEXPR_FIELD_ACCESS, .type = ft.as.value,
                            .as.field_access = { box(recv.as.value), fa.field } });
 }
@@ -869,9 +927,29 @@ static tk_texpr_result type_safe_field_access(tk_safe_field_access sfa, tk_env e
         return xerr("safe field access on a non-struct optional is not yet supported (the struct-field layer is pending — M.3)");
     tk_decl_result decl = tk_type_table_find(table, inner.as.named.name);
     if (!decl.ok) return xerr("unknown type for safe field access");
-    if (decl.as.value.body.tag != TK_BODY_STRUCT) return xerr("type is not a struct (no fields)");
-    tk_type_result ft = field_type(decl.as.value.body.as.struct_body, sfa.field, table);
+    // (W10b.CLASS) a class's fields are read exactly like a struct's; increment 2 uses the
+    // EFFECTIVE (base-inherited) field set.
+    tk_struct_body sfa_sb;
+    bool sfa_is_class = decl.as.value.body.tag == TK_BODY_CLASS;
+    if (decl.as.value.body.tag == TK_BODY_STRUCT) {
+        sfa_sb = decl.as.value.body.as.struct_body;
+    } else if (sfa_is_class) {
+        tk_fieldsvec_result eff = tk_effective_class_fields(decl.as.value.body.as.class_body, table);
+        if (!eff.ok) return xferr(eff.as.error);
+        sfa_sb = (tk_struct_body){ .fields = eff.as.value.ptr, .n_fields = eff.as.value.len, .methods = NULL, .n_methods = 0 };
+    } else {
+        return xerr("type is not a struct (no fields)");
+    }
+    tk_type_result ft = field_type(sfa_sb, sfa.field, table);
     if (!ft.ok) return xerr("no such field");
+    // (W10b.CLASS residual — intern visibility) a private (default) field is reachable only
+    // from its OWN declaring class's code, or — if `intern` — a subclass's too.
+    if (sfa_is_class) {
+        tk_member_owner_result owner = tk_find_field_owner(inner.as.named.name, table, sfa.field);
+        if (!owner.ok) return xferr(owner.as.error);
+        if (!tk_member_accessible(owner.as.value, env.owner_type, table))
+            return xferr(tk_error_named("field is private to its declaring class", sfa.field));
+    }
     // the result is `(field-type)?` — null-propagating; an already-optional field stays as-is.
     tk_type result = ft.as.value.tag == TK_TYPE_OPTIONAL ? ft.as.value
                    : (tk_type){ .tag = TK_TYPE_OPTIONAL, .as.optional.inner = tk_box_type_val(ft.as.value) };
@@ -978,20 +1056,34 @@ tk_texpr_result tk_type_struct_lit(tk_struct_lit sl, tk_type expected, tk_env en
         if (!decl.ok) return xerr("internal: generic instance was not stamped");
         name = mname;
     }
-    if (decl.as.value.body.tag != TK_BODY_STRUCT) return xerr("struct-literal target is not a struct");
-    tk_struct_body sb = decl.as.value.body.as.struct_body;
-    if (sl.nfields != sb.n_fields) return xerr("a struct literal must set exactly the declared fields (count mismatch)");
+    // (W10b.CLASS) `Name { … }` also constructs a class instance — a class's fields are typed
+    // identically to a struct's (increment 2: the EFFECTIVE, base-inherited fields too). An
+    // `abstract` class cannot be instantiated directly. The "who may construct me" restriction
+    // (a class's literal legal only inside its own static factory) is a LATER increment.
+    tk_field *sb_fields; size_t sb_n_fields;
+    if (decl.as.value.body.tag == TK_BODY_STRUCT) {
+        sb_fields = decl.as.value.body.as.struct_body.fields; sb_n_fields = decl.as.value.body.as.struct_body.n_fields;
+    } else if (decl.as.value.body.tag == TK_BODY_CLASS) {
+        if (decl.as.value.body.as.class_body.kind == TK_CLASS_ABSTRACT)
+            return xferr(tk_error_named("is abstract and cannot be instantiated directly", name));
+        tk_fieldsvec_result eff = tk_effective_class_fields(decl.as.value.body.as.class_body, table);
+        if (!eff.ok) return xferr(eff.as.error);
+        sb_fields = eff.as.value.ptr; sb_n_fields = eff.as.value.len;
+    } else {
+        return xerr("struct-literal target is not a struct");
+    }
+    if (sl.nfields != sb_n_fields) return xerr("a struct literal must set exactly the declared fields (count mismatch)");
 
-    tk_str  *names = tk_alloc((sb.n_fields ? sb.n_fields : 1) * sizeof *names); if (!names) abort();
-    tk_texpr *vals = tk_alloc((sb.n_fields ? sb.n_fields : 1) * sizeof *vals); if (!vals) abort();
-    for (size_t d = 0; d < sb.n_fields; d += 1) {
-        tk_str fname = sb.fields[d].name;
+    tk_str  *names = tk_alloc((sb_n_fields ? sb_n_fields : 1) * sizeof *names); if (!names) abort();
+    tk_texpr *vals = tk_alloc((sb_n_fields ? sb_n_fields : 1) * sizeof *vals); if (!vals) abort();
+    for (size_t d = 0; d < sb_n_fields; d += 1) {
+        tk_str fname = sb_fields[d].name;
         size_t found = sl.nfields, hits = 0;          // locate the provided value for this declared field
         for (size_t i = 0; i < sl.nfields; i += 1)
             if (tk_str_eq(sl.field_names[i], fname)) { found = i; hits += 1; }
         if (hits == 0) { tk_free0(names); tk_free0(vals); return xerr("a struct literal is missing a declared field"); }
         if (hits > 1)  { tk_free0(names); tk_free0(vals); return xerr("a struct literal sets a field more than once"); }
-        tk_type_result ft = tk_resolve_type(sb.fields[d].type_ann, table);
+        tk_type_result ft = tk_resolve_type(sb_fields[d].type_ann, table);
         if (!ft.ok) { tk_free0(names); tk_free0(vals); return xferr(ft.as.error); }
         // thread the field's type as EXPECTED so a nested generic constructor (`value = Box { … }`)
         // targets its concrete instance (S4). Non-struct-lit values type exactly as before.
@@ -1021,7 +1113,7 @@ tk_texpr_result tk_type_struct_lit(tk_struct_lit sl, tk_type expected, tk_env en
     }
     return xok((tk_texpr){ .tag = TK_TEXPR_STRUCT_INIT,
                            .type = (tk_type){ .tag = TK_TYPE_NAMED, .as.named.name = name },
-                           .as.struct_init = { names, vals, sb.n_fields } });
+                           .as.struct_init = { names, vals, sb_n_fields } });
 }
 
 // (W10) free-variable collection for a closure body — mirror of typer.tks lam_collect_*. Collects the

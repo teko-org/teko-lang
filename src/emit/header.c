@@ -79,6 +79,22 @@ static tyexport_result build_tyexport(tk_type_decl d, tk_type_table table) {
         case TK_BODY_FLAGS:
             // (C8.4) exporting a `flags` type in the `.tkh` is deferred to C8.4. Honest stop.
             return (tyexport_result){ .ok = false, .as.error = tk_error_make("exporting a flags type in the header is not yet supported") };
+        case TK_BODY_CLASS: {
+            // (W10b.CLASS increment 1) same field-export shape as a struct — reuses TK_TY_STRUCT
+            // since the C layout is identical too (no inheritance/statics surfaced yet).
+            tk_class_body cb = d.body.as.class_body;
+            tk_sigfield_list fields = tk_sigfield_list_empty();
+            for (size_t i = 0; i < cb.n_fields; i += 1) {
+                tk_type_result ft = tk_resolve_type(cb.fields[i].type_ann, table);
+                if (!ft.ok) return (tyexport_result){ .ok = false, .as.error = ft.as.error };
+                fields = tk_sigfield_list_push(fields, (tk_sigfield){ .name = cb.fields[i].name, .type = ft.as.value });
+            }
+            tk_tyexport e = { .name = d.name, .shape = TK_TY_STRUCT,
+                              .fields = fields.ptr, .nfields = fields.len,
+                              .members = NULL, .nmembers = 0, .cases = NULL, .ncases = 0,
+                              .has_doc = d.has_doc, .doc = d.doc };
+            return (tyexport_result){ .ok = true, .as.value = e };
+        }
     }
     return (tyexport_result){ .ok = false, .as.error = tk_error_make("unknown type body shape") };
 }

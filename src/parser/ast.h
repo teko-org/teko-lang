@@ -251,9 +251,16 @@ typedef struct {                                                   // Function (
     tk_str       c_symbol;                                         // the C symbol it binds (valid iff is_extern)
     tk_str       from_lib;                                         // the providing library ("" = implicit libc; valid iff is_extern)
     tk_str       os_guard;                                         // a `#os("…")` conditional-compile guard ("" = all OSes; C7.1f)
+    bool         is_intern;                                        // (W10b.CLASS, 2026-07-01) visible to inheritors (combines WITH vis); struct members always false
+    bool         is_abstract;                                      // `abstract fn` — signature only, no body (abstract classes only)
+    bool         is_virtual;                                       // `virtual fn` — overridable by a derived class
+    bool         is_override;                                      // `override fn` — overrides a base virtual/abstract method
 } tk_function;
 
-typedef struct { tk_str name; tk_type_expr type_ann; } tk_field;
+// (W10b.CLASS, 2026-07-01) vis/is_intern mirror tk_function's — a struct's tk_field always
+// carries TK_VIS_PUB/is_intern=false (struct members stay all-public); only a class-body field
+// actually varies these.
+typedef struct { tk_str name; tk_type_expr type_ann; tk_visibility vis; bool is_intern; } tk_field;
 typedef struct { tk_field *fields; size_t n_fields; tk_function *methods; size_t n_methods; }  tk_struct_body;   // (OOP A1, 2026-07-01) methods = interleaved `fn` decls; unified method model (see tk_param.has_type)
 typedef struct { tk_str  *members; size_t n_members; } tk_enum_body;    // member names, in order
 typedef struct {
@@ -264,9 +271,26 @@ typedef struct {
 typedef struct { tk_type_expr type_expr; }             tk_variant_body; // a union (A.8)
 typedef struct { tk_type_expr alias; }                 tk_alias_body;   // `type Name = <type-expr>` — a TRANSPARENT alias (self-host parity)
 typedef struct { int _unused; }                        tk_extern_body;  // `extern type Name` — an OPAQUE foreign handle (C7.1a; lowers to `void *`)
-typedef struct {                                                        // TypeBody = StructBody | EnumBody | FlagsBody | VariantBody | AliasBody | ExternBody
-    enum { TK_BODY_STRUCT, TK_BODY_ENUM, TK_BODY_FLAGS, TK_BODY_VARIANT, TK_BODY_ALIAS, TK_BODY_EXTERN } tag;
-    union { tk_struct_body struct_body; tk_enum_body enum_body; tk_flags_body flags_body; tk_variant_body variant_body; tk_alias_body alias_body; tk_extern_body extern_body; } as;
+// (W10b.CLASS, 2026-07-01) a class's KIND — SEALED (final, instantiable, NOT inheritable) is the
+// DEFAULT (Teko inverts the usual convention); ABSTRACT = inheritable, NOT instantiable; VIRTUAL
+// = both.
+typedef enum { TK_CLASS_SEALED, TK_CLASS_ABSTRACT, TK_CLASS_VIRTUAL } tk_class_kind;
+// `type C = <kind> [Base] [(binding)] [& I1 & I2 …] { fields; methods }`. See ast.tks::ClassBody
+// for the full field-by-field rationale (base-binding, implements-list trust-not-verify, member
+// visibility default).
+typedef struct {
+    tk_class_kind kind;
+    bool          has_base;
+    tk_str        base_name;
+    bool          has_base_binding;
+    tk_str        base_binding_name;
+    tk_str       *implements; size_t n_implements;
+    tk_field     *fields;     size_t n_fields;
+    tk_function  *methods;    size_t n_methods;
+} tk_class_body;
+typedef struct {                                                        // TypeBody = StructBody | EnumBody | FlagsBody | VariantBody | AliasBody | ExternBody | ClassBody
+    enum { TK_BODY_STRUCT, TK_BODY_ENUM, TK_BODY_FLAGS, TK_BODY_VARIANT, TK_BODY_ALIAS, TK_BODY_EXTERN, TK_BODY_CLASS } tag;
+    union { tk_struct_body struct_body; tk_enum_body enum_body; tk_flags_body flags_body; tk_variant_body variant_body; tk_alias_body alias_body; tk_extern_body extern_body; tk_class_body class_body; } as;
 } tk_type_body;
 typedef struct {                                                        // TypeDecl (nominal — B.13)
     tk_str        name;

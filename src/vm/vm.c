@@ -14,6 +14,7 @@
 #include "../lexer/token.h"   // tk_token_kind operator kinds
 #include "../parser/ast.h"    // tk_bind_kind, tk_bind_target, tk_path
 #include "../text/text.h"     // tk_str, tk_byte
+#include "../checker/collect.h"   // tk_type_table_of, tk_find_class_body (W10b.CLASS residual — VM reference semantics)
 
 // NOTE: we do NOT #include "teko_rt.h" — it re-typedefs tk_str / tk_byte (it is a
 // SELF-CONTAINED header for GENERATED programs, distinct from the compiler's text.h),
@@ -181,7 +182,7 @@ _Noreturn static void vm_panic_oob_at (const tk_texpr *e) { vm_panic_pos(e->line
 // =========================================================================
 typedef struct tk_value tk_value;
 
-typedef enum { TK_VAL_INT, TK_VAL_FLOAT, TK_VAL_BOOL, TK_VAL_STR, TK_VAL_LIST, TK_VAL_STRUCT, TK_VAL_OPT, TK_VAL_REF, TK_VAL_FUNC } tk_value_tag;   // (W10a) TK_VAL_FUNC = a function/closure value
+typedef enum { TK_VAL_INT, TK_VAL_FLOAT, TK_VAL_BOOL, TK_VAL_STR, TK_VAL_LIST, TK_VAL_STRUCT, TK_VAL_OPT, TK_VAL_REF, TK_VAL_FUNC, TK_VAL_CLASS_REF } tk_value_tag;   // (W10a) TK_VAL_FUNC = a function/closure value; (W10b.CLASS residual) TK_VAL_CLASS_REF = a class instance
 
 // the value list — TK_LIST over tk_value (core.h convention). Declared after tk_value.
 typedef struct { tk_value *ptr; size_t len; size_t cap; } tk_value_list;
@@ -219,6 +220,15 @@ struct tk_value {
         // an auto-ref PROMOTES the origin var to a cell, this carries the cell index, and `.value`
         // read/write goes through cell_get/cell_set (the .tks twin is the RefVal variant member).
         struct { uint64_t cell; } ref;
+        // CLASS_REF (W10b.CLASS residual — VM reference semantics) — a class instance value: the
+        // index into the SAME global cell store (g_cells) where its struct payload lives.
+        // STRUCTURALLY identical to `ref` (both are just a cell index) but semantically DISTINCT:
+        // TK_VAL_REF is MEM-1b's escape-gated, param-only, scalar-only borrow (may NOT be
+        // returned — R3), whereas a class is a REFERENCE type (increment 3's native pointer
+        // semantics) — meant to be constructed, returned, stored, and shared freely. A separate
+        // tag keeps that contract distinction explicit rather than smuggling an unrestricted use
+        // through TK_VAL_REF's "cannot escape" type.
+        struct { uint64_t cell; } class_ref;
         // FUNC (W10) — a function/closure value. A NAMED fn carries (ns, name) and is_lambda=false. A
         // closure LITERAL carries is_lambda=true + its typed params/body + a SNAPSHOT of its captured
         // variables (cap_names/cap_vals — a RefVal snapshot shares the cell → by-ref mutation). The
@@ -1396,6 +1406,15 @@ static tk_value eval_cast(const tk_texpr *e, tk_venv *env) {
     const tk_texpr *inner = e->as.cast.expr;
     tk_value iv = tk_vm_eval_expr(inner, env);
 
+    // (W10b.CLASS residual — VM reference semantics) the base-binding's synthetic `self to Base`
+    // cast (typer.c::type_method, the `class Base(binding) { … }` feature) is a same-storage
+    // REINTERPRET, not a numeric conversion — mirrors the native engine's plain C pointer cast
+    // (`(tk_t_Base *)(self)`), which is a no-op at the value level (field-flattening already lays
+    // the base's fields out as a PREFIX of the derived struct, so field-by-NAME lookup on the SAME
+    // cell already resolves correctly under either type). Any Named-to-Named cast is this identity
+    // pass-through — the checker only ever builds one for this exact feature.
+    if (inner->type.tag == TK_TYPE_NAMED && e->type.tag == TK_TYPE_NAMED) return iv;
+
     // (UTF-8 increment 1) `char to u32`/u64/i64 — DECODE the codepoint (its UTF-8 bytes, carried as
     // the str value) to its scalar value, normalized to the target int. Mirrors tk_char_to_u32 (the
     // native runtime helper) and codegen's char-cast branch (VM==native). The checker restricted the
@@ -2177,6 +2196,10 @@ static tk_value tk_vm_eval_expr(const tk_texpr *e, tk_venv *env) {
                     return cell_get(recv.as.ref.cell);
                 vm_unsupported("a reference (`Ref<T>`) exposes only `.value` (internal: checker should reject)");
             }
+            // (W10b.CLASS residual — VM reference semantics) a class receiver is a
+            // TK_VAL_CLASS_REF (a cell index) — deref through the cell to its struct payload,
+            // then fall through to the SAME field lookup a struct value uses below.
+            if (recv.tag == TK_VAL_CLASS_REF) recv = cell_get(recv.as.class_ref.cell);
             // W5-idx — `.len`: a `str` value yields its byte length as a u64. A list value
             // (slice) is an honest stop (slice VALUES are the next feature). The checker
             // already typed `.len` as u64 for str/slice receivers.
@@ -2253,6 +2276,9 @@ static tk_value tk_vm_eval_expr(const tk_texpr *e, tk_venv *env) {
                 vm_unsupported("safe field access on a non-optional value (internal: checker should reject)");
             if (!recv.as.opt.present) return v_none();              // NONE propagates
             tk_value inner = *recv.as.opt.inner;
+            // (W10b.CLASS residual — VM reference semantics) a class-typed optional's inner is a
+            // TK_VAL_CLASS_REF (not a struct value directly) — deref through the cell first.
+            if (inner.tag == TK_VAL_CLASS_REF) inner = cell_get(inner.as.class_ref.cell);
             if (inner.tag != TK_VAL_STRUCT)
                 vm_unsupported("safe field access on a non-struct optional (internal: checker should reject)");
             for (size_t i = 0; i < inner.as.st.fields.len; i += 1)
@@ -2291,7 +2317,22 @@ static tk_value tk_vm_eval_expr(const tk_texpr *e, tk_venv *env) {
                 tk_value raw = tk_vm_eval_expr(&e->as.struct_init.field_vals[i], env);
                 vals[i]  = coerce_to(raw, field_coerce_type(tn, e->as.struct_init.field_names[i]));
             }
-            return v_struct(tn, (tk_value_fields){ names, vals, nf });
+            tk_value sv = v_struct(tn, (tk_value_fields){ names, vals, nf });
+            // (W10b.CLASS residual — VM reference semantics) a class instance is a REFERENCE
+            // type (increment 3, native side): construction allocates a cell in the SAME
+            // global cell store MEM-1b already uses (g_cells) and yields a TK_VAL_CLASS_REF, so
+            // passing/binding/returning it is a cheap cell-index COPY (shared identity),
+            // matching the native engine's arena-per-object pointer semantics — NOT a struct's
+            // by-value copy.
+            {
+                tk_type_table table = tk_type_table_of(g_prog);
+                tk_classbody_result cb = tk_find_class_body(tn, table);
+                if (cb.ok) {
+                    uint64_t id = cell_alloc(sv);
+                    return (tk_value){ .tag = TK_VAL_CLASS_REF, .as.class_ref = { .cell = id } };
+                }
+            }
+            return sv;
         }
     }
     vm_unsupported("unknown expression not yet supported");

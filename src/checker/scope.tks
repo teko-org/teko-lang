@@ -14,23 +14,34 @@ type ValBinding = struct {
 // the environment: a FLAT list of bindings PLUS the namespace currently being type-checked, so an
 // UNQUALIFIED call resolves to a same-namespace function rather than a global bare-name collision
 // (#41). Later bindings shadow earlier (lexical); block scoping is implicit. (Mirror of C tk_env.)
-pub type Env = struct { bindings: []ValBinding; cur_ns: str }
+// `owner_type` (W10b.CLASS) — the DECLARING class of the method body CURRENTLY being typed ("" —
+// not inside any class method, e.g. a free function or top-level statement). Set ONLY by
+// type_method, to the class that ORIGINALLY WROTE this body (own method: itself; inherited,
+// not-overridden method: the ancestor that declared it) — NEVER the class it's being re-typed
+// FOR, which may differ (increment 2's per-owning-class re-stamping). Drives `intern`/private
+// member-access enforcement (a field/method is reachable only from its declaring class's own
+// code, or — if `is_intern` — from a subclass's own code too).
+pub type Env = struct { bindings: []ValBinding; cur_ns: str; owner_type: str }
 
-// an empty env (no bindings, no current namespace).
-pub fn env_empty() -> Env { Env { bindings = teko::list::empty(); cur_ns = "" } }
+// an empty env (no bindings, no current namespace, not inside any class method).
+pub fn env_empty() -> Env { Env { bindings = teko::list::empty(); cur_ns = ""; owner_type = "" } }
 
 // (#41) set the namespace currently being type-checked — the typed pass sets it per item.
-pub fn with_ns(env: Env, ns: str) -> Env { Env { bindings = env.bindings; cur_ns = ns } }
+pub fn with_ns(env: Env, ns: str) -> Env { Env { bindings = env.bindings; cur_ns = ns; owner_type = env.owner_type } }
+
+// (W10b.CLASS) set the DECLARING class of the method body about to be typed ("" clears it —
+// used when entering a free function).
+pub fn with_owner(env: Env, owner: str) -> Env { Env { bindings = env.bindings; cur_ns = env.cur_ns; owner_type = owner } }
 
 // define a LOCAL name (append). `is_mut`: a `mut` binding passes true; everything else false (B.21).
 // Locals carry no namespace ("").
 pub fn define(env: Env, name: str, t: Type, is_mut: bool) -> Env {
-    Env { bindings = teko::list::push(env.bindings, ValBinding { name = name; type = t; is_mut = is_mut; ns = "" }); cur_ns = env.cur_ns }
+    Env { bindings = teko::list::push(env.bindings, ValBinding { name = name; type = t; is_mut = is_mut; ns = "" }); cur_ns = env.cur_ns; owner_type = env.owner_type }
 }
 
 // (#41) define a TOP-LEVEL FUNCTION binding carrying its declaring namespace.
 pub fn define_fn(env: Env, name: str, t: Type, ns: str) -> Env {
-    Env { bindings = teko::list::push(env.bindings, ValBinding { name = name; type = t; is_mut = false; ns = ns }); cur_ns = env.cur_ns }
+    Env { bindings = teko::list::push(env.bindings, ValBinding { name = name; type = t; is_mut = false; ns = ns }); cur_ns = env.cur_ns; owner_type = env.owner_type }
 }
 
 // a binding is mutable iff declared `mut` (Let and Const are immutable — B.21).

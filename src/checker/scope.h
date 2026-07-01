@@ -12,8 +12,11 @@ typedef struct { tk_str name; tk_type type; bool is_mut; tk_str ns; } tk_val_bin
 // The env: a flat binding list (later bindings shadow earlier) PLUS the namespace currently being
 // type-checked — so an UNQUALIFIED call resolves to a same-namespace function rather than a global
 // bare-name collision (#41). Defined manually (not TK_LIST) so it can carry cur_ns.
-typedef struct { tk_val_binding *ptr; size_t len; size_t cap; tk_str cur_ns; } tk_env;
-static inline tk_env tk_env_empty(void) { return (tk_env){ .ptr = NULL, .len = 0, .cap = 0, .cur_ns = (tk_str){0} }; }
+// `owner_type` (W10b.CLASS) — the DECLARING class of the method body CURRENTLY being typed (empty
+// — not inside any class method). See scope.tks's Env doc for the full rationale.
+typedef struct { tk_val_binding *ptr; size_t len; size_t cap; tk_str cur_ns; tk_str owner_type; } tk_env;
+static inline tk_env tk_env_empty(void) { return (tk_env){ .ptr = NULL, .len = 0, .cap = 0, .cur_ns = (tk_str){0}, .owner_type = (tk_str){0} }; }
+static inline tk_env tk_env_with_owner(tk_env env, tk_str owner) { env.owner_type = owner; return env; }
 
 TK_RESULT(tk_type, tk_type_result);            // Type | error
 TK_RESULT(tk_val_binding, tk_binding_result);  // ValBinding | error (carries is_mut — B.21)

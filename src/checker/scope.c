@@ -27,7 +27,7 @@ tk_env tk_env_define(tk_env env, tk_str name, tk_type t, bool is_mut) {
     if (buf == NULL) { abort(); }
     if (n != 0) { memcpy(buf, env.ptr, n * sizeof *buf); }
     buf[n] = (tk_val_binding){ .name = name, .type = t, .is_mut = is_mut, .ns = (tk_str){0} };  // local: no ns (#41)
-    return (tk_env){ .ptr = buf, .len = n + 1, .cap = n + 1, .cur_ns = env.cur_ns };
+    return (tk_env){ .ptr = buf, .len = n + 1, .cap = n + 1, .cur_ns = env.cur_ns, .owner_type = env.owner_type };
 }
 
 // (#41) define a TOP-LEVEL FUNCTION binding carrying its declaring namespace, so an unqualified
@@ -38,7 +38,7 @@ tk_env tk_env_define_fn(tk_env env, tk_str name, tk_type t, tk_str ns) {
     if (buf == NULL) { abort(); }
     if (n != 0) { memcpy(buf, env.ptr, n * sizeof *buf); }
     buf[n] = (tk_val_binding){ .name = name, .type = t, .is_mut = false, .ns = ns };
-    return (tk_env){ .ptr = buf, .len = n + 1, .cap = n + 1, .cur_ns = env.cur_ns };
+    return (tk_env){ .ptr = buf, .len = n + 1, .cap = n + 1, .cur_ns = env.cur_ns, .owner_type = env.owner_type };
 }
 
 bool tk_bind_is_mut(tk_bind_kind k) { return k == TK_BIND_MUT; }   // Let/Const immutable (B.21)

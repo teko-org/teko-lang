@@ -79,6 +79,18 @@ type OptVal = struct { present: bool; inner: Value? }
 // `.value` read/write goes through `cell_get`/`cell_set`; the C twin is the TK_VAL_REF tag.
 type RefVal = struct { cell: u64 }
 
+// ClassRef (W10b.CLASS residual — VM reference semantics) — a CLASS instance value: the index
+// into the env's CELL STORE where its StructVal lives. STRUCTURALLY identical to RefVal (both
+// are just a cell index) but semantically DISTINCT: RefVal is MEM-1b's escape-gated, param-only,
+// scalar-only borrow (a function may NOT return one — R3), whereas a ClassRef is exactly the
+// opposite — a class is a REFERENCE type (increment 3's native pointer semantics), meant to be
+// constructed, returned, stored, and shared freely. Reusing RefVal's OWN type would either
+// require relaxing R3 for it (unsound for Ref<T>) or smuggling class instances through a type
+// whose entire contract is "cannot escape" — so this is a new, unrestricted variant over the
+// SAME cell-store mechanism (cell_alloc/cell_get), giving a class construction shared identity
+// exactly like a native `tk_region_alloc`'d pointer: `let b = a` copies only the cell index.
+type ClassRef = struct { cell: u64 }
+
 // FuncVal (W10a) — a function/closure VALUE: the (namespace, name) of the target function. A named
 // fn used as a value carries no captured environment (the W10b capture env will extend this). A
 // closure call evaluates its callee to a FuncVal and invokes that function with the call's args.
@@ -92,7 +104,7 @@ type FuncVal = struct { is_lambda: bool; ns: str; name: str; params: []checker::
 type Value = variant u8 | u16 | u32 | u64 | u128
            | i8 | i16 | i32 | i64 | i128
            | f16 | f32 | f64
-           | bool | byte | str | []Value | StructVal | OptVal | RefVal | FuncVal
+           | bool | byte | str | []Value | StructVal | OptVal | RefVal | FuncVal | ClassRef
 
 // ---------------------------------------------------------------------------
 // CONTROL FLOW. The exits a block can produce — mirrors the C `tk_flow`
@@ -1032,7 +1044,21 @@ fn eval_struct_init(si: checker::TStructInit, ty: checker::Type, env: Venv) -> E
         vals = teko::list::push(vals, coerce_to(fr.value, vm_field_coerce_type(cur.prog, tn, si.field_names[i])))
         i++
     }
-    EvalRes { value= StructVal { type_name = tn; field_names = names; field_vals = vals }; env= cur }
+    let sv = StructVal { type_name = tn; field_names = names; field_vals = vals }
+    // (W10b.CLASS residual — VM reference semantics) a class instance is a REFERENCE type
+    // (increment 3, native side): construction allocates a cell (the SAME cell-store MEM-1b
+    // already threads through eval_expr — see EvalRes) and yields a ClassRef, so passing/
+    // binding/returning it is a cheap cell-index COPY (shared identity), matching the native
+    // engine's arena-per-object pointer semantics — NOT a struct's by-value copy.
+    let table = checker::type_table_of(cur.prog)
+    match checker::find_class_body(tn, table) {
+        parser::ClassBody => {
+            let alloc = cell_alloc(cur.cells, sv)
+            return EvalRes { value= ClassRef { cell= alloc.id }; env= with_cells(cur, alloc.cells) }
+        }
+        error => {}
+    }
+    EvalRes { value= sv; env= cur }
 }
 
 // W4b — read field `fa.field` from a struct value (the checker guarantees it exists).
@@ -1048,6 +1074,23 @@ fn eval_field_access(fa: checker::TFieldAccess, env: Venv) -> EvalRes {
         RefVal as rv => {
             if fa.field == "value" { return EvalRes { value= cell_get(renv.cells, rv.cell); env= renv } }
             panic("vm: a reference (`Ref<T>`) exposes only `.value` (internal: checker should reject)")
+        }
+        // (W10b.CLASS residual — VM reference semantics) a class receiver is a ClassRef (a cell
+        // index) — deref through the cell to its StructVal, then read the field exactly like an
+        // ordinary struct value (same lookup loop, just below).
+        ClassRef as cr => {
+            match cell_get(renv.cells, cr.cell) {
+                StructVal as s => {
+                    mut i = 0
+                    loop {
+                        if i >= s.field_names.len { break }
+                        if s.field_names[i] == fa.field { return EvalRes { value= s.field_vals[i]; env= renv } }
+                        i++
+                    }
+                    panic("vm: field not found in class instance (internal: the checker guarantees the field)")
+                }
+                _ => panic("vm: a ClassRef cell must hold a StructVal (internal invariant)")
+            }
         }
         str as s => {
             if fa.field == "len" { return EvalRes { value= s.len to u64; env= renv } }
@@ -1299,6 +1342,7 @@ fn val_type_matches(subj: Value, name: str) -> bool {
         OptVal => false
         RefVal => false                            // (MEM Step 2/3) a `Ref<T>` value is never pattern-matched (escape-gated, param-only)
         FuncVal => false                           // (W10a) a function value is never pattern-matched
+        ClassRef => false                          // (W10b.CLASS residual) a class instance is nominal, never a variant-case pattern subject
     }
 }
 
@@ -1804,21 +1848,26 @@ fn eval_expr(e: checker::TExpr, env: Venv) -> EvalRes {
                 OptVal as o => {
                     if !o.present { return EvalRes { value= OptVal { present = false; inner = null }; env= re.env } }
                     let inner = match o.inner { Value as iv => iv; null => return EvalRes { value= OptVal { present = false; inner = null }; env= re.env } }
-                    match inner {
-                        StructVal as sv => {
-                            mut i = 0
-                            loop {
-                                if i >= sv.field_names.len { break }
-                                if sv.field_names[i] == sfa.field {
-                                    // result is `(field)?` — an already-optional field stays as-is.
-                                    match sv.field_vals[i] { OptVal as fo => return EvalRes { value= fo; env= re.env }; _ => return EvalRes { value= OptVal { present = true; inner = sv.field_vals[i] }; env= re.env } }
-                                }
-                                i++
-                            }
-                            panic("vm: field not found in safe field access (internal: the checker guarantees the field)")
+                    // (W10b.CLASS residual — VM reference semantics) a class-typed optional's
+                    // inner is a ClassRef (not a StructVal) — deref through the cell first.
+                    let sv = match inner {
+                        StructVal as s => s
+                        ClassRef as cr => match cell_get(re.env.cells, cr.cell) {
+                            StructVal as s => s
+                            _ => panic("vm: a ClassRef cell must hold a StructVal (internal invariant)")
                         }
                         _ => panic("vm: safe field access on a non-struct optional (internal: checker should reject)")
                     }
+                    mut i = 0
+                    loop {
+                        if i >= sv.field_names.len { break }
+                        if sv.field_names[i] == sfa.field {
+                            // result is `(field)?` — an already-optional field stays as-is.
+                            match sv.field_vals[i] { OptVal as fo => return EvalRes { value= fo; env= re.env }; _ => return EvalRes { value= OptVal { present = true; inner = sv.field_vals[i] }; env= re.env } }
+                        }
+                        i++
+                    }
+                    panic("vm: field not found in safe field access (internal: the checker guarantees the field)")
                 }
                 _ => panic("vm: safe field access on a non-optional value (internal: checker should reject)")
             }
@@ -2284,6 +2333,17 @@ fn eval_cast(c: checker::TCast, ty: checker::Type, line: u32, col: u32, env: Ven
     // casts as u8->i32. Any other type (str/named/…) is the honest non-numeric cast frontier.
     let xe = eval_expr(c.expr, env)   // (MEM Step 4) thread the operand's env once
     let cur = xe.env
+    // (W10b.CLASS residual — VM reference semantics) the base-binding's synthetic `self to Base`
+    // cast (typer.tks::type_method, the `class Base(binding) { … }` feature) is a same-storage
+    // REINTERPRET, not a numeric conversion — mirrors the native engine's plain C pointer cast
+    // (`(tk_t_Base *)(self)`), which is a no-op at the value level (field-flattening already lays
+    // the base's fields out as a PREFIX of the derived struct, so field-by-NAME lookup on the SAME
+    // StructVal/cell already resolves correctly under either type). Any Named-to-Named cast is
+    // this identity pass-through — the checker only ever builds one for this exact feature.
+    match c.expr.type {
+        Named => match ty { Named => return EvalRes { value= xe.value; env= cur }; _ => {} }
+        _ => {}
+    }
     // (UTF-8 increment 1) `char to u32`/u64/i64 — DECODE the codepoint (its UTF-8 bytes, carried as
     // the `str` Value) to its scalar value, normalized to the target int. Mirrors tk_char_to_u32 (the
     // native runtime helper) and codegen's char-cast branch (VM==native). The checker restricted the

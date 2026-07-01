@@ -541,19 +541,37 @@ fn type_method_call(mc: parser::MethodCall, env: Env, table: TypeTable) -> TExpr
     if is_flags_named(recv_t, table) { return error { message = "method typing is deferred (B.29 / M.4)" } }
     let struct_name = match recv_t { Named as n => n.name; _ => return error { message = "method typing is deferred (B.29 / M.4)" } }
     let decl = match type_table_find(table, struct_name) { parser::TypeDecl as td => td; error => return error { message = "method typing is deferred (B.29 / M.4)" } }
-    let sb = match decl.body { parser::StructBody as sb => sb; _ => return error { message = "method typing is deferred (B.29 / M.4)" } }
-    if sb.methods.len == 0 { return error { message = $"no such method '{mc.method}' on struct '{struct_name}'" } }
+    // (W10b.CLASS increment 1) a class's instance dot-call reuses this SAME desugar — only the
+    // methods list's source differs; a class's methods are otherwise typed exactly like a struct's.
+    let methods = match decl.body {
+        parser::StructBody as sb => sb.methods
+        parser::ClassBody as cb  => match effective_class_methods(cb, table) { []Function as f => f; error as e => return e }   // (W10b.CLASS increment 2) inherited methods are callable too
+        _ => return error { message = "method typing is deferred (B.29 / M.4)" }
+    }
+    if methods.len == 0 { return error { message = $"no such method '{mc.method}' on struct '{struct_name}'" } }
     mut mi: u64 = 0
     mut found = false
-    mut mfn = sb.methods[0]   // placeholder; overwritten below iff `found` (Teko has no uninitialized values)
+    mut mfn = methods[0]   // placeholder; overwritten below iff `found` (Teko has no uninitialized values)
     loop {
-        if mi >= sb.methods.len { break }
-        if sb.methods[mi].name == mc.method { found = true; mfn = sb.methods[mi]; break }
+        if mi >= methods.len { break }
+        if methods[mi].name == mc.method { found = true; mfn = methods[mi]; break }
         mi++
     }
     if !found { return error { message = $"no such method '{mc.method}' on struct '{struct_name}'" } }
     let is_instance = mfn.params.len > 0 && !mfn.params[0].has_type
     if !is_instance { return error { message = $"'{mc.method}' is a static method — call it as {struct_name}::{mc.method}(…)" } }
+    // (W10b.CLASS residual — intern visibility) a private (default) method is reachable only
+    // from its OWN declaring class's code, or — if `intern` — a subclass's too. Struct methods
+    // stay all-public (W10b.0.A) — this check only fires for a ClassBody receiver.
+    match decl.body {
+        parser::ClassBody => {
+            let owner = match find_method_owner(struct_name, table, mc.method) { MemberOwner as mo => mo; error as e => return e }
+            if !member_accessible(owner, env.owner_type, table) {
+                return error { message = $"method '{mc.method}' is private to {owner.declaring_class}" }
+            }
+        }
+        _ => {}
+    }
     let seg_struct = parser::Segment { name = struct_name }
     let seg_method = parser::Segment { name = mc.method }
     mut segs: []parser::Segment = teko::list::push(teko::list::empty(), seg_struct)
@@ -605,6 +623,22 @@ fn type_call(c: parser::Call, env: Env, table: TypeTable) -> TExpr | error {
     let ft = match lookup_call(env, c.callee) {                         // (#41) namespace-aware: a local or
         Type as t => t                                                 // a same-namespace fn (unqualified) / the qualified ns;
         error => match builtin_fn(name) { Type as t => t; error => return error { message = $"unknown function: {name}" } }   // …then the injected builtins; else name the symbol (M.3)
+    }
+    // (W10b.CLASS residual — intern visibility) a STATIC call (`ClassName::method(…)`) is
+    // reachable under the SAME rule as an instance dot-call — check it here too, routed through
+    // the resolved method namespace. `resolved_ns` names a real class only for a class(-static-
+    // or -instance-called-as-static) method; any other qualified/unqualified call (an ordinary
+    // namespaced function) leaves this a silent no-op (find_class_body errors → skipped).
+    if resolved_ns != "" {
+        match find_class_body(class_name_from_method_ns(resolved_ns), table) {
+            parser::ClassBody => {
+                let owner = match find_method_owner(class_name_from_method_ns(resolved_ns), table, name) { MemberOwner as mo => mo; error as e => return e }
+                if !member_accessible(owner, env.owner_type, table) {
+                    return error { message = $"method '{name}' is private to {owner.declaring_class}" }
+                }
+            }
+            error => {}
+        }
     }
     match ft {
         Func as f => {
@@ -921,11 +955,11 @@ fn type_cast(c: parser::Cast, env: Env, table: TypeTable) -> TExpr | error {
 // `Named` type to its `TypeDecl` body and read the field's declared type. Receiver must be a struct.
 
 // find a field by name in a struct body and resolve its annotation (M.3 — exact).
-fn field_type(sb: parser::StructBody, field: str, table: TypeTable) -> Type | error {
+fn field_type(fields: []parser::Field, field: str, table: TypeTable) -> Type | error {
     mut i = 0
     loop {
-        if i >= sb.fields.len { break }
-        if sb.fields[i].name == field { return resolve_type(sb.fields[i].type_ann, table) }
+        if i >= fields.len { break }
+        if fields[i].name == field { return resolve_type(fields[i].type_ann, table) }
         i++
     }
     error { message = $"no such field: {field}" }
@@ -972,7 +1006,17 @@ fn type_field_access(fa: parser::FieldAccess, env: Env, table: TypeTable) -> TEx
         error          => return error { message = $"unknown type for field access: {name}" }
     }
     let ft = match decl.body {
-        parser::StructBody as sb => match field_type(sb, fa.field, table) { Type as t => t; error as e => return e }
+        parser::StructBody as sb => match field_type(sb.fields, fa.field, table) { Type as t => t; error as e => return e }
+        parser::ClassBody as cb  => {
+            let t = match effective_class_fields(cb, table) { []Field as fs => match field_type(fs, fa.field, table) { Type as t => t; error as e => return e }; error as e => return e }   // (W10b.CLASS increment 2)
+            // (W10b.CLASS residual — intern visibility) a private (default) field is reachable
+            // only from its OWN declaring class's code, or — if `intern` — a subclass's too.
+            let owner = match find_field_owner(name, table, fa.field) { MemberOwner as mo => mo; error as e => return e }
+            if !member_accessible(owner, env.owner_type, table) {
+                return error { message = $"field '{fa.field}' is private to {owner.declaring_class}" }
+            }
+            t
+        }
         _                => return error { message = $"type {name} is not a struct (no fields)" }
     }
     TExpr { kind = TFieldAccess { receiver = recv; field = fa.field }; type = ft; line = 0; col = 0 }
@@ -996,7 +1040,15 @@ fn type_safe_field_access(sfa: parser::SafeFieldAccess, env: Env, table: TypeTab
         error          => return error { message = $"unknown type for safe field access: {name}" }
     }
     let ft = match decl.body {
-        parser::StructBody as sb => match field_type(sb, sfa.field, table) { Type as t => t; error as e => return e }
+        parser::StructBody as sb => match field_type(sb.fields, sfa.field, table) { Type as t => t; error as e => return e }
+        parser::ClassBody as cb  => {
+            let t = match effective_class_fields(cb, table) { []Field as fs => match field_type(fs, sfa.field, table) { Type as t => t; error as e => return e }; error as e => return e }   // (W10b.CLASS increment 2)
+            let owner = match find_field_owner(name, table, sfa.field) { MemberOwner as mo => mo; error as e => return e }
+            if !member_accessible(owner, env.owner_type, table) {
+                return error { message = $"field '{sfa.field}' is private to {owner.declaring_class}" }
+            }
+            t
+        }
         _                => return error { message = $"type {name} is not a struct (no fields)" }
     }
     // the result is `(field)?` — an already-optional field stays as-is (no double-wrap).
@@ -1101,18 +1153,27 @@ fn type_struct_lit(sl: parser::StructLit, expected: Type, env: Env, table: TypeT
         }
         name = mname
     }
-    let sb = match decl.body {
-        parser::StructBody as s => s
+    // (W10b.CLASS) `Name { … }` also constructs a class instance — a class's fields are typed
+    // identically to a struct's (increment 2: the EFFECTIVE, base-inherited fields too). An
+    // `abstract` class cannot be instantiated directly (only a concrete subclass may be — it is
+    // final, incomplete-by-design). The "who may construct me" restriction (a class's literal
+    // legal only inside its own static factory) is a LATER increment, not enforced yet.
+    let sb_fields = match decl.body {
+        parser::StructBody as s => s.fields
+        parser::ClassBody as c  => {
+            match c.kind { ClassKind::Abstract => return error { message = $"`{name}` is abstract and cannot be instantiated directly" }; _ => {} }
+            match effective_class_fields(c, table) { []Field as fs => fs; error as e => return e }
+        }
         _               => return error { message = $"struct-literal target {name} is not a struct" }
     }
-    if sl.field_names.len != sb.fields.len { return error { message = "a struct literal must set exactly the declared fields (count mismatch)" } }
+    if sl.field_names.len != sb_fields.len { return error { message = "a struct literal must set exactly the declared fields (count mismatch)" } }
 
     mut names: []str = teko::list::empty()
     mut vals: []TExpr = teko::list::empty()
     mut d = 0
     loop {
-        if d >= sb.fields.len { break }
-        let fname = sb.fields[d].name
+        if d >= sb_fields.len { break }
+        let fname = sb_fields[d].name
         // locate the provided value for this declared field (count its hits for missing/dup checks).
         mut found = sl.field_names.len
         mut hits = 0
@@ -1124,7 +1185,7 @@ fn type_struct_lit(sl: parser::StructLit, expected: Type, env: Env, table: TypeT
         }
         if hits == 0 { return error { message = "a struct literal is missing a declared field" } }
         if hits > 1 { return error { message = "a struct literal sets a field more than once" } }
-        let ft = match resolve_type(sb.fields[d].type_ann, table) { Type as t => t; error as e => return e }
+        let ft = match resolve_type(sb_fields[d].type_ann, table) { Type as t => t; error as e => return e }
         // thread the field's type as EXPECTED so a nested generic constructor (`value = Box { … }`)
         // targets its concrete instance (S4). Non-struct-lit values type exactly as before.
         mut val = match type_value_expected(sl.field_vals[found], ft, env, table) { TExpr as te => te; error as e => return e }
@@ -2112,10 +2173,22 @@ fn teko_rt_type_ok(t: Type) -> bool {
 // (OOP A1, 2026-07-01) type-check a struct METHOD's BODY. Mirrors type_function, except the
 // RECEIVER param (has_type=false, only ever index 0) binds to Named{struct_name} instead of
 // going through resolve_type (its type is implicit, never written by the user).
-fn type_method(f: parser::Function, struct_name: str, env: Env, table: TypeTable) -> TFunction | error {
-    mut local = env
+fn type_method(f: parser::Function, struct_name: str, env: Env, table: TypeTable, has_base_binding: bool, base_binding_name: str, base_name: str, declaring_class: str) -> TFunction | error {
+    // (W10b.CLASS residual — intern visibility) this body's OWN field/method accesses are
+    // checked against `declaring_class` (see type_struct_methods's own comment on why this can
+    // differ from `struct_name`), NOT `struct_name` — set before typing the body below.
+    mut local = with_owner(env, declaring_class)
     let tbl = type_param_table(f.type_params, "", table)
     let is_teko_rt = f.is_extern && f.from_lib == "teko_rt"
+    // (W10b.CLASS) `class Base(parent) { … }` — the NAMED BINDING an instance method uses to
+    // reach the base object. Only meaningful for an INSTANCE method (has a receiver); a class's
+    // static methods never chain/inherit, so there is no base object to bind there. The binding
+    // is a REINTERPRET of the SAME receiver pointer as the base type — sound because
+    // effective_class_fields lays out the base's fields as a PREFIX of the derived struct
+    // (field-flattening composition, increment 2), so a `tk_t_Derived *` and a `tk_t_Base *`
+    // pointing at the SAME address read identical bytes for every base field.
+    let is_instance_method = f.params.len > 0 && !f.params[0].has_type
+    let inject_base_binding = has_base_binding && is_instance_method
     // codegen reads TFunction.params[i].type_ann DIRECTLY (the syntactic node, not the checked
     // Type) to emit a C signature — so the receiver's placeholder type_ann (no_type(), from
     // parsing) must be REWRITTEN to a real Named(struct_name) TypeExpr before it ever reaches
@@ -2149,6 +2222,7 @@ fn type_method(f: parser::Function, struct_name: str, env: Env, table: TypeTable
         local = define(local, f.params[i].name, pt, false)
         i++
     }
+    if inject_base_binding { local = define(local, base_binding_name, Named { name = base_name }, false) }
     let ret = match function_return(f, tbl) { Type as t => t; error as e => return e }
     match ret { Reference => return error { message = "a function cannot return a reference (pass-down only)" }; _ => {} }
     if f.is_extern {
@@ -2168,7 +2242,28 @@ fn type_method(f: parser::Function, struct_name: str, env: Env, table: TypeTable
     match check_trailing_value(tb.stmts, ret, table) { null => {}; error as e => return e }
     let lc = check_labels(tb.stmts, teko::list::empty(), false, teko::list::empty())
     if lc.failed { return error { message = lc.message } }
-    TFunction { name = f.name; type_params = f.type_params; type_constraints = f.type_constraints; params = fixed_params; return_type = ret; body = tb.stmts; vis = f.vis; has_doc = f.has_doc; doc = f.doc; namespace = ""; file = ""; line = 0; col = 0; is_test = f.is_test; is_extern = false; c_symbol = ""; from_lib = "" }
+    // (W10b.CLASS) PREPEND the base-binding as the method body's FIRST statement (a synthetic
+    // `let <binding> = (<self> to <Base>)` — a plain reinterpret-cast the checker's own `to`
+    // syntax would never allow between two unrelated Named types, but this node bypasses that
+    // source-level restriction entirely; codegen's cast fallback just emits the C pointer cast).
+    // Checked ABOVE the injection (check_returns/check_trailing_value/check_labels all read the
+    // ORIGINAL body) since it changes nothing about return/trailing-value/label semantics.
+    let body = if inject_base_binding {
+        let receiver_name = f.params[0].name
+        let cast_val = TExpr {
+            kind = TCast { expr = TExpr { kind = TVar { name = receiver_name; is_func = false; func_ns = "" }; type = Named { name = struct_name }; line = 0; col = 0 } }
+            type = Named { name = base_name }
+            line = 0; col = 0
+        }
+        let bind_stmt = TBinding { kind = parser::BindKind::Let; target = parser::SimpleName { name = base_binding_name }; bound = Named { name = base_name }; value = cast_val }
+        mut prefixed: []TStatement = teko::list::push(teko::list::empty(), bind_stmt)
+        mut si = 0
+        loop { if si >= tb.stmts.len { break }; prefixed = teko::list::push(prefixed, tb.stmts[si]); si++ }
+        prefixed
+    } else {
+        tb.stmts
+    }
+    TFunction { name = f.name; type_params = f.type_params; type_constraints = f.type_constraints; params = fixed_params; return_type = ret; body = body; vis = f.vis; has_doc = f.has_doc; doc = f.doc; namespace = ""; file = ""; line = 0; col = 0; is_test = f.is_test; is_extern = false; c_symbol = ""; from_lib = "" }
 }
 
 fn type_function(f: parser::Function, env: Env, table: TypeTable) -> TFunction | error {
@@ -2225,23 +2320,60 @@ fn type_function(f: parser::Function, env: Env, table: TypeTable) -> TFunction |
 // from both type_program and type_program_with_deps' main loops, alongside the ordinary
 // TypeDecl pass-through — a struct with methods contributes MULTIPLE TItems, not one.
 fn type_struct_methods(td: parser::TypeDecl, item_ns: str, file: str, env: Env, table: TypeTable) -> []TItem | error {
-    mut out: []TItem = teko::list::empty()
+    // (W10b.CLASS) a class's methods are typed/stamped by this SAME pass — only the methods
+    // list's source differs; a class method is otherwise identical to a struct method. Increment
+    // 2: stamps the EFFECTIVE (base-inherited + overridden) methods against THIS class's own
+    // name — an inherited-not-overridden method's body is re-typed/re-emitted per owning class
+    // (no vtable/dispatch yet). An `abstract fn` signature (no body, never overridden by THIS
+    // class) has nothing to emit — skipped.
+    mut methods: []parser::Function = teko::list::empty()
+    mut has_base_binding = false
+    mut base_binding_name = ""
+    mut base_name = ""
+    mut is_class = false
+    mut own_names: []str = teko::list::empty()   // (W10b.CLASS) methods declared DIRECTLY on td — the base-binding is only ever injected for these (see below)
     match td.body {
-        parser::StructBody as sb => {
-            let method_ns = if item_ns == "" { td.name } else { item_ns ~ "::" ~ td.name }
-            mut mi = 0
-            loop {
-                if mi >= sb.methods.len { break }
-                let mf = match type_method(sb.methods[mi], td.name, env, table) {
-                    TFunction as x => x
-                    error as e => return surface_at(file, sb.methods[mi].line, sb.methods[mi].col, e)
-                }
-                let stamped = TFunction { name = mf.name; type_params = mf.type_params; type_constraints = mf.type_constraints; params = mf.params; return_type = mf.return_type; body = mf.body; vis = mf.vis; has_doc = mf.has_doc; doc = mf.doc; namespace = method_ns; file = file; line = sb.methods[mi].line; col = sb.methods[mi].col; is_test = mf.is_test; is_extern = mf.is_extern; c_symbol = mf.c_symbol; from_lib = mf.from_lib }
-                out = teko::list::push(out, stamped)
-                mi++
-            }
+        parser::StructBody as sb => { methods = sb.methods }
+        parser::ClassBody as cb  => {
+            methods = match effective_class_methods(cb, table) { []Function as f => f; error as e => return e }
+            has_base_binding = cb.has_base_binding
+            base_binding_name = cb.base_binding_name
+            base_name = cb.base_name
+            is_class = true
+            mut oi = 0
+            loop { if oi >= cb.methods.len { break }; own_names = teko::list::push(own_names, cb.methods[oi].name); oi++ }
         }
         _ => {}
+    }
+    mut out: []TItem = teko::list::empty()
+    let method_ns = if item_ns == "" { td.name } else { item_ns ~ "::" ~ td.name }
+    mut mi = 0
+    loop {
+        if mi >= methods.len { break }
+        if methods[mi].is_abstract { mi++; continue }
+        // (W10b.CLASS) the base-binding is injected ONLY for a method DECLARED DIRECTLY on THIS
+        // class (own or an override) — a PURELY inherited method (never touched by this class)
+        // keeps its ORIGINAL declaring class's own context; re-typing it under a DIFFERENT
+        // derived class must NOT inject a binding that method's body never asked for (it would
+        // either be spuriously unused, or — worse — silently shadow an ancestor's OWN binding of
+        // the same name in a 3+-level chain).
+        let use_base_binding = has_base_binding && str_set_has(own_names, methods[mi].name)
+        // (W10b.CLASS residual — intern visibility) the ACCESSOR context for THIS method body's
+        // OWN field/method accesses: the class that ORIGINALLY DECLARED it (itself, if own/an
+        // override; the ancestor that declared it, if purely inherited) — NEVER td.name when the
+        // two differ, for the exact same reason as the base-binding fix above.
+        let declaring_class = if is_class {
+            match find_method_owner(td.name, table, methods[mi].name) { MemberOwner as mo => mo.declaring_class; error => td.name }
+        } else {
+            td.name
+        }
+        let mf = match type_method(methods[mi], td.name, env, table, use_base_binding, base_binding_name, base_name, declaring_class) {
+            TFunction as x => x
+            error as e => return surface_at(file, methods[mi].line, methods[mi].col, e)
+        }
+        let stamped = TFunction { name = mf.name; type_params = mf.type_params; type_constraints = mf.type_constraints; params = mf.params; return_type = mf.return_type; body = mf.body; vis = mf.vis; has_doc = mf.has_doc; doc = mf.doc; namespace = method_ns; file = file; line = methods[mi].line; col = methods[mi].col; is_test = mf.is_test; is_extern = mf.is_extern; c_symbol = mf.c_symbol; from_lib = mf.from_lib }
+        out = teko::list::push(out, stamped)
+        mi++
     }
     out
 }

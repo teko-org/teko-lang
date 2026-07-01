@@ -119,6 +119,156 @@ tk_type_table tk_type_table_of(tk_tprogram prog) {
     return table;
 }
 
+// (W10b.CLASS increment 2) look up a class's own tk_class_body by name (mirror of
+// collect.tks::find_class_body). ok=false carries the error.
+tk_classbody_result tk_find_class_body(tk_str name, tk_type_table table) {
+    tk_decl_result decl = tk_type_table_find(table, name);
+    if (!decl.ok) return (tk_classbody_result){ .ok = false, .as.error = tk_error_named("unknown base class", name) };
+    if (decl.as.value.body.tag != TK_BODY_CLASS) return (tk_classbody_result){ .ok = false, .as.error = tk_error_named("is not a class", name) };
+    return (tk_classbody_result){ .ok = true, .as.value = decl.as.value.body.as.class_body };
+}
+
+// (W10b.CLASS increment 2) a class's EFFECTIVE fields: the base's effective fields (recursively)
+// followed by its own. Mirror of collect.tks::effective_class_fields.
+tk_fieldsvec_result tk_effective_class_fields(tk_class_body cb, tk_type_table table) {
+    tk_field *base = NULL; size_t n_base = 0;
+    if (cb.has_base) {
+        tk_classbody_result base_cb = tk_find_class_body(cb.base_name, table);
+        if (!base_cb.ok) return (tk_fieldsvec_result){ .ok = false, .as.error = base_cb.as.error };
+        tk_fieldsvec_result r = tk_effective_class_fields(base_cb.as.value, table);
+        if (!r.ok) return r;
+        base = r.as.value.ptr; n_base = r.as.value.len;
+    }
+    tk_field *out = NULL; size_t n_out = 0;
+    for (size_t i = 0; i < n_base; i += 1) tk_fields_push(&out, &n_out, base[i]);
+    for (size_t i = 0; i < cb.n_fields; i += 1) tk_fields_push(&out, &n_out, cb.fields[i]);
+    return (tk_fieldsvec_result){ .ok = true, .as.value = { .ptr = out, .len = n_out } };
+}
+
+// (W10b.CLASS increment 2) a class's EFFECTIVE methods: the base's effective methods
+// (recursively), each REPLACED by an `override` of the same name if this class declares one,
+// plus this class's own NEW methods appended. Mirror of collect.tks::effective_class_methods.
+tk_methodsvec_result tk_effective_class_methods(tk_class_body cb, tk_type_table table) {
+    tk_function *base = NULL; size_t n_base = 0;
+    if (cb.has_base) {
+        tk_classbody_result base_cb = tk_find_class_body(cb.base_name, table);
+        if (!base_cb.ok) return (tk_methodsvec_result){ .ok = false, .as.error = base_cb.as.error };
+        tk_methodsvec_result r = tk_effective_class_methods(base_cb.as.value, table);
+        if (!r.ok) return r;
+        base = r.as.value.ptr; n_base = r.as.value.len;
+    }
+    tk_function *out = NULL; size_t n_out = 0;
+    for (size_t i = 0; i < n_base; i += 1) {
+        tk_function m = base[i];
+        for (size_t j = 0; j < cb.n_methods; j += 1) {
+            if (tk_str_eq(cb.methods[j].name, m.name)) { m = cb.methods[j]; break; }
+        }
+        tk_functions_push(&out, &n_out, m);
+    }
+    for (size_t k = 0; k < cb.n_methods; k += 1) {
+        bool is_new = true;
+        for (size_t bi = 0; bi < n_base; bi += 1) {
+            if (tk_str_eq(base[bi].name, cb.methods[k].name)) { is_new = false; break; }
+        }
+        if (is_new) tk_functions_push(&out, &n_out, cb.methods[k]);
+    }
+    return (tk_methodsvec_result){ .ok = true, .as.value = { .ptr = out, .len = n_out } };
+}
+
+// (W10b.CLASS residual — intern visibility) is `class_name` the same as, or a (transitive)
+// SUBCLASS of, `ancestor_name`? Mirror of collect.tks::is_subclass_of.
+bool tk_is_subclass_of(tk_str class_name, tk_str ancestor_name, tk_type_table table) {
+    if (tk_str_eq(class_name, ancestor_name)) return true;
+    tk_classbody_result cb = tk_find_class_body(class_name, table);
+    if (!cb.ok) return false;
+    if (!cb.as.value.has_base) return false;
+    return tk_is_subclass_of(cb.as.value.base_name, ancestor_name, table);
+}
+
+// (W10b.CLASS residual — intern visibility) find field/method declaring class + reach, walking
+// `class_name`'s own members first, then its base chain. Mirror of
+// collect.tks::find_field_owner / find_method_owner.
+tk_member_owner_result tk_find_field_owner(tk_str class_name, tk_type_table table, tk_str field_name) {
+    tk_classbody_result cb = tk_find_class_body(class_name, table);
+    if (!cb.ok) return (tk_member_owner_result){ .ok = false, .as.error = cb.as.error };
+    for (size_t i = 0; i < cb.as.value.n_fields; i += 1) {
+        if (tk_str_eq(cb.as.value.fields[i].name, field_name)) {
+            tk_member_owner mo = { .declaring_class = class_name, .vis = cb.as.value.fields[i].vis, .is_intern = cb.as.value.fields[i].is_intern };
+            return (tk_member_owner_result){ .ok = true, .as.value = mo };
+        }
+    }
+    if (cb.as.value.has_base) return tk_find_field_owner(cb.as.value.base_name, table, field_name);
+    return (tk_member_owner_result){ .ok = false, .as.error = tk_error_named("internal: field not found in class chain", field_name) };
+}
+tk_member_owner_result tk_find_method_owner(tk_str class_name, tk_type_table table, tk_str method_name) {
+    tk_classbody_result cb = tk_find_class_body(class_name, table);
+    if (!cb.ok) return (tk_member_owner_result){ .ok = false, .as.error = cb.as.error };
+    for (size_t i = 0; i < cb.as.value.n_methods; i += 1) {
+        if (tk_str_eq(cb.as.value.methods[i].name, method_name)) {
+            tk_member_owner mo = { .declaring_class = class_name, .vis = cb.as.value.methods[i].vis, .is_intern = cb.as.value.methods[i].is_intern };
+            return (tk_member_owner_result){ .ok = true, .as.value = mo };
+        }
+    }
+    if (cb.as.value.has_base) return tk_find_method_owner(cb.as.value.base_name, table, method_name);
+    return (tk_member_owner_result){ .ok = false, .as.error = tk_error_named("internal: method not found in class chain", method_name) };
+}
+
+// (W10b.CLASS residual — intern visibility) is `owner`'s member reachable from code whose OWN
+// declaring class is `accessor_type` (empty — not inside any class method)? Mirror of
+// collect.tks::member_accessible.
+bool tk_member_accessible(tk_member_owner owner, tk_str accessor_type, tk_type_table table) {
+    if (owner.vis == TK_VIS_PUB || owner.vis == TK_VIS_EXP) return true;
+    // TK_VIS_PRIVATE (the class default)
+    if (accessor_type.len == 0) return false;
+    if (tk_str_eq(accessor_type, owner.declaring_class)) return true;
+    if (owner.is_intern) return tk_is_subclass_of(accessor_type, owner.declaring_class, table);
+    return false;
+}
+
+// (W10b.CLASS residual — intern visibility) recover the bare CLASS NAME from a method's
+// registered pseudo-namespace ("<owning-ns>::<ClassName>", or bare "<ClassName>" at the top
+// level — collect.c's method_ns convention) — the class name is always the LAST "::"-segment.
+// Mirror of collect.tks::class_name_from_method_ns.
+tk_str tk_class_name_from_method_ns(tk_str ns) {
+    size_t cut = 0;
+    for (size_t i = 0; i + 1 < ns.len; i += 1)
+        if (ns.ptr[i] == ':' && ns.ptr[i + 1] == ':') cut = i + 2;
+    return (tk_str){ ns.ptr + cut, ns.len - cut };
+}
+
+// (W10b.CLASS increment 2) validate ONE class's inheritance/override declarations. Mirror of
+// collect.tks::validate_class_decl.
+static tk_type_result validate_class_decl(tk_class_body cb, tk_type_table table) {
+    if (cb.has_base) {
+        tk_decl_result base_decl = tk_type_table_find(table, cb.base_name);
+        if (!base_decl.ok) return (tk_type_result){ .ok = false, .as.error = tk_error_named("unknown base class", cb.base_name) };
+        if (base_decl.as.value.body.tag != TK_BODY_CLASS) return (tk_type_result){ .ok = false, .as.error = tk_error_named("is not a class", cb.base_name) };
+        if (base_decl.as.value.body.as.class_body.kind == TK_CLASS_SEALED)
+            return (tk_type_result){ .ok = false, .as.error = tk_error_named("cannot inherit from a sealed class (only abstract/virtual classes can be a base)", cb.base_name) };
+    }
+    tk_function *base_methods = NULL; size_t n_base_methods = 0;
+    if (cb.has_base) {
+        tk_classbody_result base_cb = tk_find_class_body(cb.base_name, table);
+        if (!base_cb.ok) return (tk_type_result){ .ok = false, .as.error = base_cb.as.error };
+        tk_methodsvec_result r = tk_effective_class_methods(base_cb.as.value, table);
+        if (!r.ok) return (tk_type_result){ .ok = false, .as.error = r.as.error };
+        base_methods = r.as.value.ptr; n_base_methods = r.as.value.len;
+    }
+    for (size_t i = 0; i < cb.n_methods; i += 1) {
+        tk_function m = cb.methods[i];
+        if (!m.is_override) continue;
+        bool found = false; tk_function bm = {0};
+        for (size_t j = 0; j < n_base_methods; j += 1) {
+            if (tk_str_eq(base_methods[j].name, m.name)) { found = true; bm = base_methods[j]; break; }
+        }
+        if (!found) return (tk_type_result){ .ok = false, .as.error = tk_error_named("has no matching base method to override", m.name) };
+        bool overridable = bm.is_abstract || bm.is_virtual || bm.is_override;
+        if (!overridable) return (tk_type_result){ .ok = false, .as.error = tk_error_named("overrides a base method that is not abstract/virtual", m.name) };
+        if (bm.nparams != m.nparams) return (tk_type_result){ .ok = false, .as.error = tk_error_named("override must have the same parameter count as the base method", m.name) };
+    }
+    return (tk_type_result){ .ok = true };
+}
+
 // (MEM Step 0, R4) ESCAPE GATE — a reference cannot be a struct FIELD, variant member, slice
 // element, or alias target. tk_resolve_type already rejects a Reference inside a slice/optional/
 // union (R4 there), so this catches the BARE-position cases: `struct { f: Ref<i64> }` and a
@@ -144,6 +294,15 @@ static tk_type_result validate_type_decls(tk_type_table table) {
             if (!r.ok) return r;
             if (r.as.value.tag == TK_TYPE_REF)
                 return (tk_type_result){ .ok = false, .as.error = tk_error_make("a reference cannot be stored in a struct/variant/collection") };
+        } else if (body.tag == TK_BODY_CLASS) {   // (W10b.CLASS) same R4 escape-gate as a struct's fields
+            for (size_t f = 0; f < body.as.class_body.n_fields; f += 1) {
+                tk_type_result r = tk_resolve_type(body.as.class_body.fields[f].type_ann, tbl);
+                if (!r.ok) return r;
+                if (r.as.value.tag == TK_TYPE_REF)
+                    return (tk_type_result){ .ok = false, .as.error = tk_error_make("a reference cannot be stored in a struct/variant/collection") };
+            }
+            tk_type_result vr = validate_class_decl(body.as.class_body, table);   // (W10b.CLASS increment 2)
+            if (!vr.ok) return vr;
         }
     }
     return (tk_type_result){ .ok = true };
@@ -170,6 +329,22 @@ tk_collected_result tk_collect(tk_program program) {
             tk_str method_ns = owning_ns.len == 0 ? td.name : collect_str_concat(collect_str_concat(owning_ns, (tk_str){ .ptr = (const tk_byte *)"::", .len = 2 }), td.name);
             for (size_t mi = 0; mi < td.body.as.struct_body.n_methods; mi += 1) {
                 tk_function mf = td.body.as.struct_body.methods[mi];
+                tk_type_result mft = method_func_type(mf, td.name, table);
+                if (!mft.ok) return (tk_collected_result){ .ok = false, .as.error = mft.as.error };
+                env = tk_env_define_fn(env, mf.name, mft.as.value, method_ns);
+            }
+        } else if (program.items[i].tag == TK_ITEM_TYPE_DECL && program.items[i].as.type_decl.body.tag == TK_BODY_CLASS) {
+            // (W10b.CLASS) same registration as a struct method — the receiver is still
+            // Named{class_name} (by-value); a Ref<T> receiver is a later increment. Registers the
+            // EFFECTIVE (base-inherited + own/overridden) methods (increment 2), so an
+            // inherited-but-not-overridden method is callable as DerivedClass::method(…) too.
+            tk_type_decl td = program.items[i].as.type_decl;
+            tk_str owning_ns = program.items[i].namespace;
+            tk_str method_ns = owning_ns.len == 0 ? td.name : collect_str_concat(collect_str_concat(owning_ns, (tk_str){ .ptr = (const tk_byte *)"::", .len = 2 }), td.name);
+            tk_methodsvec_result eff = tk_effective_class_methods(td.body.as.class_body, table);
+            if (!eff.ok) return (tk_collected_result){ .ok = false, .as.error = eff.as.error };
+            for (size_t mi = 0; mi < eff.as.value.len; mi += 1) {
+                tk_function mf = eff.as.value.ptr[mi];
                 tk_type_result mft = method_func_type(mf, td.name, table);
                 if (!mft.ok) return (tk_collected_result){ .ok = false, .as.error = mft.as.error };
                 env = tk_env_define_fn(env, mf.name, mft.as.value, method_ns);
@@ -213,6 +388,20 @@ tk_collected_result tk_collect_with_seed(tk_program program, tk_collected seed) 
             tk_str method_ns = owning_ns.len == 0 ? td.name : collect_str_concat(collect_str_concat(owning_ns, (tk_str){ .ptr = (const tk_byte *)"::", .len = 2 }), td.name);
             for (size_t mi = 0; mi < td.body.as.struct_body.n_methods; mi += 1) {
                 tk_function mf = td.body.as.struct_body.methods[mi];
+                tk_type_result mft = method_func_type(mf, td.name, table);
+                if (!mft.ok) return (tk_collected_result){ .ok = false, .as.error = mft.as.error };
+                env = tk_env_define_fn(env, mf.name, mft.as.value, method_ns);
+            }
+        } else if (program.items[i].tag == TK_ITEM_TYPE_DECL && program.items[i].as.type_decl.body.tag == TK_BODY_CLASS) {
+            // (W10b.CLASS) mirrors tk_collect's class-method registration (increment 2: registers
+            // the EFFECTIVE, base-inherited methods too)
+            tk_type_decl td = program.items[i].as.type_decl;
+            tk_str owning_ns = program.items[i].namespace;
+            tk_str method_ns = owning_ns.len == 0 ? td.name : collect_str_concat(collect_str_concat(owning_ns, (tk_str){ .ptr = (const tk_byte *)"::", .len = 2 }), td.name);
+            tk_methodsvec_result eff = tk_effective_class_methods(td.body.as.class_body, table);
+            if (!eff.ok) return (tk_collected_result){ .ok = false, .as.error = eff.as.error };
+            for (size_t mi = 0; mi < eff.as.value.len; mi += 1) {
+                tk_function mf = eff.as.value.ptr[mi];
                 tk_type_result mft = method_func_type(mf, td.name, table);
                 if (!mft.ok) return (tk_collected_result){ .ok = false, .as.error = mft.as.error };
                 env = tk_env_define_fn(env, mf.name, mft.as.value, method_ns);
