@@ -62,18 +62,59 @@ fn parse_params(tokens: []lexer::Token, pos: u64) -> ParsedList<Param> | error {
     ParsedList<Param> { items = params; next = p + 1 }
 }
 
+// (W11/S6, 2026-07-01) `<T: A & B | C>` — a constraint ATOM: a bare nominal name (a
+// variant/struct the type-param must nominally belong to). Never `?`/null/void (a
+// constraint targets a concrete nominal type, matching the `<T?>` ban below).
+fn parse_constraint_atom(tokens: []lexer::Token, pos: u64) -> Parsed<ConstraintExpr> | error {
+    if !is_kind_at(tokens, pos, lexer::TokenKind::Ident) {
+        return err_at(tokens, pos, "expected a constraint name (a nominal variant/struct) in a type-parameter constraint")
+    }
+    let name = tokens[pos].text
+    mut p = pos + 1
+    if is_kind_at(tokens, p, lexer::TokenKind::Question) {
+        return err_at(tokens, p, "a nullability `?` is not allowed on a constraint atom — a constraint targets a concrete nominal type")
+    }
+    Parsed<ConstraintExpr> { node = ConstraintAtom { name = name }; next = p }
+}
+// `&`-term: one or more atoms joined by `&` (AND), left-associative.
+fn parse_constraint_and(tokens: []lexer::Token, pos: u64) -> Parsed<ConstraintExpr> | error {
+    mut left = match parse_constraint_atom(tokens, pos) { Parsed<ConstraintExpr> as x => x; error as e => return e }
+    loop {
+        if !is_kind_at(tokens, left.next, lexer::TokenKind::Amp) { break }
+        let right = match parse_constraint_atom(tokens, left.next + 1) { Parsed<ConstraintExpr> as x => x; error as e => return e }
+        left = Parsed<ConstraintExpr> { node = ConstraintAnd { left = left.node; right = right.node }; next = right.next }
+    }
+    left
+}
+// `|`-chain over `&`-terms (so `&` binds tighter than `|`: `C1 & C2 | C3` = `(C1 & C2) | C3`),
+// left-associative. This is a DEDICATED grammar (2 precedence levels, boolean semantics),
+// distinct from parse_type's `|` (a type UNION) — reusing that grammar would conflate two
+// different meanings of the same token under different AST targets.
+fn parse_constraint_expr(tokens: []lexer::Token, pos: u64) -> Parsed<ConstraintExpr> | error {
+    mut left = match parse_constraint_and(tokens, pos) { Parsed<ConstraintExpr> as x => x; error as e => return e }
+    loop {
+        if !is_kind_at(tokens, left.next, lexer::TokenKind::Pipe) { break }
+        let right = match parse_constraint_and(tokens, left.next + 1) { Parsed<ConstraintExpr> as x => x; error as e => return e }
+        left = Parsed<ConstraintExpr> { node = ConstraintOr { left = left.node; right = right.node }; next = right.next }
+    }
+    left
+}
+
 // `[doc] [pub|exp] fn name(params) -> ret { body }` (B.21, B.29). Doc + visibility optional
 // and precede `fn`; `-> ret` optional (absent = Unit). `pos` is at the doc, `pub`/`exp`, or `fn`.
 // (S4) An OPTIONAL generic type-parameter list `<T, U, …>` after a fn/type NAME. `pos` is at the
 // token AFTER the name. No `<` → empty list, pos unchanged. The decl-site `<` is UNAMBIGUOUS: the
 // `fn`/`type` keyword already committed the parse to a decl, so it is never a comparison. A decl
 // list never nests, so it closes with a single `>` (no `>>` split — that is parse_type_args' job).
-fn parse_type_params(tokens: []lexer::Token, pos: u64) -> ParsedList<str> | error {
+// (W11/S6) each name may carry an OPTIONAL `: ConstraintExpr` — names/constraints stay PARALLEL
+// (NoConstraint{} filling an unconstrained slot), so every downstream reader indexes both by i.
+fn parse_type_params(tokens: []lexer::Token, pos: u64) -> ParsedTypeParams | error {
     if !is_kind_at(tokens, pos, lexer::TokenKind::Lt) {
-        return ParsedList<str> { items = teko::list::empty(); next = pos }
+        return ParsedTypeParams { names = teko::list::empty(); constraints = teko::list::empty(); next = pos }
     }
     mut p = pos + 1
     mut names: []str = teko::list::empty()
+    mut constraints: []ConstraintExpr = teko::list::empty()
     loop {
         if !is_kind_at(tokens, p, lexer::TokenKind::Ident) {
             return err_at(tokens, p, "expected a type-parameter name in '<…>'")
@@ -85,11 +126,18 @@ fn parse_type_params(tokens: []lexer::Token, pos: u64) -> ParsedList<str> | erro
         if is_kind_at(tokens, p, lexer::TokenKind::Question) {
             return err_at(tokens, p, "a nullability `?` is not allowed on a type parameter — use `T?` only in a parameter or return type")
         }
+        if is_kind_at(tokens, p, lexer::TokenKind::Colon) {
+            let c = match parse_constraint_expr(tokens, p + 1) { Parsed<ConstraintExpr> as x => x; error as e => return e }
+            constraints = teko::list::push(constraints, c.node)
+            p = c.next
+        } else {
+            constraints = teko::list::push(constraints, NoConstraint { })
+        }
         if is_kind_at(tokens, p, lexer::TokenKind::Comma) { p = p + 1 }
         else if is_kind_at(tokens, p, lexer::TokenKind::Gt) { p = p + 1; break }
         else { return err_at(tokens, p, "expected ',' or '>' in a type-parameter list") }
     }
-    ParsedList<str> { items = names; next = p }
+    ParsedTypeParams { names = names; constraints = constraints; next = p }
 }
 
 fn parse_function(tokens: []lexer::Token, pos: u64, is_test: bool, os_guard: str) -> Parsed<Decl> | error {
@@ -125,7 +173,7 @@ fn parse_function(tokens: []lexer::Token, pos: u64, is_test: bool, os_guard: str
     let name_line: u32 = tokens[p].line
     let name_col: u32 = tokens[p].col   // W-loc-2: the fn's source position
     p = p + 1
-    let tps = match parse_type_params(tokens, p) { ParsedList<str> as x => x; error as e => return e }   // (S4) `<T, …>`
+    let tps = match parse_type_params(tokens, p) { ParsedTypeParams as x => x; error as e => return e }   // (S4/W11) `<T, U: A & B, …>`
     p = tps.next
     if !is_kind_at(tokens, p, lexer::TokenKind::LParen) {
         return err_at(tokens, p, "expected '(' for the parameter list")
@@ -163,13 +211,13 @@ fn parse_function(tokens: []lexer::Token, pos: u64, is_test: bool, os_guard: str
             p = p + 1
         }
         let no_body: []Statement = teko::list::empty()
-        return Parsed<Decl> { node = Function { name = name; type_params = tps.items; params = params.items; has_return = has_return; return_type = return_type; body = no_body; vis = vis; has_doc = has_doc; doc = doc; line = name_line; col = name_col; is_test = is_test; is_extern = true; c_symbol = c_symbol; from_lib = from_lib; os_guard = os_guard }; next = p }
+        return Parsed<Decl> { node = Function { name = name; type_params = tps.names; type_constraints = tps.constraints; params = params.items; has_return = has_return; return_type = return_type; body = no_body; vis = vis; has_doc = has_doc; doc = doc; line = name_line; col = name_col; is_test = is_test; is_extern = true; c_symbol = c_symbol; from_lib = from_lib; os_guard = os_guard }; next = p }
     }
     if !is_kind_at(tokens, p, lexer::TokenKind::LBrace) {
         return err_at(tokens, p, "expected '{' for the function body")
     }
     let blk = match parse_block(tokens, p) { ParsedList<Statement> as x => x; error as e => return e }
-    Parsed<Decl> { node = Function { name = name; type_params = tps.items; params = params.items; has_return = has_return; return_type = return_type; body = blk.items; vis = vis; has_doc = has_doc; doc = doc; line = name_line; col = name_col; is_test = is_test; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = os_guard }; next = blk.next }
+    Parsed<Decl> { node = Function { name = name; type_params = tps.names; type_constraints = tps.constraints; params = params.items; has_return = has_return; return_type = return_type; body = blk.items; vis = vis; has_doc = has_doc; doc = doc; line = name_line; col = name_col; is_test = is_test; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = os_guard }; next = blk.next }
 }
 
 // `{ name: T; name: T; … }` — field list; `;`/newline separates; empty `{ }` allowed;
@@ -271,7 +319,7 @@ fn parse_flags_decl(tokens: []lexer::Token, pos: u64) -> Parsed<Decl> | error {
         return err_at(tokens, p, "expected '{' after the flags type name")
     }
     let ms = match parse_field_names(tokens, p) { ParsedList<str> as x => x; error as e => return e }
-    Parsed<Decl> { node = TypeDecl { name = name; type_params = teko::list::empty(); body = FlagsBody { members = ms.items; values = teko::list::empty() }; vis = vis; has_doc = has_doc; doc = doc; line = name_line; col = name_col }; next = ms.next }
+    Parsed<Decl> { node = TypeDecl { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = FlagsBody { members = ms.items; values = teko::list::empty() }; vis = vis; has_doc = has_doc; doc = doc; line = name_line; col = name_col }; next = ms.next }
 }
 
 // `[doc] [pub|exp] type Name = <body>` (B.13, nominal). Doc + visibility precede `type`.
@@ -309,17 +357,17 @@ fn parse_type_decl(tokens: []lexer::Token, pos: u64) -> Parsed<Decl> | error {
     let name_line: u32 = tokens[p].line
     let name_col: u32 = tokens[p].col   // W-loc-2: the type's source position
     p = p + 1
-    let tps = match parse_type_params(tokens, p) { ParsedList<str> as x => x; error as e => return e }   // (S4) `type Box<T> = …`
+    let tps = match parse_type_params(tokens, p) { ParsedTypeParams as x => x; error as e => return e }   // (S4/W11) `type Box<T: A & B> = …`
     p = tps.next
     if is_extern {
         // `extern type Name` — an OPAQUE foreign handle: no `= <body>`, lowers to `void *`.
-        return Parsed<Decl> { node = TypeDecl { name = name; type_params = tps.items; body = ExternBody { }; vis = vis; has_doc = has_doc; doc = doc; line = name_line; col = name_col }; next = p }
+        return Parsed<Decl> { node = TypeDecl { name = name; type_params = tps.names; type_constraints = tps.constraints; body = ExternBody { }; vis = vis; has_doc = has_doc; doc = doc; line = name_line; col = name_col }; next = p }
     }
     if !is_kind_at(tokens, p, lexer::TokenKind::Assign) {
         return err_at(tokens, p, "expected '=' in a type declaration")
     }
     let body = match parse_type_body(tokens, p + 1) { Parsed<TypeBody> as x => x; error as e => return e }
-    Parsed<Decl> { node = TypeDecl { name = name; type_params = tps.items; body = body.node; vis = vis; has_doc = has_doc; doc = doc; line = name_line; col = name_col }; next = body.next }
+    Parsed<Decl> { node = TypeDecl { name = name; type_params = tps.names; type_constraints = tps.constraints; body = body.node; vis = vis; has_doc = has_doc; doc = doc; line = name_line; col = name_col }; next = body.next }
 }
 
 // `parse_module` returns Parsed<Module> (an instance of the result.tks generic).

@@ -141,6 +141,7 @@ struct tk_tstatement {
 typedef struct {
     tk_str         name;
     tk_str        *type_params; size_t n_type_params;   // (S4) generic type-parameter names (0 for a non-generic fn); monomorphized before codegen
+    tk_constraint_expr *type_constraints;    // (W11/S6) PARALLEL to type_params — checked by the monomorph pass when a param is bound to a concrete type
     tk_param      *params; size_t nparams;   // immutable (B.21), carried unchanged
     tk_type        return_type;              // void when there is no `-> ret` (M.3)
     tk_tstatement *body;   size_t nbody;

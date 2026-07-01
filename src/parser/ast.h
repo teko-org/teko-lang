@@ -203,6 +203,23 @@ struct tk_statement {
     } as;
 };
 
+// (W11/S6, 2026-07-01) generic type-parameter CONSTRAINTS — `<T: A & B | C>`. A dedicated
+// boolean grammar over nominal atoms (& tighter than |), recursive so pointer-indirected
+// (mirrors tk_expr's own recursion). TK_CONSTRAINT_NONE is the sentinel for an unconstrained
+// type-param, so a Function/TypeDecl's type_constraints array stays PARALLEL to type_params
+// (same length; index i's entry governs type_params[i]) with no separate has-constraint flag.
+typedef struct tk_constraint_expr tk_constraint_expr;
+typedef enum { TK_CONSTRAINT_NONE, TK_CONSTRAINT_ATOM, TK_CONSTRAINT_AND, TK_CONSTRAINT_OR } tk_constraint_tag;
+struct tk_constraint_expr {
+    tk_constraint_tag tag;
+    union {
+        struct { tk_str name; } atom;                                   // TK_CONSTRAINT_ATOM — a nominal variant/struct name
+        struct { tk_constraint_expr *left, *right; } and_expr;           // TK_CONSTRAINT_AND — C1 & C2
+        struct { tk_constraint_expr *left, *right; } or_expr;            // TK_CONSTRAINT_OR — C1 | C2
+        // TK_CONSTRAINT_NONE carries no payload
+    } as;
+};
+
 // =========================================================================
 // Top-level items (parser/ast.tks: Param/Function/Field/StructBody/EnumBody/
 //   VariantBody/TypeBody/TypeDecl/UseDecl/Decl + File model from parse_file.tks)
@@ -220,6 +237,7 @@ typedef enum { TK_VIS_PRIVATE = 0, TK_VIS_PUB, TK_VIS_EXP } tk_visibility;
 typedef struct {                                                   // Function (parser/ast.tks)
     tk_str       name;
     tk_str      *type_params; size_t n_type_params;                 // generic type-parameter names (S4 — n_type_params 0 for a non-generic fn)
+    tk_constraint_expr *type_constraints;                           // (W11/S6) PARALLEL to type_params (same length as n_type_params)
     tk_param    *params; size_t nparams;
     bool         has_return;                                       // `-> ret` present? (absent = Unit)
     tk_type_expr return_type;                                      // valid iff has_return
@@ -253,6 +271,7 @@ typedef struct {                                                        // TypeB
 typedef struct {                                                        // TypeDecl (nominal — B.13)
     tk_str        name;
     tk_str       *type_params; size_t n_type_params;                     // generic type-parameter names (S4 — n_type_params 0 for a non-generic type)
+    tk_constraint_expr *type_constraints;                                // (W11/S6) PARALLEL to type_params (same length as n_type_params)
     tk_type_body  body;
     tk_visibility vis;                                                  // private (default) / pub / exp
     bool          has_doc;
@@ -322,8 +341,10 @@ void tk_types_push (tk_type_expr **xs, size_t *n, tk_type_expr item);
 void tk_terms_push (tk_cmp_term **xs,  size_t *n, tk_cmp_term  item);
 void tk_decls_push (tk_decl **xs,      size_t *n, tk_decl      item);
 void tk_uses_push  (tk_use_decl **xs,  size_t *n, tk_use_decl  item);
+void tk_constraints_push(tk_constraint_expr **xs, size_t *n, tk_constraint_expr item);   // (W11/S6)
 
 tk_expr      *tk_box_expr(tk_expr e);        // heap-box a tk_expr  (recursive children)
 tk_type_expr *tk_box_type(tk_type_expr t);   // heap-box a tk_type_expr ([]T element)
+tk_constraint_expr *tk_box_constraint(tk_constraint_expr c);   // (W11/S6) heap-box a tk_constraint_expr (recursive And/Or children)
 
 #endif // TK_PARSER_AST_H

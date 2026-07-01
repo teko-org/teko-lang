@@ -40,6 +40,7 @@ void tk_types_push (tk_type_expr **xs, size_t *n, tk_type_expr item) { TK_PUSH_B
 void tk_terms_push (tk_cmp_term **xs,  size_t *n, tk_cmp_term  item) { TK_PUSH_BODY(tk_cmp_term); }
 void tk_decls_push (tk_decl **xs,      size_t *n, tk_decl      item) { TK_PUSH_BODY(tk_decl); }
 void tk_uses_push  (tk_use_decl **xs,  size_t *n, tk_use_decl  item) { TK_PUSH_BODY(tk_use_decl); }
+void tk_constraints_push(tk_constraint_expr **xs, size_t *n, tk_constraint_expr item) { TK_PUSH_BODY(tk_constraint_expr); }   // (W11/S6)
 
 #undef TK_PUSH_BODY
 
@@ -56,5 +57,11 @@ tk_type_expr *tk_box_type(tk_type_expr t) {
     tk_type_expr *p = tk_alloc(sizeof(tk_type_expr));
     if (p == NULL) { abort(); }
     memcpy(p, &t, sizeof(tk_type_expr));
+    return p;
+}
+tk_constraint_expr *tk_box_constraint(tk_constraint_expr c) {   // (W11/S6)
+    tk_constraint_expr *p = tk_alloc(sizeof(tk_constraint_expr));
+    if (p == NULL) { abort(); }
+    memcpy(p, &c, sizeof(tk_constraint_expr));
     return p;
 }

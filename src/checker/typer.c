@@ -427,7 +427,7 @@ tk_tfunction_result tk_type_function(tk_function f, tk_env env, tk_type_table ta
         if (!ret_ok) {
             return (tk_tfunction_result){ .ok = false, .as.error = tk_error_make("an `extern` function return must be a primitive (int/float/bool), `byte`, `ptr`, `uptr`, an `extern type` handle, or absent (C7.1a)") };
         }
-        tk_tfunction ef = { .name = f.name, .type_params = f.type_params, .n_type_params = f.n_type_params, .params = f.params, .nparams = f.nparams,
+        tk_tfunction ef = { .name = f.name, .type_params = f.type_params, .n_type_params = f.n_type_params, .type_constraints = f.type_constraints, .params = f.params, .nparams = f.nparams,
                             .return_type = ret, .body = NULL, .nbody = 0,
                             .vis = f.vis, .has_doc = f.has_doc, .doc = f.doc, .is_test = f.is_test,
                             .is_extern = true, .c_symbol = f.c_symbol, .from_lib = f.from_lib };
@@ -442,7 +442,7 @@ tk_tfunction_result tk_type_function(tk_function f, tk_env env, tk_type_table ta
     { tk_str seen[TK_MAX_LABELS]; size_t nseen = 0;                                  // W5-cf-2: loop labels resolve + are unique
       const char *why = check_labels(tb.as.value.stmts, tb.as.value.n, NULL, false, seen, &nseen);
       if (why) return (tk_tfunction_result){ .ok = false, .as.error = tk_error_make(why) }; }
-    tk_tfunction tf = { .name = f.name, .type_params = f.type_params, .n_type_params = f.n_type_params, .params = f.params, .nparams = f.nparams,
+    tk_tfunction tf = { .name = f.name, .type_params = f.type_params, .n_type_params = f.n_type_params, .type_constraints = f.type_constraints, .params = f.params, .nparams = f.nparams,
                         .return_type = ret, .body = tb.as.value.stmts, .nbody = tb.as.value.n,
                         .vis = f.vis, .has_doc = f.has_doc, .doc = f.doc, .is_test = f.is_test };
     return (tk_tfunction_result){ .ok = true, .as.value = tf };

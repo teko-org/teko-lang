@@ -77,31 +77,83 @@ static tk_parsed_params_result parse_params(const tk_token *t, size_t n, size_t 
     return (tk_parsed_params_result){ .ok = true, .as.value = { .items = params, .n_params = np, .next = p + 1 } };
 }
 
-// (S4) An OPTIONAL generic type-parameter list `<T, U, …>` after a fn/type NAME (parse_decl.tks
-// twin). No `<` → empty list, pos unchanged. Decl-site `<` is unambiguous (the `fn`/`type` keyword
-// already committed the parse to a decl); a decl list never nests, so it closes with a single `>`.
-static tk_parsed_names_result parse_type_params(const tk_token *t, size_t n, size_t pos) {
+// (W11/S6, 2026-07-01) `<T: A & B | C>` constraint grammar (parse_decl.tks twin). A dedicated
+// boolean grammar (& tighter than |), distinct from parse_type's `|` (a type UNION).
+typedef struct { bool ok; tk_constraint_expr node; size_t next; tk_error error; } tk_parsed_constraint;
+static tk_parsed_constraint parse_constraint_atom(const tk_token *t, size_t n, size_t pos) {
+    if (!tk_is_kind_at(t, n, pos, TK_TOKEN_IDENT)) {
+        return (tk_parsed_constraint){ .ok = false, .error = tk_err_at(t, n, pos, "expected a constraint name (a nominal variant/struct) in a type-parameter constraint") };
+    }
+    tk_str name = t[pos].text;
+    size_t p = pos + 1;
+    if (tk_is_kind_at(t, n, p, TK_TOKEN_QUESTION)) {
+        return (tk_parsed_constraint){ .ok = false, .error = tk_err_at(t, n, p, "a nullability `?` is not allowed on a constraint atom — a constraint targets a concrete nominal type") };
+    }
+    tk_constraint_expr node = { .tag = TK_CONSTRAINT_ATOM, .as.atom = { name } };
+    return (tk_parsed_constraint){ .ok = true, .node = node, .next = p };
+}
+static tk_parsed_constraint parse_constraint_and(const tk_token *t, size_t n, size_t pos) {
+    tk_parsed_constraint left = parse_constraint_atom(t, n, pos);
+    if (!left.ok) return left;
+    for (;;) {
+        if (!tk_is_kind_at(t, n, left.next, TK_TOKEN_AMP)) break;
+        tk_parsed_constraint right = parse_constraint_atom(t, n, left.next + 1);
+        if (!right.ok) return right;
+        tk_constraint_expr node = { .tag = TK_CONSTRAINT_AND, .as.and_expr = { tk_box_constraint(left.node), tk_box_constraint(right.node) } };
+        left = (tk_parsed_constraint){ .ok = true, .node = node, .next = right.next };
+    }
+    return left;
+}
+static tk_parsed_constraint parse_constraint_expr(const tk_token *t, size_t n, size_t pos) {
+    tk_parsed_constraint left = parse_constraint_and(t, n, pos);
+    if (!left.ok) return left;
+    for (;;) {
+        if (!tk_is_kind_at(t, n, left.next, TK_TOKEN_PIPE)) break;
+        tk_parsed_constraint right = parse_constraint_and(t, n, left.next + 1);
+        if (!right.ok) return right;
+        tk_constraint_expr node = { .tag = TK_CONSTRAINT_OR, .as.or_expr = { tk_box_constraint(left.node), tk_box_constraint(right.node) } };
+        left = (tk_parsed_constraint){ .ok = true, .node = node, .next = right.next };
+    }
+    return left;
+}
+
+// (S4/W11) An OPTIONAL generic type-parameter list `<T, U: A & B, …>` after a fn/type NAME
+// (parse_decl.tks twin). No `<` → empty list, pos unchanged. Decl-site `<` is unambiguous (the
+// `fn`/`type` keyword already committed the parse to a decl); a decl list never nests, so it
+// closes with a single `>`. Each name may carry an optional `: ConstraintExpr`; names/constraints
+// stay PARALLEL (TK_CONSTRAINT_NONE filling an unconstrained slot).
+static tk_parsed_type_params_result parse_type_params(const tk_token *t, size_t n, size_t pos) {
     if (!tk_is_kind_at(t, n, pos, TK_TOKEN_LT)) {
-        return (tk_parsed_names_result){ .ok = true, .as.value = { .items = NULL, .n_names = 0, .next = pos } };
+        return (tk_parsed_type_params_result){ .ok = true, .as.value = { .names = NULL, .constraints = NULL, .n = 0, .next = pos } };
     }
     size_t p = pos + 1;
     tk_str *names = NULL; size_t nn = 0;
+    tk_constraint_expr *constraints = NULL; size_t nc = 0;
     for (;;) {
         if (!tk_is_kind_at(t, n, p, TK_TOKEN_IDENT)) {
-            return (tk_parsed_names_result){ .ok = false, .as.error = tk_err_at(t, n, p, "expected a type-parameter name in '<…>'") };
+            return (tk_parsed_type_params_result){ .ok = false, .as.error = tk_err_at(t, n, p, "expected a type-parameter name in '<…>'") };
         }
         tk_strvec_push(&names, &nn, t[p].text);
         p += 1;
         // Nullability `?` is NEVER allowed on a type-PARAMETER declaration (legislation 2026-06-28):
         // `?` marks a USE of a type (`a: T?`, `-> T?`), never the param decl `<T?>` (nor a constraint).
         if (tk_is_kind_at(t, n, p, TK_TOKEN_QUESTION)) {
-            return (tk_parsed_names_result){ .ok = false, .as.error = tk_err_at(t, n, p, "a nullability `?` is not allowed on a type parameter — use `T?` only in a parameter or return type") };
+            return (tk_parsed_type_params_result){ .ok = false, .as.error = tk_err_at(t, n, p, "a nullability `?` is not allowed on a type parameter — use `T?` only in a parameter or return type") };
+        }
+        if (tk_is_kind_at(t, n, p, TK_TOKEN_COLON)) {
+            tk_parsed_constraint c = parse_constraint_expr(t, n, p + 1);
+            if (!c.ok) return (tk_parsed_type_params_result){ .ok = false, .as.error = c.error };
+            tk_constraints_push(&constraints, &nc, c.node);
+            p = c.next;
+        } else {
+            tk_constraint_expr none = { .tag = TK_CONSTRAINT_NONE };
+            tk_constraints_push(&constraints, &nc, none);
         }
         if (tk_is_kind_at(t, n, p, TK_TOKEN_COMMA)) { p += 1; }
         else if (tk_is_kind_at(t, n, p, TK_TOKEN_GT)) { p += 1; break; }
-        else { return (tk_parsed_names_result){ .ok = false, .as.error = tk_err_at(t, n, p, "expected ',' or '>' in a type-parameter list") }; }
+        else { return (tk_parsed_type_params_result){ .ok = false, .as.error = tk_err_at(t, n, p, "expected ',' or '>' in a type-parameter list") }; }
     }
-    return (tk_parsed_names_result){ .ok = true, .as.value = { .items = names, .n_names = nn, .next = p } };
+    return (tk_parsed_type_params_result){ .ok = true, .as.value = { .names = names, .constraints = constraints, .n = nn, .next = p } };
 }
 
 tk_parsed_decl_result tk_parse_function(const tk_token *t, size_t n, size_t pos, bool is_test, tk_str os_guard) {
@@ -121,7 +173,7 @@ tk_parsed_decl_result tk_parse_function(const tk_token *t, size_t n, size_t pos,
         return (tk_parsed_decl_result){ .ok = false, .as.error = tk_err_at(t, n, p, "expected a function name") };
     }
     tk_str name = t[p].text; uint32_t name_line = t[p].line, name_col = t[p].col; p += 1;   // W-loc-2: the fn's source position
-    tk_parsed_names_result tps = parse_type_params(t, n, p);   // (S4) `<T, …>`
+    tk_parsed_type_params_result tps = parse_type_params(t, n, p);   // (S4/W11) `<T, U: A & B, …>`
     if (!tps.ok) { return (tk_parsed_decl_result){ .ok = false, .as.error = tps.as.error }; }
     p = tps.as.value.next;
     if (!tk_is_kind_at(t, n, p, TK_TOKEN_LPAREN)) {
@@ -156,7 +208,7 @@ tk_parsed_decl_result tk_parse_function(const tk_token *t, size_t n, size_t pos,
             }
             from_lib = t[p].text; p += 1;
         }
-        tk_function ef = { .name = name, .type_params = tps.as.value.items, .n_type_params = tps.as.value.n_names, .params = ps.as.value.items, .nparams = ps.as.value.n_params,
+        tk_function ef = { .name = name, .type_params = tps.as.value.names, .n_type_params = tps.as.value.n, .type_constraints = tps.as.value.constraints, .params = ps.as.value.items, .nparams = ps.as.value.n_params,
             .has_return = has_return, .return_type = ret,
             .body = NULL, .nbody = 0,
             .vis = vis, .has_doc = has_doc, .doc = doc, .line = name_line, .col = name_col, .is_test = is_test,
@@ -169,7 +221,7 @@ tk_parsed_decl_result tk_parse_function(const tk_token *t, size_t n, size_t pos,
     }
     tk_parsed_block_result blk = tk_parse_block(t, n, p);
     if (!blk.ok) { return (tk_parsed_decl_result){ .ok = false, .as.error = blk.as.error }; }
-    tk_function f = { .name = name, .type_params = tps.as.value.items, .n_type_params = tps.as.value.n_names, .params = ps.as.value.items, .nparams = ps.as.value.n_params,
+    tk_function f = { .name = name, .type_params = tps.as.value.names, .n_type_params = tps.as.value.n, .type_constraints = tps.as.value.constraints, .params = ps.as.value.items, .nparams = ps.as.value.n_params,
         .has_return = has_return, .return_type = ret,
         .body = blk.as.value.items, .nbody = blk.as.value.n,
         .vis = vis, .has_doc = has_doc, .doc = doc, .line = name_line, .col = name_col, .is_test = is_test,
@@ -265,13 +317,13 @@ tk_parsed_decl_result tk_parse_type_decl(const tk_token *t, size_t n, size_t pos
         return (tk_parsed_decl_result){ .ok = false, .as.error = tk_err_at(t, n, p, "expected a type name") };
     }
     tk_str name = t[p].text; uint32_t name_line = t[p].line, name_col = t[p].col; p += 1;   // W-loc-2: the type's source position
-    tk_parsed_names_result tps = parse_type_params(t, n, p);   // (S4) `type Box<T> = …`
+    tk_parsed_type_params_result tps = parse_type_params(t, n, p);   // (S4/W11) `type Box<T: A & B> = …`
     if (!tps.ok) { return (tk_parsed_decl_result){ .ok = false, .as.error = tps.as.error }; }
     p = tps.as.value.next;
     if (is_extern) {
         // `extern type Name` — an OPAQUE foreign handle: no `= <body>`, lowers to `void *`.
         tk_type_body eb = { .tag = TK_BODY_EXTERN, .as.extern_body = { 0 } };
-        tk_type_decl etd = { .name = name, .type_params = tps.as.value.items, .n_type_params = tps.as.value.n_names, .body = eb, .vis = vis, .has_doc = has_doc, .doc = doc, .line = name_line, .col = name_col };
+        tk_type_decl etd = { .name = name, .type_params = tps.as.value.names, .n_type_params = tps.as.value.n, .type_constraints = tps.as.value.constraints, .body = eb, .vis = vis, .has_doc = has_doc, .doc = doc, .line = name_line, .col = name_col };
         tk_decl ed = { .tag = TK_DECL_TYPE, .as.type_decl = etd };
         return (tk_parsed_decl_result){ .ok = true, .as.value = { .node = ed, .next = p } };
     }
@@ -280,7 +332,7 @@ tk_parsed_decl_result tk_parse_type_decl(const tk_token *t, size_t n, size_t pos
     }
     tk_parsed_body_result body = parse_type_body(t, n, p + 1);
     if (!body.ok) { return (tk_parsed_decl_result){ .ok = false, .as.error = body.as.error }; }
-    tk_type_decl td = { .name = name, .type_params = tps.as.value.items, .n_type_params = tps.as.value.n_names, .body = body.as.value.node, .vis = vis, .has_doc = has_doc, .doc = doc, .line = name_line, .col = name_col };
+    tk_type_decl td = { .name = name, .type_params = tps.as.value.names, .n_type_params = tps.as.value.n, .type_constraints = tps.as.value.constraints, .body = body.as.value.node, .vis = vis, .has_doc = has_doc, .doc = doc, .line = name_line, .col = name_col };
     tk_decl d = { .tag = TK_DECL_TYPE, .as.type_decl = td };
     return (tk_parsed_decl_result){ .ok = true, .as.value = { .node = d, .next = body.as.value.next } };
 }

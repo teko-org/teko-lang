@@ -23,6 +23,81 @@ use teko::parser
 // inferred bindings; `params` is the generic's type-param universe.
 type MonoInst = struct { fn_name: str; mangled: str; s: Subst }
 
+// (W11/S6, 2026-07-01) CONSTRAINT CHECKING — runs HERE, at monomorphization (never at
+// definition), per the settled design: an unconstrained T stays opaque at the generic's own
+// definition; a constraint gates the CONCRETE type bound to T once a real instantiation exists.
+//
+// NOMINAL membership: an atom names a `variant`/other TypeDecl. For a `variant` atom, the
+// concrete type must equal (by type_eq — no structural check) one of the variant's declared
+// MEMBER types (e.g. `type Comparable = i64 | f64 | str` — a concrete `i64` is a member).
+// For any other TypeDecl kind (struct/enum/flags/alias/extern), the atom is an exact nominal
+// name — the concrete type must be that SAME named type. An atom naming no TypeDecl at all is
+// unsatisfiable (never silently ignored — M.1 fail-loud).
+fn constraint_atom_satisfied(atom_name: str, concrete: Type, table: TypeTable) -> bool {
+    match type_table_find(table, atom_name) {
+        parser::TypeDecl as td => {
+            match td.body {
+                parser::VariantBody as vb => {
+                    match resolve_type(vb.type_expr, table) {
+                        Type as t => match t {
+                            Variant as v => {
+                                mut i = 0
+                                loop {
+                                    if i >= v.members.len { break }
+                                    if type_eq(concrete, v.members[i]) { return true }
+                                    i++
+                                }
+                                false
+                            }
+                            _ => type_eq(concrete, t)   // a variant of one member widened to a bare type
+                        }
+                        error => false
+                    }
+                }
+                _ => match concrete { Named as n => n.name == atom_name; _ => false }   // exact nominal-name match
+            }
+        }
+        error => false   // the atom names no TypeDecl at all — unsatisfiable, never silently ignored
+    }
+}
+// The full boolean tree over atoms: `&` = both must hold, `|` = either must hold (matches the
+// parser's precedence — this just walks the already-built AND/OR tree, no precedence here).
+// (VM match-arm ordering, 2026-07-01) the MULTI-field cases (ConstraintAnd/ConstraintOr) are
+// matched BEFORE the single-/zero-field cases (ConstraintAtom/NoConstraint) — see
+// teko-vm-wrapper-descent-bug: the VM's match unreliably picks a single-/zero-field case over
+// the ACTUAL multi-field tag when the single-/zero-field arm is tried first. Native codegen is
+// unaffected (this ordering is a no-op there); reordering is the cheap, correct workaround.
+fn constraint_satisfied(c: parser::ConstraintExpr, concrete: Type, table: TypeTable) -> bool {
+    match c {
+        parser::ConstraintAnd as a  => constraint_satisfied(a.left, concrete, table) && constraint_satisfied(a.right, concrete, table)
+        parser::ConstraintOr as o   => constraint_satisfied(o.left, concrete, table) || constraint_satisfied(o.right, concrete, table)
+        parser::ConstraintAtom as a => constraint_atom_satisfied(a.name, concrete, table)
+        parser::NoConstraint  => true
+    }
+}
+// Gate a whole instantiation: type_params/type_constraints are PARALLEL; `s` is the Subst that
+// bound each param to a concrete type for THIS instantiation.
+fn check_constraints(type_params: []str, type_constraints: []parser::ConstraintExpr, s: Subst, table: TypeTable) -> error? {
+    mut i = 0
+    loop {
+        if i >= type_params.len { break }
+        match type_constraints[i] {
+            parser::NoConstraint => {}
+            _ => {
+                let bound = match subst_find_inst(s, type_params[i]) {
+                    Type as t => t
+                    null      => return error { message = teko::string::concat("internal: monomorphization did not bind type parameter '", type_params[i], "'") }
+                }
+                if !constraint_satisfied(type_constraints[i], bound, table) {
+                    return error { message = teko::string::concat("type parameter '", type_params[i], "' does not satisfy its constraint at this instantiation") }
+                }
+            }
+        }
+        i++
+    }
+    null
+}
+
 // rewrite-walk carriers: a rewritten node PLUS the instantiations it discovered. Teko has
 // no out-params, so the walk RETURNS both (the C twin threads an out-list pointer).
 type WExpr  = struct { expr: TExpr;          insts: []MonoInst }
@@ -524,7 +599,7 @@ pub fn monomorphize(prog: TProgram, table: TypeTable) -> TProgram | error {
                     // drop the generic template from the output (stamped copies replace it)
                 } else {
                     let wb = match mono_block(f.body, empty_s, prog.items, table) { WBlock as w => w; error as e => return e }
-                    let nf = TFunction { name = f.name; type_params = f.type_params; params = f.params; return_type = f.return_type; body = wb.stmts; vis = f.vis; has_doc = f.has_doc; doc = f.doc; namespace = f.namespace; file = f.file; line = f.line; col = f.col; is_test = f.is_test; is_extern = f.is_extern; c_symbol = f.c_symbol; from_lib = f.from_lib }
+                    let nf = TFunction { name = f.name; type_params = f.type_params; type_constraints = f.type_constraints; params = f.params; return_type = f.return_type; body = wb.stmts; vis = f.vis; has_doc = f.has_doc; doc = f.doc; namespace = f.namespace; file = f.file; line = f.line; col = f.col; is_test = f.is_test; is_extern = f.is_extern; c_symbol = f.c_symbol; from_lib = f.from_lib }
                     kept = teko::list::push(kept, nf)
                     queue = mono_inst_concat(queue, wb.insts)
                 }
@@ -562,6 +637,8 @@ pub fn monomorphize(prog: TProgram, table: TypeTable) -> TProgram | error {
             TFunction as f => f
             null           => return error { message = teko::str::concat("internal: monomorph could not find generic fn ", inst.fn_name) }
         }
+        // (W11/S6) CONSTRAINT CHECK — gate this instantiation's concrete bindings before stamping.
+        match check_constraints(gf.type_params, gf.type_constraints, inst.s, table) { error as e => return e; null => {} }
         // STAMP: concrete param annotations, substituted return type, body rewritten through the Subst.
         mut nparams: []parser::Param = teko::list::empty()
         mut pi = 0
@@ -573,7 +650,8 @@ pub fn monomorphize(prog: TProgram, table: TypeTable) -> TProgram | error {
         let wb = match mono_block(gf.body, inst.s, prog.items, table) { WBlock as w => w; error as e => return e }
         queue = mono_inst_concat(queue, wb.insts)
         let no_tps: []str = teko::list::empty()
-        let sf = TFunction { name = inst.mangled; type_params = no_tps; params = nparams; return_type = subst_type(gf.return_type, inst.s); body = wb.stmts; vis = gf.vis; has_doc = gf.has_doc; doc = gf.doc; namespace = gf.namespace; file = gf.file; line = gf.line; col = gf.col; is_test = false; is_extern = false; c_symbol = ""; from_lib = "" }
+        let no_tcs: []parser::ConstraintExpr = teko::list::empty()
+        let sf = TFunction { name = inst.mangled; type_params = no_tps; type_constraints = no_tcs; params = nparams; return_type = subst_type(gf.return_type, inst.s); body = wb.stmts; vis = gf.vis; has_doc = gf.has_doc; doc = gf.doc; namespace = gf.namespace; file = gf.file; line = gf.line; col = gf.col; is_test = false; is_extern = false; c_symbol = ""; from_lib = "" }
         kept = teko::list::push(kept, sf)
     }
 

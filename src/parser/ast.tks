@@ -99,6 +99,23 @@ pub type DeferStmt = struct { body: []Statement }
 
 pub type Statement = variant Binding | Assign | Return | LoopStmt | BreakStmt | ContinueStmt | ExprStmt | DeferStmt
 
+// --- generic type-parameter CONSTRAINTS (W11/S6, 2026-07-01) -----------------------------
+// `<T: ConstraintExpr>` — a DEDICATED boolean grammar over NOMINAL atoms (variant/struct
+// names), syntactically distinct from a type-expression `|` (that's a type UNION; this is a
+// boolean AND/OR over membership tests). `&` binds tighter than `|`: `C1 & C2 | C3` parses as
+// `(C1 & C2) | C3`. An atom is a bare name; the checker rejects `?`/null/void atoms (a
+// constraint targets a concrete nominal type, never a use-position nullable/void). Checked AT
+// MONOMORPHIZATION (when a generic is instantiated with a concrete type), never at definition
+// (an unconstrained T stays OPAQUE — store/pass/return only; operating on members needs a
+// constraint). NoConstraint is the sentinel for a type-param with no `: …` clause, so
+// Function/TypeDecl.type_constraints stays PARALLEL to type_params (same length, index i's
+// constraint governs type_params[i]) without an Optional wrapper.
+pub type ConstraintAtom = struct { name: str }                          // a nominal variant/struct name
+pub type ConstraintAnd  = struct { left: ConstraintExpr; right: ConstraintExpr }   // C1 & C2 — both must hold
+pub type ConstraintOr   = struct { left: ConstraintExpr; right: ConstraintExpr }   // C1 | C2 — either must hold
+pub type NoConstraint   = struct { }                                    // sentinel: the type-param has no `: …` clause
+pub type ConstraintExpr = variant ConstraintAtom | ConstraintAnd | ConstraintOr | NoConstraint
+
 // --- top-level items ---
 pub type Param    = struct { name: str; type_ann: TypeExpr; is_params: bool; has_default: bool; default_expr: Expr }   // immutable (B.21); is_params = C#-style variadic modifier (2026-07-01), trailing-only, type_ann must be a Slice; has_default/default_expr = DEFARGS (2026-07-01) — TRAILING-ONLY (once one param defaults, every later param must too), default_expr valid iff has_default
 
@@ -111,6 +128,7 @@ pub type Visibility = enum { Private; Pub; Exp }
 pub type Function = struct {
     name:        str
     type_params: []str                                  // generic type-parameter names (S4 — empty for a non-generic fn; e.g. `fn id<T>` → ["T"])
+    type_constraints: []ConstraintExpr                   // (W11/S6) PARALLEL to type_params (same length); NoConstraint{} = no `: …` clause
     params:      []Param
     has_return:  bool                                   // `-> ret` present? (absent = Unit return; P5a)
     return_type: TypeExpr                               // the return type (valid iff has_return)
@@ -137,6 +155,7 @@ pub type TypeBody    = variant StructBody | EnumBody | FlagsBody | VariantBody |
 pub type TypeDecl    = struct {                             // nominal (B.13)
     name:    str
     type_params: []str                                 // generic type-parameter names (S4 — empty for a non-generic type; e.g. `type Box<T>` → ["T"])
+    type_constraints: []ConstraintExpr                  // (W11/S6) PARALLEL to type_params (same length); NoConstraint{} = no `: …` clause
     body:    TypeBody
     vis:     Visibility                                 // private (default) / pub / exp
     has_doc: bool
