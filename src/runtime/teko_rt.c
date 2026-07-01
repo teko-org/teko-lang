@@ -211,6 +211,55 @@ tk_slice_byte tk_bytes_of_str(tk_str s) {
     return (tk_slice_byte){ (tk_byte *)s.ptr, s.len };
 }
 
+// rt_valid_utf8 — strict RFC 3629 well-formedness check (reject overlong encodings, UTF-16
+// surrogates U+D800..U+DFFF, and codepoints > U+10FFFF). Mirrors src/text/text.c's static
+// valid_utf8 byte-for-byte; duplicated here (not shared) because teko_rt.c is a SEPARATE link
+// unit from the compiler's own bootstrap text.c — generated Teko programs link teko_rt.c only,
+// never the compiler-internal text.c (ROUND 0 — str_from_utf8 the user-facing builtin).
+static bool rt_valid_utf8(const tk_byte *s, size_t len) {
+    size_t i = 0;
+    while (i < len) {
+        tk_byte b = s[i];
+        if (b <= 0x7F) { i += 1; continue; }        // ASCII — a single byte
+
+        size_t  cont;                                // continuation bytes that follow
+        tk_byte lo, hi;                              // valid range for the FIRST of them
+        if      (b >= 0xC2 && b <= 0xDF) { cont = 1; lo = 0x80; hi = 0xBF; }
+        else if (b == 0xE0)              { cont = 2; lo = 0xA0; hi = 0xBF; } // no overlong
+        else if (b >= 0xE1 && b <= 0xEC) { cont = 2; lo = 0x80; hi = 0xBF; }
+        else if (b == 0xED)              { cont = 2; lo = 0x80; hi = 0x9F; } // no surrogate
+        else if (b >= 0xEE && b <= 0xEF) { cont = 2; lo = 0x80; hi = 0xBF; }
+        else if (b == 0xF0)              { cont = 3; lo = 0x90; hi = 0xBF; } // no overlong
+        else if (b >= 0xF1 && b <= 0xF3) { cont = 3; lo = 0x80; hi = 0xBF; }
+        else if (b == 0xF4)              { cont = 3; lo = 0x80; hi = 0x8F; } // <= U+10FFFF
+        else return false;                           // 0x80..0xC1, 0xF5..0xFF: invalid lead
+
+        if (len - i <= cont) return false;           // truncated: not enough bytes
+        if (s[i + 1] < lo || s[i + 1] > hi) return false;            // first continuation
+        for (size_t k = 2; k <= cont; k += 1) {                      // the rest, plain
+            if (s[i + k] < 0x80 || s[i + k] > 0xBF) return false;
+        }
+        i += cont + 1;
+    }
+    return true;
+}
+
+// tk_rt_str_from_utf8 — the validated bytes -> str constructor (ROUND 0 / B.36). ok → a fresh
+// str COPYING the bytes; !ok → err "invalid UTF-8". Takes ptr+len (the []byte ABI; the codegen
+// lift splits the generated tk_slice_byte the same way write_file_bytes's data arg is split).
+tk_ffi_sres tk_rt_str_from_utf8(const tk_byte *ptr, uint64_t len) {
+    if (!rt_valid_utf8(ptr, (size_t)len)) {
+        tk_byte *msg = malloc(13);
+        if (msg == NULL) tk_panic("out of memory (str_from_utf8 error)");
+        memcpy(msg, "invalid UTF-8", 13);
+        return (tk_ffi_sres){ .ok = false, .err = (tk_str){ msg, 13 } };
+    }
+    tk_byte *buf = malloc(len ? len : 1);
+    if (buf == NULL) tk_panic("out of memory (str_from_utf8)");
+    if (len) memcpy(buf, ptr, (size_t)len);
+    return (tk_ffi_sres){ .ok = true, .value = (tk_str){ buf, len } };
+}
+
 // tk_one_byte — a fresh 1-byte str holding c.
 tk_str tk_one_byte(tk_byte c) {
     tk_byte *buf = malloc(1);

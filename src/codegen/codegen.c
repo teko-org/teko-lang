@@ -1113,7 +1113,7 @@ static bool emit_as(cbuf *b, tk_type expected, const tk_texpr *value, const char
 // is emitted as a statement-expression that calls a fixed-ABI runtime primitive (teko_rt.h)
 // and lifts the result into the program's generated result type (e->type). Defined after the
 // variant-wrap helpers it leans on; the CALL case dispatches to it by builtin name.
-enum cg_ffi_kind { CG_FFI_SRES, CG_FFI_URES, CG_FFI_SLRES, CG_FFI_U64RES, CG_FFI_ARGS, CG_FFI_RUN, CG_FFI_BYTES, CG_FFI_URES_BYTESLICE };   // C7.12: URES_BYTESLICE = write_file_bytes(str, []byte)
+enum cg_ffi_kind { CG_FFI_SRES, CG_FFI_URES, CG_FFI_SLRES, CG_FFI_U64RES, CG_FFI_ARGS, CG_FFI_RUN, CG_FFI_BYTES, CG_FFI_URES_BYTESLICE, CG_FFI_SRES_BYTESLICE };   // C7.12: URES_BYTESLICE = write_file_bytes(str, []byte) ; ROUND 0: SRES_BYTESLICE = str_from_utf8([]byte) -> str|error
 static bool emit_host_ffi(cbuf *b, int kind, const char *rtfn, const tk_texpr *e, const char **err);
 // W5b — a `match` lowered to a GNU statement-expression (the VALUE form).
 static bool emit_match_value(cbuf *b, const tk_texpr *e, const char **err);
@@ -1642,6 +1642,7 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
                     if (seg_is(l, "run"))           return emit_host_ffi(b, CG_FFI_RUN,    "tk_rt_run",           e, err);
                     if (seg_is(l, "bytes_from_ptr"))   return emit_host_ffi(b, CG_FFI_BYTES,            "tk_bytes_from_ptr",       e, err);   // (C7.1a) ptr+len -> []byte (slice-lift)
                     if (seg_is(l, "write_file_bytes")) return emit_host_ffi(b, CG_FFI_URES_BYTESLICE, "tk_rt_write_file_bytes",  e, err);   // C7.12: (str, []byte) -> error?
+                    if (seg_is(l, "str_from_utf8"))    return emit_host_ffi(b, CG_FFI_SRES_BYTESLICE, "tk_rt_str_from_utf8",     e, err);   // ROUND 0: ([]byte) -> str | error
                 }
             }
             // Non-shadowable built-ins: `print`/`println`, either bare or under `teko`.
@@ -2604,6 +2605,30 @@ static bool emit_host_ffi(cbuf *b, int kind, const char *rtfn, const tk_texpr *e
         cb(b, "){ .present = false } : ("); if (!emit_type(b, e->type, err)) return false;
         // E2-NATIVE: .value is now tk_error; wrap the tk_str .err message via tk_error_make.
         cb(b, "){ .present = true, .value = tk_error_make("); cb(b, tr); cb(b, ".err) }; })");
+        return true;
+    }
+
+    // ROUND 0 — sres_byteslice: str_from_utf8(bytes: []byte) -> str | error. The C function
+    // takes (ptr, len); the Teko []byte slice carries both in a struct. Same VARIANT-wrap shape
+    // as CG_FFI_SRES below, but the single arg is a []byte split into ptr+len (mirrors
+    // CG_FFI_URES_BYTESLICE's arg handling, wrapping a str|error result instead of error?).
+    if (kind == CG_FFI_SRES_BYTESLICE) {
+        tk_type byte_t = { .tag = TK_TYPE_BYTE };
+        char ts[44]; snprintf(ts, sizeof ts, "%ss", t);   // <t>s = the slice temp
+        char tr[44]; snprintf(tr, sizeof tr, "%sr", t);   // <t>r = the result temp
+        cb(b, "({ ");
+        if (!cg_slice_typename(b, byte_t, err)) return false;   // tk_slice_byte
+        cb(b, " "); cb(b, ts); cb(b, " = ");
+        if (!emit_expr(b, &e->as.call.args[0], err)) return false;   // the []byte arg
+        cb(b, "; tk_ffi_sres "); cb(b, tr); cb(b, " = "); cb(b, rtfn); cb(b, "(");
+        cb(b, ts); cb(b, ".ptr, (uint64_t)"); cb(b, ts); cb(b, ".len); ");
+        cb(b, tr); cb(b, ".ok ? ");
+        char vexpr2[64]; snprintf(vexpr2, sizeof vexpr2, "%s.value", tr);
+        if (!emit_variant_wrap_str(b, e->type, str_t, vexpr2, err)) return false;
+        cb(b, " : ");
+        char eexpr2[80]; snprintf(eexpr2, sizeof eexpr2, "tk_error_make(%s.err)", tr);
+        if (!emit_variant_wrap_str(b, e->type, err_t, eexpr2, err)) return false;
+        cb(b, "; })");
         return true;
     }
 

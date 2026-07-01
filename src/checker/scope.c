@@ -163,6 +163,9 @@ tk_type_result tk_builtin_fn(tk_str name) {
     // teko::str::last_index_of -> `u64 | error` (a found index, or error when absent)
     static tk_type u64_or_err_m[2] = { { .tag = TK_TYPE_PRIM, .as.prim = TK_PRIM_U64 }, { .tag = TK_TYPE_ERROR } };
     static tk_type u64_or_err = { .tag = TK_TYPE_VARIANT, .as.variant = { u64_or_err_m, 2 } };
+    // str_from_utf8 -> `str | error` (ROUND 0 / B.36 — the validated bytes->str door)
+    static tk_type str_or_err_m[2] = { { .tag = TK_TYPE_STR }, { .tag = TK_TYPE_ERROR } };
+    static tk_type str_or_err = { .tag = TK_TYPE_VARIANT, .as.variant = { str_or_err_m, 2 } };
     // VM-internal arithmetic FFI: sign-aware int div/rem over the i128 carrier, float div.
     static tk_type i128_t = { .tag = TK_TYPE_PRIM, .as.prim = TK_PRIM_I128 };
     static tk_type divrem_p[3] = { { .tag = TK_TYPE_PRIM, .as.prim = TK_PRIM_I128 }, { .tag = TK_TYPE_PRIM, .as.prim = TK_PRIM_I128 }, { .tag = TK_TYPE_PRIM, .as.prim = TK_PRIM_BOOL } };
@@ -199,6 +202,10 @@ tk_type_result tk_builtin_fn(tk_str name) {
     }
     if (name_is(name, "bytes_of_str")) {                             // bytes_of_str(str) -> []byte
         tk_type ft = { .tag = TK_TYPE_FUNC, .as.func = { .params = &str_t, .nparams = 1, .ret = &bytes_t } };
+        return (tk_type_result){ .ok = true, .as.value = ft };
+    }
+    if (name_is(name, "str_from_utf8")) {                            // str_from_utf8([]byte) -> str | error
+        tk_type ft = { .tag = TK_TYPE_FUNC, .as.func = { .params = &bytes_t, .nparams = 1, .ret = &str_or_err } };
         return (tk_type_result){ .ok = true, .as.value = ft };
     }
     if (name_is(name, "chars")) {                                     // str::chars(str) -> []char

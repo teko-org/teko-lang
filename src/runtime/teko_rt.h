@@ -309,6 +309,11 @@ typedef struct { tk_byte *ptr; uint64_t len; } tk_ffi_bytes;
 // (C7.1a) copy n octets from a foreign pointer into a fresh []byte (teko::mem::bytes_from_ptr).
 tk_ffi_bytes tk_bytes_from_ptr(const void *p, uint64_t n);
 
+// str_from_utf8(bytes) — the validated bytes -> str constructor (ROUND 0 / B.36). ok → a fresh
+// str COPYING the bytes; !ok → err "invalid UTF-8". Reuses tk_ffi_sres (same {ok,value,err}
+// shape as read_file/getenv). Takes ptr+len (the []byte ABI), mirroring write_file_bytes's arg.
+tk_ffi_sres tk_rt_str_from_utf8(const tk_byte *ptr, uint64_t len);
+
 // teko::io::read_file(path) — slurp the whole file as UTF-8 bytes (owned copy).
 tk_ffi_sres tk_rt_read_file(tk_str path);
 // teko::env::var(name) — the environment value, or error when unset.

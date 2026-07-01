@@ -1433,6 +1433,7 @@ fn emit_call(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, e: c
             if l == "args"          { return emit_host_ffi(buf, prog, e, c, "args",   "tk_rt_args", escaping, regions, fn_body, dctx) }
             if l == "run"           { return emit_host_ffi(buf, prog, e, c, "run",    "tk_rt_run", escaping, regions, fn_body, dctx) }
             if l == "bytes_from_ptr" { return emit_host_ffi(buf, prog, e, c, "bytes", "tk_bytes_from_ptr", escaping, regions, fn_body, dctx) }   // (C7.1a) ptr+len -> []byte (slice-lift)
+            if l == "str_from_utf8" { return emit_host_ffi(buf, prog, e, c, "sres_byteslice", "tk_rt_str_from_utf8", escaping, regions, fn_body, dctx) }   // ROUND 0: ([]byte) -> str | error
         }
     }
     // Non-shadowable built-ins: `print`/`println`, either bare or under `teko`.
@@ -2811,6 +2812,35 @@ fn emit_host_ffi(buf: []byte, prog: checker::TProgram, e: checker::TExpr, c: che
         o = cb(o, "){ .present = true, .value = tk_error_make(")
         o = cb(o, t)
         return cb(o, "r.err) }; })")
+    }
+
+    // ROUND 0 — sres_byteslice: str_from_utf8(bytes: []byte) -> str | error. The C function
+    // takes (ptr, len); the Teko []byte slice carries both in a struct. Same VARIANT-wrap shape
+    // as the generic "sres" branch below, but the single arg is a []byte split into ptr+len
+    // (mirrors "ures_byteslice"'s arg handling, wrapping a str|error result instead of error?).
+    if kind == "sres_byteslice" {
+        let byte_t = checker::Byte { }
+        mut o = cb(buf, "({ ")
+        o = match cg_slice_typename(o, byte_t) { []byte as r => r; error as err => return err }
+        o = cb(o, " ")
+        o = cb(o, t)
+        o = cb(o, "s = ")
+        o = match emit_expr_ctx(o, prog, checker::Void { }, c.args[0], escaping, regions, fn_body, dctx) { []byte as r => r; error as err => return err }
+        o = cb(o, "; tk_ffi_sres ")
+        o = cb(o, t)
+        o = cb(o, "r = ")
+        o = cb(o, rtfn)
+        o = cb(o, "(")
+        o = cb(o, t)
+        o = cb(o, "s.ptr, (uint64_t)")
+        o = cb(o, t)
+        o = cb(o, "s.len); ")
+        o = cb(o, t)
+        o = cb(o, "r.ok ? ")
+        o = match emit_variant_wrap_str(o, prog, e.type, str_t, $"{t}r.value") { []byte as r => r; error as err => return err }
+        o = cb(o, " : ")
+        o = match emit_variant_wrap_str(o, prog, e.type, err_t, teko::str::concat3("tk_error_make(", $"{t}r", ".err)")) { []byte as r => r; error as err => return err }
+        return cb(o, "; })")
     }
 
     // The struct-returning host FFI: bind the fixed-ABI result, then lift per result shape.
