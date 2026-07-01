@@ -833,6 +833,35 @@ fn try_fs_builtin(callee: parser::Path, args: []checker::TExpr, env: Venv) -> Va
             null => return null
         }
     }
+    // ROUND 0: str_from_utf8(bytes: []byte) -> str | error — the validated bytes -> str door
+    // (B.36). The VM represents []byte as []Value (each element a byte or int). Gather into a
+    // []byte (for validation) AND materialize the str (same one_byte-concat approach as
+    // try_str_builtin's str/str_of_bytes case), then validate with teko::text::valid_utf8 (the
+    // SAME RFC-3629 walk the lexer/parser use internally) before returning it.
+    if last == "str_from_utf8" {
+        let data_val = ev_val(args[0], env)
+        let xs = match data_val { []Value as b => b; _ => teko::list::empty() }
+        mut raw: []byte = teko::list::empty()
+        mut view = ""
+        mut i = 0
+        loop {
+            if i >= xs.len { break }
+            let elem = xs[i]
+            if val_is_byte(elem) || val_is_int(elem) {
+                let b = as_int(elem) to byte
+                raw = teko::list::push(raw, b)
+                view = teko::str_concat(view, teko::one_byte(b))
+            } else {
+                panic("vm: str_from_utf8 element is not a byte (internal: checker should reject)")
+            }
+            i++
+        }
+        if !teko::text::valid_utf8(raw) {
+            let base = StructVal { type_name = "error"; field_names = teko::list::empty(); field_vals = teko::list::empty() }
+            return err_set(base, "message", "invalid UTF-8")
+        }
+        return view
+    }
     null
 }
 

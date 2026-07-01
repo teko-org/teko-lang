@@ -120,6 +120,8 @@ tk_ffi_ures  tk_rt_write_file(tk_str path, tk_str content);   // D3-branch — w
 // C7.12: write_file_bytes(path, ptr, len) — write a raw byte slice to a file ([]byte VM path).
 tk_ffi_ures  tk_rt_write_file_bytes(tk_str path, const uint8_t *ptr, uint64_t len);
 tk_ffi_ures  tk_rt_mkdir(tk_str path);
+// ROUND 0: str_from_utf8(ptr, len) — validated bytes -> str (or error "invalid UTF-8").
+tk_ffi_sres  tk_rt_str_from_utf8(const uint8_t *ptr, uint64_t len);
 
 // =========================================================================
 // M.3 honest barrier. A node the VM does not yet interpret is NOT silently
@@ -1086,6 +1088,37 @@ static bool try_builtin_call(tk_path p, const tk_texpr *args, size_t nargs,
             return true;
         }
         *out = v_none();   // error? success = null (TK_VAL_OPT present=false)
+        return true;
+    }
+    // ROUND 0: str_from_utf8(bytes: []byte) -> str | error — the validated bytes -> str door
+    // (B.36). The VM represents []byte as a TK_VAL_LIST of TK_VAL_INT (u8 bits); build a
+    // contiguous byte buffer (same approach as write_file_bytes) and call the runtime validator
+    // directly, mirroring the codegen sres_byteslice lift.
+    if (seg_is(last, "str_from_utf8")) {
+        if (nargs != 1) vm_unsupported("str_from_utf8 expects exactly one argument (a []byte)");
+        tk_value data_val = tk_vm_eval_expr(&args[0], env);
+        if (data_val.tag != TK_VAL_LIST) {
+            if (data_val.tag == TK_VAL_OPT && !data_val.as.opt.present) { data_val = v_list_empty(); }
+            else vm_unsupported("str_from_utf8: argument is not a []byte list (internal: checker should reject)");
+        }
+        tk_value_list lst = data_val.as.list;
+        uint8_t *buf = NULL;
+        if (lst.len > 0) {
+            buf = (uint8_t *)tk_alloc(lst.len); if (!buf) abort();
+            for (uint64_t i = 0; i < lst.len; i += 1) {
+                tk_value elem = lst.ptr[i];
+                if (elem.tag != TK_VAL_INT) vm_unsupported("str_from_utf8: []byte element is not an integer (internal: checker should reject)");
+                buf[i] = (uint8_t)(elem.as.i.bits & 0xFF);
+            }
+        }
+        tk_ffi_sres res = tk_rt_str_from_utf8(buf, (uint64_t)lst.len);
+        if (buf) tk_free0(buf);
+        if (!res.ok) {
+            tk_value base = v_struct(ERR_LIT("error"), (tk_value_fields){ NULL, NULL, 0 });
+            *out = v_error_set(base, ERR_LIT("message"), v_str(res.err));
+            return true;
+        }
+        *out = v_str(res.value);
         return true;
     }
     return false;
