@@ -119,6 +119,12 @@ tk_type_expr no_type(void) {
     return (tk_type_expr){ .tag = TK_TEXPR_NAMED, .as.named = { .path = { .segments = NULL, .len = 0 } } };
 }
 
+// (2026-07-01 DEFARGS) a placeholder tk_expr for tk_param.default_expr when has_default is
+// false -- never evaluated, mirrors no_type()'s sentinel convention.
+tk_expr no_expr(void) {
+    return (tk_expr){ .tag = TK_EXPR_NULL };
+}
+
 static tk_annotation_result parse_annotation(const tk_token *t, size_t n, size_t pos) {
     if (!tk_is_kind_at(t, n, pos, TK_TOKEN_COLON)) {
         return (tk_annotation_result){ .ok = true, .as.value = { .has_type = false, .type_ann = no_type(), .next = pos } };

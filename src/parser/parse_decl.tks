@@ -7,6 +7,7 @@ use teko::lexer
 fn parse_params(tokens: []lexer::Token, pos: u64) -> ParsedList<Param> | error {
     mut p = pos + 1                                  // consume `(`
     mut params: []Param = teko::list::empty()
+    mut seen_default = false   // DEFARGS (2026-07-01) — TRAILING-ONLY: once true, every later param must also default
     if is_kind_at(tokens, p, lexer::TokenKind::RParen) {
         return ParsedList<Param> { items = params; next = p + 1 }
     }
@@ -31,8 +32,24 @@ fn parse_params(tokens: []lexer::Token, pos: u64) -> ParsedList<Param> | error {
         if has_params_kw {
             match ty.node { SliceType => { }; _ => return err_at(tokens, p + 2, "'params' parameter must have a slice type ([]T)") }
         }
-        params = teko::list::push(params, Param { name = name; type_ann = ty.node; is_params = has_params_kw })
-        p = ty.next
+        // DEFARGS (2026-07-01) — `= <expr>` right after the type: a default value, evaluated at
+        // the call site when the argument is omitted. TRAILING-ONLY (rule A): once ANY param
+        // defaults, every param after it must ALSO default — `=` uses Assign, consistent with
+        // struct-init `{f=v}` (not `:`, which is a type annotation).
+        mut ppos = ty.next
+        mut has_default = false
+        mut default_expr = no_expr()
+        if is_kind_at(tokens, ppos, lexer::TokenKind::Assign) {
+            let dv = match parse_expr(tokens, ppos + 1) { Parsed<Expr> as x => x; error as e => return e }
+            has_default = true
+            default_expr = dv.node
+            ppos = dv.next
+        } else if seen_default {
+            return err_at(tokens, ppos, "a default-valued parameter must be followed only by other defaulted parameters (defaults are trailing-only)")
+        }
+        if has_default { seen_default = true }
+        params = teko::list::push(params, Param { name = name; type_ann = ty.node; is_params = has_params_kw; has_default = has_default; default_expr = default_expr })
+        p = ppos
         if has_params_kw && is_kind_at(tokens, p, lexer::TokenKind::Comma) {
             return err_at(tokens, p, "'params' must be the last parameter")
         }

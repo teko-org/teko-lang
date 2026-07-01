@@ -16,5 +16,6 @@
 tk_parsed_stmt_result  tk_parse_statement(const tk_token *t, size_t n, size_t pos);
 tk_parsed_block_result tk_parse_block    (const tk_token *t, size_t n, size_t pos);
 tk_type_expr           no_type(void);   // the empty (Unit) TypeExpr — shared with parse_decl
+tk_expr                no_expr(void);   // (2026-07-01 DEFARGS) a placeholder Expr — shared with parse_decl
 
 #endif // TK_PARSER_PARSE_STMT_H
