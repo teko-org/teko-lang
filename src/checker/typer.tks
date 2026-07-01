@@ -496,7 +496,7 @@ fn type_method_call(mc: parser::MethodCall, env: Env, table: TypeTable) -> TExpr
     // methods list's source differs; a class's methods are otherwise typed exactly like a struct's.
     let methods = match decl.body {
         parser::StructBody as sb => sb.methods
-        parser::ClassBody as cb  => cb.methods
+        parser::ClassBody as cb  => match effective_class_methods(cb, table) { []Function as f => f; error as e => return e }   // (W10b.CLASS increment 2) inherited methods are callable too
         _ => return error { message = "method typing is deferred (B.29 / M.4)" }
     }
     if methods.len == 0 { return error { message = $"no such method '{mc.method}' on struct '{struct_name}'" } }
@@ -930,7 +930,7 @@ fn type_field_access(fa: parser::FieldAccess, env: Env, table: TypeTable) -> TEx
     }
     let ft = match decl.body {
         parser::StructBody as sb => match field_type(sb.fields, fa.field, table) { Type as t => t; error as e => return e }
-        parser::ClassBody as cb  => match field_type(cb.fields, fa.field, table) { Type as t => t; error as e => return e }   // (W10b.CLASS increment 1)
+        parser::ClassBody as cb  => match effective_class_fields(cb, table) { []Field as fs => match field_type(fs, fa.field, table) { Type as t => t; error as e => return e }; error as e => return e }   // (W10b.CLASS increment 2)
         _                => return error { message = $"type {name} is not a struct (no fields)" }
     }
     TExpr { kind = TFieldAccess { receiver = recv; field = fa.field }; type = ft; line = 0; col = 0 }
@@ -955,7 +955,7 @@ fn type_safe_field_access(sfa: parser::SafeFieldAccess, env: Env, table: TypeTab
     }
     let ft = match decl.body {
         parser::StructBody as sb => match field_type(sb.fields, sfa.field, table) { Type as t => t; error as e => return e }
-        parser::ClassBody as cb  => match field_type(cb.fields, sfa.field, table) { Type as t => t; error as e => return e }   // (W10b.CLASS increment 1)
+        parser::ClassBody as cb  => match effective_class_fields(cb, table) { []Field as fs => match field_type(fs, sfa.field, table) { Type as t => t; error as e => return e }; error as e => return e }   // (W10b.CLASS increment 2)
         _                => return error { message = $"type {name} is not a struct (no fields)" }
     }
     // the result is `(field)?` — an already-optional field stays as-is (no double-wrap).
@@ -1060,12 +1060,17 @@ fn type_struct_lit(sl: parser::StructLit, expected: Type, env: Env, table: TypeT
         }
         name = mname
     }
-    // (W10b.CLASS increment 1) `Name { … }` also constructs a class instance — a class's fields
-    // are typed identically to a struct's; the "who may construct me" restriction (a class's
-    // literal legal only inside its own static factory) is a LATER increment, not enforced yet.
+    // (W10b.CLASS) `Name { … }` also constructs a class instance — a class's fields are typed
+    // identically to a struct's (increment 2: the EFFECTIVE, base-inherited fields too). An
+    // `abstract` class cannot be instantiated directly (only a concrete subclass may be — it is
+    // final, incomplete-by-design). The "who may construct me" restriction (a class's literal
+    // legal only inside its own static factory) is a LATER increment, not enforced yet.
     let sb_fields = match decl.body {
         parser::StructBody as s => s.fields
-        parser::ClassBody as c  => c.fields
+        parser::ClassBody as c  => {
+            match c.kind { ClassKind::Abstract => return error { message = $"`{name}` is abstract and cannot be instantiated directly" }; _ => {} }
+            match effective_class_fields(c, table) { []Field as fs => fs; error as e => return e }
+        }
         _               => return error { message = $"struct-literal target {name} is not a struct" }
     }
     if sl.field_names.len != sb_fields.len { return error { message = "a struct literal must set exactly the declared fields (count mismatch)" } }
@@ -2160,12 +2165,16 @@ fn type_function(f: parser::Function, env: Env, table: TypeTable) -> TFunction |
 // from both type_program and type_program_with_deps' main loops, alongside the ordinary
 // TypeDecl pass-through — a struct with methods contributes MULTIPLE TItems, not one.
 fn type_struct_methods(td: parser::TypeDecl, item_ns: str, file: str, env: Env, table: TypeTable) -> []TItem | error {
-    // (W10b.CLASS increment 1) a class's methods are typed/stamped by this SAME pass — only the
-    // methods list's source differs; a class method is otherwise identical to a struct method.
+    // (W10b.CLASS) a class's methods are typed/stamped by this SAME pass — only the methods
+    // list's source differs; a class method is otherwise identical to a struct method. Increment
+    // 2: stamps the EFFECTIVE (base-inherited + overridden) methods against THIS class's own
+    // name — an inherited-not-overridden method's body is re-typed/re-emitted per owning class
+    // (no vtable/dispatch yet). An `abstract fn` signature (no body, never overridden by THIS
+    // class) has nothing to emit — skipped.
     mut methods: []parser::Function = teko::list::empty()
     match td.body {
         parser::StructBody as sb => { methods = sb.methods }
-        parser::ClassBody as cb  => { methods = cb.methods }
+        parser::ClassBody as cb  => { methods = match effective_class_methods(cb, table) { []Function as f => f; error as e => return e } }
         _ => {}
     }
     mut out: []TItem = teko::list::empty()
@@ -2173,6 +2182,7 @@ fn type_struct_methods(td: parser::TypeDecl, item_ns: str, file: str, env: Env, 
     mut mi = 0
     loop {
         if mi >= methods.len { break }
+        if methods[mi].is_abstract { mi++; continue }
         let mf = match type_method(methods[mi], td.name, env, table) {
             TFunction as x => x
             error as e => return surface_at(file, methods[mi].line, methods[mi].col, e)

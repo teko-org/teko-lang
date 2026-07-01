@@ -23,6 +23,7 @@
 #include "../parser/ast.h"    // tk_bind_kind, tk_bind_target, tk_path
 #include "../checker/escape.h" // MEM Step 1 — the escape check (frame-local classification)
 #include "../checker/monomorph.h" // (W10) tk_type_to_texpr — synthesize lifted-lambda fn params
+#include "../checker/collect.h"   // tk_type_table_of, tk_effective_class_fields (W10b.CLASS increment 2)
 
 #include <stdlib.h>           // malloc/realloc/free
 #include <string.h>           // memcpy, strlen
@@ -4033,7 +4034,7 @@ static bool cg_member_key_upper_texpr(cbuf *b, tk_type_expr m, const char **err)
 
 // Emit ONE type declaration. `name` is the decl's bare name; namespace is empty (the typed
 // item carries no provenance) so decl + ref mangle identically.
-static bool emit_type_decl(cbuf *b, tk_type_decl d, const char **err) {
+static bool emit_type_decl(cbuf *b, tk_tprogram prog, tk_type_decl d, const char **err) {
     tk_str ns = { NULL, 0 };
     switch (d.body.tag) {
         case TK_BODY_STRUCT: {
@@ -4160,18 +4161,22 @@ static bool emit_type_decl(cbuf *b, tk_type_decl d, const char **err) {
             cb(b, ";\n\n");
             return true;
         case TK_BODY_CLASS: {
-            // (W10b.CLASS increment 1) same C representation as a struct — same field layout,
-            // no inheritance/arena-per-object yet.
-            tk_class_body cb2 = d.body.as.class_body;
+            // (W10b.CLASS) same C representation as a struct — no arena-per-object yet.
+            // Increment 2: the EFFECTIVE (base-inherited) fields, so a derived class's C struct
+            // physically contains every ancestor's field too (field-flattening composition —
+            // no embedded C object/vtable).
+            tk_type_table table = tk_type_table_of(prog);
+            tk_fieldsvec_result eff = tk_effective_class_fields(d.body.as.class_body, table);
+            if (!eff.ok) return fail_node(err, "codegen: class inheritance error (unknown/invalid base class)");
             cb(b, "typedef struct ");
             mangle_type_name(b, ns, d.name);
             cb(b, " {\n");
-            for (size_t i = 0; i < cb2.n_fields; i += 1) {
+            for (size_t i = 0; i < eff.as.value.len; i += 1) {
                 cb(b, "    ");
-                if (!emit_type_expr(b, cb2.fields[i].type_ann, err)) return false;
+                if (!emit_type_expr(b, eff.as.value.ptr[i].type_ann, err)) return false;
                 cb(b, " ");
-                if (cg_field_boxed(d.name, cb2.fields[i].type_ann)) cb(b, "*");
-                cb_str(b, cb2.fields[i].name);
+                if (cg_field_boxed(d.name, eff.as.value.ptr[i].type_ann)) cb(b, "*");
+                cb_str(b, eff.as.value.ptr[i].name);
                 cb(b, ";\n");
             }
             cb(b, "} ");
@@ -4658,7 +4663,7 @@ static bool cg_emit_types_ordered(cbuf *b, tk_tprogram prog, const char **err) {
     size_t enum_count = 0;
     for (size_t i = 0; i < nn; i += 1) {
         if (named[i].body.tag != TK_BODY_ENUM && named[i].body.tag != TK_BODY_FLAGS) continue;
-        if (!emit_type_decl(b, named[i], err)) { CG_ORDERED_FREE(); return false; }
+        if (!emit_type_decl(b, prog, named[i], err)) { CG_ORDERED_FREE(); return false; }
         named_done[i] = true; enum_count += 1;
     }
     if (enum_count > 0) cb(b, "\n");
@@ -4707,7 +4712,7 @@ static bool cg_emit_types_ordered(cbuf *b, tk_tprogram prog, const char **err) {
         progress = false;
         for (size_t i = 0; i < nn; i += 1) {
             if (named_done[i] || !cg_named_ready(&N, named[i])) continue;
-            if (!emit_type_decl(b, named[i], err)) { CG_ORDERED_FREE(); return false; }
+            if (!emit_type_decl(b, prog, named[i], err)) { CG_ORDERED_FREE(); return false; }
             named_done[i] = true; remaining -= 1; progress = true;
         }
         for (size_t i = 0; i < set.len; i += 1) {

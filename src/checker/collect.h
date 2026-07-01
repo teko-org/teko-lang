@@ -9,6 +9,16 @@ TK_RESULT(tk_collected, tk_collected_result);
 
 tk_collected_result tk_collect(tk_program program);
 
+// (W10b.CLASS increment 2) inheritance helpers — shared with expr.c/typer.c (a class's
+// instance-method dispatch, field access, and construction all need the EFFECTIVE, base-
+// inherited shape, not just what's textually declared on the class itself).
+typedef struct { bool ok; union { tk_class_body value; tk_error error; } as; } tk_classbody_result;
+typedef struct { bool ok; union { struct { tk_field *ptr; size_t len; } value; tk_error error; } as; } tk_fieldsvec_result;
+typedef struct { bool ok; union { struct { tk_function *ptr; size_t len; } value; tk_error error; } as; } tk_methodsvec_result;
+tk_classbody_result  tk_find_class_body(tk_str name, tk_type_table table);
+tk_fieldsvec_result  tk_effective_class_fields(tk_class_body cb, tk_type_table table);
+tk_methodsvec_result tk_effective_class_methods(tk_class_body cb, tk_type_table table);
+
 // C7.12 — reconstruct a TypeTable from a typed program's pass-through TypeDecl items.
 // Used by the package backend in driver.c (which has a tk_tprogram, not a tk_program).
 // The namespace is set to "" — sufficient for resolve_type; W-vis-enforce is not called.

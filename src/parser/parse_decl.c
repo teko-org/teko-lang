@@ -238,6 +238,17 @@ tk_parsed_decl_result tk_parse_function(const tk_token *t, size_t n, size_t pos,
         tk_decl ed = { .tag = TK_DECL_FUNCTION, .as.function = ef };
         return (tk_parsed_decl_result){ .ok = true, .as.value = { .node = ed, .next = p } };
     }
+    // (W10b.CLASS increment 2) `abstract fn …` — a SIGNATURE ONLY, no body (abstract classes only;
+    // enforced by the checker, not the parser). A bare `;`/newline/`}` follows instead of `{`.
+    if (is_abstract && !tk_is_kind_at(t, n, p, TK_TOKEN_LBRACE)) {
+        tk_function af = { .name = name, .type_params = tps.as.value.names, .n_type_params = tps.as.value.n, .type_constraints = tps.as.value.constraints, .params = ps.as.value.items, .nparams = ps.as.value.n_params,
+            .has_return = has_return, .return_type = ret,
+            .body = NULL, .nbody = 0,
+            .vis = vis, .has_doc = has_doc, .doc = doc, .line = name_line, .col = name_col, .is_test = is_test,
+            .is_extern = false, .c_symbol = (tk_str){0}, .from_lib = (tk_str){0}, .os_guard = os_guard, .is_intern = is_intern, .is_abstract = is_abstract, .is_virtual = is_virtual, .is_override = is_override };
+        tk_decl ad = { .tag = TK_DECL_FUNCTION, .as.function = af };
+        return (tk_parsed_decl_result){ .ok = true, .as.value = { .node = ad, .next = p } };
+    }
     if (!tk_is_kind_at(t, n, p, TK_TOKEN_LBRACE)) {
         return (tk_parsed_decl_result){ .ok = false, .as.error = tk_err_at(t, n, p, "expected '{' for the function body") };
     }

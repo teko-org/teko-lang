@@ -527,19 +527,25 @@ static tk_str type_str_concat(tk_str a, tk_str b) {
 // exactly, so codegen/VM mangle+resolve method calls to these SAME items). A struct with
 // methods contributes MULTIPLE tk_titems, not one — pushed onto `items` by the caller.
 static bool type_struct_methods(tk_type_decl td, tk_str item_ns, tk_str file, tk_env env, tk_type_table table, tk_titem_list *items, tk_error *out_err) {
-    // (W10b.CLASS increment 1) a class's methods are typed/stamped by this SAME pass — only the
-    // methods list's source differs; a class method is otherwise identical to a struct method.
+    // (W10b.CLASS) a class's methods are typed/stamped by this SAME pass — only the methods
+    // list's source differs; a class method is otherwise identical to a struct method.
+    // Increment 2: stamps the EFFECTIVE (base-inherited + overridden) methods against THIS
+    // class's own name (re-typed/re-emitted per owning class, no vtable/dispatch yet). An
+    // `abstract fn` (no body, never overridden by THIS class) has nothing to emit — skipped.
     tk_function *methods; size_t n_methods;
     if (td.body.tag == TK_BODY_STRUCT) {
         methods = td.body.as.struct_body.methods; n_methods = td.body.as.struct_body.n_methods;
     } else if (td.body.tag == TK_BODY_CLASS) {
-        methods = td.body.as.class_body.methods; n_methods = td.body.as.class_body.n_methods;
+        tk_methodsvec_result eff = tk_effective_class_methods(td.body.as.class_body, table);
+        if (!eff.ok) { *out_err = eff.as.error; return false; }
+        methods = eff.as.value.ptr; n_methods = eff.as.value.len;
     } else {
         return true;
     }
     tk_str sep = { .ptr = (const tk_byte *)"::", .len = 2 };
     tk_str method_ns = item_ns.len == 0 ? td.name : type_str_concat(type_str_concat(item_ns, sep), td.name);
     for (size_t mi = 0; mi < n_methods; mi += 1) {
+        if (methods[mi].is_abstract) continue;
         tk_tfunction_result mf = type_method(methods[mi], td.name, env, table);
         if (!mf.ok) {
             uint32_t el = mf.as.error.line ? mf.as.error.line : methods[mi].line;

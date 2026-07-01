@@ -4768,18 +4768,23 @@ fn emit_type_decl(buf: []byte, prog: checker::TProgram, d: parser::TypeDecl) -> 
             out = mangle_type_name(out, "", d.name)
             cb(out, ";\n\n")
         }
-        parser::ClassBody as cb2 => {   // (W10b.CLASS increment 1) same C representation as a struct — same field layout, no inheritance/arena-per-object yet
+        parser::ClassBody as cb2 => {   // (W10b.CLASS) same C representation as a struct — same field
+            // layout, no arena-per-object yet. Increment 2: the EFFECTIVE (base-inherited) fields,
+            // so a derived class's C struct physically contains every ancestor's field too
+            // (field-flattening composition — no embedded C object/vtable).
+            let table = checker::type_table_of(prog)
+            let fields = match checker::effective_class_fields(cb2, table) { []parser::Field as fs => fs; error as err => return err }
             mut out = cb(buf, "typedef struct ")
             out = mangle_type_name(out, "", d.name)
             out = cb(out, " {\n")
             mut i = 0
             loop {
-                if i >= cb2.fields.len { break }
+                if i >= fields.len { break }
                 out = cb(out, "    ")
-                out = match emit_type_expr(out, prog, cb2.fields[i].type_ann) { []byte as o => o; error as err => return err }
+                out = match emit_type_expr(out, prog, fields[i].type_ann) { []byte as o => o; error as err => return err }
                 out = cb(out, " ")
-                if cg_field_boxed(prog, d.name, cb2.fields[i].type_ann) { out = cb(out, "*") }
-                out = cb_str(out, cb2.fields[i].name)
+                if cg_field_boxed(prog, d.name, fields[i].type_ann) { out = cb(out, "*") }
+                out = cb_str(out, fields[i].name)
                 out = cb(out, ";\n")
                 i++
             }

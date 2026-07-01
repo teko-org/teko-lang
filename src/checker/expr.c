@@ -6,6 +6,7 @@
 #include "expr.h"
 #include "typer_internal.h"   // tk_type_block (statement side, for if/match bodies)
 #include "../parser/parse_stmt.h"   // no_expr (DEFARGS placeholder, 2026-07-01)
+#include "collect.h"          // tk_effective_class_fields/methods (W10b.CLASS increment 2)
 #include <string.h>           // memcmp (string-span compares)
 
 // shared from match.c (E5b-2), promoted to non-static for reuse:
@@ -397,15 +398,18 @@ static tk_texpr_result type_method_call(tk_method_call mc, tk_env env, tk_type_t
     tk_str struct_name = recv_t.as.named.name;
     tk_decl_result td = tk_type_table_find(table, struct_name);
     if (!td.ok) return xerr("method typing is deferred (B.29 / M.4)");
-    // (W10b.CLASS increment 1) a class's instance dot-call reuses this SAME desugar — only the
-    // methods list's source differs; a class's methods are otherwise typed exactly like a struct's.
+    // (W10b.CLASS) a class's instance dot-call reuses this SAME desugar — only the methods
+    // list's source differs; a class's methods are otherwise typed exactly like a struct's.
+    // Increment 2: the EFFECTIVE (base-inherited + overridden) methods, so an inherited method
+    // is callable through a derived instance too.
     tk_function *methods; size_t n_methods;
     if (td.as.value.body.tag == TK_BODY_STRUCT) {
         methods = td.as.value.body.as.struct_body.methods;
         n_methods = td.as.value.body.as.struct_body.n_methods;
     } else if (td.as.value.body.tag == TK_BODY_CLASS) {
-        methods = td.as.value.body.as.class_body.methods;
-        n_methods = td.as.value.body.as.class_body.n_methods;
+        tk_methodsvec_result eff = tk_effective_class_methods(td.as.value.body.as.class_body, table);
+        if (!eff.ok) return xferr(eff.as.error);
+        methods = eff.as.value.ptr; n_methods = eff.as.value.len;
     } else {
         return xerr("method typing is deferred (B.29 / M.4)");
     }
@@ -832,12 +836,15 @@ static tk_texpr_result type_field_access(tk_field_access fa, tk_env env, tk_type
     if (recv.as.value.type.tag != TK_TYPE_NAMED) return xerr("field access requires a struct receiver");
     tk_decl_result decl = tk_type_table_find(table, recv.as.value.type.as.named.name);
     if (!decl.ok) return xerr("unknown type for field access");
-    // (W10b.CLASS increment 1) a class's fields are read exactly like a struct's.
+    // (W10b.CLASS) a class's fields are read exactly like a struct's; increment 2 uses the
+    // EFFECTIVE (base-inherited) field set.
     tk_struct_body fa_sb;
     if (decl.as.value.body.tag == TK_BODY_STRUCT) {
         fa_sb = decl.as.value.body.as.struct_body;
     } else if (decl.as.value.body.tag == TK_BODY_CLASS) {
-        fa_sb = (tk_struct_body){ .fields = decl.as.value.body.as.class_body.fields, .n_fields = decl.as.value.body.as.class_body.n_fields, .methods = NULL, .n_methods = 0 };
+        tk_fieldsvec_result eff = tk_effective_class_fields(decl.as.value.body.as.class_body, table);
+        if (!eff.ok) return xferr(eff.as.error);
+        fa_sb = (tk_struct_body){ .fields = eff.as.value.ptr, .n_fields = eff.as.value.len, .methods = NULL, .n_methods = 0 };
     } else {
         return xerr("type is not a struct (no fields)");
     }
@@ -887,12 +894,15 @@ static tk_texpr_result type_safe_field_access(tk_safe_field_access sfa, tk_env e
         return xerr("safe field access on a non-struct optional is not yet supported (the struct-field layer is pending — M.3)");
     tk_decl_result decl = tk_type_table_find(table, inner.as.named.name);
     if (!decl.ok) return xerr("unknown type for safe field access");
-    // (W10b.CLASS increment 1) a class's fields are read exactly like a struct's.
+    // (W10b.CLASS) a class's fields are read exactly like a struct's; increment 2 uses the
+    // EFFECTIVE (base-inherited) field set.
     tk_struct_body sfa_sb;
     if (decl.as.value.body.tag == TK_BODY_STRUCT) {
         sfa_sb = decl.as.value.body.as.struct_body;
     } else if (decl.as.value.body.tag == TK_BODY_CLASS) {
-        sfa_sb = (tk_struct_body){ .fields = decl.as.value.body.as.class_body.fields, .n_fields = decl.as.value.body.as.class_body.n_fields, .methods = NULL, .n_methods = 0 };
+        tk_fieldsvec_result eff = tk_effective_class_fields(decl.as.value.body.as.class_body, table);
+        if (!eff.ok) return xferr(eff.as.error);
+        sfa_sb = (tk_struct_body){ .fields = eff.as.value.ptr, .n_fields = eff.as.value.len, .methods = NULL, .n_methods = 0 };
     } else {
         return xerr("type is not a struct (no fields)");
     }
@@ -1004,14 +1014,19 @@ tk_texpr_result tk_type_struct_lit(tk_struct_lit sl, tk_type expected, tk_env en
         if (!decl.ok) return xerr("internal: generic instance was not stamped");
         name = mname;
     }
-    // (W10b.CLASS increment 1) `Name { … }` also constructs a class instance — a class's fields
-    // are typed identically to a struct's; the "who may construct me" restriction (a class's
-    // literal legal only inside its own static factory) is a LATER increment, not enforced yet.
+    // (W10b.CLASS) `Name { … }` also constructs a class instance — a class's fields are typed
+    // identically to a struct's (increment 2: the EFFECTIVE, base-inherited fields too). An
+    // `abstract` class cannot be instantiated directly. The "who may construct me" restriction
+    // (a class's literal legal only inside its own static factory) is a LATER increment.
     tk_field *sb_fields; size_t sb_n_fields;
     if (decl.as.value.body.tag == TK_BODY_STRUCT) {
         sb_fields = decl.as.value.body.as.struct_body.fields; sb_n_fields = decl.as.value.body.as.struct_body.n_fields;
     } else if (decl.as.value.body.tag == TK_BODY_CLASS) {
-        sb_fields = decl.as.value.body.as.class_body.fields; sb_n_fields = decl.as.value.body.as.class_body.n_fields;
+        if (decl.as.value.body.as.class_body.kind == TK_CLASS_ABSTRACT)
+            return xferr(tk_error_named("is abstract and cannot be instantiated directly", name));
+        tk_fieldsvec_result eff = tk_effective_class_fields(decl.as.value.body.as.class_body, table);
+        if (!eff.ok) return xferr(eff.as.error);
+        sb_fields = eff.as.value.ptr; sb_n_fields = eff.as.value.len;
     } else {
         return xerr("struct-literal target is not a struct");
     }

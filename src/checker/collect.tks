@@ -122,18 +122,21 @@ fn collect_funcs(items: []parser::Item, table: TypeTable) -> Env | error {
                             mi++
                         }
                     }
-                    // (W10b.CLASS increment 1) same registration as a struct method — the receiver
-                    // is still Named{class_name} (by-value); a Ref<T> receiver is a later increment.
+                    // (W10b.CLASS) same registration as a struct method — the receiver is still
+                    // Named{class_name} (by-value); a Ref<T> receiver is a later increment. Registers
+                    // the EFFECTIVE (base-inherited + own/overridden) methods (increment 2), so an
+                    // inherited-but-not-overridden method is callable as DerivedClass::method(…) too.
                     parser::ClassBody as cb => {
                         let method_ns = if items[i].namespace == "" { td.name } else { items[i].namespace ~ "::" ~ td.name }
+                        let eff = match effective_class_methods(cb, table) { []parser::Function as f => f; error as e => return e }
                         mut mi = 0
                         loop {
-                            if mi >= cb.methods.len { break }
-                            let mft = match method_func_type(cb.methods[mi], td.name, table) {
+                            if mi >= eff.len { break }
+                            let mft = match method_func_type(eff[mi], td.name, table) {
                                 Type as t  => t
                                 error as e => return e
                             }
-                            env = define_fn(env, cb.methods[mi].name, mft, method_ns)
+                            env = define_fn(env, eff[mi].name, mft, method_ns)
                             mi++
                         }
                     }
@@ -165,6 +168,126 @@ pub fn type_table_of(prog: TProgram) -> TypeTable {
         i++
     }
     table
+}
+
+// (W10b.CLASS increment 2) look up a class's own parser::ClassBody by name (error if unknown or not a class).
+pub fn find_class_body(name: str, table: TypeTable) -> parser::ClassBody | error {
+    let decl = match type_table_find(table, name) {
+        parser::TypeDecl as td => td
+        error          => return error { message = $"unknown base class: {name}" }
+    }
+    match decl.body {
+        parser::ClassBody as cb => cb
+        _               => return error { message = $"{name} is not a class" }
+    }
+}
+
+// (W10b.CLASS increment 2) a class's EFFECTIVE fields: the base's effective fields (recursively),
+// followed by its own — structural inheritance by field-flattening (composition, no embedded C
+// object/vtable yet). Used everywhere a class's data shape matters (construction, field access,
+// codegen struct layout) so a derived instance carries every ancestor's field too.
+pub fn effective_class_fields(cb: parser::ClassBody, table: TypeTable) -> []parser::Field | error {
+    mut base: []parser::Field = teko::list::empty()
+    if cb.has_base {
+        let base_cb = match find_class_body(cb.base_name, table) { parser::ClassBody as b => b; error as e => return e }
+        base = match effective_class_fields(base_cb, table) { []parser::Field as f => f; error as e => return e }
+    }
+    mut out: []parser::Field = base
+    mut i = 0
+    loop { if i >= cb.fields.len { break }; out = teko::list::push(out, cb.fields[i]); i++ }
+    out
+}
+
+// (W10b.CLASS increment 2) a class's EFFECTIVE methods: the base's effective methods (recursively),
+// each REPLACED by an `override` of the same name if this class declares one, plus this class's
+// own NEW methods appended. This is how a derived instance can call an inherited method it never
+// re-declares (`derived.baseMethod()`) — the caller (collect_funcs/type_struct_methods/
+// type_method_call) always re-types/re-stamps against the CURRENT class's own name, so an
+// inherited method's body is retyped (and re-emitted) once per class that effectively owns it.
+pub fn effective_class_methods(cb: parser::ClassBody, table: TypeTable) -> []parser::Function | error {
+    mut base: []parser::Function = teko::list::empty()
+    if cb.has_base {
+        let base_cb = match find_class_body(cb.base_name, table) { parser::ClassBody as b => b; error as e => return e }
+        base = match effective_class_methods(base_cb, table) { []parser::Function as f => f; error as e => return e }
+    }
+    mut out: []parser::Function = teko::list::empty()
+    mut i = 0
+    loop {
+        if i >= base.len { break }
+        mut m = base[i]
+        mut j = 0
+        loop {
+            if j >= cb.methods.len { break }
+            if cb.methods[j].name == m.name { m = cb.methods[j] }
+            j++
+        }
+        out = teko::list::push(out, m)
+        i++
+    }
+    mut k = 0
+    loop {
+        if k >= cb.methods.len { break }
+        mut is_new = true
+        mut bi = 0
+        loop { if bi >= base.len { break }; if base[bi].name == cb.methods[k].name { is_new = false; break }; bi++ }
+        if is_new { out = teko::list::push(out, cb.methods[k]) }
+        k++
+    }
+    out
+}
+
+// (W10b.CLASS increment 2) validate ONE class's inheritance/override declarations:
+//  - a base class must exist, be a class, and be `abstract`/`virtual` (NOT sealed — a sealed
+//    class is final, per ClassKind's doc).
+//  - an `override` method must match an existing method in the base's EFFECTIVE methods, and
+//    that base method must itself be overridable (`abstract`/`virtual`/already `override`).
+fn validate_class_decl(cb: parser::ClassBody, table: TypeTable) -> error? {
+    if cb.has_base {
+        let base_decl = match type_table_find(table, cb.base_name) {
+            parser::TypeDecl as td => td
+            error          => return error { message = $"unknown base class: {cb.base_name}" }
+        }
+        let base_cb = match base_decl.body {
+            parser::ClassBody as b => b
+            _               => return error { message = $"{cb.base_name} is not a class" }
+        }
+        match base_cb.kind {
+            parser::ClassKind::Sealed => return error { message = $"cannot inherit from `{cb.base_name}` — it is sealed (only `abstract`/`virtual` classes can be a base)" }
+            _ => {}
+        }
+    }
+    let base_methods = if cb.has_base {
+        match find_class_body(cb.base_name, table) {
+            parser::ClassBody as b => match effective_class_methods(b, table) { []parser::Function as f => f; error as e => return e }
+            error as e => return e
+        }
+    } else {
+        teko::list::empty()
+    }
+    mut i = 0
+    loop {
+        if i >= cb.methods.len { break }
+        let m = cb.methods[i]
+        if m.is_override {
+            mut found: parser::Function? = null
+            mut j = 0
+            loop {
+                if j >= base_methods.len { break }
+                if base_methods[j].name == m.name { found = base_methods[j]; break }
+                j++
+            }
+            match found {
+                null => return error { message = $"'{m.name}' has no matching base method to override" }
+                parser::Function as bm => {
+                    let overridable = bm.is_abstract || bm.is_virtual || bm.is_override
+                    if !overridable { return error { message = $"'{m.name}' overrides a base method that is not `abstract`/`virtual`" } }
+                    if bm.params.len != m.params.len { return error { message = $"'{m.name}' override must have the same parameter count as the base method" } }
+                }
+            }
+        }
+        i++
+    }
+    null
 }
 
 // (MEM Step 0, R4) ESCAPE GATE — a reference cannot be a struct FIELD, variant member, slice
@@ -208,6 +331,7 @@ fn validate_type_decls(table: TypeTable) -> error? {
                     }
                     f++
                 }
+                match validate_class_decl(cb, table) { error as e => return e; null => {} }   // (W10b.CLASS increment 2)
             }
             _ => {}
         }
@@ -273,17 +397,19 @@ fn collect_with_seed(program: parser::Program, seed: Collected) -> Collected | e
                             mi++
                         }
                     }
-                    // (W10b.CLASS increment 1) mirrors collect_funcs' class-method registration
+                    // (W10b.CLASS) mirrors collect_funcs' class-method registration (increment 2:
+                    // registers the EFFECTIVE, base-inherited methods too)
                     parser::ClassBody as cb => {
                         let method_ns = if program.items[j].namespace == "" { td.name } else { program.items[j].namespace ~ "::" ~ td.name }
+                        let eff = match effective_class_methods(cb, table) { []parser::Function as f => f; error as e => return e }
                         mut mi = 0
                         loop {
-                            if mi >= cb.methods.len { break }
-                            let mft = match method_func_type(cb.methods[mi], td.name, table) {
+                            if mi >= eff.len { break }
+                            let mft = match method_func_type(eff[mi], td.name, table) {
                                 Type as t  => t
                                 error as e => return e
                             }
-                            env = define_fn(env, cb.methods[mi].name, mft, method_ns)
+                            env = define_fn(env, eff[mi].name, mft, method_ns)
                             mi++
                         }
                     }
