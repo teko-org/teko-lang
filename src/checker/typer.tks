@@ -480,13 +480,62 @@ fn resolve_defargs(f: Func, args: []parser::Expr, arg_names: []str) -> []parser:
     resolved
 }
 
+// (C8.3, ported 2026-07-01 to close a self-host gap — see is_flags_method) flags helper method
+// calls: recv.has/all/any/none/add/remove(mask). Lowered to synthetic TAST nodes directly (not
+// through type_binary/type_unary's normal operator checks — the mask arithmetic is internal):
+//   add(mask)    -> recv | mask             (TBinary, flags type)
+//   remove(mask) -> recv & ~mask            (TBinary with a nested TUnary)
+//   has/all(mask)-> (recv & mask) == mask   (TCompare, bool)
+//   any(mask)    -> (recv & mask) != 0_flags
+//   none(mask)   -> (recv & mask) == 0_flags
+// The C bootstrap (expr.c::type_flags_method) has carried this since C8.3; the self-hosted .tks
+// checker never did (is_flags_method was defined, dead — a MethodCall always hit the "deferred"
+// error before it could dispatch here). Mirror of expr.c::type_flags_method.
+fn type_flags_method(mc: parser::MethodCall, env: Env, table: TypeTable) -> TExpr | error {
+    let recv = match type_expr(mc.receiver, env, table) { TExpr as te => te; error as e => return e }
+    let rt = recv.type
+    if !is_flags_named(rt, table) { return error { message = "method call on a non-flags receiver (flags methods: has/all/any/none/add/remove)" } }
+    if mc.args.len != 1 { return error { message = "flags methods take exactly one argument (the mask)" } }
+    let mask = match type_expr(mc.args[0], env, table) { TExpr as te => te; error as e => return e }
+    if !type_eq(rt, mask.type) {
+        return teko::error::err_typed(error { message = "flags method argument must be the same flags type as the receiver" }, type_render(rt), type_render(mask.type))
+    }
+    let is_has  = mc.method == "has"
+    let is_all  = mc.method == "all"
+    let is_any  = mc.method == "any"
+    let is_none = mc.method == "none"
+    let is_add  = mc.method == "add"
+    let is_rem  = mc.method == "remove"
+    if !is_has && !is_all && !is_any && !is_none && !is_add && !is_rem {
+        return error { message = "unknown flags method (has/all/any/none/add/remove)" }
+    }
+    if is_add {
+        return TExpr { kind = TBinary { op = lexer::TokenKind::Pipe; left = recv; right = mask }; type = rt; line = 0; col = 0 }
+    }
+    if is_rem {
+        let notmask = TExpr { kind = TUnary { op = lexer::TokenKind::Tilde; operand = mask }; type = rt; line = 0; col = 0 }
+        return TExpr { kind = TBinary { op = lexer::TokenKind::Amp; left = recv; right = notmask }; type = rt; line = 0; col = 0 }
+    }
+    let andexpr = TExpr { kind = TBinary { op = lexer::TokenKind::Amp; left = recv; right = mask }; type = rt; line = 0; col = 0 }
+    if is_has || is_all {
+        let term = TCmpTerm { op = lexer::TokenKind::EqEq; operand = mask }
+        return TExpr { kind = TCompare { first = andexpr; rest = teko::list::push(teko::list::empty(), term) }; type = Prim { kind = PrimKind::Bool }; line = 0; col = 0 }
+    }
+    // any/none: compare (recv & mask) against a zero-valued flags literal (the same pattern as
+    // an enum ordinal cast — codegen/VM read the NAMED flags type off the node, not the literal).
+    let zero = TExpr { kind = TNumber { is_float = false; value = 0; fval = 0.0 }; type = rt; line = 0; col = 0 }
+    let cmp_op = if is_none { lexer::TokenKind::EqEq } else { lexer::TokenKind::Ne }
+    let term = TCmpTerm { op = cmp_op; operand = zero }
+    TExpr { kind = TCompare { first = andexpr; rest = teko::list::push(teko::list::empty(), term) }; type = Prim { kind = PrimKind::Bool }; line = 0; col = 0 }
+}
+
 // (OOP A1, 2026-07-01) `recv.method(args)` — an INSTANCE struct-method dot-call. Desugars into
 // an ordinary `StructName::method(recv, ...args)` Call and delegates to `type_call` wholesale
 // (reuses arity/defargs/generics/namespace-mangling for free — the same trick `~` used for
 // `teko::string::concat`). The receiver is typed ONCE here just to discover which struct/method
 // is targeted; `type_call` re-types it (and every arg) as part of its normal argument pass.
-// Flags-typed receivers keep the PRE-EXISTING (untouched) "deferred" error — flags-method
-// dispatch is a separate, already-known .tks/C divergence, out of scope here (see is_flags_named).
+// Flags-typed receivers dispatch to type_flags_method (the dispatch's job, mirroring the C
+// switch's precedence — see type_dispatch's MethodCall arm), never reaching here.
 fn type_method_call(mc: parser::MethodCall, env: Env, table: TypeTable) -> TExpr | error {
     let recv_t = match type_expr(mc.receiver, env, table) { TExpr as te => te.type; error as e => return e }
     if is_flags_named(recv_t, table) { return error { message = "method typing is deferred (B.29 / M.4)" } }
@@ -1298,11 +1347,16 @@ fn type_array_lit(a: parser::ArrayLit, env: Env, table: TypeTable) -> TExpr | er
 // `Enum::Member` as a VALUE — the enum type (path minus the member) resolved to an `enum` decl,
 // the member checked, the node typed NAMED(enum) carrying enum name + member ORDINAL (so both
 // backends lower without re-lookup). C twin: type_path_expr in expr.c.
+// (C8.3, ported 2026-07-01 alongside type_flags_method to unblock its self-host testing — see
+// expr.c::type_path_expr) `Type::Member` as a VALUE: an ENUM member (ordinal = declaration
+// index) OR a FLAGS member (ordinal = the BIT INDEX, i.e. the member's power-of-2 position, not
+// its value — codegen/VM compute the actual `1 << ordinal`). The .tks side previously supported
+// ONLY enum; flags fell through to the enum-only error, a self-host divergence from expr.c.
 fn type_path_expr(pe: parser::PathExpr, table: TypeTable) -> TExpr | error {
     let p = pe.path
-    if p.segments.len < 2 { return error { message = "a path expression must name an enum member (`Enum::Member`)" } }
+    if p.segments.len < 2 { return error { message = "a path expression must name an enum or flags member (`Type::Member`)" } }
     let member = p.segments[p.segments.len - 1].name
-    mut segs: []parser::Segment = teko::list::empty()                  // the enum type = the path minus its last segment
+    mut segs: []parser::Segment = teko::list::empty()                  // the type = the path minus its last segment
     mut i: u64 = 0
     loop {
         if i >= p.segments.len - 1 { break }
@@ -1310,16 +1364,30 @@ fn type_path_expr(pe: parser::PathExpr, table: TypeTable) -> TExpr | error {
         i++
     }
     let et = match resolve_named(parser::Path { segments = segs }, table) { Type as t => t; error as e => return e }
-    let ename = match et { Named as n => n.name; _ => return error { message = "`Enum::Member` requires a named enum type" } }
-    let decl = match type_table_find(table, ename) { parser::TypeDecl as td => td; error => return error { message = $"unknown type in an `Enum::Member` path: {ename}" } }
-    let eb = match decl.body { parser::EnumBody as e => e; _ => return error { message = $"`{ename}::{member}` requires an `enum` type" } }
-    mut j: u64 = 0
-    loop {
-        if j >= eb.members.len { break }
-        if eb.members[j] == member { return TExpr { kind = TPathExpr { enum_name = ename; member = member; ordinal = j }; type = et; line = 0; col = 0 } }
-        j++
+    let tname = match et { Named as n => n.name; _ => return error { message = "`Type::Member` requires a named enum or flags type" } }
+    let decl = match type_table_find(table, tname) { parser::TypeDecl as td => td; error => return error { message = $"unknown type in a `Type::Member` path: {tname}" } }
+    match decl.body {
+        parser::EnumBody as eb => {
+            mut j: u64 = 0
+            loop {
+                if j >= eb.members.len { break }
+                if eb.members[j] == member { return TExpr { kind = TPathExpr { enum_name = tname; member = member; ordinal = j }; type = et; line = 0; col = 0 } }
+                j++
+            }
+            error { message = $"no member `{member}` in enum `{tname}`" }
+        }
+        parser::FlagsBody as fb => {
+            if fb.members.len > 128 { return error { message = "flags type has more than 128 members (u128 overflow)" } }
+            mut j: u64 = 0
+            loop {
+                if j >= fb.members.len { break }
+                if fb.members[j] == member { return TExpr { kind = TPathExpr { enum_name = tname; member = member; ordinal = j }; type = et; line = 0; col = 0 } }
+                j++
+            }
+            error { message = $"no member `{member}` in the flags type `{tname}`" }
+        }
+        _ => error { message = "`Type::Member` requires an `enum` or `flags` type" }
     }
-    error { message = $"no member `{member}` in enum `{ename}`" }
 }
 
 // (C1-POS) inner dispatch — the raw match over the untyped Expr's `kind`. The public type_expr
@@ -1345,7 +1413,16 @@ fn type_dispatch(e: parser::Expr, env: Env, table: TypeTable) -> TExpr | error {
         parser::SafeFieldAccess as sfa => type_safe_field_access(sfa, env, table)
         parser::Coalesce as co => type_coalesce(co, env, table)
         parser::Cast as c      => type_cast(c, env, table)
-        parser::MethodCall as mc => type_method_call(mc, env, table)   // OOP A1 (2026-07-01)
+        parser::MethodCall as mc => {
+            // (C8.3) flags helper methods are typed here; (OOP A1) struct instance methods
+            // dispatch to type_method_call; anything else remains deferred. Mirror of expr.c's
+            // TK_EXPR_METHOD_CALL case (the receiver is probed once for the flags check, then
+            // re-typed inside whichever branch actually handles the call).
+            match type_expr(mc.receiver, env, table) {
+                TExpr as te => if is_flags_named(te.type, table) { type_flags_method(mc, env, table) } else { type_method_call(mc, env, table) }
+                error       => type_method_call(mc, env, table)   // let it re-type and surface the real error
+            }
+        }
         parser::PathExpr as pe => type_path_expr(pe, table)   // Enum::Member as a value
         parser::StructLit as sl => type_struct_lit(sl, Void { }, env, table)   // W4a (no expected type in expr position)
         parser::Index as ix    => type_index(ix, env, table)        // W5-idx

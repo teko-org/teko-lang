@@ -2017,3 +2017,58 @@ fn oop_unknown_method_is_error() {
         error    => teko::assert::is_true(true)
     }
 }
+
+// --- flags methods (C8.3, self-host ported 2026-07-01) ---------------------------------------
+fn mk_perm_flags() -> parser::TypeDecl {
+    let members = teko::list::push(teko::list::push(teko::list::empty(), "Read"), "Write")
+    parser::TypeDecl { name = "Perm"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::FlagsBody { members = members; values = teko::list::empty() }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }
+}
+fn perm_item() -> parser::Item { parser::Item { content = mk_perm_flags(); namespace = ""; file = "" } }
+fn perm_member(name: str) -> parser::Expr { ek(parser::PathExpr { path = parser::Path { segments = teko::list::push(teko::list::push(teko::list::empty(), parser::Segment { name = "Perm" }), parser::Segment { name = name }) } }) }
+fn perm_bind_p() -> parser::Statement { parser::Binding { kind = parser::BindKind::Let; target = parser::SimpleName { name = "p" }; has_type = false; type_ann = named_t("i64"); value = perm_member("Read") } }
+fn perm_method_call(method: str, arg: parser::Expr) -> parser::Statement { st(ek(parser::MethodCall { receiver = e_var("p"); method = method; args = teko::list::push(teko::list::empty(), arg) })) }
+
+#test
+fn flags_has_type_checks() {
+    let call = perm_method_call("has", perm_member("Read"))
+    let items = teko::list::push(teko::list::push(teko::list::empty(), perm_item()), parser::Item { content = perm_bind_p(); namespace = ""; file = "" })
+    let items2 = teko::list::push(items, parser::Item { content = call; namespace = ""; file = "" })
+    match type_program(parser::Program { items = items2 }) {
+        TProgram => teko::assert::is_true(true)
+        error    => teko::assert::is_true(false)   // must NOT fail
+    }
+}
+
+#test
+fn flags_add_type_checks() {
+    let call = perm_method_call("add", perm_member("Write"))
+    let items = teko::list::push(teko::list::push(teko::list::empty(), perm_item()), parser::Item { content = perm_bind_p(); namespace = ""; file = "" })
+    let items2 = teko::list::push(items, parser::Item { content = call; namespace = ""; file = "" })
+    match type_program(parser::Program { items = items2 }) {
+        TProgram => teko::assert::is_true(true)
+        error    => teko::assert::is_true(false)   // must NOT fail
+    }
+}
+
+#test
+fn flags_unknown_method_is_error() {
+    let call = perm_method_call("nope", perm_member("Read"))
+    let items = teko::list::push(teko::list::push(teko::list::empty(), perm_item()), parser::Item { content = perm_bind_p(); namespace = ""; file = "" })
+    let items2 = teko::list::push(items, parser::Item { content = call; namespace = ""; file = "" })
+    match type_program(parser::Program { items = items2 }) {
+        TProgram => teko::assert::is_true(false)   // must fail
+        error    => teko::assert::is_true(true)
+    }
+}
+
+#test
+fn flags_wrong_arg_type_is_error() {
+    // has() called with an i64 (not the same flags type) -- must fail.
+    let call = perm_method_call("has", e_num(1))
+    let items = teko::list::push(teko::list::push(teko::list::empty(), perm_item()), parser::Item { content = perm_bind_p(); namespace = ""; file = "" })
+    let items2 = teko::list::push(items, parser::Item { content = call; namespace = ""; file = "" })
+    match type_program(parser::Program { items = items2 }) {
+        TProgram => teko::assert::is_true(false)   // must fail
+        error    => teko::assert::is_true(true)
+    }
+}
