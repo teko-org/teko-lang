@@ -164,13 +164,12 @@ static void mark_expr(tk_texpr e, bool escaping, tk_escape_set *acc) {
             return;
         }
         case TK_TEXPR_INTERP: {
-            // an interpolation BUILDS a fresh str; its holes are rendered (copied), never aliased.
-            // But the holes are EVALUATED in the outer context: when the interp is the tail value
-            // (escaping=true) they render AFTER the frame-region drop, so a `a.b`-style hole derefs
-            // a frame cell post-drop → propagate `escaping` (UAF audit). The bare-TVar scalar
-            // refinement still keeps `"{x.val}"` frame-local one level down.
-            for (size_t i = 0; i < e.as.interp.nholes; i += 1)
+            for (size_t i = 0; i < e.as.interp.nholes; i += 1) {
                 mark_expr(e.as.interp.holes[i], escaping, acc);
+                if (e.as.interp.specs && e.as.interp.specs[i].kind == TK_FSPEC_DYNAMIC)
+                    for (size_t k = 0; k < e.as.interp.specs[i].ndyn_args; k++)
+                        mark_expr(e.as.interp.specs[i].dyn_args[k], escaping, acc);
+            }
             return;
         }
         case TK_TEXPR_IN: {
@@ -341,8 +340,12 @@ static size_t count_reads_expr(tk_texpr e, tk_str name) {
         }
         case TK_TEXPR_INTERP: {
             size_t n = 0;
-            for (size_t i = 0; i < e.as.interp.nholes; i += 1)
+            for (size_t i = 0; i < e.as.interp.nholes; i += 1) {
                 n += count_reads_expr(e.as.interp.holes[i], name);
+                if (e.as.interp.specs && e.as.interp.specs[i].kind == TK_FSPEC_DYNAMIC)
+                    for (size_t k = 0; k < e.as.interp.specs[i].ndyn_args; k++)
+                        n += count_reads_expr(e.as.interp.specs[i].dyn_args[k], name);
+            }
             return n;
         }
         case TK_TEXPR_IN: {

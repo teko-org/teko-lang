@@ -932,24 +932,70 @@ fn type_index(ix: parser::Index, env: Env, table: TypeTable) -> TExpr | error {
     }
 }
 
+// is_interp_formattable — ROUND 0 hole types: str, char, bool, byte, error, int, float prims.
+fn is_interp_formattable(t: Type) -> bool {
+    match t {
+        Str   => true
+        Char  => true
+        Byte  => true
+        Error => true
+        Prim  => true   // all prim (int, float, bool)
+        _ => false
+    }
+}
+fn interp_is_numeric(t: Type) -> bool {
+    match t { Prim as p => true; _ => false }
+}
+
 // ---- string interpolation `$"…{expr}…"` (self-host parity) ----
-// Type each hole; SCOPE the hole types to what the corpus needs: a `str` hole passes through,
-// an INTEGER hole (any int prim, incl u64) converts to its decimal text, ANY OTHER hole type
-// is a clean error (no general to-string — M.3). The result type is `str`. The pieces are
-// carried verbatim (already decoded by the parser); each typed hole carries its own type so
-// VM/codegen know str-passthrough vs int→str.
+// ROUND 0 expansion: accepts str, char, bool, byte, error, int, float hole types.
+// Format specs: static (`:literal`) → validate hole is numeric; dynamic (`:[arg1,…]`) → validate
+// each arg is str. Named/variant types with specs → honest-stop. Result type is always `str`.
 fn type_interp(in: parser::Interp, env: Env, table: TypeTable) -> TExpr | error {
     mut holes: []TExpr = teko::list::empty()
+    mut specs: []TFSpec = teko::list::empty()
     mut i = 0
     loop {
         if i >= in.holes.len { break }
         let h = match type_expr(in.holes[i], env, table) { TExpr as te => te; error as e => return e }
-        let ok = match h.type { Str => true; _ => is_integer(h.type) }
-        if !ok { return error { message = "interpolation hole must be a str or an integer" } }
+        if !is_interp_formattable(h.type) {
+            return error { message = "interpolation hole type not supported in ROUND 0 (must be str/char/bool/byte/error/int/float)" }
+        }
         holes = teko::list::push(holes, h)
+        // type-check format spec if present
+        if i < in.specs.len {
+            let raw_sp = in.specs[i]
+            let typed_sp = match raw_sp.kind {
+                parser::FSpecNone => TFSpec { kind = TFSpecNone { } }
+                parser::FSpecStatic as fs => {
+                    if !interp_is_numeric(h.type) {
+                        return error { message = "format spec requires a numeric hole (int or float)" }
+                    }
+                    TFSpec { kind = TFSpecStatic { s = fs.s } }
+                }
+                parser::FSpecDynamic as fd => {
+                    if !interp_is_numeric(h.type) {
+                        return error { message = "format spec requires a numeric hole (int or float)" }
+                    }
+                    mut dyn_args: []TExpr = teko::list::empty()
+                    mut k = 0
+                    loop {
+                        if k >= fd.args.len { break }
+                        let da = match type_expr(fd.args[k], env, table) { TExpr as te => te; error as e => return e }
+                        match da.type { Str => { }; _ => return error { message = "dynamic format spec argument must be str" } }
+                        dyn_args = teko::list::push(dyn_args, da)
+                        k++
+                    }
+                    TFSpec { kind = TFSpecDynamic { args = dyn_args } }
+                }
+            }
+            specs = teko::list::push(specs, typed_sp)
+        } else {
+            specs = teko::list::push(specs, TFSpec { kind = TFSpecNone { } })
+        }
         i++
     }
-    TExpr { kind = TInterp { pieces = in.pieces; holes = holes }; type = Str { }; line = 0; col = 0 }
+    TExpr { kind = TInterp { pieces = in.pieces; holes = holes; specs = specs }; type = Str { }; line = 0; col = 0 }
 }
 
 // <expr> in [ e0, e1, … ] (Phase 2) — membership test. Type the lhs ONCE; require each element

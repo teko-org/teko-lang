@@ -12,6 +12,7 @@
 #include <stdlib.h>   // abort, malloc, free, _Exit
 #include <string.h>   // memcpy
 #include <stddef.h>   // max_align_t, offsetof — arena chunk alignment (S1; also via teko_rt.h)
+#include <inttypes.h> // PRId64, PRIx64, PRIX64 — format spec helpers
 #include <signal.h>   // signal — native crash backtraces (C1.9)
 // execinfo (backtrace) exists on macOS + glibc, but NOT musl (the Alpine/Linux pipeline). Guard it
 // so the runtime is musl-portable (C7.1f); without it the backtrace degrades to a one-line notice.
@@ -293,6 +294,97 @@ tk_str tk_ftoa(double x) {
     if (buf == NULL) tk_panic("out of memory (ftoa)");
     if (len) memcpy(buf, tmp, len);
     return (tk_str){ buf, len };
+}
+
+// --- Format spec helpers ($"{x:F2}" / $"{x:[fmt]}") ---
+// All produce fresh malloc'd str; tk_panic on OOM. snprintf into a 128-byte stack buffer
+// (all formatted numbers fit); then copy into a heap str.
+static tk_str fmt_from_buf(char *tmp, int n) {
+    if (n < 0) n = 0;
+    size_t len = (size_t)n;
+    tk_byte *buf = malloc(len ? len : 1);
+    if (buf == NULL) tk_panic("out of memory (fmt)");
+    if (len) memcpy(buf, tmp, len);
+    return (tk_str){ buf, len };
+}
+static int fmt_parse_prec(tk_str spec, int def) {
+    // parse optional trailing digits from spec (e.g. "F2" → 2, "F" → def)
+    int p = def; size_t i = 0;
+    while (i < spec.len && (spec.ptr[i] < '0' || spec.ptr[i] > '9')) i++;
+    if (i < spec.len) { p = 0; while (i < spec.len && spec.ptr[i] >= '0' && spec.ptr[i] <= '9') { p = p * 10 + (spec.ptr[i] - '0'); i++; } }
+    return p;
+}
+tk_str tk_fmt_f(double val, int prec) { char tmp[128]; return fmt_from_buf(tmp, snprintf(tmp, sizeof tmp, "%.*f", prec, val)); }
+tk_str tk_fmt_d(int64_t val, int width) { char tmp[64]; return fmt_from_buf(tmp, snprintf(tmp, sizeof tmp, "%0*" PRId64, width, val)); }
+tk_str tk_fmt_x_upper(uint64_t val) { char tmp[32]; return fmt_from_buf(tmp, snprintf(tmp, sizeof tmp, "%" PRIX64, val)); }
+tk_str tk_fmt_x_lower(uint64_t val) { char tmp[32]; return fmt_from_buf(tmp, snprintf(tmp, sizeof tmp, "%" PRIx64, val)); }
+tk_str tk_fmt_e(double val, int prec) { char tmp[128]; return fmt_from_buf(tmp, snprintf(tmp, sizeof tmp, "%.*e", prec, val)); }
+tk_str tk_fmt_g(double val, int prec) { char tmp[128]; return fmt_from_buf(tmp, snprintf(tmp, sizeof tmp, "%.*g", prec, val)); }
+tk_str tk_fmt_b(uint64_t val) {
+    char tmp[65]; int i = 0;
+    if (val == 0) { tmp[i++] = '0'; } else { for (int b = 63; b >= 0; b--) { if ((val >> (unsigned)b) & 1u) { for (; b >= 0; b--) tmp[i++] = (char)('0' + ((val >> (unsigned)b) & 1u)); break; } } }
+    return fmt_from_buf(tmp, i);
+}
+tk_str tk_fmt_p(double val, int prec) { char tmp[128]; return fmt_from_buf(tmp, snprintf(tmp, sizeof tmp, "%.*f%%", prec, val * 100.0)); }
+tk_str tk_fmt_n_f(double val, int prec) {
+    // Format with thousands separator: format without first, then insert commas.
+    char tmp[128]; int n = snprintf(tmp, sizeof tmp, "%.*f", prec, val);
+    if (n <= 0) return fmt_from_buf(tmp, n);
+    // find decimal point (if any)
+    int dot = n; for (int k = 0; k < n; k++) { if (tmp[k] == '.') { dot = k; break; } }
+    char out[160]; int o = 0, start = (tmp[0] == '-') ? 1 : 0;
+    if (tmp[0] == '-') out[o++] = '-';
+    int int_len = dot - start;
+    for (int k = start; k < dot; k++) {
+        int pos = dot - k - 1;
+        out[o++] = tmp[k];
+        if (pos > 0 && pos % 3 == 0) out[o++] = ',';
+    }
+    for (int k = dot; k < n; k++) out[o++] = tmp[k];
+    return fmt_from_buf(out, o);
+}
+tk_str tk_fmt_n_i(int64_t val) {
+    char tmp[32]; int n = snprintf(tmp, sizeof tmp, "%" PRId64, val);
+    if (n <= 0) return fmt_from_buf(tmp, n);
+    char out[48]; int o = 0, start = (tmp[0] == '-') ? 1 : 0;
+    if (tmp[0] == '-') out[o++] = '-';
+    for (int k = start; k < n; k++) { int pos = n - k - 1; out[o++] = tmp[k]; if (pos > 0 && pos % 3 == 0) out[o++] = ','; }
+    return fmt_from_buf(out, o);
+}
+// Dynamic dispatchers: parse first char of spec (case-insensitive) + optional digits.
+tk_str tk_fmt_dyn_f64(double val, tk_str spec) {
+    if (spec.len == 0) return tk_ftoa(val);
+    int prec = fmt_parse_prec(spec, 6);
+    switch (spec.ptr[0] | 0x20) {  // tolower
+        case 'f': return tk_fmt_f(val, prec);
+        case 'e': return tk_fmt_e(val, prec);
+        case 'g': return tk_fmt_g(val, prec);
+        case 'n': return tk_fmt_n_f(val, prec);
+        case 'p': return tk_fmt_p(val, prec);
+        default:  return tk_ftoa(val);
+    }
+}
+tk_str tk_fmt_dyn_i64(int64_t val, tk_str spec) {
+    if (spec.len == 0) return tk_i64_to_str(val);
+    int prec = fmt_parse_prec(spec, 0);
+    switch (spec.ptr[0] | 0x20) {
+        case 'd': return tk_fmt_d(val, prec ? prec : 1);
+        case 'x': return (spec.ptr[0] == 'X') ? tk_fmt_x_upper((uint64_t)val) : tk_fmt_x_lower((uint64_t)val);
+        case 'b': return tk_fmt_b((uint64_t)val);
+        case 'n': return tk_fmt_n_i(val);
+        default:  return tk_i64_to_str(val);
+    }
+}
+tk_str tk_fmt_dyn_u64(uint64_t val, tk_str spec) {
+    if (spec.len == 0) return tk_u64_to_str(val);
+    int prec = fmt_parse_prec(spec, 0);
+    switch (spec.ptr[0] | 0x20) {
+        case 'd': return tk_fmt_d((int64_t)val, prec ? prec : 1);
+        case 'x': return (spec.ptr[0] == 'X') ? tk_fmt_x_upper(val) : tk_fmt_x_lower(val);
+        case 'b': return tk_fmt_b(val);
+        case 'n': return tk_fmt_n_i((int64_t)val);
+        default:  return tk_u64_to_str(val);
+    }
 }
 
 // --- Phase 3 str query/slice builtins (query helpers allocate nothing; slice helpers follow

@@ -557,7 +557,14 @@ static void collect_expr_insts(tk_expr e, tk_type_expr **acc, size_t *n) {
             break;
         case TK_EXPR_CAST:     collect_expr_insts(*e.as.cast.expr, acc, n); break;
         case TK_EXPR_INDEX:    collect_expr_insts(*e.as.index.receiver, acc, n); collect_expr_insts(*e.as.index.index, acc, n); break;
-        case TK_EXPR_INTERP:   for (size_t i = 0; i < e.as.interp.nholes; i += 1) collect_expr_insts(e.as.interp.holes[i], acc, n); break;
+        case TK_EXPR_INTERP:
+            for (size_t i = 0; i < e.as.interp.nholes; i += 1) {
+                collect_expr_insts(e.as.interp.holes[i], acc, n);
+                if (e.as.interp.specs && e.as.interp.specs[i].kind == TK_FSPEC_DYNAMIC)
+                    for (size_t k = 0; k < e.as.interp.specs[i].ndyn_args; k++)
+                        collect_expr_insts(e.as.interp.specs[i].dyn_args[k], acc, n);
+            }
+            break;
         case TK_EXPR_IN:
             collect_expr_insts(*e.as.in_expr.lhs, acc, n);
             for (size_t i = 0; i < e.as.in_expr.nelems; i += 1) collect_expr_insts(e.as.in_expr.elems[i], acc, n);

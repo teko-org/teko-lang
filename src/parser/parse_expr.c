@@ -145,10 +145,81 @@ static size_t piece_escape(tk_str raw, size_t i, tk_piece_buf *b, bool *ok) {
 // FULL Teko expression (tk_parse_expr). npieces == nholes + 1.
 // `verbatim` (InterpRaw): literal bytes are appended AS-IS (no escape decoding) — a `\` is a
 // literal byte; the lexer has already collapsed single-line `""`→`"`. Holes split identically.
+// Growable array of tk_format_spec (parallel to holes).
+static void fspecs_push(tk_format_spec **arr, size_t *n, tk_format_spec fs) {
+    size_t need = (*n + 1) * sizeof(tk_format_spec);
+    tk_format_spec *p = tk_realloc0(*arr, need); if (!p) abort();
+    p[(*n)++] = fs; *arr = p;
+}
+
+// Find the format spec colon in `hole_src`: the first `:` at depth 0 (not inside `()[]{}`).
+// Returns the index of `:` or `hole_src.len` if none.
+static size_t find_fspec_colon(tk_str s) {
+    size_t depth = 0;
+    for (size_t k = 0; k < s.len; k++) {
+        tk_byte c = s.ptr[k];
+        if (c == '(' || c == '[' || c == '{') { depth++; continue; }
+        if (c == ')' || c == ']' || c == '}') { if (depth > 0) depth--; continue; }
+        if (c == ':' && depth == 0) return k;
+    }
+    return s.len;  // no spec
+}
+
+// Parse a format spec from `spec_src` (the part after the `:`).
+// Returns (TK_FSPEC_NONE, ...) on empty. On error, *err is set and returns kind = TK_FSPEC_NONE.
+// NOTE: caller must have allocated dyn_args if Dynamic; we own them via tk_alloc (arena-compatible).
+static tk_format_spec parse_fspec(tk_str spec_src, bool *error_out, const tk_token *t, size_t n, size_t pos) {
+    *error_out = false;
+    // trim leading/trailing whitespace
+    while (spec_src.len > 0 && spec_src.ptr[0] == ' ') { spec_src.ptr++; spec_src.len--; }
+    while (spec_src.len > 0 && spec_src.ptr[spec_src.len - 1] == ' ') spec_src.len--;
+    if (spec_src.len == 0) return (tk_format_spec){ .kind = TK_FSPEC_NONE };
+    if (spec_src.ptr[0] != '[') {
+        // static spec: literal string
+        return (tk_format_spec){ .kind = TK_FSPEC_STATIC, .static_spec = spec_src };
+    }
+    // dynamic spec: `[arg1, arg2, …]`
+    if (spec_src.len < 2 || spec_src.ptr[spec_src.len - 1] != ']') {
+        *error_out = true;
+        return (tk_format_spec){ .kind = TK_FSPEC_NONE };
+    }
+    tk_str inner = tk_str_slice(spec_src, 1, spec_src.len - 1);  // inside the brackets
+    // split inner on top-level commas (depth tracking)
+    tk_expr *dyn_args = NULL; size_t ndyn_args = 0;
+    size_t arg_start = 0; size_t depth = 0;
+    for (size_t k = 0; k <= inner.len; k++) {
+        bool at_comma = (k < inner.len && inner.ptr[k] == ',');
+        bool at_end   = (k == inner.len);
+        if (k < inner.len) {
+            tk_byte c = inner.ptr[k];
+            if (c == '(' || c == '[' || c == '{') { depth++; continue; }
+            if (c == ')' || c == ']' || c == '}') { if (depth > 0) depth--; continue; }
+        }
+        if ((at_comma || at_end) && depth == 0) {
+            tk_str arg_src = tk_str_slice(inner, arg_start, k);
+            // trim
+            while (arg_src.len > 0 && arg_src.ptr[0] == ' ') { arg_src.ptr++; arg_src.len--; }
+            while (arg_src.len > 0 && arg_src.ptr[arg_src.len - 1] == ' ') arg_src.len--;
+            if (arg_src.len > 0) {
+                tk_tokens_result tr = tk_tokenize(arg_src);
+                if (!tr.ok) { tk_free0(dyn_args); *error_out = true; return (tk_format_spec){ .kind = TK_FSPEC_NONE }; }
+                tk_parsed_result ae = tk_parse_expr(tr.as.value.ptr, tr.as.value.len, 0);
+                if (!ae.ok) { tk_tokens_free(tr.as.value); tk_free0(dyn_args); *error_out = true; return (tk_format_spec){ .kind = TK_FSPEC_NONE }; }
+                tk_exprs_push(&dyn_args, &ndyn_args, ae.as.value.node);
+                tk_tokens_free(tr.as.value);
+            }
+            arg_start = k + 1;
+        }
+    }
+    if (ndyn_args == 0) { tk_free0(dyn_args); return (tk_format_spec){ .kind = TK_FSPEC_NONE }; }
+    return (tk_format_spec){ .kind = TK_FSPEC_DYNAMIC, .dyn_args = dyn_args, .ndyn_args = ndyn_args };
+}
+
 static tk_parsed_result parse_interp(const tk_token *t, size_t n, size_t pos, bool verbatim) {
     tk_str raw = t[pos].text;
     tk_str   *pieces = NULL; size_t npieces = 0;
     tk_expr  *holes  = NULL; size_t nholes  = 0;
+    tk_format_spec *specs = NULL; size_t nspecs = 0;
     tk_piece_buf cur = { NULL, 0, 0 };
     size_t i = 0;
     for (;;) {
@@ -156,7 +227,7 @@ static tk_parsed_result parse_interp(const tk_token *t, size_t n, size_t pos, bo
         tk_byte c = raw.ptr[i];
         if (!verbatim && c == '\\') {
             bool ok; size_t ni = piece_escape(raw, i, &cur, &ok);
-            if (!ok) { tk_free0(cur.ptr); tk_free0(pieces); tk_free0(holes);
+            if (!ok) { tk_free0(cur.ptr); tk_free0(pieces); tk_free0(holes); tk_free0(specs);
                 return (tk_parsed_result){ .ok = false, .as.error = tk_err_at(t, n, pos, "unknown escape in interpolated string") }; }
             i = ni; continue;
         }
@@ -173,21 +244,33 @@ static tk_parsed_result parse_interp(const tk_token *t, size_t n, size_t pos, bo
                 if (hc == '{') depth += 1;
                 else if (hc == '}') { depth -= 1; if (depth == 0) break; }
             }
-            if (j >= raw.len) { tk_free0(cur.ptr); tk_free0(pieces); tk_free0(holes);
+            if (j >= raw.len) { tk_free0(cur.ptr); tk_free0(pieces); tk_free0(holes); tk_free0(specs);
                 return (tk_parsed_result){ .ok = false, .as.error = tk_err_at(t, n, pos, "unterminated `{` in interpolated string") }; }
             tk_str hole_src = tk_str_slice(raw, hs, j);
-            // re-lex + parse the hole as a FULL expression.
-            tk_tokens_result tr = tk_tokenize(hole_src);
-            if (!tr.ok) { tk_free0(pieces); tk_free0(holes);
+            // split hole_src on the first top-level `:` to separate expr from format spec.
+            size_t colon_pos = find_fspec_colon(hole_src);
+            tk_str expr_src = tk_str_slice(hole_src, 0, colon_pos);
+            tk_format_spec fs = { .kind = TK_FSPEC_NONE };
+            if (colon_pos < hole_src.len) {
+                tk_str spec_src = tk_str_slice(hole_src, colon_pos + 1, hole_src.len);
+                bool ferr = false;
+                fs = parse_fspec(spec_src, &ferr, t, n, pos);
+                if (ferr) { tk_free0(cur.ptr); tk_free0(pieces); tk_free0(holes); tk_free0(specs);
+                    return (tk_parsed_result){ .ok = false, .as.error = tk_err_at(t, n, pos, "malformed format spec in interpolated string") }; }
+            }
+            // re-lex + parse the EXPRESSION part.
+            tk_tokens_result tr = tk_tokenize(expr_src);
+            if (!tr.ok) { tk_free0(pieces); tk_free0(holes); tk_free0(specs);
                 return (tk_parsed_result){ .ok = false, .as.error = tr.as.error }; }
             tk_parsed_result he = tk_parse_expr(tr.as.value.ptr, tr.as.value.len, 0);
-            if (!he.ok) { tk_tokens_free(tr.as.value); tk_free0(pieces); tk_free0(holes); return he; }
+            if (!he.ok) { tk_tokens_free(tr.as.value); tk_free0(pieces); tk_free0(holes); tk_free0(specs); return he; }
             tk_exprs_push(&holes, &nholes, he.as.value.node);
+            fspecs_push(&specs, &nspecs, fs);   // parallel to holes; nspecs == nholes after this
             i = j + 1;                                  // past the `}`
             continue;
         }
         if (c == '}') {                                 // a stray closing brace (no open hole)
-            tk_free0(cur.ptr); tk_free0(pieces); tk_free0(holes);
+            tk_free0(cur.ptr); tk_free0(pieces); tk_free0(holes); tk_free0(specs);
             return (tk_parsed_result){ .ok = false, .as.error = tk_err_at(t, n, pos, "unexpected `}` in interpolated string") };
         }
         piece_push(&cur, c);
@@ -195,7 +278,7 @@ static tk_parsed_result parse_interp(const tk_token *t, size_t n, size_t pos, bo
     }
     // the trailing literal piece (after the last hole, or the whole string if no holes).
     tk_strvec_push(&pieces, &npieces, piece_to_str(&cur));
-    tk_expr e = tk_at((tk_expr){ .tag = TK_EXPR_INTERP, .as.interp = { .pieces = pieces, .npieces = npieces, .holes = holes, .nholes = nholes } }, t, pos);
+    tk_expr e = tk_at((tk_expr){ .tag = TK_EXPR_INTERP, .as.interp = { .pieces = pieces, .npieces = npieces, .holes = holes, .nholes = nholes, .specs = specs } }, t, pos);
     return (tk_parsed_result){ .ok = true, .as.value = { .node = e, .next = pos + 1 } };
 }
 

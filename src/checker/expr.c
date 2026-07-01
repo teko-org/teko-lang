@@ -918,31 +918,83 @@ tk_texpr_result tk_type_value_expected(tk_expr e, tk_type expected, tk_env env, 
     return tk_typer_expr(e, env, table);
 }
 
+// Returns true for float primitives (for interp hole dispatch).
+static bool is_float_prim(tk_type t) {
+    return t.tag == TK_TYPE_PRIM && (t.as.prim == TK_PRIM_F32 || t.as.prim == TK_PRIM_F64);
+}
+// Returns true for hole types that have a natural no-spec string form.
+static bool is_interp_formattable(tk_type t) {
+    if (t.tag == TK_TYPE_STR || t.tag == TK_TYPE_BYTE ||
+        t.tag == TK_TYPE_CHAR || t.tag == TK_TYPE_ERROR) return true;
+    if (is_bool(t)) return true;
+    if (is_integer(t) || is_float_prim(t)) return true;
+    return false;
+}
+// Returns true for hole types that support numeric format specs (F/D/X/E/N/G/B/P).
+static bool is_spec_numeric(tk_type t) { return is_integer(t) || is_float_prim(t); }
+
 // ---- string interpolation `$"…{expr}…"` (self-host parity) ----
-// Type each hole; SCOPE the hole types to what the corpus needs: a `str` hole passes through,
-// an INTEGER hole (any int prim, incl u64) converts to its decimal text, ANY OTHER hole type
-// is a clean error (no general to-string — M.3). The result type is `str`. The typed pieces
-// are carried verbatim (already decoded by the parser); each typed hole carries its own type
-// so VM/codegen know str-passthrough vs int→str.
+// Type each hole; expanded in ROUND 0 to accept: str, int, float, bool, byte, char, error.
+// Format specs ($"{x:F2}" / $"{x:[fmt]}") validate the spec against the hole type.
+// Named types with a spec → honest-stop (to_string() requires OOP, not yet implemented).
+// The result type is `str`.
 static tk_texpr_result type_interp(tk_interp in, tk_env env, tk_type_table table) {
-    tk_texpr *holes = NULL;
-    if (in.nholes > 0) { holes = tk_alloc(in.nholes * sizeof *holes); if (!holes) abort(); }
+    tk_texpr        *holes  = NULL;
+    tk_tinterp_spec *tspecs = NULL;
+    if (in.nholes > 0) {
+        holes  = tk_alloc(in.nholes * sizeof *holes);  if (!holes)  abort();
+        tspecs = tk_alloc(in.nholes * sizeof *tspecs); if (!tspecs) abort();
+    }
     for (size_t i = 0; i < in.nholes; i += 1) {
         tk_texpr_result h = tk_typer_expr(in.holes[i], env, table);
-        if (!h.ok) { tk_free0(holes); return h; }
+        if (!h.ok) { tk_free0(holes); tk_free0(tspecs); return h; }
         tk_type ht = h.as.value.type;
-        if (ht.tag != TK_TYPE_STR && !is_integer(ht)) {
-            tk_free0(holes);
-            return xerr("interpolation hole must be a str or an integer");
+        tk_format_spec *fs = (in.specs != NULL) ? &in.specs[i] : NULL;
+        tk_fspec_kind fkind = fs ? fs->kind : TK_FSPEC_NONE;
+        // Determine what's allowed.
+        if (!is_interp_formattable(ht)) {
+            if (ht.tag == TK_TYPE_NAMED || ht.tag == TK_TYPE_VARIANT) {
+                tk_free0(holes); tk_free0(tspecs);
+                return xerr("interpolation: user-defined types require to_string() method (not yet implemented; use explicit conversion)");
+            }
+            tk_free0(holes); tk_free0(tspecs);
+            return xerr("interpolation hole type has no string representation");
         }
-        holes[i] = h.as.value;
+        // Validate format spec against hole type.
+        tk_tinterp_spec ts = { TK_FSPEC_NONE, { NULL, 0 }, NULL, 0 };
+        if (fkind == TK_FSPEC_STATIC) {
+            if (!is_spec_numeric(ht)) {
+                tk_free0(holes); tk_free0(tspecs);
+                return xerr("format spec (F/D/X/…) only applies to numeric types (int or float)");
+            }
+            ts.kind = TK_FSPEC_STATIC; ts.static_spec = fs->static_spec;
+        } else if (fkind == TK_FSPEC_DYNAMIC) {
+            if (!is_spec_numeric(ht)) {
+                tk_free0(holes); tk_free0(tspecs);
+                return xerr("dynamic format spec only applies to numeric types (to_string() on custom types requires OOP)");
+            }
+            tk_texpr *dargs = NULL;
+            if (fs->ndyn_args > 0) { dargs = tk_alloc(fs->ndyn_args * sizeof *dargs); if (!dargs) abort(); }
+            for (size_t k = 0; k < fs->ndyn_args; k++) {
+                tk_texpr_result da = tk_typer_expr(fs->dyn_args[k], env, table);
+                if (!da.ok) { tk_free0(dargs); tk_free0(holes); tk_free0(tspecs); return da; }
+                if (da.as.value.type.tag != TK_TYPE_STR) {
+                    tk_free0(dargs); tk_free0(holes); tk_free0(tspecs);
+                    return xerr("dynamic format spec argument must be a str");
+                }
+                dargs[k] = da.as.value;
+            }
+            ts.kind = TK_FSPEC_DYNAMIC; ts.dyn_args = dargs; ts.ndyn_args = fs->ndyn_args;
+        }
+        holes[i]  = h.as.value;
+        tspecs[i] = ts;
     }
     // carry the decoded pieces verbatim (the parser already resolved escapes).
     tk_str *pieces = NULL;
     if (in.npieces > 0) { pieces = tk_alloc(in.npieces * sizeof *pieces); if (!pieces) abort();
         for (size_t i = 0; i < in.npieces; i += 1) pieces[i] = in.pieces[i]; }
     return xok((tk_texpr){ .tag = TK_TEXPR_INTERP, .type = (tk_type){ .tag = TK_TYPE_STR },
-                           .as.interp = { pieces, in.npieces, holes, in.nholes } });
+                           .as.interp = { pieces, in.npieces, holes, in.nholes, tspecs } });
 }
 
 // <expr> in [ e0, e1, … ] (Phase 2) — membership test. Type the lhs ONCE; require each element

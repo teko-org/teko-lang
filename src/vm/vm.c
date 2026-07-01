@@ -46,6 +46,20 @@ tk_str tk_str_of_bytes(tk_str bytes);
 tk_str tk_one_byte(tk_byte c);
 tk_str tk_str_concat3(tk_str a, tk_str b, tk_str c);
 tk_str tk_ftoa(double x);
+// fmt_* — ROUND 0 format-spec helpers (teko_rt.c). Declared here so vm.c doesn't pull in teko_rt.h.
+tk_str tk_fmt_f(double val, int prec);
+tk_str tk_fmt_d(int64_t val, int width);
+tk_str tk_fmt_x_upper(uint64_t val);
+tk_str tk_fmt_x_lower(uint64_t val);
+tk_str tk_fmt_e(double val, int prec);
+tk_str tk_fmt_n_f(double val, int prec);
+tk_str tk_fmt_n_i(int64_t val);
+tk_str tk_fmt_g(double val, int prec);
+tk_str tk_fmt_b(uint64_t val);
+tk_str tk_fmt_p(double val, int prec);
+tk_str tk_fmt_dyn_f64(double val, tk_str spec);
+tk_str tk_fmt_dyn_i64(int64_t val, tk_str spec);
+tk_str tk_fmt_dyn_u64(uint64_t val, tk_str spec);
 double tk_float_parse(tk_str s);  // teko::float::parse(str) -> f64
 uint64_t tk_f64_bits(double x);   // f64 → u64 IEEE-754 bit reinterpret (teko::f64_bits)
 double   tk_f64_from_bits(uint64_t bits);  // u64 → f64 IEEE-754 bit reinterpret (teko::f64_from_bits)
@@ -753,6 +767,59 @@ static bool try_builtin_call(tk_path p, const tk_texpr *args, size_t nargs,
         if (a.tag != TK_VAL_FLOAT) vm_unsupported("ftoa on a non-float value (internal: checker should reject)");
         *out = v_str(tk_ftoa(a.as.fl.f));
         return true;
+    }
+    // fmt_* — format helpers (ROUND 0 format spec). Each tk_fmt_* is in teko_rt.c.
+    if (seg_is(last, "fmt_f")) {
+        tk_value v = tk_vm_eval_expr(&args[0], env), p = tk_vm_eval_expr(&args[1], env);
+        *out = v_str(tk_fmt_f(v.as.fl.f, (int)v_as_i128(p))); return true;
+    }
+    if (seg_is(last, "fmt_e")) {
+        tk_value v = tk_vm_eval_expr(&args[0], env), p = tk_vm_eval_expr(&args[1], env);
+        *out = v_str(tk_fmt_e(v.as.fl.f, (int)v_as_i128(p))); return true;
+    }
+    if (seg_is(last, "fmt_g")) {
+        tk_value v = tk_vm_eval_expr(&args[0], env), p = tk_vm_eval_expr(&args[1], env);
+        *out = v_str(tk_fmt_g(v.as.fl.f, (int)v_as_i128(p))); return true;
+    }
+    if (seg_is(last, "fmt_n_f")) {
+        tk_value v = tk_vm_eval_expr(&args[0], env), p = tk_vm_eval_expr(&args[1], env);
+        *out = v_str(tk_fmt_n_f(v.as.fl.f, (int)v_as_i128(p))); return true;
+    }
+    if (seg_is(last, "fmt_p")) {
+        tk_value v = tk_vm_eval_expr(&args[0], env), p = tk_vm_eval_expr(&args[1], env);
+        *out = v_str(tk_fmt_p(v.as.fl.f, (int)v_as_i128(p))); return true;
+    }
+    if (seg_is(last, "fmt_d")) {
+        tk_value v = tk_vm_eval_expr(&args[0], env), w = tk_vm_eval_expr(&args[1], env);
+        *out = v_str(tk_fmt_d((int64_t)v_as_i128(v), (int)v_as_i128(w))); return true;
+    }
+    if (seg_is(last, "fmt_x_upper")) {
+        tk_value v = tk_vm_eval_expr(&args[0], env);
+        *out = v_str(tk_fmt_x_upper((uint64_t)v_as_u128(v))); return true;
+    }
+    if (seg_is(last, "fmt_x_lower")) {
+        tk_value v = tk_vm_eval_expr(&args[0], env);
+        *out = v_str(tk_fmt_x_lower((uint64_t)v_as_u128(v))); return true;
+    }
+    if (seg_is(last, "fmt_b")) {
+        tk_value v = tk_vm_eval_expr(&args[0], env);
+        *out = v_str(tk_fmt_b((uint64_t)v_as_u128(v))); return true;
+    }
+    if (seg_is(last, "fmt_n_i")) {
+        tk_value v = tk_vm_eval_expr(&args[0], env);
+        *out = v_str(tk_fmt_n_i((int64_t)v_as_i128(v))); return true;
+    }
+    if (seg_is(last, "fmt_dyn_f64")) {
+        tk_value v = tk_vm_eval_expr(&args[0], env), s = tk_vm_eval_expr(&args[1], env);
+        *out = v_str(tk_fmt_dyn_f64(v.as.fl.f, s.as.s)); return true;
+    }
+    if (seg_is(last, "fmt_dyn_i64")) {
+        tk_value v = tk_vm_eval_expr(&args[0], env), s = tk_vm_eval_expr(&args[1], env);
+        *out = v_str(tk_fmt_dyn_i64((int64_t)v_as_i128(v), s.as.s)); return true;
+    }
+    if (seg_is(last, "fmt_dyn_u64")) {
+        tk_value v = tk_vm_eval_expr(&args[0], env), s = tk_vm_eval_expr(&args[1], env);
+        *out = v_str(tk_fmt_dyn_u64((uint64_t)v_as_u128(v), s.as.s)); return true;
     }
     // str STDLIB surface — the SAME runtime symbols native codegen lowers to, so VM==native.
     if (seg_is(last, "concat") || seg_is(last, "str_concat")) {
@@ -1907,14 +1974,55 @@ static tk_value eval_interp(const tk_texpr *e, tk_venv *env) {
         acc = tk_str_concat(acc, e->as.interp.pieces[i]);
         if (i < nh) {
             tk_value h = tk_vm_eval_expr(&e->as.interp.holes[i], env);
+            tk_tinterp_spec *sp = (e->as.interp.specs) ? &e->as.interp.specs[i] : NULL;
+            tk_fspec_kind fk = sp ? sp->kind : TK_FSPEC_NONE;
             tk_str hs;
-            if (h.tag == TK_VAL_STR) {
+            if (fk == TK_FSPEC_STATIC) {
+                tk_str spec = sp->static_spec;
+                char fc = (spec.len > 0) ? (char)(spec.ptr[0] | 0x20) : 'f';
+                int prec = 0; bool has_prec = false;
+                for (size_t si = 1; si < spec.len; si++) {
+                    if (spec.ptr[si] >= '0' && spec.ptr[si] <= '9') {
+                        prec = prec * 10 + (spec.ptr[si] - '0'); has_prec = true;
+                    }
+                }
+                if (!has_prec) prec = (fc == 'd') ? 1 : 6;
+                bool is_float_val = (h.tag == TK_VAL_FLOAT);
+                bool is_sint = (h.tag == TK_VAL_INT && h.as.i.is_signed);
+                double dval = is_float_val ? h.as.fl.f : (is_sint ? (double)(int64_t)v_as_i128(h) : (double)(uint64_t)v_as_u128(h));
+                int64_t ival = is_sint ? (int64_t)v_as_i128(h) : 0;
+                uint64_t uval = (!is_sint && !is_float_val) ? (uint64_t)v_as_u128(h) : 0;
+                if      (fc == 'f') hs = tk_fmt_f(dval, prec);
+                else if (fc == 'e') hs = tk_fmt_e(dval, prec);
+                else if (fc == 'g') hs = tk_fmt_g(dval, prec);
+                else if (fc == 'n' && is_float_val) hs = tk_fmt_n_f(dval, prec);
+                else if (fc == 'p') hs = tk_fmt_p(dval, prec);
+                else if (fc == 'd') hs = tk_fmt_d(ival, prec);
+                else if (spec.len > 0 && spec.ptr[0] == 'X') hs = tk_fmt_x_upper(uval);
+                else if (fc == 'x') hs = tk_fmt_x_lower(uval);
+                else if (fc == 'b') hs = tk_fmt_b(uval);
+                else if (fc == 'n') hs = tk_fmt_n_i(ival);
+                else vm_unsupported("interpolation: unrecognized format spec");
+            } else if (fk == TK_FSPEC_DYNAMIC) {
+                tk_value spec_val = tk_vm_eval_expr(&sp->dyn_args[0], env);
+                tk_str spec_str = (spec_val.tag == TK_VAL_STR) ? spec_val.as.s : (tk_str){ NULL, 0 };
+                if (h.tag == TK_VAL_FLOAT)       hs = tk_fmt_dyn_f64(h.as.fl.f, spec_str);
+                else if (h.as.i.is_signed)        hs = tk_fmt_dyn_i64((int64_t)v_as_i128(h), spec_str);
+                else                              hs = tk_fmt_dyn_u64((uint64_t)v_as_u128(h), spec_str);
+            } else if (h.tag == TK_VAL_STR) {
                 hs = h.as.s;
             } else if (h.tag == TK_VAL_INT) {
                 hs = h.as.i.is_signed ? tk_i64_to_str((int64_t)v_as_i128(h))
                                       : tk_u64_to_str((uint64_t)v_as_u128(h));
+            } else if (h.tag == TK_VAL_FLOAT) {
+                hs = tk_ftoa(h.as.fl.f);
+            } else if (h.tag == TK_VAL_BOOL) {
+                hs = h.as.b ? (tk_str){ (const tk_byte *)"true", 4 }
+                            : (tk_str){ (const tk_byte *)"false", 5 };
+            } else if (h.tag == TK_VAL_STRUCT) {
+                hs = v_error_field(h, ERR_LIT("message")).as.s;  // error stored as struct
             } else {
-                vm_unsupported("interpolation hole is not a str or an integer (internal: checker should reject)");
+                vm_unsupported("interpolation hole type not supported");
             }
             acc = tk_str_concat(acc, hs);
         }
@@ -2531,7 +2639,12 @@ static void cov_walk_expr(const tk_texpr *e, cov_walk_t *w) {
             for (size_t i = 0; i < e->as.struct_init.nfields; i += 1) cov_walk_expr(&e->as.struct_init.field_vals[i], w);
             break;
         case TK_TEXPR_INTERP:
-            for (size_t i = 0; i < e->as.interp.nholes; i += 1) cov_walk_expr(&e->as.interp.holes[i], w);
+            for (size_t i = 0; i < e->as.interp.nholes; i += 1) {
+                cov_walk_expr(&e->as.interp.holes[i], w);
+                if (e->as.interp.specs && e->as.interp.specs[i].kind == TK_FSPEC_DYNAMIC)
+                    for (size_t k = 0; k < e->as.interp.specs[i].ndyn_args; k++)
+                        cov_walk_expr(&e->as.interp.specs[i].dyn_args[k], w);
+            }
             break;
         case TK_TEXPR_IN:
             cov_walk_expr(e->as.in_expr.lhs, w);

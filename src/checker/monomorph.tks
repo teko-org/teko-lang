@@ -340,15 +340,35 @@ fn mono_texpr(e: TExpr, s: Subst, items: []TItem, table: TypeTable) -> WExpr | e
         TInterp as in => {
             mut acc: []MonoInst = teko::list::empty()
             mut holes: []TExpr = teko::list::empty()
+            mut specs: []TFSpec = teko::list::empty()
             mut i = 0
             loop {
                 if i >= in.holes.len { break }
                 let wh = match mono_texpr(in.holes[i], s, items, table) { WExpr as w => w; error as er => return er }
                 holes = teko::list::push(holes, wh.expr)
                 acc = mono_inst_concat(acc, wh.insts)
+                if i < in.specs.len {
+                    let sp = in.specs[i]
+                    let lifted_sp = match sp.kind {
+                        TFSpecDynamic as fd => {
+                            mut dyn_args: []TExpr = teko::list::empty()
+                            mut k = 0
+                            loop {
+                                if k >= fd.args.len { break }
+                                let wa = match mono_texpr(fd.args[k], s, items, table) { WExpr as w => w; error as er => return er }
+                                dyn_args = teko::list::push(dyn_args, wa.expr)
+                                acc = mono_inst_concat(acc, wa.insts)
+                                k++
+                            }
+                            TFSpec { kind = TFSpecDynamic { args = dyn_args } }
+                        }
+                        _ => sp
+                    }
+                    specs = teko::list::push(specs, lifted_sp)
+                }
                 i++
             }
-            WExpr { expr = TExpr { kind = TInterp { pieces = in.pieces; holes = holes }; type = nt; line = e.line; col = e.col }; insts = acc }
+            WExpr { expr = TExpr { kind = TInterp { pieces = in.pieces; holes = holes; specs = specs }; type = nt; line = e.line; col = e.col }; insts = acc }
         }
         TInExpr as n => {
             let wl = match mono_texpr(n.lhs, s, items, table) { WExpr as w => w; error as er => return er }

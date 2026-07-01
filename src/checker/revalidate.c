@@ -135,14 +135,18 @@ tk_check_result tk_validate_texpr(const tk_texpr *te) {
                 return cfail("corrupt: subscript index is not an integer");
             return cok();   // the element type is re-derived in the typer (byte / slice element)
         }
-        case TK_TEXPR_INTERP: {   // $"…{expr}…": str result; each hole valid + str/integer-typed
+        case TK_TEXPR_INTERP: {   // $"…{expr}…": str result; each hole valid
             if (te->type.tag != TK_TYPE_STR)
                 return cfail("corrupt: interpolation not typed as a str");
             for (size_t i = 0; i < te->as.interp.nholes; i += 1) {
                 tk_check_result h = tk_validate_texpr(&te->as.interp.holes[i]); if (!h.ok) return h;
-                tk_type ht = te->as.interp.holes[i].type;
-                if (ht.tag != TK_TYPE_STR && !is_integer(ht))
-                    return cfail("corrupt: interpolation hole is not a str or an integer");
+                // walk dyn_args in format specs
+                if (te->as.interp.specs && te->as.interp.specs[i].kind == TK_FSPEC_DYNAMIC) {
+                    for (size_t k = 0; k < te->as.interp.specs[i].ndyn_args; k++) {
+                        tk_check_result d = tk_validate_texpr(&te->as.interp.specs[i].dyn_args[k]);
+                        if (!d.ok) return d;
+                    }
+                }
             }
             return cok();
         }

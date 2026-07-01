@@ -87,10 +87,55 @@ fn piece_escape(raw: str, i: u64, bytes: []byte) -> EscPiece | error {
 // the hole's source substring) and parsed as a FULL expression. pieces.len == holes.len + 1.
 // `verbatim` (InterpRaw): literal bytes are appended AS-IS (no escape decoding) — a `\` is a
 // literal byte; the lexer has already collapsed single-line `""`→`"`. Holes split identically.
+// find_fspec_colon — find the first `:` in `s` at depth 0 (not inside `()[]{}` pairs).
+// Returns the index, or s.len if not found.
+fn find_fspec_colon(s: str) -> u64 {
+    mut depth: i64 = 0
+    mut i: u64 = 0
+    loop {
+        if i >= s.len { break }
+        let c = s[i]
+        if c == b'(' || c == b'[' || c == b'{' { depth = depth + 1 }
+        else if c == b')' || c == b']' || c == b'}' { depth = depth - 1 }
+        else if c == b':' && depth == 0 { return i }
+        i++
+    }
+    s.len
+}
+
+// parse_fspec — parse the spec source string (after the `:`).
+// `[arg1, arg2]` → FSpecDynamic; anything else → FSpecStatic.
+fn parse_fspec(spec_src: str, tok_pos: u64, tokens: []lexer::Token) -> FSpec | error {
+    if spec_src.len == 0 { return FSpec { kind = FSpecNone { } } }
+    if spec_src[0] == b'[' {
+        // dynamic spec: `[arg1, arg2, …]` — strip the brackets, parse comma-separated exprs
+        if spec_src.len < 2 || spec_src[spec_src.len - 1] != b']' {
+            return err_at(tokens, tok_pos, "dynamic format spec must be `[expr, …]`")
+        }
+        let inner = slice(spec_src, 1, spec_src.len - 1)
+        let itoks = match lexer::tokenize(inner) { []lexer::Token as ts => ts; error as e => return e }
+        mut args: []Expr = teko::list::empty()
+        mut p: u64 = 0
+        loop {
+            if p >= itoks.len { break }
+            let ae = match parse_expr(itoks, p) { Parsed<Expr> as x => x; error as e => return e }
+            args = teko::list::push(args, ae.node)
+            p = ae.next
+            // skip comma separator
+            if p < itoks.len && itoks[p].kind == lexer::TokenKind::Comma { p = p + 1 }
+        }
+        if args.len == 0 { return err_at(tokens, tok_pos, "dynamic format spec must have at least one argument") }
+        FSpec { kind = FSpecDynamic { args = args } }
+    } else {
+        FSpec { kind = FSpecStatic { s = spec_src } }
+    }
+}
+
 fn parse_interp(tokens: []lexer::Token, pos: u64, verbatim: bool) -> Parsed<Expr> | error {
     let raw = tokens[pos].text
     mut pieces: []str = teko::list::empty()
     mut holes: []Expr = teko::list::empty()
+    mut specs: []FSpec = teko::list::empty()
     mut cur: []byte = teko::list::empty()           // the current literal piece's bytes
     mut i: u64 = 0
     loop {
@@ -120,9 +165,15 @@ fn parse_interp(tokens: []lexer::Token, pos: u64, verbatim: bool) -> Parsed<Expr
             }
             if j >= raw.len { return err_at(tokens, pos, "unterminated `{` in interpolated string") }
             let hole_src = slice(raw, hs, j)
-            let toks = match lexer::tokenize(hole_src) { []lexer::Token as ts => ts; error as e => return e }
+            // find format spec colon at depth-0
+            let colon_pos = find_fspec_colon(hole_src)
+            let expr_src = if colon_pos < hole_src.len { slice(hole_src, 0, colon_pos) } else { hole_src }
+            let spec_src = if colon_pos < hole_src.len { slice(hole_src, colon_pos + 1, hole_src.len) } else { "" }
+            let toks = match lexer::tokenize(expr_src) { []lexer::Token as ts => ts; error as e => return e }
             let he = match parse_expr(toks, 0) { Parsed<Expr> as x => x; error as e => return e }
             holes = teko::list::push(holes, he.node)
+            let sp = match parse_fspec(spec_src, pos, tokens) { FSpec as s => s; error as e => return e }
+            specs = teko::list::push(specs, sp)
             i = j + 1                                     // past the `}`
             continue
         }
@@ -131,7 +182,7 @@ fn parse_interp(tokens: []lexer::Token, pos: u64, verbatim: bool) -> Parsed<Expr
         i++
     }
     pieces = teko::list::push(pieces, str(cur))           // the trailing literal piece
-    Parsed<Expr> { node = Expr { kind = Interp { pieces = pieces; holes = holes }; line = tokens[pos].line; col = tokens[pos].col }; next = pos + 1 }
+    Parsed<Expr> { node = Expr { kind = Interp { pieces = pieces; holes = holes; specs = specs }; line = tokens[pos].line; col = tokens[pos].col }; next = pos + 1 }
 }
 
 // the LEAF: a literal, a name/path/call, `( expr )`, or an `if`/`match` expression (B.20/B.15).

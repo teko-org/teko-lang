@@ -71,12 +71,25 @@ typedef struct { tk_path path; }                             tk_path_expr;     /
 // with NO `let x: Foo<i64> = …` annotation. NULL/0 for the bare `Foo { … }` form (unchanged).
 typedef struct { tk_path type_path; tk_type_expr *type_args; size_t nargs; tk_str *field_names; tk_expr *field_vals; size_t nfields; } tk_struct_lit;
 typedef struct { tk_expr *receiver; tk_expr *index; }       tk_index;         // recv[index] — str→byte, []T→T (W5-idx)
+// Format spec for a single $"…{expr:spec}…" hole. Three cases:
+//   TK_FSPEC_NONE    — no colon in hole (existing behavior)
+//   TK_FSPEC_STATIC  — `:literal` → static_spec holds the literal string (e.g. "F2")
+//   TK_FSPEC_DYNAMIC — `:[arg1,arg2,…]` → dyn_args[0..ndyn_args) are expr arguments
+typedef enum { TK_FSPEC_NONE, TK_FSPEC_STATIC, TK_FSPEC_DYNAMIC } tk_fspec_kind;
+typedef struct {
+    tk_fspec_kind kind;
+    tk_str        static_spec;   // TK_FSPEC_STATIC: the literal spec string
+    tk_expr      *dyn_args;      // TK_FSPEC_DYNAMIC: array of expressions
+    size_t        ndyn_args;     // length of dyn_args
+} tk_format_spec;
 // `$"pre {a} mid {b} post"` — string interpolation (self-host parity). The string is
 // pieces[0] ++ str(holes[0]) ++ pieces[1] ++ … ++ pieces[nholes] — so npieces == nholes + 1.
 // Pieces are DECODED literal str spans (escapes resolved, like StrLit); each hole is a full
 // Teko expression (parsed from the hole's source span). A `str` hole passes through; an
 // integer hole converts to its decimal text; any other hole type is a clean checker error.
-typedef struct { tk_str *pieces; size_t npieces; tk_expr *holes; size_t nholes; } tk_interp;
+// specs[i] carries the optional format spec for holes[i] (nspecs == nholes).
+typedef struct { tk_str *pieces; size_t npieces; tk_expr *holes; size_t nholes;
+                 tk_format_spec *specs; /* nholes elements, parallel to holes */ } tk_interp;
 // `<expr> in [ e0, e1, … ]` → bool (Phase 2). True iff the LHS equals any element; the LHS is
 // EVALUATED ONCE. The `[ … ]` is a SPECIAL membership-set syntax valid ONLY here (no general
 // array literal). Empty set `x in []` is allowed → always false. `elems` is a flat tk_expr

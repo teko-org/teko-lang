@@ -70,8 +70,12 @@ static bool occurs_expr(const tk_texpr *e, tk_str name) {
         }
         case TK_TEXPR_INDEX:  return occurs_expr(e->as.index.receiver, name) || occurs_expr(e->as.index.index, name);
         case TK_TEXPR_INTERP: {
-            for (size_t i = 0; i < e->as.interp.nholes; i += 1)
+            for (size_t i = 0; i < e->as.interp.nholes; i += 1) {
                 if (occurs_expr(&e->as.interp.holes[i], name)) return true;
+                if (e->as.interp.specs && e->as.interp.specs[i].kind == TK_FSPEC_DYNAMIC)
+                    for (size_t k = 0; k < e->as.interp.specs[i].ndyn_args; k++)
+                        if (occurs_expr(&e->as.interp.specs[i].dyn_args[k], name)) return true;
+            }
             return false;
         }
         case TK_TEXPR_IN: {

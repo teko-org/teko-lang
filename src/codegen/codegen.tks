@@ -1953,32 +1953,140 @@ fn emit_piece_lit(buf: []byte, piece: str) -> []byte {
     cb(out, " }")
 }
 fn emit_interp(buf: []byte, prog: checker::TProgram, in: checker::TInterp, escaping: []str, regions: []RegionFrame, fn_body: []checker::TStatement, dctx: DeferCtx) -> []byte | error {
-    let nsegs = in.pieces.len + in.holes.len      // total segments (pieces interleaved with holes)
+    let nsegs = in.pieces.len + in.holes.len
     mut out = buf
-    // open one tk_str_concat( for each segment after the first (nsegs - 1 of them).
     mut s = 1
     loop { if s >= nsegs { break }; out = cb(out, "tk_str_concat("); s++ }
     mut k = 0
     loop {
         if k >= nsegs { break }
-        if k >= 1 { out = cb(out, ", ") }         // the second arg of this segment's concat(
-        if k % 2 == 0 {                           // a PIECE literal (segment 2*i → piece i)
+        if k >= 1 { out = cb(out, ", ") }
+        if k % 2 == 0 {
             out = emit_piece_lit(out, in.pieces[k / 2])
-        } else {                                  // a HOLE (segment 2*i+1 → hole i)
-            let h = in.holes[k / 2]
-            match h.type {
-                checker::Str => { out = match emit_expr_ctx(out, prog, checker::Void { }, h, escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err } }
-                checker::Prim as p => {
-                    if !cg_prim_is_int(p.kind) { return error { message = "codegen: interpolation hole must be a str or an integer" } }
-                    if cg_prim_is_signed_int(p.kind) { out = cb(out, "tk_i64_to_str((int64_t)(") }
-                    else { out = cb(out, "tk_u64_to_str((uint64_t)(") }
-                    out = match emit_expr_ctx(out, prog, checker::Void { }, h, escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
-                    out = cb(out, "))")
+        } else {
+            let hi = k / 2
+            let h = in.holes[hi]
+            if hi < in.specs.len {
+                let sp = in.specs[hi]
+                match sp.kind {
+                    checker::TFSpecStatic as fs => {
+                        let spec = fs.s
+                        let fc0 = if spec.len > 0 { spec[0] } else { 102 to byte }
+                        let fc_low = if fc0 >= 65 && fc0 <= 90 { (fc0 to u64 + 32) to byte } else { fc0 }
+                        mut prec = 0 to i64
+                        mut has_prec = false
+                        mut si = 1 to u64
+                        loop {
+                            if si >= spec.len { break }
+                            let ch = spec[si]
+                            if ch >= 48 && ch <= 57 { prec = prec * 10 + (ch to i64 - 48); has_prec = true }
+                            si++
+                        }
+                        if !has_prec { prec = if fc_low == 100 { 1 to i64 } else { 6 to i64 } }
+                        let is_flt = match h.type { checker::Prim as p => p.kind == checker::PrimKind::F32 || p.kind == checker::PrimKind::F64; _ => false }
+                        let prec_str = teko::i64_to_str(prec)
+                        if      fc_low == 102 { out = cb(out, "tk_fmt_f((double)(") }
+                        else if fc_low == 101 { out = cb(out, "tk_fmt_e((double)(") }
+                        else if fc_low == 103 { out = cb(out, "tk_fmt_g((double)(") }
+                        else if fc_low == 112 { out = cb(out, "tk_fmt_p((double)(") }
+                        else if fc_low == 100 { out = cb(out, "tk_fmt_d((int64_t)(") }
+                        else if fc_low == 120 && spec.len > 0 && spec[0] == 88 { out = cb(out, "tk_fmt_x_upper((uint64_t)(") }
+                        else if fc_low == 120 { out = cb(out, "tk_fmt_x_lower((uint64_t)(") }
+                        else if fc_low == 98  { out = cb(out, "tk_fmt_b((uint64_t)(") }
+                        else if fc_low == 110 && is_flt { out = cb(out, "tk_fmt_n_f((double)(") }
+                        else if fc_low == 110 { out = cb(out, "tk_fmt_n_i((int64_t)(") }
+                        else { return error { message = "codegen: unrecognized format spec" } }
+                        out = match emit_expr_ctx(out, prog, checker::Void { }, h, escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
+                        out = cb(out, "), ")
+                        out = cb(out, prec_str)
+                        out = cb(out, ")")
+                    }
+                    checker::TFSpecDynamic as fd => {
+                        let is_flt = match h.type { checker::Prim as p => p.kind == checker::PrimKind::F32 || p.kind == checker::PrimKind::F64; _ => false }
+                        let is_sint = match h.type { checker::Prim as p => cg_prim_is_signed_int(p.kind); _ => false }
+                        if is_flt { out = cb(out, "tk_fmt_dyn_f64((double)(") }
+                        else if is_sint { out = cb(out, "tk_fmt_dyn_i64((int64_t)(") }
+                        else { out = cb(out, "tk_fmt_dyn_u64((uint64_t)(") }
+                        out = match emit_expr_ctx(out, prog, checker::Void { }, h, escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
+                        out = cb(out, "), ")
+                        out = match emit_expr_ctx(out, prog, checker::Void { }, fd.args[0], escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
+                        out = cb(out, ")")
+                    }
+                    _ => {   // FSpecNone (explicit) — natural form
+                        match h.type {
+                            checker::Str  => { out = match emit_expr_ctx(out, prog, checker::Void { }, h, escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err } }
+                            checker::Char => { out = match emit_expr_ctx(out, prog, checker::Void { }, h, escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err } }
+                            checker::Prim as p => {
+                                if p.kind == checker::PrimKind::Bool {
+                                    out = cb(out, "(")
+                                    out = match emit_expr_ctx(out, prog, checker::Void { }, h, escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
+                                    out = cb(out, " ? (tk_str){ (const tk_byte *)\"true\", 4 } : (tk_str){ (const tk_byte *)\"false\", 5 })")
+                                } else if p.kind == checker::PrimKind::F32 || p.kind == checker::PrimKind::F64 {
+                                    out = cb(out, "tk_ftoa((double)(")
+                                    out = match emit_expr_ctx(out, prog, checker::Void { }, h, escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
+                                    out = cb(out, "))")
+                                } else if cg_prim_is_signed_int(p.kind) {
+                                    out = cb(out, "tk_i64_to_str((int64_t)(")
+                                    out = match emit_expr_ctx(out, prog, checker::Void { }, h, escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
+                                    out = cb(out, "))")
+                                } else {
+                                    out = cb(out, "tk_u64_to_str((uint64_t)(")
+                                    out = match emit_expr_ctx(out, prog, checker::Void { }, h, escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
+                                    out = cb(out, "))")
+                                }
+                            }
+                            checker::Byte => {
+                                out = cb(out, "tk_u64_to_str((uint64_t)(")
+                                out = match emit_expr_ctx(out, prog, checker::Void { }, h, escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
+                                out = cb(out, "))")
+                            }
+                            checker::Error => {
+                                out = cb(out, "(")
+                                out = match emit_expr_ctx(out, prog, checker::Void { }, h, escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
+                                out = cb(out, ").message")
+                            }
+                            _ => return error { message = "codegen: interpolation hole type not supported" }
+                        }
+                    }
                 }
-                _ => return error { message = "codegen: interpolation hole must be a str or an integer" }
+            } else {   // no spec at all — natural form
+                match h.type {
+                    checker::Str  => { out = match emit_expr_ctx(out, prog, checker::Void { }, h, escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err } }
+                    checker::Char => { out = match emit_expr_ctx(out, prog, checker::Void { }, h, escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err } }
+                    checker::Prim as p => {
+                        if p.kind == checker::PrimKind::Bool {
+                            out = cb(out, "(")
+                            out = match emit_expr_ctx(out, prog, checker::Void { }, h, escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
+                            out = cb(out, " ? (tk_str){ (const tk_byte *)\"true\", 4 } : (tk_str){ (const tk_byte *)\"false\", 5 })")
+                        } else if p.kind == checker::PrimKind::F32 || p.kind == checker::PrimKind::F64 {
+                            out = cb(out, "tk_ftoa((double)(")
+                            out = match emit_expr_ctx(out, prog, checker::Void { }, h, escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
+                            out = cb(out, "))")
+                        } else if cg_prim_is_signed_int(p.kind) {
+                            out = cb(out, "tk_i64_to_str((int64_t)(")
+                            out = match emit_expr_ctx(out, prog, checker::Void { }, h, escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
+                            out = cb(out, "))")
+                        } else {
+                            out = cb(out, "tk_u64_to_str((uint64_t)(")
+                            out = match emit_expr_ctx(out, prog, checker::Void { }, h, escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
+                            out = cb(out, "))")
+                        }
+                    }
+                    checker::Byte => {
+                        out = cb(out, "tk_u64_to_str((uint64_t)(")
+                        out = match emit_expr_ctx(out, prog, checker::Void { }, h, escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
+                        out = cb(out, "))")
+                    }
+                    checker::Error => {
+                        out = cb(out, "(")
+                        out = match emit_expr_ctx(out, prog, checker::Void { }, h, escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
+                        out = cb(out, ").message")
+                    }
+                    _ => return error { message = "codegen: interpolation hole type not supported" }
+                }
             }
         }
-        if k >= 1 { out = cb(out, ")") }          // close this segment's tk_str_concat(
+        if k >= 1 { out = cb(out, ")") }
         k++
     }
     out
@@ -4818,7 +4926,23 @@ fn cg_collect_expr_opts(set: CgTypeSet, e: checker::TExpr) -> CgTypeSet {
         checker::TCoalesce as co => { s = cg_collect_expr_opts(s, co.left); s = cg_collect_expr_opts(s, co.right) }
         checker::TStructInit as si => { mut i = 0; loop { if i >= si.field_vals.len { break }; s = cg_collect_expr_opts(s, si.field_vals[i]); i++ } }
         checker::TIndex as ix => { s = cg_collect_expr_opts(s, ix.receiver); s = cg_collect_expr_opts(s, ix.index) }
-        checker::TInterp as in => { mut i = 0; loop { if i >= in.holes.len { break }; s = cg_collect_expr_opts(s, in.holes[i]); i++ } }
+        checker::TInterp as in => {
+            mut i = 0
+            loop {
+                if i >= in.holes.len { break }
+                s = cg_collect_expr_opts(s, in.holes[i])
+                if i < in.specs.len {
+                    match in.specs[i].kind {
+                        checker::TFSpecDynamic as fd => {
+                            mut k = 0
+                            loop { if k >= fd.args.len { break }; s = cg_collect_expr_opts(s, fd.args[k]); k++ }
+                        }
+                        _ => { }
+                    }
+                }
+                i++
+            }
+        }
         checker::TInExpr as ie => { s = cg_collect_expr_opts(s, ie.lhs); mut i = 0; loop { if i >= ie.elems.len { break }; s = cg_collect_expr_opts(s, ie.elems[i]); i++ } }
         _ => { }   // leaves: type already registered above
     }
@@ -5566,9 +5690,27 @@ fn cg_lift_expr(e: checker::TExpr, acc: Ref<StampAcc>) -> checker::TExpr {
         checker::TIndex as ix      => checker::TExpr { kind = checker::TIndex { receiver = cg_lift_expr(ix.receiver, acc); index = cg_lift_expr(ix.index, acc) }; type = e.type; line = e.line; col = e.col }
         checker::TInterp as in     => {
             mut holes: []checker::TExpr = teko::list::empty()
+            mut specs: []checker::TFSpec = teko::list::empty()
             mut i = 0
-            loop { if i >= in.holes.len { break }; holes = teko::list::push(holes, cg_lift_expr(in.holes[i], acc)); i++ }
-            checker::TExpr { kind = checker::TInterp { pieces = in.pieces; holes = holes }; type = e.type; line = e.line; col = e.col }
+            loop {
+                if i >= in.holes.len { break }
+                holes = teko::list::push(holes, cg_lift_expr(in.holes[i], acc))
+                if i < in.specs.len {
+                    let sp = in.specs[i]
+                    let lifted_sp = match sp.kind {
+                        checker::TFSpecDynamic as fd => {
+                            mut args: []checker::TExpr = teko::list::empty()
+                            mut k = 0
+                            loop { if k >= fd.args.len { break }; args = teko::list::push(args, cg_lift_expr(fd.args[k], acc)); k++ }
+                            checker::TFSpec { kind = checker::TFSpecDynamic { args = args } }
+                        }
+                        _ => sp
+                    }
+                    specs = teko::list::push(specs, lifted_sp)
+                }
+                i++
+            }
+            checker::TExpr { kind = checker::TInterp { pieces = in.pieces; holes = holes; specs = specs }; type = e.type; line = e.line; col = e.col }
         }
         checker::TInExpr as ie     => {
             mut elems: []checker::TExpr = teko::list::empty()

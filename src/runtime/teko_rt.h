@@ -209,6 +209,31 @@ tk_str tk_str_concat3(tk_str a, tk_str b, tk_str c);
 // tk_ftoa — x rendered as %.17g float text (exact binary64 round-trip) in a fresh str.
 tk_str tk_ftoa(double x);
 
+// --- Format spec helpers ($"{x:F2}" / $"{x:[fmt]}") ---
+// All return fresh malloc'd str (tk_panic on OOM).  spec codes:
+//   F{n}  fixed-point n decimal places (default 6)
+//   D{n}  zero-padded integer to n digits
+//   X/x   hex uppercase/lowercase
+//   E{n}  scientific notation
+//   N{n}  thousands-separator float;  N (no digit) = integer with thousands-sep
+//   G{n}  shorter of F/E (snprintf %g)
+//   B     binary
+//   P{n}  percentage (val*100, n decimal places)
+tk_str tk_fmt_f(double val, int prec);
+tk_str tk_fmt_d(int64_t val, int width);
+tk_str tk_fmt_x_upper(uint64_t val);
+tk_str tk_fmt_x_lower(uint64_t val);
+tk_str tk_fmt_e(double val, int prec);
+tk_str tk_fmt_n_f(double val, int prec);
+tk_str tk_fmt_n_i(int64_t val);
+tk_str tk_fmt_g(double val, int prec);
+tk_str tk_fmt_b(uint64_t val);
+tk_str tk_fmt_p(double val, int prec);
+// Dynamic dispatchers: parse spec at runtime (first char + optional digits).
+tk_str tk_fmt_dyn_f64(double val, tk_str spec);
+tk_str tk_fmt_dyn_i64(int64_t val, tk_str spec);
+tk_str tk_fmt_dyn_u64(uint64_t val, tk_str spec);
+
 // --- Phase 3 str query/slice builtins (the checker types these via tk_builtin_fn) ---
 // The query helpers (eq/ends_with/contains/len) do NO allocation; the slice helpers return a
 // FRESH owned buffer (same ownership as tk_str_concat), tk_panic on OOM/out-of-range (M.1).

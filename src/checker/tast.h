@@ -42,6 +42,13 @@ typedef struct {
 } tk_tlambda;
 
 typedef struct { tk_token_kind op; tk_texpr *operand; } tk_tcmp_term;
+// Format spec entry in a typed interp node (ROUND 0). Parallel to holes[].
+typedef struct {
+    tk_fspec_kind kind;
+    tk_str        static_spec;   // TK_FSPEC_STATIC: the literal spec string (e.g. "F2")
+    tk_texpr     *dyn_args;      // TK_FSPEC_DYNAMIC: typed arg exprs (must be str)
+    size_t        ndyn_args;
+} tk_tinterp_spec;
 
 typedef struct {
     tk_pattern pattern;       // syntactic (binds; its own typing is C7a)
@@ -86,7 +93,14 @@ struct tk_texpr {
         // str(holes[0]) ++ pieces[1] ++ … ++ pieces[nholes] (npieces == nholes + 1). Each
         // hole carries its OWN resolved type (str passthrough vs integer→decimal text), so
         // both backends lower it identically (differential equivalence).
-        struct { tk_str *pieces; size_t npieces; tk_texpr *holes; size_t nholes; } interp;
+        // specs[i] carries the optional format spec for holes[i] (nspecs == nholes).
+        // (ROUND 0) A TK_TFSPEC_STATIC spec on a primitive hole enables format helpers;
+        // a TK_TFSPEC_DYNAMIC spec carries the typed arg expressions.
+        struct {
+            tk_str   *pieces; size_t npieces;
+            tk_texpr *holes;  size_t nholes;
+            tk_tinterp_spec *specs;   /* nholes elements, parallel to holes; NULL = all NONE */
+        } interp;
         // <expr> in [ … ] (Phase 2) — `.type` is bool. The lhs is EVALUATED ONCE; the result
         // is true iff lhs equals any element. Both lhs and the elements are typed TExprs, so
         // both backends lower it identically (differential equivalence).

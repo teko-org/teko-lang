@@ -387,5 +387,41 @@ tk_type_result tk_builtin_fn(tk_str name) {
         tk_type ft = { .tag = TK_TYPE_FUNC, .as.func = { .params = bfp_p, .nparams = 2, .ret = &bytes_t } };
         return (tk_type_result){ .ok = true, .as.value = ft };
     }
+    // ROUND 0 format helpers — intercepted by the VM (try_builtin_call) and native (tk_fmt_*).
+    // Signatures mirror teko_rt.tks exp fn declarations; resolved by last segment like ftoa.
+    static tk_type f64_i64_p[2] = { { .tag = TK_TYPE_PRIM, .as.prim = TK_PRIM_F64 }, { .tag = TK_TYPE_PRIM, .as.prim = TK_PRIM_I64 } };
+    static tk_type f64_str_p[2] = { { .tag = TK_TYPE_PRIM, .as.prim = TK_PRIM_F64 }, { .tag = TK_TYPE_STR } };
+    static tk_type i64_str_p[2] = { { .tag = TK_TYPE_PRIM, .as.prim = TK_PRIM_I64 }, { .tag = TK_TYPE_STR } };
+    static tk_type u64_str_p[2] = { { .tag = TK_TYPE_PRIM, .as.prim = TK_PRIM_U64 }, { .tag = TK_TYPE_STR } };
+    static tk_type i64_i64_p[2] = { { .tag = TK_TYPE_PRIM, .as.prim = TK_PRIM_I64 }, { .tag = TK_TYPE_PRIM, .as.prim = TK_PRIM_I64 } };
+    if (name_is(name, "fmt_f") || name_is(name, "fmt_e") || name_is(name, "fmt_g") ||
+        name_is(name, "fmt_n_f") || name_is(name, "fmt_p")) {       // (f64, i64) -> str
+        tk_type ft = { .tag = TK_TYPE_FUNC, .as.func = { .params = f64_i64_p, .nparams = 2, .ret = &str_t } };
+        return (tk_type_result){ .ok = true, .as.value = ft };
+    }
+    if (name_is(name, "fmt_d")) {                                    // (i64, i64) -> str
+        tk_type ft = { .tag = TK_TYPE_FUNC, .as.func = { .params = i64_i64_p, .nparams = 2, .ret = &str_t } };
+        return (tk_type_result){ .ok = true, .as.value = ft };
+    }
+    if (name_is(name, "fmt_x_upper") || name_is(name, "fmt_x_lower") || name_is(name, "fmt_b")) { // (u64) -> str
+        tk_type ft = { .tag = TK_TYPE_FUNC, .as.func = { .params = &u64_t, .nparams = 1, .ret = &str_t } };
+        return (tk_type_result){ .ok = true, .as.value = ft };
+    }
+    if (name_is(name, "fmt_n_i")) {                                  // (i64) -> str
+        tk_type ft = { .tag = TK_TYPE_FUNC, .as.func = { .params = &i64_t, .nparams = 1, .ret = &str_t } };
+        return (tk_type_result){ .ok = true, .as.value = ft };
+    }
+    if (name_is(name, "fmt_dyn_f64")) {                              // (f64, str) -> str
+        tk_type ft = { .tag = TK_TYPE_FUNC, .as.func = { .params = f64_str_p, .nparams = 2, .ret = &str_t } };
+        return (tk_type_result){ .ok = true, .as.value = ft };
+    }
+    if (name_is(name, "fmt_dyn_i64")) {                              // (i64, str) -> str
+        tk_type ft = { .tag = TK_TYPE_FUNC, .as.func = { .params = i64_str_p, .nparams = 2, .ret = &str_t } };
+        return (tk_type_result){ .ok = true, .as.value = ft };
+    }
+    if (name_is(name, "fmt_dyn_u64")) {                              // (u64, str) -> str
+        tk_type ft = { .tag = TK_TYPE_FUNC, .as.func = { .params = u64_str_p, .nparams = 2, .ret = &str_t } };
+        return (tk_type_result){ .ok = true, .as.value = ft };
+    }
     return (tk_type_result){ .ok = false, .as.error = tk_error_make("not a built-in function") };
 }

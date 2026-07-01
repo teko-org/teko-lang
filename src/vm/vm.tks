@@ -1064,8 +1064,52 @@ fn eval_index(ix: checker::TIndex, line: u32, col: u32, env: Venv) -> EvalRes {
 // builders codegen emits (i64_to_str / u64_to_str, selected by the value's own signedness), so
 // VM==codegen byte-for-byte. The result is pieces[0] ++ str(holes[0]) ++ … ++ pieces[nholes]
 // (pieces.len == holes.len + 1). The checker restricted hole types to str/integer.
+fn eval_interp_hole_no_spec(h: Value) -> str {
+    match h {
+        str as s   => s
+        bool as b  => if b { "true" } else { "false" }
+        error as e => e.message
+        _          => if val_is_float(h) { teko::ftoa(as_float(h)) }
+                      else if int_sign_of(h) { teko::i64_to_str(as_int(h) to i64) }
+                      else { teko::u64_to_str(as_int(h) to u64) }
+    }
+}
+
+fn eval_interp_static_spec(h: Value, spec: str) -> str {
+    // lowercase first byte to normalize 'F'→'f' (ASCII: 0x20 = lowercase flag for A-Z)
+    let fc0 = if spec.len > 0 { spec[0] } else { 102 to byte }  // 102 = 'f'
+    let fc_low = if fc0 >= 65 && fc0 <= 90 { (fc0 to u64 + 32) to byte } else { fc0 }
+    mut prec = 0 to i64
+    mut has_prec = false
+    mut si = 1 to u64
+    loop {
+        if si >= spec.len { break }
+        let ch = spec[si]
+        if ch >= 48 && ch <= 57 { prec = prec * 10 + (ch to i64 - 48); has_prec = true }
+        si++
+    }
+    if !has_prec { prec = if fc_low == 100 { 1 to i64 } else { 6 to i64 } }  // 100='d'
+    let is_flt = val_is_float(h)
+    let dval = if is_flt { as_float(h) }
+               else if int_sign_of(h) { as_int(h) to i64 to f64 }
+               else { as_int(h) to u64 to f64 }
+    let ival = if int_sign_of(h) { as_int(h) to i64 } else { 0 to i64 }
+    let uval = if !int_sign_of(h) && !is_flt { as_int(h) to u64 } else { 0 to u64 }
+    if      fc_low == 102 { teko::fmt_f(dval, prec) }             // 'f'
+    else if fc_low == 101 { teko::fmt_e(dval, prec) }             // 'e'
+    else if fc_low == 103 { teko::fmt_g(dval, prec) }             // 'g'
+    else if fc_low == 112 { teko::fmt_p(dval, prec) }             // 'p'
+    else if fc_low == 100 { teko::fmt_d(ival, prec) }             // 'd'
+    else if fc_low == 120 && spec.len > 0 && spec[0] == 88 { teko::fmt_x_upper(uval) }  // 'X'
+    else if fc_low == 120 { teko::fmt_x_lower(uval) }             // 'x'
+    else if fc_low == 98  { teko::fmt_b(uval) }                   // 'b'
+    else if fc_low == 110 && is_flt { teko::fmt_n_f(dval, prec) } // 'n' float
+    else if fc_low == 110 { teko::fmt_n_i(ival) }                 // 'n' int
+    else { teko::fmt_f(dval, prec) }
+}
+
 fn eval_interp(in: checker::TInterp, env: Venv) -> EvalRes {
-    mut cur = env                       // (MEM Step 4) thread the env across each hole eval
+    mut cur = env
     mut acc = ""
     mut i = 0
     loop {
@@ -1075,10 +1119,18 @@ fn eval_interp(in: checker::TInterp, env: Venv) -> EvalRes {
             let he = eval_expr(in.holes[i], cur)
             cur = he.env
             let h = he.value
-            let hs = match h {
-                str as s => s
-                _        => if int_sign_of(h) { teko::i64_to_str(as_int(h) to i64) }
-                            else { teko::u64_to_str(as_int(h) to u64) }
+            let fk = if i < in.specs.len { in.specs[i].kind } else { checker::TFSpecNone { } }
+            let hs = match fk {
+                checker::TFSpecStatic as fs => eval_interp_static_spec(h, fs.s)
+                checker::TFSpecDynamic as fd => {
+                    let se = eval_expr(fd.args[0], cur)
+                    cur = se.env
+                    let spec_str = match se.value { str as s => s; _ => "" }
+                    if val_is_float(h) { teko::fmt_dyn_f64(as_float(h), spec_str) }
+                    else if int_sign_of(h) { teko::fmt_dyn_i64(as_int(h) to i64, spec_str) }
+                    else { teko::fmt_dyn_u64(as_int(h) to u64, spec_str) }
+                }
+                _ => eval_interp_hole_no_spec(h)
             }
             acc = teko::str_concat(acc, hs)
         }
@@ -2909,7 +2961,20 @@ fn cov_walk_expr(e: checker::TExpr, w: CovWalk) -> CovWalk {
         checker::TInterp as in => {
             mut a = w0
             mut i = 0
-            loop { if i >= in.holes.len { break }; a = cov_walk_expr(in.holes[i], a); i++ }
+            loop {
+                if i >= in.holes.len { break }
+                a = cov_walk_expr(in.holes[i], a)
+                if i < in.specs.len {
+                    match in.specs[i].kind {
+                        checker::TFSpecDynamic as fd => {
+                            mut k = 0
+                            loop { if k >= fd.args.len { break }; a = cov_walk_expr(fd.args[k], a); k++ }
+                        }
+                        _ => { }
+                    }
+                }
+                i++
+            }
             a
         }
         checker::TInExpr as ie => {

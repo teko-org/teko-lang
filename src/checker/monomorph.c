@@ -346,9 +346,22 @@ static bool mono_texpr(tk_texpr e, tk_subst s, tk_tprogram prog, tk_type_table t
         }
         case TK_TEXPR_INTERP: {
             tk_texpr *holes = e.as.interp.nholes ? tk_alloc(e.as.interp.nholes * sizeof *holes) : NULL;
-            for (size_t i = 0; i < e.as.interp.nholes; i += 1)
+            tk_tinterp_spec *specs = (e.as.interp.specs && e.as.interp.nholes)
+                ? tk_alloc(e.as.interp.nholes * sizeof *specs) : NULL;
+            for (size_t i = 0; i < e.as.interp.nholes; i += 1) {
                 if (!mono_texpr(e.as.interp.holes[i], s, prog, table, &holes[i], insts, err)) return false;
+                if (specs && e.as.interp.specs) {
+                    specs[i] = e.as.interp.specs[i];  // kind + static_spec copied as-is
+                    if (specs[i].kind == TK_FSPEC_DYNAMIC && specs[i].ndyn_args > 0) {
+                        tk_texpr *da = tk_alloc(specs[i].ndyn_args * sizeof *da); if (!da) abort();
+                        for (size_t k = 0; k < specs[i].ndyn_args; k++)
+                            if (!mono_texpr(specs[i].dyn_args[k], s, prog, table, &da[k], insts, err)) { return false; }
+                        specs[i].dyn_args = da;
+                    }
+                }
+            }
             r.as.interp.holes = holes;
+            r.as.interp.specs = specs;
             break;
         }
         case TK_TEXPR_IN: {

@@ -2053,42 +2053,115 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
         }
 
         case TK_TEXPR_INTERP: {
-            // $"…{expr}…" (self-host parity) — lower to nested tk_str_concat over the piece
-            // literals and the holes: `pieces[0] ++ str(holes[0]) ++ pieces[1] ++ …`. A piece
-            // literal is the SAME (tk_str){…} emission as TK_TEXPR_STR (decoded bytes, explicit
-            // length — may contain NUL). A `str` hole is the str expr directly; an INTEGER hole
-            // is wrapped in tk_i64_to_str/tk_u64_to_str (selected by the hole's signedness) — the
-            // SAME runtime builders the VM calls, so VM==codegen byte-for-byte. The concats nest
-            // left-to-right so the build order matches the VM's accumulator. tk_str_concat is
-            // declared in teko_rt.h (the generated TU's runtime header).
+            // $"…{expr}…" — lower to nested tk_str_concat over pieces and holes.
+            // ROUND 0 expansion: accepts str, int, float, bool, byte, char, error hole types.
+            // Format specs: static ($"{x:F2}") dispatch to tk_fmt_* helpers; dynamic ($"{x:[fmt]}")
+            // dispatch to tk_fmt_dyn_f64/i64/u64 with the runtime spec expression.
             size_t np = e->as.interp.npieces, nh = e->as.interp.nholes;
-            size_t nsegs = np + nh;            // total segments (pieces interleaved with holes)
-            // nesting: concat(concat(…concat(S0, S1)…, S(n-2)), S(n-1)). Open one
-            // tk_str_concat( for each segment after S0 (nsegs - 1 of them).
+            size_t nsegs = np + nh;
             for (size_t s = 1; s < nsegs; s += 1) cb(b, "tk_str_concat(");
             for (size_t s = 0; s < nsegs; s += 1) {
-                if (s >= 1) cb(b, ", ");       // the second arg of this segment's concat(
-                if ((s & 1u) == 0) {           // a PIECE literal (segment 2*i → piece i)
+                if (s >= 1) cb(b, ", ");
+                if ((s & 1u) == 0) {           // PIECE literal
                     tk_str piece = e->as.interp.pieces[s / 2];
                     cb(b, "(tk_str){ (const tk_byte *)\"");
                     cb_cstr_escaped(b, piece);
                     cb(b, "\", ");
                     cb_i64(b, (int64_t)piece.len);
                     cb(b, " }");
-                } else {                       // a HOLE (segment 2*i+1 → hole i)
-                    const tk_texpr *h = &e->as.interp.holes[s / 2];
-                    if (h->type.tag == TK_TYPE_STR) {
-                        if (!emit_expr(b, h, err)) return false;       // str passthrough
-                    } else if (h->type.tag == TK_TYPE_PRIM && tk_prim_is_int(h->type.as.prim)) {
-                        bool sgn = tk_prim_is_signed(h->type.as.prim);
-                        cb(b, sgn ? "tk_i64_to_str((int64_t)(" : "tk_u64_to_str((uint64_t)(");
+                } else {                       // HOLE
+                    size_t hi = s / 2;
+                    const tk_texpr *h = &e->as.interp.holes[hi];
+                    tk_tinterp_spec *sp = (e->as.interp.specs) ? &e->as.interp.specs[hi] : NULL;
+                    tk_fspec_kind fk = sp ? sp->kind : TK_FSPEC_NONE;
+                    tk_type ht = h->type;
+                    // --- static spec dispatch ---
+                    if (fk == TK_FSPEC_STATIC) {
+                        tk_str spec = sp->static_spec;
+                        char fc = (spec.len > 0) ? (char)(spec.ptr[0] | 0x20) : 'f';
+                        bool is_signed_int = (ht.tag == TK_TYPE_PRIM && tk_prim_is_signed(ht.as.prim));
+                        bool is_float_h    = (ht.tag == TK_TYPE_PRIM && (ht.as.prim == TK_PRIM_F32 || ht.as.prim == TK_PRIM_F64));
+                        // parse optional trailing integer from spec (e.g. "F2" → 2)
+                        int prec = 0; bool has_prec = false;
+                        for (size_t si = 1; si < spec.len; si++) {
+                            if (spec.ptr[si] >= '0' && spec.ptr[si] <= '9') {
+                                prec = prec * 10 + (spec.ptr[si] - '0'); has_prec = true;
+                            }
+                        }
+                        if (!has_prec) prec = (fc == 'd') ? 1 : 6;
+                        char prec_buf[16]; snprintf(prec_buf, sizeof prec_buf, "%d", prec);
+                        if (fc == 'f' && is_float_h) {
+                            cb(b, "tk_fmt_f((double)("); if (!emit_expr(b, h, err)) return false;
+                            cb(b, "), "); cb(b, prec_buf); cb(b, ")");
+                        } else if (fc == 'e' && is_float_h) {
+                            cb(b, "tk_fmt_e((double)("); if (!emit_expr(b, h, err)) return false;
+                            cb(b, "), "); cb(b, prec_buf); cb(b, ")");
+                        } else if (fc == 'g' && is_float_h) {
+                            cb(b, "tk_fmt_g((double)("); if (!emit_expr(b, h, err)) return false;
+                            cb(b, "), "); cb(b, prec_buf); cb(b, ")");
+                        } else if (fc == 'n' && is_float_h) {
+                            cb(b, "tk_fmt_n_f((double)("); if (!emit_expr(b, h, err)) return false;
+                            cb(b, "), "); cb(b, prec_buf); cb(b, ")");
+                        } else if (fc == 'p' && is_float_h) {
+                            cb(b, "tk_fmt_p((double)("); if (!emit_expr(b, h, err)) return false;
+                            cb(b, "), "); cb(b, prec_buf); cb(b, ")");
+                        } else if (fc == 'd') {
+                            cb(b, "tk_fmt_d((int64_t)("); if (!emit_expr(b, h, err)) return false;
+                            cb(b, "), "); cb(b, prec_buf); cb(b, ")");
+                        } else if (spec.len > 0 && (spec.ptr[0] == 'X')) {
+                            cb(b, "tk_fmt_x_upper((uint64_t)("); if (!emit_expr(b, h, err)) return false; cb(b, "))");
+                        } else if (fc == 'x') {
+                            cb(b, "tk_fmt_x_lower((uint64_t)("); if (!emit_expr(b, h, err)) return false; cb(b, "))");
+                        } else if (fc == 'b') {
+                            cb(b, "tk_fmt_b((uint64_t)("); if (!emit_expr(b, h, err)) return false; cb(b, "))");
+                        } else if (fc == 'n') {
+                            cb(b, "tk_fmt_n_i("); if (is_signed_int) cb(b, "(int64_t)("); else cb(b, "(int64_t)(uint64_t)(");
+                            if (!emit_expr(b, h, err)) return false; cb(b, "))");
+                        } else {
+                            return fail_node(err, "codegen: unrecognized format spec");
+                        }
+                    } else if (fk == TK_FSPEC_DYNAMIC) {
+                        // Dynamic spec: first dyn_arg is the spec string.
+                        bool is_float_h  = (ht.tag == TK_TYPE_PRIM && (ht.as.prim == TK_PRIM_F32 || ht.as.prim == TK_PRIM_F64));
+                        bool is_sint = (ht.tag == TK_TYPE_PRIM && tk_prim_is_signed(ht.as.prim));
+                        if (is_float_h) cb(b, "tk_fmt_dyn_f64((double)(");
+                        else if (is_sint) cb(b, "tk_fmt_dyn_i64((int64_t)(");
+                        else             cb(b, "tk_fmt_dyn_u64((uint64_t)(");
                         if (!emit_expr(b, h, err)) return false;
-                        cb(b, "))");
+                        cb(b, "), ");
+                        if (!emit_expr(b, &sp->dyn_args[0], err)) return false;  // first arg = spec str
+                        cb(b, ")");
                     } else {
-                        return fail_node(err, "codegen: interpolation hole must be a str or an integer");
+                        // No spec: natural form (ROUND 0 expanded types).
+                        if (ht.tag == TK_TYPE_STR || ht.tag == TK_TYPE_CHAR) {
+                            if (!emit_expr(b, h, err)) return false;  // str/char passthrough (same layout)
+                        } else if (ht.tag == TK_TYPE_PRIM && ht.as.prim == TK_PRIM_BOOL) {
+                            cb(b, "(");
+                            if (!emit_expr(b, h, err)) return false;
+                            cb(b, " ? (tk_str){ (const tk_byte *)\"true\", 4 } : (tk_str){ (const tk_byte *)\"false\", 5 })");
+                        } else if (ht.tag == TK_TYPE_BYTE) {
+                            cb(b, "tk_u64_to_str((uint64_t)(");
+                            if (!emit_expr(b, h, err)) return false;
+                            cb(b, "))");
+                        } else if (ht.tag == TK_TYPE_ERROR) {
+                            cb(b, "(");
+                            if (!emit_expr(b, h, err)) return false;
+                            cb(b, ").message");
+                        } else if (ht.tag == TK_TYPE_PRIM && (ht.as.prim == TK_PRIM_F32 || ht.as.prim == TK_PRIM_F64)) {
+                            cb(b, "tk_ftoa((double)(");
+                            if (!emit_expr(b, h, err)) return false;
+                            cb(b, "))");
+                        } else if (ht.tag == TK_TYPE_PRIM && tk_prim_is_int(ht.as.prim)) {
+                            bool sgn = tk_prim_is_signed(ht.as.prim);
+                            cb(b, sgn ? "tk_i64_to_str((int64_t)(" : "tk_u64_to_str((uint64_t)(");
+                            if (!emit_expr(b, h, err)) return false;
+                            cb(b, "))");
+                        } else {
+                            return fail_node(err, "codegen: interpolation hole type not supported");
+                        }
                     }
                 }
-                if (s >= 1) cb(b, ")");        // close this segment's tk_str_concat(
+                if (s >= 1) cb(b, ")");
             }
             return true;
         }
@@ -4144,7 +4217,14 @@ static void cg_collect_expr_opts(cg_opt_set *set, const tk_texpr *e) {
         case TK_TEXPR_COALESCE: cg_collect_expr_opts(set, e->as.coalesce.left); cg_collect_expr_opts(set, e->as.coalesce.right); return;
         case TK_TEXPR_STRUCT_INIT: for (size_t i = 0; i < e->as.struct_init.nfields; i += 1) cg_collect_expr_opts(set, &e->as.struct_init.field_vals[i]); return;
         case TK_TEXPR_INDEX: cg_collect_expr_opts(set, e->as.index.receiver); cg_collect_expr_opts(set, e->as.index.index); return;
-        case TK_TEXPR_INTERP: for (size_t i = 0; i < e->as.interp.nholes; i += 1) cg_collect_expr_opts(set, &e->as.interp.holes[i]); return;
+        case TK_TEXPR_INTERP:
+            for (size_t i = 0; i < e->as.interp.nholes; i += 1) {
+                cg_collect_expr_opts(set, &e->as.interp.holes[i]);
+                if (e->as.interp.specs && e->as.interp.specs[i].kind == TK_FSPEC_DYNAMIC)
+                    for (size_t k = 0; k < e->as.interp.specs[i].ndyn_args; k++)
+                        cg_collect_expr_opts(set, &e->as.interp.specs[i].dyn_args[k]);
+            }
+            return;
         case TK_TEXPR_IN:
             cg_collect_expr_opts(set, e->as.in_expr.lhs);
             for (size_t i = 0; i < e->as.in_expr.nelems; i += 1) cg_collect_expr_opts(set, &e->as.in_expr.elems[i]);
@@ -4718,7 +4798,14 @@ static void cg_lift_expr(tk_texpr *e, uint64_t *next, tk_tfunction **fns, size_t
         case TK_TEXPR_COALESCE: cg_lift_expr(e->as.coalesce.left, next, fns, nfns); cg_lift_expr(e->as.coalesce.right, next, fns, nfns); break;
         case TK_TEXPR_STRUCT_INIT: for (size_t i = 0; i < e->as.struct_init.nfields; i += 1) cg_lift_expr(&e->as.struct_init.field_vals[i], next, fns, nfns); break;
         case TK_TEXPR_INDEX: cg_lift_expr(e->as.index.receiver, next, fns, nfns); cg_lift_expr(e->as.index.index, next, fns, nfns); break;
-        case TK_TEXPR_INTERP: for (size_t i = 0; i < e->as.interp.nholes; i += 1) cg_lift_expr(&e->as.interp.holes[i], next, fns, nfns); break;
+        case TK_TEXPR_INTERP:
+            for (size_t i = 0; i < e->as.interp.nholes; i += 1) {
+                cg_lift_expr(&e->as.interp.holes[i], next, fns, nfns);
+                if (e->as.interp.specs && e->as.interp.specs[i].kind == TK_FSPEC_DYNAMIC)
+                    for (size_t k = 0; k < e->as.interp.specs[i].ndyn_args; k++)
+                        cg_lift_expr(&e->as.interp.specs[i].dyn_args[k], next, fns, nfns);
+            }
+            break;
         case TK_TEXPR_IN: cg_lift_expr(e->as.in_expr.lhs, next, fns, nfns); for (size_t i = 0; i < e->as.in_expr.nelems; i += 1) cg_lift_expr(&e->as.in_expr.elems[i], next, fns, nfns); break;
         case TK_TEXPR_ARRAY: for (size_t i = 0; i < e->as.array.nelements; i += 1) cg_lift_expr(&e->as.array.elements[i], next, fns, nfns); break;
         default: break;   // leaves
