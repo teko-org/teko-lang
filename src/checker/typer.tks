@@ -2434,6 +2434,10 @@ pub fn type_program_with_deps(program: parser::Program, dep_prog: TProgram) -> T
     loop {
         if i >= program.items.len { break }
         let it = program.items[i]
+        // (#41) mirror typer.c (tk_type_program_with_deps line 689: `cur.cur_ns = it.namespace;`):
+        // same fix as type_program — set cur_ns per item so a loose main.tks statement's unqualified
+        // same-namespace call resolves. See type_program's comment for the full rationale.
+        cur = with_ns(cur, it.namespace)
         let ienv = with_ns(c.env, it.namespace)
         mut line: u32 = 0
         mut col: u32 = 0
@@ -2510,6 +2514,14 @@ pub fn type_program(program: parser::Program) -> TProgram | error {
     loop {
         if i >= program.items.len { break }
         let it = program.items[i]
+        // (#41) mirror typer.c (tk_type_program line 749: `cur.cur_ns = it.namespace;`): set the
+        // namespace being type-checked on the THREADED virtual-main scope BEFORE typing a loose
+        // top-level statement, so an UNQUALIFIED same-namespace call from main.tks (e.g.
+        // `use_counter(21)` resolving to a fn defined in another file of the same project) matches
+        // via lookup_call's `b.ns == env.cur_ns` clause. Without this, loose statements were typed
+        // with cur_ns="" (from env_empty) → cross-file top-level fns reported "unknown function".
+        // with_ns preserves cur's accumulated bindings (prior loose `let`s stay visible).
+        cur = with_ns(cur, it.namespace)
         let ienv = with_ns(c.env, it.namespace)   // (#41) resolve this item's calls in its namespace
         // W-loc-2: the item's source file + the decl's line:col, so a type error in the
         // flattened program resolves to file:line:col (loose statements carry no loc → file only).
