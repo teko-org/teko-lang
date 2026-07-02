@@ -695,3 +695,61 @@ fn ref_value_position_struct_holds() {
     teko::assert::is_true(p.x == 42)       // the whole-replace reached the caller's `p`
     teko::assert::is_true(p.y == 2)        // y preserved
 }
+
+// =============================================================================================
+// (#50) FLAGS member VALUES at runtime — a flags path expression `Type::Member` evaluates to
+// 1 << ordinal (power-of-2), NOT the ordinal, in BOTH engines. The pre-#50 VM lowered the
+// ordinal (Read=0, Write=1, Exec=2), so any mask.has(VmPerm::Read) was vacuously true
+// ((recv & 0) == 0). Native codegen's pre-emitted constants were always correct — these tests
+// pin the VM twins to the same values (the .tkt gate runs under BOTH the C and the .tks VM).
+// =============================================================================================
+flags VmPerm {
+    Read
+    Write
+    Exec
+}
+
+// Member values are distinct powers of two: Read=1, Write=2, Exec=4. Observed through `has`
+// ((recv & mask) == mask) — under the ordinal bug Read=0 made every has(Read) true.
+#test
+fn flags_member_values_are_powers_of_two() {
+    let w = VmPerm::Write
+    teko::assert::is_false(w.has(VmPerm::Read))    // 2 & 1 == 0 ≠ 1 (ordinal bug: 1 & 0 == 0 → true)
+    teko::assert::is_true(w.has(VmPerm::Write))    // 2 & 2 == 2
+    teko::assert::is_false(w.has(VmPerm::Exec))    // 2 & 4 == 0 ≠ 4
+    let e = VmPerm::Exec
+    teko::assert::is_false(e.has(VmPerm::Read))    // 4 & 1 == 0 ≠ 1 (ordinal bug: 2 & 0 == 0 → true)
+    teko::assert::is_false(e.has(VmPerm::Write))   // 4 & 2 == 0 ≠ 2
+    teko::assert::is_true(e.has(VmPerm::Exec))     // 4 & 4 == 4
+}
+
+// add = recv | mask; remove = recv & ~mask (the ~ runs at the flags CARRIER width, u8 here).
+#test
+fn flags_add_remove_hold() {
+    let p  = VmPerm::Read
+    let p2 = p.add(VmPerm::Write)                  // {Read, Write} = 3
+    teko::assert::is_true(p2.has(VmPerm::Read))
+    teko::assert::is_true(p2.has(VmPerm::Write))
+    teko::assert::is_false(p2.has(VmPerm::Exec))
+    let p3 = p2.remove(VmPerm::Read)               // {Write} = 2 (ordinal bug: 1 & ~0 == 1 → has(Read) stayed true)
+    teko::assert::is_false(p3.has(VmPerm::Read))
+    teko::assert::is_true(p3.has(VmPerm::Write))
+    teko::assert::is_false(p3.has(VmPerm::Exec))
+}
+
+// all = (recv & mask) == mask (same lowering as has, exercised with a COMPOSED mask);
+// any/none compare (recv & mask) against the checker's fabricated flags-typed ZERO literal —
+// pre-#50 that zero node ABORTED both VM twins ("number literal with a non-primitive type").
+#test
+fn flags_all_any_none_hold() {
+    let r  = VmPerm::Read
+    let p  = r.add(VmPerm::Exec)                   // {Read, Exec} = 5
+    let rw = r.add(VmPerm::Write)                  // {Read, Write} = 3
+    let re = r.add(VmPerm::Exec)                   // {Read, Exec} = 5
+    teko::assert::is_true(p.all(re))               // 5 & 5 == 5
+    teko::assert::is_false(p.all(rw))              // 5 & 3 == 1 ≠ 3
+    teko::assert::is_true(p.any(rw))               // 5 & 3 == 1 ≠ 0
+    teko::assert::is_false(p.any(VmPerm::Write))   // 5 & 2 == 0
+    teko::assert::is_true(p.none(VmPerm::Write))   // 5 & 2 == 0
+    teko::assert::is_false(p.none(VmPerm::Exec))   // 5 & 4 == 4 ≠ 0
+}

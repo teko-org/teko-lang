@@ -1394,8 +1394,10 @@ fn type_array_lit(a: parser::ArrayLit, env: Env, table: TypeTable) -> TExpr | er
 // (C8.3, ported 2026-07-01 alongside type_flags_method to unblock its self-host testing — see
 // expr.c::type_path_expr) `Type::Member` as a VALUE: an ENUM member (ordinal = declaration
 // index) OR a FLAGS member (ordinal = the BIT INDEX, i.e. the member's power-of-2 position, not
-// its value — codegen/VM compute the actual `1 << ordinal`). The .tks side previously supported
-// ONLY enum; flags fell through to the enum-only error, a self-host divergence from expr.c.
+// its value). (#50) The node also carries the RESOLVED member `value` (enum: the ordinal;
+// flags: `1 << ordinal`) so the VM reads it instead of recomputing (native codegen's pre-emitted
+// constants already encode it). The .tks side previously supported ONLY enum; flags fell through
+// to the enum-only error, a self-host divergence from expr.c.
 fn type_path_expr(pe: parser::PathExpr, table: TypeTable) -> TExpr | error {
     let p = pe.path
     if p.segments.len < 2 { return error { message = "a path expression must name an enum or flags member (`Type::Member`)" } }
@@ -1415,7 +1417,7 @@ fn type_path_expr(pe: parser::PathExpr, table: TypeTable) -> TExpr | error {
             mut j: u64 = 0
             loop {
                 if j >= eb.members.len { break }
-                if eb.members[j] == member { return TExpr { kind = TPathExpr { enum_name = tname; member = member; ordinal = j }; type = et; line = 0; col = 0 } }
+                if eb.members[j] == member { return TExpr { kind = TPathExpr { enum_name = tname; member = member; ordinal = j; value = j to u128 }; type = et; line = 0; col = 0 } }   // (#50) enum member VALUE = its ordinal
                 j++
             }
             error { message = $"no member `{member}` in enum `{tname}`" }
@@ -1425,7 +1427,7 @@ fn type_path_expr(pe: parser::PathExpr, table: TypeTable) -> TExpr | error {
             mut j: u64 = 0
             loop {
                 if j >= fb.members.len { break }
-                if fb.members[j] == member { return TExpr { kind = TPathExpr { enum_name = tname; member = member; ordinal = j }; type = et; line = 0; col = 0 } }
+                if fb.members[j] == member { return TExpr { kind = TPathExpr { enum_name = tname; member = member; ordinal = j; value = (1 to u128) << j }; type = et; line = 0; col = 0 } }   // (#50) flags member VALUE = 1 << ordinal (power-of-2)
                 j++
             }
             error { message = $"no member `{member}` in the flags type `{tname}`" }

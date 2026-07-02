@@ -185,12 +185,16 @@ tk_texpr tk_read_texpr(tk_reader *r, tk_strs t) {
             e.as.interp.holes  = holes;  e.as.interp.nholes  = nh;
             return e;
         }
-        case 19:                                                                /* value-level Enum::Member — enum name, member, ordinal */
+        case 19: {                                                              /* value-level Enum::Member — enum name, member, ordinal, (#50) value (u128 as hi then lo) */
             e.tag = TK_TEXPR_PATH;
             e.as.path.enum_name = tk_read_str(r, t);
             e.as.path.member    = tk_read_str(r, t);
             e.as.path.ordinal   = tk_read_u64(r);
+            uint64_t vhi = tk_read_u64(r);
+            uint64_t vlo = tk_read_u64(r);
+            e.as.path.value = (((unsigned __int128)vhi) << 64) | (unsigned __int128)vlo;
             return e;
+        }
         case 20: {                                                              /* Phase 2 — <expr> in [ … ]: lhs THEN nelems (u64) THEN each elem */
             e.tag = TK_TEXPR_IN;
             e.as.in_expr.lhs = boxe(tk_read_texpr(r, t));
