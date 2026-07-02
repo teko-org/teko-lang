@@ -129,6 +129,37 @@ tk_classbody_result tk_find_class_body(tk_str name, tk_type_table table) {
     return (tk_classbody_result){ .ok = true, .as.value = decl.as.value.body.as.class_body };
 }
 
+// GUARD cyclic class inheritance BEFORE any recursive base-chain walk (tk_effective_class_fields/
+// _methods/validate_class_decl) would recurse forever and crash (stack overflow). Walk `name`'s base
+// chain with a visited-set of the root→here PATH; a class name reappearing is a cycle, returned as
+// an honest error. Uses only the NON-recursive tk_find_class_body lookup, so it terminates even on a
+// cycle. A base that is unknown/not-a-class STOPS the walk (validate_class_decl surfaces that error).
+// Mirror of collect.tks::class_inheritance_acyclic.
+static tk_type_result class_inheritance_acyclic(tk_str name, tk_type_table table) {
+    tk_str *seen = tk_alloc(sizeof *seen); if (!seen) abort();
+    seen[0] = name; size_t n_seen = 1;
+    tk_str cur = name;
+    for (;;) {
+        tk_classbody_result cb = tk_find_class_body(cur, table);
+        if (!cb.ok) break;
+        if (!cb.as.value.has_base) break;
+        tk_str b = cb.as.value.base_name;
+        for (size_t i = 0; i < n_seen; i += 1) {
+            if (tk_str_eq(seen[i], b)) {
+                size_t len = b.len + 96; char *buf = tk_alloc(len); if (!buf) abort();
+                snprintf(buf, len, "cyclic class inheritance: '%.*s' inherits from itself (directly or transitively)", (int)b.len, (const char *)b.ptr);
+                return (tk_type_result){ .ok = false, .as.error = tk_error_make(buf) };
+            }
+        }
+        tk_str *seen2 = tk_alloc((n_seen + 1) * sizeof *seen2); if (!seen2) abort();   // seen ++ [b]
+        for (size_t i = 0; i < n_seen; i += 1) seen2[i] = seen[i];
+        seen2[n_seen] = b;
+        seen = seen2; n_seen += 1;
+        cur = b;
+    }
+    return (tk_type_result){ .ok = true };
+}
+
 // (W10b.CLASS increment 2) a class's EFFECTIVE fields: the base's effective fields (recursively)
 // followed by its own. Mirror of collect.tks::effective_class_fields.
 tk_fieldsvec_result tk_effective_class_fields(tk_class_body cb, tk_type_table table) {
@@ -417,6 +448,8 @@ static tk_type_result validate_type_decls(tk_type_table table) {
             if (r.as.value.tag == TK_TYPE_REF)
                 return (tk_type_result){ .ok = false, .as.error = tk_error_make("a reference cannot be stored in a struct/variant/collection") };
         } else if (body.tag == TK_BODY_CLASS) {   // (W10b.CLASS) same R4 escape-gate as a struct's fields
+            tk_type_result acyc = class_inheritance_acyclic(decl.name, table);   // guard cyclic inheritance BEFORE any recursive base-chain walk
+            if (!acyc.ok) return acyc;
             for (size_t f = 0; f < body.as.class_body.n_fields; f += 1) {
                 tk_type_result r = tk_resolve_type(body.as.class_body.fields[f].type_ann, tbl);
                 if (!r.ok) return r;
@@ -432,11 +465,33 @@ static tk_type_result validate_type_decls(tk_type_table table) {
                                                   body.as.class_body.implements, body.as.class_body.n_implements, table, false);
             if (!cf.ok) return cf;
         } else if (body.tag == TK_BODY_INTERFACE) {
-            // (W10b.IF) an interface's own `extends` names must each BE an interface (transitively)
-            // and must not form a cycle (seed the cycle-path with this interface's own name).
+            tk_interface_body ibb = body.as.interface_body;
+            // (W10b.IF) OWN methods must be BODYLESS signatures — a pure contract, no default bodies.
+            for (size_t mi = 0; mi < ibb.n_methods; mi += 1) {
+                if (ibb.methods[mi].nbody > 0) {
+                    tk_str nm = ibb.methods[mi].name;
+                    size_t len = nm.len + 112; char *buf = tk_alloc(len); if (!buf) abort();
+                    snprintf(buf, len, "interface method '%.*s' must be a bodyless signature (an interface is a pure contract — no default bodies)", (int)nm.len, (const char *)nm.ptr);
+                    return (tk_type_result){ .ok = false, .as.error = tk_error_make(buf) };
+                }
+            }
+            // its `extends` names must each BE an interface (transitively) and not form a cycle
+            // (seed the cycle-path with this interface's own name).
             tk_str dn = decl.name;
-            tk_methodsvec_result em = effective_interface_methods(body.as.interface_body, table, &dn, 1);
+            tk_methodsvec_result em = effective_interface_methods(ibb, table, &dn, 1);
             if (!em.ok) return (tk_type_result){ .ok = false, .as.error = em.as.error };
+            // no two EFFECTIVE methods may share a name with a DIFFERENT signature — a redeclaration
+            // conflict, caught HERE (at the interface) rather than later at an implementer.
+            for (size_t a = 0; a < em.as.value.len; a += 1) {
+                for (size_t b = a + 1; b < em.as.value.len; b += 1) {
+                    if (tk_str_eq(em.as.value.ptr[a].name, em.as.value.ptr[b].name) && !method_sig_matches(em.as.value.ptr[a], em.as.value.ptr[b], table)) {
+                        tk_str nm = em.as.value.ptr[a].name;
+                        size_t len = dn.len + nm.len + 112; char *buf = tk_alloc(len); if (!buf) abort();
+                        snprintf(buf, len, "interface '%.*s' has conflicting signatures for method '%.*s' (an extended interface declares it differently)", (int)dn.len, (const char *)dn.ptr, (int)nm.len, (const char *)nm.ptr);
+                        return (tk_type_result){ .ok = false, .as.error = tk_error_make(buf) };
+                    }
+                }
+            }
         }
     }
     return (tk_type_result){ .ok = true };

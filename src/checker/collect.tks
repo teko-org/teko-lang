@@ -182,6 +182,35 @@ pub fn find_class_body(name: str, table: TypeTable) -> parser::ClassBody | error
     }
 }
 
+// GUARD cyclic class inheritance BEFORE any recursive base-chain walk (effective_class_fields/
+// effective_class_methods/validate_class_decl) would recurse forever and crash (stack overflow).
+// Walk `name`'s base chain with a visited-set of the root→here PATH; a class name reappearing on
+// the path is a cycle (`class A B {} / class B A {}`, or the self-loop `class A A {}`), returned as
+// an honest error. Uses only the NON-recursive find_class_body lookup, so it terminates even on a
+// cycle. A base that is unknown / not-a-class STOPS the walk (validate_class_decl surfaces that
+// specific error). Mirrors the interface-cycle guard in effective_interface_methods.
+fn class_inheritance_acyclic(name: str, table: TypeTable) -> error? {
+    mut seen: []str = teko::list::push(teko::list::empty(), name)
+    mut cur = name
+    loop {
+        // a base that is unknown / not-a-class ends the walk cleanly (return null) — validate_class_decl
+        // surfaces that specific error. (`return null` here, not `break`: the self-hosted codegen does
+        // not support `break` inside a `match` used as a sub-expression.)
+        let cb = match find_class_body(cur, table) { parser::ClassBody as c => c; error => return null }
+        if !cb.has_base { break }
+        let b = cb.base_name
+        mut i = 0
+        loop {
+            if i >= seen.len { break }
+            if seen[i] == b { return error { message = $"cyclic class inheritance: '{b}' inherits from itself (directly or transitively)" } }
+            i++
+        }
+        seen = teko::list::push(seen, b)
+        cur = b
+    }
+    null
+}
+
 // (W10b.CLASS increment 2) a class's EFFECTIVE fields: the base's effective fields (recursively),
 // followed by its own — structural inheritance by field-flattening (composition, no embedded C
 // object/vtable yet). Used everywhere a class's data shape matters (construction, field access,
@@ -519,6 +548,7 @@ fn validate_type_decls(table: TypeTable) -> error? {
                 }
             }
             parser::ClassBody as cb => {   // (W10b.CLASS) same R4 escape-gate as a struct's fields
+                match class_inheritance_acyclic(decl.name, table) { error as e => return e; null => {} }   // guard cyclic inheritance BEFORE any recursive base-chain walk
                 mut f = 0
                 loop {
                     if f >= cb.fields.len { break }
@@ -534,9 +564,33 @@ fn validate_type_decls(table: TypeTable) -> error? {
                 match check_conformance(decl.name, eff, cb.implements, table, false) { error as e => return e; null => {} }   // (W10b.IF) class methods need real `pub`
             }
             parser::InterfaceBody as ib => {
-                // (W10b.IF) an interface's own `extends` names must each BE an interface (transitively)
-                // and must not form a cycle (seed `seen` with this interface's own name).
-                match effective_interface_methods(ib, table, teko::list::push(teko::list::empty(), decl.name)) { []parser::Function => {}; error as e => return e }
+                // (W10b.IF) an interface's OWN methods must be BODYLESS signatures — an interface is a
+                // pure contract; default method bodies are PROHIBITED by the design.
+                mut mi = 0
+                loop {
+                    if mi >= ib.methods.len { break }
+                    if ib.methods[mi].body.len > 0 { return error { message = $"interface method '{ib.methods[mi].name}' must be a bodyless signature (an interface is a pure contract — no default bodies)" } }
+                    mi++
+                }
+                // its `extends` names must each BE an interface (transitively) and not form a cycle
+                // (seed `seen` with this interface's own name).
+                let eff = match effective_interface_methods(ib, table, teko::list::push(teko::list::empty(), decl.name)) { []parser::Function as m => m; error as e => return e }
+                // no two EFFECTIVE methods (own + inherited) may share a name with a DIFFERENT signature
+                // — a redeclaration conflict, caught HERE (at the interface) with a clear message rather
+                // than later, confusingly, at an implementer. (Same name + same sig is legal — one method.)
+                mut a: u64 = 0
+                loop {
+                    if a >= eff.len { break }
+                    mut b: u64 = a + 1
+                    loop {
+                        if b >= eff.len { break }
+                        if eff[a].name == eff[b].name && !method_sig_matches(eff[a], eff[b], table) {
+                            return error { message = $"interface '{decl.name}' has conflicting signatures for method '{eff[a].name}' (an extended interface declares it differently)" }
+                        }
+                        b++
+                    }
+                    a++
+                }
             }
             _ => {}
         }

@@ -2050,6 +2050,14 @@ fn oop_unknown_method_is_error() {
 fn iface_method(name: str) -> parser::Function {
     parser::Function { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = teko::list::push(teko::list::empty(), recv_param("self")); has_return = true; return_type = named_t("i64"); body = teko::list::empty(); vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false }
 }
+// A bodyless instance-method signature returning str `fn name(self) -> str` (for the conflicting-sig test).
+fn iface_method_str(name: str) -> parser::Function {
+    parser::Function { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = teko::list::push(teko::list::empty(), recv_param("self")); has_return = true; return_type = named_t("str"); body = teko::list::empty(); vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false }
+}
+// An ILLEGAL interface member: a signature WITH a body `fn name(self) -> i64 { 0 }`.
+fn iface_method_with_body(name: str) -> parser::Function {
+    parser::Function { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = teko::list::push(teko::list::empty(), recv_param("self")); has_return = true; return_type = named_t("i64"); body = one_stmt(e_num(0)); vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false }
+}
 // A concrete instance method `[vis] fn name(self) -> i64 { 0 }`.
 fn impl_method(name: str, vis: parser::Visibility) -> parser::Function {
     parser::Function { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = teko::list::push(teko::list::empty(), recv_param("self")); has_return = true; return_type = named_t("i64"); body = one_stmt(e_num(0)); vis = vis; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false }
@@ -2071,6 +2079,10 @@ fn impl_struct_item(name: str, methods: []parser::Function, implements: []str) -
 }
 fn impl_class_item(name: str, methods: []parser::Function, implements: []str) -> parser::Item {
     parser::Item { content = parser::TypeDecl { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::ClassBody { kind = parser::ClassKind::Sealed; has_base = false; base_name = ""; has_base_binding = false; base_binding_name = ""; implements = implements; fields = teko::list::empty(); methods = methods }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }; namespace = ""; file = "" }
+}
+// a virtual class `type name = virtual class base { }` (empty) — for the cyclic-inheritance guard test.
+fn cyclic_class_item(name: str, base: str) -> parser::Item {
+    parser::Item { content = parser::TypeDecl { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::ClassBody { kind = parser::ClassKind::Virtual; has_base = true; base_name = base; has_base_binding = false; base_binding_name = ""; implements = teko::list::empty(); fields = teko::list::empty(); methods = teko::list::empty() }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }; namespace = ""; file = "" }
 }
 fn list1(x: parser::Function) -> []parser::Function { teko::list::push(teko::list::empty(), x) }
 fn slist1(s: str) -> []str { teko::list::push(teko::list::empty(), s) }
@@ -2248,6 +2260,44 @@ fn iface_diamond_extends_ok() {
     match type_program(parser::Program { items = items }) {
         TProgram => teko::assert::is_true(true)     // diamond is legal -> must NOT fail
         error    => teko::assert::is_true(false)
+    }
+}
+
+#test
+fn cls_cyclic_inheritance_is_error() {
+    // Acls extends Bcls, Bcls extends Acls -> a cycle. Must fail GRACEFULLY (an honest error), NOT
+    // recurse forever / stack-overflow the test run (the pre-fix compiler SIGILL'd here).
+    let a = cyclic_class_item("Acls", "Bcls")
+    let b = cyclic_class_item("Bcls", "Acls")
+    let items = teko::list::push(teko::list::push(teko::list::empty(), a), b)
+    match type_program(parser::Program { items = items }) {
+        TProgram => teko::assert::is_true(false)   // cyclic inheritance -> must fail (not hang/crash)
+        error    => teko::assert::is_true(true)
+    }
+}
+
+#test
+fn iface_method_with_body_is_error() {
+    // an interface is a PURE contract — a method with a body (a default impl) is prohibited.
+    let ifc = iface_item("Greetable", list1(iface_method_with_body("greet")), teko::list::empty())
+    let imp = impl_struct_item("Hi", list1(impl_method("greet", parser::Visibility::Pub)), slist1("Greetable"))
+    let items = teko::list::push(teko::list::push(teko::list::empty(), ifc), imp)
+    match type_program(parser::Program { items = items }) {
+        TProgram => teko::assert::is_true(false)   // interface method with a body -> must fail
+        error    => teko::assert::is_true(true)
+    }
+}
+
+#test
+fn iface_conflicting_inherited_sig_is_error() {
+    // Bderiv extends Abase; Abase.foo -> i64 but Bderiv.foo -> str: a conflicting redeclaration,
+    // caught at Bderiv's OWN declaration (no implementer needed).
+    let a = iface_item("Abase", list1(iface_method("foo")), teko::list::empty())        // foo(self) -> i64
+    let b = iface_item("Bderiv", list1(iface_method_str("foo")), slist1("Abase"))       // foo(self) -> str
+    let items = teko::list::push(teko::list::push(teko::list::empty(), a), b)
+    match type_program(parser::Program { items = items }) {
+        TProgram => teko::assert::is_true(false)   // conflicting inherited signature -> must fail
+        error    => teko::assert::is_true(true)
     }
 }
 
