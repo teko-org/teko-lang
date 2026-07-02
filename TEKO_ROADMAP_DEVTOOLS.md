@@ -1,6 +1,6 @@
 # TEKO — ROADMAP: developer tooling (`teko fmt` · `teko doc` · lint · repl)
 
-> **Status:** DESIGN (no code yet) · **Created:** 2026-07-02 · **Branch:** `feat/net-connectors` (off `chore/reboot`)
+> **Status:** DT0 ✅ DONE (issue #95) · DT1–DT3 DESIGN · **Created:** 2026-07-02 · **Branch:** `feat/net-connectors` (off `chore/reboot`)
 >
 > Native `teko` **subcommands** — written in Teko inside the compiler (`src/...`, SUPREME-RULE twin pair,
 > same ruling as `teko lsp` [[teko-lsp-native-deferred]]) — that reuse the existing lexer/parser/AST.
@@ -23,7 +23,19 @@ are pure-Teko passes over structures that already exist — no new runtime, VM-`
 
 ## 1. Units
 
-### ▪ DT0 — `teko fmt` (canonical formatter)
+### ▪ DT0 — `teko fmt` (canonical formatter) — ✅ DONE (issue #95)
+**Delivered:** `src/fmt/fmt.tks` (pure-Teko, no C twin — the `teko::regex` precedent; the C seed's `fmt`
+dispatch arm is an honest stop, M.3) + `src/fmt/fmt_test.tkt` (37 tests) + minimal-append dispatch in
+`main.c`/`main.tks`. Zero-option canonical (decision #1 → rec), comment re-attachment via a separate
+raw-token pass (decision #2 → rec). gofmt-style: author line breaks preserved (newlines are statement
+separators — fmt never joins/splits lines); `<`/`>`/`<<`/`>>` spacing preserves source adjacency (generic
+vs comparison is ambiguous at token level). Safety: input must pass the real lexer+parser, and the output
+is re-scanned and token-stream-compared — a mismatch refuses to write. **Proven:** idempotence over the
+whole corpus (2nd pass changes 0 of 84 files) and semantic preservation (the fully formatted corpus passes
+the entire 459-test gate and builds a compiler that judges the formatted tree a fixpoint). **Open:** the
+corpus reformat commit + `fmt --check` CI gate (decision #5 below); stdin mode (no stdin host surface yet
+— honest stop). Original unit spec follows.
+
 **Deps:** parser/AST. **Files:** `src/fmt/*.tks` (namespace `teko::fmt`), CLI wiring in the driver.
 A **canonical** pretty-printer: parse → format the AST/token stream → emit, so there is exactly one
 formatting of any program (gofmt-style: no options, no debate). Handles the whole grammar (decls,
