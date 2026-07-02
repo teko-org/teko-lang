@@ -42,6 +42,13 @@ tk_member_owner_result tk_find_method_owner(tk_str class_name, tk_type_table tab
 bool tk_member_accessible(tk_member_owner owner, tk_str accessor_type, tk_type_table table);
 tk_str tk_class_name_from_method_ns(tk_str ns);
 
+// (TR0, 2026-07-02) the trait-derivation FOLD — runs BEFORE collect/typing (tk_type_program's
+// first step): rewrites each struct/class TypeDecl whose `&`-list names traits (trait fields +
+// bodied methods fold in; trait names leave `implements`; bodyless requirements checked against
+// the folded table). NO-OP when the program declares no trait. Mirrors collect.tks::fold_traits.
+TK_RESULT(tk_program, tk_fold_traits_result);
+tk_fold_traits_result tk_fold_traits(tk_program program);
+
 // C7.12 — reconstruct a TypeTable from a typed program's pass-through TypeDecl items.
 // Used by the package backend in driver.c (which has a tk_tprogram, not a tk_program).
 // The namespace is set to "" — sufficient for resolve_type; W-vis-enforce is not called.

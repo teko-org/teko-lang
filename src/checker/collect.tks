@@ -528,6 +528,215 @@ fn check_conformance(type_name: str, own_methods: []parser::Function, implements
     null
 }
 
+// ── (TR0, 2026-07-02) TRAITS — the derivation FOLD ─────────────────────────────────────────────
+// A `trait` is a struct-shaped, NON-instantiable bundle of fields + methods a struct/class
+// DERIVES via the same `&`-list as interfaces. The fold runs BEFORE collect/typing
+// (type_program's first step), so every later stage — registration, conformance, typing, codegen
+// struct layout, the VM — sees each deriver's ALREADY-FOLDED body, and a trait never reaches a
+// value position (resolve_named rejects it; TR1 brings trait-typed dynamic values).
+
+// look up a trait body by name — error if the name is unknown or not a trait.
+pub fn find_trait_body(name: str, table: TypeTable) -> parser::TraitBody | error {
+    let decl = match type_table_find(table, name) { parser::TypeDecl as td => td; error => return error { message = $"unknown trait: {name}" } }
+    match decl.body {
+        parser::TraitBody as tb => tb
+        _               => return error { message = $"{name} is not a trait" }
+    }
+}
+
+// one recorded derivation: `type_name` derived `trait_name`. The bodyless-REQUIREMENT check runs
+// after ALL derivers fold, against the FOLDED table — so a class's INHERITED methods (its base
+// may itself derive or define them) can satisfy a requirement too.
+type TraitDerive = struct { type_name: str; trait_name: str }
+// the `&`-list split: names declared as traits FOLD; everything else (interfaces, or unknown
+// names the conformance check will reject) stays in `implements`.
+type SplitImpls = struct { traits: []str; ifaces: []str }
+type FoldedMembers = struct { fields: []parser::Field; methods: []parser::Function }
+
+fn split_trait_derives(implements: []str, table: TypeTable) -> SplitImpls {
+    mut traits: []str = teko::list::empty()
+    mut ifaces: []str = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= implements.len { break }
+        let is_trait = match type_table_find(table, implements[i]) {
+            parser::TypeDecl as td => match td.body { parser::TraitBody => true; _ => false }
+            error => false
+        }
+        if is_trait { traits = teko::list::push(traits, implements[i]) }
+        else { ifaces = teko::list::push(ifaces, implements[i]) }
+        i++
+    }
+    SplitImpls { traits = traits; ifaces = ifaces }
+}
+
+fn fields_have_name(fields: []parser::Field, name: str) -> bool {
+    mut i: u64 = 0
+    loop { if i >= fields.len { break }; if fields[i].name == name { return true }; i++ }
+    false
+}
+fn methods_have_name(methods: []parser::Function, name: str) -> bool {
+    mut i: u64 = 0
+    loop { if i >= methods.len { break }; if methods[i].name == name { return true }; i++ }
+    false
+}
+
+// fold `trait_names`' members into ONE deriver. Fields APPEND after the deriver's own — a name
+// collision (with the deriver's own fields or an earlier trait's) is a COMPILE ERROR (fields
+// cannot be overridden — rename or don't co-derive). A trait method WITH a body folds in UNLESS
+// the deriver defines that name itself (the deriver's own method IS the override); TWO traits
+// providing the same bodied name with no deriver override = a compile error (never an implicit
+// resolution order — W10b's no-overloading/override-only ruling). Bodyless methods are
+// REQUIREMENTS — not folded here; checked after all folds (check_trait_requirements). A folded
+// field's visibility obeys the DERIVER's kind (`into_class`: struct = public value data, class =
+// encapsulated/private); a folded method is `pub` (the bundle's methods are its public surface,
+// and a class needs `pub` methods to satisfy interfaces through them).
+fn fold_trait_members(type_name: str, own_fields: []parser::Field, own_methods: []parser::Function, trait_names: []str, table: TypeTable, into_class: bool) -> FoldedMembers | error {
+    mut fields = own_fields
+    mut methods = own_methods
+    mut i: u64 = 0
+    loop {
+        if i >= trait_names.len { break }
+        let tname = trait_names[i]
+        mut di: u64 = 0
+        loop {
+            if di >= i { break }
+            if trait_names[di] == tname { return error { message = $"'{type_name}' derives trait '{tname}' more than once" } }
+            di++
+        }
+        let tb = match find_trait_body(tname, table) { parser::TraitBody as t => t; error as e => return e }
+        mut fi: u64 = 0
+        loop {
+            if fi >= tb.fields.len { break }
+            let tf = tb.fields[fi]
+            if fields_have_name(fields, tf.name) {
+                return error { message = $"trait '{tname}' field '{tf.name}' collides with an existing field on '{type_name}' — fields cannot be overridden; rename it or do not co-derive" }
+            }
+            let fvis = if into_class { parser::Visibility::Private } else { parser::Visibility::Pub }
+            fields = teko::list::push(fields, parser::Field { name = tf.name; type_ann = tf.type_ann; vis = fvis; is_intern = false })
+            fi++
+        }
+        mut mi: u64 = 0
+        loop {
+            if mi >= tb.methods.len { break }
+            let tm = tb.methods[mi]
+            if tm.body.len > 0 {
+                if methods_have_name(own_methods, tm.name) {
+                    // the deriver defines this name itself — its method IS the override; the
+                    // trait's provided body steps aside.
+                } else if methods_have_name(methods, tm.name) {
+                    return error { message = $"method '{tm.name}' is provided by more than one derived trait — '{type_name}' must define its own '{tm.name}' to resolve the conflict" }
+                } else {
+                    methods = teko::list::push(methods, parser::Function { name = tm.name; type_params = tm.type_params; type_constraints = tm.type_constraints; params = tm.params; has_return = tm.has_return; return_type = tm.return_type; body = tm.body; vis = parser::Visibility::Pub; has_doc = tm.has_doc; doc = tm.doc; line = tm.line; col = tm.col; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = tm.os_guard; is_intern = false; is_abstract = false; is_virtual = false; is_override = false })
+                }
+            }
+            mi++
+        }
+        i++
+    }
+    FoldedMembers { fields = fields; methods = methods }
+}
+
+// the bodyless-REQUIREMENT check, against the FOLDED table: for each recorded (deriver, trait)
+// pair, every bodyless trait method must be provided by the deriver — its own methods (a folded
+// bodied method from a sibling trait counts: it IS a deriver method now) or, for a class, an
+// inherited one. A requirement SHARED by several derived traits is naturally satisfied once
+// (each pair checks independently against the same method).
+fn check_trait_requirements(derives: []TraitDerive, table: TypeTable) -> error? {
+    mut i: u64 = 0
+    loop {
+        if i >= derives.len { break }
+        let d = derives[i]
+        let tb = match find_trait_body(d.trait_name, table) { parser::TraitBody as t => t; error as e => return e }
+        let decl = match type_table_find(table, d.type_name) { parser::TypeDecl as td => td; error => return error { message = $"internal: trait deriver '{d.type_name}' vanished from the type table" } }
+        let own = match decl.body {
+            parser::StructBody as sb => sb.methods
+            parser::ClassBody as cb  => match effective_class_methods(cb, table) { []parser::Function as f => f; error as e => return e }
+            _ => teko::list::empty()
+        }
+        mut ri: u64 = 0
+        loop {
+            if ri >= tb.methods.len { break }
+            let req = tb.methods[ri]
+            if req.body.len == 0 {
+                mut found = false
+                mut mi: u64 = 0
+                loop {
+                    if mi >= own.len { break }
+                    if own[mi].name == req.name {
+                        if !method_sig_matches(req, own[mi], table) {
+                            return error { message = $"'{d.type_name}' method '{req.name}' does not match trait '{d.trait_name}'s required signature" }
+                        }
+                        found = true
+                        break
+                    }
+                    mi++
+                }
+                if !found { return error { message = $"'{d.type_name}' does not satisfy trait '{d.trait_name}' — missing required method '{req.name}'" } }
+            }
+            ri++
+        }
+        i++
+    }
+    null
+}
+
+// (TR0) THE DERIVATION FOLD — rewrites each struct/class TypeDecl whose `&`-list names traits:
+// the trait names LEAVE `implements` (interfaces stay for the ordinary conformance check), the
+// traits' fields + bodied methods fold in (fold_trait_members), and each (deriver, trait) pair
+// is recorded so its bodyless REQUIREMENTS are checked against the FOLDED table. NO-OP (the
+// program returned unchanged) when the program declares no trait at all.
+pub fn fold_traits(program: parser::Program) -> parser::Program | error {
+    let table = collect_types(program.items)
+    mut any = false
+    mut t: u64 = 0
+    loop {
+        if t >= table.len { break }
+        match table[t].decl.body { parser::TraitBody => { any = true; break }; _ => {} }
+        t++
+    }
+    if !any { return program }
+    mut items: []parser::Item = teko::list::empty()
+    mut derives: []TraitDerive = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= program.items.len { break }
+        let it = program.items[i]
+        mut content = it.content
+        match it.content {
+            parser::TypeDecl as td => {
+                match td.body {
+                    parser::StructBody as sb => {
+                        let split = split_trait_derives(sb.implements, table)
+                        if split.traits.len > 0 {
+                            let fm = match fold_trait_members(td.name, sb.fields, sb.methods, split.traits, table, false) { FoldedMembers as f => f; error as e => return e }
+                            content = parser::TypeDecl { name = td.name; type_params = td.type_params; type_constraints = td.type_constraints; body = parser::StructBody { fields = fm.fields; methods = fm.methods; implements = split.ifaces }; vis = td.vis; has_doc = td.has_doc; doc = td.doc; line = td.line; col = td.col }
+                            mut si: u64 = 0
+                            loop { if si >= split.traits.len { break }; derives = teko::list::push(derives, TraitDerive { type_name = td.name; trait_name = split.traits[si] }); si++ }
+                        }
+                    }
+                    parser::ClassBody as cb => {
+                        let split = split_trait_derives(cb.implements, table)
+                        if split.traits.len > 0 {
+                            let fm = match fold_trait_members(td.name, cb.fields, cb.methods, split.traits, table, true) { FoldedMembers as f => f; error as e => return e }
+                            content = parser::TypeDecl { name = td.name; type_params = td.type_params; type_constraints = td.type_constraints; body = parser::ClassBody { kind = cb.kind; has_base = cb.has_base; base_name = cb.base_name; has_base_binding = cb.has_base_binding; base_binding_name = cb.base_binding_name; implements = split.ifaces; fields = fm.fields; methods = fm.methods }; vis = td.vis; has_doc = td.has_doc; doc = td.doc; line = td.line; col = td.col }
+                            mut si: u64 = 0
+                            loop { if si >= split.traits.len { break }; derives = teko::list::push(derives, TraitDerive { type_name = td.name; trait_name = split.traits[si] }); si++ }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+        items = teko::list::push(items, parser::Item { content = content; namespace = it.namespace; file = it.file })
+        i++
+    }
+    let folded = collect_types(items)
+    match check_trait_requirements(derives, folded) { error as e => return e; null => {} }
+    parser::Program { items = items }
+}
+
 // (#109 W0, tightened) is `reg` a monomorphization-STAMPED generic instance? The shared
 // name_is_g_instance is a naive `__g__` substring scan, and the lexer accepts `__g__` inside
 // ordinary identifiers — so a genuine USER type named e.g. `Foo__g__Bar` must NOT slip through
@@ -643,6 +852,31 @@ fn validate_type_decls(table: TypeTable) -> error? {
                 // (W10b.IF) a class conforms via its EFFECTIVE methods (inherited base methods count).
                 let eff = match effective_class_methods(cb, table) { []parser::Function as m => m; error as e => return e }
                 match check_conformance(decl.name, eff, cb.implements, table, false) { error as e => return e; null => {} }   // (W10b.IF) class methods need real `pub`
+            }
+            parser::TraitBody as trb => {
+                // (TR0) a trait is a struct-shaped bundle: its field types resolve like a struct's
+                // (same R4 reference escape-gate). Generic traits and the class dispatch markers
+                // are OUTSIDE TR0's unit — honest errors, not silent acceptance. (A bodyless trait
+                // method already IS the requirement; a deriver-defined method IS the override.)
+                if decl.type_params.len > 0 { return error { message = $"a generic trait ('{decl.name}<…>') is not supported (TR0 — a trait is a concrete bundle)" } }
+                mut f = 0
+                loop {
+                    if f >= trb.fields.len { break }
+                    match resolve_type(trb.fields[f].type_ann, tbl) {
+                        Type as ft => match ft { Reference => return error { message = "a reference cannot be stored in a struct/variant/collection" }; _ => {} }
+                        error as e => return e
+                    }
+                    f++
+                }
+                mut tmi = 0
+                loop {
+                    if tmi >= trb.methods.len { break }
+                    let m = trb.methods[tmi]
+                    if m.is_abstract || m.is_virtual || m.is_override || m.is_intern {
+                        return error { message = $"trait method '{m.name}' may not be `abstract`/`virtual`/`override`/`intern` — a bodyless trait method is the requirement, and a deriver-defined method is the override (TR0)" }
+                    }
+                    tmi++
+                }
             }
             parser::InterfaceBody as ib => {
                 // (W10b.IF) an interface's OWN methods must be BODYLESS signatures — an interface is a

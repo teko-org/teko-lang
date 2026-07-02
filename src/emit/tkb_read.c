@@ -388,6 +388,12 @@ static tk_type_body read_typebody(tk_reader *r, tk_strs t) {
             tb.as.interface_body.methods = NULL; tb.as.interface_body.n_methods = 0;
             return tb;
         }
+        case 8: {   // (TR0) trait — fields only; methods not serialized (same gap)
+            tb.tag = TK_BODY_TRAIT;
+            tb.as.trait_body.fields = read_fields(r, t, &tb.as.trait_body.n_fields);
+            tb.as.trait_body.methods = NULL; tb.as.trait_body.n_methods = 0;
+            return tb;
+        }
     }
     r->ok = false; return tb;
 }

@@ -2949,3 +2949,155 @@ fn np_safe_nav_on_bare_null_rejected() {
         error as e => teko::assert::is_true(e.message == "`?.` on a bare `null` has no member to reach (annotate the optional's type)")
     }
 }
+
+// --- (TR0, 2026-07-02) trait derivation — the FOLD + requirement/conflict rules + honest stops ---
+// A trait is declared like a struct (fields + methods, bodies optional), derived via the same
+// `&`-list as interfaces; fold_traits rewrites derivers BEFORE typing (fields flatten in, bodied
+// methods fold in, bodyless methods become requirements). See TEKO_ROADMAP_TRAITS.md TR0.
+fn tr_field(name: str) -> parser::Field { parser::Field { name = name; type_ann = named_t("i64"); vis = parser::Visibility::Pub; is_intern = false } }
+fn tr_fields1(name: str) -> []parser::Field { teko::list::push(teko::list::empty(), tr_field(name)) }
+fn trait_item(name: str, fields: []parser::Field, methods: []parser::Function) -> parser::Item {
+    parser::Item { content = parser::TypeDecl { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::TraitBody { fields = fields; methods = methods }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }; namespace = ""; file = "" }
+}
+fn deriver_struct_item(name: str, fields: []parser::Field, methods: []parser::Function, derives: []str) -> parser::Item {
+    parser::Item { content = parser::TypeDecl { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::StructBody { fields = fields; methods = methods; implements = derives }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }; namespace = ""; file = "" }
+}
+fn deriver_class_item(name: str, fields: []parser::Field, methods: []parser::Function, derives: []str) -> parser::Item {
+    parser::Item { content = parser::TypeDecl { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::ClassBody { kind = parser::ClassKind::Sealed; has_base = false; base_name = ""; has_base_binding = false; base_binding_name = ""; implements = derives; fields = fields; methods = methods }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }; namespace = ""; file = "" }
+}
+fn items2(a: parser::Item, b: parser::Item) -> []parser::Item { teko::list::push(teko::list::push(teko::list::empty(), a), b) }
+fn items3(a: parser::Item, b: parser::Item, c: parser::Item) -> []parser::Item { teko::list::push(items2(a, b), c) }
+fn tr_program_ok(items: []parser::Item) -> bool {
+    match type_program(parser::Program { items = items }) { TProgram => true; error => false }
+}
+
+#test
+fn trait_fold_struct_gains_field_and_method() {
+    // trait Stamp { at: i64; fn stamp(self) -> i64 { 0 } } + struct P derives it; a loose
+    // statement constructs P with BOTH its own and the folded field, then calls the folded method.
+    let tr = trait_item("Stamp", tr_fields1("at"), list1(impl_method("stamp", parser::Visibility::Private)))
+    let dv = deriver_struct_item("P", tr_fields1("own"), teko::list::empty(), slist1("Stamp"))
+    let lit = ek(parser::StructLit { type_path = path1("P"); type_args = teko::list::empty(); field_names = teko::list::push(teko::list::push(teko::list::empty(), "own"), "at"); field_vals = teko::list::push(teko::list::push(teko::list::empty(), e_num(1)), e_num(2)) })
+    let bind_p = parser::Binding { kind = parser::BindKind::Let; target = parser::SimpleName { name = "p" }; has_type = false; type_ann = named_t("i64"); value = lit }
+    let call = st(ek(parser::MethodCall { receiver = e_var("p"); method = "stamp"; args = teko::list::empty() }))
+    let items = teko::list::push(items3(tr, dv, parser::Item { content = bind_p; namespace = ""; file = "" }), parser::Item { content = call; namespace = ""; file = "" })
+    teko::assert::is_true(tr_program_ok(items))
+}
+
+#test
+fn trait_fold_class_gains_members() {
+    // a CLASS deriving a trait: folded field participates in a factory's class literal, the
+    // folded method satisfies nothing but must type-check under the deriver.
+    let tr = trait_item("Stamp", tr_fields1("at"), list1(impl_method("stamp", parser::Visibility::Private)))
+    let dv = deriver_class_item("C", teko::list::empty(), teko::list::empty(), slist1("Stamp"))
+    teko::assert::is_true(tr_program_ok(items2(tr, dv)))
+}
+
+#test
+fn trait_missing_requirement_is_error() {
+    // trait Need { fn need(self) -> i64 } (bodyless = requirement); the deriver defines nothing.
+    let tr = trait_item("Need", teko::list::empty(), list1(iface_method("need")))
+    let dv = deriver_struct_item("P", tr_fields1("own"), teko::list::empty(), slist1("Need"))
+    teko::assert::is_true(!tr_program_ok(items2(tr, dv)))
+}
+
+#test
+fn trait_requirement_satisfied_by_deriver_method() {
+    let tr = trait_item("Need", teko::list::empty(), list1(iface_method("need")))
+    let dv = deriver_struct_item("P", tr_fields1("own"), list1(impl_method("need", parser::Visibility::Private)), slist1("Need"))
+    teko::assert::is_true(tr_program_ok(items2(tr, dv)))
+}
+
+#test
+fn trait_requirement_sig_mismatch_is_error() {
+    // the deriver provides `need(self, x)` where the trait requires `need(self)`.
+    let tr = trait_item("Need", teko::list::empty(), list1(iface_method("need")))
+    let dv = deriver_struct_item("P", tr_fields1("own"), list1(impl_method_arg("need", parser::Visibility::Private)), slist1("Need"))
+    teko::assert::is_true(!tr_program_ok(items2(tr, dv)))
+}
+
+#test
+fn trait_two_bodied_conflict_needs_deriver_override() {
+    // two traits both PROVIDE `m` — without a deriver-defined `m` it is a compile error; the
+    // deriver defining its own `m` IS the override (no implicit resolution order).
+    let t1 = trait_item("T1", teko::list::empty(), list1(impl_method("m", parser::Visibility::Private)))
+    let t2 = trait_item("T2", teko::list::empty(), list1(impl_method("m", parser::Visibility::Private)))
+    let bad = deriver_struct_item("P", tr_fields1("own"), teko::list::empty(), teko::list::push(slist1("T1"), "T2"))
+    teko::assert::is_true(!tr_program_ok(items3(t1, t2, bad)))
+    let good = deriver_struct_item("Q", tr_fields1("own"), list1(impl_method("m", parser::Visibility::Private)), teko::list::push(slist1("T1"), "T2"))
+    teko::assert::is_true(tr_program_ok(items3(t1, t2, good)))
+}
+
+#test
+fn trait_shared_bodyless_requirement_satisfied_once() {
+    // two traits REQUIRE the same `need(self) -> i64`; one deriver method satisfies both.
+    let t1 = trait_item("T1", teko::list::empty(), list1(iface_method("need")))
+    let t2 = trait_item("T2", teko::list::empty(), list1(iface_method("need")))
+    let dv = deriver_struct_item("P", tr_fields1("own"), list1(impl_method("need", parser::Visibility::Private)), teko::list::push(slist1("T1"), "T2"))
+    teko::assert::is_true(tr_program_ok(items3(t1, t2, dv)))
+}
+
+#test
+fn trait_field_collision_is_error() {
+    // a trait field colliding with the deriver's own field — fields cannot be overridden.
+    let tr = trait_item("Stamp", tr_fields1("x"), teko::list::empty())
+    let dv = deriver_struct_item("P", tr_fields1("x"), teko::list::empty(), slist1("Stamp"))
+    teko::assert::is_true(!tr_program_ok(items2(tr, dv)))
+    // ... and across two derived traits.
+    let t2 = trait_item("Stamp2", tr_fields1("y"), teko::list::empty())
+    let t3 = trait_item("Stamp3", tr_fields1("y"), teko::list::empty())
+    let dv2 = deriver_struct_item("Q", tr_fields1("own"), teko::list::empty(), teko::list::push(slist1("Stamp2"), "Stamp3"))
+    teko::assert::is_true(!tr_program_ok(items3(t2, t3, dv2)))
+}
+
+#test
+fn trait_is_not_instantiable() {
+    // `Stamp { at = 1 }` — a trait literal is rejected (derive it instead).
+    let tr = trait_item("Stamp", tr_fields1("at"), teko::list::empty())
+    let lit = ek(parser::StructLit { type_path = path1("Stamp"); type_args = teko::list::empty(); field_names = teko::list::push(teko::list::empty(), "at"); field_vals = teko::list::push(teko::list::empty(), e_num(1)) })
+    let bind_v = parser::Binding { kind = parser::BindKind::Let; target = parser::SimpleName { name = "v" }; has_type = false; type_ann = named_t("i64"); value = lit }
+    teko::assert::is_true(!tr_program_ok(items2(tr, parser::Item { content = bind_v; namespace = ""; file = "" })))
+}
+
+#test
+fn trait_as_value_type_is_error() {
+    // a trait as a PARAM type is TR1 territory — rejected honestly at resolution.
+    let tr = trait_item("Stamp", tr_fields1("at"), teko::list::empty())
+    let p = parser::Param { name = "s"; has_type = true; type_ann = named_t("Stamp"); is_params = false; has_default = false; default_expr = e_num(0) }
+    let f = parser::Function { name = "use_stamp"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = teko::list::push(teko::list::empty(), p); has_return = true; return_type = named_t("i64"); body = one_stmt(e_num(0)); vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false }
+    teko::assert::is_true(!tr_program_ok(items2(tr, parser::Item { content = f; namespace = ""; file = "" })))
+}
+
+#test
+fn trait_method_with_dispatch_markers_is_error() {
+    // `virtual fn` inside a trait body — the class dispatch markers are meaningless in a trait.
+    mut m = impl_method("m", parser::Visibility::Private)
+    let vm = parser::Function { name = m.name; type_params = m.type_params; type_constraints = m.type_constraints; params = m.params; has_return = m.has_return; return_type = m.return_type; body = m.body; vis = m.vis; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = true; is_override = false }
+    let tr = trait_item("Stamp", teko::list::empty(), list1(vm))
+    teko::assert::is_true(!tr_program_ok(teko::list::push(teko::list::empty(), tr)))
+}
+
+#test
+fn trait_duplicate_derive_is_error() {
+    let tr = trait_item("Stamp", tr_fields1("at"), teko::list::empty())
+    let dv = deriver_struct_item("P", tr_fields1("own"), teko::list::empty(), teko::list::push(slist1("Stamp"), "Stamp"))
+    teko::assert::is_true(!tr_program_ok(items2(tr, dv)))
+}
+
+#test
+fn trait_class_requirement_satisfied_by_pub_method() {
+    // a CLASS deriving a trait with a requirement — a `pub` class method satisfies it; a class
+    // with NO such method does not.
+    let tr = trait_item("Need", teko::list::empty(), list1(iface_method("need")))
+    let ok = deriver_class_item("C", teko::list::empty(), list1(impl_method("need", parser::Visibility::Pub)), slist1("Need"))
+    teko::assert::is_true(tr_program_ok(items2(tr, ok)))
+    let bad = deriver_class_item("D", teko::list::empty(), teko::list::empty(), slist1("Need"))
+    teko::assert::is_true(!tr_program_ok(items2(tr, bad)))
+}
+
+#test
+fn generic_trait_is_rejected() {
+    // `type T<X> = trait { }` — outside TR0's unit; honest error.
+    let td = parser::TypeDecl { name = "GT"; type_params = teko::list::push(teko::list::empty(), "X"); type_constraints = teko::list::push(teko::list::empty(), parser::NoConstraint { }); body = parser::TraitBody { fields = teko::list::empty(); methods = teko::list::empty() }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }
+    teko::assert::is_true(!tr_program_ok(teko::list::push(teko::list::empty(), parser::Item { content = td; namespace = ""; file = "" })))
+}

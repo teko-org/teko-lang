@@ -62,6 +62,10 @@ fn resolve_named(path: parser::Path, table: TypeTable) -> Type | error {
         parser::TypeDecl as td => {
             match td.body {
                 parser::AliasBody as ab => return resolve_type(ab.alias, table)
+                // (TR0) a trait NEVER reaches a value position — it is a derivable bundle, not a
+                // type for variables/params/returns/fields. Trait-typed DYNAMIC values (a vtable
+                // over the trait's bodyless requirements) arrive with TR1 — honest stop until then.
+                parser::TraitBody       => return error { message = $"trait '{name}' is not a value type — derive it from a struct or class instead (trait-typed dynamic values arrive with TR1)" }
                 // (W10b.D3) an interface IS a value type now — a contract-typed value (data + vtable
                 // fat pointer, the tk_closure-shaped rep). It resolves NOMINALLY like any other named
                 // type; the upcast/dispatch rules live in widens_into + the method-call typer.
@@ -184,6 +188,16 @@ pub fn is_interface_name(name: str, table: TypeTable) -> bool {
 pub fn is_class_name(name: str, table: TypeTable) -> bool {
     match type_table_find(table, name) {
         parser::TypeDecl as td => match td.body { parser::ClassBody => true; _ => false }
+        error => false
+    }
+}
+
+// (TR0) is `name` declared as a trait? Mirror of resolve.c::tk_is_trait_name. Used by the
+// honest stops (a trait as a constraint atom / instantiation target) — the FOLD itself splits
+// the `&`-list with its own table-scan (collect.tks::split_trait_derives).
+pub fn is_trait_name(name: str, table: TypeTable) -> bool {
+    match type_table_find(table, name) {
+        parser::TypeDecl as td => match td.body { parser::TraitBody => true; _ => false }
         error => false
     }
 }
