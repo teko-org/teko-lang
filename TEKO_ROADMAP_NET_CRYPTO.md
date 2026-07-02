@@ -1,16 +1,19 @@
-# TEKO — ROADMAP: `teko::net::*` + `teko::crypto::*`
+# TEKO — ROADMAP: `teko::net` + `teko::crypto` + `teko::encoding` + `teko::compress`
 
 > **Status:** DESIGN (no code yet) · **Created:** 2026-07-02 · **Branch:** `feat/net-connectors` (off `chore/reboot`)
 >
-> Goal: network connectors for OSI **layers 4–7** under `teko::net::*` and a security surface under
-> `teko::crypto::*`, **implemented 100% in Teko** (zero new C). Everything reaches the OS through the
-> existing `extern fn … from "<lib>"` FFI (C7.1), guarded per-OS with `#os(...)`. Targets: **macOS**,
-> **Linux (glibc + musl)**, **Windows**. Purpose: enable web + cloud-native projects in Teko.
+> Goal: network connectors for OSI **layers 4–7** under `teko::net::*`; a security surface under
+> `teko::crypto::*` (symmetric + **asymmetric/public-key** + **OpenPGP/GPG**); serialization/parsers under
+> `teko::encoding::*` (JSON, XML, YAML, protobuf, ASN.1, CBOR, …); and compression under `teko::compress::*`
+> (DEFLATE/gzip/zlib/zip, brotli, lzma/xz, zstd). **All implemented 100% in Teko** (zero new C). Everything
+> reaches the OS through the existing `extern fn … from "<lib>"` FFI (C7.1), guarded per-OS with `#os(...)`.
+> Targets: **macOS**, **Linux (glibc + musl)**, **Windows**. Purpose: web + cloud-native projects in Teko.
 >
 > This doc is the **work-distribution contract**: it is decomposed so each unit (▪ = one agent task)
 > is independently buildable, with explicit deps, file lists, the FFI symbols it binds, and its
-> verification bar. Governed by the Laws (M.0–M.5); every `.c`/`.h`↔`.tks` pair honors the SUPREME RULE
-> and every unit passes the verify-both gate ([[teko-verify-both-with-test-gate]]).
+> verification bar. It is a living levantamento — not exhaustive; new protocols/formats slot in as
+> additional child units. Governed by the Laws (M.0–M.5); every `.c`/`.h`↔`.tks` pair honors the SUPREME
+> RULE and every unit passes the verify-both gate ([[teko-verify-both-with-test-gate]]).
 
 ---
 
@@ -161,8 +164,21 @@ layer + stream multiplexing. Gates gRPC. Large unit. **Verify:** `.tkt` for HPAC
 length-prefixed protobuf messages, status codes/metadata. The cloud-native RPC baseline. **Verify:**
 `.tkt` for the message-framing codec; native unary call over loopback.
 
-**▪ N10 — `teko::net::http3`.** **Deps:** QUIC (T2 transport), **QPACK**. HTTP over QUIC. Later tier,
-gated by the QUIC sub-project. **Verify:** native GET against a loopback H3 server.
+**▪ N-QUIC — `teko::net::quic`.** **Deps:** N2 (UDP), N3 (TLS 1.3 handshake), C5 (AEAD packet
+protection). A layer-4 transport over UDP: connection/stream state machine, loss recovery + congestion
+control, TLS-1.3-in-QUIC handshake, packet-number spaces. Large sub-project of its own; gates H3/H4.
+**Verify:** `.tkt` for the packet/frame codecs (RFC 9000); native handshake against a loopback peer.
+
+**▪ N10 — `teko::net::http3`.** **Deps:** N-QUIC, **QPACK** header compression. HTTP/3 over QUIC (RFC 9114).
+**Verify:** native GET against a loopback H3 server.
+
+**▪ N10b — `teko::net::http4` (forward-looking / experimental).** **Deps:** N-QUIC. **HTTP/4 is NOT a
+ratified standard as of this writing** — there is no RFC. This unit is a **placeholder** so the HTTP stack
+is designed to admit a future major version over QUIC without a rewrite: the `teko::net::http` façade
+(`http::get`/`serve` etc.) negotiates the version (ALPN token) and dispatches to the H1/H2/H3/H4 backend,
+so `http4.tks` is added later as one more backend behind the same API. We track the IETF work and
+implement to spec when one exists; until then this ships as an **honest stub / reserved namespace**, not a
+guessed protocol. *(flagged in open decisions.)*
 
 **▪ N11 — `teko::net::mqtt`.** **Deps:** N1 (+N3 for TLS). MQTT 3.1.1 + 5.0 client (connect/publish/
 subscribe/QoS 0-2). IoT + cloud eventing. **Verify:** `.tkt` for the control-packet codec; native
@@ -197,14 +213,56 @@ corporate/cloud proxies). Small, high-leverage; **Verify:** `.tkt` for the SOCKS
 Greenfield in the corpus (no JSON / protobuf / ASN.1 today — verified). Each is pure Teko, fully
 VM-`.tkt`-testable, and reusable well beyond networking.
 
-**▪ S-JSON — `teko::encoding::json`.** **Deps:** none. Parser + encoder (RFC 8259). Needed by HTTP APIs,
-config, DoH, many cloud services. High priority, unblocks a lot.
+**▪ S-JSON — `teko::encoding::json`.** **Deps:** none. Parser + encoder (RFC 8259), streaming + DOM.
+Needed by HTTP APIs, config, DoH, many cloud services. High priority, unblocks a lot. **(T1)**
+**▪ S-XML — `teko::encoding::xml`.** **Deps:** none. Well-formed XML 1.0 parser (pull + DOM) + encoder;
+namespaces; entity handling. Feeds SOAP, RSS/Atom, config, SAML, Office/OpenXML tooling. **(T2)**
 **▪ S-PB — `teko::encoding::protobuf`.** **Deps:** none for the wire codec; a `.proto` compiler is a
-separate later tool. Varint/zigzag/length-delimited wire format. **Gates gRPC (N9).**
+separate later tool (`teko::encoding::protobuf::schema`). Varint/zigzag/length-delimited. **Gates gRPC (N9). (T2)**
 **▪ S-ASN1 — `teko::encoding::asn1`.** **Deps:** none. DER/BER encode+decode + PEM framing. **Gates X.509
-(`teko::crypto::x509`), RSA/EC key parsing.**
-**▪ S-CBOR — `teko::encoding::cbor` (T3).** Binary JSON-ish; used by COSE/WebAuthn and some IoT.
-**▪ S-URL/S-MIME helpers** — form-urlencoded, multipart/form-data (ride with N5 HTTP).
+(`teko::crypto::x509`), RSA/EC key parsing, PGP-adjacent tooling. (T2)**
+**▪ S-YAML — `teko::encoding::yaml`.** **Deps:** none. YAML 1.2 (config/k8s manifests — core cloud-native
+format). Big grammar; **(T2/T3)**.
+**▪ S-TOML — `teko::encoding::toml`.** **Deps:** none. General TOML parser (the compiler's own `.tkp`
+reader is bespoke; this is the reusable public one). **(T3)**
+**▪ S-CSV — `teko::encoding::csv`.** RFC 4180 rows/quoting. Small, high-utility. **(T3)**
+**▪ S-CBOR — `teko::encoding::cbor`.** Binary JSON-ish; used by COSE/WebAuthn and some IoT. **(T3)**
+**▪ S-MSGPACK — `teko::encoding::msgpack`.** MessagePack binary codec; common RPC/cache payload. **(T3)**
+**▪ S-URL / S-MIME helpers** — form-urlencoded, multipart/form-data, base64 MIME (ride with N5 HTTP). **(T1)**
+
+> **Suggested umbrella namespaces (new):** `teko::encoding::*` (all the above — text + binary
+> serialization) and `teko::compress::*` (§2c). Both are reusable far beyond networking; keeping them as
+> siblings of `teko::net`/`teko::crypto` (not children) reflects that.
+
+## 2c. Compression / archives — `teko::compress::*` (EXTEND the existing module)
+
+`teko::compress` **already exists** (`src/compress/compress.tks`): a pure-Teko **CRC-32** table + a
+**ZIP STORE** reader/writer for `.tkl` (C7.12). Everything below **extends that module**, all pure Teko
+(fully VM-`.tkt`-testable against canonical fixtures), reused by HTTP `Content-Encoding`, `.tkl`/archives,
+PGP, and storage. Order matters: DEFLATE is the keystone several formats reuse.
+
+**▪ Z-DEFLATE — `teko::compress::deflate`.** **Deps:** none (CRC-32 exists). RFC 1951: Huffman + LZ77
+inflate **and** deflate. **The compression keystone** — gzip/zlib/zip-DEFLATE all wrap it. **Verify:**
+`.tkt` roundtrip + decode canonical RFC streams. **(T1)**
+**▪ Z-GZIP — `teko::compress::gzip`.** **Deps:** Z-DEFLATE. RFC 1952 framing (magic/mtime/CRC-32/ISIZE)
+over DEFLATE. The default HTTP `Content-Encoding`. **(T1)**
+**▪ Z-ZLIB — `teko::compress::zlib`.** **Deps:** Z-DEFLATE. RFC 1950 framing (Adler-32) over DEFLATE.
+Used by PNG, HTTP `deflate`, many wire formats. **(T1)**
+**▪ Z-ZIP — extend `teko::compress` ZIP with DEFLATE.** **Deps:** Z-DEFLATE. Today ZIP is STORE-only; add
+method=8 (DEFLATE) entries to the existing reader/writer. **(T1/T2)**
+**▪ Z-BROTLI — `teko::compress::brotli`.** **Deps:** none (own static dictionary + model). RFC 7932;
+the modern HTTP `br` encoding. Large (built-in dictionary). **Verify:** `.tkt` decode of canonical
+vectors + roundtrip. **(T2)**
+**▪ Z-LZMA — `teko::compress::lzma` / `::xz`.** **Deps:** none. LZMA + the `.xz` container (with its
+CRC/index). Range coder + LZ. Large, delicate. **(T2/T3)**
+**▪ Z-ZSTD — `teko::compress::zstd` (suggested addition).** **Deps:** none. RFC 8878; increasingly the
+default in cloud/storage. FSE + Huffman + LZ. **(T3)**
+**▪ Z-BZIP2 — `teko::compress::bzip2` (T3, optional).** BWT-based; niche but common in archives.
+
+> **Decision to ratify (compression):** pure-Teko DEFLATE/brotli/lzma (portable, VM-testable, no OS dep)
+> vs binding `zlib`/`libbrotli`/`liblzma` via FFI where present. **Recommendation:** pure-Teko DEFLATE +
+> gzip + zlib first (bounded, unblocks HTTP + archives, no dependency); brotli/lzma/zstd may start
+> provider-backed and get pure-Teko implementations later.
 
 ---
 
@@ -264,17 +322,34 @@ data-dependent table lookups** — a real side-channel concern) vs an OS/AES-NI-
 CSPRNG bytes from the OS: `getentropy` (macOS/Linux), `getrandom` (Linux), `BCryptGenRandom` (Windows) via
 `#os` externs. Optional DRBG (HMAC/CTR) on top. **Verify:** native (VM honest-stops on the extern).
 
-**▪ C7 — `teko::crypto::pk` (public-key).** **Deps:** C0, C1, S-ASN1 (key/cert encoding), C6. **Files:**
-`src/crypto/pk/*.tks`. Split into sub-units, T2/T3, each its own agent task:
-- **RSA** — OAEP + PSS (+ `legacy` PKCS#1 v1.5); key parse/gen.
+**▪ C7 — `teko::crypto::pk` (public-key / ASYMMETRIC cryptography).** **Deps:** C0, C1, S-ASN1 (key/cert
+encoding), C6. **Files:** `src/crypto/pk/*.tks`. This is the **asymmetric** surface (the "criptografias
+assimétricas"): each algorithm is its own sub-unit + agent task, T2/T3:
+- **RSA** — encrypt/decrypt OAEP + sign/verify PSS (+ `legacy` PKCS#1 v1.5); key parse/gen.
 - **ECDSA** — P-256 / P-384 / P-521.
 - **EdDSA** — Ed25519 (+ Ed448).
-- **ECDH** — P-256 / P-384; **X25519** / **X448**.
+- **ECDH** — P-256 / P-384; **X25519** / **X448** (key agreement).
 - **DH** — classic finite-field (`legacy`).
-These need **big-integer / field arithmetic** (a shared `teko::crypto::bignum` sub-module — its own unit,
-constant-time) — a large, delicate body of work. **Decision to ratify:** OS/provider-backed first vs pure
-Teko. **Recommendation:** provider-backed for the first cut; pure-Teko X25519/Ed25519 (self-contained,
-well-specified) as the earliest hand-rolled pieces. **Verify:** RFC 7748/8032, FIPS 186 vectors.
+- **KEM (forward-looking):** ML-KEM (Kyber) / hybrid PQC — reserved namespace `teko::crypto::pk::pqc`.
+All need **big-integer / field arithmetic** — a shared **`teko::math::bigint`** module (see open decision
+#8; likely a general numeric module, not crypto-private), constant-time. **Decision to ratify:**
+OS/provider-backed first vs pure Teko. **Recommendation:** provider-backed for RSA/ECDSA first; pure-Teko
+X25519/Ed25519 (self-contained, well-specified) as the earliest hand-rolled pieces. **Verify:** RFC
+7748/8032, FIPS 186 vectors.
+
+> **On "criptografias assíncronas":** in Teko terms this is exactly the **asymmetric** layer above (C7) —
+> public/private key pairs, the basis of PGP and TLS key exchange. If instead **async crypto *operations***
+> are meant (non-blocking encrypt/decrypt returning `Intent<T>`), those ride the S8 async model
+> ([[teko-async-concurrency-design]]) and are **additive** over these same sync primitives — out of scope
+> here, but the signatures are shaped so an `async` variant wraps them without a rewrite.
+
+**▪ C7-PGP — `teko::crypto::pgp` (OpenPGP / GPG-compatible).** **Deps:** C1 (hash), C4 (cipher), C5/C2,
+C7 (RSA/ECDSA/EdDSA/ECDH), C6 (rand), Z-DEFLATE/ZLIB (§2c — PGP compresses), S-ASN1-adjacent (its own
+packet/MPI + radix-64/ASCII-armor codec). **Files:** `src/crypto/pgp/*.tks`. RFC 4880 (+ RFC 9580
+crypto-refresh): message encrypt/decrypt, sign/verify, key generation, keyring parse, ASCII armor,
+detached signatures — interoperable with GnuPG output. Large; sits at the TOP of the crypto stack (it
+composes nearly everything below). **Verify:** `.tkt` for the packet + armor codecs against fixtures;
+native encrypt→GPG-decrypt / GPG-encrypt→decrypt interop where `gpg` is available. **(T2/T3)**
 
 **▪ C8 — `teko::crypto::x509`.** **Deps:** S-ASN1, C7, C1. Certificate + CSR parse/build, chain
 verification, name/SAN matching — needed by a pure-Teko TLS and by cert tooling. T2/T3. **Verify:** `.tkt`
@@ -287,37 +362,44 @@ parse of real DER cert fixtures + chain-validation cases.
 
 ## 4. Dependency graph + tiers (build order)
 
-`S-*` = serialization (§2b), `N*` = net (§2), `C*` = crypto (§3). KEYSTONE blocks all runtime FFI units;
-the pure-Teko serialization + hash/cipher units do NOT need the keystone and can start immediately.
+`S-*` = serialization (§2b), `Z-*` = compression (§2c), `N*` = net (§2), `C*` = crypto (§3). KEYSTONE
+blocks all runtime-FFI units; every pure-Teko unit (serialization, compression, hash, cipher) needs NO
+keystone and can start immediately.
 
 ```
 KEYSTONE ── N0 ─┬─ N1 ─┬─ N3(TLS) ─┬─ N5(HTTP) ─┬─ N6(WS)   [needs C1]
                 │      │           │            ├─ N7(SSE)
-                │      │           │            └─ N8(H2) ── N9(gRPC) [needs S-PB]
+                │      │           │            ├─ N8(H2) ── N9(gRPC) [needs S-PB]
+                │      │           │            └─ (Content-Encoding needs Z-GZIP/DEFLATE/BROTLI)
                 │      │           └─ N4(DNS→DoH/DoT)
-                │      ├─ N2(UDP) ── QUIC ── N10(H3)
+                │      ├─ N2(UDP) ── N-QUIC ─┬─ N10(H3)
+                │      │                     └─ N10b(H4, reserved/experimental)
                 │      ├─ N2b(unix)
                 │      └─ N11 MQTT / N12 AMQP / N13 Redis / N14 mail / N15 ftp / N16 ssh / N17 proxy
                 └─ C6(rand)
 
 (no keystone needed — pure Teko, start now)
- S-JSON · S-PB · S-ASN1 · S-CBOR
+ Z-DEFLATE ─┬─ Z-GZIP / Z-ZLIB / Z-ZIP(deflate)      Z-BROTLI · Z-LZMA/xz · Z-ZSTD (independent)
+ S-JSON · S-XML · S-PB · S-ASN1 · S-YAML · S-CBOR · S-MSGPACK · S-TOML · S-CSV
  C0 ─┬─ C1(hash) ─┬─ C2(mac) ─┬─ C3(kdf) ── C3b(password)
      │            └─ (unblocks N6)
-     └─ C4(cipher=AES/ChaCha) ─┬─ C5(aead) ─┐
+     └─ C4(cipher=AES/ChaCha) ─┬─ C5(aead)
                                └─ C2 GMAC/CMAC
- S-ASN1 + C1 + C6 ── C7(pk: RSA/ECDSA/EdDSA/ECDH via bignum) ── C8(x509)
+ math::bigint ── C7(pk: RSA/ECDSA/EdDSA/ECDH)      [+ S-ASN1, C1, C6]  ── C8(x509)
+ C1+C4+C5+C7+C6 + Z-DEFLATE + armor ───────────────── C7-PGP (OpenPGP/GPG)   ← top of the crypto stack
  C1/C2/C3/C7 + S-JSON ── C9(JWT/COSE/TOTP)
 ```
 
 **Tiers.** **T1 (first cut — web baseline):** KEYSTONE, N0, N1, N2, N3(provider TLS), N4, N5, N6, N7,
-S-JSON; C0, C1, C2, C3, C4(AES+ChaCha), C5(AEAD), C6(rand). **T2 (cloud-native):** N2b, N8(H2), N9(gRPC),
-N11(MQTT), N12(AMQP), N13(Redis), DoH/DoT, S-PB, S-ASN1; C3b(password), C7(pk), C8(x509). **T3 (breadth):**
-QUIC/N10(H3), N14(mail), N15(ftp), N16(ssh), N17(proxy), S-CBOR, C9, pure-Teko TLS 1.3.
+S-JSON, S-URL/MIME, **Z-DEFLATE/GZIP/ZLIB**; C0, C1, C2, C3, C4(AES+ChaCha), C5(AEAD), C6(rand).
+**T2 (cloud-native):** N2b, N8(H2), N9(gRPC), N11(MQTT), N12(AMQP), N13(Redis), DoH/DoT, S-XML, S-PB,
+S-ASN1, S-YAML, **Z-BROTLI, Z-LZMA, Z-ZIP-deflate**; math::bigint, C3b(password), C7(pk), C8(x509),
+**C7-PGP**. **T3 (breadth):** N-QUIC/N10(H3)/N10b(H4-reserved), N14(mail), N15(ftp), N16(ssh), N17(proxy),
+S-CBOR/MSGPACK/TOML/CSV, Z-ZSTD/BZIP2, C9, pure-Teko TLS 1.3.
 
-**Parallelizable now (no keystone):** {S-JSON, C0}; then {C1, C4} ‖ {S-PB, S-ASN1}; then {C2, C5, C3}.
-**Parallel after KEYSTONE:** {N0, C6}; then {N1, N2, N2b, N4} once N0 is green; then the L7 fan-out.
-A migration/DRY pass is **not** part of this roadmap (Phase 11).
+**Parallelizable now (no keystone):** {S-JSON, Z-DEFLATE, C0}; then {C1, C4} ‖ {S-PB, S-ASN1, Z-GZIP};
+then {C2, C5, C3, math::bigint}. **Parallel after KEYSTONE:** {N0, C6}; then {N1, N2, N2b, N4}; then the
+L7 fan-out. A migration/DRY pass is **not** part of this roadmap (Phase 11).
 
 ## 5. Per-unit agent contract (what each task hands back)
 
@@ -336,5 +418,9 @@ full self-host fixpoint. Agents **DRAFT**; integration + any law tension → tri
 4. **Wrapping arithmetic for crypto** under `TEKO_OVERFLOW_DEBUG`: confirm release-mode wrap vs add explicit `wrapping_*` helpers. *(must resolve before ANY C-family primitive — blocks C1/C4)*
 5. **Constant-time guarantee**: does Teko need a `ct`-typed discipline / secret-int type, or is it a hand-audited convention per unit? (AES table lookups, `ct_eq`, bignum) *(rec: convention + audit first; a language feature is a separate proposal)*
 6. **Scope/tier cut for v1**: confirm T1 is the release target and T2/T3 land incrementally. Which L7 protocols are must-have for the first web/cloud milestone (HTTP+WS+TLS+JSON+gRPC?) vs later.
-7. **Async surface**: confirmed **out of scope** here; signatures shaped so S8 `Intent<T>` variants are additive.
-8. **Big-integer module** (`teko::crypto::bignum` / a general `teko::math::bigint`?): crypto public-key needs it — decide whether it lives under crypto or as a general-purpose numeric module reused elsewhere.
+7. **Async surface**: confirmed **out of scope** here; signatures shaped so S8 `Intent<T>` variants are additive. (This also answers "criptografias assíncronas" if async *operations* were meant; if **asymmetric** was meant, that's C7/PGP, in scope.)
+8. **Big-integer module** placement: `teko::crypto::bignum` (crypto-private) vs a general **`teko::math::bigint`** reused elsewhere. *(rec: general `teko::math::bigint`)*
+9. **Compression: pure Teko vs FFI** for DEFLATE/brotli/lzma/zstd. *(rec: pure-Teko DEFLATE+gzip+zlib first — bounded, no dep, unblocks HTTP; brotli/lzma/zstd may be provider-backed initially)*
+10. **HTTP/4**: **no standard exists yet.** Confirm we ship a **reserved namespace + version-negotiating façade** now and implement to spec if/when an RFC lands — vs omitting it until then. *(rec: reserve the namespace + façade seam, honest-stub the backend — no guessed protocol)*
+11. **New umbrella namespaces**: confirm `teko::encoding::*` (json/xml/yaml/toml/csv/protobuf/asn1/cbor/msgpack) and extending `teko::compress::*`, both as **siblings** of net/crypto (reusable project-wide), and `teko::math::bigint`.
+12. **PGP/GPG scope**: full OpenPGP (RFC 9580) interop is a large top-of-stack unit — confirm it's a T2/T3 deliverable gated on C4/C5/C7 + compression, not part of the first cut.
