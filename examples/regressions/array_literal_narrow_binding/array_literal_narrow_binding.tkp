@@ -1,0 +1,30 @@
+# Regression (#71): a NARROW-typed array-literal binding (`let a: []u8 = [1, 2, 3]`, no per-element
+# `to <T>` cast) must type-check AND retype each bare-literal ELEMENT to the declared narrow type —
+# not just reject the whole array with a bogus "expected []u8, found []i64" (the annotation-vs-literal
+# adoption check, `annotated_literal_reason`/`annotated_literal_ok`, had NO array-literal case at all,
+# so a checked `[]i64` array literal never widened into `[]u8` and never hit the bare-literal-adopts
+# fallback either). Companion to #68 (PR merging commit 7284125), which fixed the SAME gap for a plain
+# scalar bare-literal binding (`mut y: u8 = 1`) but left the array-literal element-wise case untouched.
+#
+# This fixture proves BOTH halves fixed together:
+#  1. the annotation now ACCEPTS `[]u8 = [1, 2, 3]` (previously a compile error).
+#  2. each element is RETYPED to u8 (not left at the literal's natural i64) — proven the same way
+#     #68 proved its scalar case: a width-sensitive `<<=` on an extracted element only computes the
+#     historically-correct result if the runtime slot is genuinely 8 bits wide (mask 7), not 64
+#     (mask 63). An un-narrowed i64 slot would compute a DIFFERENT (wrong) result for this shift.
+#
+#   a = [1, 2, 3] : []u8      (elements narrowed to u8 at the checker, not left at i64)
+#   y = a[1] = 2 : u8
+#   y <<= 9   ->  9 & 7 == 1 (u8 mask)  ->  2 << 1 == 4    (a 64-wide mask would leave the count
+#                                            unmasked: 2 << 9 == 1024, truncated to byte 0 — the
+#                                            exact #68-style discriminating case, now over an
+#                                            array-literal element instead of a plain scalar)
+#
+# Exit code is a byte, so the total (4) needs no further truncation.
+#   teko run   examples/regressions/array_literal_narrow_binding   # VM   -> exit 4
+#   teko build examples/regressions/array_literal_narrow_binding && ./examples/regressions/array_literal_narrow_binding/array_literal_narrow_binding   # -> exit 4
+name = "array_literal_narrow_binding"
+source = "src"
+
+[artifact]
+kind = "binary"

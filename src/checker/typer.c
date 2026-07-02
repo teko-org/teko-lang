@@ -114,9 +114,12 @@ static tk_typed_stmt_result type_binding(tk_binding b, tk_env env, tk_type_table
                                             tk_type_render(a.as.value), tk_type_render(v.as.value.type)));
             // a fitting bare-literal (plain-scalar) initializer ADOPTS the declared narrow type —
             // retype the leaf itself (same mechanism as the arg/struct-field/negative-literal
-            // adoption sites: tk_literal_adopts + `.type = target`), so codegen/VM see the narrow
-            // width (e.g. `mut y: u8 = 1` stores/shifts at width 8, not the literal's native i64).
-            v.as.value.type = a.as.value;
+            // adoption sites: tk_literal_adopts + retype), so codegen/VM see the narrow width
+            // (e.g. `mut y: u8 = 1` stores/shifts at width 8, not the literal's native i64).
+            // (#71) tk_retype_literal RECURSES into an array literal's elements (`[]u8 = [1,2,3]`
+            // narrows each leaf, not just the array's own type) — a plain leaf still takes the
+            // annotation wholesale, unchanged from before.
+            tk_retype_literal(&v.as.value, a.as.value);
         }
         bound = a.as.value;
         // (#4) annotation-directed element type: a sentinel empty list/array (`teko::list::empty()`
@@ -180,7 +183,8 @@ static tk_typed_stmt_result type_assign(tk_assign a, tk_env env, tk_type_table t
         // a fitting bare-literal (plain-scalar) RHS ADOPTS the target's narrow type — retype the leaf
         // itself (mirrors type_binding's identical adoption above / the arg/struct-field sites), so a
         // plain `y = 200` on a `u8` slot stores/re-widths at 8 bits, not the literal's native i64.
-        v.as.value.type = target;
+        // (#71) tk_retype_literal recurses into an array literal's elements — see type_binding.
+        tk_retype_literal(&v.as.value, target);
     }
     // (#4) a sentinel empty list/array ADOPTS the target's concrete slice type so codegen sees the
     // element. OTHERWISE keep the value's NATURAL (case / T) type and store the target as `bound` —
