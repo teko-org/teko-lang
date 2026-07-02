@@ -1,0 +1,37 @@
+# Regression (#83): a NESTED slice literal ([][]T) whose FIRST inner row is EMPTY, under an
+# annotated outer binding (`let m: [][]i64 = [[], [1]]`), ran correctly under the VM but FAILED
+# native codegen with the misleading honest-stop "codegen: an untyped empty slice needs a known
+# element type from context (internal)" — a VM≠native frontier (found during #81 verification).
+#
+# Root cause: the checker types EVERY array-literal element independently, then folds them into
+# one element type via `tk_type_join` (C twin: resolve.c) / `type_join` (Teko twin: resolve.tks).
+# `tk_type_eq`/`type_eq` treat a SENTINEL empty slice (`[]`'s own type, element == NULL/Void) as
+# equal to ANY concrete slice — correct for assignability, but `tk_type_join`'s "equal -> return
+# `a`" shortcut blindly kept WHICHEVER operand came first. When the empty row `[]` was the FIRST
+# array entry, the accumulator `a` (still the sentinel) was returned, silently discarding the
+# concrete `[]i64` established by `[1]` — the whole array's element type regressed to the
+# sentinel even though a genuinely-typed sibling was present. Native codegen then read the
+# INNER EMPTY NODE's own (never-fixed-up) type off the TExpr itself and honest-stopped. The VM
+# ran fine because it never inspects a slice's element type.
+#
+# The fix (both checker twins): tk_type_join/type_join now prefers the CONCRETE side whenever the
+# two operands are permissively type_eq but one still carries a sentinel; type_array_lit then
+# retypes any sibling element that is STILL a sentinel form of the now-concrete joined element
+# (mirrors the existing `push(empty(), x)` base-concretization in type_list_builtin).
+#
+# This fixture proves the whole leading/middle-empty-row + flat-empty surface end-to-end,
+# VM == native (exit 6):
+#   * [][]i64 = [[], [1]] (empty row FIRST, under an outer annotation) — len(m[0]) == 0,
+#     indexing the non-empty row m[1][0] == 1                                           -> 1
+#   * ragged rows [[1], [], [2, 3]] with an EMPTY MIDDLE row                             -> +2
+#   * a FLAT annotated empty slice (`let a: []i64 = []`, single level, no nesting)       -> +0
+#   * a nested loop summing every element across both nested literals (1 + (1+2+3) = 7,
+#     minus the 7 already implied leaves a net +3 contribution below)                    -> +3
+#
+#   teko run   examples/regressions/nested_slice_empty_row                # VM     -> exit 6
+#   teko build examples/regressions/nested_slice_empty_row && ./nested_slice_empty_row  # native -> exit 6
+name = "nested_slice_empty_row"
+source = "src"
+
+[artifact]
+kind = "binary"

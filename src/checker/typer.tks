@@ -1408,7 +1408,36 @@ fn type_array_lit(a: parser::ArrayLit, env: Env, table: TypeTable) -> TExpr | er
     // annotated form `let xs: []Ref<T> = …` is already rejected in resolve, but the inferred
     // element here (e.g. `[r, r]`) only surfaces now. This also rejects `a in [a, b]` (its `[a, b]`).
     if type_contains_ref(et) { return error { message = "a reference cannot be stored in a struct/variant/collection" } }
-    TExpr { kind = TArrayLit { elements = elems }; type = Slice { element = et }; line = 0; col = 0 }
+    // (#83) CONCRETIZE any sibling element still carrying a SENTINEL now that `et` (the join across
+    // every element) is settled. `[[], [1]]`'s inner `[]` types as `[]Void` on its own (this fn's
+    // own empty-array case, above); type_join now correctly folds `et` to the CONCRETE `[]i64`
+    // (the #83 fix), but the individual element's own `TExpr.type` is untouched — it still says
+    // `[]Void`, and codegen's array-literal case reads the element type OFF THE NODE ITSELF (not
+    // the parent's contribution), so it would still honest-stop. Retype every element whose type
+    // is a (possibly nested) sentinel form of the now-concrete `et` — same mechanism as the
+    // `push(empty(), x)` base-concretization in type_list_builtin above. Only fires when the
+    // element's type is type_eq to et (permissive-equal) AND actually carries a sentinel; a
+    // genuinely-narrower case that WIDENS into a wider et (e.g. a case into a declared variant) is
+    // left alone — codegen's emit_as wraps that at the use site instead.
+    let final_elems = if a.elements.len != 0 && !type_has_sentinel(et) {
+        mut out: []TArrayElem = teko::list::empty()
+        mut j = 0
+        loop {
+            if j >= elems.len { break }
+            let ael = elems[j]
+            let retyped = !ael.is_spread && type_has_sentinel(ael.expr.type) && type_eq(ael.expr.type, et)
+            out = teko::list::push(out, if retyped {
+                TArrayElem { is_spread = ael.is_spread; expr = TExpr { kind = ael.expr.kind; type = et; line = ael.expr.line; col = ael.expr.col } }
+            } else {
+                ael
+            })
+            j++
+        }
+        out
+    } else {
+        elems
+    }
+    TExpr { kind = TArrayLit { elements = final_elems }; type = Slice { element = et }; line = 0; col = 0 }
 }
 
 // ---- the expression dispatch (the evolved check_expr) ----

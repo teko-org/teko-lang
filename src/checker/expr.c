@@ -1422,6 +1422,24 @@ static tk_texpr_result type_array_lit(tk_array_lit a, tk_env env, tk_type_table 
         tk_free0(elems); tk_free0(spreads);
         return xerr("a reference cannot be stored in a struct/variant/collection");
     }
+    // (#83) CONCRETIZE any sibling element that is still carrying a SENTINEL now that `et` (the
+    // join across every element) is settled. `[[], [1]]`'s inner `[]` types as `[]NULL` on its
+    // own (type_array_lit's own empty-array case, below); tk_type_join now correctly folds `et`
+    // to the CONCRETE `[]i64` (the #83 fix above), but the individual `elems[0]` node's `.type`
+    // is untouched — it still says `[]NULL`, and codegen's TK_TEXPR_ARRAY case reads elem type
+    // OFF THE NODE ITSELF (not the parent's contribution), so it would still honest-stop. Retype
+    // every element whose type is a (possibly nested) sentinel form of the now-concrete `et` —
+    // same mechanism as the `push(empty(), x)` base-concretization in type_list_builtin above.
+    // Only fires when the element's type is tk_type_eq to et (permissive-equal) AND actually
+    // carries a sentinel; a genuinely-narrower case that WIDENS into a wider et (e.g. a case into
+    // a declared variant) is left alone — codegen's emit_as wraps that at the use site instead.
+    if (a.nelements != 0 && !tk_type_has_sentinel(&et)) {
+        for (size_t i = 0; i < a.nelements; i += 1) {
+            if (spreads[i]) continue;   // a spread's own slice type is never the sentinel (checked above)
+            if (tk_type_has_sentinel(&elems[i].type) && tk_type_eq(&elems[i].type, &et))
+                elems[i].type = et;
+        }
+    }
     // an EMPTY `[]` is the SENTINEL slice (element == NULL, like teko::list::empty()) — it unifies
     // with any concrete slice via a binding annotation. A non-empty array carries its joined element.
     tk_type st;

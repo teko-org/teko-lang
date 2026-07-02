@@ -473,6 +473,44 @@ fn nested_slice_push_and_spread_hold() {
     teko::assert::is_true(joined[2][0] == 40)
 }
 
+// (#83) a NESTED slice literal with an EMPTY inner row, under an annotated outer type: the
+// annotation (`[][]i64`) supplies the element type for `[]`'s otherwise-untyped sentinel. Ran fine
+// on the VM before the fix (the VM ignores element types); native codegen honest-stopped ("an
+// untyped empty slice needs a known element type from context") because the checker's element-type
+// JOIN (tk_type_join / type_join) silently discarded the concrete `[]i64` when the sentinel `[]`
+// happened to be the FIRST array entry (the permissive sentinel-vs-concrete tk_type_eq made the
+// join's "equal -> return a" shortcut keep the LESS informative side). Fixed by preferring the
+// concrete side in the join and retyping any sibling sentinel element once the join settles.
+#test
+fn nested_slice_leading_empty_row_under_annotation_holds() {
+    let m: [][]i64 = [[], [1]]
+    teko::assert::is_true(m.len == 2)
+    teko::assert::is_true(m[0].len == 0)
+    teko::assert::is_true(m[1].len == 1)
+    teko::assert::is_true(m[1][0] == 1)
+}
+
+// (#83) ragged rows with an EMPTY MIDDLE row (not first, not last) — the join must fold the
+// sentinel out no matter its position among the siblings.
+#test
+fn nested_slice_ragged_rows_with_empty_middle_row_hold() {
+    let m: [][]i64 = [[1], [], [2, 3]]
+    teko::assert::is_true(m.len == 3)
+    teko::assert::is_true(m[0][0] == 1)
+    teko::assert::is_true(m[1].len == 0)
+    teko::assert::is_true(m[2][0] == 2)
+    teko::assert::is_true(m[2][1] == 3)
+}
+
+// (#83) a FLAT annotated empty slice (`let a: []i64 = []`) — the single-level counterpart of the
+// nested case above (already handled by type_binding's own sentinel-adopt path, #4); locked here
+// alongside the nested fixtures so the whole family stays covered together.
+#test
+fn flat_annotated_empty_slice_holds() {
+    let a: []i64 = []
+    teko::assert::is_true(a.len == 0)
+}
+
 // ===========================================================================
 // W9.3 — SCOPE-SCOPED `defer { … }` (Zig/Swift-style, per-block, NOT Go's per-function).
 // A defer registered inside a block fires at THAT block's exit (loop body → per iteration; if/match
