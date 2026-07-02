@@ -301,30 +301,21 @@ static int spawn_wait(const char *cc, char *const argv[], bool quiet) {
 // (exit-code only — no output capture needed): try compiling an empty translation unit with
 // the clang-only flags under `-fsyntax-only`. clang accepts them (exit 0); GCC rejects the
 // unrecognized options (nonzero exit). Mirrors project.tks::cc_family_is_clang.
-static bool cc_family_is_clang(const char *cc) {
-    char tmpl[] = "/tmp/tk_ccprobe_XXXXXX";
-#ifdef _WIN32
-    // No mkstemp on Windows; a PID-salted name in the temp dir is good enough for a
-    // same-process, non-concurrent probe file.
-    char path[64];
-    snprintf(path, sizeof path, "tk_ccprobe_%d.c", (int)_getpid());
+// The probe file <binary>.ccprobe.c is deleted after the probe (best-effort, unchecked —
+// the .tks twins use teko::fs::remove_file, the host primitive ratified in issue #79).
+static bool cc_family_is_clang(const char *cc, const char *binary) {
+    size_t plen = strlen(binary) + strlen(".ccprobe.c") + 1;
+    char *path = tk_alloc(plen);
+    snprintf(path, plen, "%s.ccprobe.c", binary);
     FILE *f = fopen(path, "wb");
-#else
-    int fd = mkstemp(tmpl);
-    if (fd == -1) return true;   // can't probe — assume clang (today's default), fail open
-    close(fd);
-    char path[sizeof tmpl + 2];
-    snprintf(path, sizeof path, "%s.c", tmpl);
-    rename(tmpl, path);
-    FILE *f = fopen(path, "wb");
-#endif
-    if (f == NULL) { remove(path); return true; }
+    if (f == NULL) { tk_free0(path); return true; }   // can't probe (no file created) — assume clang (today's default), fail open
     fputs("int main(void){return 0;}\n", f);
     fclose(f);
 
     char *argv[] = { (char *)cc, "-std=c23", "-ferror-limit=0", "-fsyntax-only", path, NULL };
     int rc = spawn_wait(cc, argv, true);
-    remove(path);
+    remove(path);   // best-effort cleanup (mirrors the .tks twins' remove_file)
+    tk_free0(path);
     return rc == 0;
 }
 
@@ -334,7 +325,7 @@ static int run_cc(const char *cfile, const char *binary, tk_manifest m) {
     // Passing paths as argv elements (no shell) eliminates shell-injection risk.
     char *ccprog = m.cc.len ? cstr_of(m.cc) : NULL;
     const char *cc = ccprog ? ccprog : "cc";
-    bool is_clang = cc_family_is_clang(cc);
+    bool is_clang = cc_family_is_clang(cc, binary);
     char *target_str  = m.target.len  ? cstr_of(m.target)  : NULL;
     char *sysroot_str = m.sysroot.len ? cstr_of(m.sysroot) : NULL;
     tk_str tos = target_os_of(m);

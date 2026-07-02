@@ -1051,6 +1051,17 @@ tk_ffi_ures tk_rt_mkdir(tk_str path) {
     return (tk_ffi_ures){ .ok = true };
 }
 
+// (issue #79) teko::fs::remove_file(path) — delete the file at `path` via libc remove().
+// Already-absent is success (idempotent — mirrors mkdir's already-exists-is-success
+// contract; "ensure the file does not exist"). First use: cleaning the cc-family probe
+// file (<binary>.ccprobe.c) in the build backend's cc_family_is_clang twins (issue #73).
+tk_ffi_ures tk_rt_remove_file(tk_str path) {
+    char *p = tk_cstr(path);
+    if (remove(p) != 0 && errno != ENOENT)
+        return (tk_ffi_ures){ .ok = false, .err = tk_str_of_cstr("cannot remove file") };
+    return (tk_ffi_ures){ .ok = true };
+}
+
 tk_ffi_sres tk_rt_getcwd(void) {
     char buf[4096];
     if (getcwd(buf, sizeof buf) == NULL)

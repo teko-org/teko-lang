@@ -343,6 +343,8 @@ tk_ffi_ures tk_rt_write_file_bytes(tk_str path, const tk_byte *ptr, uint64_t len
 tk_ffi_ures tk_rt_chdir(tk_str path);
 // teko::fs::mkdir(path) — create a directory (mode 0755); SUCCESS if it already exists.
 tk_ffi_ures tk_rt_mkdir(tk_str path);
+// (issue #79) teko::fs::remove_file(path) — delete a file (libc remove); SUCCESS if already absent.
+tk_ffi_ures tk_rt_remove_file(tk_str path);
 // teko::env::cwd() — the current working directory as an owned absolute path, or error.
 tk_ffi_sres tk_rt_getcwd(void);
 // teko::env::set_var(name, value) — set an environment variable; error on failure.

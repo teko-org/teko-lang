@@ -1843,6 +1843,7 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
                     if (seg_is(l, "write_file"))    return emit_host_ffi(b, CG_FFI_URES,   "tk_rt_write_file",    e, err);
                     if (seg_is(l, "chdir"))         return emit_host_ffi(b, CG_FFI_URES,   "tk_rt_chdir",         e, err);
                     if (seg_is(l, "mkdir"))         return emit_host_ffi(b, CG_FFI_URES,   "tk_rt_mkdir",         e, err);
+                    if (seg_is(l, "remove_file"))   return emit_host_ffi(b, CG_FFI_URES,   "tk_rt_remove_file",   e, err);   // (issue #79) delete a file (idempotent)
                     if (seg_is(l, "cwd"))           return emit_host_ffi(b, CG_FFI_SRES,   "tk_rt_getcwd",        e, err);
                     if (seg_is(l, "set_var"))       return emit_host_ffi(b, CG_FFI_URES,   "tk_rt_setenv",        e, err);
                     if (seg_is(l, "list_dir"))      return emit_host_ffi(b, CG_FFI_SLRES,  "tk_rt_list_dir",      e, err);
