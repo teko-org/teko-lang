@@ -1932,6 +1932,32 @@ static tk_str bind_case_name(tk_bind_pattern bp) {
     return vm_texpr_mangle(gte);
 }
 
+// (W10b.D3 codec fix) are `a` and `b` BOTH members of one declared variant? Then a struct value
+// tagged `a` is a PROPERLY-DISCRIMINATED case wherever `b` could appear, and pat_match's
+// transparent field descent must NOT fire between them — it would conflate two cases of the SAME
+// union through an inner field (the bug the tag-24 roundtrip caught: `match ty` in the
+// interpreted tkb_write.tks hit the `Prim` arm for a `Func { ret = Prim{…} }` subject, so a
+// method Func serialized as its OWN return type). Mirrors vm.tks::variant_siblings.
+static bool variant_siblings(tk_str a, tk_str b) {
+    for (size_t i = 0; i < g_prog.nitems; i += 1) {
+        if (g_prog.items[i].tag != TK_TITEM_TYPE_DECL) continue;
+        tk_type_decl td = g_prog.items[i].as.type_decl;
+        if (td.body.tag != TK_BODY_VARIANT) continue;
+        tk_type_expr te = td.body.as.variant_body.type_expr;
+        if (te.tag != TK_TEXPR_UNION) continue;
+        bool has_a = false, has_b = false;
+        for (size_t j = 0; j < te.as.uni.len; j += 1) {
+            tk_type_expr m = te.as.uni.members[j];
+            if (m.tag != TK_TEXPR_NAMED || m.as.named.path.len == 0) continue;
+            tk_str nm = m.as.named.path.segments[m.as.named.path.len - 1].name;
+            if (name_eq(nm, a)) has_a = true;
+            if (name_eq(nm, b)) has_b = true;
+        }
+        if (has_a && has_b) return true;
+    }
+    return false;
+}
+
 // case_in_variant — is `cname` a MEMBER of the variant type `vname`? A match arm pattern may name
 // a VARIANT (e.g. `Type`) and the value's case is one of its members (e.g. `Prim`): native codegen
 // discriminates the tagged union; the VM has no wrapper (the value IS the member struct), so it
@@ -2133,7 +2159,10 @@ static bool pat_match(const tk_pattern *pat, tk_value subj, tk_venv *env) {
                 // Only struct fields are eligible — int fields are excluded because match_as_enum_int
                 // could match enum member names that coincidentally share the same ordinal value as an
                 // unrelated enum (e.g. TyShape::Variant=2 vs PrimKind::U32=2 causing false descent).
-                if (subj.tag == TK_VAL_STRUCT) {
+                // (W10b.D3 codec fix) NEVER descend between SIBLING cases of one declared variant:
+                // a subject already tagged as one case of the union the pattern names a case of is
+                // a MISS, not a container (`Func { ret = Prim }` must not take a `Prim` arm).
+                if (subj.tag == TK_VAL_STRUCT && !variant_siblings(subj.as.st.type_name, bname)) {
                     for (size_t fi = 0; fi < subj.as.st.fields.len; fi += 1) {
                         tk_value fv = subj.as.st.fields.vals[fi];
                         if (fv.tag != TK_VAL_STRUCT) continue;

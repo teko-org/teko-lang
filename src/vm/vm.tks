@@ -1548,6 +1548,50 @@ fn vm_match_as_enum_int(prog: checker::TProgram, name: str, ordinal: i128) -> bo
     false
 }
 
+// (W10b.D3 codec fix) are `a` and `b` BOTH members of one declared variant? Then a struct value
+// tagged `a` is a PROPERLY-DISCRIMINATED case wherever `b` could appear, and pat_match's
+// transparent field descent must NOT fire between them — it would conflate two cases of the SAME
+// union through an inner field (the bug the tag-24 roundtrip caught: `match ty` in tkb_write.tks
+// hit the `Prim` arm for a `Func { ret = Prim{…} }` subject, so a method Func serialized as its
+// OWN return type). Mirror of vm.c::variant_siblings.
+fn vm_variant_siblings(prog: checker::TProgram, a: str, b: str) -> bool {
+    mut i = 0
+    loop {
+        if i >= prog.items.len { break }
+        match prog.items[i] {
+            parser::TypeDecl as td => {
+                match td.body {
+                    parser::VariantBody as vb => match vb.type_expr {
+                        parser::UnionType as u => {
+                            mut has_a = false
+                            mut has_b = false
+                            mut j = 0
+                            loop {
+                                if j >= u.members.len { break }
+                                match u.members[j] {
+                                    parser::NamedType as nt => {
+                                        let nm = nt.path.segments[nt.path.segments.len - 1].name
+                                        if nm == a { has_a = true }
+                                        if nm == b { has_b = true }
+                                    }
+                                    _ => {}
+                                }
+                                j = j + 1
+                            }
+                            if has_a && has_b { return true }
+                        }
+                        _ => {}
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+        i++
+    }
+    false
+}
+
 fn vm_case_in_variant(prog: checker::TProgram, vname: str, cname: str) -> bool {
     mut i = 0
     loop {
@@ -1680,9 +1724,13 @@ fn pat_match(pat: parser::Pattern, subj: Value, env: Venv) -> PatMatch {
                 // Only struct fields are eligible — int fields are excluded because vm_match_as_enum_int
                 // could match enum member names that coincidentally share the same ordinal value as an
                 // unrelated enum (e.g. TyShape::Variant=2 vs PrimKind::U32=2 causing false descent).
+                // (W10b.D3 codec fix) NEVER descend between SIBLING cases of one declared variant:
+                // a subject already tagged as one case of the union the pattern names a case of is
+                // a MISS, not a container (`Func { ret = Prim }` must not take a `Prim` arm).
                 // Mirrors vm.c TK_PAT_BIND transparent-field-descent block.
                 match subj {
                     StructVal as sv => {
+                        if vm_variant_siblings(env.prog, sv.type_name, bname) { return PatMatch { matched = false; env = env } }
                         mut fi = 0
                         loop {
                             if fi >= sv.field_vals.len { break }
