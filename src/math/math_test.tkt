@@ -110,6 +110,19 @@ fn abs_f64_handles_negatives_and_nan() {
 }
 
 #test
+fn abs_f64_clears_the_sign_of_negative_zero() {
+    // BIT-EXACT: abs_f64(-0.0) must be +0.0 (all-zero bits), not -0.0 (sign bit set).
+    // `-0.0 == 0.0` is TRUE per IEEE-754, so a value comparison cannot catch this —
+    // the assertion goes to the bit pattern. Two -0.0 sources: the negation expression
+    // AND an exact bit-pattern construction (guards against any front-end folding of
+    // the literal `-0.0`).
+    teko::assert::is_true(teko::f64_bits(abs_f64(-0.0)) == 0)
+    teko::assert::is_true(teko::f64_bits(abs_f64(teko::f64_from_bits(0x8000000000000000))) == 0)
+    // -inf: sign cleared, still +inf.
+    teko::assert::is_true(abs_f64(-inf()) == inf())
+}
+
+#test
 fn sign_i64_covers_all_three_cases() {
     teko::assert::is_true(sign_i64(42) == 1)
     teko::assert::is_true(sign_i64(-42) == -1)
@@ -227,9 +240,22 @@ fn isqrt_perfect_squares() {
 #test
 fn isqrt_floors_non_perfect_squares() {
     teko::assert::is_true(unwrap_i64(isqrt(2)) == 1)
+    teko::assert::is_true(unwrap_i64(isqrt(3)) == 1)       // covers the n < 4 early return
     teko::assert::is_true(unwrap_i64(isqrt(15)) == 3)      // floor(sqrt(15)) = 3
     teko::assert::is_true(unwrap_i64(isqrt(99)) == 9)      // floor(sqrt(99)) = 9
     teko::assert::is_true(unwrap_i64(isqrt(101)) == 10)    // floor(sqrt(101)) = 10
+}
+
+#test
+fn isqrt_survives_the_top_of_the_i64_range() {
+    // Regression: the old initial guess `(n + 1) / 2` wrapped `n + 1` at n = i64::MAX,
+    // silently corrupting the whole Newton iteration (returned a NEGATIVE number).
+    // floor(sqrt(2^63 - 1)) = 3037000499.
+    teko::assert::is_true(unwrap_i64(isqrt(9223372036854775807)) == 3037000499)
+    // The exact perfect-square boundary just below i64::MAX: 3037000499^2.
+    teko::assert::is_true(unwrap_i64(isqrt(9223372030926249001)) == 3037000499)
+    // One below the perfect square floors down.
+    teko::assert::is_true(unwrap_i64(isqrt(9223372030926249000)) == 3037000498)
 }
 
 #test

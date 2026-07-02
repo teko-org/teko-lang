@@ -110,10 +110,13 @@ pub fn abs_i64(v: i64) -> i64 | error {
     v
 }
 
+// abs_f64 — IEEE-754 fabs semantics: clear the SIGN BIT (bit 63), branch-free. This is
+// deliberately a bit operation and not `if v < 0.0 { -v }`: the comparison form misses
+// -0.0 (IEEE-754 says `-0.0 < 0.0` is FALSE, so -0.0 would pass through with its sign
+// bit still set), while the bit-clear returns +0.0 for -0.0, +inf for -inf, and a NaN
+// (sign cleared, same payload) for NaN — exactly fabs.
 pub fn abs_f64(v: f64) -> f64 {
-    if is_nan(v) { return v }              // NaN stays NaN (no sign bit to strip meaningfully)
-    if v < 0.0 { return -v }
-    v
+    teko::f64_from_bits(teko::f64_bits(v) & ~sign_mask())
 }
 
 // sign — returns -1 / 0 / 1 (i64) for an i64 input's algebraic sign.
@@ -229,11 +232,20 @@ pub fn lcm(a: i64, b: i64) -> i64 | error {
 // isqrt — the integer square root: floor(sqrt(n)) for n >= 0, computed by Newton's
 // method over integers only (no float sqrt — that lives in M2/teko::math::real; M0
 // stays libm-free). Negative input is a domain error.
+//
+// OVERFLOW SAFETY (this module's own checked-arithmetic contract): the initial guess is
+// `n / 2 + 1`, NOT `(n + 1) / 2` — the latter's `n + 1` wraps at n = i64::MAX and
+// silently corrupts the whole iteration. With n >= 4 the guess is < n (the loop always
+// enters) and every subsequent intermediate is bounded: once x >= floor(sqrt(n)),
+// `x + n / x <= x + sqrt(n) <= n/2 + 1 + sqrt(n) < i64::MAX` — no expression in the
+// loop can wrap. n in 1..=3 (where `n/2 + 1` would NOT descend below x for n = 2) is
+// answered directly: floor(sqrt(1..3)) = 1.
 pub fn isqrt(n: i64) -> i64 | error {
     if n < 0 { return error { message = "math::isqrt: n must be non-negative" } }
     if n == 0 { return 0 }
+    if n < 4 { return 1 }
     mut x = n
-    mut y = (x + 1) / 2
+    mut y = n / 2 + 1
     loop {
         if y >= x { break }
         x = y
@@ -255,6 +267,11 @@ fn checked_mul_i64(a: i64, b: i64) -> i64 | error {
 // ipow — checked integer exponentiation by squaring: base^exp for exp >= 0. A negative
 // exponent has no integer result (checked error, not a truncating 0/1). Overflow of any
 // intermediate or final i64 result is checked (never wrapped).
+//
+// CONVENTION: `ipow(0, 0) == 1` — the empty product (the standard discrete-math /
+// programming-language convention, matching C's pow(0,0)=1 and every mainstream integer
+// pow). Callers needing the "0^0 undefined" analysis-style treatment must check for the
+// (0, 0) input themselves; this function does not error on it.
 //
 // NOTE ON SHAPE: `checked_mul_i64`'s result is unwrapped via a bare-STATEMENT match (into
 // a pre-declared `mut`), not a value-position match — see the identical note on `lcm`
