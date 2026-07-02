@@ -1,66 +1,62 @@
-# TEKO — ROADMAP: standard-library core (`teko::io` · `try` · `teko::iter`)
+# TEKO — ROADMAP: standard-library core (`teko::io` · `teko::iter`)
 
-> **Status:** DESIGN (no code yet) · **Created:** 2026-07-02 · **Branch:** `feat/net-connectors` (off `chore/reboot`)
+> **Status:** DESIGN (no code yet) · **Created:** 2026-07-02 · **Updated:** 2026-07-02 (`try` REJECTED — see §1) · **Branch:** `feat/net-connectors` (off `chore/reboot`)
 >
-> Three **foundational** additions that multiply everything built on top of them. They are listed FIRST
+> Two **foundational** additions that multiply everything built on top of them. They are listed FIRST
 > because they change the *shape* of the net/crypto/db/encoding/compress surfaces — landing them before
-> those roadmaps are sliced to agents avoids a rewrite (streaming vs whole-buffer; `try` vs hand-written
-> `match … return e`; lazy iteration vs eager allocation).
+> those roadmaps are sliced to agents avoids a rewrite (streaming vs whole-buffer; lazy iteration vs eager
+> allocation).
 >
 > Same work-distribution contract as the sibling roadmaps: each ▪ unit is one agent task with deps, files,
 > and a verify bar. Governed by the Laws (M.0–M.5); SUPREME RULE + verify-both gate apply.
 
 ---
 
-## 0. Why these three, first
+## 0. Why these two, first
 
 - **`teko::io`** gives one contract for moving bytes — so `tcp`, `tls`, `file`, `gzip`, `crypto` all
   compose (`gzip(tls(tcp))`) instead of each inventing its own read/write. It also enables **streaming**
   (process data as it arrives) instead of the whole-buffer-in-memory shape the net/crypto units would
   otherwise bake in.
-- **`try`** removes the `match … { X as v => v; error as e => return e }` boilerplate that `T | error`
-  forces on every fallible call. It is **checker-desugar-only** (same class of change as `~`, `in`,
-  `params`): zero codegen/VM work.
 - **`teko::iter`** gives lazy `map`/`filter`/`fold`/… over one iteration protocol, on top of the closures
   (W10) and generics (S4) that already exist — expressiveness without intermediate allocations.
 
+Error handling stays with **`match`**, and optional handling with **`?.`/`??`** (which already exist).
+No error-propagation operator — see §1 for why.
+
 ---
 
-## 1. `try` — error-propagation operator
+## 1. Error handling — `match` stays; `try` is REJECTED
 
-### ▪ CORE-TRY — the `try` operator
-**Deps:** none. **Files:** `src/lexer/lexer.{tks,c}` (keyword), `src/parser/parse_expr.{tks,c}` (prefix
-form), `src/checker/typer.{tks,c}` + `expr.{tks,c}` (desugar + validation), `.tkt` + a regression example.
+**RULING 2026-07-02 (user):** do **NOT** add a `try`/`?`-style error-propagation operator. Keep `match`
+as the way to handle `T | error`, and keep the existing null-propagation operators `?.` and `??` for
+optionals.
 
-**Semantics.** `try expr` where `expr : T | error`:
-- evaluates `expr` once;
-- if it is the **error** arm → `return` that error from the enclosing function;
-- otherwise → the expression yields the **`T`** value.
+**Why (the reasoning):** a `try` operator presumes the value is exactly `T | error` and that the *only*
+thing you ever want is "unwrap the `T` or propagate the `error`." But Teko's union values are richer than
+that — a result can be `A | B | error`, or a `T | error` where the `T` itself still needs validation, or a
+multi-arm variant where several non-error cases each need handling. Assuming "it's `T`, otherwise it's an
+error" is **presumptuous** and papers over cases that genuinely require inspection. The explicit `match`
+forces the author to confront every arm — it is **more verbose, and that verbosity IS the safety**
+(M.1 fail-loud, no hidden control flow). So:
 
-**Rules (checker-enforced):**
-- Valid ONLY inside a function whose return type is `… | error` (or `error?`); otherwise a clear
-  compile error ("`try` requires the enclosing function to return `… | error`").
-- `expr` must be `T | error`; the type of `try expr` is `T`.
-- Scope `defer`s still fire on the error return ([[teko-defer-per-scope]]).
-- **Desugar-only**: `try e` ⇒ `match e { T as v => v; error as x => return x }` — the exact code a
-  developer writes today. NO codegen/VM change; the lexer gains `try` (contextual at expression start to
-  avoid breaking any identifier named `try`), the parser a prefix node, the checker the desugar+validation.
+- `T | error` (and any wider union) → **`match`**, always:
+  ```teko
+  match teko::io::read_file(path) {
+      str as s   => use(s)
+      error as e => return e      // or handle e here — the author decides, explicitly
+  }
+  ```
+- optional `T?` → the existing **`?.`** (safe navigation) and **`??`** (coalesce):
+  ```teko
+  let name = user?.profile?.name ?? "anonymous"
+  ```
 
-**Example.**
-```teko
-fn fetch(host: str, req: []byte) -> []byte | error {
-    let conn = try teko::net::tcp::connect(host)   // TcpStream, or propagate the error
-    try conn.write(req)                             // propagate a write error
-    try conn.read_all()                             // []byte, or propagate
-}
-```
+`?.`/`??` already exist and are the sanctioned ergonomic shortcut — but only for **absence** (`null`),
+never for **error**, because absence is a single well-defined case whereas an error union may not be.
 
-**Verify:** `.tkt` — `try` on both arms (success threads the value; error returns it); a compile-error
-test for `try` in a non-`error` function; VM == native; both twins byte-identical; gen-2 == gen-3.
-
-**Open decision (ratify):** ship only `try` (pure propagate) now, leaving inline error handling to
-`match` — vs also adding `try expr else |e| { … }` (map/handle). *(rec: `try` only; keep the surface
-minimal, `match` already handles the rest.)*
+**Consequence for the sibling roadmaps:** their examples and dependency lines that mentioned `try` are
+corrected to use `match`; none of them depend on a `try` unit anymore.
 
 ---
 
@@ -76,8 +72,9 @@ type Closer = interface { fn close(self) -> error? }
 ```
 Plus combinators (pure Teko): `read_all(r) -> Buf | error`, `read_exact`, `copy(dst, src) -> u64 | error`,
 `BufReader`/`BufWriter` (buffering wrappers), `LimitReader`, a bytes/`str` in-memory `Reader`/`Writer`.
-`Buf` is the same arena-backed byte region the net keystone defines (shared). **Verify:** `.tkt` over
-in-memory reader/writer + copy + buffering (all pure Teko).
+`Buf` is the same arena-backed byte region the net keystone defines (shared). Callers handle the
+`… | error` results with `match`. **Verify:** `.tkt` over in-memory reader/writer + copy + buffering (all
+pure Teko).
 
 ### ▪ IO1 — wire the existing surfaces to the interfaces
 **Deps:** IO0. Make `teko::io` file/console fns (already extern-backed) and — as they land — net
@@ -113,19 +110,17 @@ and `teko::io` lines/bytes. **Verify:** `.tkt` — laziness (a `map` whose closu
 ## 4. Dependency graph + order
 
 ```
-CORE-TRY        (independent — land first, it cleans up all later code)
 IO0 ── IO1      (IO1 wires net/compress/crypto as they arrive)
 ITER0           (independent; composes with IO0 for line/byte iteration)
 ```
 
-**Order:** `CORE-TRY` first (pure desugar, immediately simplifies the compiler corpus itself and every
-subsequent unit). `IO0` before slicing net/crypto/compress to agents (their stream types should implement
-`Reader`/`Writer`). `ITER0` any time after closures. All are independent of the net KEYSTONE.
+**Order:** `IO0` before slicing net/crypto/compress to agents (their stream types should implement
+`Reader`/`Writer`). `ITER0` any time after closures. Both are independent of the net KEYSTONE.
+(Error handling needs no unit — `match` + `?.`/`??` already exist.)
 
 ## 5. Open decisions (ratify with the sibling roadmaps in PR #80)
 
-1. **`try` scope**: pure-propagate only vs also `try … else |e|` mapping. *(rec: pure only)*
-2. **`try` keyword**: reserved vs contextual-at-expression-start. *(rec: contextual, so `try` stays usable as an identifier elsewhere)*
-3. **`io` error model**: `read`/`write` return `u64 | error` with EOF as `0` (rec, Go-style) vs a distinct `Eof` error case.
-4. **`Buf`**: confirm `teko::io` and `teko::net` share the ONE arena-backed byte region (from the net keystone), not two.
-5. **`iter` protocol**: `next() -> T?` (rec — reuses the optional model) vs a `(bool, T)` pair or a `Done|Item<T>` variant.
+1. ~~`try` operator~~ — **DECIDED (rejected)**, §1. `match` stays; `?.`/`??` stay for optionals.
+2. **`io` error model**: `read`/`write` return `u64 | error` with EOF as `0` (rec, Go-style) vs a distinct `Eof` error case.
+3. **`Buf`**: confirm `teko::io` and `teko::net` share the ONE arena-backed byte region (from the net keystone), not two.
+4. **`iter` protocol**: `next() -> T?` (rec — reuses the optional model) vs a `(bool, T)` pair or a `Done|Item<T>` variant.

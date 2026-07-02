@@ -3,11 +3,11 @@
 > **Status:** DESIGN (no code yet) · **Created:** 2026-07-02 · **Branch:** `feat/net-connectors` (off `chore/reboot`)
 >
 > The layer that turns the net/crypto/encoding **primitives** into "I write an API comfortably": the
-> web/API **patterns**. Built entirely on `teko::net::http`/`ws`/`sse`, `teko::io` streams, `try`, and the
+> web/API **patterns**. Built entirely on `teko::net::http`/`ws`/`sse`, `teko::io` streams, and the
 > `teko::encoding` codecs. All 100% Teko.
 >
 > Companion to [`TEKO_ROADMAP_NET_CRYPTO.md`](TEKO_ROADMAP_NET_CRYPTO.md),
-> [`TEKO_ROADMAP_STDLIB_CORE.md`](TEKO_ROADMAP_STDLIB_CORE.md) (io/try/iter),
+> [`TEKO_ROADMAP_STDLIB_CORE.md`](TEKO_ROADMAP_STDLIB_CORE.md) (io/iter),
 > [`TEKO_ROADMAP_DB.md`](TEKO_ROADMAP_DB.md), and [`TEKO_ROADMAP_CLOUD_NATIVE.md`](TEKO_ROADMAP_CLOUD_NATIVE.md)
 > (config/observability/resilience). Same agent-distributable contract.
 
@@ -34,7 +34,7 @@ sliced to agents. Doc-comments are already parsed (`has_doc`/`doc`), so OpenAPI/
 
 ## A. Web foundation (STDLIB — thin)
 
-**▪ W0 — `teko::web` router + middleware contract.** **Deps:** net N5 (http), stdlib `io`+`try`,
+**▪ W0 — `teko::web` router + middleware contract.** **Deps:** net N5 (http), stdlib `io`,
 interfaces (W10b.IF ✅). **Files:** `src/web/router.tks`, `src/web/context.tks`.
 ```teko
 type Context = struct { /* request, response writer, path params, values */ }
@@ -109,7 +109,7 @@ loopback IdP stub.
 ## 4. Dependency graph + tiers
 
 ```
-net::http (N5) + io + try ── W0(router/mw) ─┬─ W1 std-mw ── W13 csrf/headers
+net::http (N5) + io ── W0(router/mw) ─┬─ W1 std-mw ── W13 csrf/headers
                                             ├─ W2 cookies/sessions ── W12 tokens/RBAC
                                             ├─ W3 static
                                             ├─ W4 http client ── W14 oauth/oidc (pkg)

@@ -28,7 +28,7 @@
 
 ### Configuration
 
-**▪ CN0 — `teko::config`.** **Deps:** `teko::env` (Map), encoding (JSON/YAML/TOML), stdlib `try`.
+**▪ CN0 — `teko::config`.** **Deps:** `teko::env` (Map), encoding (JSON/YAML/TOML).
 **Files:** `src/config/config.tks`. Layered configuration with precedence **flags < file < env**, typed
 access (`get_int`/`get_str`/`get_bool` → `T | error`), binding a config struct (helped by **W-DERIVE**),
 `.env` file loading, required-key validation. **Verify:** `.tkt` — precedence + typed parse + missing-key
@@ -66,7 +66,7 @@ assert clean drain + exit code.
 
 ### Resilience
 
-**▪ CN6 — `teko::resilience`.** **Deps:** stdlib `try`, `teko::time`, closures (W10 ✅). **Files:**
+**▪ CN6 — `teko::resilience`.** **Deps:** `teko::time`, closures (W10 ✅). **Files:**
 `src/resilience/*.tks`. **Retry** with backoff (exponential + jitter) + max attempts, **circuit breaker**
 (closed/open/half-open), **timeout** wrapper, **bulkhead**/semaphore-limit. All as higher-order functions
 over a fallible closure `() -> T | error`. **Verify:** `.tkt` — deterministic backoff schedule, breaker
@@ -87,7 +87,7 @@ teko::io + encoding ─── CN1 log ─┬─ CN2 metrics ── (web /metrics
                                  └─ CN3 trace  ── (web trace-mw) ── OTLP exporter (pkg)
 web ── CN4 health/readiness
 #os signals ── CN5 graceful shutdown ── (async cancellation)
-try + time + closures ── CN6 resilience
+time + closures ── CN6 resilience
 time + async ── CN7 cron/jobs
 ```
 

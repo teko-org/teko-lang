@@ -22,6 +22,62 @@ OpenAPI schema and it's O(types × formats) of boilerplate that drifts out of sy
 language solves this with *some* form of compile-time introspection (Rust `derive`, Zig `comptime` +
 `@typeInfo`, Go `reflect`+codegen, C# source generators).
 
+### 0.1 IMPORTANT — `derive` is NOT a new way to write functions or extend classes
+
+The master plan already defines how you implement methods and satisfy interfaces (W10b: struct/class
+methods, the receiver rule, `implements`/inline conformance). **`derive` does not replace or compete with
+any of that.** `derive` only *generates the exact same code you would otherwise hand-write*, for a small
+set of interfaces whose implementation is 100% determined by a type's fields. It is opt-in, per type, per
+interface — and for anything needing real logic or validation you still hand-write the method the normal
+(master-plan) way.
+
+**Example — equality.** The master plan already lets you satisfy an `Eq` interface by writing the method:
+```teko
+type Point = struct { x: i64; y: i64 }
+
+// HAND-WRITTEN (the master-plan way) — you satisfy Eq by providing the method:
+type PointEq = struct Eq {          // struct implements the Eq interface
+    x: i64; y: i64
+    pub fn eq(self, other: Point) -> bool { self.x == other.x && self.y == other.y }
+}
+```
+For `Point`, that `eq` body is *mechanical* — it is completely determined by the field list. `derive`
+writes that identical method for you:
+```teko
+#derive(Eq)                          // compiler generates the SAME eq(self, other) from the fields
+type Point = struct { x: i64; y: i64 }
+```
+`#derive(Eq)` produces exactly the `eq` above — same interface, same method, same dispatch. Nothing new in
+the object model; the compiler just filled in boilerplate.
+
+**Example — JSON.** Hand-written today (and still valid):
+```teko
+type User = struct {
+    id: i64
+    name: str
+    pub fn to_json(self) -> str { $"{{\"id\":{self.id},\"name\":{teko::encoding::json::quote(self.name)}}}" }
+}
+```
+With derive:
+```teko
+#derive(Json)                        // generates to_json/from_json by walking the fields
+type User = struct { id: i64; name: str }
+
+let u = User { id = 1; name = "ana" }
+teko::encoding::json::encode(u)      // "{\"id\":1,\"name\":\"ana\"}"  — no hand-written codec
+match teko::encoding::json::decode<User>(bytes) { User as u => …; error as e => … }
+```
+When you need something the generator can't know (rename a field, skip it, custom format), you either add a
+field attribute (`#json(name="user_id")`) or **hand-write `to_json` the normal way** — derive steps aside.
+
+**Why it matters concretely:** a `Map` key must satisfy `Hashable & Eq` ([[teko-collections-rulings]]).
+Without derive, every key struct hand-writes `hash` + `eq`. With `#derive(Hash, Eq)` the compiler writes
+both — same interfaces, zero boilerplate. Same story for encoding N formats and for request binding.
+
+So the decision is narrow: *"for a fixed set of structural interfaces, may the compiler write the method
+body from the fields, instead of the developer copying the same shape by hand?"* — not "a new way to
+define behavior."
+
 **The constraint that shapes Teko's answer:** the memory model is **monomorphization, no runtime
 reflection** — and that is a *feature* (soundness, `all-native`, no metadata bloat, Law M.0). So Teko's
 answer must be **compile-time only**: the field/type information exists during checking/codegen and is

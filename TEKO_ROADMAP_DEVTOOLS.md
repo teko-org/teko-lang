@@ -28,7 +28,7 @@ are pure-Teko passes over structures that already exist — no new runtime, VM-`
 A **canonical** pretty-printer: parse → format the AST/token stream → emit, so there is exactly one
 formatting of any program (gofmt-style: no options, no debate). Handles the whole grammar (decls,
 `match`/`loop`/`if`, `type … = struct/class/interface/variant/enum/flags`, generics, closures, the string
-kinds, `~`/`in`/`try`, attributes `#test`/`#os`/…). **Comment preservation** is the hard part — comments
+kinds, `~`/`in`, attributes `#test`/`#os`/…). **Comment preservation** is the hard part — comments
 aren't AST nodes, so they must be re-attached from the token stream (leading/trailing/free-standing).
 - `teko fmt <path>` (rewrite), `teko fmt --check` (CI gate: exit non-zero if unformatted), stdin/stdout.
 **Verify:** **idempotence** (`fmt(fmt(x)) == fmt(x)`) as a `.tkt` over the whole corpus; the compiler's own
@@ -48,7 +48,7 @@ doc text); a snapshot of the generated Markdown.
 **Deps:** checker. **Files:** `src/lint/*.tks`. Style/best-practice lints BEYOND type errors, reusing the
 checker's structures: the law-encoded ones (no `match` on bool, prefer `x != 0` over `x to bool`, `loop`
 only, `[..xs, x]` over push chains — the Phase-11 sweep targets), unused imports, shadowing hints,
-`try`-able `match` suggestions. `teko lint <path>`, `--fix` for the mechanical ones. **Verify:** `.tkt`
+unhandled-`match`-arm hints. `teko lint <path>`, `--fix` for the mechanical ones. **Verify:** `.tkt`
 per-lint fixtures.
 
 ### ▪ DT3 — `teko repl` (adjacent, T3)

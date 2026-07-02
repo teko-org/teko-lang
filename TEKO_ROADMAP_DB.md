@@ -9,7 +9,7 @@
 > who never touches SQLite must not need `libsqlite3` installed.
 >
 > Companion to [`TEKO_ROADMAP_NET_CRYPTO.md`](TEKO_ROADMAP_NET_CRYPTO.md) (drivers build on `teko::net`
-> sockets/TLS) and [`TEKO_ROADMAP_STDLIB_CORE.md`](TEKO_ROADMAP_STDLIB_CORE.md) (`io` streams + `try`).
+> sockets/TLS) and [`TEKO_ROADMAP_STDLIB_CORE.md`](TEKO_ROADMAP_STDLIB_CORE.md) (`io` streams; error handling via `match`).
 > Same agent-distributable contract.
 
 ---
@@ -60,7 +60,7 @@ both twins byte-identical.
 ## 2. `teko::db` — the common surface
 
 ### ▪ DB0 — core interface + value model
-**Deps:** STDLIB `try` + `io` (nice-to-have), net N1 (tcp). **Files:** `src/db/db.tks`.
+**Deps:** STDLIB `io` (nice-to-have), net N1 (tcp). **Files:** `src/db/db.tks`.
 ```teko
 type Value      = variant Null | Int | Float | Text | Bytes | Bool | Timestamp | Decimal
 type Row        = struct { cols: []str; vals: []Value }
