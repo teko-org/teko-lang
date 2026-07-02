@@ -268,6 +268,22 @@ tk_str tk_class_name_from_method_ns(tk_str ns) {
     return (tk_str){ ns.ptr + cut, ns.len - cut };
 }
 
+// (DEFARGS rule E, 2026-07-02) does any param in `contract_params` that OWNS a default (has_default)
+// get RESTATED (has_default again, same or different value) by the corresponding param in
+// `impl_params`? The contract (interface method / base virtual-abstract method) owns a named
+// param's default; an implementing/overriding method may only supply the type, never restate the
+// `= …` (soundness under dispatch — see teko-default-args-named-call, ruling E.i). Both param lists
+// are assumed already length-matched by the caller (method_sig_matches / the override arity check).
+// Returns the OFFENDING param's name, or an empty tk_str if no restatement is found. Mirror of
+// collect.tks::default_restated_param.
+static tk_str default_restated_param(const tk_param *contract_params, size_t n_contract, const tk_param *impl_params, size_t n_impl) {
+    size_t n = n_contract < n_impl ? n_contract : n_impl;
+    for (size_t k = 0; k < n; k += 1) {
+        if (contract_params[k].has_default && impl_params[k].has_default) return impl_params[k].name;
+    }
+    return (tk_str){0};
+}
+
 // (W10b.CLASS increment 2) validate ONE class's inheritance/override declarations. Mirror of
 // collect.tks::validate_class_decl.
 static tk_type_result validate_class_decl(tk_class_body cb, tk_type_table table) {
@@ -297,6 +313,14 @@ static tk_type_result validate_class_decl(tk_class_body cb, tk_type_table table)
         bool overridable = bm.is_abstract || bm.is_virtual || bm.is_override;
         if (!overridable) return (tk_type_result){ .ok = false, .as.error = tk_error_named("overrides a base method that is not abstract/virtual", m.name) };
         if (bm.nparams != m.nparams) return (tk_type_result){ .ok = false, .as.error = tk_error_named("override must have the same parameter count as the base method", m.name) };
+        tk_str restated = default_restated_param(bm.params, bm.nparams, m.params, m.nparams);
+        if (restated.len > 0) {
+            size_t len = m.name.len + restated.len + cb.base_name.len + 96; char *buf = tk_alloc(len); if (!buf) abort();
+            snprintf(buf, len, "'%.*s' override must not restate the default for '%.*s' — the base method '%.*s::%.*s' owns its default",
+                     (int)m.name.len, (const char *)m.name.ptr, (int)restated.len, (const char *)restated.ptr,
+                     (int)cb.base_name.len, (const char *)cb.base_name.ptr, (int)m.name.len, (const char *)m.name.ptr);
+            return (tk_type_result){ .ok = false, .as.error = tk_error_make(buf) };
+        }
     }
     return (tk_type_result){ .ok = true };
 }
@@ -411,6 +435,16 @@ static tk_type_result check_conformance(tk_str type_name, const tk_function *own
                         snprintf(buf, len, "'%.*s' method '%.*s' does not match interface '%.*s's signature",
                                  (int)type_name.len, (const char *)type_name.ptr, (int)req.name.len, (const char *)req.name.ptr, (int)iname.len, (const char *)iname.ptr);
                         return (tk_type_result){ .ok = false, .as.error = tk_error_make(buf) };
+                    }
+                    {
+                        tk_str restated = default_restated_param(req.params, req.nparams, own_methods[mi].params, own_methods[mi].nparams);
+                        if (restated.len > 0) {
+                            size_t len = type_name.len + req.name.len + restated.len + iname.len + 96; char *buf = tk_alloc(len); if (!buf) abort();
+                            snprintf(buf, len, "'%.*s' method '%.*s' must not restate the default for '%.*s' — interface '%.*s' owns its default",
+                                     (int)type_name.len, (const char *)type_name.ptr, (int)req.name.len, (const char *)req.name.ptr,
+                                     (int)restated.len, (const char *)restated.ptr, (int)iname.len, (const char *)iname.ptr);
+                            return (tk_type_result){ .ok = false, .as.error = tk_error_make(buf) };
+                        }
                     }
                     if (!members_all_public && !(own_methods[mi].vis == TK_VIS_PUB || own_methods[mi].vis == TK_VIS_EXP)) {
                         size_t len = type_name.len + req.name.len + iname.len + 80; char *buf = tk_alloc(len); if (!buf) abort();

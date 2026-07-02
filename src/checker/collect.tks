@@ -346,11 +346,31 @@ pub fn class_name_from_method_ns(ns: str) -> str {
     teko::str::slice_from(ns, (last_sep to u64) + 2)
 }
 
+// (DEFARGS rule E, 2026-07-02) does any param in `contract_params` that OWNS a default (has_default)
+// get RESTATED (has_default again, same or different value) by the corresponding param in
+// `impl_params`? The contract (interface method / base virtual-abstract method) owns a named
+// param's default; an implementing/overriding method may only supply the type, never restate the
+// `= …` (soundness under dispatch — see teko-default-args-named-call, ruling E.i). Both param lists
+// are assumed already length-matched by the caller (method_sig_matches / the override arity check).
+// Returns the OFFENDING param's name, or "" if no restatement is found. Mirror of
+// collect.c::default_restated_param.
+fn default_restated_param(contract_params: []parser::Param, impl_params: []parser::Param) -> str {
+    mut k: u64 = 0
+    let n = if contract_params.len < impl_params.len { contract_params.len } else { impl_params.len }
+    loop {
+        if k >= n { break }
+        if contract_params[k].has_default && impl_params[k].has_default { return impl_params[k].name }
+        k++
+    }
+    ""
+}
+
 // (W10b.CLASS increment 2) validate ONE class's inheritance/override declarations:
 //  - a base class must exist, be a class, and be `abstract`/`virtual` (NOT sealed — a sealed
 //    class is final, per ClassKind's doc).
 //  - an `override` method must match an existing method in the base's EFFECTIVE methods, and
 //    that base method must itself be overridable (`abstract`/`virtual`/already `override`).
+//  - (DEFARGS rule E) an `override` method must NOT restate a default the base method owns.
 fn validate_class_decl(cb: parser::ClassBody, table: TypeTable) -> error? {
     if cb.has_base {
         let base_decl = match type_table_find(table, cb.base_name) {
@@ -392,6 +412,8 @@ fn validate_class_decl(cb: parser::ClassBody, table: TypeTable) -> error? {
                     let overridable = bm.is_abstract || bm.is_virtual || bm.is_override
                     if !overridable { return error { message = $"'{m.name}' overrides a base method that is not `abstract`/`virtual`" } }
                     if bm.params.len != m.params.len { return error { message = $"'{m.name}' override must have the same parameter count as the base method" } }
+                    let restated = default_restated_param(bm.params, m.params)
+                    if restated != "" { return error { message = $"'{m.name}' override must not restate the default for '{restated}' — the base method '{cb.base_name}::{m.name}' owns its default" } }
                 }
             }
         }
@@ -508,6 +530,8 @@ fn check_conformance(type_name: str, own_methods: []parser::Function, implements
                     if !method_sig_matches(req, own_methods[mi], table) {
                         return error { message = $"'{type_name}' method '{req.name}' does not match interface '{iname}'s signature" }
                     }
+                    let restated = default_restated_param(req.params, own_methods[mi].params)
+                    if restated != "" { return error { message = $"'{type_name}' method '{req.name}' must not restate the default for '{restated}' — interface '{iname}' owns its default" } }
                     if !members_all_public {
                         match own_methods[mi].vis {
                             parser::Visibility::Pub => {}

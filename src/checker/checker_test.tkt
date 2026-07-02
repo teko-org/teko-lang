@@ -2443,6 +2443,121 @@ fn iface_conflicting_inherited_sig_is_error() {
     }
 }
 
+// --- (DEFARGS rule E, 2026-07-02, issue #103) the contract OWNS a named param's default; an
+// implementing/overriding method must NOT restate it (soundness under dispatch). ------------------
+// a trailing `greeting: str [= "Hello"]` param, defaulted iff `defaulted`.
+fn greet_param(defaulted: bool) -> parser::Param {
+    parser::Param { name = "greeting"; has_type = true; type_ann = named_t("str"); is_params = false; has_default = defaulted; default_expr = e_str("Hello") }
+}
+// a DIFFERENT default value for the same `greeting: str = "Hi"` param — a restatement that also
+// changes the value (still forbidden — the contract owns the default regardless of the value).
+fn greet_param_other_default() -> parser::Param {
+    parser::Param { name = "greeting"; has_type = true; type_ann = named_t("str"); is_params = false; has_default = true; default_expr = e_str("Hi") }
+}
+// `fn greet(self, greeting: str [= "Hello"]) -> str` — an interface method NAMING+defaulting `greeting`.
+fn iface_method_greet(defaulted: bool) -> parser::Function {
+    let params = teko::list::push(teko::list::push(teko::list::empty(), recv_param("self")), greet_param(defaulted))
+    parser::Function { name = "greet"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = params; has_return = true; return_type = named_t("str"); body = teko::list::empty(); vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false }
+}
+// a concrete `[vis] fn greet(self, greeting: str [= …]) -> str { … }` implementing method, with an
+// explicit `greeting` param (defaulted per `p`).
+fn impl_method_greet(vis: parser::Visibility, p: parser::Param) -> parser::Function {
+    let params = teko::list::push(teko::list::push(teko::list::empty(), recv_param("self")), p)
+    parser::Function { name = "greet"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = params; has_return = true; return_type = named_t("str"); body = one_stmt(e_str("hi")); vis = vis; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false }
+}
+// a `virtual`/`override` variant of impl_method_greet (for class-base-override tests).
+fn class_method_greet(vis: parser::Visibility, p: parser::Param, is_virtual: bool, is_override: bool) -> parser::Function {
+    let params = teko::list::push(teko::list::push(teko::list::empty(), recv_param("self")), p)
+    parser::Function { name = "greet"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = params; has_return = true; return_type = named_t("str"); body = one_stmt(e_str("hi")); vis = vis; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = is_virtual; is_override = is_override }
+}
+// a virtual base class `type name = virtual class { <methods> }` (no base of its own).
+fn virtual_base_class_item(name: str, methods: []parser::Function) -> parser::Item {
+    parser::Item { content = parser::TypeDecl { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::ClassBody { kind = parser::ClassKind::Virtual; has_base = false; base_name = ""; has_base_binding = false; base_binding_name = ""; implements = teko::list::empty(); fields = teko::list::empty(); methods = methods }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }; namespace = ""; file = "" }
+}
+// a sealed derived class `type name = class base { <methods> }`.
+fn sealed_derived_class_item(name: str, base: str, methods: []parser::Function) -> parser::Item {
+    parser::Item { content = parser::TypeDecl { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::ClassBody { kind = parser::ClassKind::Sealed; has_base = true; base_name = base; has_base_binding = false; base_binding_name = ""; implements = teko::list::empty(); fields = teko::list::empty(); methods = methods }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }; namespace = ""; file = "" }
+}
+
+#test
+fn iface_impl_restates_default_is_error() {
+    // Greetable.greet(self, greeting: str = "Hello") owns the default; Hi restates the SAME default
+    // -> rule E rejects the restatement (the contract, not the impl, owns it).
+    let ifc = iface_item("Greetable", list1(iface_method_greet(true)), teko::list::empty())
+    let imp = impl_struct_item("Hi", list1(impl_method_greet(parser::Visibility::Pub, greet_param(true))), slist1("Greetable"))
+    let items = teko::list::push(teko::list::push(teko::list::empty(), ifc), imp)
+    match type_program(parser::Program { items = items }) {
+        TProgram => teko::assert::is_true(false)   // restated default -> must fail
+        error    => teko::assert::is_true(true)
+    }
+}
+
+#test
+fn iface_impl_restates_different_default_is_error() {
+    // Hi restates a DIFFERENT default ("Hi" instead of "Hello") -> still an error (E.i forbids ANY
+    // restatement, not just a matching one — the value diverging is exactly the soundness hazard).
+    let ifc = iface_item("Greetable", list1(iface_method_greet(true)), teko::list::empty())
+    let imp = impl_struct_item("Hi", list1(impl_method_greet(parser::Visibility::Pub, greet_param_other_default())), slist1("Greetable"))
+    let items = teko::list::push(teko::list::push(teko::list::empty(), ifc), imp)
+    match type_program(parser::Program { items = items }) {
+        TProgram => teko::assert::is_true(false)   // different restated default -> must still fail
+        error    => teko::assert::is_true(true)
+    }
+}
+
+#test
+fn iface_impl_omits_default_ok() {
+    // Hi correctly OMITS the default (just types `greeting: str`, no `=`) — conforms cleanly; the
+    // contract's default is used at every call through the interface.
+    let ifc = iface_item("Greetable", list1(iface_method_greet(true)), teko::list::empty())
+    let imp = impl_struct_item("Hi", list1(impl_method_greet(parser::Visibility::Pub, greet_param(false))), slist1("Greetable"))
+    let items = teko::list::push(teko::list::push(teko::list::empty(), ifc), imp)
+    match type_program(parser::Program { items = items }) {
+        TProgram => teko::assert::is_true(true)    // omitted restatement -> OK
+        error    => teko::assert::is_true(false)
+    }
+}
+
+#test
+fn class_override_restates_base_default_is_error() {
+    // Base.greet(self, greeting: str = "Hello") is `virtual` and owns the default; Dog's `override`
+    // restates it -> rule E rejects (same soundness reason as the interface case, for virtual/abstract
+    // base methods).
+    let base = virtual_base_class_item("Base", list1(class_method_greet(parser::Visibility::Pub, greet_param(true), true, false)))
+    let derived = sealed_derived_class_item("Dog", "Base", list1(class_method_greet(parser::Visibility::Pub, greet_param(true), false, true)))
+    let items = teko::list::push(teko::list::push(teko::list::empty(), base), derived)
+    match type_program(parser::Program { items = items }) {
+        TProgram => teko::assert::is_true(false)   // override restated the base's default -> must fail
+        error    => teko::assert::is_true(true)
+    }
+}
+
+#test
+fn class_override_omits_base_default_ok() {
+    // Dog's override correctly OMITS the default -> conforms cleanly.
+    let base = virtual_base_class_item("Base", list1(class_method_greet(parser::Visibility::Pub, greet_param(true), true, false)))
+    let derived = sealed_derived_class_item("Dog", "Base", list1(class_method_greet(parser::Visibility::Pub, greet_param(false), false, true)))
+    let items = teko::list::push(teko::list::push(teko::list::empty(), base), derived)
+    match type_program(parser::Program { items = items }) {
+        TProgram => teko::assert::is_true(true)    // omitted restatement -> OK
+        error    => teko::assert::is_true(false)
+    }
+}
+
+#test
+fn class_override_no_default_param_still_works() {
+    // POSITIVE CONTROL: a normal override with NO default-bearing param at all (just a plain typed
+    // `greeting: str`, base does not default it either) still conforms — rule E must not misfire when
+    // there is no default to restate.
+    let base = virtual_base_class_item("Base", list1(class_method_greet(parser::Visibility::Pub, greet_param(false), true, false)))
+    let derived = sealed_derived_class_item("Dog", "Base", list1(class_method_greet(parser::Visibility::Pub, greet_param(false), false, true)))
+    let items = teko::list::push(teko::list::push(teko::list::empty(), base), derived)
+    match type_program(parser::Program { items = items }) {
+        TProgram => teko::assert::is_true(true)    // plain override, no defaults anywhere -> OK
+        error    => teko::assert::is_true(false)
+    }
+}
+
 // --- flags methods (C8.3, self-host ported 2026-07-01) ---------------------------------------
 fn mk_perm_flags() -> parser::TypeDecl {
     let members = teko::list::push(teko::list::push(teko::list::empty(), "Read"), "Write")
