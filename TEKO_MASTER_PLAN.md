@@ -653,9 +653,53 @@ All design is SETTLED: W10b OOP, DEFARGS, W10c DI, W11 constraints (sans `!`), c
 
 **🟢 ROUND 3 — OOP completion + dispatch (needs CLASS/IF):** ~~**C2** conformance~~ ✅ **DONE with IF (ROUND 2)** · ~~**C1** factories (`C|error`)~~ ✅ **DONE 2026-07-02 (issue #86)** — fallible factories `-> C | error` end-to-end BOTH engines (the gap was VM-only: `pat_match` never dereferenced a ClassRef cell, so ANY `match` over a `Class | error` union aborted "non-exhaustive"; native already worked); async factory (`Intent<C>`) DEFERRED to S8/ROUND 5 (async does not exist yet) · ~~**D1** invariant-safe construction~~ ✅ **DONE 2026-07-02 (issue #89)** — external class literals rejected in both twin checkers (`env.owner_type` boundary), zero migrations needed · **D3** dynamic dispatch (interface values + vtable, reuses `tk_closure`) · **D2** static dispatch `<T: I>` *(needs C2 **+ W11 constraints** from Round 1)*.
 
-**🟢 ROUND 4 — DI + collections (needs OOP done):**
+**🟢 ROUND 3.5 — NP-OOP + TRAITS (slotted 2026-07-02 — user ruling: traits + null-prop×OOP enter the OOP rounds).**
+
+- **Stage A — NP-OOP** (null-propagation × OOP integration). `?.`/`??` are already DONE for plain
+  optionals (see the DISJOINT-DOMAIN entry above); this stage extends them to OOP values: `?.`/`??` on
+  `C?` (nullable class) and `I?` (nullable interface — a vtable-carrying nullable fat pointer) values —
+  `obj?.method()`, `obj?.field`; factory interplay under the disjoint-domain law (a factory's `null` result
+  reads via `?.`/`??`, its `error` result reads via `match` — the two stay disjoint even when the factory
+  returns something OOP-shaped); the visibility question (`?.` must respect intern/private exactly like a
+  bare `.` — no visibility bypass through the null-propagating path). **Deps:** D3, D2 (dynamic + static
+  dispatch — `I?` needs the vtable rep D3 defines). **Status:** ⬜.
+- **Stage B — TR0** (the `trait` construct: struct-shaped, derivable, non-instantiable; fields+methods
+  folded into a deriving struct/class via field-flattening). **Deps:** W10b.IF ✅, W10b.CLASS field-
+  flattening ✅ — both already satisfied, so TR0 is **implementation-ready today**; it is sequenced HERE
+  (ROUND 3.5, not earlier) **by the user's slotting ruling, not because its deps demand it.** **Status:** ⬜.
+- **Stage C — TR1** (trait as generic constraint + dynamic vtable value). **Deps:** TR0, S6/W11 ✅, **hard
+  dep: D3** (dynamic dispatch — a trait's bodyless-requirement surface reuses the same vtable rep). **Status:** ⬜.
+- **Stage D — TR2** (compile-time field view, internal — the compiler-only enumeration of a deriver's
+  fields used to synthesize structural-trait bodies; no surface syntax, no runtime value). **Deps:**
+  checker. **Status:** ⬜.
+- **Stage E — TR3** (standard structural traits `Eq`/`Ord`/`Hash`/`Clone`/`Default`, field-wise
+  synthesized, overridable). **Deps:** TR0, TR2. Placed **explicitly BEFORE ROUND 4 collections** — TR3
+  unblocks `Map<K: Hashable & Eq>`'s key constraint ahead of the collections work in ROUND 4. **Status:** ⬜.
+
+Spec pointer for all of TR0–TR3: `TEKO_ROADMAP_TRAITS.md`.
+
+**TR4 (Json) — slotted alongside ROUND 4, not gated on it.** **Deps (per `TEKO_ROADMAP_TRAITS.md`):** TR3
++ `teko::encoding` S-JSON only — **the trait doc declares NO collections dependency for TR4**, so it does
+not wait on ROUND 4's `teko::collections` work. S-JSON itself (`TEKO_ROADMAP_NET_CRYPTO.md` §2b) is
+**Deps: none** — a pure-Teko unit startable anytime — so the realistic gate on TR4 is just TR3 landing.
+**TR5 (schema/OpenAPI)** is placed **before WEB Stage B** (not before ROUND 5): **Deps:** TR4, doc-
+comments; it directly feeds `W9 — OpenAPI generation` in `TEKO_ROADMAP_WEB.md` (`W9` deps: `W0, W8,
+TRAITS(schema), doc-comments`), so it must precede that WEB unit, independent of the ROUND 5 boundary.
+
+**🟢 ROUND 4 — DI + collections (needs OOP done) + TR4(Json) parallel:**
 - **W10c DI core** (`#inject` overlay + `LazyRef<T>` + 3 lifetimes + registration + recursive DI) — needs classes/interfaces/factories + arena-tree ext (Round 1).
-- **collections S7/W12** (`Map`/`List`/`Set`/`LinkedList`/`BTree`/`Hash` as `teko::collections` classes) — needs classes + constraints (`Map`: `K: Hashable & Eq`).
+- **collections S7/W12** (`Map`/`List`/`Set`/`LinkedList`/`BTree`/`Hash` as `teko::collections` classes) — needs classes + constraints (`Map`: `K: Hashable & Eq`, unblocked by ROUND 3.5's TR3).
+- **+ TR4(Json) parallel** — see ROUND 3.5 note above; runs alongside ROUND 4 rather than inside it (its deps are satisfied independently of DI/collections).
+- **LIB-KEYSTONES (combined crumb).** `TEKO_ROADMAP_NET_CRYPTO.md`'s **N-KEYSTONE** (`C7.19`, byte-buffer
+  transport across raw externs — `src/checker/typer.{tks,c}`, `src/codegen/codegen.{tks,c}`) and
+  `TEKO_ROADMAP_DB.md`'s **DB-KEYSTONE** (`C7.20`, extern-reachability/on-demand FFI linking —
+  `src/checker/*`, `src/codegen/codegen.{tks,c}`, `src/build/project.tks`/driver) land as **ONE crumb,
+  single-owner, in the same round** — both declare `Deps: none` independently and both touch `chk`/`cg`,
+  so the single-owner-bottleneck-file rule (`chk`/`cg` serialize within a round) forbids splitting them
+  across two agents in the same round; they must be sequenced onto the same owner (or strictly serialized)
+  rather than run as two parallel crumbs. **Flag:** neither `TEKO_ROADMAP_NET_CRYPTO.md` nor
+  `TEKO_ROADMAP_DB.md` acknowledges the other's keystone — this overlap is not documented in either
+  source, only discovered by cross-referencing them here.
 
 **🟢 ROUND 5 — DI extras + env + async/concurrency (needs Round 4):**
 - **W10c keys (`@`) + `#wire`** composition root.
@@ -666,7 +710,65 @@ All design is SETTLED: W10b OOP, DEFARGS, W10c DI, W11 constraints (sans `!`), c
 
 **🟡 ROUND N — Native object-file backend (INDEPENDENT of the OOP/DI/async critical path; not gated by ROUND 1–6, runs in parallel from whenever staffed).** Added to the ROUND list 2026-07-01 — previously only existed as prose under C3 (`TEKO_ROADMAP_INDEPENDENCE.md`) and the now-stale `⏸️ DEFERRED` bucket below, disconnected from the live tracker; this entry is the fix. **Full plan:** `TEKO_ROADMAP_NATIVE_BACKEND.md`. Scope: replace `tk_emit_c` (C-text codegen) with a backend that emits native object bytes directly (ELF/Mach-O/COFF) + **WebAssembly, BOTH environments — WASI and Browser** (scope widened same-day per user request; browser gets a thin JS-import glue for `env`/`io`/`exit`, honest-stop at runtime for `fs`/`process` since a browser sandbox has no equivalent — no virtual filesystem invented), for the 8 targets: the 6 already validated in `.github/workflows/native.yml` + 2 new Wasm CI jobs (WASI, Browser). Sub-phases N1–N8 (N6 splits into sibling N6a/WASI + N6b/Browser, sharing the same program object and `stackify_wasm`/`obj_wasm`, differing only in which `teko_rt.wasm` variant links in). **Status:** plan only (PR #42, docs/native-codegen-roadmap), zero code written. **Confirmed touching `src/codegen/*` in parallel:** ROUND 2's PR #39 already added `TK_BODY_CLASS` handling to `emit_type_decl` (CLASS struct-layout emission, data-model only) — this is a real overlap in the SAME FILE (not a design conflict, since it's additive struct-layout logic vs. a brand-new sibling backend under `src/codegen/native/`), but whoever starts ROUND N execution must rebase past ROUND 2's codegen commits, not assume the file is untouched.
 
-**Sequence:** GATE → **ROUND 0 (strings, START HERE)** → then the OOP/DI/async chain. **Critical path of that chain:** A1 → CLASS/IF → C2 → DI → S8 → ROUND 6. W11 constraints join at D2; collections gate `env` and feed async types. ROUND 0 is technically independent (only needs the GATE) but is sequenced FIRST by choice — get strings done and out of the way. **ROUND N (native backend) is orthogonal to this whole sequence** — it depends on nothing above and nothing above depends on it; it can start/pause any time relative to ROUND 1–6, staffing permitting. **Widest parallelism:** Rounds 1, 3, 4, the async sub-parts in Round 5, and ROUND N throughout.
+**Sequence:** GATE → **ROUND 0 (strings, START HERE)** → then the OOP/DI/async chain. **Critical path of that chain:** A1 → CLASS/IF → C2 → D3/D2 → **ROUND 3.5 (NP-OOP + TR0–TR3)** → DI → S8 → ROUND 6. W11 constraints join at D2; collections gate `env` and feed async types; ROUND 3.5's TR3 gates ROUND 4's `Map<K: Hashable & Eq>` key constraint. ROUND 0 is technically independent (only needs the GATE) but is sequenced FIRST by choice — get strings done and out of the way. **ROUND N (native backend) is orthogonal to this whole sequence** — it depends on nothing above and nothing above depends on it; it can start/pause any time relative to ROUND 1–6, staffing permitting. **The LIBRARY TRACKS below (PR #80 suite) are ALSO orthogonal to ROUND 1–6** for their pure-Teko halves (STDLIB_CORE, MATH, DEVTOOLS, most of NET_CRYPTO) — startable now, independent staffing — while their compiler-touching halves (LIB-KEYSTONES in ROUND 4, DB/WEB's socket-dependent units) slot into the rounds as noted in the LIBRARY TRACKS section. **Widest parallelism:** Rounds 1, 3, 4, the async sub-parts in Round 5, ROUND N, and the LIBRARY TRACKS' startable-now units, all throughout.
+
+---
+
+## LIBRARY TRACKS (PR #80 suite)
+
+Nine sibling roadmap docs landed in PR #80 (`c558eab`, 2026-07-02) covering the full-batteries surface:
+`TEKO_ROADMAP_STDLIB_CORE.md`, `TEKO_ROADMAP_MATH.md`, `TEKO_ROADMAP_DEVTOOLS.md`,
+`TEKO_ROADMAP_NET_CRYPTO.md`, `TEKO_ROADMAP_PACKAGES.md`, `TEKO_ROADMAP_DB.md`, `TEKO_ROADMAP_WEB.md`,
+`TEKO_ROADMAP_CLOUD_NATIVE.md`, plus `TEKO_ROADMAP_TRAITS.md` (slotted into ROUND 3.5 above). This section
+slots the other eight against the ROUND 1–6 critical path per **each doc's own declared dependency line** —
+the orchestrator evaluated these from the docs' text; the OOP-round placements above (traits, NP-OOP) were
+the only ones the user ruled on directly.
+
+- **STDLIB_CORE** (`teko::io` + `teko::iter`) — **`IO0`/`ITER0` all show `Deps: interfaces (W10b.IF ✅)` /
+  `closures ✅, generics ✅, interfaces ✅`** — every dep is already satisfied, so this is a **parallel
+  track startable NOW**, independent of ROUND 1–6. Retro-impact noted in the doc itself: **`IO0` gates
+  net's `Reader`/`Writer` conformance** (`TEKO_ROADMAP_NET_CRYPTO.md`'s `TcpStream`/`TlsStream` etc. are
+  meant to implement `teko::io`'s interfaces from the start, per `IO1`'s "retro-impact" note) — so IO0
+  landing before NET_CRYPTO's socket units mature avoids a later rewrite.
+- **MATH** (`teko::math::*`) — **`M0` root is `Deps: none`**, startable NOW. Two decisions the doc flags as
+  "ratify with the net/crypto ones in PR #80" resolve against `NET_CRYPTO`: `M1` (checked arithmetic) and
+  `M3` (BigInt) are the units that answer `NET_CRYPTO`'s open decisions **#4** and **#8** (per that doc's
+  §6 open-decisions list) — so while `M0` is free-standing, `M1`/`M3` have a soft coupling to when
+  NET_CRYPTO's decisions get ratified, not a hard code dependency.
+- **DEVTOOLS** (`teko fmt` / `teko doc` / lint / repl) — **`DT0` (`teko fmt`) is `Deps: parser/AST`** only
+  — no checker, no runtime — startable NOW, fully parallel with everything else (its own namespace,
+  `src/fmt/*.tks`, touches no single-owner bottleneck file).
+- **NET_CRYPTO** (`teko::net` + `teko::crypto` + `teko::encoding` + `teko::compress`) — **splits into two
+  halves by dependency shape.** The **pure-Teko half** — `S-JSON`/`S-XML`/`S-PB`/`S-ASN1`/`S-YAML`/
+  `S-TOML` (all `Deps: none`), `Z-DEFLATE`/`Z-BROTLI`/`Z-LZMA`/`Z-ZSTD` (all `Deps: none`), and `C0`/`C1`/
+  `C4`/`C6` (crypto core/hash/cipher/rand, gated only on **N-KEYSTONE**, itself `Deps: none`) — is
+  **startable NOW on disjoint namespaces** (`src/crypto/*`, `src/encoding/*`, `src/compress/*` don't
+  collide with the OOP-round compiler files). The **socket half** (`N0`/`N1`/`N2`/`N3`… real TCP/TLS/HTTP)
+  needs **N-KEYSTONE** landed as part of **LIB-KEYSTONES** (ROUND 4) before it can move — sequenced there,
+  ROUND 4/5.
+- **PACKAGES** (registry + resolver + `teko::pkg`) — **`PK0`** (`Deps: manifest parser` — already exists)
+  is startable **NOW**. **`PK1`** (semver) additionally needs `teko::math` (compare) — i.e. **after MATH
+  M0**. **`PK4`+** (fetch/registry/verify/CLI/pre-linker) need net (**N5 HTTP**), so they wait on
+  NET_CRYPTO's socket half — placed **after N5 HTTP** lands.
+- **DB** (`teko::db::*` + on-demand FFI linking) — **`DB0`** (the common surface) is `Deps: STDLIB io
+  (nice-to-have), net N1 (tcp)` — i.e. **after N1 tcp**. **`DB-KEYSTONE`** (the compiler-side extern-
+  reachability unit) is the piece folded into **LIB-KEYSTONES** (ROUND 4) alongside N-KEYSTONE — see the
+  combined-crumb note under ROUND 4 above.
+- **WEB** (`teko::web` + `teko::auth` + API standards) — **`W0`** (router/middleware) is `Deps: net N5
+  (http), stdlib io` — **after N5**. **`W8`** (typed binding+validation) is `Deps: W0, encoding, TRAITS
+  (Json/structural)` — **gated on ROUND 3.5's TR4** (Json trait). **`W9`** (OpenAPI generation) is `Deps:
+  W0, W8, TRAITS(schema), doc-comments` — **gated on ROUND 3.5's TR5** (schema trait), which is why TR5 was
+  placed "before WEB Stage B" rather than before ROUND 5 (see the ROUND 3.5 TR5 note above).
+- **CLOUD_NATIVE** (12-factor operations) — **`CN1`** (`teko::log`) is `Deps: teko::io, encoding(JSON),
+  teko::time` — needs only `io` + `time` (both already exist / land early via STDLIB_CORE), so it can start
+  **early**, well ahead of the OOP-gated units. **`CN0`** (`teko::config`) is `Deps: teko::env (Map),
+  encoding` — **needs `Map`**, i.e. **ROUND 4** collections. **`CN7`** (`teko::cron` + jobs) is `Deps:
+  teko::time, async (S8), teko::resilience` — a **hard dependency on S8/async, ROUND 5**. **`CN5`**
+  (graceful shutdown + signals) is **flagged, not resolved**: its doc text ties the shutdown `Context` to
+  "the async cancellation model" (`teko::Context`, itself a ROUND 5 async sub-part) without stating whether
+  `CN5` is shippable standalone (`#os` signal externs + a plain drain loop, no `Context` needed) or whether
+  it must wait for ROUND 5's `teko::Context` to exist — **open flag: confirm CN5 is shippable without
+  `teko::Context`, else it moves to T3 (ROUND 5-adjacent) rather than being an early win.**
 
 ### DEFERRED · BLOCKED · KNOWN LIMITATIONS (the single consolidated list — everything `⏸️`/`🚧`/`⚠️`)
 
