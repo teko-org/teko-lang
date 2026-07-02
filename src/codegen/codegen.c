@@ -644,6 +644,13 @@ static bool cg_te_reaches_byvalue(tk_type_expr te, tk_str to, cg_nameset *seen) 
         case TK_TEXPR_NAMED: {
             tk_str base = te.as.named.path.segments[te.as.named.path.len - 1].name;
             if (cg_is_prim_name(base)) return false;
+            // (#122) a CLASS is a REFERENCE type — every use lowers to a POINTER (emit_type_expr),
+            // so a class-named edge (`C`, `C?`, `C` inside a variant) is a POINTER edge, not a
+            // by-value one; it can NEVER close a by-value size cycle. Treat it like a slice. Without
+            // this, a self-referencing class-optional field (`next: Node?` on class `Node`) is
+            // wrongly flagged boxed → the field becomes `tk_opt_Node *` while every construct/read
+            // site emits it by value (`tk_opt_Node`), and cc rejects the pointer/value mismatch (#122).
+            if (cg_is_class_named(base)) return false;
             // (S4) a generic-type USE reaches its concrete instance `Box__g__i64`, not the template.
             tk_str y = base; cbuf k = { NULL, 0, 0 };
             if (te.as.named.args_len > 0) { cg_texpr_mangle(&k, te); y = (tk_str){ (const tk_byte *)k.ptr, k.len }; }
@@ -691,19 +698,38 @@ static bool cg_field_boxed(tk_str sname, tk_type_expr fte) {
     return cg_te_reaches_byvalue(fte, sname, &seen);   // does the field's by-value content reach back?
 }
 
-// Look up the declared type_expr of field `fname` in struct named `sname` from g_cg_prog.
-// Returns true + sets *out if found; false if the struct or field is absent.
+// Look up the declared type_expr of field `fname` in aggregate named `sname` from g_cg_prog.
+// Returns true + sets *out if found; false if the aggregate or field is absent.
+// (#122) A CLASS (TK_BODY_CLASS) shares the struct field layout, so its fields are looked up
+// here too — otherwise a class field's null/sentinel initializer (`f = null`, `f = []`) never
+// finds its declared `T?`/`[]T` slot type and falls through to the raw-`null` codegen error.
+// Classes use the EFFECTIVE (base-inherited) field set so an optional field declared on an
+// ancestor is found from a derived class's construction — matching emit_type_decl's class body.
 static bool cg_find_struct_field_type(tk_str sname, tk_str fname, tk_type_expr *out) {
     for (size_t i = 0; i < g_cg_prog.nitems; i += 1) {
         if (g_cg_prog.items[i].tag != TK_TITEM_TYPE_DECL) continue;
         const tk_type_decl *d = &g_cg_prog.items[i].as.type_decl;
-        if (d->body.tag != TK_BODY_STRUCT) continue;
         if (!cg_name_eq(d->name, sname)) continue;
-        for (size_t j = 0; j < d->body.as.struct_body.n_fields; j += 1) {
-            if (cg_name_eq(d->body.as.struct_body.fields[j].name, fname)) {
-                *out = d->body.as.struct_body.fields[j].type_ann;
-                return true;
+        if (d->body.tag == TK_BODY_STRUCT) {
+            for (size_t j = 0; j < d->body.as.struct_body.n_fields; j += 1) {
+                if (cg_name_eq(d->body.as.struct_body.fields[j].name, fname)) {
+                    *out = d->body.as.struct_body.fields[j].type_ann;
+                    return true;
+                }
             }
+            return false;
+        }
+        if (d->body.tag == TK_BODY_CLASS) {
+            tk_type_table table = tk_type_table_of(g_cg_prog);
+            tk_fieldsvec_result eff = tk_effective_class_fields(d->body.as.class_body, table);
+            if (!eff.ok) return false;
+            for (size_t j = 0; j < eff.as.value.len; j += 1) {
+                if (cg_name_eq(eff.as.value.ptr[j].name, fname)) {
+                    *out = eff.as.value.ptr[j].type_ann;
+                    return true;
+                }
+            }
+            return false;
         }
     }
     return false;
@@ -4928,7 +4954,13 @@ static bool cg_uvar_emitted_key(cg_typenodes *N, cbuf key) {
 // By-value readiness of a resolved type (an opt inner / a variant member tk_type).
 static bool cg_type_ready(cg_typenodes *N, tk_type t) {
     switch (t.tag) {
-        case TK_TYPE_NAMED: return cg_named_emitted(N, t.as.named.name);
+        // (#122) a CLASS inner is stored as a POINTER (`tk_t_C *`) inside a `tk_opt_C`/variant, so
+        // it needs only the forward typedef (always present) — READY like a slice. Requiring the
+        // full class body would deadlock the fixpoint: `tk_t_Node`'s by-value `Node?` field needs
+        // `tk_opt_Node` first, and `tk_opt_Node`'s `Node` value would need `tk_t_Node` first.
+        case TK_TYPE_NAMED:
+            if (cg_is_class_named(t.as.named.name)) return true;
+            return cg_named_emitted(N, t.as.named.name);
         case TK_TYPE_OPTIONAL: {
             if (t.as.optional.inner == NULL) return true;
             cbuf k = { NULL, 0, 0 }; cg_key_type(&k, *t.as.optional.inner);
@@ -4951,6 +4983,11 @@ static bool cg_texpr_ready(cg_typenodes *N, tk_type_expr te) {
                                            "i128","f16","f32","f64","bool","byte","str","error" };
             for (size_t i = 0; i < sizeof prims / sizeof *prims; i += 1)
                 if (seg_is(base, prims[i])) return true;   // builtin scalar → ready
+            // (#122) a CLASS field is a POINTER (`tk_t_C *`) — it only needs the forward typedef
+            // (always present by this pass), never the full body. So it is READY like a slice; a
+            // recursive class-optional (`Node?` inside class `Node`) would otherwise be an
+            // unbreakable by-value cycle here even though the C layout is finite.
+            if (cg_is_class_named(base)) return true;
             // (S4) a generic-type USE `Box<i64>` depends on the concrete instance, not the template.
             if (te.as.named.args_len == 0) return cg_named_emitted(N, base);
             cbuf k = { NULL, 0, 0 }; cg_texpr_mangle(&k, te);
@@ -4989,7 +5026,21 @@ static bool cg_named_ready(cg_typenodes *N, tk_type_decl d) {
                 if (!cg_texpr_ready(N, vt.as.uni.members[i])) return false;
         return true;
     }
-    return true;   // enum / alias — no by-value dependency
+    // (#122) a CLASS body has the same C layout as a struct (its EFFECTIVE, base-inherited fields
+    // laid out by value), so its BY-VALUE field deps (e.g. a `Node?` optional wrapping a class
+    // POINTER → `tk_opt_Node`) must be emitted first. Without this a class body is emitted before
+    // the `tk_opt_<inner>` it embeds is defined → cc errors "field has incomplete type". A
+    // class-named field is itself a pointer (cg_texpr_ready returns ready), so a self-cycle through
+    // a plain class reference stays breakable; only the by-value optional/variant wrappers gate here.
+    if (d.body.tag == TK_BODY_CLASS) {
+        tk_type_table table = tk_type_table_of(g_cg_prog);
+        tk_fieldsvec_result eff = tk_effective_class_fields(d.body.as.class_body, table);
+        if (!eff.ok) return true;   // inheritance error surfaces at body emission; don't stall here
+        for (size_t i = 0; i < eff.as.value.len; i += 1)
+            if (!cg_texpr_ready(N, eff.as.value.ptr[i].type_ann)) return false;
+        return true;
+    }
+    return true;   // enum / alias / interface / trait — no by-value dependency
 }
 
 // Replaces the old program-order body emission + cg_emit_optional_typedefs: emit slices first

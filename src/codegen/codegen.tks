@@ -582,6 +582,13 @@ fn cg_te_reaches_byvalue(prog: checker::TProgram, te: parser::TypeExpr, to: str,
         parser::NamedType as nt => {
             let base = nt.path.segments[nt.path.segments.len - 1].name
             if cg_is_prim_name(base) { return false }
+            // (#122) a CLASS is a REFERENCE type — every use lowers to a POINTER (emit_type_expr),
+            // so a class-named edge (`C`, `C?`, `C` inside a variant) is a POINTER edge, not a
+            // by-value one; it can NEVER close a by-value size cycle. Treat it like a slice. Without
+            // this, a self-referencing class-optional field (`next: Node?` on class `Node`) is
+            // wrongly flagged boxed → the field becomes `tk_opt_Node *` while every construct/read
+            // site emits it by value (`tk_opt_Node`), and cc rejects the pointer/value mismatch.
+            if cg_is_class_named(prog, base) { return false }
             // (S4) a generic-type USE reaches its concrete instance `Box__g__i64`, not the template.
             let y = if nt.args.len == 0 { base } else { cg_texpr_inst_name(base, nt.args) }
             if y == to { return true }
@@ -2465,8 +2472,13 @@ fn emit_interp(buf: []byte, prog: checker::TProgram, in: checker::TInterp, escap
     out
 }
 
-// cg_find_struct_field_type — look up the declared TypeExpr of field `fname` in the struct
+// cg_find_struct_field_type — look up the declared TypeExpr of field `fname` in the aggregate
 // named `sname` from the program's type declarations. Returns the TypeExpr? (null if absent).
+// (#122) A CLASS (ClassBody) shares the struct field layout, so its fields are looked up here
+// too — otherwise a class field's null/sentinel initializer (`f = null`, `f = []`) never finds
+// its declared `T?`/`[]T` slot type and falls through to the raw-`null` codegen error. Classes
+// use the EFFECTIVE (base-inherited) field set so an optional field declared on an ancestor is
+// found from a derived class's construction — matching emit_type_decl's class body.
 // (C: cg_find_struct_field_type.)
 fn cg_find_struct_field_type(prog: checker::TProgram, sname: str, fname: str) -> parser::TypeExpr? {
     mut i = 0
@@ -2474,9 +2486,9 @@ fn cg_find_struct_field_type(prog: checker::TProgram, sname: str, fname: str) ->
         if i >= prog.items.len { break }
         match prog.items[i] {
             parser::TypeDecl as d => {
-                match d.body {
-                    parser::StructBody as sb => {
-                        if d.name == sname {
+                if d.name == sname {
+                    match d.body {
+                        parser::StructBody as sb => {
                             mut j = 0
                             loop {
                                 if j >= sb.fields.len { break }
@@ -2484,8 +2496,18 @@ fn cg_find_struct_field_type(prog: checker::TProgram, sname: str, fname: str) ->
                                 j++
                             }
                         }
+                        parser::ClassBody as cb2 => {
+                            let table = checker::type_table_of(prog)
+                            let fields = match checker::effective_class_fields(cb2, table) { []parser::Field as fs => fs; error => return null }
+                            mut j = 0
+                            loop {
+                                if j >= fields.len { break }
+                                if fields[j].name == fname { return fields[j].type_ann }
+                                j++
+                            }
+                        }
+                        _ => { }
                     }
-                    _ => { }
                 }
             }
             _ => { }
@@ -5823,9 +5845,13 @@ fn cg_uvar_emitted_key(em: CgEmitted, set: CgTypeSet, key: str) -> bool {
     cg_str_in(em.uvar_keys, key)
 }
 // By-value readiness of a resolved type (an opt inner / a variant member tk_type).
-fn cg_type_ready(em: CgEmitted, set: CgTypeSet, t: checker::Type) -> bool {
+fn cg_type_ready(prog: checker::TProgram, em: CgEmitted, set: CgTypeSet, t: checker::Type) -> bool {
     match t {
-        checker::Named as nm => cg_named_emitted(em, nm.name)
+        // (#122) a CLASS inner is stored as a POINTER (`tk_t_C *`) inside a `tk_opt_C`/variant, so
+        // it needs only the forward typedef (always present) — READY like a slice. Requiring the
+        // full class body would deadlock the fixpoint: `tk_t_Node`'s by-value `Node?` field needs
+        // `tk_opt_Node` first, and `tk_opt_Node`'s `Node` value would need `tk_t_Node` first.
+        checker::Named as nm => if cg_is_class_named(prog, nm.name) { true } else { cg_named_emitted(em, nm.name) }
         checker::Optional as opt => match opt.inner {
             checker::Void => true
             _ => cg_opt_emitted_key(em, set, cg_opt_key(opt.inner))
@@ -5844,11 +5870,16 @@ fn cg_is_builtin_scalar(last: str) -> bool {
     last == "Ref"   // (MEM-1b) Ref<T> lowers to a pointer → no by-value aggregate edge
 }
 // By-value readiness of a field/member SYNTACTIC type-expr (struct field / variant member).
-fn cg_texpr_ready(em: CgEmitted, set: CgTypeSet, te: parser::TypeExpr) -> bool {
+fn cg_texpr_ready(prog: checker::TProgram, em: CgEmitted, set: CgTypeSet, te: parser::TypeExpr) -> bool {
     match te {
         parser::NamedType as nt => {
             let base = nt.path.segments[nt.path.segments.len - 1].name
             if cg_is_builtin_scalar(base) { return true }   // builtin scalar → ready
+            // (#122) a CLASS field is a POINTER (`tk_t_C *`) — it only needs the forward typedef
+            // (always present by this pass), never the full body. So it is READY like a slice; a
+            // recursive class-optional (`Node?` inside class `Node`) would otherwise be an
+            // unbreakable by-value cycle here even though the C layout is finite.
+            if cg_is_class_named(prog, base) { return true }
             // (S4) a generic-type USE `Box<i64>` depends on the concrete instance `Box__g__i64`, not
             // the (dropped) template `Box` — gate on the instance name.
             let last = if nt.args.len == 0 { base } else { cg_texpr_inst_name(base, nt.args) }
@@ -5870,7 +5901,7 @@ fn cg_named_ready(prog: checker::TProgram, em: CgEmitted, set: CgTypeSet, d: par
                 // a boxed (recursive back-edge) field is a POINTER — needs only a forward typedef,
                 // so it is NOT a by-value dependency (this is what breaks the cycle for the fixpoint).
                 if cg_field_boxed(prog, d.name, sb.fields[i].type_ann) { i++ } else {
-                    if !cg_texpr_ready(em, set, sb.fields[i].type_ann) { return false }
+                    if !cg_texpr_ready(prog, em, set, sb.fields[i].type_ann) { return false }
                     i++
                 }
             }
@@ -5881,14 +5912,31 @@ fn cg_named_ready(prog: checker::TProgram, em: CgEmitted, set: CgTypeSet, d: par
                 mut i = 0
                 loop {
                     if i >= u.members.len { break }
-                    if !cg_texpr_ready(em, set, u.members[i]) { return false }
+                    if !cg_texpr_ready(prog, em, set, u.members[i]) { return false }
                     i++
                 }
                 true
             }
             _ => true
         }
-        _ => true   // enum / alias — no by-value dependency
+        // (#122) a CLASS body has the same C layout as a struct (its EFFECTIVE, base-inherited
+        // fields laid out by value), so its BY-VALUE field deps (e.g. a `Node?` optional wrapping
+        // a class POINTER → `tk_opt_Node`) must be emitted first. Without this a class body is
+        // emitted before the `tk_opt_<inner>` it embeds is defined → cc errors "incomplete type".
+        // A class-named field is itself a pointer (cg_texpr_ready returns ready), so a self-cycle
+        // through a plain class reference stays breakable; only by-value wrappers gate here.
+        parser::ClassBody as cb2 => {
+            let table = checker::type_table_of(prog)
+            let fields = match checker::effective_class_fields(cb2, table) { []parser::Field as fs => fs; error => return true }
+            mut i = 0
+            loop {
+                if i >= fields.len { break }
+                if !cg_texpr_ready(prog, em, set, fields[i].type_ann) { return false }
+                i++
+            }
+            true
+        }
+        _ => true   // enum / alias / interface / trait — no by-value dependency
     }
 }
 
@@ -6076,7 +6124,7 @@ fn cg_emit_types_ordered(buf: []byte, prog: checker::TProgram) -> []byte | error
             let inner = set.inners[oi]
             let okey = cg_opt_key(inner)
             if cg_str_in(em.opt_keys, okey) { oi++ } else {
-                if !cg_type_ready(em, set, inner) { oi++ } else {
+                if !cg_type_ready(prog, em, set, inner) { oi++ } else {
                     out = cb(out, "typedef struct ")   // named tag (matches the forward decl) so a pointer to it resolves
                     out = match cg_opt_typename(out, inner) { []byte as o => o; error as err => return err }
                     out = cb(out, " { bool present; ")
@@ -6105,7 +6153,7 @@ fn cg_emit_types_ordered(buf: []byte, prog: checker::TProgram) -> []byte | error
                         mut m = 0
                         loop {
                             if m >= va.members.len { break }
-                            if !cg_type_ready(em, set, va.members[m]) { ready = false; break }
+                            if !cg_type_ready(prog, em, set, va.members[m]) { ready = false; break }
                             m++
                         }
                     }

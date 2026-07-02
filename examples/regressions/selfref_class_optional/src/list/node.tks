@@ -1,0 +1,48 @@
+// (#122) a self-referencing class: `next: Node?` is a class-optional field. `next = null` at
+// construction, `set_next` writes a present link, and `sum` walks the chain through safe field
+// access (`n?.value`) + `??` coalescing — all paths the VM already handles, differentially
+// pinned against native.
+
+pub type Node = class {
+    pub value: i64
+    pub next: Node?
+
+    // construct a tail node (next = null — the class-optional null-init that reached the
+    // raw-`null` native codegen error before #122).
+    pub fn make(v: i64) -> Node {
+        Node { value = v; next = null }
+    }
+
+    // link `n` after `self`: `self.next = n` writes a PRESENT class-optional (the pointer/value
+    // path that hit the tk_opt_Node* vs tk_opt_Node mismatch before #122).
+    pub fn set_next(self, n: Node) {
+        self.next = n
+    }
+}
+
+// walk the chain summing values. `cur?.value ?? 0` reads through the class-optional; the next
+// pointer is followed by re-binding to `cur.next` (also a class-optional). A fixed 8-iteration
+// cap keeps it a plain `loop` (Teko has no while/for) with a definite bound.
+pub fn sum(head: Node) -> i64 {
+    mut total = 0
+    mut cur = head.next   // Node? — start after head so we exercise the optional both present+absent
+    total = total + head.value
+    mut steps = 0
+    loop {
+        if steps >= 8 { break }
+        total = total + (cur?.value ?? 0)
+        cur = cur?.next ?? null
+        steps = steps + 1
+    }
+    total
+}
+
+pub fn run() -> i64 {
+    let a = Node::make(1)
+    let b = Node::make(2)
+    let c = Node::make(3)
+    a.set_next(b)
+    b.set_next(c)
+    // chain 1 -> 2 -> 3, tail next = null. sum = 1 + 2 + 3 = 6.
+    sum(a)
+}

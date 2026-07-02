@@ -1046,6 +1046,48 @@ fn cgt_byvalue_boxed_variant() {
     teko::assert::is_false(cg_variant_has_member(vdecl, "unknown"))
 }
 
+// (#122) a self-referencing CLASS with a `next: Node?` field. A class is pointer-lowered, so the
+// optional-of-class edge is a POINTER edge (never a by-value size cycle): the field must NOT be
+// boxed, and cg_find_struct_field_type must find the class field's declared `Node?` type (so a
+// `next = null` construction lowers to `(tk_opt_Node){ .present = false }`, not the raw-`null`
+// codegen error). Regression guard for the two native-only symptoms in issue #122.
+#test
+fn cgt_selfref_class_optional_field() {
+    // type Node = class { value: i64; next: Node? }
+    let f_value = parser::Field { name = "value"; type_ann = cgt_named_te("i64"); vis = parser::Visibility::Pub; is_intern = false }
+    let next_te = parser::OptionalType { inner = cgt_named_te("Node") }
+    let f_next  = parser::Field { name = "next"; type_ann = next_te; vis = parser::Visibility::Pub; is_intern = false }
+    let fields: []parser::Field = teko::list::push(teko::list::push(teko::list::empty(), f_value), f_next)
+    let cbody = parser::ClassBody {
+        kind = parser::ClassKind::Sealed
+        has_base = false; base_name = ""; has_base_binding = false; base_binding_name = ""
+        implements = teko::list::empty()
+        fields = fields
+        methods = teko::list::empty()
+    }
+    let cdecl = parser::TypeDecl { name = "Node"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = cbody; vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 0; col = 0 }
+    let prog = checker::TProgram { items = teko::list::push(teko::list::empty(), cdecl) }
+
+    // the class IS recognized as a class (reference type)
+    teko::assert::is_true(cg_is_class_named(prog, "Node"))
+
+    // the self-referencing class-optional field is a POINTER edge → NOT boxed
+    teko::assert::is_false(cg_field_boxed(prog, "Node", next_te))
+    // reachability stops at the class name (no by-value cycle back to Node)
+    teko::assert::is_false(cg_te_reaches_byvalue(prog, next_te, "Node", teko::list::empty()))
+
+    // the class field's declared `Node?` type IS found (drives the null-init lowering)
+    match cg_find_struct_field_type(prog, "Node", "next") {
+        parser::OptionalType => teko::assert::is_true(true)
+        _ => teko::assert::is_true(false)   // must be the OptionalType, never null/other
+    }
+    // a non-optional class field is found too
+    match cg_find_struct_field_type(prog, "Node", "value") {
+        parser::NamedType => teko::assert::is_true(true)
+        _ => teko::assert::is_true(false)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Group Q: emit_call, emit_list_empty, get_push_elem, emit_list_push,
 //           emit_field_access (slice.len + Named receiver → cg_find_struct_field_type)
