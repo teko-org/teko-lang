@@ -638,6 +638,21 @@ static bool float_fits(double v, tk_prim_kind k) { (void)v; return tk_prim_is_fl
 // i64 — Side D); a non-literal mismatch or out-of-range literal is rejected. NULL = ok.
 // Used by the typed type_binding in typer.c (reuses value_fits).
 const char *annotated_literal_reason(tk_expr value, tk_type ann) {
+    // an ARRAY LITERAL `[e0, e1, …]` annotated as `[]E` — adopts element-wise: every non-spread
+    // element must itself be a fitting bare literal for E (recurses through nested arrays/
+    // match/if via this same function). A spread element (`..xs`) is already a `[]T` value, not
+    // a literal — skip it here (its own widen/adopt was checked at array-literal typing time).
+    // Mirrors tk_literal_adopts's TK_TEXPR_ARRAY case (the range-check side), which already
+    // recurses this way; this is the RETYPING side's twin so `let a: []u8 = [1,2,3]` (#71).
+    if (value.tag == TK_EXPR_ARRAY) {
+        if (ann.tag != TK_TYPE_SLICE || ann.as.slice.element == NULL) return "value type does not match annotation";
+        for (size_t i = 0; i < value.as.array.nelements; i += 1) {
+            if (value.as.array.elements[i].is_spread) continue;
+            const char *why = annotated_literal_reason(*value.as.array.elements[i].expr, *ann.as.slice.element);
+            if (why != NULL) return why;
+        }
+        return NULL;
+    }
     // a NEGATIVE numeric literal `-N` (unary minus over a NUMBER) — adopts a SIGNED int annotation
     // that N fits, or a float annotation for `-3.14` (parse_lit's `mut d: i128 = -1`).
     if (value.tag == TK_EXPR_UNARY && value.as.unary.op == TK_TOKEN_MINUS
@@ -750,6 +765,25 @@ bool tk_literal_adopts(tk_texpr e, tk_type to) {
         return true;
     }
     return false;
+}
+
+// (#71) RETYPE a value that tk_literal_adopts(e, to) already accepted — the retyping twin of the
+// range-check above. A plain leaf (number/match/if trailing) adopts by taking `to` wholesale (the
+// existing single-site behavior at every adoption call site: binding/assign/arg/struct-field). An
+// ARRAY LITERAL instead retypes ELEMENT-WISE: each non-spread element recurses into the slice's
+// element type (so a nested array-of-arrays retypes at every depth), and the array's own `.type`
+// becomes `to` — mirrors tk_literal_adopts's recursion structure exactly, one level deeper (it
+// mutates the ALREADY-TYPED tree in place rather than just reporting fit). A spread element is
+// already a concrete `[]T` — left untouched (its own widen was checked at array-literal typing
+// time, same as the read side above).
+void tk_retype_literal(tk_texpr *e, tk_type to) {
+    if (e->tag == TK_TEXPR_ARRAY && to.tag == TK_TYPE_SLICE && to.as.slice.element != NULL) {
+        for (size_t i = 0; i < e->as.array.nelements; i += 1) {
+            if (e->as.array.is_spread && e->as.array.is_spread[i]) continue;
+            tk_retype_literal(&e->as.array.elements[i], *to.as.slice.element);
+        }
+    }
+    e->type = to;
 }
 
 // (E7) is `t` a NAMED type whose declaration is an `enum`?

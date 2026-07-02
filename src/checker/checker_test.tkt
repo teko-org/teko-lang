@@ -462,6 +462,73 @@ fn annotated_literal() {
     match type_binding(b3, env, empty_table()) { TypedStmt => teko::assert::is_true(false); error => teko::assert::is_true(true) }
 }
 
+fn arr_elems3(v0: i128, v1: i128, v2: i128) -> parser::ArrayLit {
+    mut es: []parser::ArrayElem = teko::list::empty()
+    es = teko::list::push(es, parser::ArrayElem { is_spread = false; expr = e_num(v0) })
+    es = teko::list::push(es, parser::ArrayElem { is_spread = false; expr = e_num(v1) })
+    es = teko::list::push(es, parser::ArrayElem { is_spread = false; expr = e_num(v2) })
+    parser::ArrayLit { elements = es }
+}
+
+// (#71) `annotated_literal_ok` over an ARRAY LITERAL `[1, 2, 3]` against a PRE-BUILT `[]u8` Type
+// (constructed directly — NOT via resolve_type on a hand-built nested parser::SliceType AST node,
+// which hits a known VM-only latent bug: single-field wrapper TypeExpr variants like SliceType
+// get transparent-field-descended into their FIRST-declared inner arm by the VM's pat_match, so
+// `resolve_type(SliceType{element: NamedType{"u8"}}, …)` misresolves under `teko test`/the .tkt
+// runner to the element's own resolve (Prim{U8}) instead of wrapping it in Slice — see
+// [[teko-vm-wrapper-descent-bug]]; NATIVE resolve_type is unaffected, proven by the real
+// examples/regressions/array_literal_narrow_binding differential fixture, which type-checks and
+// runs correctly on BOTH engines end-to-end through the real parser). Testing annotated_literal_ok
+// directly with a pre-built Type sidesteps that unrelated VM quirk entirely.
+// EVERY non-spread element must itself be a fitting literal for u8; NULL = all adopt.
+#test
+fn annotated_array_literal_ok_recurses_element_wise() {
+    let u8_slice: Type = Slice { element = Prim { kind = PrimKind::U8 } }
+    match annotated_literal_ok(ek(arr_elems3(1, 2, 3)), u8_slice) { null => teko::assert::is_true(true); error => teko::assert::is_true(false) }
+    // (#71) out-of-range element: `[1, 300, 3]` against []u8 must remain a compile ERROR (adoption
+    // is gated by the SAME per-element range check as the scalar case — value_fits).
+    match annotated_literal_ok(ek(arr_elems3(1, 300, 3)), u8_slice) { null => teko::assert::is_true(false); error => teko::assert::is_true(true) }
+    // a non-slice annotation over an array literal is rejected outright.
+    match annotated_literal_ok(ek(arr_elems3(1, 2, 3)), Prim { kind = PrimKind::U8 }) { null => teko::assert::is_true(false); error => teko::assert::is_true(true) }
+}
+
+// (#71) `retype_literal` over a checked `[1, 2, 3]` TArrayLit RECURSES element-wise: the array's
+// own `.type` becomes the target slice AND every element leaf is individually retyped to the
+// element type — not just the array's outer `.type` (the #68 mechanism only retyped the top-level
+// leaf; #71 extends it one level into array elements). Built directly on typed nodes (TExpr/
+// TArrayLit/TArrayElem), bypassing type_binding/resolve_type entirely (same VM-safety rationale
+// as the annotated_literal_ok test above).
+#test
+fn retype_literal_recurses_into_array_elements() {
+    let i64_elem: Type = i64t()
+    let e0 = tnum(1)
+    let e1 = tnum(2)
+    let elems: []TArrayElem = teko::list::push(teko::list::push(teko::list::empty(), TArrayElem { is_spread = false; expr = e0 }), TArrayElem { is_spread = false; expr = e1 })
+    let arr = TExpr { kind = TArrayLit { elements = elems }; type = Slice { element = i64_elem }; line = 0; col = 0 }
+    let u8_slice: Type = Slice { element = Prim { kind = PrimKind::U8 } }
+    let retyped = retype_literal(arr, u8_slice)
+    // the array's own .type is now []u8
+    match retyped.type { Slice as s => teko::assert::is_true(prim_is(s.element, PrimKind::U8)); _ => teko::assert::is_true(false) }
+    // EVERY element leaf is retyped to u8 individually — the actual #71 gap (#68 only retyped the
+    // array's own .type, not the elements inside it).
+    match retyped.kind {
+        TArrayLit as al => {
+            teko::assert::is_true(al.elements.len == 2)
+            teko::assert::is_true(prim_is(al.elements[0].expr.type, PrimKind::U8))
+            teko::assert::is_true(prim_is(al.elements[1].expr.type, PrimKind::U8))
+        }
+        _ => teko::assert::is_true(false)
+    }
+}
+
+// (#71) control — a PLAIN (non-array) leaf still retypes wholesale, unchanged from #68's behavior
+// (retype_literal's non-TArrayLit branch).
+#test
+fn retype_literal_plain_leaf_unchanged_from_68() {
+    let retyped = retype_literal(tnum(1), Prim { kind = PrimKind::U8 })
+    teko::assert::is_true(prim_is(retyped.type, PrimKind::U8))
+}
+
 #test
 fn return_type_checks() {
     let body1 = one_stmt(e_var("x"))

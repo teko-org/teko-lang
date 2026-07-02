@@ -44,5 +44,9 @@ const char *annotated_literal_reason(tk_expr value, tk_type ann);
 // C6 (extended) — a fitting numeric literal adopts the destination type (return/trailing/binding);
 // int-literal → a prim it fits or `byte` (=u8); float-literal → a fitting float prim. Over the TYPED node.
 bool tk_literal_adopts(tk_texpr e, tk_type to);
+// (#71) retype a value tk_literal_adopts already accepted — RECURSES into an array literal's
+// elements (element-wise, so `[]u8 = [1,2,3]` narrows each leaf, not just the array's own type).
+// A non-array leaf takes `to` wholesale (the existing shallow behavior). Mutates `*e` in place.
+void tk_retype_literal(tk_texpr *e, tk_type to);
 
 #endif // TK_CHECK_EXPR_H
