@@ -216,6 +216,18 @@ tk_texpr tk_read_texpr(tk_reader *r, tk_strs t) {
             return e;
         }
         case 23: e.tag = TK_TEXPR_CHAR; e.as.char_lit.bytes = tk_read_str(r, t); return e;   // (UTF-8 increment 1) tag 23 = char literal
+        case 24: {   // (W10b.D3) DYNAMIC contract-method call: path + method Func + vtable slot + args
+            e.tag = TK_TEXPR_CALL;
+            uint32_t np = tk_read_u32(r); tk_segment *segs = tk_alloc((np ? np : 1) * sizeof *segs); if (!segs) abort();
+            for (uint32_t i = 0; i < np; i += 1) segs[i].name = tk_read_str(r, t);
+            e.as.call.callee = (tk_path){ segs, np };
+            e.as.call.callee_type = tk_read_type(r, t);
+            e.as.call.iface_slot = tk_read_u32(r);
+            e.as.call.is_iface_dispatch = true;
+            uint32_t na = tk_read_u32(r); tk_texpr *as = tk_alloc((na ? na : 1) * sizeof *as); if (!as) abort();
+            for (uint32_t i = 0; i < na; i += 1) as[i] = tk_read_texpr(r, t);
+            e.as.call.args = as; e.as.call.nargs = na; return e;
+        }
     }
     r->ok = false; return e;
 }

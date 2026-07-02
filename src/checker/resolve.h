@@ -44,6 +44,14 @@ tk_type tk_expand_variant(tk_type t, tk_type_table table);
 // and `Type | error` join to `Type | error`); false when incompatible (out set only on success).
 bool tk_widens_into(tk_type from, tk_type to, tk_type_table table);
 bool tk_type_join(tk_type a, tk_type b, tk_type_table table, tk_type *out);
+
+// (W10b.D3) nominal contract conformance — the interface-value upcast gate (tk_widens_into's
+// class→interface rule) and the `<T: I>` constraint gate (monomorph). Kind probes are by decl
+// tag; `tk_type_conforms_to` walks declared `implements` through the class base chain and the
+// contract's `extends` closure (declared conformance only — nominal, closed-world).
+bool tk_is_interface_name(tk_str name, tk_type_table table);
+bool tk_is_class_name(tk_str name, tk_type_table table);
+bool tk_type_conforms_to(tk_str name, tk_str iface, tk_type_table table);
 // (#83) does `t` carry a SENTINEL slice/optional (element/inner == NULL) anywhere, incl. nested
 // (`[]NULL`, `[][]NULL`, `(NULL)?`, …)? Shared by tk_type_join's concrete-preference tie-break and
 // by array-literal element retyping (expr.c::type_array_lit) once the joined element is concrete.

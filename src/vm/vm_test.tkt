@@ -946,3 +946,145 @@ fn fallible_factory_nested_holds() {
     let msg = match bad { VmCounterPair => ""; error as e => e.message }
     teko::assert::is_true(msg == "negative start")
 }
+
+// ── OOP ROUND 3 / D3 — DYNAMIC dispatch (interface values + vtable) ─────────────────────────
+// An interface-typed VALUE dispatches to the CONCRETE class's method at runtime: natively a
+// data+vtable fat pointer, in the VM the ClassRef cell itself (the payload's class name picks
+// the method). These run in BOTH engines' VMs via the test gate; the native lowering is locked
+// by examples/regressions/interface_dispatch (differential, VM == native).
+
+type VmShape = interface {
+    fn area(self) -> i64
+    fn grown(self, extra: i64) -> i64
+}
+
+type VmNamedShape = interface VmShape {
+    fn shape_name(self) -> str
+}
+
+type VmCircleD3 = class & VmShape {
+    pub r: i64
+    pub fn make(rr: i64) -> VmCircleD3 { VmCircleD3 { r = rr } }
+    pub fn area(self) -> i64 { self.r * self.r * 3 }
+    pub fn grown(self, extra: i64) -> i64 { self.area() + extra }
+}
+
+type VmSquareD3 = class & VmNamedShape {
+    pub side: i64
+    pub fn make(s: i64) -> VmSquareD3 { VmSquareD3 { side = s } }
+    pub fn area(self) -> i64 { self.side * self.side }
+    pub fn grown(self, extra: i64) -> i64 { self.area() + extra }
+    pub fn shape_name(self) -> str { "square" }
+}
+
+type VmSpeaker = interface {
+    fn speak(self) -> str
+}
+
+type VmAnimalD3 = virtual class & VmSpeaker {
+    pub legs: i64
+    pub fn make_animal(n: i64) -> VmAnimalD3 { VmAnimalD3 { legs = n } }
+    pub virtual fn speak(self) -> str { "..." }
+}
+
+type VmDogD3 = class VmAnimalD3 {
+    pub fn make_dog() -> VmDogD3 { VmDogD3 { legs = 4 } }
+    pub override fn speak(self) -> str { "woof" }
+}
+
+// interface value as a PARAM — the call upcasts a class arg on the fly.
+fn vm_shape_area(s: VmShape) -> i64 { s.area() }
+
+// interface value as a RETURN — the return position upcasts the concrete class.
+fn vm_pick_shape(which: i64) -> VmShape {
+    if which == 0 { return VmCircleD3::make(1) }
+    return VmSquareD3::make(5)
+}
+
+// heterogeneous `[]VmShape` — mixed concrete classes behind one element type.
+fn vm_total_area(shapes: []VmShape) -> i64 {
+    mut sum: i64 = 0
+    mut i: u64 = 0
+    loop {
+        if i >= shapes.len { break }
+        let s = shapes[i]
+        sum = sum + s.area()
+        i++
+    }
+    sum
+}
+
+// (D2) static dispatch `<T: I>` — an interface IS a valid constraint; a conforming class
+// instantiates the generic (opaque hold: store/pass/return T without operating on it).
+fn vm_hold_shape<T: VmShape>(x: T) -> T { return x }
+
+// upcast at a local binding + dynamic dispatch through the interface value.
+#test
+fn iface_dispatch_upcast_local() {
+    let c = VmCircleD3::make(2)
+    let s: VmShape = c
+    teko::assert::is_true(s.area() == 12)
+}
+
+// non-receiver args flow through the dispatch.
+#test
+fn iface_dispatch_args_flow() {
+    let sq = VmSquareD3::make(3)
+    let s: VmShape = sq
+    teko::assert::is_true(s.grown(5) == 14)
+}
+
+// interface value as a param + as a return value.
+#test
+fn iface_dispatch_param_and_return() {
+    let c = VmCircleD3::make(2)
+    teko::assert::is_true(vm_shape_area(c) == 12)
+    let p = vm_pick_shape(1)
+    teko::assert::is_true(p.area() == 25)
+    let q = vm_pick_shape(0)
+    teko::assert::is_true(q.area() == 3)
+}
+
+// heterogeneous []VmShape: mixed classes summed through per-element dispatch.
+#test
+fn iface_dispatch_heterogeneous_array() {
+    let c = VmCircleD3::make(2)
+    let sq = VmSquareD3::make(3)
+    let shapes: []VmShape = [c, sq]
+    teko::assert::is_true(vm_total_area(shapes) == 21)
+}
+
+// `extends`-transitive dispatch: a VmNamedShape value reaches BOTH the extended base
+// contract's methods (area, slot 0 in the extended list) and its own (shape_name).
+#test
+fn iface_dispatch_extends_transitive() {
+    let sq = VmSquareD3::make(4)
+    let n: VmNamedShape = sq
+    teko::assert::is_true(n.area() == 16)
+    teko::assert::is_true(n.shape_name() == "square")
+    // upcast to the extended BASE contract directly (its own vtable/slot order)
+    let s: VmShape = sq
+    teko::assert::is_true(s.area() == 16)
+}
+
+// a virtual override dispatches through the contract: the DERIVED class conforms via the
+// BASE's declared implements, and the override (not the base body) runs.
+#test
+fn iface_dispatch_virtual_override() {
+    let d = VmDogD3::make_dog()
+    let sp: VmSpeaker = d
+    teko::assert::is_true(sp.speak() == "woof")
+    let a = VmAnimalD3::make_animal(2)
+    let sa: VmSpeaker = a
+    teko::assert::is_true(sa.speak() == "...")
+}
+
+// (D2 locking) `<T: I>` accepts a conforming CLASS argument and the instance survives the
+// opaque hold (reference semantics intact — the same object comes back).
+#test
+fn iface_constraint_accepts_conforming_class() {
+    let c = VmCircleD3::make(3)
+    let held = vm_hold_shape(c)
+    teko::assert::is_true(held.area() == 27)
+    teko::assert::is_true(vm_shape_area(held) == 27)
+}

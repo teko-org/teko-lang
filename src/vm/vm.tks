@@ -2609,7 +2609,101 @@ fn eval_lambda_call(fv: FuncVal, c: checker::TCall, env: Venv) -> EvalRes {
     EvalRes { value= rv; env= caller }
 }
 
+// (W10b.D3) resolve a DYNAMIC contract-method call's target: the concrete class's stamped
+// function named `method` whose namespace IS `class_name` or ends with "::" + `class_name` —
+// the SAME rule codegen's vtable build uses (cg_find_method_ns), so both engines dispatch to
+// the SAME method (virtual overrides included: every effective method is stamped per class).
+// Mirror of vm.c::find_class_method. null = not found (an honest stop at the caller).
+fn find_class_method(env: Venv, class_name: str, method: str) -> FnHit? {
+    mut i: u64 = 0
+    loop {
+        if i >= env.prog.items.len { break }
+        match env.prog.items[i] {
+            checker::TFunction as tf => {
+                if tf.name == method {
+                    if tf.namespace == class_name { return FnHit { func = tf; idx = i } }
+                    if teko::str::ends_with(tf.namespace, "::" ~ class_name) { return FnHit { func = tf; idx = i } }
+                }
+            }
+            _ => {}
+        }
+        i++
+    }
+    null
+}
+
+// (W10b.D3) DYNAMIC contract-method dispatch. The receiver (args[0]) evaluates ONCE; a class
+// instance IS the interface value in the VM (a ClassRef cell — no fat pointer needed, the cell's
+// struct payload carries the CONCRETE class name to dispatch on). The ORIGINAL ClassRef binds as
+// the receiver param (reference semantics survive the dispatch). Non-receiver args bind exactly
+// like bind_call_args (Ref auto-promotion included). Shared by BOTH eval_call and call_value —
+// the twin-asymmetry trap's two entry points. Yields StmtVal (value = null for a void method) so
+// the statement path tolerates void; the value path panics on null. Mirror of vm.c::eval_iface_call.
+fn eval_iface_call(c: checker::TCall, env: Venv) -> StmtVal {
+    let re = eval_expr(c.args[0], env)
+    mut caller = re.env
+    let recv = re.value
+    let cellid = match recv { ClassRef as cr => cr.cell; _ => panic("vm: interface dispatch on a non-class value (internal: only a class instance upcasts)") }
+    let payload = cell_get(caller.cells, cellid)
+    let concrete = match payload { StructVal as sv => sv.type_name; _ => panic("vm: interface dispatch: the class cell holds no struct payload (internal)") }
+    let method = c.callee.segments[c.callee.segments.len - 1].name
+    let h = match find_class_method(caller, concrete, method) {
+        FnHit as hit => hit
+        null => panic("vm: interface dispatch: no stamped method on the concrete class (internal: conformance was checked)")
+    }
+    let f = h.func
+    if f.params.len == 0 || f.params.len != c.args.len { panic("vm: interface dispatch: arity mismatch (internal: the checker fixed the arity)") }
+    if !f.is_test { teko::cov_mark(h.idx) }
+    mut fenv = fresh_env(caller.prog, caller.cells)
+    fenv = define(fenv, f.params[0].name, recv)   // the receiver — the ORIGINAL ClassRef
+    mut ai: u64 = 1
+    loop {
+        if ai >= c.args.len { break }
+        if param_is_ref(f, ai) {   // same auto-ref/forward rule as bind_call_args
+            match c.args[ai].kind {
+                checker::TVar as v => {
+                    match c.args[ai].type {
+                        checker::Reference => {
+                            fenv = define(fenv, f.params[ai].name, read_var(caller, v.name))   // forward the existing RefVal
+                        }
+                        _ => {
+                            let pr = promote_to_cell(caller, v.name)   // auto-ref: promote the origin var
+                            caller = pr.env
+                            fenv = with_cells(fenv, caller.cells)
+                            fenv = define(fenv, f.params[ai].name, RefVal { cell = pr.id })
+                        }
+                    }
+                }
+                _ => panic("vm: a `Ref<T>` argument must be a mutable variable (internal: checker should reject)")
+            }
+        } else {
+            let ae = eval_expr(c.args[ai], caller)
+            caller = ae.env
+            fenv = with_cells(fenv, caller.cells)
+            fenv = define(fenv, f.params[ai].name, coerce_to(ae.value, vm_param_coerce_type(f.params[ai].type_ann)))
+        }
+        ai++
+    }
+    teko::cov_enter(h.idx)
+    let fe = exec_block_ex(f.body, fenv, true)
+    teko::cov_leave()
+    caller = with_cells(caller, fe.env.cells)
+    mut rv: Value? = null
+    match fe.flow {
+        VmReturn as ret => match ret.value { Value as v => { rv = coerce_to(v, f.return_type) }; null => {} }
+        Normal as nm    => match nm.value { Value as v => { rv = coerce_to(v, f.return_type) }; null => {} }
+        _               => {}
+    }
+    StmtVal { value = rv; env = caller }
+}
+
 fn eval_call(c: checker::TCall, env: Venv) -> EvalRes {
+    // (W10b.D3) dynamic contract dispatch — FIRST, before builtin name-sniffing could collide
+    // with a method name. Same guard in call_value (the VM twin-asymmetry rule).
+    if c.is_iface_dispatch {
+        let r = eval_iface_call(c, env)
+        return EvalRes { value = r.value ?? panic("vm: void interface-method call used as a value (internal: checker should reject)"); env = r.env }
+    }
     // A builtin that RAN (`true`) is `-> void`, so there is no Value to yield: a void call
     // only appears in statement position, and reaching here in value position is an honest
     // stop (M.3), never a synthesized Unit. A `false`/`error` result == "not a builtin" —
@@ -2933,6 +3027,9 @@ fn eval_stmt_value(e: checker::TExpr, env: Venv) -> StmtVal {
 // the callee is visible at the caller after return). Returns the value AND the updated caller env.
 // (The C twin folds this into eval_call, where the cell store is a global shared by pointer.)
 fn call_value(c: checker::TCall, env: Venv) -> StmtVal {
+    // (W10b.D3) dynamic contract dispatch — FIRST, before builtin name-sniffing could collide
+    // with a method name. Same guard in eval_call (the VM twin-asymmetry rule).
+    if c.is_iface_dispatch { return eval_iface_call(c, env) }
     // A builtin that RAN (`true`) is `-> void` — yield null. A `false`/`error` result ==
     // "not a builtin": run the user fn. (Builtins do not take `Ref<T>` params — env unchanged.)
     match try_builtin(c.callee, c.args, env) {

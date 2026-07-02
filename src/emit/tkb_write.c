@@ -79,6 +79,17 @@ tk_bytes tk_write_texpr(tk_bytes b, tk_strtable t, const tk_texpr *te) {
             return b;
         }
         case TK_TEXPR_CALL: {
+            // (W10b.D3) a DYNAMIC contract-method call is its OWN tag (24): it must round-trip the
+            // resolved method Func (the cast signature) + the vtable slot, which the plain call
+            // encoding (tag 7, below) does not carry. callee = [<Iface>, <method>].
+            if (te->as.call.is_iface_dispatch) {
+                b = write_path(tk_write_u8(b, 24), t, te->as.call.callee);
+                b = tk_write_type(b, t, te->as.call.callee_type);
+                b = tk_write_u32(b, te->as.call.iface_slot);
+                b = tk_write_u32(b, (uint32_t)te->as.call.nargs);
+                for (size_t i = 0; i < te->as.call.nargs; i += 1) b = tk_write_texpr(b, t, &te->as.call.args[i]);
+                return b;
+            }
             b = write_path(tk_write_u8(b, 7), t, te->as.call.callee);
             b = tk_write_u32(b, (uint32_t)te->as.call.nargs);
             for (size_t i = 0; i < te->as.call.nargs; i += 1) b = tk_write_texpr(b, t, &te->as.call.args[i]);

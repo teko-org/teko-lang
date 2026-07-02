@@ -62,10 +62,9 @@ fn resolve_named(path: parser::Path, table: TypeTable) -> Type | error {
         parser::TypeDecl as td => {
             match td.body {
                 parser::AliasBody as ab => return resolve_type(ab.alias, table)
-                // (W10b.IF) an interface is a COMPILE-TIME CONTRACT, not a value type — it has no
-                // runtime representation yet (dynamic dispatch = a later round). Reject it wherever a
-                // value type is expected (field/param/return/local): an honest stop, not a phantom Named.
-                parser::InterfaceBody   => return error { message = $"'{name}' is an interface and cannot be used as a value type yet (dynamic dispatch is a later round)" }
+                // (W10b.D3) an interface IS a value type now — a contract-typed value (data + vtable
+                // fat pointer, the tk_closure-shaped rep). It resolves NOMINALLY like any other named
+                // type; the upcast/dispatch rules live in widens_into + the method-call typer.
                 _                       => return Named { name = name }
             }
         }
@@ -140,6 +139,19 @@ fn widens_into_at(from: Type, to: Type, table: TypeTable, depth: i64) -> bool {
         }
         _ => {}
     }
+    // (W10b.D3) UPCAST — a CLASS instance widens into a contract (interface) it NOMINALLY
+    // conforms to: `let s: Shape = circle`. Classes only (reference semantics ride the object
+    // pointer into the fat-pointer `data` field); a STRUCT is pure value data — no stable
+    // address to dispatch on — so it does NOT widen (its conformance still serves `<T: I>`).
+    match from {
+        Named as fname => match to {
+            Named as tname => {
+                if is_class_name(fname.name, table) && is_interface_name(tname.name, table) && type_conforms_to(fname.name, tname.name, table) { return true }
+            }
+            _ => {}
+        }
+        _ => {}
+    }
     match expand_variant(to, table) {        // a NAMED variant → its Variant (so cases widen in)
         Variant as tv => {
             mut j = 0
@@ -154,6 +166,83 @@ fn widens_into_at(from: Type, to: Type, table: TypeTable, depth: i64) -> bool {
     }
 }
 fn widens_into(from: Type, to: Type, table: TypeTable) -> bool { widens_into_at(from, to, table, 16) }
+
+// ── (W10b.D3) nominal contract conformance — the interface-value upcast / constraint gates ──────
+// These live HERE (not collect.tks) because widens_into needs them and resolve sits below collect
+// in the module DAG. "Contract" wording: the mechanism is per-(type, contract) and agnostic to
+// which decl kind the contract came from (today `interface`; traits reuse it later).
+
+// is `name` declared as an interface? Mirror of resolve.c::tk_is_interface_name.
+pub fn is_interface_name(name: str, table: TypeTable) -> bool {
+    match type_table_find(table, name) {
+        parser::TypeDecl as td => match td.body { parser::InterfaceBody => true; _ => false }
+        error => false
+    }
+}
+
+// is `name` declared as a class? Mirror of resolve.c::tk_is_class_name.
+pub fn is_class_name(name: str, table: TypeTable) -> bool {
+    match type_table_find(table, name) {
+        parser::TypeDecl as td => match td.body { parser::ClassBody => true; _ => false }
+        error => false
+    }
+}
+
+// does contract `sub` reach contract `want` through `extends`, transitively? Depth-bounded so a
+// (decl-rejected) cyclic `extends` can never loop here. Mirror of resolve.c::iface_extends_reaches.
+fn iface_extends_reaches(sub: str, want: str, table: TypeTable, depth: i64) -> bool {
+    if depth <= 0 { return false }
+    let ib = match type_table_find(table, sub) {
+        parser::TypeDecl as td => match td.body { parser::InterfaceBody as b => b; _ => return false }
+        error => return false
+    }
+    mut i: u64 = 0
+    loop {
+        if i >= ib.extends.len { break }
+        if ib.extends[i] == want { return true }
+        if iface_extends_reaches(ib.extends[i], want, table, depth - 1) { return true }
+        i++
+    }
+    false
+}
+
+// NOMINAL conformance: does class/struct `name` implement contract `iface` — via its OWN
+// `implements` list, an ANCESTOR class's (the class-inheritance chain), or a listed contract
+// that `extends` `iface` transitively? DECLARED conformance only (nominal, closed-world) — a
+// type that merely HAPPENS to have the methods does not conform. Hop-bounded like the extends
+// walk (cyclic inheritance is decl-rejected; the bound keeps this total regardless). Mirror of
+// resolve.c::tk_type_conforms_to.
+pub fn type_conforms_to(name: str, iface: str, table: TypeTable) -> bool {
+    mut cur = name
+    mut hops = 0
+    loop {
+        if hops >= 64 { break }
+        let td = match type_table_find(table, cur) { parser::TypeDecl as d => d; error => return false }
+        mut impls: []str = teko::list::empty()
+        mut has_base = false
+        mut base = ""
+        match td.body {
+            parser::ClassBody as cb => {
+                impls = cb.implements
+                has_base = cb.has_base
+                base = cb.base_name
+            }
+            parser::StructBody as sb => { impls = sb.implements }
+            _ => return false
+        }
+        mut i: u64 = 0
+        loop {
+            if i >= impls.len { break }
+            if impls[i] == iface { return true }
+            if iface_extends_reaches(impls[i], iface, table, 64) { return true }
+            i++
+        }
+        if !has_base { return false }
+        cur = base
+        hops++
+    }
+    false
+}
 
 // (#83) Does `t` carry a SENTINEL anywhere (a Slice whose element is `Void`, or an Optional whose
 // inner is `Void`)? `type_eq` treats a sentinel as equal to ANY concrete peer (see type.tks), which
@@ -360,6 +449,15 @@ pub fn resolve_type(te: parser::TypeExpr, table: TypeTable) -> Type | error {
                     Void      => return error { message = "a variant member may not be `void`" }
                     Optional  => return error { message = "a variant member may not be nullable (`T?`) — use `T | …` and mark the whole type `?`" }
                     Reference => return error { message = "a reference cannot be stored in a struct/variant/collection" }   // (MEM Step 0, R4)
+                    // (W10b.D3) an interface (contract) variant member is an honest stop: the VM's
+                    // untagged values discriminate a match arm by the CONCRETE class name, so a
+                    // `Shape | error` subject would silently diverge between the engines (native
+                    // has a tag, the VM does not). Plain interface-typed values work — bind first.
+                    Named as nm => {
+                        if is_interface_name(nm.name, table) {
+                            return error { message = "an interface cannot be a variant member yet — bind the interface value on its own (no `I | error` unions)" }
+                        }
+                    }
                     _         => {}
                 }
                 members = teko::list::push(members, m)

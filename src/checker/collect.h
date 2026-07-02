@@ -19,6 +19,18 @@ tk_classbody_result  tk_find_class_body(tk_str name, tk_type_table table);
 tk_fieldsvec_result  tk_effective_class_fields(tk_class_body cb, tk_type_table table);
 tk_methodsvec_result tk_effective_class_methods(tk_class_body cb, tk_type_table table);
 
+// (W10b.D3) dynamic dispatch — the interface-value surface. `tk_iface_methods_by_name` returns an
+// interface's EFFECTIVE methods (extends-transitive first, then own); a method's INDEX in this
+// list IS its vtable slot (checker typing, codegen vtables, and the VM dispatch all agree on it).
+// `tk_type_conforms_to` is the NOMINAL upcast/constraint gate (declared `implements` only, through
+// the class base chain and interface `extends`). `tk_method_func_type` (A1) is a method signature
+// as a FuncType with the untyped receiver resolved to Named{owner} — shared with expr.c/typer.c
+// for interface-receiver call typing.
+tk_methodsvec_result tk_iface_methods_by_name(tk_str iface, tk_type_table table);
+bool tk_is_interface_name(tk_str name, tk_type_table table);
+bool tk_type_conforms_to(tk_str name, tk_str iface, tk_type_table table);
+tk_type_result tk_method_func_type(tk_function f, tk_str struct_name, tk_type_table table);
+
 // (W10b.CLASS residual — intern visibility) a member's REACH: which class's OWN code declared
 // it, plus its vis/is_intern AT that declaration (an override "moves" the declaration to the
 // overriding class). Shared with expr.c/typer.c.

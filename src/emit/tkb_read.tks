@@ -273,7 +273,7 @@ fn read_texpr(r: Reader, table: []str) -> RTExpr | error {
     if tag.value == 7 {
         let cal = match read_path(tag.r, table)   { RPath as x => x; error as e => return e }
         let ar  = match read_texprs(cal.r, table) { RTExprs as x => x; error as e => return e }
-        return RTExpr { r = ar.r; value = checker::TExpr { kind = checker::TCall { callee = cal.value; args = ar.value; call_ns = ""; is_closure_call = false; callee_type = checker::Void { } }; type = ty.value; line = 0; col = 0 } }   // (W10a) call_ns/closure fields re-derived on re-check (codec is expression-level only)
+        return RTExpr { r = ar.r; value = checker::TExpr { kind = checker::TCall { callee = cal.value; args = ar.value; call_ns = ""; is_closure_call = false; callee_type = checker::Void { }; is_iface_dispatch = false; iface_slot = 0 }; type = ty.value; line = 0; col = 0 } }   // (W10a) call_ns/closure fields re-derived on re-check (codec is expression-level only)
     }
     if tag.value == 8 {
         // (C7.16) IF: inverse of write tag 8 — cond (texpr) + then_blk + has_else (u8) + else_blk.
@@ -420,6 +420,13 @@ fn read_texpr(r: Reader, table: []str) -> RTExpr | error {
     if tag.value == 23 {                                                            // (UTF-8 increment 1) CharLit: interned UTF-8 bytes
         let by = match tkb_read_str(tag.r, table) { RStr as x => x; error as e => return e }
         return RTExpr { r = by.r; value = checker::TExpr { kind = checker::TCharLit { bytes = by.value }; type = ty.value; line = 0; col = 0 } }
+    }
+    if tag.value == 24 {   // (W10b.D3) DYNAMIC contract-method call: path + method Func + vtable slot + args
+        let cal  = match read_path(tag.r, table)    { RPath as x => x; error as e => return e }
+        let ct   = match read_type(cal.r, table)    { RType as x => x; error as e => return e }
+        let slot = match read_u32(ct.r)             { RU32 as x => x; error as e => return e }
+        let ar   = match read_texprs(slot.r, table) { RTExprs as x => x; error as e => return e }
+        return RTExpr { r = ar.r; value = checker::TExpr { kind = checker::TCall { callee = cal.value; args = ar.value; call_ns = ""; is_closure_call = false; callee_type = ct.value; is_iface_dispatch = true; iface_slot = slot.value }; type = ty.value; line = 0; col = 0 } }
     }
     error { message = "bad texpr tag in .tkb" }
 }
