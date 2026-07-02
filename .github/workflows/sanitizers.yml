@@ -73,6 +73,25 @@ jobs:
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
         run: ./build-asan/teko test . --coverage
 
+      # `teko test .` exercises only the VM path — the NATIVE backend (tk_emit_c /
+      # cg_lift_program / tk_emit_tsym / run_cc) never ran under ASan, which is how the
+      # lift-pass use-after-free in tk_emit_tsym (freed items list read for the .tsym map;
+      # crashed glibc builds of any project with a non-capturing lambda) shipped unseen.
+      # Build every regressions fixture natively with the SANITIZED compiler so the whole
+      # build pipeline is ASan-covered. Leak detection off: the front-end deliberately
+      # holds compiler-lifetime allocations it never frees (core.h S0 seam discipline).
+      - name: Native-build regressions fixtures (ASan + UBSan)
+        env:
+          ASAN_OPTIONS: halt_on_error=1:detect_leaks=0
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: |
+          out="$(mktemp -d)"
+          for proj in examples/regressions/*/; do
+            ls "$proj"*.tkp >/dev/null 2>&1 || continue
+            echo "== teko build $proj"
+            ./build-asan/teko build "$proj" -o "$out/$(basename "$proj")"
+          done
+
   # ── ASan + UBSan (portable switch dispatch) ──────────────────────────────────
   asan-portable:
     name: ASan+UBSan / portable switch dispatch

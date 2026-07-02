@@ -1813,8 +1813,15 @@ static bool call_value(const tk_texpr *e, tk_venv *env, tk_value *out) {
     // (W10b.D3) dynamic contract dispatch — FIRST, before builtin name-sniffing could collide
     // with a method name. Same guard in eval_call (the VM twin-asymmetry rule).
     if (e->as.call.is_iface_dispatch) { *out = eval_iface_call(e, env); return true; }
-    if (try_builtin_call(p, args, nargs, env, out)) return true;   // `-> void` builtin (or value builtin) — no ref args
+    // (#107) a CLOSURE call ALSO goes before try_builtin_call: it matches by BARE last-segment
+    // name only (`write`, `print`, `len`, …) with no scope awareness, so a closure-typed
+    // local/param sharing one of those reserved names (e.g. a `write: WFn` param in a namespace
+    // that also has an extern `write`) would otherwise be hijacked into the builtin call instead
+    // of calling the closure VALUE — the checker already proved `is_closure_call`
+    // (tk_env_lookup_call scans innermost-first, so the local always wins); the VM just has to
+    // respect that verdict. Same guard in eval_call (the VM twin-asymmetry rule).
     if (e->as.call.is_closure_call && try_lambda_call(e, env, out)) return true;   // (W10) a lambda value runs its own body
+    if (!e->as.call.is_closure_call && try_builtin_call(p, args, nargs, env, out)) return true;   // `-> void` builtin (or value builtin) — no ref args
 
     size_t fn_idx;
     const tk_tfunction *fn = e->as.call.is_closure_call ? closure_target(e, env, &fn_idx) : find_function_ns(p, e->as.call.call_ns, &fn_idx);   // (W10a) closure call → resolve through the local FuncVal; direct call → namespace-disambiguated (BUGFIX above)
@@ -1847,8 +1854,10 @@ static tk_value eval_call(const tk_texpr *e, tk_venv *env) {
     // with a method name. Same guard in call_value (the VM twin-asymmetry rule).
     if (e->as.call.is_iface_dispatch) return eval_iface_call(e, env);
     tk_value out;
-    if (try_builtin_call(p, args, nargs, env, &out)) return out;
+    // (#107) a CLOSURE call ALSO goes before try_builtin_call — same reasoning as call_value's
+    // guard above (the VM twin-asymmetry rule: both call paths need it).
     if (e->as.call.is_closure_call && try_lambda_call(e, env, &out)) return out;   // (W10) a lambda value runs its own body
+    if (!e->as.call.is_closure_call && try_builtin_call(p, args, nargs, env, &out)) return out;
 
     size_t fn_idx;
     const tk_tfunction *fn = e->as.call.is_closure_call ? closure_target(e, env, &fn_idx) : find_function_ns(p, e->as.call.call_ns, &fn_idx);   // (W10a) closure call → resolve through the local FuncVal; direct call → namespace-disambiguated (BUGFIX above)

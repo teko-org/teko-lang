@@ -1645,6 +1645,15 @@ fn emit_call(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, e: c
     // (W10b.D3) a DYNAMIC contract-method call dispatches through the receiver's vtable —
     // FIRST, before any builtin name-sniffing below could collide with a method name.
     if c.is_iface_dispatch { return emit_iface_call(buf, prog, ret_type, c, escaping, regions, fn_body, dctx) }
+    // (#107) a CLOSURE call (the checker resolved the callee to an in-scope local/param/let-bound
+    // function VALUE, not a namespace fn) ALSO goes first, before any of the builtin/host-FFI
+    // name-sniffing blocks below: those match by BARE last-segment name only (`write`, `print`,
+    // `len`, …) with no scope awareness, so a closure-typed binding sharing one of those reserved
+    // names (e.g. a `write: WFn` param in a namespace that also has an extern `write`) would
+    // otherwise be hijacked into the builtin/extern call instead of calling the closure VALUE —
+    // the checker already proved `is_closure_call` (scope.tks::lookup_call scans innermost-first,
+    // so the local always wins over the namespace fn); codegen just has to respect that verdict.
+    if c.is_closure_call { return emit_closure_call(buf, prog, ret_type, c, escaping, regions, fn_body, dctx) }
     let p = c.callee
     // teko::list::empty / push — the SLICE (collection) builtins, FIXED+COPY. `empty()`
     // (sentinel) is normally wrapped by emit_as into a concrete slot literal; reaching here
@@ -1875,13 +1884,10 @@ fn emit_call(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, e: c
             // and same-named functions across namespaces never collide.
             out = cb_fn_name(out, c.call_ns, p.segments[p.segments.len - 1].name)
         }
-    } else if c.is_closure_call {
-        // (W10) call THROUGH a tk_closure VALUE — a single-eval statement-expression that dispatches on
-        // `env` (no-env ABI for a named-fn/non-capturing closure; env-first ABI for a capturing one).
-        return emit_closure_call(out, prog, ret_type, c, escaping, regions, fn_body, dctx)
     } else {
         // No resolved namespace (a builtin, or a name not carried) -> the bare
-        // (keyword-escaped) last segment.
+        // (keyword-escaped) last segment. (A closure call never reaches here — the (#107)
+        // is_closure_call guard at the top of emit_call already returned via emit_closure_call.)
         out = cb_ident(out, p.segments[p.segments.len - 1].name)
     }
     // A resolved USER call: wrap each arg into its parameter type (emit_as) so a bare case value
@@ -6278,8 +6284,18 @@ fn cg_lift_stmt(s: checker::TStatement, acc: Ref<StampAcc>) -> checker::TStateme
 fn cg_lift_expr(e: checker::TExpr, acc: Ref<StampAcc>) -> checker::TExpr {
     match e.kind {
         checker::TLambda as lam => {
+            // (issue #107 fix — a real lift_id counter bug this exposed) reserve THIS lambda's id
+            // BEFORE recursing into its body, so a nested lambda literal inside it stamps with
+            // HIGHER ids (outer-first numbering, stable regardless of nesting). The recursive
+            // cg_lift_block call below may advance `acc.value.next` further (once per nested
+            // lambda it finds) — the counter used AFTER the recursion must be read FRESH from
+            // `acc.value.next` (whatever the nested walk left it at), never reset to `id + 1`:
+            // that would REUSE ids already handed out to nested lambdas, producing two lifted C
+            // functions both named `__tkclo_<id>` (a duplicate-definition compile error) the
+            // moment a lambda literal contains another lambda literal.
             let id = acc.value.next
-            let nbody = cg_lift_block(lam.body, acc)   // stamp nested lambdas first
+            acc.value = StampAcc { next = id + 1; fns = acc.value.fns; lams = acc.value.lams }
+            let nbody = cg_lift_block(lam.body, acc)   // stamp nested lambdas first (ids > id)
             // synthesize a plain top-level fn for a NON-capturing lambda; capturing → emitted by the
             // capture path (recorded in `lams`).
             mut newfns = acc.value.fns
@@ -6293,7 +6309,8 @@ fn cg_lift_expr(e: checker::TExpr, acc: Ref<StampAcc>) -> checker::TExpr {
             } else {
                 newlams = teko::list::push(newlams, stamped)
             }
-            acc.value = StampAcc { next = id + 1; fns = newfns; lams = newlams }
+            // preserve whatever `next` the nested recursion advanced to (never regress it).
+            acc.value = StampAcc { next = acc.value.next; fns = newfns; lams = newlams }
             checker::TExpr { kind = stamped; type = e.type; line = e.line; col = e.col }
         }
         checker::TBinary as b      => checker::TExpr { kind = checker::TBinary { op = b.op; left = cg_lift_expr(b.left, acc); right = cg_lift_expr(b.right, acc) }; type = e.type; line = e.line; col = e.col }

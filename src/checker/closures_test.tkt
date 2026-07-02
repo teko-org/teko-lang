@@ -75,3 +75,63 @@ fn cl_use(f: (i64) -> i64, v: i64) -> i64 { return f(v) }
     }
     teko::assert::is_true(g(4) == 10)
 }
+
+// (issue #107) a closure-typed PARAM named like a reserved non-shadowable builtin (`write`,
+// `print`, `len`, …) must call THROUGH the param, never get hijacked into the builtin/extern by
+// bare-name sniffing. Regression for the codegen/VM call-lowering bug: both engines matched
+// `write`/`len`/etc. by BARE last-segment name BEFORE consulting the checker's `is_closure_call`
+// verdict, so a param sharing one of those names silently called the wrong thing (or, for an
+// extern like `teko::io::write`, failed to even compile natively — void return vs the param's
+// declared u64). `src/io/stream.tks` carried a documented naming workaround for exactly this.
+type ShadowFn = (str) -> u64
+
+fn cl_shadow_write(write: ShadowFn) -> u64 { write("ignored") }
+fn cl_shadow_print(print: ShadowFn) -> u64 { print("ignored") }
+fn cl_shadow_len(len: ShadowFn) -> u64 { len("ignored") }
+
+#test fn closure_param_shadows_write_builtin() {
+    // if hijacked, this would call teko::io::write (-> void; a native compile error against the
+    // u64-returning param type) or run print/write's real side effect and diverge from 42.
+    let f: ShadowFn = (s: str) => 42 to u64
+    teko::assert::is_true(cl_shadow_write(f) == 42)
+}
+
+#test fn closure_param_shadows_print_builtin() {
+    let f: ShadowFn = (s: str) => 7 to u64
+    teko::assert::is_true(cl_shadow_print(f) == 7)
+}
+
+#test fn closure_param_shadows_len_builtin() {
+    // if hijacked, this calls tk_str_len("ignored") == 8, not the closure's 999.
+    let f: ShadowFn = (s: str) => 999 to u64
+    teko::assert::is_true(cl_shadow_len(f) == 999)
+}
+
+// (issue #107) a `let`-bound closure (not just a param) shadowing a reserved builtin name — same
+// bare-name hijack risk, different binding origin. One fix (checked BEFORE the builtin-name
+// sniffing) must cover both.
+#test fn let_bound_closure_shadows_builtin_name() {
+    let write: ShadowFn = (s: str) => 55 to u64
+    teko::assert::is_true(write("ignored") == 55)
+    let len: ShadowFn = (s: str) => 66 to u64
+    teko::assert::is_true(len("ignored") == 66)
+}
+
+// (issue #107) NESTED closure shadowing: an outer closure param named `write` captured by an
+// inner lambda that also introduces its own `write` binding — the innermost `write` must win at
+// each call site, never the reserved builtin.
+fn cl_shadow_nested(write: ShadowFn) -> u64 {
+    let inner: ShadowFn = (s: str) => {
+        let write: ShadowFn = (s2: str) => 321 to u64   // shadows the outer PARAM `write`
+        write(s)                                        // must call the innermost local, not the builtin
+    }
+    // the outer `write` param is still reachable here (inner's shadow is scoped to its own body).
+    let outer_result = write("outer")
+    let inner_result = inner("inner")
+    outer_result + inner_result
+}
+
+#test fn nested_closure_shadows_builtin_name() {
+    let f: ShadowFn = (s: str) => 111 to u64
+    teko::assert::is_true(cl_shadow_nested(f) == 432)   // 111 (outer) + 321 (inner's own shadow)
+}

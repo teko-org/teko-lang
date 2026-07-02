@@ -2786,34 +2786,43 @@ fn eval_call(c: checker::TCall, env: Venv) -> EvalRes {
         let r = eval_iface_call(c, env)
         return EvalRes { value = r.value ?? panic("vm: void interface-method call used as a value (internal: checker should reject)"); env = r.env }
     }
-    // A builtin that RAN (`ran= true`) is `-> void`, so there is no Value to yield: a void call
-    // only appears in statement position, and reaching here in value position is an honest
-    // stop (M.3), never a synthesized Unit — this arm always panics, so BuiltinRes.env is dead
-    // here (kept only for the match arm's shape; the env matters at call_value, MEM Step 4).
-    // A `false`/`error` result == "not a builtin" — fall through to a user fn.
-    match try_builtin(c.callee, c.args, env) {
-        BuiltinRes as br => if br.ran { panic("vm: void builtin call used as a value (internal: checker should reject)") }
-        error            => {}                  // not a builtin — fall through to a user fn
-    }
-    // teko::list::empty / push — value-producing SLICE builtins (FIXED+COPY). Recognized
-    // before user-fn resolution; null == not a list builtin, fall through.
-    match try_list_builtin(c.callee, c.args, env) { Value as v => return EvalRes { value= v; env= env }; null => {} }
-    // E2 — err_loc / err_typed — value-producing error-adornment builtins. Recognized before
-    // user-fn resolution; null == not an err builtin, fall through.
-    match try_err_builtin(c.callee, c.args, env) { Value as v => return EvalRes { value= v; env= env }; null => {} }
-    // str/byte STDLIB — value-producing str-returning builtins (str/str_of_bytes/one_byte/
-    // str_concat3/ftoa). Recognized before user-fn resolution; null == not a str builtin, fall through.
-    match try_str_builtin(c.callee, c.args, env) { Value as v => return EvalRes { value= v; env= env }; null => {} }
-    // teko::fs::* host-surface builtins (list_dir). Recognized before user-fn resolution;
-    // null == not a fs builtin, fall through. (Mirrors vm.c's list_dir handler.)
-    match try_fs_builtin(c.callee, c.args, env) { Value as v => return EvalRes { value= v; env= env }; null => {} }
-    // (W10) a CLOSURE call: the callee is a LOCAL bound to a FuncVal. A LAMBDA value executes its own
+    // (#107) a CLOSURE call ALSO goes here, before ANY of the try_*_builtin name-sniffing below:
+    // those match by BARE last-segment name only (`write`, `print`, `len`, …) with no scope
+    // awareness, so a closure-typed local/param sharing one of those reserved names (e.g. a
+    // `write: WFn` param in a namespace that also has an extern `write`) would otherwise be
+    // hijacked into the builtin call instead of calling the closure VALUE — the checker already
+    // proved `is_closure_call` (tk_env_lookup_call/lookup_call scans innermost-first, so the
+    // local always wins over the namespace fn); the VM just has to respect that verdict.
+    // (W10) the callee is a LOCAL bound to a FuncVal. A LAMBDA value executes its own
     // body+captures (eval_lambda_call); a NAMED-fn value resolves THAT function and invokes it (W10a).
     if c.is_closure_call {
         match read_var(env, c.callee.segments[c.callee.segments.len - 1].name) {
             FuncVal as fv => if fv.is_lambda { return eval_lambda_call(fv, c, env) } else { }
             _ => { }
         }
+    }
+    // A builtin that RAN (`ran= true`) is `-> void`, so there is no Value to yield: a void call
+    // only appears in statement position, and reaching here in value position is an honest
+    // stop (M.3), never a synthesized Unit — this arm always panics, so BuiltinRes.env is dead
+    // here (kept only for the match arm's shape; the env matters at call_value, MEM Step 4).
+    // A `false`/`error` result == "not a builtin" — fall through to a user fn.
+    if !c.is_closure_call {
+        match try_builtin(c.callee, c.args, env) {
+            BuiltinRes as br => if br.ran { panic("vm: void builtin call used as a value (internal: checker should reject)") }
+            error            => {}                  // not a builtin — fall through to a user fn
+        }
+        // teko::list::empty / push — value-producing SLICE builtins (FIXED+COPY). Recognized
+        // before user-fn resolution; null == not a list builtin, fall through.
+        match try_list_builtin(c.callee, c.args, env) { Value as v => return EvalRes { value= v; env= env }; null => {} }
+        // E2 — err_loc / err_typed — value-producing error-adornment builtins. Recognized before
+        // user-fn resolution; null == not an err builtin, fall through.
+        match try_err_builtin(c.callee, c.args, env) { Value as v => return EvalRes { value= v; env= env }; null => {} }
+        // str/byte STDLIB — value-producing str-returning builtins (str/str_of_bytes/one_byte/
+        // str_concat3/ftoa). Recognized before user-fn resolution; null == not a str builtin, fall through.
+        match try_str_builtin(c.callee, c.args, env) { Value as v => return EvalRes { value= v; env= env }; null => {} }
+        // teko::fs::* host-surface builtins (list_dir). Recognized before user-fn resolution;
+        // null == not a fs builtin, fall through. (Mirrors vm.c's list_dir handler.)
+        match try_fs_builtin(c.callee, c.args, env) { Value as v => return EvalRes { value= v; env= env }; null => {} }
     }
     let h = if c.is_closure_call {
         match read_var(env, c.callee.segments[c.callee.segments.len - 1].name) {
@@ -3113,6 +3122,19 @@ fn call_value(c: checker::TCall, env: Venv) -> StmtVal {
     // (W10b.D3) dynamic contract dispatch — FIRST, before builtin name-sniffing could collide
     // with a method name. Same guard in eval_call (the VM twin-asymmetry rule).
     if c.is_iface_dispatch { return eval_iface_call(c, env) }
+    // (#107) a CLOSURE call ALSO goes here, before ANY of the try_*_builtin name-sniffing below —
+    // same reasoning as eval_call's guard above (the VM twin-asymmetry rule: both call paths need
+    // it). Without this, a closure-typed local/param sharing a reserved builtin name (e.g. a
+    // `write: WFn` param alongside a same-namespace extern `write`) gets hijacked into the
+    // builtin call instead of calling the closure VALUE the checker already resolved.
+    // (W10) a CLOSURE call in statement position: a LAMBDA value executes its own body+captures; a
+    // NAMED-fn value resolves THAT function (W10a). Otherwise resolve the callee path.
+    if c.is_closure_call {
+        match read_var(env, c.callee.segments[c.callee.segments.len - 1].name) {
+            FuncVal as fv => if fv.is_lambda { let r = eval_lambda_call(fv, c, env); return StmtVal { value= r.value; env= r.env } } else { }
+            _ => { }
+        }
+    }
     // A builtin that RAN (`ran= true`) is `-> void` — yield null, but the env is now
     // BuiltinRes.env (issue #106), NOT the original `env`: a builtin's argument expression may
     // itself contain a `Ref<T>` value-position call (e.g. a closure writing `r.value` nested
@@ -3121,25 +3143,19 @@ fn call_value(c: checker::TCall, env: Venv) -> StmtVal {
     // write on the self-hosted engine only (vm.c is immune: its cell store is a global shared
     // by pointer — g_cells in vm.c — so the write is already visible with no merge needed).
     // A `false`/`error` result == "not a builtin": run the user fn.
-    match try_builtin(c.callee, c.args, env) {
-        BuiltinRes as br => if br.ran { return StmtVal { value= null; env= br.env } }
-        error            => {}
-    }
-    // VALUE-producing builtins — a statement-position call can be a function's TRAILING expression
-    // (B.20), e.g. `fn empty_table() -> TypeTable { teko::list::empty() }`. Route them exactly like
-    // eval_call (list/err/str/fs) BEFORE user-fn resolution; without this a trailing `teko::list::empty()`
-    // fell through to find_function("empty") → "host function the VM cannot run". (No ref args.)
-    match try_list_builtin(c.callee, c.args, env) { Value as v => return StmtVal { value= v; env= env }; null => {} }
-    match try_err_builtin(c.callee, c.args, env)  { Value as v => return StmtVal { value= v; env= env }; null => {} }
-    match try_str_builtin(c.callee, c.args, env)  { Value as v => return StmtVal { value= v; env= env }; null => {} }
-    match try_fs_builtin(c.callee, c.args, env)   { Value as v => return StmtVal { value= v; env= env }; null => {} }
-    // (W10) a CLOSURE call in statement position: a LAMBDA value executes its own body+captures; a
-    // NAMED-fn value resolves THAT function (W10a). Otherwise resolve the callee path.
-    if c.is_closure_call {
-        match read_var(env, c.callee.segments[c.callee.segments.len - 1].name) {
-            FuncVal as fv => if fv.is_lambda { let r = eval_lambda_call(fv, c, env); return StmtVal { value= r.value; env= r.env } } else { }
-            _ => { }
+    if !c.is_closure_call {
+        match try_builtin(c.callee, c.args, env) {
+            BuiltinRes as br => if br.ran { return StmtVal { value= null; env= br.env } }
+            error            => {}
         }
+        // VALUE-producing builtins — a statement-position call can be a function's TRAILING expression
+        // (B.20), e.g. `fn empty_table() -> TypeTable { teko::list::empty() }`. Route them exactly like
+        // eval_call (list/err/str/fs) BEFORE user-fn resolution; without this a trailing `teko::list::empty()`
+        // fell through to find_function("empty") → "host function the VM cannot run". (No ref args.)
+        match try_list_builtin(c.callee, c.args, env) { Value as v => return StmtVal { value= v; env= env }; null => {} }
+        match try_err_builtin(c.callee, c.args, env)  { Value as v => return StmtVal { value= v; env= env }; null => {} }
+        match try_str_builtin(c.callee, c.args, env)  { Value as v => return StmtVal { value= v; env= env }; null => {} }
+        match try_fs_builtin(c.callee, c.args, env)   { Value as v => return StmtVal { value= v; env= env }; null => {} }
     }
     let h = if c.is_closure_call {
         match read_var(env, c.callee.segments[c.callee.segments.len - 1].name) {

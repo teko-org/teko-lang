@@ -1753,6 +1753,16 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
             // (W10b.D3) a DYNAMIC contract-method call dispatches through the receiver's vtable —
             // FIRST, before any builtin name-sniffing below could collide with a method name.
             if (e->as.call.is_iface_dispatch) return emit_iface_call(b, e, err);
+            // (#107) a CLOSURE call (the checker resolved the callee to an in-scope local/param/
+            // let-bound function VALUE, not a namespace fn) ALSO goes first, before any of the
+            // builtin/host-FFI name-sniffing blocks below: those match by BARE last-segment name
+            // only (`write`, `print`, `len`, …) with no scope awareness, so a closure-typed
+            // binding sharing one of those reserved names (e.g. a `write: WFn` param in a
+            // namespace that also has an extern `write`) would otherwise be hijacked into the
+            // builtin/extern call instead of calling the closure VALUE — the checker already
+            // proved `is_closure_call` (tk_env_lookup_call scans innermost-first, so the local
+            // always wins over the namespace fn); codegen just has to respect that verdict.
+            if (e->as.call.is_closure_call) return emit_closure_call(b, e, err);
             // callee path -> C identifier joined by "__" (single-segment in M0).
             tk_path p = e->as.call.callee;
             // E2 (native): err_loc/err_typed adorn an error VALUE with diagnostic position/types.
@@ -2037,13 +2047,11 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
                     // call agree and same-named functions across namespaces never collide.
                     cb_fn_name(b, e->as.call.call_ns, p.segments[p.len - 1].name);
                 }
-            } else if (e->as.call.is_closure_call) {
-                // (W10) call THROUGH a tk_closure VALUE — a single-eval statement-expression that
-                // dispatches on `env` (no-env ABI for named/non-capturing; env-first for capturing).
-                return emit_closure_call(b, e, err);
             } else {
                 // No resolved namespace (a builtin, or a name not carried) → the bare
-                // (keyword-escaped) last segment.
+                // (keyword-escaped) last segment. (A closure call never reaches here — the (#107)
+                // is_closure_call guard at the top of this CALL case already returned via
+                // emit_closure_call.)
                 cb_ident(b, p.segments[p.len - 1].name);
             }
             // A resolved USER call: wrap each arg into its parameter type (emit_as) so a bare case
@@ -5294,7 +5302,16 @@ static void cg_lift_program(void) {
             cg_lift_stmt(&g_cg_prog.items[i].as.statement, &next, &fns, &nfns);
     }
     if (nfns == 0) return;
-    tk_titem *ni = tk_realloc0(g_cg_prog.items, (g_cg_prog.nitems + nfns) * sizeof *ni); if (!ni) abort();
+    // Grow into a FRESH array — never realloc the caller's buffer. `tk_emit_c` receives the
+    // typer's `prog` by value, so `g_cg_prog.items` aliases storage the DRIVER still holds
+    // (tk_backend reads it again for `tk_emit_tsym` after emission). A realloc here frees
+    // that storage under the driver's feet — a use-after-free in tk_emit_tsym (heap-layout-
+    // dependent: crashed the native build of any project with a non-capturing lambda on
+    // glibc, silent on macOS). Mirrors codegen.tks::cg_lift_lambdas, which builds a NEW
+    // items list and leaves `prog0.items` untouched. The old buffer stays owned by the
+    // typer (compiler-lifetime allocation — same discipline as every other front-end list).
+    tk_titem *ni = tk_alloc((g_cg_prog.nitems + nfns) * sizeof *ni);
+    memcpy(ni, g_cg_prog.items, g_cg_prog.nitems * sizeof *ni);
     g_cg_prog.items = ni;
     for (size_t k = 0; k < nfns; k += 1)
         g_cg_prog.items[g_cg_prog.nitems++] = (tk_titem){ .tag = TK_TITEM_FUNCTION, .as.function = fns[k] };
