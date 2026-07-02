@@ -2059,6 +2059,10 @@ fn impl_method_arg(name: str, vis: parser::Visibility) -> parser::Function {
     let params = teko::list::push(teko::list::push(teko::list::empty(), recv_param("self")), parser::Param { name = "x"; has_type = true; type_ann = named_t("i64"); is_params = false; has_default = false; default_expr = e_num(0) })
     parser::Function { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = params; has_return = true; return_type = named_t("i64"); body = one_stmt(e_num(0)); vis = vis; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false }
 }
+// a STATIC method `[vis] fn name() -> i64 { 0 }` (NO untyped receiver).
+fn impl_static_method(name: str, vis: parser::Visibility) -> parser::Function {
+    parser::Function { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = teko::list::empty(); has_return = true; return_type = named_t("i64"); body = one_stmt(e_num(0)); vis = vis; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false }
+}
 fn iface_item(name: str, methods: []parser::Function, extends: []str) -> parser::Item {
     parser::Item { content = parser::TypeDecl { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::InterfaceBody { extends = extends; methods = methods }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }; namespace = ""; file = "" }
 }
@@ -2188,6 +2192,62 @@ fn iface_as_value_type_is_error() {
     match type_program(parser::Program { items = items }) {
         TProgram => teko::assert::is_true(false)   // interface as a value/field type -> must fail
         error    => teko::assert::is_true(true)
+    }
+}
+
+#test
+fn iface_static_method_does_not_satisfy_instance_method() {
+    // the interface wants an INSTANCE `describe(self)`; the struct provides a STATIC `describe()`.
+    // A static method must NOT satisfy an instance interface method -> "missing method" error.
+    let ifc = iface_item("Greetable", list1(iface_method("greet")), teko::list::empty())
+    let imp = impl_struct_item("Hi", list1(impl_static_method("greet", parser::Visibility::Pub)), slist1("Greetable"))
+    let items = teko::list::push(teko::list::push(teko::list::empty(), ifc), imp)
+    match type_program(parser::Program { items = items }) {
+        TProgram => teko::assert::is_true(false)   // static != instance -> must fail
+        error    => teko::assert::is_true(true)
+    }
+}
+
+#test
+fn iface_cyclic_extends_is_error() {
+    // Acyc extends Bcyc, Bcyc extends Acyc -> a cycle. Conformance must fail GRACEFULLY (an honest
+    // error), NOT recurse forever / crash the test run.
+    let a = iface_item("Acyc", list1(iface_method("a")), slist1("Bcyc"))
+    let b = iface_item("Bcyc", list1(iface_method("b")), slist1("Acyc"))
+    let both = teko::list::push(list1(impl_method("a", parser::Visibility::Pub)), impl_method("b", parser::Visibility::Pub))
+    let imp = impl_struct_item("Tcyc", both, slist1("Acyc"))
+    mut items: []parser::Item = teko::list::empty()
+    items = teko::list::push(items, a)
+    items = teko::list::push(items, b)
+    items = teko::list::push(items, imp)
+    match type_program(parser::Program { items = items }) {
+        TProgram => teko::assert::is_true(false)   // cyclic extends -> must fail (not hang/crash)
+        error    => teko::assert::is_true(true)
+    }
+}
+
+#test
+fn iface_diamond_extends_ok() {
+    // Dtop extends Bmid & Cmid; Bmid extends Abase; Cmid extends Abase. Abase is reached via TWO
+    // branches — that is a DIAMOND, NOT a cycle — so a struct providing a/b/c/d must conform.
+    let a = iface_item("Abase", list1(iface_method("a")), teko::list::empty())
+    let b = iface_item("Bmid", list1(iface_method("b")), slist1("Abase"))
+    let c = iface_item("Cmid", list1(iface_method("c")), slist1("Abase"))
+    let d = iface_item("Dtop", list1(iface_method("d")), teko::list::push(slist1("Bmid"), "Cmid"))
+    mut methods = list1(impl_method("a", parser::Visibility::Pub))
+    methods = teko::list::push(methods, impl_method("b", parser::Visibility::Pub))
+    methods = teko::list::push(methods, impl_method("c", parser::Visibility::Pub))
+    methods = teko::list::push(methods, impl_method("d", parser::Visibility::Pub))
+    let imp = impl_struct_item("Tdia", methods, slist1("Dtop"))
+    mut items: []parser::Item = teko::list::empty()
+    items = teko::list::push(items, a)
+    items = teko::list::push(items, b)
+    items = teko::list::push(items, c)
+    items = teko::list::push(items, d)
+    items = teko::list::push(items, imp)
+    match type_program(parser::Program { items = items }) {
+        TProgram => teko::assert::is_true(true)     // diamond is legal -> must NOT fail
+        error    => teko::assert::is_true(false)
     }
 }
 

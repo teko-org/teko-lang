@@ -386,13 +386,24 @@ pub fn find_interface_body(name: str, table: TypeTable) -> parser::InterfaceBody
 
 // (W10b.IF) an interface's EFFECTIVE methods: (transitively) every extended interface's methods,
 // then its own. Each `extends` name must itself be an interface (find_interface_body enforces it).
-pub fn effective_interface_methods(ib: parser::InterfaceBody, table: TypeTable) -> []parser::Function | error {
+// `seen` = the interface names on the current root→here PATH — a name reappearing on the path is a
+// CYCLE (`interface A B { } / interface B A { }`), rejected as an honest error instead of recursing
+// forever (a diamond — the same interface reached via two DIFFERENT branches — is fine, since `seen`
+// tracks only the current path, not all-visited). Callers seed `seen` with the interface's OWN name.
+pub fn effective_interface_methods(ib: parser::InterfaceBody, table: TypeTable, seen: []str) -> []parser::Function | error {
     mut out: []parser::Function = teko::list::empty()
     mut ei = 0
     loop {
         if ei >= ib.extends.len { break }
-        let base_ib = match find_interface_body(ib.extends[ei], table) { parser::InterfaceBody as b => b; error as e => return e }
-        let bm = match effective_interface_methods(base_ib, table) { []parser::Function as f => f; error as e => return e }
+        let ename = ib.extends[ei]
+        mut si = 0
+        loop {
+            if si >= seen.len { break }
+            if seen[si] == ename { return error { message = $"cyclic interface `extends`: '{ename}' extends itself (directly or transitively)" } }
+            si++
+        }
+        let base_ib = match find_interface_body(ename, table) { parser::InterfaceBody as b => b; error as e => return e }
+        let bm = match effective_interface_methods(base_ib, table, teko::list::push(seen, ename)) { []parser::Function as f => f; error as e => return e }
         mut bi = 0
         loop { if bi >= bm.len { break }; out = teko::list::push(out, bm[bi]); bi++ }
         ei++
@@ -411,6 +422,9 @@ fn method_sig_matches(req: parser::Function, impl_m: parser::Function, table: Ty
     if req.params.len > 0 && !req.params[0].has_type { rstart = 1 }
     mut istart: u64 = 0
     if impl_m.params.len > 0 && !impl_m.params[0].has_type { istart = 1 }
+    // instance/static parity: an INSTANCE interface method (has a receiver) must be satisfied by an
+    // INSTANCE method, not a same-named STATIC one (rstart/istart are 1 iff a receiver is present).
+    if rstart != istart { return false }
     if req.params.len - rstart != impl_m.params.len - istart { return false }
     mut k: u64 = 0
     loop {
@@ -443,7 +457,7 @@ fn check_conformance(type_name: str, own_methods: []parser::Function, implements
         if ii >= implements.len { break }
         let iname = implements[ii]
         let ib = match find_interface_body(iname, table) { parser::InterfaceBody as b => b; error as e => return e }
-        let req_methods = match effective_interface_methods(ib, table) { []parser::Function as f => f; error as e => return e }
+        let req_methods = match effective_interface_methods(ib, table, teko::list::push(teko::list::empty(), iname)) { []parser::Function as f => f; error as e => return e }
         mut ri = 0
         loop {
             if ri >= req_methods.len { break }
@@ -520,8 +534,9 @@ fn validate_type_decls(table: TypeTable) -> error? {
                 match check_conformance(decl.name, eff, cb.implements, table, false) { error as e => return e; null => {} }   // (W10b.IF) class methods need real `pub`
             }
             parser::InterfaceBody as ib => {
-                // (W10b.IF) an interface's own `extends` names must each BE an interface (transitively).
-                match effective_interface_methods(ib, table) { []parser::Function => {}; error as e => return e }
+                // (W10b.IF) an interface's own `extends` names must each BE an interface (transitively)
+                // and must not form a cycle (seed `seen` with this interface's own name).
+                match effective_interface_methods(ib, table, teko::list::push(teko::list::empty(), decl.name)) { []parser::Function => {}; error as e => return e }
             }
             _ => {}
         }

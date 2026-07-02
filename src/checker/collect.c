@@ -290,13 +290,27 @@ static ifacebody_result find_interface_body(tk_str name, tk_type_table table) {
 
 // (W10b.IF) an interface's EFFECTIVE methods: (transitively) every extended interface's methods,
 // then its own. Each `extends` name must itself be an interface (find_interface_body enforces it).
-// Mirror of collect.tks::effective_interface_methods.
-static tk_methodsvec_result effective_interface_methods(tk_interface_body ib, tk_type_table table) {
+// `seen` = the interface names on the current root→here PATH — a name reappearing on the path is a
+// CYCLE, rejected as an honest error instead of recursing forever (a diamond via two DIFFERENT
+// branches is fine — `seen` tracks only the current path). Mirror of
+// collect.tks::effective_interface_methods.
+static tk_methodsvec_result effective_interface_methods(tk_interface_body ib, tk_type_table table, const tk_str *seen, size_t n_seen) {
     tk_function *out = NULL; size_t n_out = 0;
     for (size_t ei = 0; ei < ib.n_extends; ei += 1) {
-        ifacebody_result base_ib = find_interface_body(ib.extends[ei], table);
+        tk_str ename = ib.extends[ei];
+        for (size_t si = 0; si < n_seen; si += 1) {
+            if (tk_str_eq(seen[si], ename)) {
+                size_t len = ename.len + 96; char *buf = tk_alloc(len); if (!buf) abort();
+                snprintf(buf, len, "cyclic interface `extends`: '%.*s' extends itself (directly or transitively)", (int)ename.len, (const char *)ename.ptr);
+                return (tk_methodsvec_result){ .ok = false, .as.error = tk_error_make(buf) };
+            }
+        }
+        ifacebody_result base_ib = find_interface_body(ename, table);
         if (!base_ib.ok) return (tk_methodsvec_result){ .ok = false, .as.error = base_ib.as.error };
-        tk_methodsvec_result bm = effective_interface_methods(base_ib.as.value, table);
+        tk_str *seen2 = tk_alloc((n_seen + 1) * sizeof *seen2); if (!seen2) abort();   // seen ++ [ename]
+        for (size_t i = 0; i < n_seen; i += 1) seen2[i] = seen[i];
+        seen2[n_seen] = ename;
+        tk_methodsvec_result bm = effective_interface_methods(base_ib.as.value, table, seen2, n_seen + 1);
         if (!bm.ok) return bm;
         for (size_t bi = 0; bi < bm.as.value.len; bi += 1) tk_functions_push(&out, &n_out, bm.as.value.ptr[bi]);
     }
@@ -310,6 +324,9 @@ static tk_methodsvec_result effective_interface_methods(tk_interface_body ib, tk
 static bool method_sig_matches(tk_function req, tk_function impl_m, tk_type_table table) {
     size_t rstart = (req.nparams > 0 && !req.params[0].has_type) ? 1 : 0;
     size_t istart = (impl_m.nparams > 0 && !impl_m.params[0].has_type) ? 1 : 0;
+    // instance/static parity: an INSTANCE interface method (has a receiver) must be satisfied by an
+    // INSTANCE method, not a same-named STATIC one (rstart/istart are 1 iff a receiver is present).
+    if (rstart != istart) return false;
     if (req.nparams - rstart != impl_m.nparams - istart) return false;
     for (size_t k = 0; rstart + k < req.nparams; k += 1) {
         tk_type_result rt = tk_resolve_type(req.params[rstart + k].type_ann, table);
@@ -338,7 +355,7 @@ static tk_type_result check_conformance(tk_str type_name, const tk_function *own
         tk_str iname = implements[ii];
         ifacebody_result ib = find_interface_body(iname, table);
         if (!ib.ok) return (tk_type_result){ .ok = false, .as.error = ib.as.error };
-        tk_methodsvec_result req_methods = effective_interface_methods(ib.as.value, table);
+        tk_methodsvec_result req_methods = effective_interface_methods(ib.as.value, table, &iname, 1);   // seed cycle-path with the interface's own name
         if (!req_methods.ok) return (tk_type_result){ .ok = false, .as.error = req_methods.as.error };
         for (size_t ri = 0; ri < req_methods.as.value.len; ri += 1) {
             tk_function req = req_methods.as.value.ptr[ri];
@@ -415,8 +432,10 @@ static tk_type_result validate_type_decls(tk_type_table table) {
                                                   body.as.class_body.implements, body.as.class_body.n_implements, table, false);
             if (!cf.ok) return cf;
         } else if (body.tag == TK_BODY_INTERFACE) {
-            // (W10b.IF) an interface's own `extends` names must each BE an interface (transitively).
-            tk_methodsvec_result em = effective_interface_methods(body.as.interface_body, table);
+            // (W10b.IF) an interface's own `extends` names must each BE an interface (transitively)
+            // and must not form a cycle (seed the cycle-path with this interface's own name).
+            tk_str dn = decl.name;
+            tk_methodsvec_result em = effective_interface_methods(body.as.interface_body, table, &dn, 1);
             if (!em.ok) return (tk_type_result){ .ok = false, .as.error = em.as.error };
         }
     }
