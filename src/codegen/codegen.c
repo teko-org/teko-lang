@@ -5294,7 +5294,16 @@ static void cg_lift_program(void) {
             cg_lift_stmt(&g_cg_prog.items[i].as.statement, &next, &fns, &nfns);
     }
     if (nfns == 0) return;
-    tk_titem *ni = tk_realloc0(g_cg_prog.items, (g_cg_prog.nitems + nfns) * sizeof *ni); if (!ni) abort();
+    // Grow into a FRESH array — never realloc the caller's buffer. `tk_emit_c` receives the
+    // typer's `prog` by value, so `g_cg_prog.items` aliases storage the DRIVER still holds
+    // (tk_backend reads it again for `tk_emit_tsym` after emission). A realloc here frees
+    // that storage under the driver's feet — a use-after-free in tk_emit_tsym (heap-layout-
+    // dependent: crashed the native build of any project with a non-capturing lambda on
+    // glibc, silent on macOS). Mirrors codegen.tks::cg_lift_lambdas, which builds a NEW
+    // items list and leaves `prog0.items` untouched. The old buffer stays owned by the
+    // typer (compiler-lifetime allocation — same discipline as every other front-end list).
+    tk_titem *ni = tk_alloc((g_cg_prog.nitems + nfns) * sizeof *ni);
+    memcpy(ni, g_cg_prog.items, g_cg_prog.nitems * sizeof *ni);
     g_cg_prog.items = ni;
     for (size_t k = 0; k < nfns; k += 1)
         g_cg_prog.items[g_cg_prog.nitems++] = (tk_titem){ .tag = TK_TITEM_FUNCTION, .as.function = fns[k] };
