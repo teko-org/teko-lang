@@ -1,0 +1,148 @@
+// examples/regressions/json_roundtrip/src/m/work.tks
+//
+// Drives S-JSON (teko::encoding::json, mirrored verbatim in this fixture's own
+// src/j/json.tks — see that file's header, namespace json_roundtrip::j, `use j`d
+// below) through decode -> encode -> decode -> encode and asserts the round-trip
+// fixpoint plus per-kind decoded shape checks. Each of the 9 checks below
+// contributes exactly 1 to the exit code (bool_to_i64), so a passing run exits 9
+// and any single regression changes the exit code (deterministic, both engines
+// must agree — the differential harness's contract).
+
+use j
+
+fn bool_to_i64(b: bool) -> i64 {
+    if b { 1 } else { 0 }
+}
+
+fn str_equal(a: str, b: str) -> bool {
+    if a.len != b.len { return false }
+    mut i: u64 = 0
+    loop {
+        if i >= a.len { break }
+        if a[i] != b[i] { return false }
+        i++
+    }
+    true
+}
+
+pub fn check_ops() -> i64 {
+    let doc = "{\"name\":\"Ada\",\"age\":36,\"score\":-3.5,\"active\":true,\"nothing\":null,\"tags\":[\"x\",\"y\\\"z\"],\"nested\":{\"e\":1.5e2,\"esc\":\"a\\nb\\tc\"}}"
+
+    let value = match j::decode(doc) {
+        j::JsonValue as v => v
+        error => j::JsonNull { }
+    }
+
+    // check 1: top-level decodes to an object with the expected member count.
+    let c1 = match value {
+        j::JsonObject as o => bool_to_i64(o.keys.len == 7)
+        _ => 0
+    }
+
+    // check 2: object_get finds "name" -> JsonString "Ada".
+    let c2 = match value {
+        j::JsonObject as o => match j::object_get(o, "name") {
+            j::JsonValue as v => match v {
+                j::JsonString as s => bool_to_i64(str_equal(s.value, "Ada"))
+                _ => 0
+            }
+            null => 0
+        }
+        _ => 0
+    }
+
+    // check 3: negative fractional number decodes exactly.
+    let c3 = match value {
+        j::JsonObject as o => match j::object_get(o, "score") {
+            j::JsonValue as v => match v {
+                j::JsonNumber as n => bool_to_i64(n.value == -3.5)
+                _ => 0
+            }
+            null => 0
+        }
+        _ => 0
+    }
+
+    // check 4: array_get + escaped-quote string inside an array.
+    let c4 = match value {
+        j::JsonObject as o => match j::object_get(o, "tags") {
+            j::JsonValue as v => match v {
+                j::JsonArray as a => match j::array_get(a, 1) {
+                    j::JsonValue as v2 => match v2 {
+                        j::JsonString as s => bool_to_i64(str_equal(s.value, "y\"z"))
+                        _ => 0
+                    }
+                    null => 0
+                }
+                _ => 0
+            }
+            null => 0
+        }
+        _ => 0
+    }
+
+    // check 5: nested object's exponent-form number decodes exactly (1.5e2 = 150).
+    let c5 = match value {
+        j::JsonObject as o => match j::object_get(o, "nested") {
+            j::JsonValue as v => match v {
+                j::JsonObject as inner => match j::object_get(inner, "e") {
+                    j::JsonValue as v2 => match v2 {
+                        j::JsonNumber as n => bool_to_i64(n.value == 150.0)
+                        _ => 0
+                    }
+                    null => 0
+                }
+                _ => 0
+            }
+            null => 0
+        }
+        _ => 0
+    }
+
+    // check 6: nested object's \n\t escapes decode correctly.
+    let c6 = match value {
+        j::JsonObject as o => match j::object_get(o, "nested") {
+            j::JsonValue as v => match v {
+                j::JsonObject as inner => match j::object_get(inner, "esc") {
+                    j::JsonValue as v2 => match v2 {
+                        j::JsonString as s => bool_to_i64(str_equal(s.value, "a\nb\tc"))
+                        _ => 0
+                    }
+                    null => 0
+                }
+                _ => 0
+            }
+            null => 0
+        }
+        _ => 0
+    }
+
+    // check 7: "nothing" decodes to JsonNull.
+    let c7 = match value {
+        j::JsonObject as o => match j::object_get(o, "nothing") {
+            j::JsonValue as v => match v {
+                j::JsonNull => 1
+                _ => 0
+            }
+            null => 0
+        }
+        _ => 0
+    }
+
+    // check 8: the round-trip fixpoint — encode, decode again, encode again: identical.
+    let encoded1 = j::encode(value)
+    let value2 = match j::decode(encoded1) {
+        j::JsonValue as v => v
+        error => j::JsonNull { }
+    }
+    let encoded2 = j::encode(value2)
+    let c8 = bool_to_i64(str_equal(encoded1, encoded2))
+
+    // check 9: a separately malformed document is rejected as `error` (M.1 — no panic).
+    let c9 = match j::decode("{\"a\": }") {
+        j::JsonValue => 0
+        error => 1
+    }
+
+    c1 + c2 + c3 + c4 + c5 + c6 + c7 + c8 + c9
+}

@@ -50,6 +50,7 @@ static void usage(void) {
     fputs("usage: teko build <projdir>   build the project to a native binary\n"
           "       teko run   <projdir>   run the project on the VM (debug profile)\n"
           "       teko test  <projdir>   run the project's tests\n"
+          "       teko fmt   [--check] <path>...   format .tks/.tkt sources (self-hosted binary only)\n"
           "       teko <projdir>         (bare) ≡ build\n"
           "teko compiles projects, not files: pass a project directory or .tkp\n",
           stderr);
@@ -114,6 +115,18 @@ int main(int argc, char **argv) {
     const char *cmd = argv[1];
 
     char buf[4096];
+
+    // `fmt` — DT0 (TEKO_ROADMAP_DEVTOOLS): the canonical formatter is implemented PURE-TEKO
+    // in src/fmt/fmt.tks (the teko::regex/teko::fs precedent: corpus source, no C twin), so it
+    // exists in every SELF-HOSTED binary this seed builds. MIRRORS main.tks's `fmt` arm: the
+    // seed recognizes the subcommand (so `fmt` is never mistaken for a project directory) and
+    // stops honestly (M.3) — the seed exists to bootstrap the corpus, not to format it.
+    if (strcmp(cmd, "fmt") == 0) {
+        fputs("teko: `teko fmt` is implemented by the self-hosted compiler (src/fmt/fmt.tks);\n"
+              "this C seed binary only bootstraps (build/run/test). Build the compiler\n"
+              "(`teko build . -o bin`) and run `bin/teko fmt` instead.\n", stderr);
+        return 2;
+    }
 
     // Explicit subcommands take a project (directory or `.tkp`) + optional `-o <dir>`.
     if (strcmp(cmd, "build") == 0 || strcmp(cmd, "run") == 0 || strcmp(cmd, "test") == 0) {
