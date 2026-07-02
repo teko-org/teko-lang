@@ -1131,3 +1131,74 @@ fn iface_constraint_accepts_conforming_class() {
     teko::assert::is_true(held.area() == 27)
     teko::assert::is_true(vm_shape_area(held) == 27)
 }
+
+// (#102) HOMOGENEOUS CLASS SLICES — the VM has always evaluated `[]<Class>` correctly (these
+// tests already held pre-fix); the bug was native-only (a `tk_slice_<Class>` typedef emitted
+// before the class's own `tk_t_<Class>` typedef was visible → `cc` failed with "unknown type
+// name"). These lock the VM side of the corpus and are mirrored by a differential native
+// regression (examples/regressions/class_slices) so both engines agree end-to-end.
+type VmPointD3 = class {
+    pub x: i64
+    pub y: i64
+    pub fn make(xx: i64, yy: i64) -> VmPointD3 { VmPointD3 { x = xx; y = yy } }
+    pub fn sum(self) -> i64 { self.x + self.y }
+}
+
+// construction + len + indexed method-call dispatch on a plain (non-interface) class slice.
+#test
+fn class_slice_construct_index_len_holds() {
+    let pts: []VmPointD3 = [VmPointD3::make(1, 2), VmPointD3::make(3, 4)]
+    teko::assert::is_true(pts.len == 2)
+    teko::assert::is_true(pts[0].sum() == 3)
+    teko::assert::is_true(pts[1].sum() == 7)
+}
+
+// nested `[][]<Class>` — a slice of class-slices, chained indexing + per-row len.
+#test
+fn class_slice_nested_holds() {
+    let row0: []VmPointD3 = [VmPointD3::make(1, 1), VmPointD3::make(2, 2)]
+    let row1: []VmPointD3 = [VmPointD3::make(3, 3)]
+    let grid: [][]VmPointD3 = [row0, row1]
+    teko::assert::is_true(grid.len == 2)
+    teko::assert::is_true(grid[0].len == 2)
+    teko::assert::is_true(grid[1].len == 1)
+    teko::assert::is_true(grid[0][1].sum() == 4)
+    teko::assert::is_true(grid[1][0].sum() == 6)
+}
+
+// a class slice held as a STRUCT FIELD, and passed as a PARAM / returned from a fn.
+type VmPointGroupD3 = struct { members: []VmPointD3 }
+
+fn vm_sum_points(pts: []VmPointD3) -> i64 {
+    mut total: i64 = 0
+    mut i: u64 = 0
+    loop {
+        if i >= pts.len { break }
+        total = total + pts[i].sum()
+        i++
+    }
+    total
+}
+
+fn vm_make_points(a: i64, b: i64) -> []VmPointD3 {
+    [VmPointD3::make(a, 0), VmPointD3::make(b, 0)]
+}
+
+#test
+fn class_slice_field_param_return_holds() {
+    let g = VmPointGroupD3 { members = vm_make_points(2, 3) }
+    teko::assert::is_true(g.members.len == 2)
+    teko::assert::is_true(g.members[1].sum() == 3)
+    teko::assert::is_true(vm_sum_points(vm_make_points(4, 5)) == 9)
+}
+
+// covariant `[]<Class>` -> `[]<Interface>` upcast of a homogeneous class-slice VALUE, then
+// heterogeneous dispatch through the resulting interface slice (D3 dispatch machinery).
+#test
+fn class_slice_covariant_upcast_holds() {
+    let circles: []VmCircleD3 = [VmCircleD3::make(1), VmCircleD3::make(2)]
+    let shapes: []VmShape = circles
+    teko::assert::is_true(vm_total_area(shapes) == 15)   // 1*1*3 + 2*2*3 = 3 + 12
+    let mixed: []VmShape = [VmCircleD3::make(1), VmSquareD3::make(3)]
+    teko::assert::is_true(vm_total_area(mixed) == 12)    // 1*1*3 + 3*3 = 3 + 9
+}
