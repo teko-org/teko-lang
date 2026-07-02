@@ -1,0 +1,32 @@
+// REGRESSION (#72): `exit(<int>)` on a NORMALLY-REACHED (success) path used to abort the VM
+// with "vm: `exit` is a host function the VM cannot run" (SIGABRT/134) instead of terminating
+// the interpreted program with the given status code — a VM≠native divergence. `exit`/`panic`
+// are compiler-known GLOBAL DIVERGING functions (no `never` type — the legislator's ruling),
+// so a success-path `exit(n)` must behave IDENTICALLY on both engines: process exit with n.
+//
+// Before the fix, every other regression fixture worked around this gap by calling `exit`
+// ONLY on failure branches and falling off the end (implicit exit 0) for success — which HID
+// the gap instead of exercising it. This fixture calls `exit` on the reached-in-practice
+// success path, on purpose, both DIRECTLY (statement position -> call_value) and THROUGH A
+// FUNCTION VALUE (a wrapper closure -> call_value's is_closure_call / try_lambda_call path;
+// `exit` itself is not a first-class value — the checker rejects `let f = exit` as an
+// undefined name, since `exit`/`panic` are recognized only in CALL FORM — so the
+// call-through-function-value case is proven via an indirect closure that itself calls exit).
+//
+// computed: some ordinary work product, unrelated to the exit code, to prove exit(5) really
+// runs on a path that did REAL work first (not a trivial/empty success).
+let computed: i64 = sum_to(4)   // 1+2+3+4 = 10
+if computed != 10 { exit(1) }   // failure branch (never taken) — the OLD workaround style
+
+// call-through-function-value: a wrapper closure whose body calls the global `exit`. Invoking
+// it in STATEMENT position (`wrapped_exit(...)`) is an is_closure_call, dispatched through
+// try_lambda_call inside call_value — the twin-asymmetry-prone path (vm.c's call_value /
+// vm.tks's call_value, both distinct from eval_call). If only eval_call gained the intrinsic
+// and call_value did not (or vice versa), this line — not the direct exit(1) above — is what
+// would still abort.
+let wrapped_exit = (code: i64) => exit(code)
+wrapped_exit(5)   // SUCCESS-PATH exit — the whole point of this fixture: VM exit == native exit == 5
+
+// unreachable: exit(code) diverges. If this ever executes, the VM/native failed to honor the
+// diverging call and the exit code would be wrong (project falls off the end -> implicit 0).
+exit(66)

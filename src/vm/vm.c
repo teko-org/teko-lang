@@ -33,6 +33,13 @@ void tk_eprintln(tk_str s);
 _Noreturn void tk_panic_div0(void);
 _Noreturn void tk_panic_cast(void);
 _Noreturn void tk_panic_oob(void);    // "index out of bounds" (the subscript guard — W5-idx, M.1)
+// issue #72 — the global diverging builtins `panic(str)` / `exit(<int>)` (legislator's ruling,
+// no `never` type — see typer.tks:595). Both terminate the WHOLE PROCESS, matching native
+// (tk_panic_str prints "teko: panic: <msg>" + backtrace then abort()s; tk_exit frees arena
+// regions then calls the libc exit(code)). Declared here (not teko_rt.h — see the note above)
+// so try_builtin_call can route to them exactly like print/println.
+_Noreturn void tk_panic_str(tk_str msg);
+_Noreturn void tk_exit(int32_t code);
 // string-interpolation builders — the VM concatenates pieces+holes via the SAME runtime
 // symbols codegen emits, so VM==codegen byte-for-byte (incl int→decimal text). EXTERN
 // (linked from teko_rt.c), not the static-inline numeric guards.
@@ -649,6 +656,38 @@ static bool try_builtin_call(tk_path p, const tk_texpr *args, size_t nargs,
         tk_value a = tk_vm_eval_expr(&args[0], env);
         if (a.tag != TK_VAL_STR) vm_unsupported("ewrite/eprint/eprintln on a non-str value not yet supported");
         if (seg_is(last, "eprintln")) tk_eprintln(a.as.s); else tk_eprint(a.as.s);
+        *out = v_void();
+        return true;
+    }
+
+    // issue #72 — `exit(<int>)` / `panic(str)`: the injected GLOBAL diverging builtins
+    // (typer.tks:595 — no `never` type; the checker recognizes them unqualified or under the
+    // reserved `teko::` root, whichever namespace lookup finds nothing). Both terminate the
+    // WHOLE PROCESS, exactly like native (tk_exit / tk_panic_str — teko_rt.c), so `teko run`
+    // and a compiled binary agree on exit code (M.1/M.3): a success-path `exit(5)` now ends
+    // the VM with status 5 instead of aborting into the "host function" honest-stop. Neither
+    // call returns, so *out is never read after — set for consistency with the other builtins.
+    if (seg_is(last, "exit")) {
+        if (nargs != 1) vm_unsupported("exit expects exactly one argument (an integer status code)");
+        tk_value a = tk_vm_eval_expr(&args[0], env);
+        if (a.tag != TK_VAL_INT) vm_unsupported("exit's argument must be an integer status code (internal: checker should reject)");
+        tk_exit((int32_t)v_as_i128(a));   // _Noreturn — frees arena regions, then libc exit(code)
+        *out = v_void();
+        return true;
+    }
+    if (seg_is(last, "panic")) {
+        // The checker accepts `panic(error | str)` (typer.tks:595), but native codegen only
+        // wires the `str` arm today (codegen.c:1865 emits a bare `tk_panic_str(<arg>)`, which
+        // does not compile when the arg is a `tk_error` struct — a PRE-EXISTING, SEPARATE
+        // codegen gap, not this issue's VM≠native divergence; see the #72 report). Mirror that
+        // exact frontier here: `str` runs for real, `error` falls through to the honest stop
+        // (so a program using `panic(error)` fails the SAME way on both engines — neither runs).
+        if (nargs != 1) vm_unsupported("panic expects exactly one argument (an `error` or a `str`)");
+        tk_value a = tk_vm_eval_expr(&args[0], env);
+        if (a.tag == TK_VAL_STR) {
+            tk_panic_str(a.as.s);   // _Noreturn — "teko: panic: <msg>" + backtrace, frees regions, abort()
+        }
+        vm_unsupported("panic(error) not yet supported (native codegen cannot compile it either — a separate, pre-existing gap; use panic(str))");
         *out = v_void();
         return true;
     }
