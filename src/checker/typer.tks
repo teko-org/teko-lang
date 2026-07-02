@@ -92,6 +92,7 @@ fn lam_collect_expr(e: parser::Expr, refs: Ref<[]str>, bound: Ref<[]str>) -> voi
         parser::Coalesce as co    => { lam_collect_expr(co.left, refs, bound); lam_collect_expr(co.right, refs, bound) }
         parser::Cast as ct        => lam_collect_expr(ct.expr, refs, bound)
         parser::MethodCall as mc  => { lam_collect_expr(mc.receiver, refs, bound); mut i = 0; loop { if i >= mc.args.len { break }; lam_collect_expr(mc.args[i], refs, bound); i++ } }
+        parser::SafeMethodCall as smc => { lam_collect_expr(smc.receiver, refs, bound); mut i = 0; loop { if i >= smc.args.len { break }; lam_collect_expr(smc.args[i], refs, bound); i++ } }   // (NP-OOP, issue #116)
         parser::StructLit as sl   => { mut i = 0; loop { if i >= sl.field_vals.len { break }; lam_collect_expr(sl.field_vals[i], refs, bound); i++ } }
         parser::Index as ix       => { lam_collect_expr(ix.receiver, refs, bound); lam_collect_expr(ix.index, refs, bound) }
         parser::Interp as in      => { mut i = 0; loop { if i >= in.holes.len { break }; lam_collect_expr(in.holes[i], refs, bound); i++ } }
@@ -539,6 +540,12 @@ fn type_flags_method(mc: parser::MethodCall, env: Env, table: TypeTable) -> TExp
 fn type_method_call(mc: parser::MethodCall, env: Env, table: TypeTable) -> TExpr | error {
     let recv_t = match type_expr(mc.receiver, env, table) { TExpr as te => te.type; error as e => return e }
     if is_flags_named(recv_t, table) { return error { message = "method typing is deferred (B.29 / M.4)" } }
+    // (NP-OOP, issue #116) a bare `.` call on a nullable receiver stays a compile error — but say
+    // WHY and point at the sanctioned null-propagating call (`?.`) instead of the deferral message.
+    match recv_t {
+        Optional => return error { message = "cannot call a method with `.` on a nullable value (`T?`) — use `?.` (REBOOT_PLAN §203)" }
+        _ => {}
+    }
     let struct_name = match recv_t { Named as n => n.name; _ => return error { message = "method typing is deferred (B.29 / M.4)" } }
     let decl = match type_table_find(table, struct_name) { parser::TypeDecl as td => td; error => return error { message = "method typing is deferred (B.29 / M.4)" } }
     // (W10b.D3) an INTERFACE-typed receiver — a DYNAMIC contract-method call. The method resolves
@@ -1107,6 +1114,12 @@ fn type_field_access(fa: parser::FieldAccess, env: Env, table: TypeTable) -> TEx
         }
         _ => {}
     }
+    // (NP-OOP, issue #116) a bare `.` on a nullable receiver stays a compile error — but say WHY
+    // and point at the sanctioned readers (`?.`/`??`) instead of the generic struct message.
+    match recv.type {
+        Optional => return error { message = "cannot use `.` on a nullable value (`T?`) — read it with `?.` or `??` (REBOOT_PLAN §203)" }
+        _ => {}
+    }
     let name = match recv.type {
         Named as n => n.name
         _          => return error { message = "field access requires a struct receiver" }
@@ -1134,15 +1147,71 @@ fn type_field_access(fa: parser::FieldAccess, env: Env, table: TypeTable) -> TEx
     TExpr { kind = TFieldAccess { receiver = recv; field = fa.field }; type = ft; line = 0; col = 0 }
 }
 
-// `recv?.field` (REBOOT_PLAN §203): the receiver must be an Optional of a named struct; the
-// result is the field's type made optional (null propagates). Where the inner is not a known
-// struct we honest-error (M.3) — the struct-field layer beyond named structs is pending.
-fn type_safe_field_access(sfa: parser::SafeFieldAccess, env: Env, table: TypeTable) -> TExpr | error {
-    let recv = match type_expr(sfa.receiver, env, table) { TExpr as te => te; error as e => return e }
+// ---- `?.` safe navigation (NP-OOP, issue #116) — the shared checker DESUGAR ----
+// `recv?.member…` on a CLASS/INTERFACE optional lowers IN THE CHECKER to the equivalent
+// typed match (no new TAST node, so the VM and native codegen run it through their
+// existing match/method/field machinery — twin-identical by construction):
+//     match recv { null => null; <Inner> as __tkqL_C => __tkqL_C.<member…> }
+// typed `R?` (an already-optional R stays R?; a void R makes the whole safe call void —
+// statement position only, with an EMPTY null-arm body).
+
+// the deterministic per-node binder name `__tkq<line>_<col>` (position-derived, no global
+// counter — both twin checkers produce the same name for the same node).
+fn safe_binder_name(line: u32, col: u32) -> str { $"__tkq{line}_{col}" }
+
+// build the typed `match recv { null => <null:R?>; <Inner> as binder => <armv> }`.
+// `armv` is the already-typed present-arm value (the member call/read on the binder).
+fn safe_nav_match(recv: TExpr, inner_name: str, binder: str, armv: TExpr) -> TExpr {
+    let is_void = match armv.type { Void => true; _ => false }
+    let result = if is_void { armv.type } else {
+        match armv.type { Optional => armv.type; _ => Optional { inner = armv.type } }
+    }
+    // null arm: `null => null` (typed to the result optional) — or an EMPTY body when void.
+    mut null_body: []TStatement = teko::list::empty()
+    if !is_void {
+        null_body = teko::list::push(null_body, TExprStmt { expr = TExpr { kind = TNullLit { }; type = result; line = 0; col = 0 } })
+    }
+    mut arms: []TArm = teko::list::empty()
+    let guard_ph = TExpr { kind = TNumber { is_float = false; value = 0; fval = 0.0 }; type = Void { }; line = 0; col = 0 }   // placeholder, gated by has_when (never read)
+    arms = teko::list::push(arms, TArm { pattern = parser::NullPattern { }; has_when = false; guard = guard_ph; body = null_body })
+    // present arm: `<Inner> as binder => <armv>` — the pattern re-resolves nominally in the
+    // VM/codegen exactly like a user-written `match` over a `T?`.
+    mut segs: []parser::Segment = teko::list::empty()
+    segs = teko::list::push(segs, parser::Segment { name = inner_name })
+    let bindp = parser::BindPattern { type_name = parser::Path { segments = segs }; has_binding = true; binding = binder; is_slice = false; slice_type = null; type_args = [] }
+    mut pbody: []TStatement = teko::list::empty()
+    pbody = teko::list::push(pbody, TExprStmt { expr = armv })
+    arms = teko::list::push(arms, TArm { pattern = bindp; has_when = false; guard = guard_ph; body = pbody })
+    TExpr { kind = TMatchExpr { subject = recv; arms = arms }; type = result; line = 0; col = 0 }
+}
+
+// validate a `?.` receiver: must be a NON-sentinel optional; enrich the disjoint-domain
+// case (an `X | error` union reads via `match`, never `?.` — the LAW's other half).
+fn safe_nav_receiver(receiver: parser::Expr, env: Env, table: TypeTable) -> TExpr | error {
+    let recv = match type_expr(receiver, env, table) { TExpr as te => te; error as e => return e }
     let inner = match recv.type {
         Optional as o => o.inner
-        _             => return error { message = "safe field access `?.` needs an optional receiver (`T?`) — use `.` for a non-optional (REBOOT_PLAN §203)" }
+        _ => {
+            let is_error_like = match recv.type { Error => true; _ => match expand_variant(recv.type, table) { Variant => true; _ => false } }
+            if is_error_like {
+                return error { message = "`?.` reads absence (`T?`), never errors — inspect an `X | error` union with `match` (disjoint-domain law)" }
+            }
+            return error { message = "safe access `?.` needs an optional receiver (`T?`) — use `.` for a non-optional (REBOOT_PLAN §203)" }
+        }
     }
+    match inner {
+        Void => error { message = "`?.` on a bare `null` has no member to reach (annotate the optional's type)" }
+        _    => recv
+    }
+}
+
+// `recv?.field` (REBOOT_PLAN §203): the receiver must be an OPTIONAL of a named struct or
+// class; the result is the field's type made optional — null propagates. A STRUCT inner
+// keeps the dedicated TSafeFieldAccess node; a CLASS inner desugars to the safe-nav match
+// (NP-OOP), routing through type_field_access so visibility holds EXACTLY like a bare `.`.
+fn type_safe_field_access(sfa: parser::SafeFieldAccess, line: u32, col: u32, env: Env, table: TypeTable) -> TExpr | error {
+    let recv = match safe_nav_receiver(sfa.receiver, env, table) { TExpr as te => te; error as e => return e }
+    let inner = match recv.type { Optional as o => o.inner; _ => return error { message = "internal: safe_nav_receiver guarantees an optional" } }
     let name = match inner {
         Named as n => n.name
         _          => return error { message = "safe field access on a non-struct optional is not yet supported (the struct-field layer is pending — M.3)" }
@@ -1151,21 +1220,55 @@ fn type_safe_field_access(sfa: parser::SafeFieldAccess, env: Env, table: TypeTab
         parser::TypeDecl as td => td
         error          => return error { message = $"unknown type for safe field access: {name}" }
     }
+    // (NP-OOP, issue #116) CLASS route — desugar to the safe-nav match; the arm's field read
+    // is typed by type_field_access itself (same visibility, same `.len`/field rules).
+    match decl.body {
+        parser::ClassBody => {
+            let binder = safe_binder_name(line, col)
+            let env2 = define(env, binder, inner, false)
+            let rvar = parser::Expr { kind = parser::Var { name = binder }; line = line; col = col }
+            let fa2 = parser::FieldAccess { receiver = rvar; field = sfa.field }
+            let tf = match type_field_access(fa2, env2, table) { TExpr as te => te; error as e => return e }
+            return safe_nav_match(recv, name, binder, tf)
+        }
+        _ => {}
+    }
+    // STRUCT route — the original TSafeFieldAccess lowering (native emission is value-based).
     let ft = match decl.body {
         parser::StructBody as sb => match field_type(sb.fields, sfa.field, table) { Type as t => t; error as e => return e }
-        parser::ClassBody as cb  => {
-            let t = match effective_class_fields(cb, table) { []Field as fs => match field_type(fs, sfa.field, table) { Type as t => t; error as e => return e }; error as e => return e }   // (W10b.CLASS increment 2)
-            let owner = match find_field_owner(name, table, sfa.field) { MemberOwner as mo => mo; error as e => return e }
-            if !member_accessible(owner, env.owner_type, table) {
-                return error { message = $"field '{sfa.field}' is private to {owner.declaring_class}" }
-            }
-            t
-        }
         _                => return error { message = $"type {name} is not a struct (no fields)" }
     }
     // the result is `(field)?` — an already-optional field stays as-is (no double-wrap).
     let rt = match ft { Optional => ft; _ => Optional { inner = ft } }
     TExpr { kind = TSafeFieldAccess { receiver = recv; field = sfa.field }; type = rt; line = 0; col = 0 }
+}
+
+// `recv?.method(args)` (NP-OOP, issue #116): a null-propagating METHOD call on a `T?` of a
+// named struct/class/interface. Desugars to the safe-nav match; the arm's call is typed by
+// type_method_call itself — visibility, arity, defaults and interface (vtable) dispatch all
+// behave EXACTLY like a bare `.` call (no bypass through the null-propagating path).
+fn type_safe_method_call(smc: parser::SafeMethodCall, line: u32, col: u32, env: Env, table: TypeTable) -> TExpr | error {
+    let recv = match safe_nav_receiver(smc.receiver, env, table) { TExpr as te => te; error as e => return e }
+    let inner = match recv.type { Optional as o => o.inner; _ => return error { message = "internal: safe_nav_receiver guarantees an optional" } }
+    let name = match inner {
+        Named as n => n.name
+        _          => return error { message = "safe method call `?.` needs an optional of a named type (a struct, class or interface)" }
+    }
+    let decl = match type_table_find(table, name) {
+        parser::TypeDecl as td => td
+        error          => return error { message = $"unknown type for safe method call: {name}" }
+    }
+    // an ENUM inner would desugar into a member pattern, not a type bind — honest stop.
+    match decl.body {
+        parser::EnumBody => return error { message = "safe method call on an optional enum is not yet supported — bind it with `match` first" }
+        _ => {}
+    }
+    let binder = safe_binder_name(line, col)
+    let env2 = define(env, binder, inner, false)
+    let rvar = parser::Expr { kind = parser::Var { name = binder }; line = line; col = col }
+    let call = parser::MethodCall { receiver = rvar; method = smc.method; args = smc.args }
+    let tc = match type_method_call(call, env2, table) { TExpr as te => te; error as e => return e }
+    safe_nav_match(recv, name, binder, tc)
 }
 
 // `a ?? b` (REBOOT_PLAN §203): the left must be Optional `T?`; the right is `T` (result `T`)
@@ -1176,6 +1279,12 @@ fn type_coalesce(co: parser::Coalesce, env: Env, table: TypeTable) -> TExpr | er
     let unwrapped = match l.type {
         Optional as o => o.inner
         _             => return error { message = "`??` needs an optional left operand (`T?`) — its right is the fallback (REBOOT_PLAN §203)" }
+    }
+    // (NP-OOP, issue #116) a SENTINEL optional left (`null ?? x`) has no inner `T` to unwrap —
+    // honest error (M.1), mirroring the C twin's NULL-inner guard.
+    match unwrapped {
+        Void => return error { message = "`??` on a bare `null` has nothing to unwrap — the left must be a typed `T?` (REBOOT_PLAN §203)" }
+        _ => {}
     }
     match co.right.kind {
         parser::NullLit => {   // `x ?? null` ⇒ T? — the right adopts the left's optional type
@@ -1188,7 +1297,10 @@ fn type_coalesce(co: parser::Coalesce, env: Env, table: TypeTable) -> TExpr | er
     // A DIVERGING fallback (panic/exit) never produces a value — accept it for any left type; the
     // result is the unwrapped `T` (the present-case value). (No `never` type — legislator's ruling.)
     if texpr_diverges(r) { return TExpr { kind = TCoalesce { left = l; right = r }; type = unwrapped; line = 0; col = 0 } }
-    if type_eq(r.type, unwrapped) {   // `T? ?? T` ⇒ T (the unwrapping case)
+    // `T? ?? T` ⇒ T (the unwrapping case). (NP-OOP, issue #116) the fallback may also WIDEN
+    // into T — the same assignability a binding/param slot grants (widens_into), so a
+    // conforming class instance backs an interface-typed optional: `shape_opt ?? circle`.
+    if type_eq(r.type, unwrapped) || widens_into(r.type, unwrapped, table) {
         return TExpr { kind = TCoalesce { left = l; right = r }; type = unwrapped; line = 0; col = 0 }
     }
     if type_eq(r.type, l.type) {      // `T? ?? T?` ⇒ T?
@@ -1606,7 +1718,8 @@ fn type_dispatch(e: parser::Expr, env: Env, table: TypeTable) -> TExpr | error {
         parser::IfExpr as f    => type_if(f, env, table)
         parser::MatchExpr as m => type_match(m, env, table)
         parser::FieldAccess as fa => type_field_access(fa, env, table)
-        parser::SafeFieldAccess as sfa => type_safe_field_access(sfa, env, table)
+        parser::SafeFieldAccess as sfa => type_safe_field_access(sfa, e.line, e.col, env, table)
+        parser::SafeMethodCall as smc => type_safe_method_call(smc, e.line, e.col, env, table)   // (NP-OOP, issue #116)
         parser::Coalesce as co => type_coalesce(co, env, table)
         parser::Cast as c      => type_cast(c, env, table)
         parser::MethodCall as mc => {

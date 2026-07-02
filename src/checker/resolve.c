@@ -561,6 +561,10 @@ static void collect_expr_insts(tk_expr e, tk_type_expr **acc, size_t *n) {
             collect_expr_insts(*e.as.method_call.receiver, acc, n);
             for (size_t i = 0; i < e.as.method_call.nargs; i += 1) collect_expr_insts(e.as.method_call.args[i], acc, n);
             break;
+        case TK_EXPR_SAFE_METHOD_CALL:   // (NP-OOP, issue #116) recv?.method(args)
+            collect_expr_insts(*e.as.safe_method_call.receiver, acc, n);
+            for (size_t i = 0; i < e.as.safe_method_call.nargs; i += 1) collect_expr_insts(e.as.safe_method_call.args[i], acc, n);
+            break;
         case TK_EXPR_CAST:     collect_expr_insts(*e.as.cast.expr, acc, n); break;
         case TK_EXPR_INDEX:    collect_expr_insts(*e.as.index.receiver, acc, n); collect_expr_insts(*e.as.index.index, acc, n); break;
         case TK_EXPR_INTERP:

@@ -1,0 +1,55 @@
+// distinct exit codes per failure surface (0 = all pass; the harness diffs VM vs native).
+
+// 1) C? ?.method() — present and null
+let c: Counter? = Counter::make(7)
+if (c?.get() ?? 0) != 7 { exit(1) }
+let none: Counter? = null
+if (none?.get() ?? 42) != 42 { exit(2) }
+
+// 2) non-receiver args flow through the safe call
+if (c?.plus(3) ?? 0) != 10 { exit(3) }
+
+// 3) C? ?.field (pub) — the class route desugars through the checker
+if (c?.n ?? 0) != 7 { exit(4) }
+if (none?.n ?? 5) != 5 { exit(5) }
+
+// 4) chaining: a C-returning method re-wraps (C?) and chains; a C?-returning method
+//    stays C? (no double wrap) and chains identically
+if (c?.next()?.get() ?? 0) != 8 { exit(6) }
+if (c?.maybe_next()?.n ?? 0) != 8 { exit(7) }
+if (none?.next()?.get() ?? 9) != 9 { exit(8) }
+
+// 5) a void method through ?. (statement position) — runs when present, skips when null
+c?.poke()
+none?.poke()
+
+// 6) I? ?.method() — dispatch through the vtable when non-null
+let circ = Circle::make(2)
+let s: Shape? = circ
+if (s?.area() ?? 0) != 12 { exit(9) }
+let noshape: Shape? = null
+if (noshape?.area() ?? 5) != 5 { exit(10) }
+
+// 7) ?? with class operands — the fallback rides the object REFERENCE (class values are
+//    reference-semantic: the picked value is the same object, not a copy)
+let a = Counter::make(1)
+let b = Counter::make(2)
+if (none ?? b).get() != 2 { exit(11) }
+let some: Counter? = a
+if (some ?? b).get() != 1 { exit(12) }
+
+// 8) ?? with a CONFORMING class fallback — widens into the interface inner (Shape? ?? Circle → Shape)
+let picked = noshape ?? circ
+if picked.area() != 12 { exit(13) }
+let picked2 = s ?? Circle::make(9)
+if picked2.area() != 12 { exit(14) }
+
+// 9) struct-optional safe calls — the same desugar over a struct method + the struct
+//    ?.field lowering that predates NP-OOP (locked together)
+let bx: Box? = Box { v = 6 }
+if (bx?.doubled() ?? 0) != 12 { exit(15) }
+if (bx?.v ?? 0) != 6 { exit(16) }
+let nobox: Box? = null
+if (nobox?.doubled() ?? 3) != 3 { exit(17) }
+
+exit(0)

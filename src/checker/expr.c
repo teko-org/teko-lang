@@ -395,6 +395,10 @@ static tk_texpr_result type_method_call(tk_method_call mc, tk_env env, tk_type_t
     tk_texpr_result recv_r = tk_typer_expr(*mc.receiver, env, table);
     if (!recv_r.ok) return recv_r;
     tk_type recv_t = recv_r.as.value.type;
+    // (NP-OOP, issue #116) a bare `.` call on a nullable receiver stays a compile error — but say
+    // WHY and point at the sanctioned null-propagating call (`?.`) instead of the deferral message.
+    if (recv_t.tag == TK_TYPE_OPTIONAL)
+        return xerr("cannot call a method with `.` on a nullable value (`T?`) — use `?.` (REBOOT_PLAN §203)");
     if (recv_t.tag != TK_TYPE_NAMED) return xerr("method typing is deferred (B.29 / M.4)");
     tk_str struct_name = recv_t.as.named.name;
     tk_decl_result td = tk_type_table_find(table, struct_name);
@@ -961,6 +965,10 @@ static tk_texpr_result type_field_access(tk_field_access fa, tk_env env, tk_type
         }
         return xerr("a reference (`Ref<T>`) exposes only `.value` (the referenced value)");
     }
+    // (NP-OOP, issue #116) a bare `.` on a nullable receiver stays a compile error — but say WHY
+    // and point at the sanctioned readers (`?.`/`??`) instead of the generic struct message.
+    if (recv.as.value.type.tag == TK_TYPE_OPTIONAL)
+        return xerr("cannot use `.` on a nullable value (`T?`) — read it with `?.` or `??` (REBOOT_PLAN §203)");
     if (recv.as.value.type.tag != TK_TYPE_NAMED) return xerr("field access requires a struct receiver");
     tk_decl_result decl = tk_type_table_find(table, recv.as.value.type.as.named.name);
     if (!decl.ok) return xerr("unknown type for field access");
@@ -1020,48 +1028,127 @@ static tk_texpr_result type_index(tk_index ix, tk_env env, tk_type_table table) 
 // box a tk_type onto the heap (the optional's inner) — like resolve.c's box, local here.
 static tk_type *tk_box_type_val(tk_type t) { tk_type *p = tk_alloc(sizeof *p); if (!p) abort(); *p = t; return p; }
 
-// `recv?.field` (REBOOT_PLAN §203): the receiver must be an OPTIONAL of a named struct;
-// the result is the field's type made optional — null propagates. The struct-field layer
-// is the same one type_field_access uses; if the inner is not a known struct we honest-error
-// (M.3) rather than crash.
-static tk_texpr_result type_safe_field_access(tk_safe_field_access sfa, tk_env env, tk_type_table table) {
-    tk_texpr_result recv = tk_typer_expr(*sfa.receiver, env, table); if (!recv.ok) return recv;
+// ---- `?.` safe navigation (NP-OOP, issue #116) — the shared checker DESUGAR ----
+// `recv?.member…` on a CLASS/INTERFACE optional lowers IN THE CHECKER to the equivalent
+// typed match (no new TAST node, so the VM and native codegen run it through their
+// existing match/method/field machinery — twin-identical by construction):
+//     match recv { null => null; <Inner> as __tkqL_C => __tkqL_C.<member…> }
+// typed `R?` (an already-optional R stays R?; a void R makes the whole safe call void —
+// statement position only, with an EMPTY null-arm body).
+
+// the deterministic per-node binder name `__tkq<line>_<col>` (position-derived, no global
+// counter — both twin checkers produce the same name for the same node).
+static tk_str tk_safe_binder_name(uint32_t line, uint32_t col) {
+    char buf[48];
+    int n = snprintf(buf, sizeof buf, "__tkq%u_%u", (unsigned)line, (unsigned)col);
+    char *p = tk_alloc((size_t)n + 1); if (!p) abort();
+    memcpy(p, buf, (size_t)n + 1);
+    return (tk_str){ (const tk_byte *)p, (size_t)n };
+}
+
+// build the typed `match recv { null => <null:R?>; <Inner> as binder => <armv> }`.
+// `armv` is the already-typed present-arm value (the member call/read on the binder).
+static tk_texpr tk_safe_nav_match(tk_texpr recv, tk_str inner_name, tk_str binder, tk_texpr armv) {
+    bool is_void = armv.type.tag == TK_TYPE_VOID;
+    tk_type result = is_void ? (tk_type){ .tag = TK_TYPE_VOID }
+                   : armv.type.tag == TK_TYPE_OPTIONAL ? armv.type
+                   : (tk_type){ .tag = TK_TYPE_OPTIONAL, .as.optional.inner = tk_box_type_val(armv.type) };
+    tk_tarm *arms = tk_alloc(2 * sizeof *arms); if (!arms) abort();
+    // null arm: `null => null` (typed to the result optional) — or an EMPTY body when void.
+    tk_tstatement *nbody = NULL; size_t n_nbody = 0;
+    if (!is_void) {
+        nbody = tk_alloc(sizeof *nbody); if (!nbody) abort();
+        nbody[0] = (tk_tstatement){ .tag = TK_TSTMT_EXPR, .as.expr_stmt = { .expr =
+            (tk_texpr){ .tag = TK_TEXPR_NULL, .type = result, .as.null_lit = { 0 } } } };
+        n_nbody = 1;
+    }
+    arms[0] = (tk_tarm){ .pattern = { .tag = TK_PAT_NULL }, .has_when = false, .guard = NULL,
+                         .body = nbody, .nbody = n_nbody };
+    // present arm: `<Inner> as binder => <armv>` — the pattern re-resolves nominally in the
+    // VM/codegen exactly like a user-written `match` over a `T?`.
+    tk_segment *seg = tk_alloc(sizeof *seg); if (!seg) abort();
+    seg[0] = (tk_segment){ .name = inner_name };
+    tk_tstatement *pbody = tk_alloc(sizeof *pbody); if (!pbody) abort();
+    pbody[0] = (tk_tstatement){ .tag = TK_TSTMT_EXPR, .as.expr_stmt = { .expr = armv } };
+    arms[1] = (tk_tarm){ .pattern = { .tag = TK_PAT_BIND, .as.bind = {
+                             .type_name = { seg, 1 }, .has_binding = true, .binding = binder,
+                             .is_slice = false, .slice_type = NULL, .type_args = NULL, .nargs = 0 } },
+                         .has_when = false, .guard = NULL, .body = pbody, .nbody = 1 };
+    return (tk_texpr){ .tag = TK_TEXPR_MATCH, .type = result,
+                       .as.match_expr = { box(recv), arms, 2 } };
+}
+
+// validate a `?.` receiver: must be a NON-sentinel optional; enrich the disjoint-domain
+// case (an `X | error` union reads via `match`, never `?.` — the LAW's other half).
+static tk_texpr_result tk_safe_nav_receiver(const tk_expr *receiver, tk_env env, tk_type_table table) {
+    tk_texpr_result recv = tk_typer_expr(*receiver, env, table); if (!recv.ok) return recv;
     tk_type rt = recv.as.value.type;
-    if (rt.tag != TK_TYPE_OPTIONAL)
-        return xerr("safe field access `?.` needs an optional receiver (`T?`) — use `.` for a non-optional (REBOOT_PLAN §203)");
-    tk_type inner = *rt.as.optional.inner;
+    if (rt.tag != TK_TYPE_OPTIONAL) {
+        if (rt.tag == TK_TYPE_ERROR || tk_expand_variant(rt, table).tag == TK_TYPE_VARIANT)
+            return xerr("`?.` reads absence (`T?`), never errors — inspect an `X | error` union with `match` (disjoint-domain law)");
+        return xerr("safe access `?.` needs an optional receiver (`T?`) — use `.` for a non-optional (REBOOT_PLAN §203)");
+    }
+    if (rt.as.optional.inner == NULL)
+        return xerr("`?.` on a bare `null` has no member to reach (annotate the optional's type)");
+    return recv;
+}
+
+// `recv?.field` (REBOOT_PLAN §203): the receiver must be an OPTIONAL of a named struct or
+// class; the result is the field's type made optional — null propagates. A STRUCT inner
+// keeps the dedicated TSafeFieldAccess node; a CLASS inner desugars to the safe-nav match
+// (NP-OOP), routing through type_field_access so visibility holds EXACTLY like a bare `.`.
+static tk_texpr_result type_safe_field_access(tk_safe_field_access sfa, uint32_t line, uint32_t col, tk_env env, tk_type_table table) {
+    tk_texpr_result recv = tk_safe_nav_receiver(sfa.receiver, env, table); if (!recv.ok) return recv;
+    tk_type inner = *recv.as.value.type.as.optional.inner;
     if (inner.tag != TK_TYPE_NAMED)
         return xerr("safe field access on a non-struct optional is not yet supported (the struct-field layer is pending — M.3)");
     tk_decl_result decl = tk_type_table_find(table, inner.as.named.name);
     if (!decl.ok) return xerr("unknown type for safe field access");
-    // (W10b.CLASS) a class's fields are read exactly like a struct's; increment 2 uses the
-    // EFFECTIVE (base-inherited) field set.
-    tk_struct_body sfa_sb;
-    bool sfa_is_class = decl.as.value.body.tag == TK_BODY_CLASS;
-    if (decl.as.value.body.tag == TK_BODY_STRUCT) {
-        sfa_sb = decl.as.value.body.as.struct_body;
-    } else if (sfa_is_class) {
-        tk_fieldsvec_result eff = tk_effective_class_fields(decl.as.value.body.as.class_body, table);
-        if (!eff.ok) return xferr(eff.as.error);
-        sfa_sb = (tk_struct_body){ .fields = eff.as.value.ptr, .n_fields = eff.as.value.len, .methods = NULL, .n_methods = 0 };
-    } else {
-        return xerr("type is not a struct (no fields)");
+    // (NP-OOP, issue #116) CLASS route — desugar to the safe-nav match; the arm's field read
+    // is typed by type_field_access itself (same visibility, same `.len`/field rules).
+    if (decl.as.value.body.tag == TK_BODY_CLASS) {
+        tk_str binder = tk_safe_binder_name(line, col);
+        tk_env env2 = tk_env_define(env, binder, inner, false);
+        tk_expr *rvar = tk_alloc(sizeof *rvar); if (!rvar) abort();
+        *rvar = (tk_expr){ .tag = TK_EXPR_VAR, .line = line, .col = col, .as.var = { .name = binder } };
+        tk_field_access fa2 = { .receiver = rvar, .field = sfa.field };
+        tk_texpr_result tf = type_field_access(fa2, env2, table); if (!tf.ok) return tf;
+        return xok(tk_safe_nav_match(recv.as.value, inner.as.named.name, binder, tf.as.value));
     }
+    // STRUCT route — the original TSafeFieldAccess lowering (native emission is value-based).
+    if (decl.as.value.body.tag != TK_BODY_STRUCT)
+        return xerr("type is not a struct (no fields)");
+    tk_struct_body sfa_sb = decl.as.value.body.as.struct_body;
     tk_type_result ft = field_type(sfa_sb, sfa.field, table);
     if (!ft.ok) return xerr("no such field");
-    // (W10b.CLASS residual — intern visibility) a private (default) field is reachable only
-    // from its OWN declaring class's code, or — if `intern` — a subclass's too.
-    if (sfa_is_class) {
-        tk_member_owner_result owner = tk_find_field_owner(inner.as.named.name, table, sfa.field);
-        if (!owner.ok) return xferr(owner.as.error);
-        if (!tk_member_accessible(owner.as.value, env.owner_type, table))
-            return xferr(tk_error_named("field is private to its declaring class", sfa.field));
-    }
     // the result is `(field-type)?` — null-propagating; an already-optional field stays as-is.
     tk_type result = ft.as.value.tag == TK_TYPE_OPTIONAL ? ft.as.value
                    : (tk_type){ .tag = TK_TYPE_OPTIONAL, .as.optional.inner = tk_box_type_val(ft.as.value) };
     return xok((tk_texpr){ .tag = TK_TEXPR_SAFE_FIELD_ACCESS, .type = result,
                            .as.safe_field_access = { box(recv.as.value), sfa.field } });
+}
+
+// `recv?.method(args)` (NP-OOP, issue #116): a null-propagating METHOD call on a `T?` of a
+// named struct/class/interface. Desugars to the safe-nav match; the arm's call is typed by
+// type_method_call itself — visibility, arity, defaults and interface (vtable) dispatch all
+// behave EXACTLY like a bare `.` call (no bypass through the null-propagating path).
+static tk_texpr_result type_safe_method_call(tk_safe_method_call smc, uint32_t line, uint32_t col, tk_env env, tk_type_table table) {
+    tk_texpr_result recv = tk_safe_nav_receiver(smc.receiver, env, table); if (!recv.ok) return recv;
+    tk_type inner = *recv.as.value.type.as.optional.inner;
+    if (inner.tag != TK_TYPE_NAMED)
+        return xerr("safe method call `?.` needs an optional of a named type (a struct, class or interface)");
+    tk_decl_result decl = tk_type_table_find(table, inner.as.named.name);
+    if (!decl.ok) return xerr("unknown type for safe method call");
+    // an ENUM inner would desugar into a member pattern, not a type bind — honest stop.
+    if (decl.as.value.body.tag == TK_BODY_ENUM)
+        return xerr("safe method call on an optional enum is not yet supported — bind it with `match` first");
+    tk_str binder = tk_safe_binder_name(line, col);
+    tk_env env2 = tk_env_define(env, binder, inner, false);
+    tk_expr *rvar = tk_alloc(sizeof *rvar); if (!rvar) abort();
+    *rvar = (tk_expr){ .tag = TK_EXPR_VAR, .line = line, .col = col, .as.var = { .name = binder } };
+    tk_method_call call = { .receiver = rvar, .method = smc.method, .args = smc.args, .nargs = smc.nargs };
+    tk_texpr_result tc = type_method_call(call, env2, table); if (!tc.ok) return tc;
+    return xok(tk_safe_nav_match(recv.as.value, inner.as.named.name, binder, tc.as.value));
 }
 
 // `a ?? b` (REBOOT_PLAN §203): the left must be an OPTIONAL `T?`; the right is `T` (the
@@ -1072,6 +1159,10 @@ static tk_texpr_result type_coalesce(tk_coalesce co, tk_env env, tk_type_table t
     tk_type lt = l.as.value.type;
     if (lt.tag != TK_TYPE_OPTIONAL)
         return xerr("`??` needs an optional left operand (`T?`) — its right is the fallback (REBOOT_PLAN §203)");
+    // (NP-OOP, issue #116) a SENTINEL optional left (`null ?? x`) has no inner `T` to unwrap —
+    // honest error (M.1), not a null-deref.
+    if (lt.as.optional.inner == NULL)
+        return xerr("`??` on a bare `null` has nothing to unwrap — the left must be a typed `T?` (REBOOT_PLAN §203)");
     tk_type unwrapped = *lt.as.optional.inner;   // the `T` behind the `T?`
     // RIGHT arm. A bare `null` adopts the left's optional type (`x ?? null` ⇒ `T?`); otherwise
     // type it normally and require it to be `T` (result `T`) or `T?` (result `T?`).
@@ -1088,7 +1179,10 @@ static tk_texpr_result type_coalesce(tk_coalesce co, tk_env env, tk_type_table t
         return xok((tk_texpr){ .tag = TK_TEXPR_COALESCE, .type = unwrapped,
                                .as.coalesce = { box(l.as.value), box(r.as.value) } });
     if (tk_type_is_void(&rt)) return xerr("a `void` expression cannot be the `??` fallback (M.1)");
-    if (tk_type_eq(&rt, &unwrapped))   // `T? ?? T` ⇒ T (the common, unwrapping case)
+    // `T? ?? T` ⇒ T (the common, unwrapping case). (NP-OOP, issue #116) the fallback may also
+    // WIDEN into T — the same assignability a binding/param slot grants (tk_widens_into), so a
+    // conforming class instance backs an interface-typed optional: `shape_opt ?? circle`.
+    if (tk_type_eq(&rt, &unwrapped) || tk_widens_into(rt, unwrapped, table))
         return xok((tk_texpr){ .tag = TK_TEXPR_COALESCE, .type = unwrapped,
                                .as.coalesce = { box(l.as.value), box(r.as.value) } });
     if (tk_type_eq(&rt, &lt))          // `T? ?? T?` ⇒ T? (fallback is itself optional)
@@ -1269,6 +1363,7 @@ static void lam_collect_expr(const tk_expr *e, tk_sset *refs, tk_sset *bound) {
         case TK_EXPR_SAFE_FIELD_ACCESS: lam_collect_expr(e->as.safe_field_access.receiver, refs, bound); break;
         case TK_EXPR_COALESCE: lam_collect_expr(e->as.coalesce.left, refs, bound); lam_collect_expr(e->as.coalesce.right, refs, bound); break;
         case TK_EXPR_METHOD_CALL: lam_collect_expr(e->as.method_call.receiver, refs, bound); for (size_t i = 0; i < e->as.method_call.nargs; i += 1) lam_collect_expr(&e->as.method_call.args[i], refs, bound); break;
+        case TK_EXPR_SAFE_METHOD_CALL: lam_collect_expr(e->as.safe_method_call.receiver, refs, bound); for (size_t i = 0; i < e->as.safe_method_call.nargs; i += 1) lam_collect_expr(&e->as.safe_method_call.args[i], refs, bound); break;
         case TK_EXPR_STRUCT_LIT: for (size_t i = 0; i < e->as.struct_lit.nfields; i += 1) lam_collect_expr(&e->as.struct_lit.field_vals[i], refs, bound); break;
         case TK_EXPR_INDEX: lam_collect_expr(e->as.index.receiver, refs, bound); lam_collect_expr(e->as.index.index, refs, bound); break;
         case TK_EXPR_INTERP: for (size_t i = 0; i < e->as.interp.nholes; i += 1) lam_collect_expr(&e->as.interp.holes[i], refs, bound); break;
@@ -1754,7 +1849,8 @@ static tk_texpr_result type_dispatch(tk_expr e, tk_env env, tk_type_table table)
         case TK_EXPR_IF:     return type_if(e.as.if_expr, env, table);
         case TK_EXPR_MATCH:  return type_match(e.as.match_expr, env, table);
         case TK_EXPR_FIELD_ACCESS: return type_field_access(e.as.field_access, env, table);
-        case TK_EXPR_SAFE_FIELD_ACCESS: return type_safe_field_access(e.as.safe_field_access, env, table);
+        case TK_EXPR_SAFE_FIELD_ACCESS: return type_safe_field_access(e.as.safe_field_access, e.line, e.col, env, table);
+        case TK_EXPR_SAFE_METHOD_CALL:  return type_safe_method_call(e.as.safe_method_call, e.line, e.col, env, table);   // (NP-OOP, issue #116)
         case TK_EXPR_COALESCE:     return type_coalesce(e.as.coalesce, env, table);
         case TK_EXPR_CAST:         return type_cast(e.as.cast, env, table);
         case TK_EXPR_METHOD_CALL:  {

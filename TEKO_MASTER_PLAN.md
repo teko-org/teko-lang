@@ -662,7 +662,34 @@ All design is SETTLED: W10b OOP, DEFARGS, W10c DI, W11 constraints (sans `!`), c
   reads via `?.`/`??`, its `error` result reads via `match` — the two stay disjoint even when the factory
   returns something OOP-shaped); the visibility question (`?.` must respect intern/private exactly like a
   bare `.` — no visibility bypass through the null-propagating path). **Deps:** D3, D2 (dynamic + static
-  dispatch — `I?` needs the vtable rep D3 defines). **Status:** ⬜.
+  dispatch — `I?` needs the vtable rep D3 defines). **Status:** ✅ **DONE 2026-07-02 (issue #116).**
+  Probe-first verdict: the pre-OOP lowering covered LESS than hoped — `?.method()` did not even PARSE
+  (QDot was field-only), and native `?.field` on a class emitted `.value.f` where the pointer-lowered
+  class needed `->` (cc error). Delivered: (1) `?.method(args)` end-to-end via a NEW `SafeMethodCall`
+  AST node that DESUGARS IN THE CHECKER to the equivalent typed match (`match recv { null => null;
+  <Inner> as __tkqL_C => __tkqL_C.m(args) }`, typed `R?` / void-R = void) — NO new TAST node, so VM +
+  native codegen run it through their existing match/method machinery (visibility, arity, DEFARGS,
+  interface vtable dispatch all EXACTLY as a bare `.`); class-`?.field` reroutes through the same
+  desugar (also bypassing the native `.value.f` bug — see the latent-gap note below); struct `?.field`
+  keeps the original TSafeFieldAccess lowering. (2) VM `eval_match` now COERCES the winning arm's raw
+  value to the match node's type (the VM twin of emit_arm_value→emit_as — a real parity gap the desugar
+  exposed). (3) `??` fallback WIDENS like a binding slot (`tk_widens_into`): `Shape? ?? circle` → Shape
+  (conforming-class upcast); sentinel guards (`null ?? x`, `null?.m()`) are honest errors. (4) Bare `.`
+  on `T?` stays a compile error with a POINTING message (use `?.`/`??`); `?.`/`??` on `X | error` reject
+  with the disjoint-domain message. Locks: 9 checker + 1 parser .tkt tests (`np_*`), differential
+  fixture `examples/regressions/np_oop` (17 surfaces, VM==native). 609 tests, gen-2==gen-3 byte-identical,
+  harness 38 PASS + 1 XFAIL. **LATENT codegen gap (owner: the codegen twins, reserved by #108 this wave):**
+  `codegen.c` `case TK_TEXPR_SAFE_FIELD_ACCESS` (~line 2194) + its codegen.tks twin emit `_tN.value.<field>`
+  unconditionally; a CLASS inner needs `_tN.value-><field>` (gate on `cg_is_class_named(inner)` like the
+  FIELD_ACCESS case at ~2126). Unreachable today (the checker desugars every class route away), but any
+  future producer of a class-inner TSafeFieldAccess (e.g. the C7.16 `.tkb` codec or a mono rewrite)
+  re-exposes it — fix the emitter anyway. **SECOND latent gap (PRE-EXISTING, verified on the untouched
+  struct route at the same tip):** `codegen.c cg_collect_expr_opts` (~line 4704) has NO `TK_TEXPR_LAMBDA`
+  case — the `default:` swallows it, so optional typedefs used ONLY inside a lifted lambda body are never
+  pre-declared (`let f = () => b?.v ?? 0` over `b: Box?` → cc "use of undeclared identifier 'tk_opt_i64'";
+  identical for the NP-OOP desugared forms in lambdas; VM runs all of them fine). Fix: add
+  `case TK_TEXPR_LAMBDA: cg_collect_block_opts(set, e->as.lambda.body, e->as.lambda.nbody); return;`
+  (+ collect param/ret types) and mirror in codegen.tks.
 - **Stage B — TR0** (the `trait` construct: struct-shaped, derivable, non-instantiable; fields+methods
   folded into a deriving struct/class via field-flattening). **Deps:** W10b.IF ✅, W10b.CLASS field-
   flattening ✅ — both already satisfied, so TR0 is **implementation-ready today**; it is sequenced HERE

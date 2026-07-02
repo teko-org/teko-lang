@@ -829,7 +829,7 @@ fn checker_safe_field_and_coalesce() {
     // type_safe_field_access — ms?.token where ms: Foo? → u8?
     let opt_foo_env = define(empty_env(), "ms", Optional { inner = Named { name = "Foo" } }, false)
     let sfa = parser::SafeFieldAccess { receiver = e_var("ms"); field = "token" }
-    let sfar = match type_safe_field_access(sfa, opt_foo_env, foo_table()) { TExpr as te => te; error => { teko::assert::is_true(false); return } }
+    let sfar = match type_safe_field_access(sfa, 0, 0, opt_foo_env, foo_table()) { TExpr as te => te; error => { teko::assert::is_true(false); return } }
     match sfar.type { Optional as o => match o.inner { Prim as p => teko::assert::is_true(p.kind == PrimKind::U8); _ => teko::assert::is_true(false) }; _ => teko::assert::is_true(false) }
     // type_coalesce — os ?? "default" where os: str? → str
     let opt_str_env = define(empty_env(), "os", Optional { inner = Str { } }, false)
@@ -2805,5 +2805,147 @@ fn w0_stamped_generic_instances_remain_exempt() {
     match collect_with_seed(parser::Program { items = teko::list::empty() }, seed) {
         Collected => teko::assert::is_true(true)
         error    => teko::assert::is_true(false)   // the strict exemption must still cover real stamps
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Group NP-OOP (ROUND 3.5 Stage A, issue #116): null propagation × classes/interfaces.
+// `?.method(args)` + class-`?.field` DESUGAR in the checker to a typed match (safe_nav_match);
+// these tests lock the typing surface: result optionality, the disjoint-domain rejections,
+// visibility parity with bare `.`, and the `??` conforming-fallback widening.
+// ---------------------------------------------------------------------------
+// `type Gadget = class { pub v: i64  w: i64  pub fn ping(self)->i64  fn covert(self)->i64  pub fn silent(self) }`
+fn np_gadget_decl() -> parser::TypeDecl {
+    let fv = parser::Field { name = "v"; type_ann = named_t("i64"); vis = parser::Visibility::Pub; is_intern = false }
+    let fw = parser::Field { name = "w"; type_ann = named_t("i64"); vis = parser::Visibility::Private; is_intern = false }
+    let fields = teko::list::push(teko::list::push(teko::list::empty(), fv), fw)
+    let silent = parser::Function { name = "silent"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = teko::list::push(teko::list::empty(), recv_param("self")); has_return = false; return_type = named_t("i64"); body = teko::list::empty(); vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false }
+    let methods = teko::list::push(teko::list::push(teko::list::push(teko::list::empty(), impl_method("ping", parser::Visibility::Pub)), impl_method("covert", parser::Visibility::Private)), silent)
+    parser::TypeDecl { name = "Gadget"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::ClassBody { kind = parser::ClassKind::Sealed; has_base = false; base_name = ""; has_base_binding = false; base_binding_name = ""; implements = teko::list::empty(); fields = fields; methods = methods }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }
+}
+fn np_program() -> parser::Program {
+    let item = parser::Item { content = np_gadget_decl(); namespace = ""; file = "" }
+    parser::Program { items = teko::list::push(teko::list::empty(), item) }
+}
+// collect() the one-class program so the class's methods are REGISTERED as callable fns
+// (the desugared arm call resolves `Gadget::ping` through the collected env, like real code).
+fn np_table() -> TypeTable {
+    match collect(np_program()) { Collected as c => c.types; error => panic("np_table: collect failed") }
+}
+fn np_env() -> Env {
+    let base = match collect(np_program()) { Collected as c => c.env; error => panic("np_env: collect failed") }
+    define(base, "g", Optional { inner = Named { name = "Gadget" } }, false)
+}
+fn np_smc(method: str) -> parser::SafeMethodCall { parser::SafeMethodCall { receiver = e_var("g"); method = method; args = teko::list::empty() } }
+
+#test
+fn np_safe_method_call_types_to_optional_match() {
+    // g?.ping() where g: Gadget? → i64? — and the node IS the desugared match (TMatchExpr).
+    let r = match type_safe_method_call(np_smc("ping"), 3, 7, np_env(), np_table()) { TExpr as te => te; error => { teko::assert::is_true(false); return } }
+    match r.type { Optional as o => match o.inner { Prim as p => teko::assert::is_true(p.kind == PrimKind::I64); _ => teko::assert::is_true(false) }; _ => teko::assert::is_true(false) }
+    match r.kind { TMatchExpr as m => teko::assert::is_true(m.arms.len == 2); _ => teko::assert::is_true(false) }
+}
+
+#test
+fn np_safe_method_call_void_types_to_void() {
+    // g?.silent() — a void method makes the whole safe call void (statement position only).
+    let r = match type_safe_method_call(np_smc("silent"), 3, 7, np_env(), np_table()) { TExpr as te => te; error => { teko::assert::is_true(false); return } }
+    match r.type { Void => teko::assert::is_true(true); _ => teko::assert::is_true(false) }
+}
+
+#test
+fn np_safe_method_call_private_rejected() {
+    // g?.covert() from OUTSIDE the class — `?.` must respect visibility exactly like `.`.
+    match type_safe_method_call(np_smc("covert"), 3, 7, np_env(), np_table()) {
+        TExpr => teko::assert::is_true(false)
+        error => teko::assert::is_true(true)
+    }
+}
+
+#test
+fn np_safe_field_on_class_desugars_and_respects_visibility() {
+    // g?.v → i64? through the desugared match; g?.w (private) is rejected — no visibility
+    // bypass through the null-propagating path.
+    let pub_read = parser::SafeFieldAccess { receiver = e_var("g"); field = "v" }
+    let r = match type_safe_field_access(pub_read, 3, 7, np_env(), np_table()) { TExpr as te => te; error => { teko::assert::is_true(false); return } }
+    match r.type { Optional as o => match o.inner { Prim as p => teko::assert::is_true(p.kind == PrimKind::I64); _ => teko::assert::is_true(false) }; _ => teko::assert::is_true(false) }
+    match r.kind { TMatchExpr => teko::assert::is_true(true); _ => teko::assert::is_true(false) }
+    let priv_read = parser::SafeFieldAccess { receiver = e_var("g"); field = "w" }
+    match type_safe_field_access(priv_read, 3, 7, np_env(), np_table()) {
+        TExpr => teko::assert::is_true(false)
+        error => teko::assert::is_true(true)
+    }
+}
+
+#test
+fn np_safe_nav_on_error_union_rejected_disjoint_domain() {
+    // a `Gadget | error` receiver: `?.` reads absence, never errors (the disjoint-domain law).
+    mut members: []Type = teko::list::empty()
+    members = teko::list::push(members, Named { name = "Gadget" })
+    members = teko::list::push(members, Error { })
+    let env = define(empty_env(), "g", Variant { members = members }, false)
+    match type_safe_method_call(np_smc("ping"), 3, 7, env, np_table()) {
+        TExpr => teko::assert::is_true(false)
+        error as e => teko::assert::is_true(e.message == "`?.` reads absence (`T?`), never errors — inspect an `X | error` union with `match` (disjoint-domain law)")
+    }
+    let sfa = parser::SafeFieldAccess { receiver = e_var("g"); field = "v" }
+    match type_safe_field_access(sfa, 3, 7, env, np_table()) {
+        TExpr => teko::assert::is_true(false)
+        error as e => teko::assert::is_true(e.message == "`?.` reads absence (`T?`), never errors — inspect an `X | error` union with `match` (disjoint-domain law)")
+    }
+}
+
+#test
+fn np_bare_dot_on_nullable_rejected_with_pointer_message() {
+    // bare `.` on a `Gadget?` stays a compile error — field AND method forms.
+    let fa = parser::FieldAccess { receiver = e_var("g"); field = "v" }
+    match type_field_access(fa, np_env(), np_table()) {
+        TExpr => teko::assert::is_true(false)
+        error as e => teko::assert::is_true(e.message == "cannot use `.` on a nullable value (`T?`) — read it with `?.` or `??` (REBOOT_PLAN §203)")
+    }
+    let mc = parser::MethodCall { receiver = e_var("g"); method = "ping"; args = teko::list::empty() }
+    match type_method_call(mc, np_env(), np_table()) {
+        TExpr => teko::assert::is_true(false)
+        error as e => teko::assert::is_true(e.message == "cannot call a method with `.` on a nullable value (`T?`) — use `?.` (REBOOT_PLAN §203)")
+    }
+}
+
+#test
+fn np_coalesce_conforming_class_fallback_widens_to_interface() {
+    // shape_opt ?? circle — the fallback WIDENS into the left's interface inner (Shape? ?? Circle → Shape).
+    let shape = iface_item("Shape", list1(impl_method("area", parser::Visibility::Pub)), teko::list::empty())
+    let circle = impl_class_item("Circle", list1(impl_method("area", parser::Visibility::Pub)), slist1("Shape"))
+    mut tbl: TypeTable = teko::list::empty()
+    match shape.content  { parser::TypeDecl as td => tbl = teko::list::push(tbl, TypeReg { name = "Shape";  namespace = ""; vis = parser::Visibility::Private; decl = td }); _ => {} }
+    match circle.content { parser::TypeDecl as td => tbl = teko::list::push(tbl, TypeReg { name = "Circle"; namespace = ""; vis = parser::Visibility::Private; decl = td }); _ => {} }
+    let env = define(define(empty_env(), "s", Optional { inner = Named { name = "Shape" } }, false), "c", Named { name = "Circle" }, false)
+    let co = parser::Coalesce { left = e_var("s"); right = e_var("c") }
+    let r = match type_coalesce(co, env, tbl) { TExpr as te => te; error => { teko::assert::is_true(false); return } }
+    match r.type { Named as n => teko::assert::is_true(n.name == "Shape"); _ => teko::assert::is_true(false) }
+    // and a NON-conforming fallback still fails.
+    let loner = impl_class_item("Loner", list1(impl_method("area", parser::Visibility::Pub)), teko::list::empty())
+    match loner.content { parser::TypeDecl as td => tbl = teko::list::push(tbl, TypeReg { name = "Loner"; namespace = ""; vis = parser::Visibility::Private; decl = td }); _ => {} }
+    let env2 = define(env, "l", Named { name = "Loner" }, false)
+    let co2 = parser::Coalesce { left = e_var("s"); right = e_var("l") }
+    match type_coalesce(co2, env2, tbl) { TExpr => teko::assert::is_true(false); error => teko::assert::is_true(true) }
+}
+
+#test
+fn np_coalesce_sentinel_left_rejected() {
+    // `null ?? x` — a sentinel optional left has no inner T to unwrap (honest error, M.1).
+    let co = parser::Coalesce { left = ek(parser::NullLit { }); right = e_num(1) }
+    match type_coalesce(co, empty_env(), empty_table()) {
+        TExpr => teko::assert::is_true(false)
+        error as e => teko::assert::is_true(e.message == "`??` on a bare `null` has nothing to unwrap — the left must be a typed `T?` (REBOOT_PLAN §203)")
+    }
+}
+
+#test
+fn np_safe_nav_on_bare_null_rejected() {
+    // `null?.ping()` — a sentinel optional receiver has no member to reach.
+    let smc = parser::SafeMethodCall { receiver = ek(parser::NullLit { }); method = "ping"; args = teko::list::empty() }
+    match type_safe_method_call(smc, 3, 7, empty_env(), np_table()) {
+        TExpr => teko::assert::is_true(false)
+        error as e => teko::assert::is_true(e.message == "`?.` on a bare `null` has no member to reach (annotate the optional's type)")
     }
 }

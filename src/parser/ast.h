@@ -62,6 +62,8 @@ typedef struct { tk_expr *receiver; tk_str field; }          tk_safe_field_acces
 typedef struct { tk_expr *left, *right; }                    tk_coalesce;      // x ?? y — Elvis/null-coalescing (REBOOT_PLAN §203)
 typedef struct { tk_expr *receiver; tk_str method;                            // recv.method(a, …)
                  tk_expr *args; size_t nargs; }              tk_method_call;
+typedef struct { tk_expr *receiver; tk_str method;                            // recv?.method(a, …) — null-propagating method call (NP-OOP, issue #116)
+                 tk_expr *args; size_t nargs; }              tk_safe_method_call;
 typedef struct { tk_expr *expr; tk_type_expr target; }       tk_cast;          // x to T
 typedef struct { tk_path path; }                             tk_path_expr;     // Enum::Member as a VALUE
 // Name { field = value, … } — a struct VALUE constructor (W4a). Parallel arrays (field_vals is a
@@ -110,6 +112,7 @@ typedef enum {
     TK_EXPR_BINARY, TK_EXPR_UNARY, TK_EXPR_COMPARE, TK_EXPR_CALL,
     TK_EXPR_IF, TK_EXPR_MATCH, TK_EXPR_FIELD_ACCESS, TK_EXPR_METHOD_CALL,
     TK_EXPR_SAFE_FIELD_ACCESS, TK_EXPR_COALESCE,
+    TK_EXPR_SAFE_METHOD_CALL,   // recv?.method(a, …) — null-propagating method call (NP-OOP, issue #116)
     TK_EXPR_CAST, TK_EXPR_PATH, TK_EXPR_STRUCT_LIT, TK_EXPR_INDEX,
     TK_EXPR_INTERP,   // $"…{expr}…" — string interpolation (self-host parity)
     TK_EXPR_IN,       // <expr> in [ … ] — membership test (Phase 2)
@@ -139,6 +142,7 @@ struct tk_expr {
         tk_safe_field_access safe_field_access; // TK_EXPR_SAFE_FIELD_ACCESS
         tk_coalesce     coalesce;      // TK_EXPR_COALESCE
         tk_method_call  method_call;   // TK_EXPR_METHOD_CALL
+        tk_safe_method_call safe_method_call; // TK_EXPR_SAFE_METHOD_CALL (NP-OOP, issue #116)
         tk_cast         cast;          // TK_EXPR_CAST
         tk_path_expr    path;          // TK_EXPR_PATH
         tk_struct_lit   struct_lit;    // TK_EXPR_STRUCT_LIT

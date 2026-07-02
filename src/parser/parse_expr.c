@@ -473,14 +473,22 @@ static tk_parsed_result parse_postfix(const tk_token *t, size_t n, size_t pos, b
             node = ix; p = idx.as.value.next + 1;
             continue;
         }
-        // `?.` safe field access (null-propagating — REBOOT_PLAN §203). Field-only:
-        // `?.name(` does NOT form a safe method call in the seed (the chain stops at
-        // the safe field, then `(` is handled at a higher level if/when it applies).
+        // `?.` safe navigation (null-propagating — REBOOT_PLAN §203): `?.field` reads a
+        // field; `?.method(args)` is a null-propagating METHOD call (NP-OOP, issue #116) —
+        // positional-only, like MethodCall (arg_names discarded, see the `.method()` note).
         if (tk_is_kind_at(t, n, p, TK_TOKEN_QDOT)) {
             if (!tk_is_name_at(t, n, p + 1)) {
-                return (tk_parsed_result){ .ok = false, .as.error = tk_err_at(t, n, p + 1, "expected a field name after '?.'") };
+                return (tk_parsed_result){ .ok = false, .as.error = tk_err_at(t, n, p + 1, "expected a field or method name after '?.'") };
             }
             tk_str name = t[p + 1].text;
+            if (tk_is_kind_at(t, n, p + 2, TK_TOKEN_LPAREN)) {
+                tk_parsed_call_args_result ca = parse_call_args(t, n, p + 2);
+                if (!ca.ok) { return (tk_parsed_result){ .ok = false, .as.error = ca.as.error }; }
+                tk_expr sm = tk_at((tk_expr){ .tag = TK_EXPR_SAFE_METHOD_CALL, .as.safe_method_call = { .receiver = tk_box_expr(node),
+                    .method = name, .args = ca.as.value.args, .nargs = ca.as.value.nargs } }, t, pos);
+                node = sm; p = ca.as.value.next;
+                continue;
+            }
             tk_expr sf = tk_at((tk_expr){ .tag = TK_EXPR_SAFE_FIELD_ACCESS,
                 .as.safe_field_access = { .receiver = tk_box_expr(node), .field = name } }, t, pos);
             node = sf; p = p + 2;

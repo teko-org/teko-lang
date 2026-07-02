@@ -2218,7 +2218,11 @@ static tk_value eval_match(const tk_texpr *e, tk_venv *env) {
                 tk_cov_branch(e->line, e->col, i);   // D3-branch: value-position arm `i` taken
                 tk_flow fl = tk_vm_exec_block(arm->body, arm->nbody, &armenv);
                 env_pop_to(&armenv, env->head);
-                if (fl.kind == TK_FLOW_NORMAL && fl.has_value) return fl.value;
+                // (NP-OOP, issue #116) COERCE the arm's raw value to the match node's type —
+                // the VM twin of codegen's emit_arm_value → emit_as wrap, so a `T` arm flowing
+                // into a `T?`-typed match present-wraps (the checker-desugared `?.` relies on
+                // it; exact-typed arms are a no-op).
+                if (fl.kind == TK_FLOW_NORMAL && fl.has_value) return coerce_to(fl.value, e->type);
                 vm_unsupported("control flow inside a `match` used as a sub-expression not yet supported");
             }
         }

@@ -1824,7 +1824,7 @@ fn pat_match(pat: parser::Pattern, subj: Value, env: Venv) -> PatMatch {
 // bindings ride its grown env (`pm.env`); a non-matching / guard-failing arm is discarded by NOT
 // threading that env forward (the functional stand-in for the C `env_pop_to`). Mirrors the C
 // `eval_match`.
-fn eval_match(m: checker::TMatchExpr, line: u32, col: u32, env: Venv) -> EvalRes {
+fn eval_match(m: checker::TMatchExpr, t: checker::Type, line: u32, col: u32, env: Venv) -> EvalRes {
     let se = eval_expr(m.subject, env)   // (MEM Step 4) thread the subject's env (a ref call there grows cells)
     let subj = se.value
     let senv = se.env
@@ -1841,8 +1841,12 @@ fn eval_match(m: checker::TMatchExpr, line: u32, col: u32, env: Venv) -> EvalRes
                 teko::cov_branch(line, col, i to u64)   // D3-branch: value-position arm `i` taken
                 let bo = exec_block(arm.body, ge.env)
                 match bo.flow {
-                    // thread the arm body's final env out: an outer-`mut`/cell write inside the arm survives
-                    Normal as nm => return EvalRes { value= nm.value ?? panic("vm: a `match` used as a value produced no value (internal: checker requires a value arm)"); env= with_cells(senv, bo.env.cells) }
+                    // thread the arm body's final env out: an outer-`mut`/cell write inside the arm survives.
+                    // (NP-OOP, issue #116) COERCE the arm's raw value to the match node's type — the VM
+                    // twin of codegen's emit_arm_value → emit_as wrap, so a `T` arm flowing into a
+                    // `T?`-typed match present-wraps (the checker-desugared `?.` relies on it; exact-typed
+                    // arms are a no-op).
+                    Normal as nm => return EvalRes { value= coerce_to(nm.value ?? panic("vm: a `match` used as a value produced no value (internal: checker requires a value arm)"), t); env= with_cells(senv, bo.env.cells) }
                     _            => panic("vm: control flow inside a `match` used as a sub-expression not yet supported")
                 }
             }
@@ -1960,7 +1964,7 @@ fn eval_expr(e: checker::TExpr, env: Venv) -> EvalRes {
             }
         }
         // W5b — `match` as a VALUE: pattern matching (literal/range/Alt/variant-case/destructure + `when`).
-        checker::TMatchExpr as m => eval_match(m, e.line, e.col, env)
+        checker::TMatchExpr as m => eval_match(m, e.type, e.line, e.col, env)
         // W5-idx — subscript `recv[index]` (str→byte; slice→element, bounds-checked — SLICE layer).
         checker::TIndex as ix => eval_index(ix, e.line, e.col, env)
         // $"…{expr}…" — string interpolation: pieces ++ str(holes) (self-host parity).

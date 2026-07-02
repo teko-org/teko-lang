@@ -397,12 +397,20 @@ fn parse_postfix(tokens: []lexer::Token, pos: u64, allow_struct: bool) -> Parsed
             p = idx.next + 1
             continue
         }
-        // `?.` safe field access (null-propagating — REBOOT_PLAN §203). Field-only.
+        // `?.` safe navigation (null-propagating — REBOOT_PLAN §203): `?.field` reads a
+        // field; `?.method(args)` is a null-propagating METHOD call (NP-OOP, issue #116) —
+        // positional-only, like MethodCall (arg_names discarded, see the `.method()` note).
         if is_kind_at(tokens, p, lexer::TokenKind::QDot) {
             if !is_name_at(tokens, p + 1) {
-                return err_at(tokens, p + 1, "expected a field name after '?.'")
+                return err_at(tokens, p + 1, "expected a field or method name after '?.'")
             }
             let name = tokens[p + 1].text
+            if is_kind_at(tokens, p + 2, lexer::TokenKind::LParen) {
+                let ca = match parse_call_args(tokens, p + 2) { ParsedCallArgs as x => x; error as e => return e }
+                node = Expr { kind = SafeMethodCall { receiver = node; method = name; args = ca.args }; line = tokens[pos].line; col = tokens[pos].col }
+                p = ca.next
+                continue
+            }
             node = Expr { kind = SafeFieldAccess { receiver = node; field = name }; line = tokens[pos].line; col = tokens[pos].col }
             p = p + 2
             continue
