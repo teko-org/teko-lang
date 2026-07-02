@@ -367,3 +367,39 @@ fn tkb_roundtrip_iface_dispatch_tag24() {
         error => teko::assert::is_true(false)
     }
 }
+
+// (W10b.D3 codec fix — pat_match transparent-descent regressions) The tag-24 roundtrip above
+// caught a descent-conflation bug: `match ty { Prim => … }` over a `Func { ret = Prim }` subject
+// wrongly took the Prim arm by drilling through `ret`. These three lock the CORRECTED rule
+// directly at the VM's pat_match: descent is SKIPPED only for a MULTI-FIELD SIBLING of the target
+// (Func & Prim are both `Type` members) — a SINGLE-FIELD sibling wrapper (Optional/Slice) still
+// descends, per the wrapper-descent doctrine. A checker::Type case value is a plain StructVal in
+// the VM (its type_name is the case), so a bare-case arm exercises the descent path exactly.
+fn ty_prim() -> checker::Type { checker::Prim { kind = checker::PrimKind::I64 } }
+fn match_prim_arm(ty: checker::Type) -> str {
+    match ty { checker::Prim => "prim"; _ => "other" }
+}
+
+#test
+fn descent_multifield_sibling_no_descend() {
+    // Func { params; ret = Prim; … } is MULTI-FIELD and a SIBLING of Prim (both Type members):
+    // matching it against a bare `Prim` arm must NOT descend through `ret` → the `_` arm.
+    let f: checker::Type = checker::Func { params = teko::list::empty(); ret = ty_prim(); variadic = false; param_names = teko::list::empty(); n_required = 0; defaults = teko::list::empty() }
+    teko::assert::is_true(match_prim_arm(f) == "other")
+}
+
+#test
+fn descent_singlefield_optional_wrapper_descends() {
+    // Optional { inner = Prim } is SINGLE-FIELD (a wrapper): matching it against a bare `Prim`
+    // arm STILL descends into `inner` → the `Prim` arm (doctrine — the case the coarse sibling
+    // gate wrongly broke).
+    let o: checker::Type = checker::Optional { inner = ty_prim() }
+    teko::assert::is_true(match_prim_arm(o) == "prim")
+}
+
+#test
+fn descent_singlefield_slice_wrapper_descends() {
+    // Slice { element = Prim } is SINGLE-FIELD (a wrapper) — the cheap control: descent preserved.
+    let s: checker::Type = checker::Slice { element = ty_prim() }
+    teko::assert::is_true(match_prim_arm(s) == "prim")
+}

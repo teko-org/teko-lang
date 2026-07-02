@@ -1932,12 +1932,15 @@ static tk_str bind_case_name(tk_bind_pattern bp) {
     return vm_texpr_mangle(gte);
 }
 
-// (W10b.D3 codec fix) are `a` and `b` BOTH members of one declared variant? Then a struct value
-// tagged `a` is a PROPERLY-DISCRIMINATED case wherever `b` could appear, and pat_match's
-// transparent field descent must NOT fire between them — it would conflate two cases of the SAME
-// union through an inner field (the bug the tag-24 roundtrip caught: `match ty` in the
-// interpreted tkb_write.tks hit the `Prim` arm for a `Func { ret = Prim{…} }` subject, so a
-// method Func serialized as its OWN return type). Mirrors vm.tks::variant_siblings.
+// (W10b.D3 codec fix) are `a` and `b` BOTH members of one declared variant? If so, a struct value
+// tagged `a` is ALREADY a fully-discriminated case wherever `b` could appear — so descending into
+// its fields to reinterpret it as the sibling case `b` is the conflation bug the tag-24 roundtrip
+// caught (`Func { ret = Prim }` matched a `Prim` arm through `ret`, since Func and Prim are both
+// `Type` members). Combined with the field-count guard at the descent site: descent is SKIPPED
+// only for a MULTI-FIELD sibling — a SINGLE-FIELD sibling wrapper (`Optional { inner = Prim }`)
+// still descends (doctrine — teko-vm-wrapper-descent-bug), and a NON-sibling multi-field node
+// (`Expr { kind = Compare; line; col }` → Compare, an ExprKind member Expr is not a peer of) still
+// descends (the corpus AST-node-into-kind idiom). Mirrors vm.tks::variant_siblings.
 static bool variant_siblings(tk_str a, tk_str b) {
     for (size_t i = 0; i < g_prog.nitems; i += 1) {
         if (g_prog.items[i].tag != TK_TITEM_TYPE_DECL) continue;
@@ -2153,16 +2156,21 @@ static bool pat_match(const tk_pattern *pat, tk_value subj, tk_venv *env) {
                     if (pat->as.bind.has_binding) env_define(env, pat->as.bind.binding, subj);
                     return true;
                 }
-                // Transparent field descent: when the subject is a struct whose fields contain
-                // a value that matches the pattern name (e.g. `Number as nn` on `Expr { kind =
-                // Number{…}; line; col }`), drill into the first matching STRUCT field and bind.
+                // Transparent field descent: when the subject is a struct whose fields hold a
+                // value matching the pattern name (e.g. `Compare as c` on `Expr { kind = Compare;
+                // line; col }`), drill into the first matching STRUCT field and bind. SKIPPED only
+                // for a MULTI-FIELD SIBLING of the target — a subject that is itself a properly-
+                // discriminated case of the SAME union the target belongs to must not be re-read as
+                // the sibling case through an inner field (`Func { params; ret; … }` → a `Prim` arm
+                // via `ret`, both `Type` members — the tag-24 codec bug). A SINGLE-FIELD sibling
+                // wrapper (`Optional { inner = Prim }` → Prim) still descends (doctrine); a NON-
+                // sibling multi-field node still descends (the AST-node-into-kind corpus idiom).
                 // Only struct fields are eligible — int fields are excluded because match_as_enum_int
-                // could match enum member names that coincidentally share the same ordinal value as an
-                // unrelated enum (e.g. TyShape::Variant=2 vs PrimKind::U32=2 causing false descent).
-                // (W10b.D3 codec fix) NEVER descend between SIBLING cases of one declared variant:
-                // a subject already tagged as one case of the union the pattern names a case of is
-                // a MISS, not a container (`Func { ret = Prim }` must not take a `Prim` arm).
-                if (subj.tag == TK_VAL_STRUCT && !variant_siblings(subj.as.st.type_name, bname)) {
+                // could match enum member names that coincidentally share an ordinal (e.g.
+                // TyShape::Variant=2 vs PrimKind::U32=2 causing false descent).
+                bool descend_ok = subj.tag == TK_VAL_STRUCT
+                    && !(subj.as.st.fields.len > 1 && variant_siblings(subj.as.st.type_name, bname));
+                if (descend_ok) {
                     for (size_t fi = 0; fi < subj.as.st.fields.len; fi += 1) {
                         tk_value fv = subj.as.st.fields.vals[fi];
                         if (fv.tag != TK_VAL_STRUCT) continue;
