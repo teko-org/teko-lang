@@ -433,9 +433,11 @@ static int tk_backend(const char *label, const char *stem, tk_tprogram prog, con
 
         FILE *fp = fopen(tkl_path, "wb");
         if (fp == NULL) { tk_free0(zip_bytes.ptr); return fail(label, "cannot write .tkl to the output directory"); }
-        fwrite(zip_bytes.ptr, 1, zip_bytes.len, fp);
-        fclose(fp);
+        size_t wrote = fwrite(zip_bytes.ptr, 1, zip_bytes.len, fp);
+        int close_rc = fclose(fp);
         tk_free0(zip_bytes.ptr);
+        if (wrote != zip_bytes.len) return fail(label, "short write on .tkl package");
+        if (close_rc != 0) return fail(label, "failed to close .tkl package");
 
         printf("teko: %s: packaged %s\n", label, tkl_path);
         return 0;

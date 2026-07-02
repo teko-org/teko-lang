@@ -1437,6 +1437,20 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
                 cb(b, "((uint8_t)"); cb_i128(b, e->as.number.value); cb(b, ")");
                 return true;
             }
+            // (#63) A FLAGS-typed number literal — the checker's fabricated zero in the
+            // any/none lowering (type_flags_method, expr.c) — is a NAMED type whose decl is
+            // `flags`. Emit it cast to the flags' own typedef'd carrier (`tk_t_<Name>`, the
+            // SAME uint chosen by member count as the flags typedef itself emits — TK_BODY_FLAGS
+            // above), so this reuses that carrier via its typedef name instead of re-deriving
+            // uint8_t/uint16_t/… a second time. Mirrors vm.c's flags_carrier_prim (VM twin, #50).
+            if (e->type.tag == TK_TYPE_NAMED && cg_named_is_flags(e->type.as.named.name)) {
+                cb(b, "((");
+                mangle_type_name(b, (tk_str){ NULL, 0 }, e->type.as.named.name);
+                cb(b, ")");
+                cb_i128(b, e->as.number.value);
+                cb(b, ")");
+                return true;
+            }
             // The node's resolved prim decides width / float-kind (N1/N2). A non-prim
             // number type is a checker bug, but be honest rather than mis-emit (M.3).
             if (e->type.tag != TK_TYPE_PRIM)
@@ -2481,6 +2495,9 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
             // bound to a temp via a GNU statement-expression, then compared to each element with `==`
             // OR'd together (true iff the lhs equals any element). The node's `.type` is bool.
             //   ({ <CtypeOfLhs> _invN = <lhs>; (_invN == <e0>) || (_invN == <e1>) || …; })
+            // A STR lhs routes each comparison through tk_str_eq instead (a tk_str is a {ptr,len}
+            // struct — C `==` is invalid on it; content equality, mirroring TK_TEXPR_COMPARE):
+            //   ({ tk_str _invN = <lhs>; tk_str_eq(_invN, <e0>) || tk_str_eq(_invN, <e1>) || …; })
             // The temp `_inv<buflen>` uses the CURRENT buffer length as the functional uniquifier
             // (see emit_if_value / emit_index). The EMPTY set `x in []` still EVALUATES the lhs once
             // (single-eval), then yields false — so a side-effecting lhs runs identically in the VM
@@ -2493,6 +2510,7 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
             }
             char tmp[40];
             snprintf(tmp, sizeof tmp, "_inv%zu", (size_t)b->len);
+            bool str_in = e->as.in_expr.lhs->type.tag == TK_TYPE_STR;
             cb(b, "({ ");
             if (!emit_type(b, e->as.in_expr.lhs->type, err)) return false;   // the lhs's resolved C type
             cb(b, " "); cb(b, tmp); cb(b, " = ");
@@ -2500,9 +2518,15 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
             cb(b, "; ");
             for (size_t i = 0; i < e->as.in_expr.nelems; i += 1) {
                 if (i > 0) cb(b, " || ");
-                cb(b, "("); cb(b, tmp); cb(b, " == ");
-                if (!emit_expr(b, &e->as.in_expr.elems[i], err)) return false;
-                cb(b, ")");
+                if (str_in) {
+                    cb(b, "tk_str_eq("); cb(b, tmp); cb(b, ", ");
+                    if (!emit_expr(b, &e->as.in_expr.elems[i], err)) return false;
+                    cb(b, ")");
+                } else {
+                    cb(b, "("); cb(b, tmp); cb(b, " == ");
+                    if (!emit_expr(b, &e->as.in_expr.elems[i], err)) return false;
+                    cb(b, ")");
+                }
             }
             cb(b, "; })");
             return true;
@@ -3012,7 +3036,7 @@ static bool emit_as(cbuf *b, tk_type expected, const tk_texpr *value, const char
 // This yields the VM's first-match-with-guard order, keeps bindings scoped, and compiles.
 //
 // PATTERN TESTS against the subject temp `_s`:
-//   WILDCARD -> 1 ; LITERAL -> (_s == <lit>) ; RANGE -> (_s >= lo && _s <= hi) ;
+//   WILDCARD -> 1 ; LITERAL -> (_s == <lit>) (str: tk_str_eq(_s, <lit>)) ; RANGE -> (_s >= lo && _s <= hi) ;
 //   ALT -> (t0 || t1 || …) ; BIND/FIELD case -> (_s.tag == TK_TAG_<Variant>_<case>).
 // PATTERN BINDS (emitted at the top of the arm block, before guard/body):
 //   BIND `Foo as x`        -> `auto x = _s.as.<Foo>;`            (the whole case value)
@@ -3022,10 +3046,10 @@ static bool emit_as(cbuf *b, tk_type expected, const tk_texpr *value, const char
 // =========================================================================
 
 // Emit an AST LITERAL pattern bound as a C constant comparable to the subject temp `_s`.
-// `_s` already has the subject's C type, so a bare C literal compares correctly (the VM's
-// lit_as borrows the subject's width/sign for the same reason). A str-literal pattern has
-// no C value-comparison helper in the runtime (no tk_str eq), so it is an honest barrier —
-// the VM DOES support str patterns (via name_eq), so this is a true codegen-only gap (M.3).
+// `_s` already has the subject's C type, so a bare C number/byte literal compares correctly
+// (the VM's lit_as borrows the subject's width/sign for the same reason). A str literal is a
+// (tk_str){…} compound literal with an EXPLICIT length (same form as TK_TEXPR_STR — the bytes
+// may hold NUL); the CALLER must compare it via tk_str_eq, never `==` (see emit_pat_test).
 static bool cg_emit_lit_pattern(cbuf *b, const tk_expr *lit, const char **err) {
     switch (lit->tag) {
         case TK_EXPR_NUMBER:
@@ -3036,7 +3060,12 @@ static bool cg_emit_lit_pattern(cbuf *b, const tk_expr *lit, const char **err) {
             cb_i64(b, (int64_t)lit->as.byte.value);
             return true;
         case TK_EXPR_STR:
-            return fail_node(err, "codegen: string-literal patterns not yet supported (no tk_str equality helper in the runtime)");
+            cb(b, "(tk_str){ (const tk_byte *)\"");
+            cb_cstr_escaped(b, lit->as.str.text);
+            cb(b, "\", ");
+            cb_i64(b, (int64_t)lit->as.str.text.len);
+            cb(b, " }");
+            return true;
         default:
             return fail_node(err, "codegen: unsupported literal in a pattern (parser emits only number/byte/str)");
     }
@@ -3101,6 +3130,14 @@ static bool emit_pat_test(cbuf *b, const tk_pattern *pat, const char *subj,
             cb(b, "1");
             return true;
         case TK_PAT_LITERAL:
+            // A STR literal pattern tests via tk_str_eq (a tk_str is a {ptr,len} struct — C `==`
+            // is invalid on it; content equality, mirroring TK_TEXPR_COMPARE's str branch).
+            if (pat->as.literal.value.tag == TK_EXPR_STR) {
+                cb(b, "tk_str_eq("); cb(b, subj); cb(b, ", ");
+                if (!cg_emit_lit_pattern(b, &pat->as.literal.value, err)) return false;
+                cb(b, ")");
+                return true;
+            }
             cb(b, "("); cb(b, subj); cb(b, " == ");
             if (!cg_emit_lit_pattern(b, &pat->as.literal.value, err)) return false;
             cb(b, ")");
@@ -4429,6 +4466,11 @@ static bool emit_type_decl(cbuf *b, tk_tprogram prog, tk_type_decl d, const char
             cb(b, ";\n\n");
             return true;
         }
+        case TK_BODY_INTERFACE:
+            // (W10b.IF) an interface is a COMPILE-TIME contract only — NO runtime C type is emitted
+            // (dynamic dispatch / vtable is ROUND 3). Like a transparent alias, it lowers to nothing;
+            // the checker rejects using an interface as a value type.
+            return true;
     }
     return fail_node(err, "codegen: unknown type body not yet supported");
 }
@@ -5004,7 +5046,7 @@ static char *cg_format_c(const char *src) {
     cbuf out = { NULL, 0, 0 };
     size_t depth = 0;            // open-brace count (= indent level)
     char stk[4096]; size_t sp = 0;   // bracket stack — innermost decides `;` breaking ({ vs ( )
-    bool blk[4096];              // per-`{`: is it a function/control BLOCK (preceded by `)`)? — for top-level separation
+    bool blk[4096] = {0};        // per-`{`: is it a function/control BLOCK (preceded by `)`)? — for top-level separation
     bool line_start = true;      // at the start of a fresh output line?
     char one[2] = { 0, 0 };
     size_t i = 0;

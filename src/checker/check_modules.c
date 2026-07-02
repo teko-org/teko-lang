@@ -169,6 +169,15 @@ const char *tk_check_modules(tk_program prog, tk_type_table table) {
                 // (W10b.CLASS) mirrors struct's field-only scope (methods unchecked here, same as struct methods today)
                 for (size_t k = 0; k < d.body.as.class_body.n_fields && !e; k += 1)
                     e = check_texpr(d.body.as.class_body.fields[k].type_ann, ns, table, al);
+            } else if (d.body.tag == TK_BODY_INTERFACE) {
+                // (W10b.IF) validate each method signature's TYPED params + return type-exprs
+                tk_interface_body ib = d.body.as.interface_body;
+                for (size_t mi = 0; mi < ib.n_methods && !e; mi += 1) {
+                    tk_function m = ib.methods[mi];
+                    for (size_t pi = 0; pi < m.nparams && !e; pi += 1)
+                        if (m.params[pi].has_type) e = check_texpr(m.params[pi].type_ann, ns, table, al);
+                    if (!e && m.has_return) e = check_texpr(m.return_type, ns, table, al);
+                }
             }
             // enum body: member names only; extern body (C7.1a): opaque handle — neither has type references to check
         }

@@ -185,12 +185,16 @@ tk_texpr tk_read_texpr(tk_reader *r, tk_strs t) {
             e.as.interp.holes  = holes;  e.as.interp.nholes  = nh;
             return e;
         }
-        case 19:                                                                /* value-level Enum::Member — enum name, member, ordinal */
+        case 19: {                                                              /* value-level Enum::Member — enum name, member, ordinal, (#50) value (u128 as hi then lo) */
             e.tag = TK_TEXPR_PATH;
             e.as.path.enum_name = tk_read_str(r, t);
             e.as.path.member    = tk_read_str(r, t);
             e.as.path.ordinal   = tk_read_u64(r);
+            uint64_t vhi = tk_read_u64(r);
+            uint64_t vlo = tk_read_u64(r);
+            e.as.path.value = (((unsigned __int128)vhi) << 64) | (unsigned __int128)vlo;
             return e;
+        }
         case 20: {                                                              /* Phase 2 — <expr> in [ … ]: lhs THEN nelems (u64) THEN each elem */
             e.tag = TK_TEXPR_IN;
             e.as.in_expr.lhs = boxe(tk_read_texpr(r, t));
@@ -364,6 +368,12 @@ static tk_type_body read_typebody(tk_reader *r, tk_strs t) {
             tb.as.class_body.implements = NULL; tb.as.class_body.n_implements = 0;
             tb.as.class_body.fields = read_fields(r, t, &tb.as.class_body.n_fields);
             tb.as.class_body.methods = NULL; tb.as.class_body.n_methods = 0;
+            return tb;
+        }
+        case 7: {   // (W10b.IF) extends names only — method sigs not serialized (same gap as struct/class methods)
+            tb.tag = TK_BODY_INTERFACE;
+            tb.as.interface_body.extends = read_strs(r, t, &tb.as.interface_body.n_extends);
+            tb.as.interface_body.methods = NULL; tb.as.interface_body.n_methods = 0;
             return tb;
         }
     }

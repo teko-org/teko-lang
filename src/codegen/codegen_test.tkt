@@ -1150,6 +1150,27 @@ fn cgt_emit_index_in_array_interp() {
     let in_out = match emit_expr(cgt_empty(), cgt_prog(), in_e) { []byte as o => str(o); error => "" }
     teko::assert::is_true(teko::str::contains(in_out, "=="))
 
+    // emit_in — STR lhs: "x" in ["get"] routes through tk_str_eq, never struct `==` (issue #47)
+    let str_lhs = checker::TExpr {
+        kind = checker::TVar { name = "meth"; is_func = false; func_ns = "" }
+        type = checker::Str { }
+        line = 0; col = 0
+    }
+    let str_elem = checker::TExpr {
+        kind = checker::TStrLit { text = "get" }
+        type = checker::Str { }
+        line = 0; col = 0
+    }
+    let sin_elems: []checker::TExpr = teko::list::push(teko::list::empty(), str_elem)
+    let sin_e = checker::TExpr {
+        kind = checker::TInExpr { lhs = str_lhs; elems = sin_elems }
+        type = checker::Prim { kind = checker::PrimKind::Bool }
+        line = 0; col = 0
+    }
+    let sin_out = match emit_expr(cgt_empty(), cgt_prog(), sin_e) { []byte as o => str(o); error => "" }
+    teko::assert::is_true(teko::str::contains(sin_out, "tk_str_eq("))
+    teko::assert::is_false(teko::str::contains(sin_out, "=="))
+
     // emit_array_lit — one-element array [42] of I64 (plain, no spread)
     let arr_ae: checker::TArrayElem = checker::TArrayElem { is_spread = false; expr = cgt_num_i64(42) }
     let arr_elems: []checker::TArrayElem = teko::list::push(teko::list::empty(), arr_ae)
@@ -1175,6 +1196,29 @@ fn cgt_emit_index_in_array_interp() {
     let interp_out = match emit_expr(cgt_empty(), cgt_prog(), interp_e) { []byte as o => str(o); error => "" }
     teko::assert::is_true(teko::str::contains(interp_out, "tk_str_concat"))
     teko::assert::is_true(teko::str::contains(interp_out, "tk_i64_to_str"))
+}
+
+// emit_pat_test — literal patterns against the subject temp `_s` (issue #47): an INT literal
+// tests via bare `==`; a STR literal routes through tk_str_eq over the (tk_str){…} compound
+// literal (a tk_str is a {ptr,len} struct — C `==` is invalid on it).
+#test
+fn cgt_emit_lit_pattern_str_vs_int() {
+    // int literal pattern: (_s == 42)
+    let int_pat: parser::Pattern = parser::LiteralPattern {
+        value = parser::Expr { kind = parser::Number { value = 42; is_float = false; fval = 0.0 }; line = 0; col = 0 }
+    }
+    let int_out = match emit_pat_test(cgt_empty(), cgt_prog(), int_pat, "_s", checker::Prim { kind = checker::PrimKind::I64 }) { []byte as o => str(o); error => "" }
+    teko::assert::is_true(teko::str::contains(int_out, "(_s == "))     // bare C `==` (cb_i128 spells the constant)
+    teko::assert::is_true(teko::str::contains(int_out, "42"))
+    teko::assert::is_false(teko::str::contains(int_out, "tk_str_eq"))
+
+    // str literal pattern: tk_str_eq(_s, (tk_str){ (const tk_byte *)"build", 5 })
+    let str_pat: parser::Pattern = parser::LiteralPattern {
+        value = parser::Expr { kind = parser::StrLit { text = "build" }; line = 0; col = 0 }
+    }
+    let str_out = match emit_pat_test(cgt_empty(), cgt_prog(), str_pat, "_s", checker::Str { }) { []byte as o => str(o); error => "" }
+    teko::assert::is_true(teko::str::contains(str_out, "tk_str_eq(_s, (tk_str){ (const tk_byte *)\"build\", 5 })"))
+    teko::assert::is_false(teko::str::contains(str_out, "=="))
 }
 
 // ---------------------------------------------------------------------------

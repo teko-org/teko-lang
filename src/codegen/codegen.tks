@@ -2065,6 +2065,9 @@ fn emit_index(buf: []byte, prog: checker::TProgram, e: checker::TExpr, ix: check
 // bound to a temp via a GNU statement-expression, then compared to each element with `==` OR'd
 // together (true iff the lhs equals any element). The node's `.type` is bool.
 //   ({ <CtypeOfLhs> _invN = <lhs>; (_invN == <e0>) || (_invN == <e1>) || …; })
+// A STR lhs routes each comparison through tk_str_eq instead (a tk_str is a {ptr,len} struct —
+// C `==` is invalid on it; content equality, mirroring emit_compare's str branch):
+//   ({ tk_str _invN = <lhs>; tk_str_eq(_invN, <e0>) || tk_str_eq(_invN, <e1>) || …; })
 // The temp `_inv<buf.len>` uses the buffer length as the functional uniquifier (see emit_index).
 // The EMPTY set `x in []` still EVALUATES the lhs once (single-eval), then yields false — so a
 // side-effecting lhs runs identically in the VM (which evaluates the lhs before its zero-iteration
@@ -2076,6 +2079,7 @@ fn emit_in(buf: []byte, prog: checker::TProgram, ie: checker::TInExpr, escaping:
         return cb(z, "); 0; })")
     }
     let tmp = $"_inv{buf.len}"
+    let str_in = match ie.lhs.type { checker::Str => true; _ => false }
     mut out = cb(buf, "({ ")
     out = match emit_type(out, prog, ie.lhs.type) { []byte as o => o; error as err => return err }   // the lhs's resolved C type
     out = cb(out, " ")
@@ -2087,11 +2091,19 @@ fn emit_in(buf: []byte, prog: checker::TProgram, ie: checker::TInExpr, escaping:
     loop {
         if i >= ie.elems.len { break }
         if i > 0 { out = cb(out, " || ") }
-        out = cb(out, "(")
-        out = cb(out, tmp)
-        out = cb(out, " == ")
-        out = match emit_expr_ctx(out, prog, checker::Void { }, ie.elems[i], escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
-        out = cb(out, ")")
+        if str_in {
+            out = cb(out, "tk_str_eq(")
+            out = cb(out, tmp)
+            out = cb(out, ", ")
+            out = match emit_expr_ctx(out, prog, checker::Void { }, ie.elems[i], escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
+            out = cb(out, ")")
+        } else {
+            out = cb(out, "(")
+            out = cb(out, tmp)
+            out = cb(out, " == ")
+            out = match emit_expr_ctx(out, prog, checker::Void { }, ie.elems[i], escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
+            out = cb(out, ")")
+        }
         i++
     }
     cb(out, "; })")
@@ -3323,11 +3335,11 @@ fn emit_as_r(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, expe
 }
 
 // cg_emit_lit_pattern — emit an AST LITERAL pattern bound as a C constant comparable to the
-// subject temp `_s` (which already has the subject's C type, so a bare C literal compares
-// correctly — the VM's lit_as borrows the subject's width/sign for the same reason). A
-// str-literal pattern has NO C value-comparison helper in the runtime (no tk_str eq), so it
-// is an honest barrier — the VM DOES support str patterns (name_eq), so this is a true
-// codegen-only gap (M.3). (C: `cg_emit_lit_pattern`.)
+// subject temp `_s` (which already has the subject's C type, so a bare C number/byte literal
+// compares correctly — the VM's lit_as borrows the subject's width/sign for the same reason).
+// A str literal is a (tk_str){…} compound literal with an EXPLICIT length (same form as
+// TStrLit — the bytes may hold NUL); the CALLER must compare it via tk_str_eq, never `==`
+// (see emit_pat_test). (C: `cg_emit_lit_pattern`.)
 fn cg_emit_lit_pattern(buf: []byte, lit: parser::Expr) -> []byte | error {
     // descend to the variant `.kind` — `Expr` is `struct { kind: ExprKind }` in the .tks model
     // (the C twin's tk_expr is a tagged union, so its cg_emit_lit_pattern matches `lit` directly —
@@ -3338,7 +3350,13 @@ fn cg_emit_lit_pattern(buf: []byte, lit: parser::Expr) -> []byte | error {
             cb_i128(buf, n.value)
         }
         parser::ByteLit as b => cb_i64(buf, b.value to i64)
-        parser::StrLit       => error { message = "codegen: string-literal patterns not yet supported (no tk_str equality helper in the runtime)" }
+        parser::StrLit as sl => {
+            mut out = cb(buf, "(tk_str){ (const tk_byte *)\"")
+            out = cb_cstr_escaped(out, sl.text)
+            out = cb(out, "\", ")
+            out = cb_i64(out, sl.text.len to i64)
+            cb(out, " }")
+        }
         _                    => error { message = "codegen: unsupported literal in a pattern (parser emits only number/byte/str)" }
     }
 }
@@ -3404,6 +3422,16 @@ fn emit_pat_test(buf: []byte, prog: checker::TProgram, pat: parser::Pattern, sub
     match pat {
         parser::WildcardPattern => cb(buf, "1")
         parser::LiteralPattern as lp => {
+            // A STR literal pattern tests via tk_str_eq (a tk_str is a {ptr,len} struct — C `==`
+            // is invalid on it; content equality, mirroring emit_compare's str branch).
+            let is_str_lit = match lp.value.kind { parser::StrLit => true; _ => false }
+            if is_str_lit {
+                mut out = cb(buf, "tk_str_eq(")
+                out = cb(out, subj)
+                out = cb(out, ", ")
+                out = match cg_emit_lit_pattern(out, lp.value) { []byte as o => o; error as err => return err }
+                return cb(out, ")")
+            }
             mut out = cb(buf, "(")
             out = cb(out, subj)
             out = cb(out, " == ")
@@ -4078,13 +4106,31 @@ fn emit_match_stmt(buf: []byte, prog: checker::TProgram, e: checker::TExpr, m: c
 // decimal value cast to the prim's C type, so the literal carries the right width — a
 // u128/i128 literal is wider than any C integer literal can spell on its own.
 // (C: the TK_TEXPR_NUMBER branch of emit_expr.)
-fn emit_number(buf: []byte, e: checker::TExpr, n: checker::TNumber) -> []byte | error {
+fn emit_number(buf: []byte, prog: checker::TProgram, e: checker::TExpr, n: checker::TNumber) -> []byte | error {
     // A numeric literal adopted to `byte` via literal-adoption (e.g. `c < 0x20` where c: byte).
     match e.type {
         checker::Byte => {
             mut o = cb(buf, "((uint8_t)")
             o = cb_i128(o, n.value)
             return cb(o, ")")
+        }
+        _ => { }
+    }
+    // (#63) A FLAGS-typed number literal — the checker's fabricated zero in the any/none
+    // lowering (type_flags_method, typer.tks) — is a NAMED type whose decl is `flags`. Emit it
+    // cast to the flags' own typedef'd carrier (`tk_t_<Name>`, the SAME uint chosen by member
+    // count as the flags typedef itself emits — FlagsBody above), reusing that carrier via its
+    // typedef name instead of re-deriving uint8_t/uint16_t/… a second time. Mirrors vm.tks's
+    // flags_carrier_of (VM twin, #50).
+    match e.type {
+        checker::Named as nm => {
+            if cg_named_is_flags(prog, nm.name) {
+                mut o = cb(buf, "((")
+                o = mangle_type_name(o, "", nm.name)
+                o = cb(o, ")")
+                o = cb_i128(o, n.value)
+                return cb(o, ")")
+            }
         }
         _ => { }
     }
@@ -4136,7 +4182,7 @@ fn emit_expr_ret(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, 
 // Every other expr just forwards the context unchanged. (C: `emit_expr` — globals, no threading.)
 fn emit_expr_ctx(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, e: checker::TExpr, escaping: []str, regions: []RegionFrame, fn_body: []checker::TStatement, dctx: DeferCtx) -> []byte | error {
     match e.kind {
-        checker::TNumber as n      => emit_number(buf, e, n)
+        checker::TNumber as n      => emit_number(buf, prog, e, n)
         // (W10a) a bare top-level-fn reference used as a VALUE → a `tk_closure` literal carrying the
         // C function's address (env = NULL; named fns capture nothing). A plain local emits its name.
         checker::TVar as v         => if v.is_func {
@@ -5138,6 +5184,11 @@ fn emit_type_decl(buf: []byte, prog: checker::TProgram, d: parser::TypeDecl) -> 
             out = cb(out, "} ")
             out = mangle_type_name(out, "", d.name)
             cb(out, ";\n\n")
+        }
+        parser::InterfaceBody => {   // (W10b.IF) an interface is a COMPILE-TIME contract only — NO
+            // runtime C type is emitted (dynamic dispatch / vtable is ROUND 3). Like a transparent
+            // alias, it lowers to nothing; the checker rejects using an interface as a value type.
+            buf
         }
         parser::VariantBody as vb => {
             // A variant body is a UnionType (A | B | …). Members may be ANY type (B-cg2):

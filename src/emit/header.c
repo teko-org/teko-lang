@@ -95,6 +95,10 @@ static tyexport_result build_tyexport(tk_type_decl d, tk_type_table table) {
                               .has_doc = d.has_doc, .doc = d.doc };
             return (tyexport_result){ .ok = true, .as.value = e };
         }
+        case TK_BODY_INTERFACE:
+            // (W10b.IF) exporting an interface in the `.tkh` is a LATER gap (the header has no
+            // interface shape yet — dynamic dispatch is ROUND 3). Honest stop, mirrors alias/extern.
+            return (tyexport_result){ .ok = false, .as.error = tk_error_make("exporting an interface in the header is not yet supported") };
     }
     return (tyexport_result){ .ok = false, .as.error = tk_error_make("unknown type body shape") };
 }

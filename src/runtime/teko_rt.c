@@ -13,6 +13,7 @@
 #include <string.h>   // memcpy
 #include <stddef.h>   // max_align_t, offsetof — arena chunk alignment (S1; also via teko_rt.h)
 #include <inttypes.h> // PRId64, PRIx64, PRIX64 — format spec helpers
+#include <stdarg.h>   // va_list, va_start/va_copy/va_end — fmt_alloc_vsnprintf heap-overflow path (issue #48)
 #include <signal.h>   // signal — native crash backtraces (C1.9)
 // execinfo (backtrace) exists on macOS + glibc, but NOT musl (the Alpine/Linux pipeline). Guard it
 // so the runtime is musl-portable (C7.1f); without it the backtrace degrades to a one-line notice.
@@ -343,59 +344,154 @@ tk_str tk_ftoa(double x) {
 }
 
 // --- Format spec helpers ($"{x:F2}" / $"{x:[fmt]}") ---
-// All produce fresh malloc'd str; tk_panic on OOM. snprintf into a 128-byte stack buffer
-// (all formatted numbers fit); then copy into a heap str.
-static tk_str fmt_from_buf(char *tmp, int n) {
+// All produce fresh malloc'd str; tk_panic on OOM. snprintf into a small stack buffer for the
+// common case (all everyday formatted numbers fit); a user-supplied width/precision (e.g.
+// `$"{x:F500}"`) can make snprintf's would-have-written length exceed that buffer, so every
+// helper here is capacity-aware: `n` is snprintf's return (bytes it WOULD write, NOT bytes it
+// DID write into a short buffer — see C11 7.21.6.5p3), and `fmt_from_buf` only trusts `tmp` for
+// up to `n < cap` bytes. Once `n >= cap`, `tmp` holds a truncated result — this file always
+// prefers CORRECT OUTPUT over silent truncation, so every call site re-runs its snprintf into a
+// heap buffer sized `n + 1` (see fmt_alloc_vsnprintf) rather than ever memcpy-ing past what was
+// actually written.
+static tk_str fmt_from_buf(char *tmp, size_t cap, int n) {
     if (n < 0) n = 0;
     size_t len = (size_t)n;
+    if (len >= cap) len = cap ? cap - 1 : 0;   // defensive: never trust more than snprintf actually wrote
     tk_byte *buf = malloc(len ? len : 1);
     if (buf == NULL) tk_panic("out of memory (fmt)");
     if (len) memcpy(buf, tmp, len);
     return (tk_str){ buf, len };
 }
+// fmt_alloc_vsnprintf — snprintf `format` with `args` into a HEAP buffer sized to fit the full
+// (untruncated) result, and return it as an owned tk_str. Used as the overflow path once a
+// stack-buffer snprintf reports `n >= cap` (issue #48): re-runs the SAME format/args at the
+// correct size instead of ever copying past a truncated stack buffer. The heap buffer is
+// per-call scratch — freed here, not process-lifetime (M.5 governs leaks, not this).
+static tk_str fmt_alloc_vsnprintf(const char *format, ...) {
+    va_list args;
+    va_start(args, format);
+    va_list args2;
+    va_copy(args2, args);
+    char probe[1];
+    int n = vsnprintf(probe, sizeof probe, format, args);
+    va_end(args);
+    if (n < 0) { va_end(args2); return fmt_from_buf(probe, sizeof probe, 0); }
+    size_t need = (size_t)n + 1;               // + NUL, vsnprintf's own requirement
+    char *heap = malloc(need);
+    if (heap == NULL) { va_end(args2); tk_panic("out of memory (fmt)"); }
+    int n2 = vsnprintf(heap, need, format, args2);
+    va_end(args2);
+    tk_str out = fmt_from_buf(heap, need, n2);
+    free(heap);
+    return out;
+}
 static int fmt_parse_prec(tk_str spec, int def) {
     // parse optional trailing digits from spec (e.g. "F2" → 2, "F" → def)
+    // Clamp the accumulator at FMT_PREC_MAX (still consuming all digits) to avoid signed
+    // overflow on a maliciously/accidentally huge digit run (e.g. `$"{x:[F999999999999]}"`);
+    // any in-range value (well under this bound) round-trips exactly as before.
+    enum { FMT_PREC_MAX = 10000 };
     int p = def; size_t i = 0;
     while (i < spec.len && (spec.ptr[i] < '0' || spec.ptr[i] > '9')) i++;
-    if (i < spec.len) { p = 0; while (i < spec.len && spec.ptr[i] >= '0' && spec.ptr[i] <= '9') { p = p * 10 + (spec.ptr[i] - '0'); i++; } }
+    if (i < spec.len) {
+        p = 0;
+        while (i < spec.len && spec.ptr[i] >= '0' && spec.ptr[i] <= '9') {
+            if (p < FMT_PREC_MAX) p = p * 10 + (spec.ptr[i] - '0');
+            if (p > FMT_PREC_MAX) p = FMT_PREC_MAX;
+            i++;
+        }
+    }
     return p;
 }
-tk_str tk_fmt_f(double val, int prec) { char tmp[128]; return fmt_from_buf(tmp, snprintf(tmp, sizeof tmp, "%.*f", prec, val)); }
-tk_str tk_fmt_d(int64_t val, int width) { char tmp[64]; return fmt_from_buf(tmp, snprintf(tmp, sizeof tmp, "%0*" PRId64, width, val)); }
-tk_str tk_fmt_x_upper(uint64_t val) { char tmp[32]; return fmt_from_buf(tmp, snprintf(tmp, sizeof tmp, "%" PRIX64, val)); }
-tk_str tk_fmt_x_lower(uint64_t val) { char tmp[32]; return fmt_from_buf(tmp, snprintf(tmp, sizeof tmp, "%" PRIx64, val)); }
-tk_str tk_fmt_e(double val, int prec) { char tmp[128]; return fmt_from_buf(tmp, snprintf(tmp, sizeof tmp, "%.*e", prec, val)); }
-tk_str tk_fmt_g(double val, int prec) { char tmp[128]; return fmt_from_buf(tmp, snprintf(tmp, sizeof tmp, "%.*g", prec, val)); }
+tk_str tk_fmt_f(double val, int prec) {
+    char tmp[128]; int n = snprintf(tmp, sizeof tmp, "%.*f", prec, val);
+    if (n < 0 || (size_t)n >= sizeof tmp) return fmt_alloc_vsnprintf("%.*f", prec, val);
+    return fmt_from_buf(tmp, sizeof tmp, n);
+}
+tk_str tk_fmt_d(int64_t val, int width) {
+    char tmp[64]; int n = snprintf(tmp, sizeof tmp, "%0*" PRId64, width, val);
+    if (n < 0 || (size_t)n >= sizeof tmp) return fmt_alloc_vsnprintf("%0*" PRId64, width, val);
+    return fmt_from_buf(tmp, sizeof tmp, n);
+}
+tk_str tk_fmt_x_upper(uint64_t val) { char tmp[32]; return fmt_from_buf(tmp, sizeof tmp, snprintf(tmp, sizeof tmp, "%" PRIX64, val)); }
+tk_str tk_fmt_x_lower(uint64_t val) { char tmp[32]; return fmt_from_buf(tmp, sizeof tmp, snprintf(tmp, sizeof tmp, "%" PRIx64, val)); }
+tk_str tk_fmt_e(double val, int prec) {
+    char tmp[128]; int n = snprintf(tmp, sizeof tmp, "%.*e", prec, val);
+    if (n < 0 || (size_t)n >= sizeof tmp) return fmt_alloc_vsnprintf("%.*e", prec, val);
+    return fmt_from_buf(tmp, sizeof tmp, n);
+}
+tk_str tk_fmt_g(double val, int prec) {
+    char tmp[128]; int n = snprintf(tmp, sizeof tmp, "%.*g", prec, val);
+    if (n < 0 || (size_t)n >= sizeof tmp) return fmt_alloc_vsnprintf("%.*g", prec, val);
+    return fmt_from_buf(tmp, sizeof tmp, n);
+}
 tk_str tk_fmt_b(uint64_t val) {
     char tmp[65]; int i = 0;
     if (val == 0) { tmp[i++] = '0'; } else { for (int b = 63; b >= 0; b--) { if ((val >> (unsigned)b) & 1u) { for (; b >= 0; b--) tmp[i++] = (char)('0' + ((val >> (unsigned)b) & 1u)); break; } } }
-    return fmt_from_buf(tmp, i);
+    return fmt_from_buf(tmp, sizeof tmp, i);
 }
-tk_str tk_fmt_p(double val, int prec) { char tmp[128]; return fmt_from_buf(tmp, snprintf(tmp, sizeof tmp, "%.*f%%", prec, val * 100.0)); }
+tk_str tk_fmt_p(double val, int prec) {
+    char tmp[128]; int n = snprintf(tmp, sizeof tmp, "%.*f%%", prec, val * 100.0);
+    if (n < 0 || (size_t)n >= sizeof tmp) return fmt_alloc_vsnprintf("%.*f%%", prec, val * 100.0);
+    return fmt_from_buf(tmp, sizeof tmp, n);
+}
+// tk_fmt_n_f / tk_fmt_n_i — format with a thousands separator: snprintf the plain digits, then
+// insert commas while copying into `out`. `out` must hold the digits PLUS one comma per group of
+// 3 PLUS a sign PLUS NUL headroom; for large `n` (huge width/precision) the fixed-size `out`
+// stack buffers can't hold that, so both fall back to a heap buffer sized to the worst case
+// (n digits -> at most n commas -> 2*n+2 bytes is always enough) instead of over-writing a fixed
+// array (issue #48 — `out[160]`/`out[48]` over-write).
 tk_str tk_fmt_n_f(double val, int prec) {
     // Format with thousands separator: format without first, then insert commas.
     char tmp[128]; int n = snprintf(tmp, sizeof tmp, "%.*f", prec, val);
-    if (n <= 0) return fmt_from_buf(tmp, n);
+    if (n < 0) return fmt_from_buf(tmp, sizeof tmp, n);
+    char tmp_stack[128];
+    char *src = tmp;
+    char *heap_src = NULL;
+    if ((size_t)n >= sizeof tmp) {
+        // re-run into a heap buffer big enough for the untruncated digits
+        heap_src = malloc((size_t)n + 1);
+        if (heap_src == NULL) tk_panic("out of memory (fmt)");
+        int n2 = snprintf(heap_src, (size_t)n + 1, "%.*f", prec, val);
+        if (n2 < 0) { free(heap_src); return fmt_from_buf(tmp_stack, sizeof tmp_stack, 0); }
+        n = n2;
+        src = heap_src;
+    }
     // find decimal point (if any)
-    int dot = n; for (int k = 0; k < n; k++) { if (tmp[k] == '.') { dot = k; break; } }
-    char out[160]; int o = 0, start = (tmp[0] == '-') ? 1 : 0;
-    if (tmp[0] == '-') out[o++] = '-';
-    int int_len = dot - start;
+    int dot = n; for (int k = 0; k < n; k++) { if (src[k] == '.') { dot = k; break; } }
+    size_t out_cap = (size_t)n * 2 + 2;   // worst case: a comma every digit, plus sign, plus slack
+    char out_stack[160];
+    char *out = (out_cap <= sizeof out_stack) ? out_stack : malloc(out_cap);
+    if (out == NULL) { if (heap_src) free(heap_src); tk_panic("out of memory (fmt)"); }
+    int o = 0, start = (src[0] == '-') ? 1 : 0;
+    if (src[0] == '-') out[o++] = '-';
     for (int k = start; k < dot; k++) {
         int pos = dot - k - 1;
-        out[o++] = tmp[k];
+        out[o++] = src[k];
         if (pos > 0 && pos % 3 == 0) out[o++] = ',';
     }
-    for (int k = dot; k < n; k++) out[o++] = tmp[k];
-    return fmt_from_buf(out, o);
+    for (int k = dot; k < n; k++) out[o++] = src[k];
+    tk_str result = fmt_from_buf(out, out_cap, o);
+    if (out != out_stack) free(out);
+    if (heap_src) free(heap_src);
+    return result;
 }
 tk_str tk_fmt_n_i(int64_t val) {
     char tmp[32]; int n = snprintf(tmp, sizeof tmp, "%" PRId64, val);
-    if (n <= 0) return fmt_from_buf(tmp, n);
-    char out[48]; int o = 0, start = (tmp[0] == '-') ? 1 : 0;
+    if (n <= 0) return fmt_from_buf(tmp, sizeof tmp, n);
+    // n is bounded by int64 digit count (<= 20) here, so the fixed `tmp`/`out` are always
+    // sufficient — no overflow path is reachable for this signature; kept capacity-aware for
+    // consistency with tk_fmt_n_f and to stay correct if the format ever widens.
+    size_t out_cap = (size_t)n * 2 + 2;
+    char out_stack[48];
+    char *out = (out_cap <= sizeof out_stack) ? out_stack : malloc(out_cap);
+    if (out == NULL) tk_panic("out of memory (fmt)");
+    int o = 0, start = (tmp[0] == '-') ? 1 : 0;
     if (tmp[0] == '-') out[o++] = '-';
     for (int k = start; k < n; k++) { int pos = n - k - 1; out[o++] = tmp[k]; if (pos > 0 && pos % 3 == 0) out[o++] = ','; }
-    return fmt_from_buf(out, o);
+    tk_str result = fmt_from_buf(out, out_cap, o);
+    if (out != out_stack) free(out);
+    return result;
 }
 // Dynamic dispatchers: parse first char of spec (case-insensitive) + optional digits.
 tk_str tk_fmt_dyn_f64(double val, tk_str spec) {
@@ -1200,7 +1296,7 @@ void *tk_slice_push(const void *ptr, uint64_t len, const void *elem, uint64_t es
     // copy-grow geometrically into a fresh buffer (the old one is left intact — value semantics).
     uint64_t cap = (len < 4) ? 8 : (len * 2);
     void *buf = tk_alloc(cap * esz);
-    if (len) memcpy(buf, ptr, len * esz);
+    if (len && ptr != NULL) memcpy(buf, ptr, len * esz);
     memcpy((char *)buf + len * esz, elem, esz);
     // reuse this buffer's slot if it was tracked (so a doubling buffer keeps ONE slot), else round-robin.
     int dst = (slot >= 0) ? slot : (int)(tk_push_rr++ % TK_PUSH_SLOTS);

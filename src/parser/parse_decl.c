@@ -170,7 +170,9 @@ static tk_parsed_type_params_result parse_type_params(const tk_token *t, size_t 
     return (tk_parsed_type_params_result){ .ok = true, .as.value = { .names = names, .constraints = constraints, .n = nn, .next = p } };
 }
 
-tk_parsed_decl_result tk_parse_function(const tk_token *t, size_t n, size_t pos, bool is_test, tk_str os_guard, bool allow_receiver) {
+// `allow_bodyless` (W10b.IF) — true ONLY for an INTERFACE method: a pure signature with no body
+// (mirrors the `abstract fn` bodyless path). Every other caller passes false.
+tk_parsed_decl_result tk_parse_function(const tk_token *t, size_t n, size_t pos, bool is_test, tk_str os_guard, bool allow_receiver, bool allow_bodyless) {
     size_t p = pos;
     bool has_doc = false; tk_str doc = (tk_str){0};
     if (tk_is_kind_at(t, n, p, TK_TOKEN_DOC)) { has_doc = true; doc = t[p].text; p += 1; }
@@ -240,7 +242,7 @@ tk_parsed_decl_result tk_parse_function(const tk_token *t, size_t n, size_t pos,
     }
     // (W10b.CLASS increment 2) `abstract fn …` — a SIGNATURE ONLY, no body (abstract classes only;
     // enforced by the checker, not the parser). A bare `;`/newline/`}` follows instead of `{`.
-    if (is_abstract && !tk_is_kind_at(t, n, p, TK_TOKEN_LBRACE)) {
+    if ((is_abstract || allow_bodyless) && !tk_is_kind_at(t, n, p, TK_TOKEN_LBRACE)) {
         tk_function af = { .name = name, .type_params = tps.as.value.names, .n_type_params = tps.as.value.n, .type_constraints = tps.as.value.constraints, .params = ps.as.value.items, .nparams = ps.as.value.n_params,
             .has_return = has_return, .return_type = ret,
             .body = NULL, .nbody = 0,
@@ -285,7 +287,7 @@ static tk_parsed_struct_body_result parse_fields(const tk_token *t, size_t n, si
     }
     for (;;) {
         if (struct_item_is_method(t, n, p)) {
-            tk_parsed_decl_result m = tk_parse_function(t, n, p, false, (tk_str){0}, true);
+            tk_parsed_decl_result m = tk_parse_function(t, n, p, false, (tk_str){0}, true, false);
             if (!m.ok) { return (tk_parsed_struct_body_result){ .ok = false, .as.error = m.as.error }; }
             if (m.as.value.node.tag != TK_DECL_FUNCTION) {
                 return (tk_parsed_struct_body_result){ .ok = false, .as.error = tk_err_at(t, n, p, "internal: a struct method must parse to a Function") };
@@ -341,7 +343,7 @@ static tk_parsed_struct_body_result parse_class_fields(const tk_token *t, size_t
     }
     for (;;) {
         if (class_item_is_method(t, n, p)) {
-            tk_parsed_decl_result m = tk_parse_function(t, n, p, false, (tk_str){0}, true);
+            tk_parsed_decl_result m = tk_parse_function(t, n, p, false, (tk_str){0}, true, false);
             if (!m.ok) { return (tk_parsed_struct_body_result){ .ok = false, .as.error = m.as.error }; }
             if (m.as.value.node.tag != TK_DECL_FUNCTION) {
                 return (tk_parsed_struct_body_result){ .ok = false, .as.error = tk_err_at(t, n, p, "internal: a class method must parse to a Function") };
@@ -429,17 +431,75 @@ static tk_parsed_body_result parse_class_body(const tk_token *t, size_t n, size_
     return (tk_parsed_body_result){ .ok = true, .as.value = { .node = b, .next = fs.as.value.next } };
 }
 
+// (W10b.IF) parse a `Name [& Name …]` list where the FIRST name has NO leading `&` (interface
+// extends / struct implements). Appends to *names/*n_names; returns the resume pos; *err on error.
+static size_t parse_amp_name_list(const tk_token *t, size_t n, size_t pos, tk_str **names, size_t *n_names, tk_error *err) {
+    size_t p = pos;
+    *err = (tk_error){0};
+    if (tk_is_name_at(t, n, p)) {
+        tk_strvec_push(names, n_names, t[p].text);
+        p += 1;
+        for (;;) {
+            if (!tk_is_kind_at(t, n, p, TK_TOKEN_AMP)) break;
+            if (!tk_is_name_at(t, n, p + 1)) { *err = tk_err_at(t, n, p + 1, "expected an interface name after '&'"); return p; }
+            tk_strvec_push(names, n_names, t[p + 1].text);
+            p += 2;
+        }
+    }
+    return p;
+}
+
+// (W10b.IF) `interface [I1 & I2 …] { fn sig(self) -> T; … }`. `pos` at `interface`. Extends list +
+// bodyless method signatures (tk_parse_function allow_receiver=true, allow_bodyless=true).
+static tk_parsed_body_result parse_interface_body(const tk_token *t, size_t n, size_t pos) {
+    tk_str *extends = NULL; size_t n_extends = 0; tk_error err;
+    size_t p = parse_amp_name_list(t, n, pos + 1, &extends, &n_extends, &err);
+    if (err.message) return (tk_parsed_body_result){ .ok = false, .as.error = err };
+    if (!tk_is_kind_at(t, n, p, TK_TOKEN_LBRACE)) {
+        return (tk_parsed_body_result){ .ok = false, .as.error = tk_err_at(t, n, p, "expected '{' for the interface body") };
+    }
+    p = tk_skip_seps(t, n, p + 1);
+    tk_function *methods = NULL; size_t n_methods = 0;
+    if (!tk_is_kind_at(t, n, p, TK_TOKEN_RBRACE)) {
+        for (;;) {
+            tk_parsed_decl_result m = tk_parse_function(t, n, p, false, (tk_str){0}, true, true);
+            if (!m.ok) return (tk_parsed_body_result){ .ok = false, .as.error = m.as.error };
+            if (m.as.value.node.tag != TK_DECL_FUNCTION) {
+                return (tk_parsed_body_result){ .ok = false, .as.error = tk_err_at(t, n, p, "an interface member must be a method signature (`fn …`)") };
+            }
+            tk_functions_push(&methods, &n_methods, m.as.value.node.as.function);
+            p = m.as.value.next;
+            if (tk_is_kind_at(t, n, p, TK_TOKEN_RBRACE)) break;
+            if (!tk_is_sep(t, n, p)) {
+                return (tk_parsed_body_result){ .ok = false, .as.error = tk_err_at(t, n, p, "expected ';', a newline, or '}' after an interface method") };
+            }
+            p = tk_skip_seps(t, n, p);
+            if (tk_is_kind_at(t, n, p, TK_TOKEN_RBRACE)) break;   // trailing separator
+        }
+    }
+    tk_interface_body ib = { .extends = extends, .n_extends = n_extends, .methods = methods, .n_methods = n_methods };
+    tk_type_body b = { .tag = TK_BODY_INTERFACE, .as.interface_body = ib };
+    return (tk_parsed_body_result){ .ok = true, .as.value = { .node = b, .next = p + 1 } };
+}
+
 static tk_parsed_body_result parse_type_body(const tk_token *t, size_t n, size_t pos) {
     if (tk_is_kind_at(t, n, pos, TK_TOKEN_CLASS) || tk_is_kind_at(t, n, pos, TK_TOKEN_ABSTRACT) || tk_is_kind_at(t, n, pos, TK_TOKEN_VIRTUAL)) {
         return parse_class_body(t, n, pos);
     }
+    if (tk_is_kind_at(t, n, pos, TK_TOKEN_INTERFACE)) {
+        return parse_interface_body(t, n, pos);
+    }
     if (tk_is_kind_at(t, n, pos, TK_TOKEN_STRUCT)) {
-        if (!tk_is_kind_at(t, n, pos + 1, TK_TOKEN_LBRACE)) {
-            return (tk_parsed_body_result){ .ok = false, .as.error = tk_err_at(t, n, pos + 1, "expected '{' after `struct`") };
+        // (W10b.IF) optional implements list `struct I1 & I2 { … }` between `struct` and `{`.
+        tk_str *impls = NULL; size_t n_impls = 0; tk_error ierr;
+        size_t sp = parse_amp_name_list(t, n, pos + 1, &impls, &n_impls, &ierr);
+        if (ierr.message) return (tk_parsed_body_result){ .ok = false, .as.error = ierr };
+        if (!tk_is_kind_at(t, n, sp, TK_TOKEN_LBRACE)) {
+            return (tk_parsed_body_result){ .ok = false, .as.error = tk_err_at(t, n, sp, "expected '{' after `struct` (or its interface list)") };
         }
-        tk_parsed_struct_body_result fs = parse_fields(t, n, pos + 1);
+        tk_parsed_struct_body_result fs = parse_fields(t, n, sp);
         if (!fs.ok) { return (tk_parsed_body_result){ .ok = false, .as.error = fs.as.error }; }
-        tk_type_body b = { .tag = TK_BODY_STRUCT, .as.struct_body = { .fields = fs.as.value.fields, .n_fields = fs.as.value.n_fields, .methods = fs.as.value.methods, .n_methods = fs.as.value.n_methods } };
+        tk_type_body b = { .tag = TK_BODY_STRUCT, .as.struct_body = { .fields = fs.as.value.fields, .n_fields = fs.as.value.n_fields, .methods = fs.as.value.methods, .n_methods = fs.as.value.n_methods, .implements = impls, .n_implements = n_impls } };
         return (tk_parsed_body_result){ .ok = true, .as.value = { .node = b, .next = fs.as.value.next } };
     }
     if (tk_is_kind_at(t, n, pos, TK_TOKEN_ENUM)) {
@@ -569,7 +629,7 @@ static tk_parsed_decl_result parse_decl(const tk_token *t, size_t n, size_t pos)
     if (tk_is_kind_at(t, n, k, TK_TOKEN_PUB) || tk_is_kind_at(t, n, k, TK_TOKEN_EXP)) { k += 1; }
     bool saw_extern = false;                                        // C7.1a: peek past `extern` to reach `fn`/`type`
     if (tk_is_kind_at(t, n, k, TK_TOKEN_EXTERN)) { saw_extern = true; k += 1; }
-    if (tk_is_kind_at(t, n, k, TK_TOKEN_FN))   { return tk_parse_function(t, n, start, is_test, os_guard, false); }
+    if (tk_is_kind_at(t, n, k, TK_TOKEN_FN))   { return tk_parse_function(t, n, start, is_test, os_guard, false, false); }
     if (tk_is_kind_at(t, n, k, TK_TOKEN_TYPE)) {
         if (is_test) { return (tk_parsed_decl_result){ .ok = false, .as.error = tk_err_at(t, n, k, "`#test` may only precede a function") }; }
         if (os_guard.len) { return (tk_parsed_decl_result){ .ok = false, .as.error = tk_err_at(t, n, k, "`#os(\"…\")` may only precede a function") }; }
