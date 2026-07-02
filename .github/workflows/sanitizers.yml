@@ -1,10 +1,12 @@
 name: Sanitizers & Stress
 
+# chore/reboot is the ACTIVE integration branch (the "new main") — without it here, PRs
+# targeting chore/reboot get no checks at all (issue #54).
 on:
   push:
-    branches: [main, master]
+    branches: [main, master, chore/reboot]
   pull_request:
-    branches: [main, master]
+    branches: [main, master, chore/reboot]
 
 # Restrict default token scope for all jobs in this workflow.
 permissions:
@@ -27,10 +29,16 @@ jobs:
               - 'tests/**'
               - 'CMakeLists.txt'
               - '.github/workflows/sanitizers.yml'
+              - '.github/lsan-suppressions.txt'
 
-  # ── ASan + UBSan (default computed-goto dispatch) ────────────────────────────
+  # ── ASan + UBSan + LSan (default computed-goto dispatch) ────────────────────
+  # LSan is enabled on THIS lane only (issue #54): detect_leaks=1 with a suppressions
+  # file (.github/lsan-suppressions.txt) covering the documented M.5 process-lifetime
+  # allocations (deliberately never freed by us; reclaimed by the OS at exit). Any
+  # OTHER leak fails the lane. The portable-dispatch lane keeps detect_leaks=0 so a
+  # suppressions gap can't double-fail the matrix.
   asan-default:
-    name: ASan+UBSan / default dispatch
+    name: ASan+UBSan+LSan / default dispatch
     needs: changes
     if: needs.changes.outputs.run == 'true'
     runs-on: ubuntu-latest
@@ -58,9 +66,10 @@ jobs:
       - name: Build teko
         run: cmake --build build-asan --target teko --parallel 4
 
-      - name: Run tests (ASan + UBSan)
+      - name: Run tests (ASan + UBSan + LSan)
         env:
-          ASAN_OPTIONS: halt_on_error=1:detect_leaks=0
+          ASAN_OPTIONS: halt_on_error=1:detect_leaks=1
+          LSAN_OPTIONS: suppressions=.github/lsan-suppressions.txt:print_suppressions=0
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
         run: ./build-asan/teko test . --coverage
 

@@ -1,10 +1,12 @@
 name: Native Build & Test
 
+# chore/reboot is the ACTIVE integration branch (the "new main") — without it here, PRs
+# targeting chore/reboot get no checks at all (issue #54).
 on:
   push:
-    branches: [main, master]
+    branches: [main, master, chore/reboot]
   pull_request:
-    branches: [main, master]
+    branches: [main, master, chore/reboot]
 
 # Restrict default token scope for all jobs in this workflow.
 permissions:
@@ -25,6 +27,8 @@ jobs:
             run:
               - 'src/**'
               - 'tests/**'
+              - 'examples/**'
+              - 'scripts/**'
               - 'CMakeLists.txt'
               - '.github/workflows/native.yml'
 
@@ -133,11 +137,56 @@ jobs:
       - name: Run tests via QEMU user-mode
         run: qemu-riscv64-static ./build/teko test . --coverage
 
-  # ── gate: aggregates all build-test + riscv results ──────────────────────────
+  # ── differential VM==native harness (issue #54) ──────────────────────────────
+  # Cross-runs every examples/regressions/* project through BOTH engines (`teko run`
+  # on the VM, `teko build` through the host cc + execute) and asserts identical exit
+  # codes and program stdout. This is the structural gate the audit divergences
+  # (#47/#48/#49/#50, the destructor gap) slipped past: `teko test .` only exercises
+  # the .tkt corpus and never feeds examples/regressions/* to a real cc.
+  diff-vm-native:
+    needs: changes
+    if: needs.changes.outputs.run == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            cmake_args: -G "Ninja" -DCMAKE_C_COMPILER=clang -DCMAKE_BUILD_TYPE=Release
+            install_deps: |
+              sudo apt-get update -y
+              sudo apt-get install -y cmake ninja-build clang
+          - os: macos-latest
+            cmake_args: -DCMAKE_BUILD_TYPE=Release
+            install_deps: ""
+
+    name: diff VM==native / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        if: matrix.install_deps != ''
+        run: ${{ matrix.install_deps }}
+
+      - name: Configure CMake
+        run: cmake -S . -B build ${{ matrix.cmake_args }}
+
+      - name: Build teko
+        run: cmake --build build --config Release --target teko --parallel 4
+
+      - name: Differential harness (VM == native over examples/regressions)
+        run: ./scripts/diff_vm_native.sh
+
+  # ── gate: aggregates all build-test + riscv + differential results ────────────
   gate:
     name: CI gate
     runs-on: ubuntu-latest
-    needs: [changes, build-test, riscv64-qemu]
+    needs: [changes, build-test, riscv64-qemu, diff-vm-native]
     if: always()
     permissions: {}
 
@@ -146,11 +195,13 @@ jobs:
         run: |
           BUILD_RESULT="${{ needs.build-test.result }}"
           RISCV_RESULT="${{ needs.riscv64-qemu.result }}"
+          DIFF_RESULT="${{ needs.diff-vm-native.result }}"
           CHANGES="${{ needs.changes.outputs.run }}"
 
           echo "changes.run   = $CHANGES"
           echo "build-test    = $BUILD_RESULT"
           echo "riscv64-qemu  = $RISCV_RESULT"
+          echo "diff-vm-native = $DIFF_RESULT"
 
           # If the paths filter said nothing relevant changed, everything skipped → OK
           if [ "$CHANGES" != "true" ]; then
@@ -161,6 +212,12 @@ jobs:
           # build-test must be success (not failure, not cancelled)
           if [ "$BUILD_RESULT" = "failure" ] || [ "$BUILD_RESULT" = "cancelled" ]; then
             echo "ERROR: build-test $BUILD_RESULT"
+            exit 1
+          fi
+
+          # diff-vm-native must be success — a divergence between the engines gates
+          if [ "$DIFF_RESULT" = "failure" ] || [ "$DIFF_RESULT" = "cancelled" ]; then
+            echo "ERROR: diff-vm-native $DIFF_RESULT"
             exit 1
           fi
 
