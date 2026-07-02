@@ -168,10 +168,26 @@ fn comment_trailing_whitespace_is_trimmed() {
 
 #test
 fn doc_comments_are_preserved_verbatim() {
-    // a doc comment attaches on the SAME line as its declaration (the current grammar —
-    // see parser_test.tkt's `/** hi */ fn h() { }`); fmt keeps it there, one space apart.
+    // a doc comment may attach either on the SAME line as its declaration (see
+    // parser_test.tkt's `/** hi */ fn h() { }`) or on its OWN line before it (#111,
+    // `/** hi */\nfn h() { }`) — fmt preserves whichever placement the input already used.
     assert_fixpoint("/** the doc of a. */ fn a() -> i64 { 1 }\n")
     teko::assert::is_true(fmts("/** the doc of a. */   fn a() -> i64 { 1 }\n") == "/** the doc of a. */ fn a() -> i64 { 1 }\n")
+}
+
+#test
+fn own_line_doc_comments_are_idempotent() {
+    // (#111) an own-line doc comment before a declaration: fmt must (a) accept it now that
+    // the parser grammar does, (b) keep it on its own line (never collapse it onto the
+    // declaration's line), and (c) be a fixpoint — fmt(fmt(x)) == fmt(x).
+    assert_fixpoint("/** the doc of a. */\nfn a() -> i64 { 1 }\n")
+    assert_fixpoint("/** the doc of b. */\nexp fn b() -> i64 { 1 }\n")
+    // extra blank lines between the doc and the decl collapse to the canonical single blank
+    // line (the pre-existing blank-line policy, unrelated to doc comments specifically) but
+    // the doc STAYS on its own line, never glued to the declaration.
+    let collapsed = fmts("/** the doc of c. */\n\n\nfn c() -> i64 { 1 }\n")
+    teko::assert::is_true(collapsed == "/** the doc of c. */\n\nfn c() -> i64 { 1 }\n")
+    assert_fixpoint(collapsed)
 }
 
 #test

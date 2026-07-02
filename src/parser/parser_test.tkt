@@ -998,8 +998,19 @@ fn parses_functions() {
         }
         _ => teko::assert::is_true(false)
     }
-    // a doc comment precedes the function.
+    // a doc comment precedes the function, SAME LINE.
     match func_of("/** hi */ fn h() { }") { Function as f => teko::assert::is_true(f.has_doc); _ => teko::assert::is_true(false) }
+    // (#111) a doc comment precedes the function on ITS OWN LINE — must parse and attach.
+    match func_of("/** hi */\nfn h() { }") {
+        Function as f => { teko::assert::is_true(f.has_doc); teko::assert::is_true(f.doc == "/** hi */") }
+        _ => teko::assert::is_true(false)
+    }
+    // (#111) own-line doc comment followed by a same-line `exp fn …` (doc attaches through
+    // the modifier to the function).
+    match func_of("/** hi */\nexp fn h() -> u8 { return 1 }") {
+        Function as f => { teko::assert::is_true(f.has_doc); teko::assert::is_true(f.vis == Visibility::Exp) }
+        _ => teko::assert::is_true(false)
+    }
 }
 
 #test
@@ -1038,11 +1049,21 @@ fn parses_struct_decl() {
         }
         _ => teko::assert::is_true(false)
     }
-    // /** d */ exp type Empty = struct { }  — exp, doc, empty struct.
+    // /** d */ exp type Empty = struct { }  — exp, doc, empty struct, SAME LINE.
     match type_decl_of("/** d */ exp type Empty = struct { }") {
         TypeDecl as td => {
             teko::assert::is_true(td.vis == Visibility::Exp)
             teko::assert::is_true(td.has_doc)
+            match td.body { StructBody as sb => teko::assert::is_true(sb.fields.len == 0); _ => teko::assert::is_true(false) }
+        }
+        _ => teko::assert::is_true(false)
+    }
+    // (#111) the same doc comment on ITS OWN LINE before `exp type Empty = struct { }`.
+    match type_decl_of("/** d */\nexp type Empty = struct { }") {
+        TypeDecl as td => {
+            teko::assert::is_true(td.vis == Visibility::Exp)
+            teko::assert::is_true(td.has_doc)
+            teko::assert::is_true(td.doc == "/** d */")
             match td.body { StructBody as sb => teko::assert::is_true(sb.fields.len == 0); _ => teko::assert::is_true(false) }
         }
         _ => teko::assert::is_true(false)
@@ -1156,12 +1177,31 @@ fn parses_module() {
         Module as m => { teko::assert::is_true(m.uses.len == 1); teko::assert::is_true(m.decls.len == 2) }
         _ => teko::assert::is_true(false)
     }
-    // exp + doc on a declaration.
+    // exp + doc on a declaration, SAME LINE.
     match module_of("/** d */ exp fn g() -> u8 { return 1 }") {
         Module as m => {
             teko::assert::is_true(m.uses.len == 0)
             teko::assert::is_true(m.decls.len == 1)
             match m.decls[0] { Function as fn0 => { teko::assert::is_true(fn0.vis == Visibility::Exp); teko::assert::is_true(fn0.has_doc) }; _ => teko::assert::is_true(false) }
+        }
+        _ => teko::assert::is_true(false)
+    }
+    // (#111) exp + doc on ITS OWN LINE before the declaration.
+    match module_of("/** d */\nexp fn g() -> u8 { return 1 }") {
+        Module as m => {
+            teko::assert::is_true(m.uses.len == 0)
+            teko::assert::is_true(m.decls.len == 1)
+            match m.decls[0] { Function as fn0 => { teko::assert::is_true(fn0.vis == Visibility::Exp); teko::assert::is_true(fn0.has_doc) }; _ => teko::assert::is_true(false) }
+        }
+        _ => teko::assert::is_true(false)
+    }
+    // (#111) an own-line doc comment attaches to the NEXT declaration, not a preceding one:
+    // two functions, a doc comment only before the second — the first must stay doc-less.
+    match module_of("fn a() { }\n\n/** second */\nfn b() { }") {
+        Module as m => {
+            teko::assert::is_true(m.decls.len == 2)
+            match m.decls[0] { Function as fn0 => teko::assert::is_false(fn0.has_doc); _ => teko::assert::is_true(false) }
+            match m.decls[1] { Function as fn1 => { teko::assert::is_true(fn1.has_doc); teko::assert::is_true(fn1.doc == "/** second */") }; _ => teko::assert::is_true(false) }
         }
         _ => teko::assert::is_true(false)
     }
@@ -1328,4 +1368,68 @@ fn trait_declares_no_derive_list_of_its_own() {
     // `trait A & B { }` is NOT a trait declaration (`{` must follow `trait` immediately) —
     // compose at the DERIVER instead. This parses as a malformed alias → an error.
     teko::assert::is_true(module_errors("type T = trait A & B { }"))
+}
+
+// --- (#111) own-line `/** … */` doc comments — must parse and ATTACH to the NEXT declaration,
+// same as the pre-existing same-line placement (Javadoc/rustdoc/JSDoc-style is own-line). ---
+
+#test
+fn doc_comment_own_line_attaches_to_struct_method() {
+    // a doc comment on its own line before a STRUCT method (struct_item_is_method's peek +
+    // parse_function's own doc-consume both must skip the intervening newline).
+    match module_of("type S = struct { /** greets */\npub fn hi(self) -> i64 { 0 } }") {
+        Module as m => match m.decls[0] {
+            TypeDecl as td => match td.body {
+                StructBody as sb => {
+                    teko::assert::is_true(sb.methods.len == 1)
+                    teko::assert::is_true(sb.methods[0].has_doc)
+                    teko::assert::is_true(sb.methods[0].doc == "/** greets */")
+                }
+                _ => teko::assert::is_true(false)
+            }
+            _ => teko::assert::is_true(false)
+        }
+        error => teko::assert::is_true(false)
+    }
+}
+
+#test
+fn doc_comment_own_line_attaches_to_class_method() {
+    // a doc comment on its own line before a CLASS method (class_item_is_method's peek).
+    match module_of("type C = class { /** greets */\npub fn hi(self) -> i64 { 0 } }") {
+        Module as m => match m.decls[0] {
+            TypeDecl as td => match td.body {
+                ClassBody as cb => {
+                    teko::assert::is_true(cb.methods.len == 1)
+                    teko::assert::is_true(cb.methods[0].has_doc)
+                    teko::assert::is_true(cb.methods[0].doc == "/** greets */")
+                }
+                _ => teko::assert::is_true(false)
+            }
+            _ => teko::assert::is_true(false)
+        }
+        error => teko::assert::is_true(false)
+    }
+}
+
+#test
+fn doc_comment_own_line_attaches_to_flags_decl() {
+    // an own-line doc comment before a `flags` declaration (tk_parse_flags_decl's doc-consume).
+    match module_of("/** bit flags */\nflags Perm { Read; Write }") {
+        Module as m => match m.decls[0] {
+            TypeDecl as td => { teko::assert::is_true(td.has_doc); teko::assert::is_true(td.doc == "/** bit flags */") }
+            _ => teko::assert::is_true(false)
+        }
+        error => teko::assert::is_true(false)
+    }
+}
+
+#test
+fn doc_comment_own_line_with_blank_line_still_attaches() {
+    // a blank line (multiple newlines) between the doc comment and the declaration is still
+    // "own line" placement — skip_seps/tk_skip_seps consume a RUN of separators, not just one.
+    match module_of("/** d */\n\n\nfn f() { }") {
+        Module as m => match m.decls[0] { Function as f => teko::assert::is_true(f.has_doc); _ => teko::assert::is_true(false) }
+        error => teko::assert::is_true(false)
+    }
 }

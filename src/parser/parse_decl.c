@@ -175,7 +175,10 @@ static tk_parsed_type_params_result parse_type_params(const tk_token *t, size_t 
 tk_parsed_decl_result tk_parse_function(const tk_token *t, size_t n, size_t pos, bool is_test, tk_str os_guard, bool allow_receiver, bool allow_bodyless) {
     size_t p = pos;
     bool has_doc = false; tk_str doc = (tk_str){0};
-    if (tk_is_kind_at(t, n, p, TK_TOKEN_DOC)) { has_doc = true; doc = t[p].text; p += 1; }
+    // (#111) an own-line doc comment attaches to the NEXT declaration: skip the significant
+    // newline(s) between the `/** … */` and the modifiers/keyword that follow it. Same-line
+    // placement (no newline in between) is unaffected — tk_skip_seps is a no-op there.
+    if (tk_is_kind_at(t, n, p, TK_TOKEN_DOC)) { has_doc = true; doc = t[p].text; p = tk_skip_seps(t, n, p + 1); }
     tk_visibility vis = TK_VIS_PRIVATE;                              // default: own-namespace only
     if (tk_is_kind_at(t, n, p, TK_TOKEN_PUB))      { vis = TK_VIS_PUB; p += 1; }
     else if (tk_is_kind_at(t, n, p, TK_TOKEN_EXP)) { vis = TK_VIS_EXP; p += 1; }
@@ -270,7 +273,7 @@ tk_parsed_decl_result tk_parse_function(const tk_token *t, size_t n, size_t pos,
 // preceded by a doc comment / `pub`/`exp`) or a plain field? Peek-only, no consumption.
 static bool struct_item_is_method(const tk_token *t, size_t n, size_t pos) {
     size_t k = pos;
-    if (tk_is_kind_at(t, n, k, TK_TOKEN_DOC)) { k += 1; }
+    if (tk_is_kind_at(t, n, k, TK_TOKEN_DOC)) { k = tk_skip_seps(t, n, k + 1); }   // (#111) own-line doc
     if (tk_is_kind_at(t, n, k, TK_TOKEN_PUB)) { k += 1; }
     else if (tk_is_kind_at(t, n, k, TK_TOKEN_EXP)) { k += 1; }
     return tk_is_kind_at(t, n, k, TK_TOKEN_FN);
@@ -322,7 +325,7 @@ static tk_parsed_struct_body_result parse_fields(const tk_token *t, size_t n, si
 // class-only `intern`/`abstract`/`virtual`/`override` modifiers tk_parse_function itself consumes.
 static bool class_item_is_method(const tk_token *t, size_t n, size_t pos) {
     size_t k = pos;
-    if (tk_is_kind_at(t, n, k, TK_TOKEN_DOC)) { k += 1; }
+    if (tk_is_kind_at(t, n, k, TK_TOKEN_DOC)) { k = tk_skip_seps(t, n, k + 1); }   // (#111) own-line doc
     if (tk_is_kind_at(t, n, k, TK_TOKEN_PUB)) { k += 1; }
     else if (tk_is_kind_at(t, n, k, TK_TOKEN_EXP)) { k += 1; }
     if (tk_is_kind_at(t, n, k, TK_TOKEN_INTERN)) { k += 1; }
@@ -590,7 +593,7 @@ static tk_parsed_body_result parse_type_body(const tk_token *t, size_t n, size_t
 tk_parsed_decl_result tk_parse_type_decl(const tk_token *t, size_t n, size_t pos) {
     size_t p = pos;
     bool has_doc = false; tk_str doc = (tk_str){0};
-    if (tk_is_kind_at(t, n, p, TK_TOKEN_DOC)) { has_doc = true; doc = t[p].text; p += 1; }
+    if (tk_is_kind_at(t, n, p, TK_TOKEN_DOC)) { has_doc = true; doc = t[p].text; p = tk_skip_seps(t, n, p + 1); }   // (#111) own-line doc
     tk_visibility vis = TK_VIS_PRIVATE;                              // default: own-namespace only
     if (tk_is_kind_at(t, n, p, TK_TOKEN_PUB))      { vis = TK_VIS_PUB; p += 1; }
     else if (tk_is_kind_at(t, n, p, TK_TOKEN_EXP)) { vis = TK_VIS_EXP; p += 1; }
@@ -630,7 +633,7 @@ tk_parsed_decl_result tk_parse_type_decl(const tk_token *t, size_t n, size_t pos
 static tk_parsed_decl_result tk_parse_flags_decl(const tk_token *t, size_t n, size_t pos) {
     size_t p = pos;
     bool has_doc = false; tk_str doc = (tk_str){0};
-    if (tk_is_kind_at(t, n, p, TK_TOKEN_DOC)) { has_doc = true; doc = t[p].text; p += 1; }
+    if (tk_is_kind_at(t, n, p, TK_TOKEN_DOC)) { has_doc = true; doc = t[p].text; p = tk_skip_seps(t, n, p + 1); }   // (#111) own-line doc
     tk_visibility vis = TK_VIS_PRIVATE;
     if (tk_is_kind_at(t, n, p, TK_TOKEN_PUB))      { vis = TK_VIS_PUB; p += 1; }
     else if (tk_is_kind_at(t, n, p, TK_TOKEN_EXP)) { vis = TK_VIS_EXP; p += 1; }
@@ -678,7 +681,7 @@ static tk_parsed_decl_result parse_decl(const tk_token *t, size_t n, size_t pos)
         }
     }
     size_t k = start;
-    if (tk_is_kind_at(t, n, k, TK_TOKEN_DOC)) { k += 1; }
+    if (tk_is_kind_at(t, n, k, TK_TOKEN_DOC)) { k = tk_skip_seps(t, n, k + 1); }   // (#111) own-line doc
     if (tk_is_kind_at(t, n, k, TK_TOKEN_PUB) || tk_is_kind_at(t, n, k, TK_TOKEN_EXP)) { k += 1; }
     bool saw_extern = false;                                        // C7.1a: peek past `extern` to reach `fn`/`type`
     if (tk_is_kind_at(t, n, k, TK_TOKEN_EXTERN)) { saw_extern = true; k += 1; }
