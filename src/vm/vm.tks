@@ -410,6 +410,15 @@ pub fn cast_may_lose(src: checker::PrimKind, dst: checker::PrimKind) -> bool {
     true                                 // i->u: negatives never fit
 }
 
+// BuiltinRes — (issue #106) `try_builtin`'s SUCCESS carrier: unlike the value-producing
+// builtin helpers (try_list_builtin / try_err_builtin / …) it has no Value to hand back, but
+// it MUST still hand back the (possibly grown) env — a builtin's argument expression can
+// itself contain a `Ref<T>` value-position call (e.g. a closure that writes `r.value` nested
+// inside `teko::assert::is_true(...)`), which threads a NEW env out of eval_expr exactly like
+// any other value-position call (MEM Step 4). Mirrors PatMatch's { matched: bool; env: Venv }
+// shape used elsewhere in this file for the same "yes/no + updated env" pattern.
+type BuiltinRes = struct { ran: bool; env: Venv }
+
 // ---------------------------------------------------------------------------
 // BUILTIN call recognition — VERBATIM mirror of codegen's CALL lowering: print/println
 // and teko::assert::* are non-shadowable, recognized by the path's LAST segment when the
@@ -417,26 +426,35 @@ pub fn cast_may_lose(src: checker::PrimKind, dst: checker::PrimKind) -> bool {
 // (the runtime panics with "assertion failed: <name>" — M.1).
 //
 // These builtins are all `-> void`: they run for EFFECT and produce NO Value. So this
-// helper returns `bool | error` — `true` == "it was a builtin (and was run)", and the
-// statement context (a void call is a statement) expects no value back. A non-builtin
-// path returns an `error` so `eval_call` falls through to a user fn.
+// helper returns `BuiltinRes | error` — `ran = true` == "it was a builtin (and was run)",
+// carrying the env AFTER every argument evaluated (a nested Ref<T> write threads back — see
+// BuiltinRes), and the statement context (a void call is a statement) expects no value back.
+// A non-builtin path returns an `error` so `eval_call`/`call_value` fall through to a user fn.
+//
+// (issue #106) Every arg here is evaluated via `eval_expr(arg, cur)` + `cur = ae.env` in
+// SEQUENCE (never the bare `ev_val` shortcut, and never re-reading the ORIGINAL `env` for a
+// later arg) — the same thread-then-merge discipline bind_call_args/eval_lambda_call use for
+// user-fn arguments, so a Ref<T> write inside ANY builtin argument (assert/print/exit/panic
+// alike) survives into the caller, matching vm.c (whose g_cells store is a process-global
+// shared by pointer — see g_cells in vm.c — so no merge is needed there; this is the
+// value-functional twin of that effect, not a new behavior).
 // ---------------------------------------------------------------------------
-fn try_builtin(callee: parser::Path, args: []checker::TExpr, env: Venv) -> bool | error {
+fn try_builtin(callee: parser::Path, args: []checker::TExpr, env: Venv) -> BuiltinRes | error {
     let last = callee.segments[callee.segments.len - 1].name
     let addressable = callee.segments.len == 1 || callee.segments[0].name == "teko"
     if !addressable { return error { message = "not a builtin" } }
 
     if last == "print" || last == "println" || last == "write" {
-        let a = ev_val(args[0], env)
-        match a {
-            str as s => { if last == "println" { teko::io::println(s) } else { teko::io::print(s) }; return true }
+        let ae = eval_expr(args[0], env)
+        match ae.value {
+            str as s => { if last == "println" { teko::io::println(s) } else { teko::io::print(s) }; return BuiltinRes { ran= true; env= ae.env } }
             _        => return error { message = "vm: print/println/write on a non-str value not yet supported" }
         }
     }
     if last == "ewrite" || last == "eprint" || last == "eprintln" {
-        let a = ev_val(args[0], env)
-        match a {
-            str as s => { if last == "eprintln" { teko::io::eprintln(s) } else { teko::io::ewrite(s) }; return true }
+        let ae = eval_expr(args[0], env)
+        match ae.value {
+            str as s => { if last == "eprintln" { teko::io::eprintln(s) } else { teko::io::ewrite(s) }; return BuiltinRes { ran= true; env= ae.env } }
             _        => return error { message = "vm: ewrite/eprint/eprintln on a non-str value not yet supported" }
         }
     }
@@ -449,7 +467,7 @@ fn try_builtin(callee: parser::Path, args: []checker::TExpr, env: Venv) -> bool 
     // that a user program's `exit`/`panic` call lowers to when native-compiled — so the
     // self-hosted VM's exit/panic mechanism is, by construction, the same one the compiler
     // itself uses (mirrors main.tks's own `teko::exit(...)` calls). Both diverge (never
-    // return), so the `return true` below is dead but kept for the match arm's shape.
+    // return), so the `return BuiltinRes{...}` below is dead but kept for the match arm's shape.
     if last == "exit" {
         // Native codegen passes the arg to `tk_exit(int32_t)` PLAINLY (codegen.c emits builtin
         // calls with no emit_as coercion) — an out-of-i32-range `i64`/`u64`/... status code
@@ -459,20 +477,21 @@ fn try_builtin(callee: parser::Path, args: []checker::TExpr, env: Venv) -> bool 
         // draft of this very intrinsic introduced, caught by running the self-hosted VM.
         // Mask the low 32 bits + sign-extend the SAME way norm_int's width==32 branch does
         // (never panics), matching the C cast's actual 2's-complement truncation behavior.
-        let raw = as_int(ev_val(args[0], env))
+        let ae = eval_expr(args[0], env)
+        let raw = as_int(ae.value)
         let m = raw & 0xFFFFFFFF
         let code32 = if m >= 0x80000000 { (m - 0x100000000) to i32 } else { m to i32 }
         exit(code32)
-        return true
+        return BuiltinRes { ran= true; env= ae.env }
     }
     if last == "panic" {
         // Mirror native codegen's frontier EXACTLY (codegen.c:1865 only wires the `str` arm;
         // `panic(error)` does not compile natively today — a pre-existing, separate gap, not
         // this issue's VM≠native divergence; see the #72 report). `str` runs for real here;
         // an `error` arg falls through to the honest stop so neither engine runs it.
-        let a = ev_val(args[0], env)
-        match a {
-            str as s => { panic(s); return true }
+        let ae = eval_expr(args[0], env)
+        match ae.value {
+            str as s => { panic(s); return BuiltinRes { ran= true; env= ae.env } }
             _        => return error { message = "vm: panic(error) not yet supported (native codegen cannot compile it either — a separate, pre-existing gap; use panic(str))" }
         }
     }
@@ -480,11 +499,15 @@ fn try_builtin(callee: parser::Path, args: []checker::TExpr, env: Venv) -> bool 
     let assert_ns = callee.segments.len >= 2 && callee.segments[0].name == "teko" &&
                  callee.segments[callee.segments.len - 2].name == "assert"
     if assert_ns {
-        if last == "is_true"  { teko::assert::is_true(as_bool(ev_val(args[0], env)));  return true }
-        if last == "is_false" { teko::assert::is_false(as_bool(ev_val(args[0], env))); return true }
+        if last == "is_true"  { let ae = eval_expr(args[0], env); teko::assert::is_true(as_bool(ae.value));  return BuiltinRes { ran= true; env= ae.env } }
+        if last == "is_false" { let ae = eval_expr(args[0], env); teko::assert::is_false(as_bool(ae.value)); return BuiltinRes { ran= true; env= ae.env } }
         if last == "str_contains" {
-            teko::assert::str_contains(as_str(ev_val(args[0], env)), as_str(ev_val(args[1], env)))
-            return true
+            // (issue #106) thread env across BOTH args in sequence — arg[1] must see any
+            // cell-store growth arg[0]'s evaluation produced (mirrors bind_call_args' loop).
+            let ae0 = eval_expr(args[0], env)
+            let ae1 = eval_expr(args[1], ae0.env)
+            teko::assert::str_contains(as_str(ae0.value), as_str(ae1.value))
+            return BuiltinRes { ran= true; env= ae1.env }
         }
         // equals/is_ok/... need generics — DEFERRED (matches the seed). Honest stop (M.3).
         panic("vm: this teko::assert builtin not yet supported (needs generics)")
@@ -2774,14 +2797,15 @@ fn eval_call(c: checker::TCall, env: Venv) -> EvalRes {
             _ => { }
         }
     }
-    // A builtin that RAN (`true`) is `-> void`, so there is no Value to yield: a void call
+    // A builtin that RAN (`ran= true`) is `-> void`, so there is no Value to yield: a void call
     // only appears in statement position, and reaching here in value position is an honest
-    // stop (M.3), never a synthesized Unit. A `false`/`error` result == "not a builtin" —
-    // fall through to a user fn. Builtins take no `Ref<T>` args → the env is unchanged.
+    // stop (M.3), never a synthesized Unit — this arm always panics, so BuiltinRes.env is dead
+    // here (kept only for the match arm's shape; the env matters at call_value, MEM Step 4).
+    // A `false`/`error` result == "not a builtin" — fall through to a user fn.
     if !c.is_closure_call {
         match try_builtin(c.callee, c.args, env) {
-            bool as ran => if ran { panic("vm: void builtin call used as a value (internal: checker should reject)") }
-            error       => {}                  // not a builtin — fall through to a user fn
+            BuiltinRes as br => if br.ran { panic("vm: void builtin call used as a value (internal: checker should reject)") }
+            error            => {}                  // not a builtin — fall through to a user fn
         }
         // teko::list::empty / push — value-producing SLICE builtins (FIXED+COPY). Recognized
         // before user-fn resolution; null == not a list builtin, fall through.
@@ -3107,12 +3131,18 @@ fn call_value(c: checker::TCall, env: Venv) -> StmtVal {
             _ => { }
         }
     }
-    // A builtin that RAN (`true`) is `-> void` — yield null. A `false`/`error` result ==
-    // "not a builtin": run the user fn. (Builtins do not take `Ref<T>` params — env unchanged.)
+    // A builtin that RAN (`ran= true`) is `-> void` — yield null, but the env is now
+    // BuiltinRes.env (issue #106), NOT the original `env`: a builtin's argument expression may
+    // itself contain a `Ref<T>` value-position call (e.g. a closure writing `r.value` nested
+    // inside `teko::assert::is_true(...)`), which grows/mutates the cell store exactly like any
+    // other value-position call — dropping that back to the pre-call `env` silently lost the
+    // write on the self-hosted engine only (vm.c is immune: its cell store is a global shared
+    // by pointer — g_cells in vm.c — so the write is already visible with no merge needed).
+    // A `false`/`error` result == "not a builtin": run the user fn.
     if !c.is_closure_call {
         match try_builtin(c.callee, c.args, env) {
-            bool as ran => if ran { return StmtVal { value= null; env= env } }
-            error       => {}
+            BuiltinRes as br => if br.ran { return StmtVal { value= null; env= br.env } }
+            error            => {}
         }
         // VALUE-producing builtins — a statement-position call can be a function's TRAILING expression
         // (B.20), e.g. `fn empty_table() -> TypeTable { teko::list::empty() }`. Route them exactly like
