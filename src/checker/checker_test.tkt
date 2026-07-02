@@ -2671,3 +2671,48 @@ fn w0_distinct_namespaces_distinct_names_still_collect_ok() {
         error    => teko::assert::is_true(false)
     }
 }
+
+// (#109 W0 tightened exemption — soundness) a genuine USER type whose name carries the `__g__`
+// infix (the lexer accepts it in ordinary identifiers) must NOT slip through the ban via the
+// naive substring exemption: the strict predicate requires empty ns AND a generic base behind
+// the prefix. The verifier's exact bypass scenario: `Foo__g__Bar` in aa AND bb → the W0
+// cross-namespace error, exactly like any other bare-name duplicate.
+#test
+fn w0_user_type_with_g_infix_is_not_exempt() {
+    let items = teko::list::push(teko::list::push(teko::list::empty(), w0_empty_struct_item("Foo__g__Bar", "aa")), w0_empty_struct_item("Foo__g__Bar", "bb"))
+    match collect(parser::Program { items = items }) {
+        Collected => teko::assert::is_true(false)   // must fail — the old substring exemption let this through
+        error as e => {
+            teko::assert::is_true(teko::str::contains(e.message, "two types share the bare name"))
+            teko::assert::is_true(teko::str::contains(e.message, "Foo__g__Bar"))
+            teko::assert::is_true(teko::str::contains(e.message, "aa"))
+            teko::assert::is_true(teko::str::contains(e.message, "bb"))
+        }
+    }
+    // and at the TOP LEVEL (ns "", so condition (b) alone can't reject): with NO generic `Foo`
+    // base declared, condition (c) fails → still banned as an ordinary duplicate.
+    let top = teko::list::push(teko::list::push(teko::list::empty(), w0_empty_struct_item("Foo__g__Bar", "")), w0_empty_struct_item("Foo__g__Bar", ""))
+    match collect(parser::Program { items = top }) {
+        Collected => teko::assert::is_true(false)   // must fail
+        error as e2 => teko::assert::is_true(teko::str::contains(e2.message, "duplicate type"))
+    }
+}
+
+// (#109 W0 tightened exemption — positive control) REAL stamped generic instances stay exempt.
+// A dep-seeded table shaped like post-stamping state: the generic base `Box<T>` plus TWO stamped
+// `Box__g__i64` entries (both ns "" — e.g. two dep namespaces each instantiated Box<i64>, merged
+// into one seed). collect_with_seed's validate_type_decls sees the merged table and must NOT
+// report them as duplicates — all three strict-exemption conditions hold.
+#test
+fn w0_stamped_generic_instances_remain_exempt() {
+    mut seedtbl = box_generic_table()   // `type Box<T> = struct { value: T }` (the generic base)
+    let inst_fld = parser::Field { name = "value"; type_ann = ttype_named("i64"); vis = parser::Visibility::Pub; is_intern = false }
+    let inst_decl = parser::TypeDecl { name = "Box__g__i64"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::StructBody { fields = teko::list::push(teko::list::empty(), inst_fld); methods = teko::list::empty(); implements = teko::list::empty() }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }
+    seedtbl = teko::list::push(seedtbl, TypeReg { name = "Box__g__i64"; namespace = ""; vis = parser::Visibility::Private; decl = inst_decl })
+    seedtbl = teko::list::push(seedtbl, TypeReg { name = "Box__g__i64"; namespace = ""; vis = parser::Visibility::Private; decl = inst_decl })
+    let seed = Collected { types = seedtbl; env = empty_env() }
+    match collect_with_seed(parser::Program { items = teko::list::empty() }, seed) {
+        Collected => teko::assert::is_true(true)
+        error    => teko::assert::is_true(false)   // the strict exemption must still cover real stamps
+    }
+}

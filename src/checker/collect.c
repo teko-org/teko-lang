@@ -437,6 +437,34 @@ static tk_type_result check_conformance(tk_str type_name, const tk_function *own
 static const char *ns_label_ptr(tk_str ns) { return ns.len == 0 ? "<top-level>" : (const char *)ns.ptr; }
 static int ns_label_len(tk_str ns) { return ns.len == 0 ? (int)strlen("<top-level>") : (int)ns.len; }
 
+// (#109 W0, tightened) is `reg` a monomorphization-STAMPED generic instance? The shared
+// tk_name_is_g_instance is a naive `__g__` substring scan, and the lexer accepts `__g__` inside
+// ordinary identifiers — so a genuine USER type named e.g. `Foo__g__Bar` must NOT slip through
+// the duplicate ban on the marker alone. A registration is exempt only when ALL of:
+//   (a) the name carries the `__g__` infix,
+//   (b) the registration namespace is "" (stamped instances ALWAYS register with empty ns —
+//       resolve.c::tk_instantiate_types), and
+//   (c) the prefix before the FIRST `__g__` names a declared type WITH type_params somewhere
+//       in the table (a real generic base — `Foo__g__Bar` with no generic `Foo` fails this).
+// LOCAL predicate on purpose: tk_name_is_g_instance keeps its broad substring semantics for the
+// mono pass (which only ever sees names IT stamped); only the W0 ban needs the strict form.
+// Mirror of collect.tks::w0_is_stamped_generic_reg.
+static bool w0_is_stamped_generic_reg(tk_type_reg reg, tk_type_table table) {
+    if (reg.namespace.len != 0) return false;
+    tk_str name = reg.name;
+    size_t pos = name.len;   // index of the FIRST `__g__`, or name.len when absent
+    for (size_t i = 0; i + 5 <= name.len; i += 1) {
+        if (name.ptr[i] == '_' && name.ptr[i + 1] == '_' && name.ptr[i + 2] == 'g' && name.ptr[i + 3] == '_' && name.ptr[i + 4] == '_') { pos = i; break; }
+    }
+    if (pos == name.len) return false;   // no `__g__` infix at all
+    if (pos == 0) return false;          // an empty base prefix can never name a generic decl
+    tk_str base = { .ptr = name.ptr, .len = pos };
+    for (size_t j = 0; j < table.len; j += 1) {
+        if (table.ptr[j].decl.n_type_params > 0 && tk_str_eq(table.ptr[j].name, base)) return true;
+    }
+    return false;
+}
+
 // (#109 W0) fail-loud duplicate-registration ban — the first hardening step of the
 // namespace-aware type table redesign. Two errors, both O(n^2) over the collected table
 // (small — mirrors the interface-conflict scan below):
@@ -444,16 +472,17 @@ static int ns_label_len(tk_str ns) { return ns.len == 0 ? (int)strlen("<top-leve
 //   2. same BARE name registered under two DIFFERENT namespaces = TEMPORARILY banned (today's
 //      flat, namespace-blind lookups (tk_type_table_find et al.) would silently conflate the two —
 //      W3 lifts this ban once resolution becomes namespace-aware).
-// EXEMPT: stamped generic-instance entries (tk_name_is_g_instance, namespace "") — monomorphization
-// legitimately stamps many `Base__g__<mangle>` instances that share the "" namespace bucket with
-// every other stamped instance; that's not a user-facing collision, and stamping already dedups
-// by exact mangled name (resolve.c::tk_instantiate_types's "already stamped" check).
+// EXEMPT: stamped generic-instance entries (w0_is_stamped_generic_reg — empty ns + a real
+// generic base behind the `__g__` infix) — monomorphization legitimately stamps many
+// `Base__g__<mangle>` instances that share the "" namespace bucket with every other stamped
+// instance; that's not a user-facing collision, and stamping already dedups by exact mangled
+// name (resolve.c::tk_instantiate_types's "already stamped" check).
 // Mirror of collect.tks::check_no_duplicate_types.
 static tk_type_result check_no_duplicate_types(tk_type_table table) {
     for (size_t i = 0; i < table.len; i += 1) {
-        if (tk_name_is_g_instance(table.ptr[i].name)) continue;
+        if (w0_is_stamped_generic_reg(table.ptr[i], table)) continue;
         for (size_t j = i + 1; j < table.len; j += 1) {
-            if (tk_name_is_g_instance(table.ptr[j].name)) continue;
+            if (w0_is_stamped_generic_reg(table.ptr[j], table)) continue;
             if (!tk_str_eq(table.ptr[i].name, table.ptr[j].name)) continue;
             tk_str nm = table.ptr[i].name;
             tk_str ns1 = table.ptr[i].namespace, ns2 = table.ptr[j].namespace;
