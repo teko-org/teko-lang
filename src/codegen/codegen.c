@@ -2047,13 +2047,11 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
                     // call agree and same-named functions across namespaces never collide.
                     cb_fn_name(b, e->as.call.call_ns, p.segments[p.len - 1].name);
                 }
-            } else if (e->as.call.is_closure_call) {
-                // (W10) call THROUGH a tk_closure VALUE — a single-eval statement-expression that
-                // dispatches on `env` (no-env ABI for named/non-capturing; env-first for capturing).
-                return emit_closure_call(b, e, err);
             } else {
                 // No resolved namespace (a builtin, or a name not carried) → the bare
-                // (keyword-escaped) last segment.
+                // (keyword-escaped) last segment. (A closure call never reaches here — the (#107)
+                // is_closure_call guard at the top of this CALL case already returned via
+                // emit_closure_call.)
                 cb_ident(b, p.segments[p.len - 1].name);
             }
             // A resolved USER call: wrap each arg into its parameter type (emit_as) so a bare case
