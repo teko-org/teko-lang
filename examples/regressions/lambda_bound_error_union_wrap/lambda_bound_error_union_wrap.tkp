@@ -1,0 +1,31 @@
+# Regression (#108): inside a CAPTURING lambda returning `T | error`, an early `return e`
+# where `e` is a match-BOUND error value (from `error as e => { … return e }`) — with the
+# match used as a VALUE SUB-EXPRESSION (`let x = match … { … }`, not the lambda's tail —
+# see emit_arm_value) — emitted the raw `tk_error` without the union wrap in native codegen:
+#
+#   cc: returning 'tk_error' from a function with incompatible result type 'tk_u_Buf_error'
+#
+# Root cause (C twin only — codegen.c): `return e` inside a match used as a value routes
+# through emit_arm_value, which wraps the diverging return via the C-only `g_cg_ret_type`
+# static (the .tks twin threads `ret_type` as a real parameter with no module-mutable
+# state, so it was never affected). `g_cg_ret_type` is set once per TOP-LEVEL function by
+# emit_function — but a CAPTURING lambda's lifted body is emitted separately and later, by
+# cg_emit_lambda_decls, which never set it. So a capturing lambda's bound-error return
+# wrapped into whatever type the LAST top-level function processed left behind, not the
+# lambda's own return type — literals and non-capturing lambdas (lifted to plain top-level
+# functions via emit_function) were unaffected, and a return in the lambda's own TAIL
+# position was unaffected too (that path threads `ret_type` as a parameter, not the global).
+#
+# This fixture exercises the exact shape: a capturing lambda (captures `limit`) whose body
+# has a match used as a value sub-expression (`let picked = match … { … }`) with a bound
+# error early-returned from a nested `if`, called both DIRECTLY and THROUGH A COMBINATOR
+# (a higher-order function receiving the closure as a value) so the lifted function's
+# call sites are exercised both ways. Must build+run identically on BOTH engines.
+#
+#   teko run   examples/regressions/lambda_bound_error_union_wrap   # VM     -> exit 30
+#   teko build examples/regressions/lambda_bound_error_union_wrap   # native -> binary exits 30
+name = "lambda_bound_error_union_wrap"
+source = "src"
+
+[artifact]
+kind = "binary"

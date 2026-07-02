@@ -5342,7 +5342,23 @@ static bool cg_emit_lambda_decls(cbuf *b, bool protos_only, const char **err) {
             cb(b, "    "); if (!emit_type(b, lam->captures[ui].type, err)) return false;
             cb(b, " "); cb_ident(b, lam->captures[ui].name); cb(b, " = _e->"); cb_ident(b, lam->captures[ui].name); cb(b, ";\n");
         }
-        if (!emit_block_tail(b, lam->body, lam->nbody, false, lam->ret, "    ", err)) return false;
+        // (#108) A lifted CAPTURING lambda is its own function — a `return e` nested inside a
+        // match/if used as a VALUE sub-expression in its body (emit_arm_value / emit_stmt_value)
+        // wraps via the C twin's g_cg_ret_type static (see emit_function's comment), NOT the
+        // `ret_type` threaded to emit_block_tail (which only covers the lambda's own TAIL path).
+        // Left unset here, g_cg_ret_type still held whatever top-level function was emitted last
+        // by the main pass (cg_emit_lambda_decls runs AFTER it) — a bound error variable then wrapped
+        // into that STALE type instead of the lambda's own `Buf | error`, so cc rejected the bare
+        // `tk_error` return. Set it to the lambda's own return type for the duration of its body,
+        // then restore — a later capturing lambda (or nothing, at the top-level fallback) must not
+        // see this one's type. The .tks twin has no such bug: it threads ret_type explicitly with no
+        // module-mutable global (cg_emit_lambda_decls -> emit_block_tail -> emit_as_r all take it
+        // as a parameter), so only the C twin needed this fix.
+        tk_type saved_ret_type = g_cg_ret_type;
+        g_cg_ret_type = lam->ret;
+        bool lam_ok = emit_block_tail(b, lam->body, lam->nbody, false, lam->ret, "    ", err);
+        g_cg_ret_type = saved_ret_type;
+        if (!lam_ok) return false;
         cb(b, "}\n");
     }
     return true;
