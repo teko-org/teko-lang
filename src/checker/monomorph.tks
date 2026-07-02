@@ -83,6 +83,18 @@ fn constraint_satisfied(c: parser::ConstraintExpr, concrete: Type, table: TypeTa
 }
 // Gate a whole instantiation: type_params/type_constraints are PARALLEL; `s` is the Subst that
 // bound each param to a concrete type for THIS instantiation.
+// (TR0→TR1) the first constraint ATOM naming a `trait`, if any — walked so `<T: Trait>` is an
+// HONEST TR1 stop (trait-as-constraint), never the silent exact-nominal-name fallback in
+// constraint_atom_satisfied. (VM match-arm ordering: multi-field cases first — see above.)
+fn constraint_first_trait_atom(c: parser::ConstraintExpr, table: TypeTable) -> str? {
+    match c {
+        parser::ConstraintAnd as a  => match constraint_first_trait_atom(a.left, table) { str as s => s; null => constraint_first_trait_atom(a.right, table) }
+        parser::ConstraintOr as o   => match constraint_first_trait_atom(o.left, table) { str as s => s; null => constraint_first_trait_atom(o.right, table) }
+        parser::ConstraintAtom as a => if is_trait_name(a.name, table) { a.name } else { null }
+        parser::NoConstraint  => null
+    }
+}
+
 fn check_constraints(type_params: []str, type_constraints: []parser::ConstraintExpr, s: Subst, table: TypeTable) -> error? {
     mut i = 0
     loop {
@@ -90,6 +102,11 @@ fn check_constraints(type_params: []str, type_constraints: []parser::ConstraintE
         match type_constraints[i] {
             parser::NoConstraint => {}
             _ => {
+                // (TR0→TR1) a trait as a constraint atom is TR1 — an honest stop.
+                match constraint_first_trait_atom(type_constraints[i], table) {
+                    str as tn => return error { message = teko::string::concat("'", tn, "' is a trait — a trait as a generic constraint (`<T: Trait>`) is not implemented yet (TR1)") }
+                    null => {}
+                }
                 let bound = match subst_find_inst(s, type_params[i]) {
                     Type as t => t
                     null      => return error { message = teko::string::concat("internal: monomorphization did not bind type parameter '", type_params[i], "'") }

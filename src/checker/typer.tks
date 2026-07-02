@@ -1397,6 +1397,8 @@ fn type_struct_lit(sl: parser::StructLit, expected: Type, env: Env, table: TypeT
             }
             match effective_class_fields(c, table) { []Field as fs => fs; error as e => return e }
         }
+        // (TR0) a trait is NON-instantiable — it exists only to be derived. Point at the fix.
+        parser::TraitBody => return error { message = $"'{name}' is a trait and cannot be instantiated — derive it from a struct or class instead (`type X = struct {name} …`)" }
         _               => return error { message = $"struct-literal target {name} is not a struct" }
     }
     if sl.field_names.len != sb_fields.len { return error { message = "a struct literal must set exactly the declared fields (count mismatch)" } }
@@ -2852,7 +2854,12 @@ fn surface_at(file: str, item_line: u32, item_col: u32, inner: error) -> error {
 // the project. The dep's items are NOT re-typed; only their signatures enter scope so
 // the project's code can call dep functions and reference dep types.
 // dep_prog.items is empty when there are no deps → degrades silently to type_program behavior.
-pub fn type_program_with_deps(program: parser::Program, dep_prog: TProgram) -> TProgram | error {
+pub fn type_program_with_deps(raw_program: parser::Program, dep_prog: TProgram) -> TProgram | error {
+    // (TR0) FOLD trait derivations first — PROJECT-LOCAL only (a dep's traits don't fold here:
+    // the .tkb codec does not carry trait bodies — the same method-serialization gap as
+    // struct/class methods — so a dep trait name in an `&`-list surfaces as the conformance
+    // check's honest "not an interface" error rather than a silent half-fold).
+    let program = match fold_traits(raw_program) { parser::Program as p => p; error as e => return e }
     // Seed from dep first (build base table + env from dep's type decls + fn signatures).
     let seed_empty = Collected { types = teko::list::empty(); env = env_empty() }
     let seed = match seed_from_dep(dep_prog, seed_empty.types, seed_empty.env) {
@@ -2938,7 +2945,11 @@ pub fn type_program_with_deps(program: parser::Program, dep_prog: TProgram) -> T
 }
 
 // THE TYPED ENTRY POINT: pass 1 (collect top-level names) + pass 2 (type each item).
-pub fn type_program(program: parser::Program) -> TProgram | error {
+pub fn type_program(raw_program: parser::Program) -> TProgram | error {
+    // (TR0) FOLD trait derivations FIRST — every later stage (collect, conformance, typing,
+    // codegen layout, the VM) sees each deriver's already-folded body; a trait decl itself stays
+    // registered (for honest value-position/instantiation errors) but is never emitted.
+    let program = match fold_traits(raw_program) { parser::Program as p => p; error as e => return e }
     let c = match collect(program) { Collected as col => col; error as e => return e }
     // W-vis-enforce: enforce the module system (namespace qualification + pub/exp) over the
     // whole flattened program before typing — fail loud on any cross-namespace violation (M.1).

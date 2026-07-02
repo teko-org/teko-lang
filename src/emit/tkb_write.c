@@ -261,6 +261,8 @@ static tk_bytes write_typebody(tk_bytes b, tk_strtable t, tk_type_body tb) {
             return write_fields(tk_write_u8(b, 6), t, tb.as.class_body.fields, tb.as.class_body.n_fields);
         case TK_BODY_INTERFACE:   // (W10b.IF) tag 7 — extends names only (method sigs not serialized, same gap as struct/class methods)
             return write_strs(tk_write_u8(b, 7), t, tb.as.interface_body.extends, tb.as.interface_body.n_extends);
+        case TK_BODY_TRAIT:   // (TR0) tag 8 — fields only; methods not serialized (same gap as struct/class methods)
+            return write_fields(tk_write_u8(b, 8), t, tb.as.trait_body.fields, tb.as.trait_body.n_fields);
     }
     return b;
 }

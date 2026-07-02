@@ -4582,6 +4582,11 @@ static bool emit_type_decl(cbuf *b, tk_tprogram prog, tk_type_decl d, const char
             // nothing, everything may embed it); its per-(class, contract) vtables are emitted after
             // the function prototypes. Nothing to emit here.
             return true;
+        case TK_BODY_TRAIT:
+            // (TR0) a trait is COMPILE-TIME only — its members were FOLDED into every deriver
+            // before typing (tk_fold_traits), and the checker rejects a trait in any value/
+            // instantiation position, so the decl itself lowers to nothing.
+            return true;
     }
     return fail_node(err, "codegen: unknown type body not yet supported");
 }

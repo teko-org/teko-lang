@@ -432,6 +432,204 @@ static tk_type_result check_conformance(tk_str type_name, const tk_function *own
     return (tk_type_result){ .ok = true };
 }
 
+// ── (TR0, 2026-07-02) TRAITS — the derivation FOLD (mirror of collect.tks) ─────────────────────
+
+// look up a trait body by name — error if the name is unknown or not a trait.
+typedef struct { bool ok; union { tk_trait_body value; tk_error error; } as; } traitbody_result;
+static traitbody_result find_trait_body(tk_str name, tk_type_table table) {
+    tk_decl_result decl = tk_type_table_find(table, name);
+    if (!decl.ok) {
+        size_t len = name.len + 32; char *buf = tk_alloc(len); if (!buf) abort();
+        snprintf(buf, len, "unknown trait: %.*s", (int)name.len, (const char *)name.ptr);
+        return (traitbody_result){ .ok = false, .as.error = tk_error_make(buf) };
+    }
+    if (decl.as.value.body.tag != TK_BODY_TRAIT) {
+        size_t len = name.len + 32; char *buf = tk_alloc(len); if (!buf) abort();
+        snprintf(buf, len, "%.*s is not a trait", (int)name.len, (const char *)name.ptr);
+        return (traitbody_result){ .ok = false, .as.error = tk_error_make(buf) };
+    }
+    return (traitbody_result){ .ok = true, .as.value = decl.as.value.body.as.trait_body };
+}
+
+// one recorded derivation: `type_name` derived `trait_name` (requirements checked after ALL
+// derivers fold, against the FOLDED table). Mirror of collect.tks::TraitDerive.
+typedef struct { tk_str type_name; tk_str trait_name; } trait_derive;
+
+static bool fields_have_name(const tk_field *fields, size_t n, tk_str name) {
+    for (size_t i = 0; i < n; i += 1) if (tk_str_eq(fields[i].name, name)) return true;
+    return false;
+}
+static bool methods_have_name(const tk_function *methods, size_t n, tk_str name) {
+    for (size_t i = 0; i < n; i += 1) if (tk_str_eq(methods[i].name, name)) return true;
+    return false;
+}
+
+typedef struct { bool ok; union { struct { tk_field *fields; size_t n_fields; tk_function *methods; size_t n_methods; } value; tk_error error; } as; } folded_members_result;
+
+// fold `trait_names`' members into ONE deriver — see collect.tks::fold_trait_members for the
+// full rule-by-rule rationale (field collisions error; a deriver-defined method IS the override;
+// two traits providing the same bodied name with no override = error; bodyless = requirement,
+// checked later; folded field vis obeys the deriver's kind; folded methods are `pub`).
+static folded_members_result fold_trait_members(tk_str type_name, const tk_field *own_fields, size_t n_own_fields,
+                                                const tk_function *own_methods, size_t n_own_methods,
+                                                const tk_str *trait_names, size_t n_traits, tk_type_table table, bool into_class) {
+    tk_field *fields = NULL; size_t nf = 0;
+    for (size_t i = 0; i < n_own_fields; i += 1) tk_fields_push(&fields, &nf, own_fields[i]);
+    tk_function *methods = NULL; size_t nm = 0;
+    for (size_t i = 0; i < n_own_methods; i += 1) tk_functions_push(&methods, &nm, own_methods[i]);
+    for (size_t i = 0; i < n_traits; i += 1) {
+        tk_str tname = trait_names[i];
+        for (size_t di = 0; di < i; di += 1) {
+            if (tk_str_eq(trait_names[di], tname)) {
+                size_t len = type_name.len + tname.len + 48; char *buf = tk_alloc(len); if (!buf) abort();
+                snprintf(buf, len, "'%.*s' derives trait '%.*s' more than once",
+                         (int)type_name.len, (const char *)type_name.ptr, (int)tname.len, (const char *)tname.ptr);
+                return (folded_members_result){ .ok = false, .as.error = tk_error_make(buf) };
+            }
+        }
+        traitbody_result tb = find_trait_body(tname, table);
+        if (!tb.ok) return (folded_members_result){ .ok = false, .as.error = tb.as.error };
+        for (size_t fi = 0; fi < tb.as.value.n_fields; fi += 1) {
+            tk_field tf = tb.as.value.fields[fi];
+            if (fields_have_name(fields, nf, tf.name)) {
+                size_t len = tname.len + tf.name.len + type_name.len + 112; char *buf = tk_alloc(len); if (!buf) abort();
+                snprintf(buf, len, "trait '%.*s' field '%.*s' collides with an existing field on '%.*s' — fields cannot be overridden; rename it or do not co-derive",
+                         (int)tname.len, (const char *)tname.ptr, (int)tf.name.len, (const char *)tf.name.ptr, (int)type_name.len, (const char *)type_name.ptr);
+                return (folded_members_result){ .ok = false, .as.error = tk_error_make(buf) };
+            }
+            tk_fields_push(&fields, &nf, (tk_field){ .name = tf.name, .type_ann = tf.type_ann,
+                .vis = into_class ? TK_VIS_PRIVATE : TK_VIS_PUB, .is_intern = false });
+        }
+        for (size_t mi = 0; mi < tb.as.value.n_methods; mi += 1) {
+            tk_function tm = tb.as.value.methods[mi];
+            if (tm.nbody == 0) continue;   // a bodyless method is a REQUIREMENT — not folded here
+            if (methods_have_name(own_methods, n_own_methods, tm.name)) {
+                // the deriver defines this name itself — its method IS the override.
+            } else if (methods_have_name(methods, nm, tm.name)) {
+                size_t len = tm.name.len * 2 + type_name.len + 112; char *buf = tk_alloc(len); if (!buf) abort();
+                snprintf(buf, len, "method '%.*s' is provided by more than one derived trait — '%.*s' must define its own '%.*s' to resolve the conflict",
+                         (int)tm.name.len, (const char *)tm.name.ptr, (int)type_name.len, (const char *)type_name.ptr, (int)tm.name.len, (const char *)tm.name.ptr);
+                return (folded_members_result){ .ok = false, .as.error = tk_error_make(buf) };
+            } else {
+                tk_function m = tm;
+                m.vis = TK_VIS_PUB;
+                m.is_test = false; m.is_extern = false;
+                m.c_symbol = (tk_str){0}; m.from_lib = (tk_str){0};
+                m.is_intern = false; m.is_abstract = false; m.is_virtual = false; m.is_override = false;
+                tk_functions_push(&methods, &nm, m);
+            }
+        }
+    }
+    return (folded_members_result){ .ok = true, .as.value = { .fields = fields, .n_fields = nf, .methods = methods, .n_methods = nm } };
+}
+
+// the bodyless-REQUIREMENT check, against the FOLDED table — see collect.tks. A class's
+// INHERITED methods can satisfy; a requirement shared by several traits is satisfied once.
+static tk_type_result check_trait_requirements(const trait_derive *derives, size_t n_derives, tk_type_table table) {
+    for (size_t i = 0; i < n_derives; i += 1) {
+        trait_derive d = derives[i];
+        traitbody_result tb = find_trait_body(d.trait_name, table);
+        if (!tb.ok) return (tk_type_result){ .ok = false, .as.error = tb.as.error };
+        tk_decl_result decl = tk_type_table_find(table, d.type_name);
+        if (!decl.ok) return (tk_type_result){ .ok = false, .as.error = tk_error_named("internal: trait deriver vanished from the type table", d.type_name) };
+        const tk_function *own = NULL; size_t n_own = 0;
+        if (decl.as.value.body.tag == TK_BODY_STRUCT) {
+            own = decl.as.value.body.as.struct_body.methods; n_own = decl.as.value.body.as.struct_body.n_methods;
+        } else if (decl.as.value.body.tag == TK_BODY_CLASS) {
+            tk_methodsvec_result eff = tk_effective_class_methods(decl.as.value.body.as.class_body, table);
+            if (!eff.ok) return (tk_type_result){ .ok = false, .as.error = eff.as.error };
+            own = eff.as.value.ptr; n_own = eff.as.value.len;
+        }
+        for (size_t ri = 0; ri < tb.as.value.n_methods; ri += 1) {
+            tk_function req = tb.as.value.methods[ri];
+            if (req.nbody != 0) continue;
+            bool found = false;
+            for (size_t mi = 0; mi < n_own; mi += 1) {
+                if (tk_str_eq(own[mi].name, req.name)) {
+                    if (!method_sig_matches(req, own[mi], table)) {
+                        size_t len = d.type_name.len + req.name.len + d.trait_name.len + 96; char *buf = tk_alloc(len); if (!buf) abort();
+                        snprintf(buf, len, "'%.*s' method '%.*s' does not match trait '%.*s's required signature",
+                                 (int)d.type_name.len, (const char *)d.type_name.ptr, (int)req.name.len, (const char *)req.name.ptr, (int)d.trait_name.len, (const char *)d.trait_name.ptr);
+                        return (tk_type_result){ .ok = false, .as.error = tk_error_make(buf) };
+                    }
+                    found = true; break;
+                }
+            }
+            if (!found) {
+                size_t len = d.type_name.len + d.trait_name.len + req.name.len + 96; char *buf = tk_alloc(len); if (!buf) abort();
+                snprintf(buf, len, "'%.*s' does not satisfy trait '%.*s' — missing required method '%.*s'",
+                         (int)d.type_name.len, (const char *)d.type_name.ptr, (int)d.trait_name.len, (const char *)d.trait_name.ptr, (int)req.name.len, (const char *)req.name.ptr);
+                return (tk_type_result){ .ok = false, .as.error = tk_error_make(buf) };
+            }
+        }
+    }
+    return (tk_type_result){ .ok = true };
+}
+
+// (TR0) THE DERIVATION FOLD — see collect.tks::fold_traits (the .tks twin carries the full
+// design comment). NO-OP (the program returned unchanged) when no trait is declared.
+tk_fold_traits_result tk_fold_traits(tk_program program) {
+    tk_type_table table = collect_types(program.items, program.len);
+    bool any = false;
+    for (size_t t = 0; t < table.len; t += 1) {
+        if (table.ptr[t].decl.body.tag == TK_BODY_TRAIT) { any = true; break; }
+    }
+    if (!any) return (tk_fold_traits_result){ .ok = true, .as.value = program };
+    tk_item *items = NULL; size_t n_items = 0;
+    trait_derive *derives = NULL; size_t n_derives = 0;
+    for (size_t i = 0; i < program.len; i += 1) {
+        tk_item it = program.items[i];
+        if (it.tag == TK_ITEM_TYPE_DECL) {
+            tk_type_decl td = it.as.type_decl;
+            if (td.body.tag == TK_BODY_STRUCT || td.body.tag == TK_BODY_CLASS) {
+                const tk_str *impls = td.body.tag == TK_BODY_STRUCT ? td.body.as.struct_body.implements : td.body.as.class_body.implements;
+                size_t n_impls = td.body.tag == TK_BODY_STRUCT ? td.body.as.struct_body.n_implements : td.body.as.class_body.n_implements;
+                tk_str *traits = NULL; size_t n_traits = 0;
+                tk_str *ifaces = NULL; size_t n_ifaces = 0;
+                for (size_t k = 0; k < n_impls; k += 1) {
+                    tk_decl_result dr = tk_type_table_find(table, impls[k]);
+                    bool is_trait = dr.ok && dr.as.value.body.tag == TK_BODY_TRAIT;
+                    tk_str **dst = is_trait ? &traits : &ifaces;
+                    size_t *ndst = is_trait ? &n_traits : &n_ifaces;
+                    *dst = tk_realloc0(*dst, (*ndst + 1) * sizeof **dst); if (!*dst) abort();
+                    (*dst)[*ndst] = impls[k]; *ndst += 1;
+                }
+                if (n_traits > 0) {
+                    bool into_class = td.body.tag == TK_BODY_CLASS;
+                    const tk_field *own_fields = into_class ? td.body.as.class_body.fields : td.body.as.struct_body.fields;
+                    size_t n_own_fields = into_class ? td.body.as.class_body.n_fields : td.body.as.struct_body.n_fields;
+                    const tk_function *own_methods = into_class ? td.body.as.class_body.methods : td.body.as.struct_body.methods;
+                    size_t n_own_methods = into_class ? td.body.as.class_body.n_methods : td.body.as.struct_body.n_methods;
+                    folded_members_result fm = fold_trait_members(td.name, own_fields, n_own_fields, own_methods, n_own_methods,
+                                                                  traits, n_traits, table, into_class);
+                    if (!fm.ok) return (tk_fold_traits_result){ .ok = false, .as.error = fm.as.error };
+                    if (into_class) {
+                        td.body.as.class_body.fields = fm.as.value.fields;    td.body.as.class_body.n_fields = fm.as.value.n_fields;
+                        td.body.as.class_body.methods = fm.as.value.methods;  td.body.as.class_body.n_methods = fm.as.value.n_methods;
+                        td.body.as.class_body.implements = ifaces;            td.body.as.class_body.n_implements = n_ifaces;
+                    } else {
+                        td.body.as.struct_body.fields = fm.as.value.fields;   td.body.as.struct_body.n_fields = fm.as.value.n_fields;
+                        td.body.as.struct_body.methods = fm.as.value.methods; td.body.as.struct_body.n_methods = fm.as.value.n_methods;
+                        td.body.as.struct_body.implements = ifaces;           td.body.as.struct_body.n_implements = n_ifaces;
+                    }
+                    it.as.type_decl = td;
+                    for (size_t si = 0; si < n_traits; si += 1) {
+                        derives = tk_realloc0(derives, (n_derives + 1) * sizeof *derives); if (!derives) abort();
+                        derives[n_derives] = (trait_derive){ .type_name = td.name, .trait_name = traits[si] }; n_derives += 1;
+                    }
+                }
+            }
+        }
+        items = tk_realloc0(items, (n_items + 1) * sizeof *items); if (!items) abort();
+        items[n_items] = it; n_items += 1;
+    }
+    tk_program folded_prog = { .items = items, .len = n_items };
+    tk_type_table folded = collect_types(items, n_items);
+    tk_type_result rq = check_trait_requirements(derives, n_derives, folded);
+    if (!rq.ok) return (tk_fold_traits_result){ .ok = false, .as.error = rq.as.error };
+    return (tk_fold_traits_result){ .ok = true, .as.value = folded_prog };
+}
+
 // (#109 W0) `""` (top-level) reads as `<top-level>` in a duplicate-type diagnostic — mirrors
 // collect.tks::check_no_duplicate_types's `if ns == "" { "<top-level>" } else { ns }` ternary.
 static const char *ns_label_ptr(tk_str ns) { return ns.len == 0 ? "<top-level>" : (const char *)ns.ptr; }
@@ -552,6 +750,29 @@ static tk_type_result validate_type_decls(tk_type_table table) {
             tk_type_result cf = check_conformance(decl.name, eff.as.value.ptr, eff.as.value.len,   // class methods need real `pub`
                                                   body.as.class_body.implements, body.as.class_body.n_implements, table, false);
             if (!cf.ok) return cf;
+        } else if (body.tag == TK_BODY_TRAIT) {
+            // (TR0) a trait is a struct-shaped bundle: field types resolve like a struct's (same
+            // R4 escape-gate). Generic traits + the class dispatch markers are OUTSIDE TR0's unit.
+            if (decl.n_type_params > 0) {
+                tk_str dn = decl.name;
+                size_t len = dn.len + 80; char *buf = tk_alloc(len); if (!buf) abort();
+                snprintf(buf, len, "a generic trait ('%.*s<…>') is not supported (TR0 — a trait is a concrete bundle)", (int)dn.len, (const char *)dn.ptr);
+                return (tk_type_result){ .ok = false, .as.error = tk_error_make(buf) };
+            }
+            for (size_t f = 0; f < body.as.trait_body.n_fields; f += 1) {
+                tk_type_result r = tk_resolve_type(body.as.trait_body.fields[f].type_ann, tbl);
+                if (!r.ok) return r;
+                if (r.as.value.tag == TK_TYPE_REF)
+                    return (tk_type_result){ .ok = false, .as.error = tk_error_make("a reference cannot be stored in a struct/variant/collection") };
+            }
+            for (size_t tmi = 0; tmi < body.as.trait_body.n_methods; tmi += 1) {
+                tk_function m = body.as.trait_body.methods[tmi];
+                if (m.is_abstract || m.is_virtual || m.is_override || m.is_intern) {
+                    size_t len = m.name.len + 160; char *buf = tk_alloc(len); if (!buf) abort();
+                    snprintf(buf, len, "trait method '%.*s' may not be `abstract`/`virtual`/`override`/`intern` — a bodyless trait method is the requirement, and a deriver-defined method is the override (TR0)", (int)m.name.len, (const char *)m.name.ptr);
+                    return (tk_type_result){ .ok = false, .as.error = tk_error_make(buf) };
+                }
+            }
         } else if (body.tag == TK_BODY_INTERFACE) {
             tk_interface_body ibb = body.as.interface_body;
             // (W10b.IF) OWN methods must be BODYLESS signatures — a pure contract, no default bodies.

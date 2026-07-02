@@ -467,15 +467,63 @@ fn parse_interface_body(tokens: []lexer::Token, pos: u64) -> Parsed<TypeBody> | 
     Parsed<TypeBody> { node = InterfaceBody { extends = ext.items; methods = methods }; next = p + 1 }
 }
 
+// (TR0) `trait { <fields>; <methods, with or without bodies> }`. `pos` is at the `{` (the caller
+// consumed the contextual `trait`). The body is STRUCT-SHAPED: interleaved `name: T` fields and
+// `fn` methods; unlike a struct's, a method here MAY be bodyless (a requirement the deriver must
+// satisfy — parse_function allow_bodyless=true, the interface-member path). Mirrors parse_fields.
+fn parse_trait_fields(tokens: []lexer::Token, pos: u64) -> ParsedStructBody | error {
+    mut p = skip_seps(tokens, pos + 1)   // consume `{`, skip leading separators
+    mut fields: []Field = teko::list::empty()
+    mut methods: []Function = teko::list::empty()
+    if is_kind_at(tokens, p, lexer::TokenKind::RBrace) {
+        return ParsedStructBody { fields = fields; methods = methods; next = p + 1 }
+    }
+    loop {
+        if struct_item_is_method(tokens, p) {
+            let m = match parse_function(tokens, p, false, "", true, true) { Parsed<Decl> as x => x; error as e => return e }
+            let mf = match m.node { Function as f => f; _ => return err_at(tokens, p, "internal: a trait method must parse to a Function") }
+            methods = teko::list::push(methods, mf)
+            p = m.next
+        } else {
+            if !is_name_at(tokens, p) {
+                return err_at(tokens, p, "expected a field name or a method (`fn …`) in the trait body")
+            }
+            let name = tokens[p].text
+            if !is_kind_at(tokens, p + 1, lexer::TokenKind::Colon) {
+                return err_at(tokens, p + 1, "expected ':' after a field name")
+            }
+            let ty = match parse_type(tokens, p + 2) { ParsedType as x => x; error as e => return e }
+            fields = teko::list::push(fields, Field { name = name; type_ann = ty.node; vis = Visibility::Pub; is_intern = false })
+            p = ty.next
+        }
+        if is_kind_at(tokens, p, lexer::TokenKind::RBrace) { break }
+        if !is_sep(tokens, p) {
+            return err_at(tokens, p, "expected ';', a newline, or '}' after a trait member")
+        }
+        p = skip_seps(tokens, p)
+        if is_kind_at(tokens, p, lexer::TokenKind::RBrace) { break }   // trailing separator
+    }
+    ParsedStructBody { fields = fields; methods = methods; next = p + 1 }
+}
+
 // the body of a type declaration. `struct [I & …] { fields }`, `interface [I & …] { sigs }`,
-// `enum { … }`, `variant A | B`, `[abstract|virtual] class …`, or ELSE a TRANSPARENT alias
-// `= <type-expr>` (self-host parity). `pos` is at the body's first token.
+// `trait { … }`, `enum { … }`, `variant A | B`, `[abstract|virtual] class …`, or ELSE a
+// TRANSPARENT alias `= <type-expr>` (self-host parity). `pos` is at the body's first token.
 fn parse_type_body(tokens: []lexer::Token, pos: u64) -> Parsed<TypeBody> | error {
     if is_kind_at(tokens, pos, lexer::TokenKind::Class) || is_kind_at(tokens, pos, lexer::TokenKind::Abstract) || is_kind_at(tokens, pos, lexer::TokenKind::Virtual) {
         return parse_class_body(tokens, pos)
     }
     if is_kind_at(tokens, pos, lexer::TokenKind::Interface) {
         return parse_interface_body(tokens, pos)
+    }
+    // (TR0) `trait` is CONTEXTUAL, like `from`/`params` — NOT a reserved word (an identifier named
+    // `trait` stays an ordinary Ident everywhere else). It only means "trait declaration" when the
+    // body position holds Ident("trait") IMMEDIATELY followed by `{` — a transparent alias to a
+    // type named `trait` (`type X = trait`) has no `{` and still parses as an alias below. A trait
+    // declares NO derive-list of its own (no `trait A & B { }` — compose at the deriver instead).
+    if is_kind_at(tokens, pos, lexer::TokenKind::Ident) && tokens[pos].text == "trait" && is_kind_at(tokens, pos + 1, lexer::TokenKind::LBrace) {
+        let fs = match parse_trait_fields(tokens, pos + 1) { ParsedStructBody as x => x; error as e => return e }
+        return Parsed<TypeBody> { node = TraitBody { fields = fs.fields; methods = fs.methods }; next = fs.next }
     }
     if is_kind_at(tokens, pos, lexer::TokenKind::Struct) {
         // (W10b.IF) optional implements list `struct I1 & I2 { … }` between `struct` and `{`.

@@ -8,6 +8,7 @@
 #include "../parser/parse_stmt.h"   // no_expr (DEFARGS placeholder, 2026-07-01)
 #include "collect.h"          // tk_effective_class_fields/methods (W10b.CLASS increment 2)
 #include <string.h>           // memcmp (string-span compares)
+#include <stdio.h>            // snprintf — (TR0) the trait-instantiation honest stop
 
 // shared from match.c (E5b-2), promoted to non-static for reuse:
 tk_env_result tk_check_pattern(tk_pattern p, tk_type subject, tk_env env, tk_type_table table);
@@ -1278,6 +1279,13 @@ tk_texpr_result tk_type_struct_lit(tk_struct_lit sl, tk_type expected, tk_env en
         tk_fieldsvec_result eff = tk_effective_class_fields(decl.as.value.body.as.class_body, table);
         if (!eff.ok) return xferr(eff.as.error);
         sb_fields = eff.as.value.ptr; sb_n_fields = eff.as.value.len;
+    } else if (decl.as.value.body.tag == TK_BODY_TRAIT) {
+        // (TR0) a trait is NON-instantiable — it exists only to be derived. Point at the fix.
+        size_t mlen = name.len * 2 + 128; char *mbuf = tk_alloc(mlen); if (!mbuf) abort();
+        int mn = snprintf(mbuf, mlen, "'%.*s' is a trait and cannot be instantiated — derive it from a struct or class instead (`type X = struct %.*s …`)",
+                          (int)name.len, (const char *)name.ptr, (int)name.len, (const char *)name.ptr);
+        if (mn < 0 || (size_t)mn >= mlen) abort();   // cert-err33-c: handle the return — `mlen` fits the literal + two name.len spans, so truncation is an invariant break
+        return xferr(tk_error_make(mbuf));
     } else {
         return xerr("struct-literal target is not a struct");
     }

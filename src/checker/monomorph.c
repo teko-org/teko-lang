@@ -13,6 +13,7 @@
 #include "../parser/ast.h"
 #include "../text/text.h"
 #include <string.h>
+#include <stdio.h>   // snprintf — (TR0→TR1) the trait-as-constraint honest stop
 #include <stdlib.h>
 
 // ── small allocation / string helpers ──────────────────────────────────────────────────
@@ -147,12 +148,42 @@ static bool mono_constraint_satisfied(tk_constraint_expr c, tk_type concrete, tk
     }
     return false;
 }
+// (TR0→TR1) the first constraint ATOM naming a `trait`, if any — walked so `<T: Trait>` is an
+// HONEST TR1 stop, never the silent exact-nominal-name fallback. Mirror of
+// monomorph.tks::constraint_first_trait_atom. Returns true + sets *out when found.
+static bool constraint_first_trait_atom(tk_constraint_expr c, tk_type_table table, tk_str *out) {
+    switch (c.tag) {
+        case TK_CONSTRAINT_AND:
+            return constraint_first_trait_atom(*c.as.and_expr.left, table, out)
+                || constraint_first_trait_atom(*c.as.and_expr.right, table, out);
+        case TK_CONSTRAINT_OR:
+            return constraint_first_trait_atom(*c.as.or_expr.left, table, out)
+                || constraint_first_trait_atom(*c.as.or_expr.right, table, out);
+        case TK_CONSTRAINT_ATOM:
+            if (tk_is_trait_name(c.as.atom.name, table)) { *out = c.as.atom.name; return true; }
+            return false;
+        case TK_CONSTRAINT_NONE: return false;
+    }
+    return false;
+}
+
 // Gate a whole instantiation: type_params/type_constraints are PARALLEL; `s` bound each param
 // to a concrete type for THIS instantiation. NULL on success, else the diagnostic error.
 static bool mono_check_constraints(tk_str *type_params, tk_constraint_expr *type_constraints, size_t n,
                                     tk_subst s, tk_type_table table, tk_error *out_err) {
     for (size_t i = 0; i < n; i += 1) {
         if (type_constraints[i].tag == TK_CONSTRAINT_NONE) continue;
+        // (TR0→TR1) a trait as a constraint atom is TR1 — an honest stop (message mirrors the
+        // .tks twin's concat exactly).
+        tk_str trait_atom;
+        if (constraint_first_trait_atom(type_constraints[i], table, &trait_atom)) {
+            size_t mlen = trait_atom.len + 112; char *mbuf = tk_alloc(mlen); if (!mbuf) abort();
+            int mn = snprintf(mbuf, mlen, "'%.*s' is a trait — a trait as a generic constraint (`<T: Trait>`) is not implemented yet (TR1)",
+                              (int)trait_atom.len, (const char *)trait_atom.ptr);
+            if (mn < 0 || (size_t)mn >= mlen) abort();   // cert-err33-c: handle the return — `mlen` fits the literal + trait_atom.len, so truncation is an invariant break
+            *out_err = tk_error_make(mbuf);
+            return false;
+        }
         tk_type *bound = mono_subst_find(s, type_params[i]);
         if (!bound) { *out_err = tk_error_named("internal: monomorphization did not bind type parameter", type_params[i]); return false; }
         if (!mono_constraint_satisfied(type_constraints[i], *bound, table)) {

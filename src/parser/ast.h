@@ -307,9 +307,13 @@ typedef struct {
 // full rationale. `extends`/`n_extends` = extended interfaces (the `I1 & I2` list); `methods` =
 // bodyless instance-method signatures.
 typedef struct { tk_str *extends; size_t n_extends; tk_function *methods; size_t n_methods; } tk_interface_body;
-typedef struct {                                                        // TypeBody = StructBody | EnumBody | FlagsBody | VariantBody | AliasBody | ExternBody | ClassBody | InterfaceBody
-    enum { TK_BODY_STRUCT, TK_BODY_ENUM, TK_BODY_FLAGS, TK_BODY_VARIANT, TK_BODY_ALIAS, TK_BODY_EXTERN, TK_BODY_CLASS, TK_BODY_INTERFACE } tag;
-    union { tk_struct_body struct_body; tk_enum_body enum_body; tk_flags_body flags_body; tk_variant_body variant_body; tk_alias_body alias_body; tk_extern_body extern_body; tk_class_body class_body; tk_interface_body interface_body; } as;
+// (TR0, 2026-07-02) a TRAIT body — struct-shaped (fields + methods, bodies optional), NON-
+// instantiable, derived by a struct/class via the `&`-list. See ast.tks::TraitBody for the full
+// rationale (fold-before-typing; a bodyless method = a requirement; trait values are TR1).
+typedef struct { tk_field *fields; size_t n_fields; tk_function *methods; size_t n_methods; } tk_trait_body;
+typedef struct {                                                        // TypeBody = StructBody | EnumBody | FlagsBody | VariantBody | AliasBody | ExternBody | ClassBody | InterfaceBody | TraitBody
+    enum { TK_BODY_STRUCT, TK_BODY_ENUM, TK_BODY_FLAGS, TK_BODY_VARIANT, TK_BODY_ALIAS, TK_BODY_EXTERN, TK_BODY_CLASS, TK_BODY_INTERFACE, TK_BODY_TRAIT } tag;
+    union { tk_struct_body struct_body; tk_enum_body enum_body; tk_flags_body flags_body; tk_variant_body variant_body; tk_alias_body alias_body; tk_extern_body extern_body; tk_class_body class_body; tk_interface_body interface_body; tk_trait_body trait_body; } as;
 } tk_type_body;
 typedef struct {                                                        // TypeDecl (nominal — B.13)
     tk_str        name;

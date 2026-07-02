@@ -178,6 +178,17 @@ const char *tk_check_modules(tk_program prog, tk_type_table table) {
                         if (m.params[pi].has_type) e = check_texpr(m.params[pi].type_ann, ns, table, al);
                     if (!e && m.has_return) e = check_texpr(m.return_type, ns, table, al);
                 }
+            } else if (d.body.tag == TK_BODY_TRAIT) {
+                // (TR0) fields like a struct's + method sigs like an interface's
+                tk_trait_body trb = d.body.as.trait_body;
+                for (size_t k = 0; k < trb.n_fields && !e; k += 1)
+                    e = check_texpr(trb.fields[k].type_ann, ns, table, al);
+                for (size_t mi = 0; mi < trb.n_methods && !e; mi += 1) {
+                    tk_function m = trb.methods[mi];
+                    for (size_t pi = 0; pi < m.nparams && !e; pi += 1)
+                        if (m.params[pi].has_type) e = check_texpr(m.params[pi].type_ann, ns, table, al);
+                    if (!e && m.has_return) e = check_texpr(m.return_type, ns, table, al);
+                }
             }
             // enum body: member names only; extern body (C7.1a): opaque handle — neither has type references to check
         }

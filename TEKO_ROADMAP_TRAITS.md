@@ -104,13 +104,22 @@ teko::encoding::json::encode(User { id = 1; name = "ana" })   // "{\"id\":1,\"na
 
 ## 3. Units
 
-**▪ TR0 — the `trait` construct.** **Deps:** interfaces (W10b.IF ✅), class field-flattening + methods
-(W10b.CLASS/A1 ✅). **Files:** `lexer` (keyword `trait`), `parser`/`ast` (`TraitBody` decl kind: fields +
-methods, bodies optional), `checker` (derive = fold fields (flattening) + methods; requirement-satisfaction;
-override + field/method collision rules; reject direct instantiation), `codegen`+`vm` (emit folded members;
-vtable for bodyless-requirement dynamic use). Both twins. **Verify:** `.tkt` — a struct and a class each
-derive a trait (gain fields + methods), override one, satisfy a requirement; collision → compile error;
-`trait` instantiation → compile error; VM == native; gen-2 == gen-3.
+**▪ TR0 — the `trait` construct.** ✅ **DONE (2026-07-02, issue #124).** **Deps:** interfaces (W10b.IF ✅),
+class field-flattening + methods (W10b.CLASS/A1 ✅). **As landed:** `lexer` — NO reserved word: `trait` is
+CONTEXTUAL (like `from`/`params`), recognized only as `Ident("trait")` immediately followed by `{` in the
+type-decl body position (an identifier named `trait` keeps working everywhere); `parser`/`ast` —
+`TraitBody` decl kind (fields + methods, bodies optional; a bodyless method = a requirement), deriving
+rides the SAME `&`-list as interfaces for struct AND class; `checker` — `fold_traits`, THE DERIVATION FOLD
+run as type_program's first step (both twins, both entry points): fields flatten into each deriver, bodied
+methods fold in (a deriver-defined method IS the override; two traits providing the same bodied name with
+no override = compile error, never an implicit order), bodyless requirements checked against the FOLDED
+table (a class's inherited methods can satisfy; a shared requirement is satisfied once), field collisions =
+compile error, direct instantiation + trait-in-value-position rejected with TR1 pointers, `<T: Trait>` =
+TR1 honest stop; `codegen`+`vm` — a trait decl emits NOTHING (members live in the derivers after the
+fold); the bodyless-requirement VTABLE is TR1's dynamic-value unit, not TR0's. **Verified:** 18 corpus
+tests (parser + checker; struct AND class derivers, override, requirement, collisions, non-instantiability,
+contextual identifier) + `examples/regressions/trait_basics` — VM == native, gen-2 == gen-3, 632 tests
+both engines.
 
 **▪ TR1 — trait as generic constraint + dynamic value.** **Deps:** TR0, S6 (W11 ✅), W10b.D3 dynamic
 dispatch. `<T: Trait>` monomorphized; a trait's bodyless-requirement surface usable as a vtable value.
