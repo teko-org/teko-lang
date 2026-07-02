@@ -1285,9 +1285,38 @@ fn emit_arith(buf: []byte, prog: checker::TProgram, e: checker::TExpr, b: checke
     cb(out, ")")
 }
 
+// emit_shift — #49: the `<<`/`>>` path for INTEGER prims. Routes through tk_shl_*/
+// tk_shr_* helpers (teko_rt.h) that mask the shift count by (width - 1) instead of
+// leaving an out-of-range count as plain C UB — a DEFINED result matching the VM's
+// eval_binary/apply_int_op mask exactly. Bitwise/float shift is checker-rejected, so
+// a non-integer result type reaching here is an internal invariant break.
+// (C: the `if (bop == TK_TOKEN_SHL || bop == TK_TOKEN_SHR)` block inside TK_TEXPR_BINARY.)
+fn emit_shift(buf: []byte, prog: checker::TProgram, e: checker::TExpr, b: checker::TBinary, escaping: []str, regions: []RegionFrame, fn_body: []checker::TStatement, dctx: DeferCtx) -> []byte | error {
+    let prim = match e.type {
+        checker::Prim as p => p
+        _                  => return error { message = "codegen: shift on a non-integer type not yet supported" }
+    }
+    if !cg_prim_is_int(prim.kind) {
+        return error { message = "codegen: shift on a non-integer type not yet supported" }
+    }
+    let tag = match prim_int_tag(prim.kind) {
+        str as t  => t
+        error     => return error { message = "codegen: shift on a non-integer type not yet supported" }
+    }
+    let fn_prefix = if b.op == lexer::TokenKind::Shl { "tk_shl_" } else { "tk_shr_" }
+    mut out = cb(buf, fn_prefix)
+    out = cb(out, tag)
+    out = cb(out, "(")
+    out = match emit_expr_ctx(out, prog, checker::Void { }, b.left, escaping, regions, fn_body, dctx)  { []byte as o => o; error as err => return err }
+    out = cb(out, ", ")
+    out = match emit_expr_ctx(out, prog, checker::Void { }, b.right, escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
+    cb(out, ")")
+}
+
 // emit_binary — a TBinary. `/` and `%` go through emit_div_mod; `+`, `-`, `*`
-// on integer prims go through emit_arith (C7.15 overflow guards); everything
-// else emits plain C `(L op R)`. (C: TK_TEXPR_BINARY branch of emit_expr.)
+// on integer prims go through emit_arith (C7.15 overflow guards); `<<`, `>>` on
+// integer prims go through emit_shift (#49 width-masked count); everything else
+// emits plain C `(L op R)`. (C: TK_TEXPR_BINARY branch of emit_expr.)
 fn emit_binary(buf: []byte, prog: checker::TProgram, e: checker::TExpr, b: checker::TBinary, escaping: []str, regions: []RegionFrame, fn_body: []checker::TStatement, dctx: DeferCtx) -> []byte | error {
     if b.op == lexer::TokenKind::Slash || b.op == lexer::TokenKind::Percent {
         return emit_div_mod(buf, prog, e, b, escaping, regions, fn_body, dctx)
@@ -1299,6 +1328,10 @@ fn emit_binary(buf: []byte, prog: checker::TProgram, e: checker::TExpr, b: check
             _                  => false
         }
         if is_int_prim { return emit_arith(buf, prog, e, b, escaping, regions, fn_body, dctx) }
+    }
+    // #49 — <<,>> on integer prims: route through width-masked shift helpers.
+    if b.op == lexer::TokenKind::Shl || b.op == lexer::TokenKind::Shr {
+        return emit_shift(buf, prog, e, b, escaping, regions, fn_body, dctx)
     }
     let op = match binop_c(b.op) { str as s => s; error as err => return err }
     mut out = cb(buf, "(")
@@ -2032,6 +2065,9 @@ fn emit_index(buf: []byte, prog: checker::TProgram, e: checker::TExpr, ix: check
 // bound to a temp via a GNU statement-expression, then compared to each element with `==` OR'd
 // together (true iff the lhs equals any element). The node's `.type` is bool.
 //   ({ <CtypeOfLhs> _invN = <lhs>; (_invN == <e0>) || (_invN == <e1>) || …; })
+// A STR lhs routes each comparison through tk_str_eq instead (a tk_str is a {ptr,len} struct —
+// C `==` is invalid on it; content equality, mirroring emit_compare's str branch):
+//   ({ tk_str _invN = <lhs>; tk_str_eq(_invN, <e0>) || tk_str_eq(_invN, <e1>) || …; })
 // The temp `_inv<buf.len>` uses the buffer length as the functional uniquifier (see emit_index).
 // The EMPTY set `x in []` still EVALUATES the lhs once (single-eval), then yields false — so a
 // side-effecting lhs runs identically in the VM (which evaluates the lhs before its zero-iteration
@@ -2043,6 +2079,7 @@ fn emit_in(buf: []byte, prog: checker::TProgram, ie: checker::TInExpr, escaping:
         return cb(z, "); 0; })")
     }
     let tmp = $"_inv{buf.len}"
+    let str_in = match ie.lhs.type { checker::Str => true; _ => false }
     mut out = cb(buf, "({ ")
     out = match emit_type(out, prog, ie.lhs.type) { []byte as o => o; error as err => return err }   // the lhs's resolved C type
     out = cb(out, " ")
@@ -2054,11 +2091,19 @@ fn emit_in(buf: []byte, prog: checker::TProgram, ie: checker::TInExpr, escaping:
     loop {
         if i >= ie.elems.len { break }
         if i > 0 { out = cb(out, " || ") }
-        out = cb(out, "(")
-        out = cb(out, tmp)
-        out = cb(out, " == ")
-        out = match emit_expr_ctx(out, prog, checker::Void { }, ie.elems[i], escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
-        out = cb(out, ")")
+        if str_in {
+            out = cb(out, "tk_str_eq(")
+            out = cb(out, tmp)
+            out = cb(out, ", ")
+            out = match emit_expr_ctx(out, prog, checker::Void { }, ie.elems[i], escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
+            out = cb(out, ")")
+        } else {
+            out = cb(out, "(")
+            out = cb(out, tmp)
+            out = cb(out, " == ")
+            out = match emit_expr_ctx(out, prog, checker::Void { }, ie.elems[i], escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
+            out = cb(out, ")")
+        }
         i++
     }
     cb(out, "; })")
@@ -3290,11 +3335,11 @@ fn emit_as_r(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, expe
 }
 
 // cg_emit_lit_pattern — emit an AST LITERAL pattern bound as a C constant comparable to the
-// subject temp `_s` (which already has the subject's C type, so a bare C literal compares
-// correctly — the VM's lit_as borrows the subject's width/sign for the same reason). A
-// str-literal pattern has NO C value-comparison helper in the runtime (no tk_str eq), so it
-// is an honest barrier — the VM DOES support str patterns (name_eq), so this is a true
-// codegen-only gap (M.3). (C: `cg_emit_lit_pattern`.)
+// subject temp `_s` (which already has the subject's C type, so a bare C number/byte literal
+// compares correctly — the VM's lit_as borrows the subject's width/sign for the same reason).
+// A str literal is a (tk_str){…} compound literal with an EXPLICIT length (same form as
+// TStrLit — the bytes may hold NUL); the CALLER must compare it via tk_str_eq, never `==`
+// (see emit_pat_test). (C: `cg_emit_lit_pattern`.)
 fn cg_emit_lit_pattern(buf: []byte, lit: parser::Expr) -> []byte | error {
     // descend to the variant `.kind` — `Expr` is `struct { kind: ExprKind }` in the .tks model
     // (the C twin's tk_expr is a tagged union, so its cg_emit_lit_pattern matches `lit` directly —
@@ -3305,7 +3350,13 @@ fn cg_emit_lit_pattern(buf: []byte, lit: parser::Expr) -> []byte | error {
             cb_i128(buf, n.value)
         }
         parser::ByteLit as b => cb_i64(buf, b.value to i64)
-        parser::StrLit       => error { message = "codegen: string-literal patterns not yet supported (no tk_str equality helper in the runtime)" }
+        parser::StrLit as sl => {
+            mut out = cb(buf, "(tk_str){ (const tk_byte *)\"")
+            out = cb_cstr_escaped(out, sl.text)
+            out = cb(out, "\", ")
+            out = cb_i64(out, sl.text.len to i64)
+            cb(out, " }")
+        }
         _                    => error { message = "codegen: unsupported literal in a pattern (parser emits only number/byte/str)" }
     }
 }
@@ -3371,6 +3422,16 @@ fn emit_pat_test(buf: []byte, prog: checker::TProgram, pat: parser::Pattern, sub
     match pat {
         parser::WildcardPattern => cb(buf, "1")
         parser::LiteralPattern as lp => {
+            // A STR literal pattern tests via tk_str_eq (a tk_str is a {ptr,len} struct — C `==`
+            // is invalid on it; content equality, mirroring emit_compare's str branch).
+            let is_str_lit = match lp.value.kind { parser::StrLit => true; _ => false }
+            if is_str_lit {
+                mut out = cb(buf, "tk_str_eq(")
+                out = cb(out, subj)
+                out = cb(out, ", ")
+                out = match cg_emit_lit_pattern(out, lp.value) { []byte as o => o; error as err => return err }
+                return cb(out, ")")
+            }
             mut out = cb(buf, "(")
             out = cb(out, subj)
             out = cb(out, " == ")
@@ -4651,6 +4712,50 @@ fn emit_binding(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, b
 fn emit_assign(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, a: checker::TAssign, indent: str, escaping: []str, regions: []RegionFrame, fn_body: []checker::TStatement, dctx: DeferCtx) -> []byte | error {
     let op = match assignop_c(a.op) { str as s => s; error as err => return err }
     mut out = cb(buf, indent)
+    // #61 — `<<=`/`>>=` must NOT emit the raw C compound operator: an out-of-range shift count
+    // is C UB natively, while the VM (#49, compound_apply) computes a DEFINED width-masked
+    // result. Rewrite as `lvalue = tk_shl_<w>(lvalue, rhs)` / tk_shr_<w>, routing through the
+    // SAME teko_rt.h helpers the binary `<<`/`>>` operator uses (emit_shift). SAFE to evaluate
+    // the lvalue twice: the assign-statement grammar (parse_stmt) admits only two lvalue shapes
+    // — a bare identifier (`a.name`), or (when `a.deref`) a Ref<T> handle's `(*name)` pointer
+    // dereference — never a struct field path, an array index, or a call. Both forms are pure,
+    // side-effect-free symbol lookups, so re-emitting the lvalue text a second time is cost-free.
+    if a.op == lexer::TokenKind::ShlEq || a.op == lexer::TokenKind::ShrEq {
+        let prim = match a.bound {
+            checker::Prim as p => p
+            _                  => return error { message = "codegen: shift-assign on a non-integer type not yet supported" }
+        }
+        if !cg_prim_is_int(prim.kind) {
+            return error { message = "codegen: shift-assign on a non-integer type not yet supported" }
+        }
+        let tag = match prim_int_tag(prim.kind) {
+            str as t  => t
+            error     => return error { message = "codegen: shift-assign on a non-integer type not yet supported" }
+        }
+        let fn_prefix = if a.op == lexer::TokenKind::ShlEq { "tk_shl_" } else { "tk_shr_" }
+        if a.deref {
+            out = cb(out, "(*")
+            out = cb_ident(out, a.name)
+            out = cb(out, ")")
+        } else {
+            out = cb_ident(out, a.name)
+        }
+        out = cb(out, " = ")
+        out = cb(out, fn_prefix)
+        out = cb(out, tag)
+        out = cb(out, "(")
+        if a.deref {
+            out = cb(out, "(*")
+            out = cb_ident(out, a.name)
+            out = cb(out, ")")
+        } else {
+            out = cb_ident(out, a.name)
+        }
+        out = cb(out, ", ")
+        out = match emit_expr_ctx(out, prog, checker::Void { }, a.value, escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
+        out = cb(out, ")")
+        return cb(out, ";\n")
+    }
     // (MEM-1b-ii) `r.value op= v` — write THROUGH the reference: the handle `r` IS the pointer, so the
     // lvalue is `(*r)`. (`Ref<T>` lowers to a bare `<T> *`; deref-assign is a plain C pointer store.)
     if a.deref {
@@ -5079,6 +5184,11 @@ fn emit_type_decl(buf: []byte, prog: checker::TProgram, d: parser::TypeDecl) -> 
             out = cb(out, "} ")
             out = mangle_type_name(out, "", d.name)
             cb(out, ";\n\n")
+        }
+        parser::InterfaceBody => {   // (W10b.IF) an interface is a COMPILE-TIME contract only — NO
+            // runtime C type is emitted (dynamic dispatch / vtable is ROUND 3). Like a transparent
+            // alias, it lowers to nothing; the checker rejects using an interface as a value type.
+            buf
         }
         parser::VariantBody as vb => {
             // A variant body is a UnionType (A | B | …). Members may be ANY type (B-cg2):

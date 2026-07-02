@@ -1,0 +1,23 @@
+# Regression (#49): out-of-range shift counts must be DEFINED, not UB — and the SAME across
+# both engines. The count is masked by the LEFT operand's bit-width minus 1 (C#/Java semantics):
+#
+#   (1 as u8)  << 200   -> 200 & 7  == 0  -> 1 << 0 == 1      (u8:  width 8,  mask 7)
+#   (1 as i32) << 40    -> 40  & 31 == 8  -> 1 << 8 == 256    (i32: width 32, mask 31)
+#   (256 as u64) >> 65  -> 65  & 63 == 1  -> 256 >> 1 == 128  (u64: width 64, mask 63)
+#
+# Before the fix: the VM masked EVERY shift count by a fixed 127 (wrong for anything narrower
+# than 128 bits) — for the u8 case, `200 & 127 == 72`, a shift of 72 on an 8-bit value zeroes
+# every bit before truncation, giving 0 instead of 1. Native codegen emitted a plain C `<<`/`>>`
+# with an out-of-range count — undefined behavior (observed 256 on some platforms, 0 under
+# constant folding on others), so it could silently diverge from the VM OR from itself run twice.
+#
+# sum = 1 + 256 + 128 = 385; exit code is a byte, so 385 & 0xFF = 129.
+# Both backends must agree: `teko run` exit == compiled-binary exit == 129.
+#
+#   teko run   examples/regressions/masked_shift_counts   # VM   -> exit 129
+#   teko build examples/regressions/masked_shift_counts && ./examples/regressions/masked_shift_counts/masked_shift_counts   # -> exit 129
+name = "masked_shift_counts"
+source = "src"
+
+[artifact]
+kind = "binary"

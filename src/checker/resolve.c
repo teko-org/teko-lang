@@ -325,6 +325,15 @@ tk_type_result resolve_named(tk_path path, tk_type_table table) {
             alias_depth -= 1;
             return r;
         }
+        // (W10b.IF) an interface is a COMPILE-TIME CONTRACT, not a value type — it has no runtime
+        // representation yet (dynamic dispatch = a later round). Reject it wherever a value type is
+        // expected (field/param/return/local): an honest stop, not a phantom NAMED.
+        if (ut.as.value.body.tag == TK_BODY_INTERFACE) {
+            size_t len = name.len + 128;
+            char *buf = tk_alloc(len); if (!buf) abort();
+            snprintf(buf, len, "'%.*s' is an interface and cannot be used as a value type yet (dynamic dispatch is a later round)", (int)name.len, (const char *)name.ptr);
+            return (tk_type_result){ .ok = false, .as.error = tk_error_make(buf) };
+        }
         tk_type t = { .tag = TK_TYPE_NAMED, .as.named.name = name };
         return (tk_type_result){ .ok = true, .as.value = t };
     }
@@ -473,7 +482,10 @@ static tk_type_body subst_body_names(tk_type_body body, tk_str *params, size_t n
             for (size_t i = 0; i < body.as.struct_body.n_fields; i += 1)
                 tk_fields_push(&nf, &n, (tk_field){ .name = body.as.struct_body.fields[i].name,
                     .type_ann = subst_texpr_names(body.as.struct_body.fields[i].type_ann, params, nparams, args, nargs) });
-            return (tk_type_body){ .tag = TK_BODY_STRUCT, .as.struct_body = { .fields = nf, .n_fields = n } };
+            // methods/implements dropped on a stamped generic instance (mirrors resolve.tks — the
+            // generic template's methods/implements aren't carried to the monomorphized body); NULL/0
+            // are explicit for parity with the .tks `teko::list::empty()` (designated-init already 0s them).
+            return (tk_type_body){ .tag = TK_BODY_STRUCT, .as.struct_body = { .fields = nf, .n_fields = n, .methods = NULL, .n_methods = 0, .implements = NULL, .n_implements = 0 } };
         }
         case TK_BODY_VARIANT:
             return (tk_type_body){ .tag = TK_BODY_VARIANT, .as.variant_body = { .type_expr = subst_texpr_names(body.as.variant_body.type_expr, params, nparams, args, nargs) } };
@@ -728,7 +740,8 @@ static tk_type_body normalize_inst_body(tk_type_body body, tk_type_table table) 
             for (size_t i = 0; i < body.as.struct_body.n_fields; i += 1)
                 tk_fields_push(&nf, &n, (tk_field){ .name = body.as.struct_body.fields[i].name,
                     .type_ann = normalize_inst_texpr(body.as.struct_body.fields[i].type_ann, table) });
-            return (tk_type_body){ .tag = TK_BODY_STRUCT, .as.struct_body = { .fields = nf, .n_fields = n } };
+            // methods/implements explicit NULL/0 for parity with the .tks (designated-init already 0s them).
+            return (tk_type_body){ .tag = TK_BODY_STRUCT, .as.struct_body = { .fields = nf, .n_fields = n, .methods = NULL, .n_methods = 0, .implements = NULL, .n_implements = 0 } };
         }
         case TK_BODY_VARIANT:
             return (tk_type_body){ .tag = TK_BODY_VARIANT, .as.variant_body = { .type_expr = normalize_inst_texpr(body.as.variant_body.type_expr, table) } };

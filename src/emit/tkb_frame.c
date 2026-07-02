@@ -152,6 +152,7 @@ static void collect_typebody(tk_strtable *t, tk_type_body tb) {
         case TK_BODY_ALIAS:   collect_typeexpr(t, tb.as.alias_body.alias); break;
         case TK_BODY_EXTERN:  break;
         case TK_BODY_CLASS:   collect_fields(t, tb.as.class_body.fields, tb.as.class_body.n_fields); break;   // (W10b.CLASS) methods not yet collected, same pre-existing gap as struct methods
+        case TK_BODY_INTERFACE: for (size_t i = 0; i < tb.as.interface_body.n_extends; i += 1) tk_st_intern(t, tb.as.interface_body.extends[i]); break;   // (W10b.IF) extends names only — method sigs not serialized (same gap as struct/class methods)
     }
 }
 static void collect_typedecl(tk_strtable *t, tk_type_decl d) {
