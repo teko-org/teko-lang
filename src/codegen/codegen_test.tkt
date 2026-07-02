@@ -1301,3 +1301,25 @@ fn lowers_widening_cast() {
     let x = 200 to i64
     teko::assert::is_true(x == 200)
 }
+
+// #49 — out-of-range shift counts are DEFINED, not UB: the count is masked by the LEFT
+// operand's bit-width minus 1 (C#/Java semantics), in BOTH engines. `(1 to i32) << 40` masks
+// the count to `40 & 31 == 8`, so the result is `1 << 8 == 256` — NOT 0 (a naive-mask-by-127
+// VM bug) and NOT arbitrary UB (native's old plain-C `<<`). Covers u8/i32/u64 widths, SHL and
+// SHR, plus an in-range control to prove the mask is a no-op when the count already fits.
+#test
+fn masked_shift_out_of_range_count() {
+    let a: i32 = 1
+    teko::assert::is_true((a << 40) == 256)          // 40 & 31 == 8  -> 1 << 8 == 256
+    let b: u8 = 1
+    teko::assert::is_true((b << 9) == 2)              // 9 & 7 == 1   -> 1 << 1 == 2
+    let c: u64 = 256
+    teko::assert::is_true((c >> 65) == 128)           // 65 & 63 == 1 -> 256 >> 1 == 128
+    let d: i32 = 8
+    teko::assert::is_true((d >> 34) == 2)             // 34 & 31 == 2 -> 8 >> 2 == 2
+    // in-range control — the mask must be a NO-OP when the count already fits the width.
+    let e: i32 = 1
+    teko::assert::is_true((e << 3) == 8)
+    let f: u8 = 128
+    teko::assert::is_true((f >> 7) == 1)              // count == width-1 (boundary, still in range)
+}

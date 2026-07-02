@@ -1285,9 +1285,38 @@ fn emit_arith(buf: []byte, prog: checker::TProgram, e: checker::TExpr, b: checke
     cb(out, ")")
 }
 
+// emit_shift — #49: the `<<`/`>>` path for INTEGER prims. Routes through tk_shl_*/
+// tk_shr_* helpers (teko_rt.h) that mask the shift count by (width - 1) instead of
+// leaving an out-of-range count as plain C UB — a DEFINED result matching the VM's
+// eval_binary/apply_int_op mask exactly. Bitwise/float shift is checker-rejected, so
+// a non-integer result type reaching here is an internal invariant break.
+// (C: the `if (bop == TK_TOKEN_SHL || bop == TK_TOKEN_SHR)` block inside TK_TEXPR_BINARY.)
+fn emit_shift(buf: []byte, prog: checker::TProgram, e: checker::TExpr, b: checker::TBinary, escaping: []str, regions: []RegionFrame, fn_body: []checker::TStatement, dctx: DeferCtx) -> []byte | error {
+    let prim = match e.type {
+        checker::Prim as p => p
+        _                  => return error { message = "codegen: shift on a non-integer type not yet supported" }
+    }
+    if !cg_prim_is_int(prim.kind) {
+        return error { message = "codegen: shift on a non-integer type not yet supported" }
+    }
+    let tag = match prim_int_tag(prim.kind) {
+        str as t  => t
+        error     => return error { message = "codegen: shift on a non-integer type not yet supported" }
+    }
+    let fn_prefix = if b.op == lexer::TokenKind::Shl { "tk_shl_" } else { "tk_shr_" }
+    mut out = cb(buf, fn_prefix)
+    out = cb(out, tag)
+    out = cb(out, "(")
+    out = match emit_expr_ctx(out, prog, checker::Void { }, b.left, escaping, regions, fn_body, dctx)  { []byte as o => o; error as err => return err }
+    out = cb(out, ", ")
+    out = match emit_expr_ctx(out, prog, checker::Void { }, b.right, escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
+    cb(out, ")")
+}
+
 // emit_binary — a TBinary. `/` and `%` go through emit_div_mod; `+`, `-`, `*`
-// on integer prims go through emit_arith (C7.15 overflow guards); everything
-// else emits plain C `(L op R)`. (C: TK_TEXPR_BINARY branch of emit_expr.)
+// on integer prims go through emit_arith (C7.15 overflow guards); `<<`, `>>` on
+// integer prims go through emit_shift (#49 width-masked count); everything else
+// emits plain C `(L op R)`. (C: TK_TEXPR_BINARY branch of emit_expr.)
 fn emit_binary(buf: []byte, prog: checker::TProgram, e: checker::TExpr, b: checker::TBinary, escaping: []str, regions: []RegionFrame, fn_body: []checker::TStatement, dctx: DeferCtx) -> []byte | error {
     if b.op == lexer::TokenKind::Slash || b.op == lexer::TokenKind::Percent {
         return emit_div_mod(buf, prog, e, b, escaping, regions, fn_body, dctx)
@@ -1299,6 +1328,10 @@ fn emit_binary(buf: []byte, prog: checker::TProgram, e: checker::TExpr, b: check
             _                  => false
         }
         if is_int_prim { return emit_arith(buf, prog, e, b, escaping, regions, fn_body, dctx) }
+    }
+    // #49 — <<,>> on integer prims: route through width-masked shift helpers.
+    if b.op == lexer::TokenKind::Shl || b.op == lexer::TokenKind::Shr {
+        return emit_shift(buf, prog, e, b, escaping, regions, fn_body, dctx)
     }
     let op = match binop_c(b.op) { str as s => s; error as err => return err }
     mut out = cb(buf, "(")

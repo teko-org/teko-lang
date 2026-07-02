@@ -1265,7 +1265,12 @@ static tk_value eval_binary(const tk_texpr *e, tk_venv *env) {
 
     // +,-,*,&,|,^,<<,>> — plain fixed-width arithmetic (overflow guarding DEFERRED to
     // build profiles, exactly as codegen leaves +,-,* as plain C — out of scope here).
+    // #49 — shift counts are masked by the LEFT OPERAND's bit-width minus 1 (C#/Java
+    // semantics), NOT a fixed 127: `(1 as i32) << 40` masks to `<< 8` (width=32 -> &31),
+    // matching codegen's tk_shl_*/tk_shr_* runtime helpers exactly. In-range counts are
+    // unaffected (mask is a no-op when count < width).
     unsigned __int128 a = v_as_u128(lv), b = v_as_u128(rv), raw;
+    unsigned shift_mask = (unsigned)(width - 1);
     switch (op) {
         case TK_TOKEN_PLUS:  raw = a + b; break;
         case TK_TOKEN_MINUS: raw = a - b; break;
@@ -1273,10 +1278,10 @@ static tk_value eval_binary(const tk_texpr *e, tk_venv *env) {
         case TK_TOKEN_AMP:   raw = a & b; break;
         case TK_TOKEN_PIPE:  raw = a | b; break;
         case TK_TOKEN_CARET: raw = a ^ b; break;
-        case TK_TOKEN_SHL:   raw = a << (b & 127); break;
+        case TK_TOKEN_SHL:   raw = a << (b & shift_mask); break;
         case TK_TOKEN_SHR:
-            if (is_signed) raw = (unsigned __int128)(v_as_i128(lv) >> (b & 127));
-            else           raw = a >> (b & 127);
+            if (is_signed) raw = (unsigned __int128)(v_as_i128(lv) >> (b & shift_mask));
+            else           raw = a >> (b & shift_mask);
             break;
         default: vm_unsupported("binary operator not yet supported");
     }
@@ -2367,6 +2372,9 @@ static tk_value compound_apply(tk_value old, tk_token_kind op, tk_value rhs, con
         vm_unsupported("compound assignment on a non-integer value not yet supported");
     bool sgn = old.as.i.is_signed; int w = old.as.i.width;
     uint64_t a = old.as.i.bits, b = rhs.as.i.bits, raw;
+    // #49 — mask the shift count by the LEFT (target slot's) width - 1, not a fixed 63;
+    // mirrors the eval_binary SHL/SHR fix above (same C#/Java-style semantics).
+    unsigned shift_mask = (unsigned)(w - 1);
     switch (op) {
         case TK_TOKEN_PLUSEQ:  raw = a + b; break;
         case TK_TOKEN_MINUSEQ: raw = a - b; break;
@@ -2374,8 +2382,8 @@ static tk_value compound_apply(tk_value old, tk_token_kind op, tk_value rhs, con
         case TK_TOKEN_AMPEQ:   raw = a & b; break;
         case TK_TOKEN_PIPEEQ:  raw = a | b; break;
         case TK_TOKEN_CARETEQ: raw = a ^ b; break;
-        case TK_TOKEN_SHLEQ:   raw = a << (b & 63); break;
-        case TK_TOKEN_SHREQ:   raw = sgn ? (uint64_t)((int64_t)a >> (b & 63)) : (a >> (b & 63)); break;
+        case TK_TOKEN_SHLEQ:   raw = a << (b & shift_mask); break;
+        case TK_TOKEN_SHREQ:   raw = sgn ? (uint64_t)((int64_t)a >> (b & shift_mask)) : (a >> (b & shift_mask)); break;
         case TK_TOKEN_SLASHEQ:
         case TK_TOKEN_PERCENTEQ: {
             bool isdiv = (op == TK_TOKEN_SLASHEQ);

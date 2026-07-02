@@ -1527,6 +1527,25 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
                     }
                 }
             }
+            // #49 — SHL/SHR on INTEGER prims route through tk_shl_*/tk_shr_* helpers
+            // (teko_rt.h) that mask the shift count by (width - 1), giving a DEFINED
+            // result for an out-of-range count instead of C UB (matches vm.c's
+            // eval_binary mask exactly). Bitwise/float shift is checker-rejected, so
+            // reaching here with a non-integer result type is an internal invariant break.
+            if (bop == TK_TOKEN_SHL || bop == TK_TOKEN_SHR) {
+                if (e->type.tag != TK_TYPE_PRIM || !cg_prim_is_int(e->type.as.prim))
+                    return fail_node(err, "codegen: shift on a non-integer type not yet supported");
+                const char *tag = prim_int_tag(e->type.as.prim);
+                if (tag == NULL) return fail_node(err, "codegen: shift on a non-integer type not yet supported");
+                cb(b, bop == TK_TOKEN_SHL ? "tk_shl_" : "tk_shr_");
+                cb(b, tag);
+                cb(b, "(");
+                if (!emit_expr(b, e->as.binary.left,  err)) return false;
+                cb(b, ", ");
+                if (!emit_expr(b, e->as.binary.right, err)) return false;
+                cb(b, ")");
+                return true;
+            }
             const char *op = binop_c(bop);
             if (op == NULL) return fail_node(err, "codegen: binary operator not yet supported");
             cb(b, "(");
