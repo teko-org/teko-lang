@@ -730,6 +730,17 @@ the only ones the user ruled on directly.
   net's `Reader`/`Writer` conformance** (`TEKO_ROADMAP_NET_CRYPTO.md`'s `TcpStream`/`TlsStream` etc. are
   meant to implement `teko::io`'s interfaces from the start, per `IO1`'s "retro-impact" note) — so IO0
   landing before NET_CRYPTO's socket units mature avoids a later rewrite.
+  **`IO0` ✅ BUILT 2026-07-02 (issue #93)** — `src/io/stream.tks` (+ `stream_test.tkt`, 22 tests both
+  engines; `examples/regressions/io_stream_pipeline` differential fixture): the four interfaces
+  verbatim (`Reader`/`Writer`/`Seeker`/`Closer` + `Whence`), `Buf` (pure-Teko VALUE half; N-KEYSTONE
+  adds the arena/pointer half to THIS type — §5.3 one-Buf taken), `NullStream` conformance anchor,
+  `MemReader`/`MemWriter` value-threading steps, and the combinators (`read_all`/`read_exact`/
+  `write_all`/`copy`/limit/buffered+flush) — 🔶 the combinators are typed against the closure twins
+  `ReadFn`/`WriteFn` (Ref-capture statefulness), NOT `Reader`/`Writer` params, because
+  interface-as-value dispatch is ROUND 3 D2/D3; IO1 re-types them onto the interfaces when dispatch
+  lands. EOF = 0/empty (§5.2 rec taken). Found + documented en route: the flat type-table collision
+  (emit's private `Reader` renamed `CodecReader`), the vm.tks builtin-arg Ref-cell drop, the
+  param-named-as-extern codegen hijack, and lambda `return <bound error>` union-wrap miss.
 - **MATH** (`teko::math::*`) — **`M0` root is `Deps: none`**, startable NOW. Two decisions the doc flags as
   "ratify with the net/crypto ones in PR #80" resolve against `NET_CRYPTO`: `M1` (checked arithmetic) and
   `M3` (BigInt) are the units that answer `NET_CRYPTO`'s open decisions **#4** and **#8** (per that doc's
