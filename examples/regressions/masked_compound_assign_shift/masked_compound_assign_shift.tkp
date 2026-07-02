@@ -1,0 +1,24 @@
+# Regression (#61): the COMPOUND-ASSIGN shift forms `<<=`/`>>=` must apply the SAME
+# width-(-1) mask as the binary `<<`/`>>` operator (#49), in BOTH engines. Native codegen
+# used to emit the raw C `<<=`/`>>=` compound operator for these — UB for an out-of-range
+# count — even though the plain binary path (and the VM's compound_apply) was already
+# fixed by #49. This regression pins the native codegen fix: `<<=`/`>>=` now rewrite to
+# `lvalue = tk_shl_<w>(lvalue, rhs)` / `tk_shr_<w>`, the SAME width-masking helpers the
+# binary operator already routes through.
+#
+#   (1 as i32) <<= 40   -> 40 & 31 == 8  -> 1 << 8   == 256   (i32: width 32, mask 31)
+#   (1 as u8)  <<= 200  -> 200 & 7 == 0  -> 1 << 0   == 1     (u8:  width 8,  mask 7 — the
+#                                           historical "mask by a fixed 127" VM bug would
+#                                           compute 200 & 127 == 72, shifting to 0)
+#   (256 as u64) >>= 65 -> 65 & 63 == 1  -> 256 >> 1 == 128   (u64: width 64, mask 63)
+#
+# sum = 256 + 1 + 128 = 385; exit code is a byte, so 385 & 0xFF = 129.
+# Both backends must agree: `teko run` exit == compiled-binary exit == 129.
+#
+#   teko run   examples/regressions/masked_compound_assign_shift   # VM   -> exit 129
+#   teko build examples/regressions/masked_compound_assign_shift && ./examples/regressions/masked_compound_assign_shift/masked_compound_assign_shift   # -> exit 129
+name = "masked_compound_assign_shift"
+source = "src"
+
+[artifact]
+kind = "binary"

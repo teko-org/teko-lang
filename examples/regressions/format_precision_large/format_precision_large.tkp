@@ -1,0 +1,35 @@
+# Regression: issue #48 — large format precision (`$"{x:F500}"`) must NOT stack-over-read.
+#
+# src/runtime/teko_rt.c's fmt_from_buf() used to copy `n` bytes out of a fixed 128-byte stack
+# buffer, where `n` was snprintf's WOULD-HAVE-WRITTEN return (not bytes actually written into
+# the short buffer) — a large precision like F500 made tk_fmt_f(1.0, 500) read 502 bytes out of
+# a 128-byte stack array (CWE-125 stack over-read / info leak). The fix prefers CORRECT OUTPUT
+# over truncation: once snprintf reports the result would overflow the stack buffer, the helper
+# re-runs snprintf into a freshly sized heap buffer instead of ever copying past what was
+# actually written.
+#
+# This program formats 1.0 with F500 precision (both the static `:F500` spec AND the dynamic
+# `:[…]` spec, which routes through the same runtime helper via a runtime-computed spec string),
+# and asserts the formatted string's LENGTH is exactly the correct, untruncated 502 bytes
+# ("1." + 500 zeros). A build/run under AddressSanitizer with the pre-fix code aborts with a
+# stack-buffer-overflow; post-fix it exits cleanly. (A raw length of 502 can't survive as a
+# POSIX process exit code — truncated mod 256 — so the comparison against 502 happens inside
+# the program at full i64 precision; the exit code is a small pass/fail sentinel: 42 = both
+# lengths matched, 0 = mismatch.)
+#
+# NOTE: `teko run` (the C-bootstrap VM) links tk_fmt_f/tk_fmt_dyn_f64 straight from
+# src/runtime/teko_rt.c, so it DOES exercise the real fix and also exits 42. The self-hosted
+# `.tks` twins in src/runtime/teko_rt.tks (`fmt_f`/`fmt_dyn_f64`/…) are known deferred stubs
+# that ignore precision (see repo memory: "Interp format spec") — a self-hosted VM built purely
+# from those stubs is NOT expected to reproduce the original stack over-read (it never allocates
+# a 502-byte result in the first place). The authoritative reproduction of the CWE-125 fix is
+# the native build (`teko build`), which compiles straight against teko_rt.c. Not yet wired into
+# CI compilation (tracked separately, issue #54).
+#
+#   teko build examples/regressions/format_precision_large && \
+#     ./examples/regressions/format_precision_large/format_precision_large   # → exit 42
+name = "format_precision_large"
+source = "src"
+
+[artifact]
+kind = "binary"

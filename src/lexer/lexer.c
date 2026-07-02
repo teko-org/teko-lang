@@ -272,6 +272,7 @@ static tk_token_kind keyword_kind(tk_str text) {
     if (tk_str_eq_lit(text, "virtual"))  return TK_TOKEN_VIRTUAL;
     if (tk_str_eq_lit(text, "override")) return TK_TOKEN_OVERRIDE;
     if (tk_str_eq_lit(text, "intern"))   return TK_TOKEN_INTERN;
+    if (tk_str_eq_lit(text, "interface")) return TK_TOKEN_INTERFACE;   // (W10b.IF)
     // `params` is deliberately NOT here — it's a contextual keyword like `from` (see token.h).
     // `self`/`base` are likewise deliberately NOT here — see token.h's W10b.CLASS note.
     return TK_TOKEN_IDENT;

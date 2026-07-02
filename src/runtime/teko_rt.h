@@ -517,6 +517,37 @@ static inline int32_t  tk_mod_i32(int32_t  a, int32_t  b){ if (b == 0) tk_panic_
 static inline int64_t  tk_mod_i64(int64_t  a, int64_t  b){ if (b == 0) tk_panic_div0(); return a % b; }
 static inline __int128 tk_mod_i128(__int128 a, __int128 b){ if (b == 0) tk_panic_div0(); return a % b; }
 
+// --- #49: width-masked shift <<, >> — defined result for an OUT-OF-RANGE count -------------
+// Plain C `<<`/`>>` is UB when the shift count is >= the operand's bit-width (or negative); a
+// Teko program that computes a large/negative-looking `u32`/`i64`/… count (e.g. from user input
+// or arithmetic) must not hit native UB. Ruling: mask the count by (bit-width - 1) — C#/Java
+// semantics — so `(1 as i32) << 40` == `1 << (40 & 31)` == `1 << 8` == 256, matching the VM
+// (vm.c's eval_binary / vm.tks's apply_int_op) bit-for-bit. In-range counts are unaffected (the
+// mask is a no-op when count < width). One helper per signed/unsigned width (u8..u128, i8..i128);
+// codegen selects by the binary node's result prim (same tag as tk_div_*/tk_add_*). Signed `>>`
+// keeps its existing sign-preserving (arithmetic) behavior — only the COUNT is fixed here.
+static inline uint8_t  tk_shl_u8 (uint8_t  a, uint8_t  b){ return (uint8_t )(a << (b & 7));   }
+static inline uint16_t tk_shl_u16(uint16_t a, uint16_t b){ return (uint16_t)(a << (b & 15));  }
+static inline uint32_t tk_shl_u32(uint32_t a, uint32_t b){ return a << (b & 31);              }
+static inline uint64_t tk_shl_u64(uint64_t a, uint64_t b){ return a << (b & 63);              }
+static inline unsigned __int128 tk_shl_u128(unsigned __int128 a, unsigned __int128 b){ return a << (b & 127); }
+static inline int8_t   tk_shl_i8 (int8_t   a, int8_t   b){ return (int8_t )((uint8_t )a << ((uint8_t )b & 7));   }
+static inline int16_t  tk_shl_i16(int16_t  a, int16_t  b){ return (int16_t)((uint16_t)a << ((uint16_t)b & 15));  }
+static inline int32_t  tk_shl_i32(int32_t  a, int32_t  b){ return (int32_t)((uint32_t)a << ((uint32_t)b & 31));  }
+static inline int64_t  tk_shl_i64(int64_t  a, int64_t  b){ return (int64_t)((uint64_t)a << ((uint64_t)b & 63));  }
+static inline __int128 tk_shl_i128(__int128 a, __int128 b){ return (__int128)((unsigned __int128)a << ((unsigned __int128)b & 127)); }
+
+static inline uint8_t  tk_shr_u8 (uint8_t  a, uint8_t  b){ return (uint8_t )(a >> (b & 7));   }
+static inline uint16_t tk_shr_u16(uint16_t a, uint16_t b){ return (uint16_t)(a >> (b & 15));  }
+static inline uint32_t tk_shr_u32(uint32_t a, uint32_t b){ return a >> (b & 31);              }
+static inline uint64_t tk_shr_u64(uint64_t a, uint64_t b){ return a >> (b & 63);              }
+static inline unsigned __int128 tk_shr_u128(unsigned __int128 a, unsigned __int128 b){ return a >> (b & 127); }
+static inline int8_t   tk_shr_i8 (int8_t   a, int8_t   b){ return (int8_t )(a >> (b & 7));   }
+static inline int16_t  tk_shr_i16(int16_t  a, int16_t  b){ return (int16_t)(a >> (b & 15));  }
+static inline int32_t  tk_shr_i32(int32_t  a, int32_t  b){ return a >> (b & 31);              }
+static inline int64_t  tk_shr_i64(int64_t  a, int64_t  b){ return a >> (b & 63);              }
+static inline __int128 tk_shr_i128(__int128 a, __int128 b){ return a >> (b & 127); }
+
 // --- C7.15 overflow-guarded integer +, -, *: panic when TEKO_OVERFLOW_DEBUG is set ---
 // One helper per signed/unsigned width (u8..u128, i8..i128). Float +,-,* are NOT here —
 // float overflow is not a Teko error. Bool is not an arithmetic target.
