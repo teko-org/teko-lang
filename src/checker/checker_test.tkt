@@ -2442,3 +2442,98 @@ fn flags_wrong_arg_type_is_error() {
         error    => teko::assert::is_true(true)
     }
 }
+
+// ---------------------------------------------------------------------------
+// Group P: (W10b.D1) invariant-safe construction — a class's `{…}` literal is
+// legal ONLY inside the class's OWN methods (static factories / instance
+// methods); everywhere else it must be a compile error. Struct literals are
+// pure value data and stay free.
+// ---------------------------------------------------------------------------
+// a `Cls { v = 0 }` literal expression for the given class name.
+fn d1_lit(cls: str) -> parser::Expr {
+    let names: []str = teko::list::push(teko::list::empty(), "v")
+    let vals: []parser::Expr = teko::list::push(teko::list::empty(), e_num(0))
+    ek(parser::StructLit { type_path = path1(cls); type_args = teko::list::empty(); field_names = names; field_vals = vals })
+}
+// `[pub] fn name(params…) -> ret { body }` — the D1 tests' method/function builder.
+fn d1_fn(name: str, params: []parser::Param, ret: str, body: []parser::Statement) -> parser::Function {
+    parser::Function { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = params; has_return = true; return_type = named_t(ret); body = body; vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false }
+}
+// a sealed `type name = class { v: i64  <methods> }` item.
+fn d1_class_item(name: str, methods: []parser::Function) -> parser::Item {
+    let field_v = parser::Field { name = "v"; type_ann = named_t("i64"); vis = parser::Visibility::Pub; is_intern = false }
+    parser::Item { content = parser::TypeDecl { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::ClassBody { kind = parser::ClassKind::Sealed; has_base = false; base_name = ""; has_base_binding = false; base_binding_name = ""; implements = teko::list::empty(); fields = teko::list::push(teko::list::empty(), field_v); methods = methods }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }; namespace = ""; file = "" }
+}
+fn d1_item(f: parser::Function) -> parser::Item { parser::Item { content = f; namespace = ""; file = "" } }
+
+#test
+fn d1_static_factory_constructs_own_class_ok() {
+    // `Cls::make()` — the canonical factory: a static method of Cls building `Cls { … }`.
+    let make = d1_fn("make", teko::list::empty(), "Cls", one_stmt(d1_lit("Cls")))
+    let items = teko::list::push(teko::list::empty(), d1_class_item("Cls", list1(make)))
+    match type_program(parser::Program { items = items }) {
+        TProgram => teko::assert::is_true(true)
+        error    => teko::assert::is_true(false)   // its OWN factory must stay legal
+    }
+}
+
+#test
+fn d1_instance_method_constructs_own_class_ok() {
+    // an INSTANCE method of Cls building a fresh `Cls { … }` — same encapsulation boundary.
+    let dup_params = teko::list::push(teko::list::empty(), recv_param("self"))
+    let dup = d1_fn("dup", dup_params, "Cls", one_stmt(d1_lit("Cls")))
+    let items = teko::list::push(teko::list::empty(), d1_class_item("Cls", list1(dup)))
+    match type_program(parser::Program { items = items }) {
+        TProgram => teko::assert::is_true(true)
+        error    => teko::assert::is_true(false)   // its OWN instance method must stay legal
+    }
+}
+
+#test
+fn d1_free_function_constructing_class_is_error() {
+    // a FREE function building `Cls { … }` — outside the class's surface, must fail.
+    let make = d1_fn("make", teko::list::empty(), "Cls", one_stmt(d1_lit("Cls")))
+    let sneaky = d1_fn("sneaky", teko::list::empty(), "Cls", one_stmt(d1_lit("Cls")))
+    let items = teko::list::push(teko::list::push(teko::list::empty(), d1_class_item("Cls", list1(make))), d1_item(sneaky))
+    match type_program(parser::Program { items = items }) {
+        TProgram => teko::assert::is_true(false)   // external construction -> must fail
+        error    => teko::assert::is_true(true)
+    }
+}
+
+#test
+fn d1_top_level_statement_constructing_class_is_error() {
+    // a top-level `Cls { … }` statement (script main) — outside any method, must fail.
+    let make = d1_fn("make", teko::list::empty(), "Cls", one_stmt(d1_lit("Cls")))
+    let items = teko::list::push(teko::list::push(teko::list::empty(), d1_class_item("Cls", list1(make))), parser::Item { content = st(d1_lit("Cls")); namespace = ""; file = "" })
+    match type_program(parser::Program { items = items }) {
+        TProgram => teko::assert::is_true(false)   // external construction -> must fail
+        error    => teko::assert::is_true(true)
+    }
+}
+
+#test
+fn d1_other_class_method_constructing_is_error() {
+    // ANOTHER class's method building `Cls { … }` — a method, but not Cls's own, must fail.
+    let make = d1_fn("make", teko::list::empty(), "Cls", one_stmt(d1_lit("Cls")))
+    let forge = d1_fn("forge", teko::list::empty(), "Cls", one_stmt(d1_lit("Cls")))
+    let items = teko::list::push(teko::list::push(teko::list::empty(), d1_class_item("Cls", list1(make))), d1_class_item("Other", list1(forge)))
+    match type_program(parser::Program { items = items }) {
+        TProgram => teko::assert::is_true(false)   // another type's method -> must fail
+        error    => teko::assert::is_true(true)
+    }
+}
+
+#test
+fn d1_struct_literal_stays_free() {
+    // a STRUCT literal from a free function — structs are pure value data, always legal.
+    let names: []str = teko::list::push(teko::list::empty(), "x")
+    let vals: []parser::Expr = teko::list::push(teko::list::empty(), e_num(0))
+    let pt_lit = ek(parser::StructLit { type_path = path1("Pt"); type_args = teko::list::empty(); field_names = names; field_vals = vals })
+    let free_build = d1_fn("free_build", teko::list::empty(), "Pt", one_stmt(pt_lit))
+    let items = teko::list::push(teko::list::push(teko::list::empty(), pt_item()), d1_item(free_build))
+    match type_program(parser::Program { items = items }) {
+        TProgram => teko::assert::is_true(true)
+        error    => teko::assert::is_true(false)   // struct init is FREE — must NOT fail
+    }
+}

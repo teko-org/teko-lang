@@ -1096,14 +1096,22 @@ tk_texpr_result tk_type_struct_lit(tk_struct_lit sl, tk_type expected, tk_env en
     }
     // (W10b.CLASS) `Name { … }` also constructs a class instance — a class's fields are typed
     // identically to a struct's (increment 2: the EFFECTIVE, base-inherited fields too). An
-    // `abstract` class cannot be instantiated directly. The "who may construct me" restriction
-    // (a class's literal legal only inside its own static factory) is a LATER increment.
+    // `abstract` class cannot be instantiated directly.
     tk_field *sb_fields; size_t sb_n_fields;
     if (decl.as.value.body.tag == TK_BODY_STRUCT) {
         sb_fields = decl.as.value.body.as.struct_body.fields; sb_n_fields = decl.as.value.body.as.struct_body.n_fields;
     } else if (decl.as.value.body.tag == TK_BODY_CLASS) {
         if (decl.as.value.body.as.class_body.kind == TK_CLASS_ABSTRACT)
             return xferr(tk_error_named("is abstract and cannot be instantiated directly", name));
+        // (W10b.D1) invariant-safe construction — a class's `{…}` literal is legal ONLY inside
+        // the class's OWN methods (its static factories and instance methods), so the
+        // arena-per-object and the class's invariants stay inviolable from outside code.
+        // `env.owner_type` is the DECLARING class of the method body currently being typed
+        // (empty outside any method) — a purely inherited method keeps its ORIGINAL declaring
+        // class (type_struct_methods), so a base factory constructing the base stays legal when
+        // re-typed under a derived class. Structs are pure value data: their literals stay free.
+        if (!tk_str_eq(env.owner_type, name))
+            return xferr(tk_error_named("a class literal is only legal inside the class's own methods — construct it via a static factory", name));
         tk_fieldsvec_result eff = tk_effective_class_fields(decl.as.value.body.as.class_body, table);
         if (!eff.ok) return xferr(eff.as.error);
         sb_fields = eff.as.value.ptr; sb_n_fields = eff.as.value.len;
