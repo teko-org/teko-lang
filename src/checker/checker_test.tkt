@@ -2696,3 +2696,114 @@ fn iface_variant_member_is_error() {
         error    => teko::assert::is_true(true)
     }
 }
+
+// (#109 W0) an empty-struct-body TypeDecl named `name`, wrapped as an Item under `namespace`.
+fn w0_empty_struct_item(name: str, namespace: str) -> parser::Item {
+    let td = parser::TypeDecl { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::StructBody { fields = teko::list::empty(); methods = teko::list::empty(); implements = teko::list::empty() }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }
+    parser::Item { content = td; namespace = namespace; file = "" }
+}
+
+// (#109 W0) registering the SAME (namespace, name) twice — e.g. two files both declaring
+// `namespace aa { type Reader = struct {} }` — is a real duplicate declaration, now a compile
+// error (today it silently shadowed: first-match-wins in the flat table).
+#test
+fn w0_duplicate_same_namespace_and_name_is_error() {
+    let items = teko::list::push(teko::list::push(teko::list::empty(), w0_empty_struct_item("Reader", "aa")), w0_empty_struct_item("Reader", "aa"))
+    match collect(parser::Program { items = items }) {
+        Collected => teko::assert::is_true(false)   // must fail
+        error as e => {
+            teko::assert::is_true(true)
+            teko::assert::is_true(teko::str::contains(e.message, "duplicate type"))
+            teko::assert::is_true(teko::str::contains(e.message, "Reader"))
+        }
+    }
+}
+
+// (#109 W0) the ratified design's P1 probe: `aa::Reader` and `bb::Reader` — same bare name,
+// DIFFERENT namespaces. Today's flat, namespace-blind type table silently conflates the two
+// (first-match-wins misresolution); W0 converts that incident class into a fail-loud compile
+// error naming BOTH namespaces, until W3's namespace-aware resolution lifts the ban.
+#test
+fn w0_cross_namespace_bare_name_duplicate_is_error() {
+    let items = teko::list::push(teko::list::push(teko::list::empty(), w0_empty_struct_item("Reader", "aa")), w0_empty_struct_item("Reader", "bb"))
+    match collect(parser::Program { items = items }) {
+        Collected => teko::assert::is_true(false)   // must fail
+        error as e => {
+            teko::assert::is_true(true)
+            teko::assert::is_true(teko::str::contains(e.message, "two types share the bare name"))
+            teko::assert::is_true(teko::str::contains(e.message, "Reader"))
+            teko::assert::is_true(teko::str::contains(e.message, "aa"))
+            teko::assert::is_true(teko::str::contains(e.message, "bb"))
+            teko::assert::is_true(teko::str::contains(e.message, "#109"))
+        }
+    }
+}
+
+// (#109 W0) top-level (namespace "") duplicate reads as "<top-level>" in the diagnostic, not an
+// empty/blank namespace label.
+#test
+fn w0_duplicate_top_level_names_top_level_in_message() {
+    let items = teko::list::push(teko::list::push(teko::list::empty(), w0_empty_struct_item("Widget", "")), w0_empty_struct_item("Widget", ""))
+    match collect(parser::Program { items = items }) {
+        Collected => teko::assert::is_true(false)   // must fail
+        error as e => teko::assert::is_true(teko::str::contains(e.message, "<top-level>"))
+    }
+}
+
+// (#109 W0) the ban must NOT false-positive on distinct types in distinct namespaces (the
+// ordinary, legitimate case), nor on same-name-same-namespace when there is only ONE decl.
+#test
+fn w0_distinct_namespaces_distinct_names_still_collect_ok() {
+    mut items = teko::list::push(teko::list::empty(), w0_empty_struct_item("Reader", "aa"))
+    items = teko::list::push(items, w0_empty_struct_item("Writer", "aa"))
+    items = teko::list::push(items, w0_empty_struct_item("Reader2", "bb"))
+    match collect(parser::Program { items = items }) {
+        Collected => teko::assert::is_true(true)
+        error    => teko::assert::is_true(false)
+    }
+}
+
+// (#109 W0 tightened exemption — soundness) a genuine USER type whose name carries the `__g__`
+// infix (the lexer accepts it in ordinary identifiers) must NOT slip through the ban via the
+// naive substring exemption: the strict predicate requires empty ns AND a generic base behind
+// the prefix. The verifier's exact bypass scenario: `Foo__g__Bar` in aa AND bb → the W0
+// cross-namespace error, exactly like any other bare-name duplicate.
+#test
+fn w0_user_type_with_g_infix_is_not_exempt() {
+    let items = teko::list::push(teko::list::push(teko::list::empty(), w0_empty_struct_item("Foo__g__Bar", "aa")), w0_empty_struct_item("Foo__g__Bar", "bb"))
+    match collect(parser::Program { items = items }) {
+        Collected => teko::assert::is_true(false)   // must fail — the old substring exemption let this through
+        error as e => {
+            teko::assert::is_true(teko::str::contains(e.message, "two types share the bare name"))
+            teko::assert::is_true(teko::str::contains(e.message, "Foo__g__Bar"))
+            teko::assert::is_true(teko::str::contains(e.message, "aa"))
+            teko::assert::is_true(teko::str::contains(e.message, "bb"))
+        }
+    }
+    // and at the TOP LEVEL (ns "", so condition (b) alone can't reject): with NO generic `Foo`
+    // base declared, condition (c) fails → still banned as an ordinary duplicate.
+    let top = teko::list::push(teko::list::push(teko::list::empty(), w0_empty_struct_item("Foo__g__Bar", "")), w0_empty_struct_item("Foo__g__Bar", ""))
+    match collect(parser::Program { items = top }) {
+        Collected => teko::assert::is_true(false)   // must fail
+        error as e2 => teko::assert::is_true(teko::str::contains(e2.message, "duplicate type"))
+    }
+}
+
+// (#109 W0 tightened exemption — positive control) REAL stamped generic instances stay exempt.
+// A dep-seeded table shaped like post-stamping state: the generic base `Box<T>` plus TWO stamped
+// `Box__g__i64` entries (both ns "" — e.g. two dep namespaces each instantiated Box<i64>, merged
+// into one seed). collect_with_seed's validate_type_decls sees the merged table and must NOT
+// report them as duplicates — all three strict-exemption conditions hold.
+#test
+fn w0_stamped_generic_instances_remain_exempt() {
+    mut seedtbl = box_generic_table()   // `type Box<T> = struct { value: T }` (the generic base)
+    let inst_fld = parser::Field { name = "value"; type_ann = ttype_named("i64"); vis = parser::Visibility::Pub; is_intern = false }
+    let inst_decl = parser::TypeDecl { name = "Box__g__i64"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::StructBody { fields = teko::list::push(teko::list::empty(), inst_fld); methods = teko::list::empty(); implements = teko::list::empty() }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }
+    seedtbl = teko::list::push(seedtbl, TypeReg { name = "Box__g__i64"; namespace = ""; vis = parser::Visibility::Private; decl = inst_decl })
+    seedtbl = teko::list::push(seedtbl, TypeReg { name = "Box__g__i64"; namespace = ""; vis = parser::Visibility::Private; decl = inst_decl })
+    let seed = Collected { types = seedtbl; env = empty_env() }
+    match collect_with_seed(parser::Program { items = teko::list::empty() }, seed) {
+        Collected => teko::assert::is_true(true)
+        error    => teko::assert::is_true(false)   // the strict exemption must still cover real stamps
+    }
+}

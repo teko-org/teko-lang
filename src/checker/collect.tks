@@ -528,7 +528,79 @@ fn check_conformance(type_name: str, own_methods: []parser::Function, implements
     null
 }
 
+// (#109 W0, tightened) is `reg` a monomorphization-STAMPED generic instance? The shared
+// name_is_g_instance is a naive `__g__` substring scan, and the lexer accepts `__g__` inside
+// ordinary identifiers — so a genuine USER type named e.g. `Foo__g__Bar` must NOT slip through
+// the duplicate ban on the marker alone. A registration is exempt only when ALL of:
+//   (a) the name carries the `__g__` infix,
+//   (b) the registration namespace is "" (stamped instances ALWAYS register with empty ns —
+//       resolve.tks::instantiate_types), and
+//   (c) the prefix before the FIRST `__g__` names a declared type WITH type_params somewhere
+//       in the table (a real generic base — `Foo__g__Bar` with no generic `Foo` fails this).
+// LOCAL predicate on purpose: name_is_g_instance keeps its broad substring semantics for the
+// mono pass (which only ever sees names IT stamped); only the W0 ban needs the strict form.
+fn w0_is_stamped_generic_reg(reg: TypeReg, table: TypeTable) -> bool {
+    if reg.namespace != "" { return false }
+    let name = reg.name
+    mut pos: u64 = name.len   // index of the FIRST `__g__`, or name.len when absent
+    mut i: u64 = 0
+    loop {
+        if i + 5 > name.len { break }
+        if name[i] == b'_' && name[i + 1] == b'_' && name[i + 2] == b'g' && name[i + 3] == b'_' && name[i + 4] == b'_' { pos = i; break }
+        i++
+    }
+    if pos == name.len { return false }   // no `__g__` infix at all
+    if pos == 0 { return false }          // an empty base prefix can never name a generic decl
+    let base = teko::str::slice_to(name, pos)
+    mut j: u64 = 0
+    loop {
+        if j >= table.len { break }
+        if table[j].decl.type_params.len > 0 && table[j].name == base { return true }
+        j++
+    }
+    false
+}
+
+// (#109 W0) fail-loud duplicate-registration ban — the first hardening step of the
+// namespace-aware type table redesign. Two errors, both O(n^2) over the collected table
+// (small — mirrors the interface-conflict scan above):
+//   1. same (namespace, name) registered twice = a real duplicate declaration.
+//   2. same BARE name registered under two DIFFERENT namespaces = TEMPORARILY banned (today's
+//      flat, namespace-blind lookups (type_table_find et al.) would silently conflate the two —
+//      W3 lifts this ban once resolution becomes namespace-aware).
+// EXEMPT: stamped generic-instance entries (w0_is_stamped_generic_reg — empty ns + a real
+// generic base behind the `__g__` infix) — monomorphization legitimately stamps many
+// `Base__g__<mangle>` instances that share the "" namespace bucket with every other stamped
+// instance; that's not a user-facing collision, and stamping already dedups by exact mangled
+// name (resolve.tks::instantiate_types's "already stamped" check).
+fn check_no_duplicate_types(table: TypeTable) -> error? {
+    mut i: u64 = 0
+    loop {
+        if i >= table.len { break }
+        if w0_is_stamped_generic_reg(table[i], table) { i++; continue }
+        mut j: u64 = i + 1
+        loop {
+            if j >= table.len { break }
+            if !w0_is_stamped_generic_reg(table[j], table) {
+                if table[i].name == table[j].name && table[i].namespace == table[j].namespace {
+                    let ns_label = if table[i].namespace == "" { "<top-level>" } else { table[i].namespace }
+                    return error { message = $"duplicate type '{table[i].name}' in namespace '{ns_label}'" }
+                }
+                if table[i].name == table[j].name && table[i].namespace != table[j].namespace {
+                    let ns1 = if table[i].namespace == "" { "<top-level>" } else { table[i].namespace }
+                    let ns2 = if table[j].namespace == "" { "<top-level>" } else { table[j].namespace }
+                    return error { message = $"two types share the bare name '{table[i].name}' — {ns1} and {ns2}; not yet supported (#109)" }
+                }
+            }
+            j++
+        }
+        i++
+    }
+    null
+}
+
 fn validate_type_decls(table: TypeTable) -> error? {
+    match check_no_duplicate_types(table) { error as e => return e; null => {} }   // (#109 W0)
     mut i = 0
     loop {
         if i >= table.len { break }
