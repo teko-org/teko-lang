@@ -44,6 +44,70 @@ fn check_enum_pattern(p: parser::Pattern, subject: Type, eb: parser::EnumBody, e
     }
 }
 
+// (#110) Is `named` a DIRECT case of `subject_variant` (the ONE-level-expanded subject), OR the
+// WHOLE subject itself (`raw_subject` — the pre-expansion type, e.g. a `Type as t` arm binding a
+// NAMED variant wholesale, not picking one case)? A case that is itself a nested variant must be
+// double-matched (`Outer as v => match v { Inner as i => … }`), never skip-matched directly —
+// that would require descending into a union the native codegen never synthesizes a tag for.
+// Returns true when `subject_variant` is not a variant at all (nothing to guard — the ordinary
+// resolve/typecheck path already validates non-variant subjects). Mirror of match.c::is_direct_case_of.
+fn is_direct_case_of(named: Type, subject_variant: Type, raw_subject: Type) -> bool {
+    if type_eq(named, raw_subject) { return true }   // binds the WHOLE subject, not a case of it
+    match subject_variant {
+        Variant as v => {
+            mut i = 0
+            loop {
+                if i >= v.members.len { break }
+                if type_eq(named, v.members[i]) { return true }
+                i++
+            }
+            false
+        }
+        _ => true
+    }
+}
+// (#110) find the DIRECT member of `subject` whose own (one-level) expansion contains `named` —
+// i.e. the outer case the caller should match FIRST before re-matching `named` inside it. Used
+// only to build a concrete, pasteable hint (`FooBar as v => match v { Foo as x => … }` rather than
+// the whole `FooBar | error` union, which is not a nameable bind pattern). Mirror of
+// match.c::find_containing_case (returns null when no direct member's expansion contains `named`).
+fn find_containing_case(named: Type, subject: Type, table: TypeTable) -> Type? {
+    match subject {
+        Variant as v => {
+            mut i = 0
+            loop {
+                if i >= v.members.len { break }
+                let mem = v.members[i]
+                match expand_variant(mem, table) {
+                    Variant as mv => {
+                        mut j = 0
+                        loop {
+                            if j >= mv.members.len { break }
+                            if type_eq(named, mv.members[j]) { return mem }
+                            j++
+                        }
+                    }
+                    _ => {}
+                }
+                i++
+            }
+            null
+        }
+        _ => null
+    }
+}
+// (#110) the skip-level-match diagnostic: "'Foo' is not a direct case of 'FooBar | error' —
+// match the outer case first (FooBar as v => match v { Foo as f => … })". When a direct member's
+// own expansion contains the arm's case (the common shape — a nested named variant), the hint
+// names THAT member (a real, pasteable bind pattern); otherwise it falls back to the whole subject.
+// Mirror of match.c::skip_level_error.
+fn skip_level_error(arm_type: Type, subject: Type, table: TypeTable) -> error {
+    let arm_s = type_render(arm_type)
+    let subj_s = type_render(subject)
+    let hint_s = match find_containing_case(arm_type, subject, table) { Type as t => type_render(t); null => subj_s }
+    error { message = $"'{arm_s}' is not a direct case of '{subj_s}' — match the outer case first ({hint_s} as v => match v {{ {arm_s} as x => … }})" }
+}
+
 // validate a pattern against the subject; return the env extended with bindings.
 fn check_pattern(p: parser::Pattern, subject: Type, env: Env, table: TypeTable) -> Env | error {
     // OPTIONAL subject `T?` (REBOOT_PLAN §202): `null` matches the NONE case (binds nothing);
@@ -73,12 +137,23 @@ fn check_pattern(p: parser::Pattern, subject: Type, env: Env, table: TypeTable) 
         }
         _ => {}
     }
+    // (#110) the subject's variant view — a NAMED alias of a `variant` decl expands to its Variant
+    // members (mirrors `exhaustive`); an already-inline `T | error` subject is unchanged. Used ONLY
+    // to reject SKIP-LEVEL arms below (a case of a NESTED/inner variant named directly against this
+    // outer subject) — native codegen only synthesizes tags for the subject's own direct union
+    // members, never for a member's own inner cases.
+    let subject_variant = expand_variant(subject, table)
     match p {
         parser::NullPattern       => return error { message = "`null` pattern requires an optional subject (`T?`) — REBOOT_PLAN §202" }
         parser::WildcardPattern   => env
         parser::BindPattern as bp => {
             // `[]T as x` resolves the slice TYPE-expr; a path bind resolves the named/builtin case.
             let ct = match bind_pattern_type(bp, table) { Type as t => t; error as e => return e }
+            // (#110) reject a SKIP-LEVEL arm: `ct` names a type that is not a direct case of the
+            // subject's own union (it may be a case of an INNER variant nested inside one of the
+            // subject's members). `is_direct_case_of` is a no-op (true) when the subject is not a
+            // variant at all, so ordinary struct/prim subjects are unaffected.
+            if !is_direct_case_of(ct, subject_variant, subject) { return skip_level_error(ct, subject_variant, table) }
             if !bp.has_binding { return env }      // bare case / `as _` discard — binds nothing
             define(env, bp.binding, ct, false)     // `Type as name` → name : the case type (match-binding immutable — B.21)
         }
@@ -96,6 +171,8 @@ fn check_pattern(p: parser::Pattern, subject: Type, env: Env, table: TypeTable) 
                 Named as n => n.name
                 _          => return error { message = "field pattern requires a struct type" }
             }
+            // (#110) same skip-level guard as the BIND arm above — `Type { f; g }` also names a case.
+            if !is_direct_case_of(nt, subject_variant, subject) { return skip_level_error(nt, subject_variant, table) }
             let decl = match type_table_find(table, name) {
                 parser::TypeDecl as td => td
                 error          => return error { message = $"unknown type in field pattern: {name}" }

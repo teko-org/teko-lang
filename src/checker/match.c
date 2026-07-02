@@ -1,6 +1,7 @@
 // src/checker/match.c
 #include "match.h"
 #include <string.h>
+#include <stdio.h>   // snprintf — the skip-level-match diagnostic (#110)
 
 // from typer.c — the typed expression pass + the struct field resolver
 // (forward-declared, both non-static, to avoid a match↔typer cycle).
@@ -13,6 +14,55 @@ static tk_env_result efail(tk_error e) { return (tk_env_result){ .ok = false, .a
 
 static bool name_eq(tk_str a, tk_str b);   // fwd (defined with the exhaustiveness helpers below)
 static tk_type_result bind_pattern_type(tk_pattern p, tk_type_table table);   // fwd (W9.4 — used by tk_check_pattern)
+
+// (#110) Is `named` a DIRECT case of `subject_variant` (the ONE-level-expanded subject), OR the
+// WHOLE subject itself (`raw_subject` — the pre-expansion type, e.g. a `Type as t` arm binding a
+// NAMED variant wholesale, not picking one case)? A case that is itself a nested variant must be
+// double-matched (`Outer as v => match v { Inner as i => … }`), never skip-matched directly —
+// that would require descending into a union the native codegen never synthesizes a tag for.
+// Returns true when `subject_variant` is not a variant at all (nothing to guard — the ordinary
+// resolve/typecheck path already validates non-variant subjects).
+static bool is_direct_case_of(tk_type named, tk_type subject_variant, tk_type raw_subject) {
+    if (tk_type_eq(&named, &raw_subject)) return true;   // binds the WHOLE subject, not a case of it
+    if (subject_variant.tag != TK_TYPE_VARIANT) return true;
+    for (size_t i = 0; i < subject_variant.as.variant.len; i += 1)
+        if (tk_type_eq(&named, &subject_variant.as.variant.members[i])) return true;
+    return false;
+}
+// (#110) find the DIRECT member of `subject` whose own (one-level) expansion contains `named` —
+// i.e. the outer case the caller should match FIRST before re-matching `named` inside it. Used
+// only to build a concrete, pasteable hint (`FooBar as v => match v { Foo as x => … }` rather than
+// the whole `FooBar | error` union, which is not a nameable bind pattern). Returns a NAMED type on
+// success; `named` itself unchanged (never used) when no direct member's expansion contains it —
+// the message then falls back to naming the raw subject.
+static bool find_containing_case(tk_type named, tk_type subject, tk_type_table table, tk_type *out) {
+    if (subject.tag != TK_TYPE_VARIANT) return false;
+    for (size_t i = 0; i < subject.as.variant.len; i += 1) {
+        tk_type mem = subject.as.variant.members[i];
+        tk_type mem_expanded = tk_expand_variant(mem, table);
+        if (mem_expanded.tag != TK_TYPE_VARIANT) continue;
+        for (size_t j = 0; j < mem_expanded.as.variant.len; j += 1) {
+            if (tk_type_eq(&named, &mem_expanded.as.variant.members[j])) { *out = mem; return true; }
+        }
+    }
+    return false;
+}
+// (#110) the skip-level-match diagnostic: "'Foo' is not a direct case of 'FooBar | error' —
+// match the outer case first (FooBar as v => match v { Foo as f => … })". When a direct member's
+// own expansion contains the arm's case (the common shape — a nested named variant), the hint
+// names THAT member (a real, pasteable bind pattern); otherwise it falls back to the whole subject.
+static tk_error skip_level_error(tk_type arm_type, tk_type subject, tk_type_table table) {
+    const char *arm_s = tk_type_render(arm_type);
+    const char *subj_s = tk_type_render(subject);
+    tk_type outer;
+    const char *hint_s = find_containing_case(arm_type, subject, table, &outer) ? tk_type_render(outer) : subj_s;
+    size_t len = strlen(arm_s) * 2 + strlen(subj_s) + strlen(hint_s) * 2 + 128;
+    char *buf = tk_alloc(len); if (!buf) abort();
+    int n = snprintf(buf, len, "'%s' is not a direct case of '%s' — match the outer case first (%s as v => match v { %s as x => … })",
+        arm_s, subj_s, hint_s, arm_s);
+    if (n < 0 || (size_t)n >= len) abort();   // cert-err33-c: handle the return — `len` was sized above, so truncation is an invariant break
+    return tk_error_make(buf);
+}
 
 // ENUM-subject pattern check (C7b): a bare/qualified path pattern names a MEMBER of the enum —
 // enum members carry NO data, so they bind nothing. `U8` and `PrimKind::U8` both name member "U8"
@@ -61,6 +111,12 @@ tk_env_result tk_check_pattern(tk_pattern p, tk_type subject, tk_env env, tk_typ
         if (d.ok && d.as.value.body.tag == TK_BODY_ENUM)
             return check_enum_pattern(p, subject, d.as.value.body.as.enum_body, env, table);
     }
+    // (#110) the subject's variant view — a NAMED alias of a `variant` decl expands to its
+    // TK_TYPE_VARIANT members (mirrors tk_exhaustive); an already-inline `T | error` subject is
+    // unchanged. Used ONLY to reject SKIP-LEVEL arms below (a case of a NESTED/inner variant named
+    // directly against this outer subject) — native codegen only synthesizes tags for the subject's
+    // own direct union members, never for a member's own inner cases.
+    tk_type subject_variant = tk_expand_variant(subject, table);
     switch (p.tag) {
         case TK_PAT_NULL:
             return efail(tk_error_make("`null` pattern requires an optional subject (`T?`) — REBOOT_PLAN §202"));
@@ -71,6 +127,12 @@ tk_env_result tk_check_pattern(tk_pattern p, tk_type subject, tk_env env, tk_typ
             // concrete instance `Foo__g__i64`, so the binding has the stamped type (fields visible).
             tk_type_result ct = bind_pattern_type(p, table);
             if (!ct.ok) return efail(ct.as.error);
+            // (#110) reject a SKIP-LEVEL arm: `ct` names a type that is not a direct case of the
+            // subject's own union (it may be a case of an INNER variant nested inside one of the
+            // subject's members). `is_direct_case_of` is a no-op (true) when the subject is not a
+            // variant at all, so ordinary struct/prim subjects are unaffected.
+            if (!is_direct_case_of(ct.as.value, subject_variant, subject))
+                return efail(skip_level_error(ct.as.value, subject_variant, table));
             if (!p.as.bind.has_binding) return eok(env);   // bare case / `as _` discard — binds nothing
             return eok(tk_env_define(env, p.as.bind.binding, ct.as.value, false));
         }
@@ -88,6 +150,9 @@ tk_env_result tk_check_pattern(tk_pattern p, tk_type subject, tk_env env, tk_typ
             tk_type_result nt = resolve_named(p.as.field.type_name, table);
             if (!nt.ok) return efail(nt.as.error);
             if (nt.as.value.tag != TK_TYPE_NAMED) return efail(tk_error_make("field pattern requires a struct type"));
+            // (#110) same skip-level guard as the BIND arm above — `Type { f; g }` also names a case.
+            if (!is_direct_case_of(nt.as.value, subject_variant, subject))
+                return efail(skip_level_error(nt.as.value, subject_variant, table));
             tk_decl_result decl = tk_type_table_find(table, nt.as.value.as.named.name);
             if (!decl.ok) return efail(tk_error_make("unknown type in field pattern"));
             if (decl.as.value.body.tag != TK_BODY_STRUCT) return efail(tk_error_make("type is not a struct (no fields)"));
