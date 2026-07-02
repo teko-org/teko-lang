@@ -326,3 +326,80 @@ fn tkb_tamper_caught() {
     let short = drop_last(bytes)
     match deserialize(short) { checker::TExpr => teko::assert::is_true(false); error => teko::assert::is_true(true) }
 }
+
+#test
+fn tkb_roundtrip_iface_dispatch_tag24() {
+    // (W10b.D3) tag 24 — a DYNAMIC contract-method call must round-trip the fields the plain
+    // call encoding (tag 7) does not carry: is_iface_dispatch, the resolved method Func (the
+    // vtable cast signature), and the vtable slot. callee = [Shape, area]; receiver = args[0].
+    let recv = checker::TExpr { kind = checker::TVar { name = "c"; is_func = false; func_ns = "" }; type = checker::Named { name = "Circle" }; line = 0; col = 0 }
+    mut segs: []parser::Segment = teko::list::push(teko::list::empty(), parser::Segment { name = "Shape" })
+    segs = teko::list::push(segs, parser::Segment { name = "area" })
+    let params: []checker::Type = teko::list::push(teko::list::empty(), checker::Named { name = "Shape" })
+    let pnames: []str = teko::list::push(teko::list::empty(), "self")
+    let mft = checker::Func { params = params; ret = i64ty(); variadic = false; param_names = pnames; n_required = 1; defaults = teko::list::empty() }
+    let args: []checker::TExpr = teko::list::push(teko::list::empty(), recv)
+    let orig = checker::TExpr { kind = checker::TCall { callee = parser::Path { segments = segs }; args = args; call_ns = ""; is_closure_call = false; callee_type = mft; is_iface_dispatch = true; iface_slot = 1 }; type = i64ty(); line = 0; col = 0 }
+    match deserialize(serialize(orig)) {
+        checker::TExpr as got => match got.kind {
+            checker::TCall as c => {
+                teko::assert::is_true(c.is_iface_dispatch)
+                teko::assert::is_true(c.iface_slot == 1)
+                teko::assert::is_true(c.callee.segments.len == 2)
+                teko::assert::is_true(c.callee.segments[0].name == "Shape")
+                teko::assert::is_true(c.callee.segments[1].name == "area")
+                // the method Func survives (params + ret — the codec's Func payload)
+                match c.callee_type {
+                    checker::Func as f => {
+                        teko::assert::is_true(f.params.len == 1)
+                        match f.params[0] { checker::Named as n => teko::assert::is_true(n.name == "Shape"); _ => teko::assert::is_true(false) }
+                        match f.ret { checker::Prim as p => teko::assert::is_true(p.kind == checker::PrimKind::I64); _ => teko::assert::is_true(false) }
+                    }
+                    _ => teko::assert::is_true(false)
+                }
+                // the receiver rides as args[0], narrow class type intact
+                teko::assert::is_true(c.args.len == 1)
+                match c.args[0].kind { checker::TVar as v => teko::assert::is_true(v.name == "c"); _ => teko::assert::is_true(false) }
+                match c.args[0].type { checker::Named as n => teko::assert::is_true(n.name == "Circle"); _ => teko::assert::is_true(false) }
+            }
+            _ => teko::assert::is_true(false)
+        }
+        error => teko::assert::is_true(false)
+    }
+}
+
+// (W10b.D3 codec fix — pat_match transparent-descent regressions) The tag-24 roundtrip above
+// caught a descent-conflation bug: `match ty { Prim => … }` over a `Func { ret = Prim }` subject
+// wrongly took the Prim arm by drilling through `ret`. These three lock the CORRECTED rule
+// directly at the VM's pat_match: descent is SKIPPED only for a MULTI-FIELD SIBLING of the target
+// (Func & Prim are both `Type` members) — a SINGLE-FIELD sibling wrapper (Optional/Slice) still
+// descends, per the wrapper-descent doctrine. A checker::Type case value is a plain StructVal in
+// the VM (its type_name is the case), so a bare-case arm exercises the descent path exactly.
+fn ty_prim() -> checker::Type { checker::Prim { kind = checker::PrimKind::I64 } }
+fn match_prim_arm(ty: checker::Type) -> str {
+    match ty { checker::Prim => "prim"; _ => "other" }
+}
+
+#test
+fn descent_multifield_sibling_no_descend() {
+    // Func { params; ret = Prim; … } is MULTI-FIELD and a SIBLING of Prim (both Type members):
+    // matching it against a bare `Prim` arm must NOT descend through `ret` → the `_` arm.
+    let f: checker::Type = checker::Func { params = teko::list::empty(); ret = ty_prim(); variadic = false; param_names = teko::list::empty(); n_required = 0; defaults = teko::list::empty() }
+    teko::assert::is_true(match_prim_arm(f) == "other")
+}
+
+#test
+fn descent_singlefield_optional_wrapper_descends() {
+    // Optional { inner = Prim } is SINGLE-FIELD (a wrapper): matching it against a bare `Prim`
+    // arm STILL descends into `inner` → the `Prim` arm (doctrine — the case the coarse sibling
+    // gate wrongly broke).
+    let o: checker::Type = checker::Optional { inner = ty_prim() }
+    teko::assert::is_true(match_prim_arm(o) == "prim")
+}
+
+#test
+fn descent_singlefield_slice_wrapper_descends() {
+    // Slice { element = Prim } is SINGLE-FIELD (a wrapper) — the cheap control: descent preserved.
+    let s: checker::Type = checker::Slice { element = ty_prim() }
+    teko::assert::is_true(match_prim_arm(s) == "prim")
+}

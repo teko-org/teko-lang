@@ -1408,7 +1408,7 @@ fn plainfn(name: str, ret: Type, body: []TStatement) -> TFunction {
 fn tcall1(name: str, arg: TExpr, rt: Type) -> TExpr {
     let callee = parser::Path { segments = teko::list::push(teko::list::empty(), parser::Segment { name = name }) }
     let args = teko::list::push(teko::list::empty(), arg)
-    TExpr { kind = TCall { callee = callee; args = args; call_ns = ""; is_closure_call = false; callee_type = Void { } }; type = rt; line = 0; col = 0 }
+    TExpr { kind = TCall { callee = callee; args = args; call_ns = ""; is_closure_call = false; callee_type = Void { }; is_iface_dispatch = false; iface_slot = 0 }; type = rt; line = 0; col = 0 }
 }
 fn texpr_stmt(e: TExpr) -> TStatement { TExprStmt { expr = e } }
 fn treturn(e: TExpr) -> TStatement { TReturn { has_value = true; value = e } }
@@ -2265,15 +2265,16 @@ fn iface_extends_non_interface_is_error() {
 }
 
 #test
-fn iface_as_value_type_is_error() {
-    // an interface has NO runtime representation yet — using it as a field type is an honest stop.
+fn iface_as_value_type_is_ok() {
+    // (W10b.D3) an interface IS a value type now — a contract-typed field (data + vtable fat
+    // pointer) type-checks. (This test asserted the ROUND 2 honest stop until D3 landed.)
     let ifc = iface_item("Greetable", list1(iface_method("greet")), teko::list::empty())
     let fld = parser::Field { name = "g"; type_ann = named_t("Greetable"); vis = parser::Visibility::Pub; is_intern = false }
     let holder = parser::Item { content = parser::TypeDecl { name = "Holder"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::StructBody { fields = teko::list::push(teko::list::empty(), fld); methods = teko::list::empty(); implements = teko::list::empty() }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }; namespace = ""; file = "" }
     let items = teko::list::push(teko::list::push(teko::list::empty(), ifc), holder)
     match type_program(parser::Program { items = items }) {
-        TProgram => teko::assert::is_true(false)   // interface as a value/field type -> must fail
-        error    => teko::assert::is_true(true)
+        TProgram => teko::assert::is_true(true)    // interface as a value/field type -> allowed (D3)
+        error    => teko::assert::is_true(false)
     }
 }
 
@@ -2535,5 +2536,72 @@ fn d1_struct_literal_stays_free() {
     match type_program(parser::Program { items = items }) {
         TProgram => teko::assert::is_true(true)
         error    => teko::assert::is_true(false)   // struct init is FREE — must NOT fail
+    }
+}
+
+// --- (W10b.D2, 2026-07-02) interface atoms in `<T: I>` constraints — NOMINAL conformance -----
+// A generic fn `fn hold<T: <iface>>(x: T) -> T { return x }` (the opaque hold).
+fn generic_hold_fn(iface: str) -> parser::Item {
+    let tp = teko::list::push(teko::list::empty(), "T")
+    let tc: []parser::ConstraintExpr = teko::list::push(teko::list::empty(), parser::ConstraintAtom { name = iface })
+    let params = teko::list::push(teko::list::empty(), parser::Param { name = "x"; has_type = true; type_ann = named_t("T"); is_params = false; has_default = false; default_expr = e_num(0) })
+    let body: []parser::Statement = teko::list::push(teko::list::empty(), parser::Return { has_value = true; value = e_var("x") })
+    let f = parser::Function { name = "holdc"; type_params = tp; type_constraints = tc; params = params; has_return = true; return_type = named_t("T"); body = body; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false }
+    parser::Item { content = f; namespace = ""; file = "" }
+}
+// `let p = <StructName> { }` then `holdc(p)` as a loose statement pair.
+fn hold_call_items(struct_name: str) -> []parser::Item {
+    let lit = ek(parser::StructLit { type_path = path1(struct_name); type_args = teko::list::empty(); field_names = teko::list::empty(); field_vals = teko::list::empty() })
+    let bind = parser::Binding { kind = parser::BindKind::Let; target = parser::SimpleName { name = "p" }; has_type = false; type_ann = named_t("i64"); value = lit }
+    let callargs = teko::list::push(teko::list::empty(), e_var("p"))
+    let call = st(ek(parser::Call { callee = path1("holdc"); args = callargs; arg_names = pos_names(callargs.len) }))
+    let items = teko::list::push(teko::list::empty(), parser::Item { content = bind; namespace = ""; file = "" })
+    teko::list::push(items, parser::Item { content = call; namespace = ""; file = "" })
+}
+
+// a CONFORMING struct (declared `implements`) satisfies the interface atom at monomorphization.
+#test
+fn iface_constraint_conforming_struct_ok() {
+    let ifc = iface_item("Greetable", list1(iface_method("greet")), teko::list::empty())
+    let imp = impl_struct_item("Hi", list1(impl_method("greet", parser::Visibility::Private)), slist1("Greetable"))
+    mut items = teko::list::push(teko::list::push(teko::list::empty(), ifc), imp)
+    items = teko::list::push(items, generic_hold_fn("Greetable"))
+    let tail = hold_call_items("Hi")
+    items = teko::list::push(teko::list::push(items, tail[0]), tail[1])
+    match type_program(parser::Program { items = items }) {
+        TProgram => teko::assert::is_true(true)
+        error    => teko::assert::is_true(false)
+    }
+}
+
+// a NON-conforming struct (has the method but NEVER declares `implements`) is REJECTED —
+// conformance is nominal/declared, never structural.
+#test
+fn iface_constraint_nonconforming_struct_is_error() {
+    let ifc = iface_item("Greetable", list1(iface_method("greet")), teko::list::empty())
+    let imp = impl_struct_item("Loner", list1(impl_method("greet", parser::Visibility::Private)), teko::list::empty())   // NO implements
+    mut items = teko::list::push(teko::list::push(teko::list::empty(), ifc), imp)
+    items = teko::list::push(items, generic_hold_fn("Greetable"))
+    let tail = hold_call_items("Loner")
+    items = teko::list::push(teko::list::push(items, tail[0]), tail[1])
+    match type_program(parser::Program { items = items }) {
+        TProgram => teko::assert::is_true(false)   // must fail the constraint at instantiation
+        error    => teko::assert::is_true(true)
+    }
+}
+
+// (W10b.D3) an interface may NOT be a variant member yet (the VM's untagged class values
+// cannot discriminate `I | error` — an honest checker stop, never an engine divergence).
+#test
+fn iface_variant_member_is_error() {
+    let ifc = iface_item("Greetable", list1(iface_method("greet")), teko::list::empty())
+    let uni = parser::UnionType { members = teko::list::push(teko::list::push(teko::list::empty(), named_t("Greetable")), named_t("error")) }
+    // an INLINE union in a fn's return annotation — resolved at collect time, so the ban fires.
+    let body: []parser::Statement = teko::list::push(teko::list::empty(), parser::Return { has_value = true; value = ek(parser::StructLit { type_path = path1("error"); type_args = teko::list::empty(); field_names = teko::list::push(teko::list::empty(), "message"); field_vals = teko::list::push(teko::list::empty(), e_str("x")) }) })
+    let f = parser::Function { name = "gf"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = teko::list::empty(); has_return = true; return_type = uni; body = body; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false }
+    let items = teko::list::push(teko::list::push(teko::list::empty(), ifc), parser::Item { content = f; namespace = ""; file = "" })
+    match type_program(parser::Program { items = items }) {
+        TProgram => teko::assert::is_true(false)   // must fail
+        error    => teko::assert::is_true(true)
     }
 }

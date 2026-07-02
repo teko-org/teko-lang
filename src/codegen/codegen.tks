@@ -376,6 +376,15 @@ fn cg_is_class_named(prog: checker::TProgram, name: str) -> bool {
     }
 }
 
+// (W10b.D3) is `name` an interface (a contract)? A contract-typed value lowers to the fat
+// pointer `{ data, vtable }` typedef; upcasts and dynamic method calls key off this probe.
+fn cg_is_interface_named(prog: checker::TProgram, name: str) -> bool {
+    match cg_find_decl(prog, name) {
+        parser::TypeDecl as td => match td.body { parser::InterfaceBody => true; _ => false }
+        error => false
+    }
+}
+
 // (W10b.CLASS increment 4) SOUNDNESS GUARD: does expression `e` read `name` ANYWHERE, with NO
 // exemptions? This is DELIBERATELY NOT escape.tks's `mark_expr` — that walker's "a scalar field
 // off a bare local is a safe stack-member copy" refinement is sound for an ordinary STRUCT
@@ -458,12 +467,22 @@ fn cg_expr_refs_name(e: checker::TExpr, name: str) -> bool {
 // null if the class isn't destructible. Scoped assumption: one class of a given bare name per
 // program (a name collision across namespaces both with a `destruct` is not disambiguated here).
 fn cg_find_destruct_ns(prog: checker::TProgram, class_name: str) -> str? {
+    cg_find_method_ns(prog, class_name, "destruct")
+}
+
+// (W10b.D3, generalized from increment 4's destruct lookup) does `class_name` provide a method
+// named `method` (own or inherited — `type_struct_methods` stamps EVERY effective method under
+// the OWNING class's own namespace, so searching for a TFunction named `method` whose namespace's
+// last segment is `class_name` finds it either way)? Returns that method's mangled NAMESPACE (for
+// cb_fn_name) or null. Scoped assumption: one class of a given bare name per program (a name
+// collision across namespaces is not disambiguated here). Mirror of codegen.c::cg_find_method_ns.
+fn cg_find_method_ns(prog: checker::TProgram, class_name: str, method: str) -> str? {
     mut i = 0
     loop {
         if i >= prog.items.len { break }
         match prog.items[i] {
             checker::TFunction as tf => {
-                if tf.name == "destruct" {
+                if tf.name == method {
                     if tf.namespace == class_name { return tf.namespace }
                     if teko::str::ends_with(tf.namespace, "::" ~ class_name) { return tf.namespace }
                 }
@@ -1571,10 +1590,61 @@ fn emit_list_push(buf: []byte, prog: checker::TProgram, e: checker::TExpr, c: ch
     out
 }
 
+// (W10b.D3) a DYNAMIC contract-method call through an interface value's vtable, as a GNU
+// statement-expression: bind the receiver ONCE (args[0] — a class instance is upcast on the fly
+// by emit_as, an interface value passes through), then cast slot `iface_slot`'s code pointer to
+// the method's concrete C signature — `R (*)(void *, params…)`, the receiver riding as the
+// ABI-identical `void *` data word — and call it. Rides emit_closure_call's cast-and-call scheme
+// (the tk_closure machinery the plan's D3 row names). Mirror of codegen.c::emit_iface_call.
+fn emit_iface_call(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, c: checker::TCall, escaping: []str, regions: []RegionFrame, fn_body: []checker::TStatement, dctx: DeferCtx) -> []byte | error {
+    let p = c.callee
+    let f = match c.callee_type { checker::Func as ff => ff; _ => return error { message = "codegen: malformed interface-dispatch node (internal)" } }
+    if p.segments.len < 2 || c.args.len == 0 || c.args.len != f.params.len {
+        return error { message = "codegen: malformed interface-dispatch node (internal)" }
+    }
+    let iface = p.segments[p.segments.len - 2].name
+    let t = fresh_named("_tid", buf.len to i64)
+    mut out = cb(buf, "({ ")
+    out = mangle_type_name(out, "", iface)
+    out = cb(out, " ")
+    out = cb(out, t)
+    out = cb(out, " = ")
+    let iface_t = checker::Named { name = iface }
+    out = match emit_as_r(out, prog, ret_type, iface_t, c.args[0], escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
+    out = cb(out, "; ((")
+    out = match emit_type(out, prog, f.ret) { []byte as o => o; error as err => return err }
+    out = cb(out, " (*)(void *")
+    mut pi: u64 = 1
+    loop {
+        if pi >= f.params.len { break }
+        out = cb(out, ", ")
+        out = match emit_type(out, prog, f.params[pi]) { []byte as o => o; error as err => return err }
+        pi++
+    }
+    out = cb(out, "))")
+    out = cb(out, t)
+    out = cb(out, ".vtable[")
+    out = cb(out, teko::u64_to_str(c.iface_slot to u64))
+    out = cb(out, "])(")
+    out = cb(out, t)
+    out = cb(out, ".data")
+    mut ai: u64 = 1
+    loop {
+        if ai >= c.args.len { break }
+        out = cb(out, ", ")
+        out = match emit_as_r(out, prog, ret_type, f.params[ai], c.args[ai], escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
+        ai++
+    }
+    cb(out, "); })")
+}
+
 // emit_call — a TCall. The callee path -> a C identifier joined by "__" (single-segment
 // in M0). Non-shadowable built-ins `print`/`println` (bare, or under `teko`) map to
 // tk_print/tk_println. (C: TK_TEXPR_CALL branch.)
 fn emit_call(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, e: checker::TExpr, c: checker::TCall, escaping: []str, regions: []RegionFrame, fn_body: []checker::TStatement, dctx: DeferCtx) -> []byte | error {
+    // (W10b.D3) a DYNAMIC contract-method call dispatches through the receiver's vtable —
+    // FIRST, before any builtin name-sniffing below could collide with a method name.
+    if c.is_iface_dispatch { return emit_iface_call(buf, prog, ret_type, c, escaping, regions, fn_body, dctx) }
     let p = c.callee
     // teko::list::empty / push — the SLICE (collection) builtins, FIXED+COPY. `empty()`
     // (sentinel) is normally wrapped by emit_as into a concrete slot literal; reaching here
@@ -3015,6 +3085,32 @@ fn cg_wrap_elem_str(buf: []byte, prog: checker::TProgram, expected: checker::Typ
         }
         _ => { }
     }
+    // (W10b.D3) T is a CONTRACT (interface) and the element a conforming CLASS: wrap the element
+    // lvalue into the fat pointer, exactly like emit_as's value-position upcast — this is how a
+    // homogeneous `[]Circle` value covariant-rebuilds into a `[]Shape` slot.
+    match expected {
+        checker::Named as en => {
+            if cg_is_interface_named(prog, en.name) {
+                match vtype {
+                    checker::Named as vn => {
+                        if cg_is_class_named(prog, vn.name) {
+                            mut o = cb(buf, "(")
+                            o = mangle_type_name(o, "", en.name)
+                            o = cb(o, "){ .data = (void *)(")
+                            o = cb(o, cexpr)
+                            o = cb(o, "), .vtable = tk_vt_")
+                            o = cb(o, vn.name)
+                            o = cb(o, "_")
+                            o = cb(o, en.name)
+                            return cb(o, " }")
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
     // not optional → variant-wrap when the element's key reaches T, else emit it bare (the same
     // reachability guard the C caller applies before emit_variant_wrap_str).
     let ukey = match cg_member_key_str(vtype) { str as s => s; error => "" }
@@ -3331,6 +3427,32 @@ fn emit_as_r(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, expe
             }
         }
         _ => { }
+    }
+    // (W10b.D3) CONTRACT (interface) slot: a CLASS instance upcasts into the fat pointer — the
+    // object pointer rides `data`, the (class, contract) static vtable rides `vtable`. An
+    // already-contract-typed value falls through and is emitted plainly (same C typedef).
+    match expected {
+        checker::Named as en => {
+            if cg_is_interface_named(prog, en.name) {
+                match value.type {
+                    checker::Named as vn => {
+                        if cg_is_class_named(prog, vn.name) {
+                            mut io = cb(buf, "(")
+                            io = mangle_type_name(io, "", en.name)
+                            io = cb(io, "){ .data = (void *)(")
+                            io = match emit_expr_ctx(io, prog, ret_type, value, escaping, regions, fn_body, dctx) { []byte as r => r; error as err => return err }
+                            io = cb(io, "), .vtable = tk_vt_")
+                            io = cb(io, vn.name)
+                            io = cb(io, "_")
+                            io = cb(io, en.name)
+                            return cb(io, " }")
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
     }
     // VARIANT slot wrap (B-cg2) — DIRECT or TRANSITIVE (case→variant→variant). The member is
     // identified by RESOLVED-TYPE equality (the value's KEY == a reachable member's key), so a
@@ -6186,7 +6308,7 @@ fn cg_lift_expr(e: checker::TExpr, acc: Ref<StampAcc>) -> checker::TExpr {
             mut args: []checker::TExpr = teko::list::empty()
             mut i = 0
             loop { if i >= cl.args.len { break }; args = teko::list::push(args, cg_lift_expr(cl.args[i], acc)); i++ }
-            checker::TExpr { kind = checker::TCall { callee = cl.callee; args = args; call_ns = cl.call_ns; is_closure_call = cl.is_closure_call; callee_type = cl.callee_type }; type = e.type; line = e.line; col = e.col }
+            checker::TExpr { kind = checker::TCall { callee = cl.callee; args = args; call_ns = cl.call_ns; is_closure_call = cl.is_closure_call; callee_type = cl.callee_type; is_iface_dispatch = cl.is_iface_dispatch; iface_slot = cl.iface_slot }; type = e.type; line = e.line; col = e.col }
         }
         checker::TIfExpr as f      => checker::TExpr { kind = checker::TIfExpr { cond = cg_lift_expr(f.cond, acc); then_blk = cg_lift_block(f.then_blk, acc); has_else = f.has_else; else_blk = cg_lift_block(f.else_blk, acc) }; type = e.type; line = e.line; col = e.col }
         checker::TMatchExpr as m   => {
@@ -6353,6 +6475,15 @@ fn tk_emit_c(prog0: checker::TProgram) -> str | error {
                         b = mangle_type_name(b, "", d.name)
                         b = cb(b, ";\n")
                     }
+                    // (W10b.D3) an INTERFACE (contract) value is a data+vtable FAT POINTER — the
+                    // tk_closure-shaped two-word rep. It embeds nothing and nothing orders before
+                    // it, so the FULL typedef lands here in the forward pass (a class/struct field
+                    // of contract type then just works).
+                    parser::InterfaceBody => {
+                        b = cb(b, "typedef struct { void *data; void *const *vtable; } ")
+                        b = mangle_type_name(b, "", d.name)
+                        b = cb(b, ";\n")
+                    }
                     _ => { }   // enum / alias: no forward typedef
                 }
             }
@@ -6386,6 +6517,60 @@ fn tk_emit_c(prog0: checker::TProgram) -> str | error {
             _ => { }
         }
         pi++
+    }
+    b = cb(b, "\n")
+    // (W10b.D3) per-(class, contract) VTABLES — one static table per conforming pair, built at
+    // COMPILE time (conformance is nominal and closed-world; no runtime reflection). Slot i is
+    // the contract's i-th EFFECTIVE method (extends-transitive first, then own — the checker's
+    // iface_slot agrees by construction). Identical signatures across contracts share the SAME
+    // fn-ptr for free: every slot points at the class's ONE stamped method function. Emitted
+    // after the prototypes (the fn names must be declared) and before any body; `-w` on the
+    // generated C keeps an unused table warning-free.
+    let vt_table = checker::type_table_of(prog)
+    mut vci = 0
+    loop {
+        if vci >= prog.items.len { break }
+        match prog.items[vci] {
+            parser::TypeDecl as cd => {
+                let cd_is_class = match cd.body { parser::ClassBody => true; _ => false }
+                if cd_is_class {
+                    mut vii = 0
+                    loop {
+                        if vii >= prog.items.len { break }
+                        match prog.items[vii] {
+                            parser::TypeDecl as idd => {
+                                let idd_is_iface = match idd.body { parser::InterfaceBody => true; _ => false }
+                                if idd_is_iface && checker::type_conforms_to(cd.name, idd.name, vt_table) {
+                                    let ms = match checker::iface_methods_by_name(idd.name, vt_table) { []parser::Function as f => f; error => return error { message = "codegen: interface method list failed (internal)" } }
+                                    b = cb(b, "static void *const tk_vt_")
+                                    b = cb(b, cd.name)
+                                    b = cb(b, "_")
+                                    b = cb(b, idd.name)
+                                    b = cb(b, "[] = {")
+                                    if ms.len == 0 { b = cb(b, " (void *)0") }   // a methodless contract still gets a (never-indexed) one-slot table
+                                    mut vmi: u64 = 0
+                                    loop {
+                                        if vmi >= ms.len { break }
+                                        let mns = match cg_find_method_ns(prog, cd.name, ms[vmi].name) {
+                                            str as ns2 => ns2
+                                            null => return error { message = "codegen: conforming class is missing an interface method's stamped function (internal)" }
+                                        }
+                                        b = cb(b, if vmi == 0 { " (void *)&" } else { ", (void *)&" })
+                                        b = cb_fn_name(b, mns, ms[vmi].name)
+                                        vmi++
+                                    }
+                                    b = cb(b, " };\n")
+                                }
+                            }
+                            _ => { }
+                        }
+                        vii++
+                    }
+                }
+            }
+            _ => { }
+        }
+        vci++
     }
     b = cb(b, "\n")
     // (W10) CAPTURING lambdas: env-struct typedefs + lifted-fn forward declarations (so a closure

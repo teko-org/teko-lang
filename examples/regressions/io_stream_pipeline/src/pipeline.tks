@@ -1,0 +1,302 @@
+// (IO0) differential regression: the language mechanisms the teko::io stream layer
+// (src/io/stream.tks) is built on, end-to-end on BOTH engines — value-functional byte
+// regions (struct methods returning new values), state-threading reader/writer steps,
+// Ref-capture closure factories (the MEM-1b-ii shared-mutation cell), function-type
+// aliases with union returns, and the copy/limit/buffered combinator shapes.
+//
+// SELF-CONTAINED twin: a standalone project cannot see the compiler corpus's stdlib
+// namespaces yet (teko::io/teko::regex are in scope only when building the compiler
+// itself — stdlib distribution arrives with packages), so this fixture re-declares a
+// compact io-lite with the SAME algorithms. The real module's tests live in
+// src/io/stream_test.tkt (the corpus .tkt gate, both engines); THIS fixture pins the
+// native==VM behavior of the underlying constructs.
+//
+// Exit-code protocol ONLY (no output): each failure exits with its own code; success
+// exits 0 (scripts/diff_vm_native.sh compares exit codes + stdout across engines).
+// No externs on purpose — an extern call would make the fixture NATIVE_ONLY (the VM
+// refuses foreign C calls by design, C7.1a) and lose the differential comparison.
+
+// ── the byte region (value-functional: growing returns a NEW region) ────────────────────
+
+pub type Region = struct {
+    data: []byte
+
+    fn empty() -> Region { Region { data = teko::list::empty() } }
+
+    fn from_str(s: str) -> Region { Region { data = bytes_of_str(s) } }
+
+    fn len(self) -> u64 { self.data.len }
+
+    fn push(self, b: byte) -> Region { Region { data = teko::list::push(self.data, b) } }
+
+    fn concat(self, other: Region) -> Region {
+        mut grown = self.data
+        mut i: u64 = 0
+        loop {
+            if i >= other.data.len { break }
+            grown = teko::list::push(grown, other.data[i])
+            i++
+        }
+        Region { data = grown }
+    }
+
+    fn slice(self, from: u64, to: u64) -> Region | error {
+        if from > to { return error { message = "slice: from > to" } }
+        if to > self.data.len { return error { message = "slice: out of bounds" } }
+        mut out: []byte = teko::list::empty()
+        mut i = from
+        loop {
+            if i >= to { break }
+            out = teko::list::push(out, self.data[i])
+            i++
+        }
+        Region { data = out }
+    }
+
+    fn to_str(self) -> str | error { str_from_utf8(self.data) }
+}
+
+// ── state-threading in-memory streams (B.7: return the advanced state) ──────────────────
+
+pub type ReadStep = struct { reader: MemReader; bytes: Region }
+
+pub type MemReader = struct {
+    buf: Region
+    pos: u64
+
+    fn of_str(s: str) -> MemReader { MemReader { buf = Region::from_str(s); pos = 0 } }
+
+    fn read_step(self, max: u64) -> ReadStep {
+        let total = self.buf.len()
+        if self.pos >= total || max == 0 {
+            return ReadStep { reader = self; bytes = Region::empty() }
+        }
+        mut take = total - self.pos
+        if take > max { take = max }
+        let chunk = match self.buf.slice(self.pos, self.pos + take) {
+            Region as r => r
+            error       => Region::empty()   // unreachable: bounds in range by construction
+        }
+        ReadStep { reader = MemReader { buf = self.buf; pos = self.pos + take }; bytes = chunk }
+    }
+}
+
+pub type WriteStep = struct { writer: MemWriter; written: u64 }
+
+pub type MemWriter = struct {
+    buf: Region
+
+    fn empty() -> MemWriter { MemWriter { buf = Region::empty() } }
+
+    fn write_step(self, from: Region) -> WriteStep {
+        WriteStep { writer = MemWriter { buf = self.buf.concat(from) }; written = from.len() }
+    }
+}
+
+// ── the closure stream layer (Ref-capture statefulness) ─────────────────────────────────
+
+pub type ReadFn  = (u64) -> Region | error
+pub type WriteFn = (Region) -> u64 | error
+
+pub fn mem_read_fn(source: Ref<MemReader>) -> ReadFn {
+    let lifted: ReadFn = (max: u64) => {
+        let step = source.value.read_step(max)
+        source.value = step.reader
+        step.bytes
+    }
+    lifted
+}
+
+pub fn mem_write_fn(sink: Ref<MemWriter>) -> WriteFn {
+    let lifted: WriteFn = (from: Region) => {
+        let step = sink.value.write_step(from)
+        sink.value = step.writer
+        step.written
+    }
+    lifted
+}
+
+// ── combinators (same shapes as teko::io read_all/copy/limit/buffered) ──────────────────
+
+pub fn write_all(dst: WriteFn, from: Region) -> u64 | error {
+    mut remaining = from
+    mut total: u64 = 0
+    loop {
+        if remaining.len() == 0 { break }
+        let taken = match dst(remaining) { u64 as n => n; error as e => return e }
+        if taken == 0 { return error { message = "write_all: no progress" } }
+        if taken > remaining.len() { return error { message = "write_all: over-report" } }
+        remaining = match remaining.slice(taken, remaining.len()) {
+            Region as rest => rest
+            error          => Region::empty()   // unreachable: taken <= len by the guard above
+        }
+        total = total + taken
+    }
+    total
+}
+
+pub fn copy(dst: WriteFn, src: ReadFn) -> u64 | error {
+    mut total: u64 = 0
+    loop {
+        let chunk = match src(4096) { Region as r => r; error as e => return e }
+        if chunk.len() == 0 { break }
+        let moved = match write_all(dst, chunk) { u64 as n => n; error as e => return e }
+        total = total + moved
+    }
+    total
+}
+
+pub type LimitState = struct {
+    remaining: u64
+    fn of(limit: u64) -> LimitState { LimitState { remaining = limit } }
+}
+
+pub fn limit_read_fn(src: ReadFn, state: Ref<LimitState>) -> ReadFn {
+    let limited: ReadFn = (max: u64) => {
+        mut want = state.value.remaining
+        if want > max { want = max }
+        if want == 0 { return Region::empty() }
+        match src(want) {
+            Region as chunk => {
+                state.value = LimitState { remaining = state.value.remaining - chunk.len() }
+                chunk
+            }
+            error as e => e
+        }
+    }
+    limited
+}
+
+pub type BufReaderState = struct {
+    pending: Region
+    pos: u64
+    fn fresh() -> BufReaderState { BufReaderState { pending = Region::empty(); pos = 0 } }
+}
+
+pub fn buffered_read_fn(src: ReadFn, state: Ref<BufReaderState>, chunk_size: u64) -> ReadFn {
+    let buffered: ReadFn = (max: u64) => {
+        if max == 0 { return Region::empty() }
+        mut current = state.value
+        if current.pos >= current.pending.len() {
+            match src(chunk_size) {
+                Region as gulp => {
+                    if gulp.len() == 0 { return Region::empty() }
+                    current = BufReaderState { pending = gulp; pos = 0 }
+                }
+                error as e => {
+                    let failed: Region | error = e
+                    return failed
+                }
+            }
+        }
+        mut take = current.pending.len() - current.pos
+        if take > max { take = max }
+        match current.pending.slice(current.pos, current.pos + take) {
+            Region as chunk => {
+                state.value = BufReaderState { pending = current.pending; pos = current.pos + take }
+                chunk
+            }
+            error as e => e
+        }
+    }
+    buffered
+}
+
+pub type BufWriterState = struct {
+    pending: Region
+    fn fresh() -> BufWriterState { BufWriterState { pending = Region::empty() } }
+}
+
+pub fn buffered_write_fn(dst: WriteFn, state: Ref<BufWriterState>, capacity: u64) -> WriteFn {
+    let buffered: WriteFn = (from: Region) => {
+        let combined = state.value.pending.concat(from)
+        if combined.len() < capacity {
+            state.value = BufWriterState { pending = combined }
+            return from.len()
+        }
+        match write_all(dst, combined) {
+            u64 => {
+                state.value = BufWriterState { pending = Region::empty() }
+                from.len()
+            }
+            error as e => e
+        }
+    }
+    buffered
+}
+
+pub fn flush_write(dst: WriteFn, state: Ref<BufWriterState>) -> u64 | error {
+    let pending = state.value.pending
+    if pending.len() == 0 { return 0 to u64 }
+    let flushed = match write_all(dst, pending) { u64 as n => n; error as e => return e }
+    state.value = BufWriterState { pending = Region::empty() }
+    flushed
+}
+
+// ── the checks (exit-code protocol) ─────────────────────────────────────────────────────
+
+// stage 0 — the value-threading step API used DIRECTLY (no closures): the reader/writer
+// values are unchanged by a step; the step carries the advanced state (B.7).
+pub fn check_value_steps() -> i64 {
+    let reader = MemReader::of_str("abcdef")
+    let first = reader.read_step(3)
+    let first_text = match first.bytes.to_str() { str as s => s; error => return 1 }
+    if first_text != "abc" { return 2 }
+    if reader.pos != 0 { return 3 }          // the original reader is UNCHANGED
+    if first.reader.pos != 3 { return 4 }
+    let rest = first.reader.read_step(100)
+    if rest.reader.read_step(1).bytes.len() != 0 { return 5 }   // EOF = empty, not an error
+    let writer = MemWriter::empty()
+    let wrote = writer.write_step(first.bytes)
+    if wrote.written != 3 { return 6 }
+    if writer.buf.len() != 0 { return 7 }    // the original writer is UNCHANGED
+    let echoed = match wrote.writer.buf.to_str() { str as s => s; error => return 8 }
+    if echoed != "abc" { return 9 }
+    0
+}
+
+// stage 1 — the region is a value: growing returns a NEW region.
+pub fn check_region_values() -> i64 {
+    let base = Region::from_str("ab")
+    let grown = base.push(b'c')
+    if base.len() != 2 { return 11 }
+    if grown.len() != 3 { return 12 }
+    let text = match grown.to_str() { str as s => s; error => return 13 }
+    if text != "abc" { return 14 }
+    match base.slice(2, 1) { Region => return 15; error => {} }   // from > to must fail
+    0
+}
+
+// stage 2 — Ref-capture closures advance caller-owned state visibly.
+pub fn check_closure_state() -> i64 {
+    mut reader = MemReader::of_str("hello, teko")
+    let src = mem_read_fn(reader)
+    let first = match src(5) { Region as r => r; error => return 21 }
+    let first_text = match first.to_str() { str as s => s; error => return 22 }
+    if first_text != "hello" { return 23 }
+    if reader.pos != 5 { return 24 }   // the caller's mut state advanced (M.2)
+    0
+}
+
+// stage 3 — the full pipeline: source → buffered → limited → copy → buffered sink → flush.
+pub fn check_pipeline() -> i64 {
+    mut reader = MemReader::of_str("the quick brown fox")
+    mut read_buffer = BufReaderState::fresh()
+    mut cap = LimitState::of(9)
+    mut writer = MemWriter::empty()
+    mut write_buffer = BufWriterState::fresh()
+    let sink = mem_write_fn(writer)
+    let buffered_source = buffered_read_fn(mem_read_fn(reader), read_buffer, 4)
+    let limited_source = limit_read_fn(buffered_source, cap)
+    let buffered_sink = buffered_write_fn(sink, write_buffer, 3)
+    let moved = match copy(buffered_sink, limited_source) { u64 as n => n; error => return 31 }
+    if moved != 9 { return 32 }
+    match flush_write(sink, write_buffer) { u64 => {}; error => return 33 }
+    let text = match writer.buf.to_str() { str as s => s; error => return 34 }
+    if text != "the quick" { return 35 }
+    if cap.remaining != 0 { return 36 }
+    // buffering was real: the source was gulped in 4-byte steps, so its cursor sits at 12
+    // (three gulps to satisfy the 9-byte cap), not at 9 and not at 19.
+    if reader.pos != 12 { return 37 }
+    0
+}

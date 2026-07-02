@@ -325,15 +325,9 @@ tk_type_result resolve_named(tk_path path, tk_type_table table) {
             alias_depth -= 1;
             return r;
         }
-        // (W10b.IF) an interface is a COMPILE-TIME CONTRACT, not a value type — it has no runtime
-        // representation yet (dynamic dispatch = a later round). Reject it wherever a value type is
-        // expected (field/param/return/local): an honest stop, not a phantom NAMED.
-        if (ut.as.value.body.tag == TK_BODY_INTERFACE) {
-            size_t len = name.len + 128;
-            char *buf = tk_alloc(len); if (!buf) abort();
-            snprintf(buf, len, "'%.*s' is an interface and cannot be used as a value type yet (dynamic dispatch is a later round)", (int)name.len, (const char *)name.ptr);
-            return (tk_type_result){ .ok = false, .as.error = tk_error_make(buf) };
-        }
+        // (W10b.D3) an interface IS a value type now — a contract-typed value (data + vtable fat
+        // pointer, the tk_closure-shaped rep). It resolves NOMINALLY like any other named type;
+        // the upcast/dispatch rules live in tk_widens_into + the method-call typer.
         tk_type t = { .tag = TK_TYPE_NAMED, .as.named.name = name };
         return (tk_type_result){ .ok = true, .as.value = t };
     }
@@ -824,6 +818,15 @@ static bool widens_into_at(tk_type from, tk_type to, tk_type_table table, int de
     if (from.tag == TK_TYPE_SLICE && to.tag == TK_TYPE_SLICE
         && from.as.slice.element != NULL && to.as.slice.element != NULL)
         return widens_into_at(*from.as.slice.element, *to.as.slice.element, table, depth - 1);
+    // (W10b.D3) UPCAST — a CLASS instance widens into a contract (interface) it NOMINALLY
+    // conforms to: `let s: Shape = circle`. Classes only (reference semantics ride the object
+    // pointer into the fat-pointer `data` field); a STRUCT is pure value data — no stable
+    // address to dispatch on — so it does NOT widen (its conformance still serves `<T: I>`).
+    if (from.tag == TK_TYPE_NAMED && to.tag == TK_TYPE_NAMED
+        && tk_is_class_name(from.as.named.name, table)
+        && tk_is_interface_name(to.as.named.name, table)
+        && tk_type_conforms_to(from.as.named.name, to.as.named.name, table))
+        return true;
     tk_type tv = tk_expand_variant(to, table);   // a NAMED variant → its members (so cases widen in)
     if (tv.tag == TK_TYPE_VARIANT)
         for (size_t i = 0; i < tv.as.variant.len; i += 1)
@@ -832,6 +835,71 @@ static bool widens_into_at(tk_type from, tk_type to, tk_type_table table, int de
 }
 bool tk_widens_into(tk_type from, tk_type to, tk_type_table table) {
     return widens_into_at(from, to, table, 16);   // variant nesting is shallow; 16 is a safe backstop
+}
+
+// ── (W10b.D3) nominal conformance — the interface-value upcast / constraint gates ────────────────
+// These live HERE (not collect.c) because tk_widens_into needs them and resolve sits below
+// collect in the module DAG. "Contract" wording: the mechanism is per-(type, contract) and
+// agnostic to which decl kind the contract came from (today `interface`; traits reuse it later).
+
+// is `name` declared as an interface? Mirror of resolve.tks::is_interface_name.
+bool tk_is_interface_name(tk_str name, tk_type_table table) {
+    tk_decl_result d = tk_type_table_find(table, name);
+    return d.ok && d.as.value.body.tag == TK_BODY_INTERFACE;
+}
+
+// is `name` declared as a class? Mirror of resolve.tks::is_class_name.
+bool tk_is_class_name(tk_str name, tk_type_table table) {
+    tk_decl_result d = tk_type_table_find(table, name);
+    return d.ok && d.as.value.body.tag == TK_BODY_CLASS;
+}
+
+// does contract `sub` reach contract `want` through `extends`, transitively? Depth-bounded so a
+// (decl-rejected) cyclic `extends` can never loop here. Mirror of resolve.tks::iface_extends_reaches.
+static bool iface_extends_reaches(tk_str sub, tk_str want, tk_type_table table, int depth) {
+    if (depth <= 0) return false;
+    tk_decl_result d = tk_type_table_find(table, sub);
+    if (!d.ok || d.as.value.body.tag != TK_BODY_INTERFACE) return false;
+    tk_interface_body ib = d.as.value.body.as.interface_body;
+    for (size_t i = 0; i < ib.n_extends; i += 1) {
+        if (name_eq(ib.extends[i], want)) return true;
+        if (iface_extends_reaches(ib.extends[i], want, table, depth - 1)) return true;
+    }
+    return false;
+}
+
+// NOMINAL conformance: does class/struct `name` implement contract `iface` — via its OWN
+// `implements` list, an ANCESTOR class's (the class-inheritance chain), or a listed contract
+// that `extends` `iface` transitively? DECLARED conformance only (nominal, closed-world) — a
+// type that merely HAPPENS to have the methods does not conform. Hop-bounded like the extends
+// walk (cyclic inheritance is decl-rejected; the bound keeps this total regardless). Mirror of
+// resolve.tks::type_conforms_to.
+bool tk_type_conforms_to(tk_str name, tk_str iface, tk_type_table table) {
+    tk_str cur = name;
+    for (int hops = 0; hops < 64; hops += 1) {
+        tk_decl_result d = tk_type_table_find(table, cur);
+        if (!d.ok) return false;
+        const tk_str *impls; size_t n_impls;
+        bool has_base = false; tk_str base = { NULL, 0 };
+        if (d.as.value.body.tag == TK_BODY_CLASS) {
+            impls = d.as.value.body.as.class_body.implements;
+            n_impls = d.as.value.body.as.class_body.n_implements;
+            has_base = d.as.value.body.as.class_body.has_base;
+            base = d.as.value.body.as.class_body.base_name;
+        } else if (d.as.value.body.tag == TK_BODY_STRUCT) {
+            impls = d.as.value.body.as.struct_body.implements;
+            n_impls = d.as.value.body.as.struct_body.n_implements;
+        } else {
+            return false;
+        }
+        for (size_t i = 0; i < n_impls; i += 1) {
+            if (name_eq(impls[i], iface)) return true;
+            if (iface_extends_reaches(impls[i], iface, table, 64)) return true;
+        }
+        if (!has_base) return false;
+        cur = base;
+    }
+    return false;
 }
 
 // (#83) Does `t` carry a SENTINEL anywhere (a Slice with element == NULL, or an Optional with
@@ -933,6 +1001,14 @@ tk_type_result tk_resolve_type(tk_type_expr te, tk_type_table table) {
                 if (m.as.value.tag == TK_TYPE_REF) {
                     tk_free0(members);
                     return (tk_type_result){ .ok = false, .as.error = tk_error_make("a reference cannot be stored in a struct/variant/collection") };
+                }
+                // (W10b.D3) an interface (contract) variant member is an honest stop: the VM's
+                // untagged values discriminate a match arm by the CONCRETE class name, so a
+                // `Shape | error` subject would silently diverge between the engines (native
+                // has a tag, the VM does not). Plain interface-typed values work — bind first.
+                if (m.as.value.tag == TK_TYPE_NAMED && tk_is_interface_name(m.as.value.as.named.name, table)) {
+                    tk_free0(members);
+                    return (tk_type_result){ .ok = false, .as.error = tk_error_make("an interface cannot be a variant member yet — bind the interface value on its own (no `I | error` unions)") };
                 }
                 members = tk_realloc0(members, (n + 1) * sizeof *members);
                 if (!members) abort();

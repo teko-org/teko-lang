@@ -98,7 +98,19 @@ fn write_texpr(buf: []byte, t: StrTable, te: checker::TExpr) -> []byte {
         checker::TBinary as bn  => write_texpr(write_texpr(write_u8(write_u8(b, 4), kind_byte(bn.op)), t, bn.left), t, bn.right)
         checker::TUnary as u    => write_texpr(write_u8(write_u8(b, 5), kind_byte(u.op)), t, u.operand)
         checker::TCompare as c  => write_terms(write_texpr(write_u8(b, 6), t, c.first), t, c.rest)
-        checker::TCall as cl    => write_texprs(write_path(write_u8(b, 7), t, cl.callee), t, cl.args)
+        // (W10b.D3) a DYNAMIC contract-method call is its OWN tag (24): it must round-trip the
+        // resolved method Func (the cast signature) + the vtable slot, which the plain call
+        // encoding (tag 7) does not carry. callee = [<Iface>, <method>].
+        checker::TCall as cl    => {
+            if cl.is_iface_dispatch {
+                mut ib = write_path(write_u8(b, 24), t, cl.callee)
+                ib = write_type(ib, t, cl.callee_type)
+                ib = write_u32(ib, cl.iface_slot)
+                write_texprs(ib, t, cl.args)
+            } else {
+                write_texprs(write_path(write_u8(b, 7), t, cl.callee), t, cl.args)
+            }
+        }
         // (C7.16) typed IF: tag 8 + cond (texpr) + then_blk ([]TStatement) + has_else (u8) + else_blk.
         checker::TIfExpr as iff => {
             mut sb = write_texpr(write_u8(b, 8), t, iff.cond)

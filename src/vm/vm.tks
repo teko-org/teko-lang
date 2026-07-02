@@ -1571,6 +1571,53 @@ fn vm_match_as_enum_int(prog: checker::TProgram, name: str, ordinal: i128) -> bo
     false
 }
 
+// (W10b.D3 codec fix) are `a` and `b` BOTH members of one declared variant? If so, a struct value
+// tagged `a` is ALREADY a fully-discriminated case wherever `b` could appear — so descending into
+// its fields to reinterpret it as the sibling case `b` is the conflation bug the tag-24 roundtrip
+// caught (`Func { ret = Prim }` matched a `Prim` arm through `ret`, since Func and Prim are both
+// `Type` members). Combined with the field-count guard at the descent site: descent is SKIPPED
+// only for a MULTI-FIELD sibling — a SINGLE-FIELD sibling wrapper (`Optional { inner = Prim }`)
+// still descends (doctrine — teko-vm-wrapper-descent-bug), and a NON-sibling multi-field node
+// (`Expr { kind = Compare; line; col }` → Compare) still descends (the corpus AST-into-kind idiom).
+// Mirror of vm.c::variant_siblings.
+fn vm_variant_siblings(prog: checker::TProgram, a: str, b: str) -> bool {
+    mut i = 0
+    loop {
+        if i >= prog.items.len { break }
+        match prog.items[i] {
+            parser::TypeDecl as td => {
+                match td.body {
+                    parser::VariantBody as vb => match vb.type_expr {
+                        parser::UnionType as u => {
+                            mut has_a = false
+                            mut has_b = false
+                            mut j = 0
+                            loop {
+                                if j >= u.members.len { break }
+                                match u.members[j] {
+                                    parser::NamedType as nt => {
+                                        let nm = nt.path.segments[nt.path.segments.len - 1].name
+                                        if nm == a { has_a = true }
+                                        if nm == b { has_b = true }
+                                    }
+                                    _ => {}
+                                }
+                                j = j + 1
+                            }
+                            if has_a && has_b { return true }
+                        }
+                        _ => {}
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+        i++
+    }
+    false
+}
+
 fn vm_case_in_variant(prog: checker::TProgram, vname: str, cname: str) -> bool {
     mut i = 0
     loop {
@@ -1697,15 +1744,22 @@ fn pat_match(pat: parser::Pattern, subj: Value, env: Venv) -> PatMatch {
                     }
                     return PatMatch { matched = true; env = env }
                 }
-                // Transparent field descent: when the subject is a struct with no direct match,
-                // check each STRUCT field for a value that matches the pattern name (e.g. `Number as nn`
-                // on `Expr { kind = Number{…}; line; col }`). Bind to the first matching field.
-                // Only struct fields are eligible — int fields are excluded because vm_match_as_enum_int
-                // could match enum member names that coincidentally share the same ordinal value as an
-                // unrelated enum (e.g. TyShape::Variant=2 vs PrimKind::U32=2 causing false descent).
+                // Transparent field descent: when the subject is a struct whose fields hold a
+                // value matching the pattern name (e.g. `Compare as c` on `Expr { kind = Compare;
+                // line; col }`), check each STRUCT field and bind the first match. SKIPPED only for
+                // a MULTI-FIELD SIBLING of the target — a subject that is itself a discriminated
+                // case of the SAME union the target belongs to must not be re-read as the sibling
+                // case through an inner field (`Func { params; ret; … }` → a `Prim` arm via `ret`,
+                // both `Type` members — the tag-24 codec bug). A SINGLE-FIELD sibling wrapper
+                // (`Optional { inner = Prim }`) still descends (doctrine); a NON-sibling multi-field
+                // node still descends (the AST-node-into-kind corpus idiom). Only struct fields are
+                // eligible — int fields are excluded because vm_match_as_enum_int could match enum
+                // member names that coincidentally share an ordinal (TyShape::Variant=2 vs U32=2).
                 // Mirrors vm.c TK_PAT_BIND transparent-field-descent block.
                 match subj {
                     StructVal as sv => {
+                        let is_multi_sibling = sv.field_vals.len > 1 && vm_variant_siblings(env.prog, sv.type_name, bname)
+                        if !is_multi_sibling {
                         mut fi = 0
                         loop {
                             if fi >= sv.field_vals.len { break }
@@ -1724,6 +1778,7 @@ fn pat_match(pat: parser::Pattern, subj: Value, env: Venv) -> PatMatch {
                                 _ => {}
                             }
                             fi++
+                        }
                         }
                     }
                     _ => {}
@@ -2632,7 +2687,101 @@ fn eval_lambda_call(fv: FuncVal, c: checker::TCall, env: Venv) -> EvalRes {
     EvalRes { value= rv; env= caller }
 }
 
+// (W10b.D3) resolve a DYNAMIC contract-method call's target: the concrete class's stamped
+// function named `method` whose namespace IS `class_name` or ends with "::" + `class_name` —
+// the SAME rule codegen's vtable build uses (cg_find_method_ns), so both engines dispatch to
+// the SAME method (virtual overrides included: every effective method is stamped per class).
+// Mirror of vm.c::find_class_method. null = not found (an honest stop at the caller).
+fn find_class_method(env: Venv, class_name: str, method: str) -> FnHit? {
+    mut i: u64 = 0
+    loop {
+        if i >= env.prog.items.len { break }
+        match env.prog.items[i] {
+            checker::TFunction as tf => {
+                if tf.name == method {
+                    if tf.namespace == class_name { return FnHit { func = tf; idx = i } }
+                    if teko::str::ends_with(tf.namespace, "::" ~ class_name) { return FnHit { func = tf; idx = i } }
+                }
+            }
+            _ => {}
+        }
+        i++
+    }
+    null
+}
+
+// (W10b.D3) DYNAMIC contract-method dispatch. The receiver (args[0]) evaluates ONCE; a class
+// instance IS the interface value in the VM (a ClassRef cell — no fat pointer needed, the cell's
+// struct payload carries the CONCRETE class name to dispatch on). The ORIGINAL ClassRef binds as
+// the receiver param (reference semantics survive the dispatch). Non-receiver args bind exactly
+// like bind_call_args (Ref auto-promotion included). Shared by BOTH eval_call and call_value —
+// the twin-asymmetry trap's two entry points. Yields StmtVal (value = null for a void method) so
+// the statement path tolerates void; the value path panics on null. Mirror of vm.c::eval_iface_call.
+fn eval_iface_call(c: checker::TCall, env: Venv) -> StmtVal {
+    let re = eval_expr(c.args[0], env)
+    mut caller = re.env
+    let recv = re.value
+    let cellid = match recv { ClassRef as cr => cr.cell; _ => panic("vm: interface dispatch on a non-class value (internal: only a class instance upcasts)") }
+    let payload = cell_get(caller.cells, cellid)
+    let concrete = match payload { StructVal as sv => sv.type_name; _ => panic("vm: interface dispatch: the class cell holds no struct payload (internal)") }
+    let method = c.callee.segments[c.callee.segments.len - 1].name
+    let h = match find_class_method(caller, concrete, method) {
+        FnHit as hit => hit
+        null => panic("vm: interface dispatch: no stamped method on the concrete class (internal: conformance was checked)")
+    }
+    let f = h.func
+    if f.params.len == 0 || f.params.len != c.args.len { panic("vm: interface dispatch: arity mismatch (internal: the checker fixed the arity)") }
+    if !f.is_test { teko::cov_mark(h.idx) }
+    mut fenv = fresh_env(caller.prog, caller.cells)
+    fenv = define(fenv, f.params[0].name, recv)   // the receiver — the ORIGINAL ClassRef
+    mut ai: u64 = 1
+    loop {
+        if ai >= c.args.len { break }
+        if param_is_ref(f, ai) {   // same auto-ref/forward rule as bind_call_args
+            match c.args[ai].kind {
+                checker::TVar as v => {
+                    match c.args[ai].type {
+                        checker::Reference => {
+                            fenv = define(fenv, f.params[ai].name, read_var(caller, v.name))   // forward the existing RefVal
+                        }
+                        _ => {
+                            let pr = promote_to_cell(caller, v.name)   // auto-ref: promote the origin var
+                            caller = pr.env
+                            fenv = with_cells(fenv, caller.cells)
+                            fenv = define(fenv, f.params[ai].name, RefVal { cell = pr.id })
+                        }
+                    }
+                }
+                _ => panic("vm: a `Ref<T>` argument must be a mutable variable (internal: checker should reject)")
+            }
+        } else {
+            let ae = eval_expr(c.args[ai], caller)
+            caller = ae.env
+            fenv = with_cells(fenv, caller.cells)
+            fenv = define(fenv, f.params[ai].name, coerce_to(ae.value, vm_param_coerce_type(f.params[ai].type_ann)))
+        }
+        ai++
+    }
+    teko::cov_enter(h.idx)
+    let fe = exec_block_ex(f.body, fenv, true)
+    teko::cov_leave()
+    caller = with_cells(caller, fe.env.cells)
+    mut rv: Value? = null
+    match fe.flow {
+        VmReturn as ret => match ret.value { Value as v => { rv = coerce_to(v, f.return_type) }; null => {} }
+        Normal as nm    => match nm.value { Value as v => { rv = coerce_to(v, f.return_type) }; null => {} }
+        _               => {}
+    }
+    StmtVal { value = rv; env = caller }
+}
+
 fn eval_call(c: checker::TCall, env: Venv) -> EvalRes {
+    // (W10b.D3) dynamic contract dispatch — FIRST, before builtin name-sniffing could collide
+    // with a method name. Same guard in call_value (the VM twin-asymmetry rule).
+    if c.is_iface_dispatch {
+        let r = eval_iface_call(c, env)
+        return EvalRes { value = r.value ?? panic("vm: void interface-method call used as a value (internal: checker should reject)"); env = r.env }
+    }
     // A builtin that RAN (`ran= true`) is `-> void`, so there is no Value to yield: a void call
     // only appears in statement position, and reaching here in value position is an honest
     // stop (M.3), never a synthesized Unit — this arm always panics, so BuiltinRes.env is dead
@@ -2957,6 +3106,9 @@ fn eval_stmt_value(e: checker::TExpr, env: Venv) -> StmtVal {
 // the callee is visible at the caller after return). Returns the value AND the updated caller env.
 // (The C twin folds this into eval_call, where the cell store is a global shared by pointer.)
 fn call_value(c: checker::TCall, env: Venv) -> StmtVal {
+    // (W10b.D3) dynamic contract dispatch — FIRST, before builtin name-sniffing could collide
+    // with a method name. Same guard in eval_call (the VM twin-asymmetry rule).
+    if c.is_iface_dispatch { return eval_iface_call(c, env) }
     // A builtin that RAN (`ran= true`) is `-> void` — yield null, but the env is now
     // BuiltinRes.env (issue #106), NOT the original `env`: a builtin's argument expression may
     // itself contain a `Ref<T>` value-position call (e.g. a closure writing `r.value` nested

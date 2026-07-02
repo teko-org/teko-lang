@@ -75,7 +75,7 @@ struct tk_texpr {
         struct { tk_token_kind op; tk_texpr *left, *right; }         binary;
         struct { tk_token_kind op; tk_texpr *operand; }             unary;
         struct { tk_texpr *first; tk_tcmp_term *rest; size_t nrest; } compare;
-        struct { tk_path callee; tk_texpr *args; size_t nargs; tk_str call_ns; bool is_closure_call; tk_type callee_type; } call;  // call_ns: resolved target's namespace ("" = builtin/local → no mangle) (#41/#49). (W10a) is_closure_call = callee is a LOCAL of function type (a tk_closure VALUE) → call through `((R(*)(A,B))f.fn)(args)` using callee_type (the Func) for the cast
+        struct { tk_path callee; tk_texpr *args; size_t nargs; tk_str call_ns; bool is_closure_call; tk_type callee_type; bool is_iface_dispatch; uint32_t iface_slot; } call;  // call_ns: resolved target's namespace ("" = builtin/local → no mangle) (#41/#49). (W10a) is_closure_call = callee is a LOCAL of function type (a tk_closure VALUE) → call through `((R(*)(A,B))f.fn)(args)` using callee_type (the Func) for the cast. (W10b.D3) is_iface_dispatch = a DYNAMIC contract-method call: callee = [<Iface>, <method>], args[0] = the receiver (an interface value or a class instance the emit upcasts), callee_type = the resolved interface-method Func (receiver param typed Named{Iface}), iface_slot = the method's index in the interface's effective-method list (== its vtable slot)
         struct { tk_texpr *cond; tk_tstatement *then_blk; size_t nthen;
                  bool has_else; tk_tstatement *else_blk; size_t nelse; } if_expr;
         struct { tk_texpr *subject; tk_tarm *arms; size_t narms; }    match_expr;

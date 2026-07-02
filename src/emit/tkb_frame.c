@@ -42,6 +42,9 @@ static void collect(tk_strtable *t, const tk_texpr *te) {
             break;
         case TK_TEXPR_CALL:
             for (size_t i = 0; i < te->as.call.callee.len; i += 1) tk_st_intern(t, te->as.call.callee.segments[i].name);
+            // (W10b.D3) a dispatch node (tag 24) also serializes its method Func — intern its
+            // Named param/return names too (tag 7 never writes callee_type, so this is D3-only).
+            if (te->as.call.is_iface_dispatch) collect_type(t, te->as.call.callee_type);
             for (size_t i = 0; i < te->as.call.nargs; i += 1) collect(t, &te->as.call.args[i]);
             break;
         case TK_TEXPR_CAST: collect(t, te->as.cast.expr); break;                 // S1a
