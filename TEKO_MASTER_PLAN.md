@@ -693,7 +693,11 @@ All design is SETTLED: W10b OOP, DEFARGS, W10c DI, W11 constraints (sans `!`), c
 - **Stage B — TR0** (the `trait` construct: struct-shaped, derivable, non-instantiable; fields+methods
   folded into a deriving struct/class via field-flattening). **Deps:** W10b.IF ✅, W10b.CLASS field-
   flattening ✅ — both already satisfied, so TR0 is **implementation-ready today**; it is sequenced HERE
-  (ROUND 3.5, not earlier) **by the user's slotting ruling, not because its deps demand it.** **Status:** ⬜.
+  (ROUND 3.5, not earlier) **by the user's slotting ruling, not because its deps demand it.**
+  **Status:** ✅ **DONE (2026-07-02, issue #124)** — contextual `trait` (never reserved) + `TraitBody` +
+  the checker-level derivation FOLD (fold_traits, both twins) + honest stops (instantiation, trait-as-
+  value, `<T: Trait>` → TR1 pointers); 18 corpus tests + `examples/regressions/trait_basics` (VM ==
+  native); see `TEKO_ROADMAP_TRAITS.md` TR0 for the as-landed record.
 - **Stage C — TR1** (trait as generic constraint + dynamic vtable value). **Deps:** TR0, S6/W11 ✅, **hard
   dep: D3** (dynamic dispatch — a trait's bodyless-requirement surface reuses the same vtable rep). **Status:** ⬜.
 - **Stage D — TR2** (compile-time field view, internal — the compiler-only enumeration of a deriver's
