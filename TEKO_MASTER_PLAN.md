@@ -27,6 +27,20 @@ Type-model doctrine (void/error/variant/nullable; no `never`), 128-bit + float p
 layer, match/if-value execution, labeled loops, subscript indexing, the **S0 `tk_alloc()` allocation seam**,
 slice value-layer Increment A (fixed+copy), and the `panic`/`exit` global-diverging-fn ruling are **DONE**.
 
+**NULL PROPAGATION — DONE + RATIFIED (`?.` safe navigation, `??` null-coalescing/Elvis).** `?` is
+**exclusive to nullability** (REBOOT_PLAN §202-203): type `T?`, safe field access `?.` (null-propagating),
+Elvis `??` (coalesce/fallback). Reading a `?` value REQUIRES `?.` or `??` — a bare `.` on a `T?` is a
+compile error (forced handling, no unwrap ceremony; it is an OPERATOR, not destructuring). Delivered
+end-to-end (lexer `QDot`/`QQ` → parser → checker → codegen → VM); the `optionals` regression exercises
+`error?`, a `T?` binding+match, `fn -> T?`, `?.` + `??` and agrees VM==native (exit 6).
+
+**DISJOINT-DOMAIN RULING (governs error vs absence) — `null → ?./??` ; `error → match`.** These two are
+NOT interchangeable: absence (`T?`) is a single well-defined case, so `?.`/`??` are the sanctioned
+shortcut; an `error` union may carry several non-error arms that each need inspection, so it is handled
+with `match`. **A `try`/`?` error-propagation operator is REJECTED (user 2026-07-02):** assuming a value
+is `T` unless it is `error` is presumptuous and hides cases that need validation; `match`'s explicitness IS
+the safety (M.1 fail-loud). `?.`/`??` never apply to errors, only to `null`.
+
 **★ THE VALIDATION GATE — native self-host (`cmake --build build --target selfhost`, i.e. `./build/teko
 build .` → `./bin/teko`):** this is the ONE end-to-end proof (read→lex→parse→check→native codegen→cc
 link). **It does NOT pass yet** — native codegen has a short tail of walls, so Phase 6 is 🔶 and nothing
