@@ -58,8 +58,9 @@ static tk_error skip_level_error(tk_type arm_type, tk_type subject, tk_type_tabl
     const char *hint_s = find_containing_case(arm_type, subject, table, &outer) ? tk_type_render(outer) : subj_s;
     size_t len = strlen(arm_s) * 2 + strlen(subj_s) + strlen(hint_s) * 2 + 128;
     char *buf = tk_alloc(len); if (!buf) abort();
-    snprintf(buf, len, "'%s' is not a direct case of '%s' — match the outer case first (%s as v => match v { %s as x => … })",
+    int n = snprintf(buf, len, "'%s' is not a direct case of '%s' — match the outer case first (%s as v => match v { %s as x => … })",
         arm_s, subj_s, hint_s, arm_s);
+    if (n < 0 || (size_t)n >= len) abort();   // cert-err33-c: handle the return — `len` was sized above, so truncation is an invariant break
     return tk_error_make(buf);
 }
 
