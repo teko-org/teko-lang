@@ -24,11 +24,12 @@ Teko's doctrine is a small surface (Law M.0). So this roadmap splits deliberatel
   ride the package registry + the on-demand-dependency rule (same spirit as DB's C7.20) so a consumer only
   pays for what it imports.
 
-**Cross-cutting prerequisite (open decision W-DERIVE):** typed request binding, validation, and OpenAPI
-generation are dramatically better with **compile-time serialization derive + bounded reflection** (iterate
-a struct's fields at comptime). Without it, layer B is hand-written boilerplate per type. This is a
-*language* feature decision (ties to the comptime/reflection idea) and should be ratified before B is
-sliced to agents. Doc-comments are already parsed (`has_doc`/`doc`), so OpenAPI/descriptions can reuse them.
+**Cross-cutting prerequisite — the `Json`/structural TRAITS ([`TEKO_ROADMAP_TRAITS.md`](TEKO_ROADMAP_TRAITS.md)):**
+typed request binding, validation, and OpenAPI generation are dramatically better when a type can adopt a
+compiler-known `Json`/schema trait (structural (de)serialization synthesized from its fields) instead of a
+hand-written codec per type. Without it, layer B is per-type boilerplate. This is the `trait` *language*
+decision (supersedes the rejected `#derive` attribute) and should be ratified before B is sliced. Doc-
+comments are already parsed (`has_doc`/`doc`), so OpenAPI/descriptions can reuse them.
 
 ---
 
@@ -76,12 +77,12 @@ content negotiation (`Accept`), pagination helpers, ETag/conditional-request hel
 mapping (a `T | error` handler result → status + problem+json). **Verify:** `.tkt` for problem+json +
 negotiation.
 
-**▪ W8 — typed binding + validation.** **Deps:** W0, encoding (JSON/form/query), **W-DERIVE**. Bind a
+**▪ W8 — typed binding + validation.** **Deps:** W0, encoding (JSON/form/query), **TRAITS (Json/structural)**. Bind a
 request (body/query/path/header) into a typed struct with constraints (required/range/pattern/…), return a
 typed response encoded by content negotiation. The single biggest ergonomics win — **gated on the
-derive/reflection decision.** **Verify:** `.tkt` binding + validation-failure → 400 problem+json.
+structural-`trait` decision.** **Verify:** `.tkt` binding + validation-failure → 400 problem+json.
 
-**▪ W9 — OpenAPI generation (PACKAGE).** **Deps:** W0, W8, **W-DERIVE**, doc-comments. Emit an OpenAPI 3.1
+**▪ W9 — OpenAPI generation (PACKAGE).** **Deps:** W0, W8, **TRAITS (schema)**, doc-comments. Emit an OpenAPI 3.1
 spec from routes + typed handlers + doc-comments; optional Swagger-UI static serve. API-first. **Verify:**
 `.tkt` spec snapshot for a sample API.
 
@@ -115,13 +116,13 @@ net::http (N5) + io ── W0(router/mw) ─┬─ W1 std-mw ── W13 csrf/hea
                                             ├─ W4 http client ── W14 oauth/oidc (pkg)
                                             ├─ W5 multipart/uploads
                                             ├─ W6 sse/ws handlers
-                                            └─ W7 REST helpers ─┬─ W8 binding+validation [needs W-DERIVE]
-                                                                ├─ W9 OpenAPI (pkg)   [needs W-DERIVE]
+                                            └─ W7 REST helpers ─┬─ W8 binding+validation [needs TRAITS]
+                                                                ├─ W9 OpenAPI (pkg)   [needs TRAITS]
                                                                 ├─ W10 GraphQL (pkg)
                                                                 └─ W11 JSON-RPC/webhooks (pkg)
 ```
 
-**Tiers.** **T1 (a real API today):** W0, W1, W2, W3, W4, W5, W7. **T2:** W6, W8 (needs W-DERIVE), W12,
+**Tiers.** **T1 (a real API today):** W0, W1, W2, W3, W4, W5, W7. **T2:** W6, W8 (needs TRAITS), W12,
 W13, OpenAPI (W9). **T3:** W10 GraphQL, W11, W14 OAuth/OIDC, authorization-server.
 
 **STDLIB vs PACKAGE:** stdlib = W0–W8, W12, W13 (contracts + primitives). Packages (over the registry) =
@@ -129,8 +130,8 @@ W9 OpenAPI, W10 GraphQL, W11, W14, and any full opinionated framework composing 
 
 ## 5. Open decisions (ratify with the sibling roadmaps in PR #80)
 
-1. **W-DERIVE (cross-cutting):** ship compile-time serialization derive + bounded reflection (rec — it
-   unblocks W8/W9 and the whole `teko::encoding` auto-(de)serialize story) vs hand-written per-type
+1. **Structural `trait`s (cross-cutting, [`TEKO_ROADMAP_TRAITS.md`](TEKO_ROADMAP_TRAITS.md)):** ship the `Json`/schema structural traits (rec — they
+   unblock W8/W9 and the whole `teko::encoding` auto-(de)serialize story) vs hand-written per-type
    codecs. This is a *language* decision; ratify before slicing B.
 2. **stdlib/package split** above — confirm the boundary.
 3. **Handler result shape:** handler returns `error?` writing to `Ctx` (rec, Go-style) vs returning a typed

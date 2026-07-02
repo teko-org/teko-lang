@@ -30,7 +30,7 @@
 
 **▪ CN0 — `teko::config`.** **Deps:** `teko::env` (Map), encoding (JSON/YAML/TOML).
 **Files:** `src/config/config.tks`. Layered configuration with precedence **flags < file < env**, typed
-access (`get_int`/`get_str`/`get_bool` → `T | error`), binding a config struct (helped by **W-DERIVE**),
+access (`get_int`/`get_str`/`get_bool` → `T | error`), binding a config struct (helped by the **Json/structural traits**),
 `.env` file loading, required-key validation. **Verify:** `.tkt` — precedence + typed parse + missing-key
 error.
 
@@ -106,6 +106,6 @@ backends it uses (same on-demand spirit as DB C7.20 / web packages).
    everywhere. Ties to the DI model (W10c).
 3. **Metrics/trace facades in stdlib, exporters as packages** — confirm the split so no binary carries a
    Prometheus/OTLP dependency it doesn't use.
-4. **Config binding** relies on W-DERIVE (see WEB roadmap) for typed struct binding — confirm the shared
+4. **Config binding** relies on the structural `trait`s ([`TEKO_ROADMAP_TRAITS.md`](TEKO_ROADMAP_TRAITS.md)) for typed struct binding — confirm the shared
    dependency.
 5. **cron/jobs** depends on the async model (S8) landing — confirm sequencing (T3, after S8).
