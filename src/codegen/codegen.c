@@ -4709,6 +4709,18 @@ static void cg_collect_expr_opts(cg_opt_set *set, const tk_texpr *e) {
             cg_collect_expr_opts(set, e->as.in_expr.lhs);
             for (size_t i = 0; i < e->as.in_expr.nelems; i += 1) cg_collect_expr_opts(set, &e->as.in_expr.elems[i]);
             return;
+        // (#119) A lambda literal's own resolved TYPE (registered above, at entry) is its FUNCTION
+        // type (params -> ret) — that carries no tk_opt_/tk_slice_/tk_u_ typedef of its own, so an
+        // optional/slice/variant used ONLY inside the lambda's params/return/body (never anywhere
+        // else in the enclosing function) was never visited: the collector fell through to the
+        // `default` leaf case and missed the whole body. A lifted CAPTURING lambda's body is emitted
+        // as its own function by cg_emit_lambda_decls — same as a non-capturing lambda's synthesized
+        // top-level fn — so it needs the SAME typedef registration a normal function body gets.
+        case TK_TEXPR_LAMBDA:
+            for (size_t i = 0; i < e->as.lambda.nparams; i += 1) cg_collect_type_opts(set, e->as.lambda.params[i].type);
+            cg_collect_type_opts(set, e->as.lambda.ret);
+            cg_collect_block_opts(set, e->as.lambda.body, e->as.lambda.nbody);
+            return;
         default: return;   // leaves (NUMBER/VAR/STR/BYTE/BOOL/NULL) — type already registered above
     }
 }
