@@ -51,6 +51,7 @@ bool tk_type_join(tk_type a, tk_type b, tk_type_table table, tk_type *out);
 // contract's `extends` closure (declared conformance only — nominal, closed-world).
 bool tk_is_interface_name(tk_str name, tk_type_table table);
 bool tk_is_class_name(tk_str name, tk_type_table table);
+bool tk_is_trait_name(tk_str name, tk_type_table table);   // (TR0) decl-tag probe for the trait honest stops
 bool tk_type_conforms_to(tk_str name, tk_str iface, tk_type_table table);
 // (#83) does `t` carry a SENTINEL slice/optional (element/inner == NULL) anywhere, incl. nested
 // (`[]NULL`, `[][]NULL`, `(NULL)?`, …)? Shared by tk_type_join's concrete-preference tie-break and

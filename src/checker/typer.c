@@ -679,6 +679,12 @@ static tk_error surface_at(tk_str file, uint32_t line, uint32_t col, tk_error in
 // dep_prog, then collects and type-checks `program`. Dep items are prepended to the result
 // TProgram so subsequent passes (codegen, VM) see the full program. Mirrors typer.tks::type_program_with_deps.
 tk_tprogram_result tk_type_program_with_deps(tk_program program, tk_tprogram dep_prog) {
+    // (TR0) FOLD trait derivations first — PROJECT-LOCAL only (a dep's traits don't fold: the
+    // .tkb codec doesn't carry trait bodies — same gap as struct/class methods). Mirrors
+    // typer.tks::type_program_with_deps.
+    { tk_fold_traits_result fr = tk_fold_traits(program);
+      if (!fr.ok) return (tk_tprogram_result){ .ok = false, .as.error = fr.as.error };
+      program = fr.as.value; }
     // Seed from dep (adds dep type decls + fn signatures).
     tk_collected_result seed_r = tk_seed_from_dep(dep_prog, tk_type_table_empty(), tk_env_empty());
     if (!seed_r.ok) return (tk_tprogram_result){ .ok = false, .as.error = seed_r.as.error };
@@ -742,6 +748,12 @@ tk_tprogram_result tk_type_program_with_deps(tk_program program, tk_tprogram dep
 }
 
 tk_tprogram_result tk_type_program(tk_program program) {
+    // (TR0) FOLD trait derivations FIRST — every later stage (collect, conformance, typing,
+    // codegen layout, the VM) sees each deriver's already-folded body; the trait decl itself
+    // stays registered (for honest value-position/instantiation errors) but is never emitted.
+    { tk_fold_traits_result fr = tk_fold_traits(program);
+      if (!fr.ok) return (tk_tprogram_result){ .ok = false, .as.error = fr.as.error };
+      program = fr.as.value; }
     tk_collected_result c = tk_collect(program);
     if (!c.ok) return (tk_tprogram_result){ .ok = false, .as.error = c.as.error };
     // W-vis-enforce: enforce the module system (namespace qualification + pub/exp) over the

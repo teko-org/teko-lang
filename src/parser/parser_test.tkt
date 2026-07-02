@@ -1221,3 +1221,71 @@ fn parses_safe_field_and_safe_method_call() {
     // `a?.` with nothing after is a parse error.
     teko::assert::is_true(expr_errors("a?."))
 }
+
+// --- (TR0, 2026-07-02) `trait` declarations — a CONTEXTUAL keyword, never reserved ---
+
+#test
+fn parses_trait_decl() {
+    // struct-shaped: a field, a PROVIDED method (body), and a REQUIREMENT (bodyless).
+    match module_of("type T = trait { x: i64; fn m(self) -> i64 { self.x }; fn need(self) -> i64 }") {
+        Module as m => {
+            teko::assert::is_true(m.decls.len == 1)
+            match m.decls[0] {
+                TypeDecl as td => match td.body {
+                    TraitBody as tb => {
+                        teko::assert::is_true(tb.fields.len == 1)
+                        teko::assert::is_true(tb.fields[0].name == "x")
+                        teko::assert::is_true(tb.methods.len == 2)
+                        teko::assert::is_true(tb.methods[0].body.len == 1)   // provided (has a body)
+                        teko::assert::is_true(tb.methods[1].body.len == 0)   // a requirement (bodyless)
+                    }
+                    _ => teko::assert::is_true(false)
+                }
+                _ => teko::assert::is_true(false)
+            }
+        }
+        error => teko::assert::is_true(false)
+    }
+    // an empty trait body parses too.
+    match module_of("type E = trait { }") {
+        Module as m => match m.decls[0] { TypeDecl as td => match td.body { TraitBody as tb => teko::assert::is_true(tb.fields.len == 0 && tb.methods.len == 0); _ => teko::assert::is_true(false) }; _ => teko::assert::is_true(false) }
+        error => teko::assert::is_true(false)
+    }
+}
+
+#test
+fn trait_stays_contextual_not_reserved() {
+    // `trait` as a PARAMETER name and inside an expression — an ordinary identifier.
+    match module_of("fn trait_id(trait: i64) -> i64 { trait + 1 }") {
+        Module as m => teko::assert::is_true(m.decls.len == 1)
+        error => teko::assert::is_true(false)
+    }
+    // `trait` as a struct FIELD name.
+    match module_of("type S = struct { trait: i64 }") { Module => teko::assert::is_true(true); error => teko::assert::is_true(false) }
+    // `type X = trait` with NO `{` — a transparent ALIAS to a type literally named `trait`.
+    match module_of("type X = trait") {
+        Module as m => match m.decls[0] { TypeDecl as td => match td.body { AliasBody => teko::assert::is_true(true); _ => teko::assert::is_true(false) }; _ => teko::assert::is_true(false) }
+        error => teko::assert::is_true(false)
+    }
+}
+
+#test
+fn trait_derive_list_positions_parse() {
+    // deriving rides the SAME `&`-list as interfaces: `struct T1 & T2 { … }` / `class & T1 { … }`
+    // (the parser records names; trait-vs-interface is the CHECKER's split, fold_traits).
+    match module_of("type P = struct T1 & T2 { y: i64 }") {
+        Module as m => match m.decls[0] { TypeDecl as td => match td.body { StructBody as sb => teko::assert::is_true(sb.implements.len == 2); _ => teko::assert::is_true(false) }; _ => teko::assert::is_true(false) }
+        error => teko::assert::is_true(false)
+    }
+    match module_of("type C = class & T1 { pub fn f(self) -> i64 { 0 } }") {
+        Module as m => match m.decls[0] { TypeDecl as td => match td.body { ClassBody as cb2 => teko::assert::is_true(cb2.implements.len == 1 && !cb2.has_base); _ => teko::assert::is_true(false) }; _ => teko::assert::is_true(false) }
+        error => teko::assert::is_true(false)
+    }
+}
+
+#test
+fn trait_declares_no_derive_list_of_its_own() {
+    // `trait A & B { }` is NOT a trait declaration (`{` must follow `trait` immediately) —
+    // compose at the DERIVER instead. This parses as a malformed alias → an error.
+    teko::assert::is_true(module_errors("type T = trait A & B { }"))
+}

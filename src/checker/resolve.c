@@ -325,6 +325,13 @@ tk_type_result resolve_named(tk_path path, tk_type_table table) {
             alias_depth -= 1;
             return r;
         }
+        // (TR0) a trait NEVER reaches a value position — it is a derivable bundle, not a type
+        // for variables/params/returns/fields. Trait-typed DYNAMIC values arrive with TR1.
+        if (ut.as.value.body.tag == TK_BODY_TRAIT) {
+            size_t len = name.len + 128; char *buf = tk_alloc(len); if (!buf) abort();
+            snprintf(buf, len, "trait '%.*s' is not a value type — derive it from a struct or class instead (trait-typed dynamic values arrive with TR1)", (int)name.len, (const char *)name.ptr);
+            return (tk_type_result){ .ok = false, .as.error = tk_error_make(buf) };
+        }
         // (W10b.D3) an interface IS a value type now — a contract-typed value (data + vtable fat
         // pointer, the tk_closure-shaped rep). It resolves NOMINALLY like any other named type;
         // the upcast/dispatch rules live in tk_widens_into + the method-call typer.
@@ -856,6 +863,13 @@ bool tk_is_interface_name(tk_str name, tk_type_table table) {
 bool tk_is_class_name(tk_str name, tk_type_table table) {
     tk_decl_result d = tk_type_table_find(table, name);
     return d.ok && d.as.value.body.tag == TK_BODY_CLASS;
+}
+
+// (TR0) is `name` declared as a trait? Mirror of resolve.tks::is_trait_name — used by the honest
+// stops (trait as a constraint atom / instantiation target); the fold splits the `&`-list itself.
+bool tk_is_trait_name(tk_str name, tk_type_table table) {
+    tk_decl_result d = tk_type_table_find(table, name);
+    return d.ok && d.as.value.body.tag == TK_BODY_TRAIT;
 }
 
 // does contract `sub` reach contract `want` through `extends`, transitively? Depth-bounded so a

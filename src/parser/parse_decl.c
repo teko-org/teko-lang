@@ -482,12 +482,65 @@ static tk_parsed_body_result parse_interface_body(const tk_token *t, size_t n, s
     return (tk_parsed_body_result){ .ok = true, .as.value = { .node = b, .next = p + 1 } };
 }
 
+// (TR0) `trait { <fields>; <methods, with or without bodies> }`. `pos` at the `{` (the caller
+// consumed the contextual `trait`). STRUCT-SHAPED: interleaved `name: T` fields + `fn` methods;
+// unlike a struct's, a method here MAY be bodyless (a requirement — allow_bodyless=true, the
+// interface-member path). Mirrors parse_fields / parse_decl.tks::parse_trait_fields.
+static tk_parsed_struct_body_result parse_trait_fields(const tk_token *t, size_t n, size_t pos) {
+    size_t p = tk_skip_seps(t, n, pos + 1);   // consume `{`, skip leading separators
+    tk_field *fields = NULL; size_t nf = 0;
+    tk_function *methods = NULL; size_t nm = 0;
+    if (tk_is_kind_at(t, n, p, TK_TOKEN_RBRACE)) {
+        return (tk_parsed_struct_body_result){ .ok = true, .as.value = { .fields = fields, .n_fields = 0, .methods = methods, .n_methods = 0, .next = p + 1 } };
+    }
+    for (;;) {
+        if (struct_item_is_method(t, n, p)) {
+            tk_parsed_decl_result m = tk_parse_function(t, n, p, false, (tk_str){0}, true, true);
+            if (!m.ok) { return (tk_parsed_struct_body_result){ .ok = false, .as.error = m.as.error }; }
+            if (m.as.value.node.tag != TK_DECL_FUNCTION) {
+                return (tk_parsed_struct_body_result){ .ok = false, .as.error = tk_err_at(t, n, p, "internal: a trait method must parse to a Function") };
+            }
+            tk_functions_push(&methods, &nm, m.as.value.node.as.function);
+            p = m.as.value.next;
+        } else {
+            if (!tk_is_name_at(t, n, p)) {
+                return (tk_parsed_struct_body_result){ .ok = false, .as.error = tk_err_at(t, n, p, "expected a field name or a method (`fn …`) in the trait body") };
+            }
+            tk_str name = t[p].text;
+            if (!tk_is_kind_at(t, n, p + 1, TK_TOKEN_COLON)) {
+                return (tk_parsed_struct_body_result){ .ok = false, .as.error = tk_err_at(t, n, p + 1, "expected ':' after a field name") };
+            }
+            tk_parsed_type_result ty = tk_parse_type(t, n, p + 2);
+            if (!ty.ok) { return (tk_parsed_struct_body_result){ .ok = false, .as.error = ty.as.error }; }
+            tk_fields_push(&fields, &nf, (tk_field){ .name = name, .type_ann = ty.as.value.node, .vis = TK_VIS_PUB, .is_intern = false });
+            p = ty.as.value.next;
+        }
+        if (tk_is_kind_at(t, n, p, TK_TOKEN_RBRACE)) { break; }
+        if (!tk_is_sep(t, n, p)) {
+            return (tk_parsed_struct_body_result){ .ok = false, .as.error = tk_err_at(t, n, p, "expected ';', a newline, or '}' after a trait member") };
+        }
+        p = tk_skip_seps(t, n, p);
+        if (tk_is_kind_at(t, n, p, TK_TOKEN_RBRACE)) { break; }   // trailing separator
+    }
+    return (tk_parsed_struct_body_result){ .ok = true, .as.value = { .fields = fields, .n_fields = nf, .methods = methods, .n_methods = nm, .next = p + 1 } };
+}
+
 static tk_parsed_body_result parse_type_body(const tk_token *t, size_t n, size_t pos) {
     if (tk_is_kind_at(t, n, pos, TK_TOKEN_CLASS) || tk_is_kind_at(t, n, pos, TK_TOKEN_ABSTRACT) || tk_is_kind_at(t, n, pos, TK_TOKEN_VIRTUAL)) {
         return parse_class_body(t, n, pos);
     }
     if (tk_is_kind_at(t, n, pos, TK_TOKEN_INTERFACE)) {
         return parse_interface_body(t, n, pos);
+    }
+    // (TR0) `trait` is CONTEXTUAL, like `from`/`params` — NOT a reserved word. It only means
+    // "trait declaration" when the body position holds Ident("trait") IMMEDIATELY followed by
+    // `{`; a transparent alias to a type NAMED `trait` still parses as an alias below. A trait
+    // declares NO derive-list of its own (compose at the deriver instead).
+    if (tk_is_kind_at(t, n, pos, TK_TOKEN_IDENT) && text_is(t[pos].text, "trait") && tk_is_kind_at(t, n, pos + 1, TK_TOKEN_LBRACE)) {
+        tk_parsed_struct_body_result fs = parse_trait_fields(t, n, pos + 1);
+        if (!fs.ok) { return (tk_parsed_body_result){ .ok = false, .as.error = fs.as.error }; }
+        tk_type_body b = { .tag = TK_BODY_TRAIT, .as.trait_body = { .fields = fs.as.value.fields, .n_fields = fs.as.value.n_fields, .methods = fs.as.value.methods, .n_methods = fs.as.value.n_methods } };
+        return (tk_parsed_body_result){ .ok = true, .as.value = { .node = b, .next = fs.as.value.next } };
     }
     if (tk_is_kind_at(t, n, pos, TK_TOKEN_STRUCT)) {
         // (W10b.IF) optional implements list `struct I1 & I2 { … }` between `struct` and `{`.
