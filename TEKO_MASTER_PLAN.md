@@ -756,9 +756,15 @@ the only ones the user ruled on directly.
   `S-TOML` (all `Deps: none`), `Z-DEFLATE`/`Z-BROTLI`/`Z-LZMA`/`Z-ZSTD` (all `Deps: none`), and `C0`/`C1`/
   `C4`/`C6` (crypto core/hash/cipher/rand, gated only on **N-KEYSTONE**, itself `Deps: none`) — is
   **startable NOW on disjoint namespaces** (`src/crypto/*`, `src/encoding/*`, `src/compress/*` don't
-  collide with the OOP-round compiler files). The **socket half** (`N0`/`N1`/`N2`/`N3`… real TCP/TLS/HTTP)
-  needs **N-KEYSTONE** landed as part of **LIB-KEYSTONES** (ROUND 4) before it can move — sequenced there,
-  ROUND 4/5.
+  collide with the OOP-round compiler files). **`S-JSON` ✅ LANDED** (`src/encoding/json/json.tks`,
+  namespace `teko::encoding::json`): full RFC 8259 DOM parser + encoder, no C twin (regex precedent);
+  `JsonValue` variant (Null/Bool/Number/String/Array/Object), objects as parallel `keys`/`values`
+  slices (least-surface choice pending `teko::collections::Map`, S7); 59 `.tkt` tests (escapes incl.
+  `\uXXXX` + surrogate pairs, malformed-input errors, deep nesting, round-trip fixpoint) +
+  `examples/regressions/json_roundtrip/` (exit 9, VM==native); `object_get`/`array_get` accessors kept
+  public for TR4 (`teko::traits`' `Json` structural trait) to consume later. The **socket half**
+  (`N0`/`N1`/`N2`/`N3`… real TCP/TLS/HTTP) needs **N-KEYSTONE** landed as part of **LIB-KEYSTONES**
+  (ROUND 4) before it can move — sequenced there, ROUND 4/5.
 - **PACKAGES** (registry + resolver + `teko::pkg`) — **`PK0`** (`Deps: manifest parser` — already exists)
   is startable **NOW**. **`PK1`** (semver) additionally needs `teko::math` (compare) — i.e. **after MATH
   M0**. **`PK4`+** (fetch/registry/verify/CLI/pre-linker) need net (**N5 HTTP**), so they wait on
