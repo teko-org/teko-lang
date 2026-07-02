@@ -2207,13 +2207,21 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
             tk_type recvT = e->as.safe_field_access.receiver->type;
             if (recvT.tag != TK_TYPE_OPTIONAL || recvT.as.optional.inner == NULL)
                 return fail_node(err, "codegen: safe field access on a non-optional receiver (internal)");
+            // (W10b.CLASS increment 3, latent — NP-OOP follow-up) a CLASS inner is ALWAYS a
+            // pointer (reference semantics, same as the plain TK_TEXPR_FIELD_ACCESS class case
+            // above): `_tN.value` holds a `<T> *`, so the field read needs `_tN.value-><field>`,
+            // not `_tN.value.<field>` (a `.` on a pointer is a C compile error). Gate identically
+            // to the FIELD_ACCESS class branch (cg_is_class_named on the inner's named type).
+            bool inner_is_class = recvT.as.optional.inner->tag == TK_TYPE_NAMED
+                                 && cg_is_class_named(recvT.as.optional.inner->as.named.name);
             char tmp[40]; snprintf(tmp, sizeof tmp, "_o%zu", (size_t)b->len);
             cb(b, "({ "); if (!emit_type(b, recvT, err)) return false;
             cb(b, " "); cb(b, tmp); cb(b, " = (");
             if (!emit_expr(b, e->as.safe_field_access.receiver, err)) return false;
             cb(b, "); "); cb(b, tmp); cb(b, ".present ? (");
             if (!emit_type(b, e->type, err)) return false;            // result optional type
-            cb(b, "){ .present = true, .value = "); cb(b, tmp); cb(b, ".value.");
+            cb(b, "){ .present = true, .value = "); cb(b, tmp);
+            cb(b, inner_is_class ? ".value->" : ".value.");
             cb_str(b, e->as.safe_field_access.field);
             cb(b, " } : ("); if (!emit_type(b, e->type, err)) return false;
             cb(b, "){ .present = false }; })");
