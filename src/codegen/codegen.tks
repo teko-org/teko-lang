@@ -2010,6 +2010,18 @@ fn emit_field_access(buf: []byte, prog: checker::TProgram, fa: checker::TFieldAc
 //   ? (<resTy>){ .present = true, .value = _oN.value.<field> } : (<resTy>){ .present = false }; })
 // The node's `.type` is the result optional `(field)?`; the receiver type is `T?`. (C: TK_TEXPR_SAFE_FIELD_ACCESS.)
 fn emit_safe_field_access(buf: []byte, prog: checker::TProgram, e: checker::TExpr, sfa: checker::TSafeFieldAccess, escaping: []str, regions: []RegionFrame, fn_body: []checker::TStatement, dctx: DeferCtx) -> []byte | error {
+    // (W10b.CLASS increment 3, latent — NP-OOP follow-up) a CLASS inner is ALWAYS a pointer
+    // (reference semantics, same as emit_field_access's class branch above): `_oN.value` holds
+    // a `<T> *`, so the field read needs `_oN.value-><field>`, not `_oN.value.<field>` (a `.` on
+    // a pointer doesn't compile). Gate identically to emit_field_access's is_class_recv check.
+    // (C: the inner_is_class branch of TK_TEXPR_SAFE_FIELD_ACCESS.)
+    let inner_is_class = match sfa.receiver.type {
+        checker::Optional as opt => match opt.inner {
+            checker::Named as nm => cg_is_class_named(prog, nm.name)
+            _ => false
+        }
+        _ => false
+    }
     let tmp = fresh_named("_o", buf.len to i64)
     mut out = cb(buf, "({ ")
     out = match emit_type(out, prog, sfa.receiver.type) { []byte as o => o; error as err => return err }
@@ -2017,7 +2029,8 @@ fn emit_safe_field_access(buf: []byte, prog: checker::TProgram, e: checker::TExp
     out = match emit_expr_ctx(out, prog, checker::Void { }, sfa.receiver, escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
     out = cb(out, "); "); out = cb(out, tmp); out = cb(out, ".present ? (")
     out = match emit_type(out, prog, e.type) { []byte as o => o; error as err => return err }
-    out = cb(out, "){ .present = true, .value = "); out = cb(out, tmp); out = cb(out, ".value.")
+    out = cb(out, "){ .present = true, .value = "); out = cb(out, tmp)
+    out = cb(out, if inner_is_class { ".value->" } else { ".value." })
     out = cb_str(out, sfa.field)
     out = cb(out, " } : (")
     out = match emit_type(out, prog, e.type) { []byte as o => o; error as err => return err }
@@ -5590,6 +5603,20 @@ fn cg_collect_expr_opts(set: CgTypeSet, e: checker::TExpr) -> CgTypeSet {
             }
         }
         checker::TInExpr as ie => { s = cg_collect_expr_opts(s, ie.lhs); mut i = 0; loop { if i >= ie.elems.len { break }; s = cg_collect_expr_opts(s, ie.elems[i]); i++ } }
+        // (#119) A lambda literal's own resolved type (registered above, at entry) is its FUNCTION
+        // type — that carries no tk_opt_/tk_slice_/tk_u_ typedef of its own, so an optional/slice/
+        // variant used ONLY inside the lambda's params/return/body (never anywhere else in the
+        // enclosing function) was never visited: the collector fell through to the `_` leaf arm and
+        // missed the whole body. A lifted lambda's body is emitted as its own function
+        // (cg_emit_lambda_decls, capturing; or a synthesized top-level fn, non-capturing) — same as
+        // any other function body — so it needs the SAME typedef registration a normal function
+        // body gets. (C: the TK_TEXPR_LAMBDA case of cg_collect_expr_opts.)
+        checker::TLambda as lam => {
+            mut i = 0
+            loop { if i >= lam.params.len { break }; s = cg_collect_type_opts(s, lam.params[i].type); i++ }
+            s = cg_collect_type_opts(s, lam.ret)
+            s = cg_collect_block_opts(s, lam.body)
+        }
         _ => { }   // leaves: type already registered above
     }
     s

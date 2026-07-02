@@ -337,9 +337,6 @@ pub type LimitState = struct {
 }
 
 // a ReadFn that yields at most `state.remaining` further bytes from `read`, then EOF.
-// (Lambda bodies below use match-arm VALUES for the error path — `error as e => e` — never
-// `return e`: an early `return` of a BOUND error inside a lambda misses the union wrap in
-// codegen today. Documented compiler gap; the arm-value shape is equivalent and correct.)
 pub fn limit_read_fn(read: ReadFn, state: Ref<LimitState>) -> ReadFn {
     let limited: ReadFn = (max: u64) => {
         mut want = state.value.remaining
@@ -350,7 +347,7 @@ pub fn limit_read_fn(read: ReadFn, state: Ref<LimitState>) -> ReadFn {
                 state.value = LimitState { remaining = state.value.remaining - chunk.len() }
                 chunk
             }
-            error as e => e
+            error as e => return e
         }
     }
     limited
@@ -377,12 +374,7 @@ pub fn buffered_read_fn(read: ReadFn, state: Ref<BufReaderState>, chunk_size: u6
                     if gulp.len() == 0 { return Buf::empty() }   // underlying EOF
                     current = BufReaderState { pending = gulp; pos = 0 }
                 }
-                // early-return the failure as an ALREADY-UNION value (see limit_read_fn's
-                // note: `return e` of a bare bound error misses the union wrap in a lambda).
-                error as e => {
-                    let failed: Buf | error = e
-                    return failed
-                }
+                error as e => return e
             }
         }
         mut take = current.pending.len() - current.pos

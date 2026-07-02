@@ -1,0 +1,31 @@
+// Regression (#119): `bb?.v ?? 0` inside a lambda body — the safe-nav-then-coalesce chain
+// resolves to `tk_opt_i64` for its intermediate optional, but that type appears NOWHERE in
+// the enclosing function outside the lambda. See work.tkp for the full root-cause writeup.
+
+pub type B = struct {
+    v: i64
+}
+
+// captures `bb` — exercises the CAPTURING-lambda lift path (cg_emit_lambda_decls); the
+// non-capturing lift path (a synthesized top-level fn via emit_function) was never affected
+// since a top-level function's own body was always visited by the collector's normal pass.
+pub fn make(bb: B?) -> i64 {
+    let f = () => bb?.v ?? 0
+    f()
+}
+
+// a NON-capturing variant of the same optional-chain shape, so both lift paths are pinned
+// by this one fixture (the collector bug affected the LAMBDA case broadly, not just the
+// capturing sub-path — but capturing is the shape #119 was filed against).
+pub fn make_noncapturing() -> i64 {
+    let none_b: B? = null
+    let g = () => none_b?.v ?? 7
+    g()
+}
+
+pub fn run() -> u64 {
+    let a = make(B { v = 41 })       // present -> 41
+    let b = make(null)               // absent -> 0
+    let c = make_noncapturing()      // absent -> 7
+    (a + b + c) to u64               // 41 + 0 + 7 = 48
+}

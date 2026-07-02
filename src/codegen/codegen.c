@@ -2207,13 +2207,21 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
             tk_type recvT = e->as.safe_field_access.receiver->type;
             if (recvT.tag != TK_TYPE_OPTIONAL || recvT.as.optional.inner == NULL)
                 return fail_node(err, "codegen: safe field access on a non-optional receiver (internal)");
+            // (W10b.CLASS increment 3, latent — NP-OOP follow-up) a CLASS inner is ALWAYS a
+            // pointer (reference semantics, same as the plain TK_TEXPR_FIELD_ACCESS class case
+            // above): `_tN.value` holds a `<T> *`, so the field read needs `_tN.value-><field>`,
+            // not `_tN.value.<field>` (a `.` on a pointer is a C compile error). Gate identically
+            // to the FIELD_ACCESS class branch (cg_is_class_named on the inner's named type).
+            bool inner_is_class = recvT.as.optional.inner->tag == TK_TYPE_NAMED
+                                 && cg_is_class_named(recvT.as.optional.inner->as.named.name);
             char tmp[40]; snprintf(tmp, sizeof tmp, "_o%zu", (size_t)b->len);
             cb(b, "({ "); if (!emit_type(b, recvT, err)) return false;
             cb(b, " "); cb(b, tmp); cb(b, " = (");
             if (!emit_expr(b, e->as.safe_field_access.receiver, err)) return false;
             cb(b, "); "); cb(b, tmp); cb(b, ".present ? (");
             if (!emit_type(b, e->type, err)) return false;            // result optional type
-            cb(b, "){ .present = true, .value = "); cb(b, tmp); cb(b, ".value.");
+            cb(b, "){ .present = true, .value = "); cb(b, tmp);
+            cb(b, inner_is_class ? ".value->" : ".value.");
             cb_str(b, e->as.safe_field_access.field);
             cb(b, " } : ("); if (!emit_type(b, e->type, err)) return false;
             cb(b, "){ .present = false }; })");
@@ -4709,6 +4717,18 @@ static void cg_collect_expr_opts(cg_opt_set *set, const tk_texpr *e) {
             cg_collect_expr_opts(set, e->as.in_expr.lhs);
             for (size_t i = 0; i < e->as.in_expr.nelems; i += 1) cg_collect_expr_opts(set, &e->as.in_expr.elems[i]);
             return;
+        // (#119) A lambda literal's own resolved TYPE (registered above, at entry) is its FUNCTION
+        // type (params -> ret) — that carries no tk_opt_/tk_slice_/tk_u_ typedef of its own, so an
+        // optional/slice/variant used ONLY inside the lambda's params/return/body (never anywhere
+        // else in the enclosing function) was never visited: the collector fell through to the
+        // `default` leaf case and missed the whole body. A lifted CAPTURING lambda's body is emitted
+        // as its own function by cg_emit_lambda_decls — same as a non-capturing lambda's synthesized
+        // top-level fn — so it needs the SAME typedef registration a normal function body gets.
+        case TK_TEXPR_LAMBDA:
+            for (size_t i = 0; i < e->as.lambda.nparams; i += 1) cg_collect_type_opts(set, e->as.lambda.params[i].type);
+            cg_collect_type_opts(set, e->as.lambda.ret);
+            cg_collect_block_opts(set, e->as.lambda.body, e->as.lambda.nbody);
+            return;
         default: return;   // leaves (NUMBER/VAR/STR/BYTE/BOOL/NULL) — type already registered above
     }
 }
@@ -5342,7 +5362,23 @@ static bool cg_emit_lambda_decls(cbuf *b, bool protos_only, const char **err) {
             cb(b, "    "); if (!emit_type(b, lam->captures[ui].type, err)) return false;
             cb(b, " "); cb_ident(b, lam->captures[ui].name); cb(b, " = _e->"); cb_ident(b, lam->captures[ui].name); cb(b, ";\n");
         }
-        if (!emit_block_tail(b, lam->body, lam->nbody, false, lam->ret, "    ", err)) return false;
+        // (#108) A lifted CAPTURING lambda is its own function — a `return e` nested inside a
+        // match/if used as a VALUE sub-expression in its body (emit_arm_value / emit_stmt_value)
+        // wraps via the C twin's g_cg_ret_type static (see emit_function's comment), NOT the
+        // `ret_type` threaded to emit_block_tail (which only covers the lambda's own TAIL path).
+        // Left unset here, g_cg_ret_type still held whatever top-level function was emitted last
+        // by the main pass (cg_emit_lambda_decls runs AFTER it) — a bound error variable then wrapped
+        // into that STALE type instead of the lambda's own `Buf | error`, so cc rejected the bare
+        // `tk_error` return. Set it to the lambda's own return type for the duration of its body,
+        // then restore — a later capturing lambda (or nothing, at the top-level fallback) must not
+        // see this one's type. The .tks twin has no such bug: it threads ret_type explicitly with no
+        // module-mutable global (cg_emit_lambda_decls -> emit_block_tail -> emit_as_r all take it
+        // as a parameter), so only the C twin needed this fix.
+        tk_type saved_ret_type = g_cg_ret_type;
+        g_cg_ret_type = lam->ret;
+        bool lam_ok = emit_block_tail(b, lam->body, lam->nbody, false, lam->ret, "    ", err);
+        g_cg_ret_type = saved_ret_type;
+        if (!lam_ok) return false;
         cb(b, "}\n");
     }
     return true;
