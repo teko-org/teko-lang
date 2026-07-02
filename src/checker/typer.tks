@@ -360,7 +360,7 @@ fn type_list_builtin(c: parser::Call, env: Env, table: TypeTable) -> TExpr | Not
     if last == "empty" {
         if c.args.len != 0 { return error { message = "teko::list::empty expects no arguments" } }
         // SENTINEL slice: element is the Void marker (unifies with any concrete slice — type_eq).
-        TExpr { kind = TCall { callee = c.callee; args = teko::list::empty(); call_ns = ""; is_closure_call = false; callee_type = Void { } }; type = Slice { element = Void { } }; line = 0; col = 0 }
+        TExpr { kind = TCall { callee = c.callee; args = teko::list::empty(); call_ns = ""; is_closure_call = false; callee_type = Void { }; is_iface_dispatch = false; iface_slot = 0 }; type = Slice { element = Void { } }; line = 0; col = 0 }
     } else if last == "push" {
         if c.args.len != 2 { return error { message = "teko::list::push expects two arguments (slice, item)" } }
         let s = match type_expr(c.args[0], env, table) { TExpr as te => te; error as e => return e }
@@ -381,7 +381,7 @@ fn type_list_builtin(c: parser::Call, env: Env, table: TypeTable) -> TExpr | Not
         // ignores a slice's element type but codegen's emit_list_empty REQUIRES it. (Mirror expr.c.)
         let base = match elem { Void => TExpr { kind = s.kind; type = Slice { element = result_elem }; line = s.line; col = s.col }; _ => s }
         mut args = teko::list::push(teko::list::push(teko::list::empty(), base), x)
-        TExpr { kind = TCall { callee = c.callee; args = args; call_ns = ""; is_closure_call = false; callee_type = Void { } }; type = Slice { element = result_elem }; line = 0; col = 0 }
+        TExpr { kind = TCall { callee = c.callee; args = args; call_ns = ""; is_closure_call = false; callee_type = Void { }; is_iface_dispatch = false; iface_slot = 0 }; type = Slice { element = result_elem }; line = 0; col = 0 }
     } else {
         NotListBuiltin { }
     }
@@ -541,6 +541,77 @@ fn type_method_call(mc: parser::MethodCall, env: Env, table: TypeTable) -> TExpr
     if is_flags_named(recv_t, table) { return error { message = "method typing is deferred (B.29 / M.4)" } }
     let struct_name = match recv_t { Named as n => n.name; _ => return error { message = "method typing is deferred (B.29 / M.4)" } }
     let decl = match type_table_find(table, struct_name) { parser::TypeDecl as td => td; error => return error { message = "method typing is deferred (B.29 / M.4)" } }
+    // (W10b.D3) an INTERFACE-typed receiver — a DYNAMIC contract-method call. The method resolves
+    // against the interface's EFFECTIVE (extends-transitive) signature list; its index there is
+    // the vtable slot both backends dispatch through. The receiver rides as args[0] (an interface
+    // value, or a class instance the emitters upcast on the fly). Mirror: expr.c::type_method_call.
+    match decl.body {
+        parser::InterfaceBody => {
+            let eff = match iface_methods_by_name(struct_name, table) { []parser::Function as f => f; error as e => return e }
+            if eff.len == 0 { return error { message = $"no such method '{mc.method}' on interface '{struct_name}'" } }
+            mut ifound = false
+            mut slot: u32 = 0
+            mut imfn = eff[0]   // placeholder; overwritten below iff `ifound` (Teko has no uninitialized values)
+            mut smi: u64 = 0
+            loop {
+                if smi >= eff.len { break }
+                if eff[smi].name == mc.method { ifound = true; imfn = eff[smi]; slot = smi to u32; break }
+                smi++
+            }
+            if !ifound { return error { message = $"no such method '{mc.method}' on interface '{struct_name}'" } }
+            // interface methods are INSTANCE-only signatures (decl-enforced); the receiver resolves
+            // to Named{<iface>} in the FuncType. Defaults live on the CONTRACT (DEFARGS rule E).
+            let ift = match method_func_type(imfn, struct_name, table) { Type as t => t; error as e => return e }
+            let f = match ift { Func as ff => ff; _ => return error { message = "internal: interface method signature is not a function type" } }
+            mut icargs: []parser::Expr = teko::list::push(teko::list::empty(), mc.receiver)
+            mut ica: u64 = 0
+            loop { if ica >= mc.args.len { break }; icargs = teko::list::push(icargs, mc.args[ica]); ica++ }
+            mut icnames: []str = teko::list::empty()   // dot-call is all-positional
+            mut icn: u64 = 0
+            loop { if icn >= icargs.len { break }; icnames = teko::list::push(icnames, ""); icn++ }
+            let dargs = match resolve_defargs(f, icargs, icnames) { []parser::Expr as x => x; error as e => return e }
+            if dargs.len != f.params.len { return error { message = "wrong number of arguments" } }
+            mut iargs: []TExpr = teko::list::empty()
+            mut ii: u64 = 0
+            loop {
+                if ii >= dargs.len { break }
+                mut a = match type_expr(dargs[ii], env, table) { TExpr as te => te; error as e => return e }
+                if type_is_void(a.type) { return error { message = "a `void` expression cannot be passed as an argument (M.1)" } }
+                let pt = f.params[ii]
+                if !assignable_to(a.type, pt, table) {
+                    if !literal_adopts(a, pt) { return teko::error::err_typed(error { message = "argument type mismatch" }, type_render(pt), type_render(a.type)) }
+                    a = TExpr { kind = a.kind; type = pt; line = a.line; col = a.col }   // C6 literal adopts the param type
+                } else {
+                    // adopt the param type EXCEPT where the emit wraps at the use site: a case→variant
+                    // widen, a bare T→T? widen, and (D3) a class→contract upcast — the narrow CLASS
+                    // type is what picks the (class, interface) vtable at the emit.
+                    let pt_is_variant = match expand_variant(pt, table) { Variant => true; _ => false }
+                    let pt_is_opt = match pt { Optional => true; _ => false }
+                    let arg_is_opt = match a.type { Optional => true; _ => false }
+                    let bare_to_opt = pt_is_opt && !arg_is_opt
+                    mut class_to_iface = false
+                    match pt {
+                        Named as ptn => match a.type {
+                            Named as atn => { if is_interface_name(ptn.name, table) && is_class_name(atn.name, table) { class_to_iface = true } }
+                            _ => {}
+                        }
+                        _ => {}
+                    }
+                    if !pt_is_variant && !bare_to_opt && !class_to_iface {
+                        a = TExpr { kind = a.kind; type = pt; line = a.line; col = a.col }
+                    }
+                }
+                iargs = teko::list::push(iargs, a)
+                ii++
+            }
+            let seg_iface = parser::Segment { name = struct_name }
+            let seg_m = parser::Segment { name = mc.method }
+            mut isegs: []parser::Segment = teko::list::push(teko::list::empty(), seg_iface)
+            isegs = teko::list::push(isegs, seg_m)
+            return TExpr { kind = TCall { callee = parser::Path { segments = isegs }; args = iargs; call_ns = ""; is_closure_call = false; callee_type = ift; is_iface_dispatch = true; iface_slot = slot }; type = f.ret; line = 0; col = 0 }
+        }
+        _ => {}
+    }
     // (W10b.CLASS increment 1) a class's instance dot-call reuses this SAME desugar — only the
     // methods list's source differs; a class's methods are otherwise typed exactly like a struct's.
     let methods = match decl.body {
@@ -606,7 +677,7 @@ fn type_call(c: parser::Call, env: Env, table: TypeTable) -> TExpr | error {
             let ok = match a.type { Str => true; Error => true; _ => false }
             if !ok { return error { message = "panic's argument must be an `error` or a `str`" } }
             mut pargs = teko::list::push(teko::list::empty(), a)
-            return TExpr { kind = TCall { callee = c.callee; args = pargs; call_ns = ""; is_closure_call = false; callee_type = Void { } }; type = Void { }; line = 0; col = 0 }
+            return TExpr { kind = TCall { callee = c.callee; args = pargs; call_ns = ""; is_closure_call = false; callee_type = Void { }; is_iface_dispatch = false; iface_slot = 0 }; type = Void { }; line = 0; col = 0 }
         }
         if name == "exit" {
             if c.args.len != 1 { return error { message = "exit expects one argument (an integer status code)" } }
@@ -614,7 +685,7 @@ fn type_call(c: parser::Call, env: Env, table: TypeTable) -> TExpr | error {
             let ok = match a.type { Prim as p => prim_is_int(p.kind); _ => false }
             if !ok { return error { message = "exit's argument must be an integer status code" } }
             mut eargs = teko::list::push(teko::list::empty(), a)
-            return TExpr { kind = TCall { callee = c.callee; args = eargs; call_ns = ""; is_closure_call = false; callee_type = Void { } }; type = Void { }; line = 0; col = 0 }
+            return TExpr { kind = TCall { callee = c.callee; args = eargs; call_ns = ""; is_closure_call = false; callee_type = Void { }; is_iface_dispatch = false; iface_slot = 0 }; type = Void { }; line = 0; col = 0 }
         }
     }
     // (#49) the resolved target's namespace drives the mangled C name. Only a USER function (found
@@ -653,7 +724,11 @@ fn type_call(c: parser::Call, env: Env, table: TypeTable) -> TExpr | error {
                 // un-annotated params from that target (ruling 3); other args type normally.
                 let is_lam = match dargs[ti].kind { parser::Lambda => true; _ => false }
                 let pt_is_func = match f.params[ti] { Func => true; _ => false }
-                let a = if is_lam && pt_is_func {
+                // (W10b.D3) an ARRAY-literal ARG under a `[]<interface>` param types against the
+                // contract element too (heterogeneous `[]Shape` args), like the binding-annotation path.
+                let is_arr = match dargs[ti].kind { parser::ArrayLit => true; _ => false }
+                let iface_arr_target = is_arr && is_iface_slice(f.params[ti], table)
+                let a = if (is_lam && pt_is_func) || iface_arr_target {
                     match type_value_expected(dargs[ti], f.params[ti], env, table) { TExpr as te => te; error as e => return e }
                 } else {
                     match type_expr(dargs[ti], env, table) { TExpr as te => te; error as e => return e }
@@ -684,7 +759,7 @@ fn type_call(c: parser::Call, env: Env, table: TypeTable) -> TExpr | error {
                     s = match unify(f.params[gi], targs[gi].type, s, table) { Subst as x => x; error as e => return e }
                     gi++
                 }
-                return TExpr { kind = TCall { callee = c.callee; args = targs; call_ns = resolved_ns; is_closure_call = false; callee_type = Void { } }; type = subst_type(f.ret, s); line = 0; col = 0 }
+                return TExpr { kind = TCall { callee = c.callee; args = targs; call_ns = resolved_ns; is_closure_call = false; callee_type = Void { }; is_iface_dispatch = false; iface_slot = 0 }; type = subst_type(f.ret, s); line = 0; col = 0 }
             }
             // NON-generic: each argument must WIDEN into the parameter's type (B.14 case→variant, T→T?)
             // OR be a fitting literal that adopts it (C6) — same rule as binding/return/assign.
@@ -729,7 +804,18 @@ fn type_call(c: parser::Call, env: Env, table: TypeTable) -> TExpr | error {
                         let pt_is_opt = match f.params[i] { Optional => true; _ => false }
                         let arg_is_opt = match a.type { Optional => true; _ => false }
                         let bare_to_opt = pt_is_opt && !arg_is_opt
-                        if !pt_is_variant && !bare_to_opt {
+                        // (W10b.D3) a class→contract upcast arg ALSO keeps its narrow CLASS type —
+                        // that is what picks the (class, interface) vtable when emit_as builds the
+                        // fat pointer.
+                        mut class_to_iface = false
+                        match f.params[i] {
+                            Named as ptn => match a.type {
+                                Named as atn => { if is_interface_name(ptn.name, table) && is_class_name(atn.name, table) { class_to_iface = true } }
+                                _ => {}
+                            }
+                            _ => {}
+                        }
+                        if !pt_is_variant && !bare_to_opt && !class_to_iface {
                             a = TExpr { kind = a.kind; type = f.params[i]; line = a.line; col = a.col }
                         }
                     }
@@ -741,7 +827,7 @@ fn type_call(c: parser::Call, env: Env, table: TypeTable) -> TExpr | error {
             // LOCAL (resolved_ns == "" — only define_fn sets a namespace). It is a `tk_closure` VALUE,
             // so codegen calls through `((R(*)(A,B))f.fn)(args)` using the Func type for the cast.
             let is_closure = in_scope && resolved_ns.len == 0
-            TExpr { kind = TCall { callee = c.callee; args = args; call_ns = resolved_ns; is_closure_call = is_closure; callee_type = ft }; type = f.ret; line = 0; col = 0 }
+            TExpr { kind = TCall { callee = c.callee; args = args; call_ns = resolved_ns; is_closure_call = is_closure; callee_type = ft; is_iface_dispatch = false; iface_slot = 0 }; type = f.ret; line = 0; col = 0 }
         }
         _ => error { message = $"not a function: {name}" }
     }
@@ -1041,6 +1127,8 @@ fn type_field_access(fa: parser::FieldAccess, env: Env, table: TypeTable) -> TEx
             }
             t
         }
+        // (W10b.D3) an interface value is data + vtable — the contract exposes METHODS only.
+        parser::InterfaceBody => return error { message = "an interface value exposes no fields — only its contract methods" }
         _                => return error { message = $"type {name} is not a struct (no fields)" }
     }
     TExpr { kind = TFieldAccess { receiver = recv; field = fa.field }; type = ft; line = 0; col = 0 }
@@ -1764,8 +1852,59 @@ fn type_value_expected(e: parser::Expr, expected: Type, env: Env, table: TypeTab
     match e.kind {
         parser::StructLit as sl => type_struct_lit(sl, expected, env, table)
         parser::Lambda as lam   => type_lambda(lam, expected, env, table)   // (W10) target type → un-annotated closure params infer (ruling 3)
+        parser::ArrayLit as al  => {
+            if is_iface_slice(expected, table) { return type_array_lit_expected(al, expected, env, table) }   // (W10b.D3) []<interface> literal
+            type_expr(e, env, table)
+        }
         _                       => type_expr(e, env, table)
     }
+}
+
+// (W10b.D3) is `t` a slice whose element is a NAMED contract (interface)? The gate for the
+// heterogeneous-array expected path below. Mirror of expr.c::is_iface_slice.
+fn is_iface_slice(t: Type, table: TypeTable) -> bool {
+    match t {
+        Slice as s => match s.element {
+            Named as n => is_interface_name(n.name, table)
+            _          => false
+        }
+        _ => false
+    }
+}
+
+// (W10b.D3) an ARRAY literal flowing into a `[]<interface>` slot: type each element AGAINST the
+// contract element (so `[circle, square]` under `[]Shape` never joins to an inline class union
+// the emitters cannot re-tag). Each element keeps its NARROW class type (emit_as builds the fat
+// pointer per slot); the array's own type adopts the expected `[]<interface>`. A spread element
+// contributes a whole `[]U` — U must widen into the contract element (its value covariant-
+// rebuilds element-wise instead). Mirror of expr.c::type_array_lit_expected.
+fn type_array_lit_expected(a: parser::ArrayLit, expected: Type, env: Env, table: TypeTable) -> TExpr | error {
+    let elem = match expected { Slice as s => s.element; _ => return error { message = "internal: type_array_lit_expected needs a slice expected type" } }
+    mut elems: []TArrayElem = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= a.elements.len { break }
+        let e = match type_expr(a.elements[i].expr, env, table) { TExpr as te => te; error as err2 => return err2 }
+        if a.elements[i].is_spread {
+            let selem = match e.type {
+                Slice as fs => fs.element
+                _           => return error { message = "a spread element (`..xs`) must be a slice (`[]T`)" }
+            }
+            let selem_is_void = match selem { Void => true; _ => false }
+            if selem_is_void { return error { message = "a spread element (`..xs`) must be a slice (`[]T`)" } }
+            if !assignable_to(selem, elem, table) {
+                return teko::error::err_typed(error { message = "array element type mismatch" }, type_render(elem), type_render(selem))
+            }
+        } else {
+            if type_is_void(e.type) { return error { message = "a `void` expression cannot be an array element (M.1)" } }
+            if !assignable_to(e.type, elem, table) {
+                return teko::error::err_typed(error { message = "array element type mismatch" }, type_render(elem), type_render(e.type))
+            }
+        }
+        elems = teko::list::push(elems, TArrayElem { is_spread = a.elements[i].is_spread; expr = e })   // keep the NARROW type — the emit wraps per slot
+        i++
+    }
+    TExpr { kind = TArrayLit { elements = elems }; type = expected; line = 0; col = 0 }
 }
 
 // Type a binding's value with the annotation as its expected type (so a generic constructor targets

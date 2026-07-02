@@ -460,17 +460,24 @@ static bool cg_is_class_named(tk_str name) {
     return d != NULL && d->body.tag == TK_BODY_CLASS;
 }
 
-// (W10b.CLASS increment 4) does `class_name` declare a `destruct(self) -> void` method (own or
-// inherited — tk_type_struct_methods stamps EVERY effective method under the OWNING class's own
-// namespace, so searching for a tk_tfunction named "destruct" whose namespace's last segment is
-// `class_name` finds it either way)? Returns that method's mangled NAMESPACE (for cb_fn_name) via
-// `*out`, true if found. Scoped assumption: one class of a given bare name per program (a name
-// collision across namespaces both with a `destruct` is not disambiguated here).
-static bool cg_find_destruct_ns(tk_str class_name, tk_str *out) {
+// (W10b.D3) is `name` an interface (a contract)? A contract-typed value lowers to the fat
+// pointer `{ data, vtable }` typedef; upcasts and dynamic method calls key off this probe.
+static bool cg_is_interface_named(tk_str name) {
+    const tk_type_decl *d = cg_find_decl(name);
+    return d != NULL && d->body.tag == TK_BODY_INTERFACE;
+}
+
+// (W10b.D3, generalized from increment 4's destruct lookup) does `class_name` provide a method
+// named `method` (own or inherited — tk_type_struct_methods stamps EVERY effective method under
+// the OWNING class's own namespace, so searching for a tk_tfunction named `method` whose
+// namespace's last segment is `class_name` finds it either way)? Returns that method's mangled
+// NAMESPACE (for cb_fn_name) via `*out`, true if found. Scoped assumption: one class of a given
+// bare name per program (a name collision across namespaces is not disambiguated here).
+static bool cg_find_method_ns(tk_str class_name, tk_str method, tk_str *out) {
     for (size_t i = 0; i < g_cg_prog.nitems; i += 1) {
         if (g_cg_prog.items[i].tag != TK_TITEM_FUNCTION) continue;
         const tk_tfunction *tf = &g_cg_prog.items[i].as.function;
-        if (!cg_name_eq(tf->name, (tk_str){ (const tk_byte *)"destruct", 8 })) continue;
+        if (!cg_name_eq(tf->name, method)) continue;
         if (cg_name_eq(tf->namespace, class_name)) { *out = tf->namespace; return true; }
         // namespace ends with "::" + class_name?
         tk_byte sepbuf[2] = { ':', ':' };
@@ -484,6 +491,12 @@ static bool cg_find_destruct_ns(tk_str class_name, tk_str *out) {
         }
     }
     return false;
+}
+
+// (W10b.CLASS increment 4) does `class_name` declare a `destruct(self) -> void` method (own or
+// inherited)? The destruction hook's lookup — now a thin wrapper over cg_find_method_ns.
+static bool cg_find_destruct_ns(tk_str class_name, tk_str *out) {
+    return cg_find_method_ns(class_name, (tk_str){ (const tk_byte *)"destruct", 8 }, out);
 }
 
 // (W10b.CLASS increment 4) THE DESTRUCTION HOOK text: for every TOP-LEVEL `let`/`mut` binding in
@@ -1268,6 +1281,43 @@ static bool cg_stmt_c_terminates(const tk_tstatement *s);  // (W9.3) fwd — use
 // no wrap because its struct value already carries the case name — this synthesizes the
 // C wrap, completing the W4c-deferred variant-value layer.)
 static bool emit_as(cbuf *b, tk_type expected, const tk_texpr *value, const char **err);
+
+// (W10b.D3) a DYNAMIC contract-method call through an interface value's vtable, as a GNU
+// statement-expression: bind the receiver ONCE (args[0] — a class instance is upcast on the fly
+// by emit_as, an interface value passes through), then cast slot `iface_slot`'s code pointer to
+// the method's concrete C signature — `R (*)(void *, params…)`, the receiver riding as the
+// ABI-identical `void *` data word — and call it. Rides emit_closure_call's cast-and-call scheme
+// (the tk_closure machinery the plan's D3 row names). Mirror of codegen.tks::emit_iface_call.
+static bool emit_iface_call(cbuf *b, const tk_texpr *e, const char **err) {
+    tk_path p = e->as.call.callee;
+    tk_type ift = e->as.call.callee_type;
+    if (p.len < 2 || ift.tag != TK_TYPE_FUNC || e->as.call.nargs == 0 || e->as.call.nargs != ift.as.func.nparams)
+        return fail_node(err, "codegen: malformed interface-dispatch node (internal)");
+    tk_str iface = p.segments[p.len - 2].name;
+    char t[40]; snprintf(t, sizeof t, "_tid%zu", (size_t)b->len);
+    cb(b, "({ ");
+    mangle_type_name(b, (tk_str){ NULL, 0 }, iface);
+    cb(b, " "); cb(b, t); cb(b, " = ");
+    tk_type iface_t = { .tag = TK_TYPE_NAMED, .as.named.name = iface };
+    if (!emit_as(b, iface_t, &e->as.call.args[0], err)) return false;
+    cb(b, "; ((");
+    if (!emit_type(b, *ift.as.func.ret, err)) return false;
+    cb(b, " (*)(void *");
+    for (size_t i = 1; i < ift.as.func.nparams; i += 1) {
+        cb(b, ", ");
+        if (!emit_type(b, ift.as.func.params[i], err)) return false;
+    }
+    cb(b, "))");
+    cb(b, t); cb(b, ".vtable[");
+    cb_u64_dec(b, (uint64_t)e->as.call.iface_slot);
+    cb(b, "])("); cb(b, t); cb(b, ".data");
+    for (size_t i = 1; i < e->as.call.nargs; i += 1) {
+        cb(b, ", ");
+        if (!emit_as(b, ift.as.func.params[i], &e->as.call.args[i], err)) return false;
+    }
+    cb(b, "); })");
+    return true;
+}
 // Host-FFI lifting (Phase 7): a builtin whose Teko return is `T|error` / `error?` / `[]str`
 // is emitted as a statement-expression that calls a fixed-ABI runtime primitive (teko_rt.h)
 // and lifts the result into the program's generated result type (e->type). Defined after the
@@ -1700,6 +1750,9 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
         }
 
         case TK_TEXPR_CALL: {
+            // (W10b.D3) a DYNAMIC contract-method call dispatches through the receiver's vtable —
+            // FIRST, before any builtin name-sniffing below could collide with a method name.
+            if (e->as.call.is_iface_dispatch) return emit_iface_call(b, e, err);
             // callee path -> C identifier joined by "__" (single-segment in M0).
             tk_path p = e->as.call.callee;
             // E2 (native): err_loc/err_typed adorn an error VALUE with diagnostic position/types.
@@ -2809,6 +2862,19 @@ static bool cg_wrap_elem_str(cbuf *b, tk_type expected, tk_type vtype, const cha
         cb(b, " }");
         return true;
     }
+    // (W10b.D3) T is a CONTRACT (interface) and the element a conforming CLASS: wrap the element
+    // lvalue into the fat pointer, exactly like emit_as's value-position upcast — this is how a
+    // homogeneous `[]Circle` value covariant-rebuilds into a `[]Shape` slot.
+    if (expected.tag == TK_TYPE_NAMED && cg_is_interface_named(expected.as.named.name)
+        && vtype.tag == TK_TYPE_NAMED && cg_is_class_named(vtype.as.named.name)) {
+        cb(b, "(");
+        mangle_type_name(b, (tk_str){ NULL, 0 }, expected.as.named.name);
+        cb(b, "){ .data = (void *)("); cb(b, cexpr);
+        cb(b, "), .vtable = tk_vt_");
+        cb_str(b, vtype.as.named.name); cb(b, "_"); cb_str(b, expected.as.named.name);
+        cb(b, " }");
+        return true;
+    }
     return emit_variant_wrap_str(b, expected, vtype, cexpr, err);
 }
 
@@ -3004,6 +3070,20 @@ static bool emit_as(cbuf *b, tk_type expected, const tk_texpr *value, const char
             return true;
         }
         return emit_expr(b, value, err);
+    }
+    // (W10b.D3) CONTRACT (interface) slot: a CLASS instance upcasts into the fat pointer — the
+    // object pointer rides `data`, the (class, contract) static vtable rides `vtable`. An
+    // already-contract-typed value falls through and is emitted plainly (same C typedef).
+    if (expected.tag == TK_TYPE_NAMED && cg_is_interface_named(expected.as.named.name)
+        && value->type.tag == TK_TYPE_NAMED && cg_is_class_named(value->type.as.named.name)) {
+        cb(b, "(");
+        mangle_type_name(b, (tk_str){ NULL, 0 }, expected.as.named.name);
+        cb(b, "){ .data = (void *)(");
+        if (!emit_expr(b, value, err)) return false;
+        cb(b, "), .vtable = tk_vt_");
+        cb_str(b, value->type.as.named.name); cb(b, "_"); cb_str(b, expected.as.named.name);
+        cb(b, " }");
+        return true;
     }
     // VARIANT slot wrap (B-cg2). Wrap a bare MEMBER value into the variant's tag+union rep:
     //   (<variantCType>){ .tag = TK_TAG_<V|U…>_<UPPER memberKey>, .as.<memberKey> = <value> }
@@ -4475,9 +4555,9 @@ static bool emit_type_decl(cbuf *b, tk_tprogram prog, tk_type_decl d, const char
             return true;
         }
         case TK_BODY_INTERFACE:
-            // (W10b.IF) an interface is a COMPILE-TIME contract only — NO runtime C type is emitted
-            // (dynamic dispatch / vtable is ROUND 3). Like a transparent alias, it lowers to nothing;
-            // the checker rejects using an interface as a value type.
+            // (W10b.D3) a contract's fat-pointer typedef is emitted in the FORWARD pass (it embeds
+            // nothing, everything may embed it); its per-(class, contract) vtables are emitted after
+            // the function prototypes. Nothing to emit here.
             return true;
     }
     return fail_node(err, "codegen: unknown type body not yet supported");
@@ -5286,6 +5366,14 @@ tk_cstr_result tk_emit_c(tk_tprogram prog) {
             mangle_type_name(&b, (tk_str){ NULL, 0 }, d.name);
             cb(&b, ";\n");
         }
+        // (W10b.D3) an INTERFACE (contract) value is a data+vtable FAT POINTER — the tk_closure-
+        // shaped two-word rep. It embeds nothing and nothing orders before it, so the FULL typedef
+        // lands here in the forward pass (a class/struct field of contract type then just works).
+        if (d.body.tag == TK_BODY_INTERFACE) {
+            cb(&b, "typedef struct { void *data; void *const *vtable; } ");
+            mangle_type_name(&b, (tk_str){ NULL, 0 }, d.name);
+            cb(&b, ";\n");
+        }
     }
     cb(&b, "\n");
     // Full type declarations IN DEPENDENCY ORDER (self-host): slice typedefs first (pointers),
@@ -5308,6 +5396,44 @@ tk_cstr_result tk_emit_c(tk_tprogram prog) {
         cb(&b, ";\n");
     }
     cb(&b, "\n");
+    // (W10b.D3) per-(class, contract) VTABLES — one static table per conforming pair, built at
+    // COMPILE time (conformance is nominal and closed-world; no runtime reflection). Slot i is
+    // the contract's i-th EFFECTIVE method (extends-transitive first, then own — the checker's
+    // iface_slot agrees by construction). Identical signatures across contracts share the SAME
+    // fn-ptr for free: every slot points at the class's ONE stamped method function. Emitted
+    // after the prototypes (the fn names must be declared) and before any body; `-w` on the
+    // generated C keeps an unused table warning-free.
+    {
+        tk_type_table vt_table = tk_type_table_of(prog);
+        for (size_t ci = 0; ci < prog.nitems; ci += 1) {
+            if (prog.items[ci].tag != TK_TITEM_TYPE_DECL) continue;
+            tk_type_decl cd = prog.items[ci].as.type_decl;
+            if (cd.body.tag != TK_BODY_CLASS) continue;
+            for (size_t ii = 0; ii < prog.nitems; ii += 1) {
+                if (prog.items[ii].tag != TK_TITEM_TYPE_DECL) continue;
+                tk_type_decl idd = prog.items[ii].as.type_decl;
+                if (idd.body.tag != TK_BODY_INTERFACE) continue;
+                if (!tk_type_conforms_to(cd.name, idd.name, vt_table)) continue;
+                tk_methodsvec_result ms = tk_iface_methods_by_name(idd.name, vt_table);
+                if (!ms.ok) { tk_free0(b.ptr); return cg_err("codegen: interface method list failed (internal)"); }
+                cb(&b, "static void *const tk_vt_");
+                cb_str(&b, cd.name); cb(&b, "_"); cb_str(&b, idd.name);
+                cb(&b, "[] = {");
+                if (ms.as.value.len == 0) cb(&b, " (void *)0");   // a methodless contract still gets a (never-indexed) one-slot table
+                for (size_t mi = 0; mi < ms.as.value.len; mi += 1) {
+                    tk_str mns;
+                    if (!cg_find_method_ns(cd.name, ms.as.value.ptr[mi].name, &mns)) {
+                        tk_free0(b.ptr);
+                        return cg_err("codegen: conforming class is missing an interface method's stamped function (internal)");
+                    }
+                    cb(&b, mi == 0 ? " (void *)&" : ", (void *)&");
+                    cb_fn_name(&b, mns, ms.as.value.ptr[mi].name);
+                }
+                cb(&b, " };\n");
+            }
+        }
+        cb(&b, "\n");
+    }
     // (W10) capturing lambdas: env-struct typedefs + lifted-fn forward declarations.
     if (!cg_emit_lambda_decls(&b, true, &err)) { tk_free0(b.ptr); return cg_err(err); }
     cb(&b, "\n");

@@ -66,7 +66,7 @@ static tk_type_result func_type(tk_function f, tk_type_table table) {
 // RECEIVER param (has_type=false, only ever index 0) resolves to Named{struct_name} — its type
 // is IMPLICIT (the enclosing struct), never written by the user, so it can't go through
 // tk_resolve_type like an ordinary annotated param.
-static tk_type_result method_func_type(tk_function f, tk_str struct_name, tk_type_table table) {
+tk_type_result tk_method_func_type(tk_function f, tk_str struct_name, tk_type_table table) {
     tk_type_table tbl = tk_type_param_table(f.type_params, f.n_type_params, (tk_str){0}, table);
     tk_type *params = NULL; size_t n = 0;
     tk_str *param_names = NULL;
@@ -349,6 +349,19 @@ static tk_methodsvec_result effective_interface_methods(tk_interface_body ib, tk
     return (tk_methodsvec_result){ .ok = true, .as.value = { .ptr = out, .len = n_out } };
 }
 
+// (W10b.D3) an interface's effective methods BY NAME — the PUBLIC dispatch surface. The checker
+// (interface-receiver method typing), codegen (vtable emission), and the plan's slot scheme all
+// read THIS list in THIS order (extends-transitive methods first, then own) — the method's index
+// here IS its vtable slot. Mirror of collect.tks::iface_methods_by_name.
+tk_methodsvec_result tk_iface_methods_by_name(tk_str iface, tk_type_table table) {
+    ifacebody_result ib = find_interface_body(iface, table);
+    if (!ib.ok) return (tk_methodsvec_result){ .ok = false, .as.error = ib.as.error };
+    return effective_interface_methods(ib.as.value, table, &iface, 1);
+}
+
+// (W10b.D3) `tk_is_interface_name` / `tk_type_conforms_to` live in resolve.c (the widening rule
+// tk_widens_into needs them, and resolve sits BELOW collect in the module DAG — DIP).
+
 // (W10b.IF) does implementing method `impl_m` satisfy interface-required method `req`? Same NON-
 // receiver param types (both skip their 1st untyped receiver param) + same return type. Any type
 // that fails to resolve makes it a non-match. Mirror of collect.tks::method_sig_matches.
@@ -518,7 +531,7 @@ tk_collected_result tk_collect(tk_program program) {
             tk_str method_ns = owning_ns.len == 0 ? td.name : collect_str_concat(collect_str_concat(owning_ns, (tk_str){ .ptr = (const tk_byte *)"::", .len = 2 }), td.name);
             for (size_t mi = 0; mi < td.body.as.struct_body.n_methods; mi += 1) {
                 tk_function mf = td.body.as.struct_body.methods[mi];
-                tk_type_result mft = method_func_type(mf, td.name, table);
+                tk_type_result mft = tk_method_func_type(mf, td.name, table);
                 if (!mft.ok) return (tk_collected_result){ .ok = false, .as.error = mft.as.error };
                 env = tk_env_define_fn(env, mf.name, mft.as.value, method_ns);
             }
@@ -534,7 +547,7 @@ tk_collected_result tk_collect(tk_program program) {
             if (!eff.ok) return (tk_collected_result){ .ok = false, .as.error = eff.as.error };
             for (size_t mi = 0; mi < eff.as.value.len; mi += 1) {
                 tk_function mf = eff.as.value.ptr[mi];
-                tk_type_result mft = method_func_type(mf, td.name, table);
+                tk_type_result mft = tk_method_func_type(mf, td.name, table);
                 if (!mft.ok) return (tk_collected_result){ .ok = false, .as.error = mft.as.error };
                 env = tk_env_define_fn(env, mf.name, mft.as.value, method_ns);
             }
@@ -577,7 +590,7 @@ tk_collected_result tk_collect_with_seed(tk_program program, tk_collected seed) 
             tk_str method_ns = owning_ns.len == 0 ? td.name : collect_str_concat(collect_str_concat(owning_ns, (tk_str){ .ptr = (const tk_byte *)"::", .len = 2 }), td.name);
             for (size_t mi = 0; mi < td.body.as.struct_body.n_methods; mi += 1) {
                 tk_function mf = td.body.as.struct_body.methods[mi];
-                tk_type_result mft = method_func_type(mf, td.name, table);
+                tk_type_result mft = tk_method_func_type(mf, td.name, table);
                 if (!mft.ok) return (tk_collected_result){ .ok = false, .as.error = mft.as.error };
                 env = tk_env_define_fn(env, mf.name, mft.as.value, method_ns);
             }
@@ -591,7 +604,7 @@ tk_collected_result tk_collect_with_seed(tk_program program, tk_collected seed) 
             if (!eff.ok) return (tk_collected_result){ .ok = false, .as.error = eff.as.error };
             for (size_t mi = 0; mi < eff.as.value.len; mi += 1) {
                 tk_function mf = eff.as.value.ptr[mi];
-                tk_type_result mft = method_func_type(mf, td.name, table);
+                tk_type_result mft = tk_method_func_type(mf, td.name, table);
                 if (!mft.ok) return (tk_collected_result){ .ok = false, .as.error = mft.as.error };
                 env = tk_env_define_fn(env, mf.name, mft.as.value, method_ns);
             }

@@ -1728,6 +1728,77 @@ static const tk_tfunction *closure_target(const tk_texpr *e, tk_venv *env, size_
     return find_function_ns(fp, cv.as.func.ns, out_idx);
 }
 
+// (W10b.D3) resolve a DYNAMIC contract-method call's target: the concrete class's stamped
+// function named `method` whose namespace IS `class_name` or ends with "::" + `class_name` —
+// the SAME rule codegen's vtable build uses (cg_find_method_ns), so both engines dispatch to
+// the SAME method (virtual overrides included: every effective method is stamped per class).
+// Mirror of vm.tks::find_class_method.
+static const tk_tfunction *find_class_method(tk_str class_name, tk_str method, size_t *out_idx) {
+    for (size_t i = 0; i < g_prog.nitems; i += 1) {
+        if (g_prog.items[i].tag != TK_TITEM_FUNCTION) continue;
+        const tk_tfunction *tf = &g_prog.items[i].as.function;
+        if (!name_eq(tf->name, method)) continue;
+        if (name_eq(tf->namespace, class_name)) { *out_idx = i; return tf; }
+        size_t suffix_len = 2 + class_name.len;
+        if (tf->namespace.len >= suffix_len) {
+            const tk_byte *tail = tf->namespace.ptr + (tf->namespace.len - suffix_len);
+            if (tail[0] == ':' && tail[1] == ':') {
+                tk_str name_part = { tail + 2, class_name.len };
+                if (name_eq(name_part, class_name)) { *out_idx = i; return tf; }
+            }
+        }
+    }
+    return NULL;
+}
+
+// (W10b.D3) DYNAMIC contract-method dispatch. The receiver (args[0]) evaluates ONCE; a class
+// instance IS the interface value in the VM (a ClassRef cell — no fat pointer needed, the cell's
+// struct payload carries the CONCRETE class name to dispatch on). The ORIGINAL ClassRef binds as
+// the receiver param (reference semantics survive the dispatch). Non-receiver args bind exactly
+// like bind_call_args (Ref auto-promotion included). Shared by BOTH eval_call and call_value —
+// the twin-asymmetry trap's two entry points. Mirror of vm.tks::eval_iface_call.
+static tk_value eval_iface_call(const tk_texpr *e, tk_venv *env) {
+    tk_value recv = tk_vm_eval_expr(&e->as.call.args[0], env);
+    if (recv.tag != TK_VAL_CLASS_REF)
+        vm_unsupported("interface dispatch on a non-class value (internal: only a class instance upcasts)");
+    tk_value payload = cell_get(recv.as.class_ref.cell);
+    if (payload.tag != TK_VAL_STRUCT)
+        vm_unsupported("interface dispatch: the class cell holds no struct payload (internal)");
+    tk_str method = e->as.call.callee.segments[e->as.call.callee.len - 1].name;
+    size_t fn_idx = 0;
+    const tk_tfunction *fn = find_class_method(payload.as.st.type_name, method, &fn_idx);
+    if (fn == NULL)
+        vm_unsupported("interface dispatch: no stamped method on the concrete class (internal: conformance was checked)");
+    if (fn->nparams == 0 || fn->nparams != e->as.call.nargs)
+        vm_unsupported("interface dispatch: arity mismatch (internal: the checker fixed the arity)");
+    if (!fn->is_test) tk_cov_mark(fn_idx);
+    tk_venv fenv = { .head = NULL };
+    env_define(&fenv, fn->params[0].name, recv);   // the receiver — the ORIGINAL ClassRef
+    for (size_t i = 1; i < e->as.call.nargs; i += 1) {
+        if (param_is_ref(fn, i)) {   // same auto-ref/forward rule as bind_call_args
+            if (e->as.call.args[i].tag != TK_TEXPR_VAR)
+                vm_unsupported("a `Ref<T>` argument must be a mutable variable (internal: checker should reject)");
+            if (e->as.call.args[i].type.tag == TK_TYPE_REF) {
+                tk_value fwd = tk_vm_eval_expr(&e->as.call.args[i], env);
+                env_define(&fenv, fn->params[i].name, fwd);
+            } else {
+                tk_slot *s = env_find(env, e->as.call.args[i].as.var.name);
+                if (s == NULL) vm_unsupported("auto-ref of an unbound variable (internal: checker should reject)");
+                if (!s->has_cell) { s->cell_id = cell_alloc(s->val); s->has_cell = true; }
+                env_define(&fenv, fn->params[i].name, v_ref(s->cell_id));
+            }
+        } else {
+            tk_value av = tk_vm_eval_expr(&e->as.call.args[i], env);
+            env_define(&fenv, fn->params[i].name, coerce_to(av, param_coerce_type(fn->params[i].type_ann)));
+        }
+    }
+    tk_flow fl = run_user_fn(fn, fn_idx, &fenv);
+    env_free(&fenv);
+    if ((fl.kind == TK_FLOW_RETURN || fl.kind == TK_FLOW_NORMAL) && fl.has_value)
+        return coerce_to(fl.value, fn->return_type);
+    return v_void();
+}
+
 // call_value — a call in STATEMENT position (the .tks twin's call_value). (MEM Step 2/3) This is the
 // path that SUPPORTS `Ref<T>` aliasing: auto-ref promotes the caller's `mut` lvalue to a (global) cell
 // and the callee writes through it, so `bump(x)` mutates `x`. The C cell store is global/shared, so
@@ -1739,6 +1810,9 @@ static bool call_value(const tk_texpr *e, tk_venv *env, tk_value *out) {
     const tk_texpr *args = e->as.call.args;
     size_t nargs = e->as.call.nargs;
 
+    // (W10b.D3) dynamic contract dispatch — FIRST, before builtin name-sniffing could collide
+    // with a method name. Same guard in eval_call (the VM twin-asymmetry rule).
+    if (e->as.call.is_iface_dispatch) { *out = eval_iface_call(e, env); return true; }
     if (try_builtin_call(p, args, nargs, env, out)) return true;   // `-> void` builtin (or value builtin) — no ref args
     if (e->as.call.is_closure_call && try_lambda_call(e, env, out)) return true;   // (W10) a lambda value runs its own body
 
@@ -1769,6 +1843,9 @@ static tk_value eval_call(const tk_texpr *e, tk_venv *env) {
     const tk_texpr *args = e->as.call.args;
     size_t nargs = e->as.call.nargs;
 
+    // (W10b.D3) dynamic contract dispatch — FIRST, before builtin name-sniffing could collide
+    // with a method name. Same guard in call_value (the VM twin-asymmetry rule).
+    if (e->as.call.is_iface_dispatch) return eval_iface_call(e, env);
     tk_value out;
     if (try_builtin_call(p, args, nargs, env, &out)) return out;
     if (e->as.call.is_closure_call && try_lambda_call(e, env, &out)) return out;   // (W10) a lambda value runs its own body
@@ -1853,6 +1930,35 @@ static tk_str bind_case_name(tk_bind_pattern bp) {
     if (bp.nargs == 0) return path_last(bp.type_name);
     tk_type_expr gte = { .tag = TK_TEXPR_NAMED, .as.named = { .path = bp.type_name, .args = bp.type_args, .args_len = bp.nargs } };
     return vm_texpr_mangle(gte);
+}
+
+// (W10b.D3 codec fix) are `a` and `b` BOTH members of one declared variant? If so, a struct value
+// tagged `a` is ALREADY a fully-discriminated case wherever `b` could appear — so descending into
+// its fields to reinterpret it as the sibling case `b` is the conflation bug the tag-24 roundtrip
+// caught (`Func { ret = Prim }` matched a `Prim` arm through `ret`, since Func and Prim are both
+// `Type` members). Combined with the field-count guard at the descent site: descent is SKIPPED
+// only for a MULTI-FIELD sibling — a SINGLE-FIELD sibling wrapper (`Optional { inner = Prim }`)
+// still descends (doctrine — teko-vm-wrapper-descent-bug), and a NON-sibling multi-field node
+// (`Expr { kind = Compare; line; col }` → Compare, an ExprKind member Expr is not a peer of) still
+// descends (the corpus AST-node-into-kind idiom). Mirrors vm.tks::variant_siblings.
+static bool variant_siblings(tk_str a, tk_str b) {
+    for (size_t i = 0; i < g_prog.nitems; i += 1) {
+        if (g_prog.items[i].tag != TK_TITEM_TYPE_DECL) continue;
+        tk_type_decl td = g_prog.items[i].as.type_decl;
+        if (td.body.tag != TK_BODY_VARIANT) continue;
+        tk_type_expr te = td.body.as.variant_body.type_expr;
+        if (te.tag != TK_TEXPR_UNION) continue;
+        bool has_a = false, has_b = false;
+        for (size_t j = 0; j < te.as.uni.len; j += 1) {
+            tk_type_expr m = te.as.uni.members[j];
+            if (m.tag != TK_TEXPR_NAMED || m.as.named.path.len == 0) continue;
+            tk_str nm = m.as.named.path.segments[m.as.named.path.len - 1].name;
+            if (name_eq(nm, a)) has_a = true;
+            if (name_eq(nm, b)) has_b = true;
+        }
+        if (has_a && has_b) return true;
+    }
+    return false;
 }
 
 // case_in_variant — is `cname` a MEMBER of the variant type `vname`? A match arm pattern may name
@@ -2050,13 +2156,21 @@ static bool pat_match(const tk_pattern *pat, tk_value subj, tk_venv *env) {
                     if (pat->as.bind.has_binding) env_define(env, pat->as.bind.binding, subj);
                     return true;
                 }
-                // Transparent field descent: when the subject is a struct whose fields contain
-                // a value that matches the pattern name (e.g. `Number as nn` on `Expr { kind =
-                // Number{…}; line; col }`), drill into the first matching STRUCT field and bind.
+                // Transparent field descent: when the subject is a struct whose fields hold a
+                // value matching the pattern name (e.g. `Compare as c` on `Expr { kind = Compare;
+                // line; col }`), drill into the first matching STRUCT field and bind. SKIPPED only
+                // for a MULTI-FIELD SIBLING of the target — a subject that is itself a properly-
+                // discriminated case of the SAME union the target belongs to must not be re-read as
+                // the sibling case through an inner field (`Func { params; ret; … }` → a `Prim` arm
+                // via `ret`, both `Type` members — the tag-24 codec bug). A SINGLE-FIELD sibling
+                // wrapper (`Optional { inner = Prim }` → Prim) still descends (doctrine); a NON-
+                // sibling multi-field node still descends (the AST-node-into-kind corpus idiom).
                 // Only struct fields are eligible — int fields are excluded because match_as_enum_int
-                // could match enum member names that coincidentally share the same ordinal value as an
-                // unrelated enum (e.g. TyShape::Variant=2 vs PrimKind::U32=2 causing false descent).
-                if (subj.tag == TK_VAL_STRUCT) {
+                // could match enum member names that coincidentally share an ordinal (e.g.
+                // TyShape::Variant=2 vs PrimKind::U32=2 causing false descent).
+                bool descend_ok = subj.tag == TK_VAL_STRUCT
+                    && !(subj.as.st.fields.len > 1 && variant_siblings(subj.as.st.type_name, bname));
+                if (descend_ok) {
                     for (size_t fi = 0; fi < subj.as.st.fields.len; fi += 1) {
                         tk_value fv = subj.as.st.fields.vals[fi];
                         if (fv.tag != TK_VAL_STRUCT) continue;

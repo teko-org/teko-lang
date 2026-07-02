@@ -1,0 +1,766 @@
+// src/fmt/fmt.tks   (namespace 'teko::fmt') — DT0: `teko fmt`, the canonical formatter.
+//
+// CONTRACT (TEKO_ROADMAP_DEVTOOLS.md §1 DT0). A CANONICAL pretty-printer (gofmt model:
+// zero options, no debate — open decision #1's recommendation, taken): parse → format
+// the token stream → emit. Comment preservation follows open decision #2's
+// recommendation: comments are re-attached from a SEPARATE token-stream pass (this
+// module's raw scanner keeps them as tokens), never from AST surgery — the parser and
+// AST stay untouched.
+//
+// PURE-TEKO, NO C TWIN (the teko::regex / teko::fs / teko::io precedent): this module is
+// corpus source, so BOTH engines get it automatically — the VM tree-walks it (the `.tkt`
+// gate) and every self-hosted binary compiles it natively. The C seed (main.c) only
+// RECOGNIZES the subcommand and stops honestly (M.3) — the seed exists to bootstrap, not
+// to format.
+//
+// WHAT "CANONICAL" MEANS HERE (gofmt-style — gofmt likewise preserves the author's line
+// breaks and does not enforce a line length):
+//   * line STRUCTURE is the author's: newlines are significant statement separators
+//     (B.26), so fmt NEVER joins or splits lines — it re-indents and re-spaces them;
+//   * indentation is 4 spaces per unclosed `(`/`[`/`{` depth (leading closers dedent);
+//   * inter-token spacing is normalized (one space around binary operators, none inside
+//     parens, `, ` / `; ` / `: `, ` { ` braces, tight `.`/`::`/`?.`/`..`/postfix `?`);
+//   * `<`/`>`/`<<`/`>>` are AMBIGUOUS at token level (generics vs comparison vs shift):
+//     their spacing preserves the source's tight/spaced choice — tight stays tight,
+//     spaced becomes exactly one space (idempotent both ways);
+//   * runs of blank lines collapse to ONE; blanks directly after an opener line or
+//     before a closer line are dropped; trailing whitespace is stripped; the file ends
+//     with exactly one newline;
+//   * a trailing `//` comment sits exactly THREE spaces after the code (the corpus's
+//     dominant convention); comment/string BYTES are never altered (multi-line doc
+//     comments and multi-line strings are emitted verbatim).
+//
+// SAFETY (M.1 — semantic preservation is CHECKED, not hoped): the input must pass the
+// REAL front end (teko::lexer + teko::parser — only a valid program is formatted, the
+// gofmt precedent), and after rendering the output is re-scanned and its token stream
+// (kinds + texts, newlines aside) must be BYTE-IDENTICAL to the input's; any mismatch
+// is an internal-error refusal, never a silent rewrite. Idempotence (fmt(fmt(x)) ==
+// fmt(x)) follows by construction: every emission decision depends only on the token
+// stream, the line structure, and per-side adjacency — all of which formatting fixes.
+//
+// CLI (run_cli): `teko fmt <path>…` rewrites files in place (prints each changed path);
+// `teko fmt --check <path>…` writes nothing, prints each UNformatted path and exits 1
+// when any exists (the CI gate). A path is a `.tks`/`.tkt` file or a directory walked
+// recursively (dot-entries skipped). stdin/stdout mode is an HONEST STOP (M.3): there
+// is no stdin host surface yet, and DT0 adds no new runtime.
+
+use teko::lexer
+use teko::parser
+
+// ---------------------------------------------------------------------------
+// The raw token: unlike lexer::Token, `text` is the RAW SOURCE SLICE (a string
+// literal keeps its quotes/escapes/prefixes verbatim), and comments/newlines are
+// tokens too — everything needed to re-print the file byte-consciously.
+// ---------------------------------------------------------------------------
+
+type FTokKind = enum {
+    Word      // identifier or keyword (incl `_`, `true`/`false`/`null`)
+    Num       // number literal (raw: `1_000`, `0xFF`, `1.5e3`)
+    Strish    // any string/byte/char literal, raw incl quotes: "…" $"…" @"…" """…""" b'…' c'…'
+    Comment   // `// …` (trailing ws trimmed) or `/* … */` / `/** … */` verbatim
+    Punct     // operator/delimiter, maximal-munch (mirrors lexer::read_symbol)
+    Break     // a newline
+}
+
+type FTok = struct {
+    kind:  FTokKind
+    text:  str
+    glued: bool   // true when this token starts EXACTLY where the previous one ended (no gap)
+}
+
+// a scan step: the token's END position (the token itself is sliced by the caller).
+type Span = struct {
+    end: u64
+}
+
+// --- byte helpers (mirror lexer.tks) ---
+
+fn f_at(source: str, p: u64) -> byte {
+    if p >= source.len { return 0 }
+    source[p]
+}
+
+fn f_is_digit(c: byte) -> bool {
+    c >= b'0' && c <= b'9'
+}
+
+fn f_is_hex(c: byte) -> bool {
+    f_is_digit(c) || (c >= b'a' && c <= b'f') || (c >= b'A' && c <= b'F')
+}
+
+fn f_is_alpha(c: byte) -> bool {
+    (c >= b'a' && c <= b'z') || (c >= b'A' && c <= b'Z')
+}
+
+fn f_is_ident(c: byte) -> bool {
+    f_is_alpha(c) || f_is_digit(c) || c == b'_'
+}
+
+// a located scan error (fmt refuses the file; the real lexer would refuse it too).
+fn f_err(msg: str) -> error {
+    error { message = msg }
+}
+
+// --- spans: each mirrors the corresponding lexer.tks reader, but only finds the END ---
+
+// number span — mirrors lexer::read_number (hex/bin, `_` separators, fraction, exponent).
+fn span_number(source: str, pos: u64) -> u64 {
+    if f_at(source, pos) == b'0' && (f_at(source, pos + 1) == b'x' || f_at(source, pos + 1) == b'X') {
+        mut h = pos + 2
+        loop {
+            if h >= source.len { break }
+            let c = source[h]
+            if f_is_hex(c) { h++; continue }
+            if c == b'_' && f_is_hex(f_at(source, h + 1)) { h++; continue }
+            break
+        }
+        return h
+    }
+    if f_at(source, pos) == b'0' && (f_at(source, pos + 1) == b'b' || f_at(source, pos + 1) == b'B') {
+        mut bp = pos + 2
+        loop {
+            if bp >= source.len { break }
+            let c = source[bp]
+            if c == b'0' || c == b'1' { bp++; continue }
+            if c == b'_' && (f_at(source, bp + 1) == b'0' || f_at(source, bp + 1) == b'1') { bp++; continue }
+            break
+        }
+        return bp
+    }
+    mut p = span_digits(source, pos)
+    if f_at(source, p) == b'.' && f_is_digit(f_at(source, p + 1)) {
+        p = span_digits(source, p + 1)
+    }
+    if f_at(source, p) == b'e' || f_at(source, p) == b'E' {
+        mut q = p + 1
+        if f_at(source, q) == b'+' || f_at(source, q) == b'-' { q = q + 1 }
+        if f_is_digit(f_at(source, q)) { p = span_digits(source, q) }
+    }
+    p
+}
+
+fn span_digits(source: str, pos: u64) -> u64 {
+    mut p = pos
+    loop {
+        if p >= source.len { break }
+        let c = source[p]
+        if f_is_digit(c) { p++; continue }
+        if c == b'_' && f_is_digit(f_at(source, p + 1)) { p++; continue }
+        break
+    }
+    p
+}
+
+// identifier span (also consumes a leading `_` run — mirrors read_underscore/read_ident).
+fn span_word(source: str, pos: u64) -> u64 {
+    mut p = pos
+    loop {
+        if p >= source.len { break }
+        if !f_is_ident(source[p]) { break }
+        p++
+    }
+    p
+}
+
+// the closing delimiter matches at `p`? (mirrors lexer::str_close_at.)
+fn f_close_at(source: str, p: u64, multiline: bool) -> bool {
+    if f_at(source, p) != b'"' { return false }
+    if !multiline { return true }
+    f_at(source, p + 1) == b'"' && f_at(source, p + 2) == b'"'
+}
+
+// string span — mirrors lexer::read_string/read_string_body EXACTLY (same escape,
+// `""`-doubling, `{{`/`}}`, hole-depth, and `"""` rules), but only walks to the END.
+fn span_string(source: str, pos: u64) -> Span | error {
+    mut has_interp = false
+    mut has_verbatim = false
+    mut p = pos
+    loop {
+        let c = f_at(source, p)
+        if c == b'$' { if has_interp { break }; has_interp = true; p = p + 1; continue }
+        if c == b'@' { if has_verbatim { break }; has_verbatim = true; p = p + 1; continue }
+        break
+    }
+    let multiline = f_at(source, p + 1) == b'"' && f_at(source, p + 2) == b'"'
+    mut delim: u64 = 1
+    if multiline { delim = 3 }
+    mut q = if multiline { p + 3 } else { p + 1 }
+    if has_interp {
+        mut depth: u64 = 0
+        loop {
+            if q >= source.len { return f_err("unterminated interpolated string") }
+            let c = source[q]
+            if !has_verbatim && !multiline && c == b'\\' {
+                if q + 1 >= source.len { return f_err("unterminated escape in interpolated string") }
+                q = q + 2
+                continue
+            }
+            if depth == 0 && c == b'{' && f_at(source, q + 1) == b'{' { q = q + 2; continue }
+            if depth == 0 && c == b'}' && f_at(source, q + 1) == b'}' { q = q + 2; continue }
+            if c == b'{' { depth = depth + 1; q++; continue }
+            if c == b'}' { if depth > 0 { depth = depth - 1 }; q++; continue }
+            if has_verbatim && depth == 0 && !multiline && c == b'"' && f_at(source, q + 1) == b'"' { q = q + 2; continue }
+            if depth == 0 && f_close_at(source, q, multiline) { return Span { end = q + delim } }
+            q++
+        }
+    }
+    loop {
+        if q >= source.len { return f_err("unterminated string literal") }
+        let c = source[q]
+        if has_verbatim {
+            if !multiline && c == b'"' && f_at(source, q + 1) == b'"' { q = q + 2; continue }
+            if f_close_at(source, q, multiline) { return Span { end = q + delim } }
+            q++
+            continue
+        }
+        if f_close_at(source, q, multiline) { return Span { end = q + delim } }
+        if c == b'\\' {
+            if q + 1 >= source.len { return f_err("unterminated escape") }
+            q = q + 2
+            continue
+        }
+        q++
+    }
+}
+
+// byte-literal span `b'…'` — one raw or escaped byte then `'` (mirrors read_byte_lit).
+fn span_byte_lit(source: str, pos: u64) -> Span | error {
+    mut p = pos + 2
+    if p >= source.len { return f_err("unterminated byte literal") }
+    if source[p] == b'\\' { p = p + 2 } else { p = p + 1 }
+    if f_at(source, p) != b'\'' { return f_err("expected closing ' in byte literal") }
+    Span { end = p + 1 }
+}
+
+// char-literal span `c'…'` — bytes/escapes up to `'` (mirrors read_char_lit).
+fn span_char_lit(source: str, pos: u64) -> Span | error {
+    mut p = pos + 2
+    loop {
+        if p >= source.len { return f_err("expected closing ' in char literal") }
+        if source[p] == b'\'' { return Span { end = p + 1 } }
+        if source[p] == b'\\' { p = p + 2 } else { p = p + 1 }
+    }
+}
+
+// is there a string START at pos? (mirrors lexer::is_string_start.)
+fn f_string_start(source: str, pos: u64) -> bool {
+    mut has_interp = false
+    mut has_verbatim = false
+    mut p = pos
+    loop {
+        let c = f_at(source, p)
+        if c == b'$' { if has_interp { break }; has_interp = true; p = p + 1; continue }
+        if c == b'@' { if has_verbatim { break }; has_verbatim = true; p = p + 1; continue }
+        break
+    }
+    f_at(source, p) == b'"'
+}
+
+// punct length at pos — maximal munch, EXACTLY lexer::read_symbol's table. 0 = unknown.
+fn punct_len(source: str, pos: u64) -> u64 {
+    let c  = source[pos]
+    let c1 = f_at(source, pos + 1)
+    let c2 = f_at(source, pos + 2)
+    if c == b'<' && c1 == b'<' && c2 == b'=' { return 3 }
+    if c == b'>' && c1 == b'>' && c2 == b'=' { return 3 }
+    if c == b'.' && c1 == b'.' && c2 == b'=' { return 3 }
+    if c == b'=' && (c1 == b'=' || c1 == b'>') { return 2 }
+    if c == b'!' && c1 == b'=' { return 2 }
+    if c == b'<' && (c1 == b'=' || c1 == b'<') { return 2 }
+    if c == b'>' && (c1 == b'=' || c1 == b'>') { return 2 }
+    if c == b'-' && (c1 == b'>' || c1 == b'-' || c1 == b'=') { return 2 }
+    if c == b':' && c1 == b':' { return 2 }
+    if c == b'&' && (c1 == b'&' || c1 == b'=') { return 2 }
+    if c == b'|' && (c1 == b'|' || c1 == b'=') { return 2 }
+    if c == b'+' && (c1 == b'+' || c1 == b'=') { return 2 }
+    if c == b'*' && c1 == b'=' { return 2 }
+    if c == b'/' && c1 == b'=' { return 2 }
+    if c == b'%' && c1 == b'=' { return 2 }
+    if c == b'^' && c1 == b'=' { return 2 }
+    if c == b'?' && (c1 == b'?' || c1 == b'.') { return 2 }
+    if c == b'.' && c1 == b'.' { return 2 }
+    if c == b'+' || c == b'-' || c == b'*' || c == b'/' || c == b'%' { return 1 }
+    if c == b'&' || c == b'|' || c == b'^' || c == b'~' || c == b'!' { return 1 }
+    if c == b'<' || c == b'>' || c == b'=' || c == b':' || c == b';' { return 1 }
+    if c == b',' || c == b'.' || c == b'?' || c == b'#' { return 1 }
+    if c == b'(' || c == b')' || c == b'{' || c == b'}' || c == b'[' || c == b']' { return 1 }
+    0
+}
+
+// trim trailing spaces/tabs/CR from a `//` comment's end position.
+fn rtrim_end(source: str, start: u64, end: u64) -> u64 {
+    mut e = end
+    loop {
+        if e <= start { break }
+        let c = source[e - 1]
+        if c != b' ' && c != b'\t' && c != b'\r' { break }
+        e = e - 1
+    }
+    e
+}
+
+// ---------------------------------------------------------------------------
+// scan_tokens — the raw-token pass: the lexer's exact lexical grammar, but with
+// comments and newlines AS TOKENS and every text a raw source slice.
+// ---------------------------------------------------------------------------
+
+fn scan_tokens(source: str) -> []FTok | error {
+    mut toks: []FTok = teko::list::empty()
+    mut pos: u64 = 0
+    mut last_end: u64 = source.len + 1   // sentinel: nothing is glued to "before the file"
+    loop {
+        // skip spaces/tabs/CR (newlines are tokens)
+        loop {
+            if pos >= source.len { break }
+            let w = source[pos]
+            if w != b' ' && w != b'\t' && w != b'\r' { break }
+            pos++
+        }
+        if pos >= source.len { break }
+        let c = source[pos]
+        let glued = pos == last_end
+        if c == b'\n' {
+            toks = teko::list::push(toks, FTok { kind = FTokKind::Break; text = "\n"; glued = false })
+            pos = pos + 1
+            last_end = source.len + 1   // nothing after a line break is "glued"
+            continue
+        }
+        if c == b'/' && f_at(source, pos + 1) == b'/' {
+            mut e = pos
+            loop {
+                if e >= source.len { break }
+                if source[e] == b'\n' { break }
+                e++
+            }
+            let te = rtrim_end(source, pos, e)
+            toks = teko::list::push(toks, FTok { kind = FTokKind::Comment; text = slice(source, pos, te); glued = glued })
+            pos = e
+            last_end = source.len + 1
+            continue
+        }
+        if c == b'/' && f_at(source, pos + 1) == b'*' {
+            mut e = pos + 2
+            loop {
+                if e + 1 >= source.len { return f_err("unterminated block comment") }
+                if source[e] == b'*' && source[e + 1] == b'/' { e = e + 2; break }
+                e++
+            }
+            toks = teko::list::push(toks, FTok { kind = FTokKind::Comment; text = slice(source, pos, e); glued = glued })
+            last_end = e
+            pos = e
+            continue
+        }
+        if c == b'b' && f_at(source, pos + 1) == b'\'' {
+            let s = match span_byte_lit(source, pos) { Span as sp => sp; error as err => return err }
+            toks = teko::list::push(toks, FTok { kind = FTokKind::Strish; text = slice(source, pos, s.end); glued = glued })
+            last_end = s.end
+            pos = s.end
+            continue
+        }
+        if c == b'c' && f_at(source, pos + 1) == b'\'' {
+            let s = match span_char_lit(source, pos) { Span as sp => sp; error as err => return err }
+            toks = teko::list::push(toks, FTok { kind = FTokKind::Strish; text = slice(source, pos, s.end); glued = glued })
+            last_end = s.end
+            pos = s.end
+            continue
+        }
+        if (c == b'"' || c == b'$' || c == b'@') && f_string_start(source, pos) {
+            let s = match span_string(source, pos) { Span as sp => sp; error as err => return err }
+            toks = teko::list::push(toks, FTok { kind = FTokKind::Strish; text = slice(source, pos, s.end); glued = glued })
+            last_end = s.end
+            pos = s.end
+            continue
+        }
+        if f_is_digit(c) {
+            let e = span_number(source, pos)
+            toks = teko::list::push(toks, FTok { kind = FTokKind::Num; text = slice(source, pos, e); glued = glued })
+            last_end = e
+            pos = e
+            continue
+        }
+        if f_is_alpha(c) || c == b'_' {
+            mut e = span_word(source, pos)
+            if e == pos { e = pos + 1 }   // a lone `_` wildcard
+            toks = teko::list::push(toks, FTok { kind = FTokKind::Word; text = slice(source, pos, e); glued = glued })
+            last_end = e
+            pos = e
+            continue
+        }
+        let n = punct_len(source, pos)
+        if n == 0 { return f_err("unexpected character") }
+        toks = teko::list::push(toks, FTok { kind = FTokKind::Punct; text = slice(source, pos, pos + n); glued = glued })
+        last_end = pos + n
+        pos = pos + n
+    }
+    toks
+}
+
+// ---------------------------------------------------------------------------
+// spacing rules
+// ---------------------------------------------------------------------------
+
+// reserved words (lexer::keyword_kind's table) — for spacing, `keyword (` keeps its
+// space (`return (x)`) while `ident (` is a call (`f(x)`). Contextual words
+// (`from`/`params`/`self`/`base`) are identifiers here, exactly as in the lexer.
+fn is_kw(t: str) -> bool {
+    if t == "fn" || t == "type" || t == "struct" || t == "enum" || t == "flags" { return true }
+    if t == "variant" || t == "let" || t == "mut" || t == "const" || t == "if" { return true }
+    if t == "else" || t == "loop" || t == "break" || t == "continue" || t == "return" { return true }
+    if t == "defer" || t == "match" || t == "when" || t == "in" || t == "as" { return true }
+    if t == "to" || t == "use" || t == "pub" || t == "exp" || t == "extern" { return true }
+    if t == "true" || t == "false" || t == "null" || t == "class" || t == "abstract" { return true }
+    if t == "virtual" || t == "override" || t == "intern" || t == "interface" { return true }
+    false
+}
+
+// can this token END an operand? (drives unary-vs-binary for `+`/`-`/`~`.)
+fn ends_operand(t: FTok) -> bool {
+    if t.kind == FTokKind::Num || t.kind == FTokKind::Strish { return true }
+    if t.kind == FTokKind::Word {
+        if t.text == "true" || t.text == "false" || t.text == "null" { return true }
+        return !is_kw(t.text)
+    }
+    if t.kind == FTokKind::Punct {
+        return t.text == ")" || t.text == "]" || t.text == "}" || t.text == "?" || t.text == "++" || t.text == "--"
+    }
+    false
+}
+
+fn is_opener(t: str) -> bool {
+    t == "(" || t == "[" || t == "{"
+}
+
+fn is_closer(t: str) -> bool {
+    t == ")" || t == "]" || t == "}"
+}
+
+// `<`/`>`/`<<`/`>>` are ambiguous (generics vs comparison vs shift) at token level:
+// their spacing PRESERVES the source's adjacency (tight stays tight; spaced → one space).
+fn is_angle(t: FTok) -> bool {
+    if t.kind != FTokKind::Punct { return false }
+    t.text == "<" || t.text == ">" || t.text == "<<" || t.text == ">>"
+}
+
+// the canonical gap (in spaces) between `prev` and `cur` on one line.
+// `prev_unary` = prev is a prefix operator (`!`, or `+`/`-`/`~` in unary position).
+fn gap(prev: FTok, cur: FTok, prev_unary: bool) -> u64 {
+    if cur.kind == FTokKind::Comment { return 3 }               // trailing comment — 3 spaces
+    if prev.kind == FTokKind::Comment { return 1 }              // code after a block comment
+    let pp = prev.kind == FTokKind::Punct
+    let cp = cur.kind == FTokKind::Punct
+    if cp && (cur.text == "," || cur.text == ";") { return 0 }
+    if pp && (prev.text == "," || prev.text == ";") { return 1 }
+    if (cp && cur.text == "::") || (pp && prev.text == "::") { return 0 }
+    if (cp && cur.text == ".") || (pp && prev.text == ".") { return 0 }
+    if (cp && cur.text == "?.") || (pp && prev.text == "?.") { return 0 }
+    if cp && (cur.text == ".." || cur.text == "..=") { return 0 }
+    if pp && (prev.text == ".." || prev.text == "..=") { return 0 }
+    if cp && (cur.text == "++" || cur.text == "--") { return 0 }   // postfix
+    if cp && cur.text == "?" { return 0 }                          // postfix type suffix `T?`
+    if prev_unary { return 0 }                                     // `!x`, `-x`, `~x`, `-(…)`
+    if is_angle(cur) || is_angle(prev) {
+        if cur.glued { return 0 }
+        return 1
+    }
+    if cp && (cur.text == "(" || cur.text == "[") {
+        if pp && (prev.text == "(" || prev.text == "[") { return 0 }
+        if prev.kind == FTokKind::Word {
+            if is_kw(prev.text) { return 1 }
+            return 0                                               // a call / an index
+        }
+        if pp && (prev.text == ")" || prev.text == "]" || prev.text == "?" || prev.text == "++" || prev.text == "--") { return 0 }
+        return 1
+    }
+    if pp && (prev.text == "(" || prev.text == "[") { return 0 }
+    if cp && (cur.text == ")" || cur.text == "]") { return 0 }
+    if cp && cur.text == "{" { return 1 }
+    if pp && prev.text == "{" { return 1 }
+    if cp && cur.text == "}" { return 1 }
+    if pp && prev.text == "}" { return 1 }
+    if pp && prev.text == "]" && cur.kind == FTokKind::Word && !is_kw(cur.text) { return 0 }   // `[]str`
+    if pp && prev.text == "#" { return 0 }                         // `#test`
+    if cp && cur.text == ":" { return 0 }
+    if pp && prev.text == ":" { return 1 }
+    1
+}
+
+// ---------------------------------------------------------------------------
+// render — emit the canonical text from the raw token stream.
+// ---------------------------------------------------------------------------
+
+// append a str's bytes onto the output buffer. The output is a []byte built with the
+// AMORTIZED push (O(1) each) and turned into a str ONCE at the end — building via
+// teko::str::concat over a piece list would be a chained 2-arg concat, O(n²) in the
+// file size (measured: 30KB source → ~190MB of concat garbage before this shape).
+fn emit_str(out: []byte, s: str) -> []byte {
+    mut o = out
+    mut i: u64 = 0
+    loop {
+        if i >= s.len { break }
+        o = teko::list::push(o, s[i])
+        i = i + 1
+    }
+    o
+}
+
+fn emit_indent(out: []byte, level: u64) -> []byte {
+    mut o = out
+    mut i: u64 = 0
+    loop {
+        if i >= level * 4 { break }
+        o = teko::list::push(o, b' ')
+        i = i + 1
+    }
+    o
+}
+
+fn render(toks: []FTok) -> str {
+    mut out: []byte = teko::list::empty()
+    mut depth: u64 = 0
+    mut pending_blank = false
+    mut emitted_any = false
+    mut prev_ends_open = false   // previous emitted line ended with `(`/`[`/`{`
+    mut i: u64 = 0
+    loop {
+        if i >= toks.len { break }
+        // collect one logical line [i, j)
+        mut j = i
+        loop {
+            if j >= toks.len { break }
+            if toks[j].kind == FTokKind::Break { break }
+            j = j + 1
+        }
+        if j == i {
+            // a blank line (or the newline ending the previous line was consumed below)
+            if emitted_any { pending_blank = true }
+            i = j + 1
+            continue
+        }
+        // the pending blank line: dropped after an opener line and before a closer line
+        let first = toks[i]
+        let first_closes = first.kind == FTokKind::Punct && is_closer(first.text)
+        if pending_blank {
+            if !prev_ends_open && !first_closes {
+                out = teko::list::push(out, b'\n')
+            }
+            pending_blank = false
+        }
+        // indentation: leading closers dedent
+        mut lvl = depth
+        mut k = i
+        loop {
+            if k >= j { break }
+            let t = toks[k]
+            if t.kind == FTokKind::Punct && is_closer(t.text) {
+                if lvl > 0 { lvl = lvl - 1 }
+                k = k + 1
+                continue
+            }
+            break
+        }
+        out = emit_indent(out, lvl)
+        // emit the line's tokens with canonical gaps
+        mut prev = first
+        mut prev_unary = false
+        mut m = i
+        loop {
+            if m >= j { break }
+            let t = toks[m]
+            if m > i {
+                let g = gap(prev, t, prev_unary)
+                mut gi: u64 = 0
+                loop {
+                    if gi >= g { break }
+                    out = teko::list::push(out, b' ')
+                    gi = gi + 1
+                }
+            }
+            out = emit_str(out, t.text)
+            // unary classification for the NEXT pair
+            mut unary = false
+            if t.kind == FTokKind::Punct {
+                if t.text == "!" { unary = true }
+                if t.text == "+" || t.text == "-" || t.text == "~" {
+                    // unary when nothing operand-like precedes it (line start, after an
+                    // operator/keyword/opener, or after another prefix operator).
+                    if m == i || !ends_operand(prev) { unary = true }
+                }
+                if t.text == "(" || t.text == "[" || t.text == "{" { depth = depth + 1 }
+                if is_closer(t.text) {
+                    if depth > 0 { depth = depth - 1 }
+                }
+            }
+            prev_unary = unary
+            prev = t
+            m = m + 1
+        }
+        out = teko::list::push(out, b'\n')
+        emitted_any = true
+        prev_ends_open = prev.kind == FTokKind::Punct && is_opener(prev.text)
+        i = j + 1
+    }
+    str(out)
+}
+
+// ---------------------------------------------------------------------------
+// safety: the formatted output must carry EXACTLY the input's token stream.
+// ---------------------------------------------------------------------------
+
+fn same_stream(a: []FTok, b: []FTok) -> bool {
+    mut ia: u64 = 0
+    mut ib: u64 = 0
+    loop {
+        loop {
+            if ia >= a.len { break }
+            if a[ia].kind != FTokKind::Break { break }
+            ia = ia + 1
+        }
+        loop {
+            if ib >= b.len { break }
+            if b[ib].kind != FTokKind::Break { break }
+            ib = ib + 1
+        }
+        if ia >= a.len || ib >= b.len { break }
+        if a[ia].kind != b[ib].kind { return false }
+        if a[ia].text != b[ib].text { return false }
+        ia = ia + 1
+        ib = ib + 1
+    }
+    ia >= a.len && ib >= b.len
+}
+
+// the input must be a VALID Teko file (gofmt precedent — only valid programs are
+// formatted): a module, or (the main.tks shape) a main file. Reports the module error.
+fn front_end_accepts(source: str) -> error? {
+    let tokens = match lexer::tokenize(source) {
+        []lexer::Token as t => t
+        error as e          => return e
+    }
+    let module_err = match parser::parse_module(tokens, 0) {
+        parser::Parsed<parser::Module> as _ok => return null
+        error as e                            => e
+    }
+    match parser::parse_main_file(tokens, 0) {
+        parser::Parsed<parser::MainFile> as _ok => return null
+        error                                   => return module_err
+    }
+    null
+}
+
+// format_source — the pure formatter: str in, canonical str out (or a refusal).
+pub fn format_source(source: str) -> str | error {
+    match front_end_accepts(source) {
+        error as e => return e
+        null       => {}
+    }
+    let toks = match scan_tokens(source) { []FTok as t => t; error as e => return e }
+    let out = render(toks)
+    let back = match scan_tokens(out) {
+        []FTok as t => t
+        error       => return f_err("fmt internal error: the formatted output does not re-scan (refusing to write)")
+    }
+    if !same_stream(toks, back) {
+        return f_err("fmt internal error: formatting would alter the token stream (refusing to write)")
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// CLI — `teko fmt [--check] <path>…`
+// ---------------------------------------------------------------------------
+
+fn is_teko_file(name: str) -> bool {
+    teko::str::ends_with(name, ".tks") || teko::str::ends_with(name, ".tkt")
+}
+
+// collect .tks/.tkt files under `path` (a file, or a directory walked recursively;
+// dot-entries are skipped — mirrors discover's list_dir-to-classify walk).
+fn collect_files(path: str, acc: []str) -> []str | error {
+    if is_teko_file(path) {
+        return teko::list::push(acc, path)
+    }
+    let entries = match teko::fs::list_dir(path) {
+        []str as e => e
+        error      => return error { message = teko::str::concat(path, ": not a directory or a .tks/.tkt file") }
+    }
+    mut out = acc
+    mut i: u64 = 0
+    loop {
+        if i >= entries.len { break }
+        let nm = entries[i]
+        if nm.len > 0 && nm[0] != b'.' {
+            let child = teko::str::concat(path, "/", nm)
+            if is_teko_file(nm) {
+                out = teko::list::push(out, child)
+            } else {
+                match teko::fs::list_dir(child) {
+                    []str as _sub => {
+                        out = match collect_files(child, out) { []str as o => o; error as e => return e }
+                    }
+                    error => {}   // a non-Teko regular file — skip
+                }
+            }
+        }
+        i = i + 1
+    }
+    out
+}
+
+// run_cli — argv is the FULL args (args[0]=program, args[1]="fmt"). Returns the exit code:
+// 0 ok; 1 = --check found unformatted files; 2 = usage/IO/parse error.
+pub fn run_cli(args: []str) -> i32 {
+    mut check = false
+    mut paths: []str = teko::list::empty()
+    mut i: u64 = 2
+    loop {
+        if i >= args.len { break }
+        let a = args[i]
+        if a == "--check" { check = true } else { paths = teko::list::push(paths, a) }
+        i = i + 1
+    }
+    if paths.len == 0 {
+        // stdin/stdout mode is DT0-contracted but there is no stdin host surface yet and
+        // DT0 adds no new runtime — an HONEST STOP (M.3), not a silent misread.
+        teko::io::eprintln("teko fmt: stdin mode is not available yet (no stdin host surface) — pass a .tks/.tkt file or a directory")
+        return 2
+    }
+    mut files: []str = teko::list::empty()
+    mut pi: u64 = 0
+    loop {
+        if pi >= paths.len { break }
+        files = match collect_files(paths[pi], files) {
+            []str as f => f
+            error as e => { teko::io::eprintln(teko::str::concat("teko fmt: ", e.message)); return 2 }
+        }
+        pi = pi + 1
+    }
+    mut unformatted: u64 = 0
+    mut fi: u64 = 0
+    loop {
+        if fi >= files.len { break }
+        let path = files[fi]
+        let src = match teko::io::read_file(path) {
+            str as s   => s
+            error as e => { teko::io::eprintln(teko::str::concat("teko fmt: ", path, ": ", e.message)); return 2 }
+        }
+        let out = match format_source(src) {
+            str as o   => o
+            error as e => { teko::io::eprintln(teko::str::concat("teko fmt: ", path, ": ", e.message)); return 2 }
+        }
+        if out != src {
+            unformatted = unformatted + 1
+            if check {
+                teko::io::println(path)
+            } else {
+                match teko::io::write_file(path, out) {
+                    error as e => { teko::io::eprintln(teko::str::concat("teko fmt: ", path, ": ", e.message)); return 2 }
+                    null       => {}
+                }
+                teko::io::println(path)
+            }
+        }
+        fi = fi + 1
+    }
+    if check && unformatted > 0 { return 1 }
+    0
+}

@@ -126,6 +126,14 @@ static bool mono_constraint_atom_satisfied(tk_str atom_name, tk_type concrete, t
         }
         return tk_type_eq(&concrete, &vt.as.value);   // a one-member variant widened to a bare type
     }
+    // (W10b.D2) an INTERFACE atom: the concrete type satisfies `<T: I>` when it NOMINALLY
+    // conforms (declared `implements`, through the class base chain + the contract's `extends`
+    // closure — the same gate as the D3 upcast). Classes AND structs conform here (a struct
+    // cannot become an interface VALUE, but it may instantiate a constrained generic).
+    if (td.as.value.body.tag == TK_BODY_INTERFACE)
+        return concrete.tag == TK_TYPE_NAMED
+            && (mono_name_eq(concrete.as.named.name, atom_name)   // the contract's own value type
+                || tk_type_conforms_to(concrete.as.named.name, atom_name, table));
     return concrete.tag == TK_TYPE_NAMED && mono_name_eq(concrete.as.named.name, atom_name);
 }
 static bool mono_constraint_satisfied(tk_constraint_expr c, tk_type concrete, tk_type_table table) {
