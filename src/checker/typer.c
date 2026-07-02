@@ -112,6 +112,11 @@ static tk_typed_stmt_result type_binding(tk_binding b, tk_env env, tk_type_table
             if (why != NULL)   // (C1.8) expected = the annotation, actual = the bound value's type
                 return sfail(tk_error_types(tk_error_make(why),
                                             tk_type_render(a.as.value), tk_type_render(v.as.value.type)));
+            // a fitting bare-literal (plain-scalar) initializer ADOPTS the declared narrow type —
+            // retype the leaf itself (same mechanism as the arg/struct-field/negative-literal
+            // adoption sites: tk_literal_adopts + `.type = target`), so codegen/VM see the narrow
+            // width (e.g. `mut y: u8 = 1` stores/shifts at width 8, not the literal's native i64).
+            v.as.value.type = a.as.value;
         }
         bound = a.as.value;
         // (#4) annotation-directed element type: a sentinel empty list/array (`teko::list::empty()`
@@ -172,6 +177,10 @@ static tk_typed_stmt_result type_assign(tk_assign a, tk_env env, tk_type_table t
         if (!tk_literal_adopts(v.as.value, target))   // (C1.8) expected = target, actual = value
             return sfail(tk_error_types(tk_error_make("assigned value does not match the target type"),
                                         tk_type_render(target), tk_type_render(v.as.value.type)));
+        // a fitting bare-literal (plain-scalar) RHS ADOPTS the target's narrow type — retype the leaf
+        // itself (mirrors type_binding's identical adoption above / the arg/struct-field sites), so a
+        // plain `y = 200` on a `u8` slot stores/re-widths at 8 bits, not the literal's native i64.
+        v.as.value.type = target;
     }
     // (#4) a sentinel empty list/array ADOPTS the target's concrete slice type so codegen sees the
     // element. OTHERWISE keep the value's NATURAL (case / T) type and store the target as `bound` —

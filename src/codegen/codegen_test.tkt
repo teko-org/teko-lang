@@ -1353,3 +1353,41 @@ fn masked_compound_assign_shift_out_of_range_count() {
     w <<= 3
     teko::assert::is_true(w == 8)
 }
+
+// #68 — a BARE numeric-literal initializer on a narrow-typed `mut` binding (`mut y: u8 = 1`,
+// no `to <T>` cast) must adopt the DECLARED type at the checker, so the VM's runtime slot is
+// built at the annotated width — not the literal's natural i64 default (N1/N2). Before the fix,
+// `compound_apply`'s shift-count mask (keyed off the LEFT operand's OWN runtime width) read 63
+// instead of 7 for a `u8`, so `y <<= 200` computed `200 & 63 == 8 -> 1 << 8 == 256`, truncating
+// to 0 in the VM while native codegen (which reads the width straight from the annotation,
+// independent of the literal's checked type) already produced the correct `1`. Covers u8/i16/u32
+// widths, plus an untyped `let x = 1` control proving inference for un-annotated bindings is
+// UNCHANGED (still defaults to i64).
+#test
+fn bare_literal_narrow_binding_adopts_declared_type() {
+    // u8: 200 & 7 == 0 -> 1 << 0 == 1 (the historical VM bug would mask by 63: 200 & 63 == 8 ->
+    // 1 << 8 == 256, truncated to byte 0 — this is the exact #68 discriminating case).
+    mut y: u8 = 1
+    y <<= 200
+    teko::assert::is_true(y == 1)
+    // u8: a count that DOES discriminate an 8-wide vs 64-wide mask differently from the above —
+    // 9 & 7 == 1 -> 1 << 1 == 2 (a 64-wide mask would leave the count unmasked: 1 << 9 == 512,
+    // truncated to byte 0).
+    mut y2: u8 = 1
+    y2 <<= 9
+    teko::assert::is_true(y2 == 2)
+    // i16: 20 & 15 == 4 -> 1 << 4 == 16 (a 64-wide mask would leave the count unmasked: 1 << 20,
+    // far outside an i16's range).
+    mut n: i16 = 1
+    n <<= 20
+    teko::assert::is_true(n == 16)
+    // u32: 40 & 31 == 8 -> 1 << 8 == 256 (a 64-wide mask would leave the count unmasked: 1 << 40,
+    // outside a u32's range).
+    mut u: u32 = 1
+    u <<= 40
+    teko::assert::is_true(u == 256)
+    // control — an UNTYPED binding's bare literal is unaffected (still infers i64, N1/N2): a
+    // shift count that only a 64-wide mask keeps in-range.
+    let x = 1
+    teko::assert::is_true((x << 40) == 1099511627776)   // 40 & 63 == 40 -> 1 << 40 (i64, no truncation)
+}
