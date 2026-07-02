@@ -2623,42 +2623,63 @@ static tk_value compound_apply(tk_value old, tk_token_kind op, tk_value rhs, con
     return norm_int(raw, sgn, w);
 }
 
-// (#88) resolve a FIELD-assign LHS to a POINTER at the mutable `tk_value` slot to write. The receiver
-// is walked to a storage location: a class instance's struct payload lives in the SHARED global cell
-// store (g_cells) — a pointer into it makes the write OBSERVABLE through every alias (the aliasing
-// proof); a struct value rooted at a `mut` slot is mutated in place through the slot's own storage
-// (`&slot->val`, or its cell if the slot is cell-backed). Descending a struct FIELD yields a pointer
-// INTO that struct's fields.vals[] array, so nested `a.b.c = v` mutates the innermost value in place.
-// Returns NULL on an unsupported shape (the checker guarantees a field LHS, so NULL is an internal error).
-static tk_value *vm_lvalue_ptr(const tk_texpr *e, tk_venv *env) {
+// (#88) rebuild a StructVal with one field replaced by `val` (declared field order preserved). The
+// checker guarantees `field` exists. COPY-ON-WRITE: a FRESH names/vals array is allocated (the source
+// arrays are never mutated), so a shallow tk_value COPY of a struct — a binding/param copy shares the
+// OLD arrays — is UNAFFECTED by this write. This is what preserves struct VALUE semantics (issue #88
+// follow-up): the earlier in-place `fields.vals[i] = …` corrupted aliased copies. Mirrors vm.tks
+// struct_set_field / vm.c v_error_set (the same copy-on-set idiom).
+static tk_value vm_struct_set_field(tk_value sv, tk_str field, tk_value val) {
+    size_t n = sv.as.st.fields.len;
+    tk_str   *names = tk_alloc((n ? n : 1) * sizeof *names); if (!names) abort();
+    tk_value *vals  = tk_alloc((n ? n : 1) * sizeof *vals);  if (!vals)  abort();
+    for (size_t i = 0; i < n; i += 1) {
+        names[i] = sv.as.st.fields.names[i];
+        vals[i]  = name_eq(sv.as.st.fields.names[i], field) ? val : sv.as.st.fields.vals[i];
+    }
+    return v_struct(sv.as.st.type_name, (tk_value_fields){ names, vals, n });
+}
+
+// (#88) the current VALUE at a field-assign lvalue receiver — just an evaluation (a class handle stays
+// a ClassRef; a struct value / var reads through). Mirrors vm.tks lvalue_load.
+static tk_value vm_lvalue_load(const tk_texpr *e, tk_venv *env) {
+    return tk_vm_eval_expr(e, env);
+}
+
+// (#88) store `newval` at a field-assign lvalue `e`. Two storage kinds, mirroring vm.tks lvalue_store:
+//   * the receiver IS (or derefs to) a CLASS instance → its StructVal payload lives in the SHARED cell
+//     store; cell_set the rebuilt payload so EVERY alias observes the write (reference semantics — the
+//     aliasing proof). This is the ONLY in-place mutation.
+//   * the receiver is a value-semantic STRUCT rooted at a `mut` var → rebuild the StructVal with the
+//     field replaced (copy-on-write) and store the WHOLE struct back UP the chain (recursively for
+//     nested `a.b.c`), bottoming out at the root slot (which is overwritten by value). A struct copy
+//     therefore never sees the write — its own slot still holds the OLD (unmodified) struct value.
+static void vm_lvalue_store(const tk_texpr *e, tk_value newval, tk_venv *env) {
     if (e->tag == TK_TEXPR_VAR) {
         tk_slot *slot = env_find(env, e->as.var.name);
-        if (slot == NULL) return NULL;
-        return slot->has_cell ? &g_cells[slot->cell_id] : &slot->val;
+        if (slot == NULL) vm_unsupported("field assignment to an unbound variable (internal: checker should reject)");
+        if (slot->has_cell) cell_set(slot->cell_id, newval); else slot->val = newval;
+        return;
     }
     if (e->tag == TK_TEXPR_FIELD_ACCESS) {
-        // Resolve the receiver to its storage. A class receiver is a CLASS_REF value → follow the cell
-        // to the SHARED struct payload (writes are seen by aliases). A struct receiver is resolved to
-        // its own in-place storage recursively.
-        tk_value *base;
-        // First try to resolve the receiver as an in-place lvalue (a var or a struct field path).
-        base = vm_lvalue_ptr(e->as.field_access.receiver, env);
-        if (base != NULL && base->tag == TK_VAL_CLASS_REF)
-            base = &g_cells[base->as.class_ref.cell];   // class handle stored in an lvalue → deref to shared payload
-        if (base == NULL) {
-            // The receiver is not itself an lvalue (e.g. it EVALUATES to a class ref: `make().f = …`);
-            // evaluate it — a class ref points at shared cell storage we can still mutate.
-            tk_value rv = tk_vm_eval_expr(e->as.field_access.receiver, env);
-            if (rv.tag == TK_VAL_CLASS_REF) base = &g_cells[rv.as.class_ref.cell];
-            else return NULL;
+        tk_value recv = tk_vm_eval_expr(e->as.field_access.receiver, env);
+        if (recv.tag == TK_VAL_CLASS_REF) {
+            // A CLASS instance: mutate the SHARED cell payload in place (aliases observe it).
+            tk_value payload = cell_get(recv.as.class_ref.cell);
+            if (payload.tag != TK_VAL_STRUCT) vm_unsupported("a ClassRef cell must hold a struct (internal invariant)");
+            cell_set(recv.as.class_ref.cell, vm_struct_set_field(payload, e->as.field_access.field, newval));
+            return;
         }
-        if (base->tag != TK_VAL_STRUCT) return NULL;
-        for (size_t i = 0; i < base->as.st.fields.len; i += 1)
-            if (name_eq(base->as.st.fields.names[i], e->as.field_access.field))
-                return &base->as.st.fields.vals[i];
-        return NULL;
+        if (recv.tag == TK_VAL_STRUCT) {
+            // A value-semantic STRUCT: rebuild it (copy-on-write) and store the whole struct back at the
+            // parent lvalue — recursion bottoms out at the root `mut` slot.
+            vm_lvalue_store(e->as.field_access.receiver,
+                            vm_struct_set_field(recv, e->as.field_access.field, newval), env);
+            return;
+        }
+        vm_unsupported("field assignment on a non-struct/class receiver (internal: checker should reject)");
     }
-    return NULL;
+    vm_unsupported("field assignment to an unresolvable lvalue (internal: checker should reject)");
 }
 
 static tk_flow exec_stmt(const tk_tstatement *s, tk_venv *env) {
@@ -2680,15 +2701,17 @@ static tk_flow exec_stmt(const tk_tstatement *s, tk_venv *env) {
         case TK_TSTMT_ASSIGN: {
             tk_token_kind op = s->as.assign.op;
             tk_value rhs = tk_vm_eval_expr(&s->as.assign.value, env);
-            // (#88) `recv.field op= x` — an IN-PLACE field mutation. Resolve the LHS to a pointer at the
-            // field's storage: a CLASS field lives in the SHARED cell store, so the write is observed by
-            // every alias (reference semantics — the aliasing proof); a STRUCT field is mutated in place
-            // through its `mut`-rooted slot. compound_apply applies `op`; coerce_to present-wraps the
-            // final value into the field's declared type (s->as.assign.bound), exactly like a binding.
+            // (#88) `recv.field op= x` — read the field's CURRENT value, apply the op, store it back.
+            // A CLASS field write mutates the SHARED cell payload (aliases observe it — the aliasing
+            // proof); a STRUCT field write REBUILDS the struct copy-on-write and stores it up its
+            // `mut` root, so a struct copy keeps VALUE semantics (a shallow tk_value copy shares the
+            // OLD field arrays, which vm_lvalue_store never mutates). compound_apply applies `op`;
+            // coerce_to present-wraps into the field's declared type (bound), exactly like a binding.
+            // Mirrors vm.tks field_assign (load → compound_apply → coerce_to → store).
             if (s->as.assign.kind == TK_ASSIGN_FIELD) {
-                tk_value *dst = vm_lvalue_ptr(s->as.assign.target, env);
-                if (dst == NULL) vm_unsupported("field assignment to an unresolvable lvalue (internal: checker should reject)");
-                *dst = coerce_to(compound_apply(*dst, op, rhs, &s->as.assign.value), s->as.assign.bound);
+                tk_value cur = vm_lvalue_load(s->as.assign.target, env);
+                tk_value nv  = coerce_to(compound_apply(cur, op, rhs, &s->as.assign.value), s->as.assign.bound);
+                vm_lvalue_store(s->as.assign.target, nv, env);
                 return flow_normal();
             }
             // (MEM Step 2/3) `r.value op= x` writes THROUGH a reference: `s->as.assign.name` names the
