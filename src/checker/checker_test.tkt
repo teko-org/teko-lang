@@ -428,10 +428,10 @@ fn revalidate_rederives_field_access() {
 #test
 fn mut_rule_assign() {
     let menv = define(empty_env(), "m", u32t(), true)
-    let ok = parser::Assign { name = "m"; op = lexer::TokenKind::Assign; value = e_var("m"); deref = false }
+    let ok = parser::Assign { kind = parser::AssignKind::Simple; name = "m"; op = lexer::TokenKind::Assign; value = e_var("m"); deref = false; target = parser::no_expr() }
     match type_assign(ok, menv, empty_table()) { TypedStmt => teko::assert::is_true(true); error => teko::assert::is_true(false) }
     let lenv = define(empty_env(), "l", u32t(), false)
-    let bad = parser::Assign { name = "l"; op = lexer::TokenKind::Assign; value = e_var("l"); deref = false }
+    let bad = parser::Assign { kind = parser::AssignKind::Simple; name = "l"; op = lexer::TokenKind::Assign; value = e_var("l"); deref = false; target = parser::no_expr() }
     match type_assign(bad, lenv, empty_table()) { TypedStmt => teko::assert::is_true(false); error => teko::assert::is_true(true) }
 }
 
@@ -1579,7 +1579,7 @@ fn mono_walk_covers_node_kinds() {
 
     // statements: binding, assign, expr, loop (with break/continue), defer, return.
     mut body: []TStatement = teko::list::push(teko::list::empty(), TBinding { kind = parser::BindKind::Let; target = parser::SimpleName { name = "a" }; bound = i64t(); value = bin })
-    body = teko::list::push(body, TAssign { name = "a"; op = lexer::TokenKind::Assign; bound = i64t(); value = un; deref = false })
+    body = teko::list::push(body, TAssign { kind = parser::AssignKind::Simple; name = "a"; op = lexer::TokenKind::Assign; bound = i64t(); value = un; deref = false; target = no_texpr() })
     body = teko::list::push(body, texpr_stmt(cast))
     body = teko::list::push(body, texpr_stmt(cor))
     body = teko::list::push(body, texpr_stmt(arr))
@@ -1781,7 +1781,7 @@ fn block_local_assigned_to_outer_var_is_not_block_local() {
     // block-local (the assignment RHS is excluded from the safe-inside reads — UAF trap rule 4).
     let cur = t_let("cur", t_node_init(tnum(1)))
     mut loopbody: []TStatement = teko::list::push(teko::list::empty(), cur)
-    loopbody = teko::list::push(loopbody, TAssign { name = "acc"; op = lexer::TokenKind::Assign; bound = Named { name = "Node" }; value = tvar("cur", Named { name = "Node" }); deref = false })
+    loopbody = teko::list::push(loopbody, TAssign { kind = parser::AssignKind::Simple; name = "acc"; op = lexer::TokenKind::Assign; bound = Named { name = "Node" }; value = tvar("cur", Named { name = "Node" }); deref = false; target = no_texpr() })
     loopbody = teko::list::push(loopbody, TBreakStmt { label = "" })
     let loopstmt = TLoopStmt { label = ""; body = loopbody }
     mut body: []TStatement = teko::list::push(teko::list::empty(), t_let("acc", t_node_init(tnum(0))))
@@ -2162,6 +2162,54 @@ fn cyclic_class_item(name: str, base: str) -> parser::Item {
 }
 fn list1(x: parser::Function) -> []parser::Function { teko::list::push(teko::list::empty(), x) }
 fn slist1(s: str) -> []str { teko::list::push(teko::list::empty(), s) }
+
+// (#88) a class `type Name = class { <field vis> f: i64  pub fn make() -> Name { Name { f = 0 } } }`
+// — one field with the given visibility + a static factory. Used to test field-write visibility.
+fn fa_class_item(name: str, field: str, field_vis: parser::Visibility) -> parser::Item {
+    let fld = parser::Field { name = field; type_ann = named_t("i64"); vis = field_vis; is_intern = false }
+    let flds = teko::list::push(teko::list::empty(), fld)
+    // the factory body: `Name { f = 0 }`
+    let ctor = parser::StructLit { type_path = path1(name); type_args = teko::list::empty(); field_names = slist1(field); field_vals = teko::list::push(teko::list::empty(), e_num(0)) }
+    let make = parser::Function { name = "make"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = teko::list::empty(); has_return = true; return_type = named_t(name); body = one_stmt(ek(ctor)); vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false }
+    parser::Item { content = parser::TypeDecl { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::ClassBody { kind = parser::ClassKind::Sealed; has_base = false; base_name = ""; has_base_binding = false; base_binding_name = ""; implements = teko::list::empty(); fields = flds; methods = list1(make) }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }; namespace = ""; file = "" }
+}
+
+// a top-level `let x = Name::make()` binding item.
+fn fa_let_make(name: str) -> parser::Item {
+    let callee = parser::Path { segments = teko::list::push(teko::list::push(teko::list::empty(), parser::Segment { name = name }), parser::Segment { name = "make" }) }
+    let call = ek(parser::Call { callee = callee; args = teko::list::empty(); arg_names = teko::list::empty() })
+    let bind = parser::Binding { kind = parser::BindKind::Let; target = parser::SimpleName { name = "x" }; has_type = false; type_ann = named_t(name); value = call }
+    parser::Item { content = bind; namespace = ""; file = "" }
+}
+
+// a top-level `x.<field> = 0` FIELD-assign statement item.
+fn fa_write_item(field: str) -> parser::Item {
+    let fa = ek(parser::FieldAccess { receiver = e_var("x"); field = field })
+    let asg = parser::Assign { kind = parser::AssignKind::Field; name = ""; op = lexer::TokenKind::Assign; value = e_num(0); deref = false; target = fa }
+    parser::Item { content = asg; namespace = ""; file = "" }
+}
+
+// (#88) write-visibility MIRRORS read-visibility: an external write to a PUBLIC class field checks OK.
+#test
+fn field_write_external_public_ok() {
+    let cls  = fa_class_item("Box", "v", parser::Visibility::Pub)
+    let items = teko::list::push(teko::list::push(teko::list::push(teko::list::empty(), cls), fa_let_make("Box")), fa_write_item("v"))
+    match type_program(parser::Program { items = items }) {
+        TProgram => teko::assert::is_true(true)
+        error    => teko::assert::is_true(false)
+    }
+}
+
+// (#88) an external write to a PRIVATE class field is REJECTED — same rule as reading it externally.
+#test
+fn field_write_external_private_errors() {
+    let cls  = fa_class_item("Sec", "n", parser::Visibility::Private)
+    let items = teko::list::push(teko::list::push(teko::list::push(teko::list::empty(), cls), fa_let_make("Sec")), fa_write_item("n"))
+    match type_program(parser::Program { items = items }) {
+        TProgram => teko::assert::is_true(false)   // private field written externally must fail
+        error    => teko::assert::is_true(true)
+    }
+}
 
 #test
 fn iface_conforming_struct_ok() {

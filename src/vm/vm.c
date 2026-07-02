@@ -2623,6 +2623,65 @@ static tk_value compound_apply(tk_value old, tk_token_kind op, tk_value rhs, con
     return norm_int(raw, sgn, w);
 }
 
+// (#88) rebuild a StructVal with one field replaced by `val` (declared field order preserved). The
+// checker guarantees `field` exists. COPY-ON-WRITE: a FRESH names/vals array is allocated (the source
+// arrays are never mutated), so a shallow tk_value COPY of a struct — a binding/param copy shares the
+// OLD arrays — is UNAFFECTED by this write. This is what preserves struct VALUE semantics (issue #88
+// follow-up): the earlier in-place `fields.vals[i] = …` corrupted aliased copies. Mirrors vm.tks
+// struct_set_field / vm.c v_error_set (the same copy-on-set idiom).
+static tk_value vm_struct_set_field(tk_value sv, tk_str field, tk_value val) {
+    size_t n = sv.as.st.fields.len;
+    tk_str   *names = tk_alloc((n ? n : 1) * sizeof *names); if (!names) abort();
+    tk_value *vals  = tk_alloc((n ? n : 1) * sizeof *vals);  if (!vals)  abort();
+    for (size_t i = 0; i < n; i += 1) {
+        names[i] = sv.as.st.fields.names[i];
+        vals[i]  = name_eq(sv.as.st.fields.names[i], field) ? val : sv.as.st.fields.vals[i];
+    }
+    return v_struct(sv.as.st.type_name, (tk_value_fields){ names, vals, n });
+}
+
+// (#88) the current VALUE at a field-assign lvalue receiver — just an evaluation (a class handle stays
+// a ClassRef; a struct value / var reads through). Mirrors vm.tks lvalue_load.
+static tk_value vm_lvalue_load(const tk_texpr *e, tk_venv *env) {
+    return tk_vm_eval_expr(e, env);
+}
+
+// (#88) store `newval` at a field-assign lvalue `e`. Two storage kinds, mirroring vm.tks lvalue_store:
+//   * the receiver IS (or derefs to) a CLASS instance → its StructVal payload lives in the SHARED cell
+//     store; cell_set the rebuilt payload so EVERY alias observes the write (reference semantics — the
+//     aliasing proof). This is the ONLY in-place mutation.
+//   * the receiver is a value-semantic STRUCT rooted at a `mut` var → rebuild the StructVal with the
+//     field replaced (copy-on-write) and store the WHOLE struct back UP the chain (recursively for
+//     nested `a.b.c`), bottoming out at the root slot (which is overwritten by value). A struct copy
+//     therefore never sees the write — its own slot still holds the OLD (unmodified) struct value.
+static void vm_lvalue_store(const tk_texpr *e, tk_value newval, tk_venv *env) {
+    if (e->tag == TK_TEXPR_VAR) {
+        tk_slot *slot = env_find(env, e->as.var.name);
+        if (slot == NULL) vm_unsupported("field assignment to an unbound variable (internal: checker should reject)");
+        if (slot->has_cell) cell_set(slot->cell_id, newval); else slot->val = newval;
+        return;
+    }
+    if (e->tag == TK_TEXPR_FIELD_ACCESS) {
+        tk_value recv = tk_vm_eval_expr(e->as.field_access.receiver, env);
+        if (recv.tag == TK_VAL_CLASS_REF) {
+            // A CLASS instance: mutate the SHARED cell payload in place (aliases observe it).
+            tk_value payload = cell_get(recv.as.class_ref.cell);
+            if (payload.tag != TK_VAL_STRUCT) vm_unsupported("a ClassRef cell must hold a struct (internal invariant)");
+            cell_set(recv.as.class_ref.cell, vm_struct_set_field(payload, e->as.field_access.field, newval));
+            return;
+        }
+        if (recv.tag == TK_VAL_STRUCT) {
+            // A value-semantic STRUCT: rebuild it (copy-on-write) and store the whole struct back at the
+            // parent lvalue — recursion bottoms out at the root `mut` slot.
+            vm_lvalue_store(e->as.field_access.receiver,
+                            vm_struct_set_field(recv, e->as.field_access.field, newval), env);
+            return;
+        }
+        vm_unsupported("field assignment on a non-struct/class receiver (internal: checker should reject)");
+    }
+    vm_unsupported("field assignment to an unresolvable lvalue (internal: checker should reject)");
+}
+
 static tk_flow exec_stmt(const tk_tstatement *s, tk_venv *env) {
     switch (s->tag) {
         case TK_TSTMT_BINDING: {
@@ -2642,6 +2701,19 @@ static tk_flow exec_stmt(const tk_tstatement *s, tk_venv *env) {
         case TK_TSTMT_ASSIGN: {
             tk_token_kind op = s->as.assign.op;
             tk_value rhs = tk_vm_eval_expr(&s->as.assign.value, env);
+            // (#88) `recv.field op= x` — read the field's CURRENT value, apply the op, store it back.
+            // A CLASS field write mutates the SHARED cell payload (aliases observe it — the aliasing
+            // proof); a STRUCT field write REBUILDS the struct copy-on-write and stores it up its
+            // `mut` root, so a struct copy keeps VALUE semantics (a shallow tk_value copy shares the
+            // OLD field arrays, which vm_lvalue_store never mutates). compound_apply applies `op`;
+            // coerce_to present-wraps into the field's declared type (bound), exactly like a binding.
+            // Mirrors vm.tks field_assign (load → compound_apply → coerce_to → store).
+            if (s->as.assign.kind == TK_ASSIGN_FIELD) {
+                tk_value cur = vm_lvalue_load(s->as.assign.target, env);
+                tk_value nv  = coerce_to(compound_apply(cur, op, rhs, &s->as.assign.value), s->as.assign.bound);
+                vm_lvalue_store(s->as.assign.target, nv, env);
+                return flow_normal();
+            }
             // (MEM Step 2/3) `r.value op= x` writes THROUGH a reference: `s->as.assign.name` names the
             // `Ref<T>` binding (a RefVal cell index); a deref-assign reads the cell, applies the op, and
             // writes BACK to the cell (cell_set) — so the caller's aliased var observes the write.
@@ -2998,7 +3070,7 @@ static void cov_walk_expr(const tk_texpr *e, cov_walk_t *w) {
 static void cov_walk_stmt(const tk_tstatement *st, cov_walk_t *w) {
     switch (st->tag) {
         case TK_TSTMT_BINDING: cov_walk_expr(&st->as.binding.value, w); break;
-        case TK_TSTMT_ASSIGN:  cov_walk_expr(&st->as.assign.value, w); break;
+        case TK_TSTMT_ASSIGN:  cov_walk_expr(&st->as.assign.value, w); if (st->as.assign.kind == TK_ASSIGN_FIELD) cov_walk_expr(st->as.assign.target, w); break;   // (#88) the FIELD LHS receiver is executable too
         case TK_TSTMT_RETURN:  if (st->as.ret.has_value) cov_walk_expr(&st->as.ret.value, w); break;
         case TK_TSTMT_LOOP:    cov_walk_block(st->as.loop_stmt.body, st->as.loop_stmt.nbody, w); break;
         case TK_TSTMT_EXPR:    cov_walk_expr(&st->as.expr_stmt.expr, w); break;

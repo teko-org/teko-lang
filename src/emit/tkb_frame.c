@@ -109,7 +109,7 @@ static void collect_bindtarget(tk_strtable *t, tk_bind_target bt) {
 static void collect_tstmt(tk_strtable *t, const tk_tstatement *s) {
     switch (s->tag) {
         case TK_TSTMT_BINDING:  collect_bindtarget(t, s->as.binding.target); collect_type(t, s->as.binding.bound); collect(t, &s->as.binding.value); break;
-        case TK_TSTMT_ASSIGN:   tk_st_intern(t, s->as.assign.name); collect_type(t, s->as.assign.bound); collect(t, &s->as.assign.value); break;
+        case TK_TSTMT_ASSIGN:   tk_st_intern(t, s->as.assign.name); collect_type(t, s->as.assign.bound); collect(t, &s->as.assign.value); if (s->as.assign.kind == TK_ASSIGN_FIELD && s->as.assign.target != NULL) collect(t, s->as.assign.target); break;   // (#88) the FIELD LHS receiver's strings
         case TK_TSTMT_RETURN:   collect(t, &s->as.ret.value); break;
         case TK_TSTMT_LOOP:     tk_st_intern(t, s->as.loop_stmt.label); collect_tstmts(t, s->as.loop_stmt.body, s->as.loop_stmt.nbody); break;
         case TK_TSTMT_BREAK:

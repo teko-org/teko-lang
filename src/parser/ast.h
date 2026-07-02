@@ -181,7 +181,16 @@ typedef struct {                                                          // let
     tk_type_expr  type_ann;                                               // the parsed annotation (valid iff has_type)
     tk_expr       value;
 } tk_binding;
-typedef struct { tk_str name; tk_token_kind op; tk_expr value; bool deref; } tk_assign;   // x = / += / … (B.4); deref ⇒ `name.value op= …` writes THROUGH a Ref<T> (MEM-1b-ii)
+// (#88) an assignment TARGET is one of three shapes, tagged by `kind`:
+//   TK_ASSIGN_SIMPLE    — `name op= value`; the LHS is the bare binding `name` (`deref`=false, `target`=NULL).
+//   TK_ASSIGN_REF_DEREF — `name.value op= value`; write THROUGH a `Ref<T>` handle `name` (`deref`=true — the
+//                         legacy MEM-1b-ii flag, preserved bit-for-bit; `target`=NULL).
+//   TK_ASSIGN_FIELD     — `recv.field op= value`; write a struct/class field. `target` is the LHS field-access
+//                         EXPR (a `TK_EXPR_FIELD_ACCESS`, receiver.field, arbitrarily nested); `name`/`deref` unused.
+// `deref` stays a plain bool == (kind==REF_DEREF) so every legacy reader/TKB byte layout is unchanged for the
+// two old shapes; a FIELD target is the ONLY new shape (`kind`=FIELD carries `target`, the general lvalue).
+typedef enum { TK_ASSIGN_SIMPLE = 0, TK_ASSIGN_REF_DEREF, TK_ASSIGN_FIELD } tk_assign_kind;
+typedef struct { tk_assign_kind kind; tk_str name; tk_token_kind op; tk_expr value; bool deref; tk_expr *target; } tk_assign;   // x = / += / … (B.4); see tk_assign_kind above
 typedef struct { bool has_value; tk_expr value; }               tk_return;    // return [expr] (value gated by has_value)
 typedef struct { tk_str label; tk_statement *body; size_t nbody; } tk_loop_stmt; // loop [NAME] { … } (M.5); label empty (len 0) = unlabeled
 typedef struct { tk_str label; }                                tk_jump;      // break [NAME] / continue [NAME]; label empty = innermost loop

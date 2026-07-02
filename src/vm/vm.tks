@@ -2358,6 +2358,70 @@ fn find_function(env: Venv, callee: parser::Path) -> FnHit {
     find_function_ns(env, callee, "")
 }
 
+// (#88) rebuild a StructVal with one field replaced by `val` (declared field order preserved). The
+// checker guarantees `field` exists. Mirrors the C twin's in-place `fields.vals[i] = …`.
+fn struct_set_field(sv: StructVal, field: str, val: Value) -> StructVal {
+    mut names: []str = teko::list::empty()
+    mut vals: []Value = teko::list::empty()
+    mut i = 0
+    loop {
+        if i >= sv.field_names.len { break }
+        names = teko::list::push(names, sv.field_names[i])
+        if sv.field_names[i] == field { vals = teko::list::push(vals, val) }
+        else                          { vals = teko::list::push(vals, sv.field_vals[i]) }
+        i++
+    }
+    StructVal { type_name = sv.type_name; field_names = names; field_vals = vals }
+}
+
+// (#88) the current VALUE at a field-assign lvalue receiver. A class handle stays a ClassRef (the
+// caller derefs the shared cell); a struct value / var reads straight through. Threads env (evaluating
+// the receiver may grow cells via a value-position ref call). Mirrors the C twin's vm_lvalue_ptr load.
+fn lvalue_load(e: checker::TExpr, env: Venv) -> EvalRes {
+    eval_expr(e, env)
+}
+
+// (#88) store `newval` at a field-assign lvalue `e`, returning the updated env. Two storage kinds:
+//   * the receiver is (or derefs to) a CLASS instance → its StructVal payload lives in the SHARED cell
+//     store; cell_set the rebuilt payload so EVERY alias observes the write (the aliasing proof).
+//   * the receiver is a value-semantic STRUCT rooted at a `mut` var → rebuild the StructVal and store it
+//     back UP the chain (recursively for nested `a.b.c`), or into the root slot (mutate_slot, Assign).
+// Mirrors the C twin's vm_lvalue_ptr write (which mutates a pointer into cell/slot storage in place).
+fn lvalue_store(e: checker::TExpr, newval: Value, env: Venv) -> Venv {
+    match e.kind {
+        checker::TVar as v => mutate_slot(env, v.name, lexer::TokenKind::Assign, newval)
+        checker::TFieldAccess as fa => {
+            let re = eval_expr(fa.receiver, env)
+            let renv = re.env
+            match re.value {
+                // A CLASS instance: mutate the SHARED cell payload in place (aliases observe it).
+                ClassRef as cr => {
+                    match cell_get(renv.cells, cr.cell) {
+                        StructVal as s => with_cells(renv, cell_set(renv.cells, cr.cell, struct_set_field(s, fa.field, newval)))
+                        _ => panic("vm: a ClassRef cell must hold a StructVal (internal invariant)")
+                    }
+                }
+                // A value-semantic STRUCT: rebuild it with the field replaced, then store the WHOLE
+                // struct back at the parent lvalue (recursion bottoms out at the root `mut` slot).
+                StructVal as s => lvalue_store(fa.receiver, struct_set_field(s, fa.field, newval), renv)
+                _ => panic("vm: field assignment on a non-struct/class receiver (internal: checker should reject)")
+            }
+        }
+        _ => panic("vm: field assignment to an unresolvable lvalue (internal: checker should reject)")
+    }
+}
+
+// (#88) `recv.field op= rhs` — resolve the field's CURRENT value, apply the op, store it back. A class
+// field write mutates SHARED cell storage (aliasing); a struct field write rebuilds up its `mut` root.
+// coerce_to present-wraps into the field's declared type (`bound`), exactly like a binding. Mirrors the
+// C twin's TK_ASSIGN_FIELD arm (load *dst, compound_apply, coerce_to, store).
+fn field_assign(target: checker::TExpr, op: lexer::TokenKind, rhs: Value, bound: checker::Type, env: Venv) -> Venv {
+    let lr = lvalue_load(target, env)
+    let cur = lr.value
+    let newval = coerce_to(compound_apply(cur, op, rhs), bound)
+    lvalue_store(target, newval, lr.env)
+}
+
 // mutate_slot — a compound/plain assignment to the NEWEST slot named `name`, the .tks twin of
 // vm.c's TK_TSTMT_ASSIGN compound-assign body. The C twin mutates the slot in place; the .tks env
 // is IMMUTABLE, so this rebuilds `env.slots` with that one slot replaced and returns the grown
@@ -2998,6 +3062,14 @@ fn exec_stmt(s: checker::TStatement, env: Venv) -> Step {
             if (a.op == lexer::TokenKind::SlashEq || a.op == lexer::TokenKind::PercentEq) && val_is_int(rhs) && as_int(rhs) == 0 {
                 vm_panic_div0_at(a.value.line, a.value.col)
             }
+            // (#88) `recv.field op= x` — an IN-PLACE field mutation. A CLASS field lives in the SHARED
+            // cell store, so the write is observed by every alias (reference semantics — the aliasing
+            // proof); a STRUCT field is rebuilt up its `mut` root. field_assign applies the op + wraps.
+            let is_field = match a.kind { parser::AssignKind::Field => true; _ => false }
+            if is_field {
+                let env2 = field_assign(a.target, a.op, rhs, a.bound, renv)
+                return Stepped { env= env2; value= null }
+            }
             // (MEM Step 2/3) `r.value op= x` writes THROUGH a reference: `a.name` names the `Ref<T>`
             // binding (a RefVal cell index); a deref-assign reads the cell, applies the op, and writes
             // BACK to the cell (cell_set) — so the caller's aliased var observes the write. A plain
@@ -3441,7 +3513,7 @@ fn cov_walk_expr(e: checker::TExpr, w: CovWalk) -> CovWalk {
 fn cov_walk_stmt(s: checker::TStatement, w: CovWalk) -> CovWalk {
     match s {
         checker::TBinding as b  => cov_walk_expr(b.value, w)
-        checker::TAssign as a   => cov_walk_expr(a.value, w)
+        checker::TAssign as a   => { let w2 = cov_walk_expr(a.value, w); match a.kind { parser::AssignKind::Field => cov_walk_expr(a.target, w2); _ => w2 } }   // (#88) the FIELD LHS receiver is executable too
         checker::TReturn as r   => if r.has_value { cov_walk_expr(r.value, w) } else { w }
         checker::TLoopStmt as l => cov_walk_block(l.body, w)
         checker::TExprStmt as x => cov_walk_expr(x.expr, w)

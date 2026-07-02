@@ -84,7 +84,14 @@ type TExprKind = variant TNumber | TVar | TStrLit | TByteLit | TCharLit | TBoolL
 
 // --- typed statements (mirror Statement; children are TExpr / []TStatement) ---
 pub type TBinding      = struct { kind: parser::BindKind; target: parser::BindTarget; bound: Type; value: TExpr }   // `bound`: the type the target binds to (the annotation if present, else the value's)
-pub type TAssign       = struct { name: str; op: lexer::TokenKind; bound: Type; value: TExpr; deref: bool }   // bound = the target's declared type (codegen wraps the value into it — emit_as); deref=true ⇒ `name.value op= …` writes THROUGH a Ref<T> (MEM-1b-ii)
+// (#88) a typed assignment. `kind` (parser::AssignKind) tags the target shape:
+//   Simple   — write the bare binding `name` (deref=false; target = a sentinel, unused).
+//   RefDeref — write THROUGH a `Ref<T>` handle `name` (deref=true; target = a sentinel, unused).
+//   Field    — write a struct/class field; `target` is the TYPED LHS field-access expr (a TFieldAccess),
+//              so codegen/VM reuse the read-side field lowering directly; name/deref unused.
+// `bound` = the target's declared type (codegen wraps the RHS into it — emit_as). `deref` stays a plain
+// bool == (kind==RefDeref) so the legacy TKB layout / readers are unchanged for the two old shapes.
+pub type TAssign       = struct { kind: parser::AssignKind; name: str; op: lexer::TokenKind; bound: Type; value: TExpr; deref: bool; target: TExpr }
 pub type TReturn       = struct { has_value: bool; value: TExpr }   // `value` gated by has_value (B.20) — a bare `return`'s placeholder (Number 0) types harmlessly
 pub type TLoopStmt     = struct { label: str; body: []TStatement }   // label empty = unlabeled (M.5)
 pub type TBreakStmt    = struct { label: str }                       // label empty = innermost loop
@@ -119,6 +126,12 @@ pub type TFunction = struct {
 }
 pub type TItem    = variant TFunction | parser::TypeDecl | parser::UseDecl | TStatement   // pub: TProgram.items surface + the .tkb codec (C7.16). TypeDecl/UseDecl pass through (E5c); a loose top-level Statement → typed
 pub type TProgram = struct { items: []TItem }
+
+// (#88) a placeholder typed expr for a TAssign's `target` when kind != Field (never read — gated by
+// kind). Mirrors parser::no_expr()'s sentinel convention; a Void-typed null leaf costs nothing to carry.
+pub fn no_texpr() -> TExpr {
+    TExpr { kind = TNullLit { }; type = Void { }; line = 0; col = 0 }
+}
 
 // --- env-threading carriers: the typed pass advances the env, like check_* did ---
 type TypedStmt  = struct { node: TStatement;    env: Env }   // a typed statement + the env it leaves (bindings extend it)

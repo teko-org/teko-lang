@@ -9,6 +9,7 @@ use teko::lexer
 fn prim_byte(k: checker::PrimKind) -> byte { k to byte }
 fn kind_byte(k: lexer::TokenKind) -> byte { k to byte }
 fn bindkind_byte(k: parser::BindKind) -> byte { k to byte }   // (C7.16) Let/Mut/Const → ordinal byte
+fn assign_kind_byte(k: parser::AssignKind) -> byte { k to byte }   // (#88) Simple/RefDeref/Field → ordinal byte
 fn vis_byte(v: parser::Visibility) -> byte { v to byte }      // (C7.16) Private/Pub/Exp → ordinal byte
 
 // a Type → tag byte + payload. (prim_byte/kind_byte = the enum's ordinal — E7.)
@@ -238,12 +239,17 @@ fn write_tstatement(buf: []byte, t: StrTable, s: checker::TStatement) -> []byte 
             b = write_type(b, t, bd.bound)
             write_texpr(b, t, bd.value)
         }
-        // TAssign (1): name (interned u32) + op (TokenKind u8) + bound (Type) + value (TExpr) + deref (u8).
+        // TAssign (1): kind (u8) + name (interned u32) + op (TokenKind u8) + bound (Type) + value (TExpr)
+        //   + deref (u8) [+ target (TExpr) iff kind==Field]. (#88; MEM-1b-ii)
         checker::TAssign as a => {
-            mut b = write_u8(write_u32(write_u8(buf, 1), st_find(t, a.name)), kind_byte(a.op))
+            mut b = write_u8(buf, 1)
+            b = write_u8(b, assign_kind_byte(a.kind))          // (#88) the target discriminant
+            b = write_u32(b, st_find(t, a.name))
+            b = write_u8(b, kind_byte(a.op))
             b = write_type(b, t, a.bound)
             b = write_texpr(b, t, a.value)
-            write_u8(b, (if a.deref { 1 } else { 0 }) to byte)   // (MEM-1b-ii) deref ⇒ `name.value op= …`
+            b = write_u8(b, (if a.deref { 1 } else { 0 }) to byte)   // (MEM-1b-ii) deref ⇒ `name.value op= …`
+            match a.kind { parser::AssignKind::Field => write_texpr(b, t, a.target); _ => b }   // (#88) the FIELD LHS field-access
         }
         // TReturn (2): has_value (u8) + value (TExpr).
         checker::TReturn as r => write_texpr(write_u8(write_u8(buf, 2), (if r.has_value { 1 } else { 0 }) to byte), t, r.value)

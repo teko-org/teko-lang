@@ -4064,24 +4064,28 @@ static bool emit_stmt(cbuf *b, const tk_tstatement *s, bool in_main,
             // count is C UB natively, while the VM (#49, compound_apply) computes a DEFINED
             // width-masked result. Rewrite as `lvalue = tk_shl_<w>(lvalue, rhs)` / tk_shr_<w>,
             // routing through the SAME teko_rt.h helpers the binary `<<`/`>>` operator uses.
-            // SAFE to evaluate the lvalue twice: the assign-statement grammar (parse_stmt.c)
-            // admits only two lvalue shapes — a bare identifier (`s->as.assign.name`), or (when
-            // `deref`) a Ref<T> handle's `(*name)` pointer dereference — never a struct field
-            // path, an array index, or a call. Both forms are pure, side-effect-free symbol
-            // lookups, so re-emitting the lvalue text a second time is cost-free and safe.
+            // SAFE to evaluate the lvalue twice: the three assign-statement lvalue shapes —
+            // a bare identifier (`s->as.assign.name`), a Ref<T> handle's `(*name)` pointer
+            // dereference (`deref`), or a struct/class FIELD path (`(#88); the typed LHS
+            // field-access, e.g. `(*recv).f`) — are ALL pure, side-effect-free lookups, so
+            // re-emitting the lvalue text a second time is cost-free and safe.
+            //   emit_lvalue emits the target C lvalue for whichever of the three shapes applies.
+            #define emit_lvalue()  do { \
+                if (s->as.assign.kind == TK_ASSIGN_FIELD) { if (!emit_expr(b, s->as.assign.target, err)) return false; } \
+                else if (s->as.assign.deref) { cb(b, "(*"); cb_ident(b, s->as.assign.name); cb(b, ")"); } \
+                else cb_ident(b, s->as.assign.name); \
+            } while (0)
             if (s->as.assign.op == TK_TOKEN_SHLEQ || s->as.assign.op == TK_TOKEN_SHREQ) {
                 if (s->as.assign.bound.tag != TK_TYPE_PRIM || !cg_prim_is_int(s->as.assign.bound.as.prim))
                     return fail_node(err, "codegen: shift-assign on a non-integer type not yet supported");
                 const char *tag = prim_int_tag(s->as.assign.bound.as.prim);
                 if (tag == NULL) return fail_node(err, "codegen: shift-assign on a non-integer type not yet supported");
-                if (s->as.assign.deref) { cb(b, "(*"); cb_ident(b, s->as.assign.name); cb(b, ")"); }
-                else cb_ident(b, s->as.assign.name);
+                emit_lvalue();
                 cb(b, " = ");
                 cb(b, s->as.assign.op == TK_TOKEN_SHLEQ ? "tk_shl_" : "tk_shr_");
                 cb(b, tag);
                 cb(b, "(");
-                if (s->as.assign.deref) { cb(b, "(*"); cb_ident(b, s->as.assign.name); cb(b, ")"); }
-                else cb_ident(b, s->as.assign.name);
+                emit_lvalue();
                 cb(b, ", ");
                 if (!emit_expr(b, &s->as.assign.value, err)) return false;
                 cb(b, ")");
@@ -4090,8 +4094,11 @@ static bool emit_stmt(cbuf *b, const tk_tstatement *s, bool in_main,
             }
             // (MEM-1b-ii) `r.value op= v` — write THROUGH the reference: the handle IS the pointer, so
             // the lvalue is `(*r)`. (`Ref<T>` lowers to `<T> *`; deref-assign is a plain pointer store.)
-            if (s->as.assign.deref) { cb(b, "(*"); cb_ident(b, s->as.assign.name); cb(b, ")"); }
-            else cb_ident(b, s->as.assign.name);
+            // (#88) a FIELD target emits the typed LHS field-access: `(*recv).f` for a class receiver
+            // (reference semantics — an in-place write the aliased pointer observes), `recv.f` for a
+            // struct (value semantics). emit_expr on the TFieldAccess produces the exact read-side lvalue.
+            emit_lvalue();
+            #undef emit_lvalue
             cb(b, " "); cb(b, op); cb(b, " ");
             // Wrap the value into the target's declared type (`bound`) — a case → its variant,
             // a `T` → `T?`, a fitting literal — exactly like a binding. (Plain numerics emit as-is;
@@ -4747,7 +4754,7 @@ static void cg_collect_block_opts(cg_opt_set *set, const tk_tstatement *stmts, s
             // VM's coerce_to(bound)): a deref-assign `r.value = v` through a `Ref<T?>` has bound=`T?`, and
             // that optional's tk_opt_<T> typedef must be emitted even when the value's own type is a bare
             // `T` (widened) — mirrors the BINDING arm collecting binding.bound.
-            case TK_TSTMT_ASSIGN:  cg_collect_type_opts(set, s->as.assign.bound); cg_collect_expr_opts(set, &s->as.assign.value); break;
+            case TK_TSTMT_ASSIGN:  cg_collect_type_opts(set, s->as.assign.bound); cg_collect_expr_opts(set, &s->as.assign.value); if (s->as.assign.kind == TK_ASSIGN_FIELD) cg_collect_expr_opts(set, s->as.assign.target); break;   // (#88) the FIELD LHS receiver may carry optional types too
             case TK_TSTMT_RETURN:  if (s->as.ret.has_value) cg_collect_expr_opts(set, &s->as.ret.value); break;
             case TK_TSTMT_LOOP:    cg_collect_block_opts(set, s->as.loop_stmt.body, s->as.loop_stmt.nbody); break;
             case TK_TSTMT_EXPR:    cg_collect_expr_opts(set, &s->as.expr_stmt.expr); break;
@@ -5262,7 +5269,7 @@ static void cg_lift_block(tk_tstatement *stmts, size_t n, uint64_t *next, tk_tfu
 static void cg_lift_stmt(tk_tstatement *s, uint64_t *next, tk_tfunction **fns, size_t *nfns) {
     switch (s->tag) {
         case TK_TSTMT_BINDING: cg_lift_expr(&s->as.binding.value, next, fns, nfns); break;
-        case TK_TSTMT_ASSIGN:  cg_lift_expr(&s->as.assign.value, next, fns, nfns); break;
+        case TK_TSTMT_ASSIGN:  cg_lift_expr(&s->as.assign.value, next, fns, nfns); if (s->as.assign.kind == TK_ASSIGN_FIELD) cg_lift_expr(s->as.assign.target, next, fns, nfns); break;   // (#88) lift lambdas in the FIELD LHS receiver too
         case TK_TSTMT_RETURN:  if (s->as.ret.has_value) cg_lift_expr(&s->as.ret.value, next, fns, nfns); break;
         case TK_TSTMT_LOOP:    cg_lift_block(s->as.loop_stmt.body, s->as.loop_stmt.nbody, next, fns, nfns); break;
         case TK_TSTMT_EXPR:    cg_lift_expr(&s->as.expr_stmt.expr, next, fns, nfns); break;

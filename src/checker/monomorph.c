@@ -496,6 +496,14 @@ static bool mono_tstmt(tk_tstatement st, tk_subst s, tk_tprogram prog, tk_type_t
             tk_texpr v;
             if (!mono_texpr(st.as.assign.value, s, prog, table, &v, insts, err)) return false;
             r.as.assign.value = v; r.as.assign.bound = tk_subst_type(st.as.assign.bound, s);
+            // (#88) rewrite the FIELD target's LHS field-access (its receiver + resolved field type
+            // may reference a type-param). Box the stamped copy so the pointer stays owned.
+            if (st.as.assign.kind == TK_ASSIGN_FIELD && st.as.assign.target != NULL) {
+                tk_texpr lhs;
+                if (!mono_texpr(*st.as.assign.target, s, prog, table, &lhs, insts, err)) return false;
+                tk_texpr *lp = tk_alloc(sizeof *lp); if (!lp) abort(); *lp = lhs;
+                r.as.assign.target = lp;
+            }
             break;
         }
         case TK_TSTMT_RETURN: {

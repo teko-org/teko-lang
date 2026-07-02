@@ -4864,6 +4864,25 @@ fn emit_binding(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, b
 }
 
 // emit_assign — a TAssign -> `x op= v;`. (C: TK_TSTMT_ASSIGN branch.)
+// (#88) emit the C lvalue for whichever of the three assign-target shapes applies: a bare identifier
+// (Simple), a Ref<T> handle's `(*name)` pointer deref (RefDeref), or a struct/class FIELD path (the
+// typed LHS field-access — emit_expr produces `(*recv).f` for a class, `recv.f` for a struct). All three
+// are pure, side-effect-free lookups, so it is safe to emit the lvalue text twice (the shift path does).
+fn emit_assign_lvalue(buf: []byte, prog: checker::TProgram, a: checker::TAssign) -> []byte | error {
+    match a.kind {
+        parser::AssignKind::Field => emit_expr(buf, prog, a.target)
+        _ => {
+            if a.deref {
+                mut out = cb(buf, "(*")
+                out = cb_ident(out, a.name)
+                cb(out, ")")
+            } else {
+                cb_ident(buf, a.name)
+            }
+        }
+    }
+}
+
 fn emit_assign(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, a: checker::TAssign, indent: str, escaping: []str, regions: []RegionFrame, fn_body: []checker::TStatement, dctx: DeferCtx) -> []byte | error {
     let op = match assignop_c(a.op) { str as s => s; error as err => return err }
     mut out = cb(buf, indent)
@@ -4888,24 +4907,12 @@ fn emit_assign(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, a:
             error     => return error { message = "codegen: shift-assign on a non-integer type not yet supported" }
         }
         let fn_prefix = if a.op == lexer::TokenKind::ShlEq { "tk_shl_" } else { "tk_shr_" }
-        if a.deref {
-            out = cb(out, "(*")
-            out = cb_ident(out, a.name)
-            out = cb(out, ")")
-        } else {
-            out = cb_ident(out, a.name)
-        }
+        out = match emit_assign_lvalue(out, prog, a) { []byte as o => o; error as err => return err }
         out = cb(out, " = ")
         out = cb(out, fn_prefix)
         out = cb(out, tag)
         out = cb(out, "(")
-        if a.deref {
-            out = cb(out, "(*")
-            out = cb_ident(out, a.name)
-            out = cb(out, ")")
-        } else {
-            out = cb_ident(out, a.name)
-        }
+        out = match emit_assign_lvalue(out, prog, a) { []byte as o => o; error as err => return err }
         out = cb(out, ", ")
         out = match emit_expr_ctx(out, prog, checker::Void { }, a.value, escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
         out = cb(out, ")")
@@ -4913,13 +4920,9 @@ fn emit_assign(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, a:
     }
     // (MEM-1b-ii) `r.value op= v` — write THROUGH the reference: the handle `r` IS the pointer, so the
     // lvalue is `(*r)`. (`Ref<T>` lowers to a bare `<T> *`; deref-assign is a plain C pointer store.)
-    if a.deref {
-        out = cb(out, "(*")
-        out = cb_ident(out, a.name)
-        out = cb(out, ")")
-    } else {
-        out = cb_ident(out, a.name)
-    }
+    // (#88) a FIELD target emits the typed LHS field-access (`(*recv).f` for a class — an in-place write
+    // the aliased pointer observes; `recv.f` for a struct). emit_assign_lvalue selects the shape.
+    out = match emit_assign_lvalue(out, prog, a) { []byte as o => o; error as err => return err }
     out = cb(out, " ")
     out = cb(out, op)
     out = cb(out, " ")
@@ -5637,7 +5640,7 @@ fn cg_collect_block_opts(set: CgTypeSet, stmts: []checker::TStatement) -> CgType
             // VM's coerce_to(a.bound)): a deref-assign `r.value = v` through a `Ref<T?>` has bound=`T?`,
             // and that optional's tk_opt_<T> typedef must be emitted even when the value's own type is a
             // bare `T` (widened) — mirrors the TBinding arm collecting b.bound.
-            checker::TAssign as a  => { s = cg_collect_type_opts(s, a.bound); s = cg_collect_expr_opts(s, a.value) }
+            checker::TAssign as a  => { s = cg_collect_type_opts(s, a.bound); s = cg_collect_expr_opts(s, a.value); match a.kind { parser::AssignKind::Field => s = cg_collect_expr_opts(s, a.target); _ => { } } }   // (#88) the FIELD LHS receiver may carry optional types too
             checker::TReturn as r  => { if r.has_value { s = cg_collect_expr_opts(s, r.value) } }
             checker::TLoopStmt as l => { s = cg_collect_block_opts(s, l.body) }
             checker::TExprStmt as es => { s = cg_collect_expr_opts(s, es.expr) }
@@ -6304,7 +6307,7 @@ fn cg_lift_block(stmts: []checker::TStatement, acc: Ref<StampAcc>) -> []checker:
 fn cg_lift_stmt(s: checker::TStatement, acc: Ref<StampAcc>) -> checker::TStatement {
     match s {
         checker::TBinding as b   => checker::TBinding { kind = b.kind; target = b.target; bound = b.bound; value = cg_lift_expr(b.value, acc) }
-        checker::TAssign as a    => checker::TAssign { name = a.name; op = a.op; bound = a.bound; value = cg_lift_expr(a.value, acc); deref = a.deref }
+        checker::TAssign as a    => checker::TAssign { kind = a.kind; name = a.name; op = a.op; bound = a.bound; value = cg_lift_expr(a.value, acc); deref = a.deref; target = match a.kind { parser::AssignKind::Field => cg_lift_expr(a.target, acc); _ => a.target } }   // (#88) lift lambdas in the FIELD LHS receiver too
         checker::TReturn as r     => checker::TReturn { has_value = r.has_value; value = if r.has_value { cg_lift_expr(r.value, acc) } else { r.value } }
         checker::TLoopStmt as l   => checker::TLoopStmt { label = l.label; body = cg_lift_block(l.body, acc) }
         checker::TExprStmt as es  => checker::TExprStmt { expr = cg_lift_expr(es.expr, acc) }

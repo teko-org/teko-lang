@@ -147,7 +147,89 @@ static tk_typed_stmt_result type_binding(tk_binding b, tk_env env, tk_type_table
     return sok(node, env);   // [destructuring binding: refinement]
 }
 
+// (#88) the ROOT variable of a field-access lvalue chain (`a.b.c` → `a`). Returns the `Var` name and
+// whether the whole chain is reachable from a plain-variable root (not an index / call / literal). A
+// non-Var root (e.g. `f().x`) has no binding to check for mutability — reachable=false.
+typedef struct { bool reachable; tk_str name; } tk_lvalue_root;
+static tk_lvalue_root lvalue_root(const tk_expr *e) {
+    if (e->tag == TK_EXPR_VAR)          return (tk_lvalue_root){ true, e->as.var.name };
+    if (e->tag == TK_EXPR_FIELD_ACCESS) return lvalue_root(e->as.field_access.receiver);
+    return (tk_lvalue_root){ false, (tk_str){ NULL, 0 } };
+}
+
+// (#88) a FIELD-target assignment `recv.field op= value`. The parser routes EVERY `recv.field = …`
+// here; this branch decides Ref-deref (`r.value` on a `Ref<T>` — the legacy MEM-1b-ii path, preserved
+// bit-for-bit) vs a struct/class field WRITE, enforcing write-visibility == read-visibility (the RULING).
+static tk_typed_stmt_result type_field_assign(tk_assign a, tk_env env, tk_type_table table) {
+    // Type the LHS field-access EXPR. This resolves the receiver + field type AND enforces read-side
+    // visibility (a private class field written externally is rejected here with the SAME "field is
+    // private to its declaring class" diagnostic a read would raise — write-permission == read-permission).
+    tk_texpr_result lhs = tk_typer_expr(*a.target, env, table); if (!lhs.ok) return sfail(lhs.as.error);
+    if (lhs.as.value.tag != TK_TEXPR_FIELD_ACCESS)
+        return smsg("assignment target is not a field access (internal: parser guarantees a field LHS)");
+    const tk_expr *recv_expr = a.target->as.field_access.receiver;
+    tk_texpr_result recv = tk_typer_expr(*recv_expr, env, table); if (!recv.ok) return sfail(recv.as.error);
+    tk_type rt = recv.as.value.type;
+    tk_type field_t = lhs.as.value.type;
+
+    // (MEM-1b-ii, preserved) `r.value op= x` on a `Ref<T>` — write THROUGH the reference. Detected from
+    // the RECEIVER TYPE (not a parser hardcode): a `Ref<T>` receiver + field `value`. The handle need NOT
+    // be `mut` (a `Ref<T>` is a const handle granting WRITE to its mutable target — R2). Emit the SAME
+    // deref-shaped TAssign (kind=REF_DEREF, name=the ref handle) the old parser produced, so all
+    // downstream passes / the TKB layout are byte-identical for existing Ref writes.
+    if (rt.tag == TK_TYPE_REF && tk_str_eq(a.target->as.field_access.field, (tk_str){ (const tk_byte *)"value", 5 })) {
+        if (recv_expr->tag != TK_EXPR_VAR)
+            return smsg("`.value` deref-assignment requires a bare `Ref<T>` handle on the left");
+        tk_str ref_name = recv_expr->as.var.name;
+        tk_type inner = *rt.as.ref.inner;
+        tk_texpr_result dv = tk_typer_expr(a.value, env, table); if (!dv.ok) return sfail(dv.as.error);
+        if (!assignable_to(dv.as.value.type, inner, table)) {
+            if (!tk_literal_adopts(dv.as.value, inner))
+                return sfail(tk_error_types(tk_error_make("assigned value does not match the referenced type"),
+                                            tk_type_render(inner), tk_type_render(dv.as.value.type)));
+            dv.as.value.type = inner;
+        }
+        tk_tstatement dn = { .tag = TK_TSTMT_ASSIGN, .as.assign = { .kind = TK_ASSIGN_REF_DEREF, .name = ref_name, .op = a.op, .bound = inner, .value = dv.as.value, .deref = true, .target = NULL } };
+        return sok(dn, env);
+    }
+
+    // A struct/class FIELD write. Structs are VALUE types → the write mutates the receiver in place, so
+    // the receiver must be a MUTABLE lvalue: its root variable must be a `mut` binding (the RULING —
+    // "structs: `obj.f = v` allowed wherever `obj` is a `mut` binding"). Classes are REFERENCE types (the
+    // value is a pointer; mutation flows through it — like a `Ref<T>`), so the handle need not be `mut`.
+    bool recv_is_class = rt.tag == TK_TYPE_NAMED && tk_find_class_body(rt.as.named.name, table).ok;
+    if (!recv_is_class) {
+        tk_lvalue_root root = lvalue_root(recv_expr);
+        if (!root.reachable)
+            return smsg("cannot assign to a field of a temporary value — the receiver is not a mutable variable");
+        tk_binding_result rb = tk_env_lookup_binding(env, root.name); if (!rb.ok) return sfail(rb.as.error);
+        if (!rb.as.value.is_mut)
+            return smsg("cannot assign to a field of an immutable binding — declare it `mut` (B.21)");
+    }
+
+    // Type-check the RHS against the FIELD type (same widen/adopt rule as a simple assign / binding).
+    tk_texpr_result v = tk_typer_expr(a.value, env, table); if (!v.ok) return sfail(v.as.error);
+    // (MEM Step 0, R5) ESCAPE GATE — a field write may not move a reference into a field either.
+    if (tk_type_contains_ref(&field_t) || tk_type_contains_ref(&v.as.value.type))
+        return smsg("a reference cannot be stored in a field (parameter-only in this version)");
+    if (!assignable_to(v.as.value.type, field_t, table)) {
+        if (!tk_literal_adopts(v.as.value, field_t))
+            return sfail(tk_error_types(tk_error_make("assigned value does not match the field type"),
+                                        tk_type_render(field_t), tk_type_render(v.as.value.type)));
+        tk_retype_literal(&v.as.value, field_t);
+    }
+    if (v.as.value.type.tag == TK_TYPE_SLICE && v.as.value.type.as.slice.element == NULL
+        && field_t.tag == TK_TYPE_SLICE && field_t.as.slice.element != NULL)
+        v.as.value.type = field_t;
+    tk_texpr *lhs_boxed = box(lhs.as.value);
+    tk_tstatement node = { .tag = TK_TSTMT_ASSIGN, .as.assign = { .kind = TK_ASSIGN_FIELD, .name = { NULL, 0 }, .op = a.op, .bound = field_t, .value = v.as.value, .deref = false, .target = lhs_boxed } };
+    return sok(node, env);
+}
+
 static tk_typed_stmt_result type_assign(tk_assign a, tk_env env, tk_type_table table) {
+    // (#88) a FIELD target (`recv.field = …`) — Ref-deref vs struct/class field write, decided by the
+    // receiver TYPE (type_field_assign). The simple-name path below is unchanged.
+    if (a.kind == TK_ASSIGN_FIELD) return type_field_assign(a, env, table);
     tk_binding_result tb = tk_env_lookup_binding(env, a.name); if (!tb.ok) return sfail(tb.as.error);
     // (MEM-1b-ii) `r.value op= x` — write THROUGH a reference. The handle `r` need NOT be `mut` (a
     // `Ref<T>` is a const handle granting WRITE to its mutable target — R2); the type written is T.
@@ -162,7 +244,7 @@ static tk_typed_stmt_result type_assign(tk_assign a, tk_env env, tk_type_table t
                                             tk_type_render(inner), tk_type_render(dv.as.value.type)));
             dv.as.value.type = inner;   // a fitting literal adopts T
         }
-        tk_tstatement dn = { .tag = TK_TSTMT_ASSIGN, .as.assign = { a.name, a.op, inner, dv.as.value, true } };
+        tk_tstatement dn = { .tag = TK_TSTMT_ASSIGN, .as.assign = { .kind = TK_ASSIGN_REF_DEREF, .name = a.name, .op = a.op, .bound = inner, .value = dv.as.value, .deref = true, .target = NULL } };
         return sok(dn, env);
     }
     if (!tb.as.value.is_mut) return smsg("cannot assign to immutable binding — declare it `mut` (B.21)");
@@ -194,7 +276,7 @@ static tk_typed_stmt_result type_assign(tk_assign a, tk_env env, tk_type_table t
     if (v.as.value.type.tag == TK_TYPE_SLICE && v.as.value.type.as.slice.element == NULL
         && target.tag == TK_TYPE_SLICE && target.as.slice.element != NULL)
         v.as.value.type = target;
-    tk_tstatement node = { .tag = TK_TSTMT_ASSIGN, .as.assign = { a.name, a.op, target, v.as.value, false } };
+    tk_tstatement node = { .tag = TK_TSTMT_ASSIGN, .as.assign = { .kind = TK_ASSIGN_SIMPLE, .name = a.name, .op = a.op, .bound = target, .value = v.as.value, .deref = false, .target = NULL } };
     return sok(node, env);   // mut rule enforced (B.21)
 }
 

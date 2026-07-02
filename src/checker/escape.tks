@@ -283,8 +283,13 @@ fn mark_stmt(s: TStatement, tail: bool, acc: Ref<[]str>) -> void {
         // a binding RHS escapes (the value lives on through the bound name; conservatively the
         // name may itself later escape — we do not run a second fixpoint pass).
         TBinding as b => mark_expr(b.value, true, acc)
-        // an assignment RHS escapes (it may be written into an outer/captured location).
-        TAssign as a  => mark_expr(a.value, true, acc)
+        // an assignment RHS escapes (it may be written into an outer/captured location). (#88) a FIELD
+        // write stores into an object that OUTLIVES the frame (a class is cell-backed; a struct field
+        // write escapes through its `mut` root), so the receiver's reads are escaping too.
+        TAssign as a  => {
+            mark_expr(a.value, true, acc)
+            match a.kind { parser::AssignKind::Field => mark_expr(a.target, true, acc); _ => { } }
+        }
         // a return value escapes the frame entirely.
         TReturn as r  => if r.has_value { mark_expr(r.value, true, acc) } else { }
         // an expression-statement: DISCARDED (value unused → NON-escaping) UNLESS it is in TAIL
@@ -468,7 +473,7 @@ fn count_reads_expr(e: TExpr, name: str) -> i64 {
 fn count_reads_stmt(s: TStatement, name: str) -> i64 {
     match s {
         TBinding as b   => count_reads_expr(b.value, name)
-        TAssign as a    => count_reads_expr(a.value, name)
+        TAssign as a    => count_reads_expr(a.value, name) + match a.kind { parser::AssignKind::Field => count_reads_expr(a.target, name); _ => 0 }   // (#88) the FIELD receiver reads `name` too
         TReturn as r    => if r.has_value { count_reads_expr(r.value, name) } else { 0 }
         TExprStmt as es => count_reads_expr(es.expr, name)
         TLoopStmt as l  => count_reads_block(l.body, name)

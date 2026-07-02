@@ -282,6 +282,49 @@ fn ref_struct_same_var_aliased_holds() {
 }
 
 // ---------------------------------------------------------------------------
+// (#88 follow-up) STRUCT field assignment is COPY-ON-WRITE — value semantics. A struct copy
+// (`mut b = a`) is INDEPENDENT: writing `b.f = v` must NOT mutate `a`. The vm.c field-write path
+// must rebuild the struct (copy-on-write) rather than write through a shared fields.vals[] array;
+// these tests lock that invariant on the VM (and, run through `teko build`, on native too). They
+// would FAIL under the earlier in-place write (a's field would see b's mutation). Classes stay
+// reference-semantic (aliased) — see examples/regressions/field_assignment for that side.
+// ---------------------------------------------------------------------------
+
+// a direct copy, then a field write through the copy — the original must be UNCHANGED.
+#test
+fn struct_copy_field_write_is_value_semantic() {
+    mut a = Point { x = 1; y = 2 }
+    mut b = a                                    // b is an independent COPY (value semantics)
+    b.x = 99
+    teko::assert::is_true(a.x == 1)              // a is UNCHANGED by the write through b
+    teko::assert::is_true(b.x == 99)
+    teko::assert::is_true(a.y == 2)
+}
+
+// writing a local copy of a struct PARAM must leave the caller's struct intact (param-boundary copy).
+fn vt_bump_local(p: Point) -> i64 { mut local = p; local.x = 999; local.x }
+#test
+fn struct_param_copy_field_write_is_value_semantic() {
+    let orig = Point { x = 5; y = 6 }
+    teko::assert::is_true(vt_bump_local(orig) == 999)
+    teko::assert::is_true(orig.x == 5)           // the caller's struct is UNCHANGED
+}
+
+// nested struct-in-struct copy: writing an INNER field through a copy must not corrupt the source's
+// inner field (the copy-on-write must rebuild up the whole chain, not share the inner struct's array).
+type VtInner = struct { z: i64 }
+type VtOuter = struct { inner: VtInner; w: i64 }
+#test
+fn struct_nested_copy_field_write_is_value_semantic() {
+    mut a = VtOuter { inner = VtInner { z = 1 }; w = 10 }
+    mut b = a                                    // independent COPY (deep value)
+    b.inner.z = 77
+    teko::assert::is_true(a.inner.z == 1)        // a's nested field UNCHANGED
+    teko::assert::is_true(b.inner.z == 77)
+    teko::assert::is_true(a.w == 10)
+}
+
+// ---------------------------------------------------------------------------
 // W9a fix — a deref-WRITE through a `Ref<T?>` (an OPTIONAL inner) must PRESENT-wrap the value
 // before the cell write (the binding/return present-wrap, via coerce_to(a.bound)). Without it the
 // VM stored a BARE value and a later `?? / ?.` read PANICKED ("coalesce left operand is not

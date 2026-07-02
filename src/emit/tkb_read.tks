@@ -486,13 +486,21 @@ fn read_tstatement(r: CodecReader, table: []str) -> RTStmt | error {
         return RTStmt { r = v.r; value = checker::TBinding { kind = bk.value to parser::BindKind; target = bt.value; bound = bd.value; value = v.value } }
     }
     if tag.value == 1 {
-        // TAssign: name (u32) + op (u8) + bound (Type) + value (TExpr) + deref (u8) (MEM-1b-ii).
-        let nm = match tkb_read_str(tag.r, table) { RStr as x => x; error as e => return e }
+        // TAssign: kind (u8) + name (u32) + op (u8) + bound (Type) + value (TExpr) + deref (u8)
+        //   [+ target (TExpr) iff kind==Field]. (#88; MEM-1b-ii)
+        let ak = match read_u8(tag.r)             { RByte as x => x; error as e => return e }
+        let nm = match tkb_read_str(ak.r, table)  { RStr as x => x; error as e => return e }
         let op = match read_u8(nm.r)              { RByte as x => x; error as e => return e }
         let bd = match read_type(op.r, table)     { RType as x => x; error as e => return e }
         let v  = match read_texpr(bd.r, table)    { RTExpr as x => x; error as e => return e }
         let dr = match read_u8(v.r)               { RByte as x => x; error as e => return e }
-        return RTStmt { r = dr.r; value = checker::TAssign { name = nm.value; op = kind_of(op.value); bound = bd.value; value = v.value; deref = dr.value != 0 } }
+        let akind = ak.value to parser::AssignKind
+        let is_field = match akind { parser::AssignKind::Field => true; _ => false }
+        if is_field {
+            let tg = match read_texpr(dr.r, table) { RTExpr as x => x; error as e => return e }
+            return RTStmt { r = tg.r; value = checker::TAssign { kind = akind; name = nm.value; op = kind_of(op.value); bound = bd.value; value = v.value; deref = dr.value != 0; target = tg.value } }
+        }
+        return RTStmt { r = dr.r; value = checker::TAssign { kind = akind; name = nm.value; op = kind_of(op.value); bound = bd.value; value = v.value; deref = dr.value != 0; target = checker::no_texpr() } }
     }
     if tag.value == 2 {
         let hv = match read_u8(tag.r)          { RByte as x => x; error as e => return e }

@@ -12,7 +12,6 @@
 // file-local forward declarations (defined below; tk_parse_statement dispatches to them)
 static tk_parsed_stmt_result parse_binding(const tk_token *t, size_t n, size_t pos);
 static tk_parsed_stmt_result parse_assign (const tk_token *t, size_t n, size_t pos);
-static tk_parsed_stmt_result parse_ref_assign(const tk_token *t, size_t n, size_t pos);
 
 tk_parsed_stmt_result tk_parse_statement(const tk_token *t, size_t n, size_t pos) {
     if (!tk_has_token(t, n, pos)) {
@@ -73,26 +72,31 @@ tk_parsed_stmt_result tk_parse_statement(const tk_token *t, size_t n, size_t pos
     if (tk_is_kind_at(t, n, pos, TK_TOKEN_IDENT) && tk_is_assign_op(t, n, pos + 1)) {
         return parse_assign(t, n, pos);
     }
-    // (MEM-1b-ii) `r.value op= x` — assign THROUGH a reference: `name . value <assign-op>`. The ONLY
-    // field-assignment target in value-functional Teko. Matched before the expr-statement fallback.
-    if (tk_is_kind_at(t, n, pos, TK_TOKEN_IDENT)
-        && tk_is_kind_at(t, n, pos + 1, TK_TOKEN_DOT)
-        && tk_is_name_at(t, n, pos + 2)
-        && t[pos + 2].text.len == 5 && memcmp(t[pos + 2].text.ptr, "value", 5) == 0
-        && tk_is_assign_op(t, n, pos + 3)) {
-        return parse_ref_assign(t, n, pos);
-    }
     // `i++` / `i--` — postfix increment/decrement STATEMENT sugar: desugar to the compound
     // assignment `i += 1` / `i -= 1` (reuses assign typing/codegen/VM; mut-guard included).
     if (tk_is_kind_at(t, n, pos, TK_TOKEN_IDENT) &&
         (tk_is_kind_at(t, n, pos + 1, TK_TOKEN_PLUSPLUS) || tk_is_kind_at(t, n, pos + 1, TK_TOKEN_MINUSMINUS))) {
         tk_token_kind op = tk_is_kind_at(t, n, pos + 1, TK_TOKEN_PLUSPLUS) ? TK_TOKEN_PLUSEQ : TK_TOKEN_MINUSEQ;
         tk_expr one = { .tag = TK_EXPR_NUMBER, .as.number = { .is_float = false, .value = 1 } };
-        tk_statement s = { .tag = TK_STMT_ASSIGN, .as.assign = { .name = t[pos].text, .op = op, .value = one, .deref = false } };
+        tk_statement s = { .tag = TK_STMT_ASSIGN, .as.assign = { .kind = TK_ASSIGN_SIMPLE, .name = t[pos].text, .op = op, .value = one, .deref = false, .target = NULL } };
         return (tk_parsed_stmt_result){ .ok = true, .as.value = { .node = s, .next = pos + 2 } };
     }
+    // (#88) a general FIELD/deref-assign target: parse a full postfix EXPRESSION, then — if it is a
+    // field-access path (`recv.field`, possibly nested / indexed) AND an assign-op follows — treat it as
+    // an assignment target. This subsumes the old hardcoded `name.value op= …` (MEM-1b-ii) shape: the
+    // TYPER decides Ref-deref (`r.value` on a `Ref<T>`) vs a struct/class field write from the receiver
+    // TYPE. A field-access followed by NO assign-op, and any non-field expr (e.g. `obj.m()`), fall through
+    // to the expr-statement below UNCHANGED — method-call statements are never swallowed.
     tk_parsed_result e = tk_parse_expr(t, n, pos);
     if (!e.ok) { return (tk_parsed_stmt_result){ .ok = false, .as.error = e.as.error }; }
+    if (e.as.value.node.tag == TK_EXPR_FIELD_ACCESS && tk_is_assign_op(t, n, e.as.value.next)) {
+        tk_token_kind op = t[e.as.value.next].kind;
+        tk_parsed_result v = tk_parse_expr(t, n, e.as.value.next + 1);
+        if (!v.ok) { return (tk_parsed_stmt_result){ .ok = false, .as.error = v.as.error }; }
+        tk_expr *lhs = tk_box_expr(e.as.value.node);
+        tk_statement s = { .tag = TK_STMT_ASSIGN, .as.assign = { .kind = TK_ASSIGN_FIELD, .name = { .ptr = NULL, .len = 0 }, .op = op, .value = v.as.value.node, .deref = false, .target = lhs } };
+        return (tk_parsed_stmt_result){ .ok = true, .as.value = { .node = s, .next = v.as.value.next } };
+    }
     tk_statement s = { .tag = TK_STMT_EXPR, .as.expr_stmt = { .expr = e.as.value.node } };
     return (tk_parsed_stmt_result){ .ok = true, .as.value = { .node = s, .next = e.as.value.next } };
 }
@@ -174,17 +178,6 @@ static tk_parsed_stmt_result parse_assign(const tk_token *t, size_t n, size_t po
     tk_token_kind op = t[pos + 1].kind;
     tk_parsed_result v = tk_parse_expr(t, n, pos + 2);
     if (!v.ok) { return (tk_parsed_stmt_result){ .ok = false, .as.error = v.as.error }; }
-    tk_statement s = { .tag = TK_STMT_ASSIGN, .as.assign = { .name = name, .op = op, .value = v.as.value.node, .deref = false } };
-    return (tk_parsed_stmt_result){ .ok = true, .as.value = { .node = s, .next = v.as.value.next } };
-}
-
-// (MEM-1b-ii) `name.value op= value` — write THROUGH a reference. `pos` at the ref name; the `.value`
-// shape was matched at dispatch (tokens: name . value <assign-op> value).
-static tk_parsed_stmt_result parse_ref_assign(const tk_token *t, size_t n, size_t pos) {
-    tk_str name = t[pos].text;
-    tk_token_kind op = t[pos + 3].kind;   // the assign op AFTER `.value`
-    tk_parsed_result v = tk_parse_expr(t, n, pos + 4);
-    if (!v.ok) { return (tk_parsed_stmt_result){ .ok = false, .as.error = v.as.error }; }
-    tk_statement s = { .tag = TK_STMT_ASSIGN, .as.assign = { .name = name, .op = op, .value = v.as.value.node, .deref = true } };
+    tk_statement s = { .tag = TK_STMT_ASSIGN, .as.assign = { .kind = TK_ASSIGN_SIMPLE, .name = name, .op = op, .value = v.as.value.node, .deref = false, .target = NULL } };
     return (tk_parsed_stmt_result){ .ok = true, .as.value = { .node = s, .next = v.as.value.next } };
 }
