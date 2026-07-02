@@ -36,6 +36,7 @@ tk_tprogram_result tk_deserialize_program(const tk_byte *data, size_t len);
 #include <string.h>          // strrchr, strcmp, memcpy
 #ifdef _WIN32
 #include "win32_compat.h"    // chdir→_chdir, mkdir, getcwd, setenv, dirent shim, tk_win32_spawnvp
+#include <io.h>              // _dup, _dup2, _close — fd-redirect around spawn_wait's _spawnvp (issue #73)
 #else
 #include <unistd.h>          // chdir (run the project path from its own root — A3)
 #include <spawn.h>           // posix_spawnp — safer cc invocation without shell
@@ -269,8 +270,8 @@ static int spawn_wait(const char *cc, char *const argv[], bool quiet) {
     fflush(NULL);
     _dup2(saved_out, _fileno(stdout));
     _dup2(saved_err, _fileno(stderr));
-    close(saved_out);
-    close(saved_err);
+    _close(saved_out);
+    _close(saved_err);
     return (w == -1) ? -1 : w;
 #else
     extern char **environ;

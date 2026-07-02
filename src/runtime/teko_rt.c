@@ -23,6 +23,7 @@
 #endif
 #ifdef _WIN32
 #include "../win32_compat.h"  // chdir→_chdir, mkdir, getcwd, setenv, dirent shim, tk_win32_spawnvp
+#include <io.h>        // _dup, _dup2, _close — fd-redirect around tk_rt_run_quiet's _spawnvp (issue #73)
 #else
 #include <unistd.h>   // chdir, fork, execvp, _exit (host FFI bottoms)
 #include <sys/wait.h> // waitpid — teko::process::run
@@ -1159,8 +1160,8 @@ int32_t tk_rt_run_quiet(const tk_str *argv, uint64_t n) {
     fflush(NULL);
     _dup2(saved_out, _fileno(stdout));
     _dup2(saved_err, _fileno(stderr));
-    close(saved_out);
-    close(saved_err);
+    _close(saved_out);
+    _close(saved_err);
     return (w == -1) ? 127 : (int32_t)(int8_t)w;
 #else
     pid_t pid = fork();
