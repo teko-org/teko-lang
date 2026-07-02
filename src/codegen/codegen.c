@@ -1437,6 +1437,20 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
                 cb(b, "((uint8_t)"); cb_i128(b, e->as.number.value); cb(b, ")");
                 return true;
             }
+            // (#63) A FLAGS-typed number literal — the checker's fabricated zero in the
+            // any/none lowering (type_flags_method, expr.c) — is a NAMED type whose decl is
+            // `flags`. Emit it cast to the flags' own typedef'd carrier (`tk_t_<Name>`, the
+            // SAME uint chosen by member count as the flags typedef itself emits — TK_BODY_FLAGS
+            // above), so this reuses that carrier via its typedef name instead of re-deriving
+            // uint8_t/uint16_t/… a second time. Mirrors vm.c's flags_carrier_prim (VM twin, #50).
+            if (e->type.tag == TK_TYPE_NAMED && cg_named_is_flags(e->type.as.named.name)) {
+                cb(b, "((");
+                mangle_type_name(b, (tk_str){ NULL, 0 }, e->type.as.named.name);
+                cb(b, ")");
+                cb_i128(b, e->as.number.value);
+                cb(b, ")");
+                return true;
+            }
             // The node's resolved prim decides width / float-kind (N1/N2). A non-prim
             // number type is a checker bug, but be honest rather than mis-emit (M.3).
             if (e->type.tag != TK_TYPE_PRIM)

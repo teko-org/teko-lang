@@ -4106,13 +4106,31 @@ fn emit_match_stmt(buf: []byte, prog: checker::TProgram, e: checker::TExpr, m: c
 // decimal value cast to the prim's C type, so the literal carries the right width — a
 // u128/i128 literal is wider than any C integer literal can spell on its own.
 // (C: the TK_TEXPR_NUMBER branch of emit_expr.)
-fn emit_number(buf: []byte, e: checker::TExpr, n: checker::TNumber) -> []byte | error {
+fn emit_number(buf: []byte, prog: checker::TProgram, e: checker::TExpr, n: checker::TNumber) -> []byte | error {
     // A numeric literal adopted to `byte` via literal-adoption (e.g. `c < 0x20` where c: byte).
     match e.type {
         checker::Byte => {
             mut o = cb(buf, "((uint8_t)")
             o = cb_i128(o, n.value)
             return cb(o, ")")
+        }
+        _ => { }
+    }
+    // (#63) A FLAGS-typed number literal — the checker's fabricated zero in the any/none
+    // lowering (type_flags_method, typer.tks) — is a NAMED type whose decl is `flags`. Emit it
+    // cast to the flags' own typedef'd carrier (`tk_t_<Name>`, the SAME uint chosen by member
+    // count as the flags typedef itself emits — FlagsBody above), reusing that carrier via its
+    // typedef name instead of re-deriving uint8_t/uint16_t/… a second time. Mirrors vm.tks's
+    // flags_carrier_of (VM twin, #50).
+    match e.type {
+        checker::Named as nm => {
+            if cg_named_is_flags(prog, nm.name) {
+                mut o = cb(buf, "((")
+                o = mangle_type_name(o, "", nm.name)
+                o = cb(o, ")")
+                o = cb_i128(o, n.value)
+                return cb(o, ")")
+            }
         }
         _ => { }
     }
@@ -4164,7 +4182,7 @@ fn emit_expr_ret(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, 
 // Every other expr just forwards the context unchanged. (C: `emit_expr` — globals, no threading.)
 fn emit_expr_ctx(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, e: checker::TExpr, escaping: []str, regions: []RegionFrame, fn_body: []checker::TStatement, dctx: DeferCtx) -> []byte | error {
     match e.kind {
-        checker::TNumber as n      => emit_number(buf, e, n)
+        checker::TNumber as n      => emit_number(buf, prog, e, n)
         // (W10a) a bare top-level-fn reference used as a VALUE → a `tk_closure` literal carrying the
         // C function's address (env = NULL; named fns capture nothing). A plain local emits its name.
         checker::TVar as v         => if v.is_func {
