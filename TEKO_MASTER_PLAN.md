@@ -734,7 +734,20 @@ the only ones the user ruled on directly.
   "ratify with the net/crypto ones in PR #80" resolve against `NET_CRYPTO`: `M1` (checked arithmetic) and
   `M3` (BigInt) are the units that answer `NET_CRYPTO`'s open decisions **#4** and **#8** (per that doc's
   §6 open-decisions list) — so while `M0` is free-standing, `M1`/`M3` have a soft coupling to when
-  NET_CRYPTO's decisions get ratified, not a hard code dependency.
+  NET_CRYPTO's decisions get ratified, not a hard code dependency. **`M0` ✅ DONE** (issue #96, PR TBD,
+  branch `feat/issue-96-math-m0`) — `src/math/math.tks` (+ `math_test.tkt`, 29 tests): constants
+  (`pi`/`tau`/`e`/`sqrt2`/`ln2`/`ln10`), `inf()`/`nan()` producers, float classification
+  (`is_nan`/`is_inf`/`is_finite`/`is_normal` via `teko::f64_bits` IEEE-754 bit inspection — no libm),
+  `abs`/`sign`/`copysign`, `min`/`max`/`clamp`, and the checked integer helpers `gcd`/`lcm`/`isqrt`/`ipow`
+  (`T | error` on overflow/domain edges, never panic). Pure Teko, zero `extern`/FFI, zero compiler-core
+  touches. **One documented deviation**: `min`/`max`/`clamp` ship as a PER-TYPE family (`_i64`/`_f64`)
+  rather than truly generic — verified live that operators (`<`/`>`) on an unconstrained/nominally-
+  constrained generic `T` do not yet type-check (S6, constraint-gated operator availability, is designed
+  but not implemented — `src/checker/expr.tks::is_numeric`/`is_comparable` only match concrete `Prim`
+  types). Mechanical follow-up once S6 lands. Also surfaced (and worked around, not fixed) a live VM
+  limitation: `return` inside a value-position `match` arm (`let x = match … { … => return e }`) is an
+  honest VM stop ("control flow inside a `match` used as a sub-expression not yet supported",
+  `src/vm/vm.tks`/`vm.c`) — `lcm`/`ipow` use a bare-statement `match` into a pre-declared `mut` instead.
 - **DEVTOOLS** (`teko fmt` / `teko doc` / lint / repl) — **`DT0` (`teko fmt`) is `Deps: parser/AST`** only
   — no checker, no runtime — startable NOW, fully parallel with everything else (its own namespace,
   `src/fmt/*.tks`, touches no single-owner bottleneck file).
