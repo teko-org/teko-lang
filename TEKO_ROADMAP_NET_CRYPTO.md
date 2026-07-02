@@ -127,10 +127,13 @@ RFC 6455: HTTP Upgrade handshake (`Sec-WebSocket-Accept` needs SHA-1 → **depen
 C1**), frame codec (fin/opcode/mask/payload-len), masking. **Verify:** `.tkt` on the VM for the frame
 codec + accept-key derivation (pure Teko); native echo over loopback.
 
-> Note: two abandoned pre-reboot branches (`feat/phase-19-networking`, `feat/phase-19-ws-srv`, June 17)
-> attempted a router/WS server via a **C/WASM reactor** — the exact opposite of this all-Teko mandate.
-> They are **reference only, do not merge/cherry-pick**; the RFC 6455 framing there can inform N6's test
-> vectors but not its implementation.
+> **Pre-reboot networking exists in `main` — DO NOT use it as a source (code OR syntax).** Two abandoned
+> branches (`feat/phase-19-networking`, `feat/phase-19-ws-srv`, June 17) attempted a router/WS server via a
+> **C/WASM reactor** — the exact opposite of this all-Teko mandate — and, critically, **their Teko syntax is
+> pre-reboot and diverges heavily from the current language** (removed/renamed constructs). Agents must NOT
+> open these to learn "how it was done": neither the implementation nor the syntax is valid. The ONLY
+> portable thing is **raw external data** — RFC 6455 / RFC 8439 / NIST byte vectors (hex inputs, expected
+> outputs) — which are language-agnostic. Take those from the RFCs directly, not from the old code.
 
 ---
 
