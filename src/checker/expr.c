@@ -1507,7 +1507,8 @@ static tk_texpr_result type_path_expr(tk_path_expr pe, tk_type_table table) {
         for (size_t i = 0; i < eb.n_members; i += 1)
             if (tk_str_eq(eb.members[i], member))
                 return xok((tk_texpr){ .tag = TK_TEXPR_PATH, .type = et.as.value,
-                                       .as.path = { et.as.value.as.named.name, member, (uint64_t)i } });
+                                       .as.path = { et.as.value.as.named.name, member, (uint64_t)i,
+                                                    (unsigned __int128)i } });   // (#50) enum member VALUE = its ordinal
         return xerr("no such member in the enum");
     }
     if (decl.as.value.body.tag == TK_BODY_FLAGS) {
@@ -1519,7 +1520,8 @@ static tk_texpr_result type_path_expr(tk_path_expr pe, tk_type_table table) {
         for (size_t i = 0; i < fb.n_members; i += 1)
             if (tk_str_eq(fb.members[i], member))
                 return xok((tk_texpr){ .tag = TK_TEXPR_PATH, .type = et.as.value,
-                                       .as.path = { et.as.value.as.named.name, member, (uint64_t)i } });
+                                       .as.path = { et.as.value.as.named.name, member, (uint64_t)i,
+                                                    ((unsigned __int128)1) << i } });   // (#50) flags member VALUE = 1 << ordinal (power-of-2)
         return xerr("no such member in the flags type");
     }
     return xerr("`Type::Member` requires an `enum` or `flags` type");
