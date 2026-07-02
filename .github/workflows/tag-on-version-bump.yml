@@ -1,0 +1,80 @@
+name: Tag on version bump
+
+# AUTOMATIC ADVANCEMENT of the bootstrap release tag.
+#
+# The teko.tkp manifest is the version SOURCE OF TRUTH. When its `version`/`suffix`
+# is bumped and the change lands on an integration branch, this workflow derives the
+# tag (scripts/derive_version.sh) and — ONLY if that tag does not already exist on
+# the remote — creates an annotated tag at the pushed commit and pushes it.
+#
+# Pushing the tag triggers .github/workflows/release.yml via its `push: tags:
+# '*-bootstrap'` path, which builds + gates + publishes the gen-3 release. This
+# workflow therefore does the ONE thing release.yml cannot: mint the tag from the
+# manifest automatically.
+#
+# NO RECURSION: this job runs on BRANCH push; release.yml runs on TAG push. Pushing
+# a tag here does NOT re-trigger this workflow (it has no `tags:` trigger), and this
+# workflow never pushes a branch. IDEMPOTENT: if the derived tag already exists it
+# skips (logged), so re-running on unrelated commits is a no-op.
+on:
+  push:
+    branches: [chore/reboot, main]
+
+# Creating and pushing a tag requires write access to repository contents.
+permissions:
+  contents: write
+
+# Never run two taggers concurrently for the same ref — avoids a race where two
+# pushes both see the tag missing and both try to create it.
+concurrency:
+  group: tag-on-version-bump-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Full history + tags so `git tag` / `git push` and existence checks work.
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Derive tag from teko.tkp
+        id: derive
+        run: |
+          DERIVED="$(sh scripts/derive_version.sh)"
+          echo "derived=$DERIVED" >> "$GITHUB_OUTPUT"
+          echo "teko.tkp-derived tag = $DERIVED"
+
+      - name: Create + push tag if it does not already exist
+        env:
+          DERIVED: ${{ steps.derive.outputs.derived }}
+        run: |
+          set -eu
+          # Ask the REMOTE authoritatively whether the tag exists (not just the
+          # local fetch), so the guard is robust even if a fetch missed it.
+          if git ls-remote --exit-code --tags origin "refs/tags/$DERIVED" >/dev/null 2>&1; then
+            echo "SKIP: tag '$DERIVED' already exists on origin — manifest version not bumped; nothing to do."
+            exit 0
+          fi
+
+          echo "CREATE: tag '$DERIVED' is missing on origin — the manifest version was bumped."
+          # Configure an identity for the annotated tag.
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Annotate at the pushed commit (the current HEAD of this checkout).
+          git tag -a "$DERIVED" -m "Teko bootstrap release $DERIVED (auto-tagged from teko.tkp)" "$GITHUB_SHA"
+
+          # Push ONLY this tag. Pushing the tag triggers release.yml's tag path.
+          # A concurrent creator could win the race; treat a rejected push as a
+          # benign "already created" and exit 0 (idempotent).
+          if git push origin "refs/tags/$DERIVED"; then
+            echo "Pushed tag '$DERIVED' — release.yml (tag path) will build + publish."
+          else
+            echo "NOTE: push of tag '$DERIVED' was rejected (it likely now exists via a concurrent run). Treating as already-tagged."
+          fi
