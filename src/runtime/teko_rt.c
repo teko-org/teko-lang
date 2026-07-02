@@ -23,11 +23,13 @@
 #endif
 #ifdef _WIN32
 #include "../win32_compat.h"  // chdir→_chdir, mkdir, getcwd, setenv, dirent shim, tk_win32_spawnvp
+#include <io.h>        // _dup, _dup2, _close — fd-redirect around tk_rt_run_quiet's _spawnvp (issue #73)
 #else
 #include <unistd.h>   // chdir, fork, execvp, _exit (host FFI bottoms)
 #include <sys/wait.h> // waitpid — teko::process::run
 #include <dirent.h>   // opendir/readdir — teko::fs::list_dir
 #include <sys/stat.h> // mkdir — teko::fs::mkdir (build output dir)
+#include <fcntl.h>    // O_WRONLY — /dev/null redirect for tk_rt_run_quiet (issue #73 cc probe)
 #endif
 #include <errno.h>    // errno/EEXIST — mkdir idempotence
 #include <time.h>     // clock_gettime, localtime_r, CLOCK_REALTIME — teko::time ROUND 0
@@ -1050,6 +1052,17 @@ tk_ffi_ures tk_rt_mkdir(tk_str path) {
     return (tk_ffi_ures){ .ok = true };
 }
 
+// (issue #79) teko::fs::remove_file(path) — delete the file at `path` via libc remove().
+// Already-absent is success (idempotent — mirrors mkdir's already-exists-is-success
+// contract; "ensure the file does not exist"). First use: cleaning the cc-family probe
+// file (<binary>.ccprobe.c) in the build backend's cc_family_is_clang twins (issue #73).
+tk_ffi_ures tk_rt_remove_file(tk_str path) {
+    char *p = tk_cstr(path);
+    if (remove(p) != 0 && errno != ENOENT)
+        return (tk_ffi_ures){ .ok = false, .err = tk_str_of_cstr("cannot remove file") };
+    return (tk_ffi_ures){ .ok = true };
+}
+
 tk_ffi_sres tk_rt_getcwd(void) {
     char buf[4096];
     if (getcwd(buf, sizeof buf) == NULL)
@@ -1114,6 +1127,52 @@ int32_t tk_rt_run(const tk_str *argv, uint64_t n) {
     pid_t pid = fork();
     if (pid < 0) return 127;
     if (pid == 0) {                      // child: exec; on failure exit 127 (POSIX convention)
+        execvp(cargv[0], cargv);
+        _exit(127);
+    }
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) return 127;
+    if (WIFEXITED(status)) return (int32_t)(int8_t)WEXITSTATUS(status);
+    return 127;
+#endif
+}
+
+// (issue #73) teko::process::run_quiet(args) — same contract as tk_rt_run, but the child's
+// stdout/stderr are redirected to the null device. Used by the build backend's cc flag-family
+// probe (compiling a throwaway empty translation unit to test whether the host cc accepts
+// clang-only flags) so a deliberately-rejected flag doesn't leak an "unrecognized option" line
+// into the user's build output. [teko::process]
+int32_t tk_rt_run_quiet(const tk_str *argv, uint64_t n) {
+    if (n == 0) return 127;
+    char **cargv = (char **)tk_alloc((n + 1) * sizeof *cargv);
+    for (uint64_t i = 0; i < n; i += 1) cargv[i] = tk_cstr(argv[i]);
+    cargv[n] = NULL;
+#ifdef _WIN32
+    // No fork/dup2 on Windows; redirect the whole process's std handles around the
+    // synchronous _spawnvp call, then restore them.
+    fflush(NULL);
+    int saved_out = _dup(_fileno(stdout));
+    int saved_err = _dup(_fileno(stderr));
+    FILE *null_out = freopen("NUL", "w", stdout);
+    FILE *null_err = freopen("NUL", "w", stderr);
+    (void)null_out; (void)null_err;
+    int w = tk_win32_spawnvp(cargv[0], cargv);
+    fflush(NULL);
+    _dup2(saved_out, _fileno(stdout));
+    _dup2(saved_err, _fileno(stderr));
+    _close(saved_out);
+    _close(saved_err);
+    return (w == -1) ? 127 : (int32_t)(int8_t)w;
+#else
+    pid_t pid = fork();
+    if (pid < 0) return 127;
+    if (pid == 0) {                      // child: redirect std{out,err} to /dev/null, then exec
+        int null_fd = open("/dev/null", O_WRONLY);
+        if (null_fd >= 0) {
+            dup2(null_fd, STDOUT_FILENO);
+            dup2(null_fd, STDERR_FILENO);
+            close(null_fd);
+        }
         execvp(cargv[0], cargv);
         _exit(127);
     }

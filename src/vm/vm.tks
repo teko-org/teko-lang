@@ -441,6 +441,42 @@ fn try_builtin(callee: parser::Path, args: []checker::TExpr, env: Venv) -> bool 
         }
     }
 
+    // issue #72 — `exit(<int>)` / `panic(str)`: the injected GLOBAL diverging builtins
+    // (typer.tks:595 — no `never` type; the checker recognizes them unqualified or under the
+    // reserved `teko::` root, whichever namespace lookup finds nothing). This vm.tks source is
+    // itself compiled by the SAME compiler (self-hosted): calling the bare `exit`/`panic`
+    // globals right here lowers to the SAME runtime seam (tk_exit / tk_panic_str, teko_rt.c)
+    // that a user program's `exit`/`panic` call lowers to when native-compiled — so the
+    // self-hosted VM's exit/panic mechanism is, by construction, the same one the compiler
+    // itself uses (mirrors main.tks's own `teko::exit(...)` calls). Both diverge (never
+    // return), so the `return true` below is dead but kept for the match arm's shape.
+    if last == "exit" {
+        // Native codegen passes the arg to `tk_exit(int32_t)` PLAINLY (codegen.c emits builtin
+        // calls with no emit_as coercion) — an out-of-i32-range `i64`/`u64`/... status code
+        // relies on C's IMPLICIT (unchecked, wraparound) narrowing at the call site, never a
+        // panic. A Teko checked `to i32` here would panic on exactly that case ("impossible
+        // conversion") where native silently truncates — a real VM≠native divergence a first
+        // draft of this very intrinsic introduced, caught by running the self-hosted VM.
+        // Mask the low 32 bits + sign-extend the SAME way norm_int's width==32 branch does
+        // (never panics), matching the C cast's actual 2's-complement truncation behavior.
+        let raw = as_int(ev_val(args[0], env))
+        let m = raw & 0xFFFFFFFF
+        let code32 = if m >= 0x80000000 { (m - 0x100000000) to i32 } else { m to i32 }
+        exit(code32)
+        return true
+    }
+    if last == "panic" {
+        // Mirror native codegen's frontier EXACTLY (codegen.c:1865 only wires the `str` arm;
+        // `panic(error)` does not compile natively today — a pre-existing, separate gap, not
+        // this issue's VM≠native divergence; see the #72 report). `str` runs for real here;
+        // an `error` arg falls through to the honest stop so neither engine runs it.
+        let a = ev_val(args[0], env)
+        match a {
+            str as s => { panic(s); return true }
+            _        => return error { message = "vm: panic(error) not yet supported (native codegen cannot compile it either — a separate, pre-existing gap; use panic(str))" }
+        }
+    }
+
     let assert_ns = callee.segments.len >= 2 && callee.segments[0].name == "teko" &&
                  callee.segments[callee.segments.len - 2].name == "assert"
     if assert_ns {
@@ -1342,7 +1378,7 @@ fn val_type_matches(subj: Value, name: str) -> bool {
         OptVal => false
         RefVal => false                            // (MEM Step 2/3) a `Ref<T>` value is never pattern-matched (escape-gated, param-only)
         FuncVal => false                           // (W10a) a function value is never pattern-matched
-        ClassRef => false                          // (W10b.CLASS residual) a class instance is nominal, never a variant-case pattern subject
+        ClassRef => false                          // (C1) a class instance matches by NAME via the cell deref in pat_match (needs env.cells, not available here)
     }
 }
 
@@ -1619,6 +1655,16 @@ fn pat_match(pat: parser::Pattern, subj: Value, env: Venv) -> PatMatch {
                 if !hit {
                     match subj {
                         StructVal as sv => { if vm_case_in_variant(env.prog, bname, sv.type_name) { hit = true } }
+                        // (C1 fallible factories) a CLASS instance in a union (`C | error`) is matched
+                        // by its class NAME: deref the ClassRef cell to its struct payload and compare
+                        // its type_name. On a hit the ORIGINAL ClassRef is bound (reference semantics —
+                        // the arm's binding keeps aliasing the shared object, mirroring the native pointer).
+                        ClassRef as cr => {
+                            match cell_get(env.cells, cr.cell) {
+                                StructVal as payload => { if payload.type_name == bname { hit = true } }
+                                _ => {}
+                            }
+                        }
                         _ => { if val_is_int(subj) { if vm_match_as_enum_int(env.prog, bname, as_int(subj)) { hit = true } } }
                     }
                 }

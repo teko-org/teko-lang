@@ -328,17 +328,45 @@ fn assert_dir(rt: str) -> str {
     }
 }
 
+// (issue #73) Toolchain portability: `-std=c23` and `-ferror-limit=0` are clang spellings.
+// GCC (Ubuntu's default `cc`) rejects both — GCC 13 (ubuntu-latest/24.04) only understands
+// the pre-standardization `-std=c2x` name (GCC 14+ also accepts `-std=c23`, but c2x is the
+// portable spelling), and GCC's unlimited-errors flag is `-fmax-errors=0` not
+// `-ferror-limit=0`. Detect the compiler family ONCE per build via a flag-acceptance probe
+// (exit-code only — no output capture needed): try compiling an empty translation unit with
+// the clang-only flags under `-fsyntax-only`. clang accepts them (exit 0); GCC rejects the
+// unrecognized options (nonzero exit). Mirrors driver.c::cc_family_is_clang. Uses run_quiet
+// so a deliberately-rejected flag doesn't print to the user's build output.
+fn cc_family_is_clang(cc: str, binary: str) -> bool {
+    let probe = teko::str::concat(binary, ".ccprobe.c")
+    match teko::io::write_file(probe, "int main(void){return 0;}\n") {
+        error => return true   // can't probe (no file created) — assume clang (today's default), fail open
+        null  => {}
+    }
+    mut argv: []str = teko::list::empty()
+    argv = teko::list::push(argv, cc)
+    argv = teko::list::push(argv, "-std=c23")
+    argv = teko::list::push(argv, "-ferror-limit=0")
+    argv = teko::list::push(argv, "-fsyntax-only")
+    argv = teko::list::push(argv, probe)
+    let is_clang = teko::process::run_quiet(argv) == 0
+    match teko::fs::remove_file(probe) { error => {}; null => {} }   // best-effort cleanup (issue #79; mirrors driver.c's unchecked remove)
+    is_clang
+}
+
 // Run the host C compiler over `cfile`, producing `binary`. Full parity with driver.c::run_cc: cc
 // sees the runtime + assert dirs (-I) and compiles BOTH seed sources (teko_rt.c + assert.c) plus
 // -lm, in one reuse-the-host-toolchain invocation (M.5). Returns the cc exit code.
 fn run_cc(cfile: str, binary: str, m: Manifest) -> i32 {
     let rt = rt_dir()
     let asrt = assert_dir(rt)
+    let cc = if m.cc.len > 0 { m.cc } else { "cc" }   // C7.1f: [extern] cc override
+    let is_clang = cc_family_is_clang(cc, binary)
     mut argv: []str = teko::list::empty()
-    argv = teko::list::push(argv, if m.cc.len > 0 { m.cc } else { "cc" })   // C7.1f: [extern] cc override
-    argv = teko::list::push(argv, "-std=c23")
+    argv = teko::list::push(argv, cc)
+    argv = teko::list::push(argv, if is_clang { "-std=c23" } else { "-std=c2x" })
     argv = teko::list::push(argv, "-w")               // silence warnings on generated C (machine output)
-    argv = teko::list::push(argv, "-ferror-limit=0")  // show every genuine error (clang)
+    argv = teko::list::push(argv, if is_clang { "-ferror-limit=0" } else { "-fmax-errors=0" })  // show every genuine error (GCC's unlimited-errors analog on non-clang)
     if m.target.len > 0  { argv = teko::list::push(teko::list::push(argv, "-target"), m.target) }      // C7.1f: cross target triple
     if m.sysroot.len > 0 { argv = teko::list::push(teko::list::push(argv, "--sysroot"), m.sysroot) }   // C7.1f: cross sysroot
     if m.freestanding    { argv = teko::list::push(argv, "-nostdlib") }                                 // C7.1f: drop implicit libc

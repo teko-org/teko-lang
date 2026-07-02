@@ -887,7 +887,13 @@ static bool cg_opt_mangle(cbuf *b, tk_type inner, const char **err) {
         case TK_TYPE_OPTIONAL:
             if (inner.as.optional.inner == NULL) return fail_node(err, "codegen: nested bare-null optional (internal)");
             cb(b, "opt_"); return cg_opt_mangle(b, *inner.as.optional.inner, err);
-        default: return fail_node(err, "codegen: optional inner type not yet supported");
+        // NESTED SLICE (#81) — a `[]T` in an element/inner position mangles to `slice_<elem>`
+        // (the SAME key cg_member_key already uses for a slice variant member), so `[][]T`
+        // lowers to tk_slice_slice_<elem> and every use agrees with the collected typedef.
+        case TK_TYPE_SLICE:
+            if (inner.as.slice.element == NULL) return fail_node(err, "codegen: an untyped empty slice needs a known element type from context (internal)");
+            cb(b, "slice_"); return cg_opt_mangle(b, *inner.as.slice.element, err);
+        default: return fail_node(err, "codegen: optional/slice inner type not yet supported");
     }
 }
 
@@ -1843,12 +1849,14 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
                     if (seg_is(l, "write_file"))    return emit_host_ffi(b, CG_FFI_URES,   "tk_rt_write_file",    e, err);
                     if (seg_is(l, "chdir"))         return emit_host_ffi(b, CG_FFI_URES,   "tk_rt_chdir",         e, err);
                     if (seg_is(l, "mkdir"))         return emit_host_ffi(b, CG_FFI_URES,   "tk_rt_mkdir",         e, err);
+                    if (seg_is(l, "remove_file"))   return emit_host_ffi(b, CG_FFI_URES,   "tk_rt_remove_file",   e, err);   // (issue #79) delete a file (idempotent)
                     if (seg_is(l, "cwd"))           return emit_host_ffi(b, CG_FFI_SRES,   "tk_rt_getcwd",        e, err);
                     if (seg_is(l, "set_var"))       return emit_host_ffi(b, CG_FFI_URES,   "tk_rt_setenv",        e, err);
                     if (seg_is(l, "list_dir"))      return emit_host_ffi(b, CG_FFI_SLRES,  "tk_rt_list_dir",      e, err);
                     if (seg_is(l, "last_index_of")) return emit_host_ffi(b, CG_FFI_U64RES, "tk_rt_last_index_of", e, err);
                     if (seg_is(l, "args"))          return emit_host_ffi(b, CG_FFI_ARGS,   "tk_rt_args",          e, err);
                     if (seg_is(l, "run"))           return emit_host_ffi(b, CG_FFI_RUN,    "tk_rt_run",           e, err);
+                    if (seg_is(l, "run_quiet"))     return emit_host_ffi(b, CG_FFI_RUN,    "tk_rt_run_quiet",     e, err);   // (issue #73) cc flag-family probe
                     if (seg_is(l, "bytes_from_ptr"))   return emit_host_ffi(b, CG_FFI_BYTES,            "tk_bytes_from_ptr",       e, err);   // (C7.1a) ptr+len -> []byte (slice-lift)
                     if (seg_is(l, "write_file_bytes")) return emit_host_ffi(b, CG_FFI_URES_BYTESLICE, "tk_rt_write_file_bytes",  e, err);   // C7.12: (str, []byte) -> error?
                     if (seg_is(l, "str_from_utf8"))    return emit_host_ffi(b, CG_FFI_SRES_BYTESLICE, "tk_rt_str_from_utf8",     e, err);   // ROUND 0: ([]byte) -> str | error

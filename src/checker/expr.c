@@ -638,6 +638,21 @@ static bool float_fits(double v, tk_prim_kind k) { (void)v; return tk_prim_is_fl
 // i64 — Side D); a non-literal mismatch or out-of-range literal is rejected. NULL = ok.
 // Used by the typed type_binding in typer.c (reuses value_fits).
 const char *annotated_literal_reason(tk_expr value, tk_type ann) {
+    // an ARRAY LITERAL `[e0, e1, …]` annotated as `[]E` — adopts element-wise: every non-spread
+    // element must itself be a fitting bare literal for E (recurses through nested arrays/
+    // match/if via this same function). A spread element (`..xs`) is already a `[]T` value, not
+    // a literal — skip it here (its own widen/adopt was checked at array-literal typing time).
+    // Mirrors tk_literal_adopts's TK_TEXPR_ARRAY case (the range-check side), which already
+    // recurses this way; this is the RETYPING side's twin so `let a: []u8 = [1,2,3]` (#71).
+    if (value.tag == TK_EXPR_ARRAY) {
+        if (ann.tag != TK_TYPE_SLICE || ann.as.slice.element == NULL) return "value type does not match annotation";
+        for (size_t i = 0; i < value.as.array.nelements; i += 1) {
+            if (value.as.array.elements[i].is_spread) continue;
+            const char *why = annotated_literal_reason(*value.as.array.elements[i].expr, *ann.as.slice.element);
+            if (why != NULL) return why;
+        }
+        return NULL;
+    }
     // a NEGATIVE numeric literal `-N` (unary minus over a NUMBER) — adopts a SIGNED int annotation
     // that N fits, or a float annotation for `-3.14` (parse_lit's `mut d: i128 = -1`).
     if (value.tag == TK_EXPR_UNARY && value.as.unary.op == TK_TOKEN_MINUS
@@ -750,6 +765,25 @@ bool tk_literal_adopts(tk_texpr e, tk_type to) {
         return true;
     }
     return false;
+}
+
+// (#71) RETYPE a value that tk_literal_adopts(e, to) already accepted — the retyping twin of the
+// range-check above. A plain leaf (number/match/if trailing) adopts by taking `to` wholesale (the
+// existing single-site behavior at every adoption call site: binding/assign/arg/struct-field). An
+// ARRAY LITERAL instead retypes ELEMENT-WISE: each non-spread element recurses into the slice's
+// element type (so a nested array-of-arrays retypes at every depth), and the array's own `.type`
+// becomes `to` — mirrors tk_literal_adopts's recursion structure exactly, one level deeper (it
+// mutates the ALREADY-TYPED tree in place rather than just reporting fit). A spread element is
+// already a concrete `[]T` — left untouched (its own widen was checked at array-literal typing
+// time, same as the read side above).
+void tk_retype_literal(tk_texpr *e, tk_type to) {
+    if (e->tag == TK_TEXPR_ARRAY && to.tag == TK_TYPE_SLICE && to.as.slice.element != NULL) {
+        for (size_t i = 0; i < e->as.array.nelements; i += 1) {
+            if (e->as.array.is_spread && e->as.array.is_spread[i]) continue;
+            tk_retype_literal(&e->as.array.elements[i], *to.as.slice.element);
+        }
+    }
+    e->type = to;
 }
 
 // (E7) is `t` a NAMED type whose declaration is an `enum`?
@@ -1062,14 +1096,22 @@ tk_texpr_result tk_type_struct_lit(tk_struct_lit sl, tk_type expected, tk_env en
     }
     // (W10b.CLASS) `Name { … }` also constructs a class instance — a class's fields are typed
     // identically to a struct's (increment 2: the EFFECTIVE, base-inherited fields too). An
-    // `abstract` class cannot be instantiated directly. The "who may construct me" restriction
-    // (a class's literal legal only inside its own static factory) is a LATER increment.
+    // `abstract` class cannot be instantiated directly.
     tk_field *sb_fields; size_t sb_n_fields;
     if (decl.as.value.body.tag == TK_BODY_STRUCT) {
         sb_fields = decl.as.value.body.as.struct_body.fields; sb_n_fields = decl.as.value.body.as.struct_body.n_fields;
     } else if (decl.as.value.body.tag == TK_BODY_CLASS) {
         if (decl.as.value.body.as.class_body.kind == TK_CLASS_ABSTRACT)
             return xferr(tk_error_named("is abstract and cannot be instantiated directly", name));
+        // (W10b.D1) invariant-safe construction — a class's `{…}` literal is legal ONLY inside
+        // the class's OWN methods (its static factories and instance methods), so the
+        // arena-per-object and the class's invariants stay inviolable from outside code.
+        // `env.owner_type` is the DECLARING class of the method body currently being typed
+        // (empty outside any method) — a purely inherited method keeps its ORIGINAL declaring
+        // class (type_struct_methods), so a base factory constructing the base stays legal when
+        // re-typed under a derived class. Structs are pure value data: their literals stay free.
+        if (!tk_str_eq(env.owner_type, name))
+            return xferr(tk_error_named("a class literal is only legal inside the class's own methods — construct it via a static factory", name));
         tk_fieldsvec_result eff = tk_effective_class_fields(decl.as.value.body.as.class_body, table);
         if (!eff.ok) return xferr(eff.as.error);
         sb_fields = eff.as.value.ptr; sb_n_fields = eff.as.value.len;
@@ -1379,6 +1421,30 @@ static tk_texpr_result type_array_lit(tk_array_lit a, tk_env env, tk_type_table 
             }
             elems[i]   = e.as.value;
             spreads[i] = a.elements[i].is_spread;
+        }
+        // (#83) CONCRETIZE any sibling element that is still carrying a SENTINEL now that `et`
+        // (the join across every element) is settled. `[[], [1]]`'s inner `[]` types as `[]NULL`
+        // on its own (type_array_lit's own empty-array case, below); tk_type_join now correctly
+        // folds `et` to the CONCRETE `[]i64` (the #83 fix), but the individual `elems[0]` node's
+        // `.type` is untouched — it still says `[]NULL`, and codegen's TK_TEXPR_ARRAY case reads
+        // the elem type OFF THE NODE ITSELF (not the parent's contribution), so it would still
+        // honest-stop. Retype every element whose type is a (possibly nested) sentinel form of
+        // the now-concrete `et` — same mechanism as the `push(empty(), x)` base-concretization
+        // in type_list_builtin above. Only fires when the element's type is tk_type_eq to et
+        // (permissive-equal) AND actually carries a sentinel; a genuinely-narrower case that
+        // WIDENS into a wider et (e.g. a case into a declared variant) is left alone — codegen's
+        // emit_as wraps that at the use site instead. NESTED inside the SAME allocation guard as
+        // the loop above (same idiom, same reason: the analyzer must see `elems`/`spreads`
+        // non-NULL — a sibling `a.nelements != 0` guard reads as a possible-NULL path to it).
+        // The spread test reads the INPUT `a.elements[i].is_spread` (the exact value the loop
+        // above stored into spreads[i]) — reading the heap copy trips the analyzer's loop
+        // widening ("garbage value": it cannot prove the first loop initialized every index).
+        if (!tk_type_has_sentinel(&et)) {
+            for (size_t i = 0; i < a.nelements; i += 1) {
+                if (a.elements[i].is_spread) continue;   // a spread's own slice type is never the sentinel (checked above)
+                if (tk_type_has_sentinel(&elems[i].type) && tk_type_eq(&elems[i].type, &et))
+                    elems[i].type = et;
+            }
         }
     }
     // (MEM Step 0, R4) ESCAPE GATE — an INFERRED element type may not carry a reference. The

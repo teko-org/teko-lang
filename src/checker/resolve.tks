@@ -155,6 +155,21 @@ fn widens_into_at(from: Type, to: Type, table: TypeTable, depth: i64) -> bool {
 }
 fn widens_into(from: Type, to: Type, table: TypeTable) -> bool { widens_into_at(from, to, table, 16) }
 
+// (#83) Does `t` carry a SENTINEL anywhere (a Slice whose element is `Void`, or an Optional whose
+// inner is `Void`)? `type_eq` treats a sentinel as equal to ANY concrete peer (see type.tks), which
+// is right for ASSIGNABILITY but wrong for JOIN's "equal → return `a`" shortcut: if `a` is the
+// (less informative) sentinel side and `b` is concrete, blindly returning `a` silently discards
+// the concrete element type a sibling array-literal entry established (`[[], [1]]`'s inner `[]`
+// joined against `[1]`'s `[]i64` — see type_join). Recurses through Slice/Optional so a nested
+// sentinel (`[][]Void`) is still detected. Mirror: resolve.c::tk_type_has_sentinel.
+fn type_has_sentinel(t: Type) -> bool {
+    match t {
+        Slice as s    => match s.element { Void => true; _ => type_has_sentinel(s.element) }
+        Optional as o => match o.inner   { Void => true; _ => type_has_sentinel(o.inner) }
+        _ => false
+    }
+}
+
 // (#41-followon) Collect `t`'s members into `acc` for a union JOIN: an INLINE variant contributes
 // its members (flattened); anything else contributes itself. Deduped by type_eq. Named variants
 // stay NOMINAL (consistent with how `Type | error` keeps `Type` named). (Mirror of resolve.c.)
@@ -186,8 +201,21 @@ fn union_collect(acc: []Type, t: Type, table: TypeTable) -> []Type {
 // unification (B.20). If either widens into the other, the WIDER one; otherwise the UNION variant
 // `a | b` (members flattened + deduped) — the branch values are bare cases that each widen into
 // this union, which in turn widens into any wider declared return variant. (Mirror of resolve.c.)
+//
+// (#83) "Equal" per type_eq ALSO holds sentinel-vs-concrete (`[]Void == []i64`, permissive by
+// design — see type_eq's Slice/Optional cases). Blindly returning `a` in that branch discards a
+// concrete element type when the SENTINEL happens to be the first operand: an array literal like
+// `[[], [1]]` unifies its element type by folding type_join left-to-right over `[]`'s `[]Void`
+// then `[1]`'s `[]i64`, and `a` (the accumulator) was the sentinel — the join silently kept
+// `[]Void`, so codegen later saw an untyped empty slice with no contextual element (issue #83;
+// the VM, which ignores element types, ran fine). Prefer the CONCRETE side when the two are
+// sentinel-equal but not type_has_sentinel-equal.
 fn type_join(a: Type, b: Type, table: TypeTable) -> Type {
-    if type_eq(a, b) { return a }
+    if type_eq(a, b) {
+        let a_sentinel = type_has_sentinel(a)
+        let b_sentinel = type_has_sentinel(b)
+        return if a_sentinel && !b_sentinel { b } else { a }   // prefer the concrete side
+    }
     if widens_into(a, b, table) { return b }
     if widens_into(b, a, table) { return a }
     let m1 = union_collect(teko::list::empty(), a, table)

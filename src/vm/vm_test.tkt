@@ -446,6 +446,71 @@ fn slice_same_type_noop_copy_holds() {
     teko::assert::is_true(copy[1] == 22)
 }
 
+// (#81) NESTED slices ([][]T): construction from a nested literal, chained indexing m[i][j],
+// and len at BOTH depths — over rows of DIFFERENT lengths. Native codegen lowers the element
+// type via the slice_<elem> mangle (tk_slice_slice_i64), same values as the VM.
+#test
+fn nested_slice_construct_index_len_hold() {
+    let rows: [][]i64 = [[1], [2, 3]]
+    teko::assert::is_true(rows.len == 2)
+    teko::assert::is_true(rows[0].len == 1)
+    teko::assert::is_true(rows[1].len == 2)
+    teko::assert::is_true(rows[0][0] == 1)
+    teko::assert::is_true(rows[1][0] == 2)
+    teko::assert::is_true(rows[1][1] == 3)
+}
+
+// (#81) pushing a row into a [][]i64 and spreading nested slices both preserve elements.
+#test
+fn nested_slice_push_and_spread_hold() {
+    mut acc: [][]i64 = [[10]]
+    acc = teko::list::push(acc, [20, 30])
+    teko::assert::is_true(acc.len == 2)
+    teko::assert::is_true(acc[1][1] == 30)
+    let joined: [][]i64 = [..acc, [40]]
+    teko::assert::is_true(joined.len == 3)
+    teko::assert::is_true(joined[0][0] == 10)
+    teko::assert::is_true(joined[2][0] == 40)
+}
+
+// (#83) a NESTED slice literal with an EMPTY inner row, under an annotated outer type: the
+// annotation (`[][]i64`) supplies the element type for `[]`'s otherwise-untyped sentinel. Ran fine
+// on the VM before the fix (the VM ignores element types); native codegen honest-stopped ("an
+// untyped empty slice needs a known element type from context") because the checker's element-type
+// JOIN (tk_type_join / type_join) silently discarded the concrete `[]i64` when the sentinel `[]`
+// happened to be the FIRST array entry (the permissive sentinel-vs-concrete tk_type_eq made the
+// join's "equal -> return a" shortcut keep the LESS informative side). Fixed by preferring the
+// concrete side in the join and retyping any sibling sentinel element once the join settles.
+#test
+fn nested_slice_leading_empty_row_under_annotation_holds() {
+    let m: [][]i64 = [[], [1]]
+    teko::assert::is_true(m.len == 2)
+    teko::assert::is_true(m[0].len == 0)
+    teko::assert::is_true(m[1].len == 1)
+    teko::assert::is_true(m[1][0] == 1)
+}
+
+// (#83) ragged rows with an EMPTY MIDDLE row (not first, not last) — the join must fold the
+// sentinel out no matter its position among the siblings.
+#test
+fn nested_slice_ragged_rows_with_empty_middle_row_hold() {
+    let m: [][]i64 = [[1], [], [2, 3]]
+    teko::assert::is_true(m.len == 3)
+    teko::assert::is_true(m[0][0] == 1)
+    teko::assert::is_true(m[1].len == 0)
+    teko::assert::is_true(m[2][0] == 2)
+    teko::assert::is_true(m[2][1] == 3)
+}
+
+// (#83) a FLAT annotated empty slice (`let a: []i64 = []`) — the single-level counterpart of the
+// nested case above (already handled by type_binding's own sentinel-adopt path, #4); locked here
+// alongside the nested fixtures so the whole family stays covered together.
+#test
+fn flat_annotated_empty_slice_holds() {
+    let a: []i64 = []
+    teko::assert::is_true(a.len == 0)
+}
+
 // ===========================================================================
 // W9.3 — SCOPE-SCOPED `defer { … }` (Zig/Swift-style, per-block, NOT Go's per-function).
 // A defer registered inside a block fires at THAT block's exit (loop body → per iteration; if/match
@@ -781,4 +846,103 @@ fn str_literal_match_holds() {
     let built = teko::str::concat("bu", "ild")                  // runtime-built subject
     let bcode = match built { "build" => 1; _ => 0 }
     teko::assert::is_true(bcode == 1)                           // content equality, not identity
+}
+
+// ── OOP ROUND 3 / C1 — FALLIBLE class factories (`C | error`) ────────────────────────────────
+// A class's static factory may return `C | error` (validated construction). The subject of the
+// consuming `match` is a CLASS instance (a ClassRef cell in the VM) or an `error`; the class arm
+// matches by the class NAME through the cell deref (pat_match's C1 branch) and binds the ORIGINAL
+// reference (class reference semantics survive the match).
+
+type VmCounter = class {
+    pub label: str
+    pub count: i64
+
+    // fallible factory: DEFARGS default on `start` + validation → `VmCounter | error`.
+    pub fn open(label: str, start: i64 = 0) -> VmCounter | error {
+        if start < 0 { return error { message = "negative start" } }
+        VmCounter { label = label; count = start }
+    }
+
+    pub fn read(self) -> i64 {
+        self.count
+    }
+
+    pub fn tagged(self) -> str {
+        self.label
+    }
+}
+
+type VmCounterPair = class {
+    pub left: VmCounter
+    pub right: VmCounter
+
+    // NESTED fallible factories: each inner error propagates out of the outer factory.
+    pub fn open_pair(l: str, r: str, start: i64 = 0) -> VmCounterPair | error {
+        let lc = match VmCounter::open(l, start = start) { VmCounter as c => c; error as e => return e }
+        let rc = match VmCounter::open(r, start = start) { VmCounter as c => c; error as e => return e }
+        VmCounterPair { left = lc; right = rc }
+    }
+}
+
+// success arm: the class member of the union matches by name and binds a usable instance.
+#test
+fn fallible_factory_success_arm_holds() {
+    let made = VmCounter::open("jobs", start = 2)
+    let got = match made { VmCounter as c => c.read(); error => -1 }
+    teko::assert::is_true(got == 2)
+}
+
+// error arm: validation failure routes to the `error` member with the factory's message.
+#test
+fn fallible_factory_error_arm_holds() {
+    let bad = VmCounter::open("jobs", start = -5)
+    let msg = match bad { VmCounter => "" ; error as e => e.message }
+    teko::assert::is_true(msg == "negative start")
+}
+
+// DEFARGS: the defaulted `start` still flows through the union's success arm.
+#test
+fn fallible_factory_default_arg_holds() {
+    let made = VmCounter::open("jobs")                    // start defaults to 0
+    let got = match made { VmCounter as c => c.read(); error => -1 }
+    teko::assert::is_true(got == 0)
+}
+
+// the match arm binds a fully usable instance: methods and field reads both work on the
+// binding, and a second alias of the binding reads the SAME object (class reference semantics
+// survive the match — the arm binds the ClassRef, not a copied payload).
+#test
+fn fallible_factory_binding_is_usable() {
+    let made = VmCounter::open("jobs", start = 1)
+    match made {
+        VmCounter as c => {
+            teko::assert::is_true(c.tagged() == "jobs")
+            teko::assert::is_true(c.label == "jobs")
+            let alias = c
+            teko::assert::is_true(alias.read() == 1)
+        }
+        error => teko::assert::is_true(false)
+    }
+}
+
+// arm ORDER does not matter: with the `error` arm FIRST, a class instance must fall
+// through it (the C1 cell-deref branch takes the MISS path: ClassRef payload name != "error")
+// and still land on its class arm.
+#test
+fn fallible_factory_error_arm_first_misses_class() {
+    let made = VmCounter::open("jobs", start = 7)
+    let got = match made { error => -1; VmCounter as c => c.read() }
+    teko::assert::is_true(got == 7)
+}
+
+// nested factories: success builds both inners; an inner failure propagates the inner error.
+#test
+fn fallible_factory_nested_holds() {
+    let ok = VmCounterPair::open_pair("l", "r", start = 3)
+    let sum = match ok { VmCounterPair as p => p.left.read() + p.right.read(); error => -1 }
+    teko::assert::is_true(sum == 6)
+    let bad = VmCounterPair::open_pair("l", "r", start = -1)
+    let msg = match bad { VmCounterPair => ""; error as e => e.message }
+    teko::assert::is_true(msg == "negative start")
 }

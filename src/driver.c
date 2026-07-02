@@ -36,12 +36,14 @@ tk_tprogram_result tk_deserialize_program(const tk_byte *data, size_t len);
 #include <string.h>          // strrchr, strcmp, memcpy
 #ifdef _WIN32
 #include "win32_compat.h"    // chdir→_chdir, mkdir, getcwd, setenv, dirent shim, tk_win32_spawnvp
+#include <io.h>              // _dup, _dup2, _close — fd-redirect around spawn_wait's _spawnvp (issue #73)
 #else
 #include <unistd.h>          // chdir (run the project path from its own root — A3)
 #include <spawn.h>           // posix_spawnp — safer cc invocation without shell
 #include <sys/wait.h>        // waitpid, WIFEXITED, WEXITSTATUS
 #include <sys/stat.h>        // mkdir — the native build output dir (./bin)
 #include <dirent.h>          // opendir/readdir — find the single *.tkp manifest
+#include <fcntl.h>           // O_WRONLY — /dev/null redirect for the quiet cc flag probe (issue #73)
 #endif
 
 // F3: where the minimal execution runtime (teko_rt.h/.c) lives. CMake injects the
@@ -246,12 +248,85 @@ static bool write_macos_plist(const char *path, tk_manifest m) {
     return true;
 }
 
+// Spawn `cc` with `argv` (argv[0] is ignored — `cc` is used as the exec path) and wait for
+// exit. No shell involved. When `quiet` is set, the child's stdout/stderr are redirected to
+// the null device — used by the flag probe so a deliberately-rejected flag doesn't leak an
+// "unrecognized option" line into the user's build output. Returns the child's exit code, or
+// -1 if it could not be spawned/waited on.
+static int spawn_wait(const char *cc, char *const argv[], bool quiet) {
+#ifdef _WIN32
+    if (!quiet) {
+        int w = tk_win32_spawnvp(cc, argv);
+        return (w == -1) ? -1 : w;
+    }
+    // Redirect the child's stdout/stderr to NUL for the probe, restoring afterward.
+    fflush(NULL);
+    int saved_out = _dup(_fileno(stdout));
+    int saved_err = _dup(_fileno(stderr));
+    FILE *null_out = freopen("NUL", "w", stdout);
+    FILE *null_err = freopen("NUL", "w", stderr);
+    (void)null_out; (void)null_err;
+    int w = tk_win32_spawnvp(cc, argv);
+    fflush(NULL);
+    _dup2(saved_out, _fileno(stdout));
+    _dup2(saved_err, _fileno(stderr));
+    _close(saved_out);
+    _close(saved_err);
+    return (w == -1) ? -1 : w;
+#else
+    extern char **environ;
+    pid_t pid;
+    int rc;
+    if (quiet) {
+        posix_spawn_file_actions_t fa;
+        posix_spawn_file_actions_init(&fa);
+        posix_spawn_file_actions_addopen(&fa, STDOUT_FILENO, "/dev/null", O_WRONLY, 0);
+        posix_spawn_file_actions_addopen(&fa, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
+        rc = posix_spawnp(&pid, cc, &fa, NULL, argv, environ);
+        posix_spawn_file_actions_destroy(&fa);
+    } else {
+        rc = posix_spawnp(&pid, cc, NULL, NULL, argv, environ);
+    }
+    if (rc != 0) return -1;
+    int status = 0;
+    if (waitpid(pid, &status, 0) != pid) return -1;
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+#endif
+}
+
+// (issue #73) Toolchain portability: `-std=c23` and `-ferror-limit=0` are clang spellings.
+// GCC (Ubuntu's default `cc`) rejects both — GCC 13 (ubuntu-latest/24.04) only understands
+// the pre-standardization `-std=c2x` name (GCC 14+ also accepts `-std=c23`, but c2x is the
+// portable spelling), and GCC's unlimited-errors flag is `-fmax-errors=0` not
+// `-ferror-limit=0`. Detect the compiler family ONCE per build via a flag-acceptance probe
+// (exit-code only — no output capture needed): try compiling an empty translation unit with
+// the clang-only flags under `-fsyntax-only`. clang accepts them (exit 0); GCC rejects the
+// unrecognized options (nonzero exit). Mirrors project.tks::cc_family_is_clang.
+// The probe file <binary>.ccprobe.c is deleted after the probe (best-effort, unchecked —
+// the .tks twins use teko::fs::remove_file, the host primitive ratified in issue #79).
+static bool cc_family_is_clang(const char *cc, const char *binary) {
+    size_t plen = strlen(binary) + strlen(".ccprobe.c") + 1;
+    char *path = tk_alloc(plen);
+    snprintf(path, plen, "%s.ccprobe.c", binary);
+    FILE *f = fopen(path, "wb");
+    if (f == NULL) { tk_free0(path); return true; }   // can't probe (no file created) — assume clang (today's default), fail open
+    fputs("int main(void){return 0;}\n", f);
+    fclose(f);
+
+    char *argv[] = { (char *)cc, "-std=c23", "-ferror-limit=0", "-fsyntax-only", path, NULL };
+    int rc = spawn_wait(cc, argv, true);
+    remove(path);   // best-effort cleanup (mirrors the .tks twins' remove_file)
+    tk_free0(path);
+    return rc == 0;
+}
+
 // Run the host C compiler over `cfile`, producing `binary`. Returns 0 on success.
 static int run_cc(const char *cfile, const char *binary, tk_manifest m) {
     // F3: build argv for posix_spawnp — mirrors driver.tks::run_cc's teko::process::run(argv).
     // Passing paths as argv elements (no shell) eliminates shell-injection risk.
     char *ccprog = m.cc.len ? cstr_of(m.cc) : NULL;
     const char *cc = ccprog ? ccprog : "cc";
+    bool is_clang = cc_family_is_clang(cc, binary);
     char *target_str  = m.target.len  ? cstr_of(m.target)  : NULL;
     char *sysroot_str = m.sysroot.len ? cstr_of(m.sysroot) : NULL;
     tk_str tos = target_os_of(m);
@@ -296,14 +371,17 @@ static int run_cc(const char *cfile, const char *binary, tk_manifest m) {
         lf[i] = cstr_of(m.link_flags.ptr[i]);
 
     // Assemble argv: fixed flags + optional target/sysroot + includes + sources + libs + output.
-    size_t max_args = 24 + m.link_flags.len + nos_lib;
+    // (issue #73) +1 headroom for the extra GCC flag slot (`-fmax-errors=0` replaces the single
+    // clang `-ferror-limit=0` 1-for-1, but keep max_args honest either way).
+    size_t max_args = 25 + m.link_flags.len + nos_lib;
     char **argv = tk_alloc(max_args * sizeof(char *));
     size_t argc = 0;
 
     argv[argc++] = (char *)cc;
-    argv[argc++] = "-std=c23";
+    argv[argc++] = is_clang ? "-std=c23" : "-std=c2x";
     argv[argc++] = "-w";
-    argv[argc++] = "-ferror-limit=0";
+    if (is_clang) argv[argc++] = "-ferror-limit=0";
+    else          argv[argc++] = "-fmax-errors=0";   // GCC's unlimited-errors analog
     if (target_str)  { argv[argc++] = "-target";    argv[argc++] = target_str; }
     if (sysroot_str) { argv[argc++] = "--sysroot";  argv[argc++] = sysroot_str; }
     if (m.freestanding) argv[argc++] = "-nostdlib";
@@ -320,26 +398,8 @@ static int run_cc(const char *cfile, const char *binary, tk_manifest m) {
     argv[argc++] = (char *)binary;
     argv[argc]   = NULL;
 
-    // Invoke the host compiler directly (no shell).
-    // On Windows: _spawnvp(_P_WAIT) is synchronous and returns the exit code directly.
-    // On POSIX: posix_spawnp + waitpid.
-    int rc = -1;
-#ifdef _WIN32
-    {
-        int w = tk_win32_spawnvp(cc, argv);
-        if (w != -1) rc = w;
-    }
-#else
-    {
-        extern char **environ;
-        pid_t pid;
-        if (posix_spawnp(&pid, cc, NULL, NULL, argv, environ) == 0) {
-            int status = 0;
-            if (waitpid(pid, &status, 0) == pid)
-                rc = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
-        }
-    }
-#endif
+    // Invoke the host compiler directly (no shell) — full diagnostics visible (not quiet).
+    int rc = spawn_wait(cc, argv, false);
 
     if (lf) {
         for (size_t i = 0; i < m.link_flags.len; i++) tk_free0(lf[i]);

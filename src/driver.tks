@@ -123,6 +123,29 @@ fn output_stem(path: str) -> str {
     }
 }
 
+// (issue #73) Toolchain portability: `-std=c23` and `-ferror-limit=0` are clang spellings;
+// GCC rejects both. Mirrors build/project.tks::cc_family_is_clang / driver.c's C twin —
+// probe with the clang-only flags under `-fsyntax-only` (exit code only, no output
+// capture) and fall back to GCC's spellings when they're rejected. NOTE: this run_cc is
+// dead code (the active self-hosted path is build/project.tks::run_cc) but is kept
+// mirrored per the SUPREME RULE so it doesn't silently drift back out of alignment.
+fn cc_family_is_clang(binary: str) -> bool {
+    let probe = teko::str::concat(binary, ".ccprobe.c")
+    match teko::io::write_file(probe, "int main(void){return 0;}\n") {
+        error => return true   // can't probe (no file created) — assume clang (today's default), fail open
+        null  => {}
+    }
+    mut argv: []str = teko::list::empty()
+    argv = teko::list::push(argv, "cc")
+    argv = teko::list::push(argv, "-std=c23")
+    argv = teko::list::push(argv, "-ferror-limit=0")
+    argv = teko::list::push(argv, "-fsyntax-only")
+    argv = teko::list::push(argv, probe)
+    let is_clang = teko::process::run_quiet(argv) == 0
+    match teko::fs::remove_file(probe) { error => {}; null => {} }   // best-effort cleanup (issue #79; mirrors driver.c's unchecked remove)
+    is_clang
+}
+
 // Run the host C compiler over `cfile`, producing `binary`. F3: the emitted C includes
 // the minimal runtime (teko_rt), so cc must see the runtime dir (-I) and compile its
 // source — one reuse-the-host-toolchain invocation (M.5), no extra build system. Returns
@@ -130,10 +153,11 @@ fn output_stem(path: str) -> str {
 fn run_cc(cfile: str, binary: str) -> i32 {
     // argv built via the slice value layer (empty + copy-on-push) — Teko has no `[a, b, …]`
     // array-literal syntax (Increment A); the C twin uses a C array (logic identical).
+    let is_clang = cc_family_is_clang(binary)
     mut argv: []str = teko::list::empty()
     argv = teko::list::push(argv, "cc")
-    argv = teko::list::push(argv, "-std=c23")
-    argv = teko::list::push(argv, "-ferror-limit=0")   // report every cc error, not just the first
+    argv = teko::list::push(argv, if is_clang { "-std=c23" } else { "-std=c2x" })
+    argv = teko::list::push(argv, if is_clang { "-ferror-limit=0" } else { "-fmax-errors=0" })   // report every cc error, not just the first
     argv = teko::list::push(argv, "-I")
     argv = teko::list::push(argv, rt_dir())
     argv = teko::list::push(argv, cfile)

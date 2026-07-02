@@ -834,6 +834,19 @@ bool tk_widens_into(tk_type from, tk_type to, tk_type_table table) {
     return widens_into_at(from, to, table, 16);   // variant nesting is shallow; 16 is a safe backstop
 }
 
+// (#83) Does `t` carry a SENTINEL anywhere (a Slice with element == NULL, or an Optional with
+// inner == NULL)? `tk_type_eq` treats a sentinel as equal to ANY concrete peer (§ above), which
+// is right for ASSIGNABILITY but wrong for JOIN's "equal → return `a`" shortcut: if `a` is the
+// (less informative) sentinel side and `b` is concrete, blindly returning `a` silently discards
+// the concrete element type a sibling array-literal entry established (`[[], [1]]`'s inner `[]`
+// joined against `[1]`'s `[]i64` — see tk_type_join). Recurses through Slice/Optional so a nested
+// sentinel (`[][]NULL`) is still detected. Mirror: resolve.tks::type_has_sentinel.
+bool tk_type_has_sentinel(const tk_type *t) {
+    if (t->tag == TK_TYPE_SLICE)    return t->as.slice.element == NULL    || tk_type_has_sentinel(t->as.slice.element);
+    if (t->tag == TK_TYPE_OPTIONAL) return t->as.optional.inner == NULL   || tk_type_has_sentinel(t->as.optional.inner);
+    return false;
+}
+
 // (#41-followon) Collect `t`'s members into out[] for a union JOIN: an INLINE variant contributes
 // its members (flattened); anything else (a named type/case, prim, …) contributes itself. Deduped
 // by type_eq. Named variants stay NOMINAL (consistent with how `Type | error` keeps `Type` named).
@@ -854,8 +867,22 @@ static size_t union_collect(tk_type *out, size_t n, tk_type t, tk_type_table tab
 // the result (`error` and `Type | error` join to `Type | error`). Equal types join to themselves.
 // Returns false when neither widens into the other ("the arms have different types"). The result
 // is written to *out only on success.
+//
+// (#83) "Equal" per tk_type_eq ALSO holds sentinel-vs-concrete (`[]NULL == []i64`, permissive by
+// design — see tk_type_eq's TK_TYPE_SLICE/TK_TYPE_OPTIONAL cases). Blindly returning `a` in that
+// branch discards a concrete element type when the SENTINEL happens to be the first operand: an
+// array literal like `[[], [1]]` unifies its element type by folding `tk_type_join` left-to-right
+// over `[]`'s `[]NULL` then `[1]`'s `[]i64`, and `a` (the accumulator) was the sentinel — the join
+// silently kept `[]NULL`, so codegen later saw an untyped empty slice with no contextual element
+// (issue #83; native honest-stopped while the VM, which ignores element types, ran fine). Prefer
+// the CONCRETE side when the two are sentinel-equal but not tk_type_has_sentinel-equal.
 bool tk_type_join(tk_type a, tk_type b, tk_type_table table, tk_type *out) {
-    if (tk_type_eq(&a, &b))            { *out = a; return true; }
+    if (tk_type_eq(&a, &b)) {
+        bool a_sentinel = tk_type_has_sentinel(&a);
+        bool b_sentinel = tk_type_has_sentinel(&b);
+        *out = (a_sentinel && !b_sentinel) ? b : a;   // prefer the concrete side
+        return true;
+    }
     if (tk_widens_into(a, b, table))   { *out = b; return true; }   // a is a case of b → b
     if (tk_widens_into(b, a, table))   { *out = a; return true; }   // b is a case of a → a
     // SIBLINGS (neither a case of the other): the join is the UNION variant `a | b` — the branch

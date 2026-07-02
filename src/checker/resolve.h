@@ -44,6 +44,10 @@ tk_type tk_expand_variant(tk_type t, tk_type_table table);
 // and `Type | error` join to `Type | error`); false when incompatible (out set only on success).
 bool tk_widens_into(tk_type from, tk_type to, tk_type_table table);
 bool tk_type_join(tk_type a, tk_type b, tk_type_table table, tk_type *out);
+// (#83) does `t` carry a SENTINEL slice/optional (element/inner == NULL) anywhere, incl. nested
+// (`[]NULL`, `[][]NULL`, `(NULL)?`, …)? Shared by tk_type_join's concrete-preference tie-break and
+// by array-literal element retyping (expr.c::type_array_lit) once the joined element is concrete.
+bool tk_type_has_sentinel(const tk_type *t);
 
 // (C1.8) RENDER a semantic type to a human string for diagnostics ("expected X, found Y"):
 //   prims → "i32"/"u64"/"f64"/"bool"/… (the surface spellings), "byte", "str", "error", "void",

@@ -842,6 +842,30 @@ fn const_range_check(e: parser::Expr, target: Type) -> error? {
 // (deferred; named gap — §VI). The front-line type check above already rejects such source.
 fn annotated_literal_ok(value: parser::Expr, ann: Type) -> error? {
     match value.kind {
+        // an ARRAY LITERAL `[e0, e1, …]` annotated as `[]E` — adopts element-wise: every non-spread
+        // element must itself be a fitting bare literal for E (recurses through nested arrays via
+        // this same function). A spread element (`..xs`) is already a `[]T` value, not a literal —
+        // skip it here (its own widen/adopt was checked at array-literal typing time). Mirrors
+        // literal_adopts's TArrayLit case (the range-check side), which already recurses this way;
+        // this is the RETYPING side's twin so `let a: []u8 = [1,2,3]` type-checks (#71).
+        parser::ArrayLit as al => match ann {
+            Slice as s => {
+                mut i = 0
+                mut result: error? = null
+                loop {
+                    if i >= al.elements.len { break }
+                    if !al.elements[i].is_spread {
+                        match annotated_literal_ok(al.elements[i].expr, s.element) {
+                            null => {}
+                            error as e => { result = e; break }
+                        }
+                    }
+                    i++
+                }
+                result
+            }
+            _ => error { message = "value type does not match annotation" }
+        }
         // a NEGATIVE numeric literal `-N` (unary minus over a NUMBER) — adopts a SIGNED int
         // annotation that N fits, or a float annotation for `-3.14` (parse_lit's `mut d: i128 = -1`).
         parser::Unary as u => {
@@ -1156,12 +1180,21 @@ fn type_struct_lit(sl: parser::StructLit, expected: Type, env: Env, table: TypeT
     // (W10b.CLASS) `Name { … }` also constructs a class instance — a class's fields are typed
     // identically to a struct's (increment 2: the EFFECTIVE, base-inherited fields too). An
     // `abstract` class cannot be instantiated directly (only a concrete subclass may be — it is
-    // final, incomplete-by-design). The "who may construct me" restriction (a class's literal
-    // legal only inside its own static factory) is a LATER increment, not enforced yet.
+    // final, incomplete-by-design).
     let sb_fields = match decl.body {
         parser::StructBody as s => s.fields
         parser::ClassBody as c  => {
             match c.kind { ClassKind::Abstract => return error { message = $"`{name}` is abstract and cannot be instantiated directly" }; _ => {} }
+            // (W10b.D1) invariant-safe construction — a class's `{…}` literal is legal ONLY inside
+            // the class's OWN methods (its static factories and instance methods), so the
+            // arena-per-object and the class's invariants stay inviolable from outside code.
+            // `env.owner_type` is the DECLARING class of the method body currently being typed
+            // ("" outside any method) — a purely inherited method keeps its ORIGINAL declaring
+            // class (type_struct_methods), so a base factory constructing the base stays legal when
+            // re-typed under a derived class. Structs are pure value data: their literals stay free.
+            if env.owner_type != name {
+                return error { message = $"a class literal is only legal inside the class's own methods — construct it via a static factory: {name}" }
+            }
             match effective_class_fields(c, table) { []Field as fs => fs; error as e => return e }
         }
         _               => return error { message = $"struct-literal target {name} is not a struct" }
@@ -1384,7 +1417,36 @@ fn type_array_lit(a: parser::ArrayLit, env: Env, table: TypeTable) -> TExpr | er
     // annotated form `let xs: []Ref<T> = …` is already rejected in resolve, but the inferred
     // element here (e.g. `[r, r]`) only surfaces now. This also rejects `a in [a, b]` (its `[a, b]`).
     if type_contains_ref(et) { return error { message = "a reference cannot be stored in a struct/variant/collection" } }
-    TExpr { kind = TArrayLit { elements = elems }; type = Slice { element = et }; line = 0; col = 0 }
+    // (#83) CONCRETIZE any sibling element still carrying a SENTINEL now that `et` (the join across
+    // every element) is settled. `[[], [1]]`'s inner `[]` types as `[]Void` on its own (this fn's
+    // own empty-array case, above); type_join now correctly folds `et` to the CONCRETE `[]i64`
+    // (the #83 fix), but the individual element's own `TExpr.type` is untouched — it still says
+    // `[]Void`, and codegen's array-literal case reads the element type OFF THE NODE ITSELF (not
+    // the parent's contribution), so it would still honest-stop. Retype every element whose type
+    // is a (possibly nested) sentinel form of the now-concrete `et` — same mechanism as the
+    // `push(empty(), x)` base-concretization in type_list_builtin above. Only fires when the
+    // element's type is type_eq to et (permissive-equal) AND actually carries a sentinel; a
+    // genuinely-narrower case that WIDENS into a wider et (e.g. a case into a declared variant) is
+    // left alone — codegen's emit_as wraps that at the use site instead.
+    let final_elems = if a.elements.len != 0 && !type_has_sentinel(et) {
+        mut out: []TArrayElem = teko::list::empty()
+        mut j = 0
+        loop {
+            if j >= elems.len { break }
+            let ael = elems[j]
+            let retyped = !ael.is_spread && type_has_sentinel(ael.expr.type) && type_eq(ael.expr.type, et)
+            out = teko::list::push(out, if retyped {
+                TArrayElem { is_spread = ael.is_spread; expr = TExpr { kind = ael.expr.kind; type = et; line = ael.expr.line; col = ael.expr.col } }
+            } else {
+                ael
+            })
+            j++
+        }
+        out
+    } else {
+        elems
+    }
+    TExpr { kind = TArrayLit { elements = final_elems }; type = Slice { element = et }; line = 0; col = 0 }
 }
 
 // ---- the expression dispatch (the evolved check_expr) ----
@@ -1731,7 +1793,10 @@ fn type_binding(b: parser::Binding, env: Env, table: TypeTable) -> TypedStmt | e
                     // type — retype the leaf itself (same mechanism as the arg/struct-field/negative-
                     // literal adoption sites), so codegen/VM see the narrow width (`mut y: u8 = 1`
                     // stores/shifts at width 8, not the literal's native i64). Mirrors typer.c.
-                    v = TExpr { kind = v.kind; type = at; line = v.line; col = v.col }
+                    // (#71) retype_literal RECURSES into an array literal's elements (`[]u8 = [1,2,3]`
+                    // narrows each leaf, not just the array's own type) — a plain leaf still takes
+                    // the annotation wholesale, unchanged from before.
+                    v = retype_literal(v, at)
                 }
                 error as e => return teko::error::err_typed(e, type_render(at), type_render(v.type))
             }
@@ -1800,7 +1865,8 @@ fn type_assign(a: parser::Assign, env: Env, table: TypeTable) -> TypedStmt | err
         // a fitting bare-literal (plain-scalar) RHS ADOPTS the target's narrow type — retype the leaf
         // itself (mirrors type_binding's identical adoption above), so a plain `y = 200` on a `u8`
         // slot stores/re-widths at 8 bits, not the literal's native i64.
-        v = TExpr { kind = v.kind; type = tb.type; line = v.line; col = v.col }
+        // (#71) retype_literal recurses into an array literal's elements — see type_binding.
+        v = retype_literal(v, tb.type)
     }
     // (#4) a sentinel empty list/array ADOPTS the target's concrete slice type so codegen sees the
     // element. OTHERWISE keep the value's NATURAL (case / T) type and store the target as `bound` —
@@ -1995,6 +2061,39 @@ fn literal_adopts(e: TExpr, to: Type) -> bool {
             _ => false
         }
         _ => false
+    }
+}
+
+// (#71) RETYPE a value that `literal_adopts(e, to)` already accepted — the retyping twin of the
+// range-check above. A plain leaf (number/match/if trailing) adopts by taking `to` wholesale (the
+// existing single-site behavior at every adoption call site: binding/assign/arg/struct-field). An
+// ARRAY LITERAL instead retypes ELEMENT-WISE: each non-spread element recurses into the slice's
+// element type (so a nested array-of-arrays retypes at every depth), and the array's own `.type`
+// becomes `to` — mirrors literal_adopts's recursion structure exactly, one level deeper (it
+// REBUILDS the already-typed tree — TExpr/TArrayLit/TArrayElem are value types — rather than just
+// reporting fit). A spread element is already a concrete `[]T` — left untouched (its own widen was
+// checked at array-literal typing time, same as the read side above).
+fn retype_literal(e: TExpr, to: Type) -> TExpr {
+    match e.kind {
+        TArrayLit as a => match to {
+            Slice as s => {
+                mut elems: []TArrayElem = teko::list::empty()
+                mut i = 0
+                loop {
+                    if i >= a.elements.len { break }
+                    let el = a.elements[i]
+                    if el.is_spread {
+                        elems = teko::list::push(elems, el)
+                    } else {
+                        elems = teko::list::push(elems, TArrayElem { is_spread = false; expr = retype_literal(el.expr, s.element) })
+                    }
+                    i++
+                }
+                TExpr { kind = TArrayLit { elements = elems }; type = to; line = e.line; col = e.col }
+            }
+            _ => TExpr { kind = e.kind; type = to; line = e.line; col = e.col }
+        }
+        _ => TExpr { kind = e.kind; type = to; line = e.line; col = e.col }
     }
 }
 
