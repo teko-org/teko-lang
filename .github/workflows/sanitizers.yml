@@ -130,6 +130,28 @@ jobs:
         run: ./build-asan-portable/teko test . --coverage
 
   # ── TSan (Thread Sanitizer) ───────────────────────────────────────────────────
+  # Reliability note (issue #127): `teko test` is 100% single-threaded — there is
+  # ZERO pthread/thread/atomic in src/ (verified by grep), so TSan has no race to
+  # find and never emits a SUMMARY/data-race report. The intermittent exit-143
+  # (silent SIGTERM) that blocked unrelated PRs (#125, #126) was NOT a data race
+  # and NOT a deadlock: the suite completes cleanly and deterministically (614/614)
+  # both locally under `-fsanitize=thread` and on healthy hosted runners (the
+  # "Run tests (TSan)" step is a stable ~52s there). The flake was a RESOURCE/SLOWNESS
+  # kill: TSan is the slowest lane (~2x the ASan lanes for the same ~5.3 GB RSS), and
+  # on a transiently-degraded/contended runner (the failing runs had queued ~47 min
+  # in a busy pool) that stretched window crossed the runner's resource-kill boundary
+  # mid-suite — a silent SIGTERM at an ARBITRARY test (it stalled at three different
+  # tests across runs), never at the 15-min job timeout. The fix shrinks the exposure
+  # window and makes any residual stall FAIL LOUD instead of dying silently:
+  #   1. drop `--coverage` here — it is pure redundant cost on this lane (coverage is
+  #      already validated by BOTH ASan lanes + Windows stress); removing it cuts the
+  #      TSan run ~36% (~55s → ~36s), moving it into the passing ASan lanes' envelope.
+  #   2. bound TSan's memory (history_size/memory_limit_mb/flush_memory_ms) so a
+  #      memory-tight runner flushes rather than growing into an OOM kill.
+  #   3. wrap the run in `timeout` (coreutils, always on ubuntu-latest) with a generous
+  #      600s guard — a healthy run is ~36s, so even a 10x-degraded runner completes;
+  #      if it ever DID stall, it now exits 124 with a clear timeout message at a known
+  #      bound instead of a mysterious SIGTERM-143. Job timeout kept at 15 min as backstop.
   tsan:
     name: TSan
     needs: changes
@@ -159,10 +181,15 @@ jobs:
       - name: Build teko
         run: cmake --build build-tsan --target teko --parallel 4
 
+      # No `--coverage` here (see issue-#127 note above): coverage is validated on the
+      # ASan lanes + Windows stress; on TSan it is redundant cost. `timeout` makes a stall
+      # fail loud (exit 124) at a known bound instead of a silent runner SIGTERM (143).
       - name: Run tests (TSan)
         env:
-          TSAN_OPTIONS: halt_on_error=1
-        run: ./build-tsan/teko test . --coverage
+          # Single-threaded workload: keep TSan correct for FUTURE threading bugs, but
+          # bound its footprint so a memory-tight runner flushes instead of OOM-killing.
+          TSAN_OPTIONS: halt_on_error=1:history_size=2:memory_limit_mb=6000:flush_memory_ms=2000
+        run: timeout --kill-after=30s 600s ./build-tsan/teko test .
 
   # ── Windows stress: run tests 20 times ───────────────────────────────────────
   # NOTE: Uses Clang + Ninja (not MSVC) because the project requires __int128.
