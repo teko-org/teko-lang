@@ -131,7 +131,15 @@ struct tk_tstatement {
     tk_tstatement_tag tag;
     union {
         struct { tk_bind_kind kind; tk_bind_target target; tk_type bound; tk_texpr value; } binding;
-        struct { tk_str name; tk_token_kind op; tk_type bound; tk_texpr value; bool deref; }  assign;   // bound = the target's declared type (codegen wraps the value into it — emit_as); deref ⇒ `name.value op= …` writes THROUGH a Ref<T> (MEM-1b-ii)
+        // (#88) a typed assignment. `kind` tags the target shape (mirrors tk_assign_kind):
+        //   TK_ASSIGN_SIMPLE    — write the bare binding `name` (deref=false, target unused).
+        //   TK_ASSIGN_REF_DEREF — write THROUGH a `Ref<T>` handle `name` (deref=true, target unused).
+        //   TK_ASSIGN_FIELD     — write a struct/class field. `target` is the TYPED LHS field-access expr
+        //                         (a TK_TEXPR_FIELD_ACCESS), so codegen/VM reuse the read-side field lowering
+        //                         directly (`(*recv).f` for a class, `recv.f` for a struct); name/deref unused.
+        // `bound` = the target's declared type (codegen wraps the RHS into it — emit_as). `deref` stays a plain
+        // bool == (kind==REF_DEREF) so the legacy TKB layout / readers are unchanged for the two old shapes.
+        struct { tk_assign_kind kind; tk_str name; tk_token_kind op; tk_type bound; tk_texpr value; bool deref; tk_texpr *target; }  assign;
         struct { bool has_value; tk_texpr value; }                                           ret;   // value gated by has_value
         struct { tk_str label; tk_tstatement *body; size_t nbody; }                          loop_stmt;   // label empty = unlabeled
         struct { tk_str label; }                                                             jump;        // BREAK/CONTINUE — label empty = innermost

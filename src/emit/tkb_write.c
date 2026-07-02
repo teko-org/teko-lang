@@ -175,11 +175,15 @@ static tk_bytes write_tstatement(tk_bytes b, tk_strtable t, const tk_tstatement 
             b = write_bindtarget(tk_write_u8(tk_write_u8(b, 0), bindkind_byte(s->as.binding.kind)), t, s->as.binding.target);
             b = tk_write_type(b, t, s->as.binding.bound);
             return tk_write_texpr(b, t, &s->as.binding.value);
-        case TK_TSTMT_ASSIGN:                                                // name (u32) + op (u8) + bound (Type) + value (TExpr) + deref (u8) (MEM-1b-ii)
-            b = tk_write_u8(tk_write_u32(tk_write_u8(b, 1), tk_st_find(t, s->as.assign.name)), kind_byte(s->as.assign.op));
+        case TK_TSTMT_ASSIGN:                                                // kind (u8) + name (u32) + op (u8) + bound (Type) + value (TExpr) + deref (u8) [+ target (TExpr) iff kind==FIELD] (#88; MEM-1b-ii)
+            b = tk_write_u8(b, 1);
+            b = tk_write_u8(b, (tk_byte)s->as.assign.kind);                  // (#88) the target discriminant
+            b = tk_write_u8(tk_write_u32(b, tk_st_find(t, s->as.assign.name)), kind_byte(s->as.assign.op));
             b = tk_write_type(b, t, s->as.assign.bound);
             b = tk_write_texpr(b, t, &s->as.assign.value);
-            return tk_write_u8(b, (tk_byte)(s->as.assign.deref ? 1 : 0));
+            b = tk_write_u8(b, (tk_byte)(s->as.assign.deref ? 1 : 0));
+            if (s->as.assign.kind == TK_ASSIGN_FIELD) b = tk_write_texpr(b, t, s->as.assign.target);   // (#88) the FIELD LHS field-access
+            return b;
         case TK_TSTMT_RETURN:                                                // has_value (u8) + value (TExpr)
             return tk_write_texpr(tk_write_u8(tk_write_u8(b, 2), (tk_byte)(s->as.ret.has_value ? 1 : 0)), t, &s->as.ret.value);
         case TK_TSTMT_LOOP:                                                  // label (u32) + body ([]TStatement)

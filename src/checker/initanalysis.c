@@ -109,6 +109,10 @@ static bool occurs_stmt(const tk_tstatement *s, tk_str name) {
             // (`r.value = …`, MEM-1b-ii) always READS the ref handle `r` (to dereference it).
             if (s->as.assign.op != TK_TOKEN_ASSIGN && seq(s->as.assign.name, name)) return true;
             if (s->as.assign.deref && seq(s->as.assign.name, name)) return true;
+            // (#88) a FIELD target (`recv.field = …`) is NOT a local binding — but the RECEIVER expr
+            // reads its own free variables (always, for the object; and a compound `recv.f += …` reads
+            // the field's current value through it). Walk the receiver so those reads count as uses.
+            if (s->as.assign.kind == TK_ASSIGN_FIELD && occurs_expr(s->as.assign.target, name)) return true;
             return occurs_expr(&s->as.assign.value, name);
         case TK_TSTMT_RETURN:  return s->as.ret.has_value && occurs_expr(&s->as.ret.value, name);
         case TK_TSTMT_LOOP:    return occurs_block(s->as.loop_stmt.body, s->as.loop_stmt.nbody, name);

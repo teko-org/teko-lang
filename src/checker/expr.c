@@ -1339,7 +1339,7 @@ static void lam_collect_stmt(const tk_statement *s, tk_sset *refs, tk_sset *boun
             if (s->as.binding.target.tag == TK_BIND_SIMPLE) sset_add(bound, s->as.binding.target.as.simple.name);
             else for (size_t i = 0; i < s->as.binding.target.as.destructure.nnames; i += 1) sset_add(bound, s->as.binding.target.as.destructure.names[i]);
             break;
-        case TK_STMT_ASSIGN: lam_collect_expr(&s->as.assign.value, refs, bound); break;
+        case TK_STMT_ASSIGN: lam_collect_expr(&s->as.assign.value, refs, bound); if (s->as.assign.kind == TK_ASSIGN_FIELD && s->as.assign.target != NULL) lam_collect_expr(s->as.assign.target, refs, bound); break;   // (#88) a closure writing `obj.f = …` captures `obj` (the receiver's free vars)
         case TK_STMT_RETURN: if (s->as.ret.has_value) lam_collect_expr(&s->as.ret.value, refs, bound); break;
         case TK_STMT_LOOP:   lam_collect_block(s->as.loop_stmt.body, s->as.loop_stmt.nbody, refs, bound); break;
         case TK_STMT_EXPR:   lam_collect_expr(&s->as.expr_stmt.expr, refs, bound); break;

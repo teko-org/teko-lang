@@ -213,6 +213,12 @@ static void mark_stmt(tk_tstatement s, bool tail, tk_escape_set *acc) {
             return;
         case TK_TSTMT_ASSIGN:
             mark_expr(s.as.assign.value, true, acc);    // may be written to an outer location
+            // (#88) a FIELD write stores the RHS into a struct/class object that OUTLIVES this frame
+            // (a class instance is heap/cell-backed; a struct field write escapes through its `mut`
+            // root) — so BOTH the RHS (already escaping above) AND the receiver's reads are escaping:
+            // the receiver names the destination object, and writing a frame-local reference into it
+            // would let the reference outlive the frame. Mark the receiver's reads escaping too.
+            if (s.as.assign.kind == TK_ASSIGN_FIELD) mark_expr(*s.as.assign.target, true, acc);
             return;
         case TK_TSTMT_RETURN:
             if (s.as.ret.has_value) mark_expr(s.as.ret.value, true, acc);
@@ -367,7 +373,8 @@ static size_t count_reads_expr(tk_texpr e, tk_str name) {
 static size_t count_reads_stmt(tk_tstatement s, tk_str name) {
     switch (s.tag) {
         case TK_TSTMT_BINDING:  return count_reads_expr(s.as.binding.value, name);
-        case TK_TSTMT_ASSIGN:   return count_reads_expr(s.as.assign.value, name);
+        case TK_TSTMT_ASSIGN:   return count_reads_expr(s.as.assign.value, name)
+                                     + (s.as.assign.kind == TK_ASSIGN_FIELD ? count_reads_expr(*s.as.assign.target, name) : 0);   // (#88) the FIELD receiver reads `name` too
         case TK_TSTMT_RETURN:   return s.as.ret.has_value ? count_reads_expr(s.as.ret.value, name) : 0;
         case TK_TSTMT_EXPR:     return count_reads_expr(s.as.expr_stmt.expr, name);
         case TK_TSTMT_LOOP:     return count_reads_block(s.as.loop_stmt.body, s.as.loop_stmt.nbody, name);

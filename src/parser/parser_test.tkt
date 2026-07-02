@@ -807,6 +807,46 @@ fn parses_destructure_and_assign() {
     match stmt_of("x") { ExprStmt => teko::assert::is_true(true); _ => teko::assert::is_true(false) }
 }
 
+// (#88) FIELD-target assignment parsing — `recv.field = v` is an Assign with kind=Field and a
+// field-access `target`; `recv.field += v` too; a bare method-call `obj.m()` stays an ExprStmt
+// (never swallowed as an assign target).
+#test
+fn parses_field_assign_targets() {
+    // `obj.f = 5` → Assign with kind=Field and a FieldAccess target.
+    match stmt_of("obj.f = 5") {
+        Assign as a => {
+            let is_field = match a.kind { AssignKind::Field => true; _ => false }
+            teko::assert::is_true(is_field)
+            teko::assert::is_true(a.op == lexer::TokenKind::Assign)
+            match a.target.kind { FieldAccess as fa => teko::assert::is_true(fa.field == "f"); _ => teko::assert::is_true(false) }
+        }
+        _ => teko::assert::is_true(false)
+    }
+    // `obj.f += 1` → Assign, kind=Field, op=`+=`.
+    match stmt_of("obj.f += 1") {
+        Assign as a => {
+            let is_field = match a.kind { AssignKind::Field => true; _ => false }
+            teko::assert::is_true(is_field)
+            teko::assert::is_true(a.op == lexer::TokenKind::PlusEq)
+        }
+        _ => teko::assert::is_true(false)
+    }
+    // nested `a.b.c = 1` → Assign, kind=Field (the target is a nested FieldAccess).
+    match stmt_of("a.b.c = 1") {
+        Assign as a => { let is_field = match a.kind { AssignKind::Field => true; _ => false }; teko::assert::is_true(is_field) }
+        _ => teko::assert::is_true(false)
+    }
+    // `r.value = 7` still parses as a FIELD target (the TYPER decides Ref-deref vs field from the type).
+    match stmt_of("r.value = 7") {
+        Assign as a => { let is_field = match a.kind { AssignKind::Field => true; _ => false }; teko::assert::is_true(is_field) }
+        _ => teko::assert::is_true(false)
+    }
+    // a bare method-call statement is an ExprStmt, NOT an assign target (never swallowed).
+    match stmt_of("obj.m()") { ExprStmt => teko::assert::is_true(true); _ => teko::assert::is_true(false) }
+    // a field READ used as a statement (no assign-op) stays an ExprStmt.
+    match stmt_of("obj.f") { ExprStmt => teko::assert::is_true(true); _ => teko::assert::is_true(false) }
+}
+
 #test
 fn rejects_malformed_assign() {
     teko::assert::is_true(stmt_errors("x ="))          // assignment with no value

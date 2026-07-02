@@ -527,7 +527,14 @@ fn mono_tstmt(st: TStatement, s: Subst, items: []TItem, table: TypeTable) -> WSt
         }
         TAssign as a => {
             let wv = match mono_texpr(a.value, s, items, table) { WExpr as w => w; error as er => return er }
-            WStmt { stmt = TAssign { name = a.name; op = a.op; bound = subst_type(a.bound, s); value = wv.expr; deref = a.deref }; insts = wv.insts }
+            // (#88) rewrite the FIELD target's LHS field-access (its receiver + resolved field type may
+            // reference a type-param); merge its insts. A non-FIELD target keeps the sentinel unchanged.
+            let is_field = match a.kind { parser::AssignKind::Field => true; _ => false }
+            if is_field {
+                let wt = match mono_texpr(a.target, s, items, table) { WExpr as w => w; error as er => return er }
+                return WStmt { stmt = TAssign { kind = a.kind; name = a.name; op = a.op; bound = subst_type(a.bound, s); value = wv.expr; deref = a.deref; target = wt.expr }; insts = mono_inst_concat(wv.insts, wt.insts) }
+            }
+            WStmt { stmt = TAssign { kind = a.kind; name = a.name; op = a.op; bound = subst_type(a.bound, s); value = wv.expr; deref = a.deref; target = a.target }; insts = wv.insts }
         }
         TReturn as r => {
             if r.has_value {

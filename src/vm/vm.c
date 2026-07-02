@@ -2623,6 +2623,44 @@ static tk_value compound_apply(tk_value old, tk_token_kind op, tk_value rhs, con
     return norm_int(raw, sgn, w);
 }
 
+// (#88) resolve a FIELD-assign LHS to a POINTER at the mutable `tk_value` slot to write. The receiver
+// is walked to a storage location: a class instance's struct payload lives in the SHARED global cell
+// store (g_cells) — a pointer into it makes the write OBSERVABLE through every alias (the aliasing
+// proof); a struct value rooted at a `mut` slot is mutated in place through the slot's own storage
+// (`&slot->val`, or its cell if the slot is cell-backed). Descending a struct FIELD yields a pointer
+// INTO that struct's fields.vals[] array, so nested `a.b.c = v` mutates the innermost value in place.
+// Returns NULL on an unsupported shape (the checker guarantees a field LHS, so NULL is an internal error).
+static tk_value *vm_lvalue_ptr(const tk_texpr *e, tk_venv *env) {
+    if (e->tag == TK_TEXPR_VAR) {
+        tk_slot *slot = env_find(env, e->as.var.name);
+        if (slot == NULL) return NULL;
+        return slot->has_cell ? &g_cells[slot->cell_id] : &slot->val;
+    }
+    if (e->tag == TK_TEXPR_FIELD_ACCESS) {
+        // Resolve the receiver to its storage. A class receiver is a CLASS_REF value → follow the cell
+        // to the SHARED struct payload (writes are seen by aliases). A struct receiver is resolved to
+        // its own in-place storage recursively.
+        tk_value *base;
+        // First try to resolve the receiver as an in-place lvalue (a var or a struct field path).
+        base = vm_lvalue_ptr(e->as.field_access.receiver, env);
+        if (base != NULL && base->tag == TK_VAL_CLASS_REF)
+            base = &g_cells[base->as.class_ref.cell];   // class handle stored in an lvalue → deref to shared payload
+        if (base == NULL) {
+            // The receiver is not itself an lvalue (e.g. it EVALUATES to a class ref: `make().f = …`);
+            // evaluate it — a class ref points at shared cell storage we can still mutate.
+            tk_value rv = tk_vm_eval_expr(e->as.field_access.receiver, env);
+            if (rv.tag == TK_VAL_CLASS_REF) base = &g_cells[rv.as.class_ref.cell];
+            else return NULL;
+        }
+        if (base->tag != TK_VAL_STRUCT) return NULL;
+        for (size_t i = 0; i < base->as.st.fields.len; i += 1)
+            if (name_eq(base->as.st.fields.names[i], e->as.field_access.field))
+                return &base->as.st.fields.vals[i];
+        return NULL;
+    }
+    return NULL;
+}
+
 static tk_flow exec_stmt(const tk_tstatement *s, tk_venv *env) {
     switch (s->tag) {
         case TK_TSTMT_BINDING: {
@@ -2642,6 +2680,17 @@ static tk_flow exec_stmt(const tk_tstatement *s, tk_venv *env) {
         case TK_TSTMT_ASSIGN: {
             tk_token_kind op = s->as.assign.op;
             tk_value rhs = tk_vm_eval_expr(&s->as.assign.value, env);
+            // (#88) `recv.field op= x` — an IN-PLACE field mutation. Resolve the LHS to a pointer at the
+            // field's storage: a CLASS field lives in the SHARED cell store, so the write is observed by
+            // every alias (reference semantics — the aliasing proof); a STRUCT field is mutated in place
+            // through its `mut`-rooted slot. compound_apply applies `op`; coerce_to present-wraps the
+            // final value into the field's declared type (s->as.assign.bound), exactly like a binding.
+            if (s->as.assign.kind == TK_ASSIGN_FIELD) {
+                tk_value *dst = vm_lvalue_ptr(s->as.assign.target, env);
+                if (dst == NULL) vm_unsupported("field assignment to an unresolvable lvalue (internal: checker should reject)");
+                *dst = coerce_to(compound_apply(*dst, op, rhs, &s->as.assign.value), s->as.assign.bound);
+                return flow_normal();
+            }
             // (MEM Step 2/3) `r.value op= x` writes THROUGH a reference: `s->as.assign.name` names the
             // `Ref<T>` binding (a RefVal cell index); a deref-assign reads the cell, applies the op, and
             // writes BACK to the cell (cell_set) — so the caller's aliased var observes the write.
@@ -2998,7 +3047,7 @@ static void cov_walk_expr(const tk_texpr *e, cov_walk_t *w) {
 static void cov_walk_stmt(const tk_tstatement *st, cov_walk_t *w) {
     switch (st->tag) {
         case TK_TSTMT_BINDING: cov_walk_expr(&st->as.binding.value, w); break;
-        case TK_TSTMT_ASSIGN:  cov_walk_expr(&st->as.assign.value, w); break;
+        case TK_TSTMT_ASSIGN:  cov_walk_expr(&st->as.assign.value, w); if (st->as.assign.kind == TK_ASSIGN_FIELD) cov_walk_expr(st->as.assign.target, w); break;   // (#88) the FIELD LHS receiver is executable too
         case TK_TSTMT_RETURN:  if (st->as.ret.has_value) cov_walk_expr(&st->as.ret.value, w); break;
         case TK_TSTMT_LOOP:    cov_walk_block(st->as.loop_stmt.body, st->as.loop_stmt.nbody, w); break;
         case TK_TSTMT_EXPR:    cov_walk_expr(&st->as.expr_stmt.expr, w); break;

@@ -598,7 +598,7 @@ static void collect_stmt_insts(tk_statement s, tk_type_expr **acc, size_t *n) {
             if (s.as.binding.has_type) collect_texpr_insts(s.as.binding.type_ann, acc, n);
             collect_expr_insts(s.as.binding.value, acc, n);
             break;
-        case TK_STMT_ASSIGN:  collect_expr_insts(s.as.assign.value, acc, n); break;
+        case TK_STMT_ASSIGN:  collect_expr_insts(s.as.assign.value, acc, n); if (s.as.assign.kind == TK_ASSIGN_FIELD && s.as.assign.target != NULL) collect_expr_insts(*s.as.assign.target, acc, n); break;   // (#88) the FIELD LHS receiver may name generic instances
         case TK_STMT_RETURN:  if (s.as.ret.has_value) collect_expr_insts(s.as.ret.value, acc, n); break;
         case TK_STMT_EXPR:    collect_expr_insts(s.as.expr_stmt.expr, acc, n); break;
         case TK_STMT_LOOP:    collect_stmts_insts(s.as.loop_stmt.body, s.as.loop_stmt.nbody, acc, n); break;

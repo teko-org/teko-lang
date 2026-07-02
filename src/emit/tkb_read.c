@@ -259,11 +259,17 @@ static tk_tstatement read_tstmt(tk_reader *r, tk_strs t) {
             return s;
         case 1:
             s.tag = TK_TSTMT_ASSIGN;
+            s.as.assign.kind  = (tk_assign_kind)tk_read_u8(r);   // (#88) the target discriminant
             s.as.assign.name  = tk_read_str(r, t);
             s.as.assign.op    = kind_of(tk_read_u8(r));
             s.as.assign.bound = tk_read_type(r, t);
             s.as.assign.value = tk_read_texpr(r, t);
             s.as.assign.deref = (tk_read_u8(r) != 0);   // (MEM-1b-ii)
+            s.as.assign.target = NULL;
+            if (s.as.assign.kind == TK_ASSIGN_FIELD) {   // (#88) the FIELD LHS field-access
+                tk_texpr *lp = tk_alloc(sizeof *lp); if (!lp) abort(); *lp = tk_read_texpr(r, t);
+                s.as.assign.target = lp;
+            }
             return s;
         case 2:
             s.tag = TK_TSTMT_RETURN;

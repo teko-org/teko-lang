@@ -86,7 +86,16 @@ pub type Binding = struct {                                 // let/mut/const TAR
     type_ann: TypeExpr                                  // the parsed annotation (A.8)
     value:    Expr
 }
-pub type Assign  = struct { name: str; op: lexer::TokenKind; value: Expr; deref: bool }  // x = / += / … (B.4); deref=true ⇒ `name.value op= …` writes THROUGH a `Ref<T>` (MEM-1b-ii) — the only field-assign target in value-functional Teko
+// (#88) an assignment TARGET is one of three shapes, tagged by `kind`:
+//   Simple   — `name op= value`; LHS is the bare binding `name` (deref=false, target = no_expr()).
+//   RefDeref — `name.value op= value`; write THROUGH a `Ref<T>` handle `name` (deref=true — the legacy
+//              MEM-1b-ii flag, preserved; target = no_expr()).
+//   Field    — `recv.field op= value`; write a struct/class field. `target` is the LHS field-access EXPR
+//              (a FieldAccess, receiver.field, arbitrarily nested); `name`/`deref` unused.
+// `deref` stays a plain bool == (kind==RefDeref) so every legacy reader / TKB byte layout is unchanged for the
+// two old shapes; a Field target is the ONLY new shape (kind=Field carries `target`, the general lvalue).
+pub type AssignKind = enum { Simple; RefDeref; Field }
+pub type Assign  = struct { kind: AssignKind; name: str; op: lexer::TokenKind; value: Expr; deref: bool; target: Expr }  // x = / += / … (B.4); see AssignKind above
 pub type Return  = struct { has_value: bool; value: Expr }   // `return [expr]` — bare `return` (no value) has has_value=false, value a placeholder (B.20; P4a)
 pub type LoopStmt = struct { label: str; body: []Statement }   // loop [NAME] { … } (M.5); label empty (len 0) = unlabeled
 pub type BreakStmt    = struct { label: str }               // break [NAME] — label empty = innermost loop
