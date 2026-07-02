@@ -6495,18 +6495,25 @@ fn tk_emit_c(prog0: checker::TProgram) -> str | error {
     b = cb(b, "#include \"assert.h\"\n\n")   // teko::assert seed decls (driver adds its -I)
 
     // W4c — TYPE DECLS come FIRST (before any function that uses them). Two sub-passes:
-    //   a) a forward `typedef struct tk_t_<M> tk_t_<M>;` for every struct/variant decl, so
+    //   a) a forward `typedef struct tk_t_<M> tk_t_<M>;` for every struct/variant/class decl, so
     //      a field/member that references a not-yet-defined aggregate (recursive or
     //      out-of-order types) still compiles.
-    //   b) the full type declarations (struct bodies, variant tag+union, enums).
+    //   b) the full type declarations (struct/class bodies, variant tag+union, enums).
     // (enums need no forward typedef — they carry no aggregate self-reference.)
+    // (#102) CLASS joins STRUCT/VARIANT here: a class value lowers to a POINTER everywhere it is
+    // used (`tk_t_<M> *`), so a `[]<Class>` element is `tk_t_<M> *`. cg_emit_types_ordered (below)
+    // emits ALL slice typedefs before the fixpoint that emits named (struct/variant/class) BODIES,
+    // so a `tk_slice_<Class>` typedef referencing `tk_t_<Class> *` needs the class's forward
+    // typedef to exist by then — exactly the same requirement a struct/variant already gets here.
+    // Without this, `cc` fails with "unknown type name 'tk_t_<Class>'" on the slice's `ptr` field.
     mut fw = 0
     loop {
         if fw >= prog.items.len { break }
         match prog.items[fw] {
             parser::TypeDecl as d => {
-                // only STRUCT/VARIANT decls need a forward `typedef struct …;` (an aggregate
-                // self-reference). enums carry none; a TRANSPARENT alias emits no C type at all.
+                // STRUCT/VARIANT/CLASS decls need a forward `typedef struct …;` (an aggregate
+                // self-reference, or — for class — a slice/field pointer reference that may
+                // precede the body). enums carry none; a TRANSPARENT alias emits no C type at all.
                 match d.body {
                     parser::StructBody => {
                         b = cb(b, "typedef struct ")
@@ -6516,6 +6523,13 @@ fn tk_emit_c(prog0: checker::TProgram) -> str | error {
                         b = cb(b, ";\n")
                     }
                     parser::VariantBody => {
+                        b = cb(b, "typedef struct ")
+                        b = mangle_type_name(b, "", d.name)
+                        b = cb(b, " ")
+                        b = mangle_type_name(b, "", d.name)
+                        b = cb(b, ";\n")
+                    }
+                    parser::ClassBody => {
                         b = cb(b, "typedef struct ")
                         b = mangle_type_name(b, "", d.name)
                         b = cb(b, " ")
