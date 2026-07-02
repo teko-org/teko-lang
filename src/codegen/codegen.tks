@@ -807,7 +807,14 @@ fn cg_opt_mangle(buf: []byte, inner: checker::Type) -> []byte | error {
             checker::Void => error { message = "codegen: nested bare-null optional (internal)" }
             _ => cg_opt_mangle(cb(buf, "opt_"), o.inner)
         }
-        _ => error { message = "codegen: optional inner type not yet supported" }
+        // NESTED SLICE (#81) — a `[]T` in an element/inner position mangles to `slice_<elem>`
+        // (the SAME key cg_member_key_str already uses for a slice variant member), so `[][]T`
+        // lowers to tk_slice_slice_<elem> and every use agrees with the collected typedef.
+        checker::Slice as sl => match sl.element {
+            checker::Void => error { message = "codegen: an untyped empty slice needs a known element type from context (internal)" }
+            _ => cg_opt_mangle(cb(buf, "slice_"), sl.element)
+        }
+        _ => error { message = "codegen: optional/slice inner type not yet supported" }
     }
 }
 
@@ -841,7 +848,12 @@ fn cg_opt_mangle_str(inner: checker::Type) -> str | error {
             // isn't threaded through nested array-element stmt-exprs). A plain TVar arg sidesteps it.
             _ => { let inner_s = match cg_opt_mangle_str(o.inner) { str as s => s; error as e => return e }; teko::str::concat("opt_", inner_s) }
         }
-        _ => error { message = "codegen: optional inner type not yet supported" }
+        // NESTED SLICE (#81) — the str twin of cg_opt_mangle's Slice arm: `slice_<elem>`.
+        checker::Slice as sl => match sl.element {
+            checker::Void => error { message = "codegen: an untyped empty slice needs a known element type from context (internal)" }
+            _ => { let elem_s = match cg_opt_mangle_str(sl.element) { str as s => s; error as e => return e }; teko::str::concat("slice_", elem_s) }
+        }
+        _ => error { message = "codegen: optional/slice inner type not yet supported" }
     }
 }
 

@@ -1,0 +1,25 @@
+# Regression (#81): nested slices (`[][]T`) ran correctly under the VM but FAILED native codegen
+# in BOTH compilers with the misleading honest-stop "codegen: optional inner type not yet
+# supported" — a VM≠native frontier. Root cause: the deterministic element/inner mangle
+# (`cg_opt_mangle` / `cg_opt_mangle_str`) had NO Slice case, so a slice-of-slice element fell
+# into the Optional-family default. The fix mangles a nested slice element as `slice_<elem>`
+# (the SAME key a slice variant member already used), so `[][]i64` lowers to the generated
+# `tk_slice_slice_i64` typedef — collection, emission order (inner slice typedef first) and
+# every use were already generic over the element type.
+#
+# This fixture proves the whole nested-slice surface end-to-end, VM == native (exit 16):
+#   * [][]i64 construction from a nested literal + chained indexing m[i][j] + len at both
+#     depths, across rows of DIFFERENT lengths                                        ->  8
+#   * [][]u8 with a WIDTH-SENSITIVE op on an extracted u8 element (`<<= 9` masks the count
+#     by 7 only if the element slot is genuinely 8 bits wide: 200 << 1 == 400 -> byte 144) -> +4
+#   * teko::list::push of a fresh row into a [][]i64                                  -> +2
+#   * spread of nested slices ([..a, ..b]) into a new [][]i64                         -> +1
+#   * nested `loop` iteration summing every element                                   -> +1
+#
+#   teko run   examples/regressions/nested_slices                                  # VM     -> exit 16
+#   teko build examples/regressions/nested_slices && ./nested_slices              # native -> exit 16
+name = "nested_slices"
+source = "src"
+
+[artifact]
+kind = "binary"

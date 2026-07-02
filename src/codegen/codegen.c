@@ -887,7 +887,13 @@ static bool cg_opt_mangle(cbuf *b, tk_type inner, const char **err) {
         case TK_TYPE_OPTIONAL:
             if (inner.as.optional.inner == NULL) return fail_node(err, "codegen: nested bare-null optional (internal)");
             cb(b, "opt_"); return cg_opt_mangle(b, *inner.as.optional.inner, err);
-        default: return fail_node(err, "codegen: optional inner type not yet supported");
+        // NESTED SLICE (#81) — a `[]T` in an element/inner position mangles to `slice_<elem>`
+        // (the SAME key cg_member_key already uses for a slice variant member), so `[][]T`
+        // lowers to tk_slice_slice_<elem> and every use agrees with the collected typedef.
+        case TK_TYPE_SLICE:
+            if (inner.as.slice.element == NULL) return fail_node(err, "codegen: an untyped empty slice needs a known element type from context (internal)");
+            cb(b, "slice_"); return cg_opt_mangle(b, *inner.as.slice.element, err);
+        default: return fail_node(err, "codegen: optional/slice inner type not yet supported");
     }
 }
 
