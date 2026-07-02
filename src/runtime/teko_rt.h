@@ -354,6 +354,10 @@ tk_ffi_u64res tk_rt_last_index_of(tk_str hay, tk_str needle);
 // teko::process::run(argv) — fork/exec argv[0] with argv, wait, return its exit status
 // (127 when argv is empty / exec fails). Takes the slice as ptr+len (no generated type).
 int32_t tk_rt_run(const tk_str *argv, uint64_t n);
+// teko::process::run_quiet(argv) — same contract as tk_rt_run, but the child's stdout/stderr
+// are redirected to the null device (issue #73: the cc flag-family probe uses this so a
+// deliberately-rejected compiler flag doesn't print to the user's build output).
+int32_t tk_rt_run_quiet(const tk_str *argv, uint64_t n);
 // teko::env::args() — the captured process argv as owned tk_str's; *n receives the count.
 // tk_set_args must run first (the generated `main` calls it before the virtual-main body).
 void    tk_set_args(int argc, char **argv);
