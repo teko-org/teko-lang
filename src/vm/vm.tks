@@ -1378,7 +1378,7 @@ fn val_type_matches(subj: Value, name: str) -> bool {
         OptVal => false
         RefVal => false                            // (MEM Step 2/3) a `Ref<T>` value is never pattern-matched (escape-gated, param-only)
         FuncVal => false                           // (W10a) a function value is never pattern-matched
-        ClassRef => false                          // (W10b.CLASS residual) a class instance is nominal, never a variant-case pattern subject
+        ClassRef => false                          // (C1) a class instance matches by NAME via the cell deref in pat_match (needs env.cells, not available here)
     }
 }
 
@@ -1655,6 +1655,16 @@ fn pat_match(pat: parser::Pattern, subj: Value, env: Venv) -> PatMatch {
                 if !hit {
                     match subj {
                         StructVal as sv => { if vm_case_in_variant(env.prog, bname, sv.type_name) { hit = true } }
+                        // (C1 fallible factories) a CLASS instance in a union (`C | error`) is matched
+                        // by its class NAME: deref the ClassRef cell to its struct payload and compare
+                        // its type_name. On a hit the ORIGINAL ClassRef is bound (reference semantics —
+                        // the arm's binding keeps aliasing the shared object, mirroring the native pointer).
+                        ClassRef as cr => {
+                            match cell_get(env.cells, cr.cell) {
+                                StructVal as payload => { if payload.type_name == bname { hit = true } }
+                                _ => {}
+                            }
+                        }
                         _ => { if val_is_int(subj) { if vm_match_as_enum_int(env.prog, bname, as_int(subj)) { hit = true } } }
                     }
                 }

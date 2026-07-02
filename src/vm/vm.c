@@ -1985,7 +1985,7 @@ static bool val_type_matches(tk_value subj, tk_str name) {
         case TK_VAL_BOOL:  return seg_is(name, "bool");
         case TK_VAL_STR:   return seg_is(name, "str");
         case TK_VAL_STRUCT:return name_eq(subj.as.st.type_name, name);   // a named case / `error`
-        default:           return false;   // LIST → is_slice branch; OPT → handled above
+        default:           return false;   // LIST → is_slice branch; OPT → handled above; CLASS_REF → cell deref in pat_match (C1)
     }
 }
 
@@ -2038,6 +2038,14 @@ static bool pat_match(const tk_pattern *pat, tk_value subj, tk_venv *env) {
                 bool direct = val_type_matches(subj, bname)
                     || (subj.tag == TK_VAL_STRUCT && case_in_variant(bname, subj.as.st.type_name))
                     || (subj.tag == TK_VAL_INT && match_as_enum_int(bname, v_as_u128(subj)));
+                // (C1 fallible factories) a CLASS instance in a union (`C | error`) is matched by
+                // its class NAME: deref the ClassRef cell to its struct payload and compare its
+                // type_name. On a hit the ORIGINAL ClassRef is bound (reference semantics — the
+                // arm's binding keeps aliasing the shared object, mirroring the native pointer).
+                if (!direct && subj.tag == TK_VAL_CLASS_REF) {
+                    tk_value payload = cell_get(subj.as.class_ref.cell);
+                    direct = payload.tag == TK_VAL_STRUCT && name_eq(payload.as.st.type_name, bname);
+                }
                 if (direct) {
                     if (pat->as.bind.has_binding) env_define(env, pat->as.bind.binding, subj);
                     return true;
