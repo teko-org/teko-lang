@@ -261,17 +261,20 @@ pub fn mem_write_fn(sink: Ref<MemWriter>) -> WriteFn {
 // the chunk size read_all/copy request per step (a read may return fewer).
 fn default_chunk_size() -> u64 { 4096 }
 
-// NAMING NOTE: stream parameters are `src`/`dst` (the contract's own copy(dst, src) names),
-// NEVER `read`/`write` — `teko::io` already has the extern fn `write(str)`, and codegen
-// resolves a CALL through a closure-typed param by bare name, so a param named `write`
-// would be miscompiled into the extern call (checker accepts it; the generated C breaks).
-// Documented compiler gap; avoided here by naming discipline.
+// (issue #107 — the workaround this reverts) stream parameters are named `read`/`write` (the
+// contract's own Reader.read/Writer.write names), matching ReadFn/WriteFn's roles directly.
+// This USED to collide with `teko::io`'s `extern fn write(str)` — codegen/VM resolved a CALL
+// through a closure-typed param by bare name, hijacking a param literally named `write` into
+// the extern call regardless of scope. Fixed at the root (codegen's emit_call / the VM's
+// eval_call+call_value now check the checker's `is_closure_call` BEFORE any builtin/extern
+// name-sniffing); this file no longer needs the src/dst naming workaround. See
+// examples/regressions/closure_shadows_fn for the regression proof.
 
 // drain the stream to completion — every chunk until EOF, concatenated.
-pub fn read_all(src: ReadFn) -> Buf | error {
+pub fn read_all(read: ReadFn) -> Buf | error {
     mut collected = Buf::empty()
     loop {
-        let chunk = match src(default_chunk_size()) { Buf as b => b; error as e => return e }
+        let chunk = match read(default_chunk_size()) { Buf as b => b; error as e => return e }
         if chunk.len() == 0 { break }
         collected = collected.concat(chunk)
     }
@@ -280,11 +283,11 @@ pub fn read_all(src: ReadFn) -> Buf | error {
 
 // read EXACTLY `count` bytes — reaching EOF first is an error (M.1 fail-loud), unlike
 // read_all's run-to-EOF.
-pub fn read_exact(src: ReadFn, count: u64) -> Buf | error {
+pub fn read_exact(read: ReadFn, count: u64) -> Buf | error {
     mut collected = Buf::empty()
     loop {
         if collected.len() >= count { break }
-        let chunk = match src(count - collected.len()) { Buf as b => b; error as e => return e }
+        let chunk = match read(count - collected.len()) { Buf as b => b; error as e => return e }
         if chunk.len() == 0 {
             return error { message = "io::read_exact: end of stream before the requested count" }
         }
@@ -295,12 +298,12 @@ pub fn read_exact(src: ReadFn, count: u64) -> Buf | error {
 
 // write ALL of `from`, looping while the writer takes partial counts. A writer that
 // reports 0 progress (or more bytes than offered) is an error — fail-loud, no spin.
-pub fn write_all(dst: WriteFn, from: Buf) -> u64 | error {
+pub fn write_all(write: WriteFn, from: Buf) -> u64 | error {
     mut remaining = from
     mut total: u64 = 0
     loop {
         if remaining.len() == 0 { break }
-        let taken = match dst(remaining) { u64 as n => n; error as e => return e }
+        let taken = match write(remaining) { u64 as n => n; error as e => return e }
         if taken == 0 { return error { message = "io::write_all: writer made no progress" } }
         if taken > remaining.len() { return error { message = "io::write_all: writer reported more bytes than offered" } }
         remaining = match remaining.slice(taken, remaining.len()) {
@@ -312,14 +315,14 @@ pub fn write_all(dst: WriteFn, from: Buf) -> u64 | error {
     total
 }
 
-// pump `src` into `dst` until EOF (dst-first, per the contract's copy(dst, src)).
+// pump `read` into `write` until EOF (write-first, per the contract's copy(dst, src)).
 // Returns the total number of bytes moved.
-pub fn copy(dst: WriteFn, src: ReadFn) -> u64 | error {
+pub fn copy(write: WriteFn, read: ReadFn) -> u64 | error {
     mut total: u64 = 0
     loop {
-        let chunk = match src(default_chunk_size()) { Buf as b => b; error as e => return e }
+        let chunk = match read(default_chunk_size()) { Buf as b => b; error as e => return e }
         if chunk.len() == 0 { break }
-        let moved = match write_all(dst, chunk) { u64 as n => n; error as e => return e }
+        let moved = match write_all(write, chunk) { u64 as n => n; error as e => return e }
         total = total + moved
     }
     total
@@ -333,16 +336,16 @@ pub type LimitState = struct {
     fn of(limit: u64) -> LimitState { LimitState { remaining = limit } }
 }
 
-// a ReadFn that yields at most `state.remaining` further bytes from `src`, then EOF.
+// a ReadFn that yields at most `state.remaining` further bytes from `read`, then EOF.
 // (Lambda bodies below use match-arm VALUES for the error path — `error as e => e` — never
 // `return e`: an early `return` of a BOUND error inside a lambda misses the union wrap in
 // codegen today. Documented compiler gap; the arm-value shape is equivalent and correct.)
-pub fn limit_read_fn(src: ReadFn, state: Ref<LimitState>) -> ReadFn {
+pub fn limit_read_fn(read: ReadFn, state: Ref<LimitState>) -> ReadFn {
     let limited: ReadFn = (max: u64) => {
         mut want = state.value.remaining
         if want > max { want = max }
         if want == 0 { return Buf::empty() }   // the cap is spent — EOF, even if the source has more
-        match src(want) {
+        match read(want) {
             Buf as chunk => {
                 state.value = LimitState { remaining = state.value.remaining - chunk.len() }
                 chunk
@@ -363,13 +366,13 @@ pub type BufReaderState = struct {
     fn fresh() -> BufReaderState { BufReaderState { pending = Buf::empty(); pos = 0 } }
 }
 
-pub fn buffered_read_fn(src: ReadFn, state: Ref<BufReaderState>, chunk_size: u64) -> ReadFn {
+pub fn buffered_read_fn(read: ReadFn, state: Ref<BufReaderState>, chunk_size: u64) -> ReadFn {
     let buffered: ReadFn = (max: u64) => {
         if max == 0 { return Buf::empty() }
         mut current = state.value
         if current.pos >= current.pending.len() {
             // the pending gulp is spent — pull the next one from the underlying stream.
-            match src(chunk_size) {
+            match read(chunk_size) {
                 Buf as gulp => {
                     if gulp.len() == 0 { return Buf::empty() }   // underlying EOF
                     current = BufReaderState { pending = gulp; pos = 0 }
@@ -405,14 +408,14 @@ pub type BufWriterState = struct {
     fn fresh() -> BufWriterState { BufWriterState { pending = Buf::empty() } }
 }
 
-pub fn buffered_write_fn(dst: WriteFn, state: Ref<BufWriterState>, capacity: u64) -> WriteFn {
+pub fn buffered_write_fn(write: WriteFn, state: Ref<BufWriterState>, capacity: u64) -> WriteFn {
     let buffered: WriteFn = (from: Buf) => {
         let combined = state.value.pending.concat(from)
         if combined.len() < capacity {
             state.value = BufWriterState { pending = combined }
             return from.len()
         }
-        match write_all(dst, combined) {
+        match write_all(write, combined) {
             u64 => {
                 state.value = BufWriterState { pending = Buf::empty() }
                 from.len()
@@ -425,10 +428,10 @@ pub fn buffered_write_fn(dst: WriteFn, state: Ref<BufWriterState>, capacity: u64
 
 // drain a buffered writer's pending bytes to the underlying stream. Returns how many
 // bytes were flushed (0 if nothing was pending).
-pub fn flush_write(dst: WriteFn, state: Ref<BufWriterState>) -> u64 | error {
+pub fn flush_write(write: WriteFn, state: Ref<BufWriterState>) -> u64 | error {
     let pending = state.value.pending
     if pending.len() == 0 { return 0 to u64 }
-    let flushed = match write_all(dst, pending) { u64 as n => n; error as e => return e }
+    let flushed = match write_all(write, pending) { u64 as n => n; error as e => return e }
     state.value = BufWriterState { pending = Buf::empty() }
     flushed
 }

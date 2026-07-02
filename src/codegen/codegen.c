@@ -1753,6 +1753,16 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
             // (W10b.D3) a DYNAMIC contract-method call dispatches through the receiver's vtable —
             // FIRST, before any builtin name-sniffing below could collide with a method name.
             if (e->as.call.is_iface_dispatch) return emit_iface_call(b, e, err);
+            // (#107) a CLOSURE call (the checker resolved the callee to an in-scope local/param/
+            // let-bound function VALUE, not a namespace fn) ALSO goes first, before any of the
+            // builtin/host-FFI name-sniffing blocks below: those match by BARE last-segment name
+            // only (`write`, `print`, `len`, …) with no scope awareness, so a closure-typed
+            // binding sharing one of those reserved names (e.g. a `write: WFn` param in a
+            // namespace that also has an extern `write`) would otherwise be hijacked into the
+            // builtin/extern call instead of calling the closure VALUE — the checker already
+            // proved `is_closure_call` (tk_env_lookup_call scans innermost-first, so the local
+            // always wins over the namespace fn); codegen just has to respect that verdict.
+            if (e->as.call.is_closure_call) return emit_closure_call(b, e, err);
             // callee path -> C identifier joined by "__" (single-segment in M0).
             tk_path p = e->as.call.callee;
             // E2 (native): err_loc/err_typed adorn an error VALUE with diagnostic position/types.
