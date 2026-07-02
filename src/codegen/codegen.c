@@ -4382,6 +4382,11 @@ static bool emit_type_decl(cbuf *b, tk_tprogram prog, tk_type_decl d, const char
             cb(b, ";\n\n");
             return true;
         }
+        case TK_BODY_INTERFACE:
+            // (W10b.IF) an interface is a COMPILE-TIME contract only — NO runtime C type is emitted
+            // (dynamic dispatch / vtable is ROUND 3). Like a transparent alias, it lowers to nothing;
+            // the checker rejects using an interface as a value type.
+            return true;
     }
     return fail_node(err, "codegen: unknown type body not yet supported");
 }
