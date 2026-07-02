@@ -63,9 +63,15 @@ rule, deriving reuses the class field-flattening, and a trait is usable as a gen
   methods; the deriver may **override** any provided method and must satisfy any bodyless requirement.
 - **Not instantiable:** a `trait` value is never constructed directly — only derived. (It may still be
   used as a `<T: Trait>` constraint and, for its bodyless requirements, as a dynamic interface-like value.)
-- **Multiple derivation, collisions explicit:** deriving several traits is allowed; a **field-name
-  collision** across derived traits (or with the deriver's own fields) is a compile error; two traits
-  providing a **same-named method** → the deriver must override to disambiguate. No implicit order.
+- **Multiple derivation — exactly like implementing multiple interfaces.** A struct/class may derive any
+  number of traits (`struct T1 & T2 & T3`), the same way it can implement several interfaces. The ONLY
+  thing to resolve is **method conflicts**, and there is exactly one rule for it (consistent with Teko's
+  **no-overloading / override-only** ruling from W10b.CLASS): if two derived traits provide a method with
+  the **same name**, the deriver **must provide its own method of that name** (an override) to resolve it —
+  a compile error otherwise, never an implicit resolution order. A method the deriver defines itself always
+  wins over a trait-provided one (it IS the override). A bodyless requirement shared by several traits is
+  satisfied once. (**Fields** cannot be overridden, so a field-name collision across derived traits — or
+  with the deriver's own fields — is simply a compile error; rename or don't co-derive.)
 - **Receiver / visibility:** methods follow the W10b receiver rule (`self` value, `self: Ref<T>` to
   mutate); a trait's fields obey the deriver's kind (struct = public value data; class = encapsulated).
 - **As a constraint (S6):** `<T: Timestamped>` monomorphized, exactly like an interface constraint;
