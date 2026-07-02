@@ -749,6 +749,33 @@ fn ref_value_position_match_subject_holds() {
     teko::assert::is_true(x == 42)         // and the mutation is visible after the match
 }
 
+// (issue #106) a value-returning Ref<T> call NESTED INSIDE A BUILTIN ARGUMENT — the twin of
+// case (2)'s `add1(bumpr(x))` above, but the outer call is `teko::assert::is_true(...)` (a VM
+// BUILTIN, routed through try_builtin/call_value) instead of a user fn (routed through
+// bind_call_args). Pre-fix, `call_value` threw away try_builtin's updated env and returned the
+// STALE pre-call `env`, so `x`'s write through `bumpr`'s Ref<i64> param never reached the
+// caller once the assert statement finished — the very NEXT statement (`x == 42`) still saw the
+// old value on the self-hosted VM only (vm.c's g_cells is a global shared by pointer, immune).
+#test
+fn ref_write_inside_builtin_arg_survives() {
+    mut x: i64 = 41
+    teko::assert::is_true(bumpr(x) == 42)  // bumpr(x): x→42 inside the assert's argument expr
+    teko::assert::is_true(x == 42)         // the write must have reached the caller's `x`
+}
+
+// (issue #106) the SAME shape but with TWO builtin-argument ref writes in sequence (str_contains
+// takes two args) — proves the env threads BETWEEN args within a single builtin call, not just
+// out of it. Uses two independent scalars so ordering is unambiguous.
+fn mark(r: Ref<i64>, v: i64) -> str { r.value = v; "ok" }
+#test
+fn ref_writes_inside_two_arg_builtin_survive() {
+    mut a: i64 = 0
+    mut b: i64 = 0
+    teko::assert::str_contains(mark(a, 10), mark(b, 20))
+    teko::assert::is_true(a == 10)         // first arg's ref write reached the caller
+    teko::assert::is_true(b == 20)         // second arg's ref write reached the caller
+}
+
 // (6) NON-SCALAR Ref<Point> in value position: a value-returning struct-ref fn used in `let`.
 // `setget(p, 42)` whole-replaces p.x with 42 and RETURNS the new p.x (42). p observes the write.
 fn setget(r: Ref<Point>, v: i64) -> i64 { r.value = Point { x = v; y = r.value.y }; r.value.x }
