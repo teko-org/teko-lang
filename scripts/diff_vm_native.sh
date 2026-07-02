@@ -19,14 +19,25 @@
 # into the VM's behavior) the fixture turns XPASS and the harness fails LOUDLY so the
 # list gets pruned and the fixture starts gating normally.
 #
+# In addition to the per-fixture VM==native comparison above, the harness runs one
+# CWD-REGRESSION check (issue #64): `cd <project-dir> && teko build .` — the exact
+# invocation shape a real user takes — for BOTH the C-bootstrap (./build/teko, whose
+# TK_RT_DIR/TK_SRC_DIR are baked in absolute by CMake and were never affected) and the
+# self-hosted engine (./bin/teko, built on the fly from the bootstrap if missing, whose
+# src/build/project.tks::ensure_rt_dir_abs used to resolve the runtime relative to the
+# CWD instead of the compiler binary's own location — PR #66). Both must exit 0 and
+# produce a working (executable, non-crashing) binary; see check_cwd_build_regression().
+#
 # usage: scripts/diff_vm_native.sh [fixture-dir ...]
 #   TEKO=<path-to-teko-binary>   (default: ./build/teko)
 #   FIXTURE_ROOT=<dir>           (default: examples/regressions)
+#   CWD_REGRESSION_FIXTURE=<dir> (default: examples/regressions/char_ops)
 
 set -u
 
 TEKO="${TEKO:-./build/teko}"
 FIXTURE_ROOT="${FIXTURE_ROOT:-examples/regressions}"
+CWD_REGRESSION_FIXTURE="${CWD_REGRESSION_FIXTURE:-examples/regressions/char_ops}"
 
 # ── EXPECTED-FAIL list ─────────────────────────────────────────────────────────────────
 # class_destruct_effects — the VM fires NO class destructors: W10b.CLASS increment 4's
@@ -75,6 +86,58 @@ run_limited() {
     else
         "$@"
     fi
+}
+
+# check_cwd_build_regression — issue #64: `cd <project> && teko build .` (the exact shape
+# a real user runs from inside their own project) must exit 0 and produce a working binary,
+# on BOTH engines. Takes the compiler binary's ABSOLUTE path and a short label ("bootstrap"
+# / "self-hosted") for PASS/FAIL reporting; appends to the shared pass/fail counters.
+check_cwd_build_regression() {
+    local compiler_abs="$1" label="$2"
+    local name="$(basename "$CWD_REGRESSION_FIXTURE")"
+    local check_name="cwd_build_${label}"
+    local out; out="$(mktemp -d "${TMPDIR:-/tmp}/teko-cwd-regress.XXXXXX")"
+
+    if [ ! -x "$compiler_abs" ]; then
+        fail=$((fail + 1)); failed_names+=("$check_name")
+        printf 'FAIL  %-28s compiler not found/executable at %s\n' "$check_name" "$compiler_abs"
+        rm -rf "$out"
+        return
+    fi
+
+    ( cd "$CWD_REGRESSION_FIXTURE" && run_limited "$compiler_abs" build . -o "$out" ) \
+        >"$out/build.stdout" 2>"$out/build.stderr"
+    local build_exit=$?
+
+    if [ "$build_exit" -ne 0 ]; then
+        fail=$((fail + 1)); failed_names+=("$check_name")
+        printf 'FAIL  %-28s cd-into-project build failed (exit=%s), the #64 CWD-relative runtime bug\n' "$check_name" "$build_exit"
+        sed 's/^/      | /' "$out/build.stderr" | tail -20
+        tail -5 "$out/build.stdout" | sed 's/^/      | /'
+        rm -rf "$out"
+        return
+    fi
+
+    if [ ! -x "$out/$name" ]; then
+        fail=$((fail + 1)); failed_names+=("$check_name")
+        printf 'FAIL  %-28s build exited 0 but no working binary at %s/%s\n' "$check_name" "$out" "$name"
+        rm -rf "$out"
+        return
+    fi
+
+    run_limited "$out/$name" >"$out/run.stdout" 2>"$out/run.stderr"
+    local run_exit=$?
+    if [ "$run_exit" -ge 126 ]; then
+        fail=$((fail + 1)); failed_names+=("$check_name")
+        printf 'FAIL  %-28s binary built but crashed (exit=%s)\n' "$check_name" "$run_exit"
+        [ -s "$out/run.stderr" ] && tail -5 "$out/run.stderr" | sed 's/^/      | /'
+        rm -rf "$out"
+        return
+    fi
+
+    pass=$((pass + 1))
+    printf 'PASS  %-28s cd-into-project build OK (build exit=0, binary exit=%s)\n' "$check_name" "$run_exit"
+    rm -rf "$out"
 }
 
 if [ ! -x "$TEKO" ]; then
@@ -177,6 +240,45 @@ for proj in "${fixtures[@]}"; do
         fi
     fi
 done
+
+# ── CWD-regression check (issue #64) ────────────────────────────────────────────────────
+# `cd <project> && teko build .` must work on BOTH engines: the C-bootstrap (whose
+# TK_RT_DIR/TK_SRC_DIR are baked in absolute by CMake) and the self-hosted engine (which
+# resolves its own runtime at runtime — PR #66 fixed it to use the compiler binary's own
+# location instead of the CWD). Absolute paths throughout: the check itself `cd`s.
+echo
+echo "diff_vm_native: CWD-regression check (issue #64) — cd \"$CWD_REGRESSION_FIXTURE\" && teko build ."
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+bootstrap_abs="$script_dir/${TEKO#./}"
+selfhosted_abs="$script_dir/bin/teko"
+
+if [ -x "$bootstrap_abs" ]; then
+    check_cwd_build_regression "$bootstrap_abs" "bootstrap"
+else
+    fail=$((fail + 1)); failed_names+=("cwd_build_bootstrap")
+    printf 'FAIL  %-28s bootstrap compiler not found/executable at %s\n' "cwd_build_bootstrap" "$bootstrap_abs"
+fi
+
+# Self-host on the fly if ./bin/teko is not already there (a fresh checkout / a CI job
+# that only built ./build/teko, which is the norm — this is what makes the check work
+# with ZERO workflow changes: the harness builds what it needs to test).
+if [ ! -x "$selfhosted_abs" ]; then
+    if [ -x "$bootstrap_abs" ]; then
+        echo "diff_vm_native: bin/teko not found — self-hosting via $bootstrap_abs build . -o bin"
+        if ! run_limited "$bootstrap_abs" build "$script_dir" -o "$script_dir/bin" >/tmp/teko-selfhost-build.log 2>&1; then
+            echo "diff_vm_native: self-host build failed — see /tmp/teko-selfhost-build.log" >&2
+            tail -20 /tmp/teko-selfhost-build.log | sed 's/^/      | /'
+        fi
+    fi
+fi
+
+if [ -x "$selfhosted_abs" ]; then
+    check_cwd_build_regression "$selfhosted_abs" "selfhosted"
+else
+    fail=$((fail + 1)); failed_names+=("cwd_build_selfhosted")
+    printf 'FAIL  %-28s self-hosted compiler not found/executable at %s (self-host build unavailable)\n' "cwd_build_selfhosted" "$selfhosted_abs"
+fi
 
 echo
 echo "diff_vm_native: $pass passed, $fail failed, $xfail expected-fail (still diverging), $xpass unexpectedly passing"
