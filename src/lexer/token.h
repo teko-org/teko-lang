@@ -173,6 +173,7 @@ typedef enum {
     TK_TOKEN_VIRTUAL,       // `virtual class` / `virtual fn` — instantiable+inheritable class / an overridable method
     TK_TOKEN_OVERRIDE,      // `override fn` — overrides a base virtual/abstract method
     TK_TOKEN_INTERN,        // `intern` — visibility: visible to inheritors
+    TK_TOKEN_INTERFACE,     // (W10b.IF) `interface` — the interface construct (a pure signature contract)
 } tk_token_kind;
 // `params` — variadic-parameter modifier (2026-07-01 ruling) is NOT a reserved token: like `from`
 // (FFI `extern` position), it stays a normal TK_TOKEN_IDENT and is matched CONTEXTUALLY by the

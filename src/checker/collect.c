@@ -2,6 +2,7 @@
 #include "collect.h"
 #include "tast.h"   // tk_tprogram, tk_titem, TK_TITEM_TYPE_DECL (C7.12)
 #include <string.h> // memcpy (collect_str_concat)
+#include <stdio.h>  // snprintf — (W10b.IF) conformance error messages
 
 // a ++ b — a fresh owned tk_str (local to keep the DAG tight; mirrors monomorph.c::mono_concat).
 static tk_str collect_str_concat(tk_str a, tk_str b) {
@@ -269,6 +270,107 @@ static tk_type_result validate_class_decl(tk_class_body cb, tk_type_table table)
     return (tk_type_result){ .ok = true };
 }
 
+// (W10b.IF) look up an interface body by name — error if the name is unknown or not an interface.
+// Mirror of collect.tks::find_interface_body. LOCAL result type (used only here + conformance).
+typedef struct { bool ok; union { tk_interface_body value; tk_error error; } as; } ifacebody_result;
+static ifacebody_result find_interface_body(tk_str name, tk_type_table table) {
+    tk_decl_result decl = tk_type_table_find(table, name);
+    if (!decl.ok) {
+        size_t len = name.len + 32; char *buf = tk_alloc(len); if (!buf) abort();
+        snprintf(buf, len, "unknown interface: %.*s", (int)name.len, (const char *)name.ptr);
+        return (ifacebody_result){ .ok = false, .as.error = tk_error_make(buf) };
+    }
+    if (decl.as.value.body.tag != TK_BODY_INTERFACE) {
+        size_t len = name.len + 32; char *buf = tk_alloc(len); if (!buf) abort();
+        snprintf(buf, len, "%.*s is not an interface", (int)name.len, (const char *)name.ptr);
+        return (ifacebody_result){ .ok = false, .as.error = tk_error_make(buf) };
+    }
+    return (ifacebody_result){ .ok = true, .as.value = decl.as.value.body.as.interface_body };
+}
+
+// (W10b.IF) an interface's EFFECTIVE methods: (transitively) every extended interface's methods,
+// then its own. Each `extends` name must itself be an interface (find_interface_body enforces it).
+// Mirror of collect.tks::effective_interface_methods.
+static tk_methodsvec_result effective_interface_methods(tk_interface_body ib, tk_type_table table) {
+    tk_function *out = NULL; size_t n_out = 0;
+    for (size_t ei = 0; ei < ib.n_extends; ei += 1) {
+        ifacebody_result base_ib = find_interface_body(ib.extends[ei], table);
+        if (!base_ib.ok) return (tk_methodsvec_result){ .ok = false, .as.error = base_ib.as.error };
+        tk_methodsvec_result bm = effective_interface_methods(base_ib.as.value, table);
+        if (!bm.ok) return bm;
+        for (size_t bi = 0; bi < bm.as.value.len; bi += 1) tk_functions_push(&out, &n_out, bm.as.value.ptr[bi]);
+    }
+    for (size_t mi = 0; mi < ib.n_methods; mi += 1) tk_functions_push(&out, &n_out, ib.methods[mi]);
+    return (tk_methodsvec_result){ .ok = true, .as.value = { .ptr = out, .len = n_out } };
+}
+
+// (W10b.IF) does implementing method `impl_m` satisfy interface-required method `req`? Same NON-
+// receiver param types (both skip their 1st untyped receiver param) + same return type. Any type
+// that fails to resolve makes it a non-match. Mirror of collect.tks::method_sig_matches.
+static bool method_sig_matches(tk_function req, tk_function impl_m, tk_type_table table) {
+    size_t rstart = (req.nparams > 0 && !req.params[0].has_type) ? 1 : 0;
+    size_t istart = (impl_m.nparams > 0 && !impl_m.params[0].has_type) ? 1 : 0;
+    if (req.nparams - rstart != impl_m.nparams - istart) return false;
+    for (size_t k = 0; rstart + k < req.nparams; k += 1) {
+        tk_type_result rt = tk_resolve_type(req.params[rstart + k].type_ann, table);
+        if (!rt.ok) return false;
+        tk_type_result it = tk_resolve_type(impl_m.params[istart + k].type_ann, table);
+        if (!it.ok) return false;
+        if (!tk_type_eq(&rt.as.value, &it.as.value)) return false;
+    }
+    if (req.has_return != impl_m.has_return) return false;
+    if (req.has_return) {
+        tk_type_result rr = tk_resolve_type(req.return_type, table);
+        if (!rr.ok) return false;
+        tk_type_result ir = tk_resolve_type(impl_m.return_type, table);
+        if (!ir.ok) return false;
+        if (!tk_type_eq(&rr.as.value, &ir.as.value)) return false;
+    }
+    return true;
+}
+
+// (W10b.IF) THE CONFORMANCE CHECK. `members_all_public` = true for a STRUCT (members all-public,
+// so the AST `vis` is irrelevant); false for a CLASS (a class method must genuinely be `pub`/`exp`
+// to satisfy the public interface contract). Mirror of collect.tks::check_conformance.
+static tk_type_result check_conformance(tk_str type_name, const tk_function *own_methods, size_t n_own,
+                                        const tk_str *implements, size_t n_impl, tk_type_table table, bool members_all_public) {
+    for (size_t ii = 0; ii < n_impl; ii += 1) {
+        tk_str iname = implements[ii];
+        ifacebody_result ib = find_interface_body(iname, table);
+        if (!ib.ok) return (tk_type_result){ .ok = false, .as.error = ib.as.error };
+        tk_methodsvec_result req_methods = effective_interface_methods(ib.as.value, table);
+        if (!req_methods.ok) return (tk_type_result){ .ok = false, .as.error = req_methods.as.error };
+        for (size_t ri = 0; ri < req_methods.as.value.len; ri += 1) {
+            tk_function req = req_methods.as.value.ptr[ri];
+            bool found = false;
+            for (size_t mi = 0; mi < n_own; mi += 1) {
+                if (tk_str_eq(own_methods[mi].name, req.name)) {
+                    if (!method_sig_matches(req, own_methods[mi], table)) {
+                        size_t len = type_name.len + req.name.len + iname.len + 80; char *buf = tk_alloc(len); if (!buf) abort();
+                        snprintf(buf, len, "'%.*s' method '%.*s' does not match interface '%.*s's signature",
+                                 (int)type_name.len, (const char *)type_name.ptr, (int)req.name.len, (const char *)req.name.ptr, (int)iname.len, (const char *)iname.ptr);
+                        return (tk_type_result){ .ok = false, .as.error = tk_error_make(buf) };
+                    }
+                    if (!members_all_public && !(own_methods[mi].vis == TK_VIS_PUB || own_methods[mi].vis == TK_VIS_EXP)) {
+                        size_t len = type_name.len + req.name.len + iname.len + 80; char *buf = tk_alloc(len); if (!buf) abort();
+                        snprintf(buf, len, "'%.*s' method '%.*s' must be `pub` to satisfy interface '%.*s'",
+                                 (int)type_name.len, (const char *)type_name.ptr, (int)req.name.len, (const char *)req.name.ptr, (int)iname.len, (const char *)iname.ptr);
+                        return (tk_type_result){ .ok = false, .as.error = tk_error_make(buf) };
+                    }
+                    found = true; break;
+                }
+            }
+            if (!found) {
+                size_t len = type_name.len + iname.len + req.name.len + 80; char *buf = tk_alloc(len); if (!buf) abort();
+                snprintf(buf, len, "'%.*s' does not implement interface '%.*s' — missing method '%.*s'",
+                         (int)type_name.len, (const char *)type_name.ptr, (int)iname.len, (const char *)iname.ptr, (int)req.name.len, (const char *)req.name.ptr);
+                return (tk_type_result){ .ok = false, .as.error = tk_error_make(buf) };
+            }
+        }
+    }
+    return (tk_type_result){ .ok = true };
+}
+
 // (MEM Step 0, R4) ESCAPE GATE — a reference cannot be a struct FIELD, variant member, slice
 // element, or alias target. tk_resolve_type already rejects a Reference inside a slice/optional/
 // union (R4 there), so this catches the BARE-position cases: `struct { f: Ref<i64> }` and a
@@ -289,6 +391,9 @@ static tk_type_result validate_type_decls(tk_type_table table) {
                 if (r.as.value.tag == TK_TYPE_REF)
                     return (tk_type_result){ .ok = false, .as.error = tk_error_make("a reference cannot be stored in a struct/variant/collection") };
             }
+            tk_type_result cf = check_conformance(decl.name, body.as.struct_body.methods, body.as.struct_body.n_methods,   // (W10b.IF) struct members all-public
+                                                  body.as.struct_body.implements, body.as.struct_body.n_implements, table, true);
+            if (!cf.ok) return cf;
         } else if (body.tag == TK_BODY_ALIAS) {
             tk_type_result r = tk_resolve_type(body.as.alias_body.alias, tbl);
             if (!r.ok) return r;
@@ -303,6 +408,16 @@ static tk_type_result validate_type_decls(tk_type_table table) {
             }
             tk_type_result vr = validate_class_decl(body.as.class_body, table);   // (W10b.CLASS increment 2)
             if (!vr.ok) return vr;
+            // (W10b.IF) a class conforms via its EFFECTIVE methods (inherited base methods count).
+            tk_methodsvec_result eff = tk_effective_class_methods(body.as.class_body, table);
+            if (!eff.ok) return (tk_type_result){ .ok = false, .as.error = eff.as.error };
+            tk_type_result cf = check_conformance(decl.name, eff.as.value.ptr, eff.as.value.len,   // class methods need real `pub`
+                                                  body.as.class_body.implements, body.as.class_body.n_implements, table, false);
+            if (!cf.ok) return cf;
+        } else if (body.tag == TK_BODY_INTERFACE) {
+            // (W10b.IF) an interface's own `extends` names must each BE an interface (transitively).
+            tk_methodsvec_result em = effective_interface_methods(body.as.interface_body, table);
+            if (!em.ok) return (tk_type_result){ .ok = false, .as.error = em.as.error };
         }
     }
     return (tk_type_result){ .ok = true };

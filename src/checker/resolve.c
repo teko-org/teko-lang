@@ -325,6 +325,15 @@ tk_type_result resolve_named(tk_path path, tk_type_table table) {
             alias_depth -= 1;
             return r;
         }
+        // (W10b.IF) an interface is a COMPILE-TIME CONTRACT, not a value type — it has no runtime
+        // representation yet (dynamic dispatch = a later round). Reject it wherever a value type is
+        // expected (field/param/return/local): an honest stop, not a phantom NAMED.
+        if (ut.as.value.body.tag == TK_BODY_INTERFACE) {
+            size_t len = name.len + 128;
+            char *buf = tk_alloc(len); if (!buf) abort();
+            snprintf(buf, len, "'%.*s' is an interface and cannot be used as a value type yet (dynamic dispatch is a later round)", (int)name.len, (const char *)name.ptr);
+            return (tk_type_result){ .ok = false, .as.error = tk_error_make(buf) };
+        }
         tk_type t = { .tag = TK_TYPE_NAMED, .as.named.name = name };
         return (tk_type_result){ .ok = true, .as.value = t };
     }
