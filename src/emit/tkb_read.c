@@ -366,6 +366,12 @@ static tk_type_body read_typebody(tk_reader *r, tk_strs t) {
             tb.as.class_body.methods = NULL; tb.as.class_body.n_methods = 0;
             return tb;
         }
+        case 7: {   // (W10b.IF) extends names only — method sigs not serialized (same gap as struct/class methods)
+            tb.tag = TK_BODY_INTERFACE;
+            tb.as.interface_body.extends = read_strs(r, t, &tb.as.interface_body.n_extends);
+            tb.as.interface_body.methods = NULL; tb.as.interface_body.n_methods = 0;
+            return tb;
+        }
     }
     r->ok = false; return tb;
 }

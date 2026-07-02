@@ -182,6 +182,35 @@ pub fn find_class_body(name: str, table: TypeTable) -> parser::ClassBody | error
     }
 }
 
+// GUARD cyclic class inheritance BEFORE any recursive base-chain walk (effective_class_fields/
+// effective_class_methods/validate_class_decl) would recurse forever and crash (stack overflow).
+// Walk `name`'s base chain with a visited-set of the root→here PATH; a class name reappearing on
+// the path is a cycle (`class A B {} / class B A {}`, or the self-loop `class A A {}`), returned as
+// an honest error. Uses only the NON-recursive find_class_body lookup, so it terminates even on a
+// cycle. A base that is unknown / not-a-class STOPS the walk (validate_class_decl surfaces that
+// specific error). Mirrors the interface-cycle guard in effective_interface_methods.
+fn class_inheritance_acyclic(name: str, table: TypeTable) -> error? {
+    mut seen: []str = teko::list::push(teko::list::empty(), name)
+    mut cur = name
+    loop {
+        // a base that is unknown / not-a-class ends the walk cleanly (return null) — validate_class_decl
+        // surfaces that specific error. (`return null` here, not `break`: the self-hosted codegen does
+        // not support `break` inside a `match` used as a sub-expression.)
+        let cb = match find_class_body(cur, table) { parser::ClassBody as c => c; error => return null }
+        if !cb.has_base { break }
+        let b = cb.base_name
+        mut i = 0
+        loop {
+            if i >= seen.len { break }
+            if seen[i] == b { return error { message = $"cyclic class inheritance: '{b}' inherits from itself (directly or transitively)" } }
+            i++
+        }
+        seen = teko::list::push(seen, b)
+        cur = b
+    }
+    null
+}
+
 // (W10b.CLASS increment 2) a class's EFFECTIVE fields: the base's effective fields (recursively),
 // followed by its own — structural inheritance by field-flattening (composition, no embedded C
 // object/vtable yet). Used everywhere a class's data shape matters (construction, field access,
@@ -375,6 +404,121 @@ fn validate_class_decl(cb: parser::ClassBody, table: TypeTable) -> error? {
 // element, or alias target. `resolve_type` already rejects a Reference inside a slice/optional/
 // union (R4 there), so this catches the BARE-position cases: `struct { f: Ref<i64> }` and a
 // transparent alias `type R = Ref<i64>`. Runs once per program over every declared type body.
+// (W10b.IF) look up an interface body by name — error if the name is unknown or not an interface.
+pub fn find_interface_body(name: str, table: TypeTable) -> parser::InterfaceBody | error {
+    let decl = match type_table_find(table, name) { parser::TypeDecl as td => td; error => return error { message = $"unknown interface: {name}" } }
+    match decl.body {
+        parser::InterfaceBody as ib => ib
+        _               => return error { message = $"{name} is not an interface" }
+    }
+}
+
+// (W10b.IF) an interface's EFFECTIVE methods: (transitively) every extended interface's methods,
+// then its own. Each `extends` name must itself be an interface (find_interface_body enforces it).
+// `seen` = the interface names on the current root→here PATH — a name reappearing on the path is a
+// CYCLE (`interface A B { } / interface B A { }`), rejected as an honest error instead of recursing
+// forever (a diamond — the same interface reached via two DIFFERENT branches — is fine, since `seen`
+// tracks only the current path, not all-visited). Callers seed `seen` with the interface's OWN name.
+pub fn effective_interface_methods(ib: parser::InterfaceBody, table: TypeTable, seen: []str) -> []parser::Function | error {
+    mut out: []parser::Function = teko::list::empty()
+    mut ei = 0
+    loop {
+        if ei >= ib.extends.len { break }
+        let ename = ib.extends[ei]
+        mut si = 0
+        loop {
+            if si >= seen.len { break }
+            if seen[si] == ename { return error { message = $"cyclic interface `extends`: '{ename}' extends itself (directly or transitively)" } }
+            si++
+        }
+        let base_ib = match find_interface_body(ename, table) { parser::InterfaceBody as b => b; error as e => return e }
+        let bm = match effective_interface_methods(base_ib, table, teko::list::push(seen, ename)) { []parser::Function as f => f; error as e => return e }
+        mut bi = 0
+        loop { if bi >= bm.len { break }; out = teko::list::push(out, bm[bi]); bi++ }
+        ei++
+    }
+    mut mi = 0
+    loop { if mi >= ib.methods.len { break }; out = teko::list::push(out, ib.methods[mi]); mi++ }
+    out
+}
+
+// (W10b.IF) does implementing method `impl_m` satisfy interface-required method `req`? Same NON-
+// receiver param types (both skip their 1st untyped receiver param) + same return type. Any type
+// that fails to resolve makes it a non-match (the conformance error surfaces the missing/mismatched
+// method; the unresolved type surfaces separately via check_modules/normal resolution).
+fn method_sig_matches(req: parser::Function, impl_m: parser::Function, table: TypeTable) -> bool {
+    mut rstart: u64 = 0
+    if req.params.len > 0 && !req.params[0].has_type { rstart = 1 }
+    mut istart: u64 = 0
+    if impl_m.params.len > 0 && !impl_m.params[0].has_type { istart = 1 }
+    // instance/static parity: an INSTANCE interface method (has a receiver) must be satisfied by an
+    // INSTANCE method, not a same-named STATIC one (rstart/istart are 1 iff a receiver is present).
+    if rstart != istart { return false }
+    if req.params.len - rstart != impl_m.params.len - istart { return false }
+    mut k: u64 = 0
+    loop {
+        if rstart + k >= req.params.len { break }
+        let rt = match resolve_type(req.params[rstart + k].type_ann, table) { Type as t => t; error => return false }
+        let it = match resolve_type(impl_m.params[istart + k].type_ann, table) { Type as t => t; error => return false }
+        if !type_eq(rt, it) { return false }
+        k++
+    }
+    if req.has_return != impl_m.has_return { return false }
+    if req.has_return {
+        let rr = match resolve_type(req.return_type, table) { Type as t => t; error => return false }
+        let ir = match resolve_type(impl_m.return_type, table) { Type as t => t; error => return false }
+        if !type_eq(rr, ir) { return false }
+    }
+    true
+}
+
+// (W10b.IF) THE CONFORMANCE CHECK: `type_name` (a class or struct) must CONFORM to every interface
+// in `implements` — each name must BE an interface, and `own_methods` (a class's EFFECTIVE methods,
+// or a struct's own methods) must provide every method of each interface (transitively via extends)
+// by NAME, with a matching signature AND `pub` visibility (per the OOP design: `pub fn` is required
+// to satisfy an interface method).
+// `members_all_public` = true for a STRUCT (its members are all-public per W10b.0.A, so the AST
+// `vis` field is irrelevant); false for a CLASS (a class method must genuinely be `pub`/`exp` to
+// satisfy the public interface contract — a private method is not callable through the interface).
+fn check_conformance(type_name: str, own_methods: []parser::Function, implements: []str, table: TypeTable, members_all_public: bool) -> error? {
+    mut ii = 0
+    loop {
+        if ii >= implements.len { break }
+        let iname = implements[ii]
+        let ib = match find_interface_body(iname, table) { parser::InterfaceBody as b => b; error as e => return e }
+        let req_methods = match effective_interface_methods(ib, table, teko::list::push(teko::list::empty(), iname)) { []parser::Function as f => f; error as e => return e }
+        mut ri = 0
+        loop {
+            if ri >= req_methods.len { break }
+            let req = req_methods[ri]
+            mut found = false
+            mut mi = 0
+            loop {
+                if mi >= own_methods.len { break }
+                if own_methods[mi].name == req.name {
+                    if !method_sig_matches(req, own_methods[mi], table) {
+                        return error { message = $"'{type_name}' method '{req.name}' does not match interface '{iname}'s signature" }
+                    }
+                    if !members_all_public {
+                        match own_methods[mi].vis {
+                            parser::Visibility::Pub => {}
+                            parser::Visibility::Exp => {}
+                            _ => return error { message = $"'{type_name}' method '{req.name}' must be `pub` to satisfy interface '{iname}'" }
+                        }
+                    }
+                    found = true
+                    break
+                }
+                mi++
+            }
+            if !found { return error { message = $"'{type_name}' does not implement interface '{iname}' — missing method '{req.name}'" } }
+            ri++
+        }
+        ii++
+    }
+    null
+}
+
 fn validate_type_decls(table: TypeTable) -> error? {
     mut i = 0
     loop {
@@ -395,6 +539,7 @@ fn validate_type_decls(table: TypeTable) -> error? {
                     }
                     f++
                 }
+                match check_conformance(decl.name, sb.methods, sb.implements, table, true) { error as e => return e; null => {} }   // (W10b.IF) struct members all-public
             }
             parser::AliasBody as ab => {
                 match resolve_type(ab.alias, tbl) {
@@ -403,6 +548,7 @@ fn validate_type_decls(table: TypeTable) -> error? {
                 }
             }
             parser::ClassBody as cb => {   // (W10b.CLASS) same R4 escape-gate as a struct's fields
+                match class_inheritance_acyclic(decl.name, table) { error as e => return e; null => {} }   // guard cyclic inheritance BEFORE any recursive base-chain walk
                 mut f = 0
                 loop {
                     if f >= cb.fields.len { break }
@@ -413,6 +559,38 @@ fn validate_type_decls(table: TypeTable) -> error? {
                     f++
                 }
                 match validate_class_decl(cb, table) { error as e => return e; null => {} }   // (W10b.CLASS increment 2)
+                // (W10b.IF) a class conforms via its EFFECTIVE methods (inherited base methods count).
+                let eff = match effective_class_methods(cb, table) { []parser::Function as m => m; error as e => return e }
+                match check_conformance(decl.name, eff, cb.implements, table, false) { error as e => return e; null => {} }   // (W10b.IF) class methods need real `pub`
+            }
+            parser::InterfaceBody as ib => {
+                // (W10b.IF) an interface's OWN methods must be BODYLESS signatures — an interface is a
+                // pure contract; default method bodies are PROHIBITED by the design.
+                mut mi = 0
+                loop {
+                    if mi >= ib.methods.len { break }
+                    if ib.methods[mi].body.len > 0 { return error { message = $"interface method '{ib.methods[mi].name}' must be a bodyless signature (an interface is a pure contract — no default bodies)" } }
+                    mi++
+                }
+                // its `extends` names must each BE an interface (transitively) and not form a cycle
+                // (seed `seen` with this interface's own name).
+                let eff = match effective_interface_methods(ib, table, teko::list::push(teko::list::empty(), decl.name)) { []parser::Function as m => m; error as e => return e }
+                // no two EFFECTIVE methods (own + inherited) may share a name with a DIFFERENT signature
+                // — a redeclaration conflict, caught HERE (at the interface) with a clear message rather
+                // than later, confusingly, at an implementer. (Same name + same sig is legal — one method.)
+                mut a: u64 = 0
+                loop {
+                    if a >= eff.len { break }
+                    mut b: u64 = a + 1
+                    loop {
+                        if b >= eff.len { break }
+                        if eff[a].name == eff[b].name && !method_sig_matches(eff[a], eff[b], table) {
+                            return error { message = $"interface '{decl.name}' has conflicting signatures for method '{eff[a].name}' (an extended interface declares it differently)" }
+                        }
+                        b++
+                    }
+                    a++
+                }
             }
             _ => {}
         }

@@ -695,3 +695,32 @@ fn ref_value_position_struct_holds() {
     teko::assert::is_true(p.x == 42)       // the whole-replace reached the caller's `p`
     teko::assert::is_true(p.y == 2)        // y preserved
 }
+
+// (#47) str membership `s in [ … ]` compares CONTENT (tk_str_eq semantics, same as `==` on str),
+// not pointer identity — a runtime-built str must still match a literal element. Locks the VM
+// behavior the native codegen mirrors via tk_str_eq (issue #47).
+#test
+fn str_in_membership_holds() {
+    let method = "post"
+    teko::assert::is_true(method in ["get", "post"])            // literal-bound lhs
+    teko::assert::is_false("delete" in ["get", "post"])         // absent → false
+    let built = teko::str::concat("po", "st")                   // runtime-built content
+    teko::assert::is_true(built in ["get", "post"])             // content equality, not identity
+    teko::assert::is_false(built in [])                         // empty set → always false
+}
+
+// (#47) string-literal match patterns select by CONTENT equality — first matching arm wins,
+// wildcard catches the rest. Locks the VM behavior the native codegen mirrors via tk_str_eq
+// on the subject temp (issue #47).
+#test
+fn str_literal_match_holds() {
+    let one = match "build" { "build" => 1; "run" => 2; _ => 0 }
+    teko::assert::is_true(one == 1)
+    let two = match "run" { "build" => 1; "run" => 2; _ => 0 }
+    teko::assert::is_true(two == 2)
+    let zero = match "nope" { "build" => 1; "run" => 2; _ => 0 }
+    teko::assert::is_true(zero == 0)
+    let built = teko::str::concat("bu", "ild")                  // runtime-built subject
+    let bcode = match built { "build" => 1; _ => 0 }
+    teko::assert::is_true(bcode == 1)                           // content equality, not identity
+}
