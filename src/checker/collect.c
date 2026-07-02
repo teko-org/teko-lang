@@ -432,12 +432,58 @@ static tk_type_result check_conformance(tk_str type_name, const tk_function *own
     return (tk_type_result){ .ok = true };
 }
 
+// (#109 W0) `""` (top-level) reads as `<top-level>` in a duplicate-type diagnostic — mirrors
+// collect.tks::check_no_duplicate_types's `if ns == "" { "<top-level>" } else { ns }` ternary.
+static const char *ns_label_ptr(tk_str ns) { return ns.len == 0 ? "<top-level>" : (const char *)ns.ptr; }
+static int ns_label_len(tk_str ns) { return ns.len == 0 ? (int)strlen("<top-level>") : (int)ns.len; }
+
+// (#109 W0) fail-loud duplicate-registration ban — the first hardening step of the
+// namespace-aware type table redesign. Two errors, both O(n^2) over the collected table
+// (small — mirrors the interface-conflict scan below):
+//   1. same (namespace, name) registered twice = a real duplicate declaration.
+//   2. same BARE name registered under two DIFFERENT namespaces = TEMPORARILY banned (today's
+//      flat, namespace-blind lookups (tk_type_table_find et al.) would silently conflate the two —
+//      W3 lifts this ban once resolution becomes namespace-aware).
+// EXEMPT: stamped generic-instance entries (tk_name_is_g_instance, namespace "") — monomorphization
+// legitimately stamps many `Base__g__<mangle>` instances that share the "" namespace bucket with
+// every other stamped instance; that's not a user-facing collision, and stamping already dedups
+// by exact mangled name (resolve.c::tk_instantiate_types's "already stamped" check).
+// Mirror of collect.tks::check_no_duplicate_types.
+static tk_type_result check_no_duplicate_types(tk_type_table table) {
+    for (size_t i = 0; i < table.len; i += 1) {
+        if (tk_name_is_g_instance(table.ptr[i].name)) continue;
+        for (size_t j = i + 1; j < table.len; j += 1) {
+            if (tk_name_is_g_instance(table.ptr[j].name)) continue;
+            if (!tk_str_eq(table.ptr[i].name, table.ptr[j].name)) continue;
+            tk_str nm = table.ptr[i].name;
+            tk_str ns1 = table.ptr[i].namespace, ns2 = table.ptr[j].namespace;
+            if (tk_str_eq(ns1, ns2)) {
+                size_t len = nm.len + ns_label_len(ns1) + 64;
+                char *buf = tk_alloc(len); if (!buf) abort();
+                snprintf(buf, len, "duplicate type '%.*s' in namespace '%.*s'",
+                         (int)nm.len, (const char *)nm.ptr, ns_label_len(ns1), ns_label_ptr(ns1));
+                return (tk_type_result){ .ok = false, .as.error = tk_error_make(buf) };
+            } else {
+                size_t len = nm.len + ns_label_len(ns1) + ns_label_len(ns2) + 96;
+                char *buf = tk_alloc(len); if (!buf) abort();
+                snprintf(buf, len, "two types share the bare name '%.*s' — %.*s and %.*s; not yet supported (#109)",
+                         (int)nm.len, (const char *)nm.ptr,
+                         ns_label_len(ns1), ns_label_ptr(ns1), ns_label_len(ns2), ns_label_ptr(ns2));
+                return (tk_type_result){ .ok = false, .as.error = tk_error_make(buf) };
+            }
+        }
+    }
+    return (tk_type_result){ .ok = true };
+}
+
 // (MEM Step 0, R4) ESCAPE GATE — a reference cannot be a struct FIELD, variant member, slice
 // element, or alias target. tk_resolve_type already rejects a Reference inside a slice/optional/
 // union (R4 there), so this catches the BARE-position cases: `struct { f: Ref<i64> }` and a
 // transparent alias `type R = Ref<i64>`. Runs once per program over every declared type body.
 // Mirror of collect.tks::validate_type_decls. Returns ok=true on success; ok=false carries the error.
 static tk_type_result validate_type_decls(tk_type_table table) {
+    tk_type_result dup = check_no_duplicate_types(table);   // (#109 W0)
+    if (!dup.ok) return dup;
     for (size_t i = 0; i < table.len; i += 1) {
         tk_type_decl decl = table.ptr[i].decl;
         // (S4) the decl's own generic type-params, opaque, in scope — so a generic body field `T`

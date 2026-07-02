@@ -2605,3 +2605,69 @@ fn iface_variant_member_is_error() {
         error    => teko::assert::is_true(true)
     }
 }
+
+// (#109 W0) an empty-struct-body TypeDecl named `name`, wrapped as an Item under `namespace`.
+fn w0_empty_struct_item(name: str, namespace: str) -> parser::Item {
+    let td = parser::TypeDecl { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::StructBody { fields = teko::list::empty(); methods = teko::list::empty(); implements = teko::list::empty() }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }
+    parser::Item { content = td; namespace = namespace; file = "" }
+}
+
+// (#109 W0) registering the SAME (namespace, name) twice — e.g. two files both declaring
+// `namespace aa { type Reader = struct {} }` — is a real duplicate declaration, now a compile
+// error (today it silently shadowed: first-match-wins in the flat table).
+#test
+fn w0_duplicate_same_namespace_and_name_is_error() {
+    let items = teko::list::push(teko::list::push(teko::list::empty(), w0_empty_struct_item("Reader", "aa")), w0_empty_struct_item("Reader", "aa"))
+    match collect(parser::Program { items = items }) {
+        Collected => teko::assert::is_true(false)   // must fail
+        error as e => {
+            teko::assert::is_true(true)
+            teko::assert::is_true(teko::str::contains(e.message, "duplicate type"))
+            teko::assert::is_true(teko::str::contains(e.message, "Reader"))
+        }
+    }
+}
+
+// (#109 W0) the ratified design's P1 probe: `aa::Reader` and `bb::Reader` — same bare name,
+// DIFFERENT namespaces. Today's flat, namespace-blind type table silently conflates the two
+// (first-match-wins misresolution); W0 converts that incident class into a fail-loud compile
+// error naming BOTH namespaces, until W3's namespace-aware resolution lifts the ban.
+#test
+fn w0_cross_namespace_bare_name_duplicate_is_error() {
+    let items = teko::list::push(teko::list::push(teko::list::empty(), w0_empty_struct_item("Reader", "aa")), w0_empty_struct_item("Reader", "bb"))
+    match collect(parser::Program { items = items }) {
+        Collected => teko::assert::is_true(false)   // must fail
+        error as e => {
+            teko::assert::is_true(true)
+            teko::assert::is_true(teko::str::contains(e.message, "two types share the bare name"))
+            teko::assert::is_true(teko::str::contains(e.message, "Reader"))
+            teko::assert::is_true(teko::str::contains(e.message, "aa"))
+            teko::assert::is_true(teko::str::contains(e.message, "bb"))
+            teko::assert::is_true(teko::str::contains(e.message, "#109"))
+        }
+    }
+}
+
+// (#109 W0) top-level (namespace "") duplicate reads as "<top-level>" in the diagnostic, not an
+// empty/blank namespace label.
+#test
+fn w0_duplicate_top_level_names_top_level_in_message() {
+    let items = teko::list::push(teko::list::push(teko::list::empty(), w0_empty_struct_item("Widget", "")), w0_empty_struct_item("Widget", ""))
+    match collect(parser::Program { items = items }) {
+        Collected => teko::assert::is_true(false)   // must fail
+        error as e => teko::assert::is_true(teko::str::contains(e.message, "<top-level>"))
+    }
+}
+
+// (#109 W0) the ban must NOT false-positive on distinct types in distinct namespaces (the
+// ordinary, legitimate case), nor on same-name-same-namespace when there is only ONE decl.
+#test
+fn w0_distinct_namespaces_distinct_names_still_collect_ok() {
+    mut items = teko::list::push(teko::list::empty(), w0_empty_struct_item("Reader", "aa"))
+    items = teko::list::push(items, w0_empty_struct_item("Writer", "aa"))
+    items = teko::list::push(items, w0_empty_struct_item("Reader2", "bb"))
+    match collect(parser::Program { items = items }) {
+        Collected => teko::assert::is_true(true)
+        error    => teko::assert::is_true(false)
+    }
+}
