@@ -129,29 +129,39 @@ jobs:
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
         run: ./build-asan-portable/teko test . --coverage
 
-  # ── TSan (Thread Sanitizer) ───────────────────────────────────────────────────
-  # Reliability note (issue #127): `teko test` is 100% single-threaded — there is
-  # ZERO pthread/thread/atomic in src/ (verified by grep), so TSan has no race to
-  # find and never emits a SUMMARY/data-race report. The intermittent exit-143
-  # (silent SIGTERM) that blocked unrelated PRs (#125, #126) was NOT a data race
-  # and NOT a deadlock: the suite completes cleanly and deterministically (614/614)
-  # both locally under `-fsanitize=thread` and on healthy hosted runners (the
-  # "Run tests (TSan)" step is a stable ~52s there). The flake was a RESOURCE/SLOWNESS
-  # kill: TSan is the slowest lane (~2x the ASan lanes for the same ~5.3 GB RSS), and
-  # on a transiently-degraded/contended runner (the failing runs had queued ~47 min
-  # in a busy pool) that stretched window crossed the runner's resource-kill boundary
-  # mid-suite — a silent SIGTERM at an ARBITRARY test (it stalled at three different
-  # tests across runs), never at the 15-min job timeout. The fix shrinks the exposure
-  # window and makes any residual stall FAIL LOUD instead of dying silently:
-  #   1. drop `--coverage` here — it is pure redundant cost on this lane (coverage is
-  #      already validated by BOTH ASan lanes + Windows stress); removing it cuts the
-  #      TSan run ~36% (~55s → ~36s), moving it into the passing ASan lanes' envelope.
-  #   2. bound TSan's memory (history_size/memory_limit_mb/flush_memory_ms) so a
-  #      memory-tight runner flushes rather than growing into an OOM kill.
-  #   3. wrap the run in `timeout` (coreutils, always on ubuntu-latest) with a generous
-  #      600s guard — a healthy run is ~36s, so even a 10x-degraded runner completes;
-  #      if it ever DID stall, it now exits 124 with a clear timeout message at a known
-  #      bound instead of a mysterious SIGTERM-143. Job timeout kept at 15 min as backstop.
+  # ── TSan (Thread Sanitizer): BUILD + SMOKE ────────────────────────────────────
+  # TSan runs build + smoke while the codebase is single-threaded (TSan finds no races
+  # without threads; ASan+UBSan run the full suite). RESTORE the full `teko test .`
+  # gate under TSan INCREMENTALLY as the concurrency surface lands — async/await,
+  # routines, teko::threading::run, parallelism, channels, teko::sync (S8/ASYNC,
+  # ROUND 5). Mandatory checklist item on every concurrency PR.
+  #
+  # Rationale (user-ratified, supersedes issue #127's full-suite-under-TSan approach):
+  # the test path is 100% SINGLE-THREADED today — ZERO pthread/thread/atomic/spawn in
+  # src/ (verified by grep). With no threads, TSan has no race to find: running the full
+  # 614-test suite under `-fsanitize=thread` produces NO additional coverage over the
+  # ASan+UBSan lanes (which DO run the full suite and pass) and only exposes the suite
+  # to environmental flake — the intermittent exit-143 (silent SIGTERM) that blocked
+  # unrelated PRs (#125, #126) was a RESOURCE/SLOWNESS kill on the slowest lane, never a
+  # data race or deadlock (the suite completes cleanly and deterministically both locally
+  # and on healthy runners). This is NOT a quarantine and loses NO real coverage: right-
+  # sizing the lane to BUILD + a race-clean SMOKE keeps exactly what TSan can still
+  # meaningfully assert on a single-threaded codebase, while removing the redundant,
+  # flake-prone full run.
+  #
+  # What still runs here:
+  #   1. BUILD the compiler under `-fsanitize=thread` — this catches TSan-build breakage
+  #      (instrumentation/flag incompatibilities) the moment it is introduced, so the day
+  #      threading lands the TSan toolchain is already known-good.
+  #   2. SMOKE: use the TSan-built `teko` to BUILD one small existing regression fixture
+  #      (examples/regressions/exit_success_path) and RUN the produced binary, asserting
+  #      its deterministic exit code (5). This proves the runtime executes race-clean
+  #      under TSan end-to-end (front-end -> C -> host cc -> execute) on a real program
+  #      that does actual work (a cross-file loop + a call-through-function-value closure).
+  # The #128 reliability guards are kept on the smoke run: the `timeout` wrapper makes any
+  # residual stall FAIL LOUD (exit 124) at a known bound instead of a silent SIGTERM (143),
+  # and the bounded TSAN_OPTIONS keep TSan correct for FUTURE threading bugs while capping
+  # its footprint. Job timeout kept at 15 min as backstop.
   tsan:
     name: TSan
     needs: changes
@@ -178,18 +188,42 @@ jobs:
             -DCMAKE_BUILD_TYPE=Debug \
             -DCMAKE_C_FLAGS="-fsanitize=thread -fno-omit-frame-pointer -g"
 
-      - name: Build teko
+      - name: Build teko (TSan)
         run: cmake --build build-tsan --target teko --parallel 4
 
-      # No `--coverage` here (see issue-#127 note above): coverage is validated on the
-      # ASan lanes + Windows stress; on TSan it is redundant cost. `timeout` makes a stall
-      # fail loud (exit 124) at a known bound instead of a silent runner SIGTERM (143).
-      - name: Run tests (TSan)
+      # SMOKE (not the full suite — see the BUILD + SMOKE rationale above; RESTORE the
+      # full `teko test .` gate under TSan as the concurrency surface lands). Build ONE
+      # tiny race-clean fixture with the TSan-built compiler and RUN it, asserting the
+      # fixture's deterministic exit code (5). `timeout` (coreutils, always on
+      # ubuntu-latest) makes any stall fail loud (exit 124) at a known bound instead of a
+      # silent runner SIGTERM (143); bounded TSAN_OPTIONS cap the footprint on a
+      # memory-tight runner while staying correct for FUTURE threading bugs.
+      - name: Smoke (TSan build+run of one regression fixture)
         env:
           # Single-threaded workload: keep TSan correct for FUTURE threading bugs, but
           # bound its footprint so a memory-tight runner flushes instead of OOM-killing.
           TSAN_OPTIONS: halt_on_error=1:history_size=2:memory_limit_mb=6000:flush_memory_ms=2000
-        run: timeout --kill-after=30s 600s ./build-tsan/teko test .
+        run: |
+          set -euo pipefail
+          out="$(mktemp -d)"
+          proj="examples/regressions/exit_success_path"   # tiny; deterministically exits 5
+          echo "== teko build $proj (TSan)"
+          timeout --kill-after=30s 600s ./build-tsan/teko build "$proj" -o "$out" | tee build.log
+          bin="$(sed -n 's/.*: built //p' build.log | tail -n1)"
+          if [ -z "$bin" ] || [ ! -x "$bin" ]; then
+            echo "ERROR: could not locate the built binary from the TSan build output." >&2
+            exit 1
+          fi
+          echo "== run $bin (TSan) — expecting deterministic exit code 5"
+          set +e
+          timeout --kill-after=30s 600s "$bin"
+          code=$?
+          set -e
+          if [ "$code" -ne 5 ]; then
+            echo "ERROR: TSan smoke run exited $code, expected 5 (race/abort/timeout/divergence)." >&2
+            exit 1
+          fi
+          echo "TSan smoke passed: build + run race-clean, exit code 5 as expected."
 
   # ── Windows stress: run tests 20 times ───────────────────────────────────────
   # NOTE: Uses Clang + Ninja (not MSVC) because the project requires __int128.
