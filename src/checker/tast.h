@@ -108,7 +108,10 @@ struct tk_texpr {
         // Enum::Member as a VALUE (E#/value-level enum paths). `.type` is the NAMED enum; the
         // checker resolves the enum decl + member ORDINAL so both backends lower without re-lookup:
         // codegen → the C constant `TK_E_<UPPER enum_name>_<UPPER member>`; VM → the ordinal int.
-        struct { tk_str enum_name; tk_str member; uint64_t ordinal; }  path;
+        // (#50) `value` is the checker-RESOLVED member value — the ordinal for an enum member,
+        // `1 << ordinal` (power-of-2, u128 cap) for a flags member — so the VM reads the value
+        // instead of recomputing it (native codegen's pre-emitted constants already encode it).
+        struct { tk_str enum_name; tk_str member; uint64_t ordinal; unsigned __int128 value; }  path;
         // [ e0, e1, … ] (Increment B+) — `.type` is []T; each element is a typed texpr already
         // adopted into the element type T, so both backends build the same `[]T` value.
         // A spread element (`..xs`) carries is_spread=true and was checked against []T; the spread

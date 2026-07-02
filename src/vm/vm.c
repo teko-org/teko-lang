@@ -452,17 +452,31 @@ static tk_value norm_int(unsigned __int128 raw, bool is_signed, int width) {
     return v_int(bits, is_signed, width);
 }
 
+// (#50) fwd — defined after g_prog (it scans the program's type decls). The VM's NUMERIC-path
+// rule for a NAMED type: a `flags`-declared name computes at its unsigned CARRIER prim; any
+// other Named is the enum-ordinal u64 (E7). Mirrors vm.tks's num_prim_of.
+static bool flags_carrier_prim(tk_str name, tk_prim_kind *out);
+static tk_prim_kind named_num_prim(tk_str name) {
+    tk_prim_kind fp;
+    if (flags_carrier_prim(name, &fp)) return fp;   // (C8.3/#50) flags → its carrier prim
+    return TK_PRIM_U64;                             // E7: enum ordinal — checker validated; stored as u64
+}
+
 // Pull the integer prim out of a node's resolved type (the node IS int-typed by the
 // checker at every use site below). A non-prim/non-int there is an internal invariant
-// break, reported honestly.
+// break, reported honestly. (#50) A NAMED type computes via named_num_prim (a flags value
+// at its carrier prim, an enum at the ordinal u64) — same rule as vm.tks's num_prim_of.
 static tk_prim_kind expr_int_prim(const tk_texpr *e, const char *ctx) {
+    if (e->type.tag == TK_TYPE_NAMED) return named_num_prim(e->type.as.named.name);
     if (e->type.tag != TK_TYPE_PRIM || !prim_is_int(e->type.as.prim)) vm_unsupported(ctx);
     return e->type.as.prim;
 }
 
 // Pull the NUMERIC prim (int OR float) out of a node's resolved type — for arithmetic
 // nodes that may be either. A non-prim/non-numeric there is an internal invariant break.
+// (#50) A NAMED type computes via named_num_prim (flags carrier / enum-ordinal u64).
 static tk_prim_kind expr_num_prim(const tk_texpr *e, const char *ctx) {
+    if (e->type.tag == TK_TYPE_NAMED) return named_num_prim(e->type.as.named.name);
     if (e->type.tag != TK_TYPE_PRIM
         || !(prim_is_int(e->type.as.prim) || prim_is_float(e->type.as.prim)))
         vm_unsupported(ctx);
@@ -553,6 +567,27 @@ static bool vm_str_eq(tk_str a, tk_str b) {
 
 // The whole program (so a call expr can find a top-level function by name).
 static tk_tprogram g_prog;
+
+// (#50) flags carrier prim — a NAMED type whose decl is a `flags` computes at the unsigned
+// width native codegen chose by MEMBER COUNT (1–8 → u8, 9–16 → u16, 17–32 → u32, 33–64 → u64,
+// 65–128 → u128; codegen's TK_BODY_FLAGS uint_type). True + *out iff `name` IS a flags decl.
+// Mirrors vm.tks's flags_carrier_prim.
+static bool flags_carrier_prim(tk_str name, tk_prim_kind *out) {
+    for (size_t i = 0; i < g_prog.nitems; i += 1) {
+        if (g_prog.items[i].tag != TK_TITEM_TYPE_DECL) continue;
+        tk_type_decl td = g_prog.items[i].as.type_decl;
+        if (!name_eq(td.name, name)) continue;
+        if (td.body.tag != TK_BODY_FLAGS) return false;
+        size_t n = td.body.as.flags_body.n_members;
+        *out = n <=  8 ? TK_PRIM_U8
+             : n <= 16 ? TK_PRIM_U16
+             : n <= 32 ? TK_PRIM_U32
+             : n <= 64 ? TK_PRIM_U64
+             :           TK_PRIM_U128;
+        return true;
+    }
+    return false;
+}
 
 // (C7.18) Per-call-frame defer stack: a simple linked list of deferred blocks.
 // Pushed as exec_stmt encounters TK_TSTMT_DEFER; drained LIFO at function exit.
@@ -1265,7 +1300,12 @@ static tk_value eval_binary(const tk_texpr *e, tk_venv *env) {
 
     // +,-,*,&,|,^,<<,>> — plain fixed-width arithmetic (overflow guarding DEFERRED to
     // build profiles, exactly as codegen leaves +,-,* as plain C — out of scope here).
+    // #49 — shift counts are masked by the LEFT OPERAND's bit-width minus 1 (C#/Java
+    // semantics), NOT a fixed 127: `(1 as i32) << 40` masks to `<< 8` (width=32 -> &31),
+    // matching codegen's tk_shl_*/tk_shr_* runtime helpers exactly. In-range counts are
+    // unaffected (mask is a no-op when count < width).
     unsigned __int128 a = v_as_u128(lv), b = v_as_u128(rv), raw;
+    unsigned shift_mask = (unsigned)(width - 1);
     switch (op) {
         case TK_TOKEN_PLUS:  raw = a + b; break;
         case TK_TOKEN_MINUS: raw = a - b; break;
@@ -1273,10 +1313,10 @@ static tk_value eval_binary(const tk_texpr *e, tk_venv *env) {
         case TK_TOKEN_AMP:   raw = a & b; break;
         case TK_TOKEN_PIPE:  raw = a | b; break;
         case TK_TOKEN_CARET: raw = a ^ b; break;
-        case TK_TOKEN_SHL:   raw = a << (b & 127); break;
+        case TK_TOKEN_SHL:   raw = a << (b & shift_mask); break;
         case TK_TOKEN_SHR:
-            if (is_signed) raw = (unsigned __int128)(v_as_i128(lv) >> (b & 127));
-            else           raw = a >> (b & 127);
+            if (is_signed) raw = (unsigned __int128)(v_as_i128(lv) >> (b & shift_mask));
+            else           raw = a >> (b & shift_mask);
             break;
         default: vm_unsupported("binary operator not yet supported");
     }
@@ -1398,7 +1438,8 @@ static bool cast_prim_of(tk_type t, tk_prim_kind *out) {
     if (t.tag == TK_TYPE_PRIM) { *out = t.as.prim; return true; }
     if (t.tag == TK_TYPE_BYTE) { *out = TK_PRIM_U8; return true; }
     // E7: enum→int/byte — checker already validated; enum ordinals are stored as u64 in the VM.
-    if (t.tag == TK_TYPE_NAMED) { *out = TK_PRIM_U64; return true; }
+    // (#50) a flags-typed Named computes at its carrier prim (same rule as expr_num_prim).
+    if (t.tag == TK_TYPE_NAMED) { *out = named_num_prim(t.as.named.name); return true; }
     return false;
 }
 
@@ -2148,6 +2189,13 @@ static tk_value tk_vm_eval_expr(const tk_texpr *e, tk_venv *env) {
             // TK_TYPE_BYTE (`byte` type) is like u8 — an unsigned 8-bit integer literal.
             if (e->type.tag == TK_TYPE_BYTE)
                 return v_int((unsigned __int128)(uint8_t)e->as.number.value, false, 8);
+            // (#50) a FLAGS-typed number literal — the checker's fabricated zero in the any/none
+            // lowering (type_flags_method) — computes at the flags carrier prim (unsigned).
+            if (e->type.tag == TK_TYPE_NAMED) {
+                tk_prim_kind fp;
+                if (flags_carrier_prim(e->type.as.named.name, &fp))
+                    return v_int((unsigned __int128)e->as.number.value, false, prim_width(fp));
+            }
             if (e->type.tag != TK_TYPE_PRIM)
                 vm_unsupported("number literal with a non-primitive type not yet supported");
             tk_prim_kind k = e->type.as.prim;
@@ -2177,7 +2225,15 @@ static tk_value tk_vm_eval_expr(const tk_texpr *e, tk_venv *env) {
         case TK_TEXPR_STR:  return v_str(e->as.str.text);
         case TK_TEXPR_BYTE: return v_int((uint64_t)e->as.byte.value, false, 8);   // byte == u8 rep
         case TK_TEXPR_CHAR: return v_str(e->as.char_lit.bytes);   // char — the codepoint's UTF-8 bytes (same str carrier; distinct by the checker tag, VM==native)
-        case TK_TEXPR_PATH: return v_int((unsigned __int128)e->as.path.ordinal, false, 64);   // Enum::Member → its ordinal (u64); codegen's C enum auto-numbers identically
+        case TK_TEXPR_PATH: {
+            // (#50) Type::Member → the checker-RESOLVED member value (enum: the ordinal, u64 —
+            // codegen's C enum auto-numbers identically; flags: 1 << ordinal at the carrier width —
+            // codegen's pre-emitted power-of-2 constants). No recompute — read the stored value.
+            tk_prim_kind fp;
+            if (e->type.tag == TK_TYPE_NAMED && flags_carrier_prim(e->type.as.named.name, &fp))
+                return v_int(e->as.path.value, false, prim_width(fp));
+            return v_int(e->as.path.value, false, 64);
+        }
 
         // bool literal (W2) — FULL support (bool already flows through the value model).
         case TK_TEXPR_BOOL: return v_bool(e->as.boolean.value);
@@ -2367,6 +2423,9 @@ static tk_value compound_apply(tk_value old, tk_token_kind op, tk_value rhs, con
         vm_unsupported("compound assignment on a non-integer value not yet supported");
     bool sgn = old.as.i.is_signed; int w = old.as.i.width;
     uint64_t a = old.as.i.bits, b = rhs.as.i.bits, raw;
+    // #49 — mask the shift count by the LEFT (target slot's) width - 1, not a fixed 63;
+    // mirrors the eval_binary SHL/SHR fix above (same C#/Java-style semantics).
+    unsigned shift_mask = (unsigned)(w - 1);
     switch (op) {
         case TK_TOKEN_PLUSEQ:  raw = a + b; break;
         case TK_TOKEN_MINUSEQ: raw = a - b; break;
@@ -2374,8 +2433,8 @@ static tk_value compound_apply(tk_value old, tk_token_kind op, tk_value rhs, con
         case TK_TOKEN_AMPEQ:   raw = a & b; break;
         case TK_TOKEN_PIPEEQ:  raw = a | b; break;
         case TK_TOKEN_CARETEQ: raw = a ^ b; break;
-        case TK_TOKEN_SHLEQ:   raw = a << (b & 63); break;
-        case TK_TOKEN_SHREQ:   raw = sgn ? (uint64_t)((int64_t)a >> (b & 63)) : (a >> (b & 63)); break;
+        case TK_TOKEN_SHLEQ:   raw = a << (b & shift_mask); break;
+        case TK_TOKEN_SHREQ:   raw = sgn ? (uint64_t)((int64_t)a >> (b & shift_mask)) : (a >> (b & shift_mask)); break;
         case TK_TOKEN_SLASHEQ:
         case TK_TOKEN_PERCENTEQ: {
             bool isdiv = (op == TK_TOKEN_SLASHEQ);

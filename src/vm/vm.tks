@@ -1412,10 +1412,17 @@ fn float_val(f: f64, width: u8) -> Value {
 // num_of_prim — a literal NUMBER node → a concrete Value at the node's prim (mirror of vm.c's
 // TK_TEXPR_NUMBER case): a float literal → float_val at the prim width; a bool prim → a bool Value;
 // an int literal → norm_int (width/sign-correct, incl 128). The checker guarantees the kind.
-fn num_of_prim(n: checker::TNumber, t: checker::Type) -> Value {
+fn num_of_prim(n: checker::TNumber, t: checker::Type, prog: checker::TProgram) -> Value {
     let k = match t {
         checker::Prim as p => p.kind
         checker::Byte      => checker::PrimKind::U8   // `byte` literal → u8
+        // (#50) a FLAGS-typed number literal — the checker's fabricated zero in the any/none
+        // lowering (type_flags_method) — computes at the flags carrier prim (unsigned).
+        checker::Named as nm => {
+            let cnt = flags_member_count(prog, nm.name)
+            if cnt == 0 { panic("vm: number literal with a non-primitive type not yet supported") }
+            flags_carrier_of(cnt)
+        }
         _                  => panic("vm: number literal with a non-primitive type not yet supported")
     }
     if n.is_float {
@@ -1787,7 +1794,7 @@ fn eval_expr(e: checker::TExpr, env: Venv) -> EvalRes {
     }
     match e.kind {
         // Leaf reads — pure, env unchanged. (MEM Step 4: every non-call leaf threads `env` back as-is.)
-        checker::TNumber as n   => EvalRes { value= num_of_prim(n, e.type); env= env }   // a concrete u8…i128 / f16…f64 from the node's type (float iff n.is_float)
+        checker::TNumber as n   => EvalRes { value= num_of_prim(n, e.type, env.prog); env= env }   // a concrete u8…i128 / f16…f64 from the node's type (float iff n.is_float)
         // (W10a) a bare top-level-fn reference used as a VALUE → a FuncVal (no captured env). A plain
         // local/param reads its bound value (cell-backed reads thread through the cell).
         checker::TVar as v      => if v.is_func { EvalRes { value= FuncVal { is_lambda= false; ns= v.func_ns; name= v.name; params= teko::list::empty(); body= teko::list::empty(); cap_names= teko::list::empty(); cap_vals= teko::list::empty() }; env= env } } else { EvalRes { value= read_var(env, v.name); env= env } }
@@ -1836,8 +1843,10 @@ fn eval_expr(e: checker::TExpr, env: Venv) -> EvalRes {
         checker::TInterp as in => eval_interp(in, env)
         // Phase 2 — `<lhs> in [ … ]`: true iff lhs (single-eval) value_eq's any element.
         checker::TInExpr as ie => eval_in(ie, env)
-        // Enum::Member as a VALUE → its ordinal (u64); the C twin's C enum auto-numbers identically.
-        checker::TPathExpr as pe => EvalRes { value= pe.ordinal; env= env }
+        // (#50) Type::Member as a VALUE → the checker-RESOLVED member value (enum: the ordinal,
+        // u64 — the C twin's C enum auto-numbers identically; flags: 1 << ordinal at the carrier
+        // width) — see path_value. Mirrors vm.c's TK_TEXPR_PATH case.
+        checker::TPathExpr as pe => EvalRes { value= path_value(pe, e.type, env.prog); env= env }
         // null / ?. / ?? — the OPTIONAL value model (OptVal — REBOOT_PLAN §202/§203).
         // null is NONE; the destination's wrap (coerce_to) makes it a concrete `T?`.
         checker::TNullLit            => EvalRes { value= OptVal { present = false; inner = null }; env= env }
@@ -1959,16 +1968,76 @@ fn coerce_to(v: Value, t: checker::Type) -> Value {
     }
 }
 
+// (#50) flags member count — the number of members of the `flags` decl named `name`, or 0 when
+// `name` is not a flags decl. The count picks the flags CARRIER prim (see flags_carrier_of).
+// Mirrors vm.c's flags_carrier_prim (there: bool + out-prim; here: count, 0 = not flags — the
+// .tks checker has no type-name pattern for an optional enum, so the count IS the discriminant).
+fn flags_member_count(prog: checker::TProgram, name: str) -> u64 {
+    mut i = 0
+    loop {
+        if i >= prog.items.len { break }
+        match prog.items[i] {
+            parser::TypeDecl as td => {
+                if td.name == name {
+                    match td.body {
+                        parser::FlagsBody as fb => return fb.members.len
+                        _ => return 0
+                    }
+                }
+            }
+            _ => {}
+        }
+        i++
+    }
+    0
+}
+
+// (#50) flags carrier prim by MEMBER COUNT — the unsigned width native codegen chose (1–8 → u8,
+// 9–16 → u16, 17–32 → u32, 33–64 → u64, 65–128 → u128; codegen's FlagsBody uint_type).
+fn flags_carrier_of(n: u64) -> checker::PrimKind {
+    if n <= 8  { return checker::PrimKind::U8 }
+    if n <= 16 { return checker::PrimKind::U16 }
+    if n <= 32 { return checker::PrimKind::U32 }
+    if n <= 64 { return checker::PrimKind::U64 }
+    checker::PrimKind::U128
+}
+
+// (#50) Type::Member → the checker-RESOLVED member value (enum: the ordinal as a u64 — the C
+// twin's C enum auto-numbers identically; flags: 1 << ordinal at the carrier width — native's
+// pre-emitted power-of-2 constants). No recompute — read the stored value. Mirrors vm.c's
+// TK_TEXPR_PATH case. The checked casts always fit: the checker caps a flags value below the
+// carrier's width and an enum ordinal below the member count.
+fn path_value(pe: checker::TPathExpr, t: checker::Type, prog: checker::TProgram) -> Value {
+    match t {
+        checker::Named as nm => {
+            let n = flags_member_count(prog, nm.name)
+            if n == 0 { return pe.value to u64 }   // enum: the ordinal (u64)
+            let w = prim_width(flags_carrier_of(n))
+            if w == 8       { pe.value to u8 }
+            else if w == 16 { pe.value to u16 }
+            else if w == 32 { pe.value to u32 }
+            else if w == 64 { pe.value to u64 }
+            else            { pe.value }           // 128: the value IS the u128 Value
+        }
+        _ => pe.value to u64
+    }
+}
+
 // num_prim_of — the EFFECTIVE numeric prim of a type endpoint: a Prim is itself; a `byte` is U8
-// (B.36 — byte is a u8 newtype, the same effective kind the checker's cast_kind uses). Any other
-// type (str/named/…) is the honest non-numeric frontier — a loud internal stop (M.3). Mirrors
-// vm.c's `cast_prim_of` (which returns false there; here a non-numeric reaching arithmetic/cast
-// is an invariant break the checker should have rejected, so we panic).
-fn num_prim_of(t: checker::Type) -> checker::PrimKind {
+// (B.36 — byte is a u8 newtype, the same effective kind the checker's cast_kind uses). (#50) A
+// NAMED type is its flags CARRIER prim when its decl is a `flags`, else the enum-ordinal U64
+// (E7) — the same rule as vm.c's expr_num_prim/expr_int_prim/cast_prim_of. Any other type
+// (str/…) is the honest non-numeric frontier — a loud internal stop (M.3): a non-numeric
+// reaching arithmetic/cast is an invariant break the checker should have rejected.
+fn num_prim_of(t: checker::Type, prog: checker::TProgram) -> checker::PrimKind {
     match t {
         checker::Prim as p => p.kind
         checker::Byte      => checker::PrimKind::U8
-        checker::Named     => checker::PrimKind::U64  // E7: enum ordinal — checker validated; stored as u64
+        checker::Named as nm => {
+            let n = flags_member_count(prog, nm.name)
+            if n > 0 { flags_carrier_of(n) }          // (#50) flags → its carrier prim
+            else     { checker::PrimKind::U64 }       // E7: enum ordinal — checker validated; stored as u64
+        }
         _                  => panic("vm: arithmetic/cast on a non-numeric type not yet supported")
     }
 }
@@ -1979,8 +2048,11 @@ fn num_prim_of(t: checker::Type) -> checker::PrimKind {
 // truncates via norm_int, so the carrier's extension is irrelevant for +,-,*,&,|,^,<< (only the
 // low `width` bits survive). For `>>`, `as_int` already sign/zero-extended the operand to i128, so
 // an arithmetic shift on that carrier reproduces both the signed (arithmetic) and unsigned
-// (logical) C shift. Shift counts are masked `& 127` exactly like the C twin.
+// (logical) C shift. #49 — shift counts are masked by `w - 1` (the LEFT operand's own bit-width
+// minus 1, C#/Java semantics), NOT a fixed 127: `w` is the caller's already-resolved left-operand
+// width (mirrors codegen's tk_shl_*/tk_shr_* runtime helpers exactly, same fix as the C twin).
 fn apply_int_op(op: lexer::TokenKind, l: i128, r: i128, sgn: bool, w: u8) -> i128 {
+    let mask = (w to i128) - 1
     match op {
         Plus  => l + r
         Minus => l - r
@@ -1988,8 +2060,8 @@ fn apply_int_op(op: lexer::TokenKind, l: i128, r: i128, sgn: bool, w: u8) -> i12
         Amp   => l & r
         Pipe  => l | r
         Caret => l ^ r
-        Shl   => l << (r & 127)
-        Shr   => l >> (r & 127)
+        Shl   => l << (r & mask)
+        Shr   => l >> (r & mask)
         _     => panic("vm: binary operator not yet supported")
     }
 }
@@ -2005,7 +2077,7 @@ fn eval_unary(u: checker::TUnary, t: checker::Type, env: Venv) -> EvalRes {
     let v = match u.op {
         Bang  => !as_bool(x)
         Minus => {
-            let prim = num_prim_of(t)
+            let prim = num_prim_of(t, env.prog)
             if prim_float(prim) {
                 float_val(-as_float(x), prim_width(prim))
             } else {
@@ -2013,7 +2085,7 @@ fn eval_unary(u: checker::TUnary, t: checker::Type, env: Venv) -> EvalRes {
             }
         }
         Tilde => {
-            let prim = num_prim_of(t)
+            let prim = num_prim_of(t, env.prog)
             norm_int(~as_int(x), prim_signed(prim), prim_width(prim))
         }
         _ => panic("vm: unary operator not yet supported")
@@ -2258,7 +2330,7 @@ fn eval_binary(b: checker::TBinary, ty: checker::Type, line: u32, col: u32, env:
         let re = eval_expr(b.right, le.env)
         return EvalRes { value= as_bool(re.value); env= re.env }
     }
-    let prim = num_prim_of(ty)                 // honest stop if non-numeric (mirrors codegen)
+    let prim = num_prim_of(ty, env.prog)       // honest stop if non-numeric (mirrors codegen)
     if prim_float(prim) {
         let w  = prim_width(prim)
         let le = eval_expr(b.left, env); let re = eval_expr(b.right, le.env)   // thread left→right
@@ -2350,13 +2422,13 @@ fn eval_cast(c: checker::TCast, ty: checker::Type, line: u32, col: u32, env: Ven
     // target, so the decoded codepoint always fits.
     match c.expr.type {
         checker::Char => {
-            let dtgt = num_prim_of(ty)
+            let dtgt = num_prim_of(ty, env.prog)
             let cp = vm_char_to_u32(xe.value)
             return EvalRes { value= norm_int(cp to i128, prim_signed(dtgt), prim_width(dtgt)); env= cur }
         }
         _ => {}
     }
-    let dst = num_prim_of(ty); let src = num_prim_of(c.expr.type)
+    let dst = num_prim_of(ty, env.prog); let src = num_prim_of(c.expr.type, env.prog)
     let sflt = prim_float(src); let dflt = prim_float(dst)
     if sflt && dflt {
         return EvalRes { value= float_val(as_float(xe.value), prim_width(dst)); env= cur }
