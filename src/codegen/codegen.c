@@ -4957,7 +4957,7 @@ static char *cg_format_c(const char *src) {
     cbuf out = { NULL, 0, 0 };
     size_t depth = 0;            // open-brace count (= indent level)
     char stk[4096]; size_t sp = 0;   // bracket stack — innermost decides `;` breaking ({ vs ( )
-    bool blk[4096];              // per-`{`: is it a function/control BLOCK (preceded by `)`)? — for top-level separation
+    bool blk[4096] = {0};        // per-`{`: is it a function/control BLOCK (preceded by `)`)? — for top-level separation
     bool line_start = true;      // at the start of a fresh output line?
     char one[2] = { 0, 0 };
     size_t i = 0;

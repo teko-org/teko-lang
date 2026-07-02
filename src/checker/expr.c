@@ -529,16 +529,20 @@ static tk_texpr_result type_call(tk_call c, tk_env env, tk_type_table table) {
         tk_str *param_tps = NULL; size_t n_pt = 0;
         for (size_t i = 0; i < ft.as.func.nparams; i += 1) tk_collect_sig_type_params(ft.as.func.params[i], table, &param_tps, &n_pt);
         for (size_t i = 0; i < n_all; i += 1)
-            if (!tk_is_type_param(all_tps[i], param_tps, n_pt))
+            if (!tk_is_type_param(all_tps[i], param_tps, n_pt)) {
+                tk_free0(all_tps); tk_free0(param_tps);
                 return xferr(tk_error_named("cannot infer type parameter (it appears only in the return type; annotate the call)", all_tps[i]));
+            }
         tk_subst s = { .params = param_tps, .n_params = n_pt, .names = NULL, .types = NULL, .n_bind = 0 };
         for (size_t i = 0; i < args.len; i += 1) {   // args.len == nparams (arity checked above); bound by the list so args.ptr[i] is in range
             tk_subst_result u = tk_unify(ft.as.func.params[i], args.ptr[i].type, s, table);
-            if (!u.ok) return xferr(u.as.error);
+            if (!u.ok) { tk_free0(all_tps); tk_free0(param_tps); return xferr(u.as.error); }
             s = u.as.value;
         }
         tk_type result = tk_subst_type(*ft.as.func.ret, s);
-        return xok((tk_texpr){ .tag = TK_TEXPR_CALL, .type = result, .as.call = { c.callee, args.ptr, args.len, call_ns } });
+        tk_texpr_result ret = xok((tk_texpr){ .tag = TK_TEXPR_CALL, .type = result, .as.call = { c.callee, args.ptr, args.len, call_ns } });
+        tk_free0(all_tps); tk_free0(param_tps);
+        return ret;
     }
     // NON-generic: each argument must WIDEN into the parameter's type (B.14 case→variant, T→T?) OR be
     // a fitting literal that adopts it (C6) — same rule as binding/return/assign (single source of truth).
