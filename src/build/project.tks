@@ -481,20 +481,68 @@ fn backend(dir: str, stem: str, out_dir: str, prog: checker::TProgram, m: Manife
 // Front-end (manifest → discover → assemble → check), then the native backend over the
 // merged program. The output binary stem is the manifest `name`.
 // =========================================================================
-// If TK_RT_DIR is unset, probe the in-tree runtime relative to the CURRENT cwd (before any chdir)
-// and pin TK_RT_DIR to its ABSOLUTE path, so run_cc still finds teko_rt.c after the front-end
-// chdir's into the target project (which may live anywhere). A general install pre-sets TK_RT_DIR;
-// runtime BUNDLING is Phase 7.
+// dirname_of — the parent directory of `path` (everything before the last '/'), or "." when
+// `path` has no separator. A minimal local helper (no teko::fs::dirname exists yet).
+fn dirname_of(path: str) -> str {
+    match teko::str::last_index_of(path, "/") {
+        u64 as i => teko::str::slice_to(path, i)
+        error    => "."
+    }
+}
+
+// abs_path_of — make `path` absolute against `cwd` when it isn't already (POSIX/Windows both
+// accept forward slashes here; `path` is either an argv[0]-style invocation path or already
+// absolute). Returns "" when neither is usable.
+fn abs_path_of(path: str, cwd: str) -> str {
+    if path.len == 0 { return "" }
+    if path[0] == b'/' { return path }                                   // already absolute
+    if cwd.len == 0 { return "" }
+    teko::str::concat(cwd, "/", path)
+}
+
+// probe_rt_dir — true (and TK_RT_DIR set) when `<base>/src/runtime/teko_rt.h` or
+// `<base>/runtime/teko_rt.h` exists (the in-tree layout, then a bundled-install layout).
+fn probe_rt_dir(base: str) -> bool {
+    match teko::io::read_file(teko::str::concat(base, "/src/runtime/teko_rt.h")) {
+        str   => { let _ = teko::env::set_var("TK_RT_DIR", teko::str::concat(base, "/src/runtime")); return true }
+        error => {}
+    }
+    match teko::io::read_file(teko::str::concat(base, "/runtime/teko_rt.h")) {
+        str   => { let _ = teko::env::set_var("TK_RT_DIR", teko::str::concat(base, "/runtime")); return true }
+        error => {}
+    }
+    false
+}
+
+// If TK_RT_DIR is unset, locate the in-tree runtime relative to the COMPILER BINARY's OWN
+// location (argv[0], via teko::env::args()) — NOT the current working directory (#64: a build
+// run from inside a project directory, or from an unrelated cwd via an absolute project path,
+// must still find teko_rt.c; CWD-relative probing only worked by coincidence when invoked from
+// the compiler's own source tree root). argv[0] is resolved to an absolute path against the
+// PRE-chdir cwd when it isn't already absolute (e.g. `./bin/teko` or a PATH-relative launch from
+// a shell that passes the resolved script path). Probe candidates from the binary's directory:
+// `<bindir>/..` (repo layout — `bin/teko` / `build/teko` sit one level under the tree root that
+// holds `src/runtime`) then `<bindir>` itself (a flat bundled-install layout). Pin TK_RT_DIR to
+// the ABSOLUTE match so run_cc still finds teko_rt.c after the front-end chdir's into the target
+// project. Falls back to the legacy CWD-relative probe (pre-#64 behavior) so a build invoked with
+// a bare `teko` resolved via $PATH (argv[0] not filesystem-resolvable) still works when cwd
+// happens to be the compiler's own tree. A general install pre-sets TK_RT_DIR; runtime BUNDLING
+// is Phase 7.
 fn ensure_rt_dir_abs() {
     match teko::env::var("TK_RT_DIR") { str => return; error => {} }   // already set — honor it
-    let cwd = match teko::env::cwd() { str as c => c; error => return }
-    mut rel = ""
-    match teko::io::read_file(teko::str::concat(cwd, "/src/runtime/teko_rt.h")) { str => rel = "src/runtime"; error => {} }
-    if rel == "" {
-        match teko::io::read_file(teko::str::concat(cwd, "/runtime/teko_rt.h")) { str => rel = "runtime"; error => {} }
+    let cwd = match teko::env::cwd() { str as c => c; error => "" }
+
+    let argv = teko::env::args()
+    if argv.len > 0 {
+        let exe_abs = abs_path_of(argv[0], cwd)
+        if exe_abs.len > 0 {
+            let bindir = dirname_of(exe_abs)
+            if probe_rt_dir(dirname_of(bindir)) { return }   // <bindir>/.. — the repo/tree root
+            if probe_rt_dir(bindir)             { return }   // <bindir>    — a flat bundled install
+        }
     }
-    if rel == "" { return }                                           // not found — run_cc surfaces a clear cc error
-    match teko::env::set_var("TK_RT_DIR", teko::str::concat(cwd, "/", rel)) { error => {}; null => {} }
+
+    if cwd.len > 0 { let _ = probe_rt_dir(cwd) }              // legacy fallback — cwd-relative probe
 }
 
 fn compile_project(dir: str, out_dir: str) -> i32 { compile_project_g(dir, out_dir, false) }
