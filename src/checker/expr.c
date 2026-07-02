@@ -1282,8 +1282,9 @@ tk_texpr_result tk_type_struct_lit(tk_struct_lit sl, tk_type expected, tk_env en
     } else if (decl.as.value.body.tag == TK_BODY_TRAIT) {
         // (TR0) a trait is NON-instantiable — it exists only to be derived. Point at the fix.
         size_t mlen = name.len * 2 + 128; char *mbuf = tk_alloc(mlen); if (!mbuf) abort();
-        snprintf(mbuf, mlen, "'%.*s' is a trait and cannot be instantiated — derive it from a struct or class instead (`type X = struct %.*s …`)",
-                 (int)name.len, (const char *)name.ptr, (int)name.len, (const char *)name.ptr);
+        int mn = snprintf(mbuf, mlen, "'%.*s' is a trait and cannot be instantiated — derive it from a struct or class instead (`type X = struct %.*s …`)",
+                          (int)name.len, (const char *)name.ptr, (int)name.len, (const char *)name.ptr);
+        if (mn < 0 || (size_t)mn >= mlen) abort();   // cert-err33-c: handle the return — `mlen` fits the literal + two name.len spans, so truncation is an invariant break
         return xferr(tk_error_make(mbuf));
     } else {
         return xerr("struct-literal target is not a struct");

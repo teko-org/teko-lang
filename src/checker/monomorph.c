@@ -178,8 +178,9 @@ static bool mono_check_constraints(tk_str *type_params, tk_constraint_expr *type
         tk_str trait_atom;
         if (constraint_first_trait_atom(type_constraints[i], table, &trait_atom)) {
             size_t mlen = trait_atom.len + 112; char *mbuf = tk_alloc(mlen); if (!mbuf) abort();
-            snprintf(mbuf, mlen, "'%.*s' is a trait — a trait as a generic constraint (`<T: Trait>`) is not implemented yet (TR1)",
-                     (int)trait_atom.len, (const char *)trait_atom.ptr);
+            int mn = snprintf(mbuf, mlen, "'%.*s' is a trait — a trait as a generic constraint (`<T: Trait>`) is not implemented yet (TR1)",
+                              (int)trait_atom.len, (const char *)trait_atom.ptr);
+            if (mn < 0 || (size_t)mn >= mlen) abort();   // cert-err33-c: handle the return — `mlen` fits the literal + trait_atom.len, so truncation is an invariant break
             *out_err = tk_error_make(mbuf);
             return false;
         }
