@@ -735,9 +735,14 @@ the only ones the user ruled on directly.
   `M3` (BigInt) are the units that answer `NET_CRYPTO`'s open decisions **#4** and **#8** (per that doc's
   §6 open-decisions list) — so while `M0` is free-standing, `M1`/`M3` have a soft coupling to when
   NET_CRYPTO's decisions get ratified, not a hard code dependency.
-- **DEVTOOLS** (`teko fmt` / `teko doc` / lint / repl) — **`DT0` (`teko fmt`) is `Deps: parser/AST`** only
-  — no checker, no runtime — startable NOW, fully parallel with everything else (its own namespace,
-  `src/fmt/*.tks`, touches no single-owner bottleneck file).
+- **DEVTOOLS** (`teko fmt` / `teko doc` / lint / repl) — **`DT0` (`teko fmt`) ✅ DONE** (issue #95): a
+  native `teko fmt` subcommand, pure-Teko `src/fmt/fmt.tks` (the regex precedent — no C twin; the C seed's
+  `fmt` arm is an honest stop, M.3), canonical token-stream formatter with comment preservation and a
+  `--check` CI mode. PROVEN: `fmt(fmt(corpus)) == fmt(corpus)` over all 84 corpus files + `main.tks`, and
+  the fully FORMATTED corpus still passes the whole test gate (459) and builds a compiler that judges the
+  formatted tree a fixpoint. NOT yet done (follow-ups): committing the corpus reformat so `src/**` becomes
+  an actual fixpoint + the `fmt --check` CI gate (roadmap open decision #5); stdin mode (honest stop until
+  a stdin host surface exists). `DT1` doc / `DT2` lint / `DT3` repl remain ⬜.
 - **NET_CRYPTO** (`teko::net` + `teko::crypto` + `teko::encoding` + `teko::compress`) — **splits into two
   halves by dependency shape.** The **pure-Teko half** — `S-JSON`/`S-XML`/`S-PB`/`S-ASN1`/`S-YAML`/
   `S-TOML` (all `Deps: none`), `Z-DEFLATE`/`Z-BROTLI`/`Z-LZMA`/`Z-ZSTD` (all `Deps: none`), and `C0`/`C1`/
