@@ -5408,16 +5408,24 @@ tk_cstr_result tk_emit_c(tk_tprogram prog) {
     cb(&b, "#include \"assert.h\"\n\n");   // teko::assert seed decls (driver adds its -I)
 
     // W4c — TYPE DECLS come FIRST (before any function that uses them). Two sub-passes:
-    //   a) a forward `typedef struct tk_t_<M> tk_t_<M>;` for every STRUCT/VARIANT decl,
+    //   a) a forward `typedef struct tk_t_<M> tk_t_<M>;` for every STRUCT/VARIANT/CLASS decl,
     //      so a field/member that references a not-yet-defined aggregate (recursive or
     //      out-of-order types) still compiles.
-    //   b) the full type declarations (struct bodies, variant tag+union, enums).
+    //   b) the full type declarations (struct/class bodies, variant tag+union, enums).
     // (enums need no forward typedef — they carry no aggregate self-reference.)
+    // (#102) CLASS joins STRUCT/VARIANT here: a class value lowers to a POINTER everywhere it is
+    // used (`tk_t_<M> *`), so a `[]<Class>` element is `tk_t_<M> *` — same shape as a slice of a
+    // recursive struct's boxed back-edge. Step 2 below (cg_emit_types_ordered) emits ALL slice
+    // typedefs before the fixpoint that emits named (struct/variant/class) BODIES, so a
+    // `tk_slice_<Class>` typedef referencing `tk_t_<Class> *` needs the class's forward typedef
+    // to exist by then — exactly the same requirement a struct/variant already gets here. Without
+    // this, `cc` fails with "unknown type name 'tk_t_<Class>'" on the FIRST reference (the slice's
+    // `ptr` field), even though the class's own full typedef is emitted later in the same unit.
     for (size_t i = 0; i < prog.nitems; i += 1) {
         tk_titem it = prog.items[i];
         if (it.tag != TK_TITEM_TYPE_DECL) continue;
         tk_type_decl d = it.as.type_decl;
-        if (d.body.tag == TK_BODY_STRUCT || d.body.tag == TK_BODY_VARIANT) {
+        if (d.body.tag == TK_BODY_STRUCT || d.body.tag == TK_BODY_VARIANT || d.body.tag == TK_BODY_CLASS) {
             cb(&b, "typedef struct ");
             mangle_type_name(&b, (tk_str){ NULL, 0 }, d.name);
             cb(&b, " ");

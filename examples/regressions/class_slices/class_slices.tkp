@@ -1,0 +1,26 @@
+# Regression (#102): homogeneous class slices (`[]C` where C is a class) ran correctly under
+# the VM (both twins) but FAILED native codegen in BOTH compilers with the misleading
+# `cc` error "unknown type name 'tk_t_Circle'" — a VM≠native frontier. Root cause: a class
+# value lowers to a POINTER everywhere (`tk_t_<Class> *`), so `[]<Class>` lowers to
+# `tk_slice_<Class> { tk_t_<Class> *ptr; uint64_t len; }`. Slice typedefs are emitted (in
+# dependency order) BEFORE the fixpoint that emits named struct/variant/class BODIES, but only
+# STRUCT/VARIANT/INTERFACE decls got a forward `typedef struct tk_t_<M> tk_t_<M>;` ahead of that
+# point — CLASS did not, so `tk_slice_Circle`'s `ptr` field referenced an undeclared type. Fix:
+# CLASS joins the forward-typedef pass (same "redef-to-same-type" idiom STRUCT/VARIANT already
+# use), in both codegen twins (src/codegen/codegen.c, src/codegen/codegen.tks).
+#
+# This fixture proves the whole class-slice surface end-to-end, VM == native:
+#   1) construction + len + indexed method-call dispatch on a plain (non-interface) []Circle
+#   2) nested [][]Circle — chained indexing + per-row len
+#   3) a class slice held as a struct FIELD
+#   4) a class slice as a fn PARAM and RETURN value
+#   5) covariant []Circle -> []Shape upcast of the slice VALUE, then heterogeneous per-element
+#      dispatch through the resulting interface slice (mixed concrete classes)
+#
+#   teko run   examples/regressions/class_slices                                  # VM     -> exit 0
+#   teko build examples/regressions/class_slices && ./class_slices                # native -> exit 0
+name = "class_slices"
+source = "src"
+
+[artifact]
+kind = "binary"
