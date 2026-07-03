@@ -361,8 +361,8 @@ static tk_pack_result resolve_defargs(tk_type ft, tk_expr *args, tk_str *arg_nam
         tk_str nm = arg_names[vk];
         bool matched = false; size_t fidx = 0;
         for (; fidx < ft.as.func.nparams; fidx += 1) { if (tk_str_eq(ft.as.func.param_names[fidx], nm)) { matched = true; break; } }
-        if (!matched) return (tk_pack_result){ .ok = false, .error = tk_error_named("unknown named argument", nm) };
-        if (fidx < npos) return (tk_pack_result){ .ok = false, .error = tk_error_named("named argument was already provided positionally", nm) };
+        if (!matched) return (tk_pack_result){ .ok = false, .error = tk_error_woven1("unknown named argument '", nm, "'") };
+        if (fidx < npos) return (tk_pack_result){ .ok = false, .error = tk_error_woven1("named argument '", nm, "' was already provided positionally") };
     }
     tk_expr *resolved = tk_alloc(ft.as.func.nparams * sizeof *resolved); if (!resolved) abort();
     for (size_t idx = 0; idx < ft.as.func.nparams; idx += 1) {
@@ -376,7 +376,7 @@ static tk_pack_result resolve_defargs(tk_type ft, tk_expr *args, tk_str *arg_nam
             if (found) {
                 resolved[idx] = found_expr;
             } else if (idx < ft.as.func.n_required) {
-                return (tk_pack_result){ .ok = false, .error = tk_error_named("missing required argument", ft.as.func.param_names[idx]) };
+                return (tk_pack_result){ .ok = false, .error = tk_error_woven1("missing required argument '", ft.as.func.param_names[idx], "'") };
             } else {
                 resolved[idx] = ft.as.func.defaults[idx - ft.as.func.n_required];
             }
@@ -415,7 +415,7 @@ static tk_texpr_result type_method_call(tk_method_call mc, tk_env env, tk_type_t
         for (size_t i = 0; i < eff.as.value.len; i += 1) {
             if (tk_str_eq(eff.as.value.ptr[i].name, mc.method)) { ifound = true; imfn = eff.as.value.ptr[i]; slot = i; break; }
         }
-        if (!ifound) return xferr(tk_error_named("no such method on interface", mc.method));
+        if (!ifound) return xferr(tk_error_woven2("no such method '", mc.method, "' on interface '", struct_name, "'"));
         // interface methods are INSTANCE-only signatures (decl-enforced); the receiver resolves
         // to Named{<iface>} in the FuncType. Defaults live on the CONTRACT (DEFARGS rule E).
         tk_type_result iftr = tk_method_func_type(imfn, struct_name, table);
@@ -479,9 +479,18 @@ static tk_texpr_result type_method_call(tk_method_call mc, tk_env env, tk_type_t
     for (size_t i = 0; i < n_methods; i += 1) {
         if (tk_str_eq(methods[i].name, mc.method)) { found = true; mfn = methods[i]; break; }
     }
-    if (!found) return xferr(tk_error_named("no such method on struct", mc.method));
+    if (!found) return xferr(tk_error_woven2("no such method '", mc.method, "' on struct '", struct_name, "'"));
     bool is_instance = mfn.nparams > 0 && !mfn.params[0].has_type;
-    if (!is_instance) return xferr(tk_error_named("static method — call it as StructName::method(…), not recv.method(…)", mc.method));
+    if (!is_instance) {
+        // canonical (typer.tks): "'M' is a static method — call it as S::M(…)"
+        size_t slen = mc.method.len * 2 + struct_name.len + 48; char *sbuf = tk_alloc(slen); if (!sbuf) abort();
+        int sm = snprintf(sbuf, slen, "'%.*s' is a static method — call it as %.*s::%.*s(…)",
+                          (int)mc.method.len, (const char *)mc.method.ptr,
+                          (int)struct_name.len, (const char *)struct_name.ptr,
+                          (int)mc.method.len, (const char *)mc.method.ptr);
+        if (sm < 0 || (size_t)sm >= slen) abort();
+        return xferr(tk_error_make(sbuf));
+    }
     // (W10b.CLASS residual — intern visibility) a private (default) method is reachable only
     // from its OWN declaring class's code, or — if `intern` — a subclass's too. Struct methods
     // stay all-public (W10b.0.A) — this check only fires for a class receiver.
@@ -597,7 +606,7 @@ static tk_texpr_result type_call(tk_call c, tk_env env, tk_type_table table) {
         for (size_t i = 0; i < n_all; i += 1)
             if (!tk_is_type_param(all_tps[i], param_tps, n_pt)) {
                 tk_free0(all_tps); tk_free0(param_tps);
-                return xferr(tk_error_named("cannot infer type parameter (it appears only in the return type; annotate the call)", all_tps[i]));
+                return xferr(tk_error_woven1("cannot infer type parameter ", all_tps[i], " — it appears only in the return type; annotate the call"));
             }
         tk_subst s = { .params = param_tps, .n_params = n_pt, .names = NULL, .types = NULL, .n_bind = 0 };
         for (size_t i = 0; i < args.len; i += 1) {   // args.len == nparams (arity checked above); bound by the list so args.ptr[i] is in range
@@ -927,7 +936,7 @@ static tk_texpr_result type_cast(tk_cast c, tk_env env, tk_type_table table) {
 tk_type_result field_type(tk_struct_body sb, tk_str field, tk_type_table table) {
     for (size_t i = 0; i < sb.n_fields; i += 1)
         if (tk_str_eq(sb.fields[i].name, field)) return tk_resolve_type(sb.fields[i].type_ann, table);
-    return (tk_type_result){ .ok = false, .as.error = tk_error_make("no such field") };
+    return (tk_type_result){ .ok = false, .as.error = tk_error_named("no such field", field) };
 }
 
 static tk_texpr_result type_field_access(tk_field_access fa, tk_env env, tk_type_table table) {
@@ -972,7 +981,7 @@ static tk_texpr_result type_field_access(tk_field_access fa, tk_env env, tk_type
         return xerr("cannot use `.` on a nullable value (`T?`) — read it with `?.` or `??` (REBOOT_PLAN §203)");
     if (recv.as.value.type.tag != TK_TYPE_NAMED) return xerr("field access requires a struct receiver");
     tk_decl_result decl = tk_type_table_find(table, recv.as.value.type.as.named.name);
-    if (!decl.ok) return xerr("unknown type for field access");
+    if (!decl.ok) return xferr(tk_error_named("unknown type for field access", recv.as.value.type.as.named.name));
     // (W10b.CLASS) a class's fields are read exactly like a struct's; increment 2 uses the
     // EFFECTIVE (base-inherited) field set.
     tk_struct_body fa_sb;
@@ -987,10 +996,10 @@ static tk_texpr_result type_field_access(tk_field_access fa, tk_env env, tk_type
         // (W10b.D3) an interface value is data + vtable — the contract exposes METHODS only.
         return xerr("an interface value exposes no fields — only its contract methods");
     } else {
-        return xerr("type is not a struct (no fields)");
+        return xferr(tk_error_woven1("type ", recv.as.value.type.as.named.name, " is not a struct (no fields)"));
     }
     tk_type_result ft = field_type(fa_sb, fa.field, table);
-    if (!ft.ok) return xerr("no such field");
+    if (!ft.ok) return xferr(ft.as.error);
     // (W10b.CLASS residual — intern visibility) a private (default) field is reachable only
     // from its OWN declaring class's code, or — if `intern` — a subclass's too.
     if (fa_is_class) {
@@ -1118,10 +1127,10 @@ static tk_texpr_result type_safe_field_access(tk_safe_field_access sfa, uint32_t
     }
     // STRUCT route — the original TSafeFieldAccess lowering (native emission is value-based).
     if (decl.as.value.body.tag != TK_BODY_STRUCT)
-        return xerr("type is not a struct (no fields)");
+        return xferr(tk_error_woven1("type ", inner.as.named.name, " is not a struct (no fields)"));
     tk_struct_body sfa_sb = decl.as.value.body.as.struct_body;
     tk_type_result ft = field_type(sfa_sb, sfa.field, table);
-    if (!ft.ok) return xerr("no such field");
+    if (!ft.ok) return xferr(ft.as.error);
     // the result is `(field-type)?` — null-propagating; an already-optional field stays as-is.
     tk_type result = ft.as.value.tag == TK_TYPE_OPTIONAL ? ft.as.value
                    : (tk_type){ .tag = TK_TYPE_OPTIONAL, .as.optional.inner = tk_box_type_val(ft.as.value) };
@@ -1266,7 +1275,7 @@ tk_texpr_result tk_type_struct_lit(tk_struct_lit sl, tk_type expected, tk_env en
         sb_fields = decl.as.value.body.as.struct_body.fields; sb_n_fields = decl.as.value.body.as.struct_body.n_fields;
     } else if (decl.as.value.body.tag == TK_BODY_CLASS) {
         if (decl.as.value.body.as.class_body.kind == TK_CLASS_ABSTRACT)
-            return xferr(tk_error_named("is abstract and cannot be instantiated directly", name));
+            return xferr(tk_error_woven1("`", name, "` is abstract and cannot be instantiated directly"));
         // (W10b.D1) invariant-safe construction — a class's `{…}` literal is legal ONLY inside
         // the class's OWN methods (its static factories and instance methods), so the
         // arena-per-object and the class's invariants stay inviolable from outside code.
