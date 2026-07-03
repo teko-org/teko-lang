@@ -503,7 +503,7 @@ pub fn base_vtable_slot(base: str, method: str, table: TypeTable) -> u32 | error
 // receiver param types (both skip their 1st untyped receiver param) + same return type. Any type
 // that fails to resolve makes it a non-match (the conformance error surfaces the missing/mismatched
 // method; the unresolved type surfaces separately via check_modules/normal resolution).
-fn method_sig_matches(req: parser::Function, impl_m: parser::Function, table: TypeTable) -> bool {
+fn method_sig_matches(req: parser::Function, impl_m: parser::Function, table: TypeTable, ref_ns: str) -> bool {
     mut rstart: u64 = 0
     if req.params.len > 0 && !req.params[0].has_type { rstart = 1 }
     mut istart: u64 = 0
@@ -515,15 +515,15 @@ fn method_sig_matches(req: parser::Function, impl_m: parser::Function, table: Ty
     mut k: u64 = 0
     loop {
         if rstart + k >= req.params.len { break }
-        let rt = match resolve_type(req.params[rstart + k].type_ann, table, "") { Type as t => t; error => return false }   // (#109 W1) structural sig-equality — no referencing ns
-        let it = match resolve_type(impl_m.params[istart + k].type_ann, table, "") { Type as t => t; error => return false }   // (#109 W1) structural sig-equality — no referencing ns
+        let rt = match resolve_type(req.params[rstart + k].type_ann, table, ref_ns) { Type as t => t; error => return false }   // (#109 W2) source-ref types resolve in the conforming type's namespace
+        let it = match resolve_type(impl_m.params[istart + k].type_ann, table, ref_ns) { Type as t => t; error => return false }   // (#109 W2) source-ref types resolve in the conforming type's namespace
         if !type_eq(rt, it) { return false }
         k++
     }
     if req.has_return != impl_m.has_return { return false }
     if req.has_return {
-        let rr = match resolve_type(req.return_type, table, "") { Type as t => t; error => return false }   // (#109 W1) structural sig-equality — no referencing ns
-        let ir = match resolve_type(impl_m.return_type, table, "") { Type as t => t; error => return false }   // (#109 W1) structural sig-equality — no referencing ns
+        let rr = match resolve_type(req.return_type, table, ref_ns) { Type as t => t; error => return false }   // (#109 W2) source-ref types resolve in the conforming type's namespace
+        let ir = match resolve_type(impl_m.return_type, table, ref_ns) { Type as t => t; error => return false }   // (#109 W2) source-ref types resolve in the conforming type's namespace
         if !type_eq(rr, ir) { return false }
     }
     true
@@ -537,7 +537,7 @@ fn method_sig_matches(req: parser::Function, impl_m: parser::Function, table: Ty
 // `members_all_public` = true for a STRUCT (its members are all-public per W10b.0.A, so the AST
 // `vis` field is irrelevant); false for a CLASS (a class method must genuinely be `pub`/`exp` to
 // satisfy the public interface contract — a private method is not callable through the interface).
-fn check_conformance(type_name: str, own_methods: []parser::Function, implements: []str, table: TypeTable, members_all_public: bool) -> error? {
+fn check_conformance(type_name: str, type_ns: str, own_methods: []parser::Function, implements: []str, table: TypeTable, members_all_public: bool) -> error? {
     mut ii = 0
     loop {
         if ii >= implements.len { break }
@@ -553,7 +553,7 @@ fn check_conformance(type_name: str, own_methods: []parser::Function, implements
             loop {
                 if mi >= own_methods.len { break }
                 if own_methods[mi].name == req.name {
-                    if !method_sig_matches(req, own_methods[mi], table) {
+                    if !method_sig_matches(req, own_methods[mi], table, type_ns) {
                         return error { message = $"'{type_name}' method '{req.name}' does not match interface '{iname}'s signature" }
                     }
                     let restated = default_restated_param(req.params, own_methods[mi].params)
@@ -880,7 +880,7 @@ fn validate_type_decls(table: TypeTable) -> error? {
                     }
                     f++
                 }
-                match check_conformance(decl.name, sb.methods, sb.implements, table, true) { error as e => return e; null => {} }   // (W10b.IF) struct members all-public
+                match check_conformance(decl.name, items[i].namespace, sb.methods, sb.implements, table, true) { error as e => return e; null => {} }   // (W10b.IF) struct members all-public
             }
             parser::AliasBody as ab => {
                 match resolve_type(ab.alias, tbl, ref_ns) {
@@ -902,7 +902,7 @@ fn validate_type_decls(table: TypeTable) -> error? {
                 match validate_class_decl(cb, table) { error as e => return e; null => {} }   // (W10b.CLASS increment 2)
                 // (W10b.IF) a class conforms via its EFFECTIVE methods (inherited base methods count).
                 let eff = match effective_class_methods(cb, table) { []parser::Function as m => m; error as e => return e }
-                match check_conformance(decl.name, eff, cb.implements, table, false) { error as e => return e; null => {} }   // (W10b.IF) class methods need real `pub`
+                match check_conformance(decl.name, items[i].namespace, eff, cb.implements, table, false) { error as e => return e; null => {} }   // (W10b.IF) class methods need real `pub`
             }
             parser::TraitBody as trb => {
                 // (TR0) a trait is a struct-shaped bundle: its field types resolve like a struct's
