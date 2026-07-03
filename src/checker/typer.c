@@ -618,26 +618,24 @@ static tk_tfunction_result type_method(tk_function f, tk_str struct_name, tk_env
     { tk_str seen[TK_MAX_LABELS]; size_t nseen = 0;
       const char *why = check_labels(tb.as.value.stmts, tb.as.value.n, NULL, false, seen, &nseen);
       if (why) return (tk_tfunction_result){ .ok = false, .as.error = tk_error_make(why) }; }
-    // (W10b.CLASS) PREPEND the base-binding as the method body's FIRST statement (a synthetic
-    // `let <binding> = (<self> to <Base>)` — a plain reinterpret-cast the checker's own `to`
-    // syntax would never allow between two unrelated Named types, but this node bypasses that
-    // source-level restriction entirely; codegen's cast fallback just emits the C pointer cast).
-    // Checked ABOVE (check_returns/check_trailing_value/check_labels all read the ORIGINAL body)
-    // since it changes nothing about return/trailing-value/label semantics.
+    // (W10b.CLASS / #98 Option A) PREPEND the base-binding as the method body's FIRST statement: a
+    // synthetic `let <binding>: <Base> = <self>` — self UPCAST to the base, NOT a reinterpret-cast.
+    // Binding self (the concrete subclass) with the base-typed `bound` lets emit_as build the D3 fat
+    // pointer (data + tk_vt_<Sub>_<Base>) so dispatch through the base-binding works uniformly under
+    // the one-representation model (widens_into now permits the Sub→Base widen). Checked ABOVE
+    // (check_returns/check_trailing_value/check_labels all read the ORIGINAL body) since it changes
+    // nothing about return/trailing-value/label semantics.
     tk_tstatement *body = tb.as.value.stmts;
     size_t nbody = tb.as.value.n;
     if (inject_base_binding) {
-        tk_texpr *self_var = tk_alloc(sizeof *self_var);
-        *self_var = (tk_texpr){ .tag = TK_TEXPR_VAR, .type = (tk_type){ .tag = TK_TYPE_NAMED, .as.named = { struct_name } }, .line = 0, .col = 0 };
-        self_var->as.var = (typeof(self_var->as.var)){ .name = f.params[0].name, .is_func = false, .func_ns = (tk_str){0} };
-        tk_texpr cast_val = { .tag = TK_TEXPR_CAST, .type = (tk_type){ .tag = TK_TYPE_NAMED, .as.named = { base_name } }, .line = 0, .col = 0 };
-        cast_val.as.cast.expr = self_var;
+        tk_texpr self_var = (tk_texpr){ .tag = TK_TEXPR_VAR, .type = (tk_type){ .tag = TK_TYPE_NAMED, .as.named = { struct_name } }, .line = 0, .col = 0 };
+        self_var.as.var = (typeof(self_var.as.var)){ .name = f.params[0].name, .is_func = false, .func_ns = (tk_str){0} };
         tk_tstatement bind_stmt = { .tag = TK_TSTMT_BINDING };
         bind_stmt.as.binding.kind = TK_BIND_LET;
         bind_stmt.as.binding.target.tag = TK_BIND_SIMPLE;
         bind_stmt.as.binding.target.as.simple.name = base_binding_name;
         bind_stmt.as.binding.bound = (tk_type){ .tag = TK_TYPE_NAMED, .as.named = { base_name } };
-        bind_stmt.as.binding.value = cast_val;
+        bind_stmt.as.binding.value = self_var;
         tk_tstatement *new_body = tk_alloc((nbody + 1) * sizeof *new_body);
         new_body[0] = bind_stmt;
         for (size_t i = 0; i < nbody; i += 1) new_body[i + 1] = body[i];

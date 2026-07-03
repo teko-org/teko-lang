@@ -2764,17 +2764,18 @@ fn type_method(f: parser::Function, struct_name: str, env: Env, table: TypeTable
     match check_trailing_value(tb.stmts, ret, table) { null => {}; error as e => return e }
     let lc = check_labels(tb.stmts, teko::list::empty(), false, teko::list::empty())
     if lc.failed { return error { message = lc.message } }
-    // (W10b.CLASS) PREPEND the base-binding as the method body's FIRST statement (a synthetic
-    // `let <binding> = (<self> to <Base>)` — a plain reinterpret-cast the checker's own `to`
-    // syntax would never allow between two unrelated Named types, but this node bypasses that
-    // source-level restriction entirely; codegen's cast fallback just emits the C pointer cast).
-    // Checked ABOVE the injection (check_returns/check_trailing_value/check_labels all read the
-    // ORIGINAL body) since it changes nothing about return/trailing-value/label semantics.
+    // (W10b.CLASS / #98 Option A) PREPEND the base-binding as the method body's FIRST statement: a
+    // synthetic `let <binding>: <Base> = <self>` — self UPCAST to the base, NOT a reinterpret-cast.
+    // Binding self (the concrete subclass) with the base-typed `bound` lets emit_as build the D3 fat
+    // pointer (data + tk_vt_<Sub>_<Base>), so dispatch through the base-binding works uniformly under
+    // the one-representation model (widens_into now permits the Sub→Base widen). Checked ABOVE the
+    // injection (check_returns/check_trailing_value/check_labels all read the ORIGINAL body) since it
+    // changes nothing about return/trailing-value/label semantics.
     let body = if inject_base_binding {
         let receiver_name = f.params[0].name
         let cast_val = TExpr {
-            kind = TCast { expr = TExpr { kind = TVar { name = receiver_name; is_func = false; func_ns = "" }; type = Named { name = struct_name }; line = 0; col = 0 } }
-            type = Named { name = base_name }
+            kind = TVar { name = receiver_name; is_func = false; func_ns = "" }
+            type = Named { name = struct_name }
             line = 0; col = 0
         }
         let bind_stmt = TBinding { kind = parser::BindKind::Let; target = parser::SimpleName { name = base_binding_name }; bound = Named { name = base_name }; value = cast_val }
