@@ -13,7 +13,7 @@ static tk_env_result eok(tk_env e)     { return (tk_env_result){ .ok = true,  .a
 static tk_env_result efail(tk_error e) { return (tk_env_result){ .ok = false, .as.error = e }; }
 
 static bool name_eq(tk_str a, tk_str b);   // fwd (defined with the exhaustiveness helpers below)
-static tk_type_result bind_pattern_type(tk_pattern p, tk_type_table table);   // fwd (W9.4 — used by tk_check_pattern)
+static tk_type_result bind_pattern_type(tk_pattern p, tk_type_table table, tk_str ref_ns);   // fwd (W9.4 — used by tk_check_pattern); (#109 W1) ref_ns threaded
 
 // (#110) Is `named` a DIRECT case of `subject_variant` (the ONE-level-expanded subject), OR the
 // WHOLE subject itself (`raw_subject` — the pre-expansion type, e.g. a `Type as t` arm binding a
@@ -107,7 +107,7 @@ tk_env_result tk_check_pattern(tk_pattern p, tk_type subject, tk_env env, tk_typ
     // ENUM subject (C7b): member patterns, not type binds. Detected before the generic switch so a
     // bare `U8` is not mis-resolved as a type name (resolve_named → "unknown type: U8").
     if (subject.tag == TK_TYPE_NAMED) {
-        tk_decl_result d = tk_type_table_find(table, subject.as.named.name);
+        tk_decl_result d = tk_type_table_find(table, subject.as.named.name, (tk_str){0});   // (#109 W1) enum-subject probe on a resolved name — no referencing ns
         if (d.ok && d.as.value.body.tag == TK_BODY_ENUM)
             return check_enum_pattern(p, subject, d.as.value.body.as.enum_body, env, table);
     }
@@ -125,7 +125,7 @@ tk_env_result tk_check_pattern(tk_pattern p, tk_type subject, tk_env env, tk_typ
             // `[]T as x` resolves the slice TYPE-expr; a path bind resolves the named/builtin case.
             // (W9.4) `Foo<i64> as x` carries explicit type-args → bind_pattern_type resolves the
             // concrete instance `Foo__g__i64`, so the binding has the stamped type (fields visible).
-            tk_type_result ct = bind_pattern_type(p, table);
+            tk_type_result ct = bind_pattern_type(p, table, env.cur_ns);   // (#109 W1) ref_ns = the match's enclosing namespace
             if (!ct.ok) return efail(ct.as.error);
             // (#110) reject a SKIP-LEVEL arm: `ct` names a type that is not a direct case of the
             // subject's own union (it may be a case of an INNER variant nested inside one of the
@@ -147,13 +147,13 @@ tk_env_result tk_check_pattern(tk_pattern p, tk_type subject, tk_env env, tk_typ
         }
         case TK_PAT_FIELD: {
             // C7a: variant axis `Type { f; g }` — resolve to a struct, bind each field IMMUTABLE (B.21).
-            tk_type_result nt = resolve_named(p.as.field.type_name, table);
+            tk_type_result nt = resolve_named(p.as.field.type_name, table, env.cur_ns);   // (#109 W1) ref_ns = the match's enclosing namespace
             if (!nt.ok) return efail(nt.as.error);
             if (nt.as.value.tag != TK_TYPE_NAMED) return efail(tk_error_make("field pattern requires a struct type"));
             // (#110) same skip-level guard as the BIND arm above — `Type { f; g }` also names a case.
             if (!is_direct_case_of(nt.as.value, subject_variant, subject))
                 return efail(skip_level_error(nt.as.value, subject_variant, table));
-            tk_decl_result decl = tk_type_table_find(table, nt.as.value.as.named.name);
+            tk_decl_result decl = tk_type_table_find(table, nt.as.value.as.named.name, (tk_str){0});   // (#109 W1) follow-up lookup of a resolved name — no referencing ns
             if (!decl.ok) return efail(tk_error_make("unknown type in field pattern"));
             if (decl.as.value.body.tag != TK_BODY_STRUCT) return efail(tk_error_make("type is not a struct (no fields)"));
             tk_struct_body sb = decl.as.value.body.as.struct_body;
@@ -208,13 +208,15 @@ static bool name_eq(tk_str a, tk_str b) { return a.len == b.len && (a.len == 0 |
 // Resolve the type a BIND pattern denotes: `[]T as x` → the slice type, else the named/builtin path.
 // (W9.4) `Foo<i64> as x` carries explicit type-args → resolve the concrete instance `Foo__g__i64`
 // (validates arity / rejects non-generic-with-args), so exhaustiveness/binding use the stamped type.
-static tk_type_result bind_pattern_type(tk_pattern p, tk_type_table table) {
-    if (p.as.bind.is_slice) return tk_resolve_type(*p.as.bind.slice_type, table);
+// (#109 W1) `ref_ns` = the namespace of the match arm (referencing ns for the pattern's type name);
+// threaded to tk_resolve_type/resolve_named, unused until W2's R0-R5 rules.
+static tk_type_result bind_pattern_type(tk_pattern p, tk_type_table table, tk_str ref_ns) {
+    if (p.as.bind.is_slice) return tk_resolve_type(*p.as.bind.slice_type, table, ref_ns);
     if (p.as.bind.nargs > 0) {
         tk_type_expr gte = { .tag = TK_TEXPR_NAMED, .as.named = { .path = p.as.bind.type_name, .args = p.as.bind.type_args, .args_len = p.as.bind.nargs } };
-        return tk_resolve_type(gte, table);
+        return tk_resolve_type(gte, table, ref_ns);
     }
-    return resolve_named(p.as.bind.type_name, table);
+    return resolve_named(p.as.bind.type_name, table, ref_ns);
 }
 
 // (W9.4) the case-name a single bind names: the resolved INSTANCE name `Gen__g__i64` when it carries
@@ -223,7 +225,7 @@ static tk_type_result bind_pattern_type(tk_pattern p, tk_type_table table) {
 static tk_str bind_case_name(tk_bind_pattern bp, tk_type_table table) {
     if (bp.nargs > 0) {
         tk_type_expr gte = { .tag = TK_TEXPR_NAMED, .as.named = { .path = bp.type_name, .args = bp.type_args, .args_len = bp.nargs } };
-        tk_type_result r = tk_resolve_type(gte, table);
+        tk_type_result r = tk_resolve_type(gte, table, (tk_str){0});   // (#109 W1) exhaustiveness case-name — structural, no referencing ns
         if (r.ok && r.as.value.tag == TK_TYPE_NAMED) return r.as.value.as.named.name;
     }
     return bp.type_name.segments[bp.type_name.len - 1].name;
@@ -255,13 +257,13 @@ static bool some_arm_covers_type(tk_arm *arms, size_t n, tk_type mem, tk_type_ta
         if (arms[i].has_when) continue;
         tk_pattern p = arms[i].pattern;
         if (p.tag == TK_PAT_BIND) {
-            tk_type_result rt = bind_pattern_type(p, table);
+            tk_type_result rt = bind_pattern_type(p, table, (tk_str){0});   // (#109 W1) coverage check — structural, no referencing ns
             if (rt.ok && tk_type_eq(&rt.as.value, &mem)) return true;
         } else if (p.tag == TK_PAT_ALT) {
             for (size_t j = 0; j < p.as.alt.n_options; j += 1) {
                 tk_pattern opt = p.as.alt.options[j];
                 if (opt.tag != TK_PAT_BIND) continue;
-                tk_type_result rt = bind_pattern_type(opt, table);
+                tk_type_result rt = bind_pattern_type(opt, table, (tk_str){0});   // (#109 W1) coverage check — structural, no referencing ns
                 if (rt.ok && tk_type_eq(&rt.as.value, &mem)) return true;
             }
         }
@@ -299,7 +301,7 @@ static bool present_case_covered(tk_arm *arms, size_t n, tk_type inner, tk_type_
 bool tk_exhaustive(tk_arm *arms, size_t n, tk_type subject, tk_type_table table) {
     if (has_wildcard(arms, n)) return true;
     if (subject.tag == TK_TYPE_NAMED) {   // an ENUM subject is exhaustive iff EVERY member is named (C7b)
-        tk_decl_result d = tk_type_table_find(table, subject.as.named.name);
+        tk_decl_result d = tk_type_table_find(table, subject.as.named.name, (tk_str){0});   // (#109 W1) enum-subject probe on a resolved name — no referencing ns
         if (d.ok && d.as.value.body.tag == TK_BODY_ENUM) {
             tk_enum_body eb = d.as.value.body.as.enum_body;
             for (size_t i = 0; i < eb.n_members; i += 1)

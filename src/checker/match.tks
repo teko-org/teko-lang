@@ -125,7 +125,7 @@ fn check_pattern(p: parser::Pattern, subject: Type, env: Env, table: TypeTable) 
     // bare `U8` is not mis-resolved as a type name (resolve_named → "unknown type: U8").
     match subject {
         Named as n => {
-            match type_table_find(table, n.name) {
+            match type_table_find(table, n.name, "") {   // (#109 W1) enum-subject probe on a resolved name — no referencing ns
                 parser::TypeDecl as td => {
                     match td.body {
                         parser::EnumBody as eb => return check_enum_pattern(p, subject, eb, env, table)
@@ -148,7 +148,7 @@ fn check_pattern(p: parser::Pattern, subject: Type, env: Env, table: TypeTable) 
         parser::WildcardPattern   => env
         parser::BindPattern as bp => {
             // `[]T as x` resolves the slice TYPE-expr; a path bind resolves the named/builtin case.
-            let ct = match bind_pattern_type(bp, table) { Type as t => t; error as e => return e }
+            let ct = match bind_pattern_type(bp, table, env.cur_ns) { Type as t => t; error as e => return e }   // (#109 W1) ref_ns = the match's enclosing namespace
             // (#110) reject a SKIP-LEVEL arm: `ct` names a type that is not a direct case of the
             // subject's own union (it may be a case of an INNER variant nested inside one of the
             // subject's members). `is_direct_case_of` is a no-op (true) when the subject is not a
@@ -166,14 +166,14 @@ fn check_pattern(p: parser::Pattern, subject: Type, env: Env, table: TypeTable) 
         }
         parser::FieldPattern as fp => {
             // C7a: variant axis `Type { f; g }` — resolve to a struct, bind each field IMMUTABLE (B.21).
-            let nt = match resolve_named(fp.type_name, table) { Type as t => t; error as e => return e }
+            let nt = match resolve_named(fp.type_name, table, env.cur_ns) { Type as t => t; error as e => return e }   // (#109 W1) ref_ns = the match's enclosing namespace
             let name = match nt {
                 Named as n => n.name
                 _          => return error { message = "field pattern requires a struct type" }
             }
             // (#110) same skip-level guard as the BIND arm above — `Type { f; g }` also names a case.
             if !is_direct_case_of(nt, subject_variant, subject) { return skip_level_error(nt, subject_variant, table) }
-            let decl = match type_table_find(table, name) {
+            let decl = match type_table_find(table, name, "") {   // (#109 W1) follow-up lookup of a resolved name — no referencing ns
                 parser::TypeDecl as td => td
                 error          => return error { message = $"unknown type in field pattern: {name}" }
             }
@@ -248,7 +248,7 @@ fn has_wildcard(arms: []parser::Arm) -> bool {
 // so exhaustiveness over a `variant Gen<i64> | …` covers the `Gen<i64> as x` arm by the member's name.
 fn bind_case_name(bp: parser::BindPattern, table: TypeTable) -> str {
     if bp.type_args.len > 0 {
-        let ct = match bind_pattern_type(bp, table) { Type as t => t; error => Void { } }
+        let ct = match bind_pattern_type(bp, table, "") { Type as t => t; error => Void { } }   // (#109 W1) exhaustiveness case-name — structural, no referencing ns
         match ct {
             Named as n => return n.name
             _          => {}
@@ -285,16 +285,18 @@ fn arm_case_names(p: parser::Pattern, table: TypeTable) -> []str {
 // Resolve the type a BIND pattern denotes: `[]T as x` → the slice type, else the named/builtin path.
 // (W9.4) `Foo<i64> as x` carries explicit type-args → resolve the concrete instance `Foo__g__i64`
 // (validates arity / rejects non-generic-with-args), so exhaustiveness/binding use the stamped type.
-fn bind_pattern_type(bp: parser::BindPattern, table: TypeTable) -> Type | error {
+// (#109 W1) `ref_ns` = the namespace of the match arm (referencing ns for the pattern's type name);
+// threaded to resolve_type/resolve_named, unused until W2's R0-R5 rules.
+fn bind_pattern_type(bp: parser::BindPattern, table: TypeTable, ref_ns: str) -> Type | error {
     if bp.is_slice {
         match bp.slice_type {
-            parser::TypeExpr as st => resolve_type(st, table)
+            parser::TypeExpr as st => resolve_type(st, table, ref_ns)
             null                   => error { message = "internal: slice pattern missing its slice type" }
         }
     } else if bp.type_args.len > 0 {
-        resolve_type(parser::NamedType { path = bp.type_name; args = bp.type_args }, table)
+        resolve_type(parser::NamedType { path = bp.type_name; args = bp.type_args }, table, ref_ns)
     } else {
-        resolve_named(bp.type_name, table)
+        resolve_named(bp.type_name, table, ref_ns)
     }
 }
 
@@ -308,14 +310,14 @@ fn some_arm_covers_type(arms: []parser::Arm, mem: Type, table: TypeTable) -> boo
         if !arms[i].has_when {
             match arms[i].pattern {
                 parser::BindPattern as bp => {
-                    match bind_pattern_type(bp, table) { Type as t => { if type_eq(t, mem) { return true } }; error => {} }
+                    match bind_pattern_type(bp, table, "") { Type as t => { if type_eq(t, mem) { return true } }; error => {} }   // (#109 W1) coverage check — structural, no referencing ns
                 }
                 parser::AltPattern as ap => {
                     mut j = 0
                     loop {
                         if j >= ap.options.len { break }
                         match ap.options[j] {
-                            parser::BindPattern as bp => { match bind_pattern_type(bp, table) { Type as t => { if type_eq(t, mem) { return true } }; error => {} } }
+                            parser::BindPattern as bp => { match bind_pattern_type(bp, table, "") { Type as t => { if type_eq(t, mem) { return true } }; error => {} } }   // (#109 W1) coverage check — structural, no referencing ns
                             _                 => {}
                         }
                         j++
@@ -414,7 +416,7 @@ fn exhaustive(arms: []parser::Arm, subject: Type, table: TypeTable) -> bool {
     if has_wildcard(arms) { return true }
     match subject {       // an ENUM subject — exhaustive iff EVERY member is named (C7b)
         Named as n => {
-            match type_table_find(table, n.name) {
+            match type_table_find(table, n.name, "") {   // (#109 W1) enum-subject probe on a resolved name — no referencing ns
                 parser::TypeDecl as td => {
                     match td.body {
                         parser::EnumBody as eb => return enum_covered(arms, eb, table)
