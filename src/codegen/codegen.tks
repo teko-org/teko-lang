@@ -385,6 +385,37 @@ fn cg_is_interface_named(prog: checker::TProgram, name: str) -> bool {
     }
 }
 
+// (#98) is `name` a POLYMORPHIC BASE — a non-sealed class (`abstract`/`virtual`)? A base-typed
+// value lowers to the SAME fat pointer `{ data, vtable }` as an interface value (a companion
+// `tk_base_<name>` typedef), so a Sub→Base upcast + base-typed dispatch reuse the D3 machinery.
+fn cg_is_polymorphic_base(prog: checker::TProgram, name: str) -> bool {
+    match cg_find_decl(prog, name) {
+        parser::TypeDecl as td => match td.body {
+            parser::ClassBody as cb => match cb.kind { parser::ClassKind::Sealed => false; _ => true }
+            _ => false
+        }
+        error => false
+    }
+}
+
+// (#98) does class `sub` reach ANCESTOR class `want` through the base chain (transitively)?
+// Codegen mirror of the checker's subclass_reaches — used to decide when a class value at a
+// base-typed slot is a STRICT-subclass upcast (needs the fat-pointer wrap). Hop-bounded.
+fn cg_subclass_reaches(prog: checker::TProgram, sub: str, want: str, depth: i64) -> bool {
+    if depth <= 0 { return false }
+    match cg_find_decl(prog, sub) {
+        parser::TypeDecl as td => match td.body {
+            parser::ClassBody as cb => {
+                if !cb.has_base { return false }
+                if cb.base_name == want { return true }
+                cg_subclass_reaches(prog, cb.base_name, want, depth - 1)
+            }
+            _ => false
+        }
+        error => false
+    }
+}
+
 // (W10b.CLASS increment 4) SOUNDNESS GUARD: does expression `e` read `name` ANYWHERE, with NO
 // exemptions? This is DELIBERATELY NOT escape.tks's `mark_expr` — that walker's "a scalar field
 // off a bare local is a safe stack-member copy" refinement is sound for an ordinary STRUCT
@@ -709,7 +740,11 @@ fn emit_type(buf: []byte, prog: checker::TProgram, t: checker::Type) -> []byte |
         // (W10b.CLASS increment 3) a CLASS is a REFERENCE type — every use (locals, call-arg
         // types read off .type, …) lowers to a pointer, same rule as emit_type_expr.
         checker::Named as nm => {
-            if cg_is_class_named(prog, nm.name) { cb(mangle_type_name(buf, "", nm.name), " *") }
+            // (#98) a POLYMORPHIC-BASE-typed slot is the fat pointer `tk_base_<name>` (data +
+            // vtable), NOT the raw object pointer — so a Sub→Base upcast + base-typed dispatch
+            // reuse the D3 fat pointer. (An interface-typed slot is likewise its fat typedef.)
+            if cg_is_polymorphic_base(prog, nm.name) { cb(cb(buf, "tk_base_"), nm.name) }
+            else if cg_is_class_named(prog, nm.name) { cb(mangle_type_name(buf, "", nm.name), " *") }
             else { mangle_type_name(buf, "", nm.name) }
         }
         // VARIANT (`A | B | …`) — the generated tk_u_<keys> tagged-union struct (B-cg2). Its
@@ -1065,6 +1100,10 @@ fn emit_type_expr(buf: []byte, prog: checker::TProgram, te: parser::TypeExpr) ->
             // the ONE place that decision fans out from: params, returns, fields, locals all call
             // emit_type_expr, so a class becomes `tk_t_Name *` everywhere with no special-casing
             // at each call site.
+            // (#98) a POLYMORPHIC-BASE-typed annotation (`s: Animal`, `-> Animal`, a field of base
+            // type) is the fat pointer `tk_base_<name>`, matching cg_emit_c_type — so a base-typed
+            // param/return/field reuses the D3 fat pointer. A sealed class stays a raw pointer.
+            if cg_is_polymorphic_base(prog, last) { return cb(cb(buf, "tk_base_"), last) }
             match cg_find_decl(prog, last) {
                 parser::TypeDecl as cd => match cd.body {
                     parser::ClassBody => return cb(mangle_type_name(buf, "", last), " *")
@@ -1611,12 +1650,15 @@ fn emit_iface_call(buf: []byte, prog: checker::TProgram, ret_type: checker::Type
     }
     let iface = p.segments[p.segments.len - 2].name
     let t = fresh_named("_tid", buf.len to i64)
+    let iface_t = checker::Named { name = iface }
     mut out = cb(buf, "({ ")
-    out = mangle_type_name(out, "", iface)
+    // (#98) the receiver temp's C type is the fat-pointer typedef of the dispatch target — the
+    // interface typedef `tk_t_<iface>` OR, for a base-class dispatch, `tk_base_<base>`. Route
+    // through emit_type (not raw mangle_type_name, which would emit the base's OBJECT struct).
+    out = match emit_type(out, prog, iface_t) { []byte as o => o; error as err => return err }
     out = cb(out, " ")
     out = cb(out, t)
     out = cb(out, " = ")
-    let iface_t = checker::Named { name = iface }
     out = match emit_as_r(out, prog, ret_type, iface_t, c.args[0], escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
     out = cb(out, "; ((")
     out = match emit_type(out, prog, f.ret) { []byte as o => o; error as err => return err }
@@ -3510,6 +3552,36 @@ fn emit_as_r(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, expe
                             io = cb(io, "_")
                             io = cb(io, en.name)
                             return cb(io, " }")
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+    // (#98) SUB→BASE upcast: a raw class instance upcasts into the base's fat pointer `tk_base_<B>`
+    // — the object pointer rides `.data`, the (subclass, base) static vtable rides `.vtable`.
+    // Fires when `expected` is a polymorphic base B and the value is either a STRICT subclass of B
+    // (`Dog`→`Animal`) OR a RAW construction of B itself (a factory's `return B{}` into the base
+    // ret slot) — a value ALREADY of the base fat-pointer type (a bound base local: TVar/field/etc)
+    // passes through unwrapped (its C rep is already `tk_base_<B>`). The concrete class picks the
+    // vtable, so a subclass override dispatches correctly through the base value.
+    match expected {
+        checker::Named as ben => {
+            if cg_is_polymorphic_base(prog, ben.name) {
+                match value.type {
+                    checker::Named as bvn => {
+                        if cg_is_class_named(prog, bvn.name) {
+                            let is_strict_sub = bvn.name != ben.name && cg_subclass_reaches(prog, bvn.name, ben.name, 64)
+                            let is_raw_self = bvn.name == ben.name && match value.kind { checker::TStructInit => true; _ => false }
+                            if is_strict_sub || is_raw_self {
+                                mut bo = cb(cb(buf, "(tk_base_"), ben.name)
+                                bo = cb(bo, "){ .data = (void *)(")
+                                bo = match emit_expr_ctx(bo, prog, ret_type, value, escaping, regions, fn_body, dctx) { []byte as r => r; error as err => return err }
+                                bo = cb(cb(cb(cb(bo, "), .vtable = tk_vt_"), bvn.name), "_"), ben.name)
+                                return cb(bo, " }")
+                            }
                         }
                     }
                     _ => {}
@@ -6622,12 +6694,19 @@ fn tk_emit_c(prog0: checker::TProgram) -> str | error {
                         b = mangle_type_name(b, "", d.name)
                         b = cb(b, ";\n")
                     }
-                    parser::ClassBody => {
+                    parser::ClassBody as fcb => {
                         b = cb(b, "typedef struct ")
                         b = mangle_type_name(b, "", d.name)
                         b = cb(b, " ")
                         b = mangle_type_name(b, "", d.name)
                         b = cb(b, ";\n")
+                        // (#98) a POLYMORPHIC base ALSO gets a companion FAT-POINTER typedef
+                        // `tk_base_<name>` — the D3 `{ data, vtable }` two-word rep a base-typed
+                        // slot lowers to. (A sealed class needs none — it is never a base.)
+                        match fcb.kind {
+                            parser::ClassKind::Sealed => {}
+                            _ => { b = cb(cb(cb(b, "typedef struct { void *data; void *const *vtable; } tk_base_"), d.name), ";\n") }
+                        }
                     }
                     // (W10b.D3) an INTERFACE (contract) value is a data+vtable FAT POINTER — the
                     // tk_closure-shaped two-word rep. It embeds nothing and nothing orders before
@@ -6712,6 +6791,31 @@ fn tk_emit_c(prog0: checker::TProgram) -> str | error {
                                         b = cb(b, if vmi == 0 { " (void *)&" } else { ", (void *)&" })
                                         b = cb_fn_name(b, mns, ms[vmi].name)
                                         vmi++
+                                    }
+                                    b = cb(b, " };\n")
+                                }
+                                // (#98) per-(class, BASE) vtable — `tk_vt_<Sub>_<Base>` — for every
+                                // POLYMORPHIC base `cd` IS-A (itself included, so a self-upcast of a
+                                // directly-instantiable virtual base resolves too). Slot i is the
+                                // base's i-th EFFECTIVE method (base_vtable_slot agrees). Each slot
+                                // points at THIS class's stamped method (the override, if any).
+                                let idd_is_poly_base = cg_is_polymorphic_base(prog, idd.name)
+                                let cd_is_a = cd.name == idd.name || cg_subclass_reaches(prog, cd.name, idd.name, 64)
+                                if idd_is_poly_base && cd_is_a {
+                                    let bms = match checker::base_vtable_methods(idd.name, vt_table) { []parser::Function as f => f; error => return error { message = "codegen: base method list failed (internal)" } }
+                                    b = cb(cb(cb(cb(b, "static void *const tk_vt_"), cd.name), "_"), idd.name)
+                                    b = cb(b, "[] = {")
+                                    if bms.len == 0 { b = cb(b, " (void *)0") }
+                                    mut bvmi: u64 = 0
+                                    loop {
+                                        if bvmi >= bms.len { break }
+                                        let bmns = match cg_find_method_ns(prog, cd.name, bms[bvmi].name) {
+                                            str as bns2 => bns2
+                                            null => return error { message = "codegen: subclass is missing a base method's stamped function (internal)" }
+                                        }
+                                        b = cb(b, if bvmi == 0 { " (void *)&" } else { ", (void *)&" })
+                                        b = cb_fn_name(b, bmns, bms[bvmi].name)
+                                        bvmi++
                                     }
                                     b = cb(b, " };\n")
                                 }
