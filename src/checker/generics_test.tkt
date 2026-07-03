@@ -144,3 +144,38 @@ fn gm_mk_o() -> GenMulti { return GenOther{ x = 9 } }
     let r = match gm_mk_o() { Gen<i64> as a => a.val; Gen<str> as b => 3; GenOther as c => c.x }
     teko::assert::is_true(r == 9)
 }
+
+// ── (W10b.D2, issue #99) METHOD DISPATCH on a single-interface-atom-constrained `T` ──────────
+// `<T: I>` (I an interface) now unlocks OPERATING on T — a method call `x.area()` inside the
+// generic body resolves to I's contract method, monomorphized to the concrete class at each call
+// site (D3 vtable dispatch, reused). Two conforming classes flow through the SAME generic body;
+// two methods (a plain one + an arg-taking one) prove slot indexing. Runs on the VM in both
+// engines — the checker types it, the mono pass stamps geo_measure__g__Sq / geo_measure__g__Tri,
+// and the VM dispatches each through the concrete class's method.
+type Geo = interface {
+    fn area(self) -> i64
+    fn scaled(self, k: i64) -> i64
+}
+type Sq = class & Geo {
+    pub s: i64
+    pub fn make(v: i64) -> Sq { Sq { s = v } }
+    pub fn area(self) -> i64 { self.s * self.s }
+    pub fn scaled(self, k: i64) -> i64 { self.area() * k }
+}
+type Tri = class & Geo {
+    pub b: i64
+    pub fn make(v: i64) -> Tri { Tri { b = v } }
+    pub fn area(self) -> i64 { self.b * 10 }
+    pub fn scaled(self, k: i64) -> i64 { self.area() + k }
+}
+// OPERATING on the constrained T: both methods dispatch through the interface.
+fn geo_measure<T: Geo>(x: T, k: i64) -> i64 { return x.area() + x.scaled(k) }
+
+// concrete class #1 (Sq, side 3): area=9, scaled(2)=18 → 27
+#test fn constrained_method_dispatch_class1_runs() {
+    teko::assert::is_true(geo_measure(Sq::make(3), 2) == 27)
+}
+// concrete class #2 (Tri, base 4): area=40, scaled(5)=45 → 85 — the SAME generic body, a 2nd type
+#test fn constrained_method_dispatch_class2_runs() {
+    teko::assert::is_true(geo_measure(Tri::make(4), 5) == 85)
+}
