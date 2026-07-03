@@ -16,6 +16,10 @@ TK_RESULT(tk_type_decl, tk_decl_result);   // TypeDecl | error
 
 // Build a checker error "<msg>: <name>" — names the offending symbol (M.3 — clarify, never vague).
 tk_error tk_error_named(const char *msg, tk_str name);
+// (#121) Byte-identical twin builders — weave a name INTO the sentence (matching the .tks
+// `$"…{x}…"` interpolation) instead of appending "…: name". One / two woven names.
+tk_error tk_error_woven1(const char *a, tk_str n1, const char *b);
+tk_error tk_error_woven2(const char *a, tk_str n1, const char *b, tk_str n2, const char *c);
 
 tk_decl_result tk_type_table_find(tk_type_table table, tk_str name);
 tk_type_result tk_resolve_type(tk_type_expr te, tk_type_table table);
