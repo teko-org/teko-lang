@@ -817,7 +817,7 @@ fn checker_type_path_expr() {
     let ct = color_enum_table()
     let segs: []parser::Segment = teko::list::push(teko::list::push(teko::list::empty(), parser::Segment { name = "Color" }), parser::Segment { name = "RED" })
     let pe = parser::PathExpr { path = parser::Path { segments = segs } }
-    let per = match type_path_expr(pe, ct) { TExpr as te => te; error => { teko::assert::is_true(false); return } }
+    let per = match type_path_expr(pe, ct, "") { TExpr as te => te; error => { teko::assert::is_true(false); return } }   // (#109 W1) ref_ns = "" in the test
     match per.type { Named as n => teko::assert::is_true(n.name == "Color"); _ => teko::assert::is_true(false) }
 }
 
@@ -1067,16 +1067,16 @@ fn resolves_generic_type_instantiation() {
     let inst = parser::NamedType { path = parser::Path { segments = teko::list::push(teko::list::empty(), parser::Segment { name = "Box" }) }; args = one }
     // (#110) `resolve_type` returns `Type | error`; `Named` is a case of the INNER `Type` variant,
     // not a direct case of the outer `Type | error` subject — double-match (Type as t => match t {…}).
-    teko::assert::is_true(match resolve_type(inst, tbl) { Type as t => match t { Named as n => n.name == "Box__g__i64"; _ => false }; error => false })
+    teko::assert::is_true(match resolve_type(inst, tbl, "") { Type as t => match t { Named as n => n.name == "Box__g__i64"; _ => false }; error => false })
 
     // wrong arity Box<i64, str> → error
     mut two: []parser::TypeExpr = teko::list::push(teko::list::empty(), ttype_named("i64"))
     two = teko::list::push(two, ttype_named("str"))
     let inst2 = parser::NamedType { path = parser::Path { segments = teko::list::push(teko::list::empty(), parser::Segment { name = "Box" }) }; args = two }
-    teko::assert::is_true(match resolve_type(inst2, tbl) { error => true; _ => false })
+    teko::assert::is_true(match resolve_type(inst2, tbl, "") { error => true; _ => false })
 
     // a plain `Box` (no args) still resolves nominally — no regression. (#110: double-match, see above.)
-    teko::assert::is_true(match resolve_type(ttype_named("Box"), tbl) { Type as t => match t { Named as n => n.name == "Box"; _ => false }; error => false })
+    teko::assert::is_true(match resolve_type(ttype_named("Box"), tbl, "") { Type as t => match t { Named as n => n.name == "Box"; _ => false }; error => false })
 
     // generic_inst_name / type_mangle directly: Box + [i64, str] → "Box__g__i64__str".
     mut at: []Type = teko::list::push(teko::list::empty(), i64t())
@@ -1088,13 +1088,13 @@ fn resolves_generic_type_instantiation() {
 #test
 fn resolves_ptr_generic() {
     let ptr_i64 = parser::NamedType { path = parser::Path { segments = teko::list::push(teko::list::empty(), parser::Segment { name = "ptr" }) }; args = teko::list::push(teko::list::empty(), ttype_named("i64")) }
-    let pi = match resolve_type(ptr_i64, empty_table()) { Type as t => t; error => { teko::assert::is_true(false); return } }
+    let pi = match resolve_type(ptr_i64, empty_table(), "") { Type as t => t; error => { teko::assert::is_true(false); return } }
     // STRUCTURE (VM-safe): ptr<i64> → Ptr{inner present = i64}; opaque ptr = Ptr{inner null}; distinct.
     // (exact `ptr_i64`/`ptr<i64>` mangle/render is verified via real codegen, not here — the VM drops
     // a self-recursive match arm's string prefix; see selfhost-vm-perf.)
     teko::assert::is_true(match pi { Ptr as p => match p.inner { null => false; Type as t => match t { Prim => true; _ => false } }; _ => false })
     teko::assert::is_true(type_eq(pi, pi))
-    let bare = match resolve_type(ttype_named("ptr"), empty_table()) { Type as t => t; error => { teko::assert::is_true(false); return } }
+    let bare = match resolve_type(ttype_named("ptr"), empty_table(), "") { Type as t => t; error => { teko::assert::is_true(false); return } }
     teko::assert::is_true(match bare { Ptr as p => match p.inner { null => true; Type => false }; _ => false })   // opaque ptr = null inner
     teko::assert::is_true(!type_eq(bare, pi))   // opaque ptr ≠ ptr<i64>
 }
@@ -1105,7 +1105,7 @@ fn resolves_ptr_generic() {
 #test
 fn resolves_ref_generic() {
     let ref_i64 = parser::NamedType { path = parser::Path { segments = teko::list::push(teko::list::empty(), parser::Segment { name = "Ref" }) }; args = teko::list::push(teko::list::empty(), ttype_named("i64")) }
-    let ri = match resolve_type(ref_i64, empty_table()) { Type as t => t; error => { teko::assert::is_true(false); return } }
+    let ri = match resolve_type(ref_i64, empty_table(), "") { Type as t => t; error => { teko::assert::is_true(false); return } }
     teko::assert::is_true(match ri { Reference as r => match r.inner { Prim => true; _ => false }; _ => false })   // Ref<i64> = Reference{inner = i64}
     teko::assert::is_true(type_eq(ri, ri))
     // NOTE: `ref<i64> ≠ ptr<i64>` (and `ref<i64> ≠ i64`) holds NATIVELY (tag discrimination) but is
@@ -1114,9 +1114,9 @@ fn resolves_ref_generic() {
     // so VM `type_eq(ref<i64>, ptr<i64>)` is unreliable. The native engine verifies distinctness.
     // `Ref<void>` is invalid — void is not a value.
     let ref_void = parser::NamedType { path = parser::Path { segments = teko::list::push(teko::list::empty(), parser::Segment { name = "Ref" }) }; args = teko::list::push(teko::list::empty(), ttype_named("void")) }
-    teko::assert::is_true(match resolve_type(ref_void, empty_table()) { error => true; _ => false })
+    teko::assert::is_true(match resolve_type(ref_void, empty_table(), "") { error => true; _ => false })
     // bare `Ref` (no type argument) is invalid.
-    teko::assert::is_true(match resolve_type(ttype_named("Ref"), empty_table()) { error => true; _ => false })
+    teko::assert::is_true(match resolve_type(ttype_named("Ref"), empty_table(), "") { error => true; _ => false })
 }
 
 // ---------------------------------------------------------------------------
@@ -1144,18 +1144,18 @@ fn mem_ref_nonscalar_inner_allowed() {
     // Ref<i64> (a scalar prim) → Reference. (allowed) — descend like resolves_ref_generic (VM-safe).
     // (#110) resolve_type returns `Type | error`; Reference is a case of the INNER `Type` variant —
     // double-match the outer Type case first.
-    teko::assert::is_true(match resolve_type(ref_te("i64"), empty_table()) { Type as t => match t { Reference as r => match r.inner { Prim => true; _ => false }; _ => false }; error => false })
+    teko::assert::is_true(match resolve_type(ref_te("i64"), empty_table(), "") { Type as t => match t { Reference as r => match r.inner { Prim => true; _ => false }; _ => false }; error => false })
     // Ref<Foo> (a struct/Named inner) → Reference. (ALLOWED under W9a) — inner is a Named (VM-reliable).
-    teko::assert::is_true(match resolve_type(ref_te("Foo"), foo_table()) { Type as t => match t { Reference as r => match r.inner { Named => true; _ => false }; _ => false }; error => false })
+    teko::assert::is_true(match resolve_type(ref_te("Foo"), foo_table(), "") { Type as t => match t { Reference as r => match r.inner { Named => true; _ => false }; _ => false }; error => false })
     // Ref<[]i64> (a slice inner) → Reference. (ALLOWED under W9a) — assert the OUTER tag only; the inner
     // is a Slice (a single-field wrapper), so `match r.inner { Slice => }` is unreliable in the VM
     // (transparent-field-descent); the native engine verifies the inner Slice.
-    teko::assert::is_true(match resolve_type(ref_te_of(parser::SliceType { element = ttype_named("i64") }), empty_table()) { Type as t => match t { Reference => true; _ => false }; error => false })
+    teko::assert::is_true(match resolve_type(ref_te_of(parser::SliceType { element = ttype_named("i64") }), empty_table(), "") { Type as t => match t { Reference => true; _ => false }; error => false })
     // Ref<void> → error (void is not a value).
-    teko::assert::is_true(match resolve_type(ref_te("void"), empty_table()) { error => true; _ => false })
+    teko::assert::is_true(match resolve_type(ref_te("void"), empty_table(), "") { error => true; _ => false })
     // Ref<Ref<i64>> → error (no ref-to-ref). The inner resolves to a Reference, which R1 rejects —
     // VM-reliable: the inner type-expr `Ref<i64>` is itself resolved, hits the Reference reject arm.
-    teko::assert::is_true(match resolve_type(ref_te_of(ref_te("i64")), empty_table()) { error => true; _ => false })
+    teko::assert::is_true(match resolve_type(ref_te_of(ref_te("i64")), empty_table(), "") { error => true; _ => false })
     // NOTE: Ref<i64?> (optional inner) is ALSO allowed under W9a but NOT asserted in the VM — a
     // CONSTRUCTED Reference{inner=Optional} cannot be discriminated by the inner in the VM (the
     // transparent-field-descent caveat); the native engine (`teko build`) verifies it. Ref<ptr<i64>>
@@ -1175,7 +1175,7 @@ fn mem_ref_nonscalar_inner_allowed() {
 #test
 fn mem_ref_not_nullable() {
     let ref_opt = parser::OptionalType { inner = ref_te_of(ref_te("i64")) }   // Ref<Ref<i64>>?
-    teko::assert::is_true(match resolve_type(ref_opt, empty_table()) { error => true; _ => false })
+    teko::assert::is_true(match resolve_type(ref_opt, empty_table(), "") { error => true; _ => false })
 }
 
 // (MEM Step 0, R3) NOT a RETURN type — a function returning a reference is an error; the same fn
@@ -1217,10 +1217,10 @@ fn mem_ref_not_struct_field() {
 #test
 fn mem_ref_not_collection_or_variant() {
     // []Ref<Ref<i64>> → error.
-    teko::assert::is_true(match resolve_type(parser::SliceType { element = ref_te_of(ref_te("i64")) }, empty_table()) { error => true; _ => false })
+    teko::assert::is_true(match resolve_type(parser::SliceType { element = ref_te_of(ref_te("i64")) }, empty_table(), "") { error => true; _ => false })
     // Ref<Ref<i64>> | i64 → error (a reference may not be a variant member).
     let members: []parser::TypeExpr = teko::list::push(teko::list::push(teko::list::empty(), ref_te_of(ref_te("i64"))), ttype_named("i64"))
-    teko::assert::is_true(match resolve_type(parser::UnionType { members = members }, empty_table()) { error => true; _ => false })
+    teko::assert::is_true(match resolve_type(parser::UnionType { members = members }, empty_table(), "") { error => true; _ => false })
 }
 
 // (MEM Step 0, R5) NOT a let/mut/const BINDING type — `let r: Ref<…> = …` is an error; a scalar
@@ -1319,7 +1319,7 @@ fn instantiate_types_stamps_concrete_decl() {
     let items: []parser::Item = teko::list::push(teko::list::empty(), parser::Item { content = node; namespace = ""; file = "" })
     let ext = instantiate_types(parser::Program { items = items }, tbl)
     // Box__g__i64 = struct { value: i64 } is now in the table (T substituted to i64).
-    match type_table_find(ext, "Box__g__i64") {
+    match type_table_find(ext, "Box__g__i64", "") {   // (#109 W1) ref_ns = "" in the test
         parser::TypeDecl as d => match d.body {
             parser::StructBody as sb => {
                 teko::assert::is_true(sb.fields.len == 1)
@@ -1379,10 +1379,10 @@ fn bind_pattern_explicit_type_args_resolves_instance() {
     let bp = parser::BindPattern { type_name = path1("Box"); has_binding = true; binding = "x"; is_slice = false; slice_type = null; type_args = args }
     // (#110) bind_pattern_type returns `Type | error`; Named is a case of the INNER `Type` variant —
     // double-match the outer Type case first.
-    teko::assert::is_true(match bind_pattern_type(bp, tbl) { Type as t => match t { Named as n => n.name == "Box__g__i64"; _ => false }; error => false })
+    teko::assert::is_true(match bind_pattern_type(bp, tbl, "") { Type as t => match t { Named as n => n.name == "Box__g__i64"; _ => false }; error => false })   // (#109 W1) ref_ns = "" in the test
     // a bare bind (no type-args) keeps the base name (no regression).
     let plain = parser::BindPattern { type_name = path1("Box"); has_binding = true; binding = "x"; is_slice = false; slice_type = null; type_args = teko::list::empty() }
-    teko::assert::is_true(match bind_pattern_type(plain, tbl) { Type as t => match t { Named as n => n.name == "Box"; _ => false }; error => false })
+    teko::assert::is_true(match bind_pattern_type(plain, tbl, "") { Type as t => match t { Named as n => n.name == "Box"; _ => false }; error => false })   // (#109 W1) ref_ns = "" in the test
 }
 
 // ---------------------------------------------------------------------------
