@@ -890,6 +890,16 @@ static bool widens_into_at(tk_type from, tk_type to, tk_type_table table, int de
         && tk_is_interface_name(to.as.named.name, table)
         && tk_type_conforms_to(from.as.named.name, to.as.named.name, table))
         return true;
+    // (#98) A CLASS instance ALSO widens into an ANCESTOR class (`let a: Animal = dog`) — the
+    // Sub→Base upcast, reusing the SAME fat pointer (data + the base's virtual vtable). Nominal:
+    // `from` must be a (transitive) subclass of `to`, and `to` must be a polymorphic base
+    // (`abstract`/`virtual`) — a `sealed` class can never be a base, so it never widens into.
+    if (from.tag == TK_TYPE_NAMED && to.tag == TK_TYPE_NAMED
+        && !name_eq(from.as.named.name, to.as.named.name)
+        && tk_is_class_name(from.as.named.name, table)
+        && tk_is_polymorphic_base(to.as.named.name, table)
+        && tk_subclass_reaches(from.as.named.name, to.as.named.name, table, 64))
+        return true;
     tk_type tv = tk_expand_variant(to, table);   // a NAMED variant → its members (so cases widen in)
     if (tv.tag == TK_TYPE_VARIANT)
         for (size_t i = 0; i < tv.as.variant.len; i += 1)
@@ -915,6 +925,26 @@ bool tk_is_interface_name(tk_str name, tk_type_table table) {
 bool tk_is_class_name(tk_str name, tk_type_table table) {
     tk_decl_result d = tk_type_table_find(table, name);
     return d.ok && d.as.value.body.tag == TK_BODY_CLASS;
+}
+
+// (#98) is `name` a POLYMORPHIC BASE — a class that MAY be inherited (`abstract`/`virtual`, never
+// `sealed`)? See resolve.tks::is_polymorphic_base for the rationale.
+bool tk_is_polymorphic_base(tk_str name, tk_type_table table) {
+    tk_decl_result d = tk_type_table_find(table, name);
+    return d.ok && d.as.value.body.tag == TK_BODY_CLASS
+        && d.as.value.body.as.class_body.kind != TK_CLASS_SEALED;
+}
+
+// (#98) does class `sub` reach ANCESTOR class `want` through the `base_name` chain, transitively?
+// Hop-bounded (cyclic inheritance is decl-rejected). Mirror of resolve.tks::subclass_reaches.
+bool tk_subclass_reaches(tk_str sub, tk_str want, tk_type_table table, int depth) {
+    if (depth <= 0) return false;
+    tk_decl_result d = tk_type_table_find(table, sub);
+    if (!d.ok || d.as.value.body.tag != TK_BODY_CLASS) return false;
+    tk_class_body cb = d.as.value.body.as.class_body;
+    if (!cb.has_base) return false;
+    if (name_eq(cb.base_name, want)) return true;
+    return tk_subclass_reaches(cb.base_name, want, table, depth - 1);
 }
 
 // (TR0) is `name` declared as a trait? Mirror of resolve.tks::is_trait_name — used by the honest

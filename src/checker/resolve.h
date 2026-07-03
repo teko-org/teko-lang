@@ -57,6 +57,8 @@ bool tk_is_interface_name(tk_str name, tk_type_table table);
 bool tk_is_class_name(tk_str name, tk_type_table table);
 bool tk_is_trait_name(tk_str name, tk_type_table table);   // (TR0) decl-tag probe for the trait honest stops
 bool tk_type_conforms_to(tk_str name, tk_str iface, tk_type_table table);
+bool tk_is_polymorphic_base(tk_str name, tk_type_table table);   // (#98) a non-sealed class — may be a base
+bool tk_subclass_reaches(tk_str sub, tk_str want, tk_type_table table, int depth);   // (#98) Sub→Base ancestor walk
 // (#83) does `t` carry a SENTINEL slice/optional (element/inner == NULL) anywhere, incl. nested
 // (`[]NULL`, `[][]NULL`, `(NULL)?`, …)? Shared by tk_type_join's concrete-preference tie-break and
 // by array-literal element retyping (expr.c::type_array_lit) once the joined element is concrete.

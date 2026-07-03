@@ -178,10 +178,15 @@ fn widens_into_at(from: Type, to: Type, table: TypeTable, depth: i64) -> bool {
     // conforms to: `let s: Shape = circle`. Classes only (reference semantics ride the object
     // pointer into the fat-pointer `data` field); a STRUCT is pure value data — no stable
     // address to dispatch on — so it does NOT widen (its conformance still serves `<T: I>`).
+    // (#98) A CLASS instance ALSO widens into an ANCESTOR class (`let a: Animal = dog`) — the
+    // Sub→Base upcast, reusing the SAME fat pointer (data + the base's virtual vtable). Nominal:
+    // `from` must be a (transitive) subclass of `to`, and `to` must be a polymorphic base
+    // (`abstract`/`virtual`) — a `sealed` class can never be a base, so it never widens into.
     match from {
         Named as fname => match to {
             Named as tname => {
                 if is_class_name(fname.name, table) && is_interface_name(tname.name, table) && type_conforms_to(fname.name, tname.name, table) { return true }
+                if fname.name != tname.name && is_class_name(fname.name, table) && is_polymorphic_base(tname.name, table) && subclass_reaches(fname.name, tname.name, table, 64) { return true }
             }
             _ => {}
         }
@@ -221,6 +226,34 @@ pub fn is_class_name(name: str, table: TypeTable) -> bool {
         parser::TypeDecl as td => match td.body { parser::ClassBody => true; _ => false }
         error => false
     }
+}
+
+// (#98) is `name` a POLYMORPHIC BASE — a class that MAY be inherited (`abstract`/`virtual`, never
+// `sealed`)? A Sub→Base upcast (and the base-typed dispatch/fat-pointer it enables) is only sound
+// against such a class: a `sealed` class can never be anyone's base, so a base-typed value of it
+// can only ever BE it — no polymorphism to model. Mirror of resolve.c::tk_is_polymorphic_base.
+pub fn is_polymorphic_base(name: str, table: TypeTable) -> bool {
+    match type_table_find(table, name) {
+        parser::TypeDecl as td => match td.body {
+            parser::ClassBody as cb => match cb.kind { parser::ClassKind::Sealed => false; _ => true }
+            _ => false
+        }
+        error => false
+    }
+}
+
+// (#98) does class `sub` reach ANCESTOR class `want` through the `base_name` chain, transitively?
+// Hop-bounded (cyclic inheritance is decl-rejected; the bound keeps this total regardless). Used
+// by the Sub→Base widen. Mirror of resolve.c::tk_subclass_reaches.
+pub fn subclass_reaches(sub: str, want: str, table: TypeTable, depth: i64) -> bool {
+    if depth <= 0 { return false }
+    let cb = match type_table_find(table, sub) {
+        parser::TypeDecl as td => match td.body { parser::ClassBody as b => b; _ => return false }
+        error => return false
+    }
+    if !cb.has_base { return false }
+    if cb.base_name == want { return true }
+    subclass_reaches(cb.base_name, want, table, depth - 1)
 }
 
 // (TR0) is `name` declared as a trait? Mirror of resolve.c::tk_is_trait_name. Used by the
