@@ -1351,10 +1351,13 @@ static bool emit_iface_call(cbuf *b, const tk_texpr *e, const char **err) {
         return fail_node(err, "codegen: malformed interface-dispatch node (internal)");
     tk_str iface = p.segments[p.len - 2].name;
     char t[40]; snprintf(t, sizeof t, "_tid%zu", (size_t)b->len);
-    cb(b, "({ ");
-    mangle_type_name(b, (tk_str){ NULL, 0 }, iface);
-    cb(b, " "); cb(b, t); cb(b, " = ");
     tk_type iface_t = { .tag = TK_TYPE_NAMED, .as.named.name = iface };
+    cb(b, "({ ");
+    // (#98) the receiver temp's C type is the fat-pointer typedef of the dispatch target — the
+    // interface typedef `tk_t_<iface>` OR, for a base-class dispatch, `tk_base_<base>`. Route
+    // through emit_type (not raw mangle_type_name, which would emit the base's OBJECT struct).
+    if (!emit_type(b, iface_t, err)) return false;
+    cb(b, " "); cb(b, t); cb(b, " = ");
     if (!emit_as(b, iface_t, &e->as.call.args[0], err)) return false;
     cb(b, "; ((");
     if (!emit_type(b, *ift.as.func.ret, err)) return false;
@@ -3176,6 +3179,29 @@ static bool emit_as(cbuf *b, tk_type expected, const tk_texpr *value, const char
         cb_str(b, value->type.as.named.name); cb(b, "_"); cb_str(b, expected.as.named.name);
         cb(b, " }");
         return true;
+    }
+    // (#98) SUB→BASE upcast: a raw class instance upcasts into the base's fat pointer `tk_base_<B>`
+    // — the object pointer rides `.data`, the (subclass, base) static vtable rides `.vtable`.
+    // Fires when `expected` is a polymorphic base B and the value is either a STRICT subclass of B
+    // (`Dog`→`Animal`) OR a RAW construction of B itself (a factory's `return B{}` into the base
+    // ret slot) — a value ALREADY of the base fat-pointer type (a bound base local: TVar/field/etc)
+    // passes through unwrapped (its C rep is already `tk_base_<B>`). The concrete class picks the
+    // vtable, so a subclass override dispatches correctly through the base value.
+    if (expected.tag == TK_TYPE_NAMED && cg_is_polymorphic_base(expected.as.named.name)
+        && value->type.tag == TK_TYPE_NAMED && cg_is_class_named(value->type.as.named.name)) {
+        bool is_strict_sub = !cg_name_eq(value->type.as.named.name, expected.as.named.name)
+            && cg_subclass_reaches(value->type.as.named.name, expected.as.named.name, 64);
+        bool is_raw_self = cg_name_eq(value->type.as.named.name, expected.as.named.name)
+            && value->tag == TK_TEXPR_STRUCT_INIT;
+        if (is_strict_sub || is_raw_self) {
+            cb(b, "(tk_base_"); cb_str(b, expected.as.named.name);
+            cb(b, "){ .data = (void *)(");
+            if (!emit_expr(b, value, err)) return false;
+            cb(b, "), .vtable = tk_vt_");
+            cb_str(b, value->type.as.named.name); cb(b, "_"); cb_str(b, expected.as.named.name);
+            cb(b, " }");
+            return true;
+        }
     }
     // (fix/selfhost-arm-join-widen) ARM-JOIN WIDEN: an `if`/`match` USED AS A VALUE whose two arms
     // are DIFFERENT members of a WIDER annotated variant. The checker's type_join infers the NARROW
