@@ -8,17 +8,126 @@ type TypeReg   = struct { name: str; namespace: str; vis: parser::Visibility; de
 pub type TypeTable = []TypeReg
 
 // find a user type by name; error if not registered.
-// (#109 W1) `ref_ns` = the REFERENCING namespace (the namespace of the code that wrote this type
-// reference). Reserved for the R0-R5 resolution rules (W2); the W1 body IGNORES it (behavior stays
-// byte-identical — only the plumbing lands now).
+// (#109) `ref_ns` = the REFERENCING namespace (the namespace of the code that wrote this type
+// reference). This is the RESOLVED-NAME probe: a flat name lookup, IGNORING ref_ns. It is used by
+// the ~31 internal probes that walk ALREADY-RESOLVED names (bare Named{...} in the Type model — no
+// path, no namespace to check). The namespace-aware SOURCE-reference sites (resolve_named,
+// resolve_generic_inst) call resolve_type_ref instead, applying R0-R5 over the full path.
 fn type_table_find(table: TypeTable, name: str, ref_ns: str) -> parser::TypeDecl | error {
-    // (#109 W1) reserved for the R0-R5 rules (W2)
+    // (#109) ref_ns is intentionally unused here — a resolved-name probe is namespace-blind. Every
+    // caller of THIS function passes ref_ns = "" (a resolved Named carries no source path/qualifier).
     mut i = 0
     loop {
         if i >= table.len { break }
         if table[i].name == name { return table[i].decl }
         i++
     }
+    error { message = "not a user type" }
+}
+
+// (#109 W2) does the qualifier `qual` (a path's segments BEFORE the last, joined with "::") select
+// namespace `ns`? A qualifier matches when `ns` equals it OR ends with `"::" ~ qual` — so the single
+// segment `emit` matches the canonical `teko::emit`, and the absolute `teko::emit` matches exactly
+// (R0, a special case of R4). An empty qualifier (a bare 1-segment path) never reaches here.
+fn qualifier_selects_ns(ns: str, qual: str) -> bool {
+    if ns == qual { return true }
+    teko::runtime::str_ends_with(ns, "::" ~ qual)
+}
+
+// (#109 W2) join a path's FIRST `count` segments with "::" — the qualifier of a qualified reference
+// (`teko::emit::Reader` with count=2 → "teko::emit"; `lexer::Token` with count=1 → "lexer").
+fn path_qualifier(path: parser::Path, count: u64) -> str {
+    mut out = ""
+    mut i: u64 = 0
+    loop {
+        if i >= count { break }
+        if i == 0 { out = path.segments[i].name } else { out = out ~ "::" ~ path.segments[i].name }
+        i++
+    }
+    out
+}
+
+// (#109 W2) list the namespaces a bare name IS declared in (for the R3 fail-loud diagnostic), joined
+// with ", "; "" is rendered "<top-level>". O(n) scan — used only when a bare reference misses.
+fn namespaces_declaring(table: TypeTable, name: str) -> str {
+    mut out = ""
+    mut i: u64 = 0
+    loop {
+        if i >= table.len { break }
+        if table[i].name == name {
+            let label = if table[i].namespace == "" { "<top-level>" } else { table[i].namespace }
+            if out == "" { out = label } else { out = out ~ ", " ~ label }
+        }
+        i++
+    }
+    out
+}
+
+// (#109 W2) the namespace-aware SOURCE-reference resolver — R0-R5. `path` is the WRITTEN reference,
+// `ref_ns` the namespace of the code that wrote it. Resolves to the ONE declaration the reference
+// names, or a fail-loud error. R1 (type-params) and R2 (builtins) are handled by the callers BEFORE
+// this point (type_param_table registers params in ref_ns; builtin_type runs first). Here:
+//   R3 — BARE (a 1-segment path): resolve STRICTLY within ref_ns. A same-ns entry wins; a name that
+//        exists ONLY in other namespace(s) is REJECTED (the cross-namespace collision fix) with a
+//        diagnostic naming those namespaces. An unknown name → "not a user type" (the caller renders
+//        the final "unknown type" message, unchanged).
+//   R4/R0 — QUALIFIED (a >1-segment path): match the LAST segment AND the qualifier (segments minus
+//        the last). An entry matches when name == last AND its namespace is SELECTED by the qualifier
+//        (equals, or ends-with `::qualifier`) — so `emit::Reader` binds ns `teko::emit`, and a fully
+//        canonical `teko::emit::Reader` binds it exactly (R0). Exactly one match wins; zero → unknown;
+//        two or more → an ambiguity error listing the namespaces.
+//   Privates: found-then-rejected is left to the module-visibility pass (check_modules) — a private
+//        type in another namespace is MENTIONABLE here (so error wording is precise), the existing
+//        visibility check keeps rejecting it.
+fn resolve_type_ref(path: parser::Path, table: TypeTable, ref_ns: str) -> parser::TypeDecl | error {
+    if path.segments.len == 0 { return error { message = "not a user type" } }
+    let last = path.segments[path.segments.len - 1].name
+    if path.segments.len == 1 {
+        // R3 — BARE: strict own-namespace resolution.
+        mut i: u64 = 0
+        loop {
+            if i >= table.len { break }
+            if table[i].name == last && table[i].namespace == ref_ns { return table[i].decl }
+            i++
+        }
+        // No same-ns entry. If the name lives elsewhere, that is the cross-namespace collision — the
+        // reference is not visible bare and MUST be qualified (fail-loud). Otherwise it is simply
+        // unknown (the caller's "unknown type" message stands).
+        mut j: u64 = 0
+        loop {
+            if j >= table.len { break }
+            if table[j].name == last {
+                let nss = namespaces_declaring(table, last)
+                let here = if ref_ns == "" { "<top-level>" } else { ref_ns }
+                return error { message = $"type '{last}' is not visible bare from namespace '{here}' — it is declared in: {nss}. Qualify it (`ns::{last}`) or reference it from its own namespace." }
+            }
+            j++
+        }
+        return error { message = "not a user type" }
+    }
+    // R4 / R0 — QUALIFIED: match last segment + qualifier; unique winner, else ambiguity/unknown.
+    let qual = path_qualifier(path, path.segments.len - 1)
+    mut winner_idx: i64 = -1
+    mut matched_ns = ""
+    mut ambiguous = false
+    mut i2: u64 = 0
+    loop {
+        if i2 >= table.len { break }
+        if table[i2].name == last && qualifier_selects_ns(table[i2].namespace, qual) {
+            if winner_idx >= 0 && table[i2].namespace != matched_ns {
+                ambiguous = true
+            } else {
+                winner_idx = i2 to i64
+                matched_ns = table[i2].namespace
+            }
+        }
+        i2++
+    }
+    if ambiguous {
+        let nss = namespaces_declaring(table, last)
+        return error { message = $"ambiguous type reference '{qual}::{last}' — the qualifier matches more than one namespace ({nss}). Use the absolute path (`teko::…::{last}`)." }
+    }
+    if winner_idx >= 0 { return table[winner_idx to u64].decl }
     error { message = "not a user type" }
 }
 
@@ -82,17 +191,22 @@ pub fn type_param_table(type_params: []str, type_constraints: []parser::Constrai
 }
 
 // resolve a NAMED type (a path) to a semantic Type: built-in or user type.
-// (#109 W1) `ref_ns` = the referencing namespace; threaded down unchanged (reserved for W2's R0-R5).
+// (#109 W2) `ref_ns` = the referencing namespace; drives the R0-R5 resolution rules (via
+// resolve_type_ref). R2 builtins are matched FIRST (bare only — a builtin is never namespaced); the
+// user-type lookup then applies R3 (bare = strict own-ns) / R4/R0 (qualified = last+qualifier).
 fn resolve_named(path: parser::Path, table: TypeTable, ref_ns: str) -> Type | error {
-    // (#109 W1) reserved for the R0-R5 rules (W2)
     // M.1: an empty path is an internal invariant break — an honest error, never an out-of-bounds.
     if path.segments.len == 0 { return error { message = "internal: empty type path (a void/missing type used where a value type is required)" } }
     let name = path.segments[path.segments.len - 1].name   // seed: last segment
-    match builtin_type(name) {                  // u8…u64, byte, str, error, …
-        Type as t => return t
-        error     => {}
+    // R2 — a BUILTIN resolves only for a BARE reference (`u8`…`u64`, `byte`, `str`, `error`, …). A
+    // qualified path can never name a builtin, so a `ns::str` falls through to the user-type rules.
+    if path.segments.len == 1 {
+        match builtin_type(name) {
+            Type as t => return t
+            error     => {}
+        }
     }
-    match type_table_find(table, name, ref_ns) {        // a user struct/enum/variant/alias
+    match resolve_type_ref(path, table, ref_ns) {      // R0/R3/R4 — a user struct/enum/variant/alias
         // A TRANSPARENT alias `type Name = <type-expr>` resolves THROUGH to the aliased type
         // (self-host parity): `TypeTable = []TypeReg` → a Slice, `Foo = Circle` → its Named
         // struct, etc. struct/enum/variant decls stay NOMINAL (a bare Named of `name`).
@@ -109,7 +223,9 @@ fn resolve_named(path: parser::Path, table: TypeTable, ref_ns: str) -> Type | er
                 _                       => return Named { name = name }
             }
         }
-        error    => {}
+        // R3/R4 fail-loud diagnostics (cross-namespace collision, ambiguity) propagate verbatim;
+        // the plain "not a user type" sentinel becomes the caller-facing "unknown type" message.
+        error as e => { if e.message == "not a user type" { return error { message = $"unknown type: {name}" } } return e }
     }
     error { message = $"unknown type: {name}" }
 }
@@ -694,7 +810,7 @@ fn resolve_generic_inst(nt: parser::NamedType, table: TypeTable, ref_ns: str) ->
         argtypes = teko::list::push(argtypes, a)
         i++
     }
-    match type_table_find(table, name, ref_ns) {
+    match resolve_type_ref(nt.path, table, ref_ns) {   // (#109 W2) R0/R3/R4 over the WRITTEN path
         parser::TypeDecl as td => {
             if td.type_params.len == 0 {
                 return error { message = $"type `{name}` is not generic but was given type arguments" }
@@ -704,7 +820,9 @@ fn resolve_generic_inst(nt: parser::NamedType, table: TypeTable, ref_ns: str) ->
             }
             Named { name = generic_inst_name(name, argtypes) }
         }
-        error => error { message = $"unknown generic type: {name}" }
+        // R3/R4 fail-loud diagnostics propagate verbatim; the plain "not a user type" sentinel
+        // becomes the generic-specific "unknown generic type" message.
+        error as e => { if e.message == "not a user type" { return error { message = $"unknown generic type: {name}" } } return e }
     }
 }
 

@@ -202,12 +202,107 @@ static tk_type *box(tk_type t) {
 }
 
 tk_decl_result tk_type_table_find(tk_type_table table, tk_str name, tk_str ref_ns) {
-    (void)ref_ns;   // (#109 W1) reserved for the R0-R5 rules (W2)
+    (void)ref_ns;   // (#109) resolved-name probe — namespace-blind (every caller passes ref_ns = "")
     for (size_t i = 0; i < table.len; i += 1) {
         if (name_eq(table.ptr[i].name, name)) {
             return (tk_decl_result){ .ok = true, .as.value = table.ptr[i].decl };
         }
     }
+    return (tk_decl_result){ .ok = false, .as.error = tk_error_make("not a user type") };
+}
+
+// (#109 W2) does `s` end with `suffix`? Local byte-compare twin of teko::runtime::str_ends_with,
+// kept in-file to keep the module DAG tight (like rt_cstr/rt_concat). An empty suffix always matches.
+static bool str_ends_with(tk_str s, tk_str suffix) {
+    if (suffix.len > s.len) return false;
+    return memcmp(s.ptr + (s.len - suffix.len), suffix.ptr, suffix.len) == 0;
+}
+
+// (#109 W2) does the qualifier `qual` select namespace `ns`? True when `ns` equals it OR ends with
+// "::" ~ qual — so `emit` matches `teko::emit`, and `teko::emit` matches exactly (R0). Mirror of
+// resolve.tks::qualifier_selects_ns.
+static bool qualifier_selects_ns(tk_str ns, tk_str qual) {
+    if (name_eq(ns, qual)) return true;
+    tk_str sep = rt_concat(rt_cstr("::"), qual);
+    return str_ends_with(ns, sep);
+}
+
+// (#109 W2) join a path's FIRST `count` segments with "::" — the qualifier of a qualified reference.
+// Mirror of resolve.tks::path_qualifier.
+static tk_str path_qualifier(tk_path path, size_t count) {
+    tk_str out = rt_cstr("");
+    for (size_t i = 0; i < count; i += 1) {
+        if (i == 0) out = path.segments[i].name;
+        else        out = rt_concat(rt_concat(out, rt_cstr("::")), path.segments[i].name);
+    }
+    return out;
+}
+
+// (#109 W2) the namespaces a bare name is declared in, joined with ", " ("" → "<top-level>"). Used
+// only for the R3/R4 fail-loud diagnostics. Mirror of resolve.tks::namespaces_declaring.
+static tk_str namespaces_declaring(tk_type_table table, tk_str name) {
+    tk_str out = rt_cstr("");
+    for (size_t i = 0; i < table.len; i += 1) {
+        if (name_eq(table.ptr[i].name, name)) {
+            tk_str label = table.ptr[i].namespace.len == 0 ? rt_cstr("<top-level>") : table.ptr[i].namespace;
+            out = out.len == 0 ? label : rt_concat(rt_concat(out, rt_cstr(", ")), label);
+        }
+    }
+    return out;
+}
+
+// (#109 W2) the namespace-aware SOURCE-reference resolver — R0-R5. See resolve.tks::resolve_type_ref
+// for the rule text. R1/R2 are handled by the callers before this point. Here: R3 (bare = strict
+// own-ns, cross-ns bare = fail-loud) and R4/R0 (qualified = last + qualifier, ambiguity = fail-loud).
+static tk_decl_result resolve_type_ref(tk_path path, tk_type_table table, tk_str ref_ns) {
+    if (path.len == 0) return (tk_decl_result){ .ok = false, .as.error = tk_error_make("not a user type") };
+    tk_str last = path.segments[path.len - 1].name;
+    if (path.len == 1) {
+        // R3 — BARE: strict own-namespace resolution.
+        for (size_t i = 0; i < table.len; i += 1) {
+            if (name_eq(table.ptr[i].name, last) && name_eq(table.ptr[i].namespace, ref_ns)) {
+                return (tk_decl_result){ .ok = true, .as.value = table.ptr[i].decl };
+            }
+        }
+        for (size_t j = 0; j < table.len; j += 1) {
+            if (name_eq(table.ptr[j].name, last)) {
+                tk_str nss  = namespaces_declaring(table, last);
+                tk_str here = ref_ns.len == 0 ? rt_cstr("<top-level>") : ref_ns;
+                size_t cap = 128 + last.len * 2 + here.len + nss.len;
+                char *buf = tk_alloc(cap); if (!buf) abort();
+                snprintf(buf, cap, "type '%.*s' is not visible bare from namespace '%.*s' \xe2\x80\x94 it is declared in: %.*s. Qualify it (`ns::%.*s`) or reference it from its own namespace.",
+                         (int)last.len, (const char *)last.ptr, (int)here.len, (const char *)here.ptr,
+                         (int)nss.len, (const char *)nss.ptr, (int)last.len, (const char *)last.ptr);
+                return (tk_decl_result){ .ok = false, .as.error = tk_error_make(buf) };
+            }
+        }
+        return (tk_decl_result){ .ok = false, .as.error = tk_error_make("not a user type") };
+    }
+    // R4 / R0 — QUALIFIED: match last segment + qualifier; unique winner, else ambiguity/unknown.
+    tk_str qual = path_qualifier(path, path.len - 1);
+    long winner_idx = -1;
+    tk_str matched_ns = rt_cstr("");
+    bool ambiguous = false;
+    for (size_t i = 0; i < table.len; i += 1) {
+        if (name_eq(table.ptr[i].name, last) && qualifier_selects_ns(table.ptr[i].namespace, qual)) {
+            if (winner_idx >= 0 && !name_eq(table.ptr[i].namespace, matched_ns)) {
+                ambiguous = true;
+            } else {
+                winner_idx = (long)i;
+                matched_ns = table.ptr[i].namespace;
+            }
+        }
+    }
+    if (ambiguous) {
+        tk_str nss = namespaces_declaring(table, last);
+        size_t cap = 160 + qual.len + last.len * 2 + nss.len;
+        char *buf = tk_alloc(cap); if (!buf) abort();
+        snprintf(buf, cap, "ambiguous type reference '%.*s::%.*s' \xe2\x80\x94 the qualifier matches more than one namespace (%.*s). Use the absolute path (`teko::\xe2\x80\xa6::%.*s`).",
+                 (int)qual.len, (const char *)qual.ptr, (int)last.len, (const char *)last.ptr,
+                 (int)nss.len, (const char *)nss.ptr, (int)last.len, (const char *)last.ptr);
+        return (tk_decl_result){ .ok = false, .as.error = tk_error_make(buf) };
+    }
+    if (winner_idx >= 0) return (tk_decl_result){ .ok = true, .as.value = table.ptr[winner_idx].decl };
     return (tk_decl_result){ .ok = false, .as.error = tk_error_make("not a user type") };
 }
 
@@ -356,15 +451,17 @@ void tk_collect_sig_type_params(tk_type t, tk_type_table table, tk_str **names, 
 }
 
 // non-static: shared with match.c (the typed pattern checker resolves case/struct names — C7).
-// (#109 W1) `ref_ns` = the referencing namespace; threaded down unchanged (reserved for W2's R0-R5).
+// (#109 W2) `ref_ns` = the referencing namespace; drives the R0-R5 rules via resolve_type_ref.
 tk_type_result resolve_named(tk_path path, tk_type_table table, tk_str ref_ns) {
-    (void)ref_ns;   // (#109 W1) reserved for the R0-R5 rules (W2)
     if (path.len == 0)   // M.1: an empty path is an internal invariant break — an honest error, never a crash
         return (tk_type_result){ .ok = false, .as.error = tk_error_make("internal: empty type path (a void/missing type used where a value type is required)") };
     tk_str name = path.segments[path.len - 1].name;       // seed: last segment
-    tk_type_result bt = tk_builtin_type(name);            // u8…u64, byte, str, error
-    if (bt.ok) return bt;
-    tk_decl_result ut = tk_type_table_find(table, name, ref_ns);  // a user type
+    // R2 — a BUILTIN resolves only for a BARE reference; a qualified path can never name a builtin.
+    if (path.len == 1) {
+        tk_type_result bt = tk_builtin_type(name);        // u8…u64, byte, str, error
+        if (bt.ok) return bt;
+    }
+    tk_decl_result ut = resolve_type_ref(path, table, ref_ns);   // R0/R3/R4 — a user type
     if (ut.ok) {
         // A TRANSPARENT alias `type Name = <type-expr>` resolves THROUGH to the aliased type
         // (self-host parity): `TypeTable = []TypeReg` → a SLICE, `Foo = Circle` → its NAMED
@@ -393,7 +490,11 @@ tk_type_result resolve_named(tk_path path, tk_type_table table, tk_str ref_ns) {
         tk_type t = { .tag = TK_TYPE_NAMED, .as.named.name = name };
         return (tk_type_result){ .ok = true, .as.value = t };
     }
-    return (tk_type_result){ .ok = false, .as.error = tk_error_named("unknown type", name) };
+    // R3/R4 fail-loud diagnostics (cross-namespace collision, ambiguity) propagate verbatim; the
+    // plain "not a user type" sentinel becomes the caller-facing "unknown type" message.
+    if (ut.as.error.message && strcmp(ut.as.error.message, "not a user type") == 0)
+        return (tk_type_result){ .ok = false, .as.error = tk_error_named("unknown type", name) };
+    return (tk_type_result){ .ok = false, .as.error = ut.as.error };
 }
 
 // (S4) a concrete type → its symbol fragment for a mangled generic-instance name. Mirror of
@@ -435,7 +536,6 @@ tk_str tk_generic_inst_name(tk_str base, tk_type *args, size_t nargs) {
 // (S4) `Box<i64>` → `Named{Box__g__i64}`: resolve the args, validate the generic decl's arity.
 // Mirror of resolve.tks::resolve_generic_inst.
 static tk_type_result resolve_generic_inst(tk_path path, tk_type_expr *args, size_t nargs, tk_type_table table, tk_str ref_ns) {
-    (void)ref_ns;   // (#109 W1) reserved for the R0-R5 rules (W2); threaded to every tk_resolve_type arg + the table lookup
     tk_str name = path.segments[path.len - 1].name;
     // (S-mem) builtin generic `ptr<T>` → `Ptr{inner}`; `ptr<void>` ≡ opaque ptr → NULL inner.
     if (name.len == 3 && memcmp(name.ptr, "ptr", 3) == 0) {
@@ -482,9 +582,14 @@ static tk_type_result resolve_generic_inst(tk_path path, tk_type_expr *args, siz
             return (tk_type_result){ .ok = false, .as.error = tk_error_make("a reference cannot be a generic type argument (it would be stored/escape)") };
         argtypes[i] = a.as.value;
     }
-    tk_decl_result d = tk_type_table_find(table, name, ref_ns);
-    if (!d.ok)
-        return (tk_type_result){ .ok = false, .as.error = tk_error_named("unknown generic type", name) };
+    tk_decl_result d = resolve_type_ref(path, table, ref_ns);   // (#109 W2) R0/R3/R4 over the WRITTEN path
+    if (!d.ok) {
+        // R3/R4 fail-loud diagnostics propagate verbatim; the plain "not a user type" sentinel
+        // becomes the generic-specific "unknown generic type" message.
+        if (d.as.error.message && strcmp(d.as.error.message, "not a user type") == 0)
+            return (tk_type_result){ .ok = false, .as.error = tk_error_named("unknown generic type", name) };
+        return (tk_type_result){ .ok = false, .as.error = d.as.error };
+    }
     if (d.as.value.n_type_params == 0)
         return (tk_type_result){ .ok = false, .as.error = tk_error_woven1("type `", name, "` is not generic but was given type arguments") };
     if (d.as.value.n_type_params != nargs)

@@ -29,6 +29,19 @@ static bool is_direct_case_of(tk_type named, tk_type subject_variant, tk_type ra
         if (tk_type_eq(&named, &subject_variant.as.variant.members[i])) return true;
     return false;
 }
+// (#109 W2, R5) CONTEXTUAL pattern resolution — a match-arm pattern name resolves against the
+// SUBJECT variant's own members FIRST, regardless of namespace (so a bare cross-namespace case still
+// binds where R3's strict own-ns bare rule would reject it). Matches the pattern's LAST segment name
+// against each member's nominal name; writes the member Type to *out and returns true when found.
+// A non-variant subject yields false. Mirror of match.tks::variant_member_by_name.
+static bool variant_member_by_name(tk_type subject_variant, tk_str last, tk_type *out) {
+    if (subject_variant.tag != TK_TYPE_VARIANT) return false;
+    for (size_t i = 0; i < subject_variant.as.variant.len; i += 1) {
+        tk_type m = subject_variant.as.variant.members[i];
+        if (m.tag == TK_TYPE_NAMED && name_eq(m.as.named.name, last)) { *out = m; return true; }
+    }
+    return false;
+}
 // (#110) find the DIRECT member of `subject` whose own (one-level) expansion contains `named` —
 // i.e. the outer case the caller should match FIRST before re-matching `named` inside it. Used
 // only to build a concrete, pasteable hint (`FooBar as v => match v { Foo as x => … }` rather than
@@ -125,7 +138,16 @@ tk_env_result tk_check_pattern(tk_pattern p, tk_type subject, tk_env env, tk_typ
             // `[]T as x` resolves the slice TYPE-expr; a path bind resolves the named/builtin case.
             // (W9.4) `Foo<i64> as x` carries explicit type-args → bind_pattern_type resolves the
             // concrete instance `Foo__g__i64`, so the binding has the stamped type (fields visible).
-            tk_type_result ct = bind_pattern_type(p, table, env.cur_ns);   // (#109 W1) ref_ns = the match's enclosing namespace
+            // (#109 W2, R5) a PLAIN named bind first resolves CONTEXTUALLY against the subject variant's
+            // members — a bare cross-namespace case name still binds; else fall to R0-R4.
+            tk_type_result ct;
+            tk_type r5m;
+            if (!p.as.bind.is_slice && p.as.bind.nargs == 0
+                && variant_member_by_name(subject_variant, p.as.bind.type_name.segments[p.as.bind.type_name.len - 1].name, &r5m)) {
+                ct = (tk_type_result){ .ok = true, .as.value = r5m };
+            } else {
+                ct = bind_pattern_type(p, table, env.cur_ns);   // (#109) ref_ns = the match's enclosing namespace → R0-R4
+            }
             if (!ct.ok) return efail(ct.as.error);
             // (#110) reject a SKIP-LEVEL arm: `ct` names a type that is not a direct case of the
             // subject's own union (it may be a case of an INNER variant nested inside one of the
@@ -147,7 +169,15 @@ tk_env_result tk_check_pattern(tk_pattern p, tk_type subject, tk_env env, tk_typ
         }
         case TK_PAT_FIELD: {
             // C7a: variant axis `Type { f; g }` — resolve to a struct, bind each field IMMUTABLE (B.21).
-            tk_type_result nt = resolve_named(p.as.field.type_name, table, env.cur_ns);   // (#109 W1) ref_ns = the match's enclosing namespace
+            // (#109 W2, R5) resolve the case name CONTEXTUALLY against the subject variant's members
+            // first (a bare cross-namespace case still binds), else fall to resolve_named/R0-R4.
+            tk_type_result nt;
+            tk_type r5m;
+            if (variant_member_by_name(subject_variant, p.as.field.type_name.segments[p.as.field.type_name.len - 1].name, &r5m)) {
+                nt = (tk_type_result){ .ok = true, .as.value = r5m };
+            } else {
+                nt = resolve_named(p.as.field.type_name, table, env.cur_ns);   // (#109) ref_ns = the match's enclosing namespace → R0-R4
+            }
             if (!nt.ok) return efail(nt.as.error);
             if (nt.as.value.tag != TK_TYPE_NAMED) return efail(tk_error_make("field pattern requires a struct type"));
             // (#110) same skip-level guard as the BIND arm above — `Type { f; g }` also names a case.
