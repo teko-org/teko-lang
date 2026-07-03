@@ -582,11 +582,8 @@ static tk_tfunction_result type_method(tk_function f, tk_str struct_name, tk_env
             if (!ptr.ok) return (tk_tfunction_result){ .ok = false, .as.error = ptr.as.error };
             pt = ptr.as.value;
         }
-        // (#98) KEEP has_type = false so codegen still identifies the self-RECEIVER (params[0]) and
-        // emits it as a raw `tk_t_<Class> *` even for a polymorphic base; type_ann is filled with the
-        // injected class so emit_type_expr never hits an empty path.
         fixed_params[i] = f.params[i].has_type ? f.params[i]
-            : (tk_param){ .name = f.params[i].name, .has_type = false, .type_ann = tk_type_to_texpr(pt), .is_params = false, .has_default = false, .default_expr = no_expr() };
+            : (tk_param){ .name = f.params[i].name, .has_type = true, .type_ann = tk_type_to_texpr(pt), .is_params = false, .has_default = false, .default_expr = no_expr() };
         if (f.is_extern && !is_teko_rt && !extern_type_ok(pt, table)) {
             return (tk_tfunction_result){ .ok = false, .as.error = tk_error_make("an `extern` function parameter must be a primitive (int/float/bool), `byte`, `ptr`, `uptr`, or an `extern type` handle (C7.1a)") };
         }

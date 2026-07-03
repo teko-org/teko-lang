@@ -2033,6 +2033,24 @@ fn emit_field_access(buf: []byte, prog: checker::TProgram, fa: checker::TFieldAc
         _ => false
     }
     if is_class_recv {
+        // (#98) a POLYMORPHIC-BASE-typed receiver is the fat pointer `tk_base_<B>` (data + vtable), not
+        // a raw object pointer — extract `.data`, cast to the base's raw `tk_t_<B> *`, then deref:
+        // `((*((tk_t_<B> *)(<recv>).data)).<field>)`. A plain (raw-pointer) class receiver stays
+        // `((*(<recv>)).<field>)`.
+        let recv_poly_base = match fa.receiver.type {
+            checker::Named as nm => cg_is_polymorphic_base(prog, nm.name)
+            _ => false
+        }
+        if recv_poly_base {
+            let bname = match fa.receiver.type { checker::Named as nm => nm.name; _ => "" }
+            mut ob = cb(buf, "((*((")
+            ob = mangle_type_name(ob, "", bname)
+            ob = cb(ob, " *)(")
+            ob = match emit_expr_ctx(ob, prog, checker::Void { }, fa.receiver, escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
+            ob = cb(ob, ").data)).")
+            ob = cb_str(ob, fa.field)
+            return cb(ob, ")")
+        }
         mut oc = cb(buf, "((*(")
         oc = match emit_expr_ctx(oc, prog, checker::Void { }, fa.receiver, escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
         oc = cb(oc, ")).")
@@ -5255,21 +5273,6 @@ fn emit_stmt(buf: []byte, s: checker::TStatement, in_main: bool, prog: checker::
 // definition AND the PROTOTYPE pass in tk_emit_c, so a forward declaration and its definition
 // spell the same signature. Parameter names ride cb_ident (a C-keyword param → trailing `_`).
 // (C: `emit_function_sig`.)
-// (#98) the self-RECEIVER's C type: a raw `tk_t_<Class> *` for a POLYMORPHIC-BASE class (the receiver
-// is the concrete object, never the fat base pointer `tk_base_<Class>`); for any other type (a
-// sealed/non-base class, a struct) defer to emit_type_expr unchanged. Bypasses the #98 poly-base fat
-// rule for the receiver position ONLY.
-fn cg_emit_receiver_type(buf: []byte, prog: checker::TProgram, te: parser::TypeExpr) -> []byte | error {
-    match te {
-        parser::NamedType as nt => {
-            let last = nt.path.segments[nt.path.segments.len - 1].name
-            if cg_is_polymorphic_base(prog, last) { return cb(mangle_type_name(buf, "", last), " *") }
-        }
-        _ => {}
-    }
-    emit_type_expr(buf, prog, te)
-}
-
 fn emit_function_sig(buf: []byte, prog: checker::TProgram, f: checker::TFunction) -> []byte | error {
     mut out = buf
     if f.is_extern { out = cb(out, "extern ") }   // C7.1a: a foreign prototype (no body)
@@ -5288,15 +5291,7 @@ fn emit_function_sig(buf: []byte, prog: checker::TProgram, f: checker::TFunction
         loop {
             if i >= f.params.len { break }
             if i > 0 { out = cb(out, ", ") }
-            // (#98) the self-RECEIVER (params[0], has_type=false) is the CONCRETE enclosing class — a
-            // raw `tk_t_<Class> *`. A polymorphic-base receiver would otherwise pick up the #98 fat
-            // typedef (`tk_base_<Class>`), but the receiver is the object itself, not a base-typed
-            // value: the body dereferences it (`(*self).f`) and virtual dispatch passes the object ptr.
-            if i == 0 && !f.params[0].has_type {
-                out = match cg_emit_receiver_type(out, prog, f.params[0].type_ann) { []byte as o => o; error as err => return err }
-            } else {
-                out = match emit_type_expr(out, prog, f.params[i].type_ann) { []byte as o => o; error as err => return err }
-            }
+            out = match emit_type_expr(out, prog, f.params[i].type_ann) { []byte as o => o; error as err => return err }
             out = cb(out, " ")
             out = cb_ident(out, f.params[i].name)
             i++
