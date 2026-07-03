@@ -115,10 +115,10 @@ static tk_type *mono_subst_find(tk_subst s, tk_str name) {
 // must type_eq one of its declared MEMBER types; any other TypeDecl kind is an exact
 // nominal-name match. An atom naming no TypeDecl at all is unsatisfiable (M.1 fail-loud).
 static bool mono_constraint_atom_satisfied(tk_str atom_name, tk_type concrete, tk_type_table table) {
-    tk_decl_result td = tk_type_table_find(table, atom_name);
+    tk_decl_result td = tk_type_table_find(table, atom_name, (tk_str){0});   // (#109 W1) constraint-atom probe on a resolved name — no referencing ns
     if (!td.ok) return false;
     if (td.as.value.body.tag == TK_BODY_VARIANT) {
-        tk_type_result vt = tk_resolve_type(td.as.value.body.as.variant_body.type_expr, table);
+        tk_type_result vt = tk_resolve_type(td.as.value.body.as.variant_body.type_expr, table, (tk_str){0});   // (#109 W1) variant-body expansion for constraint check — no referencing ns
         if (!vt.ok) return false;
         if (vt.as.value.tag == TK_TYPE_VARIANT) {
             for (size_t i = 0; i < vt.as.value.as.variant.len; i += 1)
@@ -344,7 +344,7 @@ static bool mono_texpr(tk_texpr e, tk_subst s, tk_tprogram prog, tk_type_table t
                 tk_type_table ptable = tk_type_param_table(gf->type_params, gf->n_type_params, gf->type_constraints, mono_cstr(""), table);
                 tk_subst sub = { .params = gf->type_params, .n_params = gf->n_type_params, .names = NULL, .types = NULL, .n_bind = 0 };
                 for (size_t i = 0; i < e.as.call.nargs; i += 1) {   // nargs == gf->nparams (arity checked at typing); bound by `args` so args[i] is in range
-                    tk_type_result pat = tk_resolve_type(gf->params[i].type_ann, ptable);
+                    tk_type_result pat = tk_resolve_type(gf->params[i].type_ann, ptable, gf->namespace);   // (#109 W1) ref_ns = the generic fn's declaring namespace
                     if (!pat.ok) { *err = pat.as.error; return false; }
                     tk_subst_result u = tk_unify(pat.as.value, args[i].type, sub, table);
                     if (!u.ok) { *err = u.as.error; return false; }

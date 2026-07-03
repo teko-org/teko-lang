@@ -115,8 +115,9 @@ fn lam_collect_expr(e: parser::Expr, refs: Ref<[]str>, bound: Ref<[]str>) -> voi
 // each by-copy unless it is a `Ref<T>` (by_ref — the only path to shared mutation).
 // resolve ONE closure parameter's type: its annotation, else the target's param type at `idx`
 // (W10 ruling 3 — inference from the target), else an honest error (annotate or give a target type).
-fn lam_param_type(p: parser::LambdaParam, idx: u64, exp_params: []Type, table: TypeTable) -> Type | error {
-    if p.has_type { return resolve_type(p.type_ann, table) }
+fn lam_param_type(p: parser::LambdaParam, idx: u64, exp_params: []Type, table: TypeTable, ref_ns: str) -> Type | error {
+    // (#109 W1) ref_ns = the namespace the lambda is written in; unused until W2's R0-R5 rules.
+    if p.has_type { return resolve_type(p.type_ann, table, ref_ns) }
     if idx < exp_params.len { return exp_params[idx] }
     error { message = $"cannot infer the type of closure parameter `{p.name}` — annotate it (`{p.name}: T`) or give the closure a target type" }
 }
@@ -130,7 +131,7 @@ fn type_lambda(lam: parser::Lambda, expected: Type, env: Env, table: TypeTable) 
     loop {
         if i >= lam.params.len { break }
         let p = lam.params[i]
-        let pt = match lam_param_type(p, i, exp_params, table) { Type as t => t; error as e => return e }
+        let pt = match lam_param_type(p, i, exp_params, table, env.cur_ns) { Type as t => t; error as e => return e }   // (#109 W1) ref_ns = the lambda's enclosing namespace
         tparams = teko::list::push(tparams, TLambdaParam { name = p.name; type = pt })
         cenv = define(cenv, p.name, pt, false)
         i++
@@ -547,7 +548,7 @@ fn type_method_call(mc: parser::MethodCall, env: Env, table: TypeTable) -> TExpr
         _ => {}
     }
     let struct_name = match recv_t { Named as n => n.name; _ => return error { message = "method typing is deferred (B.29 / M.4)" } }
-    let decl = match type_table_find(table, struct_name) { parser::TypeDecl as td => td; error => return error { message = "method typing is deferred (B.29 / M.4)" } }
+    let decl = match type_table_find(table, struct_name, "") { parser::TypeDecl as td => td; error => return error { message = "method typing is deferred (B.29 / M.4)" } }   // (#109 W1) method-receiver lookup on a resolved name — no referencing ns
     // (W10b.D3) an INTERFACE-typed receiver — a DYNAMIC contract-method call. The method resolves
     // against the interface's EFFECTIVE (extends-transitive) signature list; its index there is
     // the vtable slot both backends dispatch through. The receiver rides as args[0] (an interface
@@ -577,7 +578,7 @@ fn type_method_call(mc: parser::MethodCall, env: Env, table: TypeTable) -> TExpr
             if !ifound { return error { message = $"no such method '{mc.method}' on interface '{struct_name}'" } }
             // interface methods are INSTANCE-only signatures (decl-enforced); the receiver resolves
             // to Named{<iface>} in the FuncType. Defaults live on the CONTRACT (DEFARGS rule E).
-            let ift = match method_func_type(imfn, struct_name, table) { Type as t => t; error as e => return e }
+            let ift = match method_func_type(imfn, struct_name, table, env.cur_ns) { Type as t => t; error as e => return e }   // (#109 W1) ref_ns = the call's enclosing namespace
             let f = match ift { Func as ff => ff; _ => return error { message = "internal: interface method signature is not a function type" } }
             mut icargs: []parser::Expr = teko::list::push(teko::list::empty(), mc.receiver)
             mut ica: u64 = 0
@@ -672,7 +673,7 @@ fn type_method_call(mc: parser::MethodCall, env: Env, table: TypeTable) -> TExpr
                 let slot_res = base_vtable_slot(struct_name, mc.method, table)
                 match slot_res {
                     u32 as bslot => {
-                        let bft = match method_func_type(mfn, struct_name, table) { Type as t => t; error as e => return e }
+                        let bft = match method_func_type(mfn, struct_name, table, env.cur_ns) { Type as t => t; error as e => return e }   // (#109 W1) ref_ns = the call's enclosing namespace
                         let bf = match bft { Func as ff => ff; _ => return error { message = "internal: base method signature is not a function type" } }
                         mut bcargs: []parser::Expr = teko::list::push(teko::list::empty(), mc.receiver)
                         mut bai: u64 = 0
@@ -1088,7 +1089,7 @@ fn annotated_literal_ok(value: parser::Expr, ann: Type) -> error? {
 // (E7) is `t` a NAMED type whose declaration is an `enum`? (C: is_enum_named.)
 fn is_enum_named(t: Type, table: TypeTable) -> bool {
     match t {
-        Named as n => match type_table_find(table, n.name) {
+        Named as n => match type_table_find(table, n.name, "") {   // (#109 W1) enum-kind probe on a resolved name — no referencing ns
             parser::TypeDecl as td => match td.body { parser::EnumBody => true; _ => false }
             error                  => false
         }
@@ -1118,7 +1119,7 @@ fn is_char_decode_target(t: Type) -> bool {
 fn type_cast(c: parser::Cast, env: Env, table: TypeTable) -> TExpr | error {
     let inner = match type_expr(c.expr, env, table) { TExpr as te => te; error as e => return e }
     if type_is_void(inner.type) { return error { message = "a `void` expression cannot be cast (M.1)" } }
-    let target = match resolve_type(c.target, table) { Type as t => t; error as e => return e }
+    let target = match resolve_type(c.target, table, env.cur_ns) { Type as t => t; error as e => return e }   // (#109 W1) ref_ns = the cast's enclosing namespace
     // (UTF-8 increment 1) `char to u32`/u64/i64 — decode the codepoint to its scalar value. char is
     // NOT a numeric cast endpoint (cast_kind rejects it), so this pair is handled here; the result
     // type is the target. `<int> to char` (encode) is NOT allowed yet. (Mirrors expr.c type_cast.)
@@ -1153,7 +1154,7 @@ fn field_type(fields: []parser::Field, field: str, table: TypeTable) -> Type | e
     mut i = 0
     loop {
         if i >= fields.len { break }
-        if fields[i].name == field { return resolve_type(fields[i].type_ann, table) }
+        if fields[i].name == field { return resolve_type(fields[i].type_ann, table, "") }   // (#109 W1) field-annotation lookup on a resolved struct — no referencing ns
         i++
     }
     error { message = $"no such field: {field}" }
@@ -1201,7 +1202,7 @@ fn type_field_access(fa: parser::FieldAccess, env: Env, table: TypeTable) -> TEx
         Named as n => n.name
         _          => return error { message = "field access requires a struct receiver" }
     }
-    let decl = match type_table_find(table, name) {
+    let decl = match type_table_find(table, name, "") {   // (#109 W1) field-access receiver lookup on a resolved name — no referencing ns
         parser::TypeDecl as td => td
         error          => return error { message = $"unknown type for field access: {name}" }
     }
@@ -1293,7 +1294,7 @@ fn type_safe_field_access(sfa: parser::SafeFieldAccess, line: u32, col: u32, env
         Named as n => n.name
         _          => return error { message = "safe field access on a non-struct optional is not yet supported (the struct-field layer is pending — M.3)" }
     }
-    let decl = match type_table_find(table, name) {
+    let decl = match type_table_find(table, name, "") {   // (#109 W1) safe-field-access receiver lookup on a resolved name — no referencing ns
         parser::TypeDecl as td => td
         error          => return error { message = $"unknown type for safe field access: {name}" }
     }
@@ -1331,7 +1332,7 @@ fn type_safe_method_call(smc: parser::SafeMethodCall, line: u32, col: u32, env: 
         Named as n => n.name
         _          => return error { message = "safe method call `?.` needs an optional of a named type (a struct, class or interface)" }
     }
-    let decl = match type_table_find(table, name) {
+    let decl = match type_table_find(table, name, "") {   // (#109 W1) safe-method-call receiver lookup on a resolved name — no referencing ns
         parser::TypeDecl as td => td
         error          => return error { message = $"unknown type for safe method call: {name}" }
     }
@@ -1399,7 +1400,7 @@ fn type_coalesce(co: parser::Coalesce, env: Env, table: TypeTable) -> TExpr | er
 // retargets a GENERIC struct constructor `Box { … }` to the concrete instance named by the annotation
 // (`Box__g__i64`), so the fields type against i64 — annotation-driven (S4 type-generics, legislated).
 fn type_struct_lit(sl: parser::StructLit, expected: Type, env: Env, table: TypeTable) -> TExpr | error {
-    let nt = match resolve_named(sl.type_path, table) { Type as t => t; error as e => return e }
+    let nt = match resolve_named(sl.type_path, table, env.cur_ns) { Type as t => t; error as e => return e }   // (#109 W1) ref_ns = the literal's enclosing namespace
     // The builtin `error` is the one non-Named constructible type — `error { message = <str> }` (B.1).
     match nt {
         Error => {
@@ -1419,7 +1420,7 @@ fn type_struct_lit(sl: parser::StructLit, expected: Type, env: Env, table: TypeT
         _          => return error { message = "a struct literal requires a named struct type" }
     }
     mut name = base_name
-    mut decl = match type_table_find(table, name) {
+    mut decl = match type_table_find(table, name, "") {   // (#109 W1) struct-literal decl lookup on a resolved name — no referencing ns
         parser::TypeDecl as td => td
         error          => return error { message = $"unknown type in a struct literal: {name}" }
     }
@@ -1433,7 +1434,7 @@ fn type_struct_lit(sl: parser::StructLit, expected: Type, env: Env, table: TypeT
     // `let w: Wrap = Gen<i64>{…}` is fine).
     if sl.type_args.len > 0 {
         let gte = parser::NamedType { path = sl.type_path; args = sl.type_args }
-        let git = match resolve_type(gte, table) { Type as t => t; error as e => return e }
+        let git = match resolve_type(gte, table, env.cur_ns) { Type as t => t; error as e => return e }   // (#109 W1) ref_ns = the literal's enclosing namespace
         let ginst = match git { Named as gn => gn.name; _ => return error { message = "explicit type-arguments did not resolve to a struct instance" } }
         match tgt {
             Named as en => { if name_has_generic_base(en.name, base_name) && en.name != ginst { return error { message = "the explicit type-arguments at construction disagree with the annotated type" } } }
@@ -1452,7 +1453,7 @@ fn type_struct_lit(sl: parser::StructLit, expected: Type, env: Env, table: TypeT
         if !name_has_generic_base(mname, base_name) {
             return error { message = $"struct literal `{base_name}` does not match the annotated type" }
         }
-        decl = match type_table_find(table, mname) {
+        decl = match type_table_find(table, mname, "") {   // (#109 W1) generic-instance lookup on a resolved name — no referencing ns
             parser::TypeDecl as td => td
             error          => return error { message = $"internal: generic instance `{mname}` was not stamped" }
         }
@@ -1501,7 +1502,7 @@ fn type_struct_lit(sl: parser::StructLit, expected: Type, env: Env, table: TypeT
         }
         if hits == 0 { return error { message = "a struct literal is missing a declared field" } }
         if hits > 1 { return error { message = "a struct literal sets a field more than once" } }
-        let ft = match resolve_type(sb_fields[d].type_ann, table) { Type as t => t; error as e => return e }
+        let ft = match resolve_type(sb_fields[d].type_ann, table, "") { Type as t => t; error as e => return e }   // (#109 W1) field-annotation lookup on a resolved struct — no referencing ns
         // thread the field's type as EXPECTED so a nested generic constructor (`value = Box { … }`)
         // targets its concrete instance (S4). Non-struct-lit values type exactly as before.
         mut val = match type_value_expected(sl.field_vals[found], ft, env, table) { TExpr as te => te; error as e => return e }
@@ -1743,7 +1744,8 @@ fn type_array_lit(a: parser::ArrayLit, env: Env, table: TypeTable) -> TExpr | er
 // flags: `1 << ordinal`) so the VM reads it instead of recomputing (native codegen's pre-emitted
 // constants already encode it). The .tks side previously supported ONLY enum; flags fell through
 // to the enum-only error, a self-host divergence from expr.c.
-fn type_path_expr(pe: parser::PathExpr, table: TypeTable) -> TExpr | error {
+// (#109 W1) `ref_ns` = the namespace the `Type::Member` expression is written in; unused until W2.
+fn type_path_expr(pe: parser::PathExpr, table: TypeTable, ref_ns: str) -> TExpr | error {
     let p = pe.path
     if p.segments.len < 2 { return error { message = "a path expression must name an enum or flags member (`Type::Member`)" } }
     let member = p.segments[p.segments.len - 1].name
@@ -1754,9 +1756,9 @@ fn type_path_expr(pe: parser::PathExpr, table: TypeTable) -> TExpr | error {
         segs = teko::list::push(segs, p.segments[i])
         i++
     }
-    let et = match resolve_named(parser::Path { segments = segs }, table) { Type as t => t; error as e => return e }
+    let et = match resolve_named(parser::Path { segments = segs }, table, ref_ns) { Type as t => t; error as e => return e }   // (#109 W1) ref_ns = the expression's enclosing namespace
     let tname = match et { Named as n => n.name; _ => return error { message = "`Type::Member` requires a named enum or flags type" } }
-    let decl = match type_table_find(table, tname) { parser::TypeDecl as td => td; error => return error { message = $"unknown type in a `Type::Member` path: {tname}" } }
+    let decl = match type_table_find(table, tname, "") { parser::TypeDecl as td => td; error => return error { message = $"unknown type in a `Type::Member` path: {tname}" } }   // (#109 W1) follow-up lookup of a resolved name — no referencing ns
     match decl.body {
         parser::EnumBody as eb => {
             mut j: u64 = 0
@@ -1815,7 +1817,7 @@ fn type_dispatch(e: parser::Expr, env: Env, table: TypeTable) -> TExpr | error {
                 error       => type_method_call(mc, env, table)   // let it re-type and surface the real error
             }
         }
-        parser::PathExpr as pe => type_path_expr(pe, table)   // Enum::Member as a value
+        parser::PathExpr as pe => type_path_expr(pe, table, env.cur_ns)   // Enum::Member as a value   (#109 W1) ref_ns = the enclosing namespace
         parser::StructLit as sl => type_struct_lit(sl, Void { }, env, table)   // W4a (no expected type in expr position)
         parser::Index as ix    => type_index(ix, env, table)        // W5-idx
         parser::Interp as in   => type_interp(in, env, table)       // $"…{expr}…"
@@ -2107,7 +2109,7 @@ fn type_array_lit_expected(a: parser::ArrayLit, expected: Type, env: Env, table:
 // the concrete instance from `: Box<i64>`).
 fn type_binding_value(b: parser::Binding, env: Env, table: TypeTable) -> TExpr | error {
     if b.has_type {
-        let at = match resolve_type(b.type_ann, table) { Type as t => t; error as e => return e }
+        let at = match resolve_type(b.type_ann, table, env.cur_ns) { Type as t => t; error as e => return e }   // (#109 W1) ref_ns = the binding's enclosing namespace
         return type_value_expected(b.value, at, env, table)
     }
     type_expr(b.value, env, table)
@@ -2118,7 +2120,7 @@ fn type_binding(b: parser::Binding, env: Env, table: TypeTable) -> TypedStmt | e
     mut bound = v.type
     if type_is_void(bound) { return error { message = "cannot bind a `void` expression — it yields no value (M.1)" } }
     if b.has_type {
-        let at = match resolve_type(b.type_ann, table) { Type as t => t; error as e => return e }
+        let at = match resolve_type(b.type_ann, table, env.cur_ns) { Type as t => t; error as e => return e }   // (#109 W1) ref_ns = the binding's enclosing namespace
         if !assignable_to(v.type, at, table) {   // B.14 widening (case → variant) OR C6: a fitting literal adopts T (leaf stays i64)
             // (C1.8/E2) wrap with expected=type_render(at), actual=type_render(v.type) — mirrors
             // typer.c type_binding's tk_error_types wrap of annotated_literal_reason's message.
@@ -2351,9 +2353,10 @@ fn type_statement(s: parser::Statement, env: Env, table: TypeTable) -> TypedStmt
 // ---- items + program (the evolved check_function/check_item/check_program — E5c) ----
 
 // the resolved return type: the annotation if present, else void (no `-> ret` — M.3).
-fn function_return(f: parser::Function, table: TypeTable) -> Type | error {
+// (#109 W1) `ref_ns` = the function's declaring namespace; unused until W2's R0-R5 rules.
+fn function_return(f: parser::Function, table: TypeTable, ref_ns: str) -> Type | error {
     if !f.has_return { return Void { } }
-    resolve_type(f.return_type, table)
+    resolve_type(f.return_type, table, ref_ns)
 }
 
 // ---- C5 (DEFER scope): `return`/final-expr vs the declared return type ----
@@ -2663,7 +2666,7 @@ fn extern_type_ok(t: Type, table: TypeTable) -> bool {
         Byte => true
         Ptr => true
         Uptr => true
-        Named as nm => match type_table_find(table, nm.name) {
+        Named as nm => match type_table_find(table, nm.name, "") {   // (#109 W1) extern-kind probe on a resolved name — no referencing ns
             parser::TypeDecl as td => match td.body { parser::ExternBody => true; _ => false }
             error => false
         }
@@ -2723,7 +2726,7 @@ fn type_method(f: parser::Function, struct_name: str, env: Env, table: TypeTable
         let pt = if !f.params[i].has_type {
             Named { name = struct_name }
         } else {
-            match resolve_type(f.params[i].type_ann, tbl) { Type as t => t; error as e => return e }
+            match resolve_type(f.params[i].type_ann, tbl, env.cur_ns) { Type as t => t; error as e => return e }   // (#109 W1) ref_ns = the method's enclosing namespace
         }
         fixed_params = teko::list::push(fixed_params, if !f.params[i].has_type {
             parser::Param { name = f.params[i].name; has_type = true; type_ann = type_to_texpr(pt); is_params = false; has_default = false; default_expr = parser::no_expr() }
@@ -2745,7 +2748,7 @@ fn type_method(f: parser::Function, struct_name: str, env: Env, table: TypeTable
         i++
     }
     if inject_base_binding { local = define(local, base_binding_name, Named { name = base_name }, false) }
-    let ret = match function_return(f, tbl) { Type as t => t; error as e => return e }
+    let ret = match function_return(f, tbl, env.cur_ns) { Type as t => t; error as e => return e }   // (#109 W1) ref_ns = the fn's enclosing namespace
     match ret { Reference => return error { message = "a function cannot return a reference (pass-down only)" }; _ => {} }
     if f.is_extern {
         let ret_ok = if is_teko_rt {
@@ -2796,7 +2799,7 @@ fn type_function(f: parser::Function, env: Env, table: TypeTable) -> TFunction |
     mut i = 0
     loop {
         if i >= f.params.len { break }
-        let pt = match resolve_type(f.params[i].type_ann, tbl) { Type as t => t; error as e => return e }
+        let pt = match resolve_type(f.params[i].type_ann, tbl, env.cur_ns) { Type as t => t; error as e => return e }   // (#109 W1) ref_ns = the fn's enclosing namespace
         if f.is_extern {
             if is_teko_rt {
                 if !teko_rt_type_ok(pt) {
@@ -2811,7 +2814,7 @@ fn type_function(f: parser::Function, env: Env, table: TypeTable) -> TFunction |
         local = define(local, f.params[i].name, pt, false)        // params are immutable (B.21)
         i++
     }
-    let ret = match function_return(f, tbl) { Type as t => t; error as e => return e }
+    let ret = match function_return(f, tbl, env.cur_ns) { Type as t => t; error as e => return e }   // (#109 W1) ref_ns = the fn's enclosing namespace
     // (MEM Step 0, R3) ESCAPE GATE — a function cannot RETURN a reference (pass-down only): a
     // returned ref would outlive its caller-stack target. References flow only DOWN as params.
     match ret { Reference => return error { message = "a function cannot return a reference (pass-down only)" }; _ => {} }

@@ -97,7 +97,7 @@ static tk_typed_stmt_result type_binding(tk_binding b, tk_env env, tk_type_table
     // `Box { … }` under `: Box<i64>` targets the concrete instance (annotation-driven).
     tk_texpr_result v;
     if (b.has_type) {
-        tk_type_result at = tk_resolve_type(b.type_ann, table); if (!at.ok) return sfail(at.as.error);
+        tk_type_result at = tk_resolve_type(b.type_ann, table, env.cur_ns); if (!at.ok) return sfail(at.as.error);   // (#109 W1) ref_ns = the binding's enclosing namespace
         v = tk_type_value_expected(b.value, at.as.value, env, table);
     } else {
         v = tk_typer_expr(b.value, env, table);
@@ -106,7 +106,7 @@ static tk_typed_stmt_result type_binding(tk_binding b, tk_env env, tk_type_table
     tk_type bound = v.as.value.type;
     if (tk_type_is_void(&bound)) return smsg("cannot bind a `void` expression — it yields no value (M.1)");
     if (b.has_type) {
-        tk_type_result a = tk_resolve_type(b.type_ann, table); if (!a.ok) return sfail(a.as.error);
+        tk_type_result a = tk_resolve_type(b.type_ann, table, env.cur_ns); if (!a.ok) return sfail(a.as.error);   // (#109 W1) ref_ns = the binding's enclosing namespace
         if (!assignable_to(v.as.value.type, a.as.value, table)) {   // B.14 widening (case → variant) OR C6: a fitting literal adopts T (leaf stays i64)
             const char *why = annotated_literal_reason(b.value, a.as.value);
             if (why != NULL)   // (C1.8) expected = the annotation, actual = the bound value's type
@@ -333,9 +333,10 @@ tk_typed_stmt_result tk_type_statement(tk_statement s, tk_env env, tk_type_table
 }
 
 // ---- items + program ----
-static tk_type function_return(tk_function f, tk_type_table table) {
+// (#109 W1) `ref_ns` = the function's declaring namespace; unused until W2's R0-R5 rules.
+static tk_type function_return(tk_function f, tk_type_table table, tk_str ref_ns) {
     if (!f.has_return) return void_t();    // no `-> ret` ⇒ returns no value (M.3 — void)
-    tk_type_result r = tk_resolve_type(f.return_type, table);
+    tk_type_result r = tk_resolve_type(f.return_type, table, ref_ns);
     return r.ok ? r.as.value : void_t();   // collect validated signatures; a bad annotation surfaces there
 }
 
@@ -476,7 +477,7 @@ static bool extern_type_ok(tk_type t, tk_type_table table) {
     if (t.tag == TK_TYPE_PRIM || t.tag == TK_TYPE_BYTE
         || t.tag == TK_TYPE_PTR  || t.tag == TK_TYPE_UPTR) return true;
     if (t.tag == TK_TYPE_NAMED) {
-        tk_decl_result d = tk_type_table_find(table, t.as.named.name);
+        tk_decl_result d = tk_type_table_find(table, t.as.named.name, (tk_str){0});   // (#109 W1) extern-kind probe on a resolved name — no referencing ns
         return d.ok && d.as.value.body.tag == TK_BODY_EXTERN;
     }
     return false;
@@ -500,7 +501,7 @@ tk_tfunction_result tk_type_function(tk_function f, tk_env env, tk_type_table ta
     tk_type_table tbl = tk_type_param_table(f.type_params, f.n_type_params, f.type_constraints, (tk_str){0}, table);   // (S4) opaque type-params in scope
     bool is_teko_rt = f.is_extern && str_eq(f.from_lib, "teko_rt");   // C7.2: bypass for Teko's own runtime
     for (size_t i = 0; i < f.nparams; i += 1) {           // params immutable (B.21)
-        tk_type_result pt = tk_resolve_type(f.params[i].type_ann, tbl);
+        tk_type_result pt = tk_resolve_type(f.params[i].type_ann, tbl, env.cur_ns);   // (#109 W1) ref_ns = the fn's enclosing namespace
         if (!pt.ok) return (tk_tfunction_result){ .ok = false, .as.error = pt.as.error };
         if (f.is_extern && !is_teko_rt && !extern_type_ok(pt.as.value, table)) {
             return (tk_tfunction_result){ .ok = false, .as.error = tk_error_make("an `extern` function parameter must be a primitive (int/float/bool), `byte`, `ptr`, `uptr`, or an `extern type` handle (C7.1a)") };
@@ -510,7 +511,7 @@ tk_tfunction_result tk_type_function(tk_function f, tk_env env, tk_type_table ta
         }
         local = tk_env_define(local, f.params[i].name, pt.as.value, false);
     }
-    tk_type ret = function_return(f, tbl);
+    tk_type ret = function_return(f, tbl, env.cur_ns);   // (#109 W1) ref_ns = the fn's enclosing namespace
     // (MEM Step 0, R3) ESCAPE GATE — a function cannot RETURN a reference (pass-down only): a
     // returned ref would outlive its caller-stack target. References flow only DOWN as params.
     if (ret.tag == TK_TYPE_REF)
@@ -578,7 +579,7 @@ static tk_tfunction_result type_method(tk_function f, tk_str struct_name, tk_env
         if (!f.params[i].has_type) {
             pt = (tk_type){ .tag = TK_TYPE_NAMED, .as.named = { struct_name } };
         } else {
-            tk_type_result ptr = tk_resolve_type(f.params[i].type_ann, tbl);
+            tk_type_result ptr = tk_resolve_type(f.params[i].type_ann, tbl, env.cur_ns);   // (#109 W1) ref_ns = the method's enclosing namespace
             if (!ptr.ok) return (tk_tfunction_result){ .ok = false, .as.error = ptr.as.error };
             pt = ptr.as.value;
         }
@@ -594,7 +595,7 @@ static tk_tfunction_result type_method(tk_function f, tk_str struct_name, tk_env
     }
     if (inject_base_binding)
         local = tk_env_define(local, base_binding_name, (tk_type){ .tag = TK_TYPE_NAMED, .as.named = { base_name } }, false);
-    tk_type ret = function_return(f, tbl);
+    tk_type ret = function_return(f, tbl, env.cur_ns);   // (#109 W1) ref_ns = the fn's enclosing namespace
     if (ret.tag == TK_TYPE_REF)
         return (tk_tfunction_result){ .ok = false, .as.error = tk_error_make("a function cannot return a reference (pass-down only)") };
     if (f.is_extern) {

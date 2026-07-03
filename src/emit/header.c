@@ -19,7 +19,7 @@ typedef struct { bool ok; union { tk_fnsig value; tk_error error; } as; } fnsig_
 static fnsig_result build_fnsig(tk_tfunction f, tk_type_table table) {
     tk_sigparam_list params = tk_sigparam_list_empty();
     for (size_t i = 0; i < f.nparams; i += 1) {
-        tk_type_result pt = tk_resolve_type(f.params[i].type_ann, table);
+        tk_type_result pt = tk_resolve_type(f.params[i].type_ann, table, f.namespace);   // (#109 W1) ref_ns = the exported fn's declaring namespace
         if (!pt.ok) return (fnsig_result){ .ok = false, .as.error = pt.as.error };
         params = tk_sigparam_list_push(params, (tk_sigparam){ .name = f.params[i].name, .type = pt.as.value });
     }
@@ -38,7 +38,7 @@ static tyexport_result build_tyexport(tk_type_decl d, tk_type_table table) {
             tk_struct_body sb = d.body.as.struct_body;
             tk_sigfield_list fields = tk_sigfield_list_empty();
             for (size_t i = 0; i < sb.n_fields; i += 1) {
-                tk_type_result ft = tk_resolve_type(sb.fields[i].type_ann, table);
+                tk_type_result ft = tk_resolve_type(sb.fields[i].type_ann, table, (tk_str){0});   // (#109 W1) exported field-annotation resolve — no referencing ns in scope
                 if (!ft.ok) return (tyexport_result){ .ok = false, .as.error = ft.as.error };
                 fields = tk_sigfield_list_push(fields, (tk_sigfield){ .name = sb.fields[i].name, .type = ft.as.value });
             }
@@ -59,7 +59,7 @@ static tyexport_result build_tyexport(tk_type_decl d, tk_type_table table) {
         }
         case TK_BODY_VARIANT: {
             // resolve the union's syntactic type_expr → a semantic Variant; its members are the cases.
-            tk_type_result rt = tk_resolve_type(d.body.as.variant_body.type_expr, table);
+            tk_type_result rt = tk_resolve_type(d.body.as.variant_body.type_expr, table, (tk_str){0});   // (#109 W1) exported variant-body resolve — no referencing ns in scope
             if (!rt.ok) return (tyexport_result){ .ok = false, .as.error = rt.as.error };
             if (rt.as.value.tag != TK_TYPE_VARIANT)
                 return (tyexport_result){ .ok = false, .as.error = tk_error_make("an exported variant's body did not resolve to a union") };
@@ -85,7 +85,7 @@ static tyexport_result build_tyexport(tk_type_decl d, tk_type_table table) {
             tk_class_body cb = d.body.as.class_body;
             tk_sigfield_list fields = tk_sigfield_list_empty();
             for (size_t i = 0; i < cb.n_fields; i += 1) {
-                tk_type_result ft = tk_resolve_type(cb.fields[i].type_ann, table);
+                tk_type_result ft = tk_resolve_type(cb.fields[i].type_ann, table, (tk_str){0});   // (#109 W1) exported field-annotation resolve — no referencing ns in scope
                 if (!ft.ok) return (tyexport_result){ .ok = false, .as.error = ft.as.error };
                 fields = tk_sigfield_list_push(fields, (tk_sigfield){ .name = cb.fields[i].name, .type = ft.as.value });
             }

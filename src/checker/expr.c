@@ -402,7 +402,7 @@ static tk_texpr_result type_method_call(tk_method_call mc, tk_env env, tk_type_t
         return xerr("cannot call a method with `.` on a nullable value (`T?`) — use `?.` (REBOOT_PLAN §203)");
     if (recv_t.tag != TK_TYPE_NAMED) return xerr("method typing is deferred (B.29 / M.4)");
     tk_str struct_name = recv_t.as.named.name;
-    tk_decl_result td = tk_type_table_find(table, struct_name);
+    tk_decl_result td = tk_type_table_find(table, struct_name, (tk_str){0});   // (#109 W1) method-receiver lookup on a resolved name — no referencing ns
     if (!td.ok) return xerr("method typing is deferred (B.29 / M.4)");
     // (W10b.D3) an INTERFACE-typed receiver — a DYNAMIC contract-method call. The method resolves
     // against the interface's EFFECTIVE (extends-transitive) signature list; its index there is
@@ -427,7 +427,7 @@ static tk_texpr_result type_method_call(tk_method_call mc, tk_env env, tk_type_t
         if (!ifound) return xferr(tk_error_woven2("no such method '", mc.method, "' on interface '", struct_name, "'"));
         // interface methods are INSTANCE-only signatures (decl-enforced); the receiver resolves
         // to Named{<iface>} in the FuncType. Defaults live on the CONTRACT (DEFARGS rule E).
-        tk_type_result iftr = tk_method_func_type(imfn, struct_name, table);
+        tk_type_result iftr = tk_method_func_type(imfn, struct_name, table, env.cur_ns);   // (#109 W1) ref_ns = the call's enclosing namespace
         if (!iftr.ok) return (tk_texpr_result){ .ok = false, .as.error = iftr.as.error };
         tk_type ift = iftr.as.value;
         tk_expr *icargs = tk_alloc((mc.nargs + 1) * sizeof *icargs); if (!icargs) abort();
@@ -517,7 +517,7 @@ static tk_texpr_result type_method_call(tk_method_call mc, tk_env env, tk_type_t
     if (td.as.value.body.tag == TK_BODY_CLASS && tk_is_polymorphic_base(struct_name, table)) {
         tk_slot_result bslot = tk_base_vtable_slot(struct_name, mc.method, table);
         if (bslot.ok) {   // a subclass-only method (!ok) falls through to the direct desugar below
-            tk_type_result bftr = tk_method_func_type(mfn, struct_name, table);
+            tk_type_result bftr = tk_method_func_type(mfn, struct_name, table, env.cur_ns);   // (#109 W1) ref_ns = the call's enclosing namespace
             if (!bftr.ok) return (tk_texpr_result){ .ok = false, .as.error = bftr.as.error };
             tk_type bft = bftr.as.value;
             tk_expr *bcargs = tk_alloc((mc.nargs + 1) * sizeof *bcargs); if (!bcargs) abort();
@@ -929,13 +929,13 @@ void tk_retype_literal(tk_texpr *e, tk_type to) {
 // (E7) is `t` a NAMED type whose declaration is an `enum`?
 static bool is_enum_named(tk_type t, tk_type_table table) {
     if (t.tag != TK_TYPE_NAMED) return false;
-    tk_decl_result d = tk_type_table_find(table, t.as.named.name);
+    tk_decl_result d = tk_type_table_find(table, t.as.named.name, (tk_str){0});   // (#109 W1) enum-kind probe on a resolved name — no referencing ns
     return d.ok && d.as.value.body.tag == TK_BODY_ENUM;
 }
 // (C8.3) is `t` a NAMED type whose declaration is a `flags`?
 static bool is_flags_named(tk_type t, tk_type_table table) {
     if (t.tag != TK_TYPE_NAMED) return false;
-    tk_decl_result d = tk_type_table_find(table, t.as.named.name);
+    tk_decl_result d = tk_type_table_find(table, t.as.named.name, (tk_str){0});   // (#109 W1) flags-kind probe on a resolved name — no referencing ns
     return d.ok && d.as.value.body.tag == TK_BODY_FLAGS;
 }
 // (E7) an INTEGER cast endpoint: an int prim, or `byte` (= u8). Floats/bool excluded.
@@ -955,7 +955,7 @@ static bool is_char_decode_target(tk_type t) {
 static tk_texpr_result type_cast(tk_cast c, tk_env env, tk_type_table table) {
     tk_texpr_result inner = tk_typer_expr(*c.expr, env, table); if (!inner.ok) return inner;
     if (tk_type_is_void(&inner.as.value.type)) return xerr("a `void` expression cannot be cast (M.1)");
-    tk_type_result tgt = tk_resolve_type(c.target, table);     if (!tgt.ok) return xferr(tgt.as.error);
+    tk_type_result tgt = tk_resolve_type(c.target, table, env.cur_ns);     if (!tgt.ok) return xferr(tgt.as.error);   // (#109 W1) ref_ns = the cast's enclosing namespace
     // (UTF-8 increment 1) `char to u32`/u64/i64 — decode the codepoint to its scalar value. char is
     // NOT a numeric cast endpoint (cast_kind rejects it), so this pair is handled here; the result
     // type is the target. `<int> to char` (encode) is NOT allowed yet. (Mirrors typer.tks type_cast.)
@@ -995,7 +995,7 @@ static tk_texpr_result type_cast(tk_cast c, tk_env env, tk_type_table table) {
 // non-static: shared with match.c (the FieldPattern case forward-declares it — C7a).
 tk_type_result field_type(tk_struct_body sb, tk_str field, tk_type_table table) {
     for (size_t i = 0; i < sb.n_fields; i += 1)
-        if (tk_str_eq(sb.fields[i].name, field)) return tk_resolve_type(sb.fields[i].type_ann, table);
+        if (tk_str_eq(sb.fields[i].name, field)) return tk_resolve_type(sb.fields[i].type_ann, table, (tk_str){0});   // (#109 W1) field-annotation lookup on a resolved struct — no referencing ns
     return (tk_type_result){ .ok = false, .as.error = tk_error_named("no such field", field) };
 }
 
@@ -1040,7 +1040,7 @@ static tk_texpr_result type_field_access(tk_field_access fa, tk_env env, tk_type
     if (recv.as.value.type.tag == TK_TYPE_OPTIONAL)
         return xerr("cannot use `.` on a nullable value (`T?`) — read it with `?.` or `??` (REBOOT_PLAN §203)");
     if (recv.as.value.type.tag != TK_TYPE_NAMED) return xerr("field access requires a struct receiver");
-    tk_decl_result decl = tk_type_table_find(table, recv.as.value.type.as.named.name);
+    tk_decl_result decl = tk_type_table_find(table, recv.as.value.type.as.named.name, (tk_str){0});   // (#109 W1) field-access receiver lookup on a resolved name — no referencing ns
     if (!decl.ok) return xferr(tk_error_named("unknown type for field access", recv.as.value.type.as.named.name));
     // (W10b.CLASS) a class's fields are read exactly like a struct's; increment 2 uses the
     // EFFECTIVE (base-inherited) field set.
@@ -1172,7 +1172,7 @@ static tk_texpr_result type_safe_field_access(tk_safe_field_access sfa, uint32_t
     tk_type inner = *recv.as.value.type.as.optional.inner;
     if (inner.tag != TK_TYPE_NAMED)
         return xerr("safe field access on a non-struct optional is not yet supported (the struct-field layer is pending — M.3)");
-    tk_decl_result decl = tk_type_table_find(table, inner.as.named.name);
+    tk_decl_result decl = tk_type_table_find(table, inner.as.named.name, (tk_str){0});   // (#109 W1) safe-field-access receiver lookup on a resolved name — no referencing ns
     if (!decl.ok) return xerr("unknown type for safe field access");
     // (NP-OOP, issue #116) CLASS route — desugar to the safe-nav match; the arm's field read
     // is typed by type_field_access itself (same visibility, same `.len`/field rules).
@@ -1207,7 +1207,7 @@ static tk_texpr_result type_safe_method_call(tk_safe_method_call smc, uint32_t l
     tk_type inner = *recv.as.value.type.as.optional.inner;
     if (inner.tag != TK_TYPE_NAMED)
         return xerr("safe method call `?.` needs an optional of a named type (a struct, class or interface)");
-    tk_decl_result decl = tk_type_table_find(table, inner.as.named.name);
+    tk_decl_result decl = tk_type_table_find(table, inner.as.named.name, (tk_str){0});   // (#109 W1) safe-method-call receiver lookup on a resolved name — no referencing ns
     if (!decl.ok) return xerr("unknown type for safe method call");
     // an ENUM inner would desugar into a member pattern, not a type bind — honest stop.
     if (decl.as.value.body.tag == TK_BODY_ENUM)
@@ -1277,7 +1277,7 @@ static bool name_has_generic_base(tk_str mname, tk_str base) {
 // `expected` is the binding/return type the literal flows into (a VOID sentinel = none). It retargets
 // a GENERIC constructor `Box { … }` to the concrete instance from the annotation (S4, annotation-driven).
 tk_texpr_result tk_type_struct_lit(tk_struct_lit sl, tk_type expected, tk_env env, tk_type_table table) {
-    tk_type_result nt = resolve_named(sl.type_path, table);
+    tk_type_result nt = resolve_named(sl.type_path, table, env.cur_ns);   // (#109 W1) ref_ns = the literal's enclosing namespace
     if (!nt.ok) return xferr(nt.as.error);
     // The builtin `error` is the one non-NAMED constructible type — `error { message = <str> }`
     // (B.1: error-as-value, rep { message: str }). It is built-in, not a user struct.
@@ -1296,7 +1296,7 @@ tk_texpr_result tk_type_struct_lit(tk_struct_lit sl, tk_type expected, tk_env en
     }
     if (nt.as.value.tag != TK_TYPE_NAMED) return xerr("a struct literal requires a named struct type");
     tk_str name = nt.as.value.as.named.name;
-    tk_decl_result decl = tk_type_table_find(table, name);
+    tk_decl_result decl = tk_type_table_find(table, name, (tk_str){0});   // (#109 W1) struct-literal decl lookup on a resolved name — no referencing ns
     if (!decl.ok) return xerr("unknown type in a struct literal");
     // (W9.4) explicit construction-site type-args `Foo<i64>{ … }` resolve to the concrete instance
     // `Foo__g__i64` directly — NO annotation required. This OVERRIDES `expected`: build the synthetic
@@ -1307,7 +1307,7 @@ tk_texpr_result tk_type_struct_lit(tk_struct_lit sl, tk_type expected, tk_env en
     // ordinary binding-level widening check below handles it (so `let w: Wrap = Gen<i64>{…}` is fine).
     if (sl.nargs > 0) {
         tk_type_expr gte = { .tag = TK_TEXPR_NAMED, .as.named = { .path = sl.type_path, .args = sl.type_args, .args_len = sl.nargs } };
-        tk_type_result git = tk_resolve_type(gte, table);
+        tk_type_result git = tk_resolve_type(gte, table, env.cur_ns);   // (#109 W1) ref_ns = the literal's enclosing namespace
         if (!git.ok) return xferr(git.as.error);
         if (git.as.value.tag != TK_TYPE_NAMED) return xerr("explicit type-arguments did not resolve to a struct instance");
         if (expected.tag == TK_TYPE_NAMED && name_has_generic_base(expected.as.named.name, name)
@@ -1323,7 +1323,7 @@ tk_texpr_result tk_type_struct_lit(tk_struct_lit sl, tk_type expected, tk_env en
             return xerr("cannot infer the type arguments of a generic struct here — annotate it (e.g. `let x: Box<…> = …`)");
         tk_str mname = expected.as.named.name;
         if (!name_has_generic_base(mname, name)) return xerr("struct literal does not match the annotated type");
-        decl = tk_type_table_find(table, mname);
+        decl = tk_type_table_find(table, mname, (tk_str){0});   // (#109 W1) generic-instance lookup on a resolved name — no referencing ns
         if (!decl.ok) return xerr("internal: generic instance was not stamped");
         name = mname;
     }
@@ -1369,7 +1369,7 @@ tk_texpr_result tk_type_struct_lit(tk_struct_lit sl, tk_type expected, tk_env en
             if (tk_str_eq(sl.field_names[i], fname)) { found = i; hits += 1; }
         if (hits == 0) { tk_free0(names); tk_free0(vals); return xerr("a struct literal is missing a declared field"); }
         if (hits > 1)  { tk_free0(names); tk_free0(vals); return xerr("a struct literal sets a field more than once"); }
-        tk_type_result ft = tk_resolve_type(sb_fields[d].type_ann, table);
+        tk_type_result ft = tk_resolve_type(sb_fields[d].type_ann, table, (tk_str){0});   // (#109 W1) field-annotation lookup on a resolved struct — no referencing ns
         if (!ft.ok) { tk_free0(names); tk_free0(vals); return xferr(ft.as.error); }
         // thread the field's type as EXPECTED so a nested generic constructor (`value = Box { … }`)
         // targets its concrete instance (S4). Non-struct-lit values type exactly as before.
@@ -1461,7 +1461,7 @@ static tk_texpr_result type_lambda(tk_lambda lam, tk_type expected, tk_env env, 
     tk_env cenv = env;
     for (size_t i = 0; i < lam.nparams; i += 1) {
         tk_type pt;
-        if (lam.params[i].has_type) { tk_type_result r = tk_resolve_type(lam.params[i].type_ann, table); if (!r.ok) return xferr(r.as.error); pt = r.as.value; }
+        if (lam.params[i].has_type) { tk_type_result r = tk_resolve_type(lam.params[i].type_ann, table, env.cur_ns); if (!r.ok) return xferr(r.as.error); pt = r.as.value; }   // (#109 W1) ref_ns = the lambda's enclosing namespace
         else if (i < n_exp) pt = exp_params[i];
         else return xerr("cannot infer the type of a closure parameter — annotate it or give the closure a target type");
         tparams = tk_realloc0(tparams, (ntp + 1) * sizeof *tparams); if (!tparams) abort();
@@ -1851,15 +1851,16 @@ static tk_texpr_result type_flags_method(tk_method_call mc, tk_env env, tk_type_
 // The path is the enum type (all but the last segment) + the member (last segment). Resolve the
 // enum decl, verify it is an `enum` and the member exists, and type the node as the NAMED enum —
 // carrying the resolved enum name + member ordinal so both backends lower without re-lookup.
-static tk_texpr_result type_path_expr(tk_path_expr pe, tk_type_table table) {
+// (#109 W1) `ref_ns` = the namespace the `Type::Member` expression is written in; unused until W2.
+static tk_texpr_result type_path_expr(tk_path_expr pe, tk_type_table table, tk_str ref_ns) {
     tk_path p = pe.path;
     if (p.len < 2) return xerr("a path expression must name an enum or flags member (`Type::Member`)");
     tk_str member = p.segments[p.len - 1].name;
     tk_path type_path = { .segments = p.segments, .len = p.len - 1 };   // the type = path minus the member
-    tk_type_result et = resolve_named(type_path, table);
+    tk_type_result et = resolve_named(type_path, table, ref_ns);   // (#109 W1) ref_ns = the expression's enclosing namespace
     if (!et.ok) return xferr(et.as.error);
     if (et.as.value.tag != TK_TYPE_NAMED) return xerr("`Type::Member` requires a named enum or flags type");
-    tk_decl_result decl = tk_type_table_find(table, et.as.value.as.named.name);
+    tk_decl_result decl = tk_type_table_find(table, et.as.value.as.named.name, (tk_str){0});   // (#109 W1) follow-up lookup of a resolved name — no referencing ns
     if (!decl.ok) return xerr("unknown type in a `Type::Member` path");
     if (decl.as.value.body.tag == TK_BODY_ENUM) {
         tk_enum_body eb = decl.as.value.body.as.enum_body;
@@ -1941,7 +1942,7 @@ static tk_texpr_result type_dispatch(tk_expr e, tk_env env, tk_type_table table)
             }
             return type_method_call(mc, env, table);
         }
-        case TK_EXPR_PATH:         return type_path_expr(e.as.path, table);   // Enum::Member as a value
+        case TK_EXPR_PATH:         return type_path_expr(e.as.path, table, env.cur_ns);   // Enum::Member as a value   (#109 W1) ref_ns = the enclosing namespace
         case TK_EXPR_STRUCT_LIT:   return tk_type_struct_lit(e.as.struct_lit, (tk_type){ .tag = TK_TYPE_VOID }, env, table);   // W4a (no expected in expr position)
         case TK_EXPR_INDEX:        return type_index(e.as.index, env, table);            // W5-idx
         case TK_EXPR_INTERP:       return type_interp(e.as.interp, env, table);          // $"…{expr}…"
