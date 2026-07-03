@@ -4395,6 +4395,19 @@ static bool emit_stmt(cbuf *b, const tk_tstatement *s, bool in_main,
 // =========================================================================
 // Emit a function SIGNATURE (return type, name, parameter list) up to the closing `)`. Shared by
 // the prototype pass (`;`) and the definition (`{ … }`), so both agree byte-for-byte.
+// (#98) the self-RECEIVER's C type: a raw `tk_t_<Class> *` for a POLYMORPHIC-BASE class (the receiver
+// is the concrete object, never the fat base pointer `tk_base_<Class>`); for any other type (a
+// sealed/non-base class, a struct) defer to emit_type_expr unchanged. Bypasses the #98 poly-base fat
+// rule for the receiver position ONLY.
+static bool cg_emit_receiver_type(cbuf *b, tk_type_expr te, const char **err) {
+    if (te.tag == TK_TEXPR_NAMED) {
+        tk_path p = te.as.named.path;
+        tk_str last = p.segments[p.len - 1].name;
+        if (cg_is_polymorphic_base(last)) { mangle_type_name(b, (tk_str){ NULL, 0 }, last); cb(b, " *"); return true; }
+    }
+    return emit_type_expr(b, te, err);
+}
+
 static bool emit_function_sig(cbuf *b, tk_tfunction f, const char **err) {
     if (f.is_extern) cb(b, "extern ");    // C7.1a: a foreign prototype (no body)
     if (!emit_type(b, f.return_type, err)) return false;
@@ -4410,7 +4423,15 @@ static bool emit_function_sig(cbuf *b, tk_tfunction f, const char **err) {
     } else {
         for (size_t i = 0; i < f.nparams; i += 1) {
             if (i > 0) cb(b, ", ");
-            if (!emit_type_expr(b, f.params[i].type_ann, err)) return false;
+            // (#98) the self-RECEIVER (params[0], has_type=false) is the CONCRETE enclosing class — a
+            // raw `tk_t_<Class> *`. A polymorphic-base receiver would otherwise pick up the #98 fat
+            // typedef (`tk_base_<Class>`), but the receiver is the object itself, not a base-typed
+            // value: the body dereferences it (`(*self).f`) and virtual dispatch passes the object ptr.
+            if (i == 0 && !f.params[0].has_type) {
+                if (!cg_emit_receiver_type(b, f.params[0].type_ann, err)) return false;
+            } else {
+                if (!emit_type_expr(b, f.params[i].type_ann, err)) return false;
+            }
             cb(b, " ");
             cb_ident(b, f.params[i].name);
         }

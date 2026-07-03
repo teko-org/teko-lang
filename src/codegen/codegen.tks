@@ -5255,6 +5255,21 @@ fn emit_stmt(buf: []byte, s: checker::TStatement, in_main: bool, prog: checker::
 // definition AND the PROTOTYPE pass in tk_emit_c, so a forward declaration and its definition
 // spell the same signature. Parameter names ride cb_ident (a C-keyword param → trailing `_`).
 // (C: `emit_function_sig`.)
+// (#98) the self-RECEIVER's C type: a raw `tk_t_<Class> *` for a POLYMORPHIC-BASE class (the receiver
+// is the concrete object, never the fat base pointer `tk_base_<Class>`); for any other type (a
+// sealed/non-base class, a struct) defer to emit_type_expr unchanged. Bypasses the #98 poly-base fat
+// rule for the receiver position ONLY.
+fn cg_emit_receiver_type(buf: []byte, prog: checker::TProgram, te: parser::TypeExpr) -> []byte | error {
+    match te {
+        parser::NamedType as nt => {
+            let last = nt.path.segments[nt.path.segments.len - 1].name
+            if cg_is_polymorphic_base(prog, last) { return cb(mangle_type_name(buf, "", last), " *") }
+        }
+        _ => {}
+    }
+    emit_type_expr(buf, prog, te)
+}
+
 fn emit_function_sig(buf: []byte, prog: checker::TProgram, f: checker::TFunction) -> []byte | error {
     mut out = buf
     if f.is_extern { out = cb(out, "extern ") }   // C7.1a: a foreign prototype (no body)
@@ -5273,7 +5288,15 @@ fn emit_function_sig(buf: []byte, prog: checker::TProgram, f: checker::TFunction
         loop {
             if i >= f.params.len { break }
             if i > 0 { out = cb(out, ", ") }
-            out = match emit_type_expr(out, prog, f.params[i].type_ann) { []byte as o => o; error as err => return err }
+            // (#98) the self-RECEIVER (params[0], has_type=false) is the CONCRETE enclosing class — a
+            // raw `tk_t_<Class> *`. A polymorphic-base receiver would otherwise pick up the #98 fat
+            // typedef (`tk_base_<Class>`), but the receiver is the object itself, not a base-typed
+            // value: the body dereferences it (`(*self).f`) and virtual dispatch passes the object ptr.
+            if i == 0 && !f.params[0].has_type {
+                out = match cg_emit_receiver_type(out, prog, f.params[0].type_ann) { []byte as o => o; error as err => return err }
+            } else {
+                out = match emit_type_expr(out, prog, f.params[i].type_ann) { []byte as o => o; error as err => return err }
+            }
             out = cb(out, " ")
             out = cb_ident(out, f.params[i].name)
             i++
