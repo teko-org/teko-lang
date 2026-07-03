@@ -274,7 +274,7 @@ tk_subst_result tk_unify(tk_type pattern, tk_type arg, tk_subst s, tk_type_table
         case TK_TYPE_NAMED: {
             if (!tk_is_type_param(pattern.as.named.name, s.params, s.n_params)) return (tk_subst_result){ .ok = true, .as.value = s };
             if (type_has_void_sentinel_c(arg))
-                return (tk_subst_result){ .ok = false, .as.error = tk_error_named("cannot infer type parameter from an untyped empty slice / null — annotate the argument", pattern.as.named.name) };
+                return (tk_subst_result){ .ok = false, .as.error = tk_error_woven1("cannot infer type parameter ", pattern.as.named.name, " from an untyped empty slice / null — annotate the argument") };
             // (MEM Step 0, B) ESCAPE GATE — a reference can NEVER be the INFERRED binding for a type
             // parameter: `id(r)` where r: Ref<i64> would stamp `int64_t * id__g__ref_i64(int64_t *)`,
             // returning a raw reference that outlives its target. Mirror of the written-arg gate in
@@ -284,7 +284,7 @@ tk_subst_result tk_unify(tk_type pattern, tk_type arg, tk_subst s, tk_type_table
             tk_type *ex = subst_find_c(s, pattern.as.named.name);
             if (ex) {
                 if (tk_type_eq(ex, &arg)) return (tk_subst_result){ .ok = true, .as.value = s };
-                return (tk_subst_result){ .ok = false, .as.error = tk_error_named("type parameter inferred as conflicting types", pattern.as.named.name) };
+                return (tk_subst_result){ .ok = false, .as.error = tk_error_woven1("type parameter ", pattern.as.named.name, " inferred as conflicting types") };
             }
             size_t n = s.n_bind;
             tk_str  *nn = tk_alloc((n + 1) * sizeof *nn);
@@ -459,9 +459,9 @@ static tk_type_result resolve_generic_inst(tk_path path, tk_type_expr *args, siz
     if (!d.ok)
         return (tk_type_result){ .ok = false, .as.error = tk_error_named("unknown generic type", name) };
     if (d.as.value.n_type_params == 0)
-        return (tk_type_result){ .ok = false, .as.error = tk_error_named("type is not generic but was given type arguments", name) };
+        return (tk_type_result){ .ok = false, .as.error = tk_error_woven1("type `", name, "` is not generic but was given type arguments") };
     if (d.as.value.n_type_params != nargs)
-        return (tk_type_result){ .ok = false, .as.error = tk_error_named("generic type expects a different number of type arguments", name) };
+        return (tk_type_result){ .ok = false, .as.error = tk_error_woven1("generic type `", name, "` expects a different number of type arguments") };
     tk_type t = { .tag = TK_TYPE_NAMED, .as.named.name = tk_generic_inst_name(name, argtypes, nargs) };
     return (tk_type_result){ .ok = true, .as.value = t };
 }

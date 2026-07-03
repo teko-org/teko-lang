@@ -1,6 +1,18 @@
 // src/checker/scope.c
 #include "scope.h"
 #include <string.h>
+#include <stdio.h>    // (#121) snprintf — name the undefined symbol, matching scope.tks
+
+// (#121) "undefined name: <name>" — byte-identical to scope.tks's `$"undefined name: {name}"`.
+// Built inline (scope.c cannot include resolve.h — resolve.h includes scope.h, a cycle).
+static tk_error scope_undefined_name(tk_str name) {
+    const char *pfx = "undefined name: ";
+    size_t len = strlen(pfx) + name.len + 1;
+    char *buf = tk_alloc(len); if (!buf) abort();
+    int m = snprintf(buf, len, "%s%.*s", pfx, (int)name.len, (const char *)name.ptr);
+    if (m < 0 || (size_t)m >= len) abort();
+    return tk_error_make(buf);
+}
 
 static bool name_eq(tk_str n, tk_str m) {
     return n.len == m.len && memcmp(n.ptr, m.ptr, n.len) == 0;
@@ -69,7 +81,7 @@ tk_type_result tk_env_lookup_call(tk_env env, tk_path callee) {
             if (b.ns.len != 0 && name_eq(ns_last_seg(b.ns), qual)) return (tk_type_result){ .ok = true, .as.value = b.type };
         }
     }
-    return (tk_type_result){ .ok = false, .as.error = tk_error_make("undefined name") };
+    return (tk_type_result){ .ok = false, .as.error = scope_undefined_name(name) };
 }
 
 // (#49) the resolved target's declaring NAMESPACE for a call (same scan as tk_env_lookup_call),
@@ -96,7 +108,7 @@ tk_binding_result tk_env_lookup_binding(tk_env env, tk_str name) {
         tk_val_binding b = env.ptr[i - 1];
         if (name_eq(b.name, name)) return (tk_binding_result){ .ok = true, .as.value = b };
     }
-    return (tk_binding_result){ .ok = false, .as.error = tk_error_make("undefined name") };
+    return (tk_binding_result){ .ok = false, .as.error = scope_undefined_name(name) };
 }
 
 tk_type_result tk_env_lookup(tk_env env, tk_str name) {       // the type — thin wrapper
