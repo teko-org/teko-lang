@@ -264,6 +264,15 @@ static tk_decl_result resolve_type_ref(tk_path path, tk_type_table table, tk_str
                 return (tk_decl_result){ .ok = true, .as.value = table.ptr[i].decl };
             }
         }
+        // (R1/root) a generic type-PARAM (registered at "") and a root-level ("") type are bare-visible
+        // from ANY namespace — "" is the global root scope. Resolve it before the collision error.
+        if (ref_ns.len != 0) {
+            for (size_t k = 0; k < table.len; k += 1) {
+                if (name_eq(table.ptr[k].name, last) && table.ptr[k].namespace.len == 0) {
+                    return (tk_decl_result){ .ok = true, .as.value = table.ptr[k].decl };
+                }
+            }
+        }
         for (size_t j = 0; j < table.len; j += 1) {
             if (name_eq(table.ptr[j].name, last)) {
                 tk_str nss  = namespaces_declaring(table, last);
