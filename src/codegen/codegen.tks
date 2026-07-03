@@ -2987,6 +2987,28 @@ fn cg_var_reaches(prog: checker::TProgram, v: checker::Type, vkey: str, depth: i
     false
 }
 
+// cg_narrow_variant_widens_into — is `from` a VARIANT (inline `tk_u_…` OR a named variant decl)
+// EVERY member of which is reachable in the WIDER variant slot `to`? This is the codegen-side
+// widening test for an if/match arm JOIN whose inferred type is a NARROW member-pair union while
+// the binding/param/return slot is the WIDER annotated variant (fix/selfhost-arm-join-widen). It
+// mirrors the checker's widens_into member-by-member rule using the codegen reachability walk
+// (cg_var_reaches), so no TypeTable is needed here. `to` must itself be a variant slot; a `from`
+// with no members (or a non-variant) answers false so the caller falls through to the plain path.
+// (C: `cg_narrow_variant_widens_into`.)
+fn cg_narrow_variant_widens_into(prog: checker::TProgram, from: checker::Type, to: checker::Type) -> bool {
+    if !cg_is_variant_type(prog, to) { return false }
+    let n = cg_var_nmem(prog, from)
+    if n == 0 { return false }
+    mut i = 0
+    loop {
+        if i >= n { break }
+        let mk = match cg_var_mkey(prog, from, i) { str as s => s; error => return false }
+        if !cg_var_reaches(prog, to, mk, 16) { return false }
+        i++
+    }
+    true
+}
+
 // cg_wrap_open — emit `(<variantCType>){ .tag = <TAG for member key `mkey`>, .as.<mkey> = `
 // (no closing `}`). Inline `tk_u_…` vs named-decl tag spelling. (C: `cg_wrap_open`.)
 fn cg_wrap_open(buf: []byte, v: checker::Type, mkey: str) -> []byte | error {
@@ -3495,6 +3517,23 @@ fn emit_as_r(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, expe
             }
         }
         _ => {}
+    }
+    // (fix/selfhost-arm-join-widen) ARM-JOIN WIDEN: an `if`/`match` USED AS A VALUE whose two arms
+    // are DIFFERENT members of a WIDER annotated variant. The checker's type_join infers the NARROW
+    // member-pair union (`A | B`) as the if/match's type; the slot `expected` is the WIDER variant.
+    // Emitting the if/match plainly would type its C temp as the narrow `tk_u_A_B` and land it in the
+    // wider `tk_t_Expected` slot — `cc` rejects the incompatible struct. Re-emit the if/match with its
+    // node type RETAGGED to `expected`, so emit_if_value/emit_match_value type the temp as `expected`
+    // AND each arm's trailing value wraps into it (case → wider variant, via emit_stmt_value/
+    // emit_arm_value → emit_as_r). Guarded on EVERY narrow member reaching `expected` (a true widen).
+    let vt_is_variant = match value.type { checker::Variant => true; checker::Named as vn => cg_named_is_variant(prog, vn.name); _ => false }
+    if vt_is_variant && !cg_type_mangle_eq(value.type, expected) && cg_narrow_variant_widens_into(prog, value.type, expected) {
+        let widened = checker::TExpr { kind = value.kind; type = expected; line = value.line; col = value.col }
+        match value.kind {
+            checker::TIfExpr as f    => return emit_if_value(buf, prog, ret_type, widened, f, escaping, regions, fn_body, dctx)
+            checker::TMatchExpr as m => return emit_match_value(buf, prog, ret_type, widened, m, escaping, regions, fn_body, dctx)
+            _ => {}
+        }
     }
     // VARIANT slot wrap (B-cg2) — DIRECT or TRANSITIVE (case→variant→variant). The member is
     // identified by RESOLVED-TYPE equality (the value's KEY == a reachable member's key), so a
