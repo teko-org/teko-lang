@@ -18,6 +18,18 @@ fn type_table_find(table: TypeTable, name: str) -> parser::TypeDecl | error {
     error { message = "not a user type" }
 }
 
+// (W10b.D2) is the constraint on a type-param EXACTLY a single INTERFACE atom `<T: I>` (I a declared
+// interface)? Returns I's name iff so — the ONE shape that unlocks method dispatch on `T` (issue #99).
+// A compound constraint (`A & B`, `A | B`), a variant/struct/enum atom, a trait atom, or no
+// constraint all yield null (they keep the opaque honest-stop — a SEPARATE proposal, per the ruling).
+// The interface, monomorphized to the concrete type at each call site, drives the D3 vtable dispatch.
+fn constraint_single_interface(c: parser::ConstraintExpr, table: TypeTable) -> str? {
+    match c {
+        parser::ConstraintAtom as a => if is_interface_name(a.name, table) { a.name } else { null }
+        _                           => null   // And/Or/NoConstraint → not a single interface atom
+    }
+}
+
 // (S4) Extend the type table with generic type-params as OPAQUE nominal types, so a generic
 // signature/body resolves with `T` abstract. An unconstrained `T` has no members/operators, so
 // OPERATING on it (`x.foo`, `a > b`) fails at the definition (M.1 fail-loud, no reflection) — only
@@ -25,7 +37,15 @@ fn type_table_find(table: TypeTable, name: str) -> parser::TypeDecl | error {
 // monomorph pass substitutes each `Named{T}` with the concrete arg before codegen. PREPENDED so a
 // type-param SHADOWS a same-named user type within the generic. Empty type_params → table unchanged.
 // Used by collect (func sigs), check_modules (vis check), and typer (bodies). (C: tk_type_param_table.)
-pub fn type_param_table(type_params: []str, ns: str, table: TypeTable) -> TypeTable {
+//
+// (W10b.D2, issue #99) `type_constraints` runs PARALLEL to `type_params` (same length; NoConstraint
+// where the caller has none). When index i's constraint is a SINGLE INTERFACE ATOM `<T: I>`, the
+// type-param is registered with an `InterfaceBody { extends = [I]; methods = [] }` instead of the
+// opaque ExternBody: this makes `Named{T}.method()` resolve through the EXISTING D3 interface-dispatch
+// path (type_method_call's InterfaceBody arm redirects to `I` for the callee/vtable, keeping the
+// receiver's own `Named{T}` type so monomorphization stamps T→concrete). Every OTHER constraint shape
+// (compound A&B/A|B, a struct/variant/trait atom, or none) stays opaque ExternBody — an honest stop.
+pub fn type_param_table(type_params: []str, type_constraints: []parser::ConstraintExpr, ns: str, table: TypeTable) -> TypeTable {
     if type_params.len == 0 { return table }
     mut tbl: TypeTable = teko::list::empty()
     mut i = 0
@@ -33,7 +53,18 @@ pub fn type_param_table(type_params: []str, ns: str, table: TypeTable) -> TypeTa
         if i >= type_params.len { break }
         // namespace = the USING namespace so the W-vis-enforce cross-namespace/visibility check (check_modules)
         // treats the type-param as a LOCAL type, not a bare cross-namespace reference.
-        let d = parser::TypeDecl { name = type_params[i]; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::ExternBody { }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }
+        // (W10b.D2) a single-interface-atom constraint → an interface-mirroring body (extends the real
+        // interface; NO own methods, so type_method_call recognizes the type-param and redirects to it).
+        let has_c = i < type_constraints.len
+        let body: parser::TypeBody = if has_c {
+            match constraint_single_interface(type_constraints[i], table) {
+                str as iface => parser::InterfaceBody { extends = teko::list::push(teko::list::empty(), iface); methods = teko::list::empty() }
+                null         => parser::ExternBody { }
+            }
+        } else {
+            parser::ExternBody { }
+        }
+        let d = parser::TypeDecl { name = type_params[i]; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = body; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }
         tbl = teko::list::push(tbl, TypeReg { name = type_params[i]; namespace = ns; vis = parser::Visibility::Private; decl = d })
         i++
     }
