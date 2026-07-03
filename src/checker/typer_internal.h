@@ -27,6 +27,6 @@ bool tk_texpr_diverges(const tk_texpr *e);   // a panic/exit call (diverges — 
 // Defined in expr.c (helper of the match VALUE form); typer.c's match STATEMENT
 // form reuses it. Shared from match.c too: tk_exhaustive / tk_check_pattern.
 tk_tarm_result tk_type_arm(tk_arm a, tk_type subject, tk_env env, tk_type_table table);
-bool           tk_exhaustive(tk_arm *arms, size_t n, tk_type subject, tk_type_table table);
+bool           tk_exhaustive(tk_arm *arms, size_t n, tk_type subject, tk_type_table table, tk_str ref_ns);   // (#109 W2) ref_ns = the match's enclosing namespace
 
 #endif // TK_CHECK_TYPER_INTERNAL_H

@@ -633,7 +633,7 @@ fn type_method_call(mc: parser::MethodCall, env: Env, table: TypeTable) -> TExpr
     // methods list's source differs; a class's methods are otherwise typed exactly like a struct's.
     let methods = match decl.body {
         parser::StructBody as sb => sb.methods
-        parser::ClassBody as cb  => match effective_class_methods(cb, table) { []Function as f => f; error as e => return e }   // (W10b.CLASS increment 2) inherited methods are callable too
+        parser::ClassBody as cb  => match effective_class_methods(cb, table) { []parser::Function as f => f; error as e => return e }   // (W10b.CLASS increment 2) inherited methods are callable too
         _ => return error { message = "method typing is deferred (B.29 / M.4)" }
     }
     if methods.len == 0 { return error { message = $"no such method '{mc.method}' on struct '{struct_name}'" } }
@@ -1150,11 +1150,11 @@ fn type_cast(c: parser::Cast, env: Env, table: TypeTable) -> TExpr | error {
 // `Named` type to its `TypeDecl` body and read the field's declared type. Receiver must be a struct.
 
 // find a field by name in a struct body and resolve its annotation (M.3 — exact).
-fn field_type(fields: []parser::Field, field: str, table: TypeTable) -> Type | error {
+fn field_type(fields: []parser::Field, field: str, table: TypeTable, ref_ns: str) -> Type | error {
     mut i = 0
     loop {
         if i >= fields.len { break }
-        if fields[i].name == field { return resolve_type(fields[i].type_ann, table, "") }   // (#109 W1) field-annotation lookup on a resolved struct — no referencing ns
+        if fields[i].name == field { return resolve_type(fields[i].type_ann, table, ref_ns) }   // (#109 W2) field annotation resolves in the struct's OWN ns (its declaring namespace)
         i++
     }
     error { message = $"no such field: {field}" }
@@ -1207,9 +1207,9 @@ fn type_field_access(fa: parser::FieldAccess, env: Env, table: TypeTable) -> TEx
         error          => return error { message = $"unknown type for field access: {name}" }
     }
     let ft = match decl.body {
-        parser::StructBody as sb => match field_type(sb.fields, fa.field, table) { Type as t => t; error as e => return e }
+        parser::StructBody as sb => match field_type(sb.fields, fa.field, table, type_ns_of(table, name)) { Type as t => t; error as e => return e }
         parser::ClassBody as cb  => {
-            let t = match effective_class_fields(cb, table) { []Field as fs => match field_type(fs, fa.field, table) { Type as t => t; error as e => return e }; error as e => return e }   // (W10b.CLASS increment 2)
+            let t = match effective_class_fields(cb, table) { []parser::Field as fs => match field_type(fs, fa.field, table, type_ns_of(table, name)) { Type as t => t; error as e => return e }; error as e => return e }   // (W10b.CLASS increment 2)
             // (W10b.CLASS residual — intern visibility) a private (default) field is reachable
             // only from its OWN declaring class's code, or — if `intern` — a subclass's too.
             let owner = match find_field_owner(name, table, fa.field) { MemberOwner as mo => mo; error as e => return e }
@@ -1313,7 +1313,7 @@ fn type_safe_field_access(sfa: parser::SafeFieldAccess, line: u32, col: u32, env
     }
     // STRUCT route — the original TSafeFieldAccess lowering (native emission is value-based).
     let ft = match decl.body {
-        parser::StructBody as sb => match field_type(sb.fields, sfa.field, table) { Type as t => t; error as e => return e }
+        parser::StructBody as sb => match field_type(sb.fields, sfa.field, table, type_ns_of(table, name)) { Type as t => t; error as e => return e }
         _                => return error { message = $"type {name} is not a struct (no fields)" }
     }
     // the result is `(field)?` — an already-optional field stays as-is (no double-wrap).
@@ -1477,7 +1477,7 @@ fn type_struct_lit(sl: parser::StructLit, expected: Type, env: Env, table: TypeT
             if env.owner_type != name {
                 return error { message = $"a class literal is only legal inside the class's own methods — construct it via a static factory: {name}" }
             }
-            match effective_class_fields(c, table) { []Field as fs => fs; error as e => return e }
+            match effective_class_fields(c, table) { []parser::Field as fs => fs; error as e => return e }
         }
         // (TR0) a trait is NON-instantiable — it exists only to be derived. Point at the fix.
         parser::TraitBody => return error { message = $"'{name}' is a trait and cannot be instantiated — derive it from a struct or class instead (`type X = struct {name} …`)" }
@@ -1502,7 +1502,7 @@ fn type_struct_lit(sl: parser::StructLit, expected: Type, env: Env, table: TypeT
         }
         if hits == 0 { return error { message = "a struct literal is missing a declared field" } }
         if hits > 1 { return error { message = "a struct literal sets a field more than once" } }
-        let ft = match resolve_type(sb_fields[d].type_ann, table, "") { Type as t => t; error as e => return e }   // (#109 W1) field-annotation lookup on a resolved struct — no referencing ns
+        let ft = match resolve_type(sb_fields[d].type_ann, table, type_ns_of(table, name)) { Type as t => t; error as e => return e }   // (#109 W2) field annotation resolves in the struct's OWN ns
         // thread the field's type as EXPECTED so a nested generic constructor (`value = Box { … }`)
         // targets its concrete instance (S4). Non-struct-lit values type exactly as before.
         mut val = match type_value_expected(sl.field_vals[found], ft, env, table) { TExpr as te => te; error as e => return e }
@@ -2020,7 +2020,7 @@ fn type_match(m: parser::MatchExpr, env: Env, table: TypeTable) -> TExpr | error
         }
         i++
     }
-    if !exhaustive(m.arms, s.type, table) { return error { message = "non-exhaustive `match` (cover all cases or add `_`)" } }
+    if !exhaustive(m.arms, s.type, table, env.cur_ns) { return error { message = "non-exhaustive `match` (cover all cases or add `_`)" } }
     let result = if have_type { first } else { Void { } }   // all arms diverge → void
     TExpr { kind = TMatchExpr { subject = s; arms = arms }; type = result; line = 0; col = 0 }
 }
@@ -2036,7 +2036,7 @@ fn type_match_stmt(m: parser::MatchExpr, env: Env, table: TypeTable) -> TExpr | 
         arms = teko::list::push(arms, ai)
         i++
     }
-    if !exhaustive(m.arms, s.type, table) { return error { message = "non-exhaustive `match` (cover all cases or add `_`)" } }
+    if !exhaustive(m.arms, s.type, table, env.cur_ns) { return error { message = "non-exhaustive `match` (cover all cases or add `_`)" } }
     TExpr { kind = TMatchExpr { subject = s; arms = arms }; type = Void { }; line = 0; col = 0 }
 }
 
@@ -2861,7 +2861,7 @@ fn type_struct_methods(td: parser::TypeDecl, item_ns: str, file: str, env: Env, 
     match td.body {
         parser::StructBody as sb => { methods = sb.methods }
         parser::ClassBody as cb  => {
-            methods = match effective_class_methods(cb, table) { []Function as f => f; error as e => return e }
+            methods = match effective_class_methods(cb, table) { []parser::Function as f => f; error as e => return e }
             has_base_binding = cb.has_base_binding
             base_binding_name = cb.base_binding_name
             base_name = cb.base_name

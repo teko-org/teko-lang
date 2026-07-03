@@ -993,9 +993,9 @@ static tk_texpr_result type_cast(tk_cast c, tk_env env, tk_type_table table) {
 // tk_str_eq is declared in text.h (via type.h) and implemented in teko_rt.c.
 
 // non-static: shared with match.c (the FieldPattern case forward-declares it — C7a).
-tk_type_result field_type(tk_struct_body sb, tk_str field, tk_type_table table) {
+tk_type_result field_type(tk_struct_body sb, tk_str field, tk_type_table table, tk_str ref_ns) {
     for (size_t i = 0; i < sb.n_fields; i += 1)
-        if (tk_str_eq(sb.fields[i].name, field)) return tk_resolve_type(sb.fields[i].type_ann, table, (tk_str){0});   // (#109 W1) field-annotation lookup on a resolved struct — no referencing ns
+        if (tk_str_eq(sb.fields[i].name, field)) return tk_resolve_type(sb.fields[i].type_ann, table, ref_ns);   // (#109 W2) field annotation resolves in the struct's OWN ns (its declaring namespace)
     return (tk_type_result){ .ok = false, .as.error = tk_error_named("no such field", field) };
 }
 
@@ -1058,7 +1058,7 @@ static tk_texpr_result type_field_access(tk_field_access fa, tk_env env, tk_type
     } else {
         return xferr(tk_error_woven1("type ", recv.as.value.type.as.named.name, " is not a struct (no fields)"));
     }
-    tk_type_result ft = field_type(fa_sb, fa.field, table);
+    tk_type_result ft = field_type(fa_sb, fa.field, table, type_ns_of(table, recv.as.value.type.as.named.name));
     if (!ft.ok) return xferr(ft.as.error);
     // (W10b.CLASS residual — intern visibility) a private (default) field is reachable only
     // from its OWN declaring class's code, or — if `intern` — a subclass's too.
@@ -1189,7 +1189,7 @@ static tk_texpr_result type_safe_field_access(tk_safe_field_access sfa, uint32_t
     if (decl.as.value.body.tag != TK_BODY_STRUCT)
         return xferr(tk_error_woven1("type ", inner.as.named.name, " is not a struct (no fields)"));
     tk_struct_body sfa_sb = decl.as.value.body.as.struct_body;
-    tk_type_result ft = field_type(sfa_sb, sfa.field, table);
+    tk_type_result ft = field_type(sfa_sb, sfa.field, table, type_ns_of(table, inner.as.named.name));
     if (!ft.ok) return xferr(ft.as.error);
     // the result is `(field-type)?` — null-propagating; an already-optional field stays as-is.
     tk_type result = ft.as.value.tag == TK_TYPE_OPTIONAL ? ft.as.value
@@ -1369,7 +1369,7 @@ tk_texpr_result tk_type_struct_lit(tk_struct_lit sl, tk_type expected, tk_env en
             if (tk_str_eq(sl.field_names[i], fname)) { found = i; hits += 1; }
         if (hits == 0) { tk_free0(names); tk_free0(vals); return xerr("a struct literal is missing a declared field"); }
         if (hits > 1)  { tk_free0(names); tk_free0(vals); return xerr("a struct literal sets a field more than once"); }
-        tk_type_result ft = tk_resolve_type(sb_fields[d].type_ann, table, (tk_str){0});   // (#109 W1) field-annotation lookup on a resolved struct — no referencing ns
+        tk_type_result ft = tk_resolve_type(sb_fields[d].type_ann, table, type_ns_of(table, name));   // (#109 W2) field annotation resolves in the struct's OWN ns
         if (!ft.ok) { tk_free0(names); tk_free0(vals); return xferr(ft.as.error); }
         // thread the field's type as EXPECTED so a nested generic constructor (`value = Box { … }`)
         // targets its concrete instance (S4). Non-struct-lit values type exactly as before.
@@ -2096,7 +2096,7 @@ static tk_texpr_result type_match(tk_match_expr m, tk_env env, tk_type_table tab
         if (!have_type) { first = t; have_type = true; }
         else if (!tk_type_join(first, t, table, &first)) return xerr("the `match` arms have different types");   // widen (a case joins into its variant)
     }
-    if (!tk_exhaustive(m.arms, m.narms, s.as.value.type, table)) return xerr("non-exhaustive `match` (cover all cases or add `_`)");
+    if (!tk_exhaustive(m.arms, m.narms, s.as.value.type, table, env.cur_ns)) return xerr("non-exhaustive `match` (cover all cases or add `_`)");
     tk_type result = have_type ? first : tk_void_t();   // all arms diverge → void
     return xok((tk_texpr){ .tag = TK_TEXPR_MATCH, .type = result, .as.match_expr = { box(s.as.value), arms.ptr, arms.len } });
 }

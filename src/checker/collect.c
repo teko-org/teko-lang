@@ -411,7 +411,7 @@ tk_slot_result tk_base_vtable_slot(tk_str base, tk_str method, tk_type_table tab
 // (W10b.IF) does implementing method `impl_m` satisfy interface-required method `req`? Same NON-
 // receiver param types (both skip their 1st untyped receiver param) + same return type. Any type
 // that fails to resolve makes it a non-match. Mirror of collect.tks::method_sig_matches.
-static bool method_sig_matches(tk_function req, tk_function impl_m, tk_type_table table) {
+static bool method_sig_matches(tk_function req, tk_function impl_m, tk_type_table table, tk_str ref_ns) {
     size_t rstart = (req.nparams > 0 && !req.params[0].has_type) ? 1 : 0;
     size_t istart = (impl_m.nparams > 0 && !impl_m.params[0].has_type) ? 1 : 0;
     // instance/static parity: an INSTANCE interface method (has a receiver) must be satisfied by an
@@ -419,17 +419,17 @@ static bool method_sig_matches(tk_function req, tk_function impl_m, tk_type_tabl
     if (rstart != istart) return false;
     if (req.nparams - rstart != impl_m.nparams - istart) return false;
     for (size_t k = 0; rstart + k < req.nparams; k += 1) {
-        tk_type_result rt = tk_resolve_type(req.params[rstart + k].type_ann, table, (tk_str){0});   // (#109 W1) structural sig-equality — no referencing ns
+        tk_type_result rt = tk_resolve_type(req.params[rstart + k].type_ann, table, ref_ns);   // (#109 W2) resolve source-ref types in the declaring namespace
         if (!rt.ok) return false;
-        tk_type_result it = tk_resolve_type(impl_m.params[istart + k].type_ann, table, (tk_str){0});   // (#109 W1) structural sig-equality — no referencing ns
+        tk_type_result it = tk_resolve_type(impl_m.params[istart + k].type_ann, table, ref_ns);   // (#109 W2) resolve source-ref types in the declaring namespace
         if (!it.ok) return false;
         if (!tk_type_eq(&rt.as.value, &it.as.value)) return false;
     }
     if (req.has_return != impl_m.has_return) return false;
     if (req.has_return) {
-        tk_type_result rr = tk_resolve_type(req.return_type, table, (tk_str){0});   // (#109 W1) structural sig-equality — no referencing ns
+        tk_type_result rr = tk_resolve_type(req.return_type, table, ref_ns);   // (#109 W2) resolve source-ref types in the declaring namespace
         if (!rr.ok) return false;
-        tk_type_result ir = tk_resolve_type(impl_m.return_type, table, (tk_str){0});   // (#109 W1) structural sig-equality — no referencing ns
+        tk_type_result ir = tk_resolve_type(impl_m.return_type, table, ref_ns);   // (#109 W2) resolve source-ref types in the declaring namespace
         if (!ir.ok) return false;
         if (!tk_type_eq(&rr.as.value, &ir.as.value)) return false;
     }
@@ -439,7 +439,7 @@ static bool method_sig_matches(tk_function req, tk_function impl_m, tk_type_tabl
 // (W10b.IF) THE CONFORMANCE CHECK. `members_all_public` = true for a STRUCT (members all-public,
 // so the AST `vis` is irrelevant); false for a CLASS (a class method must genuinely be `pub`/`exp`
 // to satisfy the public interface contract). Mirror of collect.tks::check_conformance.
-static tk_type_result check_conformance(tk_str type_name, const tk_function *own_methods, size_t n_own,
+static tk_type_result check_conformance(tk_str type_name, tk_str type_ns, const tk_function *own_methods, size_t n_own,
                                         const tk_str *implements, size_t n_impl, tk_type_table table, bool members_all_public) {
     for (size_t ii = 0; ii < n_impl; ii += 1) {
         tk_str iname = implements[ii];
@@ -452,7 +452,7 @@ static tk_type_result check_conformance(tk_str type_name, const tk_function *own
             bool found = false;
             for (size_t mi = 0; mi < n_own; mi += 1) {
                 if (tk_str_eq(own_methods[mi].name, req.name)) {
-                    if (!method_sig_matches(req, own_methods[mi], table)) {
+                    if (!method_sig_matches(req, own_methods[mi], table, type_ns)) {
                         size_t len = type_name.len + req.name.len + iname.len + 80; char *buf = tk_alloc(len); if (!buf) abort();
                         snprintf(buf, len, "'%.*s' method '%.*s' does not match interface '%.*s's signature",
                                  (int)type_name.len, (const char *)type_name.ptr, (int)req.name.len, (const char *)req.name.ptr, (int)iname.len, (const char *)iname.ptr);
@@ -602,7 +602,7 @@ static tk_type_result check_trait_requirements(const trait_derive *derives, size
             bool found = false;
             for (size_t mi = 0; mi < n_own; mi += 1) {
                 if (tk_str_eq(own[mi].name, req.name)) {
-                    if (!method_sig_matches(req, own[mi], table)) {
+                    if (!method_sig_matches(req, own[mi], table, type_ns_of(table, d.type_name))) {
                         size_t len = d.type_name.len + req.name.len + d.trait_name.len + 96; char *buf = tk_alloc(len); if (!buf) abort();
                         snprintf(buf, len, "'%.*s' method '%.*s' does not match trait '%.*s's required signature",
                                  (int)d.type_name.len, (const char *)d.type_name.ptr, (int)req.name.len, (const char *)req.name.ptr, (int)d.trait_name.len, (const char *)d.trait_name.ptr);
@@ -782,7 +782,7 @@ static tk_type_result validate_type_decls(tk_type_table table) {
                 if (r.as.value.tag == TK_TYPE_REF)
                     return (tk_type_result){ .ok = false, .as.error = tk_error_make("a reference cannot be stored in a struct/variant/collection") };
             }
-            tk_type_result cf = check_conformance(decl.name, body.as.struct_body.methods, body.as.struct_body.n_methods,   // (W10b.IF) struct members all-public
+            tk_type_result cf = check_conformance(decl.name, ref_ns, body.as.struct_body.methods, body.as.struct_body.n_methods,   // (W10b.IF) struct members all-public
                                                   body.as.struct_body.implements, body.as.struct_body.n_implements, table, true);
             if (!cf.ok) return cf;
         } else if (body.tag == TK_BODY_ALIAS) {
@@ -804,7 +804,7 @@ static tk_type_result validate_type_decls(tk_type_table table) {
             // (W10b.IF) a class conforms via its EFFECTIVE methods (inherited base methods count).
             tk_methodsvec_result eff = tk_effective_class_methods(body.as.class_body, table);
             if (!eff.ok) return (tk_type_result){ .ok = false, .as.error = eff.as.error };
-            tk_type_result cf = check_conformance(decl.name, eff.as.value.ptr, eff.as.value.len,   // class methods need real `pub`
+            tk_type_result cf = check_conformance(decl.name, ref_ns, eff.as.value.ptr, eff.as.value.len,   // class methods need real `pub`
                                                   body.as.class_body.implements, body.as.class_body.n_implements, table, false);
             if (!cf.ok) return cf;
         } else if (body.tag == TK_BODY_TRAIT) {
@@ -850,7 +850,7 @@ static tk_type_result validate_type_decls(tk_type_table table) {
             // conflict, caught HERE (at the interface) rather than later at an implementer.
             for (size_t a = 0; a < em.as.value.len; a += 1) {
                 for (size_t b = a + 1; b < em.as.value.len; b += 1) {
-                    if (tk_str_eq(em.as.value.ptr[a].name, em.as.value.ptr[b].name) && !method_sig_matches(em.as.value.ptr[a], em.as.value.ptr[b], table)) {
+                    if (tk_str_eq(em.as.value.ptr[a].name, em.as.value.ptr[b].name) && !method_sig_matches(em.as.value.ptr[a], em.as.value.ptr[b], table, type_ns_of(table, dn))) {
                         tk_str nm = em.as.value.ptr[a].name;
                         size_t len = dn.len + nm.len + 112; char *buf = tk_alloc(len); if (!buf) abort();
                         snprintf(buf, len, "interface '%.*s' has conflicting signatures for method '%.*s' (an extended interface declares it differently)", (int)dn.len, (const char *)dn.ptr, (int)nm.len, (const char *)nm.ptr);

@@ -251,6 +251,16 @@ static tk_str namespaces_declaring(tk_type_table table, tk_str name) {
     return out;
 }
 
+// (#109 W2) the DECLARING namespace of a type by its (resolved) name — first match, "" if unknown.
+// Shared across the checker so a field / method-signature source annotation resolves in the type's
+// OWN namespace, not the code site's. Mirror of resolve.tks::type_ns_of.
+tk_str type_ns_of(tk_type_table table, tk_str name) {
+    for (size_t i = 0; i < table.len; i += 1) {
+        if (name_eq(table.ptr[i].name, name)) return table.ptr[i].namespace;
+    }
+    return rt_cstr("");
+}
+
 // (#109 W2) the namespace-aware SOURCE-reference resolver — R0-R5. See resolve.tks::resolve_type_ref
 // for the rule text. R1/R2 are handled by the callers before this point. Here: R3 (bare = strict
 // own-ns, cross-ns bare = fail-loud) and R4/R0 (qualified = last + qualifier, ambiguity = fail-loud).
@@ -313,6 +323,25 @@ static tk_decl_result resolve_type_ref(tk_path path, tk_type_table table, tk_str
     }
     if (winner_idx >= 0) return (tk_decl_result){ .ok = true, .as.value = table.ptr[winner_idx].decl };
     return (tk_decl_result){ .ok = false, .as.error = tk_error_make("not a user type") };
+}
+
+// (#109 W2) the DECLARING namespace of the type `path` resolves to (mirrors resolve_type_ref's winning
+// match) — the namespace a TRANSPARENT alias's body must resolve in. Returns "" for a root/builtin/
+// unknown path (its body resolves at root). Mirror of resolve.tks::type_ref_ns.
+static tk_str type_ref_ns(tk_path path, tk_type_table table, tk_str ref_ns) {
+    if (path.len == 0) return rt_cstr("");
+    tk_str last = path.segments[path.len - 1].name;
+    if (path.len == 1) {
+        for (size_t i = 0; i < table.len; i += 1) {
+            if (name_eq(table.ptr[i].name, last) && name_eq(table.ptr[i].namespace, ref_ns)) return ref_ns;   // R3 own-ns match → its own ns
+        }
+        return rt_cstr("");   // R1/root ("") match, or unknown → root scope
+    }
+    tk_str qual = path_qualifier(path, path.len - 1);
+    for (size_t j = 0; j < table.len; j += 1) {
+        if (name_eq(table.ptr[j].name, last) && qualifier_selects_ns(table.ptr[j].namespace, qual)) return table.ptr[j].namespace;
+    }
+    return rt_cstr("");
 }
 
 // (W10b.D2, issue #99) is the constraint EXACTLY a single INTERFACE atom `<T: I>`? If so, yields I's
@@ -482,7 +511,7 @@ tk_type_result resolve_named(tk_path path, tk_type_table table, tk_str ref_ns) {
             if (alias_depth > 64)
                 return (tk_type_result){ .ok = false, .as.error = tk_error_make("type alias resolves cyclically (self-referential alias chain)") };
             alias_depth += 1;
-            tk_type_result r = tk_resolve_type(ut.as.value.body.as.alias_body.alias, table, ref_ns);
+            tk_type_result r = tk_resolve_type(ut.as.value.body.as.alias_body.alias, table, type_ref_ns(path, table, ref_ns));   // (#109 W2) alias body resolves in the alias's OWN ns, not the referencing ns
             alias_depth -= 1;
             return r;
         }
@@ -817,7 +846,7 @@ tk_type_table tk_instantiate_types(tk_program program, tk_type_table table) {
         tk_type *argtypes = te.as.named.args_len ? tk_alloc(te.as.named.args_len * sizeof *argtypes) : NULL;
         bool ok = true;
         for (size_t a = 0; a < te.as.named.args_len; a += 1) {
-            tk_type_result r = tk_resolve_type(te.as.named.args[a], tbl, (tk_str){0});   // (#109 W1) program-wide inst pass — no single referencing ns
+            tk_type_result r = tk_resolve_type(te.as.named.args[a], tbl, type_ns_of(tbl, name));   // (#109 W2) resolve args in the generic base's OWN ns (its args are written alongside it)
             if (!r.ok) { ok = false; break; }
             argtypes[a] = r.as.value;
         }
@@ -831,7 +860,7 @@ tk_type_table tk_instantiate_types(tk_program program, tk_type_table table) {
         tk_type_body nbody = subst_body_names(gen.body, gen.type_params, gen.n_type_params, te.as.named.args, te.as.named.args_len);
         tk_type_decl stamped = { .name = mangled, .type_params = NULL, .n_type_params = 0, .body = nbody,
                                  .vis = gen.vis, .has_doc = false, .doc = (tk_str){0}, .line = gen.line, .col = gen.col };
-        tbl = tk_type_table_push(tbl, (tk_type_reg){ .name = mangled, .namespace = (tk_str){0}, .vis = gen.vis, .decl = stamped });
+        tbl = tk_type_table_push(tbl, (tk_type_reg){ .name = mangled, .namespace = type_ns_of(tbl, name), .vis = gen.vis, .decl = stamped });   // (#109 W2) stamp in the generic base's ns so the substituted body's bare field types resolve there
         collect_body_insts(nbody, &work, &nwork);   // transitive instantiations in the stamped body
     }
     // (W9.4) normalize generic-INSTANCE references in the stamped bodies to bare stamped names, so
@@ -872,7 +901,7 @@ static tk_type_expr normalize_inst_texpr(tk_type_expr te, tk_type_table table) {
     switch (te.tag) {
         case TK_TEXPR_NAMED: {
             if (te.as.named.args_len > 0) {
-                tk_type_result r = tk_resolve_type(te, table, (tk_str){0});   // (#109 W1) instance-normalization probe — no referencing ns
+                tk_type_result r = tk_resolve_type(te, table, type_ns_of(table, te.as.named.path.segments[te.as.named.path.len - 1].name));   // (#109 W2) normalization probe resolves in the generic base's OWN ns
                 if (r.ok && r.as.value.tag == TK_TYPE_NAMED && tk_name_is_g_instance(r.as.value.as.named.name)) {
                     tk_segment *segs = NULL; size_t ns = 0;
                     tk_segs_push(&segs, &ns, (tk_segment){ .name = r.as.value.as.named.name });
@@ -962,7 +991,7 @@ tk_type tk_expand_variant(tk_type t, tk_type_table table) {
     if (t.tag != TK_TYPE_NAMED) return t;
     tk_decl_result d = tk_type_table_find(table, t.as.named.name, (tk_str){0});   // (#109 W1) resolved-name probe, no referencing ns
     if (!d.ok || d.as.value.body.tag != TK_BODY_VARIANT) return t;
-    tk_type_result ex = tk_resolve_type(d.as.value.body.as.variant_body.type_expr, table, (tk_str){0});   // (#109 W1) expanded body has no distinct referencing ns
+    tk_type_result ex = tk_resolve_type(d.as.value.body.as.variant_body.type_expr, table, type_ns_of(table, t.as.named.name));   // (#109 W2) variant body resolves in the variant's OWN ns
     return ex.ok ? ex.as.value : t;
 }
 

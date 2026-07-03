@@ -6,7 +6,7 @@
 // from typer.c — the typed expression pass + the struct field resolver
 // (forward-declared, both non-static, to avoid a match↔typer cycle).
 tk_texpr_result tk_typer_expr(tk_expr e, tk_env env, tk_type_table table);
-tk_type_result  field_type(tk_struct_body sb, tk_str field, tk_type_table table);
+tk_type_result  field_type(tk_struct_body sb, tk_str field, tk_type_table table, tk_str ref_ns);
 bool tk_literal_adopts(tk_texpr e, tk_type to);   // from expr.c — numeric-literal adoption (byte/int)
 
 static tk_env_result eok(tk_env e)     { return (tk_env_result){ .ok = true,  .as.value = e }; }
@@ -189,7 +189,7 @@ tk_env_result tk_check_pattern(tk_pattern p, tk_type subject, tk_env env, tk_typ
             tk_struct_body sb = decl.as.value.body.as.struct_body;
             tk_env e2 = env;
             for (size_t i = 0; i < p.as.field.n_fields; i += 1) {
-                tk_type_result ft = field_type(sb, p.as.field.fields[i], table);
+                tk_type_result ft = field_type(sb, p.as.field.fields[i], table, type_ns_of(table, nt.as.value.as.named.name));
                 if (!ft.ok) return efail(ft.as.error);
                 e2 = tk_env_define(e2, p.as.field.fields[i], ft.as.value, false);   // B.21
             }
@@ -252,10 +252,10 @@ static tk_type_result bind_pattern_type(tk_pattern p, tk_type_table table, tk_st
 // (W9.4) the case-name a single bind names: the resolved INSTANCE name `Gen__g__i64` when it carries
 // explicit type-args, else the bare last path segment — so exhaustiveness over a `variant Gen<i64> | …`
 // covers the `Gen<i64> as x` arm by the member's mangled name. Mirror of match.tks::bind_case_name.
-static tk_str bind_case_name(tk_bind_pattern bp, tk_type_table table) {
+static tk_str bind_case_name(tk_bind_pattern bp, tk_type_table table, tk_str ref_ns) {
     if (bp.nargs > 0) {
         tk_type_expr gte = { .tag = TK_TEXPR_NAMED, .as.named = { .path = bp.type_name, .args = bp.type_args, .args_len = bp.nargs } };
-        tk_type_result r = tk_resolve_type(gte, table, (tk_str){0});   // (#109 W1) exhaustiveness case-name — structural, no referencing ns
+        tk_type_result r = tk_resolve_type(gte, table, ref_ns);   // (#109 W2) generic-instance case name resolves in the match's namespace
         if (r.ok && r.as.value.tag == TK_TYPE_NAMED) return r.as.value.as.named.name;
     }
     return bp.type_name.segments[bp.type_name.len - 1].name;
@@ -264,15 +264,15 @@ static tk_str bind_case_name(tk_bind_pattern bp, tk_type_table table) {
 // does pattern `p` name case `name` — directly (Bind/Field) or via a bare Alt option?
 // A slice bind (`[]T as x`) names NO nominal case (its type_name is empty) — it is covered by
 // some_arm_covers_type instead, so it is skipped here (and the empty-path read is avoided).
-static bool pattern_names(tk_pattern p, tk_str name, tk_type_table table) {
+static bool pattern_names(tk_pattern p, tk_str name, tk_type_table table, tk_str ref_ns) {
     if (p.tag == TK_PAT_BIND)
-        return !p.as.bind.is_slice && name_eq(bind_case_name(p.as.bind, table), name);
+        return !p.as.bind.is_slice && name_eq(bind_case_name(p.as.bind, table, ref_ns), name);
     if (p.tag == TK_PAT_FIELD)
         return name_eq(p.as.field.type_name.segments[p.as.field.type_name.len - 1].name, name);
     if (p.tag == TK_PAT_ALT) {
         for (size_t i = 0; i < p.as.alt.n_options; i += 1) {
             tk_pattern opt = p.as.alt.options[i];
-            if (opt.tag == TK_PAT_BIND  && !opt.as.bind.is_slice && name_eq(bind_case_name(opt.as.bind, table), name)) return true;
+            if (opt.tag == TK_PAT_BIND  && !opt.as.bind.is_slice && name_eq(bind_case_name(opt.as.bind, table, ref_ns), name)) return true;
             if (opt.tag == TK_PAT_FIELD && name_eq(opt.as.field.type_name.segments[opt.as.field.type_name.len - 1].name, name)) return true;
         }
     }
@@ -282,18 +282,18 @@ static bool pattern_names(tk_pattern p, tk_str name, tk_type_table table) {
 // non-nominal members of a `T | error` style variant — prim/byte/str/slice/error — where the
 // arm is a bind whose resolved type equals the member (e.g. `[]byte as o` ⇒ []byte, `error as e`
 // ⇒ error, `i64 as v` ⇒ i64). NAMED (nominal) members keep the name-based some_arm_names path.
-static bool some_arm_covers_type(tk_arm *arms, size_t n, tk_type mem, tk_type_table table) {
+static bool some_arm_covers_type(tk_arm *arms, size_t n, tk_type mem, tk_type_table table, tk_str ref_ns) {
     for (size_t i = 0; i < n; i += 1) {
         if (arms[i].has_when) continue;
         tk_pattern p = arms[i].pattern;
         if (p.tag == TK_PAT_BIND) {
-            tk_type_result rt = bind_pattern_type(p, table, (tk_str){0});   // (#109 W1) coverage check — structural, no referencing ns
+            tk_type_result rt = bind_pattern_type(p, table, ref_ns);   // (#109 W2) coverage check resolves the arm pattern in the match's namespace
             if (rt.ok && tk_type_eq(&rt.as.value, &mem)) return true;
         } else if (p.tag == TK_PAT_ALT) {
             for (size_t j = 0; j < p.as.alt.n_options; j += 1) {
                 tk_pattern opt = p.as.alt.options[j];
                 if (opt.tag != TK_PAT_BIND) continue;
-                tk_type_result rt = bind_pattern_type(opt, table, (tk_str){0});   // (#109 W1) coverage check — structural, no referencing ns
+                tk_type_result rt = bind_pattern_type(opt, table, ref_ns);   // (#109 W2) coverage check resolves the arm pattern in the match's namespace
                 if (rt.ok && tk_type_eq(&rt.as.value, &mem)) return true;
             }
         }
@@ -301,9 +301,9 @@ static bool some_arm_covers_type(tk_arm *arms, size_t n, tk_type mem, tk_type_ta
     return false;
 }
 // is `name` covered by some UNGUARDED arm?
-static bool some_arm_names(tk_arm *arms, size_t n, tk_str name, tk_type_table table) {
+static bool some_arm_names(tk_arm *arms, size_t n, tk_str name, tk_type_table table, tk_str ref_ns) {
     for (size_t i = 0; i < n; i += 1)
-        if (!arms[i].has_when && pattern_names(arms[i].pattern, name, table)) return true;
+        if (!arms[i].has_when && pattern_names(arms[i].pattern, name, table, ref_ns)) return true;
     return false;
 }
 // is the NONE case (a `null` pattern) covered by some UNGUARDED arm?
@@ -317,7 +317,7 @@ static bool some_arm_is_null(tk_arm *arms, size_t n) {
 // a bare bind (`T as x` / `T`) over the inner, OR (recursively) the inner's own exhaustiveness
 // when the inner is a variant. We re-run tk_exhaustive over the non-null arms with the inner
 // subject, but a bare BIND over a SCALAR inner does count as present-covering here.
-static bool present_case_covered(tk_arm *arms, size_t n, tk_type inner, tk_type_table table) {
+static bool present_case_covered(tk_arm *arms, size_t n, tk_type inner, tk_type_table table, tk_str ref_ns) {
     // A bare bind/wildcard arm (un-`null`, unguarded) covers the whole present value.
     for (size_t i = 0; i < n; i += 1) {
         if (arms[i].has_when) continue;
@@ -326,21 +326,21 @@ static bool present_case_covered(tk_arm *arms, size_t n, tk_type inner, tk_type_
         if (p.tag == TK_PAT_BIND && p.as.bind.type_name.len > 0) return true;   // `T as x` / `T` binds the present value
     }
     // Otherwise fall back to ordinary exhaustiveness over the inner (e.g. a variant inner).
-    return tk_exhaustive(arms, n, inner, table);
+    return tk_exhaustive(arms, n, inner, table, ref_ns);
 }
-bool tk_exhaustive(tk_arm *arms, size_t n, tk_type subject, tk_type_table table) {
+bool tk_exhaustive(tk_arm *arms, size_t n, tk_type subject, tk_type_table table, tk_str ref_ns) {
     if (has_wildcard(arms, n)) return true;
     if (subject.tag == TK_TYPE_NAMED) {   // an ENUM subject is exhaustive iff EVERY member is named (C7b)
-        tk_decl_result d = tk_type_table_find(table, subject.as.named.name, (tk_str){0});   // (#109 W1) enum-subject probe on a resolved name — no referencing ns
+        tk_decl_result d = tk_type_table_find(table, subject.as.named.name, (tk_str){0});   // (#109) resolved-name probe — namespace-blind (tk_type_table_find ignores ref_ns)
         if (d.ok && d.as.value.body.tag == TK_BODY_ENUM) {
             tk_enum_body eb = d.as.value.body.as.enum_body;
             for (size_t i = 0; i < eb.n_members; i += 1)
-                if (!some_arm_names(arms, n, eb.members[i], table)) return false;
+                if (!some_arm_names(arms, n, eb.members[i], table, ref_ns)) return false;
             return true;
         }
     }
     if (subject.tag == TK_TYPE_OPTIONAL) {   // `T?` — exhaustive iff `null` AND the present case are covered (REBOOT §202)
-        return some_arm_is_null(arms, n) && present_case_covered(arms, n, *subject.as.optional.inner, table);
+        return some_arm_is_null(arms, n) && present_case_covered(arms, n, *subject.as.optional.inner, table, ref_ns);
     }
     tk_type sv = tk_expand_variant(subject, table);   // a NAMED variant → its TK_TYPE_VARIANT cases (B.14/B.15)
     if (sv.tag != TK_TYPE_VARIANT) return false;
@@ -349,9 +349,9 @@ bool tk_exhaustive(tk_arm *arms, size_t n, tk_type subject, tk_type_table table)
         // NAMED (nominal) members match by name; non-nominal members (prim/byte/str/slice/error —
         // the `T | error` idiom) match by resolved-type equality against a bind arm.
         if (mem.tag == TK_TYPE_NAMED) {
-            if (!some_arm_names(arms, n, mem.as.named.name, table)) return false;
+            if (!some_arm_names(arms, n, mem.as.named.name, table, ref_ns)) return false;
         } else {
-            if (!some_arm_covers_type(arms, n, mem, table)) return false;
+            if (!some_arm_covers_type(arms, n, mem, table, ref_ns)) return false;
         }
     }
     return true;

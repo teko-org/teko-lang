@@ -63,6 +63,21 @@ fn namespaces_declaring(table: TypeTable, name: str) -> str {
     out
 }
 
+// (#109 W2) the DECLARING namespace of a type by its (resolved) name — first match, "" if unknown.
+// A struct/class field's, or a method signature's, source type annotation is written in the type's
+// OWN namespace, so resolving those annotations must reference that namespace, not the code site's.
+// Shared across the checker (collect conformance, typer field/struct-init resolution). Under W0 no
+// two types share a bare name, so the first match is unambiguous (W3 canonical names make it exact).
+fn type_ns_of(table: TypeTable, name: str) -> str {
+    mut i: u64 = 0
+    loop {
+        if i >= table.len { break }
+        if table[i].name == name { return table[i].namespace }
+        i++
+    }
+    ""
+}
+
 // (#109 W2) the namespace-aware SOURCE-reference resolver — R0-R5. `path` is the WRITTEN reference,
 // `ref_ns` the namespace of the code that wrote it. Resolves to the ONE declaration the reference
 // names, or a fail-loud error. R1 (type-params) and R2 (builtins) are handled by the callers BEFORE
@@ -140,6 +155,33 @@ fn resolve_type_ref(path: parser::Path, table: TypeTable, ref_ns: str) -> parser
     }
     if winner_idx >= 0 { return table[winner_idx to u64].decl }
     error { message = "not a user type" }
+}
+
+// (#109 W2) the DECLARING namespace of the type `path` resolves to (mirrors resolve_type_ref's winning
+// match) — the namespace a TRANSPARENT alias's body must resolve in. `TypeTable = []TypeReg` in
+// teko::checker, referenced qualified from teko::emit, expands `[]TypeReg` in teko::checker (its own
+// ns), NOT the referencing emit ns. Returns "" for a root/builtin/unknown path (its body, if any,
+// resolves at root). Companion to resolve_type_ref; W4 folds the two into one ns-carrying resolver.
+fn type_ref_ns(path: parser::Path, table: TypeTable, ref_ns: str) -> str {
+    if path.segments.len == 0 { return "" }
+    let last = path.segments[path.segments.len - 1].name
+    if path.segments.len == 1 {
+        mut i: u64 = 0
+        loop {
+            if i >= table.len { break }
+            if table[i].name == last && table[i].namespace == ref_ns { return ref_ns }   // R3 own-ns match → its own ns
+            i++
+        }
+        return ""   // R1/root ("") match, or unknown → root scope
+    }
+    let qual = path_qualifier(path, path.segments.len - 1)
+    mut j: u64 = 0
+    loop {
+        if j >= table.len { break }
+        if table[j].name == last && qualifier_selects_ns(table[j].namespace, qual) { return table[j].namespace }
+        j++
+    }
+    ""
 }
 
 // (W10b.D2) is the constraint on a type-param EXACTLY a single INTERFACE atom `<T: I>` (I a declared
@@ -223,7 +265,7 @@ fn resolve_named(path: parser::Path, table: TypeTable, ref_ns: str) -> Type | er
         // struct, etc. struct/enum/variant decls stay NOMINAL (a bare Named of `name`).
         parser::TypeDecl as td => {
             match td.body {
-                parser::AliasBody as ab => return resolve_type(ab.alias, table, ref_ns)
+                parser::AliasBody as ab => return resolve_type(ab.alias, table, type_ref_ns(path, table, ref_ns))   // (#109 W2) alias body resolves in the alias's OWN ns, not the referencing ns
                 // (TR0) a trait NEVER reaches a value position — it is a derivable bundle, not a
                 // type for variables/params/returns/fields. Trait-typed DYNAMIC values (a vtable
                 // over the trait's bodyless requirements) arrive with TR1 — honest stop until then.
@@ -256,7 +298,7 @@ fn expand_variant(t: Type, table: TypeTable) -> Type {
     }
     match decl.body {
         parser::VariantBody as vb => {
-            match resolve_type(vb.type_expr, table, "") {   // (#109 W1) expanded body has no distinct referencing ns
+            match resolve_type(vb.type_expr, table, type_ns_of(table, name)) {   // (#109 W2) variant body resolves in the variant's OWN ns (its members are written there)
                 Type as ex => ex            // the variant body's union → its Variant
                 error      => t             // unresolvable → unchanged (honest fallback, like the C `ex.ok ? … : t`)
             }
@@ -1122,7 +1164,7 @@ pub fn instantiate_types(program: parser::Program, table: TypeTable) -> TypeTabl
                 mut a = 0
                 loop {
                     if a >= nt.args.len { break }
-                    match resolve_type(nt.args[a], tbl, "") { Type as t => argtypes = teko::list::push(argtypes, t); error => { ok = false; break } }   // (#109 W1) program-wide inst pass — no single referencing ns
+                    match resolve_type(nt.args[a], tbl, type_ns_of(tbl, name)) { Type as t => argtypes = teko::list::push(argtypes, t); error => { ok = false; break } }   // (#109 W2) resolve args in the generic base's OWN ns (its args are written alongside it)
                     a++
                 }
                 if !ok { continue }
@@ -1133,7 +1175,7 @@ pub fn instantiate_types(program: parser::Program, table: TypeTable) -> TypeTabl
                         if gen.type_params.len != nt.args.len { continue }   // arity error surfaces at resolve
                         let nbody = subst_body_names(gen.body, gen.type_params, nt.args)
                         let stamped = parser::TypeDecl { name = mangled; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = nbody; vis = gen.vis; has_doc = false; doc = ""; line = gen.line; col = gen.col }
-                        tbl = teko::list::push(tbl, TypeReg { name = mangled; namespace = ""; vis = gen.vis; decl = stamped })
+                        tbl = teko::list::push(tbl, TypeReg { name = mangled; namespace = type_ns_of(tbl, name); vis = gen.vis; decl = stamped })   // (#109 W2) stamp in the generic base's ns so the substituted body's bare field types resolve there
                         work = collect_body_insts(nbody, work)   // transitive instantiations in the stamped body
                     }
                     error => continue   // unknown base type → reported at typing
@@ -1190,7 +1232,7 @@ fn normalize_inst_texpr(te: parser::TypeExpr, table: TypeTable) -> parser::TypeE
             if nt.args.len > 0 {
                 // does this `Base<args>` resolve to a stamped user generic instance? (resolve_type
                 // → resolve_generic_inst yields Named{Base__g__mangle}; ptr/Ref yield Ptr/Ref.)
-                match resolve_type(te, table, "") {   // (#109 W1) instance-normalization probe — no referencing ns
+                match resolve_type(te, table, type_ns_of(table, nt.path.segments[nt.path.segments.len - 1].name)) {   // (#109 W2) normalization probe resolves in the generic base's OWN ns
                     Type as rt => {
                         match rt {
                             Named as rn => {
