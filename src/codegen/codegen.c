@@ -5582,6 +5582,14 @@ tk_cstr_result tk_emit_c(tk_tprogram prog) {
             cb(&b, " ");
             mangle_type_name(&b, (tk_str){ NULL, 0 }, d.name);
             cb(&b, ";\n");
+            // (#98) a POLYMORPHIC base ALSO gets a companion FAT-POINTER typedef
+            // `tk_base_<name>` — the D3 `{ data, vtable }` two-word rep a base-typed
+            // slot lowers to. (A sealed class needs none — it is never a base.)
+            if (d.body.tag == TK_BODY_CLASS && d.body.as.class_body.kind != TK_CLASS_SEALED) {
+                cb(&b, "typedef struct { void *data; void *const *vtable; } tk_base_");
+                cb_str(&b, d.name);
+                cb(&b, ";\n");
+            }
         }
         // (W10b.D3) an INTERFACE (contract) value is a data+vtable FAT POINTER — the tk_closure-
         // shaped two-word rep. It embeds nothing and nothing orders before it, so the FULL typedef
@@ -5629,24 +5637,49 @@ tk_cstr_result tk_emit_c(tk_tprogram prog) {
             for (size_t ii = 0; ii < prog.nitems; ii += 1) {
                 if (prog.items[ii].tag != TK_TITEM_TYPE_DECL) continue;
                 tk_type_decl idd = prog.items[ii].as.type_decl;
-                if (idd.body.tag != TK_BODY_INTERFACE) continue;
-                if (!tk_type_conforms_to(cd.name, idd.name, vt_table)) continue;
-                tk_methodsvec_result ms = tk_iface_methods_by_name(idd.name, vt_table);
-                if (!ms.ok) { tk_free0(b.ptr); return cg_err("codegen: interface method list failed (internal)"); }
-                cb(&b, "static void *const tk_vt_");
-                cb_str(&b, cd.name); cb(&b, "_"); cb_str(&b, idd.name);
-                cb(&b, "[] = {");
-                if (ms.as.value.len == 0) cb(&b, " (void *)0");   // a methodless contract still gets a (never-indexed) one-slot table
-                for (size_t mi = 0; mi < ms.as.value.len; mi += 1) {
-                    tk_str mns;
-                    if (!cg_find_method_ns(cd.name, ms.as.value.ptr[mi].name, &mns)) {
-                        tk_free0(b.ptr);
-                        return cg_err("codegen: conforming class is missing an interface method's stamped function (internal)");
+                if (idd.body.tag == TK_BODY_INTERFACE && tk_type_conforms_to(cd.name, idd.name, vt_table)) {
+                    tk_methodsvec_result ms = tk_iface_methods_by_name(idd.name, vt_table);
+                    if (!ms.ok) { tk_free0(b.ptr); return cg_err("codegen: interface method list failed (internal)"); }
+                    cb(&b, "static void *const tk_vt_");
+                    cb_str(&b, cd.name); cb(&b, "_"); cb_str(&b, idd.name);
+                    cb(&b, "[] = {");
+                    if (ms.as.value.len == 0) cb(&b, " (void *)0");   // a methodless contract still gets a (never-indexed) one-slot table
+                    for (size_t mi = 0; mi < ms.as.value.len; mi += 1) {
+                        tk_str mns;
+                        if (!cg_find_method_ns(cd.name, ms.as.value.ptr[mi].name, &mns)) {
+                            tk_free0(b.ptr);
+                            return cg_err("codegen: conforming class is missing an interface method's stamped function (internal)");
+                        }
+                        cb(&b, mi == 0 ? " (void *)&" : ", (void *)&");
+                        cb_fn_name(&b, mns, ms.as.value.ptr[mi].name);
                     }
-                    cb(&b, mi == 0 ? " (void *)&" : ", (void *)&");
-                    cb_fn_name(&b, mns, ms.as.value.ptr[mi].name);
+                    cb(&b, " };\n");
                 }
-                cb(&b, " };\n");
+                // (#98) per-(class, BASE) vtable — `tk_vt_<Sub>_<Base>` — for every
+                // POLYMORPHIC base `cd` IS-A (itself included, so a self-upcast of a
+                // directly-instantiable virtual base resolves too). Slot i is the
+                // base's i-th EFFECTIVE method (base_vtable_slot agrees). Each slot
+                // points at THIS class's stamped method (the override, if any).
+                bool idd_is_poly_base = cg_is_polymorphic_base(idd.name);
+                bool cd_is_a = cg_name_eq(cd.name, idd.name) || cg_subclass_reaches(cd.name, idd.name, 64);
+                if (idd_is_poly_base && cd_is_a) {
+                    tk_methodsvec_result bms = tk_base_vtable_methods(idd.name, vt_table);
+                    if (!bms.ok) { tk_free0(b.ptr); return cg_err("codegen: base method list failed (internal)"); }
+                    cb(&b, "static void *const tk_vt_");
+                    cb_str(&b, cd.name); cb(&b, "_"); cb_str(&b, idd.name);
+                    cb(&b, "[] = {");
+                    if (bms.as.value.len == 0) cb(&b, " (void *)0");
+                    for (size_t bmi = 0; bmi < bms.as.value.len; bmi += 1) {
+                        tk_str bmns;
+                        if (!cg_find_method_ns(cd.name, bms.as.value.ptr[bmi].name, &bmns)) {
+                            tk_free0(b.ptr);
+                            return cg_err("codegen: subclass is missing a base method's stamped function (internal)");
+                        }
+                        cb(&b, bmi == 0 ? " (void *)&" : ", (void *)&");
+                        cb_fn_name(&b, bmns, bms.as.value.ptr[bmi].name);
+                    }
+                    cb(&b, " };\n");
+                }
             }
         }
         cb(&b, "\n");
