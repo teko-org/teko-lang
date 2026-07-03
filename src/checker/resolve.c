@@ -13,6 +13,35 @@ tk_error tk_error_named(const char *msg, tk_str name) {
     return tk_error_make(buf);
 }
 
+// (#121) Byte-identical twin-message builders. The self-hosted `.tks` engine composes its
+// diagnostics via `$"…{x}…"` interpolation, so a name is woven INTO the sentence (e.g.
+// `field 'w' is private to Widget`) rather than tacked on as `"…: w"`. These helpers let the
+// C engine emit the SAME rendered string, closing the wording divergences (issue #121). The
+// campaign leans on byte-identical messages as parity evidence, so the C twin must match the
+// canonical `.tks` text exactly. Buffers are whole-compile-lifetime (tk_alloc — arena-style).
+
+// One woven name: "<a>%.*s<b>" — e.g. tk_err_1("field '", field, "' is private to …") after a
+// second weave, or a single-name sentence in isolation.
+tk_error tk_error_woven1(const char *a, tk_str n1, const char *b) {
+    size_t len = strlen(a) + n1.len + strlen(b) + 1;
+    char *buf = tk_alloc(len); if (!buf) abort();
+    int m = snprintf(buf, len, "%s%.*s%s", a, (int)n1.len, (const char *)n1.ptr, b);
+    if (m < 0 || (size_t)m >= len) abort();
+    return tk_error_make(buf);
+}
+
+// Two woven names: "<a>%.*s<b>%.*s<c>" — e.g. `field 'w' is private to Widget`
+// = tk_error_woven2("field '", field, "' is private to ", cls, "").
+tk_error tk_error_woven2(const char *a, tk_str n1, const char *b, tk_str n2, const char *c) {
+    size_t len = strlen(a) + n1.len + strlen(b) + n2.len + strlen(c) + 1;
+    char *buf = tk_alloc(len); if (!buf) abort();
+    int m = snprintf(buf, len, "%s%.*s%s%.*s%s",
+                     a, (int)n1.len, (const char *)n1.ptr,
+                     b, (int)n2.len, (const char *)n2.ptr, c);
+    if (m < 0 || (size_t)m >= len) abort();
+    return tk_error_make(buf);
+}
+
 // (S4) tiny string builders for name mangling (whole-compile-lifetime; tk_alloc — arena-style).
 static tk_str rt_cstr(const char *s) {
     size_t n = strlen(s);

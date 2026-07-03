@@ -489,7 +489,7 @@ static tk_texpr_result type_method_call(tk_method_call mc, tk_env env, tk_type_t
         tk_member_owner_result owner = tk_find_method_owner(struct_name, table, mc.method);
         if (!owner.ok) return xferr(owner.as.error);
         if (!tk_member_accessible(owner.as.value, env.owner_type, table))
-            return xferr(tk_error_named("method is private to its declaring class", mc.method));
+            return xferr(tk_error_woven2("method '", mc.method, "' is private to ", owner.as.value.declaring_class, ""));
     }
     tk_segment *segs = tk_alloc(2 * sizeof *segs); if (!segs) abort();
     segs[0] = (tk_segment){ .name = struct_name };
@@ -555,7 +555,7 @@ static tk_texpr_result type_call(tk_call c, tk_env env, tk_type_table table) {
             tk_member_owner_result owner = tk_find_method_owner(cls, table, name);
             if (!owner.ok) return xferr(owner.as.error);
             if (!tk_member_accessible(owner.as.value, env.owner_type, table))
-                return xferr(tk_error_named("method is private to its declaring class", name));
+                return xferr(tk_error_woven2("method '", name, "' is private to ", owner.as.value.declaring_class, ""));
         }
     }
     tk_expr *dargs = c.args; size_t ndargs = c.nargs;
@@ -997,7 +997,7 @@ static tk_texpr_result type_field_access(tk_field_access fa, tk_env env, tk_type
         tk_member_owner_result owner = tk_find_field_owner(recv.as.value.type.as.named.name, table, fa.field);
         if (!owner.ok) return xferr(owner.as.error);
         if (!tk_member_accessible(owner.as.value, env.owner_type, table))
-            return xferr(tk_error_named("field is private to its declaring class", fa.field));
+            return xferr(tk_error_woven2("field '", fa.field, "' is private to ", owner.as.value.declaring_class, ""));
     }
     return xok((tk_texpr){ .tag = TK_TEXPR_FIELD_ACCESS, .type = ft.as.value,
                            .as.field_access = { box(recv.as.value), fa.field } });
