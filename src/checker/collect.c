@@ -125,7 +125,7 @@ tk_type_table tk_type_table_of(tk_tprogram prog) {
 tk_classbody_result tk_find_class_body(tk_str name, tk_type_table table) {
     tk_decl_result decl = tk_type_table_find(table, name);
     if (!decl.ok) return (tk_classbody_result){ .ok = false, .as.error = tk_error_named("unknown base class", name) };
-    if (decl.as.value.body.tag != TK_BODY_CLASS) return (tk_classbody_result){ .ok = false, .as.error = tk_error_named("is not a class", name) };
+    if (decl.as.value.body.tag != TK_BODY_CLASS) return (tk_classbody_result){ .ok = false, .as.error = tk_error_woven1("", name, " is not a class") };
     return (tk_classbody_result){ .ok = true, .as.value = decl.as.value.body.as.class_body };
 }
 
@@ -230,7 +230,7 @@ tk_member_owner_result tk_find_field_owner(tk_str class_name, tk_type_table tabl
         }
     }
     if (cb.as.value.has_base) return tk_find_field_owner(cb.as.value.base_name, table, field_name);
-    return (tk_member_owner_result){ .ok = false, .as.error = tk_error_named("internal: field not found in class chain", field_name) };
+    return (tk_member_owner_result){ .ok = false, .as.error = tk_error_woven2("internal: field '", field_name, "' not found in ", class_name, "'s class chain") };
 }
 tk_member_owner_result tk_find_method_owner(tk_str class_name, tk_type_table table, tk_str method_name) {
     tk_classbody_result cb = tk_find_class_body(class_name, table);
@@ -242,7 +242,7 @@ tk_member_owner_result tk_find_method_owner(tk_str class_name, tk_type_table tab
         }
     }
     if (cb.as.value.has_base) return tk_find_method_owner(cb.as.value.base_name, table, method_name);
-    return (tk_member_owner_result){ .ok = false, .as.error = tk_error_named("internal: method not found in class chain", method_name) };
+    return (tk_member_owner_result){ .ok = false, .as.error = tk_error_woven2("internal: method '", method_name, "' not found in ", class_name, "'s class chain") };
 }
 
 // (W10b.CLASS residual — intern visibility) is `owner`'s member reachable from code whose OWN
@@ -290,9 +290,9 @@ static tk_type_result validate_class_decl(tk_class_body cb, tk_type_table table)
     if (cb.has_base) {
         tk_decl_result base_decl = tk_type_table_find(table, cb.base_name);
         if (!base_decl.ok) return (tk_type_result){ .ok = false, .as.error = tk_error_named("unknown base class", cb.base_name) };
-        if (base_decl.as.value.body.tag != TK_BODY_CLASS) return (tk_type_result){ .ok = false, .as.error = tk_error_named("is not a class", cb.base_name) };
+        if (base_decl.as.value.body.tag != TK_BODY_CLASS) return (tk_type_result){ .ok = false, .as.error = tk_error_woven1("", cb.base_name, " is not a class") };
         if (base_decl.as.value.body.as.class_body.kind == TK_CLASS_SEALED)
-            return (tk_type_result){ .ok = false, .as.error = tk_error_named("cannot inherit from a sealed class (only abstract/virtual classes can be a base)", cb.base_name) };
+            return (tk_type_result){ .ok = false, .as.error = tk_error_woven1("cannot inherit from `", cb.base_name, "` — it is sealed (only `abstract`/`virtual` classes can be a base)") };
     }
     tk_function *base_methods = NULL; size_t n_base_methods = 0;
     if (cb.has_base) {
@@ -309,10 +309,10 @@ static tk_type_result validate_class_decl(tk_class_body cb, tk_type_table table)
         for (size_t j = 0; j < n_base_methods; j += 1) {
             if (tk_str_eq(base_methods[j].name, m.name)) { found = true; bm = base_methods[j]; break; }
         }
-        if (!found) return (tk_type_result){ .ok = false, .as.error = tk_error_named("has no matching base method to override", m.name) };
+        if (!found) return (tk_type_result){ .ok = false, .as.error = tk_error_woven1("'", m.name, "' has no matching base method to override") };
         bool overridable = bm.is_abstract || bm.is_virtual || bm.is_override;
-        if (!overridable) return (tk_type_result){ .ok = false, .as.error = tk_error_named("overrides a base method that is not abstract/virtual", m.name) };
-        if (bm.nparams != m.nparams) return (tk_type_result){ .ok = false, .as.error = tk_error_named("override must have the same parameter count as the base method", m.name) };
+        if (!overridable) return (tk_type_result){ .ok = false, .as.error = tk_error_woven1("'", m.name, "' overrides a base method that is not `abstract`/`virtual`") };
+        if (bm.nparams != m.nparams) return (tk_type_result){ .ok = false, .as.error = tk_error_woven1("'", m.name, "' override must have the same parameter count as the base method") };
         tk_str restated = default_restated_param(bm.params, bm.nparams, m.params, m.nparams);
         if (restated.len > 0) {
             size_t len = m.name.len + restated.len + cb.base_name.len + 96; char *buf = tk_alloc(len); if (!buf) abort();
@@ -565,7 +565,7 @@ static tk_type_result check_trait_requirements(const trait_derive *derives, size
         traitbody_result tb = find_trait_body(d.trait_name, table);
         if (!tb.ok) return (tk_type_result){ .ok = false, .as.error = tb.as.error };
         tk_decl_result decl = tk_type_table_find(table, d.type_name);
-        if (!decl.ok) return (tk_type_result){ .ok = false, .as.error = tk_error_named("internal: trait deriver vanished from the type table", d.type_name) };
+        if (!decl.ok) return (tk_type_result){ .ok = false, .as.error = tk_error_woven1("internal: trait deriver '", d.type_name, "' vanished from the type table") };
         const tk_function *own = NULL; size_t n_own = 0;
         if (decl.as.value.body.tag == TK_BODY_STRUCT) {
             own = decl.as.value.body.as.struct_body.methods; n_own = decl.as.value.body.as.struct_body.n_methods;
