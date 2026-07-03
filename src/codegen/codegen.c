@@ -823,6 +823,10 @@ static bool emit_type(cbuf *b, tk_type t, const char **err) {
         // (W10b.CLASS increment 3) a CLASS is a REFERENCE type — every use (locals, call-arg
         // types read off .type, …) lowers to a pointer, same rule as emit_type_expr.
         case TK_TYPE_NAMED:
+            // (#98) a POLYMORPHIC-BASE-typed slot is the fat pointer `tk_base_<name>` (data +
+            // vtable), NOT the raw object pointer — so a Sub→Base upcast + base-typed dispatch
+            // reuse the D3 fat pointer. (An interface-typed slot is likewise its fat typedef.)
+            if (cg_is_polymorphic_base(t.as.named.name)) { cb(b, "tk_base_"); cb_str(b, t.as.named.name); return true; }
             mangle_type_name(b, (tk_str){ NULL, 0 }, t.as.named.name);
             if (cg_is_class_named(t.as.named.name)) cb(b, " *");
             return true;
@@ -1152,6 +1156,10 @@ static bool emit_type_expr(cbuf *b, tk_type_expr te, const char **err) {
             // the ONE place that decision fans out from: params, returns, fields, locals all call
             // emit_type_expr, so a class becomes `tk_t_Name *` everywhere with no special-casing
             // at each call site.
+            // (#98) a POLYMORPHIC-BASE-typed annotation (`s: Animal`, `-> Animal`, a field of base
+            // type) is the fat pointer `tk_base_<name>`, matching emit_type — so a base-typed
+            // param/return/field reuses the D3 fat pointer. A sealed class stays a raw pointer.
+            if (cg_is_polymorphic_base(last)) { cb(b, "tk_base_"); cb_str(b, last); return true; }
             if (cg_is_class_named(last)) { mangle_type_name(b, (tk_str){ NULL, 0 }, last); cb(b, " *"); return true; }
             // a user-defined named aggregate -> its mangled typedef name (matches emit_type).
             mangle_type_name(b, (tk_str){ NULL, 0 }, last);
