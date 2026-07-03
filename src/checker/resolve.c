@@ -181,17 +181,40 @@ tk_decl_result tk_type_table_find(tk_type_table table, tk_str name) {
     return (tk_decl_result){ .ok = false, .as.error = tk_error_make("not a user type") };
 }
 
+// (W10b.D2, issue #99) is the constraint EXACTLY a single INTERFACE atom `<T: I>`? If so, yields I's
+// name; NULL otherwise (compound A&B/A|B, a variant/struct/trait atom, or none — all stay opaque).
+// The interface, monomorphized to the concrete type at each call site, drives the D3 vtable dispatch.
+// (resolve.tks: constraint_single_interface.) `c` may be NULL (a caller with no constraints array).
+static const tk_str *constraint_single_interface(const tk_constraint_expr *c, tk_type_table table) {
+    if (!c) return NULL;
+    if (c->tag == TK_CONSTRAINT_ATOM && tk_is_interface_name(c->as.atom.name, table)) return &c->as.atom.name;
+    return NULL;   // And/Or/None → not a single interface atom
+}
+
 // (S4) extend the table with generic type-params as OPAQUE nominal types (an unconstrained T has
 // no members/operators → operating on it fails at the definition; no reflection). Prepended so a
 // type-param shadows a same-named user type. Empty → unchanged. (resolve.tks: type_param_table.)
-tk_type_table tk_type_param_table(tk_str *type_params, size_t n_type_params, tk_str ns, tk_type_table table) {
+//
+// (W10b.D2, issue #99) `type_constraints` is PARALLEL to `type_params` (same length; may be NULL when
+// a caller has none). A SINGLE INTERFACE ATOM `<T: I>` registers the type-param with an interface-
+// mirroring body (`extends = [I]`, no own methods) instead of the opaque ExternBody, so `Named{T}.m()`
+// resolves through the EXISTING D3 dispatch (expr.c::type_method_call redirects to `I` for callee/
+// vtable, keeping the receiver's `Named{T}` for monomorphization). Every other shape stays opaque.
+tk_type_table tk_type_param_table(tk_str *type_params, size_t n_type_params, tk_constraint_expr *type_constraints, tk_str ns, tk_type_table table) {
     if (n_type_params == 0) return table;
     tk_type_table tbl = tk_type_table_empty();
     for (size_t i = 0; i < n_type_params; i += 1) {
         // namespace = the USING namespace so the W-vis-enforce check (check_modules) treats the
         // type-param as a LOCAL type, not a bare cross-namespace reference.
-        tk_type_decl d = { .name = type_params[i], .type_params = NULL, .n_type_params = 0,
-                           .body = { .tag = TK_BODY_EXTERN, .as.extern_body = { 0 } },
+        tk_type_body body = { .tag = TK_BODY_EXTERN, .as.extern_body = { 0 } };
+        const tk_str *iface = type_constraints ? constraint_single_interface(&type_constraints[i], table) : NULL;
+        if (iface) {
+            tk_str *ext = tk_alloc(sizeof *ext); if (!ext) abort(); ext[0] = *iface;
+            body = (tk_type_body){ .tag = TK_BODY_INTERFACE,
+                                   .as.interface_body = { .extends = ext, .n_extends = 1, .methods = NULL, .n_methods = 0 } };
+        }
+        tk_type_decl d = { .name = type_params[i], .type_params = NULL, .n_type_params = 0, .type_constraints = NULL,
+                           .body = body,
                            .vis = TK_VIS_PRIVATE, .has_doc = false, .doc = (tk_str){0}, .line = 0, .col = 0 };
         tbl = tk_type_table_push(tbl, (tk_type_reg){ .name = type_params[i], .namespace = ns, .vis = TK_VIS_PRIVATE, .decl = d });
     }

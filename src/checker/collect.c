@@ -28,7 +28,7 @@ static tk_type_table collect_types(tk_item *items, size_t n) {
 }
 
 static tk_type_result func_type(tk_function f, tk_type_table table) {
-    tk_type_table tbl = tk_type_param_table(f.type_params, f.n_type_params, (tk_str){0}, table);   // (S4) opaque type-params in scope
+    tk_type_table tbl = tk_type_param_table(f.type_params, f.n_type_params, f.type_constraints, (tk_str){0}, table);   // (S4) opaque type-params in scope
     tk_type *params = NULL; size_t n = 0;
     tk_str *param_names = NULL;   // DEFARGS (2026-07-01)
     tk_expr *defaults = NULL; size_t ndefaults = 0;
@@ -67,7 +67,7 @@ static tk_type_result func_type(tk_function f, tk_type_table table) {
 // is IMPLICIT (the enclosing struct), never written by the user, so it can't go through
 // tk_resolve_type like an ordinary annotated param.
 tk_type_result tk_method_func_type(tk_function f, tk_str struct_name, tk_type_table table) {
-    tk_type_table tbl = tk_type_param_table(f.type_params, f.n_type_params, (tk_str){0}, table);
+    tk_type_table tbl = tk_type_param_table(f.type_params, f.n_type_params, f.type_constraints, (tk_str){0}, table);
     tk_type *params = NULL; size_t n = 0;
     tk_str *param_names = NULL;
     tk_expr *defaults = NULL; size_t ndefaults = 0;
@@ -750,7 +750,7 @@ static tk_type_result validate_type_decls(tk_type_table table) {
         // (S4) the decl's own generic type-params, opaque, in scope — so a generic body field `T`
         // resolves to Named{T} (not "unknown type"); mirrors func_type. A `Ref<T>` field is still
         // rejected by R1 (its inner is a Named, not a scalar Prim).
-        tk_type_table tbl = tk_type_param_table(decl.type_params, decl.n_type_params, (tk_str){0}, table);
+        tk_type_table tbl = tk_type_param_table(decl.type_params, decl.n_type_params, decl.type_constraints, (tk_str){0}, table);
         tk_type_body body = decl.body;
         if (body.tag == TK_BODY_STRUCT) {
             for (size_t f = 0; f < body.as.struct_body.n_fields; f += 1) {
@@ -967,7 +967,7 @@ tk_collected_result tk_seed_from_dep(tk_tprogram dep, tk_type_table table, tk_en
         tk_tfunction f = dep.items[j].as.function;
 
         // Build param types by resolving the param type annotations against `table`.
-        tk_type_table dtbl = tk_type_param_table(f.type_params, f.n_type_params, (tk_str){0}, table);   // (S4) no-op for concrete deps
+        tk_type_table dtbl = tk_type_param_table(f.type_params, f.n_type_params, f.type_constraints, (tk_str){0}, table);   // (S4) no-op for concrete deps
         tk_type *params = NULL; size_t np = 0;
         tk_str *param_names = NULL;   // DEFARGS (2026-07-01)
         tk_expr *defaults = NULL; size_t ndefaults = 0;

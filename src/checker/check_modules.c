@@ -151,7 +151,7 @@ const char *tk_check_modules(tk_program prog, tk_type_table table) {
         if (it.tag == TK_ITEM_FUNCTION) {
             tk_function f = it.as.function;
             line = f.line; col = f.col;
-            tk_type_table ftbl = tk_type_param_table(f.type_params, f.n_type_params, ns, table);   // (S4) type-params as local types of the using ns
+            tk_type_table ftbl = tk_type_param_table(f.type_params, f.n_type_params, f.type_constraints, ns, table);   // (S4) type-params as local types of the using ns
             for (size_t p = 0; p < f.nparams && !e; p += 1)
                 e = check_texpr(f.params[p].type_ann, ns, ftbl, al);
             if (!e && f.has_return) e = check_texpr(f.return_type, ns, ftbl, al);
