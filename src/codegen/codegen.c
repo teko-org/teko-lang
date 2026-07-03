@@ -3173,9 +3173,20 @@ static bool emit_as(cbuf *b, tk_type expected, const tk_texpr *value, const char
         && value->type.tag == TK_TYPE_NAMED && cg_is_class_named(value->type.as.named.name)) {
         cb(b, "(");
         mangle_type_name(b, (tk_str){ NULL, 0 }, expected.as.named.name);
-        cb(b, "){ .data = (void *)(");
-        if (!emit_expr(b, value, err)) return false;
-        cb(b, "), .vtable = tk_vt_");
+        cb(b, "){ .data = ");
+        // (#98) if the value is ALREADY a base fat pointer (`tk_base_<vn>`, a polymorphic base
+        // that ALSO implements this interface), its object pointer already lives in `.data` —
+        // extract it (`(<v>).data`) rather than `(void *)(<v>)` (which would cast the two-word struct).
+        if (cg_is_polymorphic_base(value->type.as.named.name)) {
+            cb(b, "(");
+            if (!emit_expr(b, value, err)) return false;
+            cb(b, ").data");
+        } else {
+            cb(b, "(void *)(");
+            if (!emit_expr(b, value, err)) return false;
+            cb(b, ")");
+        }
+        cb(b, ", .vtable = tk_vt_");
         cb_str(b, value->type.as.named.name); cb(b, "_"); cb_str(b, expected.as.named.name);
         cb(b, " }");
         return true;

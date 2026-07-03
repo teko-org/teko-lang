@@ -3545,9 +3545,21 @@ fn emit_as_r(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, expe
                         if cg_is_class_named(prog, vn.name) {
                             mut io = cb(buf, "(")
                             io = mangle_type_name(io, "", en.name)
-                            io = cb(io, "){ .data = (void *)(")
-                            io = match emit_expr_ctx(io, prog, ret_type, value, escaping, regions, fn_body, dctx) { []byte as r => r; error as err => return err }
-                            io = cb(io, "), .vtable = tk_vt_")
+                            io = cb(io, "){ .data = ")
+                            // (#98) if the value is ALREADY a base fat pointer (`tk_base_<vn>`, a
+                            // polymorphic base that ALSO implements this interface), its object
+                            // pointer already lives in `.data` — extract it (`(<v>).data`) rather
+                            // than `(void *)(<v>)` (which would cast the whole two-word struct).
+                            if cg_is_polymorphic_base(prog, vn.name) {
+                                io = cb(io, "(")
+                                io = match emit_expr_ctx(io, prog, ret_type, value, escaping, regions, fn_body, dctx) { []byte as r => r; error as err => return err }
+                                io = cb(io, ").data")
+                            } else {
+                                io = cb(io, "(void *)(")
+                                io = match emit_expr_ctx(io, prog, ret_type, value, escaping, regions, fn_body, dctx) { []byte as r => r; error as err => return err }
+                                io = cb(io, ")")
+                            }
+                            io = cb(io, ", .vtable = tk_vt_")
                             io = cb(io, vn.name)
                             io = cb(io, "_")
                             io = cb(io, en.name)
