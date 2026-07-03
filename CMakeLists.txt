@@ -149,6 +149,34 @@ target_compile_definitions(teko PRIVATE
     TK_RT_DIR="${CMAKE_CURRENT_SOURCE_DIR}/src/runtime"
     TK_SRC_DIR="${CMAKE_CURRENT_SOURCE_DIR}/src")
 
+# --- CLI --version: embed the RAW teko.tkp version as a compile-time constant ----------------
+# The manifest (teko.tkp) is the SINGLE SOURCE OF TRUTH for the version (memory:
+# teko-release-versioning-rule). Parse its `version` + `suffix` at CONFIGURE time and define
+# TEKO_VERSION_STRING = "<version>[-<suffix>]" (RAW — no "4th field = published gen" release
+# substitution; that lives only in scripts/derive_version.sh / release.yml, untouched here).
+# tk_rt_version() (teko_rt.c) reads this define; main.c / main.tks print it for `--version`.
+# The self-hosted build mirrors this via run_cc's -DTEKO_VERSION_STRING (driver.c / project.tks),
+# so the bootstrap and self-host binaries embed byte-identically. teko_rt.c is a source of the
+# `teko` executable, so a target-level define reaches its compilation.
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/teko.tkp" _teko_tkp_contents)
+# `version = "A.B.C.D"` — first match wins; tolerate spaces around `=` and quotes.
+string(REGEX MATCH "\n[ \t]*version[ \t]*=[ \t]*\"([^\"]*)\"" _tkp_ver_match "\n${_teko_tkp_contents}")
+set(TEKO_MANIFEST_VERSION "${CMAKE_MATCH_1}")
+# `suffix = "…"` — may be empty (a stable release) or absent.
+string(REGEX MATCH "\n[ \t]*suffix[ \t]*=[ \t]*\"([^\"]*)\"" _tkp_suf_match "\n${_teko_tkp_contents}")
+set(TEKO_MANIFEST_SUFFIX "${CMAKE_MATCH_1}")
+if(NOT TEKO_MANIFEST_VERSION)
+    message(FATAL_ERROR "CMake: could not read `version` from teko.tkp (needed for TEKO_VERSION_STRING)")
+endif()
+if(TEKO_MANIFEST_SUFFIX)
+    set(TEKO_VERSION_STRING "${TEKO_MANIFEST_VERSION}-${TEKO_MANIFEST_SUFFIX}")
+else()
+    set(TEKO_VERSION_STRING "${TEKO_MANIFEST_VERSION}")
+endif()
+message(STATUS "teko: TEKO_VERSION_STRING = ${TEKO_VERSION_STRING} (from teko.tkp)")
+target_compile_definitions(teko PRIVATE
+    TEKO_VERSION_STRING="${TEKO_VERSION_STRING}")
+
 # --- SELF-HOST: the native build of teko's OWN corpus — THE end-to-end validation ----------
 # `teko build .` runs the full pipeline (read → lex → parse → check → native codegen → cc link),
 # emitting ./bin/teko. This is the gating proof: if this fails, the native backend is not coherent,

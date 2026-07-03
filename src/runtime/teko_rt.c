@@ -1214,6 +1214,23 @@ tk_str tk_rt_os(void) {
     return (tk_str){ (const tk_byte *)s, strlen(s) };
 }
 
+// (CLI --version) the build's VERSION STRING — the RAW project-manifest `version` +
+// `-<suffix>` (e.g. "0.0.1.0-bootstrap"), the SINGLE SOURCE OF TRUTH being teko.tkp.
+// TEKO_VERSION_STRING is injected at COMPILE TIME by both build paths: CMake defines it for
+// the C-bootstrap `teko` (from teko.tkp), and the self-host backend (driver.c/project.tks
+// run_cc) passes `-DTEKO_VERSION_STRING="<version>[-<suffix>]"` from the ALREADY-PARSED
+// manifest when it compiles this file — so `--version` never reads a file at runtime (an
+// installed binary has no manifest) and both engines embed byte-identically. The fallback
+// below is an honest placeholder for a raw `cc`-built teko_rt.c with no define (never the
+// shipped path). [backs teko::env::version]
+#ifndef TEKO_VERSION_STRING
+#define TEKO_VERSION_STRING "0.0.0.0-dev"
+#endif
+tk_str tk_rt_version(void) {
+    static const char *s = TEKO_VERSION_STRING;
+    return (tk_str){ (const tk_byte *)s, strlen(s) };
+}
+
 // D3 — test-coverage sink (host side-channel; see teko_rt.h). A growable array of distinct ids,
 // deduped on insert (the id count is bounded by the project's function count, so linear dedup is
 // fine). tk_cov_reset starts a fresh run; tk_cov_mark records a function-entry id; tk_cov_distinct

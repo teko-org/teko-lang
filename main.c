@@ -13,6 +13,11 @@
 // dispatch + delegate to the driver.
 #include "driver.h"   // tk_compile_project, tk_run_project
 
+// (CLI --version) the build version string, from teko_rt.c (TEKO_VERSION_STRING compile-time
+// constant fed from teko.tkp). Forward-declared here (not via teko_rt.h) to match driver.c's
+// pattern for tk_rt_os — tk_str is layout-identical between text.h (driver.h) and teko_rt.h.
+tk_str tk_rt_version(void);
+
 #include <stdio.h>
 #include <string.h>     // strlen, strcmp, strrchr, memcpy
 #include <signal.h>     // signal — fatal-signal handler (crash stack traces)
@@ -46,12 +51,22 @@ static void tk_install_crash_handler(void) {
     signal(SIGFPE,  tk_crash_handler);
 }
 
+// Print `teko <version>` to `stream`. The version is the RAW teko.tkp `version` + `-<suffix>`
+// (e.g. "0.0.1.0-bootstrap"), embedded at build time — no runtime file read. Mirrors main.tks.
+static void print_version(FILE *stream) {
+    tk_str v = tk_rt_version();
+    fprintf(stream, "teko %.*s\n", (int)v.len, (const char *)v.ptr);
+}
+
 static void usage(void) {
+    print_version(stderr);   // version line first (also shown by --help)
     fputs("usage: teko build <projdir>   build the project to a native binary\n"
           "       teko run   <projdir>   run the project on the VM (debug profile)\n"
           "       teko test  <projdir>   run the project's tests\n"
           "       teko fmt   [--check] <path>...   format .tks/.tkt sources (self-hosted binary only)\n"
           "       teko <projdir>         (bare) ≡ build\n"
+          "       teko --version | -v    print the version and exit\n"
+          "       teko --help | -h       print this help and exit\n"
           "teko compiles projects, not files: pass a project directory or .tkp\n",
           stderr);
 }
@@ -110,6 +125,16 @@ static bool has_coverage(int argc, char **argv) {
 
 int main(int argc, char **argv) {
     tk_install_crash_handler();   // a crash prints a C stack trace, not a silent exit (M.1)
+
+    // --version / -v and --help / -h SHORT-CIRCUIT before the "no args → usage, exit 2" path
+    // (which stays unchanged). --version prints the version line to stdout; --help prints the
+    // usage banner (which leads with the version line) — both exit 0. Mirrors main.tks.
+    if (argc >= 2) {
+        const char *a1 = argv[1];
+        if (strcmp(a1, "--version") == 0 || strcmp(a1, "-v") == 0) { print_version(stdout); return 0; }
+        if (strcmp(a1, "--help") == 0    || strcmp(a1, "-h") == 0) { usage(); return 0; }
+    }
+
     if (argc < 2) { usage(); return 2; }
 
     const char *cmd = argv[1];

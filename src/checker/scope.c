@@ -283,6 +283,10 @@ tk_type_result tk_builtin_fn(tk_str name) {
         tk_type ft = { .tag = TK_TYPE_FUNC, .as.func = { .params = NULL, .nparams = 0, .ret = &str_t } };
         return (tk_type_result){ .ok = true, .as.value = ft };
     }
+    if (name_is(name, "version")) {                                   // teko::env::version() -> str — CLI --version
+        tk_type ft = { .tag = TK_TYPE_FUNC, .as.func = { .params = NULL, .nparams = 0, .ret = &str_t } };
+        return (tk_type_result){ .ok = true, .as.value = ft };
+    }
     // teko::abort — the host abort FFI bottom (() -> void). The runtime's panic lowers to it.
     if (name_is(name, "abort")) {
         tk_type ft = { .tag = TK_TYPE_FUNC, .as.func = { .params = NULL, .nparams = 0, .ret = &void_t } };
