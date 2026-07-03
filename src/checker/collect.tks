@@ -473,6 +473,29 @@ pub fn iface_methods_by_name(iface: str, table: TypeTable) -> []parser::Function
     effective_interface_methods(ib, table, teko::list::push(teko::list::empty(), iface))
 }
 
+// (#98) the base class's VIRTUAL METHOD TABLE — its EFFECTIVE methods (base-inherited first, own
+// appended — effective_class_methods order), which is EXACTLY the slot scheme codegen's
+// `tk_vt_<Sub>_<Base>` build reads. Used by the checker (base-typed dispatch) so its `iface_slot`
+// agrees with the emitted table. Mirror of collect.c::tk_base_vtable_methods.
+pub fn base_vtable_methods(base: str, table: TypeTable) -> []parser::Function | error {
+    let cb = match find_class_body(base, table) { parser::ClassBody as b => b; error as e => return e }
+    effective_class_methods(cb, table)
+}
+
+// (#98) the vtable SLOT of `method` in `base`'s virtual method table, or an error if `method` is
+// not an effective method of the base (a subclass-only method — reachable only when the receiver
+// is statically the subclass, so it stays a DIRECT call). Mirror of collect.c::tk_base_vtable_slot.
+pub fn base_vtable_slot(base: str, method: str, table: TypeTable) -> u32 | error {
+    let ms = match base_vtable_methods(base, table) { []parser::Function as f => f; error as e => return e }
+    mut i: u64 = 0
+    loop {
+        if i >= ms.len { break }
+        if ms[i].name == method { return i to u32 }
+        i++
+    }
+    error { message = $"'{method}' is not a virtual method of base class '{base}'" }
+}
+
 // (W10b.IF) does implementing method `impl_m` satisfy interface-required method `req`? Same NON-
 // receiver param types (both skip their 1st untyped receiver param) + same return type. Any type
 // that fails to resolve makes it a non-match (the conformance error surfaces the missing/mismatched

@@ -383,6 +383,25 @@ tk_methodsvec_result tk_iface_methods_by_name(tk_str iface, tk_type_table table)
     return effective_interface_methods(ib.as.value, table, &iface, 1);
 }
 
+// (#98) the base class's VIRTUAL METHOD TABLE — its effective methods (codegen's vtable slot
+// order). Mirror of collect.tks::base_vtable_methods.
+tk_methodsvec_result tk_base_vtable_methods(tk_str base, tk_type_table table) {
+    tk_classbody_result cb = tk_find_class_body(base, table);
+    if (!cb.ok) return (tk_methodsvec_result){ .ok = false, .as.error = cb.as.error };
+    return tk_effective_class_methods(cb.as.value, table);
+}
+
+// (#98) the vtable SLOT of `method` in `base`'s virtual method table, or !ok if `method` isn't an
+// effective base method (a subclass-only method — stays a DIRECT call). Mirror of
+// collect.tks::base_vtable_slot.
+tk_slot_result tk_base_vtable_slot(tk_str base, tk_str method, tk_type_table table) {
+    tk_methodsvec_result ms = tk_base_vtable_methods(base, table);
+    if (!ms.ok) return (tk_slot_result){ .ok = false, .as.error = ms.as.error };
+    for (size_t i = 0; i < ms.as.value.len; i += 1)
+        if (tk_str_eq(ms.as.value.ptr[i].name, method)) return (tk_slot_result){ .ok = true, .as.value = (uint32_t)i };
+    return (tk_slot_result){ .ok = false, .as.error = tk_error_woven1("`", method, "` is not a virtual method of the base class") };
+}
+
 // (W10b.D3) `tk_is_interface_name` / `tk_type_conforms_to` live in resolve.c (the widening rule
 // tk_widens_into needs them, and resolve sits BELOW collect in the module DAG — DIP).
 

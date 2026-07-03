@@ -659,6 +659,74 @@ fn type_method_call(mc: parser::MethodCall, env: Env, table: TypeTable) -> TExpr
         }
         _ => {}
     }
+    // (#98) VIRTUAL DISPATCH through a POLYMORPHIC-BASE-typed receiver. When the receiver's STATIC
+    // type is a `virtual`/`abstract` class, the value may hold a subclass, so the call dispatches
+    // dynamically through the base's vtable — exactly the D3 mechanism, keyed on the base class as
+    // the "contract". The slot is the method's index in the base's EFFECTIVE method list (the same
+    // order codegen's `tk_vt_<Sub>_<Base>` build uses). The receiver rides args[0]; both engines
+    // resolve the CONCRETE override (VM by the payload's class name, native via the vtable slot).
+    // A `sealed` class is never a base — is_polymorphic_base filters it — so its calls stay direct.
+    match decl.body {
+        parser::ClassBody as bcb => {
+            if is_polymorphic_base(struct_name, table) {
+                let slot_res = base_vtable_slot(struct_name, mc.method, table)
+                match slot_res {
+                    u32 as bslot => {
+                        let bft = match method_func_type(mfn, struct_name, table) { Type as t => t; error as e => return e }
+                        let bf = match bft { Func as ff => ff; _ => return error { message = "internal: base method signature is not a function type" } }
+                        mut bcargs: []parser::Expr = teko::list::push(teko::list::empty(), mc.receiver)
+                        mut bai: u64 = 0
+                        loop { if bai >= mc.args.len { break }; bcargs = teko::list::push(bcargs, mc.args[bai]); bai++ }
+                        mut bcnames: []str = teko::list::empty()
+                        mut bni: u64 = 0
+                        loop { if bni >= bcargs.len { break }; bcnames = teko::list::push(bcnames, ""); bni++ }
+                        let bdargs = match resolve_defargs(bf, bcargs, bcnames) { []parser::Expr as x => x; error as e => return e }
+                        if bdargs.len != bf.params.len { return error { message = "wrong number of arguments" } }
+                        mut biargs: []TExpr = teko::list::empty()
+                        mut bii: u64 = 0
+                        loop {
+                            if bii >= bdargs.len { break }
+                            mut ba = match type_expr(bdargs[bii], env, table) { TExpr as te => te; error as e => return e }
+                            if type_is_void(ba.type) { return error { message = "a `void` expression cannot be passed as an argument (M.1)" } }
+                            let bpt = bf.params[bii]
+                            if !assignable_to(ba.type, bpt, table) {
+                                if !literal_adopts(ba, bpt) { return teko::error::err_typed(error { message = "argument type mismatch" }, type_render(bpt), type_render(ba.type)) }
+                                ba = TExpr { kind = ba.kind; type = bpt; line = ba.line; col = ba.col }
+                            } else {
+                                // keep the narrow type where the emit wraps at the use site (variant /
+                                // bare→optional / class→base or class→contract upcast) — the receiver
+                                // (arg 0) always stays its NARROW class so the fat pointer is built.
+                                let bpt_is_variant = match expand_variant(bpt, table) { Variant => true; _ => false }
+                                let bpt_is_opt = match bpt { Optional => true; _ => false }
+                                let barg_is_opt = match ba.type { Optional => true; _ => false }
+                                let bbare_to_opt = bpt_is_opt && !barg_is_opt
+                                mut bclass_wrap = false
+                                match bpt {
+                                    Named as bptn => match ba.type {
+                                        Named as batn => { if (is_interface_name(bptn.name, table) || is_polymorphic_base(bptn.name, table)) && is_class_name(batn.name, table) && bptn.name != batn.name { bclass_wrap = true } }
+                                        _ => {}
+                                    }
+                                    _ => {}
+                                }
+                                if !bpt_is_variant && !bbare_to_opt && !bclass_wrap {
+                                    ba = TExpr { kind = ba.kind; type = bpt; line = ba.line; col = ba.col }
+                                }
+                            }
+                            biargs = teko::list::push(biargs, ba)
+                            bii++
+                        }
+                        let bseg_base = parser::Segment { name = struct_name }   // the base class — the vtable key
+                        let bseg_m = parser::Segment { name = mc.method }
+                        mut bsegs: []parser::Segment = teko::list::push(teko::list::empty(), bseg_base)
+                        bsegs = teko::list::push(bsegs, bseg_m)
+                        return TExpr { kind = TCall { callee = parser::Path { segments = bsegs }; args = biargs; call_ns = ""; is_closure_call = false; callee_type = bft; is_iface_dispatch = true; iface_slot = bslot }; type = bf.ret; line = 0; col = 0 }
+                    }
+                    error => {}   // method not in the base vtable → fall through to the direct desugar (a NEW own method reachable only when receiver is statically the base)
+                }
+            }
+        }
+        _ => {}
+    }
     let seg_struct = parser::Segment { name = struct_name }
     let seg_method = parser::Segment { name = mc.method }
     mut segs: []parser::Segment = teko::list::push(teko::list::empty(), seg_struct)

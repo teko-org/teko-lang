@@ -509,6 +509,57 @@ static tk_texpr_result type_method_call(tk_method_call mc, tk_env env, tk_type_t
         if (!tk_member_accessible(owner.as.value, env.owner_type, table))
             return xferr(tk_error_woven2("method '", mc.method, "' is private to ", owner.as.value.declaring_class, ""));
     }
+    // (#98) VIRTUAL DISPATCH through a POLYMORPHIC-BASE-typed receiver. When the receiver's STATIC
+    // type is a `virtual`/`abstract` class, the value may hold a subclass, so the call dispatches
+    // dynamically through the base's vtable — the D3 mechanism keyed on the base class as the
+    // "contract". The slot is the method's index in the base's effective method list (codegen's
+    // `tk_vt_<Sub>_<Base>` order). A `sealed` class is never a base, so its calls stay direct.
+    if (td.as.value.body.tag == TK_BODY_CLASS && tk_is_polymorphic_base(struct_name, table)) {
+        tk_slot_result bslot = tk_base_vtable_slot(struct_name, mc.method, table);
+        if (bslot.ok) {   // a subclass-only method (!ok) falls through to the direct desugar below
+            tk_type_result bftr = tk_method_func_type(mfn, struct_name, table);
+            if (!bftr.ok) return (tk_texpr_result){ .ok = false, .as.error = bftr.as.error };
+            tk_type bft = bftr.as.value;
+            tk_expr *bcargs = tk_alloc((mc.nargs + 1) * sizeof *bcargs); if (!bcargs) abort();
+            bcargs[0] = *mc.receiver;
+            for (size_t i = 0; i < mc.nargs; i += 1) bcargs[i + 1] = mc.args[i];
+            tk_str *bcnames = tk_alloc((mc.nargs + 1) * sizeof *bcnames); if (!bcnames) abort();
+            for (size_t i = 0; i <= mc.nargs; i += 1) bcnames[i] = (tk_str){0};
+            tk_pack_result bpr = resolve_defargs(bft, bcargs, bcnames, mc.nargs + 1);
+            if (!bpr.ok) return xferr(bpr.error);
+            if (bpr.nargs != bft.as.func.nparams) return xerr("wrong number of arguments");
+            tk_texpr_list biargs = tk_texpr_list_empty();
+            for (size_t i = 0; i < bpr.nargs; i += 1) {
+                tk_texpr_result ba = tk_typer_expr(bpr.args[i], env, table);
+                if (!ba.ok) return ba;
+                if (tk_type_is_void(&ba.as.value.type)) return xerr("a `void` expression cannot be passed as an argument (M.1)");
+                tk_type bpt = bft.as.func.params[i];
+                if (!tk_widens_into(ba.as.value.type, bpt, table)) {
+                    if (!tk_literal_adopts(ba.as.value, bpt))
+                        return xferr(tk_error_types(tk_error_make("argument type mismatch"),
+                                                    tk_type_render(bpt), tk_type_render(ba.as.value.type)));
+                    ba.as.value.type = bpt;
+                } else if (tk_expand_variant(bpt, table).tag != TK_TYPE_VARIANT
+                           && !(bpt.tag == TK_TYPE_OPTIONAL && ba.as.value.type.tag != TK_TYPE_OPTIONAL)
+                           && !(bpt.tag == TK_TYPE_NAMED && ba.as.value.type.tag == TK_TYPE_NAMED
+                                && !tk_str_eq(bpt.as.named.name, ba.as.value.type.as.named.name)
+                                && (tk_is_interface_name(bpt.as.named.name, table) || tk_is_polymorphic_base(bpt.as.named.name, table))
+                                && tk_is_class_name(ba.as.value.type.as.named.name, table))) {
+                    // keep the narrow type where the emit wraps: variant / bare→optional / class→base
+                    // or class→contract upcast (the receiver — arg 0 — always stays its narrow class).
+                    ba.as.value.type = bpt;
+                }
+                biargs = tk_texpr_list_push(biargs, ba.as.value);
+            }
+            tk_segment *bsegs = tk_alloc(2 * sizeof *bsegs); if (!bsegs) abort();
+            bsegs[0] = (tk_segment){ .name = struct_name };   // the base class — the vtable key
+            bsegs[1] = (tk_segment){ .name = mc.method };
+            return xok((tk_texpr){ .tag = TK_TEXPR_CALL, .type = *bft.as.func.ret,
+                                   .as.call = { .callee = { .segments = bsegs, .len = 2 }, .args = biargs.ptr, .nargs = biargs.len,
+                                                .call_ns = (tk_str){0}, .is_closure_call = false, .callee_type = bft,
+                                                .is_iface_dispatch = true, .iface_slot = bslot.as.value } });
+        }
+    }
     tk_segment *segs = tk_alloc(2 * sizeof *segs); if (!segs) abort();
     segs[0] = (tk_segment){ .name = struct_name };
     segs[1] = (tk_segment){ .name = mc.method };

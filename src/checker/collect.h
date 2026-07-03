@@ -31,6 +31,14 @@ bool tk_is_interface_name(tk_str name, tk_type_table table);
 bool tk_type_conforms_to(tk_str name, tk_str iface, tk_type_table table);
 tk_type_result tk_method_func_type(tk_function f, tk_str struct_name, tk_type_table table);
 
+// (#98) a POLYMORPHIC BASE class's VIRTUAL METHOD TABLE — its effective methods (the same slot
+// order codegen's `tk_vt_<Sub>_<Base>` build reads); `tk_base_vtable_slot` returns the slot of
+// `method` (or !ok when it isn't an effective base method → a subclass-only, direct-dispatched
+// method). Shared by the checker (base-typed dispatch) and codegen (vtable emission).
+typedef struct { bool ok; union { uint32_t value; tk_error error; } as; } tk_slot_result;
+tk_methodsvec_result tk_base_vtable_methods(tk_str base, tk_type_table table);
+tk_slot_result       tk_base_vtable_slot(tk_str base, tk_str method, tk_type_table table);
+
 // (W10b.CLASS residual — intern visibility) a member's REACH: which class's OWN code declared
 // it, plus its vis/is_intern AT that declaration (an override "moves" the declaration to the
 // overriding class). Shared with expr.c/typer.c.
