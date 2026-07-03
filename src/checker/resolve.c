@@ -201,7 +201,8 @@ static tk_type *box(tk_type t) {
     return p;
 }
 
-tk_decl_result tk_type_table_find(tk_type_table table, tk_str name) {
+tk_decl_result tk_type_table_find(tk_type_table table, tk_str name, tk_str ref_ns) {
+    (void)ref_ns;   // (#109 W1) reserved for the R0-R5 rules (W2)
     for (size_t i = 0; i < table.len; i += 1) {
         if (name_eq(table.ptr[i].name, name)) {
             return (tk_decl_result){ .ok = true, .as.value = table.ptr[i].decl };
@@ -336,7 +337,7 @@ tk_subst_result tk_unify(tk_type pattern, tk_type arg, tk_subst s, tk_type_table
 void tk_collect_sig_type_params(tk_type t, tk_type_table table, tk_str **names, size_t *n) {
     switch (t.tag) {
         case TK_TYPE_NAMED: {
-            tk_decl_result d = tk_type_table_find(table, t.as.named.name);
+            tk_decl_result d = tk_type_table_find(table, t.as.named.name, (tk_str){0});   // (#109 W1) type-param scan on resolved names — no referencing ns
             if (d.ok) return;                                          // a user type
             if (tk_is_type_param(t.as.named.name, *names, *n)) return;  // dedup
             *names = tk_realloc0(*names, (*n + 1) * sizeof **names);
@@ -355,13 +356,15 @@ void tk_collect_sig_type_params(tk_type t, tk_type_table table, tk_str **names, 
 }
 
 // non-static: shared with match.c (the typed pattern checker resolves case/struct names — C7).
-tk_type_result resolve_named(tk_path path, tk_type_table table) {
+// (#109 W1) `ref_ns` = the referencing namespace; threaded down unchanged (reserved for W2's R0-R5).
+tk_type_result resolve_named(tk_path path, tk_type_table table, tk_str ref_ns) {
+    (void)ref_ns;   // (#109 W1) reserved for the R0-R5 rules (W2)
     if (path.len == 0)   // M.1: an empty path is an internal invariant break — an honest error, never a crash
         return (tk_type_result){ .ok = false, .as.error = tk_error_make("internal: empty type path (a void/missing type used where a value type is required)") };
     tk_str name = path.segments[path.len - 1].name;       // seed: last segment
     tk_type_result bt = tk_builtin_type(name);            // u8…u64, byte, str, error
     if (bt.ok) return bt;
-    tk_decl_result ut = tk_type_table_find(table, name);  // a user type
+    tk_decl_result ut = tk_type_table_find(table, name, ref_ns);  // a user type
     if (ut.ok) {
         // A TRANSPARENT alias `type Name = <type-expr>` resolves THROUGH to the aliased type
         // (self-host parity): `TypeTable = []TypeReg` → a SLICE, `Foo = Circle` → its NAMED
@@ -373,7 +376,7 @@ tk_type_result resolve_named(tk_path path, tk_type_table table) {
             if (alias_depth > 64)
                 return (tk_type_result){ .ok = false, .as.error = tk_error_make("type alias resolves cyclically (self-referential alias chain)") };
             alias_depth += 1;
-            tk_type_result r = tk_resolve_type(ut.as.value.body.as.alias_body.alias, table);
+            tk_type_result r = tk_resolve_type(ut.as.value.body.as.alias_body.alias, table, ref_ns);
             alias_depth -= 1;
             return r;
         }
@@ -431,12 +434,13 @@ tk_str tk_generic_inst_name(tk_str base, tk_type *args, size_t nargs) {
 
 // (S4) `Box<i64>` → `Named{Box__g__i64}`: resolve the args, validate the generic decl's arity.
 // Mirror of resolve.tks::resolve_generic_inst.
-static tk_type_result resolve_generic_inst(tk_path path, tk_type_expr *args, size_t nargs, tk_type_table table) {
+static tk_type_result resolve_generic_inst(tk_path path, tk_type_expr *args, size_t nargs, tk_type_table table, tk_str ref_ns) {
+    (void)ref_ns;   // (#109 W1) reserved for the R0-R5 rules (W2); threaded to every tk_resolve_type arg + the table lookup
     tk_str name = path.segments[path.len - 1].name;
     // (S-mem) builtin generic `ptr<T>` → `Ptr{inner}`; `ptr<void>` ≡ opaque ptr → NULL inner.
     if (name.len == 3 && memcmp(name.ptr, "ptr", 3) == 0) {
         if (nargs != 1) return (tk_type_result){ .ok = false, .as.error = tk_error_make("`ptr<T>` takes exactly one type argument") };
-        tk_type_result in = tk_resolve_type(args[0], table);
+        tk_type_result in = tk_resolve_type(args[0], table, ref_ns);
         if (!in.ok) return in;
         tk_type t = { .tag = TK_TYPE_PTR, .as.ptr.inner = (in.as.value.tag == TK_TYPE_VOID) ? NULL : box(in.as.value) };
         return (tk_type_result){ .ok = true, .as.value = t };
@@ -445,7 +449,7 @@ static tk_type_result resolve_generic_inst(tk_path path, tk_type_expr *args, siz
     // surface OVER raw `ptr<T>`). Capitalized. Never null/opaque; `Ref<void>` rejected, `Ref` needs an arg.
     if (name.len == 3 && memcmp(name.ptr, "Ref", 3) == 0) {
         if (nargs != 1) return (tk_type_result){ .ok = false, .as.error = tk_error_make("`Ref<T>` takes exactly one type argument") };
-        tk_type_result in = tk_resolve_type(args[0], table);
+        tk_type_result in = tk_resolve_type(args[0], table, ref_ns);
         if (!in.ok) return in;
         if (in.as.value.tag == TK_TYPE_VOID) return (tk_type_result){ .ok = false, .as.error = tk_error_make("`Ref<void>` is invalid — void is not a value (M.3)") };
         // (W9a) ESCAPE GATE — the inner must be a VALUE TYPE. Teko has NO field/index assignment
@@ -467,7 +471,7 @@ static tk_type_result resolve_generic_inst(tk_path path, tk_type_expr *args, siz
     }
     tk_type *argtypes = nargs ? tk_alloc(nargs * sizeof *argtypes) : NULL;
     for (size_t i = 0; i < nargs; i += 1) {
-        tk_type_result a = tk_resolve_type(args[i], table);
+        tk_type_result a = tk_resolve_type(args[i], table, ref_ns);
         if (!a.ok) return a;
         // (MEM Step 0, A) ESCAPE GATE — a reference can NEVER be a generic type ARGUMENT: carrying a
         // `Ref<T>` into a user generic would stamp it into a struct field / return position (e.g.
@@ -478,7 +482,7 @@ static tk_type_result resolve_generic_inst(tk_path path, tk_type_expr *args, siz
             return (tk_type_result){ .ok = false, .as.error = tk_error_make("a reference cannot be a generic type argument (it would be stored/escape)") };
         argtypes[i] = a.as.value;
     }
-    tk_decl_result d = tk_type_table_find(table, name);
+    tk_decl_result d = tk_type_table_find(table, name, ref_ns);
     if (!d.ok)
         return (tk_type_result){ .ok = false, .as.error = tk_error_named("unknown generic type", name) };
     if (d.as.value.n_type_params == 0)
@@ -699,14 +703,14 @@ tk_type_table tk_instantiate_types(tk_program program, tk_type_table table) {
         tk_type *argtypes = te.as.named.args_len ? tk_alloc(te.as.named.args_len * sizeof *argtypes) : NULL;
         bool ok = true;
         for (size_t a = 0; a < te.as.named.args_len; a += 1) {
-            tk_type_result r = tk_resolve_type(te.as.named.args[a], tbl);
+            tk_type_result r = tk_resolve_type(te.as.named.args[a], tbl, (tk_str){0});   // (#109 W1) program-wide inst pass — no single referencing ns
             if (!r.ok) { ok = false; break; }
             argtypes[a] = r.as.value;
         }
         if (!ok) continue;
         tk_str mangled = tk_generic_inst_name(name, argtypes, te.as.named.args_len);
-        if (tk_type_table_find(tbl, mangled).ok) continue;   // already stamped
-        tk_decl_result gd = tk_type_table_find(tbl, name);
+        if (tk_type_table_find(tbl, mangled, (tk_str){0}).ok) continue;   // (#109 W1) already-stamped probe — no referencing ns
+        tk_decl_result gd = tk_type_table_find(tbl, name, (tk_str){0});   // (#109 W1) generic-base lookup in the program-wide pass — no referencing ns
         if (!gd.ok) continue;                                // unknown base → reported at typing
         tk_type_decl gen = gd.as.value;
         if (gen.n_type_params != te.as.named.args_len) continue;   // arity error surfaces at resolve
@@ -754,7 +758,7 @@ static tk_type_expr normalize_inst_texpr(tk_type_expr te, tk_type_table table) {
     switch (te.tag) {
         case TK_TEXPR_NAMED: {
             if (te.as.named.args_len > 0) {
-                tk_type_result r = tk_resolve_type(te, table);
+                tk_type_result r = tk_resolve_type(te, table, (tk_str){0});   // (#109 W1) instance-normalization probe — no referencing ns
                 if (r.ok && r.as.value.tag == TK_TYPE_NAMED && tk_name_is_g_instance(r.as.value.as.named.name)) {
                     tk_segment *segs = NULL; size_t ns = 0;
                     tk_segs_push(&segs, &ns, (tk_segment){ .name = r.as.value.as.named.name });
@@ -842,9 +846,9 @@ static tk_type_table normalize_table_instances(tk_type_table table) {
 // terminates and does not recurse into nested named variants. Anything else returns unchanged.
 tk_type tk_expand_variant(tk_type t, tk_type_table table) {
     if (t.tag != TK_TYPE_NAMED) return t;
-    tk_decl_result d = tk_type_table_find(table, t.as.named.name);
+    tk_decl_result d = tk_type_table_find(table, t.as.named.name, (tk_str){0});   // (#109 W1) resolved-name probe, no referencing ns
     if (!d.ok || d.as.value.body.tag != TK_BODY_VARIANT) return t;
-    tk_type_result ex = tk_resolve_type(d.as.value.body.as.variant_body.type_expr, table);
+    tk_type_result ex = tk_resolve_type(d.as.value.body.as.variant_body.type_expr, table, (tk_str){0});   // (#109 W1) expanded body has no distinct referencing ns
     return ex.ok ? ex.as.value : t;
 }
 
@@ -917,20 +921,20 @@ bool tk_widens_into(tk_type from, tk_type to, tk_type_table table) {
 
 // is `name` declared as an interface? Mirror of resolve.tks::is_interface_name.
 bool tk_is_interface_name(tk_str name, tk_type_table table) {
-    tk_decl_result d = tk_type_table_find(table, name);
+    tk_decl_result d = tk_type_table_find(table, name, (tk_str){0});   // (#109 W1) kind probe on a resolved name — no referencing ns
     return d.ok && d.as.value.body.tag == TK_BODY_INTERFACE;
 }
 
 // is `name` declared as a class? Mirror of resolve.tks::is_class_name.
 bool tk_is_class_name(tk_str name, tk_type_table table) {
-    tk_decl_result d = tk_type_table_find(table, name);
+    tk_decl_result d = tk_type_table_find(table, name, (tk_str){0});   // (#109 W1) kind probe on a resolved name — no referencing ns
     return d.ok && d.as.value.body.tag == TK_BODY_CLASS;
 }
 
 // (#98) is `name` a POLYMORPHIC BASE — a class that MAY be inherited (`abstract`/`virtual`, never
 // `sealed`)? See resolve.tks::is_polymorphic_base for the rationale.
 bool tk_is_polymorphic_base(tk_str name, tk_type_table table) {
-    tk_decl_result d = tk_type_table_find(table, name);
+    tk_decl_result d = tk_type_table_find(table, name, (tk_str){0});   // (#109 W1) kind probe on a resolved name — no referencing ns
     return d.ok && d.as.value.body.tag == TK_BODY_CLASS
         && d.as.value.body.as.class_body.kind != TK_CLASS_SEALED;
 }
@@ -939,7 +943,7 @@ bool tk_is_polymorphic_base(tk_str name, tk_type_table table) {
 // Hop-bounded (cyclic inheritance is decl-rejected). Mirror of resolve.tks::subclass_reaches.
 bool tk_subclass_reaches(tk_str sub, tk_str want, tk_type_table table, int depth) {
     if (depth <= 0) return false;
-    tk_decl_result d = tk_type_table_find(table, sub);
+    tk_decl_result d = tk_type_table_find(table, sub, (tk_str){0});   // (#109 W1) ancestor walk on resolved names — no referencing ns
     if (!d.ok || d.as.value.body.tag != TK_BODY_CLASS) return false;
     tk_class_body cb = d.as.value.body.as.class_body;
     if (!cb.has_base) return false;
@@ -950,7 +954,7 @@ bool tk_subclass_reaches(tk_str sub, tk_str want, tk_type_table table, int depth
 // (TR0) is `name` declared as a trait? Mirror of resolve.tks::is_trait_name — used by the honest
 // stops (trait as a constraint atom / instantiation target); the fold splits the `&`-list itself.
 bool tk_is_trait_name(tk_str name, tk_type_table table) {
-    tk_decl_result d = tk_type_table_find(table, name);
+    tk_decl_result d = tk_type_table_find(table, name, (tk_str){0});   // (#109 W1) kind probe on a resolved name — no referencing ns
     return d.ok && d.as.value.body.tag == TK_BODY_TRAIT;
 }
 
@@ -958,7 +962,7 @@ bool tk_is_trait_name(tk_str name, tk_type_table table) {
 // (decl-rejected) cyclic `extends` can never loop here. Mirror of resolve.tks::iface_extends_reaches.
 static bool iface_extends_reaches(tk_str sub, tk_str want, tk_type_table table, int depth) {
     if (depth <= 0) return false;
-    tk_decl_result d = tk_type_table_find(table, sub);
+    tk_decl_result d = tk_type_table_find(table, sub, (tk_str){0});   // (#109 W1) extends walk on resolved names — no referencing ns
     if (!d.ok || d.as.value.body.tag != TK_BODY_INTERFACE) return false;
     tk_interface_body ib = d.as.value.body.as.interface_body;
     for (size_t i = 0; i < ib.n_extends; i += 1) {
@@ -977,7 +981,7 @@ static bool iface_extends_reaches(tk_str sub, tk_str want, tk_type_table table, 
 bool tk_type_conforms_to(tk_str name, tk_str iface, tk_type_table table) {
     tk_str cur = name;
     for (int hops = 0; hops < 64; hops += 1) {
-        tk_decl_result d = tk_type_table_find(table, cur);
+        tk_decl_result d = tk_type_table_find(table, cur, (tk_str){0});   // (#109 W1) conformance walk on resolved names — no referencing ns
         if (!d.ok) return false;
         const tk_str *impls; size_t n_impls;
         bool has_base = false; tk_str base = { NULL, 0 };
@@ -1065,16 +1069,21 @@ bool tk_type_join(tk_type a, tk_type b, tk_type_table table, tk_type *out) {
     return true;   // always joinable now (worst case: an explicit union)
 }
 
-tk_type_result tk_resolve_type(tk_type_expr te, tk_type_table table) {
+// (#109 W1) `ref_ns` = the REFERENCING namespace (the namespace of the code that wrote `te`).
+// Threaded down every recursion (slice element / union members / fn-type params+ret / optional
+// inner) and into resolve_named/resolve_generic_inst unchanged. Reserved for W2's R0-R5 rules; the
+// W1 body IGNORES it (behavior byte-identical).
+tk_type_result tk_resolve_type(tk_type_expr te, tk_type_table table, tk_str ref_ns) {
+    (void)ref_ns;   // (#109 W1) reserved for the R0-R5 rules (W2)
     switch (te.tag) {
         case TK_TEXPR_NAMED:
             // A plain name resolves as before; generic type-ARGUMENTS `Box<i64>` (S4) resolve to the
             // nominal instance `Named{Box__g__i64}` (the concrete decl is stamped by the pass / mono).
             if (te.as.named.args_len == 0)
-                return resolve_named(te.as.named.path, table);
-            return resolve_generic_inst(te.as.named.path, te.as.named.args, te.as.named.args_len, table);
+                return resolve_named(te.as.named.path, table, ref_ns);
+            return resolve_generic_inst(te.as.named.path, te.as.named.args, te.as.named.args_len, table, ref_ns);
         case TK_TEXPR_SLICE: {
-            tk_type_result el = tk_resolve_type(*te.as.slice.element, table);
+            tk_type_result el = tk_resolve_type(*te.as.slice.element, table, ref_ns);
             if (!el.ok) return el;
             // (MEM Step 0, R4) ESCAPE GATE — a reference cannot be a collection element.
             if (el.as.value.tag == TK_TYPE_REF)
@@ -1085,7 +1094,7 @@ tk_type_result tk_resolve_type(tk_type_expr te, tk_type_table table) {
         case TK_TEXPR_UNION: {
             tk_type *members = NULL; size_t n = 0;
             for (size_t i = 0; i < te.as.uni.len; i += 1) {
-                tk_type_result m = tk_resolve_type(te.as.uni.members[i], table);
+                tk_type_result m = tk_resolve_type(te.as.uni.members[i], table, ref_ns);
                 if (!m.ok) { tk_free0(members); return m; }
                 // M.1/rule 2 & 3: a variant member must be a COMPLETE type — never
                 // `void` (not a value) and never nullable (`T?` — disjoint domain).
@@ -1123,13 +1132,13 @@ tk_type_result tk_resolve_type(tk_type_expr te, tk_type_table table) {
             // (void/ref rejected — a ref cannot escape, R4; void is not a value, M.3).
             size_t np = te.as.func.nparams; tk_type *ps = np ? tk_alloc(np * sizeof *ps) : NULL;
             for (size_t i = 0; i < np; i += 1) {
-                tk_type_result p = tk_resolve_type(te.as.func.params[i], table);
+                tk_type_result p = tk_resolve_type(te.as.func.params[i], table, ref_ns);
                 if (!p.ok) { tk_free0(ps); return p; }
                 if (p.as.value.tag == TK_TYPE_VOID) { tk_free0(ps); return (tk_type_result){ .ok = false, .as.error = tk_error_make("a function type parameter may not be `void` (M.3)") }; }
                 if (p.as.value.tag == TK_TYPE_REF)  { tk_free0(ps); return (tk_type_result){ .ok = false, .as.error = tk_error_make("a reference cannot be a function-type parameter (a ref cannot escape, R4)") }; }
                 ps[i] = p.as.value;
             }
-            tk_type_result rt = tk_resolve_type(*te.as.func.ret, table);
+            tk_type_result rt = tk_resolve_type(*te.as.func.ret, table, ref_ns);
             if (!rt.ok) { tk_free0(ps); return rt; }
             tk_type t = { .tag = TK_TYPE_FUNC, .as.func = { ps, np, box(rt.as.value) } };
             return (tk_type_result){ .ok = true, .as.value = t };
@@ -1138,7 +1147,7 @@ tk_type_result tk_resolve_type(tk_type_expr te, tk_type_table table) {
             // OptionalType `T?` → TK_TYPE_OPTIONAL{ inner } (REBOOT_PLAN §202). The
             // variant-member-not-nullable rule (above, UNION case) still rejects an
             // optional as a variant member; here we just build the nullable type.
-            tk_type_result in = tk_resolve_type(*te.as.optional.inner, table);
+            tk_type_result in = tk_resolve_type(*te.as.optional.inner, table, ref_ns);
             if (!in.ok) return in;
             // an optional of optional collapses (`T??` == `T?`), and `void?` is illegal
             // (void is not a value — M.3); both guarded for honesty.

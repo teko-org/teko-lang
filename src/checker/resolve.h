@@ -21,8 +21,10 @@ tk_error tk_error_named(const char *msg, tk_str name);
 tk_error tk_error_woven1(const char *a, tk_str n1, const char *b);
 tk_error tk_error_woven2(const char *a, tk_str n1, const char *b, tk_str n2, const char *c);
 
-tk_decl_result tk_type_table_find(tk_type_table table, tk_str name);
-tk_type_result tk_resolve_type(tk_type_expr te, tk_type_table table);
+// (#109 W1) `ref_ns` = the REFERENCING namespace (the namespace of the code that wrote this type
+// reference). Reserved for the R0-R5 resolution rules (W2); the W1 body IGNORES it (byte-identical).
+tk_decl_result tk_type_table_find(tk_type_table table, tk_str name, tk_str ref_ns);
+tk_type_result tk_resolve_type(tk_type_expr te, tk_type_table table, tk_str ref_ns);
 // (S4) extend the table with generic type-params as OPAQUE nominal types (see resolve.c). Used by
 // collect (func sigs), check_modules (vis check), and typer (bodies). Empty → table unchanged.
 tk_type_table tk_type_param_table(tk_str *type_params, size_t n_type_params, tk_constraint_expr *type_constraints, tk_str ns, tk_type_table table);
@@ -35,7 +37,7 @@ tk_type tk_subst_type(tk_type t, tk_subst s);                                   
 tk_subst_result tk_unify(tk_type pattern, tk_type arg, tk_subst s, tk_type_table table);  // bind type-params from args
 void tk_collect_sig_type_params(tk_type t, tk_type_table table, tk_str **names, size_t *n);  // type-param names in a sig
 bool tk_is_type_param(tk_str name, tk_str *params, size_t np);                               // membership in a name list
-tk_type_result resolve_named(tk_path path, tk_type_table table);   // shared with match.c (C7)
+tk_type_result resolve_named(tk_path path, tk_type_table table, tk_str ref_ns);   // shared with match.c (C7); (#109 W1) ref_ns threaded
 // B.14 — a NAMED type that refers to a `variant` decl → its expanded TK_TYPE_VARIANT (members
 // stay NAMED, so it terminates); anything else is returned unchanged. Lets assignability and
 // exhaustiveness see a named variant's cases without changing the nominal representation.
