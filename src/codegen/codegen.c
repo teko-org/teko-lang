@@ -467,6 +467,28 @@ static bool cg_is_interface_named(tk_str name) {
     return d != NULL && d->body.tag == TK_BODY_INTERFACE;
 }
 
+// (#98) is `name` a POLYMORPHIC BASE — a non-sealed class (`abstract`/`virtual`)? A base-typed
+// value lowers to the SAME fat pointer `{ data, vtable }` as an interface value (a companion
+// `tk_base_<name>` typedef), so a Sub→Base upcast + base-typed dispatch reuse the D3 machinery.
+static bool cg_is_polymorphic_base(tk_str name) {
+    const tk_type_decl *d = cg_find_decl(name);
+    if (d == NULL || d->body.tag != TK_BODY_CLASS) return false;
+    return d->body.as.class_body.kind != TK_CLASS_SEALED;
+}
+
+// (#98) does class `sub` reach ANCESTOR class `want` through the base chain (transitively)?
+// Codegen mirror of the checker's subclass_reaches — used to decide when a class value at a
+// base-typed slot is a STRICT-subclass upcast (needs the fat-pointer wrap). Hop-bounded.
+static bool cg_subclass_reaches(tk_str sub, tk_str want, int depth) {
+    if (depth <= 0) return false;
+    const tk_type_decl *d = cg_find_decl(sub);
+    if (d == NULL || d->body.tag != TK_BODY_CLASS) return false;
+    const tk_class_body *cb2 = &d->body.as.class_body;
+    if (!cb2->has_base) return false;
+    if (cg_name_eq(cb2->base_name, want)) return true;
+    return cg_subclass_reaches(cb2->base_name, want, depth - 1);
+}
+
 // (W10b.D3, generalized from increment 4's destruct lookup) does `class_name` provide a method
 // named `method` (own or inherited — tk_type_struct_methods stamps EVERY effective method under
 // the OWNING class's own namespace, so searching for a tk_tfunction named `method` whose
