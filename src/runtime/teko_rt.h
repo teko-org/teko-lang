@@ -366,6 +366,10 @@ void    tk_set_args(int argc, char **argv);
 tk_str *tk_rt_args(uint64_t *n);
 // (C7.1f) the host OS name: "macos"/"linux"/"windows"/"unknown" (teko::os; per-OS resolution + `#os`).
 tk_str tk_rt_os(void);
+// (CLI --version) the build's version string — the RAW project-manifest `version` + `-<suffix>`
+// (e.g. "0.0.1.0-bootstrap"). Compiled from the TEKO_VERSION_STRING define injected by both build
+// paths (CMake for the bootstrap, run_cc for self-host), never a runtime file read. (teko::env::version)
+tk_str tk_rt_version(void);
 
 // ---- Date/Time placeholder types (ROUND 0) ----
 // Five value types: DateTime (signed ns since Unix epoch), TimeSpan (signed ns duration),

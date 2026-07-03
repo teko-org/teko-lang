@@ -553,8 +553,17 @@ fn type_method_call(mc: parser::MethodCall, env: Env, table: TypeTable) -> TExpr
     // the vtable slot both backends dispatch through. The receiver rides as args[0] (an interface
     // value, or a class instance the emitters upcast on the fly). Mirror: expr.c::type_method_call.
     match decl.body {
-        parser::InterfaceBody => {
-            let eff = match iface_methods_by_name(struct_name, table) { []parser::Function as f => f; error as e => return e }
+        parser::InterfaceBody as ib => {
+            // (W10b.D2, issue #99) the DISPATCH interface. For a plain interface receiver this IS
+            // `struct_name`. For a generic type-param `<T: I>` — registered by type_param_table with
+            // an InterfaceBody that has NO own methods and a SINGLE `extends` naming the real interface
+            // — redirect to `I` (extends[0]): the callee path + vtable key off a REAL interface (a
+            // type-param has no emitted C type / vtable), while the receiver stays `Named{T}` (below,
+            // via `struct_name`) so monomorphization stamps T→concrete. The redirect is a no-op for a
+            // normal interface (methods.len > 0), and provably slot-equivalent for a degenerate real
+            // `interface X extends Y {}` (0 own methods, 1 extends) — X's only methods ARE Y's.
+            let iface_canon = if ib.methods.len == 0 && ib.extends.len == 1 { ib.extends[0] } else { struct_name }
+            let eff = match iface_methods_by_name(iface_canon, table) { []parser::Function as f => f; error as e => return e }
             if eff.len == 0 { return error { message = $"no such method '{mc.method}' on interface '{struct_name}'" } }
             mut ifound = false
             mut slot: u32 = 0
@@ -611,7 +620,7 @@ fn type_method_call(mc: parser::MethodCall, env: Env, table: TypeTable) -> TExpr
                 iargs = teko::list::push(iargs, a)
                 ii++
             }
-            let seg_iface = parser::Segment { name = struct_name }
+            let seg_iface = parser::Segment { name = iface_canon }   // (D2) the REAL interface — the vtable/upcast key
             let seg_m = parser::Segment { name = mc.method }
             mut isegs: []parser::Segment = teko::list::push(teko::list::empty(), seg_iface)
             isegs = teko::list::push(isegs, seg_m)
@@ -2623,7 +2632,7 @@ fn type_method(f: parser::Function, struct_name: str, env: Env, table: TypeTable
     // checked against `declaring_class` (see type_struct_methods's own comment on why this can
     // differ from `struct_name`), NOT `struct_name` — set before typing the body below.
     mut local = with_owner(env, declaring_class)
-    let tbl = type_param_table(f.type_params, "", table)
+    let tbl = type_param_table(f.type_params, f.type_constraints, "", table)
     let is_teko_rt = f.is_extern && f.from_lib == "teko_rt"
     // (W10b.CLASS) `class Base(parent) { … }` — the NAMED BINDING an instance method uses to
     // reach the base object. Only meaningful for an INSTANCE method (has a receiver); a class's
@@ -2713,7 +2722,7 @@ fn type_method(f: parser::Function, struct_name: str, env: Env, table: TypeTable
 
 fn type_function(f: parser::Function, env: Env, table: TypeTable) -> TFunction | error {
     mut local = env
-    let tbl = type_param_table(f.type_params, "", table)   // (S4) the fn's generic type-params, opaque, in scope
+    let tbl = type_param_table(f.type_params, f.type_constraints, "", table)   // (S4) the fn's generic type-params, opaque, in scope
     let is_teko_rt = f.is_extern && f.from_lib == "teko_rt"   // C7.2: bypass for Teko's own runtime
     mut i = 0
     loop {

@@ -497,7 +497,7 @@ static bool teko_rt_type_ok(tk_type t) {
 
 tk_tfunction_result tk_type_function(tk_function f, tk_env env, tk_type_table table) {
     tk_env local = env;
-    tk_type_table tbl = tk_type_param_table(f.type_params, f.n_type_params, (tk_str){0}, table);   // (S4) opaque type-params in scope
+    tk_type_table tbl = tk_type_param_table(f.type_params, f.n_type_params, f.type_constraints, (tk_str){0}, table);   // (S4) opaque type-params in scope
     bool is_teko_rt = f.is_extern && str_eq(f.from_lib, "teko_rt");   // C7.2: bypass for Teko's own runtime
     for (size_t i = 0; i < f.nparams; i += 1) {           // params immutable (B.21)
         tk_type_result pt = tk_resolve_type(f.params[i].type_ann, tbl);
@@ -556,7 +556,7 @@ static tk_tfunction_result type_method(tk_function f, tk_str struct_name, tk_env
     // checked against `declaring_class` (see type_struct_methods's own comment on why this can
     // differ from `struct_name`), NOT `struct_name` — set before typing the body below.
     tk_env local = tk_env_with_owner(env, declaring_class);
-    tk_type_table tbl = tk_type_param_table(f.type_params, f.n_type_params, (tk_str){0}, table);
+    tk_type_table tbl = tk_type_param_table(f.type_params, f.n_type_params, f.type_constraints, (tk_str){0}, table);
     bool is_teko_rt = f.is_extern && str_eq(f.from_lib, "teko_rt");
     // (W10b.CLASS) `class Base(parent) { … }` — the NAMED BINDING an instance method uses to
     // reach the base object. Only meaningful for an INSTANCE method (has a receiver); a class's

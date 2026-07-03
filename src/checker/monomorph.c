@@ -341,7 +341,7 @@ static bool mono_texpr(tk_texpr e, tk_subst s, tk_tprogram prog, tk_type_table t
             tk_str bare = callee.len ? callee.segments[callee.len - 1].name : (tk_str){ .ptr = (const tk_byte *)"", .len = 0 };
             const tk_tfunction *gf = find_generic_fn(prog, bare);
             if (gf) {
-                tk_type_table ptable = tk_type_param_table(gf->type_params, gf->n_type_params, mono_cstr(""), table);
+                tk_type_table ptable = tk_type_param_table(gf->type_params, gf->n_type_params, gf->type_constraints, mono_cstr(""), table);
                 tk_subst sub = { .params = gf->type_params, .n_params = gf->n_type_params, .names = NULL, .types = NULL, .n_bind = 0 };
                 for (size_t i = 0; i < e.as.call.nargs; i += 1) {   // nargs == gf->nparams (arity checked at typing); bound by `args` so args[i] is in range
                     tk_type_result pat = tk_resolve_type(gf->params[i].type_ann, ptable);

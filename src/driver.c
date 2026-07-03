@@ -331,6 +331,24 @@ static int run_cc(const char *cfile, const char *binary, tk_manifest m) {
     char *sysroot_str = m.sysroot.len ? cstr_of(m.sysroot) : NULL;
     tk_str tos = target_os_of(m);
 
+    // (CLI --version) embed the project's RAW manifest version as a compile-time constant so
+    // tk_rt_version() (linked from teko_rt.c) returns it — the source of truth is the project's
+    // own `.tkp` (teko.tkp for teko itself). Mirrors CMake's TEKO_VERSION_STRING for the bootstrap
+    // build and project.tks::run_cc's -D flag. RAW `version` + `-<suffix>` (no gen substitution).
+    char *verdef = NULL;
+    {
+        size_t base = strlen("-DTEKO_VERSION_STRING=\"\"");
+        size_t vl = base + m.version.len + (m.suffix.len ? 1 + m.suffix.len : 0) + 1;
+        verdef = tk_alloc(vl);
+        if (m.suffix.len)
+            snprintf(verdef, vl, "-DTEKO_VERSION_STRING=\"%.*s-%.*s\"",
+                     (int)m.version.len, (const char *)m.version.ptr,
+                     (int)m.suffix.len,  (const char *)m.suffix.ptr);
+        else
+            snprintf(verdef, vl, "-DTEKO_VERSION_STRING=\"%.*s\"",
+                     (int)m.version.len, (const char *)m.version.ptr);
+    }
+
     // C7.1k: macOS Info.plist section for Mach-O version metadata.
     char *plistp = NULL, *secarg = NULL;
     if (tos.len == 5 && memcmp(tos.ptr, "macos", 5) == 0) {
@@ -373,7 +391,7 @@ static int run_cc(const char *cfile, const char *binary, tk_manifest m) {
     // Assemble argv: fixed flags + optional target/sysroot + includes + sources + libs + output.
     // (issue #73) +1 headroom for the extra GCC flag slot (`-fmax-errors=0` replaces the single
     // clang `-ferror-limit=0` 1-for-1, but keep max_args honest either way).
-    size_t max_args = 25 + m.link_flags.len + nos_lib;
+    size_t max_args = 26 + m.link_flags.len + nos_lib;   // +1 for the -DTEKO_VERSION_STRING flag
     char **argv = tk_alloc(max_args * sizeof(char *));
     size_t argc = 0;
 
@@ -382,6 +400,7 @@ static int run_cc(const char *cfile, const char *binary, tk_manifest m) {
     argv[argc++] = "-w";
     if (is_clang) argv[argc++] = "-ferror-limit=0";
     else          argv[argc++] = "-fmax-errors=0";   // GCC's unlimited-errors analog
+    if (verdef) argv[argc++] = verdef;               // -DTEKO_VERSION_STRING for teko_rt.c (CLI --version)
     if (target_str)  { argv[argc++] = "-target";    argv[argc++] = target_str; }
     if (sysroot_str) { argv[argc++] = "--sysroot";  argv[argc++] = sysroot_str; }
     if (m.freestanding) argv[argc++] = "-nostdlib";
@@ -415,6 +434,7 @@ static int run_cc(const char *cfile, const char *binary, tk_manifest m) {
     if (sysroot_str) tk_free0(sysroot_str);
     if (secarg) tk_free0(secarg);
     if (plistp) tk_free0(plistp);
+    if (verdef) tk_free0(verdef);
     if (ccprog) tk_free0(ccprog);
     return rc;
 }
