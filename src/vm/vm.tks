@@ -458,6 +458,19 @@ fn try_builtin(callee: parser::Path, args: []checker::TExpr, env: Venv) -> Built
             _        => return error { message = "vm: ewrite/eprint/eprintln on a non-str value not yet supported" }
         }
     }
+    // (mem::free) teko::mem::free(x) — memory reclaim isn't observable in the VM (host-managed), but
+    // the native lowering SCRUBS the binding (slice → empty, class → null), so mirror the scrub to
+    // keep VM==native even if a (checker-permitting) later read occurs: a slice var → empty []Value;
+    // a class var → left as-is (correct use never reads after free; the checker/ASan is the gate).
+    if last == "free" && callee.segments.len >= 2 && callee.segments[callee.segments.len - 2].name == "mem" {
+        match args[0].kind {
+            checker::TVar as v => match args[0].type {
+                checker::Slice => { let empty: []Value = teko::list::empty(); return BuiltinRes { ran= true; env= define(env, v.name, empty) } }
+                _              => return BuiltinRes { ran= true; env= env }
+            }
+            _ => return BuiltinRes { ran= true; env= env }
+        }
+    }
 
     // issue #72 — `exit(<int>)` / `panic(str)`: the injected GLOBAL diverging builtins
     // (typer.tks:595 — no `never` type; the checker recognizes them unqualified or under the
@@ -1025,7 +1038,7 @@ fn vm_struct_field_type(prog: checker::TProgram, sname: str, fname: str) -> pars
             parser::TypeDecl as d => {
                 match d.body {
                     parser::StructBody as sb => {
-                        if d.name == sname {
+                        if checker::name_last_segment(d.name) == checker::name_last_segment(sname) {   // (#109 W3) bare-vs-bare (d.name canonical; sname may be canonical or bare)
                             mut j = 0
                             loop {
                                 if j >= sb.fields.len { break }
@@ -1103,7 +1116,11 @@ fn eval_struct_init(si: checker::TStructInit, ty: checker::Type, env: Venv) -> E
         vals = teko::list::push(vals, coerce_to(fr.value, vm_field_coerce_type(cur.prog, tn, si.field_names[i])))
         i++
     }
-    let sv = StructVal { type_name = tn; field_names = names; field_vals = vals }
+    // (#109 W3) the VM is namespace-blind for runtime identity: store the BARE last segment as the
+    // struct value's type_name tag (Named.name is now canonical "ns::Name"), so every runtime
+    // dispatch/variant/pattern comparison stays bare-vs-bare. `tn` itself stays canonical below for
+    // find_class_body/vm_field_coerce_type (they resolve against the canonical type table).
+    let sv = StructVal { type_name = checker::name_last_segment(tn); field_names = names; field_vals = vals }
     // (W10b.CLASS residual — VM reference semantics) a class instance is a REFERENCE type
     // (increment 3, native side): construction allocates a cell (the SAME cell-store MEM-1b
     // already threads through eval_expr — see EvalRes) and yields a ClassRef, so passing/
@@ -1397,7 +1414,7 @@ fn val_type_matches(subj: Value, name: str) -> bool {
         byte => name == "byte"
         str  => name == "str"
         []Value => false                          // a slice member is matched by the is_slice branch
-        StructVal as sv => sv.type_name == name    // a named case / `error`
+        StructVal as sv => checker::name_last_segment(sv.type_name) == checker::name_last_segment(name)    // a named case / `error` (#109 W3: bare-vs-bare)
         OptVal => false
         RefVal => false                            // (MEM Step 2/3) a `Ref<T>` value is never pattern-matched (escape-gated, param-only)
         FuncVal => false                           // (W10a) a function value is never pattern-matched
@@ -1553,11 +1570,12 @@ fn vm_match_as_enum_int(prog: checker::TProgram, name: str, ordinal: i128) -> bo
             parser::TypeDecl as td => {
                 match td.body {
                     parser::EnumBody as eb => {
-                        if td.name == name { return true }
+                        let key = checker::name_last_segment(name)   // (#109 W3) bare-vs-bare (td.name canonical; member names bare)
+                        if checker::name_last_segment(td.name) == key { return true }
                         mut j = 0
                         loop {
                             if j >= eb.members.len { break }
-                            if eb.members[j] == name && (j to i128) == ordinal { return true }
+                            if eb.members[j] == key && (j to i128) == ordinal { return true }
                             j++
                         }
                     }
@@ -1581,6 +1599,8 @@ fn vm_match_as_enum_int(prog: checker::TProgram, name: str, ordinal: i128) -> bo
 // (`Expr { kind = Compare; line; col }` → Compare) still descends (the corpus AST-into-kind idiom).
 // Mirror of vm.c::variant_siblings.
 fn vm_variant_siblings(prog: checker::TProgram, a: str, b: str) -> bool {
+    let ka = checker::name_last_segment(a)   // (#109 W3) bare-vs-bare (a/b may be canonical Named.name; union member names are bare)
+    let kb = checker::name_last_segment(b)
     mut i = 0
     loop {
         if i >= prog.items.len { break }
@@ -1596,9 +1616,9 @@ fn vm_variant_siblings(prog: checker::TProgram, a: str, b: str) -> bool {
                                 if j >= u.members.len { break }
                                 match u.members[j] {
                                     parser::NamedType as nt => {
-                                        let nm = nt.path.segments[nt.path.segments.len - 1].name
-                                        if nm == a { has_a = true }
-                                        if nm == b { has_b = true }
+                                        let nm = checker::name_last_segment(nt.path.segments[nt.path.segments.len - 1].name)
+                                        if nm == ka { has_a = true }
+                                        if nm == kb { has_b = true }
                                     }
                                     _ => {}
                                 }
@@ -1619,12 +1639,14 @@ fn vm_variant_siblings(prog: checker::TProgram, a: str, b: str) -> bool {
 }
 
 fn vm_case_in_variant(prog: checker::TProgram, vname: str, cname: str) -> bool {
+    let kv = checker::name_last_segment(vname)   // (#109 W3) bare-vs-bare (vname/cname may be canonical; td.name canonical; member names bare)
+    let kc = checker::name_last_segment(cname)
     mut i = 0
     loop {
         if i >= prog.items.len { break }
         match prog.items[i] {
             parser::TypeDecl as td => {
-                if td.name == vname {
+                if checker::name_last_segment(td.name) == kv {
                     match td.body {
                         parser::VariantBody as vb => match vb.type_expr {
                             parser::UnionType as u => {
@@ -1632,7 +1654,7 @@ fn vm_case_in_variant(prog: checker::TProgram, vname: str, cname: str) -> bool {
                                 loop {
                                     if j >= u.members.len { break }
                                     match u.members[j] {
-                                        parser::NamedType as nt => { if nt.path.segments[nt.path.segments.len - 1].name == cname { return true } }
+                                        parser::NamedType as nt => { if checker::name_last_segment(nt.path.segments[nt.path.segments.len - 1].name) == kc { return true } }
                                         _ => {}
                                     }
                                     j = j + 1
@@ -1731,7 +1753,7 @@ fn pat_match(pat: parser::Pattern, subj: Value, env: Venv) -> PatMatch {
                         // the arm's binding keeps aliasing the shared object, mirroring the native pointer).
                         ClassRef as cr => {
                             match cell_get(env.cells, cr.cell) {
-                                StructVal as payload => { if payload.type_name == bname { hit = true } }
+                                StructVal as payload => { if checker::name_last_segment(payload.type_name) == checker::name_last_segment(bname) { hit = true } }   // (#109 W3) bare-vs-bare
                                 _ => {}
                             }
                         }
@@ -1789,7 +1811,7 @@ fn pat_match(pat: parser::Pattern, subj: Value, env: Venv) -> PatMatch {
         parser::FieldPattern as fp => {
             match subj {
                 StructVal as sv => {
-                    if sv.type_name != path_last(fp.type_name) { return PatMatch { matched = false; env = env } }
+                    if checker::name_last_segment(sv.type_name) != checker::name_last_segment(path_last(fp.type_name)) { return PatMatch { matched = false; env = env } }   // (#109 W3) bare-vs-bare
                     mut e2 = env
                     mut i = 0
                     loop {
@@ -2106,7 +2128,7 @@ fn flags_member_count(prog: checker::TProgram, name: str) -> u64 {
         if i >= prog.items.len { break }
         match prog.items[i] {
             parser::TypeDecl as td => {
-                if td.name == name {
+                if checker::name_last_segment(td.name) == checker::name_last_segment(name) {   // (#109 W3) bare-vs-bare (td.name canonical; name may be canonical or bare)
                     match td.body {
                         parser::FlagsBody as fb => return fb.members.len
                         _ => return 0
@@ -2761,14 +2783,18 @@ fn eval_lambda_call(fv: FuncVal, c: checker::TCall, env: Venv) -> EvalRes {
 // the SAME method (virtual overrides included: every effective method is stamped per class).
 // Mirror of vm.c::find_class_method. null = not found (an honest stop at the caller).
 fn find_class_method(env: Venv, class_name: str, method: str) -> FnHit? {
+    // (#109 W3) class_name is a StructVal type_name / Named — take its BARE last segment so the
+    // ends_with(tf.namespace, "::" ~ class_name) match compares a bare class tail against tf's
+    // canonical method namespace (a full ns matched via ends_with; do NOT strip tf.namespace).
+    let bname = checker::name_last_segment(class_name)
     mut i: u64 = 0
     loop {
         if i >= env.prog.items.len { break }
         match env.prog.items[i] {
             checker::TFunction as tf => {
                 if tf.name == method {
-                    if tf.namespace == class_name { return FnHit { func = tf; idx = i } }
-                    if teko::str::ends_with(tf.namespace, "::" ~ class_name) { return FnHit { func = tf; idx = i } }
+                    if tf.namespace == bname { return FnHit { func = tf; idx = i } }
+                    if teko::str::ends_with(tf.namespace, "::" ~ bname) { return FnHit { func = tf; idx = i } }
                 }
             }
             _ => {}
@@ -3649,6 +3675,12 @@ exp fn run_tests_cov(prog: checker::TProgram, record_branches: bool, write_xml: 
         match prog.items[i] {
             checker::TFunction as f => {
                 if f.is_test {
+                    // (#109 test-gate memory) checkpoint the arena; every allocation this test makes
+                    // (label, env cells, the VM's copy-everything intermediate values) is bulk-freed at
+                    // arena_pop below — so 659 tests no longer accumulate the whole run in the never-dropped
+                    // root region (the OOM that blocked the self-host gate). Coverage sinks are libc-heap,
+                    // so they survive; run_tests_cov's own loop state is on the C stack, not the arena.
+                    teko::arena_push()
                     let label = if f.namespace.len != 0 { teko::str::concat(f.namespace, "::", f.name) } else { f.name }
                     teko::io::print(teko::str::concat("test ", label, " ... "))
                     let fenv = fresh_env(prog, teko::list::empty())   // (MEM Step 2/3) each test frame starts with an empty cell store
@@ -3657,6 +3689,7 @@ exp fn run_tests_cov(prog: checker::TProgram, record_branches: bool, write_xml: 
                     teko::cov_leave()
                     teko::io::println("ok")
                     passed = passed + 1
+                    teko::arena_pop()   // free this test's transient arena span (coverage already recorded off-arena)
                 }
             }
             _ => {}

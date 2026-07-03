@@ -10,21 +10,21 @@ use teko::parser
 // stream interface (TEKO_ROADMAP_STDLIB_CORE.md IO0). The public contract name wins; the
 // private internal name yields. Pure rename — no behavior change (the C twin's own struct
 // naming is independent and unchanged).
-type CodecReader  = struct { data: []byte; pos: u64 }
-type RByte   = struct { r: CodecReader; value: byte }
-type RU32    = struct { r: CodecReader; value: u32 }
-type RU64    = struct { r: CodecReader; value: u64 }
-type RStr    = struct { r: CodecReader; value: str }
-type RType   = struct { r: CodecReader; value: checker::Type }
-type RTypes  = struct { r: CodecReader; value: []checker::Type }
-type RTable  = struct { r: CodecReader; value: []str }
+type Reader  = struct { data: []byte; pos: u64 }
+type RByte   = struct { r: Reader; value: byte }
+type RU32    = struct { r: Reader; value: u32 }
+type RU64    = struct { r: Reader; value: u64 }
+type RStr    = struct { r: Reader; value: str }
+type RType   = struct { r: Reader; value: checker::Type }
+type RTypes  = struct { r: Reader; value: []checker::Type }
+type RTable  = struct { r: Reader; value: []str }
 
-fn read_u8(r: CodecReader) -> RByte | error {
+fn read_u8(r: Reader) -> RByte | error {
     if r.pos >= r.data.len { return error { message = "truncated .tkb" } }
-    RByte { r = CodecReader { data = r.data; pos = r.pos + 1 }; value = r.data[r.pos] }
+    RByte { r = Reader { data = r.data; pos = r.pos + 1 }; value = r.data[r.pos] }
 }
 
-fn read_u32(r: CodecReader) -> RU32 | error {
+fn read_u32(r: Reader) -> RU32 | error {
     let a = match read_u8(r)   { RByte as x => x; error as e => return e }
     let b = match read_u8(a.r) { RByte as x => x; error as e => return e }
     let c = match read_u8(b.r) { RByte as x => x; error as e => return e }
@@ -32,21 +32,21 @@ fn read_u32(r: CodecReader) -> RU32 | error {
     RU32 { r = d.r; value = (a.value to u32) | ((b.value to u32) << 8) | ((c.value to u32) << 16) | ((d.value to u32) << 24) }
 }
 
-fn read_u64(r: CodecReader) -> RU64 | error {
+fn read_u64(r: Reader) -> RU64 | error {
     let lo = match read_u32(r)    { RU32 as x => x; error as e => return e }
     let hi = match read_u32(lo.r) { RU32 as x => x; error as e => return e }
     RU64 { r = hi.r; value = (lo.value to u64) | ((hi.value to u64) << 32) }
 }
 
 // a string reference = a u32 index into the (already-read) table.
-pub fn tkb_read_str(r: CodecReader, table: []str) -> RStr | error {
+pub fn tkb_read_str(r: Reader, table: []str) -> RStr | error {
     let idx = match read_u32(r) { RU32 as x => x; error as e => return e }
     if (idx.value to u64) >= table.len { return error { message = "bad string index in .tkb" } }
     RStr { r = idx.r; value = table[idx.value] }
 }
 
 // the string table: count, then each (len + bytes).
-fn read_strtable(r: CodecReader) -> RTable | error {
+fn read_strtable(r: Reader) -> RTable | error {
     let n = match read_u32(r) { RU32 as x => x; error as e => return e }
     mut rr = n.r
     mut table: []str = teko::list::empty()
@@ -91,7 +91,7 @@ fn prim_of(b: byte) -> checker::PrimKind {
     checker::PrimKind::Bool
 }
 
-fn read_types(r: CodecReader, table: []str) -> RTypes | error {
+fn read_types(r: Reader, table: []str) -> RTypes | error {
     let n = match read_u32(r) { RU32 as x => x; error as e => return e }
     mut rr = n.r
     mut xs: []checker::Type = teko::list::empty()
@@ -107,7 +107,7 @@ fn read_types(r: CodecReader, table: []str) -> RTypes | error {
 }
 
 // inverse of write_type — tags 0=Prim 1=Byte 2=Str 3=error 4=void 5=Slice 6=Named 7=Variant 8=Func 9=Optional (B.37).
-fn read_type(r: CodecReader, table: []str) -> RType | error {
+fn read_type(r: Reader, table: []str) -> RType | error {
     let tag = match read_u8(r) { RByte as x => x; error as e => return e }
     if tag.value == 0 {
         let k = match read_u8(tag.r) { RByte as x => x; error as e => return e }
@@ -148,32 +148,32 @@ fn read_type(r: CodecReader, table: []str) -> RType | error {
     error { message = "bad type tag in .tkb" }
 }
 
-type RI64    = struct { r: CodecReader; value: i64 }
-type RTExpr  = struct { r: CodecReader; value: checker::TExpr }
-type RTExprs = struct { r: CodecReader; value: []checker::TExpr }
-type RTerms  = struct { r: CodecReader; value: []checker::TCmpTerm }
-type RPath   = struct { r: CodecReader; value: parser::Path }
-type RTStmt      = struct { r: CodecReader; value: checker::TStatement }       // (C7.16)
-type RTStmts     = struct { r: CodecReader; value: []checker::TStatement }     // (C7.16)
-type RBindTarget = struct { r: CodecReader; value: parser::BindTarget }        // (C7.16)
-type RTypeExpr   = struct { r: CodecReader; value: parser::TypeExpr }          // (C7.16) program framing
-type RTypeExprs  = struct { r: CodecReader; value: []parser::TypeExpr }
-type RParams     = struct { r: CodecReader; value: []parser::Param }
-type RFields     = struct { r: CodecReader; value: []parser::Field }
-type RStrs       = struct { r: CodecReader; value: []str }
-type RTypeBody   = struct { r: CodecReader; value: parser::TypeBody }
-type RTypeDecl   = struct { r: CodecReader; value: parser::TypeDecl }
-type RUseDecl    = struct { r: CodecReader; value: parser::UseDecl }
-type RTFunction  = struct { r: CodecReader; value: checker::TFunction }
-type RTItem      = struct { r: CodecReader; value: checker::TItem }
-type RProgram    = struct { r: CodecReader; value: checker::TProgram }
-type RPExpr      = struct { r: CodecReader; value: parser::Expr }              // (C7.16) match framing
-type RPattern    = struct { r: CodecReader; value: parser::Pattern }
-type RPatterns   = struct { r: CodecReader; value: []parser::Pattern }
-type RTArm       = struct { r: CodecReader; value: checker::TArm }
-type RTArms      = struct { r: CodecReader; value: []checker::TArm }
+type RI64    = struct { r: Reader; value: i64 }
+type RTExpr  = struct { r: Reader; value: checker::TExpr }
+type RTExprs = struct { r: Reader; value: []checker::TExpr }
+type RTerms  = struct { r: Reader; value: []checker::TCmpTerm }
+type RPath   = struct { r: Reader; value: parser::Path }
+type RTStmt      = struct { r: Reader; value: checker::TStatement }       // (C7.16)
+type RTStmts     = struct { r: Reader; value: []checker::TStatement }     // (C7.16)
+type RBindTarget = struct { r: Reader; value: parser::BindTarget }        // (C7.16)
+type RTypeExpr   = struct { r: Reader; value: parser::TypeExpr }          // (C7.16) program framing
+type RTypeExprs  = struct { r: Reader; value: []parser::TypeExpr }
+type RParams     = struct { r: Reader; value: []parser::Param }
+type RFields     = struct { r: Reader; value: []parser::Field }
+type RStrs       = struct { r: Reader; value: []str }
+type RTypeBody   = struct { r: Reader; value: parser::TypeBody }
+type RTypeDecl   = struct { r: Reader; value: parser::TypeDecl }
+type RUseDecl    = struct { r: Reader; value: parser::UseDecl }
+type RTFunction  = struct { r: Reader; value: checker::TFunction }
+type RTItem      = struct { r: Reader; value: checker::TItem }
+type RProgram    = struct { r: Reader; value: checker::TProgram }
+type RPExpr      = struct { r: Reader; value: parser::Expr }              // (C7.16) match framing
+type RPattern    = struct { r: Reader; value: parser::Pattern }
+type RPatterns   = struct { r: Reader; value: []parser::Pattern }
+type RTArm       = struct { r: Reader; value: checker::TArm }
+type RTArms      = struct { r: Reader; value: []checker::TArm }
 
-fn read_i64(r: CodecReader) -> RI64 | error {
+fn read_i64(r: Reader) -> RI64 | error {
     let u = match read_u64(r) { RU64 as x => x; error as e => return e }
     RI64 { r = u.r; value = u.value to i64 }               // codec i64s are non-negative (TNumber magnitudes), so the value conversion is exact
 }
@@ -181,7 +181,7 @@ fn read_i64(r: CodecReader) -> RI64 | error {
 // inverse of kind_byte (operator TokenKind ↔ byte). The byte→enum ordinal is E7's cast.
 fn kind_of(b: byte) -> lexer::TokenKind { b to lexer::TokenKind }
 
-fn read_path(r: CodecReader, table: []str) -> RPath | error {
+fn read_path(r: Reader, table: []str) -> RPath | error {
     let n = match read_u32(r) { RU32 as x => x; error as e => return e }
     mut rr = n.r
     mut segs: []parser::Segment = teko::list::empty()
@@ -196,7 +196,7 @@ fn read_path(r: CodecReader, table: []str) -> RPath | error {
     RPath { r = rr; value = parser::Path { segments = segs } }
 }
 
-fn read_texprs(r: CodecReader, table: []str) -> RTExprs | error {
+fn read_texprs(r: Reader, table: []str) -> RTExprs | error {
     let n = match read_u32(r) { RU32 as x => x; error as e => return e }
     mut rr = n.r
     mut xs: []checker::TExpr = teko::list::empty()
@@ -211,7 +211,7 @@ fn read_texprs(r: CodecReader, table: []str) -> RTExprs | error {
     RTExprs { r = rr; value = xs }
 }
 
-fn read_terms(r: CodecReader, table: []str) -> RTerms | error {
+fn read_terms(r: Reader, table: []str) -> RTerms | error {
     let n = match read_u32(r) { RU32 as x => x; error as e => return e }
     mut rr = n.r
     mut ts: []checker::TCmpTerm = teko::list::empty()
@@ -228,7 +228,7 @@ fn read_terms(r: CodecReader, table: []str) -> RTerms | error {
 }
 
 // inverse of write_texpr: the type FIRST, then tag (0..7), then the payload.
-fn read_texpr(r: CodecReader, table: []str) -> RTExpr | error {
+fn read_texpr(r: Reader, table: []str) -> RTExpr | error {
     let ty = match read_type(r, table) { RType as x => x; error as e => return e }
     let tag = match read_u8(ty.r) { RByte as x => x; error as e => return e }
     if tag.value == 0 {
@@ -438,7 +438,7 @@ fn read_texpr(r: CodecReader, table: []str) -> RTExpr | error {
 }
 
 // (C7.16) BindTarget: inverse of write_bindtarget — tag 0 SimpleName | tag 1 DestructurePattern.
-fn read_bindtarget(r: CodecReader, table: []str) -> RBindTarget | error {
+fn read_bindtarget(r: Reader, table: []str) -> RBindTarget | error {
     let tag = match read_u8(r) { RByte as x => x; error as e => return e }
     if tag.value == 0 {
         let nm = match tkb_read_str(tag.r, table) { RStr as x => x; error as e => return e }
@@ -459,7 +459,7 @@ fn read_bindtarget(r: CodecReader, table: []str) -> RBindTarget | error {
 }
 
 // (C7.16) a []TStatement: u64 count, then each. Inverse of write_tstatements.
-fn read_tstatements(r: CodecReader, table: []str) -> RTStmts | error {
+fn read_tstatements(r: Reader, table: []str) -> RTStmts | error {
     let n = match read_u64(r) { RU64 as x => x; error as e => return e }
     mut rr = n.r
     mut xs: []checker::TStatement = teko::list::empty()
@@ -475,7 +475,7 @@ fn read_tstatements(r: CodecReader, table: []str) -> RTStmts | error {
 }
 
 // (C7.16) a TStatement: u8 tag + payload. Inverse of write_tstatement.
-fn read_tstatement(r: CodecReader, table: []str) -> RTStmt | error {
+fn read_tstatement(r: Reader, table: []str) -> RTStmt | error {
     let tag = match read_u8(r) { RByte as x => x; error as e => return e }
     if tag.value == 0 {
         // TBinding: bindkind (u8) + target (BindTarget) + bound (Type) + value (TExpr).
@@ -535,7 +535,7 @@ fn read_tstatement(r: CodecReader, table: []str) -> RTStmt | error {
 // ============================================================================
 // (C7.16) PROGRAM FRAMING readers — inverse of the write_* framing helpers.
 // ============================================================================
-fn read_typeexprs(r: CodecReader, table: []str) -> RTypeExprs | error {
+fn read_typeexprs(r: Reader, table: []str) -> RTypeExprs | error {
     let n = match read_u64(r) { RU64 as x => x; error as e => return e }
     mut rr = n.r
     mut xs: []parser::TypeExpr = teko::list::empty()
@@ -543,7 +543,7 @@ fn read_typeexprs(r: CodecReader, table: []str) -> RTypeExprs | error {
     loop { if i >= n.value { break }; let e = match read_typeexpr(rr, table) { RTypeExpr as x => x; error as e => return e }; xs = teko::list::push(xs, e.value); rr = e.r; i++ }
     RTypeExprs { r = rr; value = xs }
 }
-fn read_typeexpr(r: CodecReader, table: []str) -> RTypeExpr | error {
+fn read_typeexpr(r: Reader, table: []str) -> RTypeExpr | error {
     let tag = match read_u8(r) { RByte as x => x; error as e => return e }
     if tag.value == 0 { let p = match read_path(tag.r, table)     { RPath as x => x; error as e => return e };     return RTypeExpr { r = p.r;  value = parser::NamedType { path = p.value; args = teko::list::empty() } } }
     if tag.value == 1 { let e = match read_typeexpr(tag.r, table) { RTypeExpr as x => x; error as e => return e }; return RTypeExpr { r = e.r;  value = parser::SliceType { element = e.value } } }
@@ -556,7 +556,7 @@ fn read_typeexpr(r: CodecReader, table: []str) -> RTypeExpr | error {
     }
     error { message = "bad typeexpr tag in .tkb" }
 }
-fn read_params(r: CodecReader, table: []str) -> RParams | error {
+fn read_params(r: Reader, table: []str) -> RParams | error {
     let n = match read_u64(r) { RU64 as x => x; error as e => return e }
     mut rr = n.r
     mut xs: []parser::Param = teko::list::empty()
@@ -569,7 +569,7 @@ fn read_params(r: CodecReader, table: []str) -> RParams | error {
     }
     RParams { r = rr; value = xs }
 }
-fn read_fields(r: CodecReader, table: []str) -> RFields | error {
+fn read_fields(r: Reader, table: []str) -> RFields | error {
     let n = match read_u64(r) { RU64 as x => x; error as e => return e }
     mut rr = n.r
     mut xs: []parser::Field = teko::list::empty()
@@ -582,7 +582,7 @@ fn read_fields(r: CodecReader, table: []str) -> RFields | error {
     }
     RFields { r = rr; value = xs }
 }
-fn read_strs(r: CodecReader, table: []str) -> RStrs | error {
+fn read_strs(r: Reader, table: []str) -> RStrs | error {
     let n = match read_u64(r) { RU64 as x => x; error as e => return e }
     mut rr = n.r
     mut xs: []str = teko::list::empty()
@@ -590,7 +590,7 @@ fn read_strs(r: CodecReader, table: []str) -> RStrs | error {
     loop { if i >= n.value { break }; let s = match tkb_read_str(rr, table) { RStr as x => x; error as e => return e }; xs = teko::list::push(xs, s.value); rr = s.r; i++ }
     RStrs { r = rr; value = xs }
 }
-fn read_typebody(r: CodecReader, table: []str) -> RTypeBody | error {
+fn read_typebody(r: Reader, table: []str) -> RTypeBody | error {
     let tag = match read_u8(r) { RByte as x => x; error as e => return e }
     if tag.value == 0 { let fs = match read_fields(tag.r, table)   { RFields as x => x; error as e => return e };   return RTypeBody { r = fs.r; value = parser::StructBody { fields = fs.value ; methods = teko::list::empty(); implements = teko::list::empty() } } }
     if tag.value == 1 { let ms = match read_strs(tag.r, table)     { RStrs as x => x; error as e => return e };     return RTypeBody { r = ms.r; value = parser::EnumBody { members = ms.value } } }
@@ -635,7 +635,7 @@ fn read_typebody(r: CodecReader, table: []str) -> RTypeBody | error {
     }
     error { message = "bad typebody tag in .tkb" }
 }
-fn read_typedecl(r: CodecReader, table: []str) -> RTypeDecl | error {
+fn read_typedecl(r: Reader, table: []str) -> RTypeDecl | error {
     let nm  = match tkb_read_str(r, table)      { RStr as x => x; error as e => return e }
     let bd  = match read_typebody(nm.r, table)  { RTypeBody as x => x; error as e => return e }
     let vis = match read_u8(bd.r)               { RByte as x => x; error as e => return e }
@@ -645,13 +645,13 @@ fn read_typedecl(r: CodecReader, table: []str) -> RTypeDecl | error {
     let cl  = match read_u32(ln.r)              { RU32 as x => x; error as e => return e }
     RTypeDecl { r = cl.r; value = parser::TypeDecl { name = nm.value; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = bd.value; vis = vis.value to parser::Visibility; has_doc = hd.value != 0; doc = doc.value; line = ln.value; col = cl.value } }
 }
-fn read_usedecl(r: CodecReader, table: []str) -> RUseDecl | error {
+fn read_usedecl(r: Reader, table: []str) -> RUseDecl | error {
     let p  = match read_path(r, table)        { RPath as x => x; error as e => return e }
     let ha = match read_u8(p.r)               { RByte as x => x; error as e => return e }
     let al = match tkb_read_str(ha.r, table)  { RStr as x => x; error as e => return e }
     RUseDecl { r = al.r; value = parser::UseDecl { path = p.value; has_alias = ha.value != 0; alias = al.value } }
 }
-fn read_tfunction(r: CodecReader, table: []str) -> RTFunction | error {
+fn read_tfunction(r: Reader, table: []str) -> RTFunction | error {
     let nm  = match tkb_read_str(r, table)        { RStr as x => x; error as e => return e }
     let ps  = match read_params(nm.r, table)      { RParams as x => x; error as e => return e }
     let rt  = match read_type(ps.r, table)        { RType as x => x; error as e => return e }
@@ -669,7 +669,7 @@ fn read_tfunction(r: CodecReader, table: []str) -> RTFunction | error {
     let fr  = match tkb_read_str(cs.r, table)     { RStr as x => x; error as e => return e }
     RTFunction { r = fr.r; value = checker::TFunction { name = nm.value; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = ps.value; return_type = rt.value; body = bd.value; vis = vis.value to parser::Visibility; has_doc = hd.value != 0; doc = doc.value; namespace = ns.value; file = fl.value; line = ln.value; col = cl.value; is_test = it.value != 0; is_extern = ie.value != 0; c_symbol = cs.value; from_lib = fr.value } }
 }
-fn read_titem(r: CodecReader, table: []str) -> RTItem | error {
+fn read_titem(r: Reader, table: []str) -> RTItem | error {
     let tag = match read_u8(r) { RByte as x => x; error as e => return e }
     if tag.value == 0 { let f = match read_tfunction(tag.r, table) { RTFunction as x => x; error as e => return e }; return RTItem { r = f.r; value = f.value } }
     if tag.value == 1 { let d = match read_typedecl(tag.r, table)  { RTypeDecl as x => x; error as e => return e }; return RTItem { r = d.r; value = d.value } }
@@ -677,7 +677,7 @@ fn read_titem(r: CodecReader, table: []str) -> RTItem | error {
     if tag.value == 3 { let s = match read_tstatement(tag.r, table) { RTStmt as x => x; error as e => return e }; return RTItem { r = s.r; value = s.value } }
     error { message = "bad titem tag in .tkb" }
 }
-fn read_program(r: CodecReader, table: []str) -> RProgram | error {
+fn read_program(r: Reader, table: []str) -> RProgram | error {
     let n = match read_u64(r) { RU64 as x => x; error as e => return e }
     mut rr = n.r
     mut xs: []checker::TItem = teko::list::empty()
@@ -689,7 +689,7 @@ fn read_program(r: CodecReader, table: []str) -> RProgram | error {
 // ============================================================================
 // (C7.16) MATCH FRAMING readers — pattern-expr / Pattern / TArm.
 // ============================================================================
-fn read_pexpr(r: CodecReader, table: []str) -> RPExpr | error {
+fn read_pexpr(r: Reader, table: []str) -> RPExpr | error {
     let tag = match read_u8(r) { RByte as x => x; error as e => return e }
     if tag.value == 0 {
         let isf = match read_u8(tag.r)  { RByte as x => x; error as e => return e }
@@ -709,7 +709,7 @@ fn read_pexpr(r: CodecReader, table: []str) -> RPExpr | error {
     }
     error { message = "bad pattern-expr tag in .tkb" }
 }
-fn read_patterns(r: CodecReader, table: []str) -> RPatterns | error {
+fn read_patterns(r: Reader, table: []str) -> RPatterns | error {
     let n = match read_u64(r) { RU64 as x => x; error as e => return e }
     mut rr = n.r
     mut xs: []parser::Pattern = teko::list::empty()
@@ -717,7 +717,7 @@ fn read_patterns(r: CodecReader, table: []str) -> RPatterns | error {
     loop { if i >= n.value { break }; let p = match read_pattern(rr, table) { RPattern as x => x; error as e => return e }; xs = teko::list::push(xs, p.value); rr = p.r; i++ }
     RPatterns { r = rr; value = xs }
 }
-fn read_pattern(r: CodecReader, table: []str) -> RPattern | error {
+fn read_pattern(r: Reader, table: []str) -> RPattern | error {
     let tag = match read_u8(r) { RByte as x => x; error as e => return e }
     if tag.value == 0 { let v = match read_pexpr(tag.r, table) { RPExpr as x => x; error as e => return e }; return RPattern { r = v.r; value = parser::LiteralPattern { value = v.value } } }
     if tag.value == 1 {
@@ -747,7 +747,7 @@ fn read_pattern(r: CodecReader, table: []str) -> RPattern | error {
     if tag.value == 6 { return RPattern { r = tag.r; value = parser::NullPattern { } } }
     error { message = "bad pattern tag in .tkb" }
 }
-fn read_tarms(r: CodecReader, table: []str) -> RTArms | error {
+fn read_tarms(r: Reader, table: []str) -> RTArms | error {
     let n = match read_u64(r) { RU64 as x => x; error as e => return e }
     mut rr = n.r
     mut xs: []checker::TArm = teko::list::empty()
@@ -755,7 +755,7 @@ fn read_tarms(r: CodecReader, table: []str) -> RTArms | error {
     loop { if i >= n.value { break }; let a = match read_tarm(rr, table) { RTArm as x => x; error as e => return e }; xs = teko::list::push(xs, a.value); rr = a.r; i++ }
     RTArms { r = rr; value = xs }
 }
-fn read_tarm(r: CodecReader, table: []str) -> RTArm | error {
+fn read_tarm(r: Reader, table: []str) -> RTArm | error {
     let p  = match read_pattern(r, table) { RPattern as x => x; error as e => return e }
     let hw = match read_u8(p.r)           { RByte as x => x; error as e => return e }
     if hw.value != 0 {
@@ -771,7 +771,7 @@ fn read_tarm(r: CodecReader, table: []str) -> RTArm | error {
 
 // THE ENTRY: verify the header + hash, then read the table and the typed tree.
 fn deserialize(data: []byte) -> checker::TExpr | error {
-    let r0 = CodecReader { data = data; pos = 0 }
+    let r0 = Reader { data = data; pos = 0 }
     let m0 = match read_u8(r0)   { RByte as x => x; error as e => return e }
     let m1 = match read_u8(m0.r) { RByte as x => x; error as e => return e }
     let m2 = match read_u8(m1.r) { RByte as x => x; error as e => return e }
@@ -794,7 +794,7 @@ fn deserialize(data: []byte) -> checker::TExpr | error {
 // (C7.16) THE PROGRAM ENTRY: verify the header + VERSION 2 + hash, then read the table and the
 // typed PROGRAM. Inverse of serialize_program.
 pub fn deserialize_program(data: []byte) -> checker::TProgram | error {
-    let r0 = CodecReader { data = data; pos = 0 }
+    let r0 = Reader { data = data; pos = 0 }
     let m0 = match read_u8(r0)   { RByte as x => x; error as e => return e }
     let m1 = match read_u8(m0.r) { RByte as x => x; error as e => return e }
     let m2 = match read_u8(m1.r) { RByte as x => x; error as e => return e }

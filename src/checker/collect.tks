@@ -70,7 +70,7 @@ fn method_func_type(f: parser::Function, struct_name: str, table: TypeTable, ref
     loop {
         if i >= f.params.len { break }
         let pt = if !f.params[i].has_type {
-            Named { name = struct_name }
+            Named { name = qualify(type_ns_of(table, name_last_segment(struct_name)), name_last_segment(struct_name)) }   // (#109 W3) NORMALIZE from the bare last-segment (struct_name may arrive bare from collect OR already-canonical from interface/base dispatch): a real class → its declaring ns (canonical); a type-param `T` (absent from the global table) → "" → BARE, matching the arg's Named{T}
         } else {
             match resolve_type(f.params[i].type_ann, tbl, ref_ns) { Type as t => t; error as e => return e }
         }
@@ -323,7 +323,11 @@ pub fn member_accessible(owner: MemberOwner, accessor_type: str, table: TypeTabl
         parser::Visibility::Exp => true
         parser::Visibility::Private => {
             if accessor_type == "" { return false }
-            if accessor_type == owner.declaring_class { return true }
+            // (#109 W3) `accessor_type` (env.owner_type) and `owner.declaring_class` may differ in
+            // bare-vs-canonical spelling (the receiver's type is canonicalized via qualify(); the
+            // method's declaring class flows bare from find_method_owner) — compare by bare
+            // last-segment so a class's own method reaches its own private members.
+            if name_last_segment(accessor_type) == name_last_segment(owner.declaring_class) { return true }
             if owner.is_intern { return is_subclass_of(accessor_type, owner.declaring_class, table) }
             false
         }
@@ -844,11 +848,6 @@ fn check_no_duplicate_types(table: TypeTable) -> error? {
                 if table[i].name == table[j].name && table[i].namespace == table[j].namespace {
                     let ns_label = if table[i].namespace == "" { "<top-level>" } else { table[i].namespace }
                     return error { message = $"duplicate type '{table[i].name}' in namespace '{ns_label}'" }
-                }
-                if table[i].name == table[j].name && table[i].namespace != table[j].namespace {
-                    let ns1 = if table[i].namespace == "" { "<top-level>" } else { table[i].namespace }
-                    let ns2 = if table[j].namespace == "" { "<top-level>" } else { table[j].namespace }
-                    return error { message = $"two types share the bare name '{table[i].name}' — {ns1} and {ns2}; not yet supported (#109)" }
                 }
             }
             j++

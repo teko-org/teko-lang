@@ -389,6 +389,41 @@ fn type_list_builtin(c: parser::Call, env: Env, table: TypeTable) -> TExpr | Not
     }
 }
 
+// (mem::free ruling 2026-07-03) `teko::mem::free<T>(target: []T | Ref<T>) -> void` — MANUAL opt-in
+// deallocation, the third lifetime lever ([[teko-mem-free-design]]). ONE builtin whose parameter is a
+// SUM of the two heap shapes; the checker dispatches the arm STATICALLY by the argument's resolved
+// type (no runtime tag). SAFETY (the "equilíbrio"): the target must be a MUTABLE VARIABLE — the
+// lowering scrubs it (slice → empty, class handle → null) at the free site, so a direct
+// `free(x); use(x)` reads the scrubbed-empty value, never the parked buffer (aliasing via a separate
+// binding is the caller's razor + the ASan gate; full alias invalidation is a follow-up). Returns void.
+type NotMemFree = struct { }
+fn type_mem_free(c: parser::Call, env: Env, table: TypeTable) -> TExpr | NotMemFree | error {
+    if c.callee.segments.len < 2 { return NotMemFree { } }
+    let last = c.callee.segments[c.callee.segments.len - 1].name
+    let prev = c.callee.segments[c.callee.segments.len - 2].name
+    if last != "free" || prev != "mem" { return NotMemFree { } }
+    let rooted = c.callee.segments.len == 2 || c.callee.segments[0].name == "teko"
+    if !rooted { return NotMemFree { } }
+    if c.args.len != 1 { return error { message = "teko::mem::free expects one argument (a mutable `[]T` or class variable)" } }
+    let arg = match type_expr(c.args[0], env, table) { TExpr as te => te; error as e => return e }
+    // the target must be a plain VARIABLE (so the lowering can scrub it) that is `mut` (owned to free).
+    let vname = match arg.kind { TVar as v => v.name; _ => return error { message = "teko::mem::free requires a mutable variable — the value must have a binding to invalidate" } }
+    let vb = match lookup_binding(env, vname) { ValBinding as b => b; error as e => return e }
+    if !vb.is_mut { return error { message = $"cannot free immutable `{vname}` — declare it `mut` (free invalidates the binding)" } }
+    // the target must be a HEAP value: a slice `[]T` (free the backing buffer) or a class instance
+    // (drop its arena-per-object region). A struct-by-value / prim / str-view has no owned heap block.
+    let is_heap = match arg.type {
+        Slice => true
+        Named as nm => is_class_name(nm.name, table)
+        _ => false
+    }
+    if !is_heap { return error { message = $"teko::mem::free target must be a `[]T` slice or a class instance — `{type_render(arg.type)}` owns no freeable heap block" } }
+    // typed node: a void TCall carrying the (path, typed arg). codegen recognizes `mem::free` and
+    // dispatches the arm off arg.type (Slice → tk_free_block + scrub; class → tk_region_drop + null).
+    let av = teko::list::push(teko::list::empty(), arg)
+    TExpr { kind = TCall { callee = c.callee; args = av; call_ns = "teko::mem"; is_closure_call = false; callee_type = Void { }; is_iface_dispatch = false; iface_slot = 0 }; type = Void { }; line = 0; col = 0 }
+}
+
 // (2026-07-01) call-site desugar for a `params`-variadic function `f`. Two shapes:
 //   passthrough — exactly `f.params.len` raw args AND the last one is already typed `[]T`
 //     (T = the params element type) → pass through unchanged, no re-wrapping.
@@ -728,7 +763,7 @@ fn type_method_call(mc: parser::MethodCall, env: Env, table: TypeTable) -> TExpr
         }
         _ => {}
     }
-    let seg_struct = parser::Segment { name = struct_name }
+    let seg_struct = parser::Segment { name = name_last_segment(struct_name) }   // (#109 W3) BARE class segment — lookup_call matches the registered "ns::Class" method-ns via its ends-with qualifier rule; the resolved call_ns (canonical) drives codegen mangling
     let seg_method = parser::Segment { name = mc.method }
     mut segs: []parser::Segment = teko::list::push(teko::list::empty(), seg_struct)
     segs = teko::list::push(segs, seg_method)
@@ -746,6 +781,11 @@ fn type_call(c: parser::Call, env: Env, table: TypeTable) -> TExpr | error {
         TExpr as te    => return te
         error as e     => return e
         NotListBuiltin => { }                  // not a list builtin → fall through to the ordinary call
+    }
+    match type_mem_free(c, env, table) {       // teko::mem::free (manual dealloc — []T | class)
+        TExpr as te => return te
+        error as e  => return e
+        NotMemFree  => { }
     }
     let name = c.callee.segments[c.callee.segments.len - 1].name
     // panic / exit — injected GLOBAL diverging builtins (legislator's ruling — NO `never` type).
@@ -1415,11 +1455,12 @@ fn type_struct_lit(sl: parser::StructLit, expected: Type, env: Env, table: TypeT
         }
         _ => {}
     }
-    let base_name = match nt {
-        Named as n => n.name
+    let canon_name = match nt {
+        Named as n => n.name   // (#109 W3) CANONICAL result-type name (mirrors expr.c `name = nt.name`); type_eq compares canonical both sides
         _          => return error { message = "a struct literal requires a named struct type" }
     }
-    mut name = base_name
+    let base_name = name_last_segment(canon_name)   // (#109 W3) BARE base — a generic instance name (Gen__g__i64) is bare, so name_has_generic_base matches the bare "Gen" prefix
+    mut name = canon_name
     mut decl = match type_table_find(table, name, "") {   // (#109 W1) struct-literal decl lookup on a resolved name — no referencing ns
         parser::TypeDecl as td => td
         error          => return error { message = $"unknown type in a struct literal: {name}" }
@@ -1474,7 +1515,7 @@ fn type_struct_lit(sl: parser::StructLit, expected: Type, env: Env, table: TypeT
             // ("" outside any method) — a purely inherited method keeps its ORIGINAL declaring
             // class (type_struct_methods), so a base factory constructing the base stays legal when
             // re-typed under a derived class. Structs are pure value data: their literals stay free.
-            if env.owner_type != name {
+            if name_last_segment(env.owner_type) != name_last_segment(name) {   // (#109 W3) compare bare — `name` is the class's canonical "ns::Name", owner_type the enclosing-method class
                 return error { message = $"a class literal is only legal inside the class's own methods — construct it via a static factory: {name}" }
             }
             match effective_class_fields(c, table) { []parser::Field as fs => fs; error as e => return e }
@@ -2724,7 +2765,7 @@ fn type_method(f: parser::Function, struct_name: str, env: Env, table: TypeTable
     loop {
         if i >= f.params.len { break }
         let pt = if !f.params[i].has_type {
-            Named { name = struct_name }
+            Named { name = qualify(env.cur_ns, struct_name) }   // (#109 W3) canonical: the method's own ns qualifies its receiver type
         } else {
             match resolve_type(f.params[i].type_ann, tbl, env.cur_ns) { Type as t => t; error as e => return e }   // (#109 W1) ref_ns = the method's enclosing namespace
         }
@@ -2747,7 +2788,7 @@ fn type_method(f: parser::Function, struct_name: str, env: Env, table: TypeTable
         local = define(local, f.params[i].name, pt, false)
         i++
     }
-    if inject_base_binding { local = define(local, base_binding_name, Named { name = base_name }, false) }
+    if inject_base_binding { local = define(local, base_binding_name, Named { name = qualify(env.cur_ns, base_name) }, false) }   // (#109 W3) canonical: base type qualified by the class's own ns
     let ret = match function_return(f, tbl, env.cur_ns) { Type as t => t; error as e => return e }   // (#109 W1) ref_ns = the fn's enclosing namespace
     match ret { Reference => return error { message = "a function cannot return a reference (pass-down only)" }; _ => {} }
     if f.is_extern {
@@ -2778,10 +2819,10 @@ fn type_method(f: parser::Function, struct_name: str, env: Env, table: TypeTable
         let receiver_name = f.params[0].name
         let cast_val = TExpr {
             kind = TVar { name = receiver_name; is_func = false; func_ns = "" }
-            type = Named { name = struct_name }
+            type = Named { name = qualify(env.cur_ns, struct_name) }   // (#109 W3) canonical: self's concrete subclass type qualified by the method's ns
             line = 0; col = 0
         }
-        let bind_stmt = TBinding { kind = parser::BindKind::Let; target = parser::SimpleName { name = base_binding_name }; bound = Named { name = base_name }; value = cast_val }
+        let bind_stmt = TBinding { kind = parser::BindKind::Let; target = parser::SimpleName { name = base_binding_name }; bound = Named { name = qualify(env.cur_ns, base_name) }; value = cast_val }   // (#109 W3) canonical: base bound type qualified by the class's own ns
         mut prefixed: []TStatement = teko::list::push(teko::list::empty(), bind_stmt)
         mut si = 0
         loop { if si >= tb.stmts.len { break }; prefixed = teko::list::push(prefixed, tb.stmts[si]); si++ }
@@ -2911,7 +2952,15 @@ fn type_item(item: parser::Item, env: Env, table: TypeTable) -> TItem | error {
             // (#49) stamp the declaring namespace from the parsed item so codegen mangles the C name.
             TFunction { name = tf.name; type_params = tf.type_params; type_constraints = tf.type_constraints; params = tf.params; return_type = tf.return_type; body = tf.body; vis = tf.vis; has_doc = tf.has_doc; doc = tf.doc; namespace = item.namespace; file = item.file; line = f.line; col = f.col; is_test = tf.is_test; is_extern = tf.is_extern; c_symbol = tf.c_symbol; from_lib = tf.from_lib }
         }
-        parser::TypeDecl as td => normalize_inst_decl(td, table)   // (W9.4) rewrite `Gen<i64>` member refs to the bare stamped `Gen__g__i64` (no-op when none); else passes through (collect resolved its fields)
+        parser::TypeDecl as td => {
+            // (#109 W3) CANONICALIZE the decl name to "ns::Name" so codegen emits a namespace-distinct
+            // typedef (matching the canonical Named.name at every USE). A generic `__g__` instance keeps
+            // its already-unique bare name. Resolution stays bare-keyed (this is the TYPED program only).
+            let cd = if name_is_g_instance(td.name) { td } else {
+                parser::TypeDecl { name = qualify(item.namespace, td.name); type_params = td.type_params; type_constraints = td.type_constraints; body = td.body; vis = td.vis; has_doc = td.has_doc; doc = td.doc; line = td.line; col = td.col }
+            }
+            normalize_inst_decl(cd, table)   // (W9.4) rewrite `Gen<i64>` member refs to the bare stamped `Gen__g__i64` (no-op when none); else passes through (collect resolved its fields)
+        }
         parser::UseDecl as ud  => ud       // seed no-op (alias resolution is the checker's, later)
         parser::Statement as s => {
             let ts = match type_statement(s, env, table) { TypedStmt as x => x; error as e => return e }

@@ -561,7 +561,7 @@ static tk_texpr_result type_method_call(tk_method_call mc, tk_env env, tk_type_t
         }
     }
     tk_segment *segs = tk_alloc(2 * sizeof *segs); if (!segs) abort();
-    segs[0] = (tk_segment){ .name = struct_name };
+    segs[0] = (tk_segment){ .name = tk_name_last_segment(struct_name) };   // (#109 W3) BARE class segment — lookup_call's ends-with qualifier rule matches the registered "ns::Class" method-ns
     segs[1] = (tk_segment){ .name = mc.method };
     tk_expr *cargs = tk_alloc((mc.nargs + 1) * sizeof *cargs); if (!cargs) abort();
     cargs[0] = *mc.receiver;
@@ -572,9 +572,36 @@ static tk_texpr_result type_method_call(tk_method_call mc, tk_env env, tk_type_t
     return type_call(synthetic, env, table);
 }
 
+// (mem::free ruling 2026-07-03) `teko::mem::free<T>(target: []T | Ref<T>) -> void` — manual opt-in
+// dealloc; ONE builtin over a SUM of the two heap shapes, arm dispatched STATICALLY by the arg type.
+// Target must be a MUTABLE VARIABLE (the lowering scrubs it at the free site → no direct UAF).
+// Mirror of typer.tks::type_mem_free. Returns true iff this was a `mem::free` call.
+static bool type_mem_free(tk_call c, tk_env env, tk_type_table table, tk_texpr_result *out) {
+    if (c.callee.len < 2) return false;
+    tk_str last = c.callee.segments[c.callee.len - 1].name;
+    tk_str prev = c.callee.segments[c.callee.len - 2].name;
+    if (!seg_lit(last, "free") || !seg_lit(prev, "mem")) return false;
+    bool rooted = (c.callee.len == 2) || seg_lit(c.callee.segments[0].name, "teko");
+    if (!rooted) return false;
+    if (c.nargs != 1) { *out = xerr("teko::mem::free expects one argument (a mutable `[]T` or class variable)"); return true; }
+    tk_texpr_result a = tk_typer_expr(c.args[0], env, table); if (!a.ok) { *out = a; return true; }
+    if (a.as.value.tag != TK_TEXPR_VAR) { *out = xerr("teko::mem::free requires a mutable variable — the value must have a binding to invalidate"); return true; }
+    tk_binding_result b = tk_env_lookup_binding(env, a.as.value.as.var.name); if (!b.ok) { *out = xferr(b.as.error); return true; }
+    if (!b.as.value.is_mut) { *out = xerr("cannot free an immutable binding — declare it `mut` (free invalidates the binding)"); return true; }
+    bool is_heap = a.as.value.type.tag == TK_TYPE_SLICE
+                || (a.as.value.type.tag == TK_TYPE_NAMED && tk_is_class_name(a.as.value.type.as.named.name, table));
+    if (!is_heap) { *out = xerr("teko::mem::free target must be a `[]T` slice or a class instance — it owns no freeable heap block"); return true; }
+    tk_texpr *args = tk_alloc(sizeof *args); if (!args) abort();
+    args[0] = a.as.value;
+    tk_type vt = { .tag = TK_TYPE_VOID };
+    *out = xok((tk_texpr){ .tag = TK_TEXPR_CALL, .type = vt, .as.call = { c.callee, args, 1 } });
+    return true;
+}
+
 static tk_texpr_result type_call(tk_call c, tk_env env, tk_type_table table) {
     tk_texpr_result lb;
     if (type_list_builtin(c, env, table, &lb)) return lb;   // teko::list::empty / push (generic)
+    if (type_mem_free(c, env, table, &lb)) return lb;       // teko::mem::free (manual dealloc — []T | class)
     tk_str name = c.callee.segments[c.callee.len - 1].name;
     // panic / exit — injected GLOBAL diverging builtins (legislator's ruling — NO `never` type).
     // panic(error | str) = the message; exit(<integer>) = the status code. Both terminate the
@@ -1310,7 +1337,7 @@ tk_texpr_result tk_type_struct_lit(tk_struct_lit sl, tk_type expected, tk_env en
         tk_type_result git = tk_resolve_type(gte, table, env.cur_ns);   // (#109 W1) ref_ns = the literal's enclosing namespace
         if (!git.ok) return xferr(git.as.error);
         if (git.as.value.tag != TK_TYPE_NAMED) return xerr("explicit type-arguments did not resolve to a struct instance");
-        if (expected.tag == TK_TYPE_NAMED && name_has_generic_base(expected.as.named.name, name)
+        if (expected.tag == TK_TYPE_NAMED && name_has_generic_base(expected.as.named.name, tk_name_last_segment(name))   // (#109 W3) BARE base — the generic instance name is bare
             && !tk_str_eq(expected.as.named.name, git.as.value.as.named.name))
             return xerr("the explicit type-arguments at construction disagree with the annotated type");
         expected = git.as.value;   // retarget below as if annotated
@@ -1322,7 +1349,7 @@ tk_texpr_result tk_type_struct_lit(tk_struct_lit sl, tk_type expected, tk_env en
         if (expected.tag != TK_TYPE_NAMED)
             return xerr("cannot infer the type arguments of a generic struct here — annotate it (e.g. `let x: Box<…> = …`)");
         tk_str mname = expected.as.named.name;
-        if (!name_has_generic_base(mname, name)) return xerr("struct literal does not match the annotated type");
+        if (!name_has_generic_base(mname, tk_name_last_segment(name))) return xerr("struct literal does not match the annotated type");   // (#109 W3) BARE base
         decl = tk_type_table_find(table, mname, (tk_str){0});   // (#109 W1) generic-instance lookup on a resolved name — no referencing ns
         if (!decl.ok) return xerr("internal: generic instance was not stamped");
         name = mname;
@@ -1343,7 +1370,7 @@ tk_texpr_result tk_type_struct_lit(tk_struct_lit sl, tk_type expected, tk_env en
         // (empty outside any method) — a purely inherited method keeps its ORIGINAL declaring
         // class (type_struct_methods), so a base factory constructing the base stays legal when
         // re-typed under a derived class. Structs are pure value data: their literals stay free.
-        if (!tk_str_eq(env.owner_type, name))
+        if (!tk_str_eq(tk_name_last_segment(env.owner_type), tk_name_last_segment(name)))   // (#109 W3) compare bare last-segments
             return xferr(tk_error_named("a class literal is only legal inside the class's own methods — construct it via a static factory", name));
         tk_fieldsvec_result eff = tk_effective_class_fields(decl.as.value.body.as.class_body, table);
         if (!eff.ok) return xferr(eff.as.error);

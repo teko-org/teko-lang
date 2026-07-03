@@ -38,7 +38,7 @@ static bool variant_member_by_name(tk_type subject_variant, tk_str last, tk_type
     if (subject_variant.tag != TK_TYPE_VARIANT) return false;
     for (size_t i = 0; i < subject_variant.as.variant.len; i += 1) {
         tk_type m = subject_variant.as.variant.members[i];
-        if (m.tag == TK_TYPE_NAMED && name_eq(m.as.named.name, last)) { *out = m; return true; }
+        if (m.tag == TK_TYPE_NAMED && name_eq(tk_name_last_segment(m.as.named.name), last)) { *out = m; return true; }   // (#109 W3) canonical member name → bare last-segment vs the bare pattern segment
     }
     return false;
 }
@@ -349,7 +349,7 @@ bool tk_exhaustive(tk_arm *arms, size_t n, tk_type subject, tk_type_table table,
         // NAMED (nominal) members match by name; non-nominal members (prim/byte/str/slice/error —
         // the `T | error` idiom) match by resolved-type equality against a bind arm.
         if (mem.tag == TK_TYPE_NAMED) {
-            if (!some_arm_names(arms, n, mem.as.named.name, table, ref_ns)) return false;
+            if (!some_arm_names(arms, n, tk_name_last_segment(mem.as.named.name), table, ref_ns)) return false;   // (#109 W3) canonical member name → bare, to match the arms' bare case names
         } else {
             if (!some_arm_covers_type(arms, n, mem, table, ref_ns)) return false;
         }

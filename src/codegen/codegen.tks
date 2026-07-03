@@ -233,24 +233,32 @@ fn emit_prim(buf: []byte, k: checker::PrimKind) -> []byte | error {
 // parameter is honored (`::` -> `__`) for the day the typed item carries provenance.
 // (C: `mangle_type_name`.)
 // ---------------------------------------------------------------------------
+// (#109 W3) append a (canonical) type NAME to a C-symbol buffer, collapsing each "::" → "__" so a
+// canonical "teko::emit::Reader" becomes the valid identifier fragment "teko__emit__Reader". The ONE
+// place the "::"→"__" rule lives — used by mangle_type_name AND every direct tk_base_/tk_vt_ concat, so
+// a decl and its every reference (fat-pointer/vtable included) agree on the same C symbol.
+fn cb_tysym(buf: []byte, name: str) -> []byte {
+    mut out = buf
+    mut i = 0
+    loop {
+        if i >= name.len { break }
+        if i + 1 < name.len && name[i] == b':' && name[i + 1] == b':' {
+            out = cb(out, "__")
+            i = i + 2
+        } else {
+            out = cb_byte(out, name[i])
+            i++
+        }
+    }
+    out
+}
 fn mangle_type_name(buf: []byte, namespace: str, name: str) -> []byte {
     mut out = cb(buf, "tk_t_")
     if namespace.len > 0 {
-        mut i = 0
-        loop {
-            if i >= namespace.len { break }
-            // collapse a "::" pair into "__"; copy any other byte verbatim.
-            if i + 1 < namespace.len && namespace[i] == b':' && namespace[i + 1] == b':' {
-                out = cb(out, "__")
-                i = i + 2
-            } else {
-                out = cb_byte(out, namespace[i])
-                i++
-            }
-        }
+        out = cb_tysym(out, namespace)
         out = cb(out, "__")
     }
-    cb_str(out, name)
+    cb_tysym(out, name)   // (#109 W3) the canonical NAME may itself be "ns::Name" → "ns__Name"
 }
 
 // (#49) a top-level user FUNCTION's C name = its namespace mangled (each `:` -> `_`) + `__` + the
@@ -291,21 +299,25 @@ fn cg_path_last(p: parser::Path) -> str {
 // cg_find_variant_decl — the TypeDecl for a VARIANT named `name` (its body is a union of
 // named members), or a `not found` error. (C: `cg_find_variant_decl`, which returned NULL.)
 fn cg_find_variant_decl(prog: checker::TProgram, name: str) -> parser::TypeDecl | error {
-    mut i = 0
-    loop {
-        if i >= prog.items.len { break }
-        match prog.items[i] {
-            parser::TypeDecl as d => {
-                match d.body {
-                    parser::VariantBody => { if d.name == name { return d } }
-                    _ => { }
-                }
-            }
-            _ => { }
+    // (#109 W3) delegate bare-or-canonical name resolution to cg_find_decl (single source of truth),
+    // then require a VariantBody. cg_find_decl matches exact ns::Name OR bare last-segment.
+    match cg_find_decl(prog, name) {
+        parser::TypeDecl as d => {
+            match d.body { parser::VariantBody => return d; _ => { } }
         }
-        i++
+        error => { }
     }
     error { message = "codegen: not a declared variant" }
+}
+
+// (#109 W3) canonicalize a (possibly BARE) type name to its declared "ns::Name" so a DIRECT type
+// typedef reference (`tk_t_<canonical>`) matches its definition. A name codegen builds by hand from
+// a syntactic path segment (e.g. a struct-init field's slot type) is bare; the declared type name is
+// canonical. Non-declared names (primitives `i64`, type-params `T`, `__g__` instances) have no decl
+// and pass through unchanged. Delegates to cg_find_decl (last-segment aware) — the single source of
+// truth every codegen predicate agrees on for bare→decl resolution.
+fn cg_canon_name(prog: checker::TProgram, name: str) -> str {
+    match cg_find_decl(prog, name) { parser::TypeDecl as d => d.name; error => name }
 }
 
 // cg_named_is_variant — is the NAMED type `name` a (declared) variant? (C: `cg_named_is_variant`.)
@@ -315,40 +327,20 @@ fn cg_named_is_variant(prog: checker::TProgram, name: str) -> bool {
 
 // cg_named_is_enum — is the NAMED type `name` a (declared) enum? (C: `cg_named_is_enum`.)
 fn cg_named_is_enum(prog: checker::TProgram, name: str) -> bool {
-    mut i = 0
-    loop {
-        if i >= prog.items.len { break }
-        match prog.items[i] {
-            parser::TypeDecl as d => {
-                if d.name == name {
-                    match d.body { parser::EnumBody => return true; _ => return false }
-                }
-            }
-            _ => { }
-        }
-        i++
+    match cg_find_decl(prog, name) {
+        parser::TypeDecl as d => match d.body { parser::EnumBody => true; _ => false }
+        error => false
     }
-    false
 }
 
 // (C8.4) cg_named_is_flags — is the NAMED type `name` a (declared) flags? A flags member is a
 // pre-emitted C constant `tk_t_<Name>_<MEMBER>` (power-of-2 unsigned int), not a C enum constant.
 // (C: `cg_named_is_flags`.)
 fn cg_named_is_flags(prog: checker::TProgram, name: str) -> bool {
-    mut i = 0
-    loop {
-        if i >= prog.items.len { break }
-        match prog.items[i] {
-            parser::TypeDecl as d => {
-                if d.name == name {
-                    match d.body { parser::FlagsBody => return true; _ => return false }
-                }
-            }
-            _ => { }
-        }
-        i++
+    match cg_find_decl(prog, name) {
+        parser::TypeDecl as d => match d.body { parser::FlagsBody => true; _ => false }
+        error => false
     }
-    false
 }
 
 // cg_find_decl — any TYPE_DECL (struct/variant/enum/alias) named `name`, or a `not found`
@@ -358,10 +350,68 @@ fn cg_find_decl(prog: checker::TProgram, name: str) -> parser::TypeDecl | error 
     loop {
         if i >= prog.items.len { break }
         match prog.items[i] {
-            parser::TypeDecl as d => { if d.name == name { return d } }
+            // (#109 W3) the typed decl names are CANONICAL "ns::Name"; match a bare-or-canonical `name`
+            // by exact OR by bare last-segment (unique in the no-collision case). ns-sensitive callers
+            // (emit_type_expr) use cg_find_decl_ns to disambiguate a same-bare-name collision.
+            parser::TypeDecl as d => { if d.name == name || checker::name_last_segment(d.name) == checker::name_last_segment(name) { return d } }
             _ => { }
         }
         i++
+    }
+    error { message = "codegen: no such type decl" }
+}
+
+// (#109 W3) resolve a SYNTACTIC type path to its decl using the referencing namespace `ref_ns`,
+// against the CANONICAL decl names — so a bare `Reader` in teko::emit binds emit::Reader (not
+// teko::io::Reader). Pass 1: a qualified path matches by last-segment + a decl-ns the qualifier
+// selects; a bare path matches its OWN-ns (ref_ns) decl. Pass 2 (fallback): any last-segment match.
+fn cg_find_decl_ns(prog: checker::TProgram, path: parser::Path, ref_ns: str) -> parser::TypeDecl | error {
+    // (#109 W3) the last segment may itself be a CANONICAL "ns::Name" stuffed into ONE segment —
+    // this is what type_to_texpr/mono_named_texpr produce for a resolved Named (e.g. a method's
+    // synthetic receiver `self: teko::checker::Sq`). Strip it to the bare last-segment for matching,
+    // and lift any embedded "::"-qualifier into `qual` so ns precision is preserved.
+    let last_raw = path.segments[path.segments.len - 1].name
+    let last = checker::name_last_segment(last_raw)
+    let embedded_qual = checker::name_qualifier(last_raw)   // "" when last_raw is already bare
+    let qualified = path.segments.len > 1 || embedded_qual.len > 0
+    mut qual = ""
+    if path.segments.len > 1 {
+        mut q: u64 = 0
+        loop {
+            if q >= path.segments.len - 1 { break }
+            if q == 0 { qual = path.segments[q].name } else { qual = qual ~ "::" ~ path.segments[q].name }
+            q++
+        }
+    } else {
+        qual = embedded_qual
+    }
+    mut i = 0
+    loop {
+        if i >= prog.items.len { break }
+        match prog.items[i] {
+            parser::TypeDecl as d => {
+                if checker::name_last_segment(d.name) == last {
+                    let dns = checker::name_qualifier(d.name)
+                    if qualified {
+                        if dns == qual || teko::runtime::str_ends_with(dns, "::" ~ qual) { return d }
+                    } else {
+                        if dns == ref_ns { return d }
+                    }
+                }
+            }
+            _ => { }
+        }
+        i++
+    }
+    // fallback: any last-segment match (a root-ns type, or the no-collision common case)
+    mut j = 0
+    loop {
+        if j >= prog.items.len { break }
+        match prog.items[j] {
+            parser::TypeDecl as d => { if checker::name_last_segment(d.name) == last { return d } }
+            _ => { }
+        }
+        j++
     }
     error { message = "codegen: no such type decl" }
 }
@@ -407,7 +457,9 @@ fn cg_subclass_reaches(prog: checker::TProgram, sub: str, want: str, depth: i64)
         parser::TypeDecl as td => match td.body {
             parser::ClassBody as cb => {
                 if !cb.has_base { return false }
-                if cb.base_name == want { return true }
+                // (#109 W3) `cb.base_name` is the BARE source `extends` name; `want` may be the
+                // CANONICAL "ns::Name" of a base-typed slot — compare by bare last-segment.
+                if checker::name_last_segment(cb.base_name) == checker::name_last_segment(want) { return true }
                 cg_subclass_reaches(prog, cb.base_name, want, depth - 1)
             }
             _ => false
@@ -622,7 +674,7 @@ fn cg_te_reaches_byvalue(prog: checker::TProgram, te: parser::TypeExpr, to: str,
             if cg_is_class_named(prog, base) { return false }
             // (S4) a generic-type USE reaches its concrete instance `Box__g__i64`, not the template.
             let y = if nt.args.len == 0 { base } else { cg_texpr_inst_name(base, nt.args) }
-            if y == to { return true }
+            if checker::name_last_segment(y) == checker::name_last_segment(to) { return true }   // (#109 W3) `to` (the decl name) is canonical; `y` a bare syntactic segment — compare bare
             cg_name_reaches_byvalue(prog, y, to, seen)
         }
         parser::OptionalType as ot => cg_te_reaches_byvalue(prog, ot.inner, to, seen)   // opt embeds inner by value
@@ -743,7 +795,7 @@ fn emit_type(buf: []byte, prog: checker::TProgram, t: checker::Type) -> []byte |
             // (#98) a POLYMORPHIC-BASE-typed slot is the fat pointer `tk_base_<name>` (data +
             // vtable), NOT the raw object pointer — so a Sub→Base upcast + base-typed dispatch
             // reuse the D3 fat pointer. (An interface-typed slot is likewise its fat typedef.)
-            if cg_is_polymorphic_base(prog, nm.name) { cb(cb(buf, "tk_base_"), nm.name) }
+            if cg_is_polymorphic_base(prog, nm.name) { cb_tysym(cb(buf, "tk_base_"), nm.name) }
             else if cg_is_class_named(prog, nm.name) { cb(mangle_type_name(buf, "", nm.name), " *") }
             else { mangle_type_name(buf, "", nm.name) }
         }
@@ -900,7 +952,7 @@ fn cg_opt_mangle_str(inner: checker::Type) -> str | error {
         checker::Char  => "char"
         checker::Str   => "str"
         checker::Error => "error"
-        checker::Named as nm => nm.name
+        checker::Named as nm => checker::name_last_segment(nm.name)   // (#109 W3) BARE key — matches the syntactic cg_opt_mangle_texpr_str; keeps tk_u_/tk_slice_/tk_opt_ names valid C identifiers
         checker::Optional as o => match o.inner {
             checker::Void => error { message = "codegen: nested bare-null optional (internal)" }
             // (2026-07-01) bind the recursive result FIRST — `concat` is now variadic, so its 2nd
@@ -1056,7 +1108,7 @@ fn cg_texpr_inst_name(base: str, args: []parser::TypeExpr) -> str {
     out
 }
 
-fn emit_type_expr(buf: []byte, prog: checker::TProgram, te: parser::TypeExpr) -> []byte | error {
+fn emit_type_expr(buf: []byte, prog: checker::TProgram, te: parser::TypeExpr, ref_ns: str) -> []byte | error {
     match te {
         parser::NamedType as nt => {
             let last = nt.path.segments[nt.path.segments.len - 1].name
@@ -1078,15 +1130,18 @@ fn emit_type_expr(buf: []byte, prog: checker::TProgram, te: parser::TypeExpr) ->
             else if last == "char"  { return cb(buf, "tk_char") }   // UTF-8 codepoint (byte-slice layout)
             else if last == "str"   { return cb(buf, "tk_str") }
             else if last == "error" { return cb(buf, "tk_error") }   // error → runtime tk_error struct (E2-NATIVE)
-            else if last == "ptr"   { if nt.args.len > 0 { return cb(match emit_type_expr(buf, prog, nt.args[0]) { []byte as o => o; error as e => return e }, " *") } else { return cb(buf, "void *") } }   // ptr<T> → <T> * ; ptr → void *
+            else if last == "ptr"   { if nt.args.len > 0 { return cb(match emit_type_expr(buf, prog, nt.args[0], ref_ns) { []byte as o => o; error as e => return e }, " *") } else { return cb(buf, "void *") } }   // ptr<T> → <T> * ; ptr → void *
             else if last == "uptr"  { return cb(buf, "uintptr_t") }  // (C7.1a) opaque word-size unsigned
-            else if last == "Ref"   { if nt.args.len > 0 { return cb(match emit_type_expr(buf, prog, nt.args[0]) { []byte as o => o; error as e => return e }, " *") } else { return error { message = "`Ref<T>` needs a type argument" } } }   // (MEM-1b) Ref<T> → <T> *
-            // a TRANSPARENT alias (`type Name = <type-expr>`) emits NO C type of its own —
-            // resolve through to the aliased type-expr at every use site (e.g. a field `[]TypeReg`
-            // → tk_slice_TypeReg). Matches the checker, which resolves aliases transparently.
-            match cg_find_decl(prog, last) {
+            else if last == "Ref"   { if nt.args.len > 0 { return cb(match emit_type_expr(buf, prog, nt.args[0], ref_ns) { []byte as o => o; error as e => return e }, " *") } else { return error { message = "`Ref<T>` needs a type argument" } } }   // (MEM-1b) Ref<T> → <T> *
+            // (#109 W3) resolve the SYNTACTIC path to its canonical decl in `ref_ns` — so a bare
+            // `Reader` in teko::emit binds emit::Reader (not io::Reader), and the decl's CANONICAL
+            // name (`teko::emit::Reader`) drives every mangle, matching the decl-side typedef.
+            let cdname = match cg_find_decl_ns(prog, nt.path, ref_ns) { parser::TypeDecl as d => d.name; error => last }
+            // a TRANSPARENT alias (`type Name = <type-expr>`) emits NO C type of its own — resolve
+            // through to the aliased type-expr at every use site. Matches the checker.
+            match cg_find_decl_ns(prog, nt.path, ref_ns) {
                 parser::TypeDecl as ad => match ad.body {
-                    parser::AliasBody as alb => return emit_type_expr(buf, prog, alb.alias)
+                    parser::AliasBody as alb => return emit_type_expr(buf, prog, alb.alias, ref_ns)
                     _ => { }
                 }
                 error => { }
@@ -1094,25 +1149,19 @@ fn emit_type_expr(buf: []byte, prog: checker::TProgram, te: parser::TypeExpr) ->
             // (S4) a generic-type USE `Box<i64>` → the concrete instance typedef `tk_t_Box__g__i64`
             // (the mangled name matches checker::generic_inst_name, so decl + ref agree).
             if nt.args.len > 0 { return mangle_type_name(buf, "", cg_texpr_inst_name(last, nt.args)) }
-            // (W10b.CLASS increment 3) a CLASS is a REFERENCE type (shared identity, arena-per-
-            // object) — every use lowers to a POINTER, unconditionally (unlike a struct, which is
-            // value/by-copy and only boxed at cycle-breaking back-edges — cg_field_boxed). This is
-            // the ONE place that decision fans out from: params, returns, fields, locals all call
-            // emit_type_expr, so a class becomes `tk_t_Name *` everywhere with no special-casing
-            // at each call site.
-            // (#98) a POLYMORPHIC-BASE-typed annotation (`s: Animal`, `-> Animal`, a field of base
-            // type) is the fat pointer `tk_base_<name>`, matching cg_emit_c_type — so a base-typed
-            // param/return/field reuses the D3 fat pointer. A sealed class stays a raw pointer.
-            if cg_is_polymorphic_base(prog, last) { return cb(cb(buf, "tk_base_"), last) }
-            match cg_find_decl(prog, last) {
+            // (W10b.CLASS increment 3) a CLASS is a REFERENCE type → a POINTER everywhere.
+            // (#98) a POLYMORPHIC-BASE-typed annotation is the fat pointer `tk_base_<name>` (data +
+            // vtable), matching cg_emit_c_type. (#109 W3) mangle the CANONICAL cdname (":: → __").
+            if cg_is_polymorphic_base(prog, cdname) { return cb_tysym(cb(buf, "tk_base_"), cdname) }
+            match cg_find_decl_ns(prog, nt.path, ref_ns) {
                 parser::TypeDecl as cd => match cd.body {
-                    parser::ClassBody => return cb(mangle_type_name(buf, "", last), " *")
+                    parser::ClassBody => return cb(mangle_type_name(buf, "", cdname), " *")
                     _ => {}
                 }
                 error => {}
             }
             // a user-defined named aggregate -> its mangled typedef name (matches emit_type).
-            mangle_type_name(buf, "", last)
+            mangle_type_name(buf, "", cdname)
         }
         // SLICE `[]T` in a signature / field position → the generated `tk_slice_<elem>` struct (the
         // same name cg_slice_typename produces from the resolved type, so decl + ref agree).
@@ -1636,6 +1685,41 @@ fn emit_list_push(buf: []byte, prog: checker::TProgram, e: checker::TExpr, c: ch
     out
 }
 
+// (mem::free ruling 2026-07-03) `teko::mem::free(x)` → a void GNU stmt-expr that RECLAIMS x's heap
+// block and SCRUBS the binding so a later read yields empty/null, never the freed buffer:
+//   * []T   → tk_free_block(x.ptr, x.len*sizeof(elem)) parks the backing buffer for same-size reuse,
+//             then `x = (tk_slice_<elem>){0}` (empty);
+//   * class → tk_region_drop(x->__region) drops the object's arena-per-object region (NULL-tolerant),
+//             then `x = NULL`.
+// The checker proved x is a MUTABLE VARIABLE of a heap type, so the scrub-assignment is a valid
+// lvalue write. Mirror of codegen.c::emit_mem_free.
+fn emit_mem_free(buf: []byte, prog: checker::TProgram, c: checker::TCall, escaping: []str, regions: []RegionFrame, fn_body: []checker::TStatement, dctx: DeferCtx) -> []byte | error {
+    let arg = c.args[0]
+    match arg.type {
+        checker::Slice as sl => {
+            mut out = cb(buf, "({ tk_free_block((void *)(")
+            out = match emit_expr_ctx(out, prog, checker::Void { }, arg, escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
+            out = cb(out, ").ptr, (")
+            out = match emit_expr_ctx(out, prog, checker::Void { }, arg, escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
+            out = cb(out, ").len * sizeof(")
+            out = match emit_type(out, prog, sl.element) { []byte as o => o; error as err => return err }
+            out = cb(out, ")); (")
+            out = match emit_expr_ctx(out, prog, checker::Void { }, arg, escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
+            out = cb(out, ") = (")
+            out = match cg_slice_typename(out, sl.element) { []byte as o => o; error as err => return err }
+            cb(out, "){0}; })")
+        }
+        checker::Named => {   // a class instance — drop its region, null the handle
+            mut out = cb(buf, "({ tk_region_drop((")
+            out = match emit_expr_ctx(out, prog, checker::Void { }, arg, escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
+            out = cb(out, ")->__region); (")
+            out = match emit_expr_ctx(out, prog, checker::Void { }, arg, escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
+            cb(out, ") = NULL; })")
+        }
+        _ => error { message = "codegen: mem::free on a non-heap type (internal — checker must gate)" }
+    }
+}
+
 // (W10b.D3) a DYNAMIC contract-method call through an interface value's vtable, as a GNU
 // statement-expression: bind the receiver ONCE (args[0] — a class instance is upcast on the fly
 // by emit_as, an interface value passes through), then cast slot `iface_slot`'s code pointer to
@@ -1648,7 +1732,11 @@ fn emit_iface_call(buf: []byte, prog: checker::TProgram, ret_type: checker::Type
     if p.segments.len < 2 || c.args.len == 0 || c.args.len != f.params.len {
         return error { message = "codegen: malformed interface-dispatch node (internal)" }
     }
-    let iface = p.segments[p.segments.len - 2].name
+    // (#109 W3) the callee path segment is the interface's BARE name; canonicalize it to the
+    // declared "ns::Iface" so the fat-pointer typedef (`tk_t_<canonical>`) and the (class,iface)
+    // vtable ref (`tk_vt_<Class>_<canonical>`) both key off the SAME C symbol their definitions use.
+    let iface_raw = p.segments[p.segments.len - 2].name
+    let iface = match cg_find_decl(prog, iface_raw) { parser::TypeDecl as d => d.name; error => iface_raw }
     let t = fresh_named("_tid", buf.len to i64)
     let iface_t = checker::Named { name = iface }
     mut out = cb(buf, "({ ")
@@ -1719,6 +1807,10 @@ fn emit_call(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, e: c
             return emit_list_push(buf, prog, e, c, escaping, regions, fn_body, dctx)
         }
         return error { message = "codegen: this teko::list builtin not yet supported (only empty/push — fixed+copy)" }
+    }
+    // teko::mem::free(x) — manual dealloc (the checker proved x is a mutable heap variable).
+    if p.segments.len >= 2 && p.segments[p.segments.len - 2].name == "mem" && p.segments[p.segments.len - 1].name == "free" {
+        return emit_mem_free(buf, prog, c, escaping, regions, fn_body, dctx)
     }
     // E2 (native): err_loc/err_typed adorn an error VALUE with diagnostic position/types.
     // `error` is now the full tk_error struct (E2-NATIVE), so these call tk_error_loc /
@@ -1848,6 +1940,8 @@ fn emit_call(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, e: c
             else if last == "cov_line_reset"  { builtin = "tk_cov_line_reset";  has_builtin = true }   // () -> void
             else if last == "cov_line"        { builtin = "tk_cov_line";        has_builtin = true }   // (u32) -> void
             else if last == "cov_line_hit"    { builtin = "tk_cov_line_hit";    has_builtin = true }   // (u64,u32) -> bool
+            else if last == "arena_push"      { builtin = "tk_arena_push";      has_builtin = true }   // (#109 test-gate memory) () -> void
+            else if last == "arena_pop"       { builtin = "tk_arena_pop";       has_builtin = true }   // () -> void
             // diverging runtime panic helpers (the corpus calls these by bare name)
             else if last == "panic_div0"     { builtin = "tk_panic_div0";     has_builtin = true }
             else if last == "panic_oob"      { builtin = "tk_panic_oob";      has_builtin = true }
@@ -1966,7 +2060,7 @@ fn emit_call(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, e: c
                                 if !arg_is_ref { out = cb(out, "&") }
                                 out = match emit_expr_ctx(out, prog, ret_type, c.args[j], escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
                             } else {
-                                out = match emit_as_r(out, prog, ret_type, checker::Named { name = pn }, c.args[j], escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
+                                out = match emit_as_r(out, prog, ret_type, checker::Named { name = cg_canon_name(prog, pn) }, c.args[j], escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
                             }
                             wrapped = true
                         }
@@ -1978,7 +2072,7 @@ fn emit_call(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, e: c
                         // type, which mangles identically to the param's inner (exact-match widen).
                         parser::OptionalType as ot => {
                             let inner_t = match ot.inner {
-                                parser::NamedType as int_nt => checker::Named { name = int_nt.path.segments[int_nt.path.segments.len - 1].name }
+                                parser::NamedType as int_nt => checker::Named { name = cg_canon_name(prog, int_nt.path.segments[int_nt.path.segments.len - 1].name) }
                                 _ => c.args[j].type
                             }
                             out = match emit_as_r(out, prog, ret_type, checker::Optional { inner = inner_t }, c.args[j], escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
@@ -2547,7 +2641,7 @@ fn cg_find_struct_field_type(prog: checker::TProgram, sname: str, fname: str) ->
         if i >= prog.items.len { break }
         match prog.items[i] {
             parser::TypeDecl as d => {
-                if d.name == sname {
+                if d.name == sname || checker::name_last_segment(d.name) == checker::name_last_segment(sname) {
                     match d.body {
                         parser::StructBody as sb => {
                             mut j = 0
@@ -2682,7 +2776,7 @@ fn emit_struct_init_literal(buf: []byte, prog: checker::TProgram, e: checker::TE
         let bxN = fresh_named("_bx", bxid)
         if boxed {
             out = cb(out, "({ ")
-            match fte_opt { parser::TypeExpr as fte => { out = match emit_type_expr(out, prog, fte) { []byte as o => o; error as err => return err } }; null => { } }
+            match fte_opt { parser::TypeExpr as fte => { out = match emit_type_expr(out, prog, fte, checker::name_qualifier(name)) { []byte as o => o; error as err => return err } }; null => { } }
             out = cb(out, " *"); out = cb(out, bxN)
             // MEM Step 1: frame-local boxes ride the frame region (`tk_region_alloc(<frame>, …)`),
             // freed at the function's exit edge; everything else rides root `tk_alloc` (safe leak).
@@ -2700,7 +2794,7 @@ fn emit_struct_init_literal(buf: []byte, prog: checker::TProgram, e: checker::TE
                 parser::TypeExpr as fte => match fte {
                     parser::OptionalType => {
                         out = cb(out, "(")
-                        out = match emit_type_expr(out, prog, fte) { []byte as o => o; error as err => return err }
+                        out = match emit_type_expr(out, prog, fte, checker::name_qualifier(name)) { []byte as o => o; error as err => return err }
                         out = cb(out, "){ .present = false }")
                         true
                     }
@@ -2715,7 +2809,7 @@ fn emit_struct_init_literal(buf: []byte, prog: checker::TProgram, e: checker::TE
                             parser::TypeExpr as fte => match fte {
                                 parser::SliceType as st => {
                                     out = cb(out, "(")
-                                    out = match emit_type_expr(out, prog, fte) { []byte as o => o; error as err => return err }
+                                    out = match emit_type_expr(out, prog, fte, checker::name_qualifier(name)) { []byte as o => o; error as err => return err }
                                     out = cb(out, "){ .ptr = 0, .len = 0 }")
                                     true
                                 }
@@ -2746,18 +2840,18 @@ fn emit_struct_init_literal(buf: []byte, prog: checker::TProgram, e: checker::TE
             mut exp_t: checker::Type = checker::Void { }
             match fte_opt {
                 parser::TypeExpr as fte => match fte {
-                    parser::NamedType as nt => { exp_t = checker::Named { name = nt.path.segments[nt.path.segments.len - 1].name } }
+                    parser::NamedType as nt => { exp_t = checker::Named { name = cg_canon_name(prog, nt.path.segments[nt.path.segments.len - 1].name) } }
                     parser::SliceType as st => match st.element {
                         parser::NamedType as ent => {
                             let elem = ent.path.segments[ent.path.segments.len - 1].name
-                            if !cg_is_prim_name(elem) { exp_t = checker::Slice { element = checker::Named { name = elem } } }
+                            if !cg_is_prim_name(elem) { exp_t = checker::Slice { element = checker::Named { name = cg_canon_name(prog, elem) } } }
                         }
                         _ => { }
                     }
                     // a present value into a `T?` field (T named) → emit_as wraps T → T?
                     // ({ .present = true, .value = … }). (A bare `null` is the sentinel branch above.)
                     parser::OptionalType as ot => match ot.inner {
-                        parser::NamedType as inner_nt => { exp_t = checker::Optional { inner = checker::Named { name = inner_nt.path.segments[inner_nt.path.segments.len - 1].name } } }
+                        parser::NamedType as inner_nt => { exp_t = checker::Optional { inner = checker::Named { name = cg_canon_name(prog, inner_nt.path.segments[inner_nt.path.segments.len - 1].name) } } }
                         _ => { }
                     }
                     _ => { }
@@ -3011,7 +3105,7 @@ fn cg_var_mtype(prog: checker::TProgram, v: checker::Type, i: i64) -> checker::T
                 _ => return checker::Void { }
             }
             match members[i] {
-                parser::NamedType as nt => checker::Named { name = nt.path.segments[nt.path.segments.len - 1].name }
+                parser::NamedType as nt => checker::Named { name = cg_canon_name(prog, nt.path.segments[nt.path.segments.len - 1].name) }
                 _ => checker::Void { }
             }
         }
@@ -3095,7 +3189,7 @@ fn cg_wrap_open(buf: []byte, v: checker::Type, mkey: str) -> []byte | error {
             mut out = cb(buf, "(")
             out = mangle_type_name(out, "", nm.name)
             out = cb(out, "){ .tag = TK_TAG_")
-            out = cb_upper(out, nm.name)
+            out = cb_upper(out, checker::name_last_segment(nm.name))   // (#109 W3) BARE variant name for the TK_TAG_ constant
             out = cb(out, "_")
             out = cb_upper(out, mkey)
             out = cb(out, ", .as.")
@@ -3223,9 +3317,9 @@ fn cg_wrap_elem_str(buf: []byte, prog: checker::TProgram, expected: checker::Typ
                             o = cb(o, "){ .data = (void *)(")
                             o = cb(o, cexpr)
                             o = cb(o, "), .vtable = tk_vt_")
-                            o = cb(o, vn.name)
+                            o = cb_tysym(o, vn.name)
                             o = cb(o, "_")
-                            o = cb(o, en.name)
+                            o = cb_tysym(o, en.name)
                             return cb(o, " }")
                         }
                     }
@@ -3578,9 +3672,9 @@ fn emit_as_r(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, expe
                                 io = cb(io, ")")
                             }
                             io = cb(io, ", .vtable = tk_vt_")
-                            io = cb(io, vn.name)
+                            io = cb_tysym(io, vn.name)
                             io = cb(io, "_")
-                            io = cb(io, en.name)
+                            io = cb_tysym(io, en.name)
                             return cb(io, " }")
                         }
                     }
@@ -3606,10 +3700,10 @@ fn emit_as_r(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, expe
                             let is_strict_sub = bvn.name != ben.name && cg_subclass_reaches(prog, bvn.name, ben.name, 64)
                             let is_raw_self = bvn.name == ben.name && match value.kind { checker::TStructInit => true; _ => false }
                             if is_strict_sub || is_raw_self {
-                                mut bo = cb(cb(buf, "(tk_base_"), ben.name)
+                                mut bo = cb_tysym(cb(buf, "(tk_base_"), ben.name)
                                 bo = cb(bo, "){ .data = (void *)(")
                                 bo = match emit_expr_ctx(bo, prog, ret_type, value, escaping, regions, fn_body, dctx) { []byte as r => r; error as err => return err }
-                                bo = cb(cb(cb(cb(bo, "), .vtable = tk_vt_"), bvn.name), "_"), ben.name)
+                                bo = cb_tysym(cb(cb_tysym(cb(bo, "), .vtable = tk_vt_"), bvn.name), "_"), ben.name)
                                 return cb(bo, " }")
                             }
                         }
@@ -3785,7 +3879,10 @@ fn emit_pat_test(buf: []byte, prog: checker::TProgram, pat: parser::Pattern, sub
             // IS that variant, so the test is unconditionally true (any gating .present check is
             // upstream); the bind copies the whole value (cg_emit_pat_binds).
             let bind_whole = match variantT {
-                checker::Named as nm => (!bp0.is_slice) && (cg_path_last(bp0.type_name) == nm.name)
+                // (#109 W3) the pattern's type name is BARE; the variant's `nm.name` is CANONICAL
+                // "ns::Type" — compare by bare last-segment so `Type as t` over an optional `Type?`
+                // is still recognized as a WHOLE-value bind (not a spurious case-select of member "Type").
+                checker::Named as nm => (!bp0.is_slice) && (cg_path_last(bp0.type_name) == checker::name_last_segment(nm.name))
                 _ => false
             }
             if bind_whole { return cb(buf, "1") }
@@ -3793,7 +3890,7 @@ fn emit_pat_test(buf: []byte, prog: checker::TProgram, pat: parser::Pattern, sub
             // enum constant `TK_E_<ENUM>_<MEMBER>` (matches emit_type_decl's enum emission).
             let is_enum = match variantT { checker::Named as nm => cg_named_is_enum(prog, nm.name); _ => false }
             if is_enum {
-                let ename = match variantT { checker::Named as nm => nm.name; _ => "" }
+                let ename = match variantT { checker::Named as nm => checker::name_last_segment(nm.name); _ => "" }   // (#109 W3) BARE enum name for the TK_E_ constant
                 mut oe = cb(buf, "(")
                 oe = cb(oe, subj)
                 oe = cb(oe, " == TK_E_")
@@ -3853,7 +3950,7 @@ fn cg_kind_descend(prog: checker::TProgram, subjT: checker::Type, pat: parser::P
         i++
     }
     let fte = match kfte { null => return null; parser::TypeExpr as t => t }
-    let vname = match fte { parser::NamedType as nt => cg_path_last(nt.path); _ => return null }
+    let vname = match fte { parser::NamedType as nt => cg_canon_name(prog, cg_path_last(nt.path)); _ => return null }
     if !cg_named_is_variant(prog, vname) { return null }
     let v = checker::Named { name = vname }
     // the pattern must select a CASE of V (not a field-destructure of the struct itself).
@@ -4010,7 +4107,7 @@ fn cg_emit_pat_binds(buf: []byte, prog: checker::TProgram, pat: parser::Pattern,
                             // A bind whose type IS the inner variant itself (`TypeExpr as t` over
                             // `TypeExpr?`) binds the WHOLE present value, not a `.as.<case>` member.
                             let bind_whole = match opt.inner {
-                                checker::Named as nm => (!bp.is_slice) && (cg_path_last(bp.type_name) == nm.name)
+                                checker::Named as nm => (!bp.is_slice) && (cg_path_last(bp.type_name) == checker::name_last_segment(nm.name))   // (#109 W3) BARE compare (pattern bare vs canonical variant name)
                                 _ => false
                             }
                             if bind_whole {
@@ -4047,7 +4144,7 @@ fn cg_emit_pat_binds(buf: []byte, prog: checker::TProgram, pat: parser::Pattern,
     match pat {
         parser::BindPattern as bp => {
             let bind_whole = match subjT {
-                checker::Named as nm => (!bp.is_slice) && (cg_path_last(bp.type_name) == nm.name)
+                checker::Named as nm => (!bp.is_slice) && (cg_path_last(bp.type_name) == checker::name_last_segment(nm.name))   // (#109 W3) BARE compare (pattern bare vs canonical variant name)
                 _ => false
             }
             if bind_whole {
@@ -4544,7 +4641,7 @@ fn emit_expr_ctx(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, 
                 cb_upper(out, pe.member)
             } else {
                 mut out = cb(buf, "TK_E_")
-                out = cb_upper(out, pe.enum_name)
+                out = cb_upper(out, checker::name_last_segment(pe.enum_name))   // (#109 W3) BARE enum name — the C enum constant is TK_E_<UPPER bare enum>_<UPPER member>, consistent decl+use
                 out = cb(out, "_")
                 cb_upper(out, pe.member)
             }
@@ -5291,7 +5388,7 @@ fn emit_function_sig(buf: []byte, prog: checker::TProgram, f: checker::TFunction
         loop {
             if i >= f.params.len { break }
             if i > 0 { out = cb(out, ", ") }
-            out = match emit_type_expr(out, prog, f.params[i].type_ann) { []byte as o => o; error as err => return err }
+            out = match emit_type_expr(out, prog, f.params[i].type_ann, f.namespace) { []byte as o => o; error as err => return err }   // (#109 W3) ref_ns = the fn's declaring ns
             out = cb(out, " ")
             out = cb_ident(out, f.params[i].name)
             i++
@@ -5463,7 +5560,7 @@ fn emit_type_decl(buf: []byte, prog: checker::TProgram, d: parser::TypeDecl) -> 
             loop {
                 if i >= sb.fields.len { break }
                 out = cb(out, "    ")
-                out = match emit_type_expr(out, prog, sb.fields[i].type_ann) { []byte as o => o; error as err => return err }
+                out = match emit_type_expr(out, prog, sb.fields[i].type_ann, checker::name_qualifier(d.name)) { []byte as o => o; error as err => return err }   // (#109 W3) ref_ns = the decl's own ns
                 out = cb(out, " ")
                 // auto-box: a recursive back-edge field is a heap pointer (finite C struct).
                 if cg_field_boxed(prog, d.name, sb.fields[i].type_ann) { out = cb(out, "*") }
@@ -5488,7 +5585,7 @@ fn emit_type_decl(buf: []byte, prog: checker::TProgram, d: parser::TypeDecl) -> 
             loop {
                 if i >= fields.len { break }
                 out = cb(out, "    ")
-                out = match emit_type_expr(out, prog, fields[i].type_ann) { []byte as o => o; error as err => return err }
+                out = match emit_type_expr(out, prog, fields[i].type_ann, checker::name_qualifier(d.name)) { []byte as o => o; error as err => return err }   // (#109 W3) ref_ns = the decl's own ns
                 out = cb(out, " ")
                 if cg_field_boxed(prog, d.name, fields[i].type_ann) { out = cb(out, "*") }
                 out = cb_str(out, fields[i].name)
@@ -5556,7 +5653,7 @@ fn emit_type_decl(buf: []byte, prog: checker::TProgram, d: parser::TypeDecl) -> 
                 let mem = members[j]
                 let mk = match cg_member_key_texpr_str(mem) { str as s => s; error as err => return err }
                 out = cb(out, "        ")
-                out = match emit_type_expr(out, prog, mem) { []byte as o => o; error as err => return err }
+                out = match emit_type_expr(out, prog, mem, checker::name_qualifier(d.name)) { []byte as o => o; error as err => return err }   // (#109 W3) ref_ns = the decl's own ns
                 out = cb(out, " ")
                 out = cb_str(out, mk)   // union field == the member key
                 out = cb(out, ";\n")
@@ -5574,7 +5671,7 @@ fn emit_type_decl(buf: []byte, prog: checker::TProgram, d: parser::TypeDecl) -> 
             loop {
                 if i >= eb.members.len { break }
                 out = cb(out, "    TK_E_")
-                out = cb_upper(out, d.name)
+                out = cb_upper(out, checker::name_last_segment(d.name))   // (#109 W3) BARE enum name
                 out = cb(out, "_")
                 out = cb_upper(out, eb.members[i])
                 if i + 1 < eb.members.len { out = cb(out, ",") }
@@ -5960,7 +6057,18 @@ fn cg_str_in(xs: []str, s: str) -> bool {
     false
 }
 // Has the named decl `name` been emitted? (a builtin/scalar not in our set has no edge → ready.)
-fn cg_named_emitted(em: CgEmitted, name: str) -> bool { cg_str_in(em.names, name) }
+// (#109 W3) em.names holds CANONICAL emitted decl names; a readiness probe (cg_texpr_ready) passes a
+// BARE syntactic field segment. Match by bare last-segment so decl+dep agree regardless of ns form.
+fn cg_named_emitted(em: CgEmitted, name: str) -> bool {
+    let want = checker::name_last_segment(name)
+    mut i = 0
+    loop {
+        if i >= em.names.len { break }
+        if checker::name_last_segment(em.names[i]) == want { return true }
+        i++
+    }
+    false
+}
 // Has the optional whose inner mangles to `key` been emitted? (no matching node → no edge.)
 fn cg_opt_emitted_key(em: CgEmitted, set: CgTypeSet, key: str) -> bool {
     // an optional inner not present in the program's collected set carries no edge → ready.
@@ -6249,7 +6357,12 @@ fn cg_emit_types_ordered(buf: []byte, prog: checker::TProgram) -> []byte | error
         loop {
             if ni >= named.len { break }
             let d = named[ni]
-            if cg_named_emitted(em, d.name) { ni++ } else {
+            // (#109 W3) SELF-check uses EXACT canonical membership (not last-segment): `d.name` and
+            // `em.names` are both canonical "ns::Name", so two same-last-segment types across
+            // namespaces (`io::Reader` vs `emit::Reader`) are DISTINCT nodes — else emitting one marks
+            // the other "already emitted" (last-segment collision), it is never emitted, `remaining`
+            // never reaches 0, and the fixpoint falsely reports a cyclic value-type dependency.
+            if cg_str_in(em.names, d.name) { ni++ } else {
                 if !cg_named_ready(prog, em, set, d) { ni++ } else {
                     out = match emit_type_decl(out, prog, d) { []byte as o => o; error as err => return err }
                     em = CgEmitted { names = teko::list::push(em.names, d.name); opt_keys = em.opt_keys; uvar_keys = em.uvar_keys }
@@ -6735,7 +6848,7 @@ fn tk_emit_c(prog0: checker::TProgram) -> str | error {
                         // slot lowers to. (A sealed class needs none — it is never a base.)
                         match fcb.kind {
                             parser::ClassKind::Sealed => {}
-                            _ => { b = cb(cb(cb(b, "typedef struct { void *data; void *const *vtable; } tk_base_"), d.name), ";\n") }
+                            _ => { b = cb(cb_tysym(cb(b, "typedef struct { void *data; void *const *vtable; } tk_base_"), d.name), ";\n") }
                         }
                     }
                     // (W10b.D3) an INTERFACE (contract) value is a data+vtable FAT POINTER — the
@@ -6806,9 +6919,9 @@ fn tk_emit_c(prog0: checker::TProgram) -> str | error {
                                 if idd_is_iface && checker::type_conforms_to(cd.name, idd.name, vt_table) {
                                     let ms = match checker::iface_methods_by_name(idd.name, vt_table) { []parser::Function as f => f; error => return error { message = "codegen: interface method list failed (internal)" } }
                                     b = cb(b, "static void *const tk_vt_")
-                                    b = cb(b, cd.name)
+                                    b = cb_tysym(b, cd.name)
                                     b = cb(b, "_")
-                                    b = cb(b, idd.name)
+                                    b = cb_tysym(b, idd.name)
                                     b = cb(b, "[] = {")
                                     if ms.len == 0 { b = cb(b, " (void *)0") }   // a methodless contract still gets a (never-indexed) one-slot table
                                     mut vmi: u64 = 0
@@ -6833,7 +6946,7 @@ fn tk_emit_c(prog0: checker::TProgram) -> str | error {
                                 let cd_is_a = cd.name == idd.name || cg_subclass_reaches(prog, cd.name, idd.name, 64)
                                 if idd_is_poly_base && cd_is_a {
                                     let bms = match checker::base_vtable_methods(idd.name, vt_table) { []parser::Function as f => f; error => return error { message = "codegen: base method list failed (internal)" } }
-                                    b = cb(cb(cb(cb(b, "static void *const tk_vt_"), cd.name), "_"), idd.name)
+                                    b = cb_tysym(cb(cb_tysym(cb(b, "static void *const tk_vt_"), cd.name), "_"), idd.name)
                                     b = cb(b, "[] = {")
                                     if bms.len == 0 { b = cb(b, " (void *)0") }
                                     mut bvmi: u64 = 0

@@ -7,19 +7,55 @@ use teko::parser
 type TypeReg   = struct { name: str; namespace: str; vis: parser::Visibility; decl: parser::TypeDecl }
 pub type TypeTable = []TypeReg
 
+// (#109 W3) the CANONICAL name of a type: "ns::Name" (bare "Name" at the root ns). The semantic
+// `Named.name` carries THIS — so two same-bare-name public types in different namespaces (teko::io::
+// Reader vs teko::emit::Reader) are DISTINCT identities (type_eq) and DISTINCT C mangles. Builtins,
+// type-params, and generic `__g__` instances stay bare (ns == "" → returns the name unchanged).
+pub fn qualify(ns: str, name: str) -> str {
+    if ns == "" { name } else { ns ~ "::" ~ name }
+}
+// (#109 W3) the bare last "::"-segment of a (possibly canonical) name: "teko::emit::Reader" → "Reader",
+// "Reader" → "Reader". Manual byte-loop (mirrors class_name_from_method_ns), since last_index_of is a
+// host-only FFI edge unavailable to the VM-interpreted checker.
+pub fn name_last_segment(name: str) -> str {
+    mut last_sep: i64 = -1
+    mut i: u64 = 0
+    loop {
+        if i + 1 >= name.len { break }
+        if name[i] == b':' && name[i + 1] == b':' { last_sep = i to i64 }
+        i++
+    }
+    if last_sep < 0 { return name }
+    teko::runtime::str_slice_from(name, (last_sep to u64) + 2)
+}
+// (#109 W3) the namespace qualifier of a canonical name (everything before the final "::"):
+// "teko::emit::Reader" → "teko::emit"; "Reader" → "".
+pub fn name_qualifier(name: str) -> str {
+    mut last_sep: i64 = -1
+    mut i: u64 = 0
+    loop {
+        if i + 1 >= name.len { break }
+        if name[i] == b':' && name[i + 1] == b':' { last_sep = i to i64 }
+        i++
+    }
+    if last_sep < 0 { return "" }
+    teko::runtime::str_slice_to(name, last_sep to u64)
+}
+
 // find a user type by name; error if not registered.
-// (#109) `ref_ns` = the REFERENCING namespace (the namespace of the code that wrote this type
-// reference). This is the RESOLVED-NAME probe: a flat name lookup, IGNORING ref_ns. It is used by
-// the ~31 internal probes that walk ALREADY-RESOLVED names (bare Named{...} in the Type model — no
-// path, no namespace to check). The namespace-aware SOURCE-reference sites (resolve_named,
-// resolve_generic_inst) call resolve_type_ref instead, applying R0-R5 over the full path.
+// (#109 W3) `name` may be a CANONICAL "ns::Name" (a resolved Named.name) OR a bare source name. The
+// table entry may carry (bare name + real ns) [the typing collect table] OR (canonical name + "")
+// [the codegen/vm type_table_of re-collection]. Match when the entry's name equals `name` directly
+// OR when its qualified form qualify(ns, name) equals `name` — covering every combination. ref_ns is
+// unused (a resolved-name probe is namespace-blind; the SOURCE-reference sites use resolve_type_ref).
 fn type_table_find(table: TypeTable, name: str, ref_ns: str) -> parser::TypeDecl | error {
-    // (#109) ref_ns is intentionally unused here — a resolved-name probe is namespace-blind. Every
-    // caller of THIS function passes ref_ns = "" (a resolved Named carries no source path/qualifier).
     mut i = 0
     loop {
         if i >= table.len { break }
-        if table[i].name == name { return table[i].decl }
+        // (#109 W3) exact; OR the entry's qualified form == a canonical query; OR the entry's bare
+        // last-segment == a bare query (a bare decl field like `base_name` probing a CANONICAL-keyed
+        // type_table_of table). A canonical query still distinguishes via the qualify branch.
+        if table[i].name == name || qualify(table[i].namespace, table[i].name) == name || name_last_segment(table[i].name) == name { return table[i].decl }
         i++
     }
     error { message = "not a user type" }
@@ -72,7 +108,9 @@ fn type_ns_of(table: TypeTable, name: str) -> str {
     mut i: u64 = 0
     loop {
         if i >= table.len { break }
-        if table[i].name == name { return table[i].namespace }
+        // (#109 W3) `name` may be a CANONICAL "ns::Name" (a resolved Named.name) or a bare stamped
+        // `__g__` instance — match exact OR by the entry's qualified form (like type_table_find).
+        if table[i].name == name || qualify(table[i].namespace, table[i].name) == name { return table[i].namespace }
         i++
     }
     ""
@@ -273,7 +311,10 @@ fn resolve_named(path: parser::Path, table: TypeTable, ref_ns: str) -> Type | er
                 // (W10b.D3) an interface IS a value type now — a contract-typed value (data + vtable
                 // fat pointer, the tk_closure-shaped rep). It resolves NOMINALLY like any other named
                 // type; the upcast/dispatch rules live in widens_into + the method-call typer.
-                _                       => return Named { name = name }
+                // (#109 W3) the Named carries the CANONICAL "ns::Name" (the resolved decl's own ns) so
+                // same-bare-name types across namespaces are distinct identities + C mangles. A stamped
+                // generic `__g__` instance is already globally unique → it stays BARE (matching type_item).
+                _                       => return if name_is_g_instance(name) { Named { name = name } } else { Named { name = qualify(type_ref_ns(path, table, ref_ns), name) } }
             }
         }
         // R3/R4 fail-loud diagnostics (cross-namespace collision, ambiguity) propagate verbatim;
@@ -427,7 +468,7 @@ pub fn subclass_reaches(sub: str, want: str, table: TypeTable, depth: i64) -> bo
         error => return false
     }
     if !cb.has_base { return false }
-    if cb.base_name == want { return true }
+    if name_last_segment(cb.base_name) == name_last_segment(want) { return true }   // (#109 W3) base_name is a bare source name; `want` may be canonical — compare bare
     subclass_reaches(cb.base_name, want, table, depth - 1)
 }
 
@@ -452,7 +493,7 @@ fn iface_extends_reaches(sub: str, want: str, table: TypeTable, depth: i64) -> b
     mut i: u64 = 0
     loop {
         if i >= ib.extends.len { break }
-        if ib.extends[i] == want { return true }
+        if name_last_segment(ib.extends[i]) == name_last_segment(want) { return true }   // (#109 W3) extends is a bare source name; `want` may be canonical — compare bare
         if iface_extends_reaches(ib.extends[i], want, table, depth - 1) { return true }
         i++
     }
@@ -486,7 +527,7 @@ pub fn type_conforms_to(name: str, iface: str, table: TypeTable) -> bool {
         mut i: u64 = 0
         loop {
             if i >= impls.len { break }
-            if impls[i] == iface { return true }
+            if name_last_segment(impls[i]) == name_last_segment(iface) { return true }   // (#109 W3) implements is a bare source name; `iface` may be canonical — compare bare
             if iface_extends_reaches(impls[i], iface, table, 64) { return true }
             i++
         }
@@ -777,6 +818,26 @@ fn prim_name(k: PrimKind) -> str {
 // surface spelling (i64/…), Str/Byte/Error/Void/Ptr/Uptr → fixed words, Named → the name, Slice →
 // "slice_"+elem, Optional → "opt_"+inner. Total — always yields a symbol-safe fragment. Shared by
 // resolve (type instantiation) and the mono pass so a use and its stamped decl agree byte-for-byte.
+// (#109 W3) a symbol-safe fragment of a canonical name: each "::" → "__". Keeps a generic-instance
+// name (Gen__g__teko__emit__Reader) a valid C identifier AND distinct from Gen<teko::io::Reader> —
+// name_last_segment would collide the two. Slice-based (no byte-append-to-str primitive exists).
+pub fn mangle_ns_frag(name: str) -> str {
+    mut out = ""
+    mut start: u64 = 0
+    mut i: u64 = 0
+    loop {
+        if i + 1 >= name.len { break }
+        if name[i] == b':' && name[i + 1] == b':' {
+            out = out ~ teko::runtime::str_slice(name, start, i) ~ "__"
+            i = i + 2
+            start = i
+        } else {
+            i++
+        }
+    }
+    out ~ teko::runtime::str_slice_from(name, start)
+}
+
 // (C: tk_type_mangle.)
 pub fn type_mangle(t: Type) -> str {
     match t {
@@ -784,7 +845,7 @@ pub fn type_mangle(t: Type) -> str {
         Str           => "str"
         Byte          => "byte"
         Char          => "char"
-        Named as n    => n.name
+        Named as n    => name_last_segment(n.name)   // (#109 W3) BARE last-segment — slice/opt/generic-inst suffixes stay bare (matching the syntactic cg_opt_mangle_texpr/cg_texpr_inst_name); only DIRECT tk_t_ typedefs (mangle_type_name) carry the canonical ns where the io/emit Reader collision needs distinguishing.
         Slice as sl   => teko::str::concat("slice_", type_mangle(sl.element))
         Optional as o => teko::str::concat("opt_", type_mangle(o.inner))
         Error         => "error"
@@ -894,7 +955,7 @@ pub fn type_render(t: Type) -> str {
         Str           => "str"
         Error         => "error"
         Void          => "void"
-        Named as n    => n.name
+        Named as n    => name_last_segment(n.name)   // (#109 W3) canonical "ns::Name" → bare "Name" for readable diagnostics
         Slice as s    => match s.element { Void => "[]_"; _ => $"[]{type_render(s.element)}" }
         Optional as o => match o.inner   { Void => "_?";  _ => $"{type_render(o.inner)}?" }
         Variant as v  => render_members(v.members)

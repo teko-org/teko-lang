@@ -27,6 +27,13 @@ tk_decl_result tk_type_table_find(tk_type_table table, tk_str name, tk_str ref_n
 // (#109 W2) the declaring namespace of a type by its (resolved) name ("" if unknown) — so a field /
 // method-sig source annotation resolves in the type's OWN namespace. Shared with collect.c, typer.c, match.c.
 tk_str type_ns_of(tk_type_table table, tk_str name);
+// (#109 W3) canonical-name helpers — the semantic Named.name is now "ns::Name". Shared across the
+// checker/codegen/vm twins. qualify: (ns,name)→"ns::Name" (bare at root); name_last_segment: the bare
+// tail after the final "::"; name_qualifier: the ns before it; mangle_ns_frag: "::"→"__" symbol fragment.
+tk_str tk_qualify(tk_str ns, tk_str name);
+tk_str tk_name_last_segment(tk_str name);
+tk_str tk_name_qualifier(tk_str name);
+tk_str tk_mangle_ns_frag(tk_str name);
 tk_type_result tk_resolve_type(tk_type_expr te, tk_type_table table, tk_str ref_ns);
 // (S4) extend the table with generic type-params as OPAQUE nominal types (see resolve.c). Used by
 // collect (func sigs), check_modules (vis check), and typer (bodies). Empty → table unchanged.

@@ -577,7 +577,7 @@ static tk_tfunction_result type_method(tk_function f, tk_str struct_name, tk_env
     for (size_t i = 0; i < f.nparams; i += 1) {
         tk_type pt;
         if (!f.params[i].has_type) {
-            pt = (tk_type){ .tag = TK_TYPE_NAMED, .as.named = { struct_name } };
+            pt = (tk_type){ .tag = TK_TYPE_NAMED, .as.named = { tk_qualify(env.cur_ns, struct_name) } };   /* (#109 W3) canonical: the method's own ns qualifies its receiver type */
         } else {
             tk_type_result ptr = tk_resolve_type(f.params[i].type_ann, tbl, env.cur_ns);   // (#109 W1) ref_ns = the method's enclosing namespace
             if (!ptr.ok) return (tk_tfunction_result){ .ok = false, .as.error = ptr.as.error };
@@ -594,7 +594,7 @@ static tk_tfunction_result type_method(tk_function f, tk_str struct_name, tk_env
         local = tk_env_define(local, f.params[i].name, pt, false);
     }
     if (inject_base_binding)
-        local = tk_env_define(local, base_binding_name, (tk_type){ .tag = TK_TYPE_NAMED, .as.named = { base_name } }, false);
+        local = tk_env_define(local, base_binding_name, (tk_type){ .tag = TK_TYPE_NAMED, .as.named = { tk_qualify(env.cur_ns, base_name) } }, false);   /* (#109 W3) canonical: base type qualified by the class's own ns */
     tk_type ret = function_return(f, tbl, env.cur_ns);   // (#109 W1) ref_ns = the fn's enclosing namespace
     if (ret.tag == TK_TYPE_REF)
         return (tk_tfunction_result){ .ok = false, .as.error = tk_error_make("a function cannot return a reference (pass-down only)") };
@@ -629,13 +629,13 @@ static tk_tfunction_result type_method(tk_function f, tk_str struct_name, tk_env
     tk_tstatement *body = tb.as.value.stmts;
     size_t nbody = tb.as.value.n;
     if (inject_base_binding) {
-        tk_texpr self_var = (tk_texpr){ .tag = TK_TEXPR_VAR, .type = (tk_type){ .tag = TK_TYPE_NAMED, .as.named = { struct_name } }, .line = 0, .col = 0 };
+        tk_texpr self_var = (tk_texpr){ .tag = TK_TEXPR_VAR, .type = (tk_type){ .tag = TK_TYPE_NAMED, .as.named = { tk_qualify(env.cur_ns, struct_name) } }, .line = 0, .col = 0 };   /* (#109 W3) canonical: self's concrete subclass type qualified by the method's ns */
         self_var.as.var = (typeof(self_var.as.var)){ .name = f.params[0].name, .is_func = false, .func_ns = (tk_str){0} };
         tk_tstatement bind_stmt = { .tag = TK_TSTMT_BINDING };
         bind_stmt.as.binding.kind = TK_BIND_LET;
         bind_stmt.as.binding.target.tag = TK_BIND_SIMPLE;
         bind_stmt.as.binding.target.as.simple.name = base_binding_name;
-        bind_stmt.as.binding.bound = (tk_type){ .tag = TK_TYPE_NAMED, .as.named = { base_name } };
+        bind_stmt.as.binding.bound = (tk_type){ .tag = TK_TYPE_NAMED, .as.named = { tk_qualify(env.cur_ns, base_name) } };   /* (#109 W3) canonical: base bound type qualified by the class's own ns */
         bind_stmt.as.binding.value = self_var;
         tk_tstatement *new_body = tk_alloc((nbody + 1) * sizeof *new_body);
         new_body[0] = bind_stmt;
@@ -732,7 +732,14 @@ tk_titem_result tk_type_item(tk_item item, tk_env env, tk_type_table table) {
             tf.as.value.col  = item.as.function.col;
             return (tk_titem_result){ .ok = true, .as.value = { .tag = TK_TITEM_FUNCTION, .as.function = tf.as.value } };
         }
-        case TK_ITEM_TYPE_DECL: return (tk_titem_result){ .ok = true, .as.value = { .tag = TK_TITEM_TYPE_DECL, .as.type_decl = tk_normalize_inst_decl(item.as.type_decl, table) } };   // (W9.4) `Gen<i64>` member refs → bare stamped `Gen__g__i64` (no-op when none)
+        case TK_ITEM_TYPE_DECL: {
+            // (#109 W3) CANONICALIZE the decl name to "ns::Name" (codegen emits a namespace-distinct
+            // typedef matching the canonical Named.name at every USE). A `__g__` instance keeps its bare
+            // globally-unique name. Resolution stays bare-keyed (this mutates the TYPED program only).
+            tk_type_decl td = item.as.type_decl;
+            if (!tk_name_is_g_instance(td.name)) td.name = tk_qualify(item.namespace, td.name);
+            return (tk_titem_result){ .ok = true, .as.value = { .tag = TK_TITEM_TYPE_DECL, .as.type_decl = tk_normalize_inst_decl(td, table) } };   // (W9.4) `Gen<i64>` member refs → bare stamped `Gen__g__i64` (no-op when none)
+        }
         case TK_ITEM_USE:       return (tk_titem_result){ .ok = true, .as.value = { .tag = TK_TITEM_USE, .as.use_decl = item.as.use_decl } };
         case TK_ITEM_STATEMENT: {
             tk_typed_stmt_result ts = tk_type_statement(item.as.statement, env, table);

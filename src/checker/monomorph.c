@@ -61,7 +61,7 @@ static tk_str mono_type_mangle(tk_type t) {
         case TK_TYPE_STR:      return mono_cstr("str");
         case TK_TYPE_BYTE:     return mono_cstr("byte");
         case TK_TYPE_CHAR:     return mono_cstr("char");
-        case TK_TYPE_NAMED:    return t.as.named.name;
+        case TK_TYPE_NAMED:    return tk_name_last_segment(t.as.named.name);   /* (#109 W3) BARE — valid C generic-fn instance symbol */
         case TK_TYPE_SLICE:    { tk_str e = mono_type_mangle(*t.as.slice.element);   return mono_concat(mono_cstr("slice_"), e); }
         case TK_TYPE_OPTIONAL: { tk_str e = mono_type_mangle(*t.as.optional.inner); return mono_concat(mono_cstr("opt_"),   e); }
         case TK_TYPE_ERROR:    return mono_cstr("error");

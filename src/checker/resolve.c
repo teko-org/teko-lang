@@ -95,10 +95,12 @@ const char *tk_type_render(tk_type t) {
         case TK_TYPE_ERROR: return dup_cstr("error");
         case TK_TYPE_VOID:  return dup_cstr("void");
         case TK_TYPE_NAMED: {
-            // a nominal user type — its declared name verbatim.
-            size_t n = t.as.named.name.len;
+            // a nominal user type — its bare declared name. (#109 W3) strip a canonical "ns::Name" to
+            // "Name" for readable diagnostics (mirror of resolve.tks type_render name_last_segment).
+            tk_str seg = tk_name_last_segment(t.as.named.name);
+            size_t n = seg.len;
             char *out = tk_alloc(n + 1); if (!out) abort();
-            if (n != 0) memcpy(out, t.as.named.name.ptr, n);
+            if (n != 0) memcpy(out, seg.ptr, n);
             out[n] = '\0';
             return out;
         }
@@ -201,10 +203,50 @@ static tk_type *box(tk_type t) {
     return p;
 }
 
+// (#109 W3) the CANONICAL name of a type: "ns::Name" (bare at root). Mirror of resolve.tks::qualify.
+tk_str tk_qualify(tk_str ns, tk_str name) {
+    if (ns.len == 0) return name;
+    return rt_concat(rt_concat(ns, rt_cstr("::")), name);
+}
+// (#109 W3) the bare last "::"-segment of a (possibly canonical) name. Mirror of resolve.tks::name_last_segment.
+tk_str tk_name_last_segment(tk_str name) {
+    int64_t last_sep = -1;
+    for (size_t i = 0; i + 1 < name.len; i += 1) {
+        if (name.ptr[i] == ':' && name.ptr[i + 1] == ':') last_sep = (int64_t)i;
+    }
+    if (last_sep < 0) return name;
+    return tk_str_slice(name, (uint64_t)last_sep + 2, name.len);
+}
+// (#109 W3) the namespace qualifier (before the final "::"). Mirror of resolve.tks::name_qualifier.
+tk_str tk_name_qualifier(tk_str name) {
+    int64_t last_sep = -1;
+    for (size_t i = 0; i + 1 < name.len; i += 1) {
+        if (name.ptr[i] == ':' && name.ptr[i + 1] == ':') last_sep = (int64_t)i;
+    }
+    if (last_sep < 0) return rt_cstr("");
+    return tk_str_slice(name, 0, (uint64_t)last_sep);
+}
+// (#109 W3) a symbol-safe fragment of a canonical name: each "::" → "__". Mirror of resolve.tks::mangle_ns_frag.
+tk_str tk_mangle_ns_frag(tk_str name) {
+    tk_str out = rt_cstr("");
+    size_t start = 0, i = 0;
+    while (i + 1 < name.len) {
+        if (name.ptr[i] == ':' && name.ptr[i + 1] == ':') {
+            out = rt_concat(rt_concat(out, tk_str_slice(name, start, i)), rt_cstr("__"));
+            i += 2; start = i;
+        } else {
+            i += 1;
+        }
+    }
+    return rt_concat(out, tk_str_slice(name, start, name.len));
+}
+
 tk_decl_result tk_type_table_find(tk_type_table table, tk_str name, tk_str ref_ns) {
     (void)ref_ns;   // (#109) resolved-name probe — namespace-blind (every caller passes ref_ns = "")
     for (size_t i = 0; i < table.len; i += 1) {
-        if (name_eq(table.ptr[i].name, name)) {
+        // (#109 W3) exact; OR the entry's qualified form == a canonical query; OR the entry's bare
+        // last-segment == a bare query (a bare decl field probing a CANONICAL-keyed type_table_of table).
+        if (name_eq(table.ptr[i].name, name) || name_eq(tk_qualify(table.ptr[i].namespace, table.ptr[i].name), name) || name_eq(tk_name_last_segment(table.ptr[i].name), name)) {
             return (tk_decl_result){ .ok = true, .as.value = table.ptr[i].decl };
         }
     }
@@ -256,7 +298,8 @@ static tk_str namespaces_declaring(tk_type_table table, tk_str name) {
 // OWN namespace, not the code site's. Mirror of resolve.tks::type_ns_of.
 tk_str type_ns_of(tk_type_table table, tk_str name) {
     for (size_t i = 0; i < table.len; i += 1) {
-        if (name_eq(table.ptr[i].name, name)) return table.ptr[i].namespace;
+        // (#109 W3) `name` may be canonical "ns::Name" or a bare `__g__` instance — match exact OR the qualified form.
+        if (name_eq(table.ptr[i].name, name) || name_eq(tk_qualify(table.ptr[i].namespace, table.ptr[i].name), name)) return table.ptr[i].namespace;
     }
     return rt_cstr("");
 }
@@ -525,7 +568,10 @@ tk_type_result resolve_named(tk_path path, tk_type_table table, tk_str ref_ns) {
         // (W10b.D3) an interface IS a value type now — a contract-typed value (data + vtable fat
         // pointer, the tk_closure-shaped rep). It resolves NOMINALLY like any other named type;
         // the upcast/dispatch rules live in tk_widens_into + the method-call typer.
-        tk_type t = { .tag = TK_TYPE_NAMED, .as.named.name = name };
+        // (#109 W3) the Named carries the CANONICAL "ns::Name" (the resolved decl's own ns). A stamped
+        // generic `__g__` instance is already globally unique → stays BARE (matching tk_type_item).
+        tk_str cn = tk_name_is_g_instance(name) ? name : tk_qualify(type_ref_ns(path, table, ref_ns), name);
+        tk_type t = { .tag = TK_TYPE_NAMED, .as.named.name = cn };
         return (tk_type_result){ .ok = true, .as.value = t };
     }
     // R3/R4 fail-loud diagnostics (cross-namespace collision, ambiguity) propagate verbatim; the
@@ -544,7 +590,7 @@ tk_str tk_type_mangle(tk_type t) {
         case TK_TYPE_STR:      return rt_cstr("str");
         case TK_TYPE_BYTE:     return rt_cstr("byte");
         case TK_TYPE_CHAR:     return rt_cstr("char");
-        case TK_TYPE_NAMED:    return t.as.named.name;
+        case TK_TYPE_NAMED:    return tk_name_last_segment(t.as.named.name);   // (#109 W3) BARE last-segment — slice/opt/generic-inst suffixes stay bare (only DIRECT tk_t_ typedefs carry the canonical ns)
         case TK_TYPE_SLICE:    return rt_concat(rt_cstr("slice_"),
                                    t.as.slice.element  ? tk_type_mangle(*t.as.slice.element)  : rt_cstr("void"));
         case TK_TYPE_OPTIONAL: return rt_concat(rt_cstr("opt_"),
@@ -1090,7 +1136,7 @@ bool tk_subclass_reaches(tk_str sub, tk_str want, tk_type_table table, int depth
     if (!d.ok || d.as.value.body.tag != TK_BODY_CLASS) return false;
     tk_class_body cb = d.as.value.body.as.class_body;
     if (!cb.has_base) return false;
-    if (name_eq(cb.base_name, want)) return true;
+    if (name_eq(tk_name_last_segment(cb.base_name), tk_name_last_segment(want))) return true;   /* (#109 W3) compare bare */
     return tk_subclass_reaches(cb.base_name, want, table, depth - 1);
 }
 
@@ -1109,7 +1155,7 @@ static bool iface_extends_reaches(tk_str sub, tk_str want, tk_type_table table, 
     if (!d.ok || d.as.value.body.tag != TK_BODY_INTERFACE) return false;
     tk_interface_body ib = d.as.value.body.as.interface_body;
     for (size_t i = 0; i < ib.n_extends; i += 1) {
-        if (name_eq(ib.extends[i], want)) return true;
+        if (name_eq(tk_name_last_segment(ib.extends[i]), tk_name_last_segment(want))) return true;   /* (#109 W3) compare bare */
         if (iface_extends_reaches(ib.extends[i], want, table, depth - 1)) return true;
     }
     return false;
@@ -1140,7 +1186,7 @@ bool tk_type_conforms_to(tk_str name, tk_str iface, tk_type_table table) {
             return false;
         }
         for (size_t i = 0; i < n_impls; i += 1) {
-            if (name_eq(impls[i], iface)) return true;
+            if (name_eq(tk_name_last_segment(impls[i]), tk_name_last_segment(iface))) return true;   /* (#109 W3) compare bare */
             if (iface_extends_reaches(impls[i], iface, table, 64)) return true;
         }
         if (!has_base) return false;

@@ -2930,23 +2930,16 @@ fn w0_duplicate_same_namespace_and_name_is_error() {
     }
 }
 
-// (#109 W0) the ratified design's P1 probe: `aa::Reader` and `bb::Reader` — same bare name,
-// DIFFERENT namespaces. Today's flat, namespace-blind type table silently conflates the two
-// (first-match-wins misresolution); W0 converts that incident class into a fail-loud compile
-// error naming BOTH namespaces, until W3's namespace-aware resolution lifts the ban.
+// (#109 W3 ACCEPTANCE) the ratified design's P1 probe: `aa::Reader` and `bb::Reader` — same bare
+// name, DIFFERENT namespaces. W0 fail-loud-rejected this as "not yet supported"; W3's canonical-name
+// (`Named.name` = "ns::Name") resolution now makes the two DISTINCT identities that COEXIST — the
+// exact incident that motivated #109 (teko::io::Reader colliding with emit's codec Reader).
 #test
-fn w0_cross_namespace_bare_name_duplicate_is_error() {
+fn w0_cross_namespace_bare_name_now_coexists() {
     let items = teko::list::push(teko::list::push(teko::list::empty(), w0_empty_struct_item("Reader", "aa")), w0_empty_struct_item("Reader", "bb"))
     match collect(parser::Program { items = items }) {
-        Collected => teko::assert::is_true(false)   // must fail
-        error as e => {
-            teko::assert::is_true(true)
-            teko::assert::is_true(teko::str::contains(e.message, "two types share the bare name"))
-            teko::assert::is_true(teko::str::contains(e.message, "Reader"))
-            teko::assert::is_true(teko::str::contains(e.message, "aa"))
-            teko::assert::is_true(teko::str::contains(e.message, "bb"))
-            teko::assert::is_true(teko::str::contains(e.message, "#109"))
-        }
+        Collected => teko::assert::is_true(true)   // (#109 W3) now legal — distinct canonical names aa::Reader / bb::Reader
+        error    => teko::assert::is_true(false)
     }
 }
 
@@ -2980,16 +2973,12 @@ fn w0_distinct_namespaces_distinct_names_still_collect_ok() {
 // the prefix. The verifier's exact bypass scenario: `Foo__g__Bar` in aa AND bb → the W0
 // cross-namespace error, exactly like any other bare-name duplicate.
 #test
-fn w0_user_type_with_g_infix_is_not_exempt() {
+fn w0_user_type_with_g_infix_cross_ns_coexists_same_ns_dup_errors() {
+    // (#109 W3) `Foo__g__Bar` in aa AND bb is just another cross-namespace bare-name pair — now COEXISTS.
     let items = teko::list::push(teko::list::push(teko::list::empty(), w0_empty_struct_item("Foo__g__Bar", "aa")), w0_empty_struct_item("Foo__g__Bar", "bb"))
     match collect(parser::Program { items = items }) {
-        Collected => teko::assert::is_true(false)   // must fail — the old substring exemption let this through
-        error as e => {
-            teko::assert::is_true(teko::str::contains(e.message, "two types share the bare name"))
-            teko::assert::is_true(teko::str::contains(e.message, "Foo__g__Bar"))
-            teko::assert::is_true(teko::str::contains(e.message, "aa"))
-            teko::assert::is_true(teko::str::contains(e.message, "bb"))
-        }
+        Collected => teko::assert::is_true(true)
+        error    => teko::assert::is_true(false)
     }
     // and at the TOP LEVEL (ns "", so condition (b) alone can't reject): with NO generic `Foo`
     // base declared, condition (c) fails → still banned as an ordinary duplicate.

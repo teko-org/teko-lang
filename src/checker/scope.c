@@ -326,7 +326,8 @@ tk_type_result tk_builtin_fn(tk_str name) {
         tk_type ft = { .tag = TK_TYPE_FUNC, .as.func = { .params = &bool_t, .nparams = 1, .ret = &void_t } };
         return (tk_type_result){ .ok = true, .as.value = ft };
     }
-    if (name_is(name, "cov_branch_reset") || name_is(name, "cov_leave")) {
+    if (name_is(name, "cov_branch_reset") || name_is(name, "cov_leave")
+        || name_is(name, "arena_push") || name_is(name, "arena_pop")) {   // (#109 test-gate memory) () -> void
         tk_type ft = { .tag = TK_TYPE_FUNC, .as.func = { .params = NULL, .nparams = 0, .ret = &void_t } };
         return (tk_type_result){ .ok = true, .as.value = ft };
     }

@@ -146,6 +146,10 @@ tk_region *tk_region_new(tk_region *parent);    // a fresh empty region (default
 void      *tk_region_alloc(tk_region *r, size_t n);  // bump-allocate n (n→1), aligned; OOM→panic
 void       tk_region_drop(tk_region *r);        // bulk-free every chunk + the region (NULL-tolerant; idempotent on a re-walk — head is cleared before free; callers MUST null their handle after, as the freed region must not be reused)
 tk_region *tk_region_root(void);                // the process root region (lazy; never dropped in S1; parent = NULL — the tree root)
+// (#109 test-gate memory) checkpoint/rewind the ROOT region's bump position, bulk-freeing everything
+// it allocated in between. Balanced push/pop; used by the test-gate runner to bound per-test memory.
+void       tk_arena_push(void);                 // save the root region's current bump position
+void       tk_arena_pop(void);                  // free every root-region chunk allocated since the matching push
 // tk_region_register — bind `type_id` → `instance` in `r`'s OWN table (never an ancestor's; a
 // second registration of the same type_id in the same region OVERWRITES — the compiler is
 // expected to enforce true duplicate-registration errors at a higher DI layer; this is just the
@@ -446,6 +450,9 @@ bool     tk_cov_line_hit(uint64_t fn, uint32_t line);      // report query
 // `elem` points at one element of `esz` bytes; `*out_len` receives the new length; returns the
 // (possibly same) data pointer.
 void *tk_slice_push(const void *ptr, uint64_t len, const void *elem, uint64_t esz, uint64_t *out_len);
+// (mem::free) tk_free_block — park an explicitly freed root-arena block for same-size REUSE
+// (the `teko::mem::free` []T-arm lowering: `tk_free_block(s.ptr, s.len * sizeof(elem))`).
+void tk_free_block(void *p, uint64_t bytes);
 
 // --- arithmetic FFI over the i128 carrier (sign-aware) + float bit-patterns ---
 // div/rem: truncated division/remainder; sgn selects signed vs unsigned interpretation.

@@ -78,7 +78,7 @@ tk_type_result tk_method_func_type(tk_function f, tk_str struct_name, tk_type_ta
     for (size_t i = 0; i < f.nparams; i += 1) {
         tk_type pt;
         if (!f.params[i].has_type) {
-            pt = (tk_type){ .tag = TK_TYPE_NAMED, .as.named = { struct_name } };
+            { tk_str bn = tk_name_last_segment(struct_name); pt = (tk_type){ .tag = TK_TYPE_NAMED, .as.named = { tk_qualify(type_ns_of(table, bn), bn) } }; }   /* (#109 W3) NORMALIZE from the bare last-segment (bare from collect OR canonical from dispatch): real class → its ns; type-param `T` (absent) → "" → BARE */
         } else {
             tk_type_result ptr = tk_resolve_type(f.params[i].type_ann, tbl, ref_ns);
             if (!ptr.ok) { tk_free0(params); return ptr; }
@@ -255,7 +255,11 @@ bool tk_member_accessible(tk_member_owner owner, tk_str accessor_type, tk_type_t
     if (owner.vis == TK_VIS_PUB || owner.vis == TK_VIS_EXP) return true;
     // TK_VIS_PRIVATE (the class default)
     if (accessor_type.len == 0) return false;
-    if (tk_str_eq(accessor_type, owner.declaring_class)) return true;
+    // (#109 W3) `accessor_type` (env.owner_type) and `owner.declaring_class` may differ in
+    // bare-vs-canonical spelling (the receiver's type is canonicalized via tk_qualify(); the
+    // method's declaring class flows bare from find_method_owner) — compare by bare last-segment
+    // so a class's own method reaches its own private members.
+    if (tk_str_eq(tk_name_last_segment(accessor_type), tk_name_last_segment(owner.declaring_class))) return true;
     if (owner.is_intern) return tk_is_subclass_of(accessor_type, owner.declaring_class, table);
     return false;
 }
@@ -745,13 +749,6 @@ static tk_type_result check_no_duplicate_types(tk_type_table table) {
                 char *buf = tk_alloc(len); if (!buf) abort();
                 snprintf(buf, len, "duplicate type '%.*s' in namespace '%.*s'",
                          (int)nm.len, (const char *)nm.ptr, ns_label_len(ns1), ns_label_ptr(ns1));
-                return (tk_type_result){ .ok = false, .as.error = tk_error_make(buf) };
-            } else {
-                size_t len = nm.len + ns_label_len(ns1) + ns_label_len(ns2) + 96;
-                char *buf = tk_alloc(len); if (!buf) abort();
-                snprintf(buf, len, "two types share the bare name '%.*s' — %.*s and %.*s; not yet supported (#109)",
-                         (int)nm.len, (const char *)nm.ptr,
-                         ns_label_len(ns1), ns_label_ptr(ns1), ns_label_len(ns2), ns_label_ptr(ns2));
                 return (tk_type_result){ .ok = false, .as.error = tk_error_make(buf) };
             }
         }
