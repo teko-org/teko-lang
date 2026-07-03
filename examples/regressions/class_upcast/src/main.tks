@@ -1,0 +1,99 @@
+// (#98) Sub->Base upcast at every position — binding, param, return, field, and a
+// heterogeneous []Animal — with a virtual call through the base-typed value resolving to
+// the subclass override. Distinct exit codes per failure surface (0 = all pass; the
+// differential harness asserts VM == native).
+
+// a struct FIELD of polymorphic-base type (Sub->Base upcast at the field-init position).
+type Kennel = struct { resident: Animal }
+
+// a fn PARAM of base type + a virtual call through it (dispatches to the concrete override).
+pub fn hear(a: Animal) -> str {
+    a.speak()
+}
+
+// a fn PARAM of base type calling an INHERITED method that itself dispatches `self.speak()`.
+pub fn introduce(a: Animal) -> str {
+    a.describe()
+}
+
+// a fn RETURNING the base type — the returned subclass value upcasts into the base ret slot.
+pub fn pick(dog: bool) -> Animal {
+    if dog {
+        return Dog::make("Rex")
+    }
+    Cat::make("Milo")
+}
+
+// a heterogeneous []Animal iterated + dispatched (each element's own override fires).
+pub fn chorus(animals: []Animal) -> str {
+    mut out = ""
+    mut i: u64 = 0
+    loop {
+        if i >= animals.len { break }
+        out = out ~ animals[i].speak()
+        i++
+    }
+    out
+}
+
+// 1) BINDING position: a subclass value bound into a base-typed local, dispatched.
+pub fn check_binding() -> i64 {
+    let a: Animal = Dog::make("Rex")
+    if a.speak() != "Woof" { return 1 }
+    if a.name != "Rex" { return 2 }
+    let b: Animal = Cat::make("Milo")
+    if b.speak() != "Meow" { return 3 }
+    0
+}
+
+// 2) PARAM position: subclass argument upcasts into the base param, dispatched.
+pub fn check_param() -> i64 {
+    if hear(Dog::make("Rex")) != "Woof" { return 4 }
+    if hear(Cat::make("Milo")) != "Meow" { return 5 }
+    // an inherited method dispatching self.speak() through the base receiver.
+    if introduce(Dog::make("Rex")) != "Rex says Woof" { return 6 }
+    if introduce(Cat::make("Milo")) != "Milo says Meow" { return 7 }
+    0
+}
+
+// 3) RETURN position: the returned subclass upcasts into the base ret slot, dispatched.
+pub fn check_return() -> i64 {
+    let a = pick(true)
+    if a.speak() != "Woof" { return 8 }
+    let b = pick(false)
+    if b.speak() != "Meow" { return 9 }
+    0
+}
+
+// 4) FIELD position: a subclass value stored in a base-typed struct field, dispatched.
+pub fn check_field() -> i64 {
+    let k = Kennel { resident = Dog::make("Rex") }
+    if k.resident.speak() != "Woof" { return 10 }
+    if k.resident.name != "Rex" { return 11 }
+    0
+}
+
+// 5) heterogeneous []Animal — mixed subclasses, iterated, each override dispatched.
+pub fn check_slice() -> i64 {
+    let zoo: []Animal = [Dog::make("Rex"), Cat::make("Milo"), Dog::make("Fido")]
+    if zoo.len != 3 { return 12 }
+    if chorus(zoo) != "WoofMeowWoof" { return 13 }
+    0
+}
+
+let r1 = check_binding()
+if r1 != 0 { exit(r1) }
+
+let r2 = check_param()
+if r2 != 0 { exit(r2) }
+
+let r3 = check_return()
+if r3 != 0 { exit(r3) }
+
+let r4 = check_field()
+if r4 != 0 { exit(r4) }
+
+let r5 = check_slice()
+if r5 != 0 { exit(r5) }
+
+exit(0)
