@@ -409,7 +409,16 @@ static tk_texpr_result type_method_call(tk_method_call mc, tk_env env, tk_type_t
     // the vtable slot both backends dispatch through. The receiver rides as args[0] (an interface
     // value, or a class instance the emitters upcast on the fly). Mirror: typer.tks::type_method_call.
     if (td.as.value.body.tag == TK_BODY_INTERFACE) {
-        tk_methodsvec_result eff = tk_iface_methods_by_name(struct_name, table);
+        // (W10b.D2, issue #99) the DISPATCH interface. For a plain interface receiver this IS
+        // `struct_name`. For a generic type-param `<T: I>` — registered by tk_type_param_table with
+        // an InterfaceBody that has NO own methods and a SINGLE `extends` naming the real interface —
+        // redirect to `I` (extends[0]): the callee path + vtable key off a REAL interface (a type-
+        // param has no emitted C type / vtable), while the receiver stays `Named{T}` (below, via
+        // `struct_name`) so monomorphization stamps T→concrete. No-op for a normal interface
+        // (n_methods > 0); slot-equivalent for a degenerate real `interface X extends Y {}`.
+        tk_interface_body ib = td.as.value.body.as.interface_body;
+        tk_str iface_canon = (ib.n_methods == 0 && ib.n_extends == 1) ? ib.extends[0] : struct_name;
+        tk_methodsvec_result eff = tk_iface_methods_by_name(iface_canon, table);
         if (!eff.ok) return xferr(eff.as.error);
         bool ifound = false; tk_function imfn = {0}; size_t slot = 0;
         for (size_t i = 0; i < eff.as.value.len; i += 1) {
@@ -453,7 +462,7 @@ static tk_texpr_result type_method_call(tk_method_call mc, tk_env env, tk_type_t
             iargs = tk_texpr_list_push(iargs, a.as.value);
         }
         tk_segment *isegs = tk_alloc(2 * sizeof *isegs); if (!isegs) abort();
-        isegs[0] = (tk_segment){ .name = struct_name };
+        isegs[0] = (tk_segment){ .name = iface_canon };   // (D2) the REAL interface — the vtable/upcast key
         isegs[1] = (tk_segment){ .name = mc.method };
         return xok((tk_texpr){ .tag = TK_TEXPR_CALL, .type = *ift.as.func.ret,
                                .as.call = { .callee = { .segments = isegs, .len = 2 }, .args = iargs.ptr, .nargs = iargs.len,

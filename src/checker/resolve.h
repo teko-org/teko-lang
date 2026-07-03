@@ -21,7 +21,7 @@ tk_decl_result tk_type_table_find(tk_type_table table, tk_str name);
 tk_type_result tk_resolve_type(tk_type_expr te, tk_type_table table);
 // (S4) extend the table with generic type-params as OPAQUE nominal types (see resolve.c). Used by
 // collect (func sigs), check_modules (vis check), and typer (bodies). Empty → table unchanged.
-tk_type_table tk_type_param_table(tk_str *type_params, size_t n_type_params, tk_str ns, tk_type_table table);
+tk_type_table tk_type_param_table(tk_str *type_params, size_t n_type_params, tk_constraint_expr *type_constraints, tk_str ns, tk_type_table table);
 
 // (S4) generics inference. tk_subst = a type-param→concrete binding (parallel arrays); `params` is
 // the type-param universe, `names`/`types` the bindings. (resolve.tks: Subst / subst_type / unify.)
