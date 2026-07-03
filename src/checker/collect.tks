@@ -21,7 +21,9 @@ fn collect_types(items: []parser::Item) -> TypeTable {
 }
 
 // a function's signature as a FuncType (resolve its param + return types).
-fn func_type(f: parser::Function, table: TypeTable) -> Type | error {
+// (#109 W1) `ref_ns` = the namespace the function is declared in (the referencing namespace for its
+// param/return type annotations); threaded to resolve_type, unused until W2's R0-R5 rules.
+fn func_type(f: parser::Function, table: TypeTable, ref_ns: str) -> Type | error {
     let tbl = type_param_table(f.type_params, f.type_constraints, "", table)   // (S4) the fn's generic type-params, opaque, in scope
     mut params: []Type = teko::list::empty()
     mut param_names: []str = teko::list::empty()
@@ -30,7 +32,7 @@ fn func_type(f: parser::Function, table: TypeTable) -> Type | error {
     mut i = 0
     loop {
         if i >= f.params.len { break }
-        let pt = match resolve_type(f.params[i].type_ann, tbl) {
+        let pt = match resolve_type(f.params[i].type_ann, tbl, ref_ns) {
             Type as t  => t
             error as e => return e
         }
@@ -45,7 +47,7 @@ fn func_type(f: parser::Function, table: TypeTable) -> Type | error {
     // No `-> ret` ⇒ a void return (M.3) — f.return_type is the empty no_type() placeholder, NOT a
     // value type, so it must not be resolved. Mirrors typer.tks's function typer.
     let ret = if f.has_return {
-        match resolve_type(f.return_type, tbl) { Type as t => t; error as e => return e }
+        match resolve_type(f.return_type, tbl, ref_ns) { Type as t => t; error as e => return e }
     } else {
         Void { }
     }
@@ -57,7 +59,8 @@ fn func_type(f: parser::Function, table: TypeTable) -> Type | error {
 // RECEIVER param (has_type=false, only ever index 0) resolves to Named{struct_name} — its type
 // is IMPLICIT (the enclosing struct), never written by the user, so it can't go through
 // resolve_type like an ordinary annotated param.
-fn method_func_type(f: parser::Function, struct_name: str, table: TypeTable) -> Type | error {
+// (#109 W1) `ref_ns` = the method's declaring namespace; threaded to resolve_type, unused until W2.
+fn method_func_type(f: parser::Function, struct_name: str, table: TypeTable, ref_ns: str) -> Type | error {
     let tbl = type_param_table(f.type_params, f.type_constraints, "", table)
     mut params: []Type = teko::list::empty()
     mut param_names: []str = teko::list::empty()
@@ -69,7 +72,7 @@ fn method_func_type(f: parser::Function, struct_name: str, table: TypeTable) -> 
         let pt = if !f.params[i].has_type {
             Named { name = struct_name }
         } else {
-            match resolve_type(f.params[i].type_ann, tbl) { Type as t => t; error as e => return e }
+            match resolve_type(f.params[i].type_ann, tbl, ref_ns) { Type as t => t; error as e => return e }
         }
         params = teko::list::push(params, pt)
         param_names = teko::list::push(param_names, f.params[i].name)
@@ -80,7 +83,7 @@ fn method_func_type(f: parser::Function, struct_name: str, table: TypeTable) -> 
         i++
     }
     let ret = if f.has_return {
-        match resolve_type(f.return_type, tbl) { Type as t => t; error as e => return e }
+        match resolve_type(f.return_type, tbl, ref_ns) { Type as t => t; error as e => return e }
     } else {
         Void { }
     }
@@ -101,7 +104,7 @@ fn collect_funcs(items: []parser::Item, table: TypeTable) -> Env | error {
         if i >= items.len { break }
         match items[i].content {
             parser::Function as f => {
-                let ft = match func_type(f, table) {
+                let ft = match func_type(f, table, items[i].namespace) {   // (#109 W1) ref_ns = the fn's declaring namespace
                     Type as t  => t
                     error as e => return e
                 }
@@ -114,7 +117,7 @@ fn collect_funcs(items: []parser::Item, table: TypeTable) -> Env | error {
                         mut mi = 0
                         loop {
                             if mi >= sb.methods.len { break }
-                            let mft = match method_func_type(sb.methods[mi], td.name, table) {
+                            let mft = match method_func_type(sb.methods[mi], td.name, table, items[i].namespace) {   // (#109 W1) ref_ns = the type's declaring namespace
                                 Type as t  => t
                                 error as e => return e
                             }
@@ -132,7 +135,7 @@ fn collect_funcs(items: []parser::Item, table: TypeTable) -> Env | error {
                         mut mi = 0
                         loop {
                             if mi >= eff.len { break }
-                            let mft = match method_func_type(eff[mi], td.name, table) {
+                            let mft = match method_func_type(eff[mi], td.name, table, items[i].namespace) {   // (#109 W1) ref_ns = the type's declaring namespace
                                 Type as t  => t
                                 error as e => return e
                             }
@@ -172,7 +175,7 @@ pub fn type_table_of(prog: TProgram) -> TypeTable {
 
 // (W10b.CLASS increment 2) look up a class's own parser::ClassBody by name (error if unknown or not a class).
 pub fn find_class_body(name: str, table: TypeTable) -> parser::ClassBody | error {
-    let decl = match type_table_find(table, name) {
+    let decl = match type_table_find(table, name, "") {   // (#109 W1) class-body lookup on a resolved name — no referencing ns
         parser::TypeDecl as td => td
         error          => return error { message = $"unknown base class: {name}" }
     }
@@ -373,7 +376,7 @@ fn default_restated_param(contract_params: []parser::Param, impl_params: []parse
 //  - (DEFARGS rule E) an `override` method must NOT restate a default the base method owns.
 fn validate_class_decl(cb: parser::ClassBody, table: TypeTable) -> error? {
     if cb.has_base {
-        let base_decl = match type_table_find(table, cb.base_name) {
+        let base_decl = match type_table_find(table, cb.base_name, "") {   // (#109 W1) base-class lookup on a resolved name — no referencing ns
             parser::TypeDecl as td => td
             error          => return error { message = $"unknown base class: {cb.base_name}" }
         }
@@ -428,7 +431,7 @@ fn validate_class_decl(cb: parser::ClassBody, table: TypeTable) -> error? {
 // transparent alias `type R = Ref<i64>`. Runs once per program over every declared type body.
 // (W10b.IF) look up an interface body by name — error if the name is unknown or not an interface.
 pub fn find_interface_body(name: str, table: TypeTable) -> parser::InterfaceBody | error {
-    let decl = match type_table_find(table, name) { parser::TypeDecl as td => td; error => return error { message = $"unknown interface: {name}" } }
+    let decl = match type_table_find(table, name, "") { parser::TypeDecl as td => td; error => return error { message = $"unknown interface: {name}" } }   // (#109 W1) interface-body lookup on a resolved name — no referencing ns
     match decl.body {
         parser::InterfaceBody as ib => ib
         _               => return error { message = $"{name} is not an interface" }
@@ -512,15 +515,15 @@ fn method_sig_matches(req: parser::Function, impl_m: parser::Function, table: Ty
     mut k: u64 = 0
     loop {
         if rstart + k >= req.params.len { break }
-        let rt = match resolve_type(req.params[rstart + k].type_ann, table) { Type as t => t; error => return false }
-        let it = match resolve_type(impl_m.params[istart + k].type_ann, table) { Type as t => t; error => return false }
+        let rt = match resolve_type(req.params[rstart + k].type_ann, table, "") { Type as t => t; error => return false }   // (#109 W1) structural sig-equality — no referencing ns
+        let it = match resolve_type(impl_m.params[istart + k].type_ann, table, "") { Type as t => t; error => return false }   // (#109 W1) structural sig-equality — no referencing ns
         if !type_eq(rt, it) { return false }
         k++
     }
     if req.has_return != impl_m.has_return { return false }
     if req.has_return {
-        let rr = match resolve_type(req.return_type, table) { Type as t => t; error => return false }
-        let ir = match resolve_type(impl_m.return_type, table) { Type as t => t; error => return false }
+        let rr = match resolve_type(req.return_type, table, "") { Type as t => t; error => return false }   // (#109 W1) structural sig-equality — no referencing ns
+        let ir = match resolve_type(impl_m.return_type, table, "") { Type as t => t; error => return false }   // (#109 W1) structural sig-equality — no referencing ns
         if !type_eq(rr, ir) { return false }
     }
     true
@@ -584,7 +587,7 @@ fn check_conformance(type_name: str, own_methods: []parser::Function, implements
 
 // look up a trait body by name — error if the name is unknown or not a trait.
 pub fn find_trait_body(name: str, table: TypeTable) -> parser::TraitBody | error {
-    let decl = match type_table_find(table, name) { parser::TypeDecl as td => td; error => return error { message = $"unknown trait: {name}" } }
+    let decl = match type_table_find(table, name, "") { parser::TypeDecl as td => td; error => return error { message = $"unknown trait: {name}" } }   // (#109 W1) trait-body lookup on a resolved name — no referencing ns
     match decl.body {
         parser::TraitBody as tb => tb
         _               => return error { message = $"{name} is not a trait" }
@@ -606,7 +609,7 @@ fn split_trait_derives(implements: []str, table: TypeTable) -> SplitImpls {
     mut i: u64 = 0
     loop {
         if i >= implements.len { break }
-        let is_trait = match type_table_find(table, implements[i]) {
+        let is_trait = match type_table_find(table, implements[i], "") {   // (#109 W1) trait-kind probe on a resolved name — no referencing ns
             parser::TypeDecl as td => match td.body { parser::TraitBody => true; _ => false }
             error => false
         }
@@ -695,7 +698,7 @@ fn check_trait_requirements(derives: []TraitDerive, table: TypeTable) -> error? 
         if i >= derives.len { break }
         let d = derives[i]
         let tb = match find_trait_body(d.trait_name, table) { parser::TraitBody as t => t; error as e => return e }
-        let decl = match type_table_find(table, d.type_name) { parser::TypeDecl as td => td; error => return error { message = $"internal: trait deriver '{d.type_name}' vanished from the type table" } }
+        let decl = match type_table_find(table, d.type_name, "") { parser::TypeDecl as td => td; error => return error { message = $"internal: trait deriver '{d.type_name}' vanished from the type table" } }   // (#109 W1) trait-deriver lookup on a resolved name — no referencing ns
         let own = match decl.body {
             parser::StructBody as sb => sb.methods
             parser::ClassBody as cb  => match effective_class_methods(cb, table) { []parser::Function as f => f; error as e => return e }
@@ -861,6 +864,7 @@ fn validate_type_decls(table: TypeTable) -> error? {
     loop {
         if i >= table.len { break }
         let decl = table[i].decl
+        let ref_ns = table[i].namespace   // (#109 W1) ref_ns = the type decl's declaring namespace (referencing ns for its field annotations)
         // (S4) the decl's own generic type-params, opaque, in scope — so a generic body field `T`
         // resolves to `Named{T}` (not "unknown type"); mirrors func_type's type-param handling. A
         // `Ref<T>` field is still rejected by R1 (its inner is a Named, not a scalar Prim).
@@ -870,7 +874,7 @@ fn validate_type_decls(table: TypeTable) -> error? {
                 mut f = 0
                 loop {
                     if f >= sb.fields.len { break }
-                    match resolve_type(sb.fields[f].type_ann, tbl) {
+                    match resolve_type(sb.fields[f].type_ann, tbl, ref_ns) {
                         Type as ft => match ft { Reference => return error { message = "a reference cannot be stored in a struct/variant/collection" }; _ => {} }
                         error as e => return e
                     }
@@ -879,7 +883,7 @@ fn validate_type_decls(table: TypeTable) -> error? {
                 match check_conformance(decl.name, sb.methods, sb.implements, table, true) { error as e => return e; null => {} }   // (W10b.IF) struct members all-public
             }
             parser::AliasBody as ab => {
-                match resolve_type(ab.alias, tbl) {
+                match resolve_type(ab.alias, tbl, ref_ns) {
                     Type as at => match at { Reference => return error { message = "a reference cannot be stored in a struct/variant/collection" }; _ => {} }
                     error as e => return e
                 }
@@ -889,7 +893,7 @@ fn validate_type_decls(table: TypeTable) -> error? {
                 mut f = 0
                 loop {
                     if f >= cb.fields.len { break }
-                    match resolve_type(cb.fields[f].type_ann, tbl) {
+                    match resolve_type(cb.fields[f].type_ann, tbl, ref_ns) {
                         Type as ft => match ft { Reference => return error { message = "a reference cannot be stored in a struct/variant/collection" }; _ => {} }
                         error as e => return e
                     }
@@ -909,7 +913,7 @@ fn validate_type_decls(table: TypeTable) -> error? {
                 mut f = 0
                 loop {
                     if f >= trb.fields.len { break }
-                    match resolve_type(trb.fields[f].type_ann, tbl) {
+                    match resolve_type(trb.fields[f].type_ann, tbl, ref_ns) {
                         Type as ft => match ft { Reference => return error { message = "a reference cannot be stored in a struct/variant/collection" }; _ => {} }
                         error as e => return e
                     }
@@ -997,7 +1001,7 @@ fn collect_with_seed(program: parser::Program, seed: Collected) -> Collected | e
         if j >= program.items.len { break }
         match program.items[j].content {
             parser::Function as f => {
-                let ft = match func_type(f, table) {
+                let ft = match func_type(f, table, program.items[j].namespace) {   // (#109 W1) ref_ns = the fn's declaring namespace
                     Type as t  => t
                     error as e => return e
                 }
@@ -1010,7 +1014,7 @@ fn collect_with_seed(program: parser::Program, seed: Collected) -> Collected | e
                         mut mi = 0
                         loop {
                             if mi >= sb.methods.len { break }
-                            let mft = match method_func_type(sb.methods[mi], td.name, table) {
+                            let mft = match method_func_type(sb.methods[mi], td.name, table, program.items[j].namespace) {   // (#109 W1) ref_ns = the type's declaring namespace
                                 Type as t  => t
                                 error as e => return e
                             }
@@ -1026,7 +1030,7 @@ fn collect_with_seed(program: parser::Program, seed: Collected) -> Collected | e
                         mut mi = 0
                         loop {
                             if mi >= eff.len { break }
-                            let mft = match method_func_type(eff[mi], td.name, table) {
+                            let mft = match method_func_type(eff[mi], td.name, table, program.items[j].namespace) {   // (#109 W1) ref_ns = the type's declaring namespace
                                 Type as t  => t
                                 error as e => return e
                             }
@@ -1082,7 +1086,7 @@ fn seed_from_dep(dep: TProgram, table: TypeTable, env: Env) -> Collected | error
                 mut pi: u64 = 0
                 loop {
                     if pi >= f.params.len { break }
-                    let pt = match resolve_type(f.params[pi].type_ann, dtbl) { Type as ty => ty; error as err => return err }
+                    let pt = match resolve_type(f.params[pi].type_ann, dtbl, f.namespace) { Type as ty => ty; error as err => return err }   // (#109 W1) ref_ns = the dep fn's declaring namespace
                     params = teko::list::push(params, pt)
                     param_names = teko::list::push(param_names, f.params[pi].name)
                     if f.params[pi].has_default {

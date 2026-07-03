@@ -27,14 +27,16 @@ static tk_type_table collect_types(tk_item *items, size_t n) {
     return table;
 }
 
-static tk_type_result func_type(tk_function f, tk_type_table table) {
+// (#109 W1) `ref_ns` = the namespace the function is declared in (the referencing namespace for its
+// param/return type annotations); threaded to tk_resolve_type, unused until W2's R0-R5 rules.
+static tk_type_result func_type(tk_function f, tk_type_table table, tk_str ref_ns) {
     tk_type_table tbl = tk_type_param_table(f.type_params, f.n_type_params, f.type_constraints, (tk_str){0}, table);   // (S4) opaque type-params in scope
     tk_type *params = NULL; size_t n = 0;
     tk_str *param_names = NULL;   // DEFARGS (2026-07-01)
     tk_expr *defaults = NULL; size_t ndefaults = 0;
     size_t n_required = f.nparams;   // the first has_default param's index; TRAILING-ONLY (rule A) means every param after it also defaults
     for (size_t i = 0; i < f.nparams; i += 1) {
-        tk_type_result pt = tk_resolve_type(f.params[i].type_ann, tbl);
+        tk_type_result pt = tk_resolve_type(f.params[i].type_ann, tbl, ref_ns);
         if (!pt.ok) { tk_free0(params); return pt; }
         params = tk_realloc0(params, (n + 1) * sizeof *params);
         if (!params) abort();
@@ -53,7 +55,7 @@ static tk_type_result func_type(tk_function f, tk_type_table table) {
     // (a NAMED type-expr with an empty path), which must NOT be resolved (it is not a value type).
     // Mirrors typer.c's function typer (`if (!f.has_return) return void_t()`).
     tk_type_result ret = f.has_return
-        ? tk_resolve_type(f.return_type, tbl)
+        ? tk_resolve_type(f.return_type, tbl, ref_ns)
         : (tk_type_result){ .ok = true, .as.value = (tk_type){ .tag = TK_TYPE_VOID } };
     if (!ret.ok) { tk_free0(params); return ret; }
     tk_type *rp = tk_alloc(sizeof *rp); if (!rp) abort(); *rp = ret.as.value;
@@ -66,7 +68,8 @@ static tk_type_result func_type(tk_function f, tk_type_table table) {
 // RECEIVER param (has_type=false, only ever index 0) resolves to Named{struct_name} — its type
 // is IMPLICIT (the enclosing struct), never written by the user, so it can't go through
 // tk_resolve_type like an ordinary annotated param.
-tk_type_result tk_method_func_type(tk_function f, tk_str struct_name, tk_type_table table) {
+// (#109 W1) `ref_ns` = the method's declaring namespace; threaded to tk_resolve_type, unused until W2.
+tk_type_result tk_method_func_type(tk_function f, tk_str struct_name, tk_type_table table, tk_str ref_ns) {
     tk_type_table tbl = tk_type_param_table(f.type_params, f.n_type_params, f.type_constraints, (tk_str){0}, table);
     tk_type *params = NULL; size_t n = 0;
     tk_str *param_names = NULL;
@@ -77,7 +80,7 @@ tk_type_result tk_method_func_type(tk_function f, tk_str struct_name, tk_type_ta
         if (!f.params[i].has_type) {
             pt = (tk_type){ .tag = TK_TYPE_NAMED, .as.named = { struct_name } };
         } else {
-            tk_type_result ptr = tk_resolve_type(f.params[i].type_ann, tbl);
+            tk_type_result ptr = tk_resolve_type(f.params[i].type_ann, tbl, ref_ns);
             if (!ptr.ok) { tk_free0(params); return ptr; }
             pt = ptr.as.value;
         }
@@ -95,7 +98,7 @@ tk_type_result tk_method_func_type(tk_function f, tk_str struct_name, tk_type_ta
         }
     }
     tk_type_result ret = f.has_return
-        ? tk_resolve_type(f.return_type, tbl)
+        ? tk_resolve_type(f.return_type, tbl, ref_ns)
         : (tk_type_result){ .ok = true, .as.value = (tk_type){ .tag = TK_TYPE_VOID } };
     if (!ret.ok) { tk_free0(params); return ret; }
     tk_type *rp = tk_alloc(sizeof *rp); if (!rp) abort(); *rp = ret.as.value;
@@ -123,7 +126,7 @@ tk_type_table tk_type_table_of(tk_tprogram prog) {
 // (W10b.CLASS increment 2) look up a class's own tk_class_body by name (mirror of
 // collect.tks::find_class_body). ok=false carries the error.
 tk_classbody_result tk_find_class_body(tk_str name, tk_type_table table) {
-    tk_decl_result decl = tk_type_table_find(table, name);
+    tk_decl_result decl = tk_type_table_find(table, name, (tk_str){0});   // (#109 W1) class-body lookup on a resolved name — no referencing ns
     if (!decl.ok) return (tk_classbody_result){ .ok = false, .as.error = tk_error_named("unknown base class", name) };
     if (decl.as.value.body.tag != TK_BODY_CLASS) return (tk_classbody_result){ .ok = false, .as.error = tk_error_woven1("", name, " is not a class") };
     return (tk_classbody_result){ .ok = true, .as.value = decl.as.value.body.as.class_body };
@@ -288,7 +291,7 @@ static tk_str default_restated_param(const tk_param *contract_params, size_t n_c
 // collect.tks::validate_class_decl.
 static tk_type_result validate_class_decl(tk_class_body cb, tk_type_table table) {
     if (cb.has_base) {
-        tk_decl_result base_decl = tk_type_table_find(table, cb.base_name);
+        tk_decl_result base_decl = tk_type_table_find(table, cb.base_name, (tk_str){0});   // (#109 W1) base-class lookup on a resolved name — no referencing ns
         if (!base_decl.ok) return (tk_type_result){ .ok = false, .as.error = tk_error_named("unknown base class", cb.base_name) };
         if (base_decl.as.value.body.tag != TK_BODY_CLASS) return (tk_type_result){ .ok = false, .as.error = tk_error_woven1("", cb.base_name, " is not a class") };
         if (base_decl.as.value.body.as.class_body.kind == TK_CLASS_SEALED)
@@ -329,7 +332,7 @@ static tk_type_result validate_class_decl(tk_class_body cb, tk_type_table table)
 // Mirror of collect.tks::find_interface_body. LOCAL result type (used only here + conformance).
 typedef struct { bool ok; union { tk_interface_body value; tk_error error; } as; } ifacebody_result;
 static ifacebody_result find_interface_body(tk_str name, tk_type_table table) {
-    tk_decl_result decl = tk_type_table_find(table, name);
+    tk_decl_result decl = tk_type_table_find(table, name, (tk_str){0});   // (#109 W1) interface-body lookup on a resolved name — no referencing ns
     if (!decl.ok) {
         size_t len = name.len + 32; char *buf = tk_alloc(len); if (!buf) abort();
         snprintf(buf, len, "unknown interface: %.*s", (int)name.len, (const char *)name.ptr);
@@ -416,17 +419,17 @@ static bool method_sig_matches(tk_function req, tk_function impl_m, tk_type_tabl
     if (rstart != istart) return false;
     if (req.nparams - rstart != impl_m.nparams - istart) return false;
     for (size_t k = 0; rstart + k < req.nparams; k += 1) {
-        tk_type_result rt = tk_resolve_type(req.params[rstart + k].type_ann, table);
+        tk_type_result rt = tk_resolve_type(req.params[rstart + k].type_ann, table, (tk_str){0});   // (#109 W1) structural sig-equality — no referencing ns
         if (!rt.ok) return false;
-        tk_type_result it = tk_resolve_type(impl_m.params[istart + k].type_ann, table);
+        tk_type_result it = tk_resolve_type(impl_m.params[istart + k].type_ann, table, (tk_str){0});   // (#109 W1) structural sig-equality — no referencing ns
         if (!it.ok) return false;
         if (!tk_type_eq(&rt.as.value, &it.as.value)) return false;
     }
     if (req.has_return != impl_m.has_return) return false;
     if (req.has_return) {
-        tk_type_result rr = tk_resolve_type(req.return_type, table);
+        tk_type_result rr = tk_resolve_type(req.return_type, table, (tk_str){0});   // (#109 W1) structural sig-equality — no referencing ns
         if (!rr.ok) return false;
-        tk_type_result ir = tk_resolve_type(impl_m.return_type, table);
+        tk_type_result ir = tk_resolve_type(impl_m.return_type, table, (tk_str){0});   // (#109 W1) structural sig-equality — no referencing ns
         if (!ir.ok) return false;
         if (!tk_type_eq(&rr.as.value, &ir.as.value)) return false;
     }
@@ -490,7 +493,7 @@ static tk_type_result check_conformance(tk_str type_name, const tk_function *own
 // look up a trait body by name — error if the name is unknown or not a trait.
 typedef struct { bool ok; union { tk_trait_body value; tk_error error; } as; } traitbody_result;
 static traitbody_result find_trait_body(tk_str name, tk_type_table table) {
-    tk_decl_result decl = tk_type_table_find(table, name);
+    tk_decl_result decl = tk_type_table_find(table, name, (tk_str){0});   // (#109 W1) trait-body lookup on a resolved name — no referencing ns
     if (!decl.ok) {
         size_t len = name.len + 32; char *buf = tk_alloc(len); if (!buf) abort();
         snprintf(buf, len, "unknown trait: %.*s", (int)name.len, (const char *)name.ptr);
@@ -583,7 +586,7 @@ static tk_type_result check_trait_requirements(const trait_derive *derives, size
         trait_derive d = derives[i];
         traitbody_result tb = find_trait_body(d.trait_name, table);
         if (!tb.ok) return (tk_type_result){ .ok = false, .as.error = tb.as.error };
-        tk_decl_result decl = tk_type_table_find(table, d.type_name);
+        tk_decl_result decl = tk_type_table_find(table, d.type_name, (tk_str){0});   // (#109 W1) trait-deriver lookup on a resolved name — no referencing ns
         if (!decl.ok) return (tk_type_result){ .ok = false, .as.error = tk_error_woven1("internal: trait deriver '", d.type_name, "' vanished from the type table") };
         const tk_function *own = NULL; size_t n_own = 0;
         if (decl.as.value.body.tag == TK_BODY_STRUCT) {
@@ -640,7 +643,7 @@ tk_fold_traits_result tk_fold_traits(tk_program program) {
                 tk_str *traits = NULL; size_t n_traits = 0;
                 tk_str *ifaces = NULL; size_t n_ifaces = 0;
                 for (size_t k = 0; k < n_impls; k += 1) {
-                    tk_decl_result dr = tk_type_table_find(table, impls[k]);
+                    tk_decl_result dr = tk_type_table_find(table, impls[k], (tk_str){0});   // (#109 W1) trait-kind probe on a resolved name — no referencing ns
                     bool is_trait = dr.ok && dr.as.value.body.tag == TK_BODY_TRAIT;
                     tk_str **dst = is_trait ? &traits : &ifaces;
                     size_t *ndst = is_trait ? &n_traits : &n_ifaces;
@@ -766,6 +769,7 @@ static tk_type_result validate_type_decls(tk_type_table table) {
     if (!dup.ok) return dup;
     for (size_t i = 0; i < table.len; i += 1) {
         tk_type_decl decl = table.ptr[i].decl;
+        tk_str ref_ns = table.ptr[i].namespace;   // (#109 W1) ref_ns = the type decl's declaring namespace (referencing ns for its field annotations)
         // (S4) the decl's own generic type-params, opaque, in scope — so a generic body field `T`
         // resolves to Named{T} (not "unknown type"); mirrors func_type. A `Ref<T>` field is still
         // rejected by R1 (its inner is a Named, not a scalar Prim).
@@ -773,7 +777,7 @@ static tk_type_result validate_type_decls(tk_type_table table) {
         tk_type_body body = decl.body;
         if (body.tag == TK_BODY_STRUCT) {
             for (size_t f = 0; f < body.as.struct_body.n_fields; f += 1) {
-                tk_type_result r = tk_resolve_type(body.as.struct_body.fields[f].type_ann, tbl);
+                tk_type_result r = tk_resolve_type(body.as.struct_body.fields[f].type_ann, tbl, ref_ns);
                 if (!r.ok) return r;
                 if (r.as.value.tag == TK_TYPE_REF)
                     return (tk_type_result){ .ok = false, .as.error = tk_error_make("a reference cannot be stored in a struct/variant/collection") };
@@ -782,7 +786,7 @@ static tk_type_result validate_type_decls(tk_type_table table) {
                                                   body.as.struct_body.implements, body.as.struct_body.n_implements, table, true);
             if (!cf.ok) return cf;
         } else if (body.tag == TK_BODY_ALIAS) {
-            tk_type_result r = tk_resolve_type(body.as.alias_body.alias, tbl);
+            tk_type_result r = tk_resolve_type(body.as.alias_body.alias, tbl, ref_ns);
             if (!r.ok) return r;
             if (r.as.value.tag == TK_TYPE_REF)
                 return (tk_type_result){ .ok = false, .as.error = tk_error_make("a reference cannot be stored in a struct/variant/collection") };
@@ -790,7 +794,7 @@ static tk_type_result validate_type_decls(tk_type_table table) {
             tk_type_result acyc = class_inheritance_acyclic(decl.name, table);   // guard cyclic inheritance BEFORE any recursive base-chain walk
             if (!acyc.ok) return acyc;
             for (size_t f = 0; f < body.as.class_body.n_fields; f += 1) {
-                tk_type_result r = tk_resolve_type(body.as.class_body.fields[f].type_ann, tbl);
+                tk_type_result r = tk_resolve_type(body.as.class_body.fields[f].type_ann, tbl, ref_ns);
                 if (!r.ok) return r;
                 if (r.as.value.tag == TK_TYPE_REF)
                     return (tk_type_result){ .ok = false, .as.error = tk_error_make("a reference cannot be stored in a struct/variant/collection") };
@@ -813,7 +817,7 @@ static tk_type_result validate_type_decls(tk_type_table table) {
                 return (tk_type_result){ .ok = false, .as.error = tk_error_make(buf) };
             }
             for (size_t f = 0; f < body.as.trait_body.n_fields; f += 1) {
-                tk_type_result r = tk_resolve_type(body.as.trait_body.fields[f].type_ann, tbl);
+                tk_type_result r = tk_resolve_type(body.as.trait_body.fields[f].type_ann, tbl, ref_ns);
                 if (!r.ok) return r;
                 if (r.as.value.tag == TK_TYPE_REF)
                     return (tk_type_result){ .ok = false, .as.error = tk_error_make("a reference cannot be stored in a struct/variant/collection") };
@@ -867,7 +871,7 @@ tk_collected_result tk_collect(tk_program program) {
     for (size_t i = 0; i < program.len; i += 1) {
         if (program.items[i].tag == TK_ITEM_FUNCTION) {
             tk_function f = program.items[i].as.function;
-            tk_type_result ft = func_type(f, table);
+            tk_type_result ft = func_type(f, table, program.items[i].namespace);   // (#109 W1) ref_ns = the fn's declaring namespace
             if (!ft.ok) return (tk_collected_result){ .ok = false, .as.error = ft.as.error };
             env = tk_env_define_fn(env, f.name, ft.as.value, program.items[i].namespace);   // #41: carry the fn's ns
         } else if (program.items[i].tag == TK_ITEM_TYPE_DECL && program.items[i].as.type_decl.body.tag == TK_BODY_STRUCT) {
@@ -880,7 +884,7 @@ tk_collected_result tk_collect(tk_program program) {
             tk_str method_ns = owning_ns.len == 0 ? td.name : collect_str_concat(collect_str_concat(owning_ns, (tk_str){ .ptr = (const tk_byte *)"::", .len = 2 }), td.name);
             for (size_t mi = 0; mi < td.body.as.struct_body.n_methods; mi += 1) {
                 tk_function mf = td.body.as.struct_body.methods[mi];
-                tk_type_result mft = tk_method_func_type(mf, td.name, table);
+                tk_type_result mft = tk_method_func_type(mf, td.name, table, owning_ns);   // (#109 W1) ref_ns = the type's declaring namespace
                 if (!mft.ok) return (tk_collected_result){ .ok = false, .as.error = mft.as.error };
                 env = tk_env_define_fn(env, mf.name, mft.as.value, method_ns);
             }
@@ -896,7 +900,7 @@ tk_collected_result tk_collect(tk_program program) {
             if (!eff.ok) return (tk_collected_result){ .ok = false, .as.error = eff.as.error };
             for (size_t mi = 0; mi < eff.as.value.len; mi += 1) {
                 tk_function mf = eff.as.value.ptr[mi];
-                tk_type_result mft = tk_method_func_type(mf, td.name, table);
+                tk_type_result mft = tk_method_func_type(mf, td.name, table, owning_ns);   // (#109 W1) ref_ns = the type's declaring namespace
                 if (!mft.ok) return (tk_collected_result){ .ok = false, .as.error = mft.as.error };
                 env = tk_env_define_fn(env, mf.name, mft.as.value, method_ns);
             }
@@ -929,7 +933,7 @@ tk_collected_result tk_collect_with_seed(tk_program program, tk_collected seed) 
     for (size_t i = 0; i < program.len; i += 1) {
         if (program.items[i].tag == TK_ITEM_FUNCTION) {
             tk_function f = program.items[i].as.function;
-            tk_type_result ft = func_type(f, table);
+            tk_type_result ft = func_type(f, table, program.items[i].namespace);   // (#109 W1) ref_ns = the fn's declaring namespace
             if (!ft.ok) return (tk_collected_result){ .ok = false, .as.error = ft.as.error };
             env = tk_env_define_fn(env, f.name, ft.as.value, program.items[i].namespace);
         } else if (program.items[i].tag == TK_ITEM_TYPE_DECL && program.items[i].as.type_decl.body.tag == TK_BODY_STRUCT) {
@@ -939,7 +943,7 @@ tk_collected_result tk_collect_with_seed(tk_program program, tk_collected seed) 
             tk_str method_ns = owning_ns.len == 0 ? td.name : collect_str_concat(collect_str_concat(owning_ns, (tk_str){ .ptr = (const tk_byte *)"::", .len = 2 }), td.name);
             for (size_t mi = 0; mi < td.body.as.struct_body.n_methods; mi += 1) {
                 tk_function mf = td.body.as.struct_body.methods[mi];
-                tk_type_result mft = tk_method_func_type(mf, td.name, table);
+                tk_type_result mft = tk_method_func_type(mf, td.name, table, owning_ns);   // (#109 W1) ref_ns = the type's declaring namespace
                 if (!mft.ok) return (tk_collected_result){ .ok = false, .as.error = mft.as.error };
                 env = tk_env_define_fn(env, mf.name, mft.as.value, method_ns);
             }
@@ -953,7 +957,7 @@ tk_collected_result tk_collect_with_seed(tk_program program, tk_collected seed) 
             if (!eff.ok) return (tk_collected_result){ .ok = false, .as.error = eff.as.error };
             for (size_t mi = 0; mi < eff.as.value.len; mi += 1) {
                 tk_function mf = eff.as.value.ptr[mi];
-                tk_type_result mft = tk_method_func_type(mf, td.name, table);
+                tk_type_result mft = tk_method_func_type(mf, td.name, table, owning_ns);   // (#109 W1) ref_ns = the type's declaring namespace
                 if (!mft.ok) return (tk_collected_result){ .ok = false, .as.error = mft.as.error };
                 env = tk_env_define_fn(env, mf.name, mft.as.value, method_ns);
             }
@@ -994,7 +998,7 @@ tk_collected_result tk_seed_from_dep(tk_tprogram dep, tk_type_table table, tk_en
         bool ok = true;
         tk_error err = {0};
         for (size_t k = 0; k < f.nparams; k += 1) {
-            tk_type_result pt = tk_resolve_type(f.params[k].type_ann, dtbl);
+            tk_type_result pt = tk_resolve_type(f.params[k].type_ann, dtbl, f.namespace);   // (#109 W1) ref_ns = the dep fn's declaring namespace
             if (!pt.ok) { ok = false; err = pt.as.error; break; }
             params = tk_realloc0(params, (np + 1) * sizeof *params);
             params[np++] = pt.as.value;
