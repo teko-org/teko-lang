@@ -185,9 +185,9 @@ static bool mono_check_constraints(tk_str *type_params, tk_constraint_expr *type
             return false;
         }
         tk_type *bound = mono_subst_find(s, type_params[i]);
-        if (!bound) { *out_err = tk_error_named("internal: monomorphization did not bind type parameter", type_params[i]); return false; }
+        if (!bound) { *out_err = tk_error_woven1("internal: monomorphization did not bind type parameter '", type_params[i], "'"); return false; }
         if (!mono_constraint_satisfied(type_constraints[i], *bound, table)) {
-            *out_err = tk_error_named("type parameter does not satisfy its constraint at this instantiation", type_params[i]);
+            *out_err = tk_error_woven1("type parameter '", type_params[i], "' does not satisfy its constraint at this instantiation");
             return false;
         }
     }
@@ -605,7 +605,7 @@ tk_tprogram_result tk_monomorphize(tk_tprogram prog, tk_type_table table) {
             return (tk_tprogram_result){ .ok = false, .as.error = tk_error_make("monomorphization exceeded the instantiation ceiling (5000) — likely unbounded polymorphic recursion") };
         mono_list_push(&stamped, inst);
         const tk_tfunction *gf = find_generic_fn(prog, inst.fn_name);
-        if (!gf) return (tk_tprogram_result){ .ok = false, .as.error = tk_error_named("internal: monomorph could not find generic fn", inst.fn_name) };
+        if (!gf) return (tk_tprogram_result){ .ok = false, .as.error = tk_error_woven1("internal: monomorph could not find generic fn ", inst.fn_name, "") };
         // (W11/S6) CONSTRAINT CHECK — gate this instantiation's concrete bindings before stamping.
         {
             tk_error cerr;
