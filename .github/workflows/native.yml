@@ -46,39 +46,14 @@ jobs:
         include:
           - os: ubuntu-latest
             label: linux-x86_64
-            cmake_args: -G "Ninja" -DCMAKE_C_COMPILER=clang -DCMAKE_BUILD_TYPE=Release
-            test_cmd: ./build/teko test . --coverage
-            install_deps: |
-              sudo apt-get update -y
-              sudo apt-get install -y cmake ninja-build clang
-
           - os: ubuntu-24.04-arm
             label: linux-arm64
-            cmake_args: -G "Ninja" -DCMAKE_C_COMPILER=clang -DCMAKE_BUILD_TYPE=Release
-            test_cmd: ./build/teko test . --coverage
-            install_deps: |
-              sudo apt-get update -y
-              sudo apt-get install -y cmake ninja-build clang
-
           - os: macos-latest
             label: macos-arm64
-            cmake_args: -DCMAKE_BUILD_TYPE=Release
-            test_cmd: ./build/teko test . --coverage
-            install_deps: ""
-
-          # Windows: use Clang + Ninja (MSVC does not support __int128).
-          # The windows-latest runner ships LLVM/Clang and Ninja pre-installed.
           - os: windows-latest
             label: windows-x86_64
-            cmake_args: -G "Ninja" -DCMAKE_C_COMPILER=clang -DCMAKE_BUILD_TYPE=Release
-            test_cmd: .\build\teko.exe test . --coverage
-            install_deps: ""
-
           - os: windows-11-arm
             label: windows-arm64
-            cmake_args: -G "Ninja" -DCMAKE_C_COMPILER=clang -DCMAKE_BUILD_TYPE=Release
-            test_cmd: .\build\teko.exe test . --coverage
-            install_deps: ""
 
     name: build-test / ${{ matrix.label }}
     runs-on: ${{ matrix.os }}
@@ -87,18 +62,19 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install build dependencies
-        if: matrix.install_deps != ''
-        run: ${{ matrix.install_deps }}
+      # The compiler is no longer built from the C bootstrap — it is the previously
+      # RELEASED teko binary (Teko-only ruling). CI provisions it by downloading the
+      # latest release's per-platform asset, then runs the PR corpus through it.
+      - name: Provision teko from the latest release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LABEL: ${{ matrix.label }}
+        run: ./scripts/ci_provision_teko.sh "$LABEL"
 
-      - name: Configure CMake
-        run: cmake -S . -B build ${{ matrix.cmake_args }}
-
-      - name: Build teko
-        run: cmake --build build --config Release --target teko --parallel 4
-
-      - name: Run tests
-        run: ${{ matrix.test_cmd }}
+      - name: Test gate (VM)
+        shell: bash
+        run: teko test . --coverage
 
   # ── RISC-V cross-compile + QEMU (non-blocking) ───────────────────────────────
   riscv64-qemu:
@@ -151,12 +127,12 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            cmake_args: -G "Ninja" -DCMAKE_C_COMPILER=clang -DCMAKE_BUILD_TYPE=Release
+            label: linux-x86_64
             install_deps: |
               sudo apt-get update -y
-              sudo apt-get install -y cmake ninja-build clang
+              sudo apt-get install -y clang
           - os: macos-latest
-            cmake_args: -DCMAKE_BUILD_TYPE=Release
+            label: macos-arm64
             install_deps: ""
 
     name: diff VM==native / ${{ matrix.os }}
@@ -169,26 +145,36 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install build dependencies
+      # The native side of the harness compiles the GENERATED C (+ the runtime seam
+      # teko_rt.c) with the host cc — so cc is still needed; the COMPILER itself is
+      # the downloaded release, not a from-source build.
+      - name: Install cc
         if: matrix.install_deps != ''
         run: ${{ matrix.install_deps }}
 
-      - name: Configure CMake
-        run: cmake -S . -B build ${{ matrix.cmake_args }}
+      - name: Provision teko from the latest release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LABEL: ${{ matrix.label }}
+        run: ./scripts/ci_provision_teko.sh "$LABEL"
 
-      - name: Build teko
-        run: cmake --build build --config Release --target teko --parallel 4
+      - name: CLI flags (--version/-v, --help/-h, bare exit 2) on the released teko
+        shell: bash
+        run: ./scripts/cli_flags_test.sh "$(command -v teko)"
 
-      - name: CLI flags (--version/-v, --help/-h, bare exit 2) on the C-bootstrap teko
-        run: ./scripts/cli_flags_test.sh ./build/teko
-
-      - name: Self-host teko (for the CLI-flags parity check)
-        run: ./build/teko . -o bin
+      - name: Self-host teko (released seed rebuilds itself → bin/teko)
+        shell: bash
+        run: teko . -o bin
 
       - name: CLI flags on the self-hosted teko (identical version string)
+        shell: bash
         run: ./scripts/cli_flags_test.sh ./bin/teko
 
       - name: Differential harness (VM == native over examples/regressions)
+        shell: bash
+        env:
+          TEKO: .seed/teko
         run: ./scripts/diff_vm_native.sh
 
   # ── gate: aggregates all build-test + riscv + differential results ────────────

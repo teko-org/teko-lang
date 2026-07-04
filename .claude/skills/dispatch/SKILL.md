@@ -37,6 +37,7 @@ For BLOCKED issues, do NOT wait idle:
 - Adjacent findings reported by agents: YOU file/sequence them (agents must not `gh issue create`). Keep the board converging.
 - Update the plan/memory after each milestone (or dispatch `teko-docs`).
 - **Version bump on merge:** when you merge a CODE PR, bump `teko.tkp`'s 4th field (`BUILD`) +1 in the branch before merging (reset to 0 on a major/minor/patch bump). This auto-tags + publishes an alpha prerelease whose version matches `teko --version`. Docs/config-only merges do NOT bump it (no release).
+- **Serial merge via re-sync (not a rigid queue):** CI provisions the compiler by DOWNLOADING the latest release, and each code merge publishes a new one. So after you merge a PR, SYNC every other open PR to `main` (merge/rebase `main` in, resolve conflicts) and let its CI re-run against the NEW released compiler; only merge the next once it is green against the updated `main`. A PR is thus never merged while the previous one's Actions (CI + tag + release) are still in flight — the download-latest dependency serializes them. You orchestrate this; there is no merge queue.
 
 ## Standing laws (enforce on every agent)
 Teko-only (`.tks`; frozen C twins except `teko_rt`); W15-from-now (doc-comments only, flatten/extract); issues are 100% (no scope-narrowing, no self-spawned issues); bootstrap seed = the released binary; the full ritual on compiler changes; kill orphan sub-agents. See memory: `teko-agent-team`, `teko-no-more-mirroring`, `teko-w15-style-from-now`, `teko-issue-fix-flow`.
