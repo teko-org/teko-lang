@@ -970,6 +970,18 @@ static bool try_builtin_call(tk_path p, const tk_texpr *args, size_t nargs,
         *out = list; return true;
     }
     // len_chars — (str) -> i64. Count UTF-8 codepoints without allocation.
+    if (seg_is(last, "append_fo")) {   /* (#148 R2) teko::mem::append_fo(dst, src) — VM mirrors the value */
+        if (nargs != 2) vm_unsupported("append_fo expects two arguments ([]byte, str)");
+        tk_value afd = tk_vm_eval_expr(&args[0], env);
+        tk_value afs = tk_vm_eval_expr(&args[1], env);
+        if (afd.tag != TK_VAL_LIST) vm_unsupported("append_fo on a non-list dst (internal: checker should reject)");
+        if (afs.tag != TK_VAL_STR) vm_unsupported("append_fo src must be a str (internal: checker should reject)");
+        tk_value af_out = afd;
+        for (size_t af_i = 0; af_i < afs.as.s.len; af_i += 1)
+            af_out = v_list_push(af_out.as.list, v_int((uint64_t)afs.as.s.ptr[af_i], false, 8));
+        *out = af_out;
+        return true;
+    }
     if (seg_is(last, "peak_rss")) {   /* (#148) teko::mem::peak_rss() -> u64 (peak RSS bytes) */
         *out = v_int((unsigned __int128)tk_peak_rss(), true, 64); return true;
     }

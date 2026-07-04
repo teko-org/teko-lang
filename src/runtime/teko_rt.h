@@ -460,6 +460,9 @@ void *tk_slice_push_r(const void *ptr, uint64_t len, const void *elem, uint64_t 
 // (#148 S2 Level-2) free-old-on-grow variant — for a self-append whose chain the checker PROVED
 // linear: on a copy-grow the old buffer is PARKED on the free-list for reuse (realloc parity).
 void *tk_slice_push_fo(const void *ptr, uint64_t len, const void *elem, uint64_t esz, uint64_t *out_len);
+// (#148 R2) bulk byte-append with free-old-on-grow BY DECREE (the linear cb emitter chain) — one
+// memcpy per fragment; the old buffer parks for reuse the moment a grow replaces it.
+void *tk_append_bytes_fo(const void *ptr, uint64_t len, const void *src, uint64_t n, uint64_t *out_len);
 // (mem::free) tk_free_block — park an explicitly freed root-arena block for same-size REUSE
 // (the `teko::mem::free` []T-arm lowering: `tk_free_block(s.ptr, s.len * sizeof(elem))`).
 void tk_free_block(void *p, uint64_t bytes);

@@ -1726,6 +1726,50 @@ void *tk_slice_push_r(const void *ptr, uint64_t len, const void *elem, uint64_t 
     return buf;
 }
 
+// (#148 R2) tk_append_bytes_fo — BULK append of `n` bytes onto a []byte builder, with FREE-OLD
+// on copy-grow BY DECREE: the ONLY caller is the emitters' `cb` helper (codegen.tks), whose buffer
+// is threaded LINEARLY through every emit fn (`out = cb(out, …)` / take-buf-return-grown) — no
+// alias of an intermediate buffer ever survives, so the old buffer is parked for reuse the moment
+// a grow replaces it. TEKO_MEM_PARANOID is the decree's guard (poison + never reuse → a violation
+// fails the gate loudly). Replaces cb's per-byte push loop: one memcpy per fragment (CPU win) and
+// realloc-parity ladders (memory win).
+void *tk_append_bytes_fo(const void *ptr, uint64_t len, const void *src, uint64_t n, uint64_t *out_len) {
+    if (n == 0) { *out_len = len; return (void *)ptr; }
+    if (ptr != NULL) {   // in-place: the live tail with enough spare capacity
+        unsigned h = tk_push_slot(ptr);
+        if (tk_push_cache[h].ptr == ptr && tk_push_cache[h].len == len && tk_push_cache[h].esz == 1
+            && tk_push_cache[h].region == tk_g_root && tk_push_cache[h].region_gen == tk_g_root->gen
+            && len + n <= tk_push_cache[h].cap) {
+            memcpy((char *)ptr + len, src, n);
+            tk_push_cache[h].len = len + n;
+            *out_len = len + n;
+            return (void *)ptr;
+        }
+    }
+    // copy-grow: geometric, but never below what the fragment needs.
+    uint64_t cap = (len < 4) ? 8 : (len * 2);
+    if (cap < len + n) cap = len + n;
+    uint64_t old_bytes = len;
+    if (ptr != NULL) {
+        unsigned h = tk_push_slot(ptr);
+        if (tk_push_cache[h].ptr == ptr && tk_push_cache[h].esz == 1 && tk_push_cache[h].cap > len)
+            old_bytes = tk_push_cache[h].cap;   // the live tail — its full capacity is reusable
+        tk_push_cache[h].ptr = NULL;            // superseded (mirrors tk_slice_push_r's clear)
+    }
+    void *buf = tk_alloc(cap);
+    if (len) memcpy(buf, ptr, len);
+    memcpy((char *)buf + len, src, n);
+    unsigned hb = tk_push_slot(buf);
+    if (tk_push_cache[hb].ptr == NULL || tk_push_cache[hb].cap * tk_push_cache[hb].esz <= cap) {
+        tk_push_cache[hb].ptr = buf; tk_push_cache[hb].len = len + n;
+        tk_push_cache[hb].cap = cap; tk_push_cache[hb].esz = 1;
+        tk_push_cache[hb].region = tk_g_root; tk_push_cache[hb].region_gen = tk_g_root->gen;
+    }
+    if (ptr != NULL) tk_free_block((void *)ptr, old_bytes);   // the DECREE: the old buffer is dead
+    *out_len = len + n;
+    return buf;
+}
+
 // the default root-region lowering (unchanged contract) — a thin wrapper over the region-aware core.
 void *tk_slice_push(const void *ptr, uint64_t len, const void *elem, uint64_t esz, uint64_t *out_len) {
     // (#148 RA1) park THIS caller's return address so the core attributes the grow to the generated

@@ -1947,6 +1947,32 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
                     cb(b, ")");
                     return true;
                 }
+                // (#148 R2) teko::mem::append_fo(dst: []byte, src: str) -> []byte — BULK append with
+                // free-old BY DECREE (linear builder chains only; TEKO_MEM_PARANOID is the guard).
+                // Bridge like str(): single-eval temps, then the runtime call over raw {ptr,len} pairs.
+                if ((p.len == 1 || seg_is(p.segments[0].name, "teko"))
+                    && seg_is(pe, "append_fo") && e->as.call.nargs == 2) {
+                    char ab[40], asr[40], al[40], ap[40];
+                    snprintf(ab, sizeof ab, "_ab%zu", (size_t)b->len);
+                    snprintf(asr, sizeof asr, "_as%zu", (size_t)b->len + 1);
+                    snprintf(al, sizeof al, "_al%zu", (size_t)b->len + 2);
+                    snprintf(ap, sizeof ap, "_ap%zu", (size_t)b->len + 3);
+                    tk_type byte_el = { .tag = TK_TYPE_BYTE };
+                    tk_type bytes_ty = { .tag = TK_TYPE_SLICE, .as.slice.element = &byte_el };
+                    tk_type str_ty = { .tag = TK_TYPE_STR };
+                    cb(b, "({ ");
+                    if (!cg_slice_typename(b, byte_el, err)) return false;
+                    cb(b, " "); cb(b, ab); cb(b, " = ");
+                    if (!emit_as(b, bytes_ty, &e->as.call.args[0], err)) return false;
+                    cb(b, "; tk_str "); cb(b, asr); cb(b, " = ");
+                    if (!emit_as(b, str_ty, &e->as.call.args[1], err)) return false;
+                    cb(b, "; uint64_t "); cb(b, al); cb(b, "; uint8_t *"); cb(b, ap);
+                    cb(b, " = (uint8_t *)tk_append_bytes_fo("); cb(b, ab); cb(b, ".ptr, "); cb(b, ab); cb(b, ".len, "); cb(b, asr); cb(b, ".ptr, "); cb(b, asr); cb(b, ".len, &"); cb(b, al);
+                    cb(b, "); (");
+                    if (!cg_slice_typename(b, byte_el, err)) return false;
+                    cb(b, "){ .ptr = "); cb(b, ap); cb(b, ", .len = "); cb(b, al); cb(b, " }; })");
+                    return true;
+                }
                 // Phase 3 — `str`/`str_of_bytes` (([]byte) -> str). A []byte lowers to the generated
                 // struct `tk_slice_byte {uint8_t*,uint64_t}`, a DISTINCT C type from `tk_str
                 // {const tk_byte*,size_t}` — passing one for the other is a C constraint violation. So

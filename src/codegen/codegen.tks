@@ -47,15 +47,14 @@ use teko::parser
 // ---------------------------------------------------------------------------
 
 // cb — append a str (its UTF-8 bytes) to the C-source buffer. (C: `cb`.)
+// (#148 R2) lowered to teko::mem::append_fo: ONE memcpy per fragment (was a per-byte push loop —
+// millions of calls on a self-build) and FREE-OLD on every grow. THE DECREE that makes free-old
+// sound: the emitter buffer is threaded LINEARLY through every emit fn (`out = cb(out, …)` /
+// take-buf-return-grown) — no alias of an intermediate buffer ever survives a grow. Enforced by
+// convention in this file and guarded by TEKO_MEM_PARANOID (poison + never reuse → any violation
+// fails the 659-test gate loudly).
 fn cb(buf: []byte, s: str) -> []byte {
-    mut b = buf
-    mut i = 0
-    loop {
-        if i >= s.len { break }
-        b = teko::list::push(b, s[i])
-        i++
-    }
-    b
+    teko::mem::append_fo(buf, s)
 }
 
 // cb_str — append a str span. In C this appended a tk_str's raw bytes (no NUL); in
@@ -1846,6 +1845,27 @@ fn emit_call(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, e: c
         // tk_slice_byte {uint8_t*,uint64_t}, a DISTINCT C type from tk_str — BRIDGE the slice to a
         // tk_str at the call site (single-eval via a temp), then tk_str_of_bytes COPIES it. Mirrors codegen.c.
         let addr = (p.segments.len == 1) || (p.segments[0].name == "teko")
+        // (#148 R2) teko::mem::append_fo(dst: []byte, src: str) -> []byte — BULK append with
+        // free-old BY DECREE (linear builder chains only; TEKO_MEM_PARANOID is the guard).
+        // Bridge like str(): single-eval temps, then the runtime call over raw {ptr,len} pairs.
+        if addr && pe == "append_fo" && c.args.len == 2 {
+            let ab = $"_ab{buf.len}"
+            let asr = $"_as{buf.len + 1}"
+            let al = $"_al{buf.len + 2}"
+            let ap = $"_ap{buf.len + 3}"
+            mut o = cb(buf, "({ ")
+            o = match cg_slice_typename(o, checker::Byte { }) { []byte as r => r; error as err => return err }
+            o = cb(o, " "); o = cb(o, ab); o = cb(o, " = ")
+            o = match emit_as(o, prog, checker::Slice { element = checker::Byte { } }, c.args[0], escaping, regions, fn_body, dctx) { []byte as r => r; error as err => return err }
+            o = cb(o, "; tk_str "); o = cb(o, asr); o = cb(o, " = ")
+            o = match emit_as(o, prog, checker::Str { }, c.args[1], escaping, regions, fn_body, dctx) { []byte as r => r; error as err => return err }
+            o = cb(o, "; uint64_t "); o = cb(o, al); o = cb(o, "; uint8_t *"); o = cb(o, ap)
+            o = cb(o, " = (uint8_t *)tk_append_bytes_fo("); o = cb(o, ab); o = cb(o, ".ptr, "); o = cb(o, ab); o = cb(o, ".len, "); o = cb(o, asr); o = cb(o, ".ptr, "); o = cb(o, asr); o = cb(o, ".len, &"); o = cb(o, al)
+            o = cb(o, "); (")
+            o = match cg_slice_typename(o, checker::Byte { }) { []byte as r => r; error as err => return err }
+            o = cb(o, "){ .ptr = "); o = cb(o, ap); o = cb(o, ", .len = "); o = cb(o, al)
+            return cb(o, " }; })")
+        }
         if addr && (pe == "str" || pe == "str_of_bytes") && c.args.len == 1 {
             let sb = $"_sb{buf.len}"
             mut o = cb(buf, "({ ")

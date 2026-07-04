@@ -357,6 +357,14 @@ tk_type_result tk_builtin_fn(tk_str name) {
         tk_type ft = { .tag = TK_TYPE_FUNC, .as.func = { .params = NULL, .nparams = 0, .ret = &u64_t } };
         return (tk_type_result){ .ok = true, .as.value = ft };
     }
+    if (name_is(name, "append_fo")) {                                 // (#148 R2) teko::mem::append_fo([]byte, str) -> []byte — bulk append, free-old by decree
+        static tk_type ab_byte  = { .tag = TK_TYPE_BYTE };
+        static tk_type ab_bytes = { .tag = TK_TYPE_SLICE, .as.slice = { .element = &ab_byte } };
+        static tk_type ab_params[2];
+        ab_params[0] = ab_bytes; ab_params[1] = str_t;
+        tk_type ft = { .tag = TK_TYPE_FUNC, .as.func = { .params = ab_params, .nparams = 2, .ret = &ab_bytes } };
+        return (tk_type_result){ .ok = true, .as.value = ft };
+    }
     if (name_is(name, "cov_is_marked")) {
         tk_type ft = { .tag = TK_TYPE_FUNC, .as.func = { .params = &u64_t, .nparams = 1, .ret = &bool_t } };
         return (tk_type_result){ .ok = true, .as.value = ft };
