@@ -1,6 +1,6 @@
 # TEKO — ROADMAP: standard-library core (`teko::io` · `teko::iter`)
 
-> **Status:** DESIGN (no code yet) · **Created:** 2026-07-02 · **Updated:** 2026-07-02 (`try` REJECTED — see §1) · **Branch:** `feat/net-connectors` (off `chore/reboot`)
+> **Status:** DESIGN (no code yet) · **Created:** 2026-07-02 · **Updated:** 2026-07-02 (`try` REJECTED — see §1) · **Branch:** `main`
 >
 > Two **foundational** additions that multiply everything built on top of them. They are listed FIRST
 > because they change the *shape* of the net/crypto/db/encoding/compress surfaces — landing them before

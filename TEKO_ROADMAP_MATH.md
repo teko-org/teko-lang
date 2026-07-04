@@ -1,6 +1,6 @@
 # TEKO — ROADMAP: `teko::math::*`
 
-> **Status:** DESIGN (no code yet) · **Created:** 2026-07-02 · **Branch:** `feat/net-connectors` (off `chore/reboot`)
+> **Status:** DESIGN (no code yet) · **Created:** 2026-07-02 · **Branch:** `main`
 >
 > A specialized mathematics surface under `teko::math::*`: elementary + advanced **functions** and
 > numeric **types** that (a) are called by **name, not operators**, and (b) **return `T | error` instead

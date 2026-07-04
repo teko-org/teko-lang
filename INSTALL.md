@@ -15,7 +15,7 @@ platform notes.
 One-liner:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/schivei/teko-lang/chore/reboot/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/schivei/teko-lang/main/install.sh | sh
 ```
 
 By default this downloads the prebuilt `teko-<label>.tar.gz` for your platform from the

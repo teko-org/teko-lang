@@ -29,7 +29,7 @@ Language-design tensions are resolved by the laws in [TEKO_CONSTITUTION.md](TEKO
 
 ## Branch and PR mechanics
 
-- **Base your PRs on `chore/reboot`** (`gh pr create --base chore/reboot`). The `main` branch is the archived pre-reboot line; the repository default still points at it, so double-check the base before submitting.
+- **Base your PRs on `main`** (`gh pr create --base main`). The pre-reboot line lives on in git history only; `main` is the active development line (promoted from `chore/reboot` via PR #25).
 - Use **Conventional Commits** (`feat(parser): …`, `fix(vm): …`, `docs: …`, `chore: …`).
 - Keep PRs focused: one feature/fix per PR, with its mirror changes and tests included.
 

@@ -1,6 +1,6 @@
 # TEKO — ROADMAP: database connectors (`teko::db::*`) + on-demand FFI linking
 
-> **Status:** DESIGN (no code yet) · **Created:** 2026-07-02 · **Branch:** `feat/net-connectors` (off `chore/reboot`)
+> **Status:** DESIGN (no code yet) · **Created:** 2026-07-02 · **Branch:** `main`
 >
 > A `teko::db::*` surface: one common connection interface + plugable drivers. **Native Teko wire-protocol
 > drivers are PREFERRED** (zero external dependency, portable, `FROM scratch`-friendly); FFI drivers exist

@@ -1,6 +1,6 @@
 # TEKO — ROADMAP: package ecosystem (registry + resolver + `teko::pkg`)
 
-> **Status:** DESIGN (no code yet) · **Created:** 2026-07-02 · **Branch:** `feat/net-connectors` (off `chore/reboot`)
+> **Status:** DESIGN (no code yet) · **Created:** 2026-07-02 · **Branch:** `main`
 >
 > The ecosystem keystone. Every sibling roadmap that says "first-party PACKAGE" (web framework, GraphQL,
 > OAuth server, OpenAPI, ORM, Prometheus/OTLP exporters, FFI DB drivers) presumes a way to **publish,

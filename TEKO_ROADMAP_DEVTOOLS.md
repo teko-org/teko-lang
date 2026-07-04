@@ -1,6 +1,6 @@
 # TEKO — ROADMAP: developer tooling (`teko fmt` · `teko doc` · lint · repl)
 
-> **Status:** DT0 ✅ DONE (issue #95) · DT1–DT3 DESIGN · **Created:** 2026-07-02 · **Branch:** `feat/net-connectors` (off `chore/reboot`)
+> **Status:** DT0 ✅ DONE (issue #95) · DT1–DT3 DESIGN · **Created:** 2026-07-02 · **Branch:** `main`
 >
 > Native `teko` **subcommands** — written in Teko inside the compiler (`src/...`, SUPREME-RULE twin pair,
 > same ruling as `teko lsp` [[teko-lsp-native-deferred]]) — that reuse the existing lexer/parser/AST.
@@ -93,4 +93,4 @@ runtime, no keystone dependency. Can start immediately in parallel with the libr
    the future LSP hover consumes?
 4. **Subcommand vs external tool:** all four are in-compiler native subcommands (rec, per the `teko lsp`
    ruling) vs separate binaries.
-5. **`fmt --check` as a CI gate** on `chore/reboot` once the corpus is a fixpoint — confirm we add it.
+5. **`fmt --check` as a CI gate** on `main` once the corpus is a fixpoint — confirm we add it.

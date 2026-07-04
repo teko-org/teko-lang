@@ -1,6 +1,6 @@
 # TEKO — MASTER PLAN (execution sequence)
 
-> **Status:** active · **Created:** 2026-06-25 · **Branch:** chore/reboot
+> **Status:** active · **Created:** 2026-06-25 · **Branch:** `main` (the reboot line, promoted via PR #25)
 >
 > This is the single, ordered execution sequence for ALL open teko-lang work. It consolidates:
 > the legislator's session critiques/directives, and every not-yet-done item mined from
@@ -101,7 +101,7 @@ compile+link gate which is now the milestone reached.
 | 7 | Host independence | ✅ **CLOSED** — extern/FFI (C7.1a–i, C7.1k, C7.1m) ✅; D2/D3/D4 test gate ✅; `.tkb` program codec C7.16 ✅; `-o <dir>` ✅; main-rule C7.9 ✅; tk_str_eq C7.13 ✅; TK_RT_LIST C7.14 ✅; spread C6.7+C6.8 ✅; host ns files C7.2–5 ✅; `.tkl` ZIP C7.12 ✅; overflow-debug C7.15 ✅; pre-linker C7.10 ✅; driver.tks C7.17 ✅; flags-kw C8.1 ✅; **E2-NATIVE** ✅; **C1.7-CAST** ✅; **C8.3** ✅; **C8.5** ✅; **C8.6** ✅; **`defer` C7.18** ✅; **C7.1j multi-OS/arch CI** ✅ (W6). | FFI + host surfaces + VM test gate + project/output/pack |
 | 8 | FLAGS | ✅ **CLOSED** — C8.1 keyword ✅, C8.2 decl+AST+parser ✅, C8.3 checker (power-of-2 auto, u128 guard, bitwise, helpers) ✅, C8.4 codegen ✅, C8.5 VM ✅, C8.6 `.tkb` ✅ (W1–W4). | Bitflag enums (spec frozen) |
 | 9 | SEC | ✅ **CLOSED** — C9.2 capability audit ✅ (`src/checker/capability_audit.md`); **C9.1 SAST gate** ✅ (`.github/workflows/sast.yml` — CodeQL + clang-tidy-audit, W6). Further hardening is opportunistic, not a blocking item. | SAST + capability audit, after corrections |
-| 10 | Evolution S1–S10 | 🔶 **PARTIAL** — DONE: **S1** arena ✅, **S4** generics ✅, **ptr<T>** ✅, **MEM-1 the full automatic memory model** ✅ (W8), **W9** per-fn regions ✅, **W9.4** parser generics-ergonomics ✅, **W9.5** brevity ✅ (closed — code already DRY), **W10 closures** ✅ (`d138c35`), **W10b OOP ROUND 1+2** ✅ — struct methods (PR #37), the `class` construct all 4 increments (PR #39), `interface` + real conformance (PR #46), plus `params`/`~` concat/default-args+named-call (PRs #33/#34). NEXT: OOP ROUND 3 (interface-as-value dispatch D2/D3) + **`trait`** (W10b.TRAIT — DEFINED, struct-shaped derivable mixin; `TEKO_ROADMAP_TRAITS.md`) → **W10c** MEM-3 DI/lifetimes → S2 block-arm regions → S6/S7/S8/S9/S10. | Post-self-host campaign (arenas → generics → **memory model ✅** → brevity ✅ → **closures ✅** → **OOP R1+R2 ✅** → traits → collections → concurrency → async/await) |
+| 10 | Evolution S1–S10 | 🔶 **PARTIAL** — DONE: **S1** arena ✅, **S4** generics ✅, **ptr<T>** ✅, **MEM-1 the full automatic memory model** ✅ (W8), **W9** per-fn regions ✅, **W9.4** parser generics-ergonomics ✅, **W9.5** brevity ✅ (closed — code already DRY), **W10 closures** ✅ (`d138c35`), **W10b OOP ROUND 1+2** ✅ — struct methods (PR #37), the `class` construct all 4 increments (PR #39), `interface` + real conformance (PR #46), plus `params`/`~` concat/default-args+named-call (PRs #33/#34), **W10b OOP ROUND 3** ✅ — fallible factories C1, invariant-safe construction D1, static `<T: I>` dispatch D2 (#99/#140), dynamic vtable dispatch + Sub→Base upcast D3 (#98/#144), **`trait` TR0–TR3** ✅, **null-propagation `?.`/`??`** ✅, **#109 namespace-aware type table** ✅ (PR #147, canonical names + R0–R5 + platform-order sweep #152), **S2 MEMORY CAMPAIGN** ✅ (#148, PR #147: arena observability + free-list + `teko::mem::{free,append_fo,push_fo}` free-old by decree + right-sized rungs — self-build **8.5 GB → <300 MB**, full gate 9 GB OOM → 1.2 GB, gen-2==gen-3 fixpoint RESTORED, compiler self-reports peak). NEXT: **W10c** MEM-3 DI/lifetimes → S2 block-arm regions → S6/S7/S8/S9/S10. | Post-self-host campaign (arenas → generics → **memory model ✅** → brevity ✅ → **closures ✅** → **OOP R1+R2+R3 ✅** → **traits ✅** → collections → concurrency → async/await) |
 | 11 | **Code quality sweep** | ⬜ **LAST** | DRY + KISS + SOLID + YAGNI + 12-Factor (III/V/IX/XI/XII) + comment hygiene — applied once to settled code |
 
 ---
@@ -200,7 +200,7 @@ compile+link gate which is now the milestone reached.
 **Work:** SAST gate + capability/sandboxing audit of the `exp` / `extern` / syscall surface.
 **Exit:** the security gate runs in CI; the FFI/syscall surface is audited.
 
-### Phase 10 — EVOLUTION campaign S1–S9  *(EVOLUTION_DESIGN/JUSTIFICATION; POST-SELF-HOST; R1/R2 ratified)*  🔶 IN FLIGHT (S1/S3/S4 ✅, S2 per-fn ✅; rest ⬜)
+### Phase 10 — EVOLUTION campaign S1–S9  *(EVOLUTION_DESIGN/JUSTIFICATION; POST-SELF-HOST; R1/R2 ratified)*  🔶 IN FLIGHT (S1/S3/S4 ✅, S2 per-fn ✅ + memory campaign #148 ✅; block-arm ⬜, rest ⬜)
 **Goal:** build the foundation keystone-first, in dependency order, against real self-hosted data (M.4).
 **Hard ordering invariant:** arenas (S1–S2) before ref (S3) and before DI / collections storage; generics (S4) before real collections (S7); Map (S7) forces constraints (S6); single-task arenas+ref (S1–S3) before concurrency (S8); concurrency is independent of generics.
 **Stages:**
@@ -494,7 +494,7 @@ into **rounds** (parallel waves). The goal is **maximum agent concurrency** with
 
 **Rounds (cross-phase wave schedule):** C9.2 → **W4** · C9.1 → **W6** (see master sequence table).
 
-## Phase 10 — Evolution S1–S10 🔶 IN FLIGHT (S1 ✅, S4 ✅, S3 ✅, S2 per-fn ✅ / block ⬜; S4c/S5/S6/S7/S8/S9/S10 ⬜) *(POST-SELF-HOST; each S-stage is its own sub-project — detailed crumbs are drafted AT stage start against real data, M.4)*
+## Phase 10 — Evolution S1–S10 🔶 IN FLIGHT (S1 ✅, S4 ✅, S3 ✅, S2 per-fn ✅ + #148 memory campaign ✅ / block ⬜; S4c/S5/S6/S7/S8/S9/S10 ⬜) *(POST-SELF-HOST; each S-stage is its own sub-project — detailed crumbs are drafted AT stage start against real data, M.4)*
 
 Stage-level dependency waves (the hard-ordering invariant). Generics (S4) runs parallel to arenas (S1–S3); closures (S4c) unlock after S4; async/await (S10) is the capstone.
 
@@ -505,7 +505,7 @@ Stage-level dependency waves (the hard-ordering invariant). Generics (S4) runs p
 | ✅ | **C10.S1** arena primitive + root region | S0 seam (done) | W7 |
 | ✅ | **C10.S4** generics (unconstrained, monomorphization) | — | W7 |
 | ✅ | **C10.S3** `ref` (mutable-target only) — **delivered as `Ref<T>` in MEM-1** (the `ref` keyword became the `Ref<T>` type) | S2 | W8 |
-| 🔶 | **C10.S2 ★** scope regions + escape check — **per-FUNCTION regions DONE (MEM-1/W8)**; block-scoped regions remain (W9) | S1 | W8 (fn) / W9 (block) |
+| 🔶 | **C10.S2 ★** scope regions + escape check — **per-FUNCTION regions DONE (MEM-1/W8)**; **memory campaign DONE (#148: obs + free-list + free-old by decree + right-sized rungs — self-build <300 MB, fixpoint restored)**; block-scoped regions remain (W9) | S1 | W8 (fn) / W9 (block) |
 | ⬜ | **C10.S4c** closures — `fn` literals with lexical capture; value-capturing first (environment struct + fn-ptr pair); reference-capturing after S3. Full pipeline: parser `\|params\| body` syntax; checker captures types + infer; codegen closure struct emission; VM closure values. | S4 | W10 |
 | ⬜ | **C10.S5** DI lifetimes → arenas (`#singleton`/`#scoped`/`#transient`) | S2 (+S3) | W10 |
 | ⬜ | **C10.S6** constraints (positive; `!` only prims/sealed) | S4 + real Map need | W11 |

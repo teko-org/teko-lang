@@ -28,7 +28,7 @@ Teko is a compiled, statically-typed programming language with a **fully self-ho
 - **Automatic memory without a GC.** Lexical arena regions with escape analysis — allocation and deallocation are compiler-managed; no `malloc`/`free`, no borrow checker ceremony.
 - **A deliberately small surface.** One loop construct (`loop` + `break`), `match` for control flow over data, generics via monomorphization, value structs, reference classes, pure-contract interfaces, bitflag `flags`, `extern` FFI to C libraries.
 
-> **Status: pre-release** (`0.0.1.0-bootstrap`). The language and compiler are under active, fast-moving development on the `chore/reboot` line. Syntax and semantics can still change between commits. See [TEKO_MASTER_PLAN.md](TEKO_MASTER_PLAN.md) for the live execution roadmap.
+> **Status: pre-release** (`0.0.1.0-bootstrap`). The language and compiler are under active, fast-moving development on `main`. Syntax and semantics can still change between commits. The compiler is fully self-hosting (gen-2 == gen-3 byte-identical fixpoint) and self-builds in under 300 MB of peak memory. See [TEKO_MASTER_PLAN.md](TEKO_MASTER_PLAN.md) for the live execution roadmap.
 
 ## A taste of Teko
 

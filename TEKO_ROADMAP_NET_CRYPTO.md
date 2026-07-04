@@ -1,6 +1,6 @@
 # TEKO — ROADMAP: `teko::net` + `teko::crypto` + `teko::encoding` + `teko::compress`
 
-> **Status:** DESIGN (no code yet) · **Created:** 2026-07-02 · **Branch:** `feat/net-connectors` (off `chore/reboot`)
+> **Status:** DESIGN (no code yet) · **Created:** 2026-07-02 · **Branch:** `main`
 >
 > Goal: network connectors for OSI **layers 4–7** under `teko::net::*`; a security surface under
 > `teko::crypto::*` (symmetric + **asymmetric/public-key** + **OpenPGP/GPG**); serialization/parsers under

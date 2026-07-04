@@ -1,6 +1,6 @@
 # TEKO — ROADMAP: cloud-native / 12-factor operations
 
-> **Status:** DESIGN (no code yet) · **Created:** 2026-07-02 · **Branch:** `feat/net-connectors` (off `chore/reboot`)
+> **Status:** DESIGN (no code yet) · **Created:** 2026-07-02 · **Branch:** `main`
 >
 > The production-operations layer: configuration, observability (logs/metrics/traces), lifecycle
 > (health, graceful shutdown, signals), resilience (retry/backoff/circuit breaker), and background jobs.

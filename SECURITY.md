@@ -2,7 +2,7 @@
 
 ## Supported versions
 
-Teko is pre-release (`0.0.1.0-bootstrap`); only the tip of the active development branch (`chore/reboot`) receives fixes.
+Teko is pre-release (`0.0.1.0-bootstrap`); only the tip of the active development branch (`main`) receives fixes.
 
 ## Reporting a vulnerability
 

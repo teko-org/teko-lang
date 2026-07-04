@@ -1,6 +1,6 @@
 # TEKO — ROADMAP: web + API patterns (`teko::web` · `teko::auth` · API standards)
 
-> **Status:** DESIGN (no code yet) · **Created:** 2026-07-02 · **Branch:** `feat/net-connectors` (off `chore/reboot`)
+> **Status:** DESIGN (no code yet) · **Created:** 2026-07-02 · **Branch:** `main`
 >
 > The layer that turns the net/crypto/encoding **primitives** into "I write an API comfortably": the
 > web/API **patterns**. Built entirely on `teko::net::http`/`ws`/`sse`, `teko::io` streams, and the

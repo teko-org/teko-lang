@@ -4,7 +4,7 @@
 
 ## Checklist (project invariants — see CONTRIBUTING.md)
 
-- [ ] **Base branch is `chore/reboot`** (not `main` — the repo default is wrong)
+- [ ] **Base branch is `main`** (the active development line)
 - [ ] **SUPREME RULE**: every `.c`/`.h` change is mirrored in its `.tks` twin (and vice versa)
 - [ ] Verified with the C bootstrap: `./build/teko build . -o bin` (test gate green)
 - [ ] Verified self-hosted: `./bin/teko build . -o /tmp/gen2` (test gate green)
