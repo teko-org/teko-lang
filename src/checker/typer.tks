@@ -355,7 +355,12 @@ fn type_list_builtin(c: parser::Call, env: Env, table: TypeTable) -> TExpr | Not
     if c.callee.segments.len < 2 { return NotListBuiltin { } }
     let last = c.callee.segments[c.callee.segments.len - 1].name
     let prev = c.callee.segments[c.callee.segments.len - 2].name
-    if prev != "list" { return NotListBuiltin { } }
+    // (#148 R3) teko::mem::push_fo — push with FREE-OLD BY DECREE. Same typing/semantics as
+    // teko::list::push; the CALLER asserts the base is a linear chain (the old buffer is dead
+    // after the grow), so native codegen frees it (tk_slice_push_fo). TEKO_MEM_PARANOID is the
+    // fiscal: a wrong decree poisons instead of parking and the gate fails loudly. (Mirror expr.c.)
+    let is_pushfo = prev == "mem" && last == "push_fo"
+    if prev != "list" && !is_pushfo { return NotListBuiltin { } }
     let rooted = c.callee.segments.len == 2 || c.callee.segments[0].name == "teko"
     if !rooted { return NotListBuiltin { } }
 
@@ -363,7 +368,7 @@ fn type_list_builtin(c: parser::Call, env: Env, table: TypeTable) -> TExpr | Not
         if c.args.len != 0 { return error { message = "teko::list::empty expects no arguments" } }
         // SENTINEL slice: element is the Void marker (unifies with any concrete slice — type_eq).
         TExpr { kind = TCall { callee = c.callee; args = teko::list::empty(); call_ns = ""; is_closure_call = false; callee_type = Void { }; is_iface_dispatch = false; iface_slot = 0 }; type = Slice { element = Void { } }; line = 0; col = 0 }
-    } else if last == "push" {
+    } else if last == "push" || is_pushfo {
         if c.args.len != 2 { return error { message = "teko::list::push expects two arguments (slice, item)" } }
         let s = match type_expr(c.args[0], env, table) { TExpr as te => te; error as e => return e }
         let x = match type_expr(c.args[1], env, table) { TExpr as te => te; error as e => return e }
@@ -1949,6 +1954,8 @@ fn tblock_diverges(stmts: []TStatement) -> bool {
 // ---- a typed block: thread the env, collect the typed statements ----
 fn type_block(stmts: []parser::Statement, env: Env, table: TypeTable) -> TypedBlock | error {
     mut cur = env
+    // (#148 R3 DECREE) `out` is a linear chain: born empty, self-append-only, read only after the
+    // loop — so every copy-grow frees the superseded buffer (mem::push_fo; paranoid-gated).
     mut out: []TStatement = teko::list::empty()
     mut i = 0
     loop {
@@ -1965,13 +1972,13 @@ fn type_block(stmts: []parser::Statement, env: Env, table: TypeTable) -> TypedBl
                         IfExpr as f => {
                             if f.has_else {
                                 let te = match type_expr(es.expr, cur, table) { TExpr as x => x; error as e => return e }
-                                out = teko::list::push(out, TExprStmt { expr = te })
+                                out = teko::mem::push_fo(out, TExprStmt { expr = te })
                                 handled = true
                             }
                         }
                         MatchExpr => {
                             let te = match type_expr(es.expr, cur, table) { TExpr as x => x; error as e => return e }
-                            out = teko::list::push(out, TExprStmt { expr = te })
+                            out = teko::mem::push_fo(out, TExprStmt { expr = te })
                             handled = true
                         }
                         _ => {}
@@ -1982,7 +1989,7 @@ fn type_block(stmts: []parser::Statement, env: Env, table: TypeTable) -> TypedBl
         }
         if !handled {
             let ts = match type_statement(stmts[i], cur, table) { TypedStmt as t => t; error as e => return e }
-            out = teko::list::push(out, ts.node)
+            out = teko::mem::push_fo(out, ts.node)
             cur = ts.env
         }
         i++

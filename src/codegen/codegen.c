@@ -2018,8 +2018,18 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
             // here directly means a context-less empty (honest error). `push(base, item)` lowers
             // to an inline copy-append GNU stmt-expr (alloc len+1 via malloc/abort — M.1 — copy
             // the old elements, append a COPY of item, yield the fresh tk_slice_<elem>).
-            if (p.len >= 2 && seg_is(p.segments[0].name, "teko")
-                           && seg_is(p.segments[p.len - 2].name, "list")) {
+            // (#148 R3) teko::mem::push_fo(base, item) — push with FREE-OLD BY DECREE: the CALLER
+            // asserts the base is a linear chain (the old buffer is unreferenced after the grow),
+            // so the grow routes "@fo" → tk_slice_push_fo, which parks the superseded buffer on
+            // the free-list. Typing/semantics are teko::list::push's; only the allocation strategy
+            // differs. Selecting "@fo" via g_cg_push_frame reuses the shared push emitter below
+            // (which captures then clears the global). (Mirror of codegen.tks, which threads the
+            // "@fo" frame to emit_list_push explicitly.)
+            bool is_pushfo = p.len >= 2 && seg_is(p.segments[p.len - 2].name, "mem")
+                                        && seg_is(p.segments[p.len - 1].name, "push_fo");
+            if (is_pushfo) g_cg_push_frame = "@fo";
+            if (is_pushfo || (p.len >= 2 && seg_is(p.segments[0].name, "teko")
+                           && seg_is(p.segments[p.len - 2].name, "list"))) {
                 tk_str llast = p.segments[p.len - 1].name;
                 if (seg_is(llast, "empty")) {
                     if (e->type.tag == TK_TYPE_SLICE && e->type.as.slice.element != NULL) {
@@ -2029,7 +2039,7 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
                     }
                     return fail_node(err, "codegen: teko::list::empty() needs a known slice type from context (annotate the binding)");
                 }
-                if (seg_is(llast, "push")) {
+                if (seg_is(llast, "push") || is_pushfo) {
                     tk_type st = e->type;   // the push result type is []elem
                     if (st.tag != TK_TYPE_SLICE)
                         return fail_node(err, "codegen: teko::list::push result is not a slice (internal)");

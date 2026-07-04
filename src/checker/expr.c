@@ -269,7 +269,12 @@ static bool type_list_builtin(tk_call c, tk_env env, tk_type_table table, tk_tex
     if (c.callee.len < 2) return false;
     tk_str last = c.callee.segments[c.callee.len - 1].name;
     tk_str prev = c.callee.segments[c.callee.len - 2].name;
-    if (!seg_lit(prev, "list")) return false;
+    // (#148 R3) teko::mem::push_fo — push with FREE-OLD BY DECREE. Same typing/semantics as
+    // teko::list::push; the CALLER asserts the base is a linear chain (the old buffer is dead
+    // after the grow), so native codegen frees it (tk_slice_push_fo). TEKO_MEM_PARANOID is the
+    // fiscal: a wrong decree poisons instead of parking and the gate fails loudly. (Mirror typer.tks.)
+    bool is_pushfo = seg_lit(prev, "mem") && seg_lit(last, "push_fo");
+    if (!seg_lit(prev, "list") && !is_pushfo) return false;
     bool rooted = (c.callee.len == 2) || seg_lit(c.callee.segments[0].name, "teko");
     if (!rooted) return false;
 
@@ -280,7 +285,7 @@ static bool type_list_builtin(tk_call c, tk_env env, tk_type_table table, tk_tex
         *out = xok((tk_texpr){ .tag = TK_TEXPR_CALL, .type = st, .as.call = { c.callee, NULL, 0 } });
         return true;
     }
-    if (seg_lit(last, "push")) {
+    if (seg_lit(last, "push") || is_pushfo) {
         if (c.nargs != 2) { *out = xerr("teko::list::push expects two arguments (slice, item)"); return true; }
         tk_texpr_result s = tk_typer_expr(c.args[0], env, table); if (!s.ok) { *out = s; return true; }
         tk_texpr_result x = tk_typer_expr(c.args[1], env, table); if (!x.ok) { *out = x; return true; }

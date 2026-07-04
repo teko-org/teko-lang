@@ -743,13 +743,18 @@ static bool try_builtin_call(tk_path p, const tk_texpr *args, size_t nargs,
     // v_list_push) so `xs = teko::list::push(xs, item)` never mutates a captured `xs`.
     bool list_ns = (p.len >= 2) && seg_is(p.segments[0].name, "teko")
                                 && seg_is(p.segments[p.len - 2].name, "list");
-    if (list_ns) {
+    // (#148 R3) teko::mem::push_fo — the VM appends exactly like teko::list::push (free-old is a
+    // NATIVE allocation strategy; semantics are identical for the linear chains the decree covers).
+    bool mem_pushfo = (p.len >= 2) && seg_is(p.segments[0].name, "teko")
+                                   && seg_is(p.segments[p.len - 2].name, "mem")
+                                   && seg_is(last, "push_fo");
+    if (list_ns || mem_pushfo) {
         if (seg_is(last, "empty")) {
             if (nargs != 0) vm_unsupported("teko::list::empty expects no arguments");
             *out = v_list_empty();
             return true;
         }
-        if (seg_is(last, "push")) {
+        if (seg_is(last, "push") || mem_pushfo) {
             if (nargs != 2) vm_unsupported("teko::list::push expects two arguments (the list, the item)");
             tk_value base = tk_vm_eval_expr(&args[0], env);
             tk_value item = tk_vm_eval_expr(&args[1], env);

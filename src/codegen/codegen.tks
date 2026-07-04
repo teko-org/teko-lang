@@ -63,7 +63,9 @@ fn cb_str(buf: []byte, s: str) -> []byte { cb(buf, s) }
 
 // cb_byte — append a single byte. (No direct C name — folds the C `tmp[0]=c; cb(b,tmp)`
 // one-char path into a native byte push.)
-fn cb_byte(buf: []byte, x: byte) -> []byte { teko::list::push(buf, x) }
+// (#148 R3 DECREE) the emitter buffer is threaded linearly through every emit fn (take-buf-
+// return-grown, same ownership argument as cb/append_fo) — a copy-grow frees the old buffer.
+fn cb_byte(buf: []byte, x: byte) -> []byte { teko::mem::push_fo(buf, x) }
 
 // cb_i64 — append an i64 as decimal text. (C: `cb_i64`, which used snprintf("%PRId64").)
 // Teko has no snprintf, so the decimal render is spelled out: emit the sign, then the
@@ -1799,16 +1801,23 @@ fn emit_call(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, e: c
     // directly means a context-less empty (honest error). `push(base, item)` lowers to an
     // inline copy-append GNU stmt-expr (alloc len+1 via malloc/abort — M.1 — copy the old
     // elements, append a COPY of item, yield the fresh tk_slice_<elem>). (C: the teko::list branch.)
-    if p.segments.len >= 2 && p.segments[0].name == "teko" &&
-       p.segments[p.segments.len - 2].name == "list" {
+    // (#148 R3) teko::mem::push_fo(base, item) — push with FREE-OLD BY DECREE: the CALLER asserts
+    // the base is a linear chain (the old buffer is unreferenced after the grow), so the grow
+    // routes "@fo" → tk_slice_push_fo, which parks the superseded buffer on the free-list.
+    // Typing/semantics are teko::list::push's; only the allocation strategy differs. (C twin: the
+    // same shared push emitter, selected via g_cg_push_frame = "@fo".)
+    let is_pushfo = p.segments.len >= 2 && p.segments[p.segments.len - 2].name == "mem" &&
+                    p.segments[p.segments.len - 1].name == "push_fo"
+    if is_pushfo || (p.segments.len >= 2 && p.segments[0].name == "teko" &&
+       p.segments[p.segments.len - 2].name == "list") {
         let llast = p.segments[p.segments.len - 1].name
         if llast == "empty" {
             return emit_list_empty(buf, e)
         }
-        if llast == "push" {
+        if llast == "push" || is_pushfo {
             // (S2 Level-1) the general call path never frame-routes ("" = root); a frame-local
             // self-append `xs = push(xs, …)` is emitted directly by emit_assign with `_tkfr`.
-            return emit_list_push(buf, prog, e, c, escaping, regions, fn_body, dctx, "")
+            return emit_list_push(buf, prog, e, c, escaping, regions, fn_body, dctx, if is_pushfo { "@fo" } else { "" })
         }
         return error { message = "codegen: this teko::list builtin not yet supported (only empty/push — fixed+copy)" }
     }
@@ -6664,9 +6673,11 @@ fn cg_lift_lambdas(prog: checker::TProgram) -> LiftResult {
     LiftResult { prog = checker::TProgram { items = items }; lams = acc.lams }
 }
 fn cg_lift_block(stmts: []checker::TStatement, acc: Ref<StampAcc>) -> []checker::TStatement {
+    // (#148 R3 DECREE) `out` is a linear chain: born empty, self-append-only, read only after the
+    // loop — so every copy-grow frees the superseded buffer (mem::push_fo; paranoid-gated).
     mut out: []checker::TStatement = teko::list::empty()
     mut i = 0
-    loop { if i >= stmts.len { break }; out = teko::list::push(out, cg_lift_stmt(stmts[i], acc)); i++ }
+    loop { if i >= stmts.len { break }; out = teko::mem::push_fo(out, cg_lift_stmt(stmts[i], acc)); i++ }
     out
 }
 fn cg_lift_stmt(s: checker::TStatement, acc: Ref<StampAcc>) -> checker::TStatement {

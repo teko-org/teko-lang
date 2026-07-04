@@ -1680,7 +1680,12 @@ void *tk_slice_push_r(const void *ptr, uint64_t len, const void *elem, uint64_t 
     // copy-grow geometrically into a fresh buffer (the old one is left intact — value semantics).
     // Root goes through tk_alloc (keeps the obs RA0 attribution + free-list reuse); a frame region
     // bumps directly (no free-list — that is root-only by design).
-    uint64_t cap = (len < 4) ? 8 : (len * 2);
+    // (#148 R3b) RIGHT-SIZED first rung: cap starts at 1 and doubles (1→2→4→8…), not at a flat 8.
+    // The obs map showed the arena's #1 cost was NOT ladder garbage but OVERCAPACITY in millions of
+    // small LIVE final buffers (most blocks/arg-lists hold 1–3 elements; a flat first cap of 8
+    // wasted ~87% of every one, ~hundreds of MB corpus-wide). The extra early doublings are tiny
+    // memcpys, and every superseded rung at an fo site is parked and recycled by the free-list.
+    uint64_t cap = (len == 0) ? 1 : (len * 2);
     // (#148 RA1) attribute this grow to the GENERATED calling fn: the wrapper parked its caller's RA
     // in tk_g_push_ra; a direct (routed) call attributes its own return address.
     if (tk_obs_enabled() == 1) {
