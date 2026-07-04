@@ -105,6 +105,7 @@ void teko__assert__str_contains(tk_str hay, tk_str needle);
 void     tk_cov_reset(void);
 void     tk_cov_mark(uint64_t id);
 uint64_t tk_cov_distinct(void);
+uint64_t tk_peak_rss(void);           // (#148) peak RSS bytes — teko::mem::peak_rss
 bool     tk_cov_is_marked(uint64_t id);
 void     tk_cov_branches_on(bool on);     // D3-branch — branch coverage (off by default)
 void     tk_cov_branch_reset(void);
@@ -969,6 +970,9 @@ static bool try_builtin_call(tk_path p, const tk_texpr *args, size_t nargs,
         *out = list; return true;
     }
     // len_chars — (str) -> i64. Count UTF-8 codepoints without allocation.
+    if (seg_is(last, "peak_rss")) {   /* (#148) teko::mem::peak_rss() -> u64 (peak RSS bytes) */
+        *out = v_int((unsigned __int128)tk_peak_rss(), true, 64); return true;
+    }
     if (seg_is(last, "len_chars")) {
         if (nargs != 1) vm_unsupported("len_chars expects exactly one argument (a str)");
         tk_value sv = tk_vm_eval_expr(&args[0], env);

@@ -30,6 +30,8 @@ tk_bytes_result tk_emit_program(tk_tprogram prog, tk_type_table table);
 // tkb_read.h which re-typedefs tk_strs (clashing with the local definition in manifest.c / this TU).
 // tk_tprogram_result is already defined via checker/tast.h (included by checker/typer.h above).
 tk_tprogram_result tk_deserialize_program(const tk_byte *data, size_t len);
+// (#148) peak RSS in bytes (teko_rt.c; declared here — this TU avoids teko_rt.h, see the includes note)
+uint64_t tk_peak_rss(void);
 
 #include <stdio.h>           // fopen/fread/fclose, fprintf, printf
 #include <stdlib.h>          // malloc, realloc, free
@@ -955,6 +957,14 @@ int tk_compile_project_g(const char *dir, const char *out_dir, bool gen_cov) {
     char *stem = cstr_of(m.name);
     int rc = tk_backend(dir, stem, prog, out_dir, m);
     tk_free0(stem);
+    // (#148) the compiler reports its own memory cost at the end of a successful build.
+    if (rc == 0) {
+        uint64_t pb = tk_peak_rss();
+        if (pb > 0) {
+            unsigned long long mb10 = (unsigned long long)(pb * 10 / 1048576);
+            printf("teko: memory: peak %llu.%llu MB\n", mb10 / 10, mb10 % 10);
+        }
+    }
     return rc;
 }
 

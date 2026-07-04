@@ -27,6 +27,7 @@
 #else
 #include <unistd.h>   // chdir, fork, execvp, _exit (host FFI bottoms)
 #include <sys/wait.h> // waitpid — teko::process::run
+#include <sys/resource.h> // getrusage — teko::mem::peak_rss (#148: the compiler reports its own memory cost)
 #include <dirent.h>   // opendir/readdir — teko::fs::list_dir
 #include <sys/stat.h> // mkdir — teko::fs::mkdir (build output dir)
 #include <fcntl.h>    // O_WRONLY — /dev/null redirect for tk_rt_run_quiet (issue #73 cc probe)
@@ -1484,6 +1485,23 @@ tk_str tk_rt_os(void) {
 #ifndef TEKO_VERSION_STRING
 #define TEKO_VERSION_STRING "0.0.0.0-dev"
 #endif
+// (#148) tk_peak_rss — this process's PEAK resident set size in BYTES, so the compiler can
+// report its own memory cost at the end of a build. Darwin's ru_maxrss is bytes; Linux's is
+// KILOBYTES. 0 = unavailable (the caller suppresses the print).
+uint64_t tk_peak_rss(void) {
+#if defined(_WIN32)
+    return 0;   /* PeakWorkingSetSize via psapi — deferred; 0 suppresses the print */
+#else
+    struct rusage ru;
+    if (getrusage(RUSAGE_SELF, &ru) != 0) return 0;
+#if defined(__APPLE__)
+    return (uint64_t)ru.ru_maxrss;
+#else
+    return (uint64_t)ru.ru_maxrss * 1024u;
+#endif
+#endif
+}
+
 tk_str tk_rt_version(void) {
     static const char *s = TEKO_VERSION_STRING;
     return (tk_str){ (const tk_byte *)s, strlen(s) };

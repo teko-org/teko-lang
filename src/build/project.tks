@@ -580,6 +580,18 @@ fn ensure_rt_dir_abs() {
 
 fn compile_project(dir: str, out_dir: str) -> i32 { compile_project_g(dir, out_dir, false) }
 
+// (#148) report_peak — the compiler prints its own memory cost at the end of a successful build
+// (peak RSS via teko::mem::peak_rss; 0 = unavailable on this host → print suppressed).
+fn report_peak() {
+    let pb = teko::mem::peak_rss()
+    if pb > 0 {
+        let mb10 = pb * 10 / 1048576
+        let whole = mb10 / 10
+        let frac = mb10 % 10
+        teko::io::println($"teko: memory: peak {whole}.{frac} MB")
+    }
+}
+
 // strip_tests — the production program WITHOUT `#test` functions (D4): a release binary must
 // not carry test code. Tests are excluded from codegen; everything else passes through.
 fn strip_tests(prog: checker::TProgram) -> checker::TProgram {
@@ -613,7 +625,9 @@ fn compile_project_g(dir: str, out_dir: str, gen_cov: bool) -> i32 {
         Frontend as fe => {
             if !has_tests(fe.prog) {
                 // No tests at all → ignore the gate, build the production program (no test code present).
-                return backend(dir, fe.manifest.name, out_dir, fe.prog, fe.manifest)
+                let nrc = backend(dir, fe.manifest.name, out_dir, fe.prog, fe.manifest)
+                if nrc == 0 { report_peak() }   // (#148) the compiler reports its own memory cost
+                return nrc
             }
             // The gate ALWAYS records lines+branches (for the floors); `--coverage` additionally emits
             // <out_dir>/cobertura.xml (mkdir the dir first — idempotent). A failed assert panics here
@@ -642,7 +656,9 @@ fn compile_project_g(dir: str, out_dir: str, gen_cov: bool) -> i32 {
             // parsed into this program). quiet=true: the file map was already printed by the first
             // pass. strip_tests stays as a belt (a no-op here — no .tkt items exist to carry #test).
             let rel = match frontend_body(false, true) { Frontend as f => f; error as e => return fail(dir, e.message) }
-            backend(dir, rel.manifest.name, out_dir, strip_tests(rel.prog), rel.manifest)
+            let grc = backend(dir, rel.manifest.name, out_dir, strip_tests(rel.prog), rel.manifest)
+            if grc == 0 { report_peak() }   // (#148) the compiler reports its own memory cost
+            grc
         }
         // `.tkt` tests (or the production code) could not be ASSEMBLED/typechecked. With tests present,
         // that is a hard BUILD FAILURE — no graceful degradation (the gate is strict; only a project

@@ -2224,6 +2224,7 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
                     else if (seg_is(last, "str_from_cstr")) builtin = "tk_str_from_cstr";  // (ptr) -> str (copy a C string back)
                     else if (seg_is(last, "os"))            builtin = "tk_rt_os";         // () -> str (host OS — C7.1f)
                     else if (seg_is(last, "version"))       builtin = "tk_rt_version";    // () -> str (build version — CLI --version)
+                    else if (seg_is(last, "peak_rss"))      builtin = "tk_peak_rss";      // (#148) () -> u64 — peak RSS in bytes
                     // (err_loc/err_typed handled at the top of this CALL case — they call
                     //  tk_error_loc / tk_error_types on the full tk_error struct — E2-NATIVE.)
                 }

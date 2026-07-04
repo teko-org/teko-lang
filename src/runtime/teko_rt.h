@@ -374,6 +374,8 @@ tk_str tk_rt_os(void);
 // (e.g. "0.0.1.0-bootstrap"). Compiled from the TEKO_VERSION_STRING define injected by both build
 // paths (CMake for the bootstrap, run_cc for self-host), never a runtime file read. (teko::env::version)
 tk_str tk_rt_version(void);
+// (#148) the process peak RSS in bytes (0 = unavailable) — teko::mem::peak_rss.
+uint64_t tk_peak_rss(void);
 
 // ---- Date/Time placeholder types (ROUND 0) ----
 // Five value types: DateTime (signed ns since Unix epoch), TimeSpan (signed ns duration),
