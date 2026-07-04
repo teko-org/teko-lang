@@ -255,6 +255,12 @@ static tk_type g_cg_ret_type;
 // TK_TEXPR_STRUCT_INIT box reads it. "" / {NULL,0} ⇒ root (the safe leak default).
 static tk_escape_set g_cg_escaping;
 static const char   *g_cg_box_frame = "";
+// (S2 Level-1) g_cg_push_frame — names the frame region a `teko::list::push` lowering should grow INTO
+// (tk_slice_push_r) instead of root (tk_slice_push). Set transiently by the assign emission around a
+// frame-local self-append's RHS; the list::push case captures-and-clears it at entry (so nested pushes
+// in the args fall back to root — mirrors the Teko twin, which threads `frame` to the OUTER push only).
+// "" ⇒ root. This is the analog of g_cg_box_frame for slice buffers.
+static const char   *g_cg_push_frame = "";
 // g_cg_frame — the ACTIVE frame-region variable on the current emit path ("" ⇒ none). Set by
 // emit_function; CLEARED (save/restore) when descending into a SUB-SCOPE body (if/match/loop, a
 // tail-if/else, a match-tail arm) so those leak the region (SAFE, M.5) — mirroring the Teko twin,
@@ -354,6 +360,10 @@ static bool cg_body_has_frame_local(tk_escape_set esc, const tk_tstatement *body
         if (body[i].tag == TK_TSTMT_BINDING
             && tk_binding_is_frame_local(esc, body[i])
             && cg_same_named_struct(body[i].as.binding.bound, body[i].as.binding.value.type))
+            return true;
+        // (S2 Level-1) a NON-escaping slice binding: its buffer is built by later self-append pushes
+        // (`xs = push(xs, …)`), each routed to `_tkfr` and bulk-freed on the frame drop.
+        if (body[i].tag == TK_TSTMT_BINDING && tk_binding_is_frame_local_slice(esc, body[i]))
             return true;
     }
     return false;
@@ -2027,6 +2037,10 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
                     snprintf(iN, sizeof iN, "_si%zu", (size_t)b->len + 1);
                     snprintf(pN, sizeof pN, "_sp%zu", (size_t)b->len + 2);
                     snprintf(lN, sizeof lN, "_sl%zu", (size_t)b->len + 3);
+                    // (S2 Level-1) capture the routing frame for THIS push, then clear the global so a
+                    // nested push inside the base/item args falls back to root (mirror of the Teko twin,
+                    // which threads `frame` to the OUTER push only, not through emit_as of the args).
+                    const char *push_frame = g_cg_push_frame; g_cg_push_frame = "";
                     cb(b, "({ ");
                     if (!cg_slice_typename(b, elem, err)) return false; cb(b, " "); cb(b, bN); cb(b, " = ");
                     // Use emit_as so a sentinel empty() arg is lowered to the concrete empty literal.
@@ -2037,8 +2051,10 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
                     cb(b, "uint64_t "); cb(b, lN); cb(b, "; ");
                     if (!emit_type(b, elem, err)) return false; cb(b, " *"); cb(b, pN);
                     cb(b, " = ("); if (!emit_type(b, elem, err)) return false;
-                    cb(b, " *)tk_slice_push("); cb(b, bN); cb(b, ".ptr, "); cb(b, bN); cb(b, ".len, &"); cb(b, iN);
-                    cb(b, ", sizeof("); if (!emit_type(b, elem, err)) return false; cb(b, "), &"); cb(b, lN); cb(b, "); (");
+                    cb(b, push_frame[0] ? " *)tk_slice_push_r(" : " *)tk_slice_push("); cb(b, bN); cb(b, ".ptr, "); cb(b, bN); cb(b, ".len, &"); cb(b, iN);
+                    cb(b, ", sizeof("); if (!emit_type(b, elem, err)) return false; cb(b, "), &"); cb(b, lN);
+                    if (push_frame[0]) { cb(b, ", "); cb(b, push_frame); }   // (S2 Level-1) grow into the frame region
+                    cb(b, "); (");
                     if (!cg_slice_typename(b, elem, err)) return false;
                     cb(b, "){ .ptr = "); cb(b, pN); cb(b, ", .len = "); cb(b, lN); cb(b, " }; })");
                     return true;
@@ -4354,6 +4370,22 @@ static bool emit_stmt(cbuf *b, const tk_tstatement *s, bool in_main,
                 cb(b, ", ");
                 if (!emit_expr(b, &s->as.assign.value, err)) return false;
                 cb(b, ")");
+                cb(b, ";\n");
+                return true;
+            }
+            // (S2 Level-1) SELF-APPEND to a non-escaping slice → route the grown buffer to the frame
+            // region g_cg_frame (bulk-freed on every fn-exit edge). Emit the push directly (mirror of
+            // codegen.tks::emit_assign) with g_cg_push_frame set so the list::push case emits
+            // tk_slice_push_r(…, _tkfr). Guarded by g_cg_frame (region exists) + the SHARED predicate,
+            // which mirrors the escape carve-out so codegen and the escape set never disagree.
+            if (g_cg_frame[0] != '\0' && s->as.assign.value.tag == TK_TEXPR_CALL
+                && tk_assign_routes_to_frame(g_cg_escaping, *s)) {
+                emit_lvalue();
+                cb(b, " = ");
+                const char *saved_pf = g_cg_push_frame; g_cg_push_frame = g_cg_frame;
+                bool ok = emit_expr(b, &s->as.assign.value, err);
+                g_cg_push_frame = saved_pf;
+                if (!ok) return false;
                 cb(b, ";\n");
                 return true;
             }

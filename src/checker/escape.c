@@ -202,6 +202,31 @@ static void mark_block(const tk_tstatement *body, size_t n, bool tail, tk_escape
     }
 }
 
+// (S2 Level-1) esc_call_is_list_push — is `e` a call `…::list::push(base, item)` (matched by the
+// path tail, so any spelling of the namespace works)? Mirror of escape.tks::tcall_is_list_push.
+static bool esc_call_is_list_push(tk_texpr e) {
+    if (e.tag != TK_TEXPR_CALL) return false;
+    tk_path p = e.as.call.callee;
+    if (p.len < 2) return false;
+    tk_str last = p.segments[p.len - 1].name;
+    tk_str prev = p.segments[p.len - 2].name;
+    return last.len == 4 && memcmp(last.ptr, "push", 4) == 0
+        && prev.len == 4 && memcmp(prev.ptr, "list", 4) == 0;
+}
+
+// (S2 Level-1) esc_assign_is_self_append — is `s` exactly `xs = …::list::push(xs, item)` (a plain
+// SIMPLE name write whose RHS grows the SAME name)? Mirror of escape.tks::assign_is_self_append.
+static bool esc_assign_is_self_append(tk_tstatement s) {
+    if (s.tag != TK_TSTMT_ASSIGN) return false;
+    if (s.as.assign.kind != TK_ASSIGN_SIMPLE) return false;
+    tk_texpr v = s.as.assign.value;
+    if (!esc_call_is_list_push(v)) return false;
+    if (v.as.call.nargs != 2) return false;
+    tk_texpr base = v.as.call.args[0];
+    if (base.tag != TK_TEXPR_VAR) return false;
+    return tk_str_eq(base.as.var.name, s.as.assign.name);
+}
+
 // mark_stmt — walk one statement, establishing the escaping context per position. `tail` is TRUE
 // only for the block's LAST statement when that block's trailing value is returned: an
 // expr-statement there is an IMPLICIT RETURN (B.20/W5a) whose value codegen produces AFTER
@@ -212,6 +237,15 @@ static void mark_stmt(tk_tstatement s, bool tail, tk_escape_set *acc) {
             mark_expr(s.as.binding.value, true, acc);   // the bound value lives on
             return;
         case TK_TSTMT_ASSIGN:
+            // (S2 Level-1) SELF-APPEND carve-out: `xs = …::list::push(xs, item)` grows xs in place — the
+            // base read of xs is CONSUMED by the write-back (old buffer copied into the grown one and
+            // replaced), so it does NOT escape here. Mark ONLY the appended item (still conservatively
+            // escaping); leaving the base UNmarked lets a non-escaping accumulator be proven frame-local.
+            // Any OTHER read of xs escapes via its own position. Mirror of escape.tks.
+            if (esc_assign_is_self_append(s)) {
+                mark_expr(s.as.assign.value.as.call.args[1], true, acc);   // item only, not the base
+                return;
+            }
             mark_expr(s.as.assign.value, true, acc);    // may be written to an outer location
             // (#88) a FIELD write stores the RHS into a struct/class object that OUTLIVES this frame
             // (a class instance is heap/cell-backed; a struct field write escapes through its `mut`
@@ -263,6 +297,31 @@ bool tk_binding_is_frame_local(tk_escape_set set, tk_tstatement binding) {
     if (binding.as.binding.kind == TK_BIND_CONST) return false;
     if (esc_set_has(set, name)) return false;
     return binding.as.binding.value.tag == TK_TEXPR_STRUCT_INIT;
+}
+
+// (S2 Level-1) tk_binding_is_frame_local_slice — a non-escaping SLICE binding whose buffer never
+// leaves the frame: a let/mut SIMPLE name, not const, not in the escape set, whose bound type is a
+// slice. Unlike the struct-init predicate the value need not be an allocation site — a slice
+// accumulator is BUILT by later `xs = push(xs, …)` self-appends (each frame-routed). Mirror of
+// escape.tks::binding_is_frame_local_slice.
+bool tk_binding_is_frame_local_slice(tk_escape_set set, tk_tstatement binding) {
+    if (binding.tag != TK_TSTMT_BINDING) return false;
+    if (binding.as.binding.target.tag != TK_BIND_SIMPLE) return false;
+    tk_str name = binding.as.binding.target.as.simple.name;
+    if (name.len == 1 && name.ptr[0] == '_') return false;
+    if (binding.as.binding.kind == TK_BIND_CONST) return false;
+    if (esc_set_has(set, name)) return false;
+    return binding.as.binding.bound.tag == TK_TYPE_SLICE;
+}
+
+// (S2 Level-1) tk_assign_routes_to_frame — THE routing predicate (mirror of assign_routes_to_frame):
+// should this assignment's grown slice buffer be allocated in the frame region? True iff it is a
+// self-append `xs = push(xs, …)` whose target xs is a NON-escaping slice, so its whole buffer history
+// dies with the frame. Shared by codegen so it never disagrees with the escape carve-out.
+bool tk_assign_routes_to_frame(tk_escape_set set, tk_tstatement s) {
+    if (!esc_assign_is_self_append(s)) return false;
+    if (esc_set_has(set, s.as.assign.name)) return false;
+    return s.as.assign.bound.tag == TK_TYPE_SLICE;
 }
 
 // ── S2 — PER-BLOCK escape (block-local freeing). C twin of escape.tks. ──────────

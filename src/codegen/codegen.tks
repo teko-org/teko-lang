@@ -1654,7 +1654,7 @@ fn get_push_elem(e: checker::TExpr, c: checker::TCall) -> checker::Type | error 
 // `[]elem`. type_assign may overwrite the call's type to the sentinel when assigning push(xs,i)
 // back to a sentinel-typed xs; get_push_elem recovers the element. Lower to an inline
 // copy-append GNU stmt-expr. (C: the `push` arm.)
-fn emit_list_push(buf: []byte, prog: checker::TProgram, e: checker::TExpr, c: checker::TCall, escaping: []str, regions: []RegionFrame, fn_body: []checker::TStatement, dctx: DeferCtx) -> []byte | error {
+fn emit_list_push(buf: []byte, prog: checker::TProgram, e: checker::TExpr, c: checker::TCall, escaping: []str, regions: []RegionFrame, fn_body: []checker::TStatement, dctx: DeferCtx, frame: str) -> []byte | error {
     let elem = match get_push_elem(e, c) { checker::Type as t => t; error as err => return err }
     let bN = $"_sb{buf.len}"
     let iN = $"_si{buf.len + 1}"
@@ -1676,10 +1676,11 @@ fn emit_list_push(buf: []byte, prog: checker::TProgram, e: checker::TExpr, c: ch
     out = match emit_type(out, prog, elem) { []byte as o => o; error as err => return err }
     out = cb(out, " *"); out = cb(out, pN); out = cb(out, " = (")
     out = match emit_type(out, prog, elem) { []byte as o => o; error as err => return err }
-    out = cb(out, " *)tk_slice_push("); out = cb(out, bN); out = cb(out, ".ptr, "); out = cb(out, bN); out = cb(out, ".len, &"); out = cb(out, iN)
+    out = cb(out, if frame.len > 0 { " *)tk_slice_push_r(" } else { " *)tk_slice_push(" }); out = cb(out, bN); out = cb(out, ".ptr, "); out = cb(out, bN); out = cb(out, ".len, &"); out = cb(out, iN)
     out = cb(out, ", sizeof(")
     out = match emit_type(out, prog, elem) { []byte as o => o; error as err => return err }
-    out = cb(out, "), &"); out = cb(out, lN); out = cb(out, "); (")
+    // (S2 Level-1) a frame-local self-append routes the grown buffer to the frame region `_tkfr`.
+    out = cb(out, "), &"); out = cb(out, lN); if frame.len > 0 { out = cb(out, ", "); out = cb(out, frame) }; out = cb(out, "); (")
     out = match cg_slice_typename(out, elem) { []byte as o => o; error as err => return err }
     out = cb(out, "){ .ptr = "); out = cb(out, pN); out = cb(out, ", .len = "); out = cb(out, lN); out = cb(out, " }; })")
     out
@@ -1804,7 +1805,9 @@ fn emit_call(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, e: c
             return emit_list_empty(buf, e)
         }
         if llast == "push" {
-            return emit_list_push(buf, prog, e, c, escaping, regions, fn_body, dctx)
+            // (S2 Level-1) the general call path never frame-routes ("" = root); a frame-local
+            // self-append `xs = push(xs, …)` is emitted directly by emit_assign with `_tkfr`.
+            return emit_list_push(buf, prog, e, c, escaping, regions, fn_body, dctx, "")
         }
         return error { message = "codegen: this teko::list builtin not yet supported (only empty/push — fixed+copy)" }
     }
@@ -5144,9 +5147,25 @@ fn emit_assign_lvalue(buf: []byte, prog: checker::TProgram, a: checker::TAssign)
     }
 }
 
-fn emit_assign(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, a: checker::TAssign, indent: str, escaping: []str, regions: []RegionFrame, fn_body: []checker::TStatement, dctx: DeferCtx) -> []byte | error {
+fn emit_assign(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, a: checker::TAssign, indent: str, frame: str, escaping: []str, regions: []RegionFrame, fn_body: []checker::TStatement, dctx: DeferCtx) -> []byte | error {
     let op = match assignop_c(a.op) { str as s => s; error as err => return err }
     mut out = cb(buf, indent)
+    // (S2 Level-1) SELF-APPEND to a non-escaping slice → route the grown buffer to the frame region
+    // `_tkfr` (bulk-freed at every fn-exit edge). Emit the push directly with the frame threaded, so the
+    // whole buffer history (geometric doublings + in-place tail) dies with the frame. Guarded by
+    // frame.len (the region exists only when fn_body_has_frame_local opened it) and the SHARED predicate
+    // checker::assign_routes_to_frame, which mirrors the escape carve-out so the two never disagree.
+    if frame.len > 0 && checker::assign_routes_to_frame(escaping, a) {
+        match a.value.kind {
+            checker::TCall as c => {
+                out = match emit_assign_lvalue(out, prog, a) { []byte as o => o; error as err => return err }
+                out = cb(out, " = ")
+                out = match emit_list_push(out, prog, a.value, c, escaping, regions, fn_body, dctx, frame) { []byte as o => o; error as err => return err }
+                return cb(out, ";\n")
+            }
+            _ => { }   // not a call (unreachable when the predicate held) → fall through to the root path
+        }
+    }
     // #61 — `<<=`/`>>=` must NOT emit the raw C compound operator: an out-of-range shift count
     // is C UB natively, while the VM (#49, compound_apply) computes a DEFINED width-masked
     // result. Rewrite as `lvalue = tk_shl_<w>(lvalue, rhs)` / tk_shr_<w>, routing through the
@@ -5311,7 +5330,7 @@ fn cb_indent_deeper(indent: str) -> str {
 fn emit_stmt(buf: []byte, s: checker::TStatement, in_main: bool, prog: checker::TProgram, ret_type: checker::Type, indent: str, frame: str, escaping: []str, regions: []RegionFrame, fn_body: []checker::TStatement, dctx: DeferCtx, cur_block: []checker::TStatement, cur_block_is_value: bool) -> []byte | error {
     match s {
         checker::TBinding as b      => emit_binding(buf, prog, ret_type, b, indent, frame, escaping, regions, fn_body, dctx, cur_block, cur_block_is_value)
-        checker::TAssign as a       => emit_assign(buf, prog, ret_type, a, indent, escaping, regions, fn_body, dctx)
+        checker::TAssign as a       => emit_assign(buf, prog, ret_type, a, indent, frame, escaping, regions, fn_body, dctx)
         checker::TReturn as r       => emit_return(buf, prog, r, in_main, ret_type, indent, frame, escaping, regions, fn_body, dctx)
         checker::TExprStmt as es    => {
             // W5a — an `if` in statement position runs as CONTROL FLOW (mirrors the VM's
@@ -5437,7 +5456,12 @@ fn fn_body_has_frame_local(escaping: []str, body: []checker::TStatement) -> bool
     loop {
         if i >= body.len { break }
         match body[i] {
-            checker::TBinding as b => { if checker::binding_is_frame_local(escaping, b) && cg_same_named_struct(b.bound, b.value.type) { return true } }
+            checker::TBinding as b => {
+                if checker::binding_is_frame_local(escaping, b) && cg_same_named_struct(b.bound, b.value.type) { return true }
+                // (S2 Level-1) a NON-escaping slice binding: its buffer is built by later self-append
+                // pushes (`xs = push(xs, …)`), each routed to `_tkfr` and bulk-freed on the frame drop.
+                if checker::binding_is_frame_local_slice(escaping, b) { return true }
+            }
             _ => { }
         }
         i++

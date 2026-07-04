@@ -287,8 +287,19 @@ fn mark_stmt(s: TStatement, tail: bool, acc: Ref<[]str>) -> void {
         // write stores into an object that OUTLIVES the frame (a class is cell-backed; a struct field
         // write escapes through its `mut` root), so the receiver's reads are escaping too.
         TAssign as a  => {
-            mark_expr(a.value, true, acc)
-            match a.kind { parser::AssignKind::Field => mark_expr(a.target, true, acc); _ => { } }
+            // (S2 Level-1) SELF-APPEND carve-out: `xs = teko::list::push(xs, item)` grows xs in place —
+            // the base read of xs is CONSUMED by the write-back (the old buffer is copied into the grown
+            // one and replaced), so it does NOT escape through this statement. Mark ONLY the appended
+            // item (still conservatively escaping); leaving the base UNmarked lets a non-escaping
+            // accumulator be proven frame-local (single-pass, no fixpoint — item stays over-marked, which
+            // is always safe). Any OTHER read of xs (return/arg/alias/index) still marks it escaping via
+            // its own position, so a truly-escaping accumulator is never frame-routed.
+            if assign_is_self_append(a) {
+                mark_expr(self_append_item(a), true, acc)
+            } else {
+                mark_expr(a.value, true, acc)
+                match a.kind { parser::AssignKind::Field => mark_expr(a.target, true, acc); _ => { } }
+            }
         }
         // a return value escapes the frame entirely.
         TReturn as r  => if r.has_value { mark_expr(r.value, true, acc) } else { }
@@ -331,6 +342,76 @@ pub fn binding_is_frame_local(escaping: []str, b: TBinding) -> bool {
     match b.value.kind {
         TStructInit => true
         _           => false
+    }
+}
+
+// (S2 Level-1) tcall_is_list_push — is this call `…::list::push(base, item)`, the one true grow
+// intrinsic? Matched by the path tail (`list`, `push`) so any spelling of the namespace works.
+fn tcall_is_list_push(c: TCall) -> bool {
+    let segs = c.callee.segments
+    if segs.len < 2 { return false }
+    segs[segs.len - 1].name == "push" && segs[segs.len - 2].name == "list"
+}
+
+// (S2 Level-1) assign_is_self_append — is `a` exactly `xs = teko::list::push(xs, item)` (a plain
+// SIMPLE name write whose RHS grows the SAME name)? Only this shape earns the base-read carve-out;
+// a field/deref write, a different target, or any other RHS keeps the conservative escaping mark.
+fn assign_is_self_append(a: TAssign) -> bool {
+    match a.kind { parser::AssignKind::Simple => { }; _ => return false }
+    match a.value.kind {
+        TCall as c => {
+            if !tcall_is_list_push(c) { return false }
+            if c.args.len != 2 { return false }
+            match c.args[0].kind {
+                TVar as v => v.name == a.name
+                _         => false
+            }
+        }
+        _ => false
+    }
+}
+
+// (S2 Level-1) self_append_item — the APPENDED element (arg1) of a self-append. Precondition:
+// assign_is_self_append(a) held; the fallback (whole RHS) is never reached on that path.
+fn self_append_item(a: TAssign) -> TExpr {
+    match a.value.kind {
+        TCall as c => c.args[1]
+        _          => a.value
+    }
+}
+
+// (S2 Level-1) assign_routes_to_frame — THE routing predicate: should this assignment's grown slice
+// buffer be allocated in the function frame region (freed when the frame drops)? True iff it is a
+// self-append `xs = push(xs, …)` whose target xs is a NON-escaping slice, so its whole buffer history
+// dies with the frame. The codegen and the escape carve-out (mark_stmt) SHARE this exact shape — they
+// must never disagree: a routed push whose base the carve-out did NOT exempt could leave xs escaping
+// (leak, safe) but a base the carve-out exempted that codegen does NOT route just stays on root (also
+// safe). Coupling them here keeps both correct by construction. PUBLIC (codegen reads it).
+pub fn assign_routes_to_frame(escaping: []str, a: TAssign) -> bool {
+    if !assign_is_self_append(a) { return false }
+    if str_set_has(escaping, a.name) { return false }
+    match a.bound {
+        Slice => true
+        _     => false
+    }
+}
+
+// binding_is_frame_local_slice — (S2 Level-1) a SLICE binding whose buffer never leaves the frame:
+// a `let`/`mut` SIMPLE name, NOT const, NOT in the escaping set, whose bound type is a slice. Unlike
+// the struct-init predicate the value need not be an allocation site — a slice accumulator is BUILT
+// by later `xs = push(xs, …)` self-appends (each routed to the frame region); this predicate marks
+// that the frame is NEEDED and the name is a non-escaping slice. PUBLIC (the codegen reads it).
+pub fn binding_is_frame_local_slice(escaping: []str, b: TBinding) -> bool {
+    let name = match b.target {
+        parser::SimpleName as sn   => sn.name
+        parser::DestructurePattern => return false
+    }
+    if name == "_" { return false }
+    if b.kind == parser::BindKind::Const { return false }
+    if str_set_has(escaping, name) { return false }
+    match b.bound {
+        Slice => true
+        _     => false
     }
 }
 

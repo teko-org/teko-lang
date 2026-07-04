@@ -450,6 +450,11 @@ bool     tk_cov_line_hit(uint64_t fn, uint32_t line);      // report query
 // `elem` points at one element of `esz` bytes; `*out_len` receives the new length; returns the
 // (possibly same) data pointer.
 void *tk_slice_push(const void *ptr, uint64_t len, const void *elem, uint64_t esz, uint64_t *out_len);
+// (S2 Level-1) region-aware variant — the grown buffer is allocated in `region` (a function frame
+// region `_tkfr`) instead of the process root, so a NON-escaping slice's whole buffer history is
+// bulk-freed when the frame drops. `tk_slice_push` is the root-region wrapper over this. Codegen
+// emits this only for a slice binding the escape analysis proves frame-local.
+void *tk_slice_push_r(const void *ptr, uint64_t len, const void *elem, uint64_t esz, uint64_t *out_len, tk_region *region);
 // (mem::free) tk_free_block — park an explicitly freed root-arena block for same-size REUSE
 // (the `teko::mem::free` []T-arm lowering: `tk_free_block(s.ptr, s.len * sizeof(elem))`).
 void tk_free_block(void *p, uint64_t bytes);

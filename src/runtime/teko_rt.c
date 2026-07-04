@@ -753,6 +753,7 @@ struct tk_region {
     tk_region_entry   *entries;
     size_t             nentries;
     size_t             entries_cap;
+    uint64_t           gen;        // (S2 Level-1) unique generation stamp — distinguishes a dropped-and-reused region address from a live one (push-cache safety)
 };
 _Static_assert(offsetof(struct tk_chunk, data) % _Alignof(max_align_t) == 0,
                "chunk payload base must be max_align_t-aligned");
@@ -768,6 +769,7 @@ static struct tk_chunk *tk_chunk_try(size_t payload) {
 // region is on this list from tk_region_new until tk_region_drop or tk_regions_free_all removes it.
 static tk_region *tk_g_regs = NULL;
 static tk_region *tk_g_root = NULL;   // single-threaded seed (S8 revisit); lazy + idempotent (the root is also on tk_g_regs)
+static uint64_t   tk_g_region_gen = 0;   // (S2 Level-1) monotonic region-generation counter; every tk_region_new stamps r->gen from it (never reused, so a recycled address always carries a fresh gen)
 
 // =========================================================================
 // (mem::free ruling 2026-07-03) FREE-LIST OVERLAY over the ROOT region — the runtime seat of
@@ -793,7 +795,10 @@ static void tk_free_purge(void) {                   // rewind/termination: parke
     tk_free_parked_bytes = 0;
 }
 static void *tk_free_take(size_t an) {              // an: already 16-rounded by the caller
-    if (an <= (size_t)TK_FREE_BINS * 16) {
+    // an is 16-rounded and normally ≥16, but guard the LOWER bound too: an<16 would make `an/16 - 1`
+    // underflow (size_t) to SIZE_MAX and index tk_free_bins[-1] (a global-buffer-overflow — ASan). A
+    // sub-16 request never has a bin anyway, so fall through to the large-list scan (which returns NULL).
+    if (an >= 16 && an <= (size_t)TK_FREE_BINS * 16) {
         tk_freenode **bin = &tk_free_bins[an / 16 - 1];
         if (*bin != NULL) {
             tk_freenode *n = *bin; *bin = n->next;
@@ -902,6 +907,7 @@ tk_region *tk_region_new(tk_region *parent) {
     tk_g_regs = r;
     r->parent = parent;                        // (S2) the arena tree edge
     r->entries = NULL; r->nentries = 0; r->entries_cap = 0;   // (S2) the per-region registry, lazy
+    r->gen = ++tk_g_region_gen;                 // (S2 Level-1) unique lifetime stamp (0 is never assigned, so a zeroed cache entry never matches a live region)
     return r;
 }
 
@@ -1555,35 +1561,57 @@ bool tk_cov_line_hit(uint64_t fn, uint32_t line) {
 // nearly every push fell to the O(n) copy-grow → O(n²) memory (measured: 98 GB / 98 M allocs on a
 // source-only self-build). A 65536-bucket hash keyed by the buffer pointer keeps every live tail
 // resident regardless of interleaving depth, so a list built by N pushes copy-grows only O(log N)
-// times (the geometric doublings) instead of N — O(n²) → O(n). Stale entries (a buffer that copy-grew
-// away) are harmless: their ptr is never pushed again and arena addresses are never reused, so a stale
-// slot can never mis-match a fresh push. (#109 memory — the self-host's dominant consumer.)
+// times (the geometric doublings) instead of N — O(n²) → O(n). (#109 memory — the self-host's
+// dominant consumer.)
+//
+// (S2 Level-1) STALE-SLOT SAFETY. In S1 the "arena addresses are never reused" invariant made every
+// stale slot harmless. Frame regions BREAK it: tk_region_drop frees chunks, so a later region can
+// hand back the SAME address a dropped buffer used — an in-place append into that recycled address
+// would corrupt a live allocation. So each slot now records the OWNING region + its generation, and
+// an in-place hit additionally requires (region, region->gen) to match: a recycled address always
+// carries a fresh region and/or gen, so it can never be mistaken for a live tail. (The root free-list
+// reuse path is orthogonal — tk_free_block still EVICTS the slot on an explicit mem::free, since that
+// recycles an address WITHIN the same region/gen.)
 #define TK_PUSH_HASH_SIZE (1u << 16)   // 65536 single-probe buckets
-static struct { const void *ptr; uint64_t len, cap, esz; } tk_push_cache[TK_PUSH_HASH_SIZE];
+static struct { const void *ptr; uint64_t len, cap, esz; tk_region *region; uint64_t region_gen; } tk_push_cache[TK_PUSH_HASH_SIZE];
 static inline unsigned tk_push_slot(const void *p) {
     return (unsigned)((((uintptr_t)p >> 4) * 11400714819323198485ull) >> 48) & (TK_PUSH_HASH_SIZE - 1);
 }
 
-void *tk_slice_push(const void *ptr, uint64_t len, const void *elem, uint64_t esz, uint64_t *out_len) {
+// (S2 Level-1) the region-aware core: the grown buffer is allocated in `region`. `tk_slice_push`
+// (below) is the unchanged default lowering target (root); codegen emits THIS variant only for a
+// slice binding the escape analysis proves frame-local, passing the function's `_tkfr` frame region,
+// so the whole buffer history (geometric doublings + in-place tail) is bulk-freed on frame exit.
+void *tk_slice_push_r(const void *ptr, uint64_t len, const void *elem, uint64_t esz, uint64_t *out_len, tk_region *region) {
     unsigned h = ptr ? tk_push_slot(ptr) : 0;
-    // in-place ONLY when this is the live tail (same ptr + length witness + element size) with spare cap.
+    // in-place ONLY when this is the live tail (same ptr + length witness + element size) with spare cap
+    // AND still owned by the same live region generation (see STALE-SLOT SAFETY above).
     if (ptr != NULL && tk_push_cache[h].ptr == ptr && tk_push_cache[h].len == len
-        && tk_push_cache[h].esz == esz && len < tk_push_cache[h].cap) {
+        && tk_push_cache[h].esz == esz && len < tk_push_cache[h].cap
+        && tk_push_cache[h].region == region && tk_push_cache[h].region_gen == region->gen) {
         memcpy((char *)ptr + len * esz, elem, esz);
         tk_push_cache[h].len = len + 1;
         *out_len = len + 1;
         return (void *)ptr;
     }
     // copy-grow geometrically into a fresh buffer (the old one is left intact — value semantics).
+    // Root goes through tk_alloc (keeps the obs RA0 attribution + free-list reuse); a frame region
+    // bumps directly (no free-list — that is root-only by design).
     uint64_t cap = (len < 4) ? 8 : (len * 2);
-    void *buf = tk_alloc(cap * esz);
+    void *buf = (region == tk_g_root) ? tk_alloc(cap * esz) : tk_region_alloc(region, cap * esz);
     if (len && ptr != NULL) memcpy(buf, ptr, len * esz);
     memcpy((char *)buf + len * esz, elem, esz);
     unsigned hb = tk_push_slot(buf);   // record the new buffer's live tail (overwrite on collision = eviction)
     tk_push_cache[hb].ptr = buf; tk_push_cache[hb].len = len + 1;
     tk_push_cache[hb].cap = cap; tk_push_cache[hb].esz = esz;
+    tk_push_cache[hb].region = region; tk_push_cache[hb].region_gen = region->gen;
     *out_len = len + 1;
     return buf;
+}
+
+// the default root-region lowering (unchanged contract) — a thin wrapper over the region-aware core.
+void *tk_slice_push(const void *ptr, uint64_t len, const void *elem, uint64_t esz, uint64_t *out_len) {
+    return tk_slice_push_r(ptr, len, elem, esz, out_len, tk_region_root());
 }
 
 // (mem::free ruling 2026-07-03) tk_free_block — PARK an explicitly freed root-arena block on the
