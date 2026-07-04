@@ -789,7 +789,8 @@ tk_tprogram_result tk_type_program_with_deps(tk_program program, tk_tprogram dep
 
     tk_titem_list items = tk_titem_list_empty();
     tk_tstmt_list mainbody = tk_tstmt_list_empty();
-    tk_env cur = c.as.value.env;
+    tk_env cenv = tk_env_seal(c.as.value.env);   // (#148) seal the collected globals — forks copy locals only
+    tk_env cur = cenv;
 
     for (size_t i = 0; i < program.len; i += 1) {
         tk_item it = program.items[i];
@@ -806,7 +807,7 @@ tk_tprogram_result tk_type_program_with_deps(tk_program program, tk_tprogram dep
             mainbody = tk_tstmt_list_push(mainbody, ts.as.value.node);
             continue;
         }
-        tk_env ienv = c.as.value.env; ienv.cur_ns = it.namespace;
+        tk_env ienv = cenv; ienv.cur_ns = it.namespace;
         tk_titem_result ti = tk_type_item(it, ienv, types);
         if (!ti.ok) return (tk_tprogram_result){ .ok = false, .as.error = surface_at(it.file, line, col, ti.as.error) };
         items = tk_titem_list_push(items, ti.as.value);
@@ -856,7 +857,8 @@ tk_tprogram_result tk_type_program(tk_program program) {
     // must enter scope for the statements that follow it (mirrors type_block's env
     // threading). Non-statement items (functions/types/uses) are typed against the
     // collected env and do not advance it.
-    tk_env cur = c.as.value.env;
+    tk_env cenv = tk_env_seal(c.as.value.env);   // (#148) seal the collected globals — forks copy locals only
+    tk_env cur = cenv;
     for (size_t i = 0; i < program.len; i += 1) {
         tk_item it = program.items[i];
         cur.cur_ns = it.namespace;   // (#41) the namespace being type-checked — drives same-ns call resolution
@@ -879,7 +881,7 @@ tk_tprogram_result tk_type_program(tk_program program) {
             mainbody = tk_tstmt_list_push(mainbody, ts.as.value.node);
             continue;
         }
-        tk_env ienv = c.as.value.env; ienv.cur_ns = it.namespace;   // (#41) resolve the body's calls in the item's ns
+        tk_env ienv = cenv; ienv.cur_ns = it.namespace;   // (#41) resolve the body's calls in the item's ns
         tk_titem_result ti = tk_type_item(it, ienv, types);
         if (!ti.ok) {   // (C1-POS) prefer the failing expr's own position; the item's is the fallback
             uint32_t el = ti.as.error.line ? ti.as.error.line : line;

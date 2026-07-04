@@ -34,23 +34,37 @@ tk_env tk_env_define(tk_env env, tk_str name, tk_type t, bool is_mut) {
     // holder's `.ptr` after a realloc → heap corruption ("pointer being freed was not
     // allocated"). Copy-on-extend keeps each branch's env independent. O(n) per define;
     // the bootstrap stays small (M.5), and this matches the functional `.tks` env twin.
-    size_t n = env.len;
+    size_t n = env.len;   // (#148) the LOCAL segment only — the sealed base is shared, never copied
     tk_val_binding *buf = tk_alloc((n + 1) * sizeof *buf);
     if (buf == NULL) { abort(); }
     if (n != 0) { memcpy(buf, env.ptr, n * sizeof *buf); }
     buf[n] = (tk_val_binding){ .name = name, .type = t, .is_mut = is_mut, .ns = (tk_str){0} };  // local: no ns (#41)
-    return (tk_env){ .ptr = buf, .len = n + 1, .cap = n + 1, .cur_ns = env.cur_ns, .owner_type = env.owner_type };
+    return (tk_env){ .base = env.base, .base_len = env.base_len, .ptr = buf, .len = n + 1, .cap = n + 1, .cur_ns = env.cur_ns, .owner_type = env.owner_type };
+}
+
+// (#148) tk_env_seal — move the accumulated bindings into the immutable base segment. Called once
+// per collected env at the collect→type boundary; later defines land in a fresh locals segment.
+tk_env tk_env_seal(tk_env env) {
+    size_t total = env.base_len + env.len;
+    tk_val_binding *buf = NULL;
+    if (total != 0) {
+        buf = tk_alloc(total * sizeof *buf);
+        if (buf == NULL) { abort(); }
+        if (env.base_len != 0) memcpy(buf, env.base, env.base_len * sizeof *buf);
+        if (env.len != 0) memcpy(buf + env.base_len, env.ptr, env.len * sizeof *buf);
+    }
+    return (tk_env){ .base = buf, .base_len = total, .ptr = NULL, .len = 0, .cap = 0, .cur_ns = env.cur_ns, .owner_type = env.owner_type };
 }
 
 // (#41) define a TOP-LEVEL FUNCTION binding carrying its declaring namespace, so an unqualified
 // call resolves to a same-namespace function (not a global bare-name collision). Same copy-on-extend.
 tk_env tk_env_define_fn(tk_env env, tk_str name, tk_type t, tk_str ns) {
-    size_t n = env.len;
+    size_t n = env.len;   // (#148) locals only — the sealed base is shared
     tk_val_binding *buf = tk_alloc((n + 1) * sizeof *buf);
     if (buf == NULL) { abort(); }
     if (n != 0) { memcpy(buf, env.ptr, n * sizeof *buf); }
     buf[n] = (tk_val_binding){ .name = name, .type = t, .is_mut = false, .ns = ns };
-    return (tk_env){ .ptr = buf, .len = n + 1, .cap = n + 1, .cur_ns = env.cur_ns, .owner_type = env.owner_type };
+    return (tk_env){ .base = env.base, .base_len = env.base_len, .ptr = buf, .len = n + 1, .cap = n + 1, .cur_ns = env.cur_ns, .owner_type = env.owner_type };
 }
 
 bool tk_bind_is_mut(tk_bind_kind k) { return k == TK_BIND_MUT; }   // Let/Const immutable (B.21)
@@ -81,6 +95,15 @@ tk_type_result tk_env_lookup_call(tk_env env, tk_path callee) {
             if (b.ns.len != 0 && name_eq(ns_last_seg(b.ns), qual)) return (tk_type_result){ .ok = true, .as.value = b.type };
         }
     }
+    for (size_t i = env.base_len; i > 0; i -= 1) {   // (#148) then the sealed globals (same match rules)
+        tk_val_binding b = env.base[i - 1];
+        if (!name_eq(b.name, name)) continue;
+        if (!qualified) {
+            if (b.ns.len == 0 || name_eq(b.ns, env.cur_ns)) return (tk_type_result){ .ok = true, .as.value = b.type };
+        } else {
+            if (b.ns.len != 0 && name_eq(ns_last_seg(b.ns), qual)) return (tk_type_result){ .ok = true, .as.value = b.type };
+        }
+    }
     return (tk_type_result){ .ok = false, .as.error = scope_undefined_name(name) };
 }
 
@@ -100,12 +123,25 @@ tk_str tk_env_call_ns(tk_env env, tk_path callee) {
             if (b.ns.len != 0 && name_eq(ns_last_seg(b.ns), qual)) return b.ns;
         }
     }
+    for (size_t i = env.base_len; i > 0; i -= 1) {   // (#148) then the sealed globals (same match rules)
+        tk_val_binding b = env.base[i - 1];
+        if (!name_eq(b.name, name)) continue;
+        if (!qualified) {
+            if (b.ns.len == 0 || name_eq(b.ns, env.cur_ns)) return b.ns;
+        } else {
+            if (b.ns.len != 0 && name_eq(ns_last_seg(b.ns), qual)) return b.ns;
+        }
+    }
     return (tk_str){0};
 }
 
 tk_binding_result tk_env_lookup_binding(tk_env env, tk_str name) {
     for (size_t i = env.len; i > 0; i -= 1) {        // innermost (most recent) first
         tk_val_binding b = env.ptr[i - 1];
+        if (name_eq(b.name, name)) return (tk_binding_result){ .ok = true, .as.value = b };
+    }
+    for (size_t i = env.base_len; i > 0; i -= 1) {   // (#148) then the sealed globals (locals shadow)
+        tk_val_binding b = env.base[i - 1];
         if (name_eq(b.name, name)) return (tk_binding_result){ .ok = true, .as.value = b };
     }
     return (tk_binding_result){ .ok = false, .as.error = scope_undefined_name(name) };

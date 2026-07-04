@@ -3005,11 +3005,13 @@ pub fn type_program_with_deps(raw_program: parser::Program, dep_prog: TProgram) 
     // W-vis-enforce: enforce the module system over the project's own items.
     // We only check the project's items (not dep items — they were checked when the dep was built).
     match check_modules(program, c.types) { null => {}; error as e => return e }
+    // (#148) seal the collected globals — see type_program.
+    let cenv = seal(c.env)
     // (S4 type-generics) stamp concrete decls for written generic uses before typing (no-op when none).
     let types = instantiate_types(program, c.types)
     mut items: []TItem = teko::list::empty()
     mut mainbody: []TStatement = teko::list::empty()
-    mut cur = c.env
+    mut cur = cenv
     mut i = 0
     loop {
         if i >= program.items.len { break }
@@ -3018,7 +3020,7 @@ pub fn type_program_with_deps(raw_program: parser::Program, dep_prog: TProgram) 
         // same fix as type_program — set cur_ns per item so a loose main.tks statement's unqualified
         // same-namespace call resolves. See type_program's comment for the full rationale.
         cur = with_ns(cur, it.namespace)
-        let ienv = with_ns(c.env, it.namespace)
+        let ienv = with_ns(cenv, it.namespace)
         mut line: u32 = 0
         mut col: u32 = 0
         match it.content {
@@ -3088,12 +3090,15 @@ pub fn type_program(raw_program: parser::Program) -> TProgram | error {
     // W-vis-enforce: enforce the module system (namespace qualification + pub/exp) over the
     // whole flattened program before typing — fail loud on any cross-namespace violation (M.1).
     match check_modules(program, c.types) { null => {}; error as e => return e }
+    // (#148) SEAL the collected globals into the env's immutable base segment ONCE, so every
+    // function/arm forking from it copies only its own locals (never the whole global table).
+    let cenv = seal(c.env)
     // (S4 type-generics) STAMP concrete decls for written generic uses (`Box<i64>`) into the table
     // before typing, so field-access / struct-init see concrete fields. No-op when none are used.
     let types = instantiate_types(program, c.types)
     mut items: []TItem = teko::list::empty()
     mut mainbody: []TStatement = teko::list::empty()   // the loose top-level statements (the virtual-main), for label validation
-    mut cur = c.env                                    // threaded virtual-main scope: each loose binding extends it for the next statement (mirrors typer.c's `cur`)
+    mut cur = cenv                                     // threaded virtual-main scope: each loose binding extends it for the next statement (mirrors typer.c's `cur`)
     mut i = 0
     loop {
         if i >= program.items.len { break }
@@ -3106,7 +3111,7 @@ pub fn type_program(raw_program: parser::Program) -> TProgram | error {
         // with cur_ns="" (from env_empty) → cross-file top-level fns reported "unknown function".
         // with_ns preserves cur's accumulated bindings (prior loose `let`s stay visible).
         cur = with_ns(cur, it.namespace)
-        let ienv = with_ns(c.env, it.namespace)   // (#41) resolve this item's calls in its namespace
+        let ienv = with_ns(cenv, it.namespace)   // (#41) resolve this item's calls in its namespace
         // W-loc-2: the item's source file + the decl's line:col, so a type error in the
         // flattened program resolves to file:line:col (loose statements carry no loc → file only).
         mut line: u32 = 0
