@@ -75,7 +75,7 @@ struct tk_texpr {
         struct { tk_token_kind op; tk_texpr *left, *right; }         binary;
         struct { tk_token_kind op; tk_texpr *operand; }             unary;
         struct { tk_texpr *first; tk_tcmp_term *rest; size_t nrest; } compare;
-        struct { tk_path callee; tk_texpr *args; size_t nargs; tk_str call_ns; bool is_closure_call; tk_type callee_type; } call;  // call_ns: resolved target's namespace ("" = builtin/local → no mangle) (#41/#49). (W10a) is_closure_call = callee is a LOCAL of function type (a tk_closure VALUE) → call through `((R(*)(A,B))f.fn)(args)` using callee_type (the Func) for the cast
+        struct { tk_path callee; tk_texpr *args; size_t nargs; tk_str call_ns; bool is_closure_call; tk_type callee_type; bool is_iface_dispatch; uint32_t iface_slot; } call;  // call_ns: resolved target's namespace ("" = builtin/local → no mangle) (#41/#49). (W10a) is_closure_call = callee is a LOCAL of function type (a tk_closure VALUE) → call through `((R(*)(A,B))f.fn)(args)` using callee_type (the Func) for the cast. (W10b.D3) is_iface_dispatch = a DYNAMIC contract-method call: callee = [<Iface>, <method>], args[0] = the receiver (an interface value or a class instance the emit upcasts), callee_type = the resolved interface-method Func (receiver param typed Named{Iface}), iface_slot = the method's index in the interface's effective-method list (== its vtable slot)
         struct { tk_texpr *cond; tk_tstatement *then_blk; size_t nthen;
                  bool has_else; tk_tstatement *else_blk; size_t nelse; } if_expr;
         struct { tk_texpr *subject; tk_tarm *arms; size_t narms; }    match_expr;
@@ -108,7 +108,10 @@ struct tk_texpr {
         // Enum::Member as a VALUE (E#/value-level enum paths). `.type` is the NAMED enum; the
         // checker resolves the enum decl + member ORDINAL so both backends lower without re-lookup:
         // codegen → the C constant `TK_E_<UPPER enum_name>_<UPPER member>`; VM → the ordinal int.
-        struct { tk_str enum_name; tk_str member; uint64_t ordinal; }  path;
+        // (#50) `value` is the checker-RESOLVED member value — the ordinal for an enum member,
+        // `1 << ordinal` (power-of-2, u128 cap) for a flags member — so the VM reads the value
+        // instead of recomputing it (native codegen's pre-emitted constants already encode it).
+        struct { tk_str enum_name; tk_str member; uint64_t ordinal; unsigned __int128 value; }  path;
         // [ e0, e1, … ] (Increment B+) — `.type` is []T; each element is a typed texpr already
         // adopted into the element type T, so both backends build the same `[]T` value.
         // A spread element (`..xs`) carries is_spread=true and was checked against []T; the spread
@@ -128,7 +131,15 @@ struct tk_tstatement {
     tk_tstatement_tag tag;
     union {
         struct { tk_bind_kind kind; tk_bind_target target; tk_type bound; tk_texpr value; } binding;
-        struct { tk_str name; tk_token_kind op; tk_type bound; tk_texpr value; bool deref; }  assign;   // bound = the target's declared type (codegen wraps the value into it — emit_as); deref ⇒ `name.value op= …` writes THROUGH a Ref<T> (MEM-1b-ii)
+        // (#88) a typed assignment. `kind` tags the target shape (mirrors tk_assign_kind):
+        //   TK_ASSIGN_SIMPLE    — write the bare binding `name` (deref=false, target unused).
+        //   TK_ASSIGN_REF_DEREF — write THROUGH a `Ref<T>` handle `name` (deref=true, target unused).
+        //   TK_ASSIGN_FIELD     — write a struct/class field. `target` is the TYPED LHS field-access expr
+        //                         (a TK_TEXPR_FIELD_ACCESS), so codegen/VM reuse the read-side field lowering
+        //                         directly (`(*recv).f` for a class, `recv.f` for a struct); name/deref unused.
+        // `bound` = the target's declared type (codegen wraps the RHS into it — emit_as). `deref` stays a plain
+        // bool == (kind==REF_DEREF) so the legacy TKB layout / readers are unchanged for the two old shapes.
+        struct { tk_assign_kind kind; tk_str name; tk_token_kind op; tk_type bound; tk_texpr value; bool deref; tk_texpr *target; }  assign;
         struct { bool has_value; tk_texpr value; }                                           ret;   // value gated by has_value
         struct { tk_str label; tk_tstatement *body; size_t nbody; }                          loop_stmt;   // label empty = unlabeled
         struct { tk_str label; }                                                             jump;        // BREAK/CONTINUE — label empty = innermost

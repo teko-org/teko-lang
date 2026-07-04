@@ -1,10 +1,12 @@
 name: Sanitizers & Stress
 
+# chore/reboot is the ACTIVE integration branch (the "new main") — without it here, PRs
+# targeting chore/reboot get no checks at all (issue #54).
 on:
   push:
-    branches: [main, master]
+    branches: [main, master, chore/reboot]
   pull_request:
-    branches: [main, master]
+    branches: [main, master, chore/reboot]
 
 # Restrict default token scope for all jobs in this workflow.
 permissions:
@@ -27,10 +29,16 @@ jobs:
               - 'tests/**'
               - 'CMakeLists.txt'
               - '.github/workflows/sanitizers.yml'
+              - '.github/lsan-suppressions.txt'
 
-  # ── ASan + UBSan (default computed-goto dispatch) ────────────────────────────
+  # ── ASan + UBSan + LSan (default computed-goto dispatch) ────────────────────
+  # LSan is enabled on THIS lane only (issue #54): detect_leaks=1 with a suppressions
+  # file (.github/lsan-suppressions.txt) covering the documented M.5 process-lifetime
+  # allocations (deliberately never freed by us; reclaimed by the OS at exit). Any
+  # OTHER leak fails the lane. The portable-dispatch lane keeps detect_leaks=0 so a
+  # suppressions gap can't double-fail the matrix.
   asan-default:
-    name: ASan+UBSan / default dispatch
+    name: ASan+UBSan+LSan / default dispatch
     needs: changes
     if: needs.changes.outputs.run == 'true'
     runs-on: ubuntu-latest
@@ -58,11 +66,31 @@ jobs:
       - name: Build teko
         run: cmake --build build-asan --target teko --parallel 4
 
-      - name: Run tests (ASan + UBSan)
+      - name: Run tests (ASan + UBSan + LSan)
+        env:
+          ASAN_OPTIONS: halt_on_error=1:detect_leaks=1
+          LSAN_OPTIONS: suppressions=.github/lsan-suppressions.txt:print_suppressions=0
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: ./build-asan/teko test . --coverage
+
+      # `teko test .` exercises only the VM path — the NATIVE backend (tk_emit_c /
+      # cg_lift_program / tk_emit_tsym / run_cc) never ran under ASan, which is how the
+      # lift-pass use-after-free in tk_emit_tsym (freed items list read for the .tsym map;
+      # crashed glibc builds of any project with a non-capturing lambda) shipped unseen.
+      # Build every regressions fixture natively with the SANITIZED compiler so the whole
+      # build pipeline is ASan-covered. Leak detection off: the front-end deliberately
+      # holds compiler-lifetime allocations it never frees (core.h S0 seam discipline).
+      - name: Native-build regressions fixtures (ASan + UBSan)
         env:
           ASAN_OPTIONS: halt_on_error=1:detect_leaks=0
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
-        run: ./build-asan/teko test . --coverage
+        run: |
+          out="$(mktemp -d)"
+          for proj in examples/regressions/*/; do
+            ls "$proj"*.tkp >/dev/null 2>&1 || continue
+            echo "== teko build $proj"
+            ./build-asan/teko build "$proj" -o "$out/$(basename "$proj")"
+          done
 
   # ── ASan + UBSan (portable switch dispatch) ──────────────────────────────────
   asan-portable:
@@ -101,7 +129,39 @@ jobs:
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
         run: ./build-asan-portable/teko test . --coverage
 
-  # ── TSan (Thread Sanitizer) ───────────────────────────────────────────────────
+  # ── TSan (Thread Sanitizer): BUILD + SMOKE ────────────────────────────────────
+  # TSan runs build + smoke while the codebase is single-threaded (TSan finds no races
+  # without threads; ASan+UBSan run the full suite). RESTORE the full `teko test .`
+  # gate under TSan INCREMENTALLY as the concurrency surface lands — async/await,
+  # routines, teko::threading::run, parallelism, channels, teko::sync (S8/ASYNC,
+  # ROUND 5). Mandatory checklist item on every concurrency PR.
+  #
+  # Rationale (user-ratified, supersedes issue #127's full-suite-under-TSan approach):
+  # the test path is 100% SINGLE-THREADED today — ZERO pthread/thread/atomic/spawn in
+  # src/ (verified by grep). With no threads, TSan has no race to find: running the full
+  # 614-test suite under `-fsanitize=thread` produces NO additional coverage over the
+  # ASan+UBSan lanes (which DO run the full suite and pass) and only exposes the suite
+  # to environmental flake — the intermittent exit-143 (silent SIGTERM) that blocked
+  # unrelated PRs (#125, #126) was a RESOURCE/SLOWNESS kill on the slowest lane, never a
+  # data race or deadlock (the suite completes cleanly and deterministically both locally
+  # and on healthy runners). This is NOT a quarantine and loses NO real coverage: right-
+  # sizing the lane to BUILD + a race-clean SMOKE keeps exactly what TSan can still
+  # meaningfully assert on a single-threaded codebase, while removing the redundant,
+  # flake-prone full run.
+  #
+  # What still runs here:
+  #   1. BUILD the compiler under `-fsanitize=thread` — this catches TSan-build breakage
+  #      (instrumentation/flag incompatibilities) the moment it is introduced, so the day
+  #      threading lands the TSan toolchain is already known-good.
+  #   2. SMOKE: use the TSan-built `teko` to BUILD one small existing regression fixture
+  #      (examples/regressions/exit_success_path) and RUN the produced binary, asserting
+  #      its deterministic exit code (5). This proves the runtime executes race-clean
+  #      under TSan end-to-end (front-end -> C -> host cc -> execute) on a real program
+  #      that does actual work (a cross-file loop + a call-through-function-value closure).
+  # The #128 reliability guards are kept on the smoke run: the `timeout` wrapper makes any
+  # residual stall FAIL LOUD (exit 124) at a known bound instead of a silent SIGTERM (143),
+  # and the bounded TSAN_OPTIONS keep TSan correct for FUTURE threading bugs while capping
+  # its footprint. Job timeout kept at 15 min as backstop.
   tsan:
     name: TSan
     needs: changes
@@ -128,13 +188,42 @@ jobs:
             -DCMAKE_BUILD_TYPE=Debug \
             -DCMAKE_C_FLAGS="-fsanitize=thread -fno-omit-frame-pointer -g"
 
-      - name: Build teko
+      - name: Build teko (TSan)
         run: cmake --build build-tsan --target teko --parallel 4
 
-      - name: Run tests (TSan)
+      # SMOKE (not the full suite — see the BUILD + SMOKE rationale above; RESTORE the
+      # full `teko test .` gate under TSan as the concurrency surface lands). Build ONE
+      # tiny race-clean fixture with the TSan-built compiler and RUN it, asserting the
+      # fixture's deterministic exit code (5). `timeout` (coreutils, always on
+      # ubuntu-latest) makes any stall fail loud (exit 124) at a known bound instead of a
+      # silent runner SIGTERM (143); bounded TSAN_OPTIONS cap the footprint on a
+      # memory-tight runner while staying correct for FUTURE threading bugs.
+      - name: Smoke (TSan build+run of one regression fixture)
         env:
-          TSAN_OPTIONS: halt_on_error=1
-        run: ./build-tsan/teko test . --coverage
+          # Single-threaded workload: keep TSan correct for FUTURE threading bugs, but
+          # bound its footprint so a memory-tight runner flushes instead of OOM-killing.
+          TSAN_OPTIONS: halt_on_error=1:history_size=2:memory_limit_mb=6000:flush_memory_ms=2000
+        run: |
+          set -euo pipefail
+          out="$(mktemp -d)"
+          proj="examples/regressions/exit_success_path"   # tiny; deterministically exits 5
+          echo "== teko build $proj (TSan)"
+          timeout --kill-after=30s 600s ./build-tsan/teko build "$proj" -o "$out" | tee build.log
+          bin="$(sed -n 's/.*: built //p' build.log | tail -n1)"
+          if [ -z "$bin" ] || [ ! -x "$bin" ]; then
+            echo "ERROR: could not locate the built binary from the TSan build output." >&2
+            exit 1
+          fi
+          echo "== run $bin (TSan) — expecting deterministic exit code 5"
+          set +e
+          timeout --kill-after=30s 600s "$bin"
+          code=$?
+          set -e
+          if [ "$code" -ne 5 ]; then
+            echo "ERROR: TSan smoke run exited $code, expected 5 (race/abort/timeout/divergence)." >&2
+            exit 1
+          fi
+          echo "TSan smoke passed: build + run race-clean, exit code 5 as expected."
 
   # ── Windows stress: run tests 20 times ───────────────────────────────────────
   # NOTE: Uses Clang + Ninja (not MSVC) because the project requires __int128.

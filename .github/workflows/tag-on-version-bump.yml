@@ -1,0 +1,133 @@
+name: Tag on version bump
+
+# AUTOMATIC ADVANCEMENT of the bootstrap release tag.
+#
+# The teko.tkp manifest is the version SOURCE OF TRUTH. The bootstrap release is cut
+# from `main` ONLY, AFTER the reboot integration branch has been promoted to main.
+# When the manifest `version`/`suffix` bump lands on `main`, this workflow derives the
+# tag (scripts/derive_version.sh) and — ONLY if that tag does not already exist on
+# the remote — creates an annotated tag at the pushed commit and pushes it.
+#
+# WHY main-ONLY: cutting a release from an in-progress integration branch (e.g.
+# chore/reboot) would prematurely tag an INCOMPLETE reboot. The release must be
+# minted only once the reboot→main promotion is done, so this workflow triggers on
+# `main` exclusively.
+#
+# Pushing the tag must trigger .github/workflows/release.yml (its `push: tags:
+# '*-bootstrap'` path), which builds + gates + publishes the gen-3 release. This
+# workflow therefore does the ONE thing release.yml cannot: mint the tag from the
+# manifest automatically.
+#
+# ⚠️ TAG-PUSH TRIGGERING (RELEASE_TAG_PAT secret): GitHub does NOT emit workflow
+# trigger events for a tag pushed with the default GITHUB_TOKEN — so a GITHUB_TOKEN
+# tag push would NOT start release.yml. To make the tag actually trigger the release:
+#   • PREFERRED: set the repo secret `RELEASE_TAG_PAT` to a Personal Access Token
+#     (contents:write). The tag is pushed with that PAT, so the tag-push event fires
+#     and release.yml runs automatically. ← add this secret in repo Settings.
+#   • FALLBACK (no PAT): the tag is pushed with GITHUB_TOKEN (which will NOT trigger
+#     release.yml), and this workflow then EXPLICITLY dispatches the release via
+#     `gh workflow run release.yml -f version=$DERIVED` (release.yml exposes a
+#     workflow_dispatch with a `version` input). Works without any secret.
+# The active path is logged clearly at runtime.
+#
+# NO RECURSION: this job runs on BRANCH push; release.yml runs on TAG push (or the
+# dispatch above). Pushing a tag here does NOT re-trigger this workflow (it has no
+# `tags:` trigger), and this workflow never pushes a branch. IDEMPOTENT: if the
+# derived tag already exists it skips (logged), so re-running on unrelated commits is
+# a no-op.
+on:
+  push:
+    branches: [main]
+
+# Creating and pushing a tag requires write access to repository contents.
+# `actions: write` is needed for the FALLBACK path (no RELEASE_TAG_PAT): dispatching
+# release.yml via `gh workflow run`.
+permissions:
+  contents: write
+  actions: write
+
+# Never run two taggers concurrently for the same ref — avoids a race where two
+# pushes both see the tag missing and both try to create it.
+concurrency:
+  group: tag-on-version-bump-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Full history + tags so `git tag` / `git push` and existence checks work.
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Derive tag from teko.tkp
+        id: derive
+        run: |
+          DERIVED="$(sh scripts/derive_version.sh)"
+          echo "derived=$DERIVED" >> "$GITHUB_OUTPUT"
+          echo "teko.tkp-derived tag = $DERIVED"
+
+      - name: Create + push tag if it does not already exist
+        env:
+          DERIVED: ${{ steps.derive.outputs.derived }}
+          # PREFERRED path secret: a PAT (contents:write). When set, the tag is pushed
+          # WITH it, so the tag-push event triggers release.yml. When empty, we fall
+          # back to an explicit `gh workflow run` dispatch (see below).
+          RELEASE_TAG_PAT: ${{ secrets.RELEASE_TAG_PAT }}
+          # GITHUB_TOKEN for the FALLBACK dispatch (`gh workflow run`).
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          # Ask the REMOTE authoritatively whether the tag exists (not just the
+          # local fetch), so the guard is robust even if a fetch missed it.
+          if git ls-remote --exit-code --tags origin "refs/tags/$DERIVED" >/dev/null 2>&1; then
+            echo "SKIP: tag '$DERIVED' already exists on origin — manifest version not bumped; nothing to do."
+            exit 0
+          fi
+
+          echo "CREATE: tag '$DERIVED' is missing on origin — the manifest version was bumped."
+          # Configure an identity for the annotated tag.
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Annotate at the pushed commit (the current HEAD of this checkout).
+          git tag -a "$DERIVED" -m "Teko bootstrap release $DERIVED (auto-tagged from teko.tkp)" "$GITHUB_SHA"
+
+          if [ -n "${RELEASE_TAG_PAT:-}" ]; then
+            # ── PREFERRED: push the tag WITH the PAT ──────────────────────────────
+            # A tag pushed with a PAT (a real user credential) DOES emit the tag-push
+            # event, so release.yml's `push: tags: '*-bootstrap'` path fires on its own.
+            echo "PATH=PAT: RELEASE_TAG_PAT is set — pushing the tag with the PAT so release.yml auto-triggers."
+            PAT_REMOTE="https://x-access-token:${RELEASE_TAG_PAT}@github.com/${GITHUB_REPOSITORY}.git"
+            # A concurrent creator could win the race; treat a rejected push as a
+            # benign "already created" and exit 0 (idempotent).
+            if git push "$PAT_REMOTE" "refs/tags/$DERIVED"; then
+              echo "Pushed tag '$DERIVED' via PAT — release.yml (tag path) will build + publish."
+            else
+              echo "NOTE: PAT push of tag '$DERIVED' was rejected (it likely now exists via a concurrent run). Treating as already-tagged."
+            fi
+          else
+            # ── FALLBACK: push with GITHUB_TOKEN, then EXPLICITLY dispatch release ──
+            # GitHub does NOT emit a workflow trigger event for a GITHUB_TOKEN tag push,
+            # so we still create the tag (for provenance / release.yml's checkout) but
+            # then dispatch release.yml ourselves. release.yml exposes a
+            # workflow_dispatch with a `version` input for exactly this.
+            echo "PATH=DISPATCH: RELEASE_TAG_PAT is NOT set — pushing the tag with GITHUB_TOKEN (which does NOT trigger release.yml) then dispatching release.yml explicitly."
+            echo "               (Add a RELEASE_TAG_PAT secret in repo Settings to switch to the auto-trigger PAT path.)"
+            if git push origin "refs/tags/$DERIVED"; then
+              echo "Pushed tag '$DERIVED' via GITHUB_TOKEN."
+            else
+              echo "NOTE: push of tag '$DERIVED' was rejected (it likely now exists via a concurrent run). Treating as already-tagged."
+            fi
+            # Dispatch the release on the default branch, passing the derived version.
+            # release.yml checks out its own ref and builds/gates/publishes for $DERIVED.
+            echo "Dispatching release.yml with version=$DERIVED"
+            gh workflow run release.yml -f version="$DERIVED"
+            echo "Dispatched release.yml — it will build + gate + publish '$DERIVED'."
+          fi

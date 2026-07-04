@@ -151,7 +151,7 @@ const char *tk_check_modules(tk_program prog, tk_type_table table) {
         if (it.tag == TK_ITEM_FUNCTION) {
             tk_function f = it.as.function;
             line = f.line; col = f.col;
-            tk_type_table ftbl = tk_type_param_table(f.type_params, f.n_type_params, ns, table);   // (S4) type-params as local types of the using ns
+            tk_type_table ftbl = tk_type_param_table(f.type_params, f.n_type_params, f.type_constraints, ns, table);   // (S4) type-params as local types of the using ns
             for (size_t p = 0; p < f.nparams && !e; p += 1)
                 e = check_texpr(f.params[p].type_ann, ns, ftbl, al);
             if (!e && f.has_return) e = check_texpr(f.return_type, ns, ftbl, al);
@@ -169,6 +169,26 @@ const char *tk_check_modules(tk_program prog, tk_type_table table) {
                 // (W10b.CLASS) mirrors struct's field-only scope (methods unchecked here, same as struct methods today)
                 for (size_t k = 0; k < d.body.as.class_body.n_fields && !e; k += 1)
                     e = check_texpr(d.body.as.class_body.fields[k].type_ann, ns, table, al);
+            } else if (d.body.tag == TK_BODY_INTERFACE) {
+                // (W10b.IF) validate each method signature's TYPED params + return type-exprs
+                tk_interface_body ib = d.body.as.interface_body;
+                for (size_t mi = 0; mi < ib.n_methods && !e; mi += 1) {
+                    tk_function m = ib.methods[mi];
+                    for (size_t pi = 0; pi < m.nparams && !e; pi += 1)
+                        if (m.params[pi].has_type) e = check_texpr(m.params[pi].type_ann, ns, table, al);
+                    if (!e && m.has_return) e = check_texpr(m.return_type, ns, table, al);
+                }
+            } else if (d.body.tag == TK_BODY_TRAIT) {
+                // (TR0) fields like a struct's + method sigs like an interface's
+                tk_trait_body trb = d.body.as.trait_body;
+                for (size_t k = 0; k < trb.n_fields && !e; k += 1)
+                    e = check_texpr(trb.fields[k].type_ann, ns, table, al);
+                for (size_t mi = 0; mi < trb.n_methods && !e; mi += 1) {
+                    tk_function m = trb.methods[mi];
+                    for (size_t pi = 0; pi < m.nparams && !e; pi += 1)
+                        if (m.params[pi].has_type) e = check_texpr(m.params[pi].type_ann, ns, table, al);
+                    if (!e && m.has_return) e = check_texpr(m.return_type, ns, table, al);
+                }
             }
             // enum body: member names only; extern body (C7.1a): opaque handle — neither has type references to check
         }

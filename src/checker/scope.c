@@ -1,6 +1,18 @@
 // src/checker/scope.c
 #include "scope.h"
 #include <string.h>
+#include <stdio.h>    // (#121) snprintf — name the undefined symbol, matching scope.tks
+
+// (#121) "undefined name: <name>" — byte-identical to scope.tks's `$"undefined name: {name}"`.
+// Built inline (scope.c cannot include resolve.h — resolve.h includes scope.h, a cycle).
+static tk_error scope_undefined_name(tk_str name) {
+    const char *pfx = "undefined name: ";
+    size_t len = strlen(pfx) + name.len + 1;
+    char *buf = tk_alloc(len); if (!buf) abort();
+    int m = snprintf(buf, len, "%s%.*s", pfx, (int)name.len, (const char *)name.ptr);
+    if (m < 0 || (size_t)m >= len) abort();
+    return tk_error_make(buf);
+}
 
 static bool name_eq(tk_str n, tk_str m) {
     return n.len == m.len && memcmp(n.ptr, m.ptr, n.len) == 0;
@@ -22,23 +34,37 @@ tk_env tk_env_define(tk_env env, tk_str name, tk_type t, bool is_mut) {
     // holder's `.ptr` after a realloc → heap corruption ("pointer being freed was not
     // allocated"). Copy-on-extend keeps each branch's env independent. O(n) per define;
     // the bootstrap stays small (M.5), and this matches the functional `.tks` env twin.
-    size_t n = env.len;
+    size_t n = env.len;   // (#148) the LOCAL segment only — the sealed base is shared, never copied
     tk_val_binding *buf = tk_alloc((n + 1) * sizeof *buf);
     if (buf == NULL) { abort(); }
     if (n != 0) { memcpy(buf, env.ptr, n * sizeof *buf); }
     buf[n] = (tk_val_binding){ .name = name, .type = t, .is_mut = is_mut, .ns = (tk_str){0} };  // local: no ns (#41)
-    return (tk_env){ .ptr = buf, .len = n + 1, .cap = n + 1, .cur_ns = env.cur_ns, .owner_type = env.owner_type };
+    return (tk_env){ .base = env.base, .base_len = env.base_len, .ptr = buf, .len = n + 1, .cap = n + 1, .cur_ns = env.cur_ns, .owner_type = env.owner_type };
+}
+
+// (#148) tk_env_seal — move the accumulated bindings into the immutable base segment. Called once
+// per collected env at the collect→type boundary; later defines land in a fresh locals segment.
+tk_env tk_env_seal(tk_env env) {
+    size_t total = env.base_len + env.len;
+    tk_val_binding *buf = NULL;
+    if (total != 0) {
+        buf = tk_alloc(total * sizeof *buf);
+        if (buf == NULL) { abort(); }
+        if (env.base_len != 0) memcpy(buf, env.base, env.base_len * sizeof *buf);
+        if (env.len != 0) memcpy(buf + env.base_len, env.ptr, env.len * sizeof *buf);
+    }
+    return (tk_env){ .base = buf, .base_len = total, .ptr = NULL, .len = 0, .cap = 0, .cur_ns = env.cur_ns, .owner_type = env.owner_type };
 }
 
 // (#41) define a TOP-LEVEL FUNCTION binding carrying its declaring namespace, so an unqualified
 // call resolves to a same-namespace function (not a global bare-name collision). Same copy-on-extend.
 tk_env tk_env_define_fn(tk_env env, tk_str name, tk_type t, tk_str ns) {
-    size_t n = env.len;
+    size_t n = env.len;   // (#148) locals only — the sealed base is shared
     tk_val_binding *buf = tk_alloc((n + 1) * sizeof *buf);
     if (buf == NULL) { abort(); }
     if (n != 0) { memcpy(buf, env.ptr, n * sizeof *buf); }
     buf[n] = (tk_val_binding){ .name = name, .type = t, .is_mut = false, .ns = ns };
-    return (tk_env){ .ptr = buf, .len = n + 1, .cap = n + 1, .cur_ns = env.cur_ns, .owner_type = env.owner_type };
+    return (tk_env){ .base = env.base, .base_len = env.base_len, .ptr = buf, .len = n + 1, .cap = n + 1, .cur_ns = env.cur_ns, .owner_type = env.owner_type };
 }
 
 bool tk_bind_is_mut(tk_bind_kind k) { return k == TK_BIND_MUT; }   // Let/Const immutable (B.21)
@@ -69,7 +95,16 @@ tk_type_result tk_env_lookup_call(tk_env env, tk_path callee) {
             if (b.ns.len != 0 && name_eq(ns_last_seg(b.ns), qual)) return (tk_type_result){ .ok = true, .as.value = b.type };
         }
     }
-    return (tk_type_result){ .ok = false, .as.error = tk_error_make("undefined name") };
+    for (size_t i = env.base_len; i > 0; i -= 1) {   // (#148) then the sealed globals (same match rules)
+        tk_val_binding b = env.base[i - 1];
+        if (!name_eq(b.name, name)) continue;
+        if (!qualified) {
+            if (b.ns.len == 0 || name_eq(b.ns, env.cur_ns)) return (tk_type_result){ .ok = true, .as.value = b.type };
+        } else {
+            if (b.ns.len != 0 && name_eq(ns_last_seg(b.ns), qual)) return (tk_type_result){ .ok = true, .as.value = b.type };
+        }
+    }
+    return (tk_type_result){ .ok = false, .as.error = scope_undefined_name(name) };
 }
 
 // (#49) the resolved target's declaring NAMESPACE for a call (same scan as tk_env_lookup_call),
@@ -88,6 +123,15 @@ tk_str tk_env_call_ns(tk_env env, tk_path callee) {
             if (b.ns.len != 0 && name_eq(ns_last_seg(b.ns), qual)) return b.ns;
         }
     }
+    for (size_t i = env.base_len; i > 0; i -= 1) {   // (#148) then the sealed globals (same match rules)
+        tk_val_binding b = env.base[i - 1];
+        if (!name_eq(b.name, name)) continue;
+        if (!qualified) {
+            if (b.ns.len == 0 || name_eq(b.ns, env.cur_ns)) return b.ns;
+        } else {
+            if (b.ns.len != 0 && name_eq(ns_last_seg(b.ns), qual)) return b.ns;
+        }
+    }
     return (tk_str){0};
 }
 
@@ -96,7 +140,11 @@ tk_binding_result tk_env_lookup_binding(tk_env env, tk_str name) {
         tk_val_binding b = env.ptr[i - 1];
         if (name_eq(b.name, name)) return (tk_binding_result){ .ok = true, .as.value = b };
     }
-    return (tk_binding_result){ .ok = false, .as.error = tk_error_make("undefined name") };
+    for (size_t i = env.base_len; i > 0; i -= 1) {   // (#148) then the sealed globals (locals shadow)
+        tk_val_binding b = env.base[i - 1];
+        if (name_eq(b.name, name)) return (tk_binding_result){ .ok = true, .as.value = b };
+    }
+    return (tk_binding_result){ .ok = false, .as.error = scope_undefined_name(name) };
 }
 
 tk_type_result tk_env_lookup(tk_env env, tk_str name) {       // the type — thin wrapper
@@ -283,6 +331,10 @@ tk_type_result tk_builtin_fn(tk_str name) {
         tk_type ft = { .tag = TK_TYPE_FUNC, .as.func = { .params = NULL, .nparams = 0, .ret = &str_t } };
         return (tk_type_result){ .ok = true, .as.value = ft };
     }
+    if (name_is(name, "version")) {                                   // teko::env::version() -> str — CLI --version
+        tk_type ft = { .tag = TK_TYPE_FUNC, .as.func = { .params = NULL, .nparams = 0, .ret = &str_t } };
+        return (tk_type_result){ .ok = true, .as.value = ft };
+    }
     // teko::abort — the host abort FFI bottom (() -> void). The runtime's panic lowers to it.
     if (name_is(name, "abort")) {
         tk_type ft = { .tag = TK_TYPE_FUNC, .as.func = { .params = NULL, .nparams = 0, .ret = &void_t } };
@@ -301,6 +353,18 @@ tk_type_result tk_builtin_fn(tk_str name) {
         tk_type ft = { .tag = TK_TYPE_FUNC, .as.func = { .params = NULL, .nparams = 0, .ret = &u64_t } };
         return (tk_type_result){ .ok = true, .as.value = ft };
     }
+    if (name_is(name, "peak_rss")) {                                  // (#148) teko::mem::peak_rss() -> u64 — peak RSS in bytes
+        tk_type ft = { .tag = TK_TYPE_FUNC, .as.func = { .params = NULL, .nparams = 0, .ret = &u64_t } };
+        return (tk_type_result){ .ok = true, .as.value = ft };
+    }
+    if (name_is(name, "append_fo")) {                                 // (#148 R2) teko::mem::append_fo([]byte, str) -> []byte — bulk append, free-old by decree
+        static tk_type ab_byte  = { .tag = TK_TYPE_BYTE };
+        static tk_type ab_bytes = { .tag = TK_TYPE_SLICE, .as.slice = { .element = &ab_byte } };
+        static tk_type ab_params[2];
+        ab_params[0] = ab_bytes; ab_params[1] = str_t;
+        tk_type ft = { .tag = TK_TYPE_FUNC, .as.func = { .params = ab_params, .nparams = 2, .ret = &ab_bytes } };
+        return (tk_type_result){ .ok = true, .as.value = ft };
+    }
     if (name_is(name, "cov_is_marked")) {
         tk_type ft = { .tag = TK_TYPE_FUNC, .as.func = { .params = &u64_t, .nparams = 1, .ret = &bool_t } };
         return (tk_type_result){ .ok = true, .as.value = ft };
@@ -310,7 +374,8 @@ tk_type_result tk_builtin_fn(tk_str name) {
         tk_type ft = { .tag = TK_TYPE_FUNC, .as.func = { .params = &bool_t, .nparams = 1, .ret = &void_t } };
         return (tk_type_result){ .ok = true, .as.value = ft };
     }
-    if (name_is(name, "cov_branch_reset") || name_is(name, "cov_leave")) {
+    if (name_is(name, "cov_branch_reset") || name_is(name, "cov_leave")
+        || name_is(name, "arena_push") || name_is(name, "arena_pop")) {   // (#109 test-gate memory) () -> void
         tk_type ft = { .tag = TK_TYPE_FUNC, .as.func = { .params = NULL, .nparams = 0, .ret = &void_t } };
         return (tk_type_result){ .ok = true, .as.value = ft };
     }

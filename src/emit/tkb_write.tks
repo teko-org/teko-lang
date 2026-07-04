@@ -9,6 +9,7 @@ use teko::lexer
 fn prim_byte(k: checker::PrimKind) -> byte { k to byte }
 fn kind_byte(k: lexer::TokenKind) -> byte { k to byte }
 fn bindkind_byte(k: parser::BindKind) -> byte { k to byte }   // (C7.16) Let/Mut/Const → ordinal byte
+fn assign_kind_byte(k: parser::AssignKind) -> byte { k to byte }   // (#88) Simple/RefDeref/Field → ordinal byte
 fn vis_byte(v: parser::Visibility) -> byte { v to byte }      // (C7.16) Private/Pub/Exp → ordinal byte
 
 // a Type → tag byte + payload. (prim_byte/kind_byte = the enum's ordinal — E7.)
@@ -98,7 +99,19 @@ fn write_texpr(buf: []byte, t: StrTable, te: checker::TExpr) -> []byte {
         checker::TBinary as bn  => write_texpr(write_texpr(write_u8(write_u8(b, 4), kind_byte(bn.op)), t, bn.left), t, bn.right)
         checker::TUnary as u    => write_texpr(write_u8(write_u8(b, 5), kind_byte(u.op)), t, u.operand)
         checker::TCompare as c  => write_terms(write_texpr(write_u8(b, 6), t, c.first), t, c.rest)
-        checker::TCall as cl    => write_texprs(write_path(write_u8(b, 7), t, cl.callee), t, cl.args)
+        // (W10b.D3) a DYNAMIC contract-method call is its OWN tag (24): it must round-trip the
+        // resolved method Func (the cast signature) + the vtable slot, which the plain call
+        // encoding (tag 7) does not carry. callee = [<Iface>, <method>].
+        checker::TCall as cl    => {
+            if cl.is_iface_dispatch {
+                mut ib = write_path(write_u8(b, 24), t, cl.callee)
+                ib = write_type(ib, t, cl.callee_type)
+                ib = write_u32(ib, cl.iface_slot)
+                write_texprs(ib, t, cl.args)
+            } else {
+                write_texprs(write_path(write_u8(b, 7), t, cl.callee), t, cl.args)
+            }
+        }
         // (C7.16) typed IF: tag 8 + cond (texpr) + then_blk ([]TStatement) + has_else (u8) + else_blk.
         checker::TIfExpr as iff => {
             mut sb = write_texpr(write_u8(b, 8), t, iff.cond)
@@ -152,8 +165,8 @@ fn write_texpr(buf: []byte, t: StrTable, te: checker::TExpr) -> []byte {
             }
             sb
         }
-        // Enum::Member — PathExpr: tag 19, enum name (interned u32), member (interned u32), ordinal (u64).
-        checker::TPathExpr as pe => write_u64(write_u32(write_u32(write_u8(b, 19), st_find(t, pe.enum_name)), st_find(t, pe.member)), pe.ordinal)
+        // Enum::Member — PathExpr: tag 19, enum name (interned u32), member (interned u32), ordinal (u64), (#50) value (u128 as hi then lo u64).
+        checker::TPathExpr as pe => write_u64(write_u64(write_u64(write_u32(write_u32(write_u8(b, 19), st_find(t, pe.enum_name)), st_find(t, pe.member)), pe.ordinal), (pe.value >> 64) to u64), (pe.value & 0xFFFFFFFFFFFFFFFF) to u64)
         // Phase 2 — InExpr (<expr> in [ … ]): tag 20, lhs texpr, nelems (u64), then each elem texpr (write order = read order).
         checker::TInExpr as ie => {
             mut sb = write_texpr(write_u8(b, 20), t, ie.lhs)
@@ -226,12 +239,17 @@ fn write_tstatement(buf: []byte, t: StrTable, s: checker::TStatement) -> []byte 
             b = write_type(b, t, bd.bound)
             write_texpr(b, t, bd.value)
         }
-        // TAssign (1): name (interned u32) + op (TokenKind u8) + bound (Type) + value (TExpr) + deref (u8).
+        // TAssign (1): kind (u8) + name (interned u32) + op (TokenKind u8) + bound (Type) + value (TExpr)
+        //   + deref (u8) [+ target (TExpr) iff kind==Field]. (#88; MEM-1b-ii)
         checker::TAssign as a => {
-            mut b = write_u8(write_u32(write_u8(buf, 1), st_find(t, a.name)), kind_byte(a.op))
+            mut b = write_u8(buf, 1)
+            b = write_u8(b, assign_kind_byte(a.kind))          // (#88) the target discriminant
+            b = write_u32(b, st_find(t, a.name))
+            b = write_u8(b, kind_byte(a.op))
             b = write_type(b, t, a.bound)
             b = write_texpr(b, t, a.value)
-            write_u8(b, (if a.deref { 1 } else { 0 }) to byte)   // (MEM-1b-ii) deref ⇒ `name.value op= …`
+            b = write_u8(b, (if a.deref { 1 } else { 0 }) to byte)   // (MEM-1b-ii) deref ⇒ `name.value op= …`
+            match a.kind { parser::AssignKind::Field => write_texpr(b, t, a.target); _ => b }   // (#88) the FIELD LHS field-access
         }
         // TReturn (2): has_value (u8) + value (TExpr).
         checker::TReturn as r => write_texpr(write_u8(write_u8(buf, 2), (if r.has_value { 1 } else { 0 }) to byte), t, r.value)
@@ -294,7 +312,7 @@ fn write_fields(buf: []byte, t: StrTable, xs: []parser::Field) -> []byte {
     b
 }
 
-// a TypeBody: u8 tag + payload. StructBody(0)/EnumBody(1)/VariantBody(2)/AliasBody(3)/ExternBody(4)/FlagsBody(5)/ClassBody(6).
+// a TypeBody: u8 tag + payload. StructBody(0)/EnumBody(1)/VariantBody(2)/AliasBody(3)/ExternBody(4)/FlagsBody(5)/ClassBody(6)/InterfaceBody(7)/TraitBody(8).
 fn write_typebody(buf: []byte, t: StrTable, tb: parser::TypeBody) -> []byte {
     match tb {
         parser::StructBody as s  => write_fields(write_u8(buf, 0), t, s.fields)
@@ -316,6 +334,8 @@ fn write_typebody(buf: []byte, t: StrTable, tb: parser::TypeBody) -> []byte {
             sb
         }
         parser::ClassBody as c   => write_fields(write_u8(buf, 6), t, c.fields)   // (W10b.CLASS) fields only — methods not yet serialized (same gap as struct methods)
+        parser::InterfaceBody as ib => write_strs(write_u8(buf, 7), t, ib.extends)   // (W10b.IF) extends names only — method sigs not serialized (same gap)
+        parser::TraitBody as trb => write_fields(write_u8(buf, 8), t, trb.fields)   // (TR0) tag 8 — fields only; methods not serialized (same gap as struct/class methods)
     }
 }
 

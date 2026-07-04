@@ -1,0 +1,73 @@
+// Regression (#108): a CAPTURING lambda returning `Buf | error`, whose body binds a
+// `match` result as a VALUE sub-expression (`let picked = match … { … }`) and early-returns
+// a match-BOUND error variable from a nested `if` inside one arm — the exact shape that
+// missed the union wrap in the C twin (emit_arm_value's g_cg_ret_type, unset for lifted
+// capturing lambdas). See work.tkp for the full root-cause writeup.
+
+pub type Buf = struct {
+    len: u64
+    fn empty() -> Buf { Buf { len = 0 } }
+}
+
+fn source() -> Buf | error {
+    error { message = "boom" }
+}
+
+// captures `limit` — forces the CAPTURING lambda lift path (cg_emit_lambda_decls), not the
+// non-capturing path (which lifts to a plain top-level fn and never hit this bug).
+pub fn make(limit: u64) -> (u64) -> Buf | error {
+    let f: (u64) -> Buf | error = (max: u64) => {
+        // match used as a VALUE SUB-EXPRESSION (bound to `picked`), not the lambda's tail —
+        // routes through emit_match_value -> emit_arm_value (the buggy path pre-fix).
+        let picked = match source() {
+            Buf as b => b
+            error as e => {
+                if max == limit { return e }   // the bound-error early return (#108)
+                Buf::empty()
+            }
+        }
+        picked
+    }
+    f
+}
+
+// a higher-order combinator: receives the closure as a VALUE and calls it — exercises the
+// lifted function through an indirect call site too (not just a direct application).
+pub fn run_through(f: (u64) -> Buf | error, arg: u64) -> Buf | error {
+    f(arg)
+}
+
+// A trailing top-level function with a DIFFERENT return type, emitted AFTER make() in
+// program order — this is what left g_cg_ret_type pointing at the wrong type by the time
+// cg_emit_lambda_decls ran (it runs after ALL top-level functions). Keeps the regression
+// honest against a future reordering-sensitive "fix" that only works by emission-order luck.
+pub fn trailing_marker() -> u64 {
+    777
+}
+
+pub fn run() -> u64 {
+    let g = make(5)
+
+    // direct call: max == limit (5) -> the bound-error return path.
+    let direct_err = match g(5) {
+        Buf as _ => 0 to u64
+        error as _ => 10 to u64
+    }
+
+    // direct call: max != limit -> the non-error (Buf::empty) value path still works.
+    let direct_ok = match g(1) {
+        Buf as b => 1 to u64
+        error as _ => 0 to u64
+    }
+
+    // through-combinator call: same bound-error return path, called indirectly.
+    let combinator_err = match run_through(g, 5) {
+        Buf as _ => 0 to u64
+        error as _ => 10 to u64
+    }
+
+    let marker = trailing_marker()   // 777 — proves g_cg_ret_type pollution would have applied
+
+    // 10 + 1 + 10 = 21, plus a marker-derived 9 (777 % 10 == 7, +2 fixed) = 30.
+    direct_err + direct_ok + combinator_err + (if marker == 777 to u64 { 9 to u64 } else { 0 to u64 })
+}

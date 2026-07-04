@@ -1,0 +1,46 @@
+// (issue #107) closure-typed bindings named like a same-namespace `extern fn` — the checker
+// resolves the CALL through the local/param (a `tk_closure` VALUE), but codegen/VM used to
+// hijack it into the extern/builtin by bare-name sniffing BEFORE consulting that resolution.
+// This is the real-world shape that bit `src/io/stream.tks` (the NAMING NOTE workaround, now
+// reverted): `teko::io` already declares `extern fn write(s: str) -> void`, so any closure
+// param/local ALSO named `write` used to be miscompiled.
+
+// a genuine same-namespace extern named `write` — the exact collision shape from the issue.
+// (never actually invoked once the fix holds: every `write(...)` call below resolves to a
+// closure VALUE that shadows it, at every nesting level.)
+pub extern fn write(s: str) -> void = "tk_write" from "teko_rt"
+
+pub type WFn = (str) -> u64
+
+// bit 0 (1): a PARAM named `write` must call THROUGH the param, not the extern above.
+fn call_it(write: WFn) -> u64 {
+    write("hello")
+}
+
+// bit 2 (4): a NESTED closure re-shadowing `write` inside an outer `write`-named param — the
+// innermost binding must win at its own call site, while the outer param keeps working at its
+// own (the checker/codegen must not conflate the two scopes).
+fn nested_shadow(write: WFn) -> u64 {
+    let inner: WFn = (s: str) => {
+        let write: WFn = (s2: str) => 4 to u64   // shadows the outer PARAM `write`
+        write(s)                                  // must call the innermost local -> 4
+    }
+    if write("outer") != 1 to u64 { return 0 to u64 }   // the outer param must still be itself
+    inner("inner")                                       // -> 4
+}
+
+pub fn run() -> u64 {
+    // bit 0 (1): closure PARAM shadow.
+    let f1: WFn = (s: str) => 1 to u64
+    let bit0 = call_it(f1)
+
+    // bit 1 (2): `let`-bound closure shadow (same extern, a LOCAL binding instead of a param).
+    let write: WFn = (s: str) => 2 to u64
+    let bit1 = write("ignored")
+
+    // bit 2 (4): nested closure shadow — see nested_shadow above.
+    let f2: WFn = (s: str) => 1 to u64
+    let bit2 = nested_shadow(f2)
+
+    bit0 + bit1 + bit2   // 1 + 2 + 4 = 7
+}

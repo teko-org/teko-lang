@@ -21,27 +21,43 @@ type ValBinding = struct {
 // FOR, which may differ (increment 2's per-owning-class re-stamping). Drives `intern`/private
 // member-access enforcement (a field/method is reachable only from its declaring class's own
 // code, or — if `is_intern` — from a subclass's own code too).
-pub type Env = struct { bindings: []ValBinding; cur_ns: str; owner_type: str }
+// (#148) TWO-SEGMENT env: `base` holds the SEALED collected globals (every top-level fn/method
+// signature — hundreds of KB), `bindings` the per-scope locals. The checker extends one collected
+// env NON-LINEARLY (every function/arm forks from the same base), and a single flat list made each
+// fork COPY the whole global segment on its first define (measured 1.3 GB / 4.5k copies of ~287 KB
+// on a self-build). Sealing the globals once (seal(), called by the typer between collect and the
+// typing loop) makes a fork copy only its OWN locals — a few dozen entries. Lookups scan bindings
+// innermost-first, THEN base innermost-first (locals shadow globals; global order preserved).
+pub type Env = struct { base: []ValBinding; bindings: []ValBinding; cur_ns: str; owner_type: str }
 
 // an empty env (no bindings, no current namespace, not inside any class method).
-pub fn env_empty() -> Env { Env { bindings = teko::list::empty(); cur_ns = ""; owner_type = "" } }
+pub fn env_empty() -> Env { Env { base = teko::list::empty(); bindings = teko::list::empty(); cur_ns = ""; owner_type = "" } }
+
+// (#148) seal — move the accumulated bindings into the immutable `base` segment. Called ONCE per
+// collected env, at the collect→type boundary; later defines land in the fresh `bindings`.
+pub fn seal(env: Env) -> Env {
+    mut b = env.base
+    mut i: u64 = 0
+    loop { if i >= env.bindings.len { break }; b = teko::list::push(b, env.bindings[i]); i++ }
+    Env { base = b; bindings = teko::list::empty(); cur_ns = env.cur_ns; owner_type = env.owner_type }
+}
 
 // (#41) set the namespace currently being type-checked — the typed pass sets it per item.
-pub fn with_ns(env: Env, ns: str) -> Env { Env { bindings = env.bindings; cur_ns = ns; owner_type = env.owner_type } }
+pub fn with_ns(env: Env, ns: str) -> Env { Env { base = env.base; bindings = env.bindings; cur_ns = ns; owner_type = env.owner_type } }
 
 // (W10b.CLASS) set the DECLARING class of the method body about to be typed ("" clears it —
 // used when entering a free function).
-pub fn with_owner(env: Env, owner: str) -> Env { Env { bindings = env.bindings; cur_ns = env.cur_ns; owner_type = owner } }
+pub fn with_owner(env: Env, owner: str) -> Env { Env { base = env.base; bindings = env.bindings; cur_ns = env.cur_ns; owner_type = owner } }
 
 // define a LOCAL name (append). `is_mut`: a `mut` binding passes true; everything else false (B.21).
 // Locals carry no namespace ("").
 pub fn define(env: Env, name: str, t: Type, is_mut: bool) -> Env {
-    Env { bindings = teko::list::push(env.bindings, ValBinding { name = name; type = t; is_mut = is_mut; ns = "" }); cur_ns = env.cur_ns; owner_type = env.owner_type }
+    Env { base = env.base; bindings = teko::list::push(env.bindings, ValBinding { name = name; type = t; is_mut = is_mut; ns = "" }); cur_ns = env.cur_ns; owner_type = env.owner_type }
 }
 
 // (#41) define a TOP-LEVEL FUNCTION binding carrying its declaring namespace.
 pub fn define_fn(env: Env, name: str, t: Type, ns: str) -> Env {
-    Env { bindings = teko::list::push(env.bindings, ValBinding { name = name; type = t; is_mut = false; ns = ns }); cur_ns = env.cur_ns; owner_type = env.owner_type }
+    Env { base = env.base; bindings = teko::list::push(env.bindings, ValBinding { name = name; type = t; is_mut = false; ns = ns }); cur_ns = env.cur_ns; owner_type = env.owner_type }
 }
 
 // a binding is mutable iff declared `mut` (Let and Const are immutable — B.21).
@@ -54,6 +70,12 @@ fn lookup_binding(env: Env, name: str) -> ValBinding | error {
         if i == 0 { break }
         i = i - 1
         if env.bindings[i].name == name { return env.bindings[i] }
+    }
+    mut j = env.base.len   // (#148) then the sealed globals (locals shadow)
+    loop {
+        if j == 0 { break }
+        j = j - 1
+        if env.base[j].name == name { return env.base[j] }
     }
     error { message = $"undefined name: {name}" }
 }
@@ -95,6 +117,19 @@ fn lookup_call(env: Env, callee: parser::Path) -> Type | error {
             }
         }
     }
+    mut j = env.base.len   // (#148) then the sealed globals (same match rules)
+    loop {
+        if j == 0 { break }
+        j = j - 1
+        let b = env.base[j]
+        if b.name == name {
+            if !qualified {
+                if b.ns.len == 0 || b.ns == env.cur_ns { return b.type }
+            } else {
+                if b.ns.len != 0 && ns_last_seg(b.ns) == qual { return b.type }
+            }
+        }
+    }
     error { message = $"undefined name: {name}" }
 }
 
@@ -110,6 +145,19 @@ fn call_ns(env: Env, callee: parser::Path) -> str {
         if i == 0 { break }
         i = i - 1
         let b = env.bindings[i]
+        if b.name == name {
+            if !qualified {
+                if b.ns.len == 0 || b.ns == env.cur_ns { return b.ns }
+            } else {
+                if b.ns.len != 0 && ns_last_seg(b.ns) == qual { return b.ns }
+            }
+        }
+    }
+    mut j = env.base.len   // (#148) then the sealed globals (same match rules)
+    loop {
+        if j == 0 { break }
+        j = j - 1
+        let b = env.base[j]
         if b.name == name {
             if !qualified {
                 if b.ns.len == 0 || b.ns == env.cur_ns { return b.ns }
@@ -156,6 +204,13 @@ fn builtin_fn(name: str) -> Type | error {
     let void_t = Void { }
     let bytes_t = Slice { element = Byte { } }
     if name == "os" { return Func { params = teko::list::empty(); ret = str_t ; variadic = false ; param_names = []; n_required = 0; defaults = [] } }   // teko::os() -> str ("macos"/"linux"/"windows") — C7.1f
+    if name == "version" { return Func { params = teko::list::empty(); ret = str_t ; variadic = false ; param_names = []; n_required = 0; defaults = [] } }   // teko::env::version() -> str — CLI --version
+    if name == "peak_rss" { return Func { params = teko::list::empty(); ret = Prim { kind = PrimKind::U64 } ; variadic = false ; param_names = []; n_required = 0; defaults = [] } }   // (#148) teko::mem::peak_rss() -> u64 — the process peak RSS in bytes (0 = unavailable)
+    if name == "append_fo" {   // (#148 R2) teko::mem::append_fo([]byte, str) -> []byte — bulk append, free-old BY DECREE (linear builder chains only)
+        mut afp: []Type = teko::list::push(teko::list::empty(), bytes_t)
+        afp = teko::list::push(afp, str_t)
+        return Func { params = afp; ret = bytes_t ; variadic = false ; param_names = []; n_required = afp.len; defaults = [] }
+    }
     if name == "abort" { return Func { params = teko::list::empty(); ret = void_t ; variadic = false ; param_names = []; n_required = 0; defaults = [] } }   // teko::abort — host abort FFI bottom (() -> void)
     // D3 — test-coverage sink (host side-channel): cov_reset()/cov_mark(u64) -> void ; cov_distinct() -> u64.
     if name == "cov_reset" { return Func { params = teko::list::empty(); ret = void_t ; variadic = false ; param_names = []; n_required = 0; defaults = [] } }
@@ -167,6 +222,10 @@ fn builtin_fn(name: str) -> Type | error {
     if name == "cov_branch_reset" { return Func { params = teko::list::empty(); ret = void_t ; variadic = false ; param_names = []; n_required = 0; defaults = [] } }
     if name == "cov_enter" { return Func { params = teko::list::push(teko::list::empty(), Prim { kind = PrimKind::U64 }); ret = void_t ; variadic = false ; param_names = []; n_required = (teko::list::push(teko::list::empty(), Prim { kind = PrimKind::U64 })).len; defaults = [] } }
     if name == "cov_leave" { return Func { params = teko::list::empty(); ret = void_t ; variadic = false ; param_names = []; n_required = 0; defaults = [] } }
+    // (#109 test-gate memory) arena_push()/arena_pop() -> void — checkpoint/rewind the root region's
+    // bump position around each #test (bounds the self-host test gate's memory). Host side-channel.
+    if name == "arena_push" { return Func { params = teko::list::empty(); ret = void_t ; variadic = false ; param_names = []; n_required = 0; defaults = [] } }
+    if name == "arena_pop" { return Func { params = teko::list::empty(); ret = void_t ; variadic = false ; param_names = []; n_required = 0; defaults = [] } }
     if name == "cov_branch" {
         mut bp: []Type = teko::list::push(teko::list::push(teko::list::empty(), Prim { kind = PrimKind::U32 }), Prim { kind = PrimKind::U32 })
         bp = teko::list::push(bp, Prim { kind = PrimKind::U64 })

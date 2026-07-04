@@ -28,7 +28,7 @@ pub type TBinary  = struct { op: lexer::TokenKind; left: TExpr; right: TExpr }
 pub type TUnary   = struct { op: lexer::TokenKind; operand: TExpr }
 pub type TCmpTerm = struct { op: lexer::TokenKind; operand: TExpr }
 pub type TCompare = struct { first: TExpr; rest: []TCmpTerm }
-pub type TCall    = struct { callee: parser::Path; args: []TExpr; call_ns: str; is_closure_call: bool; callee_type: Type }   // call_ns: resolved target's namespace ("" = builtin/local → no mangle) (#41/#49). (W10a) is_closure_call = the callee is a LOCAL of function type (a `tk_closure` VALUE) → codegen calls through `((R(*)(A,B))f.fn)(args)` using callee_type (the Func) for the cast; false (callee_type unused) for a direct/builtin call.
+pub type TCall    = struct { callee: parser::Path; args: []TExpr; call_ns: str; is_closure_call: bool; callee_type: Type; is_iface_dispatch: bool; iface_slot: u32 }   // call_ns: resolved target's namespace ("" = builtin/local → no mangle) (#41/#49). (W10a) is_closure_call = the callee is a LOCAL of function type (a `tk_closure` VALUE) → codegen calls through `((R(*)(A,B))f.fn)(args)` using callee_type (the Func) for the cast; false (callee_type unused) for a direct/builtin call. (W10b.D3) is_iface_dispatch = a DYNAMIC contract-method call: callee = [<Iface>, <method>], args[0] = the receiver, callee_type = the resolved interface-method Func (receiver param typed Named{Iface}), iface_slot = the method's index in the interface's effective-method list (== its vtable slot).
 
 // control-flow expressions carry TYPED blocks/arms (B.20/B.15). The `pattern` stays
 // syntactic (it binds; pattern typing itself is C7a); `guard` is valid iff has_when.
@@ -69,7 +69,7 @@ pub type TInExpr     = struct { lhs: TExpr; elems: []TExpr }
 // flattens it at runtime (concatenates the sub-slice into the result slice).
 pub type TArrayElem  = struct { is_spread: bool; expr: TExpr }
 pub type TArrayLit   = struct { elements: []TArrayElem }
-pub type TPathExpr   = struct { enum_name: str; member: str; ordinal: u64 }   // Enum::Member as a VALUE — `.type` is the NAMED enum; carries the resolved member ordinal
+pub type TPathExpr   = struct { enum_name: str; member: str; ordinal: u64; value: u128 }   // Enum::Member as a VALUE — `.type` is the NAMED enum; carries the resolved member ordinal + (#50) the RESOLVED member value (enum: the ordinal; flags: 1 << ordinal, u128 cap) so the VM reads it instead of recomputing
 // (W10) a typed closure LITERAL. `.type` (on the TExpr) is the closure's `Func` type. `params` are
 // the typed parameters; `body` is the typed statement block (its trailing value is the result, of
 // type `ret`). `captures` lists the FREE variables the body reads from the enclosing scope — each
@@ -84,7 +84,14 @@ type TExprKind = variant TNumber | TVar | TStrLit | TByteLit | TCharLit | TBoolL
 
 // --- typed statements (mirror Statement; children are TExpr / []TStatement) ---
 pub type TBinding      = struct { kind: parser::BindKind; target: parser::BindTarget; bound: Type; value: TExpr }   // `bound`: the type the target binds to (the annotation if present, else the value's)
-pub type TAssign       = struct { name: str; op: lexer::TokenKind; bound: Type; value: TExpr; deref: bool }   // bound = the target's declared type (codegen wraps the value into it — emit_as); deref=true ⇒ `name.value op= …` writes THROUGH a Ref<T> (MEM-1b-ii)
+// (#88) a typed assignment. `kind` (parser::AssignKind) tags the target shape:
+//   Simple   — write the bare binding `name` (deref=false; target = a sentinel, unused).
+//   RefDeref — write THROUGH a `Ref<T>` handle `name` (deref=true; target = a sentinel, unused).
+//   Field    — write a struct/class field; `target` is the TYPED LHS field-access expr (a TFieldAccess),
+//              so codegen/VM reuse the read-side field lowering directly; name/deref unused.
+// `bound` = the target's declared type (codegen wraps the RHS into it — emit_as). `deref` stays a plain
+// bool == (kind==RefDeref) so the legacy TKB layout / readers are unchanged for the two old shapes.
+pub type TAssign       = struct { kind: parser::AssignKind; name: str; op: lexer::TokenKind; bound: Type; value: TExpr; deref: bool; target: TExpr }
 pub type TReturn       = struct { has_value: bool; value: TExpr }   // `value` gated by has_value (B.20) — a bare `return`'s placeholder (Number 0) types harmlessly
 pub type TLoopStmt     = struct { label: str; body: []TStatement }   // label empty = unlabeled (M.5)
 pub type TBreakStmt    = struct { label: str }                       // label empty = innermost loop
@@ -119,6 +126,12 @@ pub type TFunction = struct {
 }
 pub type TItem    = variant TFunction | parser::TypeDecl | parser::UseDecl | TStatement   // pub: TProgram.items surface + the .tkb codec (C7.16). TypeDecl/UseDecl pass through (E5c); a loose top-level Statement → typed
 pub type TProgram = struct { items: []TItem }
+
+// (#88) a placeholder typed expr for a TAssign's `target` when kind != Field (never read — gated by
+// kind). Mirrors parser::no_expr()'s sentinel convention; a Void-typed null leaf costs nothing to carry.
+pub fn no_texpr() -> TExpr {
+    TExpr { kind = TNullLit { }; type = Void { }; line = 0; col = 0 }
+}
 
 // --- env-threading carriers: the typed pass advances the env, like check_* did ---
 type TypedStmt  = struct { node: TStatement;    env: Env }   // a typed statement + the env it leaves (bindings extend it)

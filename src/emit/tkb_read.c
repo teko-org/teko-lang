@@ -185,12 +185,16 @@ tk_texpr tk_read_texpr(tk_reader *r, tk_strs t) {
             e.as.interp.holes  = holes;  e.as.interp.nholes  = nh;
             return e;
         }
-        case 19:                                                                /* value-level Enum::Member — enum name, member, ordinal */
+        case 19: {                                                              /* value-level Enum::Member — enum name, member, ordinal, (#50) value (u128 as hi then lo) */
             e.tag = TK_TEXPR_PATH;
             e.as.path.enum_name = tk_read_str(r, t);
             e.as.path.member    = tk_read_str(r, t);
             e.as.path.ordinal   = tk_read_u64(r);
+            uint64_t vhi = tk_read_u64(r);
+            uint64_t vlo = tk_read_u64(r);
+            e.as.path.value = (((unsigned __int128)vhi) << 64) | (unsigned __int128)vlo;
             return e;
+        }
         case 20: {                                                              /* Phase 2 — <expr> in [ … ]: lhs THEN nelems (u64) THEN each elem */
             e.tag = TK_TEXPR_IN;
             e.as.in_expr.lhs = boxe(tk_read_texpr(r, t));
@@ -212,6 +216,18 @@ tk_texpr tk_read_texpr(tk_reader *r, tk_strs t) {
             return e;
         }
         case 23: e.tag = TK_TEXPR_CHAR; e.as.char_lit.bytes = tk_read_str(r, t); return e;   // (UTF-8 increment 1) tag 23 = char literal
+        case 24: {   // (W10b.D3) DYNAMIC contract-method call: path + method Func + vtable slot + args
+            e.tag = TK_TEXPR_CALL;
+            uint32_t np = tk_read_u32(r); tk_segment *segs = tk_alloc((np ? np : 1) * sizeof *segs); if (!segs) abort();
+            for (uint32_t i = 0; i < np; i += 1) segs[i].name = tk_read_str(r, t);
+            e.as.call.callee = (tk_path){ segs, np };
+            e.as.call.callee_type = tk_read_type(r, t);
+            e.as.call.iface_slot = tk_read_u32(r);
+            e.as.call.is_iface_dispatch = true;
+            uint32_t na = tk_read_u32(r); tk_texpr *as = tk_alloc((na ? na : 1) * sizeof *as); if (!as) abort();
+            for (uint32_t i = 0; i < na; i += 1) as[i] = tk_read_texpr(r, t);
+            e.as.call.args = as; e.as.call.nargs = na; return e;
+        }
     }
     r->ok = false; return e;
 }
@@ -243,11 +259,17 @@ static tk_tstatement read_tstmt(tk_reader *r, tk_strs t) {
             return s;
         case 1:
             s.tag = TK_TSTMT_ASSIGN;
+            s.as.assign.kind  = (tk_assign_kind)tk_read_u8(r);   // (#88) the target discriminant
             s.as.assign.name  = tk_read_str(r, t);
             s.as.assign.op    = kind_of(tk_read_u8(r));
             s.as.assign.bound = tk_read_type(r, t);
             s.as.assign.value = tk_read_texpr(r, t);
             s.as.assign.deref = (tk_read_u8(r) != 0);   // (MEM-1b-ii)
+            s.as.assign.target = NULL;
+            if (s.as.assign.kind == TK_ASSIGN_FIELD) {   // (#88) the FIELD LHS field-access
+                tk_texpr *lp = tk_alloc(sizeof *lp); if (!lp) abort(); *lp = tk_read_texpr(r, t);
+                s.as.assign.target = lp;
+            }
             return s;
         case 2:
             s.tag = TK_TSTMT_RETURN;
@@ -364,6 +386,18 @@ static tk_type_body read_typebody(tk_reader *r, tk_strs t) {
             tb.as.class_body.implements = NULL; tb.as.class_body.n_implements = 0;
             tb.as.class_body.fields = read_fields(r, t, &tb.as.class_body.n_fields);
             tb.as.class_body.methods = NULL; tb.as.class_body.n_methods = 0;
+            return tb;
+        }
+        case 7: {   // (W10b.IF) extends names only — method sigs not serialized (same gap as struct/class methods)
+            tb.tag = TK_BODY_INTERFACE;
+            tb.as.interface_body.extends = read_strs(r, t, &tb.as.interface_body.n_extends);
+            tb.as.interface_body.methods = NULL; tb.as.interface_body.n_methods = 0;
+            return tb;
+        }
+        case 8: {   // (TR0) trait — fields only; methods not serialized (same gap)
+            tb.tag = TK_BODY_TRAIT;
+            tb.as.trait_body.fields = read_fields(r, t, &tb.as.trait_body.n_fields);
+            tb.as.trait_body.methods = NULL; tb.as.trait_body.n_methods = 0;
             return tb;
         }
     }

@@ -62,6 +62,8 @@ typedef struct { tk_expr *receiver; tk_str field; }          tk_safe_field_acces
 typedef struct { tk_expr *left, *right; }                    tk_coalesce;      // x ?? y — Elvis/null-coalescing (REBOOT_PLAN §203)
 typedef struct { tk_expr *receiver; tk_str method;                            // recv.method(a, …)
                  tk_expr *args; size_t nargs; }              tk_method_call;
+typedef struct { tk_expr *receiver; tk_str method;                            // recv?.method(a, …) — null-propagating method call (NP-OOP, issue #116)
+                 tk_expr *args; size_t nargs; }              tk_safe_method_call;
 typedef struct { tk_expr *expr; tk_type_expr target; }       tk_cast;          // x to T
 typedef struct { tk_path path; }                             tk_path_expr;     // Enum::Member as a VALUE
 // Name { field = value, … } — a struct VALUE constructor (W4a). Parallel arrays (field_vals is a
@@ -110,6 +112,7 @@ typedef enum {
     TK_EXPR_BINARY, TK_EXPR_UNARY, TK_EXPR_COMPARE, TK_EXPR_CALL,
     TK_EXPR_IF, TK_EXPR_MATCH, TK_EXPR_FIELD_ACCESS, TK_EXPR_METHOD_CALL,
     TK_EXPR_SAFE_FIELD_ACCESS, TK_EXPR_COALESCE,
+    TK_EXPR_SAFE_METHOD_CALL,   // recv?.method(a, …) — null-propagating method call (NP-OOP, issue #116)
     TK_EXPR_CAST, TK_EXPR_PATH, TK_EXPR_STRUCT_LIT, TK_EXPR_INDEX,
     TK_EXPR_INTERP,   // $"…{expr}…" — string interpolation (self-host parity)
     TK_EXPR_IN,       // <expr> in [ … ] — membership test (Phase 2)
@@ -139,6 +142,7 @@ struct tk_expr {
         tk_safe_field_access safe_field_access; // TK_EXPR_SAFE_FIELD_ACCESS
         tk_coalesce     coalesce;      // TK_EXPR_COALESCE
         tk_method_call  method_call;   // TK_EXPR_METHOD_CALL
+        tk_safe_method_call safe_method_call; // TK_EXPR_SAFE_METHOD_CALL (NP-OOP, issue #116)
         tk_cast         cast;          // TK_EXPR_CAST
         tk_path_expr    path;          // TK_EXPR_PATH
         tk_struct_lit   struct_lit;    // TK_EXPR_STRUCT_LIT
@@ -177,7 +181,16 @@ typedef struct {                                                          // let
     tk_type_expr  type_ann;                                               // the parsed annotation (valid iff has_type)
     tk_expr       value;
 } tk_binding;
-typedef struct { tk_str name; tk_token_kind op; tk_expr value; bool deref; } tk_assign;   // x = / += / … (B.4); deref ⇒ `name.value op= …` writes THROUGH a Ref<T> (MEM-1b-ii)
+// (#88) an assignment TARGET is one of three shapes, tagged by `kind`:
+//   TK_ASSIGN_SIMPLE    — `name op= value`; the LHS is the bare binding `name` (`deref`=false, `target`=NULL).
+//   TK_ASSIGN_REF_DEREF — `name.value op= value`; write THROUGH a `Ref<T>` handle `name` (`deref`=true — the
+//                         legacy MEM-1b-ii flag, preserved bit-for-bit; `target`=NULL).
+//   TK_ASSIGN_FIELD     — `recv.field op= value`; write a struct/class field. `target` is the LHS field-access
+//                         EXPR (a `TK_EXPR_FIELD_ACCESS`, receiver.field, arbitrarily nested); `name`/`deref` unused.
+// `deref` stays a plain bool == (kind==REF_DEREF) so every legacy reader/TKB byte layout is unchanged for the
+// two old shapes; a FIELD target is the ONLY new shape (`kind`=FIELD carries `target`, the general lvalue).
+typedef enum { TK_ASSIGN_SIMPLE = 0, TK_ASSIGN_REF_DEREF, TK_ASSIGN_FIELD } tk_assign_kind;
+typedef struct { tk_assign_kind kind; tk_str name; tk_token_kind op; tk_expr value; bool deref; tk_expr *target; } tk_assign;   // x = / += / … (B.4); see tk_assign_kind above
 typedef struct { bool has_value; tk_expr value; }               tk_return;    // return [expr] (value gated by has_value)
 typedef struct { tk_str label; tk_statement *body; size_t nbody; } tk_loop_stmt; // loop [NAME] { … } (M.5); label empty (len 0) = unlabeled
 typedef struct { tk_str label; }                                tk_jump;      // break [NAME] / continue [NAME]; label empty = innermost loop
@@ -261,7 +274,9 @@ typedef struct {                                                   // Function (
 // carries TK_VIS_PUB/is_intern=false (struct members stay all-public); only a class-body field
 // actually varies these.
 typedef struct { tk_str name; tk_type_expr type_ann; tk_visibility vis; bool is_intern; } tk_field;
-typedef struct { tk_field *fields; size_t n_fields; tk_function *methods; size_t n_methods; }  tk_struct_body;   // (OOP A1, 2026-07-01) methods = interleaved `fn` decls; unified method model (see tk_param.has_type)
+// (W10b.IF) `implements`/`n_implements` — the `struct I1 & I2 { … }` interface list (a struct MAY
+// implement interfaces; it just cannot inherit / be inherited). Conformance checked like a class's.
+typedef struct { tk_field *fields; size_t n_fields; tk_function *methods; size_t n_methods; tk_str *implements; size_t n_implements; }  tk_struct_body;   // (OOP A1, 2026-07-01) methods = interleaved `fn` decls; unified method model (see tk_param.has_type)
 typedef struct { tk_str  *members; size_t n_members; } tk_enum_body;    // member names, in order
 typedef struct {
     tk_str            *members;  // member names, in order
@@ -288,9 +303,17 @@ typedef struct {
     tk_field     *fields;     size_t n_fields;
     tk_function  *methods;    size_t n_methods;
 } tk_class_body;
-typedef struct {                                                        // TypeBody = StructBody | EnumBody | FlagsBody | VariantBody | AliasBody | ExternBody | ClassBody
-    enum { TK_BODY_STRUCT, TK_BODY_ENUM, TK_BODY_FLAGS, TK_BODY_VARIANT, TK_BODY_ALIAS, TK_BODY_EXTERN, TK_BODY_CLASS } tag;
-    union { tk_struct_body struct_body; tk_enum_body enum_body; tk_flags_body flags_body; tk_variant_body variant_body; tk_alias_body alias_body; tk_extern_body extern_body; tk_class_body class_body; } as;
+// (W10b.IF) an INTERFACE body — a pure signature contract. See ast.tks::InterfaceBody for the
+// full rationale. `extends`/`n_extends` = extended interfaces (the `I1 & I2` list); `methods` =
+// bodyless instance-method signatures.
+typedef struct { tk_str *extends; size_t n_extends; tk_function *methods; size_t n_methods; } tk_interface_body;
+// (TR0, 2026-07-02) a TRAIT body — struct-shaped (fields + methods, bodies optional), NON-
+// instantiable, derived by a struct/class via the `&`-list. See ast.tks::TraitBody for the full
+// rationale (fold-before-typing; a bodyless method = a requirement; trait values are TR1).
+typedef struct { tk_field *fields; size_t n_fields; tk_function *methods; size_t n_methods; } tk_trait_body;
+typedef struct {                                                        // TypeBody = StructBody | EnumBody | FlagsBody | VariantBody | AliasBody | ExternBody | ClassBody | InterfaceBody | TraitBody
+    enum { TK_BODY_STRUCT, TK_BODY_ENUM, TK_BODY_FLAGS, TK_BODY_VARIANT, TK_BODY_ALIAS, TK_BODY_EXTERN, TK_BODY_CLASS, TK_BODY_INTERFACE, TK_BODY_TRAIT } tag;
+    union { tk_struct_body struct_body; tk_enum_body enum_body; tk_flags_body flags_body; tk_variant_body variant_body; tk_alias_body alias_body; tk_extern_body extern_body; tk_class_body class_body; tk_interface_body interface_body; tk_trait_body trait_body; } as;
 } tk_type_body;
 typedef struct {                                                        // TypeDecl (nominal — B.13)
     tk_str        name;

@@ -34,11 +34,11 @@ type MonoInst = struct { fn_name: str; mangled: str; s: Subst }
 // name — the concrete type must be that SAME named type. An atom naming no TypeDecl at all is
 // unsatisfiable (never silently ignored — M.1 fail-loud).
 fn constraint_atom_satisfied(atom_name: str, concrete: Type, table: TypeTable) -> bool {
-    match type_table_find(table, atom_name) {
+    match type_table_find(table, atom_name, "") {   // (#109 W1) constraint-atom probe on a resolved name — no referencing ns
         parser::TypeDecl as td => {
             match td.body {
                 parser::VariantBody as vb => {
-                    match resolve_type(vb.type_expr, table) {
+                    match resolve_type(vb.type_expr, table, "") {   // (#109 W1) variant-body expansion for constraint check — no referencing ns
                         Type as t => match t {
                             Variant as v => {
                                 mut i = 0
@@ -54,6 +54,12 @@ fn constraint_atom_satisfied(atom_name: str, concrete: Type, table: TypeTable) -
                         error => false
                     }
                 }
+                // (W10b.D2) an INTERFACE atom: the concrete type satisfies `<T: I>` when it
+                // NOMINALLY conforms (declared `implements`, through the class base chain + the
+                // contract's `extends` closure — the same gate as the D3 upcast). Classes AND
+                // structs conform here (a struct cannot become an interface VALUE, but it may
+                // instantiate a constrained generic).
+                parser::InterfaceBody => match concrete { Named as n => n.name == atom_name || type_conforms_to(n.name, atom_name, table); _ => false }
                 _ => match concrete { Named as n => n.name == atom_name; _ => false }   // exact nominal-name match
             }
         }
@@ -77,6 +83,18 @@ fn constraint_satisfied(c: parser::ConstraintExpr, concrete: Type, table: TypeTa
 }
 // Gate a whole instantiation: type_params/type_constraints are PARALLEL; `s` is the Subst that
 // bound each param to a concrete type for THIS instantiation.
+// (TR0→TR1) the first constraint ATOM naming a `trait`, if any — walked so `<T: Trait>` is an
+// HONEST TR1 stop (trait-as-constraint), never the silent exact-nominal-name fallback in
+// constraint_atom_satisfied. (VM match-arm ordering: multi-field cases first — see above.)
+fn constraint_first_trait_atom(c: parser::ConstraintExpr, table: TypeTable) -> str? {
+    match c {
+        parser::ConstraintAnd as a  => match constraint_first_trait_atom(a.left, table) { str as s => s; null => constraint_first_trait_atom(a.right, table) }
+        parser::ConstraintOr as o   => match constraint_first_trait_atom(o.left, table) { str as s => s; null => constraint_first_trait_atom(o.right, table) }
+        parser::ConstraintAtom as a => if is_trait_name(a.name, table) { a.name } else { null }
+        parser::NoConstraint  => null
+    }
+}
+
 fn check_constraints(type_params: []str, type_constraints: []parser::ConstraintExpr, s: Subst, table: TypeTable) -> error? {
     mut i = 0
     loop {
@@ -84,6 +102,11 @@ fn check_constraints(type_params: []str, type_constraints: []parser::ConstraintE
         match type_constraints[i] {
             parser::NoConstraint => {}
             _ => {
+                // (TR0→TR1) a trait as a constraint atom is TR1 — an honest stop.
+                match constraint_first_trait_atom(type_constraints[i], table) {
+                    str as tn => return error { message = teko::string::concat("'", tn, "' is a trait — a trait as a generic constraint (`<T: Trait>`) is not implemented yet (TR1)") }
+                    null => {}
+                }
                 let bound = match subst_find_inst(s, type_params[i]) {
                     Type as t => t
                     null      => return error { message = teko::string::concat("internal: monomorphization did not bind type parameter '", type_params[i], "'") }
@@ -117,7 +140,7 @@ fn mono_type_mangle(t: Type) -> str {
         Str           => "str"
         Byte          => "byte"
         Char          => "char"
-        Named as n    => n.name
+        Named as n    => name_last_segment(n.name)   // (#109 W3) BARE — the generic-FN instance symbol `fn__g__<arg>` stays a valid C identifier; stamp + call site both use this, so they agree
         Slice as sl   => { let e = mono_type_mangle(sl.element); teko::str::concat("slice_", e) }
         Optional as o => { let e = mono_type_mangle(o.inner); teko::str::concat("opt_", e) }
         Error         => "error"
@@ -333,12 +356,12 @@ fn mono_texpr(e: TExpr, s: Subst, items: []TItem, table: TypeTable) -> WExpr | e
             match find_generic_fn(items, bare) {
                 TFunction as gf => {
                     // INFER the Subst from the rewritten arg types against the generic's param patterns.
-                    let ptable = type_param_table(gf.type_params, "", table)
+                    let ptable = type_param_table(gf.type_params, gf.type_constraints, "", table)
                     mut sub = Subst { params = gf.type_params; names = teko::list::empty(); types = teko::list::empty() }
                     mut gi = 0
                     loop {
                         if gi >= args.len { break }   // args.len == gf.params.len (arity checked at typing); bound by the rewritten-arg list
-                        let pat = match resolve_type(gf.params[gi].type_ann, ptable) { Type as t => t; error as er => return er }
+                        let pat = match resolve_type(gf.params[gi].type_ann, ptable, gf.namespace) { Type as t => t; error as er => return er }   // (#109 W1) ref_ns = the generic fn's declaring namespace
                         sub = match unify(pat, args[gi].type, sub, table) { Subst as x => x; error as er => return er }
                         gi++
                     }
@@ -346,9 +369,9 @@ fn mono_texpr(e: TExpr, s: Subst, items: []TItem, table: TypeTable) -> WExpr | e
                     // rewrite the callee's LAST segment to the mangled name (keep the leading segments + call_ns).
                     let newcallee = rewrite_last_segment(cl.callee, mangled)
                     let rec = MonoInst { fn_name = bare; mangled = mangled; s = sub }
-                    WExpr { expr = TExpr { kind = TCall { callee = newcallee; args = args; call_ns = cl.call_ns; is_closure_call = cl.is_closure_call; callee_type = cl.callee_type }; type = nt; line = e.line; col = e.col }; insts = teko::list::push(acc, rec) }
+                    WExpr { expr = TExpr { kind = TCall { callee = newcallee; args = args; call_ns = cl.call_ns; is_closure_call = cl.is_closure_call; callee_type = cl.callee_type; is_iface_dispatch = cl.is_iface_dispatch; iface_slot = cl.iface_slot }; type = nt; line = e.line; col = e.col }; insts = teko::list::push(acc, rec) }
                 }
-                null => WExpr { expr = TExpr { kind = TCall { callee = cl.callee; args = args; call_ns = cl.call_ns; is_closure_call = cl.is_closure_call; callee_type = cl.callee_type }; type = nt; line = e.line; col = e.col }; insts = acc }
+                null => WExpr { expr = TExpr { kind = TCall { callee = cl.callee; args = args; call_ns = cl.call_ns; is_closure_call = cl.is_closure_call; callee_type = cl.callee_type; is_iface_dispatch = cl.is_iface_dispatch; iface_slot = cl.iface_slot }; type = nt; line = e.line; col = e.col }; insts = acc }
             }
         }
         TIfExpr as f => {
@@ -521,7 +544,14 @@ fn mono_tstmt(st: TStatement, s: Subst, items: []TItem, table: TypeTable) -> WSt
         }
         TAssign as a => {
             let wv = match mono_texpr(a.value, s, items, table) { WExpr as w => w; error as er => return er }
-            WStmt { stmt = TAssign { name = a.name; op = a.op; bound = subst_type(a.bound, s); value = wv.expr; deref = a.deref }; insts = wv.insts }
+            // (#88) rewrite the FIELD target's LHS field-access (its receiver + resolved field type may
+            // reference a type-param); merge its insts. A non-FIELD target keeps the sentinel unchanged.
+            let is_field = match a.kind { parser::AssignKind::Field => true; _ => false }
+            if is_field {
+                let wt = match mono_texpr(a.target, s, items, table) { WExpr as w => w; error as er => return er }
+                return WStmt { stmt = TAssign { kind = a.kind; name = a.name; op = a.op; bound = subst_type(a.bound, s); value = wv.expr; deref = a.deref; target = wt.expr }; insts = mono_inst_concat(wv.insts, wt.insts) }
+            }
+            WStmt { stmt = TAssign { kind = a.kind; name = a.name; op = a.op; bound = subst_type(a.bound, s); value = wv.expr; deref = a.deref; target = a.target }; insts = wv.insts }
         }
         TReturn as r => {
             if r.has_value {
@@ -550,13 +580,15 @@ fn mono_tstmt(st: TStatement, s: Subst, items: []TItem, table: TypeTable) -> WSt
 
 // rewrite a block (a []TStatement). (C: mono_block.)
 fn mono_block(stmts: []TStatement, s: Subst, items: []TItem, table: TypeTable) -> WBlock | error {
+    // (#148 R3 DECREE) `out` is a linear chain: born empty, self-append-only, read only after the
+    // loop — so every copy-grow frees the superseded buffer (mem::push_fo; paranoid-gated).
     mut out: []TStatement = teko::list::empty()
     mut acc: []MonoInst = teko::list::empty()
     mut i = 0
     loop {
         if i >= stmts.len { break }
         let ws = match mono_tstmt(stmts[i], s, items, table) { WStmt as w => w; error as er => return er }
-        out = teko::list::push(out, ws.stmt)
+        out = teko::mem::push_fo(out, ws.stmt)
         acc = mono_inst_concat(acc, ws.insts)
         i++
     }

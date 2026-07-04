@@ -13,6 +13,7 @@
 #include "../parser/ast.h"
 #include "../text/text.h"
 #include <string.h>
+#include <stdio.h>   // snprintf — (TR0→TR1) the trait-as-constraint honest stop
 #include <stdlib.h>
 
 // ── small allocation / string helpers ──────────────────────────────────────────────────
@@ -60,7 +61,7 @@ static tk_str mono_type_mangle(tk_type t) {
         case TK_TYPE_STR:      return mono_cstr("str");
         case TK_TYPE_BYTE:     return mono_cstr("byte");
         case TK_TYPE_CHAR:     return mono_cstr("char");
-        case TK_TYPE_NAMED:    return t.as.named.name;
+        case TK_TYPE_NAMED:    return tk_name_last_segment(t.as.named.name);   /* (#109 W3) BARE — valid C generic-fn instance symbol */
         case TK_TYPE_SLICE:    { tk_str e = mono_type_mangle(*t.as.slice.element);   return mono_concat(mono_cstr("slice_"), e); }
         case TK_TYPE_OPTIONAL: { tk_str e = mono_type_mangle(*t.as.optional.inner); return mono_concat(mono_cstr("opt_"),   e); }
         case TK_TYPE_ERROR:    return mono_cstr("error");
@@ -114,10 +115,10 @@ static tk_type *mono_subst_find(tk_subst s, tk_str name) {
 // must type_eq one of its declared MEMBER types; any other TypeDecl kind is an exact
 // nominal-name match. An atom naming no TypeDecl at all is unsatisfiable (M.1 fail-loud).
 static bool mono_constraint_atom_satisfied(tk_str atom_name, tk_type concrete, tk_type_table table) {
-    tk_decl_result td = tk_type_table_find(table, atom_name);
+    tk_decl_result td = tk_type_table_find(table, atom_name, (tk_str){0});   // (#109 W1) constraint-atom probe on a resolved name — no referencing ns
     if (!td.ok) return false;
     if (td.as.value.body.tag == TK_BODY_VARIANT) {
-        tk_type_result vt = tk_resolve_type(td.as.value.body.as.variant_body.type_expr, table);
+        tk_type_result vt = tk_resolve_type(td.as.value.body.as.variant_body.type_expr, table, (tk_str){0});   // (#109 W1) variant-body expansion for constraint check — no referencing ns
         if (!vt.ok) return false;
         if (vt.as.value.tag == TK_TYPE_VARIANT) {
             for (size_t i = 0; i < vt.as.value.as.variant.len; i += 1)
@@ -126,6 +127,14 @@ static bool mono_constraint_atom_satisfied(tk_str atom_name, tk_type concrete, t
         }
         return tk_type_eq(&concrete, &vt.as.value);   // a one-member variant widened to a bare type
     }
+    // (W10b.D2) an INTERFACE atom: the concrete type satisfies `<T: I>` when it NOMINALLY
+    // conforms (declared `implements`, through the class base chain + the contract's `extends`
+    // closure — the same gate as the D3 upcast). Classes AND structs conform here (a struct
+    // cannot become an interface VALUE, but it may instantiate a constrained generic).
+    if (td.as.value.body.tag == TK_BODY_INTERFACE)
+        return concrete.tag == TK_TYPE_NAMED
+            && (mono_name_eq(concrete.as.named.name, atom_name)   // the contract's own value type
+                || tk_type_conforms_to(concrete.as.named.name, atom_name, table));
     return concrete.tag == TK_TYPE_NAMED && mono_name_eq(concrete.as.named.name, atom_name);
 }
 static bool mono_constraint_satisfied(tk_constraint_expr c, tk_type concrete, tk_type_table table) {
@@ -139,16 +148,46 @@ static bool mono_constraint_satisfied(tk_constraint_expr c, tk_type concrete, tk
     }
     return false;
 }
+// (TR0→TR1) the first constraint ATOM naming a `trait`, if any — walked so `<T: Trait>` is an
+// HONEST TR1 stop, never the silent exact-nominal-name fallback. Mirror of
+// monomorph.tks::constraint_first_trait_atom. Returns true + sets *out when found.
+static bool constraint_first_trait_atom(tk_constraint_expr c, tk_type_table table, tk_str *out) {
+    switch (c.tag) {
+        case TK_CONSTRAINT_AND:
+            return constraint_first_trait_atom(*c.as.and_expr.left, table, out)
+                || constraint_first_trait_atom(*c.as.and_expr.right, table, out);
+        case TK_CONSTRAINT_OR:
+            return constraint_first_trait_atom(*c.as.or_expr.left, table, out)
+                || constraint_first_trait_atom(*c.as.or_expr.right, table, out);
+        case TK_CONSTRAINT_ATOM:
+            if (tk_is_trait_name(c.as.atom.name, table)) { *out = c.as.atom.name; return true; }
+            return false;
+        case TK_CONSTRAINT_NONE: return false;
+    }
+    return false;
+}
+
 // Gate a whole instantiation: type_params/type_constraints are PARALLEL; `s` bound each param
 // to a concrete type for THIS instantiation. NULL on success, else the diagnostic error.
 static bool mono_check_constraints(tk_str *type_params, tk_constraint_expr *type_constraints, size_t n,
                                     tk_subst s, tk_type_table table, tk_error *out_err) {
     for (size_t i = 0; i < n; i += 1) {
         if (type_constraints[i].tag == TK_CONSTRAINT_NONE) continue;
+        // (TR0→TR1) a trait as a constraint atom is TR1 — an honest stop (message mirrors the
+        // .tks twin's concat exactly).
+        tk_str trait_atom;
+        if (constraint_first_trait_atom(type_constraints[i], table, &trait_atom)) {
+            size_t mlen = trait_atom.len + 112; char *mbuf = tk_alloc(mlen); if (!mbuf) abort();
+            int mn = snprintf(mbuf, mlen, "'%.*s' is a trait — a trait as a generic constraint (`<T: Trait>`) is not implemented yet (TR1)",
+                              (int)trait_atom.len, (const char *)trait_atom.ptr);
+            if (mn < 0 || (size_t)mn >= mlen) abort();   // cert-err33-c: handle the return — `mlen` fits the literal + trait_atom.len, so truncation is an invariant break
+            *out_err = tk_error_make(mbuf);
+            return false;
+        }
         tk_type *bound = mono_subst_find(s, type_params[i]);
-        if (!bound) { *out_err = tk_error_named("internal: monomorphization did not bind type parameter", type_params[i]); return false; }
+        if (!bound) { *out_err = tk_error_woven1("internal: monomorphization did not bind type parameter '", type_params[i], "'"); return false; }
         if (!mono_constraint_satisfied(type_constraints[i], *bound, table)) {
-            *out_err = tk_error_named("type parameter does not satisfy its constraint at this instantiation", type_params[i]);
+            *out_err = tk_error_woven1("type parameter '", type_params[i], "' does not satisfy its constraint at this instantiation");
             return false;
         }
     }
@@ -302,10 +341,10 @@ static bool mono_texpr(tk_texpr e, tk_subst s, tk_tprogram prog, tk_type_table t
             tk_str bare = callee.len ? callee.segments[callee.len - 1].name : (tk_str){ .ptr = (const tk_byte *)"", .len = 0 };
             const tk_tfunction *gf = find_generic_fn(prog, bare);
             if (gf) {
-                tk_type_table ptable = tk_type_param_table(gf->type_params, gf->n_type_params, mono_cstr(""), table);
+                tk_type_table ptable = tk_type_param_table(gf->type_params, gf->n_type_params, gf->type_constraints, mono_cstr(""), table);
                 tk_subst sub = { .params = gf->type_params, .n_params = gf->n_type_params, .names = NULL, .types = NULL, .n_bind = 0 };
                 for (size_t i = 0; i < e.as.call.nargs; i += 1) {   // nargs == gf->nparams (arity checked at typing); bound by `args` so args[i] is in range
-                    tk_type_result pat = tk_resolve_type(gf->params[i].type_ann, ptable);
+                    tk_type_result pat = tk_resolve_type(gf->params[i].type_ann, ptable, gf->namespace);   // (#109 W1) ref_ns = the generic fn's declaring namespace
                     if (!pat.ok) { *err = pat.as.error; return false; }
                     tk_subst_result u = tk_unify(pat.as.value, args[i].type, sub, table);
                     if (!u.ok) { *err = u.as.error; return false; }
@@ -457,6 +496,14 @@ static bool mono_tstmt(tk_tstatement st, tk_subst s, tk_tprogram prog, tk_type_t
             tk_texpr v;
             if (!mono_texpr(st.as.assign.value, s, prog, table, &v, insts, err)) return false;
             r.as.assign.value = v; r.as.assign.bound = tk_subst_type(st.as.assign.bound, s);
+            // (#88) rewrite the FIELD target's LHS field-access (its receiver + resolved field type
+            // may reference a type-param). Box the stamped copy so the pointer stays owned.
+            if (st.as.assign.kind == TK_ASSIGN_FIELD && st.as.assign.target != NULL) {
+                tk_texpr lhs;
+                if (!mono_texpr(*st.as.assign.target, s, prog, table, &lhs, insts, err)) return false;
+                tk_texpr *lp = tk_alloc(sizeof *lp); if (!lp) abort(); *lp = lhs;
+                r.as.assign.target = lp;
+            }
             break;
         }
         case TK_TSTMT_RETURN: {
@@ -558,7 +605,7 @@ tk_tprogram_result tk_monomorphize(tk_tprogram prog, tk_type_table table) {
             return (tk_tprogram_result){ .ok = false, .as.error = tk_error_make("monomorphization exceeded the instantiation ceiling (5000) — likely unbounded polymorphic recursion") };
         mono_list_push(&stamped, inst);
         const tk_tfunction *gf = find_generic_fn(prog, inst.fn_name);
-        if (!gf) return (tk_tprogram_result){ .ok = false, .as.error = tk_error_named("internal: monomorph could not find generic fn", inst.fn_name) };
+        if (!gf) return (tk_tprogram_result){ .ok = false, .as.error = tk_error_woven1("internal: monomorph could not find generic fn ", inst.fn_name, "") };
         // (W11/S6) CONSTRAINT CHECK — gate this instantiation's concrete bindings before stamping.
         {
             tk_error cerr;

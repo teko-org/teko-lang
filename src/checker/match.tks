@@ -44,6 +44,95 @@ fn check_enum_pattern(p: parser::Pattern, subject: Type, eb: parser::EnumBody, e
     }
 }
 
+// (#110) Is `named` a DIRECT case of `subject_variant` (the ONE-level-expanded subject), OR the
+// WHOLE subject itself (`raw_subject` — the pre-expansion type, e.g. a `Type as t` arm binding a
+// NAMED variant wholesale, not picking one case)? A case that is itself a nested variant must be
+// double-matched (`Outer as v => match v { Inner as i => … }`), never skip-matched directly —
+// that would require descending into a union the native codegen never synthesizes a tag for.
+// Returns true when `subject_variant` is not a variant at all (nothing to guard — the ordinary
+// resolve/typecheck path already validates non-variant subjects). Mirror of match.c::is_direct_case_of.
+fn is_direct_case_of(named: Type, subject_variant: Type, raw_subject: Type) -> bool {
+    if type_eq(named, raw_subject) { return true }   // binds the WHOLE subject, not a case of it
+    match subject_variant {
+        Variant as v => {
+            mut i = 0
+            loop {
+                if i >= v.members.len { break }
+                if type_eq(named, v.members[i]) { return true }
+                i++
+            }
+            false
+        }
+        _ => true
+    }
+}
+// (#109 W2, R5) CONTEXTUAL pattern resolution — a match-arm pattern name resolves against the
+// SUBJECT variant's own members FIRST, regardless of namespace. In `match shape { Circle as c => … }`
+// the bare `Circle` binds the Shape variant's `Circle` member even when the match site sits in a
+// different namespace than Shape — a valid reference that R3 (strict own-ns bare) would otherwise
+// reject. Matches by the pattern's LAST path segment against each member's nominal name; returns the
+// member Type when found (the arm binds exactly that case), else null (fall to resolve_named/R0-R4).
+// A non-variant subject (subject_variant is not a Variant) yields null — nothing contextual to bind.
+// Mirror of match.c::variant_member_by_name.
+fn variant_member_by_name(subject_variant: Type, last: str) -> Type? {
+    match subject_variant {
+        Variant as v => {
+            mut i = 0
+            loop {
+                if i >= v.members.len { break }
+                match v.members[i] {
+                    Named as n => if name_last_segment(n.name) == last { return v.members[i] }   // (#109 W3) member name is canonical "ns::Name"; the pattern's last segment is bare
+                    _          => {}
+                }
+                i++
+            }
+            null
+        }
+        _ => null
+    }
+}
+// (#110) find the DIRECT member of `subject` whose own (one-level) expansion contains `named` —
+// i.e. the outer case the caller should match FIRST before re-matching `named` inside it. Used
+// only to build a concrete, pasteable hint (`FooBar as v => match v { Foo as x => … }` rather than
+// the whole `FooBar | error` union, which is not a nameable bind pattern). Mirror of
+// match.c::find_containing_case (returns null when no direct member's expansion contains `named`).
+fn find_containing_case(named: Type, subject: Type, table: TypeTable) -> Type? {
+    match subject {
+        Variant as v => {
+            mut i = 0
+            loop {
+                if i >= v.members.len { break }
+                let mem = v.members[i]
+                match expand_variant(mem, table) {
+                    Variant as mv => {
+                        mut j = 0
+                        loop {
+                            if j >= mv.members.len { break }
+                            if type_eq(named, mv.members[j]) { return mem }
+                            j++
+                        }
+                    }
+                    _ => {}
+                }
+                i++
+            }
+            null
+        }
+        _ => null
+    }
+}
+// (#110) the skip-level-match diagnostic: "'Foo' is not a direct case of 'FooBar | error' —
+// match the outer case first (FooBar as v => match v { Foo as f => … })". When a direct member's
+// own expansion contains the arm's case (the common shape — a nested named variant), the hint
+// names THAT member (a real, pasteable bind pattern); otherwise it falls back to the whole subject.
+// Mirror of match.c::skip_level_error.
+fn skip_level_error(arm_type: Type, subject: Type, table: TypeTable) -> error {
+    let arm_s = type_render(arm_type)
+    let subj_s = type_render(subject)
+    let hint_s = match find_containing_case(arm_type, subject, table) { Type as t => type_render(t); null => subj_s }
+    error { message = $"'{arm_s}' is not a direct case of '{subj_s}' — match the outer case first ({hint_s} as v => match v {{ {arm_s} as x => … }})" }
+}
+
 // validate a pattern against the subject; return the env extended with bindings.
 fn check_pattern(p: parser::Pattern, subject: Type, env: Env, table: TypeTable) -> Env | error {
     // OPTIONAL subject `T?` (REBOOT_PLAN §202): `null` matches the NONE case (binds nothing);
@@ -61,7 +150,7 @@ fn check_pattern(p: parser::Pattern, subject: Type, env: Env, table: TypeTable) 
     // bare `U8` is not mis-resolved as a type name (resolve_named → "unknown type: U8").
     match subject {
         Named as n => {
-            match type_table_find(table, n.name) {
+            match type_table_find(table, n.name, "") {   // (#109 W1) enum-subject probe on a resolved name — no referencing ns
                 parser::TypeDecl as td => {
                     match td.body {
                         parser::EnumBody as eb => return check_enum_pattern(p, subject, eb, env, table)
@@ -73,12 +162,32 @@ fn check_pattern(p: parser::Pattern, subject: Type, env: Env, table: TypeTable) 
         }
         _ => {}
     }
+    // (#110) the subject's variant view — a NAMED alias of a `variant` decl expands to its Variant
+    // members (mirrors `exhaustive`); an already-inline `T | error` subject is unchanged. Used ONLY
+    // to reject SKIP-LEVEL arms below (a case of a NESTED/inner variant named directly against this
+    // outer subject) — native codegen only synthesizes tags for the subject's own direct union
+    // members, never for a member's own inner cases.
+    let subject_variant = expand_variant(subject, table)
     match p {
         parser::NullPattern       => return error { message = "`null` pattern requires an optional subject (`T?`) — REBOOT_PLAN §202" }
         parser::WildcardPattern   => env
         parser::BindPattern as bp => {
             // `[]T as x` resolves the slice TYPE-expr; a path bind resolves the named/builtin case.
-            let ct = match bind_pattern_type(bp, table) { Type as t => t; error as e => return e }
+            // (#109 W2, R5) a PLAIN named bind (not `[]T`, not `Foo<i64>`) first resolves CONTEXTUALLY
+            // against the subject variant's members — a bare cross-namespace case name still binds.
+            let ct = if !bp.is_slice && bp.type_args.len == 0 {
+                match variant_member_by_name(subject_variant, bp.type_name.segments[bp.type_name.segments.len - 1].name) {
+                    Type as m => m
+                    null      => match bind_pattern_type(bp, table, env.cur_ns) { Type as t => t; error as e => return e }   // (#109) ref_ns = the match's enclosing namespace → R0-R4
+                }
+            } else {
+                match bind_pattern_type(bp, table, env.cur_ns) { Type as t => t; error as e => return e }
+            }
+            // (#110) reject a SKIP-LEVEL arm: `ct` names a type that is not a direct case of the
+            // subject's own union (it may be a case of an INNER variant nested inside one of the
+            // subject's members). `is_direct_case_of` is a no-op (true) when the subject is not a
+            // variant at all, so ordinary struct/prim subjects are unaffected.
+            if !is_direct_case_of(ct, subject_variant, subject) { return skip_level_error(ct, subject_variant, table) }
             if !bp.has_binding { return env }      // bare case / `as _` discard — binds nothing
             define(env, bp.binding, ct, false)     // `Type as name` → name : the case type (match-binding immutable — B.21)
         }
@@ -91,12 +200,19 @@ fn check_pattern(p: parser::Pattern, subject: Type, env: Env, table: TypeTable) 
         }
         parser::FieldPattern as fp => {
             // C7a: variant axis `Type { f; g }` — resolve to a struct, bind each field IMMUTABLE (B.21).
-            let nt = match resolve_named(fp.type_name, table) { Type as t => t; error as e => return e }
+            // (#109 W2, R5) resolve the case name CONTEXTUALLY against the subject variant's members
+            // first (a bare cross-namespace case still binds), else fall to resolve_named/R0-R4.
+            let nt = match variant_member_by_name(subject_variant, fp.type_name.segments[fp.type_name.segments.len - 1].name) {
+                Type as m => m
+                null      => match resolve_named(fp.type_name, table, env.cur_ns) { Type as t => t; error as e => return e }   // (#109) ref_ns = the match's enclosing namespace → R0-R4
+            }
             let name = match nt {
                 Named as n => n.name
                 _          => return error { message = "field pattern requires a struct type" }
             }
-            let decl = match type_table_find(table, name) {
+            // (#110) same skip-level guard as the BIND arm above — `Type { f; g }` also names a case.
+            if !is_direct_case_of(nt, subject_variant, subject) { return skip_level_error(nt, subject_variant, table) }
+            let decl = match type_table_find(table, name, "") {   // (#109 W1) follow-up lookup of a resolved name — no referencing ns
                 parser::TypeDecl as td => td
                 error          => return error { message = $"unknown type in field pattern: {name}" }
             }
@@ -109,7 +225,7 @@ fn check_pattern(p: parser::Pattern, subject: Type, env: Env, table: TypeTable) 
             mut i = 0
             loop {
                 if i >= fp.fields.len { break }
-                let ft = match field_type(sb_fields, fp.fields[i], table) { Type as t => t; error as e => return e }
+                let ft = match field_type(sb_fields, fp.fields[i], table, type_ns_of(table, name)) { Type as t => t; error as e => return e }
                 e2 = define(e2, fp.fields[i], ft, false)      // B.21 — match-binding immutable
                 i++
             }
@@ -169,9 +285,9 @@ fn has_wildcard(arms: []parser::Arm) -> bool {
 // (W9.4) the case-name a single bind names: the resolved INSTANCE name `Gen__g__i64` when it carries
 // explicit type-args, else the bare last path segment. Mirrors bind_pattern_type's instance resolution
 // so exhaustiveness over a `variant Gen<i64> | …` covers the `Gen<i64> as x` arm by the member's name.
-fn bind_case_name(bp: parser::BindPattern, table: TypeTable) -> str {
+fn bind_case_name(bp: parser::BindPattern, table: TypeTable, ref_ns: str) -> str {
     if bp.type_args.len > 0 {
-        let ct = match bind_pattern_type(bp, table) { Type as t => t; error => Void { } }
+        let ct = match bind_pattern_type(bp, table, ref_ns) { Type as t => t; error => Void { } }   // (#109 W2) generic-instance case name resolves in the match's namespace
         match ct {
             Named as n => return n.name
             _          => {}
@@ -180,11 +296,11 @@ fn bind_case_name(bp: parser::BindPattern, table: TypeTable) -> str {
     bp.type_name.segments[bp.type_name.segments.len - 1].name
 }
 
-fn arm_case_names(p: parser::Pattern, table: TypeTable) -> []str {
+fn arm_case_names(p: parser::Pattern, table: TypeTable, ref_ns: str) -> []str {
     match p {
         parser::BindPattern as bp  => {
             if bp.is_slice { teko::list::empty() }
-            else { teko::list::push(teko::list::empty(), bind_case_name(bp, table)) }
+            else { teko::list::push(teko::list::empty(), bind_case_name(bp, table, ref_ns)) }
         }
         parser::FieldPattern as fp => teko::list::push(teko::list::empty(), fp.type_name.segments[fp.type_name.segments.len - 1].name)
         parser::AltPattern as ap   => {
@@ -193,7 +309,7 @@ fn arm_case_names(p: parser::Pattern, table: TypeTable) -> []str {
             loop {
                 if i >= ap.options.len { break }
                 match ap.options[i] {
-                    parser::BindPattern as bp  => { if !bp.is_slice { names = teko::list::push(names, bind_case_name(bp, table)) } }
+                    parser::BindPattern as bp  => { if !bp.is_slice { names = teko::list::push(names, bind_case_name(bp, table, ref_ns)) } }
                     parser::FieldPattern as fp => { names = teko::list::push(names, fp.type_name.segments[fp.type_name.segments.len - 1].name) }
                     _                  => {}
                 }
@@ -208,37 +324,39 @@ fn arm_case_names(p: parser::Pattern, table: TypeTable) -> []str {
 // Resolve the type a BIND pattern denotes: `[]T as x` → the slice type, else the named/builtin path.
 // (W9.4) `Foo<i64> as x` carries explicit type-args → resolve the concrete instance `Foo__g__i64`
 // (validates arity / rejects non-generic-with-args), so exhaustiveness/binding use the stamped type.
-fn bind_pattern_type(bp: parser::BindPattern, table: TypeTable) -> Type | error {
+// (#109 W1) `ref_ns` = the namespace of the match arm (referencing ns for the pattern's type name);
+// threaded to resolve_type/resolve_named, unused until W2's R0-R5 rules.
+fn bind_pattern_type(bp: parser::BindPattern, table: TypeTable, ref_ns: str) -> Type | error {
     if bp.is_slice {
         match bp.slice_type {
-            parser::TypeExpr as st => resolve_type(st, table)
+            parser::TypeExpr as st => resolve_type(st, table, ref_ns)
             null                   => error { message = "internal: slice pattern missing its slice type" }
         }
     } else if bp.type_args.len > 0 {
-        resolve_type(parser::NamedType { path = bp.type_name; args = bp.type_args }, table)
+        resolve_type(parser::NamedType { path = bp.type_name; args = bp.type_args }, table, ref_ns)
     } else {
-        resolve_named(bp.type_name, table)
+        resolve_named(bp.type_name, table, ref_ns)
     }
 }
 
 // Does some UNGUARDED arm cover variant member `mem` by resolved-TYPE equality? Covers the
 // non-nominal members of a `T | error` style variant (prim/byte/str/slice/error) — the arm is a
 // bind whose resolved type equals the member. NAMED (nominal) members use some_arm_names instead.
-fn some_arm_covers_type(arms: []parser::Arm, mem: Type, table: TypeTable) -> bool {
+fn some_arm_covers_type(arms: []parser::Arm, mem: Type, table: TypeTable, ref_ns: str) -> bool {
     mut i = 0
     loop {
         if i >= arms.len { break }
         if !arms[i].has_when {
             match arms[i].pattern {
                 parser::BindPattern as bp => {
-                    match bind_pattern_type(bp, table) { Type as t => { if type_eq(t, mem) { return true } }; error => {} }
+                    match bind_pattern_type(bp, table, ref_ns) { Type as t => { if type_eq(t, mem) { return true } }; error => {} }   // (#109 W2) coverage check resolves the arm pattern in the match's namespace
                 }
                 parser::AltPattern as ap => {
                     mut j = 0
                     loop {
                         if j >= ap.options.len { break }
                         match ap.options[j] {
-                            parser::BindPattern as bp => { match bind_pattern_type(bp, table) { Type as t => { if type_eq(t, mem) { return true } }; error => {} } }
+                            parser::BindPattern as bp => { match bind_pattern_type(bp, table, ref_ns) { Type as t => { if type_eq(t, mem) { return true } }; error => {} } }   // (#109 W2) coverage check resolves the arm pattern in the match's namespace
                             _                 => {}
                         }
                         j++
@@ -253,12 +371,12 @@ fn some_arm_covers_type(arms: []parser::Arm, mem: Type, table: TypeTable) -> boo
 }
 
 // is `name` covered by some UNGUARDED arm (directly via Bind/Field, or via an Alt option)?
-fn some_arm_names(arms: []parser::Arm, name: str, table: TypeTable) -> bool {
+fn some_arm_names(arms: []parser::Arm, name: str, table: TypeTable, ref_ns: str) -> bool {
     mut i = 0
     loop {
         if i >= arms.len { break }
         if !arms[i].has_when {
-            let names = arm_case_names(arms[i].pattern, table)
+            let names = arm_case_names(arms[i].pattern, table, ref_ns)
             mut j = 0
             loop {
                 if j >= names.len { break }
@@ -273,13 +391,13 @@ fn some_arm_names(arms: []parser::Arm, name: str, table: TypeTable) -> bool {
 
 // every member of the variant must be covered by some unguarded arm: NAMED (nominal) members by
 // name; non-nominal members (prim/byte/str/slice/error — the `T | error` idiom) by resolved-type.
-fn variant_covered(arms: []parser::Arm, members: []Type, table: TypeTable) -> bool {
+fn variant_covered(arms: []parser::Arm, members: []Type, table: TypeTable, ref_ns: str) -> bool {
     mut i = 0
     loop {
         if i >= members.len { break }
         match members[i] {
-            Named as nm => { if !some_arm_names(arms, nm.name, table) { return false } }
-            _           => { if !some_arm_covers_type(arms, members[i], table) { return false } }
+            Named as nm => { if !some_arm_names(arms, name_last_segment(nm.name), table, ref_ns) { return false } }   // (#109 W3) canonical member name → bare, to match the arms' bare case names
+            _           => { if !some_arm_covers_type(arms, members[i], table, ref_ns) { return false } }
         }
         i++
     }
@@ -287,11 +405,11 @@ fn variant_covered(arms: []parser::Arm, members: []Type, table: TypeTable) -> bo
 }
 
 // (C7b) every member of the enum must be covered by some unguarded arm (by name).
-fn enum_covered(arms: []parser::Arm, eb: parser::EnumBody, table: TypeTable) -> bool {
+fn enum_covered(arms: []parser::Arm, eb: parser::EnumBody, table: TypeTable, ref_ns: str) -> bool {
     mut i = 0
     loop {
         if i >= eb.members.len { break }
-        if !some_arm_names(arms, eb.members[i], table) { return false }
+        if !some_arm_names(arms, eb.members[i], table, ref_ns) { return false }
         i++
     }
     true
@@ -313,7 +431,7 @@ fn some_arm_is_null(arms: []parser::Arm) -> bool {
 // is the PRESENT case of an optional `T?` covered? A bare bind/wildcard (un-`null`, unguarded)
 // covers the whole present value; otherwise fall back to ordinary exhaustiveness over the inner
 // (e.g. a variant inner). Mirrors the C twin's present_case_covered (REBOOT_PLAN §202).
-fn present_case_covered(arms: []parser::Arm, inner: Type, table: TypeTable) -> bool {
+fn present_case_covered(arms: []parser::Arm, inner: Type, table: TypeTable, ref_ns: str) -> bool {
     mut i = 0
     loop {
         if i >= arms.len { break }
@@ -326,21 +444,21 @@ fn present_case_covered(arms: []parser::Arm, inner: Type, table: TypeTable) -> b
         }
         i++
     }
-    exhaustive(arms, inner, table)
+    exhaustive(arms, inner, table, ref_ns)
 }
 
 // a `_` covers all; an optional `T?` is exhaustive iff `null` AND the present case are covered
 // (REBOOT_PLAN §202); otherwise a Variant subject must have every case named. A NAMED variant
 // subject is first expanded to its Variant cases (B.14/B.15) so `match s { Circle … }` over a
 // `Shape = Circle | …` covers exhaustively.
-fn exhaustive(arms: []parser::Arm, subject: Type, table: TypeTable) -> bool {
+fn exhaustive(arms: []parser::Arm, subject: Type, table: TypeTable, ref_ns: str) -> bool {
     if has_wildcard(arms) { return true }
     match subject {       // an ENUM subject — exhaustive iff EVERY member is named (C7b)
         Named as n => {
-            match type_table_find(table, n.name) {
+            match type_table_find(table, n.name, "") {   // (#109) resolved-name probe — namespace-blind (type_table_find ignores ref_ns)
                 parser::TypeDecl as td => {
                     match td.body {
-                        parser::EnumBody as eb => return enum_covered(arms, eb, table)
+                        parser::EnumBody as eb => return enum_covered(arms, eb, table, ref_ns)
                         _                      => {}
                     }
                 }
@@ -350,11 +468,11 @@ fn exhaustive(arms: []parser::Arm, subject: Type, table: TypeTable) -> bool {
         _ => {}
     }
     match subject {       // an optional `T?` — `null` + present coverage (REBOOT §202)
-        Optional as opt => return some_arm_is_null(arms) && present_case_covered(arms, opt.inner, table)
+        Optional as opt => return some_arm_is_null(arms) && present_case_covered(arms, opt.inner, table, ref_ns)
         _ => {}
     }
     match expand_variant(subject, table) {       // a NAMED variant → its Variant cases (B.14/B.15)
-        Variant as v => variant_covered(arms, v.members, table)
+        Variant as v => variant_covered(arms, v.members, table, ref_ns)
         _            => false
     }
 }

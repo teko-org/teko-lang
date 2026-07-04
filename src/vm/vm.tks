@@ -384,12 +384,6 @@ fn prim_signed(k: checker::PrimKind) -> bool {
 fn prim_float(k: checker::PrimKind) -> bool {
     match k { F16 | F32 | F64 => true; _ => false }
 }
-fn prim_int(k: checker::PrimKind) -> bool {
-    match k {
-        U8 | U16 | U32 | U64 | U128 | I8 | I16 | I32 | I64 | I128 => true
-        _ => false
-    }
-}
 pub fn prim_width(k: checker::PrimKind) -> u8 {
     match k {
         U8   | I8         => 8
@@ -410,6 +404,15 @@ pub fn cast_may_lose(src: checker::PrimKind, dst: checker::PrimKind) -> bool {
     true                                 // i->u: negatives never fit
 }
 
+// BuiltinRes — (issue #106) `try_builtin`'s SUCCESS carrier: unlike the value-producing
+// builtin helpers (try_list_builtin / try_err_builtin / …) it has no Value to hand back, but
+// it MUST still hand back the (possibly grown) env — a builtin's argument expression can
+// itself contain a `Ref<T>` value-position call (e.g. a closure that writes `r.value` nested
+// inside `teko::assert::is_true(...)`), which threads a NEW env out of eval_expr exactly like
+// any other value-position call (MEM Step 4). Mirrors PatMatch's { matched: bool; env: Venv }
+// shape used elsewhere in this file for the same "yes/no + updated env" pattern.
+type BuiltinRes = struct { ran: bool; env: Venv }
+
 // ---------------------------------------------------------------------------
 // BUILTIN call recognition — VERBATIM mirror of codegen's CALL lowering: print/println
 // and teko::assert::* are non-shadowable, recognized by the path's LAST segment when the
@@ -417,38 +420,101 @@ pub fn cast_may_lose(src: checker::PrimKind, dst: checker::PrimKind) -> bool {
 // (the runtime panics with "assertion failed: <name>" — M.1).
 //
 // These builtins are all `-> void`: they run for EFFECT and produce NO Value. So this
-// helper returns `bool | error` — `true` == "it was a builtin (and was run)", and the
-// statement context (a void call is a statement) expects no value back. A non-builtin
-// path returns an `error` so `eval_call` falls through to a user fn.
+// helper returns `BuiltinRes | error` — `ran = true` == "it was a builtin (and was run)",
+// carrying the env AFTER every argument evaluated (a nested Ref<T> write threads back — see
+// BuiltinRes), and the statement context (a void call is a statement) expects no value back.
+// A non-builtin path returns an `error` so `eval_call`/`call_value` fall through to a user fn.
+//
+// (issue #106) Every arg here is evaluated via `eval_expr(arg, cur)` + `cur = ae.env` in
+// SEQUENCE (never the bare `ev_val` shortcut, and never re-reading the ORIGINAL `env` for a
+// later arg) — the same thread-then-merge discipline bind_call_args/eval_lambda_call use for
+// user-fn arguments, so a Ref<T> write inside ANY builtin argument (assert/print/exit/panic
+// alike) survives into the caller, matching vm.c (whose g_cells store is a process-global
+// shared by pointer — see g_cells in vm.c — so no merge is needed there; this is the
+// value-functional twin of that effect, not a new behavior).
 // ---------------------------------------------------------------------------
-fn try_builtin(callee: parser::Path, args: []checker::TExpr, env: Venv) -> bool | error {
+fn try_builtin(callee: parser::Path, args: []checker::TExpr, env: Venv) -> BuiltinRes | error {
     let last = callee.segments[callee.segments.len - 1].name
     let addressable = callee.segments.len == 1 || callee.segments[0].name == "teko"
     if !addressable { return error { message = "not a builtin" } }
 
     if last == "print" || last == "println" || last == "write" {
-        let a = ev_val(args[0], env)
-        match a {
-            str as s => { if last == "println" { teko::io::println(s) } else { teko::io::print(s) }; return true }
+        let ae = eval_expr(args[0], env)
+        match ae.value {
+            str as s => { if last == "println" { teko::io::println(s) } else { teko::io::print(s) }; return BuiltinRes { ran= true; env= ae.env } }
             _        => return error { message = "vm: print/println/write on a non-str value not yet supported" }
         }
     }
     if last == "ewrite" || last == "eprint" || last == "eprintln" {
-        let a = ev_val(args[0], env)
-        match a {
-            str as s => { if last == "eprintln" { teko::io::eprintln(s) } else { teko::io::ewrite(s) }; return true }
+        let ae = eval_expr(args[0], env)
+        match ae.value {
+            str as s => { if last == "eprintln" { teko::io::eprintln(s) } else { teko::io::ewrite(s) }; return BuiltinRes { ran= true; env= ae.env } }
             _        => return error { message = "vm: ewrite/eprint/eprintln on a non-str value not yet supported" }
+        }
+    }
+    // (mem::free) teko::mem::free(x) — memory reclaim isn't observable in the VM (host-managed), but
+    // the native lowering SCRUBS the binding (slice → empty, class → null), so mirror the scrub to
+    // keep VM==native even if a (checker-permitting) later read occurs: a slice var → empty []Value;
+    // a class var → left as-is (correct use never reads after free; the checker/ASan is the gate).
+    if last == "free" && callee.segments.len >= 2 && callee.segments[callee.segments.len - 2].name == "mem" {
+        match args[0].kind {
+            checker::TVar as v => match args[0].type {
+                checker::Slice => { let empty: []Value = teko::list::empty(); return BuiltinRes { ran= true; env= define(env, v.name, empty) } }
+                _              => return BuiltinRes { ran= true; env= env }
+            }
+            _ => return BuiltinRes { ran= true; env= env }
+        }
+    }
+
+    // issue #72 — `exit(<int>)` / `panic(str)`: the injected GLOBAL diverging builtins
+    // (typer.tks:595 — no `never` type; the checker recognizes them unqualified or under the
+    // reserved `teko::` root, whichever namespace lookup finds nothing). This vm.tks source is
+    // itself compiled by the SAME compiler (self-hosted): calling the bare `exit`/`panic`
+    // globals right here lowers to the SAME runtime seam (tk_exit / tk_panic_str, teko_rt.c)
+    // that a user program's `exit`/`panic` call lowers to when native-compiled — so the
+    // self-hosted VM's exit/panic mechanism is, by construction, the same one the compiler
+    // itself uses (mirrors main.tks's own `teko::exit(...)` calls). Both diverge (never
+    // return), so the `return BuiltinRes{...}` below is dead but kept for the match arm's shape.
+    if last == "exit" {
+        // Native codegen passes the arg to `tk_exit(int32_t)` PLAINLY (codegen.c emits builtin
+        // calls with no emit_as coercion) — an out-of-i32-range `i64`/`u64`/... status code
+        // relies on C's IMPLICIT (unchecked, wraparound) narrowing at the call site, never a
+        // panic. A Teko checked `to i32` here would panic on exactly that case ("impossible
+        // conversion") where native silently truncates — a real VM≠native divergence a first
+        // draft of this very intrinsic introduced, caught by running the self-hosted VM.
+        // Mask the low 32 bits + sign-extend the SAME way norm_int's width==32 branch does
+        // (never panics), matching the C cast's actual 2's-complement truncation behavior.
+        let ae = eval_expr(args[0], env)
+        let raw = as_int(ae.value)
+        let m = raw & 0xFFFFFFFF
+        let code32 = if m >= 0x80000000 { (m - 0x100000000) to i32 } else { m to i32 }
+        exit(code32)
+        return BuiltinRes { ran= true; env= ae.env }
+    }
+    if last == "panic" {
+        // Mirror native codegen's frontier EXACTLY (codegen.c:1865 only wires the `str` arm;
+        // `panic(error)` does not compile natively today — a pre-existing, separate gap, not
+        // this issue's VM≠native divergence; see the #72 report). `str` runs for real here;
+        // an `error` arg falls through to the honest stop so neither engine runs it.
+        let ae = eval_expr(args[0], env)
+        match ae.value {
+            str as s => { panic(s); return BuiltinRes { ran= true; env= ae.env } }
+            _        => return error { message = "vm: panic(error) not yet supported (native codegen cannot compile it either — a separate, pre-existing gap; use panic(str))" }
         }
     }
 
     let assert_ns = callee.segments.len >= 2 && callee.segments[0].name == "teko" &&
                  callee.segments[callee.segments.len - 2].name == "assert"
     if assert_ns {
-        if last == "is_true"  { teko::assert::is_true(as_bool(ev_val(args[0], env)));  return true }
-        if last == "is_false" { teko::assert::is_false(as_bool(ev_val(args[0], env))); return true }
+        if last == "is_true"  { let ae = eval_expr(args[0], env); teko::assert::is_true(as_bool(ae.value));  return BuiltinRes { ran= true; env= ae.env } }
+        if last == "is_false" { let ae = eval_expr(args[0], env); teko::assert::is_false(as_bool(ae.value)); return BuiltinRes { ran= true; env= ae.env } }
         if last == "str_contains" {
-            teko::assert::str_contains(as_str(ev_val(args[0], env)), as_str(ev_val(args[1], env)))
-            return true
+            // (issue #106) thread env across BOTH args in sequence — arg[1] must see any
+            // cell-store growth arg[0]'s evaluation produced (mirrors bind_call_args' loop).
+            let ae0 = eval_expr(args[0], env)
+            let ae1 = eval_expr(args[1], ae0.env)
+            teko::assert::str_contains(as_str(ae0.value), as_str(ae1.value))
+            return BuiltinRes { ran= true; env= ae1.env }
         }
         // equals/is_ok/... need generics — DEFERRED (matches the seed). Honest stop (M.3).
         panic("vm: this teko::assert builtin not yet supported (needs generics)")
@@ -469,12 +535,16 @@ fn try_list_builtin(callee: parser::Path, args: []checker::TExpr, env: Venv) -> 
     let last = callee.segments[callee.segments.len - 1].name
     let list_ns = callee.segments.len >= 2 && callee.segments[0].name == "teko" &&
                callee.segments[callee.segments.len - 2].name == "list"
-    if !list_ns { return null }
+    // (#148 R3) teko::mem::push_fo — the VM appends exactly like teko::list::push (free-old is a
+    // NATIVE allocation strategy; semantics are identical for the linear chains the decree covers).
+    let mem_pushfo = callee.segments.len >= 2 && callee.segments[0].name == "teko" &&
+               callee.segments[callee.segments.len - 2].name == "mem" && last == "push_fo"
+    if !list_ns && !mem_pushfo { return null }
     if last == "empty" {
         let xs: []Value = teko::list::empty()
         return xs
     }
-    if last == "push" {
+    if last == "push" || mem_pushfo {
         let base = ev_val(args[0], env)
         let item = ev_val(args[1], env)
         match base {
@@ -608,6 +678,28 @@ fn try_str_builtin(callee: parser::Path, args: []checker::TExpr, env: Venv) -> V
                 return acc
             }
             _ => panic("vm: concat on a non-[]str value (internal: checker should reject)")
+        }
+    }
+    // (#148) teko::mem::peak_rss() — the VM reports the HOST process's peak (native lowering when
+    // this engine is compiled; one recursion step when interpreted).
+    if last == "peak_rss"    { return (teko::mem::peak_rss()) to i64 }
+    // (#148 R2) teko::mem::append_fo(dst, src) — append src's bytes onto the []byte builder.
+    // (Free-old is a NATIVE footprint concern; the VM just produces the identical value.)
+    if last == "append_fo" {
+        let afd = ev_val(args[0], env)
+        let afs = as_str(ev_val(args[1], env))
+        match afd {
+            []Value as afl => {
+                mut af_out = afl
+                mut af_i: u64 = 0
+                loop {
+                    if af_i >= afs.len { break }
+                    af_out = teko::list::push(af_out, afs[af_i])
+                    af_i++
+                }
+                return af_out
+            }
+            _ => panic("vm: append_fo on a non-list dst (internal: checker should reject)")
         }
     }
     if last == "slice"       { return teko::slice(as_str(ev_val(args[0], env)), as_int(ev_val(args[1], env)) to u64, as_int(ev_val(args[2], env)) to u64) }
@@ -966,7 +1058,7 @@ fn vm_struct_field_type(prog: checker::TProgram, sname: str, fname: str) -> pars
             parser::TypeDecl as d => {
                 match d.body {
                     parser::StructBody as sb => {
-                        if d.name == sname {
+                        if checker::name_last_segment(d.name) == checker::name_last_segment(sname) {   // (#109 W3) bare-vs-bare (d.name canonical; sname may be canonical or bare)
                             mut j = 0
                             loop {
                                 if j >= sb.fields.len { break }
@@ -1044,7 +1136,11 @@ fn eval_struct_init(si: checker::TStructInit, ty: checker::Type, env: Venv) -> E
         vals = teko::list::push(vals, coerce_to(fr.value, vm_field_coerce_type(cur.prog, tn, si.field_names[i])))
         i++
     }
-    let sv = StructVal { type_name = tn; field_names = names; field_vals = vals }
+    // (#109 W3) the VM is namespace-blind for runtime identity: store the BARE last segment as the
+    // struct value's type_name tag (Named.name is now canonical "ns::Name"), so every runtime
+    // dispatch/variant/pattern comparison stays bare-vs-bare. `tn` itself stays canonical below for
+    // find_class_body/vm_field_coerce_type (they resolve against the canonical type table).
+    let sv = StructVal { type_name = checker::name_last_segment(tn); field_names = names; field_vals = vals }
     // (W10b.CLASS residual — VM reference semantics) a class instance is a REFERENCE type
     // (increment 3, native side): construction allocates a cell (the SAME cell-store MEM-1b
     // already threads through eval_expr — see EvalRes) and yields a ClassRef, so passing/
@@ -1338,11 +1434,11 @@ fn val_type_matches(subj: Value, name: str) -> bool {
         byte => name == "byte"
         str  => name == "str"
         []Value => false                          // a slice member is matched by the is_slice branch
-        StructVal as sv => sv.type_name == name    // a named case / `error`
+        StructVal as sv => checker::name_last_segment(sv.type_name) == checker::name_last_segment(name)    // a named case / `error` (#109 W3: bare-vs-bare)
         OptVal => false
         RefVal => false                            // (MEM Step 2/3) a `Ref<T>` value is never pattern-matched (escape-gated, param-only)
         FuncVal => false                           // (W10a) a function value is never pattern-matched
-        ClassRef => false                          // (W10b.CLASS residual) a class instance is nominal, never a variant-case pattern subject
+        ClassRef => false                          // (C1) a class instance matches by NAME via the cell deref in pat_match (needs env.cells, not available here)
     }
 }
 
@@ -1412,10 +1508,17 @@ fn float_val(f: f64, width: u8) -> Value {
 // num_of_prim — a literal NUMBER node → a concrete Value at the node's prim (mirror of vm.c's
 // TK_TEXPR_NUMBER case): a float literal → float_val at the prim width; a bool prim → a bool Value;
 // an int literal → norm_int (width/sign-correct, incl 128). The checker guarantees the kind.
-fn num_of_prim(n: checker::TNumber, t: checker::Type) -> Value {
+fn num_of_prim(n: checker::TNumber, t: checker::Type, prog: checker::TProgram) -> Value {
     let k = match t {
         checker::Prim as p => p.kind
         checker::Byte      => checker::PrimKind::U8   // `byte` literal → u8
+        // (#50) a FLAGS-typed number literal — the checker's fabricated zero in the any/none
+        // lowering (type_flags_method) — computes at the flags carrier prim (unsigned).
+        checker::Named as nm => {
+            let cnt = flags_member_count(prog, nm.name)
+            if cnt == 0 { panic("vm: number literal with a non-primitive type not yet supported") }
+            flags_carrier_of(cnt)
+        }
         _                  => panic("vm: number literal with a non-primitive type not yet supported")
     }
     if n.is_float {
@@ -1487,11 +1590,12 @@ fn vm_match_as_enum_int(prog: checker::TProgram, name: str, ordinal: i128) -> bo
             parser::TypeDecl as td => {
                 match td.body {
                     parser::EnumBody as eb => {
-                        if td.name == name { return true }
+                        let key = checker::name_last_segment(name)   // (#109 W3) bare-vs-bare (td.name canonical; member names bare)
+                        if checker::name_last_segment(td.name) == key { return true }
                         mut j = 0
                         loop {
                             if j >= eb.members.len { break }
-                            if eb.members[j] == name && (j to i128) == ordinal { return true }
+                            if eb.members[j] == key && (j to i128) == ordinal { return true }
                             j++
                         }
                     }
@@ -1505,13 +1609,64 @@ fn vm_match_as_enum_int(prog: checker::TProgram, name: str, ordinal: i128) -> bo
     false
 }
 
-fn vm_case_in_variant(prog: checker::TProgram, vname: str, cname: str) -> bool {
+// (W10b.D3 codec fix) are `a` and `b` BOTH members of one declared variant? If so, a struct value
+// tagged `a` is ALREADY a fully-discriminated case wherever `b` could appear — so descending into
+// its fields to reinterpret it as the sibling case `b` is the conflation bug the tag-24 roundtrip
+// caught (`Func { ret = Prim }` matched a `Prim` arm through `ret`, since Func and Prim are both
+// `Type` members). Combined with the field-count guard at the descent site: descent is SKIPPED
+// only for a MULTI-FIELD sibling — a SINGLE-FIELD sibling wrapper (`Optional { inner = Prim }`)
+// still descends (doctrine — teko-vm-wrapper-descent-bug), and a NON-sibling multi-field node
+// (`Expr { kind = Compare; line; col }` → Compare) still descends (the corpus AST-into-kind idiom).
+// Mirror of vm.c::variant_siblings.
+fn vm_variant_siblings(prog: checker::TProgram, a: str, b: str) -> bool {
+    let ka = checker::name_last_segment(a)   // (#109 W3) bare-vs-bare (a/b may be canonical Named.name; union member names are bare)
+    let kb = checker::name_last_segment(b)
     mut i = 0
     loop {
         if i >= prog.items.len { break }
         match prog.items[i] {
             parser::TypeDecl as td => {
-                if td.name == vname {
+                match td.body {
+                    parser::VariantBody as vb => match vb.type_expr {
+                        parser::UnionType as u => {
+                            mut has_a = false
+                            mut has_b = false
+                            mut j = 0
+                            loop {
+                                if j >= u.members.len { break }
+                                match u.members[j] {
+                                    parser::NamedType as nt => {
+                                        let nm = checker::name_last_segment(nt.path.segments[nt.path.segments.len - 1].name)
+                                        if nm == ka { has_a = true }
+                                        if nm == kb { has_b = true }
+                                    }
+                                    _ => {}
+                                }
+                                j = j + 1
+                            }
+                            if has_a && has_b { return true }
+                        }
+                        _ => {}
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+        i++
+    }
+    false
+}
+
+fn vm_case_in_variant(prog: checker::TProgram, vname: str, cname: str) -> bool {
+    let kv = checker::name_last_segment(vname)   // (#109 W3) bare-vs-bare (vname/cname may be canonical; td.name canonical; member names bare)
+    let kc = checker::name_last_segment(cname)
+    mut i = 0
+    loop {
+        if i >= prog.items.len { break }
+        match prog.items[i] {
+            parser::TypeDecl as td => {
+                if checker::name_last_segment(td.name) == kv {
                     match td.body {
                         parser::VariantBody as vb => match vb.type_expr {
                             parser::UnionType as u => {
@@ -1519,7 +1674,7 @@ fn vm_case_in_variant(prog: checker::TProgram, vname: str, cname: str) -> bool {
                                 loop {
                                     if j >= u.members.len { break }
                                     match u.members[j] {
-                                        parser::NamedType as nt => { if nt.path.segments[nt.path.segments.len - 1].name == cname { return true } }
+                                        parser::NamedType as nt => { if checker::name_last_segment(nt.path.segments[nt.path.segments.len - 1].name) == kc { return true } }
                                         _ => {}
                                     }
                                     j = j + 1
@@ -1612,6 +1767,16 @@ fn pat_match(pat: parser::Pattern, subj: Value, env: Venv) -> PatMatch {
                 if !hit {
                     match subj {
                         StructVal as sv => { if vm_case_in_variant(env.prog, bname, sv.type_name) { hit = true } }
+                        // (C1 fallible factories) a CLASS instance in a union (`C | error`) is matched
+                        // by its class NAME: deref the ClassRef cell to its struct payload and compare
+                        // its type_name. On a hit the ORIGINAL ClassRef is bound (reference semantics —
+                        // the arm's binding keeps aliasing the shared object, mirroring the native pointer).
+                        ClassRef as cr => {
+                            match cell_get(env.cells, cr.cell) {
+                                StructVal as payload => { if checker::name_last_segment(payload.type_name) == checker::name_last_segment(bname) { hit = true } }   // (#109 W3) bare-vs-bare
+                                _ => {}
+                            }
+                        }
                         _ => { if val_is_int(subj) { if vm_match_as_enum_int(env.prog, bname, as_int(subj)) { hit = true } } }
                     }
                 }
@@ -1621,15 +1786,22 @@ fn pat_match(pat: parser::Pattern, subj: Value, env: Venv) -> PatMatch {
                     }
                     return PatMatch { matched = true; env = env }
                 }
-                // Transparent field descent: when the subject is a struct with no direct match,
-                // check each STRUCT field for a value that matches the pattern name (e.g. `Number as nn`
-                // on `Expr { kind = Number{…}; line; col }`). Bind to the first matching field.
-                // Only struct fields are eligible — int fields are excluded because vm_match_as_enum_int
-                // could match enum member names that coincidentally share the same ordinal value as an
-                // unrelated enum (e.g. TyShape::Variant=2 vs PrimKind::U32=2 causing false descent).
+                // Transparent field descent: when the subject is a struct whose fields hold a
+                // value matching the pattern name (e.g. `Compare as c` on `Expr { kind = Compare;
+                // line; col }`), check each STRUCT field and bind the first match. SKIPPED only for
+                // a MULTI-FIELD SIBLING of the target — a subject that is itself a discriminated
+                // case of the SAME union the target belongs to must not be re-read as the sibling
+                // case through an inner field (`Func { params; ret; … }` → a `Prim` arm via `ret`,
+                // both `Type` members — the tag-24 codec bug). A SINGLE-FIELD sibling wrapper
+                // (`Optional { inner = Prim }`) still descends (doctrine); a NON-sibling multi-field
+                // node still descends (the AST-node-into-kind corpus idiom). Only struct fields are
+                // eligible — int fields are excluded because vm_match_as_enum_int could match enum
+                // member names that coincidentally share an ordinal (TyShape::Variant=2 vs U32=2).
                 // Mirrors vm.c TK_PAT_BIND transparent-field-descent block.
                 match subj {
                     StructVal as sv => {
+                        let is_multi_sibling = sv.field_vals.len > 1 && vm_variant_siblings(env.prog, sv.type_name, bname)
+                        if !is_multi_sibling {
                         mut fi = 0
                         loop {
                             if fi >= sv.field_vals.len { break }
@@ -1649,6 +1821,7 @@ fn pat_match(pat: parser::Pattern, subj: Value, env: Venv) -> PatMatch {
                             }
                             fi++
                         }
+                        }
                     }
                     _ => {}
                 }
@@ -1658,7 +1831,7 @@ fn pat_match(pat: parser::Pattern, subj: Value, env: Venv) -> PatMatch {
         parser::FieldPattern as fp => {
             match subj {
                 StructVal as sv => {
-                    if sv.type_name != path_last(fp.type_name) { return PatMatch { matched = false; env = env } }
+                    if checker::name_last_segment(sv.type_name) != checker::name_last_segment(path_last(fp.type_name)) { return PatMatch { matched = false; env = env } }   // (#109 W3) bare-vs-bare
                     mut e2 = env
                     mut i = 0
                     loop {
@@ -1693,7 +1866,7 @@ fn pat_match(pat: parser::Pattern, subj: Value, env: Venv) -> PatMatch {
 // bindings ride its grown env (`pm.env`); a non-matching / guard-failing arm is discarded by NOT
 // threading that env forward (the functional stand-in for the C `env_pop_to`). Mirrors the C
 // `eval_match`.
-fn eval_match(m: checker::TMatchExpr, line: u32, col: u32, env: Venv) -> EvalRes {
+fn eval_match(m: checker::TMatchExpr, t: checker::Type, line: u32, col: u32, env: Venv) -> EvalRes {
     let se = eval_expr(m.subject, env)   // (MEM Step 4) thread the subject's env (a ref call there grows cells)
     let subj = se.value
     let senv = se.env
@@ -1710,8 +1883,12 @@ fn eval_match(m: checker::TMatchExpr, line: u32, col: u32, env: Venv) -> EvalRes
                 teko::cov_branch(line, col, i to u64)   // D3-branch: value-position arm `i` taken
                 let bo = exec_block(arm.body, ge.env)
                 match bo.flow {
-                    // thread the arm body's final env out: an outer-`mut`/cell write inside the arm survives
-                    Normal as nm => return EvalRes { value= nm.value ?? panic("vm: a `match` used as a value produced no value (internal: checker requires a value arm)"); env= with_cells(senv, bo.env.cells) }
+                    // thread the arm body's final env out: an outer-`mut`/cell write inside the arm survives.
+                    // (NP-OOP, issue #116) COERCE the arm's raw value to the match node's type — the VM
+                    // twin of codegen's emit_arm_value → emit_as wrap, so a `T` arm flowing into a
+                    // `T?`-typed match present-wraps (the checker-desugared `?.` relies on it; exact-typed
+                    // arms are a no-op).
+                    Normal as nm => return EvalRes { value= coerce_to(nm.value ?? panic("vm: a `match` used as a value produced no value (internal: checker requires a value arm)"), t); env= with_cells(senv, bo.env.cells) }
                     _            => panic("vm: control flow inside a `match` used as a sub-expression not yet supported")
                 }
             }
@@ -1787,7 +1964,7 @@ fn eval_expr(e: checker::TExpr, env: Venv) -> EvalRes {
     }
     match e.kind {
         // Leaf reads — pure, env unchanged. (MEM Step 4: every non-call leaf threads `env` back as-is.)
-        checker::TNumber as n   => EvalRes { value= num_of_prim(n, e.type); env= env }   // a concrete u8…i128 / f16…f64 from the node's type (float iff n.is_float)
+        checker::TNumber as n   => EvalRes { value= num_of_prim(n, e.type, env.prog); env= env }   // a concrete u8…i128 / f16…f64 from the node's type (float iff n.is_float)
         // (W10a) a bare top-level-fn reference used as a VALUE → a FuncVal (no captured env). A plain
         // local/param reads its bound value (cell-backed reads thread through the cell).
         checker::TVar as v      => if v.is_func { EvalRes { value= FuncVal { is_lambda= false; ns= v.func_ns; name= v.name; params= teko::list::empty(); body= teko::list::empty(); cap_names= teko::list::empty(); cap_vals= teko::list::empty() }; env= env } } else { EvalRes { value= read_var(env, v.name); env= env } }
@@ -1829,15 +2006,17 @@ fn eval_expr(e: checker::TExpr, env: Venv) -> EvalRes {
             }
         }
         // W5b — `match` as a VALUE: pattern matching (literal/range/Alt/variant-case/destructure + `when`).
-        checker::TMatchExpr as m => eval_match(m, e.line, e.col, env)
+        checker::TMatchExpr as m => eval_match(m, e.type, e.line, e.col, env)
         // W5-idx — subscript `recv[index]` (str→byte; slice→element, bounds-checked — SLICE layer).
         checker::TIndex as ix => eval_index(ix, e.line, e.col, env)
         // $"…{expr}…" — string interpolation: pieces ++ str(holes) (self-host parity).
         checker::TInterp as in => eval_interp(in, env)
         // Phase 2 — `<lhs> in [ … ]`: true iff lhs (single-eval) value_eq's any element.
         checker::TInExpr as ie => eval_in(ie, env)
-        // Enum::Member as a VALUE → its ordinal (u64); the C twin's C enum auto-numbers identically.
-        checker::TPathExpr as pe => EvalRes { value= pe.ordinal; env= env }
+        // (#50) Type::Member as a VALUE → the checker-RESOLVED member value (enum: the ordinal,
+        // u64 — the C twin's C enum auto-numbers identically; flags: 1 << ordinal at the carrier
+        // width) — see path_value. Mirrors vm.c's TK_TEXPR_PATH case.
+        checker::TPathExpr as pe => EvalRes { value= path_value(pe, e.type, env.prog); env= env }
         // null / ?. / ?? — the OPTIONAL value model (OptVal — REBOOT_PLAN §202/§203).
         // null is NONE; the destination's wrap (coerce_to) makes it a concrete `T?`.
         checker::TNullLit            => EvalRes { value= OptVal { present = false; inner = null }; env= env }
@@ -1959,16 +2138,76 @@ fn coerce_to(v: Value, t: checker::Type) -> Value {
     }
 }
 
+// (#50) flags member count — the number of members of the `flags` decl named `name`, or 0 when
+// `name` is not a flags decl. The count picks the flags CARRIER prim (see flags_carrier_of).
+// Mirrors vm.c's flags_carrier_prim (there: bool + out-prim; here: count, 0 = not flags — the
+// .tks checker has no type-name pattern for an optional enum, so the count IS the discriminant).
+fn flags_member_count(prog: checker::TProgram, name: str) -> u64 {
+    mut i = 0
+    loop {
+        if i >= prog.items.len { break }
+        match prog.items[i] {
+            parser::TypeDecl as td => {
+                if checker::name_last_segment(td.name) == checker::name_last_segment(name) {   // (#109 W3) bare-vs-bare (td.name canonical; name may be canonical or bare)
+                    match td.body {
+                        parser::FlagsBody as fb => return fb.members.len
+                        _ => return 0
+                    }
+                }
+            }
+            _ => {}
+        }
+        i++
+    }
+    0
+}
+
+// (#50) flags carrier prim by MEMBER COUNT — the unsigned width native codegen chose (1–8 → u8,
+// 9–16 → u16, 17–32 → u32, 33–64 → u64, 65–128 → u128; codegen's FlagsBody uint_type).
+fn flags_carrier_of(n: u64) -> checker::PrimKind {
+    if n <= 8  { return checker::PrimKind::U8 }
+    if n <= 16 { return checker::PrimKind::U16 }
+    if n <= 32 { return checker::PrimKind::U32 }
+    if n <= 64 { return checker::PrimKind::U64 }
+    checker::PrimKind::U128
+}
+
+// (#50) Type::Member → the checker-RESOLVED member value (enum: the ordinal as a u64 — the C
+// twin's C enum auto-numbers identically; flags: 1 << ordinal at the carrier width — native's
+// pre-emitted power-of-2 constants). No recompute — read the stored value. Mirrors vm.c's
+// TK_TEXPR_PATH case. The checked casts always fit: the checker caps a flags value below the
+// carrier's width and an enum ordinal below the member count.
+fn path_value(pe: checker::TPathExpr, t: checker::Type, prog: checker::TProgram) -> Value {
+    match t {
+        checker::Named as nm => {
+            let n = flags_member_count(prog, nm.name)
+            if n == 0 { return pe.value to u64 }   // enum: the ordinal (u64)
+            let w = prim_width(flags_carrier_of(n))
+            if w == 8       { pe.value to u8 }
+            else if w == 16 { pe.value to u16 }
+            else if w == 32 { pe.value to u32 }
+            else if w == 64 { pe.value to u64 }
+            else            { pe.value }           // 128: the value IS the u128 Value
+        }
+        _ => pe.value to u64
+    }
+}
+
 // num_prim_of — the EFFECTIVE numeric prim of a type endpoint: a Prim is itself; a `byte` is U8
-// (B.36 — byte is a u8 newtype, the same effective kind the checker's cast_kind uses). Any other
-// type (str/named/…) is the honest non-numeric frontier — a loud internal stop (M.3). Mirrors
-// vm.c's `cast_prim_of` (which returns false there; here a non-numeric reaching arithmetic/cast
-// is an invariant break the checker should have rejected, so we panic).
-fn num_prim_of(t: checker::Type) -> checker::PrimKind {
+// (B.36 — byte is a u8 newtype, the same effective kind the checker's cast_kind uses). (#50) A
+// NAMED type is its flags CARRIER prim when its decl is a `flags`, else the enum-ordinal U64
+// (E7) — the same rule as vm.c's expr_num_prim/expr_int_prim/cast_prim_of. Any other type
+// (str/…) is the honest non-numeric frontier — a loud internal stop (M.3): a non-numeric
+// reaching arithmetic/cast is an invariant break the checker should have rejected.
+fn num_prim_of(t: checker::Type, prog: checker::TProgram) -> checker::PrimKind {
     match t {
         checker::Prim as p => p.kind
         checker::Byte      => checker::PrimKind::U8
-        checker::Named     => checker::PrimKind::U64  // E7: enum ordinal — checker validated; stored as u64
+        checker::Named as nm => {
+            let n = flags_member_count(prog, nm.name)
+            if n > 0 { flags_carrier_of(n) }          // (#50) flags → its carrier prim
+            else     { checker::PrimKind::U64 }       // E7: enum ordinal — checker validated; stored as u64
+        }
         _                  => panic("vm: arithmetic/cast on a non-numeric type not yet supported")
     }
 }
@@ -1979,8 +2218,11 @@ fn num_prim_of(t: checker::Type) -> checker::PrimKind {
 // truncates via norm_int, so the carrier's extension is irrelevant for +,-,*,&,|,^,<< (only the
 // low `width` bits survive). For `>>`, `as_int` already sign/zero-extended the operand to i128, so
 // an arithmetic shift on that carrier reproduces both the signed (arithmetic) and unsigned
-// (logical) C shift. Shift counts are masked `& 127` exactly like the C twin.
+// (logical) C shift. #49 — shift counts are masked by `w - 1` (the LEFT operand's own bit-width
+// minus 1, C#/Java semantics), NOT a fixed 127: `w` is the caller's already-resolved left-operand
+// width (mirrors codegen's tk_shl_*/tk_shr_* runtime helpers exactly, same fix as the C twin).
 fn apply_int_op(op: lexer::TokenKind, l: i128, r: i128, sgn: bool, w: u8) -> i128 {
+    let mask = (w to i128) - 1
     match op {
         Plus  => l + r
         Minus => l - r
@@ -1988,8 +2230,8 @@ fn apply_int_op(op: lexer::TokenKind, l: i128, r: i128, sgn: bool, w: u8) -> i12
         Amp   => l & r
         Pipe  => l | r
         Caret => l ^ r
-        Shl   => l << (r & 127)
-        Shr   => l >> (r & 127)
+        Shl   => l << (r & mask)
+        Shr   => l >> (r & mask)
         _     => panic("vm: binary operator not yet supported")
     }
 }
@@ -2005,7 +2247,7 @@ fn eval_unary(u: checker::TUnary, t: checker::Type, env: Venv) -> EvalRes {
     let v = match u.op {
         Bang  => !as_bool(x)
         Minus => {
-            let prim = num_prim_of(t)
+            let prim = num_prim_of(t, env.prog)
             if prim_float(prim) {
                 float_val(-as_float(x), prim_width(prim))
             } else {
@@ -2013,7 +2255,7 @@ fn eval_unary(u: checker::TUnary, t: checker::Type, env: Venv) -> EvalRes {
             }
         }
         Tilde => {
-            let prim = num_prim_of(t)
+            let prim = num_prim_of(t, env.prog)
             norm_int(~as_int(x), prim_signed(prim), prim_width(prim))
         }
         _ => panic("vm: unary operator not yet supported")
@@ -2158,6 +2400,70 @@ fn find_function(env: Venv, callee: parser::Path) -> FnHit {
     find_function_ns(env, callee, "")
 }
 
+// (#88) rebuild a StructVal with one field replaced by `val` (declared field order preserved). The
+// checker guarantees `field` exists. Mirrors the C twin's in-place `fields.vals[i] = …`.
+fn struct_set_field(sv: StructVal, field: str, val: Value) -> StructVal {
+    mut names: []str = teko::list::empty()
+    mut vals: []Value = teko::list::empty()
+    mut i = 0
+    loop {
+        if i >= sv.field_names.len { break }
+        names = teko::list::push(names, sv.field_names[i])
+        if sv.field_names[i] == field { vals = teko::list::push(vals, val) }
+        else                          { vals = teko::list::push(vals, sv.field_vals[i]) }
+        i++
+    }
+    StructVal { type_name = sv.type_name; field_names = names; field_vals = vals }
+}
+
+// (#88) the current VALUE at a field-assign lvalue receiver. A class handle stays a ClassRef (the
+// caller derefs the shared cell); a struct value / var reads straight through. Threads env (evaluating
+// the receiver may grow cells via a value-position ref call). Mirrors the C twin's vm_lvalue_ptr load.
+fn lvalue_load(e: checker::TExpr, env: Venv) -> EvalRes {
+    eval_expr(e, env)
+}
+
+// (#88) store `newval` at a field-assign lvalue `e`, returning the updated env. Two storage kinds:
+//   * the receiver is (or derefs to) a CLASS instance → its StructVal payload lives in the SHARED cell
+//     store; cell_set the rebuilt payload so EVERY alias observes the write (the aliasing proof).
+//   * the receiver is a value-semantic STRUCT rooted at a `mut` var → rebuild the StructVal and store it
+//     back UP the chain (recursively for nested `a.b.c`), or into the root slot (mutate_slot, Assign).
+// Mirrors the C twin's vm_lvalue_ptr write (which mutates a pointer into cell/slot storage in place).
+fn lvalue_store(e: checker::TExpr, newval: Value, env: Venv) -> Venv {
+    match e.kind {
+        checker::TVar as v => mutate_slot(env, v.name, lexer::TokenKind::Assign, newval)
+        checker::TFieldAccess as fa => {
+            let re = eval_expr(fa.receiver, env)
+            let renv = re.env
+            match re.value {
+                // A CLASS instance: mutate the SHARED cell payload in place (aliases observe it).
+                ClassRef as cr => {
+                    match cell_get(renv.cells, cr.cell) {
+                        StructVal as s => with_cells(renv, cell_set(renv.cells, cr.cell, struct_set_field(s, fa.field, newval)))
+                        _ => panic("vm: a ClassRef cell must hold a StructVal (internal invariant)")
+                    }
+                }
+                // A value-semantic STRUCT: rebuild it with the field replaced, then store the WHOLE
+                // struct back at the parent lvalue (recursion bottoms out at the root `mut` slot).
+                StructVal as s => lvalue_store(fa.receiver, struct_set_field(s, fa.field, newval), renv)
+                _ => panic("vm: field assignment on a non-struct/class receiver (internal: checker should reject)")
+            }
+        }
+        _ => panic("vm: field assignment to an unresolvable lvalue (internal: checker should reject)")
+    }
+}
+
+// (#88) `recv.field op= rhs` — resolve the field's CURRENT value, apply the op, store it back. A class
+// field write mutates SHARED cell storage (aliasing); a struct field write rebuilds up its `mut` root.
+// coerce_to present-wraps into the field's declared type (`bound`), exactly like a binding. Mirrors the
+// C twin's TK_ASSIGN_FIELD arm (load *dst, compound_apply, coerce_to, store).
+fn field_assign(target: checker::TExpr, op: lexer::TokenKind, rhs: Value, bound: checker::Type, env: Venv) -> Venv {
+    let lr = lvalue_load(target, env)
+    let cur = lr.value
+    let newval = coerce_to(compound_apply(cur, op, rhs), bound)
+    lvalue_store(target, newval, lr.env)
+}
+
 // mutate_slot — a compound/plain assignment to the NEWEST slot named `name`, the .tks twin of
 // vm.c's TK_TSTMT_ASSIGN compound-assign body. The C twin mutates the slot in place; the .tks env
 // is IMMUTABLE, so this rebuilds `env.slots` with that one slot replaced and returns the grown
@@ -2258,7 +2564,7 @@ fn eval_binary(b: checker::TBinary, ty: checker::Type, line: u32, col: u32, env:
         let re = eval_expr(b.right, le.env)
         return EvalRes { value= as_bool(re.value); env= re.env }
     }
-    let prim = num_prim_of(ty)                 // honest stop if non-numeric (mirrors codegen)
+    let prim = num_prim_of(ty, env.prog)       // honest stop if non-numeric (mirrors codegen)
     if prim_float(prim) {
         let w  = prim_width(prim)
         let le = eval_expr(b.left, env); let re = eval_expr(b.right, le.env)   // thread left→right
@@ -2350,13 +2656,13 @@ fn eval_cast(c: checker::TCast, ty: checker::Type, line: u32, col: u32, env: Ven
     // target, so the decoded codepoint always fits.
     match c.expr.type {
         checker::Char => {
-            let dtgt = num_prim_of(ty)
+            let dtgt = num_prim_of(ty, env.prog)
             let cp = vm_char_to_u32(xe.value)
             return EvalRes { value= norm_int(cp to i128, prim_signed(dtgt), prim_width(dtgt)); env= cur }
         }
         _ => {}
     }
-    let dst = num_prim_of(ty); let src = num_prim_of(c.expr.type)
+    let dst = num_prim_of(ty, env.prog); let src = num_prim_of(c.expr.type, env.prog)
     let sflt = prim_float(src); let dflt = prim_float(dst)
     if sflt && dflt {
         return EvalRes { value= float_val(as_float(xe.value), prim_width(dst)); env= cur }
@@ -2393,15 +2699,6 @@ fn param_is_ref(f: checker::TFunction, i: u64) -> bool {
         parser::NamedType as nt => nt.path.segments[nt.path.segments.len - 1].name == "Ref"
         _                       => false
     }
-}
-fn fn_has_ref_param(f: checker::TFunction) -> bool {
-    mut i: u64 = 0
-    loop {
-        if i >= f.params.len { break }
-        if param_is_ref(f, i) { return true }
-        i = i + 1
-    }
-    false
 }
 
 // (MEM Step 2/3) BoundArgs — the result of binding a call's arguments: the callee frame `fenv`
@@ -2491,34 +2788,142 @@ fn eval_lambda_call(fv: FuncVal, c: checker::TCall, env: Venv) -> EvalRes {
     EvalRes { value= rv; env= caller }
 }
 
-fn eval_call(c: checker::TCall, env: Venv) -> EvalRes {
-    // A builtin that RAN (`true`) is `-> void`, so there is no Value to yield: a void call
-    // only appears in statement position, and reaching here in value position is an honest
-    // stop (M.3), never a synthesized Unit. A `false`/`error` result == "not a builtin" —
-    // fall through to a user fn. Builtins take no `Ref<T>` args → the env is unchanged.
-    match try_builtin(c.callee, c.args, env) {
-        bool as ran => if ran { panic("vm: void builtin call used as a value (internal: checker should reject)") }
-        error       => {}                  // not a builtin — fall through to a user fn
+// (W10b.D3) resolve a DYNAMIC contract-method call's target: the concrete class's stamped
+// function named `method` whose namespace IS `class_name` or ends with "::" + `class_name` —
+// the SAME rule codegen's vtable build uses (cg_find_method_ns), so both engines dispatch to
+// the SAME method (virtual overrides included: every effective method is stamped per class).
+// Mirror of vm.c::find_class_method. null = not found (an honest stop at the caller).
+fn find_class_method(env: Venv, class_name: str, method: str) -> FnHit? {
+    // (#109 W3) class_name is a StructVal type_name / Named — take its BARE last segment so the
+    // ends_with(tf.namespace, "::" ~ class_name) match compares a bare class tail against tf's
+    // canonical method namespace (a full ns matched via ends_with; do NOT strip tf.namespace).
+    let bname = checker::name_last_segment(class_name)
+    mut i: u64 = 0
+    loop {
+        if i >= env.prog.items.len { break }
+        match env.prog.items[i] {
+            checker::TFunction as tf => {
+                if tf.name == method {
+                    if tf.namespace == bname { return FnHit { func = tf; idx = i } }
+                    if teko::str::ends_with(tf.namespace, "::" ~ bname) { return FnHit { func = tf; idx = i } }
+                }
+            }
+            _ => {}
+        }
+        i++
     }
-    // teko::list::empty / push — value-producing SLICE builtins (FIXED+COPY). Recognized
-    // before user-fn resolution; null == not a list builtin, fall through.
-    match try_list_builtin(c.callee, c.args, env) { Value as v => return EvalRes { value= v; env= env }; null => {} }
-    // E2 — err_loc / err_typed — value-producing error-adornment builtins. Recognized before
-    // user-fn resolution; null == not an err builtin, fall through.
-    match try_err_builtin(c.callee, c.args, env) { Value as v => return EvalRes { value= v; env= env }; null => {} }
-    // str/byte STDLIB — value-producing str-returning builtins (str/str_of_bytes/one_byte/
-    // str_concat3/ftoa). Recognized before user-fn resolution; null == not a str builtin, fall through.
-    match try_str_builtin(c.callee, c.args, env) { Value as v => return EvalRes { value= v; env= env }; null => {} }
-    // teko::fs::* host-surface builtins (list_dir). Recognized before user-fn resolution;
-    // null == not a fs builtin, fall through. (Mirrors vm.c's list_dir handler.)
-    match try_fs_builtin(c.callee, c.args, env) { Value as v => return EvalRes { value= v; env= env }; null => {} }
-    // (W10) a CLOSURE call: the callee is a LOCAL bound to a FuncVal. A LAMBDA value executes its own
+    null
+}
+
+// (W10b.D3) DYNAMIC contract-method dispatch. The receiver (args[0]) evaluates ONCE; a class
+// instance IS the interface value in the VM (a ClassRef cell — no fat pointer needed, the cell's
+// struct payload carries the CONCRETE class name to dispatch on). The ORIGINAL ClassRef binds as
+// the receiver param (reference semantics survive the dispatch). Non-receiver args bind exactly
+// like bind_call_args (Ref auto-promotion included). Shared by BOTH eval_call and call_value —
+// the twin-asymmetry trap's two entry points. Yields StmtVal (value = null for a void method) so
+// the statement path tolerates void; the value path panics on null. Mirror of vm.c::eval_iface_call.
+fn eval_iface_call(c: checker::TCall, env: Venv) -> StmtVal {
+    let re = eval_expr(c.args[0], env)
+    mut caller = re.env
+    let recv = re.value
+    let cellid = match recv { ClassRef as cr => cr.cell; _ => panic("vm: interface dispatch on a non-class value (internal: only a class instance upcasts)") }
+    let payload = cell_get(caller.cells, cellid)
+    let concrete = match payload { StructVal as sv => sv.type_name; _ => panic("vm: interface dispatch: the class cell holds no struct payload (internal)") }
+    let method = c.callee.segments[c.callee.segments.len - 1].name
+    let h = match find_class_method(caller, concrete, method) {
+        FnHit as hit => hit
+        null => panic("vm: interface dispatch: no stamped method on the concrete class (internal: conformance was checked)")
+    }
+    let f = h.func
+    if f.params.len == 0 || f.params.len != c.args.len { panic("vm: interface dispatch: arity mismatch (internal: the checker fixed the arity)") }
+    if !f.is_test { teko::cov_mark(h.idx) }
+    mut fenv = fresh_env(caller.prog, caller.cells)
+    fenv = define(fenv, f.params[0].name, recv)   // the receiver — the ORIGINAL ClassRef
+    mut ai: u64 = 1
+    loop {
+        if ai >= c.args.len { break }
+        if param_is_ref(f, ai) {   // same auto-ref/forward rule as bind_call_args
+            match c.args[ai].kind {
+                checker::TVar as v => {
+                    match c.args[ai].type {
+                        checker::Reference => {
+                            fenv = define(fenv, f.params[ai].name, read_var(caller, v.name))   // forward the existing RefVal
+                        }
+                        _ => {
+                            let pr = promote_to_cell(caller, v.name)   // auto-ref: promote the origin var
+                            caller = pr.env
+                            fenv = with_cells(fenv, caller.cells)
+                            fenv = define(fenv, f.params[ai].name, RefVal { cell = pr.id })
+                        }
+                    }
+                }
+                _ => panic("vm: a `Ref<T>` argument must be a mutable variable (internal: checker should reject)")
+            }
+        } else {
+            let ae = eval_expr(c.args[ai], caller)
+            caller = ae.env
+            fenv = with_cells(fenv, caller.cells)
+            fenv = define(fenv, f.params[ai].name, coerce_to(ae.value, vm_param_coerce_type(f.params[ai].type_ann)))
+        }
+        ai++
+    }
+    teko::cov_enter(h.idx)
+    let fe = exec_block_ex(f.body, fenv, true)
+    teko::cov_leave()
+    caller = with_cells(caller, fe.env.cells)
+    mut rv: Value? = null
+    match fe.flow {
+        VmReturn as ret => match ret.value { Value as v => { rv = coerce_to(v, f.return_type) }; null => {} }
+        Normal as nm    => match nm.value { Value as v => { rv = coerce_to(v, f.return_type) }; null => {} }
+        _               => {}
+    }
+    StmtVal { value = rv; env = caller }
+}
+
+fn eval_call(c: checker::TCall, env: Venv) -> EvalRes {
+    // (W10b.D3) dynamic contract dispatch — FIRST, before builtin name-sniffing could collide
+    // with a method name. Same guard in call_value (the VM twin-asymmetry rule).
+    if c.is_iface_dispatch {
+        let r = eval_iface_call(c, env)
+        return EvalRes { value = r.value ?? panic("vm: void interface-method call used as a value (internal: checker should reject)"); env = r.env }
+    }
+    // (#107) a CLOSURE call ALSO goes here, before ANY of the try_*_builtin name-sniffing below:
+    // those match by BARE last-segment name only (`write`, `print`, `len`, …) with no scope
+    // awareness, so a closure-typed local/param sharing one of those reserved names (e.g. a
+    // `write: WFn` param in a namespace that also has an extern `write`) would otherwise be
+    // hijacked into the builtin call instead of calling the closure VALUE — the checker already
+    // proved `is_closure_call` (tk_env_lookup_call/lookup_call scans innermost-first, so the
+    // local always wins over the namespace fn); the VM just has to respect that verdict.
+    // (W10) the callee is a LOCAL bound to a FuncVal. A LAMBDA value executes its own
     // body+captures (eval_lambda_call); a NAMED-fn value resolves THAT function and invokes it (W10a).
     if c.is_closure_call {
         match read_var(env, c.callee.segments[c.callee.segments.len - 1].name) {
             FuncVal as fv => if fv.is_lambda { return eval_lambda_call(fv, c, env) } else { }
             _ => { }
         }
+    }
+    // A builtin that RAN (`ran= true`) is `-> void`, so there is no Value to yield: a void call
+    // only appears in statement position, and reaching here in value position is an honest
+    // stop (M.3), never a synthesized Unit — this arm always panics, so BuiltinRes.env is dead
+    // here (kept only for the match arm's shape; the env matters at call_value, MEM Step 4).
+    // A `false`/`error` result == "not a builtin" — fall through to a user fn.
+    if !c.is_closure_call {
+        match try_builtin(c.callee, c.args, env) {
+            BuiltinRes as br => if br.ran { panic("vm: void builtin call used as a value (internal: checker should reject)") }
+            error            => {}                  // not a builtin — fall through to a user fn
+        }
+        // teko::list::empty / push — value-producing SLICE builtins (FIXED+COPY). Recognized
+        // before user-fn resolution; null == not a list builtin, fall through.
+        match try_list_builtin(c.callee, c.args, env) { Value as v => return EvalRes { value= v; env= env }; null => {} }
+        // E2 — err_loc / err_typed — value-producing error-adornment builtins. Recognized before
+        // user-fn resolution; null == not an err builtin, fall through.
+        match try_err_builtin(c.callee, c.args, env) { Value as v => return EvalRes { value= v; env= env }; null => {} }
+        // str/byte STDLIB — value-producing str-returning builtins (str/str_of_bytes/one_byte/
+        // str_concat3/ftoa). Recognized before user-fn resolution; null == not a str builtin, fall through.
+        match try_str_builtin(c.callee, c.args, env) { Value as v => return EvalRes { value= v; env= env }; null => {} }
+        // teko::fs::* host-surface builtins (list_dir). Recognized before user-fn resolution;
+        // null == not a fs builtin, fall through. (Mirrors vm.c's list_dir handler.)
+        match try_fs_builtin(c.callee, c.args, env) { Value as v => return EvalRes { value= v; env= env }; null => {} }
     }
     let h = if c.is_closure_call {
         match read_var(env, c.callee.segments[c.callee.segments.len - 1].name) {
@@ -2694,6 +3099,14 @@ fn exec_stmt(s: checker::TStatement, env: Venv) -> Step {
             if (a.op == lexer::TokenKind::SlashEq || a.op == lexer::TokenKind::PercentEq) && val_is_int(rhs) && as_int(rhs) == 0 {
                 vm_panic_div0_at(a.value.line, a.value.col)
             }
+            // (#88) `recv.field op= x` — an IN-PLACE field mutation. A CLASS field lives in the SHARED
+            // cell store, so the write is observed by every alias (reference semantics — the aliasing
+            // proof); a STRUCT field is rebuilt up its `mut` root. field_assign applies the op + wraps.
+            let is_field = match a.kind { parser::AssignKind::Field => true; _ => false }
+            if is_field {
+                let env2 = field_assign(a.target, a.op, rhs, a.bound, renv)
+                return Stepped { env= env2; value= null }
+            }
             // (MEM Step 2/3) `r.value op= x` writes THROUGH a reference: `a.name` names the `Ref<T>`
             // binding (a RefVal cell index); a deref-assign reads the cell, applies the op, and writes
             // BACK to the cell (cell_set) — so the caller's aliased var observes the write. A plain
@@ -2815,20 +3228,14 @@ fn eval_stmt_value(e: checker::TExpr, env: Venv) -> StmtVal {
 // the callee is visible at the caller after return). Returns the value AND the updated caller env.
 // (The C twin folds this into eval_call, where the cell store is a global shared by pointer.)
 fn call_value(c: checker::TCall, env: Venv) -> StmtVal {
-    // A builtin that RAN (`true`) is `-> void` — yield null. A `false`/`error` result ==
-    // "not a builtin": run the user fn. (Builtins do not take `Ref<T>` params — env unchanged.)
-    match try_builtin(c.callee, c.args, env) {
-        bool as ran => if ran { return StmtVal { value= null; env= env } }
-        error       => {}
-    }
-    // VALUE-producing builtins — a statement-position call can be a function's TRAILING expression
-    // (B.20), e.g. `fn empty_table() -> TypeTable { teko::list::empty() }`. Route them exactly like
-    // eval_call (list/err/str/fs) BEFORE user-fn resolution; without this a trailing `teko::list::empty()`
-    // fell through to find_function("empty") → "host function the VM cannot run". (No ref args.)
-    match try_list_builtin(c.callee, c.args, env) { Value as v => return StmtVal { value= v; env= env }; null => {} }
-    match try_err_builtin(c.callee, c.args, env)  { Value as v => return StmtVal { value= v; env= env }; null => {} }
-    match try_str_builtin(c.callee, c.args, env)  { Value as v => return StmtVal { value= v; env= env }; null => {} }
-    match try_fs_builtin(c.callee, c.args, env)   { Value as v => return StmtVal { value= v; env= env }; null => {} }
+    // (W10b.D3) dynamic contract dispatch — FIRST, before builtin name-sniffing could collide
+    // with a method name. Same guard in eval_call (the VM twin-asymmetry rule).
+    if c.is_iface_dispatch { return eval_iface_call(c, env) }
+    // (#107) a CLOSURE call ALSO goes here, before ANY of the try_*_builtin name-sniffing below —
+    // same reasoning as eval_call's guard above (the VM twin-asymmetry rule: both call paths need
+    // it). Without this, a closure-typed local/param sharing a reserved builtin name (e.g. a
+    // `write: WFn` param alongside a same-namespace extern `write`) gets hijacked into the
+    // builtin call instead of calling the closure VALUE the checker already resolved.
     // (W10) a CLOSURE call in statement position: a LAMBDA value executes its own body+captures; a
     // NAMED-fn value resolves THAT function (W10a). Otherwise resolve the callee path.
     if c.is_closure_call {
@@ -2836,6 +3243,28 @@ fn call_value(c: checker::TCall, env: Venv) -> StmtVal {
             FuncVal as fv => if fv.is_lambda { let r = eval_lambda_call(fv, c, env); return StmtVal { value= r.value; env= r.env } } else { }
             _ => { }
         }
+    }
+    // A builtin that RAN (`ran= true`) is `-> void` — yield null, but the env is now
+    // BuiltinRes.env (issue #106), NOT the original `env`: a builtin's argument expression may
+    // itself contain a `Ref<T>` value-position call (e.g. a closure writing `r.value` nested
+    // inside `teko::assert::is_true(...)`), which grows/mutates the cell store exactly like any
+    // other value-position call — dropping that back to the pre-call `env` silently lost the
+    // write on the self-hosted engine only (vm.c is immune: its cell store is a global shared
+    // by pointer — g_cells in vm.c — so the write is already visible with no merge needed).
+    // A `false`/`error` result == "not a builtin": run the user fn.
+    if !c.is_closure_call {
+        match try_builtin(c.callee, c.args, env) {
+            BuiltinRes as br => if br.ran { return StmtVal { value= null; env= br.env } }
+            error            => {}
+        }
+        // VALUE-producing builtins — a statement-position call can be a function's TRAILING expression
+        // (B.20), e.g. `fn empty_table() -> TypeTable { teko::list::empty() }`. Route them exactly like
+        // eval_call (list/err/str/fs) BEFORE user-fn resolution; without this a trailing `teko::list::empty()`
+        // fell through to find_function("empty") → "host function the VM cannot run". (No ref args.)
+        match try_list_builtin(c.callee, c.args, env) { Value as v => return StmtVal { value= v; env= env }; null => {} }
+        match try_err_builtin(c.callee, c.args, env)  { Value as v => return StmtVal { value= v; env= env }; null => {} }
+        match try_str_builtin(c.callee, c.args, env)  { Value as v => return StmtVal { value= v; env= env }; null => {} }
+        match try_fs_builtin(c.callee, c.args, env)   { Value as v => return StmtVal { value= v; env= env }; null => {} }
     }
     let h = if c.is_closure_call {
         match read_var(env, c.callee.segments[c.callee.segments.len - 1].name) {
@@ -3121,7 +3550,7 @@ fn cov_walk_expr(e: checker::TExpr, w: CovWalk) -> CovWalk {
 fn cov_walk_stmt(s: checker::TStatement, w: CovWalk) -> CovWalk {
     match s {
         checker::TBinding as b  => cov_walk_expr(b.value, w)
-        checker::TAssign as a   => cov_walk_expr(a.value, w)
+        checker::TAssign as a   => { let w2 = cov_walk_expr(a.value, w); match a.kind { parser::AssignKind::Field => cov_walk_expr(a.target, w2); _ => w2 } }   // (#88) the FIELD LHS receiver is executable too
         checker::TReturn as r   => if r.has_value { cov_walk_expr(r.value, w) } else { w }
         checker::TLoopStmt as l => cov_walk_block(l.body, w)
         checker::TExprStmt as x => cov_walk_expr(x.expr, w)
@@ -3257,6 +3686,12 @@ exp fn run_tests_cov(prog: checker::TProgram, record_branches: bool, write_xml: 
         match prog.items[i] {
             checker::TFunction as f => {
                 if f.is_test {
+                    // (#109 test-gate memory) checkpoint the arena; every allocation this test makes
+                    // (label, env cells, the VM's copy-everything intermediate values) is bulk-freed at
+                    // arena_pop below — so 659 tests no longer accumulate the whole run in the never-dropped
+                    // root region (the OOM that blocked the self-host gate). Coverage sinks are libc-heap,
+                    // so they survive; run_tests_cov's own loop state is on the C stack, not the arena.
+                    teko::arena_push()
                     let label = if f.namespace.len != 0 { teko::str::concat(f.namespace, "::", f.name) } else { f.name }
                     teko::io::print(teko::str::concat("test ", label, " ... "))
                     let fenv = fresh_env(prog, teko::list::empty())   // (MEM Step 2/3) each test frame starts with an empty cell store
@@ -3265,6 +3700,7 @@ exp fn run_tests_cov(prog: checker::TProgram, record_branches: bool, write_xml: 
                     teko::cov_leave()
                     teko::io::println("ok")
                     passed = passed + 1
+                    teko::arena_pop()   // free this test's transient arena span (coverage already recorded off-arena)
                 }
             }
             _ => {}

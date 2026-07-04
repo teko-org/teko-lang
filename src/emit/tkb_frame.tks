@@ -122,7 +122,7 @@ fn collect_tstatements(t: StrTable, xs: []checker::TStatement) -> StrTable {
 fn collect_tstatement(t: StrTable, s: checker::TStatement) -> StrTable {
     match s {
         checker::TBinding as bd     => collect_strings(collect_type_strings(collect_bindtarget(t, bd.target), bd.bound), bd.value)
-        checker::TAssign as a       => collect_strings(collect_type_strings(st_intern(t, a.name).table, a.bound), a.value)
+        checker::TAssign as a       => { let t2 = collect_strings(collect_type_strings(st_intern(t, a.name).table, a.bound), a.value); match a.kind { parser::AssignKind::Field => collect_strings(t2, a.target); _ => t2 } }   // (#88) the FIELD LHS receiver's strings
         checker::TReturn as r       => collect_strings(t, r.value)
         checker::TLoopStmt as l      => collect_tstatements(st_intern(t, l.label).table, l.body)
         checker::TBreakStmt as br    => st_intern(t, br.label).table
@@ -154,7 +154,13 @@ fn collect_strings(t: StrTable, te: checker::TExpr) -> StrTable {
         checker::TBinary as b  => collect_strings(collect_strings(t1, b.left), b.right)
         checker::TUnary as u   => collect_strings(t1, u.operand)
         checker::TCompare as c => collect_terms(collect_strings(t1, c.first), c.rest)
-        checker::TCall as cl   => collect_texprs(collect_path(t1, cl.callee), cl.args)
+        // (W10b.D3) a dispatch node (tag 24) also serializes its method Func — intern its Named
+        // param/return names too (tag 7 never writes callee_type, so this is D3-only).
+        checker::TCall as cl   => {
+            let tcal = collect_path(t1, cl.callee)
+            let tct = if cl.is_iface_dispatch { collect_type_strings(tcal, cl.callee_type) } else { tcal }
+            collect_texprs(tct, cl.args)
+        }
         checker::TCast as c    => collect_strings(t1, c.expr)                                    // S1a — recurse into the inner expr
         checker::TFieldAccess as f => st_intern(collect_strings(t1, f.receiver), f.field).table  // S1b — receiver AND the field name (must intern)
         checker::TInterp as in => collect_texprs(collect_pieces(t1, in.pieces), in.holes)        // $"…{expr}…" — intern pieces, recurse holes
@@ -212,6 +218,8 @@ fn collect_typebody(t: StrTable, tb: parser::TypeBody) -> StrTable {
         parser::AliasBody as a   => collect_typeexpr(t, a.alias)
         parser::ExternBody       => t
         parser::ClassBody as c   => collect_fields(t, c.fields)   // (W10b.CLASS) methods not yet collected, same pre-existing gap as struct methods
+        parser::InterfaceBody as ib => collect_pieces(t, ib.extends)   // (W10b.IF) extends names only — method sigs not serialized (same gap as struct/class methods)
+        parser::TraitBody as trb => collect_fields(t, trb.fields)   // (TR0) fields only — methods not serialized (same gap as struct/class methods)
     }
 }
 fn collect_typedecl(t: StrTable, d: parser::TypeDecl) -> StrTable {

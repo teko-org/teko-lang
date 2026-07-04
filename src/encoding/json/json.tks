@@ -1,0 +1,631 @@
+// src/encoding/json/json.tks   (namespace 'teko::encoding::json')
+//
+// S-JSON — TEKO_ROADMAP_NET_CRYPTO.md §2b: "teko::encoding::json. Deps: none. Parser +
+// encoder (RFC 8259), streaming + DOM. Needed by HTTP APIs, config, DoH, many cloud
+// services. High priority, unblocks a lot. (T1)". Pure Teko, no C twin (the `teko::regex`
+// precedent — src/regex/regex.tks — establishes that library code with zero OS/FFI
+// dependency ships as `.tks` + `.tkt` only).
+//
+// SCOPE (this unit). A full RFC 8259 DOM parser + encoder:
+//   - all 6 JSON value kinds: object, array, string, number, true/false, null;
+//   - full string escape handling (\" \\ \/ \b \f \n \r \t \uXXXX incl. surrogate pairs);
+//   - full number grammar (sign, integer, fraction, exponent) with round-trip-safe
+//     f64 decoding and shortest-safe re-encoding of integral vs fractional values;
+//   - streaming is satisfied by the DOM parser reading one `str` in one pass (no
+//     incremental/partial-input token API in this round — see "TR4-readiness" below
+//     for why a DOM-first cut is the right shape for the trait consumer).
+// NOT implemented (documented, future round, JSON5/JSONC extensions — RFC 8259 forbids
+// all of these, so their absence is spec-conformance, not a gap): comments, trailing
+// commas, unquoted keys, single-quoted strings, NaN/Infinity literals.
+//
+// VALUE MODEL — the design tension the task flagged, resolved here (no Map exists yet;
+// S7 is a later round). RFC 8259 §1 defines an "object" as "an unordered collection of
+// zero or more name/value pairs" — the wire grammar is literally a sequence of pairs, so
+// preserving SOURCE ORDER (rather than committing to hash semantics prematurely) is the
+// most faithful and least-surface DOM shape today; a future `Json::from_map`/`to_map`
+// bridge into `teko::collections::Map` (once S7 lands) can layer on top without
+// invalidating this shape.
+//
+//   DECISION: parallel slices — `JsonObject = struct { keys: []str; values: []JsonValue }`
+//   — over a `variant`-of-pairs (`[]JsonPair` where `JsonPair = struct { key: str; value:
+//   JsonValue }`). Both are expressible; parallel slices is the LEAST-SURFACE choice and
+//   matches established precedent elsewhere in this exact compiler for "n unlabeled things
+//   walked in lockstep": `parser::StructLit { field_names: []str; field_vals: []Expr }`,
+//   `parser::FlagsBody { members: []str; values: []u128 }` (src/parser/ast.tks). A
+//   `JsonPair` struct would ALSO work and reads slightly more "one item at a time", but
+//   it's one more named type for no behavioral gain — parallel slices is the established
+//   idiom here, so it's what's used. (If a future round wants keyed lookup, that's a
+//   `find_key`/`with_key` helper over these same two slices, not a shape change.)
+//
+//   The recursive cases (`array`'s elements, `object`'s values) are stored as `[]JsonValue`
+//   (a slice), matching the `teko::regex` precedent for a self-referential variant: never a
+//   bare `JsonValue` struct field, because of a confirmed VM-only defect where a bare
+//   variant-typed field read off a `match`-bound variable can come back corrupted, while
+//   the identical value behind a `[]T` slice (a different, unaffected VM code path) is
+//   fine (see src/regex/regex.tks's "the VM workaround plumbing" note). Arrays and objects
+//   already need slices for their multi-element payload, so this costs nothing extra here
+//   (unlike regex's RStar/RPlus/ROpt, which had to wrap an inherently single child).
+//
+// ERROR MODEL (M.1 fail-loud / M.3 honest types). `decode(str) -> JsonValue | error` —
+// malformed input is a checked failure (never a panic), following the `str_from_utf8` /
+// `teko::regex::compile` fallible-builtin convention. `encode` is total (a well-formed
+// `JsonValue` tree always has a valid JSON rendering) so it returns `str`, not `str |
+// error`.
+//
+// TR4-READINESS (teko::traits' Json structural trait, TEKO_ROADMAP_TRAITS.md TR4 — NOT
+// implemented here, just kept in view). TR4 will synthesize `to_json`/`from_json` for a
+// user struct by deriving field-by-field. The natural bridge point is exactly this
+// module's DOM: derived `to_json` builds a `JsonValue` (mostly `JsonObject`) and calls
+// `encode`; derived `from_json` calls `decode` then walks the resulting `JsonValue` by
+// field name via `object_get`. That is why `object_get`/`array_get` (below) exist as
+// public, trait-friendly accessors NOW even though nothing in this unit calls them
+// internally except tests — they are the exact shape TR4's generated code will want.
+
+// --- the value model ---
+
+pub type JsonNull   = struct { }                                // `null`
+pub type JsonBool   = struct { value: bool }                    // `true` / `false`
+pub type JsonNumber = struct { value: f64 }                     // any JSON number (int or float; RFC 8259 has one numeric grammar)
+pub type JsonString = struct { value: str }                     // a decoded (escapes resolved) string
+pub type JsonArray  = struct { items: []JsonValue }              // `[...]` — see the VM-workaround note above for why this is a slice
+pub type JsonObject = struct { keys: []str; values: []JsonValue } // `{...}` — parallel slices, source order preserved (see rationale above)
+
+pub type JsonValue = variant JsonNull | JsonBool | JsonNumber | JsonString | JsonArray | JsonObject
+
+// --- small ASCII classification helpers (not in the language's builtin char-ops set —
+// `is_alpha`/`is_digit`/`is_space` exist but not a hex-digit or JSON-specific whitespace
+// predicate, so these are written locally, over `byte` — the parser scans UTF-8 bytes
+// directly, decoding codepoints only inside string literals where `\uXXXX` needs it). ---
+
+fn is_json_ws(b: byte) -> bool {
+    b == b' ' || b == b'\t' || b == b'\n' || b == b'\r'
+}
+
+fn is_digit_byte(b: byte) -> bool {
+    b >= b'0' && b <= b'9'
+}
+
+fn hex_digit_value(b: byte) -> i64 {
+    if b >= b'0' && b <= b'9' { return (b to i64) - (b'0' to i64) }
+    if b >= b'a' && b <= b'f' { return (b to i64) - (b'a' to i64) + 10 }
+    if b >= b'A' && b <= b'F' { return (b to i64) - (b'A' to i64) + 10 }
+    -1
+}
+
+// --- the parser: hand-written recursive descent over the input's raw UTF-8 bytes.
+// JSON's structural grammar (RFC 8259 §2) is pure ASCII (whitespace, punctuation,
+// digits, the literal keywords) — only STRING CONTENTS can carry arbitrary UTF-8, and
+// those bytes are copied through verbatim (unescaped) except inside a recognized `\`
+// escape, so scanning by byte index (not codepoint index) is correct and avoids the
+// O(n) codepoint-reindexing `teko::regex` needs for its `.`/class matcher. ---
+
+// a parse result: the position just past what was consumed, plus the value built.
+// Threaded through by return value (no mutable out-param — the same idiom `teko::regex`
+// uses for its own `PState`).
+pub type PResult = struct { pos: u64; value: JsonValue }
+
+fn skip_ws(p: []byte, pos: u64) -> u64 {
+    mut at = pos
+    loop {
+        if at >= p.len || !is_json_ws(p[at]) { break }
+        at++
+    }
+    at
+}
+
+fn parse_value(p: []byte, pos: u64) -> PResult | error {
+    let at = skip_ws(p, pos)
+    if at >= p.len { return error { message = "json: unexpected end of input" } }
+    let b = p[at]
+    if b == b'{' { return parse_object(p, at) }
+    if b == b'[' { return parse_array(p, at) }
+    if b == b'"' { return parse_string_value(p, at) }
+    if b == b't' { return parse_literal(p, at, "true", JsonBool { value = true }) }
+    if b == b'f' { return parse_literal(p, at, "false", JsonBool { value = false }) }
+    if b == b'n' { return parse_literal(p, at, "null", JsonNull { }) }
+    if b == b'-' || is_digit_byte(b) { return parse_number(p, at) }
+    error { message = concat("json: unexpected character at offset ", i64_to_str(at to i64)) }
+}
+
+// matches a fixed ASCII keyword (`true`/`false`/`null`) starting at `pos`.
+fn parse_literal(p: []byte, pos: u64, word: str, value: JsonValue) -> PResult | error {
+    mut i: u64 = 0
+    loop {
+        if i >= word.len { break }
+        if pos + i >= p.len || p[pos + i] != word[i] {
+            return error { message = concat("json: invalid literal at offset ", i64_to_str(pos to i64)) }
+        }
+        i++
+    }
+    PResult { pos = pos + word.len; value = value }
+}
+
+// --- object: `{ "key" : value , "key" : value ... }` ---
+
+fn parse_object(p: []byte, pos: u64) -> PResult | error {
+    // pos is at '{'
+    mut at = skip_ws(p, pos + 1)
+    mut keys: []str = teko::list::empty()
+    mut values: []JsonValue = teko::list::empty()
+    if at < p.len && p[at] == b'}' { return PResult { pos = at + 1; value = JsonObject { keys = keys; values = values } } }
+    loop {
+        at = skip_ws(p, at)
+        if at >= p.len || p[at] != b'"' {
+            return error { message = concat("json: expected string key at offset ", i64_to_str(at to i64)) }
+        }
+        let key_res = match parse_string(p, at) { PStringResult as s => s; error as e => return e }
+        at = skip_ws(p, key_res.pos)
+        if at >= p.len || p[at] != b':' {
+            return error { message = concat("json: expected ':' after object key at offset ", i64_to_str(at to i64)) }
+        }
+        let val_res = match parse_value(p, at + 1) { PResult as v => v; error as e => return e }
+        keys = teko::list::push(keys, key_res.text)
+        values = teko::list::push(values, val_res.value)
+        at = skip_ws(p, val_res.pos)
+        if at >= p.len { return error { message = "json: unterminated object — expected ',' or '}'" } }
+        if p[at] == b',' { at = at + 1; continue }
+        if p[at] == b'}' { return PResult { pos = at + 1; value = JsonObject { keys = keys; values = values } } }
+        return error { message = concat("json: expected ',' or '}' at offset ", i64_to_str(at to i64)) }
+    }
+    error { message = "json: unreachable" }   // loop always returns; satisfies the checker's fall-through requirement
+}
+
+// --- array: `[ value , value ... ]` ---
+
+fn parse_array(p: []byte, pos: u64) -> PResult | error {
+    // pos is at '['
+    mut at = skip_ws(p, pos + 1)
+    mut items: []JsonValue = teko::list::empty()
+    if at < p.len && p[at] == b']' { return PResult { pos = at + 1; value = JsonArray { items = items } } }
+    loop {
+        let val_res = match parse_value(p, at) { PResult as v => v; error as e => return e }
+        items = teko::list::push(items, val_res.value)
+        at = skip_ws(p, val_res.pos)
+        if at >= p.len { return error { message = "json: unterminated array — expected ',' or ']'" } }
+        if p[at] == b',' { at = at + 1; continue }
+        if p[at] == b']' { return PResult { pos = at + 1; value = JsonArray { items = items } } }
+        return error { message = concat("json: expected ',' or ']' at offset ", i64_to_str(at to i64)) }
+    }
+    error { message = "json: unreachable" }
+}
+
+// --- string ---
+
+// a decoded string's parse result (kept distinct from `PResult` because the OBJECT-KEY
+// case needs the decoded text, not a wrapped `JsonValue` — avoids an unwrap-then-rewrap).
+pub type PStringResult = struct { pos: u64; text: str }
+
+fn parse_string_value(p: []byte, pos: u64) -> PResult | error {
+    let s = match parse_string(p, pos) { PStringResult as r => r; error as e => return e }
+    PResult { pos = s.pos; value = JsonString { value = s.text } }
+}
+
+// pos is at the opening '"'. Decodes all RFC 8259 §7 escapes, including \uXXXX and
+// surrogate pairs (\uD800-\uDBFF followed by \uDC00-\uDFFF -> one astral codepoint);
+// a lone/unpaired surrogate is preserved as the Unicode replacement handling documented
+// below (M.3 — no silent corruption: an unpaired high surrogate with no valid low
+// surrogate following is a decode error rather than emitting an invalid codepoint).
+fn parse_string(p: []byte, pos: u64) -> PStringResult | error {
+    mut at = pos + 1   // past the opening quote
+    mut out: str = ""
+    loop {
+        if at >= p.len { return error { message = "json: unterminated string" } }
+        let b = p[at]
+        if b == b'"' { return PStringResult { pos = at + 1; text = out } }
+        if b == b'\\' {
+            if at + 1 >= p.len { return error { message = "json: unterminated escape sequence" } }
+            let esc = p[at + 1]
+            if esc == b'"'  { out = out ~ one_byte(b'"');  at = at + 2; continue }
+            if esc == b'\\' { out = out ~ one_byte(b'\\'); at = at + 2; continue }
+            if esc == b'/'  { out = out ~ one_byte(b'/');  at = at + 2; continue }
+            if esc == b'b'  { out = out ~ one_byte(0x08 to byte); at = at + 2; continue }
+            if esc == b'f'  { out = out ~ one_byte(0x0C to byte); at = at + 2; continue }
+            if esc == b'n'  { out = out ~ one_byte(b'\n'); at = at + 2; continue }
+            if esc == b'r'  { out = out ~ one_byte(b'\r'); at = at + 2; continue }
+            if esc == b't'  { out = out ~ one_byte(b'\t'); at = at + 2; continue }
+            if esc == b'u' {
+                let step = match parse_unicode_escape(p, at) { UEscResult as u => u; error as e => return e }
+                out = out ~ step.text
+                at = step.pos
+                continue
+            }
+            return error { message = concat("json: invalid escape sequence at offset ", i64_to_str(at to i64)) }
+        }
+        if b < 0x20 to byte {
+            return error { message = concat("json: raw control character in string at offset ", i64_to_str(at to i64)) }
+        }
+        // any other byte (ASCII or a UTF-8 continuation/lead byte of a multibyte
+        // codepoint) is copied through verbatim — the source is already valid UTF-8
+        // (M.3's always-on invariant), so re-slicing raw bytes here can't produce
+        // invalid UTF-8 as long as escapes (the only place non-passthrough bytes are
+        // synthesized) always emit complete, valid encodings, which they do above.
+        out = out ~ one_byte(b)
+        at = at + 1
+    }
+    error { message = "json: unreachable" }
+}
+
+pub type UEscResult = struct { pos: u64; text: str }
+
+// pos is at the 'u' escape's leading backslash (p[pos] == '\\', p[pos+1] == 'u').
+// Decodes one \uXXXX, resolving a UTF-16 surrogate pair into its astral codepoint when a
+// high surrogate is immediately followed by \uDCxx-\uDFxx low surrogate.
+fn parse_unicode_escape(p: []byte, pos: u64) -> UEscResult | error {
+    let cp1 = match read_hex4(p, pos + 2) { i64 as v => v; error as e => return e }
+    // high surrogate range D800-DBFF: only valid alone as an error; try to pair it.
+    if cp1 >= 0xD800 && cp1 <= 0xDBFF {
+        if pos + 6 + 1 < p.len && p[pos + 6] == b'\\' && p[pos + 7] == b'u' {
+            let cp2 = match read_hex4(p, pos + 8) { i64 as v => v; error as e => return e }
+            if cp2 >= 0xDC00 && cp2 <= 0xDFFF {
+                let astral = 0x10000 + ((cp1 - 0xD800) * 0x400) + (cp2 - 0xDC00)
+                return UEscResult { pos = pos + 12; text = codepoint_to_str(astral) }
+            }
+        }
+        return error { message = "json: unpaired UTF-16 high surrogate in \\u escape" }
+    }
+    if cp1 >= 0xDC00 && cp1 <= 0xDFFF {
+        return error { message = "json: unpaired UTF-16 low surrogate in \\u escape" }
+    }
+    UEscResult { pos = pos + 6; text = codepoint_to_str(cp1) }
+}
+
+// reads exactly 4 hex digits starting at `pos`, returning their value (0..0xFFFF).
+fn read_hex4(p: []byte, pos: u64) -> i64 | error {
+    if pos + 4 > p.len { return error { message = "json: truncated \\u escape" } }
+    mut v: i64 = 0
+    mut i: u64 = 0
+    loop {
+        if i >= 4 { break }
+        let d = hex_digit_value(p[pos + i])
+        if d < 0 { return error { message = "json: invalid hex digit in \\u escape" } }
+        v = (v * 16) + d
+        i++
+    }
+    v
+}
+
+// builds a one-codepoint `str` by hand-encoding UTF-8 (no builtin "codepoint -> str"
+// exists yet, so this is written locally; it mirrors the well-known UTF-8 encoding
+// table and is only ever fed values in 0..0x10FFFF by the caller above).
+fn codepoint_to_str(cp: i64) -> str {
+    if cp <= 0x7F {
+        one_byte(cp to byte)
+    } else if cp <= 0x7FF {
+        let b0 = (0xC0 | (cp >> 6)) to byte
+        let b1 = (0x80 | (cp & 0x3F)) to byte
+        one_byte(b0) ~ one_byte(b1)
+    } else if cp <= 0xFFFF {
+        let b0 = (0xE0 | (cp >> 12)) to byte
+        let b1 = (0x80 | ((cp >> 6) & 0x3F)) to byte
+        let b2 = (0x80 | (cp & 0x3F)) to byte
+        one_byte(b0) ~ one_byte(b1) ~ one_byte(b2)
+    } else {
+        let b0 = (0xF0 | (cp >> 18)) to byte
+        let b1 = (0x80 | ((cp >> 12) & 0x3F)) to byte
+        let b2 = (0x80 | ((cp >> 6) & 0x3F)) to byte
+        let b3 = (0x80 | (cp & 0x3F)) to byte
+        one_byte(b0) ~ one_byte(b1) ~ one_byte(b2) ~ one_byte(b3)
+    }
+}
+
+// --- number: RFC 8259 §6 — `-? int frac? exp?` ---
+
+fn parse_number(p: []byte, pos: u64) -> PResult | error {
+    mut at = pos
+    mut negative = false
+    if at < p.len && p[at] == b'-' { negative = true; at = at + 1 }
+    if at >= p.len || !is_digit_byte(p[at]) {
+        return error { message = concat("json: invalid number at offset ", i64_to_str(pos to i64)) }
+    }
+    // integer part: '0' alone, or a nonzero digit followed by more digits (no leading
+    // zeros — RFC 8259 forbids "01"). This loop also validates that shape.
+    if p[at] == b'0' {
+        at = at + 1
+    } else {
+        loop {
+            if at >= p.len || !is_digit_byte(p[at]) { break }
+            at++
+        }
+    }
+    mut has_frac = false
+    mut frac_start: u64 = 0
+    mut frac_end: u64 = 0
+    if at < p.len && p[at] == b'.' {
+        has_frac = true
+        at = at + 1
+        frac_start = at
+        if at >= p.len || !is_digit_byte(p[at]) {
+            return error { message = "json: expected digit after '.' in number" }
+        }
+        loop {
+            if at >= p.len || !is_digit_byte(p[at]) { break }
+            at++
+        }
+        frac_end = at
+    }
+    mut has_exp = false
+    mut exp_negative = false
+    mut exp_start: u64 = 0
+    mut exp_end: u64 = 0
+    if at < p.len && (p[at] == b'e' || p[at] == b'E') {
+        has_exp = true
+        at = at + 1
+        if at < p.len && (p[at] == b'+' || p[at] == b'-') {
+            exp_negative = p[at] == b'-'
+            at = at + 1
+        }
+        exp_start = at
+        if at >= p.len || !is_digit_byte(p[at]) {
+            return error { message = "json: expected digit in number exponent" }
+        }
+        loop {
+            if at >= p.len || !is_digit_byte(p[at]) { break }
+            at++
+        }
+        exp_end = at
+        // M.1 fail-loud, not fail-slow: `pow10`/`pow10_signed` below are O(|exponent|)
+        // (a simple repeated-multiply loop, not O(log n)), so an adversarial exponent
+        // with many digits (e.g. "1e999999999") would otherwise hang the parser for a
+        // very long time before ever reaching the inevitable overflow-to-infinity. f64's
+        // usable decimal exponent range is roughly ±308 (double.MAX_EXP), so any exponent
+        // needing more than 6 digits to write is already far outside representable range
+        // — reject it as a checked error instead of spinning.
+        if exp_end - exp_start > 6 {
+            return error { message = "json: number exponent has too many digits" }
+        }
+    }
+    let sign_width = if negative { 1 to u64 } else { 0 to u64 }
+    let int_text = str_slice_bytes(p, pos + sign_width, int_end_of(p, pos, negative))
+    mut mantissa = digits_to_f64(int_text)
+    if has_frac {
+        let frac_text = str_slice_bytes(p, frac_start, frac_end)
+        mantissa = mantissa + (digits_to_f64(frac_text) / pow10(frac_end - frac_start))
+    }
+    if negative { mantissa = -mantissa }
+    if has_exp {
+        let exp_text = str_slice_bytes(p, exp_start, exp_end)
+        mut exp_val = digits_to_i64(exp_text)
+        if exp_negative { exp_val = -exp_val }
+        mantissa = mantissa * pow10_signed(exp_val)
+    }
+    PResult { pos = at; value = JsonNumber { value = mantissa } }
+}
+
+// the integer part ends where the fractional/exponent part (or the number) ends; this
+// helper just re-derives that boundary cheaply by rescanning (numbers are short).
+fn int_end_of(p: []byte, pos: u64, negative: bool) -> u64 {
+    let sign_width = if negative { 1 to u64 } else { 0 to u64 }
+    mut at = pos + sign_width
+    if at < p.len && p[at] == b'0' { return at + 1 }
+    loop {
+        if at >= p.len || !is_digit_byte(p[at]) { break }
+        at++
+    }
+    at
+}
+
+fn str_slice_bytes(p: []byte, from: u64, to_pos: u64) -> str {
+    mut out: str = ""
+    mut i = from
+    loop {
+        if i >= to_pos { break }
+        out = out ~ one_byte(p[i])
+        i++
+    }
+    out
+}
+
+// decimal-digit text (ASCII '0'-'9' only, as produced by the scans above) -> f64.
+fn digits_to_f64(digits: str) -> f64 {
+    mut v: f64 = 0.0
+    mut i: u64 = 0
+    loop {
+        if i >= digits.len { break }
+        let d = ((digits[i] to i64) - (b'0' to i64)) to f64
+        v = (v * 10.0) + d
+        i++
+    }
+    v
+}
+
+fn digits_to_i64(digits: str) -> i64 {
+    mut v: i64 = 0
+    mut i: u64 = 0
+    loop {
+        if i >= digits.len { break }
+        let d = (digits[i] to i64) - (b'0' to i64)
+        v = (v * 10) + d
+        i++
+    }
+    v
+}
+
+fn pow10(n: u64) -> f64 {
+    mut v: f64 = 1.0
+    mut i: u64 = 0
+    loop {
+        if i >= n { break }
+        v = v * 10.0
+        i++
+    }
+    v
+}
+
+fn pow10_signed(n: i64) -> f64 {
+    if n >= 0 { return pow10(n to u64) }
+    1.0 / pow10((-n) to u64)
+}
+
+// --- public decode entry point ---
+
+// decode(text) — parse a complete JSON document. Trailing (non-whitespace) input after
+// the top-level value is an error (RFC 8259 §2 — a JSON text is EXACTLY one value).
+pub fn decode(text: str) -> JsonValue | error {
+    let bytes = bytes_of_str(text)
+    let result = match parse_value(bytes, 0) { PResult as r => r; error as e => return e }
+    let after = skip_ws(bytes, result.pos)
+    if after != bytes.len {
+        return error { message = concat("json: unexpected trailing input at offset ", i64_to_str(after to i64)) }
+    }
+    result.value
+}
+
+// --- the encoder: JsonValue -> str, always total (a well-formed tree is always
+// representable, so no `| error` — mirrors teko::compress::write_zip's totality). ---
+
+pub fn encode(value: JsonValue) -> str {
+    match value {
+        JsonNull       => "null"
+        JsonBool as b  => if b.value { "true" } else { "false" }
+        JsonNumber as n => encode_number(n.value)
+        JsonString as s => encode_string(s.value)
+        JsonArray as a  => encode_array(a.items)
+        JsonObject as o => encode_object(o.keys, o.values)
+    }
+}
+
+fn encode_array(items: []JsonValue) -> str {
+    mut out = "["
+    mut i: u64 = 0
+    loop {
+        if i >= items.len { break }
+        if i > 0 { out = out ~ "," }
+        out = out ~ encode(items[i])
+        i++
+    }
+    out ~ "]"
+}
+
+fn encode_object(keys: []str, values: []JsonValue) -> str {
+    mut out = "{"
+    mut i: u64 = 0
+    loop {
+        if i >= keys.len { break }
+        if i > 0 { out = out ~ "," }
+        out = out ~ encode_string(keys[i]) ~ ":" ~ encode(values[i])
+        i++
+    }
+    out ~ "}"
+}
+
+// escapes a decoded Teko `str` back into a JSON string literal (RFC 8259 §7): the
+// mandatory escapes (`"`, `\`, and control characters < 0x20) plus the conventional
+// `\n \r \t \b \f` short forms; every other byte (ASCII printable or a UTF-8
+// continuation/lead byte) passes through verbatim — JSON strings are UTF-8-legal by
+// spec (§8.1) and Teko `str` already carries that invariant (B.36), so no re-encoding
+// is needed for the non-ASCII case, only for control characters and the two
+// structural characters.
+fn encode_string(s: str) -> str {
+    mut out = "\""
+    mut i: u64 = 0
+    loop {
+        if i >= s.len { break }
+        let b = s[i]
+        if b == b'"'  { out = out ~ "\\\""; i++; continue }
+        if b == b'\\' { out = out ~ "\\\\"; i++; continue }
+        if b == b'\n' { out = out ~ "\\n"; i++; continue }
+        if b == b'\r' { out = out ~ "\\r"; i++; continue }
+        if b == b'\t' { out = out ~ "\\t"; i++; continue }
+        if b == 0x08 to byte { out = out ~ "\\b"; i++; continue }
+        if b == 0x0C to byte { out = out ~ "\\f"; i++; continue }
+        if b < 0x20 to byte {
+            out = out ~ "\\u" ~ hex4_of(b to i64)
+            i++
+            continue
+        }
+        out = out ~ one_byte(b)
+        i++
+    }
+    out ~ "\""
+}
+
+fn hex4_of(v: i64) -> str {
+    one_byte(hex_nibble(((v >> 12) & 0xF))) ~ one_byte(hex_nibble(((v >> 8) & 0xF))) ~ one_byte(hex_nibble(((v >> 4) & 0xF))) ~ one_byte(hex_nibble(v & 0xF))
+}
+
+fn hex_nibble(v: i64) -> byte {
+    if v < 10 { return ((b'0' to i64) + v) to byte }
+    ((b'a' to i64) + (v - 10)) to byte
+}
+
+// encodes an f64 that came from JSON decoding (or was built by hand) back into JSON
+// number syntax. Integral values (no fractional part, within i64 range) are printed as
+// plain integers (`"1"`, never `"1.0"` — the more common/expected round-trip shape for
+// config/API payloads); non-integral values fall back to a straightforward fixed-point
+// rendering. (No scientific-notation re-encoding in this round — documented gap, same
+// spirit as regex's documented ROUND 0 exclusions: values needing exponent form to be
+// exact at extreme magnitudes are rare in the JSON-as-config/API use case this unit
+// targets first, and a shortest-round-trip float formatter is its own sub-problem.)
+fn encode_number(v: f64) -> str {
+    if v == (v to i64 to f64) && v >= -9223372036854775808.0 && v <= 9223372036854775807.0 {
+        return i64_to_str(v to i64)
+    }
+    encode_float_fixed(v)
+}
+
+// fixed-point fallback for non-integral numbers: sign, integer part, '.', up to 9
+// fractional digits with trailing zeros trimmed (never emitting a bare trailing '.').
+fn encode_float_fixed(v: f64) -> str {
+    mut x = v
+    mut sign = ""
+    if x < 0.0 { sign = "-"; x = -x }
+    let int_part = x to i64
+    mut frac = x - (int_part to f64)
+    mut digits = ""
+    mut i: u64 = 0
+    loop {
+        if i >= 9 { break }
+        frac = frac * 10.0
+        let d = frac to i64
+        digits = digits ~ one_byte(((b'0' to i64) + d) to byte)
+        frac = frac - (d to f64)
+        i++
+    }
+    let trimmed = trim_trailing_zeros(digits)
+    if trimmed.len == 0 { return sign ~ i64_to_str(int_part) }
+    sign ~ i64_to_str(int_part) ~ "." ~ trimmed
+}
+
+fn trim_trailing_zeros(digits: str) -> str {
+    mut end = digits.len
+    loop {
+        if end == 0 || digits[end - 1] != b'0' { break }
+        end--
+    }
+    str_slice_chars(digits, 0, end to i64)
+}
+
+// --- TR4-friendly DOM accessors (public — see the "TR4-readiness" note above) ---
+
+// object_get(obj, key) — first matching value for `key` in source order, or `null`
+// (Teko's built-in nullable) when absent. Linear scan: source order + small typical
+// object sizes make this the right complexity/simplicity trade for now (matches the
+// parallel-slices shape; a hashed lookup is exactly what `teko::collections::Map`
+// integration — noted above — will later provide for large/hot-path objects).
+pub fn object_get(obj: JsonObject, key: str) -> JsonValue? {
+    mut i: u64 = 0
+    loop {
+        if i >= obj.keys.len { break }
+        if str_eq(obj.keys[i], key) { return obj.values[i] }
+        i++
+    }
+    null
+}
+
+fn str_eq(a: str, b: str) -> bool {
+    if a.len != b.len { return false }
+    mut i: u64 = 0
+    loop {
+        if i >= a.len { break }
+        if a[i] != b[i] { return false }
+        i++
+    }
+    true
+}
+
+// array_get(arr, index) — bounds-checked element access, or `null` when out of range
+// (mirrors object_get's absent-key shape so callers handle "missing" uniformly).
+pub fn array_get(arr: JsonArray, index: u64) -> JsonValue? {
+    if index >= arr.items.len { return null }
+    arr.items[index]
+}

@@ -1,0 +1,429 @@
+// src/io/stream.tks   (namespace 'teko::io') — STDLIB_CORE unit IO0: the byte-stream contract.
+//
+// THE CONTRACT (TEKO_ROADMAP_STDLIB_CORE.md §2, IO0): the four stream interfaces every
+// stream (net/crypto/compress/file) will implement —
+//
+//   type Reader = interface { fn read(self, into: Buf)  -> u64 | error }   // bytes read (0 = EOF)
+//   type Writer = interface { fn write(self, from: Buf) -> u64 | error }   // bytes written
+//   type Seeker = interface { fn seek(self, off: i64, whence: Whence) -> u64 | error }
+//   type Closer = interface { fn close(self) -> error? }
+//
+// plus pure-Teko combinators (read_all / read_exact / copy / buffering wrappers / a limit
+// reader / in-memory reader+writer) over the shared `Buf` byte region. Errors are handled
+// with `match` (the 2026-07-02 ruling: no `try` operator); EOF is NOT an error (§5.2's
+// recommendation, Go-style: read returning 0 bytes = end of stream).
+//
+// TWO documented adaptations — the language TODAY vs the contract's full shape (M.3: the
+// gap is stated, not papered over; the regex module set the precedent of resolving such a
+// tension via the Laws with the deviation documented, rather than blocking):
+//
+//   1. INTERFACE-AS-VALUE is a later round (OOP ROUND 3 D2/D3 — resolve.tks:
+//      "an interface … cannot be used as a value type yet"). So the combinators cannot
+//      take `Reader`/`Writer`-typed parameters yet. Until dispatch lands, a STREAM VALUE
+//      is represented by its closure twin (`ReadFn`/`WriteFn` below) — W10 closures are
+//      the one polymorphism mechanism expressible today, and every stream (in-memory now;
+//      file/net/compress at IO1) can be lifted into one. When ROUND 3 lands, IO1 re-types
+//      the combinators against the interfaces; the interface declarations below are the
+//      ratified contract they will move onto.
+//
+//   2. `Buf` IS NOT MUTABLE-IN-PLACE yet. The roadmap's Buf is the arena-backed byte
+//      region the net keystone (N-KEYSTONE / C7.19) will define for the FFI boundary,
+//      where C fills memory through a pointer. Value-functional Teko has no index
+//      assignment and no field assignment (B.4/B.21; the ONLY shared-mutation cell is a
+//      `Ref<T>` param — MEM-1b-ii), so the pure-Teko side of Buf is a VALUE: operations
+//      return a NEW Buf (B.7 — "state flows without ref: caller-local + return").
+//      `read(self, into: Buf)` therefore cannot be IMPLEMENTED by a pure-Teko stateful
+//      stream today — in-memory streams instead expose value-threading `*_step` methods
+//      (the B.7 shape) bridged into stateful `ReadFn`/`WriteFn` closures via `Ref`
+//      capture. FFI-backed streams (IO1) hold their cursor on the C side, so they CAN
+//      implement `read(self, into)` once N-KEYSTONE gives Buf its arena/pointer half.
+//
+// §5 OPEN DECISIONS taken here (to be ratified with the sibling roadmaps):
+//   §5.2 io error model — EOF as 0 (the recommendation): `read` yields `0`/an empty Buf
+//        at end-of-stream; `error` is reserved for genuine failures.
+//   §5.3 ONE Buf — `teko::io::Buf` (this file) is THE byte region; `teko::net` must reuse
+//        it (N-KEYSTONE adds the arena/pointer half HERE, not a second type).
+//
+// Everything below is pure Teko (no externs) — the teko::regex precedent for library
+// modules: .tks only, no C twin (the SUPREME RULE binds compiler C↔.tks pairs, not
+// library code).
+
+// ── Whence — the seek origin ────────────────────────────────────────────────────────────
+
+pub type Whence = enum { Start; Current; End }
+
+// ── the four stream interfaces (the contract, verbatim) ─────────────────────────────────
+// Bodyless signature contracts (W10b.IF). A conforming type provides each method as `pub`
+// (class) / a plain member (struct, all-public). `NullStream` below is the conformance
+// anchor; real stateful implementers arrive with IO1 (FFI-backed streams) and ROUND 3
+// (dispatch).
+
+pub type Reader = interface { fn read(self, into: Buf) -> u64 | error }    // bytes read (0 = EOF)
+pub type Writer = interface { fn write(self, from: Buf) -> u64 | error }   // bytes written
+pub type Seeker = interface { fn seek(self, off: i64, whence: Whence) -> u64 | error }
+pub type Closer = interface { fn close(self) -> error? }                   // null = success
+
+// ── Buf — the byte region (pure-Teko value half) ────────────────────────────────────────
+// A Buf owns an immutable byte snapshot; building one is value-functional (each operation
+// returns a NEW Buf — B.7). N-KEYSTONE later adds the arena-backed mutable half for the
+// FFI boundary; the value surface below stays.
+
+pub type Buf = struct {
+    data: []byte
+
+    // the empty region.
+    fn empty() -> Buf { Buf { data = teko::list::empty() } }
+
+    // wrap an existing byte slice (no copy — a Buf is a read-only view + value ops).
+    fn from_bytes(bytes: []byte) -> Buf { Buf { data = bytes } }
+
+    // the UTF-8 bytes of a str.
+    fn from_str(s: str) -> Buf { Buf { data = bytes_of_str(s) } }
+
+    fn len(self) -> u64 { self.data.len }
+
+    fn bytes(self) -> []byte { self.data }
+
+    // append one byte — returns the grown Buf (the receiver is unchanged).
+    fn push(self, b: byte) -> Buf { Buf { data = teko::list::push(self.data, b) } }
+
+    // append a whole byte slice — returns the grown Buf.
+    fn extend(self, more: []byte) -> Buf {
+        mut grown = self.data
+        mut i: u64 = 0
+        loop {
+            if i >= more.len { break }
+            grown = teko::list::push(grown, more[i])
+            i++
+        }
+        Buf { data = grown }
+    }
+
+    // append another Buf — returns the combined Buf.
+    fn concat(self, other: Buf) -> Buf { self.extend(other.data) }
+
+    // the half-open sub-region [from, to) — out-of-range bounds are an error (M.1
+    // fail-loud: no silent clamping).
+    fn slice(self, from: u64, to: u64) -> Buf | error {
+        if from > to { return error { message = "io::Buf::slice: from > to" } }
+        if to > self.data.len { return error { message = "io::Buf::slice: range out of bounds" } }
+        mut out: []byte = teko::list::empty()
+        mut i = from
+        loop {
+            if i >= to { break }
+            out = teko::list::push(out, self.data[i])
+            i++
+        }
+        Buf { data = out }
+    }
+
+    // decode the region as UTF-8 text (str_from_utf8 is the only door — B.36).
+    fn to_str(self) -> str | error { str_from_utf8(self.data) }
+}
+
+// ── NullStream — the conformance anchor ─────────────────────────────────────────────────
+// The one stream fully implementable WITHOUT mutation: reading yields nothing (always at
+// EOF), writing discards (and honestly reports everything written), seeking moves a cursor
+// that can never observe anything, closing always succeeds. Genuinely useful (a discard
+// sink / empty source) AND it proves the four interfaces are implementable contracts.
+
+pub type NullStream = struct Reader & Writer & Seeker & Closer {
+    fn make() -> NullStream { NullStream { } }
+
+    // always at end-of-stream: 0 bytes read (the §5.2 EOF signal), never an error.
+    fn read(self, into: Buf) -> u64 | error { 0 to u64 }
+
+    // the discard sink: accepts (and drops) every byte.
+    fn write(self, from: Buf) -> u64 | error { from.len() }
+
+    // the stream is empty, so Start/Current/End are all position 0; the target is
+    // `off` from 0. A negative target is an error (per the usual seek contract);
+    // seeking past the end is allowed (reads there just hit EOF).
+    fn seek(self, off: i64, whence: Whence) -> u64 | error {
+        let base: i64 = match whence {
+            Whence::Start   => 0
+            Whence::Current => 0
+            Whence::End     => 0
+        }
+        let target = base + off
+        if target < 0 { return error { message = "io::NullStream::seek: negative position" } }
+        target to u64
+    }
+
+    fn close(self) -> error? { null }
+}
+
+// ── in-memory streams (value-threading — the B.7 shape) ─────────────────────────────────
+// A MemReader/MemWriter is an immutable VALUE; each step returns the ADVANCED stream plus
+// the step's outcome, and the caller rebinds ("mutable state lives in the caller"). The
+// closure factories further down bridge these into stateful ReadFn/WriteFn streams.
+
+// one read step: the advanced reader + the bytes read (empty = EOF, §5.2).
+pub type MemReadStep = struct { reader: MemReader; bytes: Buf }
+
+// one seek step: the repositioned reader + the new absolute position.
+pub type MemSeekStep = struct { reader: MemReader; pos: u64 }
+
+pub type MemReader = struct {
+    buf: Buf
+    pos: u64
+
+    // a reader over a byte region, positioned at the start.
+    fn over(b: Buf) -> MemReader { MemReader { buf = b; pos = 0 } }
+
+    // a reader over a str's UTF-8 bytes.
+    fn of_str(s: str) -> MemReader { MemReader { buf = Buf::from_str(s); pos = 0 } }
+
+    // read up to `max` bytes from the current position. At end-of-stream (or max == 0)
+    // the returned bytes are EMPTY and the reader is unchanged — EOF is not an error.
+    fn read_step(self, max: u64) -> MemReadStep {
+        let total = self.buf.len()
+        if self.pos >= total || max == 0 {
+            return MemReadStep { reader = self; bytes = Buf::empty() }
+        }
+        mut take = total - self.pos
+        if take > max { take = max }
+        let chunk = match self.buf.slice(self.pos, self.pos + take) {
+            Buf as b => b
+            error    => Buf::empty()   // unreachable: the bounds above are in range by construction
+        }
+        MemReadStep { reader = MemReader { buf = self.buf; pos = self.pos + take }; bytes = chunk }
+    }
+
+    // reposition: `off` relative to Start / Current / End. A negative target is an
+    // error; a target PAST the end is allowed (subsequent reads yield EOF) — the
+    // conventional seek contract.
+    fn seek_step(self, off: i64, whence: Whence) -> MemSeekStep | error {
+        let base: i64 = match whence {
+            Whence::Start   => 0
+            Whence::Current => self.pos to i64
+            Whence::End     => self.buf.len() to i64
+        }
+        let target = base + off
+        if target < 0 { return error { message = "io::MemReader::seek_step: negative position" } }
+        let new_pos = target to u64
+        MemSeekStep { reader = MemReader { buf = self.buf; pos = new_pos }; pos = new_pos }
+    }
+}
+
+// one write step: the grown writer + the bytes accepted (a memory sink accepts all).
+pub type MemWriteStep = struct { writer: MemWriter; written: u64 }
+
+pub type MemWriter = struct {
+    buf: Buf
+
+    // an empty in-memory sink.
+    fn empty() -> MemWriter { MemWriter { buf = Buf::empty() } }
+
+    // append `from` — a memory sink always accepts the whole region.
+    fn write_step(self, from: Buf) -> MemWriteStep {
+        MemWriteStep { writer = MemWriter { buf = self.buf.concat(from) }; written = from.len() }
+    }
+
+    // everything written so far.
+    fn content(self) -> Buf { self.buf }
+}
+
+// ── the closure stream layer (the polymorphism seam until ROUND 3 dispatch) ─────────────
+// A stream value TODAY is a closure pair: `ReadFn` yields the next chunk (an EMPTY Buf =
+// EOF — the same §5.2 signal, expressed value-functionally), `WriteFn` accepts a region
+// and reports how many bytes it took. Combinators below are generic over these — any
+// stream that can be lifted into a closure composes (in-memory now; file/net/compress
+// at IO1). Statefulness comes from `Ref` capture (MEM-1b-ii — "the only path to shared
+// mutation"): the factories take a `Ref` to caller-owned `mut` state and return a closure
+// that advances it, so state STILL lives visibly in the caller (B.7, M.2).
+
+pub type ReadFn  = (u64) -> Buf | error    // read(max) -> next chunk; empty = EOF; max > 0
+pub type WriteFn = (Buf) -> u64 | error    // write(from) -> bytes accepted
+
+// lift a caller-owned `mut MemReader` into a stateful ReadFn (auto-ref at the call site).
+pub fn mem_read_fn(source: Ref<MemReader>) -> ReadFn {
+    let lifted: ReadFn = (max: u64) => {
+        let step = source.value.read_step(max)
+        source.value = step.reader
+        step.bytes
+    }
+    lifted
+}
+
+// lift a caller-owned `mut MemWriter` into a stateful WriteFn.
+pub fn mem_write_fn(sink: Ref<MemWriter>) -> WriteFn {
+    let lifted: WriteFn = (from: Buf) => {
+        let step = sink.value.write_step(from)
+        sink.value = step.writer
+        step.written
+    }
+    lifted
+}
+
+// ── combinators ─────────────────────────────────────────────────────────────────────────
+
+// the chunk size read_all/copy request per step (a read may return fewer).
+fn default_chunk_size() -> u64 { 4096 }
+
+// (issue #107 — the workaround this reverts) stream parameters are named `read`/`write` (the
+// contract's own Reader.read/Writer.write names), matching ReadFn/WriteFn's roles directly.
+// This USED to collide with `teko::io`'s `extern fn write(str)` — codegen/VM resolved a CALL
+// through a closure-typed param by bare name, hijacking a param literally named `write` into
+// the extern call regardless of scope. Fixed at the root (codegen's emit_call / the VM's
+// eval_call+call_value now check the checker's `is_closure_call` BEFORE any builtin/extern
+// name-sniffing); this file no longer needs the src/dst naming workaround. See
+// examples/regressions/closure_shadows_fn for the regression proof.
+
+// drain the stream to completion — every chunk until EOF, concatenated.
+pub fn read_all(read: ReadFn) -> Buf | error {
+    mut collected = Buf::empty()
+    loop {
+        let chunk = match read(default_chunk_size()) { Buf as b => b; error as e => return e }
+        if chunk.len() == 0 { break }
+        collected = collected.concat(chunk)
+    }
+    collected
+}
+
+// read EXACTLY `count` bytes — reaching EOF first is an error (M.1 fail-loud), unlike
+// read_all's run-to-EOF.
+pub fn read_exact(read: ReadFn, count: u64) -> Buf | error {
+    mut collected = Buf::empty()
+    loop {
+        if collected.len() >= count { break }
+        let chunk = match read(count - collected.len()) { Buf as b => b; error as e => return e }
+        if chunk.len() == 0 {
+            return error { message = "io::read_exact: end of stream before the requested count" }
+        }
+        collected = collected.concat(chunk)
+    }
+    collected
+}
+
+// write ALL of `from`, looping while the writer takes partial counts. A writer that
+// reports 0 progress (or more bytes than offered) is an error — fail-loud, no spin.
+pub fn write_all(write: WriteFn, from: Buf) -> u64 | error {
+    mut remaining = from
+    mut total: u64 = 0
+    loop {
+        if remaining.len() == 0 { break }
+        let taken = match write(remaining) { u64 as n => n; error as e => return e }
+        if taken == 0 { return error { message = "io::write_all: writer made no progress" } }
+        if taken > remaining.len() { return error { message = "io::write_all: writer reported more bytes than offered" } }
+        remaining = match remaining.slice(taken, remaining.len()) {
+            Buf as rest => rest
+            error       => Buf::empty()   // unreachable: taken <= len by the guard above
+        }
+        total = total + taken
+    }
+    total
+}
+
+// pump `read` into `write` until EOF (write-first, per the contract's copy(dst, src)).
+// Returns the total number of bytes moved.
+pub fn copy(write: WriteFn, read: ReadFn) -> u64 | error {
+    mut total: u64 = 0
+    loop {
+        let chunk = match read(default_chunk_size()) { Buf as b => b; error as e => return e }
+        if chunk.len() == 0 { break }
+        let moved = match write_all(write, chunk) { u64 as n => n; error as e => return e }
+        total = total + moved
+    }
+    total
+}
+
+// ── LimitReader — cap how much an underlying stream may yield ───────────────────────────
+// Caller-owned state (B.7): `mut state = LimitState::of(n)`, then wrap the stream.
+
+pub type LimitState = struct {
+    remaining: u64
+    fn of(limit: u64) -> LimitState { LimitState { remaining = limit } }
+}
+
+// a ReadFn that yields at most `state.remaining` further bytes from `read`, then EOF.
+pub fn limit_read_fn(read: ReadFn, state: Ref<LimitState>) -> ReadFn {
+    let limited: ReadFn = (max: u64) => {
+        mut want = state.value.remaining
+        if want > max { want = max }
+        if want == 0 { return Buf::empty() }   // the cap is spent — EOF, even if the source has more
+        match read(want) {
+            Buf as chunk => {
+                state.value = LimitState { remaining = state.value.remaining - chunk.len() }
+                chunk
+            }
+            error as e => return e
+        }
+    }
+    limited
+}
+
+// ── BufReader — read-side buffering wrapper ─────────────────────────────────────────────
+// Pulls `chunk_size`-sized gulps from the underlying stream and serves any request size
+// out of the pending gulp — many small reads cost few underlying reads.
+
+pub type BufReaderState = struct {
+    pending: Buf
+    pos: u64
+    fn fresh() -> BufReaderState { BufReaderState { pending = Buf::empty(); pos = 0 } }
+}
+
+pub fn buffered_read_fn(read: ReadFn, state: Ref<BufReaderState>, chunk_size: u64) -> ReadFn {
+    let buffered: ReadFn = (max: u64) => {
+        if max == 0 { return Buf::empty() }
+        mut current = state.value
+        if current.pos >= current.pending.len() {
+            // the pending gulp is spent — pull the next one from the underlying stream.
+            match read(chunk_size) {
+                Buf as gulp => {
+                    if gulp.len() == 0 { return Buf::empty() }   // underlying EOF
+                    current = BufReaderState { pending = gulp; pos = 0 }
+                }
+                error as e => return e
+            }
+        }
+        mut take = current.pending.len() - current.pos
+        if take > max { take = max }
+        match current.pending.slice(current.pos, current.pos + take) {
+            Buf as chunk => {
+                state.value = BufReaderState { pending = current.pending; pos = current.pos + take }
+                chunk
+            }
+            error as e => e   // unreachable: bounds in range by construction
+        }
+    }
+    buffered
+}
+
+// ── BufWriter — write-side buffering wrapper ────────────────────────────────────────────
+// Accumulates writes in a pending region and drains it to the underlying stream only when
+// it reaches `capacity` — many small writes cost few underlying writes. flush_write (below)
+// drains what remains; a buffered writer MUST be flushed before its output is complete.
+
+pub type BufWriterState = struct {
+    pending: Buf
+    fn fresh() -> BufWriterState { BufWriterState { pending = Buf::empty() } }
+}
+
+pub fn buffered_write_fn(write: WriteFn, state: Ref<BufWriterState>, capacity: u64) -> WriteFn {
+    let buffered: WriteFn = (from: Buf) => {
+        let combined = state.value.pending.concat(from)
+        if combined.len() < capacity {
+            state.value = BufWriterState { pending = combined }
+            return from.len()
+        }
+        match write_all(write, combined) {
+            u64 => {
+                state.value = BufWriterState { pending = Buf::empty() }
+                from.len()
+            }
+            error as e => e
+        }
+    }
+    buffered
+}
+
+// drain a buffered writer's pending bytes to the underlying stream. Returns how many
+// bytes were flushed (0 if nothing was pending).
+pub fn flush_write(write: WriteFn, state: Ref<BufWriterState>) -> u64 | error {
+    let pending = state.value.pending
+    if pending.len() == 0 { return 0 to u64 }
+    let flushed = match write_all(write, pending) { u64 as n => n; error as e => return e }
+    state.value = BufWriterState { pending = Buf::empty() }
+    flushed
+}

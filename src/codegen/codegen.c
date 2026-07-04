@@ -209,20 +209,26 @@ static bool emit_prim(cbuf *b, tk_prim_kind k, const char **err) {
 // bare name alone — consistent for decl + ref, which is all that's required (the prompt's
 // "keep it simple and consistent"). The namespace parameter is honored (`::` -> `__`)
 // for the day the typed item carries provenance.
+// (#109 W3) append a (canonical) type NAME to a C-symbol buffer, collapsing each "::" → "__". The ONE
+// place the "::"→"__" rule lives — used by mangle_type_name AND every direct tk_base_/tk_vt_ concat, so
+// a decl and its every reference (fat-pointer/vtable included) agree on the same C symbol. Mirror of
+// codegen.tks::cb_tysym.
+static void cb_tysym(cbuf *b, tk_str name) {
+    for (size_t i = 0; i < name.len; i += 1) {
+        if (i + 1 < name.len && name.ptr[i] == ':' && name.ptr[i + 1] == ':') {
+            cb(b, "__"); i += 1; continue;
+        }
+        char one[2] = { (char)name.ptr[i], '\0' };
+        cb(b, one);
+    }
+}
 static void mangle_type_name(cbuf *b, tk_str namespace, tk_str name) {
     cb(b, "tk_t_");
     if (namespace.len > 0) {
-        for (size_t i = 0; i < namespace.len; i += 1) {
-            // collapse a "::" pair into "__"; copy any other byte verbatim.
-            if (i + 1 < namespace.len && namespace.ptr[i] == ':' && namespace.ptr[i + 1] == ':') {
-                cb(b, "__"); i += 1; continue;
-            }
-            char one[2] = { (char)namespace.ptr[i], '\0' };
-            cb(b, one);
-        }
+        cb_tysym(b, namespace);
         cb(b, "__");
     }
-    cb_str(b, name);
+    cb_tysym(b, name);   // (#109 W3) the canonical NAME may itself be "ns::Name" → "ns__Name"
 }
 
 // =========================================================================
@@ -249,6 +255,12 @@ static tk_type g_cg_ret_type;
 // TK_TEXPR_STRUCT_INIT box reads it. "" / {NULL,0} ⇒ root (the safe leak default).
 static tk_escape_set g_cg_escaping;
 static const char   *g_cg_box_frame = "";
+// (S2 Level-1) g_cg_push_frame — names the frame region a `teko::list::push` lowering should grow INTO
+// (tk_slice_push_r) instead of root (tk_slice_push). Set transiently by the assign emission around a
+// frame-local self-append's RHS; the list::push case captures-and-clears it at entry (so nested pushes
+// in the args fall back to root — mirrors the Teko twin, which threads `frame` to the OUTER push only).
+// "" ⇒ root. This is the analog of g_cg_box_frame for slice buffers.
+static const char   *g_cg_push_frame = "";
 // g_cg_frame — the ACTIVE frame-region variable on the current emit path ("" ⇒ none). Set by
 // emit_function; CLEARED (save/restore) when descending into a SUB-SCOPE body (if/match/loop, a
 // tail-if/else, a match-tail arm) so those leak the region (SAFE, M.5) — mirroring the Teko twin,
@@ -349,6 +361,10 @@ static bool cg_body_has_frame_local(tk_escape_set esc, const tk_tstatement *body
             && tk_binding_is_frame_local(esc, body[i])
             && cg_same_named_struct(body[i].as.binding.bound, body[i].as.binding.value.type))
             return true;
+        // (S2 Level-1) a NON-escaping slice binding: its buffer is built by later self-append pushes
+        // (`xs = push(xs, …)`), each routed to `_tkfr` and bulk-freed on the frame drop.
+        if (body[i].tag == TK_TSTMT_BINDING && tk_binding_is_frame_local_slice(esc, body[i]))
+            return true;
     }
     return false;
 }
@@ -401,16 +417,19 @@ static tk_str cg_path_last(tk_path p) {
     return p.len ? p.segments[p.len - 1].name : (tk_str){ NULL, 0 };
 }
 
+// (#109 W3) forward decl: the variant/enum/flags predicates below delegate bare-or-canonical
+// name resolution to cg_find_decl (defined further down), so all codegen predicates agree on
+// which decl a bare last-segment name resolves to.
+static const tk_type_decl *cg_find_decl(tk_str name);
+
 // Find the TYPE_DECL for a VARIANT named `name` (its body is a union of named members),
 // or NULL if there is no such variant decl. Used to decide whether a NAMED slot is a
 // variant (→ wrap) and to enumerate a variant's members.
 static const tk_type_decl *cg_find_variant_decl(tk_str name) {
-    for (size_t i = 0; i < g_cg_prog.nitems; i += 1) {
-        if (g_cg_prog.items[i].tag != TK_TITEM_TYPE_DECL) continue;
-        const tk_type_decl *d = &g_cg_prog.items[i].as.type_decl;
-        if (d->body.tag != TK_BODY_VARIANT) continue;
-        if (cg_name_eq(d->name, name)) return d;
-    }
+    // (#109 W3) delegate bare-or-canonical resolution to cg_find_decl (single source of truth),
+    // then require a VariantBody. cg_find_decl matches exact ns::Name OR bare last-segment.
+    const tk_type_decl *d = cg_find_decl(name);
+    if (d != NULL && d->body.tag == TK_BODY_VARIANT) return d;
     return NULL;
 }
 
@@ -420,33 +439,107 @@ static bool cg_named_is_variant(tk_str name) { return cg_find_variant_decl(name)
 // Is the NAMED type `name` a (declared) ENUM? An enum value is a plain C enum constant (no tag +
 // union), so a `match` over it tests `subj == TK_E_<ENUM>_<MEMBER>`, not the variant `.tag` scheme.
 static bool cg_named_is_enum(tk_str name) {
-    for (size_t i = 0; i < g_cg_prog.nitems; i += 1) {
-        if (g_cg_prog.items[i].tag != TK_TITEM_TYPE_DECL) continue;
-        const tk_type_decl *dd = &g_cg_prog.items[i].as.type_decl;
-        if (cg_name_eq(dd->name, name)) return dd->body.tag == TK_BODY_ENUM;
-    }
-    return false;
+    const tk_type_decl *dd = cg_find_decl(name);
+    return dd != NULL && dd->body.tag == TK_BODY_ENUM;
 }
 
 // (C8.4) Is the NAMED type `name` a (declared) FLAGS? A flags member is a pre-emitted C constant
 // `tk_t_<Name>_<MEMBER>` (power-of-2 unsigned int), not a C enum constant.
 static bool cg_named_is_flags(tk_str name) {
-    for (size_t i = 0; i < g_cg_prog.nitems; i += 1) {
-        if (g_cg_prog.items[i].tag != TK_TITEM_TYPE_DECL) continue;
-        const tk_type_decl *dd = &g_cg_prog.items[i].as.type_decl;
-        if (cg_name_eq(dd->name, name)) return dd->body.tag == TK_BODY_FLAGS;
-    }
-    return false;
+    const tk_type_decl *dd = cg_find_decl(name);
+    return dd != NULL && dd->body.tag == TK_BODY_FLAGS;
 }
 
-// Any TYPE_DECL (struct/variant/enum/alias) named `name`, or NULL.
+// (#109 W3) does span `s` end with the "::"-prefixed qualifier `qual` (i.e. tail == "::" ~ qual)?
+// Mirror of the .tks `teko::runtime::str_ends_with(dns, "::" ~ qual)` — the qualified-path decl-ns
+// suffix test in cg_find_decl_ns. Built inline (no allocation) so codegen.c stays self-contained.
+static bool cg_dns_ends_with_qual(tk_str s, tk_str qual) {
+    size_t suflen = 2 + qual.len;               // "::" + qual
+    if (s.len < suflen) return false;
+    const tk_byte *tail = s.ptr + (s.len - suflen);
+    if (tail[0] != ':' || tail[1] != ':') return false;
+    return qual.len == 0 || memcmp(tail + 2, qual.ptr, qual.len) == 0;
+}
+
+// (#109 W3) any TYPE_DECL (struct/variant/enum/alias) named `name`, or NULL. The typed decl
+// names are CANONICAL "ns::Name"; match a bare-or-canonical `name` by exact OR by bare
+// last-segment (unique in the no-collision case). ns-sensitive callers (emit_type_expr) use
+// cg_find_decl_ns to disambiguate a same-bare-name collision.
 static const tk_type_decl *cg_find_decl(tk_str name) {
+    // (#152) EXACT pass first — a canonical query can never be stolen by a same-bare cousin that
+    // merely appears earlier (discovery order differs per platform). Then the legacy bare
+    // last-segment fallback (unique in the no-collision case).
+    for (size_t e = 0; e < g_cg_prog.nitems; e += 1) {
+        if (g_cg_prog.items[e].tag != TK_TITEM_TYPE_DECL) continue;
+        const tk_type_decl *d = &g_cg_prog.items[e].as.type_decl;
+        if (cg_name_eq(d->name, name)) return d;
+    }
     for (size_t i = 0; i < g_cg_prog.nitems; i += 1) {
         if (g_cg_prog.items[i].tag != TK_TITEM_TYPE_DECL) continue;
         const tk_type_decl *d = &g_cg_prog.items[i].as.type_decl;
-        if (cg_name_eq(d->name, name)) return d;
+        if (cg_name_eq(tk_name_last_segment(d->name), tk_name_last_segment(name))) return d;
     }
     return NULL;
+}
+
+// (#109 W3) canonicalize a (possibly BARE) type name to its declared "ns::Name" so a DIRECT type
+// typedef reference (`tk_t_<canonical>`) matches its definition. A name codegen builds by hand from
+// a syntactic path segment (e.g. a struct-init field's slot type) is bare; the declared type name is
+// canonical. Non-declared names (primitives, type-params, `__g__` instances) have no decl and pass
+// through unchanged. Delegates to cg_find_decl (last-segment aware) — the single source of truth.
+static tk_str cg_canon_name(tk_str name) {
+    const tk_type_decl *d = cg_find_decl(name);
+    return d != NULL ? d->name : name;
+}
+
+// (#109 W3) resolve a SYNTACTIC type path to its decl using the referencing namespace `ref_ns`,
+// against the CANONICAL decl names — so a bare `Reader` in teko::emit binds emit::Reader (not
+// teko::io::Reader). Pass 1: a qualified path matches by last-segment + a decl-ns the qualifier
+// selects; a bare path matches its OWN-ns (ref_ns) decl. Pass 2 (fallback): any last-segment match.
+static const tk_type_decl *cg_find_decl_ns(tk_path path, tk_str ref_ns) {
+    // (#109 W3) the last segment may itself be a CANONICAL "ns::Name" stuffed into ONE segment —
+    // this is what type_to_texpr/mono_named_texpr produce for a resolved Named (e.g. a method's
+    // synthetic receiver `self: teko::checker::Sq`). Strip it to the bare last-segment for matching,
+    // and lift any embedded "::"-qualifier into `qual` so ns precision is preserved.
+    tk_str last_raw = path.segments[path.len - 1].name;
+    tk_str last = tk_name_last_segment(last_raw);
+    tk_str embedded_qual = tk_name_qualifier(last_raw);   // {NULL,0} when last_raw is already bare
+    bool qualified = path.len > 1 || embedded_qual.len > 0;
+    tk_str qual = { NULL, 0 };
+    // Build `qual` from segments[0..len-1] joined by "::" (mirror of the .tks join loop); for a
+    // single-segment canonical name, `qual` is the embedded qualifier instead.
+    cbuf qb = { NULL, 0, 0 };
+    if (path.len > 1) {
+        for (size_t q = 0; q + 1 < path.len; q += 1) {
+            if (q > 0) cb(&qb, "::");
+            cb_str(&qb, path.segments[q].name);
+        }
+        qual = (tk_str){ (const tk_byte *)qb.ptr, qb.len };
+    } else {
+        qual = embedded_qual;
+    }
+    const tk_type_decl *found = NULL;
+    for (size_t i = 0; i < g_cg_prog.nitems && found == NULL; i += 1) {
+        if (g_cg_prog.items[i].tag != TK_TITEM_TYPE_DECL) continue;
+        const tk_type_decl *d = &g_cg_prog.items[i].as.type_decl;
+        if (!cg_name_eq(tk_name_last_segment(d->name), last)) continue;
+        tk_str dns = tk_name_qualifier(d->name);
+        if (qualified) {
+            if (cg_name_eq(dns, qual) || cg_dns_ends_with_qual(dns, qual)) found = d;
+        } else {
+            if (cg_name_eq(dns, ref_ns)) found = d;
+        }
+    }
+    // fallback: any last-segment match (a root-ns type, or the no-collision common case)
+    if (found == NULL) {
+        for (size_t j = 0; j < g_cg_prog.nitems && found == NULL; j += 1) {
+            if (g_cg_prog.items[j].tag != TK_TITEM_TYPE_DECL) continue;
+            const tk_type_decl *d = &g_cg_prog.items[j].as.type_decl;
+            if (cg_name_eq(tk_name_last_segment(d->name), last)) found = d;
+        }
+    }
+    tk_free0(qb.ptr);
+    return found;
 }
 
 static void cb_ident(cbuf *b, tk_str name);      // (W10b.CLASS increment 4) fwd — used by cg_class_cleanup_text
@@ -460,17 +553,53 @@ static bool cg_is_class_named(tk_str name) {
     return d != NULL && d->body.tag == TK_BODY_CLASS;
 }
 
-// (W10b.CLASS increment 4) does `class_name` declare a `destruct(self) -> void` method (own or
-// inherited — tk_type_struct_methods stamps EVERY effective method under the OWNING class's own
-// namespace, so searching for a tk_tfunction named "destruct" whose namespace's last segment is
-// `class_name` finds it either way)? Returns that method's mangled NAMESPACE (for cb_fn_name) via
-// `*out`, true if found. Scoped assumption: one class of a given bare name per program (a name
-// collision across namespaces both with a `destruct` is not disambiguated here).
-static bool cg_find_destruct_ns(tk_str class_name, tk_str *out) {
+// (W10b.D3) is `name` an interface (a contract)? A contract-typed value lowers to the fat
+// pointer `{ data, vtable }` typedef; upcasts and dynamic method calls key off this probe.
+static bool cg_is_interface_named(tk_str name) {
+    const tk_type_decl *d = cg_find_decl(name);
+    return d != NULL && d->body.tag == TK_BODY_INTERFACE;
+}
+
+// (#98) is `name` a POLYMORPHIC BASE — a non-sealed class (`abstract`/`virtual`)? A base-typed
+// value lowers to the SAME fat pointer `{ data, vtable }` as an interface value (a companion
+// `tk_base_<name>` typedef), so a Sub→Base upcast + base-typed dispatch reuse the D3 machinery.
+static bool cg_is_polymorphic_base(tk_str name) {
+    const tk_type_decl *d = cg_find_decl(name);
+    if (d == NULL || d->body.tag != TK_BODY_CLASS) return false;
+    return d->body.as.class_body.kind != TK_CLASS_SEALED;
+}
+
+// (#98) does class `sub` reach ANCESTOR class `want` through the base chain (transitively)?
+// Codegen mirror of the checker's subclass_reaches — used to decide when a class value at a
+// base-typed slot is a STRICT-subclass upcast (needs the fat-pointer wrap). Hop-bounded.
+static bool cg_subclass_reaches(tk_str sub, tk_str want, int depth) {
+    if (depth <= 0) return false;
+    const tk_type_decl *d = cg_find_decl(sub);
+    if (d == NULL || d->body.tag != TK_BODY_CLASS) return false;
+    const tk_class_body *cb2 = &d->body.as.class_body;
+    if (!cb2->has_base) return false;
+    // (#109 W3) `base_name` is the BARE source `extends` name; `want` may be the CANONICAL
+    // "ns::Name" of a base-typed slot — compare by bare last-segment.
+    // (#152) EXACT when BOTH qualified (base_name arrives canonical from canon_class_bases); bare-compat otherwise.
+    if (tk_name_qualifier(cb2->base_name).len > 0 && tk_name_qualifier(want).len > 0) {
+        if (cg_name_eq(cb2->base_name, want)) return true;
+    } else {
+        if (cg_name_eq(tk_name_last_segment(cb2->base_name), tk_name_last_segment(want))) return true;
+    }
+    return cg_subclass_reaches(cb2->base_name, want, depth - 1);
+}
+
+// (W10b.D3, generalized from increment 4's destruct lookup) does `class_name` provide a method
+// named `method` (own or inherited — tk_type_struct_methods stamps EVERY effective method under
+// the OWNING class's own namespace, so searching for a tk_tfunction named `method` whose
+// namespace's last segment is `class_name` finds it either way)? Returns that method's mangled
+// NAMESPACE (for cb_fn_name) via `*out`, true if found. Scoped assumption: one class of a given
+// bare name per program (a name collision across namespaces is not disambiguated here).
+static bool cg_find_method_ns(tk_str class_name, tk_str method, tk_str *out) {
     for (size_t i = 0; i < g_cg_prog.nitems; i += 1) {
         if (g_cg_prog.items[i].tag != TK_TITEM_FUNCTION) continue;
         const tk_tfunction *tf = &g_cg_prog.items[i].as.function;
-        if (!cg_name_eq(tf->name, (tk_str){ (const tk_byte *)"destruct", 8 })) continue;
+        if (!cg_name_eq(tf->name, method)) continue;
         if (cg_name_eq(tf->namespace, class_name)) { *out = tf->namespace; return true; }
         // namespace ends with "::" + class_name?
         tk_byte sepbuf[2] = { ':', ':' };
@@ -484,6 +613,12 @@ static bool cg_find_destruct_ns(tk_str class_name, tk_str *out) {
         }
     }
     return false;
+}
+
+// (W10b.CLASS increment 4) does `class_name` declare a `destruct(self) -> void` method (own or
+// inherited)? The destruction hook's lookup — now a thin wrapper over cg_find_method_ns.
+static bool cg_find_destruct_ns(tk_str class_name, tk_str *out) {
+    return cg_find_method_ns(class_name, (tk_str){ (const tk_byte *)"destruct", 8 }, out);
 }
 
 // (W10b.CLASS increment 4) THE DESTRUCTION HOOK text: for every TOP-LEVEL `let`/`mut` binding in
@@ -631,10 +766,17 @@ static bool cg_te_reaches_byvalue(tk_type_expr te, tk_str to, cg_nameset *seen) 
         case TK_TEXPR_NAMED: {
             tk_str base = te.as.named.path.segments[te.as.named.path.len - 1].name;
             if (cg_is_prim_name(base)) return false;
+            // (#122) a CLASS is a REFERENCE type — every use lowers to a POINTER (emit_type_expr),
+            // so a class-named edge (`C`, `C?`, `C` inside a variant) is a POINTER edge, not a
+            // by-value one; it can NEVER close a by-value size cycle. Treat it like a slice. Without
+            // this, a self-referencing class-optional field (`next: Node?` on class `Node`) is
+            // wrongly flagged boxed → the field becomes `tk_opt_Node *` while every construct/read
+            // site emits it by value (`tk_opt_Node`), and cc rejects the pointer/value mismatch (#122).
+            if (cg_is_class_named(base)) return false;
             // (S4) a generic-type USE reaches its concrete instance `Box__g__i64`, not the template.
             tk_str y = base; cbuf k = { NULL, 0, 0 };
             if (te.as.named.args_len > 0) { cg_texpr_mangle(&k, te); y = (tk_str){ (const tk_byte *)k.ptr, k.len }; }
-            bool res = cg_name_eq(y, to) ? true : cg_name_reaches_byvalue(y, to, seen);
+            bool res = cg_name_eq(tk_name_last_segment(y), tk_name_last_segment(to)) ? true : cg_name_reaches_byvalue(y, to, seen);   /* (#109 W3) compare bare */
             if (k.ptr) tk_free0(k.ptr);
             return res;
         }
@@ -678,19 +820,39 @@ static bool cg_field_boxed(tk_str sname, tk_type_expr fte) {
     return cg_te_reaches_byvalue(fte, sname, &seen);   // does the field's by-value content reach back?
 }
 
-// Look up the declared type_expr of field `fname` in struct named `sname` from g_cg_prog.
-// Returns true + sets *out if found; false if the struct or field is absent.
+// Look up the declared type_expr of field `fname` in aggregate named `sname` from g_cg_prog.
+// Returns true + sets *out if found; false if the aggregate or field is absent.
+// (#122) A CLASS (TK_BODY_CLASS) shares the struct field layout, so its fields are looked up
+// here too — otherwise a class field's null/sentinel initializer (`f = null`, `f = []`) never
+// finds its declared `T?`/`[]T` slot type and falls through to the raw-`null` codegen error.
+// Classes use the EFFECTIVE (base-inherited) field set so an optional field declared on an
+// ancestor is found from a derived class's construction — matching emit_type_decl's class body.
 static bool cg_find_struct_field_type(tk_str sname, tk_str fname, tk_type_expr *out) {
     for (size_t i = 0; i < g_cg_prog.nitems; i += 1) {
         if (g_cg_prog.items[i].tag != TK_TITEM_TYPE_DECL) continue;
         const tk_type_decl *d = &g_cg_prog.items[i].as.type_decl;
-        if (d->body.tag != TK_BODY_STRUCT) continue;
-        if (!cg_name_eq(d->name, sname)) continue;
-        for (size_t j = 0; j < d->body.as.struct_body.n_fields; j += 1) {
-            if (cg_name_eq(d->body.as.struct_body.fields[j].name, fname)) {
-                *out = d->body.as.struct_body.fields[j].type_ann;
-                return true;
+        if (!cg_name_eq(d->name, sname)
+            && !cg_name_eq(tk_name_last_segment(d->name), tk_name_last_segment(sname))) continue;
+        if (d->body.tag == TK_BODY_STRUCT) {
+            for (size_t j = 0; j < d->body.as.struct_body.n_fields; j += 1) {
+                if (cg_name_eq(d->body.as.struct_body.fields[j].name, fname)) {
+                    *out = d->body.as.struct_body.fields[j].type_ann;
+                    return true;
+                }
             }
+            return false;
+        }
+        if (d->body.tag == TK_BODY_CLASS) {
+            tk_type_table table = tk_type_table_of(g_cg_prog);
+            tk_fieldsvec_result eff = tk_effective_class_fields(d->body.as.class_body, table);
+            if (!eff.ok) return false;
+            for (size_t j = 0; j < eff.as.value.len; j += 1) {
+                if (cg_name_eq(eff.as.value.ptr[j].name, fname)) {
+                    *out = eff.as.value.ptr[j].type_ann;
+                    return true;
+                }
+            }
+            return false;
         }
     }
     return false;
@@ -762,6 +924,10 @@ static bool emit_type(cbuf *b, tk_type t, const char **err) {
         // (W10b.CLASS increment 3) a CLASS is a REFERENCE type — every use (locals, call-arg
         // types read off .type, …) lowers to a pointer, same rule as emit_type_expr.
         case TK_TYPE_NAMED:
+            // (#98) a POLYMORPHIC-BASE-typed slot is the fat pointer `tk_base_<name>` (data +
+            // vtable), NOT the raw object pointer — so a Sub→Base upcast + base-typed dispatch
+            // reuse the D3 fat pointer. (An interface-typed slot is likewise its fat typedef.)
+            if (cg_is_polymorphic_base(t.as.named.name)) { cb(b, "tk_base_"); cb_tysym(b, t.as.named.name); return true; }
             mangle_type_name(b, (tk_str){ NULL, 0 }, t.as.named.name);
             if (cg_is_class_named(t.as.named.name)) cb(b, " *");
             return true;
@@ -815,7 +981,6 @@ static bool cg_emit_fnptr_sig_ex(cbuf *b, tk_type t, bool with_env, const char *
     cb(b, ")");
     return true;
 }
-static bool cg_emit_fnptr_sig(cbuf *b, tk_type t, const char **err) { return cg_emit_fnptr_sig_ex(b, t, false, err); }
 
 // (W10) emit a CLOSURE CALL through a `tk_closure` value as a GNU statement-expression that evaluates
 // each argument ONCE and DISPATCHES on `env`: a NON-capturing/named-fn closure (env == NULL) uses the
@@ -883,11 +1048,17 @@ static bool cg_opt_mangle(cbuf *b, tk_type inner, const char **err) {
         case TK_TYPE_CHAR:  cb(b, "char");  return true;
         case TK_TYPE_STR:   cb(b, "str");   return true;
         case TK_TYPE_ERROR: cb(b, "error"); return true;
-        case TK_TYPE_NAMED: cb_str(b, inner.as.named.name); return true;
+        case TK_TYPE_NAMED: cb_str(b, tk_name_last_segment(inner.as.named.name)); return true;   // (#109 W3) BARE key — matches the syntactic mangle; keeps tk_u_/tk_slice_/tk_opt_ valid C
         case TK_TYPE_OPTIONAL:
             if (inner.as.optional.inner == NULL) return fail_node(err, "codegen: nested bare-null optional (internal)");
             cb(b, "opt_"); return cg_opt_mangle(b, *inner.as.optional.inner, err);
-        default: return fail_node(err, "codegen: optional inner type not yet supported");
+        // NESTED SLICE (#81) — a `[]T` in an element/inner position mangles to `slice_<elem>`
+        // (the SAME key cg_member_key already uses for a slice variant member), so `[][]T`
+        // lowers to tk_slice_slice_<elem> and every use agrees with the collected typedef.
+        case TK_TYPE_SLICE:
+            if (inner.as.slice.element == NULL) return fail_node(err, "codegen: an untyped empty slice needs a known element type from context (internal)");
+            cb(b, "slice_"); return cg_opt_mangle(b, *inner.as.slice.element, err);
+        default: return fail_node(err, "codegen: optional/slice inner type not yet supported");
     }
 }
 
@@ -1036,7 +1207,7 @@ static void cg_texpr_mangle(cbuf *b, tk_type_expr te) {
     }
 }
 
-static bool emit_type_expr(cbuf *b, tk_type_expr te, const char **err) {
+static bool emit_type_expr(cbuf *b, tk_type_expr te, tk_str ref_ns, const char **err) {
     switch (te.tag) {
         case TK_TEXPR_NAMED: {
             tk_path p = te.as.named.path;
@@ -1060,22 +1231,24 @@ static bool emit_type_expr(cbuf *b, tk_type_expr te, const char **err) {
             else if (seg_is(last, "str"))   { cb(b, "tk_str");            return true; }
             else if (seg_is(last, "error")) { cb(b, "tk_error"); return true; }   // error → runtime tk_error struct (E2-NATIVE)
             else if (seg_is(last, "ptr"))   {   // ptr<T> → <T> * ; ptr → void *
-                if (te.as.named.args_len > 0) { if (!emit_type_expr(b, te.as.named.args[0], err)) return false; cb(b, " *"); return true; }
+                if (te.as.named.args_len > 0) { if (!emit_type_expr(b, te.as.named.args[0], ref_ns, err)) return false; cb(b, " *"); return true; }
                 cb(b, "void *"); return true;
             }
             else if (seg_is(last, "uptr"))  { cb(b, "uintptr_t");         return true; }   // (C7.1a) opaque word-size unsigned
             else if (seg_is(last, "Ref"))   {   // (MEM-1b) Ref<T> → <T> *
-                if (te.as.named.args_len > 0) { if (!emit_type_expr(b, te.as.named.args[0], err)) return false; cb(b, " *"); return true; }
+                if (te.as.named.args_len > 0) { if (!emit_type_expr(b, te.as.named.args[0], ref_ns, err)) return false; cb(b, " *"); return true; }
                 return fail_node(err, "`Ref<T>` needs a type argument");
             }
+            // (#109 W3) resolve the SYNTACTIC path to its canonical decl in `ref_ns` — so a bare
+            // `Reader` in teko::emit binds emit::Reader (not io::Reader), and the decl's CANONICAL
+            // name (`teko::emit::Reader`) drives every mangle, matching the decl-side typedef.
+            const tk_type_decl *rd = cg_find_decl_ns(p, ref_ns);
+            tk_str cdname = rd != NULL ? rd->name : last;
             // a TRANSPARENT alias (`type Name = <type-expr>`) emits NO C type of its own — resolve
             // through to the aliased type-expr at every use site (e.g. a `TypeTable` field = []TypeReg
             // → tk_slice_TypeReg). Matches the checker, which resolves aliases transparently.
-            {
-                const tk_type_decl *ad = cg_find_decl(last);
-                if (ad != NULL && ad->body.tag == TK_BODY_ALIAS)
-                    return emit_type_expr(b, ad->body.as.alias_body.alias, err);
-            }
+            if (rd != NULL && rd->body.tag == TK_BODY_ALIAS)
+                return emit_type_expr(b, rd->body.as.alias_body.alias, ref_ns, err);
             // (S4) a generic-type USE `Box<i64>` → the concrete instance typedef `tk_t_Box__g__i64`
             // (the mangled name matches checker::generic_inst_name, so decl + ref agree).
             if (te.as.named.args_len > 0) { cb(b, "tk_t_"); cg_texpr_mangle(b, te); return true; }
@@ -1085,9 +1258,14 @@ static bool emit_type_expr(cbuf *b, tk_type_expr te, const char **err) {
             // the ONE place that decision fans out from: params, returns, fields, locals all call
             // emit_type_expr, so a class becomes `tk_t_Name *` everywhere with no special-casing
             // at each call site.
-            if (cg_is_class_named(last)) { mangle_type_name(b, (tk_str){ NULL, 0 }, last); cb(b, " *"); return true; }
+            // (#98) a POLYMORPHIC-BASE-typed annotation (`s: Animal`, `-> Animal`, a field of base
+            // type) is the fat pointer `tk_base_<name>`, matching emit_type — so a base-typed
+            // param/return/field reuses the D3 fat pointer. A sealed class stays a raw pointer.
+            // (#109 W3) mangle the CANONICAL cdname (":: → __").
+            if (cg_is_polymorphic_base(cdname)) { cb(b, "tk_base_"); cb_tysym(b, cdname); return true; }
+            if (rd != NULL && rd->body.tag == TK_BODY_CLASS) { mangle_type_name(b, (tk_str){ NULL, 0 }, cdname); cb(b, " *"); return true; }
             // a user-defined named aggregate -> its mangled typedef name (matches emit_type).
-            mangle_type_name(b, (tk_str){ NULL, 0 }, last);
+            mangle_type_name(b, (tk_str){ NULL, 0 }, cdname);
             return true;
         }
         // SLICE `[]T` in a SIGNATURE / field position → the generated `tk_slice_<elem>` struct
@@ -1262,6 +1440,51 @@ static bool cg_stmt_c_terminates(const tk_tstatement *s);  // (W9.3) fwd — use
 // no wrap because its struct value already carries the case name — this synthesizes the
 // C wrap, completing the W4c-deferred variant-value layer.)
 static bool emit_as(cbuf *b, tk_type expected, const tk_texpr *value, const char **err);
+
+// (W10b.D3) a DYNAMIC contract-method call through an interface value's vtable, as a GNU
+// statement-expression: bind the receiver ONCE (args[0] — a class instance is upcast on the fly
+// by emit_as, an interface value passes through), then cast slot `iface_slot`'s code pointer to
+// the method's concrete C signature — `R (*)(void *, params…)`, the receiver riding as the
+// ABI-identical `void *` data word — and call it. Rides emit_closure_call's cast-and-call scheme
+// (the tk_closure machinery the plan's D3 row names). Mirror of codegen.tks::emit_iface_call.
+static bool emit_iface_call(cbuf *b, const tk_texpr *e, const char **err) {
+    tk_path p = e->as.call.callee;
+    tk_type ift = e->as.call.callee_type;
+    if (p.len < 2 || ift.tag != TK_TYPE_FUNC || e->as.call.nargs == 0 || e->as.call.nargs != ift.as.func.nparams)
+        return fail_node(err, "codegen: malformed interface-dispatch node (internal)");
+    // (#109 W3) the callee path segment is the interface's BARE name; canonicalize it to the
+    // declared "ns::Iface" so the fat-pointer typedef (`tk_t_<canonical>`) and the (class,iface)
+    // vtable ref (`tk_vt_<Class>_<canonical>`) both key off the SAME C symbol their definitions use.
+    tk_str iface_raw = p.segments[p.len - 2].name;
+    const tk_type_decl *iface_decl = cg_find_decl(iface_raw);
+    tk_str iface = iface_decl != NULL ? iface_decl->name : iface_raw;
+    char t[40]; snprintf(t, sizeof t, "_tid%zu", (size_t)b->len);
+    tk_type iface_t = { .tag = TK_TYPE_NAMED, .as.named.name = iface };
+    cb(b, "({ ");
+    // (#98) the receiver temp's C type is the fat-pointer typedef of the dispatch target — the
+    // interface typedef `tk_t_<iface>` OR, for a base-class dispatch, `tk_base_<base>`. Route
+    // through emit_type (not raw mangle_type_name, which would emit the base's OBJECT struct).
+    if (!emit_type(b, iface_t, err)) return false;
+    cb(b, " "); cb(b, t); cb(b, " = ");
+    if (!emit_as(b, iface_t, &e->as.call.args[0], err)) return false;
+    cb(b, "; ((");
+    if (!emit_type(b, *ift.as.func.ret, err)) return false;
+    cb(b, " (*)(void *");
+    for (size_t i = 1; i < ift.as.func.nparams; i += 1) {
+        cb(b, ", ");
+        if (!emit_type(b, ift.as.func.params[i], err)) return false;
+    }
+    cb(b, "))");
+    cb(b, t); cb(b, ".vtable[");
+    cb_u64_dec(b, (uint64_t)e->as.call.iface_slot);
+    cb(b, "])("); cb(b, t); cb(b, ".data");
+    for (size_t i = 1; i < e->as.call.nargs; i += 1) {
+        cb(b, ", ");
+        if (!emit_as(b, ift.as.func.params[i], &e->as.call.args[i], err)) return false;
+    }
+    cb(b, "); })");
+    return true;
+}
 // Host-FFI lifting (Phase 7): a builtin whose Teko return is `T|error` / `error?` / `[]str`
 // is emitted as a statement-expression that calls a fixed-ABI runtime primitive (teko_rt.h)
 // and lifts the result into the program's generated result type (e->type). Defined after the
@@ -1437,6 +1660,20 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
                 cb(b, "((uint8_t)"); cb_i128(b, e->as.number.value); cb(b, ")");
                 return true;
             }
+            // (#63) A FLAGS-typed number literal — the checker's fabricated zero in the
+            // any/none lowering (type_flags_method, expr.c) — is a NAMED type whose decl is
+            // `flags`. Emit it cast to the flags' own typedef'd carrier (`tk_t_<Name>`, the
+            // SAME uint chosen by member count as the flags typedef itself emits — TK_BODY_FLAGS
+            // above), so this reuses that carrier via its typedef name instead of re-deriving
+            // uint8_t/uint16_t/… a second time. Mirrors vm.c's flags_carrier_prim (VM twin, #50).
+            if (e->type.tag == TK_TYPE_NAMED && cg_named_is_flags(e->type.as.named.name)) {
+                cb(b, "((");
+                mangle_type_name(b, (tk_str){ NULL, 0 }, e->type.as.named.name);
+                cb(b, ")");
+                cb_i128(b, e->as.number.value);
+                cb(b, ")");
+                return true;
+            }
             // The node's resolved prim decides width / float-kind (N1/N2). A non-prim
             // number type is a checker bug, but be honest rather than mis-emit (M.3).
             if (e->type.tag != TK_TYPE_PRIM)
@@ -1526,6 +1763,25 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
                         return true;
                     }
                 }
+            }
+            // #49 — SHL/SHR on INTEGER prims route through tk_shl_*/tk_shr_* helpers
+            // (teko_rt.h) that mask the shift count by (width - 1), giving a DEFINED
+            // result for an out-of-range count instead of C UB (matches vm.c's
+            // eval_binary mask exactly). Bitwise/float shift is checker-rejected, so
+            // reaching here with a non-integer result type is an internal invariant break.
+            if (bop == TK_TOKEN_SHL || bop == TK_TOKEN_SHR) {
+                if (e->type.tag != TK_TYPE_PRIM || !cg_prim_is_int(e->type.as.prim))
+                    return fail_node(err, "codegen: shift on a non-integer type not yet supported");
+                const char *tag = prim_int_tag(e->type.as.prim);
+                if (tag == NULL) return fail_node(err, "codegen: shift on a non-integer type not yet supported");
+                cb(b, bop == TK_TOKEN_SHL ? "tk_shl_" : "tk_shr_");
+                cb(b, tag);
+                cb(b, "(");
+                if (!emit_expr(b, e->as.binary.left,  err)) return false;
+                cb(b, ", ");
+                if (!emit_expr(b, e->as.binary.right, err)) return false;
+                cb(b, ")");
+                return true;
             }
             const char *op = binop_c(bop);
             if (op == NULL) return fail_node(err, "codegen: binary operator not yet supported");
@@ -1661,6 +1917,19 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
         }
 
         case TK_TEXPR_CALL: {
+            // (W10b.D3) a DYNAMIC contract-method call dispatches through the receiver's vtable —
+            // FIRST, before any builtin name-sniffing below could collide with a method name.
+            if (e->as.call.is_iface_dispatch) return emit_iface_call(b, e, err);
+            // (#107) a CLOSURE call (the checker resolved the callee to an in-scope local/param/
+            // let-bound function VALUE, not a namespace fn) ALSO goes first, before any of the
+            // builtin/host-FFI name-sniffing blocks below: those match by BARE last-segment name
+            // only (`write`, `print`, `len`, …) with no scope awareness, so a closure-typed
+            // binding sharing one of those reserved names (e.g. a `write: WFn` param in a
+            // namespace that also has an extern `write`) would otherwise be hijacked into the
+            // builtin/extern call instead of calling the closure VALUE — the checker already
+            // proved `is_closure_call` (tk_env_lookup_call scans innermost-first, so the local
+            // always wins over the namespace fn); codegen just has to respect that verdict.
+            if (e->as.call.is_closure_call) return emit_closure_call(b, e, err);
             // callee path -> C identifier joined by "__" (single-segment in M0).
             tk_path p = e->as.call.callee;
             // E2 (native): err_loc/err_typed adorn an error VALUE with diagnostic position/types.
@@ -1688,6 +1957,32 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
                     cb(b, ", ");
                     if (!emit_expr(b, &e->as.call.args[2], err)) return false;
                     cb(b, ")");
+                    return true;
+                }
+                // (#148 R2) teko::mem::append_fo(dst: []byte, src: str) -> []byte — BULK append with
+                // free-old BY DECREE (linear builder chains only; TEKO_MEM_PARANOID is the guard).
+                // Bridge like str(): single-eval temps, then the runtime call over raw {ptr,len} pairs.
+                if ((p.len == 1 || seg_is(p.segments[0].name, "teko"))
+                    && seg_is(pe, "append_fo") && e->as.call.nargs == 2) {
+                    char ab[40], asr[40], al[40], ap[40];
+                    snprintf(ab, sizeof ab, "_ab%zu", (size_t)b->len);
+                    snprintf(asr, sizeof asr, "_as%zu", (size_t)b->len + 1);
+                    snprintf(al, sizeof al, "_al%zu", (size_t)b->len + 2);
+                    snprintf(ap, sizeof ap, "_ap%zu", (size_t)b->len + 3);
+                    tk_type byte_el = { .tag = TK_TYPE_BYTE };
+                    tk_type bytes_ty = { .tag = TK_TYPE_SLICE, .as.slice.element = &byte_el };
+                    tk_type str_ty = { .tag = TK_TYPE_STR };
+                    cb(b, "({ ");
+                    if (!cg_slice_typename(b, byte_el, err)) return false;
+                    cb(b, " "); cb(b, ab); cb(b, " = ");
+                    if (!emit_as(b, bytes_ty, &e->as.call.args[0], err)) return false;
+                    cb(b, "; tk_str "); cb(b, asr); cb(b, " = ");
+                    if (!emit_as(b, str_ty, &e->as.call.args[1], err)) return false;
+                    cb(b, "; uint64_t "); cb(b, al); cb(b, "; uint8_t *"); cb(b, ap);
+                    cb(b, " = (uint8_t *)tk_append_bytes_fo("); cb(b, ab); cb(b, ".ptr, "); cb(b, ab); cb(b, ".len, "); cb(b, asr); cb(b, ".ptr, "); cb(b, asr); cb(b, ".len, &"); cb(b, al);
+                    cb(b, "); (");
+                    if (!cg_slice_typename(b, byte_el, err)) return false;
+                    cb(b, "){ .ptr = "); cb(b, ap); cb(b, ", .len = "); cb(b, al); cb(b, " }; })");
                     return true;
                 }
                 // Phase 3 — `str`/`str_of_bytes` (([]byte) -> str). A []byte lowers to the generated
@@ -1735,8 +2030,18 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
             // here directly means a context-less empty (honest error). `push(base, item)` lowers
             // to an inline copy-append GNU stmt-expr (alloc len+1 via malloc/abort — M.1 — copy
             // the old elements, append a COPY of item, yield the fresh tk_slice_<elem>).
-            if (p.len >= 2 && seg_is(p.segments[0].name, "teko")
-                           && seg_is(p.segments[p.len - 2].name, "list")) {
+            // (#148 R3) teko::mem::push_fo(base, item) — push with FREE-OLD BY DECREE: the CALLER
+            // asserts the base is a linear chain (the old buffer is unreferenced after the grow),
+            // so the grow routes "@fo" → tk_slice_push_fo, which parks the superseded buffer on
+            // the free-list. Typing/semantics are teko::list::push's; only the allocation strategy
+            // differs. Selecting "@fo" via g_cg_push_frame reuses the shared push emitter below
+            // (which captures then clears the global). (Mirror of codegen.tks, which threads the
+            // "@fo" frame to emit_list_push explicitly.)
+            bool is_pushfo = p.len >= 2 && seg_is(p.segments[p.len - 2].name, "mem")
+                                        && seg_is(p.segments[p.len - 1].name, "push_fo");
+            if (is_pushfo) g_cg_push_frame = "@fo";
+            if (is_pushfo || (p.len >= 2 && seg_is(p.segments[0].name, "teko")
+                           && seg_is(p.segments[p.len - 2].name, "list"))) {
                 tk_str llast = p.segments[p.len - 1].name;
                 if (seg_is(llast, "empty")) {
                     if (e->type.tag == TK_TYPE_SLICE && e->type.as.slice.element != NULL) {
@@ -1746,7 +2051,7 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
                     }
                     return fail_node(err, "codegen: teko::list::empty() needs a known slice type from context (annotate the binding)");
                 }
-                if (seg_is(llast, "push")) {
+                if (seg_is(llast, "push") || is_pushfo) {
                     tk_type st = e->type;   // the push result type is []elem
                     if (st.tag != TK_TYPE_SLICE)
                         return fail_node(err, "codegen: teko::list::push result is not a slice (internal)");
@@ -1779,6 +2084,10 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
                     snprintf(iN, sizeof iN, "_si%zu", (size_t)b->len + 1);
                     snprintf(pN, sizeof pN, "_sp%zu", (size_t)b->len + 2);
                     snprintf(lN, sizeof lN, "_sl%zu", (size_t)b->len + 3);
+                    // (S2 Level-1) capture the routing frame for THIS push, then clear the global so a
+                    // nested push inside the base/item args falls back to root (mirror of the Teko twin,
+                    // which threads `frame` to the OUTER push only, not through emit_as of the args).
+                    const char *push_frame = g_cg_push_frame; g_cg_push_frame = "";
                     cb(b, "({ ");
                     if (!cg_slice_typename(b, elem, err)) return false; cb(b, " "); cb(b, bN); cb(b, " = ");
                     // Use emit_as so a sentinel empty() arg is lowered to the concrete empty literal.
@@ -1789,13 +2098,47 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
                     cb(b, "uint64_t "); cb(b, lN); cb(b, "; ");
                     if (!emit_type(b, elem, err)) return false; cb(b, " *"); cb(b, pN);
                     cb(b, " = ("); if (!emit_type(b, elem, err)) return false;
-                    cb(b, " *)tk_slice_push("); cb(b, bN); cb(b, ".ptr, "); cb(b, bN); cb(b, ".len, &"); cb(b, iN);
-                    cb(b, ", sizeof("); if (!emit_type(b, elem, err)) return false; cb(b, "), &"); cb(b, lN); cb(b, "); (");
+                    // (S2 Level-1/-2) routing selector: "@fo" → free-old (proven linear chain);
+                    // other non-empty → grow into that frame region; empty → root.
+                    { int fo = push_frame[0] == '@';
+                      cb(b, fo ? " *)tk_slice_push_fo(" : push_frame[0] ? " *)tk_slice_push_r(" : " *)tk_slice_push("); cb(b, bN); cb(b, ".ptr, "); cb(b, bN); cb(b, ".len, &"); cb(b, iN);
+                      cb(b, ", sizeof("); if (!emit_type(b, elem, err)) return false; cb(b, "), &"); cb(b, lN);
+                      if (push_frame[0] && !fo) { cb(b, ", "); cb(b, push_frame); } }
+                    cb(b, "); (");
                     if (!cg_slice_typename(b, elem, err)) return false;
                     cb(b, "){ .ptr = "); cb(b, pN); cb(b, ", .len = "); cb(b, lN); cb(b, " }; })");
                     return true;
                 }
                 return fail_node(err, "codegen: this teko::list builtin not yet supported (only empty/push — fixed+copy)");
+            }
+            // (mem::free) teko::mem::free(x) → void stmt-expr: reclaim x's heap block + SCRUB the
+            // binding (slice→empty, class→NULL) so a later read never sees the freed buffer. The
+            // checker proved x is a mutable heap variable. (Mirror of codegen.tks::emit_mem_free.)
+            if (p.len >= 2 && seg_is(p.segments[p.len - 2].name, "mem") && seg_is(p.segments[p.len - 1].name, "free")) {
+                tk_type at = e->as.call.args[0].type;
+                if (at.tag == TK_TYPE_SLICE) {
+                    cb(b, "({ tk_free_block((void *)(");
+                    if (!emit_expr(b, &e->as.call.args[0], err)) return false;
+                    cb(b, ").ptr, (");
+                    if (!emit_expr(b, &e->as.call.args[0], err)) return false;
+                    cb(b, ").len * sizeof(");
+                    if (!emit_type(b, *at.as.slice.element, err)) return false;
+                    cb(b, ")); (");
+                    if (!emit_expr(b, &e->as.call.args[0], err)) return false;
+                    cb(b, ") = (");
+                    if (!cg_slice_typename(b, *at.as.slice.element, err)) return false;
+                    cb(b, "){0}; })");
+                    return true;
+                }
+                if (at.tag == TK_TYPE_NAMED) {   // a class instance — drop its region, null the handle
+                    cb(b, "({ tk_region_drop((");
+                    if (!emit_expr(b, &e->as.call.args[0], err)) return false;
+                    cb(b, ")->__region); (");
+                    if (!emit_expr(b, &e->as.call.args[0], err)) return false;
+                    cb(b, ") = NULL; })");
+                    return true;
+                }
+                return fail_node(err, "codegen: mem::free on a non-heap type (internal — checker must gate)");
             }
             // Host-FFI bottoms with a VARIANT/OPTIONAL or argv return: lifted from a fixed-ABI
             // runtime result into the program's result type (the runtime can't name the generated
@@ -1810,12 +2153,14 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
                     if (seg_is(l, "write_file"))    return emit_host_ffi(b, CG_FFI_URES,   "tk_rt_write_file",    e, err);
                     if (seg_is(l, "chdir"))         return emit_host_ffi(b, CG_FFI_URES,   "tk_rt_chdir",         e, err);
                     if (seg_is(l, "mkdir"))         return emit_host_ffi(b, CG_FFI_URES,   "tk_rt_mkdir",         e, err);
+                    if (seg_is(l, "remove_file"))   return emit_host_ffi(b, CG_FFI_URES,   "tk_rt_remove_file",   e, err);   // (issue #79) delete a file (idempotent)
                     if (seg_is(l, "cwd"))           return emit_host_ffi(b, CG_FFI_SRES,   "tk_rt_getcwd",        e, err);
                     if (seg_is(l, "set_var"))       return emit_host_ffi(b, CG_FFI_URES,   "tk_rt_setenv",        e, err);
                     if (seg_is(l, "list_dir"))      return emit_host_ffi(b, CG_FFI_SLRES,  "tk_rt_list_dir",      e, err);
                     if (seg_is(l, "last_index_of")) return emit_host_ffi(b, CG_FFI_U64RES, "tk_rt_last_index_of", e, err);
                     if (seg_is(l, "args"))          return emit_host_ffi(b, CG_FFI_ARGS,   "tk_rt_args",          e, err);
                     if (seg_is(l, "run"))           return emit_host_ffi(b, CG_FFI_RUN,    "tk_rt_run",           e, err);
+                    if (seg_is(l, "run_quiet"))     return emit_host_ffi(b, CG_FFI_RUN,    "tk_rt_run_quiet",     e, err);   // (issue #73) cc flag-family probe
                     if (seg_is(l, "bytes_from_ptr"))   return emit_host_ffi(b, CG_FFI_BYTES,            "tk_bytes_from_ptr",       e, err);   // (C7.1a) ptr+len -> []byte (slice-lift)
                     if (seg_is(l, "write_file_bytes")) return emit_host_ffi(b, CG_FFI_URES_BYTESLICE, "tk_rt_write_file_bytes",  e, err);   // C7.12: (str, []byte) -> error?
                     if (seg_is(l, "str_from_utf8"))    return emit_host_ffi(b, CG_FFI_SRES_BYTESLICE, "tk_rt_str_from_utf8",     e, err);   // ROUND 0: ([]byte) -> str | error
@@ -1862,6 +2207,8 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
                     else if (seg_is(last, "cov_line_reset"))  builtin = "tk_cov_line_reset";  // () -> void
                     else if (seg_is(last, "cov_line"))        builtin = "tk_cov_line";        // (u32) -> void
                     else if (seg_is(last, "cov_line_hit"))    builtin = "tk_cov_line_hit";    // (u64,u32) -> bool
+                    else if (seg_is(last, "arena_push"))      builtin = "tk_arena_push";      // (#109 test-gate memory) () -> void
+                    else if (seg_is(last, "arena_pop"))       builtin = "tk_arena_pop";       // () -> void
                     // diverging runtime panic helpers (the corpus calls these by bare name)
                     else if (seg_is(last, "panic_div0"))     builtin = "tk_panic_div0";
                     else if (seg_is(last, "panic_oob"))      builtin = "tk_panic_oob";
@@ -1924,6 +2271,8 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
                     else if (seg_is(last, "as_cstr"))       builtin = "tk_cstr_dup";       // (str) -> ptr (fresh NUL-terminated copy)
                     else if (seg_is(last, "str_from_cstr")) builtin = "tk_str_from_cstr";  // (ptr) -> str (copy a C string back)
                     else if (seg_is(last, "os"))            builtin = "tk_rt_os";         // () -> str (host OS — C7.1f)
+                    else if (seg_is(last, "version"))       builtin = "tk_rt_version";    // () -> str (build version — CLI --version)
+                    else if (seg_is(last, "peak_rss"))      builtin = "tk_peak_rss";      // (#148) () -> u64 — peak RSS in bytes
                     // (err_loc/err_typed handled at the top of this CALL case — they call
                     //  tk_error_loc / tk_error_types on the full tk_error struct — E2-NATIVE.)
                 }
@@ -1943,13 +2292,11 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
                     // call agree and same-named functions across namespaces never collide.
                     cb_fn_name(b, e->as.call.call_ns, p.segments[p.len - 1].name);
                 }
-            } else if (e->as.call.is_closure_call) {
-                // (W10) call THROUGH a tk_closure VALUE — a single-eval statement-expression that
-                // dispatches on `env` (no-env ABI for named/non-capturing; env-first for capturing).
-                return emit_closure_call(b, e, err);
             } else {
                 // No resolved namespace (a builtin, or a name not carried) → the bare
-                // (keyword-escaped) last segment.
+                // (keyword-escaped) last segment. (A closure call never reaches here — the (#107)
+                // is_closure_call guard at the top of this CALL case already returned via
+                // emit_closure_call.)
                 cb_ident(b, p.segments[p.len - 1].name);
             }
             // A resolved USER call: wrap each arg into its parameter type (emit_as) so a bare case
@@ -1969,7 +2316,7 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
                         if (e->as.call.args[i].type.tag != TK_TYPE_REF) cb(b, "&");
                         if (!emit_expr(b, &e->as.call.args[i], err)) return false;
                     } else {
-                        tk_type exp = { .tag = TK_TYPE_NAMED, .as.named.name = pn };
+                        tk_type exp = { .tag = TK_TYPE_NAMED, .as.named.name = cg_canon_name(pn) };
                         if (!emit_as(b, exp, &e->as.call.args[i], err)) return false;
                     }
                 } else if (cf != NULL && i < cf->nparams && cf->params[i].type_ann.tag == TK_TEXPR_OPTIONAL
@@ -1985,7 +2332,7 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
                     tk_type elemT;
                     if (ite->tag == TK_TEXPR_NAMED) {
                         tk_path ip = ite->as.named.path;
-                        elemT = (tk_type){ .tag = TK_TYPE_NAMED, .as.named.name = ip.segments[ip.len - 1].name };
+                        elemT = (tk_type){ .tag = TK_TYPE_NAMED, .as.named.name = cg_canon_name(ip.segments[ip.len - 1].name) };
                     } else {
                         elemT = e->as.call.args[i].type;
                     }
@@ -2030,6 +2377,20 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
             // (W10b.CLASS increment 3) a class receiver is ALWAYS a pointer (reference semantics) —
             // `recv.field` needs a deref first (`(*recv).field`, i.e. C's `recv->field`).
             if (rt.tag == TK_TYPE_NAMED && cg_is_class_named(rt.as.named.name)) {
+                // (#98) a POLYMORPHIC-BASE-typed receiver is the fat pointer `tk_base_<B>` (data +
+                // vtable), not a raw object pointer — extract `.data`, cast to the base's raw
+                // `tk_t_<B> *`, then deref: `((*((tk_t_<B> *)(<recv>).data)).<field>)`. A plain
+                // (raw-pointer) class receiver stays `((*(<recv>)).<field>)`.
+                if (cg_is_polymorphic_base(rt.as.named.name)) {
+                    cb(b, "((*((");
+                    mangle_type_name(b, (tk_str){ NULL, 0 }, rt.as.named.name);
+                    cb(b, " *)(");
+                    if (!emit_expr(b, e->as.field_access.receiver, err)) return false;
+                    cb(b, ").data)).");
+                    cb_str(b, e->as.field_access.field);
+                    cb(b, ")");
+                    return true;
+                }
                 cb(b, "((*(");
                 if (!emit_expr(b, e->as.field_access.receiver, err)) return false;
                 cb(b, ")).");
@@ -2105,13 +2466,21 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
             tk_type recvT = e->as.safe_field_access.receiver->type;
             if (recvT.tag != TK_TYPE_OPTIONAL || recvT.as.optional.inner == NULL)
                 return fail_node(err, "codegen: safe field access on a non-optional receiver (internal)");
+            // (W10b.CLASS increment 3, latent — NP-OOP follow-up) a CLASS inner is ALWAYS a
+            // pointer (reference semantics, same as the plain TK_TEXPR_FIELD_ACCESS class case
+            // above): `_tN.value` holds a `<T> *`, so the field read needs `_tN.value-><field>`,
+            // not `_tN.value.<field>` (a `.` on a pointer is a C compile error). Gate identically
+            // to the FIELD_ACCESS class branch (cg_is_class_named on the inner's named type).
+            bool inner_is_class = recvT.as.optional.inner->tag == TK_TYPE_NAMED
+                                 && cg_is_class_named(recvT.as.optional.inner->as.named.name);
             char tmp[40]; snprintf(tmp, sizeof tmp, "_o%zu", (size_t)b->len);
             cb(b, "({ "); if (!emit_type(b, recvT, err)) return false;
             cb(b, " "); cb(b, tmp); cb(b, " = (");
             if (!emit_expr(b, e->as.safe_field_access.receiver, err)) return false;
             cb(b, "); "); cb(b, tmp); cb(b, ".present ? (");
             if (!emit_type(b, e->type, err)) return false;            // result optional type
-            cb(b, "){ .present = true, .value = "); cb(b, tmp); cb(b, ".value.");
+            cb(b, "){ .present = true, .value = "); cb(b, tmp);
+            cb(b, inner_is_class ? ".value->" : ".value.");
             cb_str(b, e->as.safe_field_access.field);
             cb(b, " } : ("); if (!emit_type(b, e->type, err)) return false;
             cb(b, "){ .present = false }; })");
@@ -2212,7 +2581,7 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
                 size_t bxid = b->len;
                 if (boxed) {
                     cb(b, "({ ");
-                    if (!emit_type_expr(b, fte, err)) return false;
+                    if (!emit_type_expr(b, fte, tk_name_qualifier(e->type.as.named.name), err)) return false;   // (#109 W3) ref_ns = the struct's own ns
                     cb(b, " *_bx"); cb_i64(b, (int64_t)bxid);
                     // MEM Step 1: a frame-local box rides the frame region (freed at the exit edge);
                     // everything else rides root `tk_alloc` (the safe leak). g_cg_box_frame is set by
@@ -2229,14 +2598,14 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
                 if (fv->type.tag == TK_TYPE_SLICE && fv->type.as.slice.element == NULL) {
                     if (have_fte && fte.tag == TK_TEXPR_SLICE && fte.as.slice.element != NULL) {
                         cb(b, "(");
-                        if (!emit_type_expr(b, fte, err)) return false;
+                        if (!emit_type_expr(b, fte, tk_name_qualifier(e->type.as.named.name), err)) return false;   // (#109 W3) ref_ns = the struct's own ns
                         cb(b, "){ .ptr = 0, .len = 0 }");
                         emitted = true;
                     }
                 } else if (fv->tag == TK_TEXPR_NULL) {
                     if (have_fte && fte.tag == TK_TEXPR_OPTIONAL) {
                         cb(b, "(");
-                        if (!emit_type_expr(b, fte, err)) return false;
+                        if (!emit_type_expr(b, fte, tk_name_qualifier(e->type.as.named.name), err)) return false;   // (#109 W3) ref_ns = the struct's own ns
                         cb(b, "){ .present = false }");
                         emitted = true;
                     }
@@ -2249,19 +2618,19 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
                     tk_type exp = { .tag = TK_TYPE_VOID }; tk_type elemT;
                     if (have_fte && fte.tag == TK_TEXPR_NAMED) {
                         tk_str fn = fte.as.named.path.segments[fte.as.named.path.len - 1].name;
-                        exp = (tk_type){ .tag = TK_TYPE_NAMED, .as.named.name = fn };
+                        exp = (tk_type){ .tag = TK_TYPE_NAMED, .as.named.name = cg_canon_name(fn) };
                     } else if (have_fte && fte.tag == TK_TEXPR_OPTIONAL && fte.as.optional.inner != NULL
                                && fte.as.optional.inner->tag == TK_TEXPR_NAMED) {
                         // a present value into a `T?` field (T named) → emit_as wraps T → T?
                         // ({ .present = true, .value = … }). (A bare `null` took the branch above.)
                         tk_path ip = fte.as.optional.inner->as.named.path;
-                        elemT = (tk_type){ .tag = TK_TYPE_NAMED, .as.named.name = ip.segments[ip.len - 1].name };
+                        elemT = (tk_type){ .tag = TK_TYPE_NAMED, .as.named.name = cg_canon_name(ip.segments[ip.len - 1].name) };
                         exp = (tk_type){ .tag = TK_TYPE_OPTIONAL, .as.optional.inner = &elemT };
                     } else if (have_fte && fte.tag == TK_TEXPR_SLICE
                                && fte.as.slice.element->tag == TK_TEXPR_NAMED
                                && !cg_is_prim_name(fte.as.slice.element->as.named.path.segments[fte.as.slice.element->as.named.path.len - 1].name)) {
                         tk_path ep = fte.as.slice.element->as.named.path;
-                        elemT = (tk_type){ .tag = TK_TYPE_NAMED, .as.named.name = ep.segments[ep.len - 1].name };
+                        elemT = (tk_type){ .tag = TK_TYPE_NAMED, .as.named.name = cg_canon_name(ep.segments[ep.len - 1].name) };
                         exp = (tk_type){ .tag = TK_TYPE_SLICE, .as.slice.element = &elemT };
                     }
                     if (exp.tag != TK_TYPE_VOID) { if (!emit_as(b, exp, fv, err)) return false; }
@@ -2403,7 +2772,7 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
                 cb_upper(b, e->as.path.member);
             } else {
                 cb(b, "TK_E_");
-                cb_upper(b, e->as.path.enum_name);
+                cb_upper(b, tk_name_last_segment(e->as.path.enum_name));   /* (#109 W3) BARE enum name */
                 cb(b, "_");
                 cb_upper(b, e->as.path.member);
             }
@@ -2462,6 +2831,9 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
             // bound to a temp via a GNU statement-expression, then compared to each element with `==`
             // OR'd together (true iff the lhs equals any element). The node's `.type` is bool.
             //   ({ <CtypeOfLhs> _invN = <lhs>; (_invN == <e0>) || (_invN == <e1>) || …; })
+            // A STR lhs routes each comparison through tk_str_eq instead (a tk_str is a {ptr,len}
+            // struct — C `==` is invalid on it; content equality, mirroring TK_TEXPR_COMPARE):
+            //   ({ tk_str _invN = <lhs>; tk_str_eq(_invN, <e0>) || tk_str_eq(_invN, <e1>) || …; })
             // The temp `_inv<buflen>` uses the CURRENT buffer length as the functional uniquifier
             // (see emit_if_value / emit_index). The EMPTY set `x in []` still EVALUATES the lhs once
             // (single-eval), then yields false — so a side-effecting lhs runs identically in the VM
@@ -2474,6 +2846,7 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
             }
             char tmp[40];
             snprintf(tmp, sizeof tmp, "_inv%zu", (size_t)b->len);
+            bool str_in = e->as.in_expr.lhs->type.tag == TK_TYPE_STR;
             cb(b, "({ ");
             if (!emit_type(b, e->as.in_expr.lhs->type, err)) return false;   // the lhs's resolved C type
             cb(b, " "); cb(b, tmp); cb(b, " = ");
@@ -2481,9 +2854,15 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
             cb(b, "; ");
             for (size_t i = 0; i < e->as.in_expr.nelems; i += 1) {
                 if (i > 0) cb(b, " || ");
-                cb(b, "("); cb(b, tmp); cb(b, " == ");
-                if (!emit_expr(b, &e->as.in_expr.elems[i], err)) return false;
-                cb(b, ")");
+                if (str_in) {
+                    cb(b, "tk_str_eq("); cb(b, tmp); cb(b, ", ");
+                    if (!emit_expr(b, &e->as.in_expr.elems[i], err)) return false;
+                    cb(b, ")");
+                } else {
+                    cb(b, "("); cb(b, tmp); cb(b, " == ");
+                    if (!emit_expr(b, &e->as.in_expr.elems[i], err)) return false;
+                    cb(b, ")");
+                }
             }
             cb(b, "; })");
             return true;
@@ -2555,7 +2934,7 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
                     if (!emit_type(b, elem, err)) return false;
                     cb(b, " *"); cb(b, spN); cb(b, " = (");
                     if (!emit_type(b, elem, err)) return false;
-                    cb(b, "*)tk_slice_push("); cb(b, accN); cb(b, ".ptr, "); cb(b, accN); cb(b, ".len, &");
+                    cb(b, "*)tk_slice_push("); cb(b, accN);   /* (#148 Level-2 BISECT: spread _fo OFF) */ cb(b, ".ptr, "); cb(b, accN); cb(b, ".len, &");
                     cb(b, subN); cb(b, ".ptr["); cb(b, jN); cb(b, "], sizeof(");
                     if (!emit_type(b, elem, err)) return false;
                     cb(b, "), &"); cb(b, capN); cb(b, "); if (!"); cb(b, spN); cb(b, ") abort(); ");
@@ -2572,7 +2951,7 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
                     if (!emit_type(b, elem, err)) return false;
                     cb(b, " *"); cb(b, spN); cb(b, " = (");
                     if (!emit_type(b, elem, err)) return false;
-                    cb(b, "*)tk_slice_push("); cb(b, accN); cb(b, ".ptr, "); cb(b, accN); cb(b, ".len, &");
+                    cb(b, "*)tk_slice_push("); cb(b, accN);   /* (#148 Level-2 BISECT: spread _fo OFF) */ cb(b, ".ptr, "); cb(b, accN); cb(b, ".len, &");
                     cb(b, tmpN); cb(b, ", sizeof(");
                     if (!emit_type(b, elem, err)) return false;
                     cb(b, "), &"); cb(b, capN); cb(b, "); if (!"); cb(b, spN); cb(b, ") abort(); ");
@@ -2628,7 +3007,7 @@ static tk_type cg_var_mtype(tk_type v, size_t i) {
     tk_type_expr te = d->body.as.variant_body.type_expr.as.uni.members[i];
     if (te.tag == TK_TEXPR_NAMED) {
         tk_str last = te.as.named.path.segments[te.as.named.path.len - 1].name;
-        return (tk_type){ .tag = TK_TYPE_NAMED, .as.named.name = last };
+        return (tk_type){ .tag = TK_TYPE_NAMED, .as.named.name = cg_canon_name(last) };
     }
     return (tk_type){ .tag = TK_TYPE_VOID };
 }
@@ -2651,6 +3030,25 @@ static bool cg_var_reaches(tk_type v, tk_str vkey, int depth) {
     }
     return false;
 }
+// cg_narrow_variant_widens_into — is `from` a VARIANT (inline `tk_u_…` OR a named variant decl)
+// EVERY member of which is reachable in the WIDER variant slot `to`? The codegen-side widening test
+// for an if/match arm JOIN whose inferred type is a NARROW member-pair union while the binding/param/
+// return slot is the WIDER annotated variant (fix/selfhost-arm-join-widen). Mirrors the checker's
+// member-by-member widens_into via the codegen reachability walk (cg_var_reaches). `to` must be a
+// variant slot; a `from` with no members (or a non-variant) answers false so the caller emits plainly.
+static bool cg_narrow_variant_widens_into(tk_type from, tk_type to) {
+    if (!cg_is_variant_type(to)) return false;
+    size_t n = cg_var_nmem(from);
+    if (n == 0) return false;
+    for (size_t i = 0; i < n; i += 1) {
+        cbuf mk = { NULL, 0, 0 }; const char *e = NULL;
+        if (!cg_var_mkey(from, i, &mk, &e)) { tk_free0(mk.ptr); return false; }
+        bool reaches = cg_var_reaches(to, (tk_str){ (const tk_byte *)mk.ptr, mk.len }, 16);
+        tk_free0(mk.ptr);
+        if (!reaches) return false;
+    }
+    return true;
+}
 // Emit `(<variantCType>){ .tag = <TAG for member key `mkey`>, .as.<mkey> = ` (no closing `}`).
 static bool cg_wrap_open(cbuf *b, tk_type v, tk_str mkey, const char **err) {
     if (v.tag == TK_TYPE_VARIANT) {
@@ -2664,7 +3062,7 @@ static bool cg_wrap_open(cbuf *b, tk_type v, tk_str mkey, const char **err) {
         cb(b, "_"); cb_upper(b, mkey);
     } else {
         cb(b, "("); mangle_type_name(b, (tk_str){ NULL, 0 }, v.as.named.name);
-        cb(b, "){ .tag = TK_TAG_"); cb_upper(b, v.as.named.name);
+        cb(b, "){ .tag = TK_TAG_"); cb_upper(b, tk_name_last_segment(v.as.named.name));   /* (#109 W3) BARE variant name */
         cb(b, "_"); cb_upper(b, mkey);
     }
     cb(b, ", .as."); cb_str(b, mkey); cb(b, " = ");
@@ -2755,6 +3153,19 @@ static bool cg_wrap_elem_str(cbuf *b, tk_type expected, tk_type vtype, const cha
         bool wrapped = cg_wrap_elem_str(b, inner, vtype, cexpr, err);   // the inner may need its own wrap
         if (*err != NULL) return false;
         if (!wrapped) { b->len = before; cb(b, cexpr); }
+        cb(b, " }");
+        return true;
+    }
+    // (W10b.D3) T is a CONTRACT (interface) and the element a conforming CLASS: wrap the element
+    // lvalue into the fat pointer, exactly like emit_as's value-position upcast — this is how a
+    // homogeneous `[]Circle` value covariant-rebuilds into a `[]Shape` slot.
+    if (expected.tag == TK_TYPE_NAMED && cg_is_interface_named(expected.as.named.name)
+        && vtype.tag == TK_TYPE_NAMED && cg_is_class_named(vtype.as.named.name)) {
+        cb(b, "(");
+        mangle_type_name(b, (tk_str){ NULL, 0 }, expected.as.named.name);
+        cb(b, "){ .data = (void *)("); cb(b, cexpr);
+        cb(b, "), .vtable = tk_vt_");
+        cb_tysym(b, vtype.as.named.name); cb(b, "_"); cb_tysym(b, expected.as.named.name);
         cb(b, " }");
         return true;
     }
@@ -2954,6 +3365,71 @@ static bool emit_as(cbuf *b, tk_type expected, const tk_texpr *value, const char
         }
         return emit_expr(b, value, err);
     }
+    // (W10b.D3) CONTRACT (interface) slot: a CLASS instance upcasts into the fat pointer — the
+    // object pointer rides `data`, the (class, contract) static vtable rides `vtable`. An
+    // already-contract-typed value falls through and is emitted plainly (same C typedef).
+    if (expected.tag == TK_TYPE_NAMED && cg_is_interface_named(expected.as.named.name)
+        && value->type.tag == TK_TYPE_NAMED && cg_is_class_named(value->type.as.named.name)) {
+        cb(b, "(");
+        mangle_type_name(b, (tk_str){ NULL, 0 }, expected.as.named.name);
+        cb(b, "){ .data = ");
+        // (#98) if the value is ALREADY a base fat pointer (`tk_base_<vn>`, a polymorphic base
+        // that ALSO implements this interface), its object pointer already lives in `.data` —
+        // extract it (`(<v>).data`) rather than `(void *)(<v>)` (which would cast the two-word struct).
+        if (cg_is_polymorphic_base(value->type.as.named.name)) {
+            cb(b, "(");
+            if (!emit_expr(b, value, err)) return false;
+            cb(b, ").data");
+        } else {
+            cb(b, "(void *)(");
+            if (!emit_expr(b, value, err)) return false;
+            cb(b, ")");
+        }
+        cb(b, ", .vtable = tk_vt_");
+        cb_tysym(b, value->type.as.named.name); cb(b, "_"); cb_tysym(b, expected.as.named.name);
+        cb(b, " }");
+        return true;
+    }
+    // (#98) SUB→BASE upcast: a raw class instance upcasts into the base's fat pointer `tk_base_<B>`
+    // — the object pointer rides `.data`, the (subclass, base) static vtable rides `.vtable`.
+    // Fires when `expected` is a polymorphic base B and the value is either a STRICT subclass of B
+    // (`Dog`→`Animal`) OR a RAW construction of B itself (a factory's `return B{}` into the base
+    // ret slot) — a value ALREADY of the base fat-pointer type (a bound base local: TVar/field/etc)
+    // passes through unwrapped (its C rep is already `tk_base_<B>`). The concrete class picks the
+    // vtable, so a subclass override dispatches correctly through the base value.
+    if (expected.tag == TK_TYPE_NAMED && cg_is_polymorphic_base(expected.as.named.name)
+        && value->type.tag == TK_TYPE_NAMED && cg_is_class_named(value->type.as.named.name)) {
+        bool is_strict_sub = !cg_name_eq(value->type.as.named.name, expected.as.named.name)
+            && cg_subclass_reaches(value->type.as.named.name, expected.as.named.name, 64);
+        bool is_raw_self = cg_name_eq(value->type.as.named.name, expected.as.named.name)
+            && value->tag == TK_TEXPR_STRUCT_INIT;
+        if (is_strict_sub || is_raw_self) {
+            cb(b, "(tk_base_"); cb_tysym(b, expected.as.named.name);
+            cb(b, "){ .data = (void *)(");
+            if (!emit_expr(b, value, err)) return false;
+            cb(b, "), .vtable = tk_vt_");
+            cb_tysym(b, value->type.as.named.name); cb(b, "_"); cb_tysym(b, expected.as.named.name);
+            cb(b, " }");
+            return true;
+        }
+    }
+    // (fix/selfhost-arm-join-widen) ARM-JOIN WIDEN: an `if`/`match` USED AS A VALUE whose two arms
+    // are DIFFERENT members of a WIDER annotated variant. The checker's type_join infers the NARROW
+    // member-pair union (`A | B`) as the if/match's type; the slot `expected` is the WIDER variant.
+    // Emitting plainly would type its C temp as the narrow `tk_u_A_B` and land it in the wider
+    // `tk_t_Expected` slot — `cc` rejects the incompatible struct. Re-emit the if/match with its node
+    // type RETAGGED to `expected`, so emit_if_value/emit_match_value type the temp as `expected` AND
+    // each arm's trailing value wraps into it (case → wider variant, via emit_stmt_value/emit_arm_value
+    // → emit_as). Guarded on EVERY narrow member reaching `expected` (a true widen).
+    bool vt_is_variant = value->type.tag == TK_TYPE_VARIANT
+        || (value->type.tag == TK_TYPE_NAMED && cg_named_is_variant(value->type.as.named.name));
+    if ((value->tag == TK_TEXPR_IF || value->tag == TK_TEXPR_MATCH)
+        && vt_is_variant && !cg_type_mangle_eq(value->type, expected)
+        && cg_narrow_variant_widens_into(value->type, expected)) {
+        tk_texpr widened = *value; widened.type = expected;
+        if (widened.tag == TK_TEXPR_IF)    return emit_if_value(b, &widened, err);
+        else                               return emit_match_value(b, &widened, err);
+    }
     // VARIANT slot wrap (B-cg2). Wrap a bare MEMBER value into the variant's tag+union rep:
     //   (<variantCType>){ .tag = TK_TAG_<V|U…>_<UPPER memberKey>, .as.<memberKey> = <value> }
     // The member is identified by RESOLVED-TYPE equality (the value's key == one member's key),
@@ -2993,7 +3469,7 @@ static bool emit_as(cbuf *b, tk_type expected, const tk_texpr *value, const char
 // This yields the VM's first-match-with-guard order, keeps bindings scoped, and compiles.
 //
 // PATTERN TESTS against the subject temp `_s`:
-//   WILDCARD -> 1 ; LITERAL -> (_s == <lit>) ; RANGE -> (_s >= lo && _s <= hi) ;
+//   WILDCARD -> 1 ; LITERAL -> (_s == <lit>) (str: tk_str_eq(_s, <lit>)) ; RANGE -> (_s >= lo && _s <= hi) ;
 //   ALT -> (t0 || t1 || …) ; BIND/FIELD case -> (_s.tag == TK_TAG_<Variant>_<case>).
 // PATTERN BINDS (emitted at the top of the arm block, before guard/body):
 //   BIND `Foo as x`        -> `auto x = _s.as.<Foo>;`            (the whole case value)
@@ -3003,10 +3479,10 @@ static bool emit_as(cbuf *b, tk_type expected, const tk_texpr *value, const char
 // =========================================================================
 
 // Emit an AST LITERAL pattern bound as a C constant comparable to the subject temp `_s`.
-// `_s` already has the subject's C type, so a bare C literal compares correctly (the VM's
-// lit_as borrows the subject's width/sign for the same reason). A str-literal pattern has
-// no C value-comparison helper in the runtime (no tk_str eq), so it is an honest barrier —
-// the VM DOES support str patterns (via name_eq), so this is a true codegen-only gap (M.3).
+// `_s` already has the subject's C type, so a bare C number/byte literal compares correctly
+// (the VM's lit_as borrows the subject's width/sign for the same reason). A str literal is a
+// (tk_str){…} compound literal with an EXPLICIT length (same form as TK_TEXPR_STR — the bytes
+// may hold NUL); the CALLER must compare it via tk_str_eq, never `==` (see emit_pat_test).
 static bool cg_emit_lit_pattern(cbuf *b, const tk_expr *lit, const char **err) {
     switch (lit->tag) {
         case TK_EXPR_NUMBER:
@@ -3017,7 +3493,12 @@ static bool cg_emit_lit_pattern(cbuf *b, const tk_expr *lit, const char **err) {
             cb_i64(b, (int64_t)lit->as.byte.value);
             return true;
         case TK_EXPR_STR:
-            return fail_node(err, "codegen: string-literal patterns not yet supported (no tk_str equality helper in the runtime)");
+            cb(b, "(tk_str){ (const tk_byte *)\"");
+            cb_cstr_escaped(b, lit->as.str.text);
+            cb(b, "\", ");
+            cb_i64(b, (int64_t)lit->as.str.text.len);
+            cb(b, " }");
+            return true;
         default:
             return fail_node(err, "codegen: unsupported literal in a pattern (parser emits only number/byte/str)");
     }
@@ -3039,7 +3520,7 @@ static bool cg_emit_tag_prefix(cbuf *b, tk_type variantT, const char **err) {
         cb(b, "_");
         return true;
     }
-    cb_upper(b, variantT.as.named.name);   // NAMED variant decl
+    cb_upper(b, tk_name_last_segment(variantT.as.named.name));   /* (#109 W3) BARE enum name */   // NAMED variant decl
     cb(b, "_");
     return true;
 }
@@ -3082,6 +3563,14 @@ static bool emit_pat_test(cbuf *b, const tk_pattern *pat, const char *subj,
             cb(b, "1");
             return true;
         case TK_PAT_LITERAL:
+            // A STR literal pattern tests via tk_str_eq (a tk_str is a {ptr,len} struct — C `==`
+            // is invalid on it; content equality, mirroring TK_TEXPR_COMPARE's str branch).
+            if (pat->as.literal.value.tag == TK_EXPR_STR) {
+                cb(b, "tk_str_eq("); cb(b, subj); cb(b, ", ");
+                if (!cg_emit_lit_pattern(b, &pat->as.literal.value, err)) return false;
+                cb(b, ")");
+                return true;
+            }
             cb(b, "("); cb(b, subj); cb(b, " == ");
             if (!cg_emit_lit_pattern(b, &pat->as.literal.value, err)) return false;
             cb(b, ")");
@@ -3106,8 +3595,11 @@ static bool emit_pat_test(cbuf *b, const tk_pattern *pat, const char *subj,
             // variant — common over an optional `TypeExpr?`): NOT a case-select. The value already
             // IS that variant, so the test is unconditionally true (any gating .present check is
             // upstream); the bind copies the whole value (emit_pat_binds).
+            // (#109 W3) the pattern's type name is BARE; the variant's name is CANONICAL "ns::Type"
+            // — compare by bare last-segment so `Type as t` over an optional `Type?` is still a
+            // WHOLE-value bind (not a spurious case-select of member "Type").
             if (variantT.tag == TK_TYPE_NAMED && !pat->as.bind.is_slice
-                && cg_name_eq(cg_path_last(pat->as.bind.type_name), variantT.as.named.name)) {
+                && cg_name_eq(cg_path_last(pat->as.bind.type_name), tk_name_last_segment(variantT.as.named.name))) {
                 cb(b, "1");
                 return true;
             }
@@ -3115,7 +3607,7 @@ static bool emit_pat_test(cbuf *b, const tk_pattern *pat, const char *subj,
             // enum constant `TK_E_<ENUM>_<MEMBER>` (matches emit_type_decl's enum emission).
             if (variantT.tag == TK_TYPE_NAMED && cg_named_is_enum(variantT.as.named.name)) {
                 cb(b, "("); cb(b, subj); cb(b, " == TK_E_");
-                cb_upper(b, variantT.as.named.name); cb(b, "_");
+                cb_upper(b, tk_name_last_segment(variantT.as.named.name));   /* (#109 W3) BARE enum name */ cb(b, "_");
                 { cbuf k = { NULL, 0, 0 };
                   if (!cg_emit_case_key(&k, pat, err)) { tk_free0(k.ptr); return false; }
                   cb_upper(b, (tk_str){ (const tk_byte *)k.ptr, k.len }); tk_free0(k.ptr); }
@@ -3172,7 +3664,7 @@ static bool cg_kind_descend(tk_type subjT, const tk_pattern *pat, tk_type *outV,
     for (size_t i = 0; i < sb.n_fields; i += 1)
         if (seg_is(sb.fields[i].name, "kind")) { kfte = sb.fields[i].type_ann; found = true; break; }
     if (!found || kfte.tag != TK_TEXPR_NAMED) return false;
-    tk_str vname = kfte.as.named.path.segments[kfte.as.named.path.len - 1].name;
+    tk_str vname = cg_canon_name(kfte.as.named.path.segments[kfte.as.named.path.len - 1].name);
     if (!cg_named_is_variant(vname)) return false;
     tk_type V = { .tag = TK_TYPE_NAMED, .as.named.name = vname };
     // the pattern must select a CASE of V (not a field-destructure of the struct itself).
@@ -3256,7 +3748,7 @@ static bool cg_emit_pat_binds(cbuf *b, const tk_pattern *pat, const char *subj,
         // A bind whose type IS the inner variant itself (`TypeExpr as t` over `TypeExpr?`) binds
         // the WHOLE present value, not a `.as.<case>` member.
         if (pat->tag == TK_PAT_BIND && !pat->as.bind.is_slice && inner.tag == TK_TYPE_NAMED
-            && cg_name_eq(cg_path_last(pat->as.bind.type_name), inner.as.named.name)) {
+            && cg_name_eq(cg_path_last(pat->as.bind.type_name), tk_name_last_segment(inner.as.named.name))) {
             if (pat->as.bind.has_binding) {
                 cb(b, indent); cb(b, "auto "); cb_str(b, pat->as.bind.binding);
                 cb(b, " = "); cb(b, val); cb(b, ";\n");
@@ -3269,7 +3761,7 @@ static bool cg_emit_pat_binds(cbuf *b, const tk_pattern *pat, const char *subj,
     // Non-optional bind-WHOLE-variant (`TypeExpr as t` where the subject IS the TypeExpr variant)
     // binds the whole value, not a `.as.<case>`.
     if (pat->tag == TK_PAT_BIND && !pat->as.bind.is_slice && subjT.tag == TK_TYPE_NAMED
-        && cg_name_eq(cg_path_last(pat->as.bind.type_name), subjT.as.named.name)) {
+        && cg_name_eq(cg_path_last(pat->as.bind.type_name), tk_name_last_segment(subjT.as.named.name))) {
         if (pat->as.bind.has_binding) {
             cb(b, indent); cb(b, "auto "); cb_str(b, pat->as.bind.binding);
             cb(b, " = "); cb(b, subj); cb(b, ";\n");
@@ -3900,10 +4392,77 @@ static bool emit_stmt(cbuf *b, const tk_tstatement *s, bool in_main,
             const char *op = assignop_c(s->as.assign.op);
             if (op == NULL) return fail_node(err, "codegen: assignment operator not yet supported");
             cb(b, indent);
+            // #61 — `<<=`/`>>=` must NOT emit the raw C compound operator: an out-of-range shift
+            // count is C UB natively, while the VM (#49, compound_apply) computes a DEFINED
+            // width-masked result. Rewrite as `lvalue = tk_shl_<w>(lvalue, rhs)` / tk_shr_<w>,
+            // routing through the SAME teko_rt.h helpers the binary `<<`/`>>` operator uses.
+            // SAFE to evaluate the lvalue twice: the three assign-statement lvalue shapes —
+            // a bare identifier (`s->as.assign.name`), a Ref<T> handle's `(*name)` pointer
+            // dereference (`deref`), or a struct/class FIELD path (`(#88); the typed LHS
+            // field-access, e.g. `(*recv).f`) — are ALL pure, side-effect-free lookups, so
+            // re-emitting the lvalue text a second time is cost-free and safe.
+            //   emit_lvalue emits the target C lvalue for whichever of the three shapes applies.
+            #define emit_lvalue()  do { \
+                if (s->as.assign.kind == TK_ASSIGN_FIELD) { if (!emit_expr(b, s->as.assign.target, err)) return false; } \
+                else if (s->as.assign.deref) { cb(b, "(*"); cb_ident(b, s->as.assign.name); cb(b, ")"); } \
+                else cb_ident(b, s->as.assign.name); \
+            } while (0)
+            if (s->as.assign.op == TK_TOKEN_SHLEQ || s->as.assign.op == TK_TOKEN_SHREQ) {
+                if (s->as.assign.bound.tag != TK_TYPE_PRIM || !cg_prim_is_int(s->as.assign.bound.as.prim))
+                    return fail_node(err, "codegen: shift-assign on a non-integer type not yet supported");
+                const char *tag = prim_int_tag(s->as.assign.bound.as.prim);
+                if (tag == NULL) return fail_node(err, "codegen: shift-assign on a non-integer type not yet supported");
+                emit_lvalue();
+                cb(b, " = ");
+                cb(b, s->as.assign.op == TK_TOKEN_SHLEQ ? "tk_shl_" : "tk_shr_");
+                cb(b, tag);
+                cb(b, "(");
+                emit_lvalue();
+                cb(b, ", ");
+                if (!emit_expr(b, &s->as.assign.value, err)) return false;
+                cb(b, ")");
+                cb(b, ";\n");
+                return true;
+            }
+            // (#148 S2 Level-2) a PROVEN-LINEAR self-append (born from empty(), self-append-only
+            // writes, no capture before the fn-final statement) FREES the old buffer on every
+            // copy-grow — realloc parity with this hand-written twin. Takes precedence over the
+            // Level-1 frame routing (free-list is root-only; the proof admits ESCAPING chains too).
+            // "@fo" rides g_cg_push_frame as the routing selector (mirror of the Teko twin's frame).
+            if (s->as.assign.value.tag == TK_TEXPR_CALL
+                && tk_assign_frees_old(g_cg_fn_body, g_cg_fn_nbody, *s)) {
+                emit_lvalue();
+                cb(b, " = ");
+                const char *saved_pf = g_cg_push_frame; g_cg_push_frame = "@fo";
+                bool ok = emit_expr(b, &s->as.assign.value, err);
+                g_cg_push_frame = saved_pf;
+                if (!ok) return false;
+                cb(b, ";\n");
+                return true;
+            }
+            // (S2 Level-1) SELF-APPEND to a non-escaping slice → route the grown buffer to the frame
+            // region g_cg_frame (bulk-freed on every fn-exit edge). Emit the push directly (mirror of
+            // codegen.tks::emit_assign) with g_cg_push_frame set so the list::push case emits
+            // tk_slice_push_r(…, _tkfr). Guarded by g_cg_frame (region exists) + the SHARED predicate,
+            // which mirrors the escape carve-out so codegen and the escape set never disagree.
+            if (g_cg_frame[0] != '\0' && s->as.assign.value.tag == TK_TEXPR_CALL
+                && tk_assign_routes_to_frame(g_cg_escaping, *s)) {
+                emit_lvalue();
+                cb(b, " = ");
+                const char *saved_pf = g_cg_push_frame; g_cg_push_frame = g_cg_frame;
+                bool ok = emit_expr(b, &s->as.assign.value, err);
+                g_cg_push_frame = saved_pf;
+                if (!ok) return false;
+                cb(b, ";\n");
+                return true;
+            }
             // (MEM-1b-ii) `r.value op= v` — write THROUGH the reference: the handle IS the pointer, so
             // the lvalue is `(*r)`. (`Ref<T>` lowers to `<T> *`; deref-assign is a plain pointer store.)
-            if (s->as.assign.deref) { cb(b, "(*"); cb_ident(b, s->as.assign.name); cb(b, ")"); }
-            else cb_ident(b, s->as.assign.name);
+            // (#88) a FIELD target emits the typed LHS field-access: `(*recv).f` for a class receiver
+            // (reference semantics — an in-place write the aliased pointer observes), `recv.f` for a
+            // struct (value semantics). emit_expr on the TFieldAccess produces the exact read-side lvalue.
+            emit_lvalue();
+            #undef emit_lvalue
             cb(b, " "); cb(b, op); cb(b, " ");
             // Wrap the value into the target's declared type (`bound`) — a case → its variant,
             // a `T` → `T?`, a fitting literal — exactly like a binding. (Plain numerics emit as-is;
@@ -4085,7 +4644,7 @@ static bool emit_function_sig(cbuf *b, tk_tfunction f, const char **err) {
     } else {
         for (size_t i = 0; i < f.nparams; i += 1) {
             if (i > 0) cb(b, ", ");
-            if (!emit_type_expr(b, f.params[i].type_ann, err)) return false;
+            if (!emit_type_expr(b, f.params[i].type_ann, f.namespace, err)) return false;   // (#109 W3) ref_ns = the fn's declaring ns
             cb(b, " ");
             cb_ident(b, f.params[i].name);
         }
@@ -4239,7 +4798,7 @@ static bool emit_type_decl(cbuf *b, tk_tprogram prog, tk_type_decl d, const char
             cb(b, " {\n");
             for (size_t i = 0; i < sb.n_fields; i += 1) {
                 cb(b, "    ");
-                if (!emit_type_expr(b, sb.fields[i].type_ann, err)) return false;
+                if (!emit_type_expr(b, sb.fields[i].type_ann, tk_name_qualifier(d.name), err)) return false;   // (#109 W3) ref_ns = the decl's own ns
                 cb(b, " ");
                 // auto-box: a recursive back-edge field is a heap pointer (finite C struct).
                 if (cg_field_boxed(d.name, sb.fields[i].type_ann)) cb(b, "*");
@@ -4260,26 +4819,26 @@ static bool emit_type_decl(cbuf *b, tk_tprogram prog, tk_type_decl d, const char
             size_t nmem = vt.as.uni.len;
             // 1) the tag enum: TK_TAG_<UPPER Name>_<UPPER memberKey> per member.
             cb(b, "typedef enum ");
-            cb(b, "tk_tag_"); cb_str(b, d.name);
+            cb(b, "tk_tag_"); cb_tysym(b, d.name);
             cb(b, " {\n");
             for (size_t i = 0; i < nmem; i += 1) {
                 cb(b, "    TK_TAG_");
-                cb_upper(b, d.name);
+                cb_upper(b, tk_name_last_segment(d.name));   /* (#109 W3) BARE enum name */
                 cb(b, "_");
                 if (!cg_member_key_upper_texpr(b, vt.as.uni.members[i], err)) return false;
                 if (i + 1 < nmem) cb(b, ",");
                 cb(b, "\n");
             }
-            cb(b, "} tk_tag_"); cb_str(b, d.name); cb(b, ";\n\n");
+            cb(b, "} tk_tag_"); cb_tysym(b, d.name); cb(b, ";\n\n");
             // 2) the value: tag + union as. Each union field is named by the member KEY and
             //    typed via emit_type_expr (covers named/error/prim/slice/optional members).
             cb(b, "typedef struct ");
             mangle_type_name(b, ns, d.name);
-            cb(b, " {\n    tk_tag_"); cb_str(b, d.name); cb(b, " tag;\n    union {\n");
+            cb(b, " {\n    tk_tag_"); cb_tysym(b, d.name); cb(b, " tag;\n    union {\n");
             for (size_t i = 0; i < nmem; i += 1) {
                 tk_type_expr mem = vt.as.uni.members[i];
                 cb(b, "        ");
-                if (!emit_type_expr(b, mem, err)) return false;
+                if (!emit_type_expr(b, mem, tk_name_qualifier(d.name), err)) return false;   // (#109 W3) ref_ns = the decl's own ns
                 cb(b, " ");
                 if (!cg_member_key_texpr(b, mem, err)) return false;   // union field == the member key
                 cb(b, ";\n");
@@ -4296,7 +4855,7 @@ static bool emit_type_decl(cbuf *b, tk_tprogram prog, tk_type_decl d, const char
             cb(b, " {\n");
             for (size_t i = 0; i < eb.n_members; i += 1) {
                 cb(b, "    TK_E_");
-                cb_upper(b, d.name);
+                cb_upper(b, tk_name_last_segment(d.name));   /* (#109 W3) BARE enum name */
                 cb(b, "_");
                 cb_upper(b, eb.members[i]);
                 if (i + 1 < eb.n_members) cb(b, ",");
@@ -4368,7 +4927,7 @@ static bool emit_type_decl(cbuf *b, tk_tprogram prog, tk_type_decl d, const char
             cb(b, " {\n");
             for (size_t i = 0; i < eff.as.value.len; i += 1) {
                 cb(b, "    ");
-                if (!emit_type_expr(b, eff.as.value.ptr[i].type_ann, err)) return false;
+                if (!emit_type_expr(b, eff.as.value.ptr[i].type_ann, tk_name_qualifier(d.name), err)) return false;   // (#109 W3) ref_ns = the decl's own ns
                 cb(b, " ");
                 if (cg_field_boxed(d.name, eff.as.value.ptr[i].type_ann)) cb(b, "*");
                 cb_str(b, eff.as.value.ptr[i].name);
@@ -4382,6 +4941,16 @@ static bool emit_type_decl(cbuf *b, tk_tprogram prog, tk_type_decl d, const char
             cb(b, ";\n\n");
             return true;
         }
+        case TK_BODY_INTERFACE:
+            // (W10b.D3) a contract's fat-pointer typedef is emitted in the FORWARD pass (it embeds
+            // nothing, everything may embed it); its per-(class, contract) vtables are emitted after
+            // the function prototypes. Nothing to emit here.
+            return true;
+        case TK_BODY_TRAIT:
+            // (TR0) a trait is COMPILE-TIME only — its members were FOLDED into every deriver
+            // before typing (tk_fold_traits), and the checker rejects a trait in any value/
+            // instantiation position, so the decl itself lowers to nothing.
+            return true;
     }
     return fail_node(err, "codegen: unknown type body not yet supported");
 }
@@ -4524,6 +5093,18 @@ static void cg_collect_expr_opts(cg_opt_set *set, const tk_texpr *e) {
             cg_collect_expr_opts(set, e->as.in_expr.lhs);
             for (size_t i = 0; i < e->as.in_expr.nelems; i += 1) cg_collect_expr_opts(set, &e->as.in_expr.elems[i]);
             return;
+        // (#119) A lambda literal's own resolved TYPE (registered above, at entry) is its FUNCTION
+        // type (params -> ret) — that carries no tk_opt_/tk_slice_/tk_u_ typedef of its own, so an
+        // optional/slice/variant used ONLY inside the lambda's params/return/body (never anywhere
+        // else in the enclosing function) was never visited: the collector fell through to the
+        // `default` leaf case and missed the whole body. A lifted CAPTURING lambda's body is emitted
+        // as its own function by cg_emit_lambda_decls — same as a non-capturing lambda's synthesized
+        // top-level fn — so it needs the SAME typedef registration a normal function body gets.
+        case TK_TEXPR_LAMBDA:
+            for (size_t i = 0; i < e->as.lambda.nparams; i += 1) cg_collect_type_opts(set, e->as.lambda.params[i].type);
+            cg_collect_type_opts(set, e->as.lambda.ret);
+            cg_collect_block_opts(set, e->as.lambda.body, e->as.lambda.nbody);
+            return;
         default: return;   // leaves (NUMBER/VAR/STR/BYTE/BOOL/NULL) — type already registered above
     }
 }
@@ -4537,7 +5118,7 @@ static void cg_collect_block_opts(cg_opt_set *set, const tk_tstatement *stmts, s
             // VM's coerce_to(bound)): a deref-assign `r.value = v` through a `Ref<T?>` has bound=`T?`, and
             // that optional's tk_opt_<T> typedef must be emitted even when the value's own type is a bare
             // `T` (widened) — mirrors the BINDING arm collecting binding.bound.
-            case TK_TSTMT_ASSIGN:  cg_collect_type_opts(set, s->as.assign.bound); cg_collect_expr_opts(set, &s->as.assign.value); break;
+            case TK_TSTMT_ASSIGN:  cg_collect_type_opts(set, s->as.assign.bound); cg_collect_expr_opts(set, &s->as.assign.value); if (s->as.assign.kind == TK_ASSIGN_FIELD) cg_collect_expr_opts(set, s->as.assign.target); break;   // (#88) the FIELD LHS receiver may carry optional types too
             case TK_TSTMT_RETURN:  if (s->as.ret.has_value) cg_collect_expr_opts(set, &s->as.ret.value); break;
             case TK_TSTMT_LOOP:    cg_collect_block_opts(set, s->as.loop_stmt.body, s->as.loop_stmt.nbody); break;
             case TK_TSTMT_EXPR:    cg_collect_expr_opts(set, &s->as.expr_stmt.expr); break;
@@ -4684,10 +5265,39 @@ static void cg_key_type(cbuf *out, tk_type t)        { const char *e = NULL; cg_
 static void cg_key_texpr(cbuf *out, tk_type_expr t)  { const char *e = NULL; cg_opt_mangle_texpr(out, t, &e); }
 static bool cg_key_eq(cbuf a, cbuf c) { return a.len == c.len && (a.len == 0 || memcmp(a.ptr, c.ptr, a.len) == 0); }
 
+// (#109 order fix) EXACT-name decl probe (never the bare-last-segment fallback) — the precise
+// readiness gate needs the one decl the canonical name denotes, not a same-bare cousin.
+static const tk_type_decl *cg_find_decl_exact(tk_str name) {
+    for (size_t i = 0; i < g_cg_prog.nitems; i += 1) {
+        if (g_cg_prog.items[i].tag != TK_TITEM_TYPE_DECL) continue;
+        const tk_type_decl *d = &g_cg_prog.items[i].as.type_decl;
+        if (cg_name_eq(d->name, name)) return d;
+    }
+    return NULL;
+}
+static bool cg_named_emitted(cg_typenodes *N, tk_str name);
+// (#109 order fix) NAMESPACE-PRECISE readiness probe: a CANONICAL struct/variant name gates on
+// ITS OWN emission (exact node match), never on a same-bare cousin from another namespace —
+// discovery (readdir) order differs per platform, and on ubuntu io::Reader emitted early
+// satisfied the emit codec structs' bare `Reader` edge before emit::Reader existed → cc "field
+// has incomplete type". Non-body categories (interface/class/enum/alias/type-param/builtin/
+// instance) keep the bare probe. Mirror of codegen.tks::cg_named_emitted_precise.
+static bool cg_named_emitted_precise(cg_typenodes *N, tk_str name) {
+    if (tk_name_qualifier(name).len > 0) {
+        const tk_type_decl *dd = cg_find_decl_exact(name);
+        if (dd != NULL && (dd->body.tag == TK_BODY_STRUCT || dd->body.tag == TK_BODY_VARIANT)) {
+            for (size_t i = 0; i < N->nnamed; i += 1)
+                if (cg_name_eq(N->named[i].name, name)) return N->named_done[i];
+            return true;   // resolved body decl not among the ordered nodes → no edge
+        }
+    }
+    return cg_named_emitted(N, name);
+}
 // Has the named decl `name` been emitted? (a builtin/alias not in our set has no edge → ready.)
 static bool cg_named_emitted(cg_typenodes *N, tk_str name) {
+    // (#109 W3) node names are CANONICAL; a readiness probe passes a BARE syntactic segment — match by bare last-segment.
     for (size_t i = 0; i < N->nnamed; i += 1)
-        if (cg_name_eq(N->named[i].name, name)) return N->named_done[i];
+        if (cg_name_eq(tk_name_last_segment(N->named[i].name), tk_name_last_segment(name))) return N->named_done[i];
     return true;
 }
 // Has the optional whose inner mangles to `key` been emitted? (no matching node → no edge.)
@@ -4711,7 +5321,13 @@ static bool cg_uvar_emitted_key(cg_typenodes *N, cbuf key) {
 // By-value readiness of a resolved type (an opt inner / a variant member tk_type).
 static bool cg_type_ready(cg_typenodes *N, tk_type t) {
     switch (t.tag) {
-        case TK_TYPE_NAMED: return cg_named_emitted(N, t.as.named.name);
+        // (#122) a CLASS inner is stored as a POINTER (`tk_t_C *`) inside a `tk_opt_C`/variant, so
+        // it needs only the forward typedef (always present) — READY like a slice. Requiring the
+        // full class body would deadlock the fixpoint: `tk_t_Node`'s by-value `Node?` field needs
+        // `tk_opt_Node` first, and `tk_opt_Node`'s `Node` value would need `tk_t_Node` first.
+        case TK_TYPE_NAMED:
+            if (cg_is_class_named(t.as.named.name)) return true;
+            return cg_named_emitted_precise(N, t.as.named.name);
         case TK_TYPE_OPTIONAL: {
             if (t.as.optional.inner == NULL) return true;
             cbuf k = { NULL, 0, 0 }; cg_key_type(&k, *t.as.optional.inner);
@@ -4726,7 +5342,7 @@ static bool cg_type_ready(cg_typenodes *N, tk_type t) {
     }
 }
 // By-value readiness of a field/member SYNTACTIC type-expr (struct field / variant member).
-static bool cg_texpr_ready(cg_typenodes *N, tk_type_expr te) {
+static bool cg_texpr_ready(cg_typenodes *N, tk_type_expr te, tk_str owner_ns) {
     switch (te.tag) {
         case TK_TEXPR_NAMED: {
             tk_str base = te.as.named.path.segments[te.as.named.path.len - 1].name;
@@ -4734,8 +5350,18 @@ static bool cg_texpr_ready(cg_typenodes *N, tk_type_expr te) {
                                            "i128","f16","f32","f64","bool","byte","str","error" };
             for (size_t i = 0; i < sizeof prims / sizeof *prims; i += 1)
                 if (seg_is(base, prims[i])) return true;   // builtin scalar → ready
+            // (#122) a CLASS field is a POINTER (`tk_t_C *`) — it only needs the forward typedef
+            // (always present by this pass), never the full body. So it is READY like a slice; a
+            // recursive class-optional (`Node?` inside class `Node`) would otherwise be an
+            // unbreakable by-value cycle here even though the C layout is finite.
+            if (cg_is_class_named(base)) return true;
             // (S4) a generic-type USE `Box<i64>` depends on the concrete instance, not the template.
-            if (te.as.named.args_len == 0) return cg_named_emitted(N, base);
+            if (te.as.named.args_len == 0) {
+                // (#109 order fix) resolve the SYNTACTIC path in the OWNER decl's namespace, so
+                // the edge points at THAT decl (namespace-precise), not a same-bare cousin.
+                const tk_type_decl *dd = cg_find_decl_ns(te.as.named.path, owner_ns);
+                return cg_named_emitted_precise(N, dd != NULL ? dd->name : base);
+            }
             cbuf k = { NULL, 0, 0 }; cg_texpr_mangle(&k, te);
             bool r = cg_named_emitted(N, (tk_str){ (const tk_byte *)k.ptr, k.len });
             tk_free0(k.ptr);
@@ -4755,13 +5381,14 @@ static bool cg_texpr_ready(cg_typenodes *N, tk_type_expr te) {
 }
 // Is a named decl's body emittable now (all its by-value field/member deps already emitted)?
 static bool cg_named_ready(cg_typenodes *N, tk_type_decl d) {
+    tk_str owner_ns = tk_name_qualifier(d.name);   // (#109 order fix) bare field refs resolve here
     if (d.body.tag == TK_BODY_STRUCT) {
         tk_struct_body sb = d.body.as.struct_body;
         for (size_t i = 0; i < sb.n_fields; i += 1) {
             // a boxed (recursive back-edge) field is a POINTER — needs only a forward typedef,
             // so it is NOT a by-value dependency (this is what breaks the cycle for the fixpoint).
             if (cg_field_boxed(d.name, sb.fields[i].type_ann)) continue;
-            if (!cg_texpr_ready(N, sb.fields[i].type_ann)) return false;
+            if (!cg_texpr_ready(N, sb.fields[i].type_ann, owner_ns)) return false;
         }
         return true;
     }
@@ -4769,10 +5396,24 @@ static bool cg_named_ready(cg_typenodes *N, tk_type_decl d) {
         tk_type_expr vt = d.body.as.variant_body.type_expr;
         if (vt.tag == TK_TEXPR_UNION)
             for (size_t i = 0; i < vt.as.uni.len; i += 1)
-                if (!cg_texpr_ready(N, vt.as.uni.members[i])) return false;
+                if (!cg_texpr_ready(N, vt.as.uni.members[i], owner_ns)) return false;
         return true;
     }
-    return true;   // enum / alias — no by-value dependency
+    // (#122) a CLASS body has the same C layout as a struct (its EFFECTIVE, base-inherited fields
+    // laid out by value), so its BY-VALUE field deps (e.g. a `Node?` optional wrapping a class
+    // POINTER → `tk_opt_Node`) must be emitted first. Without this a class body is emitted before
+    // the `tk_opt_<inner>` it embeds is defined → cc errors "field has incomplete type". A
+    // class-named field is itself a pointer (cg_texpr_ready returns ready), so a self-cycle through
+    // a plain class reference stays breakable; only the by-value optional/variant wrappers gate here.
+    if (d.body.tag == TK_BODY_CLASS) {
+        tk_type_table table = tk_type_table_of(g_cg_prog);
+        tk_fieldsvec_result eff = tk_effective_class_fields(d.body.as.class_body, table);
+        if (!eff.ok) return true;   // inheritance error surfaces at body emission; don't stall here
+        for (size_t i = 0; i < eff.as.value.len; i += 1)
+            if (!cg_texpr_ready(N, eff.as.value.ptr[i].type_ann, owner_ns)) return false;
+        return true;
+    }
+    return true;   // enum / alias / interface / trait — no by-value dependency
 }
 
 // Replaces the old program-order body emission + cg_emit_optional_typedefs: emit slices first
@@ -4957,7 +5598,7 @@ static char *cg_format_c(const char *src) {
     cbuf out = { NULL, 0, 0 };
     size_t depth = 0;            // open-brace count (= indent level)
     char stk[4096]; size_t sp = 0;   // bracket stack — innermost decides `;` breaking ({ vs ( )
-    bool blk[4096];              // per-`{`: is it a function/control BLOCK (preceded by `)`)? — for top-level separation
+    bool blk[4096] = {0};        // per-`{`: is it a function/control BLOCK (preceded by `)`)? — for top-level separation
     bool line_start = true;      // at the start of a fresh output line?
     char one[2] = { 0, 0 };
     size_t i = 0;
@@ -5052,7 +5693,7 @@ static void cg_lift_block(tk_tstatement *stmts, size_t n, uint64_t *next, tk_tfu
 static void cg_lift_stmt(tk_tstatement *s, uint64_t *next, tk_tfunction **fns, size_t *nfns) {
     switch (s->tag) {
         case TK_TSTMT_BINDING: cg_lift_expr(&s->as.binding.value, next, fns, nfns); break;
-        case TK_TSTMT_ASSIGN:  cg_lift_expr(&s->as.assign.value, next, fns, nfns); break;
+        case TK_TSTMT_ASSIGN:  cg_lift_expr(&s->as.assign.value, next, fns, nfns); if (s->as.assign.kind == TK_ASSIGN_FIELD) cg_lift_expr(s->as.assign.target, next, fns, nfns); break;   // (#88) lift lambdas in the FIELD LHS receiver too
         case TK_TSTMT_RETURN:  if (s->as.ret.has_value) cg_lift_expr(&s->as.ret.value, next, fns, nfns); break;
         case TK_TSTMT_LOOP:    cg_lift_block(s->as.loop_stmt.body, s->as.loop_stmt.nbody, next, fns, nfns); break;
         case TK_TSTMT_EXPR:    cg_lift_expr(&s->as.expr_stmt.expr, next, fns, nfns); break;
@@ -5117,7 +5758,16 @@ static void cg_lift_program(void) {
             cg_lift_stmt(&g_cg_prog.items[i].as.statement, &next, &fns, &nfns);
     }
     if (nfns == 0) return;
-    tk_titem *ni = tk_realloc0(g_cg_prog.items, (g_cg_prog.nitems + nfns) * sizeof *ni); if (!ni) abort();
+    // Grow into a FRESH array — never realloc the caller's buffer. `tk_emit_c` receives the
+    // typer's `prog` by value, so `g_cg_prog.items` aliases storage the DRIVER still holds
+    // (tk_backend reads it again for `tk_emit_tsym` after emission). A realloc here frees
+    // that storage under the driver's feet — a use-after-free in tk_emit_tsym (heap-layout-
+    // dependent: crashed the native build of any project with a non-capturing lambda on
+    // glibc, silent on macOS). Mirrors codegen.tks::cg_lift_lambdas, which builds a NEW
+    // items list and leaves `prog0.items` untouched. The old buffer stays owned by the
+    // typer (compiler-lifetime allocation — same discipline as every other front-end list).
+    tk_titem *ni = tk_alloc((g_cg_prog.nitems + nfns) * sizeof *ni);
+    memcpy(ni, g_cg_prog.items, g_cg_prog.nitems * sizeof *ni);
     g_cg_prog.items = ni;
     for (size_t k = 0; k < nfns; k += 1)
         g_cg_prog.items[g_cg_prog.nitems++] = (tk_titem){ .tag = TK_TITEM_FUNCTION, .as.function = fns[k] };
@@ -5148,7 +5798,23 @@ static bool cg_emit_lambda_decls(cbuf *b, bool protos_only, const char **err) {
             cb(b, "    "); if (!emit_type(b, lam->captures[ui].type, err)) return false;
             cb(b, " "); cb_ident(b, lam->captures[ui].name); cb(b, " = _e->"); cb_ident(b, lam->captures[ui].name); cb(b, ";\n");
         }
-        if (!emit_block_tail(b, lam->body, lam->nbody, false, lam->ret, "    ", err)) return false;
+        // (#108) A lifted CAPTURING lambda is its own function — a `return e` nested inside a
+        // match/if used as a VALUE sub-expression in its body (emit_arm_value / emit_stmt_value)
+        // wraps via the C twin's g_cg_ret_type static (see emit_function's comment), NOT the
+        // `ret_type` threaded to emit_block_tail (which only covers the lambda's own TAIL path).
+        // Left unset here, g_cg_ret_type still held whatever top-level function was emitted last
+        // by the main pass (cg_emit_lambda_decls runs AFTER it) — a bound error variable then wrapped
+        // into that STALE type instead of the lambda's own `Buf | error`, so cc rejected the bare
+        // `tk_error` return. Set it to the lambda's own return type for the duration of its body,
+        // then restore — a later capturing lambda (or nothing, at the top-level fallback) must not
+        // see this one's type. The .tks twin has no such bug: it threads ret_type explicitly with no
+        // module-mutable global (cg_emit_lambda_decls -> emit_block_tail -> emit_as_r all take it
+        // as a parameter), so only the C twin needed this fix.
+        tk_type saved_ret_type = g_cg_ret_type;
+        g_cg_ret_type = lam->ret;
+        bool lam_ok = emit_block_tail(b, lam->body, lam->nbody, false, lam->ret, "    ", err);
+        g_cg_ret_type = saved_ret_type;
+        if (!lam_ok) return false;
         cb(b, "}\n");
     }
     return true;
@@ -5173,19 +5839,43 @@ tk_cstr_result tk_emit_c(tk_tprogram prog) {
     cb(&b, "#include \"assert.h\"\n\n");   // teko::assert seed decls (driver adds its -I)
 
     // W4c — TYPE DECLS come FIRST (before any function that uses them). Two sub-passes:
-    //   a) a forward `typedef struct tk_t_<M> tk_t_<M>;` for every STRUCT/VARIANT decl,
+    //   a) a forward `typedef struct tk_t_<M> tk_t_<M>;` for every STRUCT/VARIANT/CLASS decl,
     //      so a field/member that references a not-yet-defined aggregate (recursive or
     //      out-of-order types) still compiles.
-    //   b) the full type declarations (struct bodies, variant tag+union, enums).
+    //   b) the full type declarations (struct/class bodies, variant tag+union, enums).
     // (enums need no forward typedef — they carry no aggregate self-reference.)
+    // (#102) CLASS joins STRUCT/VARIANT here: a class value lowers to a POINTER everywhere it is
+    // used (`tk_t_<M> *`), so a `[]<Class>` element is `tk_t_<M> *` — same shape as a slice of a
+    // recursive struct's boxed back-edge. Step 2 below (cg_emit_types_ordered) emits ALL slice
+    // typedefs before the fixpoint that emits named (struct/variant/class) BODIES, so a
+    // `tk_slice_<Class>` typedef referencing `tk_t_<Class> *` needs the class's forward typedef
+    // to exist by then — exactly the same requirement a struct/variant already gets here. Without
+    // this, `cc` fails with "unknown type name 'tk_t_<Class>'" on the FIRST reference (the slice's
+    // `ptr` field), even though the class's own full typedef is emitted later in the same unit.
     for (size_t i = 0; i < prog.nitems; i += 1) {
         tk_titem it = prog.items[i];
         if (it.tag != TK_TITEM_TYPE_DECL) continue;
         tk_type_decl d = it.as.type_decl;
-        if (d.body.tag == TK_BODY_STRUCT || d.body.tag == TK_BODY_VARIANT) {
+        if (d.body.tag == TK_BODY_STRUCT || d.body.tag == TK_BODY_VARIANT || d.body.tag == TK_BODY_CLASS) {
             cb(&b, "typedef struct ");
             mangle_type_name(&b, (tk_str){ NULL, 0 }, d.name);
             cb(&b, " ");
+            mangle_type_name(&b, (tk_str){ NULL, 0 }, d.name);
+            cb(&b, ";\n");
+            // (#98) a POLYMORPHIC base ALSO gets a companion FAT-POINTER typedef
+            // `tk_base_<name>` — the D3 `{ data, vtable }` two-word rep a base-typed
+            // slot lowers to. (A sealed class needs none — it is never a base.)
+            if (d.body.tag == TK_BODY_CLASS && d.body.as.class_body.kind != TK_CLASS_SEALED) {
+                cb(&b, "typedef struct { void *data; void *const *vtable; } tk_base_");
+                cb_tysym(&b, d.name);
+                cb(&b, ";\n");
+            }
+        }
+        // (W10b.D3) an INTERFACE (contract) value is a data+vtable FAT POINTER — the tk_closure-
+        // shaped two-word rep. It embeds nothing and nothing orders before it, so the FULL typedef
+        // lands here in the forward pass (a class/struct field of contract type then just works).
+        if (d.body.tag == TK_BODY_INTERFACE) {
+            cb(&b, "typedef struct { void *data; void *const *vtable; } ");
             mangle_type_name(&b, (tk_str){ NULL, 0 }, d.name);
             cb(&b, ";\n");
         }
@@ -5211,6 +5901,69 @@ tk_cstr_result tk_emit_c(tk_tprogram prog) {
         cb(&b, ";\n");
     }
     cb(&b, "\n");
+    // (W10b.D3) per-(class, contract) VTABLES — one static table per conforming pair, built at
+    // COMPILE time (conformance is nominal and closed-world; no runtime reflection). Slot i is
+    // the contract's i-th EFFECTIVE method (extends-transitive first, then own — the checker's
+    // iface_slot agrees by construction). Identical signatures across contracts share the SAME
+    // fn-ptr for free: every slot points at the class's ONE stamped method function. Emitted
+    // after the prototypes (the fn names must be declared) and before any body; `-w` on the
+    // generated C keeps an unused table warning-free.
+    {
+        tk_type_table vt_table = tk_type_table_of(prog);
+        for (size_t ci = 0; ci < prog.nitems; ci += 1) {
+            if (prog.items[ci].tag != TK_TITEM_TYPE_DECL) continue;
+            tk_type_decl cd = prog.items[ci].as.type_decl;
+            if (cd.body.tag != TK_BODY_CLASS) continue;
+            for (size_t ii = 0; ii < prog.nitems; ii += 1) {
+                if (prog.items[ii].tag != TK_TITEM_TYPE_DECL) continue;
+                tk_type_decl idd = prog.items[ii].as.type_decl;
+                if (idd.body.tag == TK_BODY_INTERFACE && tk_type_conforms_to(cd.name, idd.name, vt_table)) {
+                    tk_methodsvec_result ms = tk_iface_methods_by_name(idd.name, vt_table);
+                    if (!ms.ok) { tk_free0(b.ptr); return cg_err("codegen: interface method list failed (internal)"); }
+                    cb(&b, "static void *const tk_vt_");
+                    cb_tysym(&b, cd.name); cb(&b, "_"); cb_tysym(&b, idd.name);
+                    cb(&b, "[] = {");
+                    if (ms.as.value.len == 0) cb(&b, " (void *)0");   // a methodless contract still gets a (never-indexed) one-slot table
+                    for (size_t mi = 0; mi < ms.as.value.len; mi += 1) {
+                        tk_str mns;
+                        if (!cg_find_method_ns(cd.name, ms.as.value.ptr[mi].name, &mns)) {
+                            tk_free0(b.ptr);
+                            return cg_err("codegen: conforming class is missing an interface method's stamped function (internal)");
+                        }
+                        cb(&b, mi == 0 ? " (void *)&" : ", (void *)&");
+                        cb_fn_name(&b, mns, ms.as.value.ptr[mi].name);
+                    }
+                    cb(&b, " };\n");
+                }
+                // (#98) per-(class, BASE) vtable — `tk_vt_<Sub>_<Base>` — for every
+                // POLYMORPHIC base `cd` IS-A (itself included, so a self-upcast of a
+                // directly-instantiable virtual base resolves too). Slot i is the
+                // base's i-th EFFECTIVE method (base_vtable_slot agrees). Each slot
+                // points at THIS class's stamped method (the override, if any).
+                bool idd_is_poly_base = cg_is_polymorphic_base(idd.name);
+                bool cd_is_a = cg_name_eq(cd.name, idd.name) || cg_subclass_reaches(cd.name, idd.name, 64);
+                if (idd_is_poly_base && cd_is_a) {
+                    tk_methodsvec_result bms = tk_base_vtable_methods(idd.name, vt_table);
+                    if (!bms.ok) { tk_free0(b.ptr); return cg_err("codegen: base method list failed (internal)"); }
+                    cb(&b, "static void *const tk_vt_");
+                    cb_tysym(&b, cd.name); cb(&b, "_"); cb_tysym(&b, idd.name);
+                    cb(&b, "[] = {");
+                    if (bms.as.value.len == 0) cb(&b, " (void *)0");
+                    for (size_t bmi = 0; bmi < bms.as.value.len; bmi += 1) {
+                        tk_str bmns;
+                        if (!cg_find_method_ns(cd.name, bms.as.value.ptr[bmi].name, &bmns)) {
+                            tk_free0(b.ptr);
+                            return cg_err("codegen: subclass is missing a base method's stamped function (internal)");
+                        }
+                        cb(&b, bmi == 0 ? " (void *)&" : ", (void *)&");
+                        cb_fn_name(&b, bmns, bms.as.value.ptr[bmi].name);
+                    }
+                    cb(&b, " };\n");
+                }
+            }
+        }
+        cb(&b, "\n");
+    }
     // (W10) capturing lambdas: env-struct typedefs + lifted-fn forward declarations.
     if (!cg_emit_lambda_decls(&b, true, &err)) { tk_free0(b.ptr); return cg_err(err); }
     cb(&b, "\n");

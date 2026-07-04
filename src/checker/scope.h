@@ -14,9 +14,15 @@ typedef struct { tk_str name; tk_type type; bool is_mut; tk_str ns; } tk_val_bin
 // bare-name collision (#41). Defined manually (not TK_LIST) so it can carry cur_ns.
 // `owner_type` (W10b.CLASS) — the DECLARING class of the method body CURRENTLY being typed (empty
 // — not inside any class method). See scope.tks's Env doc for the full rationale.
-typedef struct { tk_val_binding *ptr; size_t len; size_t cap; tk_str cur_ns; tk_str owner_type; } tk_env;
-static inline tk_env tk_env_empty(void) { return (tk_env){ .ptr = NULL, .len = 0, .cap = 0, .cur_ns = (tk_str){0}, .owner_type = (tk_str){0} }; }
+// (#148) TWO-SEGMENT env: `base`/`base_len` hold the SEALED collected globals (immutable after
+// tk_env_seal — shared by every fork, never re-copied), `ptr`/`len` the per-scope locals. The
+// copy-on-extend in tk_env_define now copies only the LOCAL segment (a few dozen entries), not
+// the whole global table (measured 1.3 GB of ~287 KB whole-env copies on a self-build). Lookups
+// scan locals innermost-first, then base innermost-first (locals shadow globals).
+typedef struct { tk_val_binding *base; size_t base_len; tk_val_binding *ptr; size_t len; size_t cap; tk_str cur_ns; tk_str owner_type; } tk_env;
+static inline tk_env tk_env_empty(void) { return (tk_env){ .base = NULL, .base_len = 0, .ptr = NULL, .len = 0, .cap = 0, .cur_ns = (tk_str){0}, .owner_type = (tk_str){0} }; }
 static inline tk_env tk_env_with_owner(tk_env env, tk_str owner) { env.owner_type = owner; return env; }
+tk_env tk_env_seal(tk_env env);   // (#148) move accumulated bindings into the immutable base (collect→type boundary)
 
 TK_RESULT(tk_type, tk_type_result);            // Type | error
 TK_RESULT(tk_val_binding, tk_binding_result);  // ValBinding | error (carries is_mut — B.21)

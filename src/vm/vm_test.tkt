@@ -282,6 +282,49 @@ fn ref_struct_same_var_aliased_holds() {
 }
 
 // ---------------------------------------------------------------------------
+// (#88 follow-up) STRUCT field assignment is COPY-ON-WRITE — value semantics. A struct copy
+// (`mut b = a`) is INDEPENDENT: writing `b.f = v` must NOT mutate `a`. The vm.c field-write path
+// must rebuild the struct (copy-on-write) rather than write through a shared fields.vals[] array;
+// these tests lock that invariant on the VM (and, run through `teko build`, on native too). They
+// would FAIL under the earlier in-place write (a's field would see b's mutation). Classes stay
+// reference-semantic (aliased) — see examples/regressions/field_assignment for that side.
+// ---------------------------------------------------------------------------
+
+// a direct copy, then a field write through the copy — the original must be UNCHANGED.
+#test
+fn struct_copy_field_write_is_value_semantic() {
+    mut a = Point { x = 1; y = 2 }
+    mut b = a                                    // b is an independent COPY (value semantics)
+    b.x = 99
+    teko::assert::is_true(a.x == 1)              // a is UNCHANGED by the write through b
+    teko::assert::is_true(b.x == 99)
+    teko::assert::is_true(a.y == 2)
+}
+
+// writing a local copy of a struct PARAM must leave the caller's struct intact (param-boundary copy).
+fn vt_bump_local(p: Point) -> i64 { mut local = p; local.x = 999; local.x }
+#test
+fn struct_param_copy_field_write_is_value_semantic() {
+    let orig = Point { x = 5; y = 6 }
+    teko::assert::is_true(vt_bump_local(orig) == 999)
+    teko::assert::is_true(orig.x == 5)           // the caller's struct is UNCHANGED
+}
+
+// nested struct-in-struct copy: writing an INNER field through a copy must not corrupt the source's
+// inner field (the copy-on-write must rebuild up the whole chain, not share the inner struct's array).
+type VtInner = struct { z: i64 }
+type VtOuter = struct { inner: VtInner; w: i64 }
+#test
+fn struct_nested_copy_field_write_is_value_semantic() {
+    mut a = VtOuter { inner = VtInner { z = 1 }; w = 10 }
+    mut b = a                                    // independent COPY (deep value)
+    b.inner.z = 77
+    teko::assert::is_true(a.inner.z == 1)        // a's nested field UNCHANGED
+    teko::assert::is_true(b.inner.z == 77)
+    teko::assert::is_true(a.w == 10)
+}
+
+// ---------------------------------------------------------------------------
 // W9a fix — a deref-WRITE through a `Ref<T?>` (an OPTIONAL inner) must PRESENT-wrap the value
 // before the cell write (the binding/return present-wrap, via coerce_to(a.bound)). Without it the
 // VM stored a BARE value and a later `?? / ?.` read PANICKED ("coalesce left operand is not
@@ -444,6 +487,71 @@ fn slice_same_type_noop_copy_holds() {
     let copy: []i64 = pw_make_ints()
     teko::assert::is_true(copy[0] == 11)
     teko::assert::is_true(copy[1] == 22)
+}
+
+// (#81) NESTED slices ([][]T): construction from a nested literal, chained indexing m[i][j],
+// and len at BOTH depths — over rows of DIFFERENT lengths. Native codegen lowers the element
+// type via the slice_<elem> mangle (tk_slice_slice_i64), same values as the VM.
+#test
+fn nested_slice_construct_index_len_hold() {
+    let rows: [][]i64 = [[1], [2, 3]]
+    teko::assert::is_true(rows.len == 2)
+    teko::assert::is_true(rows[0].len == 1)
+    teko::assert::is_true(rows[1].len == 2)
+    teko::assert::is_true(rows[0][0] == 1)
+    teko::assert::is_true(rows[1][0] == 2)
+    teko::assert::is_true(rows[1][1] == 3)
+}
+
+// (#81) pushing a row into a [][]i64 and spreading nested slices both preserve elements.
+#test
+fn nested_slice_push_and_spread_hold() {
+    mut acc: [][]i64 = [[10]]
+    acc = teko::list::push(acc, [20, 30])
+    teko::assert::is_true(acc.len == 2)
+    teko::assert::is_true(acc[1][1] == 30)
+    let joined: [][]i64 = [..acc, [40]]
+    teko::assert::is_true(joined.len == 3)
+    teko::assert::is_true(joined[0][0] == 10)
+    teko::assert::is_true(joined[2][0] == 40)
+}
+
+// (#83) a NESTED slice literal with an EMPTY inner row, under an annotated outer type: the
+// annotation (`[][]i64`) supplies the element type for `[]`'s otherwise-untyped sentinel. Ran fine
+// on the VM before the fix (the VM ignores element types); native codegen honest-stopped ("an
+// untyped empty slice needs a known element type from context") because the checker's element-type
+// JOIN (tk_type_join / type_join) silently discarded the concrete `[]i64` when the sentinel `[]`
+// happened to be the FIRST array entry (the permissive sentinel-vs-concrete tk_type_eq made the
+// join's "equal -> return a" shortcut keep the LESS informative side). Fixed by preferring the
+// concrete side in the join and retyping any sibling sentinel element once the join settles.
+#test
+fn nested_slice_leading_empty_row_under_annotation_holds() {
+    let m: [][]i64 = [[], [1]]
+    teko::assert::is_true(m.len == 2)
+    teko::assert::is_true(m[0].len == 0)
+    teko::assert::is_true(m[1].len == 1)
+    teko::assert::is_true(m[1][0] == 1)
+}
+
+// (#83) ragged rows with an EMPTY MIDDLE row (not first, not last) — the join must fold the
+// sentinel out no matter its position among the siblings.
+#test
+fn nested_slice_ragged_rows_with_empty_middle_row_hold() {
+    let m: [][]i64 = [[1], [], [2, 3]]
+    teko::assert::is_true(m.len == 3)
+    teko::assert::is_true(m[0][0] == 1)
+    teko::assert::is_true(m[1].len == 0)
+    teko::assert::is_true(m[2][0] == 2)
+    teko::assert::is_true(m[2][1] == 3)
+}
+
+// (#83) a FLAT annotated empty slice (`let a: []i64 = []`) — the single-level counterpart of the
+// nested case above (already handled by type_binding's own sentinel-adopt path, #4); locked here
+// alongside the nested fixtures so the whole family stays covered together.
+#test
+fn flat_annotated_empty_slice_holds() {
+    let a: []i64 = []
+    teko::assert::is_true(a.len == 0)
 }
 
 // ===========================================================================
@@ -684,6 +792,33 @@ fn ref_value_position_match_subject_holds() {
     teko::assert::is_true(x == 42)         // and the mutation is visible after the match
 }
 
+// (issue #106) a value-returning Ref<T> call NESTED INSIDE A BUILTIN ARGUMENT — the twin of
+// case (2)'s `add1(bumpr(x))` above, but the outer call is `teko::assert::is_true(...)` (a VM
+// BUILTIN, routed through try_builtin/call_value) instead of a user fn (routed through
+// bind_call_args). Pre-fix, `call_value` threw away try_builtin's updated env and returned the
+// STALE pre-call `env`, so `x`'s write through `bumpr`'s Ref<i64> param never reached the
+// caller once the assert statement finished — the very NEXT statement (`x == 42`) still saw the
+// old value on the self-hosted VM only (vm.c's g_cells is a global shared by pointer, immune).
+#test
+fn ref_write_inside_builtin_arg_survives() {
+    mut x: i64 = 41
+    teko::assert::is_true(bumpr(x) == 42)  // bumpr(x): x→42 inside the assert's argument expr
+    teko::assert::is_true(x == 42)         // the write must have reached the caller's `x`
+}
+
+// (issue #106) the SAME shape but with TWO builtin-argument ref writes in sequence (str_contains
+// takes two args) — proves the env threads BETWEEN args within a single builtin call, not just
+// out of it. Uses two independent scalars so ordering is unambiguous.
+fn mark(r: Ref<i64>, v: i64) -> str { r.value = v; "ok" }
+#test
+fn ref_writes_inside_two_arg_builtin_survive() {
+    mut a: i64 = 0
+    mut b: i64 = 0
+    teko::assert::str_contains(mark(a, 10), mark(b, 20))
+    teko::assert::is_true(a == 10)         // first arg's ref write reached the caller
+    teko::assert::is_true(b == 20)         // second arg's ref write reached the caller
+}
+
 // (6) NON-SCALAR Ref<Point> in value position: a value-returning struct-ref fn used in `let`.
 // `setget(p, 42)` whole-replaces p.x with 42 and RETURNS the new p.x (42). p observes the write.
 fn setget(r: Ref<Point>, v: i64) -> i64 { r.value = Point { x = v; y = r.value.y }; r.value.x }
@@ -694,4 +829,419 @@ fn ref_value_position_struct_holds() {
     teko::assert::is_true(got == 42)       // the returned new x
     teko::assert::is_true(p.x == 42)       // the whole-replace reached the caller's `p`
     teko::assert::is_true(p.y == 2)        // y preserved
+}
+
+// =============================================================================================
+// (#50) FLAGS member VALUES at runtime — a flags path expression `Type::Member` evaluates to
+// 1 << ordinal (power-of-2), NOT the ordinal, in BOTH engines. The pre-#50 VM lowered the
+// ordinal (Read=0, Write=1, Exec=2), so any mask.has(VmPerm::Read) was vacuously true
+// ((recv & 0) == 0). Native codegen's pre-emitted constants were always correct — these tests
+// pin the VM twins to the same values (the .tkt gate runs under BOTH the C and the .tks VM).
+// =============================================================================================
+flags VmPerm {
+    Read
+    Write
+    Exec
+}
+
+// Member values are distinct powers of two: Read=1, Write=2, Exec=4. Observed through `has`
+// ((recv & mask) == mask) — under the ordinal bug Read=0 made every has(Read) true.
+#test
+fn flags_member_values_are_powers_of_two() {
+    let w = VmPerm::Write
+    teko::assert::is_false(w.has(VmPerm::Read))    // 2 & 1 == 0 ≠ 1 (ordinal bug: 1 & 0 == 0 → true)
+    teko::assert::is_true(w.has(VmPerm::Write))    // 2 & 2 == 2
+    teko::assert::is_false(w.has(VmPerm::Exec))    // 2 & 4 == 0 ≠ 4
+    let e = VmPerm::Exec
+    teko::assert::is_false(e.has(VmPerm::Read))    // 4 & 1 == 0 ≠ 1 (ordinal bug: 2 & 0 == 0 → true)
+    teko::assert::is_false(e.has(VmPerm::Write))   // 4 & 2 == 0 ≠ 2
+    teko::assert::is_true(e.has(VmPerm::Exec))     // 4 & 4 == 4
+}
+
+// add = recv | mask; remove = recv & ~mask (the ~ runs at the flags CARRIER width, u8 here).
+#test
+fn flags_add_remove_hold() {
+    let p  = VmPerm::Read
+    let p2 = p.add(VmPerm::Write)                  // {Read, Write} = 3
+    teko::assert::is_true(p2.has(VmPerm::Read))
+    teko::assert::is_true(p2.has(VmPerm::Write))
+    teko::assert::is_false(p2.has(VmPerm::Exec))
+    let p3 = p2.remove(VmPerm::Read)               // {Write} = 2 (ordinal bug: 1 & ~0 == 1 → has(Read) stayed true)
+    teko::assert::is_false(p3.has(VmPerm::Read))
+    teko::assert::is_true(p3.has(VmPerm::Write))
+    teko::assert::is_false(p3.has(VmPerm::Exec))
+}
+
+// all = (recv & mask) == mask (same lowering as has, exercised with a COMPOSED mask);
+// any/none compare (recv & mask) against the checker's fabricated flags-typed ZERO literal —
+// pre-#50 that zero node ABORTED both VM twins ("number literal with a non-primitive type").
+#test
+fn flags_all_any_none_hold() {
+    let r  = VmPerm::Read
+    let p  = r.add(VmPerm::Exec)                   // {Read, Exec} = 5
+    let rw = r.add(VmPerm::Write)                  // {Read, Write} = 3
+    let re = r.add(VmPerm::Exec)                   // {Read, Exec} = 5
+    teko::assert::is_true(p.all(re))               // 5 & 5 == 5
+    teko::assert::is_false(p.all(rw))              // 5 & 3 == 1 ≠ 3
+    teko::assert::is_true(p.any(rw))               // 5 & 3 == 1 ≠ 0
+    teko::assert::is_false(p.any(VmPerm::Write))   // 5 & 2 == 0
+    teko::assert::is_true(p.none(VmPerm::Write))   // 5 & 2 == 0
+    teko::assert::is_false(p.none(VmPerm::Exec))   // 5 & 4 == 4 ≠ 0
+}
+
+// (#47) str membership `s in [ … ]` compares CONTENT (tk_str_eq semantics, same as `==` on str),
+// not pointer identity — a runtime-built str must still match a literal element. Locks the VM
+// behavior the native codegen mirrors via tk_str_eq (issue #47).
+#test
+fn str_in_membership_holds() {
+    let method = "post"
+    teko::assert::is_true(method in ["get", "post"])            // literal-bound lhs
+    teko::assert::is_false("delete" in ["get", "post"])         // absent → false
+    let built = teko::str::concat("po", "st")                   // runtime-built content
+    teko::assert::is_true(built in ["get", "post"])             // content equality, not identity
+    teko::assert::is_false(built in [])                         // empty set → always false
+}
+
+// (#47) string-literal match patterns select by CONTENT equality — first matching arm wins,
+// wildcard catches the rest. Locks the VM behavior the native codegen mirrors via tk_str_eq
+// on the subject temp (issue #47).
+#test
+fn str_literal_match_holds() {
+    let one = match "build" { "build" => 1; "run" => 2; _ => 0 }
+    teko::assert::is_true(one == 1)
+    let two = match "run" { "build" => 1; "run" => 2; _ => 0 }
+    teko::assert::is_true(two == 2)
+    let zero = match "nope" { "build" => 1; "run" => 2; _ => 0 }
+    teko::assert::is_true(zero == 0)
+    let built = teko::str::concat("bu", "ild")                  // runtime-built subject
+    let bcode = match built { "build" => 1; _ => 0 }
+    teko::assert::is_true(bcode == 1)                           // content equality, not identity
+}
+
+// ── OOP ROUND 3 / C1 — FALLIBLE class factories (`C | error`) ────────────────────────────────
+// A class's static factory may return `C | error` (validated construction). The subject of the
+// consuming `match` is a CLASS instance (a ClassRef cell in the VM) or an `error`; the class arm
+// matches by the class NAME through the cell deref (pat_match's C1 branch) and binds the ORIGINAL
+// reference (class reference semantics survive the match).
+
+type VmCounter = class {
+    pub label: str
+    pub count: i64
+
+    // fallible factory: DEFARGS default on `start` + validation → `VmCounter | error`.
+    pub fn open(label: str, start: i64 = 0) -> VmCounter | error {
+        if start < 0 { return error { message = "negative start" } }
+        VmCounter { label = label; count = start }
+    }
+
+    pub fn read(self) -> i64 {
+        self.count
+    }
+
+    pub fn tagged(self) -> str {
+        self.label
+    }
+}
+
+type VmCounterPair = class {
+    pub left: VmCounter
+    pub right: VmCounter
+
+    // NESTED fallible factories: each inner error propagates out of the outer factory.
+    pub fn open_pair(l: str, r: str, start: i64 = 0) -> VmCounterPair | error {
+        let lc = match VmCounter::open(l, start = start) { VmCounter as c => c; error as e => return e }
+        let rc = match VmCounter::open(r, start = start) { VmCounter as c => c; error as e => return e }
+        VmCounterPair { left = lc; right = rc }
+    }
+}
+
+// success arm: the class member of the union matches by name and binds a usable instance.
+#test
+fn fallible_factory_success_arm_holds() {
+    let made = VmCounter::open("jobs", start = 2)
+    let got = match made { VmCounter as c => c.read(); error => -1 }
+    teko::assert::is_true(got == 2)
+}
+
+// error arm: validation failure routes to the `error` member with the factory's message.
+#test
+fn fallible_factory_error_arm_holds() {
+    let bad = VmCounter::open("jobs", start = -5)
+    let msg = match bad { VmCounter => "" ; error as e => e.message }
+    teko::assert::is_true(msg == "negative start")
+}
+
+// DEFARGS: the defaulted `start` still flows through the union's success arm.
+#test
+fn fallible_factory_default_arg_holds() {
+    let made = VmCounter::open("jobs")                    // start defaults to 0
+    let got = match made { VmCounter as c => c.read(); error => -1 }
+    teko::assert::is_true(got == 0)
+}
+
+// the match arm binds a fully usable instance: methods and field reads both work on the
+// binding, and a second alias of the binding reads the SAME object (class reference semantics
+// survive the match — the arm binds the ClassRef, not a copied payload).
+#test
+fn fallible_factory_binding_is_usable() {
+    let made = VmCounter::open("jobs", start = 1)
+    match made {
+        VmCounter as c => {
+            teko::assert::is_true(c.tagged() == "jobs")
+            teko::assert::is_true(c.label == "jobs")
+            let alias = c
+            teko::assert::is_true(alias.read() == 1)
+        }
+        error => teko::assert::is_true(false)
+    }
+}
+
+// arm ORDER does not matter: with the `error` arm FIRST, a class instance must fall
+// through it (the C1 cell-deref branch takes the MISS path: ClassRef payload name != "error")
+// and still land on its class arm.
+#test
+fn fallible_factory_error_arm_first_misses_class() {
+    let made = VmCounter::open("jobs", start = 7)
+    let got = match made { error => -1; VmCounter as c => c.read() }
+    teko::assert::is_true(got == 7)
+}
+
+// nested factories: success builds both inners; an inner failure propagates the inner error.
+#test
+fn fallible_factory_nested_holds() {
+    let ok = VmCounterPair::open_pair("l", "r", start = 3)
+    let sum = match ok { VmCounterPair as p => p.left.read() + p.right.read(); error => -1 }
+    teko::assert::is_true(sum == 6)
+    let bad = VmCounterPair::open_pair("l", "r", start = -1)
+    let msg = match bad { VmCounterPair => ""; error as e => e.message }
+    teko::assert::is_true(msg == "negative start")
+}
+
+// ── OOP ROUND 3 / D3 — DYNAMIC dispatch (interface values + vtable) ─────────────────────────
+// An interface-typed VALUE dispatches to the CONCRETE class's method at runtime: natively a
+// data+vtable fat pointer, in the VM the ClassRef cell itself (the payload's class name picks
+// the method). These run in BOTH engines' VMs via the test gate; the native lowering is locked
+// by examples/regressions/interface_dispatch (differential, VM == native).
+
+type VmShape = interface {
+    fn area(self) -> i64
+    fn grown(self, extra: i64) -> i64
+}
+
+type VmNamedShape = interface VmShape {
+    fn shape_name(self) -> str
+}
+
+type VmCircleD3 = class & VmShape {
+    pub r: i64
+    pub fn make(rr: i64) -> VmCircleD3 { VmCircleD3 { r = rr } }
+    pub fn area(self) -> i64 { self.r * self.r * 3 }
+    pub fn grown(self, extra: i64) -> i64 { self.area() + extra }
+}
+
+type VmSquareD3 = class & VmNamedShape {
+    pub side: i64
+    pub fn make(s: i64) -> VmSquareD3 { VmSquareD3 { side = s } }
+    pub fn area(self) -> i64 { self.side * self.side }
+    pub fn grown(self, extra: i64) -> i64 { self.area() + extra }
+    pub fn shape_name(self) -> str { "square" }
+}
+
+type VmSpeaker = interface {
+    fn speak(self) -> str
+}
+
+type VmAnimalD3 = virtual class & VmSpeaker {
+    pub legs: i64
+    pub fn make_animal(n: i64) -> VmAnimalD3 { VmAnimalD3 { legs = n } }
+    pub virtual fn speak(self) -> str { "..." }
+}
+
+type VmDogD3 = class VmAnimalD3 {
+    pub fn make_dog() -> VmDogD3 { VmDogD3 { legs = 4 } }
+    pub override fn speak(self) -> str { "woof" }
+}
+
+// interface value as a PARAM — the call upcasts a class arg on the fly.
+fn vm_shape_area(s: VmShape) -> i64 { s.area() }
+
+// interface value as a RETURN — the return position upcasts the concrete class.
+fn vm_pick_shape(which: i64) -> VmShape {
+    if which == 0 { return VmCircleD3::make(1) }
+    return VmSquareD3::make(5)
+}
+
+// heterogeneous `[]VmShape` — mixed concrete classes behind one element type.
+fn vm_total_area(shapes: []VmShape) -> i64 {
+    mut sum: i64 = 0
+    mut i: u64 = 0
+    loop {
+        if i >= shapes.len { break }
+        let s = shapes[i]
+        sum = sum + s.area()
+        i++
+    }
+    sum
+}
+
+// (D2) static dispatch `<T: I>` — an interface IS a valid constraint; a conforming class
+// instantiates the generic (opaque hold: store/pass/return T without operating on it).
+fn vm_hold_shape<T: VmShape>(x: T) -> T { return x }
+
+// upcast at a local binding + dynamic dispatch through the interface value.
+#test
+fn iface_dispatch_upcast_local() {
+    let c = VmCircleD3::make(2)
+    let s: VmShape = c
+    teko::assert::is_true(s.area() == 12)
+}
+
+// non-receiver args flow through the dispatch.
+#test
+fn iface_dispatch_args_flow() {
+    let sq = VmSquareD3::make(3)
+    let s: VmShape = sq
+    teko::assert::is_true(s.grown(5) == 14)
+}
+
+// interface value as a param + as a return value.
+#test
+fn iface_dispatch_param_and_return() {
+    let c = VmCircleD3::make(2)
+    teko::assert::is_true(vm_shape_area(c) == 12)
+    let p = vm_pick_shape(1)
+    teko::assert::is_true(p.area() == 25)
+    let q = vm_pick_shape(0)
+    teko::assert::is_true(q.area() == 3)
+}
+
+// heterogeneous []VmShape: mixed classes summed through per-element dispatch.
+#test
+fn iface_dispatch_heterogeneous_array() {
+    let c = VmCircleD3::make(2)
+    let sq = VmSquareD3::make(3)
+    let shapes: []VmShape = [c, sq]
+    teko::assert::is_true(vm_total_area(shapes) == 21)
+}
+
+// `extends`-transitive dispatch: a VmNamedShape value reaches BOTH the extended base
+// contract's methods (area, slot 0 in the extended list) and its own (shape_name).
+#test
+fn iface_dispatch_extends_transitive() {
+    let sq = VmSquareD3::make(4)
+    let n: VmNamedShape = sq
+    teko::assert::is_true(n.area() == 16)
+    teko::assert::is_true(n.shape_name() == "square")
+    // upcast to the extended BASE contract directly (its own vtable/slot order)
+    let s: VmShape = sq
+    teko::assert::is_true(s.area() == 16)
+}
+
+// a virtual override dispatches through the contract: the DERIVED class conforms via the
+// BASE's declared implements, and the override (not the base body) runs.
+#test
+fn iface_dispatch_virtual_override() {
+    let d = VmDogD3::make_dog()
+    let sp: VmSpeaker = d
+    teko::assert::is_true(sp.speak() == "woof")
+    let a = VmAnimalD3::make_animal(2)
+    let sa: VmSpeaker = a
+    teko::assert::is_true(sa.speak() == "...")
+}
+
+// (issue #106 × D3) COMPOSITION probe — the two features that now share eval_call/call_value:
+// an interface-METHOD call (routed through the `is_iface_dispatch` guard, which runs FIRST)
+// whose non-receiver ARGUMENT contains a Ref<i64> write, all nested INSIDE a builtin's
+// argument (routed through try_builtin's BuiltinRes env-threading). The env must thread the
+// whole chain: try_builtin → eval_expr(arg) → eval_call → is_iface_dispatch →
+// eval_iface_call (its arg eval threads the caller env) → back out through BuiltinRes.env
+// into the statement's caller — so `x` observes the write AFTER the assert statement.
+#test
+fn iface_dispatch_ref_write_inside_builtin_arg_composes() {
+    let sq = VmSquareD3::make(3)
+    let s: VmShape = sq
+    mut x: i64 = 4
+    teko::assert::is_true(s.grown(bumpr(x)) == 14)   // bumpr(x): x→5, yields 5; grown(5) = 9 + 5
+    teko::assert::is_true(x == 5)                    // the Ref write survived BOTH layers
+}
+
+// (D2 locking) `<T: I>` accepts a conforming CLASS argument and the instance survives the
+// opaque hold (reference semantics intact — the same object comes back).
+#test
+fn iface_constraint_accepts_conforming_class() {
+    let c = VmCircleD3::make(3)
+    let held = vm_hold_shape(c)
+    teko::assert::is_true(held.area() == 27)
+    teko::assert::is_true(vm_shape_area(held) == 27)
+}
+
+// (#102) HOMOGENEOUS CLASS SLICES — the VM has always evaluated `[]<Class>` correctly (these
+// tests already held pre-fix); the bug was native-only (a `tk_slice_<Class>` typedef emitted
+// before the class's own `tk_t_<Class>` typedef was visible → `cc` failed with "unknown type
+// name"). These lock the VM side of the corpus and are mirrored by a differential native
+// regression (examples/regressions/class_slices) so both engines agree end-to-end.
+type VmPointD3 = class {
+    pub x: i64
+    pub y: i64
+    pub fn make(xx: i64, yy: i64) -> VmPointD3 { VmPointD3 { x = xx; y = yy } }
+    pub fn sum(self) -> i64 { self.x + self.y }
+}
+
+// construction + len + indexed method-call dispatch on a plain (non-interface) class slice.
+#test
+fn class_slice_construct_index_len_holds() {
+    let pts: []VmPointD3 = [VmPointD3::make(1, 2), VmPointD3::make(3, 4)]
+    teko::assert::is_true(pts.len == 2)
+    teko::assert::is_true(pts[0].sum() == 3)
+    teko::assert::is_true(pts[1].sum() == 7)
+}
+
+// nested `[][]<Class>` — a slice of class-slices, chained indexing + per-row len.
+#test
+fn class_slice_nested_holds() {
+    let row0: []VmPointD3 = [VmPointD3::make(1, 1), VmPointD3::make(2, 2)]
+    let row1: []VmPointD3 = [VmPointD3::make(3, 3)]
+    let grid: [][]VmPointD3 = [row0, row1]
+    teko::assert::is_true(grid.len == 2)
+    teko::assert::is_true(grid[0].len == 2)
+    teko::assert::is_true(grid[1].len == 1)
+    teko::assert::is_true(grid[0][1].sum() == 4)
+    teko::assert::is_true(grid[1][0].sum() == 6)
+}
+
+// a class slice held as a STRUCT FIELD, and passed as a PARAM / returned from a fn.
+type VmPointGroupD3 = struct { members: []VmPointD3 }
+
+fn vm_sum_points(pts: []VmPointD3) -> i64 {
+    mut total: i64 = 0
+    mut i: u64 = 0
+    loop {
+        if i >= pts.len { break }
+        total = total + pts[i].sum()
+        i++
+    }
+    total
+}
+
+fn vm_make_points(a: i64, b: i64) -> []VmPointD3 {
+    [VmPointD3::make(a, 0), VmPointD3::make(b, 0)]
+}
+
+#test
+fn class_slice_field_param_return_holds() {
+    let g = VmPointGroupD3 { members = vm_make_points(2, 3) }
+    teko::assert::is_true(g.members.len == 2)
+    teko::assert::is_true(g.members[1].sum() == 3)
+    teko::assert::is_true(vm_sum_points(vm_make_points(4, 5)) == 9)
+}
+
+// covariant `[]<Class>` -> `[]<Interface>` upcast of a homogeneous class-slice VALUE, then
+// heterogeneous dispatch through the resulting interface slice (D3 dispatch machinery).
+#test
+fn class_slice_covariant_upcast_holds() {
+    let circles: []VmCircleD3 = [VmCircleD3::make(1), VmCircleD3::make(2)]
+    let shapes: []VmShape = circles
+    teko::assert::is_true(vm_total_area(shapes) == 15)   // 1*1*3 + 2*2*3 = 3 + 12
+    let mixed: []VmShape = [VmCircleD3::make(1), VmSquareD3::make(3)]
+    teko::assert::is_true(vm_total_area(mixed) == 12)    // 1*1*3 + 3*3 = 3 + 9
 }

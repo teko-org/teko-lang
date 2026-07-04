@@ -28,12 +28,12 @@
 
 ---
 
-## Prior art em `main` (herança pré-reboot, NÃO portada para `chore/reboot`)
+## Prior art na linha pré-reboot (histórico do git de `main`; NÃO portada para a linha atual)
 
 `main` já tem uma tentativa de extensão VS Code (`extensions/vscode/`) e um esqueleto JetBrains
 (`extensions/jetbrains/com.schivei.teko/`, TextMate-only — fora do escopo de editores deste roadmap,
 mas confirma que "gramática compartilhada" é o caminho certo). **Nenhum dos dois existe em
-`chore/reboot`** — o reboot do front-end (`REBOOT_PLAN.md`) não os carregou. Auditoria do que está lá,
+a linha atual** — o reboot do front-end (`REBOOT_PLAN.md`) não os carregou. Auditoria do que está lá,
 para reaproveitar o que serve e não repetir o que não serve:
 
 - **`language-configuration.json`** — comentários (`//`, `/* */`), brackets, auto-closing e
@@ -44,7 +44,7 @@ para reaproveitar o que serve e não repetir o que não serve:
   do projeto, hoje removidas ou nunca canônicas — ver [[teko-only-loop]]/[[teko-no-match-on-bool]] na
   memória: Teko só tem `loop`, não `for`/`switch`) e não lista `loop`/`match`/`variant`/o vocabulário
   atual. **Não portar esta gramática tal qual** — é exatamente a divergência manual que o Eixo A existe
-  para evitar; regerar do zero via A1→A2 a partir do lexer real de `chore/reboot`.
+  para evitar; regerar do zero via A1→A2 a partir do lexer real da linha atual.
 - **`src/extension.js` — comandos `teko.run`/`teko.build`.** Invocam o compilador via
   `child_process.exec` com o caminho **interpolado numa string de shell**:
   `` cp.exec(`"${compilerPath}" run "${tkpPath}"`, …) ``. **Achado de segurança:** isso é uma superfície
@@ -54,7 +54,7 @@ para reaproveitar o que serve e não repetir o que não serve:
   correção do problema.
 - **`src/extension.js` — client LSP.** Registra um `vscode-languageclient` cujo `serverOptions` chama
   `<compilerPath> check` como se fosse o processo do language server. **Esse subcomando não existe** —
-  nem no compilador antigo de `main`, nem no compilador atual de `chore/reboot` — e, mesmo que existisse,
+  nem no compilador pré-reboot, nem no compilador atual — e, mesmo que existisse,
   nada indica que falaria o protocolo LSP (JSON-RPC sobre stdio) exigido pelo `LanguageClient`. É um
   client sem servidor: o wiring existe, o servidor (Eixo C — subcomando `teko lsp`) nunca foi construído
   e está **diferido** (ver Eixo C). Ao portar, **não reativar este wiring até `teko lsp` existir de
@@ -96,7 +96,7 @@ real, e cada editor consome uma **saída gerada**, nunca uma cópia digitada à 
 
 | # | Entrega | Estado |
 |---|---|---|
-| B1 | **VS Code** — gramática TextMate embutida (consome A2) + `language-configuration.json` (comentários `//`/`/* */`, pares de bracket/aspas, indentação por bloco). | falta em `chore/reboot` (dep A2) — existe esqueleto em `main:extensions/vscode/`, mas com gramática manual e desatualizada; ver "Prior art" acima. Reaproveitar só o `language-configuration.json`. |
+| B1 | **VS Code** — gramática TextMate embutida (consome A2) + `language-configuration.json` (comentários `//`/`/* */`, pares de bracket/aspas, indentação por bloco). | falta na linha atual (dep A2) — existe esqueleto no histórico pré-reboot (`extensions/vscode/`), mas com gramática manual e desatualizada; ver "Prior art" acima. Reaproveitar só o `language-configuration.json`. |
 | B2 | **Vim/Neovim** — `syntax/teko.vim` (consome A3), `ftdetect/teko.vim` mapeando `.tks`/`.tkt` → filetype `teko` e `.tkp` → `toml` (o manifesto já É TOML — `TEKO_ROADMAP_INDEPENDENCE.md` Eixo A). *Opcional/futuro:* gramática Tree-sitter (`queries/teko/highlights.scm`) para Neovim ≥0.9, mais precisa que regex. | falta (dep A3) |
 | B3 | **Emacs** — `teko-mode.el`, modo maior derivado de `prog-mode`, `teko-font-lock-keywords` (consome A4) + `syntax-table` para comentários/strings + `.tkp` associado a `toml-mode` se instalado. | falta (dep A4) |
 | B4 | **Nano** — `teko.nanorc` (consome A5): keywords, tipos primitivos, comentários de linha/bloco, strings/interpolação. Sem contexto/aninhamento — aceita falso-positivo ocasional (limite conhecido do Nano). | falta (dep A5) |

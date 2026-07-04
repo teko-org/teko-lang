@@ -32,6 +32,21 @@ bool tk_escape_set_has(tk_escape_set set, tk_str name);
 // NOT frame-local (allocates in root, the safe default).
 bool tk_binding_is_frame_local(tk_escape_set set, tk_tstatement binding);
 
+// (S2 Level-1) tk_binding_is_frame_local_slice — a non-escaping SLICE binding (its buffer never
+// leaves the frame). Unlike the struct-init predicate the value need not be an allocation site — a
+// slice accumulator is built by later `xs = push(xs, …)` self-appends, each frame-routed.
+bool tk_binding_is_frame_local_slice(tk_escape_set set, tk_tstatement binding);
+
+// (S2 Level-1) tk_assign_routes_to_frame — THE routing predicate: is this a self-append
+// `xs = push(xs, …)` to a NON-escaping slice (its grown buffer should live in the frame region)?
+bool tk_assign_routes_to_frame(tk_escape_set set, tk_tstatement s);
+
+// (#148 S2 Level-2) tk_assign_frees_old — may this self-append's copy-grow PARK the old buffer for
+// reuse? True iff the whole-fn LINEAR-CHAIN proof holds for the assigned name (born once from
+// list::empty(), writes are self-append-only, and every non-final-statement read is a self-append
+// base — so no alias can observe a parked intermediate buffer).
+bool tk_assign_frees_old(const tk_tstatement *fn_body, size_t fn_n, tk_tstatement s);
+
 // tk_binding_is_block_local — S2: may a binding declared at the TOP LEVEL of block B (whose
 // enclosing function body is fn_body, and which yields a value iff is_value) be freed at B's exit
 // edges? True iff tk_binding_is_frame_local holds AND every textual read of the name in the whole

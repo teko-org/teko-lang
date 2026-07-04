@@ -33,6 +33,13 @@ void tk_eprintln(tk_str s);
 _Noreturn void tk_panic_div0(void);
 _Noreturn void tk_panic_cast(void);
 _Noreturn void tk_panic_oob(void);    // "index out of bounds" (the subscript guard — W5-idx, M.1)
+// issue #72 — the global diverging builtins `panic(str)` / `exit(<int>)` (legislator's ruling,
+// no `never` type — see typer.tks:595). Both terminate the WHOLE PROCESS, matching native
+// (tk_panic_str prints "teko: panic: <msg>" + backtrace then abort()s; tk_exit frees arena
+// regions then calls the libc exit(code)). Declared here (not teko_rt.h — see the note above)
+// so try_builtin_call can route to them exactly like print/println.
+_Noreturn void tk_panic_str(tk_str msg);
+_Noreturn void tk_exit(int32_t code);
 // string-interpolation builders — the VM concatenates pieces+holes via the SAME runtime
 // symbols codegen emits, so VM==codegen byte-for-byte (incl int→decimal text). EXTERN
 // (linked from teko_rt.c), not the static-inline numeric guards.
@@ -98,11 +105,14 @@ void teko__assert__str_contains(tk_str hay, tk_str needle);
 void     tk_cov_reset(void);
 void     tk_cov_mark(uint64_t id);
 uint64_t tk_cov_distinct(void);
+uint64_t tk_peak_rss(void);           // (#148) peak RSS bytes — teko::mem::peak_rss
 bool     tk_cov_is_marked(uint64_t id);
 void     tk_cov_branches_on(bool on);     // D3-branch — branch coverage (off by default)
 void     tk_cov_branch_reset(void);
 void     tk_cov_enter(uint64_t fn);
 void     tk_cov_leave(void);
+void     tk_arena_push(void);             // (#109 test-gate memory) checkpoint/rewind the root arena per test
+void     tk_arena_pop(void);
 void     tk_cov_branch(uint32_t line, uint32_t col, uint64_t outcome);
 bool     tk_cov_branch_hit(uint64_t fn, uint32_t line, uint32_t col, uint64_t outcome);
 void     tk_cov_lines_on(bool on);        // D3-line — line coverage (off by default)
@@ -452,17 +462,31 @@ static tk_value norm_int(unsigned __int128 raw, bool is_signed, int width) {
     return v_int(bits, is_signed, width);
 }
 
+// (#50) fwd — defined after g_prog (it scans the program's type decls). The VM's NUMERIC-path
+// rule for a NAMED type: a `flags`-declared name computes at its unsigned CARRIER prim; any
+// other Named is the enum-ordinal u64 (E7). Mirrors vm.tks's num_prim_of.
+static bool flags_carrier_prim(tk_str name, tk_prim_kind *out);
+static tk_prim_kind named_num_prim(tk_str name) {
+    tk_prim_kind fp;
+    if (flags_carrier_prim(name, &fp)) return fp;   // (C8.3/#50) flags → its carrier prim
+    return TK_PRIM_U64;                             // E7: enum ordinal — checker validated; stored as u64
+}
+
 // Pull the integer prim out of a node's resolved type (the node IS int-typed by the
 // checker at every use site below). A non-prim/non-int there is an internal invariant
-// break, reported honestly.
+// break, reported honestly. (#50) A NAMED type computes via named_num_prim (a flags value
+// at its carrier prim, an enum at the ordinal u64) — same rule as vm.tks's num_prim_of.
 static tk_prim_kind expr_int_prim(const tk_texpr *e, const char *ctx) {
+    if (e->type.tag == TK_TYPE_NAMED) return named_num_prim(e->type.as.named.name);
     if (e->type.tag != TK_TYPE_PRIM || !prim_is_int(e->type.as.prim)) vm_unsupported(ctx);
     return e->type.as.prim;
 }
 
 // Pull the NUMERIC prim (int OR float) out of a node's resolved type — for arithmetic
 // nodes that may be either. A non-prim/non-numeric there is an internal invariant break.
+// (#50) A NAMED type computes via named_num_prim (flags carrier / enum-ordinal u64).
 static tk_prim_kind expr_num_prim(const tk_texpr *e, const char *ctx) {
+    if (e->type.tag == TK_TYPE_NAMED) return named_num_prim(e->type.as.named.name);
     if (e->type.tag != TK_TYPE_PRIM
         || !(prim_is_int(e->type.as.prim) || prim_is_float(e->type.as.prim)))
         vm_unsupported(ctx);
@@ -493,9 +517,13 @@ static size_t g_cells_cap = 0;
 static uint64_t cell_alloc(tk_value v) {
     if (g_cells_len == g_cells_cap) {
         size_t ncap = g_cells_cap ? g_cells_cap * 2 : 8;
-        tk_value *nb = tk_alloc(ncap * sizeof *nb);
+        // (#109 test-gate memory) realloc (libc heap), NOT the arena — this static backing array must
+        // SURVIVE the per-test arena rewind (tk_arena_pop). When it grows mid-test, an arena backing
+        // would be freed by the rewind, leaving g_cells dangling (a use-after-free the never-dropped
+        // arena previously hid). The .tks twin is safe already: vm.tks threads the cell store through
+        // env.cells (a per-test slice), never a global.
+        tk_value *nb = realloc(g_cells, ncap * sizeof *nb);
         if (nb == NULL) abort();
-        for (size_t i = 0; i < g_cells_len; i += 1) nb[i] = g_cells[i];
         g_cells = nb; g_cells_cap = ncap;
     }
     uint64_t id = (uint64_t)g_cells_len;
@@ -553,6 +581,28 @@ static bool vm_str_eq(tk_str a, tk_str b) {
 
 // The whole program (so a call expr can find a top-level function by name).
 static tk_tprogram g_prog;
+
+// (#50) flags carrier prim — a NAMED type whose decl is a `flags` computes at the unsigned
+// width native codegen chose by MEMBER COUNT (1–8 → u8, 9–16 → u16, 17–32 → u32, 33–64 → u64,
+// 65–128 → u128; codegen's TK_BODY_FLAGS uint_type). True + *out iff `name` IS a flags decl.
+// Mirrors vm.tks's flags_carrier_prim.
+static bool flags_carrier_prim(tk_str name, tk_prim_kind *out) {
+    tk_str key = tk_name_last_segment(name);   // (#109 W3) bare-vs-bare (td.name canonical; name may be canonical or bare)
+    for (size_t i = 0; i < g_prog.nitems; i += 1) {
+        if (g_prog.items[i].tag != TK_TITEM_TYPE_DECL) continue;
+        tk_type_decl td = g_prog.items[i].as.type_decl;
+        if (!name_eq(tk_name_last_segment(td.name), key)) continue;
+        if (td.body.tag != TK_BODY_FLAGS) return false;
+        size_t n = td.body.as.flags_body.n_members;
+        *out = n <=  8 ? TK_PRIM_U8
+             : n <= 16 ? TK_PRIM_U16
+             : n <= 32 ? TK_PRIM_U32
+             : n <= 64 ? TK_PRIM_U64
+             :           TK_PRIM_U128;
+        return true;
+    }
+    return false;
+}
 
 // (C7.18) Per-call-frame defer stack: a simple linked list of deferred blocks.
 // Pushed as exec_stmt encounters TK_TSTMT_DEFER; drained LIFO at function exit.
@@ -617,6 +667,46 @@ static bool try_builtin_call(tk_path p, const tk_texpr *args, size_t nargs,
         *out = v_void();
         return true;
     }
+    // (mem::free) teko::mem::free(x) — reclaim isn't observable in the VM, but mirror native's SCRUB
+    // (slice → empty, class → left) so VM==native even if a later read occurs. (Mirror vm.tks.)
+    if (seg_is(last, "free") && p.len >= 2 && seg_is(p.segments[p.len - 2].name, "mem")) {
+        if (args[0].tag == TK_TEXPR_VAR && args[0].type.tag == TK_TYPE_SLICE)
+            env_define(env, args[0].as.var.name, v_list_empty());
+        *out = v_void();
+        return true;
+    }
+
+    // issue #72 — `exit(<int>)` / `panic(str)`: the injected GLOBAL diverging builtins
+    // (typer.tks:595 — no `never` type; the checker recognizes them unqualified or under the
+    // reserved `teko::` root, whichever namespace lookup finds nothing). Both terminate the
+    // WHOLE PROCESS, exactly like native (tk_exit / tk_panic_str — teko_rt.c), so `teko run`
+    // and a compiled binary agree on exit code (M.1/M.3): a success-path `exit(5)` now ends
+    // the VM with status 5 instead of aborting into the "host function" honest-stop. Neither
+    // call returns, so *out is never read after — set for consistency with the other builtins.
+    if (seg_is(last, "exit")) {
+        if (nargs != 1) vm_unsupported("exit expects exactly one argument (an integer status code)");
+        tk_value a = tk_vm_eval_expr(&args[0], env);
+        if (a.tag != TK_VAL_INT) vm_unsupported("exit's argument must be an integer status code (internal: checker should reject)");
+        tk_exit((int32_t)v_as_i128(a));   // _Noreturn — frees arena regions, then libc exit(code)
+        *out = v_void();
+        return true;
+    }
+    if (seg_is(last, "panic")) {
+        // The checker accepts `panic(error | str)` (typer.tks:595), but native codegen only
+        // wires the `str` arm today (codegen.c:1865 emits a bare `tk_panic_str(<arg>)`, which
+        // does not compile when the arg is a `tk_error` struct — a PRE-EXISTING, SEPARATE
+        // codegen gap, not this issue's VM≠native divergence; see the #72 report). Mirror that
+        // exact frontier here: `str` runs for real, `error` falls through to the honest stop
+        // (so a program using `panic(error)` fails the SAME way on both engines — neither runs).
+        if (nargs != 1) vm_unsupported("panic expects exactly one argument (an `error` or a `str`)");
+        tk_value a = tk_vm_eval_expr(&args[0], env);
+        if (a.tag == TK_VAL_STR) {
+            tk_panic_str(a.as.s);   // _Noreturn — "teko: panic: <msg>" + backtrace, frees regions, abort()
+        }
+        vm_unsupported("panic(error) not yet supported (native codegen cannot compile it either — a separate, pre-existing gap; use panic(str))");
+        *out = v_void();
+        return true;
+    }
 
     // teko::assert::* — the injected testing assertions. Recognized as a `teko`-rooted
     // path whose tail is `assert::<name>` (mirrors codegen emitting teko__assert__<name>;
@@ -653,13 +743,18 @@ static bool try_builtin_call(tk_path p, const tk_texpr *args, size_t nargs,
     // v_list_push) so `xs = teko::list::push(xs, item)` never mutates a captured `xs`.
     bool list_ns = (p.len >= 2) && seg_is(p.segments[0].name, "teko")
                                 && seg_is(p.segments[p.len - 2].name, "list");
-    if (list_ns) {
+    // (#148 R3) teko::mem::push_fo — the VM appends exactly like teko::list::push (free-old is a
+    // NATIVE allocation strategy; semantics are identical for the linear chains the decree covers).
+    bool mem_pushfo = (p.len >= 2) && seg_is(p.segments[0].name, "teko")
+                                   && seg_is(p.segments[p.len - 2].name, "mem")
+                                   && seg_is(last, "push_fo");
+    if (list_ns || mem_pushfo) {
         if (seg_is(last, "empty")) {
             if (nargs != 0) vm_unsupported("teko::list::empty expects no arguments");
             *out = v_list_empty();
             return true;
         }
-        if (seg_is(last, "push")) {
+        if (seg_is(last, "push") || mem_pushfo) {
             if (nargs != 2) vm_unsupported("teko::list::push expects two arguments (the list, the item)");
             tk_value base = tk_vm_eval_expr(&args[0], env);
             tk_value item = tk_vm_eval_expr(&args[1], env);
@@ -880,6 +975,21 @@ static bool try_builtin_call(tk_path p, const tk_texpr *args, size_t nargs,
         *out = list; return true;
     }
     // len_chars — (str) -> i64. Count UTF-8 codepoints without allocation.
+    if (seg_is(last, "append_fo")) {   /* (#148 R2) teko::mem::append_fo(dst, src) — VM mirrors the value */
+        if (nargs != 2) vm_unsupported("append_fo expects two arguments ([]byte, str)");
+        tk_value afd = tk_vm_eval_expr(&args[0], env);
+        tk_value afs = tk_vm_eval_expr(&args[1], env);
+        if (afd.tag != TK_VAL_LIST) vm_unsupported("append_fo on a non-list dst (internal: checker should reject)");
+        if (afs.tag != TK_VAL_STR) vm_unsupported("append_fo src must be a str (internal: checker should reject)");
+        tk_value af_out = afd;
+        for (size_t af_i = 0; af_i < afs.as.s.len; af_i += 1)
+            af_out = v_list_push(af_out.as.list, v_int((uint64_t)afs.as.s.ptr[af_i], false, 8));
+        *out = af_out;
+        return true;
+    }
+    if (seg_is(last, "peak_rss")) {   /* (#148) teko::mem::peak_rss() -> u64 (peak RSS bytes) */
+        *out = v_int((unsigned __int128)tk_peak_rss(), true, 64); return true;
+    }
     if (seg_is(last, "len_chars")) {
         if (nargs != 1) vm_unsupported("len_chars expects exactly one argument (a str)");
         tk_value sv = tk_vm_eval_expr(&args[0], env);
@@ -1265,7 +1375,12 @@ static tk_value eval_binary(const tk_texpr *e, tk_venv *env) {
 
     // +,-,*,&,|,^,<<,>> — plain fixed-width arithmetic (overflow guarding DEFERRED to
     // build profiles, exactly as codegen leaves +,-,* as plain C — out of scope here).
+    // #49 — shift counts are masked by the LEFT OPERAND's bit-width minus 1 (C#/Java
+    // semantics), NOT a fixed 127: `(1 as i32) << 40` masks to `<< 8` (width=32 -> &31),
+    // matching codegen's tk_shl_*/tk_shr_* runtime helpers exactly. In-range counts are
+    // unaffected (mask is a no-op when count < width).
     unsigned __int128 a = v_as_u128(lv), b = v_as_u128(rv), raw;
+    unsigned shift_mask = (unsigned)(width - 1);
     switch (op) {
         case TK_TOKEN_PLUS:  raw = a + b; break;
         case TK_TOKEN_MINUS: raw = a - b; break;
@@ -1273,10 +1388,10 @@ static tk_value eval_binary(const tk_texpr *e, tk_venv *env) {
         case TK_TOKEN_AMP:   raw = a & b; break;
         case TK_TOKEN_PIPE:  raw = a | b; break;
         case TK_TOKEN_CARET: raw = a ^ b; break;
-        case TK_TOKEN_SHL:   raw = a << (b & 127); break;
+        case TK_TOKEN_SHL:   raw = a << (b & shift_mask); break;
         case TK_TOKEN_SHR:
-            if (is_signed) raw = (unsigned __int128)(v_as_i128(lv) >> (b & 127));
-            else           raw = a >> (b & 127);
+            if (is_signed) raw = (unsigned __int128)(v_as_i128(lv) >> (b & shift_mask));
+            else           raw = a >> (b & shift_mask);
             break;
         default: vm_unsupported("binary operator not yet supported");
     }
@@ -1398,7 +1513,8 @@ static bool cast_prim_of(tk_type t, tk_prim_kind *out) {
     if (t.tag == TK_TYPE_PRIM) { *out = t.as.prim; return true; }
     if (t.tag == TK_TYPE_BYTE) { *out = TK_PRIM_U8; return true; }
     // E7: enum→int/byte — checker already validated; enum ordinals are stored as u64 in the VM.
-    if (t.tag == TK_TYPE_NAMED) { *out = TK_PRIM_U64; return true; }
+    // (#50) a flags-typed Named computes at its carrier prim (same rule as expr_num_prim).
+    if (t.tag == TK_TYPE_NAMED) { *out = named_num_prim(t.as.named.name); return true; }
     return false;
 }
 
@@ -1531,10 +1647,6 @@ static bool param_is_ref(const tk_tfunction *fn, size_t i) {
     return ta.tag == TK_TEXPR_NAMED && ta.as.named.path.len > 0
         && seg_is(ta.as.named.path.segments[ta.as.named.path.len - 1].name, "Ref");
 }
-static bool fn_has_ref_param(const tk_tfunction *fn) {
-    for (size_t i = 0; i < fn->nparams; i += 1) if (param_is_ref(fn, i)) return true;
-    return false;
-}
 
 // param_coerce_type — the coerce-slot type for a call PARAMETER, built from its declared TypeExpr (the
 // param twin of field_coerce_type, but RECURSIVE so a `[]T?` param rebuilds its elements). An
@@ -1648,6 +1760,81 @@ static const tk_tfunction *closure_target(const tk_texpr *e, tk_venv *env, size_
     return find_function_ns(fp, cv.as.func.ns, out_idx);
 }
 
+// (W10b.D3) resolve a DYNAMIC contract-method call's target: the concrete class's stamped
+// function named `method` whose namespace IS `class_name` or ends with "::" + `class_name` —
+// the SAME rule codegen's vtable build uses (cg_find_method_ns), so both engines dispatch to
+// the SAME method (virtual overrides included: every effective method is stamped per class).
+// Mirror of vm.tks::find_class_method.
+static const tk_tfunction *find_class_method(tk_str class_name, tk_str method, size_t *out_idx) {
+    // (#109 W3) class_name is a struct value type_name / Named — take its BARE last segment so the
+    // "::" + class_name suffix match compares a bare class tail against tf's canonical method
+    // namespace (a full ns matched via the suffix check; do NOT strip tf->namespace).
+    tk_str bname = tk_name_last_segment(class_name);
+    for (size_t i = 0; i < g_prog.nitems; i += 1) {
+        if (g_prog.items[i].tag != TK_TITEM_FUNCTION) continue;
+        const tk_tfunction *tf = &g_prog.items[i].as.function;
+        if (!name_eq(tf->name, method)) continue;
+        if (name_eq(tf->namespace, bname)) { *out_idx = i; return tf; }
+        size_t suffix_len = 2 + bname.len;
+        if (tf->namespace.len >= suffix_len) {
+            const tk_byte *tail = tf->namespace.ptr + (tf->namespace.len - suffix_len);
+            if (tail[0] == ':' && tail[1] == ':') {
+                tk_str name_part = { tail + 2, bname.len };
+                if (name_eq(name_part, bname)) { *out_idx = i; return tf; }
+            }
+        }
+    }
+    return NULL;
+}
+
+// (W10b.D3) DYNAMIC contract-method dispatch. The receiver (args[0]) evaluates ONCE; a class
+// instance IS the interface value in the VM (a ClassRef cell — no fat pointer needed, the cell's
+// struct payload carries the CONCRETE class name to dispatch on). The ORIGINAL ClassRef binds as
+// the receiver param (reference semantics survive the dispatch). Non-receiver args bind exactly
+// like bind_call_args (Ref auto-promotion included). Shared by BOTH eval_call and call_value —
+// the twin-asymmetry trap's two entry points. Mirror of vm.tks::eval_iface_call.
+static tk_value eval_iface_call(const tk_texpr *e, tk_venv *env) {
+    tk_value recv = tk_vm_eval_expr(&e->as.call.args[0], env);
+    if (recv.tag != TK_VAL_CLASS_REF)
+        vm_unsupported("interface dispatch on a non-class value (internal: only a class instance upcasts)");
+    tk_value payload = cell_get(recv.as.class_ref.cell);
+    if (payload.tag != TK_VAL_STRUCT)
+        vm_unsupported("interface dispatch: the class cell holds no struct payload (internal)");
+    tk_str method = e->as.call.callee.segments[e->as.call.callee.len - 1].name;
+    size_t fn_idx = 0;
+    const tk_tfunction *fn = find_class_method(payload.as.st.type_name, method, &fn_idx);
+    if (fn == NULL)
+        vm_unsupported("interface dispatch: no stamped method on the concrete class (internal: conformance was checked)");
+    if (fn->nparams == 0 || fn->nparams != e->as.call.nargs)
+        vm_unsupported("interface dispatch: arity mismatch (internal: the checker fixed the arity)");
+    if (!fn->is_test) tk_cov_mark(fn_idx);
+    tk_venv fenv = { .head = NULL };
+    env_define(&fenv, fn->params[0].name, recv);   // the receiver — the ORIGINAL ClassRef
+    for (size_t i = 1; i < e->as.call.nargs; i += 1) {
+        if (param_is_ref(fn, i)) {   // same auto-ref/forward rule as bind_call_args
+            if (e->as.call.args[i].tag != TK_TEXPR_VAR)
+                vm_unsupported("a `Ref<T>` argument must be a mutable variable (internal: checker should reject)");
+            if (e->as.call.args[i].type.tag == TK_TYPE_REF) {
+                tk_value fwd = tk_vm_eval_expr(&e->as.call.args[i], env);
+                env_define(&fenv, fn->params[i].name, fwd);
+            } else {
+                tk_slot *s = env_find(env, e->as.call.args[i].as.var.name);
+                if (s == NULL) vm_unsupported("auto-ref of an unbound variable (internal: checker should reject)");
+                if (!s->has_cell) { s->cell_id = cell_alloc(s->val); s->has_cell = true; }
+                env_define(&fenv, fn->params[i].name, v_ref(s->cell_id));
+            }
+        } else {
+            tk_value av = tk_vm_eval_expr(&e->as.call.args[i], env);
+            env_define(&fenv, fn->params[i].name, coerce_to(av, param_coerce_type(fn->params[i].type_ann)));
+        }
+    }
+    tk_flow fl = run_user_fn(fn, fn_idx, &fenv);
+    env_free(&fenv);
+    if ((fl.kind == TK_FLOW_RETURN || fl.kind == TK_FLOW_NORMAL) && fl.has_value)
+        return coerce_to(fl.value, fn->return_type);
+    return v_void();
+}
+
 // call_value — a call in STATEMENT position (the .tks twin's call_value). (MEM Step 2/3) This is the
 // path that SUPPORTS `Ref<T>` aliasing: auto-ref promotes the caller's `mut` lvalue to a (global) cell
 // and the callee writes through it, so `bump(x)` mutates `x`. The C cell store is global/shared, so
@@ -1659,8 +1846,18 @@ static bool call_value(const tk_texpr *e, tk_venv *env, tk_value *out) {
     const tk_texpr *args = e->as.call.args;
     size_t nargs = e->as.call.nargs;
 
-    if (try_builtin_call(p, args, nargs, env, out)) return true;   // `-> void` builtin (or value builtin) — no ref args
+    // (W10b.D3) dynamic contract dispatch — FIRST, before builtin name-sniffing could collide
+    // with a method name. Same guard in eval_call (the VM twin-asymmetry rule).
+    if (e->as.call.is_iface_dispatch) { *out = eval_iface_call(e, env); return true; }
+    // (#107) a CLOSURE call ALSO goes before try_builtin_call: it matches by BARE last-segment
+    // name only (`write`, `print`, `len`, …) with no scope awareness, so a closure-typed
+    // local/param sharing one of those reserved names (e.g. a `write: WFn` param in a namespace
+    // that also has an extern `write`) would otherwise be hijacked into the builtin call instead
+    // of calling the closure VALUE — the checker already proved `is_closure_call`
+    // (tk_env_lookup_call scans innermost-first, so the local always wins); the VM just has to
+    // respect that verdict. Same guard in eval_call (the VM twin-asymmetry rule).
     if (e->as.call.is_closure_call && try_lambda_call(e, env, out)) return true;   // (W10) a lambda value runs its own body
+    if (!e->as.call.is_closure_call && try_builtin_call(p, args, nargs, env, out)) return true;   // `-> void` builtin (or value builtin) — no ref args
 
     size_t fn_idx;
     const tk_tfunction *fn = e->as.call.is_closure_call ? closure_target(e, env, &fn_idx) : find_function_ns(p, e->as.call.call_ns, &fn_idx);   // (W10a) closure call → resolve through the local FuncVal; direct call → namespace-disambiguated (BUGFIX above)
@@ -1689,9 +1886,14 @@ static tk_value eval_call(const tk_texpr *e, tk_venv *env) {
     const tk_texpr *args = e->as.call.args;
     size_t nargs = e->as.call.nargs;
 
+    // (W10b.D3) dynamic contract dispatch — FIRST, before builtin name-sniffing could collide
+    // with a method name. Same guard in call_value (the VM twin-asymmetry rule).
+    if (e->as.call.is_iface_dispatch) return eval_iface_call(e, env);
     tk_value out;
-    if (try_builtin_call(p, args, nargs, env, &out)) return out;
+    // (#107) a CLOSURE call ALSO goes before try_builtin_call — same reasoning as call_value's
+    // guard above (the VM twin-asymmetry rule: both call paths need it).
     if (e->as.call.is_closure_call && try_lambda_call(e, env, &out)) return out;   // (W10) a lambda value runs its own body
+    if (!e->as.call.is_closure_call && try_builtin_call(p, args, nargs, env, &out)) return out;
 
     size_t fn_idx;
     const tk_tfunction *fn = e->as.call.is_closure_call ? closure_target(e, env, &fn_idx) : find_function_ns(p, e->as.call.call_ns, &fn_idx);   // (W10a) closure call → resolve through the local FuncVal; direct call → namespace-disambiguated (BUGFIX above)
@@ -1775,22 +1977,53 @@ static tk_str bind_case_name(tk_bind_pattern bp) {
     return vm_texpr_mangle(gte);
 }
 
+// (W10b.D3 codec fix) are `a` and `b` BOTH members of one declared variant? If so, a struct value
+// tagged `a` is ALREADY a fully-discriminated case wherever `b` could appear — so descending into
+// its fields to reinterpret it as the sibling case `b` is the conflation bug the tag-24 roundtrip
+// caught (`Func { ret = Prim }` matched a `Prim` arm through `ret`, since Func and Prim are both
+// `Type` members). Combined with the field-count guard at the descent site: descent is SKIPPED
+// only for a MULTI-FIELD sibling — a SINGLE-FIELD sibling wrapper (`Optional { inner = Prim }`)
+// still descends (doctrine — teko-vm-wrapper-descent-bug), and a NON-sibling multi-field node
+// (`Expr { kind = Compare; line; col }` → Compare, an ExprKind member Expr is not a peer of) still
+// descends (the corpus AST-node-into-kind idiom). Mirrors vm.tks::variant_siblings.
+static bool variant_siblings(tk_str a, tk_str b) {
+    tk_str ka = tk_name_last_segment(a), kb = tk_name_last_segment(b);   // (#109 W3) bare-vs-bare (a/b may be canonical; union member names bare)
+    for (size_t i = 0; i < g_prog.nitems; i += 1) {
+        if (g_prog.items[i].tag != TK_TITEM_TYPE_DECL) continue;
+        tk_type_decl td = g_prog.items[i].as.type_decl;
+        if (td.body.tag != TK_BODY_VARIANT) continue;
+        tk_type_expr te = td.body.as.variant_body.type_expr;
+        if (te.tag != TK_TEXPR_UNION) continue;
+        bool has_a = false, has_b = false;
+        for (size_t j = 0; j < te.as.uni.len; j += 1) {
+            tk_type_expr m = te.as.uni.members[j];
+            if (m.tag != TK_TEXPR_NAMED || m.as.named.path.len == 0) continue;
+            tk_str nm = tk_name_last_segment(m.as.named.path.segments[m.as.named.path.len - 1].name);
+            if (name_eq(nm, ka)) has_a = true;
+            if (name_eq(nm, kb)) has_b = true;
+        }
+        if (has_a && has_b) return true;
+    }
+    return false;
+}
+
 // case_in_variant — is `cname` a MEMBER of the variant type `vname`? A match arm pattern may name
 // a VARIANT (e.g. `Type`) and the value's case is one of its members (e.g. `Prim`): native codegen
 // discriminates the tagged union; the VM has no wrapper (the value IS the member struct), so it
 // must resolve the variant decl in the program and check membership. (Mirrors vm.tks.)
 static bool case_in_variant(tk_str vname, tk_str cname) {
+    tk_str kv = tk_name_last_segment(vname), kc = tk_name_last_segment(cname);   // (#109 W3) bare-vs-bare (vname/cname may be canonical; td.name canonical; member names bare)
     for (size_t i = 0; i < g_prog.nitems; i += 1) {
         if (g_prog.items[i].tag != TK_TITEM_TYPE_DECL) continue;
         tk_type_decl td = g_prog.items[i].as.type_decl;
-        if (!name_eq(td.name, vname)) continue;
+        if (!name_eq(tk_name_last_segment(td.name), kv)) continue;
         if (td.body.tag != TK_BODY_VARIANT) return false;
         tk_type_expr te = td.body.as.variant_body.type_expr;
         if (te.tag != TK_TEXPR_UNION) return false;
         for (size_t j = 0; j < te.as.uni.len; j += 1) {
             tk_type_expr m = te.as.uni.members[j];
             if (m.tag == TK_TEXPR_NAMED && m.as.named.path.len > 0
-                && name_eq(m.as.named.path.segments[m.as.named.path.len - 1].name, cname))
+                && name_eq(tk_name_last_segment(m.as.named.path.segments[m.as.named.path.len - 1].name), kc))
                 return true;
         }
         return false;
@@ -1809,10 +2042,11 @@ static bool case_in_variant(tk_str vname, tk_str cname) {
 // returned OPTIONAL carries a NULL inner; coerce_to reads only the tag, never the inner. (Mirrors
 // vm.tks's vm_field_coerce_type.)
 static tk_type field_coerce_type(tk_str sname, tk_str fname) {
+    tk_str skey = tk_name_last_segment(sname);   // (#109 W3) bare-vs-bare (td.name canonical; sname may be canonical or bare)
     for (size_t i = 0; i < g_prog.nitems; i += 1) {
         if (g_prog.items[i].tag != TK_TITEM_TYPE_DECL) continue;
         tk_type_decl td = g_prog.items[i].as.type_decl;
-        if (!name_eq(td.name, sname)) continue;
+        if (!name_eq(tk_name_last_segment(td.name), skey)) continue;
         if (td.body.tag != TK_BODY_STRUCT) return (tk_type){ .tag = TK_TYPE_VOID };
         tk_struct_body sb = td.body.as.struct_body;
         for (size_t j = 0; j < sb.n_fields; j += 1) {
@@ -1835,16 +2069,17 @@ static tk_type field_coerce_type(tk_str sname, tk_str fname) {
 //       matches that member's position in the enum.
 // Scans all enum TypeDecls; both cases may coexist (a member name in one enum, type name in another).
 static bool match_as_enum_int(tk_str name, unsigned __int128 ordinal) {
+    tk_str key = tk_name_last_segment(name);   // (#109 W3) bare-vs-bare (td.name canonical; enum member names bare)
     for (size_t i = 0; i < g_prog.nitems; i += 1) {
         if (g_prog.items[i].tag != TK_TITEM_TYPE_DECL) continue;
         tk_type_decl td = g_prog.items[i].as.type_decl;
         if (td.body.tag != TK_BODY_ENUM) continue;
         // Case A: pattern names the whole enum type — any valid ordinal matches.
-        if (name_eq(td.name, name)) return true;
+        if (name_eq(tk_name_last_segment(td.name), key)) return true;
         // Case B: pattern names a specific member — match only at the right ordinal.
         tk_enum_body eb = td.body.as.enum_body;
         for (size_t j = 0; j < eb.n_members; j += 1)
-            if (name_eq(eb.members[j], name) && (unsigned __int128)j == ordinal)
+            if (name_eq(eb.members[j], key) && (unsigned __int128)j == ordinal)
                 return true;
     }
     return false;
@@ -1904,8 +2139,8 @@ static bool val_type_matches(tk_value subj, tk_str name) {
         case TK_VAL_FLOAT: { int w = subj.as.fl.width; return seg_is(name, w==16?"f16":w==32?"f32":"f64"); }
         case TK_VAL_BOOL:  return seg_is(name, "bool");
         case TK_VAL_STR:   return seg_is(name, "str");
-        case TK_VAL_STRUCT:return name_eq(subj.as.st.type_name, name);   // a named case / `error`
-        default:           return false;   // LIST → is_slice branch; OPT → handled above
+        case TK_VAL_STRUCT:return name_eq(tk_name_last_segment(subj.as.st.type_name), tk_name_last_segment(name));   // a named case / `error` (#109 W3: bare-vs-bare)
+        default:           return false;   // LIST → is_slice branch; OPT → handled above; CLASS_REF → cell deref in pat_match (C1)
     }
 }
 
@@ -1958,17 +2193,33 @@ static bool pat_match(const tk_pattern *pat, tk_value subj, tk_venv *env) {
                 bool direct = val_type_matches(subj, bname)
                     || (subj.tag == TK_VAL_STRUCT && case_in_variant(bname, subj.as.st.type_name))
                     || (subj.tag == TK_VAL_INT && match_as_enum_int(bname, v_as_u128(subj)));
+                // (C1 fallible factories) a CLASS instance in a union (`C | error`) is matched by
+                // its class NAME: deref the ClassRef cell to its struct payload and compare its
+                // type_name. On a hit the ORIGINAL ClassRef is bound (reference semantics — the
+                // arm's binding keeps aliasing the shared object, mirroring the native pointer).
+                if (!direct && subj.tag == TK_VAL_CLASS_REF) {
+                    tk_value payload = cell_get(subj.as.class_ref.cell);
+                    direct = payload.tag == TK_VAL_STRUCT && name_eq(tk_name_last_segment(payload.as.st.type_name), tk_name_last_segment(bname));   // (#109 W3) bare-vs-bare
+                }
                 if (direct) {
                     if (pat->as.bind.has_binding) env_define(env, pat->as.bind.binding, subj);
                     return true;
                 }
-                // Transparent field descent: when the subject is a struct whose fields contain
-                // a value that matches the pattern name (e.g. `Number as nn` on `Expr { kind =
-                // Number{…}; line; col }`), drill into the first matching STRUCT field and bind.
+                // Transparent field descent: when the subject is a struct whose fields hold a
+                // value matching the pattern name (e.g. `Compare as c` on `Expr { kind = Compare;
+                // line; col }`), drill into the first matching STRUCT field and bind. SKIPPED only
+                // for a MULTI-FIELD SIBLING of the target — a subject that is itself a properly-
+                // discriminated case of the SAME union the target belongs to must not be re-read as
+                // the sibling case through an inner field (`Func { params; ret; … }` → a `Prim` arm
+                // via `ret`, both `Type` members — the tag-24 codec bug). A SINGLE-FIELD sibling
+                // wrapper (`Optional { inner = Prim }` → Prim) still descends (doctrine); a NON-
+                // sibling multi-field node still descends (the AST-node-into-kind corpus idiom).
                 // Only struct fields are eligible — int fields are excluded because match_as_enum_int
-                // could match enum member names that coincidentally share the same ordinal value as an
-                // unrelated enum (e.g. TyShape::Variant=2 vs PrimKind::U32=2 causing false descent).
-                if (subj.tag == TK_VAL_STRUCT) {
+                // could match enum member names that coincidentally share an ordinal (e.g.
+                // TyShape::Variant=2 vs PrimKind::U32=2 causing false descent).
+                bool descend_ok = subj.tag == TK_VAL_STRUCT
+                    && !(subj.as.st.fields.len > 1 && variant_siblings(subj.as.st.type_name, bname));
+                if (descend_ok) {
                     for (size_t fi = 0; fi < subj.as.st.fields.len; fi += 1) {
                         tk_value fv = subj.as.st.fields.vals[fi];
                         if (fv.tag != TK_VAL_STRUCT) continue;
@@ -1985,7 +2236,7 @@ static bool pat_match(const tk_pattern *pat, tk_value subj, tk_venv *env) {
         }
         case TK_PAT_FIELD: {
             if (subj.tag != TK_VAL_STRUCT) return false;
-            if (!name_eq(subj.as.st.type_name, path_last(pat->as.field.type_name))) return false;
+            if (!name_eq(tk_name_last_segment(subj.as.st.type_name), tk_name_last_segment(path_last(pat->as.field.type_name)))) return false;   // (#109 W3) bare-vs-bare
             for (size_t i = 0; i < pat->as.field.n_fields; i += 1) {              // bind each named field
                 bool found = false;
                 for (size_t j = 0; j < subj.as.st.fields.len; j += 1)
@@ -2016,7 +2267,11 @@ static tk_value eval_match(const tk_texpr *e, tk_venv *env) {
                 tk_cov_branch(e->line, e->col, i);   // D3-branch: value-position arm `i` taken
                 tk_flow fl = tk_vm_exec_block(arm->body, arm->nbody, &armenv);
                 env_pop_to(&armenv, env->head);
-                if (fl.kind == TK_FLOW_NORMAL && fl.has_value) return fl.value;
+                // (NP-OOP, issue #116) COERCE the arm's raw value to the match node's type —
+                // the VM twin of codegen's emit_arm_value → emit_as wrap, so a `T` arm flowing
+                // into a `T?`-typed match present-wraps (the checker-desugared `?.` relies on
+                // it; exact-typed arms are a no-op).
+                if (fl.kind == TK_FLOW_NORMAL && fl.has_value) return coerce_to(fl.value, e->type);
                 vm_unsupported("control flow inside a `match` used as a sub-expression not yet supported");
             }
         }
@@ -2148,6 +2403,13 @@ static tk_value tk_vm_eval_expr(const tk_texpr *e, tk_venv *env) {
             // TK_TYPE_BYTE (`byte` type) is like u8 — an unsigned 8-bit integer literal.
             if (e->type.tag == TK_TYPE_BYTE)
                 return v_int((unsigned __int128)(uint8_t)e->as.number.value, false, 8);
+            // (#50) a FLAGS-typed number literal — the checker's fabricated zero in the any/none
+            // lowering (type_flags_method) — computes at the flags carrier prim (unsigned).
+            if (e->type.tag == TK_TYPE_NAMED) {
+                tk_prim_kind fp;
+                if (flags_carrier_prim(e->type.as.named.name, &fp))
+                    return v_int((unsigned __int128)e->as.number.value, false, prim_width(fp));
+            }
             if (e->type.tag != TK_TYPE_PRIM)
                 vm_unsupported("number literal with a non-primitive type not yet supported");
             tk_prim_kind k = e->type.as.prim;
@@ -2177,7 +2439,15 @@ static tk_value tk_vm_eval_expr(const tk_texpr *e, tk_venv *env) {
         case TK_TEXPR_STR:  return v_str(e->as.str.text);
         case TK_TEXPR_BYTE: return v_int((uint64_t)e->as.byte.value, false, 8);   // byte == u8 rep
         case TK_TEXPR_CHAR: return v_str(e->as.char_lit.bytes);   // char — the codepoint's UTF-8 bytes (same str carrier; distinct by the checker tag, VM==native)
-        case TK_TEXPR_PATH: return v_int((unsigned __int128)e->as.path.ordinal, false, 64);   // Enum::Member → its ordinal (u64); codegen's C enum auto-numbers identically
+        case TK_TEXPR_PATH: {
+            // (#50) Type::Member → the checker-RESOLVED member value (enum: the ordinal, u64 —
+            // codegen's C enum auto-numbers identically; flags: 1 << ordinal at the carrier width —
+            // codegen's pre-emitted power-of-2 constants). No recompute — read the stored value.
+            tk_prim_kind fp;
+            if (e->type.tag == TK_TYPE_NAMED && flags_carrier_prim(e->type.as.named.name, &fp))
+                return v_int(e->as.path.value, false, prim_width(fp));
+            return v_int(e->as.path.value, false, 64);
+        }
 
         // bool literal (W2) — FULL support (bool already flows through the value model).
         case TK_TEXPR_BOOL: return v_bool(e->as.boolean.value);
@@ -2317,7 +2587,11 @@ static tk_value tk_vm_eval_expr(const tk_texpr *e, tk_venv *env) {
                 tk_value raw = tk_vm_eval_expr(&e->as.struct_init.field_vals[i], env);
                 vals[i]  = coerce_to(raw, field_coerce_type(tn, e->as.struct_init.field_names[i]));
             }
-            tk_value sv = v_struct(tn, (tk_value_fields){ names, vals, nf });
+            // (#109 W3) the VM is namespace-blind for runtime identity: store the BARE last segment as
+            // the struct value's type_name tag (e->type.as.named.name is now canonical "ns::Name"), so
+            // every runtime dispatch/variant/pattern comparison stays bare-vs-bare. `tn` itself stays
+            // canonical for field_coerce_type/tk_find_class_body (they resolve the canonical type table).
+            tk_value sv = v_struct(tk_name_last_segment(tn), (tk_value_fields){ names, vals, nf });
             // (W10b.CLASS residual — VM reference semantics) a class instance is a REFERENCE
             // type (increment 3, native side): construction allocates a cell in the SAME
             // global cell store MEM-1b already uses (g_cells) and yields a TK_VAL_CLASS_REF, so
@@ -2367,6 +2641,9 @@ static tk_value compound_apply(tk_value old, tk_token_kind op, tk_value rhs, con
         vm_unsupported("compound assignment on a non-integer value not yet supported");
     bool sgn = old.as.i.is_signed; int w = old.as.i.width;
     uint64_t a = old.as.i.bits, b = rhs.as.i.bits, raw;
+    // #49 — mask the shift count by the LEFT (target slot's) width - 1, not a fixed 63;
+    // mirrors the eval_binary SHL/SHR fix above (same C#/Java-style semantics).
+    unsigned shift_mask = (unsigned)(w - 1);
     switch (op) {
         case TK_TOKEN_PLUSEQ:  raw = a + b; break;
         case TK_TOKEN_MINUSEQ: raw = a - b; break;
@@ -2374,8 +2651,8 @@ static tk_value compound_apply(tk_value old, tk_token_kind op, tk_value rhs, con
         case TK_TOKEN_AMPEQ:   raw = a & b; break;
         case TK_TOKEN_PIPEEQ:  raw = a | b; break;
         case TK_TOKEN_CARETEQ: raw = a ^ b; break;
-        case TK_TOKEN_SHLEQ:   raw = a << (b & 63); break;
-        case TK_TOKEN_SHREQ:   raw = sgn ? (uint64_t)((int64_t)a >> (b & 63)) : (a >> (b & 63)); break;
+        case TK_TOKEN_SHLEQ:   raw = a << (b & shift_mask); break;
+        case TK_TOKEN_SHREQ:   raw = sgn ? (uint64_t)((int64_t)a >> (b & shift_mask)) : (a >> (b & shift_mask)); break;
         case TK_TOKEN_SLASHEQ:
         case TK_TOKEN_PERCENTEQ: {
             bool isdiv = (op == TK_TOKEN_SLASHEQ);
@@ -2388,6 +2665,65 @@ static tk_value compound_apply(tk_value old, tk_token_kind op, tk_value rhs, con
         default: vm_unsupported("assignment operator not yet supported");
     }
     return norm_int(raw, sgn, w);
+}
+
+// (#88) rebuild a StructVal with one field replaced by `val` (declared field order preserved). The
+// checker guarantees `field` exists. COPY-ON-WRITE: a FRESH names/vals array is allocated (the source
+// arrays are never mutated), so a shallow tk_value COPY of a struct — a binding/param copy shares the
+// OLD arrays — is UNAFFECTED by this write. This is what preserves struct VALUE semantics (issue #88
+// follow-up): the earlier in-place `fields.vals[i] = …` corrupted aliased copies. Mirrors vm.tks
+// struct_set_field / vm.c v_error_set (the same copy-on-set idiom).
+static tk_value vm_struct_set_field(tk_value sv, tk_str field, tk_value val) {
+    size_t n = sv.as.st.fields.len;
+    tk_str   *names = tk_alloc((n ? n : 1) * sizeof *names); if (!names) abort();
+    tk_value *vals  = tk_alloc((n ? n : 1) * sizeof *vals);  if (!vals)  abort();
+    for (size_t i = 0; i < n; i += 1) {
+        names[i] = sv.as.st.fields.names[i];
+        vals[i]  = name_eq(sv.as.st.fields.names[i], field) ? val : sv.as.st.fields.vals[i];
+    }
+    return v_struct(sv.as.st.type_name, (tk_value_fields){ names, vals, n });
+}
+
+// (#88) the current VALUE at a field-assign lvalue receiver — just an evaluation (a class handle stays
+// a ClassRef; a struct value / var reads through). Mirrors vm.tks lvalue_load.
+static tk_value vm_lvalue_load(const tk_texpr *e, tk_venv *env) {
+    return tk_vm_eval_expr(e, env);
+}
+
+// (#88) store `newval` at a field-assign lvalue `e`. Two storage kinds, mirroring vm.tks lvalue_store:
+//   * the receiver IS (or derefs to) a CLASS instance → its StructVal payload lives in the SHARED cell
+//     store; cell_set the rebuilt payload so EVERY alias observes the write (reference semantics — the
+//     aliasing proof). This is the ONLY in-place mutation.
+//   * the receiver is a value-semantic STRUCT rooted at a `mut` var → rebuild the StructVal with the
+//     field replaced (copy-on-write) and store the WHOLE struct back UP the chain (recursively for
+//     nested `a.b.c`), bottoming out at the root slot (which is overwritten by value). A struct copy
+//     therefore never sees the write — its own slot still holds the OLD (unmodified) struct value.
+static void vm_lvalue_store(const tk_texpr *e, tk_value newval, tk_venv *env) {
+    if (e->tag == TK_TEXPR_VAR) {
+        tk_slot *slot = env_find(env, e->as.var.name);
+        if (slot == NULL) vm_unsupported("field assignment to an unbound variable (internal: checker should reject)");
+        if (slot->has_cell) cell_set(slot->cell_id, newval); else slot->val = newval;
+        return;
+    }
+    if (e->tag == TK_TEXPR_FIELD_ACCESS) {
+        tk_value recv = tk_vm_eval_expr(e->as.field_access.receiver, env);
+        if (recv.tag == TK_VAL_CLASS_REF) {
+            // A CLASS instance: mutate the SHARED cell payload in place (aliases observe it).
+            tk_value payload = cell_get(recv.as.class_ref.cell);
+            if (payload.tag != TK_VAL_STRUCT) vm_unsupported("a ClassRef cell must hold a struct (internal invariant)");
+            cell_set(recv.as.class_ref.cell, vm_struct_set_field(payload, e->as.field_access.field, newval));
+            return;
+        }
+        if (recv.tag == TK_VAL_STRUCT) {
+            // A value-semantic STRUCT: rebuild it (copy-on-write) and store the whole struct back at the
+            // parent lvalue — recursion bottoms out at the root `mut` slot.
+            vm_lvalue_store(e->as.field_access.receiver,
+                            vm_struct_set_field(recv, e->as.field_access.field, newval), env);
+            return;
+        }
+        vm_unsupported("field assignment on a non-struct/class receiver (internal: checker should reject)");
+    }
+    vm_unsupported("field assignment to an unresolvable lvalue (internal: checker should reject)");
 }
 
 static tk_flow exec_stmt(const tk_tstatement *s, tk_venv *env) {
@@ -2409,6 +2745,19 @@ static tk_flow exec_stmt(const tk_tstatement *s, tk_venv *env) {
         case TK_TSTMT_ASSIGN: {
             tk_token_kind op = s->as.assign.op;
             tk_value rhs = tk_vm_eval_expr(&s->as.assign.value, env);
+            // (#88) `recv.field op= x` — read the field's CURRENT value, apply the op, store it back.
+            // A CLASS field write mutates the SHARED cell payload (aliases observe it — the aliasing
+            // proof); a STRUCT field write REBUILDS the struct copy-on-write and stores it up its
+            // `mut` root, so a struct copy keeps VALUE semantics (a shallow tk_value copy shares the
+            // OLD field arrays, which vm_lvalue_store never mutates). compound_apply applies `op`;
+            // coerce_to present-wraps into the field's declared type (bound), exactly like a binding.
+            // Mirrors vm.tks field_assign (load → compound_apply → coerce_to → store).
+            if (s->as.assign.kind == TK_ASSIGN_FIELD) {
+                tk_value cur = vm_lvalue_load(s->as.assign.target, env);
+                tk_value nv  = coerce_to(compound_apply(cur, op, rhs, &s->as.assign.value), s->as.assign.bound);
+                vm_lvalue_store(s->as.assign.target, nv, env);
+                return flow_normal();
+            }
             // (MEM Step 2/3) `r.value op= x` writes THROUGH a reference: `s->as.assign.name` names the
             // `Ref<T>` binding (a RefVal cell index); a deref-assign reads the cell, applies the op, and
             // writes BACK to the cell (cell_set) — so the caller's aliased var observes the write.
@@ -2765,7 +3114,7 @@ static void cov_walk_expr(const tk_texpr *e, cov_walk_t *w) {
 static void cov_walk_stmt(const tk_tstatement *st, cov_walk_t *w) {
     switch (st->tag) {
         case TK_TSTMT_BINDING: cov_walk_expr(&st->as.binding.value, w); break;
-        case TK_TSTMT_ASSIGN:  cov_walk_expr(&st->as.assign.value, w); break;
+        case TK_TSTMT_ASSIGN:  cov_walk_expr(&st->as.assign.value, w); if (st->as.assign.kind == TK_ASSIGN_FIELD) cov_walk_expr(st->as.assign.target, w); break;   // (#88) the FIELD LHS receiver is executable too
         case TK_TSTMT_RETURN:  if (st->as.ret.has_value) cov_walk_expr(&st->as.ret.value, w); break;
         case TK_TSTMT_LOOP:    cov_walk_block(st->as.loop_stmt.body, st->as.loop_stmt.nbody, w); break;
         case TK_TSTMT_EXPR:    cov_walk_expr(&st->as.expr_stmt.expr, w); break;
@@ -2909,6 +3258,11 @@ int tk_vm_run_tests_cov(tk_tprogram prog, bool record_branches, bool write_xml, 
         if (prog.items[i].tag != TK_TITEM_FUNCTION) continue;
         tk_tfunction f = prog.items[i].as.function;
         if (!f.is_test) continue;
+        // (#109 test-gate memory) checkpoint the arena; this test's transient arena span is bulk-freed
+        // at tk_arena_pop below, so N tests do not accumulate the whole run in the never-dropped root
+        // region. Coverage sinks are libc-heap (survive); the loop state here is on the C stack.
+        tk_arena_push();
+        g_cells_len = 0;   // (#109) fresh cell store per test (parity with vm.tks's empty env.cells); drops any arena-pointing values before the rewind
         if (f.namespace.len)
             printf("test %.*s::%.*s ... ", (int)f.namespace.len, (const char *)f.namespace.ptr,
                    (int)f.name.len, (const char *)f.name.ptr);
@@ -2922,6 +3276,7 @@ int tk_vm_run_tests_cov(tk_tprogram prog, bool record_branches, bool write_xml, 
         env_free(&fenv);
         printf("ok\n");
         passed += 1;
+        tk_arena_pop();   // free this test's transient arena span (coverage already recorded off-arena)
     }
     if (record_branches) { tk_cov_branches_on(false); tk_cov_lines_on(false); }
     if (passed == 0) {

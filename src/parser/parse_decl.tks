@@ -156,14 +156,20 @@ fn parse_type_params(tokens: []lexer::Token, pos: u64) -> ParsedTypeParams | err
 
 // `allow_receiver` (OOP A1, 2026-07-01) — true ONLY when called for a struct-body method: lets
 // the 1st param be a bare untyped name (the receiver). A top-level `fn` always passes false.
-fn parse_function(tokens: []lexer::Token, pos: u64, is_test: bool, os_guard: str, allow_receiver: bool) -> Parsed<Decl> | error {
+// `allow_bodyless` (W10b.IF) — true ONLY for an INTERFACE method: a pure signature `fn sig(self) -> T`
+// with NO body (the interface is a contract). Mirrors the `abstract fn` bodyless path; every other
+// caller passes false.
+fn parse_function(tokens: []lexer::Token, pos: u64, is_test: bool, os_guard: str, allow_receiver: bool, allow_bodyless: bool) -> Parsed<Decl> | error {
     mut p = pos
     mut has_doc = false
     mut doc = ""
+    // (#111) an own-line doc comment attaches to the NEXT declaration: skip the significant
+    // newline(s) between the `/** … */` and the modifiers/keyword that follow it. Same-line
+    // placement (no newline in between) is unaffected — skip_seps is a no-op there.
     if is_kind_at(tokens, p, lexer::TokenKind::Doc) {
         has_doc = true
         doc = tokens[p].text
-        p = p + 1
+        p = skip_seps(tokens, p + 1)
     }
     mut vis = Visibility::Private                        // default: own-namespace only
     if is_kind_at(tokens, p, lexer::TokenKind::Pub) {
@@ -247,7 +253,7 @@ fn parse_function(tokens: []lexer::Token, pos: u64, is_test: bool, os_guard: str
     }
     // (W10b.CLASS increment 2) `abstract fn …` — a SIGNATURE ONLY, no body (abstract classes only;
     // enforced by the checker, not the parser). A bare `;`/newline/`}` follows instead of `{`.
-    if is_abstract && !is_kind_at(tokens, p, lexer::TokenKind::LBrace) {
+    if (is_abstract || allow_bodyless) && !is_kind_at(tokens, p, lexer::TokenKind::LBrace) {
         let no_body: []Statement = teko::list::empty()
         return Parsed<Decl> { node = Function { name = name; type_params = tps.names; type_constraints = tps.constraints; params = params.items; has_return = has_return; return_type = return_type; body = no_body; vis = vis; has_doc = has_doc; doc = doc; line = name_line; col = name_col; is_test = is_test; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = os_guard; is_intern = is_intern; is_abstract = is_abstract; is_virtual = is_virtual; is_override = is_override }; next = p }
     }
@@ -269,7 +275,7 @@ fn parse_function(tokens: []lexer::Token, pos: u64, is_test: bool, os_guard: str
 // beyond the struct's own visibility (the checker does not special-case it further here).
 fn struct_item_is_method(tokens: []lexer::Token, pos: u64) -> bool {
     mut k = pos
-    if is_kind_at(tokens, k, lexer::TokenKind::Doc) { k = k + 1 }
+    if is_kind_at(tokens, k, lexer::TokenKind::Doc) { k = skip_seps(tokens, k + 1) }   // (#111) own-line doc
     if is_kind_at(tokens, k, lexer::TokenKind::Pub) { k = k + 1 }
     else if is_kind_at(tokens, k, lexer::TokenKind::Exp) { k = k + 1 }
     is_kind_at(tokens, k, lexer::TokenKind::Fn)
@@ -283,7 +289,7 @@ fn parse_fields(tokens: []lexer::Token, pos: u64) -> ParsedStructBody | error {
     }
     loop {
         if struct_item_is_method(tokens, p) {
-            let m = match parse_function(tokens, p, false, "", true) { Parsed<Decl> as x => x; error as e => return e }
+            let m = match parse_function(tokens, p, false, "", true, false) { Parsed<Decl> as x => x; error as e => return e }
             let mf = match m.node { Function as f => f; _ => return err_at(tokens, p, "internal: a struct method must parse to a Function") }
             methods = teko::list::push(methods, mf)
             p = m.next
@@ -314,7 +320,7 @@ fn parse_fields(tokens: []lexer::Token, pos: u64) -> ParsedStructBody | error {
 // `intern`/`abstract`/`virtual`/`override` modifiers `parse_function` itself now consumes.
 fn class_item_is_method(tokens: []lexer::Token, pos: u64) -> bool {
     mut k = pos
-    if is_kind_at(tokens, k, lexer::TokenKind::Doc) { k = k + 1 }
+    if is_kind_at(tokens, k, lexer::TokenKind::Doc) { k = skip_seps(tokens, k + 1) }   // (#111) own-line doc
     if is_kind_at(tokens, k, lexer::TokenKind::Pub) { k = k + 1 }
     else if is_kind_at(tokens, k, lexer::TokenKind::Exp) { k = k + 1 }
     if is_kind_at(tokens, k, lexer::TokenKind::Intern) { k = k + 1 }
@@ -336,7 +342,7 @@ fn parse_class_fields(tokens: []lexer::Token, pos: u64) -> ParsedStructBody | er
     }
     loop {
         if class_item_is_method(tokens, p) {
-            let m = match parse_function(tokens, p, false, "", true) { Parsed<Decl> as x => x; error as e => return e }
+            let m = match parse_function(tokens, p, false, "", true, false) { Parsed<Decl> as x => x; error as e => return e }
             let mf = match m.node { Function as f => f; _ => return err_at(tokens, p, "internal: a class method must parse to a Function") }
             methods = teko::list::push(methods, mf)
             p = m.next
@@ -419,19 +425,117 @@ fn parse_class_body(tokens: []lexer::Token, pos: u64) -> Parsed<TypeBody> | erro
     }; next = fs.next }
 }
 
-// the body of a type declaration. `struct { fields }`, `enum { … }`, `variant A | B`,
-// `[abstract|virtual] class …`, or ELSE a TRANSPARENT alias `= <type-expr>` (self-host
-// parity). `pos` is at the body's first token.
+// (W10b.IF) parse a `Name [& Name …]` list where the FIRST name has NO leading `&` (interface
+// extends / struct implements — a flat list of interface names). Returns the names + the resume pos.
+fn parse_amp_name_list(tokens: []lexer::Token, pos: u64) -> ParsedList<str> | error {
+    mut p = pos
+    mut names: []str = teko::list::empty()
+    if is_name_at(tokens, p) {
+        names = teko::list::push(names, tokens[p].text)
+        p = p + 1
+        loop {
+            if !is_kind_at(tokens, p, lexer::TokenKind::Amp) { break }
+            if !is_name_at(tokens, p + 1) { return err_at(tokens, p + 1, "expected an interface name after '&'") }
+            names = teko::list::push(names, tokens[p + 1].text)
+            p = p + 2
+        }
+    }
+    ParsedList<str> { items = names; next = p }
+}
+
+// (W10b.IF) `interface [I1 & I2 …] { fn sig(self) -> T; … }`. `pos` is at `interface`. The `I1 & I2`
+// extends list (multiple inheritance) sits between `interface` and `{`; each member is a BODYLESS
+// method signature (parse_function allow_receiver=true, allow_bodyless=true) — no fields, no bodies.
+fn parse_interface_body(tokens: []lexer::Token, pos: u64) -> Parsed<TypeBody> | error {
+    let ext = match parse_amp_name_list(tokens, pos + 1) { ParsedList<str> as x => x; error as e => return e }
+    mut p = ext.next
+    if !is_kind_at(tokens, p, lexer::TokenKind::LBrace) {
+        return err_at(tokens, p, "expected '{' for the interface body")
+    }
+    p = skip_seps(tokens, p + 1)
+    mut methods: []Function = teko::list::empty()
+    if is_kind_at(tokens, p, lexer::TokenKind::RBrace) {
+        return Parsed<TypeBody> { node = InterfaceBody { extends = ext.items; methods = methods }; next = p + 1 }
+    }
+    loop {
+        let m = match parse_function(tokens, p, false, "", true, true) { Parsed<Decl> as x => x; error as e => return e }
+        let mf = match m.node { Function as f => f; _ => return err_at(tokens, p, "an interface member must be a method signature (`fn …`)") }
+        methods = teko::list::push(methods, mf)
+        p = m.next
+        if is_kind_at(tokens, p, lexer::TokenKind::RBrace) { break }
+        if !is_sep(tokens, p) { return err_at(tokens, p, "expected ';', a newline, or '}' after an interface method") }
+        p = skip_seps(tokens, p)
+        if is_kind_at(tokens, p, lexer::TokenKind::RBrace) { break }   // trailing separator
+    }
+    Parsed<TypeBody> { node = InterfaceBody { extends = ext.items; methods = methods }; next = p + 1 }
+}
+
+// (TR0) `trait { <fields>; <methods, with or without bodies> }`. `pos` is at the `{` (the caller
+// consumed the contextual `trait`). The body is STRUCT-SHAPED: interleaved `name: T` fields and
+// `fn` methods; unlike a struct's, a method here MAY be bodyless (a requirement the deriver must
+// satisfy — parse_function allow_bodyless=true, the interface-member path). Mirrors parse_fields.
+fn parse_trait_fields(tokens: []lexer::Token, pos: u64) -> ParsedStructBody | error {
+    mut p = skip_seps(tokens, pos + 1)   // consume `{`, skip leading separators
+    mut fields: []Field = teko::list::empty()
+    mut methods: []Function = teko::list::empty()
+    if is_kind_at(tokens, p, lexer::TokenKind::RBrace) {
+        return ParsedStructBody { fields = fields; methods = methods; next = p + 1 }
+    }
+    loop {
+        if struct_item_is_method(tokens, p) {
+            let m = match parse_function(tokens, p, false, "", true, true) { Parsed<Decl> as x => x; error as e => return e }
+            let mf = match m.node { Function as f => f; _ => return err_at(tokens, p, "internal: a trait method must parse to a Function") }
+            methods = teko::list::push(methods, mf)
+            p = m.next
+        } else {
+            if !is_name_at(tokens, p) {
+                return err_at(tokens, p, "expected a field name or a method (`fn …`) in the trait body")
+            }
+            let name = tokens[p].text
+            if !is_kind_at(tokens, p + 1, lexer::TokenKind::Colon) {
+                return err_at(tokens, p + 1, "expected ':' after a field name")
+            }
+            let ty = match parse_type(tokens, p + 2) { ParsedType as x => x; error as e => return e }
+            fields = teko::list::push(fields, Field { name = name; type_ann = ty.node; vis = Visibility::Pub; is_intern = false })
+            p = ty.next
+        }
+        if is_kind_at(tokens, p, lexer::TokenKind::RBrace) { break }
+        if !is_sep(tokens, p) {
+            return err_at(tokens, p, "expected ';', a newline, or '}' after a trait member")
+        }
+        p = skip_seps(tokens, p)
+        if is_kind_at(tokens, p, lexer::TokenKind::RBrace) { break }   // trailing separator
+    }
+    ParsedStructBody { fields = fields; methods = methods; next = p + 1 }
+}
+
+// the body of a type declaration. `struct [I & …] { fields }`, `interface [I & …] { sigs }`,
+// `trait { … }`, `enum { … }`, `variant A | B`, `[abstract|virtual] class …`, or ELSE a
+// TRANSPARENT alias `= <type-expr>` (self-host parity). `pos` is at the body's first token.
 fn parse_type_body(tokens: []lexer::Token, pos: u64) -> Parsed<TypeBody> | error {
     if is_kind_at(tokens, pos, lexer::TokenKind::Class) || is_kind_at(tokens, pos, lexer::TokenKind::Abstract) || is_kind_at(tokens, pos, lexer::TokenKind::Virtual) {
         return parse_class_body(tokens, pos)
     }
+    if is_kind_at(tokens, pos, lexer::TokenKind::Interface) {
+        return parse_interface_body(tokens, pos)
+    }
+    // (TR0) `trait` is CONTEXTUAL, like `from`/`params` — NOT a reserved word (an identifier named
+    // `trait` stays an ordinary Ident everywhere else). It only means "trait declaration" when the
+    // body position holds Ident("trait") IMMEDIATELY followed by `{` — a transparent alias to a
+    // type named `trait` (`type X = trait`) has no `{` and still parses as an alias below. A trait
+    // declares NO derive-list of its own (no `trait A & B { }` — compose at the deriver instead).
+    if is_kind_at(tokens, pos, lexer::TokenKind::Ident) && tokens[pos].text == "trait" && is_kind_at(tokens, pos + 1, lexer::TokenKind::LBrace) {
+        let fs = match parse_trait_fields(tokens, pos + 1) { ParsedStructBody as x => x; error as e => return e }
+        return Parsed<TypeBody> { node = TraitBody { fields = fs.fields; methods = fs.methods }; next = fs.next }
+    }
     if is_kind_at(tokens, pos, lexer::TokenKind::Struct) {
-        if !is_kind_at(tokens, pos + 1, lexer::TokenKind::LBrace) {
-            return err_at(tokens, pos + 1, "expected '{' after `struct`")
+        // (W10b.IF) optional implements list `struct I1 & I2 { … }` between `struct` and `{`.
+        let impls = match parse_amp_name_list(tokens, pos + 1) { ParsedList<str> as x => x; error as e => return e }
+        if !is_kind_at(tokens, impls.next, lexer::TokenKind::LBrace) {
+            return err_at(tokens, impls.next, "expected '{' after `struct` (or its interface list)")
         }
-        let fs = match parse_fields(tokens, pos + 1) { ParsedStructBody as x => x; error as e => return e }
-        return Parsed<TypeBody> { node = StructBody { fields = fs.fields; methods = fs.methods }; next = fs.next }
+        let fs = match parse_fields(tokens, impls.next) { ParsedStructBody as x => x; error as e => return e }
+        return Parsed<TypeBody> { node = StructBody { fields = fs.fields; methods = fs.methods; implements = impls.items }; next = fs.next }
     }
     if is_kind_at(tokens, pos, lexer::TokenKind::Enum) {
         if !is_kind_at(tokens, pos + 1, lexer::TokenKind::LBrace) {
@@ -464,10 +568,11 @@ fn parse_flags_decl(tokens: []lexer::Token, pos: u64) -> Parsed<Decl> | error {
     mut p = pos
     mut has_doc = false
     mut doc = ""
+    // (#111) an own-line doc comment attaches to the NEXT declaration; see parse_function.
     if is_kind_at(tokens, p, lexer::TokenKind::Doc) {
         has_doc = true
         doc = tokens[p].text
-        p = p + 1
+        p = skip_seps(tokens, p + 1)
     }
     mut vis = Visibility::Private
     if is_kind_at(tokens, p, lexer::TokenKind::Pub) {
@@ -501,10 +606,11 @@ fn parse_type_decl(tokens: []lexer::Token, pos: u64) -> Parsed<Decl> | error {
     mut p = pos
     mut has_doc = false
     mut doc = ""
+    // (#111) an own-line doc comment attaches to the NEXT declaration; see parse_function.
     if is_kind_at(tokens, p, lexer::TokenKind::Doc) {
         has_doc = true
         doc = tokens[p].text
-        p = p + 1
+        p = skip_seps(tokens, p + 1)
     }
     mut vis = Visibility::Private                        // default: own-namespace only
     if is_kind_at(tokens, p, lexer::TokenKind::Pub) {
@@ -576,7 +682,7 @@ fn parse_decl(tokens: []lexer::Token, pos: u64) -> Parsed<Decl> | error {
         }
     }
     mut k = start
-    if is_kind_at(tokens, k, lexer::TokenKind::Doc) { k = k + 1 }
+    if is_kind_at(tokens, k, lexer::TokenKind::Doc) { k = skip_seps(tokens, k + 1) }   // (#111) own-line doc
     if is_kind_at(tokens, k, lexer::TokenKind::Pub) {
         k = k + 1
     } else if is_kind_at(tokens, k, lexer::TokenKind::Exp) {
@@ -588,7 +694,7 @@ fn parse_decl(tokens: []lexer::Token, pos: u64) -> Parsed<Decl> | error {
         k = k + 1
     }
     if is_kind_at(tokens, k, lexer::TokenKind::Fn) {
-        return parse_function(tokens, start, is_test, os_guard, false)
+        return parse_function(tokens, start, is_test, os_guard, false, false)
     }
     if is_kind_at(tokens, k, lexer::TokenKind::Type) {
         if is_test { return err_at(tokens, k, "`#test` may only precede a function") }

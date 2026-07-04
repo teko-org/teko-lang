@@ -32,6 +32,7 @@ pub type FieldAccess = struct { receiver: Expr; field: str }                 // 
 pub type SafeFieldAccess = struct { receiver: Expr; field: str }             // x?.field — null-propagating access (REBOOT_PLAN §203)
 pub type Coalesce    = struct { left: Expr; right: Expr }                    // x ?? y — Elvis / null-coalescing (REBOOT_PLAN §203)
 pub type MethodCall  = struct { receiver: Expr; method: str; args: []Expr }  // recv.method(a, …) — B.29 instance call via `.`; method *checking* is deferred (M.4)
+pub type SafeMethodCall = struct { receiver: Expr; method: str; args: []Expr }  // recv?.method(a, …) — null-propagating method call (NP-OOP, issue #116)
 pub type Cast        = struct { expr: Expr; target: TypeExpr }               // x to T — explicit conversion; preserves→ok / loses→compile-error (E7; M.0+M.1)
 pub type PathExpr    = struct { path: Path }                                 // a qualified path as a VALUE — Enum::Member (e.g. PrimKind::U32), module statics (P2; the F2/Part-1 AST had only single-name Var)
 pub type StructLit   = struct { type_path: Path; type_args: []TypeExpr; field_names: []str; field_vals: []Expr }   // Name { field = value, … } — a struct VALUE constructor (W4a); (W9.4) type_args = explicit `Foo<i64>{ … }` generic args (empty for bare `Foo { … }`); parallel slices (.len replaces nfields)
@@ -69,7 +70,7 @@ pub type Lambda      = struct { params: []LambdaParam; body: []Statement }
 // `TExpr` (tast.tks) and the C `tk_expr` (ast.h), so EVERY expression node carries its 1-based
 // source position. The parser stamps line/col from the node's first token; the checker copies
 // it onto the typed node and onto type-errors, so a message points at the failing expression.
-pub type ExprKind = variant Number | Var | Call | IfExpr | MatchExpr | StrLit | ByteLit | CharLit | BoolLit | NullLit | Binary | Unary | Compare | FieldAccess | SafeFieldAccess | Coalesce | MethodCall | Cast | PathExpr | StructLit | Index | Interp | InExpr | ArrayLit | Lambda
+pub type ExprKind = variant Number | Var | Call | IfExpr | MatchExpr | StrLit | ByteLit | CharLit | BoolLit | NullLit | Binary | Unary | Compare | FieldAccess | SafeFieldAccess | Coalesce | MethodCall | SafeMethodCall | Cast | PathExpr | StructLit | Index | Interp | InExpr | ArrayLit | Lambda
 pub type Expr = struct { kind: ExprKind; line: u32; col: u32 }
 
 // --- statements ---
@@ -85,7 +86,16 @@ pub type Binding = struct {                                 // let/mut/const TAR
     type_ann: TypeExpr                                  // the parsed annotation (A.8)
     value:    Expr
 }
-pub type Assign  = struct { name: str; op: lexer::TokenKind; value: Expr; deref: bool }  // x = / += / … (B.4); deref=true ⇒ `name.value op= …` writes THROUGH a `Ref<T>` (MEM-1b-ii) — the only field-assign target in value-functional Teko
+// (#88) an assignment TARGET is one of three shapes, tagged by `kind`:
+//   Simple   — `name op= value`; LHS is the bare binding `name` (deref=false, target = no_expr()).
+//   RefDeref — `name.value op= value`; write THROUGH a `Ref<T>` handle `name` (deref=true — the legacy
+//              MEM-1b-ii flag, preserved; target = no_expr()).
+//   Field    — `recv.field op= value`; write a struct/class field. `target` is the LHS field-access EXPR
+//              (a FieldAccess, receiver.field, arbitrarily nested); `name`/`deref` unused.
+// `deref` stays a plain bool == (kind==RefDeref) so every legacy reader / TKB byte layout is unchanged for the
+// two old shapes; a Field target is the ONLY new shape (kind=Field carries `target`, the general lvalue).
+pub type AssignKind = enum { Simple; RefDeref; Field }
+pub type Assign  = struct { kind: AssignKind; name: str; op: lexer::TokenKind; value: Expr; deref: bool; target: Expr }  // x = / += / … (B.4); see AssignKind above
 pub type Return  = struct { has_value: bool; value: Expr }   // `return [expr]` — bare `return` (no value) has has_value=false, value a placeholder (B.20; P4a)
 pub type LoopStmt = struct { label: str; body: []Statement }   // loop [NAME] { … } (M.5); label empty (len 0) = unlabeled
 pub type BreakStmt    = struct { label: str }               // break [NAME] — label empty = innermost loop
@@ -152,7 +162,11 @@ pub type Function = struct {
 // model): each Function's 1st param has_type=false ⇒ an INSTANCE method (the receiver, name
 // free, by-value-copy immutable, type injected by the checker as the enclosing struct); no
 // untyped 1st param ⇒ STATIC (no receiver). Struct members (fields + methods) stay ALL PUBLIC.
-pub type StructBody  = struct { fields: []Field; methods: []Function }
+// (W10b.IF) `implements: []str` — the `struct I1 & I2 { … }` interface list (a struct MAY
+// implement interfaces, per the OOP design — it just cannot inherit / be inherited). Empty when the
+// struct declares none. Conformance (does the struct provide every method of each interface) is
+// checked by the checker exactly like a class's implements list.
+pub type StructBody  = struct { fields: []Field; methods: []Function; implements: []str }
 // (W10b.CLASS, 2026-07-01) a field's REACH: `vis` is the usual Private/Pub/Exp; `is_intern`
 // widens it to "also visible to inheritors" (orthogonal, not a 4th Visibility tier — see
 // Visibility's own doc). A struct's Field always carries vis=Pub/is_intern=false (struct members
@@ -186,7 +200,25 @@ pub type ClassBody = struct {
     fields: []Field
     methods: []Function
 }
-pub type TypeBody    = variant StructBody | EnumBody | FlagsBody | VariantBody | AliasBody | ExternBody | ClassBody   // pub: TypeDecl.body surface + the .tkb codec (C7.16)
+// (W10b.IF) an INTERFACE — a PURE SIGNATURE CONTRACT: `type X = interface [I1 & I2 …] { fn sig; … }`.
+// `extends: []str` — the interfaces this one extends (multiple inheritance; the `I1 & I2` list between
+// `interface` and `{`). `methods: []Function` — INSTANCE-method SIGNATURES only (each is a bodyless
+// `Function`: 1st param untyped = the receiver; NO body, NO statics, NO default bodies; all members
+// public). A type conforms by providing every method (transitively through `extends`) with a matching
+// signature. An interface has NO runtime representation yet (dynamic dispatch = ROUND 3); it is a
+// compile-time contract only, so codegen/VM emit nothing for it and reject it as a value type.
+pub type InterfaceBody = struct { extends: []str; methods: []Function }
+// (TR0, 2026-07-02) a TRAIT — a struct-shaped, NON-instantiable bundle of fields + methods that a
+// struct/class DERIVES (`type Post = struct Timestamped { … }` — the same `&`-list position as
+// interfaces). `fields` = provided members, folded into the deriver (reusing the class
+// field-flattening); `methods` = a method WITH a body is PROVIDED (overridable — a deriver-defined
+// method of the same name IS the override), a method WITHOUT a body is a REQUIREMENT the deriver
+// must satisfy (like interface conformance). The checker FOLDS derived traits into each deriver
+// before typing (fold_traits), so codegen/VM never see a trait in a value position; the decl
+// itself emits nothing (like InterfaceBody). Trait-typed VALUES + `<T: Trait>` constraints are
+// TR1 (honest stops until then).
+pub type TraitBody = struct { fields: []Field; methods: []Function }
+pub type TypeBody    = variant StructBody | EnumBody | FlagsBody | VariantBody | AliasBody | ExternBody | ClassBody | InterfaceBody | TraitBody   // pub: TypeDecl.body surface + the .tkb codec (C7.16)
 pub type TypeDecl    = struct {                             // nominal (B.13)
     name:    str
     type_params: []str                                 // generic type-parameter names (S4 — empty for a non-generic type; e.g. `type Box<T>` → ["T"])

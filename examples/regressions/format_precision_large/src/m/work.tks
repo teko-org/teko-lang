@@ -1,0 +1,35 @@
+// Regression for issue #48: `$"{x:F500}"` (static spec) and `$"{x:[spec]}"` (dynamic spec,
+// spec computed at runtime) both route through src/runtime/teko_rt.c's tk_fmt_f/fmt_from_buf.
+// A precision of 500 makes the untruncated formatted result 502 bytes ("1." + 500 zeros) —
+// far past the 128-byte stack scratch buffer those helpers snprintf into. Before the fix this
+// was a stack over-read (CWE-125); after the fix the full, correct 502-byte result is returned
+// via a heap fallback. Returning `.len` (not the string itself) keeps this assertable as a
+// process exit code.
+
+// static spec: `:F500` is baked into the source, lowered to tk_fmt_f(val, 500) at codegen time.
+// Correct, untruncated output is "1." + 500 zeros == 502 bytes.
+pub fn static_precision_len() -> i64 {
+    let s = $"{1.0:F500}"
+    s.len to i64
+}
+
+// dynamic spec: `:[spec]` evaluates `spec` at RUNTIME and passes it to tk_fmt_dyn_f64, which
+// parses the precision digits out of the runtime string (fmt_parse_prec) and calls tk_fmt_f —
+// same over-read surface as the static path, reached through the dynamic-dispatch helper instead.
+pub fn dynamic_precision_len() -> i64 {
+    let spec = "F500"
+    let s = $"{1.0:[spec]}"
+    s.len to i64
+}
+
+// Process exit codes are POSIX 8-bit (truncated mod 256), so the raw 502-byte length can't
+// survive as `main`'s return value — 502 mod 256 == 246 is indistinguishable from a wrong
+// (truncated) result. Fold the two lengths down to a small, unambiguous sentinel instead:
+// both must equal the expected 502 EXACTLY (checked in full 64-bit precision here, before any
+// truncation), or this returns 0.
+pub fn check() -> i64 {
+    let expected: i64 = 502
+    let a = static_precision_len()
+    let b = dynamic_precision_len()
+    if a == expected && b == expected { 42 } else { 0 }
+}

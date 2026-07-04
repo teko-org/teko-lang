@@ -7,7 +7,7 @@
 > ROI ranking and a one-paragraph "build-first" recommendation.
 >
 > **Method / honesty note (M.3).** Every count below was measured against the live tree on branch
-> `chore/reboot`. Where a number is a *projection* (e.g. a compile-time speedup) it is labelled
+> the reboot line (now `main`). Where a number is a *projection* (e.g. a compile-time speedup) it is labelled
 > **[projected]** and the model is shown. The corpus measured: **49 `.tks` source units**, **40 `.c`
 > compilation units**, **49 `.h`**, **14 `.tkt` tests** — **63 VM-run units (`.tks`+`.tkt`)**, **138
 > `.c`/`.h`/`.tks` source files**, across **11 subsystems** under `src/`. Source LOC: **`.tks` ≈ 9,312**,

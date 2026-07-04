@@ -1,0 +1,39 @@
+// fix/selfhost-arm-join-widen — an `if`/`match` whose two arms are DIFFERENT members of the
+// annotated wider variant. The checker's type_join infers the NARROW `Circle | Square` union for
+// the if-expression; the binding annotation `: Shape` is the WIDER variant (three members). Native
+// codegen must type the temp as `Shape` and widen each arm into it — not the narrow member-pair
+// union `tk_u_Circle_Square` (which `cc` rejects when it lands in the `Shape`-typed C variable, a
+// DISTINCT `tk_t_Shape` struct). See ../../if_arm_variant_widen.tkp.
+
+pub type Circle = struct { r: i32 }
+pub type Square = struct { s: i32 }
+pub type Triangle = struct { b: i32; h: i32 }
+
+// A `variant` DECL (not a transparent 2-member alias) → a distinct `tk_t_Shape` C type with THREE
+// members, so the 2-arm join `Circle | Square` is a genuinely NARROWER `tk_u_Circle_Square`.
+pub type Shape = variant Circle | Square | Triangle
+
+// area "code" so we get a distinct exit for each member.
+fn area_code(sh: Shape) -> i32 {
+    match sh {
+        Circle as c => c.r * 10        // r=3 -> 30
+        Square as sq => sq.s * 11      // s=4 -> 44
+        Triangle as t => t.b * t.h     // unused here
+    }
+}
+
+pub fn pick_area(pick_circle: bool) -> i32 {
+    // if-arms are two DIFFERENT members of a THREE-member `Shape`; the binding is the WIDE `Shape`.
+    let body: Shape = if pick_circle { Circle { r = 3 } } else { Square { s = 4 } }
+    area_code(body)
+}
+
+pub fn pick_area_match(which: i32) -> i32 {
+    // Same shape via a value-form `match` (the other arm-join site: emit_match_value): two arms are
+    // two DIFFERENT members of the WIDE `Shape`. (No match-on-bool — subject is an i32.)
+    let body: Shape = match which {
+        0 => Circle { r = 3 }
+        _ => Square { s = 4 }
+    }
+    area_code(body)
+}

@@ -1,0 +1,27 @@
+# Regression (issue #122): a SELF-REFERENCING class-optional field (`next: Node?` on class
+# `Node`) broke NATIVE codegen in two ways, while the VM handled the same program:
+#
+#   1. `next = null` in the struct-literal init reached the raw-`null` codegen error
+#      ("a bare `null` needs a known optional type from context") — cg_find_struct_field_type
+#      only looked inside STRUCT bodies, never CLASS bodies, so the field's declared `Node?`
+#      slot type was never found and the null-init lowering was skipped.
+#
+#   2. The field was wrongly BOXED (`tk_opt_Node *`) while every construct/read site emitted
+#      it by value (`tk_opt_Node`) — cg_te_reaches_byvalue treated a class-named edge as a
+#      by-value cycle. A class is pointer-lowered, so `Node?` = `{ present; tk_t_Node * }` is
+#      already finite: it must NOT be boxed. Fixing that surfaced a typedef-ordering deadlock
+#      (`tk_t_Node` embeds `tk_opt_Node` by value, `tk_opt_Node` holds `tk_t_Node *`) resolved
+#      by teaching cg_named_ready / cg_type_ready that a class inner is a pointer (forward-decl
+#      is enough), so `tk_opt_Node` emits before the class body.
+#
+# This fixture builds a 3-node linked list (1 -> 2 -> 3, tail's `next = null`) and SUMS it by
+# walking `.next` via safe field access + `??` coalescing, then exits with the sum. Both
+# engines must build+run identically.
+#
+#   teko run   examples/regressions/selfref_class_optional   # VM     -> exit 6
+#   teko build examples/regressions/selfref_class_optional   # native -> binary exits 6
+name = "selfref_class_optional"
+source = "src"
+
+[artifact]
+kind = "binary"

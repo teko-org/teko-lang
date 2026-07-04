@@ -1,0 +1,33 @@
+# Regression (fix/selfhost-arm-join-widen): a variant-annotated binding whose value is an `if`/`match`
+# whose TWO ARMS are DIFFERENT members of the annotated wider variant.
+#
+#   let body: Shape = if c { Circle { r = 3 } } else { Square { s = 4 } }
+#
+# The checker's arm JOIN (type_join) infers the NARROW member-pair union `Circle | Square` as the
+# if-expression's type (each arm's type joined against the other's), then relies on widens_into to
+# accept assigning that narrow union into the wider annotated variant `Shape`. That type-checks fine
+# on BOTH engines and RUNS fine on the VM (which ignores element/union C types).
+#
+# But native codegen (src/codegen/codegen.tks::emit_if_value / emit_match_value + emit_as_r) typed the
+# if-expression's C temp as the NARROW union `tk_u_Circle_Square` and wrapped each arm's value into
+# THAT narrow union — then the surrounding `let body: Shape = …` assigned a `tk_u_Circle_Square` into a
+# `tk_t_Shape` C variable, which `cc` REJECTS:
+#     initializing 'tk_t_Shape' with an expression of incompatible type 'tk_u_Circle_Square'
+#
+# The exact shape hit `./build/teko . -o bin` on `resolve.tks::type_param_table` (issue #99 / PR #140),
+# worked around there by constructing the whole record per-arm. This fixture pins the ROOT fix: when the
+# binding/param/return slot is a wider variant the narrow arm-join widens INTO, emit_if_value/
+# emit_match_value type the temp as that WIDE variant and wrap each arm's value into it (case → wide
+# variant, transitively). The VM masks the bug, so this MUST build NATIVELY (teko build → codegen → cc)
+# — a .tkt #test would only exercise the VM and never hit the C codegen path.
+#
+#   shape_area_code() picks Circle{r=3} (area code 30) vs Square{s=4} (area code 44); returns 30 for
+#   the `true` branch, matched back out of the WIDE `Shape` variant. Exit code = 30.
+#
+#   teko run   examples/regressions/if_arm_variant_widen   # VM     -> exit 30
+#   teko build examples/regressions/if_arm_variant_widen   # native -> exit 30 (was: cc rejects)
+name = "if_arm_variant_widen"
+source = "src"
+
+[artifact]
+kind = "binary"

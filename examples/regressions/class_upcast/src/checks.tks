@@ -1,0 +1,53 @@
+// (#98) Sub->Base upcast — the surface THIS change delivers: a subclass value flows into a
+// base-typed slot (a local binding, a fn return, a base-typed param) and a virtual call
+// through that base-typed value dispatches to the subclass override. main.tks (the virtual
+// main) drives these; each returns a distinct nonzero code on failure (0 = pass). The
+// differential harness asserts VM == native.
+//
+// KNOWN GAPS (NOT exercised here — separate follow-up codegen work, see the PR checklist):
+//   * FIELD READ through a base value (`a.name` / `self.name` inside a base method) — the
+//     access lowers to a pointer deref, but a base value is a fat pointer (needs `.data`).
+//   * a RAW subclass value passed DIRECTLY as a base-typed argument (`f(Dog::make(..))`) —
+//     the call-arg isn't yet routed through the emit_as Sub->Base wrap (a base-typed LOCAL
+//     passed as the arg DOES work, and is covered below).
+//   * `[]Base` — a slice OF a polymorphic base (slice-of-base-element codegen unimplemented).
+
+// a fn PARAM of base type + a virtual call through it (dispatches to the concrete override).
+pub fn hear(a: Animal) -> str {
+    a.speak()
+}
+
+// a fn RETURNING the base type — the returned subclass value upcasts into the base ret slot.
+pub fn pick(dog: bool) -> Animal {
+    if dog {
+        return Dog::make("Rex")
+    }
+    Cat::make("Milo")
+}
+
+// 1) BINDING position: a subclass value bound into a base-typed local, dispatched.
+pub fn check_binding() -> i64 {
+    let a: Animal = Dog::make("Rex")
+    if a.speak() != "Woof" { return 1 }
+    let b: Animal = Cat::make("Milo")
+    if b.speak() != "Meow" { return 2 }
+    0
+}
+
+// 2) PARAM position: a base-typed local passed as a base param, dispatched through it.
+pub fn check_param() -> i64 {
+    let a: Animal = Dog::make("Rex")
+    if hear(a) != "Woof" { return 3 }
+    let b: Animal = Cat::make("Milo")
+    if hear(b) != "Meow" { return 4 }
+    0
+}
+
+// 3) RETURN position: the returned subclass upcasts into the base ret slot, dispatched.
+pub fn check_return() -> i64 {
+    let a = pick(true)
+    if a.speak() != "Woof" { return 5 }
+    let b = pick(false)
+    if b.speak() != "Meow" { return 6 }
+    0
+}

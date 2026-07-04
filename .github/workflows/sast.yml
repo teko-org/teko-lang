@@ -1,10 +1,12 @@
 name: SAST Gate
 
+# chore/reboot is the ACTIVE integration branch (the "new main") — without it here, PRs
+# targeting chore/reboot get no checks at all (issue #54).
 on:
   push:
-    branches: [main, master]
+    branches: [main, master, chore/reboot]
   pull_request:
-    branches: [main, master]
+    branches: [main, master, chore/reboot]
 
 # Restrict default token scope for all jobs in this workflow.
 permissions:
@@ -26,6 +28,7 @@ jobs:
               - 'src/**'
               - 'CMakeLists.txt'
               - '.github/workflows/sast.yml'
+              - '.github/sast-baseline.txt'
 
   # ── clang-tidy audit ─────────────────────────────────────────────────────────
   clang-tidy-audit:
@@ -86,6 +89,32 @@ jobs:
             exit 1
           fi
           echo "No security findings"
+
+      # Baselined checks (issue #54): cert-err33-c + clang-analyzer-core.uninitialized.*
+      # gate on NEW findings only. .github/sast-baseline.txt holds the pre-existing
+      # (file, check) pairs — line numbers deliberately excluded so ordinary edits don't
+      # churn it. A finding in a pair NOT in the baseline fails the job.
+      - name: Fail on NEW baselined-check findings
+        run: |
+          grep -E 'warning:.*\[(cert-err33-c|clang-analyzer-core\.uninitialized\.[A-Za-z]+)\]' clang-tidy-results.txt \
+            | sed -E 's|^.*/(src/[^:]+):[0-9]+:[0-9]+: warning: .*\[([a-zA-Z0-9._-]+)\]$|\1 \2|' \
+            | sort -u > found-pairs.txt || true
+          grep -v '^#' .github/sast-baseline.txt | grep -v '^$' | sort -u > baseline-pairs.txt
+
+          NEW_PAIRS="$(comm -23 found-pairs.txt baseline-pairs.txt)"
+          if [ -n "$NEW_PAIRS" ]; then
+            echo "NEW cert-err33-c / core.uninitialized.* findings (not in .github/sast-baseline.txt):"
+            echo "$NEW_PAIRS"
+            echo
+            echo "Full diagnostics:"
+            while read -r file check; do
+              grep -E "/${file//./\\.}:[0-9]+:[0-9]+: warning: .*\[${check//./\\.}\]" clang-tidy-results.txt || true
+            done <<< "$NEW_PAIRS"
+            echo
+            echo "Fix the finding, or (tribunal-level exception) add the pair to .github/sast-baseline.txt."
+            exit 1
+          fi
+          echo "No new baselined-check findings ($(wc -l < found-pairs.txt | tr -d ' ') pre-existing pair groups still baselined)"
 
   # ── gate: aggregates both SAST jobs ──────────────────────────────────────────
   gate:

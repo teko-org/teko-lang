@@ -35,7 +35,7 @@
         xs.len = xs.len + 1;                                                  \
         return xs;                                                            \
     }                                                                         \
-    static inline void Name##_free(Name xs) { free(xs.ptr); }
+    __attribute__((unused)) static inline void Name##_free(Name xs) { free(xs.ptr); }   /* (#151) many instantiations never free (arena-era callers) — not a warning */
 
 // byte — one octet (mirrors src/text/text.h's tk_byte; same rep).
 typedef uint8_t tk_byte;
@@ -146,6 +146,10 @@ tk_region *tk_region_new(tk_region *parent);    // a fresh empty region (default
 void      *tk_region_alloc(tk_region *r, size_t n);  // bump-allocate n (n→1), aligned; OOM→panic
 void       tk_region_drop(tk_region *r);        // bulk-free every chunk + the region (NULL-tolerant; idempotent on a re-walk — head is cleared before free; callers MUST null their handle after, as the freed region must not be reused)
 tk_region *tk_region_root(void);                // the process root region (lazy; never dropped in S1; parent = NULL — the tree root)
+// (#109 test-gate memory) checkpoint/rewind the ROOT region's bump position, bulk-freeing everything
+// it allocated in between. Balanced push/pop; used by the test-gate runner to bound per-test memory.
+void       tk_arena_push(void);                 // save the root region's current bump position
+void       tk_arena_pop(void);                  // free every root-region chunk allocated since the matching push
 // tk_region_register — bind `type_id` → `instance` in `r`'s OWN table (never an ancestor's; a
 // second registration of the same type_id in the same region OVERWRITES — the compiler is
 // expected to enforce true duplicate-registration errors at a higher DI layer; this is just the
@@ -343,6 +347,8 @@ tk_ffi_ures tk_rt_write_file_bytes(tk_str path, const tk_byte *ptr, uint64_t len
 tk_ffi_ures tk_rt_chdir(tk_str path);
 // teko::fs::mkdir(path) — create a directory (mode 0755); SUCCESS if it already exists.
 tk_ffi_ures tk_rt_mkdir(tk_str path);
+// (issue #79) teko::fs::remove_file(path) — delete a file (libc remove); SUCCESS if already absent.
+tk_ffi_ures tk_rt_remove_file(tk_str path);
 // teko::env::cwd() — the current working directory as an owned absolute path, or error.
 tk_ffi_sres tk_rt_getcwd(void);
 // teko::env::set_var(name, value) — set an environment variable; error on failure.
@@ -354,12 +360,22 @@ tk_ffi_u64res tk_rt_last_index_of(tk_str hay, tk_str needle);
 // teko::process::run(argv) — fork/exec argv[0] with argv, wait, return its exit status
 // (127 when argv is empty / exec fails). Takes the slice as ptr+len (no generated type).
 int32_t tk_rt_run(const tk_str *argv, uint64_t n);
+// teko::process::run_quiet(argv) — same contract as tk_rt_run, but the child's stdout/stderr
+// are redirected to the null device (issue #73: the cc flag-family probe uses this so a
+// deliberately-rejected compiler flag doesn't print to the user's build output).
+int32_t tk_rt_run_quiet(const tk_str *argv, uint64_t n);
 // teko::env::args() — the captured process argv as owned tk_str's; *n receives the count.
 // tk_set_args must run first (the generated `main` calls it before the virtual-main body).
 void    tk_set_args(int argc, char **argv);
 tk_str *tk_rt_args(uint64_t *n);
 // (C7.1f) the host OS name: "macos"/"linux"/"windows"/"unknown" (teko::os; per-OS resolution + `#os`).
 tk_str tk_rt_os(void);
+// (CLI --version) the build's version string — the RAW project-manifest `version` + `-<suffix>`
+// (e.g. "0.0.1.0-bootstrap"). Compiled from the TEKO_VERSION_STRING define injected by both build
+// paths (CMake for the bootstrap, run_cc for self-host), never a runtime file read. (teko::env::version)
+tk_str tk_rt_version(void);
+// (#148) the process peak RSS in bytes (0 = unavailable) — teko::mem::peak_rss.
+uint64_t tk_peak_rss(void);
 
 // ---- Date/Time placeholder types (ROUND 0) ----
 // Five value types: DateTime (signed ns since Unix epoch), TimeSpan (signed ns duration),
@@ -436,6 +452,20 @@ bool     tk_cov_line_hit(uint64_t fn, uint32_t line);      // report query
 // `elem` points at one element of `esz` bytes; `*out_len` receives the new length; returns the
 // (possibly same) data pointer.
 void *tk_slice_push(const void *ptr, uint64_t len, const void *elem, uint64_t esz, uint64_t *out_len);
+// (S2 Level-1) region-aware variant — the grown buffer is allocated in `region` (a function frame
+// region `_tkfr`) instead of the process root, so a NON-escaping slice's whole buffer history is
+// bulk-freed when the frame drops. `tk_slice_push` is the root-region wrapper over this. Codegen
+// emits this only for a slice binding the escape analysis proves frame-local.
+void *tk_slice_push_r(const void *ptr, uint64_t len, const void *elem, uint64_t esz, uint64_t *out_len, tk_region *region);
+// (#148 S2 Level-2) free-old-on-grow variant — for a self-append whose chain the checker PROVED
+// linear: on a copy-grow the old buffer is PARKED on the free-list for reuse (realloc parity).
+void *tk_slice_push_fo(const void *ptr, uint64_t len, const void *elem, uint64_t esz, uint64_t *out_len);
+// (#148 R2) bulk byte-append with free-old-on-grow BY DECREE (the linear cb emitter chain) — one
+// memcpy per fragment; the old buffer parks for reuse the moment a grow replaces it.
+void *tk_append_bytes_fo(const void *ptr, uint64_t len, const void *src, uint64_t n, uint64_t *out_len);
+// (mem::free) tk_free_block — park an explicitly freed root-arena block for same-size REUSE
+// (the `teko::mem::free` []T-arm lowering: `tk_free_block(s.ptr, s.len * sizeof(elem))`).
+void tk_free_block(void *p, uint64_t bytes);
 
 // --- arithmetic FFI over the i128 carrier (sign-aware) + float bit-patterns ---
 // div/rem: truncated division/remainder; sgn selects signed vs unsigned interpretation.
@@ -516,6 +546,37 @@ static inline int16_t  tk_mod_i16(int16_t  a, int16_t  b){ if (b == 0) tk_panic_
 static inline int32_t  tk_mod_i32(int32_t  a, int32_t  b){ if (b == 0) tk_panic_div0(); return a % b; }
 static inline int64_t  tk_mod_i64(int64_t  a, int64_t  b){ if (b == 0) tk_panic_div0(); return a % b; }
 static inline __int128 tk_mod_i128(__int128 a, __int128 b){ if (b == 0) tk_panic_div0(); return a % b; }
+
+// --- #49: width-masked shift <<, >> — defined result for an OUT-OF-RANGE count -------------
+// Plain C `<<`/`>>` is UB when the shift count is >= the operand's bit-width (or negative); a
+// Teko program that computes a large/negative-looking `u32`/`i64`/… count (e.g. from user input
+// or arithmetic) must not hit native UB. Ruling: mask the count by (bit-width - 1) — C#/Java
+// semantics — so `(1 as i32) << 40` == `1 << (40 & 31)` == `1 << 8` == 256, matching the VM
+// (vm.c's eval_binary / vm.tks's apply_int_op) bit-for-bit. In-range counts are unaffected (the
+// mask is a no-op when count < width). One helper per signed/unsigned width (u8..u128, i8..i128);
+// codegen selects by the binary node's result prim (same tag as tk_div_*/tk_add_*). Signed `>>`
+// keeps its existing sign-preserving (arithmetic) behavior — only the COUNT is fixed here.
+static inline uint8_t  tk_shl_u8 (uint8_t  a, uint8_t  b){ return (uint8_t )(a << (b & 7));   }
+static inline uint16_t tk_shl_u16(uint16_t a, uint16_t b){ return (uint16_t)(a << (b & 15));  }
+static inline uint32_t tk_shl_u32(uint32_t a, uint32_t b){ return a << (b & 31);              }
+static inline uint64_t tk_shl_u64(uint64_t a, uint64_t b){ return a << (b & 63);              }
+static inline unsigned __int128 tk_shl_u128(unsigned __int128 a, unsigned __int128 b){ return a << (b & 127); }
+static inline int8_t   tk_shl_i8 (int8_t   a, int8_t   b){ return (int8_t )((uint8_t )a << ((uint8_t )b & 7));   }
+static inline int16_t  tk_shl_i16(int16_t  a, int16_t  b){ return (int16_t)((uint16_t)a << ((uint16_t)b & 15));  }
+static inline int32_t  tk_shl_i32(int32_t  a, int32_t  b){ return (int32_t)((uint32_t)a << ((uint32_t)b & 31));  }
+static inline int64_t  tk_shl_i64(int64_t  a, int64_t  b){ return (int64_t)((uint64_t)a << ((uint64_t)b & 63));  }
+static inline __int128 tk_shl_i128(__int128 a, __int128 b){ return (__int128)((unsigned __int128)a << ((unsigned __int128)b & 127)); }
+
+static inline uint8_t  tk_shr_u8 (uint8_t  a, uint8_t  b){ return (uint8_t )(a >> (b & 7));   }
+static inline uint16_t tk_shr_u16(uint16_t a, uint16_t b){ return (uint16_t)(a >> (b & 15));  }
+static inline uint32_t tk_shr_u32(uint32_t a, uint32_t b){ return a >> (b & 31);              }
+static inline uint64_t tk_shr_u64(uint64_t a, uint64_t b){ return a >> (b & 63);              }
+static inline unsigned __int128 tk_shr_u128(unsigned __int128 a, unsigned __int128 b){ return a >> (b & 127); }
+static inline int8_t   tk_shr_i8 (int8_t   a, int8_t   b){ return (int8_t )(a >> (b & 7));   }
+static inline int16_t  tk_shr_i16(int16_t  a, int16_t  b){ return (int16_t)(a >> (b & 15));  }
+static inline int32_t  tk_shr_i32(int32_t  a, int32_t  b){ return a >> (b & 31);              }
+static inline int64_t  tk_shr_i64(int64_t  a, int64_t  b){ return a >> (b & 63);              }
+static inline __int128 tk_shr_i128(__int128 a, __int128 b){ return a >> (b & 127); }
 
 // --- C7.15 overflow-guarded integer +, -, *: panic when TEKO_OVERFLOW_DEBUG is set ---
 // One helper per signed/unsigned width (u8..u128, i8..i128). Float +,-,* are NOT here —

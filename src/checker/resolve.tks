@@ -7,15 +7,288 @@ use teko::parser
 type TypeReg   = struct { name: str; namespace: str; vis: parser::Visibility; decl: parser::TypeDecl }
 pub type TypeTable = []TypeReg
 
+// (#109 W3) the CANONICAL name of a type: "ns::Name" (bare "Name" at the root ns). The semantic
+// `Named.name` carries THIS — so two same-bare-name public types in different namespaces (teko::io::
+// Reader vs teko::emit::Reader) are DISTINCT identities (type_eq) and DISTINCT C mangles. Builtins,
+// type-params, and generic `__g__` instances stay bare (ns == "" → returns the name unchanged).
+pub fn qualify(ns: str, name: str) -> str {
+    if ns == "" { name } else { ns ~ "::" ~ name }
+}
+// (#148) qualify_eq — does `name` equal qualify(ns, bare) WITHOUT building the string? The hot
+// table scans compared a freshly-CONCATENATED "ns::Name" per candidate per lookup (measured 63M
+// concats / ~1 GB+overhead on a self-build); this byte-wise test allocates nothing.
+pub fn qualify_eq(ns: str, bare: str, name: str) -> bool {
+    if ns.len == 0 { return bare == name }
+    if name.len != ns.len + 2 + bare.len { return false }
+    mut i: u64 = 0
+    loop { if i >= ns.len { break }; if name[i] != ns[i] { return false }; i++ }
+    if name[ns.len] != b':' { return false }
+    if name[ns.len + 1] != b':' { return false }
+    mut j: u64 = 0
+    loop { if j >= bare.len { break }; if name[ns.len + 2 + j] != bare[j] { return false }; j++ }
+    true
+}
+// (#109 W3) the bare last "::"-segment of a (possibly canonical) name: "teko::emit::Reader" → "Reader",
+// "Reader" → "Reader". Manual byte-loop (mirrors class_name_from_method_ns), since last_index_of is a
+// host-only FFI edge unavailable to the VM-interpreted checker.
+pub fn name_last_segment(name: str) -> str {
+    mut last_sep: i64 = -1
+    mut i: u64 = 0
+    loop {
+        if i + 1 >= name.len { break }
+        if name[i] == b':' && name[i + 1] == b':' { last_sep = i to i64 }
+        i++
+    }
+    if last_sep < 0 { return name }
+    // (#148) the BUILTIN slice (→ tk_str_slice_from, one memcpy) — the materialized
+    // teko::runtime::str_slice_from builds byte-by-byte (a push loop + a final copy), and this
+    // helper runs per type-name comparison (measured ~144M tiny allocs on a self-build).
+    teko::str::slice_from(name, (last_sep to u64) + 2)
+}
+// (#109 W3) the namespace qualifier of a canonical name (everything before the final "::"):
+// "teko::emit::Reader" → "teko::emit"; "Reader" → "".
+pub fn name_qualifier(name: str) -> str {
+    mut last_sep: i64 = -1
+    mut i: u64 = 0
+    loop {
+        if i + 1 >= name.len { break }
+        if name[i] == b':' && name[i + 1] == b':' { last_sep = i to i64 }
+        i++
+    }
+    if last_sep < 0 { return "" }
+    teko::str::slice_to(name, last_sep to u64)   // (#148) builtin slice — see name_last_segment
+}
+
 // find a user type by name; error if not registered.
-fn type_table_find(table: TypeTable, name: str) -> parser::TypeDecl | error {
+// (#109 W3) `name` may be a CANONICAL "ns::Name" (a resolved Named.name) OR a bare source name. The
+// table entry may carry (bare name + real ns) [the typing collect table] OR (canonical name + "")
+// [the codegen/vm type_table_of re-collection]. Match when the entry's name equals `name` directly
+// OR when its qualified form qualify(ns, name) equals `name` — covering every combination. ref_ns is
+// unused (a resolved-name probe is namespace-blind; the SOURCE-reference sites use resolve_type_ref).
+fn type_table_find(table: TypeTable, name: str, ref_ns: str) -> parser::TypeDecl | error {
+    // (#152) TWO PASSES: pass 1 = exact name OR the entry's qualified form (both UNIQUE post-W0's
+    // per-namespace dup ban) — so a canonical query can never be stolen by a same-bare cousin that
+    // merely appears earlier in the table (discovery order differs per platform). Pass 2 = the
+    // legacy bare last-segment fallback (bare probes of a CANONICAL-keyed type_table_of table).
     mut i = 0
     loop {
         if i >= table.len { break }
-        if table[i].name == name { return table[i].decl }
+        if table[i].name == name || qualify_eq(table[i].namespace, table[i].name, name) { return table[i].decl }   // (#148) allocation-free qualified compare
         i++
     }
+    mut j = 0
+    loop {
+        if j >= table.len { break }
+        if name_last_segment(table[j].name) == name { return table[j].decl }
+        j++
+    }
     error { message = "not a user type" }
+}
+
+// (#109 W2) does the qualifier `qual` (a path's segments BEFORE the last, joined with "::") select
+// namespace `ns`? A qualifier matches when `ns` equals it OR ends with `"::" ~ qual` — so the single
+// segment `emit` matches the canonical `teko::emit`, and the absolute `teko::emit` matches exactly
+// (R0, a special case of R4). An empty qualifier (a bare 1-segment path) never reaches here.
+fn qualifier_selects_ns(ns: str, qual: str) -> bool {
+    if ns == qual { return true }
+    teko::runtime::str_ends_with(ns, "::" ~ qual)
+}
+
+// (#109 W2) join a path's FIRST `count` segments with "::" — the qualifier of a qualified reference
+// (`teko::emit::Reader` with count=2 → "teko::emit"; `lexer::Token` with count=1 → "lexer").
+fn path_qualifier(path: parser::Path, count: u64) -> str {
+    mut out = ""
+    mut i: u64 = 0
+    loop {
+        if i >= count { break }
+        if i == 0 { out = path.segments[i].name } else { out = out ~ "::" ~ path.segments[i].name }
+        i++
+    }
+    out
+}
+
+// (#109 W2) list the namespaces a bare name IS declared in (for the R3 fail-loud diagnostic), joined
+// with ", "; "" is rendered "<top-level>". O(n) scan — used only when a bare reference misses.
+fn namespaces_declaring(table: TypeTable, name: str) -> str {
+    mut out = ""
+    mut i: u64 = 0
+    loop {
+        if i >= table.len { break }
+        if table[i].name == name {
+            let label = if table[i].namespace == "" { "<top-level>" } else { table[i].namespace }
+            if out == "" { out = label } else { out = out ~ ", " ~ label }
+        }
+        i++
+    }
+    out
+}
+
+// (#109 W2) the DECLARING namespace of a type by its (resolved) name — first match, "" if unknown.
+// A struct/class field's, or a method signature's, source type annotation is written in the type's
+// OWN namespace, so resolving those annotations must reference that namespace, not the code site's.
+// Shared across the checker (collect conformance, typer field/struct-init resolution). Under W0 no
+// two types share a bare name, so the first match is unambiguous (W3 canonical names make it exact).
+fn type_ns_of(table: TypeTable, name: str) -> str {
+    mut i: u64 = 0
+    loop {
+        if i >= table.len { break }
+        // (#109 W3) `name` may be a CANONICAL "ns::Name" (a resolved Named.name) or a bare stamped
+        // `__g__` instance — match exact OR by the entry's qualified form (like type_table_find).
+        if table[i].name == name || qualify_eq(table[i].namespace, table[i].name, name) { return table[i].namespace }   // (#148) allocation-free qualified compare
+        i++
+    }
+    ""
+}
+
+// (#109 W2) the namespace-aware SOURCE-reference resolver — R0-R5. `path` is the WRITTEN reference,
+// `ref_ns` the namespace of the code that wrote it. Resolves to the ONE declaration the reference
+// names, or a fail-loud error. R1 (type-params) and R2 (builtins) are handled by the callers BEFORE
+// this point (type_param_table registers params in ref_ns; builtin_type runs first). Here:
+//   R3 — BARE (a 1-segment path): resolve STRICTLY within ref_ns. A same-ns entry wins; a name that
+//        exists ONLY in other namespace(s) is REJECTED (the cross-namespace collision fix) with a
+//        diagnostic naming those namespaces. An unknown name → "not a user type" (the caller renders
+//        the final "unknown type" message, unchanged).
+//   R4/R0 — QUALIFIED (a >1-segment path): match the LAST segment AND the qualifier (segments minus
+//        the last). An entry matches when name == last AND its namespace is SELECTED by the qualifier
+//        (equals, or ends-with `::qualifier`) — so `emit::Reader` binds ns `teko::emit`, and a fully
+//        canonical `teko::emit::Reader` binds it exactly (R0). Exactly one match wins; zero → unknown;
+//        two or more → an ambiguity error listing the namespaces.
+//   Privates: found-then-rejected is left to the module-visibility pass (check_modules) — a private
+//        type in another namespace is MENTIONABLE here (so error wording is precise), the existing
+//        visibility check keeps rejecting it.
+fn resolve_type_ref(path: parser::Path, table: TypeTable, ref_ns: str) -> parser::TypeDecl | error {
+    if path.segments.len == 0 { return error { message = "not a user type" } }
+    let last = path.segments[path.segments.len - 1].name
+    if path.segments.len == 1 {
+        // R3 — BARE: strict own-namespace resolution.
+        mut i: u64 = 0
+        loop {
+            if i >= table.len { break }
+            if table[i].name == last && table[i].namespace == ref_ns { return table[i].decl }
+            i++
+        }
+        // (R1/root) a generic type-PARAM (type_param_table registers it at "") and a root-level ("")
+        // type are bare-visible from ANY namespace — "" is the global root scope. Resolve it before
+        // the cross-namespace collision error, so a bare `T` inside a namespaced fn still resolves.
+        if ref_ns != "" {
+            mut k: u64 = 0
+            loop {
+                if k >= table.len { break }
+                if table[k].name == last && table[k].namespace == "" { return table[k].decl }
+                k++
+            }
+        }
+        // No same-ns entry. If the name lives elsewhere, that is the cross-namespace collision — the
+        // reference is not visible bare and MUST be qualified (fail-loud). Otherwise it is simply
+        // unknown (the caller's "unknown type" message stands).
+        mut j: u64 = 0
+        loop {
+            if j >= table.len { break }
+            if table[j].name == last {
+                let nss = namespaces_declaring(table, last)
+                let here = if ref_ns == "" { "<top-level>" } else { ref_ns }
+                return error { message = $"type '{last}' is not visible bare from namespace '{here}' — it is declared in: {nss}. Qualify it (`ns::{last}`) or reference it from its own namespace." }
+            }
+            j++
+        }
+        return error { message = "not a user type" }
+    }
+    // R4 / R0 — QUALIFIED: match last segment + qualifier; unique winner, else ambiguity/unknown.
+    let qual = path_qualifier(path, path.segments.len - 1)
+    mut winner_idx: i64 = -1
+    mut matched_ns = ""
+    mut ambiguous = false
+    mut i2: u64 = 0
+    loop {
+        if i2 >= table.len { break }
+        if table[i2].name == last && qualifier_selects_ns(table[i2].namespace, qual) {
+            if winner_idx >= 0 && table[i2].namespace != matched_ns {
+                ambiguous = true
+            } else {
+                winner_idx = i2 to i64
+                matched_ns = table[i2].namespace
+            }
+        }
+        i2++
+    }
+    if ambiguous {
+        let nss = namespaces_declaring(table, last)
+        return error { message = $"ambiguous type reference '{qual}::{last}' — the qualifier matches more than one namespace ({nss}). Use the absolute path (`teko::…::{last}`)." }
+    }
+    if winner_idx >= 0 { return table[winner_idx to u64].decl }
+    error { message = "not a user type" }
+}
+
+// (#109 order fix) split a SOURCE-WRITTEN type name string on "::" into a Path — so an
+// `implements`/`extends` entry or a trait-derive probe (bare "Reader" or qualified "io::Reader")
+// can ride the R0-R5 resolver like any other source reference. (Mirror resolve.c::name_to_path.)
+fn name_to_path(name: str) -> parser::Path {
+    mut segs: []parser::Segment = teko::list::empty()
+    mut rest = name
+    loop {
+        mut sep: i64 = -1
+        mut i: u64 = 0
+        loop {
+            if i + 1 >= rest.len { break }
+            if rest[i] == b':' && rest[i + 1] == b':' { sep = i to i64; break }
+            i++
+        }
+        if sep < 0 { break }
+        segs = teko::list::push(segs, parser::Segment { name = teko::str::slice_to(rest, sep to u64) })
+        rest = teko::str::slice_from(rest, (sep to u64) + 2)
+    }
+    segs = teko::list::push(segs, parser::Segment { name = rest })
+    parser::Path { segments = segs }
+}
+
+// (#109 order fix) resolve a SOURCE-WRITTEN type name string by the R0-R5 rules from `ref_ns` —
+// the string-shaped twin of resolve_type_ref. `resolved_name_ns` mirrors the WINNING namespace
+// (companion, like type_ref_ns). Used by collect's `implements`/`extends`/trait-derive walks, so
+// a bare name never resolves by table-scan order. (Mirrors resolve.c.)
+pub fn resolve_name_ref(name: str, table: TypeTable, ref_ns: str) -> parser::TypeDecl | error {
+    resolve_type_ref(name_to_path(name), table, ref_ns)
+}
+pub fn resolved_name_ns(name: str, table: TypeTable, ref_ns: str) -> str {
+    type_ref_ns(name_to_path(name), table, ref_ns)
+}
+
+// (#109 W2) the DECLARING namespace of the type `path` resolves to (mirrors resolve_type_ref's winning
+// match) — the namespace a TRANSPARENT alias's body must resolve in. `TypeTable = []TypeReg` in
+// teko::checker, referenced qualified from teko::emit, expands `[]TypeReg` in teko::checker (its own
+// ns), NOT the referencing emit ns. Returns "" for a root/builtin/unknown path (its body, if any,
+// resolves at root). Companion to resolve_type_ref; W4 folds the two into one ns-carrying resolver.
+fn type_ref_ns(path: parser::Path, table: TypeTable, ref_ns: str) -> str {
+    if path.segments.len == 0 { return "" }
+    let last = path.segments[path.segments.len - 1].name
+    if path.segments.len == 1 {
+        mut i: u64 = 0
+        loop {
+            if i >= table.len { break }
+            if table[i].name == last && table[i].namespace == ref_ns { return ref_ns }   // R3 own-ns match → its own ns
+            i++
+        }
+        return ""   // R1/root ("") match, or unknown → root scope
+    }
+    let qual = path_qualifier(path, path.segments.len - 1)
+    mut j: u64 = 0
+    loop {
+        if j >= table.len { break }
+        if table[j].name == last && qualifier_selects_ns(table[j].namespace, qual) { return table[j].namespace }
+        j++
+    }
+    ""
+}
+
+// (W10b.D2) is the constraint on a type-param EXACTLY a single INTERFACE atom `<T: I>` (I a declared
+// interface)? Returns I's name iff so — the ONE shape that unlocks method dispatch on `T` (issue #99).
+// A compound constraint (`A & B`, `A | B`), a variant/struct/enum atom, a trait atom, or no
+// constraint all yield null (they keep the opaque honest-stop — a SEPARATE proposal, per the ruling).
+// The interface, monomorphized to the concrete type at each call site, drives the D3 vtable dispatch.
+fn constraint_single_interface(c: parser::ConstraintExpr, table: TypeTable) -> str? {
+    match c {
+        parser::ConstraintAtom as a => if is_interface_name(a.name, table) { a.name } else { null }
+        _                           => null   // And/Or/NoConstraint → not a single interface atom
+    }
 }
 
 // (S4) Extend the type table with generic type-params as OPAQUE nominal types, so a generic
@@ -25,7 +298,15 @@ fn type_table_find(table: TypeTable, name: str) -> parser::TypeDecl | error {
 // monomorph pass substitutes each `Named{T}` with the concrete arg before codegen. PREPENDED so a
 // type-param SHADOWS a same-named user type within the generic. Empty type_params → table unchanged.
 // Used by collect (func sigs), check_modules (vis check), and typer (bodies). (C: tk_type_param_table.)
-pub fn type_param_table(type_params: []str, ns: str, table: TypeTable) -> TypeTable {
+//
+// (W10b.D2, issue #99) `type_constraints` runs PARALLEL to `type_params` (same length; NoConstraint
+// where the caller has none). When index i's constraint is a SINGLE INTERFACE ATOM `<T: I>`, the
+// type-param is registered with an `InterfaceBody { extends = [I]; methods = [] }` instead of the
+// opaque ExternBody: this makes `Named{T}.method()` resolve through the EXISTING D3 interface-dispatch
+// path (type_method_call's InterfaceBody arm redirects to `I` for the callee/vtable, keeping the
+// receiver's own `Named{T}` type so monomorphization stamps T→concrete). Every OTHER constraint shape
+// (compound A&B/A|B, a struct/variant/trait atom, or none) stays opaque ExternBody — an honest stop.
+pub fn type_param_table(type_params: []str, type_constraints: []parser::ConstraintExpr, ns: str, table: TypeTable) -> TypeTable {
     if type_params.len == 0 { return table }
     mut tbl: TypeTable = teko::list::empty()
     mut i = 0
@@ -33,7 +314,18 @@ pub fn type_param_table(type_params: []str, ns: str, table: TypeTable) -> TypeTa
         if i >= type_params.len { break }
         // namespace = the USING namespace so the W-vis-enforce cross-namespace/visibility check (check_modules)
         // treats the type-param as a LOCAL type, not a bare cross-namespace reference.
-        let d = parser::TypeDecl { name = type_params[i]; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::ExternBody { }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }
+        // (W10b.D2) a single-interface-atom constraint → an interface-mirroring body (extends the real
+        // interface; NO own methods, so type_method_call recognizes the type-param and redirects to it).
+        // The two arms are DIFFERENT members of the wider `TypeBody` variant; the arm-join infers the
+        // narrow `InterfaceBody | ExternBody` union while the binding is the wider `TypeBody` — native
+        // codegen widens each arm into `TypeBody` (fix/selfhost-arm-join-widen), so this natural form
+        // (was a per-arm whole-TypeReg workaround under #99) compiles on the self-host BUILD too.
+        let iface_c: str? = if i < type_constraints.len { constraint_single_interface(type_constraints[i], table) } else { null }
+        let body: parser::TypeBody = match iface_c {
+            str as iface => parser::InterfaceBody { extends = teko::list::push(teko::list::empty(), iface); methods = teko::list::empty() }
+            null         => parser::ExternBody { }
+        }
+        let d = parser::TypeDecl { name = type_params[i]; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = body; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }
         tbl = teko::list::push(tbl, TypeReg { name = type_params[i]; namespace = ns; vis = parser::Visibility::Private; decl = d })
         i++
     }
@@ -47,25 +339,44 @@ pub fn type_param_table(type_params: []str, ns: str, table: TypeTable) -> TypeTa
 }
 
 // resolve a NAMED type (a path) to a semantic Type: built-in or user type.
-fn resolve_named(path: parser::Path, table: TypeTable) -> Type | error {
+// (#109 W2) `ref_ns` = the referencing namespace; drives the R0-R5 resolution rules (via
+// resolve_type_ref). R2 builtins are matched FIRST (bare only — a builtin is never namespaced); the
+// user-type lookup then applies R3 (bare = strict own-ns) / R4/R0 (qualified = last+qualifier).
+fn resolve_named(path: parser::Path, table: TypeTable, ref_ns: str) -> Type | error {
     // M.1: an empty path is an internal invariant break — an honest error, never an out-of-bounds.
     if path.segments.len == 0 { return error { message = "internal: empty type path (a void/missing type used where a value type is required)" } }
     let name = path.segments[path.segments.len - 1].name   // seed: last segment
-    match builtin_type(name) {                  // u8…u64, byte, str, error, …
-        Type as t => return t
-        error     => {}
+    // R2 — a BUILTIN resolves only for a BARE reference (`u8`…`u64`, `byte`, `str`, `error`, …). A
+    // qualified path can never name a builtin, so a `ns::str` falls through to the user-type rules.
+    if path.segments.len == 1 {
+        match builtin_type(name) {
+            Type as t => return t
+            error     => {}
+        }
     }
-    match type_table_find(table, name) {        // a user struct/enum/variant/alias
+    match resolve_type_ref(path, table, ref_ns) {      // R0/R3/R4 — a user struct/enum/variant/alias
         // A TRANSPARENT alias `type Name = <type-expr>` resolves THROUGH to the aliased type
         // (self-host parity): `TypeTable = []TypeReg` → a Slice, `Foo = Circle` → its Named
         // struct, etc. struct/enum/variant decls stay NOMINAL (a bare Named of `name`).
         parser::TypeDecl as td => {
             match td.body {
-                parser::AliasBody as ab => return resolve_type(ab.alias, table)
-                _                       => return Named { name = name }
+                parser::AliasBody as ab => return resolve_type(ab.alias, table, type_ref_ns(path, table, ref_ns))   // (#109 W2) alias body resolves in the alias's OWN ns, not the referencing ns
+                // (TR0) a trait NEVER reaches a value position — it is a derivable bundle, not a
+                // type for variables/params/returns/fields. Trait-typed DYNAMIC values (a vtable
+                // over the trait's bodyless requirements) arrive with TR1 — honest stop until then.
+                parser::TraitBody       => return error { message = $"trait '{name}' is not a value type — derive it from a struct or class instead (trait-typed dynamic values arrive with TR1)" }
+                // (W10b.D3) an interface IS a value type now — a contract-typed value (data + vtable
+                // fat pointer, the tk_closure-shaped rep). It resolves NOMINALLY like any other named
+                // type; the upcast/dispatch rules live in widens_into + the method-call typer.
+                // (#109 W3) the Named carries the CANONICAL "ns::Name" (the resolved decl's own ns) so
+                // same-bare-name types across namespaces are distinct identities + C mangles. A stamped
+                // generic `__g__` instance is already globally unique → it stays BARE (matching type_item).
+                _                       => return if name_is_g_instance(name) { Named { name = name } } else { Named { name = qualify(type_ref_ns(path, table, ref_ns), name) } }
             }
         }
-        error    => {}
+        // R3/R4 fail-loud diagnostics (cross-namespace collision, ambiguity) propagate verbatim;
+        // the plain "not a user type" sentinel becomes the caller-facing "unknown type" message.
+        error as e => { if e.message == "not a user type" { return error { message = $"unknown type: {name}" } }; return e }
     }
     error { message = $"unknown type: {name}" }
 }
@@ -79,13 +390,13 @@ fn expand_variant(t: Type, table: TypeTable) -> Type {
         Named as n => n.name
         _          => return t          // not a named type → unchanged
     }
-    let decl = match type_table_find(table, name) {
+    let decl = match type_table_find(table, name, "") {   // (#109 W1) resolved-name probe, no referencing ns
         parser::TypeDecl as td => td
         error          => return t      // not a user type → unchanged
     }
     match decl.body {
         parser::VariantBody as vb => {
-            match resolve_type(vb.type_expr, table) {
+            match resolve_type(vb.type_expr, table, type_ns_of(table, name)) {   // (#109 W2) variant body resolves in the variant's OWN ns (its members are written there)
                 Type as ex => ex            // the variant body's union → its Variant
                 error      => t             // unresolvable → unchanged (honest fallback, like the C `ex.ok ? … : t`)
             }
@@ -136,6 +447,24 @@ fn widens_into_at(from: Type, to: Type, table: TypeTable, depth: i64) -> bool {
         }
         _ => {}
     }
+    // (W10b.D3) UPCAST — a CLASS instance widens into a contract (interface) it NOMINALLY
+    // conforms to: `let s: Shape = circle`. Classes only (reference semantics ride the object
+    // pointer into the fat-pointer `data` field); a STRUCT is pure value data — no stable
+    // address to dispatch on — so it does NOT widen (its conformance still serves `<T: I>`).
+    // (#98) A CLASS instance ALSO widens into an ANCESTOR class (`let a: Animal = dog`) — the
+    // Sub→Base upcast, reusing the SAME fat pointer (data + the base's virtual vtable). Nominal:
+    // `from` must be a (transitive) subclass of `to`, and `to` must be a polymorphic base
+    // (`abstract`/`virtual`) — a `sealed` class can never be a base, so it never widens into.
+    match from {
+        Named as fname => match to {
+            Named as tname => {
+                if is_class_name(fname.name, table) && is_interface_name(tname.name, table) && type_conforms_to(fname.name, tname.name, table) { return true }
+                if fname.name != tname.name && is_class_name(fname.name, table) && is_polymorphic_base(tname.name, table) && subclass_reaches(fname.name, tname.name, table, 64) { return true }
+            }
+            _ => {}
+        }
+        _ => {}
+    }
     match expand_variant(to, table) {        // a NAMED variant → its Variant (so cases widen in)
         Variant as tv => {
             mut j = 0
@@ -150,6 +479,148 @@ fn widens_into_at(from: Type, to: Type, table: TypeTable, depth: i64) -> bool {
     }
 }
 fn widens_into(from: Type, to: Type, table: TypeTable) -> bool { widens_into_at(from, to, table, 16) }
+
+// ── (W10b.D3) nominal contract conformance — the interface-value upcast / constraint gates ──────
+// These live HERE (not collect.tks) because widens_into needs them and resolve sits below collect
+// in the module DAG. "Contract" wording: the mechanism is per-(type, contract) and agnostic to
+// which decl kind the contract came from (today `interface`; traits reuse it later).
+
+// is `name` declared as an interface? Mirror of resolve.c::tk_is_interface_name.
+pub fn is_interface_name(name: str, table: TypeTable) -> bool {
+    match type_table_find(table, name, "") {   // (#109 W1) kind probe on a resolved name — no referencing ns
+        parser::TypeDecl as td => match td.body { parser::InterfaceBody => true; _ => false }
+        error => false
+    }
+}
+
+// is `name` declared as a class? Mirror of resolve.c::tk_is_class_name.
+pub fn is_class_name(name: str, table: TypeTable) -> bool {
+    match type_table_find(table, name, "") {   // (#109 W1) kind probe on a resolved name — no referencing ns
+        parser::TypeDecl as td => match td.body { parser::ClassBody => true; _ => false }
+        error => false
+    }
+}
+
+// (#98) is `name` a POLYMORPHIC BASE — a class that MAY be inherited (`abstract`/`virtual`, never
+// `sealed`)? A Sub→Base upcast (and the base-typed dispatch/fat-pointer it enables) is only sound
+// against such a class: a `sealed` class can never be anyone's base, so a base-typed value of it
+// can only ever BE it — no polymorphism to model. Mirror of resolve.c::tk_is_polymorphic_base.
+pub fn is_polymorphic_base(name: str, table: TypeTable) -> bool {
+    match type_table_find(table, name, "") {   // (#109 W1) kind probe on a resolved name — no referencing ns
+        parser::TypeDecl as td => match td.body {
+            parser::ClassBody as cb => match cb.kind { parser::ClassKind::Sealed => false; _ => true }
+            _ => false
+        }
+        error => false
+    }
+}
+
+// (#98) does class `sub` reach ANCESTOR class `want` through the `base_name` chain, transitively?
+// Hop-bounded (cyclic inheritance is decl-rejected; the bound keeps this total regardless). Used
+// by the Sub→Base widen. Mirror of resolve.c::tk_subclass_reaches.
+pub fn subclass_reaches(sub: str, want: str, table: TypeTable, depth: i64) -> bool {
+    if depth <= 0 { return false }
+    let cb = match type_table_find(table, sub, "") {   // (#109 W1) ancestor walk on resolved names — no referencing ns
+        parser::TypeDecl as td => match td.body { parser::ClassBody as b => b; _ => return false }
+        error => return false
+    }
+    if !cb.has_base { return false }
+    if name_last_segment(cb.base_name) == name_last_segment(want) { return true }   // (#109 W3) base_name is a bare source name; `want` may be canonical — compare bare
+    subclass_reaches(cb.base_name, want, table, depth - 1)
+}
+
+// (TR0) is `name` declared as a trait? Mirror of resolve.c::tk_is_trait_name. Used by the
+// honest stops (a trait as a constraint atom / instantiation target) — the FOLD itself splits
+// the `&`-list with its own table-scan (collect.tks::split_trait_derives).
+pub fn is_trait_name(name: str, table: TypeTable) -> bool {
+    match type_table_find(table, name, "") {   // (#109 W1) kind probe on a resolved name — no referencing ns
+        parser::TypeDecl as td => match td.body { parser::TraitBody => true; _ => false }
+        error => false
+    }
+}
+
+// does contract `sub` reach contract `want` through `extends`, transitively? Depth-bounded so a
+// (decl-rejected) cyclic `extends` can never loop here. Mirror of resolve.c::iface_extends_reaches.
+fn iface_extends_reaches(sub: str, want: str, table: TypeTable, depth: i64) -> bool {
+    if depth <= 0 { return false }
+    let ib = match type_table_find(table, sub, "") {   // (#109 W1) extends walk on resolved names — no referencing ns
+        parser::TypeDecl as td => match td.body { parser::InterfaceBody as b => b; _ => return false }
+        error => return false
+    }
+    mut i: u64 = 0
+    loop {
+        if i >= ib.extends.len { break }
+        // (#152) EXACT compare when BOTH sides are qualified (post canon_class_bases the entries
+        // are canonical whenever they resolve — a cross-ns same-bare cousin no longer conforms);
+        // a bare side (root canonical, or a synthetic type-param extends) keeps the bare compare.
+        if name_qualifier(ib.extends[i]) != "" && name_qualifier(want) != "" {
+            if ib.extends[i] == want { return true }
+        } else {
+            if name_last_segment(ib.extends[i]) == name_last_segment(want) { return true }
+        }
+        if iface_extends_reaches(ib.extends[i], want, table, depth - 1) { return true }
+        i++
+    }
+    false
+}
+
+// NOMINAL conformance: does class/struct `name` implement contract `iface` — via its OWN
+// `implements` list, an ANCESTOR class's (the class-inheritance chain), or a listed contract
+// that `extends` `iface` transitively? DECLARED conformance only (nominal, closed-world) — a
+// type that merely HAPPENS to have the methods does not conform. Hop-bounded like the extends
+// walk (cyclic inheritance is decl-rejected; the bound keeps this total regardless). Mirror of
+// resolve.c::tk_type_conforms_to.
+pub fn type_conforms_to(name: str, iface: str, table: TypeTable) -> bool {
+    mut cur = name
+    mut hops = 0
+    loop {
+        if hops >= 64 { break }
+        let td = match type_table_find(table, cur, "") { parser::TypeDecl as d => d; error => return false }   // (#109 W1) conformance walk on resolved names — no referencing ns
+        mut impls: []str = teko::list::empty()
+        mut has_base = false
+        mut base = ""
+        match td.body {
+            parser::ClassBody as cb => {
+                impls = cb.implements
+                has_base = cb.has_base
+                base = cb.base_name
+            }
+            parser::StructBody as sb => { impls = sb.implements }
+            _ => return false
+        }
+        mut i: u64 = 0
+        loop {
+            if i >= impls.len { break }
+            // (#152) EXACT when BOTH qualified (see iface_extends_reaches); bare-compat otherwise.
+            if name_qualifier(impls[i]) != "" && name_qualifier(iface) != "" {
+                if impls[i] == iface { return true }
+            } else {
+                if name_last_segment(impls[i]) == name_last_segment(iface) { return true }
+            }
+            if iface_extends_reaches(impls[i], iface, table, 64) { return true }
+            i++
+        }
+        if !has_base { return false }
+        cur = base
+        hops++
+    }
+    false
+}
+
+// (#83) Does `t` carry a SENTINEL anywhere (a Slice whose element is `Void`, or an Optional whose
+// inner is `Void`)? `type_eq` treats a sentinel as equal to ANY concrete peer (see type.tks), which
+// is right for ASSIGNABILITY but wrong for JOIN's "equal → return `a`" shortcut: if `a` is the
+// (less informative) sentinel side and `b` is concrete, blindly returning `a` silently discards
+// the concrete element type a sibling array-literal entry established (`[[], [1]]`'s inner `[]`
+// joined against `[1]`'s `[]i64` — see type_join). Recurses through Slice/Optional so a nested
+// sentinel (`[][]Void`) is still detected. Mirror: resolve.c::tk_type_has_sentinel.
+fn type_has_sentinel(t: Type) -> bool {
+    match t {
+        Slice as s    => match s.element { Void => true; _ => type_has_sentinel(s.element) }
+        Optional as o => match o.inner   { Void => true; _ => type_has_sentinel(o.inner) }
+        _ => false
+    }
+}
 
 // (#41-followon) Collect `t`'s members into `acc` for a union JOIN: an INLINE variant contributes
 // its members (flattened); anything else contributes itself. Deduped by type_eq. Named variants
@@ -182,8 +653,21 @@ fn union_collect(acc: []Type, t: Type, table: TypeTable) -> []Type {
 // unification (B.20). If either widens into the other, the WIDER one; otherwise the UNION variant
 // `a | b` (members flattened + deduped) — the branch values are bare cases that each widen into
 // this union, which in turn widens into any wider declared return variant. (Mirror of resolve.c.)
+//
+// (#83) "Equal" per type_eq ALSO holds sentinel-vs-concrete (`[]Void == []i64`, permissive by
+// design — see type_eq's Slice/Optional cases). Blindly returning `a` in that branch discards a
+// concrete element type when the SENTINEL happens to be the first operand: an array literal like
+// `[[], [1]]` unifies its element type by folding type_join left-to-right over `[]`'s `[]Void`
+// then `[1]`'s `[]i64`, and `a` (the accumulator) was the sentinel — the join silently kept
+// `[]Void`, so codegen later saw an untyped empty slice with no contextual element (issue #83;
+// the VM, which ignores element types, ran fine). Prefer the CONCRETE side when the two are
+// sentinel-equal but not type_has_sentinel-equal.
 fn type_join(a: Type, b: Type, table: TypeTable) -> Type {
-    if type_eq(a, b) { return a }
+    if type_eq(a, b) {
+        let a_sentinel = type_has_sentinel(a)
+        let b_sentinel = type_has_sentinel(b)
+        return if a_sentinel && !b_sentinel { b } else { a }   // prefer the concrete side
+    }
     if widens_into(a, b, table) { return b }
     if widens_into(b, a, table) { return a }
     let m1 = union_collect(teko::list::empty(), a, table)
@@ -281,7 +765,7 @@ pub fn unify(pattern: Type, arg: Type, s: Subst, table: TypeTable) -> Subst | er
 // (C: tk_collect_sig_type_params.)
 pub fn collect_sig_type_params(t: Type, table: TypeTable, acc: []str) -> []str {
     match t {
-        Named as n => match type_table_find(table, n.name) {
+        Named as n => match type_table_find(table, n.name, "") {   // (#109 W1) type-param scan on resolved names — no referencing ns
             parser::TypeDecl => acc
             error            => if is_type_param(n.name, acc) { acc } else { teko::list::push(acc, n.name) }
         }
@@ -295,17 +779,22 @@ pub fn collect_sig_type_params(t: Type, table: TypeTable, acc: []str) -> []str {
 }
 
 // resolve a syntactic TypeExpr to a pure semantic Type (recursive — B.8).
-pub fn resolve_type(te: parser::TypeExpr, table: TypeTable) -> Type | error {
+// (#109 W1) `ref_ns` = the REFERENCING namespace (the namespace of the code that wrote `te`).
+// Threaded down every recursion (slice element / union members / fn-type params+ret / optional
+// inner) and into resolve_named/resolve_generic_inst unchanged. Reserved for W2's R0-R5 rules;
+// the W1 body IGNORES it (behavior byte-identical).
+pub fn resolve_type(te: parser::TypeExpr, table: TypeTable, ref_ns: str) -> Type | error {
+    // (#109 W1) reserved for the R0-R5 rules (W2)
     match te {
         // A plain name resolves as before; generic type-ARGUMENTS `Box<i64>` (S4 type-generics)
         // resolve to the nominal instance `Named{Box__g__i64}` — the concrete decl is stamped by the
         // instantiation pass / mono (blocker #1: reuse the Named case, no new Type variant).
         parser::NamedType as nt => {
-            if nt.args.len == 0 { resolve_named(nt.path, table) }
-            else { resolve_generic_inst(nt, table) }
+            if nt.args.len == 0 { resolve_named(nt.path, table, ref_ns) }
+            else { resolve_generic_inst(nt, table, ref_ns) }
         }
         parser::SliceType as st => {
-            let el = match resolve_type(st.element, table) {
+            let el = match resolve_type(st.element, table, ref_ns) {
                 Type as t  => t
                 error as e => return e
             }
@@ -318,7 +807,7 @@ pub fn resolve_type(te: parser::TypeExpr, table: TypeTable) -> Type | error {
             mut i = 0
             loop {
                 if i >= ut.members.len { break }
-                let m = match resolve_type(ut.members[i], table) {
+                let m = match resolve_type(ut.members[i], table, ref_ns) {
                     Type as t  => t
                     error as e => return e
                 }
@@ -328,6 +817,15 @@ pub fn resolve_type(te: parser::TypeExpr, table: TypeTable) -> Type | error {
                     Void      => return error { message = "a variant member may not be `void`" }
                     Optional  => return error { message = "a variant member may not be nullable (`T?`) — use `T | …` and mark the whole type `?`" }
                     Reference => return error { message = "a reference cannot be stored in a struct/variant/collection" }   // (MEM Step 0, R4)
+                    // (W10b.D3) an interface (contract) variant member is an honest stop: the VM's
+                    // untagged values discriminate a match arm by the CONCRETE class name, so a
+                    // `Shape | error` subject would silently diverge between the engines (native
+                    // has a tag, the VM does not). Plain interface-typed values work — bind first.
+                    Named as nm => {
+                        if is_interface_name(nm.name, table) {
+                            return error { message = "an interface cannot be a variant member yet — bind the interface value on its own (no `I | error` unions)" }
+                        }
+                    }
                     _         => {}
                 }
                 members = teko::list::push(members, m)
@@ -343,7 +841,7 @@ pub fn resolve_type(te: parser::TypeExpr, table: TypeTable) -> Type | error {
             mut i = 0
             loop {
                 if i >= fnt.params.len { break }
-                let pt = match resolve_type(fnt.params[i], table) { Type as t => t; error as e => return e }
+                let pt = match resolve_type(fnt.params[i], table, ref_ns) { Type as t => t; error as e => return e }
                 match pt {
                     Void      => return error { message = "a function type parameter may not be `void` (M.3)" }
                     Reference => return error { message = "a reference cannot be a function-type parameter (a ref cannot escape, R4)" }
@@ -352,13 +850,13 @@ pub fn resolve_type(te: parser::TypeExpr, table: TypeTable) -> Type | error {
                 ps = teko::list::push(ps, pt)
                 i++
             }
-            let rt = match resolve_type(fnt.ret, table) { Type as t => t; error as e => return e }
+            let rt = match resolve_type(fnt.ret, table, ref_ns) { Type as t => t; error as e => return e }
             return Func { params = ps; ret = rt ; variadic = false ; param_names = []; n_required = (ps).len; defaults = [] }
         }
         parser::OptionalType as ot => {
             // OptionalType `T?` → Optional { inner } (REBOOT_PLAN §202). The variant case
             // above already rejects an optional as a variant member; here we just build it.
-            let in = match resolve_type(ot.inner, table) {
+            let in = match resolve_type(ot.inner, table, ref_ns) {
                 Type as t  => t
                 error as e => return e
             }
@@ -389,6 +887,26 @@ fn prim_name(k: PrimKind) -> str {
 // surface spelling (i64/…), Str/Byte/Error/Void/Ptr/Uptr → fixed words, Named → the name, Slice →
 // "slice_"+elem, Optional → "opt_"+inner. Total — always yields a symbol-safe fragment. Shared by
 // resolve (type instantiation) and the mono pass so a use and its stamped decl agree byte-for-byte.
+// (#109 W3) a symbol-safe fragment of a canonical name: each "::" → "__". Keeps a generic-instance
+// name (Gen__g__teko__emit__Reader) a valid C identifier AND distinct from Gen<teko::io::Reader> —
+// name_last_segment would collide the two. Slice-based (no byte-append-to-str primitive exists).
+pub fn mangle_ns_frag(name: str) -> str {
+    mut out = ""
+    mut start: u64 = 0
+    mut i: u64 = 0
+    loop {
+        if i + 1 >= name.len { break }
+        if name[i] == b':' && name[i + 1] == b':' {
+            out = out ~ teko::str::slice(name, start, i) ~ "__"   // (#148) builtin slice — see name_last_segment
+            i = i + 2
+            start = i
+        } else {
+            i++
+        }
+    }
+    out ~ teko::str::slice_from(name, start)   // (#148) builtin slice
+}
+
 // (C: tk_type_mangle.)
 pub fn type_mangle(t: Type) -> str {
     match t {
@@ -396,7 +914,7 @@ pub fn type_mangle(t: Type) -> str {
         Str           => "str"
         Byte          => "byte"
         Char          => "char"
-        Named as n    => n.name
+        Named as n    => name_last_segment(n.name)   // (#109 W3) BARE last-segment — slice/opt/generic-inst suffixes stay bare (matching the syntactic cg_opt_mangle_texpr/cg_texpr_inst_name); only DIRECT tk_t_ typedefs (mangle_type_name) carry the canonical ns where the io/emit Reader collision needs distinguishing.
         Slice as sl   => teko::str::concat("slice_", type_mangle(sl.element))
         Optional as o => teko::str::concat("opt_", type_mangle(o.inner))
         Error         => "error"
@@ -426,13 +944,14 @@ pub fn generic_inst_name(base: str, args: []Type) -> str {
 // (S4) `Box<i64>` → the nominal instance `Named{Box__g__i64}`. Resolves every type-argument, then
 // validates against the generic decl's arity (the decl must exist, be generic, same count). The
 // concrete decl (fields with T→arg substituted) is stamped by the instantiation pass / mono.
-fn resolve_generic_inst(nt: parser::NamedType, table: TypeTable) -> Type | error {
+fn resolve_generic_inst(nt: parser::NamedType, table: TypeTable, ref_ns: str) -> Type | error {
+    // (#109 W1) reserved for the R0-R5 rules (W2); threaded to every resolve_type arg + the table lookup.
     let name = nt.path.segments[nt.path.segments.len - 1].name
     // (S-mem) the builtin generic `ptr<T>` → a typed pointer `Ptr{inner}`. `ptr<void>` ≡ the opaque
     // `ptr` (void isn't a value type) → null inner. Not a user decl, handled before the table lookup.
     if name == "ptr" {
         if nt.args.len != 1 { return error { message = "`ptr<T>` takes exactly one type argument" } }
-        let argt = match resolve_type(nt.args[0], table) { Type as t => t; error as e => return e }
+        let argt = match resolve_type(nt.args[0], table, ref_ns) { Type as t => t; error as e => return e }
         match argt { Void => return Ptr { inner = null }; _ => return Ptr { inner = argt } }
     }
     // (MEM-1b) the compiler-known generic struct `Ref<T>` → the SAFE reference `Ref{inner}` (the safe
@@ -442,7 +961,7 @@ fn resolve_generic_inst(nt: parser::NamedType, table: TypeTable) -> Type | error
     // the table lookup.
     if name == "Ref" {
         if nt.args.len != 1 { return error { message = "`Ref<T>` takes exactly one type argument" } }
-        let argt = match resolve_type(nt.args[0], table) { Type as t => t; error as e => return e }
+        let argt = match resolve_type(nt.args[0], table, ref_ns) { Type as t => t; error as e => return e }
         match argt { Void => return error { message = "`Ref<void>` is invalid — void is not a value (M.3)" }; _ => {} }
         // (W9a) ESCAPE GATE — the inner must be a VALUE TYPE. Teko has NO field/index assignment
         // (value-functional), so a non-scalar ref is ONLY ever mutated by WHOLE-`.value` REPLACEMENT
@@ -464,7 +983,7 @@ fn resolve_generic_inst(nt: parser::NamedType, table: TypeTable) -> Type | error
     mut i = 0
     loop {
         if i >= nt.args.len { break }
-        let a = match resolve_type(nt.args[i], table) { Type as t => t; error as e => return e }
+        let a = match resolve_type(nt.args[i], table, ref_ns) { Type as t => t; error as e => return e }
         // (MEM Step 0, A) ESCAPE GATE — a reference can NEVER be a generic type ARGUMENT: carrying a
         // `Ref<T>` into a user generic would stamp it into a struct field / return position (e.g.
         // `Box<Ref<i64>>` → `struct { value: int64_t * }` returned by value) and escape. The template
@@ -474,7 +993,7 @@ fn resolve_generic_inst(nt: parser::NamedType, table: TypeTable) -> Type | error
         argtypes = teko::list::push(argtypes, a)
         i++
     }
-    match type_table_find(table, name) {
+    match resolve_type_ref(nt.path, table, ref_ns) {   // (#109 W2) R0/R3/R4 over the WRITTEN path
         parser::TypeDecl as td => {
             if td.type_params.len == 0 {
                 return error { message = $"type `{name}` is not generic but was given type arguments" }
@@ -484,7 +1003,9 @@ fn resolve_generic_inst(nt: parser::NamedType, table: TypeTable) -> Type | error
             }
             Named { name = generic_inst_name(name, argtypes) }
         }
-        error => error { message = $"unknown generic type: {name}" }
+        // R3/R4 fail-loud diagnostics propagate verbatim; the plain "not a user type" sentinel
+        // becomes the generic-specific "unknown generic type" message.
+        error as e => { if e.message == "not a user type" { return error { message = $"unknown generic type: {name}" } }; return e }
     }
 }
 
@@ -503,7 +1024,7 @@ pub fn type_render(t: Type) -> str {
         Str           => "str"
         Error         => "error"
         Void          => "void"
-        Named as n    => n.name
+        Named as n    => name_last_segment(n.name)   // (#109 W3) canonical "ns::Name" → bare "Name" for readable diagnostics
         Slice as s    => match s.element { Void => "[]_"; _ => $"[]{type_render(s.element)}" }
         Optional as o => match o.inner   { Void => "_?";  _ => $"{type_render(o.inner)}?" }
         Variant as v  => render_members(v.members)
@@ -595,7 +1116,7 @@ fn subst_body_names(body: parser::TypeBody, params: []str, args: []parser::TypeE
             mut nf: []parser::Field = teko::list::empty()
             mut i = 0
             loop { if i >= sb.fields.len { break }; nf = teko::list::push(nf, parser::Field { name = sb.fields[i].name; type_ann = subst_texpr_names(sb.fields[i].type_ann, params, args) ; vis = parser::Visibility::Pub; is_intern = false }); i++ }
-            parser::StructBody { fields = nf ; methods = teko::list::empty() }
+            parser::StructBody { fields = nf ; methods = teko::list::empty(); implements = teko::list::empty() }
         }
         parser::VariantBody as vb => parser::VariantBody { type_expr = subst_texpr_names(vb.type_expr, params, args) }
         parser::AliasBody as ab   => parser::AliasBody { alias = subst_texpr_names(ab.alias, params, args) }
@@ -688,6 +1209,11 @@ fn collect_expr_insts(e: parser::Expr, acc: []parser::TypeExpr) -> []parser::Typ
             mut i = 0
             loop { if i >= mc.args.len { break }; out = collect_expr_insts(mc.args[i], out); i++ }
         }
+        parser::SafeMethodCall as smc => {   // (NP-OOP, issue #116) recv?.method(args)
+            out = collect_expr_insts(smc.receiver, out)
+            mut i = 0
+            loop { if i >= smc.args.len { break }; out = collect_expr_insts(smc.args[i], out); i++ }
+        }
         parser::Cast as ct => out = collect_expr_insts(ct.expr, out)
         parser::Index as ix => { out = collect_expr_insts(ix.receiver, out); out = collect_expr_insts(ix.index, out) }
         parser::Interp as ip => { mut i = 0; loop { if i >= ip.holes.len { break }; out = collect_expr_insts(ip.holes[i], out); i++ } }
@@ -717,7 +1243,7 @@ fn collect_stmt_insts(s: parser::Statement, acc: []parser::TypeExpr) -> []parser
     mut out = acc
     match s {
         parser::Binding as b   => { if b.has_type { out = collect_texpr_insts(b.type_ann, out) }; out = collect_expr_insts(b.value, out) }
-        parser::Assign as a    => out = collect_expr_insts(a.value, out)
+        parser::Assign as a    => { out = collect_expr_insts(a.value, out); match a.kind { parser::AssignKind::Field => out = collect_expr_insts(a.target, out); _ => { } } }   // (#88) the FIELD LHS receiver may name generic instances
         parser::Return as r    => { if r.has_value { out = collect_expr_insts(r.value, out) } }
         parser::ExprStmt as es => out = collect_expr_insts(es.expr, out)
         parser::LoopStmt as l  => out = collect_stmts_insts(l.body, out)
@@ -768,18 +1294,18 @@ pub fn instantiate_types(program: parser::Program, table: TypeTable) -> TypeTabl
                 mut a = 0
                 loop {
                     if a >= nt.args.len { break }
-                    match resolve_type(nt.args[a], tbl) { Type as t => argtypes = teko::list::push(argtypes, t); error => { ok = false; break } }
+                    match resolve_type(nt.args[a], tbl, type_ns_of(tbl, name)) { Type as t => argtypes = teko::list::push(argtypes, t); error => { ok = false; break } }   // (#109 W2) resolve args in the generic base's OWN ns (its args are written alongside it)
                     a++
                 }
                 if !ok { continue }
                 let mangled = generic_inst_name(name, argtypes)
-                match type_table_find(tbl, mangled) { parser::TypeDecl => continue; error => {} }   // already stamped
-                match type_table_find(tbl, name) {
+                match type_table_find(tbl, mangled, "") { parser::TypeDecl => continue; error => {} }   // (#109 W1) already-stamped probe — no referencing ns
+                match type_table_find(tbl, name, "") {   // (#109 W1) generic-base lookup in the program-wide pass — no referencing ns
                     parser::TypeDecl as gen => {
                         if gen.type_params.len != nt.args.len { continue }   // arity error surfaces at resolve
                         let nbody = subst_body_names(gen.body, gen.type_params, nt.args)
                         let stamped = parser::TypeDecl { name = mangled; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = nbody; vis = gen.vis; has_doc = false; doc = ""; line = gen.line; col = gen.col }
-                        tbl = teko::list::push(tbl, TypeReg { name = mangled; namespace = ""; vis = gen.vis; decl = stamped })
+                        tbl = teko::list::push(tbl, TypeReg { name = mangled; namespace = type_ns_of(tbl, name); vis = gen.vis; decl = stamped })   // (#109 W2) stamp in the generic base's ns so the substituted body's bare field types resolve there
                         work = collect_body_insts(nbody, work)   // transitive instantiations in the stamped body
                     }
                     error => continue   // unknown base type → reported at typing
@@ -836,7 +1362,7 @@ fn normalize_inst_texpr(te: parser::TypeExpr, table: TypeTable) -> parser::TypeE
             if nt.args.len > 0 {
                 // does this `Base<args>` resolve to a stamped user generic instance? (resolve_type
                 // → resolve_generic_inst yields Named{Base__g__mangle}; ptr/Ref yield Ptr/Ref.)
-                match resolve_type(te, table) {
+                match resolve_type(te, table, type_ns_of(table, nt.path.segments[nt.path.segments.len - 1].name)) {   // (#109 W2) normalization probe resolves in the generic base's OWN ns
                     Type as rt => {
                         match rt {
                             Named as rn => {
@@ -881,7 +1407,7 @@ fn normalize_inst_body(body: parser::TypeBody, table: TypeTable) -> parser::Type
             mut nf: []parser::Field = teko::list::empty()
             mut i = 0
             loop { if i >= sb.fields.len { break }; nf = teko::list::push(nf, parser::Field { name = sb.fields[i].name; type_ann = normalize_inst_texpr(sb.fields[i].type_ann, table) ; vis = parser::Visibility::Pub; is_intern = false }); i++ }
-            parser::StructBody { fields = nf ; methods = teko::list::empty() }
+            parser::StructBody { fields = nf ; methods = teko::list::empty(); implements = teko::list::empty() }
         }
         parser::VariantBody as vb => parser::VariantBody { type_expr = normalize_inst_texpr(vb.type_expr, table) }
         parser::AliasBody as ab   => parser::AliasBody { alias = normalize_inst_texpr(ab.alias, table) }

@@ -8,6 +8,7 @@
 #include "../parser/parse_stmt.h"   // no_expr (DEFARGS placeholder, 2026-07-01)
 #include "collect.h"          // tk_effective_class_fields/methods (W10b.CLASS increment 2)
 #include <string.h>           // memcmp (string-span compares)
+#include <stdio.h>            // snprintf — (TR0) the trait-instantiation honest stop
 
 // shared from match.c (E5b-2), promoted to non-static for reuse:
 tk_env_result tk_check_pattern(tk_pattern p, tk_type subject, tk_env env, tk_type_table table);
@@ -74,6 +75,7 @@ static tk_texpr_result type_var(tk_var v, tk_env env) {
 
 // ---- operators (same B.22 regimes as check_binary/unary/compare) ----
 static tk_texpr_result type_call(tk_call c, tk_env env, tk_type_table table);   // forward (defined below)
+static bool is_iface_slice(tk_type t, tk_type_table table);                     // (W10b.D3) forward (defined below)
 
 // (2026-07-01) `~` — binary string concat, arity-polymorphic with unary `~` (bitwise NOT).
 // Additive precedence, NOT commutative (honest — Governing Law M.3, the same reasoning `+` was
@@ -267,7 +269,12 @@ static bool type_list_builtin(tk_call c, tk_env env, tk_type_table table, tk_tex
     if (c.callee.len < 2) return false;
     tk_str last = c.callee.segments[c.callee.len - 1].name;
     tk_str prev = c.callee.segments[c.callee.len - 2].name;
-    if (!seg_lit(prev, "list")) return false;
+    // (#148 R3) teko::mem::push_fo — push with FREE-OLD BY DECREE. Same typing/semantics as
+    // teko::list::push; the CALLER asserts the base is a linear chain (the old buffer is dead
+    // after the grow), so native codegen frees it (tk_slice_push_fo). TEKO_MEM_PARANOID is the
+    // fiscal: a wrong decree poisons instead of parking and the gate fails loudly. (Mirror typer.tks.)
+    bool is_pushfo = seg_lit(prev, "mem") && seg_lit(last, "push_fo");
+    if (!seg_lit(prev, "list") && !is_pushfo) return false;
     bool rooted = (c.callee.len == 2) || seg_lit(c.callee.segments[0].name, "teko");
     if (!rooted) return false;
 
@@ -278,7 +285,7 @@ static bool type_list_builtin(tk_call c, tk_env env, tk_type_table table, tk_tex
         *out = xok((tk_texpr){ .tag = TK_TEXPR_CALL, .type = st, .as.call = { c.callee, NULL, 0 } });
         return true;
     }
-    if (seg_lit(last, "push")) {
+    if (seg_lit(last, "push") || is_pushfo) {
         if (c.nargs != 2) { *out = xerr("teko::list::push expects two arguments (slice, item)"); return true; }
         tk_texpr_result s = tk_typer_expr(c.args[0], env, table); if (!s.ok) { *out = s; return true; }
         tk_texpr_result x = tk_typer_expr(c.args[1], env, table); if (!x.ok) { *out = x; return true; }
@@ -359,8 +366,8 @@ static tk_pack_result resolve_defargs(tk_type ft, tk_expr *args, tk_str *arg_nam
         tk_str nm = arg_names[vk];
         bool matched = false; size_t fidx = 0;
         for (; fidx < ft.as.func.nparams; fidx += 1) { if (tk_str_eq(ft.as.func.param_names[fidx], nm)) { matched = true; break; } }
-        if (!matched) return (tk_pack_result){ .ok = false, .error = tk_error_named("unknown named argument", nm) };
-        if (fidx < npos) return (tk_pack_result){ .ok = false, .error = tk_error_named("named argument was already provided positionally", nm) };
+        if (!matched) return (tk_pack_result){ .ok = false, .error = tk_error_woven1("unknown named argument '", nm, "'") };
+        if (fidx < npos) return (tk_pack_result){ .ok = false, .error = tk_error_woven1("named argument '", nm, "' was already provided positionally") };
     }
     tk_expr *resolved = tk_alloc(ft.as.func.nparams * sizeof *resolved); if (!resolved) abort();
     for (size_t idx = 0; idx < ft.as.func.nparams; idx += 1) {
@@ -374,7 +381,7 @@ static tk_pack_result resolve_defargs(tk_type ft, tk_expr *args, tk_str *arg_nam
             if (found) {
                 resolved[idx] = found_expr;
             } else if (idx < ft.as.func.n_required) {
-                return (tk_pack_result){ .ok = false, .error = tk_error_named("missing required argument", ft.as.func.param_names[idx]) };
+                return (tk_pack_result){ .ok = false, .error = tk_error_woven1("missing required argument '", ft.as.func.param_names[idx], "'") };
             } else {
                 resolved[idx] = ft.as.func.defaults[idx - ft.as.func.n_required];
             }
@@ -394,10 +401,79 @@ static tk_texpr_result type_method_call(tk_method_call mc, tk_env env, tk_type_t
     tk_texpr_result recv_r = tk_typer_expr(*mc.receiver, env, table);
     if (!recv_r.ok) return recv_r;
     tk_type recv_t = recv_r.as.value.type;
+    // (NP-OOP, issue #116) a bare `.` call on a nullable receiver stays a compile error — but say
+    // WHY and point at the sanctioned null-propagating call (`?.`) instead of the deferral message.
+    if (recv_t.tag == TK_TYPE_OPTIONAL)
+        return xerr("cannot call a method with `.` on a nullable value (`T?`) — use `?.` (REBOOT_PLAN §203)");
     if (recv_t.tag != TK_TYPE_NAMED) return xerr("method typing is deferred (B.29 / M.4)");
     tk_str struct_name = recv_t.as.named.name;
-    tk_decl_result td = tk_type_table_find(table, struct_name);
+    tk_decl_result td = tk_type_table_find(table, struct_name, (tk_str){0});   // (#109 W1) method-receiver lookup on a resolved name — no referencing ns
     if (!td.ok) return xerr("method typing is deferred (B.29 / M.4)");
+    // (W10b.D3) an INTERFACE-typed receiver — a DYNAMIC contract-method call. The method resolves
+    // against the interface's EFFECTIVE (extends-transitive) signature list; its index there is
+    // the vtable slot both backends dispatch through. The receiver rides as args[0] (an interface
+    // value, or a class instance the emitters upcast on the fly). Mirror: typer.tks::type_method_call.
+    if (td.as.value.body.tag == TK_BODY_INTERFACE) {
+        // (W10b.D2, issue #99) the DISPATCH interface. For a plain interface receiver this IS
+        // `struct_name`. For a generic type-param `<T: I>` — registered by tk_type_param_table with
+        // an InterfaceBody that has NO own methods and a SINGLE `extends` naming the real interface —
+        // redirect to `I` (extends[0]): the callee path + vtable key off a REAL interface (a type-
+        // param has no emitted C type / vtable), while the receiver stays `Named{T}` (below, via
+        // `struct_name`) so monomorphization stamps T→concrete. No-op for a normal interface
+        // (n_methods > 0); slot-equivalent for a degenerate real `interface X extends Y {}`.
+        tk_interface_body ib = td.as.value.body.as.interface_body;
+        tk_str iface_canon = (ib.n_methods == 0 && ib.n_extends == 1) ? ib.extends[0] : struct_name;
+        tk_methodsvec_result eff = tk_iface_methods_by_name(iface_canon, table);
+        if (!eff.ok) return xferr(eff.as.error);
+        bool ifound = false; tk_function imfn = {0}; size_t slot = 0;
+        for (size_t i = 0; i < eff.as.value.len; i += 1) {
+            if (tk_str_eq(eff.as.value.ptr[i].name, mc.method)) { ifound = true; imfn = eff.as.value.ptr[i]; slot = i; break; }
+        }
+        if (!ifound) return xferr(tk_error_woven2("no such method '", mc.method, "' on interface '", struct_name, "'"));
+        // interface methods are INSTANCE-only signatures (decl-enforced); the receiver resolves
+        // to Named{<iface>} in the FuncType. Defaults live on the CONTRACT (DEFARGS rule E).
+        tk_type_result iftr = tk_method_func_type(imfn, struct_name, table, env.cur_ns);   // (#109 W1) ref_ns = the call's enclosing namespace
+        if (!iftr.ok) return (tk_texpr_result){ .ok = false, .as.error = iftr.as.error };
+        tk_type ift = iftr.as.value;
+        tk_expr *icargs = tk_alloc((mc.nargs + 1) * sizeof *icargs); if (!icargs) abort();
+        icargs[0] = *mc.receiver;
+        for (size_t i = 0; i < mc.nargs; i += 1) icargs[i + 1] = mc.args[i];
+        tk_str *icnames = tk_alloc((mc.nargs + 1) * sizeof *icnames); if (!icnames) abort();
+        for (size_t i = 0; i <= mc.nargs; i += 1) icnames[i] = (tk_str){0};   // dot-call is all-positional
+        tk_pack_result pr = resolve_defargs(ift, icargs, icnames, mc.nargs + 1);
+        if (!pr.ok) return xferr(pr.error);
+        if (pr.nargs != ift.as.func.nparams) return xerr("wrong number of arguments");
+        tk_texpr_list iargs = tk_texpr_list_empty();
+        for (size_t i = 0; i < pr.nargs; i += 1) {
+            tk_texpr_result a = tk_typer_expr(pr.args[i], env, table);
+            if (!a.ok) return a;
+            if (tk_type_is_void(&a.as.value.type)) return xerr("a `void` expression cannot be passed as an argument (M.1)");
+            tk_type pt = ift.as.func.params[i];
+            if (!tk_widens_into(a.as.value.type, pt, table)) {
+                if (!tk_literal_adopts(a.as.value, pt))
+                    return xferr(tk_error_types(tk_error_make("argument type mismatch"),
+                                                tk_type_render(pt), tk_type_render(a.as.value.type)));
+                a.as.value.type = pt;   // a fitting numeric literal ADOPTS the param type — C6
+            } else if (tk_expand_variant(pt, table).tag != TK_TYPE_VARIANT
+                       && !(pt.tag == TK_TYPE_OPTIONAL && a.as.value.type.tag != TK_TYPE_OPTIONAL)
+                       && !(pt.tag == TK_TYPE_NAMED && a.as.value.type.tag == TK_TYPE_NAMED
+                            && tk_is_interface_name(pt.as.named.name, table)
+                            && tk_is_class_name(a.as.value.type.as.named.name, table))) {
+                // adopt the param type EXCEPT where the emit wraps at the use site: a case→variant
+                // widen, a bare T→T? widen, and (D3) a class→contract upcast — the narrow CLASS
+                // type is what picks the (class, interface) vtable at the emit.
+                a.as.value.type = pt;
+            }
+            iargs = tk_texpr_list_push(iargs, a.as.value);
+        }
+        tk_segment *isegs = tk_alloc(2 * sizeof *isegs); if (!isegs) abort();
+        isegs[0] = (tk_segment){ .name = iface_canon };   // (D2) the REAL interface — the vtable/upcast key
+        isegs[1] = (tk_segment){ .name = mc.method };
+        return xok((tk_texpr){ .tag = TK_TEXPR_CALL, .type = *ift.as.func.ret,
+                               .as.call = { .callee = { .segments = isegs, .len = 2 }, .args = iargs.ptr, .nargs = iargs.len,
+                                            .call_ns = (tk_str){0}, .is_closure_call = false, .callee_type = ift,
+                                            .is_iface_dispatch = true, .iface_slot = (uint32_t)slot } });
+    }
     // (W10b.CLASS) a class's instance dot-call reuses this SAME desugar — only the methods
     // list's source differs; a class's methods are otherwise typed exactly like a struct's.
     // Increment 2: the EFFECTIVE (base-inherited + overridden) methods, so an inherited method
@@ -417,9 +493,18 @@ static tk_texpr_result type_method_call(tk_method_call mc, tk_env env, tk_type_t
     for (size_t i = 0; i < n_methods; i += 1) {
         if (tk_str_eq(methods[i].name, mc.method)) { found = true; mfn = methods[i]; break; }
     }
-    if (!found) return xferr(tk_error_named("no such method on struct", mc.method));
+    if (!found) return xferr(tk_error_woven2("no such method '", mc.method, "' on struct '", struct_name, "'"));
     bool is_instance = mfn.nparams > 0 && !mfn.params[0].has_type;
-    if (!is_instance) return xferr(tk_error_named("static method — call it as StructName::method(…), not recv.method(…)", mc.method));
+    if (!is_instance) {
+        // canonical (typer.tks): "'M' is a static method — call it as S::M(…)"
+        size_t slen = mc.method.len * 2 + struct_name.len + 48; char *sbuf = tk_alloc(slen); if (!sbuf) abort();
+        int sm = snprintf(sbuf, slen, "'%.*s' is a static method — call it as %.*s::%.*s(…)",
+                          (int)mc.method.len, (const char *)mc.method.ptr,
+                          (int)struct_name.len, (const char *)struct_name.ptr,
+                          (int)mc.method.len, (const char *)mc.method.ptr);
+        if (sm < 0 || (size_t)sm >= slen) abort();
+        return xferr(tk_error_make(sbuf));
+    }
     // (W10b.CLASS residual — intern visibility) a private (default) method is reachable only
     // from its OWN declaring class's code, or — if `intern` — a subclass's too. Struct methods
     // stay all-public (W10b.0.A) — this check only fires for a class receiver.
@@ -427,10 +512,61 @@ static tk_texpr_result type_method_call(tk_method_call mc, tk_env env, tk_type_t
         tk_member_owner_result owner = tk_find_method_owner(struct_name, table, mc.method);
         if (!owner.ok) return xferr(owner.as.error);
         if (!tk_member_accessible(owner.as.value, env.owner_type, table))
-            return xferr(tk_error_named("method is private to its declaring class", mc.method));
+            return xferr(tk_error_woven2("method '", mc.method, "' is private to ", owner.as.value.declaring_class, ""));
+    }
+    // (#98) VIRTUAL DISPATCH through a POLYMORPHIC-BASE-typed receiver. When the receiver's STATIC
+    // type is a `virtual`/`abstract` class, the value may hold a subclass, so the call dispatches
+    // dynamically through the base's vtable — the D3 mechanism keyed on the base class as the
+    // "contract". The slot is the method's index in the base's effective method list (codegen's
+    // `tk_vt_<Sub>_<Base>` order). A `sealed` class is never a base, so its calls stay direct.
+    if (td.as.value.body.tag == TK_BODY_CLASS && tk_is_polymorphic_base(struct_name, table)) {
+        tk_slot_result bslot = tk_base_vtable_slot(struct_name, mc.method, table);
+        if (bslot.ok) {   // a subclass-only method (!ok) falls through to the direct desugar below
+            tk_type_result bftr = tk_method_func_type(mfn, struct_name, table, env.cur_ns);   // (#109 W1) ref_ns = the call's enclosing namespace
+            if (!bftr.ok) return (tk_texpr_result){ .ok = false, .as.error = bftr.as.error };
+            tk_type bft = bftr.as.value;
+            tk_expr *bcargs = tk_alloc((mc.nargs + 1) * sizeof *bcargs); if (!bcargs) abort();
+            bcargs[0] = *mc.receiver;
+            for (size_t i = 0; i < mc.nargs; i += 1) bcargs[i + 1] = mc.args[i];
+            tk_str *bcnames = tk_alloc((mc.nargs + 1) * sizeof *bcnames); if (!bcnames) abort();
+            for (size_t i = 0; i <= mc.nargs; i += 1) bcnames[i] = (tk_str){0};
+            tk_pack_result bpr = resolve_defargs(bft, bcargs, bcnames, mc.nargs + 1);
+            if (!bpr.ok) return xferr(bpr.error);
+            if (bpr.nargs != bft.as.func.nparams) return xerr("wrong number of arguments");
+            tk_texpr_list biargs = tk_texpr_list_empty();
+            for (size_t i = 0; i < bpr.nargs; i += 1) {
+                tk_texpr_result ba = tk_typer_expr(bpr.args[i], env, table);
+                if (!ba.ok) return ba;
+                if (tk_type_is_void(&ba.as.value.type)) return xerr("a `void` expression cannot be passed as an argument (M.1)");
+                tk_type bpt = bft.as.func.params[i];
+                if (!tk_widens_into(ba.as.value.type, bpt, table)) {
+                    if (!tk_literal_adopts(ba.as.value, bpt))
+                        return xferr(tk_error_types(tk_error_make("argument type mismatch"),
+                                                    tk_type_render(bpt), tk_type_render(ba.as.value.type)));
+                    ba.as.value.type = bpt;
+                } else if (tk_expand_variant(bpt, table).tag != TK_TYPE_VARIANT
+                           && !(bpt.tag == TK_TYPE_OPTIONAL && ba.as.value.type.tag != TK_TYPE_OPTIONAL)
+                           && !(bpt.tag == TK_TYPE_NAMED && ba.as.value.type.tag == TK_TYPE_NAMED
+                                && !tk_str_eq(bpt.as.named.name, ba.as.value.type.as.named.name)
+                                && (tk_is_interface_name(bpt.as.named.name, table) || tk_is_polymorphic_base(bpt.as.named.name, table))
+                                && tk_is_class_name(ba.as.value.type.as.named.name, table))) {
+                    // keep the narrow type where the emit wraps: variant / bare→optional / class→base
+                    // or class→contract upcast (the receiver — arg 0 — always stays its narrow class).
+                    ba.as.value.type = bpt;
+                }
+                biargs = tk_texpr_list_push(biargs, ba.as.value);
+            }
+            tk_segment *bsegs = tk_alloc(2 * sizeof *bsegs); if (!bsegs) abort();
+            bsegs[0] = (tk_segment){ .name = struct_name };   // the base class — the vtable key
+            bsegs[1] = (tk_segment){ .name = mc.method };
+            return xok((tk_texpr){ .tag = TK_TEXPR_CALL, .type = *bft.as.func.ret,
+                                   .as.call = { .callee = { .segments = bsegs, .len = 2 }, .args = biargs.ptr, .nargs = biargs.len,
+                                                .call_ns = (tk_str){0}, .is_closure_call = false, .callee_type = bft,
+                                                .is_iface_dispatch = true, .iface_slot = bslot.as.value } });
+        }
     }
     tk_segment *segs = tk_alloc(2 * sizeof *segs); if (!segs) abort();
-    segs[0] = (tk_segment){ .name = struct_name };
+    segs[0] = (tk_segment){ .name = tk_name_last_segment(struct_name) };   // (#109 W3) BARE class segment — lookup_call's ends-with qualifier rule matches the registered "ns::Class" method-ns
     segs[1] = (tk_segment){ .name = mc.method };
     tk_expr *cargs = tk_alloc((mc.nargs + 1) * sizeof *cargs); if (!cargs) abort();
     cargs[0] = *mc.receiver;
@@ -441,9 +577,36 @@ static tk_texpr_result type_method_call(tk_method_call mc, tk_env env, tk_type_t
     return type_call(synthetic, env, table);
 }
 
+// (mem::free ruling 2026-07-03) `teko::mem::free<T>(target: []T | Ref<T>) -> void` — manual opt-in
+// dealloc; ONE builtin over a SUM of the two heap shapes, arm dispatched STATICALLY by the arg type.
+// Target must be a MUTABLE VARIABLE (the lowering scrubs it at the free site → no direct UAF).
+// Mirror of typer.tks::type_mem_free. Returns true iff this was a `mem::free` call.
+static bool type_mem_free(tk_call c, tk_env env, tk_type_table table, tk_texpr_result *out) {
+    if (c.callee.len < 2) return false;
+    tk_str last = c.callee.segments[c.callee.len - 1].name;
+    tk_str prev = c.callee.segments[c.callee.len - 2].name;
+    if (!seg_lit(last, "free") || !seg_lit(prev, "mem")) return false;
+    bool rooted = (c.callee.len == 2) || seg_lit(c.callee.segments[0].name, "teko");
+    if (!rooted) return false;
+    if (c.nargs != 1) { *out = xerr("teko::mem::free expects one argument (a mutable `[]T` or class variable)"); return true; }
+    tk_texpr_result a = tk_typer_expr(c.args[0], env, table); if (!a.ok) { *out = a; return true; }
+    if (a.as.value.tag != TK_TEXPR_VAR) { *out = xerr("teko::mem::free requires a mutable variable — the value must have a binding to invalidate"); return true; }
+    tk_binding_result b = tk_env_lookup_binding(env, a.as.value.as.var.name); if (!b.ok) { *out = xferr(b.as.error); return true; }
+    if (!b.as.value.is_mut) { *out = xerr("cannot free an immutable binding — declare it `mut` (free invalidates the binding)"); return true; }
+    bool is_heap = a.as.value.type.tag == TK_TYPE_SLICE
+                || (a.as.value.type.tag == TK_TYPE_NAMED && tk_is_class_name(a.as.value.type.as.named.name, table));
+    if (!is_heap) { *out = xerr("teko::mem::free target must be a `[]T` slice or a class instance — it owns no freeable heap block"); return true; }
+    tk_texpr *args = tk_alloc(sizeof *args); if (!args) abort();
+    args[0] = a.as.value;
+    tk_type vt = { .tag = TK_TYPE_VOID };
+    *out = xok((tk_texpr){ .tag = TK_TEXPR_CALL, .type = vt, .as.call = { c.callee, args, 1 } });
+    return true;
+}
+
 static tk_texpr_result type_call(tk_call c, tk_env env, tk_type_table table) {
     tk_texpr_result lb;
     if (type_list_builtin(c, env, table, &lb)) return lb;   // teko::list::empty / push (generic)
+    if (type_mem_free(c, env, table, &lb)) return lb;       // teko::mem::free (manual dealloc — []T | class)
     tk_str name = c.callee.segments[c.callee.len - 1].name;
     // panic / exit — injected GLOBAL diverging builtins (legislator's ruling — NO `never` type).
     // panic(error | str) = the message; exit(<integer>) = the status code. Both terminate the
@@ -493,7 +656,7 @@ static tk_texpr_result type_call(tk_call c, tk_env env, tk_type_table table) {
             tk_member_owner_result owner = tk_find_method_owner(cls, table, name);
             if (!owner.ok) return xferr(owner.as.error);
             if (!tk_member_accessible(owner.as.value, env.owner_type, table))
-                return xferr(tk_error_named("method is private to its declaring class", name));
+                return xferr(tk_error_woven2("method '", name, "' is private to ", owner.as.value.declaring_class, ""));
         }
     }
     tk_expr *dargs = c.args; size_t ndargs = c.nargs;
@@ -512,8 +675,12 @@ static tk_texpr_result type_call(tk_call c, tk_env env, tk_type_table table) {
     for (size_t i = 0; i < ndargs; i += 1) {
         // (W10) a closure-literal ARG whose parameter is a concrete function type infers its
         // un-annotated params from that target (ruling 3); other args type normally.
+        // (W10b.D3) an ARRAY-literal ARG under a `[]<interface>` param types against the contract
+        // element too (heterogeneous `[]Shape` args), exactly like the binding-annotation path.
         bool lam_target = dargs[i].tag == TK_EXPR_LAMBDA && ft.as.func.params[i].tag == TK_TYPE_FUNC;
-        tk_texpr_result a = lam_target ? tk_type_value_expected(dargs[i], ft.as.func.params[i], env, table)
+        bool iface_arr_target = dargs[i].tag == TK_EXPR_ARRAY && is_iface_slice(ft.as.func.params[i], table);
+        tk_texpr_result a = (lam_target || iface_arr_target)
+                                       ? tk_type_value_expected(dargs[i], ft.as.func.params[i], env, table)
                                        : tk_typer_expr(dargs[i], env, table);
         if (!a.ok) return a;
         if (tk_type_is_void(&a.as.value.type)) return xerr("a `void` expression cannot be passed as an argument (M.1)");
@@ -529,16 +696,20 @@ static tk_texpr_result type_call(tk_call c, tk_env env, tk_type_table table) {
         tk_str *param_tps = NULL; size_t n_pt = 0;
         for (size_t i = 0; i < ft.as.func.nparams; i += 1) tk_collect_sig_type_params(ft.as.func.params[i], table, &param_tps, &n_pt);
         for (size_t i = 0; i < n_all; i += 1)
-            if (!tk_is_type_param(all_tps[i], param_tps, n_pt))
-                return xferr(tk_error_named("cannot infer type parameter (it appears only in the return type; annotate the call)", all_tps[i]));
+            if (!tk_is_type_param(all_tps[i], param_tps, n_pt)) {
+                tk_free0(all_tps); tk_free0(param_tps);
+                return xferr(tk_error_woven1("cannot infer type parameter ", all_tps[i], " — it appears only in the return type; annotate the call"));
+            }
         tk_subst s = { .params = param_tps, .n_params = n_pt, .names = NULL, .types = NULL, .n_bind = 0 };
         for (size_t i = 0; i < args.len; i += 1) {   // args.len == nparams (arity checked above); bound by the list so args.ptr[i] is in range
             tk_subst_result u = tk_unify(ft.as.func.params[i], args.ptr[i].type, s, table);
-            if (!u.ok) return xferr(u.as.error);
+            if (!u.ok) { tk_free0(all_tps); tk_free0(param_tps); return xferr(u.as.error); }
             s = u.as.value;
         }
         tk_type result = tk_subst_type(*ft.as.func.ret, s);
-        return xok((tk_texpr){ .tag = TK_TEXPR_CALL, .type = result, .as.call = { c.callee, args.ptr, args.len, call_ns } });
+        tk_texpr_result ret = xok((tk_texpr){ .tag = TK_TEXPR_CALL, .type = result, .as.call = { c.callee, args.ptr, args.len, call_ns } });
+        tk_free0(all_tps); tk_free0(param_tps);
+        return ret;
     }
     // NON-generic: each argument must WIDEN into the parameter's type (B.14 case→variant, T→T?) OR be
     // a fitting literal that adopts it (C6) — same rule as binding/return/assign (single source of truth).
@@ -563,12 +734,17 @@ static tk_texpr_result type_call(tk_call c, tk_env env, tk_type_table table) {
                                             tk_type_render(pt), tk_type_render(args.ptr[i].type)));
             args.ptr[i].type = pt;   // a fitting numeric literal ADOPTS the param type (leaf retyped) — C6
         } else if (tk_expand_variant(pt, table).tag != TK_TYPE_VARIANT
-                   && !(pt.tag == TK_TYPE_OPTIONAL && args.ptr[i].type.tag != TK_TYPE_OPTIONAL)) {
+                   && !(pt.tag == TK_TYPE_OPTIONAL && args.ptr[i].type.tag != TK_TYPE_OPTIONAL)
+                   && !(pt.tag == TK_TYPE_NAMED && args.ptr[i].type.tag == TK_TYPE_NAMED
+                        && tk_is_interface_name(pt.as.named.name, table)
+                        && tk_is_class_name(args.ptr[i].type.as.named.name, table))) {
             // A non-variant widen (empty()→[]T, exact, already-optional→T?) ADOPTS the param type; a
             // case→VARIANT widen KEEPS its case type so emit_call wraps it into the variant rep
             // (emit_as). A bare T→T? widen (param OPTIONAL, arg NOT optional) ALSO keeps its narrow
             // type, so codegen/VM see a non-optional value and present-wrap it (uniform with field/
             // return positions). An already-optional arg (U?→T?) stays adopt — never double-wrapped.
+            // (W10b.D3) a class→contract upcast arg ALSO keeps its narrow CLASS type — that is what
+            // picks the (class, interface) vtable when emit_as builds the fat pointer.
             args.ptr[i].type = pt;
         }
     }
@@ -634,6 +810,21 @@ static bool float_fits(double v, tk_prim_kind k) { (void)v; return tk_prim_is_fl
 // i64 — Side D); a non-literal mismatch or out-of-range literal is rejected. NULL = ok.
 // Used by the typed type_binding in typer.c (reuses value_fits).
 const char *annotated_literal_reason(tk_expr value, tk_type ann) {
+    // an ARRAY LITERAL `[e0, e1, …]` annotated as `[]E` — adopts element-wise: every non-spread
+    // element must itself be a fitting bare literal for E (recurses through nested arrays/
+    // match/if via this same function). A spread element (`..xs`) is already a `[]T` value, not
+    // a literal — skip it here (its own widen/adopt was checked at array-literal typing time).
+    // Mirrors tk_literal_adopts's TK_TEXPR_ARRAY case (the range-check side), which already
+    // recurses this way; this is the RETYPING side's twin so `let a: []u8 = [1,2,3]` (#71).
+    if (value.tag == TK_EXPR_ARRAY) {
+        if (ann.tag != TK_TYPE_SLICE || ann.as.slice.element == NULL) return "value type does not match annotation";
+        for (size_t i = 0; i < value.as.array.nelements; i += 1) {
+            if (value.as.array.elements[i].is_spread) continue;
+            const char *why = annotated_literal_reason(*value.as.array.elements[i].expr, *ann.as.slice.element);
+            if (why != NULL) return why;
+        }
+        return NULL;
+    }
     // a NEGATIVE numeric literal `-N` (unary minus over a NUMBER) — adopts a SIGNED int annotation
     // that N fits, or a float annotation for `-3.14` (parse_lit's `mut d: i128 = -1`).
     if (value.tag == TK_EXPR_UNARY && value.as.unary.op == TK_TOKEN_MINUS
@@ -748,16 +939,35 @@ bool tk_literal_adopts(tk_texpr e, tk_type to) {
     return false;
 }
 
+// (#71) RETYPE a value that tk_literal_adopts(e, to) already accepted — the retyping twin of the
+// range-check above. A plain leaf (number/match/if trailing) adopts by taking `to` wholesale (the
+// existing single-site behavior at every adoption call site: binding/assign/arg/struct-field). An
+// ARRAY LITERAL instead retypes ELEMENT-WISE: each non-spread element recurses into the slice's
+// element type (so a nested array-of-arrays retypes at every depth), and the array's own `.type`
+// becomes `to` — mirrors tk_literal_adopts's recursion structure exactly, one level deeper (it
+// mutates the ALREADY-TYPED tree in place rather than just reporting fit). A spread element is
+// already a concrete `[]T` — left untouched (its own widen was checked at array-literal typing
+// time, same as the read side above).
+void tk_retype_literal(tk_texpr *e, tk_type to) {
+    if (e->tag == TK_TEXPR_ARRAY && to.tag == TK_TYPE_SLICE && to.as.slice.element != NULL) {
+        for (size_t i = 0; i < e->as.array.nelements; i += 1) {
+            if (e->as.array.is_spread && e->as.array.is_spread[i]) continue;
+            tk_retype_literal(&e->as.array.elements[i], *to.as.slice.element);
+        }
+    }
+    e->type = to;
+}
+
 // (E7) is `t` a NAMED type whose declaration is an `enum`?
 static bool is_enum_named(tk_type t, tk_type_table table) {
     if (t.tag != TK_TYPE_NAMED) return false;
-    tk_decl_result d = tk_type_table_find(table, t.as.named.name);
+    tk_decl_result d = tk_type_table_find(table, t.as.named.name, (tk_str){0});   // (#109 W1) enum-kind probe on a resolved name — no referencing ns
     return d.ok && d.as.value.body.tag == TK_BODY_ENUM;
 }
 // (C8.3) is `t` a NAMED type whose declaration is a `flags`?
 static bool is_flags_named(tk_type t, tk_type_table table) {
     if (t.tag != TK_TYPE_NAMED) return false;
-    tk_decl_result d = tk_type_table_find(table, t.as.named.name);
+    tk_decl_result d = tk_type_table_find(table, t.as.named.name, (tk_str){0});   // (#109 W1) flags-kind probe on a resolved name — no referencing ns
     return d.ok && d.as.value.body.tag == TK_BODY_FLAGS;
 }
 // (E7) an INTEGER cast endpoint: an int prim, or `byte` (= u8). Floats/bool excluded.
@@ -777,7 +987,7 @@ static bool is_char_decode_target(tk_type t) {
 static tk_texpr_result type_cast(tk_cast c, tk_env env, tk_type_table table) {
     tk_texpr_result inner = tk_typer_expr(*c.expr, env, table); if (!inner.ok) return inner;
     if (tk_type_is_void(&inner.as.value.type)) return xerr("a `void` expression cannot be cast (M.1)");
-    tk_type_result tgt = tk_resolve_type(c.target, table);     if (!tgt.ok) return xferr(tgt.as.error);
+    tk_type_result tgt = tk_resolve_type(c.target, table, env.cur_ns);     if (!tgt.ok) return xferr(tgt.as.error);   // (#109 W1) ref_ns = the cast's enclosing namespace
     // (UTF-8 increment 1) `char to u32`/u64/i64 — decode the codepoint to its scalar value. char is
     // NOT a numeric cast endpoint (cast_kind rejects it), so this pair is handled here; the result
     // type is the target. `<int> to char` (encode) is NOT allowed yet. (Mirrors typer.tks type_cast.)
@@ -815,10 +1025,10 @@ static tk_texpr_result type_cast(tk_cast c, tk_env env, tk_type_table table) {
 // tk_str_eq is declared in text.h (via type.h) and implemented in teko_rt.c.
 
 // non-static: shared with match.c (the FieldPattern case forward-declares it — C7a).
-tk_type_result field_type(tk_struct_body sb, tk_str field, tk_type_table table) {
+tk_type_result field_type(tk_struct_body sb, tk_str field, tk_type_table table, tk_str ref_ns) {
     for (size_t i = 0; i < sb.n_fields; i += 1)
-        if (tk_str_eq(sb.fields[i].name, field)) return tk_resolve_type(sb.fields[i].type_ann, table);
-    return (tk_type_result){ .ok = false, .as.error = tk_error_make("no such field") };
+        if (tk_str_eq(sb.fields[i].name, field)) return tk_resolve_type(sb.fields[i].type_ann, table, ref_ns);   // (#109 W2) field annotation resolves in the struct's OWN ns (its declaring namespace)
+    return (tk_type_result){ .ok = false, .as.error = tk_error_named("no such field", field) };
 }
 
 static tk_texpr_result type_field_access(tk_field_access fa, tk_env env, tk_type_table table) {
@@ -857,9 +1067,13 @@ static tk_texpr_result type_field_access(tk_field_access fa, tk_env env, tk_type
         }
         return xerr("a reference (`Ref<T>`) exposes only `.value` (the referenced value)");
     }
+    // (NP-OOP, issue #116) a bare `.` on a nullable receiver stays a compile error — but say WHY
+    // and point at the sanctioned readers (`?.`/`??`) instead of the generic struct message.
+    if (recv.as.value.type.tag == TK_TYPE_OPTIONAL)
+        return xerr("cannot use `.` on a nullable value (`T?`) — read it with `?.` or `??` (REBOOT_PLAN §203)");
     if (recv.as.value.type.tag != TK_TYPE_NAMED) return xerr("field access requires a struct receiver");
-    tk_decl_result decl = tk_type_table_find(table, recv.as.value.type.as.named.name);
-    if (!decl.ok) return xerr("unknown type for field access");
+    tk_decl_result decl = tk_type_table_find(table, recv.as.value.type.as.named.name, (tk_str){0});   // (#109 W1) field-access receiver lookup on a resolved name — no referencing ns
+    if (!decl.ok) return xferr(tk_error_named("unknown type for field access", recv.as.value.type.as.named.name));
     // (W10b.CLASS) a class's fields are read exactly like a struct's; increment 2 uses the
     // EFFECTIVE (base-inherited) field set.
     tk_struct_body fa_sb;
@@ -870,18 +1084,21 @@ static tk_texpr_result type_field_access(tk_field_access fa, tk_env env, tk_type
         tk_fieldsvec_result eff = tk_effective_class_fields(decl.as.value.body.as.class_body, table);
         if (!eff.ok) return xferr(eff.as.error);
         fa_sb = (tk_struct_body){ .fields = eff.as.value.ptr, .n_fields = eff.as.value.len, .methods = NULL, .n_methods = 0 };
+    } else if (decl.as.value.body.tag == TK_BODY_INTERFACE) {
+        // (W10b.D3) an interface value is data + vtable — the contract exposes METHODS only.
+        return xerr("an interface value exposes no fields — only its contract methods");
     } else {
-        return xerr("type is not a struct (no fields)");
+        return xferr(tk_error_woven1("type ", recv.as.value.type.as.named.name, " is not a struct (no fields)"));
     }
-    tk_type_result ft = field_type(fa_sb, fa.field, table);
-    if (!ft.ok) return xerr("no such field");
+    tk_type_result ft = field_type(fa_sb, fa.field, table, type_ns_of(table, recv.as.value.type.as.named.name));
+    if (!ft.ok) return xferr(ft.as.error);
     // (W10b.CLASS residual — intern visibility) a private (default) field is reachable only
     // from its OWN declaring class's code, or — if `intern` — a subclass's too.
     if (fa_is_class) {
         tk_member_owner_result owner = tk_find_field_owner(recv.as.value.type.as.named.name, table, fa.field);
         if (!owner.ok) return xferr(owner.as.error);
         if (!tk_member_accessible(owner.as.value, env.owner_type, table))
-            return xferr(tk_error_named("field is private to its declaring class", fa.field));
+            return xferr(tk_error_woven2("field '", fa.field, "' is private to ", owner.as.value.declaring_class, ""));
     }
     return xok((tk_texpr){ .tag = TK_TEXPR_FIELD_ACCESS, .type = ft.as.value,
                            .as.field_access = { box(recv.as.value), fa.field } });
@@ -913,48 +1130,127 @@ static tk_texpr_result type_index(tk_index ix, tk_env env, tk_type_table table) 
 // box a tk_type onto the heap (the optional's inner) — like resolve.c's box, local here.
 static tk_type *tk_box_type_val(tk_type t) { tk_type *p = tk_alloc(sizeof *p); if (!p) abort(); *p = t; return p; }
 
-// `recv?.field` (REBOOT_PLAN §203): the receiver must be an OPTIONAL of a named struct;
-// the result is the field's type made optional — null propagates. The struct-field layer
-// is the same one type_field_access uses; if the inner is not a known struct we honest-error
-// (M.3) rather than crash.
-static tk_texpr_result type_safe_field_access(tk_safe_field_access sfa, tk_env env, tk_type_table table) {
-    tk_texpr_result recv = tk_typer_expr(*sfa.receiver, env, table); if (!recv.ok) return recv;
+// ---- `?.` safe navigation (NP-OOP, issue #116) — the shared checker DESUGAR ----
+// `recv?.member…` on a CLASS/INTERFACE optional lowers IN THE CHECKER to the equivalent
+// typed match (no new TAST node, so the VM and native codegen run it through their
+// existing match/method/field machinery — twin-identical by construction):
+//     match recv { null => null; <Inner> as __tkqL_C => __tkqL_C.<member…> }
+// typed `R?` (an already-optional R stays R?; a void R makes the whole safe call void —
+// statement position only, with an EMPTY null-arm body).
+
+// the deterministic per-node binder name `__tkq<line>_<col>` (position-derived, no global
+// counter — both twin checkers produce the same name for the same node).
+static tk_str tk_safe_binder_name(uint32_t line, uint32_t col) {
+    char buf[48];
+    int n = snprintf(buf, sizeof buf, "__tkq%u_%u", (unsigned)line, (unsigned)col);
+    char *p = tk_alloc((size_t)n + 1); if (!p) abort();
+    memcpy(p, buf, (size_t)n + 1);
+    return (tk_str){ (const tk_byte *)p, (size_t)n };
+}
+
+// build the typed `match recv { null => <null:R?>; <Inner> as binder => <armv> }`.
+// `armv` is the already-typed present-arm value (the member call/read on the binder).
+static tk_texpr tk_safe_nav_match(tk_texpr recv, tk_str inner_name, tk_str binder, tk_texpr armv) {
+    bool is_void = armv.type.tag == TK_TYPE_VOID;
+    tk_type result = is_void ? (tk_type){ .tag = TK_TYPE_VOID }
+                   : armv.type.tag == TK_TYPE_OPTIONAL ? armv.type
+                   : (tk_type){ .tag = TK_TYPE_OPTIONAL, .as.optional.inner = tk_box_type_val(armv.type) };
+    tk_tarm *arms = tk_alloc(2 * sizeof *arms); if (!arms) abort();
+    // null arm: `null => null` (typed to the result optional) — or an EMPTY body when void.
+    tk_tstatement *nbody = NULL; size_t n_nbody = 0;
+    if (!is_void) {
+        nbody = tk_alloc(sizeof *nbody); if (!nbody) abort();
+        nbody[0] = (tk_tstatement){ .tag = TK_TSTMT_EXPR, .as.expr_stmt = { .expr =
+            (tk_texpr){ .tag = TK_TEXPR_NULL, .type = result, .as.null_lit = { 0 } } } };
+        n_nbody = 1;
+    }
+    arms[0] = (tk_tarm){ .pattern = { .tag = TK_PAT_NULL }, .has_when = false, .guard = NULL,
+                         .body = nbody, .nbody = n_nbody };
+    // present arm: `<Inner> as binder => <armv>` — the pattern re-resolves nominally in the
+    // VM/codegen exactly like a user-written `match` over a `T?`.
+    tk_segment *seg = tk_alloc(sizeof *seg); if (!seg) abort();
+    seg[0] = (tk_segment){ .name = inner_name };
+    tk_tstatement *pbody = tk_alloc(sizeof *pbody); if (!pbody) abort();
+    pbody[0] = (tk_tstatement){ .tag = TK_TSTMT_EXPR, .as.expr_stmt = { .expr = armv } };
+    arms[1] = (tk_tarm){ .pattern = { .tag = TK_PAT_BIND, .as.bind = {
+                             .type_name = { seg, 1 }, .has_binding = true, .binding = binder,
+                             .is_slice = false, .slice_type = NULL, .type_args = NULL, .nargs = 0 } },
+                         .has_when = false, .guard = NULL, .body = pbody, .nbody = 1 };
+    return (tk_texpr){ .tag = TK_TEXPR_MATCH, .type = result,
+                       .as.match_expr = { box(recv), arms, 2 } };
+}
+
+// validate a `?.` receiver: must be a NON-sentinel optional; enrich the disjoint-domain
+// case (an `X | error` union reads via `match`, never `?.` — the LAW's other half).
+static tk_texpr_result tk_safe_nav_receiver(const tk_expr *receiver, tk_env env, tk_type_table table) {
+    tk_texpr_result recv = tk_typer_expr(*receiver, env, table); if (!recv.ok) return recv;
     tk_type rt = recv.as.value.type;
-    if (rt.tag != TK_TYPE_OPTIONAL)
-        return xerr("safe field access `?.` needs an optional receiver (`T?`) — use `.` for a non-optional (REBOOT_PLAN §203)");
-    tk_type inner = *rt.as.optional.inner;
+    if (rt.tag != TK_TYPE_OPTIONAL) {
+        if (rt.tag == TK_TYPE_ERROR || tk_expand_variant(rt, table).tag == TK_TYPE_VARIANT)
+            return xerr("`?.` reads absence (`T?`), never errors — inspect an `X | error` union with `match` (disjoint-domain law)");
+        return xerr("safe access `?.` needs an optional receiver (`T?`) — use `.` for a non-optional (REBOOT_PLAN §203)");
+    }
+    if (rt.as.optional.inner == NULL)
+        return xerr("`?.` on a bare `null` has no member to reach (annotate the optional's type)");
+    return recv;
+}
+
+// `recv?.field` (REBOOT_PLAN §203): the receiver must be an OPTIONAL of a named struct or
+// class; the result is the field's type made optional — null propagates. A STRUCT inner
+// keeps the dedicated TSafeFieldAccess node; a CLASS inner desugars to the safe-nav match
+// (NP-OOP), routing through type_field_access so visibility holds EXACTLY like a bare `.`.
+static tk_texpr_result type_safe_field_access(tk_safe_field_access sfa, uint32_t line, uint32_t col, tk_env env, tk_type_table table) {
+    tk_texpr_result recv = tk_safe_nav_receiver(sfa.receiver, env, table); if (!recv.ok) return recv;
+    tk_type inner = *recv.as.value.type.as.optional.inner;
     if (inner.tag != TK_TYPE_NAMED)
         return xerr("safe field access on a non-struct optional is not yet supported (the struct-field layer is pending — M.3)");
-    tk_decl_result decl = tk_type_table_find(table, inner.as.named.name);
+    tk_decl_result decl = tk_type_table_find(table, inner.as.named.name, (tk_str){0});   // (#109 W1) safe-field-access receiver lookup on a resolved name — no referencing ns
     if (!decl.ok) return xerr("unknown type for safe field access");
-    // (W10b.CLASS) a class's fields are read exactly like a struct's; increment 2 uses the
-    // EFFECTIVE (base-inherited) field set.
-    tk_struct_body sfa_sb;
-    bool sfa_is_class = decl.as.value.body.tag == TK_BODY_CLASS;
-    if (decl.as.value.body.tag == TK_BODY_STRUCT) {
-        sfa_sb = decl.as.value.body.as.struct_body;
-    } else if (sfa_is_class) {
-        tk_fieldsvec_result eff = tk_effective_class_fields(decl.as.value.body.as.class_body, table);
-        if (!eff.ok) return xferr(eff.as.error);
-        sfa_sb = (tk_struct_body){ .fields = eff.as.value.ptr, .n_fields = eff.as.value.len, .methods = NULL, .n_methods = 0 };
-    } else {
-        return xerr("type is not a struct (no fields)");
+    // (NP-OOP, issue #116) CLASS route — desugar to the safe-nav match; the arm's field read
+    // is typed by type_field_access itself (same visibility, same `.len`/field rules).
+    if (decl.as.value.body.tag == TK_BODY_CLASS) {
+        tk_str binder = tk_safe_binder_name(line, col);
+        tk_env env2 = tk_env_define(env, binder, inner, false);
+        tk_expr *rvar = tk_alloc(sizeof *rvar); if (!rvar) abort();
+        *rvar = (tk_expr){ .tag = TK_EXPR_VAR, .line = line, .col = col, .as.var = { .name = binder } };
+        tk_field_access fa2 = { .receiver = rvar, .field = sfa.field };
+        tk_texpr_result tf = type_field_access(fa2, env2, table); if (!tf.ok) return tf;
+        return xok(tk_safe_nav_match(recv.as.value, inner.as.named.name, binder, tf.as.value));
     }
-    tk_type_result ft = field_type(sfa_sb, sfa.field, table);
-    if (!ft.ok) return xerr("no such field");
-    // (W10b.CLASS residual — intern visibility) a private (default) field is reachable only
-    // from its OWN declaring class's code, or — if `intern` — a subclass's too.
-    if (sfa_is_class) {
-        tk_member_owner_result owner = tk_find_field_owner(inner.as.named.name, table, sfa.field);
-        if (!owner.ok) return xferr(owner.as.error);
-        if (!tk_member_accessible(owner.as.value, env.owner_type, table))
-            return xferr(tk_error_named("field is private to its declaring class", sfa.field));
-    }
+    // STRUCT route — the original TSafeFieldAccess lowering (native emission is value-based).
+    if (decl.as.value.body.tag != TK_BODY_STRUCT)
+        return xferr(tk_error_woven1("type ", inner.as.named.name, " is not a struct (no fields)"));
+    tk_struct_body sfa_sb = decl.as.value.body.as.struct_body;
+    tk_type_result ft = field_type(sfa_sb, sfa.field, table, type_ns_of(table, inner.as.named.name));
+    if (!ft.ok) return xferr(ft.as.error);
     // the result is `(field-type)?` — null-propagating; an already-optional field stays as-is.
     tk_type result = ft.as.value.tag == TK_TYPE_OPTIONAL ? ft.as.value
                    : (tk_type){ .tag = TK_TYPE_OPTIONAL, .as.optional.inner = tk_box_type_val(ft.as.value) };
     return xok((tk_texpr){ .tag = TK_TEXPR_SAFE_FIELD_ACCESS, .type = result,
                            .as.safe_field_access = { box(recv.as.value), sfa.field } });
+}
+
+// `recv?.method(args)` (NP-OOP, issue #116): a null-propagating METHOD call on a `T?` of a
+// named struct/class/interface. Desugars to the safe-nav match; the arm's call is typed by
+// type_method_call itself — visibility, arity, defaults and interface (vtable) dispatch all
+// behave EXACTLY like a bare `.` call (no bypass through the null-propagating path).
+static tk_texpr_result type_safe_method_call(tk_safe_method_call smc, uint32_t line, uint32_t col, tk_env env, tk_type_table table) {
+    tk_texpr_result recv = tk_safe_nav_receiver(smc.receiver, env, table); if (!recv.ok) return recv;
+    tk_type inner = *recv.as.value.type.as.optional.inner;
+    if (inner.tag != TK_TYPE_NAMED)
+        return xerr("safe method call `?.` needs an optional of a named type (a struct, class or interface)");
+    tk_decl_result decl = tk_type_table_find(table, inner.as.named.name, (tk_str){0});   // (#109 W1) safe-method-call receiver lookup on a resolved name — no referencing ns
+    if (!decl.ok) return xerr("unknown type for safe method call");
+    // an ENUM inner would desugar into a member pattern, not a type bind — honest stop.
+    if (decl.as.value.body.tag == TK_BODY_ENUM)
+        return xerr("safe method call on an optional enum is not yet supported — bind it with `match` first");
+    tk_str binder = tk_safe_binder_name(line, col);
+    tk_env env2 = tk_env_define(env, binder, inner, false);
+    tk_expr *rvar = tk_alloc(sizeof *rvar); if (!rvar) abort();
+    *rvar = (tk_expr){ .tag = TK_EXPR_VAR, .line = line, .col = col, .as.var = { .name = binder } };
+    tk_method_call call = { .receiver = rvar, .method = smc.method, .args = smc.args, .nargs = smc.nargs };
+    tk_texpr_result tc = type_method_call(call, env2, table); if (!tc.ok) return tc;
+    return xok(tk_safe_nav_match(recv.as.value, inner.as.named.name, binder, tc.as.value));
 }
 
 // `a ?? b` (REBOOT_PLAN §203): the left must be an OPTIONAL `T?`; the right is `T` (the
@@ -965,6 +1261,10 @@ static tk_texpr_result type_coalesce(tk_coalesce co, tk_env env, tk_type_table t
     tk_type lt = l.as.value.type;
     if (lt.tag != TK_TYPE_OPTIONAL)
         return xerr("`??` needs an optional left operand (`T?`) — its right is the fallback (REBOOT_PLAN §203)");
+    // (NP-OOP, issue #116) a SENTINEL optional left (`null ?? x`) has no inner `T` to unwrap —
+    // honest error (M.1), not a null-deref.
+    if (lt.as.optional.inner == NULL)
+        return xerr("`??` on a bare `null` has nothing to unwrap — the left must be a typed `T?` (REBOOT_PLAN §203)");
     tk_type unwrapped = *lt.as.optional.inner;   // the `T` behind the `T?`
     // RIGHT arm. A bare `null` adopts the left's optional type (`x ?? null` ⇒ `T?`); otherwise
     // type it normally and require it to be `T` (result `T`) or `T?` (result `T?`).
@@ -981,7 +1281,10 @@ static tk_texpr_result type_coalesce(tk_coalesce co, tk_env env, tk_type_table t
         return xok((tk_texpr){ .tag = TK_TEXPR_COALESCE, .type = unwrapped,
                                .as.coalesce = { box(l.as.value), box(r.as.value) } });
     if (tk_type_is_void(&rt)) return xerr("a `void` expression cannot be the `??` fallback (M.1)");
-    if (tk_type_eq(&rt, &unwrapped))   // `T? ?? T` ⇒ T (the common, unwrapping case)
+    // `T? ?? T` ⇒ T (the common, unwrapping case). (NP-OOP, issue #116) the fallback may also
+    // WIDEN into T — the same assignability a binding/param slot grants (tk_widens_into), so a
+    // conforming class instance backs an interface-typed optional: `shape_opt ?? circle`.
+    if (tk_type_eq(&rt, &unwrapped) || tk_widens_into(rt, unwrapped, table))
         return xok((tk_texpr){ .tag = TK_TEXPR_COALESCE, .type = unwrapped,
                                .as.coalesce = { box(l.as.value), box(r.as.value) } });
     if (tk_type_eq(&rt, &lt))          // `T? ?? T?` ⇒ T? (fallback is itself optional)
@@ -1006,7 +1309,7 @@ static bool name_has_generic_base(tk_str mname, tk_str base) {
 // `expected` is the binding/return type the literal flows into (a VOID sentinel = none). It retargets
 // a GENERIC constructor `Box { … }` to the concrete instance from the annotation (S4, annotation-driven).
 tk_texpr_result tk_type_struct_lit(tk_struct_lit sl, tk_type expected, tk_env env, tk_type_table table) {
-    tk_type_result nt = resolve_named(sl.type_path, table);
+    tk_type_result nt = resolve_named(sl.type_path, table, env.cur_ns);   // (#109 W1) ref_ns = the literal's enclosing namespace
     if (!nt.ok) return xferr(nt.as.error);
     // The builtin `error` is the one non-NAMED constructible type — `error { message = <str> }`
     // (B.1: error-as-value, rep { message: str }). It is built-in, not a user struct.
@@ -1025,7 +1328,7 @@ tk_texpr_result tk_type_struct_lit(tk_struct_lit sl, tk_type expected, tk_env en
     }
     if (nt.as.value.tag != TK_TYPE_NAMED) return xerr("a struct literal requires a named struct type");
     tk_str name = nt.as.value.as.named.name;
-    tk_decl_result decl = tk_type_table_find(table, name);
+    tk_decl_result decl = tk_type_table_find(table, name, (tk_str){0});   // (#109 W1) struct-literal decl lookup on a resolved name — no referencing ns
     if (!decl.ok) return xerr("unknown type in a struct literal");
     // (W9.4) explicit construction-site type-args `Foo<i64>{ … }` resolve to the concrete instance
     // `Foo__g__i64` directly — NO annotation required. This OVERRIDES `expected`: build the synthetic
@@ -1036,10 +1339,10 @@ tk_texpr_result tk_type_struct_lit(tk_struct_lit sl, tk_type expected, tk_env en
     // ordinary binding-level widening check below handles it (so `let w: Wrap = Gen<i64>{…}` is fine).
     if (sl.nargs > 0) {
         tk_type_expr gte = { .tag = TK_TEXPR_NAMED, .as.named = { .path = sl.type_path, .args = sl.type_args, .args_len = sl.nargs } };
-        tk_type_result git = tk_resolve_type(gte, table);
+        tk_type_result git = tk_resolve_type(gte, table, env.cur_ns);   // (#109 W1) ref_ns = the literal's enclosing namespace
         if (!git.ok) return xferr(git.as.error);
         if (git.as.value.tag != TK_TYPE_NAMED) return xerr("explicit type-arguments did not resolve to a struct instance");
-        if (expected.tag == TK_TYPE_NAMED && name_has_generic_base(expected.as.named.name, name)
+        if (expected.tag == TK_TYPE_NAMED && name_has_generic_base(expected.as.named.name, tk_name_last_segment(name))   // (#109 W3) BARE base — the generic instance name is bare
             && !tk_str_eq(expected.as.named.name, git.as.value.as.named.name))
             return xerr("the explicit type-arguments at construction disagree with the annotated type");
         expected = git.as.value;   // retarget below as if annotated
@@ -1051,24 +1354,39 @@ tk_texpr_result tk_type_struct_lit(tk_struct_lit sl, tk_type expected, tk_env en
         if (expected.tag != TK_TYPE_NAMED)
             return xerr("cannot infer the type arguments of a generic struct here — annotate it (e.g. `let x: Box<…> = …`)");
         tk_str mname = expected.as.named.name;
-        if (!name_has_generic_base(mname, name)) return xerr("struct literal does not match the annotated type");
-        decl = tk_type_table_find(table, mname);
+        if (!name_has_generic_base(mname, tk_name_last_segment(name))) return xerr("struct literal does not match the annotated type");   // (#109 W3) BARE base
+        decl = tk_type_table_find(table, mname, (tk_str){0});   // (#109 W1) generic-instance lookup on a resolved name — no referencing ns
         if (!decl.ok) return xerr("internal: generic instance was not stamped");
         name = mname;
     }
     // (W10b.CLASS) `Name { … }` also constructs a class instance — a class's fields are typed
     // identically to a struct's (increment 2: the EFFECTIVE, base-inherited fields too). An
-    // `abstract` class cannot be instantiated directly. The "who may construct me" restriction
-    // (a class's literal legal only inside its own static factory) is a LATER increment.
+    // `abstract` class cannot be instantiated directly.
     tk_field *sb_fields; size_t sb_n_fields;
     if (decl.as.value.body.tag == TK_BODY_STRUCT) {
         sb_fields = decl.as.value.body.as.struct_body.fields; sb_n_fields = decl.as.value.body.as.struct_body.n_fields;
     } else if (decl.as.value.body.tag == TK_BODY_CLASS) {
         if (decl.as.value.body.as.class_body.kind == TK_CLASS_ABSTRACT)
-            return xferr(tk_error_named("is abstract and cannot be instantiated directly", name));
+            return xferr(tk_error_woven1("`", name, "` is abstract and cannot be instantiated directly"));
+        // (W10b.D1) invariant-safe construction — a class's `{…}` literal is legal ONLY inside
+        // the class's OWN methods (its static factories and instance methods), so the
+        // arena-per-object and the class's invariants stay inviolable from outside code.
+        // `env.owner_type` is the DECLARING class of the method body currently being typed
+        // (empty outside any method) — a purely inherited method keeps its ORIGINAL declaring
+        // class (type_struct_methods), so a base factory constructing the base stays legal when
+        // re-typed under a derived class. Structs are pure value data: their literals stay free.
+        if (!tk_str_eq(tk_name_last_segment(env.owner_type), tk_name_last_segment(name)))   // (#109 W3) compare bare last-segments
+            return xferr(tk_error_named("a class literal is only legal inside the class's own methods — construct it via a static factory", name));
         tk_fieldsvec_result eff = tk_effective_class_fields(decl.as.value.body.as.class_body, table);
         if (!eff.ok) return xferr(eff.as.error);
         sb_fields = eff.as.value.ptr; sb_n_fields = eff.as.value.len;
+    } else if (decl.as.value.body.tag == TK_BODY_TRAIT) {
+        // (TR0) a trait is NON-instantiable — it exists only to be derived. Point at the fix.
+        size_t mlen = name.len * 2 + 128; char *mbuf = tk_alloc(mlen); if (!mbuf) abort();
+        int mn = snprintf(mbuf, mlen, "'%.*s' is a trait and cannot be instantiated — derive it from a struct or class instead (`type X = struct %.*s …`)",
+                          (int)name.len, (const char *)name.ptr, (int)name.len, (const char *)name.ptr);
+        if (mn < 0 || (size_t)mn >= mlen) abort();   // cert-err33-c: handle the return — `mlen` fits the literal + two name.len spans, so truncation is an invariant break
+        return xferr(tk_error_make(mbuf));
     } else {
         return xerr("struct-literal target is not a struct");
     }
@@ -1083,7 +1401,7 @@ tk_texpr_result tk_type_struct_lit(tk_struct_lit sl, tk_type expected, tk_env en
             if (tk_str_eq(sl.field_names[i], fname)) { found = i; hits += 1; }
         if (hits == 0) { tk_free0(names); tk_free0(vals); return xerr("a struct literal is missing a declared field"); }
         if (hits > 1)  { tk_free0(names); tk_free0(vals); return xerr("a struct literal sets a field more than once"); }
-        tk_type_result ft = tk_resolve_type(sb_fields[d].type_ann, table);
+        tk_type_result ft = tk_resolve_type(sb_fields[d].type_ann, table, type_ns_of(table, name));   // (#109 W2) field annotation resolves in the struct's OWN ns
         if (!ft.ok) { tk_free0(names); tk_free0(vals); return xferr(ft.as.error); }
         // thread the field's type as EXPECTED so a nested generic constructor (`value = Box { … }`)
         // targets its concrete instance (S4). Non-struct-lit values type exactly as before.
@@ -1130,7 +1448,7 @@ static void lam_collect_stmt(const tk_statement *s, tk_sset *refs, tk_sset *boun
             if (s->as.binding.target.tag == TK_BIND_SIMPLE) sset_add(bound, s->as.binding.target.as.simple.name);
             else for (size_t i = 0; i < s->as.binding.target.as.destructure.nnames; i += 1) sset_add(bound, s->as.binding.target.as.destructure.names[i]);
             break;
-        case TK_STMT_ASSIGN: lam_collect_expr(&s->as.assign.value, refs, bound); break;
+        case TK_STMT_ASSIGN: lam_collect_expr(&s->as.assign.value, refs, bound); if (s->as.assign.kind == TK_ASSIGN_FIELD && s->as.assign.target != NULL) lam_collect_expr(s->as.assign.target, refs, bound); break;   // (#88) a closure writing `obj.f = …` captures `obj` (the receiver's free vars)
         case TK_STMT_RETURN: if (s->as.ret.has_value) lam_collect_expr(&s->as.ret.value, refs, bound); break;
         case TK_STMT_LOOP:   lam_collect_block(s->as.loop_stmt.body, s->as.loop_stmt.nbody, refs, bound); break;
         case TK_STMT_EXPR:   lam_collect_expr(&s->as.expr_stmt.expr, refs, bound); break;
@@ -1154,6 +1472,7 @@ static void lam_collect_expr(const tk_expr *e, tk_sset *refs, tk_sset *bound) {
         case TK_EXPR_SAFE_FIELD_ACCESS: lam_collect_expr(e->as.safe_field_access.receiver, refs, bound); break;
         case TK_EXPR_COALESCE: lam_collect_expr(e->as.coalesce.left, refs, bound); lam_collect_expr(e->as.coalesce.right, refs, bound); break;
         case TK_EXPR_METHOD_CALL: lam_collect_expr(e->as.method_call.receiver, refs, bound); for (size_t i = 0; i < e->as.method_call.nargs; i += 1) lam_collect_expr(&e->as.method_call.args[i], refs, bound); break;
+        case TK_EXPR_SAFE_METHOD_CALL: lam_collect_expr(e->as.safe_method_call.receiver, refs, bound); for (size_t i = 0; i < e->as.safe_method_call.nargs; i += 1) lam_collect_expr(&e->as.safe_method_call.args[i], refs, bound); break;
         case TK_EXPR_STRUCT_LIT: for (size_t i = 0; i < e->as.struct_lit.nfields; i += 1) lam_collect_expr(&e->as.struct_lit.field_vals[i], refs, bound); break;
         case TK_EXPR_INDEX: lam_collect_expr(e->as.index.receiver, refs, bound); lam_collect_expr(e->as.index.index, refs, bound); break;
         case TK_EXPR_INTERP: for (size_t i = 0; i < e->as.interp.nholes; i += 1) lam_collect_expr(&e->as.interp.holes[i], refs, bound); break;
@@ -1174,7 +1493,7 @@ static tk_texpr_result type_lambda(tk_lambda lam, tk_type expected, tk_env env, 
     tk_env cenv = env;
     for (size_t i = 0; i < lam.nparams; i += 1) {
         tk_type pt;
-        if (lam.params[i].has_type) { tk_type_result r = tk_resolve_type(lam.params[i].type_ann, table); if (!r.ok) return xferr(r.as.error); pt = r.as.value; }
+        if (lam.params[i].has_type) { tk_type_result r = tk_resolve_type(lam.params[i].type_ann, table, env.cur_ns); if (!r.ok) return xferr(r.as.error); pt = r.as.value; }   // (#109 W1) ref_ns = the lambda's enclosing namespace
         else if (i < n_exp) pt = exp_params[i];
         else return xerr("cannot infer the type of a closure parameter — annotate it or give the closure a target type");
         tparams = tk_realloc0(tparams, (ntp + 1) * sizeof *tparams); if (!tparams) abort();
@@ -1204,12 +1523,64 @@ static tk_texpr_result type_lambda(tk_lambda lam, tk_type expected, tk_env env, 
     return xok((tk_texpr){ .tag = TK_TEXPR_LAMBDA, .type = ft, .as.lambda = tl });
 }
 
+// (W10b.D3) is `t` a slice whose element is a NAMED contract (interface)? The gate for the
+// heterogeneous-array expected path below. Mirror of typer.tks::is_iface_slice.
+static bool is_iface_slice(tk_type t, tk_type_table table) {
+    return t.tag == TK_TYPE_SLICE && t.as.slice.element != NULL
+        && t.as.slice.element->tag == TK_TYPE_NAMED
+        && tk_is_interface_name(t.as.slice.element->as.named.name, table);
+}
+
+// (W10b.D3) an ARRAY literal flowing into a `[]<interface>` slot: type each element AGAINST the
+// contract element (so `[circle, square]` under `[]Shape` never joins to an inline class union
+// the emitters cannot re-tag). Each element keeps its NARROW class type (emit_as builds the fat
+// pointer per slot); the array's own type adopts the expected `[]<interface>`. Spread elements
+// fall back to the normal path (their `[]C` value covariant-rebuilds element-wise instead).
+// Mirror of typer.tks::type_array_lit_expected.
+static tk_texpr_result type_array_lit_expected(tk_array_lit a, tk_type expected, tk_env env, tk_type_table table) {
+    tk_type elem = *expected.as.slice.element;
+    tk_texpr *elems   = NULL;
+    bool     *spreads = NULL;
+    if (a.nelements > 0) {
+        elems   = tk_alloc(a.nelements * sizeof *elems);   if (!elems)   abort();
+        spreads = tk_alloc(a.nelements * sizeof *spreads); if (!spreads) abort();
+        for (size_t i = 0; i < a.nelements; i += 1) {
+            tk_texpr_result e = tk_typer_expr(*a.elements[i].expr, env, table);
+            if (!e.ok) { tk_free0(elems); tk_free0(spreads); return e; }
+            if (a.elements[i].is_spread) {
+                // a spread contributes a whole `[]U` — U must widen into the contract element.
+                if (e.as.value.type.tag != TK_TYPE_SLICE || e.as.value.type.as.slice.element == NULL) {
+                    tk_free0(elems); tk_free0(spreads);
+                    return xerr("a spread element (`..xs`) must be a slice (`[]T`)");
+                }
+                if (!tk_widens_into(*e.as.value.type.as.slice.element, elem, table)) {
+                    tk_free0(elems); tk_free0(spreads);
+                    return xferr(tk_error_types(tk_error_make("array element type mismatch"),
+                                                tk_type_render(elem), tk_type_render(*e.as.value.type.as.slice.element)));
+                }
+            } else {
+                if (tk_type_is_void(&e.as.value.type)) { tk_free0(elems); tk_free0(spreads); return xerr("a `void` expression cannot be an array element (M.1)"); }
+                if (!tk_widens_into(e.as.value.type, elem, table)) {
+                    tk_free0(elems); tk_free0(spreads);
+                    return xferr(tk_error_types(tk_error_make("array element type mismatch"),
+                                                tk_type_render(elem), tk_type_render(e.as.value.type)));
+                }
+            }
+            elems[i]   = e.as.value;   // keep the NARROW type — the emit wraps per slot
+            spreads[i] = a.elements[i].is_spread;
+        }
+    }
+    return xok((tk_texpr){ .tag = TK_TEXPR_ARRAY, .type = expected, .as.array = { elems, a.nelements, spreads } });
+}
+
 // Type an expression flowing into a known EXPECTED type: a struct literal is given that type (so a
 // generic constructor targets its concrete instance); anything else types normally. Mirror of
 // typer.tks::type_value_expected — used at the binding level AND for struct-lit field values (nested).
 tk_texpr_result tk_type_value_expected(tk_expr e, tk_type expected, tk_env env, tk_type_table table) {
     if (e.tag == TK_EXPR_STRUCT_LIT) return tk_type_struct_lit(e.as.struct_lit, expected, env, table);
     if (e.tag == TK_EXPR_LAMBDA)     return type_lambda(e.as.lambda, expected, env, table);   // (W10) target → param inference
+    if (e.tag == TK_EXPR_ARRAY && is_iface_slice(expected, table))                            // (W10b.D3) []<interface> literal
+        return type_array_lit_expected(e.as.array, expected, env, table);
     return tk_typer_expr(e, env, table);
 }
 
@@ -1304,28 +1675,28 @@ static tk_texpr_result type_in(tk_in n, tk_env env, tk_type_table table) {
     // so the literal-form gate doesn't reach it. A reference may not be an `in` operand (lhs or set
     // element): the [a, b] set is a value-position collection of refs. Mirror in typer.tks::type_in.
     if (tk_type_contains_ref(&lt)) return xerr("a reference cannot be stored in a struct/variant/collection");
-    // Allocate `nelems ? nelems : 1` so `elems` is UNCONDITIONALLY non-NULL after the abort guard
-    // (tk_alloc never returns NULL — OOM panics). This makes the non-NULL-ness a constraint on the
-    // POINTER ITSELF that clang-analyzer can see, silencing a false-positive core.NullDereference on
-    // `elems[i]` below (the analyzer does not correlate `elems != NULL` with `i < nelems`). The extra
-    // 1-element alloc when nelems==0 is harmless (the loop never runs). No behavioral change.
-    tk_texpr *elems = tk_alloc((n.nelems ? n.nelems : 1) * sizeof *elems); if (!elems) abort();
-    for (size_t i = 0; i < n.nelems; i += 1) {
-        tk_texpr_result e = tk_typer_expr(n.elems[i], env, table);
-        if (!e.ok) { tk_free0(elems); return e; }
-        if (tk_type_is_void(&e.as.value.type)) {
-            tk_free0(elems);
-            return xerr("a `void` expression cannot be an operand (M.1)");
+    tk_texpr *elems = NULL;
+    if (n.nelems > 0) {
+        elems = tk_alloc(n.nelems * sizeof *elems); if (!elems) abort();
+        // Loop nested inside the allocation guard (not a sibling `if`+`for` pair) so the
+        // analyzer can see `elems` is non-NULL for every index this loop actually reaches.
+        for (size_t i = 0; i < n.nelems; i += 1) {
+            tk_texpr_result e = tk_typer_expr(n.elems[i], env, table);
+            if (!e.ok) { tk_free0(elems); return e; }
+            if (tk_type_is_void(&e.as.value.type)) {
+                tk_free0(elems);
+                return xerr("a `void` expression cannot be an operand (M.1)");
+            }
+            if (tk_type_contains_ref(&e.as.value.type)) {
+                tk_free0(elems);
+                return xerr("a reference cannot be stored in a struct/variant/collection");
+            }
+            if (!is_comparable(lt, e.as.value.type)) {
+                tk_free0(elems);
+                return xerr("`in` element is not comparable to the left-hand operand");
+            }
+            elems[i] = e.as.value;
         }
-        if (tk_type_contains_ref(&e.as.value.type)) {
-            tk_free0(elems);
-            return xerr("a reference cannot be stored in a struct/variant/collection");
-        }
-        if (!is_comparable(lt, e.as.value.type)) {
-            tk_free0(elems);
-            return xerr("`in` element is not comparable to the left-hand operand");
-        }
-        elems[i] = e.as.value;
     }
     return xok((tk_texpr){ .tag = TK_TEXPR_IN, .type = tk_prim_t(TK_PRIM_BOOL),
                            .as.in_expr = { box(lhs.as.value), elems, n.nelems } });
@@ -1336,44 +1707,70 @@ static tk_texpr_result type_in(tk_in n, tk_env env, tk_type_table table) {
 // annotation adopts it. Spread elements (`..xs`) must type as `[]T`; their element type T is widened
 // into the array's unified element type. C twin's mirror: type_array_lit in typer.tks.
 static tk_texpr_result type_array_lit(tk_array_lit a, tk_env env, tk_type_table table) {
-    // `nelements ? nelements : 1` — unconditionally non-NULL after the abort guard, so clang-analyzer
-    // sees `elems`/`spreads` are non-NULL when indexed below (silences a false-positive
-    // core.NullDereference; the analyzer doesn't correlate the pointer with `i < nelements`). Harmless
-    // 1-elem alloc when nelements==0 (loop never runs). No behavioral change.
-    tk_texpr  *elems   = tk_alloc((a.nelements ? a.nelements : 1) * sizeof *elems);   if (!elems)   abort();
-    bool      *spreads = tk_alloc((a.nelements ? a.nelements : 1) * sizeof *spreads); if (!spreads) abort();
+    tk_texpr  *elems    = NULL;
+    bool      *spreads  = NULL;
     tk_type et = (tk_type){ .tag = TK_TYPE_VOID };   // sentinel for an empty `[]`
-    for (size_t i = 0; i < a.nelements; i += 1) {
-        tk_texpr_result e = tk_typer_expr(*a.elements[i].expr, env, table);
-        if (!e.ok) { tk_free0(elems); tk_free0(spreads); return e; }
-        if (a.elements[i].is_spread) {
-            // spread element: expr must be a `[]T` slice; contribute T as the element type
-            if (e.as.value.type.tag != TK_TYPE_SLICE) {
-                tk_free0(elems); tk_free0(spreads);
-                return xerr("a spread element (`..xs`) must be a slice (`[]T`)");
-            }
-            if (e.as.value.type.as.slice.element == NULL) {
-                tk_free0(elems); tk_free0(spreads);
-                return xerr("a spread element cannot be an untyped empty slice");
-            }
-            tk_type spread_elem = *e.as.value.type.as.slice.element;
-            if (tk_type_is_void(&et)) { et = spread_elem; }   // first contributor
-            else {
-                tk_type j;
-                if (!tk_type_join(et, spread_elem, table, &j)) {
+    if (a.nelements > 0) {
+        elems   = tk_alloc(a.nelements * sizeof *elems);   if (!elems)   abort();
+        spreads = tk_alloc(a.nelements * sizeof *spreads); if (!spreads) abort();
+        // Loop nested inside the SAME allocation guard (not a sibling `if`+`for` pair) so the
+        // analyzer can see `elems`/`spreads` are non-NULL for every index this loop reaches.
+        for (size_t i = 0; i < a.nelements; i += 1) {
+            tk_texpr_result e = tk_typer_expr(*a.elements[i].expr, env, table);
+            if (!e.ok) { tk_free0(elems); tk_free0(spreads); return e; }
+            if (a.elements[i].is_spread) {
+                // spread element: expr must be a `[]T` slice; contribute T as the element type
+                if (e.as.value.type.tag != TK_TYPE_SLICE) {
                     tk_free0(elems); tk_free0(spreads);
-                    return xerr("spread element type does not match the array element type");
+                    return xerr("a spread element (`..xs`) must be a slice (`[]T`)");
                 }
-                et = j;
+                if (e.as.value.type.as.slice.element == NULL) {
+                    tk_free0(elems); tk_free0(spreads);
+                    return xerr("a spread element cannot be an untyped empty slice");
+                }
+                tk_type spread_elem = *e.as.value.type.as.slice.element;
+                if (tk_type_is_void(&et)) { et = spread_elem; }   // first contributor
+                else {
+                    tk_type j;
+                    if (!tk_type_join(et, spread_elem, table, &j)) {
+                        tk_free0(elems); tk_free0(spreads);
+                        return xerr("spread element type does not match the array element type");
+                    }
+                    et = j;
+                }
+            } else {
+                // plain element: original logic
+                if (tk_type_is_void(&e.as.value.type)) { tk_free0(elems); tk_free0(spreads); return xerr("a `void` expression cannot be an array element (M.1)"); }
+                if (tk_type_is_void(&et)) { et = e.as.value.type; }   // first contributor
+                else { tk_type j; if (!tk_type_join(et, e.as.value.type, table, &j)) { tk_free0(elems); tk_free0(spreads); return xerr("array elements have different types"); } et = j; }
             }
-        } else {
-            // plain element: original logic
-            if (tk_type_is_void(&e.as.value.type)) { tk_free0(elems); tk_free0(spreads); return xerr("a `void` expression cannot be an array element (M.1)"); }
-            if (tk_type_is_void(&et)) { et = e.as.value.type; }   // first contributor
-            else { tk_type j; if (!tk_type_join(et, e.as.value.type, table, &j)) { tk_free0(elems); tk_free0(spreads); return xerr("array elements have different types"); } et = j; }
+            elems[i]   = e.as.value;
+            spreads[i] = a.elements[i].is_spread;
         }
-        elems[i]   = e.as.value;
-        spreads[i] = a.elements[i].is_spread;
+        // (#83) CONCRETIZE any sibling element that is still carrying a SENTINEL now that `et`
+        // (the join across every element) is settled. `[[], [1]]`'s inner `[]` types as `[]NULL`
+        // on its own (type_array_lit's own empty-array case, below); tk_type_join now correctly
+        // folds `et` to the CONCRETE `[]i64` (the #83 fix), but the individual `elems[0]` node's
+        // `.type` is untouched — it still says `[]NULL`, and codegen's TK_TEXPR_ARRAY case reads
+        // the elem type OFF THE NODE ITSELF (not the parent's contribution), so it would still
+        // honest-stop. Retype every element whose type is a (possibly nested) sentinel form of
+        // the now-concrete `et` — same mechanism as the `push(empty(), x)` base-concretization
+        // in type_list_builtin above. Only fires when the element's type is tk_type_eq to et
+        // (permissive-equal) AND actually carries a sentinel; a genuinely-narrower case that
+        // WIDENS into a wider et (e.g. a case into a declared variant) is left alone — codegen's
+        // emit_as wraps that at the use site instead. NESTED inside the SAME allocation guard as
+        // the loop above (same idiom, same reason: the analyzer must see `elems`/`spreads`
+        // non-NULL — a sibling `a.nelements != 0` guard reads as a possible-NULL path to it).
+        // The spread test reads the INPUT `a.elements[i].is_spread` (the exact value the loop
+        // above stored into spreads[i]) — reading the heap copy trips the analyzer's loop
+        // widening ("garbage value": it cannot prove the first loop initialized every index).
+        if (!tk_type_has_sentinel(&et)) {
+            for (size_t i = 0; i < a.nelements; i += 1) {
+                if (a.elements[i].is_spread) continue;   // a spread's own slice type is never the sentinel (checked above)
+                if (tk_type_has_sentinel(&elems[i].type) && tk_type_eq(&elems[i].type, &et))
+                    elems[i].type = et;
+            }
+        }
     }
     // (MEM Step 0, R4) ESCAPE GATE — an INFERRED element type may not carry a reference. The
     // annotated form `let xs: []Ref<T> = …` is already rejected in resolve, but the inferred
@@ -1486,22 +1883,24 @@ static tk_texpr_result type_flags_method(tk_method_call mc, tk_env env, tk_type_
 // The path is the enum type (all but the last segment) + the member (last segment). Resolve the
 // enum decl, verify it is an `enum` and the member exists, and type the node as the NAMED enum —
 // carrying the resolved enum name + member ordinal so both backends lower without re-lookup.
-static tk_texpr_result type_path_expr(tk_path_expr pe, tk_type_table table) {
+// (#109 W1) `ref_ns` = the namespace the `Type::Member` expression is written in; unused until W2.
+static tk_texpr_result type_path_expr(tk_path_expr pe, tk_type_table table, tk_str ref_ns) {
     tk_path p = pe.path;
     if (p.len < 2) return xerr("a path expression must name an enum or flags member (`Type::Member`)");
     tk_str member = p.segments[p.len - 1].name;
     tk_path type_path = { .segments = p.segments, .len = p.len - 1 };   // the type = path minus the member
-    tk_type_result et = resolve_named(type_path, table);
+    tk_type_result et = resolve_named(type_path, table, ref_ns);   // (#109 W1) ref_ns = the expression's enclosing namespace
     if (!et.ok) return xferr(et.as.error);
     if (et.as.value.tag != TK_TYPE_NAMED) return xerr("`Type::Member` requires a named enum or flags type");
-    tk_decl_result decl = tk_type_table_find(table, et.as.value.as.named.name);
+    tk_decl_result decl = tk_type_table_find(table, et.as.value.as.named.name, (tk_str){0});   // (#109 W1) follow-up lookup of a resolved name — no referencing ns
     if (!decl.ok) return xerr("unknown type in a `Type::Member` path");
     if (decl.as.value.body.tag == TK_BODY_ENUM) {
         tk_enum_body eb = decl.as.value.body.as.enum_body;
         for (size_t i = 0; i < eb.n_members; i += 1)
             if (tk_str_eq(eb.members[i], member))
                 return xok((tk_texpr){ .tag = TK_TEXPR_PATH, .type = et.as.value,
-                                       .as.path = { et.as.value.as.named.name, member, (uint64_t)i } });
+                                       .as.path = { et.as.value.as.named.name, member, (uint64_t)i,
+                                                    (unsigned __int128)i } });   // (#50) enum member VALUE = its ordinal
         return xerr("no such member in the enum");
     }
     if (decl.as.value.body.tag == TK_BODY_FLAGS) {
@@ -1513,7 +1912,8 @@ static tk_texpr_result type_path_expr(tk_path_expr pe, tk_type_table table) {
         for (size_t i = 0; i < fb.n_members; i += 1)
             if (tk_str_eq(fb.members[i], member))
                 return xok((tk_texpr){ .tag = TK_TEXPR_PATH, .type = et.as.value,
-                                       .as.path = { et.as.value.as.named.name, member, (uint64_t)i } });
+                                       .as.path = { et.as.value.as.named.name, member, (uint64_t)i,
+                                                    ((unsigned __int128)1) << i } });   // (#50) flags member VALUE = 1 << ordinal (power-of-2)
         return xerr("no such member in the flags type");
     }
     return xerr("`Type::Member` requires an `enum` or `flags` type");
@@ -1559,7 +1959,8 @@ static tk_texpr_result type_dispatch(tk_expr e, tk_env env, tk_type_table table)
         case TK_EXPR_IF:     return type_if(e.as.if_expr, env, table);
         case TK_EXPR_MATCH:  return type_match(e.as.match_expr, env, table);
         case TK_EXPR_FIELD_ACCESS: return type_field_access(e.as.field_access, env, table);
-        case TK_EXPR_SAFE_FIELD_ACCESS: return type_safe_field_access(e.as.safe_field_access, env, table);
+        case TK_EXPR_SAFE_FIELD_ACCESS: return type_safe_field_access(e.as.safe_field_access, e.line, e.col, env, table);
+        case TK_EXPR_SAFE_METHOD_CALL:  return type_safe_method_call(e.as.safe_method_call, e.line, e.col, env, table);   // (NP-OOP, issue #116)
         case TK_EXPR_COALESCE:     return type_coalesce(e.as.coalesce, env, table);
         case TK_EXPR_CAST:         return type_cast(e.as.cast, env, table);
         case TK_EXPR_METHOD_CALL:  {
@@ -1573,7 +1974,7 @@ static tk_texpr_result type_dispatch(tk_expr e, tk_env env, tk_type_table table)
             }
             return type_method_call(mc, env, table);
         }
-        case TK_EXPR_PATH:         return type_path_expr(e.as.path, table);   // Enum::Member as a value
+        case TK_EXPR_PATH:         return type_path_expr(e.as.path, table, env.cur_ns);   // Enum::Member as a value   (#109 W1) ref_ns = the enclosing namespace
         case TK_EXPR_STRUCT_LIT:   return tk_type_struct_lit(e.as.struct_lit, (tk_type){ .tag = TK_TYPE_VOID }, env, table);   // W4a (no expected in expr position)
         case TK_EXPR_INDEX:        return type_index(e.as.index, env, table);            // W5-idx
         case TK_EXPR_INTERP:       return type_interp(e.as.interp, env, table);          // $"…{expr}…"
@@ -1727,7 +2128,7 @@ static tk_texpr_result type_match(tk_match_expr m, tk_env env, tk_type_table tab
         if (!have_type) { first = t; have_type = true; }
         else if (!tk_type_join(first, t, table, &first)) return xerr("the `match` arms have different types");   // widen (a case joins into its variant)
     }
-    if (!tk_exhaustive(m.arms, m.narms, s.as.value.type, table)) return xerr("non-exhaustive `match` (cover all cases or add `_`)");
+    if (!tk_exhaustive(m.arms, m.narms, s.as.value.type, table, env.cur_ns)) return xerr("non-exhaustive `match` (cover all cases or add `_`)");
     tk_type result = have_type ? first : tk_void_t();   // all arms diverge → void
     return xok((tk_texpr){ .tag = TK_TEXPR_MATCH, .type = result, .as.match_expr = { box(s.as.value), arms.ptr, arms.len } });
 }

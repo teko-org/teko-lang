@@ -1,0 +1,289 @@
+// src/math/math_test.tkt — tests for teko::math (M0 root unit). Covers: constants
+// (sanity bounds), float classification (is_nan/is_inf/is_finite/is_normal), abs/sign/
+// copysign, min/max/clamp (i64 + f64 families), and the checked integer helpers
+// gcd/lcm/isqrt/ipow (including their documented error edges). Pure Teko, VM-runnable
+// (no `extern`, no libm) — every case here gates BOTH engines.
+
+// --- helpers (not tests): unwrap a `T | error` for the happy-path assertions; the
+// error-path tests call the function directly and match on `error` instead. ---
+
+fn unwrap_i64(r: i64 | error) -> i64 {
+    match r {
+        i64 as v => v
+        error    => { teko::assert::is_true(false); 0 }
+    }
+}
+
+fn unwrap_f64(r: f64 | error) -> f64 {
+    match r {
+        f64 as v => v
+        error    => { teko::assert::is_true(false); 0.0 }
+    }
+}
+
+fn is_err_i64(r: i64 | error) -> bool {
+    match r { i64 => false; error => true }
+}
+
+fn is_err_f64(r: f64 | error) -> bool {
+    match r { f64 => false; error => true }
+}
+
+// --- constants ---
+
+#test
+fn constants_are_in_expected_ranges() {
+    teko::assert::is_true(pi() > 3.14 && pi() < 3.15)
+    teko::assert::is_true(tau() > 6.28 && tau() < 6.29)
+    teko::assert::is_true(e() > 2.71 && e() < 2.72)
+    teko::assert::is_true(sqrt2() > 1.41 && sqrt2() < 1.42)
+    teko::assert::is_true(ln2() > 0.69 && ln2() < 0.70)
+    teko::assert::is_true(ln10() > 2.30 && ln10() < 2.31)
+}
+
+#test
+fn tau_is_twice_pi() {
+    let diff = tau() - 2.0 * pi()
+    teko::assert::is_true(abs_f64(diff) < 0.0000000001)
+}
+
+// --- float classification ---
+
+#test
+fn nan_is_classified_correctly() {
+    teko::assert::is_true(is_nan(nan()))
+    teko::assert::is_false(is_inf(nan()))
+    teko::assert::is_false(is_finite(nan()))
+    teko::assert::is_false(is_normal(nan()))
+}
+
+#test
+fn inf_is_classified_correctly() {
+    teko::assert::is_true(is_inf(inf()))
+    teko::assert::is_true(is_inf(-inf()))
+    teko::assert::is_false(is_nan(inf()))
+    teko::assert::is_false(is_finite(inf()))
+    teko::assert::is_false(is_normal(inf()))
+}
+
+#test
+fn ordinary_values_are_finite_and_normal() {
+    teko::assert::is_true(is_finite(1.0))
+    teko::assert::is_true(is_normal(1.0))
+    teko::assert::is_false(is_nan(1.0))
+    teko::assert::is_false(is_inf(1.0))
+
+    teko::assert::is_true(is_finite(0.0))
+    teko::assert::is_true(is_finite(-42.5))
+    teko::assert::is_true(is_normal(-42.5))
+}
+
+#test
+fn zero_is_finite_but_not_normal() {
+    // 0.0's exponent field is all-zero -> finite (not inf/nan) but NOT "normal"
+    // (normal excludes zero/subnormal, per the IEEE-754 classification used here).
+    teko::assert::is_true(is_finite(0.0))
+    teko::assert::is_false(is_normal(0.0))
+}
+
+// --- abs / sign / copysign ---
+
+#test
+fn abs_i64_happy_path() {
+    teko::assert::is_true(unwrap_i64(abs_i64(5)) == 5)
+    teko::assert::is_true(unwrap_i64(abs_i64(-5)) == 5)
+    teko::assert::is_true(unwrap_i64(abs_i64(0)) == 0)
+}
+
+#test
+fn abs_i64_min_is_a_checked_error() {
+    // i64::MIN has no positive two's-complement counterpart — must error, not wrap.
+    teko::assert::is_true(is_err_i64(abs_i64(-9223372036854775807 - 1)))
+}
+
+#test
+fn abs_f64_handles_negatives_and_nan() {
+    teko::assert::is_true(abs_f64(-3.5) == 3.5)
+    teko::assert::is_true(abs_f64(3.5) == 3.5)
+    teko::assert::is_true(abs_f64(0.0) == 0.0)
+    teko::assert::is_true(is_nan(abs_f64(nan())))
+}
+
+#test
+fn abs_f64_clears_the_sign_of_negative_zero() {
+    // BIT-EXACT: abs_f64(-0.0) must be +0.0 (all-zero bits), not -0.0 (sign bit set).
+    // `-0.0 == 0.0` is TRUE per IEEE-754, so a value comparison cannot catch this —
+    // the assertion goes to the bit pattern. Two -0.0 sources: the negation expression
+    // AND an exact bit-pattern construction (guards against any front-end folding of
+    // the literal `-0.0`).
+    teko::assert::is_true(teko::f64_bits(abs_f64(-0.0)) == 0)
+    teko::assert::is_true(teko::f64_bits(abs_f64(teko::f64_from_bits(0x8000000000000000))) == 0)
+    // -inf: sign cleared, still +inf.
+    teko::assert::is_true(abs_f64(-inf()) == inf())
+}
+
+#test
+fn sign_i64_covers_all_three_cases() {
+    teko::assert::is_true(sign_i64(42) == 1)
+    teko::assert::is_true(sign_i64(-42) == -1)
+    teko::assert::is_true(sign_i64(0) == 0)
+}
+
+#test
+fn sign_f64_covers_all_three_cases() {
+    teko::assert::is_true(sign_f64(3.5) == 1.0)
+    teko::assert::is_true(sign_f64(-3.5) == -1.0)
+    teko::assert::is_true(sign_f64(0.0) == 0.0)
+    teko::assert::is_true(is_nan(sign_f64(nan())))
+}
+
+#test
+fn copysign_transfers_the_sign_bit() {
+    teko::assert::is_true(copysign_f64(3.0, -1.0) == -3.0)
+    teko::assert::is_true(copysign_f64(-3.0, -1.0) == -3.0)
+    teko::assert::is_true(copysign_f64(3.0, 1.0) == 3.0)
+    teko::assert::is_true(copysign_f64(-3.0, 1.0) == 3.0)
+}
+
+// --- min / max / clamp ---
+
+#test
+fn min_max_i64() {
+    teko::assert::is_true(min_i64(3, 7) == 3)
+    teko::assert::is_true(min_i64(7, 3) == 3)
+    teko::assert::is_true(max_i64(3, 7) == 7)
+    teko::assert::is_true(max_i64(7, 3) == 7)
+    teko::assert::is_true(min_i64(-5, -1) == -5)
+    teko::assert::is_true(max_i64(-5, -1) == -1)
+}
+
+#test
+fn min_max_f64() {
+    teko::assert::is_true(min_f64(3.5, 7.5) == 3.5)
+    teko::assert::is_true(max_f64(3.5, 7.5) == 7.5)
+}
+
+#test
+fn min_max_f64_avoid_nan_when_possible() {
+    // NaN-avoiding semantics: if exactly one operand is NaN, the OTHER wins.
+    teko::assert::is_true(min_f64(nan(), 5.0) == 5.0)
+    teko::assert::is_true(min_f64(5.0, nan()) == 5.0)
+    teko::assert::is_true(max_f64(nan(), 5.0) == 5.0)
+    teko::assert::is_true(max_f64(5.0, nan()) == 5.0)
+}
+
+#test
+fn clamp_i64_within_and_outside_range() {
+    teko::assert::is_true(unwrap_i64(clamp_i64(5, 0, 10)) == 5)
+    teko::assert::is_true(unwrap_i64(clamp_i64(-5, 0, 10)) == 0)
+    teko::assert::is_true(unwrap_i64(clamp_i64(50, 0, 10)) == 10)
+}
+
+#test
+fn clamp_i64_inverted_range_is_an_error() {
+    teko::assert::is_true(is_err_i64(clamp_i64(5, 10, 0)))
+}
+
+#test
+fn clamp_f64_within_and_outside_range() {
+    teko::assert::is_true(unwrap_f64(clamp_f64(5.0, 0.0, 10.0)) == 5.0)
+    teko::assert::is_true(unwrap_f64(clamp_f64(-5.0, 0.0, 10.0)) == 0.0)
+    teko::assert::is_true(unwrap_f64(clamp_f64(50.0, 0.0, 10.0)) == 10.0)
+}
+
+#test
+fn clamp_f64_inverted_range_is_an_error() {
+    teko::assert::is_true(is_err_f64(clamp_f64(5.0, 10.0, 0.0)))
+}
+
+// --- gcd / lcm ---
+
+#test
+fn gcd_basic_cases() {
+    teko::assert::is_true(unwrap_i64(gcd(12, 18)) == 6)
+    teko::assert::is_true(unwrap_i64(gcd(17, 5)) == 1)     // coprime
+    teko::assert::is_true(unwrap_i64(gcd(0, 5)) == 5)
+    teko::assert::is_true(unwrap_i64(gcd(0, 0)) == 0)
+}
+
+#test
+fn gcd_rejects_negative_operands() {
+    teko::assert::is_true(is_err_i64(gcd(-4, 6)))
+    teko::assert::is_true(is_err_i64(gcd(4, -6)))
+}
+
+#test
+fn lcm_basic_cases() {
+    teko::assert::is_true(unwrap_i64(lcm(4, 6)) == 12)
+    teko::assert::is_true(unwrap_i64(lcm(21, 6)) == 42)
+    teko::assert::is_true(unwrap_i64(lcm(5, 5)) == 5)
+}
+
+#test
+fn lcm_rejects_zero_and_negative_operands() {
+    teko::assert::is_true(is_err_i64(lcm(0, 5)))
+    teko::assert::is_true(is_err_i64(lcm(5, 0)))
+    teko::assert::is_true(is_err_i64(lcm(-4, 6)))
+}
+
+// --- isqrt ---
+
+#test
+fn isqrt_perfect_squares() {
+    teko::assert::is_true(unwrap_i64(isqrt(0)) == 0)
+    teko::assert::is_true(unwrap_i64(isqrt(1)) == 1)
+    teko::assert::is_true(unwrap_i64(isqrt(4)) == 2)
+    teko::assert::is_true(unwrap_i64(isqrt(144)) == 12)
+    teko::assert::is_true(unwrap_i64(isqrt(1000000)) == 1000)
+}
+
+#test
+fn isqrt_floors_non_perfect_squares() {
+    teko::assert::is_true(unwrap_i64(isqrt(2)) == 1)
+    teko::assert::is_true(unwrap_i64(isqrt(3)) == 1)       // covers the n < 4 early return
+    teko::assert::is_true(unwrap_i64(isqrt(15)) == 3)      // floor(sqrt(15)) = 3
+    teko::assert::is_true(unwrap_i64(isqrt(99)) == 9)      // floor(sqrt(99)) = 9
+    teko::assert::is_true(unwrap_i64(isqrt(101)) == 10)    // floor(sqrt(101)) = 10
+}
+
+#test
+fn isqrt_survives_the_top_of_the_i64_range() {
+    // Regression: the old initial guess `(n + 1) / 2` wrapped `n + 1` at n = i64::MAX,
+    // silently corrupting the whole Newton iteration (returned a NEGATIVE number).
+    // floor(sqrt(2^63 - 1)) = 3037000499.
+    teko::assert::is_true(unwrap_i64(isqrt(9223372036854775807)) == 3037000499)
+    // The exact perfect-square boundary just below i64::MAX: 3037000499^2.
+    teko::assert::is_true(unwrap_i64(isqrt(9223372030926249001)) == 3037000499)
+    // One below the perfect square floors down.
+    teko::assert::is_true(unwrap_i64(isqrt(9223372030926249000)) == 3037000498)
+}
+
+#test
+fn isqrt_rejects_negative_input() {
+    teko::assert::is_true(is_err_i64(isqrt(-1)))
+}
+
+// --- ipow ---
+
+#test
+fn ipow_basic_cases() {
+    teko::assert::is_true(unwrap_i64(ipow(2, 10)) == 1024)
+    teko::assert::is_true(unwrap_i64(ipow(3, 0)) == 1)      // x^0 == 1
+    teko::assert::is_true(unwrap_i64(ipow(0, 0)) == 1)      // 0^0 == 1 by convention here
+    teko::assert::is_true(unwrap_i64(ipow(5, 1)) == 5)
+    teko::assert::is_true(unwrap_i64(ipow(-2, 3)) == -8)
+    teko::assert::is_true(unwrap_i64(ipow(-2, 2)) == 4)
+}
+
+#test
+fn ipow_rejects_negative_exponent() {
+    teko::assert::is_true(is_err_i64(ipow(2, -1)))
+}
+
+#test
+fn ipow_detects_overflow() {
+    // 2^63 overflows i64 (max is 2^63 - 1).
+    teko::assert::is_true(is_err_i64(ipow(2, 63)))
+    // A large base to a modest power also overflows.
+    teko::assert::is_true(is_err_i64(ipow(1000000000000, 3)))
+}

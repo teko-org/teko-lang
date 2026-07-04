@@ -54,23 +54,26 @@ fn parse_statement(tokens: []lexer::Token, pos: u64) -> Parsed<Statement> | erro
     if is_kind_at(tokens, pos, lexer::TokenKind::Ident) && is_assign_op(tokens, pos + 1) {
         return parse_assign(tokens, pos)
     }
-    // (MEM-1b-ii) `r.value op= x` — assign THROUGH a reference: `name . value <assign-op>`. The ONLY
-    // field-assignment target in value-functional Teko (a mutation goes through a `Ref<T>`). Matched
-    // before the expr-statement fallback; `.value` is the only assignable reference field.
-    if is_kind_at(tokens, pos, lexer::TokenKind::Ident) &&
-       is_kind_at(tokens, pos + 1, lexer::TokenKind::Dot) &&
-       is_name_at(tokens, pos + 2) && tokens[pos + 2].text == "value" &&
-       is_assign_op(tokens, pos + 3) {
-        return parse_ref_assign(tokens, pos)
-    }
     // `i++` / `i--` — postfix increment/decrement STATEMENT sugar: desugar to the compound
     // assignment `i += 1` / `i -= 1` (reuses assign typing/codegen/VM; mut-guard included).
     if is_kind_at(tokens, pos, lexer::TokenKind::Ident) &&
        (is_kind_at(tokens, pos + 1, lexer::TokenKind::PlusPlus) || is_kind_at(tokens, pos + 1, lexer::TokenKind::MinusMinus)) {
         let op = if is_kind_at(tokens, pos + 1, lexer::TokenKind::PlusPlus) { lexer::TokenKind::PlusEq } else { lexer::TokenKind::MinusEq }
-        return Parsed<Statement> { node = Assign { name = tokens[pos].text; op = op; value = Expr { kind = Number { is_float = false; value = 1; fval = 0.0 }; line = 0; col = 0 }; deref = false }; next = pos + 2 }   // (C1-POS) synthesized `1` for the `i++`/`i--` desugar — not stamped in the C twin (position unknown, 0)
+        return Parsed<Statement> { node = Assign { kind = AssignKind::Simple; name = tokens[pos].text; op = op; value = Expr { kind = Number { is_float = false; value = 1; fval = 0.0 }; line = 0; col = 0 }; deref = false; target = no_expr() }; next = pos + 2 }   // (C1-POS) synthesized `1` for the `i++`/`i--` desugar — not stamped in the C twin (position unknown, 0)
     }
+    // (#88) a general FIELD/deref-assign target: parse a full postfix EXPRESSION, then — if it is a
+    // field-access path (`recv.field`, possibly nested / indexed) AND an assign-op follows — treat it as
+    // an assignment target. Subsumes the old hardcoded `name.value op= …` (MEM-1b-ii) shape: the TYPER
+    // decides Ref-deref (`r.value` on a `Ref<T>`) vs a struct/class field write from the receiver TYPE.
+    // A field-access with NO assign-op, and any non-field expr (e.g. `obj.m()`), fall through to the
+    // expr-statement below UNCHANGED — method-call statements are never swallowed.
     let e = match parse_expr(tokens, pos) { Parsed<Expr> as x => x; error as e => return e }
+    let is_field = match e.node.kind { FieldAccess as _fa => true; _ => false }
+    if is_field && is_assign_op(tokens, e.next) {
+        let op = kind_at(tokens, e.next)
+        let v = match parse_expr(tokens, e.next + 1) { Parsed<Expr> as x => x; error as er => return er }
+        return Parsed<Statement> { node = Assign { kind = AssignKind::Field; name = ""; op = op; value = v.node; deref = false; target = e.node }; next = v.next }
+    }
     Parsed<Statement> { node = ExprStmt { expr = e.node }; next = e.next }
 }
 
@@ -152,17 +155,7 @@ fn parse_assign(tokens: []lexer::Token, pos: u64) -> Parsed<Statement> | error {
     let name = tokens[pos].text
     let op = kind_at(tokens, pos + 1)
     let v = match parse_expr(tokens, pos + 2) { Parsed<Expr> as x => x; error as e => return e }
-    Parsed<Statement> { node = Assign { name = name; op = op; value = v.node; deref = false }; next = v.next }
-}
-
-// (MEM-1b-ii) `name.value op= value` — write THROUGH a reference. `pos` is at the ref name; tokens
-// are `name . value <assign-op> value` (the `.value` shape was matched at dispatch). The ref handle
-// itself need not be `mut` (the checker verifies it is a `Ref<T>`; the ref grants write to its target).
-fn parse_ref_assign(tokens: []lexer::Token, pos: u64) -> Parsed<Statement> | error {
-    let name = tokens[pos].text
-    let op = kind_at(tokens, pos + 3)   // the assign op AFTER `.value`
-    let v = match parse_expr(tokens, pos + 4) { Parsed<Expr> as x => x; error as e => return e }
-    Parsed<Statement> { node = Assign { name = name; op = op; value = v.node; deref = true }; next = v.next }
+    Parsed<Statement> { node = Assign { kind = AssignKind::Simple; name = name; op = op; value = v.node; deref = false; target = no_expr() }; next = v.next }
 }
 
 // (added to parse_statement, P4d; labels — M.5)

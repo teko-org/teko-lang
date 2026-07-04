@@ -81,7 +81,7 @@ static tk_texpr_result type_match_stmt(tk_match_expr m, tk_env env, tk_type_tabl
         tk_tarm_result ai = tk_type_arm(m.arms[i], s.as.value.type, env, table); if (!ai.ok) return xferr(ai.as.error);
         arms = tk_tarm_list_push(arms, ai.as.value);
     }
-    if (!tk_exhaustive(m.arms, m.narms, s.as.value.type, table)) return xerr("non-exhaustive `match` (cover all cases or add `_`)");
+    if (!tk_exhaustive(m.arms, m.narms, s.as.value.type, table, env.cur_ns)) return xerr("non-exhaustive `match` (cover all cases or add `_`)");
     return xok((tk_texpr){ .tag = TK_TEXPR_MATCH, .type = void_t(), .as.match_expr = { box(s.as.value), arms.ptr, arms.len } });
 }
 
@@ -97,7 +97,7 @@ static tk_typed_stmt_result type_binding(tk_binding b, tk_env env, tk_type_table
     // `Box { … }` under `: Box<i64>` targets the concrete instance (annotation-driven).
     tk_texpr_result v;
     if (b.has_type) {
-        tk_type_result at = tk_resolve_type(b.type_ann, table); if (!at.ok) return sfail(at.as.error);
+        tk_type_result at = tk_resolve_type(b.type_ann, table, env.cur_ns); if (!at.ok) return sfail(at.as.error);   // (#109 W1) ref_ns = the binding's enclosing namespace
         v = tk_type_value_expected(b.value, at.as.value, env, table);
     } else {
         v = tk_typer_expr(b.value, env, table);
@@ -106,12 +106,20 @@ static tk_typed_stmt_result type_binding(tk_binding b, tk_env env, tk_type_table
     tk_type bound = v.as.value.type;
     if (tk_type_is_void(&bound)) return smsg("cannot bind a `void` expression — it yields no value (M.1)");
     if (b.has_type) {
-        tk_type_result a = tk_resolve_type(b.type_ann, table); if (!a.ok) return sfail(a.as.error);
+        tk_type_result a = tk_resolve_type(b.type_ann, table, env.cur_ns); if (!a.ok) return sfail(a.as.error);   // (#109 W1) ref_ns = the binding's enclosing namespace
         if (!assignable_to(v.as.value.type, a.as.value, table)) {   // B.14 widening (case → variant) OR C6: a fitting literal adopts T (leaf stays i64)
             const char *why = annotated_literal_reason(b.value, a.as.value);
             if (why != NULL)   // (C1.8) expected = the annotation, actual = the bound value's type
                 return sfail(tk_error_types(tk_error_make(why),
                                             tk_type_render(a.as.value), tk_type_render(v.as.value.type)));
+            // a fitting bare-literal (plain-scalar) initializer ADOPTS the declared narrow type —
+            // retype the leaf itself (same mechanism as the arg/struct-field/negative-literal
+            // adoption sites: tk_literal_adopts + retype), so codegen/VM see the narrow width
+            // (e.g. `mut y: u8 = 1` stores/shifts at width 8, not the literal's native i64).
+            // (#71) tk_retype_literal RECURSES into an array literal's elements (`[]u8 = [1,2,3]`
+            // narrows each leaf, not just the array's own type) — a plain leaf still takes the
+            // annotation wholesale, unchanged from before.
+            tk_retype_literal(&v.as.value, a.as.value);
         }
         bound = a.as.value;
         // (#4) annotation-directed element type: a sentinel empty list/array (`teko::list::empty()`
@@ -139,7 +147,89 @@ static tk_typed_stmt_result type_binding(tk_binding b, tk_env env, tk_type_table
     return sok(node, env);   // [destructuring binding: refinement]
 }
 
+// (#88) the ROOT variable of a field-access lvalue chain (`a.b.c` → `a`). Returns the `Var` name and
+// whether the whole chain is reachable from a plain-variable root (not an index / call / literal). A
+// non-Var root (e.g. `f().x`) has no binding to check for mutability — reachable=false.
+typedef struct { bool reachable; tk_str name; } tk_lvalue_root;
+static tk_lvalue_root lvalue_root(const tk_expr *e) {
+    if (e->tag == TK_EXPR_VAR)          return (tk_lvalue_root){ true, e->as.var.name };
+    if (e->tag == TK_EXPR_FIELD_ACCESS) return lvalue_root(e->as.field_access.receiver);
+    return (tk_lvalue_root){ false, (tk_str){ NULL, 0 } };
+}
+
+// (#88) a FIELD-target assignment `recv.field op= value`. The parser routes EVERY `recv.field = …`
+// here; this branch decides Ref-deref (`r.value` on a `Ref<T>` — the legacy MEM-1b-ii path, preserved
+// bit-for-bit) vs a struct/class field WRITE, enforcing write-visibility == read-visibility (the RULING).
+static tk_typed_stmt_result type_field_assign(tk_assign a, tk_env env, tk_type_table table) {
+    // Type the LHS field-access EXPR. This resolves the receiver + field type AND enforces read-side
+    // visibility (a private class field written externally is rejected here with the SAME "field is
+    // private to its declaring class" diagnostic a read would raise — write-permission == read-permission).
+    tk_texpr_result lhs = tk_typer_expr(*a.target, env, table); if (!lhs.ok) return sfail(lhs.as.error);
+    if (lhs.as.value.tag != TK_TEXPR_FIELD_ACCESS)
+        return smsg("assignment target is not a field access (internal: parser guarantees a field LHS)");
+    const tk_expr *recv_expr = a.target->as.field_access.receiver;
+    tk_texpr_result recv = tk_typer_expr(*recv_expr, env, table); if (!recv.ok) return sfail(recv.as.error);
+    tk_type rt = recv.as.value.type;
+    tk_type field_t = lhs.as.value.type;
+
+    // (MEM-1b-ii, preserved) `r.value op= x` on a `Ref<T>` — write THROUGH the reference. Detected from
+    // the RECEIVER TYPE (not a parser hardcode): a `Ref<T>` receiver + field `value`. The handle need NOT
+    // be `mut` (a `Ref<T>` is a const handle granting WRITE to its mutable target — R2). Emit the SAME
+    // deref-shaped TAssign (kind=REF_DEREF, name=the ref handle) the old parser produced, so all
+    // downstream passes / the TKB layout are byte-identical for existing Ref writes.
+    if (rt.tag == TK_TYPE_REF && tk_str_eq(a.target->as.field_access.field, (tk_str){ (const tk_byte *)"value", 5 })) {
+        if (recv_expr->tag != TK_EXPR_VAR)
+            return smsg("`.value` deref-assignment requires a bare `Ref<T>` handle on the left");
+        tk_str ref_name = recv_expr->as.var.name;
+        tk_type inner = *rt.as.ref.inner;
+        tk_texpr_result dv = tk_typer_expr(a.value, env, table); if (!dv.ok) return sfail(dv.as.error);
+        if (!assignable_to(dv.as.value.type, inner, table)) {
+            if (!tk_literal_adopts(dv.as.value, inner))
+                return sfail(tk_error_types(tk_error_make("assigned value does not match the referenced type"),
+                                            tk_type_render(inner), tk_type_render(dv.as.value.type)));
+            dv.as.value.type = inner;
+        }
+        tk_tstatement dn = { .tag = TK_TSTMT_ASSIGN, .as.assign = { .kind = TK_ASSIGN_REF_DEREF, .name = ref_name, .op = a.op, .bound = inner, .value = dv.as.value, .deref = true, .target = NULL } };
+        return sok(dn, env);
+    }
+
+    // A struct/class FIELD write. Structs are VALUE types → the write mutates the receiver in place, so
+    // the receiver must be a MUTABLE lvalue: its root variable must be a `mut` binding (the RULING —
+    // "structs: `obj.f = v` allowed wherever `obj` is a `mut` binding"). Classes are REFERENCE types (the
+    // value is a pointer; mutation flows through it — like a `Ref<T>`), so the handle need not be `mut`.
+    bool recv_is_class = rt.tag == TK_TYPE_NAMED && tk_find_class_body(rt.as.named.name, table).ok;
+    if (!recv_is_class) {
+        tk_lvalue_root root = lvalue_root(recv_expr);
+        if (!root.reachable)
+            return smsg("cannot assign to a field of a temporary value — the receiver is not a mutable variable");
+        tk_binding_result rb = tk_env_lookup_binding(env, root.name); if (!rb.ok) return sfail(rb.as.error);
+        if (!rb.as.value.is_mut)
+            return smsg("cannot assign to a field of an immutable binding — declare it `mut` (B.21)");
+    }
+
+    // Type-check the RHS against the FIELD type (same widen/adopt rule as a simple assign / binding).
+    tk_texpr_result v = tk_typer_expr(a.value, env, table); if (!v.ok) return sfail(v.as.error);
+    // (MEM Step 0, R5) ESCAPE GATE — a field write may not move a reference into a field either.
+    if (tk_type_contains_ref(&field_t) || tk_type_contains_ref(&v.as.value.type))
+        return smsg("a reference cannot be stored in a field (parameter-only in this version)");
+    if (!assignable_to(v.as.value.type, field_t, table)) {
+        if (!tk_literal_adopts(v.as.value, field_t))
+            return sfail(tk_error_types(tk_error_make("assigned value does not match the field type"),
+                                        tk_type_render(field_t), tk_type_render(v.as.value.type)));
+        tk_retype_literal(&v.as.value, field_t);
+    }
+    if (v.as.value.type.tag == TK_TYPE_SLICE && v.as.value.type.as.slice.element == NULL
+        && field_t.tag == TK_TYPE_SLICE && field_t.as.slice.element != NULL)
+        v.as.value.type = field_t;
+    tk_texpr *lhs_boxed = box(lhs.as.value);
+    tk_tstatement node = { .tag = TK_TSTMT_ASSIGN, .as.assign = { .kind = TK_ASSIGN_FIELD, .name = { NULL, 0 }, .op = a.op, .bound = field_t, .value = v.as.value, .deref = false, .target = lhs_boxed } };
+    return sok(node, env);
+}
+
 static tk_typed_stmt_result type_assign(tk_assign a, tk_env env, tk_type_table table) {
+    // (#88) a FIELD target (`recv.field = …`) — Ref-deref vs struct/class field write, decided by the
+    // receiver TYPE (type_field_assign). The simple-name path below is unchanged.
+    if (a.kind == TK_ASSIGN_FIELD) return type_field_assign(a, env, table);
     tk_binding_result tb = tk_env_lookup_binding(env, a.name); if (!tb.ok) return sfail(tb.as.error);
     // (MEM-1b-ii) `r.value op= x` — write THROUGH a reference. The handle `r` need NOT be `mut` (a
     // `Ref<T>` is a const handle granting WRITE to its mutable target — R2); the type written is T.
@@ -154,7 +244,7 @@ static tk_typed_stmt_result type_assign(tk_assign a, tk_env env, tk_type_table t
                                             tk_type_render(inner), tk_type_render(dv.as.value.type)));
             dv.as.value.type = inner;   // a fitting literal adopts T
         }
-        tk_tstatement dn = { .tag = TK_TSTMT_ASSIGN, .as.assign = { a.name, a.op, inner, dv.as.value, true } };
+        tk_tstatement dn = { .tag = TK_TSTMT_ASSIGN, .as.assign = { .kind = TK_ASSIGN_REF_DEREF, .name = a.name, .op = a.op, .bound = inner, .value = dv.as.value, .deref = true, .target = NULL } };
         return sok(dn, env);
     }
     if (!tb.as.value.is_mut) return smsg("cannot assign to immutable binding — declare it `mut` (B.21)");
@@ -172,6 +262,11 @@ static tk_typed_stmt_result type_assign(tk_assign a, tk_env env, tk_type_table t
         if (!tk_literal_adopts(v.as.value, target))   // (C1.8) expected = target, actual = value
             return sfail(tk_error_types(tk_error_make("assigned value does not match the target type"),
                                         tk_type_render(target), tk_type_render(v.as.value.type)));
+        // a fitting bare-literal (plain-scalar) RHS ADOPTS the target's narrow type — retype the leaf
+        // itself (mirrors type_binding's identical adoption above / the arg/struct-field sites), so a
+        // plain `y = 200` on a `u8` slot stores/re-widths at 8 bits, not the literal's native i64.
+        // (#71) tk_retype_literal recurses into an array literal's elements — see type_binding.
+        tk_retype_literal(&v.as.value, target);
     }
     // (#4) a sentinel empty list/array ADOPTS the target's concrete slice type so codegen sees the
     // element. OTHERWISE keep the value's NATURAL (case / T) type and store the target as `bound` —
@@ -181,7 +276,7 @@ static tk_typed_stmt_result type_assign(tk_assign a, tk_env env, tk_type_table t
     if (v.as.value.type.tag == TK_TYPE_SLICE && v.as.value.type.as.slice.element == NULL
         && target.tag == TK_TYPE_SLICE && target.as.slice.element != NULL)
         v.as.value.type = target;
-    tk_tstatement node = { .tag = TK_TSTMT_ASSIGN, .as.assign = { a.name, a.op, target, v.as.value, false } };
+    tk_tstatement node = { .tag = TK_TSTMT_ASSIGN, .as.assign = { .kind = TK_ASSIGN_SIMPLE, .name = a.name, .op = a.op, .bound = target, .value = v.as.value, .deref = false, .target = NULL } };
     return sok(node, env);   // mut rule enforced (B.21)
 }
 
@@ -238,9 +333,10 @@ tk_typed_stmt_result tk_type_statement(tk_statement s, tk_env env, tk_type_table
 }
 
 // ---- items + program ----
-static tk_type function_return(tk_function f, tk_type_table table) {
+// (#109 W1) `ref_ns` = the function's declaring namespace; unused until W2's R0-R5 rules.
+static tk_type function_return(tk_function f, tk_type_table table, tk_str ref_ns) {
     if (!f.has_return) return void_t();    // no `-> ret` ⇒ returns no value (M.3 — void)
-    tk_type_result r = tk_resolve_type(f.return_type, table);
+    tk_type_result r = tk_resolve_type(f.return_type, table, ref_ns);
     return r.ok ? r.as.value : void_t();   // collect validated signatures; a bad annotation surfaces there
 }
 
@@ -381,7 +477,7 @@ static bool extern_type_ok(tk_type t, tk_type_table table) {
     if (t.tag == TK_TYPE_PRIM || t.tag == TK_TYPE_BYTE
         || t.tag == TK_TYPE_PTR  || t.tag == TK_TYPE_UPTR) return true;
     if (t.tag == TK_TYPE_NAMED) {
-        tk_decl_result d = tk_type_table_find(table, t.as.named.name);
+        tk_decl_result d = tk_type_table_find(table, t.as.named.name, (tk_str){0});   // (#109 W1) extern-kind probe on a resolved name — no referencing ns
         return d.ok && d.as.value.body.tag == TK_BODY_EXTERN;
     }
     return false;
@@ -402,10 +498,10 @@ static bool teko_rt_type_ok(tk_type t) {
 
 tk_tfunction_result tk_type_function(tk_function f, tk_env env, tk_type_table table) {
     tk_env local = env;
-    tk_type_table tbl = tk_type_param_table(f.type_params, f.n_type_params, (tk_str){0}, table);   // (S4) opaque type-params in scope
+    tk_type_table tbl = tk_type_param_table(f.type_params, f.n_type_params, f.type_constraints, (tk_str){0}, table);   // (S4) opaque type-params in scope
     bool is_teko_rt = f.is_extern && str_eq(f.from_lib, "teko_rt");   // C7.2: bypass for Teko's own runtime
     for (size_t i = 0; i < f.nparams; i += 1) {           // params immutable (B.21)
-        tk_type_result pt = tk_resolve_type(f.params[i].type_ann, tbl);
+        tk_type_result pt = tk_resolve_type(f.params[i].type_ann, tbl, env.cur_ns);   // (#109 W1) ref_ns = the fn's enclosing namespace
         if (!pt.ok) return (tk_tfunction_result){ .ok = false, .as.error = pt.as.error };
         if (f.is_extern && !is_teko_rt && !extern_type_ok(pt.as.value, table)) {
             return (tk_tfunction_result){ .ok = false, .as.error = tk_error_make("an `extern` function parameter must be a primitive (int/float/bool), `byte`, `ptr`, `uptr`, or an `extern type` handle (C7.1a)") };
@@ -415,7 +511,7 @@ tk_tfunction_result tk_type_function(tk_function f, tk_env env, tk_type_table ta
         }
         local = tk_env_define(local, f.params[i].name, pt.as.value, false);
     }
-    tk_type ret = function_return(f, tbl);
+    tk_type ret = function_return(f, tbl, env.cur_ns);   // (#109 W1) ref_ns = the fn's enclosing namespace
     // (MEM Step 0, R3) ESCAPE GATE — a function cannot RETURN a reference (pass-down only): a
     // returned ref would outlive its caller-stack target. References flow only DOWN as params.
     if (ret.tag == TK_TYPE_REF)
@@ -461,7 +557,7 @@ static tk_tfunction_result type_method(tk_function f, tk_str struct_name, tk_env
     // checked against `declaring_class` (see type_struct_methods's own comment on why this can
     // differ from `struct_name`), NOT `struct_name` — set before typing the body below.
     tk_env local = tk_env_with_owner(env, declaring_class);
-    tk_type_table tbl = tk_type_param_table(f.type_params, f.n_type_params, (tk_str){0}, table);
+    tk_type_table tbl = tk_type_param_table(f.type_params, f.n_type_params, f.type_constraints, (tk_str){0}, table);
     bool is_teko_rt = f.is_extern && str_eq(f.from_lib, "teko_rt");
     // (W10b.CLASS) `class Base(parent) { … }` — the NAMED BINDING an instance method uses to
     // reach the base object. Only meaningful for an INSTANCE method (has a receiver); a class's
@@ -481,9 +577,9 @@ static tk_tfunction_result type_method(tk_function f, tk_str struct_name, tk_env
     for (size_t i = 0; i < f.nparams; i += 1) {
         tk_type pt;
         if (!f.params[i].has_type) {
-            pt = (tk_type){ .tag = TK_TYPE_NAMED, .as.named = { struct_name } };
+            pt = (tk_type){ .tag = TK_TYPE_NAMED, .as.named = { tk_qualify(env.cur_ns, struct_name) } };   /* (#109 W3) canonical: the method's own ns qualifies its receiver type */
         } else {
-            tk_type_result ptr = tk_resolve_type(f.params[i].type_ann, tbl);
+            tk_type_result ptr = tk_resolve_type(f.params[i].type_ann, tbl, env.cur_ns);   // (#109 W1) ref_ns = the method's enclosing namespace
             if (!ptr.ok) return (tk_tfunction_result){ .ok = false, .as.error = ptr.as.error };
             pt = ptr.as.value;
         }
@@ -498,8 +594,8 @@ static tk_tfunction_result type_method(tk_function f, tk_str struct_name, tk_env
         local = tk_env_define(local, f.params[i].name, pt, false);
     }
     if (inject_base_binding)
-        local = tk_env_define(local, base_binding_name, (tk_type){ .tag = TK_TYPE_NAMED, .as.named = { base_name } }, false);
-    tk_type ret = function_return(f, tbl);
+        local = tk_env_define(local, base_binding_name, (tk_type){ .tag = TK_TYPE_NAMED, .as.named = { tk_name_qualifier(base_name).len > 0 ? base_name : tk_qualify(env.cur_ns, base_name) } }, false);   /* (#109 W3 / #152) canonical: base_name arrives PRE-QUALIFIED from canon_class_bases (cross-ns exact); a bare (unresolvable/root) one qualifies by the class's own ns */
+    tk_type ret = function_return(f, tbl, env.cur_ns);   // (#109 W1) ref_ns = the fn's enclosing namespace
     if (ret.tag == TK_TYPE_REF)
         return (tk_tfunction_result){ .ok = false, .as.error = tk_error_make("a function cannot return a reference (pass-down only)") };
     if (f.is_extern) {
@@ -523,26 +619,24 @@ static tk_tfunction_result type_method(tk_function f, tk_str struct_name, tk_env
     { tk_str seen[TK_MAX_LABELS]; size_t nseen = 0;
       const char *why = check_labels(tb.as.value.stmts, tb.as.value.n, NULL, false, seen, &nseen);
       if (why) return (tk_tfunction_result){ .ok = false, .as.error = tk_error_make(why) }; }
-    // (W10b.CLASS) PREPEND the base-binding as the method body's FIRST statement (a synthetic
-    // `let <binding> = (<self> to <Base>)` — a plain reinterpret-cast the checker's own `to`
-    // syntax would never allow between two unrelated Named types, but this node bypasses that
-    // source-level restriction entirely; codegen's cast fallback just emits the C pointer cast).
-    // Checked ABOVE (check_returns/check_trailing_value/check_labels all read the ORIGINAL body)
-    // since it changes nothing about return/trailing-value/label semantics.
+    // (W10b.CLASS / #98 Option A) PREPEND the base-binding as the method body's FIRST statement: a
+    // synthetic `let <binding>: <Base> = <self>` — self UPCAST to the base, NOT a reinterpret-cast.
+    // Binding self (the concrete subclass) with the base-typed `bound` lets emit_as build the D3 fat
+    // pointer (data + tk_vt_<Sub>_<Base>) so dispatch through the base-binding works uniformly under
+    // the one-representation model (widens_into now permits the Sub→Base widen). Checked ABOVE
+    // (check_returns/check_trailing_value/check_labels all read the ORIGINAL body) since it changes
+    // nothing about return/trailing-value/label semantics.
     tk_tstatement *body = tb.as.value.stmts;
     size_t nbody = tb.as.value.n;
     if (inject_base_binding) {
-        tk_texpr *self_var = tk_alloc(sizeof *self_var);
-        *self_var = (tk_texpr){ .tag = TK_TEXPR_VAR, .type = (tk_type){ .tag = TK_TYPE_NAMED, .as.named = { struct_name } }, .line = 0, .col = 0 };
-        self_var->as.var = (typeof(self_var->as.var)){ .name = f.params[0].name, .is_func = false, .func_ns = (tk_str){0} };
-        tk_texpr cast_val = { .tag = TK_TEXPR_CAST, .type = (tk_type){ .tag = TK_TYPE_NAMED, .as.named = { base_name } }, .line = 0, .col = 0 };
-        cast_val.as.cast.expr = self_var;
+        tk_texpr self_var = (tk_texpr){ .tag = TK_TEXPR_VAR, .type = (tk_type){ .tag = TK_TYPE_NAMED, .as.named = { tk_qualify(env.cur_ns, struct_name) } }, .line = 0, .col = 0 };   /* (#109 W3) canonical: self's concrete subclass type qualified by the method's ns */
+        self_var.as.var = (typeof(self_var.as.var)){ .name = f.params[0].name, .is_func = false, .func_ns = (tk_str){0} };
         tk_tstatement bind_stmt = { .tag = TK_TSTMT_BINDING };
         bind_stmt.as.binding.kind = TK_BIND_LET;
         bind_stmt.as.binding.target.tag = TK_BIND_SIMPLE;
         bind_stmt.as.binding.target.as.simple.name = base_binding_name;
-        bind_stmt.as.binding.bound = (tk_type){ .tag = TK_TYPE_NAMED, .as.named = { base_name } };
-        bind_stmt.as.binding.value = cast_val;
+        bind_stmt.as.binding.bound = (tk_type){ .tag = TK_TYPE_NAMED, .as.named = { tk_name_qualifier(base_name).len > 0 ? base_name : tk_qualify(env.cur_ns, base_name) } };   /* (#109 W3 / #152) canonical: base_name arrives PRE-QUALIFIED from canon_class_bases; a bare one qualifies by the class's own ns */
+        bind_stmt.as.binding.value = self_var;
         tk_tstatement *new_body = tk_alloc((nbody + 1) * sizeof *new_body);
         new_body[0] = bind_stmt;
         for (size_t i = 0; i < nbody; i += 1) new_body[i + 1] = body[i];
@@ -638,7 +732,14 @@ tk_titem_result tk_type_item(tk_item item, tk_env env, tk_type_table table) {
             tf.as.value.col  = item.as.function.col;
             return (tk_titem_result){ .ok = true, .as.value = { .tag = TK_TITEM_FUNCTION, .as.function = tf.as.value } };
         }
-        case TK_ITEM_TYPE_DECL: return (tk_titem_result){ .ok = true, .as.value = { .tag = TK_TITEM_TYPE_DECL, .as.type_decl = tk_normalize_inst_decl(item.as.type_decl, table) } };   // (W9.4) `Gen<i64>` member refs → bare stamped `Gen__g__i64` (no-op when none)
+        case TK_ITEM_TYPE_DECL: {
+            // (#109 W3) CANONICALIZE the decl name to "ns::Name" (codegen emits a namespace-distinct
+            // typedef matching the canonical Named.name at every USE). A `__g__` instance keeps its bare
+            // globally-unique name. Resolution stays bare-keyed (this mutates the TYPED program only).
+            tk_type_decl td = item.as.type_decl;
+            if (!tk_name_is_g_instance(td.name)) td.name = tk_qualify(item.namespace, td.name);
+            return (tk_titem_result){ .ok = true, .as.value = { .tag = TK_TITEM_TYPE_DECL, .as.type_decl = tk_normalize_inst_decl(td, table) } };   // (W9.4) `Gen<i64>` member refs → bare stamped `Gen__g__i64` (no-op when none)
+        }
         case TK_ITEM_USE:       return (tk_titem_result){ .ok = true, .as.value = { .tag = TK_TITEM_USE, .as.use_decl = item.as.use_decl } };
         case TK_ITEM_STATEMENT: {
             tk_typed_stmt_result ts = tk_type_statement(item.as.statement, env, table);
@@ -666,6 +767,12 @@ static tk_error surface_at(tk_str file, uint32_t line, uint32_t col, tk_error in
 // dep_prog, then collects and type-checks `program`. Dep items are prepended to the result
 // TProgram so subsequent passes (codegen, VM) see the full program. Mirrors typer.tks::type_program_with_deps.
 tk_tprogram_result tk_type_program_with_deps(tk_program program, tk_tprogram dep_prog) {
+    // (TR0) FOLD trait derivations first — PROJECT-LOCAL only (a dep's traits don't fold: the
+    // .tkb codec doesn't carry trait bodies — same gap as struct/class methods). Mirrors
+    // typer.tks::type_program_with_deps.
+    { tk_fold_traits_result fr = tk_fold_traits(program);
+      if (!fr.ok) return (tk_tprogram_result){ .ok = false, .as.error = fr.as.error };
+      program = tk_canon_class_bases(fr.as.value); }   // (#152) base_name -> qualified, order-independent base hops
     // Seed from dep (adds dep type decls + fn signatures).
     tk_collected_result seed_r = tk_seed_from_dep(dep_prog, tk_type_table_empty(), tk_env_empty());
     if (!seed_r.ok) return (tk_tprogram_result){ .ok = false, .as.error = seed_r.as.error };
@@ -682,7 +789,8 @@ tk_tprogram_result tk_type_program_with_deps(tk_program program, tk_tprogram dep
 
     tk_titem_list items = tk_titem_list_empty();
     tk_tstmt_list mainbody = tk_tstmt_list_empty();
-    tk_env cur = c.as.value.env;
+    tk_env cenv = tk_env_seal(c.as.value.env);   // (#148) seal the collected globals — forks copy locals only
+    tk_env cur = cenv;
 
     for (size_t i = 0; i < program.len; i += 1) {
         tk_item it = program.items[i];
@@ -699,7 +807,7 @@ tk_tprogram_result tk_type_program_with_deps(tk_program program, tk_tprogram dep
             mainbody = tk_tstmt_list_push(mainbody, ts.as.value.node);
             continue;
         }
-        tk_env ienv = c.as.value.env; ienv.cur_ns = it.namespace;
+        tk_env ienv = cenv; ienv.cur_ns = it.namespace;
         tk_titem_result ti = tk_type_item(it, ienv, types);
         if (!ti.ok) return (tk_tprogram_result){ .ok = false, .as.error = surface_at(it.file, line, col, ti.as.error) };
         items = tk_titem_list_push(items, ti.as.value);
@@ -729,6 +837,12 @@ tk_tprogram_result tk_type_program_with_deps(tk_program program, tk_tprogram dep
 }
 
 tk_tprogram_result tk_type_program(tk_program program) {
+    // (TR0) FOLD trait derivations FIRST — every later stage (collect, conformance, typing,
+    // codegen layout, the VM) sees each deriver's already-folded body; the trait decl itself
+    // stays registered (for honest value-position/instantiation errors) but is never emitted.
+    { tk_fold_traits_result fr = tk_fold_traits(program);
+      if (!fr.ok) return (tk_tprogram_result){ .ok = false, .as.error = fr.as.error };
+      program = tk_canon_class_bases(fr.as.value); }   // (#152) base_name -> qualified, order-independent base hops
     tk_collected_result c = tk_collect(program);
     if (!c.ok) return (tk_tprogram_result){ .ok = false, .as.error = c.as.error };
     // W-vis-enforce: enforce the module system (namespace qualification + pub/exp) over the
@@ -743,7 +857,8 @@ tk_tprogram_result tk_type_program(tk_program program) {
     // must enter scope for the statements that follow it (mirrors type_block's env
     // threading). Non-statement items (functions/types/uses) are typed against the
     // collected env and do not advance it.
-    tk_env cur = c.as.value.env;
+    tk_env cenv = tk_env_seal(c.as.value.env);   // (#148) seal the collected globals — forks copy locals only
+    tk_env cur = cenv;
     for (size_t i = 0; i < program.len; i += 1) {
         tk_item it = program.items[i];
         cur.cur_ns = it.namespace;   // (#41) the namespace being type-checked — drives same-ns call resolution
@@ -766,7 +881,7 @@ tk_tprogram_result tk_type_program(tk_program program) {
             mainbody = tk_tstmt_list_push(mainbody, ts.as.value.node);
             continue;
         }
-        tk_env ienv = c.as.value.env; ienv.cur_ns = it.namespace;   // (#41) resolve the body's calls in the item's ns
+        tk_env ienv = cenv; ienv.cur_ns = it.namespace;   // (#41) resolve the body's calls in the item's ns
         tk_titem_result ti = tk_type_item(it, ienv, types);
         if (!ti.ok) {   // (C1-POS) prefer the failing expr's own position; the item's is the fallback
             uint32_t el = ti.as.error.line ? ti.as.error.line : line;

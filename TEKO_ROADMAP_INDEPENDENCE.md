@@ -109,7 +109,7 @@ pontos** *(REBOOT_PLAN l.1075–1094)*.
 |---|---|---|---|
 | C1 | **Primitiva FFI/`extern`** — declarar função externa + marshalling na fronteira; `void*`/`ptr` opacos. **Forma sintática = decisão pendente.** | M.0/M.1 | **falta (legislar a forma)** |
 | C2 | **Superfícies host sobre FFI** — `teko::env::args`, `teko::exit`, `teko::panic`, `teko::io` (slurp: `read_file`/`write_file`/`write_err`, LEGISLATION §270–282) + **listagem de diretório** (para o Eixo A2) + **process/exec** (invocar `cc` na fase transpile). Destrava `driver.tks`/`main.tks`. | M.4 | parcial (só `read_file` na semente C; resto falta) |
-| C3 | **Backend nativo próprio** — emitir direto ao metal + linker próprio, aposentando o `cc` do host (o transpile-para-C é degrau, não o design final). | M.0 | **diferido** (pós-primeiro-binário) |
+| C3 | **Backend nativo próprio** — emitir direto ao metal + linker próprio, aposentando o `cc` do host (o transpile-para-C é degrau, não o design final). **Plano completo em `TEKO_ROADMAP_NATIVE_BACKEND.md`**; tracked como **ROUND N** (independente/paralelo) em `TEKO_MASTER_PLAN.md` (matriz Linux x86_64/arm64/riscv64 + macOS arm64 + Windows x86_64/arm64 + **Wasm nos dois ambientes (WASI e Browser)**; linker do sistema no M1 (incl. `wasm-ld`), linker próprio como eixo L1–L4 futuro, Wasm fora do L1–L4 por já ter `wasm-ld`). | M.0 | **agendado** (plano fechado 2026-07-01, Wasm/WASI incluído no mesmo dia, escopo estendido a Wasm/Browser no mesmo dia; execução ainda não iniciada) |
 | C4 | **Self-hosting** — materializar `codegen.tks` + `driver.tks`; rodar o ciclo de 4 pontos (semente-C → compilador-Teko ger.1 → ger.2==ger.3 bit-a-bit + corretude diferencial); **aposentar o C**. | M.4 | **diferido** (trilha longa) |
 | C5 | **Capabilities / sandboxing / auditoria de superfície** (`exp`/`extern`/syscall). | M.1 | **evolução** |
 
@@ -253,8 +253,12 @@ que por sua vez destrava `driver.tks`/`main.tks` (self-hosting). F3-pânicos (BI
 - **[C2c] `teko::fs` (dir-list)** — deps: C1.1 · M.4 · par: `src/fs/fs.{tks,c,h}` + test → `list_dir` (par Teko de A2).
 - **[C2d] `teko::process` (exec)** — deps: C1.1 · M.4 · par: `src/process/process.{tks,c,h}` + test → invocar `cc`.
   > **Aceite (cada C2x):** roda sobre FFI; `.tkt` cobre feliz + erro.
-- **[C3] Backend nativo próprio** — deps: C1.1 · M.0 · **diferido** · par: `src/codegen` (emitters + linker)
-  > Emite direto ao metal, aposenta o `cc`. **Aceite (futuro):** binário nativo sem host cc.
+- **[C3] Backend nativo próprio** — deps: C1.1 · M.0 · **agendado** · par: `src/codegen/native/*` (lir/isel/regalloc/enc/obj + `stackify_wasm`/`obj_wasm` + `native_emit`, `src/runtime` inalterado como link target)
+  > Emite direto ao metal (+ Wasm), aposenta o `cc` (eventualmente). Plano completo (matriz de alvos, arquitetura de
+  > camadas, milestones N1–N8, linker próprio L1–L4 diferido, Wasm via `wasm-ld`) em `TEKO_ROADMAP_NATIVE_BACKEND.md`.
+  > **Aceite (M1):** os 6 alvos de CI (`.github/workflows/native.yml`) + Wasm/WASI + Wasm/Browser (2 jobs novos)
+  > rodam a suite via objeto nativo, todos os motores concordando (VM==native-C==native-obj, ambos Wasm inclusos;
+  > testes de `fs`/`process` no Browser verificam o honest-stop, não rodam de fato).
 - **[C4] Self-hosting** — deps: A5, B5, C2*, M1, M2 · M.4 · **diferido**
   > Ciclo 4 pontos (semente-C → Teko ger.1 → ger.2==ger.3 + corretude diferencial); aposenta C. **Aceite (futuro):** ger.2==ger.3 bit-a-bit.
 - **[C5] Capabilities/sandboxing** — deps: C1.1 · M.1 · **evolução** — auditoria de superfície `exp`/`extern`/syscall.

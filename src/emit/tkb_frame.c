@@ -42,6 +42,9 @@ static void collect(tk_strtable *t, const tk_texpr *te) {
             break;
         case TK_TEXPR_CALL:
             for (size_t i = 0; i < te->as.call.callee.len; i += 1) tk_st_intern(t, te->as.call.callee.segments[i].name);
+            // (W10b.D3) a dispatch node (tag 24) also serializes its method Func — intern its
+            // Named param/return names too (tag 7 never writes callee_type, so this is D3-only).
+            if (te->as.call.is_iface_dispatch) collect_type(t, te->as.call.callee_type);
             for (size_t i = 0; i < te->as.call.nargs; i += 1) collect(t, &te->as.call.args[i]);
             break;
         case TK_TEXPR_CAST: collect(t, te->as.cast.expr); break;                 // S1a
@@ -106,7 +109,7 @@ static void collect_bindtarget(tk_strtable *t, tk_bind_target bt) {
 static void collect_tstmt(tk_strtable *t, const tk_tstatement *s) {
     switch (s->tag) {
         case TK_TSTMT_BINDING:  collect_bindtarget(t, s->as.binding.target); collect_type(t, s->as.binding.bound); collect(t, &s->as.binding.value); break;
-        case TK_TSTMT_ASSIGN:   tk_st_intern(t, s->as.assign.name); collect_type(t, s->as.assign.bound); collect(t, &s->as.assign.value); break;
+        case TK_TSTMT_ASSIGN:   tk_st_intern(t, s->as.assign.name); collect_type(t, s->as.assign.bound); collect(t, &s->as.assign.value); if (s->as.assign.kind == TK_ASSIGN_FIELD && s->as.assign.target != NULL) collect(t, s->as.assign.target); break;   // (#88) the FIELD LHS receiver's strings
         case TK_TSTMT_RETURN:   collect(t, &s->as.ret.value); break;
         case TK_TSTMT_LOOP:     tk_st_intern(t, s->as.loop_stmt.label); collect_tstmts(t, s->as.loop_stmt.body, s->as.loop_stmt.nbody); break;
         case TK_TSTMT_BREAK:
@@ -152,6 +155,8 @@ static void collect_typebody(tk_strtable *t, tk_type_body tb) {
         case TK_BODY_ALIAS:   collect_typeexpr(t, tb.as.alias_body.alias); break;
         case TK_BODY_EXTERN:  break;
         case TK_BODY_CLASS:   collect_fields(t, tb.as.class_body.fields, tb.as.class_body.n_fields); break;   // (W10b.CLASS) methods not yet collected, same pre-existing gap as struct methods
+        case TK_BODY_INTERFACE: for (size_t i = 0; i < tb.as.interface_body.n_extends; i += 1) tk_st_intern(t, tb.as.interface_body.extends[i]); break;   // (W10b.IF) extends names only — method sigs not serialized (same gap as struct/class methods)
+        case TK_BODY_TRAIT:   collect_fields(t, tb.as.trait_body.fields, tb.as.trait_body.n_fields); break;   // (TR0) fields only — methods not serialized (same gap as struct/class methods)
     }
 }
 static void collect_typedecl(tk_strtable *t, tk_type_decl d) {

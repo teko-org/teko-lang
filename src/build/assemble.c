@@ -127,6 +127,10 @@ tk_program_result tk_assemble_sel(tk_source_files files, bool include_tests) {
             one = tk_module_to_program(pr.as.value.node);
         }
 
+        // (#148 R1) the token buffer dies with this file's parse (the AST holds source views,
+        // never token references). This twin's lists are realloc-backed — plain free.
+        tk_free0((void *)t);
+
         // --- merge, tagging every item with this file's namespace (A3 provenance) ---
         for (size_t k = 0; k < one.len; k += 1) {
             tk_item it = one.items[k];
