@@ -834,6 +834,9 @@ static void *tk_free_take(size_t an) {              // an: already 16-rounded by
 // process exit (tk_regions_free_all). Off (the default): one predicted int compare per alloc.
 // =========================================================================
 #include <dlfcn.h>
+#if !defined(_WIN32)
+#include <execinfo.h>   /* (#148 RA2) backtrace — grand-caller attribution of LARGE push grows */
+#endif
 #define TK_OBS_CAP 16384                       // open-addressed site table (power of two)
 typedef struct { void *ra; unsigned long long bytes, count; } tk_obs_site;
 static tk_obs_site tk_obs_root[TK_OBS_CAP];    // allocations landing in the ROOT region (never freed today)
@@ -845,6 +848,13 @@ static tk_obs_site tk_obs_scoped[TK_OBS_CAP];  // allocations landing in scoped 
 static tk_obs_site tk_obs_push[TK_OBS_CAP];
 static unsigned long long tk_obs_push_bytes = 0;
 static void *tk_g_push_ra = NULL;
+// (#148 RA2) grows > 4 KB attributed one level HIGHER (the append helper's CALLER, via backtrace) —
+// answers "who drives codegen::cb's expensive copy-grows" when RA1 blames the helper itself.
+static tk_obs_site tk_obs_push2[TK_OBS_CAP];
+static unsigned long long tk_obs_push2_bytes = 0;
+// (#148 miss-reason) WHY did the live-tail witness fail, split small vs BIG (>1 MB) grows:
+// [0]=slot empty  [1]=slot holds another ptr  [2]=ptr matches, len differs  [3]=cap full (legit doubling)  [4]=esz/region/gen mismatch
+static unsigned long long tk_obs_miss[5], tk_obs_miss_big[5];
 static unsigned long long tk_obs_root_bytes = 0, tk_obs_scoped_bytes = 0;
 static unsigned long long tk_obs_drop_bytes = 0;     // bytes reclaimed by tk_region_drop (chunk `used` sums)
 static unsigned long long tk_obs_rewind_bytes = 0;   // bytes reclaimed by tk_arena_pop rewinds
@@ -903,6 +913,11 @@ static void tk_obs_dump(void) {
     tk_obs_dump_table(fp, "ROOT-lifetime bytes by call site", tk_obs_root, tk_obs_root_bytes);
     tk_obs_dump_table(fp, "SCOPED-lifetime bytes by call site", tk_obs_scoped, tk_obs_scoped_bytes);
     tk_obs_dump_table(fp, "PUSH copy-grow bytes by CALLING fn (RA1, #148)", tk_obs_push, tk_obs_push_bytes);
+    tk_obs_dump_table(fp, "PUSH >4KB grows by the helper's CALLER (RA2, #148)", tk_obs_push2, tk_obs_push2_bytes);
+    fprintf(fp, "=== PUSH miss reasons (all | >1MB grows): empty %llu|%llu  other-ptr %llu|%llu  len %llu|%llu  cap-full %llu|%llu  esz/gen %llu|%llu ===\n",
+            tk_obs_miss[0], tk_obs_miss_big[0], tk_obs_miss[1], tk_obs_miss_big[1],
+            tk_obs_miss[2], tk_obs_miss_big[2], tk_obs_miss[3], tk_obs_miss_big[3],
+            tk_obs_miss[4], tk_obs_miss_big[4]);
     if (fp != stderr) fclose(fp);
 }
 
@@ -1076,11 +1091,14 @@ void tk_arena_push(void) {
     }
     tk_arena_msp += 1;
 }
+static void tk_push_cache_purge(void);   // fwd — the cache lives beside tk_slice_push below
+
 void tk_arena_pop(void) {
     if (tk_arena_msp <= 0) return;
     tk_arena_msp -= 1;
     if (tk_arena_msp >= 64) return;            // an over-deep push saved nothing — do not rewind
     tk_free_purge();   // (mem::free) parked blocks may live inside the chunks this rewind frees
+    tk_push_cache_purge();   // (#148 safety) rewound ROOT addresses get recycled by later allocs with the SAME region+gen — a stale live-tail entry could false-hit and in-place-write into foreign memory; purge closes it
     tk_region *r = tk_region_root();
     tk_arena_mark m = tk_arena_marks[tk_arena_msp];
     struct tk_chunk *c = r->head;
@@ -1585,6 +1603,9 @@ static struct { const void *ptr; uint64_t len, cap, esz; tk_region *region; uint
 static inline unsigned tk_push_slot(const void *p) {
     return (unsigned)((((uintptr_t)p >> 4) * 11400714819323198485ull) >> 48) & (TK_PUSH_HASH_SIZE - 1);
 }
+// (#148 safety) drop EVERY live-tail witness — called by tk_arena_pop before a rewind recycles root
+// addresses (region+gen can't distinguish a recycled address WITHIN the same region).
+static void tk_push_cache_purge(void) { memset(tk_push_cache, 0, sizeof tk_push_cache); }
 
 // (S2 Level-1) the region-aware core: the grown buffer is allocated in `region`. `tk_slice_push`
 // (below) is the unchanged default lowering target (root); codegen emits THIS variant only for a
@@ -1610,17 +1631,44 @@ void *tk_slice_push_r(const void *ptr, uint64_t len, const void *elem, uint64_t 
     // (#148 RA1) attribute this grow to the GENERATED calling fn: the wrapper parked its caller's RA
     // in tk_g_push_ra; a direct (routed) call attributes its own return address.
     if (tk_obs_enabled() == 1) {
-        void *ra1 = tk_g_push_ra != NULL ? tk_g_push_ra : __builtin_return_address(0);
+        int hop = tk_g_push_ra != NULL;   // did we arrive through the tk_slice_push wrapper?
+        void *ra1 = hop ? tk_g_push_ra : __builtin_return_address(0);
         tk_obs_push_bytes += cap * esz; tk_obs_add(tk_obs_push, ra1, cap * esz);
+        {   // (#148 miss-reason) classify WHY the in-place witness failed for this grow
+            int why = (ptr == NULL || tk_push_cache[h].ptr == NULL) ? 0
+                    : (tk_push_cache[h].ptr != ptr)                  ? 1
+                    : (tk_push_cache[h].len != len)                  ? 2
+                    : (tk_push_cache[h].esz == esz && len >= tk_push_cache[h].cap) ? 3 : 4;
+            tk_obs_miss[why] += 1;
+            if (cap * esz > (1u << 20)) tk_obs_miss_big[why] += 1;
+        }
+#if !defined(_WIN32)
+        if (cap * esz > 4096) {   // (#148 RA2) the expensive grows: attribute the append helper's CALLER
+            void *fr[6]; int nf = backtrace(fr, 6);
+            int idx = 2 + hop;    // fr[0]=this fn, fr[1]=wrapper|caller, fr[2+hop]=the helper's caller
+            if (nf > idx) { tk_obs_push2_bytes += cap * esz; tk_obs_add(tk_obs_push2, fr[idx], cap * esz); }
+        }
+#endif
     }
     tk_g_push_ra = NULL;
+    // (#148) the OLD buffer's own witness (a true doubling: same ptr, cap exhausted) is superseded by
+    // this grow — clear it so a dead multi-MB entry never squats its slot blocking future tenants.
+    if (ptr != NULL && tk_push_cache[h].ptr == ptr) tk_push_cache[h].ptr = NULL;
     void *buf = (region == tk_g_root) ? tk_alloc(cap * esz) : tk_region_alloc(region, cap * esz);
     if (len && ptr != NULL) memcpy(buf, ptr, len * esz);
     memcpy((char *)buf + len * esz, elem, esz);
-    unsigned hb = tk_push_slot(buf);   // record the new buffer's live tail (overwrite on collision = eviction)
-    tk_push_cache[hb].ptr = buf; tk_push_cache[hb].len = len + 1;
-    tk_push_cache[hb].cap = cap; tk_push_cache[hb].esz = esz;
-    tk_push_cache[hb].region = region; tk_push_cache[hb].region_gen = region->gen;
+    // (#148 — the 11.5 GB fix) SIZE-AWARE eviction. Blind overwrite let 150M tiny cache inserts clobber
+    // the multi-MB output buffer's slot ~2300×; every clobber forced a FULL multi-MB copy-grow on its
+    // next append (measured: ~7.5k spurious grows averaging ~1.5 MB = 11.5 GB of 13.5 GB total churn —
+    // 85%). Policy: an incumbent with a LARGER footprint keeps the slot; the smaller newcomer is simply
+    // NOT cached (its next push copy-grows a small buffer — cheap). Safety unchanged: the witness only
+    // ever authorizes in-place when ptr+len+esz+region+gen ALL match; not caching is always safe.
+    unsigned hb = tk_push_slot(buf);
+    if (tk_push_cache[hb].ptr == NULL || tk_push_cache[hb].cap * tk_push_cache[hb].esz <= cap * esz) {
+        tk_push_cache[hb].ptr = buf; tk_push_cache[hb].len = len + 1;
+        tk_push_cache[hb].cap = cap; tk_push_cache[hb].esz = esz;
+        tk_push_cache[hb].region = region; tk_push_cache[hb].region_gen = region->gen;
+    }
     *out_len = len + 1;
     return buf;
 }
