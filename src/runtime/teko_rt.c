@@ -1141,7 +1141,9 @@ void tk_arena_pop(void) {
     tk_region *r = tk_region_root();
     tk_arena_mark m = tk_arena_marks[tk_arena_msp];
     struct tk_chunk *c = r->head;
-    while (c != m.chunk) {
+    // NULL-bounded: the mark's chunk is always in the chain (chunks only ever prepend), so the
+    // walk ends at m.chunk; the c != NULL bound makes that invariant explicit (SAST NullDeref).
+    while (c != NULL && c != m.chunk) {
         struct tk_chunk *next = c->next;
         if (tk_obs_on == 1) tk_obs_rewind_bytes += c->used;   // (S2 obs) bytes the rewind reclaims
         free(c); c = next;                                    // free chunks newer than the mark

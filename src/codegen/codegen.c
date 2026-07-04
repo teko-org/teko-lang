@@ -5253,6 +5253,34 @@ static void cg_key_type(cbuf *out, tk_type t)        { const char *e = NULL; cg_
 static void cg_key_texpr(cbuf *out, tk_type_expr t)  { const char *e = NULL; cg_opt_mangle_texpr(out, t, &e); }
 static bool cg_key_eq(cbuf a, cbuf c) { return a.len == c.len && (a.len == 0 || memcmp(a.ptr, c.ptr, a.len) == 0); }
 
+// (#109 order fix) EXACT-name decl probe (never the bare-last-segment fallback) — the precise
+// readiness gate needs the one decl the canonical name denotes, not a same-bare cousin.
+static const tk_type_decl *cg_find_decl_exact(tk_str name) {
+    for (size_t i = 0; i < g_cg_prog.nitems; i += 1) {
+        if (g_cg_prog.items[i].tag != TK_TITEM_TYPE_DECL) continue;
+        const tk_type_decl *d = &g_cg_prog.items[i].as.type_decl;
+        if (cg_name_eq(d->name, name)) return d;
+    }
+    return NULL;
+}
+static bool cg_named_emitted(cg_typenodes *N, tk_str name);
+// (#109 order fix) NAMESPACE-PRECISE readiness probe: a CANONICAL struct/variant name gates on
+// ITS OWN emission (exact node match), never on a same-bare cousin from another namespace —
+// discovery (readdir) order differs per platform, and on ubuntu io::Reader emitted early
+// satisfied the emit codec structs' bare `Reader` edge before emit::Reader existed → cc "field
+// has incomplete type". Non-body categories (interface/class/enum/alias/type-param/builtin/
+// instance) keep the bare probe. Mirror of codegen.tks::cg_named_emitted_precise.
+static bool cg_named_emitted_precise(cg_typenodes *N, tk_str name) {
+    if (tk_name_qualifier(name).len > 0) {
+        const tk_type_decl *dd = cg_find_decl_exact(name);
+        if (dd != NULL && (dd->body.tag == TK_BODY_STRUCT || dd->body.tag == TK_BODY_VARIANT)) {
+            for (size_t i = 0; i < N->nnamed; i += 1)
+                if (cg_name_eq(N->named[i].name, name)) return N->named_done[i];
+            return true;   // resolved body decl not among the ordered nodes → no edge
+        }
+    }
+    return cg_named_emitted(N, name);
+}
 // Has the named decl `name` been emitted? (a builtin/alias not in our set has no edge → ready.)
 static bool cg_named_emitted(cg_typenodes *N, tk_str name) {
     // (#109 W3) node names are CANONICAL; a readiness probe passes a BARE syntactic segment — match by bare last-segment.
@@ -5287,7 +5315,7 @@ static bool cg_type_ready(cg_typenodes *N, tk_type t) {
         // `tk_opt_Node` first, and `tk_opt_Node`'s `Node` value would need `tk_t_Node` first.
         case TK_TYPE_NAMED:
             if (cg_is_class_named(t.as.named.name)) return true;
-            return cg_named_emitted(N, t.as.named.name);
+            return cg_named_emitted_precise(N, t.as.named.name);
         case TK_TYPE_OPTIONAL: {
             if (t.as.optional.inner == NULL) return true;
             cbuf k = { NULL, 0, 0 }; cg_key_type(&k, *t.as.optional.inner);
@@ -5302,7 +5330,7 @@ static bool cg_type_ready(cg_typenodes *N, tk_type t) {
     }
 }
 // By-value readiness of a field/member SYNTACTIC type-expr (struct field / variant member).
-static bool cg_texpr_ready(cg_typenodes *N, tk_type_expr te) {
+static bool cg_texpr_ready(cg_typenodes *N, tk_type_expr te, tk_str owner_ns) {
     switch (te.tag) {
         case TK_TEXPR_NAMED: {
             tk_str base = te.as.named.path.segments[te.as.named.path.len - 1].name;
@@ -5316,7 +5344,12 @@ static bool cg_texpr_ready(cg_typenodes *N, tk_type_expr te) {
             // unbreakable by-value cycle here even though the C layout is finite.
             if (cg_is_class_named(base)) return true;
             // (S4) a generic-type USE `Box<i64>` depends on the concrete instance, not the template.
-            if (te.as.named.args_len == 0) return cg_named_emitted(N, base);
+            if (te.as.named.args_len == 0) {
+                // (#109 order fix) resolve the SYNTACTIC path in the OWNER decl's namespace, so
+                // the edge points at THAT decl (namespace-precise), not a same-bare cousin.
+                const tk_type_decl *dd = cg_find_decl_ns(te.as.named.path, owner_ns);
+                return cg_named_emitted_precise(N, dd != NULL ? dd->name : base);
+            }
             cbuf k = { NULL, 0, 0 }; cg_texpr_mangle(&k, te);
             bool r = cg_named_emitted(N, (tk_str){ (const tk_byte *)k.ptr, k.len });
             tk_free0(k.ptr);
@@ -5336,13 +5369,14 @@ static bool cg_texpr_ready(cg_typenodes *N, tk_type_expr te) {
 }
 // Is a named decl's body emittable now (all its by-value field/member deps already emitted)?
 static bool cg_named_ready(cg_typenodes *N, tk_type_decl d) {
+    tk_str owner_ns = tk_name_qualifier(d.name);   // (#109 order fix) bare field refs resolve here
     if (d.body.tag == TK_BODY_STRUCT) {
         tk_struct_body sb = d.body.as.struct_body;
         for (size_t i = 0; i < sb.n_fields; i += 1) {
             // a boxed (recursive back-edge) field is a POINTER — needs only a forward typedef,
             // so it is NOT a by-value dependency (this is what breaks the cycle for the fixpoint).
             if (cg_field_boxed(d.name, sb.fields[i].type_ann)) continue;
-            if (!cg_texpr_ready(N, sb.fields[i].type_ann)) return false;
+            if (!cg_texpr_ready(N, sb.fields[i].type_ann, owner_ns)) return false;
         }
         return true;
     }
@@ -5350,7 +5384,7 @@ static bool cg_named_ready(cg_typenodes *N, tk_type_decl d) {
         tk_type_expr vt = d.body.as.variant_body.type_expr;
         if (vt.tag == TK_TEXPR_UNION)
             for (size_t i = 0; i < vt.as.uni.len; i += 1)
-                if (!cg_texpr_ready(N, vt.as.uni.members[i])) return false;
+                if (!cg_texpr_ready(N, vt.as.uni.members[i], owner_ns)) return false;
         return true;
     }
     // (#122) a CLASS body has the same C layout as a struct (its EFFECTIVE, base-inherited fields
@@ -5364,7 +5398,7 @@ static bool cg_named_ready(cg_typenodes *N, tk_type_decl d) {
         tk_fieldsvec_result eff = tk_effective_class_fields(d.body.as.class_body, table);
         if (!eff.ok) return true;   // inheritance error surfaces at body emission; don't stall here
         for (size_t i = 0; i < eff.as.value.len; i += 1)
-            if (!cg_texpr_ready(N, eff.as.value.ptr[i].type_ann)) return false;
+            if (!cg_texpr_ready(N, eff.as.value.ptr[i].type_ann, owner_ns)) return false;
         return true;
     }
     return true;   // enum / alias / interface / trait — no by-value dependency
