@@ -1507,8 +1507,13 @@ uint64_t tk_peak_rss(void) {
 #endif
 }
 
+// The version arrives as a BARE preprocessor token (-DTEKO_VERSION_STRING=0.0.1.0-bootstrap) and
+// is STRINGIZED here — embedding the quotes in the -D flag broke on Windows (the CRT command-line
+// re-parsing of the spawned cc ate them; caught by the first release run's self-host chain).
+#define TK_VERSTR2(x) #x
+#define TK_VERSTR1(x) TK_VERSTR2(x)
 tk_str tk_rt_version(void) {
-    static const char *s = TEKO_VERSION_STRING;
+    static const char *s = TK_VERSTR1(TEKO_VERSION_STRING);
     return (tk_str){ (const tk_byte *)s, strlen(s) };
 }
 
