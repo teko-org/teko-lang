@@ -1,30 +1,28 @@
 #!/usr/bin/env sh
-# scripts/derive_version.sh — derive the bootstrap release tag from teko.tkp.
+# scripts/derive_version.sh — derive the release tag from teko.tkp.
 #
 # The manifest (teko.tkp, TOML, repo root) is the SINGLE SOURCE OF TRUTH for the
-# release version (user ruling, memory: teko-release-versioning-rule). This script
-# reads `version` and `suffix` from it and prints the tag the pipeline must publish.
+# release version (owner ruling, memory: teko-release-versioning-rule). This script
+# reads `version` and `suffix` VERBATIM and prints the tag the pipeline must publish.
 #
-# Rule:
-#   version = "A.B.C.D"   → the 4th component D is REPLACED by the published gen (3),
-#                           because release.yml publishes the gen-3 artifact.
-#   suffix  = "bootstrap" → non-empty suffix is appended as "-<suffix>".
+# Rule (ruling 2026-07-04):
+#   version = "A.B.C.D"   → published AS-IS; the 4th component D IS the build number,
+#                           which the integrator bumps +1 in the PR when merging a code
+#                           change (resetting it to 0 on a major/minor/patch bump). No
+#                           Action detects the increment — the manifest carries the truth.
+#   suffix  = "alpha"     → non-empty suffix is appended as "-<suffix>" (a prerelease).
 #   suffix  = ""          → no suffix; a stable (non-prerelease) tag.
 #
-# So   version="0.0.1.0", suffix="bootstrap"  →  0.0.1.3-bootstrap
-# and  version="0.0.2.0", suffix=""           →  0.0.2.3
+# So   version="0.0.2.0", suffix="alpha"  →  0.0.2.0-alpha
+# and  version="0.0.2.3", suffix=""       →  0.0.2.3
 #
-# Both the release workflow AND local devs call this, so the derivation lives in
-# exactly one place. It prints the tag on stdout and nothing else on success.
+# Because the embedded `teko --version` also reads teko.tkp verbatim, the released
+# binary's version MATCHES this tag exactly. Both the release workflow AND local devs
+# call this, so the derivation lives in one place. Prints the tag on stdout, nothing else.
 #
 # Usage:   sh scripts/derive_version.sh [path/to/teko.tkp]
 #          (default manifest: the teko.tkp next to this script's repo root)
-#
-# Env:     PUBLISHED_GEN — override the gen component (default 3). The pipeline
-#          publishes gen-3, so this is 3; exposed only for testing/future gens.
 set -eu
-
-PUBLISHED_GEN="${PUBLISHED_GEN:-3}"
 
 # Locate the manifest: explicit arg wins; else the repo root relative to this script.
 if [ "$#" -ge 1 ] && [ -n "$1" ]; then
@@ -113,7 +111,7 @@ case "$D" in
     ;;
 esac
 
-TAG="$A.$B.$C.$PUBLISHED_GEN"
+TAG="$VERSION"
 if [ -n "$SUFFIX" ]; then
   TAG="$TAG-$SUFFIX"
 fi
