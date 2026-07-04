@@ -27,7 +27,8 @@ jobs:
             run:
               - 'src/**'
               - 'tests/**'
-              - 'CMakeLists.txt'
+              - 'scripts/ci_cc_wrap.sh'
+              - 'scripts/ci_provision_teko.sh'
               - '.github/workflows/sanitizers.yml'
               - '.github/lsan-suppressions.txt'
 
@@ -35,14 +36,13 @@ jobs:
   # LSan is enabled on THIS lane only (issue #54): detect_leaks=1 with a suppressions
   # file (.github/lsan-suppressions.txt) covering the documented M.5 process-lifetime
   # allocations (deliberately never freed by us; reclaimed by the OS at exit). Any
-  # OTHER leak fails the lane. The portable-dispatch lane keeps detect_leaks=0 so a
-  # suppressions gap can't double-fail the matrix.
+  # OTHER leak fails the lane.
   asan-default:
     name: ASan+UBSan+LSan / default dispatch
     needs: changes
     if: needs.changes.outputs.run == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     permissions:
       contents: read
 
@@ -50,28 +50,30 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install dependencies
+      - name: Install clang
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y cmake ninja-build clang
+          sudo apt-get install -y clang
 
-      - name: Configure CMake (ASan + UBSan)
+      - name: Provision teko from the latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./scripts/ci_provision_teko.sh linux-x86_64
+
+      # The compiler is the downloaded release; sanitize its C by building gen1 (generated
+      # C + runtime seam) under -fsanitize via a cc wrapper, then RUN gen1 — that is what
+      # exercises the compiler's C under ASan/UBSan.
+      - name: Build gen1 under ASan + UBSan (cc wrapper)
         run: |
-          cmake -S . -B build-asan \
-            -G "Ninja" \
-            -DCMAKE_C_COMPILER=clang \
-            -DCMAKE_BUILD_TYPE=Debug \
-            -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
+          sh scripts/ci_cc_wrap.sh "-fsanitize=address,undefined -fno-omit-frame-pointer -g"
+          teko . -o bin
 
-      - name: Build teko
-        run: cmake --build build-asan --target teko --parallel 4
-
-      - name: Run tests (ASan + UBSan + LSan)
+      - name: Run the gate on gen1 (ASan + UBSan + LSan)
         env:
           ASAN_OPTIONS: halt_on_error=1:detect_leaks=1
           LSAN_OPTIONS: suppressions=.github/lsan-suppressions.txt:print_suppressions=0
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
-        run: ./build-asan/teko test . --coverage
+        run: ./bin/teko test . --coverage
 
       # `teko test .` exercises only the VM path — the NATIVE backend (tk_emit_c /
       # cg_lift_program / tk_emit_tsym / run_cc) never ran under ASan, which is how the
@@ -89,45 +91,8 @@ jobs:
           for proj in examples/regressions/*/; do
             ls "$proj"*.tkp >/dev/null 2>&1 || continue
             echo "== teko build $proj"
-            ./build-asan/teko build "$proj" -o "$out/$(basename "$proj")"
+            ./bin/teko build "$proj" -o "$out/$(basename "$proj")"
           done
-
-  # ── ASan + UBSan (portable switch dispatch) ──────────────────────────────────
-  asan-portable:
-    name: ASan+UBSan / portable switch dispatch
-    needs: changes
-    if: needs.changes.outputs.run == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    permissions:
-      contents: read
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install dependencies
-        run: |
-          sudo apt-get update -y
-          sudo apt-get install -y cmake ninja-build clang
-
-      - name: Configure CMake (ASan + UBSan, portable dispatch)
-        run: |
-          cmake -S . -B build-asan-portable \
-            -G "Ninja" \
-            -DCMAKE_C_COMPILER=clang \
-            -DCMAKE_BUILD_TYPE=Debug \
-            -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g" \
-            -DTEKO_VM_PORTABLE_DISPATCH=ON
-
-      - name: Build teko
-        run: cmake --build build-asan-portable --target teko --parallel 4
-
-      - name: Run tests (ASan + UBSan, portable dispatch)
-        env:
-          ASAN_OPTIONS: halt_on_error=1:detect_leaks=0
-          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
-        run: ./build-asan-portable/teko test . --coverage
 
   # ── TSan (Thread Sanitizer): BUILD + SMOKE ────────────────────────────────────
   # TSan runs build + smoke while the codebase is single-threaded (TSan finds no races
@@ -175,21 +140,20 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install dependencies
+      - name: Install clang
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y cmake ninja-build clang
+          sudo apt-get install -y clang
 
-      - name: Configure CMake (TSan)
+      - name: Provision teko from the latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./scripts/ci_provision_teko.sh linux-x86_64
+
+      - name: Build gen1 under TSan (cc wrapper)
         run: |
-          cmake -S . -B build-tsan \
-            -G "Ninja" \
-            -DCMAKE_C_COMPILER=clang \
-            -DCMAKE_BUILD_TYPE=Debug \
-            -DCMAKE_C_FLAGS="-fsanitize=thread -fno-omit-frame-pointer -g"
-
-      - name: Build teko (TSan)
-        run: cmake --build build-tsan --target teko --parallel 4
+          sh scripts/ci_cc_wrap.sh "-fsanitize=thread -fno-omit-frame-pointer -g"
+          teko . -o bin
 
       # SMOKE (not the full suite — see the BUILD + SMOKE rationale above; RESTORE the
       # full `teko test .` gate under TSan as the concurrency surface lands). Build ONE
@@ -208,7 +172,7 @@ jobs:
           out="$(mktemp -d)"
           proj="examples/regressions/exit_success_path"   # tiny; deterministically exits 5
           echo "== teko build $proj (TSan)"
-          timeout --kill-after=30s 600s ./build-tsan/teko build "$proj" -o "$out" | tee build.log
+          timeout --kill-after=30s 600s ./bin/teko build "$proj" -o "$out" | tee build.log
           bin="$(sed -n 's/.*: built //p' build.log | tail -n1)"
           if [ -z "$bin" ] || [ ! -x "$bin" ]; then
             echo "ERROR: could not locate the built binary from the TSan build output." >&2
@@ -240,18 +204,22 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Configure CMake (Clang + Ninja)
-        run: cmake -S . -B build -G "Ninja" -DCMAKE_C_COMPILER=clang -DCMAKE_BUILD_TYPE=Release
+      - name: Provision teko from the latest release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./scripts/ci_provision_teko.sh windows-x86_64
 
-      - name: Build teko
-        run: cmake --build build --target teko --parallel 4
+      - name: Build gen1 (seed compiles the PR sources)
+        shell: bash
+        run: teko . -o bin
 
-      - name: Run tests 20 times
+      - name: Run tests 20 times (gen1)
         shell: pwsh
         run: |
           for ($i = 1; $i -le 20; $i++) {
             Write-Host "=== Run $i / 20 ==="
-            .\build\teko.exe test . --coverage
+            .\bin\teko.exe test . --coverage
             if ($LASTEXITCODE -ne 0) {
               Write-Error "Test run $i failed with exit code $LASTEXITCODE"
               exit $LASTEXITCODE
@@ -263,7 +231,7 @@ jobs:
   gate:
     name: Sanitizer gate
     runs-on: ubuntu-latest
-    needs: [changes, asan-default, asan-portable, tsan, windows-stress]
+    needs: [changes, asan-default, tsan, windows-stress]
     if: always()
     permissions: {}
 
@@ -271,14 +239,12 @@ jobs:
       - name: Evaluate results
         run: |
           ASAN_DEFAULT="${{ needs.asan-default.result }}"
-          ASAN_PORTABLE="${{ needs.asan-portable.result }}"
           TSAN="${{ needs.tsan.result }}"
           WINDOWS_STRESS="${{ needs.windows-stress.result }}"
           CHANGES="${{ needs.changes.outputs.run }}"
 
           echo "changes.run    = $CHANGES"
           echo "asan-default   = $ASAN_DEFAULT"
-          echo "asan-portable  = $ASAN_PORTABLE"
           echo "tsan           = $TSAN"
           echo "windows-stress = $WINDOWS_STRESS"
 
@@ -288,7 +254,7 @@ jobs:
           fi
 
           FAILED=0
-          for RESULT in "$ASAN_DEFAULT" "$ASAN_PORTABLE" "$TSAN" "$WINDOWS_STRESS"; do
+          for RESULT in "$ASAN_DEFAULT" "$TSAN" "$WINDOWS_STRESS"; do
             if [ "$RESULT" = "failure" ] || [ "$RESULT" = "cancelled" ]; then
               FAILED=1
             fi

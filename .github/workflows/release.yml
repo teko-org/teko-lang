@@ -7,10 +7,11 @@ name: Bootstrap Release
 # fixpoint holds (gen-2 == gen-3 byte-identical). Every build job asserts both; the
 # publish job runs only if ALL of them succeeded.
 #
-# The build/gate steps below are copied FAITHFULLY from native.yml (the known-good
-# matrix): same runners, same install_deps, same cmake_args, same configure/build
-# commands. The only additions are the gen1->gen2->gen3 self-host chain, the fixpoint
-# assertion, and the packaging — no new build flags are invented.
+# The compiler is NOT built from C here — each platform seeds from the PREVIOUS
+# published release (Teko-only ruling; same as native.yml) and that seed compiles this
+# tag's sources into gen-1. The steps below add the gen1->gen2->gen3 self-host chain, the
+# fixpoint assertion, the VM==native differential, and the packaging. host cc compiles
+# the generated C; no C bootstrap, no cmake.
 on:
   workflow_dispatch:
     inputs:
@@ -83,11 +84,14 @@ jobs:
           echo "version=$V" >> "$GITHUB_OUTPUT"
           echo "Release version = $V"
 
-  # ── per-platform build + .tkt gate + self-host fixpoint + package ─────────────
-  # Matrix MIRRORS native.yml's build-test matrix exactly (runner + install_deps +
-  # cmake_args). EMIT_SRC_BUNDLE=1 on exactly ONE platform (linux-x86_64) — the
-  # generated teko.c is byte-identical everywhere (the fixpoint), so the portable
-  # bootstrap snapshot is built once and published once.
+  # ── per-platform seed + gen-1/2/3 + .tkt gate + fixpoint + package ────────────
+  # The compiler is no longer built from the C bootstrap (Teko-only ruling). Each
+  # platform SEEDS from the PREVIOUS published release (the newest one is still the
+  # prior version — this workflow publishes the new one at the end), then the seed
+  # compiles THIS tag's sources → gen-1 → gen-2 → gen-3. host cc (clang) is still
+  # needed to compile the generated C. EMIT_SRC_BUNDLE=1 on exactly ONE platform
+  # (linux-x86_64) — the generated teko.c is byte-identical everywhere (the fixpoint),
+  # so the portable bootstrap snapshot is built once and published once.
   build:
     needs: version
     permissions:
@@ -98,36 +102,30 @@ jobs:
         include:
           - os: ubuntu-latest
             label: linux-x86_64
-            cmake_args: -G "Ninja" -DCMAKE_C_COMPILER=clang -DCMAKE_BUILD_TYPE=Release
             emit_src: "1"
             install_deps: |
               sudo apt-get update -y
-              sudo apt-get install -y cmake ninja-build clang
+              sudo apt-get install -y clang
 
           - os: ubuntu-24.04-arm
             label: linux-arm64
-            cmake_args: -G "Ninja" -DCMAKE_C_COMPILER=clang -DCMAKE_BUILD_TYPE=Release
             emit_src: "0"
             install_deps: |
               sudo apt-get update -y
-              sudo apt-get install -y cmake ninja-build clang
+              sudo apt-get install -y clang
 
           - os: macos-latest
             label: macos-arm64
-            cmake_args: -DCMAKE_BUILD_TYPE=Release
             emit_src: "0"
             install_deps: ""
 
-          # Windows: Clang + Ninja (MSVC does not support __int128).
           - os: windows-latest
             label: windows-x86_64
-            cmake_args: -G "Ninja" -DCMAKE_C_COMPILER=clang -DCMAKE_BUILD_TYPE=Release
             emit_src: "0"
             install_deps: ""
 
           - os: windows-11-arm
             label: windows-arm64
-            cmake_args: -G "Ninja" -DCMAKE_C_COMPILER=clang -DCMAKE_BUILD_TYPE=Release
             emit_src: "0"
             install_deps: ""
 
@@ -138,28 +136,29 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ↓↓↓ identical to native.yml build-test steps ↓↓↓
-      - name: Install build dependencies
+      # host cc (clang) is still needed to compile the generated C into the gen-1 binary.
+      - name: Install cc
         if: matrix.install_deps != ''
         run: ${{ matrix.install_deps }}
 
-      - name: Configure CMake
-        run: cmake -S . -B build ${{ matrix.cmake_args }}
+      # Seed from the PREVIOUS published release (the newest is still the prior version).
+      - name: Provision teko from the latest release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LABEL: ${{ matrix.label }}
+        run: ./scripts/ci_provision_teko.sh "$LABEL"
 
-      - name: Build teko
-        run: cmake --build build --config Release --target teko --parallel 4
-      # ↑↑↑ identical to native.yml build-test steps ↑↑↑
-
-      # gen-1: the C bootstrap builds its OWN corpus and runs the .tkt gate (the
+      # gen-1: the released seed compiles THIS tag's corpus and runs the .tkt gate (the
       # build embeds `teko test .`; a non-zero exit here fails the job). Produces
-      # gen1out/teko (self-hosted) + gen1out/teko.c.
+      # gen1out/teko (self-hosted from the new sources) + gen1out/teko.c.
       - name: gen-1 self-build + .tkt gate (POSIX)
         if: runner.os != 'Windows'
-        run: ./build/teko . -o gen1out
+        run: teko . -o gen1out
 
       - name: gen-1 self-build + .tkt gate (Windows)
         if: runner.os == 'Windows'
-        run: .\build\teko.exe . -o gen1out
+        run: teko.exe . -o gen1out
 
       # gen-2: the self-hosted compiler builds the corpus again.
       - name: gen-2 (POSIX)
