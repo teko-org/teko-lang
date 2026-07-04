@@ -1676,11 +1676,14 @@ fn emit_list_push(buf: []byte, prog: checker::TProgram, e: checker::TExpr, c: ch
     out = match emit_type(out, prog, elem) { []byte as o => o; error as err => return err }
     out = cb(out, " *"); out = cb(out, pN); out = cb(out, " = (")
     out = match emit_type(out, prog, elem) { []byte as o => o; error as err => return err }
-    out = cb(out, if frame.len > 0 { " *)tk_slice_push_r(" } else { " *)tk_slice_push(" }); out = cb(out, bN); out = cb(out, ".ptr, "); out = cb(out, bN); out = cb(out, ".len, &"); out = cb(out, iN)
+    // (S2 Level-1/-2) the routing selector rides `frame`: "" → root tk_slice_push; "@fo" → the
+    // free-old-on-grow tk_slice_push_fo (a checker-PROVEN linear chain — #148 Level-2); anything
+    // else → tk_slice_push_r growing into that frame region variable.
+    let is_fo = frame == "@fo"
+    out = cb(out, if is_fo { " *)tk_slice_push_fo(" } else if frame.len > 0 { " *)tk_slice_push_r(" } else { " *)tk_slice_push(" }); out = cb(out, bN); out = cb(out, ".ptr, "); out = cb(out, bN); out = cb(out, ".len, &"); out = cb(out, iN)
     out = cb(out, ", sizeof(")
     out = match emit_type(out, prog, elem) { []byte as o => o; error as err => return err }
-    // (S2 Level-1) a frame-local self-append routes the grown buffer to the frame region `_tkfr`.
-    out = cb(out, "), &"); out = cb(out, lN); if frame.len > 0 { out = cb(out, ", "); out = cb(out, frame) }; out = cb(out, "); (")
+    out = cb(out, "), &"); out = cb(out, lN); if frame.len > 0 && !is_fo { out = cb(out, ", "); out = cb(out, frame) }; out = cb(out, "); (")
     out = match cg_slice_typename(out, elem) { []byte as o => o; error as err => return err }
     out = cb(out, "){ .ptr = "); out = cb(out, pN); out = cb(out, ", .len = "); out = cb(out, lN); out = cb(out, " }; })")
     out
@@ -2447,7 +2450,7 @@ fn emit_array_lit(buf: []byte, prog: checker::TProgram, e: checker::TExpr, a: ch
             out = match emit_type(out, prog, elem) { []byte as o => o; error as err => return err }
             out = cb(out, " *"); out = cb(out, spN); out = cb(out, " = (")
             out = match emit_type(out, prog, elem) { []byte as o => o; error as err => return err }
-            out = cb(out, "*)tk_slice_push("); out = cb(out, accN); out = cb(out, ".ptr, "); out = cb(out, accN); out = cb(out, ".len, &")
+            out = cb(out, "*)tk_slice_push("); out = cb(out, accN);   // (#148 Level-2 BISECT: spread _fo temporariamente OFF) out = cb(out, ".ptr, "); out = cb(out, accN); out = cb(out, ".len, &")
             out = cb(out, subN); out = cb(out, ".ptr["); out = cb(out, jN); out = cb(out, "], sizeof(")
             out = match emit_type(out, prog, elem) { []byte as o => o; error as err => return err }
             out = cb(out, "), &"); out = cb(out, capN); out = cb(out, "); if (!"); out = cb(out, spN); out = cb(out, ") abort(); ")
@@ -2464,7 +2467,7 @@ fn emit_array_lit(buf: []byte, prog: checker::TProgram, e: checker::TExpr, a: ch
             out = match emit_type(out, prog, elem) { []byte as o => o; error as err => return err }
             out = cb(out, " *"); out = cb(out, spN); out = cb(out, " = (")
             out = match emit_type(out, prog, elem) { []byte as o => o; error as err => return err }
-            out = cb(out, "*)tk_slice_push("); out = cb(out, accN); out = cb(out, ".ptr, "); out = cb(out, accN); out = cb(out, ".len, &")
+            out = cb(out, "*)tk_slice_push("); out = cb(out, accN);   // (#148 Level-2 BISECT: spread _fo temporariamente OFF) out = cb(out, ".ptr, "); out = cb(out, accN); out = cb(out, ".len, &")
             out = cb(out, tmpN); out = cb(out, ", sizeof(")
             out = match emit_type(out, prog, elem) { []byte as o => o; error as err => return err }
             out = cb(out, "), &"); out = cb(out, capN); out = cb(out, "); if (!"); out = cb(out, spN); out = cb(out, ") abort(); ")
@@ -5155,6 +5158,21 @@ fn emit_assign(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, a:
     // whole buffer history (geometric doublings + in-place tail) dies with the frame. Guarded by
     // frame.len (the region exists only when fn_body_has_frame_local opened it) and the SHARED predicate
     // checker::assign_routes_to_frame, which mirrors the escape carve-out so the two never disagree.
+    // (#148 S2 Level-2) a PROVEN-LINEAR self-append (born from empty(), self-append-only writes,
+    // no capture before the fn-final statement) may FREE the old buffer on every copy-grow —
+    // realloc parity with the hand-written C twin. Takes precedence over Level-1 frame routing
+    // (the free-list is root-only; the proof admits ESCAPING chains too, which Level-1 cannot).
+    if checker::assign_frees_old(fn_body, a) {
+        match a.value.kind {
+            checker::TCall as c => {
+                out = match emit_assign_lvalue(out, prog, a) { []byte as o => o; error as err => return err }
+                out = cb(out, " = ")
+                out = match emit_list_push(out, prog, a.value, c, escaping, regions, fn_body, dctx, "@fo") { []byte as o => o; error as err => return err }
+                return cb(out, ";\n")
+            }
+            _ => { }
+        }
+    }
     if frame.len > 0 && checker::assign_routes_to_frame(escaping, a) {
         match a.value.kind {
             checker::TCall as c => {

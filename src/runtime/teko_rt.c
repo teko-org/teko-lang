@@ -793,7 +793,7 @@ static uint64_t   tk_g_region_gen = 0;   // (S2 Level-1) monotonic region-genera
 // except by the test-gate rewind (tk_arena_pop), which PURGES the whole list first (its parked
 // blocks may sit inside the chunks the rewind frees). Single-threaded seed (S8 revisits).
 typedef struct tk_freenode { struct tk_freenode *next; size_t bytes; } tk_freenode;
-#define TK_FREE_BINS 256                            // (i+1)*16 bytes, i.e. 16..4096
+#define TK_FREE_BINS 4096                           // (i+1)*16 bytes, i.e. 16..65536 — (#148 Level-2) the doubling-ladder steps of struct lists (esz ~100-300 B × cap 32-256) must BIN exactly (the bounded large-list scan barely reuses them); 4096 ptr slots = 32 KB static
 static tk_freenode *tk_free_bins[TK_FREE_BINS];
 static tk_freenode *tk_free_large = NULL;
 static unsigned long long tk_free_parked_bytes = 0, tk_free_reused_bytes = 0, tk_free_reused_count = 0;
@@ -802,15 +802,18 @@ static void tk_free_purge(void) {                   // rewind/termination: parke
     tk_free_large = NULL;
     tk_free_parked_bytes = 0;
 }
-static void *tk_free_take(size_t an) {              // an: already 16-rounded by the caller
-    // an is 16-rounded and normally ≥16, but guard the LOWER bound too: an<16 would make `an/16 - 1`
-    // underflow (size_t) to SIZE_MAX and index tk_free_bins[-1] (a global-buffer-overflow — ASan). A
-    // sub-16 request never has a bin anyway, so fall through to the large-list scan (which returns NULL).
-    if (an >= 16 && an <= (size_t)TK_FREE_BINS * 16) {
-        tk_freenode **bin = &tk_free_bins[an / 16 - 1];
+static void *tk_free_take(size_t an) {
+    // (#148 Level-2) TAKE = CEIL-16 — never UNDERSTATE the need. The arena's alignment quantum is
+    // _Alignof(max_align_t) (8 on arm64 Darwin), so `an` may not be a 16-multiple: flooring the bin
+    // index handed a 16-byte block to a 24-byte request — an 8-byte OVERRUN into the neighbor.
+    // With ceil, bin[qa] blocks are exactly qa ≥ an bytes. (qa ≥ 16 always, so the old bins[-1]
+    // underflow guard (#150) is subsumed.)
+    size_t qa = (an + 15) & ~(size_t)15;
+    if (qa <= (size_t)TK_FREE_BINS * 16) {
+        tk_freenode **bin = &tk_free_bins[qa / 16 - 1];
         if (*bin != NULL) {
             tk_freenode *n = *bin; *bin = n->next;
-            tk_free_parked_bytes -= an; tk_free_reused_bytes += an; tk_free_reused_count += 1;
+            tk_free_parked_bytes -= qa; tk_free_reused_bytes += qa; tk_free_reused_count += 1;
             return n;
         }
         return NULL;
@@ -935,6 +938,8 @@ static void tk_obs_dump(void) {
             tk_obs_miss[0], tk_obs_miss_big[0], tk_obs_miss[1], tk_obs_miss_big[1],
             tk_obs_miss[2], tk_obs_miss_big[2], tk_obs_miss[3], tk_obs_miss_big[3],
             tk_obs_miss[4], tk_obs_miss_big[4]);
+    fprintf(fp, "=== FREE-LIST: parked %.1f MB now, reused %.1f MB across %llu takes ===\n",
+            (double)tk_free_parked_bytes / 1048576.0, (double)tk_free_reused_bytes / 1048576.0, tk_free_reused_count);
     tk_obs_dump_table(fp, "MALLOC'd str/format buffers by CALLING fn (#148 dark matter)", tk_obs_mstr, tk_obs_mstr_bytes);
     fprintf(fp, "=== MALLOC str total: %.1f MB across %llu buffers ===\n", (double)tk_obs_mstr_bytes / 1048576.0, tk_obs_mstr_count);
     // (#148 dark matter) CHUNK accounting — how much malloc'd arena capacity is NOT covered by the
@@ -1711,6 +1716,43 @@ void *tk_slice_push(const void *ptr, uint64_t len, const void *elem, uint64_t es
     return tk_slice_push_r(ptr, len, elem, esz, out_len, tk_region_root());
 }
 
+// (#148 S2 Level-2) tk_slice_push_fo — FREE-OLD-on-grow, for a self-append whose chain the checker
+// PROVED linear (born from list::empty(), self-append-only writes, no capture before the fn's final
+// statement — see escape.tks::assign_frees_old). On a copy-grow the OLD buffer is dead by that proof,
+// so it is PARKED on the free-list for reuse (realloc parity with the hand-written C twin, which
+// frees per grow). The true capacity comes from the push-cache when this buffer is the live tail
+// (usual case); otherwise the conservative len*esz lower bound. An in-place hit parks nothing.
+void *tk_slice_push_fo(const void *ptr, uint64_t len, const void *elem, uint64_t esz, uint64_t *out_len) {
+    if (tk_obs_enabled() == 1) tk_g_push_ra = __builtin_return_address(0);
+    const void *old = ptr;
+    uint64_t old_bytes = len * esz;
+    if (ptr != NULL) {
+        unsigned h = tk_push_slot(ptr);
+        if (tk_push_cache[h].ptr == ptr && tk_push_cache[h].esz == esz && tk_push_cache[h].cap > len)
+            old_bytes = tk_push_cache[h].cap * esz;   // the live tail — its full capacity is reusable
+    }
+    void *buf = tk_slice_push_r(ptr, len, elem, esz, out_len, tk_region_root());
+    if (buf != old && old != NULL) {
+        // (#148 Level-2 BISECT) TEKO_FO_MAX=N limits parking to the first N grows (binary-search
+        // the guilty park); TEKO_FO_TRACE at the boundary dumps the parking site's backtrace.
+        static long long fo_max = -2, fo_count = 0;
+        if (fo_max == -2) { const char *e = getenv("TEKO_FO_MAX"); fo_max = (e && *e) ? atoll(e) : -1; }
+        if (fo_max >= 0) {
+            if (fo_count >= fo_max) return buf;              // parking budget exhausted — plain push
+            fo_count += 1;
+#if !defined(_WIN32)
+            if (fo_count == fo_max && getenv("TEKO_FO_TRACE")) {
+                void *fr[8]; int nf = backtrace(fr, 8);
+                fprintf(stderr, "== FO park #%lld ==\n", fo_count);
+                backtrace_symbols_fd(fr, nf, 2);
+            }
+#endif
+        }
+        tk_free_block((void *)old, old_bytes);
+    }
+    return buf;
+}
+
 // (mem::free ruling 2026-07-03) tk_free_block — PARK an explicitly freed root-arena block on the
 // free list (see the free-list overlay above tk_region_alloc) so the next same-size allocation
 // REUSES it. This is `teko::mem::free`'s runtime seat: the []T arm passes the slice buffer
@@ -1722,9 +1764,22 @@ void *tk_slice_push(const void *ptr, uint64_t len, const void *elem, uint64_t es
 // direct binding is scrubbed by the lowering; see teko-mem-free-design).
 void tk_free_block(void *p, uint64_t bytes) {
     if (p == NULL) return;
+    { static int dbg=-1; if (dbg<0) dbg = getenv("TEKO_FO_DEBUG")?1:0;
+      if (dbg) fprintf(stderr, "PARK %p bytes=%llu\n", p, (unsigned long long)bytes); }
     unsigned h = tk_push_slot(p);
     if (tk_push_cache[h].ptr == p) tk_push_cache[h].ptr = NULL;   // evict the live-tail record
-    size_t usable = (size_t)bytes & ~(size_t)15;                  // round DOWN to the arena's alignment
+    // (#148 Level-2) PARK = FLOOR-16 — never LIE about the block's size. The arena aligns to
+    // _Alignof(max_align_t) (8 on arm64 Darwin), so an 8-byte block really is 8 bytes: rounding UP
+    // overran the bump-adjacent NEIGHBOR by 8 (freenode header / paranoid poison corrupted live
+    // data — caught by the poisoned-emission micro-repro). tk_free_take rounds the REQUEST up
+    // (ceil-16), so a parked block only ever serves requests ≤ its floored true size.
+    size_t usable = (size_t)bytes & ~(size_t)15;
+    // (#148 Level-2 oracle) TEKO_MEM_PARANOID: POISON the block and never park it. Arena reuse is
+    // invisible to ASan, so a wrong linearity proof would corrupt silently; with poison, any
+    // read-after-park yields 0xDD garbage and the gate/diff harness fails LOUDLY instead.
+    static int tk_paranoid = -1;
+    if (tk_paranoid < 0) { const char *e = getenv("TEKO_MEM_PARANOID"); tk_paranoid = (e != NULL && *e != '\0') ? 1 : 0; }
+    if (tk_paranoid == 1) { if (usable) memset(p, 0xDD, usable); return; }
     if (usable < sizeof(tk_freenode)) return;                     // too small to park — leak it (bump can't shrink)
     tk_freenode *n = (tk_freenode *)p;
     n->bytes = usable;

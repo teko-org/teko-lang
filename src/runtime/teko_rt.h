@@ -455,6 +455,9 @@ void *tk_slice_push(const void *ptr, uint64_t len, const void *elem, uint64_t es
 // bulk-freed when the frame drops. `tk_slice_push` is the root-region wrapper over this. Codegen
 // emits this only for a slice binding the escape analysis proves frame-local.
 void *tk_slice_push_r(const void *ptr, uint64_t len, const void *elem, uint64_t esz, uint64_t *out_len, tk_region *region);
+// (#148 S2 Level-2) free-old-on-grow variant — for a self-append whose chain the checker PROVED
+// linear: on a copy-grow the old buffer is PARKED on the free-list for reuse (realloc parity).
+void *tk_slice_push_fo(const void *ptr, uint64_t len, const void *elem, uint64_t esz, uint64_t *out_len);
 // (mem::free) tk_free_block — park an explicitly freed root-arena block for same-size REUSE
 // (the `teko::mem::free` []T-arm lowering: `tk_free_block(s.ptr, s.len * sizeof(elem))`).
 void tk_free_block(void *p, uint64_t bytes);

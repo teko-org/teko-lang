@@ -2051,9 +2051,12 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
                     cb(b, "uint64_t "); cb(b, lN); cb(b, "; ");
                     if (!emit_type(b, elem, err)) return false; cb(b, " *"); cb(b, pN);
                     cb(b, " = ("); if (!emit_type(b, elem, err)) return false;
-                    cb(b, push_frame[0] ? " *)tk_slice_push_r(" : " *)tk_slice_push("); cb(b, bN); cb(b, ".ptr, "); cb(b, bN); cb(b, ".len, &"); cb(b, iN);
-                    cb(b, ", sizeof("); if (!emit_type(b, elem, err)) return false; cb(b, "), &"); cb(b, lN);
-                    if (push_frame[0]) { cb(b, ", "); cb(b, push_frame); }   // (S2 Level-1) grow into the frame region
+                    // (S2 Level-1/-2) routing selector: "@fo" → free-old (proven linear chain);
+                    // other non-empty → grow into that frame region; empty → root.
+                    { int fo = push_frame[0] == '@';
+                      cb(b, fo ? " *)tk_slice_push_fo(" : push_frame[0] ? " *)tk_slice_push_r(" : " *)tk_slice_push("); cb(b, bN); cb(b, ".ptr, "); cb(b, bN); cb(b, ".len, &"); cb(b, iN);
+                      cb(b, ", sizeof("); if (!emit_type(b, elem, err)) return false; cb(b, "), &"); cb(b, lN);
+                      if (push_frame[0] && !fo) { cb(b, ", "); cb(b, push_frame); } }
                     cb(b, "); (");
                     if (!cg_slice_typename(b, elem, err)) return false;
                     cb(b, "){ .ptr = "); cb(b, pN); cb(b, ", .len = "); cb(b, lN); cb(b, " }; })");
@@ -2883,7 +2886,7 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
                     if (!emit_type(b, elem, err)) return false;
                     cb(b, " *"); cb(b, spN); cb(b, " = (");
                     if (!emit_type(b, elem, err)) return false;
-                    cb(b, "*)tk_slice_push("); cb(b, accN); cb(b, ".ptr, "); cb(b, accN); cb(b, ".len, &");
+                    cb(b, "*)tk_slice_push("); cb(b, accN);   /* (#148 Level-2 BISECT: spread _fo OFF) */ cb(b, ".ptr, "); cb(b, accN); cb(b, ".len, &");
                     cb(b, subN); cb(b, ".ptr["); cb(b, jN); cb(b, "], sizeof(");
                     if (!emit_type(b, elem, err)) return false;
                     cb(b, "), &"); cb(b, capN); cb(b, "); if (!"); cb(b, spN); cb(b, ") abort(); ");
@@ -2900,7 +2903,7 @@ static bool emit_expr(cbuf *b, const tk_texpr *e, const char **err) {
                     if (!emit_type(b, elem, err)) return false;
                     cb(b, " *"); cb(b, spN); cb(b, " = (");
                     if (!emit_type(b, elem, err)) return false;
-                    cb(b, "*)tk_slice_push("); cb(b, accN); cb(b, ".ptr, "); cb(b, accN); cb(b, ".len, &");
+                    cb(b, "*)tk_slice_push("); cb(b, accN);   /* (#148 Level-2 BISECT: spread _fo OFF) */ cb(b, ".ptr, "); cb(b, accN); cb(b, ".len, &");
                     cb(b, tmpN); cb(b, ", sizeof(");
                     if (!emit_type(b, elem, err)) return false;
                     cb(b, "), &"); cb(b, capN); cb(b, "); if (!"); cb(b, spN); cb(b, ") abort(); ");
@@ -4370,6 +4373,22 @@ static bool emit_stmt(cbuf *b, const tk_tstatement *s, bool in_main,
                 cb(b, ", ");
                 if (!emit_expr(b, &s->as.assign.value, err)) return false;
                 cb(b, ")");
+                cb(b, ";\n");
+                return true;
+            }
+            // (#148 S2 Level-2) a PROVEN-LINEAR self-append (born from empty(), self-append-only
+            // writes, no capture before the fn-final statement) FREES the old buffer on every
+            // copy-grow — realloc parity with this hand-written twin. Takes precedence over the
+            // Level-1 frame routing (free-list is root-only; the proof admits ESCAPING chains too).
+            // "@fo" rides g_cg_push_frame as the routing selector (mirror of the Teko twin's frame).
+            if (s->as.assign.value.tag == TK_TEXPR_CALL
+                && tk_assign_frees_old(g_cg_fn_body, g_cg_fn_nbody, *s)) {
+                emit_lvalue();
+                cb(b, " = ");
+                const char *saved_pf = g_cg_push_frame; g_cg_push_frame = "@fo";
+                bool ok = emit_expr(b, &s->as.assign.value, err);
+                g_cg_push_frame = saved_pf;
+                if (!ok) return false;
                 cb(b, ";\n");
                 return true;
             }

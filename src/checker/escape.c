@@ -324,6 +324,158 @@ bool tk_assign_routes_to_frame(tk_escape_set set, tk_tstatement s) {
     return s.as.assign.bound.tag == TK_TYPE_SLICE;
 }
 
+// ── (#148 S2 Level-2) LINEAR-CHAIN proof — free-old-on-grow. C twin of escape.tks. ─────────
+// See escape.tks for the full rationale: born once from list::empty(), every write a self-append,
+// and the read equation total - final-stmt == n_self_appends ⇒ no mid-chain capture ⇒ each
+// copy-grow may PARK the old buffer for reuse (realloc parity with the hand-written twin).
+typedef struct { int64_t births_empty, births_other, other_writes, self_appends; } tk_chain_stats;
+
+// fwd — the S2 block-local counting machinery is defined below this section.
+static bool name_eq_str(tk_str a, tk_str b);
+static size_t count_reads_stmt(tk_tstatement s, tk_str name);
+static size_t count_reads_block(const tk_tstatement *body, size_t n, tk_str name);
+
+static bool esc_binding_births_empty(tk_tstatement s) {
+    tk_texpr v = s.as.binding.value;
+    if (v.tag != TK_TEXPR_CALL) return false;
+    tk_path p = v.as.call.callee;
+    if (p.len < 2) return false;
+    tk_str last = p.segments[p.len - 1].name;
+    tk_str prev = p.segments[p.len - 2].name;
+    return last.len == 5 && memcmp(last.ptr, "empty", 5) == 0
+        && prev.len == 4 && memcmp(prev.ptr, "list", 4) == 0;
+}
+
+static tk_chain_stats chain_stats_block(const tk_tstatement *body, size_t n, tk_str name);
+
+static tk_chain_stats cs_add2(tk_chain_stats a, tk_chain_stats b) {
+    return (tk_chain_stats){ a.births_empty + b.births_empty, a.births_other + b.births_other,
+                             a.other_writes + b.other_writes, a.self_appends + b.self_appends };
+}
+
+static tk_chain_stats chain_stats_expr(tk_texpr e, tk_str name) {
+    tk_chain_stats s = {0, 0, 0, 0};
+    switch (e.tag) {
+        case TK_TEXPR_IF:
+            s = chain_stats_expr(*e.as.if_expr.cond, name);
+            s = cs_add2(s, chain_stats_block(e.as.if_expr.then_blk, e.as.if_expr.nthen, name));
+            if (e.as.if_expr.has_else)
+                s = cs_add2(s, chain_stats_block(e.as.if_expr.else_blk, e.as.if_expr.nelse, name));
+            return s;
+        case TK_TEXPR_MATCH:
+            s = chain_stats_expr(*e.as.match_expr.subject, name);
+            for (size_t i = 0; i < e.as.match_expr.narms; i += 1) {
+                if (e.as.match_expr.arms[i].has_when)
+                    s = cs_add2(s, chain_stats_expr(*e.as.match_expr.arms[i].guard, name));
+                s = cs_add2(s, chain_stats_block(e.as.match_expr.arms[i].body, e.as.match_expr.arms[i].nbody, name));
+            }
+            return s;
+        case TK_TEXPR_BINARY:
+            return cs_add2(chain_stats_expr(*e.as.binary.left, name), chain_stats_expr(*e.as.binary.right, name));
+        case TK_TEXPR_UNARY:
+            return chain_stats_expr(*e.as.unary.operand, name);
+        case TK_TEXPR_COMPARE:
+            s = chain_stats_expr(*e.as.compare.first, name);
+            for (size_t i = 0; i < e.as.compare.nrest; i += 1)
+                s = cs_add2(s, chain_stats_expr(*e.as.compare.rest[i].operand, name));
+            return s;
+        case TK_TEXPR_CALL:
+            for (size_t i = 0; i < e.as.call.nargs; i += 1)
+                s = cs_add2(s, chain_stats_expr(e.as.call.args[i], name));
+            return s;
+        case TK_TEXPR_CAST:
+            return chain_stats_expr(*e.as.cast.expr, name);
+        case TK_TEXPR_FIELD_ACCESS:
+            return chain_stats_expr(*e.as.field_access.receiver, name);
+        case TK_TEXPR_SAFE_FIELD_ACCESS:
+            return chain_stats_expr(*e.as.safe_field_access.receiver, name);
+        case TK_TEXPR_COALESCE:
+            return cs_add2(chain_stats_expr(*e.as.coalesce.left, name), chain_stats_expr(*e.as.coalesce.right, name));
+        case TK_TEXPR_INDEX:
+            return cs_add2(chain_stats_expr(*e.as.index.receiver, name), chain_stats_expr(*e.as.index.index, name));
+        case TK_TEXPR_STRUCT_INIT:
+            for (size_t i = 0; i < e.as.struct_init.nfields; i += 1)
+                s = cs_add2(s, chain_stats_expr(e.as.struct_init.field_vals[i], name));
+            return s;
+        case TK_TEXPR_ARRAY:
+            for (size_t i = 0; i < e.as.array.nelements; i += 1)
+                s = cs_add2(s, chain_stats_expr(e.as.array.elements[i], name));
+            return s;
+        case TK_TEXPR_INTERP:
+            for (size_t i = 0; i < e.as.interp.nholes; i += 1) {
+                s = cs_add2(s, chain_stats_expr(e.as.interp.holes[i], name));
+                if (e.as.interp.specs && e.as.interp.specs[i].kind == TK_FSPEC_DYNAMIC)
+                    for (size_t k = 0; k < e.as.interp.specs[i].ndyn_args; k++)
+                        s = cs_add2(s, chain_stats_expr(e.as.interp.specs[i].dyn_args[k], name));
+            }
+            return s;
+        case TK_TEXPR_IN:
+            s = chain_stats_expr(*e.as.in_expr.lhs, name);
+            for (size_t i = 0; i < e.as.in_expr.nelems; i += 1)
+                s = cs_add2(s, chain_stats_expr(e.as.in_expr.elems[i], name));
+            return s;
+        default: return s;   // leaves + TK_TEXPR_LAMBDA (lifted body — not this frame's chain)
+    }
+}
+
+static tk_chain_stats chain_stats_stmt(tk_tstatement st, tk_str name) {
+    tk_chain_stats s = {0, 0, 0, 0};
+    switch (st.tag) {
+        case TK_TSTMT_BINDING:
+            s = chain_stats_expr(st.as.binding.value, name);
+            if (st.as.binding.target.tag == TK_BIND_SIMPLE
+                && name_eq_str(st.as.binding.target.as.simple.name, name)) {
+                if (esc_binding_births_empty(st)) s.births_empty += 1; else s.births_other += 1;
+            }
+            return s;
+        case TK_TSTMT_ASSIGN:
+            s = chain_stats_expr(st.as.assign.value, name);
+            if (st.as.assign.kind == TK_ASSIGN_FIELD)
+                s = cs_add2(s, chain_stats_expr(*st.as.assign.target, name));
+            if (name_eq_str(st.as.assign.name, name)) {
+                if (esc_assign_is_self_append(st)) s.self_appends += 1; else s.other_writes += 1;
+            }
+            return s;
+        case TK_TSTMT_RETURN:
+            return st.as.ret.has_value ? chain_stats_expr(st.as.ret.value, name) : s;
+        case TK_TSTMT_EXPR:
+            return chain_stats_expr(st.as.expr_stmt.expr, name);
+        case TK_TSTMT_LOOP:
+            return chain_stats_block(st.as.loop_stmt.body, st.as.loop_stmt.nbody, name);
+        case TK_TSTMT_DEFER:
+            return chain_stats_block(st.as.defer_stmt.body, st.as.defer_stmt.nbody, name);
+        default: return s;   // break/continue
+    }
+}
+
+static tk_chain_stats chain_stats_block(const tk_tstatement *body, size_t n, tk_str name) {
+    tk_chain_stats s = {0, 0, 0, 0};
+    for (size_t i = 0; i < n; i += 1) s = cs_add2(s, chain_stats_stmt(body[i], name));
+    return s;
+}
+
+// tk_assign_frees_old — may THIS self-append's copy-grow PARK the old buffer for reuse? Mirror of
+// escape.tks::assign_frees_old (the whole-fn linear-chain proof).
+bool tk_assign_frees_old(const tk_tstatement *fn_body, size_t fn_n, tk_tstatement s) {
+    if (!esc_assign_is_self_append(s)) return false;
+    tk_str name = s.as.assign.name;
+    tk_chain_stats st = chain_stats_block(fn_body, fn_n, name);
+    if (st.births_empty != 1) return false;      // born exactly once, from empty()
+    if (st.births_other != 0) return false;      // no shadow / no aliasing rebirth
+    if (st.other_writes != 0) return false;      // writes are self-append only
+    size_t total = count_reads_block(fn_body, fn_n, name);
+    if (fn_n == 0) return false;
+    size_t last_reads = count_reads_stmt(fn_body[fn_n - 1], name);
+    tk_chain_stats last_st = chain_stats_stmt(fn_body[fn_n - 1], name);
+    if (last_st.self_appends > 0) {
+        // the FINAL statement itself pushes: a capture inside it could precede a later push on the
+        // same path (unprovable syntactically) — allow only reads that are exactly its own bases.
+        if (last_reads != (size_t)last_st.self_appends) return false;
+        return total == (size_t)st.self_appends;
+    }
+    return total - last_reads == (size_t)st.self_appends;   // every non-final read is a self-append base
+}
+
 // ── S2 — PER-BLOCK escape (block-local freeing). C twin of escape.tks. ──────────
 // A binding `x` declared at the top level of block B may be freed at B's every exit edge ONLY IF
 // every textual READ of `x` in the whole function is a SAFE non-tail/non-assign read strictly

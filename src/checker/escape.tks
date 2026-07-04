@@ -396,6 +396,181 @@ pub fn assign_routes_to_frame(escaping: []str, a: TAssign) -> bool {
     }
 }
 
+// ── (#148 S2 Level-2) LINEAR-CHAIN proof — free-old-on-grow. ─────────────────────────────
+// The C twin's lists realloc (freeing the old buffer per grow); the generated code RETAINS every
+// dead doubling in the arena — the measured gen-1-vs-gen-0 memory gap. For a PROVABLY LINEAR
+// accumulator chain, each copy-grow may park the OLD buffer on the runtime free-list for reuse
+// (realloc parity). THE PROOF (v1, conservative — any doubt routes to root, a safe leak):
+//   1. the name is BORN EXACTLY ONCE in the fn, from `…::list::empty()` (no shared buffer at birth,
+//      no shadowing to conflate the counts below);
+//   2. EVERY write to the name is a self-append `xs = push(xs, …)` (no rebinding to an alias);
+//   3. the READ EQUATION: every read of the name is a self-append base — EXCEPT reads in the fn's
+//      FINAL statement (nothing pushes after it, so capturing the final buffer there is safe).
+//      total_reads(body) - reads(final stmt) == n_self_appends  ⇒  no mid-chain capture exists,
+//      so no alias can observe a parked (freed) intermediate buffer.
+
+// per-name WRITE statistics across a whole fn body (reads are counted by count_reads_*).
+type ChainStats = struct { births_empty: i64; births_other: i64; other_writes: i64; self_appends: i64 }
+
+fn cs_zero() -> ChainStats { ChainStats { births_empty = 0; births_other = 0; other_writes = 0; self_appends = 0 } }
+fn cs_add(a: ChainStats, b: ChainStats) -> ChainStats {
+    ChainStats { births_empty = a.births_empty + b.births_empty; births_other = a.births_other + b.births_other; other_writes = a.other_writes + b.other_writes; self_appends = a.self_appends + b.self_appends }
+}
+
+// is this binding's value exactly `…::list::empty()` (the fresh-buffer birth)?
+fn binding_value_is_list_empty(b: TBinding) -> bool {
+    match b.value.kind {
+        TCall as c => {
+            let segs = c.callee.segments
+            if segs.len < 2 { return false }
+            segs[segs.len - 1].name == "empty" && segs[segs.len - 2].name == "list"
+        }
+        _ => false
+    }
+}
+
+// walk an expr for STATEMENT BLOCKS embedded in if/match arms (bindings/assigns live there too).
+fn chain_stats_expr(e: TExpr, name: str) -> ChainStats {
+    match e.kind {
+        TIfExpr as f => {
+            mut s = chain_stats_expr(f.cond, name)
+            s = cs_add(s, chain_stats_block(f.then_blk, name))
+            if f.has_else { s = cs_add(s, chain_stats_block(f.else_blk, name)) }
+            s
+        }
+        TMatchExpr as m => {
+            mut s = chain_stats_expr(m.subject, name)
+            mut i = 0
+            loop {
+                if i >= m.arms.len { break }
+                if m.arms[i].has_when { s = cs_add(s, chain_stats_expr(m.arms[i].guard, name)) }
+                s = cs_add(s, chain_stats_block(m.arms[i].body, name))
+                i++
+            }
+            s
+        }
+        TBinary as b => cs_add(chain_stats_expr(b.left, name), chain_stats_expr(b.right, name))
+        TUnary as u  => chain_stats_expr(u.operand, name)
+        TCompare as c => {
+            mut s = chain_stats_expr(c.first, name)
+            mut i = 0
+            loop { if i >= c.rest.len { break }; s = cs_add(s, chain_stats_expr(c.rest[i].operand, name)); i++ }
+            s
+        }
+        TCall as call => {
+            mut s = cs_zero()
+            mut i = 0
+            loop { if i >= call.args.len { break }; s = cs_add(s, chain_stats_expr(call.args[i], name)); i++ }
+            s
+        }
+        TCast as ct => chain_stats_expr(ct.expr, name)
+        TFieldAccess as fa => chain_stats_expr(fa.receiver, name)
+        TSafeFieldAccess as sfa => chain_stats_expr(sfa.receiver, name)
+        TCoalesce as co => cs_add(chain_stats_expr(co.left, name), chain_stats_expr(co.right, name))
+        TIndex as ix => cs_add(chain_stats_expr(ix.receiver, name), chain_stats_expr(ix.index, name))
+        TStructInit as si => {
+            mut s = cs_zero()
+            mut i = 0
+            loop { if i >= si.field_vals.len { break }; s = cs_add(s, chain_stats_expr(si.field_vals[i], name)); i++ }
+            s
+        }
+        TArrayLit as al => {
+            mut s = cs_zero()
+            mut i = 0
+            loop { if i >= al.elements.len { break }; s = cs_add(s, chain_stats_expr(al.elements[i].expr, name)); i++ }
+            s
+        }
+        TInterp as ip => {
+            mut s = cs_zero()
+            mut i = 0
+            loop {
+                if i >= ip.holes.len { break }
+                s = cs_add(s, chain_stats_expr(ip.holes[i], name))
+                if i < ip.specs.len {
+                    match ip.specs[i].kind {
+                        TFSpecDynamic as fd => {
+                            mut k = 0
+                            loop { if k >= fd.args.len { break }; s = cs_add(s, chain_stats_expr(fd.args[k], name)); k++ }
+                        }
+                        _ => { }
+                    }
+                }
+                i++
+            }
+            s
+        }
+        TInExpr as ine => {
+            mut s = chain_stats_expr(ine.lhs, name)
+            mut i = 0
+            loop { if i >= ine.elems.len { break }; s = cs_add(s, chain_stats_expr(ine.elems[i], name)); i++ }
+            s
+        }
+        _ => cs_zero()   // leaves + TLambda (its body is a LIFTED fn — not this frame's chain)
+    }
+}
+
+fn chain_stats_stmt(s: TStatement, name: str) -> ChainStats {
+    match s {
+        TBinding as b => {
+            mut st = chain_stats_expr(b.value, name)
+            match b.target {
+                parser::SimpleName as sn => {
+                    if sn.name == name {
+                        if binding_value_is_list_empty(b) { st = cs_add(st, ChainStats { births_empty = 1; births_other = 0; other_writes = 0; self_appends = 0 }) }
+                        else { st = cs_add(st, ChainStats { births_empty = 0; births_other = 1; other_writes = 0; self_appends = 0 }) }
+                    }
+                }
+                parser::DestructurePattern => { }
+            }
+            st
+        }
+        TAssign as a => {
+            mut st = chain_stats_expr(a.value, name)
+            match a.kind { parser::AssignKind::Field => st = cs_add(st, chain_stats_expr(a.target, name)); _ => { } }
+            if a.name == name {
+                if assign_is_self_append(a) { st = cs_add(st, ChainStats { births_empty = 0; births_other = 0; other_writes = 0; self_appends = 1 }) }
+                else { st = cs_add(st, ChainStats { births_empty = 0; births_other = 0; other_writes = 1; self_appends = 0 }) }
+            }
+            st
+        }
+        TReturn as r    => if r.has_value { chain_stats_expr(r.value, name) } else { cs_zero() }
+        TExprStmt as es => chain_stats_expr(es.expr, name)
+        TLoopStmt as l  => chain_stats_block(l.body, name)
+        TBreakStmt      => cs_zero()
+        TContinueStmt   => cs_zero()
+        TDeferStmt as d => chain_stats_block(d.body, name)
+    }
+}
+
+fn chain_stats_block(body: []TStatement, name: str) -> ChainStats {
+    mut s = cs_zero()
+    mut i: u64 = 0
+    loop { if i >= body.len { break }; s = cs_add(s, chain_stats_stmt(body[i], name)); i++ }
+    s
+}
+
+// assign_frees_old — may THIS self-append's copy-grow PARK the old buffer for reuse? True iff the
+// whole-fn linear-chain proof above holds for the assigned name. PUBLIC (codegen reads it).
+pub fn assign_frees_old(fn_body: []TStatement, a: TAssign) -> bool {
+    if !assign_is_self_append(a) { return false }
+    let st = chain_stats_block(fn_body, a.name)
+    if st.births_empty != 1 { return false }     // born exactly once, from empty()
+    if st.births_other != 0 { return false }     // no shadow / no aliasing rebirth
+    if st.other_writes != 0 { return false }     // writes are self-append only
+    let total = count_reads_block(fn_body, a.name)
+    if fn_body.len == 0 { return false }
+    let last_reads = count_reads_stmt(fn_body[fn_body.len - 1], a.name)
+    let last_st    = chain_stats_stmt(fn_body[fn_body.len - 1], a.name)
+    if last_st.self_appends > 0 {
+        // the FINAL statement itself pushes (a tail loop/match building the chain): a capture inside
+        // it could precede a later push ON THE SAME PATH — unprovable syntactically. Allow only when
+        // its reads are EXACTLY its own self-append bases (no capture there at all).
+        if last_reads != last_st.self_appends { return false }
+        return total == st.self_appends
+    }
+    total - last_reads == st.self_appends        // every non-final read is a self-append base
+}
+
 // binding_is_frame_local_slice — (S2 Level-1) a SLICE binding whose buffer never leaves the frame:
 // a `let`/`mut` SIMPLE name, NOT const, NOT in the escaping set, whose bound type is a slice. Unlike
 // the struct-init predicate the value need not be an allocation site — a slice accumulator is BUILT
