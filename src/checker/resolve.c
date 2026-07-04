@@ -208,6 +208,15 @@ tk_str tk_qualify(tk_str ns, tk_str name) {
     if (ns.len == 0) return name;
     return rt_concat(rt_concat(ns, rt_cstr("::")), name);
 }
+// (#148) tk_qualify_eq — does `name` equal tk_qualify(ns, bare) WITHOUT building the string?
+// Mirror of resolve.tks::qualify_eq (the hot table scans concatenated per candidate per lookup).
+bool tk_qualify_eq(tk_str ns, tk_str bare, tk_str name) {
+    if (ns.len == 0) return name_eq(bare, name);
+    if (name.len != ns.len + 2 + bare.len) return false;
+    if (memcmp(name.ptr, ns.ptr, ns.len) != 0) return false;
+    if (name.ptr[ns.len] != ':' || name.ptr[ns.len + 1] != ':') return false;
+    return bare.len == 0 || memcmp(name.ptr + ns.len + 2, bare.ptr, bare.len) == 0;
+}
 // (#109 W3) the bare last "::"-segment of a (possibly canonical) name. Mirror of resolve.tks::name_last_segment.
 tk_str tk_name_last_segment(tk_str name) {
     int64_t last_sep = -1;
@@ -246,7 +255,7 @@ tk_decl_result tk_type_table_find(tk_type_table table, tk_str name, tk_str ref_n
     for (size_t i = 0; i < table.len; i += 1) {
         // (#109 W3) exact; OR the entry's qualified form == a canonical query; OR the entry's bare
         // last-segment == a bare query (a bare decl field probing a CANONICAL-keyed type_table_of table).
-        if (name_eq(table.ptr[i].name, name) || name_eq(tk_qualify(table.ptr[i].namespace, table.ptr[i].name), name) || name_eq(tk_name_last_segment(table.ptr[i].name), name)) {
+        if (name_eq(table.ptr[i].name, name) || tk_qualify_eq(table.ptr[i].namespace, table.ptr[i].name, name) || name_eq(tk_name_last_segment(table.ptr[i].name), name)) {   // (#148) allocation-free qualified compare
             return (tk_decl_result){ .ok = true, .as.value = table.ptr[i].decl };
         }
     }
@@ -299,7 +308,7 @@ static tk_str namespaces_declaring(tk_type_table table, tk_str name) {
 tk_str type_ns_of(tk_type_table table, tk_str name) {
     for (size_t i = 0; i < table.len; i += 1) {
         // (#109 W3) `name` may be canonical "ns::Name" or a bare `__g__` instance — match exact OR the qualified form.
-        if (name_eq(table.ptr[i].name, name) || name_eq(tk_qualify(table.ptr[i].namespace, table.ptr[i].name), name)) return table.ptr[i].namespace;
+        if (name_eq(table.ptr[i].name, name) || tk_qualify_eq(table.ptr[i].namespace, table.ptr[i].name, name)) return table.ptr[i].namespace;   // (#148) allocation-free qualified compare
     }
     return rt_cstr("");
 }

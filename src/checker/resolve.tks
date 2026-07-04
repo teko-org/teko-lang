@@ -14,6 +14,20 @@ pub type TypeTable = []TypeReg
 pub fn qualify(ns: str, name: str) -> str {
     if ns == "" { name } else { ns ~ "::" ~ name }
 }
+// (#148) qualify_eq — does `name` equal qualify(ns, bare) WITHOUT building the string? The hot
+// table scans compared a freshly-CONCATENATED "ns::Name" per candidate per lookup (measured 63M
+// concats / ~1 GB+overhead on a self-build); this byte-wise test allocates nothing.
+pub fn qualify_eq(ns: str, bare: str, name: str) -> bool {
+    if ns.len == 0 { return bare == name }
+    if name.len != ns.len + 2 + bare.len { return false }
+    mut i: u64 = 0
+    loop { if i >= ns.len { break }; if name[i] != ns[i] { return false }; i++ }
+    if name[ns.len] != b':' { return false }
+    if name[ns.len + 1] != b':' { return false }
+    mut j: u64 = 0
+    loop { if j >= bare.len { break }; if name[ns.len + 2 + j] != bare[j] { return false }; j++ }
+    true
+}
 // (#109 W3) the bare last "::"-segment of a (possibly canonical) name: "teko::emit::Reader" → "Reader",
 // "Reader" → "Reader". Manual byte-loop (mirrors class_name_from_method_ns), since last_index_of is a
 // host-only FFI edge unavailable to the VM-interpreted checker.
@@ -58,7 +72,7 @@ fn type_table_find(table: TypeTable, name: str, ref_ns: str) -> parser::TypeDecl
         // (#109 W3) exact; OR the entry's qualified form == a canonical query; OR the entry's bare
         // last-segment == a bare query (a bare decl field like `base_name` probing a CANONICAL-keyed
         // type_table_of table). A canonical query still distinguishes via the qualify branch.
-        if table[i].name == name || qualify(table[i].namespace, table[i].name) == name || name_last_segment(table[i].name) == name { return table[i].decl }
+        if table[i].name == name || qualify_eq(table[i].namespace, table[i].name, name) || name_last_segment(table[i].name) == name { return table[i].decl }   // (#148) allocation-free qualified compare
         i++
     }
     error { message = "not a user type" }
@@ -113,7 +127,7 @@ fn type_ns_of(table: TypeTable, name: str) -> str {
         if i >= table.len { break }
         // (#109 W3) `name` may be a CANONICAL "ns::Name" (a resolved Named.name) or a bare stamped
         // `__g__` instance — match exact OR by the entry's qualified form (like type_table_find).
-        if table[i].name == name || qualify(table[i].namespace, table[i].name) == name { return table[i].namespace }
+        if table[i].name == name || qualify_eq(table[i].namespace, table[i].name, name) { return table[i].namespace }   // (#148) allocation-free qualified compare
         i++
     }
     ""

@@ -122,11 +122,17 @@ __attribute__((constructor)) static void tk_rt_install_crash_handler(void) {
 }
 
 // --- string interpolation builders (self-host parity) ---
+// (#148 dark matter) obs hooks for the MALLOC-backed str/format helpers (invisible to the arena
+// tables): attribute fresh-buffer bytes to the CALLING fn. Fwd decls — the obs block lives below.
+static int tk_obs_enabled(void);
+static void tk_obs_mstr_note(size_t n, void *ra);
+
 // tk_str_concat — a fresh buffer = a.ptr[0..a.len] ++ b.ptr[0..b.len]; the result OWNS it.
 // Allocation failure PANICS (M.1 fail-loud, never silent corruption). Leak-tolerant (M.5 —
 // short-lived); a zero-length result uses a 1-byte buffer so ptr is never NULL+len mismatch.
 tk_str tk_str_concat(tk_str a, tk_str b) {
     size_t n = a.len + b.len;
+    if (tk_obs_enabled() == 1) tk_obs_mstr_note(n ? n : 1, __builtin_return_address(0));
     tk_byte *buf = malloc(n ? n : 1);
     if (buf == NULL) tk_panic("out of memory (str concat)");
     if (a.len) memcpy(buf, a.ptr, a.len);
@@ -176,6 +182,7 @@ tk_str tk_u64_to_str(uint64_t v) {
     size_t i = 0;
     if (v == 0) { tmp[i++] = '0'; }
     else { while (v > 0) { tmp[i++] = (char)('0' + (v % 10)); v /= 10; } }
+    if (tk_obs_enabled() == 1) tk_obs_mstr_note(i ? i : 1, __builtin_return_address(0));
     tk_byte *buf = malloc(i ? i : 1);
     if (buf == NULL) tk_panic("out of memory (int to str)");
     for (size_t j = 0; j < i; j += 1) buf[j] = (tk_byte)tmp[i - 1 - j];   // reverse
@@ -202,6 +209,7 @@ tk_str tk_i64_to_str(int64_t v) {
 // str. A zero-length result uses a 1-byte buffer so ptr is never NULL with a stale len.
 tk_str tk_str_of_bytes(tk_str bytes) {
     size_t n = bytes.len;
+    if (tk_obs_enabled() == 1) tk_obs_mstr_note(n ? n : 1, __builtin_return_address(0));
     tk_byte *buf = malloc(n ? n : 1);
     if (buf == NULL) tk_panic("out of memory (str of bytes)");
     if (n) memcpy(buf, bytes.ptr, n);
@@ -541,17 +549,17 @@ bool tk_str_eq(tk_str a, tk_str b) {
     return memcmp(a.ptr, b.ptr, a.len) == 0;
 }
 
-// tk_str_slice — the bytes [start, end) COPIED into a fresh owned str. Bounds: an out-of-range
+// tk_str_slice — the bytes [start, end) as a ZERO-COPY VIEW into the parent str (#148). SAFE
+// because a Teko `str` is IMMUTABLE and its buffer is never individually freed (arena/root or
+// malloc'd-and-retained; mem::free frees only []T slice buffers, and str() snapshots its input),
+// so a view has exactly the parent's lifetime and is observably identical to the old fresh-owned
+// copy — while eliminating the dominant allocation in the compiler (measured 108M tiny copies /
+// 762 MB + malloc overhead on a self-build via name_last_segment alone). Bounds: an out-of-range
 // slice (start > end, or end past the byte length) PANICS (M.1, fail-loud — matches the VM's
-// index bounds check). The empty slice (start == end, in range) uses a 1-byte buffer so ptr is
-// never NULL with a stale len (parity with tk_str_concat's zero-length handling).
+// index bounds check). An empty slice keeps a valid non-NULL ptr into the parent.
 tk_str tk_str_slice(tk_str s, uint64_t start, uint64_t end) {
     if (start > end || end > s.len) tk_panic("string slice out of range");
-    size_t n = (size_t)(end - start);
-    tk_byte *buf = malloc(n ? n : 1);
-    if (buf == NULL) tk_panic("out of memory (str slice)");
-    if (n) memcpy(buf, s.ptr + start, n);
-    return (tk_str){ buf, n };
+    return (tk_str){ s.ptr + start, (size_t)(end - start) };
 }
 
 // tk_str_slice_to — slice from the start to `end`.
@@ -855,6 +863,15 @@ static unsigned long long tk_obs_push2_bytes = 0;
 // (#148 miss-reason) WHY did the live-tail witness fail, split small vs BIG (>1 MB) grows:
 // [0]=slot empty  [1]=slot holds another ptr  [2]=ptr matches, len differs  [3]=cap full (legit doubling)  [4]=esz/region/gen mismatch
 static unsigned long long tk_obs_miss[5], tk_obs_miss_big[5];
+// (#148 dark matter) fresh MALLOC'd str/format buffers (tk_str_concat / slice / of_bytes /
+// u64_to_str — outside the arena, invisible to the tables above), attributed to the CALLING fn.
+static tk_obs_site tk_obs_mstr[TK_OBS_CAP];
+static unsigned long long tk_obs_mstr_bytes = 0, tk_obs_mstr_count = 0;
+static void tk_obs_add(tk_obs_site *tab, void *ra, size_t n);   // fwd — defined just below
+static void tk_obs_mstr_note(size_t n, void *ra) {
+    tk_obs_mstr_bytes += n; tk_obs_mstr_count += 1;
+    tk_obs_add(tk_obs_mstr, ra, n);
+}
 static unsigned long long tk_obs_root_bytes = 0, tk_obs_scoped_bytes = 0;
 static unsigned long long tk_obs_drop_bytes = 0;     // bytes reclaimed by tk_region_drop (chunk `used` sums)
 static unsigned long long tk_obs_rewind_bytes = 0;   // bytes reclaimed by tk_arena_pop rewinds
@@ -918,6 +935,19 @@ static void tk_obs_dump(void) {
             tk_obs_miss[0], tk_obs_miss_big[0], tk_obs_miss[1], tk_obs_miss_big[1],
             tk_obs_miss[2], tk_obs_miss_big[2], tk_obs_miss[3], tk_obs_miss_big[3],
             tk_obs_miss[4], tk_obs_miss_big[4]);
+    tk_obs_dump_table(fp, "MALLOC'd str/format buffers by CALLING fn (#148 dark matter)", tk_obs_mstr, tk_obs_mstr_bytes);
+    fprintf(fp, "=== MALLOC str total: %.1f MB across %llu buffers ===\n", (double)tk_obs_mstr_bytes / 1048576.0, tk_obs_mstr_count);
+    // (#148 dark matter) CHUNK accounting — how much malloc'd arena capacity is NOT covered by the
+    // attributed `used` bytes (bump-tail waste + alignment padding), per live region, summed.
+    {
+        unsigned long long cap = 0, used = 0, nchunks = 0, nregs = 0;
+        for (tk_region *r = tk_g_regs; r != NULL; r = r->reg_next) {
+            nregs += 1;
+            for (struct tk_chunk *c = r->head; c != NULL; c = c->next) { nchunks += 1; cap += c->cap; used += c->used; }
+        }
+        fprintf(fp, "=== CHUNKS: %llu regions, %llu chunks, malloc'd cap %.1f MB, used %.1f MB, tail-waste %.1f MB ===\n",
+                nregs, nchunks, (double)cap / 1048576.0, (double)used / 1048576.0, (double)(cap - used) / 1048576.0);
+    }
     if (fp != stderr) fclose(fp);
 }
 

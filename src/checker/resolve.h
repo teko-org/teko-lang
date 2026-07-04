@@ -31,6 +31,7 @@ tk_str type_ns_of(tk_type_table table, tk_str name);
 // checker/codegen/vm twins. qualify: (ns,name)→"ns::Name" (bare at root); name_last_segment: the bare
 // tail after the final "::"; name_qualifier: the ns before it; mangle_ns_frag: "::"→"__" symbol fragment.
 tk_str tk_qualify(tk_str ns, tk_str name);
+bool tk_qualify_eq(tk_str ns, tk_str bare, tk_str name);   // (#148) qualify(ns,bare)==name without building the string
 tk_str tk_name_last_segment(tk_str name);
 tk_str tk_name_qualifier(tk_str name);
 tk_str tk_mangle_ns_frag(tk_str name);
