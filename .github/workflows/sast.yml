@@ -25,8 +25,8 @@ jobs:
         with:
           filters: |
             run:
-              - 'src/**'
-              - 'CMakeLists.txt'
+              - 'src/runtime/**'
+              - 'src/assert/**'
               - '.github/workflows/sast.yml'
               - '.github/sast-baseline.txt'
 
@@ -44,26 +44,21 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install build dependencies
+      - name: Install clang-tidy
         run: |
           sudo rm -f /etc/apt/sources.list.d/microsoft*.list /etc/apt/sources.list.d/azure*.list /etc/apt/sources.list.d/azure-cli*.list 2>/dev/null || true
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build clang clang-tidy
+          sudo apt-get install -y clang clang-tidy
 
-      - name: Generate compile_commands.json
+      # Teko-only: the compiler is now the released binary and its C twins are FROZEN, so
+      # clang-tidy scans the LIVE maintained C — the runtime seam (teko_rt.c) + the assert
+      # seed that are linked into every generated program. No cmake / compiler C build.
+      - name: Run clang-tidy on the live runtime C
         run: |
-          cmake -S . -B build-ct \
-            -G "Ninja" \
-            -DCMAKE_C_COMPILER=clang \
-            -DCMAKE_BUILD_TYPE=Debug \
-            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
-          cmake --build build-ct --target teko --parallel 4
-
-      - name: Run clang-tidy
-        run: |
-          run-clang-tidy -p build-ct src/ \
+          clang-tidy src/runtime/teko_rt.c src/assert/assert.c \
             -checks='-*,clang-analyzer-*,cert-*,bugprone-*,-clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling' \
             -warnings-as-errors='clang-analyzer-security.*,clang-analyzer-core.NullDereference' \
+            -- -std=c23 -Isrc/runtime -Isrc/assert \
             2>&1 | tee clang-tidy-results.txt || true
 
       - name: Upload clang-tidy results
