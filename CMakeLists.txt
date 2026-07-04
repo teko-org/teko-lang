@@ -175,7 +175,7 @@ else()
 endif()
 message(STATUS "teko: TEKO_VERSION_STRING = ${TEKO_VERSION_STRING} (from teko.tkp)")
 target_compile_definitions(teko PRIVATE
-    TEKO_VERSION_STRING="${TEKO_VERSION_STRING}")
+    TEKO_VERSION_STRING=${TEKO_VERSION_STRING})
 
 # --- SELF-HOST: the native build of teko's OWN corpus — THE end-to-end validation ----------
 # `teko build .` runs the full pipeline (read → lex → parse → check → native codegen → cc link),

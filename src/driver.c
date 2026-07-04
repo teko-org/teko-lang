@@ -339,15 +339,16 @@ static int run_cc(const char *cfile, const char *binary, tk_manifest m) {
     // build and project.tks::run_cc's -D flag. RAW `version` + `-<suffix>` (no gen substitution).
     char *verdef = NULL;
     {
-        size_t base = strlen("-DTEKO_VERSION_STRING=\"\"");
+        // BARE token (teko_rt.c stringizes) — embedded quotes broke Windows arg re-parsing.
+        size_t base = strlen("-DTEKO_VERSION_STRING=");
         size_t vl = base + m.version.len + (m.suffix.len ? 1 + m.suffix.len : 0) + 1;
         verdef = tk_alloc(vl);
         if (m.suffix.len)
-            snprintf(verdef, vl, "-DTEKO_VERSION_STRING=\"%.*s-%.*s\"",
+            snprintf(verdef, vl, "-DTEKO_VERSION_STRING=%.*s-%.*s",
                      (int)m.version.len, (const char *)m.version.ptr,
                      (int)m.suffix.len,  (const char *)m.suffix.ptr);
         else
-            snprintf(verdef, vl, "-DTEKO_VERSION_STRING=\"%.*s\"",
+            snprintf(verdef, vl, "-DTEKO_VERSION_STRING=%.*s",
                      (int)m.version.len, (const char *)m.version.ptr);
     }
 
