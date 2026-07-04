@@ -70,8 +70,16 @@ mkdir -p "$STAGE"
 cp "$BIN_PATH" "$STAGE/$BIN_NAME"
 
 if [ "$OS" = "windows" ]; then
-    # zip is available on the windows-latest runner (Git-Bash / PowerShell Compress).
-    ( cd "$STAGE" && zip -q -X "../${BIN_ARCHIVE}.zip" "$BIN_NAME" )
+    # Git-Bash on the hosted Windows runners has NO `zip` binary (the first release run died
+    # with exit 127 here); 7-Zip IS preinstalled. Prefer zip when present (local setups),
+    # else 7z, else PowerShell Compress-Archive as the last resort.
+    if command -v zip >/dev/null 2>&1; then
+        ( cd "$STAGE" && zip -q -X "../${BIN_ARCHIVE}.zip" "$BIN_NAME" )
+    elif command -v 7z >/dev/null 2>&1; then
+        ( cd "$STAGE" && 7z a -tzip -bso0 -bsp0 "../${BIN_ARCHIVE}.zip" "$BIN_NAME" >/dev/null )
+    else
+        pwsh -NoProfile -Command "Compress-Archive -Path '$STAGE/$BIN_NAME' -DestinationPath '$OUT_DIR/${BIN_ARCHIVE}.zip' -Force"
+    fi
     BIN_OUT="${BIN_ARCHIVE}.zip"
 else
     tar -C "$STAGE" -czf "$OUT_DIR/${BIN_ARCHIVE}.tar.gz" "$BIN_NAME"
