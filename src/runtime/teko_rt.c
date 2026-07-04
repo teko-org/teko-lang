@@ -838,6 +838,13 @@ static void *tk_free_take(size_t an) {              // an: already 16-rounded by
 typedef struct { void *ra; unsigned long long bytes, count; } tk_obs_site;
 static tk_obs_site tk_obs_root[TK_OBS_CAP];    // allocations landing in the ROOT region (never freed today)
 static tk_obs_site tk_obs_scoped[TK_OBS_CAP];  // allocations landing in scoped regions (freed at drop)
+// (#148 RA1) copy-grow bytes attributed to the GENERATED CALLING FN (not tk_slice_push itself, which
+// the RA0 tables blame as one opaque line). tk_slice_push (the root wrapper) parks ITS caller's RA in
+// tk_g_push_ra so the core can attribute through the wrapper hop. A separate VIEW of the same bytes —
+// overlaps the root/scoped tables by design (different aggregation of the same allocations).
+static tk_obs_site tk_obs_push[TK_OBS_CAP];
+static unsigned long long tk_obs_push_bytes = 0;
+static void *tk_g_push_ra = NULL;
 static unsigned long long tk_obs_root_bytes = 0, tk_obs_scoped_bytes = 0;
 static unsigned long long tk_obs_drop_bytes = 0;     // bytes reclaimed by tk_region_drop (chunk `used` sums)
 static unsigned long long tk_obs_rewind_bytes = 0;   // bytes reclaimed by tk_arena_pop rewinds
@@ -895,6 +902,7 @@ static void tk_obs_dump(void) {
             live ? 100.0 * (double)reclaimed / (double)live : 0.0);
     tk_obs_dump_table(fp, "ROOT-lifetime bytes by call site", tk_obs_root, tk_obs_root_bytes);
     tk_obs_dump_table(fp, "SCOPED-lifetime bytes by call site", tk_obs_scoped, tk_obs_scoped_bytes);
+    tk_obs_dump_table(fp, "PUSH copy-grow bytes by CALLING fn (RA1, #148)", tk_obs_push, tk_obs_push_bytes);
     if (fp != stderr) fclose(fp);
 }
 
@@ -1592,12 +1600,20 @@ void *tk_slice_push_r(const void *ptr, uint64_t len, const void *elem, uint64_t 
         memcpy((char *)ptr + len * esz, elem, esz);
         tk_push_cache[h].len = len + 1;
         *out_len = len + 1;
+        if (tk_g_push_ra != NULL) tk_g_push_ra = NULL;   // (#148 RA1) consume the wrapper's parked RA (NULL when obs off — predictable, ~free)
         return (void *)ptr;
     }
     // copy-grow geometrically into a fresh buffer (the old one is left intact — value semantics).
     // Root goes through tk_alloc (keeps the obs RA0 attribution + free-list reuse); a frame region
     // bumps directly (no free-list — that is root-only by design).
     uint64_t cap = (len < 4) ? 8 : (len * 2);
+    // (#148 RA1) attribute this grow to the GENERATED calling fn: the wrapper parked its caller's RA
+    // in tk_g_push_ra; a direct (routed) call attributes its own return address.
+    if (tk_obs_enabled() == 1) {
+        void *ra1 = tk_g_push_ra != NULL ? tk_g_push_ra : __builtin_return_address(0);
+        tk_obs_push_bytes += cap * esz; tk_obs_add(tk_obs_push, ra1, cap * esz);
+    }
+    tk_g_push_ra = NULL;
     void *buf = (region == tk_g_root) ? tk_alloc(cap * esz) : tk_region_alloc(region, cap * esz);
     if (len && ptr != NULL) memcpy(buf, ptr, len * esz);
     memcpy((char *)buf + len * esz, elem, esz);
@@ -1611,6 +1627,9 @@ void *tk_slice_push_r(const void *ptr, uint64_t len, const void *elem, uint64_t 
 
 // the default root-region lowering (unchanged contract) — a thin wrapper over the region-aware core.
 void *tk_slice_push(const void *ptr, uint64_t len, const void *elem, uint64_t esz, uint64_t *out_len) {
+    // (#148 RA1) park THIS caller's return address so the core attributes the grow to the generated
+    // fn, not to this wrapper hop. Only under obs (zero writes when off).
+    if (tk_obs_enabled() == 1) tk_g_push_ra = __builtin_return_address(0);
     return tk_slice_push_r(ptr, len, elem, esz, out_len, tk_region_root());
 }
 

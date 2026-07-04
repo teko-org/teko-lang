@@ -915,7 +915,7 @@ fn cg_opt_mangle(buf: []byte, inner: checker::Type) -> []byte | error {
         checker::Char  => cb(buf, "char")
         checker::Str   => cb(buf, "str")
         checker::Error => cb(buf, "error")
-        checker::Named as nm => cb_str(buf, nm.name)
+        checker::Named as nm => cb_str(buf, checker::name_last_segment(nm.name))   // (#149) BARE key — the (#109 W3) canonical nm.name carries `::` (invalid C); mirror cg_opt_mangle_str and the C twin (tk_name_last_segment)
         checker::Optional as o => match o.inner {
             checker::Void => error { message = "codegen: nested bare-null optional (internal)" }
             _ => cg_opt_mangle(cb(buf, "opt_"), o.inner)
@@ -3795,7 +3795,7 @@ fn cg_emit_tag_prefix(buf: []byte, variantT: checker::Type) -> []byte | error {
             }
             cb(out, "_")
         }
-        checker::Named as nm => { out = cb_upper(out, nm.name); cb(out, "_") }
+        checker::Named as nm => { out = cb_upper(out, checker::name_last_segment(nm.name)); cb(out, "_") }   // (#109 W3/#149) BARE variant name for the TK_TAG_ constant (mirror C)
         _ => error { message = "codegen: tag prefix over a non-variant subject (internal)" }
     }
 }
@@ -5647,14 +5647,14 @@ fn emit_type_decl(buf: []byte, prog: checker::TProgram, d: parser::TypeDecl) -> 
             }
             // 1) the tag enum: TK_TAG_<UPPER Name>_<UPPER memberKey> per member.
             mut out = cb(buf, "typedef enum tk_tag_")
-            out = cb_str(out, d.name)
+            out = cb_tysym(out, d.name)   // (#149) canonical d.name carries `::` → collapse (mirror C's cb_tysym)
             out = cb(out, " {\n")
             mut i = 0
             loop {
                 if i >= members.len { break }
                 let mk = match cg_member_key_texpr_str(members[i]) { str as s => s; error as err => return err }
                 out = cb(out, "    TK_TAG_")
-                out = cb_upper(out, d.name)
+                out = cb_upper(out, checker::name_last_segment(d.name))   // (#109 W3) BARE enum name (mirror C)
                 out = cb(out, "_")
                 out = cb_upper(out, mk)
                 if i + 1 < members.len { out = cb(out, ",") }
@@ -5662,14 +5662,14 @@ fn emit_type_decl(buf: []byte, prog: checker::TProgram, d: parser::TypeDecl) -> 
                 i++
             }
             out = cb(out, "} tk_tag_")
-            out = cb_str(out, d.name)
+            out = cb_tysym(out, d.name)   // (#149) collapse
             out = cb(out, ";\n\n")
             // 2) the value: tag + union as. Each union field is named by the member KEY and
             //    typed via emit_type_expr (covers named/error/prim/slice/optional members).
             out = cb(out, "typedef struct ")
             out = mangle_type_name(out, "", d.name)
             out = cb(out, " {\n    tk_tag_")
-            out = cb_str(out, d.name)
+            out = cb_tysym(out, d.name)   // (#149) collapse
             out = cb(out, " tag;\n    union {\n")
             mut j = 0
             loop {
