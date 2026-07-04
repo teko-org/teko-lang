@@ -6,7 +6,7 @@ Thanks for your interest! Teko is a young, fast-moving project with a few **non-
 
 ### 1. The SUPREME RULE — zero `.c`/`.h` ↔ `.tks` misalignment
 
-The compiler exists twice: the canonical Teko source (`src/**/*.tks`) and its C23 bootstrap mirror (`src/**/*.{c,h}`). **Every behavioral change to one side must be mirrored to its twin in the same PR.** A clean C build is *not* parity evidence (C `switch` `default:` arms can silently swallow missing cases) — mirror deliberately, not by compiler feedback.
+**Teko-only (ruling 2026-07-04):** the compiler's canonical source is Teko (`src/**/*.tks`) and ALL new work is implemented in Teko only. The C23 files (`src/**/*.{c,h}` except the runtime) are the FROZEN historical bootstrap — do NOT extend them for new features; the bootstrap seed is the previous released `teko` binary (or the released `teko-bootstrap-src` any-cc snapshot). The one exception is `src/runtime/teko_rt.{c,h}` (and `src/assert/assert.{c,h}`): the execution runtime linked into generated programs stays maintained C — it is the FFI seam, not mirrored compiler logic. Until CI seeds from the released binary, compiler sources must not USE a new language feature in their own code (implement feature X written in the pre-X feature set; the corpus may adopt X once a seed containing X exists).
 
 ### 2. Differential equivalence — VM == native
 
@@ -31,7 +31,7 @@ Language-design tensions are resolved by the laws in [TEKO_CONSTITUTION.md](TEKO
 
 - **Base your PRs on `main`** (`gh pr create --base main`). The pre-reboot line lives on in git history only; `main` is the active development line (promoted from `chore/reboot` via PR #25).
 - Use **Conventional Commits** (`feat(parser): …`, `fix(vm): …`, `docs: …`, `chore: …`).
-- Keep PRs focused: one feature/fix per PR, with its mirror changes and tests included.
+- Keep PRs focused: one feature/fix per PR, with its tests and regression examples included.
 
 ## Tests
 

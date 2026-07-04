@@ -2,6 +2,12 @@
 
 > **Status:** active · **Created:** 2026-06-25 · **Branch:** `main` (the reboot line, promoted via PR #25)
 >
+> **⚖️ RULING 2026-07-04 — TEKO-ONLY:** mirroring is over. Everything pending is implemented in
+> Teko (`.tks`) alone; the C twins are frozen at `0.0.1.3-bootstrap` as the historical bootstrap
+> (runtime `teko_rt.c` excepted — it stays maintained C). The bootstrap seed is the previous
+> released `teko` binary. The full backlog lives as ordered GitHub issues #157–#234 (labels
+> `fase-1-linguagem` … `fase-6-qualidade`).
+>
 > This is the single, ordered execution sequence for ALL open teko-lang work. It consolidates:
 > the legislator's session critiques/directives, and every not-yet-done item mined from
 > `TEKO_CORRECTION_PLAN.md`, `TEKO_EVOLUTION_DESIGN.md`, `TEKO_EVOLUTION_JUSTIFICATION.md`,
