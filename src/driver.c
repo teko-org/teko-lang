@@ -941,7 +941,13 @@ int tk_compile_project_g(const char *dir, const char *out_dir, bool gen_cov) {
                     dir, (unsigned long long)bcov, (unsigned long long)m.cov_branches);
             return 1;
         }
-        prog = strip_tests(prog);          // a release binary carries no test code
+        // (#151) RE-FRONT-END without the `.tkt` files for the RELEASE program: strip_tests only
+        // removes `#test` FUNCTIONS — .tkt-declared types/helpers/fixtures survived into the
+        // production binary. Re-assembling without tests strips by PROVENANCE. quiet=true: the
+        // file map already printed. (Mirrors project.tks; strip_tests stays as a belt/no-op.)
+        int rrc = frontend_body(dir, &prog, &m, false, true);
+        if (rrc != 0) return rrc;
+        prog = strip_tests(prog);
     }
     // else: no `#test` functions → ignore the gate, build the production program.
 

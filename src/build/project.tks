@@ -635,7 +635,14 @@ fn compile_project_g(dir: str, out_dir: str, gen_cov: bool) -> i32 {
             if bcov < fe.manifest.cov_branches {
                 return fail(dir, $"branch coverage {bcov}% is below the {fe.manifest.cov_branches}% floor ([coverage] branches) — add tests")
             }
-            backend(dir, fe.manifest.name, out_dir, strip_tests(fe.prog), fe.manifest)
+            // (#151) RE-FRONT-END without the `.tkt` files for the RELEASE program: strip_tests only
+            // removes `#test` FUNCTIONS — types/classes/vtables/helpers declared in .tkt files
+            // survived into the production binary (dead-strip inventory: ~217 test symbols).
+            // Re-assembling without tests removes them by PROVENANCE (the .tkt files are never even
+            // parsed into this program). quiet=true: the file map was already printed by the first
+            // pass. strip_tests stays as a belt (a no-op here — no .tkt items exist to carry #test).
+            let rel = match frontend_body(false, true) { Frontend as f => f; error as e => return fail(dir, e.message) }
+            backend(dir, rel.manifest.name, out_dir, strip_tests(rel.prog), rel.manifest)
         }
         // `.tkt` tests (or the production code) could not be ASSEMBLED/typechecked. With tests present,
         // that is a hard BUILD FAILURE — no graceful degradation (the gate is strict; only a project
