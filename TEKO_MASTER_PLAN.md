@@ -8,6 +8,13 @@
 > released `teko` binary. The full backlog lives as ordered GitHub issues #157–#234 (labels
 > `fase-1-linguagem` … `fase-6-qualidade`).
 >
+> **⚖️ RULING 2026-07-04 — W15-FROM-NOW (style applied continuously):** the W15/C11 quality
+> standard applies to ALL new AND changed code from now, not deferred to the final sweep.
+> Comments are doc-comments (`/** */`) on declarations only — no inline comments; flatten
+> aggressively (early returns / guard clauses) and extract functions to cut cyclomatic
+> complexity where flattening is impossible. Touched code is cleaned as part of the change.
+> Phase 11 (W15) is therefore a VERIFICATION pass, and `teko lint` (#231) encodes the rules.
+>
 > This is the single, ordered execution sequence for ALL open teko-lang work. It consolidates:
 > the legislator's session critiques/directives, and every not-yet-done item mined from
 > `TEKO_CORRECTION_PLAN.md`, `TEKO_EVOLUTION_DESIGN.md`, `TEKO_EVOLUTION_JUSTIFICATION.md`,

@@ -43,7 +43,8 @@ Language-design tensions are resolved by the laws in [TEKO_CONSTITUTION.md](TEKO
 
 - Write self-explanatory code; avoid cryptic mnemonic abbreviations.
 - Teko style laws (enforced by the grammar itself in several cases): the only loop is `loop { … }` (no `while`/`for`); never `match` on a bool — use `if`/`else`; casts go `bool → numeric`, never `T → bool` (use `x != 0`).
-- Comments state constraints the code can't show — not narration of what the next line does.
+- **Comments = doc-comments only (ruling 2026-07-04, W15-from-now).** Every comment on a function, type, or member is a `/** … */` doc-comment attached to the declaration. Do NOT write inline comments (`// …` mid-body or trailing). If a line genuinely needs explaining, that is the signal to extract a well-named function instead of annotating it. This applies to **new code AND any code you touch** — a changed function's old inline comments are cleaned as part of the change, not left behind.
+- **Flatten; no "Hadouken" code (same ruling).** No deep-nested pyramids (`if { if { if … } }`, nested `match` arms). Flatten with early returns / guard clauses / continues. Where flattening is impossible, **extract a function/method** to cut cyclomatic complexity and keep functions short and single-purpose (and files from growing unbounded). New and touched code both land in this shape — we apply the W15 quality standard as-you-go so the final sweep is only verification.
 
 ## Reporting issues
 
