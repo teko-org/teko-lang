@@ -252,12 +252,17 @@ tk_str tk_mangle_ns_frag(tk_str name) {
 
 tk_decl_result tk_type_table_find(tk_type_table table, tk_str name, tk_str ref_ns) {
     (void)ref_ns;   // (#109) resolved-name probe — namespace-blind (every caller passes ref_ns = "")
+    // (#152) TWO PASSES: pass 1 = exact name OR the entry's qualified form (both UNIQUE post-W0's
+    // per-namespace dup ban) — so a canonical query can never be stolen by a same-bare cousin that
+    // merely appears earlier in the table (discovery order differs per platform). Pass 2 = the
+    // legacy bare last-segment fallback (bare probes of a CANONICAL-keyed type_table_of table).
     for (size_t i = 0; i < table.len; i += 1) {
-        // (#109 W3) exact; OR the entry's qualified form == a canonical query; OR the entry's bare
-        // last-segment == a bare query (a bare decl field probing a CANONICAL-keyed type_table_of table).
-        if (name_eq(table.ptr[i].name, name) || tk_qualify_eq(table.ptr[i].namespace, table.ptr[i].name, name) || name_eq(tk_name_last_segment(table.ptr[i].name), name)) {   // (#148) allocation-free qualified compare
+        if (name_eq(table.ptr[i].name, name) || tk_qualify_eq(table.ptr[i].namespace, table.ptr[i].name, name))   // (#148) allocation-free qualified compare
             return (tk_decl_result){ .ok = true, .as.value = table.ptr[i].decl };
-        }
+    }
+    for (size_t j = 0; j < table.len; j += 1) {
+        if (name_eq(tk_name_last_segment(table.ptr[j].name), name))
+            return (tk_decl_result){ .ok = true, .as.value = table.ptr[j].decl };
     }
     return (tk_decl_result){ .ok = false, .as.error = tk_error_make("not a user type") };
 }
@@ -1195,7 +1200,13 @@ static bool iface_extends_reaches(tk_str sub, tk_str want, tk_type_table table, 
     if (!d.ok || d.as.value.body.tag != TK_BODY_INTERFACE) return false;
     tk_interface_body ib = d.as.value.body.as.interface_body;
     for (size_t i = 0; i < ib.n_extends; i += 1) {
-        if (name_eq(tk_name_last_segment(ib.extends[i]), tk_name_last_segment(want))) return true;   /* (#109 W3) compare bare */
+        /* (#152) EXACT compare when BOTH sides are qualified (post canon_class_bases the entries
+           are canonical whenever they resolve); a bare side keeps the bare compare. */
+        if (tk_name_qualifier(ib.extends[i]).len > 0 && tk_name_qualifier(want).len > 0) {
+            if (name_eq(ib.extends[i], want)) return true;
+        } else {
+            if (name_eq(tk_name_last_segment(ib.extends[i]), tk_name_last_segment(want))) return true;
+        }
         if (iface_extends_reaches(ib.extends[i], want, table, depth - 1)) return true;
     }
     return false;
@@ -1226,7 +1237,12 @@ bool tk_type_conforms_to(tk_str name, tk_str iface, tk_type_table table) {
             return false;
         }
         for (size_t i = 0; i < n_impls; i += 1) {
-            if (name_eq(tk_name_last_segment(impls[i]), tk_name_last_segment(iface))) return true;   /* (#109 W3) compare bare */
+            /* (#152) EXACT when BOTH qualified (see iface_extends_reaches); bare-compat otherwise. */
+            if (tk_name_qualifier(impls[i]).len > 0 && tk_name_qualifier(iface).len > 0) {
+                if (name_eq(impls[i], iface)) return true;
+            } else {
+                if (name_eq(tk_name_last_segment(impls[i]), tk_name_last_segment(iface))) return true;
+            }
             if (iface_extends_reaches(impls[i], iface, table, 64)) return true;
         }
         if (!has_base) return false;

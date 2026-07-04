@@ -594,7 +594,7 @@ static tk_tfunction_result type_method(tk_function f, tk_str struct_name, tk_env
         local = tk_env_define(local, f.params[i].name, pt, false);
     }
     if (inject_base_binding)
-        local = tk_env_define(local, base_binding_name, (tk_type){ .tag = TK_TYPE_NAMED, .as.named = { tk_qualify(env.cur_ns, base_name) } }, false);   /* (#109 W3) canonical: base type qualified by the class's own ns */
+        local = tk_env_define(local, base_binding_name, (tk_type){ .tag = TK_TYPE_NAMED, .as.named = { tk_name_qualifier(base_name).len > 0 ? base_name : tk_qualify(env.cur_ns, base_name) } }, false);   /* (#109 W3 / #152) canonical: base_name arrives PRE-QUALIFIED from canon_class_bases (cross-ns exact); a bare (unresolvable/root) one qualifies by the class's own ns */
     tk_type ret = function_return(f, tbl, env.cur_ns);   // (#109 W1) ref_ns = the fn's enclosing namespace
     if (ret.tag == TK_TYPE_REF)
         return (tk_tfunction_result){ .ok = false, .as.error = tk_error_make("a function cannot return a reference (pass-down only)") };
@@ -635,7 +635,7 @@ static tk_tfunction_result type_method(tk_function f, tk_str struct_name, tk_env
         bind_stmt.as.binding.kind = TK_BIND_LET;
         bind_stmt.as.binding.target.tag = TK_BIND_SIMPLE;
         bind_stmt.as.binding.target.as.simple.name = base_binding_name;
-        bind_stmt.as.binding.bound = (tk_type){ .tag = TK_TYPE_NAMED, .as.named = { tk_qualify(env.cur_ns, base_name) } };   /* (#109 W3) canonical: base bound type qualified by the class's own ns */
+        bind_stmt.as.binding.bound = (tk_type){ .tag = TK_TYPE_NAMED, .as.named = { tk_name_qualifier(base_name).len > 0 ? base_name : tk_qualify(env.cur_ns, base_name) } };   /* (#109 W3 / #152) canonical: base_name arrives PRE-QUALIFIED from canon_class_bases; a bare one qualifies by the class's own ns */
         bind_stmt.as.binding.value = self_var;
         tk_tstatement *new_body = tk_alloc((nbody + 1) * sizeof *new_body);
         new_body[0] = bind_stmt;
@@ -772,7 +772,7 @@ tk_tprogram_result tk_type_program_with_deps(tk_program program, tk_tprogram dep
     // typer.tks::type_program_with_deps.
     { tk_fold_traits_result fr = tk_fold_traits(program);
       if (!fr.ok) return (tk_tprogram_result){ .ok = false, .as.error = fr.as.error };
-      program = fr.as.value; }
+      program = tk_canon_class_bases(fr.as.value); }   // (#152) base_name -> qualified, order-independent base hops
     // Seed from dep (adds dep type decls + fn signatures).
     tk_collected_result seed_r = tk_seed_from_dep(dep_prog, tk_type_table_empty(), tk_env_empty());
     if (!seed_r.ok) return (tk_tprogram_result){ .ok = false, .as.error = seed_r.as.error };
@@ -842,7 +842,7 @@ tk_tprogram_result tk_type_program(tk_program program) {
     // stays registered (for honest value-position/instantiation errors) but is never emitted.
     { tk_fold_traits_result fr = tk_fold_traits(program);
       if (!fr.ok) return (tk_tprogram_result){ .ok = false, .as.error = fr.as.error };
-      program = fr.as.value; }
+      program = tk_canon_class_bases(fr.as.value); }   // (#152) base_name -> qualified, order-independent base hops
     tk_collected_result c = tk_collect(program);
     if (!c.ok) return (tk_tprogram_result){ .ok = false, .as.error = c.as.error };
     // W-vis-enforce: enforce the module system (namespace qualification + pub/exp) over the

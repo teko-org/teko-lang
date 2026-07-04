@@ -2795,7 +2795,7 @@ fn type_method(f: parser::Function, struct_name: str, env: Env, table: TypeTable
         local = define(local, f.params[i].name, pt, false)
         i++
     }
-    if inject_base_binding { local = define(local, base_binding_name, Named { name = qualify(env.cur_ns, base_name) }, false) }   // (#109 W3) canonical: base type qualified by the class's own ns
+    if inject_base_binding { local = define(local, base_binding_name, Named { name = if name_qualifier(base_name) != "" { base_name } else { qualify(env.cur_ns, base_name) } }, false) }   // (#109 W3 / #152) canonical: base_name arrives PRE-QUALIFIED from canon_class_bases (cross-ns exact); a bare (unresolvable/root) one qualifies by the class's own ns
     let ret = match function_return(f, tbl, env.cur_ns) { Type as t => t; error as e => return e }   // (#109 W1) ref_ns = the fn's enclosing namespace
     match ret { Reference => return error { message = "a function cannot return a reference (pass-down only)" }; _ => {} }
     if f.is_extern {
@@ -2829,7 +2829,7 @@ fn type_method(f: parser::Function, struct_name: str, env: Env, table: TypeTable
             type = Named { name = qualify(env.cur_ns, struct_name) }   // (#109 W3) canonical: self's concrete subclass type qualified by the method's ns
             line = 0; col = 0
         }
-        let bind_stmt = TBinding { kind = parser::BindKind::Let; target = parser::SimpleName { name = base_binding_name }; bound = Named { name = qualify(env.cur_ns, base_name) }; value = cast_val }   // (#109 W3) canonical: base bound type qualified by the class's own ns
+        let bind_stmt = TBinding { kind = parser::BindKind::Let; target = parser::SimpleName { name = base_binding_name }; bound = Named { name = if name_qualifier(base_name) != "" { base_name } else { qualify(env.cur_ns, base_name) } }; value = cast_val }   // (#109 W3 / #152) canonical: base_name arrives PRE-QUALIFIED from canon_class_bases; a bare one qualifies by the class's own ns
         mut prefixed: []TStatement = teko::list::push(teko::list::empty(), bind_stmt)
         mut si = 0
         loop { if si >= tb.stmts.len { break }; prefixed = teko::list::push(prefixed, tb.stmts[si]); si++ }
@@ -3000,7 +3000,8 @@ pub fn type_program_with_deps(raw_program: parser::Program, dep_prog: TProgram) 
     // the .tkb codec does not carry trait bodies — the same method-serialization gap as
     // struct/class methods — so a dep trait name in an `&`-list surfaces as the conformance
     // check's honest "not an interface" error rather than a silent half-fold).
-    let program = match fold_traits(raw_program) { parser::Program as p => p; error as e => return e }
+    let program0 = match fold_traits(raw_program) { parser::Program as p => p; error as e => return e }
+    let program = canon_class_bases(program0)   // (#152) base_name -> qualified, order-independent base hops
     // Seed from dep first (build base table + env from dep's type decls + fn signatures).
     let seed_empty = Collected { types = teko::list::empty(); env = env_empty() }
     let seed = match seed_from_dep(dep_prog, seed_empty.types, seed_empty.env) {
@@ -3092,7 +3093,8 @@ pub fn type_program(raw_program: parser::Program) -> TProgram | error {
     // (TR0) FOLD trait derivations FIRST — every later stage (collect, conformance, typing,
     // codegen layout, the VM) sees each deriver's already-folded body; a trait decl itself stays
     // registered (for honest value-position/instantiation errors) but is never emitted.
-    let program = match fold_traits(raw_program) { parser::Program as p => p; error as e => return e }
+    let program0 = match fold_traits(raw_program) { parser::Program as p => p; error as e => return e }
+    let program = canon_class_bases(program0)   // (#152) base_name -> qualified, order-independent base hops
     let c = match collect(program) { Collected as col => col; error as e => return e }
     // W-vis-enforce: enforce the module system (namespace qualification + pub/exp) over the
     // whole flattened program before typing — fail loud on any cross-namespace violation (M.1).

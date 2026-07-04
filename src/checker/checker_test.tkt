@@ -2962,6 +2962,47 @@ fn iface_bare_implements_resolves_in_own_namespace_not_scan_order() {
     }
 }
 
+// (#152) a CLASS base-chain hop must be namespace-precise: a NON-class decoy named `Base` in
+// another namespace registered FIRST must not shadow the extending class's own bb::Base
+// (readdir-order twin of the interface Reader regression — canon_class_bases + two-pass
+// type_table_find keep the hop exact).
+#test
+fn class_bare_base_resolves_in_own_namespace_not_scan_order() {
+    let decoy = w0_empty_struct_item("Base", "aa")   // NON-class named Base, FIRST in table order
+    let base_td = parser::TypeDecl { name = "Base"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::ClassBody { kind = parser::ClassKind::Virtual; has_base = false; base_name = ""; has_base_binding = false; base_binding_name = ""; implements = teko::list::empty(); fields = teko::list::empty(); methods = teko::list::empty() }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }
+    let base = parser::Item { content = base_td; namespace = "bb"; file = "" }
+    let sub0 = cyclic_class_item("Sub", "Base")   // a virtual-class helper: `class Sub Base {}`
+    let sub = parser::Item { content = sub0.content; namespace = "bb"; file = "" }
+    let items = teko::list::push(teko::list::push(teko::list::push(teko::list::empty(), decoy), base), sub)
+    match type_program(parser::Program { items = items }) {
+        TProgram => teko::assert::is_true(true)    // bb::Sub extends bb::Base — the aa decoy must not interfere
+        error    => teko::assert::is_true(false)
+    }
+}
+
+// (#152) nominal conformance must be namespace-exact for qualified identities: aa::S implementing
+// aa::X does NOT conform to bb::X (the old bare last-segment compare said it did). The probe runs
+// against the COLLECT table (the real callers' table) after canon_class_bases qualified the
+// implements entries.
+#test
+fn conformance_is_namespace_exact_for_qualified_names() {
+    let x0 = iface_item("X", teko::list::empty(), teko::list::empty())
+    let xa = parser::Item { content = x0.content; namespace = "aa"; file = "" }
+    let x1 = iface_item("X", teko::list::empty(), teko::list::empty())
+    let xb = parser::Item { content = x1.content; namespace = "bb"; file = "" }
+    let s0 = impl_struct_item("S", teko::list::empty(), slist1("X"))
+    let sa = parser::Item { content = s0.content; namespace = "aa"; file = "" }
+    let items = teko::list::push(teko::list::push(teko::list::push(teko::list::empty(), xa), xb), sa)
+    let canon = canon_class_bases(parser::Program { items = items })
+    match collect(canon) {
+        Collected as c => {
+            teko::assert::is_true(type_conforms_to("S", "aa::X", c.types))
+            teko::assert::is_false(type_conforms_to("S", "bb::X", c.types))
+        }
+        error => teko::assert::is_true(false)
+    }
+}
+
 // (#109 W0) top-level (namespace "") duplicate reads as "<top-level>" in the diagnostic, not an
 // empty/blank namespace label.
 #test

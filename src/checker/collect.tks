@@ -173,6 +173,80 @@ pub fn type_table_of(prog: TProgram) -> TypeTable {
     table
 }
 
+// (#152) canonicalize every SOURCE-WRITTEN type reference held as a STRING — a class's
+// `base_name`, a struct/class `implements` list, an interface `extends` list — to its
+// R0-R5-resolved QUALIFIED form ("ns::Name"; a root name stays bare) ONCE, at the type_program
+// entry. Every downstream hop (base chains, conformance, vtables, codegen layout) then probes an
+// exact, order-independent name instead of a bare table scan (discovery order differs per
+// platform; a type of the same bare name in ANOTHER namespace would win by scan order). An
+// unresolvable name is left AS WRITTEN — validation surfaces that specific error with the source
+// wording. NO-OP (program returned unchanged) when nothing to canonicalize. (Mirror collect.c.)
+fn canon_ref_name(name: str, table: TypeTable, ref_ns: str) -> str {
+    match resolve_name_ref(name, table, ref_ns) {
+        parser::TypeDecl as td => qualify(resolved_name_ns(name, table, ref_ns), name_last_segment(td.name))
+        error => name   // unresolvable — leave as written
+    }
+}
+fn canon_ref_list(names: []str, table: TypeTable, ref_ns: str) -> []str {
+    mut out: []str = teko::list::empty()
+    mut i: u64 = 0
+    loop { if i >= names.len { break }; out = teko::list::push(out, canon_ref_name(names[i], table, ref_ns)); i++ }
+    out
+}
+pub fn canon_class_bases(program: parser::Program) -> parser::Program {
+    let table = collect_types(program.items)
+    mut any = false
+    mut t = 0
+    loop {
+        if t >= program.items.len { break }
+        match program.items[t].content {
+            parser::TypeDecl as td => match td.body {
+                parser::ClassBody as cb    => { if cb.has_base || cb.implements.len > 0 { any = true } }
+                parser::StructBody as sb   => { if sb.implements.len > 0 { any = true } }
+                parser::InterfaceBody as b => { if b.extends.len > 0 { any = true } }
+                _ => { }
+            }
+            _ => { }
+        }
+        t++
+    }
+    if !any { return program }
+    mut items: []parser::Item = teko::list::empty()
+    mut i = 0
+    loop {
+        if i >= program.items.len { break }
+        let it = program.items[i]
+        mut content = it.content
+        match it.content {
+            parser::TypeDecl as td => {
+                match td.body {
+                    parser::ClassBody as cb => {
+                        if cb.has_base || cb.implements.len > 0 {
+                            let cbase = if cb.has_base { canon_ref_name(cb.base_name, table, it.namespace) } else { cb.base_name }
+                            content = parser::TypeDecl { name = td.name; type_params = td.type_params; type_constraints = td.type_constraints; body = parser::ClassBody { kind = cb.kind; has_base = cb.has_base; base_name = cbase; has_base_binding = cb.has_base_binding; base_binding_name = cb.base_binding_name; implements = canon_ref_list(cb.implements, table, it.namespace); fields = cb.fields; methods = cb.methods }; vis = td.vis; has_doc = td.has_doc; doc = td.doc; line = td.line; col = td.col }
+                        }
+                    }
+                    parser::StructBody as sb => {
+                        if sb.implements.len > 0 {
+                            content = parser::TypeDecl { name = td.name; type_params = td.type_params; type_constraints = td.type_constraints; body = parser::StructBody { fields = sb.fields; methods = sb.methods; implements = canon_ref_list(sb.implements, table, it.namespace) }; vis = td.vis; has_doc = td.has_doc; doc = td.doc; line = td.line; col = td.col }
+                        }
+                    }
+                    parser::InterfaceBody as ifb => {
+                        if ifb.extends.len > 0 {
+                            content = parser::TypeDecl { name = td.name; type_params = td.type_params; type_constraints = td.type_constraints; body = parser::InterfaceBody { extends = canon_ref_list(ifb.extends, table, it.namespace); methods = ifb.methods }; vis = td.vis; has_doc = td.has_doc; doc = td.doc; line = td.line; col = td.col }
+                        }
+                    }
+                    _ => { }
+                }
+            }
+            _ => { }
+        }
+        items = teko::list::push(items, parser::Item { content = content; namespace = it.namespace; file = it.file })
+        i++
+    }
+    parser::Program { items = items }
+}
+
 // (W10b.CLASS increment 2) look up a class's own parser::ClassBody by name (error if unknown or not a class).
 pub fn find_class_body(name: str, table: TypeTable) -> parser::ClassBody | error {
     let decl = match type_table_find(table, name, "") {   // (#109 W1) class-body lookup on a resolved name — no referencing ns
@@ -453,8 +527,11 @@ fn find_interface_decl(name: str, table: TypeTable, ref_ns: str) -> IfaceHit | e
     }
     // (dual-convention) the CANONICAL-keyed table (codegen/vm type_table_of: canonical name +
     // ns "") cannot satisfy the source R-rules — probe the QUALIFIED form exactly instead
-    // (an exact/qualified match is unique post-W0, never an order-dependent bare scan).
-    let decl = match type_table_find(table, qualify(ref_ns, name), "") { parser::TypeDecl as td => td; error => return error { message = $"unknown interface: {name}" } }
+    // (an exact/qualified match is unique post-W0, never an order-dependent bare scan). A name
+    // that is ALREADY qualified (#152 canon_class_bases) probes AS-IS — re-qualifying it would
+    // build "ns::ns::Name" and miss.
+    let qprobe = if name_qualifier(name) != "" { name } else { qualify(ref_ns, name) }
+    let decl = match type_table_find(table, qprobe, "") { parser::TypeDecl as td => td; error => return error { message = $"unknown interface: {name}" } }
     match decl.body {
         parser::InterfaceBody => IfaceHit { decl = decl; ns = name_qualifier(decl.name) }
         _               => return error { message = $"{name} is not an interface" }

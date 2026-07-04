@@ -56,6 +56,8 @@ tk_str tk_class_name_from_method_ns(tk_str ns);
 // the folded table). NO-OP when the program declares no trait. Mirrors collect.tks::fold_traits.
 TK_RESULT(tk_program, tk_fold_traits_result);
 tk_fold_traits_result tk_fold_traits(tk_program program);
+// (#152) base_name -> qualified, order-independent base-chain hops. Mirror collect.tks.
+tk_program tk_canon_class_bases(tk_program program);
 
 // C7.12 — reconstruct a TypeTable from a typed program's pass-through TypeDecl items.
 // Used by the package backend in driver.c (which has a tk_tprogram, not a tk_program).

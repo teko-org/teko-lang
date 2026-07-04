@@ -66,14 +66,21 @@ pub fn name_qualifier(name: str) -> str {
 // OR when its qualified form qualify(ns, name) equals `name` — covering every combination. ref_ns is
 // unused (a resolved-name probe is namespace-blind; the SOURCE-reference sites use resolve_type_ref).
 fn type_table_find(table: TypeTable, name: str, ref_ns: str) -> parser::TypeDecl | error {
+    // (#152) TWO PASSES: pass 1 = exact name OR the entry's qualified form (both UNIQUE post-W0's
+    // per-namespace dup ban) — so a canonical query can never be stolen by a same-bare cousin that
+    // merely appears earlier in the table (discovery order differs per platform). Pass 2 = the
+    // legacy bare last-segment fallback (bare probes of a CANONICAL-keyed type_table_of table).
     mut i = 0
     loop {
         if i >= table.len { break }
-        // (#109 W3) exact; OR the entry's qualified form == a canonical query; OR the entry's bare
-        // last-segment == a bare query (a bare decl field like `base_name` probing a CANONICAL-keyed
-        // type_table_of table). A canonical query still distinguishes via the qualify branch.
-        if table[i].name == name || qualify_eq(table[i].namespace, table[i].name, name) || name_last_segment(table[i].name) == name { return table[i].decl }   // (#148) allocation-free qualified compare
+        if table[i].name == name || qualify_eq(table[i].namespace, table[i].name, name) { return table[i].decl }   // (#148) allocation-free qualified compare
         i++
+    }
+    mut j = 0
+    loop {
+        if j >= table.len { break }
+        if name_last_segment(table[j].name) == name { return table[j].decl }
+        j++
     }
     error { message = "not a user type" }
 }
@@ -543,7 +550,14 @@ fn iface_extends_reaches(sub: str, want: str, table: TypeTable, depth: i64) -> b
     mut i: u64 = 0
     loop {
         if i >= ib.extends.len { break }
-        if name_last_segment(ib.extends[i]) == name_last_segment(want) { return true }   // (#109 W3) extends is a bare source name; `want` may be canonical — compare bare
+        // (#152) EXACT compare when BOTH sides are qualified (post canon_class_bases the entries
+        // are canonical whenever they resolve — a cross-ns same-bare cousin no longer conforms);
+        // a bare side (root canonical, or a synthetic type-param extends) keeps the bare compare.
+        if name_qualifier(ib.extends[i]) != "" && name_qualifier(want) != "" {
+            if ib.extends[i] == want { return true }
+        } else {
+            if name_last_segment(ib.extends[i]) == name_last_segment(want) { return true }
+        }
         if iface_extends_reaches(ib.extends[i], want, table, depth - 1) { return true }
         i++
     }
@@ -577,7 +591,12 @@ pub fn type_conforms_to(name: str, iface: str, table: TypeTable) -> bool {
         mut i: u64 = 0
         loop {
             if i >= impls.len { break }
-            if name_last_segment(impls[i]) == name_last_segment(iface) { return true }   // (#109 W3) implements is a bare source name; `iface` may be canonical — compare bare
+            // (#152) EXACT when BOTH qualified (see iface_extends_reaches); bare-compat otherwise.
+            if name_qualifier(impls[i]) != "" && name_qualifier(iface) != "" {
+                if impls[i] == iface { return true }
+            } else {
+                if name_last_segment(impls[i]) == name_last_segment(iface) { return true }
+            }
             if iface_extends_reaches(impls[i], iface, table, 64) { return true }
             i++
         }

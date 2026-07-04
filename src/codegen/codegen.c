@@ -466,11 +466,18 @@ static bool cg_dns_ends_with_qual(tk_str s, tk_str qual) {
 // last-segment (unique in the no-collision case). ns-sensitive callers (emit_type_expr) use
 // cg_find_decl_ns to disambiguate a same-bare-name collision.
 static const tk_type_decl *cg_find_decl(tk_str name) {
+    // (#152) EXACT pass first — a canonical query can never be stolen by a same-bare cousin that
+    // merely appears earlier (discovery order differs per platform). Then the legacy bare
+    // last-segment fallback (unique in the no-collision case).
+    for (size_t e = 0; e < g_cg_prog.nitems; e += 1) {
+        if (g_cg_prog.items[e].tag != TK_TITEM_TYPE_DECL) continue;
+        const tk_type_decl *d = &g_cg_prog.items[e].as.type_decl;
+        if (cg_name_eq(d->name, name)) return d;
+    }
     for (size_t i = 0; i < g_cg_prog.nitems; i += 1) {
         if (g_cg_prog.items[i].tag != TK_TITEM_TYPE_DECL) continue;
         const tk_type_decl *d = &g_cg_prog.items[i].as.type_decl;
-        if (cg_name_eq(d->name, name)
-            || cg_name_eq(tk_name_last_segment(d->name), tk_name_last_segment(name))) return d;
+        if (cg_name_eq(tk_name_last_segment(d->name), tk_name_last_segment(name))) return d;
     }
     return NULL;
 }
@@ -573,7 +580,12 @@ static bool cg_subclass_reaches(tk_str sub, tk_str want, int depth) {
     if (!cb2->has_base) return false;
     // (#109 W3) `base_name` is the BARE source `extends` name; `want` may be the CANONICAL
     // "ns::Name" of a base-typed slot — compare by bare last-segment.
-    if (cg_name_eq(tk_name_last_segment(cb2->base_name), tk_name_last_segment(want))) return true;
+    // (#152) EXACT when BOTH qualified (base_name arrives canonical from canon_class_bases); bare-compat otherwise.
+    if (tk_name_qualifier(cb2->base_name).len > 0 && tk_name_qualifier(want).len > 0) {
+        if (cg_name_eq(cb2->base_name, want)) return true;
+    } else {
+        if (cg_name_eq(tk_name_last_segment(cb2->base_name), tk_name_last_segment(want))) return true;
+    }
     return cg_subclass_reaches(cb2->base_name, want, depth - 1);
 }
 

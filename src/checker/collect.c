@@ -353,8 +353,11 @@ static ifacehit_result find_interface_decl(tk_str name, tk_type_table table, tk_
     }
     // (dual-convention) the CANONICAL-keyed table (codegen/vm type_table_of: canonical name +
     // ns "") cannot satisfy the source R-rules — probe the QUALIFIED form exactly instead
-    // (an exact/qualified match is unique post-W0, never an order-dependent bare scan).
-    tk_decl_result qd = tk_type_table_find(table, tk_qualify(ref_ns, name), (tk_str){0});
+    // (an exact/qualified match is unique post-W0, never an order-dependent bare scan). A name
+    // that is ALREADY qualified (#152 canon_class_bases) probes AS-IS — re-qualifying it would
+    // build "ns::ns::Name" and miss.
+    tk_str qprobe = tk_name_qualifier(name).len > 0 ? name : tk_qualify(ref_ns, name);
+    tk_decl_result qd = tk_type_table_find(table, qprobe, (tk_str){0});
     if (!qd.ok) {
         size_t len = name.len + 32; char *buf = tk_alloc(len); if (!buf) abort();
         snprintf(buf, len, "unknown interface: %.*s", (int)name.len, (const char *)name.ptr);
@@ -666,6 +669,57 @@ static tk_type_result check_trait_requirements(const trait_derive *derives, size
         }
     }
     return (tk_type_result){ .ok = true };
+}
+
+// (#152) canonicalize every SOURCE-WRITTEN type reference held as a STRING — a class's
+// `base_name`, a struct/class `implements` list, an interface `extends` list — to its
+// R0-R5-resolved QUALIFIED form ("ns::Name"; a root name stays bare) ONCE, at the type_program
+// entry. Every downstream hop (base chains, conformance, vtables, codegen layout) then probes an
+// exact, order-independent name instead of a bare table scan (discovery order differs per
+// platform). An unresolvable name is left AS WRITTEN — validation surfaces that specific error
+// with the source wording. NO-OP when nothing to canonicalize. Mirror of collect.tks.
+static tk_str canon_ref_name(tk_str name, tk_type_table table, tk_str ref_ns) {
+    tk_decl_result td = tk_resolve_name_ref(name, table, ref_ns);
+    if (!td.ok) return name;   // unresolvable — leave as written
+    return tk_qualify(tk_resolved_name_ns(name, table, ref_ns), tk_name_last_segment(td.as.value.name));
+}
+static tk_str *canon_ref_list(const tk_str *names, size_t n, tk_type_table table, tk_str ref_ns) {
+    tk_str *out = tk_alloc(n * sizeof *out); if (!out) abort();
+    for (size_t i = 0; i < n; i += 1) out[i] = canon_ref_name(names[i], table, ref_ns);
+    return out;
+}
+tk_program tk_canon_class_bases(tk_program program) {
+    tk_type_table table = collect_types(program.items, program.len);
+    bool any = false;
+    for (size_t t = 0; t < program.len && !any; t += 1) {
+        if (program.items[t].tag != TK_ITEM_TYPE_DECL) continue;
+        tk_type_body b = program.items[t].as.type_decl.body;
+        if (b.tag == TK_BODY_CLASS && (b.as.class_body.has_base || b.as.class_body.n_implements > 0)) any = true;
+        else if (b.tag == TK_BODY_STRUCT && b.as.struct_body.n_implements > 0) any = true;
+        else if (b.tag == TK_BODY_INTERFACE && b.as.interface_body.n_extends > 0) any = true;
+    }
+    if (!any) return program;
+    tk_item *items = tk_alloc(program.len * sizeof *items); if (!items) abort();
+    for (size_t i = 0; i < program.len; i += 1) {
+        tk_item it = program.items[i];
+        if (it.tag == TK_ITEM_TYPE_DECL) {
+            tk_type_body *b = &it.as.type_decl.body;
+            if (b->tag == TK_BODY_CLASS) {
+                if (b->as.class_body.has_base)
+                    b->as.class_body.base_name = canon_ref_name(b->as.class_body.base_name, table, it.namespace);
+                if (b->as.class_body.n_implements > 0)
+                    b->as.class_body.implements = canon_ref_list(b->as.class_body.implements, b->as.class_body.n_implements, table, it.namespace);
+            } else if (b->tag == TK_BODY_STRUCT) {
+                if (b->as.struct_body.n_implements > 0)
+                    b->as.struct_body.implements = canon_ref_list(b->as.struct_body.implements, b->as.struct_body.n_implements, table, it.namespace);
+            } else if (b->tag == TK_BODY_INTERFACE) {
+                if (b->as.interface_body.n_extends > 0)
+                    b->as.interface_body.extends = canon_ref_list(b->as.interface_body.extends, b->as.interface_body.n_extends, table, it.namespace);
+            }
+        }
+        items[i] = it;
+    }
+    return (tk_program){ .items = items, .len = program.len };
 }
 
 // (TR0) THE DERIVATION FOLD — see collect.tks::fold_traits (the .tks twin carries the full

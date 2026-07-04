@@ -347,14 +347,24 @@ fn cg_named_is_flags(prog: checker::TProgram, name: str) -> bool {
 // cg_find_decl — any TYPE_DECL (struct/variant/enum/alias) named `name`, or a `not found`
 // error. (C: `cg_find_decl`, which returned NULL.)
 fn cg_find_decl(prog: checker::TProgram, name: str) -> parser::TypeDecl | error {
+    // (#152) EXACT pass first — a canonical query can never be stolen by a same-bare cousin that
+    // merely appears earlier (discovery order differs per platform). Then the legacy bare
+    // last-segment fallback (unique in the no-collision case). ns-sensitive callers
+    // (emit_type_expr) use cg_find_decl_ns to disambiguate a same-bare-name collision.
+    mut e = 0
+    loop {
+        if e >= prog.items.len { break }
+        match prog.items[e] {
+            parser::TypeDecl as d => { if d.name == name { return d } }
+            _ => { }
+        }
+        e++
+    }
     mut i = 0
     loop {
         if i >= prog.items.len { break }
         match prog.items[i] {
-            // (#109 W3) the typed decl names are CANONICAL "ns::Name"; match a bare-or-canonical `name`
-            // by exact OR by bare last-segment (unique in the no-collision case). ns-sensitive callers
-            // (emit_type_expr) use cg_find_decl_ns to disambiguate a same-bare-name collision.
-            parser::TypeDecl as d => { if d.name == name || checker::name_last_segment(d.name) == checker::name_last_segment(name) { return d } }
+            parser::TypeDecl as d => { if checker::name_last_segment(d.name) == checker::name_last_segment(name) { return d } }
             _ => { }
         }
         i++
@@ -460,7 +470,12 @@ fn cg_subclass_reaches(prog: checker::TProgram, sub: str, want: str, depth: i64)
                 if !cb.has_base { return false }
                 // (#109 W3) `cb.base_name` is the BARE source `extends` name; `want` may be the
                 // CANONICAL "ns::Name" of a base-typed slot — compare by bare last-segment.
-                if checker::name_last_segment(cb.base_name) == checker::name_last_segment(want) { return true }
+                // (#152) EXACT when BOTH qualified (base_name arrives canonical from canon_class_bases); bare-compat otherwise.
+                if checker::name_qualifier(cb.base_name) != "" && checker::name_qualifier(want) != "" {
+                    if cb.base_name == want { return true }
+                } else {
+                    if checker::name_last_segment(cb.base_name) == checker::name_last_segment(want) { return true }
+                }
                 cg_subclass_reaches(prog, cb.base_name, want, depth - 1)
             }
             _ => false
