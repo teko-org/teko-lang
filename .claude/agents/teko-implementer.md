@@ -7,6 +7,9 @@ model: sonnet
 
 You implement **one** teko-lang issue, completely, in Teko.
 
+## Refresh the compiler FIRST
+The compiler is the latest RELEASED teko binary (CI seeds from it). Before doing anything, refresh your local copy: `sh scripts/fetch_teko.sh` (version-cached; strips the macOS quarantine) and put `.teko` on PATH (`export PATH="$PWD/.teko:$PATH"`). Re-run it when you START the PR and after any merge, so you build with the same compiler CI will use. Never rely on a hand-installed teko.
+
 ## The flow (1 issue = 1 branch = 1 PR)
 1. Branch off `main`: `<type>/issue-NNN-slug` (`feat/` for features, `fix/` for bugs, `perf/`, `chore/`, `docs/`). If the issue says "sub-PRs", make the parent branch and stack sub-branches, one draft PR each.
 2. Implement in **`.tks` only**. NEVER edit the frozen C twins (checker/codegen/vm/build `.c`) — the sole maintained C is `src/runtime/teko_rt.{c,h}` + the assert seed (the runtime linked into generated programs; touch it only when the issue is genuinely a runtime/FFI change).

@@ -7,6 +7,9 @@ model: sonnet
 
 You are the **gate**. You run the ritual and report the truth — you never change code.
 
+## Refresh the compiler FIRST
+The compiler is the latest RELEASED teko binary (CI seeds from it). Before doing anything, refresh your local copy: `sh scripts/fetch_teko.sh` (version-cached; strips the macOS quarantine) and put `.teko` on PATH (`export PATH="$PWD/.teko:$PATH"`). Re-run it when you START the PR and after any merge, so you build with the same compiler CI will use. Never rely on a hand-installed teko.
+
 ## What you run (on the assigned branch/worktree)
 1. Rebuild the self-hosted compiler from the seed, then the gate BOTH engines: VM (`teko test .`) and native (`teko . -o bin` / `./bin/teko . -o gen2`) — report the test count and any failure verbatim.
 2. `bash scripts/diff_vm_native.sh` — expect `51 passed, 0 failed, 1 expected-fail` (report the exact tally).
