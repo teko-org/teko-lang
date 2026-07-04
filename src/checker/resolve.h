@@ -34,6 +34,10 @@ tk_str tk_qualify(tk_str ns, tk_str name);
 bool tk_qualify_eq(tk_str ns, tk_str bare, tk_str name);   // (#148) qualify(ns,bare)==name without building the string
 tk_str tk_name_last_segment(tk_str name);
 tk_str tk_name_qualifier(tk_str name);
+// (#109 order fix) resolve a SOURCE-WRITTEN type name string ("Reader" / "io::Reader") by the
+// R0-R5 rules from ref_ns; tk_resolved_name_ns mirrors the winning namespace. (resolve.tks twins.)
+tk_decl_result tk_resolve_name_ref(tk_str name, tk_type_table table, tk_str ref_ns);
+tk_str tk_resolved_name_ns(tk_str name, tk_type_table table, tk_str ref_ns);
 tk_str tk_mangle_ns_frag(tk_str name);
 tk_type_result tk_resolve_type(tk_type_expr te, tk_type_table table, tk_str ref_ns);
 // (S4) extend the table with generic type-params as OPAQUE nominal types (see resolve.c). Used by

@@ -845,8 +845,8 @@ static void *tk_free_take(size_t an) {
 // Dumped periodically (every 512 MB — survives a SIGKILL under memory pressure) and at
 // process exit (tk_regions_free_all). Off (the default): one predicted int compare per alloc.
 // =========================================================================
-#include <dlfcn.h>
 #if !defined(_WIN32)
+#include <dlfcn.h>      /* dladdr — call-site symbolization for the obs tables (POSIX-only) */
 #include <execinfo.h>   /* (#148 RA2) backtrace — grand-caller attribution of LARGE push grows */
 #endif
 #define TK_OBS_CAP 16384                       // open-addressed site table (power of two)
@@ -910,8 +910,11 @@ static void tk_obs_dump_table(FILE *fp, const char *label, tk_obs_site *tab, uns
         }
         if (best < 0) break;
         printed[np++] = best;
-        Dl_info di; const char *nm = "?";
+        const char *nm = "?";
+#if !defined(_WIN32)
+        Dl_info di;
         if (dladdr(tab[best].ra, &di) && di.dli_sname) nm = di.dli_sname;
+#endif
         fprintf(fp, "  %2d  %9.1f MB  %11llu allocs  %s\n", k, tab[best].bytes / 1048576.0, tab[best].count, nm);
     }
 }

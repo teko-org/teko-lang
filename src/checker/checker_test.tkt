@@ -2943,6 +2943,25 @@ fn w0_cross_namespace_bare_name_now_coexists() {
     }
 }
 
+// (#109 order fix) a BARE `implements` name must resolve from the IMPLEMENTING type's namespace —
+// never by table-scan order. Reproduces the CI-only failure deterministically: a same-named
+// NON-interface type in another namespace registered FIRST (readdir order put teko::emit::Reader,
+// a struct, ahead of teko::io::Reader on linux-arm64) made conformance find the struct and fail
+// with "Reader is not an interface".
+#test
+fn iface_bare_implements_resolves_in_own_namespace_not_scan_order() {
+    let decoy = w0_empty_struct_item("Reader", "aa")   // NON-interface named Reader, FIRST in table order
+    let ifc0 = iface_item("Reader", teko::list::empty(), teko::list::empty())
+    let ifc = parser::Item { content = ifc0.content; namespace = "bb"; file = "" }
+    let imp0 = impl_struct_item("File", teko::list::empty(), slist1("Reader"))
+    let imp = parser::Item { content = imp0.content; namespace = "bb"; file = "" }
+    let items = teko::list::push(teko::list::push(teko::list::push(teko::list::empty(), decoy), ifc), imp)
+    match type_program(parser::Program { items = items }) {
+        TProgram => teko::assert::is_true(true)    // bb::File implements bb::Reader — the aa decoy must not interfere
+        error    => teko::assert::is_true(false)
+    }
+}
+
 // (#109 W0) top-level (namespace "") duplicate reads as "<top-level>" in the diagnostic, not an
 // empty/blank namespace label.
 #test

@@ -541,6 +541,37 @@ void tk_collect_sig_type_params(tk_type t, tk_type_table table, tk_str **names, 
 }
 
 // non-static: shared with match.c (the typed pattern checker resolves case/struct names — C7).
+// (#109 order fix) split a SOURCE-WRITTEN type name string on "::" into a tk_path — so an
+// `implements`/`extends` entry or a trait-derive probe (bare "Reader" or qualified "io::Reader")
+// can ride the R0-R5 resolver like any other source reference. (Mirror resolve.tks::name_to_path.)
+static tk_path name_to_path(tk_str name) {
+    tk_segment *segs = NULL; size_t n = 0;
+    tk_str rest = name;
+    for (;;) {
+        long long sep = -1;
+        for (uint64_t i = 0; i + 1 < rest.len; i += 1) {
+            if (rest.ptr[i] == ':' && rest.ptr[i + 1] == ':') { sep = (long long)i; break; }
+        }
+        if (sep < 0) break;
+        segs = tk_realloc0(segs, (n + 1) * sizeof *segs); if (!segs) abort();
+        segs[n].name = tk_str_slice(rest, 0, (uint64_t)sep); n += 1;
+        rest = tk_str_slice(rest, (uint64_t)sep + 2, rest.len);
+    }
+    segs = tk_realloc0(segs, (n + 1) * sizeof *segs); if (!segs) abort();
+    segs[n].name = rest; n += 1;
+    return (tk_path){ .segments = segs, .len = n };
+}
+
+// (#109 order fix) the string-shaped twins of resolve_type_ref / type_ref_ns — used by collect's
+// `implements`/`extends`/trait-derive walks, so a bare name never resolves by table-scan order.
+// (Mirror resolve.tks::resolve_name_ref / resolved_name_ns.)
+tk_decl_result tk_resolve_name_ref(tk_str name, tk_type_table table, tk_str ref_ns) {
+    return resolve_type_ref(name_to_path(name), table, ref_ns);
+}
+tk_str tk_resolved_name_ns(tk_str name, tk_type_table table, tk_str ref_ns) {
+    return type_ref_ns(name_to_path(name), table, ref_ns);
+}
+
 // (#109 W2) `ref_ns` = the referencing namespace; drives the R0-R5 rules via resolve_type_ref.
 tk_type_result resolve_named(tk_path path, tk_type_table table, tk_str ref_ns) {
     if (path.len == 0)   // M.1: an empty path is an internal invariant break — an honest error, never a crash

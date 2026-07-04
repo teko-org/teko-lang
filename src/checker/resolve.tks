@@ -212,6 +212,39 @@ fn resolve_type_ref(path: parser::Path, table: TypeTable, ref_ns: str) -> parser
     error { message = "not a user type" }
 }
 
+// (#109 order fix) split a SOURCE-WRITTEN type name string on "::" into a Path — so an
+// `implements`/`extends` entry or a trait-derive probe (bare "Reader" or qualified "io::Reader")
+// can ride the R0-R5 resolver like any other source reference. (Mirror resolve.c::name_to_path.)
+fn name_to_path(name: str) -> parser::Path {
+    mut segs: []parser::Segment = teko::list::empty()
+    mut rest = name
+    loop {
+        mut sep: i64 = -1
+        mut i: u64 = 0
+        loop {
+            if i + 1 >= rest.len { break }
+            if rest[i] == b':' && rest[i + 1] == b':' { sep = i to i64; break }
+            i++
+        }
+        if sep < 0 { break }
+        segs = teko::list::push(segs, parser::Segment { name = teko::str::slice_to(rest, sep to u64) })
+        rest = teko::str::slice_from(rest, (sep to u64) + 2)
+    }
+    segs = teko::list::push(segs, parser::Segment { name = rest })
+    parser::Path { segments = segs }
+}
+
+// (#109 order fix) resolve a SOURCE-WRITTEN type name string by the R0-R5 rules from `ref_ns` —
+// the string-shaped twin of resolve_type_ref. `resolved_name_ns` mirrors the WINNING namespace
+// (companion, like type_ref_ns). Used by collect's `implements`/`extends`/trait-derive walks, so
+// a bare name never resolves by table-scan order. (Mirrors resolve.c.)
+pub fn resolve_name_ref(name: str, table: TypeTable, ref_ns: str) -> parser::TypeDecl | error {
+    resolve_type_ref(name_to_path(name), table, ref_ns)
+}
+pub fn resolved_name_ns(name: str, table: TypeTable, ref_ns: str) -> str {
+    type_ref_ns(name_to_path(name), table, ref_ns)
+}
+
 // (#109 W2) the DECLARING namespace of the type `path` resolves to (mirrors resolve_type_ref's winning
 // match) — the namespace a TRANSPARENT alias's body must resolve in. `TypeTable = []TypeReg` in
 // teko::checker, referenced qualified from teko::emit, expands `[]TypeReg` in teko::checker (its own
