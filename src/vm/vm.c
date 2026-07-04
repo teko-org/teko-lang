@@ -1626,10 +1626,6 @@ static bool param_is_ref(const tk_tfunction *fn, size_t i) {
     return ta.tag == TK_TEXPR_NAMED && ta.as.named.path.len > 0
         && seg_is(ta.as.named.path.segments[ta.as.named.path.len - 1].name, "Ref");
 }
-static bool fn_has_ref_param(const tk_tfunction *fn) {
-    for (size_t i = 0; i < fn->nparams; i += 1) if (param_is_ref(fn, i)) return true;
-    return false;
-}
 
 // param_coerce_type — the coerce-slot type for a call PARAMETER, built from its declared TypeExpr (the
 // param twin of field_coerce_type, but RECURSIVE so a `[]T?` param rebuilds its elements). An

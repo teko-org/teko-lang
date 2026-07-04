@@ -969,7 +969,6 @@ static bool cg_emit_fnptr_sig_ex(cbuf *b, tk_type t, bool with_env, const char *
     cb(b, ")");
     return true;
 }
-static bool cg_emit_fnptr_sig(cbuf *b, tk_type t, const char **err) { return cg_emit_fnptr_sig_ex(b, t, false, err); }
 
 // (W10) emit a CLOSURE CALL through a `tk_closure` value as a GNU statement-expression that evaluates
 // each argument ONCE and DISPATCHES on `env`: a NON-capturing/named-fn closure (env == NULL) uses the

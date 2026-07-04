@@ -35,7 +35,7 @@
         xs.len = xs.len + 1;                                                  \
         return xs;                                                            \
     }                                                                         \
-    static inline void Name##_free(Name xs) { free(xs.ptr); }
+    __attribute__((unused)) static inline void Name##_free(Name xs) { free(xs.ptr); }   /* (#151) many instantiations never free (arena-era callers) — not a warning */
 
 // byte — one octet (mirrors src/text/text.h's tk_byte; same rep).
 typedef uint8_t tk_byte;
