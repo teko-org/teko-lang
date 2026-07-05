@@ -1693,6 +1693,72 @@ fn interp_is_numeric(t: Type) -> bool {
 // ROUND 0 expansion: accepts str, char, bool, byte, error, int, float hole types.
 // Format specs: static (`:literal`) → validate hole is numeric; dynamic (`:[arg1,…]`) → validate
 // each arg is str. Named/variant types with specs → honest-stop. Result type is always `str`.
+/**
+ * The calendar `to_string` function name for a Date/Time-shaped hole type, or "" if the hole is
+ * not a Date/Time value.
+ *
+ * A static format spec on a `Named` hole whose bare type name is `Date`, `Time`, or `DateTime`
+ * is a CALENDAR PATTERN (`$"{d:yyyy-MM-dd}"`), not a numeric spec; it desugars to a call to the
+ * type's own-namespace formatter (`date_to_string` for a Date/DateTime, `time_to_string` for a
+ * Time). Recognizing by bare last segment lets a re-declared local `Date`/`Time` (a standalone
+ * project cannot `use teko::time`) format identically to the canonical `teko::time` types.
+ *
+ * @param t  the hole's resolved type
+ * @return   "date_to_string" / "time_to_string" for a Date/Time/DateTime hole, else ""
+ */
+fn datetime_formatter_of(t: Type) -> str {
+    match t {
+        Named as n => {
+            let bare = name_last_segment(n.name)
+            if bare == "Date" || bare == "DateTime" { return "date_to_string" }
+            if bare == "Time" { return "time_to_string" }
+            ""
+        }
+        _ => ""
+    }
+}
+
+/**
+ * Desugar a Date/Time interpolation hole with a calendar pattern into a `to_string` CALL.
+ *
+ * Rewrites `$"{d:yyyy-MM-dd}"` into `<ns>::date_to_string(d, "yyyy-MM-dd")` (or `time_to_string`),
+ * typed here so codegen and the VM see an ordinary str-returning call — both engines then run the
+ * SAME pure-Teko formatter, guaranteeing byte-identical output. The raw (un-typed) hole is reused
+ * as the receiver so the call's own argument typing applies uniformly.
+ *
+ * @param raw_hole  the original (un-typed) hole expression
+ * @param hole_ns   the namespace qualifier of the hole's Date/Time type ("" for a bare type)
+ * @param fn_name   the formatter name from `datetime_formatter_of` (date_to_string/time_to_string)
+ * @param pattern   the calendar pattern captured from the static spec
+ * @param env       the current typing environment
+ * @param table     the resolved type table
+ * @return          the typed `to_string` call, or a checker error if it does not resolve
+ */
+fn desugar_datetime_hole(raw_hole: parser::Expr, hole_ns: str, fn_name: str, pattern: str, env: Env, table: TypeTable) -> TExpr | error {
+    mut segs: []parser::Segment = teko::list::empty()
+    if hole_ns != "" {
+        mut qi: u64 = 0
+        mut seg_start: u64 = 0
+        loop {
+            if qi + 1 >= hole_ns.len { break }
+            if hole_ns[qi] == b':' && hole_ns[qi + 1] == b':' {
+                segs = teko::list::push(segs, parser::Segment { name = teko::str::slice(hole_ns, seg_start, qi) })
+                qi = qi + 2
+                seg_start = qi
+            } else { qi++ }
+        }
+        segs = teko::list::push(segs, parser::Segment { name = teko::str::slice_from(hole_ns, seg_start) })
+    }
+    segs = teko::list::push(segs, parser::Segment { name = fn_name })
+    let pat_expr = parser::Expr { kind = parser::StrLit { text = pattern }; line = 0; col = 0 }
+    mut args: []parser::Expr = teko::list::push(teko::list::empty(), raw_hole)
+    args = teko::list::push(args, pat_expr)
+    mut arg_names: []str = teko::list::push(teko::list::empty(), "")
+    arg_names = teko::list::push(arg_names, "")
+    let call = parser::Call { callee = parser::Path { segments = segs }; args = args; arg_names = arg_names }
+    type_call(call, env, table)
+}
+
 fn type_interp(in: parser::Interp, env: Env, table: TypeTable) -> TExpr | error {
     mut holes: []TExpr = teko::list::empty()
     mut specs: []TFSpec = teko::list::empty()
@@ -1700,6 +1766,20 @@ fn type_interp(in: parser::Interp, env: Env, table: TypeTable) -> TExpr | error 
     loop {
         if i >= in.holes.len { break }
         let h = match type_expr(in.holes[i], env, table) { TExpr as te => te; error as e => return e }
+        let dt_fmt = datetime_formatter_of(h.type)
+        if dt_fmt != "" && i < in.specs.len {
+            match in.specs[i].kind {
+                parser::FSpecStatic as fs => {
+                    let hole_ns = match h.type { Named as n => name_qualifier(n.name); _ => "" }
+                    let dh = match desugar_datetime_hole(in.holes[i], hole_ns, dt_fmt, fs.s, env, table) { TExpr as te => te; error as e => return e }
+                    holes = teko::list::push(holes, dh)
+                    specs = teko::list::push(specs, TFSpec { kind = TFSpecNone { } })
+                    i++
+                    continue
+                }
+                _ => { }
+            }
+        }
         if !is_interp_formattable(h.type) {
             return error { message = "interpolation hole type not supported in ROUND 0 (must be str/char/bool/byte/error/int/float)" }
         }
