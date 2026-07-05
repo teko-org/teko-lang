@@ -10,7 +10,9 @@ use teko::parser
  *  the AST carries the key fields inert and this pass rejects them with an honest stop.
  *  A provider records an interface an impl registers for, the impl's lifetime, the impl type's
  *  canonical name, and the factory (the impl's compiler-chosen static) — built once per
- *  `#lifetime` type per interface it implements. */
+ *  `#lifetime` type per interface it implements. Both `iface` and `impl_name` are the FULL
+ *  canonical (namespace-qualified) names (issue #284), so two same-bare providers in different
+ *  namespaces are DISTINCT keys — no `di_type_id`/materializer-symbol/provider-slot collision. */
 pub type DiProvider = struct { iface: str; kind: parser::DiKind; impl_name: str; factory: str }
 
 /** The whole program's DI registration table — every `#lifetime` type's providers, keyed
@@ -57,35 +59,47 @@ pub fn build_di_registry(prog: parser::Program, table: TypeTable) -> DiRegistry 
     mut i: u64 = 0
     loop {
         if i >= prog.items.len { break }
-        let out = match register_item_providers(reg, prog.items[i]) { DiRegistry as r => r; error as e => return e }
+        let out = match register_item_providers(reg, prog.items[i], table) { DiRegistry as r => r; error as e => return e }
         reg = out
         i++
     }
     reg
 }
 
-/** Register every provider a single item contributes (none unless it is a `#lifetime` class). */
-fn register_item_providers(reg: DiRegistry, item: parser::Item) -> DiRegistry | error {
+/** Register every provider a single item contributes (none unless it is a `#lifetime` class). The
+ *  impl's canonical name is its declaring namespace (the item's source namespace) qualifying its
+ *  bare class name, so a namespaced provider keys distinctly from a same-bare cousin (issue #284). */
+fn register_item_providers(reg: DiRegistry, item: parser::Item, table: TypeTable) -> DiRegistry | error {
     let td = match item.content { parser::TypeDecl as t => t; _ => return reg }
     match td.di_kind { parser::DiKind::None => return reg; _ => { } }
     if td.has_di_key { return di_key_rejected(td) }
     let cb = match td.body { parser::ClassBody as c => c; _ => return err_di(td.line, td.col, $"`#singleton`/`#scoped`/`#transient` applies to a class, but `{td.name}` is not a class") }
     let factory = match choose_factory(td.name, cb) { str as f => f; error as e => return e }
-    register_over_implements(reg, td, cb.implements, factory)
+    let impl_canon = qualify(item.namespace, name_last_segment(td.name))
+    register_over_implements(reg, td, item.namespace, cb.implements, factory, impl_canon, table)
 }
 
-/** Add one provider for each interface `impls` names, rejecting a duplicate unkeyed registration. */
-fn register_over_implements(reg: DiRegistry, td: parser::TypeDecl, impls: []str, factory: str) -> DiRegistry | error {
+/** Add one provider for each interface `impls` names, rejecting a duplicate unkeyed registration.
+ *  Each interface reference is resolved to its FULL canonical name in the impl's namespace (issue
+ *  #284), so two same-bare interfaces in different namespaces occupy DISTINCT provider slots. */
+fn register_over_implements(reg: DiRegistry, td: parser::TypeDecl, item_ns: str, impls: []str, factory: str, impl_canon: str, table: TypeTable) -> DiRegistry | error {
     mut out = reg
     mut j: u64 = 0
     loop {
         if j >= impls.len { break }
-        let iface = name_last_segment(impls[j])
+        let iface = canonical_iface_name(impls[j], item_ns, table)
         if provider_registered(out, iface) { return err_di(td.line, td.col, $"ambiguous DI registration for interface `{iface}`: another `#lifetime` type already provides it (keys are issue #173) — construct explicitly instead") }
-        out = DiRegistry { providers = teko::list::push(out.providers, DiProvider { iface = iface; kind = td.di_kind; impl_name = td.name; factory = factory }) }
+        out = DiRegistry { providers = teko::list::push(out.providers, DiProvider { iface = iface; kind = td.di_kind; impl_name = impl_canon; factory = factory }) }
         j++
     }
     out
+}
+
+/** The FULL canonical name of an interface reference `name` written in namespace `ref_ns`: resolve
+ *  its declaring namespace (mirrors the checker's `resolved_name_ns`) and qualify its bare last
+ *  segment (issue #284). An unresolved reference falls back to its bare last segment. */
+fn canonical_iface_name(name: str, ref_ns: str, table: TypeTable) -> str {
+    qualify(resolved_name_ns(name, table, ref_ns), name_last_segment(name))
 }
 
 /** A `#lifetime` class's factory = its no-parameter static method (the DI-buildable constructor).
@@ -138,7 +152,7 @@ pub fn check_inject_overlays(prog: parser::Program, reg: DiRegistry, table: Type
     loop {
         if i >= prog.items.len { break }
         match prog.items[i].content {
-            parser::Function as f => match check_fn_overlay(f, reg) { error as e => return e; null => { } }
+            parser::Function as f => match check_fn_overlay(f, prog.items[i].namespace, reg, table) { error as e => return e; null => { } }
             _ => { }
         }
         i++
@@ -146,41 +160,51 @@ pub fn check_inject_overlays(prog: parser::Program, reg: DiRegistry, table: Type
     null
 }
 
-/** Validate one function's `#inject` overlay bindings. */
-fn check_fn_overlay(f: parser::Function, reg: DiRegistry) -> error? {
+/** Validate one function's `#inject` overlay bindings (each resolved in the fn's namespace). */
+fn check_fn_overlay(f: parser::Function, fn_ns: str, reg: DiRegistry, table: TypeTable) -> error? {
     if !f.has_inject { return null }
     mut j: u64 = 0
     loop {
         if j >= f.injects.len { break }
-        match check_binding(f.injects[j], reg) { error as e => return e; null => { } }
+        match check_binding(f.injects[j], fn_ns, reg, table) { error as e => return e; null => { } }
         j++
     }
     null
 }
 
-/** Validate one `#inject` binding: no key (core), and a registered provider must exist. */
-fn check_binding(b: parser::InjectBinding, reg: DiRegistry) -> error? {
+/** Validate one `#inject` binding: no key (core), and a registered provider must exist. The binding
+ *  type is resolved to its FULL canonical interface name (issue #284) so the lookup keys the same
+ *  slot the provider registered under. */
+fn check_binding(b: parser::InjectBinding, fn_ns: str, reg: DiRegistry, table: TypeTable) -> error? {
     if b.has_key { return err_di(b.line, b.col, $"DI keys (`@`) are not in core DI (issue #173); remove the key on `{b.name}`") }
-    let iface = binding_iface_name(b.type_ann)
+    let iface = binding_iface_name(b.type_ann, fn_ns, table)
     match resolve_provider(reg, iface) {
         DiProvider => null
         error => err_di(b.line, b.col, $"no DI provider for `{iface}` injected as `{b.name}`; annotate an implementing class with a lifetime (`#singleton`/`#scoped`/`#transient`)")
     }
 }
 
-/** The interface name an `#inject` binding names — the last segment of its `NamedType` path
- *  (a slice/union/optional/function binding type has no injectable interface name → ""). */
-fn binding_iface_name(te: parser::TypeExpr) -> str {
+/** The FULL canonical interface name an `#inject` binding names — its `NamedType` reference resolved
+ *  in the fn's namespace (issue #284). A slice/union/optional/function binding type has no
+ *  injectable interface name → "". */
+fn binding_iface_name(te: parser::TypeExpr, ref_ns: str, table: TypeTable) -> str {
     match te {
-        parser::NamedType as nt => last_segment_name(nt.path)
+        parser::NamedType as nt => canonical_iface_name(path_reference(nt.path), ref_ns, table)
         _ => ""
     }
 }
 
-/** The last segment name of a path (`a::b::C` → `C`; a single segment → itself). */
-fn last_segment_name(path: parser::Path) -> str {
-    if path.segments.len == 0 { return "" }
-    path.segments[path.segments.len - 1].name
+/** A path joined back to its `::`-separated source reference (`[a, b, C]` → `a::b::C`), so the
+ *  namespace resolver sees the full qualifier the source wrote (issue #284). */
+fn path_reference(path: parser::Path) -> str {
+    mut out = ""
+    mut i: u64 = 0
+    loop {
+        if i >= path.segments.len { break }
+        if i == 0 { out = path.segments[i].name } else { out = out ~ "::" ~ path.segments[i].name }
+        i++
+    }
+    out
 }
 
 /** The honest stop for a keyed DI annotation (`@Key`), which is out of core DI (issue #173). */
@@ -213,13 +237,12 @@ fn seed_di_injects(f: parser::Function, env: Env, tbl: TypeTable) -> Env | error
     loop {
         if i >= f.injects.len { break }
         let b = f.injects[i]
-        let iface = binding_iface_name(b.type_ann)
+        let iface = binding_iface_name(b.type_ann, env.cur_ns, tbl)
         match resolve_provider(env.di, iface) {
             DiProvider as p => {
-                let impl_bare = name_last_segment(p.impl_name)
-                let t = match resolve_type(named_texpr(impl_bare), tbl, env.cur_ns) { Type as ty => ty; error as e => return e }
+                let t = match resolve_type(named_texpr(name_last_segment(p.impl_name)), tbl, name_qualifier(p.impl_name)) { Type as ty => ty; error as e => return e }
                 local = define(local, b.name, t, false)
-                binds = teko::list::push(binds, DiInjectBind { name = b.name; iface = iface; impl_name = impl_bare; kind = p.kind })
+                binds = teko::list::push(binds, DiInjectBind { name = b.name; iface = iface; impl_name = p.impl_name; kind = p.kind })
             }
             error => {
                 let t = match resolve_type(b.type_ann, tbl, env.cur_ns) { Type as ty => ty; error as e => return e }
@@ -238,12 +261,16 @@ fn named_texpr(name: str) -> parser::TypeExpr {
 }
 
 /** Lower a USE of an injected name into the provider's materializer call (Crumb 4): a `TCall` to
- *  `__di_materialize_<Impl>` with NO source args — codegen/VM thread the enclosing region in — typed
- *  as the injected interface. Reusing `TCall` keeps the typed AST free of any new node variant. */
+ *  `__di_materialize_<mangled canonical Impl>` with NO source args — codegen/VM thread the enclosing
+ *  region in — typed as the injected interface. The symbol suffix is the canonical impl name with
+ *  each `::` collapsed to `__` (a valid, per-namespace-distinct C identifier, issue #284); the full
+ *  canonical impl name rides on `call_ns` so the VM materializer resolves the exact class + factory
+ *  (codegen ignores `call_ns` on a DI call — it emits the symbol verbatim). Reusing `TCall` keeps
+ *  the typed AST free of any new node variant. */
 pub fn di_lower_use(b: DiInjectBind, t: Type) -> TExpr {
-    let seg = parser::Segment { name = di_materializer_name(b.impl_name) }
+    let seg = parser::Segment { name = di_materializer_name(mangle_ns_frag(b.impl_name)) }
     let callee = parser::Path { segments = teko::list::push(teko::list::empty(), seg) }
-    let call = TCall { callee = callee; args = teko::list::empty(); call_ns = ""; is_closure_call = false; callee_type = t; is_iface_dispatch = false; iface_slot = 0 }
+    let call = TCall { callee = callee; args = teko::list::empty(); call_ns = b.impl_name; is_closure_call = false; callee_type = t; is_iface_dispatch = false; iface_slot = 0 }
     TExpr { kind = call; type = t; line = 0; col = 0 }
 }
 
@@ -261,16 +288,20 @@ pub fn is_di_materializer_call(name: str) -> bool {
     true
 }
 
-/** The synthesized per-impl materializer name — the compiler-chosen helper an injected-name
- *  use lowers to (`__di_materialize_<Impl>`), shared by codegen and the VM. */
+/** The synthesized per-impl materializer name — the compiler-chosen helper an injected-name use
+ *  lowers to (`__di_materialize_<Impl symbol>`), shared by codegen and the VM. The caller passes the
+ *  impl's canonical name already collapsed to a C-safe symbol (`mangle_ns_frag`), so two same-bare
+ *  impls in different namespaces never share a materializer symbol (issue #284). */
 pub fn di_materializer_name(impl_name: str) -> str {
     "__di_materialize_" ~ impl_name
 }
 
 /** (W10c/MEM-3) di_type_id — the deterministic 64-bit type identity of a type name, the key
  *  `tk_region_register`/`tk_region_lookup` (native) and the VM's `di_cache` share for a DI lifetime.
- *  FNV-1a over the name's bytes (offset basis 14695981039346656037, prime 1099511628211, u64
- *  wraparound). One derivation, so `#singleton`/`#scoped` sharing agrees across both engines. */
+ *  Callers pass the impl's C-safe canonical symbol (`mangle_ns_frag` of its canonical name), so two
+ *  same-bare impls in different namespaces get DISTINCT ids (issue #284). FNV-1a over the name's
+ *  bytes (offset basis 14695981039346656037, prime 1099511628211, u64 wraparound). One derivation,
+ *  so `#singleton`/`#scoped` sharing agrees across both engines. */
 pub fn di_type_id(name: str) -> u64 {
     mut hash: u64 = 14695981039346656037
     mut i: u64 = 0

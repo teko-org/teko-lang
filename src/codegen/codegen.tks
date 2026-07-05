@@ -5754,7 +5754,7 @@ fn emit_di_materializer_protos(buf: []byte, reg: checker::DiRegistry) -> []byte 
             out = cb(out, "static ")
             out = mangle_type_name(out, "", p.impl_name)
             out = cb(out, " *")
-            out = cb(out, checker::di_materializer_name(checker::name_last_segment(p.impl_name)))
+            out = cb(out, checker::di_materializer_name(checker::mangle_ns_frag(p.impl_name)))
             out = cb(out, "(tk_region *r);\n")
         }
         i++
@@ -5763,26 +5763,44 @@ fn emit_di_materializer_protos(buf: []byte, reg: checker::DiRegistry) -> []byte 
 }
 
 /** (W10c/MEM-3) One provider's materializer definition (see emit_di_materializers). The materializer
- *  SYMBOL uses the impl's bare last segment (matching the checker's lowered call, which keyed off the
- *  raw program's bare class name); the C TYPE uses the canonical (namespace-mangled) name. */
+ *  SYMBOL uses the impl's canonical name collapsed to a C-safe symbol (`mangle_ns_frag`), matching
+ *  the checker's lowered call and keeping two same-bare impls in different namespaces distinct (issue
+ *  #284); the C TYPE uses the same canonical (namespace-mangled) name. The factory is resolved by an
+ *  EXACT canonical-namespace match, so a same-bare cousin's factory is never chosen by mistake. */
 fn emit_di_materializer(buf: []byte, prog: checker::TProgram, p: checker::DiProvider) -> []byte | error {
-    let bare = checker::name_last_segment(p.impl_name)
-    let factory_ns = match cg_find_method_ns(prog, bare, p.factory) { str as ns => ns; null => return error { message = $"codegen: DI factory `{p.factory}` not found on `{p.impl_name}`" } }
+    let sym = checker::mangle_ns_frag(p.impl_name)
+    let factory_ns = match cg_find_di_factory_ns(prog, p.impl_name, p.factory) { str as ns => ns; null => return error { message = $"codegen: DI factory `{p.factory}` not found on `{p.impl_name}`" } }
     mut out = cb(buf, "static ")
     out = mangle_type_name(out, "", p.impl_name)
     out = cb(out, " *")
-    out = cb(out, checker::di_materializer_name(bare))
+    out = cb(out, checker::di_materializer_name(sym))
     out = cb(out, "(tk_region *r) {\n")
-    out = di_emit_materializer_body(out, p, factory_ns, bare)
+    out = di_emit_materializer_body(out, p, factory_ns, sym)
     cb(out, "}\n")
+}
+
+/** (issue #284) Resolve a DI factory's mangled namespace by an EXACT canonical class-namespace match
+ *  (`class_canon` is the impl's full canonical name, and every effective method is stamped under the
+ *  owning class's canonical namespace), so two same-bare classes never share a factory. */
+fn cg_find_di_factory_ns(prog: checker::TProgram, class_canon: str, method: str) -> str? {
+    mut i = 0
+    loop {
+        if i >= prog.items.len { break }
+        match prog.items[i] {
+            checker::TFunction as tf => { if tf.name == method && tf.namespace == class_canon { return tf.namespace } }
+            _ => { }
+        }
+        i++
+    }
+    null
 }
 
 /** (W10c/MEM-3) The lifetime-specific body of a materializer: transient builds fresh; singleton and
  *  scoped consult the arena registry (root vs. the passed region) before building + registering. */
-fn di_emit_materializer_body(buf: []byte, p: checker::DiProvider, factory_ns: str, bare: str) -> []byte {
+fn di_emit_materializer_body(buf: []byte, p: checker::DiProvider, factory_ns: str, sym: str) -> []byte {
     match p.kind {
         parser::DiKind::Transient => di_emit_transient_body(buf, p, factory_ns)
-        _ => di_emit_cached_body(buf, p, factory_ns, bare)
+        _ => di_emit_cached_body(buf, p, factory_ns, sym)
     }
 }
 
@@ -5796,9 +5814,9 @@ fn di_emit_transient_body(buf: []byte, p: checker::DiProvider, factory_ns: str) 
 /** (W10c/MEM-3) A singleton/scoped materializer looks up an already-built instance (root region for
  *  a singleton, the passed region — which walks up the arena tree — for a scoped one), returning it
  *  on a hit, else building via the factory and registering it in that region. */
-fn di_emit_cached_body(buf: []byte, p: checker::DiProvider, factory_ns: str, bare: str) -> []byte {
+fn di_emit_cached_body(buf: []byte, p: checker::DiProvider, factory_ns: str, sym: str) -> []byte {
     let scope = di_scope_expr(p.kind)
-    let id = checker::di_type_id(bare)
+    let id = checker::di_type_id(sym)
     mut out = cb(buf, "    tk_region *__s = ")
     out = cb(out, scope)
     out = cb(out, ";\n    uint64_t __id = ")
