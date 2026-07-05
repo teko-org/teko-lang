@@ -99,7 +99,11 @@ jobs:
       contents: read
     runs-on: ubuntu-latest
     env:
-      ZIG_VERSION: "0.13.0"
+      # 0.16.0 is the version validated locally + in a linux/amd64 container. 0.13.0 ships an
+      # INCOMPLETE riscv64 glibc (missing gnu/stubs-lp64d.h) → riscv64-glibc failed to compile;
+      # 0.16.0's tarball carries riscv-linux-gnu/gnu/stubs-lp64d.h. Note the tarball name format
+      # changed at 0.14.1: os/arch swapped to `zig-x86_64-linux-<v>` (was `zig-linux-x86_64-<v>`).
+      ZIG_VERSION: "0.16.0"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -107,9 +111,9 @@ jobs:
       - name: Install zig (official tarball)
         run: |
           set -eu
-          curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-x86_64-${ZIG_VERSION}.tar.xz" \
+          curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" \
             | tar -xJ
-          echo "$PWD/zig-linux-x86_64-${ZIG_VERSION}" >> "$GITHUB_PATH"
+          echo "$PWD/zig-x86_64-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
 
       - name: Verify zig
         run: zig version
@@ -124,38 +128,13 @@ jobs:
       - name: Emit the portable teko.c (one gen, no gate)
         run: teko . -o out --no-verify
 
-      # Cross-compile out/teko.c into every Linux artifact and package each. package_release.sh
-      # is reused unchanged: it wants a dir holding `teko` + `teko.c`, so each target gets a
-      # staging dir with its cross-compiled binary plus a copy of the shared teko.c. The
-      # portable source bundle (teko-bootstrap-src.tar.gz) is emitted exactly once, with the
-      # x86_64-glibc artifact (EMIT_SRC_BUNDLE=1).
+      # Cross-compile out/teko.c into all six Linux artifacts and package each. The exact same
+      # script (scripts/cross_compile_linux.sh) runs as a compile-only SMOKE in native.yml on
+      # every PR — so a broken zig version or target is caught before merge, not here.
       - name: Cross-compile + package the six Linux targets
         run: |
-          set -eu
           mkdir -p dist
-          emit_for() {
-            label="$1"; triple="$2"; static="$3"; emit_bundle="$4"
-            echo "=== $label ($triple, static=$static) ==="
-            gd="gd-$label"
-            rm -rf "$gd"; mkdir -p "$gd"
-            # -static only for musl (glibc stays dynamic, pinned to an old version for compat).
-            extra=""
-            [ "$static" = "1" ] && extra="-static"
-            zig cc -target "$triple" -std=c2x -w -O2 $extra \
-              -Isrc/runtime -Isrc/assert \
-              out/teko.c src/runtime/teko_rt.c src/assert/assert.c -lm \
-              -o "$gd/teko"
-            # Fail loudly if a target produced the wrong architecture.
-            file "$gd/teko"
-            cp out/teko.c "$gd/teko.c"
-            EMIT_SRC_BUNDLE="$emit_bundle" sh scripts/package_release.sh "$label" "$gd" src dist posix
-          }
-          emit_for linux-x86_64-glibc  x86_64-linux-gnu.2.28   0 1
-          emit_for linux-x86_64-musl   x86_64-linux-musl       1 0
-          emit_for linux-arm64-glibc   aarch64-linux-gnu.2.28  0 0
-          emit_for linux-arm64-musl    aarch64-linux-musl      1 0
-          emit_for linux-riscv64-glibc riscv64-linux-gnu.2.28  0 0
-          emit_for linux-riscv64-musl  riscv64-linux-musl      1 0
+          sh scripts/cross_compile_linux.sh out/teko.c src dist package
           echo "=== dist/ ==="; ls -la dist/
 
       - name: Upload Linux artifacts
