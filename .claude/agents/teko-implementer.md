@@ -19,9 +19,20 @@ The compiler is the latest RELEASED teko binary (CI seeds from it). Before doing
 
 ## Style — W15-from-now (non-negotiable, on new AND touched code)
 - Comments are `/** */` doc-comments on declarations only. NO inline `//` (mid-body or trailing), and NO `//` line used as a function/type header. A line that seems to need a comment is a signal to **extract a well-named function**.
-  - WRONG: `// build_ungated — assemble without the .tkt tests` above the fn (owner bounced PR #252 for exactly this).
-  - RIGHT: `/** build_ungated — assemble WITHOUT the .tkt tests, skipping the D4 gate (issue #249 lever A). */` immediately above the fn.
   - Doc-comments legally attach only immediately before a `fn`/`type` declaration; a comment with no declaration after it (e.g. in a loose-statement fixture) is deleted, not converted.
+- **FULL JAVADOC on EVERY declaration (fn/type/member, public AND private) — owner ruling 2026-07-05.** Not just `/** */`; the multi-line Javadoc shape (the lexer already captures multi-line Doc tokens → it compiles):
+  ```
+  /**
+   * One-sentence summary of the symbol's contract. Optional longer description after.
+   *
+   * @param name  description of each argument, in signature order
+   * @return      the returned value (omit for `-> void`)
+   * @throws      the condition yielding the `error` member of `-> T | error` (Teko does NOT
+   *              throw — @throws documents the error-union case). @example/@deprecated/@see/@since as needed.
+   */
+  fn signature(...)
+  ```
+  `/**` and ` */` on their own lines; ` * ` on every content line. Each struct/class field gets its OWN `/** */`. WRONG: a `//` header, OR a bare one-line `/** does x */` on a fn with params/return. RIGHT: the full block above.
 - **Mandatory pre-push audit:** `git diff origin/main -- '*.tks' '*.tkt' | grep -n '^+.*//'` MUST return empty (URLs inside string literals excepted). A PR that fails this audit gets bounced by the integrator.
 - Flatten: early returns, guard clauses, inversion. Where flattening is impossible, extract a function/method to cut cyclomatic complexity. Keep functions short and single-purpose; don't let files grow unbounded.
 - When you touch old code, clean it to this standard as part of the change.
