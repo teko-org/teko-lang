@@ -163,6 +163,8 @@ type RFields     = struct { r: Reader; value: []parser::Field }
 type RStrs       = struct { r: Reader; value: []str }
 type RConstraint  = struct { r: Reader; value: parser::ConstraintExpr }   // (#165 C2)
 type RConstraints = struct { r: Reader; value: []parser::ConstraintExpr } // (#165 C2)
+type RFunction    = struct { r: Reader; value: parser::Function }         // (#165 C4)
+type RFunctions   = struct { r: Reader; value: []parser::Function }       // (#165 C4)
 type RTypeBody   = struct { r: Reader; value: parser::TypeBody }
 type RTypeDecl   = struct { r: Reader; value: parser::TypeDecl }
 type RUseDecl    = struct { r: Reader; value: parser::UseDecl }
@@ -570,8 +572,9 @@ fn read_params(r: Reader, table: []str) -> RParams | error {
     loop {
         if i >= n.value { break }
         let nm = match tkb_read_str(rr, table) { RStr as x => x; error as e => return e }
-        let ty = match read_typeexpr(nm.r, table) { RTypeExpr as x => x; error as e => return e }
-        xs = teko::list::push(xs, parser::Param { name = nm.value; has_type = true; type_ann = ty.value; is_params = false ; has_default = false; default_expr = parser::no_expr() }); rr = ty.r; i++   // .tkb is FunctionType-only (closures) today — params is source-only, never serialized
+        let ht = match read_u8(nm.r)           { RByte as x => x; error as e => return e }   // (#165 C4) has_type
+        let ty = match read_typeexpr(ht.r, table) { RTypeExpr as x => x; error as e => return e }
+        xs = teko::list::push(xs, parser::Param { name = nm.value; has_type = ht.value != 0; type_ann = ty.value; is_params = false ; has_default = false; default_expr = parser::no_expr() }); rr = ty.r; i++
     }
     RParams { r = rr; value = xs }
 }
@@ -584,7 +587,9 @@ fn read_fields(r: Reader, table: []str) -> RFields | error {
         if i >= n.value { break }
         let nm = match tkb_read_str(rr, table) { RStr as x => x; error as e => return e }
         let ty = match read_typeexpr(nm.r, table) { RTypeExpr as x => x; error as e => return e }
-        xs = teko::list::push(xs, parser::Field { name = nm.value; type_ann = ty.value ; vis = parser::Visibility::Pub; is_intern = false }); rr = ty.r; i++
+        let vs = match read_u8(ty.r)              { RByte as x => x; error as e => return e }   // (#165 C5) vis
+        let ii = match read_u8(vs.r)              { RByte as x => x; error as e => return e }   // (#165 C5) is_intern
+        xs = teko::list::push(xs, parser::Field { name = nm.value; type_ann = ty.value; vis = vs.value to parser::Visibility; is_intern = ii.value != 0 }); rr = ii.r; i++
     }
     RFields { r = rr; value = xs }
 }
@@ -625,9 +630,58 @@ fn read_constraints(r: Reader, table: []str) -> RConstraints | error {
     loop { if i >= n.value { break }; let c = match read_constraint(rr, table) { RConstraint as x => x; error as e => return e }; xs = teko::list::push(xs, c.value); rr = c.r; i++ }
     RConstraints { r = rr; value = xs }
 }
+// (#165 C4) a parser::Function (type-body method): inverse of write_function. has_body is always 0
+// (the honest signature-only stub — R2); a nonzero has_body would need a parser-statement codec that
+// does not exist, so reject it loudly rather than mis-read.
+fn read_function(r: Reader, table: []str) -> RFunction | error {
+    let nm  = match tkb_read_str(r, table)        { RStr as x => x; error as e => return e }
+    let tp  = match read_strs(nm.r, table)        { RStrs as x => x; error as e => return e }
+    let tc  = match read_constraints(tp.r, table) { RConstraints as x => x; error as e => return e }
+    let ps  = match read_params(tc.r, table)      { RParams as x => x; error as e => return e }
+    let hr  = match read_u8(ps.r)                 { RByte as x => x; error as e => return e }
+    let rt  = match read_typeexpr(hr.r, table)    { RTypeExpr as x => x; error as e => return e }
+    let hb  = match read_u8(rt.r)                 { RByte as x => x; error as e => return e }
+    if hb.value != 0 { return error { message = "method body in .tkb (unsupported; signature-only)" } }
+    let vis = match read_u8(hb.r)                 { RByte as x => x; error as e => return e }
+    let hd  = match read_u8(vis.r)                { RByte as x => x; error as e => return e }
+    let doc = match tkb_read_str(hd.r, table)     { RStr as x => x; error as e => return e }
+    let ln  = match read_u32(doc.r)               { RU32 as x => x; error as e => return e }
+    let cl  = match read_u32(ln.r)                { RU32 as x => x; error as e => return e }
+    let it  = match read_u8(cl.r)                 { RByte as x => x; error as e => return e }
+    let ie  = match read_u8(it.r)                 { RByte as x => x; error as e => return e }
+    let cs  = match tkb_read_str(ie.r, table)     { RStr as x => x; error as e => return e }
+    let fr  = match tkb_read_str(cs.r, table)     { RStr as x => x; error as e => return e }
+    let og  = match tkb_read_str(fr.r, table)     { RStr as x => x; error as e => return e }
+    let ii  = match read_u8(og.r)                 { RByte as x => x; error as e => return e }
+    let ia  = match read_u8(ii.r)                 { RByte as x => x; error as e => return e }
+    let iv  = match read_u8(ia.r)                 { RByte as x => x; error as e => return e }
+    let io  = match read_u8(iv.r)                 { RByte as x => x; error as e => return e }
+    RFunction { r = io.r; value = parser::Function {
+        name = nm.value; type_params = tp.value; type_constraints = tc.value; params = ps.value
+        has_return = hr.value != 0; return_type = rt.value; body = teko::list::empty()
+        vis = vis.value to parser::Visibility; has_doc = hd.value != 0; doc = doc.value
+        line = ln.value; col = cl.value; is_test = it.value != 0; is_extern = ie.value != 0
+        c_symbol = cs.value; from_lib = fr.value; os_guard = og.value
+        is_intern = ii.value != 0; is_abstract = ia.value != 0; is_virtual = iv.value != 0; is_override = io.value != 0
+    } }
+}
+// (#165 C4/C5) a []parser::Function: inverse of write_functions (declaration = vtable order).
+fn read_functions(r: Reader, table: []str) -> RFunctions | error {
+    let n = match read_u64(r) { RU64 as x => x; error as e => return e }
+    mut rr = n.r
+    mut xs: []parser::Function = teko::list::empty()
+    mut i = 0
+    loop { if i >= n.value { break }; let f = match read_function(rr, table) { RFunction as x => x; error as e => return e }; xs = teko::list::push(xs, f.value); rr = f.r; i++ }
+    RFunctions { r = rr; value = xs }
+}
 fn read_typebody(r: Reader, table: []str) -> RTypeBody | error {
     let tag = match read_u8(r) { RByte as x => x; error as e => return e }
-    if tag.value == 0 { let fs = match read_fields(tag.r, table)   { RFields as x => x; error as e => return e };   return RTypeBody { r = fs.r; value = parser::StructBody { fields = fs.value ; methods = teko::list::empty(); implements = teko::list::empty() } } }
+    if tag.value == 0 {   // (#165 C5) StructBody: fields + methods + implements
+        let fs = match read_fields(tag.r, table)     { RFields as x => x; error as e => return e }
+        let ms = match read_functions(fs.r, table)   { RFunctions as x => x; error as e => return e }
+        let im = match read_strs(ms.r, table)        { RStrs as x => x; error as e => return e }
+        return RTypeBody { r = im.r; value = parser::StructBody { fields = fs.value; methods = ms.value; implements = im.value } }
+    }
     if tag.value == 1 { let ms = match read_strs(tag.r, table)     { RStrs as x => x; error as e => return e };     return RTypeBody { r = ms.r; value = parser::EnumBody { members = ms.value } } }
     if tag.value == 2 { let te = match read_typeexpr(tag.r, table) { RTypeExpr as x => x; error as e => return e }; return RTypeBody { r = te.r; value = parser::VariantBody { type_expr = te.value } } }
     if tag.value == 3 { let te = match read_typeexpr(tag.r, table) { RTypeExpr as x => x; error as e => return e }; return RTypeBody { r = te.r; value = parser::AliasBody { alias = te.value } } }
@@ -652,21 +706,30 @@ fn read_typebody(r: Reader, table: []str) -> RTypeBody | error {
         }
         return RTypeBody { r = rr; value = parser::FlagsBody { members = names; values = vals } }
     }
-    if tag.value == 6 {   // (W10b.CLASS) fields only — methods not yet serialized (same gap as struct methods)
-        let fs = match read_fields(tag.r, table) { RFields as x => x; error as e => return e }
-        return RTypeBody { r = fs.r; value = parser::ClassBody {
-            kind = parser::ClassKind::Sealed; has_base = false; base_name = ""
-            has_base_binding = false; base_binding_name = ""
-            implements = teko::list::empty(); fields = fs.value; methods = teko::list::empty()
+    if tag.value == 6 {   // (#165 C5) ClassBody: kind + base + binding + implements + fields + methods
+        let ck = match read_u8(tag.r)              { RByte as x => x; error as e => return e }
+        let hb = match read_u8(ck.r)               { RByte as x => x; error as e => return e }
+        let bn = match tkb_read_str(hb.r, table)   { RStr as x => x; error as e => return e }
+        let hbb = match read_u8(bn.r)              { RByte as x => x; error as e => return e }
+        let bbn = match tkb_read_str(hbb.r, table) { RStr as x => x; error as e => return e }
+        let im = match read_strs(bbn.r, table)     { RStrs as x => x; error as e => return e }
+        let fs = match read_fields(im.r, table)    { RFields as x => x; error as e => return e }
+        let ms = match read_functions(fs.r, table) { RFunctions as x => x; error as e => return e }
+        return RTypeBody { r = ms.r; value = parser::ClassBody {
+            kind = ck.value to parser::ClassKind; has_base = hb.value != 0; base_name = bn.value
+            has_base_binding = hbb.value != 0; base_binding_name = bbn.value
+            implements = im.value; fields = fs.value; methods = ms.value
         } }
     }
-    if tag.value == 7 {   // (W10b.IF) extends names only — method sigs not serialized (same gap)
-        let ex = match read_strs(tag.r, table) { RStrs as x => x; error as e => return e }
-        return RTypeBody { r = ex.r; value = parser::InterfaceBody { extends = ex.value; methods = teko::list::empty() } }
+    if tag.value == 7 {   // (#165 C5) InterfaceBody: extends + method SIGS (vtable order)
+        let ex = match read_strs(tag.r, table)     { RStrs as x => x; error as e => return e }
+        let ms = match read_functions(ex.r, table) { RFunctions as x => x; error as e => return e }
+        return RTypeBody { r = ms.r; value = parser::InterfaceBody { extends = ex.value; methods = ms.value } }
     }
-    if tag.value == 8 {   // (TR0) trait — fields only; methods not serialized (same gap)
-        let fs = match read_fields(tag.r, table) { RFields as x => x; error as e => return e }
-        return RTypeBody { r = fs.r; value = parser::TraitBody { fields = fs.value; methods = teko::list::empty() } }
+    if tag.value == 8 {   // (#165 C5) TraitBody: fields + method SIGS
+        let fs = match read_fields(tag.r, table)   { RFields as x => x; error as e => return e }
+        let ms = match read_functions(fs.r, table) { RFunctions as x => x; error as e => return e }
+        return RTypeBody { r = ms.r; value = parser::TraitBody { fields = fs.value; methods = ms.value } }
     }
     error { message = "bad typebody tag in .tkb" }
 }

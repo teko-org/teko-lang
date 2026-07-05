@@ -443,6 +443,159 @@ fn tkb_roundtrip_generic_type() {
     }
 }
 
+// (#165 C4) round-trip a lone parser::Function through the same-namespace codec helpers.
+fn roundtrip_function(f: parser::Function) -> parser::Function | error {
+    let table = collect_function(st_empty(), f)
+    let bytes = write_function(write_strtable(teko::list::empty(), table), table, f)
+    let r0 = Reader { data = bytes; pos = 0 }
+    let tbl = match read_strtable(r0) { RTable as x => x; error as e => return e }
+    match read_function(tbl.r, tbl.value) { RFunction as rf => rf.value; error as e => e }
+}
+
+#test
+fn tkb_roundtrip_method_sig() {
+    // (#165 C4) `virtual fn area(self) -> i64` under a `#os("linux")` guard — an instance method
+    // whose receiver is the untyped 1st param (has_type=false); every signature field + flag rides,
+    // the body is the honest signature-only stub (empty on read).
+    let recv = parser::Param { name = "self"; has_type = false; type_ann = parser::no_type(); is_params = false; has_default = false; default_expr = parser::no_expr() }
+    let m = parser::Function {
+        name = "area"; type_params = teko::list::empty(); type_constraints = teko::list::empty()
+        params = teko::list::push(teko::list::empty(), recv)
+        has_return = true; return_type = nt("i64"); body = teko::list::empty()
+        vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 3; col = 5
+        is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = "linux"
+        is_intern = true; is_abstract = false; is_virtual = true; is_override = false
+    }
+    match roundtrip_function(m) {
+        parser::Function as f => {
+            teko::assert::is_true(f.name == "area")
+            teko::assert::is_true(f.params.len == 1)
+            teko::assert::is_true(!f.params[0].has_type)
+            teko::assert::is_true(f.params[0].name == "self")
+            teko::assert::is_true(f.has_return)
+            match f.return_type { parser::NamedType as n => teko::assert::is_true(n.path.segments[0].name == "i64"); _ => teko::assert::is_true(false) }
+            teko::assert::is_true(f.body.len == 0)
+            teko::assert::is_true(f.os_guard == "linux")
+            teko::assert::is_true(f.is_intern)
+            teko::assert::is_true(f.is_virtual)
+            teko::assert::is_true(!f.is_abstract)
+            teko::assert::is_true(!f.is_override)
+            teko::assert::is_true(f.line == 3)
+            teko::assert::is_true(f.col == 5)
+        }
+        error => teko::assert::is_true(false)
+    }
+}
+
+// (#165 C5) a bodyless instance-method signature `fn <name>(self)` — the receiver is the untyped
+// 1st param; helper for the struct/interface method-order fixtures.
+fn method_sig(name: str) -> parser::Function {
+    let recv = parser::Param { name = "self"; has_type = false; type_ann = parser::no_type(); is_params = false; has_default = false; default_expr = parser::no_expr() }
+    parser::Function {
+        name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty()
+        params = teko::list::push(teko::list::empty(), recv)
+        has_return = false; return_type = parser::no_type(); body = teko::list::empty()
+        vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 0; col = 0
+        is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""
+        is_intern = false; is_abstract = false; is_virtual = false; is_override = false
+    }
+}
+
+#test
+fn tkb_roundtrip_struct_with_methods() {
+    // (#165 C5) a struct with two methods [greet, name] — before this crumb methods dropped to
+    // empty (invisible to a consuming project via seed_from_dep); the ORDER is the vtable contract.
+    let fld = parser::Field { name = "x"; type_ann = nt("i64"); vis = parser::Visibility::Pub; is_intern = false }
+    mut methods: []parser::Function = teko::list::push(teko::list::empty(), method_sig("greet"))
+    methods = teko::list::push(methods, method_sig("name"))
+    let body = parser::StructBody { fields = teko::list::push(teko::list::empty(), fld); methods = methods; implements = teko::list::push(teko::list::empty(), "Named") }
+    let td = parser::TypeDecl { name = "Point"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = body; vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 1; col = 1 }
+    let prog = checker::TProgram { items = teko::list::push(teko::list::empty(), td) }
+    match deserialize_program(serialize_program(prog)) {
+        checker::TProgram as got => match got.items[0] {
+            parser::TypeDecl as d => match d.body {
+                parser::StructBody as s => {
+                    teko::assert::is_true(s.fields.len == 1)
+                    teko::assert::is_true(s.methods.len == 2)
+                    teko::assert::is_true(s.methods[0].name == "greet")
+                    teko::assert::is_true(s.methods[1].name == "name")
+                    teko::assert::is_true(s.implements.len == 1)
+                    teko::assert::is_true(s.implements[0] == "Named")
+                }
+                _ => teko::assert::is_true(false)
+            }
+            _ => teko::assert::is_true(false)
+        }
+        error => teko::assert::is_true(false)
+    }
+}
+
+#test
+fn tkb_roundtrip_interface_methods() {
+    // (#165 C5) an interface `Shape` extending `Drawable` with two methods [area, perimeter] —
+    // the method ORDER is the vtable-slot contract the cross-package D3 dispatch relies on.
+    mut methods: []parser::Function = teko::list::push(teko::list::empty(), method_sig("area"))
+    methods = teko::list::push(methods, method_sig("perimeter"))
+    let body = parser::InterfaceBody { extends = teko::list::push(teko::list::empty(), "Drawable"); methods = methods }
+    let td = parser::TypeDecl { name = "Shape"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = body; vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 1; col = 1 }
+    let prog = checker::TProgram { items = teko::list::push(teko::list::empty(), td) }
+    match deserialize_program(serialize_program(prog)) {
+        checker::TProgram as got => match got.items[0] {
+            parser::TypeDecl as d => match d.body {
+                parser::InterfaceBody as ib => {
+                    teko::assert::is_true(ib.extends.len == 1)
+                    teko::assert::is_true(ib.extends[0] == "Drawable")
+                    teko::assert::is_true(ib.methods.len == 2)
+                    teko::assert::is_true(ib.methods[0].name == "area")
+                    teko::assert::is_true(ib.methods[1].name == "perimeter")
+                }
+                _ => teko::assert::is_true(false)
+            }
+            _ => teko::assert::is_true(false)
+        }
+        error => teko::assert::is_true(false)
+    }
+}
+
+#test
+fn tkb_roundtrip_class_with_base_and_methods() {
+    // (#165 C5) a class `Circle` extending base `Shape` (binding `parent`) implementing `Drawable`
+    // with one method — kind + base + binding + implements + methods all ride (were all dropped).
+    let fld = parser::Field { name = "r"; type_ann = nt("i64"); vis = parser::Visibility::Private; is_intern = true }
+    let body = parser::ClassBody {
+        kind = parser::ClassKind::Virtual; has_base = true; base_name = "Shape"
+        has_base_binding = true; base_binding_name = "parent"
+        implements = teko::list::push(teko::list::empty(), "Drawable")
+        fields = teko::list::push(teko::list::empty(), fld)
+        methods = teko::list::push(teko::list::empty(), method_sig("area"))
+    }
+    let td = parser::TypeDecl { name = "Circle"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = body; vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 1; col = 1 }
+    let prog = checker::TProgram { items = teko::list::push(teko::list::empty(), td) }
+    match deserialize_program(serialize_program(prog)) {
+        checker::TProgram as got => match got.items[0] {
+            parser::TypeDecl as d => match d.body {
+                parser::ClassBody as c => {
+                    teko::assert::is_true(c.kind == parser::ClassKind::Virtual)
+                    teko::assert::is_true(c.has_base)
+                    teko::assert::is_true(c.base_name == "Shape")
+                    teko::assert::is_true(c.has_base_binding)
+                    teko::assert::is_true(c.base_binding_name == "parent")
+                    teko::assert::is_true(c.implements.len == 1)
+                    teko::assert::is_true(c.implements[0] == "Drawable")
+                    teko::assert::is_true(c.fields.len == 1)
+                    teko::assert::is_true(c.fields[0].vis == parser::Visibility::Private)
+                    teko::assert::is_true(c.fields[0].is_intern)
+                    teko::assert::is_true(c.methods.len == 1)
+                    teko::assert::is_true(c.methods[0].name == "area")
+                }
+                _ => teko::assert::is_true(false)
+            }
+            _ => teko::assert::is_true(false)
+        }
+        error => teko::assert::is_true(false)
+    }
+}
+
 #test
 fn tkb_roundtrip_matchexpr() {
     // C7.16: `match x { 0 => return 1; Foo as y => return 2; _ => return 3 }` round-trips (match + 3 pattern kinds).
