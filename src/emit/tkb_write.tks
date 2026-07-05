@@ -79,6 +79,12 @@ fn write_terms(buf: []byte, t: StrTable, ts: []checker::TCmpTerm) -> []byte {
     b
 }
 
+// (#165 C1) a TCall's namespace tail — call_ns (interned) + is_closure_call (u8). Appended AFTER
+// the args of BOTH tag 7 (plain) and tag 24 (iface dispatch) so the reader stops re-deriving them.
+fn write_call_tail(buf: []byte, t: StrTable, cl: checker::TCall) -> []byte {
+    write_u8(write_u32(buf, st_find(t, cl.call_ns)), (if cl.is_closure_call { 1 } else { 0 }) to byte)
+}
+
 // a TExpr → its type, then a tag + payload (children recursive).
 fn write_texpr(buf: []byte, t: StrTable, te: checker::TExpr) -> []byte {
     let b = write_type(buf, t, te.type)        // every node carries its type
@@ -107,9 +113,11 @@ fn write_texpr(buf: []byte, t: StrTable, te: checker::TExpr) -> []byte {
                 mut ib = write_path(write_u8(b, 24), t, cl.callee)
                 ib = write_type(ib, t, cl.callee_type)
                 ib = write_u32(ib, cl.iface_slot)
-                write_texprs(ib, t, cl.args)
+                ib = write_texprs(ib, t, cl.args)
+                write_call_tail(ib, t, cl)
             } else {
-                write_texprs(write_path(write_u8(b, 7), t, cl.callee), t, cl.args)
+                let pb = write_texprs(write_path(write_u8(b, 7), t, cl.callee), t, cl.args)
+                write_call_tail(pb, t, cl)
             }
         }
         // (C7.16) typed IF: tag 8 + cond (texpr) + then_blk ([]TStatement) + has_else (u8) + else_blk.

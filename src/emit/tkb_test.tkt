@@ -145,6 +145,44 @@ fn tkb_roundtrip_coalesce() {
 }
 
 #test
+fn tkb_roundtrip_call_ns() {
+    // (#165 C1) a plain call `foo()` resolved to namespace "teko::x" round-trips call_ns +
+    // is_closure_call (both were hardcoded to ""/false before this crumb).
+    let cpath = parser::Path { segments = teko::list::push(teko::list::empty(), parser::Segment { name = "foo" }) }
+    let orig = checker::TExpr { kind = checker::TCall { callee = cpath; args = teko::list::empty(); call_ns = "teko::x"; is_closure_call = false; callee_type = checker::Void { }; is_iface_dispatch = false; iface_slot = 0 }; type = i64ty(); line = 0; col = 0 }
+    match deserialize(serialize(orig)) {
+        checker::TExpr as got => match got.kind {
+            checker::TCall as c => {
+                teko::assert::is_true(c.call_ns == "teko::x")
+                teko::assert::is_true(!c.is_closure_call)
+                teko::assert::is_true(!c.is_iface_dispatch)
+                teko::assert::is_true(c.callee.segments[0].name == "foo")
+            }
+            _ => teko::assert::is_true(false)
+        }
+        error => teko::assert::is_true(false)
+    }
+}
+
+#test
+fn tkb_roundtrip_closure_call_ns() {
+    // (#165 C1) a closure call (is_closure_call=true, call_ns="") — the flag survives independent
+    // of call_ns, and the callee_type Func rides via the leading node type (unused here, Void).
+    let cpath = parser::Path { segments = teko::list::push(teko::list::empty(), parser::Segment { name = "f" }) }
+    let orig = checker::TExpr { kind = checker::TCall { callee = cpath; args = teko::list::empty(); call_ns = ""; is_closure_call = true; callee_type = checker::Void { }; is_iface_dispatch = false; iface_slot = 0 }; type = i64ty(); line = 0; col = 0 }
+    match deserialize(serialize(orig)) {
+        checker::TExpr as got => match got.kind {
+            checker::TCall as c => {
+                teko::assert::is_true(c.is_closure_call)
+                teko::assert::is_true(c.call_ns == "")
+            }
+            _ => teko::assert::is_true(false)
+        }
+        error => teko::assert::is_true(false)
+    }
+}
+
+#test
 fn tkb_roundtrip_pathexpr() {
     // C7.16: Color::Red round-trips (collect now interns enum_name + member; ordinal u64;
     // (#50) the resolved member value rides too — a flags-style power-of-2 exercises both u64 halves).
