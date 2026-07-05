@@ -611,28 +611,28 @@ fn strip_tests(prog: checker::TProgram) -> checker::TProgram {
     checker::TProgram { items = kept }
 }
 
-// codegen_and_report — hand `prog` to the backend and, on success, report the build's peak memory
-// cost (#148). The shared tail of every build path once its program is final: no tests present,
-// the `--no-verify` escape hatch, and the gate's own release rebuild.
+/** Hand `prog` to the backend and, on success, report the build's peak memory cost (#148). The
+ *  shared tail of every build path once its program is final: no tests present, the
+ *  `--no-verify` escape hatch, and the gate's own release rebuild. */
 fn codegen_and_report(dir: str, out_dir: str, prog: checker::TProgram, m: Manifest) -> i32 {
     let rc = backend(dir, m.name, out_dir, prog, m)
     if rc == 0 { report_peak() }
     rc
 }
 
-// build_ungated — assemble WITHOUT the `.tkt` tests and codegen straight away, skipping the D4
-// gate entirely (issue #249 lever A: `--no-verify`). Used only when the caller has explicitly
-// opted out of re-verification — e.g. a self-host release chain re-proving the fixpoint on gen-2,
-// where the `.tkt` gate outcome is already known deterministic from gen-1.
+/** Assemble WITHOUT the `.tkt` tests and codegen straight away, skipping the D4 gate entirely
+ *  (issue #249 lever A: `--no-verify`). Used only when the caller has explicitly opted out of
+ *  re-verification — e.g. a self-host release chain re-proving the fixpoint on gen-2, where the
+ *  `.tkt` gate outcome is already known deterministic from gen-1. */
 fn build_ungated(dir: str, out_dir: str) -> i32 {
     let fe = match frontend_body(false, false) { Frontend as f => f; error as e => return fail(dir, e.message) }
     codegen_and_report(dir, out_dir, fe.prog, fe.manifest)
 }
 
-// coverage_gate_result — check the D4 coverage floors (from the `.tkp` [coverage] section;
-// default 80/80/80) against `fe`'s recorded function/line/branch coverage. Returns 0 when every
-// floor is met, else the first failing floor's `fail` status (BLOCKED — the build stops here).
-// Extracted from run_gate so each floor check is one guard clause instead of three nested arms.
+/** Check the D4 coverage floors (from the `.tkp` [coverage] section; default 80/80/80) against
+ *  `fe`'s recorded function/line/branch coverage. Returns 0 when every floor is met, else the
+ *  first failing floor's `fail` status (BLOCKED — the build stops here). Extracted from run_gate
+ *  so each floor check is one guard clause instead of three nested arms. */
 fn coverage_gate_result(dir: str, fe: Frontend) -> i32 {
     let fcov = vm::coverage_pct(fe.prog)
     if fcov < fe.manifest.cov_functions {
@@ -649,26 +649,26 @@ fn coverage_gate_result(dir: str, fe: Frontend) -> i32 {
     0
 }
 
-// cobertura_path_of — the `--coverage` output path ("<out_dir>/cobertura.xml", creating `out_dir`
-// first) when `gen_cov` is set, else "" (vm::run_tests_cov treats an empty path as "don't write").
+/** The `--coverage` output path ("<out_dir>/cobertura.xml", creating `out_dir` first) when
+ *  `gen_cov` is set, else "" (vm::run_tests_cov treats an empty path as "don't write"). */
 fn cobertura_path_of(out_dir: str, gen_cov: bool) -> str {
     if !gen_cov { return "" }
     let _ = teko::fs::mkdir(out_dir)
     teko::str::concat(out_dir, "/cobertura.xml")
 }
 
-// release_build_of — (#151) re-front-end WITHOUT the `.tkt` files for the RELEASE program (`quiet`
-// = the file map was already printed by the gate's first pass), strip any surviving `#test`
-// functions by provenance, and hand the clean program to the backend.
+/** (#151) Re-front-end WITHOUT the `.tkt` files for the RELEASE program (`quiet` = the file map
+ *  was already printed by the gate's first pass), strip any surviving `#test` functions by
+ *  provenance, and hand the clean program to the backend. */
 fn release_build_of(dir: str, out_dir: str) -> i32 {
     let rel = match frontend_body(false, true) { Frontend as f => f; error as e => return fail(dir, e.message) }
     codegen_and_report(dir, out_dir, strip_tests(rel.prog), rel.manifest)
 }
 
-// run_gate — the D4 test-gate body proper: run every `#test` on the VM (fail-fast), enforce the
-// coverage floors (coverage_gate_result), then rebuild the release program without the `.tkt`
-// files (release_build_of). Split out of compile_project_g so the `no_verify` short-circuit stays
-// a single early return instead of nesting the whole gate one level deeper.
+/** The D4 test-gate body proper: run every `#test` on the VM (fail-fast), enforce the coverage
+ *  floors (coverage_gate_result), then rebuild the release program without the `.tkt` files
+ *  (release_build_of). Split out of compile_project_g so the `no_verify` short-circuit stays a
+ *  single early return instead of nesting the whole gate one level deeper. */
 fn run_gate(dir: str, out_dir: str, gen_cov: bool, fe: Frontend) -> i32 {
     let trc = vm::run_tests_cov(fe.prog, true, gen_cov, cobertura_path_of(out_dir, gen_cov))
     if trc != 0 { return trc }
@@ -677,18 +677,18 @@ fn run_gate(dir: str, out_dir: str, gen_cov: bool, fe: Frontend) -> i32 {
     release_build_of(dir, out_dir)
 }
 
-// build_no_tests_present — no `#test` functions at all: ignore the gate, build the production
-// program straight from the already-assembled `fe` (no test code present to strip or verify).
+/** No `#test` functions at all: ignore the gate, build the production program straight from the
+ *  already-assembled `fe` (no test code present to strip or verify). */
 fn build_no_tests_present(dir: str, out_dir: str, fe: Frontend) -> i32 { codegen_and_report(dir, out_dir, fe.prog, fe.manifest) }
 
-// compile_project_g — the build with the D4 TEST GATE (ON BY DEFAULT; `--no-test` is IGNORED for a
-// build — a release MUST run its tests). Assemble WITH the `.tkt` tests, run them on the VM FIRST
-// (fail-fast — a failed assertion panics, aborting the build before any emission), THEN codegen the
-// production program (tests stripped, run_gate). The ONLY skips are a project with NO `#test`
-// functions (build_no_tests_present), or an explicit `no_verify=true` (issue #249 lever A —
-// `--no-verify`, build_ungated): a CI-only escape hatch for a self-host chain that has ALREADY
-// proven the gate on an earlier generation and only needs the fixpoint (`gen2.c == gen3.c`), not a
-// second full VM re-verification. `no_verify` changes NOTHING when false — the untouched default.
+/** The build with the D4 TEST GATE (ON BY DEFAULT; `--no-test` is IGNORED for a build — a release
+ *  MUST run its tests). Assemble WITH the `.tkt` tests, run them on the VM FIRST (fail-fast — a
+ *  failed assertion panics, aborting the build before any emission), THEN codegen the production
+ *  program (tests stripped, run_gate). The ONLY skips are a project with NO `#test` functions
+ *  (build_no_tests_present), or an explicit `no_verify=true` (issue #249 lever A — `--no-verify`,
+ *  build_ungated): a CI-only escape hatch for a self-host chain that has ALREADY proven the gate
+ *  on an earlier generation and only needs the fixpoint (`gen2.c == gen3.c`), not a second full VM
+ *  re-verification. `no_verify` changes NOTHING when false — the untouched default. */
 fn compile_project_g(dir: str, out_dir: str, gen_cov: bool, no_verify: bool) -> i32 {
     ensure_rt_dir_abs()
     match teko::env::chdir(dir) { error => return fail(dir, "cannot enter project directory"); null => {} }
@@ -748,11 +748,11 @@ fn coverage_of(args: []str) -> bool {
     false
 }
 
-// (issue #249 lever A) does `--no-verify` appear in the args? A `build` normally ALWAYS runs the
-// D4 `.tkt` gate first (unchanged default); this flag skips it entirely, emitting straight to
-// codegen. Intended for a self-host release chain that has already proven the gate on an earlier
-// generation and only needs to re-prove the fixpoint — NOT for everyday builds (skipping the gate
-// means the binary is unverified).
+/** (Issue #249 lever A) does `--no-verify` appear in the args? A `build` normally ALWAYS runs the
+ *  D4 `.tkt` gate first (unchanged default); this flag skips it entirely, emitting straight to
+ *  codegen. Intended for a self-host release chain that has already proven the gate on an earlier
+ *  generation and only needs to re-prove the fixpoint — NOT for everyday builds (skipping the
+ *  gate means the binary is unverified). */
 fn no_verify_of(args: []str) -> bool {
     mut i: u64 = 0
     loop {
@@ -763,9 +763,9 @@ fn no_verify_of(args: []str) -> bool {
     false
 }
 
-// the FIRST non-flag positional (the project) from `start`, or "" if none (the caller reports).
-// Skips `-o <dir>` (and its value), `--no-test` (D4; currently ignored), and `--no-verify` (#249
-// lever A) — every recognized build flag — so none of them is mistaken for the project argument.
+/** The FIRST non-flag positional (the project) from `start`, or "" if none (the caller reports).
+ *  Skips `-o <dir>` (and its value), `--no-test` (D4; currently ignored), and `--no-verify` (#249
+ *  lever A) — every recognized build flag — so none of them is mistaken for the project argument. */
 fn project_arg_of(args: []str, start: u64) -> str {
     mut i = start
     loop {
