@@ -13,8 +13,8 @@
 #   suffix  = "alpha"     → non-empty suffix is appended as "-<suffix>" (a prerelease).
 #   suffix  = ""          → no suffix; a stable (non-prerelease) tag.
 #
-# So   version="0.0.2.0", suffix="alpha"  →  0.0.2.0-alpha
-# and  version="0.0.2.3", suffix=""       →  0.0.2.3
+# So   version="0.0.2.0", suffix="alpha"  →  v0.0.2.0-alpha
+# and  version="0.0.2.3", suffix=""       →  v0.0.2.3
 #
 # Because the embedded `teko --version` also reads teko.tkp verbatim, the released
 # binary's version MATCHES this tag exactly. Both the release workflow AND local devs
@@ -111,7 +111,11 @@ case "$D" in
     ;;
 esac
 
-TAG="$VERSION"
+# The published tag/release carries a `v` prefix (git convention: `git tag v1.2.3`), while
+# teko.tkp's `version` and `teko --version` stay the bare number (`git --version` → 2.43.0).
+# So this derived TAG is `v<version>[-<suffix>]`; the binary's --version (built from teko.tkp
+# RAW in CMakeLists/run_cc) is `<version>[-<suffix>]` — the tag minus the `v`.
+TAG="v$VERSION"
 if [ -n "$SUFFIX" ]; then
   TAG="$TAG-$SUFFIX"
 fi
