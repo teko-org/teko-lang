@@ -596,16 +596,6 @@ fn resolve_named(path: parser::Path, table: TypeTable, ref_ns: str) -> Type | er
         parser::TypeDecl as td => {
             match td.body {
                 parser::AliasBody as ab => return resolve_type(ab.alias, table, type_ref_ns(path, table, ref_ns))   // (#109 W2) alias body resolves in the alias's OWN ns, not the referencing ns
-                // (TR0) a trait NEVER reaches a value position — it is a derivable bundle, not a
-                // type for variables/params/returns/fields. Trait-typed DYNAMIC values (a vtable
-                // over the trait's bodyless requirements) arrive with TR1 — honest stop until then.
-                parser::TraitBody => return error { message = $"trait '{name}' is not a value type — derive it from a struct or class instead (trait-typed dynamic values arrive with TR1)" }
-                // (W10b.D3) an interface IS a value type now — a contract-typed value (data + vtable
-                // fat pointer, the tk_closure-shaped rep). It resolves NOMINALLY like any other named
-                // type; the upcast/dispatch rules live in widens_into + the method-call typer.
-                // (#109 W3) the Named carries the CANONICAL "ns::Name" (the resolved decl's own ns) so
-                // same-bare-name types across namespaces are distinct identities + C mangles. A stamped
-                // generic `__g__` instance is already globally unique → it stays BARE (matching type_item).
                 _ => return if name_is_g_instance(name) { Named { name = name } } else { Named { name = qualify(type_ref_ns(path, table, ref_ns), name) } }
             }
         }
@@ -712,7 +702,7 @@ fn widens_into_at(from: Type, to: Type, table: TypeTable, depth: i64) -> bool {
     match from {
         Named as fname => match to {
             Named as tname => {
-                if is_class_name(fname.name, table) && is_interface_name(tname.name, table) && type_conforms_to(fname.name, tname.name, table) { return true }
+                if is_class_name(fname.name, table) && (is_interface_name(tname.name, table) || is_trait_name(tname.name, table)) && type_conforms_to(fname.name, tname.name, table) { return true }
                 if fname.name != tname.name && is_class_name(fname.name, table) && is_polymorphic_base(tname.name, table) && subclass_reaches(fname.name, tname.name, table, 64) { return true }
             }
             _ => { }
