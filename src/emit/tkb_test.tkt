@@ -145,9 +145,9 @@ fn tkb_roundtrip_coalesce() {
 }
 
 #test
+/** (#165 C1) a plain call `foo()` resolved to namespace "teko::x" round-trips call_ns +
+    is_closure_call (both were hardcoded to ""/false before this crumb). */
 fn tkb_roundtrip_call_ns() {
-    // (#165 C1) a plain call `foo()` resolved to namespace "teko::x" round-trips call_ns +
-    // is_closure_call (both were hardcoded to ""/false before this crumb).
     let cpath = parser::Path { segments = teko::list::push(teko::list::empty(), parser::Segment { name = "foo" }) }
     let orig = checker::TExpr { kind = checker::TCall { callee = cpath; args = teko::list::empty(); call_ns = "teko::x"; is_closure_call = false; callee_type = checker::Void { }; is_iface_dispatch = false; iface_slot = 0 }; type = i64ty(); line = 0; col = 0 }
     match deserialize(serialize(orig)) {
@@ -165,9 +165,9 @@ fn tkb_roundtrip_call_ns() {
 }
 
 #test
+/** (#165 C1) a closure call (is_closure_call=true, call_ns="") — the flag survives independent
+    of call_ns, and the callee_type Func rides via the leading node type (unused here, Void). */
 fn tkb_roundtrip_closure_call_ns() {
-    // (#165 C1) a closure call (is_closure_call=true, call_ns="") — the flag survives independent
-    // of call_ns, and the callee_type Func rides via the leading node type (unused here, Void).
     let cpath = parser::Path { segments = teko::list::push(teko::list::empty(), parser::Segment { name = "f" }) }
     let orig = checker::TExpr { kind = checker::TCall { callee = cpath; args = teko::list::empty(); call_ns = ""; is_closure_call = true; callee_type = checker::Void { }; is_iface_dispatch = false; iface_slot = 0 }; type = i64ty(); line = 0; col = 0 }
     match deserialize(serialize(orig)) {
@@ -316,9 +316,9 @@ fn tkb_roundtrip_program() {
     }
 }
 
-// (#165 C0) rewrite the version u32 (bytes 4..7, little-endian) of a serialized program frame to
-// a chosen value WITHOUT touching the body — the FNV-1a hash covers only data[16:], so patching a
-// header byte keeps the hash valid and lets the version guard be exercised in isolation.
+/** (#165 C0) rewrite the version u32 (bytes 4..7, little-endian) of a serialized program frame to
+    a chosen value WITHOUT touching the body — the FNV-1a hash covers only data[16:], so patching a
+    header byte keeps the hash valid and lets the version guard be exercised in isolation. */
 fn with_program_version(bytes: []byte, ver: byte) -> []byte {
     mut out: []byte = teko::list::empty()
     mut i: u64 = 0
@@ -330,8 +330,8 @@ fn with_program_version(bytes: []byte, ver: byte) -> []byte {
     out
 }
 
-// a trivial one-item TProgram (a single `use`) — enough to serialize a valid v3 frame the version
-// tests can re-stamp.
+/** a trivial one-item TProgram (a single `use`) — enough to serialize a valid v3 frame the version
+    tests can re-stamp. */
 fn trivial_program() -> checker::TProgram {
     let upath = parser::Path { segments = teko::list::push(teko::list::empty(), parser::Segment { name = "teko" }) }
     let use1 = parser::UseDecl { path = upath; has_alias = false; alias = "" }
@@ -339,17 +339,17 @@ fn trivial_program() -> checker::TProgram {
 }
 
 #test
+/** (#165 C0) a v2 program frame — the pre-#165 layout — must be REJECTED by the v3 reader
+    (the added fields changed the body layout; reading v2 as v3 would mis-parse silently). */
 fn tkb_rejects_v2_program() {
-    // (#165 C0) a v2 program frame — the pre-#165 layout — must be REJECTED by the v3 reader
-    // (the added fields changed the body layout; reading v2 as v3 would mis-parse silently).
     let v3 = serialize_program(trivial_program())
     let v2 = with_program_version(v3, 2)
     match deserialize_program(v2) { checker::TProgram => teko::assert::is_true(false); error => teko::assert::is_true(true) }
     match deserialize_program(v3) { checker::TProgram as p => teko::assert::is_true(p.items.len == 1); error => teko::assert::is_true(false) }
 }
 
-// (#165 C2) round-trip a ConstraintExpr in isolation through the same-namespace codec helpers
-// (write_constraint/read_constraint) with a fresh string table + Reader — no program frame needed.
+/** (#165 C2) round-trip a ConstraintExpr in isolation through the same-namespace codec helpers
+    (write_constraint/read_constraint) with a fresh string table + Reader — no program frame needed. */
 fn roundtrip_constraint(c: parser::ConstraintExpr) -> parser::ConstraintExpr | error {
     let table = collect_constraint(st_empty(), c)
     let bytes = write_constraint(write_strtable(teko::list::empty(), table), table, c)
@@ -359,8 +359,8 @@ fn roundtrip_constraint(c: parser::ConstraintExpr) -> parser::ConstraintExpr | e
 }
 
 #test
+/** (#165 C2) `(Ord & Eq) | Clone` + NoConstraint round-trip with exact structure preserved. */
 fn tkb_roundtrip_constraint() {
-    // (#165 C2) `(Ord & Eq) | Clone` + NoConstraint round-trip with exact structure preserved.
     let ord   = parser::ConstraintAtom { name = "Ord" }
     let eq    = parser::ConstraintAtom { name = "Eq" }
     let clone = parser::ConstraintAtom { name = "Clone" }
@@ -391,13 +391,13 @@ fn tkb_roundtrip_constraint() {
     }
 }
 
-// (#165 C3) a Named{T} typed leaf (a generic param used as an operand type).
+/** (#165 C3) a Named{T} typed leaf (a generic param used as an operand type). */
 fn named_ty(name: str) -> checker::Type { checker::Named { name = name } }
 
 #test
+/** (#165 C3) `fn id<T: Ord>(x: T) -> T { return x }` — a generic fn crossing the codec:
+    type_params == ["T"] and type_constraints == [Ord] (PARALLEL) must survive a program frame. */
 fn tkb_roundtrip_generic_fn() {
-    // (#165 C3) `fn id<T: Ord>(x: T) -> T { return x }` — a generic fn crossing the codec:
-    // type_params == ["T"] and type_constraints == [Ord] (PARALLEL) must survive a program frame.
     let tref = checker::TExpr { kind = checker::TVar { name = "x"; is_func = false; func_ns = "" }; type = named_ty("T"); line = 0; col = 0 }
     let prm = parser::Param { name = "x"; has_type = true; type_ann = nt("T"); is_params = false; has_default = false; default_expr = parser::no_expr() }
     mut body: []checker::TStatement = teko::list::push(teko::list::empty(), checker::TReturn { has_value = true; value = tref })
@@ -420,9 +420,9 @@ fn tkb_roundtrip_generic_fn() {
 }
 
 #test
+/** (#165 C3) `type Box<T> = struct { v: T }` — a generic TypeDecl: type_params ride, and an
+    absent constraint is the NoConstraint sentinel (parallel to type_params, same length). */
 fn tkb_roundtrip_generic_type() {
-    // (#165 C3) `type Box<T> = struct { v: T }` — a generic TypeDecl: type_params ride, and an
-    // absent constraint is the NoConstraint sentinel (parallel to type_params, same length).
     let fld = parser::Field { name = "v"; type_ann = nt("T"); vis = parser::Visibility::Pub; is_intern = false }
     let tparams = teko::list::push(teko::list::empty(), "T")
     let tcons: []parser::ConstraintExpr = teko::list::push(teko::list::empty(), parser::NoConstraint { })
@@ -443,7 +443,7 @@ fn tkb_roundtrip_generic_type() {
     }
 }
 
-// (#165 C4) round-trip a lone parser::Function through the same-namespace codec helpers.
+/** (#165 C4) round-trip a lone parser::Function through the same-namespace codec helpers. */
 fn roundtrip_function(f: parser::Function) -> parser::Function | error {
     let table = collect_function(st_empty(), f)
     let bytes = write_function(write_strtable(teko::list::empty(), table), table, f)
@@ -453,10 +453,10 @@ fn roundtrip_function(f: parser::Function) -> parser::Function | error {
 }
 
 #test
+/** (#165 C4) `virtual fn area(self) -> i64` under a `#os("linux")` guard — an instance method
+    whose receiver is the untyped 1st param (has_type=false); every signature field + flag rides,
+    the body is the honest signature-only stub (empty on read). */
 fn tkb_roundtrip_method_sig() {
-    // (#165 C4) `virtual fn area(self) -> i64` under a `#os("linux")` guard — an instance method
-    // whose receiver is the untyped 1st param (has_type=false); every signature field + flag rides,
-    // the body is the honest signature-only stub (empty on read).
     let recv = parser::Param { name = "self"; has_type = false; type_ann = parser::no_type(); is_params = false; has_default = false; default_expr = parser::no_expr() }
     let m = parser::Function {
         name = "area"; type_params = teko::list::empty(); type_constraints = teko::list::empty()
@@ -487,8 +487,8 @@ fn tkb_roundtrip_method_sig() {
     }
 }
 
-// (#165 C5) a bodyless instance-method signature `fn <name>(self)` — the receiver is the untyped
-// 1st param; helper for the struct/interface method-order fixtures.
+/** (#165 C5) a bodyless instance-method signature `fn <name>(self)` — the receiver is the untyped
+    1st param; helper for the struct/interface method-order fixtures. */
 fn method_sig(name: str) -> parser::Function {
     let recv = parser::Param { name = "self"; has_type = false; type_ann = parser::no_type(); is_params = false; has_default = false; default_expr = parser::no_expr() }
     parser::Function {
@@ -502,9 +502,9 @@ fn method_sig(name: str) -> parser::Function {
 }
 
 #test
+/** (#165 C5) a struct with two methods [greet, name] — before this crumb methods dropped to
+    empty (invisible to a consuming project via seed_from_dep); the ORDER is the vtable contract. */
 fn tkb_roundtrip_struct_with_methods() {
-    // (#165 C5) a struct with two methods [greet, name] — before this crumb methods dropped to
-    // empty (invisible to a consuming project via seed_from_dep); the ORDER is the vtable contract.
     let fld = parser::Field { name = "x"; type_ann = nt("i64"); vis = parser::Visibility::Pub; is_intern = false }
     mut methods: []parser::Function = teko::list::push(teko::list::empty(), method_sig("greet"))
     methods = teko::list::push(methods, method_sig("name"))
@@ -531,9 +531,9 @@ fn tkb_roundtrip_struct_with_methods() {
 }
 
 #test
+/** (#165 C5) an interface `Shape` extending `Drawable` with two methods [area, perimeter] —
+    the method ORDER is the vtable-slot contract the cross-package D3 dispatch relies on. */
 fn tkb_roundtrip_interface_methods() {
-    // (#165 C5) an interface `Shape` extending `Drawable` with two methods [area, perimeter] —
-    // the method ORDER is the vtable-slot contract the cross-package D3 dispatch relies on.
     mut methods: []parser::Function = teko::list::push(teko::list::empty(), method_sig("area"))
     methods = teko::list::push(methods, method_sig("perimeter"))
     let body = parser::InterfaceBody { extends = teko::list::push(teko::list::empty(), "Drawable"); methods = methods }
@@ -558,9 +558,9 @@ fn tkb_roundtrip_interface_methods() {
 }
 
 #test
+/** (#165 C5) a class `Circle` extending base `Shape` (binding `parent`) implementing `Drawable`
+    with one method — kind + base + binding + implements + methods all ride (were all dropped). */
 fn tkb_roundtrip_class_with_base_and_methods() {
-    // (#165 C5) a class `Circle` extending base `Shape` (binding `parent`) implementing `Drawable`
-    // with one method — kind + base + binding + implements + methods all ride (were all dropped).
     let fld = parser::Field { name = "r"; type_ann = nt("i64"); vis = parser::Visibility::Private; is_intern = true }
     let body = parser::ClassBody {
         kind = parser::ClassKind::Virtual; has_base = true; base_name = "Shape"
@@ -720,4 +720,83 @@ fn descent_singlefield_slice_wrapper_descends() {
     // Slice { element = Prim } is SINGLE-FIELD (a wrapper) — the cheap control: descent preserved.
     let s: checker::Type = checker::Slice { element = ty_prim() }
     teko::assert::is_true(match_prim_arm(s) == "prim")
+}
+
+/** (#165 C7) whether two byte buffers are element-for-element equal (lengths + every byte). */
+fn bytes_equal(a: []byte, b: []byte) -> bool {
+    if a.len != b.len { return false }
+    mut i: u64 = 0
+    loop {
+        if i >= a.len { break }
+        if a[i] != b[i] { return false }
+        i++
+    }
+    true
+}
+
+/** (#165 C7) a generic struct `type Box<T: Ord> = struct { v: T }` carrying two methods
+    [get, set] and one implements ("Named") — exercises type_params + constraints + method order. */
+fn rich_generic_struct() -> parser::TypeDecl {
+    let fld = parser::Field { name = "v"; type_ann = nt("T"); vis = parser::Visibility::Pub; is_intern = false }
+    mut methods: []parser::Function = teko::list::push(teko::list::empty(), method_sig("get"))
+    methods = teko::list::push(methods, method_sig("set"))
+    let body = parser::StructBody { fields = teko::list::push(teko::list::empty(), fld); methods = methods; implements = teko::list::push(teko::list::empty(), "Named") }
+    let tcons: []parser::ConstraintExpr = teko::list::push(teko::list::empty(), parser::ConstraintAtom { name = "Ord" })
+    parser::TypeDecl { name = "Box"; type_params = teko::list::push(teko::list::empty(), "T"); type_constraints = tcons; body = body; vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 1; col = 1 }
+}
+
+/** (#165 C7) an interface `Named` extending `Any` with two methods [name, rename] — the vtable
+    contract whose method ORDER must survive the codec. */
+fn rich_interface() -> parser::TypeDecl {
+    mut methods: []parser::Function = teko::list::push(teko::list::empty(), method_sig("name"))
+    methods = teko::list::push(methods, method_sig("rename"))
+    let body = parser::InterfaceBody { extends = teko::list::push(teko::list::empty(), "Any"); methods = methods }
+    parser::TypeDecl { name = "Named"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = body; vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 5; col = 1 }
+}
+
+/** (#165 C7) a generic fn `fn pick<T: Ord>(x: T) -> T` whose body is a match over `x` with a
+    `defer` — a generic top-level fn (TYPED body) crossing every statement kind the codec carries. */
+fn rich_generic_fn() -> checker::TFunction {
+    let voidx = checker::TExpr { kind = checker::TNullLit { }; type = checker::Void { }; line = 0; col = 0 }
+    let subj = checker::TExpr { kind = checker::TVar { name = "x"; is_func = false; func_ns = "" }; type = named_ty("T"); line = 0; col = 0 }
+    let lit0 = parser::Expr { kind = parser::Number { is_float = false; value = 0; fval = 0.0 }; line = 0; col = 0 }
+    mut armbody: []checker::TStatement = teko::list::push(teko::list::empty(), checker::TReturn { has_value = true; value = subj })
+    let arm0 = checker::TArm { pattern = parser::LiteralPattern { value = lit0 }; has_when = false; guard = voidx; body = armbody }
+    mut wildbody: []checker::TStatement = teko::list::push(teko::list::empty(), checker::TReturn { has_value = true; value = subj })
+    let arm1 = checker::TArm { pattern = parser::WildcardPattern { }; has_when = false; guard = voidx; body = wildbody }
+    mut arms: []checker::TArm = teko::list::push(teko::list::empty(), arm0)
+    arms = teko::list::push(arms, arm1)
+    let mexpr = checker::TExpr { kind = checker::TMatchExpr { subject = subj; arms = arms }; type = named_ty("T"); line = 0; col = 0 }
+    mut deferbody: []checker::TStatement = teko::list::push(teko::list::empty(), checker::TExprStmt { expr = subj })
+    mut body: []checker::TStatement = teko::list::push(teko::list::empty(), checker::TDeferStmt { body = deferbody })
+    body = teko::list::push(body, checker::TExprStmt { expr = mexpr })
+    let prm = parser::Param { name = "x"; has_type = true; type_ann = nt("T"); is_params = false; has_default = false; default_expr = parser::no_expr() }
+    let tcons: []parser::ConstraintExpr = teko::list::push(teko::list::empty(), parser::ConstraintAtom { name = "Ord" })
+    checker::TFunction { name = "pick"; type_params = teko::list::push(teko::list::empty(), "T"); type_constraints = tcons; params = teko::list::push(teko::list::empty(), prm); return_type = named_ty("T"); body = body; vis = parser::Visibility::Pub; has_doc = false; doc = ""; namespace = "m"; file = "m.tks"; line = 1; col = 1; is_test = false; is_extern = false; c_symbol = ""; from_lib = "" }
+}
+
+/** (#165 C7) a RICH TProgram: a `use`, a generic struct with methods + implements, an interface
+    (vtable order), and a generic fn whose typed body carries a match + defer. */
+fn rich_program() -> checker::TProgram {
+    let upath = parser::Path { segments = teko::list::push(teko::list::empty(), parser::Segment { name = "teko" }) }
+    mut items: []checker::TItem = teko::list::push(teko::list::empty(), parser::UseDecl { path = upath; has_alias = false; alias = "" })
+    items = teko::list::push(items, rich_generic_struct())
+    items = teko::list::push(items, rich_interface())
+    items = teko::list::push(items, rich_generic_fn())
+    checker::TProgram { items = items }
+}
+
+#test
+/** (#165 C7 — ACCEPT) full-fidelity round-trip: serialize a rich program, deserialize, then
+    RE-serialize; the two byte-arrays must be identical. Any dropped field (call_ns, type_params,
+    constraints, methods, flags) mutates the second pass, so byte-identity is the total-fidelity gate. */
+fn tkb_roundtrip_program_byte_identical() {
+    let first = serialize_program(rich_program())
+    match deserialize_program(first) {
+        checker::TProgram as prog => {
+            let second = serialize_program(prog)
+            teko::assert::is_true(bytes_equal(first, second))
+        }
+        error => teko::assert::is_true(false)
+    }
 }
