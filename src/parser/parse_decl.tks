@@ -651,16 +651,21 @@ fn parse_type_decl(tokens: []lexer::Token, pos: u64) -> Parsed<Decl> | error {
 
 // `parse_module` returns Parsed<Module> (an instance of the result.tks generic).
 
-// dispatch a top-level declaration: a function or a type decl (each may be preceded by a
-// doc comment and/or `pub`/`exp`). Peeks past the doc/visibility prefix to choose. `pos` is
-// at the doc, `pub`/`exp`, `fn`, or `type`.
-fn parse_decl(tokens: []lexer::Token, pos: u64) -> Parsed<Decl> | error {
-    // optional leading attributes (each on its own line or inline, before the decl): `#test` (D2)
-    // and `#os("…")` (C7.1f conditional-compile guard). Both apply only to a FUNCTION (rejected on a
-    // type below). Unknown attributes are an honest error.
+/** Collect the leading `#…` attributes before a declaration keyword (each on its own line or
+ *  inline): `#test` (D2), `#os("…")` (C7.1f), the three DI lifetimes `#singleton`/`#scoped`/
+ *  `#transient` (W10c, precede a `type`), and the `#inject(…)` overlay (W10c, precedes a `fn`).
+ *  A second lifetime annotation on one declaration is an honest error. `next` resumes at the
+ *  doc/visibility/keyword that follows the block; placement (fn-vs-type) is enforced by the
+ *  caller so the message names the actual keyword. */
+fn parse_decl_attributes(tokens: []lexer::Token, pos: u64) -> ParsedAttributes | error {
     mut start = pos
     mut is_test = false
     mut os_guard = ""
+    mut di_kind = DiKind::None
+    mut has_key = false
+    mut key = ""
+    mut has_inject = false
+    mut injects: []InjectBinding = teko::list::empty()
     loop {
         if !is_kind_at(tokens, start, lexer::TokenKind::Hash) { break }
         if !is_kind_at(tokens, start + 1, lexer::TokenKind::Ident) {
@@ -671,45 +676,153 @@ fn parse_decl(tokens: []lexer::Token, pos: u64) -> Parsed<Decl> | error {
             is_test = true
             start = skip_seps(tokens, start + 2)
         } else if attr == "os" {
-            // `#os("linux")` — Hash Ident '(' Str ')'.
             if !is_kind_at(tokens, start + 2, lexer::TokenKind::LParen) { return err_at(tokens, start + 2, "expected '(' after `#os`") }
             if !is_kind_at(tokens, start + 3, lexer::TokenKind::Str) { return err_at(tokens, start + 3, "expected a quoted OS name in `#os(\"…\")`") }
             os_guard = tokens[start + 3].text
             if !is_kind_at(tokens, start + 4, lexer::TokenKind::RParen) { return err_at(tokens, start + 4, "expected ')' to close `#os(…)`") }
             start = skip_seps(tokens, start + 5)
+        } else if attr == "inject" {
+            if has_inject { return err_at(tokens, start + 1, "a function may carry only one `#inject(…)` overlay") }
+            let ov = match parse_inject_overlay(tokens, start) { ParsedList<InjectBinding> as x => x; error as e => return e }
+            has_inject = true
+            injects = ov.items
+            start = skip_seps(tokens, ov.next)
+        } else if attr == "singleton" || attr == "scoped" || attr == "transient" {
+            if di_kind != DiKind::None { return err_at(tokens, start + 1, "a type may carry only one lifetime annotation (`#singleton`/`#scoped`/`#transient`)") }
+            di_kind = lifetime_kind_of(attr)
+            start = skip_seps(tokens, start + 2)
         } else {
-            return err_at(tokens, start + 1, "unknown attribute (only `#test` and `#os(\"…\")` are recognized)")
+            return err_at(tokens, start + 1, "unknown attribute (only `#test`, `#os(\"…\")`, `#inject(…)`, and the lifetimes `#singleton`/`#scoped`/`#transient` are recognized)")
         }
     }
+    ParsedAttributes { is_test = is_test; os_guard = os_guard; di_kind = di_kind; has_key = has_key; key = key; has_inject = has_inject; injects = injects; next = start }
+}
+
+/** Map a lifetime attribute name to its `DiKind` (the caller has verified it is one of the three). */
+fn lifetime_kind_of(attr: str) -> DiKind {
+    if attr == "singleton" { return DiKind::Singleton }
+    if attr == "scoped" { return DiKind::Scoped }
+    DiKind::Transient
+}
+
+/** Parse the `#inject( name: Type, … )` overlay into its bindings. `pos` is at the `#`. The list
+ *  is comma-separated, may be empty, and each binding is `name: Type` (keys `@Key` are #173 — the
+ *  bare `@` is not a lexable token in core, so a keyed binding never reaches here). */
+fn parse_inject_overlay(tokens: []lexer::Token, pos: u64) -> ParsedList<InjectBinding> | error {
+    if !is_kind_at(tokens, pos + 2, lexer::TokenKind::LParen) {
+        return err_at(tokens, pos + 2, "expected '(' after `#inject`")
+    }
+    mut p = pos + 3
+    mut bindings: []InjectBinding = teko::list::empty()
+    if is_kind_at(tokens, p, lexer::TokenKind::RParen) {
+        return ParsedList<InjectBinding> { items = bindings; next = p + 1 }
+    }
+    loop {
+        let b = match parse_inject_binding(tokens, p) { Parsed<InjectBinding> as x => x; error as e => return e }
+        bindings = teko::list::push(bindings, b.node)
+        p = b.next
+        if !is_kind_at(tokens, p, lexer::TokenKind::Comma) { break }
+        p = p + 1
+    }
+    if !is_kind_at(tokens, p, lexer::TokenKind::RParen) {
+        return err_at(tokens, p, "expected ',' or ')' in an `#inject(…)` overlay")
+    }
+    ParsedList<InjectBinding> { items = bindings; next = p + 1 }
+}
+
+/** Parse one `name: Type` binding inside an `#inject(…)` overlay. `pos` is at the binding name. */
+fn parse_inject_binding(tokens: []lexer::Token, pos: u64) -> Parsed<InjectBinding> | error {
+    if !is_name_at(tokens, pos) {
+        return err_at(tokens, pos, "expected an injected dependency name")
+    }
+    let name = tokens[pos].text
+    let bline: u32 = tokens[pos].line
+    let bcol: u32 = tokens[pos].col
+    if !is_kind_at(tokens, pos + 1, lexer::TokenKind::Colon) {
+        return err_at(tokens, pos + 1, "expected ':' after an injected dependency name")
+    }
+    let ty = match parse_type(tokens, pos + 2) { ParsedType as x => x; error as e => return e }
+    Parsed<InjectBinding> { node = InjectBinding { name = name; type_ann = ty.node; has_key = false; key = ""; line = bline; col = bcol }; next = ty.next }
+}
+
+fn parse_decl(tokens: []lexer::Token, pos: u64) -> Parsed<Decl> | error {
+    let attrs = match parse_decl_attributes(tokens, pos) { ParsedAttributes as x => x; error as e => return e }
+    let start = attrs.next
     mut k = start
-    if is_kind_at(tokens, k, lexer::TokenKind::Doc) { k = skip_seps(tokens, k + 1) }   // (#111) own-line doc
+    if is_kind_at(tokens, k, lexer::TokenKind::Doc) { k = skip_seps(tokens, k + 1) }
     if is_kind_at(tokens, k, lexer::TokenKind::Pub) {
         k = k + 1
     } else if is_kind_at(tokens, k, lexer::TokenKind::Exp) {
         k = k + 1
     }
-    mut saw_extern = false                              // C7.1a: peek past `extern` to reach `fn`/`type`
+    mut saw_extern = false
     if is_kind_at(tokens, k, lexer::TokenKind::Extern) {
         saw_extern = true
         k = k + 1
     }
     if is_kind_at(tokens, k, lexer::TokenKind::Fn) {
-        return parse_function(tokens, start, is_test, os_guard, false, false)
+        return parse_fn_decl_with_attrs(tokens, start, attrs)
     }
     if is_kind_at(tokens, k, lexer::TokenKind::Type) {
-        if is_test { return err_at(tokens, k, "`#test` may only precede a function") }
-        if os_guard != "" { return err_at(tokens, k, "`#os(\"…\")` may only precede a function") }
-        return parse_type_decl(tokens, start)   // handles the optional `extern` (→ opaque handle)
+        return parse_type_decl_with_attrs(tokens, start, k, attrs)
     }
     if is_kind_at(tokens, k, lexer::TokenKind::Flags) {
-        if is_test { return err_at(tokens, k, "`#test` may only precede a function") }
-        if os_guard != "" { return err_at(tokens, k, "`#os(\"…\")` may only precede a function") }
-        return parse_flags_decl(tokens, start)
+        return parse_flags_decl_with_attrs(tokens, start, k, attrs)
     }
     if saw_extern {
         return err_at(tokens, k, "expected `fn` or `type` after `extern`")
     }
     err_at(tokens, k, "expected a declaration (`fn`/`type`/`flags`, optionally `pub`/`exp`/doc); loose statements belong in main.tks")
+}
+
+/** Parse a `fn` declaration reached through `parse_decl`, applying the collected attributes:
+ *  a `#singleton`/`#scoped`/`#transient` lifetime may not precede a function, and the `#inject`
+ *  overlay is threaded into the parsed Function (has_inject/injects). */
+fn parse_fn_decl_with_attrs(tokens: []lexer::Token, start: u64, attrs: ParsedAttributes) -> Parsed<Decl> | error {
+    if attrs.di_kind != DiKind::None { return err_at(tokens, start, "a lifetime annotation (`#singleton`/`#scoped`/`#transient`) may only precede a `type`, not a function") }
+    let d = match parse_function(tokens, start, attrs.is_test, attrs.os_guard, false, false) { Parsed<Decl> as x => x; error as e => return e }
+    Parsed<Decl> { node = with_fn_inject(d.node, attrs.has_inject, attrs.injects); next = d.next }
+}
+
+/** Parse a `type` declaration reached through `parse_decl`, applying the collected attributes:
+ *  `#test`/`#os`/`#inject` may not precede a type, and a lifetime annotation is threaded into
+ *  the parsed TypeDecl (di_kind/has_di_key/di_key). */
+fn parse_type_decl_with_attrs(tokens: []lexer::Token, start: u64, k: u64, attrs: ParsedAttributes) -> Parsed<Decl> | error {
+    match reject_fn_only_attrs_on_type(tokens, k, attrs) { error as e => return e; null => {} }
+    let d = match parse_type_decl(tokens, start) { Parsed<Decl> as x => x; error as e => return e }
+    Parsed<Decl> { node = with_type_di(d.node, attrs.di_kind, attrs.has_key, attrs.key); next = d.next }
+}
+
+/** Parse a `flags` declaration reached through `parse_decl`. Flags carry no DI (they are values,
+ *  not injectable objects); a lifetime annotation on one is a plain type-vs-fn placement error. */
+fn parse_flags_decl_with_attrs(tokens: []lexer::Token, start: u64, k: u64, attrs: ParsedAttributes) -> Parsed<Decl> | error {
+    match reject_fn_only_attrs_on_type(tokens, k, attrs) { error as e => return e; null => {} }
+    if attrs.di_kind != DiKind::None { return err_at(tokens, k, "a lifetime annotation (`#singleton`/`#scoped`/`#transient`) may not precede a `flags` type") }
+    parse_flags_decl(tokens, start)
+}
+
+/** The function-only attributes (`#test`, `#os`, `#inject`) are all rejected before a `type`. */
+fn reject_fn_only_attrs_on_type(tokens: []lexer::Token, k: u64, attrs: ParsedAttributes) -> error? {
+    if attrs.is_test { return err_at(tokens, k, "`#test` may only precede a function") }
+    if attrs.os_guard != "" { return err_at(tokens, k, "`#os(\"…\")` may only precede a function") }
+    if attrs.has_inject { return err_at(tokens, k, "an `#inject(…)` overlay may only precede a function, not a `type`") }
+    null
+}
+
+/** Rebuild a parsed Function with its `#inject` overlay attached (all other fields preserved). */
+fn with_fn_inject(node: Decl, has_inject: bool, injects: []InjectBinding) -> Decl {
+    match node {
+        Function as f => Function { name = f.name; type_params = f.type_params; type_constraints = f.type_constraints; params = f.params; has_return = f.has_return; return_type = f.return_type; body = f.body; vis = f.vis; has_doc = f.has_doc; doc = f.doc; line = f.line; col = f.col; is_test = f.is_test; is_extern = f.is_extern; c_symbol = f.c_symbol; from_lib = f.from_lib; os_guard = f.os_guard; is_intern = f.is_intern; is_abstract = f.is_abstract; is_virtual = f.is_virtual; is_override = f.is_override; has_inject = has_inject; injects = injects }
+        _ => node
+    }
+}
+
+/** Rebuild a parsed TypeDecl with its DI lifetime annotation attached (all other fields preserved). */
+fn with_type_di(node: Decl, di_kind: DiKind, has_key: bool, key: str) -> Decl {
+    match node {
+        TypeDecl as td => TypeDecl { name = td.name; type_params = td.type_params; type_constraints = td.type_constraints; body = td.body; vis = td.vis; has_doc = td.has_doc; doc = td.doc; line = td.line; col = td.col; di_kind = di_kind; has_di_key = has_key; di_key = key }
+        _ => node
+    }
 }
 
 // a module file: the `use` header, then a loop of declarations. Rejects loose statements.
