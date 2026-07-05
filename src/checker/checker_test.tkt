@@ -3347,6 +3347,60 @@ fn trait_as_value_type_is_accepted() {
     teko::assert::is_true(tr_program_ok(items2(tr, parser::Item { content = f; namespace = ""; file = "" })))
 }
 
+/** (TR1 #176) build a generic `fn <name><T: <trait>>(x: T) -> i64 { <body> }` item — the shape
+    the trait-constraint negatives instantiate. `body` is the fn's statement list. */
+fn tr_generic_fn(name: str, trait_name: str, body: []parser::Statement) -> parser::Item {
+    let p = parser::Param { name = "x"; has_type = true; type_ann = named_t("T"); is_params = false; has_default = false; default_expr = e_num(0) }
+    let cons: []parser::ConstraintExpr = teko::list::push(teko::list::empty(), parser::ConstraintAtom { name = trait_name })
+    let f = parser::Function { name = name; type_params = teko::list::push(teko::list::empty(), "T"); type_constraints = cons; params = teko::list::push(teko::list::empty(), p); has_return = true; return_type = named_t("i64"); body = body; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false; has_inject = false; injects = teko::list::empty() }
+    parser::Item { content = f; namespace = ""; file = "" }
+}
+
+/** (TR1 #176) a loose `let <bind> = <StructName> { <field> = 0 }` binding item (constructs a struct
+    deriver value to feed a generic-fn call). */
+fn tr_let_struct(bind: str, type_name: str, field: str) -> parser::Item {
+    let lit = ek(parser::StructLit { type_path = path1(type_name); type_args = teko::list::empty(); field_names = teko::list::push(teko::list::empty(), field); field_vals = teko::list::push(teko::list::empty(), e_num(0)) })
+    let b = parser::Binding { kind = parser::BindKind::Let; target = parser::SimpleName { name = bind }; has_type = false; type_ann = named_t("i64"); value = lit }
+    parser::Item { content = b; namespace = ""; file = "" }
+}
+
+#test
+fn trait_constraint_nonderiving_arg_is_error() {
+    let tr = trait_item("Need", teko::list::empty(), list1(iface_method("need")))
+    let total = tr_generic_fn("total", "Need", one_stmt(e_num(0)))
+    let plain = deriver_struct_item("Plain", tr_fields1("own"), teko::list::empty(), teko::list::empty())
+    let mk = tr_let_struct("p", "Plain", "own")
+    let call = parser::Item { content = st(ek(parser::Call { callee = path1("total"); args = teko::list::push(teko::list::empty(), e_var("p")); arg_names = teko::list::push(teko::list::empty(), "") })); namespace = ""; file = "" }
+    mut items: []parser::Item = teko::list::push(teko::list::empty(), tr)
+    items = teko::list::push(items, total)
+    items = teko::list::push(items, plain)
+    items = teko::list::push(items, mk)
+    items = teko::list::push(items, call)
+    teko::assert::is_true(!tr_program_ok(items))
+}
+
+#test
+fn trait_struct_as_dynamic_value_is_error() {
+    let tr = trait_item("Need", teko::list::empty(), list1(iface_method("need")))
+    let dv = deriver_struct_item("P", tr_fields1("own"), list1(impl_method("need", parser::Visibility::Private)), slist1("Need"))
+    let mk = tr_let_struct("p", "P", "own")
+    let bind_s = parser::Binding { kind = parser::BindKind::Let; target = parser::SimpleName { name = "s" }; has_type = true; type_ann = named_t("Need"); value = e_var("p") }
+    let widen = parser::Item { content = bind_s; namespace = ""; file = "" }
+    mut items: []parser::Item = teko::list::push(teko::list::empty(), tr)
+    items = teko::list::push(items, dv)
+    items = teko::list::push(items, mk)
+    items = teko::list::push(items, widen)
+    teko::assert::is_true(!tr_program_ok(items))
+}
+
+#test
+fn trait_constraint_body_calls_unauthorized_method_is_error() {
+    let tr = trait_item("Need", teko::list::empty(), list1(iface_method("need")))
+    let call_bad = st(ek(parser::MethodCall { receiver = e_var("x"); method = "absent"; args = teko::list::empty() }))
+    let total = tr_generic_fn("total", "Need", teko::list::push(teko::list::empty(), call_bad))
+    teko::assert::is_true(!tr_program_ok(items2(tr, total)))
+}
+
 #test
 fn trait_method_with_dispatch_markers_is_error() {
     // `virtual fn` inside a trait body — the class dispatch markers are meaningless in a trait.
