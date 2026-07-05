@@ -1,0 +1,156 @@
+/** tooling/nano/src/nano_gen.tks (namespace 'teko_grammar_gen_nano' — same root as main.tks) —
+ *  the A5 Nano syntax-rule generator. Renders a `Spec` (read from A1's grammar-spec.json)
+ *  into `tooling/nano/teko.nanorc`: `color`/regex rules for keywords, operators, comments,
+ *  and literals — best-effort, no nesting/context (Nano's own limitation, documented in
+ *  TEKO_ROADMAP_TOOLING.md's B4: "Sem contexto/aninhamento — aceita falso-positivo ocasional").
+ *
+ *  escape a literal string for a Nano/POSIX ERE regex (Nano's `color` directive takes an
+ *  extended regular expression): `.` `*` `+` `?` `(` `)` `[` `]` `{` `}` `^` `$` `|` `\` are
+ *  all ERE metacharacters and need escaping to match a literal operator/keyword spelling.
+ */
+fn ere_escape(s: str) -> str {
+    mut out = ""
+    mut i: u64 = 0
+    loop {
+        if i >= s.len { break }
+        let c = s[i]
+        let needs_escape = c == b'.' || c == b'*' || c == b'+' || c == b'?' || c == b'(' || c == b')' || c == b'[' || c == b']' || c == b'{' || c == b'}' || c == b'^' || c == b'$' || c == b'|' || c == b'\\'
+        if needs_escape { out = out ~ "\\" }
+        out = out ~ one_char(c)
+        i++
+    }
+    out
+}
+
+/** the ERE alternation for a list of keyword texts, longest-first (maximal munch). */
+fn keyword_alternation(keywords: []SpecKeyword) -> str {
+    let sorted = sort_kw_by_length_desc(keywords)
+    mut out = ""
+    mut i: u64 = 0
+    loop {
+        if i >= sorted.len { break }
+        if i > 0 { out = out ~ "|" }
+        out = out ~ ere_escape(sorted[i].text)
+        i++
+    }
+    out
+}
+
+fn sort_kw_by_length_desc(items: []SpecKeyword) -> []SpecKeyword {
+    mut out: []SpecKeyword = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= items.len { break }
+        out = insert_kw_by_length_desc(out, items[i])
+        i++
+    }
+    out
+}
+
+fn insert_kw_by_length_desc(sorted: []SpecKeyword, item: SpecKeyword) -> []SpecKeyword {
+    mut out: []SpecKeyword = teko::list::empty()
+    mut inserted = false
+    mut i: u64 = 0
+    loop {
+        if i >= sorted.len { break }
+        if !inserted && item.text.len > sorted[i].text.len {
+            out = teko::list::push(out, item)
+            inserted = true
+        }
+        out = teko::list::push(out, sorted[i])
+        i++
+    }
+    if !inserted { out = teko::list::push(out, item) }
+    out
+}
+
+/** the ERE alternation for every operator's exact spelling, longest-first. */
+fn operator_alternation(operators: []SpecOperator) -> str {
+    let sorted = sort_op_by_length_desc(operators)
+    mut out = ""
+    mut i: u64 = 0
+    loop {
+        if i >= sorted.len { break }
+        if i > 0 { out = out ~ "|" }
+        out = out ~ ere_escape(sorted[i].text)
+        i++
+    }
+    out
+}
+
+fn sort_op_by_length_desc(items: []SpecOperator) -> []SpecOperator {
+    mut out: []SpecOperator = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= items.len { break }
+        out = insert_op_by_length_desc(out, items[i])
+        i++
+    }
+    out
+}
+
+fn insert_op_by_length_desc(sorted: []SpecOperator, item: SpecOperator) -> []SpecOperator {
+    mut out: []SpecOperator = teko::list::empty()
+    mut inserted = false
+    mut i: u64 = 0
+    loop {
+        if i >= sorted.len { break }
+        if !inserted && item.text.len > sorted[i].text.len {
+            out = teko::list::push(out, item)
+            inserted = true
+        }
+        out = teko::list::push(out, sorted[i])
+        i++
+    }
+    if !inserted { out = teko::list::push(out, item) }
+    out
+}
+
+/** wrap a raw ERE pattern in a double-quoted Nano regex-string literal, escaping any
+ *  literal `"` the pattern itself contains (Teko's own string delimiter IS `"`, so the
+ *  string/byte/char literal patterns below embed one — a bare `""..."""` would otherwise
+ *  misparse as an EMPTY string followed by stray text, exactly the bug this fixes).
+ */
+fn nano_regex_literal(pattern: str) -> str {
+    mut out = "\""
+    mut i: u64 = 0
+    loop {
+        if i >= pattern.len { break }
+        let c = pattern[i]
+        if c == b'"' { out = out ~ "\\" }
+        out = out ~ one_char(c)
+        i++
+    }
+    out ~ "\""
+}
+
+/** render the full `teko.nanorc` document from `spec`. */
+pub fn render_nanorc(spec: Spec) -> str {
+    let kw_pattern = nano_regex_literal("(" ~ keyword_alternation(spec.keywords) ~ ")")
+    let op_pattern = nano_regex_literal("(" ~ operator_alternation(spec.operators) ~ ")")
+    let line_comment_pattern = nano_regex_literal(ere_escape(spec.line_comment) ~ ".*")
+    let doc_comment_start = nano_regex_literal(ere_escape(spec.doc_comment_open))
+    let block_comment_start = nano_regex_literal(ere_escape(spec.block_comment_open))
+    let block_comment_end = nano_regex_literal(ere_escape(spec.block_comment_close))
+    let delim = ere_escape(spec.string_delimiter)
+    let string_pattern = nano_regex_literal(delim ~ "([^" ~ delim ~ "\\\\]|\\\\.)*" ~ delim)
+    let byte_char_pattern = nano_regex_literal("\\<(" ~ ere_escape(spec.byte_literal_prefix) ~ "|" ~ ere_escape(spec.char_literal_prefix) ~ ")" ~ ere_escape(spec.byte_literal_delimiter) ~ "([^\\\\']|\\\\.)*" ~ ere_escape(spec.byte_literal_delimiter))
+
+    mut out = "## tooling/nano/teko.nanorc — GENERATED by tooling/nano (A5); do not edit by hand.\n"
+    out = out ~ "## Regenerate: tooling/nano/bin/teko_grammar_gen_nano [repo-root]\n"
+    out = out ~ "## Best-effort: Nano has no nested/contextual highlighting, so a keyword or operator\n"
+    out = out ~ "## spelling that also appears inside a string/comment may be colored too (a known,\n"
+    out = out ~ "## accepted Nano limitation — see TEKO_ROADMAP_TOOLING.md's Eixo B, B4).\n\n"
+    out = out ~ "syntax \"teko\" \"\\.tks$\" \"\\.tkt$\"\n\n"
+    out = out ~ "color brightblue " ~ kw_pattern ~ "\n"
+    out = out ~ "color cyan " ~ op_pattern ~ "\n"
+    out = out ~ "color yellow " ~ string_pattern ~ "\n"
+    out = out ~ "color yellow " ~ byte_char_pattern ~ "\n"
+    out = out ~ "color magenta " ~ nano_regex_literal(spec.number_hex_pattern) ~ "\n"
+    out = out ~ "color magenta " ~ nano_regex_literal(spec.number_binary_pattern) ~ "\n"
+    out = out ~ "color magenta " ~ nano_regex_literal(spec.number_decimal_pattern) ~ "\n"
+    out = out ~ "color green " ~ line_comment_pattern ~ "\n"
+    out = out ~ "color green start=" ~ doc_comment_start ~ " end=" ~ block_comment_end ~ "\n"
+    out = out ~ "color green start=" ~ block_comment_start ~ " end=" ~ block_comment_end ~ "\n"
+    out
+}
