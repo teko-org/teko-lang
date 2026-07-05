@@ -17,52 +17,65 @@ set -eu
 LABEL="${1:?usage: ci_provision_teko.sh <LABEL>}"
 REPO="${GITHUB_REPOSITORY:?GITHUB_REPOSITORY must be set}"
 
-# Newest published release BY VERSION (prereleases included, drafts excluded). The
-# GitHub /releases API is NOT ordered by version — `[0]` can return a stale tag (e.g.
-# 0.0.1.9 ahead of 0.0.1.17). Filter to MAJOR.MINOR.PATCH.BUILD tags and pick the
-# highest with `sort -V`, so CI always seeds from the newest compiler.
-TAG="$(gh api "repos/${REPO}/releases" --paginate \
+# Candidate releases, NEWEST-VERSION FIRST (drafts excluded; the /releases API is NOT
+# version-ordered so `[0]` can be stale — filter to MAJOR.MINOR.PATCH.BUILD + reverse sort -V).
+# We walk this list and accept the first release that yields a USABLE seed: its asset exists AND
+# the extracted binary reports the release's own version. A binary that reports a DIFFERENT
+# version than its tag is a broken build (e.g. a cross-compile that dropped -DTEKO_VERSION_STRING
+# and reports 0.0.0.0-dev — such a build is also miscompiled) — skip it and fall to the next.
+TAGS="$(gh api "repos/${REPO}/releases" --paginate \
   --jq 'map(select(.draft | not) | .tag_name)[] | select(test("^v?[0-9]+([.][0-9]+){3}"))' \
-  | awk '{ orig=$0; ver=$0; sub(/^v/,"",ver); print ver"\t"orig }' | sort -V | tail -n1 | cut -f2)"
-if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
+  | awk '{ ver=$0; sub(/^v/,"",ver); print ver"\t"$0 }' | sort -rV | cut -f2)"
+if [ -z "$TAGS" ]; then
   echo "ci_provision_teko: no published release found for $REPO" >&2
   exit 1
 fi
-echo "ci_provision_teko: seeding compiler from release $TAG (asset teko-${LABEL}.*)"
 
-# Download the asset. The Linux labels gained a libc suffix (linux-x86_64 -> linux-x86_64-glibc)
-# when the release started shipping glibc+musl separately; a release predating that split has
-# only the unsuffixed asset, so fall back to `<label>` with the trailing `-glibc` stripped.
-rm -f teko-*.tar.gz teko-*.zip
-if gh release download "$TAG" -R "$REPO" -p "teko-${LABEL}.tar.gz" -p "teko-${LABEL}.zip" --clobber 2>/dev/null; then
-  :
-else
-  ALT="${LABEL%-glibc}"
-  if [ "$ALT" != "$LABEL" ]; then
-    echo "ci_provision_teko: teko-${LABEL}.* absent in $TAG — falling back to legacy teko-${ALT}.*"
-    gh release download "$TAG" -R "$REPO" -p "teko-${ALT}.tar.gz" -p "teko-${ALT}.zip" --clobber
-  else
-    echo "ci_provision_teko: no seed asset teko-${LABEL}.* in $TAG" >&2
-    exit 1
+seed_from_tag() {
+  tag="$1"
+  # Candidate asset labels: exact; then the glibc-suffixed form (a bare linux-<arch> maps to the
+  # glibc default); then the unsuffixed legacy form (-glibc stripped, for a pre-split release).
+  cands="$LABEL"
+  case "$LABEL" in
+    linux-*-glibc) cands="$cands ${LABEL%-glibc}" ;;
+    linux-*-musl)  : ;;
+    linux-*)       cands="$cands ${LABEL}-glibc" ;;
+  esac
+  rm -f teko-*.tar.gz teko-*.zip
+  got=""
+  for c in $cands; do
+    if gh release download "$tag" -R "$REPO" -p "teko-${c}.tar.gz" -p "teko-${c}.zip" --clobber 2>/dev/null; then
+      got=1; break
+    fi
+  done
+  [ -n "$got" ] || { echo "ci_provision_teko: $tag has no asset for '$LABEL' (tried: $cands) — trying older"; return 1; }
+  rm -rf .seed; mkdir -p .seed
+  archive="$(ls teko-*.zip teko-*.tar.gz 2>/dev/null | head -n1)"
+  [ -n "$archive" ] || { echo "ci_provision_teko: $tag download produced no archive — trying older"; return 1; }
+  case "$archive" in
+    *.zip) unzip -o "$archive" -d .seed >/dev/null ;;
+    *)     tar -xzf "$archive" -C .seed ;;
+  esac
+  chmod +x .seed/teko .seed/teko.exe 2>/dev/null || true
+  bin=".seed/teko"; [ -f .seed/teko.exe ] && bin=".seed/teko.exe"
+  # VERSION SANITY: the seed must report its own tag's version. A miscompiled/misbuilt binary
+  # (e.g. the -DTEKO_VERSION_STRING-less cross build reporting 0.0.0.0-dev) is rejected.
+  expectnum="${tag#v}"; expectnum="${expectnum%%-*}"
+  ver="$("$bin" --version 2>/dev/null || echo '')"
+  case "$ver" in
+    *"$expectnum"*) : ;;
+    *) echo "ci_provision_teko: $tag seed reports '$ver' (expected version $expectnum) — broken build, trying older"; return 1 ;;
+  esac
+  seed_dir="$(CDPATH='' cd -- .seed && pwd)"
+  [ -n "${GITHUB_PATH:-}" ] && printf '%s\n' "$seed_dir" >> "$GITHUB_PATH"
+  echo "ci_provision_teko: teko $tag ready at $seed_dir (version $ver)"
+  return 0
+}
+
+for TAG in $TAGS; do
+  if seed_from_tag "$TAG"; then
+    exit 0
   fi
-fi
-
-rm -rf .seed
-mkdir -p .seed
-# Extract whichever archive actually landed (name may be the label or the legacy fallback).
-ARCHIVE="$(ls teko-*.zip teko-*.tar.gz 2>/dev/null | head -n1)"
-if [ -z "$ARCHIVE" ]; then
-  echo "ci_provision_teko: no seed archive downloaded" >&2
-  exit 1
-fi
-case "$ARCHIVE" in
-  *.zip) unzip -o "$ARCHIVE" -d .seed ;;
-  *)     tar -xzf "$ARCHIVE" -C .seed ;;
-esac
-chmod +x .seed/teko .seed/teko.exe 2>/dev/null || true
-
-SEED_DIR="$(CDPATH='' cd -- .seed && pwd)"
-if [ -n "${GITHUB_PATH:-}" ]; then
-  printf '%s\n' "$SEED_DIR" >> "$GITHUB_PATH"
-fi
-echo "ci_provision_teko: teko $TAG ready at $SEED_DIR"
+done
+echo "ci_provision_teko: no usable seed found for '$LABEL' in any release" >&2
+exit 1

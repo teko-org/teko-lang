@@ -3,9 +3,22 @@
 # artifacts with `zig cc`: glibc (dynamic, pinned to an old glibc for wide compat) and musl
 # (fully static) for x86_64, arm64 and riscv64. ONE emitted teko.c → six targets, no qemu.
 #
-# Cross-compilation is deterministic: a successful compile of the (CI-proven, fixpoint) teko.c
-# for a target IS the correctness argument — the binary need not be RUN under emulation. Each
-# artifact's architecture is asserted from `file` output; a wrong-arch or failed compile aborts.
+# A successful cross-COMPILE is NOT by itself a correctness argument: `zig cc` differs from the
+# native clang/gcc that built every release <= v0.0.1.21 in two ways that the emitted teko.c's
+# latent undefined behaviour makes fatal, and BOTH must be neutralised here:
+#   1. `-O0` (not `-O1`/`-O2`) — at any optimizing level zig EXPLOITS the UB into a MISCOMPILE
+#      (the checker mis-resolves a call and rejects the compiler's own valid source). `-O0` and
+#      `-Og` compile it correctly; the native `-O0` releases always did.
+#   2. `-fno-sanitize=undefined` — zig cc enables UBSan TRAPS by default (native cc does not), so
+#      the one boundary INT64_MIN-negation in the checker's int_fits range-check aborts the
+#      process the moment it type-checks any `i64` literal near the low bound. Disabling the trap
+#      restores the native cc behaviour (the UB itself is benign here: the compared bound is
+#      correct once the negation is allowed to wrap).
+# With both, `zig cc -O0 -fno-sanitize=undefined` self-builds the whole corpus to exit 0.
+# Correctness over the marginal speed of a transient bootstrap tool run a handful of times per
+# release. The `file` architecture assertion still guards a wrong-arch/failed compile; the
+# release-cross-smoke job (native.yml) additionally RUNS the x86_64 artifact so a future
+# miscompile can never again pass a compile-only gate.
 # This is the SINGLE source of truth shared by two callers:
 #   • release.yml (mode=package) — builds + packages each target for publication;
 #   • native.yml  (mode=smoke)   — PR-CI: builds + arch-checks only, so a broken zig version or
@@ -30,6 +43,15 @@ MODE="${4:-package}"
 
 mkdir -p "$OUT"
 
+# The embedded `teko --version` reads -DTEKO_VERSION_STRING at build time (teko_rt.c stringizes
+# it), exactly as teko's own run_cc does (src/build/project.tks). This hand-rolled zig path must
+# pass the SAME define, or `--version` reports the 0.0.0.0-dev fallback instead of the release
+# version. derive_version.sh yields the git TAG `v<version>[-<suffix>]`; the binary's --version is
+# the tag MINUS the leading `v` (the RAW manifest `version[-suffix]` teko.tkp holds), so strip it.
+# The value is a BARE token — embedded quotes broke Windows arg re-parsing (project.tks).
+TEKO_VERSION_TAG="$(sh scripts/derive_version.sh 2>/dev/null || echo v0.0.0.0-dev)"
+TEKO_VERSION_STRING="${TEKO_VERSION_TAG#v}"
+
 # build_one LABEL TRIPLE STATIC EMIT_BUNDLE ARCH_KEYWORD
 #   STATIC=1 → -static (musl); EMIT_BUNDLE=1 → package_release.sh also emits the portable src
 #   bundle (once, on x86_64-glibc). ARCH_KEYWORD is grepped in `file` output to assert the target.
@@ -40,7 +62,8 @@ build_one() {
     rm -rf "$gd"; mkdir -p "$gd"
     extra=""
     [ "$static" = "1" ] && extra="-static"
-    zig cc -target "$triple" -std=c2x -w -O2 $extra \
+    zig cc -target "$triple" -std=c2x -w -O0 -fno-sanitize=undefined \
+        "-DTEKO_VERSION_STRING=$TEKO_VERSION_STRING" $extra \
         -I"$SRC/runtime" -I"$SRC/assert" \
         "$TEKO_C" "$SRC/runtime/teko_rt.c" "$SRC/assert/assert.c" -lm \
         -o "$gd/teko"

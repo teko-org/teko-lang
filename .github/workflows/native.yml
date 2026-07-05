@@ -207,13 +207,15 @@ jobs:
   # zig-version/target break (e.g. 0.13.0's incomplete riscv64 glibc, missing stubs-lp64d.h)
   # only surfaced AFTER merge, on a real tag. This job runs the SAME
   # scripts/cross_compile_linux.sh in SMOKE mode on every PR: emit teko.c, cross-compile all six
-  # Linux targets, assert each architecture. Cross-compilation is deterministic, so a clean
-  # compile of the (fixpoint) teko.c is the correctness argument — no qemu, no publish. A break
-  # here gates the merge, so a broken release can never reach main.
+  # Linux targets, assert each architecture, THEN run the x86_64-glibc artifact (native to this
+  # runner, no qemu) over the corpus. A clean cross-compile is not a clean cross-run — `zig cc`
+  # at an optimizing level once turned latent UB in teko.c into a checker miscompile that a
+  # compile-only smoke could never see (fix/readdir-order-determinism). A break here gates the
+  # merge, so a broken release can never reach main.
   release-cross-smoke:
     needs: changes
     if: needs.changes.outputs.run == 'true'
-    name: release cross-compile smoke (zig, no-run)
+    name: release cross-compile smoke (zig)
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -239,6 +241,15 @@ jobs:
 
       - name: Cross-compile all six Linux targets (compile-only, no qemu)
         run: sh scripts/cross_compile_linux.sh out/teko.c src /tmp/smoke smoke
+
+      # A clean cross-COMPILE is not a clean cross-RUN: `zig cc` at an optimizing level once
+      # miscompiled latent UB in the emitted teko.c into a checker that rejected the compiler's
+      # own valid source (fix/readdir-order-determinism). The x86_64-glibc artifact is native to
+      # this x86_64 runner, so RUN it — no qemu — over the corpus. A miscompiled binary rejects
+      # the corpus (non-zero exit) and gates the merge; this is the regression that would have
+      # caught the O2 miscompile before it ever reached a release.
+      - name: Run the x86_64-glibc cross artifact over the corpus (miscompile guard)
+        run: ./gd-linux-x86_64-glibc/teko . -o /tmp/xrun --no-verify
 
   # ── gate: aggregates all build-test + riscv + differential + cross-smoke results ──
   gate:
