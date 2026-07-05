@@ -548,22 +548,58 @@ fn probe_rt_dir(base: str) -> bool {
     false
 }
 
-// If TK_RT_DIR is unset, locate the in-tree runtime relative to the COMPILER BINARY's OWN
-// location (argv[0], via teko::env::args()) — NOT the current working directory (#64: a build
-// run from inside a project directory, or from an unrelated cwd via an absolute project path,
-// must still find teko_rt.c; CWD-relative probing only worked by coincidence when invoked from
-// the compiler's own source tree root). argv[0] is resolved to an absolute path against the
-// PRE-chdir cwd when it isn't already absolute (e.g. `./bin/teko` or a PATH-relative launch from
-// a shell that passes the resolved script path). Probe candidates from the binary's directory:
-// `<bindir>/..` (repo layout — `bin/teko` / `build/teko` sit one level under the tree root that
-// holds `src/runtime`) then `<bindir>` itself (a flat bundled-install layout). Pin TK_RT_DIR to
-// the ABSOLUTE match so run_cc still finds teko_rt.c after the front-end chdir's into the target
-// project. Falls back to the legacy CWD-relative probe (pre-#64 behavior) so a build invoked with
-// a bare `teko` resolved via $PATH (argv[0] not filesystem-resolvable) still works when cwd
-// happens to be the compiler's own tree. A general install pre-sets TK_RT_DIR; runtime BUNDLING
-// is Phase 7.
+/** home_dir — the current user's home directory: `$HOME` (POSIX) or `%USERPROFILE%` (Windows), whichever resolves first. "" when neither is set. */
+fn home_dir() -> str {
+    match teko::env::var("HOME") {
+        str as h => h
+        error    => match teko::env::var("USERPROFILE") { str as h => h; error => "" }
+    }
+}
+
+/** share_rt_bases — the (issue #157) installed-layout probe bases, in order: the per-user share dir (`<home>/.local/share/teko`, mirroring install.sh's `~/.local/bin` prefix) then the system-wide share dir (`/usr/local/share/teko`, mirroring `/usr/local/bin`). install.sh populates `<base>/runtime` + `<base>/assert` + `<base>/win32_compat.h` from the release's teko-bootstrap-src.tar.gz — the same sibling layout probe_rt_dir already expects from an in-tree checkout. */
+fn share_rt_bases() -> []str {
+    mut bases: []str = teko::list::empty()
+    let home = home_dir()
+    if home.len > 0 { bases = teko::list::push(bases, teko::str::concat(home, "/.local/share/teko")) }
+    bases = teko::list::push(bases, "/usr/local/share/teko")
+    bases
+}
+
+/** probe_share_rt_dir — true (and TK_RT_DIR set) when any (issue #157) installed-layout share dir carries a `runtime/teko_rt.h`. */
+fn probe_share_rt_dir() -> bool {
+    let bases = share_rt_bases()
+    mut i = 0
+    loop {
+        if i >= bases.len { break }
+        if probe_rt_dir(bases[i]) { return true }
+        i++
+    }
+    false
+}
+
+/**
+ * If TK_RT_DIR is unset, locate the in-tree runtime relative to the COMPILER BINARY's OWN
+ * location (argv[0], via teko::env::args()) — NOT the current working directory (#64: a build
+ * run from inside a project directory, or from an unrelated cwd via an absolute project path,
+ * must still find teko_rt.c; CWD-relative probing only worked by coincidence when invoked from
+ * the compiler's own source tree root). argv[0] is resolved to an absolute path against the
+ * PRE-chdir cwd when it isn't already absolute (e.g. `./bin/teko` or a PATH-relative launch from
+ * a shell that passes the resolved script path). Probe order:
+ *   1. `<bindir>/..` — the repo/tree root (`bin/teko` / `build/teko` sit one level under the
+ *      tree root that holds `src/runtime`).
+ *   2. `<bindir>` itself — a flat bundled-install layout.
+ *   3. the CWD (pre-#64 legacy behavior) — a bare `teko` resolved via $PATH (argv[0] not
+ *      filesystem-resolvable) still works when cwd happens to be the compiler's own tree.
+ *   4. (issue #157) the installed-layout share dirs (`probe_share_rt_dir`) — a released binary
+ *      copied to a bare `bin/` prefix by install.sh has no `src/runtime` sibling at all, so
+ *      none of the probes above can ever find it; install.sh instead stages the runtime
+ *      sources under `share/teko` beside the chosen bin prefix, and this is the last resort
+ *      that finds them.
+ * Each probe pins TK_RT_DIR to an ABSOLUTE match so run_cc still finds teko_rt.c after the
+ * front-end chdir's into the target project.
+ */
 fn ensure_rt_dir_abs() {
-    match teko::env::var("TK_RT_DIR") { str => return; error => {} }   // already set — honor it
+    match teko::env::var("TK_RT_DIR") { str => return; error => {} }
     let cwd = match teko::env::cwd() { str as c => c; error => "" }
 
     let argv = teko::env::args()
@@ -571,12 +607,13 @@ fn ensure_rt_dir_abs() {
         let exe_abs = abs_path_of(argv[0], cwd)
         if exe_abs.len > 0 {
             let bindir = dirname_of(exe_abs)
-            if probe_rt_dir(dirname_of(bindir)) { return }   // <bindir>/.. — the repo/tree root
-            if probe_rt_dir(bindir)             { return }   // <bindir>    — a flat bundled install
+            if probe_rt_dir(dirname_of(bindir)) { return }
+            if probe_rt_dir(bindir) { return }
         }
     }
 
-    if cwd.len > 0 { let _ = probe_rt_dir(cwd) }              // legacy fallback — cwd-relative probe
+    if cwd.len > 0 && probe_rt_dir(cwd) { return }
+    let _ = probe_share_rt_dir()
 }
 
 fn compile_project(dir: str, out_dir: str) -> i32 { compile_project_g(dir, out_dir, false, false) }
