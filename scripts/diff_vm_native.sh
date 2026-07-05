@@ -57,8 +57,10 @@ EXPECTED_FAIL=(
 # cc and EXECUTED, asserting only that the binary neither fails to build nor crashes
 # (exit < 126 rules out panic/abort/signal deaths); no VM comparison is possible.
 # time_types — calls the extern host-clock FFI (teko::time).
+# extern_reachability — C7.20: two declared [extern.libs], only one called (extern FFI).
 NATIVE_ONLY=(
     time_types
+    extern_reachability
 )
 
 is_expected_fail() {
