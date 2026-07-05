@@ -129,6 +129,18 @@ pub type ConstraintExpr = variant ConstraintAtom | ConstraintAnd | ConstraintOr 
 // --- top-level items ---
 pub type Param    = struct { name: str; has_type: bool; type_ann: TypeExpr; is_params: bool; has_default: bool; default_expr: Expr }   // immutable (B.21); is_params = C#-style variadic modifier (2026-07-01), trailing-only, type_ann must be a Slice; has_default/default_expr = DEFARGS (2026-07-01) — TRAILING-ONLY (once one param defaults, every later param must too), default_expr valid iff has_default; has_type = OOP A1 (2026-07-01) — false ONLY for a struct method's 1st param (the RECEIVER, name free, type injected by the checker as the enclosing struct); every other param is always typed (type_ann valid iff has_type)
 
+/** A dependency-injection lifetime (W10c/MEM-3). `None` = the type carries no
+ *  `#singleton`/`#scoped`/`#transient` annotation; the three others are the design's three
+ *  DI lifetimes — a singleton lives in the root region, a scoped instance in its owning
+ *  region (walking up the arena tree), a transient one is freshly built per use. */
+pub type DiKind = enum { None; Singleton; Scoped; Transient }
+
+/** One `#inject(name: Type)` binding on a fn overlay (W10c/MEM-3). `has_key`/`key` carry
+ *  an optional `@Key` selector — parsed so issue #173 (keys + `#wire`) needs no AST churn,
+ *  but rejected by the core-DI checker (keys are out of core scope). `line`/`col` point at
+ *  the binding name for diagnostics. */
+pub type InjectBinding = struct { name: str; type_ann: TypeExpr; has_key: bool; key: str; line: u32; col: u32 }
+
 // Visibility — a declaration's REACH (LEGISLATION "Visibility — pub vs exp"; B.9).
 // Private (default, no keyword) = own namespace only; Pub = across the project's
 // namespaces (not in the binary header); Exp = exported in the `.tkh` (the public ABI),
@@ -157,6 +169,8 @@ pub type Function = struct {
     is_abstract: bool                                   // `abstract fn` — signature only, no body (abstract classes only)
     is_virtual:  bool                                   // `virtual fn` — overridable by a derived class
     is_override: bool                                   // `override fn` — overrides a base virtual/abstract method
+    has_inject:  bool
+    injects:     []InjectBinding
 }
 // (OOP A1, 2026-07-01) methods = interleaved `fn` decls in the struct body (unified method
 // model): each Function's 1st param has_type=false ⇒ an INSTANCE method (the receiver, name
@@ -229,6 +243,9 @@ pub type TypeDecl    = struct {                             // nominal (B.13)
     doc:     str                                        // the doc span (valid iff has_doc)
     line:    u32                                        // the name's 1-based source line (W-loc-2 diagnostics)
     col:     u32                                        // the name's 1-based source column (W-loc-2 diagnostics)
+    di_kind: DiKind
+    has_di_key: bool
+    di_key:  str
 }
 pub type UseDecl     = struct { path: Path; has_alias: bool; alias: str }   // use a::b [as c]
 

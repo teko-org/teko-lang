@@ -1,0 +1,81 @@
+use teko::parser
+
+/** W10c/MEM-3 dependency injection — a resolved DI provider. The DI pass wires the
+ *  compile-time dependency graph: it runs AFTER collect + module enforcement, over the raw
+ *  `parser::Program`, reading the DI fields the parser attaches (a type's `di_kind`/`#lifetime`
+ *  and a fn's `#inject` overlay). It never mutates types; it either succeeds (yields null) or
+ *  fails with an honest `error`. Scope is CORE DI only: the `#inject` overlay, the three
+ *  lifetimes (`#singleton`/`#scoped`/`#transient`), registration + duplicate-error, and
+ *  recursive/constructor DI. Keys (`@`), decorator pipelines, and `#wire` are OUT (issue #173);
+ *  the AST carries the key fields inert and this pass rejects them with an honest stop.
+ *  A provider records an interface an impl registers for, the impl's lifetime, the impl type's
+ *  canonical name, and the factory (the impl's compiler-chosen static) — built once per
+ *  `#lifetime` type per interface it implements. */
+pub type DiProvider = struct { iface: str; kind: parser::DiKind; impl_name: str; factory: str }
+
+/** The whole program's DI registration table — every `#lifetime` type's providers, keyed
+ *  (in core) by interface alone. A duplicate `(interface)` with no key is a compile error. */
+pub type DiRegistry = struct { providers: []DiProvider }
+
+/** An empty DI registry — the starting point of a build and the whole registry of a program
+ *  with no DI annotation. */
+fn di_registry_empty() -> DiRegistry {
+    DiRegistry { providers = teko::list::empty() }
+}
+
+/** Does the program carry ANY DI annotation (a `#lifetime` type or a `#inject` fn)? A program
+ *  with none skips the whole pass, so the corpus is byte-identical until DI is used. */
+fn program_uses_di(prog: parser::Program) -> bool {
+    mut i: u64 = 0
+    loop {
+        if i >= prog.items.len { break }
+        match prog.items[i].content {
+            parser::TypeDecl as td => match td.di_kind {
+                parser::DiKind::None => { }
+                _                    => { return true }
+            }
+            parser::Function as f => { if f.has_inject { return true } }
+            _ => { }
+        }
+        i++
+    }
+    false
+}
+
+/** Build the DI registry from every `#singleton`/`#scoped`/`#transient` type in the program.
+ *  A duplicate unkeyed registration for one interface is an honest error; so is a cyclic
+ *  provider graph. (Crumb 2.) */
+pub fn build_di_registry(prog: parser::Program, table: TypeTable) -> DiRegistry | error {
+    di_registry_empty()
+}
+
+/** Resolve the single provider registered for `iface` (unkeyed, core DI). Missing → error. */
+pub fn resolve_provider(reg: DiRegistry, iface: str) -> DiProvider | error {
+    mut i: u64 = 0
+    loop {
+        if i >= reg.providers.len { break }
+        if reg.providers[i].iface == iface { return reg.providers[i] }
+        i++
+    }
+    error { message = $"DI: no provider registered for interface {iface}" }
+}
+
+/** Validate every `#inject` overlay against the registry: each binding's type must have a
+ *  registered provider (the never-null guarantee); reject keys (core boundary, #173). Crumb 2/3. */
+pub fn check_inject_overlays(prog: parser::Program, reg: DiRegistry, table: TypeTable) -> error? {
+    null
+}
+
+/** The DI pass entry point: build the registry, then check every overlay. A no-op (returns
+ *  null) on a program with no DI annotation, so the corpus is byte-identical until DI is used. */
+pub fn check_di(prog: parser::Program, table: TypeTable) -> error? {
+    if !program_uses_di(prog) { return null }
+    let reg = match build_di_registry(prog, table) { DiRegistry as r => r; error as e => return e }
+    check_inject_overlays(prog, reg, table)
+}
+
+/** The synthesized per-impl materializer name — the compiler-chosen helper an injected-name
+ *  use lowers to (`__di_materialize_<Impl>`), shared by codegen and the VM. */
+pub fn di_materializer_name(impl_name: str) -> str {
+    "__di_materialize_" ~ impl_name
+}

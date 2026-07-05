@@ -5998,18 +5998,18 @@ fn cg_collect_block_opts(set: CgTypeSet, stmts: []checker::TStatement) -> CgType
     }
     s
 }
-// (bugfix) Convert a SYNTACTIC type-expr to a resolved Type ONLY as far as the typedef collector
-// needs it (cg_collect_type_opts walks Optional/Slice/Variant; everything else is a no-op leaf). A
-// struct/variant FIELD's optional/slice/variant whose type surfaces NOWHERE in any expression (only
-// in the declaration) would otherwise never feed the collector, so its tk_opt_/tk_slice_/tk_u_
-// typedef is never emitted → `cc` fails with "unknown type name". This lets cg_emit_types_ordered's
-// second pass register those.
-//   Invariant: cg_opt_mangle(cg_te_to_type(te)) == cg_opt_mangle_texpr(te) for NAMED/OPTIONAL/SLICE
-//   — the typedef NAME (mangle of the resolved type) must agree byte-for-byte with the syntactic
-//   mangle used when the field is emitted. The prim mapping mirrors emit_type_expr exactly, so a
-//   primitive `i64?` inner yields `int64_t value;` (NOT `tk_t_i64 value;`).
-// (C: `cg_te_to_type`.)
-fn cg_te_to_type(te: parser::TypeExpr) -> checker::Type {
+/** Convert a SYNTACTIC type-expr to a resolved Type only as far as the typedef collector needs
+ *  (cg_collect_type_opts walks Optional/Slice/Variant; every other node is a no-op leaf). A
+ *  struct/variant FIELD's optional/slice/variant whose type surfaces nowhere in any expression
+ *  (only in the declaration) would otherwise never feed the collector, so its tk_opt_/tk_slice_/
+ *  tk_u_ typedef is never emitted and `cc` fails with "unknown type name". `ref_ns` is the
+ *  ENCLOSING decl's namespace: a bare same-namespace field ref (`[]DiProvider` inside
+ *  teko::checker::DiRegistry) resolves to its canonical name (teko::checker::DiProvider) via
+ *  cg_find_decl_ns, so the collected element's `tk_t_<name>` body matches the qualified named-decl
+ *  typedef — a field-ONLY element (never surfaced by an expression) is otherwise stored bare and
+ *  dangles (the #109 bare-name gap). The typedef NAME mangle (name_last_segment, always bare) is
+ *  unaffected; only the element BODY is qualified. The prim mapping mirrors emit_type_expr exactly. */
+fn cg_te_to_type_ns(prog: checker::TProgram, ref_ns: str, te: parser::TypeExpr) -> checker::Type {
     match te {
         parser::NamedType as nt => {
             let last = nt.path.segments[nt.path.segments.len - 1].name
@@ -6031,24 +6031,77 @@ fn cg_te_to_type(te: parser::TypeExpr) -> checker::Type {
             else if last == "str"   { checker::Str { } }
             else if last == "error" { checker::Error { } }
             else if last == "void"  { checker::Void { } }
-            // otherwise a user-defined named aggregate (generic args ignored for collection).
-            else { checker::Named { name = last } }
+            else { checker::Named { name = cg_te_canonical_name(prog, ref_ns, nt.path, last) } }
         }
-        parser::SliceType as st => checker::Slice { element = cg_te_to_type(st.element) }
-        parser::OptionalType as ot => checker::Optional { inner = cg_te_to_type(ot.inner) }
+        parser::SliceType as st => checker::Slice { element = cg_te_to_type_ns(prog, ref_ns, st.element) }
+        parser::OptionalType as ot => checker::Optional { inner = cg_te_to_type_ns(prog, ref_ns, ot.inner) }
         parser::UnionType as ut => {
             mut mem: []checker::Type = teko::list::empty()
             mut i = 0
             loop {
                 if i >= ut.members.len { break }
-                mem = teko::list::push(mem, cg_te_to_type(ut.members[i]))
+                mem = teko::list::push(mem, cg_te_to_type_ns(prog, ref_ns, ut.members[i]))
                 i++
             }
             checker::Variant { members = mem }
         }
-        // func-optionals aren't supported; a Func whose mangle fails so cg_opt_set_add/cg_slice_add
-        // skip it (correct — same honest-stop as elsewhere).
         parser::FunctionType => checker::Func { params = teko::list::empty(); ret = checker::Void { } ; variadic = false ; param_names = []; n_required = 0; defaults = [] }
+    }
+}
+
+/** The canonical qualified name of a user named-type reference at a field/member position: resolve
+ *  the syntactic path in `ref_ns` to its decl (cg_find_decl_ns) and take the decl's canonical name;
+ *  fall back to the bare last segment when no decl matches (a type-param `T`, a generic `__g__`
+ *  instance — those stay bare exactly as emit_type expects). */
+fn cg_te_canonical_name(prog: checker::TProgram, ref_ns: str, path: parser::Path, last: str) -> str {
+    match cg_find_decl_ns(prog, path, ref_ns) {
+        parser::TypeDecl as d => d.name
+        error                 => last
+    }
+}
+
+/** Register the generated typedefs (tk_opt_/tk_slice_/tk_u_) a decl's FIELD/MEMBER type
+ *  annotations need, resolving names in the decl's own namespace. A named variant decl gets
+ *  its own tk_t_<Name> typedef via the named-decl path, so a UnionType body recurses per-member
+ *  rather than registering the whole union as an unused inline tk_u_<keys> (which would break
+ *  byte-identity). Enum/flags/extern bodies carry no generated typedef. */
+fn cg_register_decl_field_types(set: CgTypeSet, prog: checker::TProgram, d: parser::TypeDecl) -> CgTypeSet {
+    let ref_ns = checker::name_qualifier(d.name)
+    match d.body {
+        parser::StructBody as sb => cg_register_field_list(set, prog, ref_ns, sb.fields)
+        parser::VariantBody as vb => cg_register_variant_body(set, prog, ref_ns, vb.type_expr)
+        parser::AliasBody as alb => cg_collect_type_opts(set, cg_te_to_type_ns(prog, ref_ns, alb.alias))
+        _ => set
+    }
+}
+
+/** Register every field's optional/slice/variant type in a struct body's field list. */
+fn cg_register_field_list(set: CgTypeSet, prog: checker::TProgram, ref_ns: str, fields: []parser::Field) -> CgTypeSet {
+    mut s = set
+    mut fi = 0
+    loop {
+        if fi >= fields.len { break }
+        s = cg_collect_type_opts(s, cg_te_to_type_ns(prog, ref_ns, fields[fi].type_ann))
+        fi++
+    }
+    s
+}
+
+/** Register a variant decl body's member typedefs: a UnionType recurses per-member (each named
+ *  member owns its tk_t_<Name>); any other body registers its single type-expr directly. */
+fn cg_register_variant_body(set: CgTypeSet, prog: checker::TProgram, ref_ns: str, te: parser::TypeExpr) -> CgTypeSet {
+    match te {
+        parser::UnionType as ut => {
+            mut s = set
+            mut mi = 0
+            loop {
+                if mi >= ut.members.len { break }
+                s = cg_collect_type_opts(s, cg_te_to_type_ns(prog, ref_ns, ut.members[mi]))
+                mi++
+            }
+            s
+        }
+        _ => cg_collect_type_opts(set, cg_te_to_type_ns(prog, ref_ns, te))
     }
 }
 
@@ -6355,33 +6408,7 @@ fn cg_emit_types_ordered(buf: []byte, prog: checker::TProgram) -> []byte | error
     loop {
         if td >= prog.items.len { break }
         match prog.items[td] {
-            parser::TypeDecl as d => match d.body {
-                parser::StructBody as sb => {
-                    mut fi2 = 0
-                    loop {
-                        if fi2 >= sb.fields.len { break }
-                        set = cg_collect_type_opts(set, cg_te_to_type(sb.fields[fi2].type_ann))
-                        fi2++
-                    }
-                }
-                parser::VariantBody as vb => match vb.type_expr {
-                    // A NAMED variant decl gets its own `tk_t_<Name>` typedef via the named-decl
-                    // path — do NOT register the whole union as an inline `tk_u_<keys>` (that would
-                    // emit an UNUSED typedef and break corpus byte-identity). Only its MEMBERS'
-                    // generated typedefs need registering, so recurse per-member.
-                    parser::UnionType as ut => {
-                        mut mi = 0
-                        loop {
-                            if mi >= ut.members.len { break }
-                            set = cg_collect_type_opts(set, cg_te_to_type(ut.members[mi]))
-                            mi++
-                        }
-                    }
-                    _ => { set = cg_collect_type_opts(set, cg_te_to_type(vb.type_expr)) }
-                }
-                parser::AliasBody as alb => { set = cg_collect_type_opts(set, cg_te_to_type(alb.alias)) }
-                _ => { }   // enum / flags / extern — no generated typedef to register
-            }
+            parser::TypeDecl as d => { set = cg_register_decl_field_types(set, prog, d) }
             _ => { }
         }
         td++
