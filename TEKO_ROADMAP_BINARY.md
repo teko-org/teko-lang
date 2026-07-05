@@ -1,5 +1,10 @@
 # TEKO_ROADMAP_BINARY — caminho até o PRIMEIRO binário executável
 
+> **⚠️ HISTÓRICO (2026-07-04):** este roadmap descreve o período **pré-self-hosting**
+> (Fases -1 até F3). Está COMPLETO — todas as fases finalizadas e as áreas foram promovidas ao
+> `TEKO_MASTER_PLAN.md` (Phase 6, Phase 7). Mantido como referência da evolução histórica. O
+> trabalho ativo vive em `TEKO_MASTER_PLAN.md` fases 1–11 e em GitHub issues #157–#234.
+
 > Sucede o roadmap E7 (front-end + checker + emissores `.tkb`/`.tkh`, concluídos).
 > **Alvo:** o bootstrap `teko` (o espelho **C** compilado pelo `cc` do host) compila um
 > `main.tks` mínimo e produz um **binário nativo que roda**.
@@ -148,3 +153,15 @@ geral newtype↔base · `str↔bytes` transcodificação.
 **F0 (compila) → F1 (pipeline) → F2 (emite C + cc) → F3 (runtime) = M0.**
 F3 pode correr em paralelo parcial com F2 (o runtime que o C gerado chama). F1b (`.tkp`) pode
 adiar para depois do M0 se o primeiro alvo for um `main.tks` passado direto na linha de comando.
+
+---
+
+## Referência cruzada (2026-07-04)
+
+As fases deste roadmap foram promocionadas para o `TEKO_MASTER_PLAN.md`:
+- **Fases -1 a 3** (baseline, pipeline, backend transpile) → **Phase 6** (selfhost) ✅
+- **Fase 3 (runtime)** → **Phase 7** (host independence) ✅
+
+Para demandas remanescentes relacionadas aos tópicos deste roadmap, consultar o backlog:
+**GitHub issues #157–#234** (labels `fase-1-linguagem` … `fase-6-qualidade`). O trabalho
+segue naqueles issues, em ordem de dependência topológica.

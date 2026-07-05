@@ -52,13 +52,17 @@ collections, DI lifetimes, and data-race freedom. Build it once; everything safe
 
 ## 1. The integrated feature set (what the full language gains)
 
+> **⚠️ Concurrency row note (2026-07-04):** the Concurrency row shows the OLD design (scope/spawn/channel,
+> async rejected). This was **SUPERSEDED 2026-06-30** by the ratified design: Intent<T> + async/await.
+> See issue #164 for the new design. The rest of this table (Collections, Generics, Memory, ref) remains current.
+
 | Area | Seed (today) | Evolution adds | Mechanism | New surface |
 |---|---|---|---|---|
 | **Collections** | fixed `[]T` + COPY-append (`xs+[x]`, `teko::list::push`); read-side (`[]T as x`, `.len`, indexing) | real dynamic `[]T` (amortized append), `Map<K,V>`, `Set<T>` | special-cased now → monomorphized + arena-backed later | none now; `Map`/`Set` types later |
 | **Generics** | none (per-call special-casing: `print`, `list`, `parse`, `assert`) | `fn f<T>`, `type Box<T>`, `Map<K,V>` | **monomorphization** (compile-time stamping); never dictionaries | `<T>` type-param lists (lexer/parser addition) |
 | **Memory/arenas** | malloc-everywhere, leak-tolerant (M.5-correct for batch) | root/scope/local arenas; deterministic bulk free; `#singleton`/`#scoped`/`#transient` wired to arenas | bump-allocator tree + **escape check (depth compare)** | `#`-directives exist; explicit-scope + out-region reserved |
 | **ref/pointers** | none (value-only; bare `self` + `mut`-local close the door by construction); `ptr`/`uptr` opaque FFI-only | `ref T` — **mutable target only (R2)**; read-only sharing = copy | arena-scoped reference; soundness = the escape check, **no lifetime variables, no shared/unique split** | `ref`, three positions (reserved) |
-| **Concurrency** | none (single-threaded, thread-ready: no global mutable state, no magic closures) | `scope{}`, `spawn`, `channel<T>`, `send`, `recv` | CSP channels + structured concurrency; move-on-send; 1:1 OS threads | five primitives (reserved) |
+| **Concurrency** ⚠️ **SUPERSEDED** | none (single-threaded, thread-ready: no global mutable state, no magic closures) | `scope{}`, `spawn`, `channel<T>`, `send`, `recv` **(OLD)** | CSP channels + structured concurrency; move-on-send; 1:1 OS threads | five primitives (reserved) |
 
 The full language is therefore: *a metal, no-GC, copy-by-default systems language whose escapes from copy
 (`ref`), whose storage discipline (arenas), whose abstraction (monomorphized generics), whose containers
@@ -89,10 +93,11 @@ with copy-default + arena spans + structured scopes.
    │ (mono)   │   Map forces       │ Map<K,V> / Set<T>       │
    └────┬─────┘   constraints      └───────────────────────┘
         │ K: Hashable+Eq                       
-        │                          ┌───────────────────────────────────────────┐
-        └─ retrofit (optional) ──► │ CONCURRENCY  scope{} / spawn / channel<T>  │  capstone
-                                   │  move-on-send + escape-check("task scope")  │  needs: arenas + ref
-                                   └───────────────────────────────────────────┘
+        │                          ┌───────────────────────────────────────────────────────────┐
+        └─ retrofit (optional) ──► │ ⚠️ CONCURRENCY  scope{} / spawn / channel<T>  (SUPERSEDED) │  capstone
+                                   │  move-on-send + escape-check("task scope")  (OLD DESIGN)   │  needs: arenas + ref
+                                   │  NEW (2026-06-30): Intent<T> + async/await → issue #164  │
+                                   └───────────────────────────────────────────────────────────┘
 ```
 
 **The dependency edges, each doctrine-stated (not invented):**
@@ -281,6 +286,11 @@ EVOLUTION (staged, dependency-ordered):
         out-region parameter for no-copy build. deps: S4 (+ S6 for Map) + S2/S3 (arena + ref mut) .
 
   S8  CONCURRENCY  (capstone — LAST)
+        ⚠️ **SUPERSEDED (2026-06-30) → issue #164** — ratified design: Intent<T> + async/await.
+        See issue #164 for the new design (Intent<T> union, async/await keywords, threading/channels/sync/Context).
+        This section describes the OLD model (scope/spawn/channel, async rejected) kept for historical reference.
+        ────────────────────────────────────────────────────────────────────────────────
+        [HISTORIC MODEL]
         scope{} / spawn / channel<T> / send / recv -> T|error.  1:1 OS threads (M:N later, swappable).
         data-race freedom = move-on-send + escape check with "task scope" axis (reuses S2/S3).
         independent of generics (channel<T> special-cased now, retrofit later — never forces generics).
