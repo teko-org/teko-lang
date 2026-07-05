@@ -213,7 +213,7 @@ compile+link gate which is now the milestone reached.
 **Work:** SAST gate + capability/sandboxing audit of the `exp` / `extern` / syscall surface.
 **Exit:** the security gate runs in CI; the FFI/syscall surface is audited.
 
-### Phase 10 — EVOLUTION campaign S1–S9  *(EVOLUTION_DESIGN/JUSTIFICATION; POST-SELF-HOST; R1/R2 ratified)*  🔶 IN FLIGHT (S1/S3/S4 ✅, S2 per-fn ✅ + memory campaign #148 ✅; block-arm ⬜, rest ⬜)
+### Phase 10 — EVOLUTION campaign S1–S9  *(EVOLUTION_DESIGN/JUSTIFICATION; POST-SELF-HOST; R1/R2 ratified)*  🔶 IN FLIGHT (S1/S3/S4 ✅, S2 per-fn ✅ + memory campaign #148 ✅; S2 block-arm ⬜, S5–S10 ⬜)
 **Goal:** build the foundation keystone-first, in dependency order, against real self-hosted data (M.4).
 **Hard ordering invariant:** arenas (S1–S2) before ref (S3) and before DI / collections storage; generics (S4) before real collections (S7); Map (S7) forces constraints (S6); single-task arenas+ref (S1–S3) before concurrency (S8); concurrency is independent of generics.
 **Stages:**
