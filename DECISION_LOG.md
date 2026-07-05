@@ -136,3 +136,28 @@ diferentes). O #277 já estava mergeado → correção via novo PR (nunca direto
 - **Base:** diretriz do dono ("se tem cross-compile, não precisa qemu; verifica por paridade de
   byte") — o C é o mesmo fixpoint; a tradução C→binário por target é determinística.
 - **Reversível:** sim (readicionar execução sob qemu se algum dia quisermos runtime-check real).
+
+---
+
+## 2026-07-05 — Fix do miscompile zig + drenagem do backlog validado (#281, #257/#251/#264/#260)
+
+### D12 · Release Linux via zig = `-O0 -fno-sanitize=undefined -DTEKO_VERSION_STRING` ✅
+- **Aplicada:** o `cross_compile_linux.sh` casa as flags do build normal do teko (`run_cc`): sem `-O`, define de versão. Bisecção (agente + VPS x86_64 real) provou que o `-O2` do zig explora uma UB no teko.c gerado → miscompila o checker; o compilador está INOCENTE.
+- **Alternativas:** manter `-O2` (miscompile); voltar Linux a build nativo por-arch (perde a unificação zig p/ musl/riscv — descartada por ora).
+- **Reversibilidade / follow-up:** re-habilitar `-O1/-O2` exige achar+corrigir a UB → issue **#283**. Por ora `-O0` (como todo release nativo sempre foi).
+
+### D13 · Seed AUTO-CURÁVEL (version-check) ✅
+- **Aplicada:** `ci_provision` caminha os releases newest-first e rejeita seed cujo binário reporta versão ≠ tag (o 0.0.1.24 zig reportava `0.0.0.0-dev`) → cai pro próximo bom. Contorna o **release imutável** (não deu pra despublicar o 0.0.1.24 ruim). Validado em x86_64 real.
+- **Base:** lei main-integrity (nunca seedar de algo corrompido) + robustez contra recorrência.
+
+### D14 · Smoke de release RODA o artefato (não só compila) ✅
+- **Aplicada:** o `release-cross-smoke` executa o binário x86_64-glibc sobre o corpus (nativo ao runner, sem qemu). Um smoke compile-only nunca veria um miscompile. É a regressão que teria pego o bug.
+
+### D15 · Merge-skew da DI: defaultar campos DI nos literais ao re-sincronizar ✅
+- **Aplicada:** ao re-sync features onto a main pós-DI, os literais `TypeDecl`/`Function` (que a DI ganhou campos `di_kind`/`has_inject`/…) recebem defaults (`DiKind::None`/`false`/empty). Padrão: sed guardado por `/di_kind/!` só nos que faltam + fechar chaves em concatenações de teste. Semanticamente inerte (codec/testes não usam DI).
+
+### D16 · Gate `teko fmt --check` STAGED (desabilitado até o seed ter o CLI) ✅
+- **Aplicada:** o #260 comenta o gate no native.yml — o seed (release anterior) não tinha o CLI `fmt --check`. Liga no PR após o release que o carrega (0.0.1.29) → issue **#282**. Mesmo bootstrap-handling da auto-cura do seed. O `fmt_cli_test.sh` já testa o feature no gen1.
+
+### D17 · `.gitattributes eol=lf` (cross-plataforma) ✅
+- **Aplicada:** o Windows fazia checkout dos `.tks` como CRLF → o `fmt` (LF canônico) via o corpus não-idempotente → panic. `* text=auto eol=lf` fixa LF no checkout em toda plataforma. Blobs já eram LF no git; só faltava forçar no working-tree. (CI multi-plataforma pegou o que a validação macOS/Linux não via.)
