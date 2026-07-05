@@ -1,0 +1,677 @@
+use teko::checker
+use teko::lexer
+use teko::parser
+
+/** teko::lir (lowering) — TAST -> LIR for the N1 reference subset (issue #221).
+
+    The lowering mirrors the SHAPE of the C backend's expr/stmt walk (emit_expr_ctx /
+    emit_stmt): the same recursion, a different result — instead of appending text to a
+    buffer, each visit APPENDS LInsts to the current block and RETURNS the VReg that
+    carries the value. Everything is functionally threaded (a fresh LFunc per step, no
+    mutable module state), exactly like the rest of the compiler.
+
+    Reference subset (N1): integer/float literals, arithmetic/unary, locals, `to`
+    casts, direct calls (Teko-Teko + the `exit`/`panic` builtins), `let`, `return`,
+    and expression statements. Everything else honest-stops with a NAMED error (M.1/
+    M.3) — the scaffolding N2 fills in case-by-case without rewriting the walk.
+
+    LEnv — the local map name -> VReg. The checker already resolved scope; the lowering
+    only remembers "the var `x` lives in VReg N". Parallel slices threaded functionally,
+    the same shape as the checker's Env. */
+pub type LEnv = struct { names: []str; vregs: []u32 }
+
+/** empty_lenv — an LEnv with no bindings (a function body's seed). */
+pub fn empty_lenv() -> LEnv {
+    LEnv { names = teko::list::empty(); vregs = teko::list::empty() }
+}
+
+/** lenv_bind — extend `env` with (name -> vreg). A later binding of the same name
+    shadows the earlier one (lookup scans newest-first). */
+pub fn lenv_bind(env: LEnv, name: str, vreg: u32) -> LEnv {
+    LEnv { names = teko::list::push(env.names, name); vregs = teko::list::push(env.vregs, vreg) }
+}
+
+/** LLookup — the result of an LEnv lookup: whether the name was bound + its VReg. */
+pub type LLookup = struct { found: bool; vreg: u32 }
+
+/** lenv_lookup — the VReg a local name binds to, scanning newest-first so a shadow wins. */
+pub fn lenv_lookup(env: LEnv, name: str) -> LLookup {
+    mut i = env.names.len
+    loop {
+        if i == 0 { break }
+        i = i - 1
+        if env.names[i] == name { return LLookup { found = true; vreg = env.vregs[i] } }
+    }
+    LLookup { found = false; vreg = 0 }
+}
+
+/** ltype_of — the machine class of a RESOLVED checker::Type: an integer/float by width,
+    or Ptr for every address-shaped type (str/slice/Ref/ptr/Named/Optional/Variant/Func —
+    all EXERCISED from N2), or Void for the return-only marker. This is where the semantic
+    type dies and the machine begins. */
+pub fn ltype_of(t: checker::Type) -> LType {
+    match t {
+        checker::Prim as p => ltype_of_prim(p.kind)
+        checker::Void      => LType::Void
+        _                  => LType::Ptr
+    }
+}
+
+/** ltype_of_prim — a PrimKind's machine class. Bool lowers to I8 (a single byte carrier,
+    like the C backend's bool). */
+fn ltype_of_prim(k: checker::PrimKind) -> LType {
+    if k == checker::PrimKind::F16 { return LType::F16 }
+    if k == checker::PrimKind::F32 { return LType::F32 }
+    if k == checker::PrimKind::F64 { return LType::F64 }
+    ltype_of_int_prim(k)
+}
+
+/** ltype_of_int_prim — the machine class of an INTEGER/bool PrimKind by width. Uses `==`
+    chains, not a `match`: this module's LType shares the F16/F32/F64 member names with
+    checker::PrimKind, and the released seed (0.0.1.9, before the #263 fix) mis-resolves a
+    qualified enum PATTERN across the two enums — but `==` resolves the qualified constant
+    correctly, so the equality form is the seed-safe spelling (issue #221 lowering-oracle
+    bug, root-caused to #263 not being in the CI seed). */
+fn ltype_of_int_prim(k: checker::PrimKind) -> LType {
+    if prim_width_of(k) == 8   { return LType::I8 }
+    if prim_width_of(k) == 16  { return LType::I16 }
+    if prim_width_of(k) == 32  { return LType::I32 }
+    if prim_width_of(k) == 128 { return LType::I128 }
+    if k == checker::PrimKind::Bool { return LType::I8 }
+    LType::I64
+}
+
+/** ltype_of_typeexpr — the machine class of a PARAMETER annotation (a syntactic
+    parser::TypeExpr, since a TFunction carries no resolved Func). A single-segment
+    primitive name maps by width; every other shape (compound path, slice, optional,
+    union, function) collapses to Ptr — the N1 subset only declares scalar params, so
+    Ptr never appears yet, but the mapping is total for the design-ahead contract. */
+pub fn ltype_of_typeexpr(te: parser::TypeExpr) -> LType {
+    match te {
+        parser::NamedType as nt => ltype_of_named_path(nt.path)
+        _                       => LType::Ptr
+    }
+}
+
+/** ltype_of_named_path — a single-segment primitive name -> its machine class; a
+    multi-segment path or a non-primitive name -> Ptr. */
+fn ltype_of_named_path(p: parser::Path) -> LType {
+    if p.segments.len != 1 { return LType::Ptr }
+    ltype_of_prim_name(p.segments[0].name)
+}
+
+/** ltype_of_prim_name — a primitive spelling -> its machine class, else Ptr. */
+fn ltype_of_prim_name(name: str) -> LType {
+    if name == "u8"   { return LType::I8 }
+    if name == "u16"  { return LType::I16 }
+    if name == "u32"  { return LType::I32 }
+    if name == "u64"  { return LType::I64 }
+    if name == "u128" { return LType::I128 }
+    if name == "i8"   { return LType::I8 }
+    if name == "i16"  { return LType::I16 }
+    if name == "i32"  { return LType::I32 }
+    if name == "i64"  { return LType::I64 }
+    if name == "i128" { return LType::I128 }
+    if name == "f16"  { return LType::F16 }
+    if name == "f32"  { return LType::F32 }
+    if name == "f64"  { return LType::F64 }
+    if name == "bool" { return LType::I8 }
+    if name == "byte" { return LType::I8 }
+    LType::Ptr
+}
+
+/** prim_is_signed_int — true for the signed integer prims (I8..I128); false for the
+    unsigned ints, floats, and bool. Chooses the S-variant opcode. */
+fn prim_is_signed_int(k: checker::PrimKind) -> bool {
+    k == checker::PrimKind::I8 || k == checker::PrimKind::I16 || k == checker::PrimKind::I32 ||
+    k == checker::PrimKind::I64 || k == checker::PrimKind::I128
+}
+
+/** prim_is_float_kind — true for the IEEE float prims (F16/F32/F64). Chooses the F-family
+    opcode. Uses `==`, not a `match`: this module's LType enum shares the F16/F32/F64 member
+    names with checker::PrimKind, and the released seed (0.0.1.9, before the #263 fix) mis-
+    resolves a qualified enum PATTERN across the two same-named enums (matching by ordinal),
+    silently classifying integers as floats. `==` resolves the qualified constant correctly,
+    so the equality spelling is the seed-safe form (issue #221 lowering oracle). */
+fn prim_is_float_kind(k: checker::PrimKind) -> bool {
+    k == checker::PrimKind::F16 || k == checker::PrimKind::F32 || k == checker::PrimKind::F64
+}
+
+/** lbinop_of — the LBinOp for an arithmetic operator token given the RESULT's PrimKind.
+    Float kinds pick the F-family; integers pick S/U by signedness. N1 emits only the
+    arithmetic subset; a non-arithmetic operator honest-stops (comparisons/bitwise/shifts
+    are declared in the enum for N2 but not lowered yet). */
+pub fn lbinop_of(op: lexer::TokenKind, k: checker::PrimKind) -> LBinOp | error {
+    if prim_is_float_kind(k) { return lbinop_float(op) }
+    lbinop_int(op, prim_is_signed_int(k))
+}
+
+/** lbinop_float — the F-family LBinOp for an arithmetic operator token. */
+fn lbinop_float(op: lexer::TokenKind) -> LBinOp | error {
+    match op {
+        lexer::TokenKind::Plus    => LBinOp::FAdd
+        lexer::TokenKind::Minus   => LBinOp::FSub
+        lexer::TokenKind::Star    => LBinOp::FMul
+        lexer::TokenKind::Slash   => LBinOp::FDiv
+        _ => error { message = "native backend N1: float operator not yet lowered (N2)" }
+    }
+}
+
+/** lbinop_int — the integer LBinOp for an arithmetic operator token, S/U chosen by
+    `signed`. */
+fn lbinop_int(op: lexer::TokenKind, signed: bool) -> LBinOp | error {
+    match op {
+        lexer::TokenKind::Plus    => LBinOp::IAdd
+        lexer::TokenKind::Minus   => LBinOp::ISub
+        lexer::TokenKind::Star    => LBinOp::IMul
+        lexer::TokenKind::Slash   => if signed { LBinOp::IDivS } else { LBinOp::IDivU }
+        lexer::TokenKind::Percent => if signed { LBinOp::IRemS } else { LBinOp::IRemU }
+        _ => error { message = "native backend N1: integer operator not yet lowered (N2)" }
+    }
+}
+
+/** lunop_of — the LUnOp for a prefix operator token given the operand's PrimKind. `-`
+    picks FNeg/INeg by kind; `!` picks INot. N1 does not lower `~`. */
+pub fn lunop_of(op: lexer::TokenKind, k: checker::PrimKind) -> LUnOp | error {
+    match op {
+        lexer::TokenKind::Minus => if prim_is_float_kind(k) { LUnOp::FNeg } else { LUnOp::INeg }
+        lexer::TokenKind::Bang  => LUnOp::INot
+        _ => error { message = "native backend N1: unary operator not yet lowered (N2)" }
+    }
+}
+
+/** cast_unop_of — the conversion LUnOp for a numeric `to` cast from `src` to `dst`
+    machine classes. int->float = IToF, float->int = FToI, float->float = FToF, and
+    int->int widens (SExt/ZExt by source signedness) or truncates (Trunc). A same-class
+    int cast maps to Trunc (a harmless identity width); a same-class float cast to FToF. */
+fn cast_unop_of(src: checker::PrimKind, dst: checker::PrimKind) -> LUnOp {
+    let src_f = prim_is_float_kind(src)
+    let dst_f = prim_is_float_kind(dst)
+    if src_f && dst_f { return LUnOp::FToF }
+    if src_f { return LUnOp::FToI }
+    if dst_f { return LUnOp::IToF }
+    cast_int_unop_of(src, dst)
+}
+
+/** cast_int_unop_of — the int->int conversion LUnOp: widen with sign/zero extend (by the
+    SOURCE's signedness) or truncate to a narrower/equal width. Bool is excluded from casts
+    by the checker (cast direction law), so a bool source here would be an invariant break
+    — treated as unsigned (ZExt widens). */
+fn cast_int_unop_of(src: checker::PrimKind, dst: checker::PrimKind) -> LUnOp {
+    let sw = prim_width_of(src)
+    let dw = prim_width_of(dst)
+    if dw > sw { return if prim_is_signed_int(src) { LUnOp::SExt } else { LUnOp::ZExt } }
+    LUnOp::Trunc
+}
+
+/** prim_width_of — the bit width of an integer/float PrimKind (bool = 1). Local copy of
+    the width table (type.tks's is private to teko::checker). */
+fn prim_width_of(k: checker::PrimKind) -> u32 {
+    if k == checker::PrimKind::U8   || k == checker::PrimKind::I8   { return 8 }
+    if k == checker::PrimKind::U16  || k == checker::PrimKind::I16  { return 16 }
+    if k == checker::PrimKind::U32  || k == checker::PrimKind::I32  { return 32 }
+    if k == checker::PrimKind::U64  || k == checker::PrimKind::I64  { return 64 }
+    if k == checker::PrimKind::U128 || k == checker::PrimKind::I128 { return 128 }
+    if k == checker::PrimKind::F16 { return 16 }
+    if k == checker::PrimKind::F32 { return 32 }
+    if k == checker::PrimKind::F64 { return 64 }
+    1
+}
+
+/** mangle_fn_symbol — the LIR symbol for a Teko-Teko call target: the namespace with each
+    `:` replaced by `_`, then `__`, then the C-keyword-escaped bare name — byte-identical to
+    the C backend's cb_fn_name so the native and C paths name the same symbol. An empty
+    namespace (a local/builtin) yields the bare (escaped) name. */
+pub fn mangle_fn_symbol(ns: str, name: str) -> str {
+    mut sym = ""
+    if ns.len != 0 { sym = teko::str::concat(mangle_ns(ns), "__") }
+    teko::str::concat(sym, escape_c_keyword(name))
+}
+
+/** mangle_ns — a namespace with every `:` byte rewritten to `_`. */
+fn mangle_ns(ns: str) -> str {
+    mut xs: []byte = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= ns.len { break }
+        let ch = if ns[i] == b':' { b'_' } else { ns[i] }
+        xs = teko::list::push(xs, ch)
+        i++
+    }
+    str(xs)
+}
+
+/** escape_c_keyword — a bare identifier with a trailing `_` when it collides with a C
+    keyword (mirrors codegen's cb_ident / cg_is_c_keyword so the symbol matches the C
+    definition). */
+fn escape_c_keyword(name: str) -> str {
+    if is_c_keyword(name) { return teko::str::concat(name, "_") }
+    name
+}
+
+/** is_c_keyword — the reserved C identifiers a mangled symbol must escape (the same set
+    the C backend's cg_is_c_keyword guards). */
+fn is_c_keyword(s: str) -> bool {
+    s == "bool" || s == "int" || s == "char" || s == "short" || s == "long" ||
+    s == "float" || s == "double" || s == "void" || s == "unsigned" || s == "signed" ||
+    s == "const" || s == "volatile" || s == "register" || s == "auto" || s == "static" ||
+    s == "struct" || s == "union" || s == "enum" || s == "return" || s == "default" ||
+    s == "goto" || s == "break" || s == "continue" || s == "case" || s == "switch" ||
+    s == "do" || s == "for" || s == "while" || s == "if" || s == "else" || s == "sizeof" ||
+    s == "typedef" || s == "extern" || s == "inline" || s == "restrict"
+}
+
+/** LowerCtx — the lowering state threaded through the expr/stmt walk: the current LFunc
+    being built + the id of the block instructions append to (N1 always block 0) + the
+    local env (name -> VReg) so a TVar resolves to its already-lowered value. */
+pub type LowerCtx = struct { func: LFunc; block_id: u32; env: LEnv }
+
+/** Lowered — the result of lowering an expression: the updated context + the VReg the
+    value lives in. */
+pub type Lowered = struct { ctx: LowerCtx; vreg: u32 }
+
+/** LowerStmtOut — the result of lowering a statement: the updated context (its env may be
+    extended by a `let`) + whether the statement TERMINATED the block (a return), so the
+    caller stops emitting into a closed block. */
+pub type LowerStmtOut = struct { ctx: LowerCtx; terminated: bool }
+
+/** ctx_alloc — reserve a fresh VReg in the current function, returning it + the advanced
+    context. Centralizes the alloc-then-use pattern every value-producing node repeats. */
+fn ctx_alloc(ctx: LowerCtx) -> Lowered {
+    let fresh = alloc_vreg(ctx.func)
+    Lowered { ctx = LowerCtx { func = fresh.func; block_id = ctx.block_id; env = ctx.env }; vreg = fresh.vreg }
+}
+
+/** ctx_append — append `inst` to the current block, returning the updated context. */
+fn ctx_append(ctx: LowerCtx, inst: LInst) -> LowerCtx {
+    LowerCtx { func = append_inst(ctx.func, ctx.block_id, inst); block_id = ctx.block_id; env = ctx.env }
+}
+
+/** ctx_bind — extend the context's local env with (name -> vreg). */
+fn ctx_bind(ctx: LowerCtx, name: str, vreg: u32) -> LowerCtx {
+    LowerCtx { func = ctx.func; block_id = ctx.block_id; env = lenv_bind(ctx.env, name, vreg) }
+}
+
+/** lower_expr — lower a typed expression to LIR, returning the VReg carrying its value.
+    Mirrors emit_expr_ctx's dispatch over the subset; every out-of-subset node honest-stops
+    with a NAMED error. */
+pub fn lower_expr(ctx: LowerCtx, e: checker::TExpr) -> Lowered | error {
+    match e.kind {
+        checker::TNumber as n => lower_number(ctx, e, n)
+        checker::TVar as v    => lower_var(ctx, v)
+        checker::TBinary as b => lower_binary(ctx, e, b)
+        checker::TUnary as u  => lower_unary(ctx, e, u)
+        checker::TCast as c   => lower_cast(ctx, e, c)
+        checker::TCall as cl  => lower_call(ctx, e, cl)
+        _ => error { message = teko::str::concat("native backend N1: ", texpr_kind_name(e), " not yet lowered (N2)") }
+    }
+}
+
+/** lower_number — an integer literal -> LConstInt, a float literal -> LConstFloat (carried
+    as its exact IEEE bits). */
+fn lower_number(ctx: LowerCtx, e: checker::TExpr, n: checker::TNumber) -> Lowered | error {
+    let r = ctx_alloc(ctx)
+    if n.is_float {
+        let finst = const_float_inst(r.vreg, teko::f64_bits(n.fval), e.line, e.col)
+        return Lowered { ctx = ctx_append(r.ctx, finst); vreg = r.vreg }
+    }
+    let inst = const_int_inst(r.vreg, n.value, e.line, e.col)
+    Lowered { ctx = ctx_append(r.ctx, inst); vreg = r.vreg }
+}
+
+/** lower_var — a local variable reference -> the VReg it already lives in (no instruction;
+    an SSA-lite value IS the var). A bare fn-as-value (is_func) is out of the N1 subset
+    (closures are N2). */
+fn lower_var(ctx: LowerCtx, v: checker::TVar) -> Lowered | error {
+    if v.is_func { return error { message = "native backend N1: function-as-value not yet lowered (N2)" } }
+    let hit = lenv_lookup(ctx.env, v.name)
+    if !hit.found { return error { message = teko::str::concat("native backend N1: unbound local `", v.name, "` (internal)") } }
+    Lowered { ctx = ctx; vreg = hit.vreg }
+}
+
+/** lower_binary — lower left then right, then emit the LBin chosen by the RESULT's
+    PrimKind (S/U/F picked in lbinop_of). Out-of-subset operators honest-stop. */
+fn lower_binary(ctx: LowerCtx, e: checker::TExpr, b: checker::TBinary) -> Lowered | error {
+    let lo = match lower_expr(ctx, b.left) { Lowered as x => x; error as err => return err }
+    let ro = match lower_expr(lo.ctx, b.right) { Lowered as x => x; error as err => return err }
+    let k = match prim_kind_of(e.type) { checker::PrimKind as p => p; error as err => return err }
+    let op = match lbinop_of(b.op, k) { LBinOp as o => o; error as err => return err }
+    let r = ctx_alloc(ro.ctx)
+    let inst = bin_inst(r.vreg, op, lo.vreg, ro.vreg, e.line, e.col)
+    Lowered { ctx = ctx_append(r.ctx, inst); vreg = r.vreg }
+}
+
+/** lower_unary — lower the operand, then emit the LUn chosen by the operand's PrimKind. */
+fn lower_unary(ctx: LowerCtx, e: checker::TExpr, u: checker::TUnary) -> Lowered | error {
+    let ao = match lower_expr(ctx, u.operand) { Lowered as x => x; error as err => return err }
+    let k = match prim_kind_of(u.operand.type) { checker::PrimKind as p => p; error as err => return err }
+    let op = match lunop_of(u.op, k) { LUnOp as o => o; error as err => return err }
+    let r = ctx_alloc(ao.ctx)
+    let inst = un_inst(r.vreg, op, ao.vreg, e.line, e.col)
+    Lowered { ctx = ctx_append(r.ctx, inst); vreg = r.vreg }
+}
+
+/** lower_cast — a numeric `to` cast: lower the inner value, then emit the conversion LUn
+    chosen by the src/dst machine classes. Only numeric casts are in the N1 subset; a cast
+    to/from a non-primitive honest-stops. */
+fn lower_cast(ctx: LowerCtx, e: checker::TExpr, c: checker::TCast) -> Lowered | error {
+    let ao = match lower_expr(ctx, c.expr) { Lowered as x => x; error as err => return err }
+    let src = match prim_kind_of(c.expr.type) { checker::PrimKind as p => p; error as err => return err }
+    let dst = match prim_kind_of(e.type) { checker::PrimKind as p => p; error as err => return err }
+    let r = ctx_alloc(ao.ctx)
+    let inst = un_inst(r.vreg, cast_unop_of(src, dst), ao.vreg, e.line, e.col)
+    Lowered { ctx = ctx_append(r.ctx, inst); vreg = r.vreg }
+}
+
+/** prim_kind_of — the PrimKind of a resolved primitive type; a non-prim honest-stops (its
+    node is out of the arithmetic subset). */
+fn prim_kind_of(t: checker::Type) -> checker::PrimKind | error {
+    match t {
+        checker::Prim as p => p.kind
+        _ => error { message = "native backend N1: non-primitive arithmetic operand not yet lowered (N2)" }
+    }
+}
+
+/** lower_call — a direct call. The `exit`/`panic` builtins map to their runtime symbols
+    (tk_exit / tk_panic_str), matching the C backend; a Teko-Teko call resolves its symbol
+    through the shared mangler (call_ns::name). Arguments lower left-to-right. A closure/
+    interface-dispatch call is out of the N1 subset. */
+fn lower_call(ctx: LowerCtx, e: checker::TExpr, c: checker::TCall) -> Lowered | error {
+    if c.is_closure_call { return error { message = "native backend N1: closure call not yet lowered (N2)" } }
+    if c.is_iface_dispatch { return error { message = "native backend N1: interface dispatch not yet lowered (N2)" } }
+    let lo = match lower_args(ctx, c.args) { LoweredArgs as x => x; error as err => return err }
+    lower_call_symbol(lo.ctx, e, c, lo.vregs)
+}
+
+/** LoweredArgs — the context after lowering an argument list + the VRegs, in order. */
+pub type LoweredArgs = struct { ctx: LowerCtx; vregs: []u32 }
+
+/** lower_args — lower each argument expression left-to-right, collecting its VReg. */
+fn lower_args(ctx: LowerCtx, args: []checker::TExpr) -> LoweredArgs | error {
+    mut cur = ctx
+    mut vregs: []u32 = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= args.len { break }
+        let ao = match lower_expr(cur, args[i]) { Lowered as x => x; error as err => return err }
+        cur = ao.ctx
+        vregs = teko::list::push(vregs, ao.vreg)
+        i++
+    }
+    LoweredArgs { ctx = cur; vregs = vregs }
+}
+
+/** lower_call_symbol — emit the LCall for a resolved argument list. A void-returning call
+    (a diverging builtin or a void fn) emits a valueless instruction and returns a dummy
+    VReg the caller must not read; a value call allocates a result VReg. */
+fn lower_call_symbol(ctx: LowerCtx, e: checker::TExpr, c: checker::TCall, vregs: []u32) -> Lowered | error {
+    let sym = match call_symbol(c) { str as s => s; error as err => return err }
+    if is_void_call(e.type) {
+        let inst = void_call_inst(sym, vregs, false, e.line, e.col)
+        return Lowered { ctx = ctx_append(ctx, inst); vreg = 0 }
+    }
+    let r = ctx_alloc(ctx)
+    let inst = call_inst(r.vreg, sym, vregs, false, e.line, e.col)
+    Lowered { ctx = ctx_append(r.ctx, inst); vreg = r.vreg }
+}
+
+/** is_void_call — does the call yield no value (a Void result type)? */
+fn is_void_call(t: checker::Type) -> bool {
+    match t { checker::Void => true; _ => false }
+}
+
+/** call_symbol — the LIR symbol a direct call targets: `exit`/`panic` -> their runtime
+    twins; a Teko-Teko call -> the mangled call_ns::name. A call the N1 subset does not
+    recognize (a builtin other than exit/panic) honest-stops. */
+fn call_symbol(c: checker::TCall) -> str | error {
+    let segs = c.callee.segments
+    if segs.len == 0 { return error { message = "native backend N1: empty call path (internal)" } }
+    let last = segs[segs.len - 1].name
+    let addressable = (segs.len == 1) || (segs[0].name == "teko")
+    if addressable && last == "exit" { return "tk_exit" }
+    if addressable && last == "panic" { return "tk_panic_str" }
+    if c.call_ns.len == 0 && segs.len == 1 {
+        return error { message = teko::str::concat("native backend N1: builtin `", last, "` not yet lowered (N2)") }
+    }
+    mangle_fn_symbol(c.call_ns, last)
+}
+
+/** lower_stmt — lower one statement, extending the env on a `let` and signaling block
+    termination on a `return`. Mirrors emit_stmt over the subset; out-of-subset statements
+    honest-stop. */
+pub fn lower_stmt(ctx: LowerCtx, s: checker::TStatement) -> LowerStmtOut | error {
+    match s {
+        checker::TBinding as b  => lower_binding(ctx, b)
+        checker::TReturn as r   => lower_return(ctx, r)
+        checker::TExprStmt as es => lower_expr_stmt(ctx, es)
+        _ => error { message = teko::str::concat("native backend N1: ", tstmt_kind_name(s), " not yet lowered (N2)") }
+    }
+}
+
+/** lower_binding — `let x = e`: lower `e` to a VReg, then bind `x` to it in the env. The
+    binding target must be a simple name (a destructuring pattern is out of the N1 subset). */
+fn lower_binding(ctx: LowerCtx, b: checker::TBinding) -> LowerStmtOut | error {
+    let name = match bind_target_name(b.target) { str as s => s; error as err => return err }
+    let lo = match lower_expr(ctx, b.value) { Lowered as x => x; error as err => return err }
+    LowerStmtOut { ctx = ctx_bind(lo.ctx, name, lo.vreg); terminated = false }
+}
+
+/** bind_target_name — the bound simple name; a destructuring pattern honest-stops. */
+fn bind_target_name(t: parser::BindTarget) -> str | error {
+    match t {
+        parser::SimpleName as sn => sn.name
+        _ => error { message = "native backend N1: destructuring binding not yet lowered (N2)" }
+    }
+}
+
+/** lower_return — `return e` (or bare `return`): lower the value (when present) and emit the
+    LRet terminator, closing the block. */
+fn lower_return(ctx: LowerCtx, r: checker::TReturn) -> LowerStmtOut | error {
+    if !r.has_value {
+        let vinst = ret_void_inst(r.value.line, r.value.col)
+        return LowerStmtOut { ctx = ctx_append(ctx, vinst); terminated = true }
+    }
+    let lo = match lower_expr(ctx, r.value) { Lowered as x => x; error as err => return err }
+    let inst = ret_inst(lo.vreg, r.value.line, r.value.col)
+    LowerStmtOut { ctx = ctx_append(lo.ctx, inst); terminated = true }
+}
+
+/** lower_expr_stmt — an expression statement: lower for effect (the call), discard the
+    VReg. */
+fn lower_expr_stmt(ctx: LowerCtx, es: checker::TExprStmt) -> LowerStmtOut | error {
+    let lo = match lower_expr(ctx, es.expr) { Lowered as x => x; error as err => return err }
+    LowerStmtOut { ctx = lo.ctx; terminated = false }
+}
+
+/** texpr_kind_name — a short spelling of a typed expression's kind for the honest-stop
+    message. Takes the whole TExpr (TExprKind is private to teko::checker) and matches its
+    `.kind`. */
+fn texpr_kind_name(e: checker::TExpr) -> str {
+    match e.kind {
+        checker::TNumber   => "number"
+        checker::TVar      => "variable"
+        checker::TStrLit   => "string literal"
+        checker::TByteLit  => "byte literal"
+        checker::TCharLit  => "char literal"
+        checker::TBoolLit  => "bool literal"
+        checker::TNullLit  => "null literal"
+        checker::TBinary   => "binary op"
+        checker::TUnary    => "unary op"
+        checker::TCompare  => "comparison"
+        checker::TCall     => "call"
+        checker::TIfExpr   => "if-expression"
+        checker::TMatchExpr => "match-expression"
+        checker::TCast     => "cast"
+        checker::TFieldAccess => "field access"
+        checker::TSafeFieldAccess => "safe field access"
+        checker::TCoalesce => "?? coalesce"
+        checker::TStructInit => "struct literal"
+        checker::TIndex    => "index"
+        checker::TInterp   => "string interpolation"
+        checker::TInExpr   => "in-expression"
+        checker::TPathExpr => "enum member"
+        checker::TArrayLit => "array literal"
+        checker::TLambda   => "lambda"
+    }
+}
+
+/** tstmt_kind_name — a short spelling of a TStatement for the honest-stop message. */
+fn tstmt_kind_name(s: checker::TStatement) -> str {
+    match s {
+        checker::TBinding      => "binding"
+        checker::TAssign       => "assignment"
+        checker::TReturn       => "return"
+        checker::TLoopStmt     => "loop"
+        checker::TBreakStmt    => "break"
+        checker::TContinueStmt => "continue"
+        checker::TExprStmt     => "expression statement"
+        checker::TDeferStmt    => "defer"
+    }
+}
+
+/** lower_block — lower a statement block into the current function/block, threading the env
+    and stopping at the first terminator (a return closes the block; nothing after it is
+    reachable in the N1 straight-line subset). */
+fn lower_block(ctx: LowerCtx, body: []checker::TStatement) -> LowerCtx | error {
+    mut cur = ctx
+    mut i: u64 = 0
+    loop {
+        if i >= body.len { break }
+        let out = match lower_stmt(cur, body[i]) { LowerStmtOut as x => x; error as err => return err }
+        cur = out.ctx
+        if out.terminated { return cur }
+        i++
+    }
+    cur
+}
+
+/** lower_function — a TFunction -> an LFunc: materialize each parameter as an LParam into
+    VRegs 0..n_params (bound in the env by name), then lower the body. A body that falls off
+    the end without an explicit return gets an implicit void return (the checker guarantees a
+    value-returning fn returns on every path, so this only fires for void fns). A generic or
+    extern function is out of the N1 subset. */
+pub fn lower_function(f: checker::TFunction) -> LFunc | error {
+    if f.type_params.len != 0 { return error { message = "native backend N1: generic function not yet lowered (N2)" } }
+    if f.is_extern { return error { message = "native backend N1: extern function has no body to lower" } }
+    let ptypes = param_ltypes(f.params)
+    mut fn0 = new_func(mangle_fn_symbol(f.namespace, f.name), f.params.len to u32, ptypes, ltype_of(f.return_type))
+    mut env = empty_lenv()
+    mut i: u64 = 0
+    loop {
+        if i >= f.params.len { break }
+        fn0 = append_inst(fn0, 0, param_inst(i to u32, i to u32, f.line, f.col))
+        env = lenv_bind(env, f.params[i].name, i to u32)
+        i++
+    }
+    let ctx0 = LowerCtx { func = fn0; block_id = 0; env = env }
+    let done = match lower_block(ctx0, f.body) { LowerCtx as c => c; error as err => return err }
+    close_function(done, f)
+}
+
+/** close_function — append the implicit void return if the body did not terminate the block
+    (a void fn falling off the end), then return the built LFunc. */
+fn close_function(ctx: LowerCtx, f: checker::TFunction) -> LFunc | error {
+    if block_terminated(ctx.func, ctx.block_id) { return ctx.func }
+    ctx_append(ctx, ret_void_inst(f.line, f.col)).func
+}
+
+/** block_terminated — does the block whose id is `block_id` end in a terminator (LRet/
+    LJump/LBranch)? N1 only produces LRet, so a non-empty last-inst LRet means terminated. */
+fn block_terminated(f: LFunc, block_id: u32) -> bool {
+    mut i: u64 = 0
+    loop {
+        if i >= f.blocks.len { break }
+        let b = f.blocks[i]
+        if b.id == block_id { return block_ends_in_terminator(b) }
+        i++
+    }
+    false
+}
+
+/** block_ends_in_terminator — is the block's last instruction a terminator? */
+fn block_ends_in_terminator(b: LBlock) -> bool {
+    if b.insts.len == 0 { return false }
+    inst_is_terminator(b.insts[b.insts.len - 1])
+}
+
+/** inst_is_terminator — is this instruction a block terminator (LRet/LJump/LBranch)? */
+fn inst_is_terminator(inst: LInst) -> bool {
+    match inst.op {
+        LRet    => true
+        LJump   => true
+        LBranch => true
+        _       => false
+    }
+}
+
+/** param_ltypes — the machine class of each parameter annotation (in order). */
+fn param_ltypes(params: []parser::Param) -> []LType {
+    mut out: []LType = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= params.len { break }
+        out = teko::list::push(out, ltype_of_typeexpr(params[i].type_ann))
+        i++
+    }
+    out
+}
+
+/** lower_program — the module entry: lower every top-level function, and gather the loose
+    top-level statements into a synthesized `main` (the VIRTUAL-MAIN the C backend also
+    builds), returning `int 0` if the statements fall through. Type/use declarations are
+    skipped (no code). Mirrors the loop of tk_emit_c over prog.items. */
+pub fn lower_program(prog: checker::TProgram) -> LModule | error {
+    mut m = empty_module()
+    mut loose: []checker::TStatement = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= prog.items.len { break }
+        let step = match lower_item(m, loose, prog.items[i]) { LowerItemOut as x => x; error as err => return err }
+        m = step.module
+        loose = step.loose
+        i++
+    }
+    add_func(m, match lower_virtual_main(loose) { LFunc as vf => vf; error as err => return err })
+}
+
+/** LowerItemOut — the module + accumulated loose statements after folding one top-level
+    item. */
+pub type LowerItemOut = struct { module: LModule; loose: []checker::TStatement }
+
+/** lower_item — fold one TItem: a function lowers into the module; a loose statement
+    accumulates for the virtual main; a type/use declaration is skipped. */
+fn lower_item(m: LModule, loose: []checker::TStatement, it: checker::TItem) -> LowerItemOut | error {
+    match it {
+        checker::TFunction as f => lower_item_function(m, loose, f)
+        checker::TStatement as s => LowerItemOut { module = m; loose = teko::list::push(loose, s) }
+        _ => LowerItemOut { module = m; loose = loose }
+    }
+}
+
+/** lower_item_function — lower a top-level function into the module (a `#test` function is
+    skipped — it is not part of the emitted program). */
+fn lower_item_function(m: LModule, loose: []checker::TStatement, f: checker::TFunction) -> LowerItemOut | error {
+    if f.is_test { return LowerItemOut { module = m; loose = loose } }
+    if f.is_extern { return LowerItemOut { module = m; loose = loose } }
+    let lf = match lower_function(f) { LFunc as x => x; error as err => return err }
+    LowerItemOut { module = add_func(m, lf); loose = loose }
+}
+
+/** lower_virtual_main — the synthesized `int main()` from the loose top-level statements:
+    lower each, and if control falls through append `%r = const 0; ret %r` (the ABI: main
+    returns int). An explicit `exit(n)` inside diverges, so the trailing return is dead but
+    harmless. */
+fn lower_virtual_main(loose: []checker::TStatement) -> LFunc | error {
+    let fn0 = new_func("main", 0, teko::list::empty(), LType::I32)
+    let ctx0 = LowerCtx { func = fn0; block_id = 0; env = empty_lenv() }
+    let done = match lower_block(ctx0, loose) { LowerCtx as c => c; error as err => return err }
+    close_virtual_main(done)
+}
+
+/** close_virtual_main — append `const 0; ret %r` when the body did not already terminate. */
+fn close_virtual_main(ctx: LowerCtx) -> LFunc | error {
+    if block_terminated(ctx.func, ctx.block_id) { return ctx.func }
+    let r = ctx_alloc(ctx)
+    let c0 = ctx_append(r.ctx, const_int_inst(r.vreg, 0 to i128, 0, 0))
+    ctx_append(c0, ret_inst(r.vreg, 0, 0)).func
+}
