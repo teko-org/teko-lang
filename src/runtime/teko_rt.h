@@ -335,6 +335,15 @@ tk_ffi_sres tk_rt_str_from_utf8(const tk_byte *ptr, uint64_t len);
 
 // teko::io::read_file(path) — slurp the whole file as UTF-8 bytes (owned copy).
 tk_ffi_sres tk_rt_read_file(tk_str path);
+// (DT3) teko::io::read_line() — read one LINE from stdin (the trailing '\n'/"\r\n" stripped),
+// an owned copy — empty when stdin has no more input (check tk_rt_stdin_eof() to tell that
+// apart from a genuine blank line). A DIRECT `str` return (no {ok,value,err} lift) so this
+// brand-new primitive stays lowerable by every codegen generation, including the released
+// bootstrap seed's frozen codegen.c, which can only special-case ALREADY-KNOWN {ok,value,err}
+// shapes by name (mirrors tk_rt_os/tk_rt_version's already-working plain-str shape).
+tk_str tk_rt_read_line(void);
+// (DT3) teko::io::stdin_eof() — did the LAST read_line() hit real EOF (stdin fully exhausted)?
+bool tk_rt_stdin_eof(void);
 // teko::env::var(name) — the environment value, or error when unset.
 tk_ffi_sres tk_rt_getenv(tk_str name);
 // teko::io::write_file(path, content) — (over)write the file; error on failure.
@@ -440,6 +449,12 @@ void     tk_cov_lines_on(bool on);
 void     tk_cov_line_reset(void);
 void     tk_cov_line(uint32_t line);                       // mark a line as executed (current fn)
 bool     tk_cov_line_hit(uint64_t fn, uint32_t line);      // report query
+
+// #265 — cross-process coverage merge for the NATIVE test gate. The child test binary dumps its three
+// sinks to a `.tkcov` file at exit; the compiler (parent) merges them, then runs the unchanged static
+// walk + floors. The coverage id is the shared prog.items index, so the packed ids are portable.
+void     tk_cov_dump(const char *path);    // write the three sinks to a `.tkcov` file (child, cov-on)
+bool     tk_cov_merge(tk_str path);        // union a `.tkcov` into this process's sinks (parent)
 
 // tk_slice_push — the AMORTIZED lowering of `teko::list::push` (a `[]T` grow-by-one). The
 // language keeps value semantics (fixed slices, copy-to-grow — collections #2); this is purely a

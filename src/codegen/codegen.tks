@@ -41,6 +41,14 @@ use teko::checker
 use teko::lexer
 use teko::parser
 
+/** CgMode — which `main()` the codegen entry emits (issue #265, lever D of #249). `Program`
+    (default) is today's virtual-main over the loose top-level statements — byte-for-byte the
+    historical emission, so the FIXPOINT `gen2.c == gen3.c` is untouched. `TestPlain` emits a
+    test-gate main that calls each `#test` in `prog.items` order (native gate, no coverage).
+    `TestCov` adds the `tk_cov_*` prologue/brackets (coverage sinks) — zero-cost when unused,
+    because those calls are simply absent from the emitted C under `Program`/`TestPlain`. */
+type CgMode = enum { Program; TestPlain; TestCov }
+
 // ---------------------------------------------------------------------------
 // The growable C-source buffer == a `[]byte`. These mirror cbuf's cb/cb_str/cb_i64/
 // cb_cstr_escaped. Each APPENDS to `buf` and returns the grown buffer (functional).
@@ -1282,6 +1290,15 @@ fn cg_prim_is_float(k: checker::PrimKind) -> bool { checker::prim_is_float(k) }
 // cg_prim_is_int — the integer prims (U8..U128, I8..I128). NOT bool, NOT float.
 fn cg_prim_is_int(k: checker::PrimKind) -> bool { checker::prim_is_int(k) }
 
+/** cg_is_arith_builtin_call — is a `div`/`rem`-named call the BARE reserved arithmetic FFI (`teko::div`
+    /`teko::rem`, the VM's checked ÷/% lowering) rather than a namespaced USER fn of the same name? The
+    reserved builtins carry NO user namespace (empty call_ns); a `teko::runtime::div` (i64→i64) carries
+    its own namespace and must keep its own C symbol. The native gate compiles such a user call for the
+    first time (#265), so this guard stops it from being hijacked into the `tk_div`/`tk_rem` builtin. */
+fn cg_is_arith_builtin_call(last: str, call_ns: str) -> bool {
+    (last == "div" || last == "rem") && call_ns.len == 0
+}
+
 // cg_prim_is_signed_int — the SIGNED integer prims (I8..I128). (type.tks: prim_is_signed.)
 fn cg_prim_is_signed_int(k: checker::PrimKind) -> bool { checker::prim_is_signed(k) }
 
@@ -1484,13 +1501,41 @@ fn emit_binary(buf: []byte, prog: checker::TProgram, e: checker::TExpr, b: check
     cb(out, ")")
 }
 
-// emit_unary — a TUnary -> `(op X)`. (C: TK_TEXPR_UNARY branch.)
+/** emit_unary — a TUnary -> `(op X)`. Bitwise NOT (`~`) on an integer prim TRUNCATES back to the
+    operand's C type (`(uint8_t)(~x)`): C promotes a sub-int operand to `int` before `~`, so `~(u8)0`
+    is `-1` (all 32 bits), not the width-masked `255` the VM computes — the cast re-narrows to the
+    declared width so both engines agree (#265: exposed the first time the u8 `~` test ran natively).
+    Other unaries (`-`, `!`) need no mask — their result already fits the operand width. */
 fn emit_unary(buf: []byte, prog: checker::TProgram, u: checker::TUnary, escaping: []str, regions: []RegionFrame, fn_body: []checker::TStatement, dctx: DeferCtx) -> []byte | error {
     let op = match unop_c(u.op) { str as s => s; error as err => return err }
+    let mask_type = cg_bnot_mask_type(u)
     mut out = cb(buf, "(")
+    match mask_type {
+        checker::Prim as p => { out = cb(out, "("); out = match emit_type(out, prog, checker::Prim { kind = p.kind }) { []byte as o => o; error as err => return err }; out = cb(out, ")(") }
+        _ => { }
+    }
     out = cb(out, op)
     out = match emit_expr_ctx(out, prog, checker::Void { }, u.operand, escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
+    match mask_type { checker::Prim => { out = cb(out, ")") }; _ => { } }
     cb(out, ")")
+}
+
+/** cg_bnot_mask_type — the integer-prim type whose width a `~x` result must be truncated to, else
+    `Void` (no mask). ONLY the sub-`int` widths (u8/u16/i8/i16) need it: C integer-promotes them to
+    `int` before `~`, so the result carries bits above the declared width (`~(u8)0 == -1`). i32/u32
+    and wider are already computed at their own width by C, so `~` needs no re-narrowing there. */
+fn cg_bnot_mask_type(u: checker::TUnary) -> checker::Type {
+    if u.op != lexer::TokenKind::Tilde { return checker::Void { } }
+    match u.operand.type {
+        checker::Prim as p => if cg_prim_is_subint(p.kind) { checker::Prim { kind = p.kind } } else { checker::Void { } }
+        _ => checker::Void { }
+    }
+}
+
+/** cg_prim_is_subint — a signed/unsigned integer prim NARROWER than C `int` (u8/u16/i8/i16), the
+    widths C integer-promotes before a bitwise op, so a `~` result needs an explicit re-narrow. */
+fn cg_prim_is_subint(k: checker::PrimKind) -> bool {
+    k == checker::PrimKind::U8 || k == checker::PrimKind::U16 || k == checker::PrimKind::I8 || k == checker::PrimKind::I16
 }
 
 // emit_compare — a TCompare -> chained `a<b<c` => `((a<b) && (b<c))` over ADJACENT
@@ -1702,6 +1747,23 @@ fn emit_list_push(buf: []byte, prog: checker::TProgram, e: checker::TExpr, c: ch
     out = match cg_slice_typename(out, elem) { []byte as o => o; error as err => return err }
     out = cb(out, "){ .ptr = "); out = cb(out, pN); out = cb(out, ", .len = "); out = cb(out, lN); out = cb(out, " }; })")
     out
+}
+
+/**
+ * C7.19 (#169 D0) — `teko::mem::buf_ptr(len)` lowers to a direct arena bump-allocation:
+ * `(uint8_t *)tk_region_alloc(<enclosing region>, (size_t)(len))`. Reuses whichever S1 region is
+ * open at the call site (a block region, else the function frame, else the process root — the
+ * same rule `emit_struct_init_framed` uses for a frame-local box), so the returned `ptr<byte>`'s
+ * storage is bulk-freed exactly when that region drops. No runtime forwarder is needed: the arena
+ * primitive is already a plain two-argument C call, so this is inlined rather than routed through
+ * `emit_host_ffi` (which exists for FIXED-ABI struct-returning FFI bottoms, not this).
+ */
+fn emit_buf_ptr(buf: []byte, prog: checker::TProgram, c: checker::TCall, escaping: []str, regions: []RegionFrame, fn_body: []checker::TStatement, dctx: DeferCtx) -> []byte | error {
+    mut out = cb(buf, "(uint8_t *)tk_region_alloc(")
+    out = cb(out, cg_enclosing_region_expr(regions))
+    out = cb(out, ", (size_t)(")
+    out = match emit_expr_ctx(out, prog, checker::Void { }, c.args[0], escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
+    cb(out, "))")
 }
 
 // (mem::free ruling 2026-07-03) `teko::mem::free(x)` → a void GNU stmt-expr that RECLAIMS x's heap
@@ -1952,6 +2014,7 @@ fn emit_call(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, e: c
             if l == "run_quiet"     { return emit_host_ffi(buf, prog, e, c, "run",    "tk_rt_run_quiet", escaping, regions, fn_body, dctx) }   // (issue #73) cc flag-family probe
             if l == "bytes_from_ptr" { return emit_host_ffi(buf, prog, e, c, "bytes", "tk_bytes_from_ptr", escaping, regions, fn_body, dctx) }   // (C7.1a) ptr+len -> []byte (slice-lift)
             if l == "str_from_utf8" { return emit_host_ffi(buf, prog, e, c, "sres_byteslice", "tk_rt_str_from_utf8", escaping, regions, fn_body, dctx) }   // ROUND 0: ([]byte) -> str | error
+            if l == "buf_ptr" { return emit_buf_ptr(buf, prog, c, escaping, regions, fn_body, dctx) }
         }
     }
     // Non-shadowable built-ins: `print`/`println`, either bare or under `teko`.
@@ -1973,8 +2036,8 @@ fn emit_call(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, e: c
             else if last == "parse"    { builtin = "tk_float_parse"; has_builtin = true }   // teko::float::parse(str) -> f64
             // arithmetic FFI over the i128 carrier (sign-aware) + float bit-patterns. (`div`/`rem`
             // mangle to tk_* so they never clash with libc's div/rem.)
-            else if last == "div"          { builtin = "tk_div";          has_builtin = true }   // (i128,i128,bool) -> i128
-            else if last == "rem"          { builtin = "tk_rem";          has_builtin = true }   // (i128,i128,bool) -> i128
+            else if cg_is_arith_builtin_call(last, c.call_ns) && last == "div" { builtin = "tk_div"; has_builtin = true }
+            else if cg_is_arith_builtin_call(last, c.call_ns) && last == "rem" { builtin = "tk_rem"; has_builtin = true }
             else if last == "fdiv"         { builtin = "tk_fdiv";         has_builtin = true }   // (f64,f64) -> f64
             else if last == "int_to_float" { builtin = "tk_int_to_float"; has_builtin = true }   // (i128,bool) -> f64
             else if last == "f64_bits"     { builtin = "tk_f64_bits";     has_builtin = true }   // (f64) -> u64
@@ -2132,6 +2195,11 @@ fn emit_call(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, e: c
                                 _ => c.args[j].type
                             }
                             out = match emit_as_r(out, prog, ret_type, checker::Optional { inner = inner_t }, c.args[j], escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
+                            wrapped = true
+                        }
+                        parser::SliceType as slt => {
+                            let exp_slice = cg_slice_param_type(prog, slt, c.args[j].type)
+                            out = match emit_as_r(out, prog, ret_type, exp_slice, c.args[j], escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
                             wrapped = true
                         }
                         _ => { }
@@ -2902,6 +2970,7 @@ fn emit_struct_init_literal(buf: []byte, prog: checker::TProgram, e: checker::TE
                             let elem = ent.path.segments[ent.path.segments.len - 1].name
                             if !cg_is_prim_name(elem) { exp_t = checker::Slice { element = checker::Named { name = cg_canon_name(prog, elem) } } }
                         }
+                        parser::OptionalType => { exp_t = cg_slice_param_type(prog, st, fv.type) }
                         _ => { }
                     }
                     // a present value into a `T?` field (T named) → emit_as wraps T → T?
@@ -3602,6 +3671,26 @@ fn cg_type_mangle_eq(a: checker::Type, c: checker::Type) -> bool {
 // return-context caller (binding/assign/return/tail/arm sink) uses emit_as_r to pass it down.
 fn emit_as(buf: []byte, prog: checker::TProgram, expected: checker::Type, value: checker::TExpr, escaping: []str, regions: []RegionFrame, fn_body: []checker::TStatement, dctx: DeferCtx) -> []byte | error {
     emit_as_r(buf, prog, checker::Void { }, expected, value, escaping, regions, fn_body, dctx)
+}
+
+/** cg_slice_param_type — the expected `checker::Slice` for a `[]…` PARAM (or a `[]…` struct FIELD)
+    whose annotation is `slt`, used by emit_as to coerce a bare-slice ARG (#265). A `[]…` slot never
+    reaches emit_as via the Named/Optional param branches, so this is the seam that routes it there.
+    An `OptionalType` element → `Slice { Optional { inner = <arg element> } }` so emit_as present-wraps
+    each element (UNLESS the arg element is already optional — an exact `[]T?`→`[]T?` match the checker
+    adopted to the param, where re-wrapping would make a `[]T??`). A `NamedType` element → the canonical
+    `Slice { Named }` so a covariant `[]Case`→`[]Variant` arg (e.g. `[]Return`→`[]Statement`) rebuilds
+    element-wise. Any other element → the arg's own type (emit_as no-ops when the mangle matches). The
+    checker keeps such widening args NARROW (arg_keeps_narrow_type), so the element mismatch is visible
+    here. `arg_type` is the argument's resolved slice type. */
+fn cg_slice_param_type(prog: checker::TProgram, slt: parser::SliceType, arg_type: checker::Type) -> checker::Type {
+    let arg_elem = match arg_type { checker::Slice as s => s.element; _ => checker::Void { } }
+    let arg_elem_opt = match arg_elem { checker::Optional => true; _ => false }
+    match slt.element {
+        parser::OptionalType => if arg_elem_opt { arg_type } else { checker::Slice { element = checker::Optional { inner = arg_elem } } }
+        parser::NamedType as nt => checker::Slice { element = checker::Named { name = cg_canon_name(prog, nt.path.segments[nt.path.segments.len - 1].name) } }
+        _ => arg_type
+    }
 }
 
 fn emit_as_r(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, expected: checker::Type, value: checker::TExpr, escaping: []str, regions: []RegionFrame, fn_body: []checker::TStatement, dctx: DeferCtx) -> []byte | error {
@@ -5687,8 +5776,17 @@ fn di_scope_expr(kind: parser::DiKind) -> str {
 }
 
 fn emit_function(buf: []byte, prog: checker::TProgram, f: checker::TFunction) -> []byte | error {
+    emit_function_cov(buf, prog, f, -1)
+}
+
+/** emit_function_cov — emit_function with an optional `tk_cov_mark(cov_idx)` entry prologue (#265,
+    the native-gate TestCov profile). `cov_idx < 0` emits NO prologue → byte-identical to the
+    historical emission (Program/TestPlain and every ordinary caller). A `cov_idx >= 0` marks this
+    production function's items-index on entry — the mark the VM does in eval_call. */
+fn emit_function_cov(buf: []byte, prog: checker::TProgram, f: checker::TFunction, cov_idx: i64) -> []byte | error {
     mut out = match emit_function_sig(buf, prog, f) { []byte as o => o; error as err => return err }
     out = cb(out, " {\n")
+    if cov_idx >= 0 { out = cb(cb_u128_digits(cb(out, "    tk_cov_mark("), cov_idx to u128), ");\n") }
     // (W9.3) PER-SCOPE defer. The TAST body is emitted UNCHANGED; defers are tracked via the threaded
     // DeferCtx (the functional twin of the C's g_cg_defers/g_cg_ndefers statics, reset per function).
     // A TDeferStmt appends to dctx.defers (emits nothing inline); every scope-block fires `[base, len)`
@@ -7095,7 +7193,26 @@ fn cg_emit_lambda_decls(buf: []byte, prog: checker::TProgram, lams: []checker::T
     out
 }
 
+/** tk_emit_c — the PROGRAM emission entry (the virtual-main over loose top-level statements).
+    Kept as the public name every caller uses; delegates to tk_emit_c_mode with CgMode::Program so
+    the historical output is byte-identical (the fixpoint is intact). (#265) */
 fn tk_emit_c(prog0: checker::TProgram) -> str | error {
+    tk_emit_c_mode(prog0, CgMode::Program)
+}
+
+/** tk_emit_c_test — the NATIVE TEST-GATE emission entry (#265): a translation unit whose `main()`
+    calls each `#test` in order. `cov` selects TestCov (emit the `tk_cov_*` prologue/brackets + a
+    `.tkcov` dump) vs TestPlain (no coverage, zero-cost). Exposed so the build's native gate can
+    request the test profile without naming CgMode across the namespace boundary. */
+pub fn tk_emit_c_test(prog0: checker::TProgram, cov: bool) -> str | error {
+    tk_emit_c_mode(prog0, if cov { CgMode::TestCov } else { CgMode::TestPlain })
+}
+
+/** tk_emit_c_mode — emit the C translation unit under `mode` (#265, lever D of #249). Types,
+    prototypes and function bodies are emitted IDENTICALLY across modes; only the trailing `main()`
+    differs: Program = the virtual-main (loose statements), TestPlain/TestCov = the native test gate.
+    Under TestCov the production-fn prologues additionally emit `tk_cov_mark`. */
+fn tk_emit_c_mode(prog0: checker::TProgram, mode: CgMode) -> str | error {
     let _lr = cg_lift_lambdas(prog0)   // (W10) stamp lambdas + synthesize lifted functions before emission
     let prog = _lr.prog
     let cap_lams = _lr.lams
@@ -7295,7 +7412,7 @@ fn tk_emit_c(prog0: checker::TProgram) -> str | error {
     loop {
         if i >= prog.items.len { break }
         match prog.items[i] {
-            checker::TFunction as f => { if !f.is_extern { b = match emit_function(b, prog, f) { []byte as o => o; error as err => return err } } }   // C7.1a: extern fns have no body (prototype only)
+            checker::TFunction as f => { if !f.is_extern { b = match emit_function_mode(b, prog, f, mode) { []byte as o => o; error as err => return err } } }
             parser::TypeDecl       => { }   // emitted in the type-decl passes above
             parser::UseDecl        => { }   // imports are a no-op at the C level (M0)
             checker::TStatement     => { }   // a loose Statement → virtual-main, second pass
@@ -7305,13 +7422,27 @@ fn tk_emit_c(prog0: checker::TProgram) -> str | error {
     // (W10) CAPTURING lambdas: the lifted-function DEFINITIONS (env unpack + body).
     b = match cg_emit_lambda_decls(b, prog, cap_lams, false) { []byte as o => o; error as err => return err }
 
-    // Second pass: the VIRTUAL-MAIN — the loose top-level statements, in order, become the
-    // body of C main(); falling off the end -> `return 0;` (default exit 0).
-    // W5a — the LAST loose statement, if it is a value-carrying expr-statement, becomes the
-    // process exit code via `return (int)(…)` (mirrors tk_vm_run: the virtual-main's trailing
-    // value is the exit code — B.20). emit_block_tail (with in_main=true) lowers a tail `if`'s
-    // branch returns to `return (int)(…)`.
-    // Find the LAST loose statement's index (the tail); prog.items.len means "no loose stmt".
+    b = match emit_mode_main(b, prog, mode) { []byte as o => o; error as err => return err }
+    str(cg_format_c(str(b)))
+}
+
+/** emit_mode_main — the trailing `main()`, the ONLY mode-dependent emission (#265): `Program` emits
+    the historical virtual-main over the loose top-level statements (byte-identical — the fixpoint
+    compares THIS), `TestPlain`/`TestCov` emit the native test gate that calls each `#test`. */
+fn emit_mode_main(buf: []byte, prog: checker::TProgram, mode: CgMode) -> []byte | error {
+    match mode {
+        CgMode::Program => emit_program_main(buf, prog)
+        _ => emit_test_main(buf, prog, mode)
+    }
+}
+
+/** emit_program_main — the VIRTUAL-MAIN: the loose top-level statements, in order, become the body
+    of C `main()`; falling off the end -> `return 0;` (default exit 0). W5a — the LAST loose
+    statement, if it is a value-carrying expr-statement, becomes the process exit code via
+    `return (int)(…)`. This is the historical emission verbatim (extracted, #265) — the fixpoint
+    compares THIS output, so it stays byte-for-byte identical. */
+fn emit_program_main(buf: []byte, prog: checker::TProgram) -> []byte | error {
+    mut b = buf
     mut last_stmt = prog.items.len
     mut li: u64 = 0                    // u64 index (so `last_stmt = li` matches last_stmt's u64 type)
     loop {
@@ -7349,9 +7480,89 @@ fn tk_emit_c(prog0: checker::TProgram) -> str | error {
     }
     b = cb(b, "    return 0;\n")
     b = cb(b, "}\n")
+    b
+}
 
-    // Re-flow into readable, brace-indented C (the raw emission packs each `({…})` on one line).
-    str(cg_format_c(str(b)))
+/** emit_test_main — the NATIVE TEST GATE main (#265): call each `#test` in `prog.items` order,
+    printing the same `test <label> ... ok` lines the VM runner prints; a failed assert `panic`s
+    (fail-fast, M.1) with a non-zero exit. Under `TestCov` the run is bracketed with the cov reset/on
+    calls and each test wrapped in `tk_cov_enter(idx)`/`tk_cov_leave`, then the sinks are dumped to a
+    `.tkcov` for the parent to merge; under `TestPlain` NO `tk_cov_*` is emitted (zero-cost off). */
+fn emit_test_main(buf: []byte, prog: checker::TProgram, mode: CgMode) -> []byte | error {
+    mut b = buf
+    let cov = mode == CgMode::TestCov
+    b = cb(b, "int main(int argc, char **argv) {\n")
+    b = cb(b, "    tk_set_args(argc, argv);\n")
+    if cov {
+        b = cb(b, "    tk_cov_reset();\n")
+        b = cb(b, "    tk_cov_branch_reset(); tk_cov_branches_on(true);\n")
+        b = cb(b, "    tk_cov_line_reset(); tk_cov_lines_on(true);\n")
+    }
+    mut i: u64 = 0
+    loop {
+        if i >= prog.items.len { break }
+        match prog.items[i] {
+            checker::TFunction as f => {
+                if f.is_test { b = emit_test_call(b, f, i, cov) }
+            }
+            _ => { }
+        }
+        i++
+    }
+    if cov {
+        b = cb(b, "    tk_cov_branches_on(false); tk_cov_lines_on(false);\n")
+        b = cb(b, "    { const char *dp = getenv(\"TEKO_TKCOV\"); if (dp) tk_cov_dump(dp); }\n")
+    }
+    b = cb(b, "    return 0;\n")
+    b = cb(b, "}\n")
+    b
+}
+
+/** emit_test_call — one test invocation in the native gate: `print("test <label> ... ")`, then the
+    mangled test symbol call, then `println("ok")`. The label is `namespace::name` (or bare `name`),
+    matching run_tests_cov's label exactly. Under `cov` the body's lines/branches are attributed to
+    this test via `tk_cov_enter(idx)`/`tk_cov_leave` (the same brackets the VM runner uses). (#265) */
+fn emit_test_call(buf: []byte, f: checker::TFunction, idx: u64, cov: bool) -> []byte {
+    let label = if f.namespace.len != 0 { teko::str::concat(f.namespace, "::", f.name) } else { f.name }
+    let head = teko::str::concat("test ", label, " ... ")
+    mut b = cb(buf, "    tk_print((tk_str){ (const tk_byte *)\"")
+    b = cb_cstr_escaped(b, head)
+    b = cb(b, "\", ")
+    b = cb_u128_digits(b, head.len to u128)
+    b = cb(b, " });\n")
+    if cov { b = cb(cb_u128_digits(cb(b, "    tk_cov_enter("), idx to u128), ");\n") }
+    b = cb_fn_name(cb(b, "    "), f.namespace, f.name)
+    b = cb(b, "();\n")
+    if cov { b = cb(b, "    tk_cov_leave();\n") }
+    b = cb(b, "    tk_println((tk_str){ (const tk_byte *)\"ok\", 2 });\n")
+    b
+}
+
+/** emit_function_mode — emit a function body, adding the `tk_cov_mark(idx)` entry prologue under
+    `TestCov` for each PRODUCTION (non-test, non-`teko::vm`) function so function-level coverage is
+    populated natively — the marks the VM does in eval_call. Under Program/TestPlain this is exactly
+    emit_function (no prologue → byte-identical). (#265) */
+fn emit_function_mode(buf: []byte, prog: checker::TProgram, f: checker::TFunction, mode: CgMode) -> []byte | error {
+    if mode != CgMode::TestCov { return emit_function(buf, prog, f) }
+    if f.is_test || f.namespace == "teko::vm" { return emit_function(buf, prog, f) }
+    emit_function_cov(buf, prog, f, fn_items_index(prog, f) to i64)
+}
+
+/** fn_items_index — the `prog.items` index of `f` (its coverage id, shared across processes). Matches
+    by identity of namespace + name + line (the fields the VM's cov marks key on). (#265) */
+fn fn_items_index(prog: checker::TProgram, f: checker::TFunction) -> u64 {
+    mut i: u64 = 0
+    loop {
+        if i >= prog.items.len { break }
+        match prog.items[i] {
+            checker::TFunction as g => {
+                if g.namespace == f.namespace && g.name == f.name && g.line == f.line { return i }
+            }
+            _ => { }
+        }
+        i++
+    }
+    0
 }
 
 // E3 — the `.tsym` symbol map (mirror of codegen.c tk_emit_tsym): one line per function mapping its

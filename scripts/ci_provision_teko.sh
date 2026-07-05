@@ -17,23 +17,48 @@ set -eu
 LABEL="${1:?usage: ci_provision_teko.sh <LABEL>}"
 REPO="${GITHUB_REPOSITORY:?GITHUB_REPOSITORY must be set}"
 
-# Newest published release, prereleases included (alpha), drafts excluded.
-TAG="$(gh api "repos/${REPO}/releases" --jq 'map(select(.draft | not))[0].tag_name')"
+# Newest published release BY VERSION (prereleases included, drafts excluded). The
+# GitHub /releases API is NOT ordered by version — `[0]` can return a stale tag (e.g.
+# 0.0.1.9 ahead of 0.0.1.17). Filter to MAJOR.MINOR.PATCH.BUILD tags and pick the
+# highest with `sort -V`, so CI always seeds from the newest compiler.
+TAG="$(gh api "repos/${REPO}/releases" --paginate \
+  --jq 'map(select(.draft | not) | .tag_name)[] | select(test("^v?[0-9]+([.][0-9]+){3}"))' \
+  | awk '{ orig=$0; ver=$0; sub(/^v/,"",ver); print ver"\t"orig }' | sort -V | tail -n1 | cut -f2)"
 if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
   echo "ci_provision_teko: no published release found for $REPO" >&2
   exit 1
 fi
 echo "ci_provision_teko: seeding compiler from release $TAG (asset teko-${LABEL}.*)"
 
-gh release download "$TAG" -R "$REPO" -p "teko-${LABEL}.*" --clobber
+# Download the asset. The Linux labels gained a libc suffix (linux-x86_64 -> linux-x86_64-glibc)
+# when the release started shipping glibc+musl separately; a release predating that split has
+# only the unsuffixed asset, so fall back to `<label>` with the trailing `-glibc` stripped.
+rm -f teko-*.tar.gz teko-*.zip
+if gh release download "$TAG" -R "$REPO" -p "teko-${LABEL}.tar.gz" -p "teko-${LABEL}.zip" --clobber 2>/dev/null; then
+  :
+else
+  ALT="${LABEL%-glibc}"
+  if [ "$ALT" != "$LABEL" ]; then
+    echo "ci_provision_teko: teko-${LABEL}.* absent in $TAG — falling back to legacy teko-${ALT}.*"
+    gh release download "$TAG" -R "$REPO" -p "teko-${ALT}.tar.gz" -p "teko-${ALT}.zip" --clobber
+  else
+    echo "ci_provision_teko: no seed asset teko-${LABEL}.* in $TAG" >&2
+    exit 1
+  fi
+fi
 
 rm -rf .seed
 mkdir -p .seed
-if [ -f "teko-${LABEL}.zip" ]; then
-  unzip -o "teko-${LABEL}.zip" -d .seed
-else
-  tar -xzf "teko-${LABEL}.tar.gz" -C .seed
+# Extract whichever archive actually landed (name may be the label or the legacy fallback).
+ARCHIVE="$(ls teko-*.zip teko-*.tar.gz 2>/dev/null | head -n1)"
+if [ -z "$ARCHIVE" ]; then
+  echo "ci_provision_teko: no seed archive downloaded" >&2
+  exit 1
 fi
+case "$ARCHIVE" in
+  *.zip) unzip -o "$ARCHIVE" -d .seed ;;
+  *)     tar -xzf "$ARCHIVE" -C .seed ;;
+esac
 chmod +x .seed/teko .seed/teko.exe 2>/dev/null || true
 
 SEED_DIR="$(CDPATH='' cd -- .seed && pwd)"

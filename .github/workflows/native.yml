@@ -1,10 +1,11 @@
 name: Native Build & Test
 
-# chore/reboot is the ACTIVE integration branch (the "new main") — without it here, PRs
-# targeting chore/reboot get no checks at all (issue #54).
+# CI runs on PULL REQUESTS ONLY. Branch protection requires these checks green before a PR
+# can merge, so every commit that reaches main was already 100% green — re-running the full
+# suite on the post-merge push would only duplicate that work and burn pipeline minutes. The
+# release trusts this and builds from a main tag WITHOUT re-validating (see release.yml).
+# chore/reboot stays listed so PRs targeting the integration branch still get checks (#54).
 on:
-  push:
-    branches: [main, master, chore/reboot]
   pull_request:
     branches: [main, master, chore/reboot]
 
@@ -72,11 +73,23 @@ jobs:
           LABEL: ${{ matrix.label }}
         run: ./scripts/ci_provision_teko.sh "$LABEL"
 
+      # The self-build gate stays VM (the DEFAULT — unchanged cost/floors; owner ruling 2026-07-05:
+      # the native gate regresses build time until #168's partitioning, so it is NOT the default).
       - name: Test gate (VM)
         shell: bash
-        run: teko test . --coverage
+        run: teko . -o bin
 
-  # ── RISC-V cross-compile + QEMU (non-blocking) ───────────────────────────────
+      # (#265, opt-in) The native test gate: `teko . -o gen1-native --native-gate` emits the #test
+      # corpus to a binary, runs it (a failed assert → non-zero exit bars this step), and enforces
+      # the FUNCTION coverage floor from the native run's merged marks. This lane exercises the
+      # native codegen paths a `#test` corpus exercises for the FIRST time (cc-compiling constructs
+      # the VM interpreter tolerated) — it caught 3 latent native miscompiles pre-merge. Perf win
+      # (replacing this VM gate as the default) is deferred to #168's partitioning.
+      - name: Native test gate (opt-in — correctness lane)
+        shell: bash
+        run: teko . -o gen1-native --native-gate
+
+  # ── RISC-V cross-compile + QEMU (BLOCKING — gated in the CI gate job) ─────────
   riscv64-qemu:
     needs: changes
     if: needs.changes.outputs.run == 'true'
@@ -90,28 +103,33 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install cross-compilation tools and QEMU
+      - name: Install cross-compiler + QEMU + host clang
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y \
-            cmake ninja-build \
-            gcc-riscv64-linux-gnu \
-            qemu-user qemu-user-static \
-            binfmt-support
+          sudo apt-get install -y gcc-riscv64-linux-gnu qemu-user-static clang
 
-      - name: Configure CMake (RISC-V cross)
+      # riscv has no release binary asset, so it can't download a seed like the other
+      # platforms. But it MUST NOT cmake-build from the frozen C twins — those are frozen
+      # historical code (no-mirroring ruling) and diverge from the live `.tks` (e.g. they
+      # lack the #263 enum-vs-PrimKind fix), so a cmake build tests a STALE compiler and
+      # fails on current sources (LIR's `F32` LType tripped exactly that). Instead: seed
+      # the x86_64 released binary, have it EMIT the CURRENT compiler's C (gen-1), and
+      # cross-compile THAT for riscv — testing the same compiler the other platforms run.
+      - name: Provision teko (x86_64 released seed)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./scripts/ci_provision_teko.sh linux-x86_64
+
+      - name: Emit the current compiler's C (gen-1, gate skipped here)
+        run: teko . -o gen1 --no-verify
+
+      - name: Cross-compile gen-1's teko.c for riscv64 (static)
         run: |
-          cmake -S . -B build \
-            -G "Ninja" \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_C_COMPILER=riscv64-linux-gnu-gcc \
-            -DCMAKE_EXE_LINKER_FLAGS="-static"
+          riscv64-linux-gnu-gcc -std=c2x -w -static -Isrc/runtime -Isrc/assert \
+            gen1/teko.c src/runtime/teko_rt.c src/assert/assert.c -lm -o teko-riscv
 
-      - name: Build teko (RISC-V)
-        run: cmake --build build --config Release --target teko --parallel 4
-
-      - name: Run tests via QEMU user-mode
-        run: qemu-riscv64-static ./build/teko test . --coverage
+      - name: Run the gate under QEMU user-mode
+        run: qemu-riscv64-static ./teko-riscv test . --coverage
 
   # ── differential VM==native harness (issue #54) ──────────────────────────────
   # Cross-runs every examples/regressions/* project through BOTH engines (`teko run`
@@ -184,11 +202,49 @@ jobs:
           TEKO: ./bin/teko
         run: ./scripts/diff_vm_native.sh
 
-  # ── gate: aggregates all build-test + riscv + differential results ────────────
+  # ── release cross-compile smoke: the EXACT zig-cross the release runs, compile-only ──
+  # release.yml is tag-triggered, so its Linux cross-compile went unvalidated in PR CI — a
+  # zig-version/target break (e.g. 0.13.0's incomplete riscv64 glibc, missing stubs-lp64d.h)
+  # only surfaced AFTER merge, on a real tag. This job runs the SAME
+  # scripts/cross_compile_linux.sh in SMOKE mode on every PR: emit teko.c, cross-compile all six
+  # Linux targets, assert each architecture. Cross-compilation is deterministic, so a clean
+  # compile of the (fixpoint) teko.c is the correctness argument — no qemu, no publish. A break
+  # here gates the merge, so a broken release can never reach main.
+  release-cross-smoke:
+    needs: changes
+    if: needs.changes.outputs.run == 'true'
+    name: release cross-compile smoke (zig, no-run)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      ZIG_VERSION: "0.16.0"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install zig (official tarball)
+        run: |
+          set -eu
+          curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" | tar -xJ
+          echo "$PWD/zig-x86_64-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
+
+      - name: Provision x86_64 seed
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./scripts/ci_provision_teko.sh linux-x86_64-glibc
+
+      - name: Emit teko.c (one gen, no gate)
+        run: teko . -o out --no-verify
+
+      - name: Cross-compile all six Linux targets (compile-only, no qemu)
+        run: sh scripts/cross_compile_linux.sh out/teko.c src /tmp/smoke smoke
+
+  # ── gate: aggregates all build-test + riscv + differential + cross-smoke results ──
   gate:
     name: CI gate
     runs-on: ubuntu-latest
-    needs: [changes, build-test, riscv64-qemu, diff-vm-native]
+    needs: [changes, build-test, riscv64-qemu, diff-vm-native, release-cross-smoke]
     if: always()
     permissions: {}
 
@@ -198,12 +254,14 @@ jobs:
           BUILD_RESULT="${{ needs.build-test.result }}"
           RISCV_RESULT="${{ needs.riscv64-qemu.result }}"
           DIFF_RESULT="${{ needs.diff-vm-native.result }}"
+          SMOKE_RESULT="${{ needs.release-cross-smoke.result }}"
           CHANGES="${{ needs.changes.outputs.run }}"
 
           echo "changes.run   = $CHANGES"
           echo "build-test    = $BUILD_RESULT"
           echo "riscv64-qemu  = $RISCV_RESULT"
           echo "diff-vm-native = $DIFF_RESULT"
+          echo "release-cross-smoke = $SMOKE_RESULT"
 
           # If the paths filter said nothing relevant changed, everything skipped → OK
           if [ "$CHANGES" != "true" ]; then
@@ -223,6 +281,21 @@ jobs:
             exit 1
           fi
 
-          # riscv64-qemu is non-blocking (continue-on-error), so any result is fine
+          # riscv64-qemu is BLOCKING (main-integrity law: green means green everywhere).
+          # It seeds from the released x86_64 binary and cross-compiles the current
+          # compiler's emitted C (issue #276), so a failure is a real regression, not
+          # infra noise — a red riscv gates the merge and, downstream, the release.
+          if [ "$RISCV_RESULT" = "failure" ] || [ "$RISCV_RESULT" = "cancelled" ]; then
+            echo "ERROR: riscv64-qemu $RISCV_RESULT"
+            exit 1
+          fi
+
+          # release-cross-smoke must be success — a broken release cross-compile (zig version /
+          # target / runtime portability) gates the merge so it never reaches a real tag.
+          if [ "$SMOKE_RESULT" = "failure" ] || [ "$SMOKE_RESULT" = "cancelled" ]; then
+            echo "ERROR: release-cross-smoke $SMOKE_RESULT"
+            exit 1
+          fi
+
           echo "Gate passed."
           exit 0
