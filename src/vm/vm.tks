@@ -104,9 +104,9 @@ pub type ClassRef = struct { cell: u64 }
 pub type FuncVal = struct { is_lambda: bool; ns: str; name: str; params: []checker::TLambdaParam; body: []checker::TStatement; cap_names: []str; cap_vals: []Value }
 
 pub type Value = variant u8 | u16 | u32 | u64 | u128
-           | i8 | i16 | i32 | i64 | i128
-           | f16 | f32 | f64
-           | bool | byte | str | []Value | StructVal | OptVal | RefVal | FuncVal | ClassRef
+| i8 | i16 | i32 | i64 | i128
+| f16 | f32 | f64
+| bool | byte | str | []Value | StructVal | OptVal | RefVal | FuncVal | ClassRef
 
 // ---------------------------------------------------------------------------
 // CONTROL FLOW. The exits a block can produce — mirrors the C `tk_flow`
@@ -122,10 +122,10 @@ pub type Value = variant u8 | u16 | u32 | u64 | u128
 // (The C uses ONE struct with a `kind` discriminant; here each kind is a variant member,
 // and Normal+VmReturn each carry the optional value just like the C `value` field.)
 // ---------------------------------------------------------------------------
-pub type Normal   = struct { value: Value? }   // W5a — the NORMAL flow's trailing/statement value (null == none)
-pub type VmReturn   = struct { value: Value? }   // null == return with no value (void / bare `return`)
-pub type Break    = struct { label: str }      // break [NAME] — label empty = innermost loop (M.5)
-pub type Continue = struct { label: str }      // continue [NAME] — label empty = innermost loop (M.5)
+pub type Normal = struct { value: Value? }   // W5a — the NORMAL flow's trailing/statement value (null == none)
+pub type VmReturn = struct { value: Value? }   // null == return with no value (void / bare `return`)
+pub type Break = struct { label: str }   // break [NAME] — label empty = innermost loop (M.5)
+pub type Continue = struct { label: str }   // continue [NAME] — label empty = innermost loop (M.5)
 /** pub: teko::repl (DT3) reads a top-level step's flow. */
 pub type Flow = variant Normal | VmReturn | Break | Continue
 
@@ -150,7 +150,7 @@ fn vm_panic_pos(line: u32, col: u32) {
 }
 fn vm_panic_div0_at(line: u32, col: u32) { vm_panic_pos(line, col); teko::panic_div0() }
 fn vm_panic_cast_at(line: u32, col: u32) { vm_panic_pos(line, col); teko::panic_cast() }
-fn vm_panic_oob_at (line: u32, col: u32) { vm_panic_pos(line, col); teko::panic_oob()  }
+fn vm_panic_oob_at(line: u32, col: u32) { vm_panic_pos(line, col); teko::panic_oob() }
 
 // C1.6 — width range bounds (mirror the C `i_min_of`/`i_max_of`/`u_max_of`). The .tks cast
 // guard delegated its range check to the runtime `teko::cast`/`teko::float_to_int`, which take
@@ -180,15 +180,15 @@ fn vm_cast(v: i128, src: checker::PrimKind, dst: checker::PrimKind, line: u32, c
         if uv > (i_max_of(dwidth) to u128) { vm_panic_cast_at(line, col) }   // unsigned src -> signed dst: signed max
         return v
     }
-    if uv > u_max_of(dwidth) { vm_panic_cast_at(line, col) }                 // unsigned src -> unsigned dst: 2^w-1
+    if uv > u_max_of(dwidth) { vm_panic_cast_at(line, col) }   // unsigned src -> unsigned dst: 2^w-1
     v
 }
 
 // vm_float_to_int — positioned float->int truncate (mirrors the C eval_cast FLOAT->INT guard:
 // NaN / ±∞ / out-of-range -> positioned "impossible conversion"). Truncates toward zero.
 fn vm_float_to_int(f: f64, dst: checker::PrimKind, line: u32, col: u32) -> i128 {
-    if f != f { vm_panic_cast_at(line, col) }                                // NaN never converts
-    let t = if f < 0.0 { -teko::floor(-f) } else { teko::floor(f) }          // trunc toward zero
+    if f != f { vm_panic_cast_at(line, col) }   // NaN never converts
+    let t = if f < 0.0 { -teko::floor(-f) } else { teko::floor(f) }   // trunc toward zero
     let dwidth = prim_width(dst)
     if prim_signed(dst) {
         if t < (i_min_of(dwidth) to f64) || t > (i_max_of(dwidth) to f64) { vm_panic_cast_at(line, col) }   // also catches ±∞
@@ -225,7 +225,7 @@ pub type DeferBody = struct { body: []checker::TStatement }
 // fine for a test VM, and behaviourally identical. The store only GROWS (cell_alloc appends) and
 // MUTATES (cell_set), never shrinks/reorders, so a callee that inherits the caller's cells and
 // returns its own can merge back by REPLACEMENT.
-pub type Venv  = struct { slots: []Slot; prog: checker::TProgram; defers: []DeferBody; cells: []Value; di_cache: []DiCell }
+pub type Venv = struct { slots: []Slot; prog: checker::TProgram; defers: []DeferBody; cells: []Value; di_cache: []DiCell }
 
 /** (W10c/MEM-3) One cached DI instance in the VM's threaded registry: the type-id (FNV-1a of the
  *  impl's bare name, via the shared checker::di_type_id) → the ClassRef cell holding the instance. A
@@ -258,18 +258,18 @@ fn read_var(env: Venv, name: str) -> Value {
 // A freshly-defined slot is plain (cell_id= null); only an auto-ref PROMOTION (promote_to_cell)
 // rebinds a slot to a cell. `cells` threads through unchanged.
 pub fn define(env: Venv, name: str, val: Value) -> Venv {
-    Venv { slots= teko::list::push(env.slots, Slot { name= name; val= val; cell_id= null }); prog= env.prog; defers= env.defers; cells= env.cells; di_cache= env.di_cache }
+    Venv { slots = teko::list::push(env.slots, Slot { name = name; val = val; cell_id = null }); prog = env.prog; defers = env.defers; cells = env.cells; di_cache = env.di_cache }
 }
 
 // (C7.18) push_defer — register a deferred body onto the env's defer stack.
 fn push_defer(env: Venv, body: []checker::TStatement) -> Venv {
-    Venv { slots= env.slots; prog= env.prog; defers= teko::list::push(env.defers, DeferBody { body= body }); cells= env.cells; di_cache= env.di_cache }
+    Venv { slots = env.slots; prog = env.prog; defers = teko::list::push(env.defers, DeferBody { body = body }); cells = env.cells; di_cache = env.di_cache }
 }
 
 // (W9.3) with_defers — replace an env's defer stack (used to pop a scope's defers back to its base
 // after that scope's defers have fired). Mirrors with_cells.
 fn with_defers(env: Venv, defers: []DeferBody) -> Venv {
-    Venv { slots= env.slots; prog= env.prog; defers= defers; cells= env.cells; di_cache= env.di_cache }
+    Venv { slots = env.slots; prog = env.prog; defers = defers; cells = env.cells; di_cache = env.di_cache }
 }
 
 // (W9.3) defers_up_to — the first `base` deferred bodies of `ds` (rebuilt, since the list has no
@@ -312,7 +312,7 @@ fn drain_defers_to(env: Venv, base: u64) -> Venv {
     cell store is program-wide, not per-frame); the caller passes its own cells in. pub:
     teko::repl (DT3) opens the session's root env the same way `run` does. */
 pub fn fresh_env(prog: checker::TProgram, cells: []Value) -> Venv {
-    Venv { slots= teko::list::empty(); prog= prog; defers= teko::list::empty(); cells= cells; di_cache= teko::list::empty() }
+    Venv { slots = teko::list::empty(); prog = prog; defers = teko::list::empty(); cells = cells; di_cache = teko::list::empty() }
 }
 
 // ---------------------------------------------------------------------------
@@ -323,7 +323,7 @@ pub fn fresh_env(prog: checker::TProgram, cells: []Value) -> Venv {
 // ---------------------------------------------------------------------------
 type CellAlloc = struct { cells: []Value; id: u64 }
 fn cell_alloc(cells: []Value, v: Value) -> CellAlloc {
-    CellAlloc { cells= teko::list::push(cells, v); id= cells.len }
+    CellAlloc { cells = teko::list::push(cells, v); id = cells.len }
 }
 fn cell_get(cells: []Value, id: u64) -> Value {
     if id >= cells.len { panic("vm: cell index out of range (internal: Ref<T> aliasing invariant break)") }
@@ -336,7 +336,7 @@ fn cell_set(cells: []Value, id: u64, v: Value) -> []Value {
     loop {
         if j >= cells.len { break }
         if j == id { rebuilt = teko::list::push(rebuilt, v) }
-        else       { rebuilt = teko::list::push(rebuilt, cells[j]) }
+        else { rebuilt = teko::list::push(rebuilt, cells[j]) }
         j++
     }
     rebuilt
@@ -360,8 +360,8 @@ fn promote_to_cell(env: Venv, name: str) -> Promotion {
     if !found { panic("vm: auto-ref of an unbound variable (internal: checker should reject)") }
     let slot = env.slots[idx]
     match slot.cell_id {
-        u64 as existing => return Promotion { env= env; id= existing }   // already aliased — reuse the cell
-        null            => {}
+        u64 as existing => return Promotion { env = env; id = existing }   // already aliased — reuse the cell
+        null => { }
     }
     let alloc = cell_alloc(env.cells, slot.val)
     // rebuild the slots, rebinding `idx` to the new cell (its value now lives in cells[alloc.id]).
@@ -369,18 +369,18 @@ fn promote_to_cell(env: Venv, name: str) -> Promotion {
     mut j = 0
     loop {
         if j >= env.slots.len { break }
-        if j == idx { rebuilt = teko::list::push(rebuilt, Slot { name= name; val= slot.val; cell_id= alloc.id }) }
-        else        { rebuilt = teko::list::push(rebuilt, env.slots[j]) }
+        if j == idx { rebuilt = teko::list::push(rebuilt, Slot { name = name; val = slot.val; cell_id = alloc.id }) }
+        else { rebuilt = teko::list::push(rebuilt, env.slots[j]) }
         j++
     }
-    Promotion { env= Venv { slots= rebuilt; prog= env.prog; defers= env.defers; cells= alloc.cells; di_cache= env.di_cache }; id= alloc.id }
+    Promotion { env = Venv { slots = rebuilt; prog = env.prog; defers = env.defers; cells = alloc.cells; di_cache = env.di_cache }; id = alloc.id }
 }
 
 // with_cells — replace an env's cell store (used to MERGE a callee's final cells back into the
 // caller after a call: the callee inherited the caller's cells and only grew/mutated them, so the
 // callee's final store is a superset-with-mutations and replaces the caller's wholesale).
 fn with_cells(env: Venv, cells: []Value) -> Venv {
-    Venv { slots= env.slots; prog= env.prog; defers= env.defers; cells= cells; di_cache= env.di_cache }
+    Venv { slots = env.slots; prog = env.prog; defers = env.defers; cells = cells; di_cache = env.di_cache }
 }
 
 // ---------------------------------------------------------------------------
@@ -395,22 +395,22 @@ fn prim_float(k: checker::PrimKind) -> bool {
 }
 pub fn prim_width(k: checker::PrimKind) -> u8 {
     match k {
-        U8   | I8         => 8
-        U16  | I16  | F16 => 16
-        U32  | I32  | F32 => 32
-        U64  | I64  | F64 => 64
-        U128 | I128       => 128
-        Bool              => 1
+        U8 | I8 => 8
+        U16 | I16 | F16 => 16
+        U32 | I32 | F32 => 32
+        U64 | I64 | F64 => 64
+        U128 | I128 => 128
+        Bool => 1
     }
 }
 // A cast src->dst may LOSE data (needs a runtime guard) when some source value falls
 // outside the dest range. VERBATIM from codegen's cast_may_lose.
 pub fn cast_may_lose(src: checker::PrimKind, dst: checker::PrimKind) -> bool {
     let ss = prim_signed(src); let ds = prim_signed(dst)
-    let sw = prim_width(src);  let dw = prim_width(dst)
-    if ss == ds  { return sw > dw }      // same signedness: only true narrowing loses
-    if !ss && ds { return sw >= dw }     // u->i: loses one bit of magnitude at equal width
-    true                                 // i->u: negatives never fit
+    let sw = prim_width(src); let dw = prim_width(dst)
+    if ss == ds { return sw > dw }   // same signedness: only true narrowing loses
+    if !ss && ds { return sw >= dw }   // u->i: loses one bit of magnitude at equal width
+    true   // i->u: negatives never fit
 }
 
 // BuiltinRes — (issue #106) `try_builtin`'s SUCCESS carrier: unlike the value-producing
@@ -450,15 +450,15 @@ fn try_builtin(callee: parser::Path, args: []checker::TExpr, env: Venv) -> Built
     if last == "print" || last == "println" || last == "write" {
         let ae = eval_expr(args[0], env)
         match ae.value {
-            str as s => { if last == "println" { teko::io::println(s) } else { teko::io::print(s) }; return BuiltinRes { ran= true; env= ae.env } }
-            _        => return error { message = "vm: print/println/write on a non-str value not yet supported" }
+            str as s => { if last == "println" { teko::io::println(s) } else { teko::io::print(s) }; return BuiltinRes { ran = true; env = ae.env } }
+            _ => return error { message = "vm: print/println/write on a non-str value not yet supported" }
         }
     }
     if last == "ewrite" || last == "eprint" || last == "eprintln" {
         let ae = eval_expr(args[0], env)
         match ae.value {
-            str as s => { if last == "eprintln" { teko::io::eprintln(s) } else { teko::io::ewrite(s) }; return BuiltinRes { ran= true; env= ae.env } }
-            _        => return error { message = "vm: ewrite/eprint/eprintln on a non-str value not yet supported" }
+            str as s => { if last == "eprintln" { teko::io::eprintln(s) } else { teko::io::ewrite(s) }; return BuiltinRes { ran = true; env = ae.env } }
+            _ => return error { message = "vm: ewrite/eprint/eprintln on a non-str value not yet supported" }
         }
     }
     // (mem::free) teko::mem::free(x) — memory reclaim isn't observable in the VM (host-managed), but
@@ -468,10 +468,10 @@ fn try_builtin(callee: parser::Path, args: []checker::TExpr, env: Venv) -> Built
     if last == "free" && callee.segments.len >= 2 && callee.segments[callee.segments.len - 2].name == "mem" {
         match args[0].kind {
             checker::TVar as v => match args[0].type {
-                checker::Slice => { let empty: []Value = teko::list::empty(); return BuiltinRes { ran= true; env= define(env, v.name, empty) } }
-                _              => return BuiltinRes { ran= true; env= env }
+                checker::Slice => { let empty: []Value = teko::list::empty(); return BuiltinRes { ran = true; env = define(env, v.name, empty) } }
+                _ => return BuiltinRes { ran = true; env = env }
             }
-            _ => return BuiltinRes { ran= true; env= env }
+            _ => return BuiltinRes { ran = true; env = env }
         }
     }
 
@@ -498,7 +498,7 @@ fn try_builtin(callee: parser::Path, args: []checker::TExpr, env: Venv) -> Built
         let m = raw & 0xFFFFFFFF
         let code32 = if m >= 0x80000000 { (m - 0x100000000) to i32 } else { m to i32 }
         exit(code32)
-        return BuiltinRes { ran= true; env= ae.env }
+        return BuiltinRes { ran = true; env = ae.env }
     }
     if last == "panic" {
         // Mirror native codegen's frontier EXACTLY (codegen.c:1865 only wires the `str` arm;
@@ -507,23 +507,23 @@ fn try_builtin(callee: parser::Path, args: []checker::TExpr, env: Venv) -> Built
         // an `error` arg falls through to the honest stop so neither engine runs it.
         let ae = eval_expr(args[0], env)
         match ae.value {
-            str as s => { panic(s); return BuiltinRes { ran= true; env= ae.env } }
-            _        => return error { message = "vm: panic(error) not yet supported (native codegen cannot compile it either — a separate, pre-existing gap; use panic(str))" }
+            str as s => { panic(s); return BuiltinRes { ran = true; env = ae.env } }
+            _ => return error { message = "vm: panic(error) not yet supported (native codegen cannot compile it either — a separate, pre-existing gap; use panic(str))" }
         }
     }
 
     let assert_ns = callee.segments.len >= 2 && callee.segments[0].name == "teko" &&
-                 callee.segments[callee.segments.len - 2].name == "assert"
+    callee.segments[callee.segments.len - 2].name == "assert"
     if assert_ns {
-        if last == "is_true"  { let ae = eval_expr(args[0], env); teko::assert::is_true(as_bool(ae.value));  return BuiltinRes { ran= true; env= ae.env } }
-        if last == "is_false" { let ae = eval_expr(args[0], env); teko::assert::is_false(as_bool(ae.value)); return BuiltinRes { ran= true; env= ae.env } }
+        if last == "is_true" { let ae = eval_expr(args[0], env); teko::assert::is_true(as_bool(ae.value)); return BuiltinRes { ran = true; env = ae.env } }
+        if last == "is_false" { let ae = eval_expr(args[0], env); teko::assert::is_false(as_bool(ae.value)); return BuiltinRes { ran = true; env = ae.env } }
         if last == "str_contains" {
             // (issue #106) thread env across BOTH args in sequence — arg[1] must see any
             // cell-store growth arg[0]'s evaluation produced (mirrors bind_call_args' loop).
             let ae0 = eval_expr(args[0], env)
             let ae1 = eval_expr(args[1], ae0.env)
             teko::assert::str_contains(as_str(ae0.value), as_str(ae1.value))
-            return BuiltinRes { ran= true; env= ae1.env }
+            return BuiltinRes { ran = true; env = ae1.env }
         }
         // equals/is_ok/... need generics — DEFERRED (matches the seed). Honest stop (M.3).
         panic("vm: this teko::assert builtin not yet supported (needs generics)")
@@ -543,11 +543,11 @@ fn try_builtin(callee: parser::Path, args: []checker::TExpr, env: Venv) -> Built
 fn try_list_builtin(callee: parser::Path, args: []checker::TExpr, env: Venv) -> Value? {
     let last = callee.segments[callee.segments.len - 1].name
     let list_ns = callee.segments.len >= 2 && callee.segments[0].name == "teko" &&
-               callee.segments[callee.segments.len - 2].name == "list"
+    callee.segments[callee.segments.len - 2].name == "list"
     // (#148 R3) teko::mem::push_fo — the VM appends exactly like teko::list::push (free-old is a
     // NATIVE allocation strategy; semantics are identical for the linear chains the decree covers).
     let mem_pushfo = callee.segments.len >= 2 && callee.segments[0].name == "teko" &&
-               callee.segments[callee.segments.len - 2].name == "mem" && last == "push_fo"
+    callee.segments[callee.segments.len - 2].name == "mem" && last == "push_fo"
     if !list_ns && !mem_pushfo { return null }
     if last == "empty" {
         let xs: []Value = teko::list::empty()
@@ -558,7 +558,7 @@ fn try_list_builtin(callee: parser::Path, args: []checker::TExpr, env: Venv) -> 
         let item = ev_val(args[1], env)
         match base {
             []Value as xs => return teko::list::push(xs, item)
-            _             => panic("vm: teko::list::push on a non-list value (internal: checker should reject)")
+            _ => panic("vm: teko::list::push on a non-list value (internal: checker should reject)")
         }
     }
     // other teko::list::* (len/get/…) are deferred — only empty/push in the fixed+copy seed.
@@ -582,7 +582,7 @@ fn try_err_builtin(callee: parser::Path, args: []checker::TExpr, env: Venv) -> V
                 let e1 = err_set(e, "line", as_int(ev_val(args[1], env)) to u32)
                 match e1 {
                     StructVal as e1s => return err_set(e1s, "col", as_int(ev_val(args[2], env)) to u32)
-                    _                => panic("vm: err_loc internal (err_set must yield an error struct)")
+                    _ => panic("vm: err_loc internal (err_set must yield an error struct)")
                 }
             }
             _ => panic("vm: err_loc on a non-error value (internal: checker should reject)")
@@ -594,7 +594,7 @@ fn try_err_builtin(callee: parser::Path, args: []checker::TExpr, env: Venv) -> V
                 let e1 = err_set(e, "expected", as_str(ev_val(args[1], env)))
                 match e1 {
                     StructVal as e1s => return err_set(e1s, "actual", as_str(ev_val(args[2], env)))
-                    _                => panic("vm: err_typed internal (err_set must yield an error struct)")
+                    _ => panic("vm: err_typed internal (err_set must yield an error struct)")
                 }
             }
             _ => panic("vm: err_typed on a non-error value (internal: checker should reject)")
@@ -667,13 +667,13 @@ fn try_str_builtin(callee: parser::Path, args: []checker::TExpr, env: Venv) -> V
         panic("vm: one_byte on a non-byte value (internal: checker should reject)")
     }
     // str_concat3 REMOVED (2026-07-01) — superseded by the variadic "concat" below.
-    if last == "parse"        { return teko::float::parse(as_str(ev_val(args[0], env))) }
-    if last == "ftoa"         { return teko::ftoa(as_float(ev_val(args[0], env))) }
-    if last == "f64_bits"     { return teko::f64_bits(as_float(ev_val(args[0], env))) }
+    if last == "parse" { return teko::float::parse(as_str(ev_val(args[0], env))) }
+    if last == "ftoa" { return teko::ftoa(as_float(ev_val(args[0], env))) }
+    if last == "f64_bits" { return teko::f64_bits(as_float(ev_val(args[0], env))) }
     if last == "f64_from_bits" { return teko::f64_from_bits(as_int(ev_val(args[0], env)) to u64) }
     // str STDLIB surface — the SAME runtime functions native codegen lowers to (tk_str_*), so the
     // VM matches the compiled output. (str, u64, …) args; a u64/bool result widens into Value.
-    if last == "str_concat"  { return teko::str_concat(as_str(ev_val(args[0], env)), as_str(ev_val(args[1], env))) }
+    if last == "str_concat" { return teko::str_concat(as_str(ev_val(args[0], env)), as_str(ev_val(args[1], env))) }
     // "concat" (== the LEGISLATED string::concat, TEKO_LEGISLATION.md "`+` never concatenates")
     // is the ONE public variadic form (2026-07-01, `concat3` removed). After the checker's params
     // call-site desugar, the call always arrives here with EXACTLY ONE arg — a []str, whether
@@ -691,7 +691,7 @@ fn try_str_builtin(callee: parser::Path, args: []checker::TExpr, env: Venv) -> V
     }
     // (#148) teko::mem::peak_rss() — the VM reports the HOST process's peak (native lowering when
     // this engine is compiled; one recursion step when interpreted).
-    if last == "peak_rss"    { return (teko::mem::peak_rss()) to i64 }
+    if last == "peak_rss" { return (teko::mem::peak_rss()) to i64 }
     // (#148 R2) teko::mem::append_fo(dst, src) — append src's bytes onto the []byte builder.
     // (Free-old is a NATIVE footprint concern; the VM just produces the identical value.)
     if last == "append_fo" {
@@ -711,10 +711,10 @@ fn try_str_builtin(callee: parser::Path, args: []checker::TExpr, env: Venv) -> V
             _ => panic("vm: append_fo on a non-list dst (internal: checker should reject)")
         }
     }
-    if last == "slice"       { return teko::slice(as_str(ev_val(args[0], env)), as_int(ev_val(args[1], env)) to u64, as_int(ev_val(args[2], env)) to u64) }
-    if last == "slice_to"    { return teko::slice_to(as_str(ev_val(args[0], env)), as_int(ev_val(args[1], env)) to u64) }
-    if last == "slice_from"  { return teko::slice_from(as_str(ev_val(args[0], env)), as_int(ev_val(args[1], env)) to u64) }
-    if last == "len"         { return teko::len(as_str(ev_val(args[0], env))) }
+    if last == "slice" { return teko::slice(as_str(ev_val(args[0], env)), as_int(ev_val(args[1], env)) to u64, as_int(ev_val(args[2], env)) to u64) }
+    if last == "slice_to" { return teko::slice_to(as_str(ev_val(args[0], env)), as_int(ev_val(args[1], env)) to u64) }
+    if last == "slice_from" { return teko::slice_from(as_str(ev_val(args[0], env)), as_int(ev_val(args[1], env)) to u64) }
+    if last == "len" { return teko::len(as_str(ev_val(args[0], env))) }
     // len_chars — (str) -> i64. Count UTF-8 codepoints. Computed inline (avoids a recursive
     // builtin call; teko::len_chars is registered in scope.c but calling it here is circular
     // in the .tks engine). Uses the same lead-byte heuristic as tk_str_len_chars.
@@ -747,10 +747,10 @@ fn try_str_builtin(callee: parser::Path, args: []checker::TExpr, env: Venv) -> V
             // determine lead-byte width
             let b0 = s[ci] to u64
             let w: u64 = if b0 < 0x80 to u64 { 1 to u64 }
-                         else if b0 < 0xC0 to u64 { 1 to u64 }   // continuation — degrade
-                         else if b0 < 0xE0 to u64 { 2 to u64 }
-                         else if b0 < 0xF0 to u64 { 3 to u64 }
-                         else { 4 to u64 }
+            else if b0 < 0xC0 to u64 { 1 to u64 }   // continuation — degrade
+            else if b0 < 0xE0 to u64 { 2 to u64 }
+            else if b0 < 0xF0 to u64 { 3 to u64 }
+            else { 4 to u64 }
             let end = if ci + w > slen { slen } else { ci + w }
             let cp_str: str = teko::slice(s, ci, end)
             char_list = teko::list::push(char_list, cp_str)
@@ -773,10 +773,10 @@ fn try_str_builtin(callee: parser::Path, args: []checker::TExpr, env: Venv) -> V
             if pos >= slen { break }
             let b0 = s[pos] to u64
             let w: u64 = if b0 < 0x80 to u64 { 1 to u64 }
-                         else if b0 < 0xC0 to u64 { 1 to u64 }
-                         else if b0 < 0xE0 to u64 { 2 to u64 }
-                         else if b0 < 0xF0 to u64 { 3 to u64 }
-                         else { 4 to u64 }
+            else if b0 < 0xC0 to u64 { 1 to u64 }
+            else if b0 < 0xE0 to u64 { 2 to u64 }
+            else if b0 < 0xF0 to u64 { 3 to u64 }
+            else { 4 to u64 }
             let end = if pos + w > slen { slen } else { pos + w }
             if ci == idx { found = teko::slice(s, pos, end); ok = true; break }
             ci = ci + 1
@@ -790,24 +790,24 @@ fn try_str_builtin(callee: parser::Path, args: []checker::TExpr, env: Venv) -> V
     if last == "str_slice_chars" {
         let s = as_str(ev_val(args[0], env))
         let from = as_int(ev_val(args[1], env)) to u64
-        let to   = as_int(ev_val(args[2], env)) to u64
+        let to = as_int(ev_val(args[2], env)) to u64
         let slen = teko::len(s)
         mut pos: u64 = 0
         mut ci: u64 = 0
         mut byte_from: u64 = 0
         mut byte_to: u64 = 0
         mut found_from = false
-        mut found_to   = false
+        mut found_to = false
         loop {
             if ci == from { byte_from = pos; found_from = true }
-            if ci == to   { byte_to   = pos; found_to   = true; break }
+            if ci == to { byte_to = pos; found_to = true; break }
             if pos >= slen { break }
             let b0 = s[pos] to u64
             let w: u64 = if b0 < 0x80 to u64 { 1 to u64 }
-                         else if b0 < 0xC0 to u64 { 1 to u64 }
-                         else if b0 < 0xE0 to u64 { 2 to u64 }
-                         else if b0 < 0xF0 to u64 { 3 to u64 }
-                         else { 4 to u64 }
+            else if b0 < 0xC0 to u64 { 1 to u64 }
+            else if b0 < 0xE0 to u64 { 2 to u64 }
+            else if b0 < 0xF0 to u64 { 3 to u64 }
+            else { 4 to u64 }
             let end = if pos + w > slen { slen } else { pos + w }
             ci = ci + 1
             pos = end
@@ -822,7 +822,7 @@ fn try_str_builtin(callee: parser::Path, args: []checker::TExpr, env: Venv) -> V
     // function named is_alpha), return null so the caller falls through to user fn resolution.
     if last == "is_alpha" {
         let arg0 = ev_val(args[0], env)
-        match arg0 { str => { } ; _ => return null }   // non-str arg → fall through to user fn
+        match arg0 { str => { }; _ => return null }   // non-str arg → fall through to user fn
         let s = as_str(arg0)
         let slen = teko::len(s)
         if slen == 0 to u64 { return false }
@@ -833,7 +833,7 @@ fn try_str_builtin(callee: parser::Path, args: []checker::TExpr, env: Venv) -> V
     // is_digit — (char) -> bool. ASCII '0'–'9' only; multibyte → false. Same guard.
     if last == "is_digit" {
         let arg0 = ev_val(args[0], env)
-        match arg0 { str => { } ; _ => return null }   // non-str arg → fall through to user fn
+        match arg0 { str => { }; _ => return null }   // non-str arg → fall through to user fn
         let s = as_str(arg0)
         let slen = teko::len(s)
         if slen == 0 to u64 { return false }
@@ -843,7 +843,7 @@ fn try_str_builtin(callee: parser::Path, args: []checker::TExpr, env: Venv) -> V
     // is_space — (char) -> bool. ASCII whitespace only; multibyte → false. Same guard.
     if last == "is_space" {
         let arg0 = ev_val(args[0], env)
-        match arg0 { str => { } ; _ => return null }   // non-str arg → fall through to user fn
+        match arg0 { str => { }; _ => return null }   // non-str arg → fall through to user fn
         let s = as_str(arg0)
         let slen = teko::len(s)
         if slen == 0 to u64 { return false }
@@ -853,7 +853,7 @@ fn try_str_builtin(callee: parser::Path, args: []checker::TExpr, env: Venv) -> V
     // to_lower — (char) -> char. ASCII 'A'–'Z' → 'a'–'z'; non-ASCII unchanged. Same guard.
     if last == "to_lower" {
         let arg0 = ev_val(args[0], env)
-        match arg0 { str => { } ; _ => return null }   // non-str arg → fall through to user fn
+        match arg0 { str => { }; _ => return null }   // non-str arg → fall through to user fn
         let s = as_str(arg0)
         let slen = teko::len(s)
         if slen == 0 to u64 { return s }
@@ -864,7 +864,7 @@ fn try_str_builtin(callee: parser::Path, args: []checker::TExpr, env: Venv) -> V
     // to_upper — (char) -> char. ASCII 'a'–'z' → 'A'–'Z'; non-ASCII unchanged. Same guard.
     if last == "to_upper" {
         let arg0 = ev_val(args[0], env)
-        match arg0 { str => { } ; _ => return null }   // non-str arg → fall through to user fn
+        match arg0 { str => { }; _ => return null }   // non-str arg → fall through to user fn
         let s = as_str(arg0)
         let slen = teko::len(s)
         if slen == 0 to u64 { return s }
@@ -872,8 +872,8 @@ fn try_str_builtin(callee: parser::Path, args: []checker::TExpr, env: Venv) -> V
         if b >= 0x61 to u64 && b <= 0x7A to u64 { return teko::one_byte((b - 0x20 to u64) to byte) }
         return s
     }
-    if last == "ends_with"   { return teko::ends_with(as_str(ev_val(args[0], env)), as_str(ev_val(args[1], env))) }
-    if last == "contains"    { return teko::contains(as_str(ev_val(args[0], env)), as_str(ev_val(args[1], env))) }
+    if last == "ends_with" { return teko::ends_with(as_str(ev_val(args[0], env)), as_str(ev_val(args[1], env))) }
+    if last == "contains" { return teko::contains(as_str(ev_val(args[0], env)), as_str(ev_val(args[1], env))) }
     // str_* prefixed aliases — teko::runtime::str_* forms (last segment = "str_eq", "str_len", etc.).
     // Must be builtins so the self-hosted VM matches vm.c parity (SUPREME RULE).
     if last == "str_eq" {
@@ -881,14 +881,14 @@ fn try_str_builtin(callee: parser::Path, args: []checker::TExpr, env: Venv) -> V
         let b = as_str(ev_val(args[1], env))
         return a == b
     }
-    if last == "str_len"       { return teko::len(as_str(ev_val(args[0], env))) }
-    if last == "str_slice"     { return teko::slice(as_str(ev_val(args[0], env)), as_int(ev_val(args[1], env)) to u64, as_int(ev_val(args[2], env)) to u64) }
-    if last == "str_slice_to"  { return teko::slice_to(as_str(ev_val(args[0], env)), as_int(ev_val(args[1], env)) to u64) }
+    if last == "str_len" { return teko::len(as_str(ev_val(args[0], env))) }
+    if last == "str_slice" { return teko::slice(as_str(ev_val(args[0], env)), as_int(ev_val(args[1], env)) to u64, as_int(ev_val(args[2], env)) to u64) }
+    if last == "str_slice_to" { return teko::slice_to(as_str(ev_val(args[0], env)), as_int(ev_val(args[1], env)) to u64) }
     if last == "str_slice_from" { return teko::slice_from(as_str(ev_val(args[0], env)), as_int(ev_val(args[1], env)) to u64) }
     if last == "str_ends_with" { return teko::ends_with(as_str(ev_val(args[0], env)), as_str(ev_val(args[1], env))) }
-    if last == "str_contains"  { return teko::contains(as_str(ev_val(args[0], env)), as_str(ev_val(args[1], env))) }
-    if last == "i64_to_str"  { return teko::i64_to_str(as_int(ev_val(args[0], env)) to i64) }
-    if last == "u64_to_str"  { return teko::u64_to_str(as_int(ev_val(args[0], env)) to u64) }
+    if last == "str_contains" { return teko::contains(as_str(ev_val(args[0], env)), as_str(ev_val(args[1], env))) }
+    if last == "i64_to_str" { return teko::i64_to_str(as_int(ev_val(args[0], env)) to i64) }
+    if last == "u64_to_str" { return teko::u64_to_str(as_int(ev_val(args[0], env)) to u64) }
     null   // not a str builtin — fall through to user-fn resolution
 }
 
@@ -925,7 +925,7 @@ fn try_fs_builtin(callee: parser::Path, args: []checker::TExpr, env: Venv) -> Va
         }
     }
     let stdin_result = try_stdin_builtin(last)
-    match stdin_result { Value as v => return v; null => {} }
+    match stdin_result { Value as v => return v; null => { } }
     if last == "list_dir" {
         let path = as_str(ev_val(args[0], env))
         match teko::fs::list_dir(path) {
@@ -1029,7 +1029,7 @@ fn err_set(base: StructVal, field: str, val: Value) -> Value {
     mut vals: []Value = teko::list::empty()
     mut present = false
     mut i = 0
-    loop {                                  // copy the existing fields (overwriting the target)
+    loop {   // copy the existing fields (overwriting the target)
         if i >= base.field_names.len { break }
         names = teko::list::push(names, base.field_names[i])
         if base.field_names[i] == field {
@@ -1040,7 +1040,7 @@ fn err_set(base: StructVal, field: str, val: Value) -> Value {
         }
         i++
     }
-    if !present {                           // append the new field
+    if !present {   // append the new field
         names = teko::list::push(names, field)
         vals = teko::list::push(vals, val)
     }
@@ -1063,8 +1063,8 @@ fn err_field(e: StructVal, field: str) -> Value {
         i++
     }
     if field == "line" || field == "col" { return 0 to u32 }   // unset numeric adornment → 0:u32
-    if err_field_is_str(field) { return "" }                    // unset str adornment → empty str
-    ""                                                          // any other field on an error → empty str (honest)
+    if err_field_is_str(field) { return "" }   // unset str adornment → empty str
+    ""   // any other field on an error → empty str (honest)
 }
 
 // vm_struct_field_type — the declared TypeExpr of field `fname` in struct `sname`, looked up in
@@ -1129,8 +1129,8 @@ fn vm_param_coerce_type(ann: parser::TypeExpr) -> checker::Type {
         parser::SliceType as st => {
             let elt = vm_param_coerce_type(st.element)
             match elt {
-                checker::Void => checker::Void { }                 // []T with no element wrap → no-op
-                _             => checker::Slice { element = elt }
+                checker::Void => checker::Void { }   // []T with no element wrap → no-op
+                _ => checker::Slice { element = elt }
             }
         }
         _ => checker::Void { }
@@ -1146,7 +1146,7 @@ fn vm_param_coerce_type(ann: parser::TypeExpr) -> checker::Type {
 // declared-field table; its fields ride as stored (E2 adornments are read with defaults, never ??).
 fn eval_struct_init(si: checker::TStructInit, ty: checker::Type, env: Venv) -> EvalRes {
     let tn = match ty { Named as n => n.name; Error => "error"; _ => "" }
-    mut cur = env                       // (MEM Step 4) thread the env across each field-value eval
+    mut cur = env   // (MEM Step 4) thread the env across each field-value eval
     mut names: []str = teko::list::empty()
     mut vals: []Value = teko::list::empty()
     mut i = 0
@@ -1172,11 +1172,11 @@ fn eval_struct_init(si: checker::TStructInit, ty: checker::Type, env: Venv) -> E
     match checker::find_class_body(tn, table) {
         parser::ClassBody => {
             let alloc = cell_alloc(cur.cells, sv)
-            return EvalRes { value= ClassRef { cell= alloc.id }; env= with_cells(cur, alloc.cells) }
+            return EvalRes { value = ClassRef { cell = alloc.id }; env = with_cells(cur, alloc.cells) }
         }
-        error => {}
+        error => { }
     }
-    EvalRes { value= sv; env= cur }
+    EvalRes { value = sv; env = cur }
 }
 
 // W4b — read field `fa.field` from a struct value (the checker guarantees it exists).
@@ -1190,7 +1190,7 @@ fn eval_field_access(fa: checker::TFieldAccess, env: Venv) -> EvalRes {
         // RefVal (a cell index); `.value` reads the aliased storage (cell_get). The checker (typer)
         // restricts a Reference receiver to ONLY the `.value` field, so any other field is impossible.
         RefVal as rv => {
-            if fa.field == "value" { return EvalRes { value= cell_get(renv.cells, rv.cell); env= renv } }
+            if fa.field == "value" { return EvalRes { value = cell_get(renv.cells, rv.cell); env = renv } }
             panic("vm: a reference (`Ref<T>`) exposes only `.value` (internal: checker should reject)")
         }
         // (W10b.CLASS residual — VM reference semantics) a class receiver is a ClassRef (a cell
@@ -1202,7 +1202,7 @@ fn eval_field_access(fa: checker::TFieldAccess, env: Venv) -> EvalRes {
                     mut i = 0
                     loop {
                         if i >= s.field_names.len { break }
-                        if s.field_names[i] == fa.field { return EvalRes { value= s.field_vals[i]; env= renv } }
+                        if s.field_names[i] == fa.field { return EvalRes { value = s.field_vals[i]; env = renv } }
                         i++
                     }
                     panic("vm: field not found in class instance (internal: the checker guarantees the field)")
@@ -1211,22 +1211,22 @@ fn eval_field_access(fa: checker::TFieldAccess, env: Venv) -> EvalRes {
             }
         }
         str as s => {
-            if fa.field == "len" { return EvalRes { value= s.len to u64; env= renv } }
+            if fa.field == "len" { return EvalRes { value = s.len to u64; env = renv } }
             panic("vm: only `.len` is defined on a str (internal: checker should reject)")
         }
         []Value as xs => {
-            if fa.field == "len" { return EvalRes { value= xs.len to u64; env= renv } }
+            if fa.field == "len" { return EvalRes { value = xs.len to u64; env = renv } }
             panic("vm: field access on a slice value (internal: checker should reject)")
         }
         StructVal as s => {
             // E2 — an ERROR value's adornment field (message/file/line/col/expected/actual):
             // a present field rides as stored; an UNSET adornment reads its default (empty str /
             // 0:u32) rather than an honest stop, so `e.line` on a message-only error is 0 (C1.3).
-            if s.type_name == "error" { return EvalRes { value= err_field(s, fa.field); env= renv } }
+            if s.type_name == "error" { return EvalRes { value = err_field(s, fa.field); env = renv } }
             mut i = 0
             loop {
                 if i >= s.field_names.len { break }
-                if s.field_names[i] == fa.field { return EvalRes { value= s.field_vals[i]; env= renv } }
+                if s.field_names[i] == fa.field { return EvalRes { value = s.field_vals[i]; env = renv } }
                 i++
             }
             panic("vm: field not found in struct value (internal: the checker guarantees the field)")
@@ -1248,13 +1248,13 @@ fn eval_index(ix: checker::TIndex, line: u32, col: u32, env: Venv) -> EvalRes {
     match re.value {
         str as s => {
             if i >= s.len { vm_panic_oob_at(line, col) }   // C1.6 — positioned at the subscript node
-            EvalRes { value= s[i] to byte; env= cur }
+            EvalRes { value = s[i] to byte; env = cur }
         }
         []Value as xs => {
             if i >= xs.len { vm_panic_oob_at(line, col) }   // C1.6 — positioned at the subscript node
-            EvalRes { value= xs[i]; env= cur }
+            EvalRes { value = xs[i]; env = cur }
         }
-        _            => panic("vm: subscript on a non-indexable value (internal: checker should reject)")
+        _ => panic("vm: subscript on a non-indexable value (internal: checker should reject)")
     }
 }
 
@@ -1265,17 +1265,17 @@ fn eval_index(ix: checker::TIndex, line: u32, col: u32, env: Venv) -> EvalRes {
 // (pieces.len == holes.len + 1). The checker restricted hole types to str/integer.
 fn eval_interp_hole_no_spec(h: Value) -> str {
     match h {
-        str as s   => s
-        bool as b  => if b { "true" } else { "false" }
-        _          => if val_is_float(h) { teko::ftoa(as_float(h)) }
-                      else if int_sign_of(h) { teko::i64_to_str(as_int(h) to i64) }
-                      else { teko::u64_to_str(as_int(h) to u64) }
+        str as s => s
+        bool as b => if b { "true" } else { "false" }
+        _ => if val_is_float(h) { teko::ftoa(as_float(h)) }
+        else if int_sign_of(h) { teko::i64_to_str(as_int(h) to i64) }
+        else { teko::u64_to_str(as_int(h) to u64) }
     }
 }
 
 fn eval_interp_static_spec(h: Value, spec: str) -> str {
     // lowercase first byte to normalize 'F'→'f' (ASCII: 0x20 = lowercase flag for A-Z)
-    let fc0 = if spec.len > 0 { spec[0] } else { 102 to byte }  // 102 = 'f'
+    let fc0 = if spec.len > 0 { spec[0] } else { 102 to byte }   // 102 = 'f'
     let fc_low = if fc0 >= 65 && fc0 <= 90 { (fc0 to u64 + 32) to byte } else { fc0 }
     mut prec = 0 to i64
     mut has_prec = false
@@ -1286,23 +1286,23 @@ fn eval_interp_static_spec(h: Value, spec: str) -> str {
         if ch >= 48 && ch <= 57 { prec = prec * 10 + (ch to i64 - 48); has_prec = true }
         si++
     }
-    if !has_prec { prec = if fc_low == 100 { 1 to i64 } else { 6 to i64 } }  // 100='d'
+    if !has_prec { prec = if fc_low == 100 { 1 to i64 } else { 6 to i64 } }   // 100='d'
     let is_flt = val_is_float(h)
     let dval = if is_flt { as_float(h) }
-               else if int_sign_of(h) { as_int(h) to i64 to f64 }
-               else { as_int(h) to u64 to f64 }
+    else if int_sign_of(h) { as_int(h) to i64 to f64 }
+    else { as_int(h) to u64 to f64 }
     let ival = if int_sign_of(h) { as_int(h) to i64 } else { 0 to i64 }
     let uval = if !int_sign_of(h) && !is_flt { as_int(h) to u64 } else { 0 to u64 }
-    if      fc_low == 102 { teko::fmt_f(dval, prec) }             // 'f'
-    else if fc_low == 101 { teko::fmt_e(dval, prec) }             // 'e'
-    else if fc_low == 103 { teko::fmt_g(dval, prec) }             // 'g'
-    else if fc_low == 112 { teko::fmt_p(dval, prec) }             // 'p'
-    else if fc_low == 100 { teko::fmt_d(ival, prec) }             // 'd'
-    else if fc_low == 120 && spec.len > 0 && spec[0] == 88 { teko::fmt_x_upper(uval) }  // 'X'
-    else if fc_low == 120 { teko::fmt_x_lower(uval) }             // 'x'
-    else if fc_low == 98  { teko::fmt_b(uval) }                   // 'b'
-    else if fc_low == 110 && is_flt { teko::fmt_n_f(dval, prec) } // 'n' float
-    else if fc_low == 110 { teko::fmt_n_i(ival) }                 // 'n' int
+    if fc_low == 102 { teko::fmt_f(dval, prec) }   // 'f'
+    else if fc_low == 101 { teko::fmt_e(dval, prec) }   // 'e'
+    else if fc_low == 103 { teko::fmt_g(dval, prec) }   // 'g'
+    else if fc_low == 112 { teko::fmt_p(dval, prec) }   // 'p'
+    else if fc_low == 100 { teko::fmt_d(ival, prec) }   // 'd'
+    else if fc_low == 120 && spec.len > 0 && spec[0] == 88 { teko::fmt_x_upper(uval) }   // 'X'
+    else if fc_low == 120 { teko::fmt_x_lower(uval) }   // 'x'
+    else if fc_low == 98 { teko::fmt_b(uval) }   // 'b'
+    else if fc_low == 110 && is_flt { teko::fmt_n_f(dval, prec) }   // 'n' float
+    else if fc_low == 110 { teko::fmt_n_i(ival) }   // 'n' int
     else { teko::fmt_f(dval, prec) }
 }
 
@@ -1334,7 +1334,7 @@ fn eval_interp(in: checker::TInterp, env: Venv) -> EvalRes {
         }
         i++
     }
-    EvalRes { value= acc; env= cur }
+    EvalRes { value = acc; env = cur }
 }
 
 // Phase 2 — `<lhs> in [ e0, e1, … ]` -> bool. The LHS is EVALUATED ONCE; then each element is
@@ -1346,16 +1346,16 @@ fn eval_interp(in: checker::TInterp, env: Venv) -> EvalRes {
 fn eval_in(ie: checker::TInExpr, env: Venv) -> EvalRes {
     let le = eval_expr(ie.lhs, env)   // single-eval: the LHS once
     let lhs = le.value
-    mut cur = le.env                  // (MEM Step 4) thread the env across each element eval
+    mut cur = le.env   // (MEM Step 4) thread the env across each element eval
     mut i = 0
     loop {
         if i >= ie.elems.len { break }
         let ee = eval_expr(ie.elems[i], cur)
         cur = ee.env
-        if value_eq(lhs, ee.value) { return EvalRes { value= true; env= cur } }
+        if value_eq(lhs, ee.value) { return EvalRes { value = true; env = cur } }
         i++
     }
-    EvalRes { value= false; env= cur }   // empty set, or no element matched
+    EvalRes { value = false; env = cur }   // empty set, or no element matched
 }
 
 // ---------------------------------------------------------------------------
@@ -1395,10 +1395,10 @@ fn vm_texpr_mangle(te: parser::TypeExpr) -> str {
             let last = nt.path.segments[nt.path.segments.len - 1].name
             if nt.args.len == 0 { last } else { vm_texpr_inst_name(last, nt.args) }
         }
-        parser::SliceType as st    => teko::str::concat("slice_", vm_texpr_mangle(st.element))
+        parser::SliceType as st => teko::str::concat("slice_", vm_texpr_mangle(st.element))
         parser::OptionalType as ot => teko::str::concat("opt_", vm_texpr_mangle(ot.inner))
-        parser::UnionType          => "variant"
-        parser::FunctionType       => "func"   // (W10a) matches checker type_mangle's Func fragment
+        parser::UnionType => "variant"
+        parser::FunctionType => "func"   // (W10a) matches checker type_mangle's Func fragment
     }
 }
 fn vm_texpr_inst_name(base: str, args: []parser::TypeExpr) -> str {
@@ -1424,9 +1424,9 @@ fn val_is_int(v: Value) -> bool {
     match v { u8 | u16 | u32 | u64 | u128 | i8 | i16 | i32 | i64 | i128 => true; _ => false }
 }
 fn val_is_float(v: Value) -> bool { match v { f16 | f32 | f64 => true; _ => false } }
-fn val_is_byte(v: Value)  -> bool { match v { byte => true; _ => false } }   // byte == u8 rep (compares as int)
+fn val_is_byte(v: Value) -> bool { match v { byte => true; _ => false } }   // byte == u8 rep (compares as int)
 // signedness/width of an INT Value (the member encodes both) — mirrors the C `subj.as.i.{is_signed,width}`.
-fn int_sign_of(v: Value)  -> bool { match v { i8 | i16 | i32 | i64 | i128 => true; _ => false } }
+fn int_sign_of(v: Value) -> bool { match v { i8 | i16 | i32 | i64 | i128 => true; _ => false } }
 fn int_width_of(v: Value) -> u8 {
     match v { u8 | i8 => 8; u16 | i16 => 16; u32 | i32 => 32; u64 | i64 => 64; u128 | i128 => 128; _ => 64 }
 }
@@ -1439,28 +1439,28 @@ fn float_width_of(v: Value) -> u8 { match v { f16 => 16; f32 => 32; f64 => 64; _
 // native tagged-union discrimination. (Slices are handled by the is_slice branch; `null` above.)
 fn val_type_matches(subj: Value, name: str) -> bool {
     match subj {
-        u8   => name == "u8"
-        u16  => name == "u16"
-        u32  => name == "u32"
-        u64  => name == "u64"
+        u8 => name == "u8"
+        u16 => name == "u16"
+        u32 => name == "u32"
+        u64 => name == "u64"
         u128 => name == "u128"
-        i8   => name == "i8"
-        i16  => name == "i16"
-        i32  => name == "i32"
-        i64  => name == "i64"
+        i8 => name == "i8"
+        i16 => name == "i16"
+        i32 => name == "i32"
+        i64 => name == "i64"
         i128 => name == "i128"
-        f16  => name == "f16"
-        f32  => name == "f32"
-        f64  => name == "f64"
+        f16 => name == "f16"
+        f32 => name == "f32"
+        f64 => name == "f64"
         bool => name == "bool"
         byte => name == "byte"
-        str  => name == "str"
-        []Value => false                          // a slice member is matched by the is_slice branch
-        StructVal as sv => checker::name_last_segment(sv.type_name) == checker::name_last_segment(name)    // a named case / `error` (#109 W3: bare-vs-bare)
+        str => name == "str"
+        []Value => false   // a slice member is matched by the is_slice branch
+        StructVal as sv => checker::name_last_segment(sv.type_name) == checker::name_last_segment(name)   // a named case / `error` (#109 W3: bare-vs-bare)
         OptVal => false
-        RefVal => false                            // (MEM Step 2/3) a `Ref<T>` value is never pattern-matched (escape-gated, param-only)
-        FuncVal => false                           // (W10a) a function value is never pattern-matched
-        ClassRef => false                          // (C1) a class instance matches by NAME via the cell deref in pat_match (needs env.cells, not available here)
+        RefVal => false   // (MEM Step 2/3) a `Ref<T>` value is never pattern-matched (escape-gated, param-only)
+        FuncVal => false   // (W10a) a function value is never pattern-matched
+        ClassRef => false   // (C1) a class instance matches by NAME via the cell deref in pat_match (needs env.cells, not available here)
     }
 }
 
@@ -1470,15 +1470,15 @@ fn val_type_matches(subj: Value, name: str) -> bool {
 // A wrong-kind access is an internal invariant break (the checker guarantees the kind) — panic (M.1).
 fn as_int(v: Value) -> i128 {
     match v {
-        u8 as x   => x to i128
-        u16 as x  => x to i128
-        u32 as x  => x to i128
-        u64 as x  => x to i128
+        u8 as x => x to i128
+        u16 as x => x to i128
+        u32 as x => x to i128
+        u64 as x => x to i128
         u128 as x => x to i128
-        i8 as x   => x to i128
-        i16 as x  => x to i128
-        i32 as x  => x to i128
-        i64 as x  => x to i128
+        i8 as x => x to i128
+        i16 as x => x to i128
+        i32 as x => x to i128
+        i64 as x => x to i128
         i128 as x => x
         byte as x => x to i128
         _ => panic("vm: as_int on a non-int value (checker should reject)")
@@ -1506,17 +1506,17 @@ fn as_str(v: Value) -> str {
 // sext_to_width + v_int in vm.c (the 128-bit case is the i128 carrier itself).
 fn norm_int(raw: i128, signed: bool, width: u8) -> Value {
     if signed {
-        if width == 8        { let m = raw & 0xFF;                  if m >= 0x80 { (m - 0x100) to i8 } else { m to i8 } }
-        else if width == 16  { let m = raw & 0xFFFF;               if m >= 0x8000 { (m - 0x10000) to i16 } else { m to i16 } }
-        else if width == 32  { let m = raw & 0xFFFFFFFF;           if m >= 0x80000000 { (m - 0x100000000) to i32 } else { m to i32 } }
-        else if width == 64  { let m = raw & 0xFFFFFFFFFFFFFFFF;   if m >= 0x8000000000000000 { (m - 0x10000000000000000) to i64 } else { m to i64 } }
-        else                 { raw to i128 }                       // 128: raw IS the full-width carrier
+        if width == 8 { let m = raw & 0xFF; if m >= 0x80 { (m - 0x100) to i8 } else { m to i8 } }
+        else if width == 16 { let m = raw & 0xFFFF; if m >= 0x8000 { (m - 0x10000) to i16 } else { m to i16 } }
+        else if width == 32 { let m = raw & 0xFFFFFFFF; if m >= 0x80000000 { (m - 0x100000000) to i32 } else { m to i32 } }
+        else if width == 64 { let m = raw & 0xFFFFFFFFFFFFFFFF; if m >= 0x8000000000000000 { (m - 0x10000000000000000) to i64 } else { m to i64 } }
+        else { raw to i128 }   // 128: raw IS the full-width carrier
     } else {
-        if width == 8        { (raw & 0xFF) to u8 }
-        else if width == 16  { (raw & 0xFFFF) to u16 }
-        else if width == 32  { (raw & 0xFFFFFFFF) to u32 }
-        else if width == 64  { (raw & 0xFFFFFFFFFFFFFFFF) to u64 }
-        else                 { raw to u128 }                       // 128: reinterpret the carrier's bits
+        if width == 8 { (raw & 0xFF) to u8 }
+        else if width == 16 { (raw & 0xFFFF) to u16 }
+        else if width == 32 { (raw & 0xFFFFFFFF) to u32 }
+        else if width == 64 { (raw & 0xFFFFFFFFFFFFFFFF) to u64 }
+        else { raw to u128 }   // 128: reinterpret the carrier's bits
     }
 }
 
@@ -1533,7 +1533,7 @@ fn float_val(f: f64, width: u8) -> Value {
 fn num_of_prim(n: checker::TNumber, t: checker::Type, prog: checker::TProgram) -> Value {
     let k = match t {
         checker::Prim as p => p.kind
-        checker::Byte      => checker::PrimKind::U8   // `byte` literal → u8
+        checker::Byte => checker::PrimKind::U8   // `byte` literal → u8
         // (#50) a FLAGS-typed number literal — the checker's fabricated zero in the any/none
         // lowering (type_flags_method) — computes at the flags carrier prim (unsigned).
         checker::Named as nm => {
@@ -1541,15 +1541,15 @@ fn num_of_prim(n: checker::TNumber, t: checker::Type, prog: checker::TProgram) -
             if cnt == 0 { panic("vm: number literal with a non-primitive type not yet supported") }
             flags_carrier_of(cnt)
         }
-        _                  => panic("vm: number literal with a non-primitive type not yet supported")
+        _ => panic("vm: number literal with a non-primitive type not yet supported")
     }
     if n.is_float {
         if !prim_float(k) { panic("vm: float literal with a non-float type (internal: checker should reject)") }
         float_val(n.fval, prim_width(k))
     } else {
         match k {
-            checker::PrimKind::Bool => n.value != 0                       // a bool Value
-            _                       => norm_int(n.value, prim_signed(k), prim_width(k))
+            checker::PrimKind::Bool => n.value != 0   // a bool Value
+            _ => norm_int(n.value, prim_signed(k), prim_width(k))
         }
     }
 }
@@ -1558,13 +1558,13 @@ fn num_of_prim(n: checker::TNumber, t: checker::Type, prog: checker::TProgram) -
 // list are not literal-comparable (false). Ints compare via the i128 carrier (`as_int`); the
 // distinct `byte` member compares as a byte.
 fn value_eq(a: Value, b: Value) -> bool {
-    if val_is_int(a)   && val_is_int(b)   { return as_int(a) == as_int(b) }
+    if val_is_int(a) && val_is_int(b) { return as_int(a) == as_int(b) }
     if val_is_float(a) && val_is_float(b) { return as_float(a) == as_float(b) }
     match a {
         bool as ab => match b { bool as bb => return ab == bb; _ => return false }
         byte as ay => match b { byte as by => return ay == by; _ => return false }
-        str as az  => match b { str as bz  => return az == bz; _ => return false }
-        _          => return false
+        str as az => match b { str as bz => return az == bz; _ => return false }
+        _ => return false
     }
 }
 
@@ -1579,13 +1579,13 @@ fn lit_as(lit: parser::Expr, subj: Value) -> Value {
                 float_val(n.fval, if val_is_float(subj) { float_width_of(subj) } else { 64 })
             } else {
                 norm_int(n.value,
-                         if val_is_int(subj) { int_sign_of(subj) } else { false },
-                         if val_is_int(subj) { int_width_of(subj) } else { 64 })
+                    if val_is_int(subj) { int_sign_of(subj) } else { false },
+                    if val_is_int(subj) { int_width_of(subj) } else { 64 })
             }
         }
-        parser::ByteLit as b => b.value      // a `byte` Value (the C carries u8; here byte is its own member)
-        parser::StrLit as s  => s.text       // a `str` Value
-        _                    => panic("vm: unsupported literal in a pattern (parser emits only number/byte/str)")
+        parser::ByteLit as b => b.value   // a `byte` Value (the C carries u8; here byte is its own member)
+        parser::StrLit as s => s.text   // a `str` Value
+        _ => panic("vm: unsupported literal in a pattern (parser emits only number/byte/str)")
     }
 }
 
@@ -1606,13 +1606,13 @@ type PatMatch = struct { matched: bool; env: Venv }
  * skipped). Anything else yields no candidate — the caller then has nothing to narrow against. */
 fn enum_candidate_names(t: checker::Type) -> []str {
     match t {
-        checker::Named as n   => teko::list::push(teko::list::empty(), n.name)
+        checker::Named as n => teko::list::push(teko::list::empty(), n.name)
         checker::Variant as v => {
             mut names: []str = teko::list::empty()
             mut i = 0
             loop {
                 if i >= v.members.len { break }
-                match v.members[i] { checker::Named as n => { names = teko::list::push(names, n.name) }; _ => {} }
+                match v.members[i] { checker::Named as n => { names = teko::list::push(names, n.name) }; _ => { } }
                 i++
             }
             names
@@ -1666,11 +1666,11 @@ fn vm_match_as_enum_int(prog: checker::TProgram, name: str, ordinal: i128, subj_
                                 j++
                             }
                         }
-                        _ => {}
+                        _ => { }
                     }
                 }
             }
-            _ => {}
+            _ => { }
         }
         i++
     }
@@ -1708,18 +1708,18 @@ fn vm_variant_siblings(prog: checker::TProgram, a: str, b: str) -> bool {
                                         if nm == ka { has_a = true }
                                         if nm == kb { has_b = true }
                                     }
-                                    _ => {}
+                                    _ => { }
                                 }
                                 j = j + 1
                             }
                             if has_a && has_b { return true }
                         }
-                        _ => {}
+                        _ => { }
                     }
-                    _ => {}
+                    _ => { }
                 }
             }
-            _ => {}
+            _ => { }
         }
         i++
     }
@@ -1743,7 +1743,7 @@ fn vm_case_in_variant(prog: checker::TProgram, vname: str, cname: str) -> bool {
                                     if j >= u.members.len { break }
                                     match u.members[j] {
                                         parser::NamedType as nt => { if checker::name_last_segment(nt.path.segments[nt.path.segments.len - 1].name) == kc { return true } }
-                                        _ => {}
+                                        _ => { }
                                     }
                                     j = j + 1
                                 }
@@ -1755,7 +1755,7 @@ fn vm_case_in_variant(prog: checker::TProgram, vname: str, cname: str) -> bool {
                     }
                 }
             }
-            _ => {}
+            _ => { }
         }
         i = i + 1
     }
@@ -1787,7 +1787,7 @@ fn pat_match(pat: parser::Pattern, subj: Value, env: Venv, subj_type: checker::T
                         StructVal => return pat_match(pat, inner, env, inner_type)
                         _ => {
                             match pat {
-                                parser::WildcardPattern   => return PatMatch { matched = true; env = env }
+                                parser::WildcardPattern => return PatMatch { matched = true; env = env }
                                 parser::BindPattern as bp => {
                                     if bp.has_binding { return PatMatch { matched = true; env = define(env, bp.binding, inner) } }
                                     return PatMatch { matched = true; env = env }
@@ -1799,11 +1799,11 @@ fn pat_match(pat: parser::Pattern, subj: Value, env: Venv, subj_type: checker::T
                 }
             }
         }
-        _ => {}
+        _ => { }
     }
     match pat {
-        parser::NullPattern      => PatMatch { matched = false; env = env }
-        parser::WildcardPattern  => PatMatch { matched = true; env = env }
+        parser::NullPattern => PatMatch { matched = false; env = env }
+        parser::WildcardPattern => PatMatch { matched = true; env = env }
         parser::LiteralPattern as lp => PatMatch { matched = value_eq(subj, lit_as(lp.value, subj)); env = env }
         parser::RangePattern as rp => {
             if !val_is_int(subj) { return PatMatch { matched = false; env = env } }
@@ -1850,7 +1850,7 @@ fn pat_match(pat: parser::Pattern, subj: Value, env: Venv, subj_type: checker::T
                         ClassRef as cr => {
                             match cell_get(env.cells, cr.cell) {
                                 StructVal as payload => { if checker::name_last_segment(payload.type_name) == checker::name_last_segment(bname) { hit = true } }   // (#109 W3) bare-vs-bare
-                                _ => {}
+                                _ => { }
                             }
                         }
                         _ => { if val_is_int(subj) { if vm_match_as_enum_int(env.prog, bname, as_int(subj), enum_candidate_names(subj_type)) { hit = true } } }
@@ -1878,28 +1878,28 @@ fn pat_match(pat: parser::Pattern, subj: Value, env: Venv, subj_type: checker::T
                     StructVal as sv => {
                         let is_multi_sibling = sv.field_vals.len > 1 && vm_variant_siblings(env.prog, sv.type_name, bname)
                         if !is_multi_sibling {
-                        mut fi = 0
-                        loop {
-                            if fi >= sv.field_vals.len { break }
-                            let fv = sv.field_vals[fi]
-                            match fv {
-                                StructVal as fsv => {
-                                    mut fhit = val_type_matches(fv, bname)
-                                    if !fhit { if vm_case_in_variant(env.prog, bname, fsv.type_name) { fhit = true } }
-                                    if fhit {
-                                        if bp.has_binding {
-                                            return PatMatch { matched = true; env = define(env, bp.binding, fv) }
+                            mut fi = 0
+                            loop {
+                                if fi >= sv.field_vals.len { break }
+                                let fv = sv.field_vals[fi]
+                                match fv {
+                                    StructVal as fsv => {
+                                        mut fhit = val_type_matches(fv, bname)
+                                        if !fhit { if vm_case_in_variant(env.prog, bname, fsv.type_name) { fhit = true } }
+                                        if fhit {
+                                            if bp.has_binding {
+                                                return PatMatch { matched = true; env = define(env, bp.binding, fv) }
+                                            }
+                                            return PatMatch { matched = true; env = env }
                                         }
-                                        return PatMatch { matched = true; env = env }
                                     }
+                                    _ => { }
                                 }
-                                _ => {}
+                                fi++
                             }
-                            fi++
-                        }
                         }
                     }
-                    _ => {}
+                    _ => { }
                 }
                 PatMatch { matched = false; env = env }
             }
@@ -1953,7 +1953,7 @@ fn eval_match(m: checker::TMatchExpr, t: checker::Type, line: u32, col: u32, env
         let pm = pat_match(arm.pattern, subj, senv, m.subject.type)
         if pm.matched {
             // A `when` guard may itself evaluate a ref call; thread its env into the body's env.
-            let ge = if arm.has_when { eval_expr(arm.guard, pm.env) } else { EvalRes { value= true; env= pm.env } }
+            let ge = if arm.has_when { eval_expr(arm.guard, pm.env) } else { EvalRes { value = true; env = pm.env } }
             let guard_ok = as_bool(ge.value)
             if guard_ok {
                 teko::cov_branch(line, col, i to u64)   // D3-branch: value-position arm `i` taken
@@ -1964,8 +1964,8 @@ fn eval_match(m: checker::TMatchExpr, t: checker::Type, line: u32, col: u32, env
                     // twin of codegen's emit_arm_value → emit_as wrap, so a `T` arm flowing into a
                     // `T?`-typed match present-wraps (the checker-desugared `?.` relies on it; exact-typed
                     // arms are a no-op).
-                    Normal as nm => return EvalRes { value= coerce_to(nm.value ?? panic("vm: a `match` used as a value produced no value (internal: checker requires a value arm)"), t); env= with_cells(senv, bo.env.cells) }
-                    _            => panic("vm: control flow inside a `match` used as a sub-expression not yet supported")
+                    Normal as nm => return EvalRes { value = coerce_to(nm.value ?? panic("vm: a `match` used as a value produced no value (internal: checker requires a value arm)"), t); env = with_cells(senv, bo.env.cells) }
+                    _ => panic("vm: control flow inside a `match` used as a sub-expression not yet supported")
                 }
             }
         }
@@ -1982,7 +1982,7 @@ fn eval_match(m: checker::TMatchExpr, t: checker::Type, line: u32, col: u32, env
 fn exec_match(e: checker::TExpr, env: Venv) -> FlowEnv {
     match e {
         checker::TMatchExpr as m => {
-            let base = env.slots.len      // outer scope size: the arm's pattern bindings + body locals sit above it
+            let base = env.slots.len   // outer scope size: the arm's pattern bindings + body locals sit above it
             let se = eval_expr(m.subject, env)   // (MEM Step 4) thread the subject's env
             let subj = se.value
             let senv = se.env
@@ -1992,14 +1992,14 @@ fn exec_match(e: checker::TExpr, env: Venv) -> FlowEnv {
                 let arm = m.arms[i]
                 let pm = pat_match(arm.pattern, subj, senv, m.subject.type)
                 if pm.matched {
-                    let ge = if arm.has_when { eval_expr(arm.guard, pm.env) } else { EvalRes { value= true; env= pm.env } }
+                    let ge = if arm.has_when { eval_expr(arm.guard, pm.env) } else { EvalRes { value = true; env = pm.env } }
                     let guard_ok = as_bool(ge.value)
                     if guard_ok {
                         teko::cov_branch(e.line, e.col, i to u64)   // D3-branch: arm `i` taken (no-op unless coverage on)
                         // run the arm body; POP its bindings/locals back to the outer scope (keeping
                         // outer-`mut` mutations, which mutate_slot writes at their index in [0, base)).
                         let bo = exec_block(arm.body, ge.env)
-                        return FlowEnv { flow= bo.flow; env= Venv { slots= loop_outer(bo.env.slots, base); prog= bo.env.prog; defers= bo.env.defers; cells= bo.env.cells; di_cache= bo.env.di_cache } }
+                        return FlowEnv { flow = bo.flow; env = Venv { slots = loop_outer(bo.env.slots, base); prog = bo.env.prog; defers = bo.env.defers; cells = bo.env.cells; di_cache = bo.env.di_cache } }
                     }
                 }
                 i++   // discard this arm's bindings and try the next
@@ -2035,15 +2035,15 @@ fn eval_expr(e: checker::TExpr, env: Venv) -> EvalRes {
     match e.type {
         // Optional `T?` values ARE supported now (OptVal — REBOOT_PLAN §202): null / ?. / ?? and
         // the present-wrap (coerce_to) produce them; they flow through the value model like any tag.
-        checker::Void          => panic("vm: void expression has no value (internal: checker should reject in value position)")
-        _             => {}   // a real value type — evaluate below
+        checker::Void => panic("vm: void expression has no value (internal: checker should reject in value position)")
+        _ => { }   // a real value type — evaluate below
     }
     match e.kind {
         // Leaf reads — pure, env unchanged. (MEM Step 4: every non-call leaf threads `env` back as-is.)
-        checker::TNumber as n   => EvalRes { value= num_of_prim(n, e.type, env.prog); env= env }   // a concrete u8…i128 / f16…f64 from the node's type (float iff n.is_float)
+        checker::TNumber as n => EvalRes { value = num_of_prim(n, e.type, env.prog); env = env }   // a concrete u8…i128 / f16…f64 from the node's type (float iff n.is_float)
         // (W10a) a bare top-level-fn reference used as a VALUE → a FuncVal (no captured env). A plain
         // local/param reads its bound value (cell-backed reads thread through the cell).
-        checker::TVar as v      => if v.is_func { EvalRes { value= FuncVal { is_lambda= false; ns= v.func_ns; name= v.name; params= teko::list::empty(); body= teko::list::empty(); cap_names= teko::list::empty(); cap_vals= teko::list::empty() }; env= env } } else { EvalRes { value= read_var(env, v.name); env= env } }
+        checker::TVar as v => if v.is_func { EvalRes { value = FuncVal { is_lambda = false; ns = v.func_ns; name = v.name; params = teko::list::empty(); body = teko::list::empty(); cap_names = teko::list::empty(); cap_vals = teko::list::empty() }; env = env } } else { EvalRes { value = read_var(env, v.name); env = env } }
         // (W10) a closure LITERAL → a FuncVal carrying its params/body + a SNAPSHOT of its captures
         // (read NOW from the enclosing scope; a RefVal snapshot shares the cell → by-ref mutation).
         checker::TLambda as lam => {
@@ -2056,19 +2056,19 @@ fn eval_expr(e: checker::TExpr, env: Venv) -> EvalRes {
                 cvals = teko::list::push(cvals, read_var(env, lam.captures[i].name))
                 i++
             }
-            EvalRes { value= FuncVal { is_lambda= true; ns= ""; name= ""; params= lam.params; body= lam.body; cap_names= cnames; cap_vals= cvals }; env= env }
+            EvalRes { value = FuncVal { is_lambda = true; ns = ""; name = ""; params = lam.params; body = lam.body; cap_names = cnames; cap_vals = cvals }; env = env }
         }
-        checker::TStrLit as s   => EvalRes { value= s.text; env= env }            // a `str` member of Value
-        checker::TByteLit as b  => EvalRes { value= b.value; env= env }           // a `byte` member of Value
-        checker::TCharLit as ch => EvalRes { value= ch.bytes; env= env }          // char — its UTF-8 bytes ride the `str` member (distinct by tag; VM==native)
-        checker::TBoolLit as bl => EvalRes { value= bl.value; env= env }                  // bool literal (W2) — FULL: a `bool` member of Value
-        checker::TBinary as b   => eval_binary(b, e.type, e.line, e.col, env)
-        checker::TUnary as u    => eval_unary(u, e.type, env)
-        checker::TCompare as c  => eval_compare(c, env)
-        checker::TCast as c     => eval_cast(c, e.type, e.line, e.col, env)          // F3 narrowing guard inside (positioned — C1.6)
-        checker::TCall as c     => eval_call(c, env)                                 // (MEM Step 4) value-position call — threads the callee's cells back
-        checker::TStructInit as si  => eval_struct_init(si, e.type, env)   // W4b — build a struct value (declared field order)
-        checker::TFieldAccess as fa => eval_field_access(fa, env)          // W4b — read a field by name from a struct value
+        checker::TStrLit as s => EvalRes { value = s.text; env = env }   // a `str` member of Value
+        checker::TByteLit as b => EvalRes { value = b.value; env = env }   // a `byte` member of Value
+        checker::TCharLit as ch => EvalRes { value = ch.bytes; env = env }   // char — its UTF-8 bytes ride the `str` member (distinct by tag; VM==native)
+        checker::TBoolLit as bl => EvalRes { value = bl.value; env = env }   // bool literal (W2) — FULL: a `bool` member of Value
+        checker::TBinary as b => eval_binary(b, e.type, e.line, e.col, env)
+        checker::TUnary as u => eval_unary(u, e.type, env)
+        checker::TCompare as c => eval_compare(c, env)
+        checker::TCast as c => eval_cast(c, e.type, e.line, e.col, env)   // F3 narrowing guard inside (positioned — C1.6)
+        checker::TCall as c => eval_call(c, env)   // (MEM Step 4) value-position call — threads the callee's cells back
+        checker::TStructInit as si => eval_struct_init(si, e.type, env)   // W4b — build a struct value (declared field order)
+        checker::TFieldAccess as fa => eval_field_access(fa, env)   // W4b — read a field by name from a struct value
 
         // W5a — `if` as a VALUE (nested in an expression): run it as control flow; yield the
         // taken branch's trailing value (NORMAL). A branch that DIVERGES (return/break/continue)
@@ -2077,8 +2077,8 @@ fn eval_expr(e: checker::TExpr, env: Venv) -> EvalRes {
         checker::TIfExpr as _ => {
             let fe = exec_if(e, env)   // FlowEnv — the taken branch's cell writes ride fe.env
             match fe.flow {
-                Normal as nm => EvalRes { value= nm.value ?? panic("vm: an `if` used as a value produced no value (internal: checker requires an `else` with a value)"); env= fe.env }
-                _            => panic("vm: control flow inside an `if` used as a sub-expression not yet supported")
+                Normal as nm => EvalRes { value = nm.value ?? panic("vm: an `if` used as a value produced no value (internal: checker requires an `else` with a value)"); env = fe.env }
+                _ => panic("vm: control flow inside an `if` used as a sub-expression not yet supported")
             }
         }
         // W5b — `match` as a VALUE: pattern matching (literal/range/Alt/variant-case/destructure + `when`).
@@ -2092,17 +2092,17 @@ fn eval_expr(e: checker::TExpr, env: Venv) -> EvalRes {
         // (#50) Type::Member as a VALUE → the checker-RESOLVED member value (enum: the ordinal,
         // u64 — the C twin's C enum auto-numbers identically; flags: 1 << ordinal at the carrier
         // width) — see path_value. Mirrors vm.c's TK_TEXPR_PATH case.
-        checker::TPathExpr as pe => EvalRes { value= path_value(pe, e.type, env.prog); env= env }
+        checker::TPathExpr as pe => EvalRes { value = path_value(pe, e.type, env.prog); env = env }
         // null / ?. / ?? — the OPTIONAL value model (OptVal — REBOOT_PLAN §202/§203).
         // null is NONE; the destination's wrap (coerce_to) makes it a concrete `T?`.
-        checker::TNullLit            => EvalRes { value= OptVal { present = false; inner = null }; env= env }
+        checker::TNullLit => EvalRes { value = OptVal { present = false; inner = null }; env = env }
         checker::TSafeFieldAccess as sfa => {
             // `recv?.field`: NONE → NONE; PRESENT → the inner's field, re-wrapped PRESENT.
             let re = eval_expr(sfa.receiver, env)   // thread the receiver's env (a ref call there grows cells)
             match re.value {
                 OptVal as o => {
-                    if !o.present { return EvalRes { value= OptVal { present = false; inner = null }; env= re.env } }
-                    let inner = match o.inner { Value as iv => iv; null => return EvalRes { value= OptVal { present = false; inner = null }; env= re.env } }
+                    if !o.present { return EvalRes { value = OptVal { present = false; inner = null }; env = re.env } }
+                    let inner = match o.inner { Value as iv => iv; null => return EvalRes { value = OptVal { present = false; inner = null }; env = re.env } }
                     // (W10b.CLASS residual — VM reference semantics) a class-typed optional's
                     // inner is a ClassRef (not a StructVal) — deref through the cell first.
                     let sv = match inner {
@@ -2118,7 +2118,7 @@ fn eval_expr(e: checker::TExpr, env: Venv) -> EvalRes {
                         if i >= sv.field_names.len { break }
                         if sv.field_names[i] == sfa.field {
                             // result is `(field)?` — an already-optional field stays as-is.
-                            match sv.field_vals[i] { OptVal as fo => return EvalRes { value= fo; env= re.env }; _ => return EvalRes { value= OptVal { present = true; inner = sv.field_vals[i] }; env= re.env } }
+                            match sv.field_vals[i] { OptVal as fo => return EvalRes { value = fo; env = re.env }; _ => return EvalRes { value = OptVal { present = true; inner = sv.field_vals[i] }; env = re.env } }
                         }
                         i++
                     }
@@ -2127,7 +2127,7 @@ fn eval_expr(e: checker::TExpr, env: Venv) -> EvalRes {
                 _ => panic("vm: safe field access on a non-optional value (internal: checker should reject)")
             }
         }
-        checker::TCoalesce as co  => {
+        checker::TCoalesce as co => {
             // `a ?? b`: a's inner if PRESENT, else b (short-circuit b). Both arms coerced to the
             // result type (the node's `.type`): `T? ?? T` unwraps, `T? ?? T?` stays optional.
             let le = eval_expr(co.left, env)   // thread the left operand's env
@@ -2135,10 +2135,10 @@ fn eval_expr(e: checker::TExpr, env: Venv) -> EvalRes {
                 OptVal as o => {
                     if o.present {
                         let inner = match o.inner { Value as iv => iv; null => panic("vm: present optional with no inner (internal)") }
-                        EvalRes { value= coerce_to(inner, e.type); env= le.env }
+                        EvalRes { value = coerce_to(inner, e.type); env = le.env }
                     } else {
                         let re = eval_expr(co.right, le.env)   // short-circuit: only evaluated when absent; threads from le.env
-                        EvalRes { value= coerce_to(re.value, e.type); env= re.env }
+                        EvalRes { value = coerce_to(re.value, e.type); env = re.env }
                     }
                 }
                 _ => panic("vm: coalesce left operand is not optional (internal: checker should reject)")
@@ -2154,7 +2154,7 @@ fn eval_expr(e: checker::TExpr, env: Venv) -> EvalRes {
 // individually appended (flattening the spread into the result slice at runtime).
 fn eval_array_lit(a: checker::TArrayLit, slot: checker::Type, env: Venv) -> EvalRes {
     let elem_t = match slot { checker::Slice as s => s.element; _ => checker::Void { } }
-    mut cur = env                       // (MEM Step 4) thread the env across each element's eval
+    mut cur = env   // (MEM Step 4) thread the env across each element's eval
     mut xs: []Value = teko::list::empty()
     mut i = 0
     loop {
@@ -2178,7 +2178,7 @@ fn eval_array_lit(a: checker::TArrayLit, slot: checker::Type, env: Venv) -> Eval
         }
         i = i + 1
     }
-    EvalRes { value= xs; env= cur }
+    EvalRes { value = xs; env = cur }
 }
 
 // coerce a Value into the declared slot type `t`: if `t` is `T?` and the value is NOT already an
@@ -2231,7 +2231,7 @@ fn flags_member_count(prog: checker::TProgram, name: str) -> u64 {
                     }
                 }
             }
-            _ => {}
+            _ => { }
         }
         i++
     }
@@ -2241,7 +2241,7 @@ fn flags_member_count(prog: checker::TProgram, name: str) -> u64 {
 // (#50) flags carrier prim by MEMBER COUNT — the unsigned width native codegen chose (1–8 → u8,
 // 9–16 → u16, 17–32 → u32, 33–64 → u64, 65–128 → u128; codegen's FlagsBody uint_type).
 fn flags_carrier_of(n: u64) -> checker::PrimKind {
-    if n <= 8  { return checker::PrimKind::U8 }
+    if n <= 8 { return checker::PrimKind::U8 }
     if n <= 16 { return checker::PrimKind::U16 }
     if n <= 32 { return checker::PrimKind::U32 }
     if n <= 64 { return checker::PrimKind::U64 }
@@ -2259,11 +2259,11 @@ fn path_value(pe: checker::TPathExpr, t: checker::Type, prog: checker::TProgram)
             let n = flags_member_count(prog, nm.name)
             if n == 0 { return pe.value to u64 }   // enum: the ordinal (u64)
             let w = prim_width(flags_carrier_of(n))
-            if w == 8       { pe.value to u8 }
+            if w == 8 { pe.value to u8 }
             else if w == 16 { pe.value to u16 }
             else if w == 32 { pe.value to u32 }
             else if w == 64 { pe.value to u64 }
-            else            { pe.value }           // 128: the value IS the u128 Value
+            else { pe.value }   // 128: the value IS the u128 Value
         }
         _ => pe.value to u64
     }
@@ -2278,13 +2278,13 @@ fn path_value(pe: checker::TPathExpr, t: checker::Type, prog: checker::TProgram)
 fn num_prim_of(t: checker::Type, prog: checker::TProgram) -> checker::PrimKind {
     match t {
         checker::Prim as p => p.kind
-        checker::Byte      => checker::PrimKind::U8
+        checker::Byte => checker::PrimKind::U8
         checker::Named as nm => {
             let n = flags_member_count(prog, nm.name)
-            if n > 0 { flags_carrier_of(n) }          // (#50) flags → its carrier prim
-            else     { checker::PrimKind::U64 }       // E7: enum ordinal — checker validated; stored as u64
+            if n > 0 { flags_carrier_of(n) }   // (#50) flags → its carrier prim
+            else { checker::PrimKind::U64 }   // E7: enum ordinal — checker validated; stored as u64
         }
-        _                  => panic("vm: arithmetic/cast on a non-numeric type not yet supported")
+        _ => panic("vm: arithmetic/cast on a non-numeric type not yet supported")
     }
 }
 
@@ -2300,15 +2300,15 @@ fn num_prim_of(t: checker::Type, prog: checker::TProgram) -> checker::PrimKind {
 fn apply_int_op(op: lexer::TokenKind, l: i128, r: i128, sgn: bool, w: u8) -> i128 {
     let mask = (w to i128) - 1
     match op {
-        Plus  => l + r
+        Plus => l + r
         Minus => l - r
-        Star  => l * r
-        Amp   => l & r
-        Pipe  => l | r
+        Star => l * r
+        Amp => l & r
+        Pipe => l | r
         Caret => l ^ r
-        Shl   => l << (r & mask)
-        Shr   => l >> (r & mask)
-        _     => panic("vm: binary operator not yet supported")
+        Shl => l << (r & mask)
+        Shr => l >> (r & mask)
+        _ => panic("vm: binary operator not yet supported")
     }
 }
 
@@ -2321,7 +2321,7 @@ fn eval_unary(u: checker::TUnary, t: checker::Type, env: Venv) -> EvalRes {
     let x = xe.value
     let cur = xe.env
     let v = match u.op {
-        Bang  => !as_bool(x)
+        Bang => !as_bool(x)
         Minus => {
             let prim = num_prim_of(t, env.prog)
             if prim_float(prim) {
@@ -2336,7 +2336,7 @@ fn eval_unary(u: checker::TUnary, t: checker::Type, env: Venv) -> EvalRes {
         }
         _ => panic("vm: unary operator not yet supported")
     }
-    EvalRes { value= v; env= cur }
+    EvalRes { value = v; env = cur }
 }
 
 // cmp_pair — one adjacent comparison `l <op> r`, the .tks twin of vm.c's cmp_pair. INT compares on
@@ -2354,23 +2354,23 @@ fn cmp_pair(l: Value, op: lexer::TokenKind, r: Value) -> bool {
         let a = as_int(l); let b = as_int(r)
         match op {
             EqEq => a == b
-            Ne   => a != b
-            Lt   => a < b
-            Le   => a <= b
-            Gt   => a > b
-            Ge   => a >= b
-            _    => panic("vm: comparison operator not yet supported")
+            Ne => a != b
+            Lt => a < b
+            Le => a <= b
+            Gt => a > b
+            Ge => a >= b
+            _ => panic("vm: comparison operator not yet supported")
         }
     } else if val_is_float(l) && val_is_float(r) {
         let a = as_float(l); let b = as_float(r)
         match op {
             EqEq => a == b
-            Ne   => a != b
-            Lt   => a < b
-            Le   => a <= b
-            Gt   => a > b
-            Ge   => a >= b
-            _    => panic("vm: comparison operator not yet supported")
+            Ne => a != b
+            Lt => a < b
+            Le => a <= b
+            Gt => a > b
+            Ge => a >= b
+            _ => panic("vm: comparison operator not yet supported")
         }
     } else {
         // str (byte-equality, the lexer/parser tests compare token text), else bool (==/!= only).
@@ -2378,8 +2378,8 @@ fn cmp_pair(l: Value, op: lexer::TokenKind, r: Value) -> bool {
             str as ls => match r {
                 str as rs => match op {
                     EqEq => ls == rs
-                    Ne   => !(ls == rs)
-                    _    => panic("vm: ordered comparison on str not supported")
+                    Ne => !(ls == rs)
+                    _ => panic("vm: ordered comparison on str not supported")
                 }
                 _ => panic("vm: comparing a str to a non-str (checker should reject)")
             }
@@ -2387,8 +2387,8 @@ fn cmp_pair(l: Value, op: lexer::TokenKind, r: Value) -> bool {
                 let a = as_bool(l); let b = as_bool(r)
                 match op {
                     EqEq => a == b
-                    Ne   => a != b
-                    _    => panic("vm: ordered comparison on bool not yet supported")
+                    Ne => a != b
+                    _ => panic("vm: ordered comparison on bool not yet supported")
                 }
             }
         }
@@ -2415,7 +2415,7 @@ fn eval_compare(c: checker::TCompare, env: Venv) -> EvalRes {
         prev = re.value
         i++
     }
-    EvalRes { value= acc; env= cur }
+    EvalRes { value = acc; env = cur }
 }
 
 // find_function — resolve a user call by its callee Path, the .tks twin of vm.c's find_function.
@@ -2454,7 +2454,7 @@ fn find_function_ns(env: Venv, callee: parser::Path, call_ns: str) -> FnHit {
             if j >= env.prog.items.len { break }
             match env.prog.items[j] {
                 checker::TFunction as f => { if f.namespace == call_ns && f.name == name { return FnHit { func = f; idx = j } } }
-                _              => {}
+                _ => { }
             }
             j++
         }
@@ -2464,7 +2464,7 @@ fn find_function_ns(env: Venv, callee: parser::Path, call_ns: str) -> FnHit {
         if i >= env.prog.items.len { break }
         match env.prog.items[i] {
             checker::TFunction as f => { if f.name == name { return FnHit { func = f; idx = i to u64 } } }
-            _              => {}
+            _ => { }
         }
         i++
     }
@@ -2486,7 +2486,7 @@ fn struct_set_field(sv: StructVal, field: str, val: Value) -> StructVal {
         if i >= sv.field_names.len { break }
         names = teko::list::push(names, sv.field_names[i])
         if sv.field_names[i] == field { vals = teko::list::push(vals, val) }
-        else                          { vals = teko::list::push(vals, sv.field_vals[i]) }
+        else { vals = teko::list::push(vals, sv.field_vals[i]) }
         i++
     }
     StructVal { type_name = sv.type_name; field_names = names; field_vals = vals }
@@ -2565,20 +2565,20 @@ fn mutate_slot(env: Venv, name: str, op: lexer::TokenKind, rhs: Value) -> Venv {
     match backing {
         u64 as cid => {
             // write through the cell; the slot list is unchanged (it still points at the cell).
-            return Venv { slots= env.slots; prog= env.prog; defers= env.defers; cells= cell_set(env.cells, cid, newval); di_cache= env.di_cache }
+            return Venv { slots = env.slots; prog = env.prog; defers = env.defers; cells = cell_set(env.cells, cid, newval); di_cache = env.di_cache }
         }
-        null => {}
+        null => { }
     }
     // rebuild the slots, replacing the one at `idx` with the new value (functional update).
     mut rebuilt: []Slot = teko::list::empty()
     mut j = 0
     loop {
         if j >= env.slots.len { break }
-        if j == idx { rebuilt = teko::list::push(rebuilt, Slot { name= name; val= newval; cell_id= null }) }
-        else        { rebuilt = teko::list::push(rebuilt, env.slots[j]) }
+        if j == idx { rebuilt = teko::list::push(rebuilt, Slot { name = name; val = newval; cell_id = null }) }
+        else { rebuilt = teko::list::push(rebuilt, env.slots[j]) }
         j++
     }
-    Venv { slots= rebuilt; prog= env.prog; defers= env.defers; cells= env.cells; di_cache= env.di_cache }
+    Venv { slots = rebuilt; prog = env.prog; defers = env.defers; cells = env.cells; di_cache = env.di_cache }
 }
 
 // compound_apply — apply an assignment operator to `old` with `rhs`: a plain `=` stores rhs; a
@@ -2588,21 +2588,21 @@ fn mutate_slot(env: Venv, name: str, op: lexer::TokenKind, rhs: Value) -> Venv {
 fn compound_apply(old: Value, op: lexer::TokenKind, rhs: Value) -> Value {
     match op {
         Assign => rhs
-        _      => {
+        _ => {
             let sgn = int_sign_of(old); let w = int_width_of(old)
             let a = as_int(old); let b = as_int(rhs)
             match op {
-                SlashEq   => norm_int(teko::div(a, b, sgn), sgn, w)   // CHECKED: ÷0 panics
+                SlashEq => norm_int(teko::div(a, b, sgn), sgn, w)   // CHECKED: ÷0 panics
                 PercentEq => norm_int(teko::rem(a, b, sgn), sgn, w)   // CHECKED: %0 panics
-                PlusEq    => norm_int(apply_int_op(lexer::TokenKind::Plus,  a, b, sgn, w), sgn, w)
-                MinusEq   => norm_int(apply_int_op(lexer::TokenKind::Minus, a, b, sgn, w), sgn, w)
-                StarEq    => norm_int(apply_int_op(lexer::TokenKind::Star,  a, b, sgn, w), sgn, w)
-                AmpEq     => norm_int(apply_int_op(lexer::TokenKind::Amp,   a, b, sgn, w), sgn, w)
-                PipeEq    => norm_int(apply_int_op(lexer::TokenKind::Pipe,  a, b, sgn, w), sgn, w)
-                CaretEq   => norm_int(apply_int_op(lexer::TokenKind::Caret, a, b, sgn, w), sgn, w)
-                ShlEq     => norm_int(apply_int_op(lexer::TokenKind::Shl,   a, b, sgn, w), sgn, w)
-                ShrEq     => norm_int(apply_int_op(lexer::TokenKind::Shr,   a, b, sgn, w), sgn, w)
-                _         => panic("vm: assignment operator not yet supported")
+                PlusEq => norm_int(apply_int_op(lexer::TokenKind::Plus, a, b, sgn, w), sgn, w)
+                MinusEq => norm_int(apply_int_op(lexer::TokenKind::Minus, a, b, sgn, w), sgn, w)
+                StarEq => norm_int(apply_int_op(lexer::TokenKind::Star, a, b, sgn, w), sgn, w)
+                AmpEq => norm_int(apply_int_op(lexer::TokenKind::Amp, a, b, sgn, w), sgn, w)
+                PipeEq => norm_int(apply_int_op(lexer::TokenKind::Pipe, a, b, sgn, w), sgn, w)
+                CaretEq => norm_int(apply_int_op(lexer::TokenKind::Caret, a, b, sgn, w), sgn, w)
+                ShlEq => norm_int(apply_int_op(lexer::TokenKind::Shl, a, b, sgn, w), sgn, w)
+                ShrEq => norm_int(apply_int_op(lexer::TokenKind::Shr, a, b, sgn, w), sgn, w)
+                _ => panic("vm: assignment operator not yet supported")
             }
         }
     }
@@ -2635,43 +2635,43 @@ fn eval_binary(b: checker::TBinary, ty: checker::Type, line: u32, col: u32, env:
     if b.op == lexer::TokenKind::AndAnd || b.op == lexer::TokenKind::OrOr {
         let le = eval_expr(b.left, env)   // (MEM Step 4) thread left, then SHORT-CIRCUIT right
         let l = as_bool(le.value)
-        if b.op == lexer::TokenKind::AndAnd && !l { return EvalRes { value= false; env= le.env } }
-        if b.op == lexer::TokenKind::OrOr  &&  l { return EvalRes { value= true; env= le.env } }
+        if b.op == lexer::TokenKind::AndAnd && !l { return EvalRes { value = false; env = le.env } }
+        if b.op == lexer::TokenKind::OrOr && l { return EvalRes { value = true; env = le.env } }
         let re = eval_expr(b.right, le.env)
-        return EvalRes { value= as_bool(re.value); env= re.env }
+        return EvalRes { value = as_bool(re.value); env = re.env }
     }
-    let prim = num_prim_of(ty, env.prog)       // honest stop if non-numeric (mirrors codegen)
+    let prim = num_prim_of(ty, env.prog)   // honest stop if non-numeric (mirrors codegen)
     if prim_float(prim) {
-        let w  = prim_width(prim)
+        let w = prim_width(prim)
         let le = eval_expr(b.left, env); let re = eval_expr(b.right, le.env)   // thread left→right
         let lf = as_float(le.value); let rf = as_float(re.value)
         let cur = re.env
         let fv = match b.op {
-            Plus    => float_val(lf + rf, w)
-            Minus   => float_val(lf - rf, w)
-            Star    => float_val(lf * rf, w)
+            Plus => float_val(lf + rf, w)
+            Minus => float_val(lf - rf, w)
+            Star => float_val(lf * rf, w)
             // C1.6 — POSITION the float ÷0 panic at THIS node before the runtime helper fires.
-            Slash   => { if rf == 0.0 { vm_panic_div0_at(line, col) }; float_val(teko::fdiv(lf, rf), w) }   // CHECKED: float ÷0 PANICS (M.1)
+            Slash => { if rf == 0.0 { vm_panic_div0_at(line, col) }; float_val(teko::fdiv(lf, rf), w) }   // CHECKED: float ÷0 PANICS (M.1)
             Percent => panic("vm: '%' on a float value not supported (checker should reject)")
-            _       => panic("vm: bitwise/shift on a float value not supported (checker should reject)")
+            _ => panic("vm: bitwise/shift on a float value not supported (checker should reject)")
         }
-        return EvalRes { value= fv; env= cur }
+        return EvalRes { value = fv; env = cur }
     }
-    let sgn  = prim_signed(prim); let w = prim_width(prim)
+    let sgn = prim_signed(prim); let w = prim_width(prim)
     let le = eval_expr(b.left, env); let re = eval_expr(b.right, le.env)   // thread left→right
     let l = as_int(le.value); let r = as_int(re.value)
     let cur = re.env
     // C1.6 — POSITION the int ÷0 / %0 panic at THIS node before the runtime helper fires (the
     // runtime div/rem still panic as the canonical message — M.1).
     let iv = match b.op {
-        Slash   => { if r == 0 { vm_panic_div0_at(line, col) }; norm_int(teko::div(l, r, sgn), sgn, w) }   // CHECKED: panics on /0
+        Slash => { if r == 0 { vm_panic_div0_at(line, col) }; norm_int(teko::div(l, r, sgn), sgn, w) }   // CHECKED: panics on /0
         Percent => { if r == 0 { vm_panic_div0_at(line, col) }; norm_int(teko::rem(l, r, sgn), sgn, w) }   // CHECKED: panics on %0
         // +,-,*,&,|,^,<<,>>: plain fixed-width arithmetic. Overflow guarding for +,-,* is
         // DEFERRED to build profiles (panic-debug / wrap-release) — exactly as codegen
         // leaves +,-,* as plain C. norm_int truncates to the prim's width.
-        _       => norm_int(apply_int_op(b.op, l, r, sgn, w), sgn, w)
+        _ => norm_int(apply_int_op(b.op, l, r, sgn, w), sgn, w)
     }
-    EvalRes { value= iv; env= cur }
+    EvalRes { value = iv; env = cur }
 }
 
 // vm_char_to_u32 — decode a char Value (its UTF-8 bytes ride the `str` member) to its scalar
@@ -2723,8 +2723,8 @@ fn eval_cast(c: checker::TCast, ty: checker::Type, line: u32, col: u32, env: Ven
     // StructVal/cell already resolves correctly under either type). Any Named-to-Named cast is
     // this identity pass-through — the checker only ever builds one for this exact feature.
     match c.expr.type {
-        Named => match ty { Named => return EvalRes { value= xe.value; env= cur }; _ => {} }
-        _ => {}
+        Named => match ty { Named => return EvalRes { value = xe.value; env = cur }; _ => { } }
+        _ => { }
     }
     // (UTF-8 increment 1) `char to u32`/u64/i64 — DECODE the codepoint (its UTF-8 bytes, carried as
     // the `str` Value) to its scalar value, normalized to the target int. Mirrors tk_char_to_u32 (the
@@ -2734,29 +2734,29 @@ fn eval_cast(c: checker::TCast, ty: checker::Type, line: u32, col: u32, env: Ven
         checker::Char => {
             let dtgt = num_prim_of(ty, env.prog)
             let cp = vm_char_to_u32(xe.value)
-            return EvalRes { value= norm_int(cp to i128, prim_signed(dtgt), prim_width(dtgt)); env= cur }
+            return EvalRes { value = norm_int(cp to i128, prim_signed(dtgt), prim_width(dtgt)); env = cur }
         }
-        _ => {}
+        _ => { }
     }
     let dst = num_prim_of(ty, env.prog); let src = num_prim_of(c.expr.type, env.prog)
     let sflt = prim_float(src); let dflt = prim_float(dst)
     if sflt && dflt {
-        return EvalRes { value= float_val(as_float(xe.value), prim_width(dst)); env= cur }
+        return EvalRes { value = float_val(as_float(xe.value), prim_width(dst)); env = cur }
     }
     if !sflt && dflt {
-        return EvalRes { value= float_val(teko::int_to_float(as_int(xe.value), prim_signed(src)), prim_width(dst)); env= cur }
+        return EvalRes { value = float_val(teko::int_to_float(as_int(xe.value), prim_signed(src)), prim_width(dst)); env = cur }
     }
     if sflt && !dflt {
         // C1.6 — truncate toward zero; NaN / ±∞ / out-of-range PANIC "impossible conversion",
         // POSITIONED at this node (vm_float_to_int re-derives the runtime check inline so it can
         // prefix line:col before the canonical panic — M.1).
-        return EvalRes { value= norm_int(vm_float_to_int(as_float(xe.value), dst, line, col), prim_signed(dst), prim_width(dst)); env= cur }
+        return EvalRes { value = norm_int(vm_float_to_int(as_float(xe.value), dst, line, col), prim_signed(dst), prim_width(dst)); env = cur }
     }
     let v = as_int(xe.value)
     // C1.6 — int->int narrowing PANIC positioned at this node (vm_cast re-derives the runtime
     // range check inline so it can prefix line:col before the canonical panic — M.1).
-    if cast_may_lose(src, dst) { return EvalRes { value= norm_int(vm_cast(v, src, dst, line, col), prim_signed(dst), prim_width(dst)); env= cur } }
-    EvalRes { value= norm_int(v, prim_signed(dst), prim_width(dst)); env= cur }
+    if cast_may_lose(src, dst) { return EvalRes { value = norm_int(vm_cast(v, src, dst, line, col), prim_signed(dst), prim_width(dst)); env = cur } }
+    EvalRes { value = norm_int(v, prim_signed(dst), prim_width(dst)); env = cur }
 }
 
 // eval_call — builtins first (print/println/assert — all `-> void`, run for effect, no
@@ -2773,7 +2773,7 @@ fn eval_cast(c: checker::TCast, ty: checker::Type, line: u32, col: u32, env: Ven
 fn param_is_ref(f: checker::TFunction, i: u64) -> bool {
     match f.params[i].type_ann {
         parser::NamedType as nt => nt.path.segments[nt.path.segments.len - 1].name == "Ref"
-        _                       => false
+        _ => false
     }
 }
 
@@ -2804,11 +2804,11 @@ fn bind_call_args(f: checker::TFunction, c: checker::TCall, env: Venv) -> BoundA
                     // checker types a Ref-typed arg as Reference, an auto-ref arg as the pointed T.
                     match c.args[ai].type {
                         checker::Reference => argval = read_var(caller, v.name)   // forward the existing RefVal
-                        _                  => {
-                            let p = promote_to_cell(caller, v.name)              // auto-ref: promote the origin var
+                        _ => {
+                            let p = promote_to_cell(caller, v.name)   // auto-ref: promote the origin var
                             caller = p.env
-                            fenv = with_cells(fenv, caller.cells)                // keep the callee's cells in sync with the grown store
-                            argval = RefVal { cell= p.id }
+                            fenv = with_cells(fenv, caller.cells)   // keep the callee's cells in sync with the grown store
+                            argval = RefVal { cell = p.id }
                         }
                     }
                 }
@@ -2830,7 +2830,7 @@ fn bind_call_args(f: checker::TFunction, c: checker::TCall, env: Venv) -> BoundA
         fenv = define(fenv, f.params[ai].name, coerce_to(argval ?? panic("vm: argument produced no value (internal)"), pcoerce))
         ai = ai + 1
     }
-    BoundArgs { fenv= fenv; caller= caller }
+    BoundArgs { fenv = fenv; caller = caller }
 }
 
 // (W10) invoke a closure LITERAL value: bind its params to the evaluated args in a fresh frame, bind
@@ -2858,10 +2858,10 @@ fn eval_lambda_call(fv: FuncVal, c: checker::TCall, env: Venv) -> EvalRes {
     caller = with_cells(caller, fe.env.cells)
     let rv = match fe.flow {
         VmReturn as ret => ret.value ?? panic("vm: void closure call used as a value (internal: checker should reject)")
-        Normal as nm    => nm.value ?? panic("vm: void closure call used as a value (internal: checker should reject)")
-        _               => panic("vm: void closure call used as a value (internal: checker should reject)")
+        Normal as nm => nm.value ?? panic("vm: void closure call used as a value (internal: checker should reject)")
+        _ => panic("vm: void closure call used as a value (internal: checker should reject)")
     }
-    EvalRes { value= rv; env= caller }
+    EvalRes { value = rv; env = caller }
 }
 
 // (W10b.D3) resolve a DYNAMIC contract-method call's target: the concrete class's stamped
@@ -2884,7 +2884,7 @@ fn find_class_method(env: Venv, class_name: str, method: str) -> FnHit? {
                     if teko::str::ends_with(tf.namespace, "::" ~ bname) { return FnHit { func = tf; idx = i } }
                 }
             }
-            _ => {}
+            _ => { }
         }
         i++
     }
@@ -2918,7 +2918,7 @@ fn vm_di_kind_of(env: Venv, impl_name: str) -> parser::DiKind {
         if i >= env.prog.items.len { break }
         match env.prog.items[i] {
             parser::TypeDecl as td => { if checker::name_last_segment(td.name) == impl_name { return td.di_kind } }
-            _ => {}
+            _ => { }
         }
         i++
     }
@@ -2929,14 +2929,14 @@ fn vm_di_kind_of(env: Venv, impl_name: str) -> parser::DiKind {
  *  `di_cache` hit, else build it, cache the ClassRef's cell under the type-id, and return it. */
 fn vm_di_cached(impl_name: str, id: u64, env: Venv) -> EvalRes {
     match vm_di_cache_lookup(env.di_cache, id) {
-        u64 as cell => return EvalRes { value= ClassRef { cell= cell }; env= env }
-        null => {}
+        u64 as cell => return EvalRes { value = ClassRef { cell = cell }; env = env }
+        null => { }
     }
     let built = vm_di_build(impl_name, env)
     match built.value {
         ClassRef as cr => {
-            let cached = teko::list::push(built.env.di_cache, DiCell { type_id= id; cell= cr.cell })
-            return EvalRes { value= built.value; env= vm_with_di_cache(built.env, cached) }
+            let cached = teko::list::push(built.env.di_cache, DiCell { type_id = id; cell = cr.cell })
+            return EvalRes { value = built.value; env = vm_with_di_cache(built.env, cached) }
         }
         _ => built
     }
@@ -2955,7 +2955,7 @@ fn vm_di_cache_lookup(cache: []DiCell, id: u64) -> u64? {
 
 /** (W10c/MEM-3) Rebind the env's DI cache (threaded like `cells`). */
 fn vm_with_di_cache(env: Venv, cache: []DiCell) -> Venv {
-    Venv { slots= env.slots; prog= env.prog; defers= env.defers; cells= env.cells; di_cache= cache }
+    Venv { slots = env.slots; prog = env.prog; defers = env.defers; cells = env.cells; di_cache = cache }
 }
 
 /** (W10c/MEM-3) Build one DI instance by invoking the impl's zero-arg static factory (found by
@@ -2964,8 +2964,8 @@ fn vm_with_di_cache(env: Venv, cache: []DiCell) -> Venv {
 fn vm_di_build(impl_name: str, env: Venv) -> EvalRes {
     let factory = match vm_di_factory_name(env, impl_name) { str as f => f; null => panic(teko::str::concat("vm: DI class has no zero-argument static factory: ", impl_name)) }
     let hit = match find_class_method(env, impl_name, factory) { FnHit as h => h; null => panic(teko::str::concat("vm: DI factory not found: ", impl_name)) }
-    let callee = parser::Path { segments= teko::list::push(teko::list::push(teko::list::empty(), parser::Segment { name= impl_name }), parser::Segment { name= factory }) }
-    let call = checker::TCall { callee= callee; args= teko::list::empty(); call_ns= hit.func.namespace; is_closure_call= false; callee_type= checker::Void { }; is_iface_dispatch= false; iface_slot= 0 }
+    let callee = parser::Path { segments = teko::list::push(teko::list::push(teko::list::empty(), parser::Segment { name = impl_name }), parser::Segment { name = factory }) }
+    let call = checker::TCall { callee = callee; args = teko::list::empty(); call_ns = hit.func.namespace; is_closure_call = false; callee_type = checker::Void { }; is_iface_dispatch = false; iface_slot = 0 }
     eval_call(call, env)
 }
 
@@ -2977,10 +2977,10 @@ fn vm_di_factory_name(env: Venv, impl_name: str) -> str? {
         match env.prog.items[i] {
             parser::TypeDecl as td => {
                 if checker::name_last_segment(td.name) == impl_name {
-                    match td.body { parser::ClassBody as cb => return vm_di_first_static(cb); _ => {} }
+                    match td.body { parser::ClassBody as cb => return vm_di_first_static(cb); _ => { } }
                 }
             }
-            _ => {}
+            _ => { }
         }
         i++
     }
@@ -3057,9 +3057,9 @@ fn eval_iface_call(c: checker::TCall, env: Venv) -> StmtVal {
     caller = with_cells(caller, fe.env.cells)
     mut rv: Value? = null
     match fe.flow {
-        VmReturn as ret => match ret.value { Value as v => { rv = coerce_to(v, f.return_type) }; null => {} }
-        Normal as nm    => match nm.value { Value as v => { rv = coerce_to(v, f.return_type) }; null => {} }
-        _               => {}
+        VmReturn as ret => match ret.value { Value as v => { rv = coerce_to(v, f.return_type) }; null => { } }
+        Normal as nm => match nm.value { Value as v => { rv = coerce_to(v, f.return_type) }; null => { } }
+        _ => { }
     }
     StmtVal { value = rv; env = caller }
 }
@@ -3097,20 +3097,20 @@ fn eval_call(c: checker::TCall, env: Venv) -> EvalRes {
     if !c.is_closure_call {
         match try_builtin(c.callee, c.args, env) {
             BuiltinRes as br => if br.ran { panic("vm: void builtin call used as a value (internal: checker should reject)") }
-            error            => {}                  // not a builtin — fall through to a user fn
+            error => { }   // not a builtin — fall through to a user fn
         }
         // teko::list::empty / push — value-producing SLICE builtins (FIXED+COPY). Recognized
         // before user-fn resolution; null == not a list builtin, fall through.
-        match try_list_builtin(c.callee, c.args, env) { Value as v => return EvalRes { value= v; env= env }; null => {} }
+        match try_list_builtin(c.callee, c.args, env) { Value as v => return EvalRes { value = v; env = env }; null => { } }
         // E2 — err_loc / err_typed — value-producing error-adornment builtins. Recognized before
         // user-fn resolution; null == not an err builtin, fall through.
-        match try_err_builtin(c.callee, c.args, env) { Value as v => return EvalRes { value= v; env= env }; null => {} }
+        match try_err_builtin(c.callee, c.args, env) { Value as v => return EvalRes { value = v; env = env }; null => { } }
         // str/byte STDLIB — value-producing str-returning builtins (str/str_of_bytes/one_byte/
         // str_concat3/ftoa). Recognized before user-fn resolution; null == not a str builtin, fall through.
-        match try_str_builtin(c.callee, c.args, env) { Value as v => return EvalRes { value= v; env= env }; null => {} }
+        match try_str_builtin(c.callee, c.args, env) { Value as v => return EvalRes { value = v; env = env }; null => { } }
         // teko::fs::* host-surface builtins (list_dir). Recognized before user-fn resolution;
         // null == not a fs builtin, fall through. (Mirrors vm.c's list_dir handler.)
-        match try_fs_builtin(c.callee, c.args, env) { Value as v => return EvalRes { value= v; env= env }; null => {} }
+        match try_fs_builtin(c.callee, c.args, env) { Value as v => return EvalRes { value = v; env = env }; null => { } }
     }
     let h = if c.is_closure_call {
         match read_var(env, c.callee.segments[c.callee.segments.len - 1].name) {
@@ -3157,10 +3157,10 @@ fn eval_call(c: checker::TCall, env: Venv) -> EvalRes {
     let fl = fe.flow
     let rv = match fl {
         VmReturn as ret => coerce_to(ret.value ?? panic("vm: void fn call used as a value (internal: checker should reject)"), f.return_type)
-        Normal as nm  => coerce_to(nm.value ?? panic("vm: void fn call used as a value (internal: checker should reject)"), f.return_type)  // W5a — implicit trailing value (B.20)
-        _             => panic("vm: void fn call used as a value (internal: checker should reject)")
+        Normal as nm => coerce_to(nm.value ?? panic("vm: void fn call used as a value (internal: checker should reject)"), f.return_type)   // W5a — implicit trailing value (B.20)
+        _ => panic("vm: void fn call used as a value (internal: checker should reject)")
     }
-    EvalRes { value= rv; env= caller }
+    EvalRes { value = rv; env = caller }
 }
 
 // ---------------------------------------------------------------------------
@@ -3186,9 +3186,9 @@ fn exec_block(body: []checker::TStatement, env: Venv) -> FlowEnv {
 // implicit trailing `return`). Inner scopes (loop body, statement-position arm) discard their trailing
 // value, so they keep the original "run all statements, THEN drain" order — unchanged, already matches.
 fn exec_block_ex(body: []checker::TStatement, env: Venv, is_fn_body: bool) -> FlowEnv {
-    let base = env.defers.len     // (W9.3) this scope's defer base
+    let base = env.defers.len   // (W9.3) this scope's defer base
     mut e = env
-    mut last: Value? = null      // the last NORMAL step's value — the block's trailing value (B.20)
+    mut last: Value? = null   // the last NORMAL step's value — the block's trailing value (B.20)
     mut i = 0
     loop {
         if i >= body.len { break }
@@ -3201,8 +3201,8 @@ fn exec_block_ex(body: []checker::TStatement, env: Venv, is_fn_body: bool) -> Fl
         if is_fn_tail {
             let de = drain_defers_to(e, base)   // fire the body's defers BEFORE the trailing expr
             match exec_stmt(body[i], de) {
-                Stepped as st => return FlowEnv { flow= Normal { value= st.value }; env= st.env }
-                Exit as ex    => return FlowEnv { flow= ex.flow; env= drain_defers_to(ex.env, base) }
+                Stepped as st => return FlowEnv { flow = Normal { value = st.value }; env = st.env }
+                Exit as ex => return FlowEnv { flow = ex.flow; env = drain_defers_to(ex.env, base) }
             }
         }
         match exec_stmt(body[i], e) {
@@ -3210,12 +3210,12 @@ fn exec_block_ex(body: []checker::TStatement, env: Venv, is_fn_body: bool) -> Fl
             Stepped as st => { e = st.env; last = st.value }
             // VmReturn / Break / Continue escape — carry the env AT THE EXIT so mutations before it
             // survive. (W9.3) Fire THIS block's defers FIRST, then propagate the flow outward.
-            Exit as ex    => return FlowEnv { flow= ex.flow; env= drain_defers_to(ex.env, base) }
+            Exit as ex => return FlowEnv { flow = ex.flow; env = drain_defers_to(ex.env, base) }
         }
         i++
     }
     // (W9.3) normal fall-through: fire THIS block's defers LIFO, then thread the drained env out.
-    FlowEnv { flow= Normal { value= last }; env= drain_defers_to(e, base) }
+    FlowEnv { flow = Normal { value = last }; env = drain_defers_to(e, base) }
 }
 
 /** (W9.3 part 2) Is this statement a plain value-carrying expr-statement (NOT an `if`/`match`,
@@ -3226,9 +3226,9 @@ pub fn is_plain_expr_stmt(s: checker::TStatement) -> bool {
     match s {
         checker::TExprStmt as x => {
             match x.expr {
-                checker::TIfExpr as _    => false
+                checker::TIfExpr as _ => false
                 checker::TMatchExpr as _ => false
-                _              => true
+                _ => true
             }
         }
         _ => false
@@ -3261,7 +3261,7 @@ type FlowEnv = struct { flow: Flow; env: Venv }
     persisted Venv, exactly like `run`'s own top-level loop below. */
 pub fn exec_stmt(s: checker::TStatement, env: Venv) -> Step {
     match s {
-        checker::TBinding as b  => {
+        checker::TBinding as b => {
             // Only SimpleName is lowered for M0 (destructuring is the honest frontier).
             // The RHS may be an `if`/`match` whose arm/branch DIVERGES (`error as e => return e`):
             // run it FLOW-AWARE so a return/break/continue propagates instead of binding.
@@ -3271,14 +3271,14 @@ pub fn exec_stmt(s: checker::TStatement, env: Venv) -> Step {
                     match fe.flow {
                         // present-wrap into a `T?` slot (REBOOT §202) via coerce_to(b.bound). Define on
                         // fe.env so any mutation the RHS made to an outer `mut` is kept, then bind on top.
-                        Normal as nm => Stepped { env= define(fe.env, sn.name, coerce_to(nm.value ?? panic("vm: binding RHS produced no value (internal: checker should reject)"), b.bound)); value= null }
+                        Normal as nm => Stepped { env = define(fe.env, sn.name, coerce_to(nm.value ?? panic("vm: binding RHS produced no value (internal: checker should reject)"), b.bound)); value = null }
                         // diverged (return/break/continue inside the RHS) → propagate WITH the env, no bind.
-                        VmReturn as f => Exit { flow= f; env= fe.env }
-                        Break as f    => Exit { flow= f; env= fe.env }
-                        Continue as f => Exit { flow= f; env= fe.env }
+                        VmReturn as f => Exit { flow = f; env = fe.env }
+                        Break as f => Exit { flow = f; env = fe.env }
+                        Continue as f => Exit { flow = f; env = fe.env }
                     }
                 }
-                _                => { panic("vm: destructuring binding not yet supported") }
+                _ => { panic("vm: destructuring binding not yet supported") }
             }
         }
         // An assign is a NORMAL step with NO trailing value (value: null) — it keeps the env.
@@ -3287,7 +3287,7 @@ pub fn exec_stmt(s: checker::TStatement, env: Venv) -> Step {
         // TAssign carries no line/col, but its `value` TExpr does), mirroring the C twin which
         // panics at `&s->as.assign.value`. The runtime div/rem still panic as the canonical
         // message (M.1); we only prefix line:col first.
-        checker::TAssign as a   => {
+        checker::TAssign as a => {
             let re = eval_expr(a.value, env)   // (MEM Step 4) thread the RHS env (a value-position ref call there grows cells)
             let rhs = re.value
             let renv = re.env
@@ -3300,7 +3300,7 @@ pub fn exec_stmt(s: checker::TStatement, env: Venv) -> Step {
             let is_field = match a.kind { parser::AssignKind::Field => true; _ => false }
             if is_field {
                 let env2 = field_assign(a.target, a.op, rhs, a.bound, renv)
-                return Stepped { env= env2; value= null }
+                return Stepped { env = env2; value = null }
             }
             // (MEM Step 2/3) `r.value op= x` writes THROUGH a reference: `a.name` names the `Ref<T>`
             // binding (a RefVal cell index); a deref-assign reads the cell, applies the op, and writes
@@ -3315,14 +3315,14 @@ pub fn exec_stmt(s: checker::TStatement, env: Venv) -> Step {
                 // value (the VM==native divergence: native's deref-assign emit_as already wraps).
                 let newval = coerce_to(compound_apply(cur, a.op, rhs), a.bound)
                 let env2 = with_cells(renv, cell_set(renv.cells, rv.cell, newval))
-                Stepped { env= env2; value= null }
+                Stepped { env = env2; value = null }
             } else {
-                let env2 = mutate_slot(renv, a.name, a.op, rhs); Stepped { env= env2; value= null }
+                let env2 = mutate_slot(renv, a.name, a.op, rhs); Stepped { env = env2; value = null }
             }
         }
         // `return e` rides a present value; a bare `return` carries null. The value may itself be
         // an `if`/`match` whose arm DIVERGES — run it flow-aware so an inner return propagates.
-        checker::TReturn as r   => {
+        checker::TReturn as r => {
             // (W9.3 part 2) A `return` leaves EVERY enclosing scope: fire ALL in-scope frame defers
             // (down to base 0) LIFO — innermost-block-first — BEFORE evaluating the return value, so a
             // defer that mutates the variable being returned is observed. Mirrors codegen's
@@ -3332,14 +3332,14 @@ pub fn exec_stmt(s: checker::TStatement, env: Venv) -> Step {
             if r.has_value {
                 let fe = eval_rhs_flow(r.value, denv)
                 match fe.flow {
-                    Normal as nm => Exit { flow= VmReturn { value= nm.value }; env= fe.env }
+                    Normal as nm => Exit { flow = VmReturn { value = nm.value }; env = fe.env }
                     // inner return/break/continue inside the returned value → propagate.
-                    VmReturn as f => Exit { flow= f; env= fe.env }
-                    Break as f    => Exit { flow= f; env= fe.env }
-                    Continue as f => Exit { flow= f; env= fe.env }
+                    VmReturn as f => Exit { flow = f; env = fe.env }
+                    Break as f => Exit { flow = f; env = fe.env }
+                    Continue as f => Exit { flow = f; env = fe.env }
                 }
             } else {
-                Exit { flow= VmReturn { value= null }; env= denv }
+                Exit { flow = VmReturn { value = null }; env = denv }
             }
         }
         // W5a — an `if`/`match` in statement/tail position runs as CONTROL FLOW (exec_if/exec_match),
@@ -3348,30 +3348,30 @@ pub fn exec_stmt(s: checker::TStatement, env: Venv) -> Step {
         // (a `-> void` call carries null — it produces no Value, run for effect).
         checker::TExprStmt as x => {
             match x.expr {
-                checker::TIfExpr as _    => step_of_flow(exec_if(x.expr, env))
+                checker::TIfExpr as _ => step_of_flow(exec_if(x.expr, env))
                 checker::TMatchExpr as _ => step_of_flow(exec_match(x.expr, env))
                 // (MEM Step 2/3) thread the env out of eval_stmt_value: a statement-position call may
                 // write through a `Ref<T>` arg, growing/mutating the caller's cell store — keep it.
-                _              => { let sv = eval_stmt_value(x.expr, env); Stepped { env= sv.env; value= sv.value } }
+                _ => { let sv = eval_stmt_value(x.expr, env); Stepped { env = sv.env; value = sv.value } }
             }
         }
-        checker::TLoopStmt as l     => {
+        checker::TLoopStmt as l => {
             // while(1){…} with break/continue. run_loop returns the OUTER env after the last
             // iteration (so outer-`mut` updates survive the loop — the functional twin of the C's
             // in-place env). A NORMAL completion CONTINUES the block (Stepped); a return / labeled
             // break-or-continue to an enclosing loop EXITS (Exit, carrying the loop's outer env).
             let lo = run_loop(l.label, l.body, env)
             match lo.flow {
-                Normal => Stepped { env= lo.env; value= null }
-                _      => Exit { flow= lo.flow; env= lo.env }
+                Normal => Stepped { env = lo.env; value = null }
+                _ => Exit { flow = lo.flow; env = lo.env }
             }
         }
-        checker::TBreakStmt as b    => Exit { flow= Break { label= b.label }; env= env }
-        checker::TContinueStmt as c => Exit { flow= Continue { label= c.label }; env= env }
+        checker::TBreakStmt as b => Exit { flow = Break { label = b.label }; env = env }
+        checker::TContinueStmt as c => Exit { flow = Continue { label = c.label }; env = env }
         // (C7.18) A defer statement registers the block; it executes LIFO at function exit.
         // The VM drains the defer list in eval_call after exec_block completes.
         // Panic does NOT drain deferred blocks.
-        checker::TDeferStmt as d    => Stepped { env= push_defer(env, d.body); value= null }
+        checker::TDeferStmt as d => Stepped { env = push_defer(env, d.body); value = null }
     }
 }
 
@@ -3381,11 +3381,11 @@ pub fn exec_stmt(s: checker::TStatement, env: Venv) -> Step {
 // and rides a NORMAL flow carrying its value. Mirrors the C `eval_rhs_flow`.
 fn eval_rhs_flow(e: checker::TExpr, env: Venv) -> FlowEnv {
     match e {
-        checker::TIfExpr as _    => exec_if(e, env)        // FlowEnv — mutations inside the RHS branch propagate
-        checker::TMatchExpr as _ => exec_match(e, env)     // FlowEnv — same for a match RHS
+        checker::TIfExpr as _ => exec_if(e, env)   // FlowEnv — mutations inside the RHS branch propagate
+        checker::TMatchExpr as _ => exec_match(e, env)   // FlowEnv — same for a match RHS
         // (MEM Step 4) a plain RHS may be a value-position ref call (`let y = bump(x)`): thread its
         // env out so the auto-ref'd cell write survives into the binding's env (then the bind defines on it).
-        _              => { let re = eval_expr(e, env); FlowEnv { flow= Normal { value= re.value }; env= re.env } }
+        _ => { let re = eval_expr(e, env); FlowEnv { flow = Normal { value = re.value }; env = re.env } }
     }
 }
 
@@ -3395,8 +3395,8 @@ fn eval_rhs_flow(e: checker::TExpr, env: Venv) -> FlowEnv {
 // returning the `exec_if` flow (whose NORMAL value is the statement's value).
 fn step_of_flow(fe: FlowEnv) -> Step {
     match fe.flow {
-        Normal as nm => Stepped { env= fe.env; value= nm.value }   // thread the branch's (mutated) env + value
-        _            => Exit { flow= fe.flow; env= fe.env }         // return/break/continue propagate WITH the env
+        Normal as nm => Stepped { env = fe.env; value = nm.value }   // thread the branch's (mutated) env + value
+        _ => Exit { flow = fe.flow; env = fe.env }   // return/break/continue propagate WITH the env
     }
 }
 
@@ -3409,8 +3409,8 @@ type StmtVal = struct { value: Value?; env: Venv }
 fn eval_stmt_value(e: checker::TExpr, env: Venv) -> StmtVal {
     teko::cov_line(e.line)   // D3-line — a statement-position CALL goes to call_value (bypassing eval_expr), so mark its line here (matches vm.c, which routes stmt calls through eval_expr)
     match e {
-        checker::TCall as c => call_value(c, env)                          // threads the caller env out (Ref<T> writes)
-        _          => { let re = eval_expr(e, env); StmtVal { value= re.value; env= re.env } }   // (MEM Step 4) thread env (a nested ref call grows cells)
+        checker::TCall as c => call_value(c, env)   // threads the caller env out (Ref<T> writes)
+        _ => { let re = eval_expr(e, env); StmtVal { value = re.value; env = re.env } }   // (MEM Step 4) thread env (a nested ref call grows cells)
     }
 }
 
@@ -3435,7 +3435,7 @@ fn call_value(c: checker::TCall, env: Venv) -> StmtVal {
     // NAMED-fn value resolves THAT function (W10a). Otherwise resolve the callee path.
     if c.is_closure_call {
         match read_var(env, c.callee.segments[c.callee.segments.len - 1].name) {
-            FuncVal as fv => if fv.is_lambda { let r = eval_lambda_call(fv, c, env); return StmtVal { value= r.value; env= r.env } } else { }
+            FuncVal as fv => if fv.is_lambda { let r = eval_lambda_call(fv, c, env); return StmtVal { value = r.value; env = r.env } } else { }
             _ => { }
         }
     }
@@ -3449,17 +3449,17 @@ fn call_value(c: checker::TCall, env: Venv) -> StmtVal {
     // A `false`/`error` result == "not a builtin": run the user fn.
     if !c.is_closure_call {
         match try_builtin(c.callee, c.args, env) {
-            BuiltinRes as br => if br.ran { return StmtVal { value= null; env= br.env } }
-            error            => {}
+            BuiltinRes as br => if br.ran { return StmtVal { value = null; env = br.env } }
+            error => { }
         }
         // VALUE-producing builtins — a statement-position call can be a function's TRAILING expression
         // (B.20), e.g. `fn empty_table() -> TypeTable { teko::list::empty() }`. Route them exactly like
         // eval_call (list/err/str/fs) BEFORE user-fn resolution; without this a trailing `teko::list::empty()`
         // fell through to find_function("empty") → "host function the VM cannot run". (No ref args.)
-        match try_list_builtin(c.callee, c.args, env) { Value as v => return StmtVal { value= v; env= env }; null => {} }
-        match try_err_builtin(c.callee, c.args, env)  { Value as v => return StmtVal { value= v; env= env }; null => {} }
-        match try_str_builtin(c.callee, c.args, env)  { Value as v => return StmtVal { value= v; env= env }; null => {} }
-        match try_fs_builtin(c.callee, c.args, env)   { Value as v => return StmtVal { value= v; env= env }; null => {} }
+        match try_list_builtin(c.callee, c.args, env) { Value as v => return StmtVal { value = v; env = env }; null => { } }
+        match try_err_builtin(c.callee, c.args, env) { Value as v => return StmtVal { value = v; env = env }; null => { } }
+        match try_str_builtin(c.callee, c.args, env) { Value as v => return StmtVal { value = v; env = env }; null => { } }
+        match try_fs_builtin(c.callee, c.args, env) { Value as v => return StmtVal { value = v; env = env }; null => { } }
     }
     let h = if c.is_closure_call {
         match read_var(env, c.callee.segments[c.callee.segments.len - 1].name) {
@@ -3493,9 +3493,9 @@ fn call_value(c: checker::TCall, env: Venv) -> StmtVal {
     // the write is already visible; this is the value-functional twin of that shared-pointer effect.)
     caller = with_cells(caller, fe2.env.cells)
     match fe2.flow {
-        VmReturn as ret => StmtVal { value= ret.value; env= caller }      // explicit `return e` (or bare return -> null)
-        Normal as nm  => StmtVal { value= nm.value; env= caller }       // W5a — implicit trailing value (B.20); null if none
-        _             => StmtVal { value= null; env= caller }            // break/continue can't escape a fn body
+        VmReturn as ret => StmtVal { value = ret.value; env = caller }   // explicit `return e` (or bare return -> null)
+        Normal as nm => StmtVal { value = nm.value; env = caller }   // W5a — implicit trailing value (B.20); null if none
+        _ => StmtVal { value = null; env = caller }   // break/continue can't escape a fn body
     }
 }
 
@@ -3524,7 +3524,7 @@ fn loop_outer(slots: []Slot, n: u64) -> []Slot {
 type LoopOut = struct { flow: Flow; env: Venv }
 
 fn run_loop(mylabel: str, body: []checker::TStatement, env: Venv) -> LoopOut {
-    let base = env.slots.len     // outer scope size: per-iteration locals are appended ABOVE this
+    let base = env.slots.len   // outer scope size: per-iteration locals are appended ABOVE this
     mut cur = env
     loop {
         // Run the body with PER-STATEMENT env threading (like exec_block), but CARRY the resulting
@@ -3542,25 +3542,25 @@ fn run_loop(mylabel: str, body: []checker::TStatement, env: Venv) -> LoopOut {
         loop {
             if i >= body.len { break }
             match exec_stmt(body[i], e) {
-                Stepped as st => { e = st.env }                 // thread the env forward
-                Exit as ex    => { exflow = ex.flow; e = ex.env; exited = true; break }   // keep mutations made before the exit
+                Stepped as st => { e = st.env }   // thread the env forward
+                Exit as ex => { exflow = ex.flow; e = ex.env; exited = true; break }   // keep mutations made before the exit
             }
             i = i + 1
         }
         e = drain_defers_to(e, dbase)   // (W9.3) fire this iteration's defers LIFO, then pop them
-        cur = Venv { slots = loop_outer(e.slots, base); prog = e.prog; defers= cur.defers; cells= e.cells; di_cache= e.di_cache }
+        cur = Venv { slots = loop_outer(e.slots, base); prog = e.prog; defers = cur.defers; cells = e.cells; di_cache = e.di_cache }
         if exited {
             match exflow {
                 VmReturn as ret => return LoopOut { flow = ret; env = cur }
-                Break as b    => {
+                Break as b => {
                     if b.label.len == 0 || vm_str_eq(b.label, mylabel) { break }   // this loop → done
-                    return LoopOut { flow = b; env = cur }                          // propagate to outer
+                    return LoopOut { flow = b; env = cur }   // propagate to outer
                 }
                 Continue as c => {
                     if c.label.len > 0 && !vm_str_eq(c.label, mylabel) { return LoopOut { flow = c; env = cur } }   // not ours → propagate
                     // ours → fall through to re-iterate (outer mutations up to the `continue` are kept)
                 }
-                _ => {}
+                _ => { }
             }
         }
     }
@@ -3574,7 +3574,7 @@ fn run_loop(mylabel: str, body: []checker::TStatement, env: Venv) -> LoopOut {
 fn exec_if(e: checker::TExpr, env: Venv) -> FlowEnv {
     match e {
         checker::TIfExpr as f => {
-            let base = env.slots.len      // outer scope size: the branch's block-locals sit above it
+            let base = env.slots.len   // outer scope size: the branch's block-locals sit above it
             let ce = eval_expr(f.cond, env)   // (MEM Step 4) thread the cond env (a ref call in the cond grows cells)
             let c = as_bool(ce.value)
             let cenv = ce.env
@@ -3585,14 +3585,14 @@ fn exec_if(e: checker::TExpr, env: Venv) -> FlowEnv {
             if c {
                 teko::cov_branch(e.line, e.col, 0)
                 let bo = exec_block(f.then_blk, cenv)
-                return FlowEnv { flow= bo.flow; env= Venv { slots= loop_outer(bo.env.slots, base); prog= bo.env.prog; defers= bo.env.defers; cells= bo.env.cells; di_cache= bo.env.di_cache } }
+                return FlowEnv { flow = bo.flow; env = Venv { slots = loop_outer(bo.env.slots, base); prog = bo.env.prog; defers = bo.env.defers; cells = bo.env.cells; di_cache = bo.env.di_cache } }
             }
             teko::cov_branch(e.line, e.col, 1)
             if f.has_else {
                 let bo = exec_block(f.else_blk, cenv)
-                return FlowEnv { flow= bo.flow; env= Venv { slots= loop_outer(bo.env.slots, base); prog= bo.env.prog; defers= bo.env.defers; cells= bo.env.cells; di_cache= bo.env.di_cache } }
+                return FlowEnv { flow = bo.flow; env = Venv { slots = loop_outer(bo.env.slots, base); prog = bo.env.prog; defers = bo.env.defers; cells = bo.env.cells; di_cache = bo.env.di_cache } }
             }
-            FlowEnv { flow= Normal { value= null }; env= cenv }    // if-without-else taken false: no value, cells may have grown
+            FlowEnv { flow = Normal { value = null }; env = cenv }   // if-without-else taken false: no value, cells may have grown
         }
         _ => panic("vm: exec_if on a non-if expression (internal: checker should reject)")
     }
@@ -3605,7 +3605,7 @@ fn exec_if(e: checker::TExpr, env: Venv) -> FlowEnv {
 // ---------------------------------------------------------------------------
 exp fn run(prog: checker::TProgram) -> i32 {
     mut env = fresh_env(prog, teko::list::empty())   // (MEM Step 2/3) the root frame starts with an empty cell store
-    mut last: Value? = null      // W5a — the last NORMAL top-level statement's trailing value (B.20)
+    mut last: Value? = null   // W5a — the last NORMAL top-level statement's trailing value (B.20)
     mut i = 0
     loop {
         if i >= prog.items.len { break }
@@ -3618,16 +3618,16 @@ exp fn run(prog: checker::TProgram) -> i32 {
                     Stepped as st => { env = st.env; last = st.value }
                     // A top-level VmReturn is an early process exit (like main's `return (int)n`).
                     // Break/Continue can't escape the virtual-main — the checker rejects them.
-                    Exit as ex    => {
+                    Exit as ex => {
                         match ex.flow {
                             VmReturn as ret => return exit_code_of(ret.value)
-                            Normal as nm  => { last = nm.value }   // a tail `if` routed via exec_if rides NORMAL
-                            _             => {}   // break/continue: unreachable at top level
+                            Normal as nm => { last = nm.value }   // a tail `if` routed via exec_if rides NORMAL
+                            _ => { }   // break/continue: unreachable at top level
                         }
                     }
                 }
             }
-            _ => {}                                  // functions/types/uses: not run here
+            _ => { }   // functions/types/uses: not run here
         }
         i++
     }
@@ -3644,8 +3644,8 @@ exp fn run(prog: checker::TProgram) -> i32 {
 // fn body) and query cov_branch_hit per outcome to get taken/total. Function-level line coverage
 // reuses cov_is_marked (the same per-fn mark the % summary uses).
 // ---------------------------------------------------------------------------
-type BranchSite = struct { line: u32; col: u32; n: u64 }            // n = number of outcomes
-type CovWalk    = struct { sites: []BranchSite; lines: []u32 }      // branch sites + DISTINCT executable lines
+type BranchSite = struct { line: u32; col: u32; n: u64 }   // n = number of outcomes
+type CovWalk = struct { sites: []BranchSite; lines: []u32 }   // branch sites + DISTINCT executable lines
 
 fn cov_walk_empty() -> CovWalk { CovWalk { sites = teko::list::empty(); lines = teko::list::empty() } }
 // add e.line to the distinct-line set (skip 0 = unpositioned; a fn has few lines, so linear dedup is fine).
@@ -3744,9 +3744,9 @@ fn cov_walk_expr(e: checker::TExpr, w: CovWalk) -> CovWalk {
 
 fn cov_walk_stmt(s: checker::TStatement, w: CovWalk) -> CovWalk {
     match s {
-        checker::TBinding as b  => cov_walk_expr(b.value, w)
-        checker::TAssign as a   => { let w2 = cov_walk_expr(a.value, w); match a.kind { parser::AssignKind::Field => cov_walk_expr(a.target, w2); _ => w2 } }   // (#88) the FIELD LHS receiver is executable too
-        checker::TReturn as r   => if r.has_value { cov_walk_expr(r.value, w) } else { w }
+        checker::TBinding as b => cov_walk_expr(b.value, w)
+        checker::TAssign as a => { let w2 = cov_walk_expr(a.value, w); match a.kind { parser::AssignKind::Field => cov_walk_expr(a.target, w2); _ => w2 } }   // (#88) the FIELD LHS receiver is executable too
+        checker::TReturn as r => if r.has_value { cov_walk_expr(r.value, w) } else { w }
         checker::TLoopStmt as l => cov_walk_block(l.body, w)
         checker::TExprStmt as x => cov_walk_expr(x.expr, w)
         _ => w   // break/continue — no expr
@@ -3794,7 +3794,7 @@ fn cov_line_branch(sites: []BranchSite, fn_idx: u64, ln: u32) -> LineBr {
 exp fn cov_cobertura(prog: checker::TProgram) -> str {
     mut body = ""
     mut lines_cov: u64 = 0; mut lines_val: u64 = 0
-    mut br_cov: u64 = 0;    mut br_val: u64 = 0
+    mut br_cov: u64 = 0; mut br_val: u64 = 0
     mut i = 0
     loop {
         if i >= prog.items.len { break }
@@ -3843,7 +3843,7 @@ exp fn cov_cobertura(prog: checker::TProgram) -> str {
                     body = teko::str::concat(body, "        </lines>\n      </class>\n")
                 }
             }
-            _ => {}
+            _ => { }
         }
         i++
     }
@@ -3877,7 +3877,7 @@ exp fn run_tests(prog: checker::TProgram) -> i32 { run_tests_cov(prog, false, fa
 // run (off by default — a plain run pays only one flag-check per branch); afterward it writes the
 // XML to `cov_path` (the caller picks `<out>/cobertura.xml`). Mirrors vm.c's run_tests_cov.
 exp fn run_tests_cov(prog: checker::TProgram, record_branches: bool, write_xml: bool, cov_path: str) -> i32 {
-    teko::cov_reset()        // D3 — start a fresh coverage run; eval_call marks each production fn it enters
+    teko::cov_reset()   // D3 — start a fresh coverage run; eval_call marks each production fn it enters
     // the GATE records lines+branches even without --coverage (for the floors).
     if record_branches { teko::cov_branch_reset(); teko::cov_branches_on(true); teko::cov_line_reset(); teko::cov_lines_on(true) }
     mut passed: u64 = 0
@@ -3904,7 +3904,7 @@ exp fn run_tests_cov(prog: checker::TProgram, record_branches: bool, write_xml: 
                     teko::arena_pop()   // free this test's transient arena span (coverage already recorded off-arena)
                 }
             }
-            _ => {}
+            _ => { }
         }
         i++
     }
@@ -3959,7 +3959,7 @@ exp fn line_coverage(prog: checker::TProgram) -> CovCount {
                     }
                 }
             }
-            _ => {}
+            _ => { }
         }
         i++
     }
@@ -3989,7 +3989,7 @@ exp fn branch_coverage(prog: checker::TProgram) -> CovCount {
                     }
                 }
             }
-            _ => {}
+            _ => { }
         }
         i++
     }
@@ -4010,7 +4010,7 @@ fn count_prod_fns(prog: checker::TProgram) -> u64 {
             // NATIVE VM and are never reached via find_function during interpretation, so counting them
             // would permanently depress coverage. Mirrors vm.c's count_prod_fns (the vm_ns skip).
             checker::TFunction as f => { if !f.is_test && f.namespace != "teko::vm" { n = n + 1 } }
-            _ => {}
+            _ => { }
         }
         i++
     }

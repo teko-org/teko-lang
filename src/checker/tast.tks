@@ -10,66 +10,66 @@ use teko::parser
 pub type TExpr = struct {
     kind: TExprKind
     type: Type
-    line: u32        // (C1-POS/E1) source position copied from the untyped Expr; 0 = unknown
-    col:  u32
+    line: u32   // (C1-POS/E1) source position copied from the untyped Expr; 0 = unknown
+    col: u32
 }
 
 // leaves + operators (mirror Expr; children are TExpr — the whole tree is typed).
 // same contract as ast Number (N1): raw value; `.type` decides width/float-kind.
 // (`value` is the integer carrier — canonical Teko uses i128; C bootstrap uses __int128.)
-pub type TNumber  = struct { is_float: bool; value: i128; fval: f64 }
-pub type TVar     = struct { name: str; is_func: bool; func_ns: str }   // (W10a) is_func = a bare reference to a top-level fn used as a VALUE → lowers to a `tk_closure` literal; func_ns = the fn's declaring namespace (for the C symbol mangle). A local of closure type has is_func=false (emits the bare name).
-pub type TStrLit  = struct { text: str }
+pub type TNumber = struct { is_float: bool; value: i128; fval: f64 }
+pub type TVar = struct { name: str; is_func: bool; func_ns: str }   // (W10a) is_func = a bare reference to a top-level fn used as a VALUE → lowers to a `tk_closure` literal; func_ns = the fn's declaring namespace (for the C symbol mangle). A local of closure type has is_func=false (emits the bare name).
+pub type TStrLit = struct { text: str }
 pub type TByteLit = struct { value: byte }
-pub type TCharLit = struct { bytes: str }    // c'x' — one UTF-8 codepoint; `.type` is `char`. Carries the raw UTF-8 bytes.
+pub type TCharLit = struct { bytes: str }   // c'x' — one UTF-8 codepoint; `.type` is `char`. Carries the raw UTF-8 bytes.
 pub type TBoolLit = struct { value: bool }   // `true`/`false` — `.type` is the bool prim (LEGISLATION §75)
-pub type TNullLit = struct { }               // `null` — `.type` is the inferred Optional (REBOOT_PLAN §202)
-pub type TBinary  = struct { op: lexer::TokenKind; left: TExpr; right: TExpr }
-pub type TUnary   = struct { op: lexer::TokenKind; operand: TExpr }
+pub type TNullLit = struct { }   // `null` — `.type` is the inferred Optional (REBOOT_PLAN §202)
+pub type TBinary = struct { op: lexer::TokenKind; left: TExpr; right: TExpr }
+pub type TUnary = struct { op: lexer::TokenKind; operand: TExpr }
 pub type TCmpTerm = struct { op: lexer::TokenKind; operand: TExpr }
 pub type TCompare = struct { first: TExpr; rest: []TCmpTerm }
-pub type TCall    = struct { callee: parser::Path; args: []TExpr; call_ns: str; is_closure_call: bool; callee_type: Type; is_iface_dispatch: bool; iface_slot: u32 }   // call_ns: resolved target's namespace ("" = builtin/local → no mangle) (#41/#49). (W10a) is_closure_call = the callee is a LOCAL of function type (a `tk_closure` VALUE) → codegen calls through `((R(*)(A,B))f.fn)(args)` using callee_type (the Func) for the cast; false (callee_type unused) for a direct/builtin call. (W10b.D3) is_iface_dispatch = a DYNAMIC contract-method call: callee = [<Iface>, <method>], args[0] = the receiver, callee_type = the resolved interface-method Func (receiver param typed Named{Iface}), iface_slot = the method's index in the interface's effective-method list (== its vtable slot).
+pub type TCall = struct { callee: parser::Path; args: []TExpr; call_ns: str; is_closure_call: bool; callee_type: Type; is_iface_dispatch: bool; iface_slot: u32 }   // call_ns: resolved target's namespace ("" = builtin/local → no mangle) (#41/#49). (W10a) is_closure_call = the callee is a LOCAL of function type (a `tk_closure` VALUE) → codegen calls through `((R(*)(A,B))f.fn)(args)` using callee_type (the Func) for the cast; false (callee_type unused) for a direct/builtin call. (W10b.D3) is_iface_dispatch = a DYNAMIC contract-method call: callee = [<Iface>, <method>], args[0] = the receiver, callee_type = the resolved interface-method Func (receiver param typed Named{Iface}), iface_slot = the method's index in the interface's effective-method list (== its vtable slot).
 
 // control-flow expressions carry TYPED blocks/arms (B.20/B.15). The `pattern` stays
 // syntactic (it binds; pattern typing itself is C7a); `guard` is valid iff has_when.
-pub type TArm   = struct { pattern: parser::Pattern; has_when: bool; guard: TExpr; body: []TStatement }   // pub: TMatchExpr.arms surface + the .tkb codec (C7.16). body is a STATEMENT BLOCK, like a TIfExpr branch (B.20)
-pub type TIfExpr    = struct { cond: TExpr; then_blk: []TStatement; has_else: bool; else_blk: []TStatement }
+pub type TArm = struct { pattern: parser::Pattern; has_when: bool; guard: TExpr; body: []TStatement }   // pub: TMatchExpr.arms surface + the .tkb codec (C7.16). body is a STATEMENT BLOCK, like a TIfExpr branch (B.20)
+pub type TIfExpr = struct { cond: TExpr; then_blk: []TStatement; has_else: bool; else_blk: []TStatement }
 pub type TMatchExpr = struct { subject: TExpr; arms: []TArm }
-pub type TCast      = struct { expr: TExpr }   // `x to T` (C2): the cast's target IS this node's resolved `.type`
+pub type TCast = struct { expr: TExpr }   // `x to T` (C2): the cast's target IS this node's resolved `.type`
 pub type TFieldAccess = struct { receiver: TExpr; field: str }   // `x.field` (C3): `.type` is the field's resolved type (B.29 field-read)
 pub type TSafeFieldAccess = struct { receiver: TExpr; field: str }   // `recv?.field` (REBOOT_PLAN §203): optional receiver, `.type` is `(field)?`
-pub type TCoalesce  = struct { left: TExpr; right: TExpr }   // `a ?? b` (REBOOT_PLAN §203): optional left, `.type` is the unwrapped/result type
+pub type TCoalesce = struct { left: TExpr; right: TExpr }   // `a ?? b` (REBOOT_PLAN §203): optional left, `.type` is the unwrapped/result type
 // `Name { f = v, … }` (W4a): `.type` is the named struct type; field_names/field_vals are
 // in the struct's DECLARED order (the checker reorders), so both backends lower identically.
 pub type TStructInit = struct { field_names: []str; field_vals: []TExpr }
 // `recv[index]` (W5-idx): `.type` is the element type — byte for a `str` receiver, the
 // slice's element type for a `[]T` receiver. The index is an integer-typed TExpr.
-pub type TIndex      = struct { receiver: TExpr; index: TExpr }
+pub type TIndex = struct { receiver: TExpr; index: TExpr }
 // Format spec for a $"…{expr:spec}…" hole. Three cases:
 //   TFSpecNone    — no colon (existing behavior)
 //   TFSpecStatic  — `:literal` e.g. "F2"
 //   TFSpecDynamic — `:[arg1, arg2, …]` typed arg expressions
-pub type TFSpecNone    = struct { }
-pub type TFSpecStatic  = struct { s: str }
+pub type TFSpecNone = struct { }
+pub type TFSpecStatic = struct { s: str }
 pub type TFSpecDynamic = struct { args: []TExpr }
-pub type TFSpecKind    = variant TFSpecNone | TFSpecStatic | TFSpecDynamic
-pub type TFSpec        = struct { kind: TFSpecKind }
+pub type TFSpecKind = variant TFSpecNone | TFSpecStatic | TFSpecDynamic
+pub type TFSpec = struct { kind: TFSpecKind }
 // `$"…{expr}…"` (self-host parity): `.type` is `str`. The string is pieces[0] ++ str(holes[0])
 // ++ pieces[1] ++ … ++ pieces[nholes] (pieces.len == holes.len + 1). Each hole carries its own
 // resolved type (str passthrough vs integer→decimal text), so both backends lower it identically.
 // specs[i] carries the optional format spec for holes[i] (specs.len == holes.len).
-pub type TInterp      = struct { pieces: []str; holes: []TExpr; specs: []TFSpec }
+pub type TInterp = struct { pieces: []str; holes: []TExpr; specs: []TFSpec }
 // `<expr> in [ … ]` (Phase 2): `.type` is bool. The lhs is EVALUATED ONCE; the result is true
 // iff lhs equals any element. Both lhs and the elements are typed TExprs, so both backends lower
 // it identically (differential equivalence).
-pub type TInExpr     = struct { lhs: TExpr; elems: []TExpr }
+pub type TInExpr = struct { lhs: TExpr; elems: []TExpr }
 // `[ e0, e1, … ]` (Increment B+): `.type` is `[]T` (the unified element type). Each element is a
 // typed TExpr already adopted into T, so both backends lower it identically (build a `[]T` value).
 // A spread element (`..xs`) carries is_spread=true; its expr was type-checked as `[]T` and codegen
 // flattens it at runtime (concatenates the sub-slice into the result slice).
-pub type TArrayElem  = struct { is_spread: bool; expr: TExpr }
-pub type TArrayLit   = struct { elements: []TArrayElem }
-pub type TPathExpr   = struct { enum_name: str; member: str; ordinal: u64; value: u128 }   // Enum::Member as a VALUE — `.type` is the NAMED enum; carries the resolved member ordinal + (#50) the RESOLVED member value (enum: the ordinal; flags: 1 << ordinal, u128 cap) so the VM reads it instead of recomputing
+pub type TArrayElem = struct { is_spread: bool; expr: TExpr }
+pub type TArrayLit = struct { elements: []TArrayElem }
+pub type TPathExpr = struct { enum_name: str; member: str; ordinal: u64; value: u128 }   // Enum::Member as a VALUE — `.type` is the NAMED enum; carries the resolved member ordinal + (#50) the RESOLVED member value (enum: the ordinal; flags: 1 << ordinal, u128 cap) so the VM reads it instead of recomputing
 // (W10) a typed closure LITERAL. `.type` (on the TExpr) is the closure's `Func` type. `params` are
 // the typed parameters; `body` is the typed statement block (its trailing value is the result, of
 // type `ret`). `captures` lists the FREE variables the body reads from the enclosing scope — each
@@ -77,13 +77,13 @@ pub type TPathExpr   = struct { enum_name: str; member: str; ordinal: u64; value
 // shared mutation). `lift_id` is a per-program unique id the codegen uses to name the lifted C
 // function `__tkclo_<lift_id>` and its env struct.
 pub type TLambdaParam = struct { name: str; type: Type }
-pub type TCapture     = struct { name: str; type: Type; by_ref: bool }
-pub type TLambda      = struct { params: []TLambdaParam; body: []TStatement; captures: []TCapture; ret: Type; lift_id: u64 }
+pub type TCapture = struct { name: str; type: Type; by_ref: bool }
+pub type TLambda = struct { params: []TLambdaParam; body: []TStatement; captures: []TCapture; ret: Type; lift_id: u64 }
 
 type TExprKind = variant TNumber | TVar | TStrLit | TByteLit | TCharLit | TBoolLit | TNullLit | TBinary | TUnary | TCompare | TCall | TIfExpr | TMatchExpr | TCast | TFieldAccess | TSafeFieldAccess | TCoalesce | TStructInit | TIndex | TInterp | TInExpr | TPathExpr | TArrayLit | TLambda
 
 // --- typed statements (mirror Statement; children are TExpr / []TStatement) ---
-pub type TBinding      = struct { kind: parser::BindKind; target: parser::BindTarget; bound: Type; value: TExpr }   // `bound`: the type the target binds to (the annotation if present, else the value's)
+pub type TBinding = struct { kind: parser::BindKind; target: parser::BindTarget; bound: Type; value: TExpr }   // `bound`: the type the target binds to (the annotation if present, else the value's)
 // (#88) a typed assignment. `kind` (parser::AssignKind) tags the target shape:
 //   Simple   — write the bare binding `name` (deref=false; target = a sentinel, unused).
 //   RefDeref — write THROUGH a `Ref<T>` handle `name` (deref=true; target = a sentinel, unused).
@@ -91,40 +91,40 @@ pub type TBinding      = struct { kind: parser::BindKind; target: parser::BindTa
 //              so codegen/VM reuse the read-side field lowering directly; name/deref unused.
 // `bound` = the target's declared type (codegen wraps the RHS into it — emit_as). `deref` stays a plain
 // bool == (kind==RefDeref) so the legacy TKB layout / readers are unchanged for the two old shapes.
-pub type TAssign       = struct { kind: parser::AssignKind; name: str; op: lexer::TokenKind; bound: Type; value: TExpr; deref: bool; target: TExpr }
-pub type TReturn       = struct { has_value: bool; value: TExpr }   // `value` gated by has_value (B.20) — a bare `return`'s placeholder (Number 0) types harmlessly
-pub type TLoopStmt     = struct { label: str; body: []TStatement }   // label empty = unlabeled (M.5)
-pub type TBreakStmt    = struct { label: str }                       // label empty = innermost loop
-pub type TContinueStmt = struct { label: str }                       // label empty = innermost loop
-pub type TExprStmt     = struct { expr: TExpr }
+pub type TAssign = struct { kind: parser::AssignKind; name: str; op: lexer::TokenKind; bound: Type; value: TExpr; deref: bool; target: TExpr }
+pub type TReturn = struct { has_value: bool; value: TExpr }   // `value` gated by has_value (B.20) — a bare `return`'s placeholder (Number 0) types harmlessly
+pub type TLoopStmt = struct { label: str; body: []TStatement }   // label empty = unlabeled (M.5)
+pub type TBreakStmt = struct { label: str }   // label empty = innermost loop
+pub type TContinueStmt = struct { label: str }   // label empty = innermost loop
+pub type TExprStmt = struct { expr: TExpr }
 // `defer { stmts }` (C7.18) — scoped cleanup block typed in void context; executes LIFO
 // at function exit (return, break-out-of-fn). Panic does NOT run deferred blocks.
 // Nested `defer` is rejected (body may not itself contain a TDeferStmt).
-pub type TDeferStmt    = struct { body: []TStatement }
+pub type TDeferStmt = struct { body: []TStatement }
 
 pub type TStatement = variant TBinding | TAssign | TReturn | TLoopStmt | TBreakStmt | TContinueStmt | TExprStmt | TDeferStmt
 
 // --- typed top-level items + program (mirror the checker's Item/Program — E5c) ---
 pub type TFunction = struct {
-    name:        str
-    type_params: []str            // (S4) generic type-parameter names (empty for a non-generic fn); a generic fn is stamped to concrete copies by the monomorph pass before codegen
+    name: str
+    type_params: []str   // (S4) generic type-parameter names (empty for a non-generic fn); a generic fn is stamped to concrete copies by the monomorph pass before codegen
     type_constraints: []parser::ConstraintExpr   // (W11/S6) PARALLEL to type_params — checked by the monomorph pass when a param is bound to a concrete type
-    params:      []parser::Param  // immutable params (B.21) — carried from the parser unchanged
-    return_type: Type             // resolved (void when the function has no `-> ret` — M.3)
-    body:        []TStatement
-    vis:         parser::Visibility   // private / pub / exp (carried from the parsed decl; only exp reaches the `.tkh` — M.4)
-    has_doc:     bool             // a `/** … */` doc precedes it? (carried for the `.tkh` — FnSig keeps docs)
-    doc:         str              // the doc span (valid iff has_doc)
-    namespace:   str              // (#41/#49) the declaring namespace — drives the mangled C name
-    file:        str              // (E3) the source file the fn was declared in (for the .tsym symbol map)
-    line:        u32              // (E3) the fn name's 1-based source line (for the .tsym symbol map)
-    col:         u32              // (E3) the fn name's 1-based source column
-    is_test:     bool             // (D2) a `#test` attribute precedes it? (run by `teko test` / the build gate)
-    is_extern:   bool             // (C7.1a) a foreign `extern fn` (no body — codegen emits a C prototype + direct call)
-    c_symbol:    str              // (C7.1a) the C symbol it binds (valid iff is_extern)
-    from_lib:    str              // (C7.1a) the providing library ("" = implicit libc; valid iff is_extern)
+    params: []parser::Param   // immutable params (B.21) — carried from the parser unchanged
+    return_type: Type   // resolved (void when the function has no `-> ret` — M.3)
+    body: []TStatement
+    vis: parser::Visibility   // private / pub / exp (carried from the parsed decl; only exp reaches the `.tkh` — M.4)
+    has_doc: bool   // a `/** … */` doc precedes it? (carried for the `.tkh` — FnSig keeps docs)
+    doc: str   // the doc span (valid iff has_doc)
+    namespace: str   // (#41/#49) the declaring namespace — drives the mangled C name
+    file: str   // (E3) the source file the fn was declared in (for the .tsym symbol map)
+    line: u32   // (E3) the fn name's 1-based source line (for the .tsym symbol map)
+    col: u32   // (E3) the fn name's 1-based source column
+    is_test: bool   // (D2) a `#test` attribute precedes it? (run by `teko test` / the build gate)
+    is_extern: bool   // (C7.1a) a foreign `extern fn` (no body — codegen emits a C prototype + direct call)
+    c_symbol: str   // (C7.1a) the C symbol it binds (valid iff is_extern)
+    from_lib: str   // (C7.1a) the providing library ("" = implicit libc; valid iff is_extern)
 }
-pub type TItem    = variant TFunction | parser::TypeDecl | parser::UseDecl | TStatement   // pub: TProgram.items surface + the .tkb codec (C7.16). TypeDecl/UseDecl pass through (E5c); a loose top-level Statement → typed
+pub type TItem = variant TFunction | parser::TypeDecl | parser::UseDecl | TStatement   // pub: TProgram.items surface + the .tkb codec (C7.16). TypeDecl/UseDecl pass through (E5c); a loose top-level Statement → typed
 pub type TProgram = struct { items: []TItem }
 
 // (#88) a placeholder typed expr for a TAssign's `target` when kind != Field (never read — gated by
@@ -134,5 +134,5 @@ pub fn no_texpr() -> TExpr {
 }
 
 // --- env-threading carriers: the typed pass advances the env, like check_* did ---
-type TypedStmt  = struct { node: TStatement;    env: Env }   // a typed statement + the env it leaves (bindings extend it)
+type TypedStmt = struct { node: TStatement; env: Env }   // a typed statement + the env it leaves (bindings extend it)
 type TypedBlock = struct { stmts: []TStatement; env: Env }   // a typed block + its final env

@@ -10,25 +10,25 @@ fn prim_byte(k: checker::PrimKind) -> byte { k to byte }
 fn kind_byte(k: lexer::TokenKind) -> byte { k to byte }
 fn bindkind_byte(k: parser::BindKind) -> byte { k to byte }   // (C7.16) Let/Mut/Const → ordinal byte
 fn assign_kind_byte(k: parser::AssignKind) -> byte { k to byte }   // (#88) Simple/RefDeref/Field → ordinal byte
-fn vis_byte(v: parser::Visibility) -> byte { v to byte }      // (C7.16) Private/Pub/Exp → ordinal byte
+fn vis_byte(v: parser::Visibility) -> byte { v to byte }   // (C7.16) Private/Pub/Exp → ordinal byte
 
 // a Type → tag byte + payload. (prim_byte/kind_byte = the enum's ordinal — E7.)
 fn write_type(buf: []byte, t: StrTable, ty: checker::Type) -> []byte {
     match ty {
-        checker::Prim as p    => write_u8(write_u8(buf, 0), prim_byte(p.kind))
-        checker::Byte         => write_u8(buf, 1)
-        checker::Str          => write_u8(buf, 2)
-        checker::Error        => write_u8(buf, 3)
-        checker::Void         => write_u8(buf, 4)                                  // tag 4 = void (was Unit — B.37)
-        checker::Slice as s   => write_type(write_u8(buf, 5), t, s.element)
-        checker::Named as n   => write_u32(write_u8(buf, 6), st_find(t, n.name))
+        checker::Prim as p => write_u8(write_u8(buf, 0), prim_byte(p.kind))
+        checker::Byte => write_u8(buf, 1)
+        checker::Str => write_u8(buf, 2)
+        checker::Error => write_u8(buf, 3)
+        checker::Void => write_u8(buf, 4)   // tag 4 = void (was Unit — B.37)
+        checker::Slice as s => write_type(write_u8(buf, 5), t, s.element)
+        checker::Named as n => write_u32(write_u8(buf, 6), st_find(t, n.name))
         checker::Variant as v => write_types(write_u8(buf, 7), t, v.members)
-        checker::Func as f    => write_type(write_types(write_u8(buf, 8), t, f.params), t, f.ret)
-        checker::Optional as o => write_type(write_u8(buf, 9), t, o.inner)         // tag 9 = T? (B.37)
-        checker::Ptr as p     => match p.inner { null => write_u8(buf, 10); checker::Type as it => write_type(write_u8(buf, 12), t, it) }   // tag 10 = opaque ptr; tag 12 = ptr<T> (S-mem)
-        checker::Uptr         => write_u8(buf, 11)                                  // (C7.1a) tag 11 = uptr
-        checker::Reference as r => write_type(write_u8(buf, 13), t, r.inner)        // (MEM-1b) tag 13 = Ref<T>
-        checker::Char         => write_u8(buf, 14)                                  // (UTF-8 increment 1) tag 14 = char — APPENDED (no reorder)
+        checker::Func as f => write_type(write_types(write_u8(buf, 8), t, f.params), t, f.ret)
+        checker::Optional as o => write_type(write_u8(buf, 9), t, o.inner)   // tag 9 = T? (B.37)
+        checker::Ptr as p => match p.inner { null => write_u8(buf, 10); checker::Type as it => write_type(write_u8(buf, 12), t, it) }   // tag 10 = opaque ptr; tag 12 = ptr<T> (S-mem)
+        checker::Uptr => write_u8(buf, 11)   // (C7.1a) tag 11 = uptr
+        checker::Reference as r => write_type(write_u8(buf, 13), t, r.inner)   // (MEM-1b) tag 13 = Ref<T>
+        checker::Char => write_u8(buf, 14)   // (UTF-8 increment 1) tag 14 = char — APPENDED (no reorder)
     }
 }
 
@@ -87,28 +87,28 @@ fn write_call_tail(buf: []byte, t: StrTable, cl: checker::TCall) -> []byte {
 
 // a TExpr → its type, then a tag + payload (children recursive).
 fn write_texpr(buf: []byte, t: StrTable, te: checker::TExpr) -> []byte {
-    let b = write_type(buf, t, te.type)        // every node carries its type
+    let b = write_type(buf, t, te.type)   // every node carries its type
     match te.kind {
         // N1/N2: the number node carries { is_float, value: i128, fval: f64 }. Serialize:
         // tag, is_float (u8), the 128-bit value as two u64 (hi then lo), then the f64's
         // IEEE-754 bits as a u64. read_texpr reads the exact inverse.
-        checker::TNumber as n   => write_u64(
-                              write_u64(
-                                  write_u64(
-                                      write_u8(write_u8(b, 0), (if n.is_float { 1 } else { 0 }) to byte),
-                                      (n.value >> 64) to u64),          // hi
-                                  (n.value & 0xFFFFFFFFFFFFFFFF) to u64),// lo
-                              teko::f64_bits(n.fval))                    // f64 -> u64 bit pattern
-        checker::TVar as v      => write_u32(write_u8(write_u32(write_u8(b, 1), st_find(t, v.name)), (if v.is_func { 1 } else { 0 }) to byte), st_find(t, v.func_ns))   // (W10a) name, is_func, func_ns
-        checker::TStrLit as s   => write_u32(write_u8(b, 2), st_find(t, s.text))
+        checker::TNumber as n => write_u64(
+            write_u64(
+                write_u64(
+                    write_u8(write_u8(b, 0), (if n.is_float { 1 } else { 0 }) to byte),
+                    (n.value >> 64) to u64),   // hi
+                (n.value & 0xFFFFFFFFFFFFFFFF) to u64),   // lo
+            teko::f64_bits(n.fval))   // f64 -> u64 bit pattern
+        checker::TVar as v => write_u32(write_u8(write_u32(write_u8(b, 1), st_find(t, v.name)), (if v.is_func { 1 } else { 0 }) to byte), st_find(t, v.func_ns))   // (W10a) name, is_func, func_ns
+        checker::TStrLit as s => write_u32(write_u8(b, 2), st_find(t, s.text))
         checker::TByteLit as bl => write_u8(write_u8(b, 3), bl.value)
-        checker::TBinary as bn  => write_texpr(write_texpr(write_u8(write_u8(b, 4), kind_byte(bn.op)), t, bn.left), t, bn.right)
-        checker::TUnary as u    => write_texpr(write_u8(write_u8(b, 5), kind_byte(u.op)), t, u.operand)
-        checker::TCompare as c  => write_terms(write_texpr(write_u8(b, 6), t, c.first), t, c.rest)
+        checker::TBinary as bn => write_texpr(write_texpr(write_u8(write_u8(b, 4), kind_byte(bn.op)), t, bn.left), t, bn.right)
+        checker::TUnary as u => write_texpr(write_u8(write_u8(b, 5), kind_byte(u.op)), t, u.operand)
+        checker::TCompare as c => write_terms(write_texpr(write_u8(b, 6), t, c.first), t, c.rest)
         // (W10b.D3) a DYNAMIC contract-method call is its OWN tag (24): it must round-trip the
         // resolved method Func (the cast signature) + the vtable slot, which the plain call
         // encoding (tag 7) does not carry. callee = [<Iface>, <method>].
-        checker::TCall as cl    => {
+        checker::TCall as cl => {
             if cl.is_iface_dispatch {
                 mut ib = write_path(write_u8(b, 24), t, cl.callee)
                 ib = write_type(ib, t, cl.callee_type)
@@ -130,7 +130,7 @@ fn write_texpr(buf: []byte, t: StrTable, te: checker::TExpr) -> []byte {
         // (C7.16) typed MATCH: tag 9 + subject (texpr) + arms ([]TArm).
         checker::TMatchExpr as m => write_tarms(write_texpr(write_u8(b, 9), t, m.subject), t, m.arms)
         // S1a — Cast: the target type IS te.type (already written by the leading write_type); payload is just the inner expr.
-        checker::TCast as c     => write_texpr(write_u8(b, 10), t, c.expr)
+        checker::TCast as c => write_texpr(write_u8(b, 10), t, c.expr)
         // S1b — FieldAccess: receiver THEN the interned field-name index (write order = read order).
         checker::TFieldAccess as f => write_u32(write_texpr(write_u8(b, 11), t, f.receiver), st_find(t, f.field))
         // W2 — BoolLit: tag 12 + the bool value as a u8 (1/0).
@@ -251,7 +251,7 @@ fn write_tstatement(buf: []byte, t: StrTable, s: checker::TStatement) -> []byte 
         //   + deref (u8) [+ target (TExpr) iff kind==Field]. (#88; MEM-1b-ii)
         checker::TAssign as a => {
             mut b = write_u8(buf, 1)
-            b = write_u8(b, assign_kind_byte(a.kind))          // (#88) the target discriminant
+            b = write_u8(b, assign_kind_byte(a.kind))   // (#88) the target discriminant
             b = write_u32(b, st_find(t, a.name))
             b = write_u8(b, kind_byte(a.op))
             b = write_type(b, t, a.bound)
@@ -290,9 +290,9 @@ fn write_typeexprs(buf: []byte, t: StrTable, xs: []parser::TypeExpr) -> []byte {
 // a parser TypeExpr (the syntactic type annotation): u8 tag + payload.
 fn write_typeexpr(buf: []byte, t: StrTable, te: parser::TypeExpr) -> []byte {
     match te {
-        parser::NamedType as n    => write_path(write_u8(buf, 0), t, n.path)
-        parser::SliceType as s    => write_typeexpr(write_u8(buf, 1), t, s.element)
-        parser::UnionType as u    => write_typeexprs(write_u8(buf, 2), t, u.members)
+        parser::NamedType as n => write_path(write_u8(buf, 0), t, n.path)
+        parser::SliceType as s => write_typeexpr(write_u8(buf, 1), t, s.element)
+        parser::UnionType as u => write_typeexprs(write_u8(buf, 2), t, u.members)
         parser::OptionalType as o => write_typeexpr(write_u8(buf, 3), t, o.inner)
         parser::FunctionType as f => write_typeexpr(write_typeexprs(write_u8(buf, 4), t, f.params), t, f.ret)   // (W10a) tag 4: params then ret
     }
@@ -303,8 +303,8 @@ fn write_constraint(buf: []byte, t: StrTable, c: parser::ConstraintExpr) -> []by
     match c {
         parser::ConstraintAtom as a => write_u32(write_u8(buf, 0), st_find(t, a.name))
         parser::ConstraintAnd as an => write_constraint(write_constraint(write_u8(buf, 1), t, an.left), t, an.right)
-        parser::ConstraintOr as o   => write_constraint(write_constraint(write_u8(buf, 2), t, o.left), t, o.right)
-        parser::NoConstraint        => write_u8(buf, 3)
+        parser::ConstraintOr as o => write_constraint(write_constraint(write_u8(buf, 2), t, o.left), t, o.right)
+        parser::NoConstraint => write_u8(buf, 3)
     }
 }
 
@@ -381,13 +381,13 @@ fn write_class_body(buf: []byte, t: StrTable, c: parser::ClassBody) -> []byte {
     method SIGS after extends/fields, in declaration = vtable order; FlagsBody carries name+u128 value. */
 fn write_typebody(buf: []byte, t: StrTable, tb: parser::TypeBody) -> []byte {
     match tb {
-        parser::StructBody as s  => write_struct_body(buf, t, s)
-        parser::EnumBody as e    => write_strs(write_u8(buf, 1), t, e.members)
+        parser::StructBody as s => write_struct_body(buf, t, s)
+        parser::EnumBody as e => write_strs(write_u8(buf, 1), t, e.members)
         parser::VariantBody as v => write_typeexpr(write_u8(buf, 2), t, v.type_expr)
-        parser::AliasBody as a   => write_typeexpr(write_u8(buf, 3), t, a.alias)
-        parser::ExternBody       => write_u8(buf, 4)
-        parser::FlagsBody as f   => write_flags_body(buf, t, f)
-        parser::ClassBody as c   => write_class_body(buf, t, c)
+        parser::AliasBody as a => write_typeexpr(write_u8(buf, 3), t, a.alias)
+        parser::ExternBody => write_u8(buf, 4)
+        parser::FlagsBody as f => write_flags_body(buf, t, f)
+        parser::ClassBody as c => write_class_body(buf, t, c)
         parser::InterfaceBody as ib => write_functions(write_strs(write_u8(buf, 7), t, ib.extends), t, ib.methods)
         parser::TraitBody as trb => write_functions(write_fields(write_u8(buf, 8), t, trb.fields), t, trb.methods)
     }
@@ -492,9 +492,9 @@ fn write_tfunction(buf: []byte, t: StrTable, f: checker::TFunction) -> []byte {
 // a TItem: u8 tag — TFunction(0) | TypeDecl(1) | UseDecl(2) | TStatement(3).
 fn write_titem(buf: []byte, t: StrTable, it: checker::TItem) -> []byte {
     match it {
-        checker::TFunction as f  => write_tfunction(write_u8(buf, 0), t, f)
-        parser::TypeDecl as d    => write_typedecl(write_u8(buf, 1), t, d)
-        parser::UseDecl as u     => write_usedecl(write_u8(buf, 2), t, u)
+        checker::TFunction as f => write_tfunction(write_u8(buf, 0), t, f)
+        parser::TypeDecl as d => write_typedecl(write_u8(buf, 1), t, d)
+        parser::UseDecl as u => write_usedecl(write_u8(buf, 2), t, u)
         checker::TStatement as s => write_tstatement(write_u8(buf, 3), t, s)
     }
 }
@@ -516,8 +516,8 @@ fn write_program(buf: []byte, t: StrTable, prog: checker::TProgram) -> []byte {
 // a parser::Expr in a pattern (Number/StrLit/ByteLit only): u8 tag + payload.
 fn write_pexpr(buf: []byte, t: StrTable, e: parser::Expr) -> []byte {
     match e.kind {
-        parser::Number as n  => write_u64(write_u64(write_u64(write_u8(write_u8(buf, 0), (if n.is_float { 1 } else { 0 }) to byte), (n.value >> 64) to u64), (n.value & 0xFFFFFFFFFFFFFFFF) to u64), teko::f64_bits(n.fval))
-        parser::StrLit as s  => write_u32(write_u8(buf, 1), st_find(t, s.text))
+        parser::Number as n => write_u64(write_u64(write_u64(write_u8(write_u8(buf, 0), (if n.is_float { 1 } else { 0 }) to byte), (n.value >> 64) to u64), (n.value & 0xFFFFFFFFFFFFFFFF) to u64), teko::f64_bits(n.fval))
+        parser::StrLit as s => write_u32(write_u8(buf, 1), st_find(t, s.text))
         parser::ByteLit as bl => write_u8(write_u8(buf, 2), bl.value)
         _ => write_u8(buf, 255)   // a non-literal pattern expr (does not occur — patterns hold only Number/Str/Byte); read rejects 255
     }
@@ -534,21 +534,21 @@ fn write_patterns(buf: []byte, t: StrTable, xs: []parser::Pattern) -> []byte {
 fn write_pattern(buf: []byte, t: StrTable, p: parser::Pattern) -> []byte {
     match p {
         parser::LiteralPattern as l => write_pexpr(write_u8(buf, 0), t, l.value)
-        parser::RangePattern as r   => write_pexpr(write_pexpr(write_u8(buf, 1), t, r.lo), t, r.hi)
-        parser::AltPattern as a     => write_patterns(write_u8(buf, 2), t, a.options)
+        parser::RangePattern as r => write_pexpr(write_pexpr(write_u8(buf, 1), t, r.lo), t, r.hi)
+        parser::AltPattern as a => write_patterns(write_u8(buf, 2), t, a.options)
         parser::BindPattern as bp => {
             mut b = write_path(write_u8(buf, 3), t, bp.type_name)
             b = write_u8(b, (if bp.has_binding { 1 } else { 0 }) to byte)
             b = write_u32(b, st_find(t, bp.binding))
             b = write_u8(b, (if bp.is_slice { 1 } else { 0 }) to byte)
-            match bp.slice_type {                                     // slice_type: TypeExpr? — flag + (if Some) the type
+            match bp.slice_type {   // slice_type: TypeExpr? — flag + (if Some) the type
                 parser::TypeExpr as st => write_typeexpr(write_u8(b, 1), t, st)
-                null                   => write_u8(b, 0)
+                null => write_u8(b, 0)
             }
         }
-        parser::FieldPattern as f   => write_strs(write_path(write_u8(buf, 4), t, f.type_name), t, f.fields)
-        parser::WildcardPattern     => write_u8(buf, 5)
-        parser::NullPattern         => write_u8(buf, 6)
+        parser::FieldPattern as f => write_strs(write_path(write_u8(buf, 4), t, f.type_name), t, f.fields)
+        parser::WildcardPattern => write_u8(buf, 5)
+        parser::NullPattern => write_u8(buf, 6)
     }
 }
 

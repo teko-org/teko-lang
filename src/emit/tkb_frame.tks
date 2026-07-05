@@ -33,11 +33,11 @@ fn collect_type_list(t: StrTable, xs: []checker::Type) -> StrTable {
 
 fn collect_type_strings(t: StrTable, ty: checker::Type) -> StrTable {
     match ty {
-        checker::Named as n   => st_intern(t, n.name).table
-        checker::Slice as s   => collect_type_strings(t, s.element)
+        checker::Named as n => st_intern(t, n.name).table
+        checker::Slice as s => collect_type_strings(t, s.element)
         checker::Variant as v => collect_type_list(t, v.members)
-        checker::Func as f    => collect_type_strings(collect_type_list(t, f.params), f.ret)
-        _            => t
+        checker::Func as f => collect_type_strings(collect_type_list(t, f.params), f.ret)
+        _ => t
     }
 }
 
@@ -121,14 +121,14 @@ fn collect_tstatements(t: StrTable, xs: []checker::TStatement) -> StrTable {
 // (C7.16) collect a TStatement's strings (mirrors write_tstatement).
 fn collect_tstatement(t: StrTable, s: checker::TStatement) -> StrTable {
     match s {
-        checker::TBinding as bd     => collect_strings(collect_type_strings(collect_bindtarget(t, bd.target), bd.bound), bd.value)
-        checker::TAssign as a       => { let t2 = collect_strings(collect_type_strings(st_intern(t, a.name).table, a.bound), a.value); match a.kind { parser::AssignKind::Field => collect_strings(t2, a.target); _ => t2 } }   // (#88) the FIELD LHS receiver's strings
-        checker::TReturn as r       => collect_strings(t, r.value)
-        checker::TLoopStmt as l      => collect_tstatements(st_intern(t, l.label).table, l.body)
-        checker::TBreakStmt as br    => st_intern(t, br.label).table
-        checker::TContinueStmt as c  => st_intern(t, c.label).table
-        checker::TExprStmt as e      => collect_strings(t, e.expr)
-        checker::TDeferStmt as d     => collect_tstatements(t, d.body)
+        checker::TBinding as bd => collect_strings(collect_type_strings(collect_bindtarget(t, bd.target), bd.bound), bd.value)
+        checker::TAssign as a => { let t2 = collect_strings(collect_type_strings(st_intern(t, a.name).table, a.bound), a.value); match a.kind { parser::AssignKind::Field => collect_strings(t2, a.target); _ => t2 } }   // (#88) the FIELD LHS receiver's strings
+        checker::TReturn as r => collect_strings(t, r.value)
+        checker::TLoopStmt as l => collect_tstatements(st_intern(t, l.label).table, l.body)
+        checker::TBreakStmt as br => st_intern(t, br.label).table
+        checker::TContinueStmt as c => st_intern(t, c.label).table
+        checker::TExprStmt as e => collect_strings(t, e.expr)
+        checker::TDeferStmt as d => collect_tstatements(t, d.body)
     }
 }
 
@@ -146,25 +146,25 @@ fn collect_structinit(t: StrTable, si: checker::TStructInit) -> StrTable {
 }
 
 fn collect_strings(t: StrTable, te: checker::TExpr) -> StrTable {
-    let t1 = collect_type_strings(t, te.type)        // the node's type may name things
+    let t1 = collect_type_strings(t, te.type)   // the node's type may name things
     match te.kind {
-        checker::TVar as v     => st_intern(st_intern(t1, v.name).table, v.func_ns).table   // (W10a) intern func_ns too
-        checker::TStrLit as s  => st_intern(t1, s.text).table
+        checker::TVar as v => st_intern(st_intern(t1, v.name).table, v.func_ns).table   // (W10a) intern func_ns too
+        checker::TStrLit as s => st_intern(t1, s.text).table
         checker::TCharLit as ch => st_intern(t1, ch.bytes).table   // (UTF-8 increment 1) intern the codepoint's UTF-8 bytes
-        checker::TBinary as b  => collect_strings(collect_strings(t1, b.left), b.right)
-        checker::TUnary as u   => collect_strings(t1, u.operand)
+        checker::TBinary as b => collect_strings(collect_strings(t1, b.left), b.right)
+        checker::TUnary as u => collect_strings(t1, u.operand)
         checker::TCompare as c => collect_terms(collect_strings(t1, c.first), c.rest)
         // (W10b.D3) a dispatch node (tag 24) also serializes its method Func — intern its Named
         // param/return names too (tag 7 never writes callee_type, so this is D3-only).
-        checker::TCall as cl   => {
+        checker::TCall as cl => {
             let tcal = collect_path(t1, cl.callee)
             let tct = if cl.is_iface_dispatch { collect_type_strings(tcal, cl.callee_type) } else { tcal }
             let targs = collect_texprs(tct, cl.args)
             st_intern(targs, cl.call_ns).table
         }
-        checker::TCast as c    => collect_strings(t1, c.expr)                                    // S1a — recurse into the inner expr
-        checker::TFieldAccess as f => st_intern(collect_strings(t1, f.receiver), f.field).table  // S1b — receiver AND the field name (must intern)
-        checker::TInterp as in => collect_texprs(collect_pieces(t1, in.pieces), in.holes)        // $"…{expr}…" — intern pieces, recurse holes
+        checker::TCast as c => collect_strings(t1, c.expr)   // S1a — recurse into the inner expr
+        checker::TFieldAccess as f => st_intern(collect_strings(t1, f.receiver), f.field).table   // S1b — receiver AND the field name (must intern)
+        checker::TInterp as in => collect_texprs(collect_pieces(t1, in.pieces), in.holes)   // $"…{expr}…" — intern pieces, recurse holes
         // (C7.16) the kinds previously dropped to `_` — their strings/sub-exprs MUST be interned or the
         // writer's st_find returns the not-found sentinel and the node fails to round-trip.
         checker::TSafeFieldAccess as sf => st_intern(collect_strings(t1, sf.receiver), sf.field).table
@@ -178,7 +178,7 @@ fn collect_strings(t: StrTable, te: checker::TExpr) -> StrTable {
         // pattern codec lands.) TNumber/TByteLit/TBoolLit/TNullLit carry no strings → `_`.
         checker::TIfExpr as iff => collect_tstatements(collect_tstatements(collect_strings(t1, iff.cond), iff.then_blk), iff.else_blk)
         checker::TMatchExpr as m => collect_tarms(collect_strings(t1, m.subject), m.arms)
-        _             => t1
+        _ => t1
     }
 }
 
@@ -191,9 +191,9 @@ fn collect_typeexprs(t: StrTable, xs: []parser::TypeExpr) -> StrTable {
 }
 fn collect_typeexpr(t: StrTable, te: parser::TypeExpr) -> StrTable {
     match te {
-        parser::NamedType as n    => collect_path(t, n.path)
-        parser::SliceType as s    => collect_typeexpr(t, s.element)
-        parser::UnionType as u    => collect_typeexprs(t, u.members)
+        parser::NamedType as n => collect_path(t, n.path)
+        parser::SliceType as s => collect_typeexpr(t, s.element)
+        parser::UnionType as u => collect_typeexprs(t, u.members)
         parser::OptionalType as o => collect_typeexpr(t, o.inner)
         parser::FunctionType as f => collect_typeexpr(collect_typeexprs(t, f.params), f.ret)   // (W10a)
     }
@@ -224,13 +224,13 @@ fn collect_class_body(t: StrTable, c: parser::ClassBody) -> StrTable {
 
 fn collect_typebody(t: StrTable, tb: parser::TypeBody) -> StrTable {
     match tb {
-        parser::StructBody as s  => collect_struct_body(t, s)
-        parser::EnumBody as e    => collect_pieces(t, e.members)
-        parser::FlagsBody as f   => collect_pieces(t, f.members)
+        parser::StructBody as s => collect_struct_body(t, s)
+        parser::EnumBody as e => collect_pieces(t, e.members)
+        parser::FlagsBody as f => collect_pieces(t, f.members)
         parser::VariantBody as v => collect_typeexpr(t, v.type_expr)
-        parser::AliasBody as a   => collect_typeexpr(t, a.alias)
-        parser::ExternBody       => t
-        parser::ClassBody as c   => collect_class_body(t, c)
+        parser::AliasBody as a => collect_typeexpr(t, a.alias)
+        parser::ExternBody => t
+        parser::ClassBody as c => collect_class_body(t, c)
         parser::InterfaceBody as ib => collect_functions(collect_pieces(t, ib.extends), ib.methods)
         parser::TraitBody as trb => collect_functions(collect_fields(t, trb.fields), trb.methods)
     }
@@ -240,8 +240,8 @@ fn collect_constraint(t: StrTable, c: parser::ConstraintExpr) -> StrTable {
     match c {
         parser::ConstraintAtom as a => st_intern(t, a.name).table
         parser::ConstraintAnd as an => collect_constraint(collect_constraint(t, an.left), an.right)
-        parser::ConstraintOr as o   => collect_constraint(collect_constraint(t, o.left), o.right)
-        parser::NoConstraint        => t
+        parser::ConstraintOr as o => collect_constraint(collect_constraint(t, o.left), o.right)
+        parser::NoConstraint => t
     }
 }
 
@@ -304,9 +304,9 @@ fn collect_titems(t: StrTable, xs: []checker::TItem) -> StrTable {
 }
 fn collect_titem(t: StrTable, it: checker::TItem) -> StrTable {
     match it {
-        checker::TFunction as f  => collect_tfunction(t, f)
-        parser::TypeDecl as d    => collect_typedecl(t, d)
-        parser::UseDecl as u     => collect_usedecl(t, u)
+        checker::TFunction as f => collect_tfunction(t, f)
+        parser::TypeDecl as d => collect_typedecl(t, d)
+        parser::UseDecl as u => collect_usedecl(t, u)
         checker::TStatement as s => collect_tstatement(t, s)
     }
 }
@@ -316,7 +316,7 @@ fn collect_program(t: StrTable, prog: checker::TProgram) -> StrTable { collect_t
 fn collect_pexpr(t: StrTable, e: parser::Expr) -> StrTable {
     match e.kind {
         parser::StrLit as s => st_intern(t, s.text).table
-        _ => t                                              // Number/ByteLit carry no interned string
+        _ => t   // Number/ByteLit carry no interned string
     }
 }
 fn collect_patterns(t: StrTable, xs: []parser::Pattern) -> StrTable {
@@ -328,15 +328,15 @@ fn collect_patterns(t: StrTable, xs: []parser::Pattern) -> StrTable {
 fn collect_pattern(t: StrTable, p: parser::Pattern) -> StrTable {
     match p {
         parser::LiteralPattern as l => collect_pexpr(t, l.value)
-        parser::RangePattern as r   => collect_pexpr(collect_pexpr(t, r.lo), r.hi)
-        parser::AltPattern as a     => collect_patterns(t, a.options)
+        parser::RangePattern as r => collect_pexpr(collect_pexpr(t, r.lo), r.hi)
+        parser::AltPattern as a => collect_patterns(t, a.options)
         parser::BindPattern as bp => {
             mut tab = st_intern(collect_path(t, bp.type_name), bp.binding).table
             match bp.slice_type { parser::TypeExpr as st => collect_typeexpr(tab, st); null => tab }
         }
-        parser::FieldPattern as f   => collect_pieces(collect_path(t, f.type_name), f.fields)
-        parser::WildcardPattern     => t
-        parser::NullPattern         => t
+        parser::FieldPattern as f => collect_pieces(collect_path(t, f.type_name), f.fields)
+        parser::WildcardPattern => t
+        parser::NullPattern => t
     }
 }
 fn collect_tarms(t: StrTable, xs: []checker::TArm) -> StrTable {
@@ -362,8 +362,8 @@ fn serialize(te: checker::TExpr) -> []byte {
     out = write_u8(out, b'K')
     out = write_u8(out, b'B')
     out = write_u8(out, 0)
-    out = write_u32(out, 1)                          // version 1 = a single TExpr
-    out = write_u64(out, h)                          // FNV-1a of the body
+    out = write_u32(out, 1)   // version 1 = a single TExpr
+    out = write_u64(out, h)   // FNV-1a of the body
     append_bytes(out, body)
 }
 

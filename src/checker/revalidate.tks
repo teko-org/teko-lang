@@ -35,7 +35,7 @@ fn validate_each(xs: []TExpr) -> error? {
     mut i = 0
     loop {
         if i >= xs.len { break }
-        match validate_texpr(xs[i]) { null => {}; error as e => return e }
+        match validate_texpr(xs[i]) { null => { }; error as e => return e }
         i++
     }
     null
@@ -47,22 +47,22 @@ fn validate_each(xs: []TExpr) -> error? {
 fn validate_texpr(te: TExpr) -> error? {
     match te.kind {
         TNumber as n => check_node_type(te.type, Prim { kind = if n.is_float { PrimKind::F64 } else { PrimKind::I64 } })   // default leaf type (B.38)
-        TStrLit  => check_node_type(te.type, Str { })
+        TStrLit => check_node_type(te.type, Str { })
         TByteLit => check_node_type(te.type, Byte { })
         TCharLit => check_node_type(te.type, Char { })
         TBoolLit => check_node_type(te.type, Prim { kind = PrimKind::Bool })   // true/false (LEGISLATION §75)
         TNullLit => match te.type { Optional => null; _ => error { message = "corrupt: `null` typed as a non-optional" } }   // null is `T?` (REBOOT §202)
-        TVar     => null                           // env-dependent → trust (type is present)
-        TPathExpr => null                          // Enum::Member — enum/ordinal resolved by the checker → trust
-        TCall as c => validate_each(c.args)        // [callee re-derivation is env-dependent]
+        TVar => null   // env-dependent → trust (type is present)
+        TPathExpr => null   // Enum::Member — enum/ordinal resolved by the checker → trust
+        TCall as c => validate_each(c.args)   // [callee re-derivation is env-dependent]
         TBinary as b => {
-            match validate_texpr(b.left)  { null => {}; error as e => return e }
-            match validate_texpr(b.right) { null => {}; error as e => return e }
+            match validate_texpr(b.left) { null => { }; error as e => return e }
+            match validate_texpr(b.right) { null => { }; error as e => return e }
             let d = match rederive_binary(b.left.type, b.right.type, b.op) { Type as t => t; error as e => return e }
             check_node_type(te.type, d)
         }
         TUnary as u => {
-            match validate_texpr(u.operand) { null => {}; error as e => return e }
+            match validate_texpr(u.operand) { null => { }; error as e => return e }
             if u.op == lexer::TokenKind::Bang {
                 if !is_bool(u.operand.type) { return error { message = "corrupt: `!` operand not bool" } }
                 return check_node_type(te.type, Prim { kind = PrimKind::Bool })
@@ -75,66 +75,66 @@ fn validate_texpr(te: TExpr) -> error? {
             check_node_type(te.type, u.operand.type)
         }
         TCompare as cmp => {
-            match validate_texpr(cmp.first) { null => {}; error as e => return e }
+            match validate_texpr(cmp.first) { null => { }; error as e => return e }
             mut i = 0
             loop {
                 if i >= cmp.rest.len { break }
-                match validate_texpr(cmp.rest[i].operand) { null => {}; error as e => return e }
+                match validate_texpr(cmp.rest[i].operand) { null => { }; error as e => return e }
                 i++
             }
             check_node_type(te.type, Prim { kind = PrimKind::Bool })   // a comparison is bool
         }
-        TIfExpr    => null        // [block-bearing: deep revalidation lands with program-level — E6-2]
-        TMatchExpr => null        // [idem — typed blocks/arms validate once validate_statement exists]
+        TIfExpr => null   // [block-bearing: deep revalidation lands with program-level — E6-2]
+        TMatchExpr => null   // [idem — typed blocks/arms validate once validate_statement exists]
         TCast as c => {
-            match validate_texpr(c.expr) { null => {}; error as e => return e }
-            match cast_check(c.expr.type, te.type) {           // RE-PROVE the cast independently (M.3 — not a rubber stamp)
-                null  => null
+            match validate_texpr(c.expr) { null => { }; error as e => return e }
+            match cast_check(c.expr.type, te.type) {   // RE-PROVE the cast independently (M.3 — not a rubber stamp)
+                null => null
                 error => error { message = "corrupt: illegal cast in typed tree" }
             }
         }
         TFieldAccess as f => {
-            match validate_texpr(f.receiver) { null => {}; error as e => return e }
-            match f.receiver.type {                            // struct-receiver invariant (field type is table-dependent → trust, as TVar/TCall)
+            match validate_texpr(f.receiver) { null => { }; error as e => return e }
+            match f.receiver.type {   // struct-receiver invariant (field type is table-dependent → trust, as TVar/TCall)
                 Named => null
-                _     => error { message = "corrupt: field access on a non-struct receiver" }
+                _ => error { message = "corrupt: field access on a non-struct receiver" }
             }
         }
         TSafeFieldAccess as f => {   // recv?.field (REBOOT §203): optional receiver, optional result
-            match validate_texpr(f.receiver) { null => {}; error as e => return e }
-            match f.receiver.type {                            // optional-receiver invariant
+            match validate_texpr(f.receiver) { null => { }; error as e => return e }
+            match f.receiver.type {   // optional-receiver invariant
                 Optional => match te.type { Optional => null; _ => error { message = "corrupt: safe field access result is not optional" } }
-                _        => error { message = "corrupt: safe field access on a non-optional receiver" }
+                _ => error { message = "corrupt: safe field access on a non-optional receiver" }
             }
         }
         TCoalesce as c => {   // a ?? b (REBOOT §203): optional left; result is the unwrapped/optional type
-            match validate_texpr(c.left)  { null => {}; error as e => return e }
-            match validate_texpr(c.right) { null => {}; error as e => return e }
-            match c.left.type {                                // optional-left invariant (result type re-derived in the typer)
+            match validate_texpr(c.left) { null => { }; error as e => return e }
+            match validate_texpr(c.right) { null => { }; error as e => return e }
+            match c.left.type {   // optional-left invariant (result type re-derived in the typer)
                 Optional => null
-                _        => error { message = "corrupt: `??` left operand is not optional" }
+                _ => error { message = "corrupt: `??` left operand is not optional" }
             }
         }
         TStructInit as s => {   // Name { f = v, … } (W4a): named-struct type + each field value valid
-            match te.type {                                    // named-struct invariant (field-type matching re-derived in the typer)
+            match te.type {   // named-struct invariant (field-type matching re-derived in the typer)
                 Named => validate_each(s.field_vals)
-                _     => error { message = "corrupt: struct literal not typed as a named type" }
+                _ => error { message = "corrupt: struct literal not typed as a named type" }
             }
         }
         TIndex as ix => {   // recv[index] (W5-idx): str/slice receiver, integer index (element type re-derived in the typer)
-            match validate_texpr(ix.receiver) { null => {}; error as e => return e }
-            match validate_texpr(ix.index)    { null => {}; error as e => return e }
+            match validate_texpr(ix.receiver) { null => { }; error as e => return e }
+            match validate_texpr(ix.index) { null => { }; error as e => return e }
             let ok_recv = match ix.receiver.type { Str => true; Slice => true; _ => false }
             if !ok_recv { return error { message = "corrupt: subscript on a non-indexable receiver" } }
             if !is_integer(ix.index.type) { return error { message = "corrupt: subscript index is not an integer" } }
             null
         }
         TInterp as in => {   // $"…{expr}…": str result; each hole valid + str/integer-typed
-            match te.type { Str => {}; _ => return error { message = "corrupt: interpolation not typed as a str" } }
+            match te.type { Str => { }; _ => return error { message = "corrupt: interpolation not typed as a str" } }
             mut i = 0
             loop {
                 if i >= in.holes.len { break }
-                match validate_texpr(in.holes[i]) { null => {}; error as e => return e }
+                match validate_texpr(in.holes[i]) { null => { }; error as e => return e }
                 let ok = match in.holes[i].type { Str => true; _ => is_integer(in.holes[i].type) }
                 if !ok { return error { message = "corrupt: interpolation hole is not a str or an integer" } }
                 i++
@@ -142,11 +142,11 @@ fn validate_texpr(te: TExpr) -> error? {
             null
         }
         TInExpr as ie => {   // <lhs> in [ … ] (Phase 2): bool result; lhs + each element valid
-            match validate_texpr(ie.lhs) { null => {}; error as e => return e }
+            match validate_texpr(ie.lhs) { null => { }; error as e => return e }
             mut i = 0
             loop {
                 if i >= ie.elems.len { break }
-                match validate_texpr(ie.elems[i]) { null => {}; error as e => return e }
+                match validate_texpr(ie.elems[i]) { null => { }; error as e => return e }
                 i++
             }
             check_node_type(te.type, Prim { kind = PrimKind::Bool })
@@ -155,7 +155,7 @@ fn validate_texpr(te: TExpr) -> error? {
             mut i = 0
             loop {
                 if i >= a.elements.len { break }
-                match validate_texpr(a.elements[i].expr) { null => {}; error as e => return e }
+                match validate_texpr(a.elements[i].expr) { null => { }; error as e => return e }
                 i++
             }
             null

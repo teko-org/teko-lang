@@ -51,7 +51,7 @@ fn build_aliases(prog: parser::Program) -> []AliasBind {
                     a = teko::list::push(a, AliasBind { ns = prog.items[i].namespace; alias = alias; target = join_n(u.path, u.path.segments.len) })
                 }
             }
-            _ => {}
+            _ => { }
         }
         i++
     }
@@ -94,25 +94,25 @@ fn name_exists_anywhere(table: TypeTable, name: str) -> bool {
 fn check_named(path: parser::Path, ref_ns: str, table: TypeTable, al: []AliasBind) -> error? {
     if path.segments.len == 0 { return null }
     let last = path.segments[path.segments.len - 1].name
-    match builtin_type(last) { Type => return null; error => {} }   // u8…/str/byte/error: never namespaced
+    match builtin_type(last) { Type => return null; error => { } }   // u8…/str/byte/error: never namespaced
 
-    if path.segments.len == 1 {                                     // BARE
-        match find_in_ns(table, last, ref_ns) { TypeReg => return null; null => {} }   // same-ns: bare is correct
+    if path.segments.len == 1 {   // BARE
+        match find_in_ns(table, last, ref_ns) { TypeReg => return null; null => { } }   // same-ns: bare is correct
         if name_exists_anywhere(table, last) {
             return error { message = "bare cross-namespace type reference — qualify it (`ns::Type`, with `use teko::ns`) or use the absolute path" }
         }
-        return null                                                // unknown name → the normal resolver reports it
+        return null   // unknown name → the normal resolver reports it
     }
 
     // QUALIFIED / ABSOLUTE: resolve the target namespace.
     mut target_ns = ""
-    if path.segments.len == 2 {                                    // single-segment prefix = a `use` alias
+    if path.segments.len == 2 {   // single-segment prefix = a `use` alias
         target_ns = alias_target(al, ref_ns, path.segments[0].name)
         if target_ns == "" {
             return error { message = "qualified type reference with an unbound alias — add `use teko::<ns>` (the prefix binds nothing)" }
         }
     } else {
-        target_ns = join_n(path, path.segments.len - 1)           // absolute: teko::a::b::Type → "teko::a::b"
+        target_ns = join_n(path, path.segments.len - 1)   // absolute: teko::a::b::Type → "teko::a::b"
     }
 
     match find_in_ns(table, last, target_ns) {
@@ -122,25 +122,25 @@ fn check_named(path: parser::Path, ref_ns: str, table: TypeTable, al: []AliasBin
             }
             return null
         }
-        null => {}
+        null => { }
     }
     if name_exists_anywhere(table, last) {
         return error { message = "qualified type reference names the wrong namespace — the type is declared elsewhere" }
     }
-    null                                                           // unknown → the normal resolver reports it
+    null   // unknown → the normal resolver reports it
 }
 
 // walk a type expression, checking every Named leaf.
 fn check_texpr(te: parser::TypeExpr, ref_ns: str, table: TypeTable, al: []AliasBind) -> error? {
     match te {
-        parser::NamedType as n    => check_named(n.path, ref_ns, table, al)
-        parser::SliceType as s    => check_texpr(s.element, ref_ns, table, al)
+        parser::NamedType as n => check_named(n.path, ref_ns, table, al)
+        parser::SliceType as s => check_texpr(s.element, ref_ns, table, al)
         parser::OptionalType as o => check_texpr(o.inner, ref_ns, table, al)
-        parser::UnionType as u    => {
+        parser::UnionType as u => {
             mut i = 0
             loop {
                 if i >= u.members.len { break }
-                match check_texpr(u.members[i], ref_ns, table, al) { null => {}; error as e => return e }
+                match check_texpr(u.members[i], ref_ns, table, al) { null => { }; error as e => return e }
                 i++
             }
             null
@@ -149,7 +149,7 @@ fn check_texpr(te: parser::TypeExpr, ref_ns: str, table: TypeTable, al: []AliasB
             mut i = 0
             loop {
                 if i >= fnt.params.len { break }
-                match check_texpr(fnt.params[i], ref_ns, table, al) { null => {}; error as e => return e }
+                match check_texpr(fnt.params[i], ref_ns, table, al) { null => { }; error as e => return e }
                 i++
             }
             check_texpr(fnt.ret, ref_ns, table, al)
@@ -176,7 +176,7 @@ fn check_modules(prog: parser::Program, table: TypeTable) -> error? {
                 mut p = 0
                 loop {
                     if p >= f.params.len { break }
-                    match e { error => break; null => {} }
+                    match e { error => break; null => { } }
                     e = check_texpr(f.params[p].type_ann, it.namespace, ftbl, al)
                     p++
                 }
@@ -186,7 +186,7 @@ fn check_modules(prog: parser::Program, table: TypeTable) -> error? {
                             e = check_texpr(f.return_type, it.namespace, ftbl, al)
                         }
                     }
-                    error => {}
+                    error => { }
                 }
             }
             parser::TypeDecl as d => {
@@ -197,7 +197,7 @@ fn check_modules(prog: parser::Program, table: TypeTable) -> error? {
                         mut k = 0
                         loop {
                             if k >= sb.fields.len { break }
-                            match e { error => break; null => {} }
+                            match e { error => break; null => { } }
                             e = check_texpr(sb.fields[k].type_ann, it.namespace, table, al)
                             k++
                         }
@@ -208,14 +208,14 @@ fn check_modules(prog: parser::Program, table: TypeTable) -> error? {
                     parser::AliasBody as ab => {
                         e = check_texpr(ab.alias, it.namespace, table, al)   // an alias's RHS type-expr
                     }
-                    parser::EnumBody => {}
-                    parser::FlagsBody => {}   // (C8.3) member names only; no type-exprs to validate
-                    parser::ExternBody => {}   // (C7.1a) opaque handle — no type-exprs to validate
+                    parser::EnumBody => { }
+                    parser::FlagsBody => { }   // (C8.3) member names only; no type-exprs to validate
+                    parser::ExternBody => { }   // (C7.1a) opaque handle — no type-exprs to validate
                     parser::ClassBody as cb => {   // (W10b.CLASS) mirrors StructBody's field-only scope (methods unchecked here, same as struct methods today)
                         mut k = 0
                         loop {
                             if k >= cb.fields.len { break }
-                            match e { error => break; null => {} }
+                            match e { error => break; null => { } }
                             e = check_texpr(cb.fields[k].type_ann, it.namespace, table, al)
                             k++
                         }
@@ -224,16 +224,16 @@ fn check_modules(prog: parser::Program, table: TypeTable) -> error? {
                         mut mi = 0
                         loop {
                             if mi >= ib.methods.len { break }
-                            match e { error => break; null => {} }
+                            match e { error => break; null => { } }
                             let m = ib.methods[mi]
                             mut pi = 0
                             loop {
                                 if pi >= m.params.len { break }
-                                match e { error => break; null => {} }
+                                match e { error => break; null => { } }
                                 if m.params[pi].has_type { e = check_texpr(m.params[pi].type_ann, it.namespace, table, al) }
                                 pi++
                             }
-                            match e { null => { if m.has_return { e = check_texpr(m.return_type, it.namespace, table, al) } }; error => {} }
+                            match e { null => { if m.has_return { e = check_texpr(m.return_type, it.namespace, table, al) } }; error => { } }
                             mi++
                         }
                     }
@@ -241,29 +241,29 @@ fn check_modules(prog: parser::Program, table: TypeTable) -> error? {
                         mut k = 0
                         loop {
                             if k >= trb.fields.len { break }
-                            match e { error => break; null => {} }
+                            match e { error => break; null => { } }
                             e = check_texpr(trb.fields[k].type_ann, it.namespace, table, al)
                             k++
                         }
                         mut mi = 0
                         loop {
                             if mi >= trb.methods.len { break }
-                            match e { error => break; null => {} }
+                            match e { error => break; null => { } }
                             let m = trb.methods[mi]
                             mut pi = 0
                             loop {
                                 if pi >= m.params.len { break }
-                                match e { error => break; null => {} }
+                                match e { error => break; null => { } }
                                 if m.params[pi].has_type { e = check_texpr(m.params[pi].type_ann, it.namespace, table, al) }
                                 pi++
                             }
-                            match e { null => { if m.has_return { e = check_texpr(m.return_type, it.namespace, table, al) } }; error => {} }
+                            match e { null => { if m.has_return { e = check_texpr(m.return_type, it.namespace, table, al) } }; error => { } }
                             mi++
                         }
                     }
                 }
             }
-            _ => {}
+            _ => { }
         }
         match e {
             error as err => {
@@ -276,7 +276,7 @@ fn check_modules(prog: parser::Program, table: TypeTable) -> error? {
                 let positioned = teko::error::err_loc(located, el, ec)
                 return teko::error::err_typed(positioned, err.expected, err.actual)
             }
-            null => {}
+            null => { }
         }
         i++
     }
