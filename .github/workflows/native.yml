@@ -72,19 +72,21 @@ jobs:
           LABEL: ${{ matrix.label }}
         run: ./scripts/ci_provision_teko.sh "$LABEL"
 
-      # (#265) The self-build gate is now NATIVE: `teko . -o bin` emits the #test corpus to a
-      # binary, runs it (a failed assert → non-zero exit bars the build), and enforces the FUNCTION
-      # coverage floor from the native run's merged marks — sub-second vs the VM's ~15s interpret.
-      - name: Native test gate (bars the build)
+      # The self-build gate stays VM (the DEFAULT — unchanged cost/floors; owner ruling 2026-07-05:
+      # the native gate regresses build time until #168's partitioning, so it is NOT the default).
+      - name: Test gate (VM)
         shell: bash
         run: teko . -o bin
 
-      # (#265, ratified governance) The VM stays delivered for dev/WASM, so a SEPARATE lane runs the
-      # full `.tkt` corpus on the VM — asserting VM regression AND the line/branch coverage floors
-      # (which the native gate does not yet populate). Runs on the freshly-built gen-1 (`bin/teko`).
-      - name: Test gate (VM lane) — regression + line/branch floors
+      # (#265, opt-in) The native test gate: `teko . -o gen1-native --native-gate` emits the #test
+      # corpus to a binary, runs it (a failed assert → non-zero exit bars this step), and enforces
+      # the FUNCTION coverage floor from the native run's merged marks. This lane exercises the
+      # native codegen paths a `#test` corpus exercises for the FIRST time (cc-compiling constructs
+      # the VM interpreter tolerated) — it caught 3 latent native miscompiles pre-merge. Perf win
+      # (replacing this VM gate as the default) is deferred to #168's partitioning.
+      - name: Native test gate (opt-in — correctness lane)
         shell: bash
-        run: ./bin/teko test . --coverage
+        run: teko . -o gen1-native --native-gate
 
   # ── RISC-V cross-compile + QEMU (non-blocking) ───────────────────────────────
   riscv64-qemu:

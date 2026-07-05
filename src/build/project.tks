@@ -616,7 +616,7 @@ fn ensure_rt_dir_abs() {
     let _ = probe_share_rt_dir()
 }
 
-fn compile_project(dir: str, out_dir: str) -> i32 { compile_project_g(dir, out_dir, false, false) }
+fn compile_project(dir: str, out_dir: str) -> i32 { compile_project_g(dir, out_dir, false, false, false) }
 
 // (#148) report_peak — the compiler prints its own memory cost at the end of a successful build
 // (peak RSS via teko::mem::peak_rss; 0 = unavailable on this host → print suppressed).
@@ -743,13 +743,27 @@ fn release_build_of(dir: str, out_dir: str) -> i32 {
     codegen_and_report(dir, out_dir, strip_tests(rel.prog), rel.manifest)
 }
 
-/** The D4 test-gate body proper (#265): run every `#test` NATIVELY (run_native_gate, fail-fast),
- *  enforce the FUNCTION-coverage floor from the native run's merged marks (native_function_floor),
- *  then rebuild the release program without the `.tkt` files (release_build_of). The line/branch
- *  floors are enforced on the VM lane (`teko test .`, test_project → coverage_gate_result), which the
- *  ratified governance keeps as a required CI job. Split out of compile_project_g so the `no_verify`
- *  short-circuit stays a single early return instead of nesting the whole gate one level deeper. */
-fn run_gate(dir: str, out_dir: str, gen_cov: bool, fe: Frontend) -> i32 {
+/** run_gate_vm — the D4 test-gate body run on the VM (the DEFAULT engine, #265): run every `#test`
+ *  interpreted (fail-fast), enforce all three coverage floors (coverage_gate_result — the VM's
+ *  in-process marks cover function/line/branch fully), then rebuild the release program. This is the
+ *  pre-#265 gate verbatim — unchanged cost, unchanged floors — so a plain `teko . -o out` regresses
+ *  NOTHING: the native gate (run_gate_native) is opt-in only (native_gate_of / TEKO_NATIVE_GATE=1). */
+fn run_gate_vm(dir: str, out_dir: str, gen_cov: bool, fe: Frontend) -> i32 {
+    let trc = vm::run_tests_cov(fe.prog, true, gen_cov, cobertura_path_of(out_dir, gen_cov))
+    if trc != 0 { return trc }
+    let gate_rc = coverage_gate_result(dir, fe)
+    if gate_rc != 0 { return gate_rc }
+    release_build_of(dir, out_dir)
+}
+
+/** run_gate_native — the D4 test-gate body run NATIVELY (#265, OPT-IN via `--native-gate` /
+ *  `TEKO_NATIVE_GATE=1`): run every `#test` compiled-native (run_native_gate, fail-fast), enforce the
+ *  FUNCTION-coverage floor from the native run's merged marks (native_function_floor); line/branch
+ *  floors are NOT enforced here (native has no per-expression instrumentation yet — a real corpus
+ *  build wanting the full three floors should also run the VM lane, `teko test .`). Until #168's
+ *  partitioning makes a single native run cheaper than the VM interpret it replaces, this path is
+ *  SLOWER than run_gate_vm on a large corpus — hence opt-in, not the default (owner ruling 2026-07-05). */
+fn run_gate_native(dir: str, out_dir: str, gen_cov: bool, fe: Frontend) -> i32 {
     let trc = run_native_gate(dir, out_dir, fe.prog, fe.manifest)
     if trc != 0 { return trc }
     let gate_rc = native_function_floor(dir, fe)
@@ -763,19 +777,28 @@ fn run_gate(dir: str, out_dir: str, gen_cov: bool, fe: Frontend) -> i32 {
     release_build_of(dir, out_dir)
 }
 
+/** The D4 test-gate body proper: dispatch to the VM gate (default) or the native gate (opt-in,
+ *  `native_gate` — #265). Split out of compile_project_g so the `no_verify` short-circuit stays a
+ *  single early return instead of nesting the whole gate one level deeper. */
+fn run_gate(dir: str, out_dir: str, gen_cov: bool, native_gate: bool, fe: Frontend) -> i32 {
+    if native_gate { return run_gate_native(dir, out_dir, gen_cov, fe) }
+    run_gate_vm(dir, out_dir, gen_cov, fe)
+}
+
 /** No `#test` functions at all: ignore the gate, build the production program straight from the
  *  already-assembled `fe` (no test code present to strip or verify). */
 fn build_no_tests_present(dir: str, out_dir: str, fe: Frontend) -> i32 { codegen_and_report(dir, out_dir, fe.prog, fe.manifest) }
 
 /** The build with the D4 TEST GATE (ON BY DEFAULT; `--no-test` is IGNORED for a build — a release
- *  MUST run its tests). Assemble WITH the `.tkt` tests, run them on the VM FIRST (fail-fast — a
- *  failed assertion panics, aborting the build before any emission), THEN codegen the production
- *  program (tests stripped, run_gate). The ONLY skips are a project with NO `#test` functions
+ *  MUST run its tests). Assemble WITH the `.tkt` tests, run them on the gate engine FIRST (fail-fast
+ *  — a failed assertion aborts the build before any emission), THEN codegen the production program
+ *  (tests stripped, run_gate). `native_gate` selects the engine (false = VM, the untouched default
+ *  cost/floors; true = native, opt-in — #265). The ONLY skips are a project with NO `#test` functions
  *  (build_no_tests_present), or an explicit `no_verify=true` (issue #249 lever A — `--no-verify`,
  *  build_ungated): a CI-only escape hatch for a self-host chain that has ALREADY proven the gate
- *  on an earlier generation and only needs the fixpoint (`gen2.c == gen3.c`), not a second full VM
+ *  on an earlier generation and only needs the fixpoint (`gen2.c == gen3.c`), not a second full
  *  re-verification. `no_verify` changes NOTHING when false — the untouched default. */
-fn compile_project_g(dir: str, out_dir: str, gen_cov: bool, no_verify: bool) -> i32 {
+fn compile_project_g(dir: str, out_dir: str, gen_cov: bool, no_verify: bool, native_gate: bool) -> i32 {
     ensure_rt_dir_abs()
     match teko::env::chdir(dir) { error => return fail(dir, "cannot enter project directory"); null => {} }
     if no_verify {
@@ -786,7 +809,7 @@ fn compile_project_g(dir: str, out_dir: str, gen_cov: bool, no_verify: bool) -> 
             if !has_tests(fe.prog) {
                 return build_no_tests_present(dir, out_dir, fe)
             }
-            run_gate(dir, out_dir, gen_cov, fe)
+            run_gate(dir, out_dir, gen_cov, native_gate, fe)
         }
         error as e => return fail(dir, e.message)
     }
@@ -849,9 +872,24 @@ fn no_verify_of(args: []str) -> bool {
     false
 }
 
+/** (#265) does the build request the NATIVE test gate — `--native-gate` in the args, or
+ *  `TEKO_NATIVE_GATE=1` in the environment (the CI-lane escape hatch, no arg-list plumbing needed)?
+ *  OPT-IN only: the VM gate is the untouched default (same cost/floors as before #265) until #168's
+ *  partitioning makes a single native run cheaper than the VM interpret it replaces. */
+fn native_gate_of(args: []str) -> bool {
+    mut i: u64 = 0
+    loop {
+        if i >= args.len { break }
+        if args[i] == "--native-gate" { return true }
+        i = i + 1
+    }
+    match teko::env::var("TEKO_NATIVE_GATE") { str as v => v == "1"; error => false }
+}
+
 /** The FIRST non-flag positional (the project) from `start`, or "" if none (the caller reports).
- *  Skips `-o <dir>` (and its value), `--no-test` (D4; currently ignored), and `--no-verify` (#249
- *  lever A) — every recognized build flag — so none of them is mistaken for the project argument. */
+ *  Skips `-o <dir>` (and its value), `--no-test` (D4; currently ignored), `--no-verify` (#249 lever
+ *  A), and `--native-gate` (#265) — every recognized build flag — so none of them is mistaken for
+ *  the project argument. */
 fn project_arg_of(args: []str, start: u64) -> str {
     mut i = start
     loop {
@@ -859,6 +897,7 @@ fn project_arg_of(args: []str, start: u64) -> str {
         if args[i] == "-o" { i = i + 2 }
         else if args[i] == "--no-test" { i = i + 1 }
         else if args[i] == "--no-verify" { i = i + 1 }
+        else if args[i] == "--native-gate" { i = i + 1 }
         else { return args[i] }
     }
     ""
