@@ -1434,6 +1434,93 @@ fn doc_comment_own_line_with_blank_line_still_attaches() {
     }
 }
 
+#test
+/**
+ * (issue #285) a doc comment on its own line before a STRUCT FIELD — parse_fields' field
+ * branch must peel a leading Doc too, not just struct_item_is_method's method peek.
+ *
+ * NOTE (bootstrap ordering): this test's OWN doc sits after `#test` (the seed compiler
+ * building this corpus does not yet contain this issue's fix); the new before-the-attribute
+ * placement is instead exercised as a source STRING via `module_of`, parsed at runtime.
+ */
+fn doc_comment_own_line_attaches_to_struct_field() {
+    match module_of("type S = struct { /** the x coordinate */\nx: i64; y: i64 }") {
+        Module as m => match m.decls[0] {
+            TypeDecl as td => match td.body {
+                StructBody as sb => {
+                    teko::assert::is_true(sb.fields.len == 2)
+                    teko::assert::is_true(sb.fields[0].has_doc)
+                    teko::assert::is_true(sb.fields[0].doc == "/** the x coordinate */")
+                    teko::assert::is_false(sb.fields[1].has_doc)
+                }
+                _ => teko::assert::is_true(false)
+            }
+            _ => teko::assert::is_true(false)
+        }
+        error => teko::assert::is_true(false)
+    }
+}
+
+#test
+/**
+ * (issue #285) a doc comment on its own line before a CLASS FIELD, both with and without a
+ * following `pub`/`exp`/`intern` modifier — parse_class_fields must peel the Doc BEFORE those
+ * modifiers (the same ordering parse_function already uses for a method/fn).
+ */
+fn doc_comment_own_line_attaches_to_class_field() {
+    match module_of("type C = class { /** the x coordinate */\npub x: i64; y: i64 }") {
+        Module as m => match m.decls[0] {
+            TypeDecl as td => match td.body {
+                ClassBody as cb => {
+                    teko::assert::is_true(cb.fields.len == 2)
+                    teko::assert::is_true(cb.fields[0].has_doc)
+                    teko::assert::is_true(cb.fields[0].doc == "/** the x coordinate */")
+                    teko::assert::is_true(cb.fields[0].vis == Visibility::Pub)
+                    teko::assert::is_false(cb.fields[1].has_doc)
+                }
+                _ => teko::assert::is_true(false)
+            }
+            _ => teko::assert::is_true(false)
+        }
+        error => teko::assert::is_true(false)
+    }
+}
+
+#test
+/**
+ * (issue #285) a doc comment directly above `#test fn …` — the standard Javadoc placement, ABOVE
+ * the attribute. parse_decl must peel the doc BEFORE parse_decl_attributes runs, or `#test`
+ * (sitting between the doc and `fn`) is never recognized as an attribute at all.
+ */
+fn doc_comment_before_attribute_attaches_to_test_fn() {
+    match module_of("/** exercises addition */\n#test\nfn t_add() { }") {
+        Module as m => match m.decls[0] {
+            Function as f => {
+                teko::assert::is_true(f.has_doc)
+                teko::assert::is_true(f.doc == "/** exercises addition */")
+                teko::assert::is_true(f.is_test)
+            }
+            _ => teko::assert::is_true(false)
+        }
+        error => teko::assert::is_true(false)
+    }
+}
+
+#test
+/**
+ * (issue #285) the pre-existing placement — a doc comment AFTER `#test`, directly above `fn` —
+ * must keep working alongside the new before-the-attribute placement above.
+ */
+fn doc_comment_after_attribute_attaches_to_test_fn() {
+    match module_of("#test\n/** exercises addition */\nfn t_add() { }") {
+        Module as m => match m.decls[0] {
+            Function as f => { teko::assert::is_true(f.has_doc); teko::assert::is_true(f.is_test) }
+            _ => teko::assert::is_true(false)
+        }
+        error => teko::assert::is_true(false)
+    }
+}
+
 /** The `DiKind` carried by the first declaration of `source`, or `DiKind::None` if it is not a
  *  type decl — a parser-test accessor for the W10c lifetime-annotation cases below. */
 fn first_decl_di_kind(source: str) -> DiKind {

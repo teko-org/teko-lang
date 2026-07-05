@@ -294,15 +294,16 @@ fn parse_fields(tokens: []lexer::Token, pos: u64) -> ParsedStructBody | error {
             methods = teko::list::push(methods, mf)
             p = m.next
         } else {
-            if !is_name_at(tokens, p) {
-                return err_at(tokens, p, "expected a field name or a method (`fn …`)")
+            let fdoc = peel_leading_doc(tokens, p)
+            if !is_name_at(tokens, fdoc.next) {
+                return err_at(tokens, fdoc.next, "expected a field name or a method (`fn …`)")
             }
-            let name = tokens[p].text
-            if !is_kind_at(tokens, p + 1, lexer::TokenKind::Colon) {
-                return err_at(tokens, p + 1, "expected ':' after a field name")
+            let name = tokens[fdoc.next].text
+            if !is_kind_at(tokens, fdoc.next + 1, lexer::TokenKind::Colon) {
+                return err_at(tokens, fdoc.next + 1, "expected ':' after a field name")
             }
-            let ty = match parse_type(tokens, p + 2) { ParsedType as x => x; error as e => return e }
-            fields = teko::list::push(fields, Field { name = name; type_ann = ty.node; vis = Visibility::Pub; is_intern = false })
+            let ty = match parse_type(tokens, fdoc.next + 2) { ParsedType as x => x; error as e => return e }
+            fields = teko::list::push(fields, Field { name = name; type_ann = ty.node; vis = Visibility::Pub; is_intern = false; has_doc = fdoc.has_doc; doc = fdoc.doc })
             p = ty.next
         }
         if is_kind_at(tokens, p, lexer::TokenKind::RBrace) { break }
@@ -347,20 +348,22 @@ fn parse_class_fields(tokens: []lexer::Token, pos: u64) -> ParsedStructBody | er
             methods = teko::list::push(methods, mf)
             p = m.next
         } else {
+            let fdoc = peel_leading_doc(tokens, p)
+            mut fp = fdoc.next
             mut fvis = Visibility::Private
-            if is_kind_at(tokens, p, lexer::TokenKind::Pub) { fvis = Visibility::Pub; p = p + 1 }
-            else if is_kind_at(tokens, p, lexer::TokenKind::Exp) { fvis = Visibility::Exp; p = p + 1 }
+            if is_kind_at(tokens, fp, lexer::TokenKind::Pub) { fvis = Visibility::Pub; fp = fp + 1 }
+            else if is_kind_at(tokens, fp, lexer::TokenKind::Exp) { fvis = Visibility::Exp; fp = fp + 1 }
             mut fintern = false
-            if is_kind_at(tokens, p, lexer::TokenKind::Intern) { fintern = true; p = p + 1 }
-            if !is_name_at(tokens, p) {
-                return err_at(tokens, p, "expected a field name or a method (`fn …`)")
+            if is_kind_at(tokens, fp, lexer::TokenKind::Intern) { fintern = true; fp = fp + 1 }
+            if !is_name_at(tokens, fp) {
+                return err_at(tokens, fp, "expected a field name or a method (`fn …`)")
             }
-            let name = tokens[p].text
-            if !is_kind_at(tokens, p + 1, lexer::TokenKind::Colon) {
-                return err_at(tokens, p + 1, "expected ':' after a field name")
+            let name = tokens[fp].text
+            if !is_kind_at(tokens, fp + 1, lexer::TokenKind::Colon) {
+                return err_at(tokens, fp + 1, "expected ':' after a field name")
             }
-            let ty = match parse_type(tokens, p + 2) { ParsedType as x => x; error as e => return e }
-            fields = teko::list::push(fields, Field { name = name; type_ann = ty.node; vis = fvis; is_intern = fintern })
+            let ty = match parse_type(tokens, fp + 2) { ParsedType as x => x; error as e => return e }
+            fields = teko::list::push(fields, Field { name = name; type_ann = ty.node; vis = fvis; is_intern = fintern; has_doc = fdoc.has_doc; doc = fdoc.doc })
             p = ty.next
         }
         if is_kind_at(tokens, p, lexer::TokenKind::RBrace) { break }
@@ -488,15 +491,16 @@ fn parse_trait_fields(tokens: []lexer::Token, pos: u64) -> ParsedStructBody | er
             methods = teko::list::push(methods, mf)
             p = m.next
         } else {
-            if !is_name_at(tokens, p) {
-                return err_at(tokens, p, "expected a field name or a method (`fn …`) in the trait body")
+            let fdoc = peel_leading_doc(tokens, p)
+            if !is_name_at(tokens, fdoc.next) {
+                return err_at(tokens, fdoc.next, "expected a field name or a method (`fn …`) in the trait body")
             }
-            let name = tokens[p].text
-            if !is_kind_at(tokens, p + 1, lexer::TokenKind::Colon) {
-                return err_at(tokens, p + 1, "expected ':' after a field name")
+            let name = tokens[fdoc.next].text
+            if !is_kind_at(tokens, fdoc.next + 1, lexer::TokenKind::Colon) {
+                return err_at(tokens, fdoc.next + 1, "expected ':' after a field name")
             }
-            let ty = match parse_type(tokens, p + 2) { ParsedType as x => x; error as e => return e }
-            fields = teko::list::push(fields, Field { name = name; type_ann = ty.node; vis = Visibility::Pub; is_intern = false })
+            let ty = match parse_type(tokens, fdoc.next + 2) { ParsedType as x => x; error as e => return e }
+            fields = teko::list::push(fields, Field { name = name; type_ann = ty.node; vis = Visibility::Pub; is_intern = false; has_doc = fdoc.has_doc; doc = fdoc.doc })
             p = ty.next
         }
         if is_kind_at(tokens, p, lexer::TokenKind::RBrace) { break }
@@ -745,8 +749,60 @@ fn parse_inject_binding(tokens: []lexer::Token, pos: u64) -> Parsed<InjectBindin
     Parsed<InjectBinding> { node = InjectBinding { name = name; type_ann = ty.node; has_key = false; key = ""; line = bline; col = bcol }; next = ty.next }
 }
 
+/**
+ * Peel an OPTIONAL leading doc-comment off `pos`, before any `#…` attribute is parsed
+ * (issue #285 — the standard Javadoc placement precedes `#test`/`#os`/`#inject`/the DI
+ * lifetimes, not just the `pub`/`exp`/keyword `parse_function`/`parse_type_decl` already handle).
+ *
+ * @param tokens  the full token stream
+ * @param pos     the position to peek at (a Doc token, or the first attribute/keyword)
+ * @return        the peeled doc (absent when `pos` is not a Doc token) + the resume position
+ */
+fn peel_leading_doc(tokens: []lexer::Token, pos: u64) -> ParsedLeadingDoc {
+    if !is_kind_at(tokens, pos, lexer::TokenKind::Doc) {
+        return ParsedLeadingDoc { has_doc = false; doc = ""; next = pos }
+    }
+    ParsedLeadingDoc { has_doc = true; doc = tokens[pos].text; next = skip_seps(tokens, pos + 1) }
+}
+
+/**
+ * Rebuild a parsed Decl with an OUTER doc-comment attached (issue #285) — used only when
+ * `parse_decl` itself peeled a doc that preceded the `#…` attributes, so the inner
+ * `parse_function`/`parse_type_decl`/`parse_flags_decl` never saw it and left `has_doc=false`.
+ * A no-op (the node is returned unchanged) when `has_doc` is false or the node is neither.
+ *
+ * @param node     the freshly parsed declaration
+ * @param has_doc  true iff an outer doc-comment was peeled by `parse_decl`
+ * @param doc      the outer doc-comment's text (valid iff has_doc)
+ * @return         `node`, with `has_doc`/`doc` overridden to the outer doc when present
+ */
+fn with_outer_doc(node: Decl, has_doc: bool, doc: str) -> Decl {
+    if !has_doc { return node }
+    match node {
+        Function as f => Function { name = f.name; type_params = f.type_params; type_constraints = f.type_constraints; params = f.params; has_return = f.has_return; return_type = f.return_type; body = f.body; vis = f.vis; has_doc = true; doc = doc; line = f.line; col = f.col; is_test = f.is_test; is_extern = f.is_extern; c_symbol = f.c_symbol; from_lib = f.from_lib; os_guard = f.os_guard; is_intern = f.is_intern; is_abstract = f.is_abstract; is_virtual = f.is_virtual; is_override = f.is_override; has_inject = f.has_inject; injects = f.injects }
+        TypeDecl as td => TypeDecl { name = td.name; type_params = td.type_params; type_constraints = td.type_constraints; body = td.body; vis = td.vis; has_doc = true; doc = doc; line = td.line; col = td.col; di_kind = td.di_kind; has_di_key = td.has_di_key; di_key = td.di_key }
+        _ => node
+    }
+}
+
+/**
+ * Parse one top-level declaration at `pos` — `[doc] [#attrs] [doc] [pub|exp] fn|type|flags …`.
+ *
+ * The Javadoc MAY precede the `#…` attributes (issue #285, the standard placement — a doc
+ * describes the whole declaration, above every modifier) OR follow them (the pre-existing
+ * placement `parse_function`/`parse_type_decl`/`parse_flags_decl` already parse themselves);
+ * both are accepted, but only one may be present (a doc in both slots is not a Teko idiom and
+ * the second is treated as part of the keyword search, erroring normally if it doesn't fit).
+ *
+ * @param tokens  the full token stream
+ * @param pos     the position of the first token of the declaration (a Doc, `#`, `pub`/`exp`,
+ *                `extern`, or `fn`/`type`/`flags`)
+ * @return        the parsed declaration and the position just past it
+ * @throws        a plain `error` when `pos` is not the start of a valid declaration
+ */
 fn parse_decl(tokens: []lexer::Token, pos: u64) -> Parsed<Decl> | error {
-    let attrs = match parse_decl_attributes(tokens, pos) { ParsedAttributes as x => x; error as e => return e }
+    let outer_doc = peel_leading_doc(tokens, pos)
+    let attrs = match parse_decl_attributes(tokens, outer_doc.next) { ParsedAttributes as x => x; error as e => return e }
     let start = attrs.next
     mut k = start
     if is_kind_at(tokens, k, lexer::TokenKind::Doc) { k = skip_seps(tokens, k + 1) }
@@ -761,13 +817,16 @@ fn parse_decl(tokens: []lexer::Token, pos: u64) -> Parsed<Decl> | error {
         k = k + 1
     }
     if is_kind_at(tokens, k, lexer::TokenKind::Fn) {
-        return parse_fn_decl_with_attrs(tokens, start, attrs)
+        let d = match parse_fn_decl_with_attrs(tokens, start, attrs) { Parsed<Decl> as x => x; error as e => return e }
+        return Parsed<Decl> { node = with_outer_doc(d.node, outer_doc.has_doc, outer_doc.doc); next = d.next }
     }
     if is_kind_at(tokens, k, lexer::TokenKind::Type) {
-        return parse_type_decl_with_attrs(tokens, start, k, attrs)
+        let d = match parse_type_decl_with_attrs(tokens, start, k, attrs) { Parsed<Decl> as x => x; error as e => return e }
+        return Parsed<Decl> { node = with_outer_doc(d.node, outer_doc.has_doc, outer_doc.doc); next = d.next }
     }
     if is_kind_at(tokens, k, lexer::TokenKind::Flags) {
-        return parse_flags_decl_with_attrs(tokens, start, k, attrs)
+        let d = match parse_flags_decl_with_attrs(tokens, start, k, attrs) { Parsed<Decl> as x => x; error as e => return e }
+        return Parsed<Decl> { node = with_outer_doc(d.node, outer_doc.has_doc, outer_doc.doc); next = d.next }
     }
     if saw_extern {
         return err_at(tokens, k, "expected `fn` or `type` after `extern`")
