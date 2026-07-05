@@ -1,0 +1,301 @@
+/** teko::lir (interpreter oracle) — execute the LIR subset directly (issue #221, C5).
+
+    This is the FOURTH oracle of the backend. N1 delivers the lowering (TAST -> LIR), the
+    part every future target (N2-N6) inherits WHOLE; a LIR interpreter validates that
+    lowering INDEPENDENTLY of any machine code (isel/encoding/ELF are N2+). It runs on any
+    host, needs no `cc`/QEMU, and grows one case per feature as the lowering does — the
+    cheap permanent oracle of the native path, exactly as the VM is for the whole language.
+
+    Scope (N1 subset): integer const/bin/un/param/ret + a direct Teko-Teko call + the
+    `tk_exit` builtin. A call to any other runtime `tk_*` honest-stops (N1 has no str/alloc
+    in the subset). Values are the i128 carrier; a numeric `to` cast masks to the target
+    width. Floats are lowered (LConstFloat/F-ops) but not RUN here — the N1 run-fixtures are
+    integer-only, and a float op honest-stops rather than pretend a bit-level result.
+
+    IResult — an interpreter step outcome. `tag` selects: 0 = CONTINUE (a non-terminator
+    step succeeded — a placeholder the block loop advances past, never surfaced to the
+    caller), 1 = an EXIT unwind (a `tk_exit`), 2 = an ERROR (an out-of-subset op reached at
+    runtime), 3 = a RETURN value (an `ret` terminator carrying the function's result).
+    Separating CONTINUE from RETURN is what lets the block loop know when to stop — both a
+    plain `const` step and a `ret` carry a value, but only `ret` ends the block. */
+pub type IResult = struct { tag: u32; value: i128; message: str }
+
+/** ires_continue — a non-terminator step's placeholder (the block loop advances). */
+fn ires_continue() -> IResult { IResult { tag = 0; value = 0 to i128; message = "" } }
+/** ires_return — an `ret` terminator carrying the function's result value. */
+fn ires_return(v: i128) -> IResult { IResult { tag = 3; value = v; message = "" } }
+/** ires_exit — a `tk_exit` unwind carrying the exit code. */
+fn ires_exit(code: i128) -> IResult { IResult { tag = 1; value = code; message = "" } }
+/** ires_error — an out-of-subset op reached at runtime. */
+fn ires_error(msg: str) -> IResult { IResult { tag = 2; value = 0 to i128; message = msg } }
+
+/** is_continue — a continue placeholder (the block loop advances on this alone). */
+fn is_continue(r: IResult) -> bool { r.tag == 0 }
+/** is_return — a return-value outcome (a terminator). */
+fn is_return(r: IResult) -> bool { r.tag == 3 }
+/** is_exit — an exit-unwind outcome. */
+fn is_exit(r: IResult) -> bool { r.tag == 1 }
+/** is_ierror — an error outcome. */
+fn is_ierror(r: IResult) -> bool { r.tag == 2 }
+
+/** RegFile — the per-frame VReg value store: values[i] is the i128 held by VReg i,
+    `set[i]` marks it defined (a read of an unset VReg is an internal error). */
+pub type RegFile = struct { values: []i128; set: []bool }
+
+/** new_regfile — a register file sized for a function's VRegs (next_vreg slots), all unset. */
+fn new_regfile(n: u32) -> RegFile {
+    mut vals: []i128 = teko::list::empty()
+    mut set: []bool = teko::list::empty()
+    mut i: u32 = 0
+    loop {
+        if i >= n { break }
+        vals = teko::list::push(vals, 0 to i128)
+        set = teko::list::push(set, false)
+        i++
+    }
+    RegFile { values = vals; set = set }
+}
+
+/** rf_set — store `v` into VReg `r`, returning the updated register file (functional; a
+    fresh slice with the one slot rewritten). */
+fn rf_set(rf: RegFile, r: u32, v: i128) -> RegFile {
+    mut vals: []i128 = teko::list::empty()
+    mut set: []bool = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= rf.values.len { break }
+        let is_target = (i to u32) == r
+        vals = teko::list::push(vals, if is_target { v } else { rf.values[i] })
+        set = teko::list::push(set, if is_target { true } else { rf.set[i] })
+        i++
+    }
+    RegFile { values = vals; set = set }
+}
+
+/** RFRead — a register read: whether it was defined + its value. */
+pub type RFRead = struct { ok: bool; value: i128 }
+
+/** rf_get — read VReg `r`; ok=false if the slot is out of range or undefined. */
+fn rf_get(rf: RegFile, r: u32) -> RFRead {
+    let i = r to u64
+    if i >= rf.values.len { return RFRead { ok = false; value = 0 } }
+    if !rf.set[i] { return RFRead { ok = false; value = 0 } }
+    RFRead { ok = true; value = rf.values[i] }
+}
+
+/** interp_lmodule — run the function named `entry` in `m` with `args`, returning the exit
+    code the program would produce: an explicit `tk_exit(n)` yields n; a plain `ret v` from
+    the entry yields v; an out-of-subset op or a missing function yields a NEGATIVE sentinel
+    (-1) so a fixture's expected non-negative exit never collides with a failure. */
+pub fn interp_lmodule(m: LModule, entry: str, args: []i128) -> i128 {
+    let f = find_lfunc(m, entry)
+    if !f.found { return -1 to i128 }
+    let r = interp_call(m, f.func, args, 0)
+    if is_exit(r) { return r.value }
+    if is_return(r) { return r.value }
+    -1 to i128
+}
+
+/** LFuncHit — a module function lookup result. */
+pub type LFuncHit = struct { found: bool; func: LFunc }
+
+/** find_lfunc — the function in `m` whose symbol is `sym`, or found=false. */
+fn find_lfunc(m: LModule, sym: str) -> LFuncHit {
+    mut i: u64 = 0
+    loop {
+        if i >= m.funcs.len { break }
+        if m.funcs[i].symbol == sym { return LFuncHit { found = true; func = m.funcs[i] } }
+        i++
+    }
+    LFuncHit { found = false; func = empty_lfunc() }
+}
+
+/** empty_lfunc — the sentinel returned with found=false (never read). */
+fn empty_lfunc() -> LFunc {
+    new_func("", 0, teko::list::empty(), LType::Void)
+}
+
+/** interp_call — execute `f` with argument values `args`, at recursion `depth` (a guard
+    against a runaway self-call). Materializes the params into VRegs 0..n_params, then runs
+    the single N1 block. */
+fn interp_call(m: LModule, f: LFunc, args: []i128, depth: u32) -> IResult {
+    if depth > 4096 { return ires_error("lir interp: call depth exceeded (runaway recursion?)") }
+    mut rf = new_regfile(f.next_vreg)
+    mut i: u64 = 0
+    loop {
+        if i >= f.n_params to u64 { break }
+        let a = if i < args.len { args[i] } else { 0 to i128 }
+        rf = rf_set(rf, i to u32, a)
+        i++
+    }
+    if f.blocks.len == 0 { return ires_error("lir interp: function has no block") }
+    interp_block(m, f, f.blocks[0], rf, depth)
+}
+
+/** interp_block — run a block's instructions in order until a terminator (ret) or an exit
+    unwind. A block that ends without a terminator is an internal error. */
+fn interp_block(m: LModule, f: LFunc, b: LBlock, rf0: RegFile, depth: u32) -> IResult {
+    mut rf = rf0
+    mut i: u64 = 0
+    loop {
+        if i >= b.insts.len { break }
+        let step = interp_inst(m, f, b.insts[i], rf, depth)
+        if !is_continue(step.result) { return step.result }
+        rf = step.rf
+        i++
+    }
+    ires_error("lir interp: block fell through without a terminator")
+}
+
+/** IStep — one instruction's effect: an IResult (value/exit/error) + the register file it
+    leaves. A terminator (ret) returns an exit/value result the block propagates. */
+pub type IStep = struct { result: IResult; rf: RegFile }
+
+/** istep_cont — a non-terminator step: continue with the updated register file (the result
+    is a CONTINUE placeholder the block loop advances past). */
+fn istep_cont(rf: RegFile) -> IStep { IStep { result = ires_continue(); rf = rf } }
+
+/** istep_stop — a terminator/exit/error step: propagate `r` (the block returns it). */
+fn istep_stop(r: IResult, rf: RegFile) -> IStep { IStep { result = r; rf = rf } }
+
+/** interp_inst — execute one instruction: define its result VReg (for value ops) or
+    propagate a terminator/exit. */
+fn interp_inst(m: LModule, f: LFunc, inst: LInst, rf: RegFile, depth: u32) -> IStep {
+    match inst.op {
+        LConstInt as c   => interp_def(rf, inst, c.val)
+        LConstFloat      => istep_stop(ires_error("lir interp: float ops are out of the N1 run subset"), rf)
+        LBin as b        => interp_bin(rf, inst, b)
+        LUn as u         => interp_un(rf, inst, u)
+        LParam           => istep_cont(rf)
+        LCall as c       => interp_call_inst(m, f, inst, c, rf, depth)
+        LRet as r        => interp_ret(rf, r)
+        LJump            => istep_stop(ires_error("lir interp: jump is out of the N1 run subset (N2)"), rf)
+        LBranch          => istep_stop(ires_error("lir interp: branch is out of the N1 run subset (N2)"), rf)
+    }
+}
+
+/** interp_def — store `v` into the instruction's result VReg and continue. */
+fn interp_def(rf: RegFile, inst: LInst, v: i128) -> IStep {
+    istep_cont(rf_set(rf, inst.result, v))
+}
+
+/** interp_ret — a `ret %v` (or `ret`): unwind with the returned value (0 for a void ret). */
+fn interp_ret(rf: RegFile, r: LRet) -> IStep {
+    if !r.has_value { return istep_stop(ires_return(0 to i128), rf) }
+    let v = rf_get(rf, r.value)
+    if !v.ok { return istep_stop(ires_error("lir interp: ret of an undefined VReg"), rf) }
+    istep_stop(ires_return(v.value), rf)
+}
+
+/** EvalOut — the result of an arithmetic evaluation: a computed value, or an error message
+    when the opcode/inputs are out of the N1 run subset. */
+pub type EvalOut = struct { ok: bool; value: i128; message: str }
+
+/** eval_ok — a successful arithmetic value. */
+fn eval_ok(v: i128) -> EvalOut { EvalOut { ok = true; value = v; message = "" } }
+/** eval_err — a failed arithmetic (out-of-subset opcode or bad input). */
+fn eval_err(msg: str) -> EvalOut { EvalOut { ok = false; value = 0 to i128; message = msg } }
+
+/** interp_bin — an integer binary op: read both operands, compute, store the result. A
+    float op or a divide-by-zero honest-stops (the N1 fixtures never divide by zero). */
+fn interp_bin(rf: RegFile, inst: LInst, b: LBin) -> IStep {
+    let a = rf_get(rf, b.a)
+    let c = rf_get(rf, b.b)
+    if !a.ok || !c.ok { return istep_stop(ires_error("lir interp: binary op on an undefined VReg"), rf) }
+    let r = eval_bin(b.op, a.value, c.value)
+    if !r.ok { return istep_stop(ires_error(r.message), rf) }
+    istep_cont(rf_set(rf, inst.result, r.value))
+}
+
+/** eval_bin — the arithmetic of an integer LBinOp over the i128 carrier. Signed and
+    unsigned divide/remainder both use the carrier's arithmetic (the N1 fixtures are
+    non-negative, so signed and unsigned agree); a zero divisor honest-stops. A float or
+    comparison/bitwise op is out of the N1 run subset. */
+fn eval_bin(op: LBinOp, a: i128, b: i128) -> EvalOut {
+    match op {
+        IAdd  => eval_ok(a + b)
+        ISub  => eval_ok(a - b)
+        IMul  => eval_ok(a * b)
+        IDivS => eval_div(a, b)
+        IDivU => eval_div(a, b)
+        IRemS => eval_rem(a, b)
+        IRemU => eval_rem(a, b)
+        _ => eval_err("lir interp: binary opcode is out of the N1 run subset (N2)")
+    }
+}
+
+/** eval_div — integer division with a zero-divisor guard. */
+fn eval_div(a: i128, b: i128) -> EvalOut {
+    if b == 0 to i128 { return eval_err("lir interp: divide by zero") }
+    eval_ok(a / b)
+}
+
+/** eval_rem — integer remainder with a zero-divisor guard. */
+fn eval_rem(a: i128, b: i128) -> EvalOut {
+    if b == 0 to i128 { return eval_err("lir interp: remainder by zero") }
+    eval_ok(a % b)
+}
+
+/** interp_un — an integer unary op: negate (INeg) or the numeric conversions, which the N1
+    interp treats as the identity over the i128 carrier (the fixtures cast between integer
+    widths that all fit the carrier; a real narrowing mask is N2 when narrow types run). A
+    float negation is out of the run subset. */
+fn interp_un(rf: RegFile, inst: LInst, u: LUn) -> IStep {
+    let a = rf_get(rf, u.a)
+    if !a.ok { return istep_stop(ires_error("lir interp: unary op on an undefined VReg"), rf) }
+    let r = eval_un(u.op, a.value)
+    if !r.ok { return istep_stop(ires_error(r.message), rf) }
+    istep_cont(rf_set(rf, inst.result, r.value))
+}
+
+/** eval_un — the arithmetic of an integer LUnOp: INeg negates; ZExt/SExt/Trunc are the
+    identity over the carrier (the fixtures' casts stay within i128); a float unary honest-
+    stops. */
+fn eval_un(op: LUnOp, a: i128) -> EvalOut {
+    match op {
+        INeg  => eval_ok(-a)
+        ZExt  => eval_ok(a)
+        SExt  => eval_ok(a)
+        Trunc => eval_ok(a)
+        _ => eval_err("lir interp: unary opcode is out of the N1 run subset (N2)")
+    }
+}
+
+/** interp_call_inst — a call: `tk_exit(n)` unwinds with exit code n; a Teko-Teko call
+    (found in the module) recurses; any other runtime symbol honest-stops. */
+fn interp_call_inst(m: LModule, f: LFunc, inst: LInst, c: LCall, rf: RegFile, depth: u32) -> IStep {
+    let av = read_args(rf, c.args)
+    if !av.ok { return istep_stop(ires_error("lir interp: call arg is an undefined VReg"), rf) }
+    if c.symbol == "tk_exit" { return interp_exit(av.values, rf) }
+    let callee = find_lfunc(m, c.symbol)
+    if !callee.found { return istep_stop(ires_error(teko::str::concat("lir interp: unknown call target @", c.symbol)), rf) }
+    let r = interp_call(m, callee.func, av.values, depth + 1)
+    if is_exit(r) { return istep_stop(r, rf) }
+    if is_ierror(r) { return istep_stop(r, rf) }
+    if !is_return(r) { return istep_stop(ires_error("lir interp: callee did not return a value"), rf) }
+    if !inst.has_result { return istep_cont(rf) }
+    istep_cont(rf_set(rf, inst.result, r.value))
+}
+
+/** interp_exit — `tk_exit(n)`: unwind with exit code n (0 when called with no argument). */
+fn interp_exit(args: []i128, rf: RegFile) -> IStep {
+    let code = if args.len == 0 { 0 to i128 } else { args[0] }
+    istep_stop(ires_exit(code), rf)
+}
+
+/** RFArgs — a resolved argument-value list: whether every VReg was defined + the values. */
+pub type RFArgs = struct { ok: bool; values: []i128 }
+
+/** read_args — read each argument VReg into its value; ok=false if any is undefined. */
+fn read_args(rf: RegFile, args: []u32) -> RFArgs {
+    mut vals: []i128 = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= args.len { break }
+        let v = rf_get(rf, args[i])
+        if !v.ok { return RFArgs { ok = false; values = vals } }
+        vals = teko::list::push(vals, v.value)
+        i++
+    }
+    RFArgs { ok = true; values = vals }
+}
