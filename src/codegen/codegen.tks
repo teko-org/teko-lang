@@ -4474,21 +4474,39 @@ fn emit_arm_value(buf: []byte, prog: checker::TProgram, ret_type: checker::Type,
     }
 }
 
-// emit_match_value — VALUE form: a GNU statement-expression yielding the matched arm's body
-// value (the SAME selection structure as the tail/stmt forms, but committing the trailing value
-// with `_r = <body>; break;` inside a `do {…} while (0)`):
-//   ({ <SubjCType> _sN = (<subject>); <ResultCType> _rN; do {
-//        if (<test0>) { <binds0> [if (<guard0>)] { <arm body → _rN; break;> } } … } while (0); _rN; })
-// The non-`else` `if` chain gives the VM's first-match-with-guard order; a failed guard
-// falls through to the next arm. Exhaustiveness (checker-guaranteed) means the chain always
-// commits before the `while (0)` exits. (C: `emit_match_value`.)
+/**
+ * Emit a match used as a VALUE: a GNU statement-expression yielding the matched arm's body value.
+ *
+ * The selection structure is the same as the tail/stmt forms, but the trailing value is committed
+ * with `_r = <body>; break;` inside a `do {…} while (0)`:
+ * `({ <SubjCType> _sN = (<subject>); <ResultCType> _rN = {0}; do { if (<test0>) { <binds0>
+ * [if (<guard0>)] { <arm body → _rN; break;> } } … } while (0); _rN; })`. The non-`else` `if`
+ * chain gives the VM's first-match-with-guard order; a failed guard falls through to the next arm.
+ * Exhaustiveness is checker-guaranteed, so the chain always commits before the `while (0)` exits —
+ * but C cannot prove it, so `_rN` is zero-initialized (`= {0}`, universal C zero-init for scalar,
+ * struct and union) to make the fallthrough read well-defined; the winning arm overwrites it, so
+ * behaviour is unchanged. Without the zero-init the read is UB that `zig cc -O2` exploited into the
+ * #281 self-build miscompile.
+ *
+ * @param buf       the C-source byte buffer being built
+ * @param prog      the typed program, for type/expression emission
+ * @param ret_type  the enclosing function's return type, threaded to the value arms
+ * @param e         the match expression's typed node (its `type` is the result type)
+ * @param m         the typed match: subject and arms
+ * @param escaping  the enclosing block-region escape set threaded to subject/guards/arms
+ * @param regions   the enclosing region-frame stack for arm-local bindings
+ * @param fn_body   the enclosing function body, for block-locality analysis
+ * @param dctx      the defer context threaded through the arms
+ * @return          the buffer with the value-match statement-expression appended
+ * @throws          the first emission error from a subject, guard, pattern or arm body
+ */
 fn emit_match_value(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, e: checker::TExpr, m: checker::TMatchExpr, escaping: []str, regions: []RegionFrame, fn_body: []checker::TStatement, dctx: DeferCtx) -> []byte | error {
     // S2/W9: `escaping`/`regions`/`fn_body` thread the enclosing block-region context so each value-arm
     // can open its OWN arm region for its block-local NON-tail bindings (emit_arm_value). The subject
     // and guards are emitted in the SAME enclosing context (the C twin reads its live globals there).
     let subj = fresh_named("_s", buf.len to i64)
-    let res = fresh_named("_r", buf.len to i64 + 1)   // +1 so it differs from subj
-    let subjT = m.subject.type   // for optional / variant pattern lowering
+    let res = fresh_named("_r", buf.len to i64 + 1)
+    let subjT = m.subject.type
     mut out = cb(buf, "({ ")
     out = match emit_type(out, prog, m.subject.type) { []byte as o => o; error as err => return err }
     out = cb(out, " ")
@@ -4499,7 +4517,7 @@ fn emit_match_value(buf: []byte, prog: checker::TProgram, ret_type: checker::Typ
     out = match emit_type(out, prog, e.type) { []byte as o => o; error as err => return err }
     out = cb(out, " ")
     out = cb(out, res)
-    out = cb(out, "; do {\n")
+    out = cb(out, " = {0}; do {\n")
     mut i = 0
     loop {
         if i >= m.arms.len { break }
@@ -4515,8 +4533,6 @@ fn emit_match_value(buf: []byte, prog: checker::TProgram, ret_type: checker::Typ
             out = cb(out, ") {\n")
             ci = "            "
         }
-        // the arm body is a BLOCK (B.20): its trailing value flows into _r (wrapped to the
-        // match result type), or a diverging arm (`=> return e`) emits real control flow.
         out = match emit_arm_value(out, prog, ret_type, e, arm.body, res, ci, escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
         if arm.has_when { out = cb(out, "        }\n") }
         out = cb(out, "    }\n")
@@ -4527,18 +4543,36 @@ fn emit_match_value(buf: []byte, prog: checker::TProgram, ret_type: checker::Typ
     cb(out, "; })")
 }
 
-// emit_match_tail — TAIL form: each winning arm `return`s its body, as an `if` chain inside a
-// brace block holding the subject temp. The FIRST winning arm runs its block and then `goto`s a
-// unique commit label past the chain (so the search stops at the first match — mirrors the VM).
-// The `goto` is essential: a tail match in a `-> void` fn has arm bodies that do NOT diverge
-// (no implicit `return`), so without the commit jump MULTIPLE arms would fall through and all
-// fire. A failed `when` guard naturally falls through to the next arm (the goto is INSIDE the
-// guard block). `ret_type` threads the fn return type so a tail arm body that yields a case value
-// into a variant return slot is wrapped (emit_as). (C: `emit_match_tail`.)
+/**
+ * Emit a match in TAIL position: each winning arm `return`s its body, as an `if` chain inside a
+ * brace block holding the subject temp.
+ *
+ * The FIRST winning arm runs its block and then `goto`s a unique commit label past the chain, so
+ * the search stops at the first match (mirroring the VM). The `goto` is essential: a tail match in
+ * a `-> void` fn has arm bodies that do NOT diverge (no implicit `return`), so without the commit
+ * jump MULTIPLE arms would fall through and all fire. A failed `when` guard naturally falls through
+ * to the next arm (the goto is INSIDE the guard block). `ret_type` threads the fn return type so a
+ * tail arm body that yields a case value into a variant return slot is wrapped (emit_as). The
+ * `_done:` label emits a defensive zero return for non-void functions so the checker-exhaustive
+ * chain can never fall off the function end (`-Wreturn-type`).
+ *
+ * @param buf       the C-source byte buffer being built
+ * @param prog      the typed program, for type/expression emission
+ * @param e         the match expression's typed node
+ * @param m         the typed match: subject and arms
+ * @param in_main   true iff this tail match is directly in `main`
+ * @param ret_type  the enclosing function's return type, threaded to the arm bodies
+ * @param indent    the current indentation for the emitted brace block
+ * @param escaping  the enclosing block-region escape set threaded to arm statements
+ * @param fn_body   the enclosing function body, for block-locality analysis
+ * @param dctx      the defer context threaded through the arms
+ * @return          the buffer with the tail-match brace block appended
+ * @throws          the first emission error from a subject, guard, pattern or arm body
+ */
 fn emit_match_tail(buf: []byte, prog: checker::TProgram, e: checker::TExpr, m: checker::TMatchExpr, in_main: bool, ret_type: checker::Type, indent: str, escaping: []str, fn_body: []checker::TStatement, dctx: DeferCtx) -> []byte | error {
     let subj = fresh_named("_s", buf.len to i64)
-    let done = teko::str::concat(fresh_named("tk_mt", buf.len to i64 + 1), "_done")   // unique commit label (str concat — no `+` on str)
-    let subjT = m.subject.type   // for optional / variant pattern lowering
+    let done = teko::str::concat(fresh_named("tk_mt", buf.len to i64 + 1), "_done")
+    let subjT = m.subject.type
     let inner = cb_indent_deeper(indent)
     let inner2 = cb_indent_deeper(inner)
     mut out = cb(buf, indent)
@@ -4567,22 +4601,10 @@ fn emit_match_tail(buf: []byte, prog: checker::TProgram, e: checker::TExpr, m: c
             out = cb(out, ") {\n")
             ci = cb_indent_deeper(inner2)
         }
-        // the arm body is a BLOCK in TAIL position (B.20): emit it as a tail block — its
-        // trailing value becomes a `return`, and an explicit return/break/continue inside it
-        // emits real C control flow (mirrors the VM running the arm block flow-aware).
-        // (Frameless: a return inside an arm leaks the frame region — SAFE, M.5.) S2 — the REAL
-        // `escaping` is threaded (NOT empty) so a statement-arm inside this match arm gets correct
-        // block-locality (matches the C twin's global g_cg_escaping; empty would false-positive).
-        // (W9.3) The arm is a DEFER SCOPE: record the defer base, emit the body, then fire `[base, …)`
-        // LIFO BEFORE the commit `goto` — UNLESS the arm's tail already C-terminated (a return inside
-        // already drained base 0 on its edge; a void fall-through arm fires here).
         let tarm_base = dctx.defers.len
         out = match emit_block_tail(out, arm.body, in_main, prog, ret_type, ci, "", escaping, fn_body, dctx) { []byte as o => o; error as err => return err }
         let tarm_term = if arm.body.len > 0 { cg_stmt_c_terminates(arm.body[arm.body.len - 1]) } else { false }
         if !tarm_term { out = match emit_defers(out, cg_append_direct_defers(dctx.defers, arm.body), tarm_base, prog, ci, escaping, fn_body) { []byte as o => o; error as err => return err } }
-        // FIRST match wins → jump past the remaining arms. After a diverging body (return/exit/
-        // panic) this is dead code (cc sees the generated C with `-w`); after a non-diverging
-        // void body it is the line that stops later arms from also firing.
         out = cb(out, ci)
         out = cb(out, "goto ")
         out = cb(out, done)
@@ -4595,8 +4617,35 @@ fn emit_match_tail(buf: []byte, prog: checker::TProgram, e: checker::TExpr, m: c
     out = cb(out, inner)
     out = cb(out, done)
     out = cb(out, ": ;\n")
+    out = match emit_match_tail_fallthrough_return(out, prog, ret_type, in_main, inner) { []byte as o => o; error as err => return err }
     out = cb(out, indent)
     cb(out, "}\n")
+}
+
+/**
+ * Emit a defensive `return` at the tail-match `_done:` label so a non-void function cannot
+ * fall off its end. Every tail arm diverges (returns), and the checker guarantees the match is
+ * exhaustive, so the label is only reachable on the C-visible fallthrough that exhaustiveness
+ * rules out — but C cannot prove it, yielding `-Wreturn-type`. A zero-initialized return of the
+ * function's return type makes the fallthrough well-defined without changing behaviour. `main`
+ * (`in_main`) and `-> void` functions need nothing: the former has an implicit `return 0` epilogue
+ * and the latter can legally fall off its end.
+ *
+ * @param buf       the C-source byte buffer being built
+ * @param prog      the typed program, for `emit_type`
+ * @param ret_type  the enclosing function's return type, threaded from `emit_match_tail`
+ * @param in_main   true iff this tail match is directly in `main` (no explicit return needed)
+ * @param inner     the indentation for the returned statement inside the tail-match brace block
+ * @return          the buffer with the defensive return appended (unchanged for void/main)
+ * @throws          the `emit_type` error if the return type cannot be emitted
+ */
+fn emit_match_tail_fallthrough_return(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, in_main: bool, inner: str) -> []byte | error {
+    if in_main { return buf }
+    if is_void_type(ret_type) { return buf }
+    mut out = cb(buf, inner)
+    out = cb(out, "return (")
+    out = match emit_type(out, prog, ret_type) { []byte as o => o; error as err => return err }
+    cb(out, "){0};\n")
 }
 
 // emit_match_stmt — STATEMENT form: a match whose result is DISCARDED (run each winning arm

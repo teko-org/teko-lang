@@ -6,9 +6,14 @@
 # A successful cross-COMPILE is NOT by itself a correctness argument: `zig cc` differs from the
 # native clang/gcc that built every release <= v0.0.1.21 in two ways that the emitted teko.c's
 # latent undefined behaviour makes fatal, and BOTH must be neutralised here:
-#   1. `-O0` (not `-O1`/`-O2`) — at any optimizing level zig EXPLOITS the UB into a MISCOMPILE
-#      (the checker mis-resolves a call and rejects the compiler's own valid source). `-O0` and
-#      `-Og` compile it correctly; the native `-O0` releases always did.
+#   1. `-O0` (not `-O1`/`-O2`) — at any optimizing level zig EXPLOITS residual UB into a MISCOMPILE
+#      (the checker mis-resolves a call and rejects the compiler's own valid source, x86_64-only).
+#      #283 removed ONE such UB (the uninitialized match-as-value result temp, now `= {0}`), which
+#      cleared all `-Wsometimes-uninitialized`, but a SECOND x86_64 UB survives: the cross-run of
+#      the `-O1`/`-O2` x86_64 artifact over the corpus still emits a false `argument type mismatch`
+#      at src/checker/match.tks:228 (and `-fno-strict-aliasing` does not cure it). Until that
+#      residual UB is found and fixed at the source, the release stays at `-O0` (which self-builds
+#      the corpus to exit 0). See the #283 HALT report.
 #   2. `-fno-sanitize=undefined` — zig cc enables UBSan TRAPS by default (native cc does not), so
 #      the one boundary INT64_MIN-negation in the checker's int_fits range-check aborts the
 #      process the moment it type-checks any `i64` literal near the low bound. Disabling the trap
