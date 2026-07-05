@@ -189,14 +189,20 @@ jobs:
           fi
           echo "TSan smoke passed: build + run race-clean, exit code 5 as expected."
 
-  # ── Windows stress: run tests 20 times ───────────────────────────────────────
-  # NOTE: Uses Clang + Ninja (not MSVC) because the project requires __int128.
-  windows-stress:
-    name: Windows stress (20 runs)
+  # ── Windows self-host smoke ───────────────────────────────────────────────────
+  # The ONLY per-PR lane that self-builds gen-1 on Windows (build-test only runs the
+  # seed's VM gate; diff-vm-native is linux+macos; release rebuilds Windows only at
+  # release time). ONE gate run on gen-1 is enough: the compiler is single-threaded and
+  # deterministic, so N identical sequential runs add no coverage — the historical 20×
+  # stress hunted a long-fixed intermittent hang and cost ~16 min per PR (owner ruling
+  # 2026-07-04). RE-EXPAND to a real stress N× as S8 concurrency primitives land (same
+  # trigger as the TSan full-suite re-expansion).
+  windows-selfhost:
+    name: Windows self-host smoke (gen-1)
     needs: changes
     if: needs.changes.outputs.run == 'true'
     runs-on: windows-latest
-    timeout-minutes: 25
+    timeout-minutes: 10
     permissions:
       contents: read
 
@@ -214,24 +220,17 @@ jobs:
         shell: bash
         run: teko . -o bin
 
-      - name: Run tests 20 times (gen1)
+      - name: Run the gate on gen1
         shell: pwsh
         run: |
-          for ($i = 1; $i -le 20; $i++) {
-            Write-Host "=== Run $i / 20 ==="
-            .\bin\teko.exe test . --coverage
-            if ($LASTEXITCODE -ne 0) {
-              Write-Error "Test run $i failed with exit code $LASTEXITCODE"
-              exit $LASTEXITCODE
-            }
-          }
-          Write-Host "All 20 stress runs passed."
+          .\bin\teko.exe test . --coverage
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
   # ── gate: aggregates all sanitizer + stress results ──────────────────────────
   gate:
     name: Sanitizer gate
     runs-on: ubuntu-latest
-    needs: [changes, asan-default, tsan, windows-stress]
+    needs: [changes, asan-default, tsan, windows-selfhost]
     if: always()
     permissions: {}
 
@@ -240,13 +239,13 @@ jobs:
         run: |
           ASAN_DEFAULT="${{ needs.asan-default.result }}"
           TSAN="${{ needs.tsan.result }}"
-          WINDOWS_STRESS="${{ needs.windows-stress.result }}"
+          WINDOWS_SELFHOST="${{ needs.windows-selfhost.result }}"
           CHANGES="${{ needs.changes.outputs.run }}"
 
           echo "changes.run    = $CHANGES"
           echo "asan-default   = $ASAN_DEFAULT"
           echo "tsan           = $TSAN"
-          echo "windows-stress = $WINDOWS_STRESS"
+          echo "windows-selfhost = $WINDOWS_SELFHOST"
 
           if [ "$CHANGES" != "true" ]; then
             echo "No relevant files changed — gate passes."
@@ -254,7 +253,7 @@ jobs:
           fi
 
           FAILED=0
-          for RESULT in "$ASAN_DEFAULT" "$TSAN" "$WINDOWS_STRESS"; do
+          for RESULT in "$ASAN_DEFAULT" "$TSAN" "$WINDOWS_SELFHOST"; do
             if [ "$RESULT" = "failure" ] || [ "$RESULT" = "cancelled" ]; then
               FAILED=1
             fi

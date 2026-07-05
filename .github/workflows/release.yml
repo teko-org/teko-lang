@@ -3,9 +3,13 @@ name: Bootstrap Release
 # On-demand publication of a Teko BOOTSTRAP release: per-platform gen-3 `teko` binaries
 # + the portable, any-cc `teko.c` bootstrap snapshot + checksums, as a GitHub Release.
 #
-# A release is SOUND only if, on every platform, the .tkt gate passes AND the self-host
-# fixpoint holds (gen-2 == gen-3 byte-identical). Every build job asserts both; the
-# publish job runs only if ALL of them succeeded.
+# A release is SOUND only if, on every platform, the .tkt gate passes on gen-1 AND gen-3
+# (the compiler-under-test and the shipped artifact) AND the self-host fixpoint holds
+# (gen-2 == gen-3 byte-identical). Every build job asserts all of it; the publish job
+# runs only if ALL of them succeeded. gen-2 skips the gate (`--no-verify`, issue #249
+# lever A): its ONLY purpose is proving the fixpoint, and the gate's outcome is already
+# proven deterministic by gen-1 and re-proven by gen-3 — re-running it a third time cost
+# a full VM re-verification (~time+memory) for no additional soundness.
 #
 # The compiler is NOT built from C here — each platform seeds from the PREVIOUS
 # published release (Teko-only ruling; same as native.yml) and that seed compiles this
@@ -163,14 +167,18 @@ jobs:
         shell: bash
         run: teko . -o gen1out
 
-      # gen-2: the self-hosted compiler builds the corpus again.
-      - name: gen-2 (POSIX)
+      # gen-2: the self-hosted compiler builds the corpus again. `--no-verify` (issue #249 lever
+      # A) skips re-running the `.tkt` gate here — gen-1 already proved it (above) and gen-3
+      # (below) re-proves it on the SHIPPED artifact; gen-2 exists only to prove the fixpoint
+      # (gen2.c == gen3.c), which does not need a second full VM re-verification in between. This
+      # is the ONLY gen skipping the gate — gen-1 and gen-3 keep it unchanged.
+      - name: gen-2, --no-verify (POSIX)
         if: runner.os != 'Windows'
-        run: ./gen1out/teko . -o gen2out
+        run: ./gen1out/teko . -o gen2out --no-verify
 
-      - name: gen-2 (Windows)
+      - name: gen-2, --no-verify (Windows)
         if: runner.os == 'Windows'
-        run: .\gen1out\teko.exe . -o gen2out
+        run: .\gen1out\teko.exe . -o gen2out --no-verify
 
       # gen-3: the published artifact.
       - name: gen-3 (POSIX)
