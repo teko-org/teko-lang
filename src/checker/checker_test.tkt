@@ -3427,6 +3427,154 @@ fn trait_duplicate_derive_is_error() {
     teko::assert::is_true(!tr_program_ok(items2(tr, dv)))
 }
 
+/**
+ * (TR3, #177) A struct field of a NAMED type — for the nested-recursion and nested-not-deriving
+ * structural-trait tests below.
+ *
+ * @param name      the field name
+ * @param type_name the field's named type
+ * @return the `parser::Field`
+ */
+fn named_field(name: str, type_name: str) -> parser::Field { parser::Field { name = name; type_ann = named_t(type_name); vis = parser::Visibility::Pub; is_intern = false; has_doc = false; doc = "" } }
+
+/**
+ * (TR3) A single-field list holding one `named_field`.
+ *
+ * @param name      the field name
+ * @param type_name the field's named type
+ * @return a one-element `[]parser::Field`
+ */
+fn named_fields1(name: str, type_name: str) -> []parser::Field { teko::list::push(teko::list::empty(), named_field(name, type_name)) }
+
+/**
+ * (TR3) `is_structural_trait` recognizes exactly the closed set `Eq`/`Ord`/`Hash`/`Clone`/`Default`
+ * plus the R1 synonyms `Hashable`≡`Hash` and `Comparable`≡`Ord`, matched on the bare last segment;
+ * `structural_trait_canonical` collapses the synonyms.
+ */
+#test
+fn structural_is_structural_trait_recognizes_the_closed_set() {
+    teko::assert::is_true(is_structural_trait("Eq"))
+    teko::assert::is_true(is_structural_trait("Ord"))
+    teko::assert::is_true(is_structural_trait("Hash"))
+    teko::assert::is_true(is_structural_trait("Clone"))
+    teko::assert::is_true(is_structural_trait("Default"))
+    teko::assert::is_true(is_structural_trait("Hashable"))
+    teko::assert::is_true(is_structural_trait("Comparable"))
+    teko::assert::is_true(is_structural_trait("teko::foo::Eq"))
+    teko::assert::is_true(!is_structural_trait("Renderable"))
+    teko::assert::is_true(!is_structural_trait("Equal"))
+    teko::assert::is_true(structural_trait_canonical("Hashable") == "Hash")
+    teko::assert::is_true(structural_trait_canonical("Comparable") == "Ord")
+    teko::assert::is_true(structural_trait_canonical("Eq") == "Eq")
+}
+
+/**
+ * (TR3) A struct deriving all five structural traits over scalar fields type-checks — the
+ * synthesized `eq`/`compare`/`hash`/`clone`/`default` all type against the folded field view.
+ */
+#test
+fn structural_derive_over_scalars_synthesizes_and_types() {
+    let derives = teko::list::push(teko::list::push(teko::list::push(teko::list::push(slist1("Eq"), "Ord"), "Hash"), "Clone"), "Default")
+    let dv = deriver_struct_item("P", tr_fields1("x"), teko::list::empty(), derives)
+    teko::assert::is_true(tr_program_ok(teko::list::push(teko::list::empty(), dv)))
+}
+
+/**
+ * (TR3) The synthesis over hand-built SCALAR FieldViews (nominal-direct — no wrapper TypeExpr, so
+ * the VM wrapper-descent bug near line 481 is avoided): each structural name yields exactly one
+ * method by the expected name, and a name the deriver already provides is SKIPPED (the override).
+ * The slice/optional honest-STOP runs end-to-end through the real `deriver_field_view` path on both
+ * engines (verified against `.tks` derivers with a slice/optional field), not here — a hand-built
+ * Slice/Optional FieldView would trip that VM-only wrapper bug.
+ */
+#test
+fn structural_synthesis_over_scalar_fieldviews_produces_one_method_each() {
+    let fs: []FieldView = teko::list::push(teko::list::push(teko::list::empty(), FieldView { name = "n"; type = Prim { kind = PrimKind::I64 } }), FieldView { name = "s"; type = Str { } })
+    let no_own: []str = teko::list::empty()
+    match synthesize_structural_methods("P", fs, slist1("Eq"), no_own, empty_table()) {
+        []parser::Function as ms => teko::assert::is_true(ms.len == 1 && ms[0].name == "eq")
+        error => teko::assert::is_true(false)
+    }
+    match synthesize_structural_methods("P", fs, slist1("Hash"), no_own, empty_table()) {
+        []parser::Function as ms => teko::assert::is_true(ms.len == 1 && ms[0].name == "hash")
+        error => teko::assert::is_true(false)
+    }
+    match synthesize_structural_methods("P", fs, slist1("Ord"), no_own, empty_table()) {
+        []parser::Function as ms => teko::assert::is_true(ms.len == 1 && ms[0].name == "compare")
+        error => teko::assert::is_true(false)
+    }
+    match synthesize_structural_methods("P", fs, slist1("Clone"), no_own, empty_table()) {
+        []parser::Function as ms => teko::assert::is_true(ms.len == 1 && ms[0].name == "clone")
+        error => teko::assert::is_true(false)
+    }
+    match synthesize_structural_methods("P", fs, slist1("Default"), no_own, empty_table()) {
+        []parser::Function as ms => teko::assert::is_true(ms.len == 1 && ms[0].name == "default")
+        error => teko::assert::is_true(false)
+    }
+    let own_eq: []str = slist1("eq")
+    match synthesize_structural_methods("P", fs, slist1("Eq"), own_eq, empty_table()) {
+        []parser::Function as ms => teko::assert::is_true(ms.len == 0)
+        error => teko::assert::is_true(false)
+    }
+}
+
+/**
+ * (TR3 crumb 6b) `Eq` over a nested Named field whose type does NOT derive `Eq` is a located error
+ * (the recursion has no `.eq` to call); when the nested type DOES derive `Eq`, the recursion
+ * resolves and the program type-checks.
+ */
+#test
+fn structural_derive_over_nonderiving_nested_is_error() {
+    let q = deriver_struct_item("Q", tr_fields1("own"), teko::list::empty(), teko::list::empty())
+    let p = deriver_struct_item("P", named_fields1("q", "Q"), teko::list::empty(), slist1("Eq"))
+    teko::assert::is_true(!tr_program_ok(items2(q, p)))
+    let q2 = deriver_struct_item("Q2", tr_fields1("own"), teko::list::empty(), slist1("Eq"))
+    let p2 = deriver_struct_item("P2", named_fields1("q", "Q2"), teko::list::empty(), slist1("Eq"))
+    teko::assert::is_true(tr_program_ok(items2(q2, p2)))
+}
+
+/**
+ * (TR3 crumb 6c) An enum-typed field under a structural derive is an honest stop: an enum Named is
+ * not a supported field shape in v1, so the synthesis raises a located error.
+ */
+#test
+fn structural_derive_on_an_enum_is_error() {
+    let members = teko::list::push(teko::list::push(teko::list::empty(), "RED"), "BLUE")
+    let ed = parser::TypeDecl { name = "Hue"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::EnumBody { members = members }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; di_kind = parser::DiKind::None; has_di_key = false; di_key = "" }
+    let dv = deriver_struct_item("P", named_fields1("hue", "Hue"), teko::list::empty(), slist1("Eq"))
+    teko::assert::is_true(!tr_program_ok(items2(parser::Item { content = ed; namespace = ""; file = "" }, dv)))
+}
+
+/**
+ * (TR3, trait design §2) A deriver that defines `eq` BY HAND keeps its own method — synthesis is
+ * SKIPPED for that name (the hand-written method IS the override), and the program type-checks.
+ */
+#test
+fn structural_override_wins_over_synthesis() {
+    let own_eq = parser::Function { name = "eq"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = teko::list::push(teko::list::push(teko::list::empty(), parser::Param { name = "self"; has_type = false; type_ann = named_t(""); is_params = false; has_default = false; default_expr = e_num(0) }), parser::Param { name = "other"; has_type = true; type_ann = named_t("P"); is_params = false; has_default = false; default_expr = e_num(0) }); has_return = true; return_type = named_t("bool"); body = one_stmt(ek(parser::BoolLit { value = true })); vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false; has_inject = false; injects = teko::list::empty() }
+    let dv = deriver_struct_item("P", tr_fields1("x"), teko::list::push(teko::list::empty(), own_eq), slist1("Eq"))
+    teko::assert::is_true(tr_program_ok(teko::list::push(teko::list::empty(), dv)))
+}
+
+/**
+ * (TR3, R1) A `<K: Hashable & Eq>` constraint resolves for a deriver of `Hash` + `Eq` — the
+ * `Hashable`≡`Hash` synonym lets the Map-key capability constraint bind against a structural-trait
+ * deriver, with no parallel interface.
+ */
+#test
+fn structural_constraint_atom_resolves_via_synonym() {
+    let derives = teko::list::push(slist1("Hash"), "Eq")
+    let dv = deriver_struct_item("K", tr_fields1("x"), teko::list::empty(), derives)
+    let hashable_fn = tr_generic_fn("use_key", "Hashable", one_stmt(e_num(0)))
+    let mk = tr_let_struct("k", "K", "x")
+    let call = parser::Item { content = st(ek(parser::Call { callee = path1("use_key"); args = teko::list::push(teko::list::empty(), e_var("k")); arg_names = teko::list::push(teko::list::empty(), "") })); namespace = ""; file = "" }
+    mut items: []parser::Item = teko::list::push(teko::list::empty(), dv)
+    items = teko::list::push(items, hashable_fn)
+    items = teko::list::push(items, mk)
+    items = teko::list::push(items, call)
+    teko::assert::is_true(tr_program_ok(items))
+}
+
 #test
 fn trait_class_requirement_satisfied_by_pub_method() {
     // a CLASS deriving a trait with a requirement — a `pub` class method satisfies it; a class

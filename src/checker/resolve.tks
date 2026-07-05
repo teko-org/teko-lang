@@ -285,8 +285,9 @@ fn type_ref_ns(path: parser::Path, table: TypeTable, ref_ns: str) -> str {
  * contributes its own method list (no `extends` to walk). Every other KNOWN atom kind
  * (struct/enum/flags/variant/alias/extern/class — no shared nominal method contract to expose)
  * contributes an EMPTY surface: it may still satisfy the constraint nominally, but authorizes no
- * operation on T through it. An atom naming NO TypeDecl at all is a named error (M.1 fail-loud —
- * never silently opaque).
+ * operation on T through it. (TR3) A compiler-known STRUCTURAL trait atom is likewise opaque on T —
+ * its methods are synthesized per concrete deriver, not dispatched through T in v1. An atom naming
+ * NO TypeDecl at all is a named error (M.1 fail-loud — never silently opaque).
  *
  * @param name  the constraint atom's name
  * @param table the folded type table
@@ -296,6 +297,7 @@ fn type_ref_ns(path: parser::Path, table: TypeTable, ref_ns: str) -> str {
 fn atom_surface(name: str, table: TypeTable) -> []parser::Function | error {
     if is_trait_name(name, table) { return trait_methods_by_name(name, table) }
     if is_interface_name(name, table) { return iface_methods_by_name(name, table) }
+    if is_structural_trait(name) { let empty_surface: []parser::Function = teko::list::empty(); return empty_surface }
     match type_table_find(table, name, "") {
         parser::TypeDecl => { let empty_surface: []parser::Function = teko::list::empty(); empty_surface }
         error => error { message = $"unknown constraint atom '{name}' — names no declared type" }
@@ -781,6 +783,39 @@ pub fn is_trait_name(name: str, table: TypeTable) -> bool {
         parser::TypeDecl as td => match td.body { parser::TraitBody => true; _ => false }
         error => false
     }
+}
+
+/**
+ * (TR3) The closed set of compiler-known STRUCTURAL trait names — `Eq`, `Ord`, `Hash`, `Clone`,
+ * `Default` — whose provided method bodies the compiler SYNTHESIZES from the deriver's field view
+ * (TR2), with no surface declaration and no runtime metadata (Law M.0). Matched on the bare last
+ * segment: these are reserved trait names, unqualified. A user type of the same name is not
+ * intended (the set is closed per the trait design §5 open 4). `Hashable` is accepted as a SYNONYM
+ * of `Hash` and `Comparable` of `Ord` (the collections Map-key capability names, R1) — the
+ * structural trait IS the capability, so no parallel interface is introduced.
+ *
+ * @param name a name from a deriver's `&`-list or a constraint atom (a source or resolved name)
+ * @return true iff `name`'s last segment is one of the structural trait names (or a synonym)
+ */
+pub fn is_structural_trait(name: str) -> bool {
+    let last = name_last_segment(name)
+    last == "Eq" || last == "Ord" || last == "Hash" || last == "Clone" || last == "Default" || last == "Hashable" || last == "Comparable"
+}
+
+/**
+ * (TR3) The canonical structural-trait name of `name` — collapsing the R1 synonyms so a deriver
+ * lists ONE name per capability: `Hashable` → `Hash`, `Comparable` → `Ord`; every other structural
+ * name maps to itself. Callers pass a name already known to `is_structural_trait`; a non-structural
+ * name is returned unchanged (the caller never reaches this with one).
+ *
+ * @param name a structural-trait name (possibly a synonym), bare or qualified
+ * @return the canonical bare structural-trait name
+ */
+pub fn structural_trait_canonical(name: str) -> str {
+    let last = name_last_segment(name)
+    if last == "Hashable" { return "Hash" }
+    if last == "Comparable" { return "Ord" }
+    last
 }
 
 // does contract `sub` reach contract `want` through `extends`, transitively? Depth-bounded so a

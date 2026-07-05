@@ -32,7 +32,11 @@ type MonoInst = struct { fn_name: str; mangled: str; s: Subst }
  * atom is satisfied when `concrete` nominally conforms (its own name, or `type_conforms_to` through
  * the class base chain + contract `extends` closure — the same gate as the D3 upcast); classes AND
  * structs conform here (a struct cannot become a contract VALUE, but it may instantiate a
- * constrained generic). Any other TypeDecl kind (struct/enum/flags/alias/extern) is an exact
+ * constrained generic). (TR3) A compiler-known STRUCTURAL trait atom (incl. the `Hashable`/
+ * `Comparable` synonyms, collapsed by `structural_trait_canonical`) is satisfied when `concrete`
+ * DERIVES the canonical structural trait — its folded `implements` list carries the canonical name
+ * (fold_traits keeps derives in `implements`), so `type_conforms_to` sees it; this is what lets
+ * `<K: Hashable & Eq>` bind. Any other TypeDecl kind (struct/enum/flags/alias/extern) is an exact
  * nominal name. An atom naming no TypeDecl at all is unsatisfiable (never silently ignored — M.1).
  *
  * @param atom_name the constraint atom's name
@@ -41,6 +45,10 @@ type MonoInst = struct { fn_name: str; mangled: str; s: Subst }
  * @return true iff `concrete` satisfies the atom
  */
 fn constraint_atom_satisfied(atom_name: str, concrete: Type, table: TypeTable) -> bool {
+    if is_structural_trait(atom_name) {
+        let canon = structural_trait_canonical(atom_name)
+        return match concrete { Named as n => type_conforms_to(n.name, canon, table); _ => false }
+    }
     match type_table_find(table, atom_name, "") {   // (#109 W1) constraint-atom probe on a resolved name — no referencing ns
         parser::TypeDecl as td => {
             match td.body {

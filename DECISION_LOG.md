@@ -161,3 +161,27 @@ diferentes). O #277 já estava mergeado → correção via novo PR (nunca direto
 
 ### D17 · `.gitattributes eol=lf` (cross-plataforma) ✅
 - **Aplicada:** o Windows fazia checkout dos `.tks` como CRLF → o `fmt` (LF canônico) via o corpus não-idempotente → panic. `* text=auto eol=lf` fixa LF no checkout em toda plataforma. Blobs já eram LF no git; só faltava forçar no working-tree. (CI multi-plataforma pegou o que a validação macOS/Linux não via.)
+
+---
+
+## 2026-07-05 — TR3: traits estruturais Eq/Ord/Hash/Clone/Default sintetizados (#177)
+
+### D18 · `Hashable`≡`Hash` e `Comparable`≡`Ord` como SINÔNIMOS (sem interface paralela) ✅
+- **Aplicada:** `is_structural_trait` reconhece `Hashable`/`Comparable` como sinônimos de `Hash`/`Ord`; `structural_trait_canonical` os colapsa. A chave-de-Map `<K: Hashable & Eq>` resolve contra um deriver de `Hash`+`Eq` via `type_conforms_to` (o nome canônico fica no `implements` folded). NÃO se introduziu interface `Hashable`/`Comparable` paralela.
+- **Alternativas:** criar interfaces nativas `Hashable`/`Comparable` (duplica capacidade + descasa trait-vs-interface); renomear a ruling de collections agora (fora de escopo do #177).
+- **Base:** M.0 (no-reflection) + design de traits §2 (structural derives cobrem encoding/collections sem contrato separado) + §5 (conjunto fechado). O trait estrutural É a capacidade.
+- **Reversível:** sim (uma linha em `is_structural_trait`). Reconciliar a memória `teko-collections-rulings` p/ "structural traits" quando #180/collections aterrissar — edição de 1 linha, opcional do dono.
+
+### D19 · `Ord` sintetiza `-1` como `Unary(Minus, 1)`, não `Number{value=-1}` ✅
+- **Aplicada:** o builder `mk_neg_int` produz o literal negativo como unário-menos sobre `1` positivo (o shape que o parser emite), porque `codegen::cb_i128` faz `v to u128` no carrier — e o guard F3 rejeita negativo→unsigned ("impossible conversion"). Um `Number{value=-1}` direto é o PRIMEIRO a exercitar esse caminho.
+- **Base:** M.1 (fail-loud, não quero corromper) + não tocar o codegen congelado de literais.
+- **Reportado (adjacente, NÃO nova issue):** `cb_i128` (codegen.tks:149) tem bug latente: `(v to u128)` num i128 negativo faz panic sob o guard F3; nunca disparou porque literais negativos do source são `Unary(Minus, N)`. Follow-up p/ o integrador sequenciar.
+
+### D20 · str-field Hash/Ord via `tk_str_hash`/`tk_str_cmp` (o seam de runtime C permitido) ✅
+- **Aplicada:** adicionados `tk_str_hash` (FNV-1a, casa `di_type_id`) e `tk_str_cmp` (lexicográfico unsigned) a `teko_rt.{c,h}`, com gêmeos puro-Teko em `teko_rt.tks`, registro no checker (`scope.tks`), dispatch em `codegen.tks` (→ `tk_str_*`) e intercept no VM (`vm.tks`). VM==native garantido pelos dois gêmeos.
+- **Base:** ruling no-mirroring — `teko_rt` é o C mantido (não-twin, runtime); o resto é `.tks`.
+
+### Reportados-up (adjacentes, NÃO novas issues)
+- `==` em dois structs type-checka e emite C inválido (expr.tks:19 + codegen.tks) — latente, pré-existente; questão de operator-overloading separada. TR3 NÃO auto-baixa `==`→`.eq()`.
+- Slice/Optional/enum sob derive estrutural são honest-stop em v1 (M.1); follow-up TR3.1 natural quando #178 (Json) aterrissar.
+- `cb_i128` negativo (ver D19).

@@ -550,6 +550,35 @@ bool tk_str_eq(tk_str a, tk_str b) {
     return memcmp(a.ptr, b.ptr, a.len) == 0;
 }
 
+// (TR3) tk_str_hash — FNV-1a over the str's bytes (offset basis 14695981039346656037, prime
+// 1099511628211, u64 wraparound). Mirrors di_type_id's derivation so a str-field structural
+// `Hash` folds bytes identically on both engines; an empty str hashes to the offset basis.
+uint64_t tk_str_hash(tk_str s) {
+    uint64_t h = 14695981039346656037ULL;
+    for (size_t i = 0; i < s.len; i++) {
+        h ^= (uint64_t)(unsigned char)s.ptr[i];
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+// (TR3) tk_str_cmp — lexicographic byte compare: -1 if a < b, 1 if a > b, 0 if equal. Compares the
+// common prefix byte-by-byte (unsigned), then the shorter str is the lesser. memcmp is NOT used
+// (its sign is only guaranteed for the first differing byte, and Teko strings may hold embedded
+// NUL). Used by a str-field structural `Ord`.
+int64_t tk_str_cmp(tk_str a, tk_str b) {
+    size_t n = a.len < b.len ? a.len : b.len;
+    for (size_t i = 0; i < n; i++) {
+        unsigned char ca = (unsigned char)a.ptr[i];
+        unsigned char cb = (unsigned char)b.ptr[i];
+        if (ca < cb) return -1;
+        if (ca > cb) return 1;
+    }
+    if (a.len < b.len) return -1;
+    if (a.len > b.len) return 1;
+    return 0;
+}
+
 // tk_str_slice — the bytes [start, end) as a ZERO-COPY VIEW into the parent str (#148). SAFE
 // because a Teko `str` is IMMUTABLE and its buffer is never individually freed (arena/root or
 // malloc'd-and-retained; mem::free frees only []T slice buffers, and str() snapshots its input),

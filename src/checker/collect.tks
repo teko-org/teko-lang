@@ -661,7 +661,9 @@ fn method_sig_matches(req: parser::Function, impl_m: parser::Function, table: Ty
  * by NAME, with a matching signature AND `pub` visibility (per the OOP design: `pub fn` is required
  * to satisfy an interface method). (TR1) Trait names also live in `implements` under Option B; they
  * are SKIPPED here — a trait's requirements are validated by `check_trait_requirements`, and its
- * bodied members are already folded in by `fold_traits`.
+ * bodied members are already folded in by `fold_traits`. (TR3) A compiler-known STRUCTURAL trait
+ * name (`is_structural_trait`) is likewise SKIPPED — its contract IS the synthesized method
+ * `fold_traits` folds in, never the interface path.
  *
  * @param type_name          the conforming struct/class name
  * @param type_ns            the conforming type's declaring namespace
@@ -678,7 +680,7 @@ fn check_conformance(type_name: str, type_ns: str, own_methods: []parser::Functi
     loop {
         if ii >= implements.len { break }
         let iname = implements[ii]
-        if !is_trait_name(iname, table) {
+        if !is_trait_name(iname, table) && !is_structural_trait(iname) {
             match check_one_interface(type_name, type_ns, own_methods, iname, table, members_all_public) { error as e => return e; null => { } }
         }
         ii++
@@ -852,17 +854,29 @@ pub fn trait_methods_by_name(name: str, table: TypeTable) -> []parser::Function 
 // after ALL derivers fold, against the FOLDED table — so a class's INHERITED methods (its base
 // may itself derive or define them) can satisfy a requirement too.
 type TraitDerive = struct { type_name: str; trait_name: str }
-// the `&`-list split: names declared as traits FOLD; everything else (interfaces, or unknown
-// names the conformance check will reject) stays in `implements`.
-type SplitImpls = struct { traits: []str; ifaces: []str }
+/**
+ * (TR0/TR3) THE `&`-LIST SPLIT — three disjoint buckets from one contract list: names declared as
+ * user `trait`s FOLD their bodies (`traits`); names in the compiler-known STRUCTURAL set (`Eq`/
+ * `Ord`/`Hash`/`Clone`/`Default`, incl. synonyms) SYNTHESIZE their method bodies from the field view
+ * (`structural`); everything else — interfaces, or unknown names the conformance check rejects —
+ * stays in `ifaces`. A structural name is neither an `InterfaceBody` nor a `TraitBody`, so it is
+ * recognized by `is_structural_trait` (a closed set) BEFORE the trait/interface probe.
+ */
+type SplitImpls = struct { traits: []str; ifaces: []str; structural: []str }
 type FoldedMembers = struct { fields: []parser::Field; methods: []parser::Function }
 
 fn split_trait_derives(implements: []str, table: TypeTable, ref_ns: str) -> SplitImpls {
     mut traits: []str = teko::list::empty()
     mut ifaces: []str = teko::list::empty()
+    mut structural: []str = teko::list::empty()
     mut i: u64 = 0
     loop {
         if i >= implements.len { break }
+        if is_structural_trait(implements[i]) {
+            structural = teko::list::push(structural, implements[i])
+            i++
+            continue
+        }
         let is_trait = match resolve_name_ref(implements[i], table, ref_ns) {   // (#109 order fix) SOURCE name — R0-R5 from the declaring item's namespace, never by scan order
             parser::TypeDecl as td => match td.body { parser::TraitBody => true; _ => false }
             error => false
@@ -871,7 +885,7 @@ fn split_trait_derives(implements: []str, table: TypeTable, ref_ns: str) -> Spli
         else { ifaces = teko::list::push(ifaces, implements[i]) }
         i++
     }
-    SplitImpls { traits = traits; ifaces = ifaces }
+    SplitImpls { traits = traits; ifaces = ifaces; structural = structural }
 }
 
 fn fields_have_name(fields: []parser::Field, name: str) -> bool {
@@ -986,30 +1000,94 @@ fn check_trait_requirements(derives: []TraitDerive, table: TypeTable) -> error? 
 }
 
 /**
- * (TR0/TR1) THE DERIVATION FOLD — rewrites each struct/class `TypeDecl` whose `&`-list names
- * traits: the traits' fields + bodied methods fold in (`fold_trait_members`), and each
- * (deriver, trait) pair is recorded so its bodyless REQUIREMENTS are checked against the FOLDED
- * table. The trait names STAY in `implements` (TR1, Option B): one `implements` list is the single
- * source of truth for every derived contract, so `type_conforms_to` sees the derivation and the D3
- * vtable/upcast/constraint machinery treats a trait exactly like an interface. `check_conformance`
- * skips the trait entries (their contract is `check_trait_requirements`, not the interface path).
- * NO-OP (the program returned unchanged) when the program declares no trait at all.
+ * (TR3) Does the program declare a user `trait`, OR does any deriver's `&`-list name a
+ * compiler-known STRUCTURAL trait (`Eq`/`Ord`/`Hash`/`Clone`/`Default`, incl. synonyms)? Either
+ * gates the fold — a program deriving ONLY structural traits (no user `trait` declared) must still
+ * synthesize their methods, so the old "any TraitBody?" gate alone would miss it.
  *
  * @param program the parsed program
- * @return the program with every trait-deriving struct/class folded, or an error if a fold or a
- *         requirement check fails
- * @throws when a folded field/method collides unresolvably, or a deriver misses a required method
+ * @param table   the pre-fold type table
+ * @return true iff the program needs the derivation fold
  */
-pub fn fold_traits(program: parser::Program) -> parser::Program | error {
-    let table = collect_types(program.items)
-    mut any = false
+fn program_needs_trait_fold(program: parser::Program, table: TypeTable) -> bool {
     mut t: u64 = 0
     loop {
         if t >= table.len { break }
-        match table[t].decl.body { parser::TraitBody => { any = true; break }; _ => { } }
+        match table[t].decl.body { parser::TraitBody => { return true }; _ => { } }
         t++
     }
-    if !any { return program }
+    mut i: u64 = 0
+    loop {
+        if i >= program.items.len { break }
+        match program.items[i].content {
+            parser::TypeDecl as td => match td.body {
+                parser::StructBody as sb => { if any_structural(sb.implements) { return true } }
+                parser::ClassBody as cb => { if any_structural(cb.implements) { return true } }
+                _ => { }
+            }
+            _ => { }
+        }
+        i++
+    }
+    false
+}
+
+/**
+ * (TR3) Does any name in `implements` name a compiler-known structural trait?
+ *
+ * @param implements the `&`-list of contract names
+ * @return true iff at least one is a structural trait
+ */
+fn any_structural(implements: []str) -> bool {
+    mut i: u64 = 0
+    loop { if i >= implements.len { break }; if is_structural_trait(implements[i]) { return true }; i++ }
+    false
+}
+
+/**
+ * (TR3) The names of `methods` as a `[]str` — the deriver's own method names, so a synthesized
+ * structural method whose name is already provided is SKIPPED (the hand-written one is the override).
+ *
+ * @param methods the deriver's own methods
+ * @return the parallel list of method names
+ */
+fn method_name_set(methods: []parser::Function) -> []str {
+    mut out: []str = teko::list::empty()
+    mut i: u64 = 0
+    loop { if i >= methods.len { break }; out = teko::list::push(out, methods[i].name); i++ }
+    out
+}
+
+/**
+ * (TR3) Append every method of `extra` onto `methods` — the synthesized structural methods fold
+ * AFTER the user-trait fold, so they see the ALREADY-folded field set (user-trait + base-chain
+ * fields).
+ *
+ * @param methods the deriver's existing methods
+ * @param extra   the synthesized methods to append
+ * @return the combined method list
+ */
+fn append_methods(methods: []parser::Function, extra: []parser::Function) -> []parser::Function {
+    mut out = methods
+    mut i: u64 = 0
+    loop { if i >= extra.len { break }; out = teko::list::push(out, extra[i]); i++ }
+    out
+}
+
+/** (TR3) The result of the user-trait fold pass: the rewritten items and the recorded derives. */
+type UserFoldResult = struct { items: []parser::Item; derives: []TraitDerive }
+
+/**
+ * (TR3) PASS 1 — fold every USER trait's members into its deriver(s) and record each (deriver,
+ * trait) pair for the requirement check. Structural derives are NOT touched here (their synthesis is
+ * PASS 2, over the field set THIS pass produced). A non-deriving decl passes through unchanged.
+ *
+ * @param program the parsed program
+ * @param table   the pre-fold type table
+ * @return the rewritten items plus the recorded user-trait derives, or an error if a fold fails
+ * @throws when a user-trait member collides unresolvably on a deriver
+ */
+fn fold_user_traits(program: parser::Program, table: TypeTable) -> UserFoldResult | error {
     mut items: []parser::Item = teko::list::empty()
     mut derives: []TraitDerive = teko::list::empty()
     mut i: u64 = 0
@@ -1018,36 +1096,157 @@ pub fn fold_traits(program: parser::Program) -> parser::Program | error {
         let it = program.items[i]
         mut content = it.content
         match it.content {
-            parser::TypeDecl as td => {
-                match td.body {
-                    parser::StructBody as sb => {
-                        let split = split_trait_derives(sb.implements, table, it.namespace)
-                        if split.traits.len > 0 {
-                            let fm = match fold_trait_members(td.name, sb.fields, sb.methods, split.traits, table, false) { FoldedMembers as f => f; error as e => return e }
-                            content = parser::TypeDecl { name = td.name; type_params = td.type_params; type_constraints = td.type_constraints; body = parser::StructBody { fields = fm.fields; methods = fm.methods; implements = sb.implements }; vis = td.vis; has_doc = td.has_doc; doc = td.doc; line = td.line; col = td.col; di_kind = td.di_kind; has_di_key = td.has_di_key; di_key = td.di_key }
-                            mut si: u64 = 0
-                            loop { if si >= split.traits.len { break }; derives = teko::list::push(derives, TraitDerive { type_name = td.name; trait_name = split.traits[si] }); si++ }
-                        }
+            parser::TypeDecl as td => match td.body {
+                parser::StructBody as sb => {
+                    let split = split_trait_derives(sb.implements, table, it.namespace)
+                    if split.traits.len > 0 {
+                        let fm = match fold_trait_members(td.name, sb.fields, sb.methods, split.traits, table, false) { FoldedMembers as f => f; error as e => return e }
+                        content = parser::TypeDecl { name = td.name; type_params = td.type_params; type_constraints = td.type_constraints; body = parser::StructBody { fields = fm.fields; methods = fm.methods; implements = sb.implements }; vis = td.vis; has_doc = td.has_doc; doc = td.doc; line = td.line; col = td.col; di_kind = td.di_kind; has_di_key = td.has_di_key; di_key = td.di_key }
+                        derives = record_user_trait_derives(derives, td.name, split.traits)
                     }
-                    parser::ClassBody as cb => {
-                        let split = split_trait_derives(cb.implements, table, it.namespace)
-                        if split.traits.len > 0 {
-                            let fm = match fold_trait_members(td.name, cb.fields, cb.methods, split.traits, table, true) { FoldedMembers as f => f; error as e => return e }
-                            content = parser::TypeDecl { name = td.name; type_params = td.type_params; type_constraints = td.type_constraints; body = parser::ClassBody { kind = cb.kind; has_base = cb.has_base; base_name = cb.base_name; has_base_binding = cb.has_base_binding; base_binding_name = cb.base_binding_name; implements = cb.implements; fields = fm.fields; methods = fm.methods }; vis = td.vis; has_doc = td.has_doc; doc = td.doc; line = td.line; col = td.col; di_kind = td.di_kind; has_di_key = td.has_di_key; di_key = td.di_key }
-                            mut si: u64 = 0
-                            loop { if si >= split.traits.len { break }; derives = teko::list::push(derives, TraitDerive { type_name = td.name; trait_name = split.traits[si] }); si++ }
-                        }
-                    }
-                    _ => { }
                 }
+                parser::ClassBody as cb => {
+                    let split = split_trait_derives(cb.implements, table, it.namespace)
+                    if split.traits.len > 0 {
+                        let fm = match fold_trait_members(td.name, cb.fields, cb.methods, split.traits, table, true) { FoldedMembers as f => f; error as e => return e }
+                        content = parser::TypeDecl { name = td.name; type_params = td.type_params; type_constraints = td.type_constraints; body = parser::ClassBody { kind = cb.kind; has_base = cb.has_base; base_name = cb.base_name; has_base_binding = cb.has_base_binding; base_binding_name = cb.base_binding_name; implements = cb.implements; fields = fm.fields; methods = fm.methods }; vis = td.vis; has_doc = td.has_doc; doc = td.doc; line = td.line; col = td.col; di_kind = td.di_kind; has_di_key = td.has_di_key; di_key = td.di_key }
+                        derives = record_user_trait_derives(derives, td.name, split.traits)
+                    }
+                }
+                _ => { }
             }
             _ => { }
         }
         items = teko::list::push(items, parser::Item { content = content; namespace = it.namespace; file = it.file })
         i++
     }
-    let folded = collect_types(items)
-    match check_trait_requirements(derives, folded) { error as e => return e; null => { } }
+    UserFoldResult { items = items; derives = derives }
+}
+
+/**
+ * (TR3) Record a (deriver, trait) requirement pair per USER trait derived — structural names carry
+ * no bodyless requirement (their contract is the synthesis itself), so they are NOT recorded.
+ *
+ * @param derives the accumulating derive list
+ * @param td_name the deriver's own type name
+ * @param traits  the USER-trait names this deriver derives
+ * @return the extended derive list
+ */
+fn record_user_trait_derives(derives: []TraitDerive, td_name: str, traits: []str) -> []TraitDerive {
+    mut out = derives
+    mut si: u64 = 0
+    loop { if si >= traits.len { break }; out = teko::list::push(out, TraitDerive { type_name = td_name; trait_name = traits[si] }); si++ }
+    out
+}
+
+/**
+ * (TR3) A copy of struct decl `td` with `extra` appended to its methods (the synthesized structural
+ * methods folded onto the already-baked StructBody).
+ *
+ * @param td    the struct type declaration
+ * @param sb    its struct body
+ * @param extra the synthesized methods to append
+ * @return the rewritten `TypeDecl`
+ */
+fn struct_with_methods(td: parser::TypeDecl, sb: parser::StructBody, extra: []parser::Function) -> parser::TypeDecl {
+    parser::TypeDecl { name = td.name; type_params = td.type_params; type_constraints = td.type_constraints; body = parser::StructBody { fields = sb.fields; methods = append_methods(sb.methods, extra); implements = sb.implements }; vis = td.vis; has_doc = td.has_doc; doc = td.doc; line = td.line; col = td.col; di_kind = td.di_kind; has_di_key = td.has_di_key; di_key = td.di_key }
+}
+
+/**
+ * (TR3) A copy of class decl `td` with `extra` appended to its methods — the class-body twin of
+ * `struct_with_methods`.
+ *
+ * @param td    the class type declaration
+ * @param cb    its class body
+ * @param extra the synthesized methods to append
+ * @return the rewritten `TypeDecl`
+ */
+fn class_with_methods(td: parser::TypeDecl, cb: parser::ClassBody, extra: []parser::Function) -> parser::TypeDecl {
+    parser::TypeDecl { name = td.name; type_params = td.type_params; type_constraints = td.type_constraints; body = parser::ClassBody { kind = cb.kind; has_base = cb.has_base; base_name = cb.base_name; has_base_binding = cb.has_base_binding; base_binding_name = cb.base_binding_name; implements = cb.implements; fields = cb.fields; methods = append_methods(cb.methods, extra) }; vis = td.vis; has_doc = td.has_doc; doc = td.doc; line = td.line; col = td.col; di_kind = td.di_kind; has_di_key = td.has_di_key; di_key = td.di_key }
+}
+
+/**
+ * (TR3) PASS 2 — synthesize each STRUCTURAL trait's method over ONE decl, reading the field view
+ * from the USER-trait-FOLDED `folded_table` (so co-derived user-trait fields + a class's base chain
+ * are all present). A decl that derives no structural trait passes through unchanged.
+ *
+ * @param it           the program item (rewritten if it derives a structural trait)
+ * @param folded_table the user-trait-folded type table (the field-view source)
+ * @return the item, possibly with synthesized methods folded in, or a located error
+ * @throws when a synthesized field shape is unsupported or a nested field does not derive the trait
+ */
+fn synthesize_one_decl(it: parser::Item, folded_table: TypeTable) -> parser::Item | error {
+    match it.content {
+        parser::TypeDecl as td => match td.body {
+            parser::StructBody as sb => {
+                let split = split_trait_derives(sb.implements, folded_table, it.namespace)
+                if split.structural.len == 0 { return it }
+                let fv = match deriver_field_view(td.name, folded_table) { []FieldView as v => v; error as e => return e }
+                let synth = match synthesize_structural_methods(td.name, fv, split.structural, method_name_set(sb.methods), folded_table) { []parser::Function as m => m; error as e => return e }
+                parser::Item { content = struct_with_methods(td, sb, synth); namespace = it.namespace; file = it.file }
+            }
+            parser::ClassBody as cb => {
+                let split = split_trait_derives(cb.implements, folded_table, it.namespace)
+                if split.structural.len == 0 { return it }
+                let fv = match deriver_field_view(td.name, folded_table) { []FieldView as v => v; error as e => return e }
+                let synth = match synthesize_structural_methods(td.name, fv, split.structural, method_name_set(cb.methods), folded_table) { []parser::Function as m => m; error as e => return e }
+                parser::Item { content = class_with_methods(td, cb, synth); namespace = it.namespace; file = it.file }
+            }
+            _ => it
+        }
+        _ => it
+    }
+}
+
+/**
+ * (TR3) PASS 2 driver — synthesize structural methods across every item, threading the
+ * user-trait-folded table as the field-view source.
+ *
+ * @param items        the PASS-1 items
+ * @param folded_table the user-trait-folded type table
+ * @return the items with structural methods synthesized in, or a located error
+ * @throws when a synthesized field shape is unsupported or a nested field does not derive the trait
+ */
+fn synthesize_structural(items: []parser::Item, folded_table: TypeTable) -> []parser::Item | error {
+    mut out: []parser::Item = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= items.len { break }
+        let synth = match synthesize_one_decl(items[i], folded_table) { parser::Item as it => it; error as e => return e }
+        out = teko::list::push(out, synth)
+        i++
+    }
+    out
+}
+
+/**
+ * (TR0/TR1/TR3) THE DERIVATION FOLD — rewrites each struct/class `TypeDecl` whose `&`-list names
+ * traits, in TWO passes. PASS 1 (`fold_user_traits`) folds each USER trait's fields + bodied methods
+ * into its deriver and records each (deriver, USER-trait) pair. PASS 2 (`synthesize_structural`)
+ * SYNTHESIZES each compiler-known STRUCTURAL trait's method (`Eq`/`Ord`/`Hash`/`Clone`/`Default`)
+ * into the deriver's method list over the field view computed from the PASS-1 table — so a
+ * co-derived user trait's fields and a class's full base chain are all visible to the synthesis.
+ * The trait names STAY in `implements` (TR1, Option B): one `implements` list is the single source
+ * of truth for every derived contract, so `type_conforms_to` sees the derivation and the D3
+ * vtable/upcast/constraint machinery treats a trait exactly like an interface. `check_conformance`
+ * skips the trait AND structural entries (their contracts are `check_trait_requirements` / the
+ * synthesis, not the interface path). NO-OP (the program returned unchanged) when the program
+ * declares no trait and no structural derive at all.
+ *
+ * @param program the parsed program
+ * @return the program with every trait-deriving struct/class folded, or an error if a fold, a
+ *         synthesis, or a requirement check fails
+ * @throws when a folded field/method collides unresolvably, a synthesized field shape is
+ *         unsupported, or a deriver misses a required method
+ */
+pub fn fold_traits(program: parser::Program) -> parser::Program | error {
+    let table = collect_types(program.items)
+    if !program_needs_trait_fold(program, table) { return program }
+    let user = match fold_user_traits(program, table) { UserFoldResult as u => u; error as e => return e }
+    let folded_table = collect_types(user.items)
+    let items = match synthesize_structural(user.items, folded_table) { []parser::Item as it => it; error as e => return e }
+    let folded_types = collect_types(items)
+    match check_trait_requirements(user.derives, folded_types) { error as e => return e; null => { } }
     parser::Program { items = items }
 }
 

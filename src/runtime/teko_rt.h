@@ -260,6 +260,12 @@ tk_str tk_fmt_dyn_u64(uint64_t val, tk_str spec);
 // tk_str_eq — true iff a and b have the same length and the same bytes (memcmp; embedded NUL
 // tolerated). No allocation.
 bool tk_str_eq(tk_str a, tk_str b);
+// (TR3) tk_str_hash — FNV-1a over the str's bytes (offset basis 14695981039346656037, prime
+// 1099511628211, u64 wraparound); an empty str hashes to the offset basis. No allocation.
+uint64_t tk_str_hash(tk_str s);
+// (TR3) tk_str_cmp — lexicographic byte compare (unsigned): -1 (a < b) / 0 (equal) / 1 (a > b);
+// the shorter str is the lesser when one is a prefix of the other. No allocation.
+int64_t tk_str_cmp(tk_str a, tk_str b);
 // tk_str_slice — the substring bytes [start, end) as a fresh owned str. An out-of-range slice
 // (start > end, or end > s.len) PANICS (M.1, parity with the VM's bounds check). The empty
 // slice (start == end) is a valid empty str (1-byte buffer so ptr is never NULL+stale len).

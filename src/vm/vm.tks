@@ -617,6 +617,46 @@ fn try_err_builtin(callee: parser::Path, args: []checker::TExpr, env: Venv) -> V
 // passes directly). The VM's []Value is not a contiguous byte buffer, so we MATERIALIZE the
 // bytes into a `str` first (each byte → teko::one_byte, concatenated — M.1), then call
 // teko::str_of_bytes (which COPIES into the fresh owned result), mirroring the C twin.
+/**
+ * (TR3) FNV-1a over the str's bytes (offset basis 14695981039346656037, prime 1099511628211, u64
+ * wraparound) — the VM twin of `tk_str_hash` / `teko::runtime::str_hash`, used by a str-field
+ * structural `Hash`. Both engines fold str bytes identically.
+ *
+ * @param s the string to hash
+ * @return the FNV-1a hash of `s`'s bytes
+ */
+fn vm_str_hash(s: str) -> u64 {
+    mut h: u64 = 14695981039346656037
+    mut i: u64 = 0
+    loop { if i >= teko::len(s) { break }; h = (h ^ (s[i] to u64)) * 1099511628211; i++ }
+    h
+}
+
+/**
+ * (TR3) Lexicographic byte compare (unsigned): -1 (a < b) / 0 (equal) / 1 (a > b); the shorter str
+ * is the lesser when one is a prefix of the other — the VM twin of `tk_str_cmp` /
+ * `teko::runtime::str_compare`, used by a str-field structural `Ord`.
+ *
+ * @param a the left string
+ * @param b the right string
+ * @return -1, 0, or 1 as `a` orders before, equal to, or after `b`
+ */
+fn vm_str_compare(a: str, b: str) -> i64 {
+    let la = teko::len(a)
+    let lb = teko::len(b)
+    let n = if la < lb { la } else { lb }
+    mut i: u64 = 0
+    loop {
+        if i >= n { break }
+        if (a[i] to u64) < (b[i] to u64) { return -1 }
+        if (a[i] to u64) > (b[i] to u64) { return 1 }
+        i++
+    }
+    if la < lb { return -1 }
+    if la > lb { return 1 }
+    0
+}
+
 fn try_str_builtin(callee: parser::Path, args: []checker::TExpr, env: Venv) -> Value? {
     let last = callee.segments[callee.segments.len - 1].name
     let addressable = callee.segments.len == 1 || callee.segments[0].name == "teko"
@@ -882,6 +922,8 @@ fn try_str_builtin(callee: parser::Path, args: []checker::TExpr, env: Venv) -> V
         let b = as_str(ev_val(args[1], env))
         return a == b
     }
+    if last == "str_hash" { return vm_str_hash(as_str(ev_val(args[0], env))) }
+    if last == "str_compare" { return vm_str_compare(as_str(ev_val(args[0], env)), as_str(ev_val(args[1], env))) }
     if last == "str_len" { return teko::len(as_str(ev_val(args[0], env))) }
     if last == "str_slice" { return teko::slice(as_str(ev_val(args[0], env)), as_int(ev_val(args[1], env)) to u64, as_int(ev_val(args[2], env)) to u64) }
     if last == "str_slice_to" { return teko::slice_to(as_str(ev_val(args[0], env)), as_int(ev_val(args[1], env)) to u64) }
