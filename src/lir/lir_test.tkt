@@ -1,0 +1,139 @@
+/** lirt_i64_add — a two-param `add` function computing `%0 + %1`, the canonical
+    lowered-arithmetic shape.
+
+    This file holds the teko::lir unit tests (C1: types + printer). They build LIR
+    nodes by hand and assert over the stable printer text — the LIR's version of
+    the codegen diff bar. The `lirt_` prefix keeps helper names from colliding with
+    other test modules (the VM resolves by last path segment). */
+fn lirt_i64_add() -> LFunc {
+    let ptypes = teko::list::push(teko::list::push(teko::list::empty(), LType::I64), LType::I64)
+    mut f = new_func("teko__demo__add", 2, ptypes, LType::I64)
+    let fresh = alloc_vreg(f)
+    f = fresh.func
+    f = append_inst(f, 0, bin_inst(fresh.vreg, LBinOp::IAdd, 0, 1, 0, 0))
+    append_inst(f, 0, ret_inst(fresh.vreg, 0, 0))
+}
+
+#test
+fn prints_a_function_signature_and_body() {
+    let m = add_func(empty_module(), lirt_i64_add())
+    let text = print_lmodule(m)
+    teko::assert::str_contains(text, "func @teko__demo__add(%0: i64, %1: i64) -> i64 {")
+    teko::assert::str_contains(text, "  #B0:")
+    teko::assert::str_contains(text, "    %2 = iadd %0, %1")
+    teko::assert::str_contains(text, "    ret %2")
+}
+
+#test
+fn prints_int_const_and_call_and_exit() {
+    mut f = new_func("main", 0, teko::list::empty(), LType::I32)
+    let c = alloc_vreg(f)
+    f = c.func
+    f = append_inst(f, 0, const_int_inst(c.vreg, 42, 0, 0))
+    let args = teko::list::push(teko::list::empty(), c.vreg)
+    f = append_inst(f, 0, void_call_inst("tk_exit", args, false, 0, 0))
+    let z = alloc_vreg(f)
+    f = z.func
+    f = append_inst(f, 0, const_int_inst(z.vreg, 0, 0, 0))
+    f = append_inst(f, 0, ret_inst(z.vreg, 0, 0))
+    let text = print_lmodule(add_func(empty_module(), f))
+    teko::assert::str_contains(text, "func @main() -> i32 {")
+    teko::assert::str_contains(text, "    %0 = const 42")
+    teko::assert::str_contains(text, "    call @tk_exit(%0)")
+    teko::assert::str_contains(text, "    %1 = const 0")
+    teko::assert::str_contains(text, "    ret %1")
+}
+
+#test
+fn prints_float_const_bit_exact() {
+    mut f = new_func("f", 0, teko::list::empty(), LType::F64)
+    let c = alloc_vreg(f)
+    f = c.func
+    f = append_inst(f, 0, const_float_inst(c.vreg, teko::f64_bits(1.5), 0, 0))
+    f = append_inst(f, 0, ret_inst(c.vreg, 0, 0))
+    let text = print_lmodule(add_func(empty_module(), f))
+    teko::assert::str_contains(text, "%0 = const.f64 0x3ff8000000000000")
+}
+
+#test
+fn prints_float_const_zero_bits() {
+    mut f = new_func("z", 0, teko::list::empty(), LType::F64)
+    let c = alloc_vreg(f)
+    f = c.func
+    f = append_inst(f, 0, const_float_inst(c.vreg, teko::f64_bits(0.0), 0, 0))
+    f = append_inst(f, 0, ret_inst(c.vreg, 0, 0))
+    let text = print_lmodule(add_func(empty_module(), f))
+    teko::assert::str_contains(text, "%0 = const.f64 0x0")
+}
+
+#test
+fn prints_unary_and_negative_int() {
+    mut f = new_func("neg", 1, teko::list::push(teko::list::empty(), LType::I64), LType::I64)
+    let r = alloc_vreg(f)
+    f = r.func
+    f = append_inst(f, 0, un_inst(r.vreg, LUnOp::INeg, 0, 0, 0))
+    f = append_inst(f, 0, ret_inst(r.vreg, 0, 0))
+    let text = print_lmodule(add_func(empty_module(), f))
+    teko::assert::str_contains(text, "%1 = ineg %0")
+}
+
+#test
+fn prints_negative_int_literal() {
+    mut f = new_func("m", 0, teko::list::empty(), LType::I64)
+    let c = alloc_vreg(f)
+    f = c.func
+    f = append_inst(f, 0, const_int_inst(c.vreg, -42 to i128, 0, 0))
+    f = append_inst(f, 0, ret_inst(c.vreg, 0, 0))
+    let text = print_lmodule(add_func(empty_module(), f))
+    teko::assert::str_contains(text, "%0 = const -42")
+}
+
+#test
+fn prints_param_instruction() {
+    mut f = new_func("id", 1, teko::list::push(teko::list::empty(), LType::I32), LType::I32)
+    let p = alloc_vreg(f)
+    f = p.func
+    f = append_inst(f, 0, param_inst(p.vreg, 0, 0, 0))
+    f = append_inst(f, 0, ret_inst(p.vreg, 0, 0))
+    let text = print_lmodule(add_func(empty_module(), f))
+    teko::assert::str_contains(text, "%1 = param 0")
+}
+
+#test
+fn prints_signed_div_and_rem_mnemonics() {
+    let ptypes = teko::list::push(teko::list::push(teko::list::empty(), LType::I64), LType::I64)
+    mut f = new_func("dm", 2, ptypes, LType::I64)
+    let q = alloc_vreg(f)
+    f = q.func
+    f = append_inst(f, 0, bin_inst(q.vreg, LBinOp::IDivS, 0, 1, 0, 0))
+    let rr = alloc_vreg(f)
+    f = rr.func
+    f = append_inst(f, 0, bin_inst(rr.vreg, LBinOp::IRemU, 0, 1, 0, 0))
+    f = append_inst(f, 0, ret_inst(q.vreg, 0, 0))
+    let text = print_lmodule(add_func(empty_module(), f))
+    teko::assert::str_contains(text, "%2 = idivs %0, %1")
+    teko::assert::str_contains(text, "%3 = iremu %0, %1")
+}
+
+#test
+fn prints_call_with_multiple_args() {
+    mut f = new_func("caller", 0, teko::list::empty(), LType::I64)
+    let a = alloc_vreg(f)
+    f = a.func
+    f = append_inst(f, 0, const_int_inst(a.vreg, 40, 0, 0))
+    let b = alloc_vreg(f)
+    f = b.func
+    f = append_inst(f, 0, const_int_inst(b.vreg, 2, 0, 0))
+    let args = teko::list::push(teko::list::push(teko::list::empty(), a.vreg), b.vreg)
+    let r = alloc_vreg(f)
+    f = r.func
+    f = append_inst(f, 0, call_inst(r.vreg, "teko__demo__add", args, false, 0, 0))
+    f = append_inst(f, 0, ret_inst(r.vreg, 0, 0))
+    let text = print_lmodule(add_func(empty_module(), f))
+    teko::assert::str_contains(text, "%2 = call @teko__demo__add(%0, %1)")
+}
+
+#test
+fn empty_module_prints_nothing() {
+    teko::assert::is_true(print_lmodule(empty_module()) == "")
+}

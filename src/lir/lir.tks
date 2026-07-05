@@ -1,0 +1,202 @@
+/** teko::lir — the LINEAR IR, the backend-agnostic contract that the native/Wasm
+    targets (N2-N6) all consume. N1 (issue #221) delivers the TYPES + the lowering
+    (TAST -> LIR) + a stable printer + an interpreter oracle. Machine code
+    (isel/encoding/ELF) is N2+; the RULING freezes N1 at the LIR.
+
+    Design (architect plan): SSA-lite with explicit block-args (NOT phi, NOT a
+    stack machine) — each value is defined once, merges pass block-args on the
+    edge, and a register IR serves both register targets (linear-scan) and Wasm
+    (its own stackify). A VReg is a u32 id; every value is a VReg. Instructions are
+    3-address; the operator enums are closed. Symbols arrive ALREADY mangled (the
+    lowering reuses the codegen mangler); the LIR never re-mangles.
+
+    LType — the machine class of a value: an integer/float by width, an address
+    (Ptr), or the no-value marker (Void). Signedness is a property of the OPCODE
+    (IDivS vs IDivU), never of the type — exactly like x86. str/slice/Ref/ptr/
+    Named all collapse to Ptr; those are only EXERCISED from N2 (fat-pointers),
+    but the enum closes now so N2 does not re-version it. */
+pub type LType = enum {
+    I8; I16; I32; I64; I128
+    F16; F32; F64
+    Ptr
+    Void
+}
+
+/** LBinOp — the closed set of binary operations. Signed/unsigned integer variants
+    (S/U suffix) are distinct opcodes chosen by the operand's PrimKind at lowering.
+    N1 emits only the arithmetic subset (IAdd..IRemU, FAdd..FDiv); the comparisons,
+    bitwise ops, and shifts are DECLARED now (the contract N2 consumes) but first
+    exercised from N2. */
+pub type LBinOp = enum {
+    IAdd; ISub; IMul; IDivS; IDivU; IRemS; IRemU
+    IAnd; IOr; IXor; IShl; IShrS; IShrU
+    ICmpEq; ICmpNe; ICmpLtS; ICmpLtU; ICmpLeS; ICmpLeU; ICmpGtS; ICmpGtU; ICmpGeS; ICmpGeU
+    FAdd; FSub; FMul; FDiv; FCmpEq; FCmpNe; FCmpLt; FCmpLe; FCmpGt; FCmpGe
+}
+
+/** LUnOp — the closed set of unary operations: integer/float negation + bitwise
+    not, plus the width/representation conversions (extend/truncate/int<->float).
+    N1 emits INeg/FNeg/INot + the numeric conversions from a `to` cast; the rest is
+    declared for N2. */
+pub type LUnOp = enum { INeg; INot; FNeg; ZExt; SExt; Trunc; IToF; FToI; FToF }
+
+/** LConstInt — materialize an integer literal into a VReg. `val` is the widest
+    integer carrier (i128) so no literal loses bits before machine lowering. */
+pub type LConstInt = struct { val: i128 }
+
+/** LConstFloat — materialize a float literal into a VReg. Carried as the IEEE bit
+    pattern (u64) so the printer/diff is bit-exact (no rounding drift). */
+pub type LConstFloat = struct { bits: u64 }
+
+/** LBin — `a op b`, a/b VRegs. */
+pub type LBin = struct { op: LBinOp; a: u32; b: u32 }
+
+/** LUn — `op a`, a a VReg. */
+pub type LUn = struct { op: LUnOp; a: u32 }
+
+/** LParam — the i-th input parameter of the enclosing function, materialized into
+    a VReg. */
+pub type LParam = struct { index: u32 }
+
+/** LCall — call a symbol (already mangled Teko-Teko, or a runtime `tk_*`) with the
+    given VReg arguments. `variadic` mirrors the callee's variadic marker. */
+pub type LCall = struct { symbol: str; args: []u32; variadic: bool }
+
+/** LRet — return (a terminator). `value` is the returned VReg; `has_value=false`
+    is a void return. */
+pub type LRet = struct { has_value: bool; value: u32 }
+
+/** LJump — an unconditional branch to `target` carrying block-args (the SSA-lite
+    merge). N1 emits one block per function and never jumps; declared for N2. */
+pub type LJump = struct { target: u32; args: []u32 }
+
+/** LBranch — a conditional branch (if/else). `cond` is a VReg; each edge names a
+    target block + its block-args. N1 does not emit branches; declared for N2. */
+pub type LBranch = struct { cond: u32; t_target: u32; t_args: []u32; f_target: u32; f_args: []u32 }
+
+/** LOp — the instruction payload (one of the operation cases above). */
+pub type LOp = variant LConstInt | LConstFloat | LBin | LUn | LCall | LParam | LRet | LJump | LBranch
+
+/** LInst — one instruction: the VReg it defines (has_result=false for terminators
+    and void calls), its op, and the source position propagated from the TExpr (for
+    the .tsym map and future debug info). */
+pub type LInst = struct { result: u32; has_result: bool; op: LOp; line: u32; col: u32 }
+
+/** LBlock — a basic block: its id, its block-args (SSA-lite merge params), and its
+    instruction stream ending in a terminator. N1 uses one block per function with
+    empty params. */
+pub type LBlock = struct { id: u32; params: []u32; insts: []LInst }
+
+/** LFunc — one lowered function: its ALREADY-mangled symbol, its parameter arity +
+    machine types, its return type, its blocks, and the VReg allocation counter used
+    during lowering (functional threading — no mutable module state). */
+pub type LFunc = struct { symbol: str; n_params: u32; param_types: []LType; ret_type: LType; blocks: []LBlock; next_vreg: u32 }
+
+/** LModule — the whole lowered program: its functions. Structs/globals/rodata
+    enter in N2. */
+pub type LModule = struct { funcs: []LFunc }
+
+/** empty_module — a module with no functions (the lowering seed). */
+pub fn empty_module() -> LModule {
+    LModule { funcs = teko::list::empty() }
+}
+
+/** new_func — a fresh LFunc with an empty single block (#B0) reserving VRegs
+    0..n_params for the parameters. `next_vreg` starts past the params so the first
+    lowered value gets a clean id. */
+pub fn new_func(symbol: str, n_params: u32, param_types: []LType, ret_type: LType) -> LFunc {
+    let entry = LBlock { id = 0; params = teko::list::empty(); insts = teko::list::empty() }
+    LFunc {
+        symbol = symbol
+        n_params = n_params
+        param_types = param_types
+        ret_type = ret_type
+        blocks = teko::list::push(teko::list::empty(), entry)
+        next_vreg = n_params
+    }
+}
+
+/** const_int_inst — a `%r = const.<t> val` instruction. */
+pub fn const_int_inst(result: u32, val: i128, line: u32, col: u32) -> LInst {
+    LInst { result = result; has_result = true; op = LConstInt { val = val }; line = line; col = col }
+}
+
+/** const_float_inst — a `%r = const.<t> 0x<bits>` instruction. */
+pub fn const_float_inst(result: u32, bits: u64, line: u32, col: u32) -> LInst {
+    LInst { result = result; has_result = true; op = LConstFloat { bits = bits }; line = line; col = col }
+}
+
+/** bin_inst — a `%r = <op> a, b` instruction. */
+pub fn bin_inst(result: u32, op: LBinOp, a: u32, b: u32, line: u32, col: u32) -> LInst {
+    LInst { result = result; has_result = true; op = LBin { op = op; a = a; b = b }; line = line; col = col }
+}
+
+/** un_inst — a `%r = <op> a` instruction. */
+pub fn un_inst(result: u32, op: LUnOp, a: u32, line: u32, col: u32) -> LInst {
+    LInst { result = result; has_result = true; op = LUn { op = op; a = a }; line = line; col = col }
+}
+
+/** param_inst — a `%r = param <index>` instruction. */
+pub fn param_inst(result: u32, index: u32, line: u32, col: u32) -> LInst {
+    LInst { result = result; has_result = true; op = LParam { index = index }; line = line; col = col }
+}
+
+/** call_inst — a value-producing `%r = call @sym(args)` instruction. */
+pub fn call_inst(result: u32, symbol: str, args: []u32, variadic: bool, line: u32, col: u32) -> LInst {
+    LInst { result = result; has_result = true; op = LCall { symbol = symbol; args = args; variadic = variadic }; line = line; col = col }
+}
+
+/** void_call_inst — a `call @sym(args)` instruction that yields no value (a
+    statement-level call or a diverging builtin like tk_exit). */
+pub fn void_call_inst(symbol: str, args: []u32, variadic: bool, line: u32, col: u32) -> LInst {
+    LInst { result = 0; has_result = false; op = LCall { symbol = symbol; args = args; variadic = variadic }; line = line; col = col }
+}
+
+/** ret_inst — a `ret %v` terminator. */
+pub fn ret_inst(value: u32, line: u32, col: u32) -> LInst {
+    LInst { result = 0; has_result = false; op = LRet { has_value = true; value = value }; line = line; col = col }
+}
+
+/** ret_void_inst — a `ret` (void) terminator. */
+pub fn ret_void_inst(line: u32, col: u32) -> LInst {
+    LInst { result = 0; has_result = false; op = LRet { has_value = false; value = 0 }; line = line; col = col }
+}
+
+/** push_inst_block — a fresh block with `inst` appended to its instruction stream. */
+fn push_inst_block(b: LBlock, inst: LInst) -> LBlock {
+    LBlock { id = b.id; params = b.params; insts = teko::list::push(b.insts, inst) }
+}
+
+/** append_inst — return a copy of `f` with `inst` appended to the block whose id is
+    `block_id`. N1 threads a single block (id 0). */
+pub fn append_inst(f: LFunc, block_id: u32, inst: LInst) -> LFunc {
+    mut blocks: []LBlock = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= f.blocks.len { break }
+        let b = f.blocks[i]
+        let nb = if b.id == block_id { push_inst_block(b, inst) } else { b }
+        blocks = teko::list::push(blocks, nb)
+        i++
+    }
+    LFunc { symbol = f.symbol; n_params = f.n_params; param_types = f.param_types; ret_type = f.ret_type; blocks = blocks; next_vreg = f.next_vreg }
+}
+
+/** with_next_vreg — return a copy of `f` with a new VReg counter. */
+fn with_next_vreg(f: LFunc, next_vreg: u32) -> LFunc {
+    LFunc { symbol = f.symbol; n_params = f.n_params; param_types = f.param_types; ret_type = f.ret_type; blocks = f.blocks; next_vreg = next_vreg }
+}
+
+/** FreshVReg — a newly-allocated VReg id + the function that reserved it. */
+pub type FreshVReg = struct { func: LFunc; vreg: u32 }
+
+/** alloc_vreg — reserve the next VReg id in `f`, returning it plus the advanced
+    function (functional threading — no mutable counter). */
+pub fn alloc_vreg(f: LFunc) -> FreshVReg {
+    FreshVReg { func = with_next_vreg(f, f.next_vreg + 1); vreg = f.next_vreg }
+}
+
+/** add_func — return a copy of `m` with `f` appended. */
+pub fn add_func(m: LModule, f: LFunc) -> LModule {
+    LModule { funcs = teko::list::push(m.funcs, f) }
+}

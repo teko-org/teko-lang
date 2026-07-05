@@ -1,0 +1,250 @@
+/** hex_digit — the lowercase hex character for a nibble 0..15.
+
+    This file is the stable, deterministic textual printer for the LIR — the spine
+    of the diff gate (a byte-stable dump is the LIR's version of the C-diff
+    temp-normalized bar). One instruction per line; `%N` for VRegs, `@sym` for
+    symbols, `#Bn` for blocks; floats printed as their exact IEEE bits (`0x<hex>`)
+    so no rounding drift leaks into the diff. */
+fn hex_digit(n: u64) -> byte {
+    if n < 10 { (b'0' to u64 + n) to byte } else { (b'a' to u64 + (n - 10)) to byte }
+}
+
+/** u64_hex — the u64 as `0x<hex>` with no leading-zero padding (a bare `0x0` for
+    zero). Bit-exact — the float printer feeds it the raw IEEE bits. */
+fn u64_hex(v: u64) -> str {
+    if v == 0 { return "0x0" }
+    mut digits: []byte = teko::list::empty()
+    mut n = v
+    loop {
+        if n == 0 { break }
+        digits = teko::list::push(digits, hex_digit(n % 16))
+        n = n / 16
+    }
+    mut xs: []byte = teko::list::empty()
+    xs = teko::list::push(xs, b'0')
+    xs = teko::list::push(xs, b'x')
+    mut k = digits.len
+    loop { if k == 0 { break }; k = k - 1; xs = teko::list::push(xs, digits[k]) }
+    str(xs)
+}
+
+/** i128_dec — the i128 as decimal text. i64_to_str only covers 64-bit carriers, so
+    the LIR printer renders 128-bit literals itself (digit-by-digit over the
+    magnitude, with a leading '-' for negatives). */
+fn i128_dec(v: i128) -> str {
+    if v == 0 { return "0" }
+    let neg = v < 0
+    mut mag: u128 = if neg { u128_of_neg_i128(v) } else { v to u128 }
+    mut digits: []byte = teko::list::empty()
+    loop {
+        if mag == 0 { break }
+        digits = teko::list::push(digits, (b'0' to u128 + mag % 10) to byte)
+        mag = mag / 10
+    }
+    mut xs: []byte = teko::list::empty()
+    if neg { xs = teko::list::push(xs, b'-') }
+    mut k = digits.len
+    loop { if k == 0 { break }; k = k - 1; xs = teko::list::push(xs, digits[k]) }
+    str(xs)
+}
+
+/** u128_of_neg_i128 — the magnitude of a negative i128 as a u128, computed without
+    overflowing on i128::MIN (|MIN| exceeds i128::MAX). */
+fn u128_of_neg_i128(v: i128) -> u128 {
+    ((-(v + 1)) to u128) + 1
+}
+
+/** ltype_name — the printer spelling of an LType (the machine class as a lowercase
+    suffix used in `const.<t>`, `iadd.<t>`, and the function signature). */
+fn ltype_name(t: LType) -> str {
+    match t {
+        I8   => "i8"
+        I16  => "i16"
+        I32  => "i32"
+        I64  => "i64"
+        I128 => "i128"
+        F16  => "f16"
+        F32  => "f32"
+        F64  => "f64"
+        Ptr  => "ptr"
+        Void => "void"
+    }
+}
+
+/** binop_name — the printer mnemonic for an LBinOp. */
+fn binop_name(op: LBinOp) -> str {
+    match op {
+        IAdd => "iadd"; ISub => "isub"; IMul => "imul"
+        IDivS => "idivs"; IDivU => "idivu"; IRemS => "irems"; IRemU => "iremu"
+        IAnd => "iand"; IOr => "ior"; IXor => "ixor"
+        IShl => "ishl"; IShrS => "ishrs"; IShrU => "ishru"
+        ICmpEq => "icmpeq"; ICmpNe => "icmpne"
+        ICmpLtS => "icmplts"; ICmpLtU => "icmpltu"; ICmpLeS => "icmples"; ICmpLeU => "icmpleu"
+        ICmpGtS => "icmpgts"; ICmpGtU => "icmpgtu"; ICmpGeS => "icmpges"; ICmpGeU => "icmpgeu"
+        FAdd => "fadd"; FSub => "fsub"; FMul => "fmul"; FDiv => "fdiv"
+        FCmpEq => "fcmpeq"; FCmpNe => "fcmpne"; FCmpLt => "fcmplt"; FCmpLe => "fcmple"
+        FCmpGt => "fcmpgt"; FCmpGe => "fcmpge"
+    }
+}
+
+/** unop_name — the printer mnemonic for an LUnOp. */
+fn unop_name(op: LUnOp) -> str {
+    match op {
+        INeg => "ineg"; INot => "inot"; FNeg => "fneg"
+        ZExt => "zext"; SExt => "sext"; Trunc => "trunc"
+        IToF => "itof"; FToI => "ftoi"; FToF => "ftof"
+    }
+}
+
+/** vreg_ref — a `%N` VReg reference. */
+fn vreg_ref(v: u32) -> str {
+    teko::str::concat("%", teko::u64_to_str(v to u64))
+}
+
+/** print_args — a comma-separated list of `%N` VReg references (no surrounding
+    parens; the caller supplies them). */
+fn print_args(args: []u32) -> str {
+    mut out = ""
+    mut i: u64 = 0
+    loop {
+        if i >= args.len { break }
+        if i > 0 { out = teko::str::concat(out, ", ") }
+        out = teko::str::concat(out, vreg_ref(args[i]))
+        i++
+    }
+    out
+}
+
+/** result_prefix — the `%N = ` prefix of a value-producing instruction, or the
+    empty string for a terminator / void call. */
+fn result_prefix(inst: LInst) -> str {
+    if !inst.has_result { return "" }
+    teko::str::concat(vreg_ref(inst.result), " = ")
+}
+
+/** print_const_int — `const.<t> <dec>`; the type suffix rides the return type via
+    the enclosing block so N1 keeps it terse: the literal is untyped in the printer
+    (its width is fixed by the consumer). N1 prints a bare `const <dec>`. */
+fn print_const_int(c: LConstInt) -> str {
+    teko::str::concat("const ", i128_dec(c.val))
+}
+
+/** print_const_float — `const.f64 0x<bits>` (bit-exact IEEE). */
+fn print_const_float(c: LConstFloat) -> str {
+    teko::str::concat("const.f64 ", u64_hex(c.bits))
+}
+
+/** print_bin — `<op> %a, %b`. */
+fn print_bin(b: LBin) -> str {
+    teko::str::concat(binop_name(b.op), " ", vreg_ref(b.a), ", ", vreg_ref(b.b))
+}
+
+/** print_un — `<op> %a`. */
+fn print_un(u: LUn) -> str {
+    teko::str::concat(unop_name(u.op), " ", vreg_ref(u.a))
+}
+
+/** print_param — `param <index>`. */
+fn print_param(p: LParam) -> str {
+    teko::str::concat("param ", teko::u64_to_str(p.index to u64))
+}
+
+/** print_call — `call @<sym>(<args>)`. */
+fn print_call(c: LCall) -> str {
+    teko::str::concat("call @", c.symbol, "(", print_args(c.args), ")")
+}
+
+/** print_ret — `ret %v` or `ret` (void). */
+fn print_ret(r: LRet) -> str {
+    if r.has_value { teko::str::concat("ret ", vreg_ref(r.value)) } else { "ret" }
+}
+
+/** print_jump — `jump #B<target>(<args>)`. */
+fn print_jump(j: LJump) -> str {
+    teko::str::concat("jump #B", teko::u64_to_str(j.target to u64), "(", print_args(j.args), ")")
+}
+
+/** print_branch — `branch %cond, #B<t>(<targs>), #B<f>(<fargs>)`. */
+fn print_branch(br: LBranch) -> str {
+    teko::str::concat(
+        "branch ", vreg_ref(br.cond),
+        ", #B", teko::u64_to_str(br.t_target to u64), "(", print_args(br.t_args), ")",
+        ", #B", teko::u64_to_str(br.f_target to u64), "(", print_args(br.f_args), ")"
+    )
+}
+
+/** print_op — the operation text (no result prefix). */
+fn print_op(op: LOp) -> str {
+    match op {
+        LConstInt as c   => print_const_int(c)
+        LConstFloat as c => print_const_float(c)
+        LBin as b        => print_bin(b)
+        LUn as u         => print_un(u)
+        LCall as c       => print_call(c)
+        LParam as p      => print_param(p)
+        LRet as r        => print_ret(r)
+        LJump as j       => print_jump(j)
+        LBranch as br    => print_branch(br)
+    }
+}
+
+/** print_inst — one instruction as its full `    <prefix><op>` line (4-space
+    body indent). */
+fn print_inst(inst: LInst) -> str {
+    teko::str::concat("    ", result_prefix(inst), print_op(inst.op))
+}
+
+/** print_block — a block header `  #Bn:` (with block-args when present) followed by
+    its instructions, one per line. */
+fn print_block(b: LBlock) -> str {
+    mut out = teko::str::concat("  #B", teko::u64_to_str(b.id to u64))
+    if b.params.len != 0 { out = teko::str::concat(out, "(", print_args(b.params), ")") }
+    out = teko::str::concat(out, ":\n")
+    mut i: u64 = 0
+    loop {
+        if i >= b.insts.len { break }
+        out = teko::str::concat(out, print_inst(b.insts[i]), "\n")
+        i++
+    }
+    out
+}
+
+/** print_sig_params — the `%0: i64, %1: i64` parameter list of a function header:
+    each parameter's VReg id (0..n_params) with its machine type. */
+fn print_sig_params(f: LFunc) -> str {
+    mut out = ""
+    mut i: u64 = 0
+    loop {
+        if i >= f.param_types.len { break }
+        if i > 0 { out = teko::str::concat(out, ", ") }
+        out = teko::str::concat(out, vreg_ref(i to u32), ": ", ltype_name(f.param_types[i]))
+        i++
+    }
+    out
+}
+
+/** print_func — a full function: `func @sym(params) -> ret {` + its blocks + `}`. */
+fn print_func(f: LFunc) -> str {
+    mut out = teko::str::concat("func @", f.symbol, "(", print_sig_params(f), ") -> ", ltype_name(f.ret_type), " {\n")
+    mut i: u64 = 0
+    loop {
+        if i >= f.blocks.len { break }
+        out = teko::str::concat(out, print_block(f.blocks[i]))
+        i++
+    }
+    teko::str::concat(out, "}\n")
+}
+
+/** print_lmodule — the whole module as stable text: every function in declaration
+    order, blank-line separated. This is the artifact the diff/fixpoint gate reads. */
+pub fn print_lmodule(m: LModule) -> str {
+    mut out = ""
+    mut i: u64 = 0
+    loop {
+        if i >= m.funcs.len { break }
+        if i > 0 { out = teko::str::concat(out, "\n") }
+        out = teko::str::concat(out, print_func(m.funcs[i]))
+        i++
+    }
+    out
+}
