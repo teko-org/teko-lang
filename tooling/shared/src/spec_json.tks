@@ -1,0 +1,142 @@
+/** tooling/shared/src/spec_json.tks (namespace 'grammar_extractor' — same root as main.tks) —
+ *  a minimal, self-contained JSON encoder for GrammarSpec (A1's canonical output shape).
+ *  Deliberately NOT a dependency on teko::encoding::json: that namespace only resolves
+ *  inside the compiler's own project (name = "teko"); this tool is a standalone project, so
+ *  it carries the same tiny escaping logic teko::encoding::json itself uses (RFC 8259 §7).
+ *
+ *  escape `s` into a JSON string literal (quotes included).
+ */
+pub fn encode_string(s: str) -> str {
+    mut out = "\""
+    mut i: u64 = 0
+    loop {
+        if i >= s.len { break }
+        out = out ~ encode_one_byte(s[i])
+        i++
+    }
+    out ~ "\""
+}
+
+fn encode_one_byte(b: byte) -> str {
+    if b == b'"'  { return "\\\"" }
+    if b == b'\\' { return "\\\\" }
+    if b == b'\n' { return "\\n" }
+    if b == b'\r' { return "\\r" }
+    if b == b'\t' { return "\\t" }
+    if b < 0x20 to byte { return "\\u0000" }
+    teko::str::one_byte(b)
+}
+
+/** encode one `KeywordEntry` as a JSON object `{"text":"…"}`. */
+fn encode_keyword(k: KeywordEntry) -> str {
+    "{\"text\":" ~ encode_string(k.text) ~ "}"
+}
+
+/** encode one `OperatorEntry` as a JSON object `{"text":"…","kind":"…"}`. */
+fn encode_operator(o: OperatorEntry) -> str {
+    "{\"text\":" ~ encode_string(o.text) ~ ",\"kind\":" ~ encode_string(o.kind) ~ "}"
+}
+
+/** encode one `EscapeEntry` as a JSON object `{"letter":"…","byte_value":N}`. */
+fn encode_escape(e: EscapeEntry) -> str {
+    "{\"letter\":" ~ encode_string(e.letter) ~ ",\"byte_value\":" ~ teko::str::u64_to_str(e.byte_value to u64) ~ "}"
+}
+
+/** encode a `[]KeywordEntry` as a JSON array, sorted lexicographically for a stable diff. */
+fn encode_keywords(items: []KeywordEntry) -> str {
+    let sorted = sort_keywords(items)
+    mut out = "["
+    mut i: u64 = 0
+    loop {
+        if i >= sorted.len { break }
+        if i > 0 { out = out ~ "," }
+        out = out ~ encode_keyword(sorted[i])
+        i++
+    }
+    out ~ "]"
+}
+
+/** encode a `[]OperatorEntry` as a JSON array (source order — maximal-munch length order
+ *  already carries meaning: longer operators first is how the lexer itself disambiguates).
+ */
+fn encode_operators(items: []OperatorEntry) -> str {
+    mut out = "["
+    mut i: u64 = 0
+    loop {
+        if i >= items.len { break }
+        if i > 0 { out = out ~ "," }
+        out = out ~ encode_operator(items[i])
+        i++
+    }
+    out ~ "]"
+}
+
+/** encode a `[]EscapeEntry` as a JSON array. */
+fn encode_escapes(items: []EscapeEntry) -> str {
+    mut out = "["
+    mut i: u64 = 0
+    loop {
+        if i >= items.len { break }
+        if i > 0 { out = out ~ "," }
+        out = out ~ encode_escape(items[i])
+        i++
+    }
+    out ~ "]"
+}
+
+/** ascending insertion sort by `.text` (the tables are small — a few dozen keywords — so
+ *  O(n^2) is the right amount of machinery, matching the compiler's own small-table idiom).
+ */
+fn sort_keywords(items: []KeywordEntry) -> []KeywordEntry {
+    mut out: []KeywordEntry = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= items.len { break }
+        out = insert_sorted(out, items[i])
+        i++
+    }
+    out
+}
+
+fn insert_sorted(sorted: []KeywordEntry, item: KeywordEntry) -> []KeywordEntry {
+    mut out: []KeywordEntry = teko::list::empty()
+    mut inserted = false
+    mut i: u64 = 0
+    loop {
+        if i >= sorted.len { break }
+        if !inserted && str_less(item.text, sorted[i].text) {
+            out = teko::list::push(out, item)
+            inserted = true
+        }
+        out = teko::list::push(out, sorted[i])
+        i++
+    }
+    if !inserted { out = teko::list::push(out, item) }
+    out
+}
+
+/** encode the full GrammarSpec as the canonical JSON document (A1's aceite: one JSON
+ *  containing every current keyword/operator, no parallel hardcoded copy).
+ */
+pub fn encode_spec(spec: GrammarSpec) -> str {
+    mut out = "{"
+    out = out ~ "\"keywords\":" ~ encode_keywords(spec.keywords) ~ ","
+    out = out ~ "\"operators\":" ~ encode_operators(spec.operators) ~ ","
+    out = out ~ "\"line_comment\":" ~ encode_string(spec.line_comment) ~ ","
+    out = out ~ "\"block_comment_open\":" ~ encode_string(spec.block_comment_open) ~ ","
+    out = out ~ "\"block_comment_close\":" ~ encode_string(spec.block_comment_close) ~ ","
+    out = out ~ "\"doc_comment_open\":" ~ encode_string(spec.doc_comment_open) ~ ","
+    out = out ~ "\"string_delimiter\":" ~ encode_string(spec.string_delimiter) ~ ","
+    out = out ~ "\"string_multiline_delimiter\":" ~ encode_string(spec.string_multiline_delimiter) ~ ","
+    out = out ~ "\"string_interp_prefix\":" ~ encode_string(spec.string_interp_prefix) ~ ","
+    out = out ~ "\"string_verbatim_prefix\":" ~ encode_string(spec.string_verbatim_prefix) ~ ","
+    out = out ~ "\"byte_literal_prefix\":" ~ encode_string(spec.byte_literal_prefix) ~ ","
+    out = out ~ "\"byte_literal_delimiter\":" ~ encode_string(spec.byte_literal_delimiter) ~ ","
+    out = out ~ "\"char_literal_prefix\":" ~ encode_string(spec.char_literal_prefix) ~ ","
+    out = out ~ "\"char_literal_delimiter\":" ~ encode_string(spec.char_literal_delimiter) ~ ","
+    out = out ~ "\"number_decimal_pattern\":" ~ encode_string(spec.number_decimal_pattern) ~ ","
+    out = out ~ "\"number_hex_pattern\":" ~ encode_string(spec.number_hex_pattern) ~ ","
+    out = out ~ "\"number_binary_pattern\":" ~ encode_string(spec.number_binary_pattern) ~ ","
+    out = out ~ "\"string_escapes\":" ~ encode_escapes(spec.string_escapes)
+    out ~ "}"
+}
