@@ -1,0 +1,600 @@
+// src/repl/repl.tks   (namespace 'teko::repl')
+//
+// DT3 — `teko repl`: an interactive READ-EVAL-PRINT LOOP over the VM (TEKO_ROADMAP_DEVTOOLS.md).
+// A scratchpad session: each line the user types is parsed, type-checked, and (if it is a
+// statement) INTERPRETED via teko::vm's own tree-walker (vm::exec_stmt) against a PERSISTED
+// environment — so a later line's `x + 1` sees an earlier line's `let x = 1`. Declarations
+// (`fn`/`type`/`flags`) accumulate as a session-wide module; `use` lines accumulate as a
+// session-wide header; everything else is a session-wide virtual-main BODY, one statement per
+// line (DT3 scope — no multi-line statement continuation: an incomplete line is a parse error,
+// same as any other invalid single line, never a silent misread — M.3).
+//
+// WHY RE-CHECK THE WHOLE SESSION EACH LINE. The grammar is a hard wall (parser::parse_module
+// parses decls-only, parser::parse_main_file parses statements-only — main.tks's own doc), and
+// the checker's `type_program` has no incremental/partial mode. So each new line is APPENDED to
+// its buffer, the WHOLE accumulated session is re-parsed + re-type-checked (idempotent — the
+// same source re-typechecks to the same TProgram), and only the NEWLY-typed statements (by
+// count) are actually RUN — replaying old statements would re-print their side effects. A
+// rejected line rolls its buffer append back (the session is unaffected — errors don't drop it).
+//
+// A meta-command (`:help`, `:quit`) is recognized before any parsing (a colon is not valid
+// Teko-source-start, so this is unambiguous).
+
+use teko::checker
+use teko::parser
+use teko::lexer
+use teko::vm
+
+/** One REPL session: the accumulated source buffers (use/decl/stmt), the top-level binding
+    names seen so far (KEEP-ALIVE — see `checked_source`), how many of the session's statements
+    have already been RUN, and the persisted VM environment they ran in. */
+pub type Session = struct {
+    use_src:     str
+    decl_src:    str
+    stmt_src:    str
+    bound_names: []str
+    executed:    u64
+    venv:        vm::Venv
+}
+
+/** A fresh, empty session: an empty program, an empty root VM environment. */
+pub fn new_session() -> Session {
+    let empty_prog = checker::TProgram { items = teko::list::empty() }
+    let no_names: []str = teko::list::empty()
+    Session {
+        use_src = ""
+        decl_src = ""
+        stmt_src = ""
+        bound_names = no_names
+        executed = 0
+        venv = vm::fresh_env(empty_prog, teko::list::empty())
+    }
+}
+
+/** One `step` outcome: `printed` is the line to show the user (may be empty — a decl/`use`/
+    binding produces no display value), `ok` distinguishes a rejected line (session unchanged,
+    `printed` carries the error text) from an accepted one. `quit` — the user typed a
+    quit meta-command (the CLI loop stops; `session` is returned unchanged). */
+pub type StepResult = struct { session: Session; printed: str; ok: bool; quit: bool }
+
+fn accepted(session: Session, printed: str) -> StepResult {
+    StepResult { session = session; printed = printed; ok = true; quit = false }
+}
+
+fn rejected(session: Session, message: str) -> StepResult {
+    StepResult { session = session; printed = message; ok = false; quit = false }
+}
+
+/** append `line` to `base` as its own line (a blank `base` needs no leading separator). */
+fn append_line(base: str, line: str) -> str {
+    if base == "" { return line }
+    teko::str::concat(base, "\n", line)
+}
+
+/** the first token in `line` that decides which buffer it belongs to, skipping the doc-comment/
+    visibility/`extern` prefix a declaration may carry (mirrors parser::parse_decl's own peek).
+    Falls back to `Ident` (never a `use`/decl keyword) when the line is ENTIRELY a skippable
+    prefix (e.g. a lone `pub`, no keyword after it) — the caller then treats it as a loose
+    statement (it will fail to parse as one, the same honest "error: …" any other malformed
+    line gets — M.3). */
+fn first_significant_kind(tokens: []lexer::Token) -> lexer::TokenKind {
+    mut i: u64 = 0
+    loop {
+        if i >= tokens.len { return lexer::TokenKind::Ident }
+        let k = tokens[i].kind
+        let skippable = k == lexer::TokenKind::Doc || k == lexer::TokenKind::Pub ||
+                        k == lexer::TokenKind::Exp || k == lexer::TokenKind::Extern
+        if !skippable { return k }
+        i++
+    }
+}
+
+type UseLine  = struct { }
+type DeclLine = struct { }
+type StmtLine = struct { }
+type LineKind = variant UseLine | DeclLine | StmtLine
+
+/** classify a session line by its leading keyword (`use` / a declaration start / anything
+    else — a loose statement). An empty token stream (a blank line) is a no-op statement. */
+fn classify(tokens: []lexer::Token) -> LineKind {
+    let k = first_significant_kind(tokens)
+    if k == lexer::TokenKind::Use { return UseLine { } }
+    if k == lexer::TokenKind::Fn || k == lexer::TokenKind::Type || k == lexer::TokenKind::Flags { return DeclLine { } }
+    StmtLine { }
+}
+
+/** the session's own namespace: NOT bare (`""`) — the checker's call-resolution treats an
+    EMPTY declaring namespace as "this is a local/closure value", the same sentinel a real
+    project's builtins use (scope.tks::call_ns's own doc: "an empty ns means … the builtin
+    call-map"); a session `fn` declared under `""` would be miscalled as a closure and crash
+    the VM looking for a never-`let`-bound variable of the same name. A real, non-empty,
+    same-namespace-for-both-decls-and-statements name sidesteps that sentinel entirely (an
+    unqualified call from a statement in THIS namespace matches a function in THIS namespace —
+    scope.tks::lookup_call's own same-namespace rule), exactly like any real project module. */
+fn session_ns() -> str { "repl_session" }
+
+/** parse `use_src` + `decl_src` as a module body → the decl Items (Function/TypeDecl), tagged
+    with `session_ns()` (mirrors driver.tks's module_to_program). */
+fn decl_items(use_src: str, decl_src: str) -> []parser::Item | error {
+    let src = if decl_src == "" { "" } else { append_line(use_src, decl_src) }
+    if src == "" { let none: []parser::Item = teko::list::empty(); return none }
+    let tokens = match lexer::tokenize(src) { []lexer::Token as t => t; error as e => return e }
+    let m = match parser::parse_module(tokens, 0) { parser::Parsed<parser::Module> as x => x.node; error as e => return e }
+    let ns = session_ns()
+    mut items: []parser::Item = teko::list::empty()
+    mut ui: u64 = 0
+    loop {
+        if ui >= m.uses.len { break }
+        items = teko::list::push(items, parser::Item { content = m.uses[ui]; namespace = ns; file = "" })
+        ui++
+    }
+    mut di: u64 = 0
+    loop {
+        if di >= m.decls.len { break }
+        items = match m.decls[di] {
+            parser::Function as f  => teko::list::push(items, parser::Item { content = f; namespace = ns; file = "" })
+            parser::TypeDecl as td => teko::list::push(items, parser::Item { content = td; namespace = ns; file = "" })
+        }
+        di++
+    }
+    items
+}
+
+/** parse `use_src` + `stmt_src` as a main-file body → the statement Items, in source order
+    (mirrors driver.tks's main_file_to_program). An empty `stmt_src` yields no items — the
+    session's `use` header alone is not a main file. Tagged with `session_ns()` (see
+    `decl_items`) — same namespace as the session's own `fn`/`type` declarations. */
+fn stmt_items(use_src: str, stmt_src: str) -> []parser::Item | error {
+    if stmt_src == "" { let none: []parser::Item = teko::list::empty(); return none }
+    let src = append_line(use_src, stmt_src)
+    let tokens = match lexer::tokenize(src) { []lexer::Token as t => t; error as e => return e }
+    let mf = match parser::parse_main_file(tokens, 0) { parser::Parsed<parser::MainFile> as x => x.node; error as e => return e }
+    let ns = session_ns()
+    mut items: []parser::Item = teko::list::empty()
+    mut si: u64 = 0
+    loop {
+        if si >= mf.body.len { break }
+        items = teko::list::push(items, parser::Item { content = mf.body[si]; namespace = ns; file = "" })
+        si++
+    }
+    items
+}
+
+/** the session's WHOLE program (decls before statements — the project convention), or the
+    first parse error. `check_stmt_src` is the STATEMENT source to actually parse — see
+    `keep_alive_suffix` on why the checker sees a different (longer) suffix than what gets
+    persisted/run. */
+fn session_program(use_src: str, decl_src: str, check_stmt_src: str) -> parser::Program | error {
+    let decls = match decl_items(use_src, decl_src) { []parser::Item as d => d; error as e => return e }
+    let stmts = match stmt_items(use_src, check_stmt_src) { []parser::Item as s => s; error as e => return e }
+    mut all: []parser::Item = teko::list::empty()
+    mut di: u64 = 0
+    loop { if di >= decls.len { break }; all = teko::list::push(all, decls[di]); di++ }
+    mut si: u64 = 0
+    loop { if si >= stmts.len { break }; all = teko::list::push(all, stmts[si]); si++ }
+    parser::Program { items = all }
+}
+
+/** KEEP-ALIVE (C5.1 vs. an open-ended session): the checker's unused-local check (M.1 — every
+    `let`/`mut` must be READ somewhere in its enclosing body) walks the WHOLE virtual-main body
+    as one function — a REPL's "define now, use on a LATER line" pattern legitimately violates
+    that per-step, since the reader hasn't been typed yet. Rather than relax the checker's rule
+    (a real, project-wide law — not a REPL-only concession), the REPL appends a synthetic
+    `let _ = <name>` read for every top-level binding seen so far — `_` is the checker's own
+    explicit discard target (exempt from the unused check, and freely re-bindable — see
+    initanalysis.tks) — to a CHECK-ONLY copy of the statement source. Never persisted, never run
+    (statement_items/run_new_statements only see the REAL statement count — see `step`). */
+fn keep_alive_suffix(names: []str) -> str {
+    mut out = ""
+    mut i: u64 = 0
+    loop {
+        if i >= names.len { break }
+        out = teko::str::concat(out, "\nlet _ = ", names[i])
+        i++
+    }
+    out
+}
+
+/** every top-level `let`/`mut` SIMPLE-NAME binding among `stmts`, in order (destructure targets
+    are not tracked — same scope initanalysis.tks itself tracks). */
+fn binding_names_of(stmts: []checker::TStatement) -> []str {
+    mut out: []str = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= stmts.len { break }
+        match stmts[i] {
+            checker::TBinding as b => {
+                match b.target {
+                    parser::SimpleName as sn => { if sn.name != "_" { out = teko::list::push(out, sn.name) } }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+        i++
+    }
+    out
+}
+
+/** the SAME scan as `binding_names_of`, over the UNTYPED per-line statement (used to seed THIS
+    line's own new binding into the keep-alive suffix BEFORE it is type-checked at all — see
+    `step`; a bare `let x = 1` needs `x` kept alive in the very same check that introduces it,
+    not just from the NEXT line onward). A parse failure yields no names (the real parse, right
+    after, reports the same error properly). */
+fn provisional_binding_name(line: str) -> []str {
+    let none: []str = teko::list::empty()
+    let tokens = match lexer::tokenize(line) { []lexer::Token as t => t; error => return none }
+    let mf = match parser::parse_main_file(tokens, 0) { parser::Parsed<parser::MainFile> as x => x.node; error => return none }
+    mut out: []str = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= mf.body.len { break }
+        match mf.body[i] {
+            parser::Binding as b => {
+                match b.target {
+                    parser::SimpleName as sn => { if sn.name != "_" { out = teko::list::push(out, sn.name) } }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+        i++
+    }
+    out
+}
+
+/** the first `n` of `xs` (never more than `xs.len`) — how `step` drops a checked program's
+    synthetic keep-alive tail, keeping only the REAL session statements. */
+fn first_n(xs: []checker::TStatement, n: u64) -> []checker::TStatement {
+    let stop = if n < xs.len { n } else { xs.len }
+    mut out: []checker::TStatement = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= stop { break }
+        out = teko::list::push(out, xs[i])
+        i++
+    }
+    out
+}
+
+/** `have` plus every name in `more` NOT already present (order-preserving, first-seen). */
+fn union_names(have: []str, more: []str) -> []str {
+    mut out = have
+    mut i: u64 = 0
+    loop {
+        if i >= more.len { break }
+        if !name_in(out, more[i]) { out = teko::list::push(out, more[i]) }
+        i++
+    }
+    out
+}
+
+fn name_in(names: []str, name: str) -> bool {
+    mut i: u64 = 0
+    loop {
+        if i >= names.len { break }
+        if names[i] == name { return true }
+        i++
+    }
+    false
+}
+
+/** the ordered list of TStatement items in a checked TProgram (decls interleave nothing — every
+    TStatement came from the session's stmt buffer, in source order — see session_program). */
+fn statement_items(prog: checker::TProgram) -> []checker::TStatement {
+    mut out: []checker::TStatement = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= prog.items.len { break }
+        match prog.items[i] {
+            checker::TStatement as s => out = teko::list::push(out, s)
+            _ => {}
+        }
+        i++
+    }
+    out
+}
+
+/** run every NEW statement (index ≥ `already_run`) against `venv`, threading the environment
+    forward exactly like vm::run's own top-level loop. Returns the final env, the executed
+    count, and the LAST new statement's printable value (null when there were no new statements,
+    or the last one produced none — a binding/decl-only line). */
+type RunNew = struct { venv: vm::Venv; executed: u64; last: vm::Value?; last_type: checker::Type; printable: bool }
+
+/** thread ONE step's flow exit into `run_new_statements`' running (env, last, printable):
+    a top-level `return` still shows its value (the session stays open — a REPL has no
+    caller to return TO); break/continue are unreachable at top level (the checker rejects
+    them there), so they fall back to no printable value. */
+fn exit_outcome(ex: vm::Exit) -> RunNew {
+    match ex.flow {
+        vm::Normal as nm    => RunNew { venv = ex.env; executed = 0; last = nm.value; last_type = checker::Void { }; printable = true }
+        vm::VmReturn as ret => RunNew { venv = ex.env; executed = 0; last = ret.value; last_type = checker::Void { }; printable = true }
+        _                   => RunNew { venv = ex.env; executed = 0; last = null; last_type = checker::Void { }; printable = false }
+    }
+}
+
+fn run_new_statements(stmts: []checker::TStatement, already_run: u64, venv: vm::Venv) -> RunNew {
+    mut env = venv
+    mut i = already_run
+    mut last: vm::Value? = null
+    mut last_type: checker::Type = checker::Void { }
+    mut printable = false
+    loop {
+        if i >= stmts.len { break }
+        let s = stmts[i]
+        printable = vm::is_plain_expr_stmt(s)
+        match vm::exec_stmt(s, env) {
+            vm::Stepped as st => { env = st.env; last = st.value }
+            vm::Exit as ex    => {
+                let outcome = exit_outcome(ex)
+                env = outcome.venv
+                last = outcome.last
+                printable = outcome.printable
+            }
+        }
+        if printable {
+            match s { checker::TExprStmt as es => last_type = es.expr.type; _ => {} }
+        }
+        i++
+    }
+    RunNew { venv = env; executed = stmts.len; last = last; last_type = last_type; printable = printable }
+}
+
+/** quote a str value for display (a REPL shows `"hi"`, not a bare `hi` — distinguishes a
+    string result from a bare identifier/number at a glance). No escaping beyond the quotes
+    themselves (display-only, not a re-parseable literal). */
+fn quoted(s: str) -> str { teko::str::concat("\"", s, "\"") }
+
+/** render a Value for display, given its STATIC type (Value's own runtime tag conflates
+    byte/u8 and char/str — the static type disambiguates, exactly like vm.tks's own
+    interpolation formatter). Falls back to an honest placeholder for shapes this REPL does
+    not render (M.3 — never silently wrong): closures/refs/opaque handles. */
+pub fn value_str(v: vm::Value, t: checker::Type) -> str {
+    match t {
+        checker::Char => match v { str as s => s; _ => "?" }
+        checker::Str  => match v { str as s => quoted(s); _ => "?" }
+        checker::Prim as p => prim_str(v, p.kind)
+        checker::Byte => match v { byte as b => teko::u64_to_str(b to u64); _ => "?" }
+        checker::Slice as sl => slice_str(v, sl.element)
+        checker::Optional as o => opt_str(v, o.inner)
+        checker::Named as n  => match v { vm::StructVal as sv => struct_str(sv); _ => n.name }
+        checker::Error        => match v { vm::StructVal as sv => struct_str(sv); _ => "error" }
+        checker::Func         => "<function>"
+        checker::Ptr          => "<pointer>"
+        checker::Uptr         => "<pointer>"
+        checker::Reference    => "<ref>"
+        checker::Void         => ""
+        checker::Variant      => match v { vm::StructVal as sv => struct_str(sv); _ => "<variant>" }
+    }
+}
+
+/** the scalar prims: bool by its own tag, float/int by width+signedness (the same read-the-
+    member-type recipe checker::type.tks's own predicates use). i128/u128 display truncated
+    to 64 bits (matches vm.tks's own interpolation formatter — display-only, never the
+    stored value). */
+fn prim_str(v: vm::Value, k: checker::PrimKind) -> str {
+    if k == checker::PrimKind::Bool { return match v { bool as b => if b { "true" } else { "false" }; _ => "?" } }
+    if k == checker::PrimKind::F16 || k == checker::PrimKind::F32 || k == checker::PrimKind::F64 {
+        return match v {
+            f16 as f => teko::ftoa(f to f64)
+            f32 as f => teko::ftoa(f to f64)
+            f64 as f => teko::ftoa(f)
+            _        => "?"
+        }
+    }
+    let signed = k == checker::PrimKind::I8 || k == checker::PrimKind::I16 || k == checker::PrimKind::I32 ||
+                 k == checker::PrimKind::I64 || k == checker::PrimKind::I128
+    if signed {
+        return match v {
+            i8 as n   => teko::i64_to_str(n to i64)
+            i16 as n  => teko::i64_to_str(n to i64)
+            i32 as n  => teko::i64_to_str(n to i64)
+            i64 as n  => teko::i64_to_str(n)
+            i128 as n => teko::i64_to_str(n to i64)
+            _         => "?"
+        }
+    }
+    match v {
+        u8 as n   => teko::u64_to_str(n to u64)
+        u16 as n  => teko::u64_to_str(n to u64)
+        u32 as n  => teko::u64_to_str(n to u64)
+        u64 as n  => teko::u64_to_str(n)
+        u128 as n => teko::u64_to_str(n to u64)
+        _         => "?"
+    }
+}
+
+fn slice_str(v: vm::Value, elem: checker::Type) -> str {
+    match v {
+        []vm::Value as xs => {
+            mut out = "["
+            mut i: u64 = 0
+            loop {
+                if i >= xs.len { break }
+                if i > 0 { out = teko::str::concat(out, ", ") }
+                out = teko::str::concat(out, value_str(xs[i], elem))
+                i++
+            }
+            teko::str::concat(out, "]")
+        }
+        _ => "[]"
+    }
+}
+
+fn opt_str(v: vm::Value, inner: checker::Type) -> str {
+    match v {
+        vm::OptVal as ov => if ov.present { value_str(ov.inner ?? panic("repl: present optional with no inner (internal)"), inner) } else { "null" }
+        _                => "null"
+    }
+}
+
+fn struct_str(sv: vm::StructVal) -> str {
+    mut out = teko::str::concat(sv.type_name, " { ")
+    mut i: u64 = 0
+    loop {
+        if i >= sv.field_names.len { break }
+        if i > 0 { out = teko::str::concat(out, "; ") }
+        out = teko::str::concat(out, sv.field_names[i], " = ", value_str_untyped(sv.field_vals[i]))
+        i++
+    }
+    teko::str::concat(out, " }")
+}
+
+/** a field VALUE with no static type in hand (a struct's fields aren't threaded through
+    here — TypeReg's field-type lookup isn't part of this REPL's cross-namespace surface).
+    Reads the value's OWN runtime tag directly: unambiguous for bool/numerics/slices/structs;
+    collapses byte↔u8 and char↔str (both pairs share a runtime tag) — the best available
+    information without a static type, never a wrong-silent guess (M.3). */
+fn value_str_untyped(v: vm::Value) -> str {
+    match v {
+        bool as b   => if b { "true" } else { "false" }
+        str as s    => quoted(s)
+        byte as b   => teko::u64_to_str(b to u64)
+        u8 as n     => teko::u64_to_str(n to u64)
+        u16 as n    => teko::u64_to_str(n to u64)
+        u32 as n    => teko::u64_to_str(n to u64)
+        u64 as n    => teko::u64_to_str(n)
+        u128 as n   => teko::u64_to_str(n to u64)
+        i8 as n     => teko::i64_to_str(n to i64)
+        i16 as n    => teko::i64_to_str(n to i64)
+        i32 as n    => teko::i64_to_str(n to i64)
+        i64 as n    => teko::i64_to_str(n)
+        i128 as n   => teko::i64_to_str(n to i64)
+        f16 as f    => teko::ftoa(f to f64)
+        f32 as f    => teko::ftoa(f to f64)
+        f64 as f    => teko::ftoa(f)
+        vm::StructVal as sv => struct_str(sv)
+        vm::OptVal as ov     => if ov.present { value_str_untyped(ov.inner ?? panic("repl: present optional with no inner (internal)")) } else { "null" }
+        []vm::Value as xs => {
+            mut out = "["
+            mut i: u64 = 0
+            loop {
+                if i >= xs.len { break }
+                if i > 0 { out = teko::str::concat(out, ", ") }
+                out = teko::str::concat(out, value_str_untyped(xs[i]))
+                i++
+            }
+            teko::str::concat(out, "]")
+        }
+        _ => "<opaque>"
+    }
+}
+
+/** the `: Type` label a printed result carries (best-effort — a compact name, not a full
+    mangle; enough to disambiguate a REPL result at a glance). */
+fn type_label(t: checker::Type) -> str {
+    match t {
+        checker::Prim as p  => prim_label(p.kind)
+        checker::Byte        => "byte"
+        checker::Char        => "char"
+        checker::Str         => "str"
+        checker::Error       => "error"
+        checker::Void        => "void"
+        checker::Slice as s  => teko::str::concat("[]", type_label(s.element))
+        checker::Optional as o => teko::str::concat(type_label(o.inner), "?")
+        checker::Named as n  => n.name
+        checker::Func         => "fn"
+        checker::Ptr          => "ptr"
+        checker::Uptr         => "uptr"
+        checker::Reference    => "ref"
+        checker::Variant      => "variant"
+    }
+}
+
+fn prim_label(k: checker::PrimKind) -> str {
+    if k == checker::PrimKind::U8   { return "u8" }
+    if k == checker::PrimKind::U16  { return "u16" }
+    if k == checker::PrimKind::U32  { return "u32" }
+    if k == checker::PrimKind::U64  { return "u64" }
+    if k == checker::PrimKind::U128 { return "u128" }
+    if k == checker::PrimKind::I8   { return "i8" }
+    if k == checker::PrimKind::I16  { return "i16" }
+    if k == checker::PrimKind::I32  { return "i32" }
+    if k == checker::PrimKind::I64  { return "i64" }
+    if k == checker::PrimKind::I128 { return "i128" }
+    if k == checker::PrimKind::F16  { return "f16" }
+    if k == checker::PrimKind::F32  { return "f32" }
+    if k == checker::PrimKind::F64  { return "f64" }
+    "bool"
+}
+
+/** the ":quit"/":help" meta-commands — recognized before any lexing (a leading ':' is never
+    valid Teko source). Anything else is real session source. */
+type Quit   = struct { }
+type Help   = struct { }
+type NotMeta = struct { }
+type Meta = variant Quit | Help | NotMeta
+
+fn meta_of(line: str) -> Meta {
+    if line == ":quit" || line == ":q" { return Quit { } }
+    if line == ":help" || line == ":h" { return Help { } }
+    NotMeta { }
+}
+
+/** the `:help` banner. */
+pub fn help_text() -> str {
+    "teko repl — an interactive session over the VM\n  :help, :h   show this text\n  :quit, :q   end the session\nAnything else is Teko source: a statement/expression runs against the session's\npersisted environment; a `fn`/`type`/`flags` declaration and `use` accumulate for\nlater lines to call/use."
+}
+
+/** ONE session step: classify+append `line`, re-check the whole session, run only the new
+    statement(s), and report the newest one's value (if printable). A rejected line leaves
+    `session` UNCHANGED (M.1 — an error never drops the session). A blank line (no tokens)
+    is a no-op — accepted, unchanged, nothing printed. */
+pub fn step(session: Session, line: str) -> StepResult {
+    match meta_of(line) {
+        Quit => return StepResult { session = session; printed = ""; ok = true; quit = true }
+        Help => return accepted(session, help_text())
+        NotMeta => {}
+    }
+
+    let probe = match lexer::tokenize(line) { []lexer::Token as t => t; error as e => return rejected(session, teko::str::concat("error: ", e.message)) }
+    if probe.len == 0 { return accepted(session, "") }
+
+    let kind = classify(probe)
+    let use_src  = match kind { UseLine  => append_line(session.use_src, line);  _ => session.use_src }
+    let decl_src = match kind { DeclLine => append_line(session.decl_src, line); _ => session.decl_src }
+    let stmt_src = match kind { StmtLine => append_line(session.stmt_src, line); _ => session.stmt_src }
+    let real_count = match kind { StmtLine => session.executed + 1; _ => session.executed }
+
+    let provisional_names = union_names(session.bound_names, provisional_binding_name(line))
+    let check_stmt_src = teko::str::concat(stmt_src, keep_alive_suffix(provisional_names))
+    let program = match session_program(use_src, decl_src, check_stmt_src) {
+        parser::Program as p => p
+        error as e            => return rejected(session, teko::str::concat("error: ", e.message))
+    }
+    let checked = match checker::type_program(program) {
+        checker::TProgram as c => c
+        error as e              => return rejected(session, teko::str::concat("error: ", e.message))
+    }
+
+    let all_stmts = statement_items(checked)
+    let stmts = first_n(all_stmts, real_count)
+    let ran = run_new_statements(stmts, session.executed, vm::Venv { slots = session.venv.slots; prog = checked; defers = session.venv.defers; cells = session.venv.cells })
+    let names = union_names(session.bound_names, binding_names_of(stmts))
+    let next = Session { use_src = use_src; decl_src = decl_src; stmt_src = stmt_src; bound_names = names; executed = ran.executed; venv = ran.venv }
+
+    if !ran.printable { return accepted(next, "") }
+    match ran.last {
+        vm::Value as v => accepted(next, teko::str::concat(value_str(v, ran.last_type), " : ", type_label(ran.last_type)))
+        null           => accepted(next, "")
+    }
+}
+
+/** the CLI entry (`teko repl`): read one line at a time from stdin, `step` the session, print
+    a non-empty result, stop at EOF or `:quit`. `args` is unused today (a future `teko repl
+    <projdir>` seeding the session from a project is a follow-on — DT3 ships the standalone
+    scratchpad first); kept for CLI-signature symmetry with the other subcommands. */
+pub fn run_cli(args: []str) -> i32 {
+    teko::io::println(teko::str::concat("teko repl ", teko::env::version(), " — :help for commands, :quit to exit"))
+    mut session = new_session()
+    loop {
+        teko::io::print("teko> ")
+        let line = teko::io::read_line()
+        if line == "" && teko::io::stdin_eof() { teko::io::println(""); break }
+        let r = step(session, line)
+        session = r.session
+        if r.quit { break }
+        if r.printed != "" { teko::io::println(r.printed) }
+    }
+    0
+}

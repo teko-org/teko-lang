@@ -354,10 +354,47 @@ fn cc_family_is_clang(cc: str, binary: str) -> bool {
     is_clang
 }
 
+/**
+ * (C7.20) append_reachable_link_flags — the global `[extern.libs]` resolved link flags
+ * (`-l<name>` / paths / raw flags), appended to `argv` AFTER the sources so the linker
+ * resolves their symbols (link order). A flag is appended only when its originating key
+ * (m.link_lib_name, parallel to m.link_flags) is in `reachable` — extern-reachability: only a
+ * lib whose name is actually reached by a call from the program's own entry points earns a
+ * place on the link line, so a project that declares two [extern.libs] but only calls one of
+ * them's extern fns links just that one.
+ */
+fn append_reachable_link_flags(argv: []str, m: Manifest, reachable: []str) -> []str {
+    mut out = argv
+    mut li = 0
+    loop {
+        if li >= m.link_flags.len { break }
+        if name_in(reachable, m.link_lib_name[li]) { out = teko::list::push(out, m.link_flags[li]) }
+        li = li + 1
+    }
+    out
+}
+
+/**
+ * (C7.20) append_reachable_os_lib_flags — the DEFERRED per-OS `[extern.libs.<os>]` flags
+ * (C7.1f), appended to `argv` only when their OS matches `target_os` (host, or `[extern]
+ * target`) AND their originating key is in `reachable`. Resolved HERE (native), so manifest
+ * parse stays host-independent.
+ */
+fn append_reachable_os_lib_flags(argv: []str, m: Manifest, tos: str, reachable: []str) -> []str {
+    mut out = argv
+    mut oi = 0
+    loop {
+        if oi >= m.os_lib_os.len { break }
+        if m.os_lib_os[oi] == tos && name_in(reachable, m.os_lib_name[oi]) { out = teko::list::push(out, m.os_lib_flag[oi]) }
+        oi = oi + 1
+    }
+    out
+}
+
 // Run the host C compiler over `cfile`, producing `binary`. Full parity with driver.c::run_cc: cc
 // sees the runtime + assert dirs (-I) and compiles BOTH seed sources (teko_rt.c + assert.c) plus
 // -lm, in one reuse-the-host-toolchain invocation (M.5). Returns the cc exit code.
-fn run_cc(cfile: str, binary: str, m: Manifest) -> i32 {
+fn run_cc(cfile: str, binary: str, m: Manifest, prog: checker::TProgram) -> i32 {
     let rt = rt_dir()
     let asrt = assert_dir(rt)
     let cc = if m.cc.len > 0 { m.cc } else { "cc" }   // C7.1f: [extern] cc override
@@ -384,23 +421,10 @@ fn run_cc(cfile: str, binary: str, m: Manifest) -> i32 {
     argv = teko::list::push(argv, teko::str::concat(rt, "/teko_rt.c"))
     argv = teko::list::push(argv, teko::str::concat(asrt, "/assert.c"))
     if !m.freestanding { argv = teko::list::push(argv, "-lm") }   // libm (skipped under freestanding)
-    // C7.1e: the [extern.libs] resolved link flags (`-l<name>` / paths / raw flags), appended AFTER
-    // the sources so the linker resolves their symbols (link order). Already resolved by the manifest.
-    mut li = 0
-    loop {
-        if li >= m.link_flags.len { break }
-        argv = teko::list::push(argv, m.link_flags[li])
-        li = li + 1
-    }
-    // C7.1f: the DEFERRED per-OS [extern.libs.<os>] flags — appended only when their OS matches the
-    // target (host, or `[extern] target`). Resolved HERE (native), so manifest parse stays host-independent.
+    let reachable = reachable_libs(prog)
+    argv = append_reachable_link_flags(argv, m, reachable)
     let tos = target_os(m)
-    mut oi = 0
-    loop {
-        if oi >= m.os_lib_os.len { break }
-        if m.os_lib_os[oi] == tos { argv = teko::list::push(argv, m.os_lib_flag[oi]) }
-        oi = oi + 1
-    }
+    argv = append_reachable_os_lib_flags(argv, m, tos, reachable)
     // C7.1k: on macOS, embed an Info.plist section so the Mach-O carries native version metadata
     // (mdls / `Get Info` / `otool -s __TEXT __info_plist`). Best-effort — a plist write failure must
     // not break the build. (Windows VERSIONINFO + a Linux ELF note are the staged follow-ons.)
@@ -500,7 +524,7 @@ fn backend(dir: str, stem: str, out_dir: str, prog: checker::TProgram, m: Manife
         error as e => return fail(dir, e.message)
         null       => {}                              // error? — null = success
     }
-    if run_cc(cfile, binp, m) != 0 {
+    if run_cc(cfile, binp, m, prog) != 0 {
         return fail(dir, "cc failed to build the generated C")
     }
     // E3 — write the symbol map beside the binary (best-effort; a write error never fails the build —

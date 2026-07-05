@@ -61,15 +61,17 @@ use teko::lexer
 // `[]Value` a list. (Tier-1 numerics — plan §5 [N1/N2] — are all in now; `dec`/`bigint`
 // and `error`-as-value enter when the VM grows.)
 // ---------------------------------------------------------------------------
-// W4b — a STRUCT value: nominal type name + fields in DECLARED order (mirrors the C
-// TK_VAL_STRUCT carrier). `error` is also a struct value (type_name "error", field "message").
-// A variant value is just a member-struct value (the case = its type_name); match (W5) reads it.
-type StructVal = struct { type_name: str; field_names: []str; field_vals: []Value }
+/** W4b — a STRUCT value: nominal type name + fields in DECLARED order (mirrors the C
+    TK_VAL_STRUCT carrier). `error` is also a struct value (type_name "error", field "message").
+    A variant value is just a member-struct value (the case = its type_name); match (W5) reads
+    it. pub (StructVal/OptVal/RefVal/FuncVal/ClassRef/Value below): teko::repl (DT3) inspects a
+    session step's resulting Value — matching one of its variant members needs it visible too. */
+pub type StructVal = struct { type_name: str; field_names: []str; field_vals: []Value }
 
 // OptVal (REBOOT_PLAN §202) — an optional `T?` value: NONE (present=false) or PRESENT
 // (present=true, `inner` set). Distinguishable from any payload value, so null/?./??/match-
 // over-`T?` read it unambiguously (the C twin is the TK_VAL_OPT tag).
-type OptVal = struct { present: bool; inner: Value? }
+pub type OptVal = struct { present: bool; inner: Value? }
 
 // RefVal (MEM Step 2/3) — a `Ref<T>` VALUE: the index into the env's CELL STORE where the
 // referenced scalar lives. `Ref<T>` is escape-gated to a PARAM-ONLY, SCALAR-only borrow that
@@ -77,7 +79,7 @@ type OptVal = struct { present: bool; inner: Value? }
 // call frame: a `mut` lvalue arg is PROMOTED to a cell at the auto-ref site (cell_alloc), the
 // origin slot is rebound to that cell (slot.cell_id), and this RefVal carries the cell index.
 // `.value` read/write goes through `cell_get`/`cell_set`; the C twin is the TK_VAL_REF tag.
-type RefVal = struct { cell: u64 }
+pub type RefVal = struct { cell: u64 }
 
 // ClassRef (W10b.CLASS residual — VM reference semantics) — a CLASS instance value: the index
 // into the env's CELL STORE where its StructVal lives. STRUCTURALLY identical to RefVal (both
@@ -89,7 +91,7 @@ type RefVal = struct { cell: u64 }
 // whose entire contract is "cannot escape" — so this is a new, unrestricted variant over the
 // SAME cell-store mechanism (cell_alloc/cell_get), giving a class construction shared identity
 // exactly like a native `tk_region_alloc`'d pointer: `let b = a` copies only the cell index.
-type ClassRef = struct { cell: u64 }
+pub type ClassRef = struct { cell: u64 }
 
 // FuncVal (W10a) — a function/closure VALUE: the (namespace, name) of the target function. A named
 // fn used as a value carries no captured environment (the W10b capture env will extend this). A
@@ -99,9 +101,9 @@ type ClassRef = struct { cell: u64 }
 // is_lambda=false. A closure LITERAL carries is_lambda=true + its typed params/body + a SNAPSHOT of
 // its captured variables (cap_names/cap_vals): a by-copy capture snapshots the value; a `Ref<T>`
 // capture snapshots the RefVal (the cell index — so the closure shares the cell → mutation works).
-type FuncVal = struct { is_lambda: bool; ns: str; name: str; params: []checker::TLambdaParam; body: []checker::TStatement; cap_names: []str; cap_vals: []Value }
+pub type FuncVal = struct { is_lambda: bool; ns: str; name: str; params: []checker::TLambdaParam; body: []checker::TStatement; cap_names: []str; cap_vals: []Value }
 
-type Value = variant u8 | u16 | u32 | u64 | u128
+pub type Value = variant u8 | u16 | u32 | u64 | u128
            | i8 | i16 | i32 | i64 | i128
            | f16 | f32 | f64
            | bool | byte | str | []Value | StructVal | OptVal | RefVal | FuncVal | ClassRef
@@ -124,7 +126,8 @@ pub type Normal   = struct { value: Value? }   // W5a — the NORMAL flow's trai
 pub type VmReturn   = struct { value: Value? }   // null == return with no value (void / bare `return`)
 pub type Break    = struct { label: str }      // break [NAME] — label empty = innermost loop (M.5)
 pub type Continue = struct { label: str }      // continue [NAME] — label empty = innermost loop (M.5)
-type Flow = variant Normal | VmReturn | Break | Continue
+/** pub: teko::repl (DT3) reads a top-level step's flow. */
+pub type Flow = variant Normal | VmReturn | Break | Continue
 
 // str equality (loop labels) — mirrors the C `vm_str_eq`. The empty label matches empty.
 fn vm_str_eq(a: str, b: str) -> bool { a == b }
@@ -299,10 +302,11 @@ fn drain_defers_to(env: Venv, base: u64) -> Venv {
     with_defers(e, defers_up_to(e.defers, base))
 }
 
-// (C7.18) fresh_env — a fresh call-frame env (no slots, no defers, same prog).
-// (MEM Step 2/3) `cells` is supplied by the CALLER so a `RefVal`'s cell index stays valid in the
-// callee frame (the cell store is program-wide, not per-frame); the caller passes its own cells in.
-fn fresh_env(prog: checker::TProgram, cells: []Value) -> Venv {
+/** (C7.18) a fresh call-frame env (no slots, no defers, same prog). (MEM Step 2/3) `cells`
+    is supplied by the CALLER so a `RefVal`'s cell index stays valid in the callee frame (the
+    cell store is program-wide, not per-frame); the caller passes its own cells in. pub:
+    teko::repl (DT3) opens the session's root env the same way `run` does. */
+pub fn fresh_env(prog: checker::TProgram, cells: []Value) -> Venv {
     Venv { slots= teko::list::empty(); prog= prog; defers= teko::list::empty(); cells= cells }
 }
 
@@ -883,6 +887,17 @@ fn try_str_builtin(callee: parser::Path, args: []checker::TExpr, env: Venv) -> V
     null   // not a str builtin — fall through to user-fn resolution
 }
 
+/** (DT3) teko::io::read_line / stdin_eof — stdin, one line at a time. Handled here (like
+    `read_file` below) so the VM `#test`/`teko run` path — and `teko repl`, which is VM-only —
+    can exercise them without an `extern`-cannot-run-in-the-VM honest stop. Both are plain
+    (non-error) returns (str / bool — see io.tks's own note on why), so each is a direct
+    passthrough. `null` == not one of these two → the caller falls through. */
+fn try_stdin_builtin(last_segment: str) -> Value? {
+    if last_segment == "read_line" { return teko::io::read_line() }
+    if last_segment == "stdin_eof" { return teko::io::stdin_eof() }
+    null
+}
+
 // teko::fs::* host surface builtins — value-producing (like try_list/str/err_builtin). In the
 // native vm.tks binary, `teko::fs::list_dir(path)` is lowered by codegen to `tk_rt_list_dir`,
 // so calling it here goes directly to the POSIX opendir/readdir runtime (C2* host surface).
@@ -904,6 +919,8 @@ fn try_fs_builtin(callee: parser::Path, args: []checker::TExpr, env: Venv) -> Va
             }
         }
     }
+    let stdin_result = try_stdin_builtin(last)
+    match stdin_result { Value as v => return v; null => {} }
     if last == "list_dir" {
         let path = as_str(ev_val(args[0], env))
         match teko::fs::list_dir(path) {
@@ -3085,9 +3102,11 @@ fn exec_block_ex(body: []checker::TStatement, env: Venv, is_fn_body: bool) -> Fl
     FlowEnv { flow= Normal { value= last }; env= drain_defers_to(e, base) }
 }
 
-// (W9.3 part 2) Is this statement a plain value-carrying expr-statement (NOT an `if`/`match`, which
-// run as control flow and self-route their own scope defers)? Used to detect a fn-body trailing value.
-fn is_plain_expr_stmt(s: checker::TStatement) -> bool {
+/** (W9.3 part 2) Is this statement a plain value-carrying expr-statement (NOT an `if`/`match`,
+    which run as control flow and self-route their own scope defers)? Used to detect a fn-body
+    trailing value. pub: teko::repl (DT3) reuses this to decide whether a session line's
+    result is printable. */
+pub fn is_plain_expr_stmt(s: checker::TStatement) -> bool {
     match s {
         checker::TExprStmt as x => {
             match x.expr {
@@ -3100,16 +3119,20 @@ fn is_plain_expr_stmt(s: checker::TStatement) -> bool {
     }
 }
 
-// One statement. Returns either Stepped(env', value) — a NORMAL step that threads the env
-// forward AND carries the statement's value (an expr-statement's result; `null` == none) —
-// or a Flow exit (VmReturn/Break/Continue). W5a: Stepped's `value` is how a NORMAL flow
-// carries its trailing value (the C `tk_flow.value` for a NORMAL kind); a block keeps the
-// LAST Stepped's value as its trailing value (B.20). The functional env (threaded via
-// Stepped) is the faithful Teko stand-in for the C's in-place env mutation.
-type Stepped = struct { env: Venv; value: Value? }
-type Exit    = struct { flow: Flow; env: Venv }   // env at the exit point: outer-`mut` mutations made
-                                                  // BEFORE a return/break/continue must survive the exit
-type Step    = variant Stepped | Exit
+/** a NORMAL step that threads the env forward AND carries the statement's value (an
+    expr-statement's result; `null` == none). W5a: `value` is how a NORMAL flow carries its
+    trailing value (the C `tk_flow.value` for a NORMAL kind); a block keeps the LAST Stepped's
+    value as its trailing value (B.20). The functional env (threaded via Stepped) is the
+    faithful Teko stand-in for the C's in-place env mutation. */
+pub type Stepped = struct { env: Venv; value: Value? }
+
+/** a Flow exit (VmReturn/Break/Continue): the env at the exit point (outer-`mut` mutations
+    made BEFORE the return/break/continue must survive the exit). */
+pub type Exit = struct { flow: Flow; env: Venv }
+
+/** one statement's outcome: either Stepped (see above) or an Exit. pub (Stepped/Exit/Flow
+    too): teko::repl (DT3) steps ONE statement at a time over a persisted Venv. */
+pub type Step = variant Stepped | Exit
 // FlowEnv — a Flow paired with the env AFTER running a block/if/match (block-locals already popped to
 // the enclosing scope; outer-`mut` mutations kept). The functional stand-in for the C's in-place env:
 // exec_block/exec_if/exec_match return it so a mutation INSIDE the block PROPAGATES to the caller (the
@@ -3118,7 +3141,9 @@ type Step    = variant Stepped | Exit
 // forever (the OOM cause for `bin/teko test`).
 type FlowEnv = struct { flow: Flow; env: Venv }
 
-fn exec_stmt(s: checker::TStatement, env: Venv) -> Step {
+/** pub: teko::repl (DT3) evaluates one incoming session statement at a time against its
+    persisted Venv, exactly like `run`'s own top-level loop below. */
+pub fn exec_stmt(s: checker::TStatement, env: Venv) -> Step {
     match s {
         checker::TBinding as b  => {
             // Only SimpleName is lowered for M0 (destructuring is the honest frontier).

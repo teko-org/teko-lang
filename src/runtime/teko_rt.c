@@ -1273,6 +1273,43 @@ tk_ffi_sres tk_rt_read_file(tk_str path) {
     return (tk_ffi_sres){ .ok = true, .value = (tk_str){ buf, n } };
 }
 
+// (DT3) tk_rt_stdin_eof_flag — set by the LAST tk_rt_read_line call: true iff it read zero
+// bytes before hitting EOF (stdin fully exhausted). A plain `bool`/`str` return (not the
+// {ok,value,err} FFI-lift shape) so a brand-new host primitive stays lowerable by ANY codegen
+// generation — new/unrecognized `str | error`-shaped externs need a per-name lift the SEED's
+// frozen codegen.c cannot learn post-release (the bootstrap-seed constraint); a direct `bool`/
+// `str` return needs no lift at all (mirrors tk_rt_os/tk_rt_version's already-working shape).
+static bool tk_rt_stdin_eof_flag = false;
+
+// (DT3) tk_rt_stdin_eof() — teko::io::stdin_eof(): did the LAST read_line() hit real EOF (no
+// more input at all)? Read this AFTER an empty read_line() result to tell "EOF" from "a blank
+// line" (both yield an empty str).
+bool tk_rt_stdin_eof(void) { return tk_rt_stdin_eof_flag; }
+
+// (DT3) tk_rt_read_line — one line from stdin, byte-at-a-time (portable — no POSIX-only
+// getline needed). Stops at '\n' (consumed, not kept) or EOF; a trailing '\r' (a Windows
+// "\r\n" source piped in) is also stripped. Sets tk_rt_stdin_eof_flag when zero bytes were
+// read before EOF (the "no more input" case — an empty str otherwise means a genuine blank
+// line); EOF after at least one byte still yields that final, unterminated line (matches a
+// shell's own paste-without-trailing-newline behavior) and leaves the EOF flag false.
+tk_str tk_rt_read_line(void) {
+    tk_byte_list acc = tk_byte_list_empty();
+    bool saw_any = false;
+    for (;;) {
+        int ch = fgetc(stdin);
+        if (ch == EOF) break;
+        saw_any = true;
+        if (ch == '\n') break;
+        acc = tk_byte_list_push(acc, (tk_byte)ch);
+    }
+    tk_rt_stdin_eof_flag = !saw_any;
+    if (acc.len > 0 && acc.ptr[acc.len - 1] == '\r') acc.len = acc.len - 1;
+    tk_byte *buf = (tk_byte *)tk_alloc(acc.len ? acc.len : 1);
+    if (acc.len) memcpy(buf, acc.ptr, acc.len);
+    tk_byte_list_free(acc);
+    return (tk_str){ buf, acc.len };
+}
+
 tk_ffi_sres tk_rt_getenv(tk_str name) {
     char *n = tk_cstr(name);
     const char *v = getenv(n);

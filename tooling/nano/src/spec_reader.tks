@@ -1,0 +1,266 @@
+/** tooling/nano/src/spec_reader.tks (namespace 'teko_grammar_gen_nano' — same root as
+ *  main.tks) — a minimal, TARGETED reader for grammar-spec.json (A1's canonical output).
+ *  Not a general JSON parser: the schema is fixed and owned by A1 (tooling/shared), so
+ *  this reads exactly the fields the spec always has, the same way A1 itself mines
+ *  lexer.tks — by locating a known marker and scanning the value that follows. Kept
+ *  self-contained (no cross-project `use`; teko::encoding::json only resolves inside
+ *  the compiler's own project).
+ *
+ *  one mined keyword.
+ */
+pub type SpecKeyword = struct {
+    text: str
+}
+
+/** one mined operator/punctuation entry. */
+pub type SpecOperator = struct {
+    text: str
+    kind: str
+}
+
+/** one mined string-escape entry. */
+pub type SpecEscape = struct {
+    letter: str
+    byte_value: u32
+}
+
+/** the fields every A2-A5 generator needs, read out of grammar-spec.json. */
+pub type Spec = struct {
+    keywords: []SpecKeyword
+    operators: []SpecOperator
+    line_comment: str
+    block_comment_open: str
+    block_comment_close: str
+    doc_comment_open: str
+    string_delimiter: str
+    string_interp_prefix: str
+    string_verbatim_prefix: str
+    byte_literal_prefix: str
+    byte_literal_delimiter: str
+    char_literal_prefix: str
+    char_literal_delimiter: str
+    number_decimal_pattern: str
+    number_hex_pattern: str
+    number_binary_pattern: str
+    string_escapes: []SpecEscape
+}
+
+/** read the `str` value of a top-level `"key":"value"` field. */
+fn read_string_field(json: str, key: str) -> str {
+    let marker = "\"" ~ key ~ "\":\""
+    let start = index_of_from(json, marker, 0)
+    if start >= json.len { return "" }
+    let value_start = start + marker.len
+    let value_end = find_unescaped_quote(json, value_start)
+    unescape_json(teko::str::slice(json, value_start, value_end))
+}
+
+/** the offset of the first `"` in `json` at/after `pos` that is NOT preceded by a `\`. */
+fn find_unescaped_quote(json: str, pos: u64) -> u64 {
+    mut i = pos
+    loop {
+        if i >= json.len { return json.len }
+        if json[i] == b'"' && json[i - 1] != b'\\' { return i }
+        i++
+    }
+}
+
+/** decode the JSON escapes this reader's own writer (A1's spec_json.tks) emits:
+ *  `\"` `\\` `\n` `\r` `\t` and `\u00XX` (control characters only — A1 never emits
+ *  a non-ASCII `\u` escape, since every field it writes is 7-bit ASCII source text).
+ */
+fn unescape_json(s: str) -> str {
+    mut out = ""
+    mut i: u64 = 0
+    loop {
+        if i >= s.len { break }
+        if s[i] == b'\\' && i + 1 < s.len {
+            let piece = decode_one_escape(s, i)
+            out = out ~ piece.text
+            i = piece.next
+            continue
+        }
+        out = out ~ one_char(s[i])
+        i++
+    }
+    out
+}
+
+type DecodedEscape = struct {
+    text: str
+    next: u64
+}
+
+fn decode_one_escape(s: str, i: u64) -> DecodedEscape {
+    let c = s[i + 1]
+    if c == b'"'  { return DecodedEscape { text = "\""; next = i + 2 } }
+    if c == b'\\' { return DecodedEscape { text = "\\"; next = i + 2 } }
+    if c == b'n'  { return DecodedEscape { text = "\n"; next = i + 2 } }
+    if c == b'r'  { return DecodedEscape { text = "\r"; next = i + 2 } }
+    if c == b't'  { return DecodedEscape { text = "\t"; next = i + 2 } }
+    if c == b'u' && i + 5 < s.len { return DecodedEscape { text = ""; next = i + 6 } }
+    DecodedEscape { text = one_char(c); next = i + 2 }
+}
+
+/** read the array value of a top-level `"key":[…]` field (the raw inner text, no brackets). */
+fn read_array_field(json: str, key: str) -> str {
+    let marker = "\"" ~ key ~ "\":["
+    let start = index_of_from(json, marker, 0)
+    if start >= json.len { return "" }
+    let inner_start = start + marker.len
+    let inner_end = find_matching_bracket(json, inner_start)
+    teko::str::slice(json, inner_start, inner_end)
+}
+
+/** the offset of the `]` matching the `[` implicitly opened right before `pos` (bracket
+ *  depth starts at 1; this array's own elements are flat objects, so no NESTED `[` occurs
+ *  inside them today — the depth counter still guards against that changing).
+ */
+fn find_matching_bracket(json: str, pos: u64) -> u64 {
+    mut depth: u64 = 1
+    mut i = pos
+    mut in_string = false
+    loop {
+        if i >= json.len { return json.len }
+        let c = json[i]
+        if in_string {
+            if c == b'\\' { i = i + 2; continue }
+            if c == b'"' { in_string = false }
+            i++
+            continue
+        }
+        if c == b'"' { in_string = true; i++; continue }
+        if c == b'[' { depth++; i++; continue }
+        if c == b']' {
+            depth--
+            if depth == 0 { return i }
+            i++
+            continue
+        }
+        i++
+    }
+}
+
+/** split a flat top-level array's inner text into its `{…}` object substrings. */
+fn split_objects(inner: str) -> []str {
+    mut out: []str = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= inner.len { break }
+        if inner[i] != b'{' { i++; continue }
+        let close = find_matching_brace(inner, i + 1)
+        out = teko::list::push(out, teko::str::slice(inner, i, close + 1))
+        i = close + 1
+    }
+    out
+}
+
+fn find_matching_brace(s: str, pos: u64) -> u64 {
+    mut depth: u64 = 1
+    mut i = pos
+    mut in_string = false
+    loop {
+        if i >= s.len { return s.len }
+        let c = s[i]
+        if in_string {
+            if c == b'\\' { i = i + 2; continue }
+            if c == b'"' { in_string = false }
+            i++
+            continue
+        }
+        if c == b'"' { in_string = true; i++; continue }
+        if c == b'{' { depth++; i++; continue }
+        if c == b'}' {
+            depth--
+            if depth == 0 { return i }
+            i++
+            continue
+        }
+        i++
+    }
+}
+
+/** the `str` value of `"key":"value"` inside one flat JSON object substring `obj`. */
+fn read_object_string(obj: str, key: str) -> str {
+    read_string_field(obj, key)
+}
+
+/** the `u32` value of `"key":N` inside one flat JSON object substring `obj`. */
+fn read_object_u32(obj: str, key: str) -> u32 {
+    let marker = "\"" ~ key ~ "\":"
+    let start = index_of_from(obj, marker, 0)
+    if start >= obj.len { return 0 }
+    let digit_start = start + marker.len
+    mut v: u32 = 0
+    mut i = digit_start
+    loop {
+        if i >= obj.len { break }
+        let c = obj[i]
+        if c < b'0' || c > b'9' { break }
+        v = v * 10 + (c to u32) - (b'0' to u32)
+        i++
+    }
+    v
+}
+
+fn read_keywords(json: str) -> []SpecKeyword {
+    let objs = split_objects(read_array_field(json, "keywords"))
+    mut out: []SpecKeyword = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= objs.len { break }
+        out = teko::list::push(out, SpecKeyword { text = read_object_string(objs[i], "text") })
+        i++
+    }
+    out
+}
+
+fn read_operators(json: str) -> []SpecOperator {
+    let objs = split_objects(read_array_field(json, "operators"))
+    mut out: []SpecOperator = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= objs.len { break }
+        out = teko::list::push(out, SpecOperator { text = read_object_string(objs[i], "text"); kind = read_object_string(objs[i], "kind") })
+        i++
+    }
+    out
+}
+
+fn read_escapes(json: str) -> []SpecEscape {
+    let objs = split_objects(read_array_field(json, "string_escapes"))
+    mut out: []SpecEscape = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= objs.len { break }
+        out = teko::list::push(out, SpecEscape { letter = read_object_string(objs[i], "letter"); byte_value = read_object_u32(objs[i], "byte_value") })
+        i++
+    }
+    out
+}
+
+/** parse the full `Spec` out of `json` (grammar-spec.json's text). Total: an absent field
+ *  reads as its zero value ("" / empty slice) rather than failing — a generator that only
+ *  needs a subset of fields is never blocked by an unrelated one going missing.
+ */
+pub fn read_spec(json: str) -> Spec {
+    Spec {
+        keywords = read_keywords(json)
+        operators = read_operators(json)
+        line_comment = read_string_field(json, "line_comment")
+        block_comment_open = read_string_field(json, "block_comment_open")
+        block_comment_close = read_string_field(json, "block_comment_close")
+        doc_comment_open = read_string_field(json, "doc_comment_open")
+        string_delimiter = read_string_field(json, "string_delimiter")
+        string_interp_prefix = read_string_field(json, "string_interp_prefix")
+        string_verbatim_prefix = read_string_field(json, "string_verbatim_prefix")
+        byte_literal_prefix = read_string_field(json, "byte_literal_prefix")
+        byte_literal_delimiter = read_string_field(json, "byte_literal_delimiter")
+        char_literal_prefix = read_string_field(json, "char_literal_prefix")
+        char_literal_delimiter = read_string_field(json, "char_literal_delimiter")
+        number_decimal_pattern = read_string_field(json, "number_decimal_pattern")
+        number_hex_pattern = read_string_field(json, "number_hex_pattern")
+        number_binary_pattern = read_string_field(json, "number_binary_pattern")
+        string_escapes = read_escapes(json)
+    }
+}
