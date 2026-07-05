@@ -278,6 +278,38 @@ fn tkb_roundtrip_program() {
     }
 }
 
+// (#165 C0) rewrite the version u32 (bytes 4..7, little-endian) of a serialized program frame to
+// a chosen value WITHOUT touching the body — the FNV-1a hash covers only data[16:], so patching a
+// header byte keeps the hash valid and lets the version guard be exercised in isolation.
+fn with_program_version(bytes: []byte, ver: byte) -> []byte {
+    mut out: []byte = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= bytes.len { break }
+        if i == 4 { out = teko::list::push(out, ver) } else { out = teko::list::push(out, bytes[i]) }
+        i++
+    }
+    out
+}
+
+// a trivial one-item TProgram (a single `use`) — enough to serialize a valid v3 frame the version
+// tests can re-stamp.
+fn trivial_program() -> checker::TProgram {
+    let upath = parser::Path { segments = teko::list::push(teko::list::empty(), parser::Segment { name = "teko" }) }
+    let use1 = parser::UseDecl { path = upath; has_alias = false; alias = "" }
+    checker::TProgram { items = teko::list::push(teko::list::empty(), use1) }
+}
+
+#test
+fn tkb_rejects_v2_program() {
+    // (#165 C0) a v2 program frame — the pre-#165 layout — must be REJECTED by the v3 reader
+    // (the added fields changed the body layout; reading v2 as v3 would mis-parse silently).
+    let v3 = serialize_program(trivial_program())
+    let v2 = with_program_version(v3, 2)
+    match deserialize_program(v2) { checker::TProgram => teko::assert::is_true(false); error => teko::assert::is_true(true) }
+    match deserialize_program(v3) { checker::TProgram as p => teko::assert::is_true(p.items.len == 1); error => teko::assert::is_true(false) }
+}
+
 #test
 fn tkb_roundtrip_matchexpr() {
     // C7.16: `match x { 0 => return 1; Foo as y => return 2; _ => return 3 }` round-trips (match + 3 pattern kinds).
