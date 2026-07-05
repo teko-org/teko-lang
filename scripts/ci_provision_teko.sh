@@ -17,8 +17,13 @@ set -eu
 LABEL="${1:?usage: ci_provision_teko.sh <LABEL>}"
 REPO="${GITHUB_REPOSITORY:?GITHUB_REPOSITORY must be set}"
 
-# Newest published release, prereleases included (alpha), drafts excluded.
-TAG="$(gh api "repos/${REPO}/releases" --jq 'map(select(.draft | not))[0].tag_name')"
+# Newest published release BY VERSION (prereleases included, drafts excluded). The
+# GitHub /releases API is NOT ordered by version — `[0]` can return a stale tag (e.g.
+# 0.0.1.9 ahead of 0.0.1.17). Filter to MAJOR.MINOR.PATCH.BUILD tags and pick the
+# highest with `sort -V`, so CI always seeds from the newest compiler.
+TAG="$(gh api "repos/${REPO}/releases" --paginate \
+  --jq 'map(select(.draft | not) | .tag_name)[] | select(test("^[0-9]+([.][0-9]+){3}"))' \
+  | sort -V | tail -n1)"
 if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
   echo "ci_provision_teko: no published release found for $REPO" >&2
   exit 1

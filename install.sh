@@ -196,14 +196,15 @@ latest_tag() {
         tag="$(sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$tmp" | head -n1)"
         [ -n "$tag" ] && { printf '%s' "$tag"; return 0; }
     fi
-    # 2) no stable yet — newest published release of ANY kind. The /releases list is
-    # newest-first and never returns drafts to unauthenticated callers, so the first
-    # tag_name is the newest prerelease. Honest notice on stderr (not stdout: stdout is
-    # the tag the caller captures).
-    api="https://api.github.com/repos/${REPO}/releases?per_page=30"
+    # 2) no stable yet — newest published release of ANY kind, BY VERSION. The /releases
+    # API is NOT version-ordered (its `[0]` can be a stale 0.0.1.9 ahead of 0.0.1.17), so
+    # filter to MAJOR.MINOR.PATCH.BUILD tags and take the highest via `sort -V`. Honest
+    # notice on stderr (stdout is the tag the caller captures).
+    api="https://api.github.com/repos/${REPO}/releases?per_page=100"
     tmp="$WORKDIR/releases.json"
     if download_ok "$api" "$tmp"; then
-        tag="$(sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$tmp" | head -n1)"
+        tag="$(sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$tmp" \
+            | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | sort -V | tail -n1)"
         [ -n "$tag" ] && {
             log "no stable release published yet — installing the latest prerelease: $tag"
             printf '%s' "$tag"

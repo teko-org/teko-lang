@@ -335,6 +335,15 @@ tk_ffi_sres tk_rt_str_from_utf8(const tk_byte *ptr, uint64_t len);
 
 // teko::io::read_file(path) — slurp the whole file as UTF-8 bytes (owned copy).
 tk_ffi_sres tk_rt_read_file(tk_str path);
+// (DT3) teko::io::read_line() — read one LINE from stdin (the trailing '\n'/"\r\n" stripped),
+// an owned copy — empty when stdin has no more input (check tk_rt_stdin_eof() to tell that
+// apart from a genuine blank line). A DIRECT `str` return (no {ok,value,err} lift) so this
+// brand-new primitive stays lowerable by every codegen generation, including the released
+// bootstrap seed's frozen codegen.c, which can only special-case ALREADY-KNOWN {ok,value,err}
+// shapes by name (mirrors tk_rt_os/tk_rt_version's already-working plain-str shape).
+tk_str tk_rt_read_line(void);
+// (DT3) teko::io::stdin_eof() — did the LAST read_line() hit real EOF (stdin fully exhausted)?
+bool tk_rt_stdin_eof(void);
 // teko::env::var(name) — the environment value, or error when unset.
 tk_ffi_sres tk_rt_getenv(tk_str name);
 // teko::io::write_file(path, content) — (over)write the file; error on failure.
