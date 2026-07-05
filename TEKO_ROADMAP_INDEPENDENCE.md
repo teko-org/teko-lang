@@ -1,5 +1,11 @@
 # TEKO_ROADMAP_INDEPENDENCE — projeto, testes e independência (pós-primeiro-binário)
 
+> **⚠️ HISTÓRICO (2026-07-04):** este roadmap descreve o período **pós-primeiro-binário, pré-self-host
+> completo** (Eixos A–E). A maioria foi entregue e promovida ao `TEKO_MASTER_PLAN.md` (Phase 7,
+> Phase 10). Mantido como referência histórica; o trabalho ativo segue em `TEKO_MASTER_PLAN.md`
+> fases 1–11 e em GitHub issues #157–#234. Para issues abertas remanescentes, buscar a issue
+> de cobertura no backlog (ex: #233 para LSP, #234 para DRY).
+
 > Sucede/!acompanha o `TEKO_ROADMAP_BINARY.md` (o primeiro binário via transpile-para-C, M0/M1).
 > Enquanto o BINARY prova a *pipeline* (read→lex→parse→check→emit-C→cc→exec), este roadmap reajusta o
 > que falta para a Teko ser uma toolchain **de verdade**: compilação **por projeto** (`.tkp`), um
@@ -276,3 +282,17 @@ que por sua vez destrava `driver.tks`/`main.tks` (self-hosting). F3-pânicos (BI
 - **▶ Prontos agora (deps satisfeitas):** **D2** (runner `#test` no VM — destrava D3/D4, torna os 646 asserts executáveis) · **A4** (regra do main pelo artefato) · **A5!**+**A5b** (projeto-só + mirror dos mains — correções) · **B1!** (aderência do `teko::assert`) · **E1** (posição na pipeline) · **C1.0** (legislar `extern` — você).
 - **Em seguida:** A4 → A5! → A5b (Eixo A/entrada); D2 → D3 → D4 (testes no VM); E1 → E2 → {E3,E4} (símbolos/diagnósticos); C1.0 → C1.1 → C2* (FFI/host).
 - **Correções a fechar (legislador):** A5! (remover single-file), A5b (mirror mains), B1! (par `assert.{c,h}`).
+
+---
+
+## Referência cruzada (2026-07-04)
+
+A maioria dos Eixos deste roadmap foi entregue e promovida para `TEKO_MASTER_PLAN.md`:
+- **Eixos A–D (projeto, testes, independência, VM)** → **Phase 7** (host independence) ✅
+- **Eixo E (símbolos/diagnósticos)** → **Phase 1** (diagnostics) ✅
+- **Eixo C (FFI)** → **Phase 7** (extern/FFI) ✅
+
+Para demandas remanescentes — generics constraints (S6), collections (S7), concurrency (S8), LSP
+tooling, etc. — consultar:
+**GitHub issues #157–#234** (labels `fase-1-linguagem` … `fase-6-qualidade`). O trabalho ativo
+segue em `TEKO_MASTER_PLAN.md` Phases 1–11, em ordem topológica.
