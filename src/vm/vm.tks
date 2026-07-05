@@ -61,15 +61,17 @@ use teko::lexer
 // `[]Value` a list. (Tier-1 numerics — plan §5 [N1/N2] — are all in now; `dec`/`bigint`
 // and `error`-as-value enter when the VM grows.)
 // ---------------------------------------------------------------------------
-// W4b — a STRUCT value: nominal type name + fields in DECLARED order (mirrors the C
-// TK_VAL_STRUCT carrier). `error` is also a struct value (type_name "error", field "message").
-// A variant value is just a member-struct value (the case = its type_name); match (W5) reads it.
-type StructVal = struct { type_name: str; field_names: []str; field_vals: []Value }
+/** W4b — a STRUCT value: nominal type name + fields in DECLARED order (mirrors the C
+    TK_VAL_STRUCT carrier). `error` is also a struct value (type_name "error", field "message").
+    A variant value is just a member-struct value (the case = its type_name); match (W5) reads
+    it. pub (StructVal/OptVal/RefVal/FuncVal/ClassRef/Value below): teko::repl (DT3) inspects a
+    session step's resulting Value — matching one of its variant members needs it visible too. */
+pub type StructVal = struct { type_name: str; field_names: []str; field_vals: []Value }
 
 // OptVal (REBOOT_PLAN §202) — an optional `T?` value: NONE (present=false) or PRESENT
 // (present=true, `inner` set). Distinguishable from any payload value, so null/?./??/match-
 // over-`T?` read it unambiguously (the C twin is the TK_VAL_OPT tag).
-type OptVal = struct { present: bool; inner: Value? }
+pub type OptVal = struct { present: bool; inner: Value? }
 
 // RefVal (MEM Step 2/3) — a `Ref<T>` VALUE: the index into the env's CELL STORE where the
 // referenced scalar lives. `Ref<T>` is escape-gated to a PARAM-ONLY, SCALAR-only borrow that
@@ -77,7 +79,7 @@ type OptVal = struct { present: bool; inner: Value? }
 // call frame: a `mut` lvalue arg is PROMOTED to a cell at the auto-ref site (cell_alloc), the
 // origin slot is rebound to that cell (slot.cell_id), and this RefVal carries the cell index.
 // `.value` read/write goes through `cell_get`/`cell_set`; the C twin is the TK_VAL_REF tag.
-type RefVal = struct { cell: u64 }
+pub type RefVal = struct { cell: u64 }
 
 // ClassRef (W10b.CLASS residual — VM reference semantics) — a CLASS instance value: the index
 // into the env's CELL STORE where its StructVal lives. STRUCTURALLY identical to RefVal (both
@@ -89,7 +91,7 @@ type RefVal = struct { cell: u64 }
 // whose entire contract is "cannot escape" — so this is a new, unrestricted variant over the
 // SAME cell-store mechanism (cell_alloc/cell_get), giving a class construction shared identity
 // exactly like a native `tk_region_alloc`'d pointer: `let b = a` copies only the cell index.
-type ClassRef = struct { cell: u64 }
+pub type ClassRef = struct { cell: u64 }
 
 // FuncVal (W10a) — a function/closure VALUE: the (namespace, name) of the target function. A named
 // fn used as a value carries no captured environment (the W10b capture env will extend this). A
@@ -99,9 +101,9 @@ type ClassRef = struct { cell: u64 }
 // is_lambda=false. A closure LITERAL carries is_lambda=true + its typed params/body + a SNAPSHOT of
 // its captured variables (cap_names/cap_vals): a by-copy capture snapshots the value; a `Ref<T>`
 // capture snapshots the RefVal (the cell index — so the closure shares the cell → mutation works).
-type FuncVal = struct { is_lambda: bool; ns: str; name: str; params: []checker::TLambdaParam; body: []checker::TStatement; cap_names: []str; cap_vals: []Value }
+pub type FuncVal = struct { is_lambda: bool; ns: str; name: str; params: []checker::TLambdaParam; body: []checker::TStatement; cap_names: []str; cap_vals: []Value }
 
-type Value = variant u8 | u16 | u32 | u64 | u128
+pub type Value = variant u8 | u16 | u32 | u64 | u128
            | i8 | i16 | i32 | i64 | i128
            | f16 | f32 | f64
            | bool | byte | str | []Value | StructVal | OptVal | RefVal | FuncVal | ClassRef
@@ -124,7 +126,8 @@ pub type Normal   = struct { value: Value? }   // W5a — the NORMAL flow's trai
 pub type VmReturn   = struct { value: Value? }   // null == return with no value (void / bare `return`)
 pub type Break    = struct { label: str }      // break [NAME] — label empty = innermost loop (M.5)
 pub type Continue = struct { label: str }      // continue [NAME] — label empty = innermost loop (M.5)
-type Flow = variant Normal | VmReturn | Break | Continue
+/** pub: teko::repl (DT3) reads a top-level step's flow. */
+pub type Flow = variant Normal | VmReturn | Break | Continue
 
 // str equality (loop labels) — mirrors the C `vm_str_eq`. The empty label matches empty.
 fn vm_str_eq(a: str, b: str) -> bool { a == b }
@@ -222,7 +225,12 @@ pub type DeferBody = struct { body: []checker::TStatement }
 // fine for a test VM, and behaviourally identical. The store only GROWS (cell_alloc appends) and
 // MUTATES (cell_set), never shrinks/reorders, so a callee that inherits the caller's cells and
 // returns its own can merge back by REPLACEMENT.
-pub type Venv  = struct { slots: []Slot; prog: checker::TProgram; defers: []DeferBody; cells: []Value }
+pub type Venv  = struct { slots: []Slot; prog: checker::TProgram; defers: []DeferBody; cells: []Value; di_cache: []DiCell }
+
+/** (W10c/MEM-3) One cached DI instance in the VM's threaded registry: the type-id (FNV-1a of the
+ *  impl's bare name, via the shared checker::di_type_id) → the ClassRef cell holding the instance. A
+ *  `#singleton`/`#scoped` materialization consults this before building; `#transient` never does. */
+type DiCell = struct { type_id: u64; cell: u64 }
 
 // find — newest-first scan so a later binding SHADOWS an earlier one (the checker's rule). The
 // checker guarantees every read binds, so a miss is an internal invariant break → panic (M.1),
@@ -250,18 +258,18 @@ fn read_var(env: Venv, name: str) -> Value {
 // A freshly-defined slot is plain (cell_id= null); only an auto-ref PROMOTION (promote_to_cell)
 // rebinds a slot to a cell. `cells` threads through unchanged.
 pub fn define(env: Venv, name: str, val: Value) -> Venv {
-    Venv { slots= teko::list::push(env.slots, Slot { name= name; val= val; cell_id= null }); prog= env.prog; defers= env.defers; cells= env.cells }
+    Venv { slots= teko::list::push(env.slots, Slot { name= name; val= val; cell_id= null }); prog= env.prog; defers= env.defers; cells= env.cells; di_cache= env.di_cache }
 }
 
 // (C7.18) push_defer — register a deferred body onto the env's defer stack.
 fn push_defer(env: Venv, body: []checker::TStatement) -> Venv {
-    Venv { slots= env.slots; prog= env.prog; defers= teko::list::push(env.defers, DeferBody { body= body }); cells= env.cells }
+    Venv { slots= env.slots; prog= env.prog; defers= teko::list::push(env.defers, DeferBody { body= body }); cells= env.cells; di_cache= env.di_cache }
 }
 
 // (W9.3) with_defers — replace an env's defer stack (used to pop a scope's defers back to its base
 // after that scope's defers have fired). Mirrors with_cells.
 fn with_defers(env: Venv, defers: []DeferBody) -> Venv {
-    Venv { slots= env.slots; prog= env.prog; defers= defers; cells= env.cells }
+    Venv { slots= env.slots; prog= env.prog; defers= defers; cells= env.cells; di_cache= env.di_cache }
 }
 
 // (W9.3) defers_up_to — the first `base` deferred bodies of `ds` (rebuilt, since the list has no
@@ -299,11 +307,12 @@ fn drain_defers_to(env: Venv, base: u64) -> Venv {
     with_defers(e, defers_up_to(e.defers, base))
 }
 
-// (C7.18) fresh_env — a fresh call-frame env (no slots, no defers, same prog).
-// (MEM Step 2/3) `cells` is supplied by the CALLER so a `RefVal`'s cell index stays valid in the
-// callee frame (the cell store is program-wide, not per-frame); the caller passes its own cells in.
-fn fresh_env(prog: checker::TProgram, cells: []Value) -> Venv {
-    Venv { slots= teko::list::empty(); prog= prog; defers= teko::list::empty(); cells= cells }
+/** (C7.18) a fresh call-frame env (no slots, no defers, same prog). (MEM Step 2/3) `cells`
+    is supplied by the CALLER so a `RefVal`'s cell index stays valid in the callee frame (the
+    cell store is program-wide, not per-frame); the caller passes its own cells in. pub:
+    teko::repl (DT3) opens the session's root env the same way `run` does. */
+pub fn fresh_env(prog: checker::TProgram, cells: []Value) -> Venv {
+    Venv { slots= teko::list::empty(); prog= prog; defers= teko::list::empty(); cells= cells; di_cache= teko::list::empty() }
 }
 
 // ---------------------------------------------------------------------------
@@ -364,14 +373,14 @@ fn promote_to_cell(env: Venv, name: str) -> Promotion {
         else        { rebuilt = teko::list::push(rebuilt, env.slots[j]) }
         j++
     }
-    Promotion { env= Venv { slots= rebuilt; prog= env.prog; defers= env.defers; cells= alloc.cells }; id= alloc.id }
+    Promotion { env= Venv { slots= rebuilt; prog= env.prog; defers= env.defers; cells= alloc.cells; di_cache= env.di_cache }; id= alloc.id }
 }
 
 // with_cells — replace an env's cell store (used to MERGE a callee's final cells back into the
 // caller after a call: the callee inherited the caller's cells and only grew/mutated them, so the
 // callee's final store is a superset-with-mutations and replaces the caller's wholesale).
 fn with_cells(env: Venv, cells: []Value) -> Venv {
-    Venv { slots= env.slots; prog= env.prog; defers= env.defers; cells= cells }
+    Venv { slots= env.slots; prog= env.prog; defers= env.defers; cells= cells; di_cache= env.di_cache }
 }
 
 // ---------------------------------------------------------------------------
@@ -883,6 +892,17 @@ fn try_str_builtin(callee: parser::Path, args: []checker::TExpr, env: Venv) -> V
     null   // not a str builtin — fall through to user-fn resolution
 }
 
+/** (DT3) teko::io::read_line / stdin_eof — stdin, one line at a time. Handled here (like
+    `read_file` below) so the VM `#test`/`teko run` path — and `teko repl`, which is VM-only —
+    can exercise them without an `extern`-cannot-run-in-the-VM honest stop. Both are plain
+    (non-error) returns (str / bool — see io.tks's own note on why), so each is a direct
+    passthrough. `null` == not one of these two → the caller falls through. */
+fn try_stdin_builtin(last_segment: str) -> Value? {
+    if last_segment == "read_line" { return teko::io::read_line() }
+    if last_segment == "stdin_eof" { return teko::io::stdin_eof() }
+    null
+}
+
 // teko::fs::* host surface builtins — value-producing (like try_list/str/err_builtin). In the
 // native vm.tks binary, `teko::fs::list_dir(path)` is lowered by codegen to `tk_rt_list_dir`,
 // so calling it here goes directly to the POSIX opendir/readdir runtime (C2* host surface).
@@ -904,6 +924,8 @@ fn try_fs_builtin(callee: parser::Path, args: []checker::TExpr, env: Venv) -> Va
             }
         }
     }
+    let stdin_result = try_stdin_builtin(last)
+    match stdin_result { Value as v => return v; null => {} }
     if last == "list_dir" {
         let path = as_str(ev_val(args[0], env))
         match teko::fs::list_dir(path) {
@@ -1577,29 +1599,75 @@ type PatMatch = struct { matched: bool; env: Venv }
 // VARIANT (e.g. `Type`) and the value's case is one of its members (e.g. `Prim`): the VM has no
 // wrapper (the value IS the member struct), so resolve the variant decl in the program and check
 // membership. (Mirrors vm.c case_in_variant; native codegen discriminates the tagged union.)
-// vm_match_as_enum_int — does `name` match an integer `ordinal` when the subject is an enum value?
-// Case A: `name` is an ENUM TYPE NAME (e.g., `PrimKind as k`) — any integer is a valid enum value
-//   of that type (the checker guarantees the subject came from a union like `PrimKind | error`).
-// Case B: `name` is an ENUM MEMBER NAME (e.g., `U8 =>`, `I64 =>`) — matches only at the right ordinal.
-// Mirrors vm.c match_as_enum_int.
-fn vm_match_as_enum_int(prog: checker::TProgram, name: str, ordinal: i128) -> bool {
+
+/** enum_candidate_names — the CANONICAL enum/flags type name(s) a match SUBJECT's static type may
+ * carry: a bare `Named` yields itself; a `Variant` (a fallible/union subject, e.g. `PrimKind |
+ * error`) yields every `Named` member (non-Named members carry no enum identity, so they are
+ * skipped). Anything else yields no candidate — the caller then has nothing to narrow against. */
+fn enum_candidate_names(t: checker::Type) -> []str {
+    match t {
+        checker::Named as n   => teko::list::push(teko::list::empty(), n.name)
+        checker::Variant as v => {
+            mut names: []str = teko::list::empty()
+            mut i = 0
+            loop {
+                if i >= v.members.len { break }
+                match v.members[i] { checker::Named as n => { names = teko::list::push(names, n.name) }; _ => {} }
+                i++
+            }
+            names
+        }
+        _ => teko::list::empty()
+    }
+}
+
+/** Is `td_name` (a TypeDecl's canonical name) one of the subject's enum candidates? An EMPTY
+ * candidate list means the caller had no static-type information (an internal/opaque subject) —
+ * falls back to "no restriction" so pre-existing call sites that cannot supply a type keep working. */
+fn enum_candidate_matches(candidates: []str, td_name: str) -> bool {
+    if candidates.len == 0 { return true }
+    let key = checker::name_last_segment(td_name)
+    mut i = 0
+    loop {
+        if i >= candidates.len { break }
+        if checker::name_last_segment(candidates[i]) == key { return true }
+        i++
+    }
+    false
+}
+
+/** vm_match_as_enum_int — does `name` match an integer `ordinal` when the subject is an enum value?
+ * Case A: `name` is an ENUM TYPE NAME (e.g., `PrimKind as k`) — any integer is a valid enum value
+ * of that type (the checker guarantees the subject came from a union like `PrimKind | error`).
+ * Case B: `name` is an ENUM MEMBER NAME (e.g., `U8 =>`, `I64 =>`) — matches only at the right ordinal.
+ * (#263) `subj_candidates` — the enum/flags type name(s) the match SUBJECT's own static type admits
+ * (from `enum_candidate_names`); a TypeDecl outside this set is SKIPPED even when it happens to
+ * declare a member with the same bare NAME at the same ordinal — the pre-fix scan walked EVERY enum
+ * in the whole program, so a user enum member sharing both a name (`F32`) and an ordinal with an
+ * unrelated enum (`teko::checker::PrimKind`) silently hijacked the match. Mirrors vm.c
+ * match_as_enum_int, narrowed by the subject's resolved type (native codegen never had this gap —
+ * it discriminates via the real C enum tag, never a bare-name program scan). `key` is the
+ * bare-vs-bare comparison key (#109 W3): `td.name` is canonical, member names stay bare. */
+fn vm_match_as_enum_int(prog: checker::TProgram, name: str, ordinal: i128, subj_candidates: []str) -> bool {
     mut i = 0
     loop {
         if i >= prog.items.len { break }
         match prog.items[i] {
             parser::TypeDecl as td => {
-                match td.body {
-                    parser::EnumBody as eb => {
-                        let key = checker::name_last_segment(name)   // (#109 W3) bare-vs-bare (td.name canonical; member names bare)
-                        if checker::name_last_segment(td.name) == key { return true }
-                        mut j = 0
-                        loop {
-                            if j >= eb.members.len { break }
-                            if eb.members[j] == key && (j to i128) == ordinal { return true }
-                            j++
+                if enum_candidate_matches(subj_candidates, td.name) {
+                    match td.body {
+                        parser::EnumBody as eb => {
+                            let key = checker::name_last_segment(name)
+                            if checker::name_last_segment(td.name) == key { return true }
+                            mut j = 0
+                            loop {
+                                if j >= eb.members.len { break }
+                                if eb.members[j] == key && (j to i128) == ordinal { return true }
+                                j++
+                            }
                         }
+                        _ => {}
                     }
-                    _ => {}
                 }
             }
             _ => {}
@@ -1694,19 +1762,29 @@ fn vm_case_in_variant(prog: checker::TProgram, vname: str, cname: str) -> bool {
     false
 }
 
-fn pat_match(pat: parser::Pattern, subj: Value, env: Venv) -> PatMatch {
-    // OPTIONAL subject (REBOOT_PLAN §202): `null` matches NONE; any other pattern matches the
-    // PRESENT case. A bare bind/wildcard over a present NON-struct inner binds the inner directly;
-    // a struct/variant inner recurses (the variant tag check / field destructure still applies).
+/** pat_match — does `subj` match `pat`? On match, returns the env extended with the pattern's
+ * bindings (`matched = true`); on no match, `matched = false` and the env is irrelevant (the caller
+ * discards it). The FUNCTIONAL stand-in for the C `pat_match(pat, subj, env)` that mutates `env` in
+ * place and is unwound by `env_pop_to`. `subj_type` (#263) is the match SUBJECT's own resolved
+ * static type (`TMatchExpr.subject.type`), threaded down so the enum-member arm below can narrow
+ * `vm_match_as_enum_int`'s program-wide scan to the enum(s) the subject can ACTUALLY be, instead of
+ * every enum declared anywhere in the corpus (the bare-name collision this fixes — see
+ * `vm_match_as_enum_int`'s own doc-comment).
+ *
+ * An OPTIONAL subject (REBOOT_PLAN §202): `null` matches NONE; any other pattern matches the
+ * PRESENT case. A bare bind/wildcard over a present NON-struct inner binds the inner directly;
+ * a struct/variant inner recurses (the variant tag check / field destructure still applies). */
+fn pat_match(pat: parser::Pattern, subj: Value, env: Venv, subj_type: checker::Type) -> PatMatch {
     match subj {
         OptVal as o => {
+            let inner_type = match subj_type { checker::Optional as opt => opt.inner; _ => subj_type }
             match pat {
                 parser::NullPattern => return PatMatch { matched = !o.present; env = env }
                 _ => {
                     if !o.present { return PatMatch { matched = false; env = env } }
                     let inner = match o.inner { Value as iv => iv; null => return PatMatch { matched = false; env = env } }
                     match inner {
-                        StructVal => return pat_match(pat, inner, env)   // variant/struct inner — recurse
+                        StructVal => return pat_match(pat, inner, env, inner_type)
                         _ => {
                             match pat {
                                 parser::WildcardPattern   => return PatMatch { matched = true; env = env }
@@ -1714,7 +1792,7 @@ fn pat_match(pat: parser::Pattern, subj: Value, env: Venv) -> PatMatch {
                                     if bp.has_binding { return PatMatch { matched = true; env = define(env, bp.binding, inner) } }
                                     return PatMatch { matched = true; env = env }
                                 }
-                                _ => return pat_match(pat, inner, env)
+                                _ => return pat_match(pat, inner, env, inner_type)
                             }
                         }
                     }
@@ -1724,22 +1802,20 @@ fn pat_match(pat: parser::Pattern, subj: Value, env: Venv) -> PatMatch {
         _ => {}
     }
     match pat {
-        parser::NullPattern      => PatMatch { matched = false; env = env }   // `null` over a non-optional never matches
+        parser::NullPattern      => PatMatch { matched = false; env = env }
         parser::WildcardPattern  => PatMatch { matched = true; env = env }
         parser::LiteralPattern as lp => PatMatch { matched = value_eq(subj, lit_as(lp.value, subj)); env = env }
         parser::RangePattern as rp => {
             if !val_is_int(subj) { return PatMatch { matched = false; env = env } }
             let lo = lit_as(rp.lo, subj); let hi = lit_as(rp.hi, subj)
-            // signed/unsigned compare — the .tks single signed accessor carries both (see header note).
             let v = as_int(subj)
             PatMatch { matched = as_int(lo) <= v && v <= as_int(hi); env = env }
         }
         parser::AltPattern as ap => {
-            // any option matches; options bind NOTHING (the checker forbids binding in an Alt).
             mut i = 0
             loop {
                 if i >= ap.options.len { break }
-                if pat_match(ap.options[i], subj, env).matched { return PatMatch { matched = true; env = env } }
+                if pat_match(ap.options[i], subj, env, subj_type).matched { return PatMatch { matched = true; env = env } }
                 i++
             }
             PatMatch { matched = false; env = env }
@@ -1777,7 +1853,7 @@ fn pat_match(pat: parser::Pattern, subj: Value, env: Venv) -> PatMatch {
                                 _ => {}
                             }
                         }
-                        _ => { if val_is_int(subj) { if vm_match_as_enum_int(env.prog, bname, as_int(subj)) { hit = true } } }
+                        _ => { if val_is_int(subj) { if vm_match_as_enum_int(env.prog, bname, as_int(subj), enum_candidate_names(subj_type)) { hit = true } } }
                     }
                 }
                 if hit {
@@ -1874,7 +1950,7 @@ fn eval_match(m: checker::TMatchExpr, t: checker::Type, line: u32, col: u32, env
     loop {
         if i >= m.arms.len { break }
         let arm = m.arms[i]
-        let pm = pat_match(arm.pattern, subj, senv)   // pattern bindings ride senv
+        let pm = pat_match(arm.pattern, subj, senv, m.subject.type)
         if pm.matched {
             // A `when` guard may itself evaluate a ref call; thread its env into the body's env.
             let ge = if arm.has_when { eval_expr(arm.guard, pm.env) } else { EvalRes { value= true; env= pm.env } }
@@ -1914,7 +1990,7 @@ fn exec_match(e: checker::TExpr, env: Venv) -> FlowEnv {
             loop {
                 if i >= m.arms.len { break }
                 let arm = m.arms[i]
-                let pm = pat_match(arm.pattern, subj, senv)
+                let pm = pat_match(arm.pattern, subj, senv, m.subject.type)
                 if pm.matched {
                     let ge = if arm.has_when { eval_expr(arm.guard, pm.env) } else { EvalRes { value= true; env= pm.env } }
                     let guard_ok = as_bool(ge.value)
@@ -1923,7 +1999,7 @@ fn exec_match(e: checker::TExpr, env: Venv) -> FlowEnv {
                         // run the arm body; POP its bindings/locals back to the outer scope (keeping
                         // outer-`mut` mutations, which mutate_slot writes at their index in [0, base)).
                         let bo = exec_block(arm.body, ge.env)
-                        return FlowEnv { flow= bo.flow; env= Venv { slots= loop_outer(bo.env.slots, base); prog= bo.env.prog; defers= bo.env.defers; cells= bo.env.cells } }
+                        return FlowEnv { flow= bo.flow; env= Venv { slots= loop_outer(bo.env.slots, base); prog= bo.env.prog; defers= bo.env.defers; cells= bo.env.cells; di_cache= bo.env.di_cache } }
                     }
                 }
                 i++   // discard this arm's bindings and try the next
@@ -2489,7 +2565,7 @@ fn mutate_slot(env: Venv, name: str, op: lexer::TokenKind, rhs: Value) -> Venv {
     match backing {
         u64 as cid => {
             // write through the cell; the slot list is unchanged (it still points at the cell).
-            return Venv { slots= env.slots; prog= env.prog; defers= env.defers; cells= cell_set(env.cells, cid, newval) }
+            return Venv { slots= env.slots; prog= env.prog; defers= env.defers; cells= cell_set(env.cells, cid, newval); di_cache= env.di_cache }
         }
         null => {}
     }
@@ -2502,7 +2578,7 @@ fn mutate_slot(env: Venv, name: str, op: lexer::TokenKind, rhs: Value) -> Venv {
         else        { rebuilt = teko::list::push(rebuilt, env.slots[j]) }
         j++
     }
-    Venv { slots= rebuilt; prog= env.prog; defers= env.defers; cells= env.cells }
+    Venv { slots= rebuilt; prog= env.prog; defers= env.defers; cells= env.cells; di_cache= env.di_cache }
 }
 
 // compound_apply — apply an assignment operator to `old` with `rhs`: a plain `=` stores rhs; a
@@ -2815,6 +2891,114 @@ fn find_class_method(env: Venv, class_name: str, method: str) -> FnHit? {
     null
 }
 
+/** (W10c/MEM-3) The VM's DI materializer — the mirror of codegen's `__di_materialize_<Impl>`. Strip
+ *  the prefix to the bare impl name, resolve its lifetime + zero-arg static factory, then build +
+ *  cache per lifetime: a `#singleton`/`#scoped` consults the threaded `di_cache` (a hit returns the
+ *  same ClassRef, giving shared identity), a `#transient` builds fresh. Keeps VM==native on
+ *  construction + identity; DI fixtures never observe destructor timing (the VM fires none). */
+fn vm_di_materialize(callee: str, env: Venv) -> EvalRes {
+    let impl_name = vm_di_impl_name(callee)
+    let kind = vm_di_kind_of(env, impl_name)
+    let id = checker::di_type_id(impl_name)
+    match kind {
+        parser::DiKind::Transient => vm_di_build(impl_name, env)
+        _ => vm_di_cached(impl_name, id, env)
+    }
+}
+
+/** (W10c/MEM-3) The bare impl name inside a `__di_materialize_<Impl>` callee. */
+fn vm_di_impl_name(callee: str) -> str {
+    teko::str::slice_from(callee, 17)
+}
+
+/** (W10c/MEM-3) The DI lifetime of the class named `impl_name` (its `di_kind`), or None. */
+fn vm_di_kind_of(env: Venv, impl_name: str) -> parser::DiKind {
+    mut i: u64 = 0
+    loop {
+        if i >= env.prog.items.len { break }
+        match env.prog.items[i] {
+            parser::TypeDecl as td => { if checker::name_last_segment(td.name) == impl_name { return td.di_kind } }
+            _ => {}
+        }
+        i++
+    }
+    parser::DiKind::None
+}
+
+/** (W10c/MEM-3) A cached (singleton/scoped) materialization: return the already-built instance on a
+ *  `di_cache` hit, else build it, cache the ClassRef's cell under the type-id, and return it. */
+fn vm_di_cached(impl_name: str, id: u64, env: Venv) -> EvalRes {
+    match vm_di_cache_lookup(env.di_cache, id) {
+        u64 as cell => return EvalRes { value= ClassRef { cell= cell }; env= env }
+        null => {}
+    }
+    let built = vm_di_build(impl_name, env)
+    match built.value {
+        ClassRef as cr => {
+            let cached = teko::list::push(built.env.di_cache, DiCell { type_id= id; cell= cr.cell })
+            return EvalRes { value= built.value; env= vm_with_di_cache(built.env, cached) }
+        }
+        _ => built
+    }
+}
+
+/** (W10c/MEM-3) Look up a cached DI instance's cell by type-id (null = miss). */
+fn vm_di_cache_lookup(cache: []DiCell, id: u64) -> u64? {
+    mut i: u64 = 0
+    loop {
+        if i >= cache.len { break }
+        if cache[i].type_id == id { return cache[i].cell }
+        i++
+    }
+    null
+}
+
+/** (W10c/MEM-3) Rebind the env's DI cache (threaded like `cells`). */
+fn vm_with_di_cache(env: Venv, cache: []DiCell) -> Venv {
+    Venv { slots= env.slots; prog= env.prog; defers= env.defers; cells= env.cells; di_cache= cache }
+}
+
+/** (W10c/MEM-3) Build one DI instance by invoking the impl's zero-arg static factory (found by
+ *  scanning the class's ClassBody), reusing the ordinary call path so the ClassRef is allocated
+ *  exactly as a normal `Impl::make()` would. */
+fn vm_di_build(impl_name: str, env: Venv) -> EvalRes {
+    let factory = match vm_di_factory_name(env, impl_name) { str as f => f; null => panic(teko::str::concat("vm: DI class has no zero-argument static factory: ", impl_name)) }
+    let hit = match find_class_method(env, impl_name, factory) { FnHit as h => h; null => panic(teko::str::concat("vm: DI factory not found: ", impl_name)) }
+    let callee = parser::Path { segments= teko::list::push(teko::list::push(teko::list::empty(), parser::Segment { name= impl_name }), parser::Segment { name= factory }) }
+    let call = checker::TCall { callee= callee; args= teko::list::empty(); call_ns= hit.func.namespace; is_closure_call= false; callee_type= checker::Void { }; is_iface_dispatch= false; iface_slot= 0 }
+    eval_call(call, env)
+}
+
+/** (W10c/MEM-3) The name of the class's zero-argument static factory, or null. */
+fn vm_di_factory_name(env: Venv, impl_name: str) -> str? {
+    mut i: u64 = 0
+    loop {
+        if i >= env.prog.items.len { break }
+        match env.prog.items[i] {
+            parser::TypeDecl as td => {
+                if checker::name_last_segment(td.name) == impl_name {
+                    match td.body { parser::ClassBody as cb => return vm_di_first_static(cb); _ => {} }
+                }
+            }
+            _ => {}
+        }
+        i++
+    }
+    null
+}
+
+/** (W10c/MEM-3) The first zero-parameter static method of a class body, or null. */
+fn vm_di_first_static(cb: parser::ClassBody) -> str? {
+    mut i: u64 = 0
+    loop {
+        if i >= cb.methods.len { break }
+        let m = cb.methods[i]
+        if m.params.len == 0 { return m.name }
+        i++
+    }
+    null
+}
+
 // (W10b.D3) DYNAMIC contract-method dispatch. The receiver (args[0]) evaluates ONCE; a class
 // instance IS the interface value in the VM (a ClassRef cell — no fat pointer needed, the cell's
 // struct payload carries the CONCRETE class name to dispatch on). The ORIGINAL ClassRef binds as
@@ -2881,6 +3065,9 @@ fn eval_iface_call(c: checker::TCall, env: Venv) -> StmtVal {
 }
 
 fn eval_call(c: checker::TCall, env: Venv) -> EvalRes {
+    if c.callee.segments.len == 1 && checker::is_di_materializer_call(c.callee.segments[0].name) {
+        return vm_di_materialize(c.callee.segments[0].name, env)
+    }
     // (W10b.D3) dynamic contract dispatch — FIRST, before builtin name-sniffing could collide
     // with a method name. Same guard in call_value (the VM twin-asymmetry rule).
     if c.is_iface_dispatch {
@@ -3031,9 +3218,11 @@ fn exec_block_ex(body: []checker::TStatement, env: Venv, is_fn_body: bool) -> Fl
     FlowEnv { flow= Normal { value= last }; env= drain_defers_to(e, base) }
 }
 
-// (W9.3 part 2) Is this statement a plain value-carrying expr-statement (NOT an `if`/`match`, which
-// run as control flow and self-route their own scope defers)? Used to detect a fn-body trailing value.
-fn is_plain_expr_stmt(s: checker::TStatement) -> bool {
+/** (W9.3 part 2) Is this statement a plain value-carrying expr-statement (NOT an `if`/`match`,
+    which run as control flow and self-route their own scope defers)? Used to detect a fn-body
+    trailing value. pub: teko::repl (DT3) reuses this to decide whether a session line's
+    result is printable. */
+pub fn is_plain_expr_stmt(s: checker::TStatement) -> bool {
     match s {
         checker::TExprStmt as x => {
             match x.expr {
@@ -3046,16 +3235,20 @@ fn is_plain_expr_stmt(s: checker::TStatement) -> bool {
     }
 }
 
-// One statement. Returns either Stepped(env', value) — a NORMAL step that threads the env
-// forward AND carries the statement's value (an expr-statement's result; `null` == none) —
-// or a Flow exit (VmReturn/Break/Continue). W5a: Stepped's `value` is how a NORMAL flow
-// carries its trailing value (the C `tk_flow.value` for a NORMAL kind); a block keeps the
-// LAST Stepped's value as its trailing value (B.20). The functional env (threaded via
-// Stepped) is the faithful Teko stand-in for the C's in-place env mutation.
-type Stepped = struct { env: Venv; value: Value? }
-type Exit    = struct { flow: Flow; env: Venv }   // env at the exit point: outer-`mut` mutations made
-                                                  // BEFORE a return/break/continue must survive the exit
-type Step    = variant Stepped | Exit
+/** a NORMAL step that threads the env forward AND carries the statement's value (an
+    expr-statement's result; `null` == none). W5a: `value` is how a NORMAL flow carries its
+    trailing value (the C `tk_flow.value` for a NORMAL kind); a block keeps the LAST Stepped's
+    value as its trailing value (B.20). The functional env (threaded via Stepped) is the
+    faithful Teko stand-in for the C's in-place env mutation. */
+pub type Stepped = struct { env: Venv; value: Value? }
+
+/** a Flow exit (VmReturn/Break/Continue): the env at the exit point (outer-`mut` mutations
+    made BEFORE the return/break/continue must survive the exit). */
+pub type Exit = struct { flow: Flow; env: Venv }
+
+/** one statement's outcome: either Stepped (see above) or an Exit. pub (Stepped/Exit/Flow
+    too): teko::repl (DT3) steps ONE statement at a time over a persisted Venv. */
+pub type Step = variant Stepped | Exit
 // FlowEnv — a Flow paired with the env AFTER running a block/if/match (block-locals already popped to
 // the enclosing scope; outer-`mut` mutations kept). The functional stand-in for the C's in-place env:
 // exec_block/exec_if/exec_match return it so a mutation INSIDE the block PROPAGATES to the caller (the
@@ -3064,7 +3257,9 @@ type Step    = variant Stepped | Exit
 // forever (the OOM cause for `bin/teko test`).
 type FlowEnv = struct { flow: Flow; env: Venv }
 
-fn exec_stmt(s: checker::TStatement, env: Venv) -> Step {
+/** pub: teko::repl (DT3) evaluates one incoming session statement at a time against its
+    persisted Venv, exactly like `run`'s own top-level loop below. */
+pub fn exec_stmt(s: checker::TStatement, env: Venv) -> Step {
     match s {
         checker::TBinding as b  => {
             // Only SimpleName is lowered for M0 (destructuring is the honest frontier).
@@ -3353,7 +3548,7 @@ fn run_loop(mylabel: str, body: []checker::TStatement, env: Venv) -> LoopOut {
             i = i + 1
         }
         e = drain_defers_to(e, dbase)   // (W9.3) fire this iteration's defers LIFO, then pop them
-        cur = Venv { slots = loop_outer(e.slots, base); prog = e.prog; defers= cur.defers; cells= e.cells }   // keep outer mutations (incl cell writes); drop locals
+        cur = Venv { slots = loop_outer(e.slots, base); prog = e.prog; defers= cur.defers; cells= e.cells; di_cache= e.di_cache }
         if exited {
             match exflow {
                 VmReturn as ret => return LoopOut { flow = ret; env = cur }
@@ -3390,12 +3585,12 @@ fn exec_if(e: checker::TExpr, env: Venv) -> FlowEnv {
             if c {
                 teko::cov_branch(e.line, e.col, 0)
                 let bo = exec_block(f.then_blk, cenv)
-                return FlowEnv { flow= bo.flow; env= Venv { slots= loop_outer(bo.env.slots, base); prog= bo.env.prog; defers= bo.env.defers; cells= bo.env.cells } }
+                return FlowEnv { flow= bo.flow; env= Venv { slots= loop_outer(bo.env.slots, base); prog= bo.env.prog; defers= bo.env.defers; cells= bo.env.cells; di_cache= bo.env.di_cache } }
             }
             teko::cov_branch(e.line, e.col, 1)
             if f.has_else {
                 let bo = exec_block(f.else_blk, cenv)
-                return FlowEnv { flow= bo.flow; env= Venv { slots= loop_outer(bo.env.slots, base); prog= bo.env.prog; defers= bo.env.defers; cells= bo.env.cells } }
+                return FlowEnv { flow= bo.flow; env= Venv { slots= loop_outer(bo.env.slots, base); prog= bo.env.prog; defers= bo.env.defers; cells= bo.env.cells; di_cache= bo.env.di_cache } }
             }
             FlowEnv { flow= Normal { value= null }; env= cenv }    // if-without-else taken false: no value, cells may have grown
         }
@@ -3670,6 +3865,12 @@ exp fn cov_cobertura(prog: checker::TProgram) -> str {
 // printed (so the user sees which test failed). All pass → print the count, return 0. An
 // empty suite (no `#test`) is NOT a failure — the build gate skips when absent.
 // ---------------------------------------------------------------------------
+/** cov_merge — (#265) union a child test binary's dumped `.tkcov` into THIS process's coverage
+    sinks, so the engine-independent static walk (functions_coverage/line_coverage/branch_coverage)
+    reads the native gate's coverage exactly as it read the VM's in-process marks. Returns true on a
+    successful merge. Backed by teko_rt.c's tk_cov_merge (the #168 cross-process protocol). */
+exp extern fn cov_merge(path: str) -> bool = "tk_cov_merge" from "teko_rt"
+
 exp fn run_tests(prog: checker::TProgram) -> i32 { run_tests_cov(prog, false, false, "") }
 
 // run_tests_cov — run_tests + optional Cobertura report. `gen_cov` enables BRANCH recording for the

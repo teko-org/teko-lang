@@ -1,0 +1,180 @@
+/** tooling/vscode/src/tm_gen.tks (namespace 'teko_grammar_gen_vscode' — same root as
+ *  main.tks) — the A2 TextMate grammar generator. Renders a `Spec` (read from A1's
+ *  grammar-spec.json) into `tooling/vscode/syntaxes/teko.tmLanguage.json`. Every pattern
+ *  below is DERIVED from the spec's fields, never a hand-typed keyword/operator list
+ *  (that was the exact defect the "Prior art" audit found in the pre-reboot
+ *  `extensions/vscode/syntaxes/teko.tmLanguage.json` — see TEKO_ROADMAP_TOOLING.md's
+ *  Eixo A intro).
+ *
+ *  escape a literal string for embedding inside a TextMate/Oniguruma regex alternation.
+ */
+fn regex_escape(s: str) -> str {
+    mut out = ""
+    mut i: u64 = 0
+    loop {
+        if i >= s.len { break }
+        let c = s[i]
+        let needs_escape = c == b'.' || c == b'*' || c == b'+' || c == b'?' || c == b'(' || c == b')' || c == b'[' || c == b']' || c == b'{' || c == b'}' || c == b'^' || c == b'$' || c == b'|' || c == b'\\' || c == b'/'
+        if needs_escape { out = out ~ "\\" }
+        out = out ~ one_char(c)
+        i++
+    }
+    out
+}
+
+/** the alternation pattern for a list of keyword texts, longest-first so a maximal-munch
+ *  regex engine (Oniguruma) never partial-matches a short entry before a longer one.
+ */
+fn keyword_alternation(keywords: []SpecKeyword) -> str {
+    let sorted = sort_by_length_desc_kw(keywords)
+    mut out = ""
+    mut i: u64 = 0
+    loop {
+        if i >= sorted.len { break }
+        if i > 0 { out = out ~ "|" }
+        out = out ~ regex_escape(sorted[i].text)
+        i++
+    }
+    out
+}
+
+fn sort_by_length_desc_kw(items: []SpecKeyword) -> []SpecKeyword {
+    mut out: []SpecKeyword = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= items.len { break }
+        out = insert_by_length_desc_kw(out, items[i])
+        i++
+    }
+    out
+}
+
+fn insert_by_length_desc_kw(sorted: []SpecKeyword, item: SpecKeyword) -> []SpecKeyword {
+    mut out: []SpecKeyword = teko::list::empty()
+    mut inserted = false
+    mut i: u64 = 0
+    loop {
+        if i >= sorted.len { break }
+        if !inserted && item.text.len > sorted[i].text.len {
+            out = teko::list::push(out, item)
+            inserted = true
+        }
+        out = teko::list::push(out, sorted[i])
+        i++
+    }
+    if !inserted { out = teko::list::push(out, item) }
+    out
+}
+
+/** the alternation pattern for every operator's exact spelling, longest-first. */
+fn operator_alternation(operators: []SpecOperator) -> str {
+    let sorted = sort_by_length_desc_op(operators)
+    mut out = ""
+    mut i: u64 = 0
+    loop {
+        if i >= sorted.len { break }
+        if i > 0 { out = out ~ "|" }
+        out = out ~ regex_escape(sorted[i].text)
+        i++
+    }
+    out
+}
+
+fn sort_by_length_desc_op(items: []SpecOperator) -> []SpecOperator {
+    mut out: []SpecOperator = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= items.len { break }
+        out = insert_by_length_desc_op(out, items[i])
+        i++
+    }
+    out
+}
+
+fn insert_by_length_desc_op(sorted: []SpecOperator, item: SpecOperator) -> []SpecOperator {
+    mut out: []SpecOperator = teko::list::empty()
+    mut inserted = false
+    mut i: u64 = 0
+    loop {
+        if i >= sorted.len { break }
+        if !inserted && item.text.len > sorted[i].text.len {
+            out = teko::list::push(out, item)
+            inserted = true
+        }
+        out = teko::list::push(out, sorted[i])
+        i++
+    }
+    if !inserted { out = teko::list::push(out, item) }
+    out
+}
+
+/** escape `s` for embedding inside a JSON string literal. */
+fn json_string(s: str) -> str {
+    mut out = "\""
+    mut i: u64 = 0
+    loop {
+        if i >= s.len { break }
+        let b = s[i]
+        if b == b'"'  { out = out ~ "\\\""; i++; continue }
+        if b == b'\\' { out = out ~ "\\\\"; i++; continue }
+        out = out ~ one_char(b)
+        i++
+    }
+    out ~ "\""
+}
+
+/** render the full `.tmLanguage.json` document from `spec`. */
+pub fn render_tm_grammar(spec: Spec) -> str {
+    let kw_pattern = "\\b(" ~ keyword_alternation(spec.keywords) ~ ")\\b"
+    let op_pattern = operator_alternation(spec.operators)
+    let line_comment_pattern = regex_escape(spec.line_comment) ~ ".*$"
+    let doc_comment_pattern = regex_escape(spec.doc_comment_open) ~ "[\\s\\S]*?\\*/"
+    let block_comment_pattern = regex_escape(spec.block_comment_open) ~ "[\\s\\S]*?\\*/"
+    let string_pattern = regex_escape(spec.string_delimiter) ~ "(\\\\.|[^\\\\\"])*" ~ regex_escape(spec.string_delimiter)
+    let byte_char_pattern = "\\b(" ~ regex_escape(spec.byte_literal_prefix) ~ "|" ~ regex_escape(spec.char_literal_prefix) ~ ")" ~ regex_escape(spec.byte_literal_delimiter) ~ "(\\\\.|[^\\\\'])*" ~ regex_escape(spec.byte_literal_delimiter)
+
+    mut out = "{\n"
+    out = out ~ "  \"$schema\": \"https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json\",\n"
+    out = out ~ "  \"name\": \"Teko\",\n"
+    out = out ~ "  \"scopeName\": \"source.tks\",\n"
+    out = out ~ "  \"patterns\": [\n"
+    out = out ~ "    { \"include\": \"#comments\" },\n"
+    out = out ~ "    { \"include\": \"#strings\" },\n"
+    out = out ~ "    { \"include\": \"#literals\" },\n"
+    out = out ~ "    { \"include\": \"#keywords\" },\n"
+    out = out ~ "    { \"include\": \"#operators\" }\n"
+    out = out ~ "  ],\n"
+    out = out ~ "  \"repository\": {\n"
+    out = out ~ "    \"comments\": {\n"
+    out = out ~ "      \"patterns\": [\n"
+    out = out ~ "        { \"name\": \"comment.block.documentation.teko\", \"match\": " ~ json_string(doc_comment_pattern) ~ " },\n"
+    out = out ~ "        { \"name\": \"comment.block.teko\", \"match\": " ~ json_string(block_comment_pattern) ~ " },\n"
+    out = out ~ "        { \"name\": \"comment.line.double-slash.teko\", \"match\": " ~ json_string(line_comment_pattern) ~ " }\n"
+    out = out ~ "      ]\n"
+    out = out ~ "    },\n"
+    out = out ~ "    \"strings\": {\n"
+    out = out ~ "      \"patterns\": [\n"
+    out = out ~ "        { \"name\": \"string.quoted.double.teko\", \"match\": " ~ json_string(string_pattern) ~ " }\n"
+    out = out ~ "      ]\n"
+    out = out ~ "    },\n"
+    out = out ~ "    \"literals\": {\n"
+    out = out ~ "      \"patterns\": [\n"
+    out = out ~ "        { \"name\": \"constant.character.teko\", \"match\": " ~ json_string(byte_char_pattern) ~ " },\n"
+    out = out ~ "        { \"name\": \"constant.numeric.teko\", \"match\": " ~ json_string(spec.number_binary_pattern) ~ " },\n"
+    out = out ~ "        { \"name\": \"constant.numeric.teko\", \"match\": " ~ json_string(spec.number_hex_pattern) ~ " },\n"
+    out = out ~ "        { \"name\": \"constant.numeric.teko\", \"match\": " ~ json_string(spec.number_decimal_pattern) ~ " }\n"
+    out = out ~ "      ]\n"
+    out = out ~ "    },\n"
+    out = out ~ "    \"keywords\": {\n"
+    out = out ~ "      \"patterns\": [\n"
+    out = out ~ "        { \"name\": \"keyword.control.teko\", \"match\": " ~ json_string(kw_pattern) ~ " }\n"
+    out = out ~ "      ]\n"
+    out = out ~ "    },\n"
+    out = out ~ "    \"operators\": {\n"
+    out = out ~ "      \"patterns\": [\n"
+    out = out ~ "        { \"name\": \"keyword.operator.teko\", \"match\": " ~ json_string(op_pattern) ~ " }\n"
+    out = out ~ "      ]\n"
+    out = out ~ "    }\n"
+    out = out ~ "  }\n"
+    out ~ "}\n"
+}

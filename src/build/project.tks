@@ -354,10 +354,47 @@ fn cc_family_is_clang(cc: str, binary: str) -> bool {
     is_clang
 }
 
+/**
+ * (C7.20) append_reachable_link_flags — the global `[extern.libs]` resolved link flags
+ * (`-l<name>` / paths / raw flags), appended to `argv` AFTER the sources so the linker
+ * resolves their symbols (link order). A flag is appended only when its originating key
+ * (m.link_lib_name, parallel to m.link_flags) is in `reachable` — extern-reachability: only a
+ * lib whose name is actually reached by a call from the program's own entry points earns a
+ * place on the link line, so a project that declares two [extern.libs] but only calls one of
+ * them's extern fns links just that one.
+ */
+fn append_reachable_link_flags(argv: []str, m: Manifest, reachable: []str) -> []str {
+    mut out = argv
+    mut li = 0
+    loop {
+        if li >= m.link_flags.len { break }
+        if name_in(reachable, m.link_lib_name[li]) { out = teko::list::push(out, m.link_flags[li]) }
+        li = li + 1
+    }
+    out
+}
+
+/**
+ * (C7.20) append_reachable_os_lib_flags — the DEFERRED per-OS `[extern.libs.<os>]` flags
+ * (C7.1f), appended to `argv` only when their OS matches `target_os` (host, or `[extern]
+ * target`) AND their originating key is in `reachable`. Resolved HERE (native), so manifest
+ * parse stays host-independent.
+ */
+fn append_reachable_os_lib_flags(argv: []str, m: Manifest, tos: str, reachable: []str) -> []str {
+    mut out = argv
+    mut oi = 0
+    loop {
+        if oi >= m.os_lib_os.len { break }
+        if m.os_lib_os[oi] == tos && name_in(reachable, m.os_lib_name[oi]) { out = teko::list::push(out, m.os_lib_flag[oi]) }
+        oi = oi + 1
+    }
+    out
+}
+
 // Run the host C compiler over `cfile`, producing `binary`. Full parity with driver.c::run_cc: cc
 // sees the runtime + assert dirs (-I) and compiles BOTH seed sources (teko_rt.c + assert.c) plus
 // -lm, in one reuse-the-host-toolchain invocation (M.5). Returns the cc exit code.
-fn run_cc(cfile: str, binary: str, m: Manifest) -> i32 {
+fn run_cc(cfile: str, binary: str, m: Manifest, prog: checker::TProgram) -> i32 {
     let rt = rt_dir()
     let asrt = assert_dir(rt)
     let cc = if m.cc.len > 0 { m.cc } else { "cc" }   // C7.1f: [extern] cc override
@@ -384,23 +421,10 @@ fn run_cc(cfile: str, binary: str, m: Manifest) -> i32 {
     argv = teko::list::push(argv, teko::str::concat(rt, "/teko_rt.c"))
     argv = teko::list::push(argv, teko::str::concat(asrt, "/assert.c"))
     if !m.freestanding { argv = teko::list::push(argv, "-lm") }   // libm (skipped under freestanding)
-    // C7.1e: the [extern.libs] resolved link flags (`-l<name>` / paths / raw flags), appended AFTER
-    // the sources so the linker resolves their symbols (link order). Already resolved by the manifest.
-    mut li = 0
-    loop {
-        if li >= m.link_flags.len { break }
-        argv = teko::list::push(argv, m.link_flags[li])
-        li = li + 1
-    }
-    // C7.1f: the DEFERRED per-OS [extern.libs.<os>] flags — appended only when their OS matches the
-    // target (host, or `[extern] target`). Resolved HERE (native), so manifest parse stays host-independent.
+    let reachable = reachable_libs(prog)
+    argv = append_reachable_link_flags(argv, m, reachable)
     let tos = target_os(m)
-    mut oi = 0
-    loop {
-        if oi >= m.os_lib_os.len { break }
-        if m.os_lib_os[oi] == tos { argv = teko::list::push(argv, m.os_lib_flag[oi]) }
-        oi = oi + 1
-    }
+    argv = append_reachable_os_lib_flags(argv, m, tos, reachable)
     // C7.1k: on macOS, embed an Info.plist section so the Mach-O carries native version metadata
     // (mdls / `Get Info` / `otool -s __TEXT __info_plist`). Best-effort — a plist write failure must
     // not break the build. (Windows VERSIONINFO + a Linux ELF note are the staged follow-ons.)
@@ -500,7 +524,7 @@ fn backend(dir: str, stem: str, out_dir: str, prog: checker::TProgram, m: Manife
         error as e => return fail(dir, e.message)
         null       => {}                              // error? — null = success
     }
-    if run_cc(cfile, binp, m) != 0 {
+    if run_cc(cfile, binp, m, prog) != 0 {
         return fail(dir, "cc failed to build the generated C")
     }
     // E3 — write the symbol map beside the binary (best-effort; a write error never fails the build —
@@ -548,22 +572,58 @@ fn probe_rt_dir(base: str) -> bool {
     false
 }
 
-// If TK_RT_DIR is unset, locate the in-tree runtime relative to the COMPILER BINARY's OWN
-// location (argv[0], via teko::env::args()) — NOT the current working directory (#64: a build
-// run from inside a project directory, or from an unrelated cwd via an absolute project path,
-// must still find teko_rt.c; CWD-relative probing only worked by coincidence when invoked from
-// the compiler's own source tree root). argv[0] is resolved to an absolute path against the
-// PRE-chdir cwd when it isn't already absolute (e.g. `./bin/teko` or a PATH-relative launch from
-// a shell that passes the resolved script path). Probe candidates from the binary's directory:
-// `<bindir>/..` (repo layout — `bin/teko` / `build/teko` sit one level under the tree root that
-// holds `src/runtime`) then `<bindir>` itself (a flat bundled-install layout). Pin TK_RT_DIR to
-// the ABSOLUTE match so run_cc still finds teko_rt.c after the front-end chdir's into the target
-// project. Falls back to the legacy CWD-relative probe (pre-#64 behavior) so a build invoked with
-// a bare `teko` resolved via $PATH (argv[0] not filesystem-resolvable) still works when cwd
-// happens to be the compiler's own tree. A general install pre-sets TK_RT_DIR; runtime BUNDLING
-// is Phase 7.
+/** home_dir — the current user's home directory: `$HOME` (POSIX) or `%USERPROFILE%` (Windows), whichever resolves first. "" when neither is set. */
+fn home_dir() -> str {
+    match teko::env::var("HOME") {
+        str as h => h
+        error    => match teko::env::var("USERPROFILE") { str as h => h; error => "" }
+    }
+}
+
+/** share_rt_bases — the (issue #157) installed-layout probe bases, in order: the per-user share dir (`<home>/.local/share/teko`, mirroring install.sh's `~/.local/bin` prefix) then the system-wide share dir (`/usr/local/share/teko`, mirroring `/usr/local/bin`). install.sh populates `<base>/runtime` + `<base>/assert` + `<base>/win32_compat.h` from the release's teko-bootstrap-src.tar.gz — the same sibling layout probe_rt_dir already expects from an in-tree checkout. */
+fn share_rt_bases() -> []str {
+    mut bases: []str = teko::list::empty()
+    let home = home_dir()
+    if home.len > 0 { bases = teko::list::push(bases, teko::str::concat(home, "/.local/share/teko")) }
+    bases = teko::list::push(bases, "/usr/local/share/teko")
+    bases
+}
+
+/** probe_share_rt_dir — true (and TK_RT_DIR set) when any (issue #157) installed-layout share dir carries a `runtime/teko_rt.h`. */
+fn probe_share_rt_dir() -> bool {
+    let bases = share_rt_bases()
+    mut i = 0
+    loop {
+        if i >= bases.len { break }
+        if probe_rt_dir(bases[i]) { return true }
+        i++
+    }
+    false
+}
+
+/**
+ * If TK_RT_DIR is unset, locate the in-tree runtime relative to the COMPILER BINARY's OWN
+ * location (argv[0], via teko::env::args()) — NOT the current working directory (#64: a build
+ * run from inside a project directory, or from an unrelated cwd via an absolute project path,
+ * must still find teko_rt.c; CWD-relative probing only worked by coincidence when invoked from
+ * the compiler's own source tree root). argv[0] is resolved to an absolute path against the
+ * PRE-chdir cwd when it isn't already absolute (e.g. `./bin/teko` or a PATH-relative launch from
+ * a shell that passes the resolved script path). Probe order:
+ *   1. `<bindir>/..` — the repo/tree root (`bin/teko` / `build/teko` sit one level under the
+ *      tree root that holds `src/runtime`).
+ *   2. `<bindir>` itself — a flat bundled-install layout.
+ *   3. the CWD (pre-#64 legacy behavior) — a bare `teko` resolved via $PATH (argv[0] not
+ *      filesystem-resolvable) still works when cwd happens to be the compiler's own tree.
+ *   4. (issue #157) the installed-layout share dirs (`probe_share_rt_dir`) — a released binary
+ *      copied to a bare `bin/` prefix by install.sh has no `src/runtime` sibling at all, so
+ *      none of the probes above can ever find it; install.sh instead stages the runtime
+ *      sources under `share/teko` beside the chosen bin prefix, and this is the last resort
+ *      that finds them.
+ * Each probe pins TK_RT_DIR to an ABSOLUTE match so run_cc still finds teko_rt.c after the
+ * front-end chdir's into the target project.
+ */
 fn ensure_rt_dir_abs() {
-    match teko::env::var("TK_RT_DIR") { str => return; error => {} }   // already set — honor it
+    match teko::env::var("TK_RT_DIR") { str => return; error => {} }
     let cwd = match teko::env::cwd() { str as c => c; error => "" }
 
     let argv = teko::env::args()
@@ -571,15 +631,16 @@ fn ensure_rt_dir_abs() {
         let exe_abs = abs_path_of(argv[0], cwd)
         if exe_abs.len > 0 {
             let bindir = dirname_of(exe_abs)
-            if probe_rt_dir(dirname_of(bindir)) { return }   // <bindir>/.. — the repo/tree root
-            if probe_rt_dir(bindir)             { return }   // <bindir>    — a flat bundled install
+            if probe_rt_dir(dirname_of(bindir)) { return }
+            if probe_rt_dir(bindir) { return }
         }
     }
 
-    if cwd.len > 0 { let _ = probe_rt_dir(cwd) }              // legacy fallback — cwd-relative probe
+    if cwd.len > 0 && probe_rt_dir(cwd) { return }
+    let _ = probe_share_rt_dir()
 }
 
-fn compile_project(dir: str, out_dir: str) -> i32 { compile_project_g(dir, out_dir, false) }
+fn compile_project(dir: str, out_dir: str) -> i32 { compile_project_g(dir, out_dir, false, false, false) }
 
 // (#148) report_peak — the compiler prints its own memory cost at the end of a successful build
 // (peak RSS via teko::mem::peak_rss; 0 = unavailable on this host → print suppressed).
@@ -611,59 +672,169 @@ fn strip_tests(prog: checker::TProgram) -> checker::TProgram {
     checker::TProgram { items = kept }
 }
 
-// compile_project_g — the build with the D4 TEST GATE (ALWAYS ON; `--no-test` is IGNORED for a
-// build — a release MUST run its tests). Assemble WITH the `.tkt` tests, run them on the VM FIRST
-// (fail-fast — a failed assertion panics, aborting the build before any emission), THEN codegen the
-// production program (tests stripped). The ONLY skip is a project with NO `#test` functions. (D4 —
-// tests gate emission; release bars on fail.)
-fn compile_project_g(dir: str, out_dir: str, gen_cov: bool) -> i32 {
-    ensure_rt_dir_abs()   // pin the runtime to an absolute path BEFORE the front-end chdir's
-    // D4 gate (STRICT): enter the project ONCE, assemble WITH the tests. If `.tkt` tests exist they
-    // MUST assemble, RUN, all pass, AND meet the coverage threshold — otherwise the build is BLOCKED.
-    // The ONLY skip is a project with NO tests (no `#test`): then the gate is ignored and we build.
+/** Hand `prog` to the backend and, on success, report the build's peak memory cost (#148). The
+ *  shared tail of every build path once its program is final: no tests present, the
+ *  `--no-verify` escape hatch, and the gate's own release rebuild. */
+fn codegen_and_report(dir: str, out_dir: str, prog: checker::TProgram, m: Manifest) -> i32 {
+    let rc = backend(dir, m.name, out_dir, prog, m)
+    if rc == 0 { report_peak() }
+    rc
+}
+
+/** Assemble WITHOUT the `.tkt` tests and codegen straight away, skipping the D4 gate entirely
+ *  (issue #249 lever A: `--no-verify`). Used only when the caller has explicitly opted out of
+ *  re-verification — e.g. a self-host release chain re-proving the fixpoint on gen-2, where the
+ *  `.tkt` gate outcome is already known deterministic from gen-1. */
+fn build_ungated(dir: str, out_dir: str) -> i32 {
+    let fe = match frontend_body(false, false) { Frontend as f => f; error as e => return fail(dir, e.message) }
+    codegen_and_report(dir, out_dir, fe.prog, fe.manifest)
+}
+
+/** Check the D4 coverage floors (from the `.tkp` [coverage] section; default 80/80/80) against
+ *  `fe`'s recorded function/line/branch coverage. Returns 0 when every floor is met, else the
+ *  first failing floor's `fail` status (BLOCKED — the build stops here). Extracted from run_gate
+ *  so each floor check is one guard clause instead of three nested arms. */
+fn coverage_gate_result(dir: str, fe: Frontend) -> i32 {
+    let fcov = vm::coverage_pct(fe.prog)
+    if fcov < fe.manifest.cov_functions {
+        return fail(dir, $"function coverage {fcov}% is below the {fe.manifest.cov_functions}% floor ([coverage] functions) — add tests")
+    }
+    let lcov = vm::line_coverage_pct(fe.prog)
+    if lcov < fe.manifest.cov_lines {
+        return fail(dir, $"line coverage {lcov}% is below the {fe.manifest.cov_lines}% floor ([coverage] lines) — add tests")
+    }
+    let bcov = vm::branch_coverage_pct(fe.prog)
+    if bcov < fe.manifest.cov_branches {
+        return fail(dir, $"branch coverage {bcov}% is below the {fe.manifest.cov_branches}% floor ([coverage] branches) — add tests")
+    }
+    0
+}
+
+/** native_function_floor — the FUNCTION-coverage floor, the metric the native gate populates fully via
+    the child's per-fn `tk_cov_mark` dump (#265). The native runner marks a fn ENTERED, exactly as the
+    VM's eval_call does; line/branch instrumentation (per-expression `tk_cov_line`/`tk_cov_branch` under
+    TestCov) is not yet emitted, so those two floors are enforced on the VM lane (`teko test .`) that
+    the ratified governance keeps as a required CI job. */
+fn native_function_floor(dir: str, fe: Frontend) -> i32 {
+    let fcov = vm::coverage_pct(fe.prog)
+    if fcov < fe.manifest.cov_functions {
+        return fail(dir, $"function coverage {fcov}% is below the {fe.manifest.cov_functions}% floor ([coverage] functions) — add tests")
+    }
+    0
+}
+
+/** run_native_gate — (#265, lever D of #249) the D4 test gate run NATIVELY: emit a test-profile C
+ *  translation unit whose `main()` calls each `#test` in order, compile it with the SAME `run_cc`
+ *  the build uses, run the resulting binary (a failed assert panics → non-zero exit, fail-fast M.1),
+ *  and — cov ALWAYS on for the gate, to feed the floors — merge the child's dumped `.tkcov` into
+ *  this process's coverage sinks. The engine-independent static walk (vm::*_coverage_pct) then reads
+ *  those merged sinks exactly as it read the VM's in-process marks. Replaces the 15.6 s VM interpret
+ *  of the test bodies (issue #265 measurement) with a sub-second native run. */
+fn run_native_gate(dir: str, out_dir: str, prog: checker::TProgram, m: Manifest) -> i32 {
+    let od = if out_dir.len > 0 && out_dir[out_dir.len - 1] == b'/' { teko::str::slice_to(out_dir, out_dir.len - 1) } else { out_dir }
+    match teko::fs::mkdir(od) { error => return fail(dir, "cannot create the output directory"); null => {} }
+    let stem = teko::str::concat(m.name, "-tktest")
+    let cfile = teko::str::concat(od, "/", teko::str::concat(stem, ".c"))
+    let binp = teko::str::concat(od, "/", stem)
+    let covfile = teko::str::concat(od, "/", teko::str::concat(stem, ".tkcov"))
+    let emitted = match codegen::tk_emit_c_test(prog, true) { str as s => s; error as e => return fail(dir, e.message) }
+    let csrc = teko::str::concat(emitted, codegen::tk_emit_meta(m.name, m.version, m.suffix, m.description))
+    match teko::io::write_file(cfile, csrc) { error as e => return fail(dir, e.message); null => {} }
+    if run_cc(cfile, binp, m, prog) != 0 {
+        return fail(dir, "cc failed to build the native test gate")
+    }
+    match teko::env::set_var("TEKO_TKCOV", covfile) { error => {}; null => {} }
+    mut argv: []str = teko::list::push(teko::list::empty(), binp)
+    let trc = teko::process::run(argv)
+    if trc != 0 { return trc }
+    let _ = vm::cov_merge(covfile)
+    0
+}
+
+/** The `--coverage` output path ("<out_dir>/cobertura.xml", creating `out_dir` first) when
+ *  `gen_cov` is set, else "" (vm::run_tests_cov treats an empty path as "don't write"). */
+fn cobertura_path_of(out_dir: str, gen_cov: bool) -> str {
+    if !gen_cov { return "" }
+    let _ = teko::fs::mkdir(out_dir)
+    teko::str::concat(out_dir, "/cobertura.xml")
+}
+
+/** (#151) Re-front-end WITHOUT the `.tkt` files for the RELEASE program (`quiet` = the file map
+ *  was already printed by the gate's first pass), strip any surviving `#test` functions by
+ *  provenance, and hand the clean program to the backend. */
+fn release_build_of(dir: str, out_dir: str) -> i32 {
+    let rel = match frontend_body(false, true) { Frontend as f => f; error as e => return fail(dir, e.message) }
+    codegen_and_report(dir, out_dir, strip_tests(rel.prog), rel.manifest)
+}
+
+/** run_gate_vm — the D4 test-gate body run on the VM (the DEFAULT engine, #265): run every `#test`
+ *  interpreted (fail-fast), enforce all three coverage floors (coverage_gate_result — the VM's
+ *  in-process marks cover function/line/branch fully), then rebuild the release program. This is the
+ *  pre-#265 gate verbatim — unchanged cost, unchanged floors — so a plain `teko . -o out` regresses
+ *  NOTHING: the native gate (run_gate_native) is opt-in only (native_gate_of / TEKO_NATIVE_GATE=1). */
+fn run_gate_vm(dir: str, out_dir: str, gen_cov: bool, fe: Frontend) -> i32 {
+    let trc = vm::run_tests_cov(fe.prog, true, gen_cov, cobertura_path_of(out_dir, gen_cov))
+    if trc != 0 { return trc }
+    let gate_rc = coverage_gate_result(dir, fe)
+    if gate_rc != 0 { return gate_rc }
+    release_build_of(dir, out_dir)
+}
+
+/** run_gate_native — the D4 test-gate body run NATIVELY (#265, OPT-IN via `--native-gate` /
+ *  `TEKO_NATIVE_GATE=1`): run every `#test` compiled-native (run_native_gate, fail-fast), enforce the
+ *  FUNCTION-coverage floor from the native run's merged marks (native_function_floor); line/branch
+ *  floors are NOT enforced here (native has no per-expression instrumentation yet — a real corpus
+ *  build wanting the full three floors should also run the VM lane, `teko test .`). Until #168's
+ *  partitioning makes a single native run cheaper than the VM interpret it replaces, this path is
+ *  SLOWER than run_gate_vm on a large corpus — hence opt-in, not the default (owner ruling 2026-07-05). */
+fn run_gate_native(dir: str, out_dir: str, gen_cov: bool, fe: Frontend) -> i32 {
+    let trc = run_native_gate(dir, out_dir, fe.prog, fe.manifest)
+    if trc != 0 { return trc }
+    let gate_rc = native_function_floor(dir, fe)
+    if gate_rc != 0 { return gate_rc }
+    if gen_cov {
+        let xml = vm::cov_cobertura(fe.prog)
+        let cov_path = cobertura_path_of(out_dir, gen_cov)
+        match teko::io::write_file(cov_path, xml) { error => {}; null => {} }
+        teko::io::println(teko::str::concat("teko: wrote coverage report ", cov_path))
+    }
+    release_build_of(dir, out_dir)
+}
+
+/** The D4 test-gate body proper: dispatch to the VM gate (default) or the native gate (opt-in,
+ *  `native_gate` — #265). Split out of compile_project_g so the `no_verify` short-circuit stays a
+ *  single early return instead of nesting the whole gate one level deeper. */
+fn run_gate(dir: str, out_dir: str, gen_cov: bool, native_gate: bool, fe: Frontend) -> i32 {
+    if native_gate { return run_gate_native(dir, out_dir, gen_cov, fe) }
+    run_gate_vm(dir, out_dir, gen_cov, fe)
+}
+
+/** No `#test` functions at all: ignore the gate, build the production program straight from the
+ *  already-assembled `fe` (no test code present to strip or verify). */
+fn build_no_tests_present(dir: str, out_dir: str, fe: Frontend) -> i32 { codegen_and_report(dir, out_dir, fe.prog, fe.manifest) }
+
+/** The build with the D4 TEST GATE (ON BY DEFAULT; `--no-test` is IGNORED for a build — a release
+ *  MUST run its tests). Assemble WITH the `.tkt` tests, run them on the gate engine FIRST (fail-fast
+ *  — a failed assertion aborts the build before any emission), THEN codegen the production program
+ *  (tests stripped, run_gate). `native_gate` selects the engine (false = VM, the untouched default
+ *  cost/floors; true = native, opt-in — #265). The ONLY skips are a project with NO `#test` functions
+ *  (build_no_tests_present), or an explicit `no_verify=true` (issue #249 lever A — `--no-verify`,
+ *  build_ungated): a CI-only escape hatch for a self-host chain that has ALREADY proven the gate
+ *  on an earlier generation and only needs the fixpoint (`gen2.c == gen3.c`), not a second full
+ *  re-verification. `no_verify` changes NOTHING when false — the untouched default. */
+fn compile_project_g(dir: str, out_dir: str, gen_cov: bool, no_verify: bool, native_gate: bool) -> i32 {
+    ensure_rt_dir_abs()
     match teko::env::chdir(dir) { error => return fail(dir, "cannot enter project directory"); null => {} }
+    if no_verify {
+        return build_ungated(dir, out_dir)
+    }
     match frontend_body(true, false) {
         Frontend as fe => {
             if !has_tests(fe.prog) {
-                // No tests at all → ignore the gate, build the production program (no test code present).
-                let nrc = backend(dir, fe.manifest.name, out_dir, fe.prog, fe.manifest)
-                if nrc == 0 { report_peak() }   // (#148) the compiler reports its own memory cost
-                return nrc
+                return build_no_tests_present(dir, out_dir, fe)
             }
-            // The gate ALWAYS records lines+branches (for the floors); `--coverage` additionally emits
-            // <out_dir>/cobertura.xml (mkdir the dir first — idempotent). A failed assert panics here
-            // (fail-fast) → BLOCKS the build.
-            let cov_path = if gen_cov { let _ = teko::fs::mkdir(out_dir); teko::str::concat(out_dir, "/cobertura.xml") } else { "" }
-            let trc = vm::run_tests_cov(fe.prog, true, gen_cov, cov_path)
-            if trc != 0 { return trc }
-            // D4 coverage floors (from the `.tkp` [coverage] section; default 80/80/80): the build is
-            // BLOCKED when FUNCTION, LINE, or BRANCH coverage is below its floor.
-            let fcov = vm::coverage_pct(fe.prog)
-            if fcov < fe.manifest.cov_functions {
-                return fail(dir, $"function coverage {fcov}% is below the {fe.manifest.cov_functions}% floor ([coverage] functions) — add tests")
-            }
-            let lcov = vm::line_coverage_pct(fe.prog)
-            if lcov < fe.manifest.cov_lines {
-                return fail(dir, $"line coverage {lcov}% is below the {fe.manifest.cov_lines}% floor ([coverage] lines) — add tests")
-            }
-            let bcov = vm::branch_coverage_pct(fe.prog)
-            if bcov < fe.manifest.cov_branches {
-                return fail(dir, $"branch coverage {bcov}% is below the {fe.manifest.cov_branches}% floor ([coverage] branches) — add tests")
-            }
-            // (#151) RE-FRONT-END without the `.tkt` files for the RELEASE program: strip_tests only
-            // removes `#test` FUNCTIONS — types/classes/vtables/helpers declared in .tkt files
-            // survived into the production binary (dead-strip inventory: ~217 test symbols).
-            // Re-assembling without tests removes them by PROVENANCE (the .tkt files are never even
-            // parsed into this program). quiet=true: the file map was already printed by the first
-            // pass. strip_tests stays as a belt (a no-op here — no .tkt items exist to carry #test).
-            let rel = match frontend_body(false, true) { Frontend as f => f; error as e => return fail(dir, e.message) }
-            let grc = backend(dir, rel.manifest.name, out_dir, strip_tests(rel.prog), rel.manifest)
-            if grc == 0 { report_peak() }   // (#148) the compiler reports its own memory cost
-            grc
+            run_gate(dir, out_dir, gen_cov, native_gate, fe)
         }
-        // `.tkt` tests (or the production code) could not be ASSEMBLED/typechecked. With tests present,
-        // that is a hard BUILD FAILURE — no graceful degradation (the gate is strict; only a project
-        // with NO `.tkt` files skips tests).
         error as e => return fail(dir, e.message)
     }
 }
@@ -710,13 +881,47 @@ fn coverage_of(args: []str) -> bool {
     false
 }
 
-// the FIRST non-flag positional (the project) from `start`, or "" if none (the caller reports).
+/** (Issue #249 lever A) does `--no-verify` appear in the args? A `build` normally ALWAYS runs the
+ *  D4 `.tkt` gate first (unchanged default); this flag skips it entirely, emitting straight to
+ *  codegen. Intended for a self-host release chain that has already proven the gate on an earlier
+ *  generation and only needs to re-prove the fixpoint — NOT for everyday builds (skipping the
+ *  gate means the binary is unverified). */
+fn no_verify_of(args: []str) -> bool {
+    mut i: u64 = 0
+    loop {
+        if i >= args.len { break }
+        if args[i] == "--no-verify" { return true }
+        i = i + 1
+    }
+    false
+}
+
+/** (#265) does the build request the NATIVE test gate — `--native-gate` in the args, or
+ *  `TEKO_NATIVE_GATE=1` in the environment (the CI-lane escape hatch, no arg-list plumbing needed)?
+ *  OPT-IN only: the VM gate is the untouched default (same cost/floors as before #265) until #168's
+ *  partitioning makes a single native run cheaper than the VM interpret it replaces. */
+fn native_gate_of(args: []str) -> bool {
+    mut i: u64 = 0
+    loop {
+        if i >= args.len { break }
+        if args[i] == "--native-gate" { return true }
+        i = i + 1
+    }
+    match teko::env::var("TEKO_NATIVE_GATE") { str as v => v == "1"; error => false }
+}
+
+/** The FIRST non-flag positional (the project) from `start`, or "" if none (the caller reports).
+ *  Skips `-o <dir>` (and its value), `--no-test` (D4; currently ignored), `--no-verify` (#249 lever
+ *  A), and `--native-gate` (#265) — every recognized build flag — so none of them is mistaken for
+ *  the project argument. */
 fn project_arg_of(args: []str, start: u64) -> str {
     mut i = start
     loop {
         if i >= args.len { break }
-        if args[i] == "-o" { i = i + 2 }            // skip `-o` and its value
-        else if args[i] == "--no-test" { i = i + 1 }   // skip the gate flag (D4)
+        if args[i] == "-o" { i = i + 2 }
+        else if args[i] == "--no-test" { i = i + 1 }
+        else if args[i] == "--no-verify" { i = i + 1 }
+        else if args[i] == "--native-gate" { i = i + 1 }
         else { return args[i] }
     }
     ""
@@ -743,5 +948,7 @@ fn run_project(dir: str) -> i32 {
 // since the front-end has chdir'd into the project; `teko test` has no `-o` output dir).
 fn test_project(dir: str, gen_cov: bool) -> i32 {
     let fe = match project_frontend_sel(dir, true) { Frontend as x => x; error as e => return fail(dir, e.message) }
-    if gen_cov { vm::run_tests_cov(fe.prog, true, true, "cobertura.xml") } else { vm::run_tests(fe.prog) }
+    let trc = if gen_cov { vm::run_tests_cov(fe.prog, true, true, "cobertura.xml") } else { vm::run_tests_cov(fe.prog, true, false, "") }
+    if trc != 0 { return trc }
+    coverage_gate_result(dir, fe)
 }

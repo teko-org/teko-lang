@@ -846,8 +846,10 @@ static void *tk_free_take(size_t an) {
 // process exit (tk_regions_free_all). Off (the default): one predicted int compare per alloc.
 // =========================================================================
 #if !defined(_WIN32)
-#include <dlfcn.h>      /* dladdr — call-site symbolization for the obs tables (POSIX-only) */
-#include <execinfo.h>   /* (#148 RA2) backtrace — grand-caller attribution of LARGE push grows */
+#include <dlfcn.h>      /* dladdr — call-site symbolization for the obs tables (POSIX, incl. musl) */
+#endif
+#ifdef TK_HAVE_BACKTRACE
+#include <execinfo.h>   /* (#148 RA2) backtrace — glibc/macOS only; musl has no execinfo */
 #endif
 #define TK_OBS_CAP 16384                       // open-addressed site table (power of two)
 typedef struct { void *ra; unsigned long long bytes, count; } tk_obs_site;
@@ -1273,6 +1275,43 @@ tk_ffi_sres tk_rt_read_file(tk_str path) {
     return (tk_ffi_sres){ .ok = true, .value = (tk_str){ buf, n } };
 }
 
+// (DT3) tk_rt_stdin_eof_flag — set by the LAST tk_rt_read_line call: true iff it read zero
+// bytes before hitting EOF (stdin fully exhausted). A plain `bool`/`str` return (not the
+// {ok,value,err} FFI-lift shape) so a brand-new host primitive stays lowerable by ANY codegen
+// generation — new/unrecognized `str | error`-shaped externs need a per-name lift the SEED's
+// frozen codegen.c cannot learn post-release (the bootstrap-seed constraint); a direct `bool`/
+// `str` return needs no lift at all (mirrors tk_rt_os/tk_rt_version's already-working shape).
+static bool tk_rt_stdin_eof_flag = false;
+
+// (DT3) tk_rt_stdin_eof() — teko::io::stdin_eof(): did the LAST read_line() hit real EOF (no
+// more input at all)? Read this AFTER an empty read_line() result to tell "EOF" from "a blank
+// line" (both yield an empty str).
+bool tk_rt_stdin_eof(void) { return tk_rt_stdin_eof_flag; }
+
+// (DT3) tk_rt_read_line — one line from stdin, byte-at-a-time (portable — no POSIX-only
+// getline needed). Stops at '\n' (consumed, not kept) or EOF; a trailing '\r' (a Windows
+// "\r\n" source piped in) is also stripped. Sets tk_rt_stdin_eof_flag when zero bytes were
+// read before EOF (the "no more input" case — an empty str otherwise means a genuine blank
+// line); EOF after at least one byte still yields that final, unterminated line (matches a
+// shell's own paste-without-trailing-newline behavior) and leaves the EOF flag false.
+tk_str tk_rt_read_line(void) {
+    tk_byte_list acc = tk_byte_list_empty();
+    bool saw_any = false;
+    for (;;) {
+        int ch = fgetc(stdin);
+        if (ch == EOF) break;
+        saw_any = true;
+        if (ch == '\n') break;
+        acc = tk_byte_list_push(acc, (tk_byte)ch);
+    }
+    tk_rt_stdin_eof_flag = !saw_any;
+    if (acc.len > 0 && acc.ptr[acc.len - 1] == '\r') acc.len = acc.len - 1;
+    tk_byte *buf = (tk_byte *)tk_alloc(acc.len ? acc.len : 1);
+    if (acc.len) memcpy(buf, acc.ptr, acc.len);
+    tk_byte_list_free(acc);
+    return (tk_str){ buf, acc.len };
+}
+
 tk_ffi_sres tk_rt_getenv(tk_str name) {
     char *n = tk_cstr(name);
     const char *v = getenv(n);
@@ -1641,6 +1680,85 @@ bool tk_cov_line_hit(uint64_t fn, uint32_t line) {
     return false;
 }
 
+// D3-cross-process (#265, reuse of the #168 .tkcov protocol) — the native test gate runs the tests in
+// a CHILD process, so its three coverage sinks live in the child. The child dumps them to a `.tkcov`
+// file at exit; the parent (the compiler) MERGES that file into ITS sinks, then runs the same static
+// walk + floors it always ran. The coverage id is the prog.items index in BOTH processes (they share
+// the same TProgram), so the packed branch/line ids are process-portable and just re-inserted.
+// File layout (host byte order — parent and child are the same build): magic "TKCOV1\0\0", then three
+// (count:u64, ids:u64[count]) sections in order fns / branches / lines.
+
+// tk_line_insert_raw — insert a pre-packed line id (from a merge), bypassing the tk_lines_on gate and
+// the fn-stack packing tk_cov_line uses. Same open-addressing set as tk_cov_line.
+static void tk_line_insert_raw(uint64_t id) {
+    if (id == 0) return;
+    if (tk_line_cap == 0) tk_line_rehash(1024);
+    else if (tk_line_n * 2 >= tk_line_cap) tk_line_rehash(tk_line_cap * 2);
+    uint64_t h = (id * 1099511628211ull) & (tk_line_cap - 1);
+    while (tk_line_ids[h]) { if (tk_line_ids[h] == id) return; h = (h + 1) & (tk_line_cap - 1); }
+    tk_line_ids[h] = id; tk_line_n += 1;
+}
+
+static bool tk_cov_write_section(FILE *f, const uint64_t *ids, uint64_t n) {
+    if (fwrite(&n, sizeof n, 1, f) != 1) return false;
+    if (n && fwrite(ids, sizeof *ids, n, f) != n) return false;
+    return true;
+}
+
+void tk_cov_dump(const char *path) {
+    FILE *f = fopen(path, "wb");
+    if (!f) return;
+    static const char magic[8] = { 'T','K','C','O','V','1','\0','\0' };
+    if (fwrite(magic, 1, 8, f) != 8) { fclose(f); return; }
+    (void)tk_cov_write_section(f, tk_cov_ids, tk_cov_n);
+    (void)tk_cov_write_section(f, tk_covb_ids, tk_covb_n);
+    // lines are a sparse hash table — compact the non-empty slots into a temporary contiguous array.
+    uint64_t *lines = NULL;
+    uint64_t ln = 0;
+    if (tk_line_n) {
+        lines = (uint64_t *)malloc(tk_line_n * sizeof *lines);
+        if (lines) {
+            for (uint64_t i = 0; i < tk_line_cap; i += 1) { if (tk_line_ids[i]) lines[ln++] = tk_line_ids[i]; }
+        }
+    }
+    (void)tk_cov_write_section(f, lines, ln);
+    free(lines);
+    fclose(f);
+}
+
+static uint64_t *tk_cov_read_section(FILE *f, uint64_t *out_n) {
+    uint64_t n = 0;
+    *out_n = 0;
+    if (fread(&n, sizeof n, 1, f) != 1) return NULL;
+    if (n == 0) return NULL;
+    uint64_t *ids = (uint64_t *)malloc(n * sizeof *ids);
+    if (!ids) return NULL;
+    if (fread(ids, sizeof *ids, n, f) != n) { free(ids); return NULL; }
+    *out_n = n;
+    return ids;
+}
+
+bool tk_cov_merge(tk_str path) {
+    char *cpath = (char *)tk_cstr_dup(path);
+    FILE *f = fopen(cpath, "rb");
+    free(cpath);
+    if (!f) return false;
+    char magic[8];
+    if (fread(magic, 1, 8, f) != 8 || memcmp(magic, "TKCOV1\0\0", 8) != 0) { fclose(f); return false; }
+    uint64_t n = 0;
+    uint64_t *fns = tk_cov_read_section(f, &n);
+    for (uint64_t i = 0; i < n; i += 1) tk_cov_mark(fns[i]);
+    free(fns);
+    uint64_t *br = tk_cov_read_section(f, &n);
+    for (uint64_t i = 0; i < n; i += 1) tk_covb_add(br[i]);
+    free(br);
+    uint64_t *ln = tk_cov_read_section(f, &n);
+    for (uint64_t i = 0; i < n; i += 1) tk_line_insert_raw(ln[i]);
+    free(ln);
+    fclose(f);
+    return true;
+}
+
 // --- amortized growable push (the teko::list::push lowering — see teko_rt.h) ---
 // Each growing buffer's spare capacity is tracked in a POINTER-KEYED HASH of live tails (single-probe,
 // O(1) lookup). A push to a recorded live tail (same ptr + length witness + element size, spare cap)
@@ -1710,7 +1828,7 @@ void *tk_slice_push_r(const void *ptr, uint64_t len, const void *elem, uint64_t 
             tk_obs_miss[why] += 1;
             if (cap * esz > (1u << 20)) tk_obs_miss_big[why] += 1;
         }
-#if !defined(_WIN32)
+#ifdef TK_HAVE_BACKTRACE
         if (cap * esz > 4096) {   // (#148 RA2) the expensive grows: attribute the append helper's CALLER
             void *fr[6]; int nf = backtrace(fr, 6);
             int idx = 2 + hop;    // fr[0]=this fn, fr[1]=wrapper|caller, fr[2+hop]=the helper's caller
@@ -1817,7 +1935,7 @@ void *tk_slice_push_fo(const void *ptr, uint64_t len, const void *elem, uint64_t
         if (fo_max >= 0) {
             if (fo_count >= fo_max) return buf;              // parking budget exhausted — plain push
             fo_count += 1;
-#if !defined(_WIN32)
+#ifdef TK_HAVE_BACKTRACE
             if (fo_count == fo_max && getenv("TEKO_FO_TRACE")) {
                 void *fr[8]; int nf = backtrace(fr, 8);
                 fprintf(stderr, "== FO park #%lld ==\n", fo_count);

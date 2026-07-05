@@ -17,8 +17,15 @@ fn pos_names(n: u64) -> []str {
     loop { if i >= n { break }; out = teko::list::push(out, ""); i++ }
     out
 }
-fn st(e: parser::Expr) -> parser::Statement { parser::ExprStmt { expr = e } }   // an expr-statement
+/** st — an expr-statement wrapping `e`, widened to the `Statement` variant. */
+fn st(e: parser::Expr) -> parser::Statement { parser::ExprStmt { expr = e } }
 fn one_stmt(e: parser::Expr) -> []parser::Statement { teko::list::push(teko::list::empty(), st(e)) }
+/** ret_stmt — a `return e` statement widened to the `Statement` variant, so a `[]Statement` built
+    from it carries the correct element type (native codegen keys a slice's element type on the
+    pushed value's type; #265's native gate cc-compiles these test bodies for the first time). */
+fn ret_stmt(e: parser::Expr) -> parser::Statement { parser::Return { has_value = true; value = e } }
+/** loop_stmt — a `loop { body }` statement widened to the `Statement` variant (see ret_stmt). */
+fn loop_stmt(body: []parser::Statement) -> parser::Statement { parser::LoopStmt { label = ""; body = body } }
 fn path1(name: str) -> parser::Path { parser::Path { segments = teko::list::push(teko::list::empty(), parser::Segment { name = name }) } }
 fn named_t(name: str) -> parser::TypeExpr { parser::NamedType { path = path1(name); args = teko::list::empty() } }
 
@@ -27,7 +34,7 @@ fn u32t()  -> Type { Prim { kind = PrimKind::U32 } }
 fn u8t()   -> Type { Prim { kind = PrimKind::U8 } }
 fn i64t()  -> Type { Prim { kind = PrimKind::I64 } }
 fn boolt() -> Type { Prim { kind = PrimKind::Bool } }
-fn empty_env()   -> Env       { Env { base = teko::list::empty(); bindings = teko::list::empty(); cur_ns = ""; owner_type = "" } }   // (#148) two-segment env
+fn empty_env()   -> Env       { Env { base = teko::list::empty(); bindings = teko::list::empty(); cur_ns = ""; owner_type = ""; di = DiRegistry { providers = teko::list::empty() }; injects = teko::list::empty() } }
 fn empty_table() -> TypeTable { teko::list::empty() }
 fn prim_is(t: Type, k: PrimKind) -> bool { match t { Prim as p => p.kind == k; _ => false } }
 
@@ -223,7 +230,7 @@ fn types_match() {
 fn mk_fn(name: str, ret: parser::TypeExpr, body: []parser::Statement) -> parser::Function {
     let p = parser::Param { name = "x"; has_type = true; type_ann = named_t("u32"); is_params = false ; has_default = false; default_expr = e_num(0) }
     let params = teko::list::push(teko::list::empty(), p)
-    parser::Function { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = params; has_return = true; return_type = ret; body = body; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false }
+    parser::Function { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = params; has_return = true; return_type = ret; body = body; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false; has_inject = false; injects = teko::list::empty() }
 }
 
 #test
@@ -389,7 +396,7 @@ fn revalidate_rederives_byte_casts() {
 fn foo_decl() -> parser::TypeDecl {
     let fld = parser::Field { name = "token"; type_ann = named_t("u8") ; vis = parser::Visibility::Pub; is_intern = false }
     let fields = teko::list::push(teko::list::empty(), fld)
-    parser::TypeDecl { name = "Foo"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::StructBody { fields = fields ; methods = teko::list::empty(); implements = teko::list::empty() }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }
+    parser::TypeDecl { name = "Foo"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::StructBody { fields = fields ; methods = teko::list::empty(); implements = teko::list::empty() }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; di_kind = parser::DiKind::None; has_di_key = false; di_key = "" }
 }
 fn foo_table() -> TypeTable {
     teko::list::push(teko::list::empty(), TypeReg { name = "Foo"; namespace = ""; vis = parser::Visibility::Private; decl = foo_decl() })
@@ -533,13 +540,13 @@ fn retype_literal_plain_leaf_unchanged_from_68() {
 fn return_type_checks() {
     let body1 = one_stmt(e_var("x"))
     match type_function(mk_fn("f", named_t("u32"), body1), empty_env(), empty_table()) { TFunction => teko::assert::is_true(true); error => teko::assert::is_true(false) }
-    let body2: []parser::Statement = teko::list::push(teko::list::empty(), parser::Return { has_value = true; value = e_var("x") })
+    let body2: []parser::Statement = teko::list::push(teko::list::empty(), ret_stmt(e_var("x")))
     match type_function(mk_fn("f", named_t("u32"), body2), empty_env(), empty_table()) { TFunction => teko::assert::is_true(true); error => teko::assert::is_true(false) }
-    let loopbody: []parser::Statement = teko::list::push(teko::list::empty(), parser::Return { has_value = true; value = e_var("x") })
-    let body3: []parser::Statement = teko::list::push(teko::list::empty(), parser::LoopStmt { label = ""; body = loopbody })
+    let loopbody: []parser::Statement = teko::list::push(teko::list::empty(), ret_stmt(e_var("x")))
+    let body3: []parser::Statement = teko::list::push(teko::list::empty(), loop_stmt(loopbody))
     match type_function(mk_fn("f", named_t("u32"), body3), empty_env(), empty_table()) { TFunction => teko::assert::is_true(true); error => teko::assert::is_true(false) }
     let umembers: []parser::TypeExpr = teko::list::push(teko::list::push(teko::list::empty(), named_t("u32")), named_t("error"))
-    let body4: []parser::Statement = teko::list::push(teko::list::empty(), parser::Return { has_value = true; value = e_var("x") })
+    let body4: []parser::Statement = teko::list::push(teko::list::empty(), ret_stmt(e_var("x")))
     match type_function(mk_fn("f", parser::UnionType { members = umembers }, body4), empty_env(), empty_table()) { TFunction => teko::assert::is_true(true); error => teko::assert::is_true(false) }
 }
 
@@ -565,7 +572,7 @@ fn color_table() -> TypeTable {
     let names = teko::list::push(teko::list::push(teko::list::push(teko::list::empty(), "RED"), "GREEN"), "BLUE")
     loop {
         if i >= names.len { break }
-        let td = parser::TypeDecl { name = names[i]; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::StructBody { fields = teko::list::empty() ; methods = teko::list::empty(); implements = teko::list::empty() }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }
+        let td = parser::TypeDecl { name = names[i]; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::StructBody { fields = teko::list::empty() ; methods = teko::list::empty(); implements = teko::list::empty() }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; di_kind = parser::DiKind::None; has_di_key = false; di_key = "" }
         t = teko::list::push(t, TypeReg { name = names[i]; namespace = ""; vis = parser::Visibility::Private; decl = td })
         i++
     }
@@ -641,7 +648,7 @@ fn exhaustive_barriers() {
 // ---------------------------------------------------------------------------
 fn color_enum_decl() -> parser::TypeDecl {
     let members = teko::list::push(teko::list::push(teko::list::push(teko::list::empty(), "RED"), "GREEN"), "BLUE")
-    parser::TypeDecl { name = "Color"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::EnumBody { members = members }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }
+    parser::TypeDecl { name = "Color"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::EnumBody { members = members }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; di_kind = parser::DiKind::None; has_di_key = false; di_key = "" }
 }
 fn color_enum_table() -> TypeTable {
     teko::list::push(teko::list::empty(), TypeReg { name = "Color"; namespace = ""; vis = parser::Visibility::Private; decl = color_enum_decl() })
@@ -1053,7 +1060,7 @@ fn ttype_named(name: str) -> parser::TypeExpr {
 fn box_generic_table() -> TypeTable {
     let fld = parser::Field { name = "value"; type_ann = ttype_named("T") ; vis = parser::Visibility::Pub; is_intern = false }
     let body = parser::StructBody { fields = teko::list::push(teko::list::empty(), fld) ; methods = teko::list::empty(); implements = teko::list::empty() }
-    let decl = parser::TypeDecl { name = "Box"; type_params = teko::list::push(teko::list::empty(), "T"); type_constraints = teko::list::empty(); body = body; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }
+    let decl = parser::TypeDecl { name = "Box"; type_params = teko::list::push(teko::list::empty(), "T"); type_constraints = teko::list::empty(); body = body; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; di_kind = parser::DiKind::None; has_di_key = false; di_key = "" }
     teko::list::push(teko::list::empty(), TypeReg { name = "Box"; namespace = ""; vis = parser::Visibility::Private; decl = decl })
 }
 
@@ -1199,12 +1206,12 @@ fn mem_ref_not_return_type() {
 #test
 fn mem_ref_not_struct_field() {
     let fld = parser::Field { name = "r"; type_ann = ref_te_of(ref_te("i64")) ; vis = parser::Visibility::Pub; is_intern = false }   // Ref<Ref<i64>>
-    let decl = parser::TypeDecl { name = "Holder"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::StructBody { fields = teko::list::push(teko::list::empty(), fld) ; methods = teko::list::empty(); implements = teko::list::empty() }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }
+    let decl = parser::TypeDecl { name = "Holder"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::StructBody { fields = teko::list::push(teko::list::empty(), fld) ; methods = teko::list::empty(); implements = teko::list::empty() }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; di_kind = parser::DiKind::None; has_di_key = false; di_key = "" }
     let items: []parser::Item = teko::list::push(teko::list::empty(), parser::Item { content = decl; namespace = ""; file = "" })
     teko::assert::is_true(match collect(parser::Program { items = items }) { error => true; _ => false })
     // a plain scalar field collects without error.
     let okfld = parser::Field { name = "n"; type_ann = named_t("i64") ; vis = parser::Visibility::Pub; is_intern = false }
-    let okdecl = parser::TypeDecl { name = "Holder2"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::StructBody { fields = teko::list::push(teko::list::empty(), okfld) ; methods = teko::list::empty(); implements = teko::list::empty() }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }
+    let okdecl = parser::TypeDecl { name = "Holder2"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::StructBody { fields = teko::list::push(teko::list::empty(), okfld) ; methods = teko::list::empty(); implements = teko::list::empty() }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; di_kind = parser::DiKind::None; has_di_key = false; di_key = "" }
     let okitems: []parser::Item = teko::list::push(teko::list::empty(), parser::Item { content = okdecl; namespace = ""; file = "" })
     teko::assert::is_true(match collect(parser::Program { items = okitems }) { Collected => true; _ => false })
 }
@@ -1245,7 +1252,7 @@ fn mem_ref_param_allowed() {
     let p = parser::Param { name = "r"; has_type = true; type_ann = ref_te("i64"); is_params = false ; has_default = false; default_expr = e_num(0) }
     let params = teko::list::push(teko::list::empty(), p)
     let body = teko::list::push(teko::list::empty(), parser::Return { has_value = true; value = e_num(0) })
-    let f = parser::Function { name = "f"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = params; has_return = true; return_type = named_t("i64"); body = body; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false }
+    let f = parser::Function { name = "f"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = params; has_return = true; return_type = named_t("i64"); body = body; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false; has_inject = false; injects = teko::list::empty() }
     match type_function(f, empty_env(), empty_table()) { TFunction => teko::assert::is_true(true); error => teko::assert::is_true(false) }
 }
 
@@ -1315,7 +1322,7 @@ fn instantiate_types_stamps_concrete_decl() {
     // a program with `type Node = struct { b: Box<i64> }` — a written Box<i64> use site.
     let boxi64 = parser::NamedType { path = parser::Path { segments = teko::list::push(teko::list::empty(), parser::Segment { name = "Box" }) }; args = teko::list::push(teko::list::empty(), ttype_named("i64")) }
     let fld = parser::Field { name = "b"; type_ann = boxi64 ; vis = parser::Visibility::Pub; is_intern = false }
-    let node = parser::TypeDecl { name = "Node"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::StructBody { fields = teko::list::push(teko::list::empty(), fld) ; methods = teko::list::empty(); implements = teko::list::empty() }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }
+    let node = parser::TypeDecl { name = "Node"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::StructBody { fields = teko::list::push(teko::list::empty(), fld) ; methods = teko::list::empty(); implements = teko::list::empty() }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; di_kind = parser::DiKind::None; has_di_key = false; di_key = "" }
     let items: []parser::Item = teko::list::push(teko::list::empty(), parser::Item { content = node; namespace = ""; file = "" })
     let ext = instantiate_types(parser::Program { items = items }, tbl)
     // Box__g__i64 = struct { value: i64 } is now in the table (T substituted to i64).
@@ -1338,7 +1345,7 @@ fn instantiate_types_stamps_concrete_decl() {
 fn types_generic_struct_lit() {
     // stamp Box__g__i64 into the table via the instantiation pass (as a `Box<i64>` annotation would).
     let boxi64 = parser::NamedType { path = parser::Path { segments = teko::list::push(teko::list::empty(), parser::Segment { name = "Box" }) }; args = teko::list::push(teko::list::empty(), ttype_named("i64")) }
-    let node = parser::TypeDecl { name = "Node"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::StructBody { fields = teko::list::push(teko::list::empty(), parser::Field { name = "b"; type_ann = boxi64 ; vis = parser::Visibility::Pub; is_intern = false }) ; methods = teko::list::empty(); implements = teko::list::empty() }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }
+    let node = parser::TypeDecl { name = "Node"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::StructBody { fields = teko::list::push(teko::list::empty(), parser::Field { name = "b"; type_ann = boxi64 ; vis = parser::Visibility::Pub; is_intern = false }) ; methods = teko::list::empty(); implements = teko::list::empty() }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; di_kind = parser::DiKind::None; has_di_key = false; di_key = "" }
     let items: []parser::Item = teko::list::push(teko::list::empty(), parser::Item { content = node; namespace = ""; file = "" })
     let tbl = instantiate_types(parser::Program { items = items }, box_generic_table())
     let sl = parser::StructLit { type_path = parser::Path { segments = teko::list::push(teko::list::empty(), parser::Segment { name = "Box" }) }; type_args = teko::list::empty(); field_names = teko::list::push(teko::list::empty(), "value"); field_vals = teko::list::push(teko::list::empty(), e_num(42)) }
@@ -1354,7 +1361,7 @@ fn types_struct_lit_explicit_type_args() {
     // stamp Box__g__i64 into the table (the instantiation pass walks the construction site's type-args,
     // but type_struct_lit is called directly here, so pre-stamp via a `Box<i64>`-bearing decl).
     let boxi64 = parser::NamedType { path = path1("Box"); args = teko::list::push(teko::list::empty(), ttype_named("i64")) }
-    let node = parser::TypeDecl { name = "Node2"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::StructBody { fields = teko::list::push(teko::list::empty(), parser::Field { name = "b"; type_ann = boxi64 ; vis = parser::Visibility::Pub; is_intern = false }) ; methods = teko::list::empty(); implements = teko::list::empty() }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }
+    let node = parser::TypeDecl { name = "Node2"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::StructBody { fields = teko::list::push(teko::list::empty(), parser::Field { name = "b"; type_ann = boxi64 ; vis = parser::Visibility::Pub; is_intern = false }) ; methods = teko::list::empty(); implements = teko::list::empty() }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; di_kind = parser::DiKind::None; has_di_key = false; di_key = "" }
     let items: []parser::Item = teko::list::push(teko::list::empty(), parser::Item { content = node; namespace = ""; file = "" })
     let tbl = instantiate_types(parser::Program { items = items }, box_generic_table())
     // construct with type_args = [i64], expected = Void (no annotation).
@@ -1876,14 +1883,14 @@ fn ffi_teko_rt_named_struct_return() {
     let days_field = parser::Field { name = "days"; type_ann = named_t("i32") ; vis = parser::Visibility::Pub; is_intern = false }
     mut date_fields: []parser::Field = teko::list::empty()
     date_fields = teko::list::push(date_fields, days_field)
-    let date_struct = parser::TypeDecl { name = "Date"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::StructBody { fields = date_fields ; methods = teko::list::empty(); implements = teko::list::empty() }; vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 0; col = 0 }
+    let date_struct = parser::TypeDecl { name = "Date"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::StructBody { fields = date_fields ; methods = teko::list::empty(); implements = teko::list::empty() }; vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 0; col = 0; di_kind = parser::DiKind::None; has_di_key = false; di_key = "" }
     let tbl: TypeTable = teko::list::push(empty_table(), TypeReg { name = "Date"; namespace = ""; vis = parser::Visibility::Pub; decl = date_struct })
     // extern fn: one param d: i32, returns Date (a Named struct), from "teko_rt"
     let param_d = parser::Param { name = "d"; has_type = true; type_ann = named_t("i32"); is_params = false ; has_default = false; default_expr = e_num(0) }
     mut params: []parser::Param = teko::list::empty()
     params = teko::list::push(params, param_d)
     mut no_body: []parser::Statement = teko::list::empty()
-    let f = parser::Function { name = "date_from_days"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = params; has_return = true; return_type = named_t("Date"); body = no_body; vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = true; c_symbol = "tk_rt_date_from_days"; from_lib = "teko_rt"; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false }
+    let f = parser::Function { name = "date_from_days"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = params; has_return = true; return_type = named_t("Date"); body = no_body; vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = true; c_symbol = "tk_rt_date_from_days"; from_lib = "teko_rt"; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false; has_inject = false; injects = teko::list::empty() }
     // Must succeed: Named return is allowed for `from "teko_rt"` externs (C7.2 + teko_rt_type_ok fix)
     match type_function(f, empty_env(), tbl) {
         TFunction => teko::assert::is_true(true)
@@ -1900,7 +1907,7 @@ fn ffi_teko_rt_named_struct_two_params() {
     let ticks_field = parser::Field { name = "ticks"; type_ann = named_t("i128") ; vis = parser::Visibility::Pub; is_intern = false }
     mut span_fields: []parser::Field = teko::list::empty()
     span_fields = teko::list::push(span_fields, ticks_field)
-    let span_struct = parser::TypeDecl { name = "TimeSpan"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::StructBody { fields = span_fields ; methods = teko::list::empty(); implements = teko::list::empty() }; vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 0; col = 0 }
+    let span_struct = parser::TypeDecl { name = "TimeSpan"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::StructBody { fields = span_fields ; methods = teko::list::empty(); implements = teko::list::empty() }; vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 0; col = 0; di_kind = parser::DiKind::None; has_di_key = false; di_key = "" }
     let tbl: TypeTable = teko::list::push(empty_table(), TypeReg { name = "TimeSpan"; namespace = ""; vis = parser::Visibility::Pub; decl = span_struct })
     let param_a = parser::Param { name = "a"; has_type = true; type_ann = named_t("TimeSpan"); is_params = false ; has_default = false; default_expr = e_num(0) }
     let param_b = parser::Param { name = "b"; has_type = true; type_ann = named_t("TimeSpan"); is_params = false ; has_default = false; default_expr = e_num(0) }
@@ -1908,7 +1915,7 @@ fn ffi_teko_rt_named_struct_two_params() {
     params = teko::list::push(params, param_a)
     params = teko::list::push(params, param_b)
     mut no_body: []parser::Statement = teko::list::empty()
-    let f = parser::Function { name = "timespan_add"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = params; has_return = true; return_type = named_t("TimeSpan"); body = no_body; vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = true; c_symbol = "tk_rt_timespan_add"; from_lib = "teko_rt"; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false }
+    let f = parser::Function { name = "timespan_add"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = params; has_return = true; return_type = named_t("TimeSpan"); body = no_body; vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = true; c_symbol = "tk_rt_timespan_add"; from_lib = "teko_rt"; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false; has_inject = false; injects = teko::list::empty() }
     // Must succeed: TWO Named params + a Named return, all `from "teko_rt"` (C7.2)
     match type_function(f, empty_env(), tbl) {
         TFunction => teko::assert::is_true(true)
@@ -1987,7 +1994,7 @@ fn defargs_unknown_named_is_error() {
 // function directly (check_constraints/monomorph.tks) rather than only end-to-end.
 fn numeric_table() -> TypeTable {
     let union = parser::UnionType { members = teko::list::push(teko::list::push(teko::list::empty(), named_t("i64")), named_t("f64")) }
-    let decl = parser::TypeDecl { name = "Numeric"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::VariantBody { type_expr = union }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }
+    let decl = parser::TypeDecl { name = "Numeric"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::VariantBody { type_expr = union }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; di_kind = parser::DiKind::None; has_di_key = false; di_key = "" }
     teko::list::push(empty_table(), TypeReg { name = "Numeric"; namespace = ""; vis = parser::Visibility::Private; decl = decl })
 }
 fn tps1(name: str) -> []str { teko::list::push(teko::list::empty(), name) }
@@ -2061,11 +2068,11 @@ fn mk_pt_struct() -> parser::TypeDecl {
     let field_x = parser::Field { name = "x"; type_ann = named_t("i64") ; vis = parser::Visibility::Pub; is_intern = false }
     let sum_params = teko::list::push(teko::list::empty(), recv_param("self"))
     let sum_body = one_stmt(ek(parser::FieldAccess { receiver = e_var("self"); field = "x" }))
-    let sum_fn = parser::Function { name = "sum"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = sum_params; has_return = true; return_type = named_t("i64"); body = sum_body; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false }
-    let origin_fn = parser::Function { name = "origin"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = teko::list::empty(); has_return = true; return_type = named_t("i64"); body = one_stmt(e_num(0)); vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false }
+    let sum_fn = parser::Function { name = "sum"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = sum_params; has_return = true; return_type = named_t("i64"); body = sum_body; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false; has_inject = false; injects = teko::list::empty() }
+    let origin_fn = parser::Function { name = "origin"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = teko::list::empty(); has_return = true; return_type = named_t("i64"); body = one_stmt(e_num(0)); vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false; has_inject = false; injects = teko::list::empty() }
     let methods = teko::list::push(teko::list::push(teko::list::empty(), sum_fn), origin_fn)
     let body = parser::StructBody { fields = teko::list::push(teko::list::empty(), field_x); methods = methods; implements = teko::list::empty() }
-    parser::TypeDecl { name = "Pt"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = body; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }
+    parser::TypeDecl { name = "Pt"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = body; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; di_kind = parser::DiKind::None; has_di_key = false; di_key = "" }
 }
 fn pt_item() -> parser::Item { parser::Item { content = mk_pt_struct(); namespace = ""; file = "" } }
 fn pt_struct_lit(x: i128) -> parser::Expr {
@@ -2124,41 +2131,41 @@ fn oop_unknown_method_is_error() {
 // --- (W10b.IF, 2026-07-01) interface CONFORMANCE checking ------------------------------------
 // A bodyless instance-method signature `fn name(self) -> i64` (an interface member).
 fn iface_method(name: str) -> parser::Function {
-    parser::Function { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = teko::list::push(teko::list::empty(), recv_param("self")); has_return = true; return_type = named_t("i64"); body = teko::list::empty(); vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false }
+    parser::Function { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = teko::list::push(teko::list::empty(), recv_param("self")); has_return = true; return_type = named_t("i64"); body = teko::list::empty(); vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false; has_inject = false; injects = teko::list::empty() }
 }
 // A bodyless instance-method signature returning str `fn name(self) -> str` (for the conflicting-sig test).
 fn iface_method_str(name: str) -> parser::Function {
-    parser::Function { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = teko::list::push(teko::list::empty(), recv_param("self")); has_return = true; return_type = named_t("str"); body = teko::list::empty(); vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false }
+    parser::Function { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = teko::list::push(teko::list::empty(), recv_param("self")); has_return = true; return_type = named_t("str"); body = teko::list::empty(); vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false; has_inject = false; injects = teko::list::empty() }
 }
 // An ILLEGAL interface member: a signature WITH a body `fn name(self) -> i64 { 0 }`.
 fn iface_method_with_body(name: str) -> parser::Function {
-    parser::Function { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = teko::list::push(teko::list::empty(), recv_param("self")); has_return = true; return_type = named_t("i64"); body = one_stmt(e_num(0)); vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false }
+    parser::Function { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = teko::list::push(teko::list::empty(), recv_param("self")); has_return = true; return_type = named_t("i64"); body = one_stmt(e_num(0)); vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false; has_inject = false; injects = teko::list::empty() }
 }
 // A concrete instance method `[vis] fn name(self) -> i64 { 0 }`.
 fn impl_method(name: str, vis: parser::Visibility) -> parser::Function {
-    parser::Function { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = teko::list::push(teko::list::empty(), recv_param("self")); has_return = true; return_type = named_t("i64"); body = one_stmt(e_num(0)); vis = vis; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false }
+    parser::Function { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = teko::list::push(teko::list::empty(), recv_param("self")); has_return = true; return_type = named_t("i64"); body = one_stmt(e_num(0)); vis = vis; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false; has_inject = false; injects = teko::list::empty() }
 }
 // A concrete method with an extra typed param `fn name(self, x: i64) -> i64 { 0 }` (signature mismatch).
 fn impl_method_arg(name: str, vis: parser::Visibility) -> parser::Function {
     let params = teko::list::push(teko::list::push(teko::list::empty(), recv_param("self")), parser::Param { name = "x"; has_type = true; type_ann = named_t("i64"); is_params = false; has_default = false; default_expr = e_num(0) })
-    parser::Function { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = params; has_return = true; return_type = named_t("i64"); body = one_stmt(e_num(0)); vis = vis; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false }
+    parser::Function { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = params; has_return = true; return_type = named_t("i64"); body = one_stmt(e_num(0)); vis = vis; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false; has_inject = false; injects = teko::list::empty() }
 }
 // a STATIC method `[vis] fn name() -> i64 { 0 }` (NO untyped receiver).
 fn impl_static_method(name: str, vis: parser::Visibility) -> parser::Function {
-    parser::Function { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = teko::list::empty(); has_return = true; return_type = named_t("i64"); body = one_stmt(e_num(0)); vis = vis; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false }
+    parser::Function { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = teko::list::empty(); has_return = true; return_type = named_t("i64"); body = one_stmt(e_num(0)); vis = vis; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false; has_inject = false; injects = teko::list::empty() }
 }
 fn iface_item(name: str, methods: []parser::Function, extends: []str) -> parser::Item {
-    parser::Item { content = parser::TypeDecl { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::InterfaceBody { extends = extends; methods = methods }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }; namespace = ""; file = "" }
+    parser::Item { content = parser::TypeDecl { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::InterfaceBody { extends = extends; methods = methods }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; di_kind = parser::DiKind::None; has_di_key = false; di_key = "" }; namespace = ""; file = "" }
 }
 fn impl_struct_item(name: str, methods: []parser::Function, implements: []str) -> parser::Item {
-    parser::Item { content = parser::TypeDecl { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::StructBody { fields = teko::list::empty(); methods = methods; implements = implements }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }; namespace = ""; file = "" }
+    parser::Item { content = parser::TypeDecl { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::StructBody { fields = teko::list::empty(); methods = methods; implements = implements }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; di_kind = parser::DiKind::None; has_di_key = false; di_key = "" }; namespace = ""; file = "" }
 }
 fn impl_class_item(name: str, methods: []parser::Function, implements: []str) -> parser::Item {
-    parser::Item { content = parser::TypeDecl { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::ClassBody { kind = parser::ClassKind::Sealed; has_base = false; base_name = ""; has_base_binding = false; base_binding_name = ""; implements = implements; fields = teko::list::empty(); methods = methods }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }; namespace = ""; file = "" }
+    parser::Item { content = parser::TypeDecl { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::ClassBody { kind = parser::ClassKind::Sealed; has_base = false; base_name = ""; has_base_binding = false; base_binding_name = ""; implements = implements; fields = teko::list::empty(); methods = methods }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; di_kind = parser::DiKind::None; has_di_key = false; di_key = "" }; namespace = ""; file = "" }
 }
 // a virtual class `type name = virtual class base { }` (empty) — for the cyclic-inheritance guard test.
 fn cyclic_class_item(name: str, base: str) -> parser::Item {
-    parser::Item { content = parser::TypeDecl { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::ClassBody { kind = parser::ClassKind::Virtual; has_base = true; base_name = base; has_base_binding = false; base_binding_name = ""; implements = teko::list::empty(); fields = teko::list::empty(); methods = teko::list::empty() }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }; namespace = ""; file = "" }
+    parser::Item { content = parser::TypeDecl { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::ClassBody { kind = parser::ClassKind::Virtual; has_base = true; base_name = base; has_base_binding = false; base_binding_name = ""; implements = teko::list::empty(); fields = teko::list::empty(); methods = teko::list::empty() }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; di_kind = parser::DiKind::None; has_di_key = false; di_key = "" }; namespace = ""; file = "" }
 }
 fn list1(x: parser::Function) -> []parser::Function { teko::list::push(teko::list::empty(), x) }
 fn slist1(s: str) -> []str { teko::list::push(teko::list::empty(), s) }
@@ -2170,8 +2177,8 @@ fn fa_class_item(name: str, field: str, field_vis: parser::Visibility) -> parser
     let flds = teko::list::push(teko::list::empty(), fld)
     // the factory body: `Name { f = 0 }`
     let ctor = parser::StructLit { type_path = path1(name); type_args = teko::list::empty(); field_names = slist1(field); field_vals = teko::list::push(teko::list::empty(), e_num(0)) }
-    let make = parser::Function { name = "make"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = teko::list::empty(); has_return = true; return_type = named_t(name); body = one_stmt(ek(ctor)); vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false }
-    parser::Item { content = parser::TypeDecl { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::ClassBody { kind = parser::ClassKind::Sealed; has_base = false; base_name = ""; has_base_binding = false; base_binding_name = ""; implements = teko::list::empty(); fields = flds; methods = list1(make) }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }; namespace = ""; file = "" }
+    let make = parser::Function { name = "make"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = teko::list::empty(); has_return = true; return_type = named_t(name); body = one_stmt(ek(ctor)); vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false; has_inject = false; injects = teko::list::empty() }
+    parser::Item { content = parser::TypeDecl { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::ClassBody { kind = parser::ClassKind::Sealed; has_base = false; base_name = ""; has_base_binding = false; base_binding_name = ""; implements = teko::list::empty(); fields = flds; methods = list1(make) }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; di_kind = parser::DiKind::None; has_di_key = false; di_key = "" }; namespace = ""; file = "" }
 }
 
 // a top-level `let x = Name::make()` binding item.
@@ -2237,11 +2244,11 @@ fn field_read_external_private_message_is_canonical() {
 // — a private INSTANCE method plus a public static factory (so `Name::make()` types `x`).
 fn priv_method_class_item(name: str, method: str) -> parser::Item {
     let fld = parser::Field { name = "w"; type_ann = named_t("i64"); vis = parser::Visibility::Pub; is_intern = false }
-    let secret = parser::Function { name = method; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = teko::list::push(teko::list::empty(), recv_param("self")); has_return = true; return_type = named_t("i64"); body = one_stmt(e_num(0)); vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false }
+    let secret = parser::Function { name = method; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = teko::list::push(teko::list::empty(), recv_param("self")); has_return = true; return_type = named_t("i64"); body = one_stmt(e_num(0)); vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false; has_inject = false; injects = teko::list::empty() }
     let ctor = parser::StructLit { type_path = path1(name); type_args = teko::list::empty(); field_names = slist1("w"); field_vals = teko::list::push(teko::list::empty(), e_num(0)) }
-    let make = parser::Function { name = "make"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = teko::list::empty(); has_return = true; return_type = named_t(name); body = one_stmt(ek(ctor)); vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false }
+    let make = parser::Function { name = "make"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = teko::list::empty(); has_return = true; return_type = named_t(name); body = one_stmt(ek(ctor)); vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false; has_inject = false; injects = teko::list::empty() }
     let methods = teko::list::push(teko::list::push(teko::list::empty(), secret), make)
-    parser::Item { content = parser::TypeDecl { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::ClassBody { kind = parser::ClassKind::Sealed; has_base = false; base_name = ""; has_base_binding = false; base_binding_name = ""; implements = teko::list::empty(); fields = teko::list::push(teko::list::empty(), fld); methods = methods }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }; namespace = ""; file = "" }
+    parser::Item { content = parser::TypeDecl { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::ClassBody { kind = parser::ClassKind::Sealed; has_base = false; base_name = ""; has_base_binding = false; base_binding_name = ""; implements = teko::list::empty(); fields = teko::list::push(teko::list::empty(), fld); methods = methods }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; di_kind = parser::DiKind::None; has_di_key = false; di_key = "" }; namespace = ""; file = "" }
 }
 
 // (#121) TWIN-MESSAGE PARITY: the private-METHOD diagnostic must read EXACTLY
@@ -2372,7 +2379,7 @@ fn iface_as_value_type_is_ok() {
     // pointer) type-checks. (This test asserted the ROUND 2 honest stop until D3 landed.)
     let ifc = iface_item("Greetable", list1(iface_method("greet")), teko::list::empty())
     let fld = parser::Field { name = "g"; type_ann = named_t("Greetable"); vis = parser::Visibility::Pub; is_intern = false }
-    let holder = parser::Item { content = parser::TypeDecl { name = "Holder"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::StructBody { fields = teko::list::push(teko::list::empty(), fld); methods = teko::list::empty(); implements = teko::list::empty() }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }; namespace = ""; file = "" }
+    let holder = parser::Item { content = parser::TypeDecl { name = "Holder"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::StructBody { fields = teko::list::push(teko::list::empty(), fld); methods = teko::list::empty(); implements = teko::list::empty() }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; di_kind = parser::DiKind::None; has_di_key = false; di_key = "" }; namespace = ""; file = "" }
     let items = teko::list::push(teko::list::push(teko::list::empty(), ifc), holder)
     match type_program(parser::Program { items = items }) {
         TProgram => teko::assert::is_true(true)    // interface as a value/field type -> allowed (D3)
@@ -2466,8 +2473,8 @@ fn iface_class_conforms_via_inherited_method() {
     // Derived extends Base (which has `pub fn greet`) and implements Greetable but does NOT redeclare
     // greet — it must conform via the INHERITED method (exercises the effective_class_methods path).
     let ifc = iface_item("Greetable", list1(iface_method("greet")), teko::list::empty())
-    let base = parser::Item { content = parser::TypeDecl { name = "Base"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::ClassBody { kind = parser::ClassKind::Virtual; has_base = false; base_name = ""; has_base_binding = false; base_binding_name = ""; implements = teko::list::empty(); fields = teko::list::empty(); methods = list1(impl_method("greet", parser::Visibility::Pub)) }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }; namespace = ""; file = "" }
-    let derived = parser::Item { content = parser::TypeDecl { name = "Derived"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::ClassBody { kind = parser::ClassKind::Sealed; has_base = true; base_name = "Base"; has_base_binding = false; base_binding_name = ""; implements = slist1("Greetable"); fields = teko::list::empty(); methods = teko::list::empty() }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }; namespace = ""; file = "" }
+    let base = parser::Item { content = parser::TypeDecl { name = "Base"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::ClassBody { kind = parser::ClassKind::Virtual; has_base = false; base_name = ""; has_base_binding = false; base_binding_name = ""; implements = teko::list::empty(); fields = teko::list::empty(); methods = list1(impl_method("greet", parser::Visibility::Pub)) }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; di_kind = parser::DiKind::None; has_di_key = false; di_key = "" }; namespace = ""; file = "" }
+    let derived = parser::Item { content = parser::TypeDecl { name = "Derived"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::ClassBody { kind = parser::ClassKind::Sealed; has_base = true; base_name = "Base"; has_base_binding = false; base_binding_name = ""; implements = slist1("Greetable"); fields = teko::list::empty(); methods = teko::list::empty() }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; di_kind = parser::DiKind::None; has_di_key = false; di_key = "" }; namespace = ""; file = "" }
     mut items: []parser::Item = teko::list::empty()
     items = teko::list::push(items, ifc)
     items = teko::list::push(items, base)
@@ -2505,26 +2512,26 @@ fn greet_param_other_default() -> parser::Param {
 // `fn greet(self, greeting: str [= "Hello"]) -> str` — an interface method NAMING+defaulting `greeting`.
 fn iface_method_greet(defaulted: bool) -> parser::Function {
     let params = teko::list::push(teko::list::push(teko::list::empty(), recv_param("self")), greet_param(defaulted))
-    parser::Function { name = "greet"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = params; has_return = true; return_type = named_t("str"); body = teko::list::empty(); vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false }
+    parser::Function { name = "greet"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = params; has_return = true; return_type = named_t("str"); body = teko::list::empty(); vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false; has_inject = false; injects = teko::list::empty() }
 }
 // a concrete `[vis] fn greet(self, greeting: str [= …]) -> str { … }` implementing method, with an
 // explicit `greeting` param (defaulted per `p`).
 fn impl_method_greet(vis: parser::Visibility, p: parser::Param) -> parser::Function {
     let params = teko::list::push(teko::list::push(teko::list::empty(), recv_param("self")), p)
-    parser::Function { name = "greet"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = params; has_return = true; return_type = named_t("str"); body = one_stmt(e_str("hi")); vis = vis; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false }
+    parser::Function { name = "greet"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = params; has_return = true; return_type = named_t("str"); body = one_stmt(e_str("hi")); vis = vis; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false; has_inject = false; injects = teko::list::empty() }
 }
 // a `virtual`/`override` variant of impl_method_greet (for class-base-override tests).
 fn class_method_greet(vis: parser::Visibility, p: parser::Param, is_virtual: bool, is_override: bool) -> parser::Function {
     let params = teko::list::push(teko::list::push(teko::list::empty(), recv_param("self")), p)
-    parser::Function { name = "greet"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = params; has_return = true; return_type = named_t("str"); body = one_stmt(e_str("hi")); vis = vis; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = is_virtual; is_override = is_override }
+    parser::Function { name = "greet"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = params; has_return = true; return_type = named_t("str"); body = one_stmt(e_str("hi")); vis = vis; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = is_virtual; is_override = is_override; has_inject = false; injects = teko::list::empty() }
 }
 // a virtual base class `type name = virtual class { <methods> }` (no base of its own).
 fn virtual_base_class_item(name: str, methods: []parser::Function) -> parser::Item {
-    parser::Item { content = parser::TypeDecl { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::ClassBody { kind = parser::ClassKind::Virtual; has_base = false; base_name = ""; has_base_binding = false; base_binding_name = ""; implements = teko::list::empty(); fields = teko::list::empty(); methods = methods }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }; namespace = ""; file = "" }
+    parser::Item { content = parser::TypeDecl { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::ClassBody { kind = parser::ClassKind::Virtual; has_base = false; base_name = ""; has_base_binding = false; base_binding_name = ""; implements = teko::list::empty(); fields = teko::list::empty(); methods = methods }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; di_kind = parser::DiKind::None; has_di_key = false; di_key = "" }; namespace = ""; file = "" }
 }
 // a sealed derived class `type name = class base { <methods> }`.
 fn sealed_derived_class_item(name: str, base: str, methods: []parser::Function) -> parser::Item {
-    parser::Item { content = parser::TypeDecl { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::ClassBody { kind = parser::ClassKind::Sealed; has_base = true; base_name = base; has_base_binding = false; base_binding_name = ""; implements = teko::list::empty(); fields = teko::list::empty(); methods = methods }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }; namespace = ""; file = "" }
+    parser::Item { content = parser::TypeDecl { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::ClassBody { kind = parser::ClassKind::Sealed; has_base = true; base_name = base; has_base_binding = false; base_binding_name = ""; implements = teko::list::empty(); fields = teko::list::empty(); methods = methods }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; di_kind = parser::DiKind::None; has_di_key = false; di_key = "" }; namespace = ""; file = "" }
 }
 
 #test
@@ -2609,7 +2616,7 @@ fn class_override_no_default_param_still_works() {
 // --- flags methods (C8.3, self-host ported 2026-07-01) ---------------------------------------
 fn mk_perm_flags() -> parser::TypeDecl {
     let members = teko::list::push(teko::list::push(teko::list::empty(), "Read"), "Write")
-    parser::TypeDecl { name = "Perm"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::FlagsBody { members = members; values = teko::list::empty() }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }
+    parser::TypeDecl { name = "Perm"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::FlagsBody { members = members; values = teko::list::empty() }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; di_kind = parser::DiKind::None; has_di_key = false; di_key = "" }
 }
 fn perm_item() -> parser::Item { parser::Item { content = mk_perm_flags(); namespace = ""; file = "" } }
 fn perm_member(name: str) -> parser::Expr { ek(parser::PathExpr { path = parser::Path { segments = teko::list::push(teko::list::push(teko::list::empty(), parser::Segment { name = "Perm" }), parser::Segment { name = name }) } }) }
@@ -2675,12 +2682,12 @@ fn d1_lit(cls: str) -> parser::Expr {
 }
 // `[pub] fn name(params…) -> ret { body }` — the D1 tests' method/function builder.
 fn d1_fn(name: str, params: []parser::Param, ret: str, body: []parser::Statement) -> parser::Function {
-    parser::Function { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = params; has_return = true; return_type = named_t(ret); body = body; vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false }
+    parser::Function { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = params; has_return = true; return_type = named_t(ret); body = body; vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false; has_inject = false; injects = teko::list::empty() }
 }
 // a sealed `type name = class { v: i64  <methods> }` item.
 fn d1_class_item(name: str, methods: []parser::Function) -> parser::Item {
     let field_v = parser::Field { name = "v"; type_ann = named_t("i64"); vis = parser::Visibility::Pub; is_intern = false }
-    parser::Item { content = parser::TypeDecl { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::ClassBody { kind = parser::ClassKind::Sealed; has_base = false; base_name = ""; has_base_binding = false; base_binding_name = ""; implements = teko::list::empty(); fields = teko::list::push(teko::list::empty(), field_v); methods = methods }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }; namespace = ""; file = "" }
+    parser::Item { content = parser::TypeDecl { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::ClassBody { kind = parser::ClassKind::Sealed; has_base = false; base_name = ""; has_base_binding = false; base_binding_name = ""; implements = teko::list::empty(); fields = teko::list::push(teko::list::empty(), field_v); methods = methods }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; di_kind = parser::DiKind::None; has_di_key = false; di_key = "" }; namespace = ""; file = "" }
 }
 fn d1_item(f: parser::Function) -> parser::Item { parser::Item { content = f; namespace = ""; file = "" } }
 
@@ -2761,11 +2768,11 @@ fn d1_struct_literal_stays_free() {
 // synthesizes tags for the subject's own direct union members, never a nested member's cases.
 // The safe idiom (`FooBar as v => match v { Foo as f => … }`) must stay accepted.
 fn empty_struct_decl(name: str) -> parser::TypeDecl {
-    parser::TypeDecl { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::StructBody { fields = teko::list::empty(); methods = teko::list::empty(); implements = teko::list::empty() }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }
+    parser::TypeDecl { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::StructBody { fields = teko::list::empty(); methods = teko::list::empty(); implements = teko::list::empty() }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; di_kind = parser::DiKind::None; has_di_key = false; di_key = "" }
 }
 fn foobar_variant_decl() -> parser::TypeDecl {
     let union = parser::UnionType { members = teko::list::push(teko::list::push(teko::list::empty(), named_t("Foo")), named_t("Bar")) }
-    parser::TypeDecl { name = "FooBar"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::VariantBody { type_expr = union }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }
+    parser::TypeDecl { name = "FooBar"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::VariantBody { type_expr = union }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; di_kind = parser::DiKind::None; has_di_key = false; di_key = "" }
 }
 // FooBar = variant Foo | Bar; the type table also registers Foo/Bar themselves.
 fn foobar_table() -> TypeTable {
@@ -2848,7 +2855,7 @@ fn generic_hold_fn(iface: str) -> parser::Item {
     let tc: []parser::ConstraintExpr = teko::list::push(teko::list::empty(), parser::ConstraintAtom { name = iface })
     let params = teko::list::push(teko::list::empty(), parser::Param { name = "x"; has_type = true; type_ann = named_t("T"); is_params = false; has_default = false; default_expr = e_num(0) })
     let body: []parser::Statement = teko::list::push(teko::list::empty(), parser::Return { has_value = true; value = e_var("x") })
-    let f = parser::Function { name = "holdc"; type_params = tp; type_constraints = tc; params = params; has_return = true; return_type = named_t("T"); body = body; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false }
+    let f = parser::Function { name = "holdc"; type_params = tp; type_constraints = tc; params = params; has_return = true; return_type = named_t("T"); body = body; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false; has_inject = false; injects = teko::list::empty() }
     parser::Item { content = f; namespace = ""; file = "" }
 }
 // `let p = <StructName> { }` then `holdc(p)` as a loose statement pair.
@@ -2900,7 +2907,7 @@ fn iface_variant_member_is_error() {
     let uni = parser::UnionType { members = teko::list::push(teko::list::push(teko::list::empty(), named_t("Greetable")), named_t("error")) }
     // an INLINE union in a fn's return annotation — resolved at collect time, so the ban fires.
     let body: []parser::Statement = teko::list::push(teko::list::empty(), parser::Return { has_value = true; value = ek(parser::StructLit { type_path = path1("error"); type_args = teko::list::empty(); field_names = teko::list::push(teko::list::empty(), "message"); field_vals = teko::list::push(teko::list::empty(), e_str("x")) }) })
-    let f = parser::Function { name = "gf"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = teko::list::empty(); has_return = true; return_type = uni; body = body; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false }
+    let f = parser::Function { name = "gf"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = teko::list::empty(); has_return = true; return_type = uni; body = body; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false; has_inject = false; injects = teko::list::empty() }
     let items = teko::list::push(teko::list::push(teko::list::empty(), ifc), parser::Item { content = f; namespace = ""; file = "" })
     match type_program(parser::Program { items = items }) {
         TProgram => teko::assert::is_true(false)   // must fail
@@ -2910,7 +2917,7 @@ fn iface_variant_member_is_error() {
 
 // (#109 W0) an empty-struct-body TypeDecl named `name`, wrapped as an Item under `namespace`.
 fn w0_empty_struct_item(name: str, namespace: str) -> parser::Item {
-    let td = parser::TypeDecl { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::StructBody { fields = teko::list::empty(); methods = teko::list::empty(); implements = teko::list::empty() }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }
+    let td = parser::TypeDecl { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::StructBody { fields = teko::list::empty(); methods = teko::list::empty(); implements = teko::list::empty() }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; di_kind = parser::DiKind::None; has_di_key = false; di_key = "" }
     parser::Item { content = td; namespace = namespace; file = "" }
 }
 
@@ -2969,7 +2976,7 @@ fn iface_bare_implements_resolves_in_own_namespace_not_scan_order() {
 #test
 fn class_bare_base_resolves_in_own_namespace_not_scan_order() {
     let decoy = w0_empty_struct_item("Base", "aa")   // NON-class named Base, FIRST in table order
-    let base_td = parser::TypeDecl { name = "Base"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::ClassBody { kind = parser::ClassKind::Virtual; has_base = false; base_name = ""; has_base_binding = false; base_binding_name = ""; implements = teko::list::empty(); fields = teko::list::empty(); methods = teko::list::empty() }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }
+    let base_td = parser::TypeDecl { name = "Base"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::ClassBody { kind = parser::ClassKind::Virtual; has_base = false; base_name = ""; has_base_binding = false; base_binding_name = ""; implements = teko::list::empty(); fields = teko::list::empty(); methods = teko::list::empty() }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; di_kind = parser::DiKind::None; has_di_key = false; di_key = "" }
     let base = parser::Item { content = base_td; namespace = "bb"; file = "" }
     let sub0 = cyclic_class_item("Sub", "Base")   // a virtual-class helper: `class Sub Base {}`
     let sub = parser::Item { content = sub0.content; namespace = "bb"; file = "" }
@@ -3058,7 +3065,7 @@ fn w0_user_type_with_g_infix_cross_ns_coexists_same_ns_dup_errors() {
 fn w0_stamped_generic_instances_remain_exempt() {
     mut seedtbl = box_generic_table()   // `type Box<T> = struct { value: T }` (the generic base)
     let inst_fld = parser::Field { name = "value"; type_ann = ttype_named("i64"); vis = parser::Visibility::Pub; is_intern = false }
-    let inst_decl = parser::TypeDecl { name = "Box__g__i64"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::StructBody { fields = teko::list::push(teko::list::empty(), inst_fld); methods = teko::list::empty(); implements = teko::list::empty() }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }
+    let inst_decl = parser::TypeDecl { name = "Box__g__i64"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::StructBody { fields = teko::list::push(teko::list::empty(), inst_fld); methods = teko::list::empty(); implements = teko::list::empty() }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; di_kind = parser::DiKind::None; has_di_key = false; di_key = "" }
     seedtbl = teko::list::push(seedtbl, TypeReg { name = "Box__g__i64"; namespace = ""; vis = parser::Visibility::Private; decl = inst_decl })
     seedtbl = teko::list::push(seedtbl, TypeReg { name = "Box__g__i64"; namespace = ""; vis = parser::Visibility::Private; decl = inst_decl })
     let seed = Collected { types = seedtbl; env = empty_env() }
@@ -3079,9 +3086,9 @@ fn np_gadget_decl() -> parser::TypeDecl {
     let fv = parser::Field { name = "v"; type_ann = named_t("i64"); vis = parser::Visibility::Pub; is_intern = false }
     let fw = parser::Field { name = "w"; type_ann = named_t("i64"); vis = parser::Visibility::Private; is_intern = false }
     let fields = teko::list::push(teko::list::push(teko::list::empty(), fv), fw)
-    let silent = parser::Function { name = "silent"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = teko::list::push(teko::list::empty(), recv_param("self")); has_return = false; return_type = named_t("i64"); body = teko::list::empty(); vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false }
+    let silent = parser::Function { name = "silent"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = teko::list::push(teko::list::empty(), recv_param("self")); has_return = false; return_type = named_t("i64"); body = teko::list::empty(); vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false; has_inject = false; injects = teko::list::empty() }
     let methods = teko::list::push(teko::list::push(teko::list::push(teko::list::empty(), impl_method("ping", parser::Visibility::Pub)), impl_method("covert", parser::Visibility::Private)), silent)
-    parser::TypeDecl { name = "Gadget"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::ClassBody { kind = parser::ClassKind::Sealed; has_base = false; base_name = ""; has_base_binding = false; base_binding_name = ""; implements = teko::list::empty(); fields = fields; methods = methods }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }
+    parser::TypeDecl { name = "Gadget"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::ClassBody { kind = parser::ClassKind::Sealed; has_base = false; base_name = ""; has_base_binding = false; base_binding_name = ""; implements = teko::list::empty(); fields = fields; methods = methods }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; di_kind = parser::DiKind::None; has_di_key = false; di_key = "" }
 }
 fn np_program() -> parser::Program {
     let item = parser::Item { content = np_gadget_decl(); namespace = ""; file = "" }
@@ -3230,13 +3237,13 @@ fn np_safe_nav_on_bare_null_rejected() {
 fn tr_field(name: str) -> parser::Field { parser::Field { name = name; type_ann = named_t("i64"); vis = parser::Visibility::Pub; is_intern = false } }
 fn tr_fields1(name: str) -> []parser::Field { teko::list::push(teko::list::empty(), tr_field(name)) }
 fn trait_item(name: str, fields: []parser::Field, methods: []parser::Function) -> parser::Item {
-    parser::Item { content = parser::TypeDecl { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::TraitBody { fields = fields; methods = methods }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }; namespace = ""; file = "" }
+    parser::Item { content = parser::TypeDecl { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::TraitBody { fields = fields; methods = methods }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; di_kind = parser::DiKind::None; has_di_key = false; di_key = "" }; namespace = ""; file = "" }
 }
 fn deriver_struct_item(name: str, fields: []parser::Field, methods: []parser::Function, derives: []str) -> parser::Item {
-    parser::Item { content = parser::TypeDecl { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::StructBody { fields = fields; methods = methods; implements = derives }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }; namespace = ""; file = "" }
+    parser::Item { content = parser::TypeDecl { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::StructBody { fields = fields; methods = methods; implements = derives }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; di_kind = parser::DiKind::None; has_di_key = false; di_key = "" }; namespace = ""; file = "" }
 }
 fn deriver_class_item(name: str, fields: []parser::Field, methods: []parser::Function, derives: []str) -> parser::Item {
-    parser::Item { content = parser::TypeDecl { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::ClassBody { kind = parser::ClassKind::Sealed; has_base = false; base_name = ""; has_base_binding = false; base_binding_name = ""; implements = derives; fields = fields; methods = methods }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }; namespace = ""; file = "" }
+    parser::Item { content = parser::TypeDecl { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::ClassBody { kind = parser::ClassKind::Sealed; has_base = false; base_name = ""; has_base_binding = false; base_binding_name = ""; implements = derives; fields = fields; methods = methods }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; di_kind = parser::DiKind::None; has_di_key = false; di_key = "" }; namespace = ""; file = "" }
 }
 fn items2(a: parser::Item, b: parser::Item) -> []parser::Item { teko::list::push(teko::list::push(teko::list::empty(), a), b) }
 fn items3(a: parser::Item, b: parser::Item, c: parser::Item) -> []parser::Item { teko::list::push(items2(a, b), c) }
@@ -3337,7 +3344,7 @@ fn trait_as_value_type_is_error() {
     // a trait as a PARAM type is TR1 territory — rejected honestly at resolution.
     let tr = trait_item("Stamp", tr_fields1("at"), teko::list::empty())
     let p = parser::Param { name = "s"; has_type = true; type_ann = named_t("Stamp"); is_params = false; has_default = false; default_expr = e_num(0) }
-    let f = parser::Function { name = "use_stamp"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = teko::list::push(teko::list::empty(), p); has_return = true; return_type = named_t("i64"); body = one_stmt(e_num(0)); vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false }
+    let f = parser::Function { name = "use_stamp"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = teko::list::push(teko::list::empty(), p); has_return = true; return_type = named_t("i64"); body = one_stmt(e_num(0)); vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false; has_inject = false; injects = teko::list::empty() }
     teko::assert::is_true(!tr_program_ok(items2(tr, parser::Item { content = f; namespace = ""; file = "" })))
 }
 
@@ -3345,7 +3352,7 @@ fn trait_as_value_type_is_error() {
 fn trait_method_with_dispatch_markers_is_error() {
     // `virtual fn` inside a trait body — the class dispatch markers are meaningless in a trait.
     mut m = impl_method("m", parser::Visibility::Private)
-    let vm = parser::Function { name = m.name; type_params = m.type_params; type_constraints = m.type_constraints; params = m.params; has_return = m.has_return; return_type = m.return_type; body = m.body; vis = m.vis; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = true; is_override = false }
+    let vm = parser::Function { name = m.name; type_params = m.type_params; type_constraints = m.type_constraints; params = m.params; has_return = m.has_return; return_type = m.return_type; body = m.body; vis = m.vis; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = true; is_override = false; has_inject = false; injects = teko::list::empty() }
     let tr = trait_item("Stamp", teko::list::empty(), list1(vm))
     teko::assert::is_true(!tr_program_ok(teko::list::push(teko::list::empty(), tr)))
 }
@@ -3371,7 +3378,7 @@ fn trait_class_requirement_satisfied_by_pub_method() {
 #test
 fn generic_trait_is_rejected() {
     // `type T<X> = trait { }` — outside TR0's unit; honest error.
-    let td = parser::TypeDecl { name = "GT"; type_params = teko::list::push(teko::list::empty(), "X"); type_constraints = teko::list::push(teko::list::empty(), parser::NoConstraint { }); body = parser::TraitBody { fields = teko::list::empty(); methods = teko::list::empty() }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }
+    let td = parser::TypeDecl { name = "GT"; type_params = teko::list::push(teko::list::empty(), "X"); type_constraints = teko::list::push(teko::list::empty(), parser::NoConstraint { }); body = parser::TraitBody { fields = teko::list::empty(); methods = teko::list::empty() }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; di_kind = parser::DiKind::None; has_di_key = false; di_key = "" }
     teko::assert::is_true(!tr_program_ok(teko::list::push(teko::list::empty(), parser::Item { content = td; namespace = ""; file = "" })))
 }
 
@@ -3383,13 +3390,13 @@ fn generic_trait_is_rejected() {
  */
 fn fv_field(name: str, type_ann: parser::TypeExpr) -> parser::Field { parser::Field { name = name; type_ann = type_ann; vis = parser::Visibility::Pub; is_intern = false } }
 fn fv_struct_item(name: str, fields: []parser::Field) -> parser::Item {
-    parser::Item { content = parser::TypeDecl { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::StructBody { fields = fields; methods = teko::list::empty(); implements = teko::list::empty() }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }; namespace = ""; file = "" }
+    parser::Item { content = parser::TypeDecl { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::StructBody { fields = fields; methods = teko::list::empty(); implements = teko::list::empty() }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; di_kind = parser::DiKind::None; has_di_key = false; di_key = "" }; namespace = ""; file = "" }
 }
 fn fv_struct_item_derives(name: str, fields: []parser::Field, derives: []str) -> parser::Item {
-    parser::Item { content = parser::TypeDecl { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::StructBody { fields = fields; methods = teko::list::empty(); implements = derives }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }; namespace = ""; file = "" }
+    parser::Item { content = parser::TypeDecl { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::StructBody { fields = fields; methods = teko::list::empty(); implements = derives }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; di_kind = parser::DiKind::None; has_di_key = false; di_key = "" }; namespace = ""; file = "" }
 }
 fn fv_class_item(name: str, kind: parser::ClassKind, has_base: bool, base_name: str, fields: []parser::Field) -> parser::Item {
-    parser::Item { content = parser::TypeDecl { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::ClassBody { kind = kind; has_base = has_base; base_name = base_name; has_base_binding = false; base_binding_name = ""; implements = teko::list::empty(); fields = fields; methods = teko::list::empty() }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }; namespace = ""; file = "" }
+    parser::Item { content = parser::TypeDecl { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::ClassBody { kind = kind; has_base = has_base; base_name = base_name; has_base_binding = false; base_binding_name = ""; implements = teko::list::empty(); fields = fields; methods = teko::list::empty() }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; di_kind = parser::DiKind::None; has_di_key = false; di_key = "" }; namespace = ""; file = "" }
 }
 fn fv_table(items: []parser::Item) -> TypeTable {
     match collect(parser::Program { items = items }) { Collected as c => c.types; error => panic("fv_table: collect failed") }
@@ -3471,4 +3478,100 @@ fn field_view_unknown_deriver_is_error() {
 fn field_view_non_struct_or_class_is_error() {
     let table = color_enum_table()
     match deriver_field_view("Color", table) { []FieldView => teko::assert::is_true(false); error => teko::assert::is_true(true) }
+}
+
+/** An empty TypeTable — the DI pass keys its registry by source interface names, never touching
+ *  the table, so DI unit tests need no `collect` (which would reject the deliberately dangling
+ *  interface names these fixtures use). */
+fn di_empty_table() -> TypeTable { teko::list::empty() }
+
+/** A `#lifetime` DI class item: a class with a no-arg static factory `make` and an implements list. */
+fn di_class_item(name: str, kind: parser::DiKind, implements: []str) -> parser::Item {
+    let methods = teko::list::push(teko::list::empty(), impl_static_method("make", parser::Visibility::Pub))
+    let body = parser::ClassBody { kind = parser::ClassKind::Sealed; has_base = false; base_name = ""; has_base_binding = false; base_binding_name = ""; implements = implements; fields = teko::list::empty(); methods = methods }
+    parser::Item { content = parser::TypeDecl { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = body; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; di_kind = kind; has_di_key = false; di_key = "" }; namespace = ""; file = "" }
+}
+
+/** A function item carrying a single `#inject(name: Type)` binding. */
+fn di_inject_fn_item(fn_name: str, bind_name: str, bind_type: str) -> parser::Item {
+    let binding = parser::InjectBinding { name = bind_name; type_ann = named_t(bind_type); has_key = false; key = ""; line = 7; col = 3 }
+    let injects = teko::list::push(teko::list::empty(), binding)
+    let f = parser::Function { name = fn_name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = teko::list::empty(); has_return = false; return_type = named_t("i64"); body = teko::list::empty(); vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false; has_inject = true; injects = injects }
+    parser::Item { content = f; namespace = ""; file = "" }
+}
+
+#test
+fn di_single_provider_registers_and_resolves() {
+    let items = teko::list::push(teko::list::empty(), di_class_item("Logger", parser::DiKind::Singleton, teko::list::push(teko::list::empty(), "Log")))
+    match build_di_registry(parser::Program { items = items }, di_empty_table()) {
+        DiRegistry as reg => {
+            teko::assert::is_true(reg.providers.len == 1)
+            teko::assert::is_true(reg.providers[0].iface == "Log")
+            teko::assert::is_true(reg.providers[0].impl_name == "Logger")
+            teko::assert::is_true(reg.providers[0].factory == "make")
+            match resolve_provider(reg, "Log") { DiProvider as p => teko::assert::is_true(p.kind == parser::DiKind::Singleton); error => teko::assert::is_true(false) }
+        }
+        error => teko::assert::is_true(false)
+    }
+}
+
+#test
+fn di_duplicate_registration_is_error() {
+    let a = di_class_item("LoggerA", parser::DiKind::Singleton, teko::list::push(teko::list::empty(), "Log"))
+    let b = di_class_item("LoggerB", parser::DiKind::Scoped, teko::list::push(teko::list::empty(), "Log"))
+    let items = teko::list::push(teko::list::push(teko::list::empty(), a), b)
+    match build_di_registry(parser::Program { items = items }, di_empty_table()) { DiRegistry => teko::assert::is_true(false); error => teko::assert::is_true(true) }
+}
+
+#test
+fn di_missing_provider_is_error() {
+    let fn_item = di_inject_fn_item("handle", "log", "Log")
+    let items = teko::list::push(teko::list::empty(), fn_item)
+    match check_di(parser::Program { items = items }, di_empty_table()) { null => teko::assert::is_true(false); error => teko::assert::is_true(true) }
+}
+
+#test
+fn di_inject_with_registered_provider_is_accepted() {
+    let cls = di_class_item("Logger", parser::DiKind::Singleton, teko::list::push(teko::list::empty(), "Log"))
+    let fn_item = di_inject_fn_item("handle", "log", "Log")
+    let items = teko::list::push(teko::list::push(teko::list::empty(), cls), fn_item)
+    match check_di(parser::Program { items = items }, di_empty_table()) { null => teko::assert::is_true(true); error => teko::assert::is_true(false) }
+}
+
+#test
+fn di_lifetime_on_non_class_is_error() {
+    let te = teko::list::push(teko::list::empty(), fv_field("x", named_t("i64")))
+    let bad = fv_struct_item("Thing", te)
+    let items = teko::list::push(teko::list::empty(), with_struct_di_singleton(bad))
+    match build_di_registry(parser::Program { items = items }, di_empty_table()) { DiRegistry => teko::assert::is_true(false); error => teko::assert::is_true(true) }
+}
+
+/** Attach `#singleton` to a struct item (an illegal placement the DI pass must reject). */
+fn with_struct_di_singleton(item: parser::Item) -> parser::Item {
+    match item.content {
+        parser::TypeDecl as td => parser::Item { content = parser::TypeDecl { name = td.name; type_params = td.type_params; type_constraints = td.type_constraints; body = td.body; vis = td.vis; has_doc = td.has_doc; doc = td.doc; line = td.line; col = td.col; di_kind = parser::DiKind::Singleton; has_di_key = false; di_key = "" }; namespace = item.namespace; file = item.file }
+        _ => item
+    }
+}
+
+#test
+fn di_use_lowers_to_materializer_call() {
+    let ib = DiInjectBind { name = "log"; iface = "Log"; impl_name = "Logger"; kind = parser::DiKind::Singleton }
+    let te = di_lower_use(ib, Named { name = "Log" })
+    match te.kind {
+        TCall as c => {
+            teko::assert::is_true(c.callee.segments.len == 1)
+            teko::assert::is_true(c.callee.segments[0].name == "__di_materialize_Logger")
+            teko::assert::is_true(c.args.len == 0)
+            teko::assert::is_false(c.is_iface_dispatch)
+        }
+        _ => teko::assert::is_true(false)
+    }
+    teko::assert::is_true(is_di_materializer_call("__di_materialize_Logger"))
+    teko::assert::is_false(is_di_materializer_call("make"))
+}
+
+#test
+fn di_materializer_name_is_impl_prefixed() {
+    teko::assert::is_true(di_materializer_name("Logger") == "__di_materialize_Logger")
 }

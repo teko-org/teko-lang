@@ -1433,3 +1433,60 @@ fn doc_comment_own_line_with_blank_line_still_attaches() {
         error => teko::assert::is_true(false)
     }
 }
+
+/** The `DiKind` carried by the first declaration of `source`, or `DiKind::None` if it is not a
+ *  type decl — a parser-test accessor for the W10c lifetime-annotation cases below. */
+fn first_decl_di_kind(source: str) -> DiKind {
+    match module_of(source) {
+        Module as m => match m.decls[0] { TypeDecl as td => td.di_kind; _ => DiKind::None }
+        error => DiKind::None
+    }
+}
+
+#test
+fn parses_lifetime_annotations_on_a_type() {
+    teko::assert::is_true(first_decl_di_kind("#singleton\ntype Logger = class { }") == DiKind::Singleton)
+    teko::assert::is_true(first_decl_di_kind("#scoped\ntype Session = class { }") == DiKind::Scoped)
+    teko::assert::is_true(first_decl_di_kind("#transient\ntype Handler = class { }") == DiKind::Transient)
+    teko::assert::is_true(first_decl_di_kind("type Plain = class { }") == DiKind::None)
+}
+
+#test
+fn parses_inject_overlay_on_a_function() {
+    match module_of("#inject(log: Logger, db: Store)\nfn handle() { }") {
+        Module as m => match m.decls[0] {
+            Function as f => {
+                teko::assert::is_true(f.has_inject)
+                teko::assert::is_true(f.injects.len == 2)
+                teko::assert::is_true(f.injects[0].name == "log")
+                teko::assert::is_true(f.injects[1].name == "db")
+                teko::assert::is_false(f.injects[0].has_key)
+            }
+            _ => teko::assert::is_true(false)
+        }
+        error => teko::assert::is_true(false)
+    }
+    match module_of("#inject()\nfn handle() { }") {
+        Module as m => match m.decls[0] {
+            Function as f => { teko::assert::is_true(f.has_inject); teko::assert::is_true(f.injects.len == 0) }
+            _ => teko::assert::is_true(false)
+        }
+        error => teko::assert::is_true(false)
+    }
+}
+
+#test
+fn rejects_swapped_di_placement() {
+    teko::assert::is_true(module_errors("#singleton\nfn handle() { }"))
+    teko::assert::is_true(module_errors("#inject(log: Logger)\ntype Logger = class { }"))
+}
+
+#test
+fn rejects_double_lifetime_annotation() {
+    teko::assert::is_true(module_errors("#singleton\n#scoped\ntype Logger = class { }"))
+}
+
+#test
+fn rejects_double_inject_overlay() {
+    teko::assert::is_true(module_errors("#inject(a: A)\n#inject(b: B)\nfn handle() { }"))
+}
