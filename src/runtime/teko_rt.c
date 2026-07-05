@@ -1312,6 +1312,37 @@ tk_str tk_rt_read_line(void) {
     return (tk_str){ buf, acc.len };
 }
 
+// tk_rt_read_stdin — slurp stdin until EOF, a bare tk_str (like tk_rt_read_line/tk_rt_version —
+// no error union, so the call lowers through the fully GENERIC extern path with no per-name
+// codegen dispatch; a `str | error` shape would need a NEW emit_host_ffi entry, which the
+// CURRENTLY RELEASED seed's codegen cannot lower — see #229). stdin is not seekable (unlike
+// read_file's fseek/ftell sizing), so this grows a plain malloc'd scratch buffer by doubling,
+// then makes ONE tk_alloc + memcpy into the arena-owned result (mirrors tk_str_of_cstr). A
+// genuine read failure is exceedingly rare for a host frontier primitive with no recoverable-
+// error channel (mirrors read_line()/version()) — panic (M.1 fail-loud) rather than truncating.
+tk_str tk_rt_read_stdin(void) {
+    size_t cap = 64 * 1024;
+    size_t len = 0;
+    char *scratch = (char *)malloc(cap);
+    if (scratch == NULL) tk_panic("cannot allocate stdin buffer");
+    for (;;) {
+        if (len == cap) {
+            cap = cap * 2;
+            char *grown = (char *)realloc(scratch, cap);
+            if (grown == NULL) { free(scratch); tk_panic("cannot grow stdin buffer"); }
+            scratch = grown;
+        }
+        size_t got = fread(scratch + len, 1, cap - len, stdin);
+        len += got;
+        if (got == 0) break;
+    }
+    if (ferror(stdin)) { free(scratch); tk_panic("cannot read stdin"); }
+    tk_byte *buf = (tk_byte *)tk_alloc(len ? len : 1);
+    if (len) memcpy(buf, scratch, len);
+    free(scratch);
+    return (tk_str){ buf, len };
+}
+
 tk_ffi_sres tk_rt_getenv(tk_str name) {
     char *n = tk_cstr(name);
     const char *v = getenv(n);

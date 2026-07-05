@@ -1,8 +1,12 @@
 // src/fmt/fmt.tks   (namespace 'teko::fmt') — DT0: `teko fmt`, the canonical formatter.
 //
+// A module-level header stays a `//` block (not a `/** */` doc-comment): Teko's Doc token
+// only attaches to a following fn/type/flags declaration (parse_decl.tks), never to a
+// `use` statement — there is no grammar slot for a floating module doc here.
+//
 // CONTRACT (TEKO_ROADMAP_DEVTOOLS.md §1 DT0). A CANONICAL pretty-printer (gofmt model:
-// zero options, no debate — open decision #1's recommendation, taken): parse → format
-// the token stream → emit. Comment preservation follows open decision #2's
+// zero options, no debate — open decision #1's recommendation, taken): parse -> format
+// the token stream -> emit. Comment preservation follows open decision #2's
 // recommendation: comments are re-attached from a SEPARATE token-stream pass (this
 // module's raw scanner keeps them as tokens), never from AST surgery — the parser and
 // AST stay untouched.
@@ -41,8 +45,8 @@
 // CLI (run_cli): `teko fmt <path>…` rewrites files in place (prints each changed path);
 // `teko fmt --check <path>…` writes nothing, prints each UNformatted path and exits 1
 // when any exists (the CI gate). A path is a `.tks`/`.tkt` file or a directory walked
-// recursively (dot-entries skipped). stdin/stdout mode is an HONEST STOP (M.3): there
-// is no stdin host surface yet, and DT0 adds no new runtime.
+// recursively (dot-entries skipped). `teko fmt -` (issue #229) reads the source from
+// stdin and writes the canonical result to stdout — no file is touched.
 
 use teko::lexer
 use teko::parser
@@ -54,17 +58,17 @@ use teko::parser
 // ---------------------------------------------------------------------------
 
 type FTokKind = enum {
-    Word      // identifier or keyword (incl `_`, `true`/`false`/`null`)
-    Num       // number literal (raw: `1_000`, `0xFF`, `1.5e3`)
-    Strish    // any string/byte/char literal, raw incl quotes: "…" $"…" @"…" """…""" b'…' c'…'
+    Word   // identifier or keyword (incl `_`, `true`/`false`/`null`)
+    Num   // number literal (raw: `1_000`, `0xFF`, `1.5e3`)
+    Strish   // any string/byte/char literal, raw incl quotes: "…" $"…" @"…" """…""" b'…' c'…'
     Comment   // `// …` (trailing ws trimmed) or `/* … */` / `/** … */` verbatim
-    Punct     // operator/delimiter, maximal-munch (mirrors lexer::read_symbol)
-    Break     // a newline
+    Punct   // operator/delimiter, maximal-munch (mirrors lexer::read_symbol)
+    Break   // a newline
 }
 
 type FTok = struct {
-    kind:  FTokKind
-    text:  str
+    kind: FTokKind
+    text: str
     glued: bool   // true when this token starts EXACTLY where the previous one ended (no gap)
 }
 
@@ -258,7 +262,7 @@ fn f_string_start(source: str, pos: u64) -> bool {
 
 // punct length at pos — maximal munch, EXACTLY lexer::read_symbol's table. 0 = unknown.
 fn punct_len(source: str, pos: u64) -> u64 {
-    let c  = source[pos]
+    let c = source[pos]
     let c1 = f_at(source, pos + 1)
     let c2 = f_at(source, pos + 2)
     if c == b'<' && c1 == b'<' && c2 == b'=' { return 3 }
@@ -444,8 +448,8 @@ fn is_angle(t: FTok) -> bool {
 // the canonical gap (in spaces) between `prev` and `cur` on one line.
 // `prev_unary` = prev is a prefix operator (`!`, or `+`/`-`/`~` in unary position).
 fn gap(prev: FTok, cur: FTok, prev_unary: bool) -> u64 {
-    if cur.kind == FTokKind::Comment { return 3 }               // trailing comment — 3 spaces
-    if prev.kind == FTokKind::Comment { return 1 }              // code after a block comment
+    if cur.kind == FTokKind::Comment { return 3 }   // trailing comment — 3 spaces
+    if prev.kind == FTokKind::Comment { return 1 }   // code after a block comment
     let pp = prev.kind == FTokKind::Punct
     let cp = cur.kind == FTokKind::Punct
     if cp && (cur.text == "," || cur.text == ";") { return 0 }
@@ -456,8 +460,8 @@ fn gap(prev: FTok, cur: FTok, prev_unary: bool) -> u64 {
     if cp && (cur.text == ".." || cur.text == "..=") { return 0 }
     if pp && (prev.text == ".." || prev.text == "..=") { return 0 }
     if cp && (cur.text == "++" || cur.text == "--") { return 0 }   // postfix
-    if cp && cur.text == "?" { return 0 }                          // postfix type suffix `T?`
-    if prev_unary { return 0 }                                     // `!x`, `-x`, `~x`, `-(…)`
+    if cp && cur.text == "?" { return 0 }   // postfix type suffix `T?`
+    if prev_unary { return 0 }   // `!x`, `-x`, `~x`, `-(…)`
     if is_angle(cur) || is_angle(prev) {
         if cur.glued { return 0 }
         return 1
@@ -466,7 +470,7 @@ fn gap(prev: FTok, cur: FTok, prev_unary: bool) -> u64 {
         if pp && (prev.text == "(" || prev.text == "[") { return 0 }
         if prev.kind == FTokKind::Word {
             if is_kw(prev.text) { return 1 }
-            return 0                                               // a call / an index
+            return 0   // a call / an index
         }
         if pp && (prev.text == ")" || prev.text == "]" || prev.text == "?" || prev.text == "++" || prev.text == "--") { return 0 }
         return 1
@@ -478,7 +482,7 @@ fn gap(prev: FTok, cur: FTok, prev_unary: bool) -> u64 {
     if cp && cur.text == "}" { return 1 }
     if pp && prev.text == "}" { return 1 }
     if pp && prev.text == "]" && cur.kind == FTokKind::Word && !is_kw(cur.text) { return 0 }   // `[]str`
-    if pp && prev.text == "#" { return 0 }                         // `#test`
+    if pp && prev.text == "#" { return 0 }   // `#test`
     if cp && cur.text == ":" { return 0 }
     if pp && prev.text == ":" { return 1 }
     1
@@ -634,15 +638,15 @@ fn same_stream(a: []FTok, b: []FTok) -> bool {
 fn front_end_accepts(source: str) -> error? {
     let tokens = match lexer::tokenize(source) {
         []lexer::Token as t => t
-        error as e          => return e
+        error as e => return e
     }
     let module_err = match parser::parse_module(tokens, 0) {
         parser::Parsed<parser::Module> as _ok => return null
-        error as e                            => e
+        error as e => e
     }
     match parser::parse_main_file(tokens, 0) {
         parser::Parsed<parser::MainFile> as _ok => return null
-        error                                   => return module_err
+        error => return module_err
     }
     null
 }
@@ -651,13 +655,13 @@ fn front_end_accepts(source: str) -> error? {
 pub fn format_source(source: str) -> str | error {
     match front_end_accepts(source) {
         error as e => return e
-        null       => {}
+        null => { }
     }
     let toks = match scan_tokens(source) { []FTok as t => t; error as e => return e }
     let out = render(toks)
     let back = match scan_tokens(out) {
         []FTok as t => t
-        error       => return f_err("fmt internal error: the formatted output does not re-scan (refusing to write)")
+        error => return f_err("fmt internal error: the formatted output does not re-scan (refusing to write)")
     }
     if !same_stream(toks, back) {
         return f_err("fmt internal error: formatting would alter the token stream (refusing to write)")
@@ -681,7 +685,7 @@ fn collect_files(path: str, acc: []str) -> []str | error {
     }
     let entries = match teko::fs::list_dir(path) {
         []str as e => e
-        error      => return error { message = teko::str::concat(path, ": not a directory or a .tks/.tkt file") }
+        error => return error { message = teko::str::concat(path, ": not a directory or a .tks/.tkt file") }
     }
     mut out = acc
     mut i: u64 = 0
@@ -697,7 +701,7 @@ fn collect_files(path: str, acc: []str) -> []str | error {
                     []str as _sub => {
                         out = match collect_files(child, out) { []str as o => o; error as e => return e }
                     }
-                    error => {}   // a non-Teko regular file — skip
+                    error => { }   // a non-Teko regular file — skip
                 }
             }
         }
@@ -706,8 +710,36 @@ fn collect_files(path: str, acc: []str) -> []str | error {
     out
 }
 
-// run_cli — argv is the FULL args (args[0]=program, args[1]="fmt"). Returns the exit code:
-// 0 ok; 1 = --check found unformatted files; 2 = usage/IO/parse error.
+/**
+ * run_stdin — the `teko fmt -` mode (issue #229): read the whole of stdin, format it, and
+ * write the canonical result to stdout — no file is touched, in place or otherwise. Under
+ * `--check`, nothing is printed to stdout; the placeholder path "<stdin>" is reported (the
+ * gofmt `-l -` convention) when the input would change, and the exit code carries the verdict.
+ */
+fn run_stdin(check: bool) -> i32 {
+    let src = teko::io::read_stdin()
+    let out = match format_source(src) {
+        str as o => o
+        error as e => { teko::io::eprintln(teko::str::concat("teko fmt: <stdin>: ", e.message)); return 2 }
+    }
+    if check {
+        if out != src {
+            teko::io::println("<stdin>")
+            return 1
+        }
+        return 0
+    }
+    teko::io::write(out)
+    0
+}
+
+/**
+ * run_cli — argv is the FULL args (args[0]=program, args[1]="fmt"). Returns the exit code:
+ * 0 ok; 1 = --check found unformatted files (or a `-` stdin input that would change); 2 =
+ * usage/IO/parse error. A single `-` path switches to run_stdin (issue #229); mixing `-`
+ * with other paths is rejected by collect_files (it is neither a directory nor a
+ * .tks/.tkt file), which is an honest refusal rather than a silently ambiguous mode.
+ */
 pub fn run_cli(args: []str) -> i32 {
     mut check = false
     mut paths: []str = teko::list::empty()
@@ -718,10 +750,11 @@ pub fn run_cli(args: []str) -> i32 {
         if a == "--check" { check = true } else { paths = teko::list::push(paths, a) }
         i = i + 1
     }
+    if paths.len == 1 && paths[0] == "-" {
+        return run_stdin(check)
+    }
     if paths.len == 0 {
-        // stdin/stdout mode is DT0-contracted but there is no stdin host surface yet and
-        // DT0 adds no new runtime — an HONEST STOP (M.3), not a silent misread.
-        teko::io::eprintln("teko fmt: stdin mode is not available yet (no stdin host surface) — pass a .tks/.tkt file or a directory")
+        teko::io::eprintln("teko fmt: pass a .tks/.tkt file, a directory, or - for stdin")
         return 2
     }
     mut files: []str = teko::list::empty()
@@ -740,11 +773,11 @@ pub fn run_cli(args: []str) -> i32 {
         if fi >= files.len { break }
         let path = files[fi]
         let src = match teko::io::read_file(path) {
-            str as s   => s
+            str as s => s
             error as e => { teko::io::eprintln(teko::str::concat("teko fmt: ", path, ": ", e.message)); return 2 }
         }
         let out = match format_source(src) {
-            str as o   => o
+            str as o => o
             error as e => { teko::io::eprintln(teko::str::concat("teko fmt: ", path, ": ", e.message)); return 2 }
         }
         if out != src {
@@ -754,7 +787,7 @@ pub fn run_cli(args: []str) -> i32 {
             } else {
                 match teko::io::write_file(path, out) {
                     error as e => { teko::io::eprintln(teko::str::concat("teko fmt: ", path, ": ", e.message)); return 2 }
-                    null       => {}
+                    null => { }
                 }
                 teko::io::println(path)
             }

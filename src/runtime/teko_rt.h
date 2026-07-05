@@ -344,6 +344,10 @@ tk_ffi_sres tk_rt_read_file(tk_str path);
 tk_str tk_rt_read_line(void);
 // (DT3) teko::io::stdin_eof() — did the LAST read_line() hit real EOF (stdin fully exhausted)?
 bool tk_rt_stdin_eof(void);
+// (#229) teko::io::read_stdin() — slurp all of stdin until EOF (owned copy), for `teko fmt -`.
+// A bare tk_str (no error union — see tk_rt_read_stdin's definition for why); panics on a
+// genuine read failure.
+tk_str tk_rt_read_stdin(void);
 // teko::env::var(name) — the environment value, or error when unset.
 tk_ffi_sres tk_rt_getenv(tk_str name);
 // teko::io::write_file(path, content) — (over)write the file; error on failure.
