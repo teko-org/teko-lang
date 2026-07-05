@@ -58,9 +58,13 @@ EXPECTED_FAIL=(
 # (exit < 126 rules out panic/abort/signal deaths); no VM comparison is possible.
 # time_types — calls the extern host-clock FFI (teko::time).
 # extern_reachability — C7.20: two declared [extern.libs], only one called (extern FFI).
+# buf_ptr_memset_roundtrip — calls a raw `extern` (libc memset) over a `teko::mem::buf_ptr`
+#   arena buffer (C7.19); `buf_ptr` is a host-only builtin with no VM interception, same
+#   honest-stop shape as any other raw extern.
 NATIVE_ONLY=(
     time_types
     extern_reachability
+    buf_ptr_memset_roundtrip
 )
 
 is_expected_fail() {

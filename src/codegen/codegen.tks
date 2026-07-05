@@ -1704,6 +1704,23 @@ fn emit_list_push(buf: []byte, prog: checker::TProgram, e: checker::TExpr, c: ch
     out
 }
 
+/**
+ * C7.19 (#169 D0) — `teko::mem::buf_ptr(len)` lowers to a direct arena bump-allocation:
+ * `(uint8_t *)tk_region_alloc(<enclosing region>, (size_t)(len))`. Reuses whichever S1 region is
+ * open at the call site (a block region, else the function frame, else the process root — the
+ * same rule `emit_struct_init_framed` uses for a frame-local box), so the returned `ptr<byte>`'s
+ * storage is bulk-freed exactly when that region drops. No runtime forwarder is needed: the arena
+ * primitive is already a plain two-argument C call, so this is inlined rather than routed through
+ * `emit_host_ffi` (which exists for FIXED-ABI struct-returning FFI bottoms, not this).
+ */
+fn emit_buf_ptr(buf: []byte, prog: checker::TProgram, c: checker::TCall, escaping: []str, regions: []RegionFrame, fn_body: []checker::TStatement, dctx: DeferCtx) -> []byte | error {
+    mut out = cb(buf, "(uint8_t *)tk_region_alloc(")
+    out = cb(out, cg_enclosing_region_expr(regions))
+    out = cb(out, ", (size_t)(")
+    out = match emit_expr_ctx(out, prog, checker::Void { }, c.args[0], escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
+    cb(out, "))")
+}
+
 // (mem::free ruling 2026-07-03) `teko::mem::free(x)` → a void GNU stmt-expr that RECLAIMS x's heap
 // block and SCRUBS the binding so a later read yields empty/null, never the freed buffer:
 //   * []T   → tk_free_block(x.ptr, x.len*sizeof(elem)) parks the backing buffer for same-size reuse,
@@ -1946,6 +1963,7 @@ fn emit_call(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, e: c
             if l == "run_quiet"     { return emit_host_ffi(buf, prog, e, c, "run",    "tk_rt_run_quiet", escaping, regions, fn_body, dctx) }   // (issue #73) cc flag-family probe
             if l == "bytes_from_ptr" { return emit_host_ffi(buf, prog, e, c, "bytes", "tk_bytes_from_ptr", escaping, regions, fn_body, dctx) }   // (C7.1a) ptr+len -> []byte (slice-lift)
             if l == "str_from_utf8" { return emit_host_ffi(buf, prog, e, c, "sres_byteslice", "tk_rt_str_from_utf8", escaping, regions, fn_body, dctx) }   // ROUND 0: ([]byte) -> str | error
+            if l == "buf_ptr" { return emit_buf_ptr(buf, prog, c, escaping, regions, fn_body, dctx) }
         }
     }
     // Non-shadowable built-ins: `print`/`println`, either bare or under `teko`.

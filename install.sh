@@ -1,40 +1,39 @@
 #!/bin/sh
 # install.sh — installer for the Teko compiler (`teko`), macOS + Linux.
 #
-# Two install paths:
-#   1. from-release (DEFAULT) — download the prebuilt `teko-<label>.tar.gz` from the
-#      latest GitHub release, verify its sha256 against SHA256SUMS.txt, extract, strip
-#      the macOS quarantine flag, and install the binary to a prefix on your PATH.
-#   2. from-source (--from-source, or AUTOMATIC when no prebuilt asset exists for this
-#      architecture — e.g. Intel macOS x86_64) — build `teko` with the system C compiler,
-#      preferring CMake in a teko-lang checkout, else the portable bootstrap-src bundle.
+# from-release ONLY (ruling 2026-07-04, issue #157): this installer is not a toolchain —
+# it downloads the prebuilt `teko-<label>.tar.gz` from a GitHub release (default: the
+# latest published one), verifies its sha256 against SHA256SUMS.txt, extracts, strips the
+# macOS quarantine flag, and installs the binary to a prefix on your PATH. It also stages
+# that release's `teko-bootstrap-src.tar.gz` runtime/assert/win32_compat.h sources under a
+# `share/teko` dir mirroring the chosen prefix — this is what lets `teko build` on the
+# installed binary find its C runtime outside a teko-lang checkout (see `rt_dir()` /
+# `probe_share_rt_dir()` in src/build/project.tks). A platform with no published asset is
+# an honest error listing the assets that DO exist — never a silent from-source build.
 #
 # Quick start:
-#   curl -fsSL https://raw.githubusercontent.com/schivei/teko-lang/chore/reboot/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/schivei/teko-lang/main/install.sh | sh
 #
 # Options:
-#   --from-source        force the from-source build path
 #   --version <tag>      install a specific release tag (default: latest)
 #   --prefix <dir>       install directory (default: /usr/local/bin, else ~/.local/bin)
-#   --uninstall          remove the installed `teko` binary
+#   --uninstall          remove the installed `teko` binary (and its share/teko runtime)
 #   --help               show this help
 #
 # Environment overrides:
 #   TEKO_VERSION   same as --version <tag>
 #   PREFIX         same as --prefix <dir>
-#   CC             C compiler to use for the from-source build (default: cc)
 #
 # POSIX sh only — no bashisms. Safe to pipe from curl.
 set -eu
 
 REPO="schivei/teko-lang"
 REPO_URL="https://github.com/${REPO}"
-RAW_BRANCH="chore/reboot"
+RAW_BRANCH="main"
 
 # ── configurable state (filled from flags / env) ─────────────────────────────
 VERSION="${TEKO_VERSION:-}"       # release tag, empty = latest
 PREFIX="${PREFIX:-}"              # install dir, empty = auto-resolve
-FROM_SOURCE=0
 DO_UNINSTALL=0
 BIN_NAME="teko"
 
@@ -52,7 +51,6 @@ Usage:
   install.sh [options]
 
 Options:
-  --from-source      build teko from source instead of downloading a release
   --version <tag>    install a specific release tag (default: latest)
   --prefix <dir>     install directory (default: /usr/local/bin, else ~/.local/bin)
   --uninstall        remove the installed teko binary and exit
@@ -61,12 +59,11 @@ Options:
 Environment:
   TEKO_VERSION   same as --version
   PREFIX         same as --prefix
-  CC             C compiler for the from-source build (default: cc)
 
 Examples:
   curl -fsSL https://raw.githubusercontent.com/${REPO}/${RAW_BRANCH}/install.sh | sh
   ./install.sh --version 0.0.1.3-bootstrap
-  ./install.sh --from-source --prefix "\$HOME/.local/bin"
+  ./install.sh --prefix "\$HOME/.local/bin"
   ./install.sh --uninstall
 EOF
 }
@@ -74,7 +71,6 @@ EOF
 # ── argument parsing (POSIX getopts can't do long options, so parse by hand) ──
 while [ "$#" -gt 0 ]; do
     case "$1" in
-        --from-source)  FROM_SOURCE=1 ;;
         --uninstall)    DO_UNINSTALL=1 ;;
         --help|-h)      usage; exit 0 ;;
         --version)      shift; [ "$#" -gt 0 ] || die "--version needs a tag"; VERSION="$1" ;;
@@ -87,8 +83,8 @@ while [ "$#" -gt 0 ]; do
 done
 
 # ── OS / arch detection ──────────────────────────────────────────────────────
-# Sets OS (macos|linux), ARCH (x86_64|arm64), LABEL (release asset label, may be empty
-# when no prebuilt asset exists for this platform, e.g. macOS x86_64).
+# Sets OS (macos|linux), ARCH (x86_64|arm64), LABEL (release asset label, empty when no
+# prebuilt asset is published for this platform — e.g. Intel macOS).
 detect_platform() {
     uname_s="$(uname -s)"
     uname_m="$(uname -m)"
@@ -105,12 +101,10 @@ detect_platform() {
         *)                     die "unsupported architecture: $uname_m" ;;
     esac
 
-    # Map (OS, ARCH) to the published release label. macOS ships arm64 only; Intel
-    # macOS has no prebuilt asset and must build from source (LABEL stays empty).
+    # Map (OS, ARCH) to the published release label. macOS ships arm64 only today.
     LABEL=""
     case "${OS}-${ARCH}" in
         macos-arm64)   LABEL="macos-arm64" ;;
-        macos-x86_64)  LABEL="" ;;             # no macos-x86_64 asset → from-source
         linux-x86_64)  LABEL="linux-x86_64" ;;
         linux-arm64)   LABEL="linux-arm64" ;;
     esac
@@ -184,14 +178,17 @@ download_ok() {
 
 # ── temp workspace with guaranteed cleanup ───────────────────────────────────
 WORKDIR=""
-cleanup() { [ -n "$WORKDIR" ] && rm -rf "$WORKDIR"; }
+cleanup() { if [ -n "$WORKDIR" ]; then rm -rf "$WORKDIR"; fi; }
 trap cleanup EXIT INT TERM
 mktmp() {
     WORKDIR="$(mktemp -d 2>/dev/null || mktemp -d -t teko-install)"
 }
 
 # ── resolve latest release tag via the GitHub API (best effort) ──────────────
+# Prefers the latest STABLE release; falls back to the newest prerelease when no stable
+# exists yet (pre-alpha: every release is `-alpha`), so `curl | sh` with no args works.
 latest_tag() {
+    # 1) latest STABLE: GitHub's /releases/latest excludes prereleases and drafts.
     api="https://api.github.com/repos/${REPO}/releases/latest"
     tmp="$WORKDIR/latest.json"
     if download_ok "$api" "$tmp"; then
@@ -199,7 +196,31 @@ latest_tag() {
         tag="$(sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$tmp" | head -n1)"
         [ -n "$tag" ] && { printf '%s' "$tag"; return 0; }
     fi
+    # 2) no stable yet — newest published release of ANY kind. The /releases list is
+    # newest-first and never returns drafts to unauthenticated callers, so the first
+    # tag_name is the newest prerelease. Honest notice on stderr (not stdout: stdout is
+    # the tag the caller captures).
+    api="https://api.github.com/repos/${REPO}/releases?per_page=30"
+    tmp="$WORKDIR/releases.json"
+    if download_ok "$api" "$tmp"; then
+        tag="$(sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$tmp" | head -n1)"
+        [ -n "$tag" ] && {
+            log "no stable release published yet — installing the latest prerelease: $tag"
+            printf '%s' "$tag"
+            return 0
+        }
+    fi
     return 1
+}
+
+# list_release_assets TAG — best-effort list of asset names published under TAG, for the
+# honest "no asset for your platform" error. Empty output when the API call fails.
+list_release_assets() {
+    tag="$1"
+    api="https://api.github.com/repos/${REPO}/releases/tags/${tag}"
+    tmp="$WORKDIR/assets.json"
+    download_ok "$api" "$tmp" || return 0
+    sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$tmp"
 }
 
 # ── install a binary file into INSTALL_DIR ───────────────────────────────────
@@ -216,6 +237,69 @@ install_binary() {
         xattr -d com.apple.quarantine "$dest" 2>/dev/null || true
     fi
     INSTALLED_BIN="$dest"
+}
+
+# share_dir_for_prefix PREFIX — the `share/teko` dir mirroring an install prefix (issue
+# #157): `/usr/local/bin` → `/usr/local/share/teko`; anything under `$HOME` (e.g. the
+# `~/.local/bin` fallback) → `$HOME/.local/share/teko`; any other custom --prefix mirrors
+# the same `<prefix-parent>/share/teko` shape. This is where the native-build runtime
+# (`teko_rt.{c,h}`, `assert/`, `win32_compat.h`) lives once installed — `rt_dir()`
+# (src/build/project.tks) probes it as a last resort so a project built with the
+# installed binary can still find its C runtime.
+share_dir_for_prefix() {
+    prefix="$1"
+    case "$prefix" in
+        "$HOME"/*) printf '%s' "$HOME/.local/share/teko" ;;
+        *)         printf '%s' "/usr/local/share/teko" ;;
+    esac
+}
+
+# install_share_runtime TAG — download this release's `teko-bootstrap-src.tar.gz` and
+# extract its `runtime/`, `assert/`, and `win32_compat.h` into the share dir mirroring
+# INSTALL_DIR (issue #157). Best-effort: a missing/broken bundle logs a warning and
+# leaves the binary installed — `teko build` still works for a project whose OWN
+# checkout happens to carry `src/runtime` (or `TK_RT_DIR` is set by hand); only a
+# from-scratch native build on a clean machine needs this share dir.
+install_share_runtime() {
+    tag="$1"
+    bundle_url="${REPO_URL}/releases/download/${tag}/teko-bootstrap-src.tar.gz"
+    bundle_tar="$WORKDIR/teko-bootstrap-src.tar.gz"
+
+    log "downloading $bundle_url (native-build runtime)"
+    if ! download_ok "$bundle_url" "$bundle_tar"; then
+        log "warning: no teko-bootstrap-src.tar.gz for $tag — 'teko build' may not find its C runtime outside a checkout"
+        return 1
+    fi
+
+    # Verify against the SHA256SUMS.txt already fetched for the binary (same release):
+    # present but no matching entry → refuse (tampered/corrupt); absent entirely → the
+    # binary install already logged that and fell back, so just skip verification here.
+    if [ -f "$WORKDIR/SHA256SUMS.txt" ]; then
+        want="$(grep "teko-bootstrap-src.tar.gz\$" "$WORKDIR/SHA256SUMS.txt" | awk '{print $1}' | head -n1)"
+        if [ -n "$want" ]; then
+            got="$(sha256_of "$bundle_tar")"
+            if [ "$want" != "$got" ]; then
+                log "warning: sha256 MISMATCH for teko-bootstrap-src.tar.gz (expected $want, got $got) — skipping share install"
+                return 1
+            fi
+            log "sha256 verified: $got"
+        fi
+    fi
+
+    ( cd "$WORKDIR" && tar -xzf teko-bootstrap-src.tar.gz ) || { log "warning: failed to extract teko-bootstrap-src.tar.gz"; return 1; }
+    bundle_dir="$WORKDIR/teko-bootstrap-src"
+    if [ ! -d "$bundle_dir/runtime" ] || [ ! -d "$bundle_dir/assert" ] || [ ! -f "$bundle_dir/win32_compat.h" ]; then
+        log "warning: teko-bootstrap-src.tar.gz is missing runtime/assert/win32_compat.h — skipping share install"
+        return 1
+    fi
+
+    share_dir="$(share_dir_for_prefix "$INSTALL_DIR")"
+    mkdir -p "$share_dir" || { log "warning: cannot create $share_dir — skipping share install"; return 1; }
+    cp -R "$bundle_dir/runtime" "$share_dir/runtime" || { log "warning: cannot write $share_dir/runtime"; return 1; }
+    cp -R "$bundle_dir/assert" "$share_dir/assert" || { log "warning: cannot write $share_dir/assert"; return 1; }
+    cp "$bundle_dir/win32_compat.h" "$share_dir/win32_compat.h" || { log "warning: cannot write $share_dir/win32_compat.h"; return 1; }
+    log "installed native-build runtime to $share_dir"
+    return 0
 }
 
 # ── verify the installed binary actually runs; print PATH hint if needed ──────
@@ -274,22 +358,51 @@ do_uninstall() {
         fi
     done
     [ "$removed" -eq 1 ] || log "no installed teko binary found in: $dirs"
+    remove_share_runtime "$dirs"
 }
 
-# ── from-release install path ────────────────────────────────────────────────
-install_from_release() {
-    [ -n "$LABEL" ] || return 1   # no prebuilt asset for this platform
+# remove_share_runtime DIRS — best-effort cleanup of the share/teko runtime this
+# installer stages (issue #157), mirroring each bin dir in DIRS via share_dir_for_prefix.
+remove_share_runtime() {
+    dirs="$1"
+    for d in $dirs; do
+        share_dir="$(share_dir_for_prefix "$d")"
+        if [ -d "$share_dir" ]; then
+            if [ -w "$(dirname "$share_dir")" ]; then
+                rm -rf "$share_dir" && log "removed $share_dir"
+            else
+                err "cannot remove $share_dir (no write permission) — try: sudo rm -rf '$share_dir'"
+            fi
+        fi
+    done
+}
 
+# no_asset_error TAG — an honest error when this platform has no published release asset:
+# list whatever assets DO exist for TAG and point at the support issue. Never falls back
+# to a silent build (ruling 2026-07-04, issue #157: install.sh is not a toolchain).
+no_asset_error() {
+    tag="$1"
+    assets="$(list_release_assets "$tag")"
+    err "no release asset published for ${OS}-${ARCH} in $tag."
+    if [ -n "$assets" ]; then
+        err "assets available in $tag:"
+        printf '%s\n' "$assets" | while IFS= read -r a; do err "  - $a"; done
+    fi
+    err "this installer only installs published binaries (no from-source build)."
+    err "please open an issue requesting a ${OS}-${ARCH} asset: ${REPO_URL}/issues"
+    exit 1
+}
+
+# ── from-release install (the ONLY install path) ─────────────────────────────
+install_from_release() {
     mktmp
     tag="$VERSION"
     if [ -z "$tag" ]; then
-        if tag="$(latest_tag)"; then
-            log "latest release: $tag"
-        else
-            log "could not resolve a latest release (none published yet?)"
-            return 1
-        fi
+        tag="$(latest_tag)" || die "could not resolve the latest release (none published yet?)"
+        log "latest release: $tag"
     fi
+
+    [ -n "$LABEL" ] || no_asset_error "$tag"
 
     base="${REPO_URL}/releases/download/${tag}"
     asset="teko-${LABEL}.tar.gz"
@@ -298,32 +411,27 @@ install_from_release() {
 
     log "downloading $asset_url"
     if ! download_ok "$asset_url" "$WORKDIR/$asset"; then
-        log "release asset not found: $asset_url"
-        return 1
+        no_asset_error "$tag"
     fi
 
-    # Verify checksum against the release's SHA256SUMS.txt. If the sums file is present
-    # we REQUIRE a match; a mismatch aborts. If it's absent, we refuse to trust the
-    # download and fall back to source.
-    if download_ok "$sums_url" "$WORKDIR/SHA256SUMS.txt"; then
-        want="$(grep " $asset\$" "$WORKDIR/SHA256SUMS.txt" | awk '{print $1}' | head -n1)"
-        if [ -z "$want" ]; then
-            # Some checksum files use "*name" (binary marker) or bare names; retry loosely.
-            want="$(grep "$asset" "$WORKDIR/SHA256SUMS.txt" | awk '{print $1}' | head -n1)"
-        fi
-        [ -n "$want" ] || die "no checksum for $asset in SHA256SUMS.txt (refusing to install unverified download)"
-        got="$(sha256_of "$WORKDIR/$asset")"
-        if [ "$want" != "$got" ]; then
-            die "sha256 MISMATCH for $asset
+    # Verify checksum against the release's SHA256SUMS.txt. Refuse to install without a
+    # verified match (tampered/corrupt download, or a release published without sums).
+    download_ok "$sums_url" "$WORKDIR/SHA256SUMS.txt" \
+        || die "SHA256SUMS.txt not available for $tag — refusing to install an unverified download"
+    want="$(grep " $asset\$" "$WORKDIR/SHA256SUMS.txt" | awk '{print $1}' | head -n1)"
+    if [ -z "$want" ]; then
+        # Some checksum files use "*name" (binary marker) or bare names; retry loosely.
+        want="$(grep "$asset" "$WORKDIR/SHA256SUMS.txt" | awk '{print $1}' | head -n1)"
+    fi
+    [ -n "$want" ] || die "no checksum for $asset in SHA256SUMS.txt (refusing to install unverified download)"
+    got="$(sha256_of "$WORKDIR/$asset")"
+    if [ "$want" != "$got" ]; then
+        die "sha256 MISMATCH for $asset
     expected: $want
     got:      $got
 Refusing to install a tampered/corrupt download."
-        fi
-        log "sha256 verified: $got"
-    else
-        log "SHA256SUMS.txt not available for $tag — cannot verify download, falling back to source"
-        return 1
     fi
+    log "sha256 verified: $got"
 
     # Extract the binary.
     ( cd "$WORKDIR" && tar -xzf "$asset" ) || die "failed to extract $asset"
@@ -331,95 +439,12 @@ Refusing to install a tampered/corrupt download."
 
     resolve_prefix
     install_binary "$WORKDIR/$BIN_NAME"
+    # (issue #157) stage the native-build runtime under share/teko so a `teko build` run
+    # from ANY project directory — not just a teko-lang checkout — finds teko_rt.c.
+    # Best-effort: install_share_runtime already logs a warning and returns non-zero on
+    # failure; a missing bundle must not fail the (already-verified) binary install.
+    install_share_runtime "$tag" || true
     finish
-    return 0
-}
-
-# ── from-source install path ─────────────────────────────────────────────────
-# Build order of preference:
-#   1. inside a teko-lang checkout with CMakeLists.txt → cmake build target `teko`
-#   2. else git clone --depth 1 the repo → cmake build
-#   3. else (only a released teko-bootstrap-src.tar.gz) → cc line from build.sh
-install_from_source() {
-    log "building teko from source with the system C compiler"
-
-    src_root=""
-    cloned=0
-
-    # (1) Are we already inside a teko-lang checkout?
-    if [ -f "./CMakeLists.txt" ] && [ -f "./main.c" ] && [ -d "./src/runtime" ]; then
-        src_root="$(pwd)"
-        log "using current checkout: $src_root"
-    fi
-
-    # (2) Try the portable source bundle from a release (no git/cmake needed).
-    if [ -z "$src_root" ]; then
-        mktmp
-        tag="$VERSION"
-        [ -n "$tag" ] || tag="$(latest_tag 2>/dev/null || true)"
-        if [ -n "$tag" ]; then
-            bundle_url="${REPO_URL}/releases/download/${tag}/teko-bootstrap-src.tar.gz"
-            log "trying portable source bundle: $bundle_url"
-            if download_ok "$bundle_url" "$WORKDIR/teko-bootstrap-src.tar.gz"; then
-                ( cd "$WORKDIR" && tar -xzf teko-bootstrap-src.tar.gz )
-                bdir="$WORKDIR/teko-bootstrap-src"
-                if [ -f "$bdir/teko.c" ] && [ -f "$bdir/runtime/teko_rt.c" ]; then
-                    build_bundle "$bdir" || die "bundle build failed"
-                    resolve_prefix
-                    install_binary "$bdir/$BIN_NAME"
-                    finish
-                    return 0
-                fi
-            fi
-            log "no usable source bundle for $tag"
-        fi
-    fi
-
-    # (3) No checkout and no bundle → clone the repo.
-    if [ -z "$src_root" ]; then
-        have git || die "git is required to clone the source (or run this from a teko-lang checkout)"
-        [ -n "${WORKDIR:-}" ] || mktmp
-        log "cloning $REPO_URL (branch $RAW_BRANCH)"
-        git clone --depth 1 --branch "$RAW_BRANCH" "$REPO_URL" "$WORKDIR/teko-lang" \
-            || git clone --depth 1 "$REPO_URL" "$WORKDIR/teko-lang" \
-            || die "git clone failed"
-        src_root="$WORKDIR/teko-lang"
-        cloned=1
-    fi
-
-    # CMake build of the `teko` target.
-    have cmake || die "cmake is required for the from-source build; install cmake or use a released source bundle"
-    have "${CC:-cc}" || die "no C compiler found (set CC or install a compiler)"
-    build_dir="$src_root/build-install"
-    log "cmake configure (Release)"
-    cmake -S "$src_root" -B "$build_dir" -DCMAKE_BUILD_TYPE=Release >&2 || die "cmake configure failed"
-    log "cmake build (target teko)"
-    cmake --build "$build_dir" --target teko >&2 || die "cmake build failed"
-
-    built="$build_dir/teko"
-    [ -f "$built" ] || built="$(find "$build_dir" -name teko -type f -perm -u+x 2>/dev/null | head -n1)"
-    [ -n "$built" ] && [ -f "$built" ] || die "cmake build did not produce a teko binary"
-
-    resolve_prefix
-    install_binary "$built"
-    # Clean the throwaway build dir we created inside a user checkout (leave clones to
-    # the temp cleanup trap).
-    [ "$cloned" -eq 0 ] && rm -rf "$build_dir"
-    finish
-    return 0
-}
-
-# build_bundle DIR — compile the portable bootstrap-src bundle with the documented cc
-# line (kept byte-identical to the bundle's build.sh / scripts/package_release.sh).
-build_bundle() {
-    d="$1"
-    cc="${CC:-cc}"
-    have "$cc" || die "no C compiler found (set CC or install a compiler)"
-    log "compiling bundle with: $cc -std=c23 -Iruntime -Iassert teko.c runtime/teko_rt.c assert/assert.c -lm -o teko"
-    ( cd "$d" && "$cc" -std=c23 -w -Iruntime -Iassert \
-        teko.c runtime/teko_rt.c assert/assert.c -lm -o teko ) \
-        || return 1
-    [ -f "$d/$BIN_NAME" ]
 }
 
 # ── main ─────────────────────────────────────────────────────────────────────
@@ -431,24 +456,7 @@ main() {
 
     detect_platform
     log "platform: ${OS}-${ARCH}${LABEL:+ (release label: $LABEL)}"
-
-    if [ "$FROM_SOURCE" -eq 1 ]; then
-        install_from_source
-        exit $?
-    fi
-
-    if [ -z "$LABEL" ]; then
-        log "no prebuilt binary for ${OS}-${ARCH} (e.g. Intel macOS is source-only) — building from source"
-        install_from_source
-        exit $?
-    fi
-
-    # Default: try the release, gracefully fall back to source.
-    if install_from_release; then
-        exit 0
-    fi
-    log "falling back to the from-source build"
-    install_from_source
+    install_from_release
 }
 
 main
