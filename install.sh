@@ -204,7 +204,9 @@ latest_tag() {
     tmp="$WORKDIR/releases.json"
     if download_ok "$api" "$tmp"; then
         tag="$(sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$tmp" \
-            | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | sort -V | tail -n1)"
+            | grep -E '^v?[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' \
+            | awk '{ orig=$0; ver=$0; sub(/^v/,"",ver); print ver"\t"orig }' \
+            | sort -V | tail -n1 | cut -f2)"
         [ -n "$tag" ] && {
             log "no stable release published yet — installing the latest prerelease: $tag"
             printf '%s' "$tag"
