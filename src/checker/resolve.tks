@@ -279,15 +279,226 @@ fn type_ref_ns(path: parser::Path, table: TypeTable, ref_ns: str) -> str {
     ""
 }
 
-// (W10b.D2) is the constraint on a type-param EXACTLY a single INTERFACE atom `<T: I>` (I a declared
-// interface)? Returns I's name iff so — the ONE shape that unlocks method dispatch on `T` (issue #99).
-// A compound constraint (`A & B`, `A | B`), a variant/struct/enum atom, a trait atom, or no
-// constraint all yield null (they keep the opaque honest-stop — a SEPARATE proposal, per the ruling).
-// The interface, monomorphized to the concrete type at each call site, drives the D3 vtable dispatch.
-fn constraint_single_interface(c: parser::ConstraintExpr, table: TypeTable) -> str? {
+// (S6, issue #162) an interface-atom's own EFFECTIVE (extends-transitive) methods — the leaf case
+// of a constraint's method surface. A trait atom is a named TR1 honest stop (the gancho #176
+// plugs by replacing this one arm with the trait's required methods, once traits reuse the D3
+// vtable — traits are struct-shaped/derivable per [[teko-traits-and-nullprop-rounds]]). Every
+// other atom kind (struct/enum/flags/variant/alias/extern/class — no shared nominal method
+// contract to expose) contributes an EMPTY surface: it may still satisfy the constraint nominally
+// (Tensão 1 — nominal membership is unaffected), but authorizes no operation on T through it.
+fn atom_surface(name: str, table: TypeTable) -> []parser::Function | error {
+    if is_trait_name(name, table) { return error { message = $"'{name}' is a trait — a trait as a generic constraint (`<T: Trait>`) is not implemented yet (TR1)" } }
+    if is_interface_name(name, table) { return iface_methods_by_name(name, table) }
+    let empty_surface: []parser::Function = teko::list::empty()
+    empty_surface
+}
+
+// (S6) does `m` already appear (by name) in `methods`?
+fn surface_has(methods: []parser::Function, m: parser::Function) -> bool {
+    mut i = 0
+    loop { if i >= methods.len { return false }; if methods[i].name == m.name { return true }; i++ }
+    false
+}
+
+// (S6) the UNION of two method surfaces (an `A & B` constraint — T satisfies BOTH contracts, so
+// every method of both is authorized). A name shared by both sides is kept once.
+fn surface_union(a: []parser::Function, b: []parser::Function) -> []parser::Function {
+    mut out = a
+    mut i = 0
+    loop {
+        if i >= b.len { break }
+        if !surface_has(out, b[i]) { out = teko::list::push(out, b[i]) }
+        i++
+    }
+    out
+}
+
+// (S6) the signature-matched INTERSECTION of two method surfaces (an `A | B` constraint — T is
+// one OR the other at runtime, so only what BOTH universally guarantee — same name, same
+// non-receiver param types, same return type, via method_sig_matches — is safe to authorize).
+fn surface_intersect(a: []parser::Function, b: []parser::Function, table: TypeTable) -> []parser::Function {
+    mut out: []parser::Function = teko::list::empty()
+    mut i = 0
+    loop {
+        if i >= a.len { break }
+        mut j = 0
+        loop {
+            if j >= b.len { break }
+            if a[i].name == b[j].name && method_sig_matches(a[i], b[j], table, "") { out = teko::list::push(out, a[i]) }
+            j++
+        }
+        i++
+    }
+    out
+}
+
+/** The effective method surface a ConstraintExpr authorizes on a type-param T: an interface atom
+    contributes its own effective methods; `And` UNIONS the two sides' surfaces (both contracts
+    hold, so both surfaces' methods are safe); `Or` signature-matches INTERSECTS them (only what
+    every reachable branch guarantees is universally safe); a struct/variant atom or NoConstraint
+    contributes an empty (opaque-only) surface; a trait atom is atom_surface's named TR1 stop.
+    Recursive over the ConstraintExpr tree, mirroring constraint_satisfied's shape. */
+pub fn constraint_surface(c: parser::ConstraintExpr, table: TypeTable) -> []parser::Function | error {
     match c {
-        parser::ConstraintAtom as a => if is_interface_name(a.name, table) { a.name } else { null }
-        _                           => null   // And/Or/NoConstraint → not a single interface atom
+        parser::ConstraintAnd as a => {
+            let l = match constraint_surface(a.left, table) { []parser::Function as f => f; error as e => return e }
+            let r = match constraint_surface(a.right, table) { []parser::Function as f => f; error as e => return e }
+            surface_union(l, r)
+        }
+        parser::ConstraintOr as o => {
+            let l = match constraint_surface(o.left, table) { []parser::Function as f => f; error as e => return e }
+            let r = match constraint_surface(o.right, table) { []parser::Function as f => f; error as e => return e }
+            surface_intersect(l, r, table)
+        }
+        parser::ConstraintAtom as a => atom_surface(a.name, table)
+        parser::NoConstraint        => { let empty_surface: []parser::Function = teko::list::empty(); empty_surface }
+    }
+}
+
+// (S6, Risco 3) does `iface` already have a method (by NAME) present among `names`'s OWN methods
+// with a DIFFERENT signature — an ambiguous `A & B` where both declare e.g. `area` incompatibly?
+// Same name + SAME signature is fine (equivalent, kept once); same name + different signature is
+// rejected at the DEFINITION with a named error (never a silent pick).
+fn interface_conflicts_with(iface: str, names: []str, table: TypeTable) -> str | error {
+    let ims = match iface_methods_by_name(iface, table) { []parser::Function as f => f; error as e => return e }
+    mut i = 0
+    loop {
+        if i >= names.len { break }
+        let others = match iface_methods_by_name(names[i], table) { []parser::Function as f => f; error as e => return e }
+        mut mi = 0
+        loop {
+            if mi >= ims.len { break }
+            mut oi = 0
+            loop {
+                if oi >= others.len { break }
+                if ims[mi].name == others[oi].name && !method_sig_matches(ims[mi], others[oi], table, "") {
+                    return $"method '{ims[mi].name}' is ambiguous — declared by both '{names[i]}' and '{iface}' with different signatures"
+                }
+                oi++
+            }
+            mi++
+        }
+        i++
+    }
+    ""
+}
+
+// (S6) append `iface` to `names`, rejecting an ambiguous same-name-different-signature clash
+// against any interface already in the list (Risco 3) — the AND-union of a constraint's
+// interfaces. Duplicates (the exact same interface reachable via two branches) are kept once.
+fn interfaces_and_union(names: []str, iface: str, table: TypeTable) -> []str | error {
+    mut i = 0
+    loop { if i >= names.len { break }; if names[i] == iface { return names }; i++ }
+    let conflict = match interface_conflicts_with(iface, names, table) { str as s => s; error as e => return e }
+    if conflict != "" { return error { message = conflict } }
+    teko::list::push(names, iface)
+}
+
+// (S6) the interface names an `And` constraint contributes, merged with Risco-3 ambiguity
+// checking — every interface of `l` folded into `r`'s list (or vice versa; either order is
+// equivalent since the check is symmetric).
+fn merge_interfaces_and(l: []str, r: []str, table: TypeTable) -> []str | error {
+    mut out = r
+    mut i = 0
+    loop {
+        if i >= l.len { break }
+        out = match interfaces_and_union(out, l[i], table) { []str as s => s; error as e => return e }
+        i++
+    }
+    out
+}
+
+// (S6) keep only the interfaces of `names` that still own at least one method in `surface` (an
+// `Or`'s intersected surface) — an interface contributing nothing to the surviving surface would
+// add an unreachable `extends` to the synthetic InterfaceBody.
+fn interfaces_surviving(names: []str, surface: []parser::Function, table: TypeTable) -> []str | error {
+    mut out: []str = teko::list::empty()
+    mut i = 0
+    loop {
+        if i >= names.len { break }
+        let ms = match iface_methods_by_name(names[i], table) { []parser::Function as f => f; error as e => return e }
+        mut keep = false
+        mut mi = 0
+        loop { if mi >= ms.len { break }; if surface_has(surface, ms[mi]) { keep = true; break }; mi++ }
+        if keep { out = teko::list::push(out, names[i]) }
+        i++
+    }
+    out
+}
+
+/** The interface names a ConstraintExpr contributes to a type-param's synthetic InterfaceBody
+    `extends` list — the And-UNION of interface atoms (Risco-3 ambiguity-checked); an `Or`
+    contributes only the interfaces whose methods SURVIVE the intersected surface. Empty for a
+    struct/variant atom or NoConstraint; a named TR1 stop for a trait atom (mirrors atom_surface).
+    Recursive, mirroring constraint_surface's shape — the two stay in lockstep by construction. */
+fn constraint_interfaces(c: parser::ConstraintExpr, table: TypeTable) -> []str | error {
+    match c {
+        parser::ConstraintAnd as a => {
+            let l = match constraint_interfaces(a.left, table) { []str as s => s; error as e => return e }
+            let r = match constraint_interfaces(a.right, table) { []str as s => s; error as e => return e }
+            merge_interfaces_and(l, r, table)
+        }
+        parser::ConstraintOr as o => {
+            let surface = match constraint_surface(c, table) { []parser::Function as f => f; error as e => return e }
+            let l = match constraint_interfaces(o.left, table) { []str as s => s; error as e => return e }
+            let r = match constraint_interfaces(o.right, table) { []str as s => s; error as e => return e }
+            interfaces_surviving(surface_union_names(l, r), surface, table)
+        }
+        parser::ConstraintAtom as a => {
+            if is_trait_name(a.name, table) { return error { message = $"'{a.name}' is a trait — a trait as a generic constraint (`<T: Trait>`) is not implemented yet (TR1)" } }
+            if is_interface_name(a.name, table) { return teko::list::push(teko::list::empty(), a.name) }
+            let no_interfaces: []str = teko::list::empty()
+            no_interfaces
+        }
+        parser::NoConstraint => { let no_interfaces: []str = teko::list::empty(); no_interfaces }
+    }
+}
+
+// (S6) the union of two interface-name lists with no ambiguity check (an Or's two branches are
+// ALREADY narrowed by their own constraint_interfaces call; interfaces_surviving does the actual
+// gating against the intersected surface right after) — no duplicates.
+fn surface_union_names(a: []str, b: []str) -> []str {
+    mut out = a
+    mut i = 0
+    loop {
+        if i >= b.len { break }
+        mut already = false
+        mut j = 0
+        loop { if j >= out.len { break }; if out[j] == b[i] { already = true; break }; j++ }
+        if !already { out = teko::list::push(out, b[i]) }
+        i++
+    }
+    out
+}
+
+// (S6) which interface in `ifaces` (a type-param's synthetic InterfaceBody `extends` list) OWNS
+// `method` — the first (in `extends` order) whose OWN effective methods declare it — or null. This
+// keys the D3 vtable slot: an N-extends surface's method dispatches through whichever interface
+// actually declares it, exactly generalizing the single-interface `<T: I>` redirect.
+pub fn method_owner_interface(ifaces: []str, method: str, table: TypeTable) -> str? {
+    mut i = 0
+    loop {
+        if i >= ifaces.len { break }
+        let no_methods: []parser::Function = teko::list::empty()
+        let ms = match iface_methods_by_name(ifaces[i], table) { []parser::Function as f => f; error => no_methods }
+        mut j = 0
+        loop { if j >= ms.len { break }; if ms[j].name == method { return ifaces[i] }; j++ }
+        i++
+    }
+    null
+}
+
+// (S6) the type-param's synthetic InterfaceBody `extends` list for constraint `c` — the empty list
+// (opaque ExternBody, honest stop) for NoConstraint/a struct-or-variant atom, the constraint's
+// interfaces (constraint_interfaces) otherwise. A TR1/ambiguity error here is swallowed to the
+// opaque fallback: type_param_table has no error channel (mirrors S4's total-function shape), so
+// the SAME error re-surfaces, named, the moment the body actually operates on T (crumb 4/6) or a
+// concrete instantiation is checked (check_constraints) — never silently ignored (M.1).
+fn type_param_extends(c: parser::ConstraintExpr, table: TypeTable) -> []str {
+    let no_interfaces: []str = teko::list::empty()
+    match constraint_interfaces(c, table) {
+        []str as ifaces => ifaces
+        error            => no_interfaces
     }
 }
 
@@ -299,13 +510,16 @@ fn constraint_single_interface(c: parser::ConstraintExpr, table: TypeTable) -> s
 // type-param SHADOWS a same-named user type within the generic. Empty type_params → table unchanged.
 // Used by collect (func sigs), check_modules (vis check), and typer (bodies). (C: tk_type_param_table.)
 //
-// (W10b.D2, issue #99) `type_constraints` runs PARALLEL to `type_params` (same length; NoConstraint
-// where the caller has none). When index i's constraint is a SINGLE INTERFACE ATOM `<T: I>`, the
-// type-param is registered with an `InterfaceBody { extends = [I]; methods = [] }` instead of the
-// opaque ExternBody: this makes `Named{T}.method()` resolve through the EXISTING D3 interface-dispatch
-// path (type_method_call's InterfaceBody arm redirects to `I` for the callee/vtable, keeping the
-// receiver's own `Named{T}` type so monomorphization stamps T→concrete). Every OTHER constraint shape
-// (compound A&B/A|B, a struct/variant/trait atom, or none) stays opaque ExternBody — an honest stop.
+// (W10b.D2, issue #99; generalized S6/issue #162) `type_constraints` runs PARALLEL to
+// `type_params` (same length; NoConstraint where the caller has none). Index i's constraint
+// contributes an `extends` list of N interfaces (type_param_extends — the And-union / Or-
+// intersection surface's declaring interfaces; a single-interface atom `<T: I>` is the N=1
+// degenerate case, unchanged since #99). A non-empty list registers the type-param with an
+// `InterfaceBody { extends = <the list>; methods = [] }` instead of the opaque ExternBody: this
+// makes `Named{T}.method()` resolve through the EXISTING D3 interface-dispatch path
+// (type_method_call's InterfaceBody arm searches EACH interface of `extends` for the method,
+// keeping the receiver's own `Named{T}` type so monomorphization stamps T→concrete). An empty
+// list (struct/variant atom or no constraint) stays opaque ExternBody — an honest stop.
 pub fn type_param_table(type_params: []str, type_constraints: []parser::ConstraintExpr, ns: str, table: TypeTable) -> TypeTable {
     if type_params.len == 0 { return table }
     mut tbl: TypeTable = teko::list::empty()
@@ -314,17 +528,13 @@ pub fn type_param_table(type_params: []str, type_constraints: []parser::Constrai
         if i >= type_params.len { break }
         // namespace = the USING namespace so the W-vis-enforce cross-namespace/visibility check (check_modules)
         // treats the type-param as a LOCAL type, not a bare cross-namespace reference.
-        // (W10b.D2) a single-interface-atom constraint → an interface-mirroring body (extends the real
-        // interface; NO own methods, so type_method_call recognizes the type-param and redirects to it).
+        // (S6) the extends list mirrors the constraint's own contract surface — see type_param_extends.
         // The two arms are DIFFERENT members of the wider `TypeBody` variant; the arm-join infers the
         // narrow `InterfaceBody | ExternBody` union while the binding is the wider `TypeBody` — native
         // codegen widens each arm into `TypeBody` (fix/selfhost-arm-join-widen), so this natural form
         // (was a per-arm whole-TypeReg workaround under #99) compiles on the self-host BUILD too.
-        let iface_c: str? = if i < type_constraints.len { constraint_single_interface(type_constraints[i], table) } else { null }
-        let body: parser::TypeBody = match iface_c {
-            str as iface => parser::InterfaceBody { extends = teko::list::push(teko::list::empty(), iface); methods = teko::list::empty() }
-            null         => parser::ExternBody { }
-        }
+        let ifaces: []str = if i < type_constraints.len { type_param_extends(type_constraints[i], table) } else { teko::list::empty() }
+        let body: parser::TypeBody = if ifaces.len > 0 { parser::InterfaceBody { extends = ifaces; methods = teko::list::empty() } } else { parser::ExternBody { } }
         let d = parser::TypeDecl { name = type_params[i]; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = body; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }
         tbl = teko::list::push(tbl, TypeReg { name = type_params[i]; namespace = ns; vis = parser::Visibility::Private; decl = d })
         i++

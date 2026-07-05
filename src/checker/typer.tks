@@ -571,6 +571,71 @@ fn type_flags_method(mc: parser::MethodCall, env: Env, table: TypeTable) -> TExp
     TExpr { kind = TCompare { first = andexpr; rest = teko::list::push(teko::list::empty(), term) }; type = Prim { kind = PrimKind::Bool }; line = 0; col = 0 }
 }
 
+// (W10b.D3; generalized S6/issue #162) a resolved interface dot-call: the DECLARING interface
+// (the D3 vtable/upcast key), the resolved Function signature, and its vtable SLOT within that
+// interface's own effective-methods list.
+type IfaceDispatch = struct { iface: str; method: parser::Function; slot: u32 }
+
+// (S6) find `method` within `eff` (an interface's own effective methods), returning its slot.
+fn find_method_slot(eff: []parser::Function, method: str) -> IfaceDispatch? {
+    mut i: u64 = 0
+    loop {
+        if i >= eff.len { break }
+        if eff[i].name == method { return IfaceDispatch { iface = ""; method = eff[i]; slot = i to u32 } }
+        i++
+    }
+    null
+}
+
+// (W10b.D2, issue #99; generalized S6/issue #162) resolve `method` on an InterfaceBody receiver
+// to its DISPATCH interface + slot. A plain interface receiver (methods.len > 0) dispatches
+// against ITSELF (`struct_name`). A generic type-param — registered by type_param_table with an
+// InterfaceBody that has NO own methods and an `extends` list of N real interfaces (S6: the
+// constraint's And-union / Or-intersection surface) — searches EACH interface of `extends`, in
+// order, for the first that OWNS the method (method_owner_interface — the D3 vtable key), and
+// reads the slot from THAT interface's own effective-methods list (never a concatenated list —
+// the emitted vtable is per-(class, interface), so the slot must agree with it). A method not
+// owned by any interface of `extends` is the S6 "outside the authorized surface" honest stop.
+fn resolve_iface_dispatch(ib: parser::InterfaceBody, struct_name: str, method: str, table: TypeTable) -> IfaceDispatch | error {
+    if ib.methods.len > 0 || ib.extends.len != 1 {
+        let eff = match iface_methods_by_name(struct_name, table) { []parser::Function as f => f; error as e => return e }
+        return match find_method_slot(eff, method) {
+            IfaceDispatch as d => IfaceDispatch { iface = struct_name; method = d.method; slot = d.slot }
+            null               => error { message = $"no such method '{method}' on interface '{struct_name}'" }
+        }
+    }
+    let owner = match method_owner_interface(ib.extends, method, table) {
+        str as o => o
+        null     => return error { message = $"method '{method}' is not guaranteed by the constraint on type parameter '{struct_name}' ({type_param_surface_message(ib.extends, table)})" }
+    }
+    let eff = match iface_methods_by_name(owner, table) { []parser::Function as f => f; error as e => return e }
+    match find_method_slot(eff, method) {
+        IfaceDispatch as d => IfaceDispatch { iface = owner; method = d.method; slot = d.slot }
+        null               => error { message = $"internal: method_owner_interface named '{owner}' as owner of '{method}' but its effective methods do not contain it" }
+    }
+}
+
+// (S6, M.1) render the type-param's authorized surface (every method name every constrained
+// interface of `extends` contributes) for the "not guaranteed by the constraint" error — so the
+// message enumerates what IS available, never just what is missing.
+fn type_param_surface_message(extends: []str, table: TypeTable) -> str {
+    mut names = ""
+    mut i = 0
+    loop {
+        if i >= extends.len { break }
+        let ms = match iface_methods_by_name(extends[i], table) { []parser::Function as f => f; error => teko::list::empty() }
+        mut j = 0
+        loop {
+            if j >= ms.len { break }
+            if names == "" { names = ms[j].name } else { names = $"{names}, {ms[j].name}" }
+            j++
+        }
+        i++
+    }
+    if names == "" { return "available: none" }
+    $"available: {names}"
+}
+
 // (OOP A1, 2026-07-01) `recv.method(args)` — an INSTANCE struct-method dot-call. Desugars into
 // an ordinary `StructName::method(recv, ...args)` Call and delegates to `type_call` wholesale
 // (reuses arity/defargs/generics/namespace-mangling for free — the same trick `~` used for
@@ -595,27 +660,10 @@ fn type_method_call(mc: parser::MethodCall, env: Env, table: TypeTable) -> TExpr
     // value, or a class instance the emitters upcast on the fly). Mirror: expr.c::type_method_call.
     match decl.body {
         parser::InterfaceBody as ib => {
-            // (W10b.D2, issue #99) the DISPATCH interface. For a plain interface receiver this IS
-            // `struct_name`. For a generic type-param `<T: I>` — registered by type_param_table with
-            // an InterfaceBody that has NO own methods and a SINGLE `extends` naming the real interface
-            // — redirect to `I` (extends[0]): the callee path + vtable key off a REAL interface (a
-            // type-param has no emitted C type / vtable), while the receiver stays `Named{T}` (below,
-            // via `struct_name`) so monomorphization stamps T→concrete. The redirect is a no-op for a
-            // normal interface (methods.len > 0), and provably slot-equivalent for a degenerate real
-            // `interface X extends Y {}` (0 own methods, 1 extends) — X's only methods ARE Y's.
-            let iface_canon = if ib.methods.len == 0 && ib.extends.len == 1 { ib.extends[0] } else { struct_name }
-            let eff = match iface_methods_by_name(iface_canon, table) { []parser::Function as f => f; error as e => return e }
-            if eff.len == 0 { return error { message = $"no such method '{mc.method}' on interface '{struct_name}'" } }
-            mut ifound = false
-            mut slot: u32 = 0
-            mut imfn = eff[0]   // placeholder; overwritten below iff `ifound` (Teko has no uninitialized values)
-            mut smi: u64 = 0
-            loop {
-                if smi >= eff.len { break }
-                if eff[smi].name == mc.method { ifound = true; imfn = eff[smi]; slot = smi to u32; break }
-                smi++
-            }
-            if !ifound { return error { message = $"no such method '{mc.method}' on interface '{struct_name}'" } }
+            let dispatch = match resolve_iface_dispatch(ib, struct_name, mc.method, table) { IfaceDispatch as d => d; error as e => return e }
+            let iface_canon = dispatch.iface
+            let imfn = dispatch.method
+            let slot = dispatch.slot
             // interface methods are INSTANCE-only signatures (decl-enforced); the receiver resolves
             // to Named{<iface>} in the FuncType. Defaults live on the CONTRACT (DEFARGS rule E).
             let ift = match method_func_type(imfn, struct_name, table, env.cur_ns) { Type as t => t; error as e => return e }   // (#109 W1) ref_ns = the call's enclosing namespace
