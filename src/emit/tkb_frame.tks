@@ -159,7 +159,8 @@ fn collect_strings(t: StrTable, te: checker::TExpr) -> StrTable {
         checker::TCall as cl   => {
             let tcal = collect_path(t1, cl.callee)
             let tct = if cl.is_iface_dispatch { collect_type_strings(tcal, cl.callee_type) } else { tcal }
-            collect_texprs(tct, cl.args)
+            let targs = collect_texprs(tct, cl.args)
+            st_intern(targs, cl.call_ns).table
         }
         checker::TCast as c    => collect_strings(t1, c.expr)                                    // S1a — recurse into the inner expr
         checker::TFieldAccess as f => st_intern(collect_strings(t1, f.receiver), f.field).table  // S1b — receiver AND the field name (must intern)
@@ -209,27 +210,83 @@ fn collect_fields(t: StrTable, xs: []parser::Field) -> StrTable {
     loop { if i >= xs.len { break }; tab = collect_typeexpr(st_intern(tab, xs[i].name).table, xs[i].type_ann); i++ }
     tab
 }
+/** (#165 C5) collect a StructBody's fields + methods + implements strings. */
+fn collect_struct_body(t: StrTable, s: parser::StructBody) -> StrTable {
+    collect_pieces(collect_functions(collect_fields(t, s.fields), s.methods), s.implements)
+}
+
+/** (#165 C5) collect a ClassBody's base names + implements + fields + methods strings. */
+fn collect_class_body(t: StrTable, c: parser::ClassBody) -> StrTable {
+    let bases = st_intern(st_intern(t, c.base_name).table, c.base_binding_name).table
+    let impls = collect_pieces(bases, c.implements)
+    collect_functions(collect_fields(impls, c.fields), c.methods)
+}
+
 fn collect_typebody(t: StrTable, tb: parser::TypeBody) -> StrTable {
     match tb {
-        parser::StructBody as s  => collect_fields(t, s.fields)
+        parser::StructBody as s  => collect_struct_body(t, s)
         parser::EnumBody as e    => collect_pieces(t, e.members)
         parser::FlagsBody as f   => collect_pieces(t, f.members)
         parser::VariantBody as v => collect_typeexpr(t, v.type_expr)
         parser::AliasBody as a   => collect_typeexpr(t, a.alias)
         parser::ExternBody       => t
-        parser::ClassBody as c   => collect_fields(t, c.fields)   // (W10b.CLASS) methods not yet collected, same pre-existing gap as struct methods
-        parser::InterfaceBody as ib => collect_pieces(t, ib.extends)   // (W10b.IF) extends names only — method sigs not serialized (same gap as struct/class methods)
-        parser::TraitBody as trb => collect_fields(t, trb.fields)   // (TR0) fields only — methods not serialized (same gap as struct/class methods)
+        parser::ClassBody as c   => collect_class_body(t, c)
+        parser::InterfaceBody as ib => collect_functions(collect_pieces(t, ib.extends), ib.methods)
+        parser::TraitBody as trb => collect_functions(collect_fields(t, trb.fields), trb.methods)
     }
 }
+/** (#165 C2) collect a ConstraintExpr's atom names (mirrors write_constraint). */
+fn collect_constraint(t: StrTable, c: parser::ConstraintExpr) -> StrTable {
+    match c {
+        parser::ConstraintAtom as a => st_intern(t, a.name).table
+        parser::ConstraintAnd as an => collect_constraint(collect_constraint(t, an.left), an.right)
+        parser::ConstraintOr as o   => collect_constraint(collect_constraint(t, o.left), o.right)
+        parser::NoConstraint        => t
+    }
+}
+
+/** (#165 C2) collect a []ConstraintExpr (mirrors write_constraints). */
+fn collect_constraints(t: StrTable, xs: []parser::ConstraintExpr) -> StrTable {
+    mut tab = t
+    mut i = 0
+    loop { if i >= xs.len { break }; tab = collect_constraint(tab, xs[i]); i++ }
+    tab
+}
+
 fn collect_typedecl(t: StrTable, d: parser::TypeDecl) -> StrTable {
-    st_intern(collect_typebody(st_intern(t, d.name).table, d.body), d.doc).table
+    let named = st_intern(t, d.name).table
+    let params = collect_pieces(named, d.type_params)
+    let cons = collect_constraints(params, d.type_constraints)
+    st_intern(collect_typebody(cons, d.body), d.doc).table
+}
+
+/** (#165 C4) collect a parser::Function's SIGNATURE strings (mirrors write_function — body is stubbed). */
+fn collect_function(t: StrTable, f: parser::Function) -> StrTable {
+    mut tab = st_intern(t, f.name).table
+    tab = collect_pieces(tab, f.type_params)
+    tab = collect_constraints(tab, f.type_constraints)
+    tab = collect_params(tab, f.params)
+    tab = collect_typeexpr(tab, f.return_type)
+    tab = st_intern(tab, f.doc).table
+    tab = st_intern(tab, f.c_symbol).table
+    tab = st_intern(tab, f.from_lib).table
+    st_intern(tab, f.os_guard).table
+}
+
+/** (#165 C4/C5) collect a []parser::Function (mirrors write_functions). */
+fn collect_functions(t: StrTable, xs: []parser::Function) -> StrTable {
+    mut tab = t
+    mut i = 0
+    loop { if i >= xs.len { break }; tab = collect_function(tab, xs[i]); i++ }
+    tab
 }
 fn collect_usedecl(t: StrTable, u: parser::UseDecl) -> StrTable {
     st_intern(collect_path(t, u.path), u.alias).table
 }
 fn collect_tfunction(t: StrTable, f: checker::TFunction) -> StrTable {
     mut tab = st_intern(t, f.name).table
+    tab = collect_pieces(tab, f.type_params)
+    tab = collect_constraints(tab, f.type_constraints)
     tab = collect_params(tab, f.params)
     tab = collect_type_strings(tab, f.return_type)
     tab = collect_tstatements(tab, f.body)
@@ -310,8 +367,9 @@ fn serialize(te: checker::TExpr) -> []byte {
     append_bytes(out, body)
 }
 
-// (C7.16) serialize a whole typed PROGRAM. Same frame, VERSION 2 (program tree) so the reader
-// can't confuse it with a version-1 single-expr `.tkb`. The KEYSTONE for `.tkl` packaging (C7.12).
+/** (C7.16) serialize a whole typed PROGRAM. Same frame, VERSION 3 (program tree) so the reader
+    can't confuse it with a version-1 single-expr `.tkb` nor an older v2 that lacked call_ns /
+    type_params / type_constraints / method fidelity (#165). The KEYSTONE for `.tkl` packaging. */
 fn serialize_program(prog: checker::TProgram) -> []byte {
     let table = collect_program(st_empty(), prog)
     let body = write_program(write_strtable(teko::list::empty(), table), table, prog)
@@ -321,7 +379,7 @@ fn serialize_program(prog: checker::TProgram) -> []byte {
     out = write_u8(out, b'K')
     out = write_u8(out, b'B')
     out = write_u8(out, 0)
-    out = write_u32(out, 2)                          // version 2 = a program tree
+    out = write_u32(out, 3)
     out = write_u64(out, h)
     append_bytes(out, body)
 }

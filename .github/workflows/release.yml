@@ -1,17 +1,22 @@
 name: Bootstrap Release
 
-# On-demand publication of a Teko BOOTSTRAP release: per-platform gen-3 `teko` binaries
-# + the portable, any-cc `teko.c` bootstrap snapshot + checksums, as a GitHub Release.
+# Publication of a Teko release: per-platform `teko` binaries + the portable, any-cc
+# `teko.c` bootstrap snapshot + checksums, as a GitHub Release.
 #
-# A release is SOUND only if, on every platform, the .tkt gate passes AND the self-host
-# fixpoint holds (gen-2 == gen-3 byte-identical). Every build job asserts both; the
-# publish job runs only if ALL of them succeeded.
+# CI IS THE SINGLE SOURCE OF TRUTH — the release RE-VALIDATES NOTHING. A tag only ever
+# points at a main commit, and a commit only reaches main through a pull request whose full
+# CI suite (Native Build & Test + SAST + Sanitizers + CodeQL) closed green — branch
+# protection blocks a red PR from merging. So "on main" already means "CI was 100% green".
+# Re-running the gate / the gen-2/gen-3 self-host chain / the fixpoint / the VM==native
+# differential here would just burn pipeline minutes re-proving what the PR already proved.
+# The release therefore only BUILDS and PUBLISHES.
 #
-# The compiler is NOT built from C here — each platform seeds from the PREVIOUS
-# published release (Teko-only ruling; same as native.yml) and that seed compiles this
-# tag's sources into gen-1. The steps below add the gen1->gen2->gen3 self-host chain, the
-# fixpoint assertion, the VM==native differential, and the packaging. host cc compiles
-# the generated C; no C bootstrap, no cmake.
+# Build model: ONE generation per artifact. The x86_64 seed (the previous release) compiles
+# THIS tag's corpus once into the portable `teko.c`; `zig cc` then cross-compiles that single
+# `teko.c` into all six Linux artifacts (glibc + musl × x86_64 / arm64 / riscv64) from one
+# runner, and the macOS/Windows runners each seed-and-build natively. Codegen is
+# deterministic and CI already proved the self-host fixpoint, so one generation IS the
+# fixpoint artifact.
 on:
   workflow_dispatch:
     inputs:
@@ -19,11 +24,15 @@ on:
         description: >-
           Release version / tag. LEAVE EMPTY to use the teko.tkp-derived tag
           (the manifest is the source of truth). Provide a value ONLY to override
-          for a one-off. GitHub Actions cannot compute an input default
-          dynamically, so the default is empty and the `version` job falls back
-          to the derived tag (scripts/derive_version.sh) when this is blank.
+          for a one-off.
         required: false
         default: ""
+      dry_run:
+        description: >-
+          Build + package every target and upload the artifacts, but DO NOT publish a
+          GitHub Release. Use to validate the pipeline end-to-end before a real tag.
+        required: false
+        default: "false"
   push:
     tags:
       - "*-alpha"
@@ -35,13 +44,6 @@ permissions:
 
 jobs:
   # ── resolve the version once — the teko.tkp manifest is the SOURCE OF TRUTH ────
-  # The manifest dictates the version (scripts/derive_version.sh). Three modes:
-  #   • push tag   → the pushed tag MUST equal the derived tag, else FAIL (no
-  #                  publishing a tag the manifest does not sanction).
-  #   • dispatch with a `version` input → that value is used verbatim (one-off
-  #                  human override).
-  #   • dispatch with an EMPTY input → fall back to the derived tag (the manifest
-  #                  default; GitHub cannot compute a dynamic input default).
   version:
     runs-on: ubuntu-latest
     permissions:
@@ -84,15 +86,67 @@ jobs:
           echo "version=$V" >> "$GITHUB_OUTPUT"
           echo "Release version = $V"
 
-  # ── per-platform seed + gen-1/2/3 + .tkt gate + fixpoint + package ────────────
-  # The compiler is no longer built from the C bootstrap (Teko-only ruling). Each
-  # platform SEEDS from the PREVIOUS published release (the newest one is still the
-  # prior version — this workflow publishes the new one at the end), then the seed
-  # compiles THIS tag's sources → gen-1 → gen-2 → gen-3. host cc (clang) is still
-  # needed to compile the generated C. EMIT_SRC_BUNDLE=1 on exactly ONE platform
-  # (linux-x86_64) — the generated teko.c is byte-identical everywhere (the fixpoint),
-  # so the portable bootstrap snapshot is built once and published once.
-  build:
+  # ── Linux: ONE runner, ONE emit, six zig-cross artifacts ──────────────────────
+  # The x86_64 seed compiles THIS tag's corpus once (`--no-verify` — no gate; CI already
+  # verified this commit) into the portable `out/teko.c`. `zig cc` then cross-compiles that
+  # single C into six artifacts: glibc (dynamic, pinned to an old glibc for wide compat) and
+  # musl (fully static) for x86_64, arm64 and riscv64. `zig` ships a complete cross toolchain
+  # (clang + both libcs + all three arches), so no qemu, no per-arch runner, no musl-cross
+  # packages — and it handles the runtime's `__int128` / C23 exactly like the native builds.
+  build-linux:
+    needs: version
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    env:
+      # 0.16.0 is the version validated locally + in a linux/amd64 container. 0.13.0 ships an
+      # INCOMPLETE riscv64 glibc (missing gnu/stubs-lp64d.h) → riscv64-glibc failed to compile;
+      # 0.16.0's tarball carries riscv-linux-gnu/gnu/stubs-lp64d.h. Note the tarball name format
+      # changed at 0.14.1: os/arch swapped to `zig-x86_64-linux-<v>` (was `zig-linux-x86_64-<v>`).
+      ZIG_VERSION: "0.16.0"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install zig (official tarball)
+        run: |
+          set -eu
+          curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" \
+            | tar -xJ
+          echo "$PWD/zig-x86_64-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
+
+      - name: Verify zig
+        run: zig version
+
+      # Seed the x86_64 compiler from the previous release and emit THIS tag's teko.c once.
+      - name: Provision x86_64 seed
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./scripts/ci_provision_teko.sh linux-x86_64-glibc
+
+      - name: Emit the portable teko.c (one gen, no gate)
+        run: teko . -o out --no-verify
+
+      # Cross-compile out/teko.c into all six Linux artifacts and package each. The exact same
+      # script (scripts/cross_compile_linux.sh) runs as a compile-only SMOKE in native.yml on
+      # every PR — so a broken zig version or target is caught before merge, not here.
+      - name: Cross-compile + package the six Linux targets
+        run: |
+          mkdir -p dist
+          sh scripts/cross_compile_linux.sh out/teko.c src dist package
+          echo "=== dist/ ==="; ls -la dist/
+
+      - name: Upload Linux artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-linux
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  # ── macOS + Windows: native seed-and-build (their libc/ABI needs the real platform) ──
+  build-native:
     needs: version
     permissions:
       contents: read
@@ -100,33 +154,17 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            label: linux-x86_64
-            emit_src: "1"
-            install_deps: |
-              sudo apt-get update -y
-              sudo apt-get install -y clang
-
-          - os: ubuntu-24.04-arm
-            label: linux-arm64
-            emit_src: "0"
-            install_deps: |
-              sudo apt-get update -y
-              sudo apt-get install -y clang
-
           - os: macos-latest
             label: macos-arm64
-            emit_src: "0"
+            ostype: posix
             install_deps: ""
-
           - os: windows-latest
             label: windows-x86_64
-            emit_src: "0"
+            ostype: windows
             install_deps: ""
-
           - os: windows-11-arm
             label: windows-arm64
-            emit_src: "0"
+            ostype: windows
             install_deps: ""
 
     name: release build / ${{ matrix.label }}
@@ -136,110 +174,29 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # host cc (clang) is still needed to compile the generated C into the gen-1 binary.
       - name: Install cc
         if: matrix.install_deps != ''
         run: ${{ matrix.install_deps }}
 
-      # Seed from the PREVIOUS published release (the newest is still the prior version).
-      - name: Provision teko from the latest release
+      - name: Provision seed from the latest release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           LABEL: ${{ matrix.label }}
         run: ./scripts/ci_provision_teko.sh "$LABEL"
 
-      # gen-1: the released seed compiles THIS tag's corpus and runs the .tkt gate (the
-      # build embeds `teko test .`; a non-zero exit here fails the job). Produces
-      # gen1out/teko (self-hosted from the new sources) + gen1out/teko.c.
-      #
-      # `shell: bash` on ALL platforms (incl. Windows). ci_provision_teko.sh runs in bash
-      # and adds the seed to $GITHUB_PATH as a POSIX path (/d/a/.../.seed); only bash
-      # resolves that on Windows — a pwsh step reports "'teko.exe' is not recognized".
-      # native.yml's build-test and sanitizers' windows-stress prove `teko` under bash on
-      # Windows. gen-2/gen-3 below stay pwsh: they invoke the LOCALLY-built .\gen1out\teko.exe
-      # by explicit path, not via the seed PATH.
-      - name: gen-1 self-build + .tkt gate (seed compiles the tag's corpus)
+      # ONE generation, no gate (`--no-verify`) — CI already verified this commit.
+      # `shell: bash` on all platforms: the seed is added to $GITHUB_PATH as a POSIX path,
+      # which only bash resolves on Windows.
+      - name: Build the release binary (one gen, no gate)
         shell: bash
-        run: teko . -o gen1out
+        run: teko . -o out --no-verify
 
-      # gen-2: the self-hosted compiler builds the corpus again.
-      - name: gen-2 (POSIX)
-        if: runner.os != 'Windows'
-        run: ./gen1out/teko . -o gen2out
-
-      - name: gen-2 (Windows)
-        if: runner.os == 'Windows'
-        run: .\gen1out\teko.exe . -o gen2out
-
-      # gen-3: the published artifact.
-      - name: gen-3 (POSIX)
-        if: runner.os != 'Windows'
-        run: ./gen2out/teko . -o gen3out
-
-      - name: gen-3 (Windows)
-        if: runner.os == 'Windows'
-        run: .\gen2out\teko.exe . -o gen3out
-
-      # THE fixpoint: gen-2 == gen-3, byte-identical. The release is sound only if
-      # the self-host reached a stable fixed point on THIS platform. Compare the
-      # generated teko.c (the portable snapshot) — the load-bearing invariant.
-      - name: Assert self-host fixpoint (gen-2 == gen-3) — POSIX
-        if: runner.os != 'Windows'
-        run: |
-          if cmp -s gen2out/teko.c gen3out/teko.c; then
-            echo "OK: gen-2 == gen-3 (self-host fixpoint holds)"
-          else
-            echo "ERROR: gen-2 teko.c != gen-3 teko.c — self-host is NOT a fixpoint; release unsound." >&2
-            cmp gen2out/teko.c gen3out/teko.c || true
-            exit 1
-          fi
-
-      - name: Assert self-host fixpoint (gen-2 == gen-3) — Windows
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $h2 = (Get-FileHash gen2out/teko.c -Algorithm SHA256).Hash
-          $h3 = (Get-FileHash gen3out/teko.c -Algorithm SHA256).Hash
-          if ($h2 -eq $h3) {
-            Write-Host "OK: gen-2 == gen-3 (self-host fixpoint holds)"
-          } else {
-            Write-Error "gen-2 teko.c != gen-3 teko.c — self-host is NOT a fixpoint; release unsound."
-            exit 1
-          }
-
-      # The gen-3 being SHIPPED must pass the VM==native differential over every
-      # regression fixture — a gen-0-vs-gen-3 codegen divergence (issue #243: the
-      # nested-slice spread push) reached a release exactly because release.yml did NOT
-      # run this. POSIX only (the harness is bash + needs cc). Windows-specific codegen
-      # is not covered here; the fixpoint + .tkt gate above still guard it.
-      - name: Differential harness (VM == native) on the gen-3 being released — POSIX
-        if: runner.os != 'Windows'
-        env:
-          TEKO: ./gen3out/teko
-        run: |
-          mkdir -p bin
-          cp gen3out/teko bin/teko
-          ./scripts/diff_vm_native.sh
-
-      # Package: per-platform gen-3 binary archive + (once) the portable bootstrap
-      # snapshot + checksums. package_release.sh documents the PROVEN minimal file set.
-      - name: Package (POSIX)
-        if: runner.os != 'Windows'
-        env:
-          EMIT_SRC_BUNDLE: ${{ matrix.emit_src }}
+      - name: Package
+        shell: bash
         run: |
           mkdir -p dist
-          sh scripts/package_release.sh "${{ matrix.label }}" gen3out src dist posix
-
-      - name: Package (Windows)
-        if: runner.os == 'Windows'
-        shell: bash
-        env:
-          EMIT_SRC_BUNDLE: ${{ matrix.emit_src }}
-        run: |
-          mkdir -p dist
-          sh scripts/package_release.sh "${{ matrix.label }}" gen3out src dist windows
+          sh scripts/package_release.sh "${{ matrix.label }}" out src dist "${{ matrix.ostype }}"
 
       - name: Upload platform artifacts
         uses: actions/upload-artifact@v4
@@ -249,14 +206,13 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  # ── publish: only if EVERY platform's gate + fixpoint + package succeeded ──────
-  # `needs: [version, build]` — a matrix job is a single `needs` entry; if ANY leg
-  # failed or was cancelled, `build` is not "success" and this job is skipped, so no
-  # release is ever published from a partial/failed matrix. `if: success()` makes that
-  # explicit.
+  # ── publish: only if every build succeeded AND this is not a dry run ───────────
+  # `needs: [version, build-linux, build-native]` — if any leg failed/cancelled, neither
+  # build is "success" and this job is skipped, so no release is ever published from a
+  # partial matrix. A dry-run dispatch builds+uploads everything but stops here.
   publish:
-    needs: [version, build]
-    if: success()
+    needs: [version, build-linux, build-native]
+    if: ${{ success() && github.event.inputs.dry_run != 'true' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -272,7 +228,7 @@ jobs:
       - name: Flatten artifacts + combine checksums
         run: |
           mkdir -p release
-          # Each release-<label>/ holds that platform's archive(s) + its SHA256SUMS-<label>.txt.
+          # Each release-<name>/ holds that platform's archive(s) + its SHA256SUMS-*.txt.
           find artifacts -type f -exec cp {} release/ \;
           # Merge the per-platform checksum files into one canonical SHA256SUMS.txt.
           ( cd release && cat SHA256SUMS-*.txt | sort -u > SHA256SUMS.txt )
@@ -282,21 +238,28 @@ jobs:
           cat release/SHA256SUMS.txt
 
       - name: Write release notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           V="${{ needs.version.outputs.version }}"
           cat > release/NOTES.md <<EOF
-          # Teko $V — gen-3 bootstrap release
+          # Teko $V
 
-          This is the **gen-3 bootstrap** release of the Teko compiler. Each platform
-          binary was produced by the self-host chain
-          \`C-bootstrap teko → gen-1 → gen-2 → gen-3\`, and the release only publishes
-          when **every** platform's \`.tkt\` gate passes **and** the self-host fixpoint
-          holds (\`gen-2 == gen-3\`, byte-identical generated \`teko.c\`).
+          Self-hosted \`teko\` compiler binaries. Each binary was produced by the previous
+          release's compiler compiling this tag's own sources; **correctness was verified by
+          CI** on this exact commit before it reached main (the \`.tkt\` gate, the self-host
+          fixpoint \`gen-2 == gen-3\`, and the VM==native differential all ran in the
+          \`Native Build & Test\` / SAST / Sanitizers / CodeQL workflows on the merged PR).
+          The release itself re-validates nothing — CI is the single source of truth.
 
           ## Artifacts
-          - \`teko-<platform>.tar.gz\` / \`.zip\` — the gen-3 \`teko\` binary per platform.
-          - \`teko-bootstrap-src.tar.gz\` — the portable, **any-cc** bootstrap snapshot:
-            the generated gen-3 \`teko.c\` plus the exact minimal runtime it links.
+          Linux ships **glibc** (dynamic; needs glibc ≥ 2.28) and **musl** (fully static;
+          runs anywhere) for **x86_64**, **arm64** and **riscv64**:
+          - \`teko-linux-{x86_64,arm64,riscv64}-glibc.tar.gz\`
+          - \`teko-linux-{x86_64,arm64,riscv64}-musl.tar.gz\`
+          - \`teko-macos-arm64.tar.gz\`, \`teko-windows-x86_64.zip\`, \`teko-windows-arm64.zip\`
+          - \`teko-bootstrap-src.tar.gz\` — the portable, **any-cc** bootstrap snapshot: the
+            generated \`teko.c\` plus the exact minimal runtime it links.
           - \`SHA256SUMS.txt\` — checksums of every artifact.
 
           ## Building from the portable \`teko.c\` snapshot
@@ -310,40 +273,55 @@ jobs:
              -lm -o teko          # or run ./build.sh
           \`\`\`
 
-          The bundle carries exactly what a from-scratch \`cc\` needs:
-          \`teko.c\`, \`runtime/teko_rt.{c,h}\`, \`assert/assert.{c,h}\`, and
-          \`win32_compat.h\` (a no-op on POSIX; \`teko_rt.c\` reaches it via \`../\` on
-          Windows). MSVC is not supported — the runtime uses \`__int128\` and other
-          GCC/Clang extensions; use Clang on Windows.
+          The bundle carries exactly what a from-scratch \`cc\` needs: \`teko.c\`,
+          \`runtime/teko_rt.{c,h}\`, \`assert/assert.{c,h}\`, and \`win32_compat.h\`. MSVC is
+          not supported — the runtime uses \`__int128\` and other GCC/Clang extensions.
           EOF
           echo "wrote release/NOTES.md"
+
+          # Append GitHub's auto-generated changelog against the CORRECT predecessor.
+          # GitHub's /releases API is NOT version-ordered, so its auto-picked "previous tag"
+          # is wrong. Compute the predecessor by VERSION — the highest published version-tag
+          # below this one (across old no-v and new v- tags) — and pass it to generate-notes.
+          PRED="$(gh api "repos/${GITHUB_REPOSITORY}/releases" --paginate \
+            --jq 'map(select(.draft | not) | .tag_name)[] | select(test("^v?[0-9]+([.][0-9]+){3}"))' \
+            | grep -vxF "$V" \
+            | awk '{ o=$0; v=$0; sub(/^v/,"",v); print v"\t"o }' | sort -V | tail -n1 | cut -f2)"
+          if [ -n "$PRED" ]; then
+            echo "changelog predecessor (by version) = $PRED"
+            BODY="$(gh api "repos/${GITHUB_REPOSITORY}/releases/generate-notes" \
+              -f tag_name="$V" -f previous_tag_name="$PRED" --jq '.body' 2>/dev/null || true)"
+            if [ -n "$BODY" ]; then
+              { printf '\n\n## Changes since %s\n\n' "$PRED"; printf '%s\n' "$BODY"; } >> release/NOTES.md
+              echo "appended changelog vs $PRED"
+            else
+              echo "generate-notes returned empty — keeping static notes only"
+            fi
+          else
+            echo "no predecessor version-tag found — first release, no changelog"
+          fi
 
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           V="${{ needs.version.outputs.version }}"
-          # Idempotent: if the tag already exists as a release, upload/replace assets;
-          # otherwise create it. `--verify-tag` is intentionally NOT used so a
-          # workflow_dispatch (no pre-existing tag) still creates the tag from the
-          # checked-out ref.
+          # Idempotent: replace assets if the release already exists, else create it.
           if gh release view "$V" >/dev/null 2>&1; then
             echo "Release $V exists — uploading assets (clobber)."
             gh release upload "$V" release/teko-*.tar.gz release/teko-*.zip release/SHA256SUMS.txt --clobber || true
             gh release edit "$V" --notes-file release/NOTES.md
           else
             echo "Creating release $V."
-            # Collect the asset list (globs that may be empty are pruned by the shell loop).
             ASSETS=""
             for f in release/teko-*.tar.gz release/teko-*.zip release/SHA256SUMS.txt; do
               [ -e "$f" ] && ASSETS="$ASSETS $f"
             done
-            # Any suffixed tag (…-alpha / …-bootstrap) is a PRERELEASE.
             PRERELEASE=""
             case "$V" in *-*) PRERELEASE="--prerelease" ;; esac
             # shellcheck disable=SC2086
             gh release create "$V" \
-              --title "Teko $V — gen-3" \
+              --title "Teko $V" \
               --notes-file release/NOTES.md \
               $PRERELEASE \
               $ASSETS

@@ -79,6 +79,12 @@ fn write_terms(buf: []byte, t: StrTable, ts: []checker::TCmpTerm) -> []byte {
     b
 }
 
+/** (#165 C1) a TCall's namespace tail — call_ns (interned) + is_closure_call (u8). Appended AFTER
+    the args of BOTH tag 7 (plain) and tag 24 (iface dispatch) so the reader stops re-deriving them. */
+fn write_call_tail(buf: []byte, t: StrTable, cl: checker::TCall) -> []byte {
+    write_u8(write_u32(buf, st_find(t, cl.call_ns)), (if cl.is_closure_call { 1 } else { 0 }) to byte)
+}
+
 // a TExpr → its type, then a tag + payload (children recursive).
 fn write_texpr(buf: []byte, t: StrTable, te: checker::TExpr) -> []byte {
     let b = write_type(buf, t, te.type)        // every node carries its type
@@ -107,9 +113,11 @@ fn write_texpr(buf: []byte, t: StrTable, te: checker::TExpr) -> []byte {
                 mut ib = write_path(write_u8(b, 24), t, cl.callee)
                 ib = write_type(ib, t, cl.callee_type)
                 ib = write_u32(ib, cl.iface_slot)
-                write_texprs(ib, t, cl.args)
+                ib = write_texprs(ib, t, cl.args)
+                write_call_tail(ib, t, cl)
             } else {
-                write_texprs(write_path(write_u8(b, 7), t, cl.callee), t, cl.args)
+                let pb = write_texprs(write_path(write_u8(b, 7), t, cl.callee), t, cl.args)
+                write_call_tail(pb, t, cl)
             }
         }
         // (C7.16) typed IF: tag 8 + cond (texpr) + then_blk ([]TStatement) + has_else (u8) + else_blk.
@@ -290,6 +298,24 @@ fn write_typeexpr(buf: []byte, t: StrTable, te: parser::TypeExpr) -> []byte {
     }
 }
 
+/** (#165 C2) a ConstraintExpr: u8 tag. Atom(0, interned name) | And(1, left+right) | Or(2, left+right) | NoConstraint(3). */
+fn write_constraint(buf: []byte, t: StrTable, c: parser::ConstraintExpr) -> []byte {
+    match c {
+        parser::ConstraintAtom as a => write_u32(write_u8(buf, 0), st_find(t, a.name))
+        parser::ConstraintAnd as an => write_constraint(write_constraint(write_u8(buf, 1), t, an.left), t, an.right)
+        parser::ConstraintOr as o   => write_constraint(write_constraint(write_u8(buf, 2), t, o.left), t, o.right)
+        parser::NoConstraint        => write_u8(buf, 3)
+    }
+}
+
+/** (#165 C2) a []ConstraintExpr (PARALLEL to type_params): u64 count + each. */
+fn write_constraints(buf: []byte, t: StrTable, xs: []parser::ConstraintExpr) -> []byte {
+    mut b = write_u64(buf, xs.len to u64)
+    mut i = 0
+    loop { if i >= xs.len { break }; b = write_constraint(b, t, xs[i]); i++ }
+    b
+}
+
 // a []str (interned indices): u64 count + each.
 fn write_strs(buf: []byte, t: StrTable, xs: []str) -> []byte {
     mut b = write_u64(buf, xs.len to u64)
@@ -298,50 +324,95 @@ fn write_strs(buf: []byte, t: StrTable, xs: []str) -> []byte {
     b
 }
 
+/** a []Param: u64 count, then each name (interned) + has_type (u8) + type_ann (TypeExpr). (#165 C4)
+    has_type rides so a method RECEIVER (the untyped 1st param, has_type=false — the instance-method
+    marker) survives; the type_ann is still always written (the no_type() sentinel when has_type=false). */
 fn write_params(buf: []byte, t: StrTable, xs: []parser::Param) -> []byte {
     mut b = write_u64(buf, xs.len to u64)
     mut i = 0
-    loop { if i >= xs.len { break }; b = write_typeexpr(write_u32(b, st_find(t, xs[i].name)), t, xs[i].type_ann); i++ }
+    loop {
+        if i >= xs.len { break }
+        b = write_u32(b, st_find(t, xs[i].name))
+        b = write_u8(b, (if xs[i].has_type { 1 } else { 0 }) to byte)
+        b = write_typeexpr(b, t, xs[i].type_ann)
+        i++
+    }
     b
 }
 
+/** a []Field: u64 count, then each name (interned) + type_ann (TypeExpr) + vis (u8) + is_intern (u8).
+    (#165 C5) vis + is_intern ride so a CLASS field (private-by-default; intern widens to inheritors)
+    survives; a struct field is always Pub/false but pays the two bytes for one uniform shape. */
 fn write_fields(buf: []byte, t: StrTable, xs: []parser::Field) -> []byte {
     mut b = write_u64(buf, xs.len to u64)
     mut i = 0
-    loop { if i >= xs.len { break }; b = write_typeexpr(write_u32(b, st_find(t, xs[i].name)), t, xs[i].type_ann); i++ }
+    loop {
+        if i >= xs.len { break }
+        b = write_typeexpr(write_u32(b, st_find(t, xs[i].name)), t, xs[i].type_ann)
+        b = write_u8(b, vis_byte(xs[i].vis))
+        b = write_u8(b, (if xs[i].is_intern { 1 } else { 0 }) to byte)
+        i++
+    }
     b
 }
 
-// a TypeBody: u8 tag + payload. StructBody(0)/EnumBody(1)/VariantBody(2)/AliasBody(3)/ExternBody(4)/FlagsBody(5)/ClassBody(6)/InterfaceBody(7)/TraitBody(8).
+/** (#165 C5) a class-kind's ordinal byte — Sealed/Abstract/Virtual → 0/1/2 (the enum→int cast). */
+fn class_kind_byte(k: parser::ClassKind) -> byte { k to byte }
+
+/** (#165 C5) a StructBody: fields + methods + implements (all now ride — full fidelity). */
+fn write_struct_body(buf: []byte, t: StrTable, s: parser::StructBody) -> []byte {
+    write_strs(write_functions(write_fields(write_u8(buf, 0), t, s.fields), t, s.methods), t, s.implements)
+}
+
+/** (#165 C5) a ClassBody: kind + base + binding + implements + fields + methods (all ride). */
+fn write_class_body(buf: []byte, t: StrTable, c: parser::ClassBody) -> []byte {
+    mut b = write_u8(write_u8(buf, 6), class_kind_byte(c.kind))
+    b = write_u8(b, (if c.has_base { 1 } else { 0 }) to byte)
+    b = write_u32(b, st_find(t, c.base_name))
+    b = write_u8(b, (if c.has_base_binding { 1 } else { 0 }) to byte)
+    b = write_u32(b, st_find(t, c.base_binding_name))
+    b = write_strs(b, t, c.implements)
+    b = write_fields(b, t, c.fields)
+    write_functions(b, t, c.methods)
+}
+
+/** a TypeBody: u8 tag + payload. StructBody(0)/EnumBody(1)/VariantBody(2)/AliasBody(3)/ExternBody(4)/
+    FlagsBody(5)/ClassBody(6)/InterfaceBody(7)/TraitBody(8). (#165 C5) Interface/Trait ride their
+    method SIGS after extends/fields, in declaration = vtable order; FlagsBody carries name+u128 value. */
 fn write_typebody(buf: []byte, t: StrTable, tb: parser::TypeBody) -> []byte {
     match tb {
-        parser::StructBody as s  => write_fields(write_u8(buf, 0), t, s.fields)
+        parser::StructBody as s  => write_struct_body(buf, t, s)
         parser::EnumBody as e    => write_strs(write_u8(buf, 1), t, e.members)
         parser::VariantBody as v => write_typeexpr(write_u8(buf, 2), t, v.type_expr)
         parser::AliasBody as a   => write_typeexpr(write_u8(buf, 3), t, a.alias)
         parser::ExternBody       => write_u8(buf, 4)
-        parser::FlagsBody as f   => {   // (C8.6) names + power-of-2 values: n(u64), then for each name_idx(u32)+hi(u64)+lo(u64)
-            mut sb = write_u64(write_u8(buf, 5), f.members.len to u64)
-            mut i = 0
-            loop {
-                if i >= f.members.len { break }
-                sb = write_u32(sb, st_find(t, f.members[i]))
-                let v = f.values[i]
-                sb = write_u64(sb, (v >> 64) to u64)   // hi
-                sb = write_u64(sb, (v & 0xFFFFFFFFFFFFFFFF) to u64)   // lo
-                i++
-            }
-            sb
-        }
-        parser::ClassBody as c   => write_fields(write_u8(buf, 6), t, c.fields)   // (W10b.CLASS) fields only — methods not yet serialized (same gap as struct methods)
-        parser::InterfaceBody as ib => write_strs(write_u8(buf, 7), t, ib.extends)   // (W10b.IF) extends names only — method sigs not serialized (same gap)
-        parser::TraitBody as trb => write_fields(write_u8(buf, 8), t, trb.fields)   // (TR0) tag 8 — fields only; methods not serialized (same gap as struct/class methods)
+        parser::FlagsBody as f   => write_flags_body(buf, t, f)
+        parser::ClassBody as c   => write_class_body(buf, t, c)
+        parser::InterfaceBody as ib => write_functions(write_strs(write_u8(buf, 7), t, ib.extends), t, ib.methods)
+        parser::TraitBody as trb => write_functions(write_fields(write_u8(buf, 8), t, trb.fields), t, trb.methods)
     }
 }
 
-// a parser TypeDecl: name + body + vis + has_doc + doc + line + col.
+/** (C8.6) a FlagsBody: n(u64), then for each member name_idx(u32) + value hi(u64) + lo(u64). */
+fn write_flags_body(buf: []byte, t: StrTable, f: parser::FlagsBody) -> []byte {
+    mut sb = write_u64(write_u8(buf, 5), f.members.len to u64)
+    mut i = 0
+    loop {
+        if i >= f.members.len { break }
+        sb = write_u32(sb, st_find(t, f.members[i]))
+        let v = f.values[i]
+        sb = write_u64(sb, (v >> 64) to u64)
+        sb = write_u64(sb, (v & 0xFFFFFFFFFFFFFFFF) to u64)
+        i++
+    }
+    sb
+}
+
+/** a parser TypeDecl: name + type_params + type_constraints + body + vis + has_doc + doc + line + col. */
 fn write_typedecl(buf: []byte, t: StrTable, d: parser::TypeDecl) -> []byte {
     mut b = write_u32(buf, st_find(t, d.name))
+    b = write_strs(b, t, d.type_params)
+    b = write_constraints(b, t, d.type_constraints)
     b = write_typebody(b, t, d.body)
     b = write_u8(b, vis_byte(d.vis))
     b = write_u8(b, (if d.has_doc { 1 } else { 0 }) to byte)
@@ -357,9 +428,51 @@ fn write_usedecl(buf: []byte, t: StrTable, u: parser::UseDecl) -> []byte {
     write_u32(b, st_find(t, u.alias))
 }
 
-// a TFunction: name + params + return_type + body + vis + has_doc + doc + namespace + file + line + col + is_test + is_extern + c_symbol + from_lib.
+/** (#165 C4) a parser::Function (a type-body METHOD): the full SIGNATURE + an honest body STUB.
+    Method bodies are []Statement (PARSER-level, untyped) and no parser-level statement codec exists;
+    the vtable contract + conformance need only the signature (dispatch is by order+type, and the
+    body compiles at install), so has_body is written 0 and no body content rides (plan R2, law M.3).
+    Layout: name, type_params, type_constraints, params, has_return, return_type (always — sentinel
+    when absent), has_body (0), vis, has_doc, doc, line, col, is_test, is_extern, c_symbol, from_lib,
+    os_guard, is_intern, is_abstract, is_virtual, is_override. */
+fn write_function(buf: []byte, t: StrTable, f: parser::Function) -> []byte {
+    mut b = write_u32(buf, st_find(t, f.name))
+    b = write_strs(b, t, f.type_params)
+    b = write_constraints(b, t, f.type_constraints)
+    b = write_params(b, t, f.params)
+    b = write_u8(b, (if f.has_return { 1 } else { 0 }) to byte)
+    b = write_typeexpr(b, t, f.return_type)
+    b = write_u8(b, 0)
+    b = write_u8(b, vis_byte(f.vis))
+    b = write_u8(b, (if f.has_doc { 1 } else { 0 }) to byte)
+    b = write_u32(b, st_find(t, f.doc))
+    b = write_u32(b, f.line to u32)
+    b = write_u32(b, f.col to u32)
+    b = write_u8(b, (if f.is_test { 1 } else { 0 }) to byte)
+    b = write_u8(b, (if f.is_extern { 1 } else { 0 }) to byte)
+    b = write_u32(b, st_find(t, f.c_symbol))
+    b = write_u32(b, st_find(t, f.from_lib))
+    b = write_u32(b, st_find(t, f.os_guard))
+    b = write_u8(b, (if f.is_intern { 1 } else { 0 }) to byte)
+    b = write_u8(b, (if f.is_abstract { 1 } else { 0 }) to byte)
+    b = write_u8(b, (if f.is_virtual { 1 } else { 0 }) to byte)
+    write_u8(b, (if f.is_override { 1 } else { 0 }) to byte)
+}
+
+/** (#165 C4/C5) a []parser::Function (a type body's methods, in DECLARATION order = vtable order):
+    u64 count + each. */
+fn write_functions(buf: []byte, t: StrTable, xs: []parser::Function) -> []byte {
+    mut b = write_u64(buf, xs.len to u64)
+    mut i = 0
+    loop { if i >= xs.len { break }; b = write_function(b, t, xs[i]); i++ }
+    b
+}
+
+/** a TFunction: name + type_params + type_constraints + params + return_type + body + vis + has_doc + doc + namespace + file + line + col + is_test + is_extern + c_symbol + from_lib. */
 fn write_tfunction(buf: []byte, t: StrTable, f: checker::TFunction) -> []byte {
     mut b = write_u32(buf, st_find(t, f.name))
+    b = write_strs(b, t, f.type_params)
+    b = write_constraints(b, t, f.type_constraints)
     b = write_params(b, t, f.params)
     b = write_type(b, t, f.return_type)
     b = write_tstatements(b, t, f.body)

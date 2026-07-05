@@ -1,0 +1,116 @@
+use teko::parser
+use teko::checker
+
+/**
+ * priv_fn — a void-returning TFunction with a hand-built body, PRIVATE visibility (the common
+ * case; reachability never treats a private fn as a root by itself).
+ *
+ * (Tests for teko::build reachability, C7.20; #test collected.) Every test below builds a typed
+ * program BY HAND (checker::TFunction/TProgram literals, like checker_test.tkt's monomorphize
+ * group K) so the call-graph closure and the roots (loose statements + `exp` functions) are
+ * exercised directly, without a full front-end pass.
+ */
+fn priv_fn(name: str, body: []checker::TStatement) -> checker::TFunction {
+    checker::TFunction { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = teko::list::empty(); return_type = checker::Void { }; body = body; vis = parser::Visibility::Private; has_doc = false; doc = ""; namespace = ""; file = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = "" }
+}
+
+/** exp_fn — an `exp`-visibility TFunction: a library's public surface, one reachability ROOT. */
+fn exp_fn(name: str, body: []checker::TStatement) -> checker::TFunction {
+    checker::TFunction { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = teko::list::empty(); return_type = checker::Void { }; body = body; vis = parser::Visibility::Exp; has_doc = false; doc = ""; namespace = ""; file = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = "" }
+}
+
+/** extern_fn — an extern TFunction (no body) bound to `lib` via `from_lib`. */
+fn extern_fn(name: str, lib: str) -> checker::TFunction {
+    let no_body: []checker::TStatement = teko::list::empty()
+    checker::TFunction { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = teko::list::empty(); return_type = checker::Void { }; body = no_body; vis = parser::Visibility::Pub; has_doc = false; doc = ""; namespace = ""; file = ""; line = 0; col = 0; is_test = false; is_extern = true; c_symbol = "sym"; from_lib = lib }
+}
+
+/** call_stmt — a typed no-arg call `NAME()` (void result — reachability only reads the name). */
+fn call_stmt(name: str) -> checker::TStatement {
+    let callee = parser::Path { segments = teko::list::push(teko::list::empty(), parser::Segment { name = name }) }
+    let ce = checker::TExpr { kind = checker::TCall { callee = callee; args = teko::list::empty(); call_ns = ""; is_closure_call = false; callee_type = checker::Void { }; is_iface_dispatch = false; iface_slot = 0 }; type = checker::Void { }; line = 0; col = 0 }
+    checker::TExprStmt { expr = ce }
+}
+
+/** one_stmt — a single-statement body. */
+fn one_stmt(s: checker::TStatement) -> []checker::TStatement { teko::list::push(teko::list::empty(), s) }
+
+/** one_item — a single-function item list, the seed for building up a TProgram by hand. */
+fn one_item(f: checker::TFunction) -> []checker::TItem { teko::list::push(teko::list::empty(), f) }
+
+/** push_item — append one more TFunction item to an item list. */
+fn push_item(items: []checker::TItem, f: checker::TFunction) -> []checker::TItem { teko::list::push(items, f) }
+
+#test
+/** The virtual-main (a loose statement) calls the extern fn directly — it must be reachable. */
+fn directly_called_extern_lib_is_reachable() {
+    let root = call_stmt("db_open")
+    let items = teko::list::push(one_item(extern_fn("db_open", "sqlite3")), root)
+    let prog = checker::TProgram { items = items }
+    teko::assert::is_true(name_in(reachable_libs(prog), "sqlite3"))
+}
+
+#test
+/**
+ * The extern fn EXISTS in the program but nothing ever calls it — its lib must NOT appear in
+ * the reachable set (the C7.20 keystone: declared-but-unused stays unlinked).
+ */
+fn undeclared_extern_lib_stays_unreachable() {
+    let items = one_item(extern_fn("phantom", "phantomlib"))
+    let prog = checker::TProgram { items = items }
+    teko::assert::is_false(name_in(reachable_libs(prog), "phantomlib"))
+}
+
+#test
+/**
+ * main -> helper() -> the extern fn: reachability must FOLLOW the chain, not just the direct
+ * callees of the entry points.
+ */
+fn transitive_call_through_a_helper_reaches_its_lib() {
+    let helper = priv_fn("helper", one_stmt(call_stmt("raw_write")))
+    let items0 = one_item(extern_fn("raw_write", "libc"))
+    let items1 = push_item(items0, helper)
+    let items2 = teko::list::push(items1, call_stmt("helper"))
+    let prog = checker::TProgram { items = items2 }
+    teko::assert::is_true(name_in(reachable_libs(prog), "libc"))
+}
+
+#test
+/** The exact C7.20 shape: TWO extern libs declared, only ONE ever called. */
+fn two_declared_libs_only_the_called_one_is_reachable() {
+    let items0 = one_item(extern_fn("used_sym", "usedlib"))
+    let items1 = push_item(items0, extern_fn("unused_sym", "unusedlib"))
+    let items2 = teko::list::push(items1, call_stmt("used_sym"))
+    let prog = checker::TProgram { items = items2 }
+    let reached = reachable_libs(prog)
+    teko::assert::is_true(name_in(reached, "usedlib"))
+    teko::assert::is_false(name_in(reached, "unusedlib"))
+}
+
+#test
+/**
+ * A library artifact has NO virtual-main; its `exp` surface is the entry point a caller
+ * outside this program reaches — so an exp fn's own calls must count as reachable even when
+ * nothing IN this program calls the exp fn itself.
+ */
+fn exp_function_is_its_own_root_even_when_uncalled_locally() {
+    let pubapi = exp_fn("pubapi", one_stmt(call_stmt("crypto_init")))
+    let items0 = one_item(extern_fn("crypto_init", "crypto"))
+    let items1 = push_item(items0, pubapi)
+    let prog = checker::TProgram { items = items1 }
+    teko::assert::is_true(name_in(reachable_libs(prog), "crypto"))
+}
+
+#test
+/**
+ * `let f = extern_fn` (TVar{is_func=true}) is a first-class reference, not a TCall — the walk
+ * must still count it as reaching the extern's lib (W10a closures-over-fns shape).
+ */
+fn function_taken_as_a_value_counts_as_a_use() {
+    let fref = checker::TExpr { kind = checker::TVar { name = "raw_read"; is_func = true; func_ns = "" }; type = checker::Void { }; line = 0; col = 0 }
+    let bound = checker::TBinding { kind = parser::BindKind::Let; target = parser::SimpleName { name = "f" }; bound = checker::Void { }; value = fref }
+    let items0 = one_item(extern_fn("raw_read", "libc"))
+    let items1 = teko::list::push(items0, bound)
+    let prog = checker::TProgram { items = items1 }
+    teko::assert::is_true(name_in(reachable_libs(prog), "libc"))
+}

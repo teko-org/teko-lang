@@ -1,0 +1,120 @@
+// src/repl/repl_test.tkt — tests for teko::repl (DT3 — `teko repl`, the VM-backed session).
+//
+// SCOPE NOTE. `teko::repl::step` runs an ACCEPTED line's newly-typed statement(s) through
+// `teko::vm::exec_stmt` — the compiler's OWN tree-walker, itself a normal function in this
+// corpus. Since `teko test .` runs every `#test` THROUGH THE VM (D2), a test that reaches
+// `run_new_statements` makes the OUTER VM interpret `vm.tks`'s source A SECOND TIME (nested
+// self-interpretation), and `vm.tks::exec_stmt` unconditionally calls `teko::cov_line` (D3-line
+// instrumentation) — a builtin the VM's `try_builtin` has no shim for (native-codegen-only,
+// like every `cov_*` builtin). Reaching it aborts with "vm: `cov_line` is a host function the
+// VM cannot run". No prior test called `vm::exec_stmt`/`run_loop` directly, so this pre-existing
+// gap never surfaced before (a genuine compiler limitation — reported, not routed around here).
+// So these tests cover every REPL path that stops BEFORE `run_new_statements`: the `:help`/
+// `:quit` meta-commands (short-circuit before any parse), a lexer/parser/checker rejection
+// (returns before running anything), and `value_str`'s display formatting on the PRIM/str/char
+// arms of `checker::Type` (a pure function of a constructed Value + its static Type — no VM
+// interpretation involved).
+//
+// `value_str`'s Slice/Optional arms are NOT covered here: `checker::Slice{element}` and
+// `checker::Optional{inner}` are both single-field SIBLING members of the `checker::Type`
+// variant, which is exactly the shape the VM's documented wrapper-descent bug (see
+// vm_variant_siblings's own doc, vm.tks — "a SINGLE-FIELD sibling wrapper … still descends")
+// conflates when interpreting a `match t { … }` over a constructed `Type` value — a pre-existing
+// VM-only test-authoring hazard (never a compiler bug), not something to route around here.
+
+use teko::checker
+
+#test
+fn help_meta_command_prints_the_banner_and_keeps_the_session() {
+    let session = teko::repl::new_session()
+    let r = teko::repl::step(session, ":help")
+    teko::assert::is_true(r.ok)
+    teko::assert::is_false(r.quit)
+    teko::assert::is_true(r.printed == teko::repl::help_text())
+}
+
+#test
+fn help_short_alias_matches_the_long_form() {
+    let session = teko::repl::new_session()
+    let r = teko::repl::step(session, ":h")
+    teko::assert::is_true(r.printed == teko::repl::help_text())
+}
+
+#test
+fn quit_meta_command_signals_the_caller_to_stop() {
+    let session = teko::repl::new_session()
+    let r = teko::repl::step(session, ":quit")
+    teko::assert::is_true(r.ok)
+    teko::assert::is_true(r.quit)
+    teko::assert::is_true(r.printed == "")
+}
+
+#test
+fn quit_short_alias_also_signals_stop() {
+    let session = teko::repl::new_session()
+    let r = teko::repl::step(session, ":q")
+    teko::assert::is_true(r.quit)
+}
+
+#test
+fn a_blank_line_is_a_no_op_before_any_parse() {
+    let session = teko::repl::new_session()
+    let r = teko::repl::step(session, "")
+    teko::assert::is_true(r.ok)
+    teko::assert::is_false(r.quit)
+    teko::assert::is_true(r.printed == "")
+}
+
+#test
+fn an_unterminated_token_stream_is_rejected() {
+    let session = teko::repl::new_session()
+    let r = teko::repl::step(session, "\"unterminated")
+    teko::assert::is_false(r.ok)
+    teko::assert::str_contains(r.printed, "error:")
+}
+
+#test
+fn a_syntax_error_is_rejected_before_running_anything() {
+    let session = teko::repl::new_session()
+    let r = teko::repl::step(session, "let y +")
+    teko::assert::is_false(r.ok)
+    teko::assert::str_contains(r.printed, "error:")
+}
+
+#test
+fn an_undefined_name_is_a_type_error_before_running_anything() {
+    let session = teko::repl::new_session()
+    let r = teko::repl::step(session, "this_name_was_never_bound")
+    teko::assert::is_false(r.ok)
+    teko::assert::str_contains(r.printed, "error:")
+}
+
+#test
+fn a_rejected_line_never_flips_quit() {
+    let session = teko::repl::new_session()
+    let r = teko::repl::step(session, "let y +")
+    teko::assert::is_false(r.quit)
+}
+
+#test
+fn value_str_renders_bool_and_numeric_prims() {
+    let bool_t = checker::Prim { kind = checker::PrimKind::Bool }
+    teko::assert::is_true(teko::repl::value_str(true, bool_t) == "true")
+    teko::assert::is_true(teko::repl::value_str(false, bool_t) == "false")
+    let i64_t = checker::Prim { kind = checker::PrimKind::I64 }
+    teko::assert::is_true(teko::repl::value_str(42 to i64, i64_t) == "42")
+    let u64_t = checker::Prim { kind = checker::PrimKind::U64 }
+    teko::assert::is_true(teko::repl::value_str(7 to u64, u64_t) == "7")
+}
+
+#test
+fn value_str_quotes_str_and_passes_char_through_bare() {
+    teko::assert::is_true(teko::repl::value_str("hi", checker::Str { }) == "\"hi\"")
+    teko::assert::is_true(teko::repl::value_str("a", checker::Char { }) == "a")
+}
+
+#test
+fn value_str_falls_back_honestly_on_unrendered_shapes() {
+    teko::assert::is_true(teko::repl::value_str(true, checker::Func { params = []; ret = checker::Void { }; variadic = false; param_names = []; n_required = 0; defaults = [] }) == "<function>")
+    teko::assert::is_true(teko::repl::value_str(true, checker::Void { }) == "")
+}

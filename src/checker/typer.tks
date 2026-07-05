@@ -43,6 +43,7 @@ fn type_nulllit(n: parser::NullLit) -> TExpr | error {
 }
 fn type_var(v: parser::Var, env: Env) -> TExpr | error {
     let b = match lookup_binding(env, v.name) { ValBinding as bb => bb; error as e => return e }
+    match lookup_inject(env, v.name) { DiInjectBind as ib => return di_lower_use(ib, b.type); error => {} }
     // (W10a) a bare reference to a top-level FUNCTION used as a VALUE: only `define_fn` sets a
     // non-empty `ns`, so `ns != "" && type is Func` uniquely identifies a fn reference (a local of
     // closure type has ns=""). It lowers to a `tk_closure` literal; a plain local emits its name.
@@ -722,22 +723,7 @@ fn type_method_call(mc: parser::MethodCall, env: Env, table: TypeTable) -> TExpr
                     if !literal_adopts(a, pt) { return teko::error::err_typed(error { message = "argument type mismatch" }, type_render(pt), type_render(a.type)) }
                     a = TExpr { kind = a.kind; type = pt; line = a.line; col = a.col }   // C6 literal adopts the param type
                 } else {
-                    // adopt the param type EXCEPT where the emit wraps at the use site: a case→variant
-                    // widen, a bare T→T? widen, and (D3) a class→contract upcast — the narrow CLASS
-                    // type is what picks the (class, interface) vtable at the emit.
-                    let pt_is_variant = match expand_variant(pt, table) { Variant => true; _ => false }
-                    let pt_is_opt = match pt { Optional => true; _ => false }
-                    let arg_is_opt = match a.type { Optional => true; _ => false }
-                    let bare_to_opt = pt_is_opt && !arg_is_opt
-                    mut class_to_iface = false
-                    match pt {
-                        Named as ptn => match a.type {
-                            Named as atn => { if is_interface_name(ptn.name, table) && is_class_name(atn.name, table) { class_to_iface = true } }
-                            _ => {}
-                        }
-                        _ => {}
-                    }
-                    if !pt_is_variant && !bare_to_opt && !class_to_iface {
+                    if !arg_keeps_narrow_type(pt, a.type, table) {
                         a = TExpr { kind = a.kind; type = pt; line = a.line; col = a.col }
                     }
                 }
@@ -817,22 +803,7 @@ fn type_method_call(mc: parser::MethodCall, env: Env, table: TypeTable) -> TExpr
                                 if !literal_adopts(ba, bpt) { return teko::error::err_typed(error { message = "argument type mismatch" }, type_render(bpt), type_render(ba.type)) }
                                 ba = TExpr { kind = ba.kind; type = bpt; line = ba.line; col = ba.col }
                             } else {
-                                // keep the narrow type where the emit wraps at the use site (variant /
-                                // bare→optional / class→base or class→contract upcast) — the receiver
-                                // (arg 0) always stays its NARROW class so the fat pointer is built.
-                                let bpt_is_variant = match expand_variant(bpt, table) { Variant => true; _ => false }
-                                let bpt_is_opt = match bpt { Optional => true; _ => false }
-                                let barg_is_opt = match ba.type { Optional => true; _ => false }
-                                let bbare_to_opt = bpt_is_opt && !barg_is_opt
-                                mut bclass_wrap = false
-                                match bpt {
-                                    Named as bptn => match ba.type {
-                                        Named as batn => { if (is_interface_name(bptn.name, table) || is_polymorphic_base(bptn.name, table)) && is_class_name(batn.name, table) && bptn.name != batn.name { bclass_wrap = true } }
-                                        _ => {}
-                                    }
-                                    _ => {}
-                                }
-                                if !bpt_is_variant && !bbare_to_opt && !bclass_wrap {
+                                if !arg_keeps_narrow_type(bpt, ba.type, table) {
                                     ba = TExpr { kind = ba.kind; type = bpt; line = ba.line; col = ba.col }
                                 }
                             }
@@ -1009,26 +980,7 @@ fn type_call(c: parser::Call, env: Env, table: TypeTable) -> TExpr | error {
                         if !literal_adopts(a, f.params[i]) { return teko::error::err_typed(error { message = "argument type mismatch" }, type_render(f.params[i]), type_render(a.type)) }
                         a = TExpr { kind = a.kind; type = f.params[i]; line = a.line; col = a.col }   // C6 literal adopts the param type
                     } else {
-                        // A non-variant widen (empty()→[]T, exact, already-optional→T?) ADOPTS the param
-                        // type; a case→VARIANT widen KEEPS its case type so emit_call wraps it into the
-                        // variant rep (emit_as). A bare T→T? widen (param OPTIONAL, arg NOT optional) ALSO
-                        // keeps its narrow type so codegen/VM present-wrap it (uniform with field/return).
-                        let pt_is_variant = match expand_variant(f.params[i], table) { Variant => true; _ => false }
-                        let pt_is_opt = match f.params[i] { Optional => true; _ => false }
-                        let arg_is_opt = match a.type { Optional => true; _ => false }
-                        let bare_to_opt = pt_is_opt && !arg_is_opt
-                        // (W10b.D3) a class→contract upcast arg ALSO keeps its narrow CLASS type —
-                        // that is what picks the (class, interface) vtable when emit_as builds the
-                        // fat pointer.
-                        mut class_to_iface = false
-                        match f.params[i] {
-                            Named as ptn => match a.type {
-                                Named as atn => { if is_interface_name(ptn.name, table) && is_class_name(atn.name, table) { class_to_iface = true } }
-                                _ => {}
-                            }
-                            _ => {}
-                        }
-                        if !pt_is_variant && !bare_to_opt && !class_to_iface {
+                        if !arg_keeps_narrow_type(f.params[i], a.type, table) {
                             a = TExpr { kind = a.kind; type = f.params[i]; line = a.line; col = a.col }
                         }
                     }
@@ -1074,7 +1026,7 @@ fn value_fits(v: i128, k: PrimKind) -> bool {
     if k == PrimKind::I8   { return v >= -128 && v <= 127 }
     if k == PrimKind::I16  { return v >= -32768 && v <= 32767 }
     if k == PrimKind::I32  { return v >= -2147483648 && v <= 2147483647 }
-    if k == PrimKind::I64  { return v >= -9223372036854775808 && v <= 9223372036854775807 }
+    if k == PrimKind::I64  { return v >= (-9223372036854775807 - 1) && v <= 9223372036854775807 }
     if k == PrimKind::I128 { return true }                        // v is already an i128
     false   // Bool — not a numeric range (guarded by the caller)
 }
@@ -2507,6 +2459,51 @@ fn function_return(f: parser::Function, table: TypeTable, ref_ns: str) -> Type |
 // case widens transitively, and `T` widens into `T?`.
 fn assignable_to(from: Type, to: Type, table: TypeTable) -> bool { widens_into(from, to, table) }
 
+/** arg_keeps_narrow_type — an argument that WIDENS into a parameter type `pt` normally ADOPTS `pt`
+    (its TExpr.type is rewritten to `pt`); but where the EMIT wraps the value at the use site, the
+    arg must KEEP its narrow `arg_type` so codegen/VM see the concrete value they must wrap. True for:
+    a case→variant widen (emit_as tags the union), a bare `T`→`T?` widen (present-wrap), a class→
+    interface/base upcast (fat-pointer build), and a `[]E_a`→`[]E_p` element widen where `E_a != E_p`
+    (the slice is REBUILT element-wise — bare `[]i64`→`[]i64?` or covariant `[]Return`→`[]Statement`;
+    #265: the native gate cc-compiles these for the first time, so a widened arg-type would hide the
+    element mismatch and cc would reject the distinct `tk_slice_*` struct). */
+fn arg_keeps_narrow_type(pt: Type, arg_type: Type, table: TypeTable) -> bool {
+    let pt_is_variant = match expand_variant(pt, table) { Variant => true; _ => false }
+    if pt_is_variant { return true }
+    let pt_is_opt = match pt { Optional => true; _ => false }
+    let arg_is_opt = match arg_type { Optional => true; _ => false }
+    if pt_is_opt && !arg_is_opt { return true }
+    if arg_class_upcast(pt, arg_type, table) { return true }
+    slice_element_widens(pt, arg_type)
+}
+
+/** arg_class_upcast — the param is an interface or polymorphic base and the arg is a DIFFERENT-named
+    class conforming to it (a fat-pointer upcast the emit builds from the narrow class). (#265) */
+fn arg_class_upcast(pt: Type, arg_type: Type, table: TypeTable) -> bool {
+    match pt {
+        Named as ptn => match arg_type {
+            Named as atn => (is_interface_name(ptn.name, table) || is_polymorphic_base(ptn.name, table)) && is_class_name(atn.name, table) && ptn.name != atn.name
+            _ => false
+        }
+        _ => false
+    }
+}
+
+/** slice_element_widens — both types are slices whose ELEMENTS differ (`[]E_a` → `[]E_p`, `E_a != E_p`):
+    a bare→optional element widen or a covariant case→variant element widen. The emit rebuilds the
+    slice element-wise, so the arg must keep its narrow `[]E_a` type for codegen to see the mismatch.
+    A SENTINEL empty slice (`teko::list::empty()`, element = `void`) is EXCLUDED — it carries no
+    concrete element, so it ADOPTS the param's concrete slice type (collections #4) as before. */
+fn slice_element_widens(pt: Type, arg_type: Type) -> bool {
+    match pt {
+        Slice as ps => match arg_type {
+            Slice as as_ => !type_is_void(as_.element) && !type_eq(ps.element, as_.element)
+            _ => false
+        }
+        _ => false
+    }
+}
+
 // check every `return` reachable as a statement (descend into loop bodies and `if`-blocks;
 // match-arm returns await the divergence item — arm bodies are expressions, not statements).
 fn check_returns(stmts: []TStatement, ret: Type, table: TypeTable) -> error? {
@@ -2945,6 +2942,9 @@ fn type_function(f: parser::Function, env: Env, table: TypeTable) -> TFunction |
         local = define(local, f.params[i].name, pt, false)        // params are immutable (B.21)
         i++
     }
+    if f.has_inject {
+        local = match seed_di_injects(f, local, tbl) { Env as e => e; error as e => return e }
+    }
     let ret = match function_return(f, tbl, env.cur_ns) { Type as t => t; error as e => return e }   // (#109 W1) ref_ns = the fn's enclosing namespace
     // (MEM Step 0, R3) ESCAPE GATE — a function cannot RETURN a reference (pass-down only): a
     // returned ref would outlive its caller-stack target. References flow only DOWN as params.
@@ -3047,7 +3047,7 @@ fn type_item(item: parser::Item, env: Env, table: TypeTable) -> TItem | error {
             // typedef (matching the canonical Named.name at every USE). A generic `__g__` instance keeps
             // its already-unique bare name. Resolution stays bare-keyed (this is the TYPED program only).
             let cd = if name_is_g_instance(td.name) { td } else {
-                parser::TypeDecl { name = qualify(item.namespace, td.name); type_params = td.type_params; type_constraints = td.type_constraints; body = td.body; vis = td.vis; has_doc = td.has_doc; doc = td.doc; line = td.line; col = td.col }
+                parser::TypeDecl { name = qualify(item.namespace, td.name); type_params = td.type_params; type_constraints = td.type_constraints; body = td.body; vis = td.vis; has_doc = td.has_doc; doc = td.doc; line = td.line; col = td.col; di_kind = td.di_kind; has_di_key = td.has_di_key; di_key = td.di_key }
             }
             normalize_inst_decl(cd, table)   // (W9.4) rewrite `Gen<i64>` member refs to the bare stamped `Gen__g__i64` (no-op when none); else passes through (collect resolved its fields)
         }
@@ -3096,8 +3096,10 @@ pub fn type_program_with_deps(raw_program: parser::Program, dep_prog: TProgram) 
     // W-vis-enforce: enforce the module system over the project's own items.
     // We only check the project's items (not dep items — they were checked when the dep was built).
     match check_modules(program, c.types) { null => {}; error as e => return e }
+    match check_di(program, c.types) { null => {}; error as e => return e }
+    let di_reg = match build_di_registry(program, c.types) { DiRegistry as r => r; error as e => return e }
     // (#148) seal the collected globals — see type_program.
-    let cenv = seal(c.env)
+    let cenv = with_di(seal(c.env), di_reg)
     // (S4 type-generics) stamp concrete decls for written generic uses before typing (no-op when none).
     let types = instantiate_types(program, c.types)
     mut items: []TItem = teko::list::empty()
@@ -3182,9 +3184,11 @@ pub fn type_program(raw_program: parser::Program) -> TProgram | error {
     // W-vis-enforce: enforce the module system (namespace qualification + pub/exp) over the
     // whole flattened program before typing — fail loud on any cross-namespace violation (M.1).
     match check_modules(program, c.types) { null => {}; error as e => return e }
+    match check_di(program, c.types) { null => {}; error as e => return e }
+    let di_reg = match build_di_registry(program, c.types) { DiRegistry as r => r; error as e => return e }
     // (#148) SEAL the collected globals into the env's immutable base segment ONCE, so every
     // function/arm forking from it copies only its own locals (never the whole global table).
-    let cenv = seal(c.env)
+    let cenv = with_di(seal(c.env), di_reg)
     // (S4 type-generics) STAMP concrete decls for written generic uses (`Box<i64>`) into the table
     // before typing, so field-access / struct-init see concrete fields. No-op when none are used.
     let types = instantiate_types(program, c.types)
