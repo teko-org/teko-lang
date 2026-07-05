@@ -256,10 +256,16 @@ fn type_tilde_chain(b: parser::Binary, env: Env, table: TypeTable) -> TExpr | er
     // a non-str `~` operand fails there with a clear message, no separate check needed here.
     type_call(call, env, table)
 }
+/** `~` is desugared WHOLESALE (chain-flattened + literal-folded) BEFORE the generic operand-typing
+    below — it never reaches a plain TBinary node (codegen/VM see an ordinary TCall or TStrLit,
+    nothing new to handle, mirroring how `params` needed no engine changes).
+    (S6, issue #162) operators over a constrained type-param T stay a HONEST STOP, intentionally —
+    no operator-trait exists yet to authorize `+`/`-`/… the way an interface constraint authorizes
+    a method call. `is_numeric`/`is_integer`/`is_bool` below never match a type-param's `Named{T}`
+    (opaque OR interface-mirroring), so every arm below already falls through to its own clear error
+    for a `T` operand — NO new logic is needed, and none is added here (avoids gold-plating a
+    pre-alpha surface). Real operators on T arrive with an operator-trait constraint (#176+). */
 fn type_binary(b: parser::Binary, env: Env, table: TypeTable) -> TExpr | error {
-    // `~` is desugared WHOLESALE (chain-flattened + literal-folded) BEFORE the generic
-    // operand-typing below — it never reaches a plain TBinary node (codegen/VM see an ordinary
-    // TCall or TStrLit, nothing new to handle, mirroring how `params` needed no engine changes).
     if b.op == lexer::TokenKind::Tilde { return type_tilde_chain(b, env, table) }
     mut l = match type_expr(b.left, env, table)  { TExpr as te => te; error as e => return e }
     mut r = match type_expr(b.right, env, table) { TExpr as te => te; error as e => return e }
@@ -571,12 +577,12 @@ fn type_flags_method(mc: parser::MethodCall, env: Env, table: TypeTable) -> TExp
     TExpr { kind = TCompare { first = andexpr; rest = teko::list::push(teko::list::empty(), term) }; type = Prim { kind = PrimKind::Bool }; line = 0; col = 0 }
 }
 
-// (W10b.D3; generalized S6/issue #162) a resolved interface dot-call: the DECLARING interface
-// (the D3 vtable/upcast key), the resolved Function signature, and its vtable SLOT within that
-// interface's own effective-methods list.
+/** (W10b.D3; generalized S6/issue #162) a resolved interface dot-call: the DECLARING interface
+    (the D3 vtable/upcast key), the resolved Function signature, and its vtable SLOT within that
+    interface's own effective-methods list. */
 type IfaceDispatch = struct { iface: str; method: parser::Function; slot: u32 }
 
-// (S6) find `method` within `eff` (an interface's own effective methods), returning its slot.
+/** (S6) find `method` within `eff` (an interface's own effective methods), returning its slot. */
 fn find_method_slot(eff: []parser::Function, method: str) -> IfaceDispatch? {
     mut i: u64 = 0
     loop {
@@ -587,17 +593,20 @@ fn find_method_slot(eff: []parser::Function, method: str) -> IfaceDispatch? {
     null
 }
 
-// (W10b.D2, issue #99; generalized S6/issue #162) resolve `method` on an InterfaceBody receiver
-// to its DISPATCH interface + slot. A plain interface receiver (methods.len > 0) dispatches
-// against ITSELF (`struct_name`). A generic type-param — registered by type_param_table with an
-// InterfaceBody that has NO own methods and an `extends` list of N real interfaces (S6: the
-// constraint's And-union / Or-intersection surface) — searches EACH interface of `extends`, in
-// order, for the first that OWNS the method (method_owner_interface — the D3 vtable key), and
-// reads the slot from THAT interface's own effective-methods list (never a concatenated list —
-// the emitted vtable is per-(class, interface), so the slot must agree with it). A method not
-// owned by any interface of `extends` is the S6 "outside the authorized surface" honest stop.
+/** (W10b.D2, issue #99; generalized S6/issue #162) resolve `method` on an InterfaceBody receiver
+    to its DISPATCH interface + slot. A plain interface receiver (methods.len > 0 — it declares its
+    OWN methods, so it IS the dispatch interface) resolves against ITSELF (`struct_name`). A body
+    with NO own methods (methods.len == 0) is either a genuine `interface X extends A, B {}` OR a
+    generic type-param's synthetic InterfaceBody (type_param_table; S6: an `extends` list of N real
+    interfaces, the constraint's And-union / Or-intersection surface) — BOTH shapes want the SAME
+    resolution: search EACH interface of `extends`, in order, for the first that OWNS the method
+    (method_owner_interface — the D3 vtable key), and read the slot from THAT interface's own
+    effective-methods list (never a concatenated list — the emitted vtable is per-(class,
+    interface), so the slot must agree with it). This subsumes the single-extends #99 case (the
+    search trivially finds the one interface). A method owned by no interface of `extends` is the
+    S6 "outside the authorized surface" honest stop. */
 fn resolve_iface_dispatch(ib: parser::InterfaceBody, struct_name: str, method: str, table: TypeTable) -> IfaceDispatch | error {
-    if ib.methods.len > 0 || ib.extends.len != 1 {
+    if ib.methods.len > 0 {
         let eff = match iface_methods_by_name(struct_name, table) { []parser::Function as f => f; error as e => return e }
         return match find_method_slot(eff, method) {
             IfaceDispatch as d => IfaceDispatch { iface = struct_name; method = d.method; slot = d.slot }
@@ -615,9 +624,9 @@ fn resolve_iface_dispatch(ib: parser::InterfaceBody, struct_name: str, method: s
     }
 }
 
-// (S6, M.1) render the type-param's authorized surface (every method name every constrained
-// interface of `extends` contributes) for the "not guaranteed by the constraint" error — so the
-// message enumerates what IS available, never just what is missing.
+/** (S6, M.1) render the type-param's authorized surface (every method name every constrained
+    interface of `extends` contributes) for the "not guaranteed by the constraint" error — so the
+    message enumerates what IS available, never just what is missing. */
 fn type_param_surface_message(extends: []str, table: TypeTable) -> str {
     mut names = ""
     mut i = 0
@@ -636,28 +645,54 @@ fn type_param_surface_message(extends: []str, table: TypeTable) -> str {
     $"available: {names}"
 }
 
-// (OOP A1, 2026-07-01) `recv.method(args)` — an INSTANCE struct-method dot-call. Desugars into
-// an ordinary `StructName::method(recv, ...args)` Call and delegates to `type_call` wholesale
-// (reuses arity/defargs/generics/namespace-mangling for free — the same trick `~` used for
-// `teko::string::concat`). The receiver is typed ONCE here just to discover which struct/method
-// is targeted; `type_call` re-types it (and every arg) as part of its normal argument pass.
-// Flags-typed receivers dispatch to type_flags_method (the dispatch's job, mirroring the C
-// switch's precedence — see type_dispatch's MethodCall arm), never reaching here.
+/** (S6, M.1) is `decl` a type-param's OWN synthetic decl (resolve::type_param_table) — never a
+    genuine user decl, which the parser's own invariant keeps same-length on `type_params`/
+    `type_constraints` (so a real 0-type-param decl always carries 0 constraints, the one shape a
+    type-param's synthetic decl never has). */
+fn is_type_param_decl(decl: parser::TypeDecl) -> bool {
+    decl.type_params.len == 0 && decl.type_constraints.len == 1
+}
+
+/** (S6, M.1) when a constrained type-param's `extends` list came back EMPTY not because the
+    constraint genuinely authorizes nothing (NoConstraint / a struct-or-variant atom) but because
+    resolve::constraint_interfaces ERRORED (a trait atom / an unknown atom / a Risco-3 ambiguity),
+    recompute that SAME error here so the honest stop names the real reason instead of the generic
+    "method typing is deferred" — resolve::type_param_table has no error channel, so this is where
+    the swallowed error re-surfaces, at the first attempted operation on `T` (never silently lost). */
+fn type_param_call_error(decl: parser::TypeDecl, table: TypeTable) -> error? {
+    if !is_type_param_decl(decl) { return null }
+    match constraint_interfaces(decl.type_constraints[0], table) {
+        []str => null
+        error as e => e
+    }
+}
+
+/** `recv.method(args)` — an INSTANCE struct-method dot-call (OOP A1, 2026-07-01). Desugars into
+    an ordinary `StructName::method(recv, ...args)` Call and delegates to `type_call` wholesale
+    (reuses arity/defargs/generics/namespace-mangling for free — the same trick `~` used for
+    `teko::string::concat`). The receiver is typed ONCE here just to discover which struct/method
+    is targeted; `type_call` re-types it (and every arg) as part of its normal argument pass.
+    Flags-typed receivers dispatch to type_flags_method (the dispatch's job, mirroring the C
+    switch's precedence — see type_dispatch's MethodCall arm), never reaching here. A bare `.` call
+    on a nullable receiver stays a compile error (NP-OOP, issue #116) — but names WHY and points at
+    the sanctioned null-propagating call (`?.`) instead of the deferral message. The receiver-type
+    lookup (`type_table_find`) is a resolved-name probe (#109 W1, no referencing ns); once resolved,
+    a type-param's swallowed constraint error (S6, M.1 — a trait atom / an unknown atom / a Risco-3
+    ambiguity) re-surfaces here, named, before an INTERFACE-typed receiver's DYNAMIC contract-method
+    call resolves against the interface's EFFECTIVE (extends-transitive) signature list; its index
+    there is the vtable slot both backends dispatch through. The receiver rides as args[0] (an
+    interface value, or a class instance the emitters upcast on the fly). Mirror:
+    expr.c::type_method_call. */
 fn type_method_call(mc: parser::MethodCall, env: Env, table: TypeTable) -> TExpr | error {
     let recv_t = match type_expr(mc.receiver, env, table) { TExpr as te => te.type; error as e => return e }
     if is_flags_named(recv_t, table) { return error { message = "method typing is deferred (B.29 / M.4)" } }
-    // (NP-OOP, issue #116) a bare `.` call on a nullable receiver stays a compile error — but say
-    // WHY and point at the sanctioned null-propagating call (`?.`) instead of the deferral message.
     match recv_t {
         Optional => return error { message = "cannot call a method with `.` on a nullable value (`T?`) — use `?.` (REBOOT_PLAN §203)" }
         _ => {}
     }
     let struct_name = match recv_t { Named as n => n.name; _ => return error { message = "method typing is deferred (B.29 / M.4)" } }
-    let decl = match type_table_find(table, struct_name, "") { parser::TypeDecl as td => td; error => return error { message = "method typing is deferred (B.29 / M.4)" } }   // (#109 W1) method-receiver lookup on a resolved name — no referencing ns
-    // (W10b.D3) an INTERFACE-typed receiver — a DYNAMIC contract-method call. The method resolves
-    // against the interface's EFFECTIVE (extends-transitive) signature list; its index there is
-    // the vtable slot both backends dispatch through. The receiver rides as args[0] (an interface
-    // value, or a class instance the emitters upcast on the fly). Mirror: expr.c::type_method_call.
+    let decl = match type_table_find(table, struct_name, "") { parser::TypeDecl as td => td; error => return error { message = "method typing is deferred (B.29 / M.4)" } }
+    match type_param_call_error(decl, table) { error as e => return e; null => {} }
     match decl.body {
         parser::InterfaceBody as ib => {
             let dispatch = match resolve_iface_dispatch(ib, struct_name, mc.method, table) { IfaceDispatch as d => d; error as e => return e }

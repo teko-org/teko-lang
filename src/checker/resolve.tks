@@ -279,29 +279,32 @@ fn type_ref_ns(path: parser::Path, table: TypeTable, ref_ns: str) -> str {
     ""
 }
 
-// (S6, issue #162) an interface-atom's own EFFECTIVE (extends-transitive) methods — the leaf case
-// of a constraint's method surface. A trait atom is a named TR1 honest stop (the gancho #176
-// plugs by replacing this one arm with the trait's required methods, once traits reuse the D3
-// vtable — traits are struct-shaped/derivable per [[teko-traits-and-nullprop-rounds]]). Every
-// other atom kind (struct/enum/flags/variant/alias/extern/class — no shared nominal method
-// contract to expose) contributes an EMPTY surface: it may still satisfy the constraint nominally
-// (Tensão 1 — nominal membership is unaffected), but authorizes no operation on T through it.
+/** (S6, issue #162) an interface-atom's own EFFECTIVE (extends-transitive) methods — the leaf case
+    of a constraint's method surface. A trait atom is a named TR1 honest stop (the gancho #176
+    plugs by replacing this one arm with the trait's required methods, once traits reuse the D3
+    vtable — traits are struct-shaped/derivable per [[teko-traits-and-nullprop-rounds]]). Every
+    other KNOWN atom kind (struct/enum/flags/variant/alias/extern/class — no shared nominal method
+    contract to expose) contributes an EMPTY surface: it may still satisfy the constraint nominally
+    (Tensão 1 — nominal membership is unaffected), but authorizes no operation on T through it. An
+    atom naming NO TypeDecl at all is a named error (M.1 fail-loud — never silently opaque). */
 fn atom_surface(name: str, table: TypeTable) -> []parser::Function | error {
     if is_trait_name(name, table) { return error { message = $"'{name}' is a trait — a trait as a generic constraint (`<T: Trait>`) is not implemented yet (TR1)" } }
     if is_interface_name(name, table) { return iface_methods_by_name(name, table) }
-    let empty_surface: []parser::Function = teko::list::empty()
-    empty_surface
+    match type_table_find(table, name, "") {
+        parser::TypeDecl => { let empty_surface: []parser::Function = teko::list::empty(); empty_surface }
+        error            => error { message = $"unknown constraint atom '{name}' — names no declared type" }
+    }
 }
 
-// (S6) does `m` already appear (by name) in `methods`?
+/** (S6) does `m` already appear (by name) in `methods`? */
 fn surface_has(methods: []parser::Function, m: parser::Function) -> bool {
     mut i = 0
     loop { if i >= methods.len { return false }; if methods[i].name == m.name { return true }; i++ }
     false
 }
 
-// (S6) the UNION of two method surfaces (an `A & B` constraint — T satisfies BOTH contracts, so
-// every method of both is authorized). A name shared by both sides is kept once.
+/** (S6) the UNION of two method surfaces (an `A & B` constraint — T satisfies BOTH contracts, so
+    every method of both is authorized). A name shared by both sides is kept once. */
 fn surface_union(a: []parser::Function, b: []parser::Function) -> []parser::Function {
     mut out = a
     mut i = 0
@@ -313,9 +316,9 @@ fn surface_union(a: []parser::Function, b: []parser::Function) -> []parser::Func
     out
 }
 
-// (S6) the signature-matched INTERSECTION of two method surfaces (an `A | B` constraint — T is
-// one OR the other at runtime, so only what BOTH universally guarantee — same name, same
-// non-receiver param types, same return type, via method_sig_matches — is safe to authorize).
+/** (S6) the signature-matched INTERSECTION of two method surfaces (an `A | B` constraint — T is
+    one OR the other at runtime, so only what BOTH universally guarantee — same name, same
+    non-receiver param types, same return type, via method_sig_matches — is safe to authorize). */
 fn surface_intersect(a: []parser::Function, b: []parser::Function, table: TypeTable) -> []parser::Function {
     mut out: []parser::Function = teko::list::empty()
     mut i = 0
@@ -355,10 +358,10 @@ pub fn constraint_surface(c: parser::ConstraintExpr, table: TypeTable) -> []pars
     }
 }
 
-// (S6, Risco 3) does `iface` already have a method (by NAME) present among `names`'s OWN methods
-// with a DIFFERENT signature — an ambiguous `A & B` where both declare e.g. `area` incompatibly?
-// Same name + SAME signature is fine (equivalent, kept once); same name + different signature is
-// rejected at the DEFINITION with a named error (never a silent pick).
+/** (S6, Risco 3) does `iface` already have a method (by NAME) present among `names`'s OWN methods
+    with a DIFFERENT signature — an ambiguous `A & B` where both declare e.g. `area` incompatibly?
+    Same name + SAME signature is fine (equivalent, kept once); same name + different signature is
+    rejected at the DEFINITION with a named error (never a silent pick). */
 fn interface_conflicts_with(iface: str, names: []str, table: TypeTable) -> str | error {
     let ims = match iface_methods_by_name(iface, table) { []parser::Function as f => f; error as e => return e }
     mut i = 0
@@ -383,9 +386,9 @@ fn interface_conflicts_with(iface: str, names: []str, table: TypeTable) -> str |
     ""
 }
 
-// (S6) append `iface` to `names`, rejecting an ambiguous same-name-different-signature clash
-// against any interface already in the list (Risco 3) — the AND-union of a constraint's
-// interfaces. Duplicates (the exact same interface reachable via two branches) are kept once.
+/** (S6) append `iface` to `names`, rejecting an ambiguous same-name-different-signature clash
+    against any interface already in the list (Risco 3) — the AND-union of a constraint's
+    interfaces. Duplicates (the exact same interface reachable via two branches) are kept once. */
 fn interfaces_and_union(names: []str, iface: str, table: TypeTable) -> []str | error {
     mut i = 0
     loop { if i >= names.len { break }; if names[i] == iface { return names }; i++ }
@@ -394,9 +397,9 @@ fn interfaces_and_union(names: []str, iface: str, table: TypeTable) -> []str | e
     teko::list::push(names, iface)
 }
 
-// (S6) the interface names an `And` constraint contributes, merged with Risco-3 ambiguity
-// checking — every interface of `l` folded into `r`'s list (or vice versa; either order is
-// equivalent since the check is symmetric).
+/** (S6) the interface names an `And` constraint contributes, merged with Risco-3 ambiguity
+    checking — every interface of `l` folded into `r`'s list (or vice versa; either order is
+    equivalent since the check is symmetric). */
 fn merge_interfaces_and(l: []str, r: []str, table: TypeTable) -> []str | error {
     mut out = r
     mut i = 0
@@ -408,9 +411,9 @@ fn merge_interfaces_and(l: []str, r: []str, table: TypeTable) -> []str | error {
     out
 }
 
-// (S6) keep only the interfaces of `names` that still own at least one method in `surface` (an
-// `Or`'s intersected surface) — an interface contributing nothing to the surviving surface would
-// add an unreachable `extends` to the synthetic InterfaceBody.
+/** (S6) keep only the interfaces of `names` that still own at least one method in `surface` (an
+    `Or`'s intersected surface) — an interface contributing nothing to the surviving surface would
+    add an unreachable `extends` to the synthetic InterfaceBody. */
 fn interfaces_surviving(names: []str, surface: []parser::Function, table: TypeTable) -> []str | error {
     mut out: []str = teko::list::empty()
     mut i = 0
@@ -454,9 +457,9 @@ fn constraint_interfaces(c: parser::ConstraintExpr, table: TypeTable) -> []str |
     }
 }
 
-// (S6) the union of two interface-name lists with no ambiguity check (an Or's two branches are
-// ALREADY narrowed by their own constraint_interfaces call; interfaces_surviving does the actual
-// gating against the intersected surface right after) — no duplicates.
+/** (S6) the union of two interface-name lists with no ambiguity check (an Or's two branches are
+    ALREADY narrowed by their own constraint_interfaces call; interfaces_surviving does the actual
+    gating against the intersected surface right after) — no duplicates. */
 fn surface_union_names(a: []str, b: []str) -> []str {
     mut out = a
     mut i = 0
@@ -471,10 +474,10 @@ fn surface_union_names(a: []str, b: []str) -> []str {
     out
 }
 
-// (S6) which interface in `ifaces` (a type-param's synthetic InterfaceBody `extends` list) OWNS
-// `method` — the first (in `extends` order) whose OWN effective methods declare it — or null. This
-// keys the D3 vtable slot: an N-extends surface's method dispatches through whichever interface
-// actually declares it, exactly generalizing the single-interface `<T: I>` redirect.
+/** (S6) which interface in `ifaces` (a type-param's synthetic InterfaceBody `extends` list) OWNS
+    `method` — the first (in `extends` order) whose OWN effective methods declare it — or null. This
+    keys the D3 vtable slot: an N-extends surface's method dispatches through whichever interface
+    actually declares it, exactly generalizing the single-interface `<T: I>` redirect. */
 pub fn method_owner_interface(ifaces: []str, method: str, table: TypeTable) -> str? {
     mut i = 0
     loop {
@@ -488,12 +491,12 @@ pub fn method_owner_interface(ifaces: []str, method: str, table: TypeTable) -> s
     null
 }
 
-// (S6) the type-param's synthetic InterfaceBody `extends` list for constraint `c` — the empty list
-// (opaque ExternBody, honest stop) for NoConstraint/a struct-or-variant atom, the constraint's
-// interfaces (constraint_interfaces) otherwise. A TR1/ambiguity error here is swallowed to the
-// opaque fallback: type_param_table has no error channel (mirrors S4's total-function shape), so
-// the SAME error re-surfaces, named, the moment the body actually operates on T (crumb 4/6) or a
-// concrete instantiation is checked (check_constraints) — never silently ignored (M.1).
+/** (S6) the type-param's synthetic InterfaceBody `extends` list for constraint `c` — the empty list
+    (opaque ExternBody, honest stop) for NoConstraint/a struct-or-variant atom, the constraint's
+    interfaces (constraint_interfaces) otherwise. A TR1/ambiguity error here is swallowed to the
+    opaque fallback: type_param_table has no error channel (mirrors S4's total-function shape), so
+    the SAME error re-surfaces, named, the moment the body actually operates on T (crumb 4/6) or a
+    concrete instantiation is checked (check_constraints) — never silently ignored (M.1). */
 fn type_param_extends(c: parser::ConstraintExpr, table: TypeTable) -> []str {
     let no_interfaces: []str = teko::list::empty()
     match constraint_interfaces(c, table) {
@@ -502,41 +505,55 @@ fn type_param_extends(c: parser::ConstraintExpr, table: TypeTable) -> []str {
     }
 }
 
-// (S4) Extend the type table with generic type-params as OPAQUE nominal types, so a generic
-// signature/body resolves with `T` abstract. An unconstrained `T` has no members/operators, so
-// OPERATING on it (`x.foo`, `a > b`) fails at the definition (M.1 fail-loud, no reflection) — only
-// opaque usage (store/pass/return/hold/match-bind) is allowed (constraints unlock ops at S6). The
-// monomorph pass substitutes each `Named{T}` with the concrete arg before codegen. PREPENDED so a
-// type-param SHADOWS a same-named user type within the generic. Empty type_params → table unchanged.
-// Used by collect (func sigs), check_modules (vis check), and typer (bodies). (C: tk_type_param_table.)
-//
-// (W10b.D2, issue #99; generalized S6/issue #162) `type_constraints` runs PARALLEL to
-// `type_params` (same length; NoConstraint where the caller has none). Index i's constraint
-// contributes an `extends` list of N interfaces (type_param_extends — the And-union / Or-
-// intersection surface's declaring interfaces; a single-interface atom `<T: I>` is the N=1
-// degenerate case, unchanged since #99). A non-empty list registers the type-param with an
-// `InterfaceBody { extends = <the list>; methods = [] }` instead of the opaque ExternBody: this
-// makes `Named{T}.method()` resolve through the EXISTING D3 interface-dispatch path
-// (type_method_call's InterfaceBody arm searches EACH interface of `extends` for the method,
-// keeping the receiver's own `Named{T}` type so monomorphization stamps T→concrete). An empty
-// list (struct/variant atom or no constraint) stays opaque ExternBody — an honest stop.
+/** (S6) the constraint at index `i`, or NoConstraint when the caller supplied fewer constraints
+    than type-params (the parser's own invariant keeps them same-length, but callers that build
+    `type_constraints` by hand — tests, synthetic tables — may not). */
+fn constraint_at(type_constraints: []parser::ConstraintExpr, i: u64) -> parser::ConstraintExpr {
+    if i < type_constraints.len { return type_constraints[i] }
+    parser::NoConstraint { }
+}
+
+/** (S6) a type-param's synthetic TypeReg for `type_param_table`: namespace = the USING namespace
+    (so the W-vis-enforce cross-namespace/visibility check treats the type-param as LOCAL, never a
+    cross-namespace reference), and `body` mirrors the constraint's own contract surface (empty
+    `extends` → opaque ExternBody, an honest stop; a non-empty `extends` → InterfaceBody, unlocking
+    D3 dispatch — see type_param_extends). The synthetic TypeDecl carries the OWN constraint on its
+    own `type_constraints` (a single-element list — `type_params` stays empty, so this can never
+    collide with a genuine multi-param user decl's parallel arrays) so a later honest-stop site
+    (type_method_call) can recompute the REAL reason a swallowed error occurred (a trait atom / an
+    unknown atom / a Risco-3 ambiguity) instead of a generic "deferred" message (M.1 fail-loud even
+    when type_param_extends itself has to swallow the error, S4's total-function shape). The two
+    `body` arms are DIFFERENT members of the wider `TypeBody` variant; the arm-join infers the
+    narrow `InterfaceBody | ExternBody` union while the binding is the wider `TypeBody` — native
+    codegen widens each arm into `TypeBody` (fix/selfhost-arm-join-widen), so this natural form (was
+    a per-arm whole-TypeReg workaround under #99) compiles on the self-host BUILD too. */
+fn type_param_reg(name: str, own_constraint: parser::ConstraintExpr, ns: str, table: TypeTable) -> TypeReg {
+    let ifaces: []str = type_param_extends(own_constraint, table)
+    let body: parser::TypeBody = if ifaces.len > 0 { parser::InterfaceBody { extends = ifaces; methods = teko::list::empty() } } else { parser::ExternBody { } }
+    let carried_constraints = teko::list::push(teko::list::empty(), own_constraint)
+    let d = parser::TypeDecl { name = name; type_params = teko::list::empty(); type_constraints = carried_constraints; body = body; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }
+    TypeReg { name = name; namespace = ns; vis = parser::Visibility::Private; decl = d }
+}
+
+/** (S4) Extend the type table with generic type-params as OPAQUE nominal types, so a generic
+    signature/body resolves with `T` abstract. An unconstrained `T` has no members/operators, so
+    OPERATING on it (`x.foo`, `a > b`) fails at the definition (M.1 fail-loud, no reflection) — only
+    opaque usage (store/pass/return/hold/match-bind) is allowed (constraints unlock ops at S6). The
+    monomorph pass substitutes each `Named{T}` with the concrete arg before codegen. PREPENDED so a
+    type-param SHADOWS a same-named user type within the generic. Empty type_params → table unchanged.
+    Used by collect (func sigs), check_modules (vis check), and typer (bodies). (C: tk_type_param_table.)
+    (W10b.D2, issue #99; generalized S6/issue #162) `type_constraints` runs PARALLEL to
+    `type_params` (same length; NoConstraint where the caller has none) — see type_param_reg for how
+    index i's constraint becomes its synthetic TypeReg (a single-interface atom `<T: I>` is the N=1
+    degenerate case, unchanged since #99). */
 pub fn type_param_table(type_params: []str, type_constraints: []parser::ConstraintExpr, ns: str, table: TypeTable) -> TypeTable {
     if type_params.len == 0 { return table }
     mut tbl: TypeTable = teko::list::empty()
     mut i = 0
     loop {
         if i >= type_params.len { break }
-        // namespace = the USING namespace so the W-vis-enforce cross-namespace/visibility check (check_modules)
-        // treats the type-param as a LOCAL type, not a bare cross-namespace reference.
-        // (S6) the extends list mirrors the constraint's own contract surface — see type_param_extends.
-        // The two arms are DIFFERENT members of the wider `TypeBody` variant; the arm-join infers the
-        // narrow `InterfaceBody | ExternBody` union while the binding is the wider `TypeBody` — native
-        // codegen widens each arm into `TypeBody` (fix/selfhost-arm-join-widen), so this natural form
-        // (was a per-arm whole-TypeReg workaround under #99) compiles on the self-host BUILD too.
-        let ifaces: []str = if i < type_constraints.len { type_param_extends(type_constraints[i], table) } else { teko::list::empty() }
-        let body: parser::TypeBody = if ifaces.len > 0 { parser::InterfaceBody { extends = ifaces; methods = teko::list::empty() } } else { parser::ExternBody { } }
-        let d = parser::TypeDecl { name = type_params[i]; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = body; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }
-        tbl = teko::list::push(tbl, TypeReg { name = type_params[i]; namespace = ns; vis = parser::Visibility::Private; decl = d })
+        let own_constraint = constraint_at(type_constraints, i to u64)
+        tbl = teko::list::push(tbl, type_param_reg(type_params[i], own_constraint, ns, table))
         i++
     }
     mut j = 0

@@ -3374,3 +3374,125 @@ fn generic_trait_is_rejected() {
     let td = parser::TypeDecl { name = "GT"; type_params = teko::list::push(teko::list::empty(), "X"); type_constraints = teko::list::push(teko::list::empty(), parser::NoConstraint { }); body = parser::TraitBody { fields = teko::list::empty(); methods = teko::list::empty() }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }
     teko::assert::is_true(!tr_program_ok(teko::list::push(teko::list::empty(), parser::Item { content = td; namespace = ""; file = "" })))
 }
+
+/** (S6, issue #162) constraint-surface FIXTURES (crumb 7): a synthetic 2-interface TypeTable
+    (`Geo.area` / `Named2.label`) for constraint_interfaces unit checks below, independent of a
+    full program (crumb-1/2's own isolation).
+    These fixtures are AST-BUILT (via type_program), not real `A & B` SYNTAX in a `.tks` fixture:
+    the CI/release gate's front-end is the PREVIOUSLY RELEASED `teko` seed (governance #235,
+    mirroring retired), whose checker predates this PR's fix — a real `<T: A & B>` fixture
+    parsed+typed by THAT seed would fail with the OLD "method typing is deferred" message and turn
+    the gate red, even though gen-1 (built FROM this fix) type-checks and RUNS the identical program
+    correctly (verified manually: seed compiles this source into gen-1, gen-1 in turn compiles+runs
+    a `both<T: Geo & Named2>` program end to end, exit 0). These AST-level tests exercise the SAME
+    checker functions the real syntax would reach (constraint_interfaces/type_method_call), so they
+    are equivalent coverage today; the real-syntax end-to-end `generics_test.tkt` fixture can be
+    added once a release carries this fix. */
+fn s6_iface_decl(name: str, methods: []parser::Function) -> parser::TypeDecl {
+    parser::TypeDecl { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::InterfaceBody { extends = teko::list::empty(); methods = methods }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }
+}
+fn s6_geo_named2_table() -> TypeTable {
+    let d_geo = s6_iface_decl("Geo", list1(iface_method("area")))
+    let d_named2 = s6_iface_decl("Named2", list1(iface_method("label")))
+    teko::list::push(teko::list::push(empty_table(), TypeReg { name = "Geo"; namespace = ""; vis = parser::Visibility::Private; decl = d_geo }), TypeReg { name = "Named2"; namespace = ""; vis = parser::Visibility::Private; decl = d_named2 })
+}
+
+#test
+/** `Geo & Named2`'s constraint_interfaces is the AND-union of both atoms — both interfaces,
+    unambiguous (disjoint method names). */
+fn s6_and_constraint_interfaces_is_the_union() {
+    let c: parser::ConstraintExpr = parser::ConstraintAnd { left = parser::ConstraintAtom { name = "Geo" }; right = parser::ConstraintAtom { name = "Named2" } }
+    match constraint_interfaces(c, s6_geo_named2_table()) {
+        []str as ifaces => teko::assert::is_true(ifaces.len == 2)
+        error as e       => { teko::io::println(e.message); teko::assert::is_true(false) }
+    }
+}
+
+/** A full program `fn both<T: Geo & Named2>(x: T) -> i64 { return x.area() }` type-checks: the
+    UNION surface authorizes `area` (owned by Geo), and `Sq2` conforms to both interfaces. */
+fn s6_and_program(body_method: str) -> parser::Program {
+    let ifc_geo = iface_item("Geo", list1(iface_method("area")), teko::list::empty())
+    let ifc_named2 = iface_item("Named2", list1(iface_method("label")), teko::list::empty())
+    let sq2 = impl_class_item("Sq2", teko::list::push(list1(impl_method("area", parser::Visibility::Pub)), impl_method("label", parser::Visibility::Pub)), teko::list::push(teko::list::push(teko::list::empty(), "Geo"), "Named2"))
+    let tp = teko::list::push(teko::list::empty(), "T")
+    let tc: []parser::ConstraintExpr = teko::list::push(teko::list::empty(), parser::ConstraintAnd { left = parser::ConstraintAtom { name = "Geo" }; right = parser::ConstraintAtom { name = "Named2" } })
+    let params = teko::list::push(teko::list::empty(), parser::Param { name = "x"; has_type = true; type_ann = named_t("T"); is_params = false; has_default = false; default_expr = e_num(0) })
+    let body: []parser::Statement = teko::list::push(teko::list::empty(), parser::Return { has_value = true; value = ek(parser::MethodCall { receiver = e_var("x"); method = body_method; args = teko::list::empty() }) })
+    let f = parser::Function { name = "both"; type_params = tp; type_constraints = tc; params = params; has_return = true; return_type = named_t("i64"); body = body; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false }
+    let fitem = parser::Item { content = f; namespace = ""; file = "" }
+    mut items = teko::list::push(teko::list::push(teko::list::empty(), ifc_geo), ifc_named2)
+    items = teko::list::push(items, sq2)
+    items = teko::list::push(items, fitem)
+    parser::Program { items = items }
+}
+
+#test
+/** crumb-7 fixture 1: `A&B`, a method of EACH side (`x.area()`) — accepted. */
+fn s6_and_constraint_authorizes_either_sides_method() {
+    teko::assert::is_true(tr_program_ok(s6_and_program("area").items))
+}
+
+#test
+/** crumb-7 fixture 3: a member outside a SINGLE-interface constraint's surface (`label` is not on
+    `Geo`) is rejected AT THE DEFINITION, independent of any instantiation. */
+fn s6_single_constraint_rejects_member_outside_surface() {
+    let ifc_geo = iface_item("Geo", list1(iface_method("area")), teko::list::empty())
+    let tp = teko::list::push(teko::list::empty(), "T")
+    let tc: []parser::ConstraintExpr = teko::list::push(teko::list::empty(), parser::ConstraintAtom { name = "Geo" })
+    let params = teko::list::push(teko::list::empty(), parser::Param { name = "x"; has_type = true; type_ann = named_t("T"); is_params = false; has_default = false; default_expr = e_num(0) })
+    let body: []parser::Statement = teko::list::push(teko::list::empty(), parser::Return { has_value = true; value = ek(parser::MethodCall { receiver = e_var("x"); method = "label"; args = teko::list::empty() }) })
+    let f = parser::Function { name = "bad"; type_params = tp; type_constraints = tc; params = params; has_return = true; return_type = named_t("i64"); body = body; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false }
+    let items = teko::list::push(teko::list::push(teko::list::empty(), ifc_geo), parser::Item { content = f; namespace = ""; file = "" })
+    teko::assert::is_true(!tr_program_ok(items))
+}
+
+#test
+/** crumb-7 fixture 4: nominal mono-rejection is UNTOUCHED — a concrete arg conforming to only ONE
+    side of `Geo & Named2` (missing `label`/`Named2`) still fails at `check_constraints`, the
+    existing per-instance safety net (S6 adds no new instance-time check). */
+fn s6_and_constraint_mono_rejects_non_conforming_concrete() {
+    let ifc_geo = iface_item("Geo", list1(iface_method("area")), teko::list::empty())
+    let ifc_named2 = iface_item("Named2", list1(iface_method("label")), teko::list::empty())
+    let sq_geo_only = impl_class_item("SqGeoOnly", list1(impl_method("area", parser::Visibility::Pub)), slist1("Geo"))
+    let tp = teko::list::push(teko::list::empty(), "T")
+    let tc: []parser::ConstraintExpr = teko::list::push(teko::list::empty(), parser::ConstraintAnd { left = parser::ConstraintAtom { name = "Geo" }; right = parser::ConstraintAtom { name = "Named2" } })
+    let params = teko::list::push(teko::list::empty(), parser::Param { name = "x"; has_type = true; type_ann = named_t("T"); is_params = false; has_default = false; default_expr = e_num(0) })
+    let body: []parser::Statement = teko::list::push(teko::list::empty(), parser::Return { has_value = true; value = ek(parser::MethodCall { receiver = e_var("x"); method = "area"; args = teko::list::empty() }) })
+    let f = parser::Function { name = "both2"; type_params = tp; type_constraints = tc; params = params; has_return = true; return_type = named_t("i64"); body = body; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false }
+    let make_lit = ek(parser::StructLit { type_path = path1("SqGeoOnly"); type_args = teko::list::empty(); field_names = teko::list::empty(); field_vals = teko::list::empty() })
+    let call = st(ek(parser::Call { callee = path1("both2"); args = teko::list::push(teko::list::empty(), make_lit); arg_names = pos_names(1) }))
+    mut items = teko::list::push(teko::list::push(teko::list::empty(), ifc_geo), ifc_named2)
+    items = teko::list::push(items, sq_geo_only)
+    items = teko::list::push(items, parser::Item { content = f; namespace = ""; file = "" })
+    items = teko::list::push(items, parser::Item { content = call; namespace = ""; file = "" })
+    teko::assert::is_true(!tr_program_ok(items))
+}
+
+/** crumb-7 fixture 2: `A|B` INTERSECTS by signature — `Geo | Named2Alt` (a 2nd interface ALSO
+    declaring `area(self)->i64`, matching Geo's signature exactly) authorizes `area` (common to
+    both branches) but NOT `label` (only on one branch). */
+fn s6_or_program(body_method: str) -> parser::Program {
+    let ifc_geo = iface_item("Geo", list1(iface_method("area")), teko::list::empty())
+    let ifc_alt = iface_item("GeoAlt", list1(iface_method("area")), teko::list::empty())
+    let sq2 = impl_class_item("SqAlt", list1(impl_method("area", parser::Visibility::Pub)), slist1("Geo"))
+    let tp = teko::list::push(teko::list::empty(), "T")
+    let tc: []parser::ConstraintExpr = teko::list::push(teko::list::empty(), parser::ConstraintOr { left = parser::ConstraintAtom { name = "Geo" }; right = parser::ConstraintAtom { name = "GeoAlt" } })
+    let params = teko::list::push(teko::list::empty(), parser::Param { name = "x"; has_type = true; type_ann = named_t("T"); is_params = false; has_default = false; default_expr = e_num(0) })
+    let body: []parser::Statement = teko::list::push(teko::list::empty(), parser::Return { has_value = true; value = ek(parser::MethodCall { receiver = e_var("x"); method = body_method; args = teko::list::empty() }) })
+    let f = parser::Function { name = "only_common"; type_params = tp; type_constraints = tc; params = params; has_return = true; return_type = named_t("i64"); body = body; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false }
+    let fitem = parser::Item { content = f; namespace = ""; file = "" }
+    mut items = teko::list::push(teko::list::push(teko::list::empty(), ifc_geo), ifc_alt)
+    items = teko::list::push(items, sq2)
+    items = teko::list::push(items, fitem)
+    parser::Program { items = items }
+}
+
+#test
+fn s6_or_constraint_authorizes_the_common_method() {
+    teko::assert::is_true(tr_program_ok(s6_or_program("area").items))
+}
+
+#test
+fn s6_or_constraint_rejects_a_method_outside_the_intersection() {
+    teko::assert::is_true(!tr_program_ok(s6_or_program("label").items))
+}
