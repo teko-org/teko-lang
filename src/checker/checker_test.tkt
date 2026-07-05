@@ -3374,3 +3374,101 @@ fn generic_trait_is_rejected() {
     let td = parser::TypeDecl { name = "GT"; type_params = teko::list::push(teko::list::empty(), "X"); type_constraints = teko::list::push(teko::list::empty(), parser::NoConstraint { }); body = parser::TraitBody { fields = teko::list::empty(); methods = teko::list::empty() }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; di_kind = parser::DiKind::None; has_di_key = false; di_key = "" }
     teko::assert::is_true(!tr_program_ok(teko::list::push(teko::list::empty(), parser::Item { content = td; namespace = ""; file = "" })))
 }
+
+/**
+ * (TR2, 2026-07-04) the compile-time FIELD VIEW — `deriver_field_view`. The compiler-internal,
+ * deriver-agnostic enumeration of a struct/class's fields with each annotation resolved to a real
+ * `Type` (name + type, no runtime value). See TEKO_ROADMAP_TRAITS.md TR2. TR3 (a later unit)
+ * synthesizes structural-trait bodies (Eq/Ord/Hash/Clone/Default) from it.
+ */
+fn fv_field(name: str, type_ann: parser::TypeExpr) -> parser::Field { parser::Field { name = name; type_ann = type_ann; vis = parser::Visibility::Pub; is_intern = false } }
+fn fv_struct_item(name: str, fields: []parser::Field) -> parser::Item {
+    parser::Item { content = parser::TypeDecl { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::StructBody { fields = fields; methods = teko::list::empty(); implements = teko::list::empty() }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }; namespace = ""; file = "" }
+}
+fn fv_struct_item_derives(name: str, fields: []parser::Field, derives: []str) -> parser::Item {
+    parser::Item { content = parser::TypeDecl { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::StructBody { fields = fields; methods = teko::list::empty(); implements = derives }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }; namespace = ""; file = "" }
+}
+fn fv_class_item(name: str, kind: parser::ClassKind, has_base: bool, base_name: str, fields: []parser::Field) -> parser::Item {
+    parser::Item { content = parser::TypeDecl { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::ClassBody { kind = kind; has_base = has_base; base_name = base_name; has_base_binding = false; base_binding_name = ""; implements = teko::list::empty(); fields = fields; methods = teko::list::empty() }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }; namespace = ""; file = "" }
+}
+fn fv_table(items: []parser::Item) -> TypeTable {
+    match collect(parser::Program { items = items }) { Collected as c => c.types; error => panic("fv_table: collect failed") }
+}
+
+#test
+/**
+ * A plain struct's field view: names + RESOLVED types, in declaration order.
+ */
+fn field_view_struct_own_fields_with_types() {
+    let fields = teko::list::push(teko::list::push(teko::list::empty(), fv_field("x", named_t("i64"))), fv_field("active", named_t("bool")))
+    let table = fv_table(teko::list::push(teko::list::empty(), fv_struct_item("Point", fields)))
+    let view = match deriver_field_view("Point", table) { []FieldView as v => v; error => { teko::assert::is_true(false); return } }
+    teko::assert::is_true(view.len == 2)
+    teko::assert::is_true(view[0].name == "x")
+    teko::assert::is_true(type_eq(view[0].type, i64t()))
+    teko::assert::is_true(view[1].name == "active")
+    teko::assert::is_true(type_eq(view[1].type, boolt()))
+}
+
+#test
+/**
+ * `fold_traits` runs before the field view is ever consulted — a struct deriving a trait already
+ * carries the trait's field in its OWN `fields` by the time `collect()` sees it.
+ */
+fn field_view_struct_includes_trait_folded_fields() {
+    let tr = trait_item("Stamp", tr_fields1("at"), teko::list::empty())
+    let dv = fv_struct_item_derives("Post", teko::list::push(teko::list::empty(), fv_field("title", named_t("str"))), slist1("Stamp"))
+    let folded = match fold_traits(parser::Program { items = items2(tr, dv) }) { parser::Program as p => p; error => { teko::assert::is_true(false); return } }
+    let table = fv_table(folded.items)
+    let view = match deriver_field_view("Post", table) { []FieldView as v => v; error => { teko::assert::is_true(false); return } }
+    teko::assert::is_true(view.len == 2)
+    teko::assert::is_true(view[0].name == "title")
+    teko::assert::is_true(view[1].name == "at")
+    teko::assert::is_true(type_eq(view[1].type, i64t()))
+}
+
+#test
+/**
+ * A class's view walks the FULL base chain (`effective_class_fields`) — base fields first, then
+ * the derived class's own, exactly like construction/field-access already sees it.
+ */
+fn field_view_class_includes_base_chain_fields() {
+    let base = fv_class_item("Animal", parser::ClassKind::Virtual, false, "", teko::list::push(teko::list::empty(), fv_field("name", named_t("str"))))
+    let derived = fv_class_item("Dog", parser::ClassKind::Sealed, true, "Animal", teko::list::push(teko::list::empty(), fv_field("breed", named_t("str"))))
+    let table = fv_table(items2(base, derived))
+    let view = match deriver_field_view("Dog", table) { []FieldView as v => v; error => { teko::assert::is_true(false); return } }
+    teko::assert::is_true(view.len == 2)
+    teko::assert::is_true(view[0].name == "name")
+    teko::assert::is_true(view[1].name == "breed")
+}
+
+#test
+/**
+ * A field typed as another user struct resolves to `Named{that struct}`, not left as a bare
+ * source `TypeExpr` — this is exactly what a synthesized Eq/Hash needs to recurse per field.
+ */
+fn field_view_nested_named_field_resolves() {
+    let inner = fv_struct_item("Address", teko::list::push(teko::list::empty(), fv_field("city", named_t("str"))))
+    let outer = fv_struct_item("Person", teko::list::push(teko::list::empty(), fv_field("home", named_t("Address"))))
+    let table = fv_table(items2(inner, outer))
+    let view = match deriver_field_view("Person", table) { []FieldView as v => v; error => { teko::assert::is_true(false); return } }
+    teko::assert::is_true(view.len == 1)
+    teko::assert::is_true(view[0].name == "home")
+    match view[0].type { Named as n => teko::assert::is_true(n.name == "Address"); _ => teko::assert::is_true(false) }
+}
+
+#test
+fn field_view_unknown_deriver_is_error() {
+    let table = fv_table(teko::list::push(teko::list::empty(), fv_struct_item("Solo", teko::list::empty())))
+    match deriver_field_view("Ghost", table) { []FieldView => teko::assert::is_true(false); error => teko::assert::is_true(true) }
+}
+
+#test
+/**
+ * An enum has no field shape — the view must refuse it (TR3 can only synthesize field-wise
+ * bodies for a struct/class deriver).
+ */
+fn field_view_non_struct_or_class_is_error() {
+    let table = color_enum_table()
+    match deriver_field_view("Color", table) { []FieldView => teko::assert::is_true(false); error => teko::assert::is_true(true) }
+}
