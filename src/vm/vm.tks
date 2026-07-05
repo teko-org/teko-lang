@@ -1577,29 +1577,75 @@ type PatMatch = struct { matched: bool; env: Venv }
 // VARIANT (e.g. `Type`) and the value's case is one of its members (e.g. `Prim`): the VM has no
 // wrapper (the value IS the member struct), so resolve the variant decl in the program and check
 // membership. (Mirrors vm.c case_in_variant; native codegen discriminates the tagged union.)
-// vm_match_as_enum_int — does `name` match an integer `ordinal` when the subject is an enum value?
-// Case A: `name` is an ENUM TYPE NAME (e.g., `PrimKind as k`) — any integer is a valid enum value
-//   of that type (the checker guarantees the subject came from a union like `PrimKind | error`).
-// Case B: `name` is an ENUM MEMBER NAME (e.g., `U8 =>`, `I64 =>`) — matches only at the right ordinal.
-// Mirrors vm.c match_as_enum_int.
-fn vm_match_as_enum_int(prog: checker::TProgram, name: str, ordinal: i128) -> bool {
+
+/** enum_candidate_names — the CANONICAL enum/flags type name(s) a match SUBJECT's static type may
+ * carry: a bare `Named` yields itself; a `Variant` (a fallible/union subject, e.g. `PrimKind |
+ * error`) yields every `Named` member (non-Named members carry no enum identity, so they are
+ * skipped). Anything else yields no candidate — the caller then has nothing to narrow against. */
+fn enum_candidate_names(t: checker::Type) -> []str {
+    match t {
+        checker::Named as n   => teko::list::push(teko::list::empty(), n.name)
+        checker::Variant as v => {
+            mut names: []str = teko::list::empty()
+            mut i = 0
+            loop {
+                if i >= v.members.len { break }
+                match v.members[i] { checker::Named as n => { names = teko::list::push(names, n.name) }; _ => {} }
+                i++
+            }
+            names
+        }
+        _ => teko::list::empty()
+    }
+}
+
+/** Is `td_name` (a TypeDecl's canonical name) one of the subject's enum candidates? An EMPTY
+ * candidate list means the caller had no static-type information (an internal/opaque subject) —
+ * falls back to "no restriction" so pre-existing call sites that cannot supply a type keep working. */
+fn enum_candidate_matches(candidates: []str, td_name: str) -> bool {
+    if candidates.len == 0 { return true }
+    let key = checker::name_last_segment(td_name)
+    mut i = 0
+    loop {
+        if i >= candidates.len { break }
+        if checker::name_last_segment(candidates[i]) == key { return true }
+        i++
+    }
+    false
+}
+
+/** vm_match_as_enum_int — does `name` match an integer `ordinal` when the subject is an enum value?
+ * Case A: `name` is an ENUM TYPE NAME (e.g., `PrimKind as k`) — any integer is a valid enum value
+ * of that type (the checker guarantees the subject came from a union like `PrimKind | error`).
+ * Case B: `name` is an ENUM MEMBER NAME (e.g., `U8 =>`, `I64 =>`) — matches only at the right ordinal.
+ * (#263) `subj_candidates` — the enum/flags type name(s) the match SUBJECT's own static type admits
+ * (from `enum_candidate_names`); a TypeDecl outside this set is SKIPPED even when it happens to
+ * declare a member with the same bare NAME at the same ordinal — the pre-fix scan walked EVERY enum
+ * in the whole program, so a user enum member sharing both a name (`F32`) and an ordinal with an
+ * unrelated enum (`teko::checker::PrimKind`) silently hijacked the match. Mirrors vm.c
+ * match_as_enum_int, narrowed by the subject's resolved type (native codegen never had this gap —
+ * it discriminates via the real C enum tag, never a bare-name program scan). `key` is the
+ * bare-vs-bare comparison key (#109 W3): `td.name` is canonical, member names stay bare. */
+fn vm_match_as_enum_int(prog: checker::TProgram, name: str, ordinal: i128, subj_candidates: []str) -> bool {
     mut i = 0
     loop {
         if i >= prog.items.len { break }
         match prog.items[i] {
             parser::TypeDecl as td => {
-                match td.body {
-                    parser::EnumBody as eb => {
-                        let key = checker::name_last_segment(name)   // (#109 W3) bare-vs-bare (td.name canonical; member names bare)
-                        if checker::name_last_segment(td.name) == key { return true }
-                        mut j = 0
-                        loop {
-                            if j >= eb.members.len { break }
-                            if eb.members[j] == key && (j to i128) == ordinal { return true }
-                            j++
+                if enum_candidate_matches(subj_candidates, td.name) {
+                    match td.body {
+                        parser::EnumBody as eb => {
+                            let key = checker::name_last_segment(name)
+                            if checker::name_last_segment(td.name) == key { return true }
+                            mut j = 0
+                            loop {
+                                if j >= eb.members.len { break }
+                                if eb.members[j] == key && (j to i128) == ordinal { return true }
+                                j++
+                            }
                         }
+                        _ => {}
                     }
-                    _ => {}
                 }
             }
             _ => {}
@@ -1694,19 +1740,29 @@ fn vm_case_in_variant(prog: checker::TProgram, vname: str, cname: str) -> bool {
     false
 }
 
-fn pat_match(pat: parser::Pattern, subj: Value, env: Venv) -> PatMatch {
-    // OPTIONAL subject (REBOOT_PLAN §202): `null` matches NONE; any other pattern matches the
-    // PRESENT case. A bare bind/wildcard over a present NON-struct inner binds the inner directly;
-    // a struct/variant inner recurses (the variant tag check / field destructure still applies).
+/** pat_match — does `subj` match `pat`? On match, returns the env extended with the pattern's
+ * bindings (`matched = true`); on no match, `matched = false` and the env is irrelevant (the caller
+ * discards it). The FUNCTIONAL stand-in for the C `pat_match(pat, subj, env)` that mutates `env` in
+ * place and is unwound by `env_pop_to`. `subj_type` (#263) is the match SUBJECT's own resolved
+ * static type (`TMatchExpr.subject.type`), threaded down so the enum-member arm below can narrow
+ * `vm_match_as_enum_int`'s program-wide scan to the enum(s) the subject can ACTUALLY be, instead of
+ * every enum declared anywhere in the corpus (the bare-name collision this fixes — see
+ * `vm_match_as_enum_int`'s own doc-comment).
+ *
+ * An OPTIONAL subject (REBOOT_PLAN §202): `null` matches NONE; any other pattern matches the
+ * PRESENT case. A bare bind/wildcard over a present NON-struct inner binds the inner directly;
+ * a struct/variant inner recurses (the variant tag check / field destructure still applies). */
+fn pat_match(pat: parser::Pattern, subj: Value, env: Venv, subj_type: checker::Type) -> PatMatch {
     match subj {
         OptVal as o => {
+            let inner_type = match subj_type { checker::Optional as opt => opt.inner; _ => subj_type }
             match pat {
                 parser::NullPattern => return PatMatch { matched = !o.present; env = env }
                 _ => {
                     if !o.present { return PatMatch { matched = false; env = env } }
                     let inner = match o.inner { Value as iv => iv; null => return PatMatch { matched = false; env = env } }
                     match inner {
-                        StructVal => return pat_match(pat, inner, env)   // variant/struct inner — recurse
+                        StructVal => return pat_match(pat, inner, env, inner_type)
                         _ => {
                             match pat {
                                 parser::WildcardPattern   => return PatMatch { matched = true; env = env }
@@ -1714,7 +1770,7 @@ fn pat_match(pat: parser::Pattern, subj: Value, env: Venv) -> PatMatch {
                                     if bp.has_binding { return PatMatch { matched = true; env = define(env, bp.binding, inner) } }
                                     return PatMatch { matched = true; env = env }
                                 }
-                                _ => return pat_match(pat, inner, env)
+                                _ => return pat_match(pat, inner, env, inner_type)
                             }
                         }
                     }
@@ -1724,22 +1780,20 @@ fn pat_match(pat: parser::Pattern, subj: Value, env: Venv) -> PatMatch {
         _ => {}
     }
     match pat {
-        parser::NullPattern      => PatMatch { matched = false; env = env }   // `null` over a non-optional never matches
+        parser::NullPattern      => PatMatch { matched = false; env = env }
         parser::WildcardPattern  => PatMatch { matched = true; env = env }
         parser::LiteralPattern as lp => PatMatch { matched = value_eq(subj, lit_as(lp.value, subj)); env = env }
         parser::RangePattern as rp => {
             if !val_is_int(subj) { return PatMatch { matched = false; env = env } }
             let lo = lit_as(rp.lo, subj); let hi = lit_as(rp.hi, subj)
-            // signed/unsigned compare — the .tks single signed accessor carries both (see header note).
             let v = as_int(subj)
             PatMatch { matched = as_int(lo) <= v && v <= as_int(hi); env = env }
         }
         parser::AltPattern as ap => {
-            // any option matches; options bind NOTHING (the checker forbids binding in an Alt).
             mut i = 0
             loop {
                 if i >= ap.options.len { break }
-                if pat_match(ap.options[i], subj, env).matched { return PatMatch { matched = true; env = env } }
+                if pat_match(ap.options[i], subj, env, subj_type).matched { return PatMatch { matched = true; env = env } }
                 i++
             }
             PatMatch { matched = false; env = env }
@@ -1777,7 +1831,7 @@ fn pat_match(pat: parser::Pattern, subj: Value, env: Venv) -> PatMatch {
                                 _ => {}
                             }
                         }
-                        _ => { if val_is_int(subj) { if vm_match_as_enum_int(env.prog, bname, as_int(subj)) { hit = true } } }
+                        _ => { if val_is_int(subj) { if vm_match_as_enum_int(env.prog, bname, as_int(subj), enum_candidate_names(subj_type)) { hit = true } } }
                     }
                 }
                 if hit {
@@ -1874,7 +1928,7 @@ fn eval_match(m: checker::TMatchExpr, t: checker::Type, line: u32, col: u32, env
     loop {
         if i >= m.arms.len { break }
         let arm = m.arms[i]
-        let pm = pat_match(arm.pattern, subj, senv)   // pattern bindings ride senv
+        let pm = pat_match(arm.pattern, subj, senv, m.subject.type)
         if pm.matched {
             // A `when` guard may itself evaluate a ref call; thread its env into the body's env.
             let ge = if arm.has_when { eval_expr(arm.guard, pm.env) } else { EvalRes { value= true; env= pm.env } }
@@ -1914,7 +1968,7 @@ fn exec_match(e: checker::TExpr, env: Venv) -> FlowEnv {
             loop {
                 if i >= m.arms.len { break }
                 let arm = m.arms[i]
-                let pm = pat_match(arm.pattern, subj, senv)
+                let pm = pat_match(arm.pattern, subj, senv, m.subject.type)
                 if pm.matched {
                     let ge = if arm.has_when { eval_expr(arm.guard, pm.env) } else { EvalRes { value= true; env= pm.env } }
                     let guard_ok = as_bool(ge.value)

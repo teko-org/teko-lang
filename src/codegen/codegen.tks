@@ -1290,6 +1290,15 @@ fn cg_prim_is_float(k: checker::PrimKind) -> bool { checker::prim_is_float(k) }
 // cg_prim_is_int — the integer prims (U8..U128, I8..I128). NOT bool, NOT float.
 fn cg_prim_is_int(k: checker::PrimKind) -> bool { checker::prim_is_int(k) }
 
+/** cg_is_arith_builtin_call — is a `div`/`rem`-named call the BARE reserved arithmetic FFI (`teko::div`
+    /`teko::rem`, the VM's checked ÷/% lowering) rather than a namespaced USER fn of the same name? The
+    reserved builtins carry NO user namespace (empty call_ns); a `teko::runtime::div` (i64→i64) carries
+    its own namespace and must keep its own C symbol. The native gate compiles such a user call for the
+    first time (#265), so this guard stops it from being hijacked into the `tk_div`/`tk_rem` builtin. */
+fn cg_is_arith_builtin_call(last: str, call_ns: str) -> bool {
+    (last == "div" || last == "rem") && call_ns.len == 0
+}
+
 // cg_prim_is_signed_int — the SIGNED integer prims (I8..I128). (type.tks: prim_is_signed.)
 fn cg_prim_is_signed_int(k: checker::PrimKind) -> bool { checker::prim_is_signed(k) }
 
@@ -1492,13 +1501,41 @@ fn emit_binary(buf: []byte, prog: checker::TProgram, e: checker::TExpr, b: check
     cb(out, ")")
 }
 
-// emit_unary — a TUnary -> `(op X)`. (C: TK_TEXPR_UNARY branch.)
+/** emit_unary — a TUnary -> `(op X)`. Bitwise NOT (`~`) on an integer prim TRUNCATES back to the
+    operand's C type (`(uint8_t)(~x)`): C promotes a sub-int operand to `int` before `~`, so `~(u8)0`
+    is `-1` (all 32 bits), not the width-masked `255` the VM computes — the cast re-narrows to the
+    declared width so both engines agree (#265: exposed the first time the u8 `~` test ran natively).
+    Other unaries (`-`, `!`) need no mask — their result already fits the operand width. */
 fn emit_unary(buf: []byte, prog: checker::TProgram, u: checker::TUnary, escaping: []str, regions: []RegionFrame, fn_body: []checker::TStatement, dctx: DeferCtx) -> []byte | error {
     let op = match unop_c(u.op) { str as s => s; error as err => return err }
+    let mask_type = cg_bnot_mask_type(u)
     mut out = cb(buf, "(")
+    match mask_type {
+        checker::Prim as p => { out = cb(out, "("); out = match emit_type(out, prog, checker::Prim { kind = p.kind }) { []byte as o => o; error as err => return err }; out = cb(out, ")(") }
+        _ => { }
+    }
     out = cb(out, op)
     out = match emit_expr_ctx(out, prog, checker::Void { }, u.operand, escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
+    match mask_type { checker::Prim => { out = cb(out, ")") }; _ => { } }
     cb(out, ")")
+}
+
+/** cg_bnot_mask_type — the integer-prim type whose width a `~x` result must be truncated to, else
+    `Void` (no mask). ONLY the sub-`int` widths (u8/u16/i8/i16) need it: C integer-promotes them to
+    `int` before `~`, so the result carries bits above the declared width (`~(u8)0 == -1`). i32/u32
+    and wider are already computed at their own width by C, so `~` needs no re-narrowing there. */
+fn cg_bnot_mask_type(u: checker::TUnary) -> checker::Type {
+    if u.op != lexer::TokenKind::Tilde { return checker::Void { } }
+    match u.operand.type {
+        checker::Prim as p => if cg_prim_is_subint(p.kind) { checker::Prim { kind = p.kind } } else { checker::Void { } }
+        _ => checker::Void { }
+    }
+}
+
+/** cg_prim_is_subint — a signed/unsigned integer prim NARROWER than C `int` (u8/u16/i8/i16), the
+    widths C integer-promotes before a bitwise op, so a `~` result needs an explicit re-narrow. */
+fn cg_prim_is_subint(k: checker::PrimKind) -> bool {
+    k == checker::PrimKind::U8 || k == checker::PrimKind::U16 || k == checker::PrimKind::I8 || k == checker::PrimKind::I16
 }
 
 // emit_compare — a TCompare -> chained `a<b<c` => `((a<b) && (b<c))` over ADJACENT
@@ -1975,11 +2012,8 @@ fn emit_call(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, e: c
             else if last == "parse"    { builtin = "tk_float_parse"; has_builtin = true }   // teko::float::parse(str) -> f64
             // arithmetic FFI over the i128 carrier (sign-aware) + float bit-patterns. (`div`/`rem`
             // mangle to tk_* so they never clash with libc's div/rem.)
-            // Guard with call_ns.len==0 so a USER fn named `div`/`rem` in a namespace (e.g.
-            // teko::runtime::div, i64→i64) resolves to its own C symbol, not the arithmetic builtin
-            // (which is the bare `teko::div(a,b,sgn)` the VM's checked ÷/% lower to). (#265)
-            else if last == "div" && c.call_ns.len == 0 { builtin = "tk_div";          has_builtin = true }   // (i128,i128,bool) -> i128
-            else if last == "rem" && c.call_ns.len == 0 { builtin = "tk_rem";          has_builtin = true }   // (i128,i128,bool) -> i128
+            else if cg_is_arith_builtin_call(last, c.call_ns) && last == "div" { builtin = "tk_div"; has_builtin = true }
+            else if cg_is_arith_builtin_call(last, c.call_ns) && last == "rem" { builtin = "tk_rem"; has_builtin = true }
             else if last == "fdiv"         { builtin = "tk_fdiv";         has_builtin = true }   // (f64,f64) -> f64
             else if last == "int_to_float" { builtin = "tk_int_to_float"; has_builtin = true }   // (i128,bool) -> f64
             else if last == "f64_bits"     { builtin = "tk_f64_bits";     has_builtin = true }   // (f64) -> u64
@@ -2139,10 +2173,6 @@ fn emit_call(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, e: c
                             out = match emit_as_r(out, prog, ret_type, checker::Optional { inner = inner_t }, c.args[j], escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
                             wrapped = true
                         }
-                        // A `[]T?` (or covariant `[]U`) slice PARAM: route a bare `[]T` / `[]U` arg through
-                        // emit_as so it gets the element-wise present-wrap / variant rebuild (the same
-                        // coercion a binding/field slot already gets). Without this the bare slice passes
-                        // straight through and cc rejects the distinct `tk_slice_*` C struct. (#265)
                         parser::SliceType as slt => {
                             let exp_slice = cg_slice_param_type(prog, slt, c.args[j].type)
                             out = match emit_as_r(out, prog, ret_type, exp_slice, c.args[j], escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
@@ -2916,6 +2946,7 @@ fn emit_struct_init_literal(buf: []byte, prog: checker::TProgram, e: checker::TE
                             let elem = ent.path.segments[ent.path.segments.len - 1].name
                             if !cg_is_prim_name(elem) { exp_t = checker::Slice { element = checker::Named { name = cg_canon_name(prog, elem) } } }
                         }
+                        parser::OptionalType => { exp_t = cg_slice_param_type(prog, st, fv.type) }
                         _ => { }
                     }
                     // a present value into a `T?` field (T named) → emit_as wraps T → T?
@@ -3618,22 +3649,21 @@ fn emit_as(buf: []byte, prog: checker::TProgram, expected: checker::Type, value:
     emit_as_r(buf, prog, checker::Void { }, expected, value, escaping, regions, fn_body, dctx)
 }
 
-/** cg_slice_param_type — the expected `checker::Slice` for a `[]…` PARAM whose annotation is `slt`,
-    used by emit_as to coerce a bare-slice ARG (#265). When the param element is `T?`, the expected
-    element is `Optional { inner = <arg element> }` so emit_as present-wraps each element; otherwise
-    the expected slice IS the arg's own type (a no-op pass-through — emit_as only rebuilds on an
-    element-mangle mismatch). `arg_type` is the argument's resolved slice type. */
+/** cg_slice_param_type — the expected `checker::Slice` for a `[]…` PARAM (or a `[]…` struct FIELD)
+    whose annotation is `slt`, used by emit_as to coerce a bare-slice ARG (#265). A `[]…` slot never
+    reaches emit_as via the Named/Optional param branches, so this is the seam that routes it there.
+    An `OptionalType` element → `Slice { Optional { inner = <arg element> } }` so emit_as present-wraps
+    each element (UNLESS the arg element is already optional — an exact `[]T?`→`[]T?` match the checker
+    adopted to the param, where re-wrapping would make a `[]T??`). A `NamedType` element → the canonical
+    `Slice { Named }` so a covariant `[]Case`→`[]Variant` arg (e.g. `[]Return`→`[]Statement`) rebuilds
+    element-wise. Any other element → the arg's own type (emit_as no-ops when the mangle matches). The
+    checker keeps such widening args NARROW (arg_keeps_narrow_type), so the element mismatch is visible
+    here. `arg_type` is the argument's resolved slice type. */
 fn cg_slice_param_type(prog: checker::TProgram, slt: parser::SliceType, arg_type: checker::Type) -> checker::Type {
     let arg_elem = match arg_type { checker::Slice as s => s.element; _ => checker::Void { } }
     let arg_elem_opt = match arg_elem { checker::Optional => true; _ => false }
     match slt.element {
-        // Only wrap when the ARG element is NOT already optional — the checker sometimes pre-widens the
-        // arg's type to the param type (`[]i64?`), in which case expected == actual and emit_as no-ops;
-        // wrapping again would produce a `[]i64??` double-optional. (#265)
         parser::OptionalType => if arg_elem_opt { arg_type } else { checker::Slice { element = checker::Optional { inner = arg_elem } } }
-        // A `[]Named` param (e.g. `[]Statement`) fed a covariant `[]Case` arg (e.g. `[]Return`):
-        // the expected element is that Named, so emit_as rebuilds element-wise with the case→variant
-        // wrap. A same-Named arg mangles identically → emit_as no-ops. (#265)
         parser::NamedType as nt => checker::Slice { element = checker::Named { name = cg_canon_name(prog, nt.path.segments[nt.path.segments.len - 1].name) } }
         _ => arg_type
     }
@@ -7178,7 +7208,7 @@ fn tk_emit_c_mode(prog0: checker::TProgram, mode: CgMode) -> str | error {
     loop {
         if i >= prog.items.len { break }
         match prog.items[i] {
-            checker::TFunction as f => { if !f.is_extern { b = match emit_function_mode(b, prog, f, mode) { []byte as o => o; error as err => return err } } }   // C7.1a: extern fns have no body (prototype only)
+            checker::TFunction as f => { if !f.is_extern { b = match emit_function_mode(b, prog, f, mode) { []byte as o => o; error as err => return err } } }
             parser::TypeDecl       => { }   // emitted in the type-decl passes above
             parser::UseDecl        => { }   // imports are a no-op at the C level (M0)
             checker::TStatement     => { }   // a loose Statement → virtual-main, second pass
@@ -7188,15 +7218,18 @@ fn tk_emit_c_mode(prog0: checker::TProgram, mode: CgMode) -> str | error {
     // (W10) CAPTURING lambdas: the lifted-function DEFINITIONS (env unpack + body).
     b = match cg_emit_lambda_decls(b, prog, cap_lams, false) { []byte as o => o; error as err => return err }
 
-    // The trailing main() is the ONLY mode-dependent emission. Program = the historical
-    // virtual-main (byte-identical); TestPlain/TestCov = the native test gate (#265).
-    b = match mode {
-        CgMode::Program => match emit_program_main(b, prog) { []byte as o => o; error as err => return err }
-        _ => match emit_test_main(b, prog, mode) { []byte as o => o; error as err => return err }
-    }
-
-    // Re-flow into readable, brace-indented C (the raw emission packs each `({…})` on one line).
+    b = match emit_mode_main(b, prog, mode) { []byte as o => o; error as err => return err }
     str(cg_format_c(str(b)))
+}
+
+/** emit_mode_main — the trailing `main()`, the ONLY mode-dependent emission (#265): `Program` emits
+    the historical virtual-main over the loose top-level statements (byte-identical — the fixpoint
+    compares THIS), `TestPlain`/`TestCov` emit the native test gate that calls each `#test`. */
+fn emit_mode_main(buf: []byte, prog: checker::TProgram, mode: CgMode) -> []byte | error {
+    match mode {
+        CgMode::Program => emit_program_main(buf, prog)
+        _ => emit_test_main(buf, prog, mode)
+    }
 }
 
 /** emit_program_main — the VIRTUAL-MAIN: the loose top-level statements, in order, become the body

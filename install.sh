@@ -185,13 +185,30 @@ mktmp() {
 }
 
 # ── resolve latest release tag via the GitHub API (best effort) ──────────────
+# Prefers the latest STABLE release; falls back to the newest prerelease when no stable
+# exists yet (pre-alpha: every release is `-alpha`), so `curl | sh` with no args works.
 latest_tag() {
+    # 1) latest STABLE: GitHub's /releases/latest excludes prereleases and drafts.
     api="https://api.github.com/repos/${REPO}/releases/latest"
     tmp="$WORKDIR/latest.json"
     if download_ok "$api" "$tmp"; then
         # Extract "tag_name": "..." without jq.
         tag="$(sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$tmp" | head -n1)"
         [ -n "$tag" ] && { printf '%s' "$tag"; return 0; }
+    fi
+    # 2) no stable yet — newest published release of ANY kind. The /releases list is
+    # newest-first and never returns drafts to unauthenticated callers, so the first
+    # tag_name is the newest prerelease. Honest notice on stderr (not stdout: stdout is
+    # the tag the caller captures).
+    api="https://api.github.com/repos/${REPO}/releases?per_page=30"
+    tmp="$WORKDIR/releases.json"
+    if download_ok "$api" "$tmp"; then
+        tag="$(sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$tmp" | head -n1)"
+        [ -n "$tag" ] && {
+            log "no stable release published yet — installing the latest prerelease: $tag"
+            printf '%s' "$tag"
+            return 0
+        }
     fi
     return 1
 }
