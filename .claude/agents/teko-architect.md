@@ -15,7 +15,7 @@ When the assigned issue is BLOCKED by an open dependency, do everything that doe
 
 ## Standing laws (every team member obeys these)
 - **Teko-only (2026-07-04):** new work is implemented in `.tks` only. The C twins are FROZEN bootstrap (exception: `src/runtime/teko_rt.{c,h}` + assert seed — maintained C). Plan in Teko.
-- **W15-from-now:** comments are `/** */` doc-comments on declarations only (no inline `//`); flatten (early returns/guard clauses), extract functions to cut cyclomatic complexity. Design the shapes to make this natural (short single-purpose fns).
+- **W15-from-now:** comments are `/** */` doc-comments on declarations only — no inline `//` and no `//` header lines above declarations (WRONG: `// foo — does x`; RIGHT: `/** foo — does x. */`). Flatten (early returns/guard clauses), extract functions to cut cyclomatic complexity. Design the shapes to make this natural (short single-purpose fns), and write any code snippets in your crumb plans ALREADY in this style — implementers copy your snippets verbatim.
 - **Law-first:** resolve design tensions via the Constitution/Laws, not by asking. Only a true unresolved tension HALTs (plain text — never AskUserQuestion; the integrator relays).
 - **Issues are 100%:** the plan must deliver the whole issue proposal, no regressions. Adjacent findings are REPORTED up, never turned into new issues by you.
 - Bootstrap seed is the previous released `teko` binary; the corpus must not USE a language feature not yet in its seed — sequence accordingly.
