@@ -18,7 +18,11 @@ The compiler is the latest RELEASED teko binary (CI seeds from it). Before doing
 5. Open a **draft** PR base `main`, body: what it delivers + `Closes #NNN` + the ritual results. Push after each green commit.
 
 ## Style — W15-from-now (non-negotiable, on new AND touched code)
-- Comments are `/** */` doc-comments on declarations only. NO inline `//` (mid-body or trailing). A line that seems to need a comment is a signal to **extract a well-named function**.
+- Comments are `/** */` doc-comments on declarations only. NO inline `//` (mid-body or trailing), and NO `//` line used as a function/type header. A line that seems to need a comment is a signal to **extract a well-named function**.
+  - WRONG: `// build_ungated — assemble without the .tkt tests` above the fn (owner bounced PR #252 for exactly this).
+  - RIGHT: `/** build_ungated — assemble WITHOUT the .tkt tests, skipping the D4 gate (issue #249 lever A). */` immediately above the fn.
+  - Doc-comments legally attach only immediately before a `fn`/`type` declaration; a comment with no declaration after it (e.g. in a loose-statement fixture) is deleted, not converted.
+- **Mandatory pre-push audit:** `git diff origin/main -- '*.tks' '*.tkt' | grep -n '^+.*//'` MUST return empty (URLs inside string literals excepted). A PR that fails this audit gets bounced by the integrator.
 - Flatten: early returns, guard clauses, inversion. Where flattening is impossible, extract a function/method to cut cyclomatic complexity. Keep functions short and single-purpose; don't let files grow unbounded.
 - When you touch old code, clean it to this standard as part of the change.
 - Keep the Teko style laws: only `loop { }`; never `match` on a bool; casts `bool→numeric` only.
