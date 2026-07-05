@@ -391,6 +391,58 @@ fn tkb_roundtrip_constraint() {
     }
 }
 
+// (#165 C3) a Named{T} typed leaf (a generic param used as an operand type).
+fn named_ty(name: str) -> checker::Type { checker::Named { name = name } }
+
+#test
+fn tkb_roundtrip_generic_fn() {
+    // (#165 C3) `fn id<T: Ord>(x: T) -> T { return x }` — a generic fn crossing the codec:
+    // type_params == ["T"] and type_constraints == [Ord] (PARALLEL) must survive a program frame.
+    let tref = checker::TExpr { kind = checker::TVar { name = "x"; is_func = false; func_ns = "" }; type = named_ty("T"); line = 0; col = 0 }
+    let prm = parser::Param { name = "x"; has_type = true; type_ann = nt("T"); is_params = false; has_default = false; default_expr = parser::no_expr() }
+    mut body: []checker::TStatement = teko::list::push(teko::list::empty(), checker::TReturn { has_value = true; value = tref })
+    let tparams = teko::list::push(teko::list::empty(), "T")
+    let tcons: []parser::ConstraintExpr = teko::list::push(teko::list::empty(), parser::ConstraintAtom { name = "Ord" })
+    let fn1 = checker::TFunction { name = "id"; type_params = tparams; type_constraints = tcons; params = teko::list::push(teko::list::empty(), prm); return_type = named_ty("T"); body = body; vis = parser::Visibility::Pub; has_doc = false; doc = ""; namespace = "m"; file = "m.tks"; line = 1; col = 1; is_test = false; is_extern = false; c_symbol = ""; from_lib = "" }
+    let prog = checker::TProgram { items = teko::list::push(teko::list::empty(), fn1) }
+    match deserialize_program(serialize_program(prog)) {
+        checker::TProgram as got => match got.items[0] {
+            checker::TFunction as f => {
+                teko::assert::is_true(f.type_params.len == 1)
+                teko::assert::is_true(f.type_params[0] == "T")
+                teko::assert::is_true(f.type_constraints.len == 1)
+                match f.type_constraints[0] { parser::ConstraintAtom as a => teko::assert::is_true(a.name == "Ord"); _ => teko::assert::is_true(false) }
+            }
+            _ => teko::assert::is_true(false)
+        }
+        error => teko::assert::is_true(false)
+    }
+}
+
+#test
+fn tkb_roundtrip_generic_type() {
+    // (#165 C3) `type Box<T> = struct { v: T }` — a generic TypeDecl: type_params ride, and an
+    // absent constraint is the NoConstraint sentinel (parallel to type_params, same length).
+    let fld = parser::Field { name = "v"; type_ann = nt("T"); vis = parser::Visibility::Pub; is_intern = false }
+    let tparams = teko::list::push(teko::list::empty(), "T")
+    let tcons: []parser::ConstraintExpr = teko::list::push(teko::list::empty(), parser::NoConstraint { })
+    let td = parser::TypeDecl { name = "Box"; type_params = tparams; type_constraints = tcons; body = parser::StructBody { fields = teko::list::push(teko::list::empty(), fld); methods = teko::list::empty(); implements = teko::list::empty() }; vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 1; col = 1 }
+    let prog = checker::TProgram { items = teko::list::push(teko::list::empty(), td) }
+    match deserialize_program(serialize_program(prog)) {
+        checker::TProgram as got => match got.items[0] {
+            parser::TypeDecl as d => {
+                teko::assert::is_true(d.name == "Box")
+                teko::assert::is_true(d.type_params.len == 1)
+                teko::assert::is_true(d.type_params[0] == "T")
+                teko::assert::is_true(d.type_constraints.len == 1)
+                match d.type_constraints[0] { parser::NoConstraint => teko::assert::is_true(true); _ => teko::assert::is_true(false) }
+            }
+            _ => teko::assert::is_true(false)
+        }
+        error => teko::assert::is_true(false)
+    }
+}
+
 #test
 fn tkb_roundtrip_matchexpr() {
     // C7.16: `match x { 0 => return 1; Foo as y => return 2; _ => return 3 }` round-trips (match + 3 pattern kinds).
