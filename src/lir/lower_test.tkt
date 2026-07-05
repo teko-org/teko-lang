@@ -1,0 +1,261 @@
+use teko::checker
+use teko::lexer
+use teko::parser
+
+/** lwt_prim — a resolved primitive Type for a PrimKind (the arithmetic operand type).
+
+    Unit tests for the TAST->LIR lowering (C2-C4, issue #221). They build small typed
+    ASTs by hand and assert over the stable printer text (the LIR's diff bar) plus the
+    pure mapping tables (ltype_of / lbinop_of / lunop_of) and the honest-stop messages.
+    The `lwt_` prefix keeps helper names from colliding with other test modules (the VM
+    resolves tests by last path segment). */
+fn lwt_prim(k: checker::PrimKind) -> checker::Type { checker::Prim { kind = k } }
+
+fn lwt_num(v: i128, k: checker::PrimKind) -> checker::TExpr {
+    checker::TExpr { kind = checker::TNumber { is_float = false; value = v; fval = 0.0 }; type = lwt_prim(k); line = 0; col = 0 }
+}
+
+fn lwt_num_i64(v: i128) -> checker::TExpr { lwt_num(v, checker::PrimKind::I64) }
+
+fn lwt_fnum(v: f64) -> checker::TExpr {
+    checker::TExpr { kind = checker::TNumber { is_float = true; value = 0 to i128; fval = v }; type = lwt_prim(checker::PrimKind::F64); line = 0; col = 0 }
+}
+
+fn lwt_var(name: str, k: checker::PrimKind) -> checker::TExpr {
+    checker::TExpr { kind = checker::TVar { name = name; is_func = false; func_ns = "" }; type = lwt_prim(k); line = 0; col = 0 }
+}
+
+fn lwt_bin(op: lexer::TokenKind, l: checker::TExpr, r: checker::TExpr, k: checker::PrimKind) -> checker::TExpr {
+    checker::TExpr { kind = checker::TBinary { op = op; left = l; right = r }; type = lwt_prim(k); line = 0; col = 0 }
+}
+
+fn lwt_unary(op: lexer::TokenKind, operand: checker::TExpr, k: checker::PrimKind) -> checker::TExpr {
+    checker::TExpr { kind = checker::TUnary { op = op; operand = operand }; type = lwt_prim(k); line = 0; col = 0 }
+}
+
+fn lwt_cast(inner: checker::TExpr, k: checker::PrimKind) -> checker::TExpr {
+    checker::TExpr { kind = checker::TCast { expr = inner }; type = lwt_prim(k); line = 0; col = 0 }
+}
+
+fn lwt_seg(s: str) -> parser::Segment { parser::Segment { name = s } }
+fn lwt_path1(s: str) -> parser::Path { parser::Path { segments = teko::list::push(teko::list::empty(), lwt_seg(s)) } }
+
+fn lwt_call(path: parser::Path, ns: str, args: []checker::TExpr, ret: checker::Type) -> checker::TExpr {
+    checker::TExpr {
+        kind = checker::TCall { callee = path; args = args; call_ns = ns; is_closure_call = false; callee_type = checker::Void { }; is_iface_dispatch = false; iface_slot = 0 }
+        type = ret; line = 0; col = 0
+    }
+}
+
+fn lwt_named_te(s: str) -> parser::TypeExpr { parser::NamedType { path = lwt_path1(s); args = teko::list::empty() } }
+
+fn lwt_param(name: str, tname: str) -> parser::Param {
+    parser::Param { name = name; has_type = true; type_ann = lwt_named_te(tname); is_params = false; has_default = false; default_expr = parser::no_expr() }
+}
+
+fn lwt_ret(e: checker::TExpr) -> checker::TStatement { checker::TReturn { has_value = true; value = e } }
+fn lwt_bind(name: str, e: checker::TExpr, k: checker::PrimKind) -> checker::TStatement {
+    checker::TBinding { kind = parser::BindKind::Let; target = parser::SimpleName { name = name }; bound = lwt_prim(k); value = e }
+}
+fn lwt_exprstmt(e: checker::TExpr) -> checker::TStatement { checker::TExprStmt { expr = e } }
+
+fn lwt_fn(name: str, ns: str, params: []parser::Param, ret: checker::Type, body: []checker::TStatement) -> checker::TFunction {
+    checker::TFunction {
+        name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty()
+        namespace = ns; params = params; return_type = ret; body = body
+        vis = parser::Visibility::Private; has_doc = false; doc = ""
+        file = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""
+    }
+}
+
+/** lwt_lower_expr_text — lower a single expression into a fresh i64 fn body and return its
+    printed LIR (for asserting on the emitted instructions). */
+fn lwt_lower_expr_text(e: checker::TExpr) -> str {
+    let f0 = new_func("t", 0, teko::list::empty(), LType::I64)
+    let ctx0 = LowerCtx { func = f0; block_id = 0; env = empty_lenv() }
+    let lo = match lower_expr(ctx0, e) { Lowered as x => x; error as err => return teko::str::concat("ERR: ", err.message) }
+    print_lmodule(add_func(empty_module(), lo.ctx.func))
+}
+
+#test
+fn lwt_ltype_of_maps_prims_to_machine_classes() {
+    teko::assert::is_true(match ltype_of(lwt_prim(checker::PrimKind::I64)) { I64 => true; _ => false })
+    teko::assert::is_true(match ltype_of(lwt_prim(checker::PrimKind::U32)) { I32 => true; _ => false })
+    teko::assert::is_true(match ltype_of(lwt_prim(checker::PrimKind::I8))  { I8  => true; _ => false })
+    teko::assert::is_true(match ltype_of(lwt_prim(checker::PrimKind::F64)) { F64 => true; _ => false })
+    teko::assert::is_true(match ltype_of(lwt_prim(checker::PrimKind::Bool)) { I8 => true; _ => false })
+}
+
+#test
+fn lwt_ltype_of_non_prim_collapses_to_ptr() {
+    teko::assert::is_true(match ltype_of(checker::Str { }) { Ptr => true; _ => false })
+    teko::assert::is_true(match ltype_of(checker::Slice { element = checker::Byte { } }) { Ptr => true; _ => false })
+    teko::assert::is_true(match ltype_of(checker::Named { name = "Widget" }) { Ptr => true; _ => false })
+    teko::assert::is_true(match ltype_of(checker::Void { }) { Void => true; _ => false })
+}
+
+#test
+fn lwt_ltype_of_typeexpr_maps_param_annotations() {
+    teko::assert::is_true(match ltype_of_typeexpr(lwt_named_te("i32")) { I32 => true; _ => false })
+    teko::assert::is_true(match ltype_of_typeexpr(lwt_named_te("f64")) { F64 => true; _ => false })
+    teko::assert::is_true(match ltype_of_typeexpr(lwt_named_te("Widget")) { Ptr => true; _ => false })
+}
+
+/** lwt_binop_is — did lbinop_of return exactly `want` (not an error)? */
+fn lwt_binop_is(op: lexer::TokenKind, k: checker::PrimKind, want: LBinOp) -> bool {
+    match lbinop_of(op, k) { LBinOp as o => o == want; error => false }
+}
+
+/** lwt_unop_is — did lunop_of return exactly `want` (not an error)? */
+fn lwt_unop_is(op: lexer::TokenKind, k: checker::PrimKind, want: LUnOp) -> bool {
+    match lunop_of(op, k) { LUnOp as o => o == want; error => false }
+}
+
+#test
+fn lwt_lbinop_of_picks_signedness_and_family() {
+    teko::assert::is_true(lwt_binop_is(lexer::TokenKind::Plus, checker::PrimKind::I64, LBinOp::IAdd))
+    teko::assert::is_true(lwt_binop_is(lexer::TokenKind::Slash, checker::PrimKind::I32, LBinOp::IDivS))
+    teko::assert::is_true(lwt_binop_is(lexer::TokenKind::Slash, checker::PrimKind::U32, LBinOp::IDivU))
+    teko::assert::is_true(lwt_binop_is(lexer::TokenKind::Percent, checker::PrimKind::I64, LBinOp::IRemS))
+    teko::assert::is_true(lwt_binop_is(lexer::TokenKind::Plus, checker::PrimKind::F64, LBinOp::FAdd))
+}
+
+#test
+fn lwt_lbinop_of_rejects_non_arithmetic() {
+    teko::assert::is_true(match lbinop_of(lexer::TokenKind::Amp, checker::PrimKind::I64) { LBinOp => false; error => true })
+}
+
+#test
+fn lwt_lunop_of_picks_negation_family() {
+    teko::assert::is_true(lwt_unop_is(lexer::TokenKind::Minus, checker::PrimKind::I64, LUnOp::INeg))
+    teko::assert::is_true(lwt_unop_is(lexer::TokenKind::Minus, checker::PrimKind::F64, LUnOp::FNeg))
+    teko::assert::is_true(lwt_unop_is(lexer::TokenKind::Bang, checker::PrimKind::Bool, LUnOp::INot))
+}
+
+#test
+fn lwt_lenv_bind_and_lookup_newest_wins() {
+    let e0 = lenv_bind(lenv_bind(empty_lenv(), "x", 3), "x", 7)
+    let hit = lenv_lookup(e0, "x")
+    teko::assert::is_true(hit.found)
+    teko::assert::is_true(hit.vreg == 7)
+    teko::assert::is_true(!lenv_lookup(e0, "y").found)
+}
+
+#test
+fn lwt_lowers_int_literal() {
+    let text = lwt_lower_expr_text(lwt_num_i64(42 to i128))
+    teko::assert::str_contains(text, "%0 = const 42")
+}
+
+#test
+fn lwt_lowers_float_literal_bit_exact() {
+    let text = lwt_lower_expr_text(lwt_fnum(1.5))
+    teko::assert::str_contains(text, "%0 = const.f64 0x3ff8000000000000")
+}
+
+#test
+fn lwt_lowers_binary_mul() {
+    let e = lwt_bin(lexer::TokenKind::Star, lwt_num_i64(6 to i128), lwt_num_i64(7 to i128), checker::PrimKind::I64)
+    let text = lwt_lower_expr_text(e)
+    teko::assert::str_contains(text, "%0 = const 6")
+    teko::assert::str_contains(text, "%1 = const 7")
+    teko::assert::str_contains(text, "%2 = imul %0, %1")
+}
+
+#test
+fn lwt_lowers_signed_div() {
+    let e = lwt_bin(lexer::TokenKind::Slash, lwt_num_i64(100 to i128), lwt_num_i64(7 to i128), checker::PrimKind::I64)
+    teko::assert::str_contains(lwt_lower_expr_text(e), "%2 = idivs %0, %1")
+}
+
+#test
+fn lwt_lowers_unary_neg() {
+    let e = lwt_unary(lexer::TokenKind::Minus, lwt_num_i64(42 to i128), checker::PrimKind::I64)
+    teko::assert::str_contains(lwt_lower_expr_text(e), "%1 = ineg %0")
+}
+
+#test
+fn lwt_lowers_cast_i64_to_i32_truncates() {
+    let e = lwt_cast(lwt_num_i64(42 to i128), checker::PrimKind::I32)
+    teko::assert::str_contains(lwt_lower_expr_text(e), "%1 = trunc %0")
+}
+
+#test
+fn lwt_lowers_cast_i32_to_i64_sign_extends() {
+    let inner = lwt_num(5 to i128, checker::PrimKind::I32)
+    let e = lwt_cast(inner, checker::PrimKind::I64)
+    teko::assert::str_contains(lwt_lower_expr_text(e), "%1 = sext %0")
+}
+
+#test
+fn lwt_lowers_exit_builtin_to_tk_exit() {
+    let call = lwt_call(lwt_path1("exit"), "", teko::list::push(teko::list::empty(), lwt_num_i64(42 to i128)), checker::Void { })
+    teko::assert::str_contains(lwt_lower_expr_text(call), "call @tk_exit(%0)")
+}
+
+#test
+fn lwt_lowers_direct_teko_call_with_mangle() {
+    let args = teko::list::push(teko::list::push(teko::list::empty(), lwt_num_i64(40 to i128)), lwt_num_i64(2 to i128))
+    let call = lwt_call(lwt_path1("add"), "teko::demo", args, checker::Prim { kind = checker::PrimKind::I64 })
+    teko::assert::str_contains(lwt_lower_expr_text(call), "%2 = call @teko__demo__add(%0, %1)")
+}
+
+#test
+fn lwt_lowers_function_with_params_and_return() {
+    let params = teko::list::push(teko::list::push(teko::list::empty(), lwt_param("a", "i64")), lwt_param("b", "i64"))
+    let body = teko::list::push(teko::list::empty(), lwt_ret(lwt_bin(lexer::TokenKind::Plus, lwt_var("a", checker::PrimKind::I64), lwt_var("b", checker::PrimKind::I64), checker::PrimKind::I64)))
+    let f = lwt_fn("add", "teko::demo", params, checker::Prim { kind = checker::PrimKind::I64 }, body)
+    let lf = match lower_function(f) { LFunc as x => x; error as err => return }
+    let text = print_lmodule(add_func(empty_module(), lf))
+    teko::assert::str_contains(text, "func @teko__demo__add(%0: i64, %1: i64) -> i64 {")
+    teko::assert::str_contains(text, "%0 = param 0")
+    teko::assert::str_contains(text, "%1 = param 1")
+    teko::assert::str_contains(text, "%2 = iadd %0, %1")
+    teko::assert::str_contains(text, "ret %2")
+}
+
+/** lwt_item — a loose top-level statement as a TItem (the virtual-main path). */
+fn lwt_item(s: checker::TStatement) -> checker::TItem { s }
+
+#test
+fn lwt_lowers_let_bindings_thread_vregs() {
+    let mul = lwt_bin(lexer::TokenKind::Star, lwt_var("x", checker::PrimKind::I64), lwt_var("y", checker::PrimKind::I64), checker::PrimKind::I64)
+    mut items: []checker::TItem = teko::list::empty()
+    items = teko::list::push(items, lwt_item(lwt_bind("x", lwt_num_i64(6 to i128), checker::PrimKind::I64)))
+    items = teko::list::push(items, lwt_item(lwt_bind("y", lwt_num_i64(7 to i128), checker::PrimKind::I64)))
+    items = teko::list::push(items, lwt_item(lwt_exprstmt(lwt_call(lwt_path1("exit"), "", teko::list::push(teko::list::empty(), mul), checker::Void { }))))
+    let prog = checker::TProgram { items = items }
+    let m = match lower_program(prog) { LModule as x => x; error as err => return }
+    let text = print_lmodule(m)
+    teko::assert::str_contains(text, "%2 = imul %0, %1")
+    teko::assert::str_contains(text, "call @tk_exit(%2)")
+}
+
+#test
+fn lwt_virtual_main_falls_through_to_return_zero() {
+    let prog = checker::TProgram { items = teko::list::empty() }
+    let m = match lower_program(prog) { LModule as x => x; error as err => return }
+    let text = print_lmodule(m)
+    teko::assert::str_contains(text, "func @main() -> i32 {")
+    teko::assert::str_contains(text, "const 0")
+}
+
+#test
+fn lwt_honest_stop_on_match_expr() {
+    let subj = lwt_num_i64(1 to i128)
+    let mexpr = checker::TExpr { kind = checker::TMatchExpr { subject = subj; arms = teko::list::empty() }; type = checker::Prim { kind = checker::PrimKind::I64 }; line = 0; col = 0 }
+    let text = lwt_lower_expr_text(mexpr)
+    teko::assert::str_contains(text, "match-expression not yet lowered")
+}
+
+#test
+fn lwt_honest_stop_on_generic_function() {
+    let gf = checker::TFunction {
+        name = "gen"; type_params = teko::list::push(teko::list::empty(), "T"); type_constraints = teko::list::empty()
+        namespace = "teko::demo"; params = teko::list::empty(); return_type = checker::Void { }; body = teko::list::empty()
+        vis = parser::Visibility::Private; has_doc = false; doc = ""
+        file = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""
+    }
+    let ok = match lower_function(gf) { LFunc => false; error as e => teko::str::contains(e.message, "generic function not yet lowered") }
+    teko::assert::is_true(ok)
+}
