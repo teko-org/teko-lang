@@ -643,56 +643,102 @@ fn method_sig_matches(req: parser::Function, impl_m: parser::Function, table: Ty
     true
 }
 
-// (W10b.IF) THE CONFORMANCE CHECK: `type_name` (a class or struct) must CONFORM to every interface
-// in `implements` — each name must BE an interface, and `own_methods` (a class's EFFECTIVE methods,
-// or a struct's own methods) must provide every method of each interface (transitively via extends)
-// by NAME, with a matching signature AND `pub` visibility (per the OOP design: `pub fn` is required
-// to satisfy an interface method).
-// `members_all_public` = true for a STRUCT (its members are all-public per W10b.0.A, so the AST
-// `vis` field is irrelevant); false for a CLASS (a class method must genuinely be `pub`/`exp` to
-// satisfy the public interface contract — a private method is not callable through the interface).
+/**
+ * (W10b.IF) THE CONFORMANCE CHECK: `type_name` (a class or struct) must CONFORM to every INTERFACE
+ * in `implements` — each interface name must be provided by `own_methods` (a class's EFFECTIVE
+ * methods, or a struct's own methods) for every method of that interface (transitively via extends)
+ * by NAME, with a matching signature AND `pub` visibility (per the OOP design: `pub fn` is required
+ * to satisfy an interface method). (TR1) Trait names also live in `implements` under Option B; they
+ * are SKIPPED here — a trait's requirements are validated by `check_trait_requirements`, and its
+ * bodied members are already folded in by `fold_traits`.
+ *
+ * @param type_name          the conforming struct/class name
+ * @param type_ns            the conforming type's declaring namespace
+ * @param own_methods        the type's effective methods (class: base chain; struct: own)
+ * @param implements         the `&`-list of contract names (interfaces ∪ derived traits)
+ * @param table              the folded type table
+ * @param members_all_public true for a STRUCT (members all-public per W10b.0.A, `vis` irrelevant);
+ *                           false for a CLASS (a satisfying method must genuinely be `pub`/`exp`)
+ * @return null on full conformance
+ * @throws when an interface method is missing, mismatched, or not `pub` on a class
+ */
 fn check_conformance(type_name: str, type_ns: str, own_methods: []parser::Function, implements: []str, table: TypeTable, members_all_public: bool) -> error? {
     mut ii = 0
     loop {
         if ii >= implements.len { break }
         let iname = implements[ii]
-        // (#109 order fix) `iname` is the SOURCE name from the `implements` list — resolve it
-        // from the CONFORMING type's namespace, and walk its extends from the FOUND decl's own ns.
-        let ihit = match find_interface_decl(iname, table, type_ns) { IfaceHit as h => h; error as e => return e }
-        let ib = match ihit.decl.body { parser::InterfaceBody as b => b; _ => return error { message = $"{iname} is not an interface" } }   // unreachable — find_interface_decl verified
-        let req_methods = match effective_interface_methods(ib, ihit.ns, table, teko::list::push(teko::list::empty(), qualify(ihit.ns, name_last_segment(ihit.decl.name)))) { []parser::Function as f => f; error as e => return e }
-        mut ri = 0
-        loop {
-            if ri >= req_methods.len { break }
-            let req = req_methods[ri]
-            mut found = false
-            mut mi = 0
-            loop {
-                if mi >= own_methods.len { break }
-                if own_methods[mi].name == req.name {
-                    if !method_sig_matches(req, own_methods[mi], table, type_ns) {
-                        return error { message = $"'{type_name}' method '{req.name}' does not match interface '{iname}'s signature" }
-                    }
-                    let restated = default_restated_param(req.params, own_methods[mi].params)
-                    if restated != "" { return error { message = $"'{type_name}' method '{req.name}' must not restate the default for '{restated}' — interface '{iname}' owns its default" } }
-                    if !members_all_public {
-                        match own_methods[mi].vis {
-                            parser::Visibility::Pub => { }
-                            parser::Visibility::Exp => { }
-                            _ => return error { message = $"'{type_name}' method '{req.name}' must be `pub` to satisfy interface '{iname}'" }
-                        }
-                    }
-                    found = true
-                    break
-                }
-                mi++
-            }
-            if !found { return error { message = $"'{type_name}' does not implement interface '{iname}' — missing method '{req.name}'" } }
-            ri++
+        if !is_trait_name(iname, table) {
+            match check_one_interface(type_name, type_ns, own_methods, iname, table, members_all_public) { error as e => return e; null => { } }
         }
         ii++
     }
     null
+}
+
+/**
+ * Check that `own_methods` satisfies a SINGLE interface `iname` (transitively via extends): each
+ * required method is present by NAME, with a matching signature, no restated default, and — for a
+ * class — real `pub`/`exp` visibility. `iname` is a SOURCE name resolved from the conforming type's
+ * namespace; its extends walk starts from the found decl's own namespace.
+ *
+ * @param type_name          the conforming struct/class name
+ * @param type_ns            the conforming type's declaring namespace
+ * @param own_methods        the type's effective methods
+ * @param iname              the interface name to check against
+ * @param table              the folded type table
+ * @param members_all_public true for a STRUCT; false for a CLASS
+ * @return null when the type conforms to `iname`
+ * @throws when a required method is missing, mismatched, restates a default, or is not `pub`
+ */
+fn check_one_interface(type_name: str, type_ns: str, own_methods: []parser::Function, iname: str, table: TypeTable, members_all_public: bool) -> error? {
+    let ihit = match find_interface_decl(iname, table, type_ns) { IfaceHit as h => h; error as e => return e }
+    let ib = match ihit.decl.body { parser::InterfaceBody as b => b; _ => return error { message = $"{iname} is not an interface" } }
+    let req_methods = match effective_interface_methods(ib, ihit.ns, table, teko::list::push(teko::list::empty(), qualify(ihit.ns, name_last_segment(ihit.decl.name)))) { []parser::Function as f => f; error as e => return e }
+    mut ri = 0
+    loop {
+        if ri >= req_methods.len { break }
+        match check_one_requirement(type_name, type_ns, own_methods, iname, req_methods[ri], table, members_all_public) { error as e => return e; null => { } }
+        ri++
+    }
+    null
+}
+
+/**
+ * Check that `own_methods` provides ONE required interface method `req` (matched by NAME) with a
+ * matching signature, no restated default, and the required visibility on a class.
+ *
+ * @param type_name          the conforming struct/class name
+ * @param type_ns            the conforming type's declaring namespace
+ * @param own_methods        the type's effective methods
+ * @param iname              the owning interface name (for error messages)
+ * @param req                the required method
+ * @param table              the folded type table
+ * @param members_all_public true for a STRUCT; false for a CLASS
+ * @return null when `req` is satisfied
+ * @throws when `req` is missing, its signature mismatches, it restates a default, or is not `pub`
+ */
+fn check_one_requirement(type_name: str, type_ns: str, own_methods: []parser::Function, iname: str, req: parser::Function, table: TypeTable, members_all_public: bool) -> error? {
+    mut mi = 0
+    loop {
+        if mi >= own_methods.len { break }
+        if own_methods[mi].name == req.name {
+            if !method_sig_matches(req, own_methods[mi], table, type_ns) {
+                return error { message = $"'{type_name}' method '{req.name}' does not match interface '{iname}'s signature" }
+            }
+            let restated = default_restated_param(req.params, own_methods[mi].params)
+            if restated != "" { return error { message = $"'{type_name}' method '{req.name}' must not restate the default for '{restated}' — interface '{iname}' owns its default" } }
+            if !members_all_public {
+                match own_methods[mi].vis {
+                    parser::Visibility::Pub => { }
+                    parser::Visibility::Exp => { }
+                    _ => return error { message = $"'{type_name}' method '{req.name}' must be `pub` to satisfy interface '{iname}'" }
+                }
+            }
+            return null
+        }
+        mi++
+    }
+    error { message = $"'{type_name}' does not implement interface '{iname}' — missing method '{req.name}'" }
 }
 
 /**
@@ -911,11 +957,21 @@ fn check_trait_requirements(derives: []TraitDerive, table: TypeTable) -> error? 
     null
 }
 
-// (TR0) THE DERIVATION FOLD — rewrites each struct/class TypeDecl whose `&`-list names traits:
-// the trait names LEAVE `implements` (interfaces stay for the ordinary conformance check), the
-// traits' fields + bodied methods fold in (fold_trait_members), and each (deriver, trait) pair
-// is recorded so its bodyless REQUIREMENTS are checked against the FOLDED table. NO-OP (the
-// program returned unchanged) when the program declares no trait at all.
+/**
+ * (TR0/TR1) THE DERIVATION FOLD — rewrites each struct/class `TypeDecl` whose `&`-list names
+ * traits: the traits' fields + bodied methods fold in (`fold_trait_members`), and each
+ * (deriver, trait) pair is recorded so its bodyless REQUIREMENTS are checked against the FOLDED
+ * table. The trait names STAY in `implements` (TR1, Option B): one `implements` list is the single
+ * source of truth for every derived contract, so `type_conforms_to` sees the derivation and the D3
+ * vtable/upcast/constraint machinery treats a trait exactly like an interface. `check_conformance`
+ * skips the trait entries (their contract is `check_trait_requirements`, not the interface path).
+ * NO-OP (the program returned unchanged) when the program declares no trait at all.
+ *
+ * @param program the parsed program
+ * @return the program with every trait-deriving struct/class folded, or an error if a fold or a
+ *         requirement check fails
+ * @throws when a folded field/method collides unresolvably, or a deriver misses a required method
+ */
 pub fn fold_traits(program: parser::Program) -> parser::Program | error {
     let table = collect_types(program.items)
     mut any = false
@@ -940,7 +996,7 @@ pub fn fold_traits(program: parser::Program) -> parser::Program | error {
                         let split = split_trait_derives(sb.implements, table, it.namespace)
                         if split.traits.len > 0 {
                             let fm = match fold_trait_members(td.name, sb.fields, sb.methods, split.traits, table, false) { FoldedMembers as f => f; error as e => return e }
-                            content = parser::TypeDecl { name = td.name; type_params = td.type_params; type_constraints = td.type_constraints; body = parser::StructBody { fields = fm.fields; methods = fm.methods; implements = split.ifaces }; vis = td.vis; has_doc = td.has_doc; doc = td.doc; line = td.line; col = td.col; di_kind = td.di_kind; has_di_key = td.has_di_key; di_key = td.di_key }
+                            content = parser::TypeDecl { name = td.name; type_params = td.type_params; type_constraints = td.type_constraints; body = parser::StructBody { fields = fm.fields; methods = fm.methods; implements = sb.implements }; vis = td.vis; has_doc = td.has_doc; doc = td.doc; line = td.line; col = td.col; di_kind = td.di_kind; has_di_key = td.has_di_key; di_key = td.di_key }
                             mut si: u64 = 0
                             loop { if si >= split.traits.len { break }; derives = teko::list::push(derives, TraitDerive { type_name = td.name; trait_name = split.traits[si] }); si++ }
                         }
@@ -949,7 +1005,7 @@ pub fn fold_traits(program: parser::Program) -> parser::Program | error {
                         let split = split_trait_derives(cb.implements, table, it.namespace)
                         if split.traits.len > 0 {
                             let fm = match fold_trait_members(td.name, cb.fields, cb.methods, split.traits, table, true) { FoldedMembers as f => f; error as e => return e }
-                            content = parser::TypeDecl { name = td.name; type_params = td.type_params; type_constraints = td.type_constraints; body = parser::ClassBody { kind = cb.kind; has_base = cb.has_base; base_name = cb.base_name; has_base_binding = cb.has_base_binding; base_binding_name = cb.base_binding_name; implements = split.ifaces; fields = fm.fields; methods = fm.methods }; vis = td.vis; has_doc = td.has_doc; doc = td.doc; line = td.line; col = td.col; di_kind = td.di_kind; has_di_key = td.has_di_key; di_key = td.di_key }
+                            content = parser::TypeDecl { name = td.name; type_params = td.type_params; type_constraints = td.type_constraints; body = parser::ClassBody { kind = cb.kind; has_base = cb.has_base; base_name = cb.base_name; has_base_binding = cb.has_base_binding; base_binding_name = cb.base_binding_name; implements = cb.implements; fields = fm.fields; methods = fm.methods }; vis = td.vis; has_doc = td.has_doc; doc = td.doc; line = td.line; col = td.col; di_kind = td.di_kind; has_di_key = td.has_di_key; di_key = td.di_key }
                             mut si: u64 = 0
                             loop { if si >= split.traits.len { break }; derives = teko::list::push(derives, TraitDerive { type_name = td.name; trait_name = split.traits[si] }); si++ }
                         }
