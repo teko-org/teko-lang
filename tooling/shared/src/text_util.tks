@@ -1,0 +1,89 @@
+/** tooling/shared/src/text_util.tks (namespace 'grammar_extractor' — same root as main.tks) —
+ *  small byte-level text helpers the extractor needs that are not part of the compiler's
+ *  built-in `teko::str::*` surface (no `starts_with`/`split_lines`/`trim` builtin exists —
+ *  see src/checker/scope.tks::builtin_fn). Mirrors the scanning idiom of src/lexer/lexer.tks
+ *  (byte-by-byte loops over `[]byte`/`str`), kept minimal and total.
+ *
+ *  a one-byte `str` from `b` (the built-in `teko::str::one_byte`, named here for
+ *  discoverability alongside this module's other small text helpers).
+ */
+pub fn one_char(b: byte) -> str {
+    teko::str::one_byte(b)
+}
+
+/** does `source` (from `pos`) begin with the literal `needle`? */
+pub fn starts_with_at(source: str, pos: u64, needle: str) -> bool {
+    if pos + needle.len > source.len { return false }
+    mut i: u64 = 0
+    loop {
+        if i >= needle.len { break }
+        if source[pos + i] != needle[i] { return false }
+        i++
+    }
+    true
+}
+
+/** trim leading/trailing ASCII spaces and tabs from `s`. */
+pub fn trim(s: str) -> str {
+    mut start: u64 = 0
+    loop {
+        if start >= s.len { break }
+        if s[start] != b' ' && s[start] != b'\t' { break }
+        start++
+    }
+    mut end = s.len
+    loop {
+        if end <= start { break }
+        let last = s[end - 1]
+        if last != b' ' && last != b'\t' && last != b'\r' { break }
+        end--
+    }
+    teko::str::slice(s, start, end)
+}
+
+/** split `source` into its lines (splitting on `\n`; a trailing `\r` is dropped per line). */
+pub fn split_lines(source: str) -> []str {
+    mut out: []str = teko::list::empty()
+    mut start: u64 = 0
+    mut i: u64 = 0
+    loop {
+        if i >= source.len {
+            if start < i { out = teko::list::push(out, teko::str::slice(source, start, i)) }
+            break
+        }
+        if source[i] == b'\n' {
+            out = teko::list::push(out, teko::str::slice(source, start, i))
+            i++
+            start = i
+            continue
+        }
+        i++
+    }
+    out
+}
+
+/** the byte offset of the first `needle` in `s` at/after `from`, or `s.len` if absent. */
+pub fn index_of_from(s: str, needle: str, from: u64) -> u64 {
+    if needle.len == 0 { return from }
+    mut i = from
+    loop {
+        if i + needle.len > s.len { return s.len }
+        if starts_with_at(s, i, needle) { return i }
+        i++
+    }
+}
+
+/** byte-wise lexicographic order: is `a` strictly less than `b`? (`str` has no built-in
+ *  `<` — see src/checker/typer.tks::type_compare, numeric/bool-only — so a stable sort
+ *  over keywords needs its own ordering, mirroring C's strcmp shape.)
+ */
+pub fn str_less(a: str, b: str) -> bool {
+    let shorter = if a.len < b.len { a.len } else { b.len }
+    mut i: u64 = 0
+    loop {
+        if i >= shorter { break }
+        if a[i] != b[i] { return a[i] < b[i] }
+        i++
+    }
+    a.len < b.len
+}

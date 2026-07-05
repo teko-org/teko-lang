@@ -1,8 +1,7 @@
 # Installing Teko
 
 Teko ships two install mechanisms for macOS and Linux: a POSIX `install.sh` script and
-a Homebrew tap. Both are covered below, along with the from-source fallback and a few
-platform notes.
+a Homebrew tap. Both are covered below, along with a few platform notes.
 
 > **Pre-alpha.** Teko is pre-alpha software. The prebuilt binaries are **not** Apple
 > code-signed or notarized — that is intentionally out of scope for CLI tooling at this
@@ -18,23 +17,29 @@ One-liner:
 curl -fsSL https://raw.githubusercontent.com/schivei/teko-lang/main/install.sh | sh
 ```
 
-By default this downloads the prebuilt `teko-<label>.tar.gz` for your platform from the
-latest GitHub release, **verifies its SHA-256** against the release's `SHA256SUMS.txt`
-(aborting on any mismatch), extracts the `teko` binary, strips the macOS quarantine flag,
-and installs it to a directory on your `PATH`.
+`install.sh` is a **from-release installer only** — it is not a toolchain. With no
+arguments it downloads the prebuilt `teko-<label>.tar.gz` for your platform from the
+**latest published GitHub release**, **verifies its SHA-256** against the release's
+`SHA256SUMS.txt` (aborting on any mismatch), extracts the `teko` binary, strips the
+macOS quarantine flag, and installs it to a directory on your `PATH`. It also stages
+that release's `runtime`/`assert`/`win32_compat.h` sources under a `share/teko` dir
+mirroring the chosen prefix, so `teko build` on the installed binary can find its C
+runtime from any project directory — not just inside a `teko-lang` checkout.
+
+A platform with no published release asset is an **honest error**: the script lists
+whatever assets the release DOES publish and points at the issue tracker — it never
+falls back to building from source.
 
 ### Options
 
 | Option | Effect |
 | --- | --- |
-| `--from-source` | Build `teko` from source instead of downloading a release. |
 | `--version <tag>` | Install a specific release tag (default: latest). |
 | `--prefix <dir>` | Install directory (default: `/usr/local/bin`, else `~/.local/bin`). |
-| `--uninstall` | Remove the installed `teko` binary. |
+| `--uninstall` | Remove the installed `teko` binary and its staged runtime. |
 | `--help` | Show usage. |
 
-Environment overrides: `TEKO_VERSION` (= `--version`), `PREFIX` (= `--prefix`), and
-`CC` (C compiler for the from-source build, default `cc`).
+Environment overrides: `TEKO_VERSION` (= `--version`), `PREFIX` (= `--prefix`).
 
 Examples:
 
@@ -44,9 +49,6 @@ Examples:
 
 # Install without sudo, into your home directory
 ./install.sh --prefix "$HOME/.local/bin"
-
-# Force a source build
-./install.sh --from-source
 
 # Remove it
 ./install.sh --uninstall
@@ -87,34 +89,33 @@ brew uninstall teko
 brew untap schivei/teko
 ```
 
-## From source (fallback)
+## Building from source
 
-The `install.sh` from-source path (via `--from-source`, or automatically when no
-prebuilt asset exists for your architecture — see the caveat below) builds `teko` with
-your system C compiler. It picks the best available source in this order:
+`install.sh` never builds from source — it only installs published release assets. To
+build `teko` yourself (contributing, or a platform with no published asset), use CMake
+directly against a `teko-lang` checkout:
 
-1. **Inside a `teko-lang` checkout** — configures and builds the `teko` CMake target:
-   ```sh
-   cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-   cmake --build build --target teko
-   ```
-2. **A released portable bundle** (`teko-bootstrap-src.tar.gz`) — builds it with the
-   documented single command:
-   ```sh
-   cc -std=c23 -w -Iruntime -Iassert teko.c runtime/teko_rt.c assert/assert.c -lm -o teko
-   ```
-3. **Otherwise** — `git clone --depth 1` the repo into a temp directory and CMake-build
-   it there.
+```sh
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --target teko
+```
 
-Requirements for the from-source path: a C compiler with **C23** support (recent Clang
-or GCC) and, for the checkout/clone route, `cmake` and `git`.
+or, from a released portable bundle (`teko-bootstrap-src.tar.gz`), the documented
+single command:
+
+```sh
+cc -std=c23 -w -Iruntime -Iassert teko.c runtime/teko_rt.c assert/assert.c -lm -o teko
+```
+
+Requirements: a C compiler with **C23** support (recent Clang or GCC) and, for the
+checkout route, `cmake`.
 
 ## Platform notes and caveats
 
 - **macOS prebuilt binaries are Apple Silicon (arm64) only.** There is no
-  `macos-x86_64` release asset. On an **Intel Mac**, `install.sh` detects this and
-  builds from source automatically — no extra flags needed. Homebrew already builds
-  from source on every architecture.
+  `macos-x86_64` release asset yet. On an **Intel Mac**, `install.sh` reports an
+  honest error listing the assets that ARE published — see "Building from source"
+  above. Homebrew already builds from source on every architecture.
 - **Supported release labels:** `macos-arm64`, `linux-x86_64`, `linux-arm64` (plus
   Windows labels, which this script does not target). Windows users should build from
   the portable bundle or use WSL.
@@ -123,9 +124,6 @@ or GCC) and, for the checkout/clone route, `cmake` and `git`.
   attribute after download so Gatekeeper does not block the CLI; the Homebrew formula
   sidesteps the issue entirely by compiling locally. This decision is deliberate and
   will be revisited before a stable release.
-- **No release published yet.** Until `0.0.1.3-bootstrap` is released, the from-release
-  path has nothing to download; the script degrades gracefully and builds from source.
-  Use `--from-source` explicitly to skip the release probe.
 
 ## Uninstalling
 

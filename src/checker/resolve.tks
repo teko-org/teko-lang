@@ -405,6 +405,24 @@ fn expand_variant(t: Type, table: TypeTable) -> Type {
     }
 }
 
+/**
+ * ptr_widens_to_opaque — C7.19 OPAQUE-PTR DEGRADE: a typed `ptr<T>` (`from`) widens into the
+ * untyped opaque `ptr` (`to = Ptr{inner = null}`) — the reverse of `type_eq`'s `ptr_inner_eq`,
+ * which requires matching inners because it also backs strict overload/return checks. Transport-
+ * only builtins (`bytes_from_ptr`, `str_from_cstr`) take the opaque `ptr` so ANY typed pointer
+ * (e.g. `teko::mem::buf_ptr`'s `ptr<byte>`) may flow in without a cast; a typed pointer never
+ * widens into a DIFFERENTLY typed one (no `ptr<byte>` -> `ptr<i32>`).
+ */
+fn ptr_widens_to_opaque(from: Type, to: Type) -> bool {
+    match from {
+        Ptr => match to {
+            Ptr as tp => match tp.inner { null => true; Type => false }
+            _         => false
+        }
+        _ => false
+    }
+}
+
 // (#41-followon) Does a value of `from` WIDEN into `to`? The single source of truth for value-
 // position widening, shared by the return/trailing-value/assign/binding check (assignable_to
 // delegates here) and the match/`if` arm JOIN (type_join). Rules (B.14 + present-wrap §202):
@@ -447,6 +465,7 @@ fn widens_into_at(from: Type, to: Type, table: TypeTable, depth: i64) -> bool {
         }
         _ => {}
     }
+    if ptr_widens_to_opaque(from, to) { return true }
     // (W10b.D3) UPCAST — a CLASS instance widens into a contract (interface) it NOMINALLY
     // conforms to: `let s: Shape = circle`. Classes only (reference semantics ride the object
     // pointer into the fat-pointer `data` field); a STRUCT is pure value data — no stable
