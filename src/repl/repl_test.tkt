@@ -11,11 +11,18 @@
 // gap never surfaced before (a genuine compiler limitation — reported, not routed around here).
 // So these tests cover every REPL path that stops BEFORE `run_new_statements`: the `:help`/
 // `:quit` meta-commands (short-circuit before any parse), a lexer/parser/checker rejection
-// (returns before running anything), and `value_str`'s display formatting (a pure function of
-// a constructed Value + its static Type — no VM interpretation involved).
+// (returns before running anything), and `value_str`'s display formatting on the PRIM/str/char
+// arms of `checker::Type` (a pure function of a constructed Value + its static Type — no VM
+// interpretation involved).
+//
+// `value_str`'s Slice/Optional arms are NOT covered here: `checker::Slice{element}` and
+// `checker::Optional{inner}` are both single-field SIBLING members of the `checker::Type`
+// variant, which is exactly the shape the VM's documented wrapper-descent bug (see
+// vm_variant_siblings's own doc, vm.tks — "a SINGLE-FIELD sibling wrapper … still descends")
+// conflates when interpreting a `match t { … }` over a constructed `Type` value — a pre-existing
+// VM-only test-authoring hazard (never a compiler bug), not something to route around here.
 
 use teko::checker
-use teko::vm
 
 #test
 fn help_meta_command_prints_the_banner_and_keeps_the_session() {
@@ -104,23 +111,6 @@ fn value_str_renders_bool_and_numeric_prims() {
 fn value_str_quotes_str_and_passes_char_through_bare() {
     teko::assert::is_true(teko::repl::value_str("hi", checker::Str { }) == "\"hi\"")
     teko::assert::is_true(teko::repl::value_str("a", checker::Char { }) == "a")
-}
-
-#test
-fn value_str_renders_a_slice_of_its_element_type() {
-    let xs: []vm::Value = [1 to i64, 2 to i64, 3 to i64]
-    let t = checker::Slice { element = checker::Prim { kind = checker::PrimKind::I64 } }
-    teko::assert::is_true(teko::repl::value_str(xs, t) == "[1, 2, 3]")
-}
-
-#test
-fn value_str_renders_null_and_present_optionals() {
-    let inner_t = checker::Prim { kind = checker::PrimKind::I64 }
-    let opt_t = checker::Optional { inner = inner_t }
-    let none_v = vm::OptVal { present = false; inner = null }
-    teko::assert::is_true(teko::repl::value_str(none_v, opt_t) == "null")
-    let some_v = vm::OptVal { present = true; inner = 5 to i64 }
-    teko::assert::is_true(teko::repl::value_str(some_v, opt_t) == "5")
 }
 
 #test
