@@ -1274,6 +1274,41 @@ fn eval_interp_hole_no_spec(h: Value) -> str {
     }
 }
 
+/**
+ * Reinterpret an integer interpolation hole as an unsigned 64-bit value, matching C's
+ * `(uint64_t)` cast at the native format-spec call site.
+ *
+ * A hex/binary/thousands spec on a SIGNED hole lowers natively to `tk_fmt_*((uint64_t)(hole))`,
+ * a two's-complement bit reinterpretation that never traps. A checked Teko `to u64` would
+ * instead PANIC on a negative value ("impossible conversion") — a VM≠native divergence — so this
+ * masks the low 64 bits like the native cast, keeping the self-hosted VM byte-identical.
+ *
+ * @param raw  the hole's integer bits as i128 (an int hole via `as_int`, or a float hole
+ *             truncated toward zero into i128)
+ * @return     the low 64 bits of `raw` as a u64 (two's-complement wrap, never panics)
+ */
+fn wrap_hole_to_u64(raw: i128) -> u64 {
+    (raw & (u_max_of(64) to i128)) to u64
+}
+
+/**
+ * Reinterpret an integer interpolation hole as a signed 64-bit value, matching C's `(int64_t)`
+ * cast at the native format-spec call site (used by the `d`/`n` integer families).
+ *
+ * Masks the low 64 bits then sign-extends from bit 63, mirroring C's two's-complement narrowing
+ * — an UNSIGNED hole above `i64::MAX` wraps to negative exactly as `(int64_t)` does, where a
+ * checked Teko `to i64` would PANIC.
+ *
+ * @param raw  the hole's integer bits as i128 (an int hole via `as_int`, or a float hole
+ *             truncated toward zero into i128)
+ * @return     the low 64 bits of `raw` as an i64 (two's-complement wrap, never panics)
+ */
+fn wrap_hole_to_i64(raw: i128) -> i64 {
+    let masked = raw & (u_max_of(64) to i128)
+    if masked >= ((1 to i128) << 63) { return (masked - ((1 to i128) << 64)) to i64 }
+    masked to i64
+}
+
 fn eval_interp_static_spec(h: Value, spec: str) -> str {
     // lowercase first byte to normalize 'F'→'f' (ASCII: 0x20 = lowercase flag for A-Z)
     let fc0 = if spec.len > 0 { spec[0] } else { 102 to byte }   // 102 = 'f'
@@ -1292,8 +1327,9 @@ fn eval_interp_static_spec(h: Value, spec: str) -> str {
     let dval = if is_flt { as_float(h) }
     else if int_sign_of(h) { as_int(h) to i64 to f64 }
     else { as_int(h) to u64 to f64 }
-    let ival = if int_sign_of(h) { as_int(h) to i64 } else { 0 to i64 }
-    let uval = if !int_sign_of(h) && !is_flt { as_int(h) to u64 } else { 0 to u64 }
+    let int_bits = if is_flt { as_float(h) to i128 } else { as_int(h) }
+    let ival = wrap_hole_to_i64(int_bits)
+    let uval = wrap_hole_to_u64(int_bits)
     if fc_low == 102 { teko::fmt_f(dval, prec) }   // 'f'
     else if fc_low == 101 { teko::fmt_e(dval, prec) }   // 'e'
     else if fc_low == 103 { teko::fmt_g(dval, prec) }   // 'g'

@@ -2627,6 +2627,28 @@ fn emit_piece_lit(buf: []byte, piece: str) -> []byte {
     out = cb_i64(out, piece.len to i64)
     cb(out, " }")
 }
+
+/**
+ * Whether the static format-spec family for `fc_low` accepts a precision/width second
+ * argument in its `tk_fmt_*` runtime signature.
+ *
+ * The hex (`x`/`X`), binary (`b`), and integer-thousands (`n` on a non-float hole) helpers
+ * take ONLY the value — `tk_fmt_x_upper(v)` / `tk_fmt_x_lower(v)` / `tk_fmt_b(v)` /
+ * `tk_fmt_n_i(v)`. Every other family (`f`/`e`/`g`/`p`/`d`, and `n` on a float) takes a
+ * second precision-or-width argument. Emitting the second argument for a one-argument helper
+ * makes the generated C fail to compile (too many arguments) — the native path breaks while
+ * the VM keeps producing output, a VM==native divergence.
+ *
+ * @param fc_low  the spec's normalized (lowercased) leading format character
+ * @param is_flt  true when the hole's static type is a float (f32/f64)
+ * @return        true iff the selected `tk_fmt_*` runtime helper takes a precision/width arg
+ */
+fn fmt_family_takes_prec(fc_low: byte, is_flt: bool) -> bool {
+    if fc_low == 120 { return false }
+    if fc_low == 98 { return false }
+    if fc_low == 110 && !is_flt { return false }
+    true
+}
 fn emit_interp(buf: []byte, prog: checker::TProgram, in: checker::TInterp, escaping: []str, regions: []RegionFrame, fn_body: []checker::TStatement, dctx: DeferCtx) -> []byte | error {
     let nsegs = in.pieces.len + in.holes.len
     mut out = buf
@@ -2672,9 +2694,13 @@ fn emit_interp(buf: []byte, prog: checker::TProgram, in: checker::TInterp, escap
                         else if fc_low == 110 { out = cb(out, "tk_fmt_n_i((int64_t)(") }
                         else { return error { message = "codegen: unrecognized format spec" } }
                         out = match emit_expr_ctx(out, prog, checker::Void { }, h, escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
-                        out = cb(out, "), ")
-                        out = cb(out, prec_str)
-                        out = cb(out, ")")
+                        if fmt_family_takes_prec(fc_low, is_flt) {
+                            out = cb(out, "), ")
+                            out = cb(out, prec_str)
+                            out = cb(out, ")")
+                        } else {
+                            out = cb(out, "))")
+                        }
                     }
                     checker::TFSpecDynamic as fd => {
                         let is_flt = match h.type { checker::Prim as p => p.kind == checker::PrimKind::F32 || p.kind == checker::PrimKind::F64; _ => false }

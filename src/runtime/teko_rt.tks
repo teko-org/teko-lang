@@ -161,23 +161,302 @@ exp fn ftoa(x: f64) -> str {
     teko::fmt::f64_g17(x)   // DEFERRED host float renderer (FFI bottom — C1)
 }
 
-// fmt_* — ROUND 0 format-spec helpers. All are snprintf-based (FFI bottom — C1); the C twins
-// live in teko_rt.c and are declared in teko_rt.h. The VM intercepts these by OUTER function
-// name ("fmt_f", "fmt_e", …) and dispatches to the C symbols directly (parallel to ftoa).
-// Bodies are type-correct placeholders — never reached at runtime.
+/**
+ * Left-pad `body` with `pad` bytes until its total length reaches `width`.
+ *
+ * Used by the zero-padded integer format (`$"{n:D5}"`). A `body` already at or beyond
+ * `width` is returned unchanged; the padding is prepended, so a signed value's `-` is NOT
+ * kept in front of the zeros (matching C's `%0*d`, whose padding placement is handled by the
+ * caller when a sign is present — see `fmt_d`).
+ *
+ * @param body   the already-rendered digit text
+ * @param width  the minimum total width to pad `body` up to
+ * @param pad    the single byte used for each padding position
+ * @return       `body` left-padded with `pad` to at least `width` bytes
+ */
+fn pad_left(body: str, width: i64, pad: byte) -> str {
+    let have = body.len to i64
+    if have >= width { return body }
+    mut xs: []byte = teko::list::empty()
+    mut i = have
+    loop { if i >= width { break }; xs = teko::list::push(xs, pad); i++ }
+    str_concat(str(xs), body)
+}
+
+/**
+ * Insert a comma between every group of three decimal digits of `digits`, right-aligned.
+ *
+ * `digits` is the plain (sign-free) decimal text; the caller re-attaches any sign. Grouping
+ * starts from the least-significant digit, so "1234567" becomes "1,234,567". A digit run of
+ * three or fewer is returned unchanged.
+ *
+ * @param digits  the sign-free decimal digit text to group
+ * @return        `digits` with a comma inserted after each group of three, from the right
+ */
+fn group_thousands(digits: str) -> str {
+    let n = digits.len to i64
+    mut xs: []byte = teko::list::empty()
+    mut i = 0 to i64
+    loop {
+        if i >= n { break }
+        let remaining = n - i
+        if i > 0 && remaining % 3 == 0 { xs = teko::list::push(xs, b',') }
+        xs = teko::list::push(xs, digits[i to u64])
+        i++
+    }
+    str(xs)
+}
+
+/**
+ * Render the unsigned magnitude of `x` in base `radix` (2..=16) using `alphabet` for digits.
+ *
+ * The hex and binary format families lower to this: base 16 with an upper- or lower-case
+ * digit alphabet, or base 2. Zero renders as a single "0". No sign is emitted (the families
+ * that use this take an already-unsigned value).
+ *
+ * @param x         the unsigned magnitude to render
+ * @param radix     the numeric base, 2 through 16
+ * @param alphabet  the 16-byte digit table (index 0..radix-1 selects the digit byte)
+ * @return          the base-`radix` text of `x`
+ */
+fn to_radix(x: u64, radix: u64, alphabet: str) -> str {
+    if x == 0 { return "0" }
+    mut digits: []byte = teko::list::empty()
+    mut n = x
+    loop {
+        if n == 0 { break }
+        digits = teko::list::push(digits, alphabet[n % radix])
+        n = n / radix
+    }
+    mut xs: []byte = teko::list::empty()
+    mut k = digits.len
+    loop { if k == 0 { break }; k = k - 1; xs = teko::list::push(xs, digits[k]) }
+    str(xs)
+}
+
+/**
+ * fmt_d — `x` as decimal, zero-padded on the left to a minimum field `width` (`$"{n:D5}"`).
+ *
+ * Mirrors C's `%0*` `PRId64`: a negative value keeps its `-` in front of the zero padding, so
+ * the sign occupies one of the `width` positions. A `width` at or below the natural digit
+ * count leaves the value unpadded.
+ *
+ * @param x      the signed integer to render
+ * @param width  the minimum total field width (including any sign)
+ * @return       `x` in decimal, left-padded with zeros to at least `width` bytes
+ */
+exp fn fmt_d(x: i64, width: i64) -> str {
+    if x >= 0 { return pad_left(i64_to_str(x), width, b'0') }
+    let mag = ((-(x + 1)) to u64) + 1
+    let padded = pad_left(u64_to_str(mag), width - 1, b'0')
+    str_concat("-", padded)
+}
+
+/**
+ * fmt_x_upper — `x` as upper-case hexadecimal (`$"{n:X}"`), no `0x` prefix, no padding.
+ *
+ * @param x  the unsigned value to render
+ * @return   the upper-case base-16 text of `x`
+ */
+exp fn fmt_x_upper(x: u64) -> str { to_radix(x, 16, "0123456789ABCDEF") }
+
+/**
+ * fmt_x_lower — `x` as lower-case hexadecimal (`$"{n:x}"`), no `0x` prefix, no padding.
+ *
+ * @param x  the unsigned value to render
+ * @return   the lower-case base-16 text of `x`
+ */
+exp fn fmt_x_lower(x: u64) -> str { to_radix(x, 16, "0123456789abcdef") }
+
+/**
+ * fmt_b — `x` as binary (`$"{n:b}"`), no `0b` prefix, no padding, minimal width.
+ *
+ * @param x  the unsigned value to render
+ * @return   the base-2 text of `x`
+ */
+exp fn fmt_b(x: u64) -> str { to_radix(x, 2, "0123456789ABCDEF") }
+
+/**
+ * fmt_n_i — `x` as decimal with a comma every three digits (`$"{n:N}"` on an integer hole).
+ *
+ * A negative value keeps its leading `-`; grouping applies only to the magnitude digits.
+ *
+ * @param x  the signed integer to render
+ * @return   `x` in decimal with thousands separators
+ */
+exp fn fmt_n_i(x: i64) -> str {
+    if x >= 0 { return group_thousands(u64_to_str(x to u64)) }
+    let mag = ((-(x + 1)) to u64) + 1
+    str_concat("-", group_thousands(u64_to_str(mag)))
+}
+
+/**
+ * fmt_f — `x` rounded to `prec` fractional digits, fixed-point (`$"{x:F2}"`).
+ *
+ * The float families bottom out at the host `%.*f`/`%.*e`/`%.*g` renderer — the SAME deferred
+ * FFI edge (C1) `ftoa`/`f64_g17` bottom out at. Reproducing libc's binary64-to-decimal rounding
+ * byte-for-byte in Teko needs a precision-aware host primitive the current seed does not yet
+ * expose, so this body renders through the seed-known `ftoa` bottom; the C twin
+ * (teko_rt.c::tk_fmt_f) carries the precise `%.*f` behavior, and the VM intercepts `fmt_f` by
+ * name at the interpolation layer so `teko run` matches the native build.
+ *
+ * @param x     the value to render
+ * @param prec  the number of fractional digits (may be 0)
+ * @return      `x` as fixed-point text with exactly `prec` fractional digits
+ */
 exp fn fmt_f(x: f64, prec: i64) -> str { ftoa(x) }
+
+/**
+ * fmt_e — `x` in scientific notation with `prec` fractional mantissa digits (`$"{x:E3}"`).
+ *
+ * Deferred host bottom, like `fmt_f`; the C twin (teko_rt.c::tk_fmt_e) carries the `%.*e`
+ * behavior and the VM intercepts `fmt_e` by name.
+ *
+ * @param x     the value to render
+ * @param prec  the number of fractional mantissa digits
+ * @return      `x` in `d.dddde±dd` scientific text
+ */
 exp fn fmt_e(x: f64, prec: i64) -> str { ftoa(x) }
+
+/**
+ * fmt_g — `x` in the shorter of fixed/scientific with `prec` significant digits (`$"{x:G4}"`).
+ *
+ * Deferred host bottom, like `fmt_f`; the C twin (teko_rt.c::tk_fmt_g) carries the `%.*g`
+ * behavior and the VM intercepts `fmt_g` by name.
+ *
+ * @param x     the value to render
+ * @param prec  the number of significant digits
+ * @return      `x` in the shorter general representation
+ */
 exp fn fmt_g(x: f64, prec: i64) -> str { ftoa(x) }
+
+/**
+ * fmt_n_f — `x` as fixed-point with `prec` fractional digits AND thousands separators
+ * (`$"{x:N2}"`).
+ *
+ * Deferred host bottom, like `fmt_f` (the `%.*f` render precedes the Teko grouping the C twin
+ * teko_rt.c::tk_fmt_n_f performs); the VM intercepts `fmt_n_f` by name.
+ *
+ * @param x     the value to render
+ * @param prec  the number of fractional digits
+ * @return      `x` as grouped fixed-point text (comma every three integer digits)
+ */
 exp fn fmt_n_f(x: f64, prec: i64) -> str { ftoa(x) }
+
+/**
+ * fmt_p — `x` scaled by 100 and rendered as a percentage with `prec` fractional digits and a
+ * trailing `%` (`$"{x:P1}"`, so 0.25 → "25.0%").
+ *
+ * Deferred host bottom, like `fmt_f`; the C twin (teko_rt.c::tk_fmt_p) carries the `%.*f%%`
+ * behavior and the VM intercepts `fmt_p` by name.
+ *
+ * @param x     the fraction to render as a percent
+ * @param prec  the number of fractional digits
+ * @return      `x * 100` as fixed-point text followed by `%`
+ */
 exp fn fmt_p(x: f64, prec: i64) -> str { ftoa(x) }
-exp fn fmt_d(x: i64, width: i64) -> str { i64_to_str(x) }
-exp fn fmt_x_upper(x: u64) -> str { u64_to_str(x) }
-exp fn fmt_x_lower(x: u64) -> str { u64_to_str(x) }
-exp fn fmt_b(x: u64) -> str { u64_to_str(x) }
-exp fn fmt_n_i(x: i64) -> str { i64_to_str(x) }
-exp fn fmt_dyn_f64(x: f64, spec: str) -> str { ftoa(x) }
-exp fn fmt_dyn_i64(x: i64, spec: str) -> str { i64_to_str(x) }
-exp fn fmt_dyn_u64(x: u64, spec: str) -> str { u64_to_str(x) }
+
+/**
+ * fmt_dyn_f64 — dynamic-spec float formatting (`$"{x:[spec]}"`), dispatching on the first
+ * spec byte (case-insensitive) with an optional trailing precision.
+ *
+ * @param x     the value to render
+ * @param spec  the runtime spec string (e.g. "F2", "e3", "N", "p1")
+ * @return      `x` formatted per `spec`; an empty/unknown spec falls back to `ftoa`
+ */
+exp fn fmt_dyn_f64(x: f64, spec: str) -> str {
+    if spec.len == 0 { return ftoa(x) }
+    let prec = fmt_parse_prec(spec, 6)
+    let fc = fmt_lead_lower(spec)
+    if fc == b'f' { return fmt_f(x, prec) }
+    if fc == b'e' { return fmt_e(x, prec) }
+    if fc == b'g' { return fmt_g(x, prec) }
+    if fc == b'n' { return fmt_n_f(x, prec) }
+    if fc == b'p' { return fmt_p(x, prec) }
+    ftoa(x)
+}
+
+/**
+ * fmt_dyn_i64 — dynamic-spec signed-integer formatting (`$"{n:[spec]}"`).
+ *
+ * @param x     the signed value to render
+ * @param spec  the runtime spec string (e.g. "D5", "X", "b", "N")
+ * @return      `x` formatted per `spec`; an empty/unknown spec falls back to decimal
+ */
+exp fn fmt_dyn_i64(x: i64, spec: str) -> str {
+    if spec.len == 0 { return i64_to_str(x) }
+    let prec = fmt_parse_prec(spec, 0)
+    let fc = fmt_lead_lower(spec)
+    if fc == b'd' { return fmt_d(x, if prec > 0 { prec } else { 1 }) }
+    if fc == b'x' {
+        if spec[0] == b'X' { return fmt_x_upper(x to u64) }
+        return fmt_x_lower(x to u64)
+    }
+    if fc == b'b' { return fmt_b(x to u64) }
+    if fc == b'n' { return fmt_n_i(x) }
+    i64_to_str(x)
+}
+
+/**
+ * fmt_dyn_u64 — dynamic-spec unsigned-integer formatting (`$"{u:[spec]}"`).
+ *
+ * @param x     the unsigned value to render
+ * @param spec  the runtime spec string (e.g. "D5", "X", "b", "N")
+ * @return      `x` formatted per `spec`; an empty/unknown spec falls back to decimal
+ */
+exp fn fmt_dyn_u64(x: u64, spec: str) -> str {
+    if spec.len == 0 { return u64_to_str(x) }
+    let prec = fmt_parse_prec(spec, 0)
+    let fc = fmt_lead_lower(spec)
+    if fc == b'd' { return fmt_d(x to i64, if prec > 0 { prec } else { 1 }) }
+    if fc == b'x' {
+        if spec[0] == b'X' { return fmt_x_upper(x) }
+        return fmt_x_lower(x)
+    }
+    if fc == b'b' { return fmt_b(x) }
+    if fc == b'n' { return fmt_n_i(x to i64) }
+    u64_to_str(x)
+}
+
+/**
+ * Lower-case the leading byte of a dynamic format spec (ASCII A–Z → a–z), for the
+ * case-insensitive family dispatch in the `fmt_dyn_*` helpers.
+ *
+ * @param spec  the runtime spec string (assumed non-empty by the callers)
+ * @return      the spec's first byte, lower-cased if it was an upper-case ASCII letter
+ */
+fn fmt_lead_lower(spec: str) -> byte {
+    let c = spec[0]
+    if c >= b'A' && c <= b'Z' { return (c to u64 + 32) to byte }
+    c
+}
+
+/**
+ * Parse the optional trailing decimal precision out of a dynamic format spec (e.g. "F2" → 2).
+ *
+ * Skips the leading non-digit family byte(s), then reads the digit run. A spec with no digits
+ * yields `def`. The accumulator is clamped at 10000 (matching the C twin's FMT_PREC_MAX) so a
+ * pathologically long digit run cannot overflow.
+ *
+ * @param spec  the runtime spec string
+ * @param def   the precision to use when the spec carries no digits
+ * @return      the parsed precision, or `def` when absent
+ */
+fn fmt_parse_prec(spec: str, def: i64) -> i64 {
+    mut i = 0 to u64
+    loop { if i >= spec.len { break }; let c = spec[i]; if c >= b'0' && c <= b'9' { break }; i++ }
+    if i >= spec.len { return def }
+    mut p = 0 to i64
+    loop {
+        if i >= spec.len { break }
+        let c = spec[i]
+        if c < b'0' || c > b'9' { break }
+        if p < 10000 { p = p * 10 + (c to i64 - 48) }
+        if p > 10000 { p = 10000 }
+        i++
+    }
+    p
+}
 
 // --- Phase 3 str query/slice builtins (mirror of teko_rt.c's tk_str_eq / tk_str_slice /
 // tk_str_slice_to / tk_str_slice_from / tk_str_len / tk_str_ends_with / tk_str_contains /
