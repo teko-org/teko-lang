@@ -30,15 +30,35 @@ if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
 fi
 echo "ci_provision_teko: seeding compiler from release $TAG (asset teko-${LABEL}.*)"
 
-gh release download "$TAG" -R "$REPO" -p "teko-${LABEL}.*" --clobber
+# Download the asset. The Linux labels gained a libc suffix (linux-x86_64 -> linux-x86_64-glibc)
+# when the release started shipping glibc+musl separately; a release predating that split has
+# only the unsuffixed asset, so fall back to `<label>` with the trailing `-glibc` stripped.
+rm -f teko-*.tar.gz teko-*.zip
+if gh release download "$TAG" -R "$REPO" -p "teko-${LABEL}.tar.gz" -p "teko-${LABEL}.zip" --clobber 2>/dev/null; then
+  :
+else
+  ALT="${LABEL%-glibc}"
+  if [ "$ALT" != "$LABEL" ]; then
+    echo "ci_provision_teko: teko-${LABEL}.* absent in $TAG — falling back to legacy teko-${ALT}.*"
+    gh release download "$TAG" -R "$REPO" -p "teko-${ALT}.tar.gz" -p "teko-${ALT}.zip" --clobber
+  else
+    echo "ci_provision_teko: no seed asset teko-${LABEL}.* in $TAG" >&2
+    exit 1
+  fi
+fi
 
 rm -rf .seed
 mkdir -p .seed
-if [ -f "teko-${LABEL}.zip" ]; then
-  unzip -o "teko-${LABEL}.zip" -d .seed
-else
-  tar -xzf "teko-${LABEL}.tar.gz" -C .seed
+# Extract whichever archive actually landed (name may be the label or the legacy fallback).
+ARCHIVE="$(ls teko-*.zip teko-*.tar.gz 2>/dev/null | head -n1)"
+if [ -z "$ARCHIVE" ]; then
+  echo "ci_provision_teko: no seed archive downloaded" >&2
+  exit 1
 fi
+case "$ARCHIVE" in
+  *.zip) unzip -o "$ARCHIVE" -d .seed ;;
+  *)     tar -xzf "$ARCHIVE" -C .seed ;;
+esac
 chmod +x .seed/teko .seed/teko.exe 2>/dev/null || true
 
 SEED_DIR="$(CDPATH='' cd -- .seed && pwd)"

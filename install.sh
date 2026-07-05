@@ -83,8 +83,9 @@ while [ "$#" -gt 0 ]; do
 done
 
 # ── OS / arch detection ──────────────────────────────────────────────────────
-# Sets OS (macos|linux), ARCH (x86_64|arm64), LABEL (release asset label, empty when no
-# prebuilt asset is published for this platform — e.g. Intel macOS).
+# Sets OS (macos|linux), ARCH (x86_64|arm64|riscv64), LIBC (glibc|musl, Linux only), and
+# LABEL (release asset label, empty when no prebuilt asset is published for this platform —
+# e.g. Intel macOS).
 detect_platform() {
     uname_s="$(uname -s)"
     uname_m="$(uname -m)"
@@ -98,15 +99,30 @@ detect_platform() {
     case "$uname_m" in
         x86_64|amd64)          ARCH="x86_64" ;;
         arm64|aarch64)         ARCH="arm64" ;;
+        riscv64)               ARCH="riscv64" ;;
         *)                     die "unsupported architecture: $uname_m" ;;
     esac
 
-    # Map (OS, ARCH) to the published release label. macOS ships arm64 only today.
+    # Linux ships glibc (dynamic) and musl (static) per arch. Pick the C library this system
+    # actually uses so the binary's dynamic deps resolve: musl distros (Alpine) get the
+    # static musl build; everything else gets glibc. TEKO_LIBC overrides the auto-detection.
+    LIBC=""
+    if [ "$OS" = "linux" ]; then
+        LIBC="${TEKO_LIBC:-}"
+        if [ -z "$LIBC" ]; then
+            if [ -n "$(ls /lib/ld-musl-* 2>/dev/null)" ] || (ldd --version 2>&1 | grep -qi musl); then
+                LIBC="musl"
+            else
+                LIBC="glibc"
+            fi
+        fi
+    fi
+
+    # Map (OS, ARCH[, LIBC]) to the published release label. macOS ships arm64 only today.
     LABEL=""
-    case "${OS}-${ARCH}" in
-        macos-arm64)   LABEL="macos-arm64" ;;
-        linux-x86_64)  LABEL="linux-x86_64" ;;
-        linux-arm64)   LABEL="linux-arm64" ;;
+    case "$OS" in
+        macos)  [ "$ARCH" = "arm64" ] && LABEL="macos-arm64" ;;
+        linux)  LABEL="linux-${ARCH}-${LIBC}" ;;
     esac
 }
 
@@ -408,13 +424,24 @@ install_from_release() {
     [ -n "$LABEL" ] || no_asset_error "$tag"
 
     base="${REPO_URL}/releases/download/${tag}"
-    asset="teko-${LABEL}.tar.gz"
-    asset_url="${base}/${asset}"
     sums_url="${base}/SHA256SUMS.txt"
 
-    log "downloading $asset_url"
-    if ! download_ok "$asset_url" "$WORKDIR/$asset"; then
-        no_asset_error "$tag"
+    # Primary asset name; for glibc, releases predating the glibc/musl split named it without
+    # the `-glibc` suffix (teko-linux-x86_64.tar.gz), so fall back to that legacy name.
+    asset="teko-${LABEL}.tar.gz"
+    log "downloading ${base}/${asset}"
+    if ! download_ok "${base}/${asset}" "$WORKDIR/$asset"; then
+        if [ "${LIBC:-}" = "glibc" ]; then
+            legacy="teko-linux-${ARCH}.tar.gz"
+            log "$asset not found — trying legacy $legacy"
+            if download_ok "${base}/${legacy}" "$WORKDIR/$legacy"; then
+                asset="$legacy"
+            else
+                no_asset_error "$tag"
+            fi
+        else
+            no_asset_error "$tag"
+        fi
     fi
 
     # Verify checksum against the release's SHA256SUMS.txt. Refuse to install without a

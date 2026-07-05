@@ -35,7 +35,20 @@ case "$arch" in
   arm64|aarch64) a=arm64 ;;
   *) echo "fetch_teko: unsupported arch '$arch'" >&2; exit 1 ;;
 esac
+# Linux ships glibc (dynamic) + musl (static) per arch — pick the one this system uses
+# (musl distros expose /lib/ld-musl-*). macOS/Windows have a single libc, no suffix.
 LABEL="${o}-${a}"
+if [ "$o" = linux ]; then
+  libc="${TEKO_LIBC:-}"
+  if [ -z "$libc" ]; then
+    if [ -n "$(ls /lib/ld-musl-* 2>/dev/null)" ] || (ldd --version 2>&1 | grep -qi musl); then
+      libc=musl
+    else
+      libc=glibc
+    fi
+  fi
+  LABEL="${o}-${a}-${libc}"
+fi
 
 # Newest release BY VERSION — the /releases API is not version-ordered, so `[0]` can be
 # a stale tag (0.0.1.9 ahead of 0.0.1.17). Filter to MAJOR.MINOR.PATCH.BUILD + `sort -V`.
@@ -58,7 +71,19 @@ fi
 echo "fetch_teko: updating to $TAG (asset teko-${LABEL}.${ext})"
 rm -rf "$DEST"
 mkdir -p "$DEST"
-gh release download "$TAG" -R "$REPO" -p "teko-${LABEL}.${ext}" -D "$DEST"
+# Releases predating the glibc/musl split named the glibc asset without a suffix
+# (teko-linux-x86_64.tar.gz), so fall back to that legacy name.
+if ! gh release download "$TAG" -R "$REPO" -p "teko-${LABEL}.${ext}" -D "$DEST" 2>/dev/null; then
+  ALT="${LABEL%-glibc}"
+  if [ "$ALT" != "$LABEL" ]; then
+    echo "fetch_teko: teko-${LABEL}.${ext} absent — falling back to legacy teko-${ALT}.${ext}"
+    gh release download "$TAG" -R "$REPO" -p "teko-${ALT}.${ext}" -D "$DEST"
+    LABEL="$ALT"
+  else
+    echo "fetch_teko: no asset teko-${LABEL}.${ext} in $TAG" >&2
+    exit 1
+  fi
+fi
 if [ "$ext" = zip ]; then
   unzip -o "${DEST}/teko-${LABEL}.zip" -d "$DEST"
 else

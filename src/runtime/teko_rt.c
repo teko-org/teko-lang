@@ -846,8 +846,10 @@ static void *tk_free_take(size_t an) {
 // process exit (tk_regions_free_all). Off (the default): one predicted int compare per alloc.
 // =========================================================================
 #if !defined(_WIN32)
-#include <dlfcn.h>      /* dladdr — call-site symbolization for the obs tables (POSIX-only) */
-#include <execinfo.h>   /* (#148 RA2) backtrace — grand-caller attribution of LARGE push grows */
+#include <dlfcn.h>      /* dladdr — call-site symbolization for the obs tables (POSIX, incl. musl) */
+#endif
+#ifdef TK_HAVE_BACKTRACE
+#include <execinfo.h>   /* (#148 RA2) backtrace — glibc/macOS only; musl has no execinfo */
 #endif
 #define TK_OBS_CAP 16384                       // open-addressed site table (power of two)
 typedef struct { void *ra; unsigned long long bytes, count; } tk_obs_site;
@@ -1826,7 +1828,7 @@ void *tk_slice_push_r(const void *ptr, uint64_t len, const void *elem, uint64_t 
             tk_obs_miss[why] += 1;
             if (cap * esz > (1u << 20)) tk_obs_miss_big[why] += 1;
         }
-#if !defined(_WIN32)
+#ifdef TK_HAVE_BACKTRACE
         if (cap * esz > 4096) {   // (#148 RA2) the expensive grows: attribute the append helper's CALLER
             void *fr[6]; int nf = backtrace(fr, 6);
             int idx = 2 + hop;    // fr[0]=this fn, fr[1]=wrapper|caller, fr[2+hop]=the helper's caller
@@ -1933,7 +1935,7 @@ void *tk_slice_push_fo(const void *ptr, uint64_t len, const void *elem, uint64_t
         if (fo_max >= 0) {
             if (fo_count >= fo_max) return buf;              // parking budget exhausted — plain push
             fo_count += 1;
-#if !defined(_WIN32)
+#ifdef TK_HAVE_BACKTRACE
             if (fo_count == fo_max && getenv("TEKO_FO_TRACE")) {
                 void *fr[8]; int nf = backtrace(fr, 8);
                 fprintf(stderr, "== FO park #%lld ==\n", fo_count);
