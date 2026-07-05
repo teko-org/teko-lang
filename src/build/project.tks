@@ -649,6 +649,34 @@ fn coverage_gate_result(dir: str, fe: Frontend) -> i32 {
     0
 }
 
+/** run_native_gate — (#265, lever D of #249) the D4 test gate run NATIVELY: emit a test-profile C
+ *  translation unit whose `main()` calls each `#test` in order, compile it with the SAME `run_cc`
+ *  the build uses, run the resulting binary (a failed assert panics → non-zero exit, fail-fast M.1),
+ *  and — cov ALWAYS on for the gate, to feed the floors — merge the child's dumped `.tkcov` into
+ *  this process's coverage sinks. The engine-independent static walk (vm::*_coverage_pct) then reads
+ *  those merged sinks exactly as it read the VM's in-process marks. Replaces the 15.6 s VM interpret
+ *  of the test bodies (issue #265 measurement) with a sub-second native run. */
+fn run_native_gate(dir: str, out_dir: str, prog: checker::TProgram, m: Manifest) -> i32 {
+    let od = if out_dir.len > 0 && out_dir[out_dir.len - 1] == b'/' { teko::str::slice_to(out_dir, out_dir.len - 1) } else { out_dir }
+    match teko::fs::mkdir(od) { error => return fail(dir, "cannot create the output directory"); null => {} }
+    let stem = teko::str::concat(m.name, "-tktest")
+    let cfile = teko::str::concat(od, "/", teko::str::concat(stem, ".c"))
+    let binp = teko::str::concat(od, "/", stem)
+    let covfile = teko::str::concat(od, "/", teko::str::concat(stem, ".tkcov"))
+    let emitted = match codegen::tk_emit_c_test(prog, true) { str as s => s; error as e => return fail(dir, e.message) }
+    let csrc = teko::str::concat(emitted, codegen::tk_emit_meta(m.name, m.version, m.suffix, m.description))
+    match teko::io::write_file(cfile, csrc) { error as e => return fail(dir, e.message); null => {} }
+    if run_cc(cfile, binp, m) != 0 {
+        return fail(dir, "cc failed to build the native test gate")
+    }
+    match teko::env::set_var("TEKO_TKCOV", covfile) { error => {}; null => {} }
+    mut argv: []str = teko::list::push(teko::list::empty(), binp)
+    let trc = teko::process::run(argv)
+    if trc != 0 { return trc }
+    let _ = vm::cov_merge(covfile)
+    0
+}
+
 /** The `--coverage` output path ("<out_dir>/cobertura.xml", creating `out_dir` first) when
  *  `gen_cov` is set, else "" (vm::run_tests_cov treats an empty path as "don't write"). */
 fn cobertura_path_of(out_dir: str, gen_cov: bool) -> str {
@@ -670,10 +698,16 @@ fn release_build_of(dir: str, out_dir: str) -> i32 {
  *  (release_build_of). Split out of compile_project_g so the `no_verify` short-circuit stays a
  *  single early return instead of nesting the whole gate one level deeper. */
 fn run_gate(dir: str, out_dir: str, gen_cov: bool, fe: Frontend) -> i32 {
-    let trc = vm::run_tests_cov(fe.prog, true, gen_cov, cobertura_path_of(out_dir, gen_cov))
+    let trc = run_native_gate(dir, out_dir, fe.prog, fe.manifest)
     if trc != 0 { return trc }
     let gate_rc = coverage_gate_result(dir, fe)
     if gate_rc != 0 { return gate_rc }
+    if gen_cov {
+        let xml = vm::cov_cobertura(fe.prog)
+        let cov_path = cobertura_path_of(out_dir, gen_cov)
+        match teko::io::write_file(cov_path, xml) { error => {}; null => {} }
+        teko::io::println(teko::str::concat("teko: wrote coverage report ", cov_path))
+    }
     release_build_of(dir, out_dir)
 }
 

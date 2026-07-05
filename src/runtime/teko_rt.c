@@ -1641,6 +1641,85 @@ bool tk_cov_line_hit(uint64_t fn, uint32_t line) {
     return false;
 }
 
+// D3-cross-process (#265, reuse of the #168 .tkcov protocol) — the native test gate runs the tests in
+// a CHILD process, so its three coverage sinks live in the child. The child dumps them to a `.tkcov`
+// file at exit; the parent (the compiler) MERGES that file into ITS sinks, then runs the same static
+// walk + floors it always ran. The coverage id is the prog.items index in BOTH processes (they share
+// the same TProgram), so the packed branch/line ids are process-portable and just re-inserted.
+// File layout (host byte order — parent and child are the same build): magic "TKCOV1\0\0", then three
+// (count:u64, ids:u64[count]) sections in order fns / branches / lines.
+
+// tk_line_insert_raw — insert a pre-packed line id (from a merge), bypassing the tk_lines_on gate and
+// the fn-stack packing tk_cov_line uses. Same open-addressing set as tk_cov_line.
+static void tk_line_insert_raw(uint64_t id) {
+    if (id == 0) return;
+    if (tk_line_cap == 0) tk_line_rehash(1024);
+    else if (tk_line_n * 2 >= tk_line_cap) tk_line_rehash(tk_line_cap * 2);
+    uint64_t h = (id * 1099511628211ull) & (tk_line_cap - 1);
+    while (tk_line_ids[h]) { if (tk_line_ids[h] == id) return; h = (h + 1) & (tk_line_cap - 1); }
+    tk_line_ids[h] = id; tk_line_n += 1;
+}
+
+static bool tk_cov_write_section(FILE *f, const uint64_t *ids, uint64_t n) {
+    if (fwrite(&n, sizeof n, 1, f) != 1) return false;
+    if (n && fwrite(ids, sizeof *ids, n, f) != n) return false;
+    return true;
+}
+
+void tk_cov_dump(const char *path) {
+    FILE *f = fopen(path, "wb");
+    if (!f) return;
+    static const char magic[8] = { 'T','K','C','O','V','1','\0','\0' };
+    if (fwrite(magic, 1, 8, f) != 8) { fclose(f); return; }
+    (void)tk_cov_write_section(f, tk_cov_ids, tk_cov_n);
+    (void)tk_cov_write_section(f, tk_covb_ids, tk_covb_n);
+    // lines are a sparse hash table — compact the non-empty slots into a temporary contiguous array.
+    uint64_t *lines = NULL;
+    uint64_t ln = 0;
+    if (tk_line_n) {
+        lines = (uint64_t *)malloc(tk_line_n * sizeof *lines);
+        if (lines) {
+            for (uint64_t i = 0; i < tk_line_cap; i += 1) { if (tk_line_ids[i]) lines[ln++] = tk_line_ids[i]; }
+        }
+    }
+    (void)tk_cov_write_section(f, lines, ln);
+    free(lines);
+    fclose(f);
+}
+
+static uint64_t *tk_cov_read_section(FILE *f, uint64_t *out_n) {
+    uint64_t n = 0;
+    *out_n = 0;
+    if (fread(&n, sizeof n, 1, f) != 1) return NULL;
+    if (n == 0) return NULL;
+    uint64_t *ids = (uint64_t *)malloc(n * sizeof *ids);
+    if (!ids) return NULL;
+    if (fread(ids, sizeof *ids, n, f) != n) { free(ids); return NULL; }
+    *out_n = n;
+    return ids;
+}
+
+bool tk_cov_merge(tk_str path) {
+    char *cpath = (char *)tk_cstr_dup(path);
+    FILE *f = fopen(cpath, "rb");
+    free(cpath);
+    if (!f) return false;
+    char magic[8];
+    if (fread(magic, 1, 8, f) != 8 || memcmp(magic, "TKCOV1\0\0", 8) != 0) { fclose(f); return false; }
+    uint64_t n = 0;
+    uint64_t *fns = tk_cov_read_section(f, &n);
+    for (uint64_t i = 0; i < n; i += 1) tk_cov_mark(fns[i]);
+    free(fns);
+    uint64_t *br = tk_cov_read_section(f, &n);
+    for (uint64_t i = 0; i < n; i += 1) tk_covb_add(br[i]);
+    free(br);
+    uint64_t *ln = tk_cov_read_section(f, &n);
+    for (uint64_t i = 0; i < n; i += 1) tk_line_insert_raw(ln[i]);
+    free(ln);
+    fclose(f);
+    return true;
+}
+
 // --- amortized growable push (the teko::list::push lowering — see teko_rt.h) ---
 // Each growing buffer's spare capacity is tracked in a POINTER-KEYED HASH of live tails (single-probe,
 // O(1) lookup). A push to a recorded live tail (same ptr + length witness + element size, spare cap)
