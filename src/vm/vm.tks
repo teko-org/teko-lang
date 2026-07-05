@@ -228,8 +228,9 @@ pub type DeferBody = struct { body: []checker::TStatement }
 pub type Venv = struct { slots: []Slot; prog: checker::TProgram; defers: []DeferBody; cells: []Value; di_cache: []DiCell }
 
 /** (W10c/MEM-3) One cached DI instance in the VM's threaded registry: the type-id (FNV-1a of the
- *  impl's bare name, via the shared checker::di_type_id) → the ClassRef cell holding the instance. A
- *  `#singleton`/`#scoped` materialization consults this before building; `#transient` never does. */
+ *  impl's C-safe canonical symbol, via the shared checker::di_type_id — issue #284) → the ClassRef
+ *  cell holding the instance. A `#singleton`/`#scoped` materialization consults this before building;
+ *  `#transient` never does. */
 type DiCell = struct { type_id: u64; cell: u64 }
 
 // find — newest-first scan so a later binding SHADOWS an earlier one (the checker's rule). The
@@ -2891,33 +2892,34 @@ fn find_class_method(env: Venv, class_name: str, method: str) -> FnHit? {
     null
 }
 
-/** (W10c/MEM-3) The VM's DI materializer — the mirror of codegen's `__di_materialize_<Impl>`. Strip
- *  the prefix to the bare impl name, resolve its lifetime + zero-arg static factory, then build +
- *  cache per lifetime: a `#singleton`/`#scoped` consults the threaded `di_cache` (a hit returns the
- *  same ClassRef, giving shared identity), a `#transient` builds fresh. Keeps VM==native on
- *  construction + identity; DI fixtures never observe destructor timing (the VM fires none). */
-fn vm_di_materialize(callee: str, env: Venv) -> EvalRes {
-    let impl_name = vm_di_impl_name(callee)
-    let kind = vm_di_kind_of(env, impl_name)
-    let id = checker::di_type_id(impl_name)
+/** (W10c/MEM-3) The VM's DI materializer — the mirror of codegen's `__di_materialize_<Impl symbol>`.
+ *  The lowered call carries the impl's FULL canonical name on `call_ns` (issue #284), so the VM keys
+ *  the `di_cache` by the SAME mangled canonical the native id derives from, and resolves the exact
+ *  class + factory even when a same-bare class exists in another namespace. Build + cache per
+ *  lifetime: a `#singleton`/`#scoped` consults the threaded `di_cache` (a hit returns the same
+ *  ClassRef, giving shared identity), a `#transient` builds fresh. Keeps VM==native on construction +
+ *  identity; DI fixtures never observe destructor timing (the VM fires none). */
+fn vm_di_materialize(c: checker::TCall, env: Venv) -> EvalRes {
+    let impl_canon = c.call_ns
+    let kind = vm_di_kind_of(env, impl_canon)
+    let id = checker::di_type_id(checker::mangle_ns_frag(impl_canon))
     match kind {
-        parser::DiKind::Transient => vm_di_build(impl_name, env)
-        _ => vm_di_cached(impl_name, id, env)
+        parser::DiKind::Transient => vm_di_build(impl_canon, env)
+        _ => vm_di_cached(impl_canon, id, env)
     }
 }
 
-/** (W10c/MEM-3) The bare impl name inside a `__di_materialize_<Impl>` callee. */
-fn vm_di_impl_name(callee: str) -> str {
-    teko::str::slice_from(callee, 17)
-}
-
-/** (W10c/MEM-3) The DI lifetime of the class named `impl_name` (its `di_kind`), or None. */
-fn vm_di_kind_of(env: Venv, impl_name: str) -> parser::DiKind {
+/** (W10c/MEM-3) The DI lifetime of the class whose canonical name is `impl_canon` (its `di_kind`),
+ *  or None. A TItem `TypeDecl` is bare (no namespace), so the bare last segment of `impl_canon` is
+ *  matched; a same-bare cousin's lifetime, if it differed, would be disambiguated by the factory
+ *  resolution — but core DI's lifetimes are per-class and this scan only reads the kind. */
+fn vm_di_kind_of(env: Venv, impl_canon: str) -> parser::DiKind {
+    let bare = checker::name_last_segment(impl_canon)
     mut i: u64 = 0
     loop {
         if i >= env.prog.items.len { break }
         match env.prog.items[i] {
-            parser::TypeDecl as td => { if checker::name_last_segment(td.name) == impl_name { return td.di_kind } }
+            parser::TypeDecl as td => { if checker::name_last_segment(td.name) == bare { return td.di_kind } }
             _ => { }
         }
         i++
@@ -2927,12 +2929,12 @@ fn vm_di_kind_of(env: Venv, impl_name: str) -> parser::DiKind {
 
 /** (W10c/MEM-3) A cached (singleton/scoped) materialization: return the already-built instance on a
  *  `di_cache` hit, else build it, cache the ClassRef's cell under the type-id, and return it. */
-fn vm_di_cached(impl_name: str, id: u64, env: Venv) -> EvalRes {
+fn vm_di_cached(impl_canon: str, id: u64, env: Venv) -> EvalRes {
     match vm_di_cache_lookup(env.di_cache, id) {
         u64 as cell => return EvalRes { value = ClassRef { cell = cell }; env = env }
         null => { }
     }
-    let built = vm_di_build(impl_name, env)
+    let built = vm_di_build(impl_canon, env)
     match built.value {
         ClassRef as cr => {
             let cached = teko::list::push(built.env.di_cache, DiCell { type_id = id; cell = cr.cell })
@@ -2958,42 +2960,29 @@ fn vm_with_di_cache(env: Venv, cache: []DiCell) -> Venv {
     Venv { slots = env.slots; prog = env.prog; defers = env.defers; cells = env.cells; di_cache = cache }
 }
 
-/** (W10c/MEM-3) Build one DI instance by invoking the impl's zero-arg static factory (found by
- *  scanning the class's ClassBody), reusing the ordinary call path so the ClassRef is allocated
- *  exactly as a normal `Impl::make()` would. */
-fn vm_di_build(impl_name: str, env: Venv) -> EvalRes {
-    let factory = match vm_di_factory_name(env, impl_name) { str as f => f; null => panic(teko::str::concat("vm: DI class has no zero-argument static factory: ", impl_name)) }
-    let hit = match find_class_method(env, impl_name, factory) { FnHit as h => h; null => panic(teko::str::concat("vm: DI factory not found: ", impl_name)) }
-    let callee = parser::Path { segments = teko::list::push(teko::list::push(teko::list::empty(), parser::Segment { name = impl_name }), parser::Segment { name = factory }) }
+/** (W10c/MEM-3) Build one DI instance by invoking the impl's zero-arg static factory (resolved by an
+ *  EXACT canonical-namespace match, issue #284), reusing the ordinary call path so the ClassRef is
+ *  allocated exactly as a normal `Impl::make()` would — the exact factory even when a same-bare class
+ *  lives in another namespace. */
+fn vm_di_build(impl_canon: str, env: Venv) -> EvalRes {
+    let hit = match vm_di_factory_hit(env, impl_canon) { FnHit as h => h; null => panic(teko::str::concat("vm: DI class has no zero-argument static factory: ", impl_canon)) }
+    let callee = parser::Path { segments = teko::list::push(teko::list::push(teko::list::empty(), parser::Segment { name = checker::name_last_segment(impl_canon) }), parser::Segment { name = hit.func.name }) }
     let call = checker::TCall { callee = callee; args = teko::list::empty(); call_ns = hit.func.namespace; is_closure_call = false; callee_type = checker::Void { }; is_iface_dispatch = false; iface_slot = 0 }
     eval_call(call, env)
 }
 
-/** (W10c/MEM-3) The name of the class's zero-argument static factory, or null. */
-fn vm_di_factory_name(env: Venv, impl_name: str) -> str? {
+/** (issue #284) The impl's zero-argument static factory TFunction, found by an EXACT match on the
+ *  class's canonical namespace (every effective method is stamped under the owning class's canonical
+ *  namespace), in program order — mirroring the checker's `choose_factory` (first zero-arg static).
+ *  A method whose first parameter is typed (or which has none) is static; a receiver is untyped. */
+fn vm_di_factory_hit(env: Venv, impl_canon: str) -> FnHit? {
     mut i: u64 = 0
     loop {
         if i >= env.prog.items.len { break }
         match env.prog.items[i] {
-            parser::TypeDecl as td => {
-                if checker::name_last_segment(td.name) == impl_name {
-                    match td.body { parser::ClassBody as cb => return vm_di_first_static(cb); _ => { } }
-                }
-            }
+            checker::TFunction as tf => { if tf.namespace == impl_canon && tf.params.len == 0 { return FnHit { func = tf; idx = i } } }
             _ => { }
         }
-        i++
-    }
-    null
-}
-
-/** (W10c/MEM-3) The first zero-parameter static method of a class body, or null. */
-fn vm_di_first_static(cb: parser::ClassBody) -> str? {
-    mut i: u64 = 0
-    loop {
-        if i >= cb.methods.len { break }
-        let m = cb.methods[i]
-        if m.params.len == 0 { return m.name }
         i++
     }
     null
@@ -3066,7 +3055,7 @@ fn eval_iface_call(c: checker::TCall, env: Venv) -> StmtVal {
 
 fn eval_call(c: checker::TCall, env: Venv) -> EvalRes {
     if c.callee.segments.len == 1 && checker::is_di_materializer_call(c.callee.segments[0].name) {
-        return vm_di_materialize(c.callee.segments[0].name, env)
+        return vm_di_materialize(c, env)
     }
     // (W10b.D3) dynamic contract dispatch — FIRST, before builtin name-sniffing could collide
     // with a method name. Same guard in call_value (the VM twin-asymmetry rule).
