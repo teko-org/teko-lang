@@ -161,6 +161,8 @@ type RTypeExprs  = struct { r: Reader; value: []parser::TypeExpr }
 type RParams     = struct { r: Reader; value: []parser::Param }
 type RFields     = struct { r: Reader; value: []parser::Field }
 type RStrs       = struct { r: Reader; value: []str }
+type RConstraint  = struct { r: Reader; value: parser::ConstraintExpr }   // (#165 C2)
+type RConstraints = struct { r: Reader; value: []parser::ConstraintExpr } // (#165 C2)
 type RTypeBody   = struct { r: Reader; value: parser::TypeBody }
 type RTypeDecl   = struct { r: Reader; value: parser::TypeDecl }
 type RUseDecl    = struct { r: Reader; value: parser::UseDecl }
@@ -593,6 +595,35 @@ fn read_strs(r: Reader, table: []str) -> RStrs | error {
     mut i = 0
     loop { if i >= n.value { break }; let s = match tkb_read_str(rr, table) { RStr as x => x; error as e => return e }; xs = teko::list::push(xs, s.value); rr = s.r; i++ }
     RStrs { r = rr; value = xs }
+}
+// (#165 C2) a ConstraintExpr: inverse of write_constraint — tag 0 Atom | 1 And | 2 Or | 3 NoConstraint.
+fn read_constraint(r: Reader, table: []str) -> RConstraint | error {
+    let tag = match read_u8(r) { RByte as x => x; error as e => return e }
+    if tag.value == 0 {
+        let nm = match tkb_read_str(tag.r, table) { RStr as x => x; error as e => return e }
+        return RConstraint { r = nm.r; value = parser::ConstraintAtom { name = nm.value } }
+    }
+    if tag.value == 1 {
+        let l = match read_constraint(tag.r, table) { RConstraint as x => x; error as e => return e }
+        let rt = match read_constraint(l.r, table)  { RConstraint as x => x; error as e => return e }
+        return RConstraint { r = rt.r; value = parser::ConstraintAnd { left = l.value; right = rt.value } }
+    }
+    if tag.value == 2 {
+        let l = match read_constraint(tag.r, table) { RConstraint as x => x; error as e => return e }
+        let rt = match read_constraint(l.r, table)  { RConstraint as x => x; error as e => return e }
+        return RConstraint { r = rt.r; value = parser::ConstraintOr { left = l.value; right = rt.value } }
+    }
+    if tag.value == 3 { return RConstraint { r = tag.r; value = parser::NoConstraint { } } }
+    error { message = "bad constraint tag in .tkb" }
+}
+// (#165 C2) a []ConstraintExpr: inverse of write_constraints.
+fn read_constraints(r: Reader, table: []str) -> RConstraints | error {
+    let n = match read_u64(r) { RU64 as x => x; error as e => return e }
+    mut rr = n.r
+    mut xs: []parser::ConstraintExpr = teko::list::empty()
+    mut i = 0
+    loop { if i >= n.value { break }; let c = match read_constraint(rr, table) { RConstraint as x => x; error as e => return e }; xs = teko::list::push(xs, c.value); rr = c.r; i++ }
+    RConstraints { r = rr; value = xs }
 }
 fn read_typebody(r: Reader, table: []str) -> RTypeBody | error {
     let tag = match read_u8(r) { RByte as x => x; error as e => return e }

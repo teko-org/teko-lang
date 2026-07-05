@@ -348,6 +348,49 @@ fn tkb_rejects_v2_program() {
     match deserialize_program(v3) { checker::TProgram as p => teko::assert::is_true(p.items.len == 1); error => teko::assert::is_true(false) }
 }
 
+// (#165 C2) round-trip a ConstraintExpr in isolation through the same-namespace codec helpers
+// (write_constraint/read_constraint) with a fresh string table + Reader — no program frame needed.
+fn roundtrip_constraint(c: parser::ConstraintExpr) -> parser::ConstraintExpr | error {
+    let table = collect_constraint(st_empty(), c)
+    let bytes = write_constraint(write_strtable(teko::list::empty(), table), table, c)
+    let r0 = Reader { data = bytes; pos = 0 }
+    let tbl = match read_strtable(r0) { RTable as x => x; error as e => return e }
+    match read_constraint(tbl.r, tbl.value) { RConstraint as rc => rc.value; error as e => e }
+}
+
+#test
+fn tkb_roundtrip_constraint() {
+    // (#165 C2) `(Ord & Eq) | Clone` + NoConstraint round-trip with exact structure preserved.
+    let ord   = parser::ConstraintAtom { name = "Ord" }
+    let eq    = parser::ConstraintAtom { name = "Eq" }
+    let clone = parser::ConstraintAtom { name = "Clone" }
+    let andc  = parser::ConstraintAnd { left = ord; right = eq }
+    let orc: parser::ConstraintExpr = parser::ConstraintOr { left = andc; right = clone }
+    match roundtrip_constraint(orc) {
+        parser::ConstraintExpr as v => match v {
+            parser::ConstraintOr as o => {
+                match o.left {
+                    parser::ConstraintAnd as an => {
+                        match an.left  { parser::ConstraintAtom as a => teko::assert::is_true(a.name == "Ord"); _ => teko::assert::is_true(false) }
+                        match an.right { parser::ConstraintAtom as a => teko::assert::is_true(a.name == "Eq");  _ => teko::assert::is_true(false) }
+                    }
+                    _ => teko::assert::is_true(false)
+                }
+                match o.right { parser::ConstraintAtom as a => teko::assert::is_true(a.name == "Clone"); _ => teko::assert::is_true(false) }
+            }
+            _ => teko::assert::is_true(false)
+        }
+        error => teko::assert::is_true(false)
+    }
+    match roundtrip_constraint(parser::NoConstraint { }) {
+        parser::ConstraintExpr as v => match v {
+            parser::NoConstraint => teko::assert::is_true(true)
+            _ => teko::assert::is_true(false)
+        }
+        error => teko::assert::is_true(false)
+    }
+}
+
 #test
 fn tkb_roundtrip_matchexpr() {
     // C7.16: `match x { 0 => return 1; Foo as y => return 2; _ => return 3 }` round-trips (match + 3 pattern kinds).
