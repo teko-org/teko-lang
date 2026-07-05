@@ -102,28 +102,33 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install cross-compilation tools and QEMU
+      - name: Install cross-compiler + QEMU + host clang
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y \
-            cmake ninja-build \
-            gcc-riscv64-linux-gnu \
-            qemu-user qemu-user-static \
-            binfmt-support
+          sudo apt-get install -y gcc-riscv64-linux-gnu qemu-user-static clang
 
-      - name: Configure CMake (RISC-V cross)
+      # riscv has no release binary asset, so it can't download a seed like the other
+      # platforms. But it MUST NOT cmake-build from the frozen C twins — those are frozen
+      # historical code (no-mirroring ruling) and diverge from the live `.tks` (e.g. they
+      # lack the #263 enum-vs-PrimKind fix), so a cmake build tests a STALE compiler and
+      # fails on current sources (LIR's `F32` LType tripped exactly that). Instead: seed
+      # the x86_64 released binary, have it EMIT the CURRENT compiler's C (gen-1), and
+      # cross-compile THAT for riscv — testing the same compiler the other platforms run.
+      - name: Provision teko (x86_64 released seed)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./scripts/ci_provision_teko.sh linux-x86_64
+
+      - name: Emit the current compiler's C (gen-1, gate skipped here)
+        run: teko . -o gen1 --no-verify
+
+      - name: Cross-compile gen-1's teko.c for riscv64 (static)
         run: |
-          cmake -S . -B build \
-            -G "Ninja" \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_C_COMPILER=riscv64-linux-gnu-gcc \
-            -DCMAKE_EXE_LINKER_FLAGS="-static"
+          riscv64-linux-gnu-gcc -std=c2x -w -static -Isrc/runtime -Isrc/assert \
+            gen1/teko.c src/runtime/teko_rt.c src/assert/assert.c -lm -o teko-riscv
 
-      - name: Build teko (RISC-V)
-        run: cmake --build build --config Release --target teko --parallel 4
-
-      - name: Run tests via QEMU user-mode
-        run: qemu-riscv64-static ./build/teko test . --coverage
+      - name: Run the gate under QEMU user-mode
+        run: qemu-riscv64-static ./teko-riscv test . --coverage
 
   # ── differential VM==native harness (issue #54) ──────────────────────────────
   # Cross-runs every examples/regressions/* project through BOTH engines (`teko run`
