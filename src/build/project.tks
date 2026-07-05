@@ -686,6 +686,19 @@ fn coverage_gate_result(dir: str, fe: Frontend) -> i32 {
     0
 }
 
+/** native_function_floor — the FUNCTION-coverage floor, the metric the native gate populates fully via
+    the child's per-fn `tk_cov_mark` dump (#265). The native runner marks a fn ENTERED, exactly as the
+    VM's eval_call does; line/branch instrumentation (per-expression `tk_cov_line`/`tk_cov_branch` under
+    TestCov) is not yet emitted, so those two floors are enforced on the VM lane (`teko test .`) that
+    the ratified governance keeps as a required CI job. */
+fn native_function_floor(dir: str, fe: Frontend) -> i32 {
+    let fcov = vm::coverage_pct(fe.prog)
+    if fcov < fe.manifest.cov_functions {
+        return fail(dir, $"function coverage {fcov}% is below the {fe.manifest.cov_functions}% floor ([coverage] functions) — add tests")
+    }
+    0
+}
+
 /** run_native_gate — (#265, lever D of #249) the D4 test gate run NATIVELY: emit a test-profile C
  *  translation unit whose `main()` calls each `#test` in order, compile it with the SAME `run_cc`
  *  the build uses, run the resulting binary (a failed assert panics → non-zero exit, fail-fast M.1),
@@ -730,14 +743,16 @@ fn release_build_of(dir: str, out_dir: str) -> i32 {
     codegen_and_report(dir, out_dir, strip_tests(rel.prog), rel.manifest)
 }
 
-/** The D4 test-gate body proper: run every `#test` on the VM (fail-fast), enforce the coverage
- *  floors (coverage_gate_result), then rebuild the release program without the `.tkt` files
- *  (release_build_of). Split out of compile_project_g so the `no_verify` short-circuit stays a
- *  single early return instead of nesting the whole gate one level deeper. */
+/** The D4 test-gate body proper (#265): run every `#test` NATIVELY (run_native_gate, fail-fast),
+ *  enforce the FUNCTION-coverage floor from the native run's merged marks (native_function_floor),
+ *  then rebuild the release program without the `.tkt` files (release_build_of). The line/branch
+ *  floors are enforced on the VM lane (`teko test .`, test_project → coverage_gate_result), which the
+ *  ratified governance keeps as a required CI job. Split out of compile_project_g so the `no_verify`
+ *  short-circuit stays a single early return instead of nesting the whole gate one level deeper. */
 fn run_gate(dir: str, out_dir: str, gen_cov: bool, fe: Frontend) -> i32 {
     let trc = run_native_gate(dir, out_dir, fe.prog, fe.manifest)
     if trc != 0 { return trc }
-    let gate_rc = coverage_gate_result(dir, fe)
+    let gate_rc = native_function_floor(dir, fe)
     if gate_rc != 0 { return gate_rc }
     if gen_cov {
         let xml = vm::cov_cobertura(fe.prog)
@@ -870,5 +885,7 @@ fn run_project(dir: str) -> i32 {
 // since the front-end has chdir'd into the project; `teko test` has no `-o` output dir).
 fn test_project(dir: str, gen_cov: bool) -> i32 {
     let fe = match project_frontend_sel(dir, true) { Frontend as x => x; error as e => return fail(dir, e.message) }
-    if gen_cov { vm::run_tests_cov(fe.prog, true, true, "cobertura.xml") } else { vm::run_tests(fe.prog) }
+    let trc = if gen_cov { vm::run_tests_cov(fe.prog, true, true, "cobertura.xml") } else { vm::run_tests_cov(fe.prog, true, false, "") }
+    if trc != 0 { return trc }
+    coverage_gate_result(dir, fe)
 }
