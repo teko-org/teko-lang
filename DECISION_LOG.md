@@ -98,3 +98,41 @@ corrompido; só CLEAN.
 - **Base:** correção de portabilidade necessária para D1; sem mudança de comportamento em
   macOS/glibc/Windows. `dladdr`/dlfcn (existe no musl) fica sob `!_WIN32`.
 - **Reversível:** sim, mas reverter re-quebra o musl.
+
+---
+
+## 2026-07-05 — Fix do release + validação sem qemu (PR ci/fix-zig-riscv, 0.0.1.24)
+
+Contexto: o release 0.0.1.23 (primeiro de 9 targets) FALHOU no `build-linux` — o zig **0.13.0**
+tem o glibc de riscv64 incompleto (falta `gnu/stubs-lp64d.h`), quebrando `linux-riscv64-glibc`.
+Causa raiz do meu erro: validei local com zig **0.16.0** mas pinei **0.13.0** no CI (versões
+diferentes). O #277 já estava mergeado → correção via novo PR (nunca direto na main).
+
+### D1 (adendo) · Versão do zig = **0.16.0** (a que atende TODOS os targets) ✅
+- **Aplicada:** `ZIG_VERSION=0.16.0`. **Busca definitiva** (não tentativa-erro): 0.16.0 é o
+  stable mais recente E seu tarball contém `riscv-linux-gnu/gnu/stubs-lp64d.h` (confirmado por
+  `tar -tJf`; 0.13.0 NÃO tem). Compila os 6 targets (validado local no 0.16 + download/versão
+  conferidos em container linux/amd64). Corrigido também o nome do tarball: 0.14.1+ usa
+  `zig-x86_64-linux-<v>` (os/arch trocados vs o formato antigo `zig-linux-x86_64-<v>`).
+- **Alternativas:** 0.13.0/0.14.0 (riscv glibc incompleto/incerto — descartados por evidência).
+- **Fallback futuro (diretriz do dono):** se o zig algum dia NÃO atender um target, usar o `cc`
+  específico da arquitetura/SO para aquele target (por-arch), mantendo zig para os demais.
+
+### D10 · Smoke de cross-compile no CI de PR (`release-cross-smoke`) ✅
+- **Aplicada:** novo job em `native.yml` roda o MESMO `scripts/cross_compile_linux.sh` (extraído
+  do release, fonte única — sem drift) em modo `smoke`: emite teko.c e cross-compila os 6 Linux,
+  conferindo a arquitetura de cada um. Bloqueante no `gate`.
+- **Por quê:** `release.yml` é disparado por tag, então sua parte Linux não rodava no CI de PR —
+  foi por isso que a quebra do 0.13.0 só apareceu PÓS-merge. Agora uma quebra de release
+  (versão do zig / target / portabilidade do runtime) gateia o merge. Custa ~1 runner de compile
+  por PR relevante; o dono priorizou não publicar release quebrado.
+- **Reversível:** sim.
+
+### D11 · Validação por COMPILE + arquitetura, SEM qemu (diretriz do dono) ✅
+- **Aplicada:** para validar os binários cross NÃO se roda o binário sob qemu; cross-compile é
+  determinístico, então **compilar com sucesso o teko.c (que é o fixpoint byte-idêntico provado
+  pelo CI) + conferir a arquitetura via `file`** É o argumento de correção. Removido o smoke por
+  qemu que eu vinha usando.
+- **Base:** diretriz do dono ("se tem cross-compile, não precisa qemu; verifica por paridade de
+  byte") — o C é o mesmo fixpoint; a tradução C→binário por target é determinística.
+- **Reversível:** sim (readicionar execução sob qemu se algum dia quisermos runtime-check real).
