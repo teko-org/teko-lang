@@ -17,8 +17,15 @@ fn pos_names(n: u64) -> []str {
     loop { if i >= n { break }; out = teko::list::push(out, ""); i++ }
     out
 }
-fn st(e: parser::Expr) -> parser::Statement { parser::ExprStmt { expr = e } }   // an expr-statement
+/** st — an expr-statement wrapping `e`, widened to the `Statement` variant. */
+fn st(e: parser::Expr) -> parser::Statement { parser::ExprStmt { expr = e } }
 fn one_stmt(e: parser::Expr) -> []parser::Statement { teko::list::push(teko::list::empty(), st(e)) }
+/** ret_stmt — a `return e` statement widened to the `Statement` variant, so a `[]Statement` built
+    from it carries the correct element type (native codegen keys a slice's element type on the
+    pushed value's type; #265's native gate cc-compiles these test bodies for the first time). */
+fn ret_stmt(e: parser::Expr) -> parser::Statement { parser::Return { has_value = true; value = e } }
+/** loop_stmt — a `loop { body }` statement widened to the `Statement` variant (see ret_stmt). */
+fn loop_stmt(body: []parser::Statement) -> parser::Statement { parser::LoopStmt { label = ""; body = body } }
 fn path1(name: str) -> parser::Path { parser::Path { segments = teko::list::push(teko::list::empty(), parser::Segment { name = name }) } }
 fn named_t(name: str) -> parser::TypeExpr { parser::NamedType { path = path1(name); args = teko::list::empty() } }
 
@@ -533,13 +540,13 @@ fn retype_literal_plain_leaf_unchanged_from_68() {
 fn return_type_checks() {
     let body1 = one_stmt(e_var("x"))
     match type_function(mk_fn("f", named_t("u32"), body1), empty_env(), empty_table()) { TFunction => teko::assert::is_true(true); error => teko::assert::is_true(false) }
-    let body2: []parser::Statement = teko::list::push(teko::list::empty(), parser::Return { has_value = true; value = e_var("x") })
+    let body2: []parser::Statement = teko::list::push(teko::list::empty(), ret_stmt(e_var("x")))
     match type_function(mk_fn("f", named_t("u32"), body2), empty_env(), empty_table()) { TFunction => teko::assert::is_true(true); error => teko::assert::is_true(false) }
-    let loopbody: []parser::Statement = teko::list::push(teko::list::empty(), parser::Return { has_value = true; value = e_var("x") })
-    let body3: []parser::Statement = teko::list::push(teko::list::empty(), parser::LoopStmt { label = ""; body = loopbody })
+    let loopbody: []parser::Statement = teko::list::push(teko::list::empty(), ret_stmt(e_var("x")))
+    let body3: []parser::Statement = teko::list::push(teko::list::empty(), loop_stmt(loopbody))
     match type_function(mk_fn("f", named_t("u32"), body3), empty_env(), empty_table()) { TFunction => teko::assert::is_true(true); error => teko::assert::is_true(false) }
     let umembers: []parser::TypeExpr = teko::list::push(teko::list::push(teko::list::empty(), named_t("u32")), named_t("error"))
-    let body4: []parser::Statement = teko::list::push(teko::list::empty(), parser::Return { has_value = true; value = e_var("x") })
+    let body4: []parser::Statement = teko::list::push(teko::list::empty(), ret_stmt(e_var("x")))
     match type_function(mk_fn("f", parser::UnionType { members = umembers }, body4), empty_env(), empty_table()) { TFunction => teko::assert::is_true(true); error => teko::assert::is_true(false) }
 }
 

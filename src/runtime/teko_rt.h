@@ -450,6 +450,12 @@ void     tk_cov_line_reset(void);
 void     tk_cov_line(uint32_t line);                       // mark a line as executed (current fn)
 bool     tk_cov_line_hit(uint64_t fn, uint32_t line);      // report query
 
+// #265 — cross-process coverage merge for the NATIVE test gate. The child test binary dumps its three
+// sinks to a `.tkcov` file at exit; the compiler (parent) merges them, then runs the unchanged static
+// walk + floors. The coverage id is the shared prog.items index, so the packed ids are portable.
+void     tk_cov_dump(const char *path);    // write the three sinks to a `.tkcov` file (child, cov-on)
+bool     tk_cov_merge(tk_str path);        // union a `.tkcov` into this process's sinks (parent)
+
 // tk_slice_push — the AMORTIZED lowering of `teko::list::push` (a `[]T` grow-by-one). The
 // language keeps value semantics (fixed slices, copy-to-grow — collections #2); this is purely a
 // codegen optimization so a LINEAR `b = push(b, x)` chain (the codegen output buffer is 1.4MB+
