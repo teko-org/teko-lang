@@ -1,0 +1,2225 @@
+/**
+ * `math::checked` (M1) — the integer-arithmetic-mode unit of `teko::math`. Per
+ * TEKO_ROADMAP_MATH.md §M1 and issue #185: three families, for each integer width this unit
+ * ships (u8/u16/u32/u64, i8/i16/i32/i64). `checked_*` -> `T | error` (overflow / divide-by-zero
+ * / shift-out-of-range is a RETURNED error, never a panic, independent of the TEKO_OVERFLOW_DEBUG
+ * build knob). `wrapping_*` -> `T` (two's-complement modular wraparound, total). `saturating_*`
+ * -> `T` (clamp to the type's MIN / MAX, total).
+ *
+ * WHOLE-UNIT GROUND RULE (roadmap §0): named functions, no operators; errors are values;
+ * domain / edge failures return `T | error`, never panic. `checked_*` is `T | error` (a variant
+ * carrying the CAUSE), not `T?` — the error domain, not the absence domain (disjoint-domain
+ * law). `wrapping_*` / `saturating_*` are total and return `T` bare (no `match`, no error
+ * branch); that total branchless shape is what constant-time crypto math (#194) and the bigint
+ * limb-carry paths (#187) consume.
+ *
+ * PURE TEKO, ZERO COMPILER SURFACE, ZERO UNDEFINED BEHAVIOR. Two facts shape every function:
+ * (1) the `to` cast TRAPS out of range in BOTH engines, so `wrapping_*` cannot compute-wide-
+ * then-cast-down (it would panic on the very overflow it absorbs) — wrap is done by bit
+ * operations at the target width. (2) Signed `+`/`-`/`*` in the emitted C is UB on overflow, so
+ * signed wrapping is routed through the same-width UNSIGNED domain (where `+`/`-`/`*` is defined
+ * modular in C) and the bit pattern reinterpreted back via `uN_bits_of_iN` / `iN_from_uN_bits`,
+ * which use in-range subtractions only (mirroring the VM's `norm_int`, so both engines agree
+ * bit-for-bit).
+ *
+ * WIDTH SCOPE (128-bit deferred). The 8 widths here are exactly the set issue #185 enumerates.
+ * The 128-bit widths (u128/i128) are intentionally NOT shipped yet: the released VM's `norm_int`
+ * (src/vm/vm.tks) reinterprets a `u128` value via a trapping `raw to u128`, which PANICS for any
+ * `u128` whose high bit is set (e.g. `u128::MAX`, `2^127`), so a `u128` family cannot pass the VM
+ * side of the test gate. The native engine handles it correctly; the divergence is a VM defect,
+ * reported for a separate fix. Once the VM reinterpret is corrected, u128/i128 are a mechanical
+ * extension of this same file (the signed reinterpret pair below already generalizes to 128).
+ *
+ * PER-WIDTH FAMILY (not generic). Operating on a generic `T` with `+`/`<`/`/` needs S6
+ * (constraint-gated operators), designed but not implemented — the same reason `teko::math`'s
+ * min/max/clamp ship per-type. A single generic entry point is a mechanical follow-up once S6
+ * lands; this is flagged, not silently narrowed.
+ *
+ * This first declaration, `checked_error`, is the single home for the three failure causes this
+ * unit reports (overflow, divide-by-zero, shift-out-of-range) so every `checked_*` function names
+ * the barrier the same way (M.3 — name the barrier; M.5 — one source of truth).
+ *
+ * @param reason  the human-readable cause of the checked failure
+ * @return        an `error` whose `message` is `reason`
+ */
+fn checked_error(reason: str) -> error { error { message = reason } }
+
+/**
+ * The minimum value of `u8` — zero (every unsigned type's floor).
+ *
+ * @return      `0` typed as `u8`
+ */
+pub fn u8_min() -> u8 { 0 to u8 }
+
+/**
+ * The maximum value of `u8` (2^8 - 1), constructed as `~0` (all bits set) — one uniform, width-agnostic form for every unsigned ceiling.
+ *
+ * @return      `u8::MAX`
+ */
+pub fn u8_max() -> u8 { ~(0 to u8) }
+
+/**
+ * Add `a + b` as `u8`, erroring instead of wrapping on overflow.
+ *
+ * @param a  the augend
+ * @param b  the addend
+ * @return      `a + b` as `u8`, or an `error` if the sum exceeds `u8::MAX`
+ * @throws      when `a > u8::MAX - b`
+ */
+pub fn checked_add_u8(a: u8, b: u8) -> u8 | error {
+    if a > u8_max() - b { return checked_error("math::checked_add_u8: overflow") }
+    a + b
+}
+
+/**
+ * Subtract `a - b` as `u8`, erroring instead of wrapping on unsigned underflow.
+ *
+ * @param a  the minuend
+ * @param b  the subtrahend
+ * @return      `a - b` as `u8`, or an `error` if `b > a`
+ * @throws      when `b > a` (the difference would be negative, impossible for `u8`)
+ */
+pub fn checked_sub_u8(a: u8, b: u8) -> u8 | error {
+    if b > a { return checked_error("math::checked_sub_u8: underflow") }
+    a - b
+}
+
+/**
+ * Multiply `a * b` as `u8`, erroring instead of wrapping on overflow.
+ *
+ * Zero operands never overflow; otherwise the product overflows iff `b > u8::MAX / a`.
+ *
+ * @param a  the multiplicand
+ * @param b  the multiplier
+ * @return      `a * b` as `u8`, or an `error` if the product exceeds `u8::MAX`
+ * @throws      when `a != 0` and `b > u8::MAX / a`
+ */
+pub fn checked_mul_u8(a: u8, b: u8) -> u8 | error {
+    if a == u8_min() || b == u8_min() { return u8_min() }
+    if b > u8_max() / a { return checked_error("math::checked_mul_u8: overflow") }
+    a * b
+}
+
+/**
+ * Divide `a / b` as `u8`, erroring on a zero divisor (never a panic).
+ *
+ * @param a  the dividend
+ * @param b  the divisor
+ * @return      `a / b` as `u8`, or an `error` if `b == 0`
+ * @throws      when `b == 0` (division by zero)
+ */
+pub fn checked_div_u8(a: u8, b: u8) -> u8 | error {
+    if b == u8_min() { return checked_error("math::checked_div_u8: divide by zero") }
+    a / b
+}
+
+/**
+ * Remainder `a % b` as `u8`, erroring on a zero divisor (never a panic).
+ *
+ * @param a  the dividend
+ * @param b  the divisor
+ * @return      `a % b` as `u8`, or an `error` if `b == 0`
+ * @throws      when `b == 0` (division by zero)
+ */
+pub fn checked_rem_u8(a: u8, b: u8) -> u8 | error {
+    if b == u8_min() { return checked_error("math::checked_rem_u8: divide by zero") }
+    a % b
+}
+
+/**
+ * Negate `a` as `u8`. Only `0` negates within an unsigned type; any nonzero value has no representable negative.
+ *
+ * @param a  the value to negate
+ * @return      `0` when `a == 0`, otherwise an `error`
+ * @throws      when `a != 0` (an unsigned type has no negative values)
+ */
+pub fn checked_neg_u8(a: u8) -> u8 | error {
+    if a == u8_min() { return u8_min() }
+    checked_error("math::checked_neg_u8: unsigned negation of a nonzero value")
+}
+
+/**
+ * Raise `base` to `exp` as `u8` by squaring, erroring instead of wrapping on overflow. `base^0 == 1` (the empty product).
+ *
+ * @param base  the base
+ * @param power  the exponent (non-negative by `u32` type)
+ * @return      `base^exp` as `u8`, or an `error` if any intermediate overflows
+ * @throws      when a partial product exceeds `u8::MAX`
+ */
+pub fn checked_pow_u8(base: u8, power: u32) -> u8 | error {
+    mut result: u8 = (1 to u8)
+    mut b = base
+    mut e = power
+    loop {
+        if e == 0 { break }
+        if e % 2 == 1 {
+            match checked_mul_u8(result, b) {
+                u8 as v => { result = v }
+                error as err => return err
+            }
+        }
+        e = e / 2
+        if e != 0 {
+            match checked_mul_u8(b, b) {
+                u8 as v => { b = v }
+                error as err => return err
+            }
+        }
+    }
+    result
+}
+
+/**
+ * Shift `a` left by `count` bits as `u8`, erroring when `count >= 8` (distinct from `wrapping_shl`, which masks the count).
+ *
+ * @param a  the value to shift
+ * @param count  the shift amount in bits
+ * @return      `a << count` as `u8`, or an `error` if `count >= 8`
+ * @throws      when `count >= 8`
+ */
+pub fn checked_shl_u8(a: u8, count: u32) -> u8 | error {
+    if count >= 8 { return checked_error("math::checked_shl_u8: shift out of range") }
+    a << (count to u8)
+}
+
+/**
+ * Shift `a` right by `count` bits as `u8` (logical), erroring when `count >= 8` (distinct from `wrapping_shr`, which masks the count).
+ *
+ * @param a  the value to shift
+ * @param count  the shift amount in bits
+ * @return      `a >> count` as `u8`, or an `error` if `count >= 8`
+ * @throws      when `count >= 8`
+ */
+pub fn checked_shr_u8(a: u8, count: u32) -> u8 | error {
+    if count >= 8 { return checked_error("math::checked_shr_u8: shift out of range") }
+    a >> (count to u8)
+}
+
+/**
+ * Wrapping `a + b` as `u8` — the sum modulo 2^8. The unsigned `+` in the emitted C is already defined modular, so this is a bare operation. Total.
+ *
+ * @param a  the left operand
+ * @param b  the right operand
+ * @return      `(a + b) mod 2^8` as `u8`
+ */
+pub fn wrapping_add_u8(a: u8, b: u8) -> u8 { a + b }
+
+/**
+ * Wrapping `a - b` as `u8` — the difference modulo 2^8. The unsigned `-` in the emitted C is already defined modular, so this is a bare operation. Total.
+ *
+ * @param a  the left operand
+ * @param b  the right operand
+ * @return      `(a - b) mod 2^8` as `u8`
+ */
+pub fn wrapping_sub_u8(a: u8, b: u8) -> u8 { a - b }
+
+/**
+ * Wrapping `a * b` as `u8` — the product modulo 2^8. The unsigned `*` in the emitted C is already defined modular, so this is a bare operation. Total.
+ *
+ * @param a  the left operand
+ * @param b  the right operand
+ * @return      `(a * b) mod 2^8` as `u8`
+ */
+pub fn wrapping_mul_u8(a: u8, b: u8) -> u8 { a * b }
+
+/**
+ * Wrapping negation of `a` as `u8` — `(0 - a) mod 2^8` (`0` maps to `0`). Total; the unsigned subtraction is defined modular.
+ *
+ * @param a  the value to negate
+ * @return      `(0 - a) mod 2^8` as `u8`
+ */
+pub fn wrapping_neg_u8(a: u8) -> u8 { u8_min() - a }
+
+/**
+ * Wrapping left shift of `a` by `count` bits as `u8`; the count is masked to `count mod 8` (the #49/#61 shift semantics), so it never traps. Total.
+ *
+ * @param a  the value to shift
+ * @param count  the shift amount (masked to `mod 8`)
+ * @return      `a << (count mod 8)` as `u8`
+ */
+pub fn wrapping_shl_u8(a: u8, count: u32) -> u8 { a << ((count % 8) to u8) }
+
+/**
+ * Wrapping right shift of `a` by `count` bits as `u8` (logical); the count is masked to `count mod 8` (the #49/#61 shift semantics). Total.
+ *
+ * @param a  the value to shift
+ * @param count  the shift amount (masked to `mod 8`)
+ * @return      `a >> (count mod 8)` as `u8`
+ */
+pub fn wrapping_shr_u8(a: u8, count: u32) -> u8 { a >> ((count % 8) to u8) }
+
+/**
+ * Saturating `a + b` as `u8` — clamps to `u8::MAX` on overflow instead of wrapping or erroring. Total.
+ *
+ * @param a  the augend
+ * @param b  the addend
+ * @return      `a + b`, or `u8::MAX` if the sum would overflow
+ */
+pub fn saturating_add_u8(a: u8, b: u8) -> u8 {
+    if a > u8_max() - b { return u8_max() }
+    a + b
+}
+
+/**
+ * Saturating `a - b` as `u8` — clamps to `0` on underflow instead of wrapping or erroring. Total.
+ *
+ * @param a  the minuend
+ * @param b  the subtrahend
+ * @return      `a - b`, or `0` if `b > a`
+ */
+pub fn saturating_sub_u8(a: u8, b: u8) -> u8 {
+    if b > a { return u8_min() }
+    a - b
+}
+
+/**
+ * Saturating `a * b` as `u8` — clamps to `u8::MAX` on overflow. Total.
+ *
+ * @param a  the multiplicand
+ * @param b  the multiplier
+ * @return      `a * b`, or `u8::MAX` if the product would overflow
+ */
+pub fn saturating_mul_u8(a: u8, b: u8) -> u8 {
+    if a == u8_min() || b == u8_min() { return u8_min() }
+    if b > u8_max() / a { return u8_max() }
+    a * b
+}
+
+/**
+ * The minimum value of `u16` — zero (every unsigned type's floor).
+ *
+ * @return      `0` typed as `u16`
+ */
+pub fn u16_min() -> u16 { 0 to u16 }
+
+/**
+ * The maximum value of `u16` (2^16 - 1), constructed as `~0` (all bits set) — one uniform, width-agnostic form for every unsigned ceiling.
+ *
+ * @return      `u16::MAX`
+ */
+pub fn u16_max() -> u16 { ~(0 to u16) }
+
+/**
+ * Add `a + b` as `u16`, erroring instead of wrapping on overflow.
+ *
+ * @param a  the augend
+ * @param b  the addend
+ * @return      `a + b` as `u16`, or an `error` if the sum exceeds `u16::MAX`
+ * @throws      when `a > u16::MAX - b`
+ */
+pub fn checked_add_u16(a: u16, b: u16) -> u16 | error {
+    if a > u16_max() - b { return checked_error("math::checked_add_u16: overflow") }
+    a + b
+}
+
+/**
+ * Subtract `a - b` as `u16`, erroring instead of wrapping on unsigned underflow.
+ *
+ * @param a  the minuend
+ * @param b  the subtrahend
+ * @return      `a - b` as `u16`, or an `error` if `b > a`
+ * @throws      when `b > a` (the difference would be negative, impossible for `u16`)
+ */
+pub fn checked_sub_u16(a: u16, b: u16) -> u16 | error {
+    if b > a { return checked_error("math::checked_sub_u16: underflow") }
+    a - b
+}
+
+/**
+ * Multiply `a * b` as `u16`, erroring instead of wrapping on overflow.
+ *
+ * Zero operands never overflow; otherwise the product overflows iff `b > u16::MAX / a`.
+ *
+ * @param a  the multiplicand
+ * @param b  the multiplier
+ * @return      `a * b` as `u16`, or an `error` if the product exceeds `u16::MAX`
+ * @throws      when `a != 0` and `b > u16::MAX / a`
+ */
+pub fn checked_mul_u16(a: u16, b: u16) -> u16 | error {
+    if a == u16_min() || b == u16_min() { return u16_min() }
+    if b > u16_max() / a { return checked_error("math::checked_mul_u16: overflow") }
+    a * b
+}
+
+/**
+ * Divide `a / b` as `u16`, erroring on a zero divisor (never a panic).
+ *
+ * @param a  the dividend
+ * @param b  the divisor
+ * @return      `a / b` as `u16`, or an `error` if `b == 0`
+ * @throws      when `b == 0` (division by zero)
+ */
+pub fn checked_div_u16(a: u16, b: u16) -> u16 | error {
+    if b == u16_min() { return checked_error("math::checked_div_u16: divide by zero") }
+    a / b
+}
+
+/**
+ * Remainder `a % b` as `u16`, erroring on a zero divisor (never a panic).
+ *
+ * @param a  the dividend
+ * @param b  the divisor
+ * @return      `a % b` as `u16`, or an `error` if `b == 0`
+ * @throws      when `b == 0` (division by zero)
+ */
+pub fn checked_rem_u16(a: u16, b: u16) -> u16 | error {
+    if b == u16_min() { return checked_error("math::checked_rem_u16: divide by zero") }
+    a % b
+}
+
+/**
+ * Negate `a` as `u16`. Only `0` negates within an unsigned type; any nonzero value has no representable negative.
+ *
+ * @param a  the value to negate
+ * @return      `0` when `a == 0`, otherwise an `error`
+ * @throws      when `a != 0` (an unsigned type has no negative values)
+ */
+pub fn checked_neg_u16(a: u16) -> u16 | error {
+    if a == u16_min() { return u16_min() }
+    checked_error("math::checked_neg_u16: unsigned negation of a nonzero value")
+}
+
+/**
+ * Raise `base` to `exp` as `u16` by squaring, erroring instead of wrapping on overflow. `base^0 == 1` (the empty product).
+ *
+ * @param base  the base
+ * @param power  the exponent (non-negative by `u32` type)
+ * @return      `base^exp` as `u16`, or an `error` if any intermediate overflows
+ * @throws      when a partial product exceeds `u16::MAX`
+ */
+pub fn checked_pow_u16(base: u16, power: u32) -> u16 | error {
+    mut result: u16 = (1 to u16)
+    mut b = base
+    mut e = power
+    loop {
+        if e == 0 { break }
+        if e % 2 == 1 {
+            match checked_mul_u16(result, b) {
+                u16 as v => { result = v }
+                error as err => return err
+            }
+        }
+        e = e / 2
+        if e != 0 {
+            match checked_mul_u16(b, b) {
+                u16 as v => { b = v }
+                error as err => return err
+            }
+        }
+    }
+    result
+}
+
+/**
+ * Shift `a` left by `count` bits as `u16`, erroring when `count >= 16` (distinct from `wrapping_shl`, which masks the count).
+ *
+ * @param a  the value to shift
+ * @param count  the shift amount in bits
+ * @return      `a << count` as `u16`, or an `error` if `count >= 16`
+ * @throws      when `count >= 16`
+ */
+pub fn checked_shl_u16(a: u16, count: u32) -> u16 | error {
+    if count >= 16 { return checked_error("math::checked_shl_u16: shift out of range") }
+    a << (count to u16)
+}
+
+/**
+ * Shift `a` right by `count` bits as `u16` (logical), erroring when `count >= 16` (distinct from `wrapping_shr`, which masks the count).
+ *
+ * @param a  the value to shift
+ * @param count  the shift amount in bits
+ * @return      `a >> count` as `u16`, or an `error` if `count >= 16`
+ * @throws      when `count >= 16`
+ */
+pub fn checked_shr_u16(a: u16, count: u32) -> u16 | error {
+    if count >= 16 { return checked_error("math::checked_shr_u16: shift out of range") }
+    a >> (count to u16)
+}
+
+/**
+ * Wrapping `a + b` as `u16` — the sum modulo 2^16. The unsigned `+` in the emitted C is already defined modular, so this is a bare operation. Total.
+ *
+ * @param a  the left operand
+ * @param b  the right operand
+ * @return      `(a + b) mod 2^16` as `u16`
+ */
+pub fn wrapping_add_u16(a: u16, b: u16) -> u16 { a + b }
+
+/**
+ * Wrapping `a - b` as `u16` — the difference modulo 2^16. The unsigned `-` in the emitted C is already defined modular, so this is a bare operation. Total.
+ *
+ * @param a  the left operand
+ * @param b  the right operand
+ * @return      `(a - b) mod 2^16` as `u16`
+ */
+pub fn wrapping_sub_u16(a: u16, b: u16) -> u16 { a - b }
+
+/**
+ * Wrapping `a * b` as `u16` — the product modulo 2^16. The unsigned `*` in the emitted C is already defined modular, so this is a bare operation. Total.
+ *
+ * @param a  the left operand
+ * @param b  the right operand
+ * @return      `(a * b) mod 2^16` as `u16`
+ */
+pub fn wrapping_mul_u16(a: u16, b: u16) -> u16 { a * b }
+
+/**
+ * Wrapping negation of `a` as `u16` — `(0 - a) mod 2^16` (`0` maps to `0`). Total; the unsigned subtraction is defined modular.
+ *
+ * @param a  the value to negate
+ * @return      `(0 - a) mod 2^16` as `u16`
+ */
+pub fn wrapping_neg_u16(a: u16) -> u16 { u16_min() - a }
+
+/**
+ * Wrapping left shift of `a` by `count` bits as `u16`; the count is masked to `count mod 16` (the #49/#61 shift semantics), so it never traps. Total.
+ *
+ * @param a  the value to shift
+ * @param count  the shift amount (masked to `mod 16`)
+ * @return      `a << (count mod 16)` as `u16`
+ */
+pub fn wrapping_shl_u16(a: u16, count: u32) -> u16 { a << ((count % 16) to u16) }
+
+/**
+ * Wrapping right shift of `a` by `count` bits as `u16` (logical); the count is masked to `count mod 16` (the #49/#61 shift semantics). Total.
+ *
+ * @param a  the value to shift
+ * @param count  the shift amount (masked to `mod 16`)
+ * @return      `a >> (count mod 16)` as `u16`
+ */
+pub fn wrapping_shr_u16(a: u16, count: u32) -> u16 { a >> ((count % 16) to u16) }
+
+/**
+ * Saturating `a + b` as `u16` — clamps to `u16::MAX` on overflow instead of wrapping or erroring. Total.
+ *
+ * @param a  the augend
+ * @param b  the addend
+ * @return      `a + b`, or `u16::MAX` if the sum would overflow
+ */
+pub fn saturating_add_u16(a: u16, b: u16) -> u16 {
+    if a > u16_max() - b { return u16_max() }
+    a + b
+}
+
+/**
+ * Saturating `a - b` as `u16` — clamps to `0` on underflow instead of wrapping or erroring. Total.
+ *
+ * @param a  the minuend
+ * @param b  the subtrahend
+ * @return      `a - b`, or `0` if `b > a`
+ */
+pub fn saturating_sub_u16(a: u16, b: u16) -> u16 {
+    if b > a { return u16_min() }
+    a - b
+}
+
+/**
+ * Saturating `a * b` as `u16` — clamps to `u16::MAX` on overflow. Total.
+ *
+ * @param a  the multiplicand
+ * @param b  the multiplier
+ * @return      `a * b`, or `u16::MAX` if the product would overflow
+ */
+pub fn saturating_mul_u16(a: u16, b: u16) -> u16 {
+    if a == u16_min() || b == u16_min() { return u16_min() }
+    if b > u16_max() / a { return u16_max() }
+    a * b
+}
+
+/**
+ * The minimum value of `u32` — zero (every unsigned type's floor).
+ *
+ * @return      `0` typed as `u32`
+ */
+pub fn u32_min() -> u32 { 0 to u32 }
+
+/**
+ * The maximum value of `u32` (2^32 - 1), constructed as `~0` (all bits set) — one uniform, width-agnostic form for every unsigned ceiling.
+ *
+ * @return      `u32::MAX`
+ */
+pub fn u32_max() -> u32 { ~(0 to u32) }
+
+/**
+ * Add `a + b` as `u32`, erroring instead of wrapping on overflow.
+ *
+ * @param a  the augend
+ * @param b  the addend
+ * @return      `a + b` as `u32`, or an `error` if the sum exceeds `u32::MAX`
+ * @throws      when `a > u32::MAX - b`
+ */
+pub fn checked_add_u32(a: u32, b: u32) -> u32 | error {
+    if a > u32_max() - b { return checked_error("math::checked_add_u32: overflow") }
+    a + b
+}
+
+/**
+ * Subtract `a - b` as `u32`, erroring instead of wrapping on unsigned underflow.
+ *
+ * @param a  the minuend
+ * @param b  the subtrahend
+ * @return      `a - b` as `u32`, or an `error` if `b > a`
+ * @throws      when `b > a` (the difference would be negative, impossible for `u32`)
+ */
+pub fn checked_sub_u32(a: u32, b: u32) -> u32 | error {
+    if b > a { return checked_error("math::checked_sub_u32: underflow") }
+    a - b
+}
+
+/**
+ * Multiply `a * b` as `u32`, erroring instead of wrapping on overflow.
+ *
+ * Zero operands never overflow; otherwise the product overflows iff `b > u32::MAX / a`.
+ *
+ * @param a  the multiplicand
+ * @param b  the multiplier
+ * @return      `a * b` as `u32`, or an `error` if the product exceeds `u32::MAX`
+ * @throws      when `a != 0` and `b > u32::MAX / a`
+ */
+pub fn checked_mul_u32(a: u32, b: u32) -> u32 | error {
+    if a == u32_min() || b == u32_min() { return u32_min() }
+    if b > u32_max() / a { return checked_error("math::checked_mul_u32: overflow") }
+    a * b
+}
+
+/**
+ * Divide `a / b` as `u32`, erroring on a zero divisor (never a panic).
+ *
+ * @param a  the dividend
+ * @param b  the divisor
+ * @return      `a / b` as `u32`, or an `error` if `b == 0`
+ * @throws      when `b == 0` (division by zero)
+ */
+pub fn checked_div_u32(a: u32, b: u32) -> u32 | error {
+    if b == u32_min() { return checked_error("math::checked_div_u32: divide by zero") }
+    a / b
+}
+
+/**
+ * Remainder `a % b` as `u32`, erroring on a zero divisor (never a panic).
+ *
+ * @param a  the dividend
+ * @param b  the divisor
+ * @return      `a % b` as `u32`, or an `error` if `b == 0`
+ * @throws      when `b == 0` (division by zero)
+ */
+pub fn checked_rem_u32(a: u32, b: u32) -> u32 | error {
+    if b == u32_min() { return checked_error("math::checked_rem_u32: divide by zero") }
+    a % b
+}
+
+/**
+ * Negate `a` as `u32`. Only `0` negates within an unsigned type; any nonzero value has no representable negative.
+ *
+ * @param a  the value to negate
+ * @return      `0` when `a == 0`, otherwise an `error`
+ * @throws      when `a != 0` (an unsigned type has no negative values)
+ */
+pub fn checked_neg_u32(a: u32) -> u32 | error {
+    if a == u32_min() { return u32_min() }
+    checked_error("math::checked_neg_u32: unsigned negation of a nonzero value")
+}
+
+/**
+ * Raise `base` to `exp` as `u32` by squaring, erroring instead of wrapping on overflow. `base^0 == 1` (the empty product).
+ *
+ * @param base  the base
+ * @param power  the exponent (non-negative by `u32` type)
+ * @return      `base^exp` as `u32`, or an `error` if any intermediate overflows
+ * @throws      when a partial product exceeds `u32::MAX`
+ */
+pub fn checked_pow_u32(base: u32, power: u32) -> u32 | error {
+    mut result: u32 = (1 to u32)
+    mut b = base
+    mut e = power
+    loop {
+        if e == 0 { break }
+        if e % 2 == 1 {
+            match checked_mul_u32(result, b) {
+                u32 as v => { result = v }
+                error as err => return err
+            }
+        }
+        e = e / 2
+        if e != 0 {
+            match checked_mul_u32(b, b) {
+                u32 as v => { b = v }
+                error as err => return err
+            }
+        }
+    }
+    result
+}
+
+/**
+ * Shift `a` left by `count` bits as `u32`, erroring when `count >= 32` (distinct from `wrapping_shl`, which masks the count).
+ *
+ * @param a  the value to shift
+ * @param count  the shift amount in bits
+ * @return      `a << count` as `u32`, or an `error` if `count >= 32`
+ * @throws      when `count >= 32`
+ */
+pub fn checked_shl_u32(a: u32, count: u32) -> u32 | error {
+    if count >= 32 { return checked_error("math::checked_shl_u32: shift out of range") }
+    a << (count to u32)
+}
+
+/**
+ * Shift `a` right by `count` bits as `u32` (logical), erroring when `count >= 32` (distinct from `wrapping_shr`, which masks the count).
+ *
+ * @param a  the value to shift
+ * @param count  the shift amount in bits
+ * @return      `a >> count` as `u32`, or an `error` if `count >= 32`
+ * @throws      when `count >= 32`
+ */
+pub fn checked_shr_u32(a: u32, count: u32) -> u32 | error {
+    if count >= 32 { return checked_error("math::checked_shr_u32: shift out of range") }
+    a >> (count to u32)
+}
+
+/**
+ * Wrapping `a + b` as `u32` — the sum modulo 2^32. The unsigned `+` in the emitted C is already defined modular, so this is a bare operation. Total.
+ *
+ * @param a  the left operand
+ * @param b  the right operand
+ * @return      `(a + b) mod 2^32` as `u32`
+ */
+pub fn wrapping_add_u32(a: u32, b: u32) -> u32 { a + b }
+
+/**
+ * Wrapping `a - b` as `u32` — the difference modulo 2^32. The unsigned `-` in the emitted C is already defined modular, so this is a bare operation. Total.
+ *
+ * @param a  the left operand
+ * @param b  the right operand
+ * @return      `(a - b) mod 2^32` as `u32`
+ */
+pub fn wrapping_sub_u32(a: u32, b: u32) -> u32 { a - b }
+
+/**
+ * Wrapping `a * b` as `u32` — the product modulo 2^32. The unsigned `*` in the emitted C is already defined modular, so this is a bare operation. Total.
+ *
+ * @param a  the left operand
+ * @param b  the right operand
+ * @return      `(a * b) mod 2^32` as `u32`
+ */
+pub fn wrapping_mul_u32(a: u32, b: u32) -> u32 { a * b }
+
+/**
+ * Wrapping negation of `a` as `u32` — `(0 - a) mod 2^32` (`0` maps to `0`). Total; the unsigned subtraction is defined modular.
+ *
+ * @param a  the value to negate
+ * @return      `(0 - a) mod 2^32` as `u32`
+ */
+pub fn wrapping_neg_u32(a: u32) -> u32 { u32_min() - a }
+
+/**
+ * Wrapping left shift of `a` by `count` bits as `u32`; the count is masked to `count mod 32` (the #49/#61 shift semantics), so it never traps. Total.
+ *
+ * @param a  the value to shift
+ * @param count  the shift amount (masked to `mod 32`)
+ * @return      `a << (count mod 32)` as `u32`
+ */
+pub fn wrapping_shl_u32(a: u32, count: u32) -> u32 { a << ((count % 32) to u32) }
+
+/**
+ * Wrapping right shift of `a` by `count` bits as `u32` (logical); the count is masked to `count mod 32` (the #49/#61 shift semantics). Total.
+ *
+ * @param a  the value to shift
+ * @param count  the shift amount (masked to `mod 32`)
+ * @return      `a >> (count mod 32)` as `u32`
+ */
+pub fn wrapping_shr_u32(a: u32, count: u32) -> u32 { a >> ((count % 32) to u32) }
+
+/**
+ * Saturating `a + b` as `u32` — clamps to `u32::MAX` on overflow instead of wrapping or erroring. Total.
+ *
+ * @param a  the augend
+ * @param b  the addend
+ * @return      `a + b`, or `u32::MAX` if the sum would overflow
+ */
+pub fn saturating_add_u32(a: u32, b: u32) -> u32 {
+    if a > u32_max() - b { return u32_max() }
+    a + b
+}
+
+/**
+ * Saturating `a - b` as `u32` — clamps to `0` on underflow instead of wrapping or erroring. Total.
+ *
+ * @param a  the minuend
+ * @param b  the subtrahend
+ * @return      `a - b`, or `0` if `b > a`
+ */
+pub fn saturating_sub_u32(a: u32, b: u32) -> u32 {
+    if b > a { return u32_min() }
+    a - b
+}
+
+/**
+ * Saturating `a * b` as `u32` — clamps to `u32::MAX` on overflow. Total.
+ *
+ * @param a  the multiplicand
+ * @param b  the multiplier
+ * @return      `a * b`, or `u32::MAX` if the product would overflow
+ */
+pub fn saturating_mul_u32(a: u32, b: u32) -> u32 {
+    if a == u32_min() || b == u32_min() { return u32_min() }
+    if b > u32_max() / a { return u32_max() }
+    a * b
+}
+
+/**
+ * The minimum value of `u64` — zero (every unsigned type's floor).
+ *
+ * @return      `0` typed as `u64`
+ */
+pub fn u64_min() -> u64 { 0 to u64 }
+
+/**
+ * The maximum value of `u64` (2^64 - 1), constructed as `~0` (all bits set) — one uniform, width-agnostic form for every unsigned ceiling.
+ *
+ * @return      `u64::MAX`
+ */
+pub fn u64_max() -> u64 { ~(0 to u64) }
+
+/**
+ * Add `a + b` as `u64`, erroring instead of wrapping on overflow.
+ *
+ * @param a  the augend
+ * @param b  the addend
+ * @return      `a + b` as `u64`, or an `error` if the sum exceeds `u64::MAX`
+ * @throws      when `a > u64::MAX - b`
+ */
+pub fn checked_add_u64(a: u64, b: u64) -> u64 | error {
+    if a > u64_max() - b { return checked_error("math::checked_add_u64: overflow") }
+    a + b
+}
+
+/**
+ * Subtract `a - b` as `u64`, erroring instead of wrapping on unsigned underflow.
+ *
+ * @param a  the minuend
+ * @param b  the subtrahend
+ * @return      `a - b` as `u64`, or an `error` if `b > a`
+ * @throws      when `b > a` (the difference would be negative, impossible for `u64`)
+ */
+pub fn checked_sub_u64(a: u64, b: u64) -> u64 | error {
+    if b > a { return checked_error("math::checked_sub_u64: underflow") }
+    a - b
+}
+
+/**
+ * Multiply `a * b` as `u64`, erroring instead of wrapping on overflow.
+ *
+ * Zero operands never overflow; otherwise the product overflows iff `b > u64::MAX / a`.
+ *
+ * @param a  the multiplicand
+ * @param b  the multiplier
+ * @return      `a * b` as `u64`, or an `error` if the product exceeds `u64::MAX`
+ * @throws      when `a != 0` and `b > u64::MAX / a`
+ */
+pub fn checked_mul_u64(a: u64, b: u64) -> u64 | error {
+    if a == u64_min() || b == u64_min() { return u64_min() }
+    if b > u64_max() / a { return checked_error("math::checked_mul_u64: overflow") }
+    a * b
+}
+
+/**
+ * Divide `a / b` as `u64`, erroring on a zero divisor (never a panic).
+ *
+ * @param a  the dividend
+ * @param b  the divisor
+ * @return      `a / b` as `u64`, or an `error` if `b == 0`
+ * @throws      when `b == 0` (division by zero)
+ */
+pub fn checked_div_u64(a: u64, b: u64) -> u64 | error {
+    if b == u64_min() { return checked_error("math::checked_div_u64: divide by zero") }
+    a / b
+}
+
+/**
+ * Remainder `a % b` as `u64`, erroring on a zero divisor (never a panic).
+ *
+ * @param a  the dividend
+ * @param b  the divisor
+ * @return      `a % b` as `u64`, or an `error` if `b == 0`
+ * @throws      when `b == 0` (division by zero)
+ */
+pub fn checked_rem_u64(a: u64, b: u64) -> u64 | error {
+    if b == u64_min() { return checked_error("math::checked_rem_u64: divide by zero") }
+    a % b
+}
+
+/**
+ * Negate `a` as `u64`. Only `0` negates within an unsigned type; any nonzero value has no representable negative.
+ *
+ * @param a  the value to negate
+ * @return      `0` when `a == 0`, otherwise an `error`
+ * @throws      when `a != 0` (an unsigned type has no negative values)
+ */
+pub fn checked_neg_u64(a: u64) -> u64 | error {
+    if a == u64_min() { return u64_min() }
+    checked_error("math::checked_neg_u64: unsigned negation of a nonzero value")
+}
+
+/**
+ * Raise `base` to `exp` as `u64` by squaring, erroring instead of wrapping on overflow. `base^0 == 1` (the empty product).
+ *
+ * @param base  the base
+ * @param power  the exponent (non-negative by `u32` type)
+ * @return      `base^exp` as `u64`, or an `error` if any intermediate overflows
+ * @throws      when a partial product exceeds `u64::MAX`
+ */
+pub fn checked_pow_u64(base: u64, power: u32) -> u64 | error {
+    mut result: u64 = (1 to u64)
+    mut b = base
+    mut e = power
+    loop {
+        if e == 0 { break }
+        if e % 2 == 1 {
+            match checked_mul_u64(result, b) {
+                u64 as v => { result = v }
+                error as err => return err
+            }
+        }
+        e = e / 2
+        if e != 0 {
+            match checked_mul_u64(b, b) {
+                u64 as v => { b = v }
+                error as err => return err
+            }
+        }
+    }
+    result
+}
+
+/**
+ * Shift `a` left by `count` bits as `u64`, erroring when `count >= 64` (distinct from `wrapping_shl`, which masks the count).
+ *
+ * @param a  the value to shift
+ * @param count  the shift amount in bits
+ * @return      `a << count` as `u64`, or an `error` if `count >= 64`
+ * @throws      when `count >= 64`
+ */
+pub fn checked_shl_u64(a: u64, count: u32) -> u64 | error {
+    if count >= 64 { return checked_error("math::checked_shl_u64: shift out of range") }
+    a << (count to u64)
+}
+
+/**
+ * Shift `a` right by `count` bits as `u64` (logical), erroring when `count >= 64` (distinct from `wrapping_shr`, which masks the count).
+ *
+ * @param a  the value to shift
+ * @param count  the shift amount in bits
+ * @return      `a >> count` as `u64`, or an `error` if `count >= 64`
+ * @throws      when `count >= 64`
+ */
+pub fn checked_shr_u64(a: u64, count: u32) -> u64 | error {
+    if count >= 64 { return checked_error("math::checked_shr_u64: shift out of range") }
+    a >> (count to u64)
+}
+
+/**
+ * Wrapping `a + b` as `u64` — the sum modulo 2^64. The unsigned `+` in the emitted C is already defined modular, so this is a bare operation. Total.
+ *
+ * @param a  the left operand
+ * @param b  the right operand
+ * @return      `(a + b) mod 2^64` as `u64`
+ */
+pub fn wrapping_add_u64(a: u64, b: u64) -> u64 { a + b }
+
+/**
+ * Wrapping `a - b` as `u64` — the difference modulo 2^64. The unsigned `-` in the emitted C is already defined modular, so this is a bare operation. Total.
+ *
+ * @param a  the left operand
+ * @param b  the right operand
+ * @return      `(a - b) mod 2^64` as `u64`
+ */
+pub fn wrapping_sub_u64(a: u64, b: u64) -> u64 { a - b }
+
+/**
+ * Wrapping `a * b` as `u64` — the product modulo 2^64. The unsigned `*` in the emitted C is already defined modular, so this is a bare operation. Total.
+ *
+ * @param a  the left operand
+ * @param b  the right operand
+ * @return      `(a * b) mod 2^64` as `u64`
+ */
+pub fn wrapping_mul_u64(a: u64, b: u64) -> u64 { a * b }
+
+/**
+ * Wrapping negation of `a` as `u64` — `(0 - a) mod 2^64` (`0` maps to `0`). Total; the unsigned subtraction is defined modular.
+ *
+ * @param a  the value to negate
+ * @return      `(0 - a) mod 2^64` as `u64`
+ */
+pub fn wrapping_neg_u64(a: u64) -> u64 { u64_min() - a }
+
+/**
+ * Wrapping left shift of `a` by `count` bits as `u64`; the count is masked to `count mod 64` (the #49/#61 shift semantics), so it never traps. Total.
+ *
+ * @param a  the value to shift
+ * @param count  the shift amount (masked to `mod 64`)
+ * @return      `a << (count mod 64)` as `u64`
+ */
+pub fn wrapping_shl_u64(a: u64, count: u32) -> u64 { a << ((count % 64) to u64) }
+
+/**
+ * Wrapping right shift of `a` by `count` bits as `u64` (logical); the count is masked to `count mod 64` (the #49/#61 shift semantics). Total.
+ *
+ * @param a  the value to shift
+ * @param count  the shift amount (masked to `mod 64`)
+ * @return      `a >> (count mod 64)` as `u64`
+ */
+pub fn wrapping_shr_u64(a: u64, count: u32) -> u64 { a >> ((count % 64) to u64) }
+
+/**
+ * Saturating `a + b` as `u64` — clamps to `u64::MAX` on overflow instead of wrapping or erroring. Total.
+ *
+ * @param a  the augend
+ * @param b  the addend
+ * @return      `a + b`, or `u64::MAX` if the sum would overflow
+ */
+pub fn saturating_add_u64(a: u64, b: u64) -> u64 {
+    if a > u64_max() - b { return u64_max() }
+    a + b
+}
+
+/**
+ * Saturating `a - b` as `u64` — clamps to `0` on underflow instead of wrapping or erroring. Total.
+ *
+ * @param a  the minuend
+ * @param b  the subtrahend
+ * @return      `a - b`, or `0` if `b > a`
+ */
+pub fn saturating_sub_u64(a: u64, b: u64) -> u64 {
+    if b > a { return u64_min() }
+    a - b
+}
+
+/**
+ * Saturating `a * b` as `u64` — clamps to `u64::MAX` on overflow. Total.
+ *
+ * @param a  the multiplicand
+ * @param b  the multiplier
+ * @return      `a * b`, or `u64::MAX` if the product would overflow
+ */
+pub fn saturating_mul_u64(a: u64, b: u64) -> u64 {
+    if a == u64_min() || b == u64_min() { return u64_min() }
+    if b > u64_max() / a { return u64_max() }
+    a * b
+}
+
+/**
+ * The maximum value of `i8` (2^7 - 1).
+ *
+ * @return      `i8::MAX`
+ */
+pub fn i8_max() -> i8 { 127 }
+
+/**
+ * The minimum value of `i8` (-2^7). Written as `-MAX - 1` via an annotated intermediate, since `-2^7` has no positive counterpart to negate.
+ *
+ * @return      `i8::MIN`
+ */
+pub fn i8_min() -> i8 {
+    let m: i8 = -127
+    m - 1
+}
+
+/**
+ * Reinterpret `a: i8` as its two's-complement bit pattern typed `u8`.
+ *
+ * Non-negative `a` maps directly. For negative `a`, `a - i8::MIN` lands in
+ * `[0, 2^7 - 1]` (in range — no trapping cast, no signed overflow); adding the
+ * sign bit `2^7` in the `u8` domain reconstructs `a + 2^8`, the two's-complement
+ * pattern. Mirrors the VM's `norm_int`, so both engines agree bit-for-bit.
+ *
+ * @param a  the signed value to reinterpret
+ * @return      the `u8` whose bits equal `a`'s two's-complement encoding
+ */
+fn u8_bits_of_i8(a: i8) -> u8 {
+    if a >= 0 { return a to u8 }
+    (a - i8_min()) to u8 + ((1 to u8) << 7)
+}
+
+/**
+ * Reinterpret a `u8` bit pattern `u` as the `i8` it two's-complement encodes — the inverse of `u8_bits_of_i8`.
+ *
+ * Sign bit clear (`u < 2^7`) maps directly. Otherwise `u - 2^7` is in
+ * `[0, 2^7 - 1]` (in range), and adding `i8::MIN` yields `u - 2^8`, the signed
+ * interpretation of a set sign bit.
+ *
+ * @param u  the `u8` bit pattern to reinterpret
+ * @return      the `i8` two's-complement-encoded by `u`
+ */
+fn i8_from_u8_bits(u: u8) -> i8 {
+    if u < ((1 to u8) << 7) { return u to i8 }
+    (u - ((1 to u8) << 7)) to i8 + i8_min()
+}
+
+/**
+ * Add `a + b` as `i8`, erroring instead of overflowing (signed overflow is UB in the emitted C — never performed here). Overflow is caught by in-range boundary comparisons.
+ *
+ * @param a  the augend
+ * @param b  the addend
+ * @return      `a + b` as `i8`, or an `error` on signed overflow
+ * @throws      when the sum leaves `[i8::MIN, i8::MAX]`
+ */
+pub fn checked_add_i8(a: i8, b: i8) -> i8 | error {
+    if b > 0 && a > i8_max() - b { return checked_error("math::checked_add_i8: overflow") }
+    if b < 0 && a < i8_min() - b { return checked_error("math::checked_add_i8: overflow") }
+    a + b
+}
+
+/**
+ * Subtract `a - b` as `i8`, erroring instead of overflowing. The boundary comparisons (`i8::MAX + b` for `b < 0`, `i8::MIN + b` for `b > 0`) stay in range.
+ *
+ * @param a  the minuend
+ * @param b  the subtrahend
+ * @return      `a - b` as `i8`, or an `error` on signed overflow
+ * @throws      when the difference leaves `[i8::MIN, i8::MAX]`
+ */
+pub fn checked_sub_i8(a: i8, b: i8) -> i8 | error {
+    if b < 0 && a > i8_max() + b { return checked_error("math::checked_sub_i8: overflow") }
+    if b > 0 && a < i8_min() + b { return checked_error("math::checked_sub_i8: overflow") }
+    a - b
+}
+
+/**
+ * Multiply `a * b` as `i8`, erroring instead of overflowing. The `i8::MIN` corners (`a == -1 && b == MIN`, and its mirror) are handled before the division-bound checks, since `MIN / -1` itself overflows.
+ *
+ * @param a  the multiplicand
+ * @param b  the multiplier
+ * @return      `a * b` as `i8`, or an `error` on signed overflow
+ * @throws      when the product leaves `[i8::MIN, i8::MAX]`
+ */
+pub fn checked_mul_i8(a: i8, b: i8) -> i8 | error {
+    if a == 0 || b == 0 { return (0 to i8) }
+    if a == -1 {
+        if b == i8_min() { return checked_error("math::checked_mul_i8: overflow") }
+        return -b
+    }
+    if b == -1 {
+        if a == i8_min() { return checked_error("math::checked_mul_i8: overflow") }
+        return -a
+    }
+    if a > 0 {
+        if b > 0 && a > i8_max() / b { return checked_error("math::checked_mul_i8: overflow") }
+        if b < 0 && b < i8_min() / a { return checked_error("math::checked_mul_i8: overflow") }
+    } else {
+        if b > 0 && a < i8_min() / b { return checked_error("math::checked_mul_i8: overflow") }
+        if b < 0 && a < i8_max() / b { return checked_error("math::checked_mul_i8: overflow") }
+    }
+    a * b
+}
+
+/**
+ * Divide `a / b` as `i8`, erroring on a zero divisor and on `i8::MIN / -1` (whose true quotient `i8::MAX + 1` is unrepresentable).
+ *
+ * @param a  the dividend
+ * @param b  the divisor
+ * @return      `a / b` as `i8`, or an `error` on divide-by-zero or `MIN / -1`
+ * @throws      when `b == 0`, or `a == i8::MIN && b == -1`
+ */
+pub fn checked_div_i8(a: i8, b: i8) -> i8 | error {
+    if b == 0 { return checked_error("math::checked_div_i8: divide by zero") }
+    if a == i8_min() && b == -1 { return checked_error("math::checked_div_i8: overflow") }
+    a / b
+}
+
+/**
+ * Remainder `a % b` as `i8`, erroring on a zero divisor. `i8::MIN % -1` is defined `0` (returned directly; the bare `%` would be UB there).
+ *
+ * @param a  the dividend
+ * @param b  the divisor
+ * @return      `a % b` as `i8`, `0` for `MIN % -1`, or an `error` if `b == 0`
+ * @throws      when `b == 0` (division by zero)
+ */
+pub fn checked_rem_i8(a: i8, b: i8) -> i8 | error {
+    if b == 0 { return checked_error("math::checked_rem_i8: divide by zero") }
+    if a == i8_min() && b == -1 { return (0 to i8) }
+    a % b
+}
+
+/**
+ * Negate `a` as `i8`, erroring only on `i8::MIN` (which has no representable positive counterpart in two's complement).
+ *
+ * @param a  the value to negate
+ * @return      `-a` as `i8`, or an `error` if `a == i8::MIN`
+ * @throws      when `a == i8::MIN`
+ */
+pub fn checked_neg_i8(a: i8) -> i8 | error {
+    if a == i8_min() { return checked_error("math::checked_neg_i8: overflow") }
+    -a
+}
+
+/**
+ * Raise `base` to `exp` as `i8` by squaring, erroring instead of overflowing. `base^0 == 1`; a negative base is fine (its sign follows the exponent's parity).
+ *
+ * @param base  the base
+ * @param power  the exponent (non-negative by `u32` type)
+ * @return      `base^exp` as `i8`, or an `error` if any step overflows
+ * @throws      when a partial product leaves `[i8::MIN, i8::MAX]`
+ */
+pub fn checked_pow_i8(base: i8, power: u32) -> i8 | error {
+    mut result: i8 = (1 to i8)
+    mut b = base
+    mut e = power
+    loop {
+        if e == 0 { break }
+        if e % 2 == 1 {
+            match checked_mul_i8(result, b) {
+                i8 as v => { result = v }
+                error as err => return err
+            }
+        }
+        e = e / 2
+        if e != 0 {
+            match checked_mul_i8(b, b) {
+                i8 as v => { b = v }
+                error as err => return err
+            }
+        }
+    }
+    result
+}
+
+/**
+ * Shift `a` left by `count` bits as `i8`, erroring when `count >= 8`. The shift itself rides the runtime's masked, UB-free signed shift.
+ *
+ * @param a  the value to shift
+ * @param count  the shift amount in bits
+ * @return      `a << count` as `i8`, or an `error` if `count >= 8`
+ * @throws      when `count >= 8`
+ */
+pub fn checked_shl_i8(a: i8, count: u32) -> i8 | error {
+    if count >= 8 { return checked_error("math::checked_shl_i8: shift out of range") }
+    a << (count to i8)
+}
+
+/**
+ * Shift `a` right by `count` bits as `i8` (arithmetic — sign-preserving), erroring when `count >= 8`.
+ *
+ * @param a  the value to shift
+ * @param count  the shift amount in bits
+ * @return      `a >> count` as `i8`, or an `error` if `count >= 8`
+ * @throws      when `count >= 8`
+ */
+pub fn checked_shr_i8(a: i8, count: u32) -> i8 | error {
+    if count >= 8 { return checked_error("math::checked_shr_i8: shift out of range") }
+    a >> (count to i8)
+}
+
+/**
+ * Wrapping `a + b` as `i8` — the sum modulo 2^8. Routed through the `u8` domain (where `+` is defined modular in C) and reinterpreted back, so no signed overflow UB is emitted. Total.
+ *
+ * @param a  the left operand
+ * @param b  the right operand
+ * @return      `(a + b) mod 2^8` as `i8` (two's-complement wraparound)
+ */
+pub fn wrapping_add_i8(a: i8, b: i8) -> i8 {
+    i8_from_u8_bits(u8_bits_of_i8(a) + u8_bits_of_i8(b))
+}
+
+/**
+ * Wrapping `a - b` as `i8` — the difference modulo 2^8. Routed through the `u8` domain (where `-` is defined modular in C) and reinterpreted back, so no signed overflow UB is emitted. Total.
+ *
+ * @param a  the left operand
+ * @param b  the right operand
+ * @return      `(a - b) mod 2^8` as `i8` (two's-complement wraparound)
+ */
+pub fn wrapping_sub_i8(a: i8, b: i8) -> i8 {
+    i8_from_u8_bits(u8_bits_of_i8(a) - u8_bits_of_i8(b))
+}
+
+/**
+ * Wrapping `a * b` as `i8` — the product modulo 2^8. Routed through the `u8` domain (where `*` is defined modular in C) and reinterpreted back, so no signed overflow UB is emitted. Total.
+ *
+ * @param a  the left operand
+ * @param b  the right operand
+ * @return      `(a * b) mod 2^8` as `i8` (two's-complement wraparound)
+ */
+pub fn wrapping_mul_i8(a: i8, b: i8) -> i8 {
+    i8_from_u8_bits(u8_bits_of_i8(a) * u8_bits_of_i8(b))
+}
+
+/**
+ * Wrapping negation of `a` as `i8` — `i8::MIN` maps to itself (defining the UB corner). Routed through the `u8` domain, so no signed overflow is emitted. Total.
+ *
+ * @param a  the value to negate
+ * @return      `-a mod 2^8` as `i8` (with `i8::MIN -> i8::MIN`)
+ */
+pub fn wrapping_neg_i8(a: i8) -> i8 {
+    i8_from_u8_bits((0 to u8) - u8_bits_of_i8(a))
+}
+
+/**
+ * Wrapping left shift of `a` by `count` bits as `i8`; the count is masked to `count mod 8` (the #49/#61 semantics); the runtime's signed `<<` is UB-free. Total.
+ *
+ * @param a  the value to shift
+ * @param count  the shift amount (masked to `mod 8`)
+ * @return      `a << (count mod 8)` as `i8`
+ */
+pub fn wrapping_shl_i8(a: i8, count: u32) -> i8 { a << ((count % 8) to i8) }
+
+/**
+ * Wrapping right shift of `a` by `count` bits as `i8` (arithmetic); the count is masked to `count mod 8` (the #49/#61 semantics). Total.
+ *
+ * @param a  the value to shift
+ * @param count  the shift amount (masked to `mod 8`)
+ * @return      `a >> (count mod 8)` as `i8`
+ */
+pub fn wrapping_shr_i8(a: i8, count: u32) -> i8 { a >> ((count % 8) to i8) }
+
+/**
+ * Saturating `a + b` as `i8` — clamps to `i8::MAX` on positive overflow and `i8::MIN` on negative overflow. Total.
+ *
+ * @param a  the augend
+ * @param b  the addend
+ * @return      `a + b`, or the sign-appropriate bound on overflow
+ */
+pub fn saturating_add_i8(a: i8, b: i8) -> i8 {
+    match checked_add_i8(a, b) {
+        i8 as v => v
+        error => { if b > 0 { return i8_max() }; i8_min() }
+    }
+}
+
+/**
+ * Saturating `a - b` as `i8` — clamps to `i8::MAX` on positive overflow and `i8::MIN` on negative overflow. Total.
+ *
+ * @param a  the minuend
+ * @param b  the subtrahend
+ * @return      `a - b`, or the sign-appropriate bound on overflow
+ */
+pub fn saturating_sub_i8(a: i8, b: i8) -> i8 {
+    match checked_sub_i8(a, b) {
+        i8 as v => v
+        error => { if b < 0 { return i8_max() }; i8_min() }
+    }
+}
+
+/**
+ * Saturating `a * b` as `i8` — clamps to `i8::MAX` when the product's sign is positive, `i8::MIN` when negative. Total.
+ *
+ * @param a  the multiplicand
+ * @param b  the multiplier
+ * @return      `a * b`, or the sign-appropriate bound on overflow
+ */
+pub fn saturating_mul_i8(a: i8, b: i8) -> i8 {
+    match checked_mul_i8(a, b) {
+        i8 as v => v
+        error => { if (a > 0) == (b > 0) { return i8_max() }; i8_min() }
+    }
+}
+
+/**
+ * The maximum value of `i16` (2^15 - 1).
+ *
+ * @return      `i16::MAX`
+ */
+pub fn i16_max() -> i16 { 32767 }
+
+/**
+ * The minimum value of `i16` (-2^15). Written as `-MAX - 1` via an annotated intermediate, since `-2^15` has no positive counterpart to negate.
+ *
+ * @return      `i16::MIN`
+ */
+pub fn i16_min() -> i16 {
+    let m: i16 = -32767
+    m - 1
+}
+
+/**
+ * Reinterpret `a: i16` as its two's-complement bit pattern typed `u16`.
+ *
+ * Non-negative `a` maps directly. For negative `a`, `a - i16::MIN` lands in
+ * `[0, 2^15 - 1]` (in range — no trapping cast, no signed overflow); adding the
+ * sign bit `2^15` in the `u16` domain reconstructs `a + 2^16`, the two's-complement
+ * pattern. Mirrors the VM's `norm_int`, so both engines agree bit-for-bit.
+ *
+ * @param a  the signed value to reinterpret
+ * @return      the `u16` whose bits equal `a`'s two's-complement encoding
+ */
+fn u16_bits_of_i16(a: i16) -> u16 {
+    if a >= 0 { return a to u16 }
+    (a - i16_min()) to u16 + ((1 to u16) << 15)
+}
+
+/**
+ * Reinterpret a `u16` bit pattern `u` as the `i16` it two's-complement encodes — the inverse of `u16_bits_of_i16`.
+ *
+ * Sign bit clear (`u < 2^15`) maps directly. Otherwise `u - 2^15` is in
+ * `[0, 2^15 - 1]` (in range), and adding `i16::MIN` yields `u - 2^16`, the signed
+ * interpretation of a set sign bit.
+ *
+ * @param u  the `u16` bit pattern to reinterpret
+ * @return      the `i16` two's-complement-encoded by `u`
+ */
+fn i16_from_u16_bits(u: u16) -> i16 {
+    if u < ((1 to u16) << 15) { return u to i16 }
+    (u - ((1 to u16) << 15)) to i16 + i16_min()
+}
+
+/**
+ * Add `a + b` as `i16`, erroring instead of overflowing (signed overflow is UB in the emitted C — never performed here). Overflow is caught by in-range boundary comparisons.
+ *
+ * @param a  the augend
+ * @param b  the addend
+ * @return      `a + b` as `i16`, or an `error` on signed overflow
+ * @throws      when the sum leaves `[i16::MIN, i16::MAX]`
+ */
+pub fn checked_add_i16(a: i16, b: i16) -> i16 | error {
+    if b > 0 && a > i16_max() - b { return checked_error("math::checked_add_i16: overflow") }
+    if b < 0 && a < i16_min() - b { return checked_error("math::checked_add_i16: overflow") }
+    a + b
+}
+
+/**
+ * Subtract `a - b` as `i16`, erroring instead of overflowing. The boundary comparisons (`i16::MAX + b` for `b < 0`, `i16::MIN + b` for `b > 0`) stay in range.
+ *
+ * @param a  the minuend
+ * @param b  the subtrahend
+ * @return      `a - b` as `i16`, or an `error` on signed overflow
+ * @throws      when the difference leaves `[i16::MIN, i16::MAX]`
+ */
+pub fn checked_sub_i16(a: i16, b: i16) -> i16 | error {
+    if b < 0 && a > i16_max() + b { return checked_error("math::checked_sub_i16: overflow") }
+    if b > 0 && a < i16_min() + b { return checked_error("math::checked_sub_i16: overflow") }
+    a - b
+}
+
+/**
+ * Multiply `a * b` as `i16`, erroring instead of overflowing. The `i16::MIN` corners (`a == -1 && b == MIN`, and its mirror) are handled before the division-bound checks, since `MIN / -1` itself overflows.
+ *
+ * @param a  the multiplicand
+ * @param b  the multiplier
+ * @return      `a * b` as `i16`, or an `error` on signed overflow
+ * @throws      when the product leaves `[i16::MIN, i16::MAX]`
+ */
+pub fn checked_mul_i16(a: i16, b: i16) -> i16 | error {
+    if a == 0 || b == 0 { return (0 to i16) }
+    if a == -1 {
+        if b == i16_min() { return checked_error("math::checked_mul_i16: overflow") }
+        return -b
+    }
+    if b == -1 {
+        if a == i16_min() { return checked_error("math::checked_mul_i16: overflow") }
+        return -a
+    }
+    if a > 0 {
+        if b > 0 && a > i16_max() / b { return checked_error("math::checked_mul_i16: overflow") }
+        if b < 0 && b < i16_min() / a { return checked_error("math::checked_mul_i16: overflow") }
+    } else {
+        if b > 0 && a < i16_min() / b { return checked_error("math::checked_mul_i16: overflow") }
+        if b < 0 && a < i16_max() / b { return checked_error("math::checked_mul_i16: overflow") }
+    }
+    a * b
+}
+
+/**
+ * Divide `a / b` as `i16`, erroring on a zero divisor and on `i16::MIN / -1` (whose true quotient `i16::MAX + 1` is unrepresentable).
+ *
+ * @param a  the dividend
+ * @param b  the divisor
+ * @return      `a / b` as `i16`, or an `error` on divide-by-zero or `MIN / -1`
+ * @throws      when `b == 0`, or `a == i16::MIN && b == -1`
+ */
+pub fn checked_div_i16(a: i16, b: i16) -> i16 | error {
+    if b == 0 { return checked_error("math::checked_div_i16: divide by zero") }
+    if a == i16_min() && b == -1 { return checked_error("math::checked_div_i16: overflow") }
+    a / b
+}
+
+/**
+ * Remainder `a % b` as `i16`, erroring on a zero divisor. `i16::MIN % -1` is defined `0` (returned directly; the bare `%` would be UB there).
+ *
+ * @param a  the dividend
+ * @param b  the divisor
+ * @return      `a % b` as `i16`, `0` for `MIN % -1`, or an `error` if `b == 0`
+ * @throws      when `b == 0` (division by zero)
+ */
+pub fn checked_rem_i16(a: i16, b: i16) -> i16 | error {
+    if b == 0 { return checked_error("math::checked_rem_i16: divide by zero") }
+    if a == i16_min() && b == -1 { return (0 to i16) }
+    a % b
+}
+
+/**
+ * Negate `a` as `i16`, erroring only on `i16::MIN` (which has no representable positive counterpart in two's complement).
+ *
+ * @param a  the value to negate
+ * @return      `-a` as `i16`, or an `error` if `a == i16::MIN`
+ * @throws      when `a == i16::MIN`
+ */
+pub fn checked_neg_i16(a: i16) -> i16 | error {
+    if a == i16_min() { return checked_error("math::checked_neg_i16: overflow") }
+    -a
+}
+
+/**
+ * Raise `base` to `exp` as `i16` by squaring, erroring instead of overflowing. `base^0 == 1`; a negative base is fine (its sign follows the exponent's parity).
+ *
+ * @param base  the base
+ * @param power  the exponent (non-negative by `u32` type)
+ * @return      `base^exp` as `i16`, or an `error` if any step overflows
+ * @throws      when a partial product leaves `[i16::MIN, i16::MAX]`
+ */
+pub fn checked_pow_i16(base: i16, power: u32) -> i16 | error {
+    mut result: i16 = (1 to i16)
+    mut b = base
+    mut e = power
+    loop {
+        if e == 0 { break }
+        if e % 2 == 1 {
+            match checked_mul_i16(result, b) {
+                i16 as v => { result = v }
+                error as err => return err
+            }
+        }
+        e = e / 2
+        if e != 0 {
+            match checked_mul_i16(b, b) {
+                i16 as v => { b = v }
+                error as err => return err
+            }
+        }
+    }
+    result
+}
+
+/**
+ * Shift `a` left by `count` bits as `i16`, erroring when `count >= 16`. The shift itself rides the runtime's masked, UB-free signed shift.
+ *
+ * @param a  the value to shift
+ * @param count  the shift amount in bits
+ * @return      `a << count` as `i16`, or an `error` if `count >= 16`
+ * @throws      when `count >= 16`
+ */
+pub fn checked_shl_i16(a: i16, count: u32) -> i16 | error {
+    if count >= 16 { return checked_error("math::checked_shl_i16: shift out of range") }
+    a << (count to i16)
+}
+
+/**
+ * Shift `a` right by `count` bits as `i16` (arithmetic — sign-preserving), erroring when `count >= 16`.
+ *
+ * @param a  the value to shift
+ * @param count  the shift amount in bits
+ * @return      `a >> count` as `i16`, or an `error` if `count >= 16`
+ * @throws      when `count >= 16`
+ */
+pub fn checked_shr_i16(a: i16, count: u32) -> i16 | error {
+    if count >= 16 { return checked_error("math::checked_shr_i16: shift out of range") }
+    a >> (count to i16)
+}
+
+/**
+ * Wrapping `a + b` as `i16` — the sum modulo 2^16. Routed through the `u16` domain (where `+` is defined modular in C) and reinterpreted back, so no signed overflow UB is emitted. Total.
+ *
+ * @param a  the left operand
+ * @param b  the right operand
+ * @return      `(a + b) mod 2^16` as `i16` (two's-complement wraparound)
+ */
+pub fn wrapping_add_i16(a: i16, b: i16) -> i16 {
+    i16_from_u16_bits(u16_bits_of_i16(a) + u16_bits_of_i16(b))
+}
+
+/**
+ * Wrapping `a - b` as `i16` — the difference modulo 2^16. Routed through the `u16` domain (where `-` is defined modular in C) and reinterpreted back, so no signed overflow UB is emitted. Total.
+ *
+ * @param a  the left operand
+ * @param b  the right operand
+ * @return      `(a - b) mod 2^16` as `i16` (two's-complement wraparound)
+ */
+pub fn wrapping_sub_i16(a: i16, b: i16) -> i16 {
+    i16_from_u16_bits(u16_bits_of_i16(a) - u16_bits_of_i16(b))
+}
+
+/**
+ * Wrapping `a * b` as `i16` — the product modulo 2^16. Routed through the `u16` domain (where `*` is defined modular in C) and reinterpreted back, so no signed overflow UB is emitted. Total.
+ *
+ * @param a  the left operand
+ * @param b  the right operand
+ * @return      `(a * b) mod 2^16` as `i16` (two's-complement wraparound)
+ */
+pub fn wrapping_mul_i16(a: i16, b: i16) -> i16 {
+    i16_from_u16_bits(u16_bits_of_i16(a) * u16_bits_of_i16(b))
+}
+
+/**
+ * Wrapping negation of `a` as `i16` — `i16::MIN` maps to itself (defining the UB corner). Routed through the `u16` domain, so no signed overflow is emitted. Total.
+ *
+ * @param a  the value to negate
+ * @return      `-a mod 2^16` as `i16` (with `i16::MIN -> i16::MIN`)
+ */
+pub fn wrapping_neg_i16(a: i16) -> i16 {
+    i16_from_u16_bits((0 to u16) - u16_bits_of_i16(a))
+}
+
+/**
+ * Wrapping left shift of `a` by `count` bits as `i16`; the count is masked to `count mod 16` (the #49/#61 semantics); the runtime's signed `<<` is UB-free. Total.
+ *
+ * @param a  the value to shift
+ * @param count  the shift amount (masked to `mod 16`)
+ * @return      `a << (count mod 16)` as `i16`
+ */
+pub fn wrapping_shl_i16(a: i16, count: u32) -> i16 { a << ((count % 16) to i16) }
+
+/**
+ * Wrapping right shift of `a` by `count` bits as `i16` (arithmetic); the count is masked to `count mod 16` (the #49/#61 semantics). Total.
+ *
+ * @param a  the value to shift
+ * @param count  the shift amount (masked to `mod 16`)
+ * @return      `a >> (count mod 16)` as `i16`
+ */
+pub fn wrapping_shr_i16(a: i16, count: u32) -> i16 { a >> ((count % 16) to i16) }
+
+/**
+ * Saturating `a + b` as `i16` — clamps to `i16::MAX` on positive overflow and `i16::MIN` on negative overflow. Total.
+ *
+ * @param a  the augend
+ * @param b  the addend
+ * @return      `a + b`, or the sign-appropriate bound on overflow
+ */
+pub fn saturating_add_i16(a: i16, b: i16) -> i16 {
+    match checked_add_i16(a, b) {
+        i16 as v => v
+        error => { if b > 0 { return i16_max() }; i16_min() }
+    }
+}
+
+/**
+ * Saturating `a - b` as `i16` — clamps to `i16::MAX` on positive overflow and `i16::MIN` on negative overflow. Total.
+ *
+ * @param a  the minuend
+ * @param b  the subtrahend
+ * @return      `a - b`, or the sign-appropriate bound on overflow
+ */
+pub fn saturating_sub_i16(a: i16, b: i16) -> i16 {
+    match checked_sub_i16(a, b) {
+        i16 as v => v
+        error => { if b < 0 { return i16_max() }; i16_min() }
+    }
+}
+
+/**
+ * Saturating `a * b` as `i16` — clamps to `i16::MAX` when the product's sign is positive, `i16::MIN` when negative. Total.
+ *
+ * @param a  the multiplicand
+ * @param b  the multiplier
+ * @return      `a * b`, or the sign-appropriate bound on overflow
+ */
+pub fn saturating_mul_i16(a: i16, b: i16) -> i16 {
+    match checked_mul_i16(a, b) {
+        i16 as v => v
+        error => { if (a > 0) == (b > 0) { return i16_max() }; i16_min() }
+    }
+}
+
+/**
+ * The maximum value of `i32` (2^31 - 1).
+ *
+ * @return      `i32::MAX`
+ */
+pub fn i32_max() -> i32 { 2147483647 }
+
+/**
+ * The minimum value of `i32` (-2^31). Written as `-MAX - 1` via an annotated intermediate, since `-2^31` has no positive counterpart to negate.
+ *
+ * @return      `i32::MIN`
+ */
+pub fn i32_min() -> i32 {
+    let m: i32 = -2147483647
+    m - 1
+}
+
+/**
+ * Reinterpret `a: i32` as its two's-complement bit pattern typed `u32`.
+ *
+ * Non-negative `a` maps directly. For negative `a`, `a - i32::MIN` lands in
+ * `[0, 2^31 - 1]` (in range — no trapping cast, no signed overflow); adding the
+ * sign bit `2^31` in the `u32` domain reconstructs `a + 2^32`, the two's-complement
+ * pattern. Mirrors the VM's `norm_int`, so both engines agree bit-for-bit.
+ *
+ * @param a  the signed value to reinterpret
+ * @return      the `u32` whose bits equal `a`'s two's-complement encoding
+ */
+fn u32_bits_of_i32(a: i32) -> u32 {
+    if a >= 0 { return a to u32 }
+    (a - i32_min()) to u32 + ((1 to u32) << 31)
+}
+
+/**
+ * Reinterpret a `u32` bit pattern `u` as the `i32` it two's-complement encodes — the inverse of `u32_bits_of_i32`.
+ *
+ * Sign bit clear (`u < 2^31`) maps directly. Otherwise `u - 2^31` is in
+ * `[0, 2^31 - 1]` (in range), and adding `i32::MIN` yields `u - 2^32`, the signed
+ * interpretation of a set sign bit.
+ *
+ * @param u  the `u32` bit pattern to reinterpret
+ * @return      the `i32` two's-complement-encoded by `u`
+ */
+fn i32_from_u32_bits(u: u32) -> i32 {
+    if u < ((1 to u32) << 31) { return u to i32 }
+    (u - ((1 to u32) << 31)) to i32 + i32_min()
+}
+
+/**
+ * Add `a + b` as `i32`, erroring instead of overflowing (signed overflow is UB in the emitted C — never performed here). Overflow is caught by in-range boundary comparisons.
+ *
+ * @param a  the augend
+ * @param b  the addend
+ * @return      `a + b` as `i32`, or an `error` on signed overflow
+ * @throws      when the sum leaves `[i32::MIN, i32::MAX]`
+ */
+pub fn checked_add_i32(a: i32, b: i32) -> i32 | error {
+    if b > 0 && a > i32_max() - b { return checked_error("math::checked_add_i32: overflow") }
+    if b < 0 && a < i32_min() - b { return checked_error("math::checked_add_i32: overflow") }
+    a + b
+}
+
+/**
+ * Subtract `a - b` as `i32`, erroring instead of overflowing. The boundary comparisons (`i32::MAX + b` for `b < 0`, `i32::MIN + b` for `b > 0`) stay in range.
+ *
+ * @param a  the minuend
+ * @param b  the subtrahend
+ * @return      `a - b` as `i32`, or an `error` on signed overflow
+ * @throws      when the difference leaves `[i32::MIN, i32::MAX]`
+ */
+pub fn checked_sub_i32(a: i32, b: i32) -> i32 | error {
+    if b < 0 && a > i32_max() + b { return checked_error("math::checked_sub_i32: overflow") }
+    if b > 0 && a < i32_min() + b { return checked_error("math::checked_sub_i32: overflow") }
+    a - b
+}
+
+/**
+ * Multiply `a * b` as `i32`, erroring instead of overflowing. The `i32::MIN` corners (`a == -1 && b == MIN`, and its mirror) are handled before the division-bound checks, since `MIN / -1` itself overflows.
+ *
+ * @param a  the multiplicand
+ * @param b  the multiplier
+ * @return      `a * b` as `i32`, or an `error` on signed overflow
+ * @throws      when the product leaves `[i32::MIN, i32::MAX]`
+ */
+pub fn checked_mul_i32(a: i32, b: i32) -> i32 | error {
+    if a == 0 || b == 0 { return (0 to i32) }
+    if a == -1 {
+        if b == i32_min() { return checked_error("math::checked_mul_i32: overflow") }
+        return -b
+    }
+    if b == -1 {
+        if a == i32_min() { return checked_error("math::checked_mul_i32: overflow") }
+        return -a
+    }
+    if a > 0 {
+        if b > 0 && a > i32_max() / b { return checked_error("math::checked_mul_i32: overflow") }
+        if b < 0 && b < i32_min() / a { return checked_error("math::checked_mul_i32: overflow") }
+    } else {
+        if b > 0 && a < i32_min() / b { return checked_error("math::checked_mul_i32: overflow") }
+        if b < 0 && a < i32_max() / b { return checked_error("math::checked_mul_i32: overflow") }
+    }
+    a * b
+}
+
+/**
+ * Divide `a / b` as `i32`, erroring on a zero divisor and on `i32::MIN / -1` (whose true quotient `i32::MAX + 1` is unrepresentable).
+ *
+ * @param a  the dividend
+ * @param b  the divisor
+ * @return      `a / b` as `i32`, or an `error` on divide-by-zero or `MIN / -1`
+ * @throws      when `b == 0`, or `a == i32::MIN && b == -1`
+ */
+pub fn checked_div_i32(a: i32, b: i32) -> i32 | error {
+    if b == 0 { return checked_error("math::checked_div_i32: divide by zero") }
+    if a == i32_min() && b == -1 { return checked_error("math::checked_div_i32: overflow") }
+    a / b
+}
+
+/**
+ * Remainder `a % b` as `i32`, erroring on a zero divisor. `i32::MIN % -1` is defined `0` (returned directly; the bare `%` would be UB there).
+ *
+ * @param a  the dividend
+ * @param b  the divisor
+ * @return      `a % b` as `i32`, `0` for `MIN % -1`, or an `error` if `b == 0`
+ * @throws      when `b == 0` (division by zero)
+ */
+pub fn checked_rem_i32(a: i32, b: i32) -> i32 | error {
+    if b == 0 { return checked_error("math::checked_rem_i32: divide by zero") }
+    if a == i32_min() && b == -1 { return (0 to i32) }
+    a % b
+}
+
+/**
+ * Negate `a` as `i32`, erroring only on `i32::MIN` (which has no representable positive counterpart in two's complement).
+ *
+ * @param a  the value to negate
+ * @return      `-a` as `i32`, or an `error` if `a == i32::MIN`
+ * @throws      when `a == i32::MIN`
+ */
+pub fn checked_neg_i32(a: i32) -> i32 | error {
+    if a == i32_min() { return checked_error("math::checked_neg_i32: overflow") }
+    -a
+}
+
+/**
+ * Raise `base` to `exp` as `i32` by squaring, erroring instead of overflowing. `base^0 == 1`; a negative base is fine (its sign follows the exponent's parity).
+ *
+ * @param base  the base
+ * @param power  the exponent (non-negative by `u32` type)
+ * @return      `base^exp` as `i32`, or an `error` if any step overflows
+ * @throws      when a partial product leaves `[i32::MIN, i32::MAX]`
+ */
+pub fn checked_pow_i32(base: i32, power: u32) -> i32 | error {
+    mut result: i32 = (1 to i32)
+    mut b = base
+    mut e = power
+    loop {
+        if e == 0 { break }
+        if e % 2 == 1 {
+            match checked_mul_i32(result, b) {
+                i32 as v => { result = v }
+                error as err => return err
+            }
+        }
+        e = e / 2
+        if e != 0 {
+            match checked_mul_i32(b, b) {
+                i32 as v => { b = v }
+                error as err => return err
+            }
+        }
+    }
+    result
+}
+
+/**
+ * Shift `a` left by `count` bits as `i32`, erroring when `count >= 32`. The shift itself rides the runtime's masked, UB-free signed shift.
+ *
+ * @param a  the value to shift
+ * @param count  the shift amount in bits
+ * @return      `a << count` as `i32`, or an `error` if `count >= 32`
+ * @throws      when `count >= 32`
+ */
+pub fn checked_shl_i32(a: i32, count: u32) -> i32 | error {
+    if count >= 32 { return checked_error("math::checked_shl_i32: shift out of range") }
+    a << (count to i32)
+}
+
+/**
+ * Shift `a` right by `count` bits as `i32` (arithmetic — sign-preserving), erroring when `count >= 32`.
+ *
+ * @param a  the value to shift
+ * @param count  the shift amount in bits
+ * @return      `a >> count` as `i32`, or an `error` if `count >= 32`
+ * @throws      when `count >= 32`
+ */
+pub fn checked_shr_i32(a: i32, count: u32) -> i32 | error {
+    if count >= 32 { return checked_error("math::checked_shr_i32: shift out of range") }
+    a >> (count to i32)
+}
+
+/**
+ * Wrapping `a + b` as `i32` — the sum modulo 2^32. Routed through the `u32` domain (where `+` is defined modular in C) and reinterpreted back, so no signed overflow UB is emitted. Total.
+ *
+ * @param a  the left operand
+ * @param b  the right operand
+ * @return      `(a + b) mod 2^32` as `i32` (two's-complement wraparound)
+ */
+pub fn wrapping_add_i32(a: i32, b: i32) -> i32 {
+    i32_from_u32_bits(u32_bits_of_i32(a) + u32_bits_of_i32(b))
+}
+
+/**
+ * Wrapping `a - b` as `i32` — the difference modulo 2^32. Routed through the `u32` domain (where `-` is defined modular in C) and reinterpreted back, so no signed overflow UB is emitted. Total.
+ *
+ * @param a  the left operand
+ * @param b  the right operand
+ * @return      `(a - b) mod 2^32` as `i32` (two's-complement wraparound)
+ */
+pub fn wrapping_sub_i32(a: i32, b: i32) -> i32 {
+    i32_from_u32_bits(u32_bits_of_i32(a) - u32_bits_of_i32(b))
+}
+
+/**
+ * Wrapping `a * b` as `i32` — the product modulo 2^32. Routed through the `u32` domain (where `*` is defined modular in C) and reinterpreted back, so no signed overflow UB is emitted. Total.
+ *
+ * @param a  the left operand
+ * @param b  the right operand
+ * @return      `(a * b) mod 2^32` as `i32` (two's-complement wraparound)
+ */
+pub fn wrapping_mul_i32(a: i32, b: i32) -> i32 {
+    i32_from_u32_bits(u32_bits_of_i32(a) * u32_bits_of_i32(b))
+}
+
+/**
+ * Wrapping negation of `a` as `i32` — `i32::MIN` maps to itself (defining the UB corner). Routed through the `u32` domain, so no signed overflow is emitted. Total.
+ *
+ * @param a  the value to negate
+ * @return      `-a mod 2^32` as `i32` (with `i32::MIN -> i32::MIN`)
+ */
+pub fn wrapping_neg_i32(a: i32) -> i32 {
+    i32_from_u32_bits((0 to u32) - u32_bits_of_i32(a))
+}
+
+/**
+ * Wrapping left shift of `a` by `count` bits as `i32`; the count is masked to `count mod 32` (the #49/#61 semantics); the runtime's signed `<<` is UB-free. Total.
+ *
+ * @param a  the value to shift
+ * @param count  the shift amount (masked to `mod 32`)
+ * @return      `a << (count mod 32)` as `i32`
+ */
+pub fn wrapping_shl_i32(a: i32, count: u32) -> i32 { a << ((count % 32) to i32) }
+
+/**
+ * Wrapping right shift of `a` by `count` bits as `i32` (arithmetic); the count is masked to `count mod 32` (the #49/#61 semantics). Total.
+ *
+ * @param a  the value to shift
+ * @param count  the shift amount (masked to `mod 32`)
+ * @return      `a >> (count mod 32)` as `i32`
+ */
+pub fn wrapping_shr_i32(a: i32, count: u32) -> i32 { a >> ((count % 32) to i32) }
+
+/**
+ * Saturating `a + b` as `i32` — clamps to `i32::MAX` on positive overflow and `i32::MIN` on negative overflow. Total.
+ *
+ * @param a  the augend
+ * @param b  the addend
+ * @return      `a + b`, or the sign-appropriate bound on overflow
+ */
+pub fn saturating_add_i32(a: i32, b: i32) -> i32 {
+    match checked_add_i32(a, b) {
+        i32 as v => v
+        error => { if b > 0 { return i32_max() }; i32_min() }
+    }
+}
+
+/**
+ * Saturating `a - b` as `i32` — clamps to `i32::MAX` on positive overflow and `i32::MIN` on negative overflow. Total.
+ *
+ * @param a  the minuend
+ * @param b  the subtrahend
+ * @return      `a - b`, or the sign-appropriate bound on overflow
+ */
+pub fn saturating_sub_i32(a: i32, b: i32) -> i32 {
+    match checked_sub_i32(a, b) {
+        i32 as v => v
+        error => { if b < 0 { return i32_max() }; i32_min() }
+    }
+}
+
+/**
+ * Saturating `a * b` as `i32` — clamps to `i32::MAX` when the product's sign is positive, `i32::MIN` when negative. Total.
+ *
+ * @param a  the multiplicand
+ * @param b  the multiplier
+ * @return      `a * b`, or the sign-appropriate bound on overflow
+ */
+pub fn saturating_mul_i32(a: i32, b: i32) -> i32 {
+    match checked_mul_i32(a, b) {
+        i32 as v => v
+        error => { if (a > 0) == (b > 0) { return i32_max() }; i32_min() }
+    }
+}
+
+/**
+ * The maximum value of `i64` (2^63 - 1).
+ *
+ * @return      `i64::MAX`
+ */
+pub fn i64_max() -> i64 { 9223372036854775807 }
+
+/**
+ * The minimum value of `i64` (-2^63). Written as `-MAX - 1` via an annotated intermediate, since `-2^63` has no positive counterpart to negate.
+ *
+ * @return      `i64::MIN`
+ */
+pub fn i64_min() -> i64 {
+    let m: i64 = -9223372036854775807
+    m - 1
+}
+
+/**
+ * Reinterpret `a: i64` as its two's-complement bit pattern typed `u64`.
+ *
+ * Non-negative `a` maps directly. For negative `a`, `a - i64::MIN` lands in
+ * `[0, 2^63 - 1]` (in range — no trapping cast, no signed overflow); adding the
+ * sign bit `2^63` in the `u64` domain reconstructs `a + 2^64`, the two's-complement
+ * pattern. Mirrors the VM's `norm_int`, so both engines agree bit-for-bit.
+ *
+ * @param a  the signed value to reinterpret
+ * @return      the `u64` whose bits equal `a`'s two's-complement encoding
+ */
+fn u64_bits_of_i64(a: i64) -> u64 {
+    if a >= 0 { return a to u64 }
+    (a - i64_min()) to u64 + ((1 to u64) << 63)
+}
+
+/**
+ * Reinterpret a `u64` bit pattern `u` as the `i64` it two's-complement encodes — the inverse of `u64_bits_of_i64`.
+ *
+ * Sign bit clear (`u < 2^63`) maps directly. Otherwise `u - 2^63` is in
+ * `[0, 2^63 - 1]` (in range), and adding `i64::MIN` yields `u - 2^64`, the signed
+ * interpretation of a set sign bit.
+ *
+ * @param u  the `u64` bit pattern to reinterpret
+ * @return      the `i64` two's-complement-encoded by `u`
+ */
+fn i64_from_u64_bits(u: u64) -> i64 {
+    if u < ((1 to u64) << 63) { return u to i64 }
+    (u - ((1 to u64) << 63)) to i64 + i64_min()
+}
+
+/**
+ * Add `a + b` as `i64`, erroring instead of overflowing (signed overflow is UB in the emitted C — never performed here). Overflow is caught by in-range boundary comparisons.
+ *
+ * @param a  the augend
+ * @param b  the addend
+ * @return      `a + b` as `i64`, or an `error` on signed overflow
+ * @throws      when the sum leaves `[i64::MIN, i64::MAX]`
+ */
+pub fn checked_add_i64(a: i64, b: i64) -> i64 | error {
+    if b > 0 && a > i64_max() - b { return checked_error("math::checked_add_i64: overflow") }
+    if b < 0 && a < i64_min() - b { return checked_error("math::checked_add_i64: overflow") }
+    a + b
+}
+
+/**
+ * Subtract `a - b` as `i64`, erroring instead of overflowing. The boundary comparisons (`i64::MAX + b` for `b < 0`, `i64::MIN + b` for `b > 0`) stay in range.
+ *
+ * @param a  the minuend
+ * @param b  the subtrahend
+ * @return      `a - b` as `i64`, or an `error` on signed overflow
+ * @throws      when the difference leaves `[i64::MIN, i64::MAX]`
+ */
+pub fn checked_sub_i64(a: i64, b: i64) -> i64 | error {
+    if b < 0 && a > i64_max() + b { return checked_error("math::checked_sub_i64: overflow") }
+    if b > 0 && a < i64_min() + b { return checked_error("math::checked_sub_i64: overflow") }
+    a - b
+}
+
+/**
+ * Multiply `a * b` as `i64`, erroring instead of overflowing. The `i64::MIN` corners (`a == -1 && b == MIN`, and its mirror) are handled before the division-bound checks, since `MIN / -1` itself overflows.
+ *
+ * @param a  the multiplicand
+ * @param b  the multiplier
+ * @return      `a * b` as `i64`, or an `error` on signed overflow
+ * @throws      when the product leaves `[i64::MIN, i64::MAX]`
+ */
+pub fn checked_mul_i64(a: i64, b: i64) -> i64 | error {
+    if a == 0 || b == 0 { return (0 to i64) }
+    if a == -1 {
+        if b == i64_min() { return checked_error("math::checked_mul_i64: overflow") }
+        return -b
+    }
+    if b == -1 {
+        if a == i64_min() { return checked_error("math::checked_mul_i64: overflow") }
+        return -a
+    }
+    if a > 0 {
+        if b > 0 && a > i64_max() / b { return checked_error("math::checked_mul_i64: overflow") }
+        if b < 0 && b < i64_min() / a { return checked_error("math::checked_mul_i64: overflow") }
+    } else {
+        if b > 0 && a < i64_min() / b { return checked_error("math::checked_mul_i64: overflow") }
+        if b < 0 && a < i64_max() / b { return checked_error("math::checked_mul_i64: overflow") }
+    }
+    a * b
+}
+
+/**
+ * Divide `a / b` as `i64`, erroring on a zero divisor and on `i64::MIN / -1` (whose true quotient `i64::MAX + 1` is unrepresentable).
+ *
+ * @param a  the dividend
+ * @param b  the divisor
+ * @return      `a / b` as `i64`, or an `error` on divide-by-zero or `MIN / -1`
+ * @throws      when `b == 0`, or `a == i64::MIN && b == -1`
+ */
+pub fn checked_div_i64(a: i64, b: i64) -> i64 | error {
+    if b == 0 { return checked_error("math::checked_div_i64: divide by zero") }
+    if a == i64_min() && b == -1 { return checked_error("math::checked_div_i64: overflow") }
+    a / b
+}
+
+/**
+ * Remainder `a % b` as `i64`, erroring on a zero divisor. `i64::MIN % -1` is defined `0` (returned directly; the bare `%` would be UB there).
+ *
+ * @param a  the dividend
+ * @param b  the divisor
+ * @return      `a % b` as `i64`, `0` for `MIN % -1`, or an `error` if `b == 0`
+ * @throws      when `b == 0` (division by zero)
+ */
+pub fn checked_rem_i64(a: i64, b: i64) -> i64 | error {
+    if b == 0 { return checked_error("math::checked_rem_i64: divide by zero") }
+    if a == i64_min() && b == -1 { return (0 to i64) }
+    a % b
+}
+
+/**
+ * Negate `a` as `i64`, erroring only on `i64::MIN` (which has no representable positive counterpart in two's complement).
+ *
+ * @param a  the value to negate
+ * @return      `-a` as `i64`, or an `error` if `a == i64::MIN`
+ * @throws      when `a == i64::MIN`
+ */
+pub fn checked_neg_i64(a: i64) -> i64 | error {
+    if a == i64_min() { return checked_error("math::checked_neg_i64: overflow") }
+    -a
+}
+
+/**
+ * Raise `base` to `exp` as `i64` by squaring, erroring instead of overflowing. `base^0 == 1`; a negative base is fine (its sign follows the exponent's parity).
+ *
+ * @param base  the base
+ * @param power  the exponent (non-negative by `u32` type)
+ * @return      `base^exp` as `i64`, or an `error` if any step overflows
+ * @throws      when a partial product leaves `[i64::MIN, i64::MAX]`
+ */
+pub fn checked_pow_i64(base: i64, power: u32) -> i64 | error {
+    mut result: i64 = (1 to i64)
+    mut b = base
+    mut e = power
+    loop {
+        if e == 0 { break }
+        if e % 2 == 1 {
+            match checked_mul_i64(result, b) {
+                i64 as v => { result = v }
+                error as err => return err
+            }
+        }
+        e = e / 2
+        if e != 0 {
+            match checked_mul_i64(b, b) {
+                i64 as v => { b = v }
+                error as err => return err
+            }
+        }
+    }
+    result
+}
+
+/**
+ * Shift `a` left by `count` bits as `i64`, erroring when `count >= 64`. The shift itself rides the runtime's masked, UB-free signed shift.
+ *
+ * @param a  the value to shift
+ * @param count  the shift amount in bits
+ * @return      `a << count` as `i64`, or an `error` if `count >= 64`
+ * @throws      when `count >= 64`
+ */
+pub fn checked_shl_i64(a: i64, count: u32) -> i64 | error {
+    if count >= 64 { return checked_error("math::checked_shl_i64: shift out of range") }
+    a << (count to i64)
+}
+
+/**
+ * Shift `a` right by `count` bits as `i64` (arithmetic — sign-preserving), erroring when `count >= 64`.
+ *
+ * @param a  the value to shift
+ * @param count  the shift amount in bits
+ * @return      `a >> count` as `i64`, or an `error` if `count >= 64`
+ * @throws      when `count >= 64`
+ */
+pub fn checked_shr_i64(a: i64, count: u32) -> i64 | error {
+    if count >= 64 { return checked_error("math::checked_shr_i64: shift out of range") }
+    a >> (count to i64)
+}
+
+/**
+ * Wrapping `a + b` as `i64` — the sum modulo 2^64. Routed through the `u64` domain (where `+` is defined modular in C) and reinterpreted back, so no signed overflow UB is emitted. Total.
+ *
+ * @param a  the left operand
+ * @param b  the right operand
+ * @return      `(a + b) mod 2^64` as `i64` (two's-complement wraparound)
+ */
+pub fn wrapping_add_i64(a: i64, b: i64) -> i64 {
+    i64_from_u64_bits(u64_bits_of_i64(a) + u64_bits_of_i64(b))
+}
+
+/**
+ * Wrapping `a - b` as `i64` — the difference modulo 2^64. Routed through the `u64` domain (where `-` is defined modular in C) and reinterpreted back, so no signed overflow UB is emitted. Total.
+ *
+ * @param a  the left operand
+ * @param b  the right operand
+ * @return      `(a - b) mod 2^64` as `i64` (two's-complement wraparound)
+ */
+pub fn wrapping_sub_i64(a: i64, b: i64) -> i64 {
+    i64_from_u64_bits(u64_bits_of_i64(a) - u64_bits_of_i64(b))
+}
+
+/**
+ * Wrapping `a * b` as `i64` — the product modulo 2^64. Routed through the `u64` domain (where `*` is defined modular in C) and reinterpreted back, so no signed overflow UB is emitted. Total.
+ *
+ * @param a  the left operand
+ * @param b  the right operand
+ * @return      `(a * b) mod 2^64` as `i64` (two's-complement wraparound)
+ */
+pub fn wrapping_mul_i64(a: i64, b: i64) -> i64 {
+    i64_from_u64_bits(u64_bits_of_i64(a) * u64_bits_of_i64(b))
+}
+
+/**
+ * Wrapping negation of `a` as `i64` — `i64::MIN` maps to itself (defining the UB corner). Routed through the `u64` domain, so no signed overflow is emitted. Total.
+ *
+ * @param a  the value to negate
+ * @return      `-a mod 2^64` as `i64` (with `i64::MIN -> i64::MIN`)
+ */
+pub fn wrapping_neg_i64(a: i64) -> i64 {
+    i64_from_u64_bits((0 to u64) - u64_bits_of_i64(a))
+}
+
+/**
+ * Wrapping left shift of `a` by `count` bits as `i64`; the count is masked to `count mod 64` (the #49/#61 semantics); the runtime's signed `<<` is UB-free. Total.
+ *
+ * @param a  the value to shift
+ * @param count  the shift amount (masked to `mod 64`)
+ * @return      `a << (count mod 64)` as `i64`
+ */
+pub fn wrapping_shl_i64(a: i64, count: u32) -> i64 { a << ((count % 64) to i64) }
+
+/**
+ * Wrapping right shift of `a` by `count` bits as `i64` (arithmetic); the count is masked to `count mod 64` (the #49/#61 semantics). Total.
+ *
+ * @param a  the value to shift
+ * @param count  the shift amount (masked to `mod 64`)
+ * @return      `a >> (count mod 64)` as `i64`
+ */
+pub fn wrapping_shr_i64(a: i64, count: u32) -> i64 { a >> ((count % 64) to i64) }
+
+/**
+ * Saturating `a + b` as `i64` — clamps to `i64::MAX` on positive overflow and `i64::MIN` on negative overflow. Total.
+ *
+ * @param a  the augend
+ * @param b  the addend
+ * @return      `a + b`, or the sign-appropriate bound on overflow
+ */
+pub fn saturating_add_i64(a: i64, b: i64) -> i64 {
+    match checked_add_i64(a, b) {
+        i64 as v => v
+        error => { if b > 0 { return i64_max() }; i64_min() }
+    }
+}
+
+/**
+ * Saturating `a - b` as `i64` — clamps to `i64::MAX` on positive overflow and `i64::MIN` on negative overflow. Total.
+ *
+ * @param a  the minuend
+ * @param b  the subtrahend
+ * @return      `a - b`, or the sign-appropriate bound on overflow
+ */
+pub fn saturating_sub_i64(a: i64, b: i64) -> i64 {
+    match checked_sub_i64(a, b) {
+        i64 as v => v
+        error => { if b < 0 { return i64_max() }; i64_min() }
+    }
+}
+
+/**
+ * Saturating `a * b` as `i64` — clamps to `i64::MAX` when the product's sign is positive, `i64::MIN` when negative. Total.
+ *
+ * @param a  the multiplicand
+ * @param b  the multiplier
+ * @return      `a * b`, or the sign-appropriate bound on overflow
+ */
+pub fn saturating_mul_i64(a: i64, b: i64) -> i64 {
+    match checked_mul_i64(a, b) {
+        i64 as v => v
+        error => { if (a > 0) == (b > 0) { return i64_max() }; i64_min() }
+    }
+}
