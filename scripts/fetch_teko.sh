@@ -40,8 +40,8 @@ LABEL="${o}-${a}"
 # Newest release BY VERSION — the /releases API is not version-ordered, so `[0]` can be
 # a stale tag (0.0.1.9 ahead of 0.0.1.17). Filter to MAJOR.MINOR.PATCH.BUILD + `sort -V`.
 TAG="$(gh api "repos/${REPO}/releases" --paginate \
-  --jq 'map(select(.draft | not) | .tag_name)[] | select(test("^[0-9]+([.][0-9]+){3}"))' \
-  | sort -V | tail -n1)"
+  --jq 'map(select(.draft | not) | .tag_name)[] | select(test("^v?[0-9]+([.][0-9]+){3}"))' \
+  | awk '{ orig=$0; ver=$0; sub(/^v/,"",ver); print ver"\t"orig }' | sort -V | tail -n1 | cut -f2)"
 if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
   echo "fetch_teko: no published release found for $REPO" >&2
   exit 1
