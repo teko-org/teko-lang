@@ -31,20 +31,29 @@ fi
 echo "ci_provision_teko: seeding compiler from release $TAG (asset teko-${LABEL}.*)"
 
 # Download the asset. The Linux labels gained a libc suffix (linux-x86_64 -> linux-x86_64-glibc)
-# when the release started shipping glibc+musl separately; a release predating that split has
-# only the unsuffixed asset, so fall back to `<label>` with the trailing `-glibc` stripped.
+# when the release started shipping glibc+musl separately — but a caller may pass EITHER form,
+# and the target release may predate OR postdate the split. So try, in order: the exact label;
+# then the glibc-suffixed form (a bare `linux-<arch>` maps to `linux-<arch>-glibc`, the default);
+# then the unsuffixed legacy form (`-glibc` stripped, for a pre-split release). First hit wins.
+# macOS/Windows labels never changed, so their only candidate is themselves.
+CANDS="$LABEL"
+case "$LABEL" in
+  linux-*-glibc) CANDS="$CANDS ${LABEL%-glibc}" ;;   # new -glibc name -> legacy bare
+  linux-*-musl)  : ;;                                 # musl has no legacy alias
+  linux-*)       CANDS="$CANDS ${LABEL}-glibc" ;;     # legacy bare -> new glibc default
+esac
 rm -f teko-*.tar.gz teko-*.zip
-if gh release download "$TAG" -R "$REPO" -p "teko-${LABEL}.tar.gz" -p "teko-${LABEL}.zip" --clobber 2>/dev/null; then
-  :
-else
-  ALT="${LABEL%-glibc}"
-  if [ "$ALT" != "$LABEL" ]; then
-    echo "ci_provision_teko: teko-${LABEL}.* absent in $TAG — falling back to legacy teko-${ALT}.*"
-    gh release download "$TAG" -R "$REPO" -p "teko-${ALT}.tar.gz" -p "teko-${ALT}.zip" --clobber
-  else
-    echo "ci_provision_teko: no seed asset teko-${LABEL}.* in $TAG" >&2
-    exit 1
+GOT=""
+for c in $CANDS; do
+  if gh release download "$TAG" -R "$REPO" -p "teko-${c}.tar.gz" -p "teko-${c}.zip" --clobber 2>/dev/null; then
+    GOT="$c"
+    [ "$c" = "$LABEL" ] || echo "ci_provision_teko: teko-${LABEL}.* absent in $TAG — using teko-${c}.*"
+    break
   fi
+done
+if [ -z "$GOT" ]; then
+  echo "ci_provision_teko: no seed asset for '$LABEL' (tried: $CANDS) in $TAG" >&2
+  exit 1
 fi
 
 rm -rf .seed
