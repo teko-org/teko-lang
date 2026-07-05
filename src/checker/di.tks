@@ -17,6 +17,12 @@ pub type DiProvider = struct { iface: str; kind: parser::DiKind; impl_name: str;
  *  (in core) by interface alone. A duplicate `(interface)` with no key is a compile error. */
 pub type DiRegistry = struct { providers: []DiProvider }
 
+/** One injected local in scope while a fn body is typed (W10c/MEM-3): the source `#inject` name,
+ *  the provider it resolved to, and its lifetime. A USE of `name` lowers to a call of the
+ *  provider's materializer — carried on the `Env` so `type_var` sees it without re-threading the
+ *  registry through every typer entry point. */
+pub type DiInjectBind = struct { name: str; iface: str; impl_name: str; kind: parser::DiKind }
+
 /** An empty DI registry — the starting point of a build and the whole registry of a program
  *  with no DI annotation. */
 fn di_registry_empty() -> DiRegistry {
@@ -193,6 +199,54 @@ pub fn check_di(prog: parser::Program, table: TypeTable) -> error? {
     if !program_uses_di(prog) { return null }
     let reg = match build_di_registry(prog, table) { DiRegistry as r => r; error as e => return e }
     check_inject_overlays(prog, reg, table)
+}
+
+/** Seed a fn body's environment with its `#inject` overlay (Crumb 4): each binding becomes a local
+ *  of its resolved interface type AND a `DiInjectBind` on the env, so a later USE of the name lowers
+ *  to the provider's materializer call. The registry is read off the env (set once at program
+ *  level). A binding whose interface has no provider is caught by `check_inject_overlays`; here a
+ *  miss falls through to a plain local, so this never introduces a second diagnostic. */
+fn seed_di_injects(f: parser::Function, env: Env, tbl: TypeTable) -> Env | error {
+    mut local = env
+    mut binds: []DiInjectBind = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= f.injects.len { break }
+        let b = f.injects[i]
+        let iface = binding_iface_name(b.type_ann)
+        let t = match resolve_type(b.type_ann, tbl, env.cur_ns) { Type as ty => ty; error as e => return e }
+        local = define(local, b.name, t, false)
+        match resolve_provider(env.di, iface) {
+            DiProvider as p => binds = teko::list::push(binds, DiInjectBind { name = b.name; iface = iface; impl_name = p.impl_name; kind = p.kind })
+            error => {}
+        }
+        i++
+    }
+    with_injects(local, binds)
+}
+
+/** Lower a USE of an injected name into the provider's materializer call (Crumb 4): a `TCall` to
+ *  `__di_materialize_<Impl>` with NO source args — codegen/VM thread the enclosing region in — typed
+ *  as the injected interface. Reusing `TCall` keeps the typed AST free of any new node variant. */
+pub fn di_lower_use(b: DiInjectBind, t: Type) -> TExpr {
+    let seg = parser::Segment { name = di_materializer_name(b.impl_name) }
+    let callee = parser::Path { segments = teko::list::push(teko::list::empty(), seg) }
+    let call = TCall { callee = callee; args = teko::list::empty(); call_ns = ""; is_closure_call = false; callee_type = t; is_iface_dispatch = false; iface_slot = 0 }
+    TExpr { kind = call; type = t; line = 0; col = 0 }
+}
+
+/** Is `name` a call to a DI materializer helper (`__di_materialize_…`)? Codegen and the VM use this
+ *  to recognize the synthesized call an injected-name use lowered to (Crumb 5/7). */
+pub fn is_di_materializer_call(name: str) -> bool {
+    let prefix = "__di_materialize_"
+    if name.len < prefix.len { return false }
+    mut i: u64 = 0
+    loop {
+        if i >= prefix.len { break }
+        if name[i] != prefix[i] { return false }
+        i++
+    }
+    true
 }
 
 /** The synthesized per-impl materializer name — the compiler-chosen helper an injected-name

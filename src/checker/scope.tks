@@ -28,10 +28,37 @@ type ValBinding = struct {
 // on a self-build). Sealing the globals once (seal(), called by the typer between collect and the
 // typing loop) makes a fork copy only its OWN locals — a few dozen entries. Lookups scan bindings
 // innermost-first, THEN base innermost-first (locals shadow globals; global order preserved).
-pub type Env = struct { base: []ValBinding; bindings: []ValBinding; cur_ns: str; owner_type: str }
+/** (W10c/MEM-3) `di` — the program's DI registry (set once at the program level, empty otherwise);
+ *  `injects` — the DI-injected locals in scope while THIS fn body is typed (empty for every
+ *  non-`#inject` function, so a DI-free corpus is byte-identical). A `type_var` reading an injected
+ *  name lowers to the provider's materializer call. */
+pub type Env = struct { base: []ValBinding; bindings: []ValBinding; cur_ns: str; owner_type: str; di: DiRegistry; injects: []DiInjectBind }
 
 // an empty env (no bindings, no current namespace, not inside any class method).
-pub fn env_empty() -> Env { Env { base = teko::list::empty(); bindings = teko::list::empty(); cur_ns = ""; owner_type = "" } }
+pub fn env_empty() -> Env { Env { base = teko::list::empty(); bindings = teko::list::empty(); cur_ns = ""; owner_type = ""; di = di_registry_empty(); injects = teko::list::empty() } }
+
+/** (W10c/MEM-3) set the program DI registry once — the typer seeds it onto the base env after the
+ *  DI pass so `type_function` can resolve each `#inject` binding to its provider. */
+pub fn with_di(env: Env, di: DiRegistry) -> Env {
+    Env { base = env.base; bindings = env.bindings; cur_ns = env.cur_ns; owner_type = env.owner_type; di = di; injects = env.injects }
+}
+
+/** (W10c/MEM-3) set the DI-injected locals in scope for the fn body about to be typed. */
+pub fn with_injects(env: Env, injects: []DiInjectBind) -> Env {
+    Env { base = env.base; bindings = env.bindings; cur_ns = env.cur_ns; owner_type = env.owner_type; di = env.di; injects = injects }
+}
+
+/** (W10c/MEM-3) the DI-injected binding named `name` in scope, or an error if none — the signal a
+ *  `type_var` uses to decide whether to lower the read into a materializer call. */
+pub fn lookup_inject(env: Env, name: str) -> DiInjectBind | error {
+    mut i = env.injects.len
+    loop {
+        if i == 0 { break }
+        i = i - 1
+        if env.injects[i].name == name { return env.injects[i] }
+    }
+    error { message = $"no injected binding named {name}" }
+}
 
 // (#148) seal — move the accumulated bindings into the immutable `base` segment. Called ONCE per
 // collected env, at the collect→type boundary; later defines land in the fresh `bindings`.
@@ -39,25 +66,25 @@ pub fn seal(env: Env) -> Env {
     mut b = env.base
     mut i: u64 = 0
     loop { if i >= env.bindings.len { break }; b = teko::list::push(b, env.bindings[i]); i++ }
-    Env { base = b; bindings = teko::list::empty(); cur_ns = env.cur_ns; owner_type = env.owner_type }
+    Env { base = b; bindings = teko::list::empty(); cur_ns = env.cur_ns; owner_type = env.owner_type; di = env.di; injects = env.injects }
 }
 
 // (#41) set the namespace currently being type-checked — the typed pass sets it per item.
-pub fn with_ns(env: Env, ns: str) -> Env { Env { base = env.base; bindings = env.bindings; cur_ns = ns; owner_type = env.owner_type } }
+pub fn with_ns(env: Env, ns: str) -> Env { Env { base = env.base; bindings = env.bindings; cur_ns = ns; owner_type = env.owner_type; di = env.di; injects = env.injects } }
 
 // (W10b.CLASS) set the DECLARING class of the method body about to be typed ("" clears it —
 // used when entering a free function).
-pub fn with_owner(env: Env, owner: str) -> Env { Env { base = env.base; bindings = env.bindings; cur_ns = env.cur_ns; owner_type = owner } }
+pub fn with_owner(env: Env, owner: str) -> Env { Env { base = env.base; bindings = env.bindings; cur_ns = env.cur_ns; owner_type = owner; di = env.di; injects = env.injects } }
 
 // define a LOCAL name (append). `is_mut`: a `mut` binding passes true; everything else false (B.21).
 // Locals carry no namespace ("").
 pub fn define(env: Env, name: str, t: Type, is_mut: bool) -> Env {
-    Env { base = env.base; bindings = teko::list::push(env.bindings, ValBinding { name = name; type = t; is_mut = is_mut; ns = "" }); cur_ns = env.cur_ns; owner_type = env.owner_type }
+    Env { base = env.base; bindings = teko::list::push(env.bindings, ValBinding { name = name; type = t; is_mut = is_mut; ns = "" }); cur_ns = env.cur_ns; owner_type = env.owner_type; di = env.di; injects = env.injects }
 }
 
 // (#41) define a TOP-LEVEL FUNCTION binding carrying its declaring namespace.
 pub fn define_fn(env: Env, name: str, t: Type, ns: str) -> Env {
-    Env { base = env.base; bindings = teko::list::push(env.bindings, ValBinding { name = name; type = t; is_mut = false; ns = ns }); cur_ns = env.cur_ns; owner_type = env.owner_type }
+    Env { base = env.base; bindings = teko::list::push(env.bindings, ValBinding { name = name; type = t; is_mut = false; ns = ns }); cur_ns = env.cur_ns; owner_type = env.owner_type; di = env.di; injects = env.injects }
 }
 
 // a binding is mutable iff declared `mut` (Let and Const are immutable — B.21).

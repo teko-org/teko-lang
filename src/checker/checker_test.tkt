@@ -27,7 +27,7 @@ fn u32t()  -> Type { Prim { kind = PrimKind::U32 } }
 fn u8t()   -> Type { Prim { kind = PrimKind::U8 } }
 fn i64t()  -> Type { Prim { kind = PrimKind::I64 } }
 fn boolt() -> Type { Prim { kind = PrimKind::Bool } }
-fn empty_env()   -> Env       { Env { base = teko::list::empty(); bindings = teko::list::empty(); cur_ns = ""; owner_type = "" } }   // (#148) two-segment env
+fn empty_env()   -> Env       { Env { base = teko::list::empty(); bindings = teko::list::empty(); cur_ns = ""; owner_type = ""; di = DiRegistry { providers = teko::list::empty() }; injects = teko::list::empty() } }
 fn empty_table() -> TypeTable { teko::list::empty() }
 fn prim_is(t: Type, k: PrimKind) -> bool { match t { Prim as p => p.kind == k; _ => false } }
 
@@ -3545,4 +3545,26 @@ fn with_struct_di_singleton(item: parser::Item) -> parser::Item {
         parser::TypeDecl as td => parser::Item { content = parser::TypeDecl { name = td.name; type_params = td.type_params; type_constraints = td.type_constraints; body = td.body; vis = td.vis; has_doc = td.has_doc; doc = td.doc; line = td.line; col = td.col; di_kind = parser::DiKind::Singleton; has_di_key = false; di_key = "" }; namespace = item.namespace; file = item.file }
         _ => item
     }
+}
+
+#test
+fn di_use_lowers_to_materializer_call() {
+    let ib = DiInjectBind { name = "log"; iface = "Log"; impl_name = "Logger"; kind = parser::DiKind::Singleton }
+    let te = di_lower_use(ib, Named { name = "Log" })
+    match te.kind {
+        TCall as c => {
+            teko::assert::is_true(c.callee.segments.len == 1)
+            teko::assert::is_true(c.callee.segments[0].name == "__di_materialize_Logger")
+            teko::assert::is_true(c.args.len == 0)
+            teko::assert::is_false(c.is_iface_dispatch)
+        }
+        _ => teko::assert::is_true(false)
+    }
+    teko::assert::is_true(is_di_materializer_call("__di_materialize_Logger"))
+    teko::assert::is_false(is_di_materializer_call("make"))
+}
+
+#test
+fn di_materializer_name_is_impl_prefixed() {
+    teko::assert::is_true(di_materializer_name("Logger") == "__di_materialize_Logger")
 }
