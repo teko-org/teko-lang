@@ -23,16 +23,23 @@ use teko::parser
 // inferred bindings; `params` is the generic's type-param universe.
 type MonoInst = struct { fn_name: str; mangled: str; s: Subst }
 
-// (W11/S6, 2026-07-01) CONSTRAINT CHECKING — runs HERE, at monomorphization (never at
-// definition), per the settled design: an unconstrained T stays opaque at the generic's own
-// definition; a constraint gates the CONCRETE type bound to T once a real instantiation exists.
-//
-// NOMINAL membership: an atom names a `variant`/other TypeDecl. For a `variant` atom, the
-// concrete type must equal (by type_eq — no structural check) one of the variant's declared
-// MEMBER types (e.g. `type Comparable = i64 | f64 | str` — a concrete `i64` is a member).
-// For any other TypeDecl kind (struct/enum/flags/alias/extern), the atom is an exact nominal
-// name — the concrete type must be that SAME named type. An atom naming no TypeDecl at all is
-// unsatisfiable (never silently ignored — M.1 fail-loud).
+/**
+ * (W11/S6) CONSTRAINT CHECKING — does `concrete` satisfy the single atom `atom_name`? Runs HERE,
+ * at monomorphization (never at definition): an unconstrained `T` stays opaque at the generic's
+ * own definition; a constraint gates the CONCRETE type bound to `T` once a real instantiation
+ * exists. Membership is NOMINAL. A `variant` atom is satisfied when `concrete` equals (by `type_eq`
+ * — no structural check) one of the variant's declared MEMBER types. An INTERFACE or (TR1) TRAIT
+ * atom is satisfied when `concrete` nominally conforms (its own name, or `type_conforms_to` through
+ * the class base chain + contract `extends` closure — the same gate as the D3 upcast); classes AND
+ * structs conform here (a struct cannot become a contract VALUE, but it may instantiate a
+ * constrained generic). Any other TypeDecl kind (struct/enum/flags/alias/extern) is an exact
+ * nominal name. An atom naming no TypeDecl at all is unsatisfiable (never silently ignored — M.1).
+ *
+ * @param atom_name the constraint atom's name
+ * @param concrete  the concrete type bound to the type parameter at this instantiation
+ * @param table     the folded type table
+ * @return true iff `concrete` satisfies the atom
+ */
 fn constraint_atom_satisfied(atom_name: str, concrete: Type, table: TypeTable) -> bool {
     match type_table_find(table, atom_name, "") {   // (#109 W1) constraint-atom probe on a resolved name — no referencing ns
         parser::TypeDecl as td => {
@@ -54,12 +61,8 @@ fn constraint_atom_satisfied(atom_name: str, concrete: Type, table: TypeTable) -
                         error => false
                     }
                 }
-                // (W10b.D2) an INTERFACE atom: the concrete type satisfies `<T: I>` when it
-                // NOMINALLY conforms (declared `implements`, through the class base chain + the
-                // contract's `extends` closure — the same gate as the D3 upcast). Classes AND
-                // structs conform here (a struct cannot become an interface VALUE, but it may
-                // instantiate a constrained generic).
                 parser::InterfaceBody => match concrete { Named as n => n.name == atom_name || type_conforms_to(n.name, atom_name, table); _ => false }
+                parser::TraitBody => match concrete { Named as n => n.name == atom_name || type_conforms_to(n.name, atom_name, table); _ => false }
                 _ => match concrete { Named as n => n.name == atom_name; _ => false }   // exact nominal-name match
             }
         }
@@ -81,20 +84,19 @@ fn constraint_satisfied(c: parser::ConstraintExpr, concrete: Type, table: TypeTa
         parser::NoConstraint => true
     }
 }
-// Gate a whole instantiation: type_params/type_constraints are PARALLEL; `s` is the Subst that
-// bound each param to a concrete type for THIS instantiation.
-// (TR0→TR1) the first constraint ATOM naming a `trait`, if any — walked so `<T: Trait>` is an
-// HONEST TR1 stop (trait-as-constraint), never the silent exact-nominal-name fallback in
-// constraint_atom_satisfied. (VM match-arm ordering: multi-field cases first — see above.)
-fn constraint_first_trait_atom(c: parser::ConstraintExpr, table: TypeTable) -> str? {
-    match c {
-        parser::ConstraintAnd as a => match constraint_first_trait_atom(a.left, table) { str as s => s; null => constraint_first_trait_atom(a.right, table) }
-        parser::ConstraintOr as o => match constraint_first_trait_atom(o.left, table) { str as s => s; null => constraint_first_trait_atom(o.right, table) }
-        parser::ConstraintAtom as a => if is_trait_name(a.name, table) { a.name } else { null }
-        parser::NoConstraint => null
-    }
-}
-
+/**
+ * Gate a whole instantiation: `type_params` and `type_constraints` are PARALLEL; `s` is the Subst
+ * that bound each param to a concrete type for THIS instantiation. (TR1) A trait as a constraint
+ * atom is a normal atom now — it flows into `constraint_satisfied` and is checked nominally, no
+ * honest stop.
+ *
+ * @param type_params      the generic's type-parameter names
+ * @param type_constraints the parallel constraint expression per type parameter
+ * @param s                the Subst binding each param to its concrete type
+ * @param table            the folded type table
+ * @return null when every constraint is satisfied
+ * @throws when a param is unbound, or a bound concrete type does not satisfy its constraint
+ */
 fn check_constraints(type_params: []str, type_constraints: []parser::ConstraintExpr, s: Subst, table: TypeTable) -> error? {
     mut i = 0
     loop {
@@ -102,11 +104,6 @@ fn check_constraints(type_params: []str, type_constraints: []parser::ConstraintE
         match type_constraints[i] {
             parser::NoConstraint => { }
             _ => {
-                // (TR0→TR1) a trait as a constraint atom is TR1 — an honest stop.
-                match constraint_first_trait_atom(type_constraints[i], table) {
-                    str as tn => return error { message = teko::string::concat("'", tn, "' is a trait — a trait as a generic constraint (`<T: Trait>`) is not implemented yet (TR1)") }
-                    null => { }
-                }
                 let bound = match subst_find_inst(s, type_params[i]) {
                     Type as t => t
                     null => return error { message = teko::string::concat("internal: monomorphization did not bind type parameter '", type_params[i], "'") }

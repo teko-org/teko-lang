@@ -279,16 +279,22 @@ fn type_ref_ns(path: parser::Path, table: TypeTable, ref_ns: str) -> str {
     ""
 }
 
-/** (S6, issue #162) an interface-atom's own EFFECTIVE (extends-transitive) methods — the leaf case
-    of a constraint's method surface. A trait atom is a named TR1 honest stop (the gancho #176
-    plugs by replacing this one arm with the trait's required methods, once traits reuse the D3
-    vtable — traits are struct-shaped/derivable per [[teko-traits-and-nullprop-rounds]]). Every
-    other KNOWN atom kind (struct/enum/flags/variant/alias/extern/class — no shared nominal method
-    contract to expose) contributes an EMPTY surface: it may still satisfy the constraint nominally
-    (Tensão 1 — nominal membership is unaffected), but authorizes no operation on T through it. An
-    atom naming NO TypeDecl at all is a named error (M.1 fail-loud — never silently opaque). */
+/**
+ * (S6, issue #162 / TR1 #176) A contract-atom's own EFFECTIVE methods — the leaf case of a
+ * constraint's method surface. An INTERFACE contributes its extends-transitive methods; a TRAIT
+ * contributes its own method list (no `extends` to walk). Every other KNOWN atom kind
+ * (struct/enum/flags/variant/alias/extern/class — no shared nominal method contract to expose)
+ * contributes an EMPTY surface: it may still satisfy the constraint nominally, but authorizes no
+ * operation on T through it. An atom naming NO TypeDecl at all is a named error (M.1 fail-loud —
+ * never silently opaque).
+ *
+ * @param name  the constraint atom's name
+ * @param table the folded type table
+ * @return the atom's authorized method surface (possibly empty)
+ * @throws when `name` names no declared type
+ */
 fn atom_surface(name: str, table: TypeTable) -> []parser::Function | error {
-    if is_trait_name(name, table) { return error { message = $"'{name}' is a trait — a trait as a generic constraint (`<T: Trait>`) is not implemented yet (TR1)" } }
+    if is_trait_name(name, table) { return trait_methods_by_name(name, table) }
     if is_interface_name(name, table) { return iface_methods_by_name(name, table) }
     match type_table_find(table, name, "") {
         parser::TypeDecl => { let empty_surface: []parser::Function = teko::list::empty(); empty_surface }
@@ -429,11 +435,13 @@ fn interfaces_surviving(names: []str, surface: []parser::Function, table: TypeTa
     out
 }
 
-/** The interface names a ConstraintExpr contributes to a type-param's synthetic InterfaceBody
-    `extends` list — the And-UNION of interface atoms (Risco-3 ambiguity-checked); an `Or`
-    contributes only the interfaces whose methods SURVIVE the intersected surface. Empty for a
-    struct/variant atom or NoConstraint; a named TR1 stop for a trait atom (mirrors atom_surface).
-    Recursive, mirroring constraint_surface's shape — the two stay in lockstep by construction. */
+/** The contract names a ConstraintExpr contributes to a type-param's synthetic InterfaceBody
+    `extends` list — the And-UNION of contract atoms (Risco-3 ambiguity-checked); an `Or`
+    contributes only the contracts whose methods SURVIVE the intersected surface. Empty for a
+    struct/variant atom or NoConstraint. (TR1) A trait atom contributes its OWN name exactly like an
+    interface — the synthetic type-param's `extends` names it, and `method_owner_interface` keys the
+    vtable slot off it via the now-trait-aware `iface_methods_by_name`. Recursive, mirroring
+    constraint_surface's shape — the two stay in lockstep by construction. */
 fn constraint_interfaces(c: parser::ConstraintExpr, table: TypeTable) -> []str | error {
     match c {
         parser::ConstraintAnd as a => {
@@ -448,7 +456,7 @@ fn constraint_interfaces(c: parser::ConstraintExpr, table: TypeTable) -> []str |
             interfaces_surviving(surface_union_names(l, r), surface, table)
         }
         parser::ConstraintAtom as a => {
-            if is_trait_name(a.name, table) { return error { message = $"'{a.name}' is a trait — a trait as a generic constraint (`<T: Trait>`) is not implemented yet (TR1)" } }
+            if is_trait_name(a.name, table) { return teko::list::push(teko::list::empty(), a.name) }
             if is_interface_name(a.name, table) { return teko::list::push(teko::list::empty(), a.name) }
             let no_interfaces: []str = teko::list::empty()
             no_interfaces
@@ -588,16 +596,6 @@ fn resolve_named(path: parser::Path, table: TypeTable, ref_ns: str) -> Type | er
         parser::TypeDecl as td => {
             match td.body {
                 parser::AliasBody as ab => return resolve_type(ab.alias, table, type_ref_ns(path, table, ref_ns))   // (#109 W2) alias body resolves in the alias's OWN ns, not the referencing ns
-                // (TR0) a trait NEVER reaches a value position — it is a derivable bundle, not a
-                // type for variables/params/returns/fields. Trait-typed DYNAMIC values (a vtable
-                // over the trait's bodyless requirements) arrive with TR1 — honest stop until then.
-                parser::TraitBody => return error { message = $"trait '{name}' is not a value type — derive it from a struct or class instead (trait-typed dynamic values arrive with TR1)" }
-                // (W10b.D3) an interface IS a value type now — a contract-typed value (data + vtable
-                // fat pointer, the tk_closure-shaped rep). It resolves NOMINALLY like any other named
-                // type; the upcast/dispatch rules live in widens_into + the method-call typer.
-                // (#109 W3) the Named carries the CANONICAL "ns::Name" (the resolved decl's own ns) so
-                // same-bare-name types across namespaces are distinct identities + C mangles. A stamped
-                // generic `__g__` instance is already globally unique → it stays BARE (matching type_item).
                 _ => return if name_is_g_instance(name) { Named { name = name } } else { Named { name = qualify(type_ref_ns(path, table, ref_ns), name) } }
             }
         }
@@ -704,7 +702,7 @@ fn widens_into_at(from: Type, to: Type, table: TypeTable, depth: i64) -> bool {
     match from {
         Named as fname => match to {
             Named as tname => {
-                if is_class_name(fname.name, table) && is_interface_name(tname.name, table) && type_conforms_to(fname.name, tname.name, table) { return true }
+                if is_class_name(fname.name, table) && (is_interface_name(tname.name, table) || is_trait_name(tname.name, table)) && type_conforms_to(fname.name, tname.name, table) { return true }
                 if fname.name != tname.name && is_class_name(fname.name, table) && is_polymorphic_base(tname.name, table) && subclass_reaches(fname.name, tname.name, table, 64) { return true }
             }
             _ => { }

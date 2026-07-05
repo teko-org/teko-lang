@@ -454,6 +454,22 @@ fn cg_is_interface_named(prog: checker::TProgram, name: str) -> bool {
     }
 }
 
+/**
+ * (TR1) Is `name` a `trait` declared in this program? A trait VALUE lowers to the SAME
+ * `{ data, vtable }` fat pointer as an interface value (W10b.D3), so upcast + dynamic-dispatch
+ * codegen key off this probe exactly as they do off `cg_is_interface_named`.
+ *
+ * @param prog the typed program
+ * @param name the (bare or canonical) contract name
+ * @return true iff `name` names a `TraitBody` decl
+ */
+fn cg_is_trait_named(prog: checker::TProgram, name: str) -> bool {
+    match cg_find_decl(prog, name) {
+        parser::TypeDecl as td => match td.body { parser::TraitBody => true; _ => false }
+        error => false
+    }
+}
+
 // (#98) is `name` a POLYMORPHIC BASE — a non-sealed class (`abstract`/`virtual`)? A base-typed
 // value lowers to the SAME fat pointer `{ data, vtable }` as an interface value (a companion
 // `tk_base_<name>` typedef), so a Sub→Base upcast + base-typed dispatch reuse the D3 machinery.
@@ -3433,7 +3449,7 @@ fn cg_wrap_elem_str(buf: []byte, prog: checker::TProgram, expected: checker::Typ
     // homogeneous `[]Circle` value covariant-rebuilds into a `[]Shape` slot.
     match expected {
         checker::Named as en => {
-            if cg_is_interface_named(prog, en.name) {
+            if cg_is_interface_named(prog, en.name) || cg_is_trait_named(prog, en.name) {
                 match vtype {
                     checker::Named as vn => {
                         if cg_is_class_named(prog, vn.name) {
@@ -3796,7 +3812,7 @@ fn emit_as_r(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, expe
     // already-contract-typed value falls through and is emitted plainly (same C typedef).
     match expected {
         checker::Named as en => {
-            if cg_is_interface_named(prog, en.name) {
+            if cg_is_interface_named(prog, en.name) || cg_is_trait_named(prog, en.name) {
                 match value.type {
                     checker::Named as vn => {
                         if cg_is_class_named(prog, vn.name) {
@@ -7349,6 +7365,11 @@ fn tk_emit_c_mode(prog0: checker::TProgram, mode: CgMode) -> str | error {
                         b = mangle_type_name(b, "", d.name)
                         b = cb(b, ";\n")
                     }
+                    parser::TraitBody => {
+                        b = cb(b, "typedef struct { void *data; void *const *vtable; } ")
+                        b = mangle_type_name(b, "", d.name)
+                        b = cb(b, ";\n")
+                    }
                     _ => { }   // enum / alias: no forward typedef
                 }
             }
@@ -7405,7 +7426,7 @@ fn tk_emit_c_mode(prog0: checker::TProgram, mode: CgMode) -> str | error {
                         if vii >= prog.items.len { break }
                         match prog.items[vii] {
                             parser::TypeDecl as idd => {
-                                let idd_is_iface = match idd.body { parser::InterfaceBody => true; _ => false }
+                                let idd_is_iface = match idd.body { parser::InterfaceBody => true; parser::TraitBody => true; _ => false }
                                 if idd_is_iface && checker::type_conforms_to(cd.name, idd.name, vt_table) {
                                     let ms = match checker::iface_methods_by_name(idd.name, vt_table) { []parser::Function as f => f; error => return error { message = "codegen: interface method list failed (internal)" } }
                                     b = cb(b, "static void *const tk_vt_")
