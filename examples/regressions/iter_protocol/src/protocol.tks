@@ -1,0 +1,349 @@
+/**
+ * A monomorphic i64 iterator: a closure yielding the next element or `null` at exhaustion.
+ * Self-contained twin of `teko::iter::IntIter` — a standalone project cannot see the compiler
+ * corpus's stdlib namespaces (they are in scope only when building the compiler itself), so
+ * this fixture re-declares the SAME shapes; the real module's tests live in
+ * `src/iter/iter_test.tkt`. THIS fixture pins the native==VM behavior of the protocol.
+ *
+ * @since ITER0
+ */
+pub type IntIter = () -> i64?
+
+/**
+ * The half-open range cursor: the next value to yield and the exclusive upper bound. Cursors
+ * live in caller-owned `mut` state and are threaded through a `Ref` (the one shared-mutation
+ * cell) — a `mut` captured directly by a closure is by-copy and would never advance.
+ *
+ * @param next  the next integer to yield
+ * @param hi    the exclusive upper bound
+ * @since ITER0
+ */
+pub type RangeCursor = struct { next: i64; hi: i64 }
+
+/**
+ * Iterate the half-open range `[cur.next, cur.hi)`.
+ *
+ * @param cur  the caller-owned range cursor
+ * @return     an IntIter over the range
+ * @since ITER0
+ */
+pub fn range(cur: Ref<RangeCursor>) -> IntIter {
+    let it: IntIter = () => {
+        if cur.value.next >= cur.value.hi { return null }
+        let v = cur.value.next
+        cur.value = RangeCursor { next = v + 1; hi = cur.value.hi }
+        v
+    }
+    it
+}
+
+/**
+ * Lazily map each element through `f`; stateless, so no cursor.
+ *
+ * @param src  the upstream iterator
+ * @param f    the per-element transform
+ * @return     a lazy IntIter of the transformed elements
+ * @since ITER0
+ */
+pub fn map(src: IntIter, f: (i64) -> i64) -> IntIter {
+    let mapped: IntIter = () => {
+        let nx = src()
+        match nx {
+            i64 as v => f(v)
+            null => null
+        }
+    }
+    mapped
+}
+
+/**
+ * Lazily keep only elements satisfying `keep`; stateless.
+ *
+ * @param src   the upstream iterator
+ * @param keep  the survival predicate
+ * @return      a lazy IntIter of the surviving elements
+ * @since ITER0
+ */
+pub fn filter(src: IntIter, keep: (i64) -> bool) -> IntIter {
+    let filtered: IntIter = () => {
+        mut result: i64? = null
+        loop {
+            let nx = src()
+            match nx {
+                i64 as v => {
+                    if keep(v) { result = v; break }
+                }
+                null => break
+            }
+        }
+        result
+    }
+    filtered
+}
+
+/**
+ * The remaining-count cursor for `take`.
+ *
+ * @param left  how many more elements `take` may yield
+ * @since ITER0
+ */
+pub type TakeCursor = struct { left: i64 }
+
+/**
+ * Yield at most `cur.left` elements, then stop WITHOUT pulling the source further (the lazy
+ * cap this fixture proves).
+ *
+ * @param src  the upstream iterator
+ * @param cur  the caller-owned remaining-count cursor
+ * @return     a lazy IntIter of at most `n` leading elements
+ * @since ITER0
+ */
+pub fn take(src: IntIter, cur: Ref<TakeCursor>) -> IntIter {
+    let taken: IntIter = () => {
+        if cur.value.left <= 0 { return null }
+        let nx = src()
+        match nx {
+            i64 as v => { cur.value = TakeCursor { left = cur.value.left - 1 }; v }
+            null => null
+        }
+    }
+    taken
+}
+
+/**
+ * The remaining-to-drop cursor for `skip`.
+ *
+ * @param left  how many more leading elements to discard
+ * @since ITER0
+ */
+pub type SkipCursor = struct { left: i64 }
+
+/**
+ * Discard the first `cur.left` elements, then pass the rest through.
+ *
+ * @param src  the upstream iterator
+ * @param cur  the caller-owned remaining-to-drop cursor
+ * @return     a lazy IntIter with its first `n` elements dropped
+ * @since ITER0
+ */
+pub fn skip(src: IntIter, cur: Ref<SkipCursor>) -> IntIter {
+    let skipped: IntIter = () => {
+        loop {
+            if cur.value.left <= 0 { break }
+            let dropped = src()
+            match dropped {
+                i64 => cur.value = SkipCursor { left = cur.value.left - 1 }
+                null => { cur.value = SkipCursor { left = 0 }; return null }
+            }
+        }
+        src()
+    }
+    skipped
+}
+
+/**
+ * The which-source cursor for `chain`.
+ *
+ * @param first_done  whether the first iterator has yielded `null`
+ * @since ITER0
+ */
+pub type ChainCursor = struct { first_done: bool }
+
+/**
+ * Concatenate two iterators: all of `a`, then all of `b`.
+ *
+ * @param a    the first iterator (drained first)
+ * @param b    the second iterator
+ * @param cur  the caller-owned which-source cursor
+ * @return     a lazy IntIter over `a` followed by `b`
+ * @since ITER0
+ */
+pub fn chain(a: IntIter, b: IntIter, cur: Ref<ChainCursor>) -> IntIter {
+    let ch: IntIter = () => {
+        if cur.value.first_done == false {
+            let na = a()
+            match na {
+                i64 as x => return x
+                null => cur.value = ChainCursor { first_done = true }
+            }
+        }
+        b()
+    }
+    ch
+}
+
+/**
+ * Drain the iterator, threading an accumulator through `step` (eager left fold).
+ *
+ * @param src   the iterator to drain
+ * @param init  the starting accumulator
+ * @param step  the combiner
+ * @return      the final accumulator
+ * @since ITER0
+ */
+pub fn fold(src: IntIter, init: i64, step: (i64, i64) -> i64) -> i64 {
+    mut acc = init
+    loop {
+        let nx = src()
+        match nx {
+            i64 as v => acc = step(acc, v)
+            null => break
+        }
+    }
+    acc
+}
+
+/**
+ * Sum the elements the iterator yields.
+ *
+ * @param src  the iterator to drain
+ * @return     the arithmetic sum
+ * @since ITER0
+ */
+pub fn sum(src: IntIter) -> i64 {
+    mut total: i64 = 0
+    loop {
+        let nx = src()
+        match nx {
+            i64 as v => total = total + v
+            null => break
+        }
+    }
+    total
+}
+
+/**
+ * Materialize the iterator into an `[]i64`, preserving order.
+ *
+ * @param src  the iterator to drain
+ * @return     a slice of every element yielded, in order
+ * @since ITER0
+ */
+pub fn collect(src: IntIter) -> []i64 {
+    mut out: []i64 = teko::list::empty()
+    loop {
+        let nx = src()
+        match nx {
+            i64 as v => out = teko::list::push(out, v)
+            null => break
+        }
+    }
+    out
+}
+
+/**
+ * Wrap a caller-owned counter cell into an identity transform that ticks the cell on each
+ * call — the instrument the laziness check reads back to prove a `map` closure ran exactly as
+ * many times as the downstream `take` demanded.
+ *
+ * @param cell  the caller-owned tick counter
+ * @return      an identity transform that ticks `cell`
+ * @since ITER0
+ */
+pub fn counting_identity(cell: Ref<i64>) -> (i64) -> i64 {
+    let c: (i64) -> i64 = (x: i64) => { cell.value = cell.value + 1; x }
+    c
+}
+
+/**
+ * The even predicate the checks use.
+ *
+ * @param x  the value to test
+ * @return   true when `x` is even
+ * @since ITER0
+ */
+pub fn is_even(x: i64) -> bool { x % 2 == 0 }
+
+/**
+ * The ten-times transform the composition check uses.
+ *
+ * @param x  the value to scale
+ * @return   `x * 10`
+ * @since ITER0
+ */
+pub fn times_ten(x: i64) -> i64 { x * 10 }
+
+/**
+ * The addition combiner the fold check uses.
+ *
+ * @param a  the running accumulator
+ * @param x  the next element
+ * @return   `a + x`
+ * @since ITER0
+ */
+pub fn add(a: i64, x: i64) -> i64 { a + x }
+
+/**
+ * Stage 0 — sources and `collect` roundtrip: `range` yields the sequence in order.
+ *
+ * @return  0 on success, else a distinct failure code
+ * @since ITER0
+ */
+pub fn check_sources() -> i64 {
+    mut rc = RangeCursor { next = 0; hi = 4 }
+    let collected = collect(range(rc))
+    if collected.len != 4 { return 1 }
+    if collected[0] != 0 { return 2 }
+    if collected[3] != 3 { return 3 }
+    0
+}
+
+/**
+ * Stage 1 — the laziness proof: a `map` closure ticking a counter, capped by `take(2)` over a
+ * thousand-element range, ticks EXACTLY twice.
+ *
+ * @return  0 on success, else a distinct failure code
+ * @since ITER0
+ */
+pub fn check_laziness() -> i64 {
+    mut count_cell = 0
+    let ticking = counting_identity(count_cell)
+    mut rc = RangeCursor { next = 0; hi = 1000 }
+    mut tc = TakeCursor { left = 2 }
+    let result = collect(take(map(range(rc), ticking), tc))
+    if result.len != 2 { return 11 }
+    if result[0] != 0 { return 12 }
+    if result[1] != 1 { return 13 }
+    if count_cell != 2 { return 14 }
+    0
+}
+
+/**
+ * Stage 2 — adapter correctness: `filter`, `skip`, `chain` behave.
+ *
+ * @return  0 on success, else a distinct failure code
+ * @since ITER0
+ */
+pub fn check_adapters() -> i64 {
+    mut rc = RangeCursor { next = 0; hi = 6 }
+    let evens = collect(filter(range(rc), is_even))
+    if evens.len != 3 { return 21 }
+    if evens[2] != 4 { return 22 }
+    mut rc2 = RangeCursor { next = 0; hi = 5 }
+    mut sc = SkipCursor { left = 2 }
+    let after_skip = collect(skip(range(rc2), sc))
+    if after_skip.len != 3 { return 23 }
+    if after_skip[0] != 2 { return 24 }
+    mut ra = RangeCursor { next = 0; hi = 2 }
+    mut rb = RangeCursor { next = 10; hi = 12 }
+    mut cc = ChainCursor { first_done = false }
+    let chained = collect(chain(range(ra), range(rb), cc))
+    if chained.len != 4 { return 25 }
+    if chained[3] != 11 { return 26 }
+    0
+}
+
+/**
+ * Stage 3 — the composition payoff + terminals: `fold(map(filter(range,even),*10),0,+)` == 60.
+ *
+ * @return  0 on success, else a distinct failure code
+ * @since ITER0
+ */
+pub fn check_pipeline() -> i64 {
+    mut rc = RangeCursor { next = 0; hi = 6 }
+    let total = fold(map(filter(range(rc), is_even), times_ten), 0, add)
+    if total != 60 { return 31 }
+    mut rc2 = RangeCursor { next = 1; hi = 5 }
+    if sum(range(rc2)) != 10 { return 32 }
+    0
+}

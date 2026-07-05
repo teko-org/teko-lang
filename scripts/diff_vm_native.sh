@@ -61,10 +61,13 @@ EXPECTED_FAIL=(
 # buf_ptr_memset_roundtrip — calls a raw `extern` (libc memset) over a `teko::mem::buf_ptr`
 #   arena buffer (C7.19); `buf_ptr` is a host-only builtin with no VM interception, same
 #   honest-stop shape as any other raw extern.
+# io_file_copy — IO1 (#184): file -> store -> file -> unstore -> file over the ReadFn/WriteFn
+#   copy seam; calls the read_file / write_file_bytes externs, which the VM refuses by design.
 NATIVE_ONLY=(
     time_types
     extern_reachability
     buf_ptr_memset_roundtrip
+    io_file_copy
 )
 
 is_expected_fail() {

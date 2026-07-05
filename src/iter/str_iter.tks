@@ -1,0 +1,141 @@
+/**
+ * The 0-based cursor over an `over_strs` source. Caller-owned so the position survives across
+ * pulls.
+ *
+ * @param pos  the index of the next string to yield
+ * @since ITER0
+ */
+pub type StrCursor = struct { pos: u64 }
+
+/**
+ * Iterate a `[]str` front-to-back — the source shape for line iteration over readers. Each
+ * pull yields the string at the cursor and advances it; `null` once the slice is exhausted.
+ *
+ * @param xs   the backing slice (read-only — never mutated)
+ * @param cur  the caller-owned position cursor, advanced on each pull
+ * @return     a StrIter over `xs` in order
+ * @example    mut c = StrCursor { pos = 0 }; over_strs(split_lines(text), c)
+ * @since ITER0
+ */
+pub fn over_strs(xs: []str, cur: Ref<StrCursor>) -> StrIter {
+    let it: StrIter = () => {
+        if cur.value.pos >= xs.len { return null }
+        let v = xs[cur.value.pos]
+        cur.value = StrCursor { pos = cur.value.pos + 1 }
+        v
+    }
+    it
+}
+
+/**
+ * Split text into lines on the `\n` byte (a trailing newline does NOT yield a final empty
+ * line; a trailing non-newline segment IS a line). The bridge from a whole drained buffer to
+ * a `StrIter` of lines — `over_strs(split_lines(text), cur)` is the roadmap's "iterators over
+ * teko::io lines".
+ *
+ * @param text  the text to break into lines
+ * @return      the lines, in order, without their line terminators
+ * @example     split_lines("a\nb") yields ["a", "b"]
+ * @since ITER0
+ */
+pub fn split_lines(text: str) -> []str {
+    let bytes = bytes_of_str(text)
+    mut lines: []str = teko::list::empty()
+    mut cur: []byte = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= bytes.len { break }
+        let b = bytes[i]
+        if b == b'\n' {
+            lines = teko::list::push(lines, decode_line(cur))
+            cur = teko::list::empty()
+        } else {
+            cur = teko::list::push(cur, b)
+        }
+        i++
+    }
+    if cur.len > 0 {
+        lines = teko::list::push(lines, decode_line(cur))
+    }
+    lines
+}
+
+/**
+ * Decode one accumulated line's bytes as UTF-8, substituting the empty string on malformed
+ * input (line splitting must not fail the whole iteration).
+ *
+ * @param bytes  the raw bytes of a single line (no terminator)
+ * @return       the decoded line, or "" if the bytes are not valid UTF-8
+ * @since ITER0
+ */
+fn decode_line(bytes: []byte) -> str {
+    match str_from_utf8(bytes) {
+        str as s => s
+        error => ""
+    }
+}
+
+/**
+ * Lazily map each string through `f`. Nothing runs until a terminal drives the result; `f` is
+ * called at most once per pulled string. Stateless.
+ *
+ * @param src  the upstream str iterator
+ * @param f    the per-string transform
+ * @return     a lazy StrIter yielding `f(s)` for each upstream string, `null` at exhaustion
+ * @since ITER0
+ */
+pub fn map_strs(src: StrIter, f: (str) -> str) -> StrIter {
+    let mapped: StrIter = () => {
+        let nx = src()
+        match nx {
+            str as v => f(v)
+            null => null
+        }
+    }
+    mapped
+}
+
+/**
+ * Lazily keep only the strings for which `keep` holds. Each pull advances the source until a
+ * kept string is found or the source is exhausted. Stateless.
+ *
+ * @param src   the upstream str iterator
+ * @param keep  the predicate a string must satisfy to be yielded
+ * @return      a lazy StrIter of the surviving strings, `null` at exhaustion
+ * @since ITER0
+ */
+pub fn filter_strs(src: StrIter, keep: (str) -> bool) -> StrIter {
+    let filtered: StrIter = () => {
+        mut result: str? = null
+        loop {
+            let nx = src()
+            match nx {
+                str as v => {
+                    if keep(v) { result = v; break }
+                }
+                null => break
+            }
+        }
+        result
+    }
+    filtered
+}
+
+/**
+ * Materialize the str iterator into a `[]str`, preserving order. Drains the source.
+ *
+ * @param src  the str iterator to drain
+ * @return     a slice of every string the iterator yielded, in order
+ * @since ITER0
+ */
+pub fn collect_strs(src: StrIter) -> []str {
+    mut out: []str = teko::list::empty()
+    loop {
+        let nx = src()
+        match nx {
+            str as v => out = teko::list::push(out, v)
+            null => break
+        }
+    }
+    out
+}

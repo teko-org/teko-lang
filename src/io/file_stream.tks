@@ -1,0 +1,71 @@
+/**
+ * The one-shot cursor for a file ReadFn — flips once the whole-file buffer has been yielded.
+ * Caller-owned (MEM-1b-ii) so the "already delivered" flag survives across pulls.
+ *
+ * @param delivered  whether the file's contents have already been handed out
+ * @since IO1
+ */
+pub type FileReadCursor = struct { delivered: bool }
+
+/**
+ * Wrap a file's whole contents as a `ReadFn`: the first pull reads `path` and yields the
+ * entire file as one Buf (or the read error, threaded through the ReadFn's own `Buf | error`
+ * result), and every later pull yields EOF (an empty Buf). Returning a plain `ReadFn` — not a
+ * `ReadFn | error` — is deliberate: a variant whose arm is a function type is not lowerable
+ * by codegen yet, so the read error rides the ReadFn's existing `Buf | error` channel instead.
+ *
+ * True streaming `read(self, into: Buf)` needs the arena-backed mutable Buf half (the
+ * N-KEYSTONE, documented in `stream.tks`); until then a file stream is the whole buffer lifted
+ * into the closure seam — exactly `stream.tks`'s stated IO1 plan. This calls the `read_file`
+ * extern, so it runs NATIVE-only (the VM refuses foreign calls by design, C7.1a).
+ *
+ * @param path  the path to read on the first pull
+ * @param cur   the caller-owned one-shot cursor (`FileReadCursor { delivered = false }`)
+ * @return      a ReadFn yielding the file bytes (or the read error) once, then EOF
+ * @see         copy — pumps a file_read_fn into any Writer sink
+ * @since IO1
+ */
+pub fn file_read_fn(path: str, cur: Ref<FileReadCursor>) -> ReadFn {
+    let reader: ReadFn = (max: u64) => {
+        if cur.value.delivered { return Buf::empty() }
+        cur.value = FileReadCursor { delivered = true }
+        match read_file(path) {
+            str as s => Buf::from_str(s)
+            error as e => e
+        }
+    }
+    reader
+}
+
+/**
+ * Build an in-memory `WriteFn` sink that accumulates every write into a caller-owned
+ * MemWriter; pair it with `file_flush` to commit the accumulated bytes to disk. The write
+ * side needs no arena Buf (it consumes value Bufs), so it composes TODAY over the value half.
+ *
+ * @param sink  the caller-owned accumulator advanced on each write
+ * @return      a WriteFn that appends each region to `sink`
+ * @see         file_flush — writes the accumulated bytes to a path
+ * @since IO1
+ */
+pub fn file_write_sink(sink: Ref<MemWriter>) -> WriteFn {
+    let lifted: WriteFn = (from: Buf) => {
+        let step = sink.value.write_step(from)
+        sink.value = step.writer
+        step.written
+    }
+    lifted
+}
+
+/**
+ * Commit an accumulated file-write sink's bytes to `path` via the `write_file_bytes` extern
+ * (NATIVE-only). Returns the error case on a write failure, `null` on success.
+ *
+ * @param path  the destination path
+ * @param sink  the accumulator whose bytes are written out
+ * @return      `null` on success, or the write error
+ * @throws      the `write_file_bytes` error when the path could not be written
+ * @since IO1
+ */
+pub fn file_flush(path: str, sink: Ref<MemWriter>) -> error? {
+    write_file_bytes(path, sink.value.content().bytes())
+}
