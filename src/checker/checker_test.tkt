@@ -3472,3 +3472,77 @@ fn field_view_non_struct_or_class_is_error() {
     let table = color_enum_table()
     match deriver_field_view("Color", table) { []FieldView => teko::assert::is_true(false); error => teko::assert::is_true(true) }
 }
+
+/** An empty TypeTable — the DI pass keys its registry by source interface names, never touching
+ *  the table, so DI unit tests need no `collect` (which would reject the deliberately dangling
+ *  interface names these fixtures use). */
+fn di_empty_table() -> TypeTable { teko::list::empty() }
+
+/** A `#lifetime` DI class item: a class with a no-arg static factory `make` and an implements list. */
+fn di_class_item(name: str, kind: parser::DiKind, implements: []str) -> parser::Item {
+    let methods = teko::list::push(teko::list::empty(), impl_static_method("make", parser::Visibility::Pub))
+    let body = parser::ClassBody { kind = parser::ClassKind::Sealed; has_base = false; base_name = ""; has_base_binding = false; base_binding_name = ""; implements = implements; fields = teko::list::empty(); methods = methods }
+    parser::Item { content = parser::TypeDecl { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = body; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; di_kind = kind; has_di_key = false; di_key = "" }; namespace = ""; file = "" }
+}
+
+/** A function item carrying a single `#inject(name: Type)` binding. */
+fn di_inject_fn_item(fn_name: str, bind_name: str, bind_type: str) -> parser::Item {
+    let binding = parser::InjectBinding { name = bind_name; type_ann = named_t(bind_type); has_key = false; key = ""; line = 7; col = 3 }
+    let injects = teko::list::push(teko::list::empty(), binding)
+    let f = parser::Function { name = fn_name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = teko::list::empty(); has_return = false; return_type = named_t("i64"); body = teko::list::empty(); vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false; has_inject = true; injects = injects }
+    parser::Item { content = f; namespace = ""; file = "" }
+}
+
+#test
+fn di_single_provider_registers_and_resolves() {
+    let items = teko::list::push(teko::list::empty(), di_class_item("Logger", parser::DiKind::Singleton, teko::list::push(teko::list::empty(), "Log")))
+    match build_di_registry(parser::Program { items = items }, di_empty_table()) {
+        DiRegistry as reg => {
+            teko::assert::is_true(reg.providers.len == 1)
+            teko::assert::is_true(reg.providers[0].iface == "Log")
+            teko::assert::is_true(reg.providers[0].impl_name == "Logger")
+            teko::assert::is_true(reg.providers[0].factory == "make")
+            match resolve_provider(reg, "Log") { DiProvider as p => teko::assert::is_true(p.kind == parser::DiKind::Singleton); error => teko::assert::is_true(false) }
+        }
+        error => teko::assert::is_true(false)
+    }
+}
+
+#test
+fn di_duplicate_registration_is_error() {
+    let a = di_class_item("LoggerA", parser::DiKind::Singleton, teko::list::push(teko::list::empty(), "Log"))
+    let b = di_class_item("LoggerB", parser::DiKind::Scoped, teko::list::push(teko::list::empty(), "Log"))
+    let items = teko::list::push(teko::list::push(teko::list::empty(), a), b)
+    match build_di_registry(parser::Program { items = items }, di_empty_table()) { DiRegistry => teko::assert::is_true(false); error => teko::assert::is_true(true) }
+}
+
+#test
+fn di_missing_provider_is_error() {
+    let fn_item = di_inject_fn_item("handle", "log", "Log")
+    let items = teko::list::push(teko::list::empty(), fn_item)
+    match check_di(parser::Program { items = items }, di_empty_table()) { null => teko::assert::is_true(false); error => teko::assert::is_true(true) }
+}
+
+#test
+fn di_inject_with_registered_provider_is_accepted() {
+    let cls = di_class_item("Logger", parser::DiKind::Singleton, teko::list::push(teko::list::empty(), "Log"))
+    let fn_item = di_inject_fn_item("handle", "log", "Log")
+    let items = teko::list::push(teko::list::push(teko::list::empty(), cls), fn_item)
+    match check_di(parser::Program { items = items }, di_empty_table()) { null => teko::assert::is_true(true); error => teko::assert::is_true(false) }
+}
+
+#test
+fn di_lifetime_on_non_class_is_error() {
+    let te = teko::list::push(teko::list::empty(), fv_field("x", named_t("i64")))
+    let bad = fv_struct_item("Thing", te)
+    let items = teko::list::push(teko::list::empty(), with_struct_di_singleton(bad))
+    match build_di_registry(parser::Program { items = items }, di_empty_table()) { DiRegistry => teko::assert::is_true(false); error => teko::assert::is_true(true) }
+}
+
+/** Attach `#singleton` to a struct item (an illegal placement the DI pass must reject). */
+fn with_struct_di_singleton(item: parser::Item) -> parser::Item {
+    match item.content {
+        parser::TypeDecl as td => parser::Item { content = parser::TypeDecl { name = td.name; type_params = td.type_params; type_constraints = td.type_constraints; body = td.body; vis = td.vis; has_doc = td.has_doc; doc = td.doc; line = td.line; col = td.col; di_kind = parser::DiKind::Singleton; has_di_key = false; di_key = "" }; namespace = item.namespace; file = item.file }
+        _ => item
+    }
+}

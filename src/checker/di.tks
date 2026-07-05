@@ -43,10 +43,75 @@ fn program_uses_di(prog: parser::Program) -> bool {
 }
 
 /** Build the DI registry from every `#singleton`/`#scoped`/`#transient` type in the program.
- *  A duplicate unkeyed registration for one interface is an honest error; so is a cyclic
- *  provider graph. (Crumb 2.) */
+ *  Each `#lifetime` class registers one provider per interface it implements (the annotation IS
+ *  the registration). A duplicate unkeyed registration for one interface is an honest error, and
+ *  a `#lifetime` on a non-class type (only classes are injectable objects) is rejected. (Crumb 2.) */
 pub fn build_di_registry(prog: parser::Program, table: TypeTable) -> DiRegistry | error {
-    di_registry_empty()
+    mut reg = di_registry_empty()
+    mut i: u64 = 0
+    loop {
+        if i >= prog.items.len { break }
+        let out = match register_item_providers(reg, prog.items[i]) { DiRegistry as r => r; error as e => return e }
+        reg = out
+        i++
+    }
+    reg
+}
+
+/** Register every provider a single item contributes (none unless it is a `#lifetime` class). */
+fn register_item_providers(reg: DiRegistry, item: parser::Item) -> DiRegistry | error {
+    let td = match item.content { parser::TypeDecl as t => t; _ => return reg }
+    match td.di_kind { parser::DiKind::None => return reg; _ => {} }
+    if td.has_di_key { return di_key_rejected(td) }
+    let cb = match td.body { parser::ClassBody as c => c; _ => return err_di(td.line, td.col, $"`#singleton`/`#scoped`/`#transient` applies to a class, but `{td.name}` is not a class") }
+    let factory = match choose_factory(td.name, cb) { str as f => f; error as e => return e }
+    register_over_implements(reg, td, cb.implements, factory)
+}
+
+/** Add one provider for each interface `impls` names, rejecting a duplicate unkeyed registration. */
+fn register_over_implements(reg: DiRegistry, td: parser::TypeDecl, impls: []str, factory: str) -> DiRegistry | error {
+    mut out = reg
+    mut j: u64 = 0
+    loop {
+        if j >= impls.len { break }
+        let iface = impls[j]
+        if provider_registered(out, iface) { return err_di(td.line, td.col, $"ambiguous DI registration for interface `{iface}`: another `#lifetime` type already provides it (keys are issue #173) — construct explicitly instead") }
+        out = DiRegistry { providers = teko::list::push(out.providers, DiProvider { iface = iface; kind = td.di_kind; impl_name = td.name; factory = factory }) }
+        j++
+    }
+    out
+}
+
+/** A `#lifetime` class's factory = its no-parameter static method (the DI-buildable constructor).
+ *  Core DI needs a zero-arg (or fully-injected) static; the first static with no non-injected
+ *  parameters is chosen. A class with no usable static factory is a hard error. */
+fn choose_factory(class_name: str, cb: parser::ClassBody) -> str | error {
+    mut i: u64 = 0
+    loop {
+        if i >= cb.methods.len { break }
+        let m = cb.methods[i]
+        if is_static_method(m) && m.params.len == 0 { return m.name }
+        i++
+    }
+    error { message = $"DI: class `{class_name}` has no zero-argument static factory to build it (core DI builds via a no-arg static)" }
+}
+
+/** A class method is STATIC when its first parameter is typed (an instance method's receiver is
+ *  the sole untyped first parameter — OOP A1). A method with no parameters is static too. */
+fn is_static_method(m: parser::Function) -> bool {
+    if m.params.len == 0 { return true }
+    m.params[0].has_type
+}
+
+/** Is any provider already registered for `iface` (unkeyed)? */
+fn provider_registered(reg: DiRegistry, iface: str) -> bool {
+    mut i: u64 = 0
+    loop {
+        if i >= reg.providers.len { break }
+        if reg.providers[i].iface == iface { return true }
+        i++
+    }
+    false
 }
 
 /** Resolve the single provider registered for `iface` (unkeyed, core DI). Missing → error. */
@@ -61,9 +126,65 @@ pub fn resolve_provider(reg: DiRegistry, iface: str) -> DiProvider | error {
 }
 
 /** Validate every `#inject` overlay against the registry: each binding's type must have a
- *  registered provider (the never-null guarantee); reject keys (core boundary, #173). Crumb 2/3. */
+ *  registered provider (the never-null guarantee) and may not carry a key (core boundary, #173). */
 pub fn check_inject_overlays(prog: parser::Program, reg: DiRegistry, table: TypeTable) -> error? {
+    mut i: u64 = 0
+    loop {
+        if i >= prog.items.len { break }
+        match prog.items[i].content {
+            parser::Function as f => match check_fn_overlay(f, reg) { error as e => return e; null => {} }
+            _ => {}
+        }
+        i++
+    }
     null
+}
+
+/** Validate one function's `#inject` overlay bindings. */
+fn check_fn_overlay(f: parser::Function, reg: DiRegistry) -> error? {
+    if !f.has_inject { return null }
+    mut j: u64 = 0
+    loop {
+        if j >= f.injects.len { break }
+        match check_binding(f.injects[j], reg) { error as e => return e; null => {} }
+        j++
+    }
+    null
+}
+
+/** Validate one `#inject` binding: no key (core), and a registered provider must exist. */
+fn check_binding(b: parser::InjectBinding, reg: DiRegistry) -> error? {
+    if b.has_key { return err_di(b.line, b.col, $"DI keys (`@`) are not in core DI (issue #173); remove the key on `{b.name}`") }
+    let iface = binding_iface_name(b.type_ann)
+    match resolve_provider(reg, iface) {
+        DiProvider => null
+        error => err_di(b.line, b.col, $"no DI provider for `{iface}` injected as `{b.name}`; annotate an implementing class with a lifetime (`#singleton`/`#scoped`/`#transient`)")
+    }
+}
+
+/** The interface name an `#inject` binding names — the last segment of its `NamedType` path
+ *  (a slice/union/optional/function binding type has no injectable interface name → ""). */
+fn binding_iface_name(te: parser::TypeExpr) -> str {
+    match te {
+        parser::NamedType as nt => last_segment_name(nt.path)
+        _ => ""
+    }
+}
+
+/** The last segment name of a path (`a::b::C` → `C`; a single segment → itself). */
+fn last_segment_name(path: parser::Path) -> str {
+    if path.segments.len == 0 { return "" }
+    path.segments[path.segments.len - 1].name
+}
+
+/** The honest stop for a keyed DI annotation (`@Key`), which is out of core DI (issue #173). */
+fn di_key_rejected(td: parser::TypeDecl) -> error {
+    err_di(td.line, td.col, $"DI keys (`@`) are not in core DI (issue #173); remove the key on `{td.name}`")
+}
+
+/** Build a located DI error (1-based line/col from the offending decl or binding). */
+fn err_di(line: u32, col: u32, message: str) -> error {
+    teko::error::err_loc(error { message = message }, line, col)
 }
 
 /** The DI pass entry point: build the registry, then check every overlay. A no-op (returns
