@@ -80,7 +80,7 @@ fn register_over_implements(reg: DiRegistry, td: parser::TypeDecl, impls: []str,
     mut j: u64 = 0
     loop {
         if j >= impls.len { break }
-        let iface = impls[j]
+        let iface = name_last_segment(impls[j])
         if provider_registered(out, iface) { return err_di(td.line, td.col, $"ambiguous DI registration for interface `{iface}`: another `#lifetime` type already provides it (keys are issue #173) — construct explicitly instead") }
         out = DiRegistry { providers = teko::list::push(out.providers, DiProvider { iface = iface; kind = td.di_kind; impl_name = td.name; factory = factory }) }
         j++
@@ -214,15 +214,27 @@ fn seed_di_injects(f: parser::Function, env: Env, tbl: TypeTable) -> Env | error
         if i >= f.injects.len { break }
         let b = f.injects[i]
         let iface = binding_iface_name(b.type_ann)
-        let t = match resolve_type(b.type_ann, tbl, env.cur_ns) { Type as ty => ty; error as e => return e }
-        local = define(local, b.name, t, false)
         match resolve_provider(env.di, iface) {
-            DiProvider as p => binds = teko::list::push(binds, DiInjectBind { name = b.name; iface = iface; impl_name = p.impl_name; kind = p.kind })
-            error => {}
+            DiProvider as p => {
+                let impl_bare = name_last_segment(p.impl_name)
+                let t = match resolve_type(named_texpr(impl_bare), tbl, env.cur_ns) { Type as ty => ty; error as e => return e }
+                local = define(local, b.name, t, false)
+                binds = teko::list::push(binds, DiInjectBind { name = b.name; iface = iface; impl_name = impl_bare; kind = p.kind })
+            }
+            error => {
+                let t = match resolve_type(b.type_ann, tbl, env.cur_ns) { Type as ty => ty; error as e => return e }
+                local = define(local, b.name, t, false)
+            }
         }
         i++
     }
     with_injects(local, binds)
+}
+
+/** A bare single-segment `NamedType` for `name` — used to bind an injected local to its concrete
+ *  DI impl type (dispatch is static: a provider resolves to exactly one impl). */
+fn named_texpr(name: str) -> parser::TypeExpr {
+    parser::NamedType { path = parser::Path { segments = teko::list::push(teko::list::empty(), parser::Segment { name = name }) }; args = teko::list::empty() }
 }
 
 /** Lower a USE of an injected name into the provider's materializer call (Crumb 4): a `TCall` to
@@ -253,4 +265,20 @@ pub fn is_di_materializer_call(name: str) -> bool {
  *  use lowers to (`__di_materialize_<Impl>`), shared by codegen and the VM. */
 pub fn di_materializer_name(impl_name: str) -> str {
     "__di_materialize_" ~ impl_name
+}
+
+/** (W10c/MEM-3) di_type_id — the deterministic 64-bit type identity of a type name, the key
+ *  `tk_region_register`/`tk_region_lookup` (native) and the VM's `di_cache` share for a DI lifetime.
+ *  FNV-1a over the name's bytes (offset basis 14695981039346656037, prime 1099511628211, u64
+ *  wraparound). One derivation, so `#singleton`/`#scoped` sharing agrees across both engines. */
+pub fn di_type_id(name: str) -> u64 {
+    mut hash: u64 = 14695981039346656037
+    mut i: u64 = 0
+    loop {
+        if i >= name.len { break }
+        hash = hash ^ (name[i] to u64)
+        hash = hash * 1099511628211
+        i++
+    }
+    hash
 }

@@ -1811,6 +1811,12 @@ fn emit_call(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, e: c
     // so the local always wins over the namespace fn); codegen just has to respect that verdict.
     if c.is_closure_call { return emit_closure_call(buf, prog, ret_type, c, escaping, regions, fn_body, dctx) }
     let p = c.callee
+    if p.segments.len == 1 && checker::is_di_materializer_call(p.segments[0].name) {
+        mut dout = cb(buf, p.segments[0].name)
+        dout = cb(dout, "(")
+        dout = cb(dout, cg_enclosing_region_expr(regions))
+        return cb(dout, ")")
+    }
     // teko::list::empty / push — the SLICE (collection) builtins, FIXED+COPY. `empty()`
     // (sentinel) is normally wrapped by emit_as into a concrete slot literal; reaching here
     // directly means a context-less empty (honest error). `push(base, item)` lowers to an
@@ -5531,6 +5537,155 @@ fn fn_body_has_frame_local(escaping: []str, body: []checker::TStatement) -> bool
     false
 }
 
+/** (W10c/MEM-3) Rebuild the DI provider registry from the TYPED program (codegen has no raw
+ *  `parser::Program`). Walks the passed-through `TypeDecl` items — each `#lifetime` class's
+ *  `di_kind` + `implements` + no-arg static factory survive into the typed AST unchanged. */
+fn cg_build_di_registry(prog: checker::TProgram) -> checker::DiRegistry | error {
+    mut providers: []checker::DiProvider = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= prog.items.len { break }
+        match prog.items[i] {
+            parser::TypeDecl as td => providers = match cg_add_di_providers(providers, td) { []checker::DiProvider as ps => ps; error as e => return e }
+            _ => {}
+        }
+        i++
+    }
+    checker::DiRegistry { providers = providers }
+}
+
+/** (W10c/MEM-3) Add a `#lifetime` class's providers (one per implemented interface) to the list. */
+fn cg_add_di_providers(providers: []checker::DiProvider, td: parser::TypeDecl) -> []checker::DiProvider | error {
+    match td.di_kind { parser::DiKind::None => return providers; _ => {} }
+    let cb0 = match td.body { parser::ClassBody as c => c; _ => return providers }
+    let factory = match cg_di_factory(cb0) { str as f => f; null => return error { message = $"codegen: DI class `{td.name}` has no zero-argument static factory" } }
+    mut out = providers
+    mut j: u64 = 0
+    loop {
+        if j >= cb0.implements.len { break }
+        out = teko::list::push(out, checker::DiProvider { iface = cb0.implements[j]; kind = td.di_kind; impl_name = td.name; factory = factory })
+        j++
+    }
+    out
+}
+
+/** (W10c/MEM-3) The name of a class's zero-argument static factory (its first no-arg static), or
+ *  null when it has none. */
+fn cg_di_factory(cb0: parser::ClassBody) -> str? {
+    mut i: u64 = 0
+    loop {
+        if i >= cb0.methods.len { break }
+        let m = cb0.methods[i]
+        let is_static = if m.params.len == 0 { true } else { m.params[0].has_type }
+        if is_static && m.params.len == 0 { return m.name }
+        i++
+    }
+    null
+}
+
+/** (W10c/MEM-3) Emit every DI materializer C function ahead of the ordinary function bodies. One
+ *  `static tk_t_<Impl> *__di_materialize_<Impl>(tk_region *r)` per registered provider builds the
+ *  instance via the impl's zero-arg static factory, caching it per lifetime (singleton → root,
+ *  scoped → the passed region which walks up the arena tree, transient → fresh every call). */
+fn emit_di_materializers(buf: []byte, prog: checker::TProgram, reg: checker::DiRegistry) -> []byte | error {
+    mut out = buf
+    mut seen: []str = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= reg.providers.len { break }
+        let p = reg.providers[i]
+        if !cg_str_in(seen, p.impl_name) {
+            seen = teko::list::push(seen, p.impl_name)
+            out = match emit_di_materializer(out, prog, p) { []byte as o => o; error as e => return e }
+        }
+        i++
+    }
+    out
+}
+
+
+/** (W10c/MEM-3) Emit a forward prototype for every DI materializer, so a caller emitted before the
+ *  materializer definition still resolves under C23's declare-before-use rule. */
+fn emit_di_materializer_protos(buf: []byte, reg: checker::DiRegistry) -> []byte | error {
+    mut out = buf
+    mut seen: []str = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= reg.providers.len { break }
+        let p = reg.providers[i]
+        if !cg_str_in(seen, p.impl_name) {
+            seen = teko::list::push(seen, p.impl_name)
+            out = cb(out, "static ")
+            out = mangle_type_name(out, "", p.impl_name)
+            out = cb(out, " *")
+            out = cb(out, checker::di_materializer_name(checker::name_last_segment(p.impl_name)))
+            out = cb(out, "(tk_region *r);\n")
+        }
+        i++
+    }
+    out
+}
+
+/** (W10c/MEM-3) One provider's materializer definition (see emit_di_materializers). The materializer
+ *  SYMBOL uses the impl's bare last segment (matching the checker's lowered call, which keyed off the
+ *  raw program's bare class name); the C TYPE uses the canonical (namespace-mangled) name. */
+fn emit_di_materializer(buf: []byte, prog: checker::TProgram, p: checker::DiProvider) -> []byte | error {
+    let bare = checker::name_last_segment(p.impl_name)
+    let factory_ns = match cg_find_method_ns(prog, bare, p.factory) { str as ns => ns; null => return error { message = $"codegen: DI factory `{p.factory}` not found on `{p.impl_name}`" } }
+    mut out = cb(buf, "static ")
+    out = mangle_type_name(out, "", p.impl_name)
+    out = cb(out, " *")
+    out = cb(out, checker::di_materializer_name(bare))
+    out = cb(out, "(tk_region *r) {\n")
+    out = di_emit_materializer_body(out, p, factory_ns, bare)
+    cb(out, "}\n")
+}
+
+/** (W10c/MEM-3) The lifetime-specific body of a materializer: transient builds fresh; singleton and
+ *  scoped consult the arena registry (root vs. the passed region) before building + registering. */
+fn di_emit_materializer_body(buf: []byte, p: checker::DiProvider, factory_ns: str, bare: str) -> []byte {
+    match p.kind {
+        parser::DiKind::Transient => di_emit_transient_body(buf, p, factory_ns)
+        _                         => di_emit_cached_body(buf, p, factory_ns, bare)
+    }
+}
+
+/** (W10c/MEM-3) A transient materializer builds a fresh instance every call (no registry). */
+fn di_emit_transient_body(buf: []byte, p: checker::DiProvider, factory_ns: str) -> []byte {
+    mut out = cb(buf, "    (void)r;\n    return ")
+    out = cb_fn_name(out, factory_ns, p.factory)
+    cb(out, "();\n")
+}
+
+/** (W10c/MEM-3) A singleton/scoped materializer looks up an already-built instance (root region for
+ *  a singleton, the passed region — which walks up the arena tree — for a scoped one), returning it
+ *  on a hit, else building via the factory and registering it in that region. */
+fn di_emit_cached_body(buf: []byte, p: checker::DiProvider, factory_ns: str, bare: str) -> []byte {
+    let scope = di_scope_expr(p.kind)
+    let id = checker::di_type_id(bare)
+    mut out = cb(buf, "    tk_region *__s = ")
+    out = cb(out, scope)
+    out = cb(out, ";\n    uint64_t __id = ")
+    out = cb(out, teko::u64_to_str(id))
+    out = cb(out, "ULL;\n    ")
+    out = mangle_type_name(out, "", p.impl_name)
+    out = cb(out, " *__hit = tk_region_lookup(__s, __id);\n    if (__hit) { return __hit; }\n    ")
+    out = mangle_type_name(out, "", p.impl_name)
+    out = cb(out, " *__obj = ")
+    out = cb_fn_name(out, factory_ns, p.factory)
+    out = cb(out, "();\n    tk_region_register(__s, __id, __obj);\n    return __obj;\n")
+    out
+}
+
+/** (W10c/MEM-3) The region a lifetime caches in: the root region for a singleton, the passed
+ *  region for a scoped instance (transient never caches). */
+fn di_scope_expr(kind: parser::DiKind) -> str {
+    match kind {
+        parser::DiKind::Singleton => "tk_region_root()"
+        _                         => "r"
+    }
+}
+
 fn emit_function(buf: []byte, prog: checker::TProgram, f: checker::TFunction) -> []byte | error {
     mut out = match emit_function_sig(buf, prog, f) { []byte as o => o; error as err => return err }
     out = cb(out, " {\n")
@@ -6944,6 +7099,7 @@ fn tk_emit_c(prog0: checker::TProgram) -> str | error {
     let _lr = cg_lift_lambdas(prog0)   // (W10) stamp lambdas + synthesize lifted functions before emission
     let prog = _lr.prog
     let cap_lams = _lr.lams
+    let di_reg = match cg_build_di_registry(prog) { checker::DiRegistry as r => r; error as e => return e }   // (W10c/MEM-3) DI providers → per-impl materializers
     mut b: []byte = teko::list::empty()
     b = cb(b, "// generated by teko (F2 backend) — do not edit\n")
     b = cb(b, "#include <stdint.h>\n")
@@ -7045,6 +7201,7 @@ fn tk_emit_c(prog0: checker::TProgram) -> str | error {
         }
         pi++
     }
+    b = match emit_di_materializer_protos(b, di_reg) { []byte as o => o; error as err => return err }
     b = cb(b, "\n")
     // (W10b.D3) per-(class, contract) VTABLES — one static table per conforming pair, built at
     // COMPILE time (conformance is nominal and closed-world; no runtime reflection). Slot i is
@@ -7129,6 +7286,10 @@ fn tk_emit_c(prog0: checker::TProgram) -> str | error {
     // literal `&__tkclo_<id>` + `sizeof(__tkenv_<id>)` resolve before the user functions).
     b = match cg_emit_lambda_decls(b, prog, cap_lams, true) { []byte as o => o; error as err => return err }
     b = cb(b, "\n")
+
+    // (W10c/MEM-3) DI materializers precede the user function bodies (their prototypes rode the
+    // prototype pass, so an earlier-emitted caller still resolves). No-op when the corpus has no DI.
+    b = match emit_di_materializers(b, prog, di_reg) { []byte as o => o; error as err => return err }
 
     // First pass: emit every top-level function. Type-decls are handled above; use-decls
     // are a no-op at the C level (imports); loose statements are the second pass.
