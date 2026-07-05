@@ -298,6 +298,118 @@ fn find_generic_fn(items: []TItem, name: str) -> TFunction? {
     null
 }
 
+/**
+ * The vtable slot of `method` within interface `iface` — the method's index in the interface's
+ * effective (extends-transitive) method list, exactly the order codegen emits the vtable in. A
+ * lookup error (an unknown interface) collapses to null: the callers only ever pass an interface
+ * name that already resolved to a conforming InterfaceBody, so "no slot" is the sole meaningful
+ * outcome and both no-match and the impossible-error case leave the dispatch untouched (M.1: the
+ * original honest stop still fires downstream if the constraint was genuinely unsatisfiable).
+ *
+ * @param iface   the RESOLVED interface name whose effective-method list is searched
+ * @param method  the dispatched method's bare name
+ * @param table   the checker type table (interface bodies + extends closure)
+ * @return        the slot index, or null when the interface does not declare `method`
+ */
+fn iface_method_slot(iface: str, method: str, table: TypeTable) -> u32? {
+    let no_methods: []parser::Function = teko::list::empty()
+    let eff = match iface_methods_by_name(iface, table) { []parser::Function as f => f; error => no_methods }
+    mut i: u64 = 0
+    loop {
+        if i >= eff.len { break }
+        if teko::runtime::str_eq(eff[i].name, method) { return i to u32 }
+        i++
+    }
+    null
+}
+
+/**
+ * The interface that `class_name` ACTUALLY implements for a dispatched `method`, among all
+ * interfaces owning that method — the correct (S6) Or-constraint vtable key at a concrete
+ * instantiation. Under `<T: A | B>` where both A and B own `method`, the static dispatch key is
+ * A (the first constraint atom, method_owner_interface); a concrete arg conforming to ONLY B
+ * needs its call re-keyed to B, or native codegen emits an upcast to a never-generated
+ * `tk_vt_<class>_A` vtable (a VM==native divergence — the VM name-dispatches, cc rejects the
+ * undeclared symbol). Scans the type table for an interface that BOTH owns `method` AND that
+ * `class_name` NOMINALLY conforms to (type_conforms_to — the same gate as the D3 upcast).
+ *
+ * @param class_name  the concrete class the type-param bound to at this instantiation
+ * @param method      the dispatched method's bare name
+ * @param table       the checker type table
+ * @return            the bare name of the conformed owning interface, or null when none is found
+ *                    (a well-typed constraint always yields one; null leaves the call untouched)
+ */
+fn conformed_owner_iface(class_name: str, method: str, table: TypeTable) -> str? {
+    mut i: u64 = 0
+    loop {
+        if i >= table.len { break }
+        let reg = table[i]
+        let is_iface = match reg.decl.body { parser::InterfaceBody => true; _ => false }
+        if is_iface && type_conforms_to(class_name, name_last_segment(reg.name), table) {
+            match iface_method_slot(name_last_segment(reg.name), method, table) {
+                u32 => return name_last_segment(reg.name)
+                null => {}
+            }
+        }
+        i++
+    }
+    null
+}
+
+/**
+ * Rewrite the interface segment (second-to-last) of a dispatch callee path to `iface`, keeping
+ * every other segment — the sibling of rewrite_last_segment for the dispatch KEY rather than the
+ * name.
+ *
+ * @param p      the dispatch callee path (`[..., iface, method]`)
+ * @param iface  the interface name to substitute at the second-to-last position
+ * @return       the path with its interface segment replaced
+ */
+fn rewrite_iface_segment(p: parser::Path, iface: str) -> parser::Path {
+    mut segs: []parser::Segment = teko::list::empty()
+    mut i: u64 = 0
+    let key_idx = p.segments.len - 2
+    loop {
+        if i >= p.segments.len { break }
+        if i == key_idx { segs = teko::list::push(segs, parser::Segment { name = iface }) }
+        else { segs = teko::list::push(segs, p.segments[i]) }
+        i++
+    }
+    parser::Path { segments = segs }
+}
+
+/**
+ * Re-key an interface-dispatch TCall to the interface the CONCRETE receiver implements, when the
+ * currently-keyed interface is not one the receiver conforms to. This is the S6 Or-constraint fix,
+ * applied at monomorphization: once `T` is bound to a concrete class, the dispatch key baked at
+ * typing (the first constraint atom — method_owner_interface) may name an interface the class does
+ * not implement, so native codegen would emit an upcast to a never-generated `tk_vt_<class>_<iface>`
+ * vtable (a VM==native divergence). When the receiver already conforms to the keyed interface (the
+ * And-constraint path, and the first-branch Or case) the call passes through UNCHANGED, so no
+ * non-Or dispatch is perturbed; when no conforming owner is found the call is likewise left as-is.
+ * An interface-value receiver (which passes through the fat pointer with no upcast) conforms to no
+ * interface as a class/struct would (type_conforms_to's class/struct-body gate), so it never finds
+ * a conformed owner here and is left untouched by construction.
+ *
+ * @param cl     the interface-dispatch TCall (is_iface_dispatch true; args already rewritten)
+ * @param args   the receiver-plus-arguments list, rewritten to concrete types for this instance
+ * @param table  the checker type table (conformance + effective-method-slot lookups)
+ * @return       the re-keyed TCall, or `cl` unchanged when re-keying does not apply
+ */
+fn rekey_iface_dispatch(cl: TCall, args: []TExpr, table: TypeTable) -> TCall {
+    if !cl.is_iface_dispatch || cl.callee.segments.len < 2 || args.len == 0 {
+        return cl
+    }
+    let recv_class = match args[0].type { Named as n => n.name; _ => return cl }
+    let cur_iface = cl.callee.segments[cl.callee.segments.len - 2].name
+    if type_conforms_to(recv_class, cur_iface, table) { return cl }
+    let method = cl.callee.segments[cl.callee.segments.len - 1].name
+    let owner = match conformed_owner_iface(recv_class, method, table) { str as o => o; null => return cl }
+    let slot = match iface_method_slot(owner, method, table) { u32 as sv => sv; null => return cl }
+    let newcallee = rewrite_iface_segment(cl.callee, owner)
+    TCall { callee = newcallee; args = cl.args; call_ns = cl.call_ns; is_closure_call = cl.is_closure_call; callee_type = cl.callee_type; is_iface_dispatch = cl.is_iface_dispatch; iface_slot = slot }
+}
+
 // ── the total rewrite walk ───────────────────────────────────────────────────────────────
 // For EVERY TExpr: set `.type = subst_type(e.type, s)` and recurse into ALL children. At a
 // TCall whose last-path-segment names a generic TFunction in `items`, INFER the Subst from the
@@ -371,7 +483,11 @@ fn mono_texpr(e: TExpr, s: Subst, items: []TItem, table: TypeTable) -> WExpr | e
                     let rec = MonoInst { fn_name = bare; mangled = mangled; s = sub }
                     WExpr { expr = TExpr { kind = TCall { callee = newcallee; args = args; call_ns = cl.call_ns; is_closure_call = cl.is_closure_call; callee_type = cl.callee_type; is_iface_dispatch = cl.is_iface_dispatch; iface_slot = cl.iface_slot }; type = nt; line = e.line; col = e.col }; insts = teko::list::push(acc, rec) }
                 }
-                null => WExpr { expr = TExpr { kind = TCall { callee = cl.callee; args = args; call_ns = cl.call_ns; is_closure_call = cl.is_closure_call; callee_type = cl.callee_type; is_iface_dispatch = cl.is_iface_dispatch; iface_slot = cl.iface_slot }; type = nt; line = e.line; col = e.col }; insts = acc }
+                null => {
+                    let passthrough = TCall { callee = cl.callee; args = args; call_ns = cl.call_ns; is_closure_call = cl.is_closure_call; callee_type = cl.callee_type; is_iface_dispatch = cl.is_iface_dispatch; iface_slot = cl.iface_slot }
+                    let rekeyed = rekey_iface_dispatch(passthrough, args, table)
+                    WExpr { expr = TExpr { kind = rekeyed; type = nt; line = e.line; col = e.col }; insts = acc }
+                }
             }
         }
         TIfExpr as f => {
