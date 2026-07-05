@@ -43,6 +43,7 @@ fn type_nulllit(n: parser::NullLit) -> TExpr | error {
 }
 fn type_var(v: parser::Var, env: Env) -> TExpr | error {
     let b = match lookup_binding(env, v.name) { ValBinding as bb => bb; error as e => return e }
+    match lookup_inject(env, v.name) { DiInjectBind as ib => return di_lower_use(ib, b.type); error => {} }
     // (W10a) a bare reference to a top-level FUNCTION used as a VALUE: only `define_fn` sets a
     // non-empty `ns`, so `ns != "" && type is Func` uniquely identifies a fn reference (a local of
     // closure type has ns=""). It lowers to a `tk_closure` literal; a plain local emits its name.
@@ -2858,6 +2859,9 @@ fn type_function(f: parser::Function, env: Env, table: TypeTable) -> TFunction |
         local = define(local, f.params[i].name, pt, false)        // params are immutable (B.21)
         i++
     }
+    if f.has_inject {
+        local = match seed_di_injects(f, local, tbl) { Env as e => e; error as e => return e }
+    }
     let ret = match function_return(f, tbl, env.cur_ns) { Type as t => t; error as e => return e }   // (#109 W1) ref_ns = the fn's enclosing namespace
     // (MEM Step 0, R3) ESCAPE GATE — a function cannot RETURN a reference (pass-down only): a
     // returned ref would outlive its caller-stack target. References flow only DOWN as params.
@@ -2960,7 +2964,7 @@ fn type_item(item: parser::Item, env: Env, table: TypeTable) -> TItem | error {
             // typedef (matching the canonical Named.name at every USE). A generic `__g__` instance keeps
             // its already-unique bare name. Resolution stays bare-keyed (this is the TYPED program only).
             let cd = if name_is_g_instance(td.name) { td } else {
-                parser::TypeDecl { name = qualify(item.namespace, td.name); type_params = td.type_params; type_constraints = td.type_constraints; body = td.body; vis = td.vis; has_doc = td.has_doc; doc = td.doc; line = td.line; col = td.col }
+                parser::TypeDecl { name = qualify(item.namespace, td.name); type_params = td.type_params; type_constraints = td.type_constraints; body = td.body; vis = td.vis; has_doc = td.has_doc; doc = td.doc; line = td.line; col = td.col; di_kind = td.di_kind; has_di_key = td.has_di_key; di_key = td.di_key }
             }
             normalize_inst_decl(cd, table)   // (W9.4) rewrite `Gen<i64>` member refs to the bare stamped `Gen__g__i64` (no-op when none); else passes through (collect resolved its fields)
         }
@@ -3009,8 +3013,10 @@ pub fn type_program_with_deps(raw_program: parser::Program, dep_prog: TProgram) 
     // W-vis-enforce: enforce the module system over the project's own items.
     // We only check the project's items (not dep items — they were checked when the dep was built).
     match check_modules(program, c.types) { null => {}; error as e => return e }
+    match check_di(program, c.types) { null => {}; error as e => return e }
+    let di_reg = match build_di_registry(program, c.types) { DiRegistry as r => r; error as e => return e }
     // (#148) seal the collected globals — see type_program.
-    let cenv = seal(c.env)
+    let cenv = with_di(seal(c.env), di_reg)
     // (S4 type-generics) stamp concrete decls for written generic uses before typing (no-op when none).
     let types = instantiate_types(program, c.types)
     mut items: []TItem = teko::list::empty()
@@ -3095,9 +3101,11 @@ pub fn type_program(raw_program: parser::Program) -> TProgram | error {
     // W-vis-enforce: enforce the module system (namespace qualification + pub/exp) over the
     // whole flattened program before typing — fail loud on any cross-namespace violation (M.1).
     match check_modules(program, c.types) { null => {}; error as e => return e }
+    match check_di(program, c.types) { null => {}; error as e => return e }
+    let di_reg = match build_di_registry(program, c.types) { DiRegistry as r => r; error as e => return e }
     // (#148) SEAL the collected globals into the env's immutable base segment ONCE, so every
     // function/arm forking from it copies only its own locals (never the whole global table).
-    let cenv = seal(c.env)
+    let cenv = with_di(seal(c.env), di_reg)
     // (S4 type-generics) STAMP concrete decls for written generic uses (`Box<i64>`) into the table
     // before typing, so field-access / struct-init see concrete fields. No-op when none are used.
     let types = instantiate_types(program, c.types)
