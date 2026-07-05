@@ -89,15 +89,16 @@ jobs:
         shell: bash
         run: teko . -o gen1-native --native-gate
 
-      # fmt gate (issue #229) — DISABLED FOR NOW. `teko` here is the previously RELEASED
-      # binary (see the provision step above); `teko fmt --check .` requires the seed to be a
-      # release that already contains the `fmt --check`/`fmt -` CLI this PR ships, so the gate
-      # can only turn on starting with the PR that lands AFTER the release carrying this change.
-      # The corpus is already reformatted to fmt's canonical shape (this PR's own commit) — the
-      # integrator uncomments this step once that release exists.
-      # - name: fmt gate — the corpus must already be canonical (issue #229)
-      #   shell: bash
-      #   run: teko fmt --check .
+      # fmt gate (issue #229 / #282): the corpus must be in `teko fmt`'s canonical shape.
+      # Runs the JUST-BUILT gen-1 (`./bin/teko`, from the "Test gate (VM)" step above), NOT the
+      # released seed — gen-1 is built from THIS PR's sources, so it always carries the current
+      # `fmt --check` CLI AND parser. Using the seed instead choked on regression fixtures that
+      # exercise syntax newer than the seed (e.g. #285's doc-comment-before-field). .gitattributes
+      # pins `.tks`/`.tkt` to LF so the check is byte-stable on every platform. A non-canonical
+      # file reddens the merge — this keeps the corpus formatted going forward.
+      - name: fmt gate — the corpus must be canonical (issue #229)
+        shell: bash
+        run: ./bin/teko fmt --check .
 
   # ── RISC-V cross-compile + QEMU (BLOCKING — gated in the CI gate job) ─────────
   riscv64-qemu:
@@ -253,6 +254,12 @@ jobs:
       - name: Emit teko.c (one gen, no gate)
         run: teko . -o out --no-verify
 
+      # NOTE: a `zig cc -fsyntax-only -Werror=sometimes-uninitialized` guard was tried here but
+      # zig's clang is stricter than Apple clang and still flags residual value-match temps the
+      # `= {0}` codegen fix (#283) doesn't fully cover — a `-Werror` guard is not satisfiable yet.
+      # The real regression protection is the cross-RUN step below: a miscompiled artifact rejects
+      # the corpus (non-zero exit) and gates the merge. Re-add the syntax guard once the residual
+      # x86_64 UB (still open on #283) is fixed and the emitted C is `-Werror`-clean under zig.
       - name: Cross-compile all six Linux targets (compile-only, no qemu)
         run: sh scripts/cross_compile_linux.sh out/teko.c src /tmp/smoke smoke
 
