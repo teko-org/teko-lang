@@ -277,6 +277,17 @@ fn builtin_fn(name: str) -> Type | error {
         return Func { params = afp; ret = bytes_t; variadic = false; param_names = []; n_required = afp.len; defaults = [] }
     }
     if name == "abort" { return Func { params = teko::list::empty(); ret = void_t; variadic = false; param_names = []; n_required = 0; defaults = [] } }   // teko::abort — host abort FFI bottom (() -> void)
+    // Global I/O builtins (str) -> void — print/println/write/eprint/eprintln/ewrite are in scope
+    // EVERYWHERE without the teko::io:: namespace, exactly like the panic/exit globals (#316, owner
+    // ruling 2026-07-06): print("hi") works in any project, including EXTERNAL ones with no src/io.
+    // FALLBACK ONLY: the resolver (typer.tks) reaches builtin_fn after lookup_call finds nothing, so
+    // the compiler's own qualified teko::io::print resolves to the user extern FIRST → this arm never
+    // fires on the corpus → gen2==gen3 untouched. Codegen (CALL lowering) + VM (BUILTIN recognition)
+    // already map the last segment print/… -> tk_* runtime symbols, so both engines emit identically.
+    if name == "print" || name == "println" || name == "write" || name == "ewrite" || name == "eprint" || name == "eprintln" {
+        let iop = teko::list::push(teko::list::empty(), str_t)
+        return Func { params = iop; ret = void_t; variadic = false; param_names = []; n_required = iop.len; defaults = [] }
+    }
     // D3 — test-coverage sink (host side-channel): cov_reset()/cov_mark(u64) -> void ; cov_distinct() -> u64.
     if name == "cov_reset" { return Func { params = teko::list::empty(); ret = void_t; variadic = false; param_names = []; n_required = 0; defaults = [] } }
     if name == "cov_mark" { return Func { params = teko::list::push(teko::list::empty(), Prim { kind = PrimKind::U64 }); ret = void_t; variadic = false; param_names = []; n_required = (teko::list::push(teko::list::empty(), Prim { kind = PrimKind::U64 })).len; defaults = [] } }
