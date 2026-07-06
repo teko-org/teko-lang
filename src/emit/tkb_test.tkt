@@ -276,7 +276,7 @@ fn tkb_roundtrip_program() {
     let use1 = parser::UseDecl { path = upath; has_alias = false; alias = "" }
     // type Point = struct { x: i64 }
     let fld = parser::Field { name = "x"; type_ann = nt("i64"); vis = parser::Visibility::Pub; is_intern = false; has_doc = false; doc = "" }
-    let td = parser::TypeDecl { name = "Point"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::StructBody { fields = teko::list::push(teko::list::empty(), fld); methods = teko::list::empty(); implements = teko::list::empty() }; vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 1; col = 1; di_kind = parser::DiKind::None; has_di_key = false; di_key = "" }
+    let td = parser::TypeDecl { name = "Point"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::StructBody { fields = teko::list::push(teko::list::empty(), fld); methods = teko::list::empty(); implements = teko::list::empty() }; vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 1; col = 1; di_kind = parser::DiKind::None; has_di_key = false; di_key = ""; is_unsafe = false; must_free = false }
     // fn id(n: i64) -> i64 { return n }
     let prm = parser::Param { name = "n"; has_type = true; type_ann = nt("i64"); is_params = false; has_default = false; default_expr = parser::no_expr() }
     let nref = checker::TExpr { kind = checker::TVar { name = "n"; is_func = false; func_ns = "" }; type = i64ty(); line = 0; col = 0 }
@@ -426,7 +426,7 @@ fn tkb_roundtrip_generic_type() {
     let fld = parser::Field { name = "v"; type_ann = nt("T"); vis = parser::Visibility::Pub; is_intern = false; has_doc = false; doc = "" }
     let tparams = teko::list::push(teko::list::empty(), "T")
     let tcons: []parser::ConstraintExpr = teko::list::push(teko::list::empty(), parser::NoConstraint { })
-    let td = parser::TypeDecl { name = "Box"; type_params = tparams; type_constraints = tcons; body = parser::StructBody { fields = teko::list::push(teko::list::empty(), fld); methods = teko::list::empty(); implements = teko::list::empty() }; vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 1; col = 1; di_kind = parser::DiKind::None; has_di_key = false; di_key = "" }
+    let td = parser::TypeDecl { name = "Box"; type_params = tparams; type_constraints = tcons; body = parser::StructBody { fields = teko::list::push(teko::list::empty(), fld); methods = teko::list::empty(); implements = teko::list::empty() }; vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 1; col = 1; di_kind = parser::DiKind::None; has_di_key = false; di_key = ""; is_unsafe = false; must_free = false }
     let prog = checker::TProgram { items = teko::list::push(teko::list::empty(), td) }
     match deserialize_program(serialize_program(prog)) {
         checker::TProgram as got => match got.items[0] {
@@ -465,7 +465,7 @@ fn tkb_roundtrip_method_sig() {
         vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 3; col = 5
         is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = "linux"
         is_intern = true; is_abstract = false; is_virtual = true; is_override = false
-        has_inject = false; injects = teko::list::empty()
+        has_inject = false; injects = teko::list::empty(); is_unsafe = false
     }
     match roundtrip_function(m) {
         parser::Function as f => {
@@ -488,6 +488,41 @@ fn tkb_roundtrip_method_sig() {
     }
 }
 
+#test
+/** (U1, #332) is_unsafe = true round-trips through the .tkb codec's Function payload — the
+    companion of tkb_roundtrip_method_sig (which only ever exercised is_unsafe = false). */
+fn tkb_roundtrip_function_is_unsafe_true() {
+    let m = parser::Function {
+        name = "peek"; type_params = teko::list::empty(); type_constraints = teko::list::empty()
+        params = teko::list::empty()
+        has_return = true; return_type = nt("i64"); body = teko::list::empty()
+        vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 1; col = 1
+        is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""
+        is_intern = false; is_abstract = false; is_virtual = false; is_override = false
+        has_inject = false; injects = teko::list::empty(); is_unsafe = true
+    }
+    match roundtrip_function(m) {
+        parser::Function as f => teko::assert::is_true(f.is_unsafe)
+        error => teko::assert::is_true(false)
+    }
+}
+
+#test
+/** (U1, #332) is_unsafe = true round-trips through the .tkb codec's TypeDecl payload — every
+    existing tkb_test.tkt TypeDecl fixture only ever exercised is_unsafe = false. */
+fn tkb_roundtrip_typedecl_is_unsafe_true() {
+    let body = parser::StructBody { fields = teko::list::empty(); methods = teko::list::empty(); implements = teko::list::empty() }
+    let td = parser::TypeDecl { name = "RawBuf"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = body; vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 1; col = 1; di_kind = parser::DiKind::None; has_di_key = false; di_key = ""; is_unsafe = true; must_free = false }
+    let prog = checker::TProgram { items = teko::list::push(teko::list::empty(), td) }
+    match deserialize_program(serialize_program(prog)) {
+        checker::TProgram as got => match got.items[0] {
+            parser::TypeDecl as d => teko::assert::is_true(d.is_unsafe)
+            _ => teko::assert::is_true(false)
+        }
+        error => teko::assert::is_true(false)
+    }
+}
+
 /** (#165 C5) a bodyless instance-method signature `fn <name>(self)` — the receiver is the untyped
     1st param; helper for the struct/interface method-order fixtures. */
 fn method_sig(name: str) -> parser::Function {
@@ -499,7 +534,7 @@ fn method_sig(name: str) -> parser::Function {
         vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 0; col = 0
         is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""
         is_intern = false; is_abstract = false; is_virtual = false; is_override = false
-        has_inject = false; injects = teko::list::empty()
+        has_inject = false; injects = teko::list::empty(); is_unsafe = false
     }
 }
 
@@ -511,7 +546,7 @@ fn tkb_roundtrip_struct_with_methods() {
     mut methods: []parser::Function = teko::list::push(teko::list::empty(), method_sig("greet"))
     methods = teko::list::push(methods, method_sig("name"))
     let body = parser::StructBody { fields = teko::list::push(teko::list::empty(), fld); methods = methods; implements = teko::list::push(teko::list::empty(), "Named") }
-    let td = parser::TypeDecl { name = "Point"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = body; vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 1; col = 1; di_kind = parser::DiKind::None; has_di_key = false; di_key = "" }
+    let td = parser::TypeDecl { name = "Point"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = body; vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 1; col = 1; di_kind = parser::DiKind::None; has_di_key = false; di_key = ""; is_unsafe = false; must_free = false }
     let prog = checker::TProgram { items = teko::list::push(teko::list::empty(), td) }
     match deserialize_program(serialize_program(prog)) {
         checker::TProgram as got => match got.items[0] {
@@ -539,7 +574,7 @@ fn tkb_roundtrip_interface_methods() {
     mut methods: []parser::Function = teko::list::push(teko::list::empty(), method_sig("area"))
     methods = teko::list::push(methods, method_sig("perimeter"))
     let body = parser::InterfaceBody { extends = teko::list::push(teko::list::empty(), "Drawable"); methods = methods }
-    let td = parser::TypeDecl { name = "Shape"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = body; vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 1; col = 1; di_kind = parser::DiKind::None; has_di_key = false; di_key = "" }
+    let td = parser::TypeDecl { name = "Shape"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = body; vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 1; col = 1; di_kind = parser::DiKind::None; has_di_key = false; di_key = ""; is_unsafe = false; must_free = false }
     let prog = checker::TProgram { items = teko::list::push(teko::list::empty(), td) }
     match deserialize_program(serialize_program(prog)) {
         checker::TProgram as got => match got.items[0] {
@@ -571,7 +606,7 @@ fn tkb_roundtrip_class_with_base_and_methods() {
         fields = teko::list::push(teko::list::empty(), fld)
         methods = teko::list::push(teko::list::empty(), method_sig("area"))
     }
-    let td = parser::TypeDecl { name = "Circle"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = body; vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 1; col = 1; di_kind = parser::DiKind::None; has_di_key = false; di_key = "" }
+    let td = parser::TypeDecl { name = "Circle"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = body; vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 1; col = 1; di_kind = parser::DiKind::None; has_di_key = false; di_key = ""; is_unsafe = false; must_free = false }
     let prog = checker::TProgram { items = teko::list::push(teko::list::empty(), td) }
     match deserialize_program(serialize_program(prog)) {
         checker::TProgram as got => match got.items[0] {
@@ -739,7 +774,7 @@ fn rich_generic_struct() -> parser::TypeDecl {
     methods = teko::list::push(methods, method_sig("set"))
     let body = parser::StructBody { fields = teko::list::push(teko::list::empty(), fld); methods = methods; implements = teko::list::push(teko::list::empty(), "Named") }
     let tcons: []parser::ConstraintExpr = teko::list::push(teko::list::empty(), parser::ConstraintAtom { name = "Ord" })
-    parser::TypeDecl { name = "Box"; type_params = teko::list::push(teko::list::empty(), "T"); type_constraints = tcons; body = body; vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 1; col = 1; di_kind = parser::DiKind::None; has_di_key = false; di_key = "" }
+    parser::TypeDecl { name = "Box"; type_params = teko::list::push(teko::list::empty(), "T"); type_constraints = tcons; body = body; vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 1; col = 1; di_kind = parser::DiKind::None; has_di_key = false; di_key = ""; is_unsafe = false; must_free = false }
 }
 
 /** (#165 C7) an interface `Named` extending `Any` with two methods [name, rename] — the vtable
@@ -748,7 +783,7 @@ fn rich_interface() -> parser::TypeDecl {
     mut methods: []parser::Function = teko::list::push(teko::list::empty(), method_sig("name"))
     methods = teko::list::push(methods, method_sig("rename"))
     let body = parser::InterfaceBody { extends = teko::list::push(teko::list::empty(), "Any"); methods = methods }
-    parser::TypeDecl { name = "Named"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = body; vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 5; col = 1; di_kind = parser::DiKind::None; has_di_key = false; di_key = "" }
+    parser::TypeDecl { name = "Named"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = body; vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 5; col = 1; di_kind = parser::DiKind::None; has_di_key = false; di_key = ""; is_unsafe = false; must_free = false }
 }
 
 /** (#165 C7) a generic fn `fn pick<T: Ord>(x: T) -> T` whose body is a match over `x` with a
