@@ -390,6 +390,75 @@ fn rewrite_iface_segment(p: parser::Path, iface: str) -> parser::Path {
 }
 
 /**
+ * Is `name` a STRUCT (value type, no vtable) in the folded type table? The checker twin of codegen's
+ * `cg_is_class_named` — resolves the (canonical or bare-stamped) receiver name through the same
+ * qualified-aware `type_table_find` used by conformance/field resolution, so a same-bare struct in a
+ * sibling namespace is never mistaken for this one (#294, #109-family: keyed off the canonical
+ * `Named.name`, not an order-dependent bare probe). A class/interface/trait/enum/alias returns false —
+ * only a struct receiver is rewritten away from the vtable dispatch path.
+ *
+ * @param table  the folded type table
+ * @param name   the (canonical) receiver type name
+ * @return       true iff `name` resolves to a `StructBody` decl
+ * @since onda-3 (#294)
+ */
+fn is_struct_named(table: TypeTable, name: str) -> bool {
+    match type_table_find(table, name, "") {
+        parser::TypeDecl as td => match td.body { parser::StructBody => true; _ => false }
+        error => false
+    }
+}
+
+/**
+ * Build the DIRECT struct-method-dispatch callee as the two-segment path `[struct_name, method]`,
+ * whose single qualifier segment carries the receiver's FULL CANONICAL struct name so codegen and the
+ * VM key off the exact owning namespace (`Struct::method`), never colliding with a same-bare struct in
+ * a sibling namespace (#294). Mirrors the checker's own `method_dispatch_callee` (typer.tks) — the same
+ * shape a plain instance dot-call already lowers to; the method's TFunction namespace IS this canonical
+ * name (typer.tks:3218 `method_ns`), so setting `call_ns = struct_name` matches its definition.
+ *
+ * @param struct_name  the receiver's canonical struct name (`ns::…::Struct`, or bare at the root ns)
+ * @param method       the dispatched method's bare name
+ * @return             the `[struct_name, method]` callee path
+ * @since onda-3 (#294)
+ */
+fn struct_dispatch_callee(struct_name: str, method: str) -> parser::Path {
+    mut segs: []parser::Segment = teko::list::push(teko::list::empty(), parser::Segment { name = struct_name })
+    segs = teko::list::push(segs, parser::Segment { name = method })
+    parser::Path { segments = segs }
+}
+
+/**
+ * Rewrite a constraint-dispatch call whose CONCRETE receiver is a value-type STRUCT into a DIRECT call
+ * to that struct's stamped concrete method — a constraint is a MONOMORPHIZATION GATE, not a dynamic-
+ * dispatch promotion (#294, ruling (a) / teko-oop-w10b-design). A `<T: Contract>` body with `T` bound
+ * to a concrete struct is fully known at instantiation, so `x.measure()` lowers to a direct
+ * `Struct::measure(x)` call rather than a fat-pointer upcast the struct has no representation for (a
+ * struct is a value with no `{data,vtable}`; the class-only `emit_iface_call` would cc-reject natively
+ * and panic on the VM). Dynamic dispatch (the fat pointer) stays CLASS-only, exactly as before: a
+ * class/interface/trait receiver leaves `is_iface_dispatch=true` and passes through unchanged, so the
+ * vtable path is not perturbed. The direct call resolves through `find_function_ns`/`cg_find_function`
+ * like any ordinary stamped method — no new VM or codegen dispatch. A no-op when the receiver is not a
+ * struct, so the existing corpus (which has no constraint-bound struct dispatch) is byte-identical.
+ *
+ * @param cl     the interface-dispatch TCall (is_iface_dispatch true; args already rewritten)
+ * @param args   the rewritten args (args[0] is the receiver, carrying the concrete resolved type)
+ * @param table  the folded type table (classifies the receiver as struct vs class vs interface)
+ * @return       a DIRECT TCall keyed on the stamped struct method when the receiver is a struct; else `cl`
+ * @since onda-3 (#294)
+ */
+fn rekey_struct_constraint_dispatch(cl: TCall, args: []TExpr, table: TypeTable) -> TCall {
+    if !cl.is_iface_dispatch || cl.callee.segments.len < 2 || args.len == 0 {
+        return cl
+    }
+    let recv = match args[0].type { Named as n => n.name; _ => return cl }
+    if !is_struct_named(table, recv) { return cl }
+    let method = cl.callee.segments[cl.callee.segments.len - 1].name
+    let direct = struct_dispatch_callee(recv, method)
+    TCall { callee = direct; args = cl.args; call_ns = recv; is_closure_call = false; callee_type = cl.callee_type; is_iface_dispatch = false; iface_slot = 0 }
+}
+
+/**
  * Re-key an interface-dispatch TCall to the interface the CONCRETE receiver implements, when the
  * currently-keyed interface is not one the receiver conforms to. This is the S6 Or-constraint fix,
  * applied at monomorphization: once `T` is bound to a concrete class, the dispatch key baked at
@@ -400,7 +469,9 @@ fn rewrite_iface_segment(p: parser::Path, iface: str) -> parser::Path {
  * non-Or dispatch is perturbed; when no conforming owner is found the call is likewise left as-is.
  * An interface-value receiver (which passes through the fat pointer with no upcast) conforms to no
  * interface as a class/struct would (type_conforms_to's class/struct-body gate), so it never finds
- * a conformed owner here and is left untouched by construction.
+ * a conformed owner here and is left untouched by construction. A constraint-bound STRUCT receiver
+ * (a value type with no vtable) is rewritten to a DIRECT stamped-method call FIRST — before any
+ * re-key or the class-only vtable path could see it (#294, ruling (a)).
  *
  * @param cl     the interface-dispatch TCall (is_iface_dispatch true; args already rewritten)
  * @param args   the receiver-plus-arguments list, rewritten to concrete types for this instance
@@ -408,6 +479,8 @@ fn rewrite_iface_segment(p: parser::Path, iface: str) -> parser::Path {
  * @return       the re-keyed TCall, or `cl` unchanged when re-keying does not apply
  */
 fn rekey_iface_dispatch(cl: TCall, args: []TExpr, table: TypeTable) -> TCall {
+    let struct_direct = rekey_struct_constraint_dispatch(cl, args, table)
+    if !struct_direct.is_iface_dispatch { return struct_direct }
     if !cl.is_iface_dispatch || cl.callee.segments.len < 2 || args.len == 0 {
         return cl
     }
