@@ -6,6 +6,9 @@
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
+#ifdef _WIN32
+#define _CRT_RAND_S   // rand_s (CSPRNG in the ucrt, no import lib) — must precede <stdlib.h> (#194 C6)
+#endif
 #include "teko_rt.h"
 #include <ctype.h>    // isalpha (ROUND 0 UTF-8 codepoint ops)
 #include <stdio.h>    // fwrite, fputc, fputs, stdout, stderr
@@ -31,6 +34,7 @@
 #include <dirent.h>   // opendir/readdir — teko::fs::list_dir
 #include <sys/stat.h> // mkdir — teko::fs::mkdir (build output dir)
 #include <fcntl.h>    // O_WRONLY — /dev/null redirect for tk_rt_run_quiet (issue #73 cc probe)
+#include <sys/random.h> // getentropy (macOS) / getrandom (Linux glibc>=2.25, musl) — teko::crypto::rand (#194 C6)
 #endif
 #include <errno.h>    // errno/EEXIST — mkdir idempotence
 #include <time.h>     // clock_gettime, localtime_r, CLOCK_REALTIME — teko::time ROUND 0
@@ -1604,6 +1608,50 @@ uint64_t tk_peak_rss(void) {
     return (uint64_t)ru.ru_maxrss * 1024u;
 #endif
 #endif
+}
+
+// (#194 C6) teko::crypto::rand::secure_bytes(n) — n bytes from the host CSPRNG. Every
+// platform bottom fills a caller-owned buffer in fixed-size (or single) chunks and PANICS
+// (M.1) on a genuine host entropy failure — a CSPRNG that silently degrades to weak/short
+// output is a security defect, never a soft `error` here. n == 0 allocates a 1-byte buffer
+// (never NULL) but reports len == 0, mirroring tk_str_slice's empty-slice convention.
+tk_slice_byte tk_rt_secure_bytes(uint64_t n) {
+    tk_byte *out = (tk_byte *)tk_alloc(n == 0 ? 1 : n);
+#if defined(_WIN32)
+    // rand_s (ucrt, RtlGenRandom-backed) is a CSPRNG in the CRT — needs NO import lib, unlike
+    // BCryptGenRandom's bcrypt.lib which the self-host link cannot resolve for a runtime symbol the
+    // compiler's own corpus never calls. Fills 32 bits per rand_s call.
+    uint64_t filled = 0;
+    while (filled < n) {
+        unsigned int v;
+        if (rand_s(&v) != 0) tk_panic("teko::crypto::rand::secure_bytes: rand_s failed");
+        uint64_t chunk = n - filled;
+        if (chunk > 4) chunk = 4;
+        for (uint64_t k = 0; k < chunk; k += 1) out[filled + k] = (tk_byte)((v >> (8 * k)) & 0xFFu);
+        filled += chunk;
+    }
+#elif defined(__APPLE__)
+    // getentropy(2) caps a single call at 256 bytes and errors past that — chunk the fill.
+    uint64_t filled = 0;
+    while (filled < n) {
+        uint64_t chunk = n - filled;
+        if (chunk > 256) chunk = 256;
+        if (getentropy(out + filled, (size_t)chunk) != 0) {
+            tk_panic("teko::crypto::rand::secure_bytes: getentropy failed");
+        }
+        filled += chunk;
+    }
+#else
+    // getrandom(2) (Linux, glibc/musl) may return fewer bytes than requested (a signal
+    // interruption or a short read from the blocking-entropy-pool edge) — loop to fill.
+    uint64_t filled = 0;
+    while (filled < n) {
+        ssize_t got = getrandom(out + filled, (size_t)(n - filled), 0);
+        if (got < 0) tk_panic("teko::crypto::rand::secure_bytes: getrandom failed");
+        filled += (uint64_t)got;
+    }
+#endif
+    return (tk_slice_byte){ out, n };
 }
 
 // The version arrives as a BARE preprocessor token (-DTEKO_VERSION_STRING=0.0.1.0-bootstrap) and

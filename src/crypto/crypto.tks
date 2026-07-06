@@ -1,0 +1,99 @@
+/**
+ * `teko::crypto` core (C0) — the common surface every crypto family builds on: a
+ * `CryptoError` value type, constant-time byte comparison (`ct_eq`), and a hex-digest
+ * renderer shared by every hash/MAC/KDF that reports its output as a lowercase hex string
+ * (the universal KAT-vector format: RFC/NIST test vectors are always given in hex).
+ *
+ * Per issue #194 (C0+C1+C6) and TEKO_ROADMAP_NET_CRYPTO.md §3: pure Teko, no OS dependency,
+ * VM-`.tkt`-testable. `teko::crypto::hash` (C1) and `teko::crypto::rand` (C6) are the sibling
+ * files that build on this core; `teko::math::checked` (M1, issue #185) supplies the
+ * wrapping-arithmetic primitives every hash round uses (M.1 — signed overflow is UB in the
+ * emitted C, so the block-cipher/hash math never touches a signed type).
+ *
+ * NO INDEX-ASSIGNMENT (a Teko language law): every byte buffer here is built by
+ * `teko::list::push` (functional growth) rather than in-place mutation — the same discipline
+ * `teko::compress`'s CRC-32/ZIP writer already uses.
+ */
+
+/**
+ * A crypto-domain failure (bad key/nonce length, malformed input, verification failure, …).
+ * A DISTINCT type from the bare built-in `error` so call sites can name the domain precisely
+ * in a `match`, mirroring `teko::math::checked`'s `checked_error` convention — every crypto
+ * function that can fail returns `T | CryptoError`, never a panic for a caller-supplied bad
+ * input (M.1 — panics are reserved for host/entropy failures, never attacker-controlled data).
+ */
+pub type CryptoError = struct {
+    /** the human-readable cause of the failure */
+    message: str
+}
+
+/**
+ * Build a `CryptoError` carrying `reason` — the single constructor every crypto function
+ * routes its failure messages through (M.5 — one source of truth for the error shape).
+ *
+ * @param reason  the human-readable cause of the failure
+ * @return        a `CryptoError` whose `message` is `reason`
+ */
+pub fn crypto_error(reason: str) -> CryptoError {
+    CryptoError { message = reason }
+}
+
+/**
+ * Constant-time equality of two byte slices — the ONLY safe way to compare a computed MAC/
+ * digest/tag against an expected value in security code. A naive `==`-style early-return
+ * compare leaks the position of the first mismatching byte through timing (a real side
+ * channel exploited against MAC verification); this instead touches EVERY byte of both
+ * slices unconditionally and folds the mismatches with bitwise OR, so its running time
+ * depends only on the (public) lengths, never on where a mismatch occurs.
+ *
+ * A length mismatch returns `false` immediately — the lengths themselves are not secret
+ * (every real protocol fixes the expected tag length ahead of time), so that early return
+ * introduces no exploitable timing channel.
+ *
+ * @param a  the first byte slice (e.g. the computed tag)
+ * @param b  the second byte slice (e.g. the expected tag)
+ * @return   `true` iff `a` and `b` have equal length and identical bytes at every index
+ */
+pub fn ct_eq(a: []byte, b: []byte) -> bool {
+    if a.len != b.len { return false }
+    mut diff: u32 = 0
+    mut i: u64 = 0
+    loop {
+        if i >= a.len { break }
+        diff = diff | ((a[i] to u32) ^ (b[i] to u32))
+        i++
+    }
+    diff == 0
+}
+
+/**
+ * Renders one nibble (0..15) as its lowercase hex digit.
+ *
+ * @param nibble  a value in 0..15 (the caller guarantees this range)
+ * @return        the lowercase hex character for `nibble`
+ */
+fn hex_nibble(nibble: u32) -> byte {
+    if nibble < 10 { return (b'0' to u32 + nibble) to byte }
+    (b'a' to u32 + (nibble - 10)) to byte
+}
+
+/**
+ * Renders a byte slice as a lowercase hex string — the canonical textual form for a
+ * hash/MAC digest, matching every RFC/NIST known-answer-vector listing (e.g.
+ * `sha256("abc")` = `"ba7816bf..."`).
+ *
+ * @param data  the bytes to render
+ * @return      `data`, two lowercase hex characters per byte, most-significant nibble first
+ */
+pub fn to_hex(data: []byte) -> str {
+    mut out: []byte = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= data.len { break }
+        let v = data[i] to u32
+        out = teko::list::push(out, hex_nibble(v >> 4))
+        out = teko::list::push(out, hex_nibble(v & 0xF))
+        i++
+    }
+    str_of_bytes(out)
+}

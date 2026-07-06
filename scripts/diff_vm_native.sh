@@ -61,10 +61,14 @@ EXPECTED_FAIL=(
 # buf_ptr_memset_roundtrip — calls a raw `extern` (libc memset) over a `teko::mem::buf_ptr`
 #   arena buffer (C7.19); `buf_ptr` is a host-only builtin with no VM interception, same
 #   honest-stop shape as any other raw extern.
+# crypto_rand_secure_bytes — calls teko::crypto::rand::secure_bytes, a `from "teko_rt"`
+#   extern (#194 C6); the VM rejects EVERY extern (not just raw platform ones — C7.1a), so
+#   this CSPRNG primitive is native-only, same shape as time_types.
 NATIVE_ONLY=(
     time_types
     extern_reachability
     buf_ptr_memset_roundtrip
+    crypto_rand_secure_bytes
 )
 
 is_expected_fail() {
