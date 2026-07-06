@@ -185,3 +185,43 @@ diferentes). O #277 já estava mergeado → correção via novo PR (nunca direto
 - `==` em dois structs type-checka e emite C inválido (expr.tks:19 + codegen.tks) — latente, pré-existente; questão de operator-overloading separada. TR3 NÃO auto-baixa `==`→`.eq()`.
 - Slice/Optional/enum sob derive estrutural são honest-stop em v1 (M.1); follow-up TR3.1 natural quando #178 (Json) aterrissar.
 - `cb_i128` negativo (ver D19).
+
+---
+
+## 2026-07-05 — Reorganização do backlog por dependência (fases "para trás e fora de ordem")
+
+### D21 · Ondas de dependência sobrepostas às fases; keystone da fase-1 destrava a fase-3 ✅
+- **Contexto (o que o dono viu):** fase-1-linguagem 25% / fase-2-packaging 22% / **fase-3-stdlib 2%** (33 abertas) / fase-4 16% / fase-5 50% / fase-6 0%. Merges oportunistas (unblocked-first, monomorphic-first) deram aparência de "fora de ordem": tooling e stdlib-roots aterrissaram à frente de fechar a linguagem.
+- **Diagnóstico:** as fases NÃO são topo-ordenadas de fato — um **keystone da fase-1** (cluster monomorfização+128-bit) é o PORTÃO de toda a fase-3 genérica. Enquanto não fecha, 33 issues de stdlib ficam represadas. O monomorphic-first foi deliberado (camada genérica parada atrás do cluster), mas os labels não comunicavam.
+- **Aplicada:**
+  1. Criado label `keystone`; marcado o cluster #254/#290/#294/#296/#299/#301.
+  2. Rotuladas 9 issues sem-fase (#158/#159→fase-2; #163→fase-3; #164/#283→fase-1; #167/#168/#282→fase-6; #233→fase-5).
+  3. Espinha de **milestones = ondas de dependência** (delegada à teko-docs) sobre os labels de fase.
+  4. Ordem corrigida ratificada (abaixo).
+- **Ordem corrigida (recomendação, base: dep-DAG + "o VPS/site é DEPOIS" nas palavras do dono → fundação primeiro):**
+  - **Onda 2 (fechar):** #300 (#184) — em rework (review HALTou: tee corrompe dados + flat_map/tee-iterator/compress omitidos → issue-100%).
+  - **Onda 3 (KEYSTONE):** sub-cluster A `#290→#301→#254→#294` + sub-cluster B `#296∥#299`. Destrava fase-3 genérica + coleções #163 + parte de async #164.
+  - **Onda 4:** fase-1 cleanup independente (#171/#172/#173/#174) + cadeia de traits #178→#179.
+  - **Onda 5:** fase-3 stdlib flui (coleções #163 primeiro → math/encodings/compress/crypto/net roots).
+  - **Trilha paralela (fillers near-term):** higiene de release/dist #267/#159/#282/#283 (servem o pipeline JÁ ativo); packaging pesado #180/#218-220 e site/servidor de pacotes = DEPOIS (palavra do dono).
+- **Alternativas registradas:** (B) puxar fase-2 packaging/dist + site teko-lang.cloud para a frente em paralelo à onda-3 — REJEITADA por ora (dono disse "esse VPS DEPOIS"); (C) priorizar amplitude de stdlib visível (net/http/db/web) para demos — adiada (depende da onda-3 para a camada genérica).
+- **Base constitucional:** issues-must-be-100% + backlog-deve-convergir + main-integrity; dependência força keystone-antes-de-dependentes (não é escolha de produto, é topo-ordem). A única escolha de produto (fundação vs site-primeiro) resolvida pela palavra do dono ("depois").
+
+### D22 · #294 (struct sob `<T: Contract>`): constraint É gate de monomorfização, não promoção a dispatch dinâmico ✅ (do architect, law-first)
+- **Aplicada:** um struct constrangido por `<T: Contract>` despacha DIRETO ao método concreto estampado (precisa do #254 antes); o fat-pointer/vtable segue exclusivo de `class`, casando o design OOP já assentado. NÃO se promove struct-constrangido a vtable dinâmica.
+- **Base:** design OOP assentado (vtable = ref-semantics de class) + monomorfização (constraint = prova em tempo de estampagem). Registrado para revisão no gate LTS. Residual (struct-como-VALOR-de-contrato em slot) reportado, não expandido.
+
+---
+
+## 2026-07-05 — #184 (#300): fix do tee + descoberta de que flat_map é bloqueado pelo keystone
+
+### D23 · #184 é vítima do keystone: núcleo monomórfico fecha, `flat_map`/tee-lazy sequenciam com #301 ✅
+- **Contexto:** review adversarial do #300 HALTou com (1) `tee_write_fn` corrompendo dados em sinks assimétricos [bug real] e (2) `flat_map`/tee-iterator/compress "omitidos" [issue-100%].
+- **Investigação (leituras, sem build):** o PARKED doc do `iter.tks` já documenta com repro empírico que `flat_map` precisa carregar um iterator interno (closure) em estado mutável (`Ref` cell / campo `IntIter?`) — que é EXATAMENTE o **#301** (closure-in-Ref/optional não round-trip; codegen não mangla optional/slice de function-type; VM dropa closure re-assentada num Ref). `compress_stream.tks` é construível (byte-state `Ref<MemWriter>` + `write_zip`/`read_zip`), só falta um teste exercitando o round-trip.
+- **Aplicada:**
+  1. **Fix do tee (bug real):** `tee_write_fn` agora drena 100% da região em CADA sink via `write_all` antes de reportar consumo → nunca re-oferece cauda → sem double-feed em sinks assimétricos. Docstring reescrito. Checkpoint commitado local em `fix/issue-184-resync` (NÃO pushado — pega-leve, sem CI até o batch com #301).
+  2. **flat_map / fold genérico / tee-lazy de iterator:** NÃO forçados — bloqueados pelo #301. PARKED doc atualizado p/ citar #301 explicitamente.
+  3. **Escopo #184:** entrega o núcleo monomórfico (IO0 streams c/ tee corrigido + ITER0 adapters/terminals + IO1 file copy); o remanescente (`flat_map`, tee-lazy, + teste assimétrico do tee, + teste round-trip do compress) sequencia com #301 na onda-3, validado num único CI, então #184 fecha 100%.
+- **Base constitucional:** issues-must-be-100% NÃO exige entregar o que o compilador não compila (bloqueio de capacidade = dependência legítima, reportada+folded, não omissão). main-integrity: o bug do tee é real mas vive num PR aberto (não em main) — corrigido; #184 NÃO mergeia até 100% (pós-#301). Alinha com D21 (keystone antes de dependentes).
+- **Correção ao review:** o achado "flat_map omitido silenciosamente" foi sobre-sinalização — é deferral documentado e bloqueado, não narrowing. (O achado do tee estava 100% correto.)
+- **Reversível:** o fix do tee é independente e correto por si; o resto é aditivo pós-#301.
