@@ -67,27 +67,28 @@ jobs:
           sh scripts/ci_cc_wrap.sh "-fsanitize=address,undefined -fno-omit-frame-pointer -g"
           teko . -o bin
 
-      # This lane runs the VM gate for now (with #323's memory caps + no --coverage). Flipping it to
-      # the NATIVE gate — which would additionally ASan-check the production native build pipeline and
-      # drop the VM functional-env balloon under ASan — is DEFERRED, not abandoned. The re-flip is a
-      # rolling UB-audit of the native path: each pre-existing UB it surfaces must be fixed at the root
-      # before the flip lands. So far the native #test corpus under UBSan surfaced (1) the #291 trait
-      # dynamic-vtable function-pointer-type mismatch — FIXED in THIS PR via typed dispatch thunks; and
-      # then, once dispatch no longer aborted, (2) two more PRE-EXISTING runtime UBs the VM gate never
-      # reached: `tk_mul_u16` signed-integer-overflow (uint16 operands promote to int; 65535*65535
-      # overflows), and a SYSTEMIC arena under-alignment — `tk_region_alloc` rounds to
-      # `_Alignof(max_align_t)` (8 on arm64) but `ExprKind`/`TExprKind` carry an `__int128` needing
-      # 16, so every Expr/TExpr can land misaligned on max_align_t<16 platforms. Those two are a
-      # dedicated runtime-alignment pass (its own careful fixpoint/gate re-verification) which will
-      # re-flip THIS lane to the native gate and validate the fix under the very UBSan that exposed it.
-      # The #168 build-gate memory win (VM→native default for `teko . -o bin`) is independent of this
-      # lane and already landed. The #323 caps stay: they bound the VM gate's ASan footprint.
-      - name: Run the gate on gen1 (VM, ASan + UBSan + LSan)
+      # This lane runs the NATIVE gate (`./bin/teko . -o gen2-asan`): the sanitized gen1 compiles the
+      # whole project through the PRODUCTION native pipeline (front-end -> emitted C -> host cc ->
+      # execute), so ASan/UBSan/LSan cover the emitted C + runtime seam on the path the release ships,
+      # and it drops the VM functional-env balloon under ASan. This lane is a rolling UB-audit of the
+      # native path: each pre-existing UB it surfaces is fixed at the ROOT before the flip stays green.
+      # It has so far surfaced and driven root fixes for (1) the #291 trait dynamic-vtable function-
+      # pointer-type mismatch (typed dispatch thunks); and, once dispatch no longer aborted, two more
+      # PRE-EXISTING runtime UBs the VM gate never reached, BOTH fixed at the root before this re-flip:
+      # (2a) `tk_mul_u16` signed-integer-overflow (uint16 operands promote to int; 65535*65535
+      # overflows) — now multiplied in `unsigned`; and (2b) a SYSTEMIC arena under-alignment —
+      # `tk_region_alloc` rounded to `_Alignof(max_align_t)` (8 on arm64) but `ExprKind`/`TExprKind`
+      # carry an `__int128` needing 16, so every Expr/TExpr could land 8-byte-aligned on a
+      # max_align_t<16 target — now the arena guarantees TK_ARENA_ALIGN (max of max_align_t's and
+      # __int128's) for the payload base AND the bump/size rounding. The #168 build-gate memory win
+      # (VM→native default for `teko . -o bin`) is independent of this lane. The #323 ASan caps stay:
+      # they bound the lane's ASan footprint on the 7 GB runner.
+      - name: Run the gate on gen1 (native, ASan + UBSan + LSan)
         env:
           ASAN_OPTIONS: halt_on_error=1:detect_leaks=1:quarantine_size_mb=64:malloc_context_size=5
           LSAN_OPTIONS: suppressions=.github/lsan-suppressions.txt:print_suppressions=0
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
-        run: ./bin/teko test .
+        run: ./bin/teko . -o gen2-asan
 
       # The VM gate above ASan-covers the compiler's C while it INTERPRETS the tests, but not the
       # native BUILD pipeline (tk_emit_c / cg_lift_program / tk_emit_tsym / run_cc). So build every

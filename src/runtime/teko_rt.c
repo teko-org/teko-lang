@@ -26,6 +26,7 @@
 #endif
 #ifdef _WIN32
 #include "../win32_compat.h"  // chdir→_chdir, mkdir, getcwd, setenv, dirent shim, tk_win32_spawnvp
+#include <malloc.h>   // _aligned_malloc / _aligned_free — over-aligned arena chunks (tk_chunk_alloc)
 #include <io.h>        // _dup, _dup2, _close — fd-redirect around tk_rt_run_quiet's _spawnvp (issue #73)
 #else
 #include <unistd.h>   // chdir, fork, execvp, _exit (host FFI bottoms)
@@ -773,13 +774,22 @@ tk_char tk_to_upper(tk_char c) {
 }
 
 // ── Arena allocation (S1) — bump allocator over a chunk-list. See teko_rt.h. ──
-// Each chunk is one malloc'd block: a header + payload, bump-filled by `used`. The
-// `max_align_t data[]` flexible member forces the payload base to max_align_t alignment,
-// so rounding `used` up to that alignment aligns every sub-allocation exactly as malloc
-// would. Chunks are libc-malloc'd, so tk_region_drop's free() on each is heap-correct (no
-// arena interior pointer is ever passed to libc free). NOTE: the seed is single-threaded;
-// the lazy root init (tk_g_root) is not synchronized — revisit at S8 (concurrency).
-struct tk_chunk { struct tk_chunk *next; size_t cap; size_t used; max_align_t data[]; };
+// Each chunk is one aligned-malloc'd block: a header + payload, bump-filled by `used`.
+// The payload must satisfy the STRONGEST alignment any Teko value needs, which is NOT
+// _Alignof(max_align_t) on every target: on arm64 that is 8, but ExprKind/TExprKind carry
+// an `__int128` needing 16, so allocations rounded only to 8 would land 8-byte-aligned and
+// dereferences would be UB (UBSan-flagged). TK_ARENA_ALIGN is therefore the MAX of
+// max_align_t's alignment and __int128's — 16 on arm64, still 16 on x86_64 — and it drives
+// BOTH the payload-base over-alignment (`_Alignas` on `data`) and the `used`/size rounding
+// in tk_region_alloc. Chunks come from tk_chunk_alloc (a portable aligned allocator) and are
+// released through tk_chunk_free, so tk_region_drop's release on each is heap-correct (no
+// arena interior pointer is ever passed to the deallocator). NOTE: the seed is single-
+// threaded; the lazy root init (tk_g_root) is not synchronized — revisit at S8 (concurrency).
+#define TK_ARENA_ALIGN                                                          \
+    (_Alignof(max_align_t) > _Alignof(__int128)                                 \
+         ? _Alignof(max_align_t)                                                \
+         : _Alignof(__int128))
+struct tk_chunk { struct tk_chunk *next; size_t cap; size_t used; _Alignas(TK_ARENA_ALIGN) unsigned char data[]; };
 // (W9.3b) `reg_next` is an INTRUSIVE link into the GLOBAL live-region registry (tk_g_regs) — no extra
 // allocation. tk_region_new prepends; tk_region_drop unlinks; tk_regions_free_all walks + frees all.
 // (S2) `parent` is the arena TREE edge (NULL = no parent — the root, or a deliberately
@@ -797,12 +807,41 @@ struct tk_region {
     size_t             entries_cap;
     uint64_t           gen;        // (S2 Level-1) unique generation stamp — distinguishes a dropped-and-reused region address from a live one (push-cache safety)
 };
-_Static_assert(offsetof(struct tk_chunk, data) % _Alignof(max_align_t) == 0,
-               "chunk payload base must be max_align_t-aligned");
+_Static_assert(offsetof(struct tk_chunk, data) % TK_ARENA_ALIGN == 0,
+               "chunk payload base must be TK_ARENA_ALIGN-aligned");
+_Static_assert(_Alignof(struct tk_chunk) % TK_ARENA_ALIGN == 0,
+               "chunk struct alignment must cover TK_ARENA_ALIGN (the _Alignas on data)");
+
+// Portable aligned block allocator for chunks: guarantees a TK_ARENA_ALIGN-aligned base so the
+// _Alignas(TK_ARENA_ALIGN) payload member is honored even where malloc under-aligns (the C
+// standard only promises _Alignof(max_align_t)). POSIX uses posix_memalign (freed with plain
+// free); Windows uses _aligned_malloc (freed with _aligned_free — see tk_chunk_free). NULL on OOM.
+static void *tk_chunk_alloc(size_t bytes) {
+#if defined(_WIN32)
+    return _aligned_malloc(bytes, TK_ARENA_ALIGN);
+#else
+    // posix_memalign requires size a multiple of nothing but alignment a power-of-two multiple of
+    // sizeof(void*); TK_ARENA_ALIGN (16) satisfies that on every 64-bit target. On failure it
+    // returns non-zero and leaves the out-pointer indeterminate, so normalize to NULL.
+    void *p = NULL;
+    if (posix_memalign(&p, TK_ARENA_ALIGN, bytes) != 0) return NULL;
+    return p;
+#endif
+}
+
+// Release a chunk block obtained from tk_chunk_alloc. Windows _aligned_malloc blocks MUST NOT be
+// passed to plain free(); every chunk-release site routes through here to stay heap-correct.
+static void tk_chunk_free(struct tk_chunk *c) {
+#if defined(_WIN32)
+    _aligned_free(c);
+#else
+    free(c);
+#endif
+}
 
 // Allocate a chunk with `payload` usable bytes; NULL on OOM (the caller decides retry/panic).
 static struct tk_chunk *tk_chunk_try(size_t payload) {
-    struct tk_chunk *c = malloc(offsetof(struct tk_chunk, data) + payload);
+    struct tk_chunk *c = tk_chunk_alloc(offsetof(struct tk_chunk, data) + payload);
     if (c != NULL) { c->next = NULL; c->cap = payload; c->used = 0; }
     return c;
 }
@@ -819,8 +858,8 @@ static uint64_t   tk_g_region_gen = 0;   // (S2 Level-1) monotonic region-genera
 // block to the bump, so an explicitly freed block is PARKED on a size-class free list instead,
 // and tk_region_alloc consults that list BEFORE bumping — real REUSE: an explicit free stops
 // the footprint from growing even though the region is never dropped.
-//   * bins: exact-size classes for blocks ≤ 4096 B (16-byte steps — max_align granularity, the
-//     same rounding tk_region_alloc applies), single-probe pop = O(1);
+//   * bins: exact-size classes for blocks ≤ 4096 B (16-byte steps = TK_ARENA_ALIGN granularity,
+//     the same rounding tk_region_alloc applies), single-probe pop = O(1);
 //   * large list: > 4096 B, bounded first-fit (size must be ≥ request and ≤ 2× — no headers, so
 //     a block is never split; the cap avoids quadratic scans).
 // ROOT-ONLY by design: parked blocks live inside root chunks, which are never freed mid-run —
@@ -837,11 +876,10 @@ static void tk_free_purge(void) {                   // rewind/termination: parke
     tk_free_parked_bytes = 0;
 }
 static void *tk_free_take(size_t an) {
-    // (#148 Level-2) TAKE = CEIL-16 — never UNDERSTATE the need. The arena's alignment quantum is
-    // _Alignof(max_align_t) (8 on arm64 Darwin), so `an` may not be a 16-multiple: flooring the bin
-    // index handed a 16-byte block to a 24-byte request — an 8-byte OVERRUN into the neighbor.
-    // With ceil, bin[qa] blocks are exactly qa ≥ an bytes. (qa ≥ 16 always, so the old bins[-1]
-    // underflow guard (#150) is subsumed.)
+    // (#148 Level-2) TAKE = CEIL-16 — never UNDERSTATE the need. The bin granularity is 16 bytes
+    // (= TK_ARENA_ALIGN); requests round up so bin[qa] blocks are exactly qa ≥ an bytes. Ceil (not
+    // floor) so a 24-byte request never gets handed a 16-byte block (an 8-byte OVERRUN into the
+    // neighbor). (qa ≥ 16 always, so the old bins[-1] underflow guard (#150) is subsumed.)
     size_t qa = (an + 15) & ~(size_t)15;
     if (qa <= (size_t)TK_FREE_BINS * 16) {
         tk_freenode **bin = &tk_free_bins[qa / 16 - 1];
@@ -1041,7 +1079,7 @@ void *tk_region_alloc(tk_region *r, size_t n) {
     // objects, frame regions). The ROOT side is recorded in tk_alloc (whose RA0 is the REAL site;
     // recording here would blame everything on tk_alloc itself).
     if (tk_obs_on == 1 && r != tk_g_root) { tk_obs_scoped_bytes += n; tk_obs_add(tk_obs_scoped, __builtin_return_address(0), n); }
-    size_t align = _Alignof(max_align_t);
+    size_t align = TK_ARENA_ALIGN;
     size_t an = (n + (align - 1)) & ~(align - 1);   // round the request up to alignment
     // (mem::free) REUSE an explicitly freed block first — root-only (parked blocks live in root
     // chunks). A hit costs one bin probe; an empty free list costs one NULL compare.
@@ -1067,7 +1105,7 @@ void *tk_region_alloc(tk_region *r, size_t n) {
     c->used = an;
     c->next = r->head;
     r->head = c;
-    return (char *)c->data;                          // base 0 is max_align_t-aligned (flexible member)
+    return (char *)c->data;                          // base 0 is TK_ARENA_ALIGN-aligned (over-aligned flexible member)
 }
 
 void tk_region_drop(tk_region *r) {
@@ -1088,7 +1126,7 @@ void tk_region_drop(tk_region *r) {
         tk_obs_regions_dropped += 1;
         for (struct tk_chunk *oc = c; oc != NULL; oc = oc->next) tk_obs_drop_bytes += oc->used;
     }
-    while (c != NULL) { struct tk_chunk *next = c->next; free(c); c = next; }
+    while (c != NULL) { struct tk_chunk *next = c->next; tk_chunk_free(c); c = next; }
     free(r->entries); r->entries = NULL; r->nentries = 0; r->entries_cap = 0;   // (S2) the per-region registry — a separate malloc'd array, not chunk-backed
     free(r);
 }
@@ -1111,7 +1149,7 @@ void tk_regions_free_all(void) {
     while (r != NULL) {
         tk_region *rnext = r->reg_next;
         struct tk_chunk *c = r->head;
-        while (c != NULL) { struct tk_chunk *cnext = c->next; free(c); c = cnext; }
+        while (c != NULL) { struct tk_chunk *cnext = c->next; tk_chunk_free(c); c = cnext; }
         free(r->entries);   // (S2) the per-region registry — a separate malloc'd array, not chunk-backed
         free(r);
         r = rnext;
@@ -1181,7 +1219,7 @@ void tk_arena_pop(void) {
     while (c != NULL && c != m.chunk) {
         struct tk_chunk *next = c->next;
         if (tk_obs_on == 1) tk_obs_rewind_bytes += c->used;   // (S2 obs) bytes the rewind reclaims
-        free(c); c = next;                                    // free chunks newer than the mark
+        tk_chunk_free(c); c = next;                           // free chunks newer than the mark
     }
     r->head = m.chunk;
     if (m.chunk != NULL) {
@@ -2089,9 +2127,10 @@ void tk_free_block(void *p, uint64_t bytes) {
       if (dbg) fprintf(stderr, "PARK %p bytes=%llu\n", p, (unsigned long long)bytes); }
     unsigned h = tk_push_slot(p);
     if (tk_push_cache[h].ptr == p) tk_push_cache[h].ptr = NULL;   // evict the live-tail record
-    // (#148 Level-2) PARK = FLOOR-16 — never LIE about the block's size. The arena aligns to
-    // _Alignof(max_align_t) (8 on arm64 Darwin), so an 8-byte block really is 8 bytes: rounding UP
-    // overran the bump-adjacent NEIGHBOR by 8 (freenode header / paranoid poison corrupted live
+    // (#148 Level-2) PARK = FLOOR-16 — never LIE about the block's size. The caller's `bytes` is a
+    // true LOWER bound (len*esz) that need not be a 16-multiple: flooring to the 16-byte bin
+    // granularity keeps the parked size ≤ the block's real usable extent, so serving it never
+    // overruns the bump-adjacent NEIGHBOR (freenode header / paranoid poison would corrupt live
     // data — caught by the poisoned-emission micro-repro). tk_free_take rounds the REQUEST up
     // (ceil-16), so a parked block only ever serves requests ≤ its floored true size.
     size_t usable = (size_t)bytes & ~(size_t)15;
