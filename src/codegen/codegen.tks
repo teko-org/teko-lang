@@ -143,16 +143,32 @@ fn cb_u128_c_expr(buf: []byte, v: u128) -> []byte {
     cb(b, "ULL)")
 }
 
+// reinterpret_i128_bits_u128 — the raw 128 bits of a signed value AS a u128, two's-complement,
+// NEVER trapping. Local to codegen's cb_* family (codegen must not depend on vm.tks): each 64-bit
+// half is masked out (non-negative after the mask, so the `to u128` is total), then recomposed in
+// u128 space where every sub-op is total. The codegen-side twin of the VM's
+// reinterpret_i128_to_u128. (C: `cb_reinterpret_i128_bits_u128`; #299.)
+fn reinterpret_i128_bits_u128(v: i128) -> u128 {
+    let lo = (v & 0xFFFFFFFFFFFFFFFF) to u128
+    let hi = ((v >> 64) & 0xFFFFFFFFFFFFFFFF) to u128
+    (hi << 64) | lo
+}
+
 // cb_i128 — append a signed 128-bit value as a C constant expression (sign + magnitude via the
-// shift form). For the most-negative value, negating in i128 overflows, so the magnitude is
-// derived via unsigned wrap. (C: `cb_i128`.)
+// shift form). A negative i128 must NOT compute its magnitude via `v to u128`: the checked cast
+// PANICS ("impossible conversion") on a negative source. Historically this never fired (a source
+// negative parses as `Unary(Minus, Number)`), but a DIRECT negative `Number` (a synthesizer or a
+// checked-math fold) reaches here. Instead reinterpret the bits into u128 (never trapping) and take
+// the two's-complement magnitude `~bits + 1`, total even for the most-negative value (whose i128
+// negation overflows). (C: `cb_i128`; #299.)
 fn cb_i128(buf: []byte, v: i128) -> []byte {
     if v < 0 {
+        let mag = (~reinterpret_i128_bits_u128(v)) + (1 to u128)
         mut b = cb(buf, "-(")
-        b = cb_u128_c_expr(b, (0 to u128) - (v to u128))
+        b = cb_u128_c_expr(b, mag)
         return cb(b, ")")
     }
-    cb_u128_c_expr(buf, v to u128)
+    cb_u128_c_expr(buf, reinterpret_i128_bits_u128(v))
 }
 
 // cb_f64_literal — append a f64 as a round-trippable decimal literal. The C twin used
