@@ -3993,6 +3993,15 @@ fn must_free_fn(body: []parser::Statement) -> parser::Function {
  *  via `return` is the only consume shape available to it in these tests). */
 fn return_h_stmt() -> parser::Statement { ret_stmt(e_var("h")) }
 
+/** A `fn(h: FileHandle) -> i64 { <body> }` — the SAME tracked param `h`, but a return type
+ *  UNRELATED to `FileHandle`, so `return <n>` type-checks while never consuming `h`; proves a
+ *  `return` of something OTHER than the tracked name is treated as a DROP, not an exempting
+ *  divergence (the correctness gap `stmt_diverges_standalone` must NOT paper over). */
+fn must_free_fn_i64_ret(body: []parser::Statement) -> parser::Function {
+    let p = parser::Param { name = "h"; has_type = true; type_ann = named_t("FileHandle"); is_params = false; has_default = false; default_expr = e_num(0) }
+    parser::Function { name = "use_handle_i64"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = teko::list::push(teko::list::empty(), p); has_return = true; return_type = named_t("i64"); body = body; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false; has_inject = false; injects = teko::list::empty(); is_unsafe = false }
+}
+
 /** The expr-statement `teko::mem::free(h)` — the LOCAL-binding consume (`h` here is a `mut`
  *  local, never the tracked param — see must_free_local_binding_freed_and_dropped). */
 fn free_h_stmt() -> parser::Statement {
@@ -4020,6 +4029,22 @@ fn must_free_param_freed_on_straight_line_is_accepted() {
 fn must_free_param_dropped_is_error() {
     let table = must_free_table("FileHandle")
     let f = must_free_fn(one_stmt(e_num(0)))
+    match type_function(f, empty_env(), table) { TFunction => teko::assert::is_true(false); error => teko::assert::is_true(true) }
+}
+
+/**
+ * S2 (#336): `return <something-else>` while the tracked `#must_free` param `h` sits unconsumed
+ * is a DROP, not an exempting divergence — a `return` only counts as a consume when its value
+ * IS the tracked name (`stmt_consumes_must_free`); any other return value abandons `h` just as
+ * surely as falling off the end does. Guards against `stmt_diverges_standalone` over-broadly
+ * treating every `TReturn` as safe (the correctness gap the honest bound does NOT cover — this
+ * one is a real soundness requirement of the "first cut" consume set itself, not the aliased-
+ * free UAF the design already excludes).
+ */
+#test
+fn must_free_param_return_of_other_value_is_still_dropped() {
+    let table = must_free_table("FileHandle")
+    let f = must_free_fn_i64_ret(teko::list::push(teko::list::empty(), ret_stmt(e_num(7))))
     match type_function(f, empty_env(), table) { TFunction => teko::assert::is_true(false); error => teko::assert::is_true(true) }
 }
 
@@ -4100,5 +4125,51 @@ fn must_free_local_binding_freed_and_dropped() {
     let ok_items = teko::list::push(teko::list::push(teko::list::empty(), cls), rebind_handle_item(teko::list::push(teko::list::empty(), free_h_stmt())))
     match type_program(parser::Program { items = ok_items }) { TProgram => teko::assert::is_true(true); error => teko::assert::is_true(false) }
     let bad_items = teko::list::push(teko::list::push(teko::list::empty(), cls), rebind_handle_item(teko::list::empty()))
+    match type_program(parser::Program { items = bad_items }) { TProgram => teko::assert::is_true(false); error => teko::assert::is_true(true) }
+}
+
+/**
+ * S2 (#336) acceptance 3 (split control flow, NON-diverging consume): a LOCAL `#must_free`
+ * binding freed via `teko::mem::free(h)` on BOTH arms of an `if`/`else` is accepted. Distinct
+ * from the param if/else test: `mem::free` does not itself end control flow (unlike `return`),
+ * so this is the case that actually exercises the branch-recursion arm of the dataflow
+ * (`stmt_branches_all_consume_must_free`) rather than short-circuiting on divergence.
+ */
+#test
+fn must_free_local_binding_freed_on_both_if_arms_via_mem_free_is_accepted() {
+    let cls = must_free_class_item("FileHandle")
+    let cond = ek(parser::BoolLit { value = true })
+    let iff = parser::IfExpr { cond = cond; then_blk = teko::list::push(teko::list::empty(), free_h_stmt()); has_else = true; else_blk = teko::list::push(teko::list::empty(), free_h_stmt()) }
+    let ok_items = teko::list::push(teko::list::push(teko::list::empty(), cls), rebind_handle_item(teko::list::push(teko::list::empty(), st(ek(iff)))))
+    match type_program(parser::Program { items = ok_items }) { TProgram => teko::assert::is_true(true); error => teko::assert::is_true(false) }
+}
+
+/**
+ * S2 (#336) acceptance 3 (match split, NON-diverging consume): a LOCAL `#must_free` binding
+ * freed via `teko::mem::free(h)` on EVERY arm of a `match` is accepted — exercises
+ * `match_arms_all_consume_must_free` (a `mem::free` call does not itself diverge, so this
+ * cannot short-circuit on divergence the way an all-`return` match would).
+ */
+#test
+fn must_free_local_binding_freed_on_every_match_arm_via_mem_free_is_accepted() {
+    let cls = must_free_class_item("FileHandle")
+    let arm0 = parser::Arm { pattern = parser::LiteralPattern { value = e_num(0) }; has_when = false; guard = e_num(0); body = teko::list::push(teko::list::empty(), free_h_stmt()) }
+    let armw = parser::Arm { pattern = parser::WildcardPattern { }; has_when = false; guard = e_num(0); body = teko::list::push(teko::list::empty(), free_h_stmt()) }
+    let m = parser::MatchExpr { subject = e_num(0); arms = teko::list::push(teko::list::push(teko::list::empty(), arm0), armw) }
+    let ok_items = teko::list::push(teko::list::push(teko::list::empty(), cls), rebind_handle_item(teko::list::push(teko::list::empty(), st(ek(m)))))
+    match type_program(parser::Program { items = ok_items }) { TProgram => teko::assert::is_true(true); error => teko::assert::is_true(false) }
+}
+
+/**
+ * S2 (#336): a LOCAL `#must_free` binding freed via `teko::mem::free(h)` on only ONE arm of an
+ * `if`/`else` is still a drop (the other arm falls through unfreed) — rejected. The NON-
+ * diverging counterpart of `must_free_param_freed_on_only_one_if_arm_is_error`.
+ */
+#test
+fn must_free_local_binding_freed_on_only_one_if_arm_via_mem_free_is_error() {
+    let cls = must_free_class_item("FileHandle")
+    let cond = ek(parser::BoolLit { value = true })
+    let iff = parser::IfExpr { cond = cond; then_blk = teko::list::push(teko::list::empty(), free_h_stmt()); has_else = true; else_blk = one_stmt(e_num(0)) }
+    let bad_items = teko::list::push(teko::list::push(teko::list::empty(), cls), rebind_handle_item(teko::list::push(teko::list::empty(), st(ek(iff)))))
     match type_program(parser::Program { items = bad_items }) { TProgram => teko::assert::is_true(false); error => teko::assert::is_true(true) }
 }

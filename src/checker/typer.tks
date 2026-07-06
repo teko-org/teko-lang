@@ -2184,17 +2184,22 @@ fn tblock_diverges(stmts: []TStatement) -> bool {
 
 /**
  * (S2, the 0.1.0.0-beta memory+unsafe remodel #336) does every path through `stmts`, STARTING
- * AT INDEX `from`, either diverge or consume the tracked `#must_free` binding `name` before
+ * AT INDEX `from`, either CONSUME the tracked `#must_free` binding `name` or DIVERGE, before
  * falling off the block's end? The DUAL of `tblock_diverges` (which asks "does every path exit
- * before falling off the end?"; this asks "does every NON-DIVERGING path CONSUME `name` before
- * falling off the end?"). Consumed = reaches `teko::mem::free(name)` (the exact call
- * `type_mem_free` recognizes, `call_ns == "teko::mem"`) OR is moved out via `return name` (the
- * first-cut consume set — a follow-up may widen this to a general move-tracking pass, per the
- * design's accepted conservative-over-rejection tax). A path that DIVERGES (panic/exit,
- * `return` of anything, break, continue) before reaching the block's end never drops the value,
- * so it needs no consume (mirrors `tblock_diverges`'s own divergence primitive). `from` lets a
- * binding declared PARTWAY through a block be checked only over its OWN remaining scope (the
- * statements after its own `TBinding`), never over statements that precede its declaration.
+ * before falling off the end?"; this asks "does every path either consume `name` or exit
+ * WITHOUT falling off the end unconsumed?"). Consumed = reaches `teko::mem::free(name)` (the
+ * exact call `type_mem_free` recognizes, `call_ns == "teko::mem"`) OR is moved out via
+ * `return name` (the first-cut consume set — a follow-up may widen this to a general
+ * move-tracking pass, per the design's accepted conservative-over-rejection tax). A path that
+ * DIVERGES (`break`/`continue`/a trailing `panic`/`exit` call) before reaching the block's end
+ * never drops the value, so it needs no consume — but a bare `return <something-else>` is NOT
+ * treated as divergence here (unlike `tblock_diverges`'s own primitive, which cares only about
+ * "does this block yield a trailing value"): a return of anything OTHER than the tracked name
+ * abandons the value just as surely as falling off the end does, so it is checked for
+ * CONSUMPTION first (`stmt_consumes_must_free`), and only genuinely-diverging statements are
+ * exempted. `from` lets a binding declared PARTWAY through a block be checked only over its OWN
+ * remaining scope (the statements after its own `TBinding`), never over statements that precede
+ * its declaration.
  *
  * HONEST BOUND (mirrors the note at `type_mem_free`, `docs/design/memory-unsafe-backend-remodel.md`
  * §5): this is a LOCAL, PER-BINDING dataflow — it has no points-to/uniqueness fact, so it catches
@@ -2204,14 +2209,14 @@ fn tblock_diverges(stmts: []TStatement) -> bool {
  * @param stmts  the typed statement block to walk (a function body, or an if/match branch)
  * @param from   the index to start walking from (0 for a param; a binding's own index + 1 for a local)
  * @param name   the tracked `#must_free` binding/param's name
- * @return       true iff every path through `stmts[from..]` either diverges or consumes `name`
+ * @return       true iff every path through `stmts[from..]` either consumes `name` or diverges
  */
 fn must_free_consumed_on_all_paths(stmts: []TStatement, from: u64, name: str) -> bool {
     mut i = from
     loop {
         if i >= stmts.len { break }
-        if stmt_diverges_standalone(stmts[i]) { return true }
         if stmt_consumes_must_free(stmts[i], name) { return true }
+        if stmt_diverges_standalone(stmts[i]) { return true }
         if stmt_branches_all_consume_must_free(stmts[i], name) { return true }
         i++
     }
@@ -2220,17 +2225,20 @@ fn must_free_consumed_on_all_paths(stmts: []TStatement, from: u64, name: str) ->
 
 /**
  * Does this ONE statement, by itself, unconditionally end the enclosing block's control flow
- * (a `return`/`break`/`continue`, or a trailing-expression-statement panic/exit call)? A plain
- * `if`/`match` embedded in a `TExprStmt` is handled separately by
- * `stmt_branches_all_consume_must_free` (it may consume on every branch without ITSELF being a
- * `tblock_diverges`-style divergence), so this predicate deliberately does NOT recurse into one.
+ * WITHOUT abandoning a `#must_free` value (a `break`/`continue`, or a trailing-expression-
+ * statement `panic`/`exit` call)? Deliberately does NOT include `TReturn` — a `return` of
+ * anything other than the tracked name is a DROP, not an exempting divergence (the caller
+ * checks `stmt_consumes_must_free` first, which recognizes the ONE `return`-shape that IS a
+ * legal consume: `return name` itself). A plain `if`/`match` embedded in a `TExprStmt` is
+ * handled separately by `stmt_branches_all_consume_must_free` (it may consume on every branch
+ * without ITSELF being a `tblock_diverges`-style divergence), so this predicate deliberately
+ * does NOT recurse into one.
  *
  * @param s  the typed statement to test
- * @return   true iff this statement alone diverges (never falls through)
+ * @return   true iff this statement alone diverges (never falls through) without a `return`
  */
 fn stmt_diverges_standalone(s: TStatement) -> bool {
     match s {
-        TReturn => true
         TBreakStmt => true
         TContinueStmt => true
         TExprStmt as es => texpr_diverges(es.expr)
