@@ -635,7 +635,7 @@ fn parse_flags_decl(tokens: []lexer::Token, pos: u64) -> Parsed<Decl> | error {
         return err_at(tokens, p, "expected '{' after the flags type name")
     }
     let ms = match parse_field_names(tokens, p) { ParsedList<str> as x => x; error as e => return e }
-    Parsed<Decl> { node = TypeDecl { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = FlagsBody { members = ms.items; values = teko::list::empty() }; vis = vis; has_doc = has_doc; doc = doc; line = name_line; col = name_col; di_kind = DiKind::None; has_di_key = false; di_key = ""; is_unsafe = false }; next = ms.next }
+    Parsed<Decl> { node = TypeDecl { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = FlagsBody { members = ms.items; values = teko::list::empty() }; vis = vis; has_doc = has_doc; doc = doc; line = name_line; col = name_col; di_kind = DiKind::None; has_di_key = false; di_key = ""; is_unsafe = false; must_free = false }; next = ms.next }
 }
 
 // `[doc] [pub|exp] type Name = <body>` (B.13, nominal). Doc + visibility precede `type`.
@@ -681,23 +681,24 @@ fn parse_type_decl(tokens: []lexer::Token, pos: u64) -> Parsed<Decl> | error {
     p = tps.next
     if is_extern {
         // `extern type Name` — an OPAQUE foreign handle: no `= <body>`, lowers to `void *`.
-        return Parsed<Decl> { node = TypeDecl { name = name; type_params = tps.names; type_constraints = tps.constraints; body = ExternBody { }; vis = vis; has_doc = has_doc; doc = doc; line = name_line; col = name_col; di_kind = DiKind::None; has_di_key = false; di_key = ""; is_unsafe = is_unsafe }; next = p }
+        return Parsed<Decl> { node = TypeDecl { name = name; type_params = tps.names; type_constraints = tps.constraints; body = ExternBody { }; vis = vis; has_doc = has_doc; doc = doc; line = name_line; col = name_col; di_kind = DiKind::None; has_di_key = false; di_key = ""; is_unsafe = is_unsafe; must_free = false }; next = p }
     }
     if !is_kind_at(tokens, p, lexer::TokenKind::Assign) {
         return err_at(tokens, p, "expected '=' in a type declaration")
     }
     let body = match parse_type_body(tokens, p + 1) { Parsed<TypeBody> as x => x; error as e => return e }
-    Parsed<Decl> { node = TypeDecl { name = name; type_params = tps.names; type_constraints = tps.constraints; body = body.node; vis = vis; has_doc = has_doc; doc = doc; line = name_line; col = name_col; di_kind = DiKind::None; has_di_key = false; di_key = ""; is_unsafe = is_unsafe }; next = body.next }
+    Parsed<Decl> { node = TypeDecl { name = name; type_params = tps.names; type_constraints = tps.constraints; body = body.node; vis = vis; has_doc = has_doc; doc = doc; line = name_line; col = name_col; di_kind = DiKind::None; has_di_key = false; di_key = ""; is_unsafe = is_unsafe; must_free = false }; next = body.next }
 }
 
 // `parse_module` returns Parsed<Module> (an instance of the result.tks generic).
 
 /** Collect the leading `#…` attributes before a declaration keyword (each on its own line or
  *  inline): `#test` (D2), `#os("…")` (C7.1f), the three DI lifetimes `#singleton`/`#scoped`/
- *  `#transient` (W10c, precede a `type`), and the `#inject(…)` overlay (W10c, precedes a `fn`).
- *  A second lifetime annotation on one declaration is an honest error. `next` resumes at the
- *  doc/visibility/keyword that follows the block; placement (fn-vs-type) is enforced by the
- *  caller so the message names the actual keyword. */
+ *  `#transient` (W10c, precede a `type`), the `#inject(…)` overlay (W10c, precedes a `fn`), and
+ *  `#must_free` (S2, the 0.1.0.0-beta memory+unsafe remodel #336 — precedes a `type`). A second
+ *  lifetime annotation, or a doubled `#must_free`, on one declaration is an honest error. `next`
+ *  resumes at the doc/visibility/keyword that follows the block; placement (fn-vs-type) is
+ *  enforced by the caller so the message names the actual keyword. */
 fn parse_decl_attributes(tokens: []lexer::Token, pos: u64) -> ParsedAttributes | error {
     mut start = pos
     mut is_test = false
@@ -707,6 +708,7 @@ fn parse_decl_attributes(tokens: []lexer::Token, pos: u64) -> ParsedAttributes |
     mut key = ""
     mut has_inject = false
     mut injects: []InjectBinding = teko::list::empty()
+    mut must_free = false
     loop {
         if !is_kind_at(tokens, start, lexer::TokenKind::Hash) { break }
         if !is_kind_at(tokens, start + 1, lexer::TokenKind::Ident) {
@@ -732,11 +734,15 @@ fn parse_decl_attributes(tokens: []lexer::Token, pos: u64) -> ParsedAttributes |
             if di_kind != DiKind::None { return err_at(tokens, start + 1, "a type may carry only one lifetime annotation (`#singleton`/`#scoped`/`#transient`)") }
             di_kind = lifetime_kind_of(attr)
             start = skip_seps(tokens, start + 2)
+        } else if attr == "must_free" {
+            if must_free { return err_at(tokens, start + 1, "a type may carry only one `#must_free` attribute") }
+            must_free = true
+            start = skip_seps(tokens, start + 2)
         } else {
-            return err_at(tokens, start + 1, "unknown attribute (only `#test`, `#os(\"…\")`, `#inject(…)`, and the lifetimes `#singleton`/`#scoped`/`#transient` are recognized)")
+            return err_at(tokens, start + 1, "unknown attribute (only `#test`, `#os(\"…\")`, `#inject(…)`, the lifetimes `#singleton`/`#scoped`/`#transient`, and `#must_free` are recognized)")
         }
     }
-    ParsedAttributes { is_test = is_test; os_guard = os_guard; di_kind = di_kind; has_key = has_key; key = key; has_inject = has_inject; injects = injects; next = start }
+    ParsedAttributes { is_test = is_test; os_guard = os_guard; di_kind = di_kind; has_key = has_key; key = key; has_inject = has_inject; injects = injects; must_free = must_free; next = start }
 }
 
 /** Map a lifetime attribute name to its `DiKind` (the caller has verified it is one of the three). */
@@ -817,7 +823,7 @@ fn with_outer_doc(node: Decl, has_doc: bool, doc: str) -> Decl {
     if !has_doc { return node }
     match node {
         Function as f => Function { name = f.name; type_params = f.type_params; type_constraints = f.type_constraints; params = f.params; has_return = f.has_return; return_type = f.return_type; body = f.body; vis = f.vis; has_doc = true; doc = doc; line = f.line; col = f.col; is_test = f.is_test; is_extern = f.is_extern; c_symbol = f.c_symbol; from_lib = f.from_lib; os_guard = f.os_guard; is_intern = f.is_intern; is_abstract = f.is_abstract; is_virtual = f.is_virtual; is_override = f.is_override; has_inject = f.has_inject; injects = f.injects; is_unsafe = f.is_unsafe }
-        TypeDecl as td => TypeDecl { name = td.name; type_params = td.type_params; type_constraints = td.type_constraints; body = td.body; vis = td.vis; has_doc = true; doc = doc; line = td.line; col = td.col; di_kind = td.di_kind; has_di_key = td.has_di_key; di_key = td.di_key; is_unsafe = td.is_unsafe }
+        TypeDecl as td => TypeDecl { name = td.name; type_params = td.type_params; type_constraints = td.type_constraints; body = td.body; vis = td.vis; has_doc = true; doc = doc; line = td.line; col = td.col; di_kind = td.di_kind; has_di_key = td.has_di_key; di_key = td.di_key; is_unsafe = td.is_unsafe; must_free = td.must_free }
         _ => node
     }
 }
@@ -873,28 +879,32 @@ fn parse_decl(tokens: []lexer::Token, pos: u64) -> Parsed<Decl> | error {
 }
 
 /** Parse a `fn` declaration reached through `parse_decl`, applying the collected attributes:
- *  a `#singleton`/`#scoped`/`#transient` lifetime may not precede a function, and the `#inject`
- *  overlay is threaded into the parsed Function (has_inject/injects). */
+ *  a `#singleton`/`#scoped`/`#transient` lifetime may not precede a function, `#must_free` may
+ *  only precede a `type` (S2 #336), and the `#inject` overlay is threaded into the parsed
+ *  Function (has_inject/injects). */
 fn parse_fn_decl_with_attrs(tokens: []lexer::Token, start: u64, attrs: ParsedAttributes) -> Parsed<Decl> | error {
     if attrs.di_kind != DiKind::None { return err_at(tokens, start, "a lifetime annotation (`#singleton`/`#scoped`/`#transient`) may only precede a `type`, not a function") }
+    if attrs.must_free { return err_at(tokens, start, "`#must_free` may only precede a `type`") }
     let d = match parse_function(tokens, start, attrs.is_test, attrs.os_guard, false, false) { Parsed<Decl> as x => x; error as e => return e }
     Parsed<Decl> { node = with_fn_inject(d.node, attrs.has_inject, attrs.injects); next = d.next }
 }
 
 /** Parse a `type` declaration reached through `parse_decl`, applying the collected attributes:
- *  `#test`/`#os`/`#inject` may not precede a type, and a lifetime annotation is threaded into
- *  the parsed TypeDecl (di_kind/has_di_key/di_key). */
+ *  `#test`/`#os`/`#inject` may not precede a type, and a lifetime annotation + `#must_free` (S2
+ *  #336) are threaded into the parsed TypeDecl (di_kind/has_di_key/di_key/must_free). */
 fn parse_type_decl_with_attrs(tokens: []lexer::Token, start: u64, k: u64, attrs: ParsedAttributes) -> Parsed<Decl> | error {
     match reject_fn_only_attrs_on_type(tokens, k, attrs) { error as e => return e; null => { } }
     let d = match parse_type_decl(tokens, start) { Parsed<Decl> as x => x; error as e => return e }
-    Parsed<Decl> { node = with_type_di(d.node, attrs.di_kind, attrs.has_key, attrs.key); next = d.next }
+    Parsed<Decl> { node = with_type_di(d.node, attrs.di_kind, attrs.has_key, attrs.key, attrs.must_free); next = d.next }
 }
 
 /** Parse a `flags` declaration reached through `parse_decl`. Flags carry no DI (they are values,
- *  not injectable objects); a lifetime annotation on one is a plain type-vs-fn placement error. */
+ *  not injectable objects); a lifetime annotation or `#must_free` on one is a plain type-vs-fn
+ *  placement error (flags are values, not a freeable heap handle). */
 fn parse_flags_decl_with_attrs(tokens: []lexer::Token, start: u64, k: u64, attrs: ParsedAttributes) -> Parsed<Decl> | error {
     match reject_fn_only_attrs_on_type(tokens, k, attrs) { error as e => return e; null => { } }
     if attrs.di_kind != DiKind::None { return err_at(tokens, k, "a lifetime annotation (`#singleton`/`#scoped`/`#transient`) may not precede a `flags` type") }
+    if attrs.must_free { return err_at(tokens, k, "`#must_free` may not precede a `flags` type") }
     parse_flags_decl(tokens, start)
 }
 
@@ -914,10 +924,11 @@ fn with_fn_inject(node: Decl, has_inject: bool, injects: []InjectBinding) -> Dec
     }
 }
 
-/** Rebuild a parsed TypeDecl with its DI lifetime annotation attached (all other fields preserved). */
-fn with_type_di(node: Decl, di_kind: DiKind, has_key: bool, key: str) -> Decl {
+/** Rebuild a parsed TypeDecl with its DI lifetime annotation and `#must_free` marker (S2 #336)
+ *  attached (all other fields preserved). */
+fn with_type_di(node: Decl, di_kind: DiKind, has_key: bool, key: str, must_free: bool) -> Decl {
     match node {
-        TypeDecl as td => TypeDecl { name = td.name; type_params = td.type_params; type_constraints = td.type_constraints; body = td.body; vis = td.vis; has_doc = td.has_doc; doc = td.doc; line = td.line; col = td.col; di_kind = di_kind; has_di_key = has_key; di_key = key; is_unsafe = td.is_unsafe }
+        TypeDecl as td => TypeDecl { name = td.name; type_params = td.type_params; type_constraints = td.type_constraints; body = td.body; vis = td.vis; has_doc = td.has_doc; doc = td.doc; line = td.line; col = td.col; di_kind = di_kind; has_di_key = has_key; di_key = key; is_unsafe = td.is_unsafe; must_free = must_free }
         _ => node
     }
 }
