@@ -406,8 +406,14 @@ fn type_list_builtin(c: parser::Call, env: Env, table: TypeTable) -> TExpr | Not
 // SUM of the two heap shapes; the checker dispatches the arm STATICALLY by the argument's resolved
 // type (no runtime tag). SAFETY (the "equilíbrio"): the target must be a MUTABLE VARIABLE — the
 // lowering scrubs it (slice → empty, class handle → null) at the free site, so a direct
-// `free(x); use(x)` reads the scrubbed-empty value, never the parked buffer (aliasing via a separate
-// binding is the caller's razor + the ASan gate; full alias invalidation is a follow-up). Returns void.
+// `free(x); use(x)` reads the scrubbed-empty value, never the parked buffer. But an ALIASED free
+// (`y = x; free(x); use(y)`) is NOT caught: not statically (there is no uniqueness/points-to fact
+// yet), and NOT by ASan either. `mem::free` never calls libc `free` -- it parks the block on a
+// private free-list over the arena (teko_rt.c:856), so a use-after-free reads reused-but-still-mapped
+// memory that AddressSanitizer cannot see. Only `TEKO_MEM_PARANOID=1` (poison-and-never-reuse) traps
+// it today. The real fix is the inferred-spine affine/uniqueness check
+// (docs/design/memory-unsafe-backend-remodel.md); until it lands, aliased free is the caller's razor
+// + PARANOID, NOT a static or ASan guarantee. Returns void.
 type NotMemFree = struct { }
 fn type_mem_free(c: parser::Call, env: Env, table: TypeTable) -> TExpr | NotMemFree | error {
     if c.callee.segments.len < 2 { return NotMemFree { } }
