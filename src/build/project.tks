@@ -710,26 +710,26 @@ fn coverage_gate_result(dir: str, fe: Frontend) -> i32 {
     0
 }
 
-/** native_function_floor — the FUNCTION-coverage floor, the metric the native gate populates fully via
-    the child's per-fn `tk_cov_mark` dump (#265). The native runner marks a fn ENTERED, exactly as the
-    VM's eval_call does; line/branch instrumentation (per-expression `tk_cov_line`/`tk_cov_branch` under
-    TestCov) is not yet emitted, so those two floors are enforced on the VM lane (`teko test .`) that
-    the ratified governance keeps as a required CI job. */
-fn native_function_floor(dir: str, fe: Frontend) -> i32 {
-    let fcov = vm::coverage_pct(fe.prog)
-    if fcov < fe.manifest.cov_functions {
-        return fail(dir, $"function coverage {fcov}% is below the {fe.manifest.cov_functions}% floor ([coverage] functions) — add tests")
-    }
-    0
+/** report_native_coverage — print the three engine-independent coverage metrics (function/line/branch)
+ *  the native gate populated, so the native and VM lanes are directly comparable in CI logs (#265
+ *  Track A parity). Uses the exported percentage wrappers (vm::*_coverage_pct). */
+fn report_native_coverage(prog: checker::TProgram) {
+    let fcov = vm::coverage_pct(prog)
+    let lcov = vm::line_coverage_pct(prog)
+    let bcov = vm::branch_coverage_pct(prog)
+    teko::io::println($"teko: coverage {fcov}% functions")
+    teko::io::println($"teko: coverage {lcov}% lines")
+    teko::io::println($"teko: coverage {bcov}% branches")
 }
 
 /** run_native_gate — (#265, lever D of #249) the D4 test gate run NATIVELY: emit a test-profile C
  *  translation unit whose `main()` calls each `#test` in order, compile it with the SAME `run_cc`
  *  the build uses, run the resulting binary (a failed assert panics → non-zero exit, fail-fast M.1),
  *  and — cov ALWAYS on for the gate, to feed the floors — merge the child's dumped `.tkcov` into
- *  this process's coverage sinks. The engine-independent static walk (vm::*_coverage_pct) then reads
- *  those merged sinks exactly as it read the VM's in-process marks. Replaces the 15.6 s VM interpret
- *  of the test bodies (issue #265 measurement) with a sub-second native run. */
+ *  this process's coverage sinks. Under TestCov each PRODUCTION fn body carries `tk_cov_line_at`/
+ *  `tk_cov_branch_at` interior marks (#265 Track A), so the merged sinks populate ALL THREE metrics —
+ *  the engine-independent static walk (vm::*_coverage_pct) reads them exactly as it read the VM's
+ *  in-process marks. Replaces the 15.6 s VM interpret of the test bodies with a sub-second native run. */
 fn run_native_gate(dir: str, out_dir: str, prog: checker::TProgram, m: Manifest) -> i32 {
     let od = if out_dir.len > 0 && out_dir[out_dir.len - 1] == b'/' { teko::str::slice_to(out_dir, out_dir.len - 1) } else { out_dir }
     match teko::fs::mkdir(od) { error => return fail(dir, "cannot create the output directory"); null => { } }
@@ -781,16 +781,17 @@ fn run_gate_vm(dir: str, out_dir: str, gen_cov: bool, fe: Frontend) -> i32 {
 }
 
 /** run_gate_native — the D4 test-gate body run NATIVELY (#265, OPT-IN via `--native-gate` /
- *  `TEKO_NATIVE_GATE=1`): run every `#test` compiled-native (run_native_gate, fail-fast), enforce the
- *  FUNCTION-coverage floor from the native run's merged marks (native_function_floor); line/branch
- *  floors are NOT enforced here (native has no per-expression instrumentation yet — a real corpus
- *  build wanting the full three floors should also run the VM lane, `teko test .`). Until #168's
- *  partitioning makes a single native run cheaper than the VM interpret it replaces, this path is
- *  SLOWER than run_gate_vm on a large corpus — hence opt-in, not the default (owner ruling 2026-07-05). */
+ *  `TEKO_NATIVE_GATE=1`): run every `#test` compiled-native (run_native_gate, fail-fast), then enforce
+ *  ALL THREE coverage floors (function/line/branch) via coverage_gate_result — the SAME floor fn the
+ *  VM lane uses. Track A's per-fn line/branch instrumentation (tk_cov_line_at/tk_cov_branch_at) makes
+ *  the native run populate the line and branch sinks too, so coverage_gate_result works VERBATIM on the
+ *  merged native sinks. Until #168's partitioning makes a single native run cheaper than the VM
+ *  interpret it replaces, this path is opt-in, not the default (owner ruling 2026-07-05). */
 fn run_gate_native(dir: str, out_dir: str, gen_cov: bool, fe: Frontend) -> i32 {
     let trc = run_native_gate(dir, out_dir, fe.prog, fe.manifest)
     if trc != 0 { return trc }
-    let gate_rc = native_function_floor(dir, fe)
+    report_native_coverage(fe.prog)
+    let gate_rc = coverage_gate_result(dir, fe)
     if gate_rc != 0 { return gate_rc }
     if gen_cov {
         let xml = vm::cov_cobertura(fe.prog)

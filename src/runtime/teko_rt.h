@@ -460,6 +460,14 @@ void     tk_cov_line_reset(void);
 void     tk_cov_line(uint32_t line);                       // mark a line as executed (current fn)
 bool     tk_cov_line_hit(uint64_t fn, uint32_t line);      // report query
 
+// #265 (Track A) — EXPLICIT-fn line/branch marks for the native test gate. The VM keeps a live
+// enter/leave fn-stack (eval_call), so tk_cov_line/tk_cov_branch read tk_fn_stack[sp-1]. The native
+// test binary has NO enter/leave inside production bodies, so codegen passes the owning fn's
+// prog.items index EXPLICITLY, bypassing the stack — every interior mark keys on the fn the static
+// floor walk (line_coverage/branch_coverage) queries. Same tk_line_id/tk_branch_id packing.
+void     tk_cov_line_at(uint64_t fn, uint32_t line);                             // mark a line for fn (explicit)
+void     tk_cov_branch_at(uint64_t fn, uint32_t line, uint32_t col, uint64_t outcome);  // mark a branch for fn (explicit)
+
 // #265 — cross-process coverage merge for the NATIVE test gate. The child test binary dumps its three
 // sinks to a `.tkcov` file at exit; the compiler (parent) merges them, then runs the unchanged static
 // walk + floors. The coverage id is the shared prog.items index, so the packed ids are portable.

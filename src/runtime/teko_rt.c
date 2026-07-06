@@ -1691,6 +1691,13 @@ void tk_cov_branch(uint32_t line, uint32_t col, uint64_t outcome) {
     uint64_t fn = tk_fn_sp > 0 ? tk_fn_stack[tk_fn_sp - 1] : 0;
     tk_covb_add(tk_branch_id(fn, line, col, outcome));
 }
+// #265 (Track A) — the EXPLICIT-fn twin of tk_cov_branch. The native test gate has no fn-stack
+// inside production bodies (no enter/leave), so codegen passes the owning fn index directly, so
+// the mark keys on the same fn the static floor walk queries. Same packing, same dedup set.
+void tk_cov_branch_at(uint64_t fn, uint32_t line, uint32_t col, uint64_t outcome) {
+    if (!tk_covb_on) return;
+    tk_covb_add(tk_branch_id(fn, line, col, outcome));
+}
 bool tk_cov_branch_hit(uint64_t fn, uint32_t line, uint32_t col, uint64_t outcome) {
     uint64_t id = tk_branch_id(fn, line, col, outcome);
     for (uint64_t i = 0; i < tk_covb_n; i += 1) if (tk_covb_ids[i] == id) return true;
@@ -1722,15 +1729,26 @@ static void tk_line_rehash(uint64_t ncap) {
 }
 void tk_cov_lines_on(bool on) { tk_lines_on = on ? 1 : 0; }
 void tk_cov_line_reset(void) { tk_line_n = 0; for (uint64_t i = 0; i < tk_line_cap; i += 1) tk_line_ids[i] = 0; }
-void tk_cov_line(uint32_t line) {
-    if (!tk_lines_on || line == 0) return;
-    uint64_t fn = tk_fn_sp > 0 ? tk_fn_stack[tk_fn_sp - 1] : 0;
-    uint64_t id = tk_line_id(fn, line);
+// tk_line_insert_packed — insert a (fn,line)-packed id into the open-addressing set (grow-then-probe),
+// deduping. Shared by the stack-keyed tk_cov_line and the explicit-fn tk_cov_line_at (#265 Track A).
+static void tk_line_insert_packed(uint64_t id) {
     if (tk_line_cap == 0) tk_line_rehash(1024);
     else if (tk_line_n * 2 >= tk_line_cap) tk_line_rehash(tk_line_cap * 2);
     uint64_t h = (id * 1099511628211ull) & (tk_line_cap - 1);
     while (tk_line_ids[h]) { if (tk_line_ids[h] == id) return; h = (h + 1) & (tk_line_cap - 1); }
     tk_line_ids[h] = id; tk_line_n += 1;
+}
+void tk_cov_line(uint32_t line) {
+    if (!tk_lines_on || line == 0) return;
+    uint64_t fn = tk_fn_sp > 0 ? tk_fn_stack[tk_fn_sp - 1] : 0;
+    tk_line_insert_packed(tk_line_id(fn, line));
+}
+// #265 (Track A) — the EXPLICIT-fn twin of tk_cov_line. The native test gate has no fn-stack inside
+// production bodies (no enter/leave), so codegen passes the owning fn index directly, so the mark
+// keys on the same fn the static floor walk queries. Same packing, same open-addressing set.
+void tk_cov_line_at(uint64_t fn, uint32_t line) {
+    if (!tk_lines_on || line == 0) return;
+    tk_line_insert_packed(tk_line_id(fn, line));
 }
 bool tk_cov_line_hit(uint64_t fn, uint32_t line) {
     if (tk_line_cap == 0) return false;
