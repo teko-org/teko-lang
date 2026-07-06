@@ -1566,19 +1566,25 @@ fn type_struct_lit(sl: parser::StructLit, expected: Type, env: Env, table: TypeT
     // (S4) constructing a GENERIC struct → retarget to the concrete instance named by `tgt` (the
     // annotation OR the W9.4 construction-site type-args), so `Box { … }` under `: Box<i64>`
     // (or `Box<i64> { … }`) builds `Box__g__i64` (its fields are T→i64).
+    mut is_self_construct = false
     if decl.type_params.len > 0 {
-        let mname = match tgt {
-            Named as en => en.name
-            _ => return error { message = $"cannot infer the type arguments of `{base_name}` here — annotate it (e.g. `let x: {base_name}<…> = …`)" }
+        if is_self_generic_construct(base_name, env.owner_type, decl.type_params) {
+            is_self_construct = true
+            name = phantom_self_inst_name(base_name, decl.type_params)
+        } else {
+            let mname = match tgt {
+                Named as en => en.name
+                _ => return error { message = $"cannot infer the type arguments of `{base_name}` here — annotate it (e.g. `let x: {base_name}<…> = …`)" }
+            }
+            if !name_has_generic_base(mname, base_name) {
+                return error { message = $"struct literal `{base_name}` does not match the annotated type" }
+            }
+            decl = match type_table_find(table, mname, "") {
+                parser::TypeDecl as td => td
+                error => return error { message = $"internal: generic instance `{mname}` was not stamped" }
+            }
+            name = mname
         }
-        if !name_has_generic_base(mname, base_name) {
-            return error { message = $"struct literal `{base_name}` does not match the annotated type" }
-        }
-        decl = match type_table_find(table, mname, "") {   // (#109 W1) generic-instance lookup on a resolved name — no referencing ns
-            parser::TypeDecl as td => td
-            error => return error { message = $"internal: generic instance `{mname}` was not stamped" }
-        }
-        name = mname
     }
     // (W10b.CLASS) `Name { … }` also constructs a class instance — a class's fields are typed
     // identically to a struct's (increment 2: the EFFECTIVE, base-inherited fields too). An
@@ -1595,7 +1601,7 @@ fn type_struct_lit(sl: parser::StructLit, expected: Type, env: Env, table: TypeT
             // ("" outside any method) — a purely inherited method keeps its ORIGINAL declaring
             // class (type_struct_methods), so a base factory constructing the base stays legal when
             // re-typed under a derived class. Structs are pure value data: their literals stay free.
-            if name_last_segment(env.owner_type) != name_last_segment(name) {   // (#109 W3) compare bare — `name` is the class's canonical "ns::Name", owner_type the enclosing-method class
+            if !is_self_construct && name_last_segment(env.owner_type) != name_last_segment(name) {
                 return error { message = $"a class literal is only legal inside the class's own methods — construct it via a static factory: {name}" }
             }
             match effective_class_fields(c, table) { []parser::Field as fs => fs; error as e => return e }

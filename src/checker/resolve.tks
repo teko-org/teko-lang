@@ -156,6 +156,32 @@ fn type_ns_of(table: TypeTable, name: str) -> str {
 //   Privates: found-then-rejected is left to the module-visibility pass (check_modules) — a private
 //        type in another namespace is MENTIONABLE here (so error wording is precise), the existing
 //        visibility check keeps rejecting it.
+/**
+ * Resolve a BARE stamped generic-instance name (`Box__g__i64`) to its TypeDecl from ANY namespace, or
+ * null when `last` is not a stamped instance name (#254 L4/L5). A stamped instance name is
+ * collision-proof — no user symbol may carry the `__g__` infix — so it is bare-visible everywhere,
+ * exactly like a root-level or type-param name. A stamped instance's own methods carry the instance
+ * name in their (normalized) signatures, and `register_instance_methods` resolves those signatures with
+ * no referencing namespace, so a bare `Box__g__i64` in a `-> Box<T>` return / `Box<T>` param must
+ * resolve regardless of the instance's declaring namespace. Consulted BEFORE the cross-namespace
+ * collision error, which would otherwise reject the bare stamped name from "".
+ *
+ * @param last  the path's last segment (the referenced type name)
+ * @param table the folded type table
+ * @return      the stamped instance's decl, or null when `last` is not a stamped instance name
+ * @since onda-3 (#254 L4/L5)
+ */
+fn resolve_bare_g_instance(last: str, table: TypeTable) -> parser::TypeDecl? {
+    if !name_is_g_instance(last) { return null }
+    mut g: u64 = 0
+    loop {
+        if g >= table.len { break }
+        if table[g].name == last { return table[g].decl }
+        g++
+    }
+    null
+}
+
 fn resolve_type_ref(path: parser::Path, table: TypeTable, ref_ns: str) -> parser::TypeDecl | error {
     if path.segments.len == 0 { return error { message = "not a user type" } }
     let last = path.segments[path.segments.len - 1].name
@@ -178,6 +204,7 @@ fn resolve_type_ref(path: parser::Path, table: TypeTable, ref_ns: str) -> parser
                 k++
             }
         }
+        match resolve_bare_g_instance(last, table) { parser::TypeDecl as td => return td; null => { } }
         // No same-ns entry. If the name lives elsewhere, that is the cross-namespace collision — the
         // reference is not visible bare and MUST be qualified (fail-loud). Otherwise it is simply
         // unknown (the caller's "unknown type" message stands).
@@ -1278,6 +1305,51 @@ pub fn generic_inst_name(base: str, args: []Type) -> str {
         i++
     }
     out
+}
+
+/**
+ * Is this struct/class literal a SELF-CONSTRUCT inside its own generic template — i.e. the base
+ * being constructed equals the enclosing method's owner type, AND that owner is generic (so no
+ * concrete instance is stamped while typing the abstract template)? Only then do we type against the
+ * abstract template body and tag the node with the phantom `Base__g__<param>` instance name that the
+ * mono pass will later remap to the concrete stamp (#254 L4/L5). A non-generic owner, or a
+ * construction of a DIFFERENT generic type, is NOT a self-construct → the ordinary
+ * expected-instance path (unchanged) applies.
+ *
+ * @param base_name    the bare base of the constructed type (`Box`)
+ * @param owner_type   the enclosing method's owner (`env.owner_type`, canonical or "")
+ * @param decl_tparams the constructed base's type-params (generic iff non-empty)
+ * @return             true iff this is a self-construct of the enclosing generic template
+ * @since onda-3 (#254 L4/L5)
+ */
+pub fn is_self_generic_construct(base_name: str, owner_type: str, decl_tparams: []str) -> bool {
+    if decl_tparams.len == 0 { return false }
+    if owner_type == "" { return false }
+    name_last_segment(owner_type) == base_name
+}
+
+/**
+ * The PHANTOM generic-instance name for a self-construct inside a generic template: the enclosing
+ * type's OWN type-params, in order, mangled exactly as `resolve_generic_inst` mangles `-> Box<T>`
+ * (`Box__g__T`). The template body's self-init, its `-> Box<T>` return, and any `Box<T>` local all
+ * carry this SAME spelling, so the mono pass's single `phantom → concrete` remap retargets them
+ * together (#254 L4/L5). Reuses `generic_inst_name` over the owner's params-as-Named so the spelling
+ * cannot drift from the resolver's.
+ *
+ * @param base_name     the bare base (`Box`)
+ * @param owner_tparams the enclosing type's type-param names (`["T"]`)
+ * @return              the phantom instance name (`Box__g__T`)
+ * @since onda-3 (#254 L4/L5)
+ */
+pub fn phantom_self_inst_name(base_name: str, owner_tparams: []str) -> str {
+    mut args: []Type = teko::list::empty()
+    mut i = 0
+    loop {
+        if i >= owner_tparams.len { break }
+        args = teko::list::push(args, Named { name = owner_tparams[i] })
+        i++
+    }
+    generic_inst_name(base_name, args)
 }
 
 // (S4) `Box<i64>` → the nominal instance `Named{Box__g__i64}`. Resolves every type-argument, then
