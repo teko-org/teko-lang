@@ -1577,3 +1577,161 @@ fn rejects_double_lifetime_annotation() {
 fn rejects_double_inject_overlay() {
     teko::assert::is_true(module_errors("#inject(a: A)\n#inject(b: B)\nfn handle() { }"))
 }
+
+/**
+ * U1 (#332) acceptance 1/2: `unsafe type M = struct { … }` and `unsafe type C = class { }`
+ * both parse, with the resulting `TypeDecl.is_unsafe` set to true.
+ */
+#test
+fn parses_unsafe_struct_and_class_type_decl() {
+    match type_decl_of("unsafe type M = struct { p: u8 }") {
+        TypeDecl as td => teko::assert::is_true(td.is_unsafe)
+        _ => teko::assert::is_true(false)
+    }
+    match type_decl_of("unsafe type C = class { }") {
+        TypeDecl as td => teko::assert::is_true(td.is_unsafe)
+        _ => teko::assert::is_true(false)
+    }
+}
+
+/**
+ * `pub unsafe type` carries both `is_unsafe = true` and `vis = Pub` (the visibility consume
+ * runs immediately ahead of the `unsafe` consume in `parse_type_decl`). `extern unsafe type`
+ * carries `is_unsafe = true` on the opaque-handle construction; plain `extern type` (no
+ * `unsafe`) leaves it false.
+ */
+#test
+fn parses_pub_unsafe_and_extern_unsafe_type_decl() {
+    match type_decl_of("pub unsafe type M = struct { p: u8 }") {
+        TypeDecl as td => { teko::assert::is_true(td.is_unsafe); teko::assert::is_true(td.vis == Visibility::Pub) }
+        _ => teko::assert::is_true(false)
+    }
+    match type_decl_of("extern unsafe type Handle") {
+        TypeDecl as td => { teko::assert::is_true(td.is_unsafe); match td.body { ExternBody => teko::assert::is_true(true); _ => teko::assert::is_true(false) } }
+        _ => teko::assert::is_true(false)
+    }
+    match type_decl_of("extern type Plain") {
+        TypeDecl as td => teko::assert::is_false(td.is_unsafe)
+        _ => teko::assert::is_true(false)
+    }
+}
+
+/**
+ * U1 (#332) acceptance 3: `pub unsafe fn f() -> …` carries `is_unsafe = true` AND `vis = Pub`;
+ * a bare `unsafe fn g() { }` carries `is_unsafe = true` with `vis` staying Private (default).
+ */
+#test
+fn parses_unsafe_fn_with_and_without_pub() {
+    match func_of("pub unsafe fn f() -> u8 { return 1 }") {
+        Function as f => { teko::assert::is_true(f.is_unsafe); teko::assert::is_true(f.vis == Visibility::Pub) }
+        _ => teko::assert::is_true(false)
+    }
+    match func_of("unsafe fn g() { }") {
+        Function as f => { teko::assert::is_true(f.is_unsafe); teko::assert::is_true(f.vis == Visibility::Private) }
+        _ => teko::assert::is_true(false)
+    }
+}
+
+/**
+ * U1 (#332) acceptance 4 (no-regression control): a normal `type`/`fn`, with no `unsafe`
+ * modifier, still parses and carries `is_unsafe = false` (the default everywhere).
+ */
+#test
+fn plain_type_and_fn_default_to_not_unsafe() {
+    match type_decl_of("type X = struct { }") {
+        TypeDecl as td => teko::assert::is_false(td.is_unsafe)
+        _ => teko::assert::is_true(false)
+    }
+    match func_of("fn h() { }") {
+        Function as f => teko::assert::is_false(f.is_unsafe)
+        _ => teko::assert::is_true(false)
+    }
+}
+
+/**
+ * U1 (#332) acceptance 6: a method's own `Function.is_unsafe` stays false even inside an
+ * `unsafe type` — the enclosing `TypeDecl.is_unsafe` is the sole source of truth (methods are
+ * never marked individually).
+ */
+#test
+fn unsafe_method_inside_an_unsafe_type_is_not_individually_marked() {
+    match type_decl_of("unsafe type C = class { pub fn m(self) { } }") {
+        TypeDecl as td => {
+            teko::assert::is_true(td.is_unsafe)
+            match td.body {
+                ClassBody as cb => teko::assert::is_false(cb.methods[0].is_unsafe)
+                _ => teko::assert::is_true(false)
+            }
+        }
+        _ => teko::assert::is_true(false)
+    }
+}
+
+/**
+ * U1 (#332) acceptance 7: `unsafe extern fn` is REJECTED (the accepted modifier order is
+ * `[pub|exp] [extern] unsafe fn` — `extern` is consumed before `unsafe` is even attempted), but
+ * `extern unsafe fn` parses cleanly, carrying both `is_unsafe` and `is_extern`.
+ */
+#test
+fn rejects_unsafe_before_extern_but_accepts_extern_unsafe() {
+    teko::assert::is_true(func_errors("unsafe extern fn bad() = \"bad\""))
+    match func_of("extern unsafe fn good() = \"good\"") {
+        Function as f => { teko::assert::is_true(f.is_unsafe); teko::assert::is_true(f.is_extern) }
+        _ => teko::assert::is_true(false)
+    }
+}
+
+/**
+ * An own-line outer doc-comment (issue #285 placement) attaches to an `unsafe type` reached
+ * through the full `parse_decl` path — exercises `with_outer_doc`'s `TypeDecl` rebuild arm,
+ * the one that must also preserve `is_unsafe` (U1, #332).
+ */
+#test
+fn outer_doc_attaches_to_a_type_decl_through_parse_decl() {
+    match module_of("/** d */\nunsafe type M = struct { }") {
+        Module as m => match m.decls[0] {
+            TypeDecl as td => { teko::assert::is_true(td.has_doc); teko::assert::is_true(td.doc == "/** d */"); teko::assert::is_true(td.is_unsafe) }
+            _ => teko::assert::is_true(false)
+        }
+        error => teko::assert::is_true(false)
+    }
+}
+
+/**
+ * The `parse_decl` pre-dispatch lookahead must also skip a contextual `unsafe`, or an
+ * `unsafe fn`/`unsafe type` falls through to the "expected a declaration" error instead of
+ * reaching `parse_function`/`parse_type_decl` (U1, #332).
+ */
+#test
+fn parses_unsafe_decl_through_the_module_lookahead() {
+    match module_of("unsafe fn f() { }\nunsafe type T = struct { }") {
+        Module as m => {
+            teko::assert::is_true(m.decls.len == 2)
+            match m.decls[0] { Function as f => teko::assert::is_true(f.is_unsafe); _ => teko::assert::is_true(false) }
+            match m.decls[1] { TypeDecl as td => teko::assert::is_true(td.is_unsafe); _ => teko::assert::is_true(false) }
+        }
+        error => teko::assert::is_true(false)
+    }
+}
+
+/**
+ * U1 (#332) acceptance 5: `unsafe` stays a CONTEXTUAL keyword — a namespace segment literally
+ * named `unsafe` (e.g. `teko::mem::unsafe`) remains a legal `::`-path component, both in a
+ * `use` header and in a qualified type reference.
+ */
+#test
+fn unsafe_still_parses_as_a_path_segment() {
+    match module_of("use teko::mem::unsafe") {
+        Module as m => teko::assert::is_true(m.uses.len == 1)
+        error => teko::assert::is_true(false)
+    }
+    let t = match type_of("teko::mem::unsafe::RawBuf") { TypeExpr as x => x; error => return }
+    match t {
+        NamedType as n => {
+            teko::assert::is_true(n.path.segments.len == 4)
+            teko::assert::is_true(n.path.segments[2].name == "unsafe")
+            teko::assert::is_true(n.path.segments[3].name == "RawBuf")
+        }
+        _ => teko::assert::is_true(false)
+    }
+}
