@@ -1,0 +1,178 @@
+/**
+ * Tests for `teko::encoding::base64` (issue #189, T1). Covers the RFC 4648 known-answer
+ * vectors (the "Man"/"Ma"/"M" family + the empty string), all three alphabets (standard,
+ * URL-safe padded, URL-safe unpadded), non-ASCII/non-UTF-8-safe raw byte round-trips, and
+ * malformed-input error cases (M.1 fail-loud via `error`, never a panic). This file lives
+ * under `teko::encoding::base64` (namespace = directory), so the functions under test are
+ * called bare, mirroring `teko::math::checked_test.tkt`'s convention.
+ */
+
+/**
+ * Builds a `[]byte` from a fixed list of raw byte values — used where the payload is not
+ * valid UTF-8 (so a `str` literal + `bytes_of_str` cannot represent it), mirroring
+ * `teko::compress::compress_test.tkt`'s direct-byte-construction idiom.
+ *
+ * @param a  the first byte
+ * @param b  the second byte
+ * @param c  the third byte
+ * @return   a fresh 3-element `[]byte`
+ */
+fn bytes3(a: byte, b: byte, c: byte) -> []byte {
+    mut out: []byte = teko::list::empty()
+    out = teko::list::push(out, a)
+    out = teko::list::push(out, b)
+    out = teko::list::push(out, c)
+    out
+}
+
+/**
+ * Compares two `[]byte` slices for equal content (Teko has no built-in slice equality).
+ *
+ * @param a  the first slice
+ * @param b  the second slice
+ * @return   true when both slices have the same length and identical bytes at every index
+ */
+fn bytes_equal(a: []byte, b: []byte) -> bool {
+    if a.len != b.len { return false }
+    mut i: u64 = 0
+    loop {
+        if i >= a.len { break }
+        if a[i] != b[i] { return false }
+        i++
+    }
+    true
+}
+
+/**
+ * Unwraps a `[]byte | error` decode result — a failure in a "should succeed" test is itself a
+ * test failure (mirrors `teko::encoding::json::json_test.tkt`'s `decoded` helper shape).
+ *
+ * @param result  the decode outcome under test
+ * @return        the decoded bytes on success, or an empty slice (after failing the assertion) on error
+ */
+fn expect_ok(result: []byte | error) -> []byte {
+    match result {
+        []byte as b => b
+        error => { teko::assert::is_true(false); teko::list::empty() }
+    }
+}
+
+/**
+ * Asserts that `result` is an `error` (a "should fail" decode case).
+ *
+ * @param result  the decode outcome under test
+ */
+fn expect_error(result: []byte | error) {
+    match result {
+        []byte => teko::assert::is_true(false)
+        error => teko::assert::is_true(true)
+    }
+}
+
+#test
+fn encode_rfc4648_known_answers() {
+    teko::assert::is_true(encode_standard(teko::list::empty()) == "")
+    teko::assert::is_true(encode_standard(bytes_of_str("f")) == "Zg==")
+    teko::assert::is_true(encode_standard(bytes_of_str("fo")) == "Zm8=")
+    teko::assert::is_true(encode_standard(bytes_of_str("foo")) == "Zm9v")
+    teko::assert::is_true(encode_standard(bytes_of_str("foob")) == "Zm9vYg==")
+    teko::assert::is_true(encode_standard(bytes_of_str("fooba")) == "Zm9vYmE=")
+    teko::assert::is_true(encode_standard(bytes_of_str("foobar")) == "Zm9vYmFy")
+}
+
+#test
+fn encode_hello_world() {
+    teko::assert::is_true(encode_standard(bytes_of_str("Hello, World!")) == "SGVsbG8sIFdvcmxkIQ==")
+}
+
+#test
+fn decode_rfc4648_known_answers() {
+    teko::assert::is_true(bytes_equal(expect_ok(decode_standard("")), teko::list::empty()))
+    teko::assert::is_true(bytes_equal(expect_ok(decode_standard("Zg==")), bytes_of_str("f")))
+    teko::assert::is_true(bytes_equal(expect_ok(decode_standard("Zm8=")), bytes_of_str("fo")))
+    teko::assert::is_true(bytes_equal(expect_ok(decode_standard("Zm9v")), bytes_of_str("foo")))
+    teko::assert::is_true(bytes_equal(expect_ok(decode_standard("Zm9vYg==")), bytes_of_str("foob")))
+    teko::assert::is_true(bytes_equal(expect_ok(decode_standard("Zm9vYmE=")), bytes_of_str("fooba")))
+    teko::assert::is_true(bytes_equal(expect_ok(decode_standard("Zm9vYmFy")), bytes_of_str("foobar")))
+}
+
+#test
+fn round_trip_standard_alphabet() {
+    let cases = ["", "f", "fo", "foo", "foob", "fooba", "foobar", "The quick brown fox jumps over the lazy dog"]
+    mut i: u64 = 0
+    loop {
+        if i >= cases.len { break }
+        let original = bytes_of_str(cases[i])
+        let encoded = encode_standard(original)
+        let decoded = expect_ok(decode_standard(encoded))
+        teko::assert::is_true(bytes_equal(original, decoded))
+        i++
+    }
+}
+
+#test
+fn standard_alphabet_uses_plus_slash() {
+    let raw = bytes3(0xFB to byte, 0xFF to byte, 0xBF to byte)
+    teko::assert::is_true(encode_standard(raw) == "+/+/")
+}
+
+#test
+fn url_safe_alphabet_uses_dash_underscore() {
+    let raw = bytes3(0xFB to byte, 0xFF to byte, 0xBF to byte)
+    teko::assert::is_true(encode_url_safe(raw) == "-_-_")
+}
+
+#test
+fn url_safe_round_trip_matches_standard_bytes() {
+    let raw = bytes3(0xFB to byte, 0xFF to byte, 0xBF to byte)
+    let decoded = expect_ok(decode_url_safe("-_-_"))
+    teko::assert::is_true(bytes_equal(raw, decoded))
+}
+
+#test
+fn url_safe_no_pad_omits_padding() {
+    teko::assert::is_true(encode_url_safe_no_pad(bytes_of_str("f")) == "Zg")
+    teko::assert::is_true(encode_url_safe_no_pad(bytes_of_str("fo")) == "Zm8")
+    teko::assert::is_true(encode_url_safe_no_pad(bytes_of_str("foo")) == "Zm9v")
+}
+
+#test
+fn url_safe_no_pad_round_trip() {
+    let cases = ["", "f", "fo", "foo", "foob", "fooba", "foobar"]
+    mut i: u64 = 0
+    loop {
+        if i >= cases.len { break }
+        let original = bytes_of_str(cases[i])
+        let encoded = encode_url_safe_no_pad(original)
+        let decoded = expect_ok(decode_url_safe_no_pad(encoded))
+        teko::assert::is_true(bytes_equal(original, decoded))
+        i++
+    }
+}
+
+#test
+fn sixteen_byte_sequence_matches_known_answer() {
+    mut raw: []byte = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= 16 { break }
+        raw = teko::list::push(raw, i to byte)
+        i++
+    }
+    teko::assert::is_true(encode_standard(raw) == "AAECAwQFBgcICQoLDA0ODw==")
+}
+
+#test
+fn decode_rejects_invalid_character() {
+    expect_error(decode_standard("Zm9v!m9v"))
+}
+
+#test
+fn decode_rejects_bad_padding_length() {
+    expect_error(decode_standard("Zm9"))
+}
+
+#test
+fn decode_rejects_unpadded_single_leftover_char() {
+    expect_error(decode_url_safe_no_pad("Zg8Q1"))
+}

@@ -1,0 +1,452 @@
+/**
+ * `teko::encoding::base64` — RFC 4648 Base64 encode/decode, T1 of issue #189 (encodings T1:
+ * TOML + CSV + URL/MIME). Pure Teko, no C twin (the `teko::regex` / `teko::encoding::json`
+ * precedent: library code with zero OS/FFI dependency ships as `.tks` + `.tkt` only, and both
+ * engines get it automatically — the VM tree-walks it, every self-hosted binary compiles it
+ * natively).
+ *
+ * VERBATIM COPY of `src/encoding/base64/base64.tks`, kept in sync by hand — this regression
+ * fixture is its own standalone project (cross-project `[aliases]` resolution is not
+ * implemented in the seed yet), so it self-contains the module it exercises, mirroring
+ * `examples/regressions/json_roundtrip/src/j/json.tks`'s established convention.
+ *
+ * THREE ALPHABETS, ONE ENGINE. RFC 4648 §4 "standard" (`+`/`/`, padded with `=`), §5
+ * "URL and filename safe" (`-`/`_` in place of `+`/`/`, padded), and the padding-free variant
+ * used by MIME/`base64url` contexts that omit trailing `=`. All three share the same 6-bit
+ * grouping and only differ in (a) which two characters represent indices 62/63 and (b) whether
+ * `=` padding is emitted/required. `Base64Alphabet` selects the two extra characters and the
+ * padding policy so `encode`/`decode` stay ONE implementation each, parameterized by alphabet —
+ * avoiding three near-duplicate encoders (M.5 — one source of truth).
+ *
+ * ERROR MODEL (M.1 fail-loud / M.3 honest types). `decode` is `str -> []byte | error`: invalid
+ * alphabet characters, a malformed padding tail, or a truncated (non-multiple-of-4, unpadded-
+ * short) final group are checked failures, never a panic. `encode` is total (any `[]byte` has a
+ * valid Base64 rendering) so it returns `str` bare, matching `teko::encoding::json::encode`'s
+ * totality precedent.
+ */
+type Base64Alphabet = struct {
+    /**
+     * The character standing for 6-bit value 62 (`+` standard, `-` URL-safe).
+     */
+    char62: byte
+    /**
+     * The character standing for 6-bit value 63 (`/` standard, `_` URL-safe).
+     */
+    char63: byte
+    /**
+     * Whether `encode` emits trailing `=` padding and `decode` requires/consumes it.
+     */
+    padded: bool
+}
+
+/**
+ * The RFC 4648 §4 standard alphabet (`+`/`/`), WITH `=` padding — the default MIME/general-
+ * purpose form (`Content-Transfer-Encoding: base64`, data URIs, PEM-adjacent text).
+ *
+ * @return      the standard, padded `Base64Alphabet`
+ */
+pub fn standard_alphabet() -> Base64Alphabet {
+    Base64Alphabet { char62 = b'+'; char63 = b'/'; padded = true }
+}
+
+/**
+ * The RFC 4648 §5 URL-and-filename-safe alphabet (`-`/`_`), WITH `=` padding — safe to embed
+ * directly in a URL path/query segment without percent-encoding `+`/`/`.
+ *
+ * @return      the URL-safe, padded `Base64Alphabet`
+ */
+pub fn url_safe_alphabet() -> Base64Alphabet {
+    Base64Alphabet { char62 = b'-'; char63 = b'_'; padded = true }
+}
+
+/**
+ * The URL-safe alphabet WITHOUT `=` padding — the compact `base64url` form used by JWT
+ * segments and other contexts where trailing padding is conventionally omitted.
+ *
+ * @return      the URL-safe, unpadded `Base64Alphabet`
+ */
+pub fn url_safe_no_pad_alphabet() -> Base64Alphabet {
+    Base64Alphabet { char62 = b'-'; char63 = b'_'; padded = false }
+}
+
+/**
+ * Maps a 6-bit value (0..63) to its Base64 character under `alphabet`.
+ *
+ * @param alphabet  the alphabet selecting the 62/63 characters
+ * @param sextet    a value in 0..63 (the caller guarantees this range)
+ * @return          the corresponding Base64 alphabet character
+ */
+fn base64_char_of(alphabet: Base64Alphabet, sextet: u32) -> byte {
+    if sextet < 26 { return (b'A' to u32 + sextet) to byte }
+    if sextet < 52 { return (b'a' to u32 + (sextet - 26)) to byte }
+    if sextet < 62 { return (b'0' to u32 + (sextet - 52)) to byte }
+    if sextet == 62 { return alphabet.char62 }
+    alphabet.char63
+}
+
+/**
+ * Encodes one complete 3-byte group into its 4-character Base64 quantum, appending it to `out`.
+ *
+ * @param out       the growing output byte accumulator
+ * @param alphabet  the alphabet selecting the 62/63 characters
+ * @param b0        the group's first input byte
+ * @param b1        the group's second input byte
+ * @param b2        the group's third input byte
+ * @return          `out` with the 4 encoded characters appended
+ */
+fn encode_full_group(out: []byte, alphabet: Base64Alphabet, b0: byte, b1: byte, b2: byte) -> []byte {
+    let n0 = b0 to u32
+    let n1 = b1 to u32
+    let n2 = b2 to u32
+    mut o = out
+    o = teko::list::push(o, base64_char_of(alphabet, n0 >> 2))
+    o = teko::list::push(o, base64_char_of(alphabet, ((n0 & 0x3) << 4) | (n1 >> 4)))
+    o = teko::list::push(o, base64_char_of(alphabet, ((n1 & 0xF) << 2) | (n2 >> 6)))
+    o = teko::list::push(o, base64_char_of(alphabet, n2 & 0x3F))
+    o
+}
+
+/**
+ * Encodes a trailing 1- or 2-byte remainder group (fewer than 3 input bytes left), appending
+ * its Base64 characters — plus `=` padding when `alphabet.padded` — to `out`.
+ *
+ * @param out       the growing output byte accumulator
+ * @param alphabet  the alphabet selecting the 62/63 characters and padding policy
+ * @param b0        the remainder's first byte
+ * @param has_b1    whether a second remainder byte follows
+ * @param b1        the remainder's second byte (ignored when `has_b1` is false)
+ * @return          `out` with the remainder's encoded characters (and any padding) appended
+ */
+fn encode_tail_group(out: []byte, alphabet: Base64Alphabet, b0: byte, has_b1: bool, b1: byte) -> []byte {
+    let n0 = b0 to u32
+    mut o = out
+    o = teko::list::push(o, base64_char_of(alphabet, n0 >> 2))
+    if has_b1 {
+        let n1 = b1 to u32
+        o = teko::list::push(o, base64_char_of(alphabet, ((n0 & 0x3) << 4) | (n1 >> 4)))
+        o = teko::list::push(o, base64_char_of(alphabet, (n1 & 0xF) << 2))
+        if alphabet.padded { o = teko::list::push(o, b'=') }
+        return o
+    }
+    o = teko::list::push(o, base64_char_of(alphabet, (n0 & 0x3) << 4))
+    if alphabet.padded {
+        o = teko::list::push(o, b'=')
+        o = teko::list::push(o, b'=')
+    }
+    o
+}
+
+/**
+ * Encodes `data` as Base64 text under `alphabet`. Total (M.3 — a byte slice always has a valid
+ * Base64 rendering): never fails, so the return type is `str` bare.
+ *
+ * @param data      the raw bytes to encode
+ * @param alphabet  the alphabet (standard, URL-safe, or URL-safe unpadded) to render under
+ * @return          the Base64-encoded text
+ */
+pub fn encode(data: []byte, alphabet: Base64Alphabet) -> str {
+    mut out: []byte = teko::list::empty()
+    mut i: u64 = 0
+    let full_groups = data.len / 3
+    loop {
+        if i >= full_groups { break }
+        let base = i * 3
+        out = encode_full_group(out, alphabet, data[base], data[base + 1], data[base + 2])
+        i++
+    }
+    let remainder = data.len - (full_groups * 3)
+    if remainder == 1 {
+        out = encode_tail_group(out, alphabet, data[full_groups * 3], false, 0 to byte)
+    } else if remainder == 2 {
+        out = encode_tail_group(out, alphabet, data[full_groups * 3], true, data[(full_groups * 3) + 1])
+    }
+    str(out)
+}
+
+/**
+ * `encode` under the RFC 4648 §4 standard, padded alphabet — the common default.
+ *
+ * @param data  the raw bytes to encode
+ * @return      the standard-alphabet Base64 text
+ */
+pub fn encode_standard(data: []byte) -> str {
+    encode(data, standard_alphabet())
+}
+
+/**
+ * `encode` under the RFC 4648 §5 URL-safe, padded alphabet.
+ *
+ * @param data  the raw bytes to encode
+ * @return      the URL-safe Base64 text
+ */
+pub fn encode_url_safe(data: []byte) -> str {
+    encode(data, url_safe_alphabet())
+}
+
+/**
+ * `encode` under the URL-safe, UNPADDED alphabet (the `base64url`/JWT-segment convention).
+ *
+ * @param data  the raw bytes to encode
+ * @return      the URL-safe, unpadded Base64 text
+ */
+pub fn encode_url_safe_no_pad(data: []byte) -> str {
+    encode(data, url_safe_no_pad_alphabet())
+}
+
+/**
+ * Decodes one Base64 alphabet character to its 6-bit value under `alphabet`, or reports it as
+ * not a member of the alphabet.
+ *
+ * @param alphabet  the alphabet selecting the 62/63 characters
+ * @param c         the character to classify
+ * @return          the 6-bit value (0..63), or `error` when `c` is outside the alphabet
+ */
+fn base64_value_of(alphabet: Base64Alphabet, c: byte) -> u32 | error {
+    if c >= b'A' && c <= b'Z' { return (c to u32) - (b'A' to u32) }
+    if c >= b'a' && c <= b'z' { return (c to u32) - (b'a' to u32) + 26 }
+    if c >= b'0' && c <= b'9' { return (c to u32) - (b'0' to u32) + 52 }
+    if c == alphabet.char62 { return 62 to u32 }
+    if c == alphabet.char63 { return 63 to u32 }
+    error { message = "base64: invalid character in input" }
+}
+
+/**
+ * The parsed shape of one decode pass's input: the alphabet characters with any trailing `=`
+ * padding (and, for the unpadded variant, any trailing whitespace) already stripped, plus how
+ * many padding characters were present (0, 1, or 2 — used to size the final output group).
+ */
+type Base64Trimmed = struct {
+    /**
+     * The input with trailing `=` padding characters removed.
+     */
+    body: []byte
+    /**
+     * The count of trailing `=` characters that were removed (0, 1, or 2).
+     */
+    pad_count: u64
+}
+
+/**
+ * Strips trailing `=` padding from `input` under `alphabet`'s padding policy, validating that a
+ * padded alphabet's padding (when present) is well-formed (1 or 2 trailing `=`, never more, and
+ * never on a body whose length isn't a multiple of 4 once padding is included).
+ *
+ * @param input     the raw Base64 text bytes
+ * @param alphabet  the alphabet in effect (its `padded` flag governs padding expectations)
+ * @return          the trimmed body plus pad count, or `error` for malformed padding
+ */
+fn trim_base64_padding(input: []byte, alphabet: Base64Alphabet) -> Base64Trimmed | error {
+    if !alphabet.padded {
+        return Base64Trimmed { body = input; pad_count = 0 }
+    }
+    if input.len == 0 {
+        return Base64Trimmed { body = input; pad_count = 0 }
+    }
+    if input.len % 4 != 0 {
+        return error { message = "base64: padded input length must be a multiple of 4" }
+    }
+    mut pad: u64 = 0
+    if input[input.len - 1] == b'=' { pad = 1 }
+    if pad == 1 && input.len >= 2 && input[input.len - 2] == b'=' { pad = 2 }
+    Base64Trimmed { body = bytes_slice_view(input, 0, input.len - pad); pad_count = pad }
+}
+
+/**
+ * A copying sub-slice view of `data[from, to)` as a fresh `[]byte` (Teko slices have no native
+ * sub-slice operator over `[]byte`, so this copies the range — mirrors
+ * `teko::encoding::json`'s `str_slice_bytes` helper, generalized to return bytes instead of a
+ * `str`).
+ *
+ * @param data  the source byte slice
+ * @param from  the inclusive start offset
+ * @param to    the exclusive end offset
+ * @return      a fresh `[]byte` holding `data[from, to)`
+ */
+fn bytes_slice_view(data: []byte, from: u64, to: u64) -> []byte {
+    mut out: []byte = teko::list::empty()
+    mut i = from
+    loop {
+        if i >= to { break }
+        out = teko::list::push(out, data[i])
+        i++
+    }
+    out
+}
+
+/**
+ * Decodes one full 4-character Base64 quantum (no padding involved) into its 3 output bytes,
+ * appending them to `out`.
+ *
+ * @param out       the growing decoded-byte accumulator
+ * @param alphabet  the alphabet in effect
+ * @param c0        the quantum's first character
+ * @param c1        the quantum's second character
+ * @param c2        the quantum's third character
+ * @param c3        the quantum's fourth character
+ * @return          `out` with the 3 decoded bytes appended, or `error` on an invalid character
+ */
+fn decode_full_quantum(out: []byte, alphabet: Base64Alphabet, c0: byte, c1: byte, c2: byte, c3: byte) -> []byte | error {
+    let v0 = match base64_value_of(alphabet, c0) { u32 as v => v; error as e => return e }
+    let v1 = match base64_value_of(alphabet, c1) { u32 as v => v; error as e => return e }
+    let v2 = match base64_value_of(alphabet, c2) { u32 as v => v; error as e => return e }
+    let v3 = match base64_value_of(alphabet, c3) { u32 as v => v; error as e => return e }
+    mut o = out
+    o = teko::list::push(o, ((v0 << 2) | (v1 >> 4)) to byte)
+    o = teko::list::push(o, (((v1 << 4) | (v2 >> 2)) & 0xFF) to byte)
+    o = teko::list::push(o, (((v2 << 6) | v3) & 0xFF) to byte)
+    o
+}
+
+/**
+ * Decodes a final quantum shortened by padding (2 or 3 significant characters) into its 1 or 2
+ * output bytes, appending them to `out`.
+ *
+ * @param out         the growing decoded-byte accumulator
+ * @param alphabet    the alphabet in effect
+ * @param c0          the quantum's first character
+ * @param c1          the quantum's second character
+ * @param has_c2      whether a third significant character follows (one `=` of padding)
+ * @param c2          the quantum's third character (ignored when `has_c2` is false)
+ * @return            `out` with the decoded tail byte(s) appended, or `error` on an invalid character
+ */
+fn decode_tail_quantum(out: []byte, alphabet: Base64Alphabet, c0: byte, c1: byte, has_c2: bool, c2: byte) -> []byte | error {
+    let v0 = match base64_value_of(alphabet, c0) { u32 as v => v; error as e => return e }
+    let v1 = match base64_value_of(alphabet, c1) { u32 as v => v; error as e => return e }
+    mut o = out
+    o = teko::list::push(o, ((v0 << 2) | (v1 >> 4)) to byte)
+    if has_c2 {
+        let v2 = match base64_value_of(alphabet, c2) { u32 as v => v; error as e => return e }
+        o = teko::list::push(o, (((v1 << 4) | (v2 >> 2)) & 0xFF) to byte)
+    }
+    o
+}
+
+/**
+ * Decodes the trailing (possibly padding-shortened) quantum of a padded-alphabet input,
+ * dispatching to a full or partial quantum decode by `trimmed.pad_count`.
+ *
+ * @param out       the growing decoded-byte accumulator
+ * @param alphabet  the alphabet in effect
+ * @param trimmed   the padding-stripped body plus its pad count
+ * @param start     the offset of the trailing quantum's first character within `trimmed.body`
+ * @return          `out` with the trailing quantum's decoded byte(s) appended, or `error`
+ */
+fn decode_trailing_quantum(out: []byte, alphabet: Base64Alphabet, trimmed: Base64Trimmed, start: u64) -> []byte | error {
+    let body = trimmed.body
+    if trimmed.pad_count == 0 {
+        return decode_full_quantum(out, alphabet, body[start], body[start + 1], body[start + 2], body[start + 3])
+    }
+    if trimmed.pad_count == 1 {
+        return decode_tail_quantum(out, alphabet, body[start], body[start + 1], true, body[start + 2])
+    }
+    decode_tail_quantum(out, alphabet, body[start], body[start + 1], false, 0 to byte)
+}
+
+/**
+ * Validates that an UNPADDED alphabet's trimmed body never has a length whose remainder mod 4
+ * is 1 (0, 2, and 3 are the only legal short-group tails for Base64 — a single leftover
+ * character cannot encode any byte, padded or not).
+ *
+ * @param body_len  the trimmed body's length
+ * @return          `error` when `body_len % 4 == 1`, otherwise `null` (no error)
+ */
+fn validate_unpadded_length(body_len: u64) -> error? {
+    if body_len % 4 == 1 { return error { message = "base64: invalid unpadded input length" } }
+    null
+}
+
+/**
+ * Decodes the unpadded trailing group of an unpadded-alphabet input (0, 2, or 3 leftover
+ * characters after the full 4-character quantums), appending its decoded byte(s) to `out`.
+ *
+ * @param out           the growing decoded-byte accumulator
+ * @param alphabet      the alphabet in effect
+ * @param body          the (already length-validated) input body
+ * @param full_quantums the count of complete 4-character quantums before this tail
+ * @return              `out` with the tail's decoded byte(s) appended, or `error`
+ */
+fn decode_unpadded_tail(out: []byte, alphabet: Base64Alphabet, body: []byte, full_quantums: u64) -> []byte | error {
+    let start = full_quantums * 4
+    let remainder = body.len - start
+    if remainder == 0 { return out }
+    if remainder == 2 { return decode_tail_quantum(out, alphabet, body[start], body[start + 1], false, 0 to byte) }
+    decode_tail_quantum(out, alphabet, body[start], body[start + 1], true, body[start + 2])
+}
+
+/**
+ * Decodes every complete 4-character Base64 quantum in `body` (all but the final, possibly
+ * partial group), appending their decoded bytes to `out`.
+ *
+ * @param out           the growing decoded-byte accumulator
+ * @param alphabet      the alphabet in effect
+ * @param body          the input body being decoded
+ * @param full_quantums the count of complete 4-character quantums to decode
+ * @return              `out` with every complete quantum's bytes appended, or `error`
+ */
+fn decode_full_quantums(out: []byte, alphabet: Base64Alphabet, body: []byte, full_quantums: u64) -> []byte | error {
+    mut o = out
+    mut i: u64 = 0
+    loop {
+        if i >= full_quantums { break }
+        let base = i * 4
+        let next = match decode_full_quantum(o, alphabet, body[base], body[base + 1], body[base + 2], body[base + 3]) { []byte as b => b; error as e => return e }
+        o = next
+        i++
+    }
+    o
+}
+
+/**
+ * Decodes Base64 `text` under `alphabet` back to raw bytes. Malformed input (an out-of-
+ * alphabet character, bad padding, or an illegal trailing group length) is a checked `error`
+ * (M.1 fail-loud), never a panic.
+ *
+ * @param text      the Base64-encoded text
+ * @param alphabet  the alphabet the text was encoded under
+ * @return          the decoded bytes, or `error` for malformed input
+ */
+pub fn decode(text: str, alphabet: Base64Alphabet) -> []byte | error {
+    let input = bytes_of_str(text)
+    let trimmed = match trim_base64_padding(input, alphabet) { Base64Trimmed as t => t; error as e => return e }
+    if !alphabet.padded {
+        match validate_unpadded_length(trimmed.body.len) { null => { }; error as e => return e }
+    }
+    let body = trimmed.body
+    let has_trailing = alphabet.padded && trimmed.pad_count > 0
+    let full_quantums = body.len / 4
+    mut out = match decode_full_quantums(teko::list::empty(), alphabet, body, full_quantums) { []byte as b => b; error as e => return e }
+    if has_trailing {
+        return decode_trailing_quantum(out, alphabet, trimmed, full_quantums * 4)
+    }
+    decode_unpadded_tail(out, alphabet, body, full_quantums)
+}
+
+/**
+ * `decode` under the RFC 4648 §4 standard, padded alphabet.
+ *
+ * @param text  the standard-alphabet Base64 text
+ * @return      the decoded bytes, or `error` for malformed input
+ */
+pub fn decode_standard(text: str) -> []byte | error {
+    decode(text, standard_alphabet())
+}
+
+/**
+ * `decode` under the RFC 4648 §5 URL-safe, padded alphabet.
+ *
+ * @param text  the URL-safe Base64 text
+ * @return      the decoded bytes, or `error` for malformed input
+ */
+pub fn decode_url_safe(text: str) -> []byte | error {
+    decode(text, url_safe_alphabet())
+}
+
+/**
+ * `decode` under the URL-safe, UNPADDED alphabet.
+ *
+ * @param text  the URL-safe, unpadded Base64 text
+ * @return      the decoded bytes, or `error` for malformed input
+ */
+pub fn decode_url_safe_no_pad(text: str) -> []byte | error {
+    decode(text, url_safe_no_pad_alphabet())
+}
