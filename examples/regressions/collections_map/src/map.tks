@@ -1,0 +1,150 @@
+/**
+ * A growable, reference-semantic hash map from `str` keys to a generic `V` value — a self-contained
+ * copy of the teko::collections::Map<V> contract (issue #163) so the regression is a standalone
+ * project the VM==native harness can diff without pulling the compiler corpus. Keyed on `str` (a real
+ * hash via teko::runtime::str_hash + a real `==`); the generic-`K` key the collections ruling
+ * envisions is blocked on structural-trait dispatch through a type parameter (documented in the
+ * corpus module). Backed by three parallel arrays (keys/hashes/vals) re-grown on each mutation, with
+ * the shared scan a free function — both shapes sidestep fresh-generic-stack codegen gaps (nested
+ * generic construction; a generic instance method calling a sibling on self). Instantiated at TWO
+ * value types (i64 + str) by main.tks.
+ */
+type Map<V> = class {
+    /** The keys, in insertion order — parallel to `hashes` and `vals`. */
+    intern keys: []str
+    /** Each key's cached FNV-1a hash, compared before the full key for cheap collision rejection. */
+    intern hashes: []u64
+    /** The values, parallel to `keys` (the value for `keys[i]` is `vals[i]`). */
+    intern vals: []V
+
+    /**
+     * Build an empty `Map<V>`.
+     *
+     * @return a fresh, empty `Map<V>` at the caller's concrete value type `V`
+     */
+    pub fn make() -> Map<V> {
+        Map { keys = teko::list::empty(); hashes = teko::list::empty(); vals = teko::list::empty() }
+    }
+
+    /**
+     * The number of distinct keys currently held.
+     *
+     * @return the entry count
+     */
+    pub fn len(self) -> u64 { self.keys.len }
+
+    /**
+     * Whether `k` is a key in the map.
+     *
+     * @param k  the key to test
+     * @return   `true` iff `k` is present
+     */
+    pub fn contains(self, k: str) -> bool {
+        find_index(self.keys, self.hashes, teko::runtime::str_hash(k), k) < self.keys.len
+    }
+
+    /**
+     * Insert or update the value for `k`, in place (an existing key is overwritten without growing
+     * the entry count).
+     *
+     * @param k  the key to insert or update
+     * @param v  the value to associate with `k`
+     */
+    pub fn insert(self, k: str, v: V) {
+        let h = teko::runtime::str_hash(k)
+        let at = find_index(self.keys, self.hashes, h, k)
+        if at < self.keys.len {
+            self.vals = replace_at(self.vals, at, v)
+            return
+        }
+        self.keys = teko::list::push(self.keys, k)
+        self.hashes = teko::list::push(self.hashes, h)
+        self.vals = teko::list::push(self.vals, v)
+    }
+
+    /**
+     * The value associated with `k`, or `null` when `k` is absent.
+     *
+     * @param k  the key to look up
+     * @return   the associated value, or `null` if `k` is not present
+     */
+    pub fn get(self, k: str) -> V? {
+        let at = find_index(self.keys, self.hashes, teko::runtime::str_hash(k), k)
+        if at >= self.keys.len { return null }
+        self.vals[at]
+    }
+
+    /**
+     * Remove the entry for `k` if present, in place.
+     *
+     * @param k  the key to remove
+     * @return   `true` iff an entry for `k` existed and was removed
+     */
+    pub fn remove(self, k: str) -> bool {
+        let at = find_index(self.keys, self.hashes, teko::runtime::str_hash(k), k)
+        if at >= self.keys.len { return false }
+        self.keys = drop_at(self.keys, at)
+        self.hashes = drop_at(self.hashes, at)
+        self.vals = drop_at(self.vals, at)
+        true
+    }
+}
+
+/**
+ * Find the index of key `k` (hash `h`) in the parallel key/hash arrays, or `keys.len` when absent —
+ * the cheap u64 hash is compared before the full `str` key, so collisions stay correct.
+ *
+ * @param keys    the key array
+ * @param hashes  the parallel cached-hash array
+ * @param h       the precomputed hash of the sought key
+ * @param k       the sought key
+ * @return        the index of `k`, or `keys.len` if absent
+ */
+fn find_index(keys: []str, hashes: []u64, h: u64, k: str) -> u64 {
+    mut i: u64 = 0
+    loop {
+        if i >= keys.len { break }
+        if hashes[i] == h && keys[i] == k { return i }
+        i++
+    }
+    keys.len
+}
+
+/**
+ * Return a copy of `xs` with the element at index `at` replaced by `v` — the value-functional
+ * overwrite `Map::insert` folds over on an existing key.
+ *
+ * @param xs  the source array
+ * @param at  the index to overwrite
+ * @param v   the replacement element
+ * @return    a fresh array equal to `xs` except at `at`
+ */
+fn replace_at<T>(xs: []T, at: u64, v: T) -> []T {
+    mut out: []T = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= xs.len { break }
+        if i == at { out = teko::list::push(out, v) } else { out = teko::list::push(out, xs[i]) }
+        i++
+    }
+    out
+}
+
+/**
+ * Return a copy of `xs` with the element at index `at` removed (the following elements shift down) —
+ * the backing shape of `Map::remove`.
+ *
+ * @param xs  the source array
+ * @param at  the index to drop
+ * @return    a fresh array equal to `xs` with the `at`-th element removed
+ */
+fn drop_at<T>(xs: []T, at: u64) -> []T {
+    mut out: []T = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= xs.len { break }
+        if i != at { out = teko::list::push(out, xs[i]) }
+        i++
+    }
+    out
+}
