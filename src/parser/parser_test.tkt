@@ -1132,18 +1132,24 @@ fn use_errors(source: str) -> bool {
 
 #test
 fn parses_use_decls() {
-    // use a::b::c  — a 3-segment path, no alias.
+    // use a::b::c  — a 3-segment path, no alias, no grouped names (acceptance 3).
     match use_of("use a::b::c") {
         UseDecl as u => {
             teko::assert::is_false(u.has_alias)
             teko::assert::is_true(u.path.segments.len == 3)
             teko::assert::is_true(u.path.segments[2].name == "c")
+            teko::assert::is_true(u.names.len == 0)
         }
         _ => teko::assert::is_true(false)
     }
-    // use a::b as c  — with an alias.
+    // use a::b as c  — with an alias, no grouped names (acceptance 3).
     match use_of("use a::b as c") {
-        UseDecl as u => { teko::assert::is_true(u.has_alias); teko::assert::is_true(u.alias == "c"); teko::assert::is_true(u.path.segments.len == 2) }
+        UseDecl as u => {
+            teko::assert::is_true(u.has_alias)
+            teko::assert::is_true(u.alias == "c")
+            teko::assert::is_true(u.path.segments.len == 2)
+            teko::assert::is_true(u.names.len == 0)
+        }
         _ => teko::assert::is_true(false)
     }
     // a single-segment use.
@@ -1155,6 +1161,42 @@ fn rejects_malformed_use() {
     teko::assert::is_true(use_errors("use"))   // no path
     teko::assert::is_true(use_errors("use a as"))   // `as` with no alias name
     teko::assert::is_true(use_errors("use ::"))   // `::` with no leading name
+    teko::assert::is_true(use_errors("use a::"))   // trailing `::` with no name and no `[`
+}
+
+#test
+fn parses_grouped_use_import() {
+    // acceptance 1: a 3-segment path with a two-name grouped import, no alias.
+    match use_of("use teko::mem::unsafe::[ Owned, RawBuf ]") {
+        UseDecl as u => {
+            teko::assert::is_false(u.has_alias)
+            teko::assert::is_true(u.alias == "")
+            teko::assert::is_true(u.path.segments.len == 3)
+            teko::assert::is_true(u.path.segments[2].name == "unsafe")
+            teko::assert::is_true(u.names.len == 2)
+            teko::assert::is_true(u.names[0] == "Owned")
+            teko::assert::is_true(u.names[1] == "RawBuf")
+        }
+        _ => teko::assert::is_true(false)
+    }
+    // acceptance 2: a single-element grouped import.
+    match use_of("use path::[ A ]") {
+        UseDecl as u => {
+            teko::assert::is_true(u.path.segments.len == 1)
+            teko::assert::is_true(u.names.len == 1)
+            teko::assert::is_true(u.names[0] == "A")
+        }
+        _ => teko::assert::is_true(false)
+    }
+}
+
+#test
+fn rejects_malformed_grouped_use_import() {
+    teko::assert::is_true(use_errors("use path::[ ]"))   // empty list
+    teko::assert::is_true(use_errors("use path::[ A B ]"))   // missing comma
+    teko::assert::is_true(use_errors("use path::[ A, ]"))   // trailing comma
+    teko::assert::is_true(use_errors("use path::[ A, B"))   // unclosed list
+    teko::assert::is_true(use_errors("use path::[ A, B ] as x"))   // no alias on a grouped import
 }
 
 // appended to parser_test.tkt — R-main-c module tests.

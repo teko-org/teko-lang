@@ -273,7 +273,7 @@ fn tkb_roundtrip_program() {
     // C7.16: a whole TProgram (use + struct typedecl + function) round-trips via serialize_program.
     // use teko::lexer
     let upath = parser::Path { segments = teko::list::push(teko::list::push(teko::list::empty(), parser::Segment { name = "teko" }), parser::Segment { name = "lexer" }) }
-    let use1 = parser::UseDecl { path = upath; has_alias = false; alias = "" }
+    let use1 = parser::UseDecl { path = upath; has_alias = false; alias = ""; names = teko::list::empty() }
     // type Point = struct { x: i64 }
     let fld = parser::Field { name = "x"; type_ann = nt("i64"); vis = parser::Visibility::Pub; is_intern = false; has_doc = false; doc = "" }
     let td = parser::TypeDecl { name = "Point"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::StructBody { fields = teko::list::push(teko::list::empty(), fld); methods = teko::list::empty(); implements = teko::list::empty() }; vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 1; col = 1; di_kind = parser::DiKind::None; has_di_key = false; di_key = ""; is_unsafe = false; must_free = false }
@@ -316,6 +316,57 @@ fn tkb_roundtrip_program() {
     }
 }
 
+#test
+fn tkb_roundtrip_aliased_use() {
+    // acceptance 3 (S1, #335): use a::b as c round-trips — has_alias/alias survive, names empty.
+    let upath = parser::Path { segments = teko::list::push(teko::list::push(teko::list::empty(), parser::Segment { name = "a" }), parser::Segment { name = "b" }) }
+    let use1 = parser::UseDecl { path = upath; has_alias = true; alias = "c"; names = teko::list::empty() }
+    let items: []checker::TItem = teko::list::push(teko::list::empty(), use1)
+    let prog = checker::TProgram { items = items }
+    match deserialize_program(serialize_program(prog)) {
+        checker::TProgram as got => {
+            teko::assert::is_true(got.items.len == 1)
+            match got.items[0] {
+                parser::UseDecl as u => {
+                    teko::assert::is_true(u.has_alias)
+                    teko::assert::is_true(u.alias == "c")
+                    teko::assert::is_true(u.path.segments.len == 2)
+                    teko::assert::is_true(u.names.len == 0)
+                }
+                _ => teko::assert::is_true(false)
+            }
+        }
+        error => teko::assert::is_true(false)
+    }
+}
+
+#test
+fn tkb_roundtrip_grouped_use_names() {
+    // acceptance 5 (S1, #335): use a::b::[ X, Y ] round-trips — names preserved, in order.
+    let upath = parser::Path { segments = teko::list::push(teko::list::push(teko::list::empty(), parser::Segment { name = "a" }), parser::Segment { name = "b" }) }
+    let names: []str = teko::list::push(teko::list::push(teko::list::empty(), "X"), "Y")
+    let use1 = parser::UseDecl { path = upath; has_alias = false; alias = ""; names = names }
+    let items: []checker::TItem = teko::list::push(teko::list::empty(), use1)
+    let prog = checker::TProgram { items = items }
+    match deserialize_program(serialize_program(prog)) {
+        checker::TProgram as got => {
+            teko::assert::is_true(got.items.len == 1)
+            match got.items[0] {
+                parser::UseDecl as u => {
+                    teko::assert::is_false(u.has_alias)
+                    teko::assert::is_true(u.alias == "")
+                    teko::assert::is_true(u.path.segments.len == 2)
+                    teko::assert::is_true(u.names.len == 2)
+                    teko::assert::is_true(u.names[0] == "X")
+                    teko::assert::is_true(u.names[1] == "Y")
+                }
+                _ => teko::assert::is_true(false)
+            }
+        }
+        error => teko::assert::is_true(false)
+    }
+}
+
 /** (#165 C0) rewrite the version u32 (bytes 4..7, little-endian) of a serialized program frame to
     a chosen value WITHOUT touching the body — the FNV-1a hash covers only data[16:], so patching a
     header byte keeps the hash valid and lets the version guard be exercised in isolation. */
@@ -334,7 +385,7 @@ fn with_program_version(bytes: []byte, ver: byte) -> []byte {
     tests can re-stamp. */
 fn trivial_program() -> checker::TProgram {
     let upath = parser::Path { segments = teko::list::push(teko::list::empty(), parser::Segment { name = "teko" }) }
-    let use1 = parser::UseDecl { path = upath; has_alias = false; alias = "" }
+    let use1 = parser::UseDecl { path = upath; has_alias = false; alias = ""; names = teko::list::empty() }
     checker::TProgram { items = teko::list::push(teko::list::empty(), use1) }
 }
 
@@ -811,7 +862,7 @@ fn rich_generic_fn() -> checker::TFunction {
     (vtable order), and a generic fn whose typed body carries a match + defer. */
 fn rich_program() -> checker::TProgram {
     let upath = parser::Path { segments = teko::list::push(teko::list::empty(), parser::Segment { name = "teko" }) }
-    mut items: []checker::TItem = teko::list::push(teko::list::empty(), parser::UseDecl { path = upath; has_alias = false; alias = "" })
+    mut items: []checker::TItem = teko::list::push(teko::list::empty(), parser::UseDecl { path = upath; has_alias = false; alias = ""; names = teko::list::empty() })
     items = teko::list::push(items, rich_generic_struct())
     items = teko::list::push(items, rich_interface())
     items = teko::list::push(items, rich_generic_fn())
