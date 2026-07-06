@@ -55,6 +55,31 @@ fn func_type(f: parser::Function, table: TypeTable, ref_ns: str) -> Type | error
     Func { params = params; ret = ret; variadic = is_variadic; param_names = param_names; n_required = n_required; defaults = defaults }
 }
 
+/**
+ * The receiver param's CANONICAL type name for a method of `struct_name` declared in `ref_ns`. The
+ * receiver (`self`, index 0, `has_type=false`) is IMPLICITLY the enclosing type. When `struct_name`
+ * already carries a qualifier it is canonical (it arrived that way from an instance/base/interface
+ * dispatch) and is used verbatim; a BARE `struct_name` that names a REAL type declared in `ref_ns`
+ * is qualified by that OWN declaring namespace (collect passes the type's real ns), NOT by an
+ * order-dependent bare table probe — the fix that kept two same-bare classes across namespaces from
+ * sharing one receiver type (#290, #109-family). A bare name ABSENT from `ref_ns` is a type-param
+ * (`T`) and stays bare, matching the argument's `Named{T}` at monomorphization.
+ *
+ * @param struct_name  the enclosing type name (canonical from dispatch, or bare from collect)
+ * @param ref_ns       the method's declaring namespace (empty at the root)
+ * @param table        the folded type table (to classify bare `struct_name` as a real type vs a param)
+ * @return             the receiver's canonical `ns::…::Type` name (bare for the root ns or a type-param)
+ * @since onda-3 (#290)
+ */
+fn receiver_canonical_name(struct_name: str, ref_ns: str, table: TypeTable) -> str {
+    if name_qualifier(struct_name) != "" { return struct_name }
+    let qualified = qualify(ref_ns, struct_name)
+    match type_table_find(table, qualified, "") {
+        parser::TypeDecl => qualified
+        error => struct_name
+    }
+}
+
 // (OOP A1, 2026-07-01) a struct METHOD's signature as a FuncType. Mirrors func_type, except the
 // RECEIVER param (has_type=false, only ever index 0) resolves to Named{struct_name} — its type
 // is IMPLICIT (the enclosing struct), never written by the user, so it can't go through
@@ -70,7 +95,7 @@ fn method_func_type(f: parser::Function, struct_name: str, table: TypeTable, ref
     loop {
         if i >= f.params.len { break }
         let pt = if !f.params[i].has_type {
-            Named { name = qualify(type_ns_of(table, name_last_segment(struct_name)), name_last_segment(struct_name)) }   // (#109 W3) NORMALIZE from the bare last-segment (struct_name may arrive bare from collect OR already-canonical from interface/base dispatch): a real class → its declaring ns (canonical); a type-param `T` (absent from the global table) → "" → BARE, matching the arg's Named{T}
+            Named { name = receiver_canonical_name(struct_name, ref_ns, table) }
         } else {
             match resolve_type(f.params[i].type_ann, tbl, ref_ns) { Type as t => t; error as e => return e }
         }

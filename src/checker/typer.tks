@@ -668,6 +668,32 @@ fn type_param_call_error(decl: parser::TypeDecl, table: TypeTable) -> error? {
     }
 }
 
+/**
+ * Build the direct-method-dispatch callee as a TWO-segment path whose qualifier segment carries the
+ * receiver's FULL CANONICAL class name (`ns::…::Class`) and whose last segment is the method, so
+ * `lookup_call`/`call_ns` key off the exact owning namespace and never collide with a same-bare
+ * class in a sibling namespace (#290, #109-family). The receiver's `struct_name` is already
+ * canonical (from `recv_t = Named{n.name}`), so it is placed verbatim as the single qualifier
+ * segment; `ns_matches_call_qualifier` then compares `b.ns` against that whole canonical string
+ * (equals, or ends-with `::<class>`), disambiguating two same-bare classes. Keeping the qualifier in
+ * ONE segment — rather than splitting it back to `[..ns.., Class]` — means the callee never starts
+ * with `teko`, so it never trips the VM's `teko`-rooted builtin name-sniffer (which would otherwise
+ * treat a method named `len`/`str`/`parse`/… on a `teko::…` class as a string builtin). Mirrors how
+ * FIELD access already resolves off the canonical `Named` via the type table (why fields never
+ * regressed). Both backends read only the LAST segment (the method) plus `TCall.call_ns`, so the
+ * qualifier's shape is transparent to codegen and the VM.
+ *
+ * @param struct_name  the receiver's canonical class name (`ns::…::Class`, or bare at the root ns)
+ * @param method       the dispatched method's bare name
+ * @return             the `[Class-canonical, method]` callee path
+ * @since onda-3 (#290)
+ */
+fn method_dispatch_callee(struct_name: str, method: str) -> parser::Path {
+    mut segs: []parser::Segment = teko::list::push(teko::list::empty(), parser::Segment { name = struct_name })
+    segs = teko::list::push(segs, parser::Segment { name = method })
+    parser::Path { segments = segs }
+}
+
 /** `recv.method(args)` — an INSTANCE struct-method dot-call (OOP A1, 2026-07-01). Desugars into
     an ordinary `StructName::method(recv, ...args)` Call and delegates to `type_call` wholesale
     (reuses arity/defargs/generics/namespace-mangling for free — the same trick `~` used for
@@ -783,14 +809,11 @@ fn type_method_call(mc: parser::MethodCall, env: Env, table: TypeTable) -> TExpr
         }
         _ => { }
     }
-    let seg_struct = parser::Segment { name = name_last_segment(struct_name) }   // (#109 W3) BARE class segment — lookup_call matches the registered "ns::Class" method-ns via its ends-with qualifier rule; the resolved call_ns (canonical) drives codegen mangling
-    let seg_method = parser::Segment { name = mc.method }
-    mut segs: []parser::Segment = teko::list::push(teko::list::empty(), seg_struct)
-    segs = teko::list::push(segs, seg_method)
+    let segs = method_dispatch_callee(struct_name, mc.method).segments
     mut cargs: []parser::Expr = teko::list::push(teko::list::empty(), mc.receiver)
     mut ai: u64 = 0
     loop { if ai >= mc.args.len { break }; cargs = teko::list::push(cargs, mc.args[ai]); ai++ }
-    mut cnames: []str = teko::list::empty()   // an instance dot-call is always all-positional (named-call not yet threaded through MethodCall — see parse_expr.tks)
+    mut cnames: []str = teko::list::empty()
     mut ni: u64 = 0
     loop { if ni >= cargs.len { break }; cnames = teko::list::push(cnames, ""); ni++ }
     type_call(parser::Call { callee = parser::Path { segments = segs }; args = cargs; arg_names = cnames }, env, table)
