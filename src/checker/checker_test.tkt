@@ -3962,3 +3962,143 @@ fn subst_method_sig_names_skips_return_type_when_has_return_is_false() {
     teko::assert::is_false(stamped.has_return)
     teko::assert::is_false(stamped.is_unsafe)
 }
+
+/**
+ * A sealed `#must_free type FileHandle = class { pub fn make() -> FileHandle { FileHandle { } } }`
+ *  — the PARAM-focused tests never construct one (a param of this type is enough), but the
+ *  LOCAL-BINDING tests need a legal construction site (a class literal is only legal inside the
+ *  class's own methods — D1 — so a static factory is required to obtain a value at all). */
+fn must_free_class_item(name: str) -> parser::Item {
+    let ctor = parser::StructLit { type_path = path1(name); type_args = teko::list::empty(); field_names = teko::list::empty(); field_vals = teko::list::empty() }
+    let make = parser::Function { name = "make"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = teko::list::empty(); has_return = true; return_type = named_t(name); body = one_stmt(ek(ctor)); vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false; has_inject = false; injects = teko::list::empty(); is_unsafe = false }
+    let body = parser::ClassBody { kind = parser::ClassKind::Sealed; has_base = false; base_name = ""; has_base_binding = false; base_binding_name = ""; implements = teko::list::empty(); fields = teko::list::empty(); methods = list1(make) }
+    parser::Item { content = parser::TypeDecl { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = body; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; di_kind = parser::DiKind::None; has_di_key = false; di_key = ""; is_unsafe = false; must_free = true }; namespace = ""; file = "" }
+}
+
+/** A `TypeTable` with one `#must_free` class, `name`. */
+fn must_free_table(name: str) -> TypeTable {
+    match collect(parser::Program { items = teko::list::push(teko::list::empty(), must_free_class_item(name)) }) { Collected as c => c.types; error => panic("must_free_table: collect failed") }
+}
+
+/** A `fn(h: FileHandle) -> FileHandle { <body> }` — the tracked param is always named `h`; the
+ *  return type is `FileHandle` itself so `return h` (the PARAM consume set — a param is always
+ *  immutable, B.21, so it can never reach `teko::mem::free`, which requires a `mut` target; only
+ *  a MOVE-out via `return` can consume one) is well-typed. */
+fn must_free_fn(body: []parser::Statement) -> parser::Function {
+    let p = parser::Param { name = "h"; has_type = true; type_ann = named_t("FileHandle"); is_params = false; has_default = false; default_expr = e_num(0) }
+    parser::Function { name = "use_handle"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = teko::list::push(teko::list::empty(), p); has_return = true; return_type = named_t("FileHandle"); body = body; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false; has_inject = false; injects = teko::list::empty(); is_unsafe = false }
+}
+
+/** The statement `return h` — the tracked param's consume (a param is immutable, so a MOVE-out
+ *  via `return` is the only consume shape available to it in these tests). */
+fn return_h_stmt() -> parser::Statement { ret_stmt(e_var("h")) }
+
+/** The expr-statement `teko::mem::free(h)` — the LOCAL-binding consume (`h` here is a `mut`
+ *  local, never the tracked param — see must_free_local_binding_freed_and_dropped). */
+fn free_h_stmt() -> parser::Statement {
+    let callee = parser::Path { segments = teko::list::push(teko::list::push(teko::list::push(teko::list::empty(), parser::Segment { name = "teko" }), parser::Segment { name = "mem" }), parser::Segment { name = "free" }) }
+    let args = teko::list::push(teko::list::empty(), e_var("h"))
+    st(ek(parser::Call { callee = callee; args = args; arg_names = pos_names(1); type_args = teko::list::empty() }))
+}
+
+/**
+ * S2 (#336) acceptance 3 (straight line): a `#must_free` param moved out via `return h` as the
+ * function's ONLY statement type-checks cleanly.
+ */
+#test
+fn must_free_param_freed_on_straight_line_is_accepted() {
+    let table = must_free_table("FileHandle")
+    let f = must_free_fn(teko::list::push(teko::list::empty(), return_h_stmt()))
+    match type_function(f, empty_env(), table) { TFunction => teko::assert::is_true(true); error => teko::assert::is_true(false) }
+}
+
+/**
+ * S2 (#336) acceptance 2: a `#must_free` param that is never consumed on any path is a compile
+ * error at the binding's (here, the function's fallback) position.
+ */
+#test
+fn must_free_param_dropped_is_error() {
+    let table = must_free_table("FileHandle")
+    let f = must_free_fn(one_stmt(e_num(0)))
+    match type_function(f, empty_env(), table) { TFunction => teko::assert::is_true(false); error => teko::assert::is_true(true) }
+}
+
+/**
+ * S2 (#336) acceptance 3 (split control flow): an `if`/`else` where BOTH arms return `h` is
+ * accepted — the dataflow does not require a single straight-line consume.
+ */
+#test
+fn must_free_param_freed_on_both_if_arms_is_accepted() {
+    let table = must_free_table("FileHandle")
+    let cond = ek(parser::BoolLit { value = true })
+    let iff = parser::IfExpr { cond = cond; then_blk = teko::list::push(teko::list::empty(), return_h_stmt()); has_else = true; else_blk = teko::list::push(teko::list::empty(), return_h_stmt()) }
+    let f = must_free_fn(teko::list::push(teko::list::empty(), st(ek(iff))))
+    match type_function(f, empty_env(), table) { TFunction => teko::assert::is_true(true); error => teko::assert::is_true(false) }
+}
+
+/**
+ * S2 (#336): an `if`/`else` where only ONE arm returns `h` is still a drop (the other arm falls
+ * through unconsumed) — rejected.
+ */
+#test
+fn must_free_param_freed_on_only_one_if_arm_is_error() {
+    let table = must_free_table("FileHandle")
+    let cond = ek(parser::BoolLit { value = true })
+    let iff = parser::IfExpr { cond = cond; then_blk = teko::list::push(teko::list::empty(), return_h_stmt()); has_else = true; else_blk = one_stmt(e_num(0)) }
+    let f = must_free_fn(teko::list::push(teko::list::empty(), st(ek(iff))))
+    match type_function(f, empty_env(), table) { TFunction => teko::assert::is_true(false); error => teko::assert::is_true(true) }
+}
+
+/**
+ * S2 (#336) acceptance 3 (match split): a `match` where EVERY arm returns `h` is accepted.
+ */
+#test
+fn must_free_param_freed_on_every_match_arm_is_accepted() {
+    let table = must_free_table("FileHandle")
+    let arm0 = parser::Arm { pattern = parser::LiteralPattern { value = e_num(0) }; has_when = false; guard = e_num(0); body = teko::list::push(teko::list::empty(), return_h_stmt()) }
+    let armw = parser::Arm { pattern = parser::WildcardPattern { }; has_when = false; guard = e_num(0); body = teko::list::push(teko::list::empty(), return_h_stmt()) }
+    let m = parser::MatchExpr { subject = e_num(0); arms = teko::list::push(teko::list::push(teko::list::empty(), arm0), armw) }
+    let f = must_free_fn(teko::list::push(teko::list::empty(), st(ek(m))))
+    match type_function(f, empty_env(), table) { TFunction => teko::assert::is_true(true); error => teko::assert::is_true(false) }
+}
+
+/**
+ * S2 (#336) acceptance 4: a path that DIVERGES (`panic`, an unqualified builtin call) before
+ * ever needing to consume `h` needs no consume — accepted.
+ */
+#test
+fn must_free_param_diverging_path_needs_no_free() {
+    let table = must_free_table("FileHandle")
+    let panic_call = ek(parser::Call { callee = path1("panic"); args = teko::list::push(teko::list::empty(), e_str("unreachable")); arg_names = pos_names(1); type_args = teko::list::empty() })
+    let f = must_free_fn(teko::list::push(teko::list::empty(), st(panic_call)))
+    match type_function(f, empty_env(), table) { TFunction => teko::assert::is_true(true); error => teko::assert::is_true(false) }
+}
+
+/** A no-arg free function `fn make_handle() -> FileHandle { FileHandle { } }` — the peer item
+ *  the local-binding test calls `FileHandle::make()` (the class's own static factory, D1-legal)
+ *  to obtain a `#must_free`-typed VALUE without going through a tracked param (so the local-
+ *  binding path is exercised in isolation from the param path). */
+fn rebind_handle_item(extra: []parser::Statement) -> parser::Item {
+    let callee = parser::Path { segments = teko::list::push(teko::list::push(teko::list::empty(), parser::Segment { name = "FileHandle" }), parser::Segment { name = "make" }) }
+    let call = ek(parser::Call { callee = callee; args = teko::list::empty(); arg_names = teko::list::empty(); type_args = teko::list::empty() })
+    let bind_h = parser::Binding { kind = parser::BindKind::Mut; target = parser::SimpleName { name = "h" }; has_type = false; type_ann = named_t("FileHandle"); value = call }
+    let body: []parser::Statement = teko::list::push(teko::list::empty(), bind_h)
+    mut full = body
+    mut i = 0
+    loop { if i >= extra.len { break }; full = teko::list::push(full, extra[i]); i++ }
+    let f = parser::Function { name = "rebind_handle"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = teko::list::empty(); has_return = false; return_type = named_t("i64"); body = full; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false; has_inject = false; injects = teko::list::empty(); is_unsafe = false }
+    parser::Item { content = f; namespace = ""; file = "" }
+}
+
+/**
+ * S2 (#336): a `#must_free` LOCAL BINDING (not a param) mirrors the param case — freed on the
+ * straight line is accepted, dropped is an error.
+ */
+#test
+fn must_free_local_binding_freed_and_dropped() {
+    let cls = must_free_class_item("FileHandle")
+    let ok_items = teko::list::push(teko::list::push(teko::list::empty(), cls), rebind_handle_item(teko::list::push(teko::list::empty(), free_h_stmt())))
+    match type_program(parser::Program { items = ok_items }) { TProgram => teko::assert::is_true(true); error => teko::assert::is_true(false) }
+    let bad_items = teko::list::push(teko::list::push(teko::list::empty(), cls), rebind_handle_item(teko::list::empty()))
+    match type_program(parser::Program { items = bad_items }) { TProgram => teko::assert::is_true(false); error => teko::assert::is_true(true) }
+}
