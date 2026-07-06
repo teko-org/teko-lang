@@ -952,6 +952,31 @@ fn subst_add_type_remap(s: Subst, from_name: str, to_type: Type) -> Subst {
 }
 
 /**
+ * The instance's method Subst (`instance_method_subst` + base/canon → instance remaps), FURTHER extended
+ * with the PHANTOM self-construct spelling `Base__g__<owner-params>` → the concrete instance — so a
+ * `Box { … }` self-init inside `Box::dup` (typed against the abstract template to `Named{Box__g__T}`)
+ * retargets to `Box__g__i64` in the stamped body (#254 L4/L5). The phantom is built from the
+ * template's OWN type-params via the same `generic_inst_name`, so it matches the spelling
+ * `type_struct_lit` tagged the self-init with. A no-op when the template has no type-params (never a
+ * self-construct) → byte-identical to the L3 Subst for the existing corpus.
+ *
+ * @param template    the generic template decl
+ * @param template_ns the template's declaring namespace
+ * @param inst        the stamped instance decl
+ * @param table       the folded type table
+ * @return            the L3 Subst extended with the phantom → instance remap
+ * @since onda-3 (#254 L4/L5)
+ */
+fn instance_method_subst_l5(template: parser::TypeDecl, template_ns: str, inst: parser::TypeDecl, table: TypeTable) -> Subst {
+    let s = instance_method_subst(template, template_ns, inst, table)
+    if template.type_params.len == 0 { return s }
+    let base = g_instance_base(inst.name)
+    let phantom = phantom_self_inst_name(base, template.type_params)
+    if teko::runtime::str_eq(phantom, inst.name) { return s }
+    subst_add_type_remap(s, phantom, Named { name = inst.name })
+}
+
+/**
  * Stamp EVERY method of a single stamped generic-type instance, keyed by the instance name (#254
  * layer 3). Locates the generic template for the instance's base, builds the instance's method Subst
  * once, then stamps each carried method from its abstract typed template body. A method whose abstract
@@ -968,7 +993,7 @@ fn subst_add_type_remap(s: Subst, from_name: str, to_type: Type) -> Subst {
 fn stamp_instance_methods(inst: parser::TypeDecl, items: []TItem, table: TypeTable) -> WFnList | error {
     let base = g_instance_base(inst.name)
     let template = match find_generic_template(table, base) { TemplateReg as tr => tr; null => return WFnList { fns = teko::list::empty(); insts = teko::list::empty() } }
-    let s = instance_method_subst(template.decl, template.namespace, inst, table)
+    let s = instance_method_subst_l5(template.decl, template.namespace, inst, table)
     let methods = mono_decl_methods(inst)
     mut fns: []TFunction = teko::list::empty()
     mut insts: []MonoInst = teko::list::empty()

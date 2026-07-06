@@ -252,7 +252,7 @@ fn type_tilde_chain(b: parser::Binary, env: Env, table: TypeTable) -> TExpr | er
     mut pos_names: []str = teko::list::empty()   // DEFARGS (2026-07-01) — this synthetic call is always all-positional
     mut ni: u64 = 0
     loop { if ni >= folded.len { break }; pos_names = teko::list::push(pos_names, ""); ni++ }
-    let call = parser::Call { callee = parser::Path { segments = segs }; args = folded; arg_names = pos_names }
+    let call = parser::Call { callee = parser::Path { segments = segs }; args = folded; arg_names = pos_names; type_args = teko::list::empty() }
     // `concat`'s own arg-widening (type_call, below) already requires every piece to be `str` —
     // a non-str `~` operand fails there with a clear message, no separate check needed here.
     type_call(call, env, table)
@@ -816,7 +816,7 @@ fn type_method_call(mc: parser::MethodCall, env: Env, table: TypeTable) -> TExpr
     mut cnames: []str = teko::list::empty()
     mut ni: u64 = 0
     loop { if ni >= cargs.len { break }; cnames = teko::list::push(cnames, ""); ni++ }
-    type_call(parser::Call { callee = parser::Path { segments = segs }; args = cargs; arg_names = cnames }, env, table)
+    type_call(parser::Call { callee = parser::Path { segments = segs }; args = cargs; arg_names = cnames; type_args = teko::list::empty() }, env, table)
 }
 
 /**
@@ -875,7 +875,71 @@ fn type_contract_dispatch(ib: parser::InterfaceBody, struct_name: str, mc: parse
     TExpr { kind = TCall { callee = parser::Path { segments = isegs }; args = iargs; call_ns = ""; is_closure_call = false; callee_type = ift; is_iface_dispatch = true; iface_slot = slot }; type = f.ret; line = 0; col = 0 }
 }
 
-fn type_call(c: parser::Call, env: Env, table: TypeTable) -> TExpr | error {
+/**
+ * A single-segment path wrapping `name` (`Cell` → `Path{[Cell]}`) — the minimal path for resolving a
+ * construction-site base type through `resolve_type` (#254 L5).
+ *
+ * @param name  the single segment name
+ * @return      a one-segment path
+ * @since onda-3 (#254 L5)
+ */
+fn single_seg_path(name: str) -> parser::Path {
+    parser::Path { segments = teko::list::push(teko::list::empty(), parser::Segment { name = name }) }
+}
+
+/**
+ * A copy of `p` with the segment at position `idx` renamed to `name` (`Cell::make`, idx 0 → `X`,
+ * yields `X::make`) — the positional twin of `rewrite_last_segment` (#254 L5). Used to rewrite a
+ * generic static call's OWNER segment (the second-to-last) to the mangled instance name.
+ *
+ * @param p     the path to rewrite
+ * @param idx   the segment position to rename
+ * @param name  the new segment name
+ * @return      `p` with segment `idx` renamed
+ * @since onda-3 (#254 L5)
+ */
+fn rewrite_segment_at(p: parser::Path, idx: u64, name: str) -> parser::Path {
+    mut segs: []parser::Segment = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= p.segments.len { break }
+        if i == idx { segs = teko::list::push(segs, parser::Segment { name = name }) }
+        else { segs = teko::list::push(segs, p.segments[i]) }
+        i++
+    }
+    parser::Path { segments = segs }
+}
+
+/**
+ * Retarget a static-call callee that carries construction-site type-args (`Cell<i64>::make(…)`) to the
+ * mangled generic-instance owner (`Cell__g__i64::make`), so `lookup_call` resolves the stamped factory
+ * `register_instance_methods` registered (#254 L5). Resolves the type-args to concrete types, mangles
+ * the base (the callee's SECOND-TO-LAST segment) via `generic_inst_name`, and rewrites that segment.
+ * A call with no type-args (or a single-segment callee) passes through unchanged → byte-identical for
+ * every existing call.
+ *
+ * @param c      the parsed static call (carrying type_args)
+ * @param table  the folded type table (arg resolution)
+ * @param ref_ns the call's enclosing namespace
+ * @return       the callee path with the owner segment mangled to the instance, or `c.callee` verbatim
+ * @throws       when a type-arg fails to resolve
+ * @since onda-3 (#254 L5)
+ */
+fn retarget_generic_static_callee(c: parser::Call, table: TypeTable, ref_ns: str) -> parser::Path | error {
+    if c.type_args.len == 0 || c.callee.segments.len < 2 { return c.callee }
+    let owner_idx = c.callee.segments.len - 2
+    let base = c.callee.segments[owner_idx].name
+    let nt = parser::NamedType { path = single_seg_path(base); args = c.type_args }
+    let rt = match resolve_type(nt, table, ref_ns) { Type as t => t; error as e => return e }
+    let inst = match rt { Named as n => n.name; _ => return c.callee }
+    rewrite_segment_at(c.callee, owner_idx, inst)
+}
+
+fn type_call(c0: parser::Call, env: Env, table: TypeTable) -> TExpr | error {
+    let c = if c0.type_args.len == 0 { c0 } else {
+        let rc = match retarget_generic_static_callee(c0, table, env.cur_ns) { parser::Path as p => p; error as e => return e }
+        parser::Call { callee = rc; args = c0.args; arg_names = c0.arg_names; type_args = c0.type_args }
+    }
     match type_list_builtin(c, env, table) {   // teko::list::empty / push (generic)
         TExpr as te => return te
         error as e => return e
@@ -1566,19 +1630,25 @@ fn type_struct_lit(sl: parser::StructLit, expected: Type, env: Env, table: TypeT
     // (S4) constructing a GENERIC struct → retarget to the concrete instance named by `tgt` (the
     // annotation OR the W9.4 construction-site type-args), so `Box { … }` under `: Box<i64>`
     // (or `Box<i64> { … }`) builds `Box__g__i64` (its fields are T→i64).
+    mut is_self_construct = false
     if decl.type_params.len > 0 {
-        let mname = match tgt {
-            Named as en => en.name
-            _ => return error { message = $"cannot infer the type arguments of `{base_name}` here — annotate it (e.g. `let x: {base_name}<…> = …`)" }
+        if is_self_generic_construct(base_name, env.owner_type, decl.type_params) {
+            is_self_construct = true
+            name = phantom_self_inst_name(base_name, decl.type_params)
+        } else {
+            let mname = match tgt {
+                Named as en => en.name
+                _ => return error { message = $"cannot infer the type arguments of `{base_name}` here — annotate it (e.g. `let x: {base_name}<…> = …`)" }
+            }
+            if !name_has_generic_base(mname, base_name) {
+                return error { message = $"struct literal `{base_name}` does not match the annotated type" }
+            }
+            decl = match type_table_find(table, mname, "") {
+                parser::TypeDecl as td => td
+                error => return error { message = $"internal: generic instance `{mname}` was not stamped" }
+            }
+            name = mname
         }
-        if !name_has_generic_base(mname, base_name) {
-            return error { message = $"struct literal `{base_name}` does not match the annotated type" }
-        }
-        decl = match type_table_find(table, mname, "") {   // (#109 W1) generic-instance lookup on a resolved name — no referencing ns
-            parser::TypeDecl as td => td
-            error => return error { message = $"internal: generic instance `{mname}` was not stamped" }
-        }
-        name = mname
     }
     // (W10b.CLASS) `Name { … }` also constructs a class instance — a class's fields are typed
     // identically to a struct's (increment 2: the EFFECTIVE, base-inherited fields too). An
@@ -1595,7 +1665,7 @@ fn type_struct_lit(sl: parser::StructLit, expected: Type, env: Env, table: TypeT
             // ("" outside any method) — a purely inherited method keeps its ORIGINAL declaring
             // class (type_struct_methods), so a base factory constructing the base stays legal when
             // re-typed under a derived class. Structs are pure value data: their literals stay free.
-            if name_last_segment(env.owner_type) != name_last_segment(name) {   // (#109 W3) compare bare — `name` is the class's canonical "ns::Name", owner_type the enclosing-method class
+            if !is_self_construct && name_last_segment(env.owner_type) != name_last_segment(name) {
                 return error { message = $"a class literal is only legal inside the class's own methods — construct it via a static factory: {name}" }
             }
             match effective_class_fields(c, table) { []parser::Field as fs => fs; error as e => return e }
@@ -1778,7 +1848,7 @@ fn desugar_datetime_hole(raw_hole: parser::Expr, hole_ns: str, fn_name: str, pat
     args = teko::list::push(args, pat_expr)
     mut arg_names: []str = teko::list::push(teko::list::empty(), "")
     arg_names = teko::list::push(arg_names, "")
-    let call = parser::Call { callee = parser::Path { segments = segs }; args = args; arg_names = arg_names }
+    let call = parser::Call { callee = parser::Path { segments = segs }; args = args; arg_names = arg_names; type_args = teko::list::empty() }
     type_call(call, env, table)
 }
 
