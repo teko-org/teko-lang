@@ -1,18 +1,33 @@
-// src/compress/compress.tks  (namespace 'teko::compress')
-//
-// C7.12 — pure-Teko ZIP-STORE writer for `.tkl` package output.
-//
-// Produces a standard ZIP archive (PKZIP format) using method=0 (STORE — no compression).
-// All entries are stored verbatim; the archive is fully deterministic (no timestamps, no
-// filesystem metadata, no host-OS variance). Mirrors zip.c exactly.
-//
-// Public surface:
-//   type ZipEntry = struct { name: str; data: []byte }
-//   pub fn write_zip(entries: []ZipEntry) -> []byte
+/**
+ * `teko::compress` — checksums (CRC-32, Adler-32) and the ZIP (PKZIP) container.
+ *
+ * ZIP entries may be stored verbatim (method 0 — STORE, always available) or DEFLATE-
+ * compressed (method 8 — see `teko::compress::deflate`/`teko::compress::inflate`, issue
+ * #192). `write_zip` always emits STORE (fully deterministic, zero dependency on the
+ * DEFLATE compressor's chosen strategy); `write_zip_deflate` emits method 8 for every
+ * entry. `read_zip` accepts BOTH methods transparently (it inflates method-8 entries on
+ * the way out), so callers never need to know which writer produced an archive.
+ *
+ * All entries in a method-0 archive are fully deterministic (no timestamps, no
+ * filesystem metadata, no host-OS variance); method-8 archives share the same fixed
+ * mod-time/mod-date convention, so they stay byte-deterministic too (the underlying
+ * `deflate` compressor is itself deterministic — see its own doc-comment).
+ *
+ * Public surface:
+ *   type ZipEntry = struct { name: str; data: []byte }
+ *   pub fn write_zip(entries: []ZipEntry) -> []byte
+ *   pub fn write_zip_deflate(entries: []ZipEntry) -> []byte
+ *   pub fn read_zip(data: []byte) -> []ZipEntry | error
+ *   pub fn crc32_of(data: []byte) -> u32
+ *   pub fn adler32_of(data: []byte) -> u32
+ */
 
-// --- CRC-32 (polynomial 0xEDB88320, reflected / little-endian standard) ---
-
-// Build one row of the 256-entry CRC-32 table.
+/**
+ * Build one row of the CRC-32 lookup table (polynomial 0xEDB88320, reflected).
+ *
+ * @param i  the table index (0-255), used as the initial 8-bit remainder
+ * @return   the accumulated 32-bit remainder after 8 reduction steps
+ */
 fn crc32_row(i: u32) -> u32 {
     mut crc = i
     mut k = 0
@@ -28,9 +43,14 @@ fn crc32_row(i: u32) -> u32 {
     crc
 }
 
-// CRC-32 of a byte slice. `init` is the running CRC (pass 0xFFFFFFFF to start; XOR
-// the final result with 0xFFFFFFFF to get the standard CRC-32 value).
-fn crc32_of(data: []byte) -> u32 {
+/**
+ * The CRC-32 (polynomial 0xEDB88320) of a byte slice, in its standard (post-inverted)
+ * form.
+ *
+ * @param data  the bytes to checksum
+ * @return      the standard CRC-32 value (`0` for an empty slice)
+ */
+pub fn crc32_of(data: []byte) -> u32 {
     mut crc: u32 = 0xFFFFFFFF
     mut i = 0
     loop {
@@ -43,8 +63,42 @@ fn crc32_of(data: []byte) -> u32 {
     crc ^ 0xFFFFFFFF
 }
 
-// --- low-level little-endian write helpers (mirrors tkb_buf.tks) ---
+/**
+ * The largest prime below 2^16 — the Adler-32 modulus (RFC 1950 §9).
+ *
+ * @return  `65521`
+ */
+fn adler32_modulus() -> u32 { 65521 }
 
+/**
+ * The Adler-32 checksum of a byte slice (RFC 1950 §9): two 16-bit sums, `a` (the running
+ * byte sum) and `b` (the running sum of `a`), each reduced mod 65521, packed as
+ * `(b << 16) | a`. `a` starts at `1` (not `0`) per the spec.
+ *
+ * @param data  the bytes to checksum
+ * @return      the Adler-32 value (`1` for an empty slice)
+ */
+pub fn adler32_of(data: []byte) -> u32 {
+    mut a: u32 = 1
+    mut b: u32 = 0
+    let m = adler32_modulus()
+    mut i = 0
+    loop {
+        if i >= data.len { break }
+        a = (a + (data[i] to u32)) % m
+        b = (b + a) % m
+        i++
+    }
+    (b << 16) | a
+}
+
+/**
+ * Append a little-endian `u16` (the low 16 bits of `x`) to a growing byte buffer.
+ *
+ * @param buf  the buffer to extend
+ * @param x    the value whose low 16 bits are appended
+ * @return     `buf` with the two new bytes appended
+ */
 fn zip_u16(buf: []byte, x: u32) -> []byte {
     mut b = buf
     b = teko::list::push(b, (x & 0xFF) to byte)
@@ -52,6 +106,13 @@ fn zip_u16(buf: []byte, x: u32) -> []byte {
     b
 }
 
+/**
+ * Append a little-endian `u32` to a growing byte buffer.
+ *
+ * @param buf  the buffer to extend
+ * @param x    the value appended
+ * @return     `buf` with the four new bytes appended
+ */
 fn zip_u32(buf: []byte, x: u32) -> []byte {
     mut b = buf
     b = teko::list::push(b, (x & 0xFF) to byte)
@@ -61,7 +122,13 @@ fn zip_u32(buf: []byte, x: u32) -> []byte {
     b
 }
 
-// Append raw bytes (a []byte slice) into the growing output buffer.
+/**
+ * Append a whole byte slice to a growing output buffer.
+ *
+ * @param buf  the buffer to extend
+ * @param src  the bytes to append
+ * @return     `buf` with `src`'s bytes appended, in order
+ */
 fn zip_bytes(buf: []byte, src: []byte) -> []byte {
     mut b = buf
     mut i = 0
@@ -73,7 +140,13 @@ fn zip_bytes(buf: []byte, src: []byte) -> []byte {
     b
 }
 
-// Append a str's bytes into the output buffer (filename fields).
+/**
+ * Append a `str`'s raw bytes to a growing output buffer (used for filename fields).
+ *
+ * @param buf  the buffer to extend
+ * @param s    the string whose bytes are appended
+ * @return     `buf` with `s`'s bytes appended, in order
+ */
 fn zip_str(buf: []byte, s: str) -> []byte {
     mut b = buf
     mut i = 0
@@ -85,93 +158,166 @@ fn zip_str(buf: []byte, s: str) -> []byte {
     b
 }
 
-// --- ZIP format constants ---
-//
-// Local file header  signature: 0x04034B50  ("PK\x03\x04")
-// Central dir header signature: 0x02014B50  ("PK\x01\x02")
-// End of central dir signature: 0x06054B50  ("PK\x05\x06")
-//
-// version_needed  = 20  (2.0 — deflate/store baseline)
-// version_made_by = 20  (2.0; host OS = 0 = MS-DOS/generic)
-// method          = 0   (STORE — no compression)
-// flags           = 0   (no encryption, no UTF-8 flag needed for pure-ASCII names)
-// mod_time        = 0
-// mod_date        = 0x4A21  (2025-01-01: year 2025–1980=45, month 1, day 1 → (45<<9)|(1<<5)|1 = 0x5A21)
-//                            Wait: year 45 = 0b101101 = 0x2D; (0x2D << 9)|(1<<5)|1 = 0x5A21
-//                            Use 0x5A21 (2025-01-01) for determinism.
+/**
+ * The fixed DOS last-mod-date field this module stamps on every entry: 2025-01-01
+ * (year 45 since 1980, month 1, day 1), packed `(year << 9) | (month << 5) | day`.
+ * A fixed date keeps every archive this module writes byte-for-byte deterministic —
+ * no timestamps, no filesystem metadata, no host-OS variance.
+ *
+ * @return  `0x5A21`
+ */
+fn zip_fixed_dos_date() -> u32 { 0x5A21 }
 
-// DOS date for 2025-01-01: year=(2025-1980)=45=0b101101, month=1, day=1
-// Packed: (45 << 9) | (1 << 5) | 1 = 23040 | 32 | 1 = 23073 = 0x5A21
-// DOS time: 00:00:00 → 0
+/**
+ * ZIP local/central-directory compression-method code: no compression, entry bytes
+ * stored verbatim.
+ *
+ * @return  `0`
+ */
+fn zip_method_store() -> u32 { 0 }
 
-// --- per-entry bookkeeping for the central directory ---
+/**
+ * ZIP local/central-directory compression-method code: DEFLATE (RFC 1951).
+ *
+ * @return  `8`
+ */
+fn zip_method_deflate() -> u32 { 8 }
+
+/**
+ * One bookkeeping record collected while writing local file headers, consumed when
+ * assembling the matching central-directory entries in phase 2 of `write_zip_entries`.
+ */
 type ZipCDEntry = struct {
-    name: str   // filename
-    crc32: u32   // CRC-32 of the uncompressed data
-    size: u32   // uncompressed (= compressed) size in bytes
-    offset: u32   // byte offset of the local header from start of archive
+    /** The entry's filename, copied verbatim into the central-directory record. */
+    name: str
+    /** The CRC-32 of the entry's UNCOMPRESSED data. */
+    crc32: u32
+    /** The uncompressed size, in bytes. */
+    uncompressed_size: u32
+    /** The size of the entry's data as stored in the archive, in bytes (== `uncompressed_size` for STORE). */
+    compressed_size: u32
+    /** The compression method (`zip_method_store()` or `zip_method_deflate()`). */
+    method: u32
+    /** The byte offset of this entry's local file header from the start of the archive. */
+    offset: u32
 }
 
-// --- public types ---
+/**
+ * A single archive member: its filename and its raw (uncompressed) bytes.
+ *
+ * @param name  the entry's filename, stored verbatim (no path normalization)
+ * @param data  the entry's uncompressed bytes
+ */
 pub type ZipEntry = struct { name: str; data: []byte }
 
-// --- read_zip: parse a ZIP-STORE archive and return its entries as []ZipEntry ---
-//
-// Minimal PKZIP local-file-header walker. Reads only the local file headers (signature
-// 0x04034B50 = "PK\x03\x04") and their file data — enough to extract the entries in order.
-// Does NOT parse the central directory (that is the source-of-truth for a complete ZIP, but
-// STORE archives produced by write_zip are self-consistent: the local headers carry the full
-// filename, size, and CRC). Returns the list of extracted entries, or an error if the data
-// is malformed or not a ZIP archive.
-//
-// Usage: given the raw bytes of a .tkl package, extract its entries:
-//   let entries = match read_zip(data) { []ZipEntry as e => e; error as e => return e }
+/**
+ * Read the little-endian `u32` at `data[pos..pos+4)`, WITHOUT bounds-checking the read
+ * (callers must have already validated `pos + 4 <= data.len`).
+ *
+ * @param data  the byte slice to read from
+ * @param pos   the offset of the first byte
+ * @return      the decoded `u32`
+ */
+fn zip_read_u32(data: []byte, pos: u64) -> u32 {
+    (data[pos] to u32) | ((data[pos + 1] to u32) << 8) | ((data[pos + 2] to u32) << 16) | ((data[pos + 3] to u32) << 24)
+}
+
+/**
+ * Read the little-endian `u16` at `data[pos..pos+2)`, WITHOUT bounds-checking the read
+ * (callers must have already validated `pos + 2 <= data.len`).
+ *
+ * @param data  the byte slice to read from
+ * @param pos   the offset of the first byte
+ * @return      the decoded `u16`, widened to `u64`
+ */
+fn zip_read_u16(data: []byte, pos: u64) -> u64 {
+    (data[pos] to u64) | ((data[pos + 1] to u64) << 8)
+}
+
+/**
+ * Extract `len` bytes starting at `data[pos]` into a fresh slice, WITHOUT
+ * bounds-checking the read (callers must have already validated the range).
+ *
+ * @param data  the byte slice to read from
+ * @param pos   the offset of the first byte to extract
+ * @param len   the number of bytes to extract
+ * @return      a new slice holding the extracted bytes, in order
+ */
+fn zip_extract(data: []byte, pos: u64, len: u64) -> []byte {
+    mut out: []byte = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= len { break }
+        out = teko::list::push(out, data[pos + i])
+        i++
+    }
+    out
+}
+
+/**
+ * Decode one entry's data, dispatching on its ZIP compression method.
+ *
+ * @param method       the ZIP compression-method code (0 = STORE, 8 = DEFLATE)
+ * @param stored_bytes the entry's on-disk bytes (compressed, per `method`)
+ * @return             the entry's original (uncompressed) bytes, or an `error` for an
+ *                     unsupported method or malformed DEFLATE stream
+ * @throws             when `method` is neither STORE nor DEFLATE, or the DEFLATE stream
+ *                      is malformed
+ */
+fn zip_decode_entry(method: u32, stored_bytes: []byte) -> []byte | error {
+    if method == zip_method_store() { return stored_bytes }
+    if method == zip_method_deflate() {
+        return match teko::compress::inflate(stored_bytes) {
+            []byte as out => out
+            error as e => e
+        }
+    }
+    error { message = "read_zip: unsupported compression method" }
+}
+
+/**
+ * Parse a PKZIP archive (STORE and/or DEFLATE entries) and return its members as
+ * `[]ZipEntry`, decompressing any DEFLATE (method 8) entry transparently.
+ *
+ * Minimal PKZIP local-file-header walker: reads only the local file headers (signature
+ * `0x04034B50` = `"PK\x03\x04"`) and their file data — enough to extract every entry in
+ * order. Does NOT parse the central directory (that is the source-of-truth for a
+ * complete ZIP, but archives produced by this module's own writers are self-consistent:
+ * the local headers carry the full filename, size, method, and CRC).
+ *
+ * @param data  the raw bytes of a ZIP archive
+ * @return      the archive's entries, in on-disk order, or an `error` if the data is
+ *              malformed, truncated, or not a ZIP archive
+ * @throws      when a local header's declared sizes run past the end of `data`, or an
+ *              entry uses an unsupported compression method
+ * @example     given the raw bytes of a `.tkl` package:
+ *              `let entries = match read_zip(data) { []ZipEntry as e => e; error as e => return e }`
+ */
 pub fn read_zip(data: []byte) -> []ZipEntry | error {
     mut pos: u64 = 0
     mut result: []ZipEntry = teko::list::empty()
 
     loop {
-        // Need at least 30 bytes for a local file header (without filename / extra).
         if pos + 30 > data.len { break }
-
-        // Local file header signature: 0x50 0x4B 0x03 0x04 ("PK\x03\x04")
         if data[pos] != 0x50 || data[pos + 1] != 0x4B || data[pos + 2] != 0x03 || data[pos + 3] != 0x04 {
-            // Not a local file header — may be central directory or end record; stop.
             break
         }
 
-        // Skip: version needed (2), flags (2), method (2), mod time (2), mod date (2),
-        //        CRC-32 (4), compressed size (4), uncompressed size (4)  = 22 bytes, offset from sig start = 4.
-        // Compressed size is at offset 18 from the signature (local header field offset 18).
-        let comp_size = (data[pos + 18] to u32) | ((data[pos + 19] to u32) << 8) | ((data[pos + 20] to u32) << 16) | ((data[pos + 21] to u32) << 24)
+        let method = zip_read_u16(data, pos + 8) to u32
+        let comp_size = zip_read_u32(data, pos + 18)
+        let fname_len = zip_read_u16(data, pos + 26)
+        let extra_len = zip_read_u16(data, pos + 28)
 
-        // Filename length at offset 26; extra field length at offset 28 (both u16 LE).
-        let fname_len = (data[pos + 26] to u64) | ((data[pos + 27] to u64) << 8)
-        let extra_len = (data[pos + 28] to u64) | ((data[pos + 29] to u64) << 8)
-
-        // Data begins after: 30-byte fixed header + fname_len + extra_len.
         let header_end = pos + 30 + fname_len + extra_len
         if header_end + (comp_size to u64) > data.len {
             return error { message = "truncated ZIP entry data" }
         }
 
-        // Extract the filename (bytes pos+30 .. pos+30+fname_len).
-        mut name_bytes: []byte = teko::list::empty()
-        mut fi: u64 = 0
-        loop {
-            if fi >= fname_len { break }
-            name_bytes = teko::list::push(name_bytes, data[pos + 30 + fi])
-            fi++
-        }
-        let entry_name = str(name_bytes)
-
-        // Extract the file data (bytes header_end .. header_end + comp_size).
-        mut entry_data: []byte = teko::list::empty()
-        mut di: u64 = 0
-        loop {
-            if di >= (comp_size to u64) { break }
-            entry_data = teko::list::push(entry_data, data[header_end + di])
-            di++
+        let entry_name = str(zip_extract(data, pos + 30, fname_len))
+        let stored_bytes = zip_extract(data, header_end, comp_size to u64)
+        let entry_data = match zip_decode_entry(method, stored_bytes) {
+            []byte as out => out
+            error as e => return e
         }
 
         result = teko::list::push(result, ZipEntry { name = entry_name; data = entry_data })
@@ -181,95 +327,129 @@ pub fn read_zip(data: []byte) -> []ZipEntry | error {
     result
 }
 
-// --- write_zip: assemble a complete ZIP archive and return it as []byte ---
-pub fn write_zip(entries: []ZipEntry) -> []byte {
+/**
+ * Compress `data` under the given ZIP method (STORE = pass through verbatim, DEFLATE =
+ * `teko::compress::deflate`).
+ *
+ * @param method  the ZIP compression-method code (0 = STORE, 8 = DEFLATE)
+ * @param data    the entry's uncompressed bytes
+ * @return        the entry's on-disk bytes under `method`
+ */
+fn zip_encode_entry(method: u32, data: []byte) -> []byte {
+    if method == zip_method_deflate() { return teko::compress::deflate(data) }
+    data
+}
+
+/**
+ * Assemble a complete ZIP archive (local headers + file data + central directory + end
+ * record) from a list of entries, using ONE compression method for every entry.
+ *
+ * @param entries  the archive members to write, in the order they will appear on disk
+ * @param method   the ZIP compression-method code applied to every entry (0 = STORE, 8 = DEFLATE)
+ * @return         the complete archive bytes
+ */
+fn write_zip_entries(entries: []ZipEntry, method: u32) -> []byte {
     mut buf: []byte = teko::list::empty()
     mut cd: []ZipCDEntry = teko::list::empty()
 
-    // --- Phase 1: local file headers + file data ---
     mut i = 0
     loop {
         if i >= entries.len { break }
         let entry = entries[i]
         let crc = crc32_of(entry.data)
-        let sz = entry.data.len to u32
-        let off = buf.len to u32   // byte offset of THIS local header
+        let uncompressed_size = entry.data.len to u32
+        let stored_bytes = zip_encode_entry(method, entry.data)
+        let compressed_size = stored_bytes.len to u32
+        let off = buf.len to u32
 
-        // Local File Header (30 bytes + filename)
-        // signature  PK\x03\x04
         buf = teko::list::push(buf, 0x50 to byte)
         buf = teko::list::push(buf, 0x4B to byte)
         buf = teko::list::push(buf, 0x03 to byte)
         buf = teko::list::push(buf, 0x04 to byte)
-        buf = zip_u16(buf, 20)   // version needed: 2.0
-        buf = zip_u16(buf, 0)   // general purpose bit flag
-        buf = zip_u16(buf, 0)   // compression method: STORE
-        buf = zip_u16(buf, 0)   // last mod file time: 00:00:00
-        buf = zip_u16(buf, 0x5A21)   // last mod file date: 2025-01-01
-        buf = zip_u32(buf, crc)   // CRC-32
-        buf = zip_u32(buf, sz)   // compressed size   (= uncompressed, method 0)
-        buf = zip_u32(buf, sz)   // uncompressed size
-        buf = zip_u16(buf, entry.name.len to u32)   // filename length
-        buf = zip_u16(buf, 0)   // extra field length
-        buf = zip_str(buf, entry.name)   // filename
+        buf = zip_u16(buf, 20)
+        buf = zip_u16(buf, 0)
+        buf = zip_u16(buf, method)
+        buf = zip_u16(buf, 0)
+        buf = zip_u16(buf, zip_fixed_dos_date())
+        buf = zip_u32(buf, crc)
+        buf = zip_u32(buf, compressed_size)
+        buf = zip_u32(buf, uncompressed_size)
+        buf = zip_u16(buf, entry.name.len to u32)
+        buf = zip_u16(buf, 0)
+        buf = zip_str(buf, entry.name)
+        buf = zip_bytes(buf, stored_bytes)
 
-        // File data
-        buf = zip_bytes(buf, entry.data)
-
-        // Record the central-directory info for phase 2
-        cd = teko::list::push(cd, ZipCDEntry { name = entry.name; crc32 = crc; size = sz; offset = off })
+        cd = teko::list::push(cd, ZipCDEntry { name = entry.name; crc32 = crc; uncompressed_size = uncompressed_size; compressed_size = compressed_size; method = method; offset = off })
         i++
     }
 
-    // --- Phase 2: central directory ---
-    let cd_offset = buf.len to u32   // byte offset where central directory begins
+    let cd_offset = buf.len to u32
     mut j = 0
     loop {
         if j >= cd.len { break }
         let rec = cd[j]
 
-        // Central Directory File Header (46 bytes + filename)
-        // signature PK\x01\x02
         buf = teko::list::push(buf, 0x50 to byte)
         buf = teko::list::push(buf, 0x4B to byte)
         buf = teko::list::push(buf, 0x01 to byte)
         buf = teko::list::push(buf, 0x02 to byte)
-        buf = zip_u16(buf, 20)   // version made by: 2.0
-        buf = zip_u16(buf, 20)   // version needed: 2.0
-        buf = zip_u16(buf, 0)   // general purpose bit flag
-        buf = zip_u16(buf, 0)   // compression method: STORE
-        buf = zip_u16(buf, 0)   // last mod file time
-        buf = zip_u16(buf, 0x5A21)   // last mod file date: 2025-01-01
-        buf = zip_u32(buf, rec.crc32)   // CRC-32
-        buf = zip_u32(buf, rec.size)   // compressed size
-        buf = zip_u32(buf, rec.size)   // uncompressed size
-        buf = zip_u16(buf, rec.name.len to u32)   // filename length
-        buf = zip_u16(buf, 0)   // extra field length
-        buf = zip_u16(buf, 0)   // file comment length
-        buf = zip_u16(buf, 0)   // disk number start
-        buf = zip_u16(buf, 0)   // internal file attributes
-        buf = zip_u32(buf, 0)   // external file attributes
-        buf = zip_u32(buf, rec.offset)   // relative offset of local header
-        buf = zip_str(buf, rec.name)   // filename
+        buf = zip_u16(buf, 20)
+        buf = zip_u16(buf, 20)
+        buf = zip_u16(buf, 0)
+        buf = zip_u16(buf, rec.method)
+        buf = zip_u16(buf, 0)
+        buf = zip_u16(buf, zip_fixed_dos_date())
+        buf = zip_u32(buf, rec.crc32)
+        buf = zip_u32(buf, rec.compressed_size)
+        buf = zip_u32(buf, rec.uncompressed_size)
+        buf = zip_u16(buf, rec.name.len to u32)
+        buf = zip_u16(buf, 0)
+        buf = zip_u16(buf, 0)
+        buf = zip_u16(buf, 0)
+        buf = zip_u16(buf, 0)
+        buf = zip_u32(buf, 0)
+        buf = zip_u32(buf, rec.offset)
+        buf = zip_str(buf, rec.name)
 
         j++
     }
 
-    let cd_size = (buf.len to u32) - cd_offset   // size of the central directory in bytes
+    let cd_size = (buf.len to u32) - cd_offset
 
-    // --- Phase 3: end of central directory record (22 bytes) ---
-    // signature PK\x05\x06
     buf = teko::list::push(buf, 0x50 to byte)
     buf = teko::list::push(buf, 0x4B to byte)
     buf = teko::list::push(buf, 0x05 to byte)
     buf = teko::list::push(buf, 0x06 to byte)
-    buf = zip_u16(buf, 0)   // disk number
-    buf = zip_u16(buf, 0)   // disk with start of central dir
-    buf = zip_u16(buf, entries.len to u32)   // entries on this disk
-    buf = zip_u16(buf, entries.len to u32)   // total entries
-    buf = zip_u32(buf, cd_size)   // size of central directory
-    buf = zip_u32(buf, cd_offset)   // offset of central directory
-    buf = zip_u16(buf, 0)   // archive comment length
+    buf = zip_u16(buf, 0)
+    buf = zip_u16(buf, 0)
+    buf = zip_u16(buf, entries.len to u32)
+    buf = zip_u16(buf, entries.len to u32)
+    buf = zip_u32(buf, cd_size)
+    buf = zip_u32(buf, cd_offset)
+    buf = zip_u16(buf, 0)
 
     buf
+}
+
+/**
+ * Assemble a complete ZIP archive with every entry STORED verbatim (method 0 — no
+ * compression). Fully deterministic (no timestamps, no filesystem metadata, no
+ * host-OS variance).
+ *
+ * @param entries  the archive members to write, in the order they will appear on disk
+ * @return         the complete archive bytes
+ */
+pub fn write_zip(entries: []ZipEntry) -> []byte {
+    write_zip_entries(entries, zip_method_store())
+}
+
+/**
+ * Assemble a complete ZIP archive with every entry DEFLATE-compressed (method 8).
+ * `read_zip` decompresses these entries transparently, exactly like STORE ones.
+ *
+ * @param entries  the archive members to write, in the order they will appear on disk
+ * @return         the complete archive bytes
+ */
+pub fn write_zip_deflate(entries: []ZipEntry) -> []byte {
+    write_zip_entries(entries, zip_method_deflate())
 }

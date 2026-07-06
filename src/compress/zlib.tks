@@ -1,0 +1,98 @@
+/**
+ * `teko::compress::zlib` — RFC 1950 zlib framing (a 2-byte header + Adler-32 trailer)
+ * around a raw DEFLATE stream. Used by PNG, HTTP `Content-Encoding: deflate`, and many
+ * wire formats.
+ *
+ * Public surface:
+ *   pub fn zlib_compress(data: []byte) -> []byte
+ *   pub fn zlib_decompress(data: []byte) -> []byte | error
+ */
+
+/**
+ * The zlib `CMF` byte this module always emits: `CM = 8` (DEFLATE), `CINFO = 7` (a 32K
+ * window — the largest RFC 1950 allows, always valid regardless of how small the actual
+ * back-reference window used happens to be).
+ *
+ * @return  `0x78`
+ */
+fn zlib_cmf() -> u32 { 0x78 }
+
+/**
+ * Choose the `FLG` byte completing a zlib header (RFC 1950 §2.2): `FDICT = 0` (no
+ * preset dictionary — this module never uses one) and the `FCHECK` low 5 bits set so
+ * that `(CMF * 256 + FLG) mod 31 == 0`. The `FLEVEL` bits (a compression-level hint,
+ * bits 6-7) are left `0` — decoders must accept any value there.
+ *
+ * @param cmf  the header's `CMF` byte (see `zlib_cmf`)
+ * @return     the `FLG` byte pairing with `cmf` to satisfy the header checksum
+ */
+fn zlib_flg(cmf: u32) -> u32 {
+    let base = cmf * 256
+    let remainder = base % 31
+    if remainder == 0 { return 0 }
+    31 - remainder
+}
+
+/**
+ * Compress `data` into a complete zlib stream: the 2-byte header, the raw DEFLATE
+ * payload (`teko::compress::deflate`), and the big-endian Adler-32 trailer of the
+ * ORIGINAL (uncompressed) bytes.
+ *
+ * @param data  the bytes to compress
+ * @return      the framed zlib stream
+ */
+pub fn zlib_compress(data: []byte) -> []byte {
+    let cmf = zlib_cmf()
+    let flg = zlib_flg(cmf)
+    mut out: []byte = teko::list::empty()
+    out = teko::list::push(out, cmf to byte)
+    out = teko::list::push(out, flg to byte)
+
+    let payload = teko::compress::deflate(data)
+    mut i: u64 = 0
+    loop {
+        if i >= payload.len { break }
+        out = teko::list::push(out, payload[i])
+        i++
+    }
+
+    let checksum = teko::compress::adler32_of(data)
+    out = teko::list::push(out, ((checksum >> 24) & 0xFF) to byte)
+    out = teko::list::push(out, ((checksum >> 16) & 0xFF) to byte)
+    out = teko::list::push(out, ((checksum >> 8) & 0xFF) to byte)
+    out = teko::list::push(out, (checksum & 0xFF) to byte)
+    out
+}
+
+/**
+ * Decompress a complete zlib stream (2-byte header + DEFLATE payload + 4-byte
+ * big-endian Adler-32 trailer), verifying both the header checksum and the trailing
+ * Adler-32 against the decompressed bytes.
+ *
+ * @param data  the framed zlib stream
+ * @return      the original (decompressed) bytes, or an `error` if the stream is too
+ *              short, uses an unsupported compression method, fails its header check,
+ *              or its trailing Adler-32 does not match the decompressed data
+ * @throws      when `data.len < 6`, `CM != 8`, `(CMF*256+FLG) mod 31 != 0`, `FDICT` is
+ *              set (a preset dictionary — unsupported), or the trailing checksum
+ *              mismatches
+ */
+pub fn zlib_decompress(data: []byte) -> []byte | error {
+    if data.len < 6 { return error { message = "zlib: stream too short for header + trailer" } }
+
+    let cmf = data[0] to u32
+    let flg = data[1] to u32
+    if (cmf & 0x0F) != 8 { return error { message = "zlib: unsupported compression method (CM != 8)" } }
+    if ((cmf * 256) + flg) % 31 != 0 { return error { message = "zlib: header check (FCHECK) failed" } }
+    if (flg & 0x20) != 0 { return error { message = "zlib: preset dictionary (FDICT) is not supported" } }
+
+    let payload = slice_bytes(data, 2, data.len - 4)
+    let decompressed = match teko::compress::inflate(payload) { []byte as b => b; error as e => return e }
+
+    let trailer_pos = data.len - 4
+    let expected = (data[trailer_pos] to u32 << 24) | (data[trailer_pos + 1] to u32 << 16) | (data[trailer_pos + 2] to u32 << 8) | (data[trailer_pos + 3] to u32)
+    let actual = teko::compress::adler32_of(decompressed)
+    if expected != actual { return error { message = "zlib: Adler-32 checksum mismatch" } }
+
+    decompressed
+}

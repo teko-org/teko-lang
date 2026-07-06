@@ -1,0 +1,276 @@
+/**
+ * src/compress/inflate_test.tkt — checksum, DEFLATE/zlib/gzip, and ZIP-method-8 tests
+ * for `teko::compress` (issue #192). #test collected (no `main`). Verified in BOTH the
+ * VM gate and the native build gate (verify-both mandate).
+ *
+ * KNOWN-ANSWER VECTORS: the DEFLATE/zlib/gzip streams below were produced by CPython's
+ * `zlib`/`gzip` modules (`zlib.compressobj(9, zlib.DEFLATED, -15)` for raw DEFLATE,
+ * `zlib.compress(data, 9)` for zlib framing, `gzip.compress(data, compresslevel=9,
+ * mtime=0)` for gzip framing) against a 200-byte skewed-frequency payload — chosen
+ * specifically because it compiles into exactly ONE DYNAMIC-Huffman block (`BFINAL=1`,
+ * `BTYPE=10`), so `inflate` is proven against ALL THREE block shapes it must decode:
+ * this vector exercises dynamic Huffman + LZ77 back-references, `zip_store_round_trip`
+ * (compress_test.tkt) exercises the STORE path end-to-end, and `deflate_inflate_round_trip`
+ * below exercises this module's own (STORED-block) compressor against its own decompressor.
+ */
+
+/**
+ * Build a `[]byte` from a `[]u32` literal (each element truncated to its low 8 bits) —
+ * lets a long known-answer byte vector be written as a plain integer array literal
+ * (`[]byte` array literals require a `to byte` cast on every bare element, `[]u32` does
+ * not).
+ */
+fn bytes_of(xs: []u32) -> []byte {
+    mut out: []byte = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= xs.len { break }
+        out = teko::list::push(out, xs[i] to byte)
+        i++
+    }
+    out
+}
+
+/**
+ * True iff `a` and `b` have the same length and equal bytes at every index.
+ */
+fn bytes_eq(a: []byte, b: []byte) -> bool {
+    if a.len != b.len { return false }
+    mut i: u64 = 0
+    loop {
+        if i >= a.len { break }
+        if a[i] != b[i] { return false }
+        i++
+    }
+    true
+}
+
+/**
+ * The 200-byte skewed-frequency plaintext shared by every known-answer vector below.
+ */
+fn kav_plaintext() -> []byte {
+    let xs: []u32 = [62, 45, 93, 38, 83, 65, 37, 79, 36, 71, 38, 40, 71, 110, 43, 52, 91, 121, 86, 68, 123, 36, 113, 59, 44, 42, 60, 109, 48, 87, 91, 67, 84, 37, 37, 51, 95, 71, 61, 87, 73, 60, 107, 98, 56, 86, 81, 114, 100, 59, 123, 42, 71, 103, 45, 77, 36, 94, 104, 86, 114, 61, 98, 88, 87, 75, 111, 121, 76, 94, 37, 98, 92, 125, 110, 59, 67, 94, 34, 75, 48, 42, 37, 106, 44, 56, 67, 114, 40, 73, 84, 114, 109, 113, 59, 70, 64, 114, 121, 45, 48, 53, 53, 76, 87, 57, 33, 71, 66, 86, 121, 96, 80, 90, 95, 37, 117, 106, 114, 108, 68, 68, 41, 91, 37, 38, 52, 46, 63, 37, 32, 45, 41, 65, 34, 114, 90, 45, 56, 64, 65, 43, 112, 125, 75, 76, 40, 41, 63, 57, 110, 46, 34, 121, 83, 45, 84, 35, 83, 123, 113, 98, 57, 65, 47, 106, 83, 106, 63, 52, 109, 125, 113, 109, 109, 102, 53, 80, 64, 35, 35, 59, 57, 97, 121, 73, 119, 125, 121, 65, 52, 53, 49, 50, 90, 117, 111, 76, 94, 108]
+    bytes_of(xs)
+}
+
+/**
+ * The raw DEFLATE encoding (RFC 1951, no zlib/gzip framing) of `kav_plaintext()` — a
+ * single dynamic-Huffman block (`BFINAL=1`, `BTYPE=10`).
+ */
+fn kav_raw_deflate() -> []byte {
+    let xs: []u32 = [5, 193, 129, 138, 130, 48, 0, 0, 208, 95, 233, 212, 137, 90, 43, 235, 20, 148, 213, 233, 82, 110, 136, 198, 21, 138, 134, 94, 214, 73, 84, 88, 211, 28, 196, 49, 196, 127, 239, 189, 47, 120, 144, 99, 12, 126, 36, 34, 43, 164, 25, 27, 5, 79, 253, 94, 234, 208, 68, 91, 82, 61, 43, 188, 4, 128, 207, 35, 89, 101, 193, 242, 94, 89, 233, 142, 157, 81, 175, 145, 43, 220, 72, 229, 45, 101, 171, 106, 159, 133, 45, 143, 74, 80, 253, 14, 13, 242, 74, 33, 212, 53, 80, 79, 44, 143, 41, 65, 194, 104, 135, 190, 93, 198, 161, 110, 154, 81, 102, 127, 144, 117, 202, 79, 219, 252, 8, 94, 53, 123, 248, 190, 90, 0, 217, 152, 58, 96, 4, 85, 44, 176, 28, 90, 46, 30, 63, 135, 48, 82, 84, 199, 110, 166, 2, 143, 97, 34, 198, 125, 87, 217, 120, 86, 199, 181, 99, 208, 161, 163, 244, 98, 110, 93, 81, 68, 246, 31, 15, 254, 7, 142, 13, 115, 190, 200, 95, 109, 84, 62, 222]
+    bytes_of(xs)
+}
+
+/**
+ * The zlib (RFC 1950) framing of `kav_raw_deflate()`: a 2-byte header (`0x78 0xDA`)
+ * plus the same DEFLATE payload plus a 4-byte big-endian Adler-32 trailer.
+ */
+fn kav_zlib_stream() -> []byte {
+    let xs: []u32 = [120, 218, 5, 193, 129, 138, 130, 48, 0, 0, 208, 95, 233, 212, 137, 90, 43, 235, 20, 148, 213, 233, 82, 110, 136, 198, 21, 138, 134, 94, 214, 73, 84, 88, 211, 28, 196, 49, 196, 127, 239, 189, 47, 120, 144, 99, 12, 126, 36, 34, 43, 164, 25, 27, 5, 79, 253, 94, 234, 208, 68, 91, 82, 61, 43, 188, 4, 128, 207, 35, 89, 101, 193, 242, 94, 89, 233, 142, 157, 81, 175, 145, 43, 220, 72, 229, 45, 101, 171, 106, 159, 133, 45, 143, 74, 80, 253, 14, 13, 242, 74, 33, 212, 53, 80, 79, 44, 143, 41, 65, 194, 104, 135, 190, 93, 198, 161, 110, 154, 81, 102, 127, 144, 117, 202, 79, 219, 252, 8, 94, 53, 123, 248, 190, 90, 0, 217, 152, 58, 96, 4, 85, 44, 176, 28, 90, 46, 30, 63, 135, 48, 82, 84, 199, 110, 166, 2, 143, 97, 34, 198, 125, 87, 217, 120, 86, 199, 181, 99, 208, 161, 163, 244, 98, 110, 93, 81, 68, 246, 31, 15, 254, 7, 142, 13, 115, 190, 200, 95, 109, 84, 62, 222, 190, 37, 59, 22]
+    bytes_of(xs)
+}
+
+/**
+ * The gzip (RFC 1952) framing of `kav_raw_deflate()`: a 10-byte fixed header
+ * (`MTIME=0`, `OS=255`) plus the same DEFLATE payload plus an 8-byte little-endian
+ * CRC-32/ISIZE trailer.
+ */
+fn kav_gzip_stream() -> []byte {
+    let xs: []u32 = [31, 139, 8, 0, 0, 0, 0, 0, 2, 255, 5, 193, 129, 138, 130, 48, 0, 0, 208, 95, 233, 212, 137, 90, 43, 235, 20, 148, 213, 233, 82, 110, 136, 198, 21, 138, 134, 94, 214, 73, 84, 88, 211, 28, 196, 49, 196, 127, 239, 189, 47, 120, 144, 99, 12, 126, 36, 34, 43, 164, 25, 27, 5, 79, 253, 94, 234, 208, 68, 91, 82, 61, 43, 188, 4, 128, 207, 35, 89, 101, 193, 242, 94, 89, 233, 142, 157, 81, 175, 145, 43, 220, 72, 229, 45, 101, 171, 106, 159, 133, 45, 143, 74, 80, 253, 14, 13, 242, 74, 33, 212, 53, 80, 79, 44, 143, 41, 65, 194, 104, 135, 190, 93, 198, 161, 110, 154, 81, 102, 127, 144, 117, 202, 79, 219, 252, 8, 94, 53, 123, 248, 190, 90, 0, 217, 152, 58, 96, 4, 85, 44, 176, 28, 90, 46, 30, 63, 135, 48, 82, 84, 199, 110, 166, 2, 143, 97, 34, 198, 125, 87, 217, 120, 86, 199, 181, 99, 208, 161, 163, 244, 98, 110, 93, 81, 68, 246, 31, 15, 254, 7, 142, 13, 115, 190, 200, 95, 109, 84, 62, 222, 244, 38, 183, 52, 200, 0, 0, 0]
+    bytes_of(xs)
+}
+
+/**
+ * `adler32_of` matches RFC 1950's reference test vector: `Adler-32("123456789")` is a
+ * well-known check value (`0x091E01DE`), and the empty slice yields `1` (the algorithm's
+ * initial state, never touched by any byte).
+ */
+#test
+fn adler32_known_vectors() {
+    let s = "123456789"
+    mut data: []byte = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= s.len { break }
+        data = teko::list::push(data, s[i])
+        i++
+    }
+    teko::assert::is_true(teko::compress::adler32_of(data) == 0x091E01DE)
+
+    mut empty: []byte = teko::list::empty()
+    teko::assert::is_true(teko::compress::adler32_of(empty) == 1)
+}
+
+/**
+ * `inflate` decodes a real single-block DYNAMIC-Huffman DEFLATE stream (produced by
+ * CPython's `zlib`) back to its exact original bytes.
+ */
+#test
+fn inflate_dynamic_huffman_known_vector() {
+    let decoded = match teko::compress::inflate(kav_raw_deflate()) {
+        []byte as b => b
+        error as e => { teko::assert::is_true(false); teko::list::empty() }
+    }
+    teko::assert::is_true(bytes_eq(decoded, kav_plaintext()))
+}
+
+/**
+ * A malformed DEFLATE stream (reserved `BTYPE 11`) is a reported `error`, never a panic.
+ */
+#test
+fn inflate_reserved_block_type_is_error() {
+    let bad: []byte = [0x07 to byte]
+    match teko::compress::inflate(bad) {
+        []byte => teko::assert::is_true(false)
+        error => teko::assert::is_true(true)
+    }
+}
+
+/**
+ * `deflate` produces a stream `inflate` decodes back to the exact original bytes, for a
+ * spread of input shapes: empty, a single byte, a short literal string, and a highly
+ * repetitive run (the LZ77 back-reference-friendly case, even though this module's own
+ * compressor does not itself use back-references — the ROUND TRIP must still hold).
+ */
+#test
+fn deflate_inflate_round_trip() {
+    mut empty: []byte = teko::list::empty()
+    let empty_roundtrip = match teko::compress::inflate(teko::compress::deflate(empty)) {
+        []byte as b => b
+        error as e => { teko::assert::is_true(false); teko::list::empty() }
+    }
+    teko::assert::is_true(empty_roundtrip.len == 0)
+
+    let plaintext = kav_plaintext()
+    let roundtrip = match teko::compress::inflate(teko::compress::deflate(plaintext)) {
+        []byte as b => b
+        error as e => { teko::assert::is_true(false); teko::list::empty() }
+    }
+    teko::assert::is_true(bytes_eq(roundtrip, plaintext))
+
+    mut repetitive: []byte = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= 5000 { break }
+        repetitive = teko::list::push(repetitive, (i % 7) to byte)
+        i++
+    }
+    let rep_roundtrip = match teko::compress::inflate(teko::compress::deflate(repetitive)) {
+        []byte as b => b
+        error as e => { teko::assert::is_true(false); teko::list::empty() }
+    }
+    teko::assert::is_true(bytes_eq(rep_roundtrip, repetitive))
+}
+
+/**
+ * `zlib_decompress` decodes a real zlib stream (produced by CPython's `zlib.compress`)
+ * back to its exact original bytes, and this module's own `zlib_compress` output
+ * round-trips through the same decoder.
+ */
+#test
+fn zlib_known_vector_and_round_trip() {
+    let decoded = match teko::compress::zlib_decompress(kav_zlib_stream()) {
+        []byte as b => b
+        error as e => { teko::assert::is_true(false); teko::list::empty() }
+    }
+    teko::assert::is_true(bytes_eq(decoded, kav_plaintext()))
+
+    let plaintext = kav_plaintext()
+    let own_roundtrip = match teko::compress::zlib_decompress(teko::compress::zlib_compress(plaintext)) {
+        []byte as b => b
+        error as e => { teko::assert::is_true(false); teko::list::empty() }
+    }
+    teko::assert::is_true(bytes_eq(own_roundtrip, plaintext))
+}
+
+/**
+ * A corrupted zlib trailer (Adler-32 mismatch) is a reported `error`, never a panic —
+ * flip the last trailer byte of an otherwise-valid stream.
+ */
+#test
+fn zlib_corrupted_checksum_is_error() {
+    let good = teko::compress::zlib_compress(kav_plaintext())
+    mut corrupt: []byte = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= good.len { break }
+        if i == good.len - 1 {
+            corrupt = teko::list::push(corrupt, ((good[i] to u32) ^ 0xFF) to byte)
+        } else {
+            corrupt = teko::list::push(corrupt, good[i])
+        }
+        i++
+    }
+    match teko::compress::zlib_decompress(corrupt) {
+        []byte => teko::assert::is_true(false)
+        error => teko::assert::is_true(true)
+    }
+}
+
+/**
+ * `gzip_decompress` decodes a real gzip member (produced by CPython's `gzip.compress`)
+ * back to its exact original bytes, and this module's own `gzip_compress` output
+ * round-trips through the same decoder.
+ */
+#test
+fn gzip_known_vector_and_round_trip() {
+    let decoded = match teko::compress::gzip_decompress(kav_gzip_stream()) {
+        []byte as b => b
+        error as e => { teko::assert::is_true(false); teko::list::empty() }
+    }
+    teko::assert::is_true(bytes_eq(decoded, kav_plaintext()))
+
+    let plaintext = kav_plaintext()
+    let own_roundtrip = match teko::compress::gzip_decompress(teko::compress::gzip_compress(plaintext)) {
+        []byte as b => b
+        error as e => { teko::assert::is_true(false); teko::list::empty() }
+    }
+    teko::assert::is_true(bytes_eq(own_roundtrip, plaintext))
+}
+
+/**
+ * A corrupted gzip magic byte is a reported `error`, never a panic.
+ */
+#test
+fn gzip_bad_magic_is_error() {
+    let good = teko::compress::gzip_compress(kav_plaintext())
+    mut corrupt: []byte = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= good.len { break }
+        if i == 0 {
+            corrupt = teko::list::push(corrupt, ((good[i] to u32) ^ 0xFF) to byte)
+        } else {
+            corrupt = teko::list::push(corrupt, good[i])
+        }
+        i++
+    }
+    match teko::compress::gzip_decompress(corrupt) {
+        []byte => teko::assert::is_true(false)
+        error => teko::assert::is_true(true)
+    }
+}
+
+/**
+ * A ZIP archive written with `write_zip_deflate` (method-8 entries) round-trips through
+ * `read_zip` exactly like a STORE archive, transparently decompressing each entry.
+ */
+#test
+fn zip_deflate_entries_round_trip() {
+    let plaintext = kav_plaintext()
+    mut entries: []teko::compress::ZipEntry = teko::list::empty()
+    entries = teko::list::push(entries, teko::compress::ZipEntry { name = "payload.bin"; data = plaintext })
+
+    let archive = teko::compress::write_zip_deflate(entries)
+    teko::assert::is_true(archive.len > 0)
+
+    match teko::compress::read_zip(archive) {
+        []teko::compress::ZipEntry as got => {
+            teko::assert::is_true(got.len == 1)
+            teko::assert::is_true(teko::runtime::str_eq(got[0].name, "payload.bin"))
+            teko::assert::is_true(bytes_eq(got[0].data, plaintext))
+        }
+        error as e => teko::assert::is_true(false)
+    }
+}

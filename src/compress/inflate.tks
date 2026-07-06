@@ -1,0 +1,731 @@
+/**
+ * `teko::compress::inflate` — a RFC 1951 DEFLATE decompressor: stored, fixed-Huffman,
+ * and dynamic-Huffman blocks, plus LZ77 back-reference expansion.
+ *
+ * PURE TEKO, MONOMORPHIC (`[]byte -> []byte | error`), no mutation of shared state — the
+ * whole decode is VALUE-THREADED: every step function takes a cursor (a `BitReader` or
+ * `InflateState`) and returns a NEW one, the same pattern `teko::regex`'s parser uses
+ * (no index assignment / no in-place mutation is expressible in Teko — B.4/B.21).
+ *
+ * Canonical Huffman decoding (RFC 1951 §3.2.2) is done WITHOUT a lookup table: bits are
+ * peeled one at a time, extending a running `code` and comparing it against each length's
+ * first assigned code (`first_code[len]`), threaded through `[]u32` count/offset lists
+ * built once per Huffman table from an explicit code-length array.
+ */
+
+/**
+ * A bit-level cursor over a byte slice: DEFLATE packs bits LSB-first within each byte,
+ * consumed in stream order (RFC 1951 §3.1.1).
+ */
+type BitReader = struct {
+    /** The underlying compressed bytes. */
+    data: []byte
+    /** The index of the next byte to read bits from. */
+    byte_pos: u64
+    /** The number of bits already consumed from `data[byte_pos]` (0-7). */
+    bit_pos: u32
+}
+
+/**
+ * Start a `BitReader` at the beginning of `data`.
+ *
+ * @param data  the compressed bytes to read
+ * @return      a fresh cursor positioned at bit 0 of byte 0
+ */
+fn bitreader_new(data: []byte) -> BitReader {
+    BitReader { data = data; byte_pos = 0; bit_pos = 0 }
+}
+
+/**
+ * The result of reading one bit: its value plus the advanced cursor.
+ */
+type BitResult = struct {
+    /** The bit value (`0` or `1`). */
+    bit: u32
+    /** The cursor advanced past the consumed bit. */
+    next: BitReader
+}
+
+/**
+ * Read one bit from `r`, LSB-first within the current byte.
+ *
+ * @param r  the cursor to read from
+ * @return   the bit value (`0` or `1`) and the advanced cursor, or an `error` if `r` has
+ *           run past the end of its data
+ * @throws   when `r.byte_pos >= r.data.len` (the stream ended mid-block)
+ */
+fn read_bit(r: BitReader) -> BitResult | error {
+    if r.byte_pos >= r.data.len { return error { message = "inflate: unexpected end of stream" } }
+    let cur_byte = r.data[r.byte_pos] to u32
+    let bit = (cur_byte >> r.bit_pos) & 1
+    if r.bit_pos == 7 {
+        return BitResult { bit = bit; next = BitReader { data = r.data; byte_pos = r.byte_pos + 1; bit_pos = 0 } }
+    }
+    BitResult { bit = bit; next = BitReader { data = r.data; byte_pos = r.byte_pos; bit_pos = r.bit_pos + 1 } }
+}
+
+/**
+ * The result of reading a multi-bit field: its assembled value plus the advanced cursor.
+ */
+type BitsResult = struct {
+    /** The assembled value (the first bit read is the LOW-order bit). */
+    value: u32
+    /** The cursor advanced past the consumed bits. */
+    next: BitReader
+}
+
+/**
+ * Read `count` bits from `r`, LSB-first (the bit read first becomes the LOW-order bit of
+ * the result — DEFLATE's "extra bits" and stored-block length convention).
+ *
+ * @param r      the cursor to read from
+ * @param count  the number of bits to read (0-32)
+ * @return       the assembled value and the advanced cursor, or an `error` on truncation
+ * @throws       when the stream ends before `count` bits are available
+ */
+fn read_bits(r: BitReader, count: u32) -> BitsResult | error {
+    mut cur = r
+    mut value: u32 = 0
+    mut i: u32 = 0
+    loop {
+        if i >= count { break }
+        let step = match read_bit(cur) { BitResult as b => b; error as e => return e }
+        value = value | (step.bit << i)
+        cur = step.next
+        i++
+    }
+    BitsResult { value = value; next = cur }
+}
+
+/**
+ * Advance `r` to the start of the next byte, discarding any partially-read bits
+ * (the stored-block alignment rule, RFC 1951 §3.2.4).
+ *
+ * @param r  the cursor to align
+ * @return   `r` at `bit_pos == 0`, advancing to the next byte if any bits were pending
+ */
+fn align_to_byte(r: BitReader) -> BitReader {
+    if r.bit_pos == 0 { return r }
+    BitReader { data = r.data; byte_pos = r.byte_pos + 1; bit_pos = 0 }
+}
+
+/**
+ * A canonical Huffman decode table (RFC 1951 §3.2.2), built from an explicit
+ * per-symbol code-length array. Symbols are decoded bit-by-bit: `first_code[len]` is the
+ * smallest `len`-bit code assigned to any symbol of that length, and `first_index[len]`
+ * is that symbol's position in `symbols_by_len` (which lists every symbol in
+ * (length, original-index) order, matching the canonical assignment order).
+ */
+type HuffTable = struct {
+    /** `first_code[len]` = the first canonical code assigned at bit-length `len` (index 0 unused). */
+    first_code: []u32
+    /** `count[len]` = how many symbols have bit-length `len` (index 0 unused). */
+    count: []u32
+    /** `first_index[len]` = the starting offset into `symbols_by_len` for length `len`. */
+    first_index: []u32
+    /** every symbol with a nonzero code length, ordered by (length, original symbol index). */
+    symbols_by_len: []u32
+    /** the longest code length present (0 if the table is empty). */
+    max_len: u32
+}
+
+/**
+ * The largest DEFLATE Huffman code length reachable (RFC 1951 caps literal/length and
+ * distance codes at 15 bits; the code-length alphabet itself at 7).
+ *
+ * @return  `15`
+ */
+fn max_huffman_bits() -> u32 { 15 }
+
+/**
+ * Count how many entries of `lengths` equal `len`.
+ *
+ * @param lengths  the per-symbol code-length array
+ * @param len      the length to count
+ * @return         the number of symbols whose code length is `len`
+ */
+fn count_symbols_of_length(lengths: []u32, len: u32) -> u32 {
+    mut n: u32 = 0
+    mut i: u64 = 0
+    loop {
+        if i >= lengths.len { break }
+        if lengths[i] == len { n = n + 1 }
+        i++
+    }
+    n
+}
+
+/**
+ * Build the `count`/`first_code`/`first_index` tables and the `symbols_by_len` list for a
+ * canonical Huffman code, from its per-symbol length array (RFC 1951 §3.2.2's algorithm).
+ *
+ * @param lengths  the per-symbol code-length array (`0` = symbol unused)
+ * @return         the fully-built `HuffTable`, or an `error` if the lengths do not form a
+ *                 valid (over- or under-subscribed) canonical code
+ * @throws         when the codes assigned would exceed `max_huffman_bits()` capacity at
+ *                  some length (an over-subscribed code)
+ */
+fn build_huffman(lengths: []u32) -> HuffTable | error {
+    mut count: []u32 = teko::list::push(teko::list::empty(), 0 to u32)
+    mut len: u32 = 1
+    loop {
+        if len > max_huffman_bits() { break }
+        count = teko::list::push(count, count_symbols_of_length(lengths, len))
+        len++
+    }
+
+    mut first_code: []u32 = teko::list::push(teko::list::empty(), 0 to u32)
+    mut first_index: []u32 = teko::list::push(teko::list::empty(), 0 to u32)
+    mut code: u32 = 0
+    mut index: u32 = 0
+    len = 1
+    loop {
+        if len > max_huffman_bits() { break }
+        code = (code + count[len - 1]) << 1
+        first_code = teko::list::push(first_code, code)
+        first_index = teko::list::push(first_index, index)
+        index = index + count[len]
+        len++
+    }
+
+    let max_len = index
+    mut symbols_by_len: []u32 = teko::list::empty()
+    len = 1
+    loop {
+        if len > max_huffman_bits() { break }
+        mut sym: u64 = 0
+        loop {
+            if sym >= lengths.len { break }
+            if lengths[sym] == len { symbols_by_len = teko::list::push(symbols_by_len, sym to u32) }
+            sym++
+        }
+        len++
+    }
+
+    HuffTable { first_code = first_code; count = count; first_index = first_index; symbols_by_len = symbols_by_len; max_len = max_len }
+}
+
+/**
+ * The result of decoding one Huffman-coded symbol: its value plus the advanced cursor.
+ */
+type SymbolResult = struct {
+    /** The decoded symbol. */
+    symbol: u32
+    /** The cursor advanced past the consumed code bits. */
+    next: BitReader
+}
+
+/**
+ * Decode one symbol from `r` against `table`, peeling one bit at a time (RFC 1951's
+ * canonical-code decode: extend the running code and compare against each length's
+ * first assigned code).
+ *
+ * @param r      the cursor to read from
+ * @param table  the Huffman table to decode against
+ * @return       the decoded symbol and the advanced cursor, or an `error` on a malformed
+ *               (unassigned) code or stream truncation
+ * @throws       when no valid symbol is found within `max_huffman_bits()` bits
+ */
+fn decode_symbol(r: BitReader, table: HuffTable) -> SymbolResult | error {
+    mut cur = r
+    mut code: u32 = 0
+    mut len: u32 = 1
+    loop {
+        if len > max_huffman_bits() { return error { message = "inflate: invalid Huffman code" } }
+        let step = match read_bit(cur) { BitResult as b => b; error as e => return e }
+        code = (code << 1) | step.bit
+        cur = step.next
+        let next_len_first = code - table.first_code[len]
+        if table.count[len] > 0 && next_len_first < table.count[len] {
+            let symbol = table.symbols_by_len[(table.first_index[len] to u64) + (next_len_first to u64)]
+            return SymbolResult { symbol = symbol; next = cur }
+        }
+        len++
+    }
+    error { message = "inflate: invalid Huffman code" }
+}
+
+/**
+ * The fixed literal/length code lengths (RFC 1951 §3.2.6): 0-143 -> 8 bits, 144-255 -> 9
+ * bits, 256-279 -> 7 bits, 280-287 -> 8 bits.
+ *
+ * @return  the 288-entry code-length array for the fixed literal/length alphabet
+ */
+fn fixed_litlen_lengths() -> []u32 {
+    mut lengths: []u32 = teko::list::empty()
+    mut sym: u32 = 0
+    loop {
+        if sym >= 288 { break }
+        if sym < 144 { lengths = teko::list::push(lengths, 8) }
+        else if sym < 256 { lengths = teko::list::push(lengths, 9) }
+        else if sym < 280 { lengths = teko::list::push(lengths, 7) }
+        else { lengths = teko::list::push(lengths, 8) }
+        sym++
+    }
+    lengths
+}
+
+/**
+ * The fixed distance code lengths (RFC 1951 §3.2.6): all 32 codes at 5 bits.
+ *
+ * @return  the 32-entry code-length array for the fixed distance alphabet
+ */
+fn fixed_dist_lengths() -> []u32 {
+    mut lengths: []u32 = teko::list::empty()
+    mut sym: u32 = 0
+    loop {
+        if sym >= 32 { break }
+        lengths = teko::list::push(lengths, 5)
+        sym++
+    }
+    lengths
+}
+
+/**
+ * The base length (before extra bits) for a length code (RFC 1951 §3.2.5), for codes
+ * 257-285 (`sym` is the 0-based offset from 257).
+ *
+ * @param sym  the length-code offset (`0` = code 257, … `28` = code 285)
+ * @return     the base match length
+ */
+fn length_base(sym: u32) -> u32 {
+    let bases: []u32 = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258]
+    bases[sym]
+}
+
+/**
+ * The number of extra bits following a length code (RFC 1951 §3.2.5).
+ *
+ * @param sym  the length-code offset (`0` = code 257, … `28` = code 285)
+ * @return     the extra-bit count (`0` for code 285, the exact-258 sentinel)
+ */
+fn length_extra_bits(sym: u32) -> u32 {
+    let extras: []u32 = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0]
+    extras[sym]
+}
+
+/**
+ * The base distance (before extra bits) for a distance code (RFC 1951 §3.2.5).
+ *
+ * @param sym  the distance-code index (0-29)
+ * @return     the base back-reference distance
+ */
+fn distance_base(sym: u32) -> u32 {
+    let bases: []u32 = [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577]
+    bases[sym]
+}
+
+/**
+ * The number of extra bits following a distance code (RFC 1951 §3.2.5).
+ *
+ * @param sym  the distance-code index (0-29)
+ * @return     the extra-bit count
+ */
+fn distance_extra_bits(sym: u32) -> u32 {
+    let extras: []u32 = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13]
+    extras[sym]
+}
+
+/**
+ * The full running state of one inflate pass: the bit cursor plus the growing output
+ * buffer (value-threaded — every step returns a NEW `InflateState`).
+ */
+type InflateState = struct {
+    /** The bit cursor over the compressed input. */
+    reader: BitReader
+    /** The decompressed bytes produced so far. */
+    output: []byte
+}
+
+/**
+ * Copy one LZ77 back-reference (`length` bytes, each copied from `distance` bytes before
+ * the current output end) into `output`. Overlapping copies (`distance < length`, the
+ * common run-length-encoding case) are correct because each byte is appended before the
+ * next one is read.
+ *
+ * @param output    the output buffer to extend
+ * @param distance  how many bytes back the copy source starts (1-32768)
+ * @param length    how many bytes to copy (3-258)
+ * @return          `output` with the `length` copied bytes appended, or an `error` if
+ *                  `distance` reaches before the start of `output`
+ * @throws          when `distance > output.len` (a malformed or truncated stream)
+ */
+fn copy_back_reference(output: []byte, distance: u32, length: u32) -> []byte | error {
+    if (distance to u64) > output.len { return error { message = "inflate: back-reference distance exceeds output so far" } }
+    mut out = output
+    mut i: u32 = 0
+    loop {
+        if i >= length { break }
+        let src_index = out.len - (distance to u64)
+        out = teko::list::push(out, out[src_index])
+        i++
+    }
+    out
+}
+
+/**
+ * Decode one literal/length/distance symbol stream (shared by fixed- and
+ * dynamic-Huffman blocks) until the end-of-block symbol (256) is reached.
+ *
+ * @param state      the running inflate state (cursor + output so far)
+ * @param litlen     the literal/length Huffman table
+ * @param dist       the distance Huffman table
+ * @return           the state advanced past this block's end-of-block symbol, or an
+ *                   `error` on a malformed code, an out-of-range distance code, or
+ *                   stream truncation
+ * @throws           when a decoded distance symbol has no assigned base/extra-bits (an
+ *                   invalid code, RFC 1951 §3.2.5 reserves 30-31)
+ */
+fn inflate_huffman_block(state: InflateState, litlen: HuffTable, dist: HuffTable) -> InflateState | error {
+    mut cur = state.reader
+    mut out = state.output
+    loop {
+        let sym_step = match decode_symbol(cur, litlen) { SymbolResult as s => s; error as e => return e }
+        cur = sym_step.next
+        let symbol = sym_step.symbol
+
+        if symbol < 256 {
+            out = teko::list::push(out, symbol to byte)
+            continue
+        }
+        if symbol == 256 { break }
+
+        let len_offset = symbol - 257
+        if len_offset > 28 { return error { message = "inflate: invalid length code" } }
+        let extra_len = match read_bits(cur, length_extra_bits(len_offset)) { BitsResult as b => b; error as e => return e }
+        cur = extra_len.next
+        let match_length = length_base(len_offset) + extra_len.value
+
+        let dist_step = match decode_symbol(cur, dist) { SymbolResult as s => s; error as e => return e }
+        cur = dist_step.next
+        if dist_step.symbol > 29 { return error { message = "inflate: invalid distance code" } }
+        let extra_dist = match read_bits(cur, distance_extra_bits(dist_step.symbol)) { BitsResult as b => b; error as e => return e }
+        cur = extra_dist.next
+        let match_distance = distance_base(dist_step.symbol) + extra_dist.value
+
+        out = match copy_back_reference(out, match_distance, match_length) { []byte as b => b; error as e => return e }
+    }
+    InflateState { reader = cur; output = out }
+}
+
+/**
+ * Decode one STORED block (BTYPE 00): align to a byte boundary, read `LEN`/`NLEN`
+ * (`u16` each, `NLEN` the one's-complement check of `LEN`), then copy `LEN` raw bytes
+ * (RFC 1951 §3.2.4).
+ *
+ * @param state  the running inflate state (cursor + output so far)
+ * @return       the state advanced past this stored block, or an `error` if `NLEN`
+ *               fails its check or the block is truncated
+ * @throws       when `NLEN != ~LEN` (a corrupted stored-block header)
+ */
+fn inflate_stored_block(state: InflateState) -> InflateState | error {
+    let aligned = align_to_byte(state.reader)
+    if aligned.byte_pos + 4 > aligned.data.len { return error { message = "inflate: truncated stored-block header" } }
+    let len = (aligned.data[aligned.byte_pos] to u64) | ((aligned.data[aligned.byte_pos + 1] to u64) << 8)
+    let nlen = (aligned.data[aligned.byte_pos + 2] to u64) | ((aligned.data[aligned.byte_pos + 3] to u64) << 8)
+    if (nlen & 0xFFFF) != ((~len) & 0xFFFF) { return error { message = "inflate: stored-block NLEN check failed" } }
+
+    let data_start = aligned.byte_pos + 4
+    if data_start + len > aligned.data.len { return error { message = "inflate: truncated stored-block data" } }
+
+    mut out = state.output
+    mut i: u64 = 0
+    loop {
+        if i >= len { break }
+        out = teko::list::push(out, aligned.data[data_start + i])
+        i++
+    }
+
+    InflateState { reader = BitReader { data = aligned.data; byte_pos = data_start + len; bit_pos = 0 }; output = out }
+}
+
+/**
+ * Decode one FIXED-Huffman block (BTYPE 01): the fixed literal/length and distance
+ * tables are rebuilt for every such block (RFC 1951 §3.2.6) — simple and correct; a
+ * production decoder would cache them, but a DEFLATE stream typically has few blocks.
+ *
+ * @param state  the running inflate state (cursor + output so far)
+ * @return       the state advanced past this fixed-Huffman block, or an `error` on a
+ *               malformed code or stream truncation
+ */
+fn inflate_fixed_block(state: InflateState) -> InflateState | error {
+    let litlen = match build_huffman(fixed_litlen_lengths()) { HuffTable as t => t; error as e => return e }
+    let dist = match build_huffman(fixed_dist_lengths()) { HuffTable as t => t; error as e => return e }
+    inflate_huffman_block(state, litlen, dist)
+}
+
+/**
+ * The order in which code-length-alphabet lengths are transmitted in a dynamic-Huffman
+ * block header (RFC 1951 §3.2.7) — a fixed permutation chosen so that trailing (likely
+ * unused) entries can be omitted via `HCLEN`.
+ *
+ * @return  the 19-entry permutation array
+ */
+fn code_length_order() -> []u32 {
+    [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15]
+}
+
+/**
+ * The running state of decoding a dynamic block's code-length arrays (literal/length +
+ * distance lengths are transmitted as ONE combined sequence, RFC 1951 §3.2.7).
+ */
+type CodeLengthsResult = struct {
+    /** The cursor advanced past the decoded length sequence. */
+    reader: BitReader
+    /** The decoded code lengths, in symbol order. */
+    lengths: []u32
+}
+
+/**
+ * Decode `total` code lengths (the combined literal/length + distance sequence) using
+ * the already-built code-length Huffman table, expanding the three repeat symbols
+ * (16 = repeat previous 3-6 times, 17 = repeat zero 3-10 times, 18 = repeat zero 11-138
+ * times).
+ *
+ * @param r         the cursor positioned at the start of the encoded length sequence
+ * @param cl_table  the code-length alphabet's own Huffman table
+ * @param total     how many lengths to produce in total
+ * @return          the decoded length array (exactly `total` entries) and the advanced
+ *                  cursor, or an `error` on a malformed code, an invalid leading repeat,
+ *                  or stream truncation
+ * @throws          when repeat symbol 16 appears before any length has been produced
+ */
+fn decode_code_lengths(r: BitReader, cl_table: HuffTable, total: u32) -> CodeLengthsResult | error {
+    mut cur = r
+    mut lengths: []u32 = teko::list::empty()
+    loop {
+        if lengths.len >= (total to u64) { break }
+        let sym_step = match decode_symbol(cur, cl_table) { SymbolResult as s => s; error as e => return e }
+        cur = sym_step.next
+        let symbol = sym_step.symbol
+
+        if symbol < 16 {
+            lengths = teko::list::push(lengths, symbol)
+            continue
+        }
+        if symbol == 16 {
+            if lengths.len == 0 { return error { message = "inflate: repeat code 16 with no previous length" } }
+            let prev = lengths[lengths.len - 1]
+            let extra = match read_bits(cur, 2) { BitsResult as b => b; error as e => return e }
+            cur = extra.next
+            let repeat = extra.value + 3
+            mut k: u32 = 0
+            loop { if k >= repeat { break }; lengths = teko::list::push(lengths, prev); k++ }
+            continue
+        }
+        if symbol == 17 {
+            let extra = match read_bits(cur, 3) { BitsResult as b => b; error as e => return e }
+            cur = extra.next
+            let repeat = extra.value + 3
+            mut k: u32 = 0
+            loop { if k >= repeat { break }; lengths = teko::list::push(lengths, 0); k++ }
+            continue
+        }
+        let extra = match read_bits(cur, 7) { BitsResult as b => b; error as e => return e }
+        cur = extra.next
+        let repeat = extra.value + 11
+        mut k: u32 = 0
+        loop { if k >= repeat { break }; lengths = teko::list::push(lengths, 0); k++ }
+    }
+    CodeLengthsResult { reader = cur; lengths = lengths }
+}
+
+/**
+ * Slice `lengths[from, to)` into a fresh array (used to split the combined
+ * literal/length + distance code-length sequence back into its two halves).
+ *
+ * @param lengths  the source array
+ * @param from     the inclusive start index
+ * @param to       the exclusive end index
+ * @return         the extracted sub-array, in order
+ */
+fn slice_u32(lengths: []u32, from: u64, to: u64) -> []u32 {
+    mut out: []u32 = teko::list::empty()
+    mut i = from
+    loop {
+        if i >= to { break }
+        out = teko::list::push(out, lengths[i])
+        i++
+    }
+    out
+}
+
+/**
+ * One `(position, length)` pair read while decoding the code-length alphabet's own
+ * lengths — Teko has no index assignment, so the out-of-order `code_length_order()`
+ * permutation is applied by RECORDING pairs in read order and then, for each of the 19
+ * positions, scanning for its match (`code_length_lengths_of`), rather than writing
+ * into a mutable array by index.
+ */
+type CodeLengthSlot = struct {
+    /** The alphabet position (symbol index, 0-18) this length was transmitted for. */
+    position: u32
+    /** The code length assigned to `position`. */
+    length: u32
+}
+
+/**
+ * Read the `HCLEN` code-length-alphabet lengths (3 bits each, RFC 1951 §3.2.7), applying
+ * the `code_length_order()` permutation to recover the 19 lengths in ALPHABET order
+ * (position 0 = symbol 0, … position 18 = symbol 18). Any position not covered by
+ * `HCLEN` entries is implicitly length `0` (unused).
+ *
+ * @param r      the cursor positioned right after `HCLEN` itself
+ * @param hclen  how many (position, length) entries are encoded (4-19)
+ * @return       the 19-entry code-length array (indexed by symbol) and the advanced
+ *               cursor, or an `error` on stream truncation
+ */
+fn read_code_length_alphabet(r: BitReader, hclen: u32) -> CodeLengthsResult | error {
+    let order = code_length_order()
+    mut cur = r
+    mut slots: []CodeLengthSlot = teko::list::empty()
+    mut i: u32 = 0
+    loop {
+        if i >= hclen { break }
+        let step = match read_bits(cur, 3) { BitsResult as b => b; error as e => return e }
+        cur = step.next
+        slots = teko::list::push(slots, CodeLengthSlot { position = order[i]; length = step.value })
+        i++
+    }
+
+    mut lengths: []u32 = teko::list::empty()
+    mut p: u32 = 0
+    loop {
+        if p >= 19 { break }
+        lengths = teko::list::push(lengths, code_length_lengths_of(slots, p))
+        p++
+    }
+    CodeLengthsResult { reader = cur; lengths = lengths }
+}
+
+/**
+ * Find the length recorded for alphabet position `p` among the `HCLEN` slots (`0` if no
+ * slot named `p` — the RFC's "trailing lengths are zero" shorthand).
+ *
+ * @param slots  the `(position, length)` pairs read in transmission order
+ * @param p      the alphabet position to look up
+ * @return       the length assigned to `p`, or `0` if none was transmitted
+ */
+fn code_length_lengths_of(slots: []CodeLengthSlot, p: u32) -> u32 {
+    mut i: u64 = 0
+    loop {
+        if i >= slots.len { break }
+        if slots[i].position == p { return slots[i].length }
+        i++
+    }
+    0
+}
+
+/**
+ * Decode one DYNAMIC-Huffman block (BTYPE 10, RFC 1951 §3.2.7): read `HLIT`/`HDIST`/
+ * `HCLEN`, the code-length alphabet's own lengths, build its table, decode the combined
+ * literal/length + distance length sequence, build both final tables, then decode the
+ * block body exactly like a fixed-Huffman block.
+ *
+ * @param state  the running inflate state (cursor + output so far)
+ * @return       the state advanced past this dynamic-Huffman block, or an `error` on any
+ *               malformed header field, code, or stream truncation
+ */
+fn inflate_dynamic_block(state: InflateState) -> InflateState | error {
+    let hlit_step = match read_bits(state.reader, 5) { BitsResult as b => b; error as e => return e }
+    let hlit = hlit_step.value + 257
+    let hdist_step = match read_bits(hlit_step.next, 5) { BitsResult as b => b; error as e => return e }
+    let hdist = hdist_step.value + 1
+    let hclen_step = match read_bits(hdist_step.next, 4) { BitsResult as b => b; error as e => return e }
+    let hclen = hclen_step.value + 4
+
+    let cl_alphabet = match read_code_length_alphabet(hclen_step.next, hclen) { CodeLengthsResult as r => r; error as e => return e }
+    let cl_table = match build_huffman(cl_alphabet.lengths) { HuffTable as t => t; error as e => return e }
+
+    let combined = match decode_code_lengths(cl_alphabet.reader, cl_table, hlit + hdist) { CodeLengthsResult as r => r; error as e => return e }
+    let litlen_lengths = slice_u32(combined.lengths, 0, hlit to u64)
+    let dist_lengths = slice_u32(combined.lengths, hlit to u64, (hlit + hdist) to u64)
+
+    let litlen = match build_huffman(litlen_lengths) { HuffTable as t => t; error as e => return e }
+    let dist = match build_huffman(dist_lengths) { HuffTable as t => t; error as e => return e }
+
+    inflate_huffman_block(InflateState { reader = combined.reader; output = state.output }, litlen, dist)
+}
+
+/**
+ * The DEFLATE block-type code for a stored (uncompressed) block (RFC 1951 §3.2.3).
+ *
+ * @return  `0`
+ */
+fn block_type_stored() -> u32 { 0 }
+
+/**
+ * The DEFLATE block-type code for a fixed-Huffman block.
+ *
+ * @return  `1`
+ */
+fn block_type_fixed() -> u32 { 1 }
+
+/**
+ * The DEFLATE block-type code for a dynamic-Huffman block.
+ *
+ * @return  `2`
+ */
+fn block_type_dynamic() -> u32 { 2 }
+
+/**
+ * The result of decoding one DEFLATE block: the advanced state plus whether it was the
+ * stream's final block.
+ */
+type BlockResult = struct {
+    /** The inflate state advanced past this block. */
+    state: InflateState
+    /** Whether this block's `BFINAL` bit was set (the stream's last block). */
+    is_final: bool
+}
+
+/**
+ * Decode exactly one DEFLATE block (its 3-bit header, `BFINAL`+`BTYPE`, then the body
+ * matching `BTYPE`).
+ *
+ * @param state  the running inflate state, positioned at a block header
+ * @return       the advanced state and whether this was the FINAL block (`BFINAL == 1`),
+ *               or an `error` on a malformed header or block body
+ * @throws       when `BTYPE == 3` (reserved, RFC 1951 §3.2.3)
+ */
+fn inflate_one_block(state: InflateState) -> BlockResult | error {
+    let final_step = match read_bit(state.reader) { BitResult as b => b; error as e => return e }
+    let is_final = final_step.bit != 0
+    let type_step = match read_bits(final_step.next, 2) { BitsResult as b => b; error as e => return e }
+    let btype = type_step.value
+    let body_state = InflateState { reader = type_step.next; output = state.output }
+
+    if btype == block_type_stored() {
+        let next = match inflate_stored_block(body_state) { InflateState as s => s; error as e => return e }
+        return BlockResult { state = next; is_final = is_final }
+    }
+    if btype == block_type_fixed() {
+        let next = match inflate_fixed_block(body_state) { InflateState as s => s; error as e => return e }
+        return BlockResult { state = next; is_final = is_final }
+    }
+    if btype == block_type_dynamic() {
+        let next = match inflate_dynamic_block(body_state) { InflateState as s => s; error as e => return e }
+        return BlockResult { state = next; is_final = is_final }
+    }
+    error { message = "inflate: reserved block type (BTYPE 3)" }
+}
+
+/**
+ * Decompress a raw DEFLATE bitstream (RFC 1951 — no zlib/gzip framing) into its original
+ * bytes.
+ *
+ * @param data  the compressed DEFLATE stream
+ * @return      the decompressed bytes, or an `error` on any malformed block, code, or
+ *              truncation
+ * @throws      when the stream ends before a `BFINAL == 1` block, or any block body is
+ *              malformed (see `inflate_one_block`)
+ */
+pub fn inflate(data: []byte) -> []byte | error {
+    mut state = InflateState { reader = bitreader_new(data); output = teko::list::empty() }
+    loop {
+        let step = match inflate_one_block(state) { BlockResult as r => r; error as e => return e }
+        state = step.state
+        if step.is_final { break }
+    }
+    state.output
+}

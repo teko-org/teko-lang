@@ -1,0 +1,107 @@
+/**
+ * `teko::compress::deflate` — a RFC 1951 DEFLATE compressor.
+ *
+ * STRATEGY (documented trade, not a hidden shortcut — M.3): this compressor emits ONLY
+ * STORED blocks (BTYPE 00). A stored block is always byte-for-byte correct (no Huffman
+ * modeling, no LZ77 match search) and is one of the two block shapes RFC 1951 itself
+ * defines as fully valid DEFLATE — real decoders (including `teko::compress::inflate`,
+ * which additionally decodes fixed- and dynamic-Huffman blocks) MUST accept it. It
+ * produces no size reduction (indeed each block adds a 5-byte header), trading
+ * compression ratio for a compressor that is trivially, mechanically correct — the same
+ * trade a naive/`Z_NO_COMPRESSION` zlib mode makes. A real fixed/dynamic-Huffman
+ * encoder is a mechanical follow-up (issue #193, "advanced compress") once this
+ * round-trips; see the module's own issue (#192) for the scope note.
+ *
+ * Every wrapper built on this module (`teko::compress::zlib`, `teko::compress::gzip`,
+ * and ZIP method-8 entries) is therefore fully interoperable with real-world DEFLATE
+ * decoders on the COMPRESS side too: the bytes this emits are valid input to zlib/gzip
+ * itself, not just to this project's own `inflate`.
+ */
+
+/**
+ * The largest byte count one STORED block can carry (`LEN` is a `u16`, RFC 1951 §3.2.4).
+ *
+ * @return  `65535`
+ */
+fn max_stored_block_len() -> u64 { 65535 }
+
+/**
+ * Append one STORED-block header (`BFINAL` + `BTYPE 00` packed into a single byte since
+ * a stored block always starts byte-aligned, followed by `LEN`/`NLEN` as little-endian
+ * `u16`s) and the block's raw bytes.
+ *
+ * @param buf       the growing compressed-output buffer
+ * @param chunk     this block's raw bytes (at most `max_stored_block_len()` long)
+ * @param is_final  whether this is the LAST block in the stream (`BFINAL`)
+ * @return          `buf` with the new stored block appended
+ */
+fn append_stored_block(buf: []byte, chunk: []byte, is_final: bool) -> []byte {
+    mut out = buf
+    let bfinal_bit: u32 = if is_final { 1 to u32 } else { 0 to u32 }
+    out = teko::list::push(out, bfinal_bit to byte)
+
+    let len = chunk.len to u32
+    let nlen = (~len) & 0xFFFF
+    out = teko::list::push(out, (len & 0xFF) to byte)
+    out = teko::list::push(out, ((len >> 8) & 0xFF) to byte)
+    out = teko::list::push(out, (nlen & 0xFF) to byte)
+    out = teko::list::push(out, ((nlen >> 8) & 0xFF) to byte)
+
+    mut i: u64 = 0
+    loop {
+        if i >= chunk.len { break }
+        out = teko::list::push(out, chunk[i])
+        i++
+    }
+    out
+}
+
+/**
+ * Extract `data[from, to)` into a fresh byte slice — shared by every `teko::compress`
+ * wrapper (`zlib`/`gzip`) that needs to peel a fixed-size header/trailer off a stream.
+ *
+ * @param data  the source bytes
+ * @param from  the inclusive start index
+ * @param to    the exclusive end index
+ * @return      the extracted bytes, in order
+ */
+fn slice_bytes(data: []byte, from: u64, to: u64) -> []byte {
+    mut out: []byte = teko::list::empty()
+    mut i = from
+    loop {
+        if i >= to { break }
+        out = teko::list::push(out, data[i])
+        i++
+    }
+    out
+}
+
+/**
+ * Compress `data` into a raw DEFLATE bitstream (RFC 1951 — no zlib/gzip framing) using
+ * STORED blocks only (see the module doc-comment for why). The empty input still
+ * produces one (empty, final) stored block, so `inflate(deflate([]))` round-trips to
+ * an empty slice rather than needing special-cased handling downstream.
+ *
+ * @param data  the bytes to compress
+ * @return      a valid DEFLATE stream that decompresses back to `data`
+ */
+pub fn deflate(data: []byte) -> []byte {
+    mut out: []byte = teko::list::empty()
+    let block_len = max_stored_block_len()
+
+    if data.len == 0 {
+        return append_stored_block(out, data, true)
+    }
+
+    mut pos: u64 = 0
+    loop {
+        let remaining = data.len - pos
+        let this_len = if remaining < block_len { remaining } else { block_len }
+        let chunk = slice_bytes(data, pos, pos + this_len)
+        let is_final = pos + this_len >= data.len
+        out = append_stored_block(out, chunk, is_final)
+        pos = pos + this_len
+        if is_final { break }
+    }
+    out
+}
