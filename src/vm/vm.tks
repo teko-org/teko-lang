@@ -1553,7 +1553,7 @@ fn as_int(v: Value) -> i128 {
         u16 as x => x to i128
         u32 as x => x to i128
         u64 as x => x to i128
-        u128 as x => x to i128
+        u128 as x => reinterpret_u128_to_i128(x)   // non-trapping: u128 high-bit doesn't fit i128 (#296)
         i8 as x => x to i128
         i16 as x => x to i128
         i32 as x => x to i128
@@ -1578,6 +1578,50 @@ fn as_str(v: Value) -> str {
     match v { str as x => x; _ => panic("vm: as_str on a non-str value (checker should reject)") }
 }
 
+/**
+ * Reinterpret an i128 carrier's raw BITS as a u128, two's-complement, never trapping.
+ *
+ * The VM carries every integer Value in an i128; a u128 with the high bit set is stored as a
+ * NEGATIVE i128, and a checked `i128 to u128` PANICS on it ("impossible conversion") — a VM≠native
+ * divergence (native lowers a u128 as a plain `(unsigned __int128)` reinterpret). There is no
+ * 128-bit-wide non-trapping cast op, so we rebuild the value from its two 64-bit halves: the low
+ * half is masked out non-trapping (`wrap_hole_to_u64`), the high half is the arithmetic shift's low
+ * 64 bits, and they are recomposed in u128 space where every sub-op is total.
+ *
+ * @param raw  the integer Value's raw bits as an i128 carrier
+ * @return     the same bit pattern as a u128 (two's-complement reinterpret, never panics)
+ * @see wrap_hole_to_u64 the 64-bit sibling reinterpret (vm.tks)
+ * @since onda-3 (#296)
+ */
+fn reinterpret_i128_to_u128(raw: i128) -> u128 {
+    let lo = wrap_hole_to_u64(raw) to u128
+    let hi = wrap_hole_to_u64(raw >> 64) to u128
+    (hi << 64) | lo
+}
+
+/**
+ * Reinterpret a u128's raw BITS as an i128, two's-complement, never trapping — the inverse of
+ * `reinterpret_i128_to_u128`.
+ *
+ * `as_int` collapses every integer Value into the shared i128 carrier for arithmetic, but a u128
+ * with the high bit set does NOT fit i128, so a checked `u128 to i128` PANICS ("impossible
+ * conversion"). Native reinterprets the bits (a u128 and i128 share the same 128-bit register).
+ * We reproduce that without a trapping op: the high-bit-clear half fits i128 directly; the
+ * high-bit-set case removes the sign bit (fits), then subtracts 2^127 (as two 2^126 steps, each in
+ * range) so no intermediate ever overflows i128.
+ *
+ * @param x  the u128 bit pattern
+ * @return   the same 128 bits as an i128 (two's-complement reinterpret, never panics)
+ * @see reinterpret_i128_to_u128 the inverse (i128 carrier bits -> u128)
+ * @since onda-3 (#296)
+ */
+fn reinterpret_u128_to_i128(x: u128) -> i128 {
+    let sign_bit = (1 to u128) << 127
+    if x < sign_bit { return x to i128 }
+    let low = (x - sign_bit) to i128
+    low - ((1 to i128) << 126) - ((1 to i128) << 126)
+}
+
 // Value CONSTRUCTORS — the .tks stand-in for the C v_int / v_float (+ norm_int). A `u32` Value IS
 // the `u32` case (the member carries the scalar), so we build by MASKING the low `width` bits with
 // bitwise `&` (never panics, unlike a checked `to`) and then sign-extending for signed widths — the
@@ -1595,7 +1639,7 @@ fn norm_int(raw: i128, signed: bool, width: u8) -> Value {
         else if width == 16 { (raw & 0xFFFF) to u16 }
         else if width == 32 { (raw & 0xFFFFFFFF) to u32 }
         else if width == 64 { (raw & 0xFFFFFFFFFFFFFFFF) to u64 }
-        else { raw to u128 }   // 128: reinterpret the carrier's bits
+        else { reinterpret_i128_to_u128(raw) }   // 128: reinterpret the carrier's bits (non-trapping, #296)
     }
 }
 
@@ -2386,7 +2430,7 @@ fn apply_int_op(op: lexer::TokenKind, l: i128, r: i128, sgn: bool, w: u8) -> i12
         Pipe => l | r
         Caret => l ^ r
         Shl => l << (r & mask)
-        Shr => l >> (r & mask)
+        Shr => if (!sgn) && (w == 128) { reinterpret_u128_to_i128(reinterpret_i128_to_u128(l) >> (r & mask)) } else { l >> (r & mask) }   // unsigned 128 = LOGICAL shift (carrier may be negative); u8..u64 unsigned have positive carriers (#296)
         _ => panic("vm: binary operator not yet supported")
     }
 }
