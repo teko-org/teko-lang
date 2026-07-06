@@ -154,6 +154,37 @@ fn parse_type_params(tokens: []lexer::Token, pos: u64) -> ParsedTypeParams | err
     ParsedTypeParams { names = names; constraints = constraints; next = p }
 }
 
+/**
+ * Does token `pos` start a contextual `unsafe` declaration modifier?
+ *
+ * `unsafe` (U1, 0.1.0.0-beta memory+unsafe remodel §3) is deliberately CONTEXTUAL — a plain
+ * `Ident` whose text is `"unsafe"` — not a reserved keyword, so a namespace segment literally
+ * named `unsafe` (e.g. `teko::mem::unsafe`) stays a legal `::`-path component.
+ *
+ * @param tokens the full token stream
+ * @param pos    the position to test
+ * @return       true iff `tokens[pos]` is the contextual `unsafe` modifier
+ */
+fn is_unsafe_modifier_at(tokens: []lexer::Token, pos: u64) -> bool {
+    is_kind_at(tokens, pos, lexer::TokenKind::Ident) && tokens[pos].text == "unsafe"
+}
+
+/**
+ * Consume an optional contextual `unsafe` modifier at `pos` — the declaration-level risk marker
+ * on `type`/`fn` (U1, 0.1.0.0-beta memory+unsafe remodel §2/§3). Placed AFTER `extern` in both
+ * `parse_function` and `parse_type_decl`'s modifier chain, so `pub unsafe fn`/bare `unsafe fn`
+ * parse while `unsafe extern fn` is rejected (the `extern` consume runs first and wins).
+ *
+ * @param tokens the full token stream
+ * @param pos    the position to consume from (immediately after the `extern` consume)
+ * @return       whether `unsafe` was present (`node`), and the position just past it (`next`,
+ *               unchanged if absent)
+ */
+fn consume_unsafe_modifier(tokens: []lexer::Token, pos: u64) -> Parsed<bool> {
+    if !is_unsafe_modifier_at(tokens, pos) { return Parsed<bool> { node = false; next = pos } }
+    Parsed<bool> { node = true; next = pos + 1 }
+}
+
 // `allow_receiver` (OOP A1, 2026-07-01) — true ONLY when called for a struct-body method: lets
 // the 1st param be a bare untyped name (the receiver). A top-level `fn` always passes false.
 // `allow_bodyless` (W10b.IF) — true ONLY for an INTERFACE method: a pure signature `fn sig(self) -> T`
@@ -200,6 +231,9 @@ fn parse_function(tokens: []lexer::Token, pos: u64, is_test: bool, os_guard: str
         is_extern = true
         p = p + 1
     }
+    let unsafe_mod = consume_unsafe_modifier(tokens, p)
+    let is_unsafe = unsafe_mod.node
+    p = unsafe_mod.next
     if !is_kind_at(tokens, p, lexer::TokenKind::Fn) {
         return err_at(tokens, p, "expected `fn`")
     }
@@ -249,19 +283,19 @@ fn parse_function(tokens: []lexer::Token, pos: u64, is_test: bool, os_guard: str
             p = p + 1
         }
         let no_body: []Statement = teko::list::empty()
-        return Parsed<Decl> { node = Function { name = name; type_params = tps.names; type_constraints = tps.constraints; params = params.items; has_return = has_return; return_type = return_type; body = no_body; vis = vis; has_doc = has_doc; doc = doc; line = name_line; col = name_col; is_test = is_test; is_extern = true; c_symbol = c_symbol; from_lib = from_lib; os_guard = os_guard; is_intern = is_intern; is_abstract = is_abstract; is_virtual = is_virtual; is_override = is_override; has_inject = false; injects = teko::list::empty() }; next = p }
+        return Parsed<Decl> { node = Function { name = name; type_params = tps.names; type_constraints = tps.constraints; params = params.items; has_return = has_return; return_type = return_type; body = no_body; vis = vis; has_doc = has_doc; doc = doc; line = name_line; col = name_col; is_test = is_test; is_extern = true; c_symbol = c_symbol; from_lib = from_lib; os_guard = os_guard; is_intern = is_intern; is_abstract = is_abstract; is_virtual = is_virtual; is_override = is_override; has_inject = false; injects = teko::list::empty(); is_unsafe = is_unsafe }; next = p }
     }
     // (W10b.CLASS increment 2) `abstract fn …` — a SIGNATURE ONLY, no body (abstract classes only;
     // enforced by the checker, not the parser). A bare `;`/newline/`}` follows instead of `{`.
     if (is_abstract || allow_bodyless) && !is_kind_at(tokens, p, lexer::TokenKind::LBrace) {
         let no_body: []Statement = teko::list::empty()
-        return Parsed<Decl> { node = Function { name = name; type_params = tps.names; type_constraints = tps.constraints; params = params.items; has_return = has_return; return_type = return_type; body = no_body; vis = vis; has_doc = has_doc; doc = doc; line = name_line; col = name_col; is_test = is_test; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = os_guard; is_intern = is_intern; is_abstract = is_abstract; is_virtual = is_virtual; is_override = is_override; has_inject = false; injects = teko::list::empty() }; next = p }
+        return Parsed<Decl> { node = Function { name = name; type_params = tps.names; type_constraints = tps.constraints; params = params.items; has_return = has_return; return_type = return_type; body = no_body; vis = vis; has_doc = has_doc; doc = doc; line = name_line; col = name_col; is_test = is_test; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = os_guard; is_intern = is_intern; is_abstract = is_abstract; is_virtual = is_virtual; is_override = is_override; has_inject = false; injects = teko::list::empty(); is_unsafe = is_unsafe }; next = p }
     }
     if !is_kind_at(tokens, p, lexer::TokenKind::LBrace) {
         return err_at(tokens, p, "expected '{' for the function body")
     }
     let blk = match parse_block(tokens, p) { ParsedList<Statement> as x => x; error as e => return e }
-    Parsed<Decl> { node = Function { name = name; type_params = tps.names; type_constraints = tps.constraints; params = params.items; has_return = has_return; return_type = return_type; body = blk.items; vis = vis; has_doc = has_doc; doc = doc; line = name_line; col = name_col; is_test = is_test; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = os_guard; is_intern = is_intern; is_abstract = is_abstract; is_virtual = is_virtual; is_override = is_override; has_inject = false; injects = teko::list::empty() }; next = blk.next }
+    Parsed<Decl> { node = Function { name = name; type_params = tps.names; type_constraints = tps.constraints; params = params.items; has_return = has_return; return_type = return_type; body = blk.items; vis = vis; has_doc = has_doc; doc = doc; line = name_line; col = name_col; is_test = is_test; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = os_guard; is_intern = is_intern; is_abstract = is_abstract; is_virtual = is_virtual; is_override = is_override; has_inject = false; injects = teko::list::empty(); is_unsafe = is_unsafe }; next = blk.next }
 }
 
 // `{ name: T; name: T; … }` — field list; `;`/newline separates; empty `{ }` allowed;
@@ -601,7 +635,7 @@ fn parse_flags_decl(tokens: []lexer::Token, pos: u64) -> Parsed<Decl> | error {
         return err_at(tokens, p, "expected '{' after the flags type name")
     }
     let ms = match parse_field_names(tokens, p) { ParsedList<str> as x => x; error as e => return e }
-    Parsed<Decl> { node = TypeDecl { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = FlagsBody { members = ms.items; values = teko::list::empty() }; vis = vis; has_doc = has_doc; doc = doc; line = name_line; col = name_col; di_kind = DiKind::None; has_di_key = false; di_key = "" }; next = ms.next }
+    Parsed<Decl> { node = TypeDecl { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = FlagsBody { members = ms.items; values = teko::list::empty() }; vis = vis; has_doc = has_doc; doc = doc; line = name_line; col = name_col; di_kind = DiKind::None; has_di_key = false; di_key = ""; is_unsafe = false }; next = ms.next }
 }
 
 // `[doc] [pub|exp] type Name = <body>` (B.13, nominal). Doc + visibility precede `type`.
@@ -629,6 +663,9 @@ fn parse_type_decl(tokens: []lexer::Token, pos: u64) -> Parsed<Decl> | error {
         is_extern = true
         p = p + 1
     }
+    let unsafe_mod = consume_unsafe_modifier(tokens, p)
+    let is_unsafe = unsafe_mod.node
+    p = unsafe_mod.next
     if !is_kind_at(tokens, p, lexer::TokenKind::Type) {
         return err_at(tokens, p, "expected `type`")
     }
@@ -644,13 +681,13 @@ fn parse_type_decl(tokens: []lexer::Token, pos: u64) -> Parsed<Decl> | error {
     p = tps.next
     if is_extern {
         // `extern type Name` — an OPAQUE foreign handle: no `= <body>`, lowers to `void *`.
-        return Parsed<Decl> { node = TypeDecl { name = name; type_params = tps.names; type_constraints = tps.constraints; body = ExternBody { }; vis = vis; has_doc = has_doc; doc = doc; line = name_line; col = name_col; di_kind = DiKind::None; has_di_key = false; di_key = "" }; next = p }
+        return Parsed<Decl> { node = TypeDecl { name = name; type_params = tps.names; type_constraints = tps.constraints; body = ExternBody { }; vis = vis; has_doc = has_doc; doc = doc; line = name_line; col = name_col; di_kind = DiKind::None; has_di_key = false; di_key = ""; is_unsafe = is_unsafe }; next = p }
     }
     if !is_kind_at(tokens, p, lexer::TokenKind::Assign) {
         return err_at(tokens, p, "expected '=' in a type declaration")
     }
     let body = match parse_type_body(tokens, p + 1) { Parsed<TypeBody> as x => x; error as e => return e }
-    Parsed<Decl> { node = TypeDecl { name = name; type_params = tps.names; type_constraints = tps.constraints; body = body.node; vis = vis; has_doc = has_doc; doc = doc; line = name_line; col = name_col; di_kind = DiKind::None; has_di_key = false; di_key = "" }; next = body.next }
+    Parsed<Decl> { node = TypeDecl { name = name; type_params = tps.names; type_constraints = tps.constraints; body = body.node; vis = vis; has_doc = has_doc; doc = doc; line = name_line; col = name_col; di_kind = DiKind::None; has_di_key = false; di_key = ""; is_unsafe = is_unsafe }; next = body.next }
 }
 
 // `parse_module` returns Parsed<Module> (an instance of the result.tks generic).
@@ -779,8 +816,8 @@ fn peel_leading_doc(tokens: []lexer::Token, pos: u64) -> ParsedLeadingDoc {
 fn with_outer_doc(node: Decl, has_doc: bool, doc: str) -> Decl {
     if !has_doc { return node }
     match node {
-        Function as f => Function { name = f.name; type_params = f.type_params; type_constraints = f.type_constraints; params = f.params; has_return = f.has_return; return_type = f.return_type; body = f.body; vis = f.vis; has_doc = true; doc = doc; line = f.line; col = f.col; is_test = f.is_test; is_extern = f.is_extern; c_symbol = f.c_symbol; from_lib = f.from_lib; os_guard = f.os_guard; is_intern = f.is_intern; is_abstract = f.is_abstract; is_virtual = f.is_virtual; is_override = f.is_override; has_inject = f.has_inject; injects = f.injects }
-        TypeDecl as td => TypeDecl { name = td.name; type_params = td.type_params; type_constraints = td.type_constraints; body = td.body; vis = td.vis; has_doc = true; doc = doc; line = td.line; col = td.col; di_kind = td.di_kind; has_di_key = td.has_di_key; di_key = td.di_key }
+        Function as f => Function { name = f.name; type_params = f.type_params; type_constraints = f.type_constraints; params = f.params; has_return = f.has_return; return_type = f.return_type; body = f.body; vis = f.vis; has_doc = true; doc = doc; line = f.line; col = f.col; is_test = f.is_test; is_extern = f.is_extern; c_symbol = f.c_symbol; from_lib = f.from_lib; os_guard = f.os_guard; is_intern = f.is_intern; is_abstract = f.is_abstract; is_virtual = f.is_virtual; is_override = f.is_override; has_inject = f.has_inject; injects = f.injects; is_unsafe = f.is_unsafe }
+        TypeDecl as td => TypeDecl { name = td.name; type_params = td.type_params; type_constraints = td.type_constraints; body = td.body; vis = td.vis; has_doc = true; doc = doc; line = td.line; col = td.col; di_kind = td.di_kind; has_di_key = td.has_di_key; di_key = td.di_key; is_unsafe = td.is_unsafe }
         _ => node
     }
 }
@@ -816,6 +853,7 @@ fn parse_decl(tokens: []lexer::Token, pos: u64) -> Parsed<Decl> | error {
         saw_extern = true
         k = k + 1
     }
+    if is_unsafe_modifier_at(tokens, k) { k = k + 1 }
     if is_kind_at(tokens, k, lexer::TokenKind::Fn) {
         let d = match parse_fn_decl_with_attrs(tokens, start, attrs) { Parsed<Decl> as x => x; error as e => return e }
         return Parsed<Decl> { node = with_outer_doc(d.node, outer_doc.has_doc, outer_doc.doc); next = d.next }
@@ -871,7 +909,7 @@ fn reject_fn_only_attrs_on_type(tokens: []lexer::Token, k: u64, attrs: ParsedAtt
 /** Rebuild a parsed Function with its `#inject` overlay attached (all other fields preserved). */
 fn with_fn_inject(node: Decl, has_inject: bool, injects: []InjectBinding) -> Decl {
     match node {
-        Function as f => Function { name = f.name; type_params = f.type_params; type_constraints = f.type_constraints; params = f.params; has_return = f.has_return; return_type = f.return_type; body = f.body; vis = f.vis; has_doc = f.has_doc; doc = f.doc; line = f.line; col = f.col; is_test = f.is_test; is_extern = f.is_extern; c_symbol = f.c_symbol; from_lib = f.from_lib; os_guard = f.os_guard; is_intern = f.is_intern; is_abstract = f.is_abstract; is_virtual = f.is_virtual; is_override = f.is_override; has_inject = has_inject; injects = injects }
+        Function as f => Function { name = f.name; type_params = f.type_params; type_constraints = f.type_constraints; params = f.params; has_return = f.has_return; return_type = f.return_type; body = f.body; vis = f.vis; has_doc = f.has_doc; doc = f.doc; line = f.line; col = f.col; is_test = f.is_test; is_extern = f.is_extern; c_symbol = f.c_symbol; from_lib = f.from_lib; os_guard = f.os_guard; is_intern = f.is_intern; is_abstract = f.is_abstract; is_virtual = f.is_virtual; is_override = f.is_override; has_inject = has_inject; injects = injects; is_unsafe = f.is_unsafe }
         _ => node
     }
 }
@@ -879,7 +917,7 @@ fn with_fn_inject(node: Decl, has_inject: bool, injects: []InjectBinding) -> Dec
 /** Rebuild a parsed TypeDecl with its DI lifetime annotation attached (all other fields preserved). */
 fn with_type_di(node: Decl, di_kind: DiKind, has_key: bool, key: str) -> Decl {
     match node {
-        TypeDecl as td => TypeDecl { name = td.name; type_params = td.type_params; type_constraints = td.type_constraints; body = td.body; vis = td.vis; has_doc = td.has_doc; doc = td.doc; line = td.line; col = td.col; di_kind = di_kind; has_di_key = has_key; di_key = key }
+        TypeDecl as td => TypeDecl { name = td.name; type_params = td.type_params; type_constraints = td.type_constraints; body = td.body; vis = td.vis; has_doc = td.has_doc; doc = td.doc; line = td.line; col = td.col; di_kind = di_kind; has_di_key = has_key; di_key = key; is_unsafe = td.is_unsafe }
         _ => node
     }
 }
