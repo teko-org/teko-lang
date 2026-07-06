@@ -1,0 +1,92 @@
+/**
+ * teko::collections::List<T> — a growable, reference-semantic sequence of `T` (issue #163). Unlike
+ * a fixed-size `[]T` array (a value snapshot that copies on every append), a `List<T>` is a CLASS:
+ * it has object identity, two references to the same list observe each other's mutations, and its
+ * `push`/`set`/`pop` methods mutate the SAME object in place (per the collections ruling — the
+ * growable collections are classes, not structs, and mutate through the object's own receiver).
+ *
+ * The backing store is a fixed-size `[]T` the class OWNS and re-grows: because Teko arrays are
+ * value snapshots (`teko::list::push` copy-appends), every mutation reassigns the `items` field to
+ * a freshly built array. That reassignment is the sanctioned class field-write (`self.items = …`),
+ * which the class's reference semantics make visible through every alias.
+ *
+ * Instantiate through the generic static factory `List<T>::make()` (the #254 L5 path); the element
+ * type `T` may be any type. Two distinct instantiations (`List<i64>` / `List<str>`) are covered by
+ * the `.tkt` gate and the `collections_list` regression, proving the body monomorphizes per width.
+ */
+pub type List<T> = class {
+    /** The owned backing array — reassigned to a freshly grown/shrunk copy on every mutation. */
+    intern items: []T
+
+    /**
+     * Build an empty `List<T>` — the generic static factory (`List<i64>::make()`).
+     *
+     * @return a fresh, empty `List<T>` at the caller's concrete `T`
+     */
+    pub fn make() -> List<T> { List { items = teko::list::empty() } }
+
+    /**
+     * The number of elements currently held.
+     *
+     * @return the element count
+     */
+    pub fn len(self) -> u64 { self.items.len }
+
+    /**
+     * Whether the list holds no elements.
+     *
+     * @return `true` iff `len() == 0`
+     */
+    pub fn is_empty(self) -> bool { self.items.len == 0 }
+
+    /**
+     * Append `x` to the end of the list, growing it in place (the receiver — and every alias of it —
+     * observes the new element).
+     *
+     * @param x  the element to append, of the list's concrete `T`
+     */
+    pub fn push(self, x: T) { self.items = teko::list::push(self.items, x) }
+
+    /**
+     * Read the element at index `i`. The index MUST be in `[0, len())` — an out-of-range index is a
+     * fail-loud array bounds violation (M.1: no silent clamping), exactly as a bare `[]T` index is.
+     *
+     * @param i  the zero-based index to read
+     * @return   the element at `i`
+     */
+    pub fn get(self, i: u64) -> T { self.items[i] }
+
+    /**
+     * Overwrite the element at index `i` with `x`, in place. An index at or beyond `len()` leaves the
+     * list unchanged (the value-functional rebuild simply finds no slot to replace); callers that
+     * need append semantics use `push`.
+     *
+     * @param i  the zero-based index to overwrite
+     * @param x  the replacement element
+     */
+    pub fn set(self, i: u64, x: T) { self.items = arr_replace_at(self.items, i, x) }
+
+    /**
+     * Remove the last element, shrinking the list in place. Popping an empty list is a no-op (the
+     * length stays zero); callers that must distinguish an empty pop guard on `is_empty()` first.
+     */
+    pub fn pop(self) { self.items = arr_drop_last(self.items) }
+
+    /**
+     * Remove the element at index `i`, shifting the following elements down by one, in place. An
+     * index at or beyond `len()` leaves the list unchanged.
+     *
+     * @param i  the zero-based index to remove
+     */
+    pub fn remove_at(self, i: u64) { self.items = arr_drop_at(self.items, i) }
+
+    /**
+     * A fixed-size `[]T` snapshot of the list's current contents — the door to iterate a `List<T>`
+     * with a `loop` (Teko's only loop) over `.len` and indexing, since `in` is array-only (the
+     * collections ruling: collections expose methods, not `in`). The returned array is an
+     * independent value; later mutations to the list do not change it.
+     *
+     * @return the current elements as a `[]T` value snapshot
+     */
+    pub fn to_array(self) -> []T { self.items }
+}
