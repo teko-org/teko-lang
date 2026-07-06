@@ -3980,6 +3980,25 @@ fn must_free_table(name: str) -> TypeTable {
     match collect(parser::Program { items = teko::list::push(teko::list::empty(), must_free_class_item(name)) }) { Collected as c => c.types; error => panic("must_free_table: collect failed") }
 }
 
+/**
+ * `is_must_free_name` on a name absent from the table falls through `type_table_find`'s error
+ * arm, returning `false` (an unregistered name can never be `#must_free` — the defensive `error
+ * => false` arm this exercises).
+ */
+#test
+fn is_must_free_name_unknown_name_is_false() {
+    teko::assert::is_false(is_must_free_name("NoSuchType", empty_table()))
+}
+
+/** `is_must_free_name` on a registered type WITHOUT `#must_free` is false (the ordinary
+ *  non-tracked-type case, distinct from the unknown-name case above). */
+#test
+fn is_must_free_name_plain_type_is_false() {
+    let items = teko::list::push(teko::list::empty(), fv_struct_item("Plain", teko::list::empty()))
+    let table = match collect(parser::Program { items = items }) { Collected as c => c.types; error => panic("collect failed") }
+    teko::assert::is_false(is_must_free_name("Plain", table))
+}
+
 /** A `fn(h: FileHandle) -> FileHandle { <body> }` — the tracked param is always named `h`; the
  *  return type is `FileHandle` itself so `return h` (the PARAM consume set — a param is always
  *  immutable, B.21, so it can never reach `teko::mem::free`, which requires a `mut` target; only
@@ -4018,6 +4037,22 @@ fn free_h_stmt() -> parser::Statement {
 fn must_free_param_freed_on_straight_line_is_accepted() {
     let table = must_free_table("FileHandle")
     let f = must_free_fn(teko::list::push(teko::list::empty(), return_h_stmt()))
+    match type_function(f, empty_env(), table) { TFunction => teko::assert::is_true(true); error => teko::assert::is_true(false) }
+}
+
+/**
+ * A non-consuming, non-diverging, non-branching statement (an unrelated `let`, neither a
+ * `TReturn` nor a `TExprStmt`) BEFORE the consume is skipped over cleanly — exercises
+ * `stmt_consumes_must_free`'s and `stmt_diverges_standalone`'s shared `_ => false` fallthrough,
+ * proving the scan continues past it to the real consume.
+ */
+#test
+fn must_free_param_freed_after_an_unrelated_statement_is_accepted() {
+    let table = must_free_table("FileHandle")
+    let unrelated_bind: parser::Statement = parser::Binding { kind = parser::BindKind::Let; target = parser::SimpleName { name = "n" }; has_type = false; type_ann = named_t("i64"); value = e_num(0) }
+    let unrelated_expr = st(e_num(0))
+    let body: []parser::Statement = teko::list::push(teko::list::push(teko::list::push(teko::list::empty(), unrelated_expr), unrelated_bind), return_h_stmt())
+    let f = must_free_fn(body)
     match type_function(f, empty_env(), table) { TFunction => teko::assert::is_true(true); error => teko::assert::is_true(false) }
 }
 
@@ -4126,6 +4161,38 @@ fn must_free_local_binding_freed_and_dropped() {
     match type_program(parser::Program { items = ok_items }) { TProgram => teko::assert::is_true(true); error => teko::assert::is_true(false) }
     let bad_items = teko::list::push(teko::list::push(teko::list::empty(), cls), rebind_handle_item(teko::list::empty()))
     match type_program(parser::Program { items = bad_items }) { TProgram => teko::assert::is_true(false); error => teko::assert::is_true(true) }
+}
+
+/**
+ * A `#must_free` value bound through a `DestructurePattern` target (`let { } = FileHandle::make()`)
+ * is NOT tracked (mirrors `initanalysis.tks`'s unused-local check — `type_binding` never defines
+ * destructure names, so there is nothing to bind against) — the program is accepted even though
+ * the value is never freed, exercising `check_must_free_locals_stmt`'s `DestructurePattern` arm.
+ */
+#test
+fn must_free_destructure_target_is_untracked() {
+    let cls = must_free_class_item("FileHandle")
+    let callee = parser::Path { segments = teko::list::push(teko::list::push(teko::list::empty(), parser::Segment { name = "FileHandle" }), parser::Segment { name = "make" }) }
+    let call = ek(parser::Call { callee = callee; args = teko::list::empty(); arg_names = teko::list::empty(); type_args = teko::list::empty() })
+    let bind_h = parser::Binding { kind = parser::BindKind::Let; target = parser::DestructurePattern { names = teko::list::empty() }; has_type = false; type_ann = named_t("FileHandle"); value = call }
+    let f = parser::Function { name = "destructure_handle"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = teko::list::empty(); has_return = false; return_type = named_t("i64"); body = teko::list::push(teko::list::empty(), bind_h); vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false; has_inject = false; injects = teko::list::empty(); is_unsafe = false }
+    let items = teko::list::push(teko::list::push(teko::list::empty(), cls), parser::Item { content = f; namespace = ""; file = "" })
+    match type_program(parser::Program { items = items }) { TProgram => teko::assert::is_true(true); error => teko::assert::is_true(false) }
+}
+
+/**
+ * A one-armed `if` (no `else`) embedded as a value-position statement never branches for the
+ * dataflow's purposes (`check_must_free_locals_expr`'s `!f.has_else` fallthrough) — exercised
+ * here alongside a straight-line free so the whole function still type-checks.
+ */
+#test
+fn must_free_one_armed_if_does_not_branch_the_local_check() {
+    let cls = must_free_class_item("FileHandle")
+    let cond = ek(parser::BoolLit { value = true })
+    let noelse = parser::IfExpr { cond = cond; then_blk = one_stmt(e_num(0)); has_else = false; else_blk = teko::list::empty() }
+    let extra: []parser::Statement = teko::list::push(teko::list::push(teko::list::empty(), st(ek(noelse))), free_h_stmt())
+    let items = teko::list::push(teko::list::push(teko::list::empty(), cls), rebind_handle_item(extra))
+    match type_program(parser::Program { items = items }) { TProgram => teko::assert::is_true(true); error => teko::assert::is_true(false) }
 }
 
 /**
