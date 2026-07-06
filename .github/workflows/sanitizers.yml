@@ -67,27 +67,32 @@ jobs:
           sh scripts/ci_cc_wrap.sh "-fsanitize=address,undefined -fno-omit-frame-pointer -g"
           teko . -o bin
 
-      - name: Run the gate on gen1 (ASan + UBSan + LSan)
+      # The gate is NATIVE by default (#168 memory-debt fix): the sanitized gen1 runs the #test
+      # corpus in a CHILD process (`teko . -o gen2-asan`), so the SANITIZED compiler's OWN peak stays
+      # codegen-only — no ~1.5 GB VM functional-env balloon. That is what made the VM gate (`teko
+      # test .`) OOM the 7 GB runner as the corpus grew (encodings/compress/crypto/collections):
+      # ASan amplifies the balloon ~2-3x. The native flip removes the balloon AND, as a bonus,
+      # ASan-checks the PRODUCTION native path (tk_emit_c_test → run_cc → the child test binary),
+      # which the VM gate never exercised. The child test binary inherits ASAN_OPTIONS, so a memory
+      # bug in the compiled tests still fails the lane. The #323 quarantine_size_mb + malloc_context_
+      # size CAPS are KEPT DEFENSIVELY — the arena frees a lot per #test via arena_pop, and a large
+      # freed-block quarantine + deep alloc-context stacks still cost RAM under ASan (LSan needs the
+      # quarantine bounded, not zero). detect_leaks stays 1: the native gate's own allocations must
+      # be leak-clean, with the documented process-lifetime allocations covered by the suppressions.
+      - name: Run the gate on gen1 (native, ASan + UBSan + LSan)
         env:
-          # quarantine_size_mb + malloc_context_size CAP ASan's memory: the arena frees a lot per
-          # #test via arena_pop, so ASan's default 256 MB/thread quarantine (holding freed blocks)
-          # + deep alloc-context stacks pushed the sanitized gate past the 7 GB GitHub runner as the
-          # corpus grew (encodings/compress/crypto/collections) — the runner OOM'd ("received a
-          # shutdown signal"). This is the gate-memory debt (#265/#168) amplified ~2-3x by ASan.
-          # --coverage dropped: the main build-test gate enforces the coverage floors; the ASan
-          # lane's job is memory-safety, and coverage instrumentation only adds RAM here.
           ASAN_OPTIONS: halt_on_error=1:detect_leaks=1:quarantine_size_mb=64:malloc_context_size=5
           LSAN_OPTIONS: suppressions=.github/lsan-suppressions.txt:print_suppressions=0
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
-        run: ./bin/teko test .
+        run: ./bin/teko . -o gen2-asan
 
-      # `teko test .` exercises only the VM path — the NATIVE backend (tk_emit_c /
-      # cg_lift_program / tk_emit_tsym / run_cc) never ran under ASan, which is how the
-      # lift-pass use-after-free in tk_emit_tsym (freed items list read for the .tsym map;
-      # crashed glibc builds of any project with a non-capturing lambda) shipped unseen.
-      # Build every regressions fixture natively with the SANITIZED compiler so the whole
-      # build pipeline is ASan-covered. Leak detection off: the front-end deliberately
-      # holds compiler-lifetime allocations it never frees (core.h S0 seam discipline).
+      # The native gate above already ASan-covers the whole native BUILD pipeline (tk_emit_c /
+      # cg_lift_program / tk_emit_tsym / run_cc) — that is how the lift-pass use-after-free in
+      # tk_emit_tsym (freed items list read for the .tsym map; crashed glibc builds of any project
+      # with a non-capturing lambda) would now be caught. Also build every regressions fixture
+      # natively with the SANITIZED compiler so the fixture corpus's own constructs are ASan-covered.
+      # Leak detection off: the front-end deliberately holds compiler-lifetime allocations it never
+      # frees (core.h S0 seam discipline).
       - name: Native-build regressions fixtures (ASan + UBSan)
         env:
           ASAN_OPTIONS: halt_on_error=1:detect_leaks=0

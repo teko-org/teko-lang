@@ -1,13 +1,18 @@
 name: Native Build & Test
 
-# CI runs on PULL REQUESTS ONLY. Branch protection requires these checks green before a PR
-# can merge, so every commit that reaches main was already 100% green — re-running the full
-# suite on the post-merge push would only duplicate that work and burn pipeline minutes. The
-# release trusts this and builds from a main tag WITHOUT re-validating (see release.yml).
-# chore/reboot stays listed so PRs targeting the integration branch still get checks (#54).
+# CI runs on PULL REQUESTS (the per-PR gate) plus a nightly SCHEDULE (the VM-regression lane).
+# Branch protection requires the PR checks green before a PR can merge, so every commit that
+# reaches main was already 100% green — re-running the full suite on the post-merge push would
+# only duplicate that work and burn pipeline minutes. The release trusts this and builds from a
+# main tag WITHOUT re-validating (see release.yml). chore/reboot stays listed so PRs targeting the
+# integration branch still get checks (#54). The `schedule:` trigger drives ONLY vm-gate-nightly
+# (#168): since the native gate became the default per-PR gate, the VM gate runs once nightly over
+# the full corpus to keep VM regressions caught without paying the ~1.5 GB VM-gate memory per PR.
 on:
   pull_request:
     branches: [main, master, chore/reboot]
+  schedule:
+    - cron: '0 6 * * *'
 
 # Restrict default token scope for all jobs in this workflow.
 permissions:
@@ -15,7 +20,11 @@ permissions:
 
 jobs:
   # ── path filter ──────────────────────────────────────────────────────────────
+  # PR-only: the paths-filter needs a pull_request context. On the nightly `schedule`
+  # trigger this job is skipped, so every per-PR job (needs: changes) skips too, and
+  # only vm-gate-nightly (which does NOT need changes) runs.
   changes:
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     outputs:
       run: ${{ steps.filter.outputs.run }}
@@ -77,31 +86,20 @@ jobs:
           LABEL: ${{ matrix.label }}
         run: ./scripts/ci_provision_teko.sh "$LABEL"
 
-      # The self-build gate stays VM (the DEFAULT — unchanged cost/floors; owner ruling 2026-07-05:
-      # the native gate regresses build time until #168's partitioning, so it is NOT the default).
-      - name: Test gate (VM)
+      # The self-build gate is now NATIVE by default (#168 memory-debt fix, owner "VM out of tests"
+      # ruling): `teko . -o bin` compiles the #test corpus to a binary, runs it in a CHILD process
+      # (a failed assert → non-zero exit bars this step), and enforces ALL THREE coverage floors
+      # (function/line/branch, #265 Track A) from the native run's merged marks. Because the tests
+      # run out-of-process, the compiler's own peak stays codegen-only (~940 MB here) instead of the
+      # VM gate's ~1.5 GB in-process functional-env balloon — the per-PR gate memory drop. This is
+      # ONE gate per platform (the historical VM+native double is gone); the VM gate moves to the
+      # scheduled `vm-gate-nightly` lane below. `--vm-gate` still forces the VM gate for local debug.
+      - name: Test gate (native — default since #168)
         shell: bash
         run: teko . -o bin
 
-      # (#265, opt-in) The native test gate: `teko . -o gen1-native --native-gate` emits the #test
-      # corpus to a binary, runs it (a failed assert → non-zero exit bars this step), and enforces
-      # the FUNCTION coverage floor from the native run's merged marks. This lane exercises the
-      # native codegen paths a `#test` corpus exercises for the FIRST time (cc-compiling constructs
-      # the VM interpreter tolerated) — it caught 3 latent native miscompiles pre-merge. Perf win
-      # (replacing this VM gate as the default) is deferred to #168's partitioning.
-      #
-      # UN-DOUBLE (owner ruling 2026-07-06, compile-time): this ran on EVERY platform, so each
-      # ran the #test corpus TWICE (VM + native) — the self-inflicted ~16m regression. Until the
-      # native gate is fast+complete (#168 compile-once + #265 line/branch coverage) and REPLACES
-      # the VM gate (the owner's "VM out of tests" destination), it runs on ONE platform only as
-      # the native-codegen correctness lane. The VM gate above stays the coverage-floor gate.
-      - name: Native test gate (opt-in — correctness lane, one platform)
-        if: matrix.label == 'linux-x86_64'
-        shell: bash
-        run: teko . -o gen1-native --native-gate
-
       # fmt gate (issue #229 / #282): the corpus must be in `teko fmt`'s canonical shape.
-      # Runs the JUST-BUILT gen-1 (`./bin/teko`, from the "Test gate (VM)" step above), NOT the
+      # Runs the JUST-BUILT gen-1 (`./bin/teko`, from the "Test gate (native)" step above), NOT the
       # released seed — gen-1 is built from THIS PR's sources, so it always carries the current
       # `fmt --check` CLI AND parser. Using the seed instead choked on regression fixtures that
       # exercise syntax newer than the seed (e.g. #285's doc-comment-before-field). .gitattributes
@@ -287,6 +285,39 @@ jobs:
       # caught the O2 miscompile before it ever reached a release.
       - name: Run the x86_64-glibc cross artifact over the corpus (miscompile guard)
         run: ./gd-linux-x86_64-glibc/teko . -o /tmp/xrun --no-verify
+
+  # ── nightly VM-gate lane (#168 governance) ────────────────────────────────────
+  # Since the native gate became the DEFAULT per-PR gate (#168 memory-debt fix), the VM gate no
+  # longer runs on every PR — its ~1.5 GB in-process functional-env peak was the per-PR gate
+  # memory debt. But the VM is still the dev/debug/WASM engine and must not silently regress, so
+  # `teko test .` (the full #test corpus, VM-interpreted, all three coverage floors) runs once
+  # NIGHTLY over the whole corpus. This keeps VM==native parity honest at the gate level; the
+  # per-PR diff-vm-native job already proves VM==native RELEASE parity on every PR. Runs ONLY on
+  # the schedule trigger (not on PRs), so it adds ZERO per-PR wall-clock or memory.
+  vm-gate-nightly:
+    name: VM gate (nightly regression)
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Provision teko from the latest release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./scripts/ci_provision_teko.sh linux-x86_64
+
+      - name: Build gen1 (native default gate) so the VM lane tests THIS corpus
+        shell: bash
+        run: teko . -o bin
+
+      - name: VM gate over the full corpus (teko test .)
+        shell: bash
+        run: ./bin/teko test .
 
   # ── gate: aggregates all build-test + riscv + differential + cross-smoke results ──
   gate:

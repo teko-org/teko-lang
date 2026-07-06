@@ -1402,6 +1402,33 @@ fn cg_is_arith_builtin_call(last: str, call_ns: str) -> bool {
     (last == "div" || last == "rem") && call_ns.len == 0
 }
 
+/** cg_assert_c_symbol — the C symbol for an INJECTED `teko::assert::<name>` call, or "" when the
+ *  call is not a `teko::assert::*` builtin. The injected assertions (is_true/is_false/str_contains)
+ *  are recognized by the checker as builtins WITHOUT a resolved namespace (empty call_ns), so a
+ *  standalone project that does not itself define `teko::assert` would otherwise emit the BARE last
+ *  segment (`is_true(...)`) — undeclared C, breaking the native test gate. This mirrors the VM's
+ *  `teko::assert::*` recognition (segments[0]=="teko" && segments[len-2]=="assert") and emits the
+ *  `teko__assert__<name>` symbol the assert seed (src/assert/assert.{c,h}) defines/declares, so the
+ *  native gate compiles the same assertions the VM interprets. The caller only consults this when
+ *  `call_ns` is empty; a project that DEFINES its own `teko::assert` resolves the call with a
+ *  namespace and keeps the existing resolved-user-call lowering (cb_fn_name → the same mangled
+ *  symbol), so the emitted C is byte-unchanged for the compiler's own corpus (the fixpoint is intact).
+ *
+ *  @param callee  the call's callee path (parser::Path)
+ *  @return        "teko__assert__<name>" for is_true/is_false/str_contains under teko::assert, else ""
+ *  @since #168 */
+fn cg_assert_c_symbol(callee: parser::Path) -> str {
+    let segs = callee.segments
+    if segs.len < 2 { return "" }
+    if segs[0].name != "teko" { return "" }
+    if segs[segs.len - 2].name != "assert" { return "" }
+    let last = segs[segs.len - 1].name
+    if last == "is_true" || last == "is_false" || last == "str_contains" {
+        return teko::str::concat("teko__assert__", last)
+    }
+    ""
+}
+
 // cg_prim_is_signed_int — the SIGNED integer prims (I8..I128). (type.tks: prim_is_signed.)
 fn cg_prim_is_signed_int(k: checker::PrimKind) -> bool { checker::prim_is_signed(k) }
 
@@ -2126,7 +2153,9 @@ fn emit_call(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, e: c
     if p.segments.len >= 1 {
         let last = p.segments[p.segments.len - 1].name
         let addressable = (p.segments.len == 1) || (p.segments[0].name == "teko")
-        if addressable {
+        let assert_sym = if c.call_ns.len == 0 { cg_assert_c_symbol(p) } else { "" }
+        if assert_sym.len != 0 { builtin = assert_sym; has_builtin = true }
+        else if addressable {
             if last == "print" { builtin = "tk_print"; has_builtin = true }
             else if last == "println" { builtin = "tk_println"; has_builtin = true }
             else if last == "panic" { builtin = "tk_panic_str"; has_builtin = true }   // panic(str) — diverges (no `never` type)
