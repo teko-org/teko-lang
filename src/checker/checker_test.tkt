@@ -4029,6 +4029,14 @@ fn free_h_stmt() -> parser::Statement {
     st(ek(parser::Call { callee = callee; args = args; arg_names = pos_names(1); type_args = teko::list::empty() }))
 }
 
+/** The statement `defer { teko::mem::free(h) }` — the per-scope-cleanup consume shape (arguably
+ *  THE canonical `#must_free` idiom): a defer body runs LIFO on every normal exit from its
+ *  enclosing block, so freeing the tracked handle inside one satisfies the dataflow for the
+ *  rest of that scope. */
+fn defer_free_h_stmt() -> parser::Statement {
+    parser::DeferStmt { body = teko::list::push(teko::list::empty(), free_h_stmt()) }
+}
+
 /**
  * S2 (#336) acceptance 3 (straight line): a `#must_free` param moved out via `return h` as the
  * function's ONLY statement type-checks cleanly.
@@ -4161,6 +4169,58 @@ fn must_free_local_binding_freed_and_dropped() {
     match type_program(parser::Program { items = ok_items }) { TProgram => teko::assert::is_true(true); error => teko::assert::is_true(false) }
     let bad_items = teko::list::push(teko::list::push(teko::list::empty(), cls), rebind_handle_item(teko::list::empty()))
     match type_program(parser::Program { items = bad_items }) { TProgram => teko::assert::is_true(false); error => teko::assert::is_true(true) }
+}
+
+/**
+ * The canonical `#must_free` cleanup idiom: `mut h = FileHandle::make(); defer { teko::mem::free(h) }`
+ * (no OTHER free anywhere) type-checks cleanly — a `defer` that frees the tracked handle
+ * satisfies the dataflow for the rest of the scope, since it runs on every normal exit.
+ */
+#test
+fn must_free_local_binding_freed_via_defer_is_accepted() {
+    let cls = must_free_class_item("FileHandle")
+    let items = teko::list::push(teko::list::push(teko::list::empty(), cls), rebind_handle_item(teko::list::push(teko::list::empty(), defer_free_h_stmt())))
+    match type_program(parser::Program { items = items }) { TProgram => teko::assert::is_true(true); error => teko::assert::is_true(false) }
+}
+
+/**
+ * A `defer { … }` whose body does NOT free the tracked handle (an unrelated statement inside)
+ * does not satisfy the dataflow — `h` is still dropped and this is rejected. Exercises
+ * `defer_frees`'s "scanned the whole body, found no matching free" fallthrough.
+ */
+#test
+fn must_free_defer_that_does_not_free_is_still_an_error() {
+    let cls = must_free_class_item("FileHandle")
+    let unrelated_defer: parser::Statement = parser::DeferStmt { body = one_stmt(e_num(0)) }
+    let items = teko::list::push(teko::list::push(teko::list::empty(), cls), rebind_handle_item(teko::list::push(teko::list::empty(), unrelated_defer)))
+    match type_program(parser::Program { items = items }) { TProgram => teko::assert::is_true(false); error => teko::assert::is_true(true) }
+}
+
+/**
+ * DOCUMENTED FIRST-CUT BOUND (`docs/design/memory-unsafe-backend-remodel.md` §5a) — PINNED, not
+ * fixed: a `#must_free` local declared and dropped INSIDE a `loop { }` body compiles CLEAN
+ * today. The dataflow never recurses into a `TLoopStmt`'s body (`must_free_consumed_on_all_paths`
+ * only walks straight-line statements and `if`/`match` branches reached from a binding's own
+ * declaration point), so `loop { let h = FileHandle::make(); break }` — never freed — is
+ * currently accepted. This test asserts the CURRENT behavior so the hole is pinned (a visible,
+ * intentional regression test) rather than silently relied upon; closing it is a scope WIDENING
+ * (loop-body-aware walking), explicitly out of this issue's first-cut scope. `read_h` (`let _ =
+ * h`) is a harmless READ that satisfies the UNRELATED unused-local check (`initanalysis.tks`)
+ * without itself being a consume, so this test isolates the must_free loop-body gap alone.
+ */
+#test
+fn must_free_dropped_inside_a_loop_body_is_not_caught_documented_gap() {
+    let cls = must_free_class_item("FileHandle")
+    let callee = parser::Path { segments = teko::list::push(teko::list::push(teko::list::empty(), parser::Segment { name = "FileHandle" }), parser::Segment { name = "make" }) }
+    let call = ek(parser::Call { callee = callee; args = teko::list::empty(); arg_names = teko::list::empty(); type_args = teko::list::empty() })
+    let bind_h: parser::Statement = parser::Binding { kind = parser::BindKind::Mut; target = parser::SimpleName { name = "h" }; has_type = false; type_ann = named_t("FileHandle"); value = call }
+    let read_h: parser::Statement = parser::Binding { kind = parser::BindKind::Let; target = parser::SimpleName { name = "_" }; has_type = false; type_ann = named_t("FileHandle"); value = e_var("h") }
+    let brk: parser::Statement = parser::BreakStmt { label = "" }
+    let loop_body: []parser::Statement = teko::list::push(teko::list::push(teko::list::push(teko::list::empty(), bind_h), read_h), brk)
+    let body: []parser::Statement = teko::list::push(teko::list::push(teko::list::empty(), loop_stmt(loop_body)), ret_stmt(e_num(0)))
+    let f = parser::Function { name = "leaks_inside_a_loop"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = teko::list::empty(); has_return = true; return_type = named_t("i64"); body = body; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false; has_inject = false; injects = teko::list::empty(); is_unsafe = false }
+    let items = teko::list::push(teko::list::push(teko::list::empty(), cls), parser::Item { content = f; namespace = ""; file = "" })
+    match type_program(parser::Program { items = items }) { TProgram => teko::assert::is_true(true); error => teko::assert::is_true(false) }
 }
 
 /**

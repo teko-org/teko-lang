@@ -2188,23 +2188,32 @@ fn tblock_diverges(stmts: []TStatement) -> bool {
  * falling off the block's end? The DUAL of `tblock_diverges` (which asks "does every path exit
  * before falling off the end?"; this asks "does every path either consume `name` or exit
  * WITHOUT falling off the end unconsumed?"). Consumed = reaches `teko::mem::free(name)` (the
- * exact call `type_mem_free` recognizes, `call_ns == "teko::mem"`) OR is moved out via
- * `return name` (the first-cut consume set — a follow-up may widen this to a general
- * move-tracking pass, per the design's accepted conservative-over-rejection tax). A path that
- * DIVERGES (`break`/`continue`/a trailing `panic`/`exit` call) before reaching the block's end
- * never drops the value, so it needs no consume — but a bare `return <something-else>` is NOT
- * treated as divergence here (unlike `tblock_diverges`'s own primitive, which cares only about
- * "does this block yield a trailing value"): a return of anything OTHER than the tracked name
- * abandons the value just as surely as falling off the end does, so it is checked for
- * CONSUMPTION first (`stmt_consumes_must_free`), and only genuinely-diverging statements are
- * exempted. `from` lets a binding declared PARTWAY through a block be checked only over its OWN
- * remaining scope (the statements after its own `TBinding`), never over statements that precede
- * its declaration.
+ * exact call `type_mem_free` recognizes, `call_ns == "teko::mem"`), is moved out via `return
+ * name`, or is freed inside a `defer { … }` block (`stmt_consumes_must_free` — a `defer` runs
+ * LIFO on every normal exit from its enclosing block, so freeing `name` inside one satisfies the
+ * rest of the scope exactly as an inline free would; this is arguably THE canonical `#must_free`
+ * idiom: `mut h = make(); defer { mem::free(h) }`). This is the first-cut consume set — a
+ * follow-up may widen it to a general move-tracking pass, per the design's accepted
+ * conservative-over-rejection tax (see the bounds below). A path that DIVERGES
+ * (`break`/`continue`/a trailing `panic`/`exit` call) before reaching the block's end never
+ * drops the value, so it needs no consume — but a bare `return <something-else>` is NOT treated
+ * as divergence here (unlike `tblock_diverges`'s own primitive, which cares only about "does
+ * this block yield a trailing value"): a return of anything OTHER than the tracked name abandons
+ * the value just as surely as falling off the end does, so it is checked for CONSUMPTION first
+ * (`stmt_consumes_must_free`), and only genuinely-diverging statements are exempted. `from` lets
+ * a binding declared PARTWAY through a block be checked only over its OWN remaining scope (the
+ * statements after its own `TBinding`), never over statements that precede its declaration.
  *
- * HONEST BOUND (mirrors the note at `type_mem_free`, `docs/design/memory-unsafe-backend-remodel.md`
- * §5): this is a LOCAL, PER-BINDING dataflow — it has no points-to/uniqueness fact, so it catches
- * only the SILENT-LEAK case (a `#must_free` value dropped on some path). It is powerless against
- * the ALIASED-FREE use-after-free (`y = x; free(x); use(y)`), which still needs the spine (L1).
+ * HONEST BOUNDS (`docs/design/memory-unsafe-backend-remodel.md` §5a — read it alongside the
+ * `mem::free` aliased-UAF note at §5/`type_mem_free`): this is a LOCAL, PER-BINDING dataflow — it
+ * has no points-to/uniqueness fact, so it catches only the SILENT-LEAK case (a `#must_free`
+ * value dropped on some path). It is powerless against (1) the ALIASED-FREE use-after-free (`y =
+ * x; free(x); use(y)`), (2) a `#must_free` binding declared INSIDE a `loop { }` body (never
+ * walked — see `stmt_diverges_standalone`'s coverage note), (3) a PARAM consumed any way other
+ * than `return name` (a param is immutable, B.21, so `mem::free` never applies to one; consuming
+ * it by passing it to a callee needs move-tracking), and (4) reassigning a `mut` local before its
+ * PRIOR value was freed (`mut h = make(); h = make()` leaks the first `h`) — all four need the
+ * spine's general move/points-to tracking (`#331`), not this local check's.
  *
  * @param stmts  the typed statement block to walk (a function body, or an if/match branch)
  * @param from   the index to start walking from (0 for a param; a binding's own index + 1 for a local)
@@ -2236,10 +2245,11 @@ fn must_free_consumed_on_all_paths(stmts: []TStatement, from: u64, name: str) ->
  *
  * COVERAGE NOTE: the `TBreakStmt`/`TContinueStmt` arms are genuinely unreachable from the
  * current call graph — `must_free_consumed_on_all_paths` never recurses into a `TLoopStmt`'s
- * body (loop bodies are out of this local dataflow's first-cut scope, matching the design's "no
- * loop modeling" bound), so a `break`/`continue` can never actually reach this function today.
- * They are included for FORWARD COMPATIBILITY (a future loop-body-aware widening would need
- * them immediately) and because they are the semantically-correct answer, not dead weight.
+ * body (a documented first-cut bound: a `#must_free` binding declared INSIDE a `loop { }` is not
+ * checked at all today — see `docs/design/memory-unsafe-backend-remodel.md` §5a), so a
+ * `break`/`continue` can never actually reach this function today. They are included for
+ * FORWARD COMPATIBILITY (a future loop-body-aware widening would need them immediately) and
+ * because they are the semantically-correct answer, not dead weight.
  *
  * @param s  the typed statement to test
  * @return   true iff this statement alone diverges (never falls through) without a `return`
@@ -2254,9 +2264,15 @@ fn stmt_diverges_standalone(s: TStatement) -> bool {
 }
 
 /**
- * Does this ONE statement itself CONSUME the tracked `#must_free` binding `name` — either a
- * `teko::mem::free(name)` call (a bare expression-statement) or `return name` (a `TReturn` whose
- * value is exactly the tracked variable)?
+ * Does this ONE statement itself CONSUME the tracked `#must_free` binding `name` — a
+ * `teko::mem::free(name)` call (a bare expression-statement), `return name` (a `TReturn` whose
+ * value is exactly the tracked variable), or a `defer { … }` block whose body frees `name`
+ * (`defer_frees`)? A `defer` runs LIFO on EVERY normal exit from its enclosing block (the
+ * per-scope cleanup idiom — this is arguably THE canonical `#must_free` pattern: `mut h =
+ * make(); defer { mem::free(h) }`), so once such a defer is seen, `name` is satisfied for the
+ * rest of that scope exactly as if it had been freed on the spot — a later explicit
+ * `mem::free(name)` would in fact double-free, but that is the EXISTING `mem::free` immutable-
+ * binding-scrub story (out of this dataflow's scope), not a new gap this consume introduces.
  *
  * @param s     the typed statement to test
  * @param name  the tracked `#must_free` binding/param's name
@@ -2266,8 +2282,29 @@ fn stmt_consumes_must_free(s: TStatement, name: str) -> bool {
     match s {
         TReturn as r => r.has_value && texpr_is_must_free_var(r.value, name)
         TExprStmt as es => texpr_is_mem_free_call(es.expr, name)
+        TDeferStmt as d => defer_frees(d.body, name)
         _ => false
     }
+}
+
+/**
+ * Does a `defer { … }` block's body contain a `teko::mem::free(name)` call — anywhere among its
+ * (flat, non-nested — nested `defer` is checker-rejected) statements? A defer body is typed in
+ * void context as a plain statement list, so this is a direct scan (no branch/divergence
+ * reasoning needed — the defer body always runs to completion once entered).
+ *
+ * @param body  the defer block's typed statements
+ * @param name  the tracked `#must_free` binding/param's name
+ * @return      true iff any statement in `body` is `teko::mem::free(name)`
+ */
+fn defer_frees(body: []TStatement, name: str) -> bool {
+    mut i = 0
+    loop {
+        if i >= body.len { break }
+        match body[i] { TExprStmt as es => { if texpr_is_mem_free_call(es.expr, name) { return true } }; _ => { } }
+        i++
+    }
+    false
 }
 
 /**
@@ -2484,6 +2521,12 @@ fn check_must_free_locals_expr(e: TExpr, table: TypeTable) -> error? {
  * (`must_free_consumed_on_all_paths`) on every path reachable from its own declaration point —
  * params from the whole body, locals from their own declaring block onward. Returns the FIRST
  * dropped-path error found (fail-fast, mirrors every other checker pass).
+ *
+ * HONEST BOUNDS: see `must_free_consumed_on_all_paths`'s doc-comment and
+ * `docs/design/memory-unsafe-backend-remodel.md` §5a — this pass does not walk loop bodies, does
+ * not track a param consumed any way other than `return`, does not track a `mut` local
+ * reassigned before its prior value was freed, and `#must_free` itself is not yet serialized in
+ * the `.tkb` codec (module-local today).
  *
  * @param f      the parsed function (for param collection + the position fallback)
  * @param tbl    the fn's type table (extended with its own generic type-params)
