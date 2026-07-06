@@ -427,3 +427,27 @@ pub fn flush_write(write: WriteFn, state: Ref<BufWriterState>) -> u64 | error {
     state.value = BufWriterState { pending = Buf::empty() }
     flushed
 }
+
+/**
+ * Fan every write out to TWO sinks — the tee combinator (IO0's missing piece). Each
+ * incoming region is offered to `primary` then `secondary`; the reported progress is the
+ * SMALLER of the two accepted counts, so a `write_all` driver keeps looping until both
+ * sinks have drained the whole region (M.1 fail-loud — a lagging sink is never dropped).
+ * A sink error aborts the tee with that error.
+ *
+ * @param primary    the first sink (e.g. the real destination)
+ * @param secondary  the second sink (e.g. a hash/audit/log sink)
+ * @return           a WriteFn that mirrors each write into both sinks
+ * @throws           the `error` a sink returns, propagated verbatim (aborts the tee)
+ * @see              copy — the usual driver for a tee'd sink
+ * @since IO0
+ */
+pub fn tee_write_fn(primary: WriteFn, secondary: WriteFn) -> WriteFn {
+    let teed: WriteFn = (from: Buf) => {
+        let a = match primary(from) { u64 as n => n; error as e => return e }
+        let b = match secondary(from) { u64 as n => n; error as e => return e }
+        if a <= b { return a }
+        b
+    }
+    teed
+}

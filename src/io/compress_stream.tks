@@ -1,0 +1,85 @@
+/**
+ * A `WriteFn` sink that accumulates every write into a caller-owned MemWriter; `zip_seal`
+ * turns the accumulated bytes into a single-entry ZIP-STORE archive under `name`. Honest
+ * naming: this is ZIP-STORE (method 0, lossless, no compression), NOT gzip — there is no
+ * DEFLATE in `teko::compress` yet (reported up as a separate compress roadmap item). The
+ * write side consumes value Bufs, so it composes over `teko::io`'s existing combinators TODAY.
+ *
+ * @param acc  the caller-owned byte accumulator advanced on each write
+ * @return     a WriteFn appending each region to `acc`
+ * @see        zip_seal — seals the accumulated bytes into an archive
+ * @since IO1
+ */
+pub fn zip_writer(acc: Ref<MemWriter>) -> WriteFn {
+    let lifted: WriteFn = (from: Buf) => {
+        let step = acc.value.write_step(from)
+        acc.value = step.writer
+        step.written
+    }
+    lifted
+}
+
+/**
+ * Seal a `zip_writer`'s accumulated bytes into a one-entry ZIP-STORE archive under `name`.
+ * The returned Buf is the raw archive bytes (a `.tkl`/`.zip` payload) ready to write to disk.
+ *
+ * @param name  the entry name to store the bytes under
+ * @param acc   the accumulator holding the payload bytes
+ * @return      the ZIP-STORE archive as a Buf
+ * @since IO1
+ */
+pub fn zip_seal(name: str, acc: Ref<MemWriter>) -> Buf {
+    let entry = teko::compress::ZipEntry { name = name; data = acc.value.content().bytes() }
+    let archive = teko::compress::write_zip([entry])
+    Buf::from_bytes(archive)
+}
+
+/**
+ * The one-shot cursor for a ZIP-STORE `ReadFn` — flips once the extracted entry has been
+ * yielded.
+ *
+ * @param delivered  whether the entry's bytes have already been handed out
+ * @since IO1
+ */
+pub type ZipReadCursor = struct { delivered: bool }
+
+/**
+ * Open a ZIP-STORE archive and expose its FIRST entry's data as a one-shot `ReadFn`: the
+ * first pull decodes the archive and yields the whole entry as one Buf (or the decode error,
+ * threaded through the ReadFn's own `Buf | error` result), every later pull yields EOF.
+ * Returning a plain `ReadFn` — not a `ReadFn | error` — is deliberate: a variant whose arm is
+ * a function type is not lowerable by codegen yet, so the decode error rides the ReadFn's
+ * existing `Buf | error` channel instead. Mirrors `file_read_fn`'s whole-buffer-into-the-seam
+ * shape (true streaming decompression waits on the arena Buf half).
+ *
+ * @param archive  the raw archive bytes
+ * @param cur      the caller-owned one-shot cursor (`ZipReadCursor { delivered = false }`)
+ * @return         a ReadFn yielding the first entry's bytes (or the decode error) once, then EOF
+ * @since IO1
+ */
+pub fn zip_reader(archive: Buf, cur: Ref<ZipReadCursor>) -> ReadFn {
+    let reader: ReadFn = (max: u64) => {
+        if cur.value.delivered { return Buf::empty() }
+        cur.value = ZipReadCursor { delivered = true }
+        first_entry_buf(archive)
+    }
+    reader
+}
+
+/**
+ * Decode a ZIP-STORE archive and return its first entry's data as a Buf, or an `error` on a
+ * malformed or empty archive. Extracted so `zip_reader`'s closure stays a single expression.
+ *
+ * @param archive  the raw archive bytes
+ * @return         the first entry's payload, or an `error`
+ * @throws         the `read_zip` error on malformed data, or an empty-archive error
+ * @since IO1
+ */
+fn first_entry_buf(archive: Buf) -> Buf | error {
+    let entries = match teko::compress::read_zip(archive.bytes()) {
+        []teko::compress::ZipEntry as e => e
+        error as e => return e
+    }
+    if entries.len == 0 { return error { message = "io::zip_reader: archive has no entries" } }
+    Buf::from_bytes(entries[0].data)
+}

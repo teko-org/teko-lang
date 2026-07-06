@@ -1,0 +1,302 @@
+/**
+ * The 0-based cursor over an `over_array` source. Caller-owned (MEM-1b-ii): a `mut` local
+ * threaded into the source through a `Ref`, so the position survives across pulls.
+ *
+ * @param pos  the index of the next element to yield
+ * @since ITER0
+ */
+pub type ArrayCursor = struct { pos: u64 }
+
+/**
+ * Iterate an i64 slice front-to-back. Each pull yields the element at the cursor and
+ * advances it; `null` once the slice is exhausted.
+ *
+ * @param xs   the backing slice (read-only — never mutated)
+ * @param cur  the caller-owned position cursor, advanced on each pull
+ * @return     an IntIter over `xs` in order
+ * @example    mut c = ArrayCursor { pos = 0 }; over_array([1, 2, 3], c)
+ * @since ITER0
+ */
+pub fn over_array(xs: []i64, cur: Ref<ArrayCursor>) -> IntIter {
+    let it: IntIter = () => {
+        if cur.value.pos >= xs.len { return null }
+        let v = xs[cur.value.pos]
+        cur.value = ArrayCursor { pos = cur.value.pos + 1 }
+        v
+    }
+    it
+}
+
+/**
+ * The half-open cursor over a `range` source: the next value to yield and the exclusive
+ * upper bound. Caller-owned so the sequence advances across pulls.
+ *
+ * @param next  the next integer to yield
+ * @param hi    the exclusive upper bound — `range` stops once `next >= hi`
+ * @since ITER0
+ */
+pub type RangeCursor = struct { next: i64; hi: i64 }
+
+/**
+ * Iterate the half-open integer range `[cur.next, cur.hi)`. Each pull yields the current
+ * value and advances the cursor; `null` once the bound is reached.
+ *
+ * @param cur  the caller-owned range cursor (`RangeCursor { next = lo; hi = hi }`)
+ * @return     an IntIter over the half-open range
+ * @example    mut c = RangeCursor { next = 0; hi = 3 }; range(c) yields 0, 1, 2
+ * @since ITER0
+ */
+pub fn range(cur: Ref<RangeCursor>) -> IntIter {
+    let it: IntIter = () => {
+        if cur.value.next >= cur.value.hi { return null }
+        let v = cur.value.next
+        cur.value = RangeCursor { next = v + 1; hi = cur.value.hi }
+        v
+    }
+    it
+}
+
+/**
+ * A single-element iterator: yields `v` once, then `null` forever. Caller-owned emitted
+ * flag so the one element is delivered exactly once.
+ *
+ * @param v     the sole element
+ * @param cur   the caller-owned once cursor (`OnceCursor { emitted = false }`)
+ * @return      an IntIter yielding `v` exactly once
+ * @since ITER0
+ */
+pub fn once(v: i64, cur: Ref<OnceCursor>) -> IntIter {
+    let it: IntIter = () => {
+        if cur.value.emitted { return null }
+        cur.value = OnceCursor { emitted = true }
+        v
+    }
+    it
+}
+
+/**
+ * The one-shot cursor for `once` — flips to `emitted` after the single element is yielded.
+ *
+ * @param emitted  whether the element has already been delivered
+ * @since ITER0
+ */
+pub type OnceCursor = struct { emitted: bool }
+
+/**
+ * The empty iterator: yields `null` immediately and forever. Stateless (nothing to advance).
+ *
+ * @return  an IntIter with no elements
+ * @since ITER0
+ */
+pub fn empty() -> IntIter {
+    let it: IntIter = () => null
+    it
+}
+
+/**
+ * Lazily map each element through `f` — the classic transform adapter. Nothing runs until a
+ * terminal drives the returned iterator; `f` is called at most once per pulled element (the
+ * laziness the `.tkt` asserts). The source is advanced in lockstep as the result is pulled;
+ * `map` holds no state of its own, so it needs no cursor.
+ *
+ * @param src  the upstream i64 iterator
+ * @param f    the per-element transform
+ * @return     a lazy IntIter yielding `f(x)` for each upstream `x`, `null` at exhaustion
+ * @example    map(range(rc), (x: i64) => x * 10) yields the upstream scaled by ten
+ * @since ITER0
+ */
+pub fn map(src: IntIter, f: (i64) -> i64) -> IntIter {
+    let mapped: IntIter = () => {
+        let nx = src()
+        match nx {
+            i64 as v => f(v)
+            null => null
+        }
+    }
+    mapped
+}
+
+/**
+ * Lazily keep only the elements for which `keep` holds. Each pull advances the source until
+ * a kept element is found or the source is exhausted; `filter` holds no state of its own.
+ *
+ * @param src   the upstream i64 iterator
+ * @param keep  the predicate an element must satisfy to be yielded
+ * @return      a lazy IntIter of the surviving elements, `null` at exhaustion
+ * @example     filter(range(rc), (x: i64) => x % 2 == 0) yields the even elements
+ * @since ITER0
+ */
+pub fn filter(src: IntIter, keep: (i64) -> bool) -> IntIter {
+    let filtered: IntIter = () => {
+        mut result: i64? = null
+        loop {
+            let nx = src()
+            match nx {
+                i64 as v => {
+                    if keep(v) { result = v; break }
+                }
+                null => break
+            }
+        }
+        result
+    }
+    filtered
+}
+
+/**
+ * The remaining-count cursor for `take` — decremented on each yielded element.
+ *
+ * @param left  how many more elements `take` may yield before reporting exhaustion
+ * @since ITER0
+ */
+pub type TakeCursor = struct { left: i64 }
+
+/**
+ * Yield at most `cur.left` elements from the source, then report exhaustion — WITHOUT
+ * pulling the source any further (the laziness cap the `.tkt` proves). Threads the remaining
+ * count through the caller-owned cursor.
+ *
+ * @param src  the upstream i64 iterator
+ * @param cur  the caller-owned remaining-count cursor (`TakeCursor { left = n }`)
+ * @return     a lazy IntIter of at most `n` leading elements
+ * @example    take(range(rc), tc) with tc = TakeCursor { left = 3 }
+ * @since ITER0
+ */
+pub fn take(src: IntIter, cur: Ref<TakeCursor>) -> IntIter {
+    let taken: IntIter = () => {
+        if cur.value.left <= 0 { return null }
+        let nx = src()
+        match nx {
+            i64 as v => { cur.value = TakeCursor { left = cur.value.left - 1 }; v }
+            null => null
+        }
+    }
+    taken
+}
+
+/**
+ * The remaining-to-drop cursor for `skip` — decremented as leading elements are discarded.
+ *
+ * @param left  how many more leading elements `skip` must still discard
+ * @since ITER0
+ */
+pub type SkipCursor = struct { left: i64 }
+
+/**
+ * Discard the first `cur.left` elements, then pass the rest through unchanged. The drop
+ * happens on the first pull (the cursor drives it); afterwards each pull forwards the source
+ * directly.
+ *
+ * @param src  the upstream i64 iterator
+ * @param cur  the caller-owned remaining-to-drop cursor (`SkipCursor { left = n }`)
+ * @return     a lazy IntIter over the source with its first `n` elements dropped
+ * @example    skip(range(rc), sc) with sc = SkipCursor { left = 2 }
+ * @since ITER0
+ */
+pub fn skip(src: IntIter, cur: Ref<SkipCursor>) -> IntIter {
+    let skipped: IntIter = () => {
+        loop {
+            if cur.value.left <= 0 { break }
+            let dropped = src()
+            match dropped {
+                i64 => cur.value = SkipCursor { left = cur.value.left - 1 }
+                null => { cur.value = SkipCursor { left = 0 }; return null }
+            }
+        }
+        src()
+    }
+    skipped
+}
+
+/**
+ * The running-index cursor for `enumerate` — incremented for each element paired.
+ *
+ * @param index  the 0-based index the next element will be tagged with
+ * @since ITER0
+ */
+pub type EnumCursor = struct { index: i64 }
+
+/**
+ * Pair each element with its 0-based index. Threads the running index through the
+ * caller-owned cursor; `null` once the source is exhausted.
+ *
+ * @param src  the upstream i64 iterator
+ * @param cur  the caller-owned index cursor (`EnumCursor { index = 0 }`)
+ * @return     a lazy iterator of `IntIndexed { index; value }`
+ * @example    enumerate(over_array(xs, ac), ec) yields (0, xs[0]), (1, xs[1]), …
+ * @since ITER0
+ */
+pub fn enumerate(src: IntIter, cur: Ref<EnumCursor>) -> IntIndexedIter {
+    let en: IntIndexedIter = () => {
+        let nx = src()
+        match nx {
+            i64 as v => {
+                let out = IntIndexed { index = cur.value.index; value = v }
+                cur.value = EnumCursor { index = cur.value.index + 1 }
+                out
+            }
+            null => null
+        }
+    }
+    en
+}
+
+/**
+ * Pair elements from two iterators, stopping at the SHORTER (the first to yield `null`).
+ * Stateless — each pull advances both sources once.
+ *
+ * @param a  the first i64 iterator (its element becomes `first`)
+ * @param b  the second i64 iterator (its element becomes `second`)
+ * @return   a lazy iterator of `IntPair { first; second }`, `null` when either is exhausted
+ * @example  zip(range(ra), range(rb))
+ * @since ITER0
+ */
+pub fn zip(a: IntIter, b: IntIter) -> IntPairIter {
+    let z: IntPairIter = () => {
+        let na = a()
+        match na {
+            i64 as x => {
+                let nb = b()
+                match nb {
+                    i64 as y => IntPair { first = x; second = y }
+                    null => null
+                }
+            }
+            null => null
+        }
+    }
+    z
+}
+
+/**
+ * The which-source cursor for `chain` — flips once the first iterator is exhausted.
+ *
+ * @param first_done  whether the first iterator has already yielded `null`
+ * @since ITER0
+ */
+pub type ChainCursor = struct { first_done: bool }
+
+/**
+ * Concatenate two iterators: yield every element of `a`, then every element of `b`. Threads
+ * the which-source flag through the caller-owned cursor so the switch happens exactly once.
+ *
+ * @param a    the first i64 iterator (drained first)
+ * @param b    the second i64 iterator (drained after `a`)
+ * @param cur  the caller-owned which-source cursor (`ChainCursor { first_done = false }`)
+ * @return     a lazy IntIter over `a` followed by `b`
+ * @example    chain(range(ra), range(rb), cc)
+ * @since ITER0
+ */
+pub fn chain(a: IntIter, b: IntIter, cur: Ref<ChainCursor>) -> IntIter {
+    let ch: IntIter = () => {
+        if cur.value.first_done == false {
+            let na = a()
+            match na {
+                i64 as x => return x
+                null => cur.value = ChainCursor { first_done = true }
+            }
+        }
+        b()
+    }
+    ch
+}

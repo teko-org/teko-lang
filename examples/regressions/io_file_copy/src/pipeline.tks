@@ -1,0 +1,335 @@
+/**
+ * Slurp a file as UTF-8 bytes — re-declared here because a standalone project cannot see the
+ * compiler corpus's `teko::io` namespace (stdlib distribution arrives with packages). Binds
+ * the same runtime symbol the corpus `teko::io::read_file` does.
+ *
+ * @param path  the file to read
+ * @return      the file contents as a str, or an error on failure
+ * @throws      the runtime read error (missing file, permissions, …)
+ * @since IO1
+ */
+pub extern fn read_file(path: str) -> str | error = "tk_rt_read_file" from "teko_rt"
+
+/**
+ * Write raw bytes to a file — the corpus `teko::io::write_file_bytes` twin.
+ *
+ * @param path  the destination file
+ * @param data  the bytes to write
+ * @return      null on success, or the write error
+ * @throws      the runtime write error
+ * @since IO1
+ */
+pub extern fn write_file_bytes(path: str, data: []byte) -> error? = "tk_rt_write_file_bytes" from "teko_rt"
+
+/**
+ * A byte region — a value-functional snapshot (growing returns a NEW region). Self-contained
+ * twin of `teko::io::Buf`.
+ *
+ * @param data  the immutable byte snapshot this region views
+ * @since IO1
+ */
+pub type Buf = struct {
+    data: []byte
+
+    /**
+     * The empty region.
+     *
+     * @return  a Buf with no bytes
+     */
+    fn empty() -> Buf { Buf { data = teko::list::empty() } }
+
+    /**
+     * Wrap an existing byte slice (no copy — a read-only view plus value ops).
+     *
+     * @param bytes  the backing slice
+     * @return       a Buf viewing `bytes`
+     */
+    fn from_bytes(bytes: []byte) -> Buf { Buf { data = bytes } }
+
+    /**
+     * The UTF-8 bytes of a str.
+     *
+     * @param s  the source string
+     * @return   a Buf of `s`'s UTF-8 bytes
+     */
+    fn from_str(s: str) -> Buf { Buf { data = bytes_of_str(s) } }
+
+    /**
+     * The number of bytes in the region.
+     *
+     * @param self  the region
+     * @return      its byte length
+     */
+    fn len(self) -> u64 { self.data.len }
+
+    /**
+     * The region's raw bytes.
+     *
+     * @param self  the region
+     * @return      the backing slice
+     */
+    fn bytes(self) -> []byte { self.data }
+
+    /**
+     * Append another region — returns the combined region (the receiver is unchanged).
+     *
+     * @param self   the region
+     * @param other  the region to append
+     * @return       the concatenation
+     */
+    fn concat(self, other: Buf) -> Buf {
+        mut grown = self.data
+        mut i: u64 = 0
+        loop {
+            if i >= other.data.len { break }
+            grown = teko::list::push(grown, other.data[i])
+            i++
+        }
+        Buf { data = grown }
+    }
+
+    /**
+     * The half-open sub-region `[from, to)` — out-of-range bounds are an error.
+     *
+     * @param self  the region
+     * @param from  the inclusive start index
+     * @param to    the exclusive end index
+     * @return      the sub-region, or an error on a bad range
+     * @throws      when `from > to` or `to` exceeds the length
+     */
+    fn slice(self, from: u64, to: u64) -> Buf | error {
+        if from > to { return error { message = "Buf::slice: from > to" } }
+        if to > self.data.len { return error { message = "Buf::slice: out of bounds" } }
+        mut out: []byte = teko::list::empty()
+        mut i = from
+        loop {
+            if i >= to { break }
+            out = teko::list::push(out, self.data[i])
+            i++
+        }
+        Buf { data = out }
+    }
+}
+
+/**
+ * One write step: the grown writer plus the count accepted. Value-threading (B.7).
+ *
+ * @param writer   the advanced writer
+ * @param written  how many bytes this step accepted
+ * @since IO1
+ */
+pub type WriteStep = struct { writer: MemWriter; written: u64 }
+
+/**
+ * An in-memory byte accumulator — a value (each step returns the advanced writer).
+ *
+ * @param buf  the bytes accumulated so far
+ * @since IO1
+ */
+pub type MemWriter = struct {
+    buf: Buf
+
+    /**
+     * An empty in-memory sink.
+     *
+     * @return  a MemWriter with no bytes
+     */
+    fn empty() -> MemWriter { MemWriter { buf = Buf::empty() } }
+
+    /**
+     * Append `from` — a memory sink accepts the whole region.
+     *
+     * @param self  the sink
+     * @param from  the region to append
+     * @return      the write step (grown sink + count)
+     */
+    fn write_step(self, from: Buf) -> WriteStep {
+        WriteStep { writer = MemWriter { buf = self.buf.concat(from) }; written = from.len() }
+    }
+
+    /**
+     * Everything written so far.
+     *
+     * @param self  the sink
+     * @return      the accumulated region
+     */
+    fn content(self) -> Buf { self.buf }
+}
+
+/**
+ * A stateful read closure: `read(max)` yields the next chunk (an EMPTY Buf = EOF), or an
+ * error. Self-contained twin of `teko::io::ReadFn`.
+ *
+ * @since IO1
+ */
+pub type ReadFn = (u64) -> Buf | error
+
+/**
+ * A stateful write closure: `write(from)` reports how many bytes it accepted, or an error.
+ *
+ * @since IO1
+ */
+pub type WriteFn = (Buf) -> u64 | error
+
+/**
+ * The one-shot cursor for a whole-buffer ReadFn — flips once the buffer has been yielded.
+ *
+ * @param delivered  whether the buffer's bytes have already been handed out
+ * @since IO1
+ */
+pub type OnceCursor = struct { delivered: bool }
+
+/**
+ * Lift a file's whole contents into a `ReadFn`: the first pull reads `path` and yields it as
+ * one Buf (or the read error via the ReadFn's own `Buf | error` channel), then EOF. Threads
+ * the one-shot flag through the caller-owned cursor.
+ *
+ * @param path  the file to read on the first pull
+ * @param cur   the caller-owned one-shot cursor
+ * @return      a ReadFn over the file
+ * @since IO1
+ */
+pub fn file_read_fn(path: str, cur: Ref<OnceCursor>) -> ReadFn {
+    let reader: ReadFn = (max: u64) => {
+        if cur.value.delivered { return Buf::empty() }
+        cur.value = OnceCursor { delivered = true }
+        match read_file(path) {
+            str as s => Buf::from_str(s)
+            error as e => e
+        }
+    }
+    reader
+}
+
+/**
+ * A `WriteFn` sink accumulating every write into a caller-owned MemWriter.
+ *
+ * @param sink  the caller-owned accumulator advanced on each write
+ * @return      a WriteFn appending each region to `sink`
+ * @since IO1
+ */
+pub fn mem_write_fn(sink: Ref<MemWriter>) -> WriteFn {
+    let lifted: WriteFn = (from: Buf) => {
+        let step = sink.value.write_step(from)
+        sink.value = step.writer
+        step.written
+    }
+    lifted
+}
+
+/**
+ * Write ALL of `from`, looping while the writer takes partial counts. A writer reporting no
+ * progress, or more than offered, is an error (fail-loud).
+ *
+ * @param write  the sink to drain into
+ * @param from   the region to write completely
+ * @return       the total bytes written, or an error
+ * @throws       when the writer stalls or over-reports, or the sink itself errors
+ * @since IO1
+ */
+pub fn write_all(write: WriteFn, from: Buf) -> u64 | error {
+    mut remaining = from
+    mut total: u64 = 0
+    loop {
+        if remaining.len() == 0 { break }
+        let taken = match write(remaining) { u64 as n => n; error as e => return e }
+        if taken == 0 { return error { message = "write_all: no progress" } }
+        if taken > remaining.len() { return error { message = "write_all: over-report" } }
+        remaining = match remaining.slice(taken, remaining.len()) {
+            Buf as rest => rest
+            error => Buf::empty()
+        }
+        total = total + taken
+    }
+    total
+}
+
+/**
+ * Pump `read` into `write` until EOF (the contract's copy(dst, src)). Returns the bytes moved.
+ *
+ * @param write  the destination sink
+ * @param read   the source stream
+ * @return       the total bytes moved, or an error
+ * @throws       any read or write error, propagated
+ * @since IO1
+ */
+pub fn copy(write: WriteFn, read: ReadFn) -> u64 | error {
+    mut total: u64 = 0
+    loop {
+        let chunk = match read(4096) { Buf as b => b; error as e => return e }
+        if chunk.len() == 0 { break }
+        let moved = match write_all(write, chunk) { u64 as n => n; error as e => return e }
+        total = total + moved
+    }
+    total
+}
+
+/**
+ * Frame a payload into a length-prefixed STORE blob: four big-endian length bytes followed by
+ * the payload. The self-contained stand-in for a ZIP-STORE archive (lossless, no compression);
+ * a real DEFLATE codec is a separate compress roadmap item. `unstore` is the exact inverse.
+ *
+ * @param payload  the bytes to frame
+ * @return         the framed STORE blob
+ * @since IO1
+ */
+pub fn store(payload: Buf) -> Buf {
+    let n = payload.len()
+    mut header: []byte = teko::list::empty()
+    header = teko::list::push(header, ((n >> 24) & 255) to byte)
+    header = teko::list::push(header, ((n >> 16) & 255) to byte)
+    header = teko::list::push(header, ((n >> 8) & 255) to byte)
+    header = teko::list::push(header, (n & 255) to byte)
+    Buf::from_bytes(header).concat(payload)
+}
+
+/**
+ * Recover the payload from a length-prefixed STORE blob (the inverse of `store`). A blob
+ * shorter than its declared length is an error.
+ *
+ * @param blob  the framed STORE blob
+ * @return      the original payload, or an error on a truncated blob
+ * @throws      when the blob is shorter than its four-byte header or its declared length
+ * @since IO1
+ */
+pub fn unstore(blob: Buf) -> Buf | error {
+    let raw = blob.bytes()
+    if raw.len < 4 { return error { message = "unstore: blob shorter than its header" } }
+    let n = ((raw[0] to u64) << 24) | ((raw[1] to u64) << 16) | ((raw[2] to u64) << 8) | (raw[3] to u64)
+    if 4 + n > raw.len { return error { message = "unstore: truncated payload" } }
+    blob.slice(4, 4 + n)
+}
+
+/**
+ * The full IO1 payoff: file → store → file → unstore → file, wired entirely through the
+ * copy/ReadFn/WriteFn seam, asserting the round-tripped bytes equal the source. Each stage
+ * failure returns a distinct code; success returns 0.
+ *
+ * @param source_path   the file whose bytes are round-tripped
+ * @param archive_path  where the STORE blob is written
+ * @param out_path      where the recovered bytes are written
+ * @return              0 on a successful lossless round-trip, else a distinct failure code
+ * @since IO1
+ */
+pub fn run_copy_pipeline(source_path: str, archive_path: str, out_path: str) -> i64 {
+    mut source_cursor = OnceCursor { delivered = false }
+    mut store_sink = MemWriter::empty()
+    let framed = match copy(mem_write_fn(store_sink), file_read_fn(source_path, source_cursor)) {
+        u64 => store(store_sink.content())
+        error => return 1
+    }
+    match write_file_bytes(archive_path, framed.bytes()) {
+        error => return 2
+        null => { }
+    }
+    let archive_text = match read_file(archive_path) { str as s => s; error => return 3 }
+    let payload = match unstore(Buf::from_str(archive_text)) { Buf as b => b; error => return 4 }
+    match write_file_bytes(out_path, payload.bytes()) {
+        error => return 5
+        null => { }
+    }
+    let original = match read_file(source_path) { str as s => s; error => return 6 }
+    let recovered = match read_file(out_path) { str as s => s; error => return 7 }
+    if original != recovered { return 8 }
+    0
+}

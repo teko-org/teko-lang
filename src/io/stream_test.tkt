@@ -391,3 +391,84 @@ fn pipeline_composes_across_wrappers() {
     teko::assert::is_true(text_of(writer.content().to_str()) == "the quick")
     teko::assert::is_true(reader.pos == 12)   // gulped in 4-byte steps: three gulps for a 9-byte cap
 }
+
+/**
+ * A WriteFn that accepts at most HALF of each offered region (rounding up so a 1-byte
+ * region still makes progress), appending the accepted prefix to a caller-owned MemWriter.
+ * Drives the `tee_write_fn` min-progress path: a `write_all` over a tee whose secondary is
+ * this half-taker must loop until BOTH sinks have drained the whole region.
+ *
+ * @param sink  the caller-owned in-memory accumulator advanced on each partial accept
+ * @return      a WriteFn that takes ceil(len/2) bytes per call and reports that count
+ * @since IO0
+ */
+fn half_taking_write_fn(sink: Ref<MemWriter>) -> WriteFn {
+    let half: WriteFn = (from: Buf) => {
+        mut take = from.len() / 2
+        if take == 0 { take = from.len() }
+        let prefix = match from.slice(0, take) { Buf as b => b; error => Buf::empty() }
+        let step = sink.value.write_step(prefix)
+        sink.value = step.writer
+        step.written
+    }
+    half
+}
+
+/**
+ * A WriteFn that always fails — for `tee_write_fn` error-propagation tests.
+ *
+ * @return  a WriteFn whose every call yields the `error` arm
+ * @since IO0
+ */
+fn failing_write_fn() -> WriteFn {
+    let failing: WriteFn = (from: Buf) => error { message = "sink boom" }
+    failing
+}
+
+/**
+ * `tee_write_fn` mirrors each write into both sinks and a `write_all` driver leaves both
+ * holding the full region, reporting the min of the two accepted counts (equal here).
+ */
+#test
+fn tee_write_fn_mirrors_to_both_sinks() {
+    mut primary_sink = MemWriter::empty()
+    mut secondary_sink = MemWriter::empty()
+    let tee = tee_write_fn(mem_write_fn(primary_sink), mem_write_fn(secondary_sink))
+    let wrote = count_of(write_all(tee, Buf::from_str("hello, teko")))
+    teko::assert::is_true(wrote == 11)
+    teko::assert::is_true(text_of(primary_sink.content().to_str()) == "hello, teko")
+    teko::assert::is_true(text_of(secondary_sink.content().to_str()) == "hello, teko")
+}
+
+/**
+ * When both sinks accept only a partial prefix per call, `tee_write_fn` reports the SMALLER
+ * of the two accepted counts, and the `write_all` driver keeps looping until BOTH sinks
+ * have drained the whole region. Both sinks are partial-consistent (they append exactly the
+ * bytes they report), which is the contract a min-progress tee requires — a sink that
+ * commits more than it reports would double-append the re-offered tail.
+ */
+#test
+fn tee_write_fn_reports_min_progress() {
+    mut fast_sink = MemWriter::empty()
+    mut slow_sink = MemWriter::empty()
+    let tee = tee_write_fn(half_taking_write_fn(fast_sink), half_taking_write_fn(slow_sink))
+    let wrote = count_of(write_all(tee, Buf::from_str("streaming")))
+    teko::assert::is_true(wrote == 9)
+    teko::assert::is_true(text_of(fast_sink.content().to_str()) == "streaming")
+    teko::assert::is_true(text_of(slow_sink.content().to_str()) == "streaming")
+}
+
+/**
+ * A failing secondary sink aborts the tee: driving it through `write_all` yields the error
+ * arm, never a silent partial write.
+ */
+#test
+fn tee_write_fn_propagates_error() {
+    mut good_sink = MemWriter::empty()
+    let tee = tee_write_fn(mem_write_fn(good_sink), failing_write_fn())
+    let failed = match write_all(tee, Buf::from_str("x")) {
+        u64 => false
+        error => true
+    }
+    teko::assert::is_true(failed)
+}

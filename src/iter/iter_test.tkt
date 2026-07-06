@@ -1,0 +1,317 @@
+/**
+ * Wrap a caller-owned i64 call-counter cell into an identity transform that ticks the cell
+ * on every call — the instrument the laziness tests read back to prove a `map`/`filter`
+ * closure ran EXACTLY as many times as the downstream `take` demanded, never once more.
+ * The cell is a `Ref<i64>` (MEM-1b-ii), the only shared-mutation seam a closure can advance
+ * across calls.
+ *
+ * @param cell  the caller-owned tick counter, incremented on each call
+ * @return      an identity `(i64) -> i64` that ticks `cell` as a side effect
+ */
+fn counting_identity(cell: Ref<i64>) -> (i64) -> i64 {
+    let c: (i64) -> i64 = (x: i64) => { cell.value = cell.value + 1; x }
+    c
+}
+
+/**
+ * Unwrap an `i64?`, treating the `null` case as a distinguished sentinel so a failed pull
+ * surfaces as a wrong value rather than a panic inside an assert.
+ *
+ * @param value     the optional to unwrap
+ * @param sentinel  the value to substitute for `null`
+ * @return          the wrapped i64, or `sentinel` at exhaustion
+ */
+fn or_else(value: i64?, sentinel: i64) -> i64 {
+    match value {
+        i64 as v => v
+        null => sentinel
+    }
+}
+
+/**
+ * `range` yields the half-open sequence in order and stops at the bound.
+ */
+#test
+fn range_yields_the_sequence() {
+    mut rc = RangeCursor { next = 0; hi = 4 }
+    let collected = collect(range(rc))
+    teko::assert::is_true(collected.len == 4)
+    teko::assert::is_true(collected[0] == 0)
+    teko::assert::is_true(collected[3] == 3)
+}
+
+/**
+ * `over_array` walks the backing slice front-to-back.
+ */
+#test
+fn over_array_walks_the_slice() {
+    mut ac = ArrayCursor { pos = 0 }
+    let collected = collect(over_array([10, 20, 30], ac))
+    teko::assert::is_true(collected.len == 3)
+    teko::assert::is_true(collected[0] == 10)
+    teko::assert::is_true(collected[2] == 30)
+}
+
+/**
+ * `once` yields its element exactly once; `empty` yields nothing.
+ */
+#test
+fn once_and_empty_edge_sources() {
+    mut oc = OnceCursor { emitted = false }
+    let single = collect(once(7, oc))
+    teko::assert::is_true(single.len == 1)
+    teko::assert::is_true(single[0] == 7)
+    let nothing = collect(empty())
+    teko::assert::is_true(nothing.len == 0)
+}
+
+/**
+ * `map` under a `take` runs its closure EXACTLY as many times as `take` pulls — the headline
+ * laziness proof: a `map` over a thousand-element range, capped at two, must tick the counter
+ * exactly twice, never a thousand times.
+ */
+#test
+fn map_is_lazy_past_take() {
+    mut count_cell = 0
+    let ticking = counting_identity(count_cell)
+    mut rc = RangeCursor { next = 0; hi = 1000 }
+    mut tc = TakeCursor { left = 2 }
+    let result = collect(take(map(range(rc), ticking), tc))
+    teko::assert::is_true(result.len == 2)
+    teko::assert::is_true(result[0] == 0)
+    teko::assert::is_true(result[1] == 1)
+    teko::assert::is_true(count_cell == 2)
+}
+
+/**
+ * `filter` under a `take` pulls the source only until the cap is met — the counter ticks
+ * once per source element inspected, and the run stops after the third kept element without
+ * draining the thousand-element range.
+ */
+#test
+fn filter_is_lazy_past_take() {
+    mut count_cell = 0
+    let ticking = counting_identity(count_cell)
+    mut rc = RangeCursor { next = 0; hi = 1000 }
+    mut tc = TakeCursor { left = 3 }
+    let result = collect(take(filter(map(range(rc), ticking), is_even_local), tc))
+    teko::assert::is_true(result.len == 3)
+    teko::assert::is_true(result[0] == 0)
+    teko::assert::is_true(result[2] == 4)
+    teko::assert::is_true(count_cell == 5)
+}
+
+/**
+ * The local even predicate used by the laziness and filter tests.
+ *
+ * @param x  the value to test
+ * @return   true when `x` is even
+ */
+fn is_even_local(x: i64) -> bool { x % 2 == 0 }
+
+/**
+ * The local ten-times transform used by the composition test.
+ *
+ * @param x  the value to scale
+ * @return   `x * 10`
+ */
+fn times_ten_local(x: i64) -> i64 { x * 10 }
+
+/**
+ * The local addition combiner used by the fold/reduce tests.
+ *
+ * @param a  the running accumulator
+ * @param x  the next element
+ * @return   `a + x`
+ */
+fn add_local(a: i64, x: i64) -> i64 { a + x }
+
+/**
+ * `map` transforms every element.
+ */
+#test
+fn map_transforms() {
+    mut rc = RangeCursor { next = 1; hi = 4 }
+    let collected = collect(map(range(rc), times_ten_local))
+    teko::assert::is_true(collected.len == 3)
+    teko::assert::is_true(collected[0] == 10)
+    teko::assert::is_true(collected[2] == 30)
+}
+
+/**
+ * `filter` keeps only the matching elements.
+ */
+#test
+fn filter_keeps_matching() {
+    mut rc = RangeCursor { next = 0; hi = 6 }
+    let collected = collect(filter(range(rc), is_even_local))
+    teko::assert::is_true(collected.len == 3)
+    teko::assert::is_true(collected[0] == 0)
+    teko::assert::is_true(collected[2] == 4)
+}
+
+/**
+ * `take` yields a leading prefix; `skip` drops one.
+ */
+#test
+fn take_and_skip_slice() {
+    mut rc = RangeCursor { next = 0; hi = 5 }
+    mut tc = TakeCursor { left = 2 }
+    let leading = collect(take(range(rc), tc))
+    teko::assert::is_true(leading.len == 2)
+    teko::assert::is_true(leading[1] == 1)
+    mut rc2 = RangeCursor { next = 0; hi = 5 }
+    mut sc = SkipCursor { left = 2 }
+    let trailing = collect(skip(range(rc2), sc))
+    teko::assert::is_true(trailing.len == 3)
+    teko::assert::is_true(trailing[0] == 2)
+}
+
+/**
+ * `enumerate` pairs each element with its index.
+ */
+#test
+fn enumerate_pairs_indices() {
+    mut ac = ArrayCursor { pos = 0 }
+    mut ec = EnumCursor { index = 0 }
+    let en = enumerate(over_array([10, 20, 30], ac), ec)
+    let first = en()
+    let first_index = match first { IntIndexed as ix => ix.index; null => -1 }
+    let first_value = match first { IntIndexed as ix => ix.value; null => -1 }
+    teko::assert::is_true(first_index == 0)
+    teko::assert::is_true(first_value == 10)
+    let second = en()
+    let second_index = match second { IntIndexed as ix => ix.index; null => -1 }
+    let second_value = match second { IntIndexed as ix => ix.value; null => -1 }
+    teko::assert::is_true(second_index == 1)
+    teko::assert::is_true(second_value == 20)
+}
+
+/**
+ * `zip` stops at the shorter of the two iterators.
+ */
+#test
+fn zip_stops_at_the_shorter() {
+    mut ra = RangeCursor { next = 0; hi = 2 }
+    mut rb = RangeCursor { next = 100; hi = 105 }
+    let z = zip(range(ra), range(rb))
+    let p0 = z()
+    let p0_sum = match p0 { IntPair as p => p.first + p.second; null => -1 }
+    teko::assert::is_true(p0_sum == 100)
+    let p1 = z()
+    let p1_sum = match p1 { IntPair as p => p.first + p.second; null => -1 }
+    teko::assert::is_true(p1_sum == 102)
+    let p2 = z()
+    let exhausted = match p2 { IntPair => false; null => true }
+    teko::assert::is_true(exhausted)
+}
+
+/**
+ * `chain` concatenates the two iterators in order.
+ */
+#test
+fn chain_concatenates() {
+    mut ra = RangeCursor { next = 0; hi = 2 }
+    mut rb = RangeCursor { next = 10; hi = 12 }
+    mut cc = ChainCursor { first_done = false }
+    let collected = collect(chain(range(ra), range(rb), cc))
+    teko::assert::is_true(collected.len == 4)
+    teko::assert::is_true(collected[0] == 0)
+    teko::assert::is_true(collected[2] == 10)
+    teko::assert::is_true(collected[3] == 11)
+}
+
+/**
+ * `fold` threads an accumulator; `sum` and `count` drain to totals.
+ */
+#test
+fn fold_sum_count_terminals() {
+    mut rc = RangeCursor { next = 1; hi = 5 }
+    let folded = fold(range(rc), 0, add_local)
+    teko::assert::is_true(folded == 10)
+    mut rc2 = RangeCursor { next = 1; hi = 5 }
+    teko::assert::is_true(sum(range(rc2)) == 10)
+    mut rc3 = RangeCursor { next = 1; hi = 5 }
+    teko::assert::is_true(count(range(rc3)) == 4)
+}
+
+/**
+ * `reduce` folds without a seed and is `null` on an empty iterator.
+ */
+#test
+fn reduce_terminal() {
+    mut rc = RangeCursor { next = 1; hi = 4 }
+    let reduced = reduce(range(rc), add_local)
+    teko::assert::is_true(or_else(reduced, -1) == 6)
+    mut empty_rc = RangeCursor { next = 0; hi = 0 }
+    let reduced_empty = reduce(range(empty_rc), add_local)
+    let is_empty = match reduced_empty { i64 => false; null => true }
+    teko::assert::is_true(is_empty)
+}
+
+/**
+ * `any`/`all` short-circuit; `find` returns the first match or `null`.
+ */
+#test
+fn any_all_find_terminals() {
+    mut rc = RangeCursor { next = 0; hi = 6 }
+    teko::assert::is_true(any(range(rc), is_even_local))
+    mut rc2 = RangeCursor { next = 1; hi = 6 }
+    mut rc3 = RangeCursor { next = 0; hi = 6 }
+    teko::assert::is_true(all(range(rc2), is_even_local) == false)
+    teko::assert::is_true(all(range(rc3), is_gte_zero_local))
+    mut rc4 = RangeCursor { next = 1; hi = 6 }
+    let found = find(range(rc4), is_even_local)
+    teko::assert::is_true(or_else(found, -1) == 2)
+    mut rc5 = RangeCursor { next = 1; hi = 2 }
+    let missed = find(range(rc5), is_even_local)
+    let is_miss = match missed { i64 => false; null => true }
+    teko::assert::is_true(is_miss)
+}
+
+/**
+ * A non-negativity predicate the all-terminal test uses for its true case.
+ *
+ * @param x  the value to test
+ * @return   true when `x >= 0`
+ */
+fn is_gte_zero_local(x: i64) -> bool { x >= 0 }
+
+/**
+ * The composition payoff: `fold(map(filter(range(0,6), even), *10), 0, +)` == 60.
+ */
+#test
+fn pipeline_range_filter_map_fold() {
+    mut rc = RangeCursor { next = 0; hi = 6 }
+    let total = fold(map(filter(range(rc), is_even_local), times_ten_local), 0, add_local)
+    teko::assert::is_true(total == 60)
+}
+
+/**
+ * The byte-element bridge: `collect_bytes(take_bytes(over_bytes(bytes_of("hello")), 3))`
+ * yields the first three bytes.
+ */
+#test
+fn bytes_pipeline() {
+    mut bc = ByteCursor { pos = 0 }
+    mut tbc = TakeByteCursor { left = 3 }
+    let taken = collect_bytes(take_bytes(over_bytes(bytes_of_str("hello"), bc), tbc))
+    teko::assert::is_true(taken.len == 3)
+    teko::assert::is_true(taken[0] == b'h')
+    teko::assert::is_true(taken[1] == b'e')
+    teko::assert::is_true(taken[2] == b'l')
+}
+
+/**
+ * The str-element bridge: lines split from text drain through a StrIter in order.
+ */
+#test
+fn lines_pipeline() {
+    let lines = split_lines("alpha\nbeta\ngamma")
+    teko::assert::is_true(lines.len == 3)
+    mut sc = StrCursor { pos = 0 }
+    let collected = collect_strs(over_strs(lines, sc))
+    teko::assert::is_true(collected.len == 3)
+    teko::assert::is_true(collected[0] == "alpha")
+    teko::assert::is_true(collected[2] == "gamma")
+}
