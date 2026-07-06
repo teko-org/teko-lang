@@ -1,0 +1,1299 @@
+<title>Memory-model surfaces in Teko — an honest comparison</title>
+<style>
+  :root {
+    --ground: #12131A;
+    --panel: #1B1D28;
+    --panel-2: #21243050;
+    --hair: #2E3142;
+    --hair-soft: #262838;
+    --ink: #E6E7EE;
+    --ink-dim: #C3C6D4;
+    --muted: #9195AB;
+    --faint: #6D7288;
+    --accent: #7C9CF5;
+    --accent-dim: #5C7AD0;
+    --green: #55BE93;
+    --green-bg: #123227;
+    --amber: #DE9863;
+    --amber-bg: #2E2113;
+    --rose: #D3707B;
+    --rose-bg: #2C161B;
+    --code-bg: #0E0F16;
+    --code-ink: #C8CBDA;
+
+    --mono: ui-monospace, "SF Mono", "SFMono-Regular", "Menlo", "Cascadia Mono", "Roboto Mono", monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", "Arial", sans-serif;
+
+    --measure: 68ch;
+  }
+
+  * { box-sizing: border-box; }
+
+  body { margin: 0; }
+
+  .page {
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--sans);
+    font-size: 16px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+    padding: clamp(1.1rem, 4vw, 4rem) clamp(1rem, 5vw, 3rem) 6rem;
+  }
+
+  .wrap { max-width: 1180px; margin: 0 auto; }
+
+  /* ---- typographic scale ---- */
+  h1, h2, h3, h4 { font-weight: 640; line-height: 1.15; text-wrap: balance; letter-spacing: -0.015em; margin: 0; }
+  h1 { font-size: clamp(1.9rem, 4.4vw, 3.1rem); letter-spacing: -0.03em; }
+  h2 { font-size: clamp(1.4rem, 3vw, 2rem); letter-spacing: -0.022em; }
+  h3 { font-size: 1.18rem; }
+  h4 { font-size: 1rem; }
+
+  p { margin: 0; }
+  .prose p + p { margin-top: 0.85rem; }
+  .prose { max-width: var(--measure); color: var(--ink-dim); }
+
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  a:focus-visible, summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 3px; }
+
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: 0.72rem;
+    letter-spacing: 0.22em;
+    text-transform: uppercase;
+    color: var(--faint);
+    margin: 0 0 0.9rem;
+  }
+
+  /* ---- masthead ---- */
+  .masthead { padding-bottom: 2.4rem; border-bottom: 1px solid var(--hair); margin-bottom: 2.8rem; }
+  .masthead .lede { font-size: clamp(1.02rem, 1.7vw, 1.22rem); color: var(--ink-dim); max-width: 62ch; margin-top: 1.3rem; }
+  .masthead .lede strong { color: var(--ink); font-weight: 620; }
+
+  .kicker-row { display: flex; flex-wrap: wrap; gap: 0.5rem 1.4rem; margin-top: 1.6rem; font-family: var(--mono); font-size: 0.74rem; color: var(--muted); letter-spacing: 0.04em; }
+  .kicker-row span { display: inline-flex; align-items: center; gap: 0.5ch; }
+  .dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; }
+  .dot.g { background: var(--green); }
+  .dot.a { background: var(--amber); }
+  .dot.r { background: var(--rose); }
+
+  /* ---- section framing ---- */
+  section { margin-top: 3.6rem; }
+  .sec-head { margin-bottom: 1.6rem; }
+  .sec-head h2 { display: flex; align-items: baseline; gap: 0.8rem; flex-wrap: wrap; }
+  .sec-num { font-family: var(--mono); font-size: 0.9rem; color: var(--accent); font-weight: 500; letter-spacing: 0; }
+
+  /* ---- taxonomy legend ---- */
+  .taxo { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 1px; background: var(--hair-soft); border: 1px solid var(--hair-soft); border-radius: 12px; overflow: hidden; }
+  .taxo-cell { background: var(--panel); padding: 1.25rem 1.35rem; }
+  .taxo-cell .tag { font-family: var(--mono); font-size: 0.68rem; letter-spacing: 0.14em; text-transform: uppercase; margin-bottom: 0.7rem; display: inline-block; padding: 0.2rem 0.55rem; border-radius: 5px; }
+  .tag.real { color: var(--accent); background: #17203a; }
+  .tag.invisible { color: var(--muted); background: #232636; }
+  .tag.inferred { color: var(--green); background: var(--green-bg); }
+  .tag.runtime { color: var(--amber); background: var(--amber-bg); }
+  .taxo-cell h4 { margin-bottom: 0.35rem; }
+  .taxo-cell p { font-size: 0.9rem; color: var(--muted); line-height: 1.5; }
+  .taxo-cell .models { margin-top: 0.75rem; font-size: 0.82rem; color: var(--ink-dim); }
+  .taxo-cell .models b { color: var(--ink); font-weight: 600; }
+
+  .headline-note { margin-top: 1.5rem; padding: 1.15rem 1.35rem; border-left: 3px solid var(--accent); background: var(--panel-2); border-radius: 0 8px 8px 0; color: var(--ink-dim); font-size: 0.97rem; max-width: 82ch; }
+  .headline-note strong { color: var(--ink); }
+
+  /* ---- model profile cards ---- */
+  .profiles { display: grid; gap: 1.1rem; }
+  .profile { border: 1px solid var(--hair); border-radius: 13px; background: var(--panel); overflow: hidden; }
+  .profile > summary { list-style: none; cursor: pointer; padding: 1.35rem 1.5rem; display: grid; grid-template-columns: 1fr auto; gap: 0.7rem 1rem; align-items: start; }
+  .profile > summary::-webkit-details-marker { display: none; }
+  .profile > summary:hover { background: #1F2230; }
+  .profile .p-title { display: flex; flex-direction: column; gap: 0.5rem; }
+  .profile .p-title h3 { letter-spacing: -0.02em; }
+  .badges { display: flex; flex-wrap: wrap; gap: 0.45rem; align-items: center; }
+  .chip { font-family: var(--mono); font-size: 0.66rem; letter-spacing: 0.1em; text-transform: uppercase; padding: 0.24rem 0.6rem; border-radius: 100px; font-weight: 500; white-space: nowrap; }
+  .chip.pileA { color: var(--green); background: var(--green-bg); border: 1px solid #1e4d3a; }
+  .chip.pileB { color: var(--amber); background: var(--amber-bg); border: 1px solid #4a331a; }
+  .chip.surf-real { color: var(--accent); background: #17203a; border: 1px solid #2b3c66; }
+  .chip.surf-inv { color: var(--muted); background: #232636; border: 1px solid #333650; }
+  .chip.surf-inf { color: var(--green); background: var(--green-bg); border: 1px solid #1e4d3a; }
+  .chip.surf-rt { color: var(--amber); background: var(--amber-bg); border: 1px solid #4a331a; }
+  .expand-hint { font-family: var(--mono); font-size: 0.68rem; color: var(--faint); letter-spacing: 0.08em; align-self: center; white-space: nowrap; }
+  .profile[open] .expand-hint::after { content: "collapse ▲"; }
+  .profile:not([open]) .expand-hint::after { content: "expand ▾"; }
+
+  .p-body { padding: 0 1.5rem 1.6rem; border-top: 1px solid var(--hair-soft); }
+  .band { display: grid; grid-template-columns: 1fr 1fr; gap: 1.4rem; margin-top: 1.4rem; }
+  @media (max-width: 720px) { .band { grid-template-columns: 1fr; } }
+  .band .cell h4 { font-family: var(--mono); font-size: 0.7rem; letter-spacing: 0.14em; text-transform: uppercase; color: var(--faint); margin-bottom: 0.55rem; }
+  .band .cell.feel h4 { color: var(--accent); }
+  .band .cell.buys h4 { color: var(--green); }
+  .band .cell p { font-size: 0.93rem; color: var(--ink-dim); line-height: 1.58; }
+
+  /* ---- scenario matrix ---- */
+  .scenario { margin-top: 2.2rem; border: 1px solid var(--hair); border-radius: 13px; overflow: hidden; background: var(--panel); }
+  .s-head { padding: 1.15rem 1.5rem; background: linear-gradient(180deg,#20232f,#191b25); border-bottom: 1px solid var(--hair); display: flex; align-items: baseline; gap: 0.9rem; flex-wrap: wrap; }
+  .s-head .s-id { font-family: var(--mono); font-weight: 600; color: var(--accent); font-size: 1.05rem; letter-spacing: 0.02em; }
+  .s-head .s-name { font-size: 1.12rem; font-weight: 600; }
+  .s-head .s-sub { font-size: 0.9rem; color: var(--muted); flex-basis: 100%; margin-top: 0.15rem; }
+
+  .model-row { padding: 1.3rem 1.5rem; border-top: 1px solid var(--hair-soft); }
+  .model-row:first-of-type { border-top: none; }
+  .mr-head { display: flex; align-items: center; gap: 0.7rem; flex-wrap: wrap; margin-bottom: 0.85rem; }
+  .mr-head .mname { font-weight: 640; font-size: 1rem; letter-spacing: -0.01em; }
+  .mr-head .mtag { font-family: var(--mono); font-size: 0.63rem; letter-spacing: 0.1em; text-transform: uppercase; padding: 0.2rem 0.5rem; border-radius: 4px; }
+
+  pre { margin: 0; }
+  .code { background: var(--code-bg); border: 1px solid #191b26; border-radius: 9px; overflow-x: auto; margin: 0.4rem 0 0; }
+  .code code { display: block; font-family: var(--mono); font-size: 0.795rem; line-height: 1.62; color: var(--code-ink); padding: 1rem 1.15rem; white-space: pre; tab-size: 4; }
+  .tok-c { color: #6C7186; font-style: italic; }   /* comment */
+  .tok-k { color: #8FB0FA; }                        /* keyword */
+  .tok-t { color: #6FCF9E; }                        /* type */
+  .tok-a { color: #E0A86A; }                        /* annotation / sigil */
+  .tok-f { color: #C7A4F0; }                        /* fn name */
+  .tok-n { color: #D97F8B; }                        /* number / literal */
+  .tok-s { color: #9CCF86; }                        /* string */
+
+  .meta-row { display: grid; grid-template-columns: 1fr 1fr; gap: 0.9rem; margin-top: 0.9rem; }
+  @media (max-width: 760px) { .meta-row { grid-template-columns: 1fr; } }
+  .meta { border-radius: 8px; padding: 0.8rem 0.95rem; font-size: 0.87rem; line-height: 1.52; }
+  .meta .lbl { font-family: var(--mono); font-size: 0.64rem; letter-spacing: 0.13em; text-transform: uppercase; display: block; margin-bottom: 0.35rem; }
+  .meta.delta { background: #171a24; border: 1px solid var(--hair-soft); color: var(--ink-dim); }
+  .meta.delta .lbl { color: var(--muted); }
+  .meta.lower { background: #171a24; border: 1px solid var(--hair-soft); color: var(--ink-dim); }
+  .meta.lower .lbl { color: var(--muted); }
+
+  .honest { margin-top: 0.9rem; background: var(--rose-bg); border: 1px solid #4a2229; border-left: 3px solid var(--rose); border-radius: 0 8px 8px 0; padding: 0.85rem 1rem; font-size: 0.88rem; line-height: 1.55; color: #EBC8CC; }
+  .honest .lbl { font-family: var(--mono); font-size: 0.64rem; letter-spacing: 0.13em; text-transform: uppercase; color: var(--rose); display: block; margin-bottom: 0.35rem; }
+  .honest.win { background: var(--green-bg); border-color: #1e4d3a; border-left-color: var(--green); color: #C4E7D6; }
+  .honest.win .lbl { color: var(--green); }
+
+  .delta-none { color: var(--muted); font-style: italic; }
+
+  /* ---- pile split ---- */
+  .pile-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1.2rem; }
+  @media (max-width: 720px) { .pile-grid { grid-template-columns: 1fr; } }
+  .pile { border-radius: 13px; padding: 1.5rem 1.6rem; border: 1px solid var(--hair); }
+  .pile.a { background: linear-gradient(180deg, #11241c, #14161f); border-color: #1e4d3a; }
+  .pile.b { background: linear-gradient(180deg, #241a11, #16161f); border-color: #4a331a; }
+  .pile h3 { display: flex; align-items: center; gap: 0.6rem; margin-bottom: 0.4rem; }
+  .pile.a h3 { color: #7BD8AF; }
+  .pile.b h3 { color: #EBB483; }
+  .pile .sub { font-family: var(--mono); font-size: 0.72rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); margin-bottom: 1rem; }
+  .pile ul { margin: 0; padding: 0; list-style: none; display: grid; gap: 0.7rem; }
+  .pile li { padding-left: 1.3rem; position: relative; font-size: 0.93rem; color: var(--ink-dim); line-height: 1.5; }
+  .pile li::before { content: ""; position: absolute; left: 0; top: 0.55em; width: 7px; height: 7px; border-radius: 2px; }
+  .pile.a li::before { background: var(--green); }
+  .pile.b li::before { background: var(--amber); }
+  .pile li b { color: var(--ink); font-weight: 620; }
+
+  /* ---- bottom line ---- */
+  .bottom { margin-top: 3.6rem; border: 1px solid var(--hair); border-radius: 14px; overflow: hidden; }
+  .bottom-head { background: var(--code-bg); padding: 1.5rem 1.7rem; border-bottom: 1px solid var(--hair); }
+  .bottom-head .eyebrow { color: var(--rose); margin-bottom: 0.6rem; }
+  .bottom-head h2 { color: var(--ink); }
+  .bottom-body { padding: 1.7rem; display: grid; gap: 1.1rem; }
+  .bottom-body p { color: var(--ink-dim); max-width: 76ch; }
+  .bottom-body .kv { display: grid; grid-template-columns: max-content 1fr; gap: 0.6rem 1.3rem; margin-top: 0.4rem; align-items: baseline; }
+  @media (max-width: 620px) { .bottom-body .kv { grid-template-columns: 1fr; gap: 0.2rem 0; } .bottom-body .kv dt { margin-top: 0.6rem; } }
+  .bottom-body dt { font-family: var(--mono); font-size: 0.74rem; letter-spacing: 0.06em; text-transform: uppercase; color: var(--accent); white-space: nowrap; }
+  .bottom-body dd { margin: 0; color: var(--ink-dim); font-size: 0.94rem; }
+  .verdict { font-size: 1.08rem; color: var(--ink); font-weight: 560; max-width: 74ch; line-height: 1.5; }
+  .verdict em { color: var(--rose); font-style: normal; }
+  .verdict b { color: var(--green); }
+
+  footer { margin-top: 4rem; padding-top: 1.6rem; border-top: 1px solid var(--hair); font-family: var(--mono); font-size: 0.74rem; color: var(--faint); letter-spacing: 0.03em; line-height: 1.7; }
+
+  .jump { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-top: 1.5rem; }
+  .jump a { font-family: var(--mono); font-size: 0.74rem; padding: 0.35rem 0.7rem; border: 1px solid var(--hair); border-radius: 6px; color: var(--muted); letter-spacing: 0.03em; }
+  .jump a:hover { color: var(--accent); border-color: var(--accent-dim); text-decoration: none; }
+
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+
+<div class="page">
+<div class="wrap">
+
+  <header class="masthead">
+    <p class="eyebrow">Teko · memory-model research · surface study</p>
+    <h1>Six theoretical memory models, and what they would actually look like in your hands</h1>
+    <p class="lede">A scenario-by-scenario look at how each candidate model would appear on the surface of Teko — measured against today's arena. The headline finding is not about power. It is about <strong>visibility</strong>: half of these models have no surface syntax at all, which is precisely what makes them the low-risk ideas.</p>
+
+    <div class="kicker-row">
+      <span><span class="dot g"></span>Pile A — steal a piece</span>
+      <span><span class="dot a"></span>Pile B — bet the language</span>
+      <span><span class="dot r"></span>Honest ceiling / limit</span>
+    </div>
+
+    <nav class="jump" aria-label="Jump to scenario">
+      <a href="#taxonomy">Taxonomy</a>
+      <a href="#profiles">Model profiles</a>
+      <a href="#s1">S1 tree</a>
+      <a href="#s2">S2 return-fresh</a>
+      <a href="#s3">S3 cycle</a>
+      <a href="#s4">S4 doubly-linked</a>
+      <a href="#s5">S5 cache</a>
+      <a href="#s6">S6 aliased-free</a>
+      <a href="#piles">Pile split</a>
+      <a href="#bottom">Bottom line</a>
+    </nav>
+  </header>
+
+  <!-- ================= TAXONOMY ================= -->
+  <section id="taxonomy">
+    <div class="sec-head">
+      <p class="eyebrow"><span class="sec-num">01</span> &nbsp;The split that matters</p>
+      <h2>Which of these you can even see</h2>
+      <p class="prose" style="margin-top:1rem">Before comparing capability, sort the models by whether the programmer ever writes anything. This is the load-bearing distinction: a model with no surface can only ever tighten an existing rule or optimise a runtime, never regress a working program — so its cost of being wrong is near zero. That is the whole reason to reach for it first.</p>
+    </div>
+
+    <div class="taxo">
+      <div class="taxo-cell">
+        <span class="tag real">Real surface</span>
+        <h4>You write a sigil or keyword</h4>
+        <p>A visible construct enters the source. This is where the ergonomic cost — and the language bet — lives.</p>
+        <p class="models"><b>NOEMA</b> (<code>&amp;T</code> read-borrow) · <b>Relevant types</b> (<code>#must_free</code>) · <b>Adoption &amp; abandon</b> (<code>region</code> / <code>adopt</code> / <code>abandon</code>)</p>
+      </div>
+      <div class="taxo-cell">
+        <span class="tag invisible">Invisible — internal</span>
+        <h4>A proof lens on the IR</h4>
+        <p>No keyword, no qualifier, nothing at the source. The model's entire effect lives in the compiler's own conscience.</p>
+        <p class="models"><b>Ordered types</b> — the LIFO fragment as an internal soundness proof over the region tree.</p>
+      </div>
+      <div class="taxo-cell">
+        <span class="tag inferred">Mostly inferred</span>
+        <h4>The compiler fills it in</h4>
+        <p>A qualifier exists in principle but you almost never write it; it is inferred from analysis Teko already runs, then erased.</p>
+        <p class="models"><b>Second-class values</b> (<code>@local</code> / may-not-escape) — the pilotable idea.</p>
+      </div>
+      <div class="taxo-cell">
+        <span class="tag runtime">Runtime only</span>
+        <h4>An allocator swap</h4>
+        <p>Not a language feature at all — a <code>teko_rt.c</code> change, optionally surfaced as one scope beside <code>defer</code>.</p>
+        <p class="models"><b>REAPS</b> — recycle freed blocks back into the bump path.</p>
+      </div>
+    </div>
+
+    <p class="headline-note"><strong>Read this as the thesis of the whole page.</strong> Only three of the six put anything in front of the programmer. The other three — ordered types (internal proof), REAPS (runtime allocator), and second-class values (inferred) — are, from the keyboard, indistinguishable from today's Teko. "Has no surface" is not a footnote; it is the finding. It is what sorts the safe experiments from the language bets.</p>
+  </section>
+
+  <!-- ================= PROFILES ================= -->
+  <section id="profiles">
+    <div class="sec-head">
+      <p class="eyebrow"><span class="sec-num">02</span> &nbsp;Per-model profile</p>
+      <h2>What it feels like &amp; what it actually buys Teko</h2>
+      <p class="prose" style="margin-top:1rem">Each model in one honest band: the felt experience at the keyboard, and the single thing it genuinely adds — stated without overselling. Expand any card for the full read.</p>
+    </div>
+
+    <div class="profiles">
+
+      <!-- Second-class -->
+      <details class="profile" id="prof-secondclass" open>
+        <summary>
+          <div class="p-title">
+            <h3>Second-class values</h3>
+            <div class="badges">
+              <span class="chip pileA">Pile A · steal a piece</span>
+              <span class="chip surf-inf">Surface: mostly inferred</span>
+            </div>
+          </div>
+          <span class="expand-hint"></span>
+        </summary>
+        <div class="p-body">
+          <div class="band">
+            <div class="cell feel">
+              <h4>What it feels like</h4>
+              <p>Programming feels exactly like today's Teko 99% of the time — you never write the qualifier — right up until the compiler stops you at a return or a field-store: "this Ref is second-class, it cannot leave here." It is the current informal <code>Ref-can't-escape</code> rule turned into a checker that actually catches you. The language feels more honest, not heavier.</p>
+            </div>
+            <div class="cell buys">
+              <h4>What it actually buys Teko</h4>
+              <p>A sound, inferable foundation under the ad-hoc "Ref may not escape a field" rule Teko already enforces informally. The compiler infers a <code>@local</code> bit per binding from the escape analysis it already runs, checks it at every escape boundary, and erases it before codegen — pure C stack locals, zero runtime cost. It buys <em>soundness + inference</em>, not new capability: zero power over escaping, cyclic, or shared data. Its whole value is that it changes almost nothing observable. <strong>The honest gate:</strong> "just infer it, zero annotation" is contingent on auditing that Teko's name-based escape analysis is actually sound for aliased/returned values — that audit is the real cost, not the qualifier. It leaves every hard cliff (graph-leak, aliased-free, cycles, concurrency) exactly where it was.</p>
+            </div>
+          </div>
+        </div>
+      </details>
+
+      <!-- Ordered types -->
+      <details class="profile" id="prof-ordered">
+        <summary>
+          <div class="p-title">
+            <h3>Ordered types <span style="color:var(--faint);font-weight:400;font-size:0.9rem">— LIFO fragment of ordered logic</span></h3>
+            <div class="badges">
+              <span class="chip pileA">Pile A · steal a piece</span>
+              <span class="chip surf-inv">Surface: invisible / internal</span>
+            </div>
+          </div>
+          <span class="expand-hint"></span>
+        </summary>
+        <div class="p-body">
+          <div class="band">
+            <div class="cell feel">
+              <h4>What it feels like</h4>
+              <p>It feels exactly like current arena Teko — because it <em>is</em> current arena Teko. Nothing changes in your hands. The only difference lives in the compiler's conscience: what used to be a hand-audited belief ("the region tree is stack-shaped, so drops are safe") becomes a discharged proof obligation on the IR. You never see it, never write it, never fight it.</p>
+            </div>
+            <div class="cell buys">
+              <h4>What it actually buys Teko</h4>
+              <p>A type-theoretic name and soundness proof for the region tree Teko <em>already</em> ships — nothing more, and that is the point. Ordered logic (Polakow, CMU 2001) is the LIFO fragment of linear logic: later-introduced resources are consumed before earlier ones — precisely the frame/loop/arm region tree. It turns arena correctness from hand-audit into sound-by-construction, finding exactly <em>where</em> the current per-binding-name escape analysis is unsound. <strong>But it is honest about its ceiling:</strong> pure ordered types express strictly <em>less</em> than Teko already does — strict LIFO forbids any non-nested lifetime, so S2 return-fresh and the promote-to-root path are, in the pure calculus, ill-typed. That refusal is the diagnostic value: it maps exactly where the arena's safety rests on machinery beyond the ordered fragment.</p>
+            </div>
+          </div>
+        </div>
+      </details>
+
+      <!-- NOEMA -->
+      <details class="profile" id="prof-noema">
+        <summary>
+          <div class="p-title">
+            <h3>NOEMA <span style="color:var(--faint);font-weight:400;font-size:0.9rem">— Neut-style <code>&amp;T</code> read-borrow</span></h3>
+            <div class="badges">
+              <span class="chip pileA">Pile A · steal a piece</span>
+              <span class="chip surf-real">Surface: real syntax</span>
+            </div>
+          </div>
+          <span class="expand-hint"></span>
+        </summary>
+        <div class="p-body">
+          <div class="band">
+            <div class="cell feel">
+              <h4>What it feels like</h4>
+              <p>Almost identical to Ref-based Teko, except read-only access gets a distinct sigil: any function that only observes a value takes it as <code>&amp;T</code>, and the compiler forbids that borrow from being stashed in a field, returned, or aliased past its source. The mental model is "reads are cheap, tethered, and can never be the pointer that dangles"; anything that must outlive or own still uses ordinary values / Ref.</p>
+            </div>
+            <div class="cell buys">
+              <h4>What it actually buys Teko</h4>
+              <p>Exactly <em>one</em> thing, cleanly: it makes the <em>read</em> side of the aliased-free cliff (S6) sound by construction. A <code>&amp;T</code> noema is statically forbidden from being stored or outliving its source, so it can never become the surviving alias that dangles after a free. Zero runtime cost — the sigil erases to a plain C pointer. <strong>What it does not buy:</strong> no new capability — it cannot host cycles, reclaim graphs, or make owning aliases sound. Critically, the rule is extracted from a viral full-linearity discipline Teko refuses to adopt, so "the <code>&amp;t</code> rule alone is sound in a non-linear language" is unproven engineering: Teko must itself prove its name-based check enforces the no-store/no-escape invariant the noema requires.</p>
+            </div>
+          </div>
+        </div>
+      </details>
+
+      <!-- Relevant types -->
+      <details class="profile" id="prof-relevant">
+        <summary>
+          <div class="p-title">
+            <h3>Relevant types <span style="color:var(--faint);font-weight:400;font-size:0.9rem">— <code>#must_free</code> must-use handle</span></h3>
+            <div class="badges">
+              <span class="chip pileA">Pile A · steal a piece</span>
+              <span class="chip surf-real">Surface: real syntax</span>
+            </div>
+          </div>
+          <span class="expand-hint"></span>
+        </summary>
+        <div class="p-body">
+          <div class="band">
+            <div class="cell feel">
+              <h4>What it feels like</h4>
+              <p>Like the compiler handing you a receipt you are legally required to spend: every relevant handle nags at you until you free, return, or move it, so leaks turn from invisible drift into a red squiggle you clear on the same line you allocate. The discipline is entirely about not-forgetting-to-free — and it stays conspicuously silent the moment two names point at one buffer.</p>
+            </div>
+            <div class="cell buys">
+              <h4>What it actually buys Teko</h4>
+              <p>A single, opt-in, fully-erasable annotation that converts Teko's most common silent failure — leak-to-root in a long-running program — into a compile error, at zero runtime cost and with no new subsystem. It rides entirely on the arena + existing <code>teko::mem::free</code>, adding only a consume-or-fail dataflow check. Genuinely valuable exactly where leaks hurt (S2 escaping allocs, S5 caches) and honest about buying nothing on the hard cliffs: for cycles/DLLs it collapses to "the region must be closed" (which lexical arenas already guarantee), and for aliased-free it is <em>powerless by construction</em>. Being the relevant / must-consume dual, it enforces at-least-once freeing and has no notion of uniqueness — so it can make a use-after-free <em>more</em> likely while eliminating the leak.</p>
+            </div>
+          </div>
+        </div>
+      </details>
+
+      <!-- REAPS -->
+      <details class="profile" id="prof-reaps">
+        <summary>
+          <div class="p-title">
+            <h3>REAPS <span style="color:var(--faint);font-weight:400;font-size:0.9rem">— region allocator with recycling free</span></h3>
+            <div class="badges">
+              <span class="chip pileA">Pile A · steal a piece</span>
+              <span class="chip surf-rt">Surface: runtime only</span>
+            </div>
+          </div>
+          <span class="expand-hint"></span>
+        </summary>
+        <div class="p-body">
+          <div class="band">
+            <div class="cell feel">
+              <h4>What it feels like</h4>
+              <p>Like nothing changed — you write the same arena Teko you already write, and 99% of the time the allocator swap under <code>teko_rt.c</code> is invisible. The one moment it surfaces is wrapping a churny, phase-structured cache in a <code>reap { }</code> block that reads exactly like the <code>defer</code> / <code>arena_push</code> you already know, quietly keeping that phase's footprint from creeping upward.</p>
+            </div>
+            <div class="cell buys">
+              <h4>What it actually buys Teko</h4>
+              <p>A footprint plateau for churn-heavy, phase-structured workloads (servers, caches, memo tables) at near-zero surface cost — recycle-freed-blocks-into-the-bump-path under <code>teko_rt.c</code>. <strong>The honest ledger is thin:</strong> it <em>plateaus</em> fragmentation and does <em>not</em> compact; Teko already ships a weaker version (park-on-freelist), so the real delta is just coalescing + feeding runs back to the bump pointer. And it is safety-neutral-to-<em>negative</em>: no reachability fact, so it cannot touch any correctness cliff, and by recycling freed memory sooner it makes the S6 use-after-free more likely to return corrupted bytes. Buy it as a runtime footprint optimisation for the eventual server era, not as an answer to any correctness cliff.</p>
+            </div>
+          </div>
+        </div>
+      </details>
+
+      <!-- Adoption -->
+      <details class="profile" id="prof-adoption">
+        <summary>
+          <div class="p-title">
+            <h3>Adoption &amp; abandon <span style="color:var(--faint);font-weight:400;font-size:0.9rem">— Mezzo adopter regions</span></h3>
+            <div class="badges">
+              <span class="chip pileB">Pile B · bet the language</span>
+              <span class="chip surf-real">Surface: real syntax</span>
+            </div>
+          </div>
+          <span class="expand-hint"></span>
+        </summary>
+        <div class="p-body">
+          <div class="band">
+            <div class="cell feel">
+              <h4>What it feels like</h4>
+              <p>Like drawing a box around a knot of mutually-pointing objects and saying "these are one thing now": inside the box you point wherever you like — cycles, back-edges, aliases, all fine — and you pay nothing until the moment you try to pull one object back <em>out</em>, where a runtime tag-check makes you prove it is really leaving. It is the arena-of-nodes + index workaround Teko already reaches for, except the region is a first-class value and the "is this index still valid" check is a language-enforced dynamic guard instead of a comment.</p>
+            </div>
+            <div class="cell buys">
+              <h4>What it actually buys Teko</h4>
+              <p>Exactly one thing the shipping arena cannot express: a sound, Coq-verified way to host a genuinely cyclic/aliased mutable graph in a bulk-reclaimed region <em>without</em> a per-op refcount and <em>without</em> a tracing GC — the S3/S4 territory. It promotes the hand-rolled arena-of-nodes pattern into a checked construct. <strong>The price and boundary, honestly:</strong> it does not compute the reachability fact Teko lacks — it <em>sidesteps</em> it by making the adoption tag a runtime word and abandon a runtime branch. It closes the cyclic-graph cliff but leaves aliased-free (S6) essentially untouched, and full Mezzo is the permission calculus whose own authors wrote a post-mortem — so the affordable version is a narrow library-plus-two-keywords hatch. A real capability for the graph corner, paid for in runtime tags + a per-object dynamic check. Pile B.</p>
+            </div>
+          </div>
+        </div>
+      </details>
+
+    </div>
+  </section>
+
+  <!-- ================= SCENARIO MATRIX ================= -->
+  <section id="matrix">
+    <div class="sec-head">
+      <p class="eyebrow"><span class="sec-num">03</span> &nbsp;The comparison proper</p>
+      <h2>Scenario by scenario — every model's surface, its delta from arena, its honest flag</h2>
+      <p class="prose" style="margin-top:1rem">Six canonical shapes. Under each, all six models, in a fixed order: the three invisible/inferred/runtime ones (second-class, ordered, REAPS) that mostly show <em>no delta</em>, then the three real-surface ones (noema, relevant, adoption). Watch how much of the matrix is "nothing changed" — that emptiness is the substance.</p>
+    </div>
+
+    <!-- ============ S1 ============ -->
+    <article class="scenario" id="s1">
+      <div class="s-head">
+        <span class="s-id">S1</span>
+        <span class="s-name">Binary tree — build then sum</span>
+        <span class="s-sub">The arena's happy path: a nested, acyclic structure read-only traversed and dropped in bulk. The baseline against which every delta is measured.</span>
+      </div>
+
+      <div class="model-row">
+        <div class="mr-head"><span class="mname">Second-class values</span><span class="mtag" style="color:var(--green);background:var(--green-bg)">inferred</span></div>
+        <div class="code"><pre><code><span class="tok-c">/** Second-class is INFERRED — S1 surface is byte-identical to today. */</span>
+<span class="tok-k">pub type</span> <span class="tok-t">Node</span> = <span class="tok-k">class</span> {
+    <span class="tok-k">pub</span> value: <span class="tok-t">i64</span>
+    <span class="tok-k">pub</span> left: <span class="tok-t">Node?</span>
+    <span class="tok-k">pub</span> right: <span class="tok-t">Node?</span>
+    <span class="tok-k">pub fn</span> <span class="tok-f">leaf</span>(v: <span class="tok-t">i64</span>) -&gt; <span class="tok-t">Node</span> { <span class="tok-t">Node</span> { value = v; left = null; right = null } }
+    <span class="tok-k">pub fn</span> <span class="tok-f">branch</span>(v: <span class="tok-t">i64</span>, l: <span class="tok-t">Node</span>, r: <span class="tok-t">Node</span>) -&gt; <span class="tok-t">Node</span> { <span class="tok-t">Node</span> { value = v; left = l; right = r } }
+}
+
+<span class="tok-c">/** `n` is inferred @local (read-only, never stored/returned) — the qualifier rides invisibly. */</span>
+<span class="tok-k">pub fn</span> <span class="tok-f">sum</span>(n: <span class="tok-t">Node</span>) -&gt; <span class="tok-t">i64</span> {
+    <span class="tok-k">let</span> ls = <span class="tok-k">match</span> n.left { <span class="tok-t">Node</span> <span class="tok-k">as</span> l =&gt; <span class="tok-f">sum</span>(l); _ =&gt; <span class="tok-n">0</span> }
+    <span class="tok-k">let</span> rs = <span class="tok-k">match</span> n.right { <span class="tok-t">Node</span> <span class="tok-k">as</span> r =&gt; <span class="tok-f">sum</span>(r); _ =&gt; <span class="tok-n">0</span> }
+    n.value + ls + rs
+}
+
+<span class="tok-k">pub fn</span> <span class="tok-f">run</span>() -&gt; <span class="tok-t">i64</span> {
+    <span class="tok-k">let</span> l = <span class="tok-t">Node</span>::<span class="tok-f">leaf</span>(<span class="tok-n">2</span>)
+    <span class="tok-k">let</span> r = <span class="tok-t">Node</span>::<span class="tok-f">leaf</span>(<span class="tok-n">3</span>)
+    <span class="tok-k">let</span> root = <span class="tok-t">Node</span>::<span class="tok-f">branch</span>(<span class="tok-n">1</span>, l, r)   <span class="tok-c">// inferred first-class: flows into sum, never escapes run</span>
+    <span class="tok-f">sum</span>(root)   <span class="tok-c">// 6</span>
+}</code></pre></div>
+        <div class="meta-row">
+          <div class="meta delta"><span class="lbl">Delta from arena</span><span class="delta-none">Nothing visible.</span> The checker infers a <code>@local</code> bit on <code>n</code> (only read) and proves <code>root</code> stays inside <code>run</code>. No annotation written; code identical to arena S1.</div>
+          <div class="meta lower"><span class="lbl">Lowering</span>Identical to today: classes → heap-arena objects, <code>sum</code> recurses over pointers, the qualifier erased before codegen. Zero runtime cost — the bit exists only during checking.</div>
+        </div>
+        <div class="honest"><span class="lbl">Honest flag</span>The qualifier does <em>nothing</em> here — pure inference on a program that already type-checks. Not evidence the model helps; evidence it is invisible in the common case. Buys nothing beyond a soundness lens.</div>
+      </div>
+
+      <div class="model-row">
+        <div class="mr-head"><span class="mname">Ordered types</span><span class="mtag" style="color:var(--muted);background:#232636">internal proof</span></div>
+        <div class="code"><pre><code><span class="tok-c">/* Source is byte-identical to arena Teko (Node/sum/run as above).
+ * INTERNAL PROOF OBLIGATION (invisible):
+ *   ordered context for run()   Γ = [ l &lt; r &lt; root ]   (intro order = arena order)
+ * The whole tree lives in run()'s frame region, consumed on frame exit in reverse:
+ *   root ⊣ r ⊣ l.  Ordered typing DISCHARGES this: every alloc is freed
+ *   strictly-later-introduced-first, so the single bulk drop is provably sound —
+ *   sum() only READS and root outlives l,r within the SAME frame. */</span></code></pre></div>
+        <div class="meta-row">
+          <div class="meta delta"><span class="lbl">Delta from arena</span><span class="delta-none">Nothing (invisible).</span> Byte-identical source; the only addition is an internal ordered-context annotation the compiler attaches to the IR, discharges, then erases.</div>
+          <div class="meta lower"><span class="lbl">Lowering</span>Exactly today's: one frame region for <code>run()</code>, bump-allocated Nodes, a single region drop at frame exit. Proof erased before codegen; zero runtime and zero code-size delta.</div>
+        </div>
+        <div class="honest"><span class="lbl">Honest flag</span>The <em>only</em> scenario where ordered types and Teko agree perfectly — and even here the lens proves nothing the arena didn't already do; it replaces "we believe the drop is safe" with "the ordered context proves it." Confidence, not capability. It does not prove the class-pointer edges are non-aliasing; it <em>assumes</em> the tree is acyclic.</div>
+      </div>
+
+      <div class="model-row">
+        <div class="mr-head"><span class="mname">REAPS</span><span class="mtag" style="color:var(--amber);background:var(--amber-bg)">runtime</span></div>
+        <div class="code"><pre><code><span class="tok-c">// Source byte-identical to arena S1. REAPS is a teko_rt.c allocator swap:
+// no source change, no `reap` scope — pure build-then-sum, nothing freed mid-frame.</span></code></pre></div>
+        <div class="meta-row">
+          <div class="meta delta"><span class="lbl">Delta from arena</span><span class="delta-none">Nothing (invisible).</span> REAPS changes only which <code>teko_rt.c</code> allocator backs the frame region.</div>
+          <div class="meta lower"><span class="lbl">Lowering</span>Same arena: <code>l</code>/<code>r</code>/<code>root</code> bump-allocated, whole region dropped on return. The recycle path is never exercised — no node is individually freed, so the reap degenerates to a plain bump arena.</div>
+        </div>
+        <div class="honest"><span class="lbl">Honest flag</span>REAPS buys literally nothing here — allocate-only trees never free mid-frame, so the recycle-into-bump machinery is dead. Honest only insofar as it shows the surface is invisible; the model's whole point does not fire.</div>
+      </div>
+
+      <div class="model-row">
+        <div class="mr-head"><span class="mname">NOEMA</span><span class="mtag" style="color:var(--accent);background:#17203a">real syntax</span></div>
+        <div class="code"><pre><code><span class="tok-c">/** Tree summed through read-borrows: sum() only OBSERVES, so it takes &amp;Node. */</span>
+<span class="tok-k">pub fn</span> <span class="tok-f">sum</span>(n: <span class="tok-a">&amp;</span><span class="tok-t">Node</span>) -&gt; <span class="tok-t">i64</span> {
+    <span class="tok-k">let</span> ls = <span class="tok-k">match</span> n.left { <span class="tok-t">Node</span> <span class="tok-k">as</span> l =&gt; <span class="tok-f">sum</span>(<span class="tok-a">&amp;</span>l); _ =&gt; <span class="tok-n">0</span> }
+    <span class="tok-k">let</span> rs = <span class="tok-k">match</span> n.right { <span class="tok-t">Node</span> <span class="tok-k">as</span> r =&gt; <span class="tok-f">sum</span>(<span class="tok-a">&amp;</span>r); _ =&gt; <span class="tok-n">0</span> }
+    n.value + ls + rs
+}
+<span class="tok-k">pub fn</span> <span class="tok-f">run</span>() -&gt; <span class="tok-t">i64</span> {
+    <span class="tok-k">let</span> l = <span class="tok-t">Node</span>::<span class="tok-f">leaf</span>(<span class="tok-n">2</span>); <span class="tok-k">let</span> r = <span class="tok-t">Node</span>::<span class="tok-f">leaf</span>(<span class="tok-n">3</span>)
+    <span class="tok-k">let</span> root = <span class="tok-t">Node</span>::<span class="tok-f">branch</span>(<span class="tok-n">1</span>, l, r)
+    <span class="tok-f">sum</span>(<span class="tok-a">&amp;</span>root)   <span class="tok-c">// 6</span>
+}</code></pre></div>
+        <div class="meta-row">
+          <div class="meta delta"><span class="lbl">Delta from arena</span><code>sum()</code> takes <code>&amp;Node</code> instead of <code>Node</code>; recursive calls pass <code>&amp;l</code>/<code>&amp;r</code>. The tree is still arena-owned; only the read traversal is a borrow. Ownership and construction unchanged.</div>
+          <div class="meta lower"><span class="lbl">Lowering</span><code>&amp;Node</code> erases to a plain <code>const Node*</code>. No copy, no discard/free on the borrow. Identical machine code to today's by-reference class pointer; the sigil is a compile-time-only tether.</div>
+        </div>
+        <div class="honest"><span class="lbl">Honest flag</span>Pure cosmetics — no dangling risk here, so the noema buys nothing except signalling intent. On a well-nested recursion the "never stored/returned" check is trivially satisfied and adds no safety a plain <code>Node</code> param lacked.</div>
+      </div>
+
+      <div class="model-row">
+        <div class="mr-head"><span class="mname">Relevant types</span><span class="mtag" style="color:var(--accent);background:#17203a">real syntax</span></div>
+        <div class="code"><pre><code><span class="tok-k">pub fn</span> <span class="tok-f">run</span>() -&gt; <span class="tok-t">i64</span> {
+    <span class="tok-a">#must_free</span> <span class="tok-k">let</span> l = <span class="tok-t">Node</span>::<span class="tok-f">leaf</span>(<span class="tok-n">2</span>)
+    <span class="tok-a">#must_free</span> <span class="tok-k">let</span> r = <span class="tok-t">Node</span>::<span class="tok-f">leaf</span>(<span class="tok-n">3</span>)
+    <span class="tok-a">#must_free</span> <span class="tok-k">let</span> root = <span class="tok-t">Node</span>::<span class="tok-f">branch</span>(<span class="tok-n">1</span>, l, r)  <span class="tok-c">// consumes l,r into the tree —</span>
+                                                 <span class="tok-c">// their obligation transfers to root</span>
+    <span class="tok-k">let</span> total = <span class="tok-f">sum</span>(root)                        <span class="tok-c">// 6</span>
+    <span class="tok-t">teko::mem</span>::<span class="tok-f">free</span>(root)                        <span class="tok-c">// discharges the whole tree</span>
+    total
+    <span class="tok-c">// delete the free() line and run() would NOT compile:</span>
+    <span class="tok-c">//   error: relevant handle `root` reaches end of scope unconsumed</span>
+}</code></pre></div>
+        <div class="meta-row">
+          <div class="meta delta"><span class="lbl">Delta from arena</span>Adds <code>#must_free</code> on three bindings + an explicit <code>free(root)</code>. Arena omits both (the tree leaks to root, reclaimed only at exit). Consuming <code>l</code>,<code>r</code> into <code>branch</code> transfers their obligation to <code>root</code> — one free, not three.</div>
+          <div class="meta lower"><span class="lbl">Lowering</span><code>#must_free</code> is a compile-time relevance bit, fully erased. Node allocs → identical arena bump-allocs; <code>free(root)</code> → the existing free-list-over-arena call. Zero runtime cost; the only artifact is a compile error on a missing free.</div>
+        </div>
+        <div class="honest"><span class="lbl">Honest flag</span>Catches the <em>leak</em>, nothing more. After <code>free(root)</code> the child pointers dangle exactly as in S6 — reading them is still an un-diagnosed UAF. The obligation-transfer rule presumes Teko sees that <code>branch</code> stores its args — leaning on the same reachability fact it does not yet compute; the honest MVP restricts <code>#must_free</code> to same-scope frees.</div>
+      </div>
+
+      <div class="model-row">
+        <div class="mr-head"><span class="mname">Adoption &amp; abandon</span><span class="mtag" style="color:var(--amber);background:var(--amber-bg)">real syntax · Pile B</span></div>
+        <div class="code"><pre><code><span class="tok-k">pub type</span> <span class="tok-t">Node</span> = <span class="tok-k">class in region</span> {   <span class="tok-c">// `in region` = adoptable: carries a hidden adopter tag</span>
+    <span class="tok-k">pub</span> value: <span class="tok-t">i64</span>; <span class="tok-k">pub</span> left: <span class="tok-t">Node?</span>; <span class="tok-k">pub</span> right: <span class="tok-t">Node?</span>
+}
+<span class="tok-k">pub fn</span> <span class="tok-f">run</span>() -&gt; <span class="tok-t">i64</span> {
+    <span class="tok-k">region</span> arena {                              <span class="tok-c">// opens an adopter region</span>
+        <span class="tok-k">let</span> l = <span class="tok-f">adopt</span>(arena, <span class="tok-t">Node</span> { value = <span class="tok-n">2</span>; left = null; right = null })
+        <span class="tok-k">let</span> r = <span class="tok-f">adopt</span>(arena, <span class="tok-t">Node</span> { value = <span class="tok-n">3</span>; left = null; right = null })
+        <span class="tok-k">let</span> root = <span class="tok-f">adopt</span>(arena, <span class="tok-t">Node</span> { value = <span class="tok-n">1</span>; left = l; right = r })
+        <span class="tok-f">sum</span>(root)   <span class="tok-c">// 6</span>
+    }                                           <span class="tok-c">// arena drops: whole tree freed in bulk</span>
+}</code></pre></div>
+        <div class="meta-row">
+          <div class="meta delta"><span class="lbl">Delta from arena</span>Adds <code>region arena { }</code> and <code>adopt(arena, …)</code> around allocation; class marked <code>class in region</code> carries an adopter tag. Same result as arena S1 (which needs none of this). Pure <em>overhead</em>: extra syntax + a per-node tag word for zero benefit.</div>
+          <div class="meta lower"><span class="lbl">Lowering</span><code>region arena</code> → bump arena push/pop (today's frame region). Each <code>Node</code> gains a hidden <code>uintptr adopter</code> field set by <code>adopt</code>. <code>sum</code> unchanged. Region drop = single reset. Tag words are dead weight here (never read).</div>
+        </div>
+        <div class="honest"><span class="lbl">Honest flag</span>For a pure tree this model buys <em>nothing</em> over the shipping arena and costs one tag word per node plus adopt-call noise — the arena already handles nested-lifetime trees perfectly. S1 only demonstrates the syntax; value does not appear until cycles / back-edges (S3 / S4).</div>
+      </div>
+    </article>
+
+    <!-- ============ S2 ============ -->
+    <article class="scenario" id="s2">
+      <div class="s-head">
+        <span class="s-id">S2</span>
+        <span class="s-name">Return-fresh — build a list locally and return it</span>
+        <span class="s-sub">The case the arena was <em>built</em> to handle via escape-analysis + promote-to-root. This is where the invisible models diverge most sharply: some name it, some reject it, one regresses it.</span>
+      </div>
+
+      <div class="model-row">
+        <div class="mr-head"><span class="mname">Second-class values</span><span class="mtag" style="color:var(--green);background:var(--green-bg)">inferred</span></div>
+        <div class="code"><pre><code><span class="tok-c">/** THE SCENARIO THAT MATTERS. The RETURN is the decision point:
+ *  `xs` MUST be inferred first-class, or the return is rejected. */</span>
+<span class="tok-k">pub fn</span> <span class="tok-f">make_range</span>(n: <span class="tok-t">i64</span>) -&gt; <span class="tok-t">[]i64</span> {
+    <span class="tok-k">mut</span> xs: <span class="tok-t">[]i64</span> = <span class="tok-t">teko::list</span>::<span class="tok-f">empty</span>()   <span class="tok-c">// inference starts xs as @local (frame-scoped)</span>
+    <span class="tok-k">mut</span> i = <span class="tok-n">0</span>
+    <span class="tok-k">loop</span> {
+        <span class="tok-k">if</span> i &gt;= n { <span class="tok-k">break</span> }
+        xs = <span class="tok-t">teko::list</span>::<span class="tok-f">push</span>(xs, i)
+        i++
+    }
+    xs   <span class="tok-c">// RETURN forces first-class: checker PROMOTES xs here, or errors</span>
+}
+
+<span class="tok-c">/** Contrast — DOES NOT COMPILE: a value capturing a @local Ref cannot be returned. */</span>
+<span class="tok-c">// pub fn leak(seed: []i64) -> Ref&lt;[]i64&gt; {</span>
+<span class="tok-c">//     let r = teko::mem::ref(seed)   // r is @local (borrow of a param)</span>
+<span class="tok-c">//     r                              // ERROR: second-class `r` may not escape</span>
+<span class="tok-c">// }</span></code></pre></div>
+        <div class="meta-row">
+          <div class="meta delta"><span class="lbl">Delta from arena</span>Surface identical for the working <code>make_range</code>. The delta is the <em>rejection</em> path (commented <code>leak</code>): today Teko silently allows a Ref to be returned and dangle; here that return is a compile error. For owning values, inference promotes to first-class at the return — nothing changes.</div>
+          <div class="meta lower"><span class="lbl">Lowering</span><code>make_range</code> unchanged: <code>xs</code> inferred first-class <em>because</em> returned, so it lowers to today's arena-promotion. The rejected <code>leak</code> never reaches codegen. No runtime check — the escape decision is entirely static.</div>
+        </div>
+        <div class="honest"><span class="lbl">Honest flag</span>The win is soundness on the <em>reject</em> side, not capability: it does not make more programs return values — it makes illegal returns (returning a borrow/Ref) a compile error instead of a silent dangle. The promotion of <code>xs</code> is exactly today's arena behavior; the model only <em>names</em> it. Its soundness is contingent on the name-based analysis correctly separating "buffer escapes" from "Ref-of-param does not" — the one load-bearing, unaudited spot.</div>
+      </div>
+
+      <div class="model-row">
+        <div class="mr-head"><span class="mname">Ordered types</span><span class="mtag" style="color:var(--muted);background:#232636">internal proof</span></div>
+        <div class="code"><pre><code><span class="tok-c">/* Source byte-identical to arena S2 (make_range returns a fresh []i64).
+ * INTERNAL PROOF OBLIGATION (invisible) — and it FAILS in the pure calculus:
+ *   Γ_make_range = [ xs ]   introduced inside make_range's frame.
+ * Strict LIFO demands xs be CONSUMED before the frame closes. But `return xs`
+ * moves xs PAST the frame boundary — a non-nested lifetime. In pure ordered
+ * types this is ILL-TYPED: the fragment has no rule for a resource outliving
+ * its introducing context. Teko handles it via ESCAPE ANALYSIS + promote-to-root,
+ * machinery OUTSIDE the ordered fragment. So the lens does not certify make_range;
+ * it FLAGS the escape edge as 'beyond LIFO — trust the escape analysis here.' */</span></code></pre></div>
+        <div class="meta-row">
+          <div class="meta delta"><span class="lbl">Delta from arena</span><span class="delta-none">Nothing (invisible)</span> at the source — but a decisive <em>negative</em> signal internally: pure ordered types <em>reject</em> this program, whereas Teko compiles it fine. The delta is diagnostic, not behavioral.</div>
+          <div class="meta lower"><span class="lbl">Lowering</span>Teko lowers as today: <code>xs</code> and its buffer promoted out of the frame into the caller/root region. Ordered types contribute <em>nothing</em> — the escape/promotion path is precisely what they cannot express; codegen falls back entirely to existing escape analysis.</div>
+        </div>
+        <div class="honest"><span class="lbl">Honest flag</span>THE headline honesty point for this model: strict LIFO forbids exactly this, so pure ordered types express <em>strictly less</em> than Teko already does. Return-fresh is the canonical case the arena was built for, and the one ordered logic refuses to type. The lens is useful only as a boundary marker ("escape happens here, outside what I proved") — the actual soundness still rests on Teko's per-name analysis, which may itself be unsound for returned values.</div>
+      </div>
+
+      <div class="model-row">
+        <div class="mr-head"><span class="mname">REAPS</span><span class="mtag" style="color:var(--amber);background:var(--amber-bg)">runtime</span></div>
+        <div class="code"><pre><code><span class="tok-c">// Source byte-identical to arena S2. The list grows by repeated push:
+// each push retires the OLD backing buffer. Under REAPS those retired buffers
+// are recycled into the bump frontier instead of stranded — but invisible; no surface change.</span></code></pre></div>
+        <div class="meta-row">
+          <div class="meta delta"><span class="lbl">Delta from arena</span><span class="delta-none">Nothing visible.</span> The runtime delta: intermediate (superseded) list buffers from each push are recycled by the allocator instead of sitting dead until frame-drop.</div>
+          <div class="meta lower"><span class="lbl">Lowering</span>Same escape routing — <code>xs</code> promoted to caller/root. The delta is under the hood: today's park-on-freelist parks retired buffers without coalescing; REAPS coalesces adjacent retired runs and hands them back to the bump pointer, so a long grow-loop peaks lower. The escaped final buffer is untouched (still live).</div>
+        </div>
+        <div class="honest"><span class="lbl">Honest flag</span>Recycling helps only the transient grow-buffers, not the escaping result — and Teko <em>already</em> parks freed buffers, so the only real delta is coalescing. For a 4-element loop the peak-memory win is negligible; the benefit is asymptotic, on large grow loops. Correctness and lifetime unchanged.</div>
+      </div>
+
+      <div class="model-row">
+        <div class="mr-head"><span class="mname">NOEMA</span><span class="mtag" style="color:var(--accent);background:#17203a">real syntax</span></div>
+        <div class="code"><pre><code><span class="tok-c">/** RETURN-FRESH: the result ESCAPES, so it CANNOT be a noema. A &amp;T may never be returned. */</span>
+<span class="tok-k">pub fn</span> <span class="tok-f">make_range</span>(n: <span class="tok-t">i64</span>) -&gt; <span class="tok-t">[]i64</span> {   <span class="tok-c">// owns + escapes → plain owning value, NOT &amp;[]i64</span>
+    <span class="tok-k">mut</span> xs: <span class="tok-t">[]i64</span> = <span class="tok-t">teko::list</span>::<span class="tok-f">empty</span>()
+    <span class="tok-k">mut</span> i = <span class="tok-n">0</span>
+    <span class="tok-k">loop</span> { <span class="tok-k">if</span> i &gt;= n { <span class="tok-k">break</span> }; xs = <span class="tok-t">teko::list</span>::<span class="tok-f">push</span>(xs, i); i++ }
+    xs   <span class="tok-c">// escapes to caller/root region — an owning value, arena-promoted as today</span>
+}</code></pre></div>
+        <div class="meta-row">
+          <div class="meta delta"><span class="lbl">Delta from arena</span><span class="delta-none">Nothing changed</span> vs the real arena version — and that is the point. A returned fresh list is exactly what a noema forbids, so <code>make_range</code> keeps its owning <code>-&gt; []i64</code> signature. The model draws the line here rather than adding syntax.</div>
+          <div class="meta lower"><span class="lbl">Lowering</span>Identical to today: <code>xs</code> promoted out of the frame into caller/root. No borrow involved, so no noema machinery participates.</div>
+        </div>
+        <div class="honest"><span class="lbl">Honest flag</span>The noema deliberately does not help return-fresh — it is a confinement rule, not an ownership-transfer mechanism. If anything it makes the escape boundary explicit (you literally cannot write <code>&amp;[]i64</code> as the return type), a small documentation win, not a capability win.</div>
+      </div>
+
+      <div class="model-row">
+        <div class="mr-head"><span class="mname">Relevant types</span><span class="mtag" style="color:var(--accent);background:#17203a">real syntax</span></div>
+        <div class="code"><pre><code><span class="tok-k">pub fn</span> <span class="tok-f">make_range</span>(n: <span class="tok-t">i64</span>) -&gt; <span class="tok-a">#must_free</span> <span class="tok-t">[]i64</span> {
+    <span class="tok-c">// Return type is a relevant handle: the CALLER inherits the free obligation.</span>
+    <span class="tok-a">#must_free</span> <span class="tok-k">mut</span> xs: <span class="tok-t">[]i64</span> = <span class="tok-t">teko::list</span>::<span class="tok-f">empty</span>()
+    <span class="tok-k">mut</span> i = <span class="tok-n">0</span>
+    <span class="tok-k">loop</span> {
+        <span class="tok-k">if</span> i &gt;= n { <span class="tok-k">break</span> }
+        xs = <span class="tok-t">teko::list</span>::<span class="tok-f">push</span>(xs, i)  <span class="tok-c">// rebind keeps the SAME obligation on xs</span>
+        i++
+    }
+    xs   <span class="tok-c">// RETURN discharges here, re-emits to caller via #must_free return type</span>
+}
+<span class="tok-k">pub fn</span> <span class="tok-f">run</span>() -&gt; <span class="tok-t">i64</span> {
+    <span class="tok-a">#must_free</span> <span class="tok-k">let</span> xs = <span class="tok-f">make_range</span>(<span class="tok-n">4</span>)          <span class="tok-c">// obligation received from callee</span>
+    <span class="tok-k">let</span> total = xs[<span class="tok-n">0</span>] + xs[<span class="tok-n">1</span>] + xs[<span class="tok-n">2</span>] + xs[<span class="tok-n">3</span>]  <span class="tok-c">// 6</span>
+    <span class="tok-t">teko::mem</span>::<span class="tok-f">free</span>(xs)                        <span class="tok-c">// caller discharges it</span>
+    total
+}</code></pre></div>
+        <div class="meta-row">
+          <div class="meta delta"><span class="lbl">Delta from arena</span>Return type gains <code>#must_free</code>; caller gains <code>#must_free let</code> + explicit <code>free(xs)</code>. Arena returns plain <code>[]i64</code> and never frees. Returning is the sanctioned way to discharge the obligation in the callee and re-raise it on the caller.</div>
+          <div class="meta lower"><span class="lbl">Lowering</span>Qualifier erased; <code>make_range</code> → the identical escape-promotion the arena already does. <code>free(xs)</code> → the same <code>mem::free</code> call. The only compile-time addition is a dataflow check that every path frees, returns, or moves <code>xs</code>. No runtime delta.</div>
+        </div>
+        <div class="honest win"><span class="lbl">Honest flag · clean case</span>The clean case for a relevant type — an escaping allocation is exactly what leaks silently today, and threading the obligation through the return turns "caller forgot to free" into a compile error. Caveat: it works only because the obligation propagates through the <code>xs = push(xs,…)</code> rebinds as the-same-handle (a cheap, sound syntactic move rule). It still frees nothing the arena wouldn't reclaim at exit — it just makes the free mandatory and checked for long-running programs.</div>
+      </div>
+
+      <div class="model-row">
+        <div class="mr-head"><span class="mname">Adoption &amp; abandon</span><span class="mtag" style="color:var(--rose);background:var(--rose-bg)">real syntax · Pile B · regresses</span></div>
+        <div class="code"><pre><code><span class="tok-c">/** RETURN-FRESH is the HARD case for adopters. A region is LEXICAL, so a node
+ *  adopted into a local region cannot escape the block. To return, thread the
+ *  caller's region as a parameter (or abandon + re-adopt, paying per-object checks). */</span>
+<span class="tok-k">pub fn</span> <span class="tok-f">make_range</span>(dst: <span class="tok-k">region</span>, n: <span class="tok-t">i64</span>) -&gt; <span class="tok-t">[]i64</span> {
+    <span class="tok-k">mut</span> xs: <span class="tok-t">[]i64</span> = <span class="tok-t">teko::list</span>::<span class="tok-f">empty</span>()
+    <span class="tok-k">mut</span> i = <span class="tok-n">0</span>
+    <span class="tok-k">loop</span> { <span class="tok-k">if</span> i &gt;= n { <span class="tok-k">break</span> }; xs = <span class="tok-t">teko::list</span>::<span class="tok-f">push</span>(xs, i); i++ }  <span class="tok-c">// buffer adopted into dst</span>
+    xs   <span class="tok-c">// escapes safely: already lives in the caller-owned region dst</span>
+}
+<span class="tok-k">pub fn</span> <span class="tok-f">run</span>() -&gt; <span class="tok-t">i64</span> {
+    <span class="tok-k">region</span> here {
+        <span class="tok-k">let</span> xs = <span class="tok-f">make_range</span>(here, <span class="tok-n">4</span>)   <span class="tok-c">// built directly in `here`</span>
+        xs[<span class="tok-n">0</span>] + xs[<span class="tok-n">1</span>] + xs[<span class="tok-n">2</span>] + xs[<span class="tok-n">3</span>]  <span class="tok-c">// 6</span>
+    }
+}</code></pre></div>
+        <div class="meta-row">
+          <div class="meta delta"><span class="lbl">Delta from arena</span>Arena returns a fresh list with <em>zero</em> ceremony (auto-promotes to caller/root). Here the region is lexical and non-escaping, so you must thread <code>dst: region</code> as a parameter, or abandon-and-re-adopt across the boundary (an O(n) dynamic check per node). A <em>regression</em> in ergonomics vs shipping Teko for the escape case.</div>
+          <div class="meta lower"><span class="lbl">Lowering</span><code>dst: region</code> → passing the caller's arena pointer down; <code>push</code> allocates in <code>dst</code>'s bump space so it survives the callee frame. The abandon/re-adopt alternative would incur a runtime tag-equality check + rewrite per element — O(n) purely to move ownership.</div>
+        </div>
+        <div class="honest"><span class="lbl">Honest flag · the model's worst case</span>The honest counter-weight to the S3/S4 win: adopter regions do not auto-promote escapees, so the exact case the shipping arena is <em>designed</em> for becomes either region-threading boilerplate or an O(n) abandon/re-adopt tax. The frontier does not give escape for free here — it makes it harder than the arena already does.</div>
+      </div>
+    </article>
+
+    <!-- ============ S3 ============ -->
+    <article class="scenario" id="s3">
+      <div class="s-head">
+        <span class="s-id">S3</span>
+        <span class="s-name">Cyclic graph — mutual back-edges, capped walk</span>
+        <span class="s-sub">The first real cliff. A refcount would leak the 2-cycle; the arena bulk-drops it. This is the one place a Pile-B model earns a genuine new capability.</span>
+      </div>
+
+      <div class="model-row">
+        <div class="mr-head"><span class="mname">Second-class values</span><span class="mtag" style="color:var(--green);background:var(--green-bg)">inferred</span></div>
+        <div class="code"><pre><code><span class="tok-c">/** Cyclic graph. Second-class values are SILENT here — a mutable cycle is exactly the
+ *  aliased/escaping data the qualifier says nothing about. Surface identical to today. */</span>
+<span class="tok-k">pub fn</span> <span class="tok-f">link</span>(self, other: <span class="tok-t">GNode</span>) { self.next = other }   <span class="tok-c">// field-store: `other` must be first-class</span>
+
+<span class="tok-k">pub fn</span> <span class="tok-f">run</span>() -&gt; <span class="tok-t">i64</span> {
+    <span class="tok-k">let</span> a = <span class="tok-t">GNode</span>::<span class="tok-f">make</span>(<span class="tok-n">1</span>)
+    <span class="tok-k">let</span> b = <span class="tok-t">GNode</span>::<span class="tok-f">make</span>(<span class="tok-n">2</span>)
+    a.<span class="tok-f">link</span>(b)   <span class="tok-c">// b stored into a.next ⇒ b is first-class</span>
+    b.<span class="tok-f">link</span>(a)   <span class="tok-c">// a stored into b.next ⇒ a is first-class</span>
+    <span class="tok-f">walk</span>(a, <span class="tok-n">4</span>)  <span class="tok-c">// 1 + 2 + 1 + 2 = 6</span>
+}</code></pre></div>
+        <div class="meta-row">
+          <div class="meta delta"><span class="lbl">Delta from arena</span><span class="delta-none">None functionally.</span> <code>link</code> stores <code>other</code> into a field, so <code>a</code>, <code>b</code> are inferred <em>first-class</em> — the qualifier correctly steps out of the way. <code>start</code> in <code>walk</code> inferred <code>@local</code>. Same code, same cap-bounded traversal.</div>
+          <div class="meta lower"><span class="lbl">Lowering</span>Identical to today: two arena objects, a back-edge set by field mutation, a step-capped walk. Qualifier erased. The cycle still lives on the arena, reclaimed only in bulk on region drop.</div>
+        </div>
+        <div class="honest"><span class="lbl">Honest flag</span>Does <em>nothing</em> for the actual cycle problem. Second-class values cannot reclaim a cycle, detect the leak, or prove isolation — a cyclic mutable graph is precisely the escaping/aliased data the model has zero power over. It infers <code>a</code>/<code>b</code> first-class and has nothing more to offer. The cap is still what makes the walk terminate.</div>
+      </div>
+
+      <div class="model-row">
+        <div class="mr-head"><span class="mname">Ordered types</span><span class="mtag" style="color:var(--muted);background:#232636">internal proof</span></div>
+        <div class="code"><pre><code><span class="tok-c">/* Source byte-identical to arena S3 (mutual cycle a↔b set by mutation, capped walk).
+ * INTERNAL PROOF OBLIGATION (invisible): ordered context Γ = [ a &lt; b ].
+ * The lens PROVES a and b are BOTH consumed on run()'s frame drop, later-first
+ * (b ⊣ a), so BULK RECLAMATION is LIFO-sound: nothing outlives the frame.
+ * But the CYCLE — the a.next=b / b.next=a back-edges — is invisible to ordered
+ * logic: the fragment is about consumption ORDER, not the reachability GRAPH.
+ * It proves 'the region drop is ordered-sound'; NOT 'the cycle is safe to walk' —
+ * that safety comes entirely from the runtime step-cap, not the type system. */</span></code></pre></div>
+        <div class="meta-row">
+          <div class="meta delta"><span class="lbl">Delta from arena</span><span class="delta-none">Nothing (invisible).</span> Ordered types certify only the frame-level LIFO drop of {a,b}; the cyclic aliasing is neither certified nor forbidden — simply outside the fragment's vocabulary.</div>
+          <div class="meta lower"><span class="lbl">Lowering</span>Identical: <code>a</code> and <code>b</code> bump-allocated in <code>run()</code>'s frame, both reclaimed in one region drop. The cycle needs no special reclamation — bulk region-drop ignores internal edges. Ordered types add no instruction.</div>
+        </div>
+        <div class="honest"><span class="lbl">Honest flag</span>Gives a <em>false sense of coverage</em> if oversold: they certify the drop is LIFO-ordered, but that was never the risky part — the risk is the cycle, and the fragment says nothing about aliasing or reachability. The traversal is safe only because of the runtime cap. A clean illustration that ordered logic addresses lifetime <em>nesting</em>, not the graph-shape cliffs that are Teko's actual hard problems.</div>
+      </div>
+
+      <div class="model-row">
+        <div class="mr-head"><span class="mname">REAPS</span><span class="mtag" style="color:var(--amber);background:var(--amber-bg)">runtime</span></div>
+        <div class="code"><pre><code><span class="tok-c">// Source byte-identical to arena S3. REAPS is orthogonal to cycles: it is an allocator,
+// it has no reachability graph and cannot free a cyclic pair individually. The cycle lives
+// and dies with the whole reap (bulk drop), exactly as with today's arena.</span></code></pre></div>
+        <div class="meta-row">
+          <div class="meta delta"><span class="lbl">Delta from arena</span><span class="delta-none">Nothing (invisible).</span> The cyclic pair is bulk-reclaimed on region drop, identical to today; REAPS adds no cycle-awareness.</div>
+          <div class="meta lower"><span class="lbl">Lowering</span><code>a</code> and <code>b</code> bump-allocated; back-edge is a raw pointer field; whole region dropped at once. REAPS never tries to individually free <code>a</code> or <code>b</code> (nothing calls free), so it behaves as the plain arena. No per-object recycle path involved.</div>
+        </div>
+        <div class="honest"><span class="lbl">Honest flag</span>REAPS does <em>not</em> touch the cycle cliff at all — a bump/free allocator with no reachability tracking can neither detect the a↔b cycle nor free the pair individually. Any impression that a richer allocator helps with cycles is false; only bulk region-drop reclaims them, exactly as today.</div>
+      </div>
+
+      <div class="model-row">
+        <div class="mr-head"><span class="mname">NOEMA</span><span class="mtag" style="color:var(--accent);background:#17203a">real syntax</span></div>
+        <div class="code"><pre><code><span class="tok-k">pub fn</span> <span class="tok-f">link</span>(self, other: <span class="tok-t">GNode</span>) { self.next = other }   <span class="tok-c">// mutation → not a noema</span>
+
+<span class="tok-c">/** Read-only cyclic walk over a borrow; the cap still bounds the cycle. */</span>
+<span class="tok-k">pub fn</span> <span class="tok-f">walk</span>(start: <span class="tok-a">&amp;</span><span class="tok-t">GNode</span>, cap: <span class="tok-t">i64</span>) -&gt; <span class="tok-t">i64</span> {
+    <span class="tok-k">mut</span> total = <span class="tok-n">0</span>
+    <span class="tok-k">mut</span> cur: <span class="tok-t">GNode?</span> = start.<span class="tok-f">next_or_self</span>()   <span class="tok-c">// borrow observed, never stored past scope</span>
+    <span class="tok-c">// … capped loop …</span>
+    total
+}
+<span class="tok-k">pub fn</span> <span class="tok-f">run</span>() -&gt; <span class="tok-t">i64</span> {
+    <span class="tok-k">let</span> a = <span class="tok-t">GNode</span>::<span class="tok-f">make</span>(<span class="tok-n">1</span>); <span class="tok-k">let</span> b = <span class="tok-t">GNode</span>::<span class="tok-f">make</span>(<span class="tok-n">2</span>)
+    a.<span class="tok-f">link</span>(b); b.<span class="tok-f">link</span>(a)   <span class="tok-c">// cycle closed by owning mutation</span>
+    <span class="tok-f">walk</span>(<span class="tok-a">&amp;</span>a, <span class="tok-n">4</span>)             <span class="tok-c">// 6</span>
+}</code></pre></div>
+        <div class="meta-row">
+          <div class="meta delta"><span class="lbl">Delta from arena</span><code>walk()</code> takes <code>&amp;GNode</code>. Construction (<code>make</code>/<code>link</code>) untouched: closing the cycle requires field mutation, which a read-only noema forbids, so <code>link(self, other)</code> stays an owning method.</div>
+          <div class="meta lower"><span class="lbl">Lowering</span><code>&amp;GNode</code> → <code>const GNode*</code>. The cycle is unaffected — it lives in the arena exactly as today, reclaimed by bulk region drop. The borrow adds no per-node cost and no reachability tracking.</div>
+        </div>
+        <div class="honest"><span class="lbl">Honest flag</span>The noema does <em>nothing</em> for the actual hard part of S3 — hosting and reclaiming the cycle. The cycle still relies on arena bulk-drop; the borrow only makes the read traversal tethered. Do not read this as "noema handles cyclic graphs": it handles the read, the arena handles the cycle.</div>
+      </div>
+
+      <div class="model-row">
+        <div class="mr-head"><span class="mname">Relevant types</span><span class="mtag" style="color:var(--accent);background:#17203a">real syntax</span></div>
+        <div class="code"><pre><code><span class="tok-c">/** Per-node #must_free does NOT work on a cycle: after a.link(b); b.link(a) they co-own
+ *  each other, and freeing one dangles the other. So it must be ONE obligation over the region. */</span>
+<span class="tok-k">pub fn</span> <span class="tok-f">run</span>() -&gt; <span class="tok-t">i64</span> {
+    <span class="tok-a">#must_free</span> <span class="tok-k">region</span> g {
+        <span class="tok-k">let</span> a = <span class="tok-t">GNode</span>::<span class="tok-f">make</span>(<span class="tok-n">1</span>)
+        <span class="tok-k">let</span> b = <span class="tok-t">GNode</span>::<span class="tok-f">make</span>(<span class="tok-n">2</span>)
+        a.<span class="tok-f">link</span>(b)   <span class="tok-c">// a → b</span>
+        b.<span class="tok-f">link</span>(a)   <span class="tok-c">// b → a  (cycle closed, both live in region g)</span>
+        <span class="tok-k">let</span> total = <span class="tok-f">walk</span>(a, <span class="tok-n">4</span>)   <span class="tok-c">// 6</span>
+        total
+    }   <span class="tok-c">// region g reclaimed in bulk here; the ONE obligation discharged by the close</span>
+}</code></pre></div>
+        <div class="meta-row">
+          <div class="meta delta"><span class="lbl">Delta from arena</span>Wraps the two nodes in a <code>#must_free region g { }</code> instead of bare <code>let</code> bindings; the region close replaces any per-node free. Individual <code>#must_free let a</code>/<code>let b</code> is deliberately not used — the model degrades to a whole-region obligation the moment a cycle exists.</div>
+          <div class="meta lower"><span class="lbl">Lowering</span><code>#must_free region { }</code> → a nested arena push/pop — the exact mechanism Teko already has, just marked so the compiler requires the region be entered/exited (always true, lexically). Runtime cost = the existing bulk region drop; zero new machinery.</div>
+        </div>
+        <div class="honest"><span class="lbl">Honest flag</span>Where the idea hits its ceiling honestly: for a cycle there is no sound per-object free, so <code>#must_free</code> collapses into "the region must be closed" — which the lexical arena already guarantees. The annotation buys essentially <em>nothing</em> here beyond documentation. Presenting per-node <code>#must_free</code> on cyclic nodes would be a lie; the honest surface forces the region form and admits it adds no reclamation power.</div>
+      </div>
+
+      <div class="model-row">
+        <div class="mr-head"><span class="mname">Adoption &amp; abandon</span><span class="mtag" style="color:var(--green);background:var(--green-bg)">real syntax · Pile B · the win</span></div>
+        <div class="code"><pre><code><span class="tok-c">/** THIS is where the model shines. Both nodes adopted into one region; the back-edge
+ *  b.next=a is just an alias WITHIN the region — no escape-gate exception, no index workaround.
+ *  The region owns the whole cycle and reclaims it in bulk. A 2-cycle LEAKS under refcount;
+ *  no tracing GC needed. No abandon ⇒ no dynamic check fires. */</span>
+<span class="tok-k">pub type</span> <span class="tok-t">GNode</span> = <span class="tok-k">class in region</span> { <span class="tok-k">pub</span> id: <span class="tok-t">i64</span>; <span class="tok-k">pub</span> next: <span class="tok-t">GNode?</span> }
+<span class="tok-k">pub fn</span> <span class="tok-f">run</span>() -&gt; <span class="tok-t">i64</span> {
+    <span class="tok-k">region</span> graph {
+        <span class="tok-k">let</span> a = <span class="tok-f">adopt</span>(graph, <span class="tok-t">GNode</span> { id = <span class="tok-n">1</span>; next = null })
+        <span class="tok-k">let</span> b = <span class="tok-f">adopt</span>(graph, <span class="tok-t">GNode</span> { id = <span class="tok-n">2</span>; next = null })
+        a.next = b   <span class="tok-c">// free intra-region alias</span>
+        b.next = a   <span class="tok-c">// cycle closed — both ends co-owned by `graph`</span>
+        <span class="tok-f">walk</span>(a, <span class="tok-n">4</span>)   <span class="tok-c">// 6</span>
+    }               <span class="tok-c">// whole cycle freed in bulk; RC would have leaked it</span>
+}</code></pre></div>
+        <div class="meta-row">
+          <div class="meta delta"><span class="lbl">Delta from arena</span>Real S3 <em>already</em> compiles (mutable class fields close the cycle) and the arena already bulk-reclaims it — so the runtime <em>outcome</em> is the same. The genuine delta is soundness / story: the cycle is now co-owned by an explicit Coq-verified adopter region instead of the class-field-mutation loophole + traversal cap, and the "a bulk region can host a cycle no refcount can free" guarantee becomes first-class. It removes the need to fall back to arena-of-nodes + index.</div>
+          <div class="meta lower"><span class="lbl">Lowering</span><code>region graph</code> = bump arena; <code>adopt</code> sets each node's adopter tag. Back-edges are plain pointer stores. Region drop = one reset that frees both nodes regardless of the cycle. Tags written but, with no abandon, never checked — runtime cost is just the tag words.</div>
+        </div>
+        <div class="honest"><span class="lbl">Honest flag</span>The win is real but narrow: for a cycle you only <em>traverse</em>, shipping Teko already does this at runtime — the model adds a verified soundness story and drops the index-workaround, not a new runtime capability. Tag words are paid even though no abandon-check runs. The bulk reclaim is the actual jewel: it frees a cycle a refcount would leak, without a GC.</div>
+      </div>
+    </article>
+
+    <!-- ============ S4 ============ -->
+    <article class="scenario" id="s4">
+      <div class="s-head">
+        <span class="s-id">S4</span>
+        <span class="s-name">Doubly-linked list — next & prev, walked both ways</span>
+        <span class="s-sub">Every interior node is multiply-aliased. The canonical adoption showcase — and where the abandon-check earns its keep on splice-out, while the invisible models stay silent.</span>
+      </div>
+
+      <div class="model-row">
+        <div class="mr-head"><span class="mname">Second-class values</span><span class="mtag" style="color:var(--green);background:var(--green-bg)">inferred</span></div>
+        <div class="code"><pre><code><span class="tok-c">/** next AND prev are field-stores, so every node is inferred FIRST-CLASS.
+ *  The qualifier is invisible; surface identical to today. */</span>
+<span class="tok-k">pub fn</span> <span class="tok-f">attach</span>(self, n: <span class="tok-t">DNode</span>) {
+    self.next = n     <span class="tok-c">// n escapes into self's field ⇒ n first-class</span>
+    n.prev = self     <span class="tok-c">// self escapes into n's field ⇒ self first-class</span>
+}</code></pre></div>
+        <div class="meta-row">
+          <div class="meta delta"><span class="lbl">Delta from arena</span><span class="delta-none">None.</span> Because <code>attach</code> stores both directions into fields, inference marks every node first-class immediately — the <code>@local</code> qualifier never applies to a linked node. Code, behavior, both-directions walk identical to arena S4.</div>
+          <div class="meta lower"><span class="lbl">Lowering</span>Identical: three arena objects wired with next/prev by post-hoc field mutation, forward+backward capped walk. Qualifier erased, zero runtime cost.</div>
+        </div>
+        <div class="honest"><span class="lbl">Honest flag</span>Zero effect on the doubly-linked structure. The moment a node is stored into another's field it is first-class, so the model has nothing to enforce and nothing to reclaim. Back-edges, bulk reclamation, and the mandatory step caps are all exactly as today — the model neither helps nor hinders.</div>
+      </div>
+
+      <div class="model-row">
+        <div class="mr-head"><span class="mname">Ordered types</span><span class="mtag" style="color:var(--muted);background:#232636">internal proof</span></div>
+        <div class="code"><pre><code><span class="tok-c">/* Source byte-identical to arena S4 (attach writes prev via mutation; build3 RETURNS head).
+ * INTERNAL PROOF OBLIGATION (invisible) — FAILS TWICE:
+ *   (1) a,b,c introduced in build3's frame Γ = [ a &lt; b &lt; c ], but `return a` moves the
+ *       WHOLE structure past the frame — a non-nested escape, ill-typed in pure LIFO (as S2).
+ *   (2) the prev back-edges make the object graph non-tree; ordered logic has no rule
+ *       for the resulting aliasing.
+ * The lens certifies nothing here beyond flagging both boundaries. Reclamation is sound
+ * only because promotion routes the whole cluster to root and one bulk drop needs no
+ * per-edge reasoning. */</span></code></pre></div>
+        <div class="meta-row">
+          <div class="meta delta"><span class="lbl">Delta from arena</span><span class="delta-none">Nothing (invisible).</span> Doubly compounded rejection internally (escape + back-edge aliasing), zero source change, zero behavioral change.</div>
+          <div class="meta lower"><span class="lbl">Lowering</span>As today: <code>a,b,c</code> allocated in <code>build3</code>'s frame, then the head (and whole reachable cluster) promoted to caller/root on return; one bulk drop reclaims all three. next/prev are plain pointers; bulk region-drop never walks them. Ordered types contribute nothing.</div>
+        </div>
+        <div class="honest"><span class="lbl">Honest flag</span>The worst-case showcase of the ceiling: this violates <em>both</em> conditions ordered logic requires — nested lifetime (broken by the escaping return) and tree shape (broken by prev back-edges). If anyone claims ordered types make doubly-linked lists "sound," this is the counterexample: they don't touch the aliasing, and the cluster's lifetime correctness is the name-based escape analysis's burden — the very analysis the verify pass warns may be unsound for exactly this returned-aliased case.</div>
+      </div>
+
+      <div class="model-row">
+        <div class="mr-head"><span class="mname">REAPS</span><span class="mtag" style="color:var(--amber);background:var(--amber-bg)">runtime</span></div>
+        <div class="code"><pre><code><span class="tok-c">// Source byte-identical to arena S4. The three nodes escape build3() as one connected
+// object graph; REAPS reclaims them in bulk when the enclosing region drops, no per-node free.</span></code></pre></div>
+        <div class="meta-row">
+          <div class="meta delta"><span class="lbl">Delta from arena</span><span class="delta-none">Nothing (invisible).</span> The whole a↔b↔c graph is bulk-reclaimed by region drop exactly as today; REAPS adds nothing for a structure freed as a unit.</div>
+          <div class="meta lower"><span class="lbl">Lowering</span><code>a</code>/<code>b</code>/<code>c</code> bump-allocated; <code>next</code>/<code>prev</code> wired by mutation; the graph escapes <code>build3()</code> and is bulk-dropped. No individual free is issued, so REAPS' recycle path is inert. Same C, same lifetime.</div>
+        </div>
+        <div class="honest"><span class="lbl">Honest flag</span>No delta: a doubly-linked list freed as a whole is a pure bulk-drop case the plain arena already handles. REAPS would only matter if the program individually freed interior nodes and kept allocating — this scenario never does.</div>
+      </div>
+
+      <div class="model-row">
+        <div class="mr-head"><span class="mname">NOEMA</span><span class="mtag" style="color:var(--accent);background:#17203a">real syntax</span></div>
+        <div class="code"><pre><code><span class="tok-k">pub fn</span> <span class="tok-f">attach</span>(self, n: <span class="tok-t">DNode</span>) { self.next = n; n.prev = self }   <span class="tok-c">// mutation → not a noema</span>
+<span class="tok-k">pub fn</span> <span class="tok-f">build3</span>() -&gt; <span class="tok-t">DNode</span> { <span class="tok-c">/* a,b,c; a.attach(b); b.attach(c); */</span> a }  <span class="tok-c">// escapes → owning</span>
+
+<span class="tok-c">/** Forward then backward, all through a read-borrow of the head. */</span>
+<span class="tok-k">pub fn</span> <span class="tok-f">walk_both</span>(head: <span class="tok-a">&amp;</span><span class="tok-t">DNode</span>) -&gt; <span class="tok-t">i64</span> { <span class="tok-c">/* two capped loops over next then prev */</span> }
+<span class="tok-k">pub fn</span> <span class="tok-f">run</span>() -&gt; <span class="tok-t">i64</span> { <span class="tok-f">walk_both</span>(<span class="tok-a">&amp;</span><span class="tok-f">build3</span>()) }</code></pre></div>
+        <div class="meta-row">
+          <div class="meta delta"><span class="lbl">Delta from arena</span><code>walk_both()</code> takes <code>&amp;DNode</code>. Everything structural — <code>make</code>, <code>attach</code> (writes prev via mutation), <code>build3</code> returning an owning <code>DNode</code> — is unchanged, because back-edge wiring and escape both fall outside what a noema permits.</div>
+          <div class="meta lower"><span class="lbl">Lowering</span><code>&amp;DNode</code> → <code>const DNode*</code>. The next/prev back-edges are ordinary arena pointers. The borrow does not touch the aliasing between next and prev; both directions are just field reads under the const pointer.</div>
+        </div>
+        <div class="honest"><span class="lbl">Honest flag</span>S4's genuine difficulty is that a node is reachable via two edges — a shared-aliasing fact. The noema is silent on that; it only guarantees <code>walk_both</code> won't stash the head-borrow somewhere it outlives the list. Shared internal aliasing is still unproven and still relies on arena bulk-drop for safety.</div>
+      </div>
+
+      <div class="model-row">
+        <div class="mr-head"><span class="mname">Relevant types</span><span class="mtag" style="color:var(--accent);background:#17203a">real syntax</span></div>
+        <div class="code"><pre><code><span class="tok-k">pub fn</span> <span class="tok-f">build3</span>() -&gt; <span class="tok-a">#must_free</span> <span class="tok-k">region</span> <span class="tok-t">DNode</span> {
+    <span class="tok-a">#must_free</span> <span class="tok-k">region</span> dll {
+        <span class="tok-k">let</span> a = <span class="tok-t">DNode</span>::<span class="tok-f">make</span>(<span class="tok-n">1</span>); <span class="tok-k">let</span> b = <span class="tok-t">DNode</span>::<span class="tok-f">make</span>(<span class="tok-n">2</span>); <span class="tok-k">let</span> c = <span class="tok-t">DNode</span>::<span class="tok-f">make</span>(<span class="tok-n">3</span>)
+        a.<span class="tok-f">attach</span>(b)   <span class="tok-c">// a ↔ b</span>
+        b.<span class="tok-f">attach</span>(c)   <span class="tok-c">// b ↔ c</span>
+        a             <span class="tok-c">// escapes WITH the region: obligation rides out on the return type</span>
+    }
+}
+<span class="tok-k">pub fn</span> <span class="tok-f">run</span>() -&gt; <span class="tok-t">i64</span> {
+    <span class="tok-a">#must_free</span> <span class="tok-k">let</span> dll = <span class="tok-f">build3</span>()   <span class="tok-c">// receive the region-obligation</span>
+    <span class="tok-k">let</span> total = <span class="tok-f">walk_both</span>(dll)      <span class="tok-c">// 12</span>
+    <span class="tok-t">teko::mem</span>::<span class="tok-f">free</span>(dll)            <span class="tok-c">// discharge the whole region at once</span>
+    total
+}</code></pre></div>
+        <div class="meta-row">
+          <div class="meta delta"><span class="lbl">Delta from arena</span>Same region-level obligation as S3, plus <code>#must_free region DNode</code> on the return type so the whole DLL's single obligation escapes <code>build3</code> onto <code>run</code>. Arena returns a bare <code>DNode</code> and never frees. Per-node <code>#must_free</code> is again impossible (each node double-owned via next/prev).</div>
+          <div class="meta lower"><span class="lbl">Lowering</span><code>#must_free region DNode</code> return → escape-promoting the whole sub-arena to the caller (region hand-off), then <code>free(dll)</code> → a bulk region reclaim — both existing arena operations. prev/next back-edges need no special handling because nothing is freed individually.</div>
+        </div>
+        <div class="honest"><span class="lbl">Honest flag</span>Limits identical to S3: with prev+next every node is multiply-owned, so the only sound relevant handle is over the whole region; the win is "you cannot forget to free the region" — real for a long-lived DLL, but no capability the arena lacked. Whole-region hand-off across a return is the <em>aspirational</em> part: it presumes Teko can promote a sub-arena as a first-class returnable obligation, which today is implicit escape promotion, not a tracked movable region — the most speculative piece of the model.</div>
+      </div>
+
+      <div class="model-row">
+        <div class="mr-head"><span class="mname">Adoption &amp; abandon</span><span class="mtag" style="color:var(--green);background:var(--green-bg)">real syntax · Pile B · showcase</span></div>
+        <div class="code"><pre><code><span class="tok-c">/** THE canonical adoption showcase. Each node has next AND prev, multiply-aliased. All
+ *  adopted into one region; back-edges are free intra-region aliases. Removing a node is
+ *  where `abandon` — and its MANDATORY dynamic per-object check — appears. */</span>
+<span class="tok-k">pub fn</span> <span class="tok-f">build3</span>(r: <span class="tok-k">region</span>) -&gt; <span class="tok-t">DNode</span> {
+    <span class="tok-k">let</span> a = <span class="tok-f">adopt</span>(r, <span class="tok-t">DNode</span> { value = <span class="tok-n">1</span>; next = null; prev = null })
+    <span class="tok-k">let</span> b = <span class="tok-f">adopt</span>(r, <span class="tok-t">DNode</span> { value = <span class="tok-n">2</span>; next = null; prev = null })
+    <span class="tok-k">let</span> c = <span class="tok-f">adopt</span>(r, <span class="tok-t">DNode</span> { value = <span class="tok-n">3</span>; next = null; prev = null })
+    a.next = b; b.prev = a   <span class="tok-c">// a ↔ b, both aliases inside r</span>
+    b.next = c; c.prev = b   <span class="tok-c">// b ↔ c</span>
+    a
+}
+<span class="tok-k">pub fn</span> <span class="tok-f">run</span>() -&gt; <span class="tok-t">i64</span> {
+    <span class="tok-k">region</span> dll {
+        <span class="tok-k">let</span> head = <span class="tok-f">build3</span>(dll)
+        <span class="tok-f">walk_both</span>(head)   <span class="tok-c">// 12</span>
+        <span class="tok-c">// To splice a node OUT you would abandon(dll, node) — which TRAPS at runtime</span>
+        <span class="tok-c">// unless every alias (next/prev) has been re-pointed first.</span>
+    }
+}</code></pre></div>
+        <div class="meta-row">
+          <div class="meta delta"><span class="lbl">Delta from arena</span>Real S4 also compiles today and the arena bulk-frees it — same outcome. The model's delta is (a) the multiply-aliased prev/next web is now <em>explicitly</em> co-owned by a region instead of leaning on field-mutation + the step cap, replacing the arena-of-nodes+index workaround; and (b) it introduces a <em>safe splice-out</em> story via <code>abandon</code>, which shipping Teko has no answer for. That safe-removal path is the one genuinely new capability over the arena.</div>
+          <div class="meta lower"><span class="lbl">Lowering</span><code>region dll</code> = bump arena; each node tagged. next/prev wiring = plain pointer stores. Bulk walk unchanged. <code>abandon(dll, node)</code> lowers to: check <code>node.adopter == dll</code> (else trap), then a per-object guard that the node is not still reachable-as-adopted, then clear the tag and hand it back as a free-standing value. That guard is a runtime branch on <em>every</em> abandon.</div>
+        </div>
+        <div class="honest"><span class="lbl">Honest flag</span>The DLL is the showcase, but read the fine print: for build+traverse the model still only matches the shipping arena while charging tag words. The unique payoff — safely splicing a node <em>out</em> — is precisely the operation that fires the mandatory dynamic per-object abandon-check, and that check is Mezzo's mechanism, not something Teko can make static. Even a clean abandon does not compact the region or fix aliased-free elsewhere; it only proves <em>this</em> removal is safe.</div>
+      </div>
+    </article>
+
+    <!-- ============ S5 ============ -->
+    <article class="scenario" id="s5">
+      <div class="s-head">
+        <span class="s-id">S5</span>
+        <span class="s-name">Long-lived cache — one eviction with an explicit free</span>
+        <span class="s-sub">The anti-LIFO pattern: a root-lived table whose entries come and go by value. Where relevant types genuinely earn their keep, REAPS gets its one real (modest) win, and ordered types are structurally mismatched.</span>
+      </div>
+
+      <div class="model-row">
+        <div class="mr-head"><span class="mname">Second-class values</span><span class="mtag" style="color:var(--green);background:var(--green-bg)">inferred</span></div>
+        <div class="code"><pre><code><span class="tok-k">pub fn</span> <span class="tok-f">lookup</span>(table: <span class="tok-t">[]Entry</span>, key: <span class="tok-t">i64</span>) -&gt; <span class="tok-t">i64</span> { <span class="tok-c">/* table inferred @local: scanned, not stored */</span> }
+<span class="tok-k">pub fn</span> <span class="tok-f">evict</span>(table: <span class="tok-t">[]Entry</span>, drop_key: <span class="tok-t">i64</span>) -&gt; <span class="tok-t">[]Entry</span> {
+    <span class="tok-k">mut</span> fresh: <span class="tok-t">[]Entry</span> = <span class="tok-t">teko::list</span>::<span class="tok-f">empty</span>()   <span class="tok-c">// @local until returned, then promoted first-class</span>
+    <span class="tok-c">// … copy survivors …</span>
+    <span class="tok-t">teko::mem</span>::<span class="tok-f">free</span>(table)   <span class="tok-c">// still frees ONLY the direct binding — model does not track the alias</span>
+    fresh
+}</code></pre></div>
+        <div class="meta-row">
+          <div class="meta delta"><span class="lbl">Delta from arena</span><span class="delta-none">None visible.</span> Inference marks <code>table</code> in <code>lookup</code> as <code>@local</code> and <code>fresh</code> / <code>insert</code>'s result as first-class (returned). The root-lived <code>cache</code> is first-class throughout. Same code as arena S5.</div>
+          <div class="meta lower"><span class="lbl">Lowering</span>Identical: root-region <code>[]Entry</code>, functional push growing new buffers, <code>teko::mem::free</code> parking the superseded buffer on the free-list over the arena. Qualifier erased.</div>
+        </div>
+        <div class="honest"><span class="lbl">Honest flag</span>The model does <em>not</em> make the free safe. <code>free(table)</code> still scrubs only the direct binding; second-class values govern <em>escape</em>, not <em>free</em> — they have no notion of who else aliases the buffer being freed. The cache-outlives-entries lifetime and eviction correctness are unchanged and still rest on the same unaudited assumption that no live alias exists at the free point.</div>
+      </div>
+
+      <div class="model-row">
+        <div class="mr-head"><span class="mname">Ordered types</span><span class="mtag" style="color:var(--muted);background:#232636">internal proof</span></div>
+        <div class="code"><pre><code><span class="tok-c">/* Source byte-identical to arena S5 (root-lived memo table, one eviction that frees the old buffer).
+ * INTERNAL PROOF OBLIGATION (invisible) — LIFO is the WRONG AXIS:
+ * The cache is deliberately a LONG-LIVED root resource whose entries come and go by
+ * VALUE eviction, not by nesting. Ordered logic assumes consumption order mirrors
+ * introduction order; a memo table's whole purpose is that lifetimes DO NOT nest.
+ * So the fragment does not model this pattern — it can locally certify the per-call
+ * frames of insert/evict/lookup, but the interesting object (root-region cache + explicit
+ * mem::free) is outside LIFO by construction. The free's safety is the escape analysis's job. */</span></code></pre></div>
+        <div class="meta-row">
+          <div class="meta delta"><span class="lbl">Delta from arena</span><span class="delta-none">Nothing (invisible).</span> Ordered types certify only the ephemeral per-call frames; the root-lived cache and its explicit <code>mem::free</code> fall entirely outside the LIFO fragment.</div>
+          <div class="meta lower"><span class="lbl">Lowering</span>As today: cache buffers live in the root region across calls; insert/evict return grown/rebuilt buffers; <code>teko::mem::free</code> parks the superseded buffer on the free-list. Root-region lifetimes are non-LIFO by definition and lower via the existing arena + free-list path.</div>
+        </div>
+        <div class="honest"><span class="lbl">Honest flag</span>Structurally mismatched to long-lived non-nested state: a cache is <em>the</em> anti-LIFO pattern. The lens can rubber-stamp the little function frames but is silent on the one thing that matters — whether <code>free(table)</code> is safe given the buffer may be aliased. That is exactly the reachability/uniqueness fact Teko does not compute; ordered logic does not supply it and does not pretend to. Do not sell this model as helping caches — it doesn't.</div>
+      </div>
+
+      <div class="model-row">
+        <div class="mr-head"><span class="mname">REAPS</span><span class="mtag" style="color:var(--amber);background:var(--amber-bg)">runtime · the one surfaced scope</span></div>
+        <div class="code"><pre><code><span class="tok-k">pub fn</span> <span class="tok-f">evict</span>(table: <span class="tok-t">[]Entry</span>, drop_key: <span class="tok-t">i64</span>) -&gt; <span class="tok-t">[]Entry</span> {
+    <span class="tok-c">// … copy survivors into fresh …</span>
+    <span class="tok-t">teko::mem</span>::<span class="tok-f">free</span>(table)   <span class="tok-c">// recycled into the reap's bump frontier, not just parked</span>
+    fresh
+}
+<span class="tok-k">pub fn</span> <span class="tok-f">run</span>() -&gt; <span class="tok-t">i64</span> {
+    <span class="tok-k">reap</span> {                                  <span class="tok-c">// &lt;-- the ONE surfaced construct: a phase-scoped recycling region</span>
+        <span class="tok-k">mut</span> cache: <span class="tok-t">[]Entry</span> = <span class="tok-t">teko::list</span>::<span class="tok-f">empty</span>()
+        cache = <span class="tok-f">insert</span>(cache, <span class="tok-n">1</span>, <span class="tok-n">10</span>)
+        cache = <span class="tok-f">insert</span>(cache, <span class="tok-n">2</span>, <span class="tok-n">20</span>)
+        cache = <span class="tok-f">insert</span>(cache, <span class="tok-n">3</span>, <span class="tok-n">30</span>)
+        cache = <span class="tok-f">evict</span>(cache, <span class="tok-n">2</span>)             <span class="tok-c">// freed old buffer coalesced back into the bump path</span>
+        <span class="tok-f">lookup</span>(cache, <span class="tok-n">1</span>) + <span class="tok-f">lookup</span>(cache, <span class="tok-n">3</span>) <span class="tok-c">// 40</span>
+    }                                       <span class="tok-c">// reap drops: whatever survived is bulk-reclaimed</span>
+}</code></pre></div>
+        <div class="meta-row">
+          <div class="meta delta"><span class="lbl">Delta from arena</span>Adds an opt-in <code>reap { }</code> scope around the cache phase (the only surface change in the whole matrix). Inside it, <code>teko::mem::free</code> becomes recycle-into-bump rather than park-on-freelist, so a long-lived cache with churn plateaus its footprint instead of growing monotonically.</div>
+          <div class="meta lower"><span class="lbl">Lowering</span><code>reap { }</code> lowers exactly like the existing <code>arena_push</code>/<code>defer</code> region: nested region frame, bulk-dropped at the closing brace. The novelty is the allocator backing it: <code>free(table)</code> coalesces the freed buffer's size-class run and resets the bump frontier over it, so the next <code>insert</code> reuses it. No GC, no refcount, no reachability graph — a size-class free-list fused with the bump pointer, all in <code>teko_rt.c</code>.</div>
+        </div>
+        <div class="honest"><span class="lbl">Honest flag</span>The model's best case, and still <em>modest</em>. Teko already parks freed buffers; the delta is only coalescing + feeding them to the bump pointer, which just plateaus fragmentation — it does <em>not</em> compact, so a pathological size-class mix still strands memory. The <code>reap</code> scope is real surface but a cousin of the existing <code>arena_push</code>, not a new capability. And it does nothing for S6: recycling a freed buffer makes a dangling alias <em>more</em> dangerous (space reused sooner) — safety-neutral-to-negative, purely a footprint tool.</div>
+      </div>
+
+      <div class="model-row">
+        <div class="mr-head"><span class="mname">NOEMA</span><span class="mtag" style="color:var(--accent);background:#17203a">real syntax</span></div>
+        <div class="code"><pre><code><span class="tok-c">/** Read-only scan through a borrow of the table. */</span>
+<span class="tok-k">pub fn</span> <span class="tok-f">lookup</span>(table: <span class="tok-a">&amp;</span><span class="tok-t">[]Entry</span>, key: <span class="tok-t">i64</span>) -&gt; <span class="tok-t">i64</span> { <span class="tok-c">/* scans len + elements, no copy */</span> }
+<span class="tok-k">pub fn</span> <span class="tok-f">insert</span>(table: <span class="tok-t">[]Entry</span>, key: <span class="tok-t">i64</span>, val: <span class="tok-t">i64</span>) -&gt; <span class="tok-t">[]Entry</span> { <span class="tok-c">/* owns/returns → not &amp; */</span> }
+<span class="tok-k">pub fn</span> <span class="tok-f">evict</span>(table: <span class="tok-t">[]Entry</span>, drop_key: <span class="tok-t">i64</span>) -&gt; <span class="tok-t">[]Entry</span> {
+    <span class="tok-c">// … copy survivors …</span>
+    <span class="tok-t">teko::mem</span>::<span class="tok-f">free</span>(table)   <span class="tok-c">// consumes the owning binding — forbidden on a &amp;T</span>
+    fresh
+}
+<span class="tok-c">// run(): lookup(&amp;cache, 1) + lookup(&amp;cache, 3)   // 40</span></code></pre></div>
+        <div class="meta-row">
+          <div class="meta delta"><span class="lbl">Delta from arena</span>Only <code>lookup()</code> changes: <code>&amp;[]Entry</code>, called as <code>lookup(&amp;cache, …)</code>. <code>insert</code>/<code>evict</code> keep owning signatures because they push/free — operations a read-only noema is defined to forbid. The eviction free is unchanged.</div>
+          <div class="meta lower"><span class="lbl">Lowering</span><code>&amp;[]Entry</code> → const pointer to the list header; <code>lookup</code> reads len and elements with no copy. <code>insert</code>/<code>evict</code> lower exactly as today, including <code>mem::free</code> parking the old buffer. The borrow adds no lifetime metadata to the long-lived table.</div>
+        </div>
+        <div class="honest"><span class="lbl">Honest flag</span>Enforces a useful invariant almost by accident: because <code>free()</code> consumes an owning binding and <code>lookup</code> only ever has a <code>&amp;T</code>, you can never accidentally free through a lookup path. But it does <em>not</em> make eviction safe against a live reader — if some other holder kept an owning alias to the freed buffer, the noema on lookup says nothing about that holder. It confines the borrower, not the owner.</div>
+      </div>
+
+      <div class="model-row">
+        <div class="mr-head"><span class="mname">Relevant types</span><span class="mtag" style="color:var(--green);background:var(--green-bg)">real syntax · best case</span></div>
+        <div class="code"><pre><code><span class="tok-k">pub fn</span> <span class="tok-f">evict</span>(table: <span class="tok-a">#must_free</span> <span class="tok-t">[]Entry</span>, drop_key: <span class="tok-t">i64</span>) -&gt; <span class="tok-a">#must_free</span> <span class="tok-t">[]Entry</span> {
+    <span class="tok-a">#must_free</span> <span class="tok-k">mut</span> fresh: <span class="tok-t">[]Entry</span> = <span class="tok-t">teko::list</span>::<span class="tok-f">empty</span>()
+    <span class="tok-c">// … copy survivors …</span>
+    <span class="tok-t">teko::mem</span>::<span class="tok-f">free</span>(table)   <span class="tok-c">// CONSUMES the incoming obligation — required: table is #must_free,</span>
+                             <span class="tok-c">// so evict CANNOT return without freeing or forwarding it</span>
+    fresh                    <span class="tok-c">// forwards the (new) obligation to the caller</span>
+}
+<span class="tok-k">pub fn</span> <span class="tok-f">run</span>() -&gt; <span class="tok-t">i64</span> {
+    <span class="tok-a">#must_free</span> <span class="tok-k">mut</span> cache: <span class="tok-t">[]Entry</span> = <span class="tok-t">teko::list</span>::<span class="tok-f">empty</span>()
+    cache = <span class="tok-f">insert</span>(cache, <span class="tok-n">1</span>, <span class="tok-n">10</span>)   <span class="tok-c">// rebind: consume-and-reissue keeps one live obligation</span>
+    cache = <span class="tok-f">insert</span>(cache, <span class="tok-n">2</span>, <span class="tok-n">20</span>)
+    cache = <span class="tok-f">insert</span>(cache, <span class="tok-n">3</span>, <span class="tok-n">30</span>)
+    cache = <span class="tok-f">evict</span>(cache, <span class="tok-n">2</span>)          <span class="tok-c">// old buffer freed inside evict; cache now names the fresh one</span>
+    <span class="tok-k">let</span> total = <span class="tok-f">lookup</span>(cache, <span class="tok-n">1</span>) + <span class="tok-f">lookup</span>(cache, <span class="tok-n">3</span>)   <span class="tok-c">// 40</span>
+    <span class="tok-t">teko::mem</span>::<span class="tok-f">free</span>(cache)         <span class="tok-c">// final discharge — without this line, run() fails to compile</span>
+    total
+}</code></pre></div>
+        <div class="meta-row">
+          <div class="meta delta"><span class="lbl">Delta from arena</span>Threads <code>#must_free</code> through the params/returns of <code>insert</code>/<code>evict</code> and the <code>cache</code> binding, adds a final <code>free(cache)</code>. Arena S5 already had one <code>free(table)</code> inside <code>evict</code> but silently leaked the final cache at exit and had no compile-time guarantee <code>evict</code> freed the old buffer. Here <code>evict</code>'s <code>#must_free</code> param makes freeing-or-forwarding mandatory, and the terminal leak becomes a compile error.</div>
+          <div class="meta lower"><span class="lbl">Lowering</span>All qualifiers erased. <code>insert</code>/<code>evict</code> → identical <code>list::push</code> / <code>mem::free</code> calls. The one genuinely new lowered artifact vs arena-S5 is the final <code>free(cache)</code> in <code>run</code>. Compile-time adds obligation dataflow across three rebinds and two call boundaries. No per-op runtime cost.</div>
+        </div>
+        <div class="honest win"><span class="lbl">Honest flag · best scenario</span>The model's best scenario: a long-lived cache is exactly where an accidental missing-free leaks unbounded, and relevant typing turns both the per-eviction free <em>and</em> the terminal free into checked obligations. Caveats: (1) it fixes only the <em>leak</em> — the freed old buffer inside <code>evict</code> can still be aliased-and-read elsewhere (S6 hazard) with no diagnostic; (2) the consume-and-reissue rule must be sound move-tracking, which is the syntactic, in-scope case Teko can actually do; (3) eviction still copies survivors into <code>fresh</code> — relevant types do nothing to make it in-place or cheaper.</div>
+      </div>
+
+      <div class="model-row">
+        <div class="mr-head"><span class="mname">Adoption &amp; abandon</span><span class="mtag" style="color:var(--amber);background:var(--amber-bg)">real syntax · Pile B</span></div>
+        <div class="code"><pre><code><span class="tok-c">/** The abandon-check earns its keep. Table lives in long-lived cache_r; each entry adopted.
+ *  Eviction is abandon(cache_r, victim) — the dynamic check guarantees no live alias survives,
+ *  so 'evict then someone still reads the old slot' becomes a TRAP, not silent corruption. */</span>
+<span class="tok-k">pub type</span> <span class="tok-t">Entry</span> = <span class="tok-k">class in region</span> { key: <span class="tok-t">i64</span>; val: <span class="tok-t">i64</span> }
+<span class="tok-k">pub fn</span> <span class="tok-f">run</span>() -&gt; <span class="tok-t">i64</span> {
+    <span class="tok-k">region</span> cache_r {                 <span class="tok-c">// long-lived: outlives the entries it hosts</span>
+        <span class="tok-k">mut</span> cache: <span class="tok-t">[]Entry</span> = <span class="tok-t">teko::list</span>::<span class="tok-f">empty</span>()
+        cache = <span class="tok-t">teko::list</span>::<span class="tok-f">push</span>(cache, <span class="tok-f">adopt</span>(cache_r, <span class="tok-t">Entry</span> { key = <span class="tok-n">1</span>; val = <span class="tok-n">10</span> }))
+        <span class="tok-k">let</span> victim = <span class="tok-f">adopt</span>(cache_r, <span class="tok-t">Entry</span> { key = <span class="tok-n">2</span>; val = <span class="tok-n">20</span> })
+        cache = <span class="tok-t">teko::list</span>::<span class="tok-f">push</span>(cache, victim)
+        cache = <span class="tok-t">teko::list</span>::<span class="tok-f">push</span>(cache, <span class="tok-f">adopt</span>(cache_r, <span class="tok-t">Entry</span> { key = <span class="tok-n">3</span>; val = <span class="tok-n">30</span> }))
+        cache = <span class="tok-f">rebuild_without</span>(cache, <span class="tok-n">2</span>)   <span class="tok-c">// drop key 2 from the table array</span>
+        <span class="tok-f">abandon</span>(cache_r, victim)            <span class="tok-c">// reclaim the evicted entry; TRAPS if still aliased</span>
+        <span class="tok-f">lookup</span>(cache, <span class="tok-n">1</span>) + <span class="tok-f">lookup</span>(cache, <span class="tok-n">3</span>)   <span class="tok-c">// 40</span>
+    }
+}</code></pre></div>
+        <div class="meta-row">
+          <div class="meta delta"><span class="lbl">Delta from arena</span>Arena S5 evicts by rebuilding the array + <code>free(table)</code> — scrubs only the direct binding, silently dangles any alias. Here eviction is <code>abandon(cache_r, victim)</code>, whose mandatory dynamic check turns "evicted-but-still-aliased" from silent UAF into a runtime <em>trap</em>. A real safety upgrade for the eviction case — at the cost of the per-object check and long-lived tag words.</div>
+          <div class="meta lower"><span class="lbl">Lowering</span><code>region cache_r</code> = a long-lived arena not reset at block granularity (entries freed individually via abandon, region reset only at end). <code>abandon</code> lowers to: verify <code>victim.adopter == cache_r</code>, run the dynamic no-live-alias guard, then return the entry's storage to a size-class free-list over the arena. If an alias survived, the guard traps instead of freeing.</div>
+        </div>
+        <div class="honest"><span class="lbl">Honest flag</span>Honest limits: the abandon-check catches the alias only if the model actually tracks per-object alias status at runtime — extra bookkeeping beyond a single tag word, and the part of Mezzo judged too heavy to carry. Individual <code>abandon</code> does <em>not</em> compact the arena (freed slots go to a free-list, fragmentation plateaus — same limit as Reaps). And the long-lived region pays tag+bookkeeping storage for its entire lifetime, not just at eviction.</div>
+      </div>
+    </article>
+
+    <!-- ============ S6 ============ -->
+    <article class="scenario" id="s6">
+      <div class="s-head">
+        <span class="s-id">S6</span>
+        <span class="s-name">Aliased free — the use-after-free probe</span>
+        <span class="s-sub"><code>y = x; free x; read y</code>. The hard cliff nothing here closes cheaply. This scenario is the honest ceiling of the entire matrix — read every flag as a limit, not a feature.</span>
+      </div>
+
+      <div class="model-row">
+        <div class="mr-head"><span class="mname">Second-class values</span><span class="mtag" style="color:var(--green);background:var(--green-bg)">inferred</span></div>
+        <div class="code"><pre><code><span class="tok-c">/** THE UAF PROBE. `y = x` is an ALIAS; free x; read y. Second-class values do NOT catch
+ *  this: both x and y are first-class local owners, and the model governs escape, not
+ *  aliasing-across-free. Surface identical to today; it still compiles. */</span>
+<span class="tok-k">pub fn</span> <span class="tok-f">run</span>() -&gt; <span class="tok-t">i64</span> {
+    <span class="tok-k">mut</span> x: <span class="tok-t">[]i64</span> = <span class="tok-t">teko::list</span>::<span class="tok-f">empty</span>()
+    x = <span class="tok-t">teko::list</span>::<span class="tok-f">push</span>(x, <span class="tok-n">41</span>)
+    x = <span class="tok-t">teko::list</span>::<span class="tok-f">push</span>(x, <span class="tok-n">1</span>)
+
+    <span class="tok-k">let</span> y = x            <span class="tok-c">// ALIAS: y and x name the SAME buffer. Both first-class locals —</span>
+                         <span class="tok-c">// NOT @local, and even if @local, the qualifier says nothing about aliasing.</span>
+    <span class="tok-t">teko::mem</span>::<span class="tok-f">free</span>(x)   <span class="tok-c">// parks the buffer + scrubs x — does NOT touch y</span>
+
+    y[<span class="tok-n">0</span>] + y[<span class="tok-n">1</span>]          <span class="tok-c">// reads the dangling alias: STILL a runtime UAF, STILL not a compile error</span>
+}</code></pre></div>
+        <div class="meta-row">
+          <div class="meta delta"><span class="lbl">Delta from arena</span><span class="delta-none">None.</span> The program compiles and mis-behaves identically to arena S6. Second-class values add no alias tracking, so <code>let y = x</code> followed by <code>free x</code> is not flagged. The model is silent on exactly the cliff this scenario probes.</div>
+          <div class="meta lower"><span class="lbl">Lowering</span>Identical to today: <code>free</code> parks the buffer and scrubs <code>x</code>; <code>y</code> still points at the parked buffer; the read is a UAF caught only by an AddressSanitizer build. The <code>@local</code> bit, present or not, is erased and irrelevant here.</div>
+        </div>
+        <div class="honest"><span class="lbl">Honest flag · the model's ceiling</span>The model's honest ceiling. Sound aliased-free needs a reachability/uniqueness fact (which alias is live at the free) that second-class values do <em>not</em> compute — they are an escape-confinement discipline, orthogonal to alias-uniqueness. Closing S6 requires L3 / alias-types / fractional-uniqueness-grade capability tracking, which is Pile-B bet-the-language research. The flagship pilot leaves S6 exactly as broken as today.</div>
+      </div>
+
+      <div class="model-row">
+        <div class="mr-head"><span class="mname">Ordered types</span><span class="mtag" style="color:var(--muted);background:#232636">internal proof</span></div>
+        <div class="code"><pre><code><span class="tok-c">/* Source byte-identical to arena S6 (y = x; free x; read y).
+ * INTERNAL PROOF OBLIGATION (invisible) — and it does NOT fire:
+ * One might hope ordered logic catches this, since a well-behaved ordered/linear context
+ * would forbid using x after it is consumed by free. BUT the ordered FRAGMENT tracks the
+ * NESTING order of resources, not their ALIASING: it has no notion that y and x denote the
+ * SAME buffer. That aliasing fact requires LINEARITY / uniqueness (each resource used once) —
+ * the FULL linear discipline, NOT the LIFO ordered fragment this model is. So the lens sees
+ * `let y = x` as an ordinary introduction, `free x` as ordinary consumption, `y[...]` as an
+ * ordinary use of a still-live resource. It emits NO error. */</span></code></pre></div>
+        <div class="meta-row">
+          <div class="meta delta"><span class="lbl">Delta from arena</span><span class="delta-none">Nothing (invisible)</span> — and no improvement: the UAF still compiles silently. Ordered types add a soundness proof for lifetime nesting but do <em>not</em> close the aliased-free hole.</div>
+          <div class="meta lower"><span class="lbl">Lowering</span>Identical to today: <code>y</code> and <code>x</code> share one backing buffer; <code>mem::free</code> parks it and scrubs only <code>x</code>; <code>y[0]+y[1]</code> reads the parked (possibly reused) buffer — a runtime UAF caught only by ASan, never by the type system. Ordered types insert no check and change no codegen.</div>
+        </div>
+        <div class="honest"><span class="lbl">Honest flag · constitutional limit</span>The decisive limit: ordered types are the LIFO fragment, which reasons about consumption <em>order</em>, not <em>aliasing</em> or <em>uniqueness</em> — so they are constitutionally unable to catch aliased-free UAF. Closing S6 needs full linearity / uniqueness (the whole viral discipline the frontier verdict places in Pile B), not the invisible ordered lens. Anyone hoping this plugs the UAF probe is conflating ordered logic with linear logic.</div>
+      </div>
+
+      <div class="model-row">
+        <div class="mr-head"><span class="mname">REAPS</span><span class="mtag" style="color:var(--rose);background:var(--rose-bg)">runtime · makes it WORSE</span></div>
+        <div class="code"><pre><code><span class="tok-k">pub fn</span> <span class="tok-f">run</span>() -&gt; <span class="tok-t">i64</span> {
+    <span class="tok-k">mut</span> x: <span class="tok-t">[]i64</span> = <span class="tok-t">teko::list</span>::<span class="tok-f">empty</span>()
+    x = <span class="tok-t">teko::list</span>::<span class="tok-f">push</span>(x, <span class="tok-n">41</span>); x = <span class="tok-t">teko::list</span>::<span class="tok-f">push</span>(x, <span class="tok-n">1</span>)
+
+    <span class="tok-k">let</span> y = x            <span class="tok-c">// ALIAS: y and x name the SAME backing buffer</span>
+    <span class="tok-t">teko::mem</span>::<span class="tok-f">free</span>(x)   <span class="tok-c">// recycles the buffer into the bump frontier + scrubs x — but does NOT touch y</span>
+
+    y[<span class="tok-n">0</span>] + y[<span class="tok-n">1</span>]          <span class="tok-c">// reads the dangling alias: UNSAFE, not a compile error</span>
+    <span class="tok-c">// REAPS has no idea y aliases x. Worse: recycling hands that memory to the next</span>
+    <span class="tok-c">// allocation SOONER, turning read-of-stale-data into read-of-OVERWRITTEN-data.</span>
+}</code></pre></div>
+        <div class="meta-row">
+          <div class="meta delta"><span class="lbl">Delta from arena</span><span class="delta-none">Nothing visible</span> at the source; the observable runtime delta is <em>negative</em> for safety — recycling makes the freed buffer eligible for immediate reuse, so the dangling <code>y</code> read is more likely to return corrupted (reallocated) bytes rather than merely stale ones.</div>
+          <div class="meta lower"><span class="lbl">Lowering</span>Identical C to today: <code>free(x)</code> scrubs only the direct binding and returns the buffer to the allocator; <code>y</code> still holds the raw pointer. Under REAPS the returned buffer is coalesced into the bump frontier and can be re-handed on the very next allocation, so the UAF through <code>y</code> races against reuse. Still no compile-time diagnostic.</div>
+        </div>
+        <div class="honest"><span class="lbl">Honest flag · makes it worse</span>REAPS makes the aliased-free cliff <em>worse</em>, not better. Zero reachability/aliasing awareness (exactly the fact the whole frontier needs and REAPS does not supply), so it cannot diagnose the UAF; and faster recycling shortens the window before the freed memory is overwritten, converting stale-read bugs into corrupted-read bugs. Any safety story here must come from a different model; REAPS is orthogonal to safety entirely.</div>
+      </div>
+
+      <div class="model-row">
+        <div class="mr-head"><span class="mname">NOEMA</span><span class="mtag" style="color:var(--green);background:var(--green-bg)">real syntax · the one real win</span></div>
+        <div class="code"><pre><code><span class="tok-c">/** THE UAF PROBE — the one scenario the noema actually improves. */</span>
+<span class="tok-k">pub fn</span> <span class="tok-f">run</span>() -&gt; <span class="tok-t">i64</span> {
+    <span class="tok-k">mut</span> x: <span class="tok-t">[]i64</span> = <span class="tok-t">teko::list</span>::<span class="tok-f">empty</span>()
+    x = <span class="tok-t">teko::list</span>::<span class="tok-f">push</span>(x, <span class="tok-n">41</span>); x = <span class="tok-t">teko::list</span>::<span class="tok-f">push</span>(x, <span class="tok-n">1</span>)
+
+    <span class="tok-k">let</span> y: <span class="tok-a">&amp;</span><span class="tok-t">[]i64</span> = <span class="tok-a">&amp;</span>x   <span class="tok-c">// y is a NOEMA: read-only, tethered to x, may NOT outlive x</span>
+    <span class="tok-t">teko::mem</span>::<span class="tok-f">free</span>(x)   <span class="tok-c">// COMPILE ERROR: cannot free/consume x while a live noema &amp;x (y) borrows it</span>
+
+    y[<span class="tok-n">0</span>] + y[<span class="tok-n">1</span>]          <span class="tok-c">// …so this read is never reached with a dangling y</span>
+}
+<span class="tok-c">/* If instead you wrote `let y = x` (an OWNING alias, no &amp;), the model is silent — that is
+   the hole it does NOT close: two owning names to one buffer is still unproven, UAF-capable. */</span></code></pre></div>
+        <div class="meta-row">
+          <div class="meta delta"><span class="lbl">Delta from arena</span>The alias is written as a noema: <code>let y: &amp;[]i64 = &amp;x</code>. In arena S6 <code>let y = x</code> is a silent owning alias and <code>free(x)</code> compiles into a UAF. Here, because <code>y</code> borrows <code>x</code> read-only, <code>free(x)</code> is rejected while the borrow is live — the UAF read is unreachable.</div>
+          <div class="meta lower"><span class="lbl">Lowering</span><code>&amp;x</code> → <code>const int*</code> aliasing <code>x</code>'s buffer; the borrow-liveness check runs at compile time only. When it passes, the freed-while-borrowed case simply never codegens; when you legitimately drop the borrow first, <code>free</code> lowers to today's free-list park. Zero runtime cost, no tag, no refcount.</div>
+        </div>
+        <div class="honest win"><span class="lbl">Honest flag · the one real win, bounded</span>The model's <em>one</em> real win — and it is bounded. It fixes S6 only when the alias is a <code>&amp;T</code> noema; the classic owning <code>let y = x</code> alias is exactly what the noema cannot see and does <em>not</em> protect. Worse, the soundness of "reject free while <code>&amp;x</code> is live" depends on Teko proving its name-based escape/borrow tracking sees every live noema — a fact Neut gets from full linearity that Teko has <em>not</em> established. So the guarantee is real in shape but rests on unbuilt/unaudited analysis, not on the copied rule alone.</div>
+      </div>
+
+      <div class="model-row">
+        <div class="mr-head"><span class="mname">Relevant types</span><span class="mtag" style="color:var(--rose);background:var(--rose-bg)">real syntax · powerless here</span></div>
+        <div class="code"><pre><code><span class="tok-k">pub fn</span> <span class="tok-f">run</span>() -&gt; <span class="tok-t">i64</span> {
+    <span class="tok-a">#must_free</span> <span class="tok-k">mut</span> x: <span class="tok-t">[]i64</span> = <span class="tok-t">teko::list</span>::<span class="tok-f">empty</span>()
+    x = <span class="tok-t">teko::list</span>::<span class="tok-f">push</span>(x, <span class="tok-n">41</span>); x = <span class="tok-t">teko::list</span>::<span class="tok-f">push</span>(x, <span class="tok-n">1</span>)
+
+    <span class="tok-k">let</span> y = x            <span class="tok-c">// ALIAS. #must_free governs whether x is FREED, not whether an alias EXISTS.</span>
+                         <span class="tok-c">// y is an ordinary borrow-shaped copy of the handle; the model does not track it.</span>
+    <span class="tok-t">teko::mem</span>::<span class="tok-f">free</span>(x)   <span class="tok-c">// discharges x's obligation (good — no leak). But y still points at the freed buffer.</span>
+
+    y[<span class="tok-n">0</span>] + y[<span class="tok-n">1</span>]          <span class="tok-c">// UNSAFE read through dangling alias — STILL not a compile error.</span>
+    <span class="tok-c">// #must_free made the LEAK impossible; it did nothing about the USE-AFTER-FREE.</span>
+}</code></pre></div>
+        <div class="meta-row">
+          <div class="meta delta"><span class="lbl">Delta from arena</span>Only adds <code>#must_free</code> to the <code>x</code> binding. The free, the alias, and the unsafe read are byte-for-byte arena S6. The relevant type changes <em>nothing</em> about this scenario's outcome — included to show the boundary explicitly.</div>
+          <div class="meta lower"><span class="lbl">Lowering</span>Identical to arena-S6: <code>push</code> calls, one <code>mem::free</code> that scrubs the direct binding, a dangling read through <code>y</code>. The <code>#must_free</code> bit is erased and influences only leak-checking, which this program already passes (<code>x</code> IS freed). No effect on the UAF path.</div>
+        </div>
+        <div class="honest"><span class="lbl">Honest flag · powerless by construction</span>The headline honest limit: relevant types are the <em>dual</em> of affine/linear — affine says "at most once," relevant says "at least once (must consume)." Neither is <em>uniqueness</em>. <code>#must_free</code> guarantees <code>x</code> is freed exactly on schedule, which is precisely why the UAF is now <em>more</em> reachable: the buffer is definitely gone by the time <code>y</code> reads it. Do not let leak-safety be read as memory-safety — S6 is still a live use-after-free.</div>
+      </div>
+
+      <div class="model-row">
+        <div class="mr-head"><span class="mname">Adoption &amp; abandon</span><span class="mtag" style="color:var(--amber);background:var(--amber-bg)">real syntax · Pile B · trap, not fix</span></div>
+        <div class="code"><pre><code><span class="tok-c">/** The honest LIMIT of the model. To get any protection you must route the buffer THROUGH
+ *  a region and use `abandon` instead of `free`. Then the alias makes the abandon-check TRAP.
+ *  With plain teko::mem::free (no region), the model gives you NOTHING — same silent UAF. */</span>
+<span class="tok-k">pub fn</span> <span class="tok-f">run</span>() -&gt; <span class="tok-t">i64</span> {
+    <span class="tok-k">region</span> r {
+        <span class="tok-k">let</span> x = <span class="tok-f">adopt</span>(r, <span class="tok-t">teko::list</span>::<span class="tok-f">of</span>(<span class="tok-n">41</span>, <span class="tok-n">1</span>))   <span class="tok-c">// buffer adopted into region r</span>
+        <span class="tok-k">let</span> y = x                                   <span class="tok-c">// ALIAS: y and x co-owned in r</span>
+        <span class="tok-f">abandon</span>(r, x)   <span class="tok-c">// TRAPS at runtime: x is still aliased by y (dynamic per-object check)</span>
+                        <span class="tok-c">// → use-after-free prevented by a RUNTIME trap, not a compile error</span>
+        y[<span class="tok-n">0</span>] + y[<span class="tok-n">1</span>]     <span class="tok-c">// unreachable: abandon already trapped</span>
+    }
+}</code></pre></div>
+        <div class="meta-row">
+          <div class="meta delta"><span class="lbl">Delta from arena</span>Arena S6 compiles and silently reads a dangling alias (UAF, caught only by ASan). The delta is <em>conditional</em>: IF you route the buffer through a region and reclaim with <code>abandon</code>, the mandatory dynamic per-object check <em>traps</em> on the surviving alias — turning silent UAF into a deterministic runtime abort. IF you keep plain <code>teko::mem::free</code>, the model changes nothing. It converts UAF-to-corruption into UAF-to-trap, but only inside the region discipline, and only as a runtime catch — never a compile error.</div>
+          <div class="meta lower"><span class="lbl">Lowering</span><code>adopt(r, buf)</code> tags the buffer with region id r. <code>let y = x</code> is a pointer copy; both refer to the same tagged buffer. <code>abandon(r, x)</code> lowers to the dynamic ownership guard: it detects the buffer still has a live co-owner (y) and calls the trap/panic path instead of returning storage — a runtime branch + abort, no static reasoning.</div>
+        </div>
+        <div class="honest"><span class="lbl">Honest flag · trap, not a closed cliff</span>The crucial honesty point: adoption-and-abandon does <em>not</em> make aliased-free statically safe — it does not compute the reachability/uniqueness fact Teko lacks. It only downgrades the failure from silent corruption to a deterministic <em>runtime trap</em>, and only when the buffer is inside a region and freed via abandon; plain <code>free</code> still UAFs silently. The check is dynamic (a runtime word + branch per abandon), fires at abandon-time not the aliasing site, and is Mezzo's post-mortemed mechanism. Net: better failure mode, not a closed cliff.</div>
+      </div>
+    </article>
+  </section>
+
+  <!-- ================= PILE SPLIT ================= -->
+  <section id="piles">
+    <div class="sec-head">
+      <p class="eyebrow"><span class="sec-num">04</span> &nbsp;The strategic split</p>
+      <h2>Pile A — steal a piece &nbsp;·&nbsp; Pile B — bet the language</h2>
+      <p class="prose" style="margin-top:1rem">The five Pile-A models are cheap because they cannot regress a working program — they tighten an existing rule, prove an existing invariant, or optimise a runtime. The lone Pile-B model buys a genuine new capability (the cyclic-graph corner) but pays for it in runtime tags, a per-object dynamic check, and region-permission threading that is a discipline, not a free lens.</p>
+    </div>
+
+    <div class="pile-grid">
+      <div class="pile a">
+        <h3><span class="dot g"></span>Pile A — steal a piece</h3>
+        <p class="sub">Low-risk · mostly invisible · tightens or optimises, never regresses</p>
+        <ul>
+          <li><b>Second-class values</b> — inferred <code>@local</code>; a soundness floor under the existing Ref-can't-escape rule. The pilotable idea. Zero annotation, zero runtime cost; real cost is the escape-analysis audit.</li>
+          <li><b>Ordered types</b> — invisible internal proof for the region tree. Certifies the easy 80%, honestly refuses the hard 20% (escape, aliasing, cycles).</li>
+          <li><b>NOEMA (<code>&amp;T</code>)</b> — one read-borrow rule; makes the read side of aliased-free sound. Bounded to borrow-shaped aliases; soundness leans on unbuilt tracking.</li>
+          <li><b>Relevant types (<code>#must_free</code>)</b> — opt-in leak-catcher. Genuinely valuable at S2/S5; powerless on aliased-free by construction (the must-consume dual, not uniqueness).</li>
+          <li><b>REAPS</b> — allocator swap, one <code>reap { }</code> scope. Footprint plateau for churn; touches no correctness cliff and worsens S6.</li>
+        </ul>
+      </div>
+
+      <div class="pile b">
+        <h3><span class="dot a"></span>Pile B — bet the language</h3>
+        <p class="sub">Real new power · real ongoing price · a discipline, not a lens</p>
+        <ul>
+          <li><b>Adoption &amp; abandon (Mezzo)</b> — the only model that buys a capability the shipping arena cannot express: a sound, Coq-verified cyclic/aliased mutable graph in a bulk-reclaimed region, no refcount, no GC (S3/S4).</li>
+          <li><b>Paid in runtime</b> — a per-object adoption tag word and a mandatory dynamic abandon-check; it <em>sidesteps</em> the reachability fact Teko lacks rather than computing it.</li>
+          <li><b>Regresses the easy case</b> — S2 return-fresh becomes region-threading boilerplate or an O(n) abandon/re-adopt tax; the arena auto-promotes for free.</li>
+          <li><b>Leaves S6 open</b> — abandon guards removal <em>from a region</em>; it downgrades aliased-free to a runtime trap, never a static fix, and only inside the discipline.</li>
+          <li><b>Full Mezzo was post-mortemed</b> — the affordable version is a narrow library-plus-two-keywords hatch, not importing the permission calculus.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= BOTTOM LINE ================= -->
+  <section id="bottom">
+    <div class="bottom">
+      <div class="bottom-head">
+        <p class="eyebrow">The honest bottom line</p>
+        <h2>Nothing here closes the hard cliffs cheaply</h2>
+      </div>
+      <div class="bottom-body">
+        <p class="verdict">Across all six models and all six scenarios, the pattern is consistent: the cheap ideas are cheap <em>because</em> they add almost nothing observable, and the one model that buys real new power (<b>adoption &amp; abandon</b>) pays an ongoing runtime price, regresses the arena's easy case, and still leaves the aliased-free cliff open.</p>
+
+        <dl class="kv">
+          <dt>The pilotable idea</dt>
+          <dd><b>Second-class values.</b> It is a <em>soundness floor, not new power</em> — an inferred <code>@local</code> bit that turns today's silent Ref-escape holes into compile errors and can only ever tighten an existing restriction, never regress a working program. Its real cost is the audit of Teko's name-based escape analysis, not the qualifier.</dd>
+
+          <dt>The invisible half</dt>
+          <dd>Ordered types (internal proof), REAPS (runtime allocator), and second-class values (inferred) put nothing in front of the programmer. "Has no surface" is the headline finding — it is exactly what makes them the low-risk Pile-A ideas, and exactly why none of them can reach the hard cliffs.</dd>
+
+          <dt>Every hard cliff, unmoved</dt>
+          <dd>Graph-leak, cycles (S3), aliased-free UAF (S6), and concurrency sit where they were. NOEMA closes only the <em>borrow-shaped</em> read side of S6; adoption downgrades S6 to a runtime trap inside a region; everything else is silent or, in REAPS' case, makes it worse.</dd>
+
+          <dt>What no model does</dt>
+          <dd>None of them computes the reachability/uniqueness fact the frontier actually needs. The models that touch S6 at all either extract one rule from a full-linearity discipline Teko refuses to adopt (NOEMA) or sidestep the fact with a runtime check (adoption). Sound static aliased-free remains Pile-B, bet-the-language research.</dd>
+        </dl>
+
+        <p style="margin-top:0.6rem">If a pilot ships, ship <b>second-class values</b> — precisely because it is the model most likely to change nothing observable while making the language more honest. Do not read any of these as a step toward memory safety on the hard cliffs; that step is not cheaply available here.</p>
+      </div>
+    </div>
+
+    <footer>
+      Teko · memory-model surface study · S1–S6 across 6 theoretical models<br>
+      Sources cited in-line: Osvald/Rompf OOPSLA 2016 · Xhebraj/Rompf ECOOP 2022 · Scala 3 Capture Checking · Polakow CMU 2001 (ordered logic) · Neut (&amp;t read-borrow) · Mezzo (adoption/abandon) · Berger/Zorn/McKinley OOPSLA 2002 (Reaps).<br>
+      No model claim in this document is sold beyond what its scenario flags support.
+    </footer>
+  </section>
+
+</div>
+</div>
