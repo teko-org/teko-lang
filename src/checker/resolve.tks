@@ -156,6 +156,32 @@ fn type_ns_of(table: TypeTable, name: str) -> str {
 //   Privates: found-then-rejected is left to the module-visibility pass (check_modules) — a private
 //        type in another namespace is MENTIONABLE here (so error wording is precise), the existing
 //        visibility check keeps rejecting it.
+/**
+ * Resolve a BARE stamped generic-instance name (`Box__g__i64`) to its TypeDecl from ANY namespace, or
+ * null when `last` is not a stamped instance name (#254 L4/L5). A stamped instance name is
+ * collision-proof — no user symbol may carry the `__g__` infix — so it is bare-visible everywhere,
+ * exactly like a root-level or type-param name. A stamped instance's own methods carry the instance
+ * name in their (normalized) signatures, and `register_instance_methods` resolves those signatures with
+ * no referencing namespace, so a bare `Box__g__i64` in a `-> Box<T>` return / `Box<T>` param must
+ * resolve regardless of the instance's declaring namespace. Consulted BEFORE the cross-namespace
+ * collision error, which would otherwise reject the bare stamped name from "".
+ *
+ * @param last  the path's last segment (the referenced type name)
+ * @param table the folded type table
+ * @return      the stamped instance's decl, or null when `last` is not a stamped instance name
+ * @since onda-3 (#254 L4/L5)
+ */
+fn resolve_bare_g_instance(last: str, table: TypeTable) -> parser::TypeDecl? {
+    if !name_is_g_instance(last) { return null }
+    mut g: u64 = 0
+    loop {
+        if g >= table.len { break }
+        if table[g].name == last { return table[g].decl }
+        g++
+    }
+    null
+}
+
 fn resolve_type_ref(path: parser::Path, table: TypeTable, ref_ns: str) -> parser::TypeDecl | error {
     if path.segments.len == 0 { return error { message = "not a user type" } }
     let last = path.segments[path.segments.len - 1].name
@@ -178,6 +204,7 @@ fn resolve_type_ref(path: parser::Path, table: TypeTable, ref_ns: str) -> parser
                 k++
             }
         }
+        match resolve_bare_g_instance(last, table) { parser::TypeDecl as td => return td; null => { } }
         // No same-ns entry. If the name lives elsewhere, that is the cross-namespace collision — the
         // reference is not visible bare and MUST be qualified (fail-loud). Otherwise it is simply
         // unknown (the caller's "unknown type" message stands).
@@ -285,8 +312,9 @@ fn type_ref_ns(path: parser::Path, table: TypeTable, ref_ns: str) -> str {
  * contributes its own method list (no `extends` to walk). Every other KNOWN atom kind
  * (struct/enum/flags/variant/alias/extern/class — no shared nominal method contract to expose)
  * contributes an EMPTY surface: it may still satisfy the constraint nominally, but authorizes no
- * operation on T through it. An atom naming NO TypeDecl at all is a named error (M.1 fail-loud —
- * never silently opaque).
+ * operation on T through it. (TR3) A compiler-known STRUCTURAL trait atom is likewise opaque on T —
+ * its methods are synthesized per concrete deriver, not dispatched through T in v1. An atom naming
+ * NO TypeDecl at all is a named error (M.1 fail-loud — never silently opaque).
  *
  * @param name  the constraint atom's name
  * @param table the folded type table
@@ -296,6 +324,7 @@ fn type_ref_ns(path: parser::Path, table: TypeTable, ref_ns: str) -> str {
 fn atom_surface(name: str, table: TypeTable) -> []parser::Function | error {
     if is_trait_name(name, table) { return trait_methods_by_name(name, table) }
     if is_interface_name(name, table) { return iface_methods_by_name(name, table) }
+    if is_structural_trait(name) { let empty_surface: []parser::Function = teko::list::empty(); return empty_surface }
     match type_table_find(table, name, "") {
         parser::TypeDecl => { let empty_surface: []parser::Function = teko::list::empty(); empty_surface }
         error => error { message = $"unknown constraint atom '{name}' — names no declared type" }
@@ -573,6 +602,66 @@ pub fn type_param_table(type_params: []str, type_constraints: []parser::Constrai
     tbl
 }
 
+/**
+ * Append two type-param name lists (`a ++ b`) — the enclosing type's params ahead of a method's own.
+ * A trivial two-list concat, factored so the method-table builder reads declaratively.
+ *
+ * @param a  the leading names (the enclosing type's type-params)
+ * @param b  the trailing names (the method's own type-params)
+ * @return   a new list holding every name of `a` followed by every name of `b`
+ * @since onda-3 (#254)
+ */
+fn concat_tps(a: []str, b: []str) -> []str {
+    mut out: []str = teko::list::empty()
+    mut i = 0
+    loop { if i >= a.len { break }; out = teko::list::push(out, a[i]); i++ }
+    mut j = 0
+    loop { if j >= b.len { break }; out = teko::list::push(out, b[j]); j++ }
+    out
+}
+
+/**
+ * Append two constraint lists (`a ++ b`), parallel to concat_tps so the enclosing type's constraints
+ * stay index-aligned with its params when both lists are prepended to a method's own.
+ *
+ * @param a  the leading constraints (the enclosing type's type-constraints)
+ * @param b  the trailing constraints (the method's own type-constraints)
+ * @return   a new list holding every constraint of `a` followed by every constraint of `b`
+ * @since onda-3 (#254)
+ */
+fn concat_tcs(a: []parser::ConstraintExpr, b: []parser::ConstraintExpr) -> []parser::ConstraintExpr {
+    mut out: []parser::ConstraintExpr = teko::list::empty()
+    mut i = 0
+    loop { if i >= a.len { break }; out = teko::list::push(out, a[i]); i++ }
+    mut j = 0
+    loop { if j >= b.len { break }; out = teko::list::push(out, b[j]); j++ }
+    out
+}
+
+/**
+ * Build a method's type-param table PREPENDED with the enclosing type's own type-params/constraints,
+ * so a method of `Box<T>` that references `T` resolves against the OWNER's `T` instead of failing
+ * with "unknown type: T" (#254 layer 1). `owner_name` is looked up by its CANONICAL name via the
+ * two-pass exact/qualified match (never an order-dependent bare probe — #290/#109 family): a bare
+ * name absent from the table (a plain non-generic owner, a free fn, or a receiver type-param)
+ * contributes an empty prefix, keeping the result byte-identical to `type_param_table(mtps, …)` for
+ * the existing corpus (which carries ZERO generic methods).
+ *
+ * @param owner_name  the enclosing type's canonical name (`ns::…::Type`, or bare at the root ns)
+ * @param mtps        the method's own type-params
+ * @param mtcs        the method's own type-constraints
+ * @param ns          the using namespace for the synthesized type-param TypeRegs (per type_param_table)
+ * @param table       the folded type table (source of the owner's params + the canonical lookup)
+ * @return            a type-param table over `owner_tps ++ mtps` / `owner_tcs ++ mtcs`
+ * @since onda-3 (#254)
+ */
+pub fn method_type_param_table(owner_name: str, mtps: []str, mtcs: []parser::ConstraintExpr, ns: str, table: TypeTable) -> TypeTable {
+    match type_table_find(table, owner_name, "") {
+        parser::TypeDecl as td => type_param_table(concat_tps(td.type_params, mtps), concat_tcs(td.type_constraints, mtcs), ns, table)
+        error => type_param_table(mtps, mtcs, ns, table)
+    }
+}
+
 // resolve a NAMED type (a path) to a semantic Type: built-in or user type.
 // (#109 W2) `ref_ns` = the referencing namespace; drives the R0-R5 resolution rules (via
 // resolve_type_ref). R2 builtins are matched FIRST (bare only — a builtin is never namespaced); the
@@ -781,6 +870,39 @@ pub fn is_trait_name(name: str, table: TypeTable) -> bool {
         parser::TypeDecl as td => match td.body { parser::TraitBody => true; _ => false }
         error => false
     }
+}
+
+/**
+ * (TR3) The closed set of compiler-known STRUCTURAL trait names — `Eq`, `Ord`, `Hash`, `Clone`,
+ * `Default` — whose provided method bodies the compiler SYNTHESIZES from the deriver's field view
+ * (TR2), with no surface declaration and no runtime metadata (Law M.0). Matched on the bare last
+ * segment: these are reserved trait names, unqualified. A user type of the same name is not
+ * intended (the set is closed per the trait design §5 open 4). `Hashable` is accepted as a SYNONYM
+ * of `Hash` and `Comparable` of `Ord` (the collections Map-key capability names, R1) — the
+ * structural trait IS the capability, so no parallel interface is introduced.
+ *
+ * @param name a name from a deriver's `&`-list or a constraint atom (a source or resolved name)
+ * @return true iff `name`'s last segment is one of the structural trait names (or a synonym)
+ */
+pub fn is_structural_trait(name: str) -> bool {
+    let last = name_last_segment(name)
+    last == "Eq" || last == "Ord" || last == "Hash" || last == "Clone" || last == "Default" || last == "Hashable" || last == "Comparable"
+}
+
+/**
+ * (TR3) The canonical structural-trait name of `name` — collapsing the R1 synonyms so a deriver
+ * lists ONE name per capability: `Hashable` → `Hash`, `Comparable` → `Ord`; every other structural
+ * name maps to itself. Callers pass a name already known to `is_structural_trait`; a non-structural
+ * name is returned unchanged (the caller never reaches this with one).
+ *
+ * @param name a structural-trait name (possibly a synonym), bare or qualified
+ * @return the canonical bare structural-trait name
+ */
+pub fn structural_trait_canonical(name: str) -> str {
+    let last = name_last_segment(name)
+    if last == "Hashable" { return "Hash" }
+    if last == "Comparable" { return "Ord" }
+    last
 }
 
 // does contract `sub` reach contract `want` through `extends`, transitively? Depth-bounded so a
@@ -1185,6 +1307,51 @@ pub fn generic_inst_name(base: str, args: []Type) -> str {
     out
 }
 
+/**
+ * Is this struct/class literal a SELF-CONSTRUCT inside its own generic template — i.e. the base
+ * being constructed equals the enclosing method's owner type, AND that owner is generic (so no
+ * concrete instance is stamped while typing the abstract template)? Only then do we type against the
+ * abstract template body and tag the node with the phantom `Base__g__<param>` instance name that the
+ * mono pass will later remap to the concrete stamp (#254 L4/L5). A non-generic owner, or a
+ * construction of a DIFFERENT generic type, is NOT a self-construct → the ordinary
+ * expected-instance path (unchanged) applies.
+ *
+ * @param base_name    the bare base of the constructed type (`Box`)
+ * @param owner_type   the enclosing method's owner (`env.owner_type`, canonical or "")
+ * @param decl_tparams the constructed base's type-params (generic iff non-empty)
+ * @return             true iff this is a self-construct of the enclosing generic template
+ * @since onda-3 (#254 L4/L5)
+ */
+pub fn is_self_generic_construct(base_name: str, owner_type: str, decl_tparams: []str) -> bool {
+    if decl_tparams.len == 0 { return false }
+    if owner_type == "" { return false }
+    name_last_segment(owner_type) == base_name
+}
+
+/**
+ * The PHANTOM generic-instance name for a self-construct inside a generic template: the enclosing
+ * type's OWN type-params, in order, mangled exactly as `resolve_generic_inst` mangles `-> Box<T>`
+ * (`Box__g__T`). The template body's self-init, its `-> Box<T>` return, and any `Box<T>` local all
+ * carry this SAME spelling, so the mono pass's single `phantom → concrete` remap retargets them
+ * together (#254 L4/L5). Reuses `generic_inst_name` over the owner's params-as-Named so the spelling
+ * cannot drift from the resolver's.
+ *
+ * @param base_name     the bare base (`Box`)
+ * @param owner_tparams the enclosing type's type-param names (`["T"]`)
+ * @return              the phantom instance name (`Box__g__T`)
+ * @since onda-3 (#254 L4/L5)
+ */
+pub fn phantom_self_inst_name(base_name: str, owner_tparams: []str) -> str {
+    mut args: []Type = teko::list::empty()
+    mut i = 0
+    loop {
+        if i >= owner_tparams.len { break }
+        args = teko::list::push(args, Named { name = owner_tparams[i] })
+        i++
+    }
+    generic_inst_name(base_name, args)
+}
+
 // (S4) `Box<i64>` → the nominal instance `Named{Box__g__i64}`. Resolves every type-argument, then
 // validates against the generic decl's arity (the decl must exist, be generic, same count). The
 // concrete decl (fields with T→arg substituted) is stamped by the instantiation pass / mono.
@@ -1353,14 +1520,82 @@ fn subst_texpr_names(te: parser::TypeExpr, params: []str, args: []parser::TypeEx
     }
 }
 
-// substitute the type-params throughout a type-decl BODY (struct fields / variant / alias).
+/**
+ * Substitute the enclosing type's parameters through a method's SIGNATURE (its param type
+ * annotations and return type) so a stamped instance carries a concrete method signature (#254
+ * layer 2). Only the signature is rewritten — the body statements are left untouched, because a
+ * stamped-instance method is never re-typed nor re-emitted from this syntactic body; its concrete
+ * body is stamped from the ALREADY-TYPED template method by the mono pass (layer 3). The receiver
+ * param (index 0, `has_type=false`) is preserved verbatim: the checker re-injects the enclosing
+ * (now concrete) type as its type when the instance's method is typed/registered.
+ *
+ * @param f       the method (a struct/class body Function)
+ * @param params  the enclosing type's parameter names
+ * @param args    the concrete type-args at this instantiation
+ * @return        the method with its param annotations + return type substituted to concrete types
+ * @since onda-3 (#254)
+ */
+fn subst_method_sig_names(f: parser::Function, params: []str, args: []parser::TypeExpr) -> parser::Function {
+    mut nps: []parser::Param = teko::list::empty()
+    mut i = 0
+    loop {
+        if i >= f.params.len { break }
+        let np = if f.params[i].has_type {
+            parser::Param { name = f.params[i].name; has_type = true; type_ann = subst_texpr_names(f.params[i].type_ann, params, args); is_params = f.params[i].is_params; has_default = f.params[i].has_default; default_expr = f.params[i].default_expr }
+        } else {
+            f.params[i]
+        }
+        nps = teko::list::push(nps, np)
+        i++
+    }
+    let nret = if f.has_return { subst_texpr_names(f.return_type, params, args) } else { f.return_type }
+    parser::Function { name = f.name; type_params = f.type_params; type_constraints = f.type_constraints; params = nps; has_return = f.has_return; return_type = nret; body = f.body; vis = f.vis; has_doc = f.has_doc; doc = f.doc; line = f.line; col = f.col; is_test = f.is_test; is_extern = f.is_extern; c_symbol = f.c_symbol; from_lib = f.from_lib; os_guard = f.os_guard; is_intern = f.is_intern; is_abstract = f.is_abstract; is_virtual = f.is_virtual; is_override = f.is_override; has_inject = f.has_inject; injects = f.injects }
+}
+
+/**
+ * Substitute the enclosing type's parameters through a method LIST — every method's signature is
+ * rewritten to concrete types (#254 layer 2). A NO-OP on an empty list (the existing corpus's
+ * generic types carry no methods) → byte-identical.
+ *
+ * @param methods the enclosing type's methods
+ * @param params  the enclosing type's parameter names
+ * @param args    the concrete type-args at this instantiation
+ * @return        the methods with their signatures substituted
+ * @since onda-3 (#254)
+ */
+fn subst_methods_names(methods: []parser::Function, params: []str, args: []parser::TypeExpr) -> []parser::Function {
+    mut out: []parser::Function = teko::list::empty()
+    mut i = 0
+    loop { if i >= methods.len { break }; out = teko::list::push(out, subst_method_sig_names(methods[i], params, args)); i++ }
+    out
+}
+
+/**
+ * Substitute the enclosing type's parameters throughout a type-decl BODY (struct fields + methods /
+ * class fields + methods / variant / alias). (#254 layer 2) methods are now KEPT and their signatures
+ * substituted — previously dropped for a struct (`methods = []`), previously passed through
+ * un-substituted for a class via the `_` arm. A body kind that carries no type-exprs (enum/flags/
+ * extern) passes through unchanged.
+ *
+ * @param body    the generic type's body
+ * @param params  the enclosing type's parameter names
+ * @param args    the concrete type-args at this instantiation
+ * @return        the body with fields AND method signatures substituted to concrete types
+ * @since onda-3 (#254)
+ */
 fn subst_body_names(body: parser::TypeBody, params: []str, args: []parser::TypeExpr) -> parser::TypeBody {
     match body {
         parser::StructBody as sb => {
             mut nf: []parser::Field = teko::list::empty()
             mut i = 0
             loop { if i >= sb.fields.len { break }; nf = teko::list::push(nf, parser::Field { name = sb.fields[i].name; type_ann = subst_texpr_names(sb.fields[i].type_ann, params, args); vis = parser::Visibility::Pub; is_intern = false; has_doc = sb.fields[i].has_doc; doc = sb.fields[i].doc }); i++ }
-            parser::StructBody { fields = nf; methods = teko::list::empty(); implements = teko::list::empty() }
+            parser::StructBody { fields = nf; methods = subst_methods_names(sb.methods, params, args); implements = sb.implements }
+        }
+        parser::ClassBody as cb => {
+            mut nf: []parser::Field = teko::list::empty()
+            mut i = 0
+            loop { if i >= cb.fields.len { break }; nf = teko::list::push(nf, parser::Field { name = cb.fields[i].name; type_ann = subst_texpr_names(cb.fields[i].type_ann, params, args); vis = cb.fields[i].vis; is_intern = cb.fields[i].is_intern; has_doc = cb.fields[i].has_doc; doc = cb.fields[i].doc }); i++ }
+            parser::ClassBody { kind = cb.kind; has_base = cb.has_base; base_name = cb.base_name; has_base_binding = cb.has_base_binding; base_binding_name = cb.base_binding_name; implements = cb.implements; fields = nf; methods = subst_methods_names(cb.methods, params, args) }
         }
         parser::VariantBody as vb => parser::VariantBody { type_expr = subst_texpr_names(vb.type_expr, params, args) }
         parser::AliasBody as ab => parser::AliasBody { alias = subst_texpr_names(ab.alias, params, args) }
@@ -1386,10 +1621,53 @@ fn collect_texpr_insts(te: parser::TypeExpr, acc: []parser::TypeExpr) -> []parse
     out
 }
 
+/**
+ * Collect every generic-type USE reachable through a method — its signature (param annotations +
+ * return type) AND its body statements (#254 layer 2). This is what makes a transitive instance
+ * that appears ONLY inside a method body (`list.push(Box<i64>{…})`) get stamped: without it, such an
+ * instance is never discovered. A NO-OP when the method references no generic type.
+ *
+ * @param f    the method (a struct/class body Function)
+ * @param acc  the accumulated generic-use list
+ * @return     `acc` extended with every generic use found in the method's signature and body
+ * @since onda-3 (#254)
+ */
+fn collect_method_insts(f: parser::Function, acc: []parser::TypeExpr) -> []parser::TypeExpr {
+    mut out = acc
+    mut i = 0
+    loop { if i >= f.params.len { break }; if f.params[i].has_type { out = collect_texpr_insts(f.params[i].type_ann, out) }; i++ }
+    if f.has_return { out = collect_texpr_insts(f.return_type, out) }
+    collect_stmts_insts(f.body, out)
+}
+
+/**
+ * Collect every generic-type USE reachable through a method LIST (#254 layer 2). NO-OP on empty.
+ *
+ * @param methods the type's methods
+ * @param acc     the accumulated generic-use list
+ * @return        `acc` extended with every generic use found in the methods
+ * @since onda-3 (#254)
+ */
+fn collect_methods_insts(methods: []parser::Function, acc: []parser::TypeExpr) -> []parser::TypeExpr {
+    mut out = acc
+    mut i = 0
+    loop { if i >= methods.len { break }; out = collect_method_insts(methods[i], out); i++ }
+    out
+}
+
 fn collect_body_insts(body: parser::TypeBody, acc: []parser::TypeExpr) -> []parser::TypeExpr {
     mut out = acc
     match body {
-        parser::StructBody as sb => { mut i = 0; loop { if i >= sb.fields.len { break }; out = collect_texpr_insts(sb.fields[i].type_ann, out); i++ } }
+        parser::StructBody as sb => {
+            mut i = 0
+            loop { if i >= sb.fields.len { break }; out = collect_texpr_insts(sb.fields[i].type_ann, out); i++ }
+            out = collect_methods_insts(sb.methods, out)
+        }
+        parser::ClassBody as cb => {
+            mut i = 0
+            loop { if i >= cb.fields.len { break }; out = collect_texpr_insts(cb.fields[i].type_ann, out); i++ }
+            out = collect_methods_insts(cb.methods, out)
+        }
         parser::VariantBody as vb => out = collect_texpr_insts(vb.type_expr, out)
         parser::AliasBody as ab => out = collect_texpr_insts(ab.alias, out)
         _ => { }
@@ -1412,6 +1690,25 @@ fn collect_site_args(path: parser::Path, args: []parser::TypeExpr, acc: []parser
     collect_texpr_insts(parser::NamedType { path = path; args = args }, acc)
 }
 
+/**
+ * Collect the generic-instance a static-factory call names via construction-site type-args
+ * (`Cell<i64>::make(…)` → stamp `Cell__g__i64`) (#254 L5). The instance's OWNER base is the callee's
+ * SECOND-TO-LAST segment (`Cell` of `Cell::make`); synthesizing `Cell<i64>` and running it through
+ * `collect_site_args` stamps it exactly like a `Cell<i64>{…}` construction. A call with no type-args
+ * (or a single-segment callee) contributes nothing — every existing call is unchanged.
+ *
+ * @param call the parsed call (possibly carrying construction-site type-args)
+ * @param acc  the instance worklist so far
+ * @return     `acc` plus the factory instance's synthetic NamedType (or `acc` unchanged)
+ * @since onda-3 (#254 L5)
+ */
+fn collect_call_site_args(call: parser::Call, acc: []parser::TypeExpr) -> []parser::TypeExpr {
+    if call.type_args.len == 0 { return acc }
+    if call.callee.segments.len < 2 { return acc }
+    let base = call.callee.segments[call.callee.segments.len - 2].name
+    collect_site_args(parser::Path { segments = teko::list::push(teko::list::empty(), parser::Segment { name = base }) }, call.type_args, acc)
+}
+
 // (W9.4) walk an expression for construction-site type-args (`Foo<i64>{…}`) and nested patterns.
 fn collect_expr_insts(e: parser::Expr, acc: []parser::TypeExpr) -> []parser::TypeExpr {
     mut out = acc
@@ -1428,7 +1725,11 @@ fn collect_expr_insts(e: parser::Expr, acc: []parser::TypeExpr) -> []parser::Typ
             mut i = 0
             loop { if i >= c.rest.len { break }; out = collect_expr_insts(c.rest[i].operand, out); i++ }
         }
-        parser::Call as call => { mut i = 0; loop { if i >= call.args.len { break }; out = collect_expr_insts(call.args[i], out); i++ } }
+        parser::Call as call => {
+            out = collect_call_site_args(call, out)
+            mut i = 0
+            loop { if i >= call.args.len { break }; out = collect_expr_insts(call.args[i], out); i++ }
+        }
         parser::IfExpr as f => {
             out = collect_expr_insts(f.cond, out)
             out = collect_stmts_insts(f.then_blk, out)
@@ -1576,6 +1877,37 @@ pub fn name_is_g_instance(name: str) -> bool {
     false
 }
 
+/** A generic TEMPLATE decl paired with its declaring namespace — the mono pass needs both to stamp
+    an instance's methods (the template carries the abstract method bodies; the ns canonicalizes the
+    receiver remap). TypeReg is file-private, so this pub struct exposes just the two fields (#254). */
+pub type TemplateReg = struct { decl: parser::TypeDecl; namespace: str }
+
+/**
+ * The GENERIC TEMPLATE decl (`type Box<T>`) named `base`, paired with its declaring namespace — the
+ * source of a stamped instance's abstract method bodies + the receiver-remap canonical name (#254
+ * layer 3). Matches the template by its base name being `base` (name OR last segment) AND carrying
+ * type-params. Returns null when no generic template named `base` is registered.
+ *
+ * @param table the folded type table
+ * @param base  the generic base name (`Box`, from `g_instance_base` of the instance)
+ * @return      the template decl + its namespace, or null when no generic `base` exists
+ * @since onda-3 (#254)
+ */
+pub fn find_generic_template(table: TypeTable, base: str) -> TemplateReg? {
+    mut i = 0
+    loop {
+        if i >= table.len { break }
+        let reg = table[i]
+        if reg.decl.type_params.len > 0 {
+            if teko::runtime::str_eq(reg.name, base) || teko::runtime::str_eq(name_last_segment(reg.name), base) {
+                return TemplateReg { decl = reg.decl; namespace = reg.namespace }
+            }
+        }
+        i++
+    }
+    null
+}
+
 // (S4) the concrete generic-type INSTANCE decls stamped into the table (the `__g__`-marked entries),
 // for the mono pass to emit as program items so codegen sees the concrete struct/variant. TypeReg is
 // file-private, so this accessor exposes just the decls. (C: tk_table_generic_instances.)
@@ -1644,14 +1976,73 @@ fn normalize_inst_texpr(te: parser::TypeExpr, table: TypeTable) -> parser::TypeE
     }
 }
 
-// (W9.4) normalize generic-instance references throughout a type-decl BODY. (C: normalize_inst_body.)
+/**
+ * Normalize the generic-instance references in a method's SIGNATURE (param annotations + return type)
+ * to bare stamped names, mirroring normalize_inst_body's field walk (#254 layer 2). The receiver
+ * (index 0, `has_type=false`) and the body are preserved verbatim (the concrete body is stamped from
+ * the typed template by the mono pass). A NO-OP when the signature carries no generic-instance ref.
+ *
+ * @param f      the method (a struct/class body Function)
+ * @param table  the folded type table (drives the generic-instance name resolution)
+ * @return       the method with its signature's generic-instance refs normalized to bare stamped names
+ * @since onda-3 (#254)
+ */
+fn normalize_inst_method(f: parser::Function, table: TypeTable) -> parser::Function {
+    mut nps: []parser::Param = teko::list::empty()
+    mut i = 0
+    loop {
+        if i >= f.params.len { break }
+        let np = if f.params[i].has_type {
+            parser::Param { name = f.params[i].name; has_type = true; type_ann = normalize_inst_texpr(f.params[i].type_ann, table); is_params = f.params[i].is_params; has_default = f.params[i].has_default; default_expr = f.params[i].default_expr }
+        } else {
+            f.params[i]
+        }
+        nps = teko::list::push(nps, np)
+        i++
+    }
+    let nret = if f.has_return { normalize_inst_texpr(f.return_type, table) } else { f.return_type }
+    parser::Function { name = f.name; type_params = f.type_params; type_constraints = f.type_constraints; params = nps; has_return = f.has_return; return_type = nret; body = f.body; vis = f.vis; has_doc = f.has_doc; doc = f.doc; line = f.line; col = f.col; is_test = f.is_test; is_extern = f.is_extern; c_symbol = f.c_symbol; from_lib = f.from_lib; os_guard = f.os_guard; is_intern = f.is_intern; is_abstract = f.is_abstract; is_virtual = f.is_virtual; is_override = f.is_override; has_inject = f.has_inject; injects = f.injects }
+}
+
+/**
+ * Normalize the generic-instance references in a method LIST (#254 layer 2). NO-OP on an empty list.
+ *
+ * @param methods the type's methods
+ * @param table   the folded type table
+ * @return        the methods with their signatures' generic-instance refs normalized
+ * @since onda-3 (#254)
+ */
+fn normalize_inst_methods(methods: []parser::Function, table: TypeTable) -> []parser::Function {
+    mut out: []parser::Function = teko::list::empty()
+    mut i = 0
+    loop { if i >= methods.len { break }; out = teko::list::push(out, normalize_inst_method(methods[i], table)); i++ }
+    out
+}
+
+/**
+ * (W9.4) Normalize generic-instance references to bare stamped names throughout a type-decl BODY.
+ * (#254 layer 2) methods are now KEPT and their signatures normalized — previously dropped for a
+ * struct, previously un-normalized for a class (the `_` passthrough). A body kind with no type-exprs
+ * passes through unchanged.
+ *
+ * @param body   the type-decl's body
+ * @param table  the folded type table (drives the generic-instance name resolution)
+ * @return       the body with fields AND method signatures' generic-instance refs normalized
+ * @since onda-3 (#254)
+ */
 fn normalize_inst_body(body: parser::TypeBody, table: TypeTable) -> parser::TypeBody {
     match body {
         parser::StructBody as sb => {
             mut nf: []parser::Field = teko::list::empty()
             mut i = 0
             loop { if i >= sb.fields.len { break }; nf = teko::list::push(nf, parser::Field { name = sb.fields[i].name; type_ann = normalize_inst_texpr(sb.fields[i].type_ann, table); vis = parser::Visibility::Pub; is_intern = false; has_doc = sb.fields[i].has_doc; doc = sb.fields[i].doc }); i++ }
-            parser::StructBody { fields = nf; methods = teko::list::empty(); implements = teko::list::empty() }
+            parser::StructBody { fields = nf; methods = normalize_inst_methods(sb.methods, table); implements = sb.implements }
+        }
+        parser::ClassBody as cb => {
+            mut nf: []parser::Field = teko::list::empty()
+            mut i = 0
+            loop { if i >= cb.fields.len { break }; nf = teko::list::push(nf, parser::Field { name = cb.fields[i].name; type_ann = normalize_inst_texpr(cb.fields[i].type_ann, table); vis = cb.fields[i].vis; is_intern = cb.fields[i].is_intern; has_doc = cb.fields[i].has_doc; doc = cb.fields[i].doc }); i++ }
+            parser::ClassBody { kind = cb.kind; has_base = cb.has_base; base_name = cb.base_name; has_base_binding = cb.has_base_binding; base_binding_name = cb.base_binding_name; implements = cb.implements; fields = nf; methods = normalize_inst_methods(cb.methods, table) }
         }
         parser::VariantBody as vb => parser::VariantBody { type_expr = normalize_inst_texpr(vb.type_expr, table) }
         parser::AliasBody as ab => parser::AliasBody { alias = normalize_inst_texpr(ab.alias, table) }

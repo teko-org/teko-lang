@@ -1,0 +1,100 @@
+/**
+ * A growable, reference-semantic generic `List<T>` — a self-contained copy of the
+ * teko::collections::List<T> contract (issue #163) so the regression is a standalone project the
+ * VM==native harness can diff without pulling the compiler corpus. The backing `[]T` array is
+ * fixed-size (Teko arrays copy on append), so each mutation reassigns the owned `items` field to a
+ * freshly grown/shrunk array; the class's reference semantics make that write visible through every
+ * alias. Instantiated at TWO types (i64 + str) by main.tks, proving the body monomorphizes per width.
+ */
+type List<T> = class {
+    /** The owned backing array — reassigned to a freshly grown/shrunk copy on every mutation. */
+    intern items: []T
+
+    /**
+     * Build an empty `List<T>`.
+     *
+     * @return a fresh, empty `List<T>` at the caller's concrete `T`
+     */
+    pub fn make() -> List<T> { List { items = teko::list::empty() } }
+
+    /**
+     * The number of elements currently held.
+     *
+     * @return the element count
+     */
+    pub fn len(self) -> u64 { self.items.len }
+
+    /**
+     * Whether the list holds no elements.
+     *
+     * @return `true` iff `len() == 0`
+     */
+    pub fn is_empty(self) -> bool { self.items.len == 0 }
+
+    /**
+     * Append `x` to the end of the list, growing it in place.
+     *
+     * @param x  the element to append
+     */
+    pub fn push(self, x: T) { self.items = teko::list::push(self.items, x) }
+
+    /**
+     * Read the element at index `i` (must be in `[0, len())`).
+     *
+     * @param i  the zero-based index to read
+     * @return   the element at `i`
+     */
+    pub fn get(self, i: u64) -> T { self.items[i] }
+
+    /**
+     * Overwrite the element at index `i` with `x`, in place.
+     *
+     * @param i  the zero-based index to overwrite
+     * @param x  the replacement element
+     */
+    pub fn set(self, i: u64, x: T) { self.items = replace_at(self.items, i, x) }
+
+    /**
+     * Remove the last element, shrinking the list in place (a no-op on an empty list).
+     */
+    pub fn pop(self) { self.items = drop_last(self.items) }
+}
+
+/**
+ * Return a copy of `xs` with the element at index `at` replaced by `v` (an out-of-range `at` yields
+ * an unchanged copy) — the value-functional overwrite `List::set` folds over.
+ *
+ * @param xs  the source array
+ * @param at  the index to overwrite
+ * @param v   the replacement element
+ * @return    a fresh array equal to `xs` except at `at`
+ */
+fn replace_at<T>(xs: []T, at: u64, v: T) -> []T {
+    mut out: []T = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= xs.len { break }
+        if i == at { out = teko::list::push(out, v) } else { out = teko::list::push(out, xs[i]) }
+        i++
+    }
+    out
+}
+
+/**
+ * Return a copy of `xs` without its final element (an empty `xs` yields an empty copy) — the backing
+ * shape of `List::pop`.
+ *
+ * @param xs  the source array
+ * @return    a fresh array equal to `xs` without its last element
+ */
+fn drop_last<T>(xs: []T) -> []T {
+    if xs.len == 0 { return teko::list::empty() }
+    mut out: []T = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i + 1 >= xs.len { break }
+        out = teko::list::push(out, xs[i])
+        i++
+    }
+    out
+}

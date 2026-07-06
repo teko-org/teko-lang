@@ -1,0 +1,70 @@
+/**
+ * teko::collections — the growable, heap-of-arena collection classes (issue #163, the flagship
+ * payoff of the #254 generic-class keystone). This root unit holds the pure array combinators the
+ * `List<T>` and `Map<V>` classes both fold over: Teko arrays are FIXED-SIZE value snapshots
+ * (`teko::list::push` copy-appends, returning a NEW array), so every "in-place" mutation a growable
+ * collection performs is a self-field REASSIGNMENT to a freshly built array. These free generic
+ * helpers centralise the two rebuild shapes (replace-at, drop-at) that field reassignment needs,
+ * monomorphized per element type at each instantiation.
+ *
+ * WHY free functions and not private instance methods: on the freshly landed generic-class stack a
+ * generic instance method that calls a SIBLING generic instance method on `self` type-checks and
+ * runs on the VM, but the native mono/codegen pass never emits the stamped sibling (`List__…`),
+ * so the C fails to link (`use of undeclared identifier`). Routing shared logic through a free
+ * generic function — which the mono pass DOES stamp per instantiation — keeps both engines in lock
+ * step. Reported to the integrator as a generic-stack follow-up (#163 report).
+ */
+
+/**
+ * Return a copy of `xs` with the element at index `at` replaced by `v` — the value-functional
+ * shape a growable collection uses to overwrite one slot (Teko has no array index-assignment). An
+ * `at` outside `[0, xs.len)` yields an unchanged copy, so the caller guards the bound before the
+ * write it intends to be observable.
+ *
+ * @param xs  the source array
+ * @param at  the index to overwrite
+ * @param v   the replacement element
+ * @return    a fresh array equal to `xs` except at `at`, which holds `v`
+ */
+pub fn arr_replace_at<T>(xs: []T, at: u64, v: T) -> []T {
+    mut out: []T = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= xs.len { break }
+        if i == at { out = teko::list::push(out, v) } else { out = teko::list::push(out, xs[i]) }
+        i++
+    }
+    out
+}
+
+/**
+ * Return a copy of `xs` with the element at index `at` removed (the following elements shift down
+ * by one), the value-functional shape `Map::remove` and `List::remove_at` use. An `at` at or beyond
+ * `xs.len` yields an unchanged copy.
+ *
+ * @param xs  the source array
+ * @param at  the index to drop
+ * @return    a fresh array equal to `xs` with the `at`-th element removed
+ */
+pub fn arr_drop_at<T>(xs: []T, at: u64) -> []T {
+    mut out: []T = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= xs.len { break }
+        if i != at { out = teko::list::push(out, xs[i]) }
+        i++
+    }
+    out
+}
+
+/**
+ * Return a copy of `xs` with its last element removed — the backing shape of `List::pop`. An empty
+ * `xs` yields an empty copy (the caller decides whether an empty pop is an error).
+ *
+ * @param xs  the source array
+ * @return    a fresh array equal to `xs` without its final element
+ */
+pub fn arr_drop_last<T>(xs: []T) -> []T {
+    if xs.len == 0 { return teko::list::empty() }
+    arr_drop_at(xs, xs.len - 1)
+}

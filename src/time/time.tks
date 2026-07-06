@@ -90,3 +90,181 @@ pub extern fn date_add_days(d: Date, days: i32) -> Date = "tk_rt_date_add_days" 
 
 // date_diff_days(a, b) — signed day difference a - b.
 pub extern fn date_diff_days(a: Date, b: Date) -> i32 = "tk_rt_date_diff_days" from "teko_rt"
+
+/**
+ * A Gregorian calendar date broken into its year, month, and day-of-month components.
+ *
+ * `$"{d:yyyy-MM-dd}"` and `date_to_string`/`time_to_string` compute their fields in pure Teko
+ * (via `civil_from_days`), unlike the extern host-clock accessors above (`date_year`/… bottom
+ * out at the host and cannot run on `teko run`), so both engines produce byte-identical output.
+ * The field math mirrors src/runtime/teko_rt.c's tk_jdn_to_ymd / tk_rt_time_hour helpers.
+ */
+pub type CivilDate = struct {
+    /** the Gregorian year (e.g. 1970 for epoch day 0; may be negative for far-past dates) */
+    year: i64
+    /** the month, 1 through 12 */
+    month: i64
+    /** the day of the month, 1 through 31 */
+    day: i64
+}
+
+/**
+ * Convert a days-since-epoch count (Date.days) into its Gregorian year/month/day.
+ *
+ * Uses the Richards (2013) Julian-Day-Number algorithm, identical to teko_rt.c::tk_jdn_to_ymd,
+ * so it handles negative day counts (pre-1970 dates) the same way the native accessors do.
+ *
+ * @param days  the number of days since 1970-01-01 (may be negative)
+ * @return      the year, month (1..12), and day-of-month (1..31) for `days`
+ */
+pub fn civil_from_days(days: i64) -> CivilDate {
+    let jdn = days + 2440588
+    let f = jdn + 1401 + (((4 * jdn + 274277) / 146097) * 3 / 4) - 38
+    let e = 4 * f + 3
+    let g = (e % 1461) / 4
+    let h = 5 * g + 2
+    let day = (h % 153) / 5 + 1
+    let month = (h / 153 + 2) % 12 + 1
+    let year = e / 1461 - 4716 + (14 - month) / 12
+    CivilDate { year = year; month = month; day = day }
+}
+
+/**
+ * Render `v` in decimal, left-padded with leading zeros to at least `width` digits.
+ *
+ * Assumes a non-negative `v` (the calendar fields it formats are all non-negative). Used for the
+ * zero-padded pattern tokens (`yyyy`/`MM`/`dd`/`HH`/`mm`/`ss`).
+ *
+ * @param v      the non-negative value to render
+ * @param width  the minimum digit width
+ * @return       `v` in decimal, zero-padded on the left to `width` digits
+ */
+fn pad_zeros(v: i64, width: i64) -> str {
+    mut s = digits_of(v)
+    loop {
+        if s.len to i64 >= width { break }
+        s = teko::str::concat("0", s)
+    }
+    s
+}
+
+/**
+ * Render a non-negative integer as its plain decimal text.
+ *
+ * @param v  the non-negative value to render
+ * @return   the decimal digits of `v` ("0" for zero)
+ */
+fn digits_of(v: i64) -> str {
+    if v == 0 { return "0" }
+    mut digits: []byte = teko::list::empty()
+    mut n = v
+    loop {
+        if n == 0 { break }
+        digits = teko::list::push(digits, (48 + n % 10) to byte)
+        n = n / 10
+    }
+    mut xs: []byte = teko::list::empty()
+    mut k = digits.len
+    loop { if k == 0 { break }; k = k - 1; xs = teko::list::push(xs, digits[k]) }
+    str(xs)
+}
+
+/**
+ * The number of leading bytes at `pattern[i]` that equal `pattern[i]` (a run of one token byte).
+ *
+ * Calendar patterns use repeated letters to select a width (`yyyy` vs `yy`, `MM` vs `M`); this
+ * counts the run so the caller can dispatch on its length.
+ *
+ * @param pattern  the format pattern
+ * @param i        the run's start index
+ * @return         the count of consecutive bytes equal to `pattern[i]`, starting at `i`
+ */
+fn run_length(pattern: str, i: u64) -> u64 {
+    let c = pattern[i]
+    mut j = i
+    loop { if j >= pattern.len { break }; if pattern[j] != c { break }; j++ }
+    j - i
+}
+
+/**
+ * Format a Date value against a calendar pattern (`$"{d:yyyy-MM-dd}"` / `to_string`).
+ *
+ * Recognized tokens: `yyyy` (4-digit year), `yy` (2-digit year), `MM`/`M` (month), `dd`/`d`
+ * (day). Any other byte — separators like `-`, `/`, `.`, spaces — passes through literally.
+ *
+ * @param d        the date to format
+ * @param pattern  the calendar pattern
+ * @return         `d` rendered per `pattern`
+ */
+pub fn date_to_string(d: Date, pattern: str) -> str {
+    let civ = civil_from_days(d.days to i64)
+    mut out = ""
+    mut i = 0 to u64
+    loop {
+        if i >= pattern.len { break }
+        let c = pattern[i]
+        if c == b'y' {
+            let n = run_length(pattern, i)
+            if n >= 4 { out = teko::str::concat(out, pad_zeros(civ.year, 4)) }
+            else { out = teko::str::concat(out, pad_zeros(civ.year % 100, 2)) }
+            i = i + n
+        } else if c == b'M' {
+            let n = run_length(pattern, i)
+            if n >= 2 { out = teko::str::concat(out, pad_zeros(civ.month, 2)) }
+            else { out = teko::str::concat(out, digits_of(civ.month)) }
+            i = i + n
+        } else if c == b'd' {
+            let n = run_length(pattern, i)
+            if n >= 2 { out = teko::str::concat(out, pad_zeros(civ.day, 2)) }
+            else { out = teko::str::concat(out, digits_of(civ.day)) }
+            i = i + n
+        } else {
+            out = teko::str::concat(out, teko::one_byte(c))
+            i++
+        }
+    }
+    out
+}
+
+/**
+ * Format a Time value against a clock pattern (`$"{t:HH:mm:ss}"` / `to_string`).
+ *
+ * Recognized tokens: `HH`/`H` (hour 0..23), `mm`/`m` (minute), `ss`/`s` (second). Any other byte
+ * passes through literally. The field math mirrors teko_rt.c::tk_rt_time_hour/minute/second.
+ *
+ * @param t        the time-of-day to format
+ * @param pattern  the clock pattern
+ * @return         `t` rendered per `pattern`
+ */
+pub fn time_to_string(t: Time, pattern: str) -> str {
+    let secs = (t.ticks / 1000000000) to i64
+    let hour = secs / 3600
+    let minute = (secs % 3600) / 60
+    let second = secs % 60
+    mut out = ""
+    mut i = 0 to u64
+    loop {
+        if i >= pattern.len { break }
+        let c = pattern[i]
+        if c == b'H' {
+            let n = run_length(pattern, i)
+            if n >= 2 { out = teko::str::concat(out, pad_zeros(hour, 2)) }
+            else { out = teko::str::concat(out, digits_of(hour)) }
+            i = i + n
+        } else if c == b'm' {
+            let n = run_length(pattern, i)
+            if n >= 2 { out = teko::str::concat(out, pad_zeros(minute, 2)) }
+            else { out = teko::str::concat(out, digits_of(minute)) }
+            i = i + n
+        } else if c == b's' {
+            let n = run_length(pattern, i)
+            if n >= 2 { out = teko::str::concat(out, pad_zeros(second, 2)) }
+            else { out = teko::str::concat(out, digits_of(second)) }
+            i = i + n
+        } else {
+            out = teko::str::concat(out, teko::one_byte(c))
+            i++
+        }
+    }
+    out
+}

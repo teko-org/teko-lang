@@ -108,8 +108,10 @@ TK_RT_LIST(tk_byte,   tk_byte_list)    // []byte  — byte builder, str of bytes
 TK_RT_LIST(tk_str,    tk_str_list)     // []str   — string accumulator lists (argv, paths, …)
 TK_RT_LIST(int64_t,   tk_i64_list)     // []i64   — integer accumulator lists
 
-// tk_alloc — the allocation seam (S0→S1). Hands back a fresh, uniquely-addressable,
-// max_align_t-aligned block of ≥ n usable bytes (n→1 when 0 so the result is unique);
+// tk_alloc — the allocation seam (S0→S1). Hands back a fresh, uniquely-addressable block of
+// ≥ n usable bytes (n→1 when 0 so the result is unique), aligned to the arena's alignment
+// (TK_ARENA_ALIGN in teko_rt.c: max of max_align_t's and __int128's, so __int128-carrying
+// Expr/TExpr nodes are correctly aligned even where max_align_t's alignment is only 8);
 // tk_panic on OOM (M.1, never NULL). Generated code allocates through this: slice
 // copy-append AND the auto-boxed recursive-value-type back-edges (tk_alloc(sizeof *p)).
 // (S1) The body now bump-allocates from the process ROOT region (tk_region_root) instead
@@ -122,9 +124,10 @@ TK_RT_LIST(int64_t,   tk_i64_list)     // []i64   — integer accumulator lists
 void *tk_alloc(size_t n);
 
 // ── Arena allocation (S1 — TEKO_EVOLUTION_DESIGN §5.2: arena primitive + root region) ──
-// A bump-allocator REGION: a chunk-list of malloc'd blocks, sub-allocated by a bump offset.
-// No per-object metadata, no free-list (M.0 metal/no-GC). region_alloc results are
-// max_align_t-aligned (malloc's own guarantee), so every type that was malloc-stored stays
+// A bump-allocator REGION: a chunk-list of aligned-malloc'd blocks, sub-allocated by a bump
+// offset. No per-object metadata, no free-list (M.0 metal/no-GC). region_alloc results are
+// TK_ARENA_ALIGN-aligned (an over-aligned chunk payload, NOT merely malloc's guarantee — see
+// teko_rt.c), so every type that was malloc-stored — including __int128-carrying nodes — stays
 // correctly aligned. OOM panics (M.1, never NULL). region_drop bulk-frees the whole span in
 // one pass (the S2 keystone). The process ROOT region (tk_region_root) is never dropped in
 // S1 → its memory lives for the whole process = today's malloc-everywhere leak (M.5
@@ -260,6 +263,12 @@ tk_str tk_fmt_dyn_u64(uint64_t val, tk_str spec);
 // tk_str_eq — true iff a and b have the same length and the same bytes (memcmp; embedded NUL
 // tolerated). No allocation.
 bool tk_str_eq(tk_str a, tk_str b);
+// (TR3) tk_str_hash — FNV-1a over the str's bytes (offset basis 14695981039346656037, prime
+// 1099511628211, u64 wraparound); an empty str hashes to the offset basis. No allocation.
+uint64_t tk_str_hash(tk_str s);
+// (TR3) tk_str_cmp — lexicographic byte compare (unsigned): -1 (a < b) / 0 (equal) / 1 (a > b);
+// the shorter str is the lesser when one is a prefix of the other. No allocation.
+int64_t tk_str_cmp(tk_str a, tk_str b);
 // tk_str_slice — the substring bytes [start, end) as a fresh owned str. An out-of-range slice
 // (start > end, or end > s.len) PANICS (M.1, parity with the VM's bounds check). The empty
 // slice (start == end) is a valid empty str (1-byte buffer so ptr is never NULL+stale len).
@@ -390,6 +399,13 @@ tk_str tk_rt_version(void);
 // (#148) the process peak RSS in bytes (0 = unavailable) — teko::mem::peak_rss.
 uint64_t tk_peak_rss(void);
 
+// (#194 C6) teko::crypto::rand::secure_bytes(n) — n cryptographically-secure random bytes
+// from the host CSPRNG (getrandom(2)/getentropy(3) on POSIX, rand_s (ucrt) on Windows).
+// Returns a fresh owned buffer of EXACTLY n bytes (n == 0 -> a valid empty slice, ptr may be
+// NULL); tk_panic on a genuine host entropy failure (M.1 — silently returning weak/short
+// output is a security defect, never a soft error here).
+tk_slice_byte tk_rt_secure_bytes(uint64_t n);
+
 // ---- Date/Time placeholder types (ROUND 0) ----
 // Five value types: DateTime (signed ns since Unix epoch), TimeSpan (signed ns duration),
 // Time (ns since midnight), Date (days since 1970-01-01 = 0), DateTimeOffset (DateTime + offset).
@@ -453,6 +469,14 @@ void     tk_cov_lines_on(bool on);
 void     tk_cov_line_reset(void);
 void     tk_cov_line(uint32_t line);                       // mark a line as executed (current fn)
 bool     tk_cov_line_hit(uint64_t fn, uint32_t line);      // report query
+
+// #265 (Track A) — EXPLICIT-fn line/branch marks for the native test gate. The VM keeps a live
+// enter/leave fn-stack (eval_call), so tk_cov_line/tk_cov_branch read tk_fn_stack[sp-1]. The native
+// test binary has NO enter/leave inside production bodies, so codegen passes the owning fn's
+// prog.items index EXPLICITLY, bypassing the stack — every interior mark keys on the fn the static
+// floor walk (line_coverage/branch_coverage) queries. Same tk_line_id/tk_branch_id packing.
+void     tk_cov_line_at(uint64_t fn, uint32_t line);                             // mark a line for fn (explicit)
+void     tk_cov_branch_at(uint64_t fn, uint32_t line, uint32_t col, uint64_t outcome);  // mark a branch for fn (explicit)
 
 // #265 — cross-process coverage merge for the NATIVE test gate. The child test binary dumps its three
 // sinks to a `.tkcov` file at exit; the compiler (parent) merges them, then runs the unchanged static
@@ -672,7 +696,7 @@ static inline int64_t  tk_sub_i64(int64_t  a, int64_t  b){ return a - b; }
 static inline __int128 tk_sub_i128(__int128 a, __int128 b){ return a - b; }
 
 static inline uint8_t  tk_mul_u8 (uint8_t  a, uint8_t  b){ return (uint8_t )(a * b); }
-static inline uint16_t tk_mul_u16(uint16_t a, uint16_t b){ return (uint16_t)(a * b); }
+static inline uint16_t tk_mul_u16(uint16_t a, uint16_t b){ return (uint16_t)((unsigned)a * (unsigned)b); }
 static inline uint32_t tk_mul_u32(uint32_t a, uint32_t b){ return a * b; }
 static inline uint64_t tk_mul_u64(uint64_t a, uint64_t b){ return a * b; }
 static inline unsigned __int128 tk_mul_u128(unsigned __int128 a, unsigned __int128 b){ return a * b; }

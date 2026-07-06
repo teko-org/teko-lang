@@ -63,11 +63,15 @@ EXPECTED_FAIL=(
 #   honest-stop shape as any other raw extern.
 # io_file_copy — IO1 (#184): file -> store -> file -> unstore -> file over the ReadFn/WriteFn
 #   copy seam; calls the read_file / write_file_bytes externs, which the VM refuses by design.
+# crypto_rand_secure_bytes — calls teko::crypto::rand::secure_bytes, a `from "teko_rt"`
+#   extern (#194 C6); the VM rejects EVERY extern (not just raw platform ones — C7.1a), so
+#   this CSPRNG primitive is native-only, same shape as time_types.
 NATIVE_ONLY=(
     time_types
     extern_reachability
     buf_ptr_memset_roundtrip
     io_file_copy
+    crypto_rand_secure_bytes
 )
 
 is_expected_fail() {

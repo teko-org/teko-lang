@@ -617,6 +617,46 @@ fn try_err_builtin(callee: parser::Path, args: []checker::TExpr, env: Venv) -> V
 // passes directly). The VM's []Value is not a contiguous byte buffer, so we MATERIALIZE the
 // bytes into a `str` first (each byte → teko::one_byte, concatenated — M.1), then call
 // teko::str_of_bytes (which COPIES into the fresh owned result), mirroring the C twin.
+/**
+ * (TR3) FNV-1a over the str's bytes (offset basis 14695981039346656037, prime 1099511628211, u64
+ * wraparound) — the VM twin of `tk_str_hash` / `teko::runtime::str_hash`, used by a str-field
+ * structural `Hash`. Both engines fold str bytes identically.
+ *
+ * @param s the string to hash
+ * @return the FNV-1a hash of `s`'s bytes
+ */
+fn vm_str_hash(s: str) -> u64 {
+    mut h: u64 = 14695981039346656037
+    mut i: u64 = 0
+    loop { if i >= teko::len(s) { break }; h = (h ^ (s[i] to u64)) * 1099511628211; i++ }
+    h
+}
+
+/**
+ * (TR3) Lexicographic byte compare (unsigned): -1 (a < b) / 0 (equal) / 1 (a > b); the shorter str
+ * is the lesser when one is a prefix of the other — the VM twin of `tk_str_cmp` /
+ * `teko::runtime::str_compare`, used by a str-field structural `Ord`.
+ *
+ * @param a the left string
+ * @param b the right string
+ * @return -1, 0, or 1 as `a` orders before, equal to, or after `b`
+ */
+fn vm_str_compare(a: str, b: str) -> i64 {
+    let la = teko::len(a)
+    let lb = teko::len(b)
+    let n = if la < lb { la } else { lb }
+    mut i: u64 = 0
+    loop {
+        if i >= n { break }
+        if (a[i] to u64) < (b[i] to u64) { return -1 }
+        if (a[i] to u64) > (b[i] to u64) { return 1 }
+        i++
+    }
+    if la < lb { return -1 }
+    if la > lb { return 1 }
+    0
+}
+
 fn try_str_builtin(callee: parser::Path, args: []checker::TExpr, env: Venv) -> Value? {
     let last = callee.segments[callee.segments.len - 1].name
     let addressable = callee.segments.len == 1 || callee.segments[0].name == "teko"
@@ -882,6 +922,8 @@ fn try_str_builtin(callee: parser::Path, args: []checker::TExpr, env: Venv) -> V
         let b = as_str(ev_val(args[1], env))
         return a == b
     }
+    if last == "str_hash" { return vm_str_hash(as_str(ev_val(args[0], env))) }
+    if last == "str_compare" { return vm_str_compare(as_str(ev_val(args[0], env)), as_str(ev_val(args[1], env))) }
     if last == "str_len" { return teko::len(as_str(ev_val(args[0], env))) }
     if last == "str_slice" { return teko::slice(as_str(ev_val(args[0], env)), as_int(ev_val(args[1], env)) to u64, as_int(ev_val(args[2], env)) to u64) }
     if last == "str_slice_to" { return teko::slice_to(as_str(ev_val(args[0], env)), as_int(ev_val(args[1], env)) to u64) }
@@ -1274,6 +1316,41 @@ fn eval_interp_hole_no_spec(h: Value) -> str {
     }
 }
 
+/**
+ * Reinterpret an integer interpolation hole as an unsigned 64-bit value, matching C's
+ * `(uint64_t)` cast at the native format-spec call site.
+ *
+ * A hex/binary/thousands spec on a SIGNED hole lowers natively to `tk_fmt_*((uint64_t)(hole))`,
+ * a two's-complement bit reinterpretation that never traps. A checked Teko `to u64` would
+ * instead PANIC on a negative value ("impossible conversion") — a VM≠native divergence — so this
+ * masks the low 64 bits like the native cast, keeping the self-hosted VM byte-identical.
+ *
+ * @param raw  the hole's integer bits as i128 (an int hole via `as_int`, or a float hole
+ *             truncated toward zero into i128)
+ * @return     the low 64 bits of `raw` as a u64 (two's-complement wrap, never panics)
+ */
+fn wrap_hole_to_u64(raw: i128) -> u64 {
+    (raw & (u_max_of(64) to i128)) to u64
+}
+
+/**
+ * Reinterpret an integer interpolation hole as a signed 64-bit value, matching C's `(int64_t)`
+ * cast at the native format-spec call site (used by the `d`/`n` integer families).
+ *
+ * Masks the low 64 bits then sign-extends from bit 63, mirroring C's two's-complement narrowing
+ * — an UNSIGNED hole above `i64::MAX` wraps to negative exactly as `(int64_t)` does, where a
+ * checked Teko `to i64` would PANIC.
+ *
+ * @param raw  the hole's integer bits as i128 (an int hole via `as_int`, or a float hole
+ *             truncated toward zero into i128)
+ * @return     the low 64 bits of `raw` as an i64 (two's-complement wrap, never panics)
+ */
+fn wrap_hole_to_i64(raw: i128) -> i64 {
+    let masked = raw & (u_max_of(64) to i128)
+    if masked >= ((1 to i128) << 63) { return (masked - ((1 to i128) << 64)) to i64 }
+    masked to i64
+}
+
 fn eval_interp_static_spec(h: Value, spec: str) -> str {
     // lowercase first byte to normalize 'F'→'f' (ASCII: 0x20 = lowercase flag for A-Z)
     let fc0 = if spec.len > 0 { spec[0] } else { 102 to byte }   // 102 = 'f'
@@ -1292,8 +1369,9 @@ fn eval_interp_static_spec(h: Value, spec: str) -> str {
     let dval = if is_flt { as_float(h) }
     else if int_sign_of(h) { as_int(h) to i64 to f64 }
     else { as_int(h) to u64 to f64 }
-    let ival = if int_sign_of(h) { as_int(h) to i64 } else { 0 to i64 }
-    let uval = if !int_sign_of(h) && !is_flt { as_int(h) to u64 } else { 0 to u64 }
+    let int_bits = if is_flt { as_float(h) to i128 } else { as_int(h) }
+    let ival = wrap_hole_to_i64(int_bits)
+    let uval = wrap_hole_to_u64(int_bits)
     if fc_low == 102 { teko::fmt_f(dval, prec) }   // 'f'
     else if fc_low == 101 { teko::fmt_e(dval, prec) }   // 'e'
     else if fc_low == 103 { teko::fmt_g(dval, prec) }   // 'g'
@@ -1475,7 +1553,7 @@ fn as_int(v: Value) -> i128 {
         u16 as x => x to i128
         u32 as x => x to i128
         u64 as x => x to i128
-        u128 as x => x to i128
+        u128 as x => reinterpret_u128_to_i128(x)   // non-trapping: u128 high-bit doesn't fit i128 (#296)
         i8 as x => x to i128
         i16 as x => x to i128
         i32 as x => x to i128
@@ -1500,6 +1578,50 @@ fn as_str(v: Value) -> str {
     match v { str as x => x; _ => panic("vm: as_str on a non-str value (checker should reject)") }
 }
 
+/**
+ * Reinterpret an i128 carrier's raw BITS as a u128, two's-complement, never trapping.
+ *
+ * The VM carries every integer Value in an i128; a u128 with the high bit set is stored as a
+ * NEGATIVE i128, and a checked `i128 to u128` PANICS on it ("impossible conversion") — a VM≠native
+ * divergence (native lowers a u128 as a plain `(unsigned __int128)` reinterpret). There is no
+ * 128-bit-wide non-trapping cast op, so we rebuild the value from its two 64-bit halves: the low
+ * half is masked out non-trapping (`wrap_hole_to_u64`), the high half is the arithmetic shift's low
+ * 64 bits, and they are recomposed in u128 space where every sub-op is total.
+ *
+ * @param raw  the integer Value's raw bits as an i128 carrier
+ * @return     the same bit pattern as a u128 (two's-complement reinterpret, never panics)
+ * @see wrap_hole_to_u64 the 64-bit sibling reinterpret (vm.tks)
+ * @since onda-3 (#296)
+ */
+fn reinterpret_i128_to_u128(raw: i128) -> u128 {
+    let lo = wrap_hole_to_u64(raw) to u128
+    let hi = wrap_hole_to_u64(raw >> 64) to u128
+    (hi << 64) | lo
+}
+
+/**
+ * Reinterpret a u128's raw BITS as an i128, two's-complement, never trapping — the inverse of
+ * `reinterpret_i128_to_u128`.
+ *
+ * `as_int` collapses every integer Value into the shared i128 carrier for arithmetic, but a u128
+ * with the high bit set does NOT fit i128, so a checked `u128 to i128` PANICS ("impossible
+ * conversion"). Native reinterprets the bits (a u128 and i128 share the same 128-bit register).
+ * We reproduce that without a trapping op: the high-bit-clear half fits i128 directly; the
+ * high-bit-set case removes the sign bit (fits), then subtracts 2^127 (as two 2^126 steps, each in
+ * range) so no intermediate ever overflows i128.
+ *
+ * @param x  the u128 bit pattern
+ * @return   the same 128 bits as an i128 (two's-complement reinterpret, never panics)
+ * @see reinterpret_i128_to_u128 the inverse (i128 carrier bits -> u128)
+ * @since onda-3 (#296)
+ */
+fn reinterpret_u128_to_i128(x: u128) -> i128 {
+    let sign_bit = (1 to u128) << 127
+    if x < sign_bit { return x to i128 }
+    let low = (x - sign_bit) to i128
+    low - ((1 to i128) << 126) - ((1 to i128) << 126)
+}
+
 // Value CONSTRUCTORS — the .tks stand-in for the C v_int / v_float (+ norm_int). A `u32` Value IS
 // the `u32` case (the member carries the scalar), so we build by MASKING the low `width` bits with
 // bitwise `&` (never panics, unlike a checked `to`) and then sign-extending for signed widths — the
@@ -1517,7 +1639,7 @@ fn norm_int(raw: i128, signed: bool, width: u8) -> Value {
         else if width == 16 { (raw & 0xFFFF) to u16 }
         else if width == 32 { (raw & 0xFFFFFFFF) to u32 }
         else if width == 64 { (raw & 0xFFFFFFFFFFFFFFFF) to u64 }
-        else { raw to u128 }   // 128: reinterpret the carrier's bits
+        else { reinterpret_i128_to_u128(raw) }   // 128: reinterpret the carrier's bits (non-trapping, #296)
     }
 }
 
@@ -2308,7 +2430,7 @@ fn apply_int_op(op: lexer::TokenKind, l: i128, r: i128, sgn: bool, w: u8) -> i12
         Pipe => l | r
         Caret => l ^ r
         Shl => l << (r & mask)
-        Shr => l >> (r & mask)
+        Shr => if (!sgn) && (w == 128) { reinterpret_u128_to_i128(reinterpret_i128_to_u128(l) >> (r & mask)) } else { l >> (r & mask) }   // unsigned 128 = LOGICAL shift (carrier may be negative); u8..u64 unsigned have positive carriers (#296)
         _ => panic("vm: binary operator not yet supported")
     }
 }

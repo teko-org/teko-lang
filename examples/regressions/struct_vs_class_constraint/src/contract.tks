@@ -1,0 +1,65 @@
+/**
+ * A measurement contract satisfied by BOTH a value-type struct and a ref-type class in the same
+ * program — the discriminator that proves the constraint-dispatch fix stays a NO-OP for classes:
+ * the struct receiver lowers to a DIRECT stamped-method call, the class receiver keeps dispatching
+ * through its vtable, both correct (#294 ruling (a)).
+ */
+type Measurable = interface {
+    /**
+     * Report this value's measure.
+     *
+     * @return the value's measure as a signed 64-bit integer
+     */
+    fn measure(self) -> i64
+}
+
+/**
+ * A STRUCT conforming to `Measurable` (value type, no vtable) — constraint dispatch on it must
+ * resolve to the concrete stamped `StructValue::measure`, never a fat-pointer upcast (#294).
+ */
+type StructValue = struct Measurable {
+    /** The stored width. */
+    w: i64
+
+    /**
+     * Report the stored width unchanged.
+     *
+     * @return the stored width
+     */
+    pub fn measure(self) -> i64 { self.w }
+}
+
+/**
+ * A CLASS conforming to `Measurable` (ref type, has a vtable) — constraint dispatch on it keeps
+ * routing through the vtable exactly as before the fix, proving the struct rewrite does not perturb
+ * the class dispatch path (#294).
+ */
+type ClassValue = class & Measurable {
+    /** The stored width. */
+    pub w: i64
+
+    /**
+     * Construct a `ClassValue` wrapping `x`.
+     *
+     * @param x  the width to store
+     * @return   a fresh `ClassValue`
+     */
+    pub fn make(x: i64) -> ClassValue { ClassValue { w = x } }
+
+    /**
+     * Report ten more than the stored width, so a mismatched dispatch would surface loudly.
+     *
+     * @return the stored width plus ten
+     */
+    pub fn measure(self) -> i64 { self.w + 10 }
+}
+
+/**
+ * Dispatch `measure()` through a `Measurable` constraint. Instantiated once at a STRUCT type
+ * (direct stamped call) and once at a CLASS type (vtable dispatch) — both must return the correct
+ * per-type measure (#294).
+ *
+ * @param x  a value whose concrete type satisfies `Measurable`
+ * @return   `x.measure()` at the receiver's concrete type
+ */
+fn total<T: Measurable>(x: T) -> i64 { return x.measure() }

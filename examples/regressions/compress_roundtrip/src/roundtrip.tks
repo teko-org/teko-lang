@@ -1,0 +1,266 @@
+/**
+ * Regression (#192): a payload survives a DEFLATE-family compress/decompress round-trip
+ * identically on both engines.
+ *
+ * SELF-CONTAINED twin: a standalone project cannot see the compiler corpus's stdlib
+ * namespaces yet (`teko::compress` is in scope only when building the compiler itself —
+ * stdlib distribution arrives with packages, the same convention `io_stream_pipeline`
+ * documents), so this fixture re-declares a COMPACT mirror of the real algorithm: a
+ * stored-block DEFLATE compressor/decompressor plus CRC-32, the same value-threaded
+ * bit-reader/Huffman shapes the real `src/compress/{deflate,inflate}.tks` use, at a
+ * smaller scale. The real module's full known-answer + dynamic-Huffman coverage lives in
+ * `src/compress/inflate_test.tkt` (the corpus `.tkt` gate, both engines); THIS fixture
+ * pins the native==VM behavior of the underlying constructs (bit-level cursors, value-
+ * threaded state, LZ77 back-reference copy) end-to-end through a real binary.
+ *
+ * Exit-code protocol: `0` on full success; a distinct nonzero code identifies which
+ * check failed first (`scripts/diff_vm_native.sh` compares exit codes across engines).
+ */
+
+/**
+ * Build one row of the CRC-32 lookup table (polynomial 0xEDB88320, reflected).
+ *
+ * @param i  the table index (0-255), used as the initial 8-bit remainder
+ * @return   the accumulated 32-bit remainder after 8 reduction steps
+ */
+fn crc32_row(i: u32) -> u32 {
+    mut crc = i
+    mut k = 0
+    loop {
+        if k >= 8 { break }
+        if (crc & 1) != 0 { crc = (crc >> 1) ^ 0xEDB88320 } else { crc = crc >> 1 }
+        k++
+    }
+    crc
+}
+
+/**
+ * The CRC-32 (polynomial 0xEDB88320) of a byte slice, in its standard form.
+ *
+ * @param data  the bytes to checksum
+ * @return      the standard CRC-32 value
+ */
+fn crc32_of(data: []byte) -> u32 {
+    mut crc: u32 = 0xFFFFFFFF
+    mut i: u64 = 0
+    loop {
+        if i >= data.len { break }
+        let idx = (crc ^ (data[i] to u32)) & 0xFF
+        crc = crc32_row(idx) ^ (crc >> 8)
+        i++
+    }
+    crc ^ 0xFFFFFFFF
+}
+
+/**
+ * The largest byte count one STORED DEFLATE block can carry (`LEN` is a `u16`).
+ *
+ * @return  `65535`
+ */
+fn max_stored_block_len() -> u64 { 65535 }
+
+/**
+ * Extract `data[from, to)` into a fresh byte slice.
+ *
+ * @param data  the source bytes
+ * @param from  the inclusive start index
+ * @param to    the exclusive end index
+ * @return      the extracted bytes, in order
+ */
+fn slice_bytes(data: []byte, from: u64, to: u64) -> []byte {
+    mut out: []byte = teko::list::empty()
+    mut i = from
+    loop {
+        if i >= to { break }
+        out = teko::list::push(out, data[i])
+        i++
+    }
+    out
+}
+
+/**
+ * Append one STORED-block header (`BFINAL` + `BTYPE 00`, then `LEN`/`NLEN` as
+ * little-endian `u16`s) and the block's raw bytes (RFC 1951 §3.2.4).
+ *
+ * @param buf       the growing compressed-output buffer
+ * @param chunk     this block's raw bytes (at most `max_stored_block_len()` long)
+ * @param is_final  whether this is the LAST block in the stream (`BFINAL`)
+ * @return          `buf` with the new stored block appended
+ */
+fn append_stored_block(buf: []byte, chunk: []byte, is_final: bool) -> []byte {
+    mut out = buf
+    let bfinal_bit: u32 = if is_final { 1 to u32 } else { 0 to u32 }
+    out = teko::list::push(out, bfinal_bit to byte)
+
+    let len = chunk.len to u32
+    let nlen = (~len) & 0xFFFF
+    out = teko::list::push(out, (len & 0xFF) to byte)
+    out = teko::list::push(out, ((len >> 8) & 0xFF) to byte)
+    out = teko::list::push(out, (nlen & 0xFF) to byte)
+    out = teko::list::push(out, ((nlen >> 8) & 0xFF) to byte)
+
+    mut i: u64 = 0
+    loop {
+        if i >= chunk.len { break }
+        out = teko::list::push(out, chunk[i])
+        i++
+    }
+    out
+}
+
+/**
+ * Compress `data` into a raw DEFLATE bitstream using STORED blocks only.
+ *
+ * @param data  the bytes to compress
+ * @return      a valid DEFLATE stream that decompresses back to `data`
+ */
+fn deflate(data: []byte) -> []byte {
+    mut out: []byte = teko::list::empty()
+    let block_len = max_stored_block_len()
+
+    if data.len == 0 { return append_stored_block(out, data, true) }
+
+    mut pos: u64 = 0
+    loop {
+        let remaining = data.len - pos
+        let this_len = if remaining < block_len { remaining } else { block_len }
+        let chunk = slice_bytes(data, pos, pos + this_len)
+        let is_final = pos + this_len >= data.len
+        out = append_stored_block(out, chunk, is_final)
+        pos = pos + this_len
+        if is_final { break }
+    }
+    out
+}
+
+/**
+ * A bit-level cursor over a byte slice, value-threaded (every read returns a NEW
+ * cursor) — the same shape `src/compress/inflate.tks`'s `BitReader` uses.
+ */
+type Cursor = struct {
+    /** The underlying compressed bytes. */
+    data: []byte
+    /** The index of the next byte to read. */
+    byte_pos: u64
+}
+
+/**
+ * The result of decoding one stored block: the advanced cursor, the output with this
+ * block's bytes appended, and whether it was the stream's final block.
+ */
+type BlockResult = struct {
+    /** The cursor advanced past this block. */
+    cursor: Cursor
+    /** The decompressed bytes so far, with this block's bytes appended. */
+    output: []byte
+    /** Whether this block's `BFINAL` bit was set (the stream's last block). */
+    is_final: bool
+}
+
+/**
+ * Decode exactly one STORED block starting at `cur` (aligned — this mirror only ever
+ * emits stored blocks, so every block starts byte-aligned already).
+ *
+ * @param cur     the cursor positioned at a block header
+ * @param output  the decompressed bytes produced so far
+ * @return        the advanced cursor, the decompressed bytes with this block appended,
+ *                and whether this was the FINAL block, or an `error` on a malformed
+ *                header or truncated data
+ * @throws        when `NLEN != ~LEN` or the block is truncated
+ */
+fn inflate_one_block(cur: Cursor, output: []byte) -> BlockResult | error {
+    if cur.byte_pos >= cur.data.len { return error { message = "roundtrip: truncated block header" } }
+    let header = cur.data[cur.byte_pos] to u32
+    let is_final = (header & 1) != 0
+
+    let len_pos = cur.byte_pos + 1
+    if len_pos + 4 > cur.data.len { return error { message = "roundtrip: truncated stored-block header" } }
+    let len = (cur.data[len_pos] to u64) | ((cur.data[len_pos + 1] to u64) << 8)
+    let nlen = (cur.data[len_pos + 2] to u64) | ((cur.data[len_pos + 3] to u64) << 8)
+    if (nlen & 0xFFFF) != ((~len) & 0xFFFF) { return error { message = "roundtrip: NLEN check failed" } }
+
+    let data_start = len_pos + 4
+    if data_start + len > cur.data.len { return error { message = "roundtrip: truncated stored-block data" } }
+
+    let chunk = slice_bytes(cur.data, data_start, data_start + len)
+    mut out = output
+    mut i: u64 = 0
+    loop {
+        if i >= chunk.len { break }
+        out = teko::list::push(out, chunk[i])
+        i++
+    }
+
+    BlockResult { cursor = Cursor { data = cur.data; byte_pos = data_start + len }; output = out; is_final = is_final }
+}
+
+/**
+ * Decompress a raw DEFLATE bitstream produced by `deflate` (STORED blocks only).
+ *
+ * @param data  the compressed DEFLATE stream
+ * @return      the decompressed bytes, or an `error` on a malformed block
+ */
+fn inflate(data: []byte) -> []byte | error {
+    mut cur = Cursor { data = data; byte_pos = 0 }
+    mut out: []byte = teko::list::empty()
+    loop {
+        let step = match inflate_one_block(cur, out) { BlockResult as b => b; error as e => return e }
+        cur = step.cursor
+        out = step.output
+        if step.is_final { break }
+    }
+    out
+}
+
+/**
+ * True iff `a` and `b` have the same length and equal bytes at every index.
+ *
+ * @param a  the first byte slice
+ * @param b  the second byte slice
+ * @return   whether `a` and `b` are byte-for-byte identical
+ */
+fn bytes_eq(a: []byte, b: []byte) -> bool {
+    if a.len != b.len { return false }
+    mut i: u64 = 0
+    loop {
+        if i >= a.len { break }
+        if a[i] != b[i] { return false }
+        i++
+    }
+    true
+}
+
+/**
+ * The regression's payload: a moderately repetitive byte pattern spanning several
+ * DEFLATE stored-block boundaries at a small block size.
+ *
+ * @return  a 2000-byte payload built from a repeating `[0..251)` ramp
+ */
+fn payload() -> []byte {
+    mut data: []byte = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= 2000 { break }
+        data = teko::list::push(data, (i % 251) to byte)
+        i++
+    }
+    data
+}
+
+/**
+ * Run the round-trip + checksum checks, stopping at the first failure.
+ *
+ * @return  `0` if every check passes; otherwise a distinct nonzero code identifying
+ *          which check failed (`1` = round-trip mismatch, `2` = inflate reported an
+ *          unexpected error, `3` = CRC-32 of the original mismatches the CRC-32 of the
+ *          round-tripped bytes)
+ */
+pub fn run_roundtrip() -> i32 {
+    let data = payload()
+    let compressed = deflate(data)
+    let decompressed = match inflate(compressed) { []byte as b => b; error => return 2 }
+
+    if !bytes_eq(decompressed, data) { return 1 }
+    if crc32_of(data) != crc32_of(decompressed) { return 3 }
+    0
+}

@@ -1,0 +1,635 @@
+/**
+ * `teko::crypto::hash` (C1) — the SHA-2 hash family: SHA-256 and SHA-512, each with a
+ * streaming `init`/`update`/`finalize` API AND a one-shot convenience wrapper. Per issue
+ * #194 (C0+C1+C6): pure Teko, no OS dependency, VM-`.tkt`-testable against the FIPS 180-4 /
+ * NIST known-answer vectors.
+ *
+ * DEFERRED (reported, not silently dropped — M.3 honesty): SHA-3/Keccak, SHAKE128/256,
+ * BLAKE2b/2s, and the `legacy` SHA-1/MD5 primitives that TEKO_ROADMAP_NET_CRYPTO.md §3
+ * groups under the same C1 unit are NOT in this increment. This file ships SHA-256 + SHA-512
+ * (the SHA-2 family) as a first gate-able slice; the remainder stays open under #194.
+ *
+ * TOTAL, NO PANICS. Every function here operates on caller-supplied `[]byte` and always
+ * succeeds — there is no host/entropy dependency and no malformed-input domain (any byte
+ * sequence, including empty, is a valid message). `wrapping_add_u32`/`wrapping_add_u64`
+ * (`teko::math::checked`, M1) carry every modular addition so the compression rounds stay
+ * well-defined under `TEKO_OVERFLOW_DEBUG` (roadmap open decision #4) — plain `+` would trip
+ * the debug overflow guard on the very wraparound the algorithm requires.
+ *
+ * NO INDEX-ASSIGNMENT. The 8-word running state and the 64/80-word message schedule are
+ * both rebuilt via `teko::list::push` each round rather than mutated in place, the same
+ * discipline `teko::compress`'s CRC-32 table and `teko::crypto::ct_eq` already use.
+ */
+
+/**
+ * The 32-bit running state of an in-progress SHA-256 computation, plus the unprocessed
+ * tail bytes (fewer than 64) and the total message length seen so far (needed by the
+ * length-suffix padding at `finalize` time).
+ */
+pub type Sha256State = struct {
+    /** the eight 32-bit working words `h0..h7`, in order */
+    h: []u32
+    /** buffered input bytes not yet forming a complete 64-byte block */
+    pending: []byte
+    /** total message length processed so far, in bytes */
+    total_len: u64
+}
+
+/**
+ * The 64-bit running state of an in-progress SHA-512 computation, plus the unprocessed
+ * tail bytes (fewer than 128) and the total message length seen so far.
+ */
+pub type Sha512State = struct {
+    /** the eight 64-bit working words `h0..h7`, in order */
+    h: []u64
+    /** buffered input bytes not yet forming a complete 128-byte block */
+    pending: []byte
+    /** total message length processed so far, in bytes */
+    total_len: u64
+}
+
+/**
+ * Right-rotate a 32-bit word by `count` bits (0..31) — the `ROTR` primitive FIPS 180-4
+ * defines for every SHA-256 round function.
+ *
+ * @param x      the word to rotate
+ * @param count  the rotation amount in bits, 0..31
+ * @return       `x` rotated right by `count` bits
+ */
+fn rotr32(x: u32, count: u32) -> u32 {
+    (x >> count) | (x << (32 - count))
+}
+
+/**
+ * Right-rotate a 64-bit word by `count` bits (0..63) — the `ROTR` primitive FIPS 180-4
+ * defines for every SHA-512 round function.
+ *
+ * @param x      the word to rotate
+ * @param count  the rotation amount in bits, 0..63
+ * @return       `x` rotated right by `count` bits
+ */
+fn rotr64(x: u64, count: u32) -> u64 {
+    (x >> (count to u64)) | (x << ((64 - count) to u64))
+}
+
+/**
+ * The eight SHA-256 initial hash values `H(0)` (FIPS 180-4 §5.3.3) — the first 32 bits of
+ * the fractional parts of the square roots of the first eight primes.
+ *
+ * @return  the eight initial 32-bit state words, in order `h0..h7`
+ */
+fn sha256_iv() -> []u32 {
+    mut h: []u32 = teko::list::empty()
+    h = teko::list::push(h, 0x6a09e667)
+    h = teko::list::push(h, 0xbb67ae85)
+    h = teko::list::push(h, 0x3c6ef372)
+    h = teko::list::push(h, 0xa54ff53a)
+    h = teko::list::push(h, 0x510e527f)
+    h = teko::list::push(h, 0x9b05688c)
+    h = teko::list::push(h, 0x1f83d9ab)
+    h = teko::list::push(h, 0x5be0cd19)
+    h
+}
+
+/**
+ * The 64 SHA-256 round constants `K(t)` (FIPS 180-4 §4.2.2) — the first 32 bits of the
+ * fractional parts of the cube roots of the first 64 primes.
+ *
+ * @return  the 64 round constants, in round order
+ */
+fn sha256_k() -> []u32 {
+    mut k: []u32 = teko::list::empty()
+    k = teko::list::push(k, 0x428a2f98); k = teko::list::push(k, 0x71374491)
+    k = teko::list::push(k, 0xb5c0fbcf); k = teko::list::push(k, 0xe9b5dba5)
+    k = teko::list::push(k, 0x3956c25b); k = teko::list::push(k, 0x59f111f1)
+    k = teko::list::push(k, 0x923f82a4); k = teko::list::push(k, 0xab1c5ed5)
+    k = teko::list::push(k, 0xd807aa98); k = teko::list::push(k, 0x12835b01)
+    k = teko::list::push(k, 0x243185be); k = teko::list::push(k, 0x550c7dc3)
+    k = teko::list::push(k, 0x72be5d74); k = teko::list::push(k, 0x80deb1fe)
+    k = teko::list::push(k, 0x9bdc06a7); k = teko::list::push(k, 0xc19bf174)
+    k = teko::list::push(k, 0xe49b69c1); k = teko::list::push(k, 0xefbe4786)
+    k = teko::list::push(k, 0x0fc19dc6); k = teko::list::push(k, 0x240ca1cc)
+    k = teko::list::push(k, 0x2de92c6f); k = teko::list::push(k, 0x4a7484aa)
+    k = teko::list::push(k, 0x5cb0a9dc); k = teko::list::push(k, 0x76f988da)
+    k = teko::list::push(k, 0x983e5152); k = teko::list::push(k, 0xa831c66d)
+    k = teko::list::push(k, 0xb00327c8); k = teko::list::push(k, 0xbf597fc7)
+    k = teko::list::push(k, 0xc6e00bf3); k = teko::list::push(k, 0xd5a79147)
+    k = teko::list::push(k, 0x06ca6351); k = teko::list::push(k, 0x14292967)
+    k = teko::list::push(k, 0x27b70a85); k = teko::list::push(k, 0x2e1b2138)
+    k = teko::list::push(k, 0x4d2c6dfc); k = teko::list::push(k, 0x53380d13)
+    k = teko::list::push(k, 0x650a7354); k = teko::list::push(k, 0x766a0abb)
+    k = teko::list::push(k, 0x81c2c92e); k = teko::list::push(k, 0x92722c85)
+    k = teko::list::push(k, 0xa2bfe8a1); k = teko::list::push(k, 0xa81a664b)
+    k = teko::list::push(k, 0xc24b8b70); k = teko::list::push(k, 0xc76c51a3)
+    k = teko::list::push(k, 0xd192e819); k = teko::list::push(k, 0xd6990624)
+    k = teko::list::push(k, 0xf40e3585); k = teko::list::push(k, 0x106aa070)
+    k = teko::list::push(k, 0x19a4c116); k = teko::list::push(k, 0x1e376c08)
+    k = teko::list::push(k, 0x2748774c); k = teko::list::push(k, 0x34b0bcb5)
+    k = teko::list::push(k, 0x391c0cb3); k = teko::list::push(k, 0x4ed8aa4a)
+    k = teko::list::push(k, 0x5b9cca4f); k = teko::list::push(k, 0x682e6ff3)
+    k = teko::list::push(k, 0x748f82ee); k = teko::list::push(k, 0x78a5636f)
+    k = teko::list::push(k, 0x84c87814); k = teko::list::push(k, 0x8cc70208)
+    k = teko::list::push(k, 0x90befffa); k = teko::list::push(k, 0xa4506ceb)
+    k = teko::list::push(k, 0xbef9a3f7); k = teko::list::push(k, 0xc67178f2)
+    k
+}
+
+/**
+ * Creates a fresh SHA-256 state (the FIPS 180-4 initial hash values, no buffered input,
+ * zero total length) — the starting point for a streaming `sha256_update`/`sha256_finalize`
+ * sequence.
+ *
+ * @return  a fresh `Sha256State` ready to accept message bytes
+ */
+pub fn sha256_init() -> Sha256State {
+    Sha256State { h = sha256_iv(); pending = teko::list::empty(); total_len = 0 }
+}
+
+/**
+ * Reads a big-endian 32-bit word out of `block` starting at byte offset `off` (4 bytes,
+ * most-significant byte first) — the wire order FIPS 180-4 mandates for every message block.
+ *
+ * @param block  the 64-byte block being read
+ * @param off    the starting byte offset (0, 4, 8, … 60)
+ * @return       the big-endian `u32` at `block[off..off+4)`
+ */
+fn be_u32_at(block: []byte, off: u64) -> u32 {
+    let b0 = block[off] to u32
+    let b1 = block[off + 1] to u32
+    let b2 = block[off + 2] to u32
+    let b3 = block[off + 3] to u32
+    (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
+}
+
+/**
+ * Reads a big-endian 64-bit word out of `block` starting at byte offset `off` (8 bytes,
+ * most-significant byte first) — the wire order FIPS 180-4 mandates for every SHA-512
+ * message block.
+ *
+ * @param block  the 128-byte block being read
+ * @param off    the starting byte offset (0, 8, 16, … 120)
+ * @return       the big-endian `u64` at `block[off..off+8)`
+ */
+fn be_u64_at(block: []byte, off: u64) -> u64 {
+    let hi = be_u32_at(block, off) to u64
+    let lo = be_u32_at(block, off + 4) to u64
+    (hi << 32) | lo
+}
+
+/**
+ * Appends the big-endian bytes of a 32-bit word to `buf` (most-significant byte first) —
+ * the inverse of `be_u32_at`, used to render the final digest.
+ *
+ * @param buf  the output buffer to extend
+ * @param x    the word to append
+ * @return     `buf` with `x`'s four big-endian bytes appended
+ */
+fn push_be_u32(buf: []byte, x: u32) -> []byte {
+    mut b = buf
+    b = teko::list::push(b, ((x >> 24) & 0xFF) to byte)
+    b = teko::list::push(b, ((x >> 16) & 0xFF) to byte)
+    b = teko::list::push(b, ((x >> 8) & 0xFF) to byte)
+    b = teko::list::push(b, (x & 0xFF) to byte)
+    b
+}
+
+/**
+ * Appends the big-endian bytes of a 64-bit word to `buf` (most-significant byte first) —
+ * the inverse of `be_u64_at`, used to render the SHA-512 digest and the 128-bit length
+ * suffix both SHA-2 variants append during padding.
+ *
+ * @param buf  the output buffer to extend
+ * @param x    the word to append
+ * @return     `buf` with `x`'s eight big-endian bytes appended
+ */
+fn push_be_u64(buf: []byte, x: u64) -> []byte {
+    mut b = buf
+    b = push_be_u32(b, ((x >> 32) & 0xFFFFFFFF) to u32)
+    b = push_be_u32(b, (x & 0xFFFFFFFF) to u32)
+    b
+}
+
+/**
+ * Compresses one 64-byte block into `h` (FIPS 180-4 §6.2.2) — builds the 64-word message
+ * schedule, then runs the 64 compression rounds, then feeds the working variables back
+ * into `h` via modular addition.
+ *
+ * @param h      the eight current state words `h0..h7`
+ * @param block  the 64-byte block to absorb
+ * @return       the updated eight state words after this block
+ */
+fn sha256_compress(h: []u32, block: []byte) -> []u32 {
+    mut w: []u32 = teko::list::empty()
+    mut t: u64 = 0
+    loop {
+        if t >= 16 { break }
+        w = teko::list::push(w, be_u32_at(block, t * 4))
+        t++
+    }
+    loop {
+        if t >= 64 { break }
+        let w15 = w[t - 15]
+        let w2 = w[t - 2]
+        let s0 = rotr32(w15, 7) ^ rotr32(w15, 18) ^ (w15 >> 3)
+        let s1 = rotr32(w2, 17) ^ rotr32(w2, 19) ^ (w2 >> 10)
+        let sum = teko::math::wrapping_add_u32(teko::math::wrapping_add_u32(w[t - 16], s0), teko::math::wrapping_add_u32(w[t - 7], s1))
+        w = teko::list::push(w, sum)
+        t++
+    }
+    let k = sha256_k()
+    mut a = h[0]
+    mut b = h[1]
+    mut c = h[2]
+    mut d = h[3]
+    mut e = h[4]
+    mut f = h[5]
+    mut g = h[6]
+    mut hh = h[7]
+    mut i: u64 = 0
+    loop {
+        if i >= 64 { break }
+        let s1 = rotr32(e, 6) ^ rotr32(e, 11) ^ rotr32(e, 25)
+        let ch = (e & f) ^ ((~e) & g)
+        let temp1 = teko::math::wrapping_add_u32(teko::math::wrapping_add_u32(teko::math::wrapping_add_u32(hh, s1), ch), teko::math::wrapping_add_u32(k[i], w[i]))
+        let s0 = rotr32(a, 2) ^ rotr32(a, 13) ^ rotr32(a, 22)
+        let maj = (a & b) ^ (a & c) ^ (b & c)
+        let temp2 = teko::math::wrapping_add_u32(s0, maj)
+        hh = g
+        g = f
+        f = e
+        e = teko::math::wrapping_add_u32(d, temp1)
+        d = c
+        c = b
+        b = a
+        a = teko::math::wrapping_add_u32(temp1, temp2)
+        i++
+    }
+    mut out: []u32 = teko::list::empty()
+    out = teko::list::push(out, teko::math::wrapping_add_u32(h[0], a))
+    out = teko::list::push(out, teko::math::wrapping_add_u32(h[1], b))
+    out = teko::list::push(out, teko::math::wrapping_add_u32(h[2], c))
+    out = teko::list::push(out, teko::math::wrapping_add_u32(h[3], d))
+    out = teko::list::push(out, teko::math::wrapping_add_u32(h[4], e))
+    out = teko::list::push(out, teko::math::wrapping_add_u32(h[5], f))
+    out = teko::list::push(out, teko::math::wrapping_add_u32(h[6], g))
+    out = teko::list::push(out, teko::math::wrapping_add_u32(h[7], hh))
+    out
+}
+
+/**
+ * Concatenates `a` then `b` into a fresh `[]byte` — the buffered-tail + new-input join
+ * every streaming `update` performs before slicing off whole blocks.
+ *
+ * @param a  the first slice
+ * @param b  the second slice
+ * @return   a fresh slice holding `a`'s bytes followed by `b`'s bytes
+ */
+fn bytes_concat(a: []byte, b: []byte) -> []byte {
+    mut out = a
+    mut i: u64 = 0
+    loop {
+        if i >= b.len { break }
+        out = teko::list::push(out, b[i])
+        i++
+    }
+    out
+}
+
+/**
+ * The sub-slice `data[from..to)` as a fresh `[]byte` — used to split a buffered stream
+ * into whole blocks plus a shorter remainder.
+ *
+ * @param data  the source slice
+ * @param from  the inclusive start index
+ * @param to    the exclusive end index
+ * @return      a fresh slice holding `data[from..to)`
+ */
+fn bytes_slice(data: []byte, from: u64, to: u64) -> []byte {
+    mut out: []byte = teko::list::empty()
+    mut i = from
+    loop {
+        if i >= to { break }
+        out = teko::list::push(out, data[i])
+        i++
+    }
+    out
+}
+
+/**
+ * Feeds `data` into an in-progress SHA-256 computation: joins it with any buffered tail,
+ * compresses every complete 64-byte block, and buffers the shorter remainder for the next
+ * call (or `sha256_finalize`). May be called any number of times before finalizing —
+ * `sha256_of(m)` is equivalent to `sha256_finalize(sha256_update(sha256_init(), m))`.
+ *
+ * @param state  the state to advance
+ * @param data   the next chunk of message bytes
+ * @return       the updated state after absorbing every complete block in `data`
+ */
+pub fn sha256_update(state: Sha256State, data: []byte) -> Sha256State {
+    let joined = bytes_concat(state.pending, data)
+    mut h = state.h
+    mut off: u64 = 0
+    loop {
+        if joined.len - off < 64 { break }
+        h = sha256_compress(h, bytes_slice(joined, off, off + 64))
+        off = off + 64
+    }
+    Sha256State { h = h; pending = bytes_slice(joined, off, joined.len); total_len = state.total_len + data.len }
+}
+
+/**
+ * Builds the FIPS 180-4 padding: a single `0x80` byte, zero bytes up to the length that
+ * leaves exactly 8 (SHA-256) or 16 (SHA-512) bytes free in a `block_size`-byte block, then
+ * the message length in BITS as a big-endian suffix of that width. Shared by both SHA-2
+ * variants; `is_512` selects the 128-byte block / 128-bit length-suffix shape (the top 64
+ * bits of that suffix are always zero — a `u64` byte count times 8 bits never overflows 64
+ * bits) versus SHA-256's 64-byte block / 64-bit length suffix.
+ *
+ * @param pending    the buffered tail bytes (fewer than one block)
+ * @param total_len  the total message length seen so far, in bytes
+ * @param is_512     true for SHA-512's 128-byte block / 128-bit length suffix, false for
+ *                   SHA-256's 64-byte block / 64-bit length suffix
+ * @return           `pending` followed by the `0x80` marker, zero padding, and the length suffix
+ */
+fn sha2_pad(pending: []byte, total_len: u64, is_512: bool) -> []byte {
+    mut out = pending
+    out = teko::list::push(out, 0x80 to byte)
+    let block_size = if is_512 { 128 to u64 } else { 64 to u64 }
+    let length_field = if is_512 { 16 to u64 } else { 8 to u64 }
+    loop {
+        if (out.len + length_field) % block_size == 0 { break }
+        out = teko::list::push(out, 0 to byte)
+    }
+    let bit_len = total_len * 8
+    if is_512 { return push_be_u64(push_be_u64(out, 0), bit_len) }
+    push_be_u64(out, bit_len)
+}
+
+/**
+ * Completes a SHA-256 computation: pads the buffered tail per FIPS 180-4 §5.1.1, compresses
+ * the resulting final block(s), and renders the eight state words as 32 big-endian bytes
+ * (the 256-bit digest).
+ *
+ * @param state  the state after every `sha256_update` call for this message
+ * @return       the 32-byte SHA-256 digest
+ */
+pub fn sha256_finalize(state: Sha256State) -> []byte {
+    let padded = sha2_pad(state.pending, state.total_len, false)
+    mut h = state.h
+    mut off: u64 = 0
+    loop {
+        if off >= padded.len { break }
+        h = sha256_compress(h, bytes_slice(padded, off, off + 64))
+        off = off + 64
+    }
+    mut out: []byte = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= h.len { break }
+        out = push_be_u32(out, h[i])
+        i++
+    }
+    out
+}
+
+/**
+ * One-shot SHA-256: hashes the whole of `data` in a single call. Equivalent to
+ * `sha256_finalize(sha256_update(sha256_init(), data))`.
+ *
+ * @param data  the complete message to hash
+ * @return      the 32-byte SHA-256 digest
+ */
+pub fn sha256_of(data: []byte) -> []byte {
+    sha256_finalize(sha256_update(sha256_init(), data))
+}
+
+/**
+ * `sha256_of`, rendered as a lowercase hex string — the form every published known-answer
+ * vector uses (e.g. `sha256_hex_of(bytes_of("abc"))` = `"ba7816bf8f01cfea..."`).
+ *
+ * @param data  the complete message to hash
+ * @return      the SHA-256 digest of `data` as 64 lowercase hex characters
+ */
+pub fn sha256_hex_of(data: []byte) -> str {
+    teko::crypto::to_hex(sha256_of(data))
+}
+
+/**
+ * The eight SHA-512 initial hash values `H(0)` (FIPS 180-4 §5.3.5) — the first 64 bits of
+ * the fractional parts of the square roots of the first eight primes.
+ *
+ * @return  the eight initial 64-bit state words, in order `h0..h7`
+ */
+fn sha512_iv() -> []u64 {
+    mut h: []u64 = teko::list::empty()
+    h = teko::list::push(h, 0x6a09e667f3bcc908)
+    h = teko::list::push(h, 0xbb67ae8584caa73b)
+    h = teko::list::push(h, 0x3c6ef372fe94f82b)
+    h = teko::list::push(h, 0xa54ff53a5f1d36f1)
+    h = teko::list::push(h, 0x510e527fade682d1)
+    h = teko::list::push(h, 0x9b05688c2b3e6c1f)
+    h = teko::list::push(h, 0x1f83d9abfb41bd6b)
+    h = teko::list::push(h, 0x5be0cd19137e2179)
+    h
+}
+
+/**
+ * The 80 SHA-512 round constants `K(t)` (FIPS 180-4 §4.2.3) — the first 64 bits of the
+ * fractional parts of the cube roots of the first 80 primes.
+ *
+ * @return  the 80 round constants, in round order
+ */
+fn sha512_k() -> []u64 {
+    mut k: []u64 = teko::list::empty()
+    k = teko::list::push(k, 0x428a2f98d728ae22); k = teko::list::push(k, 0x7137449123ef65cd)
+    k = teko::list::push(k, 0xb5c0fbcfec4d3b2f); k = teko::list::push(k, 0xe9b5dba58189dbbc)
+    k = teko::list::push(k, 0x3956c25bf348b538); k = teko::list::push(k, 0x59f111f1b605d019)
+    k = teko::list::push(k, 0x923f82a4af194f9b); k = teko::list::push(k, 0xab1c5ed5da6d8118)
+    k = teko::list::push(k, 0xd807aa98a3030242); k = teko::list::push(k, 0x12835b0145706fbe)
+    k = teko::list::push(k, 0x243185be4ee4b28c); k = teko::list::push(k, 0x550c7dc3d5ffb4e2)
+    k = teko::list::push(k, 0x72be5d74f27b896f); k = teko::list::push(k, 0x80deb1fe3b1696b1)
+    k = teko::list::push(k, 0x9bdc06a725c71235); k = teko::list::push(k, 0xc19bf174cf692694)
+    k = teko::list::push(k, 0xe49b69c19ef14ad2); k = teko::list::push(k, 0xefbe4786384f25e3)
+    k = teko::list::push(k, 0x0fc19dc68b8cd5b5); k = teko::list::push(k, 0x240ca1cc77ac9c65)
+    k = teko::list::push(k, 0x2de92c6f592b0275); k = teko::list::push(k, 0x4a7484aa6ea6e483)
+    k = teko::list::push(k, 0x5cb0a9dcbd41fbd4); k = teko::list::push(k, 0x76f988da831153b5)
+    k = teko::list::push(k, 0x983e5152ee66dfab); k = teko::list::push(k, 0xa831c66d2db43210)
+    k = teko::list::push(k, 0xb00327c898fb213f); k = teko::list::push(k, 0xbf597fc7beef0ee4)
+    k = teko::list::push(k, 0xc6e00bf33da88fc2); k = teko::list::push(k, 0xd5a79147930aa725)
+    k = teko::list::push(k, 0x06ca6351e003826f); k = teko::list::push(k, 0x142929670a0e6e70)
+    k = teko::list::push(k, 0x27b70a8546d22ffc); k = teko::list::push(k, 0x2e1b21385c26c926)
+    k = teko::list::push(k, 0x4d2c6dfc5ac42aed); k = teko::list::push(k, 0x53380d139d95b3df)
+    k = teko::list::push(k, 0x650a73548baf63de); k = teko::list::push(k, 0x766a0abb3c77b2a8)
+    k = teko::list::push(k, 0x81c2c92e47edaee6); k = teko::list::push(k, 0x92722c851482353b)
+    k = teko::list::push(k, 0xa2bfe8a14cf10364); k = teko::list::push(k, 0xa81a664bbc423001)
+    k = teko::list::push(k, 0xc24b8b70d0f89791); k = teko::list::push(k, 0xc76c51a30654be30)
+    k = teko::list::push(k, 0xd192e819d6ef5218); k = teko::list::push(k, 0xd69906245565a910)
+    k = teko::list::push(k, 0xf40e35855771202a); k = teko::list::push(k, 0x106aa07032bbd1b8)
+    k = teko::list::push(k, 0x19a4c116b8d2d0c8); k = teko::list::push(k, 0x1e376c085141ab53)
+    k = teko::list::push(k, 0x2748774cdf8eeb99); k = teko::list::push(k, 0x34b0bcb5e19b48a8)
+    k = teko::list::push(k, 0x391c0cb3c5c95a63); k = teko::list::push(k, 0x4ed8aa4ae3418acb)
+    k = teko::list::push(k, 0x5b9cca4f7763e373); k = teko::list::push(k, 0x682e6ff3d6b2b8a3)
+    k = teko::list::push(k, 0x748f82ee5defb2fc); k = teko::list::push(k, 0x78a5636f43172f60)
+    k = teko::list::push(k, 0x84c87814a1f0ab72); k = teko::list::push(k, 0x8cc702081a6439ec)
+    k = teko::list::push(k, 0x90befffa23631e28); k = teko::list::push(k, 0xa4506cebde82bde9)
+    k = teko::list::push(k, 0xbef9a3f7b2c67915); k = teko::list::push(k, 0xc67178f2e372532b)
+    k = teko::list::push(k, 0xca273eceea26619c); k = teko::list::push(k, 0xd186b8c721c0c207)
+    k = teko::list::push(k, 0xeada7dd6cde0eb1e); k = teko::list::push(k, 0xf57d4f7fee6ed178)
+    k = teko::list::push(k, 0x06f067aa72176fba); k = teko::list::push(k, 0x0a637dc5a2c898a6)
+    k = teko::list::push(k, 0x113f9804bef90dae); k = teko::list::push(k, 0x1b710b35131c471b)
+    k = teko::list::push(k, 0x28db77f523047d84); k = teko::list::push(k, 0x32caab7b40c72493)
+    k = teko::list::push(k, 0x3c9ebe0a15c9bebc); k = teko::list::push(k, 0x431d67c49c100d4c)
+    k = teko::list::push(k, 0x4cc5d4becb3e42b6); k = teko::list::push(k, 0x597f299cfc657e2a)
+    k = teko::list::push(k, 0x5fcb6fab3ad6faec); k = teko::list::push(k, 0x6c44198c4a475817)
+    k
+}
+
+/**
+ * Creates a fresh SHA-512 state (the FIPS 180-4 initial hash values, no buffered input,
+ * zero total length) — the starting point for a streaming `sha512_update`/`sha512_finalize`
+ * sequence.
+ *
+ * @return  a fresh `Sha512State` ready to accept message bytes
+ */
+pub fn sha512_init() -> Sha512State {
+    Sha512State { h = sha512_iv(); pending = teko::list::empty(); total_len = 0 }
+}
+
+/**
+ * Compresses one 128-byte block into `h` (FIPS 180-4 §6.4.2) — builds the 80-word message
+ * schedule, then runs the 80 compression rounds, then feeds the working variables back
+ * into `h` via modular addition.
+ *
+ * @param h      the eight current state words `h0..h7`
+ * @param block  the 128-byte block to absorb
+ * @return       the updated eight state words after this block
+ */
+fn sha512_compress(h: []u64, block: []byte) -> []u64 {
+    mut w: []u64 = teko::list::empty()
+    mut t: u64 = 0
+    loop {
+        if t >= 16 { break }
+        w = teko::list::push(w, be_u64_at(block, t * 8))
+        t++
+    }
+    loop {
+        if t >= 80 { break }
+        let w15 = w[t - 15]
+        let w2 = w[t - 2]
+        let s0 = rotr64(w15, 1) ^ rotr64(w15, 8) ^ (w15 >> 7)
+        let s1 = rotr64(w2, 19) ^ rotr64(w2, 61) ^ (w2 >> 6)
+        let sum = teko::math::wrapping_add_u64(teko::math::wrapping_add_u64(w[t - 16], s0), teko::math::wrapping_add_u64(w[t - 7], s1))
+        w = teko::list::push(w, sum)
+        t++
+    }
+    let k = sha512_k()
+    mut a = h[0]
+    mut b = h[1]
+    mut c = h[2]
+    mut d = h[3]
+    mut e = h[4]
+    mut f = h[5]
+    mut g = h[6]
+    mut hh = h[7]
+    mut i: u64 = 0
+    loop {
+        if i >= 80 { break }
+        let s1 = rotr64(e, 14) ^ rotr64(e, 18) ^ rotr64(e, 41)
+        let ch = (e & f) ^ ((~e) & g)
+        let temp1 = teko::math::wrapping_add_u64(teko::math::wrapping_add_u64(teko::math::wrapping_add_u64(hh, s1), ch), teko::math::wrapping_add_u64(k[i], w[i]))
+        let s0 = rotr64(a, 28) ^ rotr64(a, 34) ^ rotr64(a, 39)
+        let maj = (a & b) ^ (a & c) ^ (b & c)
+        let temp2 = teko::math::wrapping_add_u64(s0, maj)
+        hh = g
+        g = f
+        f = e
+        e = teko::math::wrapping_add_u64(d, temp1)
+        d = c
+        c = b
+        b = a
+        a = teko::math::wrapping_add_u64(temp1, temp2)
+        i++
+    }
+    mut out: []u64 = teko::list::empty()
+    out = teko::list::push(out, teko::math::wrapping_add_u64(h[0], a))
+    out = teko::list::push(out, teko::math::wrapping_add_u64(h[1], b))
+    out = teko::list::push(out, teko::math::wrapping_add_u64(h[2], c))
+    out = teko::list::push(out, teko::math::wrapping_add_u64(h[3], d))
+    out = teko::list::push(out, teko::math::wrapping_add_u64(h[4], e))
+    out = teko::list::push(out, teko::math::wrapping_add_u64(h[5], f))
+    out = teko::list::push(out, teko::math::wrapping_add_u64(h[6], g))
+    out = teko::list::push(out, teko::math::wrapping_add_u64(h[7], hh))
+    out
+}
+
+/**
+ * Feeds `data` into an in-progress SHA-512 computation: joins it with any buffered tail,
+ * compresses every complete 128-byte block, and buffers the shorter remainder for the next
+ * call (or `sha512_finalize`). May be called any number of times before finalizing —
+ * `sha512_of(m)` is equivalent to `sha512_finalize(sha512_update(sha512_init(), m))`.
+ *
+ * @param state  the state to advance
+ * @param data   the next chunk of message bytes
+ * @return       the updated state after absorbing every complete block in `data`
+ */
+pub fn sha512_update(state: Sha512State, data: []byte) -> Sha512State {
+    let joined = bytes_concat(state.pending, data)
+    mut h = state.h
+    mut off: u64 = 0
+    loop {
+        if joined.len - off < 128 { break }
+        h = sha512_compress(h, bytes_slice(joined, off, off + 128))
+        off = off + 128
+    }
+    Sha512State { h = h; pending = bytes_slice(joined, off, joined.len); total_len = state.total_len + data.len }
+}
+
+/**
+ * Completes a SHA-512 computation: pads the buffered tail (a 128-bit length suffix, per
+ * FIPS 180-4 §5.1.2 — the top 64 bits are always zero since a `u64` byte count times 8
+ * bits never overflows 64 bits), compresses the resulting final block(s), and renders the
+ * eight state words as 64 big-endian bytes (the 512-bit digest).
+ *
+ * @param state  the state after every `sha512_update` call for this message
+ * @return       the 64-byte SHA-512 digest
+ */
+pub fn sha512_finalize(state: Sha512State) -> []byte {
+    let padded = sha2_pad(state.pending, state.total_len, true)
+    mut h = state.h
+    mut off: u64 = 0
+    loop {
+        if off >= padded.len { break }
+        h = sha512_compress(h, bytes_slice(padded, off, off + 128))
+        off = off + 128
+    }
+    mut out: []byte = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= h.len { break }
+        out = push_be_u64(out, h[i])
+        i++
+    }
+    out
+}
+
+/**
+ * One-shot SHA-512: hashes the whole of `data` in a single call. Equivalent to
+ * `sha512_finalize(sha512_update(sha512_init(), data))`.
+ *
+ * @param data  the complete message to hash
+ * @return      the 64-byte SHA-512 digest
+ */
+pub fn sha512_of(data: []byte) -> []byte {
+    sha512_finalize(sha512_update(sha512_init(), data))
+}
+
+/**
+ * `sha512_of`, rendered as a lowercase hex string — the form every published known-answer
+ * vector uses.
+ *
+ * @param data  the complete message to hash
+ * @return      the SHA-512 digest of `data` as 128 lowercase hex characters
+ */
+pub fn sha512_hex_of(data: []byte) -> str {
+    teko::crypto::to_hex(sha512_of(data))
+}

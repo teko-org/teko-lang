@@ -1,0 +1,120 @@
+/**
+ * `teko::compress::gzip` — RFC 1952 gzip framing (a 10-byte header + CRC-32/ISIZE
+ * trailer) around a raw DEFLATE stream. The default HTTP `Content-Encoding: gzip`
+ * container.
+ *
+ * Public surface:
+ *   pub fn gzip_compress(data: []byte) -> []byte
+ *   pub fn gzip_decompress(data: []byte) -> []byte | error
+ */
+
+/**
+ * The gzip magic header bytes (RFC 1952 §2.3.1).
+ *
+ * @return  a two-element slice, `[0x1F, 0x8B]`
+ */
+fn gzip_magic() -> []byte { [0x1F to byte, 0x8B to byte] }
+
+/**
+ * The gzip compression-method byte this module always emits.
+ *
+ * @return  `8` (DEFLATE — the only method RFC 1952 defines)
+ */
+fn gzip_cm_deflate() -> byte { 8 to byte }
+
+/**
+ * The 10-byte gzip member header this module emits: magic, `CM = 8`, `FLG = 0` (no
+ * optional fields — filename/comment/extra/header-CRC are all omitted), `MTIME = 0`
+ * (deterministic output — no wall-clock timestamp), `XFL = 0`, `OS = 255` ("unknown",
+ * the portable choice per RFC 1952 §2.3.1 when the host OS is not being recorded).
+ *
+ * @return  the fixed 10-byte header
+ */
+fn gzip_header() -> []byte {
+    mut out: []byte = teko::list::empty()
+    let magic = gzip_magic()
+    out = teko::list::push(out, magic[0])
+    out = teko::list::push(out, magic[1])
+    out = teko::list::push(out, gzip_cm_deflate())
+    out = teko::list::push(out, 0 to byte)
+    out = teko::list::push(out, 0 to byte)
+    out = teko::list::push(out, 0 to byte)
+    out = teko::list::push(out, 0 to byte)
+    out = teko::list::push(out, 0 to byte)
+    out = teko::list::push(out, 0 to byte)
+    out = teko::list::push(out, 255 to byte)
+    out
+}
+
+/**
+ * Compress `data` into a complete gzip member: the fixed 10-byte header, the raw
+ * DEFLATE payload (`teko::compress::deflate`), and the little-endian CRC-32 + ISIZE
+ * trailer of the ORIGINAL (uncompressed) bytes.
+ *
+ * @param data  the bytes to compress
+ * @return      the framed gzip stream
+ */
+pub fn gzip_compress(data: []byte) -> []byte {
+    mut out = gzip_header()
+
+    let payload = teko::compress::deflate(data)
+    mut i: u64 = 0
+    loop {
+        if i >= payload.len { break }
+        out = teko::list::push(out, payload[i])
+        i++
+    }
+
+    let crc = teko::compress::crc32_of(data)
+    out = teko::list::push(out, (crc & 0xFF) to byte)
+    out = teko::list::push(out, ((crc >> 8) & 0xFF) to byte)
+    out = teko::list::push(out, ((crc >> 16) & 0xFF) to byte)
+    out = teko::list::push(out, ((crc >> 24) & 0xFF) to byte)
+
+    let isize = (data.len % 4294967296) to u32
+    out = teko::list::push(out, (isize & 0xFF) to byte)
+    out = teko::list::push(out, ((isize >> 8) & 0xFF) to byte)
+    out = teko::list::push(out, ((isize >> 16) & 0xFF) to byte)
+    out = teko::list::push(out, ((isize >> 24) & 0xFF) to byte)
+    out
+}
+
+/**
+ * Decompress a complete gzip member (10-byte fixed header + DEFLATE payload + 8-byte
+ * little-endian CRC-32/ISIZE trailer), verifying the magic, compression method, and
+ * both trailer fields against the decompressed bytes. Optional gzip header fields
+ * (`FLG` bits for filename/comment/extra/header-CRC) are rejected rather than skipped —
+ * this module only reads members IT wrote (`FLG == 0`); a general-purpose reader
+ * accepting arbitrary third-party gzip members is out of scope for this pass.
+ *
+ * @param data  the framed gzip stream
+ * @return      the original (decompressed) bytes, or an `error` if the stream is too
+ *              short, is not a gzip member, uses an unsupported compression method or
+ *              optional header field, or its trailer does not match the decompressed
+ *              data
+ * @throws      when `data.len < 18`, the magic bytes mismatch, `CM != 8`, `FLG != 0`, or
+ *              the trailing CRC-32/ISIZE mismatches
+ */
+pub fn gzip_decompress(data: []byte) -> []byte | error {
+    if data.len < 18 { return error { message = "gzip: stream too short for header + trailer" } }
+
+    let magic = gzip_magic()
+    if data[0] != magic[0] || data[1] != magic[1] { return error { message = "gzip: bad magic bytes" } }
+    if data[2] != gzip_cm_deflate() { return error { message = "gzip: unsupported compression method" } }
+    if data[3] != (0 to byte) { return error { message = "gzip: optional header fields are not supported" } }
+
+    let payload = slice_bytes(data, 10, data.len - 8)
+    let decompressed = match teko::compress::inflate(payload) { []byte as b => b; error as e => return e }
+
+    let trailer_pos = data.len - 8
+    let expected_crc = (data[trailer_pos] to u32) | ((data[trailer_pos + 1] to u32) << 8) | ((data[trailer_pos + 2] to u32) << 16) | ((data[trailer_pos + 3] to u32) << 24)
+    let actual_crc = teko::compress::crc32_of(decompressed)
+    if expected_crc != actual_crc { return error { message = "gzip: CRC-32 checksum mismatch" } }
+
+    let isize_pos = trailer_pos + 4
+    let expected_isize = (data[isize_pos] to u32) | ((data[isize_pos + 1] to u32) << 8) | ((data[isize_pos + 2] to u32) << 16) | ((data[isize_pos + 3] to u32) << 24)
+    let actual_isize = (decompressed.len % 4294967296) to u32
+    if expected_isize != actual_isize { return error { message = "gzip: ISIZE mismatch" } }
+
+    decompressed
+}

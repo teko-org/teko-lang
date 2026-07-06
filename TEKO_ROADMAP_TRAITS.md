@@ -129,9 +129,18 @@ dispatch. `<T: Trait>` monomorphized; a trait's bodyless-requirement surface usa
 deriver's fields/types/doc used to synthesize structural-trait bodies. No surface syntax, no runtime value.
 **Verify:** internal — the view of a fixture struct matches.
 
-**▪ TR3 — standard structural traits.** **Deps:** TR0, TR2. `Eq`, `Ord`, `Hash`, `Clone`, `Default`
-(field-wise synthesized; overridable). Immediately unblocks `Map` keys (`Hashable & Eq`). **Verify:**
-`.tkt` per trait; a derived `eq`/`hash` == a hand-written one.
+**▪ TR3 — standard structural traits.** ✅ **DONE (2026-07-05, issue #177).** **Deps:** TR0, TR2. `Eq`,
+`Ord`, `Hash`, `Clone`, `Default` (field-wise synthesized; overridable). Immediately unblocks `Map` keys
+(`Hashable & Eq`). **As landed:** synthesis emits AST inside `fold_traits` (`synth.tks`) — each derived
+structural trait builds `parser::Function` bodies from the TR2 field view, folded into the deriver, so the
+existing type/emit path handles them (zero new codegen, zero new VM node, VM==native automatic). `eq`
+(field-wise `==`, `&&`), `compare` (lexicographic ±1/0), `hash` (FNV-1a fold; `tk_str_hash` for str),
+`clone` (field-wise deep copy), `default` (static, field-wise zero/empty). `Hashable`≡`Hash` /
+`Comparable`≡`Ord` synonyms. Nested Named recurses (must co-derive), and a hand-written method overrides the
+synthesized default. Slice/optional/enum/variant/ptr/ref/func fields are an honest stop in v1. **Verified:**
+7 `.tkt` checker tests (recognition, synthesis, override, honest stops, synonym constraint) + 5 regression
+fixtures (`trait_derive_eq/hash/ord/clone_default/nested`, VM==native), a derived `eq`/`hash` matches a
+hand-written one.
 
 **▪ TR4 — serialization traits.** **Deps:** TR3, `teko::encoding` (JSON first → protobuf/CBOR). `Json`
 (+ siblings): synthesized `to_json`/`from_json`; the encoding/web unblocker. **Verify:** `.tkt` roundtrip.

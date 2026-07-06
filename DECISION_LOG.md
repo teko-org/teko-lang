@@ -161,3 +161,106 @@ diferentes). O #277 já estava mergeado → correção via novo PR (nunca direto
 
 ### D17 · `.gitattributes eol=lf` (cross-plataforma) ✅
 - **Aplicada:** o Windows fazia checkout dos `.tks` como CRLF → o `fmt` (LF canônico) via o corpus não-idempotente → panic. `* text=auto eol=lf` fixa LF no checkout em toda plataforma. Blobs já eram LF no git; só faltava forçar no working-tree. (CI multi-plataforma pegou o que a validação macOS/Linux não via.)
+
+---
+
+## 2026-07-05 — TR3: traits estruturais Eq/Ord/Hash/Clone/Default sintetizados (#177)
+
+### D18 · `Hashable`≡`Hash` e `Comparable`≡`Ord` como SINÔNIMOS (sem interface paralela) ✅
+- **Aplicada:** `is_structural_trait` reconhece `Hashable`/`Comparable` como sinônimos de `Hash`/`Ord`; `structural_trait_canonical` os colapsa. A chave-de-Map `<K: Hashable & Eq>` resolve contra um deriver de `Hash`+`Eq` via `type_conforms_to` (o nome canônico fica no `implements` folded). NÃO se introduziu interface `Hashable`/`Comparable` paralela.
+- **Alternativas:** criar interfaces nativas `Hashable`/`Comparable` (duplica capacidade + descasa trait-vs-interface); renomear a ruling de collections agora (fora de escopo do #177).
+- **Base:** M.0 (no-reflection) + design de traits §2 (structural derives cobrem encoding/collections sem contrato separado) + §5 (conjunto fechado). O trait estrutural É a capacidade.
+- **Reversível:** sim (uma linha em `is_structural_trait`). Reconciliar a memória `teko-collections-rulings` p/ "structural traits" quando #180/collections aterrissar — edição de 1 linha, opcional do dono.
+
+### D19 · `Ord` sintetiza `-1` como `Unary(Minus, 1)`, não `Number{value=-1}` ✅
+- **Aplicada:** o builder `mk_neg_int` produz o literal negativo como unário-menos sobre `1` positivo (o shape que o parser emite), porque `codegen::cb_i128` faz `v to u128` no carrier — e o guard F3 rejeita negativo→unsigned ("impossible conversion"). Um `Number{value=-1}` direto é o PRIMEIRO a exercitar esse caminho.
+- **Base:** M.1 (fail-loud, não quero corromper) + não tocar o codegen congelado de literais.
+- **Reportado (adjacente, NÃO nova issue):** `cb_i128` (codegen.tks:149) tem bug latente: `(v to u128)` num i128 negativo faz panic sob o guard F3; nunca disparou porque literais negativos do source são `Unary(Minus, N)`. Follow-up p/ o integrador sequenciar.
+
+### D20 · str-field Hash/Ord via `tk_str_hash`/`tk_str_cmp` (o seam de runtime C permitido) ✅
+- **Aplicada:** adicionados `tk_str_hash` (FNV-1a, casa `di_type_id`) e `tk_str_cmp` (lexicográfico unsigned) a `teko_rt.{c,h}`, com gêmeos puro-Teko em `teko_rt.tks`, registro no checker (`scope.tks`), dispatch em `codegen.tks` (→ `tk_str_*`) e intercept no VM (`vm.tks`). VM==native garantido pelos dois gêmeos.
+- **Base:** ruling no-mirroring — `teko_rt` é o C mantido (não-twin, runtime); o resto é `.tks`.
+
+### Reportados-up (adjacentes, NÃO novas issues)
+- `==` em dois structs type-checka e emite C inválido (expr.tks:19 + codegen.tks) — latente, pré-existente; questão de operator-overloading separada. TR3 NÃO auto-baixa `==`→`.eq()`.
+- Slice/Optional/enum sob derive estrutural são honest-stop em v1 (M.1); follow-up TR3.1 natural quando #178 (Json) aterrissar.
+- `cb_i128` negativo (ver D19).
+
+---
+
+## 2026-07-05 — Reorganização do backlog por dependência (fases "para trás e fora de ordem")
+
+### D21 · Ondas de dependência sobrepostas às fases; keystone da fase-1 destrava a fase-3 ✅
+- **Contexto (o que o dono viu):** fase-1-linguagem 25% / fase-2-packaging 22% / **fase-3-stdlib 2%** (33 abertas) / fase-4 16% / fase-5 50% / fase-6 0%. Merges oportunistas (unblocked-first, monomorphic-first) deram aparência de "fora de ordem": tooling e stdlib-roots aterrissaram à frente de fechar a linguagem.
+- **Diagnóstico:** as fases NÃO são topo-ordenadas de fato — um **keystone da fase-1** (cluster monomorfização+128-bit) é o PORTÃO de toda a fase-3 genérica. Enquanto não fecha, 33 issues de stdlib ficam represadas. O monomorphic-first foi deliberado (camada genérica parada atrás do cluster), mas os labels não comunicavam.
+- **Aplicada:**
+  1. Criado label `keystone`; marcado o cluster #254/#290/#294/#296/#299/#301.
+  2. Rotuladas 9 issues sem-fase (#158/#159→fase-2; #163→fase-3; #164/#283→fase-1; #167/#168/#282→fase-6; #233→fase-5).
+  3. Espinha de **milestones = ondas de dependência** (delegada à teko-docs) sobre os labels de fase.
+  4. Ordem corrigida ratificada (abaixo).
+- **Ordem corrigida (recomendação, base: dep-DAG + "o VPS/site é DEPOIS" nas palavras do dono → fundação primeiro):**
+  - **Onda 2 (fechar):** #300 (#184) — em rework (review HALTou: tee corrompe dados + flat_map/tee-iterator/compress omitidos → issue-100%).
+  - **Onda 3 (KEYSTONE):** sub-cluster A `#290→#301→#254→#294` + sub-cluster B `#296∥#299`. Destrava fase-3 genérica + coleções #163 + parte de async #164.
+  - **Onda 4:** fase-1 cleanup independente (#171/#172/#173/#174) + cadeia de traits #178→#179.
+  - **Onda 5:** fase-3 stdlib flui (coleções #163 primeiro → math/encodings/compress/crypto/net roots).
+  - **Trilha paralela (fillers near-term):** higiene de release/dist #267/#159/#282/#283 (servem o pipeline JÁ ativo); packaging pesado #180/#218-220 e site/servidor de pacotes = DEPOIS (palavra do dono).
+- **Alternativas registradas:** (B) puxar fase-2 packaging/dist + site teko-lang.cloud para a frente em paralelo à onda-3 — REJEITADA por ora (dono disse "esse VPS DEPOIS"); (C) priorizar amplitude de stdlib visível (net/http/db/web) para demos — adiada (depende da onda-3 para a camada genérica).
+- **Base constitucional:** issues-must-be-100% + backlog-deve-convergir + main-integrity; dependência força keystone-antes-de-dependentes (não é escolha de produto, é topo-ordem). A única escolha de produto (fundação vs site-primeiro) resolvida pela palavra do dono ("depois").
+
+### D22 · #294 (struct sob `<T: Contract>`): constraint É gate de monomorfização, não promoção a dispatch dinâmico ✅ (do architect, law-first)
+- **Aplicada:** um struct constrangido por `<T: Contract>` despacha DIRETO ao método concreto estampado (precisa do #254 antes); o fat-pointer/vtable segue exclusivo de `class`, casando o design OOP já assentado. NÃO se promove struct-constrangido a vtable dinâmica.
+- **Base:** design OOP assentado (vtable = ref-semantics de class) + monomorfização (constraint = prova em tempo de estampagem). Registrado para revisão no gate LTS. Residual (struct-como-VALOR-de-contrato em slot) reportado, não expandido.
+
+---
+
+## 2026-07-05 — #184 (#300): fix do tee + descoberta de que flat_map é bloqueado pelo keystone
+
+### D23 · #184 é vítima do keystone: núcleo monomórfico fecha, `flat_map`/tee-lazy sequenciam com #301 ✅
+- **Contexto:** review adversarial do #300 HALTou com (1) `tee_write_fn` corrompendo dados em sinks assimétricos [bug real] e (2) `flat_map`/tee-iterator/compress "omitidos" [issue-100%].
+- **Investigação (leituras, sem build):** o PARKED doc do `iter.tks` já documenta com repro empírico que `flat_map` precisa carregar um iterator interno (closure) em estado mutável (`Ref` cell / campo `IntIter?`) — que é EXATAMENTE o **#301** (closure-in-Ref/optional não round-trip; codegen não mangla optional/slice de function-type; VM dropa closure re-assentada num Ref). `compress_stream.tks` é construível (byte-state `Ref<MemWriter>` + `write_zip`/`read_zip`), só falta um teste exercitando o round-trip.
+- **Aplicada:**
+  1. **Fix do tee (bug real):** `tee_write_fn` agora drena 100% da região em CADA sink via `write_all` antes de reportar consumo → nunca re-oferece cauda → sem double-feed em sinks assimétricos. Docstring reescrito. Checkpoint commitado local em `fix/issue-184-resync` (NÃO pushado — pega-leve, sem CI até o batch com #301).
+  2. **flat_map / fold genérico / tee-lazy de iterator:** NÃO forçados — bloqueados pelo #301. PARKED doc atualizado p/ citar #301 explicitamente.
+  3. **Escopo #184:** entrega o núcleo monomórfico (IO0 streams c/ tee corrigido + ITER0 adapters/terminals + IO1 file copy); o remanescente (`flat_map`, tee-lazy, + teste assimétrico do tee, + teste round-trip do compress) sequencia com #301 na onda-3, validado num único CI, então #184 fecha 100%.
+- **Base constitucional:** issues-must-be-100% NÃO exige entregar o que o compilador não compila (bloqueio de capacidade = dependência legítima, reportada+folded, não omissão). main-integrity: o bug do tee é real mas vive num PR aberto (não em main) — corrigido; #184 NÃO mergeia até 100% (pós-#301). Alinha com D21 (keystone antes de dependentes).
+- **Correção ao review:** o achado "flat_map omitido silenciosamente" foi sobre-sinalização — é deferral documentado e bloqueado, não narrowing. (O achado do tee estava 100% correto.)
+- **Reversível:** o fix do tee é independente e correto por si; o resto é aditivo pós-#301.
+
+---
+
+## 2026-07-06 — Compile-time: CI quickwins + gate nativo (VM-out) + plano-mestre do backlog
+
+### D24 · CI 16m→~6m: desabilitar riscv/windows-arm + un-double do gate (#306) ✅
+- **Contexto:** o dono flagou 16m31s inaceitável. Architect achou: o 16m é AUTO-INFLIGIDO — o gate nativo (#265, opt-in) rodava como 2º gate em TODA plataforma → cada uma rodava os 863 `#test` DUAS vezes (VM+nativo). Caminho crítico = windows-arm64 973s.
+- **Aplicada (#306, merged):** windows-arm64 comentado da matriz build-test (pendência #304); riscv64-qemu `if: false` (rodava `test .--coverage` inteiro sob qemu ~8-9m, 85% execução emulada — pendência #305); gate nativo restrito a linux-x86_64 (un-double). Projeção 16m→~6m. Só `native.yml`, sem bump.
+- **Base:** a "All Green" ruleset NÃO exige checks por nome (verificado) → desabilitar jobs não trava merge; o `gate` job trata `skipped` como pass. As duas lanes são PENDÊNCIAS de suporte (#304/#305), não deleções.
+- **Alternativas registradas:** smoke de arch em vez de comentar (dono preferiu comentar por hora); nightly.
+
+### D25 · VM fora dos testes = destino via #265+#168; até lá VM é o gate (phasing) ✅
+- **Aplicada:** ruling do dono (VM out dos testes, [[teko-native-test-gate]]) é o DESTINO, realizado quando o gate nativo for rápido+completo (#168 compile-once + #265 line/branch cov nativo), então ele SUBSTITUI o VM em tudo. O `native.yml:76` já documentava a ruling de 2026-07-05 ("native regresses build time until #168"), então "siga o que disse antes" = essa posição estabelecida. Interim: VM é o gate de piso de cobertura.
+- **Base:** o gate nativo HOJE é mais lento (emit+cc por gate) + só mede cobertura de função → cortar o VM agora regrediria tempo+cobertura. #168+#265-cov consertam antes do corte.
+
+### D26 · Plano-mestre de drain + 5 chamadas autônomas (workflow read-only) ✅
+- **Aplicada:** `docs/design/backlog-drain-master-plan.md` (DAG + Batches 0→8 + ready-set de 32 issues + notas). Ordem recomendada: Batch 0 (in-flight) → **K-B (gate nativo, CI mais leve p/ todo o resto)** → K-A (monomorfização #290→#254→#294) → onda-4 → roots stdlib → famílias → qualidade (#234 por último).
+- **Chamadas autônomas (law-first, para revisão LTS):** (1) #294 = constraint é gate de monomorfização, não vtable; (2) #265 A5 = `tk_cov_line_at`/`tk_cov_branch_at` no seam `teko_rt` (não-twin, crescimento permitido); (3) K-B antes de K-A (CI mais leve = ganho de todo o backlog); (4) #184 tratado como keystone apesar de un-milestoned (destrava 6+ folhas onda-5); (5) #304/#305 NÃO bloqueiam o drain (viram nightly se precisarem de fix upstream).
+- **Decisões ABERTAS que preciso da sua régua antes do batch relevante:** #174 regex NFA-vs-backtracking (bloqueia Batch 3.3 — recomendo NFA por segurança/sem backtracking catastrófico); #254 layer-4 `Env.expected_ret` (alta rotatividade); #233 LSP sem gate de início; #182 TCC/#267-item1 diferidos pós-alpha.
+- **Correção de ground-truth:** 74 abertas (não 73); o design pai `onda3-monomorphization-cluster.md` SUB-CONTA sites nos 4 roots → confiar em `drain-onda3-subcluster-A.md`.
+
+---
+
+## 2026-07-06 — OOP syntax: `this` / `base` / `static` (pedido do dono, feedback de dev)
+
+### D27 · `this`/`base`/`static` = rename SÓ de front-end (codegen+VM byte-idênticos) — design pronto, 1 HALT
+- **Contexto:** dono (2026-07-06) pediu trocar o receiver (1º arg solto sem tipo) por `this`, o `class Base(binding)` por `base`, e adicionar `static` explícito. Dev achou a sintaxe atual confusa.
+- **Ground truth (verificado):** receiver = `params[0]` com `has_type=false`, NOME escolhido pelo autor (`self` hoje); codegen/VM leem `params[0]` POSICIONALMENTE (nunca casam a string) → renomear é fixpoint-neutro. Base-binding já é `let <binding>: <Base> = <this upcast>` sintético no typer (`typer.tks:3110-3128`). Static/instance é `params.len==0 || params[0].has_type` em TODO lugar (`di.tks:119`, `typer.tks:745`, `collect.tks:721`).
+- **Keystone de implementação:** o parser INJETA um `Param{name="this"; has_type=false}` sintético p/ método não-`static` → preserva o invariante inteiro do checker, então **#254 (métodos genéricos) + #294 (constraint dispatch), que leem o modelo de receiver atual, precisam de ZERO mudança**.
+- **Autônomo (law-first, p/ revisão LTS):** (1) `static` = RESERVADA (sem colisão; M.2); `this`/`base` = CONTEXTUAIS — `base` é nome de local VIVO em `driver.tks`/`resolve.tks`/`zlib.tks`, reservar quebraria produção; (2) add `"this"` ao `cg_is_c_keyword` (kw de C++, não C — fixpoint-neutro); (3) tamanho = **L** (não XL): produção tem 0 classes/4 interfaces/0 traits; massa OOP está nos `.tkt` + `synth.tks` (~89 sites de receiver); codegen/VM intocados.
+- **Base constitucional:** M.2 explícito + M.3 honesto = GANHO (torna receiver/staticness visíveis vs convenção implícita do 1º arg solto). Consistente com no-`ref`-keyword, modelo no-GC/arena/Ref-por-lowering (`this` = receiver pointer-lowered arena-backed), e `teko-default-args-named-call` (receiver ainda anda em args[0] sem nome). Sem tensão de Lei.
+- **HALT (precisa da régua do dono):** **hard-cut (A) vs transição dual-syntax (B).** Recomendo **(A) hard-cut ANTES da enxurrada fase-3 de coleções**: migração é pequena+codegen-neutra, gramática dual mantém viva a implicitness que o dono quer remover (cheiro M.2/M.3), e #163 (coleções, ABERTO, sem árvore `src/collections` ainda) deve ser escrito já na sintaxe nova, não duas vezes. (B) só p/ proteger #163 em voo.
+- **Doc:** `docs/design/oop-this-base-static.md`. Memória: `teko-oop-this-base-static-design`.
+
+### D27-owner · RATIFICAÇÃO (dono 2026-07-06): OOP this/base/static = HARD-CUT ✅
+- **Decisão do dono:** aprovada a opção A (hard-cut) da revisão de arquitetura (D27 / docs/design/oop-this-base-static.md). **Justificativa do dono:** "ainda não temos a LTS e nem código em produção, logo, há coisas que podemos remodelar se assim for melhor" — pré-LTS + zero código em produção = SEM dívida de backward-compat → o hard-cut limpo vence a transição dual-syntax (que só carregaria complexidade de parser duplo sem necessidade).
+- **Timing vs #163:** deixar o #163 (coleções, in-flight) fechar na sintaxe ANTIGA; o PR do hard-cut reescreve todo o corpus (incl. #163) atomicamente via codemod mecânico (rename self→this + drop base-binding + add static). Sem desperdício, sem re-escrita humana.
+- **Base:** é renomeação PURA de front-end (receiver=params[0] posicional; base já é `let <bind> = <this upcast>` sintético) → codegen/VM idênticos → **fixpoint-safe** (#254/#294 zero mudança). Tamanho L. Risco = codemod perturbar codegen → mitigado por rename-só + gate gen2==gen3 (crumb C4). `static`=reservada, `this`/`base`=contextuais (`base` é nome local vivo).
+- **Sequência:** #163 fecha → hard-cut OOP (próximo keystone, verificação independente do fixpoint) → resto da fase-3 na sintaxe nova.

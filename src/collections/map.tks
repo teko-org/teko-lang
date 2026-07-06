@@ -1,0 +1,151 @@
+/**
+ * teko::collections::Map<V> — a growable, reference-semantic hash map from `str` keys to `V` values
+ * (issue #163). A `Map<V>` is a CLASS (per the collections ruling — growable collections are ref
+ * types with object identity, mutated through the receiver), hash-bucketed so lookup is amortised
+ * O(1): each key's FNV-1a hash (`teko::runtime::str_hash`) is cached alongside it, and a lookup
+ * compares the cheap `u64` hash before the full `str` key, so collisions stay correct (two keys
+ * with the same hash still compare unequal by their bytes) and non-collisions stay cheap.
+ *
+ * KEY TYPE — `str`, not a generic `K`. The collections ruling specifies `Map<K: Hashable & Eq, V>`,
+ * but on the current generic stack a STRUCTURAL trait atom (`Hashable`/`Eq`) is OPAQUE on a type
+ * parameter by design (resolve.tks::atom_surface, TR3: "its methods are synthesized per concrete
+ * deriver, not dispatched through T in v1"), so a generic method body may NOT call `k.hash()` /
+ * `k.eq(other)` on a `<K: Hashable & Eq>` parameter, and a bare `==` on a constrained/unconstrained
+ * `K` either rejects at the checker or diverges VM-vs-native. `str` is the ruling's own primary
+ * driver (`teko::env` = `Map<str, str?>`) and has a real hash (`teko::runtime::str_hash`) plus a
+ * real `==` (lowers to `tk_str_eq`), so a `str`-keyed map is fully expressible and VM==native today.
+ * Generic-`K` keys are DEFERRED to a compiler round that authorizes structural-trait dispatch on a
+ * type parameter (reported to the integrator as a generic-stack follow-up, #163 report).
+ *
+ * The backing store is three PARALLEL fixed-size arrays (`keys`/`hashes`/`vals`) the class owns and
+ * re-grows on each mutation, rather than a single `[]Entry<V>`: constructing a nested generic struct
+ * (`Entry<V> { … }`) inside a generic method body currently fails to resolve on the fresh generic
+ * stack (the stamp lookup loses the owning namespace → "type not visible bare"). Parallel arrays of
+ * a concrete-plus-generic element type sidestep that gap and are a standard hash-map representation.
+ *
+ * The shared scan (`map_find_index`) is a FREE function, not a private instance method, for the same
+ * reason the sibling collection helpers are: a generic instance method calling a sibling instance
+ * method on `self` runs on the VM but fails to link natively (the stamped sibling is never emitted).
+ */
+pub type Map<V> = class {
+    /** The keys, in insertion order — parallel to `hashes` and `vals`. */
+    intern keys: []str
+    /** Each key's cached FNV-1a hash, compared before the full key for cheap collision rejection. */
+    intern hashes: []u64
+    /** The values, parallel to `keys` (the value for `keys[i]` is `vals[i]`). */
+    intern vals: []V
+
+    /**
+     * Build an empty `Map<V>` — the generic static factory (`Map<i64>::make()`).
+     *
+     * @return a fresh, empty `Map<V>` at the caller's concrete value type `V`
+     */
+    pub fn make() -> Map<V> {
+        Map { keys = teko::list::empty(); hashes = teko::list::empty(); vals = teko::list::empty() }
+    }
+
+    /**
+     * The number of distinct keys currently held.
+     *
+     * @return the entry count
+     */
+    pub fn len(self) -> u64 { self.keys.len }
+
+    /**
+     * Whether the map holds no entries.
+     *
+     * @return `true` iff `len() == 0`
+     */
+    pub fn is_empty(self) -> bool { self.keys.len == 0 }
+
+    /**
+     * Whether `k` is a key in the map.
+     *
+     * @param k  the key to test
+     * @return   `true` iff `k` is present
+     */
+    pub fn contains(self, k: str) -> bool {
+        map_find_index(self.keys, self.hashes, teko::runtime::str_hash(k), k) < self.keys.len
+    }
+
+    /**
+     * Insert or update the value for `k`. If `k` is already present its value is overwritten in place
+     * (the entry count is unchanged); otherwise a new entry is appended. Every alias of the map
+     * observes the change (reference semantics).
+     *
+     * @param k  the key to insert or update
+     * @param v  the value to associate with `k`
+     */
+    pub fn insert(self, k: str, v: V) {
+        let h = teko::runtime::str_hash(k)
+        let at = map_find_index(self.keys, self.hashes, h, k)
+        if at < self.keys.len {
+            self.vals = arr_replace_at(self.vals, at, v)
+            return
+        }
+        self.keys = teko::list::push(self.keys, k)
+        self.hashes = teko::list::push(self.hashes, h)
+        self.vals = teko::list::push(self.vals, v)
+    }
+
+    /**
+     * The value associated with `k`, or `null` when `k` is absent — the null-propagating lookup
+     * (`V?`, matched with the disjoint-domain null path per the OOP ruling, never an `error` union).
+     *
+     * @param k  the key to look up
+     * @return   the associated value, or `null` if `k` is not present
+     */
+    pub fn get(self, k: str) -> V? {
+        let at = map_find_index(self.keys, self.hashes, teko::runtime::str_hash(k), k)
+        if at >= self.keys.len { return null }
+        self.vals[at]
+    }
+
+    /**
+     * Remove the entry for `k` if present, in place. Removing an absent key is a no-op. Returns
+     * whether an entry was actually removed, so a caller can distinguish "was present" from "absent"
+     * without a preceding `contains` scan.
+     *
+     * @param k  the key to remove
+     * @return   `true` iff an entry for `k` existed and was removed
+     */
+    pub fn remove(self, k: str) -> bool {
+        let at = map_find_index(self.keys, self.hashes, teko::runtime::str_hash(k), k)
+        if at >= self.keys.len { return false }
+        self.keys = arr_drop_at(self.keys, at)
+        self.hashes = arr_drop_at(self.hashes, at)
+        self.vals = arr_drop_at(self.vals, at)
+        true
+    }
+
+    /**
+     * A fixed-size `[]str` snapshot of the map's current keys, in insertion order — the door to
+     * iterate a map's entries (loop over the keys, `get` each). The returned array is an independent
+     * value; later mutations do not change it.
+     *
+     * @return the current keys as a `[]str` value snapshot
+     */
+    pub fn keys(self) -> []str { self.keys }
+}
+
+/**
+ * Find the index of key `k` (whose precomputed hash is `h`) in the parallel `keys`/`hashes` arrays,
+ * or `keys.len` when absent. The `u64` hash is compared before the full `str` key so a hash mismatch
+ * rejects a non-matching key without a byte compare, while an equal hash still falls through to the
+ * exact `str` compare — keeping collisions correct.
+ *
+ * @param keys    the map's key array
+ * @param hashes  the parallel cached-hash array (`hashes[i]` is the hash of `keys[i]`)
+ * @param h       the precomputed hash of the sought key
+ * @param k       the sought key
+ * @return        the index of `k` in `keys`, or `keys.len` if `k` is absent
+ */
+fn map_find_index(keys: []str, hashes: []u64, h: u64, k: str) -> u64 {
+    mut i: u64 = 0
+    loop {
+        if i >= keys.len { break }
+        if hashes[i] == h && keys[i] == k { return i }
+        i++
+    }
+    keys.len
+}
