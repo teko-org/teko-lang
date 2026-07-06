@@ -124,74 +124,100 @@ fn ns_last_seg(ns: str) -> str {
     slice(ns, cut, ns.len)
 }
 
-// (#41) NAMESPACE-AWARE call resolution (mirror of C tk_env_lookup_call). UNQUALIFIED `name`: a
-// LOCAL (ns empty) or a function in the CURRENT namespace. QUALIFIED `q::…::name`: a function whose
-// namespace's last segment == q. Innermost first (locals shadow). Returns the function/value type.
+/**
+ * Does the binding namespace `b_ns` satisfy the QUALIFIER of a qualified call callee? The qualifier
+ * is every segment of `callee` before the last (the called name), joined with `::`. A binding
+ * matches when its namespace equals that FULL qualifier, or ends with `::<qualifier>` — the same
+ * R0-R5 rule `qualifier_selects_ns` already applies to type references. Keying off the FULL
+ * qualifier (not merely its last segment) disambiguates two same-bare classes across namespaces:
+ * a class method's ns is `owner::…::Class` (collect's `method_ns` convention), and the method
+ * dispatch callee carries `[..owner.., Class, method]` (#290, #109-family). A plain `ns::fn` call
+ * is unaffected — its qualifier is the target namespace, matched exactly as before.
+ *
+ * @param b_ns    the candidate binding's declaring namespace (never empty at the call site)
+ * @param callee  the qualified call callee (`callee.segments.len > 1`)
+ * @return        true iff `b_ns` equals or ends-with the callee's full `::`-joined qualifier
+ * @since onda-3 (#290)
+ */
+fn ns_matches_call_qualifier(b_ns: str, callee: parser::Path) -> bool {
+    qualifier_selects_ns(b_ns, path_qualifier(callee, callee.segments.len - 1))
+}
+
+/**
+ * Does binding `b` resolve the call `callee` in env `env`? An UNQUALIFIED callee (`ns`-less) binds a
+ * LOCAL (ns empty) or a function in the CURRENT namespace; a QUALIFIED callee binds a function whose
+ * namespace satisfies the callee's full qualifier (`ns_matches_call_qualifier`). Shared by
+ * `lookup_call` and `call_ns` so both scans apply one identical rule.
+ *
+ * @param b         a candidate value binding (already known to share the callee's last-segment name)
+ * @param callee    the call callee path
+ * @param cur_ns    the calling namespace (for the unqualified same-namespace case)
+ * @param qualified whether the callee carries a qualifier (`callee.segments.len > 1`)
+ * @return          true iff `b` is the call's resolved target under the namespace rules
+ * @since onda-3 (#290)
+ */
+fn call_binding_matches(b: ValBinding, callee: parser::Path, cur_ns: str, qualified: bool) -> bool {
+    if !qualified { return b.ns.len == 0 || b.ns == cur_ns }
+    b.ns.len != 0 && ns_matches_call_qualifier(b.ns, callee)
+}
+
+/**
+ * (#41) NAMESPACE-AWARE call resolution (mirror of C `tk_env_lookup_call`): the type of the function
+ * or value the callee names. An UNQUALIFIED `name` binds a LOCAL (empty ns) or a function in the
+ * CURRENT namespace; a QUALIFIED `q::…::name` binds a function whose namespace satisfies the callee's
+ * full qualifier (`call_binding_matches`). Scans innermost bindings first (locals shadow), then the
+ * sealed globals under the same rule.
+ *
+ * @param env     the typing environment (local bindings + sealed globals + current namespace)
+ * @param callee  the call callee path
+ * @return        the resolved target's type
+ * @throws        when no binding resolves the callee (`undefined name`)
+ */
 fn lookup_call(env: Env, callee: parser::Path) -> Type | error {
     let name = callee.segments[callee.segments.len - 1].name
     let qualified = callee.segments.len > 1
-    let qual = if qualified { callee.segments[callee.segments.len - 2].name } else { "" }
     mut i = env.bindings.len
     loop {
         if i == 0 { break }
         i = i - 1
         let b = env.bindings[i]
-        if b.name == name {
-            if !qualified {
-                if b.ns.len == 0 || b.ns == env.cur_ns { return b.type }
-            } else {
-                if b.ns.len != 0 && ns_last_seg(b.ns) == qual { return b.type }
-            }
-        }
+        if b.name == name && call_binding_matches(b, callee, env.cur_ns, qualified) { return b.type }
     }
-    mut j = env.base.len   // (#148) then the sealed globals (same match rules)
+    mut j = env.base.len
     loop {
         if j == 0 { break }
         j = j - 1
         let b = env.base[j]
-        if b.name == name {
-            if !qualified {
-                if b.ns.len == 0 || b.ns == env.cur_ns { return b.type }
-            } else {
-                if b.ns.len != 0 && ns_last_seg(b.ns) == qual { return b.type }
-            }
-        }
+        if b.name == name && call_binding_matches(b, callee, env.cur_ns, qualified) { return b.type }
     }
     error { message = $"undefined name: {name}" }
 }
 
-// (#49) the resolved target's declaring NAMESPACE for a call (same scan as lookup_call), or the
-// empty str if the callee is a LOCAL (ns empty) or resolves to nothing (a builtin). Codegen mangles
-// a user call by this namespace; an empty ns means "use the builtin call-map / bare name".
+/**
+ * (#49) the resolved target's declaring NAMESPACE for a call — the same scan as `lookup_call` but
+ * returning the winning binding's namespace. Codegen mangles a user call by this namespace; an empty
+ * string means a LOCAL (empty ns), an unresolved callee, or a builtin (use the call-map / bare name).
+ *
+ * @param env     the typing environment
+ * @param callee  the call callee path
+ * @return        the resolved target's namespace, or "" for a local/builtin/unresolved callee
+ */
 fn call_ns(env: Env, callee: parser::Path) -> str {
     let name = callee.segments[callee.segments.len - 1].name
     let qualified = callee.segments.len > 1
-    let qual = if qualified { callee.segments[callee.segments.len - 2].name } else { "" }
     mut i = env.bindings.len
     loop {
         if i == 0 { break }
         i = i - 1
         let b = env.bindings[i]
-        if b.name == name {
-            if !qualified {
-                if b.ns.len == 0 || b.ns == env.cur_ns { return b.ns }
-            } else {
-                if b.ns.len != 0 && ns_last_seg(b.ns) == qual { return b.ns }
-            }
-        }
+        if b.name == name && call_binding_matches(b, callee, env.cur_ns, qualified) { return b.ns }
     }
-    mut j = env.base.len   // (#148) then the sealed globals (same match rules)
+    mut j = env.base.len
     loop {
         if j == 0 { break }
         j = j - 1
         let b = env.base[j]
-        if b.name == name {
-            if !qualified {
-                if b.ns.len == 0 || b.ns == env.cur_ns { return b.ns }
-            } else {
-                if b.ns.len != 0 && ns_last_seg(b.ns) == qual { return b.ns }
-            }
-        }
+        if b.name == name && call_binding_matches(b, callee, env.cur_ns, qualified) { return b.ns }
     }
     ""
 }
