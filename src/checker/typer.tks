@@ -2182,6 +2182,301 @@ fn tblock_diverges(stmts: []TStatement) -> bool {
     }
 }
 
+/**
+ * (S2, the 0.1.0.0-beta memory+unsafe remodel #336) does every path through `stmts`, STARTING
+ * AT INDEX `from`, either diverge or consume the tracked `#must_free` binding `name` before
+ * falling off the block's end? The DUAL of `tblock_diverges` (which asks "does every path exit
+ * before falling off the end?"; this asks "does every NON-DIVERGING path CONSUME `name` before
+ * falling off the end?"). Consumed = reaches `teko::mem::free(name)` (the exact call
+ * `type_mem_free` recognizes, `call_ns == "teko::mem"`) OR is moved out via `return name` (the
+ * first-cut consume set — a follow-up may widen this to a general move-tracking pass, per the
+ * design's accepted conservative-over-rejection tax). A path that DIVERGES (panic/exit,
+ * `return` of anything, break, continue) before reaching the block's end never drops the value,
+ * so it needs no consume (mirrors `tblock_diverges`'s own divergence primitive). `from` lets a
+ * binding declared PARTWAY through a block be checked only over its OWN remaining scope (the
+ * statements after its own `TBinding`), never over statements that precede its declaration.
+ *
+ * HONEST BOUND (mirrors the note at `type_mem_free`, `docs/design/memory-unsafe-backend-remodel.md`
+ * §5): this is a LOCAL, PER-BINDING dataflow — it has no points-to/uniqueness fact, so it catches
+ * only the SILENT-LEAK case (a `#must_free` value dropped on some path). It is powerless against
+ * the ALIASED-FREE use-after-free (`y = x; free(x); use(y)`), which still needs the spine (L1).
+ *
+ * @param stmts  the typed statement block to walk (a function body, or an if/match branch)
+ * @param from   the index to start walking from (0 for a param; a binding's own index + 1 for a local)
+ * @param name   the tracked `#must_free` binding/param's name
+ * @return       true iff every path through `stmts[from..]` either diverges or consumes `name`
+ */
+fn must_free_consumed_on_all_paths(stmts: []TStatement, from: u64, name: str) -> bool {
+    mut i = from
+    loop {
+        if i >= stmts.len { break }
+        if stmt_diverges_standalone(stmts[i]) { return true }
+        if stmt_consumes_must_free(stmts[i], name) { return true }
+        if stmt_branches_all_consume_must_free(stmts[i], name) { return true }
+        i++
+    }
+    false
+}
+
+/**
+ * Does this ONE statement, by itself, unconditionally end the enclosing block's control flow
+ * (a `return`/`break`/`continue`, or a trailing-expression-statement panic/exit call)? A plain
+ * `if`/`match` embedded in a `TExprStmt` is handled separately by
+ * `stmt_branches_all_consume_must_free` (it may consume on every branch without ITSELF being a
+ * `tblock_diverges`-style divergence), so this predicate deliberately does NOT recurse into one.
+ *
+ * @param s  the typed statement to test
+ * @return   true iff this statement alone diverges (never falls through)
+ */
+fn stmt_diverges_standalone(s: TStatement) -> bool {
+    match s {
+        TReturn => true
+        TBreakStmt => true
+        TContinueStmt => true
+        TExprStmt as es => texpr_diverges(es.expr)
+        _ => false
+    }
+}
+
+/**
+ * Does this ONE statement itself CONSUME the tracked `#must_free` binding `name` — either a
+ * `teko::mem::free(name)` call (a bare expression-statement) or `return name` (a `TReturn` whose
+ * value is exactly the tracked variable)?
+ *
+ * @param s     the typed statement to test
+ * @param name  the tracked `#must_free` binding/param's name
+ * @return      true iff this statement consumes `name`
+ */
+fn stmt_consumes_must_free(s: TStatement, name: str) -> bool {
+    match s {
+        TReturn as r => r.has_value && texpr_is_must_free_var(r.value, name)
+        TExprStmt as es => texpr_is_mem_free_call(es.expr, name)
+        _ => false
+    }
+}
+
+/**
+ * Is `e` exactly a bare read of the tracked variable `name` (the first-cut MOVE consume, per the
+ * design's "return x" consume set — also reused to match `mem::free`'s own single argument)?
+ *
+ * @param e     the typed expression to test
+ * @param name  the tracked `#must_free` binding/param's name
+ * @return      true iff `e` is the bare variable `name`
+ */
+fn texpr_is_must_free_var(e: TExpr, name: str) -> bool {
+    match e.kind { TVar as v => v.name == name; _ => false }
+}
+
+/**
+ * Is `e` exactly the call `teko::mem::free(name)` — the one FREE consume this dataflow
+ * recognizes, matching `type_mem_free`'s own dispatch (`call_ns == "teko::mem"`, one argument,
+ * that argument a bare read of the tracked variable)?
+ *
+ * @param e     the typed expression to test
+ * @param name  the tracked `#must_free` binding/param's name
+ * @return      true iff `e` is `teko::mem::free(name)`
+ */
+fn texpr_is_mem_free_call(e: TExpr, name: str) -> bool {
+    match e.kind {
+        TCall as c => {
+            if c.call_ns != "teko::mem" { return false }
+            if c.args.len != 1 { return false }
+            texpr_is_must_free_var(c.args[0], name)
+        }
+        _ => false
+    }
+}
+
+/**
+ * Does this ONE statement embed a value-position `if`/`match` whose EVERY branch/arm either
+ * diverges or consumes `name` (recursively, via `must_free_consumed_on_all_paths`) — the
+ * split-control-flow case (acceptance criterion 3: "both arms of an `if` / all arms of a
+ * `match`"). Only a trailing `TExprStmt` can carry a value-position `if`/`match` (B.20); any
+ * other statement shape cannot branch, so it is not this case.
+ *
+ * @param s     the typed statement to test
+ * @param name  the tracked `#must_free` binding/param's name
+ * @return      true iff `s` is an if/match whose every path consumes `name` (or diverges)
+ */
+fn stmt_branches_all_consume_must_free(s: TStatement, name: str) -> bool {
+    match s {
+        TExprStmt as es => match es.expr.kind {
+            TIfExpr as f => f.has_else && must_free_consumed_on_all_paths(f.then_blk, 0, name) && must_free_consumed_on_all_paths(f.else_blk, 0, name)
+            TMatchExpr as m => match_arms_all_consume_must_free(m, name)
+            _ => false
+        }
+        _ => false
+    }
+}
+
+/**
+ * Does EVERY arm of `m` either diverge or consume `name`? An exhaustive `match` with zero arms
+ * cannot occur (parser rejects an empty match), but the empty case is handled defensively as
+ * "not consumed" (vacuously false) rather than assumed unreachable.
+ *
+ * @param m     the typed match expression
+ * @param name  the tracked `#must_free` binding/param's name
+ * @return      true iff every arm consumes `name` (or diverges)
+ */
+fn match_arms_all_consume_must_free(m: TMatchExpr, name: str) -> bool {
+    if m.arms.len == 0 { return false }
+    mut i = 0
+    loop {
+        if i >= m.arms.len { break }
+        if !must_free_consumed_on_all_paths(m.arms[i].body, 0, name) { return false }
+        i++
+    }
+    true
+}
+
+/**
+ * Check every `#must_free`-typed PARAMETER of `f` against the whole (typed) body — a param whose
+ * resolved nominal type (`Named`) names a `TypeDecl` carrying `must_free = true`
+ * (`is_must_free_name`). Params carry no source position of their own (`parser::Param` has
+ * none), so a rejection blames the function's own `line`/`col` (the existing W-loc-2 fallback
+ * `type_item` already applies to any error a checker pass leaves unpositioned). Returns the
+ * FIRST dropped-path error found (fail-fast, mirrors every other checker pass).
+ *
+ * @param f      the parsed function (its untyped params, walked in declaration order)
+ * @param tbl    the fn's type table (extended with its own generic type-params)
+ * @param ns     the fn's enclosing namespace (param types resolve against it, #109 W1)
+ * @param body   the fn's typed body
+ * @return       an error naming the first dropped `#must_free` param, or nothing
+ */
+fn check_must_free_params(f: parser::Function, tbl: TypeTable, ns: str, body: []TStatement) -> error? {
+    mut i = 0
+    loop {
+        if i >= f.params.len { break }
+        let pt = match resolve_type(f.params[i].type_ann, tbl, ns) { Type as t => t; error as e => return e }
+        match pt {
+            Named as nm => {
+                if is_must_free_name(nm.name, tbl) {
+                    if !must_free_consumed_on_all_paths(body, 0, f.params[i].name) {
+                        return teko::error::err_loc(error { message = must_free_dropped_message(f.params[i].name) }, f.line, f.col)
+                    }
+                }
+            }
+            _ => { }
+        }
+        i++
+    }
+    null
+}
+
+/**
+ * The diagnostic for a dropped `#must_free` handle (S2 #336) — shared by the param check and the
+ * local-binding check so both name the same contract in the same words.
+ *
+ * @param name  the dropped handle's binding/param name
+ * @return      the rendered message
+ */
+fn must_free_dropped_message(name: str) -> str {
+    $"`#must_free` value `{name}` is dropped without being freed on this path — call `teko::mem::free({name})` or move it out"
+}
+
+/**
+ * Check every `#must_free`-typed LOCAL BINDING (`let`/`mut`/`const` simple-name target) declared
+ * in `stmts` — a binding whose bound type (`TBinding.bound`) is a `Named` naming a `must_free`
+ * `TypeDecl`. Each is checked over its OWN remaining scope: the statements strictly AFTER its own
+ * declaration in the SAME block (`must_free_consumed_on_all_paths(stmts, i + 1, name)`), which is
+ * exactly where a read of it can occur (the structural definite-assignment guarantee —
+ * `initanalysis.tks` relies on the same fact for its unused-local check). Recurses into a value-
+ * position `if`/`match`'s branch blocks (a binding declared inside one is scoped to that branch).
+ * Returns the FIRST dropped-path error found (fail-fast, mirrors every other checker pass).
+ *
+ * @param stmts  the typed statement block to walk
+ * @param table  the type table (kind probes for each binding's bound type)
+ * @return       an error naming the first dropped `#must_free` local, or nothing
+ */
+fn check_must_free_locals(stmts: []TStatement, table: TypeTable) -> error? {
+    mut i: u64 = 0
+    loop {
+        if i >= stmts.len { break }
+        match check_must_free_locals_stmt(stmts[i], stmts, i, table) { null => { }; error as e => return e }
+        i++
+    }
+    null
+}
+
+/**
+ * The single-statement step of `check_must_free_locals`: if `stmts[i]` is a `#must_free`
+ * binding, check its own remaining scope; if it carries nested branch blocks (`if`/`match`),
+ * recurse into each. A `DestructurePattern` target is not tracked (mirrors
+ * `initanalysis.tks`'s unused-local check — `type_binding` never defines destructure names,
+ * so there is nothing to bind against here either).
+ *
+ * @param s      the statement at index `i`
+ * @param stmts  the enclosing block (so a binding's remaining scope can be re-walked)
+ * @param i      `s`'s own index in `stmts`
+ * @param table  the type table (kind probes for a binding's bound type)
+ * @return       an error naming the first dropped `#must_free` local, or nothing
+ */
+fn check_must_free_locals_stmt(s: TStatement, stmts: []TStatement, i: u64, table: TypeTable) -> error? {
+    match s {
+        TBinding as b => match b.target {
+            parser::SimpleName as sn => match b.bound {
+                Named as nm => {
+                    if is_must_free_name(nm.name, table) && !must_free_consumed_on_all_paths(stmts, i + 1, sn.name) {
+                        return teko::error::err_loc(error { message = must_free_dropped_message(sn.name) }, b.value.line, b.value.col)
+                    }
+                    null
+                }
+                _ => null
+            }
+            parser::DestructurePattern => null
+        }
+        TExprStmt as es => check_must_free_locals_expr(es.expr, table)
+        _ => null
+    }
+}
+
+/**
+ * Recurse `check_must_free_locals` into a value-position `if`/`match`'s branch blocks (a plain
+ * non-branching expression carries none).
+ *
+ * @param e      the typed expression to inspect
+ * @param table  the type table (kind probes for each binding's bound type)
+ * @return       an error naming the first dropped `#must_free` local inside `e`'s branches, or nothing
+ */
+fn check_must_free_locals_expr(e: TExpr, table: TypeTable) -> error? {
+    match e.kind {
+        TIfExpr as f => {
+            match check_must_free_locals(f.then_blk, table) { null => { }; error as er => return er }
+            if f.has_else { return check_must_free_locals(f.else_blk, table) }
+            null
+        }
+        TMatchExpr as m => {
+            mut i = 0
+            loop {
+                if i >= m.arms.len { break }
+                match check_must_free_locals(m.arms[i].body, table) { null => { }; error as er => return er }
+                i++
+            }
+            null
+        }
+        _ => null
+    }
+}
+
+/**
+ * Run the consume-or-fail dataflow over every `#must_free`-tracked binding/param in a function
+ * (S2, the 0.1.0.0-beta memory+unsafe remodel #336): each must be consumed
+ * (`must_free_consumed_on_all_paths`) on every path reachable from its own declaration point —
+ * params from the whole body, locals from their own declaring block onward. Returns the FIRST
+ * dropped-path error found (fail-fast, mirrors every other checker pass).
+ *
+ * @param f      the parsed function (for param collection + the position fallback)
+ * @param tbl    the fn's type table (extended with its own generic type-params)
+ * @param ns     the fn's enclosing namespace (param type resolution, #109 W1)
+ * @param body   the fn's typed body
+ * @param table  the outer type table (kind probes)
+ * @return       an error naming the first dropped `#must_free` handle, or nothing
+ */
+fn check_must_free(f: parser::Function, tbl: TypeTable, ns: str, body: []TStatement, table: TypeTable) -> error? {
+    match check_must_free_params(f, tbl, ns, body) { null => { }; error as e => return e }
+    check_must_free_locals(body, table)
+}
+
 // ---- a typed block: thread the env, collect the typed statements ----
 fn type_block(stmts: []parser::Statement, env: Env, table: TypeTable) -> TypedBlock | error {
     mut cur = env
@@ -3186,6 +3481,7 @@ fn type_function(f: parser::Function, env: Env, table: TypeTable) -> TFunction |
     match check_trailing_value(tb.stmts, ret, table) { null => { }; error as e => return e }   // C5: trailing value (when present) matches
     let lc = check_labels(tb.stmts, teko::list::empty(), false, teko::list::empty())   // W5-cf-2: loop labels resolve + are unique
     if lc.failed { return error { message = lc.message } }
+    match check_must_free(f, tbl, env.cur_ns, tb.stmts, table) { null => { }; error as e => return e }
     TFunction { name = f.name; type_params = f.type_params; type_constraints = f.type_constraints; params = f.params; return_type = ret; body = tb.stmts; vis = f.vis; has_doc = f.has_doc; doc = f.doc; namespace = ""; file = ""; line = 0; col = 0; is_test = f.is_test; is_extern = false; c_symbol = ""; from_lib = "" }   // (#49/E3) namespace/file/line stamped by type_item from the parsed item
 }
 
