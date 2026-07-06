@@ -225,3 +225,23 @@ diferentes). O #277 já estava mergeado → correção via novo PR (nunca direto
 - **Base constitucional:** issues-must-be-100% NÃO exige entregar o que o compilador não compila (bloqueio de capacidade = dependência legítima, reportada+folded, não omissão). main-integrity: o bug do tee é real mas vive num PR aberto (não em main) — corrigido; #184 NÃO mergeia até 100% (pós-#301). Alinha com D21 (keystone antes de dependentes).
 - **Correção ao review:** o achado "flat_map omitido silenciosamente" foi sobre-sinalização — é deferral documentado e bloqueado, não narrowing. (O achado do tee estava 100% correto.)
 - **Reversível:** o fix do tee é independente e correto por si; o resto é aditivo pós-#301.
+
+---
+
+## 2026-07-06 — Compile-time: CI quickwins + gate nativo (VM-out) + plano-mestre do backlog
+
+### D24 · CI 16m→~6m: desabilitar riscv/windows-arm + un-double do gate (#306) ✅
+- **Contexto:** o dono flagou 16m31s inaceitável. Architect achou: o 16m é AUTO-INFLIGIDO — o gate nativo (#265, opt-in) rodava como 2º gate em TODA plataforma → cada uma rodava os 863 `#test` DUAS vezes (VM+nativo). Caminho crítico = windows-arm64 973s.
+- **Aplicada (#306, merged):** windows-arm64 comentado da matriz build-test (pendência #304); riscv64-qemu `if: false` (rodava `test .--coverage` inteiro sob qemu ~8-9m, 85% execução emulada — pendência #305); gate nativo restrito a linux-x86_64 (un-double). Projeção 16m→~6m. Só `native.yml`, sem bump.
+- **Base:** a "All Green" ruleset NÃO exige checks por nome (verificado) → desabilitar jobs não trava merge; o `gate` job trata `skipped` como pass. As duas lanes são PENDÊNCIAS de suporte (#304/#305), não deleções.
+- **Alternativas registradas:** smoke de arch em vez de comentar (dono preferiu comentar por hora); nightly.
+
+### D25 · VM fora dos testes = destino via #265+#168; até lá VM é o gate (phasing) ✅
+- **Aplicada:** ruling do dono (VM out dos testes, [[teko-native-test-gate]]) é o DESTINO, realizado quando o gate nativo for rápido+completo (#168 compile-once + #265 line/branch cov nativo), então ele SUBSTITUI o VM em tudo. O `native.yml:76` já documentava a ruling de 2026-07-05 ("native regresses build time until #168"), então "siga o que disse antes" = essa posição estabelecida. Interim: VM é o gate de piso de cobertura.
+- **Base:** o gate nativo HOJE é mais lento (emit+cc por gate) + só mede cobertura de função → cortar o VM agora regrediria tempo+cobertura. #168+#265-cov consertam antes do corte.
+
+### D26 · Plano-mestre de drain + 5 chamadas autônomas (workflow read-only) ✅
+- **Aplicada:** `docs/design/backlog-drain-master-plan.md` (DAG + Batches 0→8 + ready-set de 32 issues + notas). Ordem recomendada: Batch 0 (in-flight) → **K-B (gate nativo, CI mais leve p/ todo o resto)** → K-A (monomorfização #290→#254→#294) → onda-4 → roots stdlib → famílias → qualidade (#234 por último).
+- **Chamadas autônomas (law-first, para revisão LTS):** (1) #294 = constraint é gate de monomorfização, não vtable; (2) #265 A5 = `tk_cov_line_at`/`tk_cov_branch_at` no seam `teko_rt` (não-twin, crescimento permitido); (3) K-B antes de K-A (CI mais leve = ganho de todo o backlog); (4) #184 tratado como keystone apesar de un-milestoned (destrava 6+ folhas onda-5); (5) #304/#305 NÃO bloqueiam o drain (viram nightly se precisarem de fix upstream).
+- **Decisões ABERTAS que preciso da sua régua antes do batch relevante:** #174 regex NFA-vs-backtracking (bloqueia Batch 3.3 — recomendo NFA por segurança/sem backtracking catastrófico); #254 layer-4 `Env.expected_ret` (alta rotatividade); #233 LSP sem gate de início; #182 TCC/#267-item1 diferidos pós-alpha.
+- **Correção de ground-truth:** 74 abertas (não 73); o design pai `onda3-monomorphization-cluster.md` SUB-CONTA sites nos 4 roots → confiar em `drain-onda3-subcluster-A.md`.
