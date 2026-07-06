@@ -70,6 +70,19 @@ type CovCtx = struct {
 }
 
 /**
+ * The result of emitting one vtable's dispatch thunks (#291): the grown output buffer paired with
+ * the grown set of thunk symbols already defined. A named struct is the seed-compatible way to
+ * return two values from `cg_emit_vtable_thunks` (the seed rejects bare tuple return types), so the
+ * thunk-emission phase can thread BOTH the buffer and the dedup set through its pair walk.
+ */
+type TThunkEmit = struct {
+    /** the output byte buffer with this vtable's not-yet-seen instance-method thunks appended. */
+    buf: []byte
+    /** the dedup set of `cb_vtthunk_name` symbols, grown with the thunks emitted for this vtable. */
+    emitted: []str
+}
+
+/**
  * cov_off — the no-instrumentation CovCtx (every Program/TestPlain path and every ordinary caller).
  *
  * @return a CovCtx with `on = false` → emit_cov_line/emit_cov_branch emit ZERO bytes.
@@ -7655,6 +7668,436 @@ fn cg_emit_lambda_decls(buf: []byte, prog: checker::TProgram, lams: []checker::T
     out
 }
 
+/**
+ * Emit the C symbol name of a vtable dispatch THUNK for one vtable slot, identified by the vtable-
+ * owning class, the contract/base it conforms to, and the method: `tk_vtthunk_<Class>__<Contract>__
+ * <method>` (each `::` mangled to `__`). Keying on the (class, contract) PAIR — not just the
+ * resolved method — is required: a base method inherited unchanged by a subclass reconstructs a
+ * DIFFERENT self-receiver vtable (`tk_vt_<Class>_<Base>`) per owning class, so those thunks must be
+ * distinct C functions. Both the vtable slot (which takes the thunk's address) and the thunk
+ * definition spell the name through this one function, so they always agree.
+ *
+ * @param buf       the output byte buffer to append to
+ * @param cd_name   the vtable-owning class's canonical name
+ * @param idd_name  the contract/base's canonical name (the vtable's second key)
+ * @param method    the method's bare name
+ * @return          the buffer with the thunk symbol name appended
+ * @since #291 (trait/interface vtable dispatch UB fix)
+ */
+fn cb_vtthunk_name(buf: []byte, cd_name: str, idd_name: str, method: str) -> []byte {
+    cb_ident(cb(cb_tysym(cb(cb_tysym(cb(buf, "tk_vtthunk_"), cd_name), "__"), idd_name), "__"), method)
+}
+
+/**
+ * Emit ONE vtable dispatch thunk DEFINITION: a well-typed wrapper whose genuine C signature is
+ * `R tk_vtthunk_<Class>__<Contract>__<method>(void *self, params…)`, whose body forwards to the
+ * concrete monomorphized method after RECONSTRUCTING the method's real receiver from the raw
+ * object pointer `self`. Storing this thunk's address in a vtable slot makes the dynamic dispatch's
+ * `R (*)(void *, params…)` cast CORRECT BY CONSTRUCTION — the thunk truly has that signature — so
+ * the C23 6.3.2.3p8 undefined behavior of calling the concrete method through a `void *`-first
+ * pointer type never occurs (it is `-fsanitize=function`/CFI/LTO clean).
+ *
+ * The receiver reconstruction is TYPE-DIRECTED, because a monomorphized method takes one of two
+ * receiver ABIs:
+ *   - a LEAF/own class method takes a raw pointer `tk_t_<Class> *` — the thunk casts `(tk_t_<C> *)self`;
+ *   - a POLYMORPHIC-BASE method takes the base fat pointer `tk_base_<Base>` (a `{data, vtable}`
+ *     struct by value) — the thunk rebuilds it as `(tk_base_<B>){ .data = self, .vtable =
+ *     tk_vt_<Class>_<B> }`, restoring the object's own (class, base) self-dispatch vtable (the old
+ *     direct call passed only the data word, dropping the vtable — a latent self-dispatch bug this
+ *     thunk additionally repairs).
+ *
+ * The caller DEDUPS by the `cb_vtthunk_name` symbol (a base method inherited across subclasses
+ * yields distinct thunks; identical (class, contract) slots reuse one): guard with `cg_str_in`.
+ *
+ * @param buf       the output byte buffer to append to
+ * @param prog      the whole typed program (resolves the concrete method's real signature)
+ * @param cd_name   the vtable-owning class's canonical name (rides the thunk symbol + self vtable)
+ * @param idd_name  the contract/base's canonical name (rides the thunk symbol)
+ * @param mns       the concrete method's mangled namespace (from `cg_find_method_ns`)
+ * @param method    the method's bare name
+ * @return          the buffer with the thunk definition appended
+ * @throws          when the concrete method cannot be found (an internal codegen inconsistency)
+ * @since #291 (trait/interface vtable dispatch UB fix)
+ */
+fn cg_emit_vtthunk_def(buf: []byte, prog: checker::TProgram, cd_name: str, idd_name: str, mns: str, method: str) -> []byte | error {
+    let f = match cg_find_function(prog, mns, method) { checker::TFunction as tf => tf; error => return error { message = "codegen: vtable thunk cannot resolve its concrete method (internal)" } }
+    if f.params.len == 0 { return error { message = "codegen: vtable thunk method has no receiver parameter (internal)" } }
+    mut out = match emit_type(buf, prog, f.return_type) { []byte as o => o; error as err => return err }
+    out = cb_vtthunk_name(cb(out, " "), cd_name, idd_name, method)
+    out = cb(out, "(void *self")
+    mut pi: u64 = 1
+    loop {
+        if pi >= f.params.len { break }
+        out = cb(out, ", ")
+        out = match emit_type_expr(out, prog, f.params[pi].type_ann, f.namespace) { []byte as o => o; error as err => return err }
+        out = cb(out, " ")
+        out = cb_ident(out, f.params[pi].name)
+        pi++
+    }
+    let returns_void = match f.return_type { checker::Void => true; _ => false }
+    out = cb(out, ") { ")
+    out = cb(out, if returns_void { "" } else { "return " })
+    out = cb_fn_name(out, mns, method)
+    out = cb(out, "(")
+    out = match cg_emit_vtthunk_receiver(out, prog, cd_name, f.params[0].type_ann, f.namespace) { []byte as o => o; error as err => return err }
+    mut ai: u64 = 1
+    loop {
+        if ai >= f.params.len { break }
+        out = cb(out, ", ")
+        out = cb_ident(out, f.params[ai].name)
+        ai++
+    }
+    cb(out, "); }\n")
+}
+
+/**
+ * Emit the reconstructed receiver EXPRESSION that a dispatch thunk forwards to the concrete method,
+ * from the thunk's raw `void *self`. The shape follows the method's declared receiver C type:
+ *   - a polymorphic-base receiver (`tk_base_<B>`, a `{data, vtable}` fat pointer by value) becomes
+ *     `(tk_base_<B>){ .data = self, .vtable = tk_vt_<cd>_<B> }` — the object's own (class, base)
+ *     self-dispatch vtable is restored;
+ *   - any other receiver is a raw class pointer, cast directly as `(<recv-C-type>)self`.
+ *
+ * @param buf         the output byte buffer to append to
+ * @param prog        the whole typed program (resolves the receiver's polymorphic-base status + C type)
+ * @param cd_name     the vtable-owning class (names the self-dispatch vtable for a base receiver)
+ * @param recv_ann    the concrete method's receiver parameter type annotation (`params[0].type_ann`)
+ * @param recv_ns     the method's declaring namespace (ref_ns for `emit_type_expr`)
+ * @return            the buffer with the receiver expression appended
+ * @throws            when the receiver's C type cannot be emitted (an internal inconsistency)
+ * @since #291 (trait/interface vtable dispatch UB fix)
+ */
+fn cg_emit_vtthunk_receiver(buf: []byte, prog: checker::TProgram, cd_name: str, recv_ann: parser::TypeExpr, recv_ns: str) -> []byte | error {
+    let base = cg_vtthunk_base_name(recv_ann)
+    if base.len > 0 && cg_is_polymorphic_base(prog, base) {
+        mut out = cb_tysym(cb(buf, "(tk_base_"), base)
+        out = cb(out, "){ .data = self, .vtable = ")
+        out = cb_tysym(cb(cb_tysym(cb(out, "tk_vt_"), cd_name), "_"), base)
+        return cb(out, " }")
+    }
+    mut out = cb(buf, "(")
+    out = match emit_type_expr(out, prog, recv_ann, recv_ns) { []byte as o => o; error as err => return err }
+    cb(out, ")self")
+}
+
+/**
+ * The bare NAMED type name of a receiver annotation, or the empty string when the annotation is not
+ * a plain named type. Used to test a thunk receiver for polymorphic-base status without resolving
+ * the whole type (the receiver of a method is always a `NamedType` — the class/base it belongs to).
+ *
+ * @param recv_ann  the receiver parameter's type annotation
+ * @return          the annotation's last path segment name, or "" if it is not a `NamedType`
+ * @since #291 (trait/interface vtable dispatch UB fix)
+ */
+fn cg_vtthunk_base_name(recv_ann: parser::TypeExpr) -> str {
+    match recv_ann {
+        parser::NamedType as nt => nt.path.segments[nt.path.segments.len - 1].name
+        _ => ""
+    }
+}
+
+/**
+ * Is `m` (a raw parser method) an INSTANCE method — one whose first parameter is the implicit
+ * untyped receiver (OOP A1: a class method is static when its first parameter is typed, or it has
+ * none)? Only instance methods are the target of a DYNAMIC vtable dispatch, so only they get a
+ * typed dispatch thunk; a STATIC factory that happens to occupy a base-vtable slot (never invoked
+ * through the `void *`-first cast) keeps a direct `&method` address and needs no thunk.
+ *
+ * @param m  the effective method as returned by `iface_methods_by_name`/`base_vtable_methods`
+ * @return   true when `m` has an implicit untyped receiver (an instance method)
+ * @since #291 (trait/interface vtable dispatch UB fix)
+ */
+fn cg_method_is_instance(m: parser::Function) -> bool {
+    m.params.len > 0 && !m.params[0].has_type
+}
+
+/**
+ * Emit ONE vtable slot's code-pointer initializer text: `(void *)&<thunk>` for an INSTANCE method
+ * (the typed dispatch thunk) or `(void *)&<method>` for a STATIC one (a dead slot never taken
+ * through the dynamic-dispatch cast, so the direct address is UB-free). Shared by the interface and
+ * polymorphic-base vtable definition passes so both spell a slot identically.
+ *
+ * @param buf       the output byte buffer to append to
+ * @param prog      the whole typed program (resolves the method's mangled namespace)
+ * @param cd_name   the vtable-owning class's canonical name
+ * @param idd_name  the contract/base's canonical name
+ * @param m         the effective method for this slot
+ * @return          the buffer with the slot initializer appended
+ * @throws          when the method's stamped function cannot be resolved (an internal inconsistency)
+ * @since #291 (trait/interface vtable dispatch UB fix)
+ */
+fn cg_emit_vtable_slot(buf: []byte, prog: checker::TProgram, cd_name: str, idd_name: str, m: parser::Function) -> []byte | error {
+    if cg_method_is_instance(m) {
+        return cb_vtthunk_name(cb(buf, "(void *)&"), cd_name, idd_name, m.name)
+    }
+    let mns = match cg_find_method_ns(prog, cd_name, m.name) {
+        str as ns2 => ns2
+        null => return error { message = "codegen: conforming class is missing a vtable method's stamped function (internal)" }
+    }
+    cb_fn_name(cb(buf, "(void *)&"), mns, m.name)
+}
+
+/**
+ * Does class decl `cd` provide a per-(class, contract) INTERFACE/TRAIT vtable for type decl `idd`?
+ * True when `idd` is an interface or trait AND `cd` nominally conforms to it. Factored so the three
+ * vtable-emission phases (forward-decl, thunk, definition) apply the SAME gate.
+ *
+ * @param cd        the candidate vtable-owning class decl
+ * @param idd       the candidate contract decl
+ * @param vt_table  the checker's type table (conformance oracle)
+ * @return          true when a `tk_vt_<cd>_<idd>` interface vtable must be emitted
+ * @since #291 (trait/interface vtable dispatch UB fix)
+ */
+fn cg_pair_is_iface_vtable(cd: parser::TypeDecl, idd: parser::TypeDecl, vt_table: checker::TypeTable) -> bool {
+    let idd_is_iface = match idd.body { parser::InterfaceBody => true; parser::TraitBody => true; _ => false }
+    idd_is_iface && checker::type_conforms_to(cd.name, idd.name, vt_table)
+}
+
+/**
+ * Does class decl `cd` provide a per-(class, base) POLYMORPHIC-BASE vtable for type decl `idd`?
+ * True when `idd` is a polymorphic (non-sealed) base class AND `cd` IS-A `idd` (itself included, so
+ * a directly-instantiable virtual base gets its own self-vtable). Factored so the three vtable-
+ * emission phases apply the SAME gate.
+ *
+ * @param prog  the whole typed program (polymorphic-base + subclass-reachability oracles)
+ * @param cd    the candidate vtable-owning class decl
+ * @param idd   the candidate base decl
+ * @return      true when a `tk_vt_<cd>_<idd>` base vtable must be emitted
+ * @since #291 (trait/interface vtable dispatch UB fix)
+ */
+fn cg_pair_is_base_vtable(prog: checker::TProgram, cd: parser::TypeDecl, idd: parser::TypeDecl) -> bool {
+    let idd_is_poly_base = cg_is_polymorphic_base(prog, idd.name)
+    let cd_is_a = cd.name == idd.name || cg_subclass_reaches(prog, cd.name, idd.name, 64)
+    idd_is_poly_base && cd_is_a
+}
+
+/**
+ * Emit a `static void *const tk_vt_<cd>_<idd>[]` DEFINITION whose slots are `method_list` in order:
+ * an instance-method slot takes its typed dispatch thunk's address, a static-method slot the method
+ * directly (`cg_emit_vtable_slot`); a methodless contract still gets one never-indexed `(void *)0`
+ * slot. Shared by the interface and base vtable definition passes.
+ *
+ * @param buf          the output byte buffer to append to
+ * @param prog         the whole typed program (resolves each slot's stamped function)
+ * @param cd_name      the vtable-owning class's canonical name
+ * @param idd_name     the contract/base's canonical name
+ * @param method_list  the vtable's effective methods, in slot order
+ * @return             the buffer with the vtable definition appended
+ * @throws             propagated from `cg_emit_vtable_slot` on an internal inconsistency
+ * @since #291 (trait/interface vtable dispatch UB fix)
+ */
+fn cg_emit_vtable_def(buf: []byte, prog: checker::TProgram, cd_name: str, idd_name: str, method_list: []parser::Function) -> []byte | error {
+    mut b = cb_tysym(cb(cb_tysym(cb(buf, "static void *const tk_vt_"), cd_name), "_"), idd_name)
+    b = cb(b, "[] = {")
+    if method_list.len == 0 { b = cb(b, " (void *)0") }
+    mut i: u64 = 0
+    loop {
+        if i >= method_list.len { break }
+        b = cb(b, if i == 0 { " " } else { ", " })
+        b = match cg_emit_vtable_slot(b, prog, cd_name, idd_name, method_list[i]) { []byte as o => o; error as err => return err }
+        i++
+    }
+    cb(b, " };\n")
+}
+
+/**
+ * Emit the dispatch thunks for one vtable's `method_list` (INSTANCE methods only — statics keep a
+ * direct slot address and need no thunk), deduplicated against `emitted` by the `cb_vtthunk_name`
+ * symbol. Bundles the grown buffer and grown dedup set into a `TThunkEmit` so the thunk-emission
+ * phase can thread both through its (class, contract)/(class, base) pair walk.
+ *
+ * @param buf          the output byte buffer to append to
+ * @param prog         the whole typed program
+ * @param cd_name      the vtable-owning class's canonical name
+ * @param idd_name     the contract/base's canonical name
+ * @param method_list  the vtable's effective methods
+ * @param emitted      the set of thunk symbols already defined
+ * @return             a `TThunkEmit` bundling the grown buffer and the grown `emitted` set
+ * @throws             propagated from `cg_emit_vtthunk_def` on an internal inconsistency
+ * @since #291 (trait/interface vtable dispatch UB fix)
+ */
+fn cg_emit_vtable_thunks(buf: []byte, prog: checker::TProgram, cd_name: str, idd_name: str, method_list: []parser::Function, emitted: []str) -> TThunkEmit | error {
+    mut b = buf
+    mut seen = emitted
+    mut i: u64 = 0
+    loop {
+        if i >= method_list.len { break }
+        let m = method_list[i]
+        i++
+        if !cg_method_is_instance(m) { continue }
+        let key = str(cb_vtthunk_name(teko::list::empty(), cd_name, idd_name, m.name))
+        if cg_str_in(seen, key) { continue }
+        let mns = match cg_find_method_ns(prog, cd_name, m.name) {
+            str as ns2 => ns2
+            null => return error { message = "codegen: conforming class is missing a vtable method's stamped function (internal)" }
+        }
+        b = match cg_emit_vtthunk_def(b, prog, cd_name, idd_name, mns, m.name) { []byte as o => o; error as err => return err }
+        seen = teko::list::push(seen, key)
+    }
+    TThunkEmit { buf = b; emitted = seen }
+}
+
+/**
+ * Emit ALL per-(class, contract) and per-(class, base) VTABLES plus their dispatch thunks (#291),
+ * in three ordered phases that break the thunk⇄vtable reference cycle (a thunk names its self-
+ * dispatch vtable; a vtable names its thunks):
+ *   1. forward-DECLARE every vtable array (`static void *const tk_vt_<cd>_<idd>[];`);
+ *   2. DEFINE every dispatch thunk (may now reference any forward-declared vtable);
+ *   3. DEFINE every vtable array (slots reference the now-defined thunks).
+ * The (class, contract)/(class, base) pair walk is identical across phases (the same conformance /
+ * IS-A gates); only the per-pair emission differs. Conformance is nominal and closed-world, so this
+ * whole block is compile-time and reflection-free. A program with no dynamic dispatch (e.g. the
+ * compiler's own sources) emits nothing here — the fixpoint is untouched.
+ *
+ * @param buf   the output byte buffer to append to
+ * @param prog  the whole typed program
+ * @return      the buffer with every vtable forward-decl, thunk, and definition appended
+ * @throws      propagated from the per-pair emitters on an internal inconsistency
+ * @since #291 (trait/interface vtable dispatch UB fix)
+ */
+fn cg_emit_vtables_and_thunks(buf: []byte, prog: checker::TProgram) -> []byte | error {
+    let vt_table = checker::type_table_of(prog)
+    mut b = match cg_emit_vtable_protos(buf, prog, vt_table) { []byte as o => o; error as err => return err }
+    b = match cg_emit_all_vtthunks(b, prog, vt_table) { []byte as o => o; error as err => return err }
+    cg_emit_all_vtable_defs(b, prog, vt_table)
+}
+
+/**
+ * Phase 1 — forward-DECLARE every vtable array so a thunk defined in phase 2 may take a later-
+ * defined vtable's address (`.vtable = tk_vt_<cd>_<idd>`). Walks the (class, contract)/(class, base)
+ * pairs, emitting `static void *const tk_vt_<cd>_<idd>[];` for each.
+ *
+ * @param buf       the output byte buffer to append to
+ * @param prog      the whole typed program
+ * @param vt_table  the checker's type table
+ * @return          the buffer with every vtable forward declaration appended
+ * @since #291 (trait/interface vtable dispatch UB fix)
+ */
+fn cg_emit_vtable_protos(buf: []byte, prog: checker::TProgram, vt_table: checker::TypeTable) -> []byte | error {
+    mut b = buf
+    mut ci = 0
+    loop {
+        if ci >= prog.items.len { break }
+        match prog.items[ci] {
+            parser::TypeDecl as cd => {
+                if match cd.body { parser::ClassBody => true; _ => false } {
+                    mut ii = 0
+                    loop {
+                        if ii >= prog.items.len { break }
+                        match prog.items[ii] {
+                            parser::TypeDecl as idd => {
+                                if cg_pair_is_iface_vtable(cd, idd, vt_table) { b = cb(cb_tysym(cb(cb_tysym(cb(b, "static void *const tk_vt_"), cd.name), "_"), idd.name), "[];\n") }
+                                if cg_pair_is_base_vtable(prog, cd, idd) { b = cb(cb_tysym(cb(cb_tysym(cb(b, "static void *const tk_vt_"), cd.name), "_"), idd.name), "[];\n") }
+                            }
+                            _ => { }
+                        }
+                        ii++
+                    }
+                }
+            }
+            _ => { }
+        }
+        ci++
+    }
+    b
+}
+
+/**
+ * Phase 2 — DEFINE every dispatch thunk (deduplicated program-wide). Walks the same pairs as phase
+ * 1; for each vtable's method list emits the instance-method thunks not yet defined.
+ *
+ * @param buf       the output byte buffer to append to
+ * @param prog      the whole typed program
+ * @param vt_table  the checker's type table
+ * @return          the buffer with every dispatch thunk defined
+ * @throws          propagated from the per-vtable thunk emitter on an internal inconsistency
+ * @since #291 (trait/interface vtable dispatch UB fix)
+ */
+fn cg_emit_all_vtthunks(buf: []byte, prog: checker::TProgram, vt_table: checker::TypeTable) -> []byte | error {
+    mut b = buf
+    mut emitted: []str = teko::list::empty()
+    mut ci = 0
+    loop {
+        if ci >= prog.items.len { break }
+        match prog.items[ci] {
+            parser::TypeDecl as cd => {
+                if match cd.body { parser::ClassBody => true; _ => false } {
+                    mut ii = 0
+                    loop {
+                        if ii >= prog.items.len { break }
+                        match prog.items[ii] {
+                            parser::TypeDecl as idd => {
+                                if cg_pair_is_iface_vtable(cd, idd, vt_table) {
+                                    let ms = match checker::iface_methods_by_name(idd.name, vt_table) { []parser::Function as f => f; error => return error { message = "codegen: interface method list failed (internal)" } }
+                                    let r = match cg_emit_vtable_thunks(b, prog, cd.name, idd.name, ms, emitted) { TThunkEmit as e => e; error as err => return err }
+                                    b = r.buf; emitted = r.emitted
+                                }
+                                if cg_pair_is_base_vtable(prog, cd, idd) {
+                                    let bms = match checker::base_vtable_methods(idd.name, vt_table) { []parser::Function as f => f; error => return error { message = "codegen: base method list failed (internal)" } }
+                                    let r = match cg_emit_vtable_thunks(b, prog, cd.name, idd.name, bms, emitted) { TThunkEmit as e => e; error as err => return err }
+                                    b = r.buf; emitted = r.emitted
+                                }
+                            }
+                            _ => { }
+                        }
+                        ii++
+                    }
+                }
+            }
+            _ => { }
+        }
+        ci++
+    }
+    b
+}
+
+/**
+ * Phase 3 — DEFINE every vtable array (slots reference the phase-2 thunks). Walks the same pairs as
+ * phases 1 and 2, emitting the interface vtable (`iface_methods_by_name` slots) and the base vtable
+ * (`base_vtable_methods` slots) for each qualifying pair.
+ *
+ * @param buf       the output byte buffer to append to
+ * @param prog      the whole typed program
+ * @param vt_table  the checker's type table
+ * @return          the buffer with every vtable definition appended
+ * @throws          propagated from the per-vtable definition emitter on an internal inconsistency
+ * @since #291 (trait/interface vtable dispatch UB fix)
+ */
+fn cg_emit_all_vtable_defs(buf: []byte, prog: checker::TProgram, vt_table: checker::TypeTable) -> []byte | error {
+    mut b = buf
+    mut ci = 0
+    loop {
+        if ci >= prog.items.len { break }
+        match prog.items[ci] {
+            parser::TypeDecl as cd => {
+                if match cd.body { parser::ClassBody => true; _ => false } {
+                    mut ii = 0
+                    loop {
+                        if ii >= prog.items.len { break }
+                        match prog.items[ii] {
+                            parser::TypeDecl as idd => {
+                                if cg_pair_is_iface_vtable(cd, idd, vt_table) {
+                                    let ms = match checker::iface_methods_by_name(idd.name, vt_table) { []parser::Function as f => f; error => return error { message = "codegen: interface method list failed (internal)" } }
+                                    b = match cg_emit_vtable_def(b, prog, cd.name, idd.name, ms) { []byte as o => o; error as err => return err }
+                                }
+                                if cg_pair_is_base_vtable(prog, cd, idd) {
+                                    let bms = match checker::base_vtable_methods(idd.name, vt_table) { []parser::Function as f => f; error => return error { message = "codegen: base method list failed (internal)" } }
+                                    b = match cg_emit_vtable_def(b, prog, cd.name, idd.name, bms) { []byte as o => o; error as err => return err }
+                                }
+                            }
+                            _ => { }
+                        }
+                        ii++
+                    }
+                }
+            }
+            _ => { }
+        }
+        ci++
+    }
+    b
+}
+
 /** tk_emit_c — the PROGRAM emission entry (the virtual-main over loose top-level statements).
     Kept as the public name every caller uses; delegates to tk_emit_c_mode with CgMode::Program so
     the historical output is byte-identical (the fixpoint is intact). (#265) */
@@ -7787,84 +8230,7 @@ fn tk_emit_c_mode(prog0: checker::TProgram, mode: CgMode) -> str | error {
     }
     b = match emit_di_materializer_protos(b, di_reg) { []byte as o => o; error as err => return err }
     b = cb(b, "\n")
-    // (W10b.D3) per-(class, contract) VTABLES — one static table per conforming pair, built at
-    // COMPILE time (conformance is nominal and closed-world; no runtime reflection). Slot i is
-    // the contract's i-th EFFECTIVE method (extends-transitive first, then own — the checker's
-    // iface_slot agrees by construction). Identical signatures across contracts share the SAME
-    // fn-ptr for free: every slot points at the class's ONE stamped method function. Emitted
-    // after the prototypes (the fn names must be declared) and before any body; `-w` on the
-    // generated C keeps an unused table warning-free.
-    let vt_table = checker::type_table_of(prog)
-    mut vci = 0
-    loop {
-        if vci >= prog.items.len { break }
-        match prog.items[vci] {
-            parser::TypeDecl as cd => {
-                let cd_is_class = match cd.body { parser::ClassBody => true; _ => false }
-                if cd_is_class {
-                    mut vii = 0
-                    loop {
-                        if vii >= prog.items.len { break }
-                        match prog.items[vii] {
-                            parser::TypeDecl as idd => {
-                                let idd_is_iface = match idd.body { parser::InterfaceBody => true; parser::TraitBody => true; _ => false }
-                                if idd_is_iface && checker::type_conforms_to(cd.name, idd.name, vt_table) {
-                                    let ms = match checker::iface_methods_by_name(idd.name, vt_table) { []parser::Function as f => f; error => return error { message = "codegen: interface method list failed (internal)" } }
-                                    b = cb(b, "static void *const tk_vt_")
-                                    b = cb_tysym(b, cd.name)
-                                    b = cb(b, "_")
-                                    b = cb_tysym(b, idd.name)
-                                    b = cb(b, "[] = {")
-                                    if ms.len == 0 { b = cb(b, " (void *)0") }   // a methodless contract still gets a (never-indexed) one-slot table
-                                    mut vmi: u64 = 0
-                                    loop {
-                                        if vmi >= ms.len { break }
-                                        let mns = match cg_find_method_ns(prog, cd.name, ms[vmi].name) {
-                                            str as ns2 => ns2
-                                            null => return error { message = "codegen: conforming class is missing an interface method's stamped function (internal)" }
-                                        }
-                                        b = cb(b, if vmi == 0 { " (void *)&" } else { ", (void *)&" })
-                                        b = cb_fn_name(b, mns, ms[vmi].name)
-                                        vmi++
-                                    }
-                                    b = cb(b, " };\n")
-                                }
-                                // (#98) per-(class, BASE) vtable — `tk_vt_<Sub>_<Base>` — for every
-                                // POLYMORPHIC base `cd` IS-A (itself included, so a self-upcast of a
-                                // directly-instantiable virtual base resolves too). Slot i is the
-                                // base's i-th EFFECTIVE method (base_vtable_slot agrees). Each slot
-                                // points at THIS class's stamped method (the override, if any).
-                                let idd_is_poly_base = cg_is_polymorphic_base(prog, idd.name)
-                                let cd_is_a = cd.name == idd.name || cg_subclass_reaches(prog, cd.name, idd.name, 64)
-                                if idd_is_poly_base && cd_is_a {
-                                    let bms = match checker::base_vtable_methods(idd.name, vt_table) { []parser::Function as f => f; error => return error { message = "codegen: base method list failed (internal)" } }
-                                    b = cb_tysym(cb(cb_tysym(cb(b, "static void *const tk_vt_"), cd.name), "_"), idd.name)
-                                    b = cb(b, "[] = {")
-                                    if bms.len == 0 { b = cb(b, " (void *)0") }
-                                    mut bvmi: u64 = 0
-                                    loop {
-                                        if bvmi >= bms.len { break }
-                                        let bmns = match cg_find_method_ns(prog, cd.name, bms[bvmi].name) {
-                                            str as bns2 => bns2
-                                            null => return error { message = "codegen: subclass is missing a base method's stamped function (internal)" }
-                                        }
-                                        b = cb(b, if bvmi == 0 { " (void *)&" } else { ", (void *)&" })
-                                        b = cb_fn_name(b, bmns, bms[bvmi].name)
-                                        bvmi++
-                                    }
-                                    b = cb(b, " };\n")
-                                }
-                            }
-                            _ => { }
-                        }
-                        vii++
-                    }
-                }
-            }
-            _ => { }
-        }
-        vci++
-    }
+    b = match cg_emit_vtables_and_thunks(b, prog) { []byte as o => o; error as err => return err }
     b = cb(b, "\n")
     // (W10) CAPTURING lambdas: env-struct typedefs + lifted-fn forward declarations (so a closure
     // literal `&__tkclo_<id>` + `sizeof(__tkenv_<id>)` resolve before the user functions).

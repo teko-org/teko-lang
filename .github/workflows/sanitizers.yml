@@ -67,32 +67,34 @@ jobs:
           sh scripts/ci_cc_wrap.sh "-fsanitize=address,undefined -fno-omit-frame-pointer -g"
           teko . -o bin
 
-      # This lane runs the VM gate for now (with #323's memory caps + no --coverage). Flipping it to
-      # the NATIVE gate — which would additionally ASan-check the production native build pipeline and
-      # drop the VM functional-env balloon under ASan — is DEFERRED, not abandoned: running the #test
-      # corpus natively under UBSan surfaced a PRE-EXISTING undefined behavior in the #291 trait
-      # dynamic-vtable dispatch. A contract method is invoked through an `R (*)(void *, …)` pointer
-      # while its definition takes a concrete receiver type (codegen.tks ~1907-1966); -fsanitize=
-      # function flags the function-pointer-type mismatch, which is real UB (CFI/LTO-fragile) even
-      # though it happens to work on mainstream ABIs. That UB is fixed at the ROOT (typed dispatch
-      # thunks) in a dedicated follow-up which will re-flip this lane to the native gate and validate
-      # the fix under the very UBSan check that exposed it. The #168 build-gate memory win (VM→native
-      # default for `teko . -o bin`) is independent of this lane and lands regardless. The #323 caps
-      # stay: they bound the VM gate's ASan footprint on the 7 GB runner.
-      - name: Run the gate on gen1 (VM, ASan + UBSan + LSan)
+      # This lane runs the NATIVE gate (#168): the sanitized gen1 compiles the #test corpus to a
+      # binary and runs it in a CHILD process, so ASan/UBSan additionally cover the PRODUCTION native
+      # build pipeline (tk_emit_c / cg_lift_program / run_cc) AND the compiler's per-gate peak stays
+      # codegen-only (no VM functional-env balloon under ASan). #323's quarantine/context memory caps
+      # stay defensively. On Linux clang, `-fsanitize=undefined` INCLUDES `-fsanitize=function`, so
+      # UBSan flags any call through an incompatible function-pointer type: that is the very check
+      # which exposed the #291 trait dynamic-vtable dispatch UB (a contract method invoked through
+      # `R (*)(void *, …)` while defined with a concrete receiver). That UB is now fixed at the ROOT —
+      # each vtable slot stores a per-method TYPED THUNK `R tk_vtthunk_<Class>__<Contract>__<m>(void
+      # *self, …)` whose genuine signature matches the dispatch cast (well-typed, CFI/LTO clean) — so
+      # the native gate is GREEN here, and this lane now continuously guards the trait/interface/base
+      # dispatch paths against a regression.
+      - name: Run the gate on gen1 (native, ASan + UBSan + LSan)
         env:
           ASAN_OPTIONS: halt_on_error=1:detect_leaks=1:quarantine_size_mb=64:malloc_context_size=5
           LSAN_OPTIONS: suppressions=.github/lsan-suppressions.txt:print_suppressions=0
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
-        run: ./bin/teko test .
+        run: ./bin/teko . -o gen2-asan
 
-      # The VM gate above ASan-covers the compiler's C while it INTERPRETS the tests, but not the
-      # native BUILD pipeline (tk_emit_c / cg_lift_program / tk_emit_tsym / run_cc). So build every
-      # regressions fixture natively with the SANITIZED compiler to ASan-cover that pipeline — that is
-      # how the lift-pass use-after-free in tk_emit_tsym (freed items list read for the .tsym map;
-      # crashed glibc builds of any project with a non-capturing lambda) is caught. This is a BUILD
-      # (no run), so the deferred trait-vtable UBSan finding above does not fire here. Leak detection
-      # off: the front-end deliberately holds compiler-lifetime allocations it never frees (core.h S0).
+      # The native gate above ASan-covers the compiler self-test corpus (compiled to a binary and run
+      # in a child process), but each regressions fixture is its OWN dispatch surface. Build every
+      # regressions fixture natively with the SANITIZED compiler to ASan-cover the whole build pipeline
+      # (tk_emit_c / cg_lift_program / tk_emit_tsym / run_cc) — that is how the lift-pass use-after-free
+      # in tk_emit_tsym (freed items list read for the .tsym map; crashed glibc builds of any project
+      # with a non-capturing lambda) is caught. The interface_dispatch / class_* / trait_* fixtures
+      # here additionally ASan/UBSan-cover the #291 typed-thunk dispatch paths on a build. Leak
+      # detection off: the front-end deliberately holds compiler-lifetime allocations it never frees
+      # (core.h S0).
       - name: Native-build regressions fixtures (ASan + UBSan)
         env:
           ASAN_OPTIONS: halt_on_error=1:detect_leaks=0
