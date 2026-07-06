@@ -397,7 +397,7 @@ tk_str tk_rt_version(void);
 uint64_t tk_peak_rss(void);
 
 // (#194 C6) teko::crypto::rand::secure_bytes(n) — n cryptographically-secure random bytes
-// from the host CSPRNG (getrandom(2)/getentropy(3) on POSIX, BCryptGenRandom on Windows).
+// from the host CSPRNG (getrandom(2)/getentropy(3) on POSIX, rand_s (ucrt) on Windows).
 // Returns a fresh owned buffer of EXACTLY n bytes (n == 0 -> a valid empty slice, ptr may be
 // NULL); tk_panic on a genuine host entropy failure (M.1 — silently returning weak/short
 // output is a security defect, never a soft error here).

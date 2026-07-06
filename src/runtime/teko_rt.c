@@ -6,6 +6,9 @@
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
+#ifdef _WIN32
+#define _CRT_RAND_S   // rand_s (CSPRNG in the ucrt, no import lib) — must precede <stdlib.h> (#194 C6)
+#endif
 #include "teko_rt.h"
 #include <ctype.h>    // isalpha (ROUND 0 UTF-8 codepoint ops)
 #include <stdio.h>    // fwrite, fputc, fputs, stdout, stderr
@@ -24,8 +27,6 @@
 #ifdef _WIN32
 #include "../win32_compat.h"  // chdir→_chdir, mkdir, getcwd, setenv, dirent shim, tk_win32_spawnvp
 #include <io.h>        // _dup, _dup2, _close — fd-redirect around tk_rt_run_quiet's _spawnvp (issue #73)
-#include <windows.h>   // BCryptGenRandom (teko::crypto::rand — #194 C6)
-#include <bcrypt.h>    // BCryptGenRandom / STATUS_SUCCESS
 #else
 #include <unistd.h>   // chdir, fork, execvp, _exit (host FFI bottoms)
 #include <sys/wait.h> // waitpid — teko::process::run
@@ -1617,8 +1618,18 @@ uint64_t tk_peak_rss(void) {
 tk_slice_byte tk_rt_secure_bytes(uint64_t n) {
     tk_byte *out = (tk_byte *)tk_alloc(n == 0 ? 1 : n);
 #if defined(_WIN32)
-    NTSTATUS st = BCryptGenRandom(NULL, out, (ULONG)n, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
-    if (st != 0) tk_panic("teko::crypto::rand::secure_bytes: BCryptGenRandom failed");
+    // rand_s (ucrt, RtlGenRandom-backed) is a CSPRNG in the CRT — needs NO import lib, unlike
+    // BCryptGenRandom's bcrypt.lib which the self-host link cannot resolve for a runtime symbol the
+    // compiler's own corpus never calls. Fills 32 bits per rand_s call.
+    uint64_t filled = 0;
+    while (filled < n) {
+        unsigned int v;
+        if (rand_s(&v) != 0) tk_panic("teko::crypto::rand::secure_bytes: rand_s failed");
+        uint64_t chunk = n - filled;
+        if (chunk > 4) chunk = 4;
+        for (uint64_t k = 0; k < chunk; k += 1) out[filled + k] = (tk_byte)((v >> (8 * k)) & 0xFFu);
+        filled += chunk;
+    }
 #elif defined(__APPLE__)
     // getentropy(2) caps a single call at 256 bytes and errors past that — chunk the fill.
     uint64_t filled = 0;
