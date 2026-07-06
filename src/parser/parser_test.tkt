@@ -1578,6 +1578,47 @@ fn rejects_double_inject_overlay() {
     teko::assert::is_true(module_errors("#inject(a: A)\n#inject(b: B)\nfn handle() { }"))
 }
 
+/** The `must_free` flag carried by the first declaration of `source`, or `false` if it is
+ *  not a type decl — a parser-test accessor for the S2 (#336) `#must_free` cases below. */
+fn first_decl_must_free(source: str) -> bool {
+    match module_of(source) {
+        Module as m => match m.decls[0] { TypeDecl as td => td.must_free; _ => false }
+        error => false
+    }
+}
+
+/**
+ * S2 (#336) acceptance 1: `#must_free type FileHandle = class { … }` parses, with the
+ * resulting `TypeDecl.must_free` set to true; a plain `type` (no `#must_free`) stays false.
+ */
+#test
+fn parses_must_free_attribute_on_a_type() {
+    teko::assert::is_true(first_decl_must_free("#must_free\ntype FileHandle = class { }"))
+    teko::assert::is_true(first_decl_must_free("#must_free\ntype M = struct { p: u8 }"))
+    teko::assert::is_false(first_decl_must_free("type Plain = class { }"))
+}
+
+/**
+ * S2 (#336) acceptance 5: `#must_free` may only precede a `type` — rejected before a `fn`,
+ * rejected before a `flags`, and (since `#` never starts a statement) a leading `#must_free`
+ * before a `let` fails to parse as a declaration in the first place.
+ */
+#test
+fn rejects_must_free_on_fn_flags_and_let() {
+    teko::assert::is_true(module_errors("#must_free\nfn handle() { }"))
+    teko::assert::is_true(module_errors("#must_free\nflags F { A; B }"))
+    teko::assert::is_true(module_errors("#must_free\nlet x = 1"))
+}
+
+/**
+ * S2 (#336) acceptance 6: a doubled `#must_free` on one declaration is rejected, mirroring the
+ * doubled-lifetime-annotation check.
+ */
+#test
+fn rejects_double_must_free_attribute() {
+    teko::assert::is_true(module_errors("#must_free\n#must_free\ntype FileHandle = class { }"))
+}
+
 /**
  * U1 (#332) acceptance 1/2: `unsafe type M = struct { … }` and `unsafe type C = class { }`
  * both parse, with the resulting `TypeDecl.is_unsafe` set to true.
