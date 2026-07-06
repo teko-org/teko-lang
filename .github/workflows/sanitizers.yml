@@ -69,10 +69,17 @@ jobs:
 
       - name: Run the gate on gen1 (ASan + UBSan + LSan)
         env:
-          ASAN_OPTIONS: halt_on_error=1:detect_leaks=1
+          # quarantine_size_mb + malloc_context_size CAP ASan's memory: the arena frees a lot per
+          # #test via arena_pop, so ASan's default 256 MB/thread quarantine (holding freed blocks)
+          # + deep alloc-context stacks pushed the sanitized gate past the 7 GB GitHub runner as the
+          # corpus grew (encodings/compress/crypto/collections) — the runner OOM'd ("received a
+          # shutdown signal"). This is the gate-memory debt (#265/#168) amplified ~2-3x by ASan.
+          # --coverage dropped: the main build-test gate enforces the coverage floors; the ASan
+          # lane's job is memory-safety, and coverage instrumentation only adds RAM here.
+          ASAN_OPTIONS: halt_on_error=1:detect_leaks=1:quarantine_size_mb=64:malloc_context_size=5
           LSAN_OPTIONS: suppressions=.github/lsan-suppressions.txt:print_suppressions=0
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
-        run: ./bin/teko test . --coverage
+        run: ./bin/teko test .
 
       # `teko test .` exercises only the VM path — the NATIVE backend (tk_emit_c /
       # cg_lift_program / tk_emit_tsym / run_cc) never ran under ASan, which is how the
