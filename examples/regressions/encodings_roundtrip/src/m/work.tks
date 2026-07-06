@@ -1,0 +1,126 @@
+use b64
+use url
+use csv
+
+/**
+ * Converts a boolean check outcome to its exit-code contribution (1 = held, 0 = failed) —
+ * the same accumulator idiom `json_roundtrip::m::work`'s `check_ops` uses. This module drives
+ * `teko::encoding::base64`, `teko::encoding::url`, and `teko::encoding::csv` (issue #189,
+ * mirrored verbatim in this fixture's own `src/b64`/`src/url`/`src/csv` — see each file's
+ * header, namespaces `encodings_roundtrip::b64`/`::url`/`::csv`, `use`d above) through
+ * known-answer encode/decode checks plus round-trip fixpoints; `check_ops` below sums all 12
+ * checks into the fixture's exit code.
+ *
+ * @param b  the check's boolean outcome
+ * @return   1 when `b` is true, 0 otherwise
+ */
+fn bool_to_i64(b: bool) -> i64 {
+    if b { 1 } else { 0 }
+}
+
+/**
+ * Compares two `[]byte` slices for equal content (Teko has no built-in slice equality).
+ *
+ * @param a  the first slice
+ * @param b  the second slice
+ * @return   true when both slices have the same length and identical bytes at every index
+ */
+fn bytes_equal(a: []byte, b: []byte) -> bool {
+    if a.len != b.len { return false }
+    mut i: u64 = 0
+    loop {
+        if i >= a.len { break }
+        if a[i] != b[i] { return false }
+        i++
+    }
+    true
+}
+
+/**
+ * Base64 checks: the RFC 4648 "Man"/"" known answers plus a URL-safe round-trip.
+ *
+ * @return  1 for each of 4 checks that held (0..4)
+ */
+fn base64_checks() -> i64 {
+    let c1 = bool_to_i64(b64::encode_standard(bytes_of_str("Man")) == "TWFu")
+    let c2 = bool_to_i64(b64::encode_standard(teko::list::empty()) == "")
+    let decoded = match b64::decode_standard("TWFu") {
+        []byte as v => v
+        error => teko::list::empty()
+    }
+    let c3 = bool_to_i64(bytes_equal(decoded, bytes_of_str("Man")))
+    let raw = bytes_of_str("foobar")
+    let round_tripped = match b64::decode_url_safe_no_pad(b64::encode_url_safe_no_pad(raw)) {
+        []byte as v => v
+        error => teko::list::empty()
+    }
+    let c4 = bool_to_i64(bytes_equal(round_tripped, raw))
+    c1 + c2 + c3 + c4
+}
+
+/**
+ * URL checks: RFC 3986 percent-encoding known answer, form-urlencoded space-as-`+`, and a
+ * form-body parse round-trip.
+ *
+ * @return  1 for each of 4 checks that held (0..4)
+ */
+fn url_checks() -> i64 {
+    let c1 = bool_to_i64(url::percent_encode("hello world!") == "hello%20world%21")
+    let c2 = bool_to_i64(url::encode_form_component("john doe") == "john+doe")
+    let decoded = match url::percent_decode("hello%20world%21") {
+        str as s => s
+        error => ""
+    }
+    let c3 = bool_to_i64(decoded == "hello world!")
+    let fields = match url::parse_form("name=john+doe&q=a%2Bb") {
+        []url::FormField as f => f
+        error => teko::list::empty()
+    }
+    let c4 = bool_to_i64(fields.len == 2 && fields[0].value == "john doe" && fields[1].value == "a+b")
+    c1 + c2 + c3 + c4
+}
+
+/**
+ * CSV checks: RFC 4180 minimal-quoting write, quoted-field parse, and a write-then-parse
+ * round-trip over commas/quotes/newlines.
+ *
+ * @return  1 for each of 4 checks that held (0..4)
+ */
+fn csv_checks() -> i64 {
+    mut fields: []str = teko::list::empty()
+    fields = teko::list::push(fields, "hello, world")
+    fields = teko::list::push(fields, "plain")
+    let row = csv::CsvRow { fields = fields }
+    mut rows: []csv::CsvRow = teko::list::empty()
+    rows = teko::list::push(rows, row)
+    let written = csv::write_csv(rows)
+    let c1 = bool_to_i64(written == "\"hello, world\",plain\r\n")
+
+    let parsed = match csv::parse_csv("a,b,c\r\n1,2,3\r\n") {
+        []csv::CsvRow as r => r
+        error => teko::list::empty()
+    }
+    let c2 = bool_to_i64(parsed.len == 2 && parsed[0].fields[0] == "a" && parsed[1].fields[2] == "3")
+
+    let round_tripped = match csv::parse_csv(written) {
+        []csv::CsvRow as r => r
+        error => teko::list::empty()
+    }
+    let c3 = bool_to_i64(round_tripped.len == 1 && round_tripped[0].fields[0] == "hello, world")
+
+    let rejected = match csv::parse_csv("\"unterminated") {
+        []csv::CsvRow => false
+        error => true
+    }
+    let c4 = bool_to_i64(rejected)
+    c1 + c2 + c3 + c4
+}
+
+/**
+ * Runs every codec's checks and sums their exit-code contributions.
+ *
+ * @return  the total held-check count (0..12; 12 = every check passed)
+ */
+pub fn check_ops() -> i64 {
+    base64_checks() + url_checks() + csv_checks()
+}
