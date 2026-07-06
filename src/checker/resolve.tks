@@ -1690,6 +1690,25 @@ fn collect_site_args(path: parser::Path, args: []parser::TypeExpr, acc: []parser
     collect_texpr_insts(parser::NamedType { path = path; args = args }, acc)
 }
 
+/**
+ * Collect the generic-instance a static-factory call names via construction-site type-args
+ * (`Cell<i64>::make(…)` → stamp `Cell__g__i64`) (#254 L5). The instance's OWNER base is the callee's
+ * SECOND-TO-LAST segment (`Cell` of `Cell::make`); synthesizing `Cell<i64>` and running it through
+ * `collect_site_args` stamps it exactly like a `Cell<i64>{…}` construction. A call with no type-args
+ * (or a single-segment callee) contributes nothing — every existing call is unchanged.
+ *
+ * @param call the parsed call (possibly carrying construction-site type-args)
+ * @param acc  the instance worklist so far
+ * @return     `acc` plus the factory instance's synthetic NamedType (or `acc` unchanged)
+ * @since onda-3 (#254 L5)
+ */
+fn collect_call_site_args(call: parser::Call, acc: []parser::TypeExpr) -> []parser::TypeExpr {
+    if call.type_args.len == 0 { return acc }
+    if call.callee.segments.len < 2 { return acc }
+    let base = call.callee.segments[call.callee.segments.len - 2].name
+    collect_site_args(parser::Path { segments = teko::list::push(teko::list::empty(), parser::Segment { name = base }) }, call.type_args, acc)
+}
+
 // (W9.4) walk an expression for construction-site type-args (`Foo<i64>{…}`) and nested patterns.
 fn collect_expr_insts(e: parser::Expr, acc: []parser::TypeExpr) -> []parser::TypeExpr {
     mut out = acc
@@ -1706,7 +1725,11 @@ fn collect_expr_insts(e: parser::Expr, acc: []parser::TypeExpr) -> []parser::Typ
             mut i = 0
             loop { if i >= c.rest.len { break }; out = collect_expr_insts(c.rest[i].operand, out); i++ }
         }
-        parser::Call as call => { mut i = 0; loop { if i >= call.args.len { break }; out = collect_expr_insts(call.args[i], out); i++ } }
+        parser::Call as call => {
+            out = collect_call_site_args(call, out)
+            mut i = 0
+            loop { if i >= call.args.len { break }; out = collect_expr_insts(call.args[i], out); i++ }
+        }
         parser::IfExpr as f => {
             out = collect_expr_insts(f.cond, out)
             out = collect_stmts_insts(f.then_blk, out)
