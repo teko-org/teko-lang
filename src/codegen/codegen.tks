@@ -704,20 +704,52 @@ fn cg_find_method_ns(prog: checker::TProgram, class_name: str, method: str) -> s
     null
 }
 
-// (W10b.CLASS increment 4) THE DESTRUCTION HOOK text: for every TOP-LEVEL `let`/`mut` binding in
-// `fn_body` that is a simple name, not `_`, not `const`, NOT in the escaping set (provably
-// frame-local — never returned/aliased outward), NOT referenced in `tail_expr` (the exit edge's
-// OWN return/tail value, evaluated AFTER this cleanup — `has_tail=false` when the exit edge has
-// no such expression, e.g. the fall-through path, where anything referencing the binding already
-// ran EARLIER, in original statement order), and of a CLASS type, emit a call to its `destruct()`
-// (if it declares one) followed by dropping its own per-object arena region (`__region`, set at
-// construction — emit_struct_init_framed). Scoped to TOP-LEVEL bindings only (a nested-block
-// local is a further extension, not yet covered). Called at every one of a function's exit edges
-// (emit_return / emit_exprstmt_tail's tail-value-return / emit_function's fall-through), mirroring
-// exactly where the frame region itself gets dropped.
-// (`has_tail`/`tail_expr` is a plain pair, NOT `checker::TExpr?` — an Optional wrapping the
-// compiler's own large recursive TExpr type hits a latent self-host codegen gap unrelated to this
-// feature; the has-flag pair sidesteps it, matching the codebase's existing has_X/X convention.)
+/**
+ * Is this binding's initializer a BORROWED VIEW of another region's storage — i.e. a value
+ * that aliases memory the class-cleanup hook must NOT drop? A `let slot = slots[i]` reads the
+ * class POINTER already stored in the slice's backing array, so `slot` and the slice element
+ * are the SAME pointer sharing one `__region`. Dropping `slot->__region` at scope exit would
+ * free storage the slice still owns (a use-after-free the moment the slice is read again), so
+ * the cleanup hook skips a binding whose initializer indexes a slice: the slice owns the
+ * region, the local only borrows it.
+ *
+ * @param b  the top-level `let`/`mut` binding under consideration
+ * @return   true when the initializer is a slice-element read (an aliasing borrow); false when
+ *           the binding owns its object (a fresh construction, call result, or field read)
+ * @since #325
+ */
+fn cg_binding_is_slice_element_borrow(b: checker::TBinding) -> bool {
+    match b.value.kind {
+        checker::TIndex as ix => match ix.receiver.type { checker::Slice => true; _ => false }
+        _ => false
+    }
+}
+
+/**
+ * Emit THE DESTRUCTION HOOK text: for every TOP-LEVEL `let`/`mut` binding that owns a CLASS
+ * object, a call to its `destruct()` (if declared) followed by a drop of its own per-object
+ * arena region (`__region`, set at construction — emit_struct_init_framed). (W10b.CLASS
+ * increment 4.) A binding qualifies only when it is a simple name (not `_`, not `const`), NOT
+ * in the escaping set (provably frame-local — never returned/aliased outward), NOT referenced
+ * in `tail_expr` (the exit edge's OWN return/tail value, evaluated AFTER this cleanup), NOT a
+ * borrowed view of a slice's storage (cg_binding_is_slice_element_borrow — the slice owns that
+ * region), and of a CLASS type. Scoped to TOP-LEVEL bindings only (a nested-block local is a
+ * further extension, not yet covered). Called at every one of a function's exit edges
+ * (emit_return / emit_exprstmt_tail's tail-value-return / emit_function's fall-through),
+ * mirroring exactly where the frame region itself gets dropped.
+ *
+ * `has_tail`/`tail_expr` is a plain pair, NOT `checker::TExpr?` — an Optional wrapping the
+ * compiler's own large recursive TExpr type hits a latent self-host codegen gap unrelated to
+ * this feature; the has-flag pair sidesteps it, matching the codebase's has_X/X convention.
+ *
+ * @param prog       the whole typed program (resolves a bound name to its class decl + destruct)
+ * @param escaping   names that escape the frame (returned/aliased outward — never dropped here)
+ * @param fn_body    the function's top-level statements, scanned for droppable class bindings
+ * @param has_tail   whether `tail_expr` carries the exit edge's own return/tail value
+ * @param tail_expr  the exit edge's return/tail value (consulted only when `has_tail`)
+ * @return           the C cleanup text, or an error propagated from a name/symbol lookup
+ * @since #122 (W10b.CLASS)
+ */
 fn cg_class_cleanup_text(prog: checker::TProgram, escaping: []str, fn_body: []checker::TStatement, has_tail: bool, tail_expr: checker::TExpr) -> str | error {
     mut out: []byte = teko::list::empty()
     mut i = 0
@@ -727,7 +759,8 @@ fn cg_class_cleanup_text(prog: checker::TProgram, escaping: []str, fn_body: []ch
             checker::TBinding as b => {
                 let name = match b.target { parser::SimpleName as sn => sn.name; parser::DestructurePattern => "" }
                 let referenced_in_tail = has_tail && cg_expr_refs_name(tail_expr, name)
-                if name.len > 0 && name != "_" && b.kind != parser::BindKind::Const && !cg_str_in(escaping, name) && !referenced_in_tail {
+                let is_borrow = cg_binding_is_slice_element_borrow(b)
+                if name.len > 0 && name != "_" && b.kind != parser::BindKind::Const && !cg_str_in(escaping, name) && !referenced_in_tail && !is_borrow {
                     let cname = match b.bound { checker::Named as nm => nm.name; _ => "" }
                     if cname.len > 0 && cg_is_class_named(prog, cname) {
                         match cg_find_destruct_ns(prog, cname) {

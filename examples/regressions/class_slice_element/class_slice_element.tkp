@@ -1,0 +1,24 @@
+# Regression (#325 — BUG 2): reading a class-typed slice element into a local
+# (`let slot = slots[i]` where `slots: []Slot` and Slot is a class) crashed native codegen's
+# scope-exit region-drop — a VM≠native frontier (the VM never hits it). A class value lowers to
+# a POINTER, so `slots[i]` reads the pointer already stored in the slice's backing array: the
+# local `slot` and the slice element are the SAME pointer, sharing one per-object `__region`.
+# The class-cleanup hook (cg_class_cleanup_text) treated `slot` as an OWNED object and emitted
+# `tk_region_drop(slot->__region)` at each exit edge — freeing storage the slice still owns
+# (a use-after-free), and worse, misresolving the type to the slice type (tk_slice_Slot has no
+# `__region`) so `cc` rejected the generated C outright. Fix: SUPPRESS the drop for a local
+# whose initializer indexes a slice — the slice owns the region, the local only BORROWS a view.
+#
+# This fixture pins the whole slice-element-of-class borrow surface, VM == native, at exit 0:
+#   1) the live/valid path      — reads slots[0].value through the borrowed local
+#   2) the dead-slot path       — !slot.alive returns null (fallback used)
+#   3) the stale-generation path — slot.gen != r.gen returns null (fallback used)
+#   4) the out-of-bounds path   — r.idx >= slots.len returns null BEFORE the local exists
+#
+#   teko run   examples/regressions/class_slice_element                          # VM     -> exit 0
+#   teko build examples/regressions/class_slice_element && ./class_slice_element # native -> exit 0
+name = "class_slice_element"
+source = "src"
+
+[artifact]
+kind = "binary"

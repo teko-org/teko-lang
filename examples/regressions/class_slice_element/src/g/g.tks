@@ -1,0 +1,92 @@
+/**
+ * A generational slot — a class, so every use lowers to a POINTER. Held in a `[]Slot`, whose
+ * backing array stores those pointers directly; indexing the slice yields a BORROWED view of
+ * one, never a fresh object.
+ */
+pub type Slot = class {
+    /** The payload read out through a valid, live, current-generation reference. */
+    pub value: i64
+    /** The generation stamp; a reference is stale unless it matches. */
+    pub gen: u64
+    /** Whether the slot currently holds a live value. */
+    pub alive: bool
+
+    /**
+     * Construct a slot with an explicit value, generation, and liveness.
+     *
+     * @param v  the payload
+     * @param g  the generation stamp
+     * @param a  whether the slot is live
+     * @return   a fresh Slot in its own per-object region
+     */
+    pub fn make(v: i64, g: u64, a: bool) -> Slot { Slot { value = v; gen = g; alive = a } }
+}
+
+/**
+ * A generational reference into a `[]Slot`: an index plus the generation it expects to find.
+ */
+pub type GenRef = struct {
+    /** The slot index this reference points at. */
+    idx: u64
+    /** The generation the pointed slot must still carry to be valid. */
+    gen: u64
+}
+
+/**
+ * Dereference a generational reference against a slot slice, reading the payload of a valid,
+ * live, current-generation slot. The `let slot = slots[r.idx]` binds a BORROWED view of a
+ * class element (a pointer aliasing the slice's storage), so no scope-exit region-drop may
+ * fire on `slot` — the slice still owns the region.
+ *
+ * @param slots  the backing slot slice (owns every element's region)
+ * @param r      the generational reference to resolve
+ * @return       the slot's value when valid; null when out of bounds, dead, or stale
+ * @since #325
+ */
+pub fn gr_deref(slots: []Slot, r: GenRef) -> i64? {
+    if r.idx >= slots.len { return null }
+    let slot = slots[r.idx]
+    if !slot.alive { return null }
+    if slot.gen != r.gen { return null }
+    slot.value
+}
+
+/**
+ * Resolve a reference to a concrete value, substituting a fallback when the reference does not
+ * name a valid live current-generation slot.
+ *
+ * @param slots     the backing slot slice
+ * @param r         the generational reference to resolve
+ * @param fallback  the value returned when the reference is invalid
+ * @return          the referenced value, or `fallback` when invalid
+ * @since #325
+ */
+pub fn resolved(slots: []Slot, r: GenRef, fallback: i64) -> i64 {
+    let got = gr_deref(slots, r)
+    match got {
+        i64 as v => v
+        null => fallback
+    }
+}
+
+/**
+ * Drive every path through the slice-element borrow: a live read, a dead slot, a stale
+ * generation, and an out-of-bounds index. Each branch returns a distinct non-zero code on
+ * mismatch so a native region-drop regression (double-free / wrong value) surfaces as a
+ * divergent exit code against the VM.
+ *
+ * @return 0 when all four paths agree; a distinct 1x code identifies the first failing path
+ * @since #325
+ */
+pub fn driver() -> i64 {
+    let slots = [Slot::make(42, 1, true), Slot::make(99, 1, false)]
+    let live = resolved(slots, GenRef { idx = 0; gen = 1 }, 200)
+    if live != 42 { return 10 }
+    let dead = resolved(slots, GenRef { idx = 1; gen = 1 }, 201)
+    if dead != 201 { return 11 }
+    let stale = resolved(slots, GenRef { idx = 0; gen = 9 }, 202)
+    if stale != 202 { return 12 }
+    let oob = resolved(slots, GenRef { idx = 7; gen = 1 }, 203)
+    if oob != 203 { return 13 }
+    0
+}
