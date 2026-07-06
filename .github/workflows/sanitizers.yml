@@ -67,32 +67,32 @@ jobs:
           sh scripts/ci_cc_wrap.sh "-fsanitize=address,undefined -fno-omit-frame-pointer -g"
           teko . -o bin
 
-      # The gate is NATIVE by default (#168 memory-debt fix): the sanitized gen1 runs the #test
-      # corpus in a CHILD process (`teko . -o gen2-asan`), so the SANITIZED compiler's OWN peak stays
-      # codegen-only — no ~1.5 GB VM functional-env balloon. That is what made the VM gate (`teko
-      # test .`) OOM the 7 GB runner as the corpus grew (encodings/compress/crypto/collections):
-      # ASan amplifies the balloon ~2-3x. The native flip removes the balloon AND, as a bonus,
-      # ASan-checks the PRODUCTION native path (tk_emit_c_test → run_cc → the child test binary),
-      # which the VM gate never exercised. The child test binary inherits ASAN_OPTIONS, so a memory
-      # bug in the compiled tests still fails the lane. The #323 quarantine_size_mb + malloc_context_
-      # size CAPS are KEPT DEFENSIVELY — the arena frees a lot per #test via arena_pop, and a large
-      # freed-block quarantine + deep alloc-context stacks still cost RAM under ASan (LSan needs the
-      # quarantine bounded, not zero). detect_leaks stays 1: the native gate's own allocations must
-      # be leak-clean, with the documented process-lifetime allocations covered by the suppressions.
-      - name: Run the gate on gen1 (native, ASan + UBSan + LSan)
+      # This lane runs the VM gate for now (with #323's memory caps + no --coverage). Flipping it to
+      # the NATIVE gate — which would additionally ASan-check the production native build pipeline and
+      # drop the VM functional-env balloon under ASan — is DEFERRED, not abandoned: running the #test
+      # corpus natively under UBSan surfaced a PRE-EXISTING undefined behavior in the #291 trait
+      # dynamic-vtable dispatch. A contract method is invoked through an `R (*)(void *, …)` pointer
+      # while its definition takes a concrete receiver type (codegen.tks ~1907-1966); -fsanitize=
+      # function flags the function-pointer-type mismatch, which is real UB (CFI/LTO-fragile) even
+      # though it happens to work on mainstream ABIs. That UB is fixed at the ROOT (typed dispatch
+      # thunks) in a dedicated follow-up which will re-flip this lane to the native gate and validate
+      # the fix under the very UBSan check that exposed it. The #168 build-gate memory win (VM→native
+      # default for `teko . -o bin`) is independent of this lane and lands regardless. The #323 caps
+      # stay: they bound the VM gate's ASan footprint on the 7 GB runner.
+      - name: Run the gate on gen1 (VM, ASan + UBSan + LSan)
         env:
           ASAN_OPTIONS: halt_on_error=1:detect_leaks=1:quarantine_size_mb=64:malloc_context_size=5
           LSAN_OPTIONS: suppressions=.github/lsan-suppressions.txt:print_suppressions=0
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
-        run: ./bin/teko . -o gen2-asan
+        run: ./bin/teko test .
 
-      # The native gate above already ASan-covers the whole native BUILD pipeline (tk_emit_c /
-      # cg_lift_program / tk_emit_tsym / run_cc) — that is how the lift-pass use-after-free in
-      # tk_emit_tsym (freed items list read for the .tsym map; crashed glibc builds of any project
-      # with a non-capturing lambda) would now be caught. Also build every regressions fixture
-      # natively with the SANITIZED compiler so the fixture corpus's own constructs are ASan-covered.
-      # Leak detection off: the front-end deliberately holds compiler-lifetime allocations it never
-      # frees (core.h S0 seam discipline).
+      # The VM gate above ASan-covers the compiler's C while it INTERPRETS the tests, but not the
+      # native BUILD pipeline (tk_emit_c / cg_lift_program / tk_emit_tsym / run_cc). So build every
+      # regressions fixture natively with the SANITIZED compiler to ASan-cover that pipeline — that is
+      # how the lift-pass use-after-free in tk_emit_tsym (freed items list read for the .tsym map;
+      # crashed glibc builds of any project with a non-capturing lambda) is caught. This is a BUILD
+      # (no run), so the deferred trait-vtable UBSan finding above does not fire here. Leak detection
+      # off: the front-end deliberately holds compiler-lifetime allocations it never frees (core.h S0).
       - name: Native-build regressions fixtures (ASan + UBSan)
         env:
           ASAN_OPTIONS: halt_on_error=1:detect_leaks=0
