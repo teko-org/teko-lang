@@ -2950,15 +2950,30 @@ fn teko_rt_type_ok(t: Type) -> bool {
     }
 }
 
-// (OOP A1, 2026-07-01) type-check a struct METHOD's BODY. Mirrors type_function, except the
-// RECEIVER param (has_type=false, only ever index 0) binds to Named{struct_name} instead of
-// going through resolve_type (its type is implicit, never written by the user).
+/**
+ * (OOP A1, 2026-07-01) Type-check a struct/class METHOD's BODY. Mirrors type_function, except the
+ * RECEIVER param (`has_type=false`, only ever index 0) binds to `Named{struct_name}` instead of going
+ * through resolve_type (its type is implicit, never written by the user). (#254) The method's
+ * type-param table is PREPENDED with the enclosing type's own params, so a body referencing `T`
+ * resolves against the owner's `T` — a NO-OP for a non-generic owner.
+ *
+ * @param f                  the method to type-check
+ * @param struct_name        the enclosing type name (bare from the caller; canonicalized here)
+ * @param env                the typing environment
+ * @param table              the folded type table
+ * @param has_base_binding   does the class expose a named base-object binding to this method?
+ * @param base_binding_name  the base-binding local name (valid iff has_base_binding)
+ * @param base_name          the (canonical) base class name (valid iff has_base_binding)
+ * @param declaring_class    the class that ORIGINALLY declared this body (intern/private access ctx)
+ * @return                   the typed method as a TFunction (namespace stamped by the caller)
+ * @throws                   on any body type error, a bad return/trailing value, or a label failure
+ */
 fn type_method(f: parser::Function, struct_name: str, env: Env, table: TypeTable, has_base_binding: bool, base_binding_name: str, base_name: str, declaring_class: str) -> TFunction | error {
     // (W10b.CLASS residual — intern visibility) this body's OWN field/method accesses are
     // checked against `declaring_class` (see type_struct_methods's own comment on why this can
     // differ from `struct_name`), NOT `struct_name` — set before typing the body below.
     mut local = with_owner(env, declaring_class)
-    let tbl = type_param_table(f.type_params, f.type_constraints, "", table)
+    let tbl = method_type_param_table(receiver_canonical_name(struct_name, env.cur_ns, table), f.type_params, f.type_constraints, "", table)
     let is_teko_rt = f.is_extern && f.from_lib == "teko_rt"
     // (W10b.CLASS) `class Base(parent) { … }` — the NAMED BINDING an instance method uses to
     // reach the base object. Only meaningful for an INSTANCE method (has a receiver); a class's
@@ -3225,10 +3240,10 @@ pub fn type_program_with_deps(raw_program: parser::Program, dep_prog: TProgram) 
     match check_modules(program, c.types) { null => { }; error as e => return e }
     match check_di(program, c.types) { null => { }; error as e => return e }
     let di_reg = match build_di_registry(program, c.types) { DiRegistry as r => r; error as e => return e }
-    // (#148) seal the collected globals — see type_program.
-    let cenv = with_di(seal(c.env), di_reg)
     // (S4 type-generics) stamp concrete decls for written generic uses before typing (no-op when none).
     let types = instantiate_types(program, c.types)
+    let menv = match register_instance_methods(c.env, types) { Env as e => e; error as e => return e }
+    let cenv = with_di(seal(menv), di_reg)
     mut items: []TItem = teko::list::empty()
     mut mainbody: []TStatement = teko::list::empty()
     mut cur = cenv
@@ -3313,12 +3328,11 @@ pub fn type_program(raw_program: parser::Program) -> TProgram | error {
     match check_modules(program, c.types) { null => { }; error as e => return e }
     match check_di(program, c.types) { null => { }; error as e => return e }
     let di_reg = match build_di_registry(program, c.types) { DiRegistry as r => r; error as e => return e }
-    // (#148) SEAL the collected globals into the env's immutable base segment ONCE, so every
-    // function/arm forking from it copies only its own locals (never the whole global table).
-    let cenv = with_di(seal(c.env), di_reg)
     // (S4 type-generics) STAMP concrete decls for written generic uses (`Box<i64>`) into the table
     // before typing, so field-access / struct-init see concrete fields. No-op when none are used.
     let types = instantiate_types(program, c.types)
+    let menv = match register_instance_methods(c.env, types) { Env as e => e; error as e => return e }
+    let cenv = with_di(seal(menv), di_reg)
     mut items: []TItem = teko::list::empty()
     mut mainbody: []TStatement = teko::list::empty()   // the loose top-level statements (the virtual-main), for label validation
     mut cur = cenv   // threaded virtual-main scope: each loose binding extends it for the next statement (mirrors typer.c's `cur`)

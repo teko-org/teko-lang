@@ -71,7 +71,7 @@ fn func_type(f: parser::Function, table: TypeTable, ref_ns: str) -> Type | error
  * @return             the receiver's canonical `ns::…::Type` name (bare for the root ns or a type-param)
  * @since onda-3 (#290)
  */
-fn receiver_canonical_name(struct_name: str, ref_ns: str, table: TypeTable) -> str {
+pub fn receiver_canonical_name(struct_name: str, ref_ns: str, table: TypeTable) -> str {
     if name_qualifier(struct_name) != "" { return struct_name }
     let qualified = qualify(ref_ns, struct_name)
     match type_table_find(table, qualified, "") {
@@ -80,13 +80,23 @@ fn receiver_canonical_name(struct_name: str, ref_ns: str, table: TypeTable) -> s
     }
 }
 
-// (OOP A1, 2026-07-01) a struct METHOD's signature as a FuncType. Mirrors func_type, except the
-// RECEIVER param (has_type=false, only ever index 0) resolves to Named{struct_name} — its type
-// is IMPLICIT (the enclosing struct), never written by the user, so it can't go through
-// resolve_type like an ordinary annotated param.
-// (#109 W1) `ref_ns` = the method's declaring namespace; threaded to resolve_type, unused until W2.
+/**
+ * (OOP A1, 2026-07-01) A struct/class METHOD's signature as a FuncType. Mirrors func_type, except the
+ * RECEIVER param (`has_type=false`, only ever index 0) resolves to `Named{struct_name}` — its type is
+ * IMPLICIT (the enclosing type), never written by the user, so it cannot go through resolve_type like
+ * an ordinary annotated param. (#254) The method's type-param table is PREPENDED with the enclosing
+ * type's own params (`method_type_param_table`), so a method of `Box<T>` referencing `T` resolves
+ * against the owner's `T` instead of "unknown type: T" — a NO-OP for a non-generic owner.
+ *
+ * @param struct_name  the enclosing type name (canonical from a dispatch, or bare from collect)
+ * @param table        the folded type table (receiver-canonicalization + owner-param lookup)
+ * @param ref_ns       the method's declaring namespace (#109 W1; threaded to resolve_type)
+ * @param f            the method whose signature is built
+ * @return             the method's Func type (receiver + params + return, all resolved)
+ * @throws             when a param or return annotation fails to resolve
+ */
 fn method_func_type(f: parser::Function, struct_name: str, table: TypeTable, ref_ns: str) -> Type | error {
-    let tbl = type_param_table(f.type_params, f.type_constraints, "", table)
+    let tbl = method_type_param_table(receiver_canonical_name(struct_name, ref_ns, table), f.type_params, f.type_constraints, "", table)
     mut params: []Type = teko::list::empty()
     mut param_names: []str = teko::list::empty()
     mut defaults: []parser::Expr = teko::list::empty()
@@ -176,6 +186,60 @@ fn collect_funcs(items: []parser::Item, table: TypeTable) -> Env | error {
         i++
     }
     env
+}
+
+/**
+ * Register a stamped generic-type INSTANCE's methods (kept + signature-substituted by #254 layer 2)
+ * into the env, keyed by the instance's own bare name (`Box__g__i64`) — so a dot-call `b.get()` on a
+ * `Box__g__i64` value desugars to `Box__g__i64::get(b)` and `lookup_call` resolves it. The instance
+ * name is already canonical/bare (it is what the resolved receiver's `Named.name` carries and what the
+ * dispatch callee's qualifier is), so `method_ns` is the instance name verbatim, matching the
+ * bare dispatch qualifier the same way stamped-instance field access resolves off the bare name.
+ * A NON-generic-type body contributes nothing (its methods live on the template, registered as usual).
+ *
+ * @param env    the env to extend (the collected globals, before sealing)
+ * @param table  the folded type table (source of the stamped instances + method signatures)
+ * @return       the env with every stamped instance method registered
+ * @throws       when a method signature fails to resolve (surfaced as at the template)
+ * @since onda-3 (#254)
+ */
+pub fn register_instance_methods(env: Env, table: TypeTable) -> Env | error {
+    mut out = env
+    let insts = table_generic_instances(table)
+    mut i = 0
+    loop {
+        if i >= insts.len { break }
+        let methods = instance_methods_of(insts[i])
+        mut mi = 0
+        loop {
+            if mi >= methods.len { break }
+            let mft = match method_func_type(methods[mi], insts[i].name, table, "") {
+                Type as t => t
+                error as e => return e
+            }
+            out = define_fn(out, methods[mi].name, mft, insts[i].name)
+            mi++
+        }
+        i++
+    }
+    out
+}
+
+/**
+ * The methods a stamped generic-type instance carries (kept + substituted by #254 layer 2) — struct
+ * or class body; every other body kind has no methods. Static and instance methods alike are returned
+ * (both need registering as `Instance::method` callables).
+ *
+ * @param decl  the stamped instance's TypeDecl
+ * @return      the instance's methods, or an empty list for a non-struct/class body
+ * @since onda-3 (#254)
+ */
+fn instance_methods_of(decl: parser::TypeDecl) -> []parser::Function {
+    match decl.body {
+        parser::StructBody as sb => sb.methods
+        parser::ClassBody as cb => cb.methods
+        _ => teko::list::empty()
+    }
 }
 
 // C7.12 — reconstruct a TypeTable from a TYPED program's pass-through TypeDecl items.
