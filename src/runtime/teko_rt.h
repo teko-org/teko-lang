@@ -396,6 +396,13 @@ tk_str tk_rt_version(void);
 // (#148) the process peak RSS in bytes (0 = unavailable) — teko::mem::peak_rss.
 uint64_t tk_peak_rss(void);
 
+// (#194 C6) teko::crypto::rand::secure_bytes(n) — n cryptographically-secure random bytes
+// from the host CSPRNG (getrandom(2)/getentropy(3) on POSIX, BCryptGenRandom on Windows).
+// Returns a fresh owned buffer of EXACTLY n bytes (n == 0 -> a valid empty slice, ptr may be
+// NULL); tk_panic on a genuine host entropy failure (M.1 — silently returning weak/short
+// output is a security defect, never a soft error here).
+tk_slice_byte tk_rt_secure_bytes(uint64_t n);
+
 // ---- Date/Time placeholder types (ROUND 0) ----
 // Five value types: DateTime (signed ns since Unix epoch), TimeSpan (signed ns duration),
 // Time (ns since midnight), Date (days since 1970-01-01 = 0), DateTimeOffset (DateTime + offset).

@@ -126,6 +126,13 @@ target_link_libraries(teko PRIVATE teko_bootstrap)
 if(UNIX AND NOT APPLE)
     target_link_libraries(teko PRIVATE m)
 endif()
+# teko_rt.c's tk_rt_secure_bytes (#194 C6, teko::crypto::rand) calls BCryptGenRandom on
+# Windows, which lives in bcrypt.lib (not linked by default). A generated project that
+# calls teko::crypto::rand::secure_bytes needs the same link flag via its own
+# `.tkp` [extern.libs.windows] (mirroring the ws2_32 precedent for networking).
+if(WIN32)
+    target_link_libraries(teko PRIVATE bcrypt)
+endif()
 # src/win32_int128_builtins.c provides __divti3/__udivti3/__modti3/__umodti3/
 # __floattidf/__floatuntidf/__fixdfti/__fixunsdfti — the compiler-rt builtins
 # needed for __int128 arithmetic on Windows. Clang on MSVC ABI does not
