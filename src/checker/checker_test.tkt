@@ -4785,3 +4785,151 @@ fn unsafe_generic_base_instantiated_with_safe_arg_stamps_unsafe() {
         error as e => teko::assert::is_true(teko::str::contains(e.message, "names unsafe type in its signature"))
     }
 }
+
+/**
+ * Builds a region-handle TypeTable (#358) — a single `#must_free` struct `Arena` with one `uptr`
+ * field `region`, the Arena shape `is_region_handle_name` recognizes structurally.
+ *
+ * @return a TypeTable holding exactly the region-handle `Arena` decl
+ */
+fn region_handle_table() -> TypeTable {
+    let fld = parser::Field { name = "region"; type_ann = named_t("uptr"); vis = parser::Visibility::Pub; is_intern = false; has_doc = false; doc = "" }
+    let fields = teko::list::push(teko::list::empty(), fld)
+    let decl = parser::TypeDecl { name = "Arena"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::StructBody { fields = fields; methods = teko::list::empty(); implements = teko::list::empty() }; vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 0; col = 0; di_kind = parser::DiKind::None; has_di_key = false; di_key = ""; is_unsafe = true; must_free = true }
+    teko::list::push(teko::list::empty(), TypeReg { name = "Arena"; namespace = ""; vis = parser::Visibility::Pub; decl = decl })
+}
+
+/**
+ * Builds a rooted `teko::mem::<op>` call path — the three-segment shape the region builtins
+ * dispatch on.
+ *
+ * @param op the last segment (`region_new`/`region_alloc`/`free`)
+ * @return   the path `teko::mem::<op>`
+ */
+fn mem_path(op: str) -> parser::Path {
+    mut segs = teko::list::push(teko::list::empty(), parser::Segment { name = "teko" })
+    segs = teko::list::push(segs, parser::Segment { name = "mem" })
+    parser::Path { segments = teko::list::push(segs, parser::Segment { name = op }) }
+}
+
+/**
+ * Builds a `#must_free` struct table whose sole field is a NON-`uptr` (`u64`) — the near-miss the
+ * region-handle probe must REJECT (right `#must_free` + arity, wrong field type).
+ *
+ * @return a TypeTable with one `#must_free` single-`u64`-field struct `NotArena`
+ */
+fn non_uptr_must_free_table() -> TypeTable {
+    let fld = parser::Field { name = "n"; type_ann = named_t("u64"); vis = parser::Visibility::Pub; is_intern = false; has_doc = false; doc = "" }
+    let fields = teko::list::push(teko::list::empty(), fld)
+    let decl = parser::TypeDecl { name = "NotArena"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::StructBody { fields = fields; methods = teko::list::empty(); implements = teko::list::empty() }; vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 0; col = 0; di_kind = parser::DiKind::None; has_di_key = false; di_key = ""; is_unsafe = true; must_free = true }
+    teko::list::push(teko::list::empty(), TypeReg { name = "NotArena"; namespace = ""; vis = parser::Visibility::Pub; decl = decl })
+}
+
+/**
+ * Builds a `#must_free` struct table with TWO `uptr` fields — the near-miss the region-handle probe
+ * must REJECT on arity (a single-field shape is required); also exercises the field-name accessor's
+ * multi-field else-branch.
+ *
+ * @return a TypeTable with one `#must_free` two-`uptr`-field struct `TwoField`
+ */
+fn two_field_must_free_table() -> TypeTable {
+    mut fields = teko::list::push(teko::list::empty(), parser::Field { name = "a"; type_ann = named_t("uptr"); vis = parser::Visibility::Pub; is_intern = false; has_doc = false; doc = "" })
+    fields = teko::list::push(fields, parser::Field { name = "b"; type_ann = named_t("uptr"); vis = parser::Visibility::Pub; is_intern = false; has_doc = false; doc = "" })
+    let decl = parser::TypeDecl { name = "TwoField"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::StructBody { fields = fields; methods = teko::list::empty(); implements = teko::list::empty() }; vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 0; col = 0; di_kind = parser::DiKind::None; has_di_key = false; di_key = ""; is_unsafe = true; must_free = true }
+    teko::list::push(teko::list::empty(), TypeReg { name = "TwoField"; namespace = ""; vis = parser::Visibility::Pub; decl = decl })
+}
+
+/**
+ * Builds a `#must_free` single-field struct whose field names an UNRESOLVABLE type — exercises
+ * `is_region_handle_decl`'s `resolve_type` error arm (a field type that cannot resolve is not
+ * `uptr`, so the shape is rejected without crashing).
+ *
+ * @return a TypeTable with one `#must_free` struct `BadField` whose field type is unknown
+ */
+fn unresolvable_field_must_free_table() -> TypeTable {
+    let fld = parser::Field { name = "x"; type_ann = named_t("NoSuchType"); vis = parser::Visibility::Pub; is_intern = false; has_doc = false; doc = "" }
+    let fields = teko::list::push(teko::list::empty(), fld)
+    let decl = parser::TypeDecl { name = "BadField"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::StructBody { fields = fields; methods = teko::list::empty(); implements = teko::list::empty() }; vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 0; col = 0; di_kind = parser::DiKind::None; has_di_key = false; di_key = ""; is_unsafe = true; must_free = true }
+    teko::list::push(teko::list::empty(), TypeReg { name = "BadField"; namespace = ""; vis = parser::Visibility::Pub; decl = decl })
+}
+
+/**
+ * Builds a `#must_free` NON-struct (interface) table — exercises `is_region_handle_decl`'s
+ * non-`StructBody` reject arm (the flag is set, but the body kind disqualifies it).
+ *
+ * @return a TypeTable with one `#must_free` interface `MustIface`
+ */
+fn must_free_iface_table() -> TypeTable {
+    let decl = parser::TypeDecl { name = "MustIface"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::InterfaceBody { extends = teko::list::empty(); methods = teko::list::empty() }; vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 0; col = 0; di_kind = parser::DiKind::None; has_di_key = false; di_key = ""; is_unsafe = false; must_free = true }
+    teko::list::push(teko::list::empty(), TypeReg { name = "MustIface"; namespace = ""; vis = parser::Visibility::Pub; decl = decl })
+}
+
+#test
+fn region_handle_predicate_recognizes_arena() {
+    let tbl = region_handle_table()
+    teko::assert::is_false(is_region_handle_name("MustIface", must_free_iface_table()))
+    teko::assert::is_true(region_handle_field_name("MustIface", must_free_iface_table()) == "")
+    teko::assert::is_true(is_region_handle_name("Arena", tbl))
+    teko::assert::is_true(region_handle_field_name("Arena", tbl) == "region")
+    teko::assert::is_false(is_region_handle_name("Missing", tbl))
+    teko::assert::is_true(region_handle_field_name("Missing", tbl) == "")
+    teko::assert::is_false(is_region_handle_name("Foo", foo_table()))
+    teko::assert::is_true(region_handle_field_name("Foo", foo_table()) == "token")
+    teko::assert::is_false(is_region_handle_name("BadField", unresolvable_field_must_free_table()))
+    teko::assert::is_false(is_region_handle_name("NotArena", non_uptr_must_free_table()))
+    teko::assert::is_false(is_region_handle_name("TwoField", two_field_must_free_table()))
+    teko::assert::is_true(region_handle_field_name("TwoField", two_field_must_free_table()) == "")
+    teko::assert::is_false(is_region_handle_name("Color", color_enum_table()))
+    teko::assert::is_true(region_handle_field_name("Color", color_enum_table()) == "")
+}
+
+#test
+fn region_new_types_to_uptr() {
+    let call = parser::Call { callee = mem_path("region_new"); args = teko::list::empty(); arg_names = teko::list::empty(); type_args = teko::list::empty() }
+    match type_call(call, empty_env(), empty_table()) {
+        TExpr as te => match te.type { Uptr => teko::assert::is_true(true); _ => teko::assert::is_true(false) }
+        error => teko::assert::is_true(false)
+    }
+    let bad = parser::Call { callee = mem_path("region_new"); args = teko::list::push(teko::list::empty(), e_num(1)); arg_names = pos_names(1); type_args = teko::list::empty() }
+    match type_call(bad, empty_env(), empty_table()) { TExpr => teko::assert::is_true(false); error => teko::assert::is_true(true) }
+}
+
+#test
+fn region_alloc_types_to_ptr_of_init() {
+    let env = define(empty_env(), "reg", Uptr { }, false)
+    mut args = teko::list::push(teko::list::empty(), e_var("reg"))
+    args = teko::list::push(args, e_num(42))
+    let call = parser::Call { callee = mem_path("region_alloc"); args = args; arg_names = pos_names(2); type_args = teko::list::empty() }
+    match type_call(call, env, empty_table()) {
+        TExpr as te => match te.type { Ptr as p => match p.inner { Type => teko::assert::is_true(true); null => teko::assert::is_true(false) }; _ => teko::assert::is_true(false) }
+        error => teko::assert::is_true(false)
+    }
+    mut bad_args = teko::list::push(teko::list::empty(), e_num(1))
+    bad_args = teko::list::push(bad_args, e_num(42))
+    let bad = parser::Call { callee = mem_path("region_alloc"); args = bad_args; arg_names = pos_names(2); type_args = teko::list::empty() }
+    match type_call(bad, empty_env(), empty_table()) { TExpr => teko::assert::is_true(false); error => teko::assert::is_true(true) }
+    let void_init = ek(parser::Call { callee = path1("println"); args = teko::list::push(teko::list::empty(), e_str("x")); arg_names = pos_names(1); type_args = teko::list::empty() })
+    mut void_args = teko::list::push(teko::list::empty(), e_var("reg"))
+    void_args = teko::list::push(void_args, void_init)
+    let with_void = parser::Call { callee = mem_path("region_alloc"); args = void_args; arg_names = pos_names(2); type_args = teko::list::empty() }
+    match type_call(with_void, env, empty_table()) { TExpr => teko::assert::is_true(false); error => teko::assert::is_true(true) }
+    let one_arg = parser::Call { callee = mem_path("region_alloc"); args = teko::list::push(teko::list::empty(), e_var("reg")); arg_names = pos_names(1); type_args = teko::list::empty() }
+    match type_call(one_arg, env, empty_table()) { TExpr => teko::assert::is_true(false); error => teko::assert::is_true(true) }
+    mut foo_segs = teko::list::push(teko::list::empty(), parser::Segment { name = "foo" })
+    foo_segs = teko::list::push(foo_segs, parser::Segment { name = "mem" })
+    foo_segs = teko::list::push(foo_segs, parser::Segment { name = "region_alloc" })
+    mut foo_args = teko::list::push(teko::list::empty(), e_var("reg"))
+    foo_args = teko::list::push(foo_args, e_num(42))
+    let not_rooted = parser::Call { callee = parser::Path { segments = foo_segs }; args = foo_args; arg_names = pos_names(2); type_args = teko::list::empty() }
+    match type_call(not_rooted, env, empty_table()) { TExpr => teko::assert::is_true(false); error => teko::assert::is_true(true) }
+}
+
+#test
+fn mem_free_accepts_region_handle() {
+    let env = define(empty_env(), "a", Named { name = "Arena" }, true)
+    let call = parser::Call { callee = mem_path("free"); args = teko::list::push(teko::list::empty(), e_var("a")); arg_names = pos_names(1); type_args = teko::list::empty() }
+    match type_call(call, env, region_handle_table()) {
+        TExpr as te => match te.type { Void => teko::assert::is_true(true); _ => teko::assert::is_true(false) }
+        error => teko::assert::is_true(false)
+    }
+}

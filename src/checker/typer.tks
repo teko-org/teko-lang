@@ -429,18 +429,84 @@ fn type_mem_free(c: parser::Call, env: Env, table: TypeTable) -> TExpr | NotMemF
     let vname = match arg.kind { TVar as v => v.name; _ => return error { message = "teko::mem::free requires a mutable variable — the value must have a binding to invalidate" } }
     let vb = match lookup_binding(env, vname) { ValBinding as b => b; error as e => return e }
     if !vb.is_mut { return error { message = $"cannot free immutable `{vname}` — declare it `mut` (free invalidates the binding)" } }
-    // the target must be a HEAP value: a slice `[]T` (free the backing buffer) or a class instance
-    // (drop its arena-per-object region). A struct-by-value / prim / str-view has no owned heap block.
     let is_heap = match arg.type {
         Slice => true
-        Named as nm => is_class_name(nm.name, table)
+        Named as nm => is_class_name(nm.name, table) || is_region_handle_name(nm.name, table)
         _ => false
     }
-    if !is_heap { return error { message = $"teko::mem::free target must be a `[]T` slice or a class instance — `{type_render(arg.type)}` owns no freeable heap block" } }
-    // typed node: a void TCall carrying the (path, typed arg). codegen recognizes `mem::free` and
-    // dispatches the arm off arg.type (Slice → tk_free_block + scrub; class → tk_region_drop + null).
+    if !is_heap { return error { message = $"teko::mem::free target must be a `[]T` slice, a class instance, or a manual region handle (`unsafe #must_free type` with a single `uptr` field) — `{type_render(arg.type)}` owns no freeable heap block" } }
     let av = teko::list::push(teko::list::empty(), arg)
     TExpr { kind = TCall { callee = c.callee; args = av; call_ns = "teko::mem"; is_closure_call = false; callee_type = Void { }; is_iface_dispatch = false; iface_slot = 0 }; type = Void { }; line = 0; col = 0 }
+}
+
+/**
+ * The negative sentinel for `type_region_new`/`type_region_alloc` — the call is not one of the
+ * manual-region builtins, so `type_call` falls through to ordinary resolution.
+ */
+type NotRegionOp = struct { }
+
+/**
+ * (S3, issue #358) `teko::mem::region_new() -> uptr` — the manual-region CONSTRUCTOR builtin
+ * behind `Arena::new()`. Opens a fresh child region under the process root (`tk_region_new`) and
+ * hands its raw `tk_region *` back as an opaque `uptr` word — the value an `unsafe #must_free type
+ * Arena` stores in its single field and later bulk-frees via `teko::mem::free`. Non-generic,
+ * zero-arity; dispatched statically by the (rooted) `teko::mem::region_new` path exactly like
+ * `type_mem_free`, BEFORE ordinary name resolution, so it never collides with a user symbol.
+ *
+ * @param c      the raw call node
+ * @param env    the typing environment
+ * @param table  the folded type table
+ * @return       a `uptr`-typed void-namespaced TCall, `NotRegionOp` if the path is not region_new,
+ *               or an error on wrong arity
+ * @throws       when the call passes any arguments (region_new takes none)
+ */
+fn type_region_new(c: parser::Call, env: Env, table: TypeTable) -> TExpr | NotRegionOp | error {
+    if c.callee.segments.len < 2 { return NotRegionOp { } }
+    let last = c.callee.segments[c.callee.segments.len - 1].name
+    let prev = c.callee.segments[c.callee.segments.len - 2].name
+    if last != "region_new" || prev != "mem" { return NotRegionOp { } }
+    let rooted = c.callee.segments.len == 2 || c.callee.segments[0].name == "teko"
+    if !rooted { return NotRegionOp { } }
+    if c.args.len != 0 { return error { message = "teko::mem::region_new takes no arguments (it opens a fresh region)" } }
+    TExpr { kind = TCall { callee = c.callee; args = teko::list::empty(); call_ns = "teko::mem"; is_closure_call = false; callee_type = Void { }; is_iface_dispatch = false; iface_slot = 0 }; type = Uptr { }; line = 0; col = 0 }
+}
+
+/**
+ * (S3, issue #358) `teko::mem::region_alloc(region: uptr, init: T) -> ptr<T>` — bump-allocates a
+ * `T` INTO the region named by the `uptr` handle, copies `init` into it, and hands back a raw
+ * `ptr<T>` attached to that region's lifetime (dangling after the region is freed — the `unsafe`
+ * risk the dev owns). This is the manual, non-lexical complement to `teko::mem::buf_ptr` (which
+ * allocates a byte buffer into the ENCLOSING region); here the region is CHOSEN by the caller.
+ *
+ * The element type `T` is INFERRED from `init`'s resolved type — no method-level/free generic
+ * machinery is involved (this is a special checker+codegen builtin, not a Teko-bodied generic fn),
+ * so it sidesteps the generic-stack gaps entirely (see the #358 fixture header + DECISION_LOG).
+ * `init` may be any concrete non-void value; the returned `ptr<T>` is opaque in Teko, crossing the
+ * boundary only via the existing raw-pointer builtins (`bytes_from_ptr`, a raw `extern`).
+ *
+ * @param c      the raw call node
+ * @param env    the typing environment
+ * @param table  the folded type table
+ * @return       a `ptr<T>`-typed TCall (T = init's type), `NotRegionOp` if the path is not
+ *               region_alloc, or an error on wrong arity / a non-`uptr` region / a `void` init
+ * @throws       when the region argument is not a `uptr`, or `init` is a `void` expression
+ */
+fn type_region_alloc(c: parser::Call, env: Env, table: TypeTable) -> TExpr | NotRegionOp | error {
+    if c.callee.segments.len < 2 { return NotRegionOp { } }
+    let last = c.callee.segments[c.callee.segments.len - 1].name
+    let prev = c.callee.segments[c.callee.segments.len - 2].name
+    if last != "region_alloc" || prev != "mem" { return NotRegionOp { } }
+    let rooted = c.callee.segments.len == 2 || c.callee.segments[0].name == "teko"
+    if !rooted { return NotRegionOp { } }
+    if c.args.len != 2 { return error { message = "teko::mem::region_alloc expects two arguments (a `uptr` region handle and the value to allocate)" } }
+    let region = match type_expr(c.args[0], env, table) { TExpr as te => te; error as e => return e }
+    let region_ok = match region.type { Uptr => true; _ => false }
+    if !region_ok { return error { message = $"teko::mem::region_alloc's first argument must be a `uptr` region handle — got `{type_render(region.type)}`" } }
+    let init = match type_expr(c.args[1], env, table) { TExpr as te => te; error as e => return e }
+    if type_is_void(init.type) { return error { message = "teko::mem::region_alloc cannot allocate a `void` value" } }
+    mut ra_args = teko::list::push(teko::list::empty(), region)
+    ra_args = teko::list::push(ra_args, init)
+    TExpr { kind = TCall { callee = c.callee; args = ra_args; call_ns = "teko::mem"; is_closure_call = false; callee_type = Void { }; is_iface_dispatch = false; iface_slot = 0 }; type = Ptr { inner = init.type }; line = 0; col = 0 }
 }
 
 // (2026-07-01) call-site desugar for a `params`-variadic function `f`. Two shapes:
@@ -956,6 +1022,16 @@ fn type_call(c0: parser::Call, env: Env, table: TypeTable) -> TExpr | error {
         TExpr as te => return te
         error as e => return e
         NotMemFree => { }
+    }
+    match type_region_new(c, env, table) {
+        TExpr as te => return te
+        error as e => return e
+        NotRegionOp => { }
+    }
+    match type_region_alloc(c, env, table) {
+        TExpr as te => return te
+        error as e => return e
+        NotRegionOp => { }
     }
     let name = c.callee.segments[c.callee.segments.len - 1].name
     // panic / exit — injected GLOBAL diverging builtins (legislator's ruling — NO `never` type).

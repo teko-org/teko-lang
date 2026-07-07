@@ -1942,6 +1942,48 @@ fn emit_buf_ptr(buf: []byte, prog: checker::TProgram, c: checker::TCall, escapin
     cb(out, "))")
 }
 
+/**
+ * (#358) `teko::mem::region_alloc(region, init)` — bump-allocate ONE `T` into the caller-chosen
+ * region (`tk_region_alloc`, NOT the enclosing region `emit_buf_ptr` uses), copy `init` into it,
+ * and yield the freshly written `ptr<T>`. Emits a single-eval GNU statement-expression:
+ *   ({ T *_ra<N> = (T *)tk_region_alloc((tk_region *)(<region>), sizeof(T)); *_ra<N> = (<init>); _ra<N>; })
+ * The element type `T` is read off the call node's `.type` (`ptr<T>`, set by `type_region_alloc`).
+ * The returned `T *` IS the `ptr<T>` C representation (a `ptr<T>` lowers to `T *`), so no cast on
+ * the result. The region pointer round-trips through `uptr` (`uintptr_t` -> `tk_region *`).
+ *
+ * @param buf      the output buffer
+ * @param prog     the typed program (for type/region emission)
+ * @param e        the call expression node (carries the `ptr<T>` result type)
+ * @param c        the typed call (args[0] = region `uptr`, args[1] = `init`)
+ * @param escaping the escape-analysis frame set
+ * @param regions  the open region-frame stack
+ * @param fn_body  the enclosing function body (defer context)
+ * @param dctx     the defer context
+ * @return         the buffer with the region-alloc stmt-expr appended, or a codegen error
+ * @throws         when the result type is not `ptr<T>` (internal — the checker guarantees it)
+ */
+fn emit_region_alloc(buf: []byte, prog: checker::TProgram, e: checker::TExpr, c: checker::TCall, escaping: []str, regions: []RegionFrame, fn_body: []checker::TStatement, dctx: DeferCtx) -> []byte | error {
+    let elem = match e.type { checker::Ptr as p => match p.inner { checker::Type as t => t; null => return error { message = "codegen: region_alloc result is an opaque ptr (internal — checker must set ptr<T>)" } }; _ => return error { message = "codegen: region_alloc result is not a ptr type (internal)" } }
+    let ra = fresh_named("_ra", buf.len to i64)
+    mut out = cb(buf, "({ ")
+    out = match emit_type(out, prog, elem) { []byte as o => o; error as err => return err }
+    out = cb(out, " *")
+    out = cb(out, ra)
+    out = cb(out, " = (")
+    out = match emit_type(out, prog, elem) { []byte as o => o; error as err => return err }
+    out = cb(out, " *)tk_region_alloc((tk_region *)(")
+    out = match emit_expr_ctx(out, prog, checker::Void { }, c.args[0], escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
+    out = cb(out, "), sizeof(")
+    out = match emit_type(out, prog, elem) { []byte as o => o; error as err => return err }
+    out = cb(out, ")); *")
+    out = cb(out, ra)
+    out = cb(out, " = (")
+    out = match emit_expr_ctx(out, prog, elem, c.args[1], escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
+    out = cb(out, "); ")
+    out = cb(out, ra)
+    cb(out, "; })")
+}
+
 // (mem::free ruling 2026-07-03) `teko::mem::free(x)` → a void GNU stmt-expr that RECLAIMS x's heap
 // block and SCRUBS the binding so a later read yields empty/null, never the freed buffer:
 //   * []T   → tk_free_block(x.ptr, x.len*sizeof(elem)) parks the backing buffer for same-size reuse,
@@ -1966,7 +2008,10 @@ fn emit_mem_free(buf: []byte, prog: checker::TProgram, c: checker::TCall, escapi
             out = match cg_slice_typename(out, sl.element) { []byte as o => o; error as err => return err }
             cb(out, "){0}; })")
         }
-        checker::Named => {   // a class instance — drop its region, null the handle
+        checker::Named as nm => {
+            if checker::is_region_handle_name(nm.name, checker::type_table_of(prog)) {
+                return emit_region_free(buf, prog, nm.name, arg, escaping, regions, fn_body, dctx)
+            }
             mut out = cb(buf, "({ tk_region_drop((")
             out = match emit_expr_ctx(out, prog, checker::Void { }, arg, escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
             out = cb(out, ")->__region); (")
@@ -1975,6 +2020,41 @@ fn emit_mem_free(buf: []byte, prog: checker::TProgram, c: checker::TCall, escapi
         }
         _ => error { message = "codegen: mem::free on a non-heap type (internal — checker must gate)" }
     }
+}
+
+/**
+ * (#358) Lowers `teko::mem::free(a)` on a MANUAL REGION HANDLE (`unsafe #must_free type Arena`) to
+ * the bulk-drop `tk_region_drop_subtree`, which frees the handle's whole child region AND every
+ * object region parented under it (NOT the per-block free-list path a slice/class free takes), then
+ * scrubs the handle's `uptr` field to 0 so a later read never re-uses the freed `tk_region *`. Emits
+ * a void GNU statement-expression, mirroring `emit_mem_free`'s slice/class arms:
+ * `({ tk_region_drop_subtree((tk_region *)(a).region); (a).region = (uintptr_t)0; })`. The field is
+ * a by-value struct access (`.`); `field` is the handle's sole `uptr` field, recovered from the
+ * checker's `region_handle_field_name` (the same structural probe that routed here). The scrub
+ * matches the S2 free-and-null discipline `tk_region_drop_subtree` requires.
+ *
+ * @param buf      the output buffer
+ * @param prog     the typed program (for the region-handle field lookup)
+ * @param tname    the region-handle type name (already proven `is_region_handle_name`)
+ * @param arg      the handle expression to free (a mutable variable of `tname`)
+ * @param escaping the escape-analysis frame set
+ * @param regions  the open region-frame stack
+ * @param fn_body  the enclosing function body (defer context)
+ * @param dctx     the defer context
+ * @return         the buffer with the region-free stmt-expr appended, or a codegen error
+ * @throws         when emitting the handle expression fails (propagated from `emit_expr_ctx`)
+ */
+fn emit_region_free(buf: []byte, prog: checker::TProgram, tname: str, arg: checker::TExpr, escaping: []str, regions: []RegionFrame, fn_body: []checker::TStatement, dctx: DeferCtx) -> []byte | error {
+    let field = checker::region_handle_field_name(tname, checker::type_table_of(prog))
+    mut out = cb(buf, "({ tk_region_drop_subtree((tk_region *)(")
+    out = match emit_expr_ctx(out, prog, checker::Void { }, arg, escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
+    out = cb(out, ").")
+    out = cb(out, field)
+    out = cb(out, "); (")
+    out = match emit_expr_ctx(out, prog, checker::Void { }, arg, escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
+    out = cb(out, ").")
+    out = cb(out, field)
+    cb(out, " = (uintptr_t)0; })")
 }
 
 // (W10b.D3) a DYNAMIC contract-method call through an interface value's vtable, as a GNU
@@ -2083,6 +2163,12 @@ fn emit_call(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, e: c
     // teko::mem::free(x) — manual dealloc (the checker proved x is a mutable heap variable).
     if p.segments.len >= 2 && p.segments[p.segments.len - 2].name == "mem" && p.segments[p.segments.len - 1].name == "free" {
         return emit_mem_free(buf, prog, c, escaping, regions, fn_body, dctx)
+    }
+    if p.segments.len >= 2 && p.segments[p.segments.len - 2].name == "mem" && p.segments[p.segments.len - 1].name == "region_new" {
+        return cb(buf, "(uintptr_t)tk_region_new(tk_region_root())")
+    }
+    if p.segments.len >= 2 && p.segments[p.segments.len - 2].name == "mem" && p.segments[p.segments.len - 1].name == "region_alloc" {
+        return emit_region_alloc(buf, prog, e, c, escaping, regions, fn_body, dctx)
     }
     // E2 (native): err_loc/err_typed adorn an error VALUE with diagnostic position/types.
     // `error` is now the full tk_error struct (E2-NATIVE), so these call tk_error_loc /
