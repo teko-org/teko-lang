@@ -1,0 +1,57 @@
+# Code coverage upload (feeds the native "Restrict code coverage" ruleset).
+#
+# The ruleset rule enforces min% / max-drop from the uploaded Cobertura report; it needs
+# coverage data POSTED for both the base branch (baseline) and each PR. This job produces the
+# report with gen-1 (the compiler built from THIS ref — the released seed cannot parse the
+# umbrella's new syntax like `use ::[…]`) and uploads it. It is NON-BLOCKING (fail-on-error:
+# false, and it is NOT one of the required CI/Sanitizer/SAST gates): a failed upload must never
+# wedge a merge. The ruleset — not this job — is what gates.
+name: Code Coverage
+
+on:
+  push:
+    branches: [main, 'remodel/**']
+    paths-ignore: ['**.md', 'docs/**']
+  pull_request:
+    branches: [main, 'remodel/**']
+
+# code-quality:write is the fine-grained permission the upload API requires.
+permissions:
+  contents: read
+  code-quality: write
+
+concurrency:
+  group: coverage-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  coverage:
+    # Skip fork PRs (no code-quality:write on the fork token) and the merge queue.
+    if: >-
+      github.event_name == 'push' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Provision the released seed
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./scripts/ci_provision_teko.sh linux-x86_64
+
+      - name: Build gen-1 (the umbrella compiler — has the new syntax)
+        run: teko . -o bin
+
+      - name: Produce the Cobertura report (gen-1)
+        run: ./bin/teko test . --coverage
+
+      - name: Upload coverage to GitHub Code Quality
+        uses: actions/upload-code-coverage@v1
+        with:
+          file: cobertura.xml
+          language: C
+          label: code-coverage/teko
+          fail-on-error: false
