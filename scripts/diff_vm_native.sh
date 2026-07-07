@@ -89,9 +89,17 @@ NATIVE_ONLY=(
 # unsafe_field_in_safe_struct — U3 (#334) AC#4: a SAFE struct naming an unsafe-typed field
 #   (without the `unsafe` modifier itself) is a compile-time error (U2's #333 field-contagion
 #   gate), not a runtime one.
+# adopt_return_type_mismatch / adopt_break_outside_loop / adopt_break_unknown_label /
+#   adopt_unused_local — #337: `adopt { }` allows return/break/continue (unlike `defer`), so
+#   check_returns/check_labels/check_locals must still validate its body — these four fixtures
+#   each trip one of those checks from inside an adopt block.
 COMPILE_FAIL=(
     must_free_leak
     unsafe_field_in_safe_struct
+    adopt_return_type_mismatch
+    adopt_break_outside_loop
+    adopt_break_unknown_label
+    adopt_unused_local
 )
 
 is_expected_fail() {

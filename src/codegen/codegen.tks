@@ -6004,6 +6004,18 @@ fn emit_stmt(buf: []byte, s: checker::TStatement, in_main: bool, prog: checker::
  * drops the adopter region via the region-stack helpers (a plain drop — a SAFE leak of the object
  * subtree on that rare escape edge; the normal brace does the full subtree reclamation).
  *
+ * ACCEPTED LIMITATIONS (by design, per the issue — do not "fix" without a follow-on spine issue):
+ *   - DYNAMIC correctness only, no static escape gate: an object built with a lexical struct-init
+ *     directly inside `adopt { }` and then STORED into an outer binding (escaping the block)
+ *     DANGLES after the brace — its child region was subtree-dropped along with everything else.
+ *     `adopt` does not prove non-escape; that is deferred to a future spine-based confinement
+ *     analysis layered on top of this dynamic primitive.
+ *   - "lexically inside" is literal: an object built by a FACTORY/METHOD CALLED FROM inside
+ *     `adopt { }` (e.g. `Node::make(1)`) opens its per-object region parented to THAT FUNCTION's
+ *     own enclosing region (typically root, if the factory has no frame region of its own) — NOT
+ *     the caller's adopter. Such an object safely LEAKS to root (within-model, not reclaimed by
+ *     the adopt brace); only allocations the adopt body performs directly are captured.
+ *
  * @param buf       the C output buffer
  * @param a         the typed adopt statement
  * @param in_main   whether the enclosing function is the virtual-main
