@@ -2893,11 +2893,15 @@ fn type_binding(b: parser::Binding, env: Env, table: TypeTable) -> TypedStmt | e
     if bound_is_sentinel_slice {
         return error { message = "an empty list needs a known element type; annotate the binding (e.g. `mut xs: []i32 = teko::list::empty()`)" }
     }
-    // (MEM Step 0, R5) ESCAPE GATE — a reference cannot be bound to a LOCAL (parameter-only in this
-    // version). Binding a ref to a let/mut/const would let it outlive its target via the local; the
-    // only permitted ref handle is a function PARAMETER (which never reaches type_binding). The
-    // contains-ref check also catches an INFERRED `[]Ref` / `Ref?` bound from ANY source.
-    if type_contains_ref(bound) { return error { message = "a reference cannot be bound to a local (parameter-only in this version)" } }
+    // (MEM Step 0, R5 — RELAXED under the spine, #331 L2a) a BARE `Reference` bound is DEFERRED to
+    // the post-typing `check_ref_storability` gate: a ref bound to a local is sound iff the spine
+    // proves its param-rooted referent outlives it (the only ref value obtainable is a `Ref<T>`
+    // parameter read, whose referent is caller-owned). A NESTED ref (`[]Ref` / `Ref?` / variant) has
+    // no single referent anchor ⇒ KEEP the unconditional reject with the unchanged diagnostic.
+    match bound {
+        Reference => { }
+        _ => if type_contains_ref(bound) { return error { message = "a reference cannot be bound to a local (parameter-only in this version)" } }
+    }
     if !env.fn_unsafe && unsafe_carrying(bound, table) {
         return error { message = "safe fn binds a local of unsafe type — mark the enclosing fn `unsafe fn` or bind only safe types (§2: unsafe data cannot be held by a safe local)" }
     }
@@ -3000,10 +3004,14 @@ fn type_assign(a: parser::Assign, env: Env, table: TypeTable) -> TypedStmt | err
     }
     if !tb.is_mut { return error { message = $"cannot assign to immutable `{a.name}` — declare it `mut` (B.21)" } }
     mut v = match type_expr(a.value, env, table) { TExpr as te => te; error as e => return e }
-    // (MEM Step 0, R5) ESCAPE GATE — a plain `name = <…>` assign may not move a reference into a
-    // local (even nested in a slice/optional/variant). This is the assign twin of the binding gate;
-    // the `.value` deref-assign path above is exempt (it writes THROUGH a ref, which is allowed).
-    if type_contains_ref(tb.type) || type_contains_ref(v.type) { return error { message = "a reference cannot be bound to a local (parameter-only in this version)" } }
+    // (MEM Step 0, R5 — RELAXED under the spine, #331 L2a) the assign twin: a bare `Reference` →
+    // `Reference` reassign (`mut r = p; r = q`) is DEFERRED to `check_ref_storability`; anything else
+    // (a nested ref on either side) KEEPs the unconditional reject. The `.value` deref-assign path
+    // above is exempt (it writes THROUGH a ref).
+    let both_bare_ref = (match tb.type { Reference => true; _ => false }) && (match v.type { Reference => true; _ => false })
+    if !both_bare_ref {
+        if type_contains_ref(tb.type) || type_contains_ref(v.type) { return error { message = "a reference cannot be bound to a local (parameter-only in this version)" } }
+    }
     // The value must WIDEN into the target's type (B.14 case→variant, T→T?) OR be a fitting literal
     // that adopts it (C6) — same rule as an annotated binding (the single source of truth).
     if !assignable_to(v.type, tb.type, table) {
@@ -3632,7 +3640,175 @@ fn type_method(f: parser::Function, struct_name: str, env: Env, table: TypeTable
     } else {
         tb.stmts
     }
-    TFunction { name = f.name; type_params = f.type_params; type_constraints = f.type_constraints; params = fixed_params; return_type = ret; body = body; vis = f.vis; has_doc = f.has_doc; doc = f.doc; namespace = ""; file = ""; line = 0; col = 0; is_test = f.is_test; is_extern = false; c_symbol = ""; from_lib = "" }
+    let tf = TFunction { name = f.name; type_params = f.type_params; type_constraints = f.type_constraints; params = fixed_params; return_type = ret; body = body; vis = f.vis; has_doc = f.has_doc; doc = f.doc; namespace = ""; file = ""; line = 0; col = 0; is_test = f.is_test; is_extern = false; c_symbol = ""; from_lib = "" }
+    match check_ref_storability(tf) { null => { }; error as e => return e }   // (#331 L2a) R5 Ref-storability gate over the assembled method body
+    tf
+}
+
+/**
+ * (#331 L2a) POST-typing Ref-storability gate. `fn_spine` needs a fully-typed `TFunction`, so this
+ * runs ONCE per function after the body is assembled (it cannot be threaded into `type_binding`,
+ * which runs mid-typing before any `TFunction` exists). It ADMITS a ref bound / reassigned to a
+ * local IFF the spine proves the borrow's referent outlives it; otherwise it re-raises the R5 reject
+ * the inline gate deferred. The only ref value obtainable today is a `Ref<T>` parameter read, so an
+ * admitted ref-to-local is `bf = BfParam` and its referent is caller-owned (strictly outlives the
+ * local). An un-nameable RHS (`if`/`match`/call) yields `cell_of == -1` ⇒ conservative reject.
+ *
+ * @param tf  the fully-typed function
+ * @return    null when every ref-to-local is spine-sound, else the R5 reject error
+ */
+fn check_ref_storability(tf: TFunction) -> error? {
+    if !fn_has_ref_param(tf) { return null }
+    check_ref_storability_block(tf.body, fn_spine(tf))
+}
+
+/**
+ * True iff any of the function's parameters is a `Ref<T>`. The ONLY reference value obtainable today
+ * is a `Ref<T>` parameter read, so a function with no ref parameter can hold no ref-to-local — the
+ * gate skips it without building the spine (a per-function cost paid only where a ref can appear).
+ *
+ * @param tf  the typed function
+ * @return    true iff at least one parameter is a reference
+ */
+fn fn_has_ref_param(tf: TFunction) -> bool {
+    mut i = 0
+    loop {
+        if i >= tf.params.len { break }
+        let p = tf.params[i]
+        if p.has_type {
+            if type_ann_is_ref(p.type_ann) { return true }
+        }
+        i++
+    }
+    false
+}
+
+/**
+ * Walk a statement block, checking each ref-to-local bind/assign and recursing into nested blocks.
+ *
+ * @param stmts  the typed statement block
+ * @param spine  the function's spine fact
+ * @return       null when sound, else the first reject error
+ */
+fn check_ref_storability_block(stmts: []TStatement, spine: Spine) -> error? {
+    mut i = 0
+    loop {
+        if i >= stmts.len { break }
+        match check_ref_storability_stmt(stmts[i], spine) { error as e => return e; null => { } }
+        i++
+    }
+    null
+}
+
+/**
+ * Check one statement: a ref-to-local `TBinding` / simple `TAssign` is gated by the spine; loop /
+ * defer / adopt bodies and value-position `if`/`match` arms recurse so a branch-nested ref-bind is
+ * not missed (mirrors the cell-universe walk).
+ *
+ * @param s      the typed statement
+ * @param spine  the function's spine fact
+ * @return       null when sound, else the reject error
+ */
+fn check_ref_storability_stmt(s: TStatement, spine: Spine) -> error? {
+    match s {
+        TBinding as b => match check_ref_bind_storable(b, spine) { error as e => return e; null => check_ref_storability_expr(b.value, spine) }
+        TAssign as a => match check_ref_assign_storable(a, spine) { error as e => return e; null => check_ref_storability_expr(a.value, spine) }
+        TLoopStmt as l => check_ref_storability_block(l.body, spine)
+        TDeferStmt as d => check_ref_storability_block(d.body, spine)
+        TAdoptStmt as a => check_ref_storability_block(a.body, spine)
+        TReturn as r => if r.has_value { check_ref_storability_expr(r.value, spine) } else { null }
+        TExprStmt as es => check_ref_storability_expr(es.expr, spine)
+        TBreakStmt => null
+        TContinueStmt => null
+    }
+}
+
+/**
+ * Recurse the Ref-storability check into a value-position `if`/`match`'s arm bodies (each a statement
+ * block); any other expression carries no block, so it is a no-op.
+ *
+ * @param e      the typed expression
+ * @param spine  the function's spine fact
+ * @return       null when sound, else the reject error
+ */
+fn check_ref_storability_expr(e: TExpr, spine: Spine) -> error? {
+    match e.kind {
+        TIfExpr as f => match check_ref_storability_block(f.then_blk, spine) { error as er => return er; null => if f.has_else { check_ref_storability_block(f.else_blk, spine) } else { null } }
+        TMatchExpr as m => check_ref_storability_match(m, spine)
+        _ => null
+    }
+}
+
+/**
+ * Recurse the Ref-storability check into every match arm body.
+ *
+ * @param m      the typed match expression
+ * @param spine  the function's spine fact
+ * @return       null when sound, else the reject error
+ */
+fn check_ref_storability_match(m: TMatchExpr, spine: Spine) -> error? {
+    mut i = 0
+    loop {
+        if i >= m.arms.len { break }
+        match check_ref_storability_block(m.arms[i].body, spine) { error as e => return e; null => { } }
+        i++
+    }
+    null
+}
+
+/**
+ * Gate a `TBinding`: only a bare-`Reference`-bound `SimpleName` is a ref-to-local (nested-ref bounds
+ * were rejected inline); check the spine. A destructure names no single ref cell.
+ *
+ * @param b      the typed binding
+ * @param spine  the function's spine fact
+ * @return       null when sound, else the reject error
+ */
+fn check_ref_bind_storable(b: TBinding, spine: Spine) -> error? {
+    match b.bound {
+        Reference => match b.target {
+            parser::SimpleName as sn => ref_borrow_or_error(spine, sn.name, b.value)
+            parser::DestructurePattern => null
+        }
+        _ => null
+    }
+}
+
+/**
+ * Gate a `TAssign`: only a bare-`Reference` simple-name reassign is a ref-to-local; a field / deref
+ * write names no single ref-to-local pair.
+ *
+ * @param a      the typed assignment
+ * @param spine  the function's spine fact
+ * @return       null when sound, else the reject error
+ */
+fn check_ref_assign_storable(a: TAssign, spine: Spine) -> error? {
+    match a.kind {
+        parser::AssignKind::Simple => match a.bound { Reference => ref_borrow_or_error(spine, a.name, a.value); _ => null }
+        _ => null
+    }
+}
+
+/**
+ * The core spine query for one ref-to-local site: ADMIT iff `ref_target_outlives(borrow = the storage
+ * local's cell, referent = the RHS source cell)` holds. The bf-inherit writer set `bf[borrow] =
+ * BfParam` so the tag is meaningful; an un-nameable RHS or an un-found cell (`cell_of == -1`) is a
+ * conservative reject with the UNCHANGED R5 diagnostic (no fixture drift).
+ *
+ * @param spine   the function's spine fact
+ * @param target  the ref-to-local binding/assign's storage local name
+ * @param value   the RHS expression (its bare-`TVar` name is the referent)
+ * @return        null when the borrow provably outlives, else the R5 reject error
+ */
+fn ref_borrow_or_error(spine: Spine, target: str, value: TExpr) -> error? {
+    let borrow = cell_of(spine, target)
+    let referent = cell_of(spine, alias_src_name(value))
+    if borrow >= 0 {
+        if referent >= 0 {
+            if ref_target_outlives(spine, borrow to u32, referent to u32) { return null }
+        }
+    }
+    error { message = "a reference cannot be bound to a local (parameter-only in this version)" }
 }
 
 /**
@@ -3698,7 +3874,9 @@ fn type_function(f: parser::Function, env: Env, table: TypeTable) -> TFunction |
     let lc = check_labels(tb.stmts, teko::list::empty(), false, teko::list::empty())   // W5-cf-2: loop labels resolve + are unique
     if lc.failed { return error { message = lc.message } }
     match check_must_free(f, tbl, env.cur_ns, tb.stmts, table) { null => { }; error as e => return e }
-    TFunction { name = f.name; type_params = f.type_params; type_constraints = f.type_constraints; params = f.params; return_type = ret; body = tb.stmts; vis = f.vis; has_doc = f.has_doc; doc = f.doc; namespace = ""; file = ""; line = 0; col = 0; is_test = f.is_test; is_extern = false; c_symbol = ""; from_lib = "" }   // (#49/E3) namespace/file/line stamped by type_item from the parsed item
+    let tf = TFunction { name = f.name; type_params = f.type_params; type_constraints = f.type_constraints; params = f.params; return_type = ret; body = tb.stmts; vis = f.vis; has_doc = f.has_doc; doc = f.doc; namespace = ""; file = ""; line = 0; col = 0; is_test = f.is_test; is_extern = false; c_symbol = ""; from_lib = "" }   // (#49/E3) namespace/file/line stamped by type_item from the parsed item
+    match check_ref_storability(tf) { null => { }; error as e => return e }   // (#331 L2a) R5 Ref-storability gate over the assembled body
+    tf
 }
 
 // (OOP A1, 2026-07-01) type-check EVERY method body on a struct TypeDecl and stamp each into a

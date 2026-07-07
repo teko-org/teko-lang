@@ -943,6 +943,156 @@ fn alias_src_name(e: TExpr) -> str {
 }
 
 /**
+ * Return the borrowed-from axis with index `i` replaced by `v` (parallel arrays rebuilt by copy —
+ * the compiler corpus has no in-place slice write for a value element). Mirrors `set_us`.
+ *
+ * @param bf  the borrowed-from axis
+ * @param i   the cell index to replace
+ * @param v   the new borrowed-from value
+ * @return    the axis with element `i` set to `v`
+ */
+fn set_bf(bf: []BorrowedFrom, i: u32, v: BorrowedFrom) -> []BorrowedFrom {
+    mut acc: []BorrowedFrom = teko::list::empty()
+    mut k = 0
+    loop {
+        if k >= bf.len { break }
+        if k to u32 == i {
+            acc = teko::list::push(acc, v)
+        } else {
+            acc = teko::list::push(acc, bf[k])
+        }
+        k++
+    }
+    acc
+}
+
+/**
+ * The borrowed-from INHERIT sweep over one statement block (#331 L2a). A ref-to-local binding
+ * `let r = p` (whose only legal RHS today is a bare `Reference` param read — there is no address-of
+ * operator) inherits the source cell's `bf`: `bf[r] := bf[p]` (always `BfParam` under param-only
+ * refs). Single-assignment (a local is the target of ≤ 1 binding); recurses into nested blocks so a
+ * ref-to-local inside a loop / adopter / if-match arm is not missed. Return-value threaded.
+ *
+ * @param body   the typed statement block
+ * @param cells  the cell universe
+ * @param bf     the borrowed-from axis so far
+ * @return       the axis with this block's ref-to-local inheritances applied
+ */
+fn bf_transfer_block(body: []TStatement, cells: []Cell, bf: []BorrowedFrom) -> []BorrowedFrom {
+    mut acc = bf
+    mut i = 0
+    loop {
+        if i >= body.len { break }
+        acc = bf_transfer_stmt(body[i], cells, acc)
+        i++
+    }
+    acc
+}
+
+/**
+ * Descend the bf-inherit sweep into an expression's control-flow arm bodies (a value-position
+ * `if` / `match` carries a statement block per branch). Mirrors `transfer_expr`.
+ *
+ * @param e      the typed expression
+ * @param cells  the cell universe
+ * @param bf     the borrowed-from axis so far
+ * @return       the axis with the arm bodies' inheritances applied
+ */
+fn bf_transfer_expr(e: TExpr, cells: []Cell, bf: []BorrowedFrom) -> []BorrowedFrom {
+    match e.kind {
+        TIfExpr as f => bf_transfer_block(f.else_blk, cells, bf_transfer_block(f.then_blk, cells, bf))
+        TMatchExpr as m => bf_transfer_match(m, cells, bf)
+        _ => bf
+    }
+}
+
+/**
+ * The bf-inherit sweep over a match expression's arm bodies. Return-value threaded. Mirrors
+ * `transfer_match`.
+ *
+ * @param m      the typed match expression
+ * @param cells  the cell universe
+ * @param bf     the borrowed-from axis so far
+ * @return       the axis with every arm body's inheritances applied
+ */
+fn bf_transfer_match(m: TMatchExpr, cells: []Cell, bf: []BorrowedFrom) -> []BorrowedFrom {
+    mut acc = bf
+    mut i = 0
+    loop {
+        if i >= m.arms.len { break }
+        acc = bf_transfer_block(m.arms[i].body, cells, acc)
+        i++
+    }
+    acc
+}
+
+/**
+ * The bf-inherit sweep for one statement. Only a `TBinding` inherits (writes `bf`); a `TAssign` never
+ * writes `bf` (the assign's borrowed-from is the single-assigned binding-time value the gate reads) —
+ * it only recurses into its value's arm bodies. Loop / defer / adopt bodies and if / match arms
+ * recurse so a nested ref-to-local is reached. Mirrors `transfer_stmt`.
+ *
+ * @param s      the typed statement
+ * @param cells  the cell universe
+ * @param bf     the borrowed-from axis so far
+ * @return       the axis with this statement's ref-to-local inheritance applied
+ */
+fn bf_transfer_stmt(s: TStatement, cells: []Cell, bf: []BorrowedFrom) -> []BorrowedFrom {
+    match s {
+        TBinding as b => bf_transfer_expr(b.value, cells, bf_transfer_binding(b, cells, bf))
+        TAssign as a => bf_transfer_expr(a.value, cells, bf)
+        TLoopStmt as l => bf_transfer_block(l.body, cells, bf)
+        TDeferStmt as d => bf_transfer_block(d.body, cells, bf)
+        TAdoptStmt as a => bf_transfer_block(a.body, cells, bf)
+        TReturn as r => if r.has_value { bf_transfer_expr(r.value, cells, bf) } else { bf }
+        TExprStmt as es => bf_transfer_expr(es.expr, cells, bf)
+        TBreakStmt => bf
+        TContinueStmt => bf
+    }
+}
+
+/**
+ * The bf-inherit for a binding: a ref-to-local `let r = p` (bound carries a `Reference` and the RHS
+ * is a bare `TVar`) inherits `bf[r] := bf[p]`. A non-ref bound, a non-bare RHS, or an un-found cell
+ * leaves `bf` unchanged (the gate then reads `BfNone` and conservatively rejects). A destructure
+ * pattern names no single ref cell.
+ *
+ * @param b      the typed binding
+ * @param cells  the cell universe
+ * @param bf     the borrowed-from axis so far
+ * @return       the axis with this binding's inheritance applied (or unchanged)
+ */
+fn bf_transfer_binding(b: TBinding, cells: []Cell, bf: []BorrowedFrom) -> []BorrowedFrom {
+    if !type_contains_ref(b.bound) { return bf }
+    match b.value.kind {
+        TVar as v => match b.target {
+            parser::SimpleName as sn => bf_inherit_at(cells, bf, sn.name, v.name)
+            parser::DestructurePattern => bf
+        }
+        _ => bf
+    }
+}
+
+/**
+ * Write `bf[dst] := bf[src]` when both the destination local `dst` and the source `src` are cells in
+ * this function's universe; otherwise leave `bf` unchanged (a conservative non-inherit ⇒ the gate
+ * reads `BfNone` for `dst` and rejects).
+ *
+ * @param cells  the cell universe
+ * @param bf     the borrowed-from axis so far
+ * @param dst    the ref-to-local binding's target name
+ * @param src    the RHS source variable name
+ * @return       the axis with `dst` inheriting `src`'s borrowed-from (or unchanged)
+ */
+fn bf_inherit_at(cells: []Cell, bf: []BorrowedFrom, dst: str, src: str) -> []BorrowedFrom {
+    let di = cell_index(cells, dst, "")
+    if di < 0 { return bf }
+    let si = cell_index(cells, src, "")
+    if si < 0 { return bf }
+    set_bf(bf, di to u32, bf[si to u32])
+}
+
+/**
  * The spine fact for one function — a bounded, per-function points-to / uniqueness lattice layered
  * BESIDE `fn_escaping_vars` (the name set stays byte-identical; this only ever CERTIFIES a subset of
  * what the name set over-marked). Builds the finite cell universe of `f`, seeds each axis at its
@@ -960,7 +1110,7 @@ pub fn fn_spine(f: TFunction) -> Spine {
     let cells = add_block_cells(f.body, add_param_cells(f, teko::list::empty()))
     let us = transfer_block(f.body, cells, seed_us(cells))
     let pt_state = pt_transfer_block(f.body, cells, 0, false, PtTransferState { pt = seed_pt(cells); next_region = 0 })
-    Spine { cells = cells; pt = pt_state.pt; bf = seed_bf(cells); us = us }
+    Spine { cells = cells; pt = pt_state.pt; bf = bf_transfer_block(f.body, cells, seed_bf(cells)); us = us }
 }
 
 /**
