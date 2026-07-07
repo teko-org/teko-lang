@@ -1317,3 +1317,180 @@ fn sp_free_call(name: str) -> TExpr {
         sp_exprstmt(sp_free_call("xs")))
     match check_ref_storability(sp_fn(teko::list::empty(), body)) { null => teko::assert::is_true(false); error => teko::assert::is_true(true) }
 }
+
+// ── L2b capture sweep (option b): launder captures join `us = shared` ─────────
+
+/**
+ * A NON-`free` call over the given args (callee `push`, ns `teko::list`), typed non-scalar — the
+ * capturing-call shape whose non-scalar bare-local args the capture sweep marks shared.
+ *
+ * @param args  the call's typed arguments
+ * @return      a `TCall` typed expression
+ */
+fn sp_nonfree_call(args: []TExpr) -> TExpr {
+    TExpr { kind = TCall { callee = sp_path("push"); args = args; call_ns = "teko::list"; is_closure_call = false; callee_type = Void { }; is_iface_dispatch = false; iface_slot = 0 }; type = sp_nonscalar(); line = 0; col = 0 }
+}
+
+/**
+ * A CANONICAL `teko::mem::free(name)` call with a full three-segment path — the shape
+ * `is_mem_free_call` recognizes (so the capture sweep SKIPS its argument as a consume).
+ *
+ * @param name  the freed variable's name
+ * @return      a `teko::mem::free` `TCall` typed expression
+ */
+fn sp_mem_free_call(name: str) -> TExpr {
+    let segs = teko::list::push(teko::list::push(teko::list::push(teko::list::empty(), parser::Segment { name = "teko" }), parser::Segment { name = "mem" }), parser::Segment { name = "free" })
+    TExpr { kind = TCall { callee = parser::Path { segments = segs }; args = teko::list::push(teko::list::empty(), sp_nonscalar_var(name)); call_ns = "teko::mem"; is_closure_call = false; callee_type = Void { }; is_iface_dispatch = false; iface_slot = 0 }; type = Void { }; line = 0; col = 0 }
+}
+
+/**
+ * A single-field struct-init `{ f = value }` — the field-STORE shape whose non-scalar bare-local
+ * field value the capture sweep marks shared.
+ *
+ * @param value  the field's typed value expression
+ * @return       a `TStructInit` typed expression
+ */
+fn sp_struct_init(value: TExpr) -> TExpr {
+    TExpr { kind = TStructInit { field_names = teko::list::push(teko::list::empty(), "f"); field_vals = teko::list::push(teko::list::empty(), value) }; type = sp_nonscalar(); line = 0; col = 0 }
+}
+
+/**
+ * A `TCall` value with the given path segment names and `call_ns` — for probing `is_mem_free_call`'s
+ * shape arms directly.
+ *
+ * @param names  the callee path's segment names
+ * @param ns     the resolved call namespace
+ * @return       a `TCall` value
+ */
+fn sp_tcall_segs(names: []str, ns: str) -> TCall {
+    mut segs: []parser::Segment = teko::list::empty()
+    mut i = 0
+    loop {
+        if i >= names.len { break }
+        segs = teko::list::push(segs, parser::Segment { name = names[i] })
+        i++
+    }
+    TCall { callee = parser::Path { segments = segs }; args = teko::list::empty(); call_ns = ns; is_closure_call = false; callee_type = Void { }; is_iface_dispatch = false; iface_slot = 0 }
+}
+
+/**
+ * (#331 L2b, option b) A non-scalar bare local passed as a NON-`free` call argument is CAPTURED —
+ * the capture sweep joins it `us = shared`, so `is_unique_at` is false (closes the container-store /
+ * call-return launder class: `ys = push(ys, xs); free(xs)`).
+ */
+#test fn spine_capture_call_arg_marks_operand_shared() {
+    let mk = sp_let("xs", sp_nonfree_call(teko::list::empty()))
+    let cap = sp_let("z", sp_nonfree_call(teko::list::push(teko::list::empty(), sp_nonscalar_var("xs"))))
+    let s = fn_spine(sp_fn(teko::list::empty(), teko::list::push(teko::list::push(teko::list::empty(), mk), cap)))
+    teko::assert::is_false(is_unique_at(s, cell_of(s, "xs") to u32))
+}
+
+/**
+ * (#331 L2b, option b) The self-thread exclusion: `xs = push(xs, …)` threads `xs` through the call
+ * and re-binds it — NOT a capture — so `xs` stays unique (the builder-then-`free` idiom, `mem_free`
+ * fixture, is not over-rejected).
+ */
+#test fn spine_capture_self_thread_call_arg_stays_unique() {
+    let mk = sp_let("xs", sp_nonfree_call(teko::list::empty()))
+    let self_thread = sp_assign_simple("xs", sp_nonfree_call(teko::list::push(teko::list::empty(), sp_nonscalar_var("xs"))))
+    let s = fn_spine(sp_fn(teko::list::empty(), teko::list::push(teko::list::push(teko::list::empty(), mk), self_thread)))
+    teko::assert::is_true(is_unique_at(s, cell_of(s, "xs") to u32))
+}
+
+/**
+ * (#331 L2b, option b) A non-scalar bare local stored into a struct FIELD (`{ f = xs }`) escapes —
+ * the capture sweep marks it shared.
+ */
+#test fn spine_capture_struct_init_store_marks_shared() {
+    let mk = sp_let("xs", sp_nonfree_call(teko::list::empty()))
+    let store = sp_let("box", sp_struct_init(sp_nonscalar_var("xs")))
+    let s = fn_spine(sp_fn(teko::list::empty(), teko::list::push(teko::list::push(teko::list::empty(), mk), store)))
+    teko::assert::is_false(is_unique_at(s, cell_of(s, "xs") to u32))
+}
+
+/**
+ * (#331 L2b, option b) A field-EXTRACT of a non-scalar interior (`let y = obj.data`) aliases `obj`'s
+ * interior — the capture sweep marks the base `obj` shared (closes `let y = obj.data; free(obj)`).
+ */
+#test fn spine_capture_field_extract_marks_base_shared() {
+    let mkobj = sp_let("obj", sp_nonfree_call(teko::list::empty()))
+    let ext = sp_let("y", sp_field("obj", "data", sp_nonscalar()))
+    let s = fn_spine(sp_fn(teko::list::empty(), teko::list::push(teko::list::push(teko::list::empty(), mkobj), ext)))
+    teko::assert::is_false(is_unique_at(s, cell_of(s, "obj") to u32))
+}
+
+/**
+ * (#331 L2b, option b) A SCALAR field read (`let n = obj.len`) copies a stack member — no alias — so
+ * the base `obj` stays unique (the `.len`-before-`free` false-positive is avoided).
+ */
+#test fn spine_capture_scalar_field_extract_stays_unique() {
+    let mkobj = sp_let("obj", sp_nonfree_call(teko::list::empty()))
+    let ext = sp_let("n", sp_field("obj", "len", sp_i64()))
+    let s = fn_spine(sp_fn(teko::list::empty(), teko::list::push(teko::list::push(teko::list::empty(), mkobj), ext)))
+    teko::assert::is_true(is_unique_at(s, cell_of(s, "obj") to u32))
+}
+
+/**
+ * (#331 L2b, option b) The self-defeat guard: a canonical `teko::mem::free(xs)` is a CONSUME, not a
+ * capture — the sweep skips it, so `xs` stays unique and a UNIQUE free is admitted (never rejects
+ * itself).
+ */
+#test fn spine_capture_mem_free_call_does_not_capture_its_arg() {
+    let mk = sp_let("xs", sp_nonfree_call(teko::list::empty()))
+    let freeit = sp_exprstmt(sp_mem_free_call("xs"))
+    let s = fn_spine(sp_fn(teko::list::empty(), teko::list::push(teko::list::push(teko::list::empty(), mk), freeit)))
+    teko::assert::is_true(is_unique_at(s, cell_of(s, "xs") to u32))
+}
+
+/**
+ * (#331 L2b, option b) The capture sweep recurses into a loop body — a capture inside `loop { … }`
+ * still joins shared (mirrors the direct-alias transfer's block recursion).
+ */
+#test fn spine_capture_recurses_into_loop_body() {
+    let mk = sp_let("xs", sp_nonfree_call(teko::list::empty()))
+    let cap = sp_let("z", sp_nonfree_call(teko::list::push(teko::list::empty(), sp_nonscalar_var("xs"))))
+    let lp = sp_loop(teko::list::push(teko::list::empty(), cap))
+    let s = fn_spine(sp_fn(teko::list::empty(), teko::list::push(teko::list::push(teko::list::empty(), mk), lp)))
+    teko::assert::is_false(is_unique_at(s, cell_of(s, "xs") to u32))
+}
+
+/**
+ * (#331 L2b, option b) `is_mem_free_call` shape probe — coverage of every reject arm: a short path
+ * (`< 2` segments), a wrong last segment, a wrong second-to-last segment, and an unrooted
+ * `foo::mem::free`; plus the canonical accept.
+ */
+#test fn spine_is_mem_free_call_covers_shapes() {
+    teko::assert::is_false(is_mem_free_call(sp_tcall_segs(teko::list::push(teko::list::empty(), "free"), "teko::mem")))
+    teko::assert::is_false(is_mem_free_call(sp_tcall_segs(teko::list::push(teko::list::push(teko::list::empty(), "mem"), "alloc"), "teko::mem")))
+    teko::assert::is_false(is_mem_free_call(sp_tcall_segs(teko::list::push(teko::list::push(teko::list::empty(), "list"), "free"), "teko::list")))
+    teko::assert::is_false(is_mem_free_call(sp_tcall_segs(teko::list::push(teko::list::push(teko::list::push(teko::list::empty(), "foo"), "mem"), "free"), "foo::mem")))
+    teko::assert::is_true(is_mem_free_call(sp_tcall_segs(teko::list::push(teko::list::push(teko::list::push(teko::list::empty(), "teko"), "mem"), "free"), "teko::mem")))
+}
+
+/** A fresh capturing call `push(xs)` — its non-scalar bare-local arg `xs` is a capture operand. */
+fn sp_cap() -> TExpr { sp_nonfree_call(teko::list::push(teko::list::empty(), sp_nonscalar_var("xs"))) }
+
+/** Wrap `e` in a `TExpr` of the given kind, typed non-scalar (the wrapper's own type is never read). */
+fn sp_wrap(k: TExprKind) -> TExpr { TExpr { kind = k; type = sp_nonscalar(); line = 0; col = 0 } }
+
+/**
+ * (#331 L2b, option b) The capture sweep RECURSES through every compound-expression arm — a capturing
+ * call nested inside a binary, unary, comparison, cast, coalesce, index, interpolation, `in`, and
+ * array literal each still reaches `xs` and joins it shared (monotone, so one shared handle suffices).
+ * Covers `capture_expr`'s compound arms + `capture_cmp` + `capture_array`.
+ */
+#test fn spine_capture_recurses_through_compound_exprs() {
+    mut body: []TStatement = teko::list::push(teko::list::empty(), sp_let("xs", sp_nonfree_call(teko::list::empty())))
+    body = teko::list::push(body, sp_let("a", sp_wrap(TBinary { op = lexer::TokenKind::Assign; left = sp_cap(); right = sp_i64_lit(0) })))
+    body = teko::list::push(body, sp_let("b", sp_wrap(TUnary { op = lexer::TokenKind::Assign; operand = sp_cap() })))
+    body = teko::list::push(body, sp_let("c", sp_wrap(TCompare { first = sp_cap(); rest = teko::list::push(teko::list::empty(), TCmpTerm { op = lexer::TokenKind::Assign; operand = sp_cap() }) })))
+    body = teko::list::push(body, sp_let("d", sp_wrap(TCast { expr = sp_cap() })))
+    body = teko::list::push(body, sp_let("k", sp_wrap(TSafeFieldAccess { receiver = sp_cap(); field = "x" })))
+    body = teko::list::push(body, sp_let("e", sp_wrap(TCoalesce { left = sp_cap(); right = sp_cap() })))
+    body = teko::list::push(body, sp_let("g", sp_wrap(TIndex { receiver = sp_cap(); index = sp_cap() })))
+    body = teko::list::push(body, sp_let("h", sp_wrap(TInterp { pieces = teko::list::push(teko::list::empty(), ""); holes = teko::list::push(teko::list::empty(), sp_cap()); specs = teko::list::push(teko::list::empty(), TFSpec { kind = TFSpecNone { } }) })))
+    body = teko::list::push(body, sp_let("i", sp_wrap(TInExpr { lhs = sp_cap(); elems = teko::list::push(teko::list::empty(), sp_cap()) })))
+    body = teko::list::push(body, sp_let("j", sp_wrap(TArrayLit { elements = teko::list::push(teko::list::empty(), TArrayElem { is_spread = false; expr = sp_cap() }) })))
+    let s = fn_spine(sp_fn(teko::list::empty(), body))
+    teko::assert::is_false(is_unique_at(s, cell_of(s, "xs") to u32))
+}

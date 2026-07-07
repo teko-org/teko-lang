@@ -943,6 +943,303 @@ fn alias_src_name(e: TExpr) -> str {
 }
 
 /**
+ * Is `e` a bare non-scalar local read (a `TVar` of heap type)? The CAPTURE-source shape: only a
+ * heap-carrying local passed by value can be aliased by a capturing callee / container / interior
+ * handle. A scalar copy carries no shared handle.
+ *
+ * @param e  the typed expression
+ * @return   true iff `e` is a bare `TVar` read of non-scalar type
+ */
+fn is_nonscalar_bare_local(e: TExpr) -> bool {
+    if !expr_is_bare_local(e) { return false }
+    !type_is_scalar(e.type)
+}
+
+/**
+ * Is `c` a `teko::mem::free(_)` call? Mirrors `typer.tks`'s `type_mem_free` shape probe (last two
+ * segments `mem::free`, rooted at `teko` or bare). The capture sweep must SKIP such a call: its
+ * argument is CONSUMED (the affine gate's subject), never captured — else `free(x)` would mark its
+ * own `x` shared and the gate would reject every free.
+ *
+ * @param c  the typed call
+ * @return   true iff `c` is a canonical `teko::mem::free` call
+ */
+fn is_mem_free_call(c: TCall) -> bool {
+    if c.callee.segments.len < 2 { return false }
+    if c.callee.segments[c.callee.segments.len - 1].name != "free" { return false }
+    if c.callee.segments[c.callee.segments.len - 2].name != "mem" { return false }
+    c.callee.segments.len == 2 || c.callee.segments[0].name == "teko"
+}
+
+/**
+ * The self-thread exclusion name for a bind target: the `SimpleName` being bound (`x` in `let x =
+ * …`), "" for a destructure. A non-scalar local re-bound to a call over ITSELF (`x = push(x, item)`)
+ * is threaded, not captured — the capture sweep excludes it so the builder-then-`free` idiom
+ * (`mem_free` fixture) is not over-rejected.
+ *
+ * @param t  the bind target
+ * @return   the target's simple name, "" if not a simple name
+ */
+fn bind_target_name(t: parser::BindTarget) -> str {
+    match t {
+        parser::SimpleName as sn => sn.name
+        parser::DestructurePattern => ""
+    }
+}
+
+/**
+ * The capture sweep over one statement block (PR-3 / L2b completion): a non-scalar bare local that
+ * ESCAPES into an aliasing position — passed as a non-`free` call argument, stored into a struct
+ * field, or its non-scalar interior extracted (`let y = obj.data`) — joins `UsShared`, so a later
+ * `free` of it is rejected as aliased. Layered BESIDE the direct-alias `transfer_block`; both only
+ * CLIMB `us` (monotone), so the composite is order-independent. Return-value threaded (a functional
+ * accumulate) for engine-deterministic output.
+ *
+ * @param body   the typed statement block
+ * @param cells  the cell universe
+ * @param us     the unique-vs-shared axis so far (post direct-alias transfer)
+ * @return       the axis with this block's captures joined to `UsShared`
+ */
+fn capture_block(body: []TStatement, cells: []Cell, us: []Unique) -> []Unique {
+    mut acc = us
+    mut i = 0
+    loop {
+        if i >= body.len { break }
+        acc = capture_stmt(body[i], cells, acc)
+        i++
+    }
+    acc
+}
+
+/**
+ * The capture sweep for one statement. A binding / assignment derives its self-thread exclusion (the
+ * target name) and marks its RHS's field-extract + escaping captures; a loop / defer / adopt body
+ * recurses; an expr-statement / return value sweeps with no exclusion.
+ *
+ * @param s      the typed statement
+ * @param cells  the cell universe
+ * @param us     the unique-vs-shared axis so far
+ * @return       the axis with this statement's captures joined to `UsShared`
+ */
+fn capture_stmt(s: TStatement, cells: []Cell, us: []Unique) -> []Unique {
+    match s {
+        TBinding as b => capture_binding(b, cells, us)
+        TAssign as a => capture_assign(a, cells, us)
+        TLoopStmt as l => capture_block(l.body, cells, us)
+        TDeferStmt as d => capture_block(d.body, cells, us)
+        TAdoptStmt as a => capture_block(a.body, cells, us)
+        TReturn as r => if r.has_value { capture_expr(r.value, cells, us, "") } else { us }
+        TExprStmt as es => capture_expr(es.expr, cells, us, "")
+        TBreakStmt => us
+        TContinueStmt => us
+    }
+}
+
+/**
+ * The capture sweep for a binding `let y = rhs`: mark `rhs`'s field-extract (`obj.data`) alias, then
+ * sweep `rhs`'s escaping captures excluding `y` (the self-thread name).
+ *
+ * @param b      the typed binding
+ * @param cells  the cell universe
+ * @param us     the unique-vs-shared axis so far
+ * @return       the axis with this binding's captures joined
+ */
+fn capture_binding(b: TBinding, cells: []Cell, us: []Unique) -> []Unique {
+    capture_expr(b.value, cells, mark_field_extract(b.value, cells, us), bind_target_name(b.target))
+}
+
+/**
+ * The capture sweep for an assignment `y = rhs`: mark `rhs`'s field-extract alias, then sweep its
+ * escaping captures excluding `y` (self-thread) for a simple write; a field / deref write names no
+ * excludable self.
+ *
+ * @param a      the typed assignment
+ * @param cells  the cell universe
+ * @param us     the unique-vs-shared axis so far
+ * @return       the axis with this assignment's captures joined
+ */
+fn capture_assign(a: TAssign, cells: []Cell, us: []Unique) -> []Unique {
+    let excl = match a.kind {
+        parser::AssignKind::Simple => a.name
+        _ => ""
+    }
+    capture_expr(a.value, cells, mark_field_extract(a.value, cells, us), excl)
+}
+
+/**
+ * Mark the FIELD-EXTRACT alias of a binding / assign RHS: `let y = obj.data` where `obj` is a bare
+ * non-scalar local and the extracted field is itself non-scalar aliases `y` to `obj`'s interior, so
+ * `obj` joins `UsShared` (a later `free(obj)` would dangle `y`). A SCALAR field read (`xs.len`) copies
+ * a stack member — no alias — and is left unique.
+ *
+ * @param v      the typed RHS expression
+ * @param cells  the cell universe
+ * @param us     the unique-vs-shared axis so far
+ * @return       the axis with the field-extract base (if any) joined to `UsShared`
+ */
+fn mark_field_extract(v: TExpr, cells: []Cell, us: []Unique) -> []Unique {
+    match v.kind {
+        TFieldAccess as fa => {
+            if type_is_scalar(v.type) { return us }
+            if !is_nonscalar_bare_local(fa.receiver) { return us }
+            join_us_at(cells, us, alias_src_name(fa.receiver), "")
+        }
+        _ => us
+    }
+}
+
+/**
+ * The capture sweep over an expression: a non-`free` call's non-scalar bare-local arguments and a
+ * struct-init's non-scalar bare-local field values (both != the self-thread `exclude` name) join
+ * `UsShared`; every compound expression recurses so a nested call / init is not missed. A value-
+ * position `if` / `match` re-enters `capture_block` per arm (exclusion re-derived per statement).
+ *
+ * @param e        the typed expression
+ * @param cells    the cell universe
+ * @param us       the unique-vs-shared axis so far
+ * @param exclude  the self-thread name to leave unique ("" = none)
+ * @return         the axis with this expression's captures joined
+ */
+fn capture_expr(e: TExpr, cells: []Cell, us: []Unique, exclude: str) -> []Unique {
+    match e.kind {
+        TCall as c => capture_call(c, cells, us, exclude)
+        TStructInit as si => capture_operands(si.field_vals, cells, us, exclude)
+        TBinary as b => capture_expr(b.right, cells, capture_expr(b.left, cells, us, exclude), exclude)
+        TUnary as u => capture_expr(u.operand, cells, us, exclude)
+        TCompare as cm => capture_cmp(cm, cells, us, exclude)
+        TCast as ct => capture_expr(ct.expr, cells, us, exclude)
+        TFieldAccess as fa => capture_expr(fa.receiver, cells, us, exclude)
+        TSafeFieldAccess as fa => capture_expr(fa.receiver, cells, us, exclude)
+        TCoalesce as co => capture_expr(co.right, cells, capture_expr(co.left, cells, us, exclude), exclude)
+        TIndex as ix => capture_expr(ix.index, cells, capture_expr(ix.receiver, cells, us, exclude), exclude)
+        TInterp as ip => capture_operands(ip.holes, cells, us, exclude)
+        TInExpr as ie => capture_operands(ie.elems, cells, capture_expr(ie.lhs, cells, us, exclude), exclude)
+        TArrayLit as al => capture_array(al, cells, us, exclude)
+        TIfExpr as f => capture_block(f.else_blk, cells, capture_block(f.then_blk, cells, us))
+        TMatchExpr as m => capture_match(m, cells, us)
+        _ => us
+    }
+}
+
+/**
+ * The capture sweep for a call: SKIP a `teko::mem::free` (its argument is consumed, not captured);
+ * otherwise every non-scalar bare-local argument (!= `exclude`) joins `UsShared`, and each argument
+ * recurses for a nested call / init.
+ *
+ * @param c        the typed call
+ * @param cells    the cell universe
+ * @param us       the unique-vs-shared axis so far
+ * @param exclude  the self-thread name to leave unique
+ * @return         the axis with this call's captured arguments joined
+ */
+fn capture_call(c: TCall, cells: []Cell, us: []Unique, exclude: str) -> []Unique {
+    if is_mem_free_call(c) { return us }
+    capture_operands(c.args, cells, us, exclude)
+}
+
+/**
+ * Mark + recurse a list of operand expressions (call arguments, struct-init field values, array /
+ * interpolation / `in` elements): each non-scalar bare local (!= `exclude`) joins `UsShared`, then
+ * every operand recurses via `capture_expr` for nested captures.
+ *
+ * @param ops      the operand expressions
+ * @param cells    the cell universe
+ * @param us       the unique-vs-shared axis so far
+ * @param exclude  the self-thread name to leave unique
+ * @return         the axis with these operands' captures joined
+ */
+fn capture_operands(ops: []TExpr, cells: []Cell, us: []Unique, exclude: str) -> []Unique {
+    mut acc = us
+    mut i = 0
+    loop {
+        if i >= ops.len { break }
+        acc = capture_operand(ops[i], cells, acc, exclude)
+        i++
+    }
+    acc
+}
+
+/**
+ * Mark + recurse ONE operand: if it is a non-scalar bare local other than `exclude`, join it to
+ * `UsShared`; then recurse into it for any nested call / init.
+ *
+ * @param op       the operand expression
+ * @param cells    the cell universe
+ * @param us       the unique-vs-shared axis so far
+ * @param exclude  the self-thread name to leave unique
+ * @return         the axis with this operand's capture (if any) joined
+ */
+fn capture_operand(op: TExpr, cells: []Cell, us: []Unique, exclude: str) -> []Unique {
+    mut acc = us
+    if is_nonscalar_bare_local(op) {
+        let nm = alias_src_name(op)
+        if nm != exclude { acc = join_us_at(cells, acc, nm, "") }
+    }
+    capture_expr(op, cells, acc, exclude)
+}
+
+/**
+ * The capture sweep over a comparison chain's terms (each carries an operand expr).
+ *
+ * @param cm       the typed comparison
+ * @param cells    the cell universe
+ * @param us       the unique-vs-shared axis so far
+ * @param exclude  the self-thread name to leave unique
+ * @return         the axis with the chain's captures joined
+ */
+fn capture_cmp(cm: TCompare, cells: []Cell, us: []Unique, exclude: str) -> []Unique {
+    mut acc = capture_expr(cm.first, cells, us, exclude)
+    mut i = 0
+    loop {
+        if i >= cm.rest.len { break }
+        acc = capture_expr(cm.rest[i].operand, cells, acc, exclude)
+        i++
+    }
+    acc
+}
+
+/**
+ * The capture sweep over an array literal's elements (each carries an `expr`; a spread element's
+ * expr is swept like any other operand).
+ *
+ * @param al       the typed array literal
+ * @param cells    the cell universe
+ * @param us       the unique-vs-shared axis so far
+ * @param exclude  the self-thread name to leave unique
+ * @return         the axis with the elements' captures joined
+ */
+fn capture_array(al: TArrayLit, cells: []Cell, us: []Unique, exclude: str) -> []Unique {
+    mut acc = us
+    mut i = 0
+    loop {
+        if i >= al.elements.len { break }
+        acc = capture_operand(al.elements[i].expr, cells, acc, exclude)
+        i++
+    }
+    acc
+}
+
+/**
+ * The capture sweep over a match expression's arm bodies (each arm is a statement block; exclusion
+ * is re-derived per statement inside).
+ *
+ * @param m      the typed match expression
+ * @param cells  the cell universe
+ * @param us     the unique-vs-shared axis so far
+ * @return       the axis with every arm body's captures joined
+ */
+fn capture_match(m: TMatchExpr, cells: []Cell, us: []Unique) -> []Unique {
+    mut acc = us
+    mut i = 0
+    loop {
+        if i >= m.arms.len { break }
+        acc = capture_block(m.arms[i].body, cells, acc)
+        i++
+    }
+    acc
+}
+
+/**
  * Return the borrowed-from axis with index `i` replaced by `v` (parallel arrays rebuilt by copy —
  * the compiler corpus has no in-place slice write for a value element). Mirrors `set_us`.
  *
@@ -1108,7 +1405,7 @@ fn bf_inherit_at(cells: []Cell, bf: []BorrowedFrom, dst: str, src: str) -> []Bor
  */
 pub fn fn_spine(f: TFunction) -> Spine {
     let cells = add_block_cells(f.body, add_param_cells(f, teko::list::empty()))
-    let us = transfer_block(f.body, cells, seed_us(cells))
+    let us = capture_block(f.body, cells, transfer_block(f.body, cells, seed_us(cells)))
     let pt_state = pt_transfer_block(f.body, cells, 0, false, PtTransferState { pt = seed_pt(cells); next_region = 0 })
     Spine { cells = cells; pt = pt_state.pt; bf = bf_transfer_block(f.body, cells, seed_bf(cells)); us = us }
 }

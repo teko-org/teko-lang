@@ -415,6 +415,44 @@ are unaffected; L2b is a NEW check at the `free` site, not a change to the consu
 `us(xs) = UsUnique` → **still PASSES** (exit 67). This is the regression floor: L2b must not reject
 the sound unique-free. The new `free_aliased_rejected` fixture (§6) is its negative twin.
 
+### 3.3 The capture sweep — closing the LAUNDERED aliased free (option b, 2026-07-07)
+
+The base L2b gate above closes the **direct** aliased free (`let y = x; free(x)`) because the L1 `us`
+transfer marks a direct `let y = x` alias shared. But a bare `let y = x` is not the only way to make a
+second live handle. A pre-merge adversarial review (teko-reviewer, PR #366) found three **laundered**
+alias classes the direct transfer misses, each a real, trivially-constructible aliased-free UAF the
+gate would silently ADMIT:
+
+1. **container-store** — `ys = teko::list::push(ys, xs); free(xs)` (`xs`'s buffer is now also held by
+   `ys[i]`);
+2. **call-return launder** — `let y = passthrough(xs); free(xs)` (the callee returns/keeps `xs`);
+3. **field-extract** — `let y = obj.data; free(obj)` (`y` aliases `obj`'s non-scalar interior).
+
+The owner ruling (2026-07-07) chose to **close the full class now** (option b) rather than narrow the
+claim. The fix is a second monotone pass, `capture_block`, layered BESIDE the direct-alias
+`transfer_block` in `fn_spine` (`spine.tks`) — it does **not** modify `escape.tks` (the #330 LAYER
+verdict: `fn_escaping_vars` stays byte-identical). A non-scalar bare local joins `us = shared` when it:
+
+- is passed as an argument to a **non-`free`** call (covers 1 & 2), **except** when the enclosing
+  statement re-binds the call result to that same local (`xs = push(xs, …)` — the self-thread, so the
+  builder-then-`free` idiom is not over-rejected); or
+- is stored into a struct field (`{ f = xs }`); or
+- has a **non-scalar** interior extracted (`let y = obj.data` — a SCALAR field read like `xs.len`
+  copies a stack member and is NOT an alias, so the base stays unique).
+
+**Three soundness guards** make this safe against over-reject: (a) the self-thread exclusion keeps
+`xs = push(xs, item); free(xs)` passing (`mem_free` fixture); (b) `is_mem_free_call` skips a
+`teko::mem::free` call so the consume never marks its own target shared (else every `free` would
+reject itself); (c) the scalar-field discriminator keeps `.len`-before-`free` unique. Validated: the
+gen-2 self-build accepts the whole compiler corpus (no over-reject), gen2==gen3 byte-identical
+(fixpoint held), and the two new negative fixtures (`free_captured_by_container_rejected`,
+`free_field_extract_rejected`) reject with the aliased-free diagnostic.
+
+**Accepted cost (option b):** the call-argument rule is argument-blind to the callee's actual
+behavior, so a `free(x)` after passing `x` to a *read-only* function is now conservatively rejected
+(the sound over-reject direction — §1.4 "cannot name → ⊤"). The compiler corpus does not hit this,
+and a caller can always `free` before the read-only call.
+
 ---
 
 ## 4. L2c — channel-send-move (semantics only)
