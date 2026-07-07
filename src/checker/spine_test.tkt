@@ -1269,3 +1269,51 @@ fn sp_ref_ty() -> Type { Reference { inner = sp_i64() } }
     let s = fn_spine(sp_fn(teko::list::push(teko::list::empty(), sp_ref_param("p")), teko::list::empty()))
     match ref_borrow_or_error(s, "nope", sp_var("p", sp_ref_ty())) { null => teko::assert::is_true(false); error => teko::assert::is_true(true) }
 }
+
+/** A `teko::mem::free(name)` call expression, for testing the L2b affine free gate. */
+fn sp_free_call(name: str) -> TExpr {
+    TExpr { kind = TCall { callee = sp_path("free"); args = teko::list::push(teko::list::empty(), sp_nonscalar_var(name)); call_ns = "teko::mem"; is_closure_call = false; callee_type = Void { }; is_iface_dispatch = false; iface_slot = 0 }; type = Void { }; line = 0; col = 0 }
+}
+
+/**
+ * (#331 L2b) `check_free_site` REJECTS a `mem::free` of an ALIASED target (`let y = xs` makes
+ * `us(xs) = shared`) — the aliased-free UAF.
+ */
+#test fn check_free_site_rejects_aliased_target() {
+    let body = teko::list::push(teko::list::push(teko::list::empty(),
+            sp_let("xs", sp_field("obj", "data", sp_nonscalar()))),
+        sp_let("y", sp_nonscalar_var("xs")))
+    let s = fn_spine(sp_fn(teko::list::empty(), body))
+    match check_free_site(sp_free_call("xs"), s) { null => teko::assert::is_true(false); error => teko::assert::is_true(true) }
+}
+
+/** (#331 L2b) `check_free_site` ADMITS a `mem::free` of a UNIQUE target. */
+#test fn check_free_site_admits_unique_target() {
+    let body = teko::list::push(teko::list::empty(), sp_let("xs", sp_field("obj", "data", sp_nonscalar())))
+    let s = fn_spine(sp_fn(teko::list::empty(), body))
+    match check_free_site(sp_free_call("xs"), s) { null => teko::assert::is_true(true); error => teko::assert::is_true(false) }
+}
+
+/** (#331 L2b) `check_free_site` is a no-op on a non-`mem::free` expression. */
+#test fn check_free_site_ignores_non_free_expr() {
+    let s = fn_spine(sp_fn(teko::list::empty(), teko::list::empty()))
+    match check_free_site(sp_i64_lit(1), s) { null => teko::assert::is_true(true); error => teko::assert::is_true(false) }
+}
+
+/** (#331 L2b) `check_free_site`'s defensive guard: a free of a name that is not a cell (`ci < 0`) is a no-op. */
+#test fn check_free_site_missing_target_is_noop() {
+    let s = fn_spine(sp_fn(teko::list::empty(), teko::list::empty()))
+    match check_free_site(sp_free_call("nope"), s) { null => teko::assert::is_true(true); error => teko::assert::is_true(false) }
+}
+
+/**
+ * (#331 L2b) End-to-end: `check_ref_storability` rejects an aliased free — the fast-path's
+ * `stmts_have_free` scan finds the free (no ref param), builds the spine, and the walk gates it.
+ */
+#test fn check_ref_storability_rejects_aliased_free() {
+    let body = teko::list::push(teko::list::push(teko::list::push(teko::list::empty(),
+                sp_let("xs", sp_field("obj", "data", sp_nonscalar()))),
+            sp_let("y", sp_nonscalar_var("xs"))),
+        sp_exprstmt(sp_free_call("xs")))
+    match check_ref_storability(sp_fn(teko::list::empty(), body)) { null => teko::assert::is_true(false); error => teko::assert::is_true(true) }
+}
