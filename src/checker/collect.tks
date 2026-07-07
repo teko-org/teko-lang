@@ -23,6 +23,25 @@ fn collect_types(items: []parser::Item) -> TypeTable {
 // a function's signature as a FuncType (resolve its param + return types).
 // (#109 W1) `ref_ns` = the namespace the function is declared in (the referencing namespace for its
 // param/return type annotations); threaded to resolve_type, unused until W2's R0-R5 rules.
+/**
+ * The U2 fn-signature containment gate (§2, the 0.1.0.0-beta memory+unsafe remodel #333)
+ * — a resolved param/return type `t` may carry an unsafe-typed component only if the fn
+ * itself is `unsafe` (`fn_unsafe`). Calls are UNCOLORED (§2 line 87): this gate fires on
+ * the SIGNATURE only, in `func_type`/`method_func_type`, never on a call expression — the
+ * color lives on data, not on call sites.
+ *
+ * @param fn_name     the fn's name (blamed in the error)
+ * @param fn_unsafe   is the fn itself `unsafe` (own flag, OR'd with the owner type for a method)?
+ * @param t           the resolved param or return type
+ * @param table       the program's type table (for the `unsafe_carrying` leaf probe)
+ * @return            an error iff `t` carries unsafe data into a non-`unsafe` fn's signature
+ */
+fn reject_unsafe_signature_contagion(fn_name: str, fn_unsafe: bool, t: Type, table: TypeTable) -> error? {
+    if fn_unsafe { return null }
+    if !unsafe_carrying(t, table) { return null }
+    error { message = $"safe fn '{fn_name}' names unsafe type in its signature — mark it `unsafe fn` or take/return only safe types (§2: only safe types cross the boundary)" }
+}
+
 fn func_type(f: parser::Function, table: TypeTable, ref_ns: str) -> Type | error {
     let tbl = type_param_table(f.type_params, f.type_constraints, "", table)   // (S4) the fn's generic type-params, opaque, in scope
     mut params: []Type = teko::list::empty()
@@ -36,6 +55,7 @@ fn func_type(f: parser::Function, table: TypeTable, ref_ns: str) -> Type | error
             Type as t => t
             error as e => return e
         }
+        match reject_unsafe_signature_contagion(f.name, f.is_unsafe, pt, table) { error as e => return e; null => { } }
         params = teko::list::push(params, pt)
         param_names = teko::list::push(param_names, f.params[i].name)
         if f.params[i].has_default {
@@ -51,6 +71,7 @@ fn func_type(f: parser::Function, table: TypeTable, ref_ns: str) -> Type | error
     } else {
         Void { }
     }
+    match reject_unsafe_signature_contagion(f.name, f.is_unsafe, ret, table) { error as e => return e; null => { } }
     let is_variadic = f.params.len > 0 && f.params[f.params.len - 1].is_params
     Func { params = params; ret = ret; variadic = is_variadic; param_names = param_names; n_required = n_required; defaults = defaults }
 }
@@ -95,8 +116,30 @@ pub fn receiver_canonical_name(struct_name: str, ref_ns: str, table: TypeTable) 
  * @return             the method's Func type (receiver + params + return, all resolved)
  * @throws             when a param or return annotation fails to resolve
  */
+/**
+ * Is `f`, a method of `struct_name`, EFFECTIVELY unsafe (§2 line 72) — its own `is_unsafe`
+ * (always `false` at parse time; kept for symmetry with `func_type`'s check) OR'd with its
+ * enclosing type's `is_unsafe`? A method never carries its own unsafe marker: unsafe-ness
+ * attaches to the ENCLOSING `TypeDecl`, so every method of an `unsafe type` is unsafe by
+ * inheritance, uniformly — no per-method annotation to drift out of sync with the owner.
+ *
+ * @param f            the method whose effective unsafe-ness is asked
+ * @param struct_name  the enclosing type name (canonical from a dispatch, or bare from collect)
+ * @param ref_ns       the method's declaring namespace
+ * @param table        the folded type table (owner lookup)
+ * @return             true iff `f` or its enclosing type is `unsafe`
+ */
+fn method_is_effective_unsafe(f: parser::Function, struct_name: str, ref_ns: str, table: TypeTable) -> bool {
+    if f.is_unsafe { return true }
+    match type_table_find(table, receiver_canonical_name(struct_name, ref_ns, table), "") {
+        parser::TypeDecl as owner => owner.is_unsafe
+        error => false
+    }
+}
+
 fn method_func_type(f: parser::Function, struct_name: str, table: TypeTable, ref_ns: str) -> Type | error {
     let tbl = method_type_param_table(receiver_canonical_name(struct_name, ref_ns, table), f.type_params, f.type_constraints, "", table)
+    let fn_unsafe = method_is_effective_unsafe(f, struct_name, ref_ns, table)
     mut params: []Type = teko::list::empty()
     mut param_names: []str = teko::list::empty()
     mut defaults: []parser::Expr = teko::list::empty()
@@ -108,6 +151,9 @@ fn method_func_type(f: parser::Function, struct_name: str, table: TypeTable, ref
             Named { name = receiver_canonical_name(struct_name, ref_ns, table) }
         } else {
             match resolve_type(f.params[i].type_ann, tbl, ref_ns) { Type as t => t; error as e => return e }
+        }
+        if f.params[i].has_type {
+            match reject_unsafe_signature_contagion(f.name, fn_unsafe, pt, table) { error as e => return e; null => { } }
         }
         params = teko::list::push(params, pt)
         param_names = teko::list::push(param_names, f.params[i].name)
@@ -122,6 +168,7 @@ fn method_func_type(f: parser::Function, struct_name: str, table: TypeTable, ref
     } else {
         Void { }
     }
+    match reject_unsafe_signature_contagion(f.name, fn_unsafe, ret, table) { error as e => return e; null => { } }
     let is_variadic = f.params.len > 0 && f.params[f.params.len - 1].is_params
     Func { params = params; ret = ret; variadic = is_variadic; param_names = param_names; n_required = n_required; defaults = defaults }
 }
@@ -1405,6 +1452,29 @@ fn check_no_duplicate_types(table: TypeTable) -> error? {
     null
 }
 
+/**
+ * The U2 field-composition contagion gate (§2, the 0.1.0.0-beta memory+unsafe remodel
+ * #333) — a resolved field type `ft` may carry an unsafe-typed component (directly or
+ * through `[]M`/`M?`/`Ref<M>`/`ptr<M>`/a variant member) only if the ENCLOSING decl is
+ * itself `unsafe`. A safe struct/class/trait/alias embedding an unsafe-typed field would
+ * otherwise leak unsafe data behind a safe-looking wrapper, defeating the whole point of
+ * the nominal color. Called once per field by every `validate_type_decls` body loop
+ * (struct/class/trait fields, and the alias body) — the SAME gate shape, parameterized
+ * only by which name to blame in the message.
+ *
+ * @param decl_name    the enclosing TypeDecl's name (blamed in the error)
+ * @param decl_unsafe  is the enclosing TypeDecl itself `unsafe`?
+ * @param field_name   the offending field's name (blamed in the error)
+ * @param ft           the field's resolved semantic type
+ * @param table        the program's type table (for the `unsafe_carrying` leaf probe)
+ * @return             an error iff `ft` carries unsafe data into a non-`unsafe` decl
+ */
+fn reject_unsafe_field_contagion(decl_name: str, decl_unsafe: bool, field_name: str, ft: Type, table: TypeTable) -> error? {
+    if decl_unsafe { return null }
+    if !unsafe_carrying(ft, table) { return null }
+    error { message = $"struct/class '{decl_name}' has an unsafe-typed field '{field_name}' — it must be declared `unsafe` (unsafe data cannot be held by a safe type; §2 contagion-by-composition)" }
+}
+
 fn validate_type_decls(table: TypeTable) -> error? {
     match check_no_duplicate_types(table) { error as e => return e; null => { } }   // (#109 W0)
     mut i = 0
@@ -1422,7 +1492,10 @@ fn validate_type_decls(table: TypeTable) -> error? {
                 loop {
                     if f >= sb.fields.len { break }
                     match resolve_type(sb.fields[f].type_ann, tbl, ref_ns) {
-                        Type as ft => match ft { Reference => return error { message = "a reference cannot be stored in a struct/variant/collection" }; _ => { } }
+                        Type as ft => {
+                            match ft { Reference => return error { message = "a reference cannot be stored in a struct/variant/collection" }; _ => { } }
+                            match reject_unsafe_field_contagion(decl.name, decl.is_unsafe, sb.fields[f].name, ft, table) { error as e => return e; null => { } }
+                        }
                         error as e => return e
                     }
                     f++
@@ -1431,7 +1504,10 @@ fn validate_type_decls(table: TypeTable) -> error? {
             }
             parser::AliasBody as ab => {
                 match resolve_type(ab.alias, tbl, ref_ns) {
-                    Type as at => match at { Reference => return error { message = "a reference cannot be stored in a struct/variant/collection" }; _ => { } }
+                    Type as at => {
+                        match at { Reference => return error { message = "a reference cannot be stored in a struct/variant/collection" }; _ => { } }
+                        match reject_unsafe_field_contagion(decl.name, decl.is_unsafe, "alias", at, table) { error as e => return e; null => { } }
+                    }
                     error as e => return e
                 }
             }
@@ -1441,7 +1517,10 @@ fn validate_type_decls(table: TypeTable) -> error? {
                 loop {
                     if f >= cb.fields.len { break }
                     match resolve_type(cb.fields[f].type_ann, tbl, ref_ns) {
-                        Type as ft => match ft { Reference => return error { message = "a reference cannot be stored in a struct/variant/collection" }; _ => { } }
+                        Type as ft => {
+                            match ft { Reference => return error { message = "a reference cannot be stored in a struct/variant/collection" }; _ => { } }
+                            match reject_unsafe_field_contagion(decl.name, decl.is_unsafe, cb.fields[f].name, ft, table) { error as e => return e; null => { } }
+                        }
                         error as e => return e
                     }
                     f++
@@ -1461,7 +1540,10 @@ fn validate_type_decls(table: TypeTable) -> error? {
                 loop {
                     if f >= trb.fields.len { break }
                     match resolve_type(trb.fields[f].type_ann, tbl, ref_ns) {
-                        Type as ft => match ft { Reference => return error { message = "a reference cannot be stored in a struct/variant/collection" }; _ => { } }
+                        Type as ft => {
+                            match ft { Reference => return error { message = "a reference cannot be stored in a struct/variant/collection" }; _ => { } }
+                            match reject_unsafe_field_contagion(decl.name, decl.is_unsafe, trb.fields[f].name, ft, table) { error as e => return e; null => { } }
+                        }
                         error as e => return e
                     }
                     f++
@@ -1512,9 +1594,23 @@ fn validate_type_decls(table: TypeTable) -> error? {
     null
 }
 
-// pass 1: types first, then function signatures — the top-level environment.
+/**
+ * Pass 1: types first, then function signatures — the top-level environment.
+ *
+ * (U2 #333 F1) Generic instances are STAMPED here, BEFORE field/signature validation, not
+ * after `collect()` returns — `validate_type_decls`/`func_type`/`method_func_type` resolve a
+ * written `Box<Raw>` to `Named{"Box__g__Raw"}` and probe the TABLE for that name's
+ * `is_unsafe`; if the stamp doesn't exist yet the probe misses and the unsafe-carrying gate
+ * silently passes. `instantiate_types` is idempotent (it dedups already-stamped names), so
+ * calling it here and again later (`type_program`'s post-collect stamp, kept for callers
+ * that only need the table, e.g. mono) is a safe no-op the second time.
+ *
+ * @param program the parsed (trait-folded, base-canonicalized) program
+ * @return        the collected type table + top-level environment
+ * @throws        on a field/signature containment violation (R4, U2) or a duplicate type (W0)
+ */
 fn collect(program: parser::Program) -> Collected | error {
-    let table = collect_types(program.items)
+    let table = instantiate_types(program, collect_types(program.items))
     match validate_type_decls(table) { error as e => return e; null => { } }   // (MEM Step 0, R4)
     let env = match collect_funcs(program.items, table) {
         Env as e => e
@@ -1523,23 +1619,35 @@ fn collect(program: parser::Program) -> Collected | error {
     Collected { types = table; env = env }
 }
 
-// C7.10 — collect with a pre-seeded (table, env). Adds the project's type decls on top of
-// the seeded table, then adds the project's function signatures on top of the seeded env.
-// Used by type_program_with_deps to inject dep items before type-checking the project.
+/**
+ * C7.10 — collect with a pre-seeded (table, env). Adds the project's type decls on top of
+ * the seeded table, then adds the project's function signatures on top of the seeded env.
+ * Used by `type_program_with_deps` to inject dep items before type-checking the project.
+ *
+ * (U2 #333 F1) Same early-stamp ordering as `collect()` — `instantiate_types` runs BEFORE
+ * `validate_type_decls`/`func_type` so a project-written `Box<Raw>` (dep or project generic)
+ * is already stamped, and its unsafe-carrying is visible to the field/signature gates.
+ *
+ * @param program the project's parsed program (dep items are NOT re-typed, only seeded)
+ * @param seed    the dep-derived (table, env) to extend
+ * @return        the collected type table + environment, project items layered on the seed
+ * @throws        on a field/signature containment violation (R4, U2) or a duplicate type (W0)
+ */
 fn collect_with_seed(program: parser::Program, seed: Collected) -> Collected | error {
     // Augment the table with the project's type decls (dep types already in seed.types).
-    mut table = seed.types
+    mut table0 = seed.types
     mut i = 0
     loop {
         if i >= program.items.len { break }
         match program.items[i].content {
             parser::TypeDecl as td => {
-                table = teko::list::push(table, TypeReg { name = td.name; namespace = program.items[i].namespace; vis = td.vis; decl = td })
+                table0 = teko::list::push(table0, TypeReg { name = td.name; namespace = program.items[i].namespace; vis = td.vis; decl = td })
             }
             _ => { }
         }
         i++
     }
+    let table = instantiate_types(program, table0)
     match validate_type_decls(table) { error as e => return e; null => { } }   // (MEM Step 0, R4)
     // Augment the env with the project's function signatures (dep fns already in seed.env).
     mut env = seed.env

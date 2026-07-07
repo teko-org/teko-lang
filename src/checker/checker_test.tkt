@@ -34,7 +34,7 @@ fn u32t() -> Type { Prim { kind = PrimKind::U32 } }
 fn u8t() -> Type { Prim { kind = PrimKind::U8 } }
 fn i64t() -> Type { Prim { kind = PrimKind::I64 } }
 fn boolt() -> Type { Prim { kind = PrimKind::Bool } }
-fn empty_env() -> Env { Env { base = teko::list::empty(); bindings = teko::list::empty(); cur_ns = ""; owner_type = ""; di = DiRegistry { providers = teko::list::empty() }; injects = teko::list::empty() } }
+fn empty_env() -> Env { Env { base = teko::list::empty(); bindings = teko::list::empty(); cur_ns = ""; owner_type = ""; di = DiRegistry { providers = teko::list::empty() }; injects = teko::list::empty(); fn_unsafe = false } }
 fn empty_table() -> TypeTable { teko::list::empty() }
 fn prim_is(t: Type, k: PrimKind) -> bool { match t { Prim as p => p.kind == k; _ => false } }
 
@@ -4329,4 +4329,459 @@ fn grouped_use_decl_type_checks_and_binds_nothing() {
     let uitem = parser::Item { content = use1; namespace = ""; file = "" }
     let items = teko::list::push(teko::list::empty(), uitem)
     match type_program(parser::Program { items = items }) { TProgram => teko::assert::is_true(true); error => teko::assert::is_true(false) }
+}
+
+/**
+ * U2 (#333) — unsafe nominal containment + contagion-by-composition. An `unsafe type M =
+ * struct { p: i64 }` item — the leaf unsafe type every U2 test builds on (a plain `i64` field
+ * is enough; the FIELD shape is irrelevant to containment, only `M`'s OWN `is_unsafe` flag is).
+ */
+fn unsafe_leaf_item() -> parser::Item {
+    let fld = parser::Field { name = "p"; type_ann = named_t("i64"); vis = parser::Visibility::Pub; is_intern = false; has_doc = false; doc = "" }
+    parser::Item { content = parser::TypeDecl { name = "M"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::StructBody { fields = teko::list::push(teko::list::empty(), fld); methods = teko::list::empty(); implements = teko::list::empty() }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; di_kind = parser::DiKind::None; has_di_key = false; di_key = ""; is_unsafe = true; must_free = false }; namespace = ""; file = "" }
+}
+
+/** A `fn(m: M) -> M { m }` item — `is_unsafe` on the `Function` itself is the ONLY knob (parallel
+ *  to `unsafe_leaf_item`'s type-side knob), so the same builder serves both the REJECT (criterion
+ *  1, safe) and ACCEPT (criterion 2, `unsafe fn`) cases.
+ *
+ * @param fn_is_unsafe  whether the built `fn`'s OWN `is_unsafe` flag is set
+ */
+fn leak_fn_item(fn_is_unsafe: bool) -> parser::Item {
+    let p = parser::Param { name = "m"; has_type = true; type_ann = named_t("M"); is_params = false; has_default = false; default_expr = e_num(0) }
+    let f = parser::Function { name = "leak"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = teko::list::push(teko::list::empty(), p); has_return = true; return_type = named_t("M"); body = one_stmt(e_var("m")); vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false; has_inject = false; injects = teko::list::empty(); is_unsafe = fn_is_unsafe }
+    d1_item(f)
+}
+
+/**
+ * Criterion 1 — `fn leak(m: M) -> M { m }` (a SAFE fn) naming the `unsafe type M` in its
+ * signature is rejected: `func_type`'s `reject_unsafe_signature_contagion` fires on the param
+ * (the leftmost occurrence checked, before the return).
+ */
+#test
+fn safe_fn_naming_unsafe_type_in_signature_is_rejected() {
+    let items = teko::list::push(teko::list::push(teko::list::empty(), unsafe_leaf_item()), leak_fn_item(false))
+    match type_program(parser::Program { items = items }) {
+        TProgram => teko::assert::is_true(false)
+        error as e => teko::assert::is_true(teko::str::contains(e.message, "names unsafe type in its signature"))
+    }
+}
+
+/**
+ * Criterion 2 — the SAME signature shape as above, but `unsafe fn work(m: M) -> M { m }` (the fn
+ * itself carries `is_unsafe = true`) compiles: the signature gate's `fn_unsafe` guard is satisfied
+ * so `unsafe_carrying` is never even consulted for the rejection.
+ */
+#test
+fn unsafe_fn_naming_unsafe_type_in_signature_is_accepted() {
+    let items = teko::list::push(teko::list::push(teko::list::empty(), unsafe_leaf_item()), leak_fn_item(true))
+    match type_program(parser::Program { items = items }) { TProgram => teko::assert::is_true(true); error => teko::assert::is_true(false) }
+}
+
+/** A `type Wrapper = struct { m: M }` item — a struct field naming the unsafe type `M`, whose
+ *  OWN unsafe-ness is the knob under test (parallels `unsafe_leaf_item`/`leak_fn_item`'s shape).
+ *
+ * @param decl_is_unsafe  whether `Wrapper` itself is declared `unsafe`
+ */
+fn wrapper_struct_item(decl_is_unsafe: bool) -> parser::Item {
+    let fld = parser::Field { name = "m"; type_ann = named_t("M"); vis = parser::Visibility::Pub; is_intern = false; has_doc = false; doc = "" }
+    parser::Item { content = parser::TypeDecl { name = "Wrapper"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::StructBody { fields = teko::list::push(teko::list::empty(), fld); methods = teko::list::empty(); implements = teko::list::empty() }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; di_kind = parser::DiKind::None; has_di_key = false; di_key = ""; is_unsafe = decl_is_unsafe; must_free = false }; namespace = ""; file = "" }
+}
+
+/**
+ * Criterion 3 — `type Wrapper = struct { m: M }` (a SAFE struct with an unsafe-typed field) is
+ * rejected: `validate_type_decls`' `reject_unsafe_field_contagion` fires because `Wrapper` is not
+ * itself `unsafe` (contagion by composition).
+ */
+#test
+fn safe_struct_field_of_unsafe_type_is_rejected() {
+    let items = teko::list::push(teko::list::push(teko::list::empty(), unsafe_leaf_item()), wrapper_struct_item(false))
+    match type_program(parser::Program { items = items }) {
+        TProgram => teko::assert::is_true(false)
+        error as e => teko::assert::is_true(teko::str::contains(e.message, "must be declared `unsafe`"))
+    }
+}
+
+/**
+ * Criterion 4 — the SAME field shape, but `unsafe type Wrapper = struct { m: M }` compiles: the
+ * field-contagion gate's `decl_unsafe` guard is satisfied.
+ */
+#test
+fn unsafe_struct_field_of_unsafe_type_is_accepted() {
+    let items = teko::list::push(teko::list::push(teko::list::empty(), unsafe_leaf_item()), wrapper_struct_item(true))
+    match type_program(parser::Program { items = items }) { TProgram => teko::assert::is_true(true); error => teko::assert::is_true(false) }
+}
+
+/** The `TypeTable` `unsafe_leaf_item`'s standalone program would collect — built directly (no
+ *  `collect(parser::Program)` round-trip needed) since `type_binding`/`type_function` take a
+ *  `TypeTable` straight, mirroring `foo_table`/`must_free_table`'s shape above. */
+fn unsafe_leaf_table() -> TypeTable {
+    match unsafe_leaf_item().content { parser::TypeDecl as td => teko::list::push(teko::list::empty(), TypeReg { name = td.name; namespace = ""; vis = td.vis; decl = td }); _ => teko::list::empty() }
+}
+
+/**
+ * Criterion 5 — `let x: M = M { p = 0 }` inside a SAFE fn body (`env.fn_unsafe = false`, the
+ * `empty_env()` default) is rejected by `type_binding`'s local-containment gate — the ANNOTATED
+ * bound type `M` is unsafe-carrying and the enclosing fn is not `unsafe`.
+ */
+#test
+fn safe_fn_binds_local_of_unsafe_type_is_rejected() {
+    let ctor = parser::StructLit { type_path = path1("M"); type_args = teko::list::empty(); field_names = teko::list::push(teko::list::empty(), "p"); field_vals = teko::list::push(teko::list::empty(), e_num(0)) }
+    let bad = parser::Binding { kind = parser::BindKind::Let; target = parser::SimpleName { name = "x" }; has_type = true; type_ann = named_t("M"); value = ek(ctor) }
+    match type_binding(bad, empty_env(), unsafe_leaf_table()) {
+        TypedStmt => teko::assert::is_true(false)
+        error as e => teko::assert::is_true(teko::str::contains(e.message, "binds a local of unsafe type"))
+    }
+}
+
+/**
+ * Criterion 5's control — the SAME local binding, but with `env.fn_unsafe = true` (the enclosing
+ * fn is `unsafe`), compiles: the containment gate's `env.fn_unsafe` guard is satisfied.
+ */
+#test
+fn unsafe_fn_binds_local_of_unsafe_type_is_accepted() {
+    let ctor = parser::StructLit { type_path = path1("M"); type_args = teko::list::empty(); field_names = teko::list::push(teko::list::empty(), "p"); field_vals = teko::list::push(teko::list::empty(), e_num(0)) }
+    let okb = parser::Binding { kind = parser::BindKind::Let; target = parser::SimpleName { name = "x" }; has_type = true; type_ann = named_t("M"); value = ek(ctor) }
+    match type_binding(okb, with_fn_unsafe(empty_env(), true), unsafe_leaf_table()) { TypedStmt => teko::assert::is_true(true); error => teko::assert::is_true(false) }
+}
+
+/**
+ * `is_unsafe_type` / `unsafe_carrying` direct unit coverage (every new branch). `is_unsafe_type`
+ * on an unregistered name falls through `type_table_find`'s error arm, returning `false`
+ * (mirrors `is_must_free_name_unknown_name_is_false`).
+ */
+#test
+fn is_unsafe_type_unknown_name_is_false() {
+    teko::assert::is_false(is_unsafe_type("NoSuchType", empty_table()))
+}
+
+/** `is_unsafe_type` on a registered but NON-`unsafe` type is false (the ordinary case). */
+#test
+fn is_unsafe_type_plain_type_is_false() {
+    teko::assert::is_false(is_unsafe_type("Foo", foo_table()))
+}
+
+/** `is_unsafe_type` on a registered `unsafe type` is true — the leaf predicate's true branch. */
+#test
+fn is_unsafe_type_unsafe_decl_is_true() {
+    teko::assert::is_true(is_unsafe_type("M", unsafe_leaf_table()))
+}
+
+/**
+ * `method_is_effective_unsafe`'s three arms, each exercised directly: (1) the method's OWN
+ * `is_unsafe` short-circuits true (never reachable through real parsing — methods always parse
+ * `is_unsafe = false`, per design — but the OR-rule itself must hold if ever driven this way);
+ * (2) an ABSENT owner (an unregistered `struct_name`) falls to `type_table_find`'s error arm,
+ * `false`; (3) a REGISTERED owner's OWN `is_unsafe` is read when the method's own flag is false —
+ * the inheritance rule (§2 line 72) that makes every method of an `unsafe type` unsafe.
+ */
+#test
+fn method_is_effective_unsafe_all_three_arms() {
+    let safe_method = parser::Function { name = "m"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = teko::list::empty(); has_return = false; return_type = named_t("i64"); body = teko::list::empty(); vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false; has_inject = false; injects = teko::list::empty(); is_unsafe = false }
+    let unsafe_method = parser::Function { name = safe_method.name; type_params = safe_method.type_params; type_constraints = safe_method.type_constraints; params = safe_method.params; has_return = safe_method.has_return; return_type = safe_method.return_type; body = safe_method.body; vis = safe_method.vis; has_doc = safe_method.has_doc; doc = safe_method.doc; line = safe_method.line; col = safe_method.col; is_test = safe_method.is_test; is_extern = safe_method.is_extern; c_symbol = safe_method.c_symbol; from_lib = safe_method.from_lib; os_guard = safe_method.os_guard; is_intern = safe_method.is_intern; is_abstract = safe_method.is_abstract; is_virtual = safe_method.is_virtual; is_override = safe_method.is_override; has_inject = safe_method.has_inject; injects = safe_method.injects; is_unsafe = true }
+    teko::assert::is_true(method_is_effective_unsafe(unsafe_method, "NoSuchOwner", "", empty_table()))
+    teko::assert::is_false(method_is_effective_unsafe(safe_method, "NoSuchOwner", "", empty_table()))
+    teko::assert::is_true(method_is_effective_unsafe(safe_method, "M", "", unsafe_leaf_table()))
+    teko::assert::is_false(method_is_effective_unsafe(safe_method, "Foo", "", foo_table()))
+}
+
+/** A `Holder { fn take(self, m: M) { } }` class method item, parameterized by whether the
+ *  enclosing class is itself `unsafe` — the OWN-class knob `method_func_type`'s signature gate
+ *  reads through `method_is_effective_unsafe` (a safe method inheriting the owner's flag).
+ *
+ * @param class_is_unsafe  whether the enclosing `Holder` class is declared `unsafe`
+ */
+fn holder_class_item(class_is_unsafe: bool) -> parser::Item {
+    let recv = parser::Param { name = "self"; has_type = false; type_ann = named_t("i64"); is_params = false; has_default = false; default_expr = e_num(0) }
+    let m_param = parser::Param { name = "m"; has_type = true; type_ann = named_t("M"); is_params = false; has_default = false; default_expr = e_num(0) }
+    let take = parser::Function { name = "take"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = teko::list::push(teko::list::push(teko::list::empty(), recv), m_param); has_return = false; return_type = named_t("i64"); body = teko::list::empty(); vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false; has_inject = false; injects = teko::list::empty(); is_unsafe = false }
+    let body = parser::ClassBody { kind = parser::ClassKind::Sealed; has_base = false; base_name = ""; has_base_binding = false; base_binding_name = ""; implements = teko::list::empty(); fields = teko::list::empty(); methods = list1(take) }
+    parser::Item { content = parser::TypeDecl { name = "Holder"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = body; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; di_kind = parser::DiKind::None; has_di_key = false; di_key = ""; is_unsafe = class_is_unsafe; must_free = false }; namespace = ""; file = "" }
+}
+
+/**
+ * A SAFE class's method naming the `unsafe type M` in a param is rejected — `method_func_type`'s
+ * signature gate (via `method_is_effective_unsafe`, whose owner-lookup arm returns `Holder`'s own
+ * `false`) fires exactly like a free fn's (criterion 1's method-shaped twin).
+ */
+#test
+fn safe_class_method_naming_unsafe_type_in_param_is_rejected() {
+    let items = teko::list::push(teko::list::push(teko::list::empty(), unsafe_leaf_item()), holder_class_item(false))
+    match type_program(parser::Program { items = items }) {
+        TProgram => teko::assert::is_true(false)
+        error as e => teko::assert::is_true(teko::str::contains(e.message, "names unsafe type in its signature"))
+    }
+}
+
+/**
+ * The SAME method shape, but `Holder` itself is `unsafe` — the method INHERITS the owner's
+ * unsafe-ness (§2 line 72) even though the method's own `is_unsafe` is `false` at parse time, so
+ * it compiles (criterion 2's method-shaped twin).
+ */
+#test
+fn method_of_unsafe_class_naming_unsafe_type_in_param_is_accepted() {
+    let items = teko::list::push(teko::list::push(teko::list::empty(), unsafe_leaf_item()), holder_class_item(true))
+    match type_program(parser::Program { items = items }) { TProgram => teko::assert::is_true(true); error => teko::assert::is_true(false) }
+}
+
+/** `unsafe_carrying` on a bare `Named{M}` (the leaf case) is true when `M` is `unsafe`, and
+ *  false for a plain scalar/builtin (never registered, so `is_unsafe_type` misses the table by
+ *  construction — no false positive on scalars/generics, acceptance criterion 8). */
+#test
+fn unsafe_carrying_named_leaf() {
+    teko::assert::is_true(unsafe_carrying(Named { name = "M" }, unsafe_leaf_table()))
+    teko::assert::is_false(unsafe_carrying(i64t(), unsafe_leaf_table()))
+    teko::assert::is_false(unsafe_carrying(Named { name = "T" }, unsafe_leaf_table()))
+}
+
+/** `unsafe_carrying` recurses through `[]M` (Slice), `M?` (Optional), `Ref<M>` (Reference), and
+ *  `ptr<M>` (Ptr, present inner) — every compositional carrier the design calls out (criterion
+ *  7). Each wraps the SAME unsafe leaf `M`; the safe-scalar sibling of each shape is false. The
+ *  final assertion is the OPAQUE `ptr` (`inner = null`) — the `Ptr` case's `null` arm, never
+ *  carrying. */
+#test
+fn unsafe_carrying_recurses_through_every_carrier() {
+    let table = unsafe_leaf_table()
+    let m = Named { name = "M" }
+    teko::assert::is_true(unsafe_carrying(Slice { element = m }, table))
+    teko::assert::is_false(unsafe_carrying(Slice { element = i64t() }, table))
+    teko::assert::is_true(unsafe_carrying(Optional { inner = m }, table))
+    teko::assert::is_false(unsafe_carrying(Optional { inner = i64t() }, table))
+    teko::assert::is_true(unsafe_carrying(Reference { inner = m }, table))
+    teko::assert::is_false(unsafe_carrying(Reference { inner = i64t() }, table))
+    teko::assert::is_true(unsafe_carrying(Ptr { inner = m }, table))
+    teko::assert::is_false(unsafe_carrying(Ptr { inner = i64t() }, table))
+    teko::assert::is_false(unsafe_carrying(Ptr { inner = null }, table))
+}
+
+/** `unsafe_carrying` over a `Variant` recurses each member — true iff ANY member carries unsafe
+ *  data (criterion 7's variant case), and every OTHER `Type` shape not explicitly walked
+ *  (`Prim`/`Void`/`Error`/…) falls to the catch-all `_ => false` arm. `Func` is NOT a catch-all
+ *  case any more (F2, adversarial review of #333) — it is asserted separately below. */
+#test
+fn unsafe_carrying_variant_and_catch_all() {
+    let table = unsafe_leaf_table()
+    let m = Named { name = "M" }
+    let mixed = Variant { members = teko::list::push(teko::list::push(teko::list::empty(), i64t()), m) }
+    teko::assert::is_true(unsafe_carrying(mixed, table))
+    let all_safe = Variant { members = teko::list::push(teko::list::push(teko::list::empty(), i64t()), Str { }) }
+    teko::assert::is_false(unsafe_carrying(all_safe, table))
+    teko::assert::is_false(unsafe_carrying(Void { }, table))
+    teko::assert::is_false(unsafe_carrying(Error { }, table))
+}
+
+/**
+ * F2 (adversarial review of #333) — `unsafe_carrying` recurses into a `Func` type's PARAMS and
+ * RETURN: a safe field/param typed `fn(Raw)->Raw` names `Raw` in its shape, so it must be
+ * unsafe-carrying even though CALLS stay uncolored (this is about the VALUE's type, never a call
+ * site). Covers: an unsafe PARAM, an unsafe RETURN, and the all-safe negative (both param and
+ * return are plain scalars) — the fully-safe `Func` from the catch-all test above.
+ */
+#test
+fn unsafe_carrying_recurses_into_func_params_and_return() {
+    let table = unsafe_leaf_table()
+    let m = Named { name = "M" }
+    let unsafe_param_fn = Func { params = teko::list::push(teko::list::empty(), m); ret = Void { }; variadic = false; param_names = []; n_required = 0; defaults = [] }
+    teko::assert::is_true(unsafe_carrying(unsafe_param_fn, table))
+    let unsafe_ret_fn = Func { params = teko::list::empty(); ret = m; variadic = false; param_names = []; n_required = 0; defaults = [] }
+    teko::assert::is_true(unsafe_carrying(unsafe_ret_fn, table))
+    let safe_fn = Func { params = teko::list::push(teko::list::empty(), i64t()); ret = i64t(); variadic = false; param_names = []; n_required = 0; defaults = [] }
+    teko::assert::is_false(unsafe_carrying(safe_fn, table))
+}
+
+/**
+ * F3 (adversarial review of #333) — the depth bound must FAIL CLOSED: a carrier chain nested
+ * PAST the recursion budget rejects (conservative `true`) rather than silently reporting "not
+ * carrying" and leaking unsafe data through a type the walk gave up on. Exercises the exact
+ * boundary the public `unsafe_carrying` seeds (`depth = 32`) by nesting `Optional` one level
+ * DEEPER than the budget around a plain safe scalar (no unsafe type is even reachable) — a
+ * within-budget nesting of the SAME depth-1 shape must still say "safe" (false), proving the
+ * `true` only fires from budget exhaustion, not from over-eager recursion.
+ */
+#test
+fn unsafe_carrying_depth_bound_fails_closed() {
+    let table = unsafe_leaf_table()
+    mut too_deep: Type = i64t()
+    mut i = 0
+    loop { if i >= 33 { break }; too_deep = Optional { inner = too_deep }; i++ }
+    teko::assert::is_true(unsafe_carrying(too_deep, table))
+    mut within_budget: Type = i64t()
+    mut j = 0
+    loop { if j >= 31 { break }; within_budget = Optional { inner = within_budget }; j++ }
+    teko::assert::is_false(unsafe_carrying(within_budget, table))
+}
+
+/**
+ * A generic `type Box<T> = struct { value: T }` item (SAFE — no `unsafe` marker of its own) —
+ * F1's (adversarial review of #333) fixture for "unsafe data hides behind a generic". Reused
+ * by every F1 test below; `M`'s own `is_unsafe` (from `unsafe_leaf_item`) is the only thing
+ * that ever makes `Box<M>` unsafe-carrying — `Box` itself never mentions an unsafe type.
+ */
+fn box_generic_item() -> parser::Item {
+    let fld = parser::Field { name = "value"; type_ann = ttype_named("T"); vis = parser::Visibility::Pub; is_intern = false; has_doc = false; doc = "" }
+    let body = parser::StructBody { fields = teko::list::push(teko::list::empty(), fld); methods = teko::list::empty(); implements = teko::list::empty() }
+    let decl = parser::TypeDecl { name = "Box"; type_params = teko::list::push(teko::list::empty(), "T"); type_constraints = teko::list::empty(); body = body; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; di_kind = parser::DiKind::None; has_di_key = false; di_key = ""; is_unsafe = false; must_free = false }
+    parser::Item { content = decl; namespace = ""; file = "" }
+}
+
+/** A `Box<M>` NamedType (one type-argument, the unsafe leaf `M`) — the generic-instance
+ *  annotation every F1 signature/field/local test below names. */
+fn box_of_m_texpr() -> parser::TypeExpr {
+    parser::NamedType { path = parser::Path { segments = teko::list::push(teko::list::empty(), parser::Segment { name = "Box" }) }; args = teko::list::push(teko::list::empty(), named_t("M")) }
+}
+
+/** A `fn(b: Box<M>) -> Box<M> { b }` item — the generic-instance-over-unsafe twin of
+ *  `leak_fn_item`, parameterized the same way (the fn's OWN `is_unsafe` is the only knob). */
+fn leak_box_fn_item(fn_is_unsafe: bool) -> parser::Item {
+    let p = parser::Param { name = "b"; has_type = true; type_ann = box_of_m_texpr(); is_params = false; has_default = false; default_expr = e_num(0) }
+    let f = parser::Function { name = "leak_box"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = teko::list::push(teko::list::empty(), p); has_return = true; return_type = box_of_m_texpr(); body = one_stmt(e_var("b")); vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false; has_inject = false; injects = teko::list::empty(); is_unsafe = fn_is_unsafe }
+    d1_item(f)
+}
+
+/**
+ * F1 (adversarial review of #333) criterion 1's generic twin — `fn leak_box(b: Box<M>) ->
+ * Box<M> { b }` (a SAFE fn) naming the generic instance `Box<M>` (over the unsafe type `M`)
+ * in its signature is rejected. Before the fix, `Box<M>` resolved to a stamped
+ * `Named{"Box__g__M"}` whose `is_unsafe` was inherited only from `Box`'s own (false) flag,
+ * so this leaked; the fix marks the STAMP itself unsafe when any type-argument is
+ * unsafe-carrying (`generic_args_unsafe_carrying`), AND moves `instantiate_types` to run
+ * BEFORE `validate_type_decls`/`func_type` in `collect()` so the stamp exists in time for
+ * the signature gate to see it.
+ */
+#test
+fn safe_fn_naming_generic_instance_over_unsafe_type_is_rejected() {
+    let items = teko::list::push(teko::list::push(teko::list::push(teko::list::empty(), unsafe_leaf_item()), box_generic_item()), leak_box_fn_item(false))
+    match type_program(parser::Program { items = items }) {
+        TProgram => teko::assert::is_true(false)
+        error as e => teko::assert::is_true(teko::str::contains(e.message, "names unsafe type in its signature"))
+    }
+}
+
+/**
+ * The SAME generic-instance signature, but `unsafe fn leak_box(b: Box<M>) -> Box<M> { b }`
+ * compiles — the fn's own `is_unsafe` satisfies the signature gate exactly like the
+ * non-generic criterion 2 case.
+ */
+#test
+fn unsafe_fn_naming_generic_instance_over_unsafe_type_is_accepted() {
+    let items = teko::list::push(teko::list::push(teko::list::push(teko::list::empty(), unsafe_leaf_item()), box_generic_item()), leak_box_fn_item(true))
+    match type_program(parser::Program { items = items }) { TProgram => teko::assert::is_true(true); error => teko::assert::is_true(false) }
+}
+
+/** A `type BoxWrapper = struct { held: Box<M> }` item — a SAFE struct field naming the
+ *  generic instance `Box<M>` (F1's field-composition twin of `wrapper_struct_item`).
+ *
+ * @param decl_is_unsafe  whether `BoxWrapper` itself is declared `unsafe`
+ */
+fn box_wrapper_struct_item(decl_is_unsafe: bool) -> parser::Item {
+    let fld = parser::Field { name = "held"; type_ann = box_of_m_texpr(); vis = parser::Visibility::Pub; is_intern = false; has_doc = false; doc = "" }
+    parser::Item { content = parser::TypeDecl { name = "BoxWrapper"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::StructBody { fields = teko::list::push(teko::list::empty(), fld); methods = teko::list::empty(); implements = teko::list::empty() }; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; di_kind = parser::DiKind::None; has_di_key = false; di_key = ""; is_unsafe = decl_is_unsafe; must_free = false }; namespace = ""; file = "" }
+}
+
+/**
+ * F1 criterion 3's generic twin — `type BoxWrapper = struct { held: Box<M> }` (a SAFE struct
+ * with a field of the generic instance `Box<M>`) is rejected: the field-contagion gate now
+ * sees the stamped `Box__g__M`'s `is_unsafe = true` (set at stamp time) and fires exactly
+ * like the plain `Wrapper { m: M }` case.
+ */
+#test
+fn safe_struct_field_of_generic_instance_over_unsafe_type_is_rejected() {
+    let items = teko::list::push(teko::list::push(teko::list::push(teko::list::empty(), unsafe_leaf_item()), box_generic_item()), box_wrapper_struct_item(false))
+    match type_program(parser::Program { items = items }) {
+        TProgram => teko::assert::is_true(false)
+        error as e => teko::assert::is_true(teko::str::contains(e.message, "must be declared `unsafe`"))
+    }
+}
+
+/**
+ * The SAME field shape, but `unsafe type BoxWrapper = struct { held: Box<M> }` compiles —
+ * the field-contagion gate's `decl_unsafe` guard is satisfied exactly like the plain case.
+ */
+#test
+fn unsafe_struct_field_of_generic_instance_over_unsafe_type_is_accepted() {
+    let items = teko::list::push(teko::list::push(teko::list::push(teko::list::empty(), unsafe_leaf_item()), box_generic_item()), box_wrapper_struct_item(true))
+    match type_program(parser::Program { items = items }) { TProgram => teko::assert::is_true(true); error => teko::assert::is_true(false) }
+}
+
+/**
+ * F1 criterion 5's generic twin — a safe fn body binding a LOCAL of the generic instance
+ * type `Box<M>` is rejected by the SAME local-containment gate (`type_binding`) as a plain
+ * unsafe local, via `unsafe_carrying`'s `Named` leaf case reading the stamped decl's
+ * `is_unsafe`. Uses `instantiate_types` directly (not the full `type_program` pipeline) to
+ * build a table carrying the `Box__g__M` stamp, mirroring how `type_binding`'s OTHER F1
+ * tests reuse `unsafe_leaf_table()` directly.
+ */
+#test
+fn safe_fn_binds_local_of_generic_instance_over_unsafe_type_is_rejected() {
+    let items = teko::list::push(teko::list::push(teko::list::empty(), unsafe_leaf_item()), box_generic_item())
+    let leak_item = leak_box_fn_item(false)
+    let program = parser::Program { items = teko::list::push(items, leak_item) }
+    let table = instantiate_types(program, collect_types(program.items))
+    let ctor = parser::StructLit { type_path = path1("Box"); type_args = teko::list::push(teko::list::empty(), named_t("M")); field_names = teko::list::push(teko::list::empty(), "value"); field_vals = teko::list::push(teko::list::empty(), ek(parser::StructLit { type_path = path1("M"); type_args = teko::list::empty(); field_names = teko::list::push(teko::list::empty(), "p"); field_vals = teko::list::push(teko::list::empty(), e_num(0)) })) }
+    let bad = parser::Binding { kind = parser::BindKind::Let; target = parser::SimpleName { name = "x" }; has_type = true; type_ann = box_of_m_texpr(); value = ek(ctor) }
+    match type_binding(bad, empty_env(), table) {
+        TypedStmt => teko::assert::is_true(false)
+        error as e => teko::assert::is_true(teko::str::contains(e.message, "binds a local of unsafe type"))
+    }
+}
+
+/**
+ * F1's NESTED generic twin — `Box<Box<M>>` (a generic instance whose OWN type-argument is
+ * ANOTHER generic instance over an unsafe type) is transitively unsafe-carrying: the
+ * worklist stamps the INNER `Box__g__M` first (innermost-first, `collect_texpr_insts`), so
+ * by the time the OUTER `Box__g__Box__g__M` is stamped, `generic_args_unsafe_carrying` sees
+ * the inner stamp's `is_unsafe = true` directly (no extra depth cost — the Named leaf reads
+ * a flag, it does not re-walk the inner generic's substituted body).
+ */
+#test
+fn safe_fn_naming_nested_generic_instance_over_unsafe_type_is_rejected() {
+    let inner = box_of_m_texpr()
+    let outer = parser::NamedType { path = parser::Path { segments = teko::list::push(teko::list::empty(), parser::Segment { name = "Box" }) }; args = teko::list::push(teko::list::empty(), inner) }
+    let p = parser::Param { name = "b"; has_type = true; type_ann = outer; is_params = false; has_default = false; default_expr = e_num(0) }
+    let f = parser::Function { name = "leak_nested_box"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = teko::list::push(teko::list::empty(), p); has_return = false; return_type = named_t("i64"); body = teko::list::empty(); vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false; has_inject = false; injects = teko::list::empty(); is_unsafe = false }
+    let items = teko::list::push(teko::list::push(teko::list::push(teko::list::empty(), unsafe_leaf_item()), box_generic_item()), d1_item(f))
+    match type_program(parser::Program { items = items }) {
+        TProgram => teko::assert::is_true(false)
+        error as e => teko::assert::is_true(teko::str::contains(e.message, "names unsafe type in its signature"))
+    }
+}
+
+/**
+ * `generic_args_unsafe_carrying` direct unit coverage — true iff ANY argument in the list is
+ * unsafe-carrying (the leaf `M`), false when every argument is safe (an empty list included,
+ * the base case of the loop's guard never firing).
+ */
+#test
+fn generic_args_unsafe_carrying_any_vs_none() {
+    let table = unsafe_leaf_table()
+    let m = Named { name = "M" }
+    teko::assert::is_true(generic_args_unsafe_carrying(teko::list::push(teko::list::push(teko::list::empty(), i64t()), m), table))
+    teko::assert::is_false(generic_args_unsafe_carrying(teko::list::push(teko::list::push(teko::list::empty(), i64t()), Str { }), table))
+    teko::assert::is_false(generic_args_unsafe_carrying(teko::list::empty(), table))
+}
+
+/**
+ * The OTHER half of the stamp-time OR (F1, adversarial review of #333): an `unsafe type
+ * Box<T>` (the GENERIC BASE itself declared unsafe) instantiated with a perfectly SAFE
+ * argument (`Box<i64>`) still stamps `is_unsafe = true` — the base's OWN flag propagates to
+ * every instance regardless of the argument, exactly like a non-generic `unsafe type`'s
+ * `is_unsafe` is unconditional. Exercises the LEFT operand of `gen.is_unsafe ||
+ * generic_args_unsafe_carrying(...)` (the right-hand generic-over-unsafe case is covered by
+ * every OTHER F1 test above, where the base `Box` is always safe).
+ */
+#test
+fn unsafe_generic_base_instantiated_with_safe_arg_stamps_unsafe() {
+    let fld = parser::Field { name = "value"; type_ann = ttype_named("T"); vis = parser::Visibility::Pub; is_intern = false; has_doc = false; doc = "" }
+    let body = parser::StructBody { fields = teko::list::push(teko::list::empty(), fld); methods = teko::list::empty(); implements = teko::list::empty() }
+    let decl = parser::TypeDecl { name = "Box"; type_params = teko::list::push(teko::list::empty(), "T"); type_constraints = teko::list::empty(); body = body; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; di_kind = parser::DiKind::None; has_di_key = false; di_key = ""; is_unsafe = true; must_free = false }
+    let unsafe_box_item = parser::Item { content = decl; namespace = ""; file = "" }
+    let one = teko::list::push(teko::list::empty(), ttype_named("i64"))
+    let inst = parser::NamedType { path = parser::Path { segments = teko::list::push(teko::list::empty(), parser::Segment { name = "Box" }) }; args = one }
+    let p = parser::Param { name = "b"; has_type = true; type_ann = inst; is_params = false; has_default = false; default_expr = e_num(0) }
+    let f = parser::Function { name = "take_box"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = teko::list::push(teko::list::empty(), p); has_return = false; return_type = named_t("i64"); body = teko::list::empty(); vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false; has_inject = false; injects = teko::list::empty(); is_unsafe = false }
+    let items = teko::list::push(teko::list::push(teko::list::empty(), unsafe_box_item), d1_item(f))
+    match type_program(parser::Program { items = items }) {
+        TProgram => teko::assert::is_true(false)
+        error as e => teko::assert::is_true(teko::str::contains(e.message, "names unsafe type in its signature"))
+    }
 }
