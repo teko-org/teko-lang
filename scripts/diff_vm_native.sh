@@ -74,6 +74,17 @@ NATIVE_ONLY=(
     crypto_rand_secure_bytes
 )
 
+# ── COMPILE-FAIL list ──────────────────────────────────────────────────────────────────
+# NEGATIVE fixtures — a project the checker must REJECT (a compile error), on BOTH
+# engines, rather than run-and-compare exit codes/stdout (there is no successful run to
+# compare). Asserts `teko run` AND `teko build` both exit non-zero, proving the two
+# engines reject the SAME project identically.
+# must_free_leak — S2 (#336): a `#must_free` handle dropped without being freed on some
+#   path is a compile-time error (the local consume-or-fail dataflow), not a runtime one.
+COMPILE_FAIL=(
+    must_free_leak
+)
+
 is_expected_fail() {
     local name="$1" x
     for x in "${EXPECTED_FAIL[@]}"; do [ "$x" = "$name" ] && return 0; done
@@ -83,6 +94,12 @@ is_expected_fail() {
 is_native_only() {
     local name="$1" x
     for x in "${NATIVE_ONLY[@]}"; do [ "$x" = "$name" ] && return 0; done
+    return 1
+}
+
+is_compile_fail() {
+    local name="$1" x
+    for x in "${COMPILE_FAIL[@]}"; do [ "$x" = "$name" ] && return 0; done
     return 1
 }
 
@@ -185,6 +202,24 @@ for proj in "${fixtures[@]}"; do
     name="$(basename "$proj")"
     out="$work/$name"
     mkdir -p "$out"
+
+    # ── NEGATIVE fixture: both engines must REJECT it (a compile error), not run ───
+    if is_compile_fail "$name"; then
+        run_limited "$TEKO" run "$proj" >"$out/vm.stdout" 2>"$out/vm.stderr"
+        vm_rc=$?
+        run_limited "$TEKO" build "$proj" -o "$out/bin" >"$out/build.stdout" 2>"$out/build.stderr"
+        native_rc=$?
+        if [ "$vm_rc" -ne 0 ] && [ "$native_rc" -ne 0 ]; then
+            pass=$((pass + 1))
+            printf 'PASS  %-28s both engines reject (compile-fail) vm=%s native=%s\n' "$name" "$vm_rc" "$native_rc"
+        else
+            fail=$((fail + 1)); failed_names+=("$name")
+            printf 'FAIL  %-28s expected BOTH engines to reject; vm=%s native=%s\n' "$name" "$vm_rc" "$native_rc"
+            [ "$vm_rc" -eq 0 ] && tail -5 "$out/vm.stdout" | sed 's/^/      | vm: /'
+            [ "$native_rc" -eq 0 ] && tail -5 "$out/build.stdout" | sed 's/^/      | native: /'
+        fi
+        continue
+    fi
 
     # ── engine 1: the VM (skipped for native-only fixtures) ────────────────────────
     if ! is_native_only "$name"; then

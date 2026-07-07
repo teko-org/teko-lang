@@ -178,6 +178,35 @@ valid segment), OR name the namespace `teko::mem::raw` and reserve `unsafe` as a
 
 ---
 
+## 5a. S2 `#must_free` — the LOCAL consume-or-fail dataflow's honest first-cut bounds
+
+`#must_free` (issue #336) is a **local, per-binding** dataflow — no points-to/uniqueness fact, so
+(mirroring the `mem::free` aliased-UAF note in §5) it is powerless against the ALIASED-FREE
+use-after-free (`y = x; free(x); use(y)`), which still needs the spine (`#331`). Implementation
+surfaced FOUR further first-cut bounds, recorded here so they are documented, not silently
+assumed:
+
+- **Loop bodies are NOT walked.** A `#must_free` binding declared inside a `loop { }` body is not
+  checked at all — a leak there compiles silently today. The dataflow only walks straight-line
+  blocks and `if`/`match` branches reached from a tracked binding's own declaration point; it
+  never recurses into a `TLoopStmt`'s body. Closing this is a scope WIDENING (loop-body-aware
+  walking), not a bug fix — deferred, tracked alongside the spine work.
+- **A `#must_free` PARAM can only be consumed by `return h`.** A parameter is always immutable
+  (B.21), and `teko::mem::free` requires a `mut` target — so a received handle can never reach
+  `mem::free` directly; only a move-out via `return` consumes it. Consuming a param by moving it
+  into a callee (rather than returning it) needs general move-tracking, which is the spine's job
+  (`#331`), not this local check's.
+- **Reassigning a `mut #must_free` local leaks the overwritten value.** `mut h = make(); h =
+  make()` (an unfreed `h` overwritten before any free) is NOT caught — the dataflow tracks
+  whether `h`'s NAME is eventually consumed somewhere in its scope, not whether every VALUE ever
+  bound to it was. General move/assignment tracking is again the spine's job (`#331`).
+- **`must_free` is not yet serialized in the `.tkb` codec** (it mirrors the pre-existing
+  un-serialized `di_kind` gap there) — so the constraint is currently MODULE-LOCAL: a `.tkb`-read
+  `TypeDecl` always carries `must_free = false`. A `.tkl` package boundary must not yet rely on
+  `#must_free` surviving a `.tkb` round-trip; wiring the codec is a follow-up.
+
+---
+
 ## 6. The one-paragraph summary (for whoever opens the branch)
 
 Keep the arena as the invisible default; do not add a GC. Build the **spine** (a bounded inferred
