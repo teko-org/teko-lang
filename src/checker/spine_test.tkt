@@ -281,6 +281,20 @@ fn sp_bf_is_none(b: BorrowedFrom) -> bool { match b { BfNone => true; _ => false
 }
 
 /**
+ * `ref_target_outlives` REJECTS a `BfTop` borrow (the referent is unknown / joined-over) — the
+ * conservative unknown-referent arm, hand-installed since `fn_spine`'s L1 seeding never itself
+ * produces `BfTop`.
+ */
+#test fn spine_ref_target_outlives_rejects_bftop() {
+    let body = teko::list::push(teko::list::empty(), sp_let("y", sp_var("k", sp_i64())))
+    let base = fn_spine(sp_fn(teko::list::empty(), body))
+    let yi = cell_of(base, "y") to u32
+    let top_bf = sp_set_bf(base.bf, yi, sp_bf_top())
+    let s = Spine { cells = base.cells; pt = base.pt; bf = top_bf; us = base.us }
+    teko::assert::is_false(ref_target_outlives(s, yi, yi))
+}
+
+/**
  * The points-to join is a monotone least-upper-bound: `PtFrame` is bottom, the same concrete site
  * joins to itself, two DIFFERENT concrete sites climb to `PtTop`, and any `PtTop` input is absorbing.
  */
@@ -688,9 +702,9 @@ fn sp_continue() -> TStatement {
  */
 #test fn spine_add_stmt_cells_covers_assign_return_break_continue() {
     let body = teko::list::push(teko::list::push(teko::list::push(teko::list::push(teko::list::empty(),
-        sp_assign_simple("y", sp_field("x", "f", sp_i64()))),
-        sp_return(sp_field("z", "g", sp_i64()))),
-        sp_break()),
+                    sp_assign_simple("y", sp_field("x", "f", sp_i64()))),
+                sp_return(sp_field("z", "g", sp_i64()))),
+            sp_break()),
         sp_continue())
     let s = fn_spine(sp_fn(teko::list::empty(), body))
     teko::assert::is_true(sp_has_field_cell(s, "x", "f"))
@@ -703,8 +717,8 @@ fn sp_continue() -> TStatement {
  */
 #test fn spine_add_stmt_cells_recurses_into_loop_defer_adopt_bodies() {
     let body = teko::list::push(teko::list::push(teko::list::push(teko::list::empty(),
-        sp_loop(teko::list::push(teko::list::empty(), sp_exprstmt(sp_field("lp", "a", sp_i64()))))),
-        sp_defer(teko::list::push(teko::list::empty(), sp_exprstmt(sp_field("df", "b", sp_i64()))))),
+                sp_loop(teko::list::push(teko::list::empty(), sp_exprstmt(sp_field("lp", "a", sp_i64()))))),
+            sp_defer(teko::list::push(teko::list::empty(), sp_exprstmt(sp_field("df", "b", sp_i64()))))),
         sp_adopt(teko::list::push(teko::list::empty(), sp_exprstmt(sp_field("ad", "c", sp_i64())))))
     let s = fn_spine(sp_fn(teko::list::empty(), body))
     teko::assert::is_true(sp_has_field_cell(s, "lp", "a"))
@@ -980,6 +994,7 @@ fn sp_i64_lit(v: i128) -> TExpr {
 #test fn spine_bf_same_referent_covers_param_agreement_and_top_mismatch() {
     teko::assert::is_true(bf_same_referent(sp_bf_param(2), sp_bf_param(2)))
     teko::assert::is_false(bf_same_referent(sp_bf_top(), sp_bf_top()))
+    teko::assert::is_false(bf_same_referent(sp_bf_local("a"), sp_bf_none()))
 }
 
 /**
@@ -1003,6 +1018,18 @@ fn sp_i64_lit(v: i128) -> TExpr {
     let s = fn_spine(sp_fn(teko::list::empty(), body))
     teko::assert::is_true(is_unique_at(s, cell_of(s, "target") to u32))
     teko::assert::is_true(is_unique_at(s, cell_of(s, "m") to u32))
+}
+
+/**
+ * `transfer_assign`'s `Simple`-kind arm joins BOTH cells to `UsShared` when the RHS IS an alias
+ * source (`target = donor` where `donor` is a bare non-scalar local) — the `mark_alias_shared` call
+ * reached FROM `transfer_assign` itself (distinct from `transfer_binding`'s own call site).
+ */
+#test fn spine_transfer_assign_simple_kind_with_alias_source_marks_both_shared() {
+    let body = teko::list::push(teko::list::push(teko::list::push(teko::list::empty(), sp_let("donor", sp_i64_lit(1))), sp_let("target", sp_i64_lit(2))), sp_assign_simple("target", sp_nonscalar_var("donor")))
+    let s = fn_spine(sp_fn(teko::list::empty(), body))
+    teko::assert::is_false(is_unique_at(s, cell_of(s, "target") to u32))
+    teko::assert::is_false(is_unique_at(s, cell_of(s, "donor") to u32))
 }
 
 /**
