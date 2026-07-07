@@ -900,3 +900,158 @@ fn sp_i64_lit(v: i128) -> TExpr {
     let s = fn_spine(sp_fn(teko::list::empty(), body))
     teko::assert::is_false(is_unique_at(s, 999))
 }
+
+/**
+ * `add_cell` de-duplicates: adding the SAME `name` / `field` key twice leaves the universe with
+ * exactly one matching cell (the early-return `cell_index >= 0` branch).
+ */
+#test fn spine_add_cell_deduplicates_repeated_key() {
+    let once = add_cell(teko::list::empty(), "x", "", false)
+    let twice = add_cell(once, "x", "", false)
+    teko::assert::is_true(twice.len == 1)
+}
+
+/**
+ * `add_param_cells` covers a param with `has_type = false` (the OOP receiver-injected-type shape,
+ * `parser::Param`'s own contract) — never a `Reference`, since `type_ann_is_ref` is never consulted
+ * on that path.
+ */
+#test fn spine_add_param_cells_covers_receiver_param_without_type_annotation() {
+    let receiver = parser::Param { name = "self"; has_type = false; type_ann = sp_named_ann("i64"); is_params = false; has_default = false; default_expr = sp_no_expr() }
+    let params = teko::list::push(teko::list::empty(), receiver)
+    let s = fn_spine(sp_fn(params, teko::list::empty()))
+    let ri = cell_of(s, "self")
+    teko::assert::is_true(ri >= 0)
+    teko::assert::is_true(sp_pt_is_frame(s.pt[ri to u32]))
+}
+
+/**
+ * `add_field_cell` contributes NO cell for the OUTER two-hop path itself (`a.b.c` is never a cell —
+ * it collapses to `⊤`) when the receiver `a.b` is not a bare local; it still recurses into that
+ * non-bare receiver (`add_expr_cells`), so the INNER one-hop `a.b` is enumerated on its own.
+ */
+#test fn spine_add_field_cell_two_hop_path_yields_only_the_inner_one_hop_cell() {
+    let inner = sp_field("a", "b", sp_nonscalar())
+    let outer = TExpr { kind = TFieldAccess { receiver = inner; field = "c" }; type = sp_i64(); line = 0; col = 0 }
+    let body = teko::list::push(teko::list::empty(), sp_exprstmt(outer))
+    let s = fn_spine(sp_fn(teko::list::empty(), body))
+    teko::assert::is_true(sp_has_field_cell(s, "a", "b"))
+    teko::assert::is_false(sp_has_field_cell(s, "a", "c"))
+    teko::assert::is_true(cell_of(s, "a") < 0)
+}
+
+/**
+ * `pt_rank` maps every `PointsTo` member to its lattice rank: `PtFrame` = 0; `PtParam` / `PtAdopter`
+ * / `PtRoot` = 1; `PtTop` = 2.
+ */
+#test fn spine_pt_rank_covers_every_member() {
+    teko::assert::is_true(pt_rank(sp_pt_frame()) == 0)
+    teko::assert::is_true(pt_rank(sp_pt_param(0)) == 1)
+    teko::assert::is_true(pt_rank(sp_pt_adopter(0)) == 1)
+    teko::assert::is_true(pt_rank(sp_pt_root()) == 1)
+    teko::assert::is_true(pt_rank(sp_pt_top()) == 2)
+}
+
+/**
+ * `bf_rank` maps every `BorrowedFrom` member to its lattice rank: `BfNone` = 0; `BfParam` / `BfLocal`
+ * = 1; `BfTop` = 2.
+ */
+#test fn spine_bf_rank_covers_every_member() {
+    teko::assert::is_true(bf_rank(sp_bf_none()) == 0)
+    teko::assert::is_true(bf_rank(sp_bf_param(0)) == 1)
+    teko::assert::is_true(bf_rank(sp_bf_local("a")) == 1)
+    teko::assert::is_true(bf_rank(sp_bf_top()) == 2)
+}
+
+/**
+ * `pt_same_site` agrees on two `PtAdopter` values sharing a concrete region, and DISAGREES for a
+ * `PtRoot` paired with any non-`PtRoot` (the remaining cross-kind arm `pt_same_site`'s prior test
+ * did not reach).
+ */
+#test fn spine_pt_same_site_covers_adopter_agreement_and_root_mismatch() {
+    teko::assert::is_true(pt_same_site(sp_pt_adopter(3), sp_pt_adopter(3)))
+    teko::assert::is_false(pt_same_site(sp_pt_root(), sp_pt_frame()))
+}
+
+/**
+ * `bf_same_referent` agrees on two `BfParam` values naming the same slot (the remaining `BfParam`
+ * self-agreement arm) and disagrees for a `BfTop` paired with `BfTop` (never a named referent).
+ */
+#test fn spine_bf_same_referent_covers_param_agreement_and_top_mismatch() {
+    teko::assert::is_true(bf_same_referent(sp_bf_param(2), sp_bf_param(2)))
+    teko::assert::is_false(bf_same_referent(sp_bf_top(), sp_bf_top()))
+}
+
+/**
+ * `transfer_binding`'s `DestructurePattern` arm names no single target cell even when the RHS IS an
+ * alias source — a destructure binds MULTIPLE names, none of which this one-hop analysis can key,
+ * so the axis passes through unchanged (no cell is joined to `UsShared`).
+ */
+#test fn spine_transfer_binding_destructure_with_alias_source_rhs_is_a_no_op() {
+    let destructure = TBinding { kind = parser::BindKind::Let; target = parser::DestructurePattern { names = teko::list::push(teko::list::push(teko::list::empty(), "a"), "b") }; bound = sp_nonscalar(); value = sp_nonscalar_var("donor") }
+    let body = teko::list::push(teko::list::push(teko::list::empty(), sp_let("donor", sp_i64_lit(1))), destructure)
+    let s = fn_spine(sp_fn(teko::list::empty(), body))
+    teko::assert::is_true(is_unique_at(s, cell_of(s, "donor") to u32))
+}
+
+/**
+ * `transfer_assign`'s early return fires when the RHS is NOT an alias source (a scalar copy) — even
+ * for a `Simple`-kind assignment, no cell is joined to `UsShared`.
+ */
+#test fn spine_transfer_assign_scalar_rhs_is_a_no_op() {
+    let body = teko::list::push(teko::list::push(teko::list::push(teko::list::empty(), sp_let("m", sp_i64_lit(1))), sp_let("target", sp_i64_lit(2))), sp_assign_simple("target", sp_var("m", sp_i64())))
+    let s = fn_spine(sp_fn(teko::list::empty(), body))
+    teko::assert::is_true(is_unique_at(s, cell_of(s, "target") to u32))
+    teko::assert::is_true(is_unique_at(s, cell_of(s, "m") to u32))
+}
+
+/**
+ * `referent_not_escaping_adopter` ADMITS a `PtRoot` referent (a safe leak, never adopter-confined)
+ * and a `PtTop` referent (joined-over, treated as Root — never itself an adopter-escape reject).
+ */
+#test fn spine_referent_not_escaping_adopter_admits_root_and_top() {
+    let body = teko::list::push(teko::list::empty(), sp_let("only", sp_i64_lit(1)))
+    let base = fn_spine(sp_fn(teko::list::empty(), body))
+    let oi = cell_of(base, "only") to u32
+    let root_s = Spine { cells = base.cells; pt = sp_set_pt(base.pt, oi, sp_pt_root()); bf = base.bf; us = base.us }
+    let top_s = Spine { cells = base.cells; pt = sp_set_pt(base.pt, oi, sp_pt_top()); bf = base.bf; us = base.us }
+    teko::assert::is_true(referent_not_escaping_adopter(root_s, oi))
+    teko::assert::is_true(referent_not_escaping_adopter(top_s, oi))
+}
+
+/**
+ * `is_unique_at` treats a `UsTop` cell (joined-over) as NOT unique — the safe (over-reject)
+ * direction, exercised directly since `fn_spine`'s L1 transfer never itself produces `UsTop`.
+ */
+#test fn spine_is_unique_at_rejects_top() {
+    let body = teko::list::push(teko::list::empty(), sp_let("only", sp_i64_lit(1)))
+    let base = fn_spine(sp_fn(teko::list::empty(), body))
+    let oi = cell_of(base, "only") to u32
+    let top_us = sp_set_us(base.us, oi, sp_us_top())
+    let s = Spine { cells = base.cells; pt = base.pt; bf = base.bf; us = top_us }
+    teko::assert::is_false(is_unique_at(s, oi))
+}
+
+/**
+ * Return the unique-vs-shared axis with index `i` replaced by `v` (a test-local rebuild-by-copy,
+ * mirroring the module's `set_us`).
+ *
+ * @param us  the unique-vs-shared axis
+ * @param i   the cell index to replace
+ * @param v   the new unique-vs-shared value
+ * @return    the axis with element `i` set to `v`
+ */
+fn sp_set_us(us: []Unique, i: u32, v: Unique) -> []Unique {
+    mut acc: []Unique = teko::list::empty()
+    mut k = 0
+    loop {
+        if k >= us.len { break }
+        if k to u32 == i {
+            acc = teko::list::push(acc, v)
+        } else {
+            acc = teko::list::push(acc, us[k])
+        }
+        k++
+    }
+    acc
+}
