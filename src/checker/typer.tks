@@ -75,6 +75,7 @@ fn lam_collect_stmt(s: parser::Statement, refs: Ref<[]str>, bound: Ref<[]str>) -
         parser::LoopStmt as l => lam_collect_block(l.body, refs, bound)
         parser::ExprStmt as es => lam_collect_expr(es.expr, refs, bound)
         parser::DeferStmt as d => lam_collect_block(d.body, refs, bound)
+        parser::AdoptStmt as a => lam_collect_block(a.body, refs, bound)
         parser::BreakStmt => { }
         parser::ContinueStmt => { }
     }
@@ -3008,7 +3009,25 @@ fn type_statement(s: parser::Statement, env: Env, table: TypeTable) -> TypedStmt
             let tb = match type_block(d.body, env, table) { TypedBlock as x => x; error as e => return e }
             TypedStmt { node = TDeferStmt { body = tb.stmts }; env = env }
         }
+        parser::AdoptStmt as a => type_adopt(a, env, table)
     }
+}
+
+/**
+ * type_adopt — type-check an `adopt [name] { … }` block in void context. The body is an ordinary
+ * control-flow block (return/break/continue and nested `adopt` are ALL allowed — no defer-style
+ * rejection), typed via type_block so its bindings are scoped inside and don't leak `env`. The
+ * bound name is a codegen/region label; it introduces no binding into `env` in this increment.
+ *
+ * @param a      the parsed AdoptStmt
+ * @param env    the enclosing type environment (unchanged on return — the body is scoped)
+ * @param table  the program type table
+ * @return       the typed statement, or a type error propagated from the body
+ * @throws        when a body statement fails to type-check
+ */
+fn type_adopt(a: parser::AdoptStmt, env: Env, table: TypeTable) -> TypedStmt | error {
+    let tb = match type_block(a.body, env, table) { TypedBlock as x => x; error as e => return e }
+    TypedStmt { node = TAdoptStmt { name = a.name; body = tb.stmts }; env = env }
 }
 
 // ---- items + program (the evolved check_function/check_item/check_program — E5c) ----
