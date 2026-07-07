@@ -4,7 +4,7 @@ use teko::parser
  * A scalar `i64` type — a copy source (NOT an alias source; reading it carries no shared handle).
  *
  * The #331 L1 unit suite (`src/checker/spine_test.tkt`, namespace `teko::checker`) lives beside the
- * module so it reaches the PRIVATE lattice helpers (`pt_join` / `bf_join` / `us_join` / the seeds) as
+ * module so it reaches the PRIVATE lattice helpers (`pt_join` / `us_join` / the seeds) as
  * well as the PUBLIC query surface (`fn_spine` / `cell_of` / `ref_target_outlives` / `is_unique_at`).
  * It proves the fact is CORRECT on hand-built inputs: the finite cell universe, every lattice arm,
  * the three joins, the monotone alias-transfer, both gate queries (unique vs shared,
@@ -311,22 +311,6 @@ fn sp_bf_is_none(b: BorrowedFrom) -> bool { match b { BfNone => true; _ => false
 }
 
 /**
- * The borrowed-from join is a monotone least-upper-bound: `BfNone` is bottom, the same referent joins
- * to itself, two DIFFERENT referents climb to `BfTop`, and any `BfTop` input is absorbing.
- */
-#test fn spine_bf_join_is_monotone_lub() {
-    let none = sp_bf_none()
-    let b0 = sp_bf_param(0)
-    let b1 = sp_bf_param(1)
-    let top = sp_bf_top()
-    teko::assert::is_true(sp_bf_is_param(bf_join(none, b0)))
-    teko::assert::is_true(sp_bf_is_param(bf_join(b0, b0)))
-    teko::assert::is_true(sp_bf_is_top(bf_join(b0, b1)))
-    teko::assert::is_true(sp_bf_is_top(bf_join(top, none)))
-    teko::assert::is_true(sp_bf_is_none(bf_join(none, none)))
-}
-
-/**
  * The unique-vs-shared join climbs monotonically: `UsUnique < UsShared < UsTop`, and any `UsTop`
  * input is absorbing.
  */
@@ -413,34 +397,11 @@ fn sp_pt_top() -> PointsTo { PtTop { } }
 fn sp_pt_is_top(p: PointsTo) -> bool { match p { PtTop => true; _ => false } }
 
 /**
- * A `BfNone` borrowed-from value.
- *
- * @return the borrows-nothing value
- */
-fn sp_bf_none() -> BorrowedFrom { BfNone { } }
-
-/**
- * A `BfParam` borrowed-from value for slot `i`.
- *
- * @param i  the borrowed parameter slot
- * @return   the borrows-param value
- */
-fn sp_bf_param(i: u32) -> BorrowedFrom { BfParam { id = BfParamId { index = i } } }
-
-/**
  * A `BfTop` borrowed-from value.
  *
  * @return the joined-over borrowed-from value
  */
 fn sp_bf_top() -> BorrowedFrom { BfTop { } }
-
-/**
- * Is a borrowed-from value `BfTop`?
- *
- * @param b  the borrowed-from value
- * @return   true iff `BfTop`
- */
-fn sp_bf_is_top(b: BorrowedFrom) -> bool { match b { BfTop => true; _ => false } }
 
 /**
  * A `UsUnique` unique-vs-shared value.
@@ -807,18 +768,6 @@ fn sp_wild_arm(bodyexpr: TExpr) -> TArm {
 }
 
 /**
- * `bf_same_referent` agrees on two `BfLocal` values naming the SAME local, and DISAGREES across
- * every other pairing (different local names, or a cross-kind `BfParam` / `BfLocal` pair).
- */
-#test fn spine_bf_same_referent_covers_local_and_cross_kind_pairs() {
-    teko::assert::is_true(bf_same_referent(sp_bf_local("a"), sp_bf_local("a")))
-    teko::assert::is_false(bf_same_referent(sp_bf_local("a"), sp_bf_local("b")))
-    teko::assert::is_false(bf_same_referent(sp_bf_param(0), sp_bf_local("a")))
-    teko::assert::is_false(bf_same_referent(sp_bf_none(), sp_bf_param(0)))
-    teko::assert::is_false(bf_same_referent(sp_bf_top(), sp_bf_param(0)))
-}
-
-/**
  * A `BfLocal` borrowed-from value naming local `name`.
  *
  * @param name  the borrowed local's name
@@ -967,17 +916,6 @@ fn sp_i64_lit(v: i128) -> TExpr {
 }
 
 /**
- * `bf_rank` maps every `BorrowedFrom` member to its lattice rank: `BfNone` = 0; `BfParam` / `BfLocal`
- * = 1; `BfTop` = 2.
- */
-#test fn spine_bf_rank_covers_every_member() {
-    teko::assert::is_true(bf_rank(sp_bf_none()) == 0)
-    teko::assert::is_true(bf_rank(sp_bf_param(0)) == 1)
-    teko::assert::is_true(bf_rank(sp_bf_local("a")) == 1)
-    teko::assert::is_true(bf_rank(sp_bf_top()) == 2)
-}
-
-/**
  * `pt_same_site` agrees on two `PtAdopter` values sharing a concrete region, and DISAGREES for a
  * `PtRoot` paired with any non-`PtRoot` (the remaining cross-kind arm `pt_same_site`'s prior test
  * did not reach).
@@ -985,16 +923,6 @@ fn sp_i64_lit(v: i128) -> TExpr {
 #test fn spine_pt_same_site_covers_adopter_agreement_and_root_mismatch() {
     teko::assert::is_true(pt_same_site(sp_pt_adopter(3), sp_pt_adopter(3)))
     teko::assert::is_false(pt_same_site(sp_pt_root(), sp_pt_frame()))
-}
-
-/**
- * `bf_same_referent` agrees on two `BfParam` values naming the same slot (the remaining `BfParam`
- * self-agreement arm) and disagrees for a `BfTop` paired with `BfTop` (never a named referent).
- */
-#test fn spine_bf_same_referent_covers_param_agreement_and_top_mismatch() {
-    teko::assert::is_true(bf_same_referent(sp_bf_param(2), sp_bf_param(2)))
-    teko::assert::is_false(bf_same_referent(sp_bf_top(), sp_bf_top()))
-    teko::assert::is_false(bf_same_referent(sp_bf_local("a"), sp_bf_none()))
 }
 
 /**
@@ -1081,4 +1009,114 @@ fn sp_set_us(us: []Unique, i: u32, v: Unique) -> []Unique {
         k++
     }
     acc
+}
+
+/**
+ * The region id of a `PtAdopter` points-to value (precondition: `p` IS `PtAdopter`).
+ *
+ * @param p  the points-to value
+ * @return   its adopter region id
+ */
+fn sp_pt_adopter_region(p: PointsTo) -> u32 {
+    match p { PtAdopter as a => a.id.region; _ => 999 to u32 }
+}
+
+/**
+ * Is a points-to value `PtAdopter`?
+ *
+ * @param p  the points-to value
+ * @return   true iff `PtAdopter`
+ */
+fn sp_pt_is_adopter(p: PointsTo) -> bool { match p { PtAdopter => true; _ => false } }
+
+/**
+ * `fn_spine`'s `pt`-transfer wires `pt_join`/`PtAdopter` end to end (spine-build-plan §5.1): a
+ * binding inside an `adopt { }` block is `pt = PtAdopter(region)`, while a sibling binding OUTSIDE
+ * any adopter stays the seeded `PtFrame` floor — proving the adopter-confinement fact is a REAL
+ * fixpoint transfer, not merely a hand-installed test fixture.
+ */
+#test fn spine_fn_spine_marks_adopter_confined_bindings_pt_adopter() {
+    let body = teko::list::push(teko::list::push(teko::list::empty(),
+        sp_let("outside", sp_i64_lit(1))),
+        sp_adopt(teko::list::push(teko::list::empty(), sp_let("inside", sp_i64_lit(2)))))
+    let s = fn_spine(sp_fn(teko::list::empty(), body))
+    let oi = cell_of(s, "outside") to u32
+    let ii = cell_of(s, "inside") to u32
+    teko::assert::is_true(sp_pt_is_frame(s.pt[oi]))
+    teko::assert::is_true(sp_pt_is_adopter(s.pt[ii]))
+}
+
+/**
+ * Two SIBLING (non-nested) `adopt { }` blocks each earn their OWN region id — a binding inside the
+ * first adopter and a binding inside the second are never `pt_same_site`, so a borrow could not
+ * conflate one adopter's lifetime with the other's.
+ */
+#test fn spine_fn_spine_gives_sibling_adopters_distinct_region_ids() {
+    let body = teko::list::push(teko::list::push(teko::list::empty(),
+        sp_adopt(teko::list::push(teko::list::empty(), sp_let("first", sp_i64_lit(1))))),
+        sp_adopt(teko::list::push(teko::list::empty(), sp_let("second", sp_i64_lit(2)))))
+    let s = fn_spine(sp_fn(teko::list::empty(), body))
+    let fi = cell_of(s, "first") to u32
+    let si = cell_of(s, "second") to u32
+    teko::assert::is_true(sp_pt_is_adopter(s.pt[fi]))
+    teko::assert::is_true(sp_pt_is_adopter(s.pt[si]))
+    teko::assert::is_false(sp_pt_adopter_region(s.pt[fi]) == sp_pt_adopter_region(s.pt[si]))
+}
+
+/**
+ * A NESTED `adopt { }` (an adopter inside another adopter's body) opens its OWN fresh region,
+ * distinct from its enclosing adopter's — the inner binding is confined to the inner region, not
+ * merged with the outer one.
+ */
+#test fn spine_fn_spine_nested_adopter_opens_a_fresh_region() {
+    let inner_adopt = sp_adopt(teko::list::push(teko::list::empty(), sp_let("inner", sp_i64_lit(1))))
+    let body = teko::list::push(teko::list::empty(), sp_adopt(teko::list::push(teko::list::push(teko::list::empty(), sp_let("outer", sp_i64_lit(2))), inner_adopt)))
+    let s = fn_spine(sp_fn(teko::list::empty(), body))
+    let oi = cell_of(s, "outer") to u32
+    let ii = cell_of(s, "inner") to u32
+    teko::assert::is_true(sp_pt_is_adopter(s.pt[oi]))
+    teko::assert::is_true(sp_pt_is_adopter(s.pt[ii]))
+    teko::assert::is_false(sp_pt_adopter_region(s.pt[oi]) == sp_pt_adopter_region(s.pt[ii]))
+}
+
+/**
+ * A binding inside a `loop { }` / `defer { }` body that is itself INSIDE an `adopt { }` block still
+ * inherits the enclosing adopter's region (`pt_transfer_stmt`'s `TLoopStmt` / `TDeferStmt` recursion
+ * threads `has_region` through unchanged).
+ */
+#test fn spine_fn_spine_loop_and_defer_inside_adopter_inherit_its_region() {
+    let body = teko::list::push(teko::list::empty(), sp_adopt(teko::list::push(teko::list::push(teko::list::empty(),
+        sp_loop(teko::list::push(teko::list::empty(), sp_let("looped", sp_i64_lit(1))))),
+        sp_defer(teko::list::push(teko::list::empty(), sp_let("deferred", sp_i64_lit(2)))))))
+    let s = fn_spine(sp_fn(teko::list::empty(), body))
+    let li = cell_of(s, "looped") to u32
+    let di = cell_of(s, "deferred") to u32
+    teko::assert::is_true(sp_pt_is_adopter(s.pt[li]))
+    teko::assert::is_true(sp_pt_is_adopter(s.pt[di]))
+    teko::assert::is_true(sp_pt_adopter_region(s.pt[li]) == sp_pt_adopter_region(s.pt[di]))
+}
+
+/**
+ * `pt_transfer_binding`'s `DestructurePattern` arm names no single target cell inside an adopter
+ * either (mirrors `add_binding_cell` / `transfer_binding`'s own destructure no-op) — the axis passes
+ * through unchanged.
+ */
+#test fn spine_pt_transfer_binding_destructure_inside_adopter_is_a_no_op() {
+    let destructure = TBinding { kind = parser::BindKind::Let; target = parser::DestructurePattern { names = teko::list::push(teko::list::push(teko::list::empty(), "a"), "b") }; bound = sp_i64(); value = sp_i64_lit(1) }
+    let body = teko::list::push(teko::list::empty(), sp_adopt(teko::list::push(teko::list::empty(), destructure)))
+    let s = fn_spine(sp_fn(teko::list::empty(), body))
+    teko::assert::is_true(s.cells.len == 0)
+}
+
+/**
+ * `join_pt_adopter_at` leaves the axis UNCHANGED when the named key is not in the cell universe (the
+ * defensive `idx < 0` guard) — exercised directly since every binding `fn_spine` walks always has a
+ * corresponding cell in normal use.
+ */
+#test fn spine_join_pt_adopter_at_ignores_unknown_key() {
+    let body = teko::list::push(teko::list::empty(), sp_let("only", sp_i64_lit(1)))
+    let s = fn_spine(sp_fn(teko::list::empty(), body))
+    let unchanged = join_pt_adopter_at(s.cells, s.pt, "nonexistent", 0)
+    teko::assert::is_true(unchanged.len == s.pt.len)
+    teko::assert::is_true(sp_pt_is_frame(unchanged[cell_of(s, "only") to u32]))
 }

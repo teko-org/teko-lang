@@ -170,9 +170,15 @@ pub fn fn_spine(f: TFunction) -> Spine { /* build universe → seed → worklist
   relaxes R5); the referent's own `pt`/`us` are read by `ref_target_outlives`.
 - anything the analysis cannot name → join to `⊤` on the relevant axis (the safe direction).
 
-**The join** is componentwise (union for `pt`; `BfNone < BfParam/BfLocal < BfTop`; `UsUnique <
-UsShared < UsTop`). **Termination:** finite cell set × fixed-height lattice × monotone transfers ⇒
-fixpoint in ≤ `|cells| × 3` iterations (`spine-layer-or-replace.md` §2c.2 "termination").
+**The climbing axes join componentwise** — `pt` (union of allocation sites capped at `PtTop`) and
+`us` (`UsUnique < UsShared < UsTop`) are monotone-join-climbed to a fixpoint. **`bf` does NOT join:**
+it is SINGLE-ASSIGNMENT — a `Reference` cell is seeded once (`BfParam(i)`/`BfNone`, refs being
+parameter-only today) and, once L2a relaxes R5, written once more by DEFINITE ASSIGNMENT (`:=`) at
+the ref-bind's one referent site — never merged, because a ref names exactly one referent
+syntactically. The `BfNone < BfParam/BfLocal < BfTop` ordering exists for the outlives predicate's
+variant reads (`ref_target_outlives`), not for a join. **Termination:** finite cell set × fixed-height
+lattice × monotone transfers on the two climbing axes ⇒ fixpoint in ≤ `|cells| × 3` iterations
+(the `× 3` is the product-lattice height bound; `spine-layer-or-replace.md` §2c.2 "termination").
 
 ### 1.5 The two queries the L2 gates consume
 

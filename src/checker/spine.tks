@@ -14,10 +14,16 @@ use teko::parser
  * PR-1 SCOPE: the PURE query (`fn_spine`) plus its two gate queries (`ref_target_outlives` /
  * `is_unique_at`). Nothing consumes it for a decision yet (that is PR-2 / PR-3), so it emits no C
  * and relaxes no gate — FIXPOINT is preserved by construction. The universe is FINITE per function
- * (bindings + their one-hop fields + `Reference` params), which — with the fixed-height (≤ 3)
- * lattice axes — makes the worklist fixpoint terminate in ≤ |cells| × 3. The `name` / `field` pair
- * projects to the `escape.tks` name set by dropping `field` (a one-hop `x.f` cell projects to the
- * name `x`), so `fn_escaping_vars` stays byte-identical.
+ * (bindings + their one-hop fields + `Reference` params); the product lattice
+ * (`pt` × `bf` × `us`) has fixed height ≤ 3 per axis, bounding the STATE SPACE — not a claim every
+ * axis dynamically climbs. Only `pt` (the adopter-confinement transfer, §5.1) and `us` (the alias
+ * transfer) are MONOTONE-JOIN-climbed to a worklist fixpoint in ≤ |cells| × 3 join steps; `bf` is
+ * SINGLE-ASSIGNMENT (seeded once per `Reference` cell — a ref is parameter-only today — and, once
+ * PR-2's L2a relaxation lands, written once more by DEFINITE ASSIGNMENT at a local ref-bind's one
+ * syntactic borrow site, never by joining two candidate referents), so `BorrowedFrom` carries no
+ * join in this build (see its own doc-comment). The `name` / `field` pair projects to the
+ * `escape.tks` name set by dropping `field` (a one-hop `x.f` cell projects to the name `x`), so
+ * `fn_escaping_vars` stays byte-identical.
  *
  * @see docs/design/spine-build-plan.md §1 (L1 — the fact)
  * @see docs/design/spine-layer-or-replace.md §2c.2 (the abstract domain + termination)
@@ -124,13 +130,18 @@ pub type BfParam = struct { id: BfParamId }
  */
 pub type BfLocal = struct { id: BfLocalId }
 /**
- * `⊤` — the referent is unknown / joined-over. The outlives proof FAILS (REJECT); conservative.
+ * `⊤` — the referent is un-nameable (a shape `ref_target_outlives`' caller could not resolve to a
+ * single cell). The outlives proof FAILS (REJECT); conservative.
  */
 pub type BfTop = struct { }
 /**
- * For a `Reference` cell, WHICH referent it borrows (the borrowed-from axis). `⊤` (BfTop) ⇒ referent
- * unknown ⇒ the outlives proof FAILS ⇒ REJECT. A ref is parameter-only today, so `bf` is initially
- * `BfParam(i)` or `BfNone`. Fixed height ≤ 3 (`BfNone < BfParam / BfLocal < BfTop`).
+ * For a `Reference` cell, WHICH referent it borrows (the borrowed-from axis). Unlike `pt` / `us`,
+ * `bf` is SINGLE-ASSIGNMENT, not join-climbed: a ref is parameter-only today, so `fn_spine` seeds it
+ * once per cell (`BfParam(i)` for a `Reference` param, `BfNone` otherwise) and no L1 transfer ever
+ * revisits it. PR-2's L2a relaxation writes `bf(r) := BfLocal(referent-name)` by DEFINITE ASSIGNMENT
+ * at the one syntactic borrow site a local ref-bind names — never by joining two candidate
+ * referents (a binding names at most one RHS) — so `BorrowedFrom` carries no join in this build.
+ * `⊤` (BfTop) ⇒ referent unknown ⇒ the outlives proof FAILS ⇒ REJECT.
  */
 pub type BorrowedFrom = variant BfNone | BfParam | BfLocal | BfTop
 
@@ -501,55 +512,142 @@ fn pt_join(a: PointsTo, b: PointsTo) -> PointsTo {
 }
 
 /**
- * The lattice rank of a borrowed-from value (`BfNone` = 0 < named referent = 1 < `BfTop` = 2).
+ * The points-to axis threaded alongside a fresh-region-id counter while walking `adopt { }` blocks —
+ * each lexically distinct adopter earns its own `PtAdopter(region_id)` (§5.1), so the walk must carry
+ * both the growing axis and the next unused id together.
  *
- * @param b  the borrowed-from value
- * @return   its lattice rank
+ * @field pt           the points-to axis so far
+ * @field next_region  the next unused adopter region id
  */
-fn bf_rank(b: BorrowedFrom) -> u32 {
-    match b {
-        BfNone => 0
-        BfParam => 1
-        BfLocal => 1
-        BfTop => 2
+type PtTransferState = struct { pt: []PointsTo; next_region: u32 }
+
+/**
+ * Return the points-to axis with index `i` replaced by `v` (parallel arrays are rebuilt by copy —
+ * the compiler corpus has no in-place slice write for a value element; mirrors `set_us`).
+ *
+ * @param pt  the points-to axis
+ * @param i   the cell index to replace
+ * @param v   the new points-to value
+ * @return    the axis with element `i` set to `v`
+ */
+fn set_pt(pt: []PointsTo, i: u32, v: PointsTo) -> []PointsTo {
+    mut acc: []PointsTo = teko::list::empty()
+    mut k = 0
+    loop {
+        if k >= pt.len { break }
+        if k to u32 == i {
+            acc = teko::list::push(acc, v)
+        } else {
+            acc = teko::list::push(acc, pt[k])
+        }
+        k++
+    }
+    acc
+}
+
+/**
+ * Join `PtAdopter(region)` into the cell keyed `name` (field "" — a bare binding target), returning
+ * the updated axis. A missing cell leaves the axis unchanged (the key is not in this function's
+ * universe).
+ *
+ * @param cells   the cell universe
+ * @param pt      the points-to axis
+ * @param name    the bound name allocated inside the adopter
+ * @param region  the enclosing adopter's region id
+ * @return        the axis with the named cell joined to `PtAdopter(region)`
+ */
+fn join_pt_adopter_at(cells: []Cell, pt: []PointsTo, name: str, region: u32) -> []PointsTo {
+    let idx = cell_index(cells, name, "")
+    if idx < 0 { return pt }
+    set_pt(pt, idx to u32, pt_join(pt[idx to u32], PtAdopter { id = PtAdopterId { region = region; top = false } }))
+}
+
+/**
+ * The points-to transfer sweep over one statement block: every binding target INSIDE an `adopt { }`
+ * body (walked with `in_region` = that adopter's id) joins `PtAdopter(region)` into its cell (§5.1);
+ * a nested `adopt { }` allocates its OWN fresh region id (`state.next_region` bumped) so distinct
+ * adopters never merge into the same site. Recurses into loop / defer bodies too (their bindings
+ * inherit the SAME enclosing adopter, if any).
+ *
+ * @param body       the typed statement block
+ * @param cells      the cell universe
+ * @param in_region  the enclosing adopter's region id, valid iff `has_region`
+ * @param has_region true iff this block is (transitively) inside an `adopt { }`
+ * @param state      the points-to axis + next-region-id counter so far
+ * @return           the updated transfer state
+ */
+fn pt_transfer_block(body: []TStatement, cells: []Cell, in_region: u32, has_region: bool, state: PtTransferState) -> PtTransferState {
+    mut acc = state
+    mut i = 0
+    loop {
+        if i >= body.len { break }
+        acc = pt_transfer_stmt(body[i], cells, in_region, has_region, acc)
+        i++
+    }
+    acc
+}
+
+/**
+ * The points-to transfer for one statement: a `TBinding` to a `SimpleName` INSIDE an adopter joins
+ * `PtAdopter(region)` into its cell; `TLoopStmt` / `TDeferStmt` bodies recurse under the SAME
+ * enclosing region; a `TAdoptStmt` opens a FRESH region for its own body (nested adopters never
+ * collapse into one site).
+ *
+ * @param s          the typed statement
+ * @param cells      the cell universe
+ * @param in_region  the enclosing adopter's region id, valid iff `has_region`
+ * @param has_region true iff this statement is (transitively) inside an `adopt { }`
+ * @param state      the points-to axis + next-region-id counter so far
+ * @return           the updated transfer state
+ */
+fn pt_transfer_stmt(s: TStatement, cells: []Cell, in_region: u32, has_region: bool, state: PtTransferState) -> PtTransferState {
+    match s {
+        TBinding as b => pt_transfer_binding(b, cells, in_region, has_region, state)
+        TLoopStmt as l => pt_transfer_block(l.body, cells, in_region, has_region, state)
+        TDeferStmt as d => pt_transfer_block(d.body, cells, in_region, has_region, state)
+        TAdoptStmt as a => pt_transfer_adopt(a, cells, state)
+        TAssign => state
+        TReturn => state
+        TExprStmt => state
+        TBreakStmt => state
+        TContinueStmt => state
     }
 }
 
 /**
- * Do two borrowed-from values name the SAME referent? Two `BfParam` agree iff same slot; two
- * `BfLocal` agree iff same name.
+ * Join `PtAdopter(region)` into a binding's target cell when this binding is (transitively) inside an
+ * `adopt { }` block; a binding outside any adopter (`has_region = false`) is left untouched (its `pt`
+ * stays whatever the seed / an outer join already established).
  *
- * @param a  the first borrowed-from value
- * @param b  the second borrowed-from value
- * @return   true iff both name the identical referent
+ * @param b          the typed binding
+ * @param cells      the cell universe
+ * @param in_region  the enclosing adopter's region id, valid iff `has_region`
+ * @param has_region true iff this binding is (transitively) inside an `adopt { }`
+ * @param state      the points-to axis + next-region-id counter so far
+ * @return           the updated transfer state
  */
-fn bf_same_referent(a: BorrowedFrom, b: BorrowedFrom) -> bool {
-    match a {
-        BfParam as pa => match b { BfParam as pb => pa.id.index == pb.id.index; _ => false }
-        BfLocal as la => match b { BfLocal as lb => la.id.name == lb.id.name; _ => false }
-        BfNone => false
-        BfTop => false
+fn pt_transfer_binding(b: TBinding, cells: []Cell, in_region: u32, has_region: bool, state: PtTransferState) -> PtTransferState {
+    if !has_region { return state }
+    match b.target {
+        parser::SimpleName as sn => PtTransferState { pt = join_pt_adopter_at(cells, state.pt, sn.name, in_region); next_region = state.next_region }
+        parser::DestructurePattern => state
     }
 }
 
 /**
- * The borrowed-from join (least upper bound). `BfNone` is bottom; a named referent joined with the
- * same referent is itself; two DIFFERENT referents (or any pair reaching rank 2) climb to `BfTop`
- * (referent unknown ⇒ the outlives proof fails). Monotone.
+ * Open a FRESH region for an `adopt { }` block's own body (bumping `next_region`), then walk that
+ * body under the new region id — a nested adopter never shares its enclosing adopter's site (each
+ * lexical `adopt { }` is bulk-dropped independently).
  *
- * @param a  the current borrowed-from value
- * @param b  the incoming borrowed-from value
- * @return   the least upper bound of `a` and `b`
+ * @param a      the typed adopt statement
+ * @param cells  the cell universe
+ * @param state  the points-to axis + next-region-id counter so far
+ * @return       the updated transfer state
  */
-fn bf_join(a: BorrowedFrom, b: BorrowedFrom) -> BorrowedFrom {
-    let ra = bf_rank(a)
-    let rb = bf_rank(b)
-    if ra == 2 { return BfTop { } }
-    if rb == 2 { return BfTop { } }
-    if ra == 0 { return b }
-    if rb == 0 { return a }
-    if bf_same_referent(a, b) { return a }
-    BfTop { }
+fn pt_transfer_adopt(a: TAdoptStmt, cells: []Cell, state: PtTransferState) -> PtTransferState {
+    let region = state.next_region
+    let opened = PtTransferState { pt = state.pt; next_region = state.next_region + 1 }
+    pt_transfer_block(a.body, cells, region, true, opened)
 }
 
 /**
@@ -760,9 +858,10 @@ fn alias_src_name(e: TExpr) -> str {
  * The spine fact for one function — a bounded, per-function points-to / uniqueness lattice layered
  * BESIDE `fn_escaping_vars` (the name set stays byte-identical; this only ever CERTIFIES a subset of
  * what the name set over-marked). Builds the finite cell universe of `f`, seeds each axis at its
- * climb-floor, then runs the monotone alias-transfer to a fixpoint. Every transfer only moves a cell
- * UP the fixed-height (≤ 3) lattice, so it terminates in ≤ |cells| × 3 join steps (§2c.2
- * termination). Reads `f.params` + `f.body`; touches NO `mark_*` code.
+ * climb-floor, then runs the monotone alias-transfer (`us`) and the adopter-confinement transfer
+ * (`pt`, §5.1) to a fixpoint. Every transfer only moves a cell UP the fixed-height (≤ 3) lattice, so
+ * it terminates in ≤ |cells| × 3 join steps (§2c.2 termination). Reads `f.params` + `f.body`; touches
+ * NO `mark_*` code.
  *
  * @param f  the typed function to analyze
  * @return   the per-cell points-to / borrowed-from / unique-vs-shared fact for `f`
@@ -772,7 +871,8 @@ fn alias_src_name(e: TExpr) -> str {
 pub fn fn_spine(f: TFunction) -> Spine {
     let cells = add_block_cells(f.body, add_param_cells(f, teko::list::empty()))
     let us = transfer_block(f.body, cells, seed_us(cells))
-    Spine { cells = cells; pt = seed_pt(cells); bf = seed_bf(cells); us = us }
+    let pt_state = pt_transfer_block(f.body, cells, 0, false, PtTransferState { pt = seed_pt(cells); next_region = 0 })
+    Spine { cells = cells; pt = pt_state.pt; bf = seed_bf(cells); us = us }
 }
 
 /**
