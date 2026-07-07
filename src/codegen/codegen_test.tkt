@@ -972,6 +972,65 @@ fn cgt_emit_defer() {
     teko::assert::is_true(teko::str::contains(r2, "_c"))   // drained inside the if AND at the tail
 }
 
+/**
+ * cgt_emit_adopt — (#337) verify the `adopt { }` lowering opens an adopter region and closes it
+ * with the SUBTREE-drop primitive, and that a NESTED adopt opens a second (inner) region. The
+ * emitted C must name tk_region_new (the adopter open) and tk_region_drop_subtree (the bulk-drop
+ * at the brace), NOT the plain tk_region_drop — that distinction is what reclaims the per-object
+ * child regions instead of leaking them to the process root.
+ */
+#test
+fn cgt_emit_adopt() {
+    let prog = cgt_prog()
+    let ret_type = checker::Prim { kind = checker::PrimKind::I64 }
+
+    let inner_body: []checker::TStatement = teko::list::push(cgt_empty_stmts(), checker::TBinding {
+            kind = parser::BindKind::Let
+            target = parser::SimpleName { name = "_a" }
+            bound = checker::Prim { kind = checker::PrimKind::I64 }
+            value = cgt_num_i64(0)
+    })
+    let adopt_s: checker::TStatement = checker::TAdoptStmt { name = ""; body = inner_body }
+    mut body: []checker::TStatement = cgt_empty_stmts()
+    body = teko::list::push(body, adopt_s)
+    body = teko::list::push(body, cgt_ret(cgt_num_i64(3)))
+    let f = cgt_fn0("cgt_fn_adopt", "teko::cgt", ret_type, body)
+    let r = match emit_function(cgt_empty(), prog, f) { []byte as o => str(o); error => "" }
+    teko::assert::is_true(teko::str::contains(r, "cgt_fn_adopt"))
+    teko::assert::is_true(teko::str::contains(r, "tk_region_new"))
+    teko::assert::is_true(teko::str::contains(r, "tk_region_drop_subtree"))
+
+    let named_s: checker::TStatement = checker::TAdoptStmt { name = "r"; body = inner_body }
+    let nested_body: []checker::TStatement = teko::list::push(cgt_empty_stmts(), named_s)
+    let outer_s: checker::TStatement = checker::TAdoptStmt { name = ""; body = nested_body }
+    mut body2: []checker::TStatement = cgt_empty_stmts()
+    body2 = teko::list::push(body2, outer_s)
+    body2 = teko::list::push(body2, cgt_ret(cgt_num_i64(3)))
+    let f2 = cgt_fn0("cgt_fn_adopt_nested", "teko::cgt", ret_type, body2)
+    let r2 = match emit_function(cgt_empty(), prog, f2) { []byte as o => str(o); error => "" }
+    teko::assert::is_true(teko::str::contains(r2, "cgt_fn_adopt_nested"))
+    teko::assert::is_true(count_substr(r2, "tk_region_drop_subtree") >= 2)
+}
+
+/**
+ * count_substr — the number of non-overlapping occurrences of `needle` in `hay`. Used by the
+ * nested-adopt test to prove BOTH the inner and outer adopters emit a subtree-drop.
+ *
+ * @param hay     the text to search
+ * @param needle  the substring to count (non-empty)
+ * @return        the occurrence count
+ */
+fn count_substr(hay: str, needle: str) -> u64 {
+    if needle.len == 0 { return 0 }
+    mut n: u64 = 0
+    mut i: u64 = 0
+    loop {
+        if i + needle.len > hay.len { break }
+        if teko::str::contains(teko::str::slice(hay, i, i + needle.len), needle) { n = n + 1; i = i + needle.len } else { i = i + 1 }
+    }
+    n
+}
+
 // ---------------------------------------------------------------------------
 // Helper: 3-segment path for teko::list::empty / push
 // ---------------------------------------------------------------------------
