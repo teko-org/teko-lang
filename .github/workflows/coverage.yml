@@ -37,16 +37,23 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: ./scripts/ci_provision_teko.sh linux-x86_64
 
-      - name: Build gen-1 (the umbrella compiler — has the new syntax)
-        run: teko . -o bin
+      # Build gen-1 AND write Cobertura from the NATIVE (out-of-process) coverage sinks — the same
+      # low-memory path as the passing native gate. NOT `teko test . --coverage`, which runs the
+      # corpus in the VM in-process and the extra memory gets the CI job killed ("operation canceled").
+      - name: Build gen-1 + native coverage → cobertura
+        run: teko . -o bin --coverage
 
-      - name: Produce the Cobertura report (gen-1)
-        run: ./bin/teko test . --coverage
+      - name: Locate the Cobertura report
+        id: cov
+        run: |
+          f="$(find . -name cobertura.xml -print -quit)"
+          echo "path=$f" >> "$GITHUB_OUTPUT"
+          echo "found: $f"
 
       - name: Upload coverage to GitHub Code Quality
         uses: actions/upload-code-coverage@v1
         with:
-          file: cobertura.xml
+          file: ${{ steps.cov.outputs.path }}
           language: C
           label: code-coverage/teko
           fail-on-error: false
