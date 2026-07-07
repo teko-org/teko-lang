@@ -48,6 +48,9 @@ fn parse_statement(tokens: []lexer::Token, pos: u64) -> Parsed<Statement> | erro
         let blk = match parse_block(tokens, lbrace) { ParsedList<Statement> as x => x; error as e => return e }
         return Parsed<Statement> { node = DeferStmt { body = blk.items }; next = blk.next }
     }
+    if is_adopt_head(tokens, pos) {
+        return parse_adopt(tokens, pos)
+    }
     if is_kind_at(tokens, pos, lexer::TokenKind::Let) || is_kind_at(tokens, pos, lexer::TokenKind::Mut) || is_kind_at(tokens, pos, lexer::TokenKind::Const) {
         return parse_binding(tokens, pos)
     }
@@ -75,6 +78,46 @@ fn parse_statement(tokens: []lexer::Token, pos: u64) -> Parsed<Statement> | erro
         return Parsed<Statement> { node = Assign { kind = AssignKind::Field; name = ""; op = op; value = v.node; deref = false; target = e.node }; next = v.next }
     }
     Parsed<Statement> { node = ExprStmt { expr = e.node }; next = e.next }
+}
+
+/**
+ * is_adopt_head — is the token at `pos` a CONTEXTUAL `adopt` statement head? True only for the
+ * ident text "adopt" immediately followed by `{` (`adopt { … }`) OR by an ident then `{`
+ * (`adopt name { … }`). Any other use of a symbol named `adopt` (an assignment target, an
+ * expression, a field/method receiver) is NOT a head and falls through to ordinary parsing, so a
+ * local or namespace segment named `adopt` stays legal (the contextual-keyword invariant).
+ *
+ * @param tokens  the token stream
+ * @param pos     the candidate statement-head index
+ * @return        true when `pos` opens an adopter block
+ */
+fn is_adopt_head(tokens: []lexer::Token, pos: u64) -> bool {
+    if !is_kind_at(tokens, pos, lexer::TokenKind::Ident) { return false }
+    if tokens[pos].text != "adopt" { return false }
+    if is_kind_at(tokens, pos + 1, lexer::TokenKind::LBrace) { return true }
+    is_kind_at(tokens, pos + 1, lexer::TokenKind::Ident) && is_kind_at(tokens, pos + 2, lexer::TokenKind::LBrace)
+}
+
+/**
+ * parse_adopt — parse a contextual `adopt [name] { stmts }` at `pos` (the `adopt` ident). An
+ * optional bound name (an ident before the `{`, mirroring the `loop NAME {` label) is captured;
+ * a mandatory block then follows, reusing parse_block. Unlike `defer`, the body may contain
+ * `return`/`break`/`continue` and nested `adopt` — no rejection here.
+ *
+ * @param tokens  the token stream
+ * @param pos     the index of the `adopt` ident (is_adopt_head already true)
+ * @return        the parsed AdoptStmt and the index past its closing brace, or a parse error
+ * @throws        when the mandatory `{` is absent after the optional name
+ */
+fn parse_adopt(tokens: []lexer::Token, pos: u64) -> Parsed<Statement> | error {
+    mut name = ""
+    mut lbrace = pos + 1
+    if is_kind_at(tokens, pos + 1, lexer::TokenKind::Ident) { name = tokens[pos + 1].text; lbrace = pos + 2 }
+    if !is_kind_at(tokens, lbrace, lexer::TokenKind::LBrace) {
+        return err_at(tokens, lbrace, "expected '{' after `adopt`")
+    }
+    let blk = match parse_block(tokens, lbrace) { ParsedList<Statement> as x => x; error as e => return e }
+    Parsed<Statement> { node = AdoptStmt { name = name; body = blk.items }; next = blk.next }
 }
 
 // a `{ … }` block: a sequence of statements, `;`/newline separated; empty `{ }` allowed;

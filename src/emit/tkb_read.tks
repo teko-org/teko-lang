@@ -538,6 +538,11 @@ fn read_tstatement(r: Reader, table: []str) -> RTStmt | error {
         let bd = match read_tstatements(tag.r, table) { RTStmts as x => x; error as e => return e }
         return RTStmt { r = bd.r; value = checker::TDeferStmt { body = bd.value } }
     }
+    if tag.value == 8 {
+        let nm = match tkb_read_str(tag.r, table) { RStr as x => x; error as e => return e }
+        let bd = match read_tstatements(nm.r, table) { RTStmts as x => x; error as e => return e }
+        return RTStmt { r = bd.r; value = checker::TAdoptStmt { name = nm.value; body = bd.value } }
+    }
     error { message = "bad tstatement tag in .tkb" }
 }
 
@@ -635,7 +640,8 @@ fn read_constraints(r: Reader, table: []str) -> RConstraints | error {
 }
 /** (#165 C4) a parser::Function (type-body method): inverse of write_function. has_body is always 0
     (the honest signature-only stub — R2); a nonzero has_body would need a parser-statement codec that
-    does not exist, so reject it loudly rather than mis-read. */
+    does not exist, so reject it loudly rather than mis-read. is_unsafe (U1) rides last — always false
+    for a method (the enclosing TypeDecl.is_unsafe is the source of truth per the remodel design). */
 fn read_function(r: Reader, table: []str) -> RFunction | error {
     let nm = match tkb_read_str(r, table) { RStr as x => x; error as e => return e }
     let tp = match read_strs(nm.r, table) { RStrs as x => x; error as e => return e }
@@ -659,14 +665,15 @@ fn read_function(r: Reader, table: []str) -> RFunction | error {
     let ia = match read_u8(ii.r) { RByte as x => x; error as e => return e }
     let iv = match read_u8(ia.r) { RByte as x => x; error as e => return e }
     let io = match read_u8(iv.r) { RByte as x => x; error as e => return e }
-    RFunction { r = io.r; value = parser::Function {
+    let iu = match read_u8(io.r) { RByte as x => x; error as e => return e }
+    RFunction { r = iu.r; value = parser::Function {
             name = nm.value; type_params = tp.value; type_constraints = tc.value; params = ps.value
             has_return = hr.value != 0; return_type = rt.value; body = teko::list::empty()
             vis = vis.value to parser::Visibility; has_doc = hd.value != 0; doc = doc.value
             line = ln.value; col = cl.value; is_test = it.value != 0; is_extern = ie.value != 0
             c_symbol = cs.value; from_lib = fr.value; os_guard = og.value
             is_intern = ii.value != 0; is_abstract = ia.value != 0; is_virtual = iv.value != 0; is_override = io.value != 0
-            has_inject = false; injects = teko::list::empty()
+            has_inject = false; injects = teko::list::empty(); is_unsafe = iu.value != 0
     } }
 }
 /** (#165 C4/C5) a []parser::Function: inverse of write_functions (declaration = vtable order). */
@@ -740,6 +747,20 @@ fn read_typebody(r: Reader, table: []str) -> RTypeBody | error {
     }
     error { message = "bad typebody tag in .tkb" }
 }
+/**
+ * Read a parser TypeDecl: inverse of write_typedecl.
+ *
+ * `di_kind`/`has_di_key`/`di_key` are NOT round-tripped (write_typedecl never serializes them) —
+ * a `.tkb`-read TypeDecl always carries `di_kind = None`, a pre-existing gap this pass does not
+ * close. `must_free` (S2, the 0.1.0.0-beta memory+unsafe remodel #336) is likewise not yet
+ * serialized — it always reads back `false`, consistent with the same precedent; wiring it
+ * through the `.tkb` codec is a follow-up, not part of this local checker-only change.
+ *
+ * @param r      the reader cursor, positioned at the TypeDecl's first field
+ * @param table  the program's deduplicated string table (referenced by index)
+ * @return       the decoded TypeDecl plus the reader's advanced position
+ * @throws       a malformed-encoding error (propagated from any field reader)
+ */
 fn read_typedecl(r: Reader, table: []str) -> RTypeDecl | error {
     let nm = match tkb_read_str(r, table) { RStr as x => x; error as e => return e }
     let tp = match read_strs(nm.r, table) { RStrs as x => x; error as e => return e }
@@ -750,13 +771,23 @@ fn read_typedecl(r: Reader, table: []str) -> RTypeDecl | error {
     let doc = match tkb_read_str(hd.r, table) { RStr as x => x; error as e => return e }
     let ln = match read_u32(doc.r) { RU32 as x => x; error as e => return e }
     let cl = match read_u32(ln.r) { RU32 as x => x; error as e => return e }
-    RTypeDecl { r = cl.r; value = parser::TypeDecl { name = nm.value; type_params = tp.value; type_constraints = tc.value; body = bd.value; vis = vis.value to parser::Visibility; has_doc = hd.value != 0; doc = doc.value; line = ln.value; col = cl.value; di_kind = parser::DiKind::None; has_di_key = false; di_key = "" } }
+    let iu = match read_u8(cl.r) { RByte as x => x; error as e => return e }
+    RTypeDecl { r = iu.r; value = parser::TypeDecl { name = nm.value; type_params = tp.value; type_constraints = tc.value; body = bd.value; vis = vis.value to parser::Visibility; has_doc = hd.value != 0; doc = doc.value; line = ln.value; col = cl.value; di_kind = parser::DiKind::None; has_di_key = false; di_key = ""; is_unsafe = iu.value != 0; must_free = false } }
 }
+/**
+ * The inverse of `write_usedecl` — reads `path` + `has_alias` + `alias` + `names` (S1, the
+ * 0.1.0.0-beta remodel §3.1).
+ *
+ * @param r     the reader cursor
+ * @param table the interned string table
+ * @return      the decoded `UseDecl` plus the resume cursor, or a decode error
+ */
 fn read_usedecl(r: Reader, table: []str) -> RUseDecl | error {
     let p = match read_path(r, table) { RPath as x => x; error as e => return e }
     let ha = match read_u8(p.r) { RByte as x => x; error as e => return e }
     let al = match tkb_read_str(ha.r, table) { RStr as x => x; error as e => return e }
-    RUseDecl { r = al.r; value = parser::UseDecl { path = p.value; has_alias = ha.value != 0; alias = al.value } }
+    let nl = match read_strs(al.r, table) { RStrs as x => x; error as e => return e }
+    RUseDecl { r = nl.r; value = parser::UseDecl { path = p.value; has_alias = ha.value != 0; alias = al.value; names = nl.value } }
 }
 fn read_tfunction(r: Reader, table: []str) -> RTFunction | error {
     let nm = match tkb_read_str(r, table) { RStr as x => x; error as e => return e }

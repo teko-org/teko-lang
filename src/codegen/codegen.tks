@@ -5989,7 +5989,57 @@ fn emit_stmt(buf: []byte, s: checker::TStatement, in_main: bool, prog: checker::
         // emit_stmt itself emits NOTHING inline for a defer. It fires LIFO at its scope's exit edge.
         // (C: TK_TSTMT_DEFER — g_cg_defers[g_cg_ndefers++] = s, emits nothing.)
         checker::TDeferStmt => b0
+        checker::TAdoptStmt as a => emit_adopt(b0, a, in_main, prog, ret_type, indent, frame, escaping, regions, fn_body, dctx)
     }
+}
+
+/**
+ * emit_adopt — lower an `adopt [name] { … }` block (the C1 closer). ALWAYS opens an adopter region
+ * `tk_region_new(<enclosing>)` (unlike an arm region, opened only when it has a block-local — an
+ * adopter is opened unconditionally, since its purpose IS to own every allocation inside), pushes a
+ * RegionFrame so cg_enclosing_region_expr returns the adopter for every allocation inside (each
+ * per-object class child region parents under it), emits the body, fires the block's defers LIFO,
+ * then SUBTREE-DROPS: `tk_region_drop_subtree(<adopter>)` frees the adopter AND every object region
+ * parented under it in one sweep (cycles irrelevant). A `return`/`break`/`continue` inside the body
+ * drops the adopter region via the region-stack helpers (a plain drop — a SAFE leak of the object
+ * subtree on that rare escape edge; the normal brace does the full subtree reclamation).
+ *
+ * ACCEPTED LIMITATIONS (by design, per the issue — do not "fix" without a follow-on spine issue):
+ *   - DYNAMIC correctness only, no static escape gate: an object built with a lexical struct-init
+ *     directly inside `adopt { }` and then STORED into an outer binding (escaping the block)
+ *     DANGLES after the brace — its child region was subtree-dropped along with everything else.
+ *     `adopt` does not prove non-escape; that is deferred to a future spine-based confinement
+ *     analysis layered on top of this dynamic primitive.
+ *   - "lexically inside" is literal: an object built by a FACTORY/METHOD CALLED FROM inside
+ *     `adopt { }` (e.g. `Node::make(1)`) opens its per-object region parented to THAT FUNCTION's
+ *     own enclosing region (typically root, if the factory has no frame region of its own) — NOT
+ *     the caller's adopter. Such an object safely LEAKS to root (within-model, not reclaimed by
+ *     the adopt brace); only allocations the adopt body performs directly are captured.
+ *
+ * @param buf       the C output buffer
+ * @param a         the typed adopt statement
+ * @param in_main   whether the enclosing function is the virtual-main
+ * @param prog      the typed program
+ * @param ret_type  the enclosing function's return type
+ * @param indent    the C indentation
+ * @param frame     the enclosing frame region name (fallback parent when the region stack is empty)
+ * @param escaping  the enclosing function's escape set
+ * @param regions   the active block-region stack
+ * @param fn_body   the enclosing function body (for block-local analysis)
+ * @param dctx      the threaded defer/coverage context
+ * @return          the buffer with the adopter block emitted, or a codegen error
+ * @throws          when a body statement fails to emit
+ */
+fn emit_adopt(buf: []byte, a: checker::TAdoptStmt, in_main: bool, prog: checker::TProgram, ret_type: checker::Type, indent: str, frame: str, escaping: []str, regions: []RegionFrame, fn_body: []checker::TStatement, dctx: DeferCtx) -> []byte | error {
+    let base = dctx.defers.len
+    let fall = cg_append_direct_defers(dctx.defers, a.body)
+    let region = fresh_named("_tkad", buf.len to i64)
+    mut out = cb(buf, indent); out = cb(out, "tk_region *"); out = cb(out, region); out = cb(out, " = tk_region_new("); out = cb(out, cg_enclosing_region_expr_framed(regions, frame)); out = cb(out, ");\n")
+    let regs2 = teko::list::push(regions, RegionFrame { name = region; label = ""; is_loop = false; defer_base = base })
+    out = match emit_block(out, a.body, in_main, prog, ret_type, indent, escaping, regs2, fn_body, dctx, a.body, false) { []byte as o => o; error as err => return err }
+    out = match emit_defers(out, fall, base, prog, indent, escaping, fn_body) { []byte as o => o; error as err => return err }
+    out = cb(out, indent); out = cb(out, "tk_region_drop_subtree("); out = cb(out, region); out = cb(out, "); "); out = cb(out, region); out = cb(out, " = NULL;\n")
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -6720,6 +6770,7 @@ fn cg_collect_block_opts(set: CgTypeSet, stmts: []checker::TStatement) -> CgType
             checker::TLoopStmt as l => { s = cg_collect_block_opts(s, l.body) }
             checker::TExprStmt as es => { s = cg_collect_expr_opts(s, es.expr) }
             checker::TDeferStmt as d => { s = cg_collect_block_opts(s, d.body) }
+            checker::TAdoptStmt as a => { s = cg_collect_block_opts(s, a.body) }
             _ => { }
         }
         i++
@@ -7494,6 +7545,7 @@ fn cg_lift_stmt(s: checker::TStatement, acc: Ref<StampAcc>) -> checker::TStateme
         checker::TLoopStmt as l => checker::TLoopStmt { label = l.label; body = cg_lift_block(l.body, acc) }
         checker::TExprStmt as es => checker::TExprStmt { expr = cg_lift_expr(es.expr, acc) }
         checker::TDeferStmt as d => checker::TDeferStmt { body = cg_lift_block(d.body, acc) }
+        checker::TAdoptStmt as a => checker::TAdoptStmt { name = a.name; body = cg_lift_block(a.body, acc) }
         checker::TBreakStmt => s
         checker::TContinueStmt => s
     }

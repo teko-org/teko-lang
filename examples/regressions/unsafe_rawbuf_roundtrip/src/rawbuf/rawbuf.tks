@@ -1,0 +1,72 @@
+/**
+ * A LOCAL COPY of the U3 (`teko::mem::unsafe`, issue #334) `RawBuf` shape, WITH the `unsafe`
+ * modifier (this fixture is compiled by gen1/native, never the released seed, so U1's `unsafe`
+ * grammar is available here — unlike the stdlib module itself, which stages the modifier off
+ * until a seed refresh; see `src/mem/unsafe/rawbuf.tks`'s header). Mirrors the established
+ * cross-project convention (`crypto_hash_kat`'s verbatim `crypto.tks` copy): a regression
+ * fixture is its own standalone project, so it self-contains the shapes it exercises.
+ *
+ * An `unsafe type` pairing a raw address with its length in bytes — lowers to exactly
+ * `typedef struct tk_t_RawBuf { uint8_t *ptr; uint64_t len; } tk_t_RawBuf;` (AC#2), since
+ * codegen's `emit_type_decl` keys off the body shape, never the `unsafe` flag (AC#5).
+ */
+pub unsafe type RawBuf = struct {
+    /** The buffer's raw base address, as returned by `teko::mem::buf_ptr`. */
+    ptr: ptr<byte>
+
+    /** The buffer's length in bytes. */
+    len: u64
+}
+
+/**
+ * Bump-allocates a fresh `len`-byte arena region and wraps its raw address in a `RawBuf`.
+ * `unsafe fn` because its return type names the `unsafe type RawBuf` (U2's fn-signature
+ * containment gate) — a `pub fn` here would be rejected.
+ *
+ * @param len the buffer's length in bytes
+ * @return    a `RawBuf` describing the freshly allocated region
+ */
+pub unsafe fn rawbuf_alloc(len: u64) -> RawBuf {
+    RawBuf { ptr = teko::mem::buf_ptr(len); len = len }
+}
+
+/**
+ * Reads `buf`'s bytes back into a safe `[]byte` copy — the one boundary crossing a `RawBuf` may
+ * perform (the remodel's §2 boundary rule: only a by-value safe copy, or an `Owned<T>`, may
+ * leave an `unsafe fn`). `unsafe fn` because its parameter names the `unsafe type RawBuf`.
+ *
+ * @param buf the buffer to read
+ * @return    a freshly copied `[]byte` holding `buf.len` bytes read from `buf.ptr`
+ */
+pub unsafe fn rawbuf_read(buf: RawBuf) -> []byte {
+    teko::mem::bytes_from_ptr(buf.ptr, buf.len)
+}
+
+/**
+ * Raw libc `memset` — NOT `from "teko_rt"` (no Teko-owned wrapper), mirroring
+ * `buf_ptr_memset_roundtrip`'s `fill_bytes`. Binds directly to the C runtime symbol linked
+ * into every generated binary. Fills `n` bytes at `dst` with `val` and returns `dst`.
+ */
+pub extern fn fill_bytes(dst: ptr<byte>, val: i32, n: u64) -> ptr<byte> = "memset"
+
+/**
+ * Allocates an 8-byte `RawBuf` (AC#1), fills it with the byte value 5 through the raw `memset`
+ * extern reaching directly into its raw `ptr<byte>` field, then reads the written bytes back
+ * as a safe `[]byte` (`rawbuf_read`, the boundary crossing) and sums them. Deterministic:
+ * 8 bytes * 5 = 40. `unsafe fn` because it binds a local of the `unsafe type RawBuf`.
+ *
+ * @return the sum of the 8 filled bytes (40)
+ */
+pub unsafe fn filled_sum() -> i32 {
+    let buf = rawbuf_alloc(8)
+    fill_bytes(buf.ptr, 5, buf.len)
+    let written = rawbuf_read(buf)
+    mut total: i32 = 0
+    mut i: u64 = 0
+    loop {
+        if i >= written.len { break }
+        total = total + (written[i] to i32)
+        i++
+    }
+    total
+}
