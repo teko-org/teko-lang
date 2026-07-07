@@ -877,25 +877,33 @@ pub fn is_unsafe_type(name: str, table: TypeTable) -> bool {
 /**
  * Does the resolved `t` CARRY an unsafe-typed component — either `t` itself names an
  * `unsafe type` (the leaf case) or `t` is a compositional carrier (`[]M`, `M?`, `Ref<M>`,
- * `ptr<M>`, or a variant with an unsafe member) wrapping one? Mirrors the recursion shape
- * of `widens_into_at`/`carries_sentinel`: depth-bounded so a self-referential variant
- * cannot loop. This is the sole engine behind the U2 containment gates (field
- * composition, fn signatures, locals) — every carrier the checker lets a value travel
+ * `ptr<M>`, a variant with an unsafe member, or a `fn(…)->…` signature naming an unsafe
+ * param/return) wrapping one? Mirrors the recursion shape of `widens_into_at`/
+ * `carries_sentinel`: depth-bounded so a self-referential variant cannot loop. Fails
+ * CLOSED at the depth bound (a containment gate exhausting its budget must REJECT, never
+ * silently pass unsafe data through as "not carrying"). A `Func` is recursed into because
+ * this walk is about DATA the value's TYPE names, not call sites — calls stay uncolored,
+ * but a safe field/param typed `fn(Raw)->Raw` still stores/exposes `Raw` in its shape. This
+ * is the sole engine behind the U2 containment gates (field composition, fn signatures,
+ * locals, and generic-instance stamping) — every carrier the checker lets a value travel
  * through must be walked here, or unsafe data could leak through it unchecked.
  *
  * @param t      a resolved semantic Type (a field/param/return/local's annotation)
  * @param table  the program's type table (for the leaf `is_unsafe_type` probe)
- * @param depth  remaining recursion budget (seed 16, like `widens_into`)
+ * @param depth  remaining recursion budget (seed 32 — deeper than `widens_into`'s 16, since
+ *               generic composition (`Box<Box<Box<…>>>`) is a nesting source this walk
+ *               traverses that `widens_into_at` never does)
  * @return       true iff `t` names, or transitively wraps, an unsafe type
  */
 fn unsafe_carrying_at(t: Type, table: TypeTable, depth: i64) -> bool {
-    if depth <= 0 { return false }
+    if depth <= 0 { return true }
     match t {
         Named as n => is_unsafe_type(n.name, table)
         Slice as s => unsafe_carrying_at(s.element, table, depth - 1)
         Optional as o => unsafe_carrying_at(o.inner, table, depth - 1)
         Reference as r => unsafe_carrying_at(r.inner, table, depth - 1)
         Ptr as p => match p.inner { Type as inner => unsafe_carrying_at(inner, table, depth - 1); null => false }
+        Func as f => func_type_unsafe_carrying(f, table, depth - 1)
         Variant as v => {
             mut i = 0
             loop {
@@ -910,15 +918,60 @@ fn unsafe_carrying_at(t: Type, table: TypeTable, depth: i64) -> bool {
 }
 
 /**
+ * Does a `Func` type's signature — every param and the return — name or carry an unsafe
+ * type? Split out of `unsafe_carrying_at`'s `Func` arm to keep that match flat (single
+ * early-return loop over params, then the return type).
+ *
+ * @param f      the resolved function-type signature
+ * @param table  the program's type table
+ * @param depth  remaining recursion budget, already decremented by the caller
+ * @return       true iff any param or the return type is unsafe-carrying
+ */
+fn func_type_unsafe_carrying(f: Func, table: TypeTable, depth: i64) -> bool {
+    mut i = 0
+    loop {
+        if i >= f.params.len { break }
+        if unsafe_carrying_at(f.params[i], table, depth) { return true }
+        i++
+    }
+    unsafe_carrying_at(f.ret, table, depth)
+}
+
+/**
  * Does the resolved `t` carry an unsafe-typed component (§2 contagion-by-composition)?
- * The public, depth-seeded entry point over `unsafe_carrying_at` — mirrors `widens_into`
- * seeding `widens_into_at` with 16.
+ * The public, depth-seeded entry point over `unsafe_carrying_at` — seeded at 32 (deeper than
+ * `widens_into`'s 16 seed; see `unsafe_carrying_at`'s doc for why).
  *
  * @param t      a resolved semantic Type (a field/param/return/local's annotation)
  * @param table  the program's type table
  * @return       true iff `t` names, or transitively wraps, an unsafe type
  */
-pub fn unsafe_carrying(t: Type, table: TypeTable) -> bool { unsafe_carrying_at(t, table, 16) }
+pub fn unsafe_carrying(t: Type, table: TypeTable) -> bool { unsafe_carrying_at(t, table, 32) }
+
+/**
+ * Does ANY of a generic instantiation's resolved type-ARGUMENTS carry an unsafe type
+ * (`Box<Raw>`, `List<Raw>`, `Map<str, Raw>`, …)? Used at STAMP time (`instantiate_types`)
+ * so a generic instance whose substituted body embeds unsafe data becomes `is_unsafe = true`
+ * itself — otherwise a safe fn/field/local naming `Box<Raw>` would resolve to a stamped
+ * `Named{"Box__g__Raw"}` decl whose OWN `is_unsafe` is false (inherited only from the
+ * generic base template, which never mentions `Raw`), silently defeating every downstream
+ * containment gate (field/signature/local) that trusts a `Named`'s resolved decl. Marking
+ * the STAMP itself unsafe means the existing gates fire automatically, uniformly, with no
+ * separate `__g__`-name special-casing at each call site.
+ *
+ * @param argtypes the instantiation's resolved type-arguments, in declaration order
+ * @param table    the program's type table
+ * @return         true iff any argument names, or transitively wraps, an unsafe type
+ */
+fn generic_args_unsafe_carrying(argtypes: []Type, table: TypeTable) -> bool {
+    mut i = 0
+    loop {
+        if i >= argtypes.len { break }
+        if unsafe_carrying(argtypes[i], table) { return true }
+        i++
+    }
+    false
+}
 
 // (#98) is `name` a POLYMORPHIC BASE — a class that MAY be inherited (`abstract`/`virtual`, never
 // `sealed`)? A Sub→Base upcast (and the base-typed dispatch/fat-pointer it enables) is only sound
@@ -1935,7 +1988,8 @@ pub fn instantiate_types(program: parser::Program, table: TypeTable) -> TypeTabl
                     parser::TypeDecl as gen => {
                         if gen.type_params.len != nt.args.len { continue }   // arity error surfaces at resolve
                         let nbody = subst_body_names(gen.body, gen.type_params, nt.args)
-                        let stamped = parser::TypeDecl { name = mangled; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = nbody; vis = gen.vis; has_doc = false; doc = ""; line = gen.line; col = gen.col; di_kind = parser::DiKind::None; has_di_key = false; di_key = ""; is_unsafe = gen.is_unsafe; must_free = gen.must_free }
+                        let inst_unsafe = gen.is_unsafe || generic_args_unsafe_carrying(argtypes, tbl)
+                        let stamped = parser::TypeDecl { name = mangled; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = nbody; vis = gen.vis; has_doc = false; doc = ""; line = gen.line; col = gen.col; di_kind = parser::DiKind::None; has_di_key = false; di_key = ""; is_unsafe = inst_unsafe; must_free = gen.must_free }
                         tbl = teko::list::push(tbl, TypeReg { name = mangled; namespace = type_ns_of(tbl, name); vis = gen.vis; decl = stamped })   // (#109 W2) stamp in the generic base's ns so the substituted body's bare field types resolve there
                         work = collect_body_insts(nbody, work)   // transitive instantiations in the stamped body
                     }

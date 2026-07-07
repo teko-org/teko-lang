@@ -92,3 +92,54 @@ pub unsafe fn dup_addr(addr: i64) -> i64 {
     let w = make_wrapper(addr)
     raw_addr(w.m)
 }
+
+/**
+ * A plain (SAFE) generic box, unrelated to unsafe-ness on its own — `Box<i64>` is perfectly
+ * safe. Its danger is entirely a function of what `T` is instantiated with: `Box<Raw>`
+ * carries unsafe data through composition (F1, adversarial review of #333), even though
+ * `Box` itself is declared with no `unsafe` marker at all.
+ */
+pub type Box<T> = struct {
+    /** The boxed value, at whatever concrete type this instance is stamped to. */
+    value: T
+}
+
+/**
+ * A NESTED generic instantiation, `Box<Box<Raw>>` — proves the STAMP-time unsafe-carrying
+ * check (F1) is transitive through nested generics, not just one level: the inner
+ * `Box__g__Raw` stamp must already be marked unsafe by the time the outer `Box__g__Box__g__Raw`
+ * stamp is computed (the worklist stamps innermost-first).
+ *
+ * @param b the doubly-boxed raw handle
+ * @return  the same doubly-boxed handle, echoed back
+ */
+pub unsafe fn echo_nested_box(b: Box<Box<Raw>>) -> Box<Box<Raw>> {
+    b
+}
+
+/**
+ * An `unsafe fn` naming `Box<Raw>` (a generic instance over an unsafe type) in both its
+ * param and return position — the ACCEPT twin of the checker_test.tkt REJECT case (a safe
+ * fn naming `Box<Raw>` must be rejected; an `unsafe fn` may).
+ *
+ * @param b the boxed raw handle
+ * @return  the same boxed handle, echoed back
+ */
+pub unsafe fn echo_box(b: Box<Raw>) -> Box<Raw> {
+    b
+}
+
+/**
+ * A SAFE-signature (`i64 -> i64`) entry point so a SAFE caller (this fixture's top-level
+ * script) can exercise `Box<Raw>`/`Box<Box<Raw>>` without itself ever binding a generic-
+ * over-unsafe local (which the local-containment gate would reject outside an `unsafe fn`,
+ * exactly like the plain `Raw` case above).
+ *
+ * @param addr the address to round-trip through `Box<Raw>` and `Box<Box<Raw>>`
+ * @return     the same address, having passed through both boxed shapes internally
+ */
+pub unsafe fn box_addr_of(addr: i64) -> i64 {
+    let boxed = echo_box(Box<Raw> { value = make_raw(addr) })
+    let nested = echo_nested_box(Box<Box<Raw>> { value = boxed })
+    raw_addr(nested.value.value)
+}

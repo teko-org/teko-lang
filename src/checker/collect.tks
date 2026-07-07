@@ -1594,9 +1594,23 @@ fn validate_type_decls(table: TypeTable) -> error? {
     null
 }
 
-// pass 1: types first, then function signatures — the top-level environment.
+/**
+ * Pass 1: types first, then function signatures — the top-level environment.
+ *
+ * (U2 #333 F1) Generic instances are STAMPED here, BEFORE field/signature validation, not
+ * after `collect()` returns — `validate_type_decls`/`func_type`/`method_func_type` resolve a
+ * written `Box<Raw>` to `Named{"Box__g__Raw"}` and probe the TABLE for that name's
+ * `is_unsafe`; if the stamp doesn't exist yet the probe misses and the unsafe-carrying gate
+ * silently passes. `instantiate_types` is idempotent (it dedups already-stamped names), so
+ * calling it here and again later (`type_program`'s post-collect stamp, kept for callers
+ * that only need the table, e.g. mono) is a safe no-op the second time.
+ *
+ * @param program the parsed (trait-folded, base-canonicalized) program
+ * @return        the collected type table + top-level environment
+ * @throws        on a field/signature containment violation (R4, U2) or a duplicate type (W0)
+ */
 fn collect(program: parser::Program) -> Collected | error {
-    let table = collect_types(program.items)
+    let table = instantiate_types(program, collect_types(program.items))
     match validate_type_decls(table) { error as e => return e; null => { } }   // (MEM Step 0, R4)
     let env = match collect_funcs(program.items, table) {
         Env as e => e
@@ -1605,23 +1619,35 @@ fn collect(program: parser::Program) -> Collected | error {
     Collected { types = table; env = env }
 }
 
-// C7.10 — collect with a pre-seeded (table, env). Adds the project's type decls on top of
-// the seeded table, then adds the project's function signatures on top of the seeded env.
-// Used by type_program_with_deps to inject dep items before type-checking the project.
+/**
+ * C7.10 — collect with a pre-seeded (table, env). Adds the project's type decls on top of
+ * the seeded table, then adds the project's function signatures on top of the seeded env.
+ * Used by `type_program_with_deps` to inject dep items before type-checking the project.
+ *
+ * (U2 #333 F1) Same early-stamp ordering as `collect()` — `instantiate_types` runs BEFORE
+ * `validate_type_decls`/`func_type` so a project-written `Box<Raw>` (dep or project generic)
+ * is already stamped, and its unsafe-carrying is visible to the field/signature gates.
+ *
+ * @param program the project's parsed program (dep items are NOT re-typed, only seeded)
+ * @param seed    the dep-derived (table, env) to extend
+ * @return        the collected type table + environment, project items layered on the seed
+ * @throws        on a field/signature containment violation (R4, U2) or a duplicate type (W0)
+ */
 fn collect_with_seed(program: parser::Program, seed: Collected) -> Collected | error {
     // Augment the table with the project's type decls (dep types already in seed.types).
-    mut table = seed.types
+    mut table0 = seed.types
     mut i = 0
     loop {
         if i >= program.items.len { break }
         match program.items[i].content {
             parser::TypeDecl as td => {
-                table = teko::list::push(table, TypeReg { name = td.name; namespace = program.items[i].namespace; vis = td.vis; decl = td })
+                table0 = teko::list::push(table0, TypeReg { name = td.name; namespace = program.items[i].namespace; vis = td.vis; decl = td })
             }
             _ => { }
         }
         i++
     }
+    let table = instantiate_types(program, table0)
     match validate_type_decls(table) { error as e => return e; null => { } }   // (MEM Step 0, R4)
     // Augment the env with the project's function signatures (dep fns already in seed.env).
     mut env = seed.env
