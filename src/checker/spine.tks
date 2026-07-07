@@ -588,10 +588,56 @@ fn pt_transfer_block(body: []TStatement, cells: []Cell, in_region: u32, has_regi
 }
 
 /**
+ * Descend the points-to transfer into an expression's control-flow arm bodies under the SAME
+ * enclosing region: a statement- or value-position `if` / `match` carries a STATEMENT BLOCK per
+ * branch, and the cell universe enumerates those blocks' cells — so a binding allocated inside an
+ * in-adopter branch must still join `PtAdopter(region)`, else it stays `PtFrame` and the §5.1
+ * ADOPT-escape guard admits a borrow of it escaping the brace (an unsound under-approximation).
+ * Mirrors `add_expr_cells`; a non-branching expression carries no block, so it is a no-op.
+ *
+ * @param e          the typed expression
+ * @param cells      the cell universe
+ * @param in_region  the enclosing adopter's region id, valid iff `has_region`
+ * @param has_region true iff this expression is (transitively) inside an `adopt { }`
+ * @param state      the points-to axis + next-region-id counter so far
+ * @return           the updated transfer state
+ */
+fn pt_transfer_expr(e: TExpr, cells: []Cell, in_region: u32, has_region: bool, state: PtTransferState) -> PtTransferState {
+    match e.kind {
+        TIfExpr as f => pt_transfer_block(f.else_blk, cells, in_region, has_region, pt_transfer_block(f.then_blk, cells, in_region, has_region, state))
+        TMatchExpr as m => pt_transfer_match(m, cells, in_region, has_region, state)
+        _ => state
+    }
+}
+
+/**
+ * The points-to transfer over a match expression's arm bodies (each a statement block, like an
+ * if-branch) under the SAME enclosing region. State-threaded (functional accumulate).
+ *
+ * @param m          the typed match expression
+ * @param cells      the cell universe
+ * @param in_region  the enclosing adopter's region id, valid iff `has_region`
+ * @param has_region true iff this expression is (transitively) inside an `adopt { }`
+ * @param state      the points-to axis + next-region-id counter so far
+ * @return           the updated transfer state
+ */
+fn pt_transfer_match(m: TMatchExpr, cells: []Cell, in_region: u32, has_region: bool, state: PtTransferState) -> PtTransferState {
+    mut acc = state
+    mut i = 0
+    loop {
+        if i >= m.arms.len { break }
+        acc = pt_transfer_block(m.arms[i].body, cells, in_region, has_region, acc)
+        i++
+    }
+    acc
+}
+
+/**
  * The points-to transfer for one statement: a `TBinding` to a `SimpleName` INSIDE an adopter joins
  * `PtAdopter(region)` into its cell; `TLoopStmt` / `TDeferStmt` bodies recurse under the SAME
  * enclosing region; a `TAdoptStmt` opens a FRESH region for its own body (nested adopters never
- * collapse into one site).
+ * collapse into one site); a statement- or value-position `if` / `match` recurses into its arm
+ * bodies (`pt_transfer_expr`) under the same region so a branch-local allocation is not missed.
  *
  * @param s          the typed statement
  * @param cells      the cell universe
@@ -602,13 +648,13 @@ fn pt_transfer_block(body: []TStatement, cells: []Cell, in_region: u32, has_regi
  */
 fn pt_transfer_stmt(s: TStatement, cells: []Cell, in_region: u32, has_region: bool, state: PtTransferState) -> PtTransferState {
     match s {
-        TBinding as b => pt_transfer_binding(b, cells, in_region, has_region, state)
+        TBinding as b => pt_transfer_expr(b.value, cells, in_region, has_region, pt_transfer_binding(b, cells, in_region, has_region, state))
         TLoopStmt as l => pt_transfer_block(l.body, cells, in_region, has_region, state)
         TDeferStmt as d => pt_transfer_block(d.body, cells, in_region, has_region, state)
         TAdoptStmt as a => pt_transfer_adopt(a, cells, state)
-        TAssign => state
-        TReturn => state
-        TExprStmt => state
+        TAssign as a => pt_transfer_expr(a.value, cells, in_region, has_region, state)
+        TReturn as r => if r.has_value { pt_transfer_expr(r.value, cells, in_region, has_region, state) } else { state }
+        TExprStmt as es => pt_transfer_expr(es.expr, cells, in_region, has_region, state)
         TBreakStmt => state
         TContinueStmt => state
     }
@@ -784,8 +830,50 @@ fn transfer_block(body: []TStatement, cells: []Cell, us: []Unique) -> []Unique {
 }
 
 /**
+ * Descend the alias-transfer into an expression's control-flow arm bodies. A statement- or
+ * value-position `if` / `match` carries a STATEMENT BLOCK per branch, and the cell universe
+ * (`add_expr_cells`) enumerates those blocks' cells — so the transfer MUST visit them too, else an
+ * alias created inside a branch never joins `UsShared` (an unsound under-approximation). Mirrors
+ * `add_expr_cells` exactly; a non-branching expression contributes no block, so it is a no-op.
+ *
+ * @param e      the typed expression
+ * @param cells  the cell universe
+ * @param us     the unique-vs-shared axis so far
+ * @return       the axis with the expression's arm-body aliases joined
+ */
+fn transfer_expr(e: TExpr, cells: []Cell, us: []Unique) -> []Unique {
+    match e.kind {
+        TIfExpr as f => transfer_block(f.else_blk, cells, transfer_block(f.then_blk, cells, us))
+        TMatchExpr as m => transfer_match(m, cells, us)
+        _ => us
+    }
+}
+
+/**
+ * The alias-transfer over a match expression's arm bodies (each arm is a statement block, like an
+ * if-branch). Return-value threaded (functional accumulate); monotone (only climbs `us` up).
+ *
+ * @param m      the typed match expression
+ * @param cells  the cell universe
+ * @param us     the unique-vs-shared axis so far
+ * @return       the axis with every arm body's aliases joined
+ */
+fn transfer_match(m: TMatchExpr, cells: []Cell, us: []Unique) -> []Unique {
+    mut acc = us
+    mut i = 0
+    loop {
+        if i >= m.arms.len { break }
+        acc = transfer_block(m.arms[i].body, cells, acc)
+        i++
+    }
+    acc
+}
+
+/**
  * The alias-transfer for one statement. A `TBinding` / `TAssign` to a `SimpleName` whose RHS aliases
- * a bare non-scalar local joins both cells to `UsShared`; a loop / defer / adopt body recurses.
+ * a bare non-scalar local joins both cells to `UsShared`; a loop / defer / adopt body recurses; and
+ * a statement- or value-position `if` / `match` (`TExprStmt`, or a binding / assign / return value)
+ * recurses into its arm bodies (`transfer_expr`) so a branch-local alias is not missed.
  *
  * @param s      the typed statement
  * @param cells  the cell universe
@@ -794,13 +882,13 @@ fn transfer_block(body: []TStatement, cells: []Cell, us: []Unique) -> []Unique {
  */
 fn transfer_stmt(s: TStatement, cells: []Cell, us: []Unique) -> []Unique {
     match s {
-        TBinding as b => transfer_binding(b, cells, us)
-        TAssign as a => transfer_assign(a, cells, us)
+        TBinding as b => transfer_expr(b.value, cells, transfer_binding(b, cells, us))
+        TAssign as a => transfer_expr(a.value, cells, transfer_assign(a, cells, us))
         TLoopStmt as l => transfer_block(l.body, cells, us)
         TDeferStmt as d => transfer_block(d.body, cells, us)
         TAdoptStmt as a => transfer_block(a.body, cells, us)
-        TReturn => us
-        TExprStmt => us
+        TReturn as r => if r.has_value { transfer_expr(r.value, cells, us) } else { us }
+        TExprStmt as es => transfer_expr(es.expr, cells, us)
         TBreakStmt => us
         TContinueStmt => us
     }

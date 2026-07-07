@@ -257,6 +257,63 @@ fn sp_bf_is_none(b: BorrowedFrom) -> bool { match b { BfNone => true; _ => false
 }
 
 /**
+ * An alias (`let y = x`) inside an `if` arm body — reached only through a statement-position
+ * `TExprStmt(TIfExpr)` — still joins BOTH cells to shared: `transfer_stmt` descends into the branch
+ * bodies via `transfer_expr`. A top-level-only walk would leave `x` unique and let PR-3's affine
+ * free ADMIT `free(x)` while `y` still aliases it (the aliased-free UAF this fact exists to reject).
+ */
+#test fn spine_us_alias_inside_if_arm_joins_shared() {
+    let then_blk = teko::list::push(teko::list::empty(), sp_let("y", sp_nonscalar_var("x")))
+    let iff = TExpr { kind = TIfExpr { cond = sp_var("c", sp_bool_t()); then_blk = then_blk; has_else = false; else_blk = teko::list::empty() }; type = sp_nonscalar(); line = 0; col = 0 }
+    let body = teko::list::push(teko::list::push(teko::list::empty(),
+            sp_let("x", sp_field("obj", "data", sp_nonscalar()))),
+        sp_exprstmt(iff))
+    let s = fn_spine(sp_fn(teko::list::empty(), body))
+    teko::assert::is_false(is_unique_at(s, cell_of(s, "x") to u32))
+    teko::assert::is_false(is_unique_at(s, cell_of(s, "y") to u32))
+}
+
+/**
+ * The same alias inside a `match` arm body (reached through `TExprStmt(TMatchExpr)`) likewise joins
+ * both cells to shared — `transfer_match` descends into every arm body.
+ */
+#test fn spine_us_alias_inside_match_arm_joins_shared() {
+    let arm = TArm { pattern = parser::WildcardPattern { }; has_when = false; guard = sp_no_texpr(); body = teko::list::push(teko::list::empty(), sp_let("y", sp_nonscalar_var("x"))) }
+    let mtch = TExpr { kind = TMatchExpr { subject = sp_var("subj", sp_i64()); arms = teko::list::push(teko::list::empty(), arm) }; type = sp_nonscalar(); line = 0; col = 0 }
+    let body = teko::list::push(teko::list::push(teko::list::empty(),
+            sp_let("x", sp_field("obj", "data", sp_nonscalar()))),
+        sp_exprstmt(mtch))
+    let s = fn_spine(sp_fn(teko::list::empty(), body))
+    teko::assert::is_false(is_unique_at(s, cell_of(s, "x") to u32))
+    teko::assert::is_false(is_unique_at(s, cell_of(s, "y") to u32))
+}
+
+/**
+ * A binding allocated inside an `if` arm that is itself inside an `adopt { }` still joins
+ * `PtAdopter` — `pt_transfer_stmt` descends into the branch under the enclosing region, so the §5.1
+ * ADOPT-escape guard is not defeated by a branch (a top-level-only walk would leave it `PtFrame`).
+ */
+#test fn spine_pt_alloc_inside_in_adopter_if_arm_is_pt_adopter() {
+    let then_blk = teko::list::push(teko::list::empty(), sp_let("v", sp_i64_lit(1)))
+    let iff = TExpr { kind = TIfExpr { cond = sp_var("c", sp_bool_t()); then_blk = then_blk; has_else = false; else_blk = teko::list::empty() }; type = sp_i64(); line = 0; col = 0 }
+    let body = teko::list::push(teko::list::empty(), sp_adopt(teko::list::push(teko::list::empty(), sp_exprstmt(iff))))
+    let s = fn_spine(sp_fn(teko::list::empty(), body))
+    teko::assert::is_true(sp_pt_is_adopter(s.pt[cell_of(s, "v") to u32]))
+}
+
+/**
+ * Same for a `match` arm inside an `adopt { }` — `pt_transfer_match` descends into the arm body
+ * under the enclosing region.
+ */
+#test fn spine_pt_alloc_inside_in_adopter_match_arm_is_pt_adopter() {
+    let arm = TArm { pattern = parser::WildcardPattern { }; has_when = false; guard = sp_no_texpr(); body = teko::list::push(teko::list::empty(), sp_let("v", sp_i64_lit(1))) }
+    let mtch = TExpr { kind = TMatchExpr { subject = sp_var("subj", sp_i64()); arms = teko::list::push(teko::list::empty(), arm) }; type = sp_i64(); line = 0; col = 0 }
+    let body = teko::list::push(teko::list::empty(), sp_adopt(teko::list::push(teko::list::empty(), sp_exprstmt(mtch))))
+    let s = fn_spine(sp_fn(teko::list::empty(), body))
+    teko::assert::is_true(sp_pt_is_adopter(s.pt[cell_of(s, "v") to u32]))
+}
+
+/**
  * `ref_target_outlives` ADMITS a borrow whose `bf` names a `BfParam` referent that is not adopter-
  * confined (a param outlives every frame local), and REJECTS an out-of-range borrow index (a `bf`
  * that never resolves ⇒ conservative FALSE).
