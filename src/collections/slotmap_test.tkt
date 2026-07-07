@@ -1,0 +1,152 @@
+/**
+ * Unwrap a `SlotMap<i64>::get` result (an `i64?`) to a plain `i64`, substituting `fallback` for the
+ * null (miss) case — a test helper so the round-trip assertions stay one line each.
+ *
+ * @param got       the optional value returned by `SlotMap<i64>::get`
+ * @param fallback  the value returned when `got` is null
+ * @return          the wrapped value, or `fallback` if `got` is null
+ */
+fn unwrap_or(got: i64?, fallback: i64) -> i64 {
+    match got {
+        i64 as v => v
+        null => fallback
+    }
+}
+
+#test
+/**
+ * insert two i64 values, read both back by handle; len/is_empty/contains track them, and an
+ * out-of-range handle (never issued) is not found.
+ */
+fn slotmap_i64_insert_get_contains() {
+    let m = SlotMap<i64>::make()
+    teko::assert::is_true(m.is_empty())
+    let ix_a = m.insert(10)
+    let ix_b = m.insert(20)
+    teko::assert::is_true(m.len() == 2)
+    teko::assert::is_false(m.is_empty())
+    teko::assert::is_true(m.contains(ix_a))
+    teko::assert::is_true(m.contains(ix_b))
+    teko::assert::is_true(unwrap_or(m.get(ix_a), -1) == 10)
+    teko::assert::is_true(unwrap_or(m.get(ix_b), -1) == 20)
+    let never_issued = GenIndex { slot = 99; gen = 0 }
+    teko::assert::is_false(m.contains(never_issued))
+    match m.get(never_issued) {
+        i64 as v => teko::assert::is_true(false)
+        null => teko::assert::is_true(true)
+    }
+}
+
+#test
+/**
+ * The SAME body at a `str` value type — the second value instantiation, proving insert/get/remove
+ * monomorphize per value width.
+ */
+fn slotmap_str_value_instantiation() {
+    let m = SlotMap<str>::make()
+    let ix_a = m.insert("first")
+    let ix_b = m.insert("second")
+    teko::assert::is_true(m.len() == 2)
+    match m.get(ix_b) {
+        str as s => teko::assert::is_true(s == "second")
+        null => teko::assert::is_true(false)
+    }
+    teko::assert::is_true(m.remove(ix_a))
+    teko::assert::is_false(m.contains(ix_a))
+    teko::assert::is_true(m.contains(ix_b))
+}
+
+#test
+/**
+ * THE blessed safety property: a handle captured BEFORE its slot is removed becomes stale — `get`
+ * returns null and `contains` returns false — a caught wrong-generation miss, not a UAF.
+ */
+fn slotmap_stale_handle_is_caught() {
+    let m = SlotMap<i64>::make()
+    let ix = m.insert(42)
+    teko::assert::is_true(unwrap_or(m.get(ix), -1) == 42)
+    teko::assert::is_true(m.remove(ix))
+    teko::assert::is_false(m.contains(ix))
+    match m.get(ix) {
+        i64 as v => teko::assert::is_true(false)
+        null => teko::assert::is_true(true)
+    }
+    teko::assert::is_true(m.is_empty())
+}
+
+#test
+/**
+ * THE slot-reuse-doesn't-alias property: insert A, remove it, insert B (which recycles the freed
+ * slot). The OLD handle to A must stay a caught miss (bumped generation) while the NEW handle reads
+ * B, never A — the old handle must never alias the reused slot's new occupant.
+ */
+fn slotmap_reused_slot_does_not_alias_old_handle() {
+    let m = SlotMap<i64>::make()
+    let ix_a = m.insert(111)
+    teko::assert::is_true(m.remove(ix_a))
+    let ix_b = m.insert(222)
+    teko::assert::is_true(ix_b.slot == ix_a.slot)
+    teko::assert::is_false(ix_b.gen == ix_a.gen)
+    teko::assert::is_false(m.contains(ix_a))
+    match m.get(ix_a) {
+        i64 as v => teko::assert::is_true(false)
+        null => teko::assert::is_true(true)
+    }
+    teko::assert::is_true(m.contains(ix_b))
+    teko::assert::is_true(unwrap_or(m.get(ix_b), -1) == 222)
+}
+
+#test
+/**
+ * Removing an already-removed (or never-issued) handle is a no-op returning `false`; `len` does not
+ * go negative and stays accurate across a mix of inserts and removals.
+ */
+fn slotmap_remove_absent_and_double_remove_are_noops() {
+    let m = SlotMap<i64>::make()
+    let ix = m.insert(1)
+    teko::assert::is_true(m.remove(ix))
+    teko::assert::is_false(m.remove(ix))
+    teko::assert::is_true(m.is_empty())
+    let never_issued = GenIndex { slot = 5; gen = 0 }
+    teko::assert::is_false(m.remove(never_issued))
+    teko::assert::is_true(m.len() == 0)
+}
+
+#test
+/**
+ * len/is_empty track the live count across a mix of inserts and removals, including a slot-reuse
+ * append that keeps the count consistent.
+ */
+fn slotmap_len_tracks_live_count_across_mutations() {
+    let m = SlotMap<i64>::make()
+    let ix_a = m.insert(1)
+    let ix_b = m.insert(2)
+    let ix_c = m.insert(3)
+    teko::assert::is_true(m.len() == 3)
+    teko::assert::is_true(m.remove(ix_b))
+    teko::assert::is_true(m.len() == 2)
+    let ix_d = m.insert(4)
+    teko::assert::is_true(m.len() == 3)
+    teko::assert::is_true(m.contains(ix_a))
+    teko::assert::is_true(m.contains(ix_c))
+    teko::assert::is_true(m.contains(ix_d))
+    teko::assert::is_false(m.contains(ix_b))
+}
+
+#test
+/**
+ * Reference semantics: two bindings to the SAME slot map observe each other's inserts and removals.
+ */
+fn slotmap_aliasing_is_reference_semantic() {
+    let a = SlotMap<i64>::make()
+    let b = a
+    let ix_a = a.insert(7)
+    let ix_b = b.insert(8)
+    teko::assert::is_true(a.len() == 2)
+    teko::assert::is_true(b.len() == 2)
+    teko::assert::is_true(a.contains(ix_b))
+    teko::assert::is_true(b.contains(ix_a))
+    teko::assert::is_true(b.remove(ix_a))
+    teko::assert::is_true(a.len() == 1)
+    teko::assert::is_false(a.contains(ix_a))
+}
