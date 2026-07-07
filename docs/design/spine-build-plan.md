@@ -267,6 +267,111 @@ fn ref_bind_is_sound(bound: Type, s: Spine, borrow: u32, ref_ce: u32) -> bool {
 }
 ```
 
+### 2.4 IMPLEMENTATION-PINNED design (2026-07-07, workflow-derived + adversarially verified — supersedes the shapes in §2.1–2.3 where they differ)
+
+A design workflow (4 readers · 2 proposals · synthesis · 4 skeptics) pinned the exact L2a. Two prior
+drafts failed here — one deferred (post-pass that never admitted: `ref_target_outlives(idx, idx)`),
+one was reverted for committing a binary. This subsection is the authoritative recipe.
+
+**THE LANGUAGE FACT that reshapes everything — refs are param-only AND there is no address-of.**
+`Ref<T>` is `Reference{inner}` (type.tks:82), created ONLY by resolving the generic `Ref<T>`; there is
+**no `&`/take-address operator** in the surface. Grep-confirmed, the ONLY way a `Reference`-typed value
+appears in an expression is a bare `TVar` reading a **`Ref<T>` parameter** (typer.tks:44) — or that
+TVar forwarded to another ref param. `r.value` reads `T` (strips the ref); a fn cannot return a ref (R3
+KEEP); auto-ref keeps the value `T`-typed (the `&` lives only at the C boundary). ⇒ the only "ref-to-
+local" is `let r = p` / `mut r = p; r = q` aliasing a ref **parameter**. **`bf = BfLocal` is UNREACHABLE
+today** (it needs `&local`); the "bf writer" is a **bf-INHERIT** writer (`bf[storage] := bf[source]`,
+always `BfParam`). The `BfLocal`/`BfTop` arms of `ref_target_outlives` stay unchanged L1 code (no
+new-code coverage debt; cover the unreachable arms via a fabricated-`Spine` unit test).
+
+**PHASE ORDERING (why §2.3's "thread fn_spine into the gates" is INFEASIBLE):** `fn_spine` needs a typed
+`TFunction`; `type_binding`/`type_assign` run mid-typing on `parser::` nodes before any `TFunction`
+exists. So the consumer is a **post-typing pass** `check_ref_storability(tf) -> null | error`, run ONCE
+per function after the body is assembled (`type_function` after `check_must_free`, ~typer.tks:3700, over
+the `TFunction` built at :3701; `type_method` over the assembled body ~:3635). Build `fn_spine(tf)` ONCE
+from the ACTUAL `fixed_params` (so `is_ref_param`/`seed_bf` yield `BfParam` — a stripped shell seeds
+`BfNone` and silently under-admits, a likely cause of the draft's "never admitted").
+
+**THE (borrow, referent) PAIRING — the exact bug the reverted draft had.** For each ref-to-local site the
+gate calls `ref_target_outlives(spine, borrow = cell_of(target) to u32, referent = cell_of(source) to u32)`
+where **target** = the LHS storage local (its `bf` was single-assigned to `BfParam` by the inherit
+writer) and **source** = the RHS bare-`TVar` name (`borrow_source_name`, reuse the `alias_src_name` shape,
+spine.tks:938). da848b6 passed `(idx, idx)` — reading the referent's own `bf` (`BfNone`) — so it never
+admitted. `cell_of == -1` wraps to an out-of-range `u32` the guards reject ⇒ conservative reject.
+
+**THE bf-INHERIT WRITER (spine.tks).** Replace `bf = seed_bf(cells)` in `fn_spine` (:963) with
+`bf = bf_transfer_block(f.body, cells, seed_bf(cells))`. Add a `bf_transfer_{block,stmt,expr,match,binding}`
+family mirroring the `us` transfer family (:821-895) + a `set_bf` helper (copy `set_us` :794 with the
+`BorrowedFrom` element). It recurses into loop/defer/adopt bodies AND if/match arm bodies **exactly like
+`add_block_cells`** (a missed arm ⇒ a ref-to-local nested there types through unvalidated). It fires ONLY
+on `TBinding` (never `TAssign`) whose `target` is `SimpleName`, `type_contains_ref(bound)`, and `value.kind`
+is a bare `TVar` whose source cell exists → `bf[dst] := bf[src]`. Single-assignment is PRESERVED (a local
+is the target of ≤1 binding; params are seeded, never targets). A chain `let a=p; let b=a` inherits
+transitively in the forward sweep (no back-edges).
+
+**INLINE-GATE RELAX (required — the post-pass alone relaxes nothing, since the inline gate rejects before
+a TBinding/TAssign exists).** At typer.tks:2900 narrow to: `match bound { Reference => { /* bare ref —
+defer to the post-pass */ } _ => if type_contains_ref(bound) { return error{…UNCHANGED string…} } }`.
+Identically at the assign twin (:3006), deferring only when BOTH `tb.type` and `v.type` are a bare
+`Reference`. A `Slice<Ref>`/`Ref?` bound STILL rejects inline with its original message (KEEP — no anchor).
+The `.value` RefDeref path (:2989) returns earlier and stays exempt. The post-pass reject emits the EXACT
+existing string `"a reference cannot be bound to a local (parameter-only in this version)"` (no fixture drift).
+
+**CASE MATRIX (admit / reject):**
+- `let r = p` (bare ref param) → **ADMIT**. `bf[r]=BfParam` ⇒ `referent_not_escaping_adopter(p)` (pt[p]=PtParam) ⇒ true. The primary win + positive RUN fixture.
+- `let a=p; let b=a` (transitive chain) → **ADMIT** on the inherited `BfParam` tag.
+- `let r = if c {p} else {q}` (non-bare RHS) → **REJECT** (double-safe: writer skips ⇒ bf[r]=BfNone; and `borrow_source_name=""` ⇒ referent=-1). The negative EXPECT_COMPILE_FAIL fixture.
+- `let xs = [p,p]` (Slice<Reference>) → **REJECT** inline (nested-ref bound, no anchor).
+- `mut r=p; r=q` → **ADMIT** (gate reads the single-assigned `bf[r]=BfParam` + a fresh per-site referent `q`).
+- `p.value = 7` (RefDeref write-through) → **exempt/unchanged** (stores T, not a ref).
+- `b.slot = <ref>` (store a ref into a field) → **REJECT / KEEP the inline gate byte-identical**. This is **VACUOUS**: no struct/class field can be DECLARED `Ref`-typed (collect.tks:1496+/resolve.tks:1373+), so `field_t` is never a `Reference` — wiring a spine narrow-relax here would be dead, uncoverable code. **DEFER §2.1(ii) entirely.**
+
+**★ SKEPTIC AMENDMENT 1 (UNSOUND — MUST ship in PR-2): closure-capture is an escape route the rationale
+missed.** `fn leak(p: Ref<i64>) -> (fn()->i64) { let r = p; () => { r.value } }` — admitting `let r = p`
+lets a closure capture `r` into its heap env and RETURN it, carrying a ref to the caller's (now-dead)
+object past the frame → UAF. The "R3/R4/R2/field-store = complete escape set" claim is FALSE. **Fix:** in
+`type_lambda` (typer.tks:~158-163 capture loop) REJECT any capture whose captured type satisfies
+`type_contains_ref` — a `Reference` may not cross a function boundary through a closure env (same law as
+R3/R4). Add a fixture: a ref-local captured in an escaping lambda → COMPILE_FAIL. (Verify whether a ref
+PARAM capture is already rejected today; either way, this gate must hold once `let r = p` is admitted.)
+
+**★ SKEPTIC AMENDMENT 2 (OVER-REJECT — fix for correctness): a ref-chain link is not a data referent.**
+The adopter guard checks `pt[referent]`, but for a chain link `let b = a` the `referent` = `a` is itself a
+ref-local whose `pt[a]` records where the POINTER `a` is stored (possibly an adopt region), NOT where the
+data lives → a sound chain in an adopt block over-rejects. **Fix:** in the post-pass, when the referent
+cell is itself a `Reference` (`is_ref_param` OR `bf[referent] != BfNone`), skip the pt-adopter check — the
+inherited `BfParam` tag already proves param-rooted.
+
+**PR-2 SHIPS:** (1) the bf-inherit writer + `set_bf` in spine.tks; (2) the two inline-gate narrows
+(typer.tks:2900/:3006); (3) `check_ref_storability(tf)` post-pass wired in `type_function`/`type_method`,
+with amendment-2's chain-link skip; (4) the closure-capture ref-reject in `type_lambda` (amendment 1);
+(5) fixtures — `stored_borrow_sound` reshaped as a ref-to-local **BIND** (take `Ref<i64>`, `let r = p`,
+read AND write `r.value`, return a sentinel; VM==native) + a negative un-nameable-RHS EXPECT_COMPILE_FAIL
+(added to BOTH `diff_vm_native.sh` COMPILE_FAIL[] and the `sanitizers.yml` skip loop) + a
+closure-capture-of-ref-local EXPECT_COMPILE_FAIL + a fabricated-`Spine` unit test covering the
+`BfNone`/`BfTop`/`PtAdopter`/cell-not-found reject arms (100%-new-code) + a ref-to-local inside a match arm
+AND a loop body (recursion fidelity). **PR-2 DEFERS:** the field-store relax (vacuous), the literal
+`BfLocal` writer + `&local` surface, adopter-escape enforcement at the store site (needs per-cell scope
+data `Cell` lacks), L2b/L2c. **Reviewer gate:** `git diff` shows ZERO change in `resolve.tks`, `collect.tks`,
+and the field-store gate (typer.tks:2965).
+
+**KNOWN BOUND — lambda bodies are NOT gated (sound today; adversarial-review finding 2).** Both the bf
+writer (`bf_transfer_*`) and the gate (`check_ref_storability_*`) descend into `if`/`match`/`loop`/`defer`/
+`adopt` bodies exactly like `add_stmt_cells`, but NEITHER descends into a lambda body — the spine's cell
+universe (`add_expr_cells`) does not model closures. So a ref-to-local inside a `() => { … }` is admitted
+UNGATED, including the un-nameable `let r = if c {p} else {q}` that is rejected at the top level (an
+asymmetry). This is SOUND under param-only refs: every admitted lambda-body ref-to-local still roots at a
+caller-owned `Ref<T>` parameter and is valid within the frame; the only escape (capturing a ref into a
+returned closure env) is the PRE-EXISTING closure-capture UAF (filed separately), which needs no `let r = p`
+(a direct `p` capture already leaks). Consistent gating of lambda bodies waits for the spine to model
+closures — do it together with the closure-capture escape fix (its natural escape-fact provider).
+
+**Soundness (why the shipped subset is sound):** the only ref value is a `Ref<T>` param read; its referent
+is caller-owned and strictly outlives every callee local; R3/R4/R2/field-store stay unconditional KEEP AND
+closure-capture now KEEPs ref captures (amendment 1) ⇒ an admitted ref-to-local can only be read, deref'd,
+or forwarded DOWN another ref param — it can never escape the frame. Every deferred piece is vacuous or
+unconstructable, so deferring cannot under-reject; the shipped subset over-rejects at worst.
+
 ---
 
 ## 3. L2b — affine `free(x)` (`us = unique` at `type_mem_free`)

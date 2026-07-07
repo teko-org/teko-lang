@@ -1177,3 +1177,95 @@ fn sp_pt_is_adopter(p: PointsTo) -> bool { match p { PtAdopter => true; _ => fal
     teko::assert::is_true(unchanged.len == s.pt.len)
     teko::assert::is_true(sp_pt_is_frame(unchanged[cell_of(s, "only") to u32]))
 }
+
+/** A `Ref<i64>` typed value, for building a ref-to-local binding's RHS. */
+fn sp_ref_ty() -> Type { Reference { inner = sp_i64() } }
+
+/**
+ * (#331 L2a) The bf-INHERIT writer sets `bf[r] := bf[p] = BfParam` for a ref-to-local `let r = p`
+ * (the only ref-typed RHS today is a `Ref<T>` param read; `bf = BfLocal` is unreachable).
+ */
+#test fn spine_bf_writer_inherits_param_for_ref_to_local() {
+    let body = teko::list::push(teko::list::empty(), sp_let("r", sp_var("p", sp_ref_ty())))
+    let s = fn_spine(sp_fn(teko::list::push(teko::list::empty(), sp_ref_param("p")), body))
+    teko::assert::is_true(sp_bf_is_param(s.bf[cell_of(s, "r") to u32]))
+}
+
+/** (#331 L2a) The inherit is TRANSITIVE: `let a = p; let b = a` ⇒ bf[a] = bf[b] = BfParam. */
+#test fn spine_bf_writer_inherits_transitively() {
+    let body = teko::list::push(teko::list::push(teko::list::empty(),
+            sp_let("a", sp_var("p", sp_ref_ty()))),
+        sp_let("b", sp_var("a", sp_ref_ty())))
+    let s = fn_spine(sp_fn(teko::list::push(teko::list::empty(), sp_ref_param("p")), body))
+    teko::assert::is_true(sp_bf_is_param(s.bf[cell_of(s, "a") to u32]))
+    teko::assert::is_true(sp_bf_is_param(s.bf[cell_of(s, "b") to u32]))
+}
+
+/** (#331 L2a) The bf writer descends into a MATCH arm body (a missed arm would leave `r` BfNone). */
+#test fn spine_bf_writer_descends_into_match_arm() {
+    let arm = TArm { pattern = parser::WildcardPattern { }; has_when = false; guard = sp_no_texpr(); body = teko::list::push(teko::list::empty(), sp_let("r", sp_var("p", sp_ref_ty()))) }
+    let mtch = TExpr { kind = TMatchExpr { subject = sp_var("subj", sp_i64()); arms = teko::list::push(teko::list::empty(), arm) }; type = sp_i64(); line = 0; col = 0 }
+    let body = teko::list::push(teko::list::empty(), sp_exprstmt(mtch))
+    let s = fn_spine(sp_fn(teko::list::push(teko::list::empty(), sp_ref_param("p")), body))
+    teko::assert::is_true(sp_bf_is_param(s.bf[cell_of(s, "r") to u32]))
+}
+
+/** (#331 L2a) The bf writer descends into a LOOP body. */
+#test fn spine_bf_writer_descends_into_loop() {
+    let loopbody = teko::list::push(teko::list::empty(), sp_let("r", sp_var("p", sp_ref_ty())))
+    let body = teko::list::push(teko::list::empty(), sp_loop(loopbody))
+    let s = fn_spine(sp_fn(teko::list::push(teko::list::empty(), sp_ref_param("p")), body))
+    teko::assert::is_true(sp_bf_is_param(s.bf[cell_of(s, "r") to u32]))
+}
+
+/** (#331 L2a) `check_ref_storability` ADMITS a sound `let r = p` (bf[r] = BfParam ⇒ outlives). */
+#test fn check_ref_storability_admits_ref_to_local() {
+    let body = teko::list::push(teko::list::empty(), sp_let("r", sp_var("p", sp_ref_ty())))
+    let tf = sp_fn(teko::list::push(teko::list::empty(), sp_ref_param("p")), body)
+    match check_ref_storability(tf) { null => teko::assert::is_true(true); error => teko::assert::is_true(false) }
+}
+
+/**
+ * (#331 L2a) `check_ref_storability` REJECTS a ref-to-local from an un-nameable `if` source (the
+ * referent cell resolves to -1 ⇒ conservative reject with the R5 diagnostic).
+ */
+#test fn check_ref_storability_rejects_unnameable_source() {
+    let iff = TExpr { kind = TIfExpr { cond = sp_var("c", sp_bool_t()); then_blk = teko::list::push(teko::list::empty(), sp_exprstmt(sp_var("p", sp_ref_ty()))); has_else = true; else_blk = teko::list::push(teko::list::empty(), sp_exprstmt(sp_var("q", sp_ref_ty()))) }; type = sp_ref_ty(); line = 0; col = 0 }
+    let body = teko::list::push(teko::list::empty(), sp_let("r", iff))
+    let params = teko::list::push(teko::list::push(teko::list::empty(), sp_ref_param("p")), sp_ref_param("q"))
+    match check_ref_storability(sp_fn(params, body)) { null => teko::assert::is_true(false); error => teko::assert::is_true(true) }
+}
+
+/** (#331 L2a) `check_ref_storability` fast-paths a function with NO ref parameter (returns null). */
+#test fn check_ref_storability_skips_non_ref_fn() {
+    let body = teko::list::push(teko::list::empty(), sp_let("x", sp_i64_lit(1)))
+    let tf = sp_fn(teko::list::push(teko::list::empty(), sp_param("y")), body)
+    match check_ref_storability(tf) { null => teko::assert::is_true(true); error => teko::assert::is_true(false) }
+}
+
+/**
+ * (#331 L2a) `bf_inherit_at`'s defensive guards: a missing DESTINATION cell (`di < 0`) leaves `bf`
+ * untouched. Unreachable from `fn_spine` (a binding target is always a cell) — exercised directly.
+ */
+#test fn spine_bf_inherit_at_missing_dst_is_noop() {
+    let s = fn_spine(sp_fn(teko::list::push(teko::list::empty(), sp_ref_param("p")), teko::list::empty()))
+    let out = bf_inherit_at(s.cells, s.bf, "nope", "p")
+    teko::assert::is_true(out.len == s.bf.len)
+    teko::assert::is_true(sp_bf_is_param(out[cell_of(s, "p") to u32]))
+}
+
+/** (#331 L2a) `bf_inherit_at`'s missing-SOURCE guard (`si < 0`) leaves `bf` untouched. */
+#test fn spine_bf_inherit_at_missing_src_is_noop() {
+    let s = fn_spine(sp_fn(teko::list::push(teko::list::empty(), sp_ref_param("p")), teko::list::empty()))
+    let out = bf_inherit_at(s.cells, s.bf, "p", "nope")
+    teko::assert::is_true(sp_bf_is_param(out[cell_of(s, "p") to u32]))
+}
+
+/**
+ * (#331 L2a) `ref_borrow_or_error`'s defensive guard: a target that is not a cell (`borrow < 0`)
+ * conservatively REJECTS. Unreachable from typing (a bind/assign target is always a cell) — direct.
+ */
+#test fn ref_borrow_or_error_missing_target_rejects() {
+    let s = fn_spine(sp_fn(teko::list::push(teko::list::empty(), sp_ref_param("p")), teko::list::empty()))
+    match ref_borrow_or_error(s, "nope", sp_var("p", sp_ref_ty())) { null => teko::assert::is_true(false); error => teko::assert::is_true(true) }
+}
