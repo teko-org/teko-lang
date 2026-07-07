@@ -1,0 +1,210 @@
+/**
+ * teko::collections::SlotMap<T> — the generational-index slot map, the blessed zero-language-cost
+ * representation for cyclic object graphs under the no-GC arena model (design
+ * `docs/design/memory-unsafe-backend-remodel.md` §1/§L3). A naive graph idiom where nodes hold
+ * direct references to each other has no sound automatic reclamation under a bump-arena and is a
+ * use-after-free (UAF) hazard neither static analysis nor ASan catches. `SlotMap<T>` sidesteps this
+ * entirely: nodes live in a backing array indexed by slot, and every handle (`GenIndex`) carries the
+ * GENERATION the slot had when the handle was issued. A stale handle — one captured before its slot
+ * was removed and later reused by an unrelated insert — is a caught wrong-generation miss: `get`
+ * returns `null` and `contains` returns `false`, never a silent read of the wrong node.
+ *
+ * `GenIndex` is deliberately a NON-GENERIC struct (both fields `u64`): the corpus `Map<V>` records
+ * that constructing a nested generic struct inside a generic method body fails to resolve on the
+ * current generic stack (`src/collections/map.tks`, "type not visible bare"), so only the container
+ * `SlotMap<T>` is generic — the handle stays concrete and sidesteps that gap.
+ *
+ * The backing store is FIVE parallel fixed-size arrays the class owns and re-grows on each mutation
+ * (the same representation `List<T>` and `Map<V>` use, for the same reason: Teko arrays are
+ * fixed-size value snapshots, so every "in-place" mutation is a self-field reassignment to a freshly
+ * built array via `teko::list::push` / the `arr_*` combinators in `src/collections/collections.tks`).
+ * Removed slots are threaded onto a free list (`free_head` + `free_next`) so a later insert recycles
+ * a hole in O(1) without a scan, bumping that slot's generation so every outstanding handle to it is
+ * invalidated.
+ *
+ * The one shared check both `get`/`contains`/`remove` need (`slotmap_is_live`) routes through a FREE
+ * `pub fn(…)` function operating on the concrete parallel arrays and the concrete `GenIndex`, not a
+ * private instance method: the corpus records that a generic instance method calling a SIBLING
+ * instance method on `self` type-checks and runs on the VM, but the native mono pass never emits the
+ * stamped sibling, breaking the native link (`src/collections/collections.tks`). Because `GenIndex`
+ * and the arrays it scans (`[]u64`/`[]bool`) are concrete rather than `T`-shaped, the helper needs no
+ * generic parameter of its own.
+ *
+ * The class's `bool`/`u64` housekeeping arrays (`live`/`gens`/`free_next`) rebuild through the small
+ * CONCRETE wrappers `bool_replace_at`/`u64_replace_at`, not a direct call to the shared generic
+ * `arr_replace_at<T>` (`collections.tks`): inside a method of a class generic over `T`, calling
+ * `arr_replace_at` directly with a `[]bool`/`[]u64` argument collides the free function's own type
+ * parameter (also named `T`) with the class's `T` and the native mono pass rejects the argument
+ * ("argument type mismatch") even though the VM and the checker's general shape both allow it. A thin
+ * concrete wrapper monomorphizes `arr_replace_at` at `bool`/`u64` on its OWN, so the call the class
+ * method makes is to an already-concrete function and the collision never arises. Reported to the
+ * integrator as a generic-stack follow-up (a class-generic `T` shadowing a callee's own same-named
+ * type parameter breaks native codegen for concrete-array arguments).
+ */
+pub type GenIndex = struct {
+    /** The backing-array index this handle points at. */
+    slot: u64
+    /** The generation the slot was at when this handle was issued. */
+    gen: u64
+}
+
+/**
+ * A generational-index slot map of `T` values (the blessed no-GC graph idiom, design L3). See the
+ * module doc-comment for the full safety rationale.
+ */
+pub type SlotMap<T> = class {
+    /** The current generation of each slot, parallel to `vals`/`live`/`free_next`. */
+    intern gens: []u64
+    /** The value stored in each slot (meaningful only where `live[i]` is true). */
+    intern vals: []T
+    /** Whether slot `i` currently holds a live value. */
+    intern live: []bool
+    /** The free-list link for slot `i` (meaningful only where `!live[i]`). */
+    intern free_next: []u64
+    /** The index of the first free slot, or `gens.len` when the free list is empty. */
+    intern free_head: u64
+    /** The number of currently live slots. */
+    intern count: u64
+
+    /**
+     * Build an empty `SlotMap<T>` — the generic static factory (`SlotMap<Node>::make()`).
+     *
+     * @return a fresh, empty `SlotMap<T>` at the caller's concrete `T`, with an empty free list
+     */
+    pub fn make() -> SlotMap<T> {
+        SlotMap {
+            gens = teko::list::empty();
+            vals = teko::list::empty();
+            live = teko::list::empty();
+            free_next = teko::list::empty();
+            free_head = 0;
+            count = 0
+        }
+    }
+
+    /**
+     * The number of currently live entries.
+     *
+     * @return the live-slot count
+     */
+    pub fn len(self) -> u64 { self.count }
+
+    /**
+     * Whether the slot map holds no live entries.
+     *
+     * @return `true` iff `len() == 0`
+     */
+    pub fn is_empty(self) -> bool { self.count == 0 }
+
+    /**
+     * Insert `x`, returning the `GenIndex` handle that names it. Reuses a slot off the free list
+     * when one is available (its generation was already bumped at removal time, invalidating every
+     * stale handle to it); otherwise appends a brand-new slot at generation 0.
+     *
+     * @param x  the value to store
+     * @return   the handle naming the newly occupied slot at its current generation
+     */
+    pub fn insert(self, x: T) -> GenIndex {
+        if self.free_head < self.gens.len {
+            let slot = self.free_head
+            let next_free = self.free_next[slot]
+            let gen = self.gens[slot]
+            self.vals = arr_replace_at(self.vals, slot, x)
+            self.live = bool_replace_at(self.live, slot, true)
+            self.free_head = next_free
+            self.count = self.count + 1
+            return GenIndex { slot = slot; gen = gen }
+        }
+        let slot = self.gens.len
+        self.gens = teko::list::push(self.gens, 0)
+        self.vals = teko::list::push(self.vals, x)
+        self.live = teko::list::push(self.live, true)
+        self.free_next = teko::list::push(self.free_next, 0)
+        self.count = self.count + 1
+        GenIndex { slot = slot; gen = 0 }
+    }
+
+    /**
+     * Read the value at `ix`, or `null` when `ix` no longer names a live value — either because its
+     * slot is out of range, the slot is not currently live, or the slot's generation has moved past
+     * `ix.gen` (the slot was removed and possibly reused since `ix` was issued). This is the caught
+     * wrong-generation miss: a stale handle never returns a wrong-node read.
+     *
+     * @param ix  the handle to look up
+     * @return    the stored value, or `null` if `ix` is stale or out of range
+     */
+    pub fn get(self, ix: GenIndex) -> T? {
+        if !slotmap_is_live(self.gens, self.live, ix) { return null }
+        self.vals[ix.slot]
+    }
+
+    /**
+     * Whether `ix` currently names a live value — the same liveness-and-generation check as `get`,
+     * without unwrapping the value.
+     *
+     * @param ix  the handle to test
+     * @return    `true` iff `ix` names a live slot at its issued generation
+     */
+    pub fn contains(self, ix: GenIndex) -> bool { slotmap_is_live(self.gens, self.live, ix) }
+
+    /**
+     * Remove the value at `ix`, invalidating every outstanding handle to that slot. A no-op (and
+     * returns `false`) when `ix` is already stale or out of range. On success, the slot's generation
+     * is bumped (so a captured `GenIndex` to it can never again read a value — even after the slot
+     * is recycled by a later insert) and the slot is pushed onto the free list for reuse.
+     *
+     * @param ix  the handle to remove
+     * @return    `true` iff `ix` named a live slot that was actually removed
+     */
+    pub fn remove(self, ix: GenIndex) -> bool {
+        if !slotmap_is_live(self.gens, self.live, ix) { return false }
+        self.live = bool_replace_at(self.live, ix.slot, false)
+        self.gens = u64_replace_at(self.gens, ix.slot, ix.gen + 1)
+        self.free_next = u64_replace_at(self.free_next, ix.slot, self.free_head)
+        self.free_head = ix.slot
+        self.count = self.count - 1
+        true
+    }
+}
+
+/**
+ * Whether `ix` names a currently live slot at its issued generation — the shared liveness check
+ * behind `SlotMap::get`/`contains`/`remove`, routed through a free function because a generic
+ * instance method calling a sibling instance method on `self` breaks the native mono pass.
+ *
+ * @param gens  the slot map's per-slot generation array
+ * @param live  the slot map's per-slot liveness array, parallel to `gens`
+ * @param ix    the handle to test
+ * @return      `true` iff `ix.slot` is in range, currently live, and at generation `ix.gen`
+ */
+pub fn slotmap_is_live(gens: []u64, live: []bool, ix: GenIndex) -> bool {
+    if ix.slot >= gens.len { return false }
+    if !live[ix.slot] { return false }
+    gens[ix.slot] == ix.gen
+}
+
+/**
+ * Replace the element at index `at` in a `[]bool` array with `v` — a concrete monomorphization of
+ * `arr_replace_at<T>` (`collections.tks`) that a `SlotMap<T>` method calls to rebuild its `live`
+ * array without directly invoking the generic helper (see the module doc-comment for why a direct
+ * call collides the class's own `T` with the callee's).
+ *
+ * @param xs  the source `[]bool` array
+ * @param at  the index to overwrite
+ * @param v   the replacement value
+ * @return    a fresh array equal to `xs` except at `at`, which holds `v`
+ */
+pub fn bool_replace_at(xs: []bool, at: u64, v: bool) -> []bool { arr_replace_at(xs, at, v) }
+
+/**
+ * Replace the element at index `at` in a `[]u64` array with `v` — a concrete monomorphization of
+ * `arr_replace_at<T>` (`collections.tks`) that a `SlotMap<T>` method calls to rebuild its `gens`/
+ * `free_next` arrays without directly invoking the generic helper (see the module doc-comment for
+ * why a direct call collides the class's own `T` with the callee's).
+ *
+ * @param xs  the source `[]u64` array
+ * @param at  the index to overwrite
+ * @param v   the replacement value
+ * @return    a fresh array equal to `xs` except at `at`, which holds `v`
+ */
+pub fn u64_replace_at(xs: []u64, at: u64, v: u64) -> []u64 { arr_replace_at(xs, at, v) }
