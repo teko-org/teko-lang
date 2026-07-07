@@ -66,12 +66,17 @@ EXPECTED_FAIL=(
 # crypto_rand_secure_bytes — calls teko::crypto::rand::secure_bytes, a `from "teko_rt"`
 #   extern (#194 C6); the VM rejects EVERY extern (not just raw platform ones — C7.1a), so
 #   this CSPRNG primitive is native-only, same shape as time_types.
+# unsafe_rawbuf_roundtrip — U3 (#334): an `unsafe fn` allocs a `RawBuf` (raw `ptr<byte>` +
+#   len) and a raw `extern` (libc memset, NOT `from "teko_rt"`) writes through its raw field;
+#   same host-only `buf_ptr` builtin the VM refuses, same honest-stop shape as
+#   buf_ptr_memset_roundtrip.
 NATIVE_ONLY=(
     time_types
     extern_reachability
     buf_ptr_memset_roundtrip
     io_file_copy
     crypto_rand_secure_bytes
+    unsafe_rawbuf_roundtrip
 )
 
 # ── COMPILE-FAIL list ──────────────────────────────────────────────────────────────────
@@ -81,8 +86,12 @@ NATIVE_ONLY=(
 # engines reject the SAME project identically.
 # must_free_leak — S2 (#336): a `#must_free` handle dropped without being freed on some
 #   path is a compile-time error (the local consume-or-fail dataflow), not a runtime one.
+# unsafe_field_in_safe_struct — U3 (#334) AC#4: a SAFE struct naming an unsafe-typed field
+#   (without the `unsafe` modifier itself) is a compile-time error (U2's #333 field-contagion
+#   gate), not a runtime one.
 COMPILE_FAIL=(
     must_free_leak
+    unsafe_field_in_safe_struct
 )
 
 is_expected_fail() {
