@@ -93,6 +93,9 @@ NATIVE_ONLY=(
 #   adopt_unused_local — #337: `adopt { }` allows return/break/continue (unlike `defer`), so
 #   check_returns/check_labels/check_locals must still validate its body — these four fixtures
 #   each trip one of those checks from inside an adopt block.
+# ref_returned_rejected / ref_in_collection_rejected — #331 L1 KEEP-FOREVER guards: a fn that
+#   RETURNS a `Ref<T>` (R3) and a `Ref<T>` stored as a struct member (R4) each stay a compile
+#   error (spine-build-plan §7). PR-1's pure `fn_spine` query relaxed NEITHER — these prove it.
 COMPILE_FAIL=(
     must_free_leak
     unsafe_field_in_safe_struct
@@ -100,6 +103,8 @@ COMPILE_FAIL=(
     adopt_break_outside_loop
     adopt_break_unknown_label
     adopt_unused_local
+    ref_returned_rejected
+    ref_in_collection_rejected
 )
 
 is_expected_fail() {
