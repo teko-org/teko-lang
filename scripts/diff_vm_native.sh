@@ -114,6 +114,7 @@ COMPILE_FAIL=(
     ref_returned_rejected
     ref_in_collection_rejected
     arena_manual_leak
+    ref_local_unnamed_source_rejected
 )
 
 is_expected_fail() {
