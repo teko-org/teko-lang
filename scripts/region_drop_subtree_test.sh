@@ -17,5 +17,5 @@ WORK="$(mktemp -d 2>/dev/null || mktemp -d -t regiondroptest)"
 trap 'rm -rf "$WORK"' EXIT INT TERM
 
 BIN="$WORK/region_drop_subtree_test"
-"$CC" -std=c23 -Wall -Wextra -o "$BIN" "$SCRIPT_DIR/region_drop_subtree_test.c"
+"$CC" -std=c2x -Wall -Wextra -o "$BIN" "$SCRIPT_DIR/region_drop_subtree_test.c"
 "$BIN"
