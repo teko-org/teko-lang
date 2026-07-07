@@ -97,6 +97,40 @@ analysis. So `unsafe` is the keystone that **ships FIRST**, independent of the (
 (This corrects the earlier belief that `unsafe` containment was "a slice of the spine" — that was
 true for a *lexical block*, not for a *type marker*.)
 
+### 2c. The `unsafe #must_free` Arena — a dev-controlled manual region (=#358, owner 2026-07-06)
+
+A **manual, non-lexical, unsafe-only** region: the dev creates it, allocates pointers *into* it, and
+**bulk-frees the whole region** at a point of their choosing. It is the unsafe, non-lexical complement
+to the (lexical, safe) `adopt { }`.
+
+```teko
+unsafe #must_free type Arena = ...        // both markers coexist on the TypeDecl (U1 is_unsafe + S2 must_free)
+unsafe fn build() -> i64 {
+    mut a = Arena::new()                  // tk_region_new (fresh child region)
+    let p = a.alloc<Node>(...)            // ptr<Node> attached to a's lifetime
+    mem::free(a)                          // bulk-free the whole region (the #must_free consume)
+    0
+}                                         // dropping `a` without mem::free(a) => COMPILE ERROR
+```
+
+The elegance: it **composes the wave's two features, each guarding the half it can**.
+- **`#must_free` bars the region leak** — dropping the `Arena` without `mem::free(a)` is a compile
+  error (the §5a dataflow). You cannot leak the whole region.
+- **`unsafe` contains the residual** — after the bulk-free the pointers into the region are dangling
+  (the aliased-UAF the spine cannot track). The dev assumes *exactly* that risk, and only that.
+
+Zero grammar (stdlib type; the markers already parse). `Arena::new/alloc/free` map onto the existing
+`tk_region_new/alloc/free` arena tree (the same `adopt` reuses) — expose it, don't build a new allocator.
+
+**The full memory ladder (auto → raw):**
+
+| tool | lifetime | safety |
+|---|---|---|
+| `arena` default | per-scope (invisible) | safe |
+| `#must_free` / `mem::free` / `defer` / `adopt` | dev-controlled release | safe (the "C# `using`/`IDisposable`" tier — **stronger**: `#must_free` *forces* the release, C# only warns) |
+| **`unsafe #must_free` Arena** | dev-controlled region, bulk-free | unsafe (leak barred by `#must_free`; dangling owned by `unsafe`) |
+| `RawBuf` / `Owned<T>` | raw buffer | unsafe (malloc/free) |
+
 ---
 
 ## 3. Surface syntax additions (lexer + parser)
