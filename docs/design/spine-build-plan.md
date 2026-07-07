@@ -355,6 +355,17 @@ AND a loop body (recursion fidelity). **PR-2 DEFERS:** the field-store relax (va
 data `Cell` lacks), L2b/L2c. **Reviewer gate:** `git diff` shows ZERO change in `resolve.tks`, `collect.tks`,
 and the field-store gate (typer.tks:2965).
 
+**KNOWN BOUND — lambda bodies are NOT gated (sound today; adversarial-review finding 2).** Both the bf
+writer (`bf_transfer_*`) and the gate (`check_ref_storability_*`) descend into `if`/`match`/`loop`/`defer`/
+`adopt` bodies exactly like `add_stmt_cells`, but NEITHER descends into a lambda body — the spine's cell
+universe (`add_expr_cells`) does not model closures. So a ref-to-local inside a `() => { … }` is admitted
+UNGATED, including the un-nameable `let r = if c {p} else {q}` that is rejected at the top level (an
+asymmetry). This is SOUND under param-only refs: every admitted lambda-body ref-to-local still roots at a
+caller-owned `Ref<T>` parameter and is valid within the frame; the only escape (capturing a ref into a
+returned closure env) is the PRE-EXISTING closure-capture UAF (filed separately), which needs no `let r = p`
+(a direct `p` capture already leaks). Consistent gating of lambda bodies waits for the spine to model
+closures — do it together with the closure-capture escape fix (its natural escape-fact provider).
+
 **Soundness (why the shipped subset is sound):** the only ref value is a `Ref<T>` param read; its referent
 is caller-owned and strictly outlives every callee local; R3/R4/R2/field-store stay unconditional KEEP AND
 closure-capture now KEEPs ref captures (amendment 1) ⇒ an admitted ref-to-local can only be read, deref'd,
