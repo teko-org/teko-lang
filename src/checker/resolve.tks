@@ -853,6 +853,73 @@ pub fn is_must_free_name(name: str, table: TypeTable) -> bool {
     }
 }
 
+/**
+ * Is `name` declared `unsafe` (U1/U2, the 0.1.0.0-beta memory+unsafe remodel #333) — a
+ * `unsafe type M = struct|class { … }` whose values may only be named by another `unsafe`
+ * type or an `unsafe fn` (contagion-by-composition, never a spine/flow analysis — a pure
+ * nominal probe, mirroring `is_must_free_name`/`is_interface_name`). A bare builtin
+ * (`str`, `u64`, `byte`, `error`, …) or a type-param (`T`) misses the table entirely (or
+ * resolves to a synthetic opaque registration whose `is_unsafe` is false), so this
+ * predicate returns false for them by construction — never a false positive on safe
+ * scalars/generics.
+ *
+ * @param name   a resolved (canonical or bare) type name
+ * @param table  the program's type table
+ * @return       true iff `name`'s TypeDecl carries `is_unsafe = true`
+ */
+pub fn is_unsafe_type(name: str, table: TypeTable) -> bool {
+    match type_table_find(table, name, "") {
+        parser::TypeDecl as td => td.is_unsafe
+        error => false
+    }
+}
+
+/**
+ * Does the resolved `t` CARRY an unsafe-typed component — either `t` itself names an
+ * `unsafe type` (the leaf case) or `t` is a compositional carrier (`[]M`, `M?`, `Ref<M>`,
+ * `ptr<M>`, or a variant with an unsafe member) wrapping one? Mirrors the recursion shape
+ * of `widens_into_at`/`carries_sentinel`: depth-bounded so a self-referential variant
+ * cannot loop. This is the sole engine behind the U2 containment gates (field
+ * composition, fn signatures, locals) — every carrier the checker lets a value travel
+ * through must be walked here, or unsafe data could leak through it unchecked.
+ *
+ * @param t      a resolved semantic Type (a field/param/return/local's annotation)
+ * @param table  the program's type table (for the leaf `is_unsafe_type` probe)
+ * @param depth  remaining recursion budget (seed 16, like `widens_into`)
+ * @return       true iff `t` names, or transitively wraps, an unsafe type
+ */
+fn unsafe_carrying_at(t: Type, table: TypeTable, depth: i64) -> bool {
+    if depth <= 0 { return false }
+    match t {
+        Named as n => is_unsafe_type(n.name, table)
+        Slice as s => unsafe_carrying_at(s.element, table, depth - 1)
+        Optional as o => unsafe_carrying_at(o.inner, table, depth - 1)
+        Reference as r => unsafe_carrying_at(r.inner, table, depth - 1)
+        Ptr as p => match p.inner { Type as inner => unsafe_carrying_at(inner, table, depth - 1); null => false }
+        Variant as v => {
+            mut i = 0
+            loop {
+                if i >= v.members.len { break }
+                if unsafe_carrying_at(v.members[i], table, depth - 1) { return true }
+                i++
+            }
+            false
+        }
+        _ => false
+    }
+}
+
+/**
+ * Does the resolved `t` carry an unsafe-typed component (§2 contagion-by-composition)?
+ * The public, depth-seeded entry point over `unsafe_carrying_at` — mirrors `widens_into`
+ * seeding `widens_into_at` with 16.
+ *
+ * @param t      a resolved semantic Type (a field/param/return/local's annotation)
+ * @param table  the program's type table
+ * @return       true iff `t` names, or transitively wraps, an unsafe type
+ */
+pub fn unsafe_carrying(t: Type, table: TypeTable) -> bool { unsafe_carrying_at(t, table, 16) }
+
 // (#98) is `name` a POLYMORPHIC BASE — a class that MAY be inherited (`abstract`/`virtual`, never
 // `sealed`)? A Sub→Base upcast (and the base-typed dispatch/fat-pointer it enables) is only sound
 // against such a class: a `sealed` class can never be anyone's base, so a base-typed value of it

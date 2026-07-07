@@ -2758,6 +2758,21 @@ fn type_binding_value(b: parser::Binding, env: Env, table: TypeTable) -> TExpr |
     type_expr(b.value, env, table)
 }
 
+/**
+ * Type-checks a `let`/`mut`/`const` binding statement, producing its typed `TBinding` node and
+ * the environment extended with the newly bound name (a `SimpleName` target; a
+ * `DestructurePattern` target is left as a refinement — the environment is returned unchanged).
+ *
+ * @param b      the parsed binding (target, optional annotation, initializer)
+ * @param env    the typing environment (read for `env.fn_unsafe`, U2's local-containment gate)
+ * @param table  the program's type table
+ * @return       the typed statement plus the environment with the new binding defined
+ * @throws       when the initializer/annotation mismatch (widening), an empty untyped
+ *               collection, a reference is bound to a local (R5), or (U2, §2 line 84) a SAFE
+ *               fn body binds a local of unsafe type (not as a param, return, field, OR local) —
+ *               `env.fn_unsafe` was set once by `type_function`/`type_method` before this body's
+ *               statements were typed
+ */
 fn type_binding(b: parser::Binding, env: Env, table: TypeTable) -> TypedStmt | error {
     mut v = match type_binding_value(b, env, table) { TExpr as te => te; error as e => return e }
     mut bound = v.type
@@ -2806,6 +2821,9 @@ fn type_binding(b: parser::Binding, env: Env, table: TypeTable) -> TypedStmt | e
     // only permitted ref handle is a function PARAMETER (which never reaches type_binding). The
     // contains-ref check also catches an INFERRED `[]Ref` / `Ref?` bound from ANY source.
     if type_contains_ref(bound) { return error { message = "a reference cannot be bound to a local (parameter-only in this version)" } }
+    if !env.fn_unsafe && unsafe_carrying(bound, table) {
+        return error { message = "safe fn binds a local of unsafe type — mark the enclosing fn `unsafe fn` or bind only safe types (§2: unsafe data cannot be held by a safe local)" }
+    }
     let node = TBinding { kind = b.kind; target = b.target; bound = bound; value = v }
     match b.target {
         parser::SimpleName as sn => TypedStmt { node = node; env = define(env, sn.name, bound, bind_is_mut(b.kind)) }
@@ -3400,13 +3418,16 @@ fn teko_rt_type_ok(t: Type) -> bool {
  * @param base_name          the (canonical) base class name (valid iff has_base_binding)
  * @param declaring_class    the class that ORIGINALLY declared this body (intern/private access ctx)
  * @return                   the typed method as a TFunction (namespace stamped by the caller)
- * @throws                   on any body type error, a bad return/trailing value, or a label failure
+ * @throws                   on any body type error, a bad return/trailing value, a label failure,
+ *                           or (U2, §2 line 72) a local/param/return of unsafe type when neither
+ *                           the method's own `is_unsafe` nor its owning type's is set — a method
+ *                           inherits its OWNER type's unsafe-ness (`method_is_effective_unsafe`)
  */
 fn type_method(f: parser::Function, struct_name: str, env: Env, table: TypeTable, has_base_binding: bool, base_binding_name: str, base_name: str, declaring_class: str) -> TFunction | error {
     // (W10b.CLASS residual — intern visibility) this body's OWN field/method accesses are
     // checked against `declaring_class` (see type_struct_methods's own comment on why this can
     // differ from `struct_name`), NOT `struct_name` — set before typing the body below.
-    mut local = with_owner(env, declaring_class)
+    mut local = with_fn_unsafe(with_owner(env, declaring_class), method_is_effective_unsafe(f, struct_name, env.cur_ns, table))
     let tbl = method_type_param_table(receiver_canonical_name(struct_name, env.cur_ns, table), f.type_params, f.type_constraints, "", table)
     let is_teko_rt = f.is_extern && f.from_lib == "teko_rt"
     // (W10b.CLASS) `class Base(parent) { … }` — the NAMED BINDING an instance method uses to
@@ -3496,8 +3517,22 @@ fn type_method(f: parser::Function, struct_name: str, env: Env, table: TypeTable
     TFunction { name = f.name; type_params = f.type_params; type_constraints = f.type_constraints; params = fixed_params; return_type = ret; body = body; vis = f.vis; has_doc = f.has_doc; doc = f.doc; namespace = ""; file = ""; line = 0; col = 0; is_test = f.is_test; is_extern = false; c_symbol = ""; from_lib = "" }
 }
 
+/**
+ * Type-checks a top-level namespace FUNCTION's body, producing the fully typed `TFunction` item
+ * (an `extern` declaration is bodyless and returns early with an empty body — its return/param
+ * marshalling is still validated).
+ *
+ * @param f      the function to type-check
+ * @param env    the typing environment
+ * @param table  the folded type table
+ * @return       the typed function
+ * @throws       on a bad param/return type, a returned reference (R3), any body type error, a
+ *               bad return/trailing value, a label failure, or (U2, §2) a param/return/local of
+ *               unsafe type when `f` itself is not `unsafe` — a top-level fn has no owner to OR
+ *               in (unlike a method, see `type_method`), so only `f.is_unsafe` itself governs
+ */
 fn type_function(f: parser::Function, env: Env, table: TypeTable) -> TFunction | error {
-    mut local = env
+    mut local = with_fn_unsafe(env, f.is_unsafe)
     let tbl = type_param_table(f.type_params, f.type_constraints, "", table)   // (S4) the fn's generic type-params, opaque, in scope
     let is_teko_rt = f.is_extern && f.from_lib == "teko_rt"   // C7.2: bypass for Teko's own runtime
     mut i = 0

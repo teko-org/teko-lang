@@ -1,0 +1,94 @@
+/**
+ * An `unsafe type` holding a raw field — the leaf unsafe type every other case in this
+ * fixture builds on (acceptance criterion 2's target). Values of `Raw` may only be named
+ * by another `unsafe type` or an `unsafe fn` (U2's nominal containment).
+ */
+pub unsafe type Raw = struct {
+    /** A raw address, carried as a plain integer (U3 gives this a real raw-memory shape). */
+    addr: i64
+}
+
+/**
+ * An `unsafe type` embedding an unsafe-typed field (`m: Raw`) through PLAIN composition —
+ * criterion 4's "unsafe wrapping unsafe" case. Would be REJECTED if `Wrapper` were not
+ * itself `unsafe` (that rejection is exercised in checker_test.tkt).
+ */
+pub unsafe type Wrapper = struct {
+    /** The wrapped raw handle. */
+    m: Raw
+}
+
+/**
+ * An `unsafe type` embedding an unsafe-typed field through EACH compositional carrier the
+ * containment walk must recurse through — `[]Raw` (slice), `Raw?` (optional), `ptr<Raw>`
+ * (typed pointer) — proving `unsafe_carrying` fires on every one of them, not just a bare
+ * `Named`. Still accepted because `Carriers` itself is `unsafe`.
+ */
+pub unsafe type Carriers = struct {
+    /** A slice of raw handles. */
+    many: []Raw
+    /** An optional raw handle. */
+    maybe: Raw?
+    /** A typed pointer to a raw handle's shape. */
+    addr: ptr<Raw>
+}
+
+/**
+ * Builds a `Raw` around the given address. `unsafe fn` naming `Raw` in both its param
+ * position (implicit, via the field access) and its return type — criterion 2.
+ *
+ * @param addr the address to wrap
+ * @return     the constructed handle
+ */
+pub unsafe fn make_raw(addr: i64) -> Raw {
+    Raw { addr = addr }
+}
+
+/**
+ * Reads a `Raw`'s address — another `unsafe fn` naming the unsafe type in its param
+ * position (criterion 2, the param-side twin of `make_raw`'s return-side case).
+ *
+ * @param r the handle to read
+ * @return  its wrapped address
+ */
+pub unsafe fn raw_addr(r: Raw) -> i64 {
+    r.addr
+}
+
+/**
+ * Builds a `Wrapper` around a fresh `Raw` — proves the `unsafe type` composition (criterion
+ * 4) round-trips through a real value, not just type-checks.
+ *
+ * @param addr the address the inner `Raw` wraps
+ * @return     the constructed wrapper
+ */
+pub unsafe fn make_wrapper(addr: i64) -> Wrapper {
+    Wrapper { m = make_raw(addr) }
+}
+
+/**
+ * Reads a `Wrapper`'s inner address — a SAFE-signature (`i64 -> i64`) entry point so a
+ * SAFE caller (this fixture's top-level script) can exercise the `Wrapper`/`Raw`
+ * composition without itself ever binding an unsafe-typed local (which the local-
+ * containment gate would reject outside an `unsafe fn`).
+ *
+ * @param addr the address to wrap-then-unwrap
+ * @return     the same address, round-tripped through `Wrapper`/`Raw` internally
+ */
+pub unsafe fn wrapper_addr(addr: i64) -> i64 {
+    raw_addr(make_wrapper(addr).m)
+}
+
+/**
+ * A SAFE, boundary-crossing `unsafe fn` that only takes/returns SAFE types (`i64`) —
+ * criterion 6's target: a safe fn may CALL this (the color lives on the signature's DATA,
+ * never the call site), even though the fn body itself works with `Raw`/`Wrapper`
+ * internally (both legal locals here, since `dup_addr` is itself `unsafe fn`).
+ *
+ * @param addr the address to round-trip
+ * @return     the same address, having passed through unsafe-typed locals internally
+ */
+pub unsafe fn dup_addr(addr: i64) -> i64 {
+    let w = make_wrapper(addr)
+    raw_addr(w.m)
+}
