@@ -3249,6 +3249,7 @@ fn check_return_stmt(s: TStatement, ret: Type, table: TypeTable) -> error? {
         }
         TLoopStmt as l => check_returns(l.body, ret, table)
         TExprStmt as es => check_returns_inexpr(es.expr, ret, table)
+        TAdoptStmt as a => check_returns(a.body, ret, table)
         _ => null
     }
 }
@@ -3338,6 +3339,23 @@ fn check_labels_inexpr(e: TExpr, scope: []str, in_loop: bool, seen: []str) -> La
     }
 }
 
+/**
+ * check_labels — validate every `break`/`continue` in `stmts` against its enclosing loop
+ * structure: a bare `break`/`continue` must be inside SOME loop (`in_loop`); a labeled one must
+ * name a loop currently in `scope`; a `loop NAME { }` label must be unique among its enclosing
+ * siblings (`seen`, dedup-checked via `lbl_enclosing`). `adopt { }` is an ORDINARY block, not a
+ * loop — it introduces NO label frame and does not reset `in_loop`, so a bare `break`/`continue`
+ * inside still targets the enclosing loop (or is rejected when there is none), and a labeled one
+ * still resolves against the SAME enclosing `scope` (mirrors codegen's region-stack crossing
+ * behavior, which drops an adopter region on the way out without treating it as a loop boundary).
+ *
+ * @param stmts    the statement block to validate
+ * @param scope    every loop label currently enclosing this block (innermost last)
+ * @param in_loop  whether SOME enclosing loop exists (enables a bare break/continue)
+ * @param seen     loop labels already declared among `stmts`' enclosing siblings (dup-check)
+ * @return         a LabelCheck: failed=false with the accumulated `seen` on success, else the
+ *                 first violation's message
+ */
 fn check_labels(stmts: []TStatement, scope: []str, in_loop: bool, seen: []str) -> LabelCheck {
     mut acc = seen
     mut i = 0
@@ -3370,6 +3388,11 @@ fn check_labels(stmts: []TStatement, scope: []str, in_loop: bool, seen: []str) -
             }
             TExprStmt as es => {
                 let t = check_labels_inexpr(es.expr, scope, in_loop, acc)
+                if t.failed { return t }
+                acc = t.seen
+            }
+            TAdoptStmt as a => {
+                let t = check_labels(a.body, scope, in_loop, acc)
                 if t.failed { return t }
                 acc = t.seen
             }
