@@ -1546,3 +1546,76 @@ fn bare_literal_narrow_binding_adopts_declared_type() {
     let x = 1
     teko::assert::is_true((x << 40) == 1099511627776)   // 40 & 63 == 40 -> 1 << 40 (i64, no truncation)
 }
+
+/**
+ * Builds a single-`uptr`-field `#must_free` struct TypeDecl named `name` — the Arena-shaped
+ * manual region-handle (#358) the codegen region-free path recognizes structurally.
+ *
+ * @param name the type's name
+ * @return     a `#must_free` struct TypeDecl with one `uptr` field named `region`
+ */
+fn cgt_region_handle_decl(name: str) -> parser::TypeDecl {
+    let field = parser::Field { name = "region"; type_ann = cgt_named_te("uptr"); vis = parser::Visibility::Pub; is_intern = false; has_doc = false; doc = "" }
+    let fields: []parser::Field = teko::list::push(teko::list::empty(), field)
+    let body = parser::StructBody { fields = fields; methods = teko::list::empty(); implements = teko::list::empty() }
+    parser::TypeDecl { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = body; vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 0; col = 0; di_kind = parser::DiKind::None; has_di_key = false; di_key = ""; is_unsafe = true; must_free = true }
+}
+
+/**
+ * A `TProgram` whose sole item is the region-handle TypeDecl `name` — so `type_table_of` /
+ * `is_region_handle_name` resolve it when the emit path probes for the Arena structure.
+ *
+ * @param name the region-handle type's name
+ * @return     a program carrying exactly that TypeDecl
+ */
+fn cgt_prog_with_region_handle(name: str) -> checker::TProgram {
+    let items: []checker::TItem = teko::list::push(teko::list::empty(), cgt_region_handle_decl(name))
+    checker::TProgram { items = items }
+}
+
+/**
+ * Group S (#358): the manual-region codegen builtins. `emit_region_alloc` bump-allocates a `T`
+ * into a `uptr` region and copies the init in (a `ptr<T>` GNU stmt-expr routed through
+ * `tk_region_alloc`); `emit_region_free` bulk-drops a region handle via `tk_region_drop_subtree`
+ * and scrubs its `uptr` field; `region_new` lowers inline to `tk_region_new(tk_region_root())`.
+ */
+#test
+fn cgt_region_ops() {
+    let region_var = checker::TExpr {
+        kind = checker::TVar { name = "reg"; is_func = false; func_ns = "" }
+        type = checker::Uptr { }
+        line = 0; col = 0
+    }
+    let alloc_args: []checker::TExpr = teko::list::push(teko::list::push(teko::list::empty(), region_var), cgt_num(42 to i128, checker::PrimKind::U64))
+    let alloc_e = checker::TExpr {
+        kind = checker::TCall { callee = cgt_path3("teko", "mem", "region_alloc"); args = alloc_args; call_ns = "teko::mem"; is_closure_call = false; callee_type = checker::Void { }; is_iface_dispatch = false; iface_slot = 0 }
+        type = checker::Ptr { inner = checker::Prim { kind = checker::PrimKind::U64 } }
+        line = 0; col = 0
+    }
+    let alloc_out = match emit_expr(cgt_empty(), cgt_prog(), alloc_e) { []byte as o => str(o); error => "" }
+    teko::assert::is_true(teko::str::contains(alloc_out, "tk_region_alloc"))
+    teko::assert::is_true(teko::str::contains(alloc_out, "sizeof(uint64_t)"))
+
+    let new_e = checker::TExpr {
+        kind = checker::TCall { callee = cgt_path3("teko", "mem", "region_new"); args = teko::list::empty(); call_ns = "teko::mem"; is_closure_call = false; callee_type = checker::Void { }; is_iface_dispatch = false; iface_slot = 0 }
+        type = checker::Uptr { }
+        line = 0; col = 0
+    }
+    let new_out = match emit_expr(cgt_empty(), cgt_prog(), new_e) { []byte as o => str(o); error => "" }
+    teko::assert::is_true(teko::str::contains(new_out, "tk_region_new(tk_region_root())"))
+
+    let handle_var = checker::TExpr {
+        kind = checker::TVar { name = "a"; is_func = false; func_ns = "" }
+        type = checker::Named { name = "Arena" }
+        line = 0; col = 0
+    }
+    let free_args: []checker::TExpr = teko::list::push(teko::list::empty(), handle_var)
+    let free_e = checker::TExpr {
+        kind = checker::TCall { callee = cgt_path3("teko", "mem", "free"); args = free_args; call_ns = "teko::mem"; is_closure_call = false; callee_type = checker::Void { }; is_iface_dispatch = false; iface_slot = 0 }
+        type = checker::Void { }
+        line = 0; col = 0
+    }
+    let free_out = match emit_expr(cgt_empty(), cgt_prog_with_region_handle("Arena"), free_e) { []byte as o => str(o); error => "" }
+    teko::assert::is_true(teko::str::contains(free_out, "tk_region_drop_subtree"))
+    teko::assert::is_true(teko::str::contains(free_out, ".region"))
+}

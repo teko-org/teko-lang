@@ -854,6 +854,72 @@ pub fn is_must_free_name(name: str, table: TypeTable) -> bool {
 }
 
 /**
+ * Is `name` a MANUAL REGION-HANDLE type (S3, issue #358 — the `unsafe #must_free type Arena`
+ * shape) — a `#must_free` struct declaring exactly one `uptr` field, which holds the raw
+ * `tk_region *` this handle bulk-frees? This is the STRUCTURAL signal that routes
+ * `teko::mem::free(handle)` to `tk_region_drop_subtree` (bulk-drop the whole child region),
+ * rather than the slice free-list or the class arena-per-object drop. Keyed off shape + the
+ * `#must_free` flag, never a hard-coded `Arena` name, so any project's region-handle type (the
+ * stdlib `teko::mem::unsafe::Arena` OR a fixture's local copy) is recognized identically.
+ *
+ * A non-`#must_free` struct, or one whose single field is not `uptr`, or any multi-field /
+ * non-struct type, is NOT a region handle — those keep their existing `teko::mem::free` routing
+ * (or are rejected as non-heap). Fails CLOSED: an unresolvable field type is treated as non-`uptr`.
+ *
+ * @param name   a resolved (canonical or bare) type name
+ * @param table  the program's type table
+ * @return       true iff `name` is a `#must_free` struct with a single `uptr` field
+ */
+pub fn is_region_handle_name(name: str, table: TypeTable) -> bool {
+    match type_table_find(table, name, "") {
+        parser::TypeDecl as td => is_region_handle_decl(td, table)
+        error => false
+    }
+}
+
+/**
+ * The structural test behind `is_region_handle_name`: `td` is a `#must_free` struct whose sole
+ * field resolves to the opaque word-size `uptr` (the raw `tk_region *` carrier). Split out so the
+ * region-field NAME can be recovered separately (`region_handle_field_name`) without re-deciding.
+ *
+ * @param td     a resolved type declaration
+ * @param table  the program's type table
+ * @return       true iff `td` is a `#must_free` single-`uptr`-field struct
+ */
+fn is_region_handle_decl(td: parser::TypeDecl, table: TypeTable) -> bool {
+    if !td.must_free { return false }
+    match td.body {
+        parser::StructBody as sb => {
+            if sb.fields.len != 1 { return false }
+            match resolve_type(sb.fields[0].type_ann, table, "") {
+                Type as t => match t { Uptr => true; _ => false }
+                error => false
+            }
+        }
+        _ => false
+    }
+}
+
+/**
+ * The NAME of a region-handle type's single `uptr` field — the field `teko::mem::free` codegen
+ * reads to reach the raw `tk_region *`. Only meaningful when `is_region_handle_name(name, …)` is
+ * true; returns the empty string otherwise (the caller has already gated on the predicate).
+ *
+ * @param name   a resolved region-handle type name
+ * @param table  the program's type table
+ * @return       the single `uptr` field's name, or "" if `name` is not a region handle
+ */
+pub fn region_handle_field_name(name: str, table: TypeTable) -> str {
+    match type_table_find(table, name, "") {
+        parser::TypeDecl as td => match td.body {
+            parser::StructBody as sb => if sb.fields.len == 1 { sb.fields[0].name } else { "" }
+            _ => ""
+        }
+        error => ""
+    }
+}
+
+/**
  * Is `name` declared `unsafe` (U1/U2, the 0.1.0.0-beta memory+unsafe remodel #333) — a
  * `unsafe type M = struct|class { … }` whose values may only be named by another `unsafe`
  * type or an `unsafe fn` (contagion-by-composition, never a spine/flow analysis — a pure

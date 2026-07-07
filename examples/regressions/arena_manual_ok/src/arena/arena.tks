@@ -1,0 +1,85 @@
+/**
+ * A LOCAL COPY of the S3 (`teko::mem::unsafe`, issue #358) `Arena` shape, WITH the `#must_free`
+ * and `unsafe` modifiers (this fixture is compiled by gen1/native, never the released seed, so
+ * both markers are available here — unlike the stdlib module itself, which stages them off until a
+ * seed refresh; see src/mem/unsafe/arena.tks's header). Mirrors the unsafe_rawbuf_roundtrip
+ * convention: a regression fixture is its own standalone project, so it self-contains the shape it
+ * exercises.
+ *
+ * The dev-controlled, non-lexical MANUAL region: `Arena::new` opens a fresh child region
+ * (`region_new` -> tk_region_new), `region_alloc` bump-allocates a `ptr<T>` into it, and
+ * `teko::mem::free(a)` bulk-drops the whole subtree (tk_region_drop_subtree). `#must_free` bars the
+ * region leak (a compile error if dropped unfreed — arena_manual_leak); `unsafe` contains the
+ * residual dangling-`ptr<T>`-after-free risk the dev owns. The handle carries the raw `tk_region *`
+ * as an opaque `uptr` — the single field the checker's `is_region_handle_name` probe recognizes.
+ */
+#must_free
+pub unsafe type Arena = struct {
+    /** The raw `tk_region *` this handle owns, carried as an opaque `uptr`; 0 once bulk-freed. */
+    region: uptr
+
+    /**
+     * Opens a fresh manual region (a new child of the process root) and wraps its raw handle. The
+     * method inherits its owning type's `unsafe`-ness; the returned `Arena` is `#must_free`.
+     *
+     * @return a fresh `Arena` owning a newly opened child region
+     */
+    pub fn new() -> Arena {
+        Arena { region = teko::mem::region_new() }
+    }
+}
+
+/**
+ * Allocates a single `u64` INTO the arena, reads its low byte back through the raw `ptr<u64>`
+ * (`bytes_from_ptr`, the one boundary crossing that copies region bytes into a safe `[]byte`), and
+ * frees the whole region via a `defer { teko::mem::free(a) }` — the canonical `#must_free` cleanup
+ * idiom, satisfying the consume on the fn's single exit path. `unsafe fn` because it binds a local
+ * of the `unsafe type Arena`. For `value = 42` the low byte reads back 42.
+ *
+ * @param value the `u64` to allocate and read back through the region pointer
+ * @return      the low byte of `value`, read back through the `ptr<u64>` before the region is freed
+ */
+pub unsafe fn via_defer(value: u64) -> i32 {
+    mut a = Arena::new()
+    defer { teko::mem::free(a) }
+    let p = teko::mem::region_alloc(a.region, value)
+    let back = teko::mem::bytes_from_ptr(p, 1)
+    back[0] to i32
+}
+
+/**
+ * Allocates a single `u64` INTO the arena, reads its low byte back through the raw `ptr<u64>`, then
+ * frees the region on BOTH arms of the `if` (AC#4 — every branch consumes the `#must_free` handle):
+ * the `flag`-true arm returns the read-back byte, the false arm returns 0. `unsafe fn` because it
+ * binds a local of the `unsafe type Arena`.
+ *
+ * @param flag  selects the arm: true reads the value back, false returns 0
+ * @param value the `u64` to allocate into the region
+ * @return      the low byte of `value` (flag true) or 0 (flag false), each after bulk-freeing
+ */
+pub unsafe fn via_branches(flag: bool, value: u64) -> i32 {
+    mut a = Arena::new()
+    let p = teko::mem::region_alloc(a.region, value)
+    let back = teko::mem::bytes_from_ptr(p, 1)
+    if flag {
+        teko::mem::free(a)
+        back[0] to i32
+    } else {
+        teko::mem::free(a)
+        0
+    }
+}
+
+/**
+ * Sums the three manual-region sub-results — the deterministic fixture sentinel. The defer path
+ * reads back 42, the if-true arm reads back 20, the if-false arm returns 0: 42 + 20 + 0 = 62.
+ * `unsafe fn` because it calls the `unsafe fn`s that name the `unsafe type Arena`.
+ *
+ * @return the exit sentinel, 62
+ */
+pub unsafe fn total() -> i32 {
+    let x = via_defer(42)
+    let y = via_branches(true, 20)
+    let z = via_branches(false, 20)
+    x + y + z
+}

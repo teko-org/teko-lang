@@ -70,6 +70,10 @@ EXPECTED_FAIL=(
 #   len) and a raw `extern` (libc memset, NOT `from "teko_rt"`) writes through its raw field;
 #   same host-only `buf_ptr` builtin the VM refuses, same honest-stop shape as
 #   buf_ptr_memset_roundtrip.
+# arena_manual_ok — S3 (#358): an `unsafe fn` opens an `unsafe #must_free type Arena`, bump-allocs
+#   `ptr<T>`s into it (teko::mem::region_alloc), reads them back (bytes_from_ptr), and bulk-frees
+#   the region on all paths (teko::mem::free -> tk_region_drop_subtree). region_alloc/bytes_from_ptr
+#   are host-only arena builtins the VM refuses — same honest-stop shape as unsafe_rawbuf_roundtrip.
 NATIVE_ONLY=(
     time_types
     extern_reachability
@@ -77,6 +81,7 @@ NATIVE_ONLY=(
     io_file_copy
     crypto_rand_secure_bytes
     unsafe_rawbuf_roundtrip
+    arena_manual_ok
 )
 
 # ── COMPILE-FAIL list ──────────────────────────────────────────────────────────────────
@@ -93,6 +98,9 @@ NATIVE_ONLY=(
 #   adopt_unused_local — #337: `adopt { }` allows return/break/continue (unlike `defer`), so
 #   check_returns/check_labels/check_locals must still validate its body — these four fixtures
 #   each trip one of those checks from inside an adopt block.
+# arena_manual_leak — S3 (#358): an `unsafe #must_free type Arena` opened in an `unsafe fn` and
+#   dropped WITHOUT `teko::mem::free(a)` on some path is a compile-time error (S2/#336's local
+#   consume-or-fail dataflow — the `#must_free` half of the composition), not a runtime one.
 COMPILE_FAIL=(
     must_free_leak
     unsafe_field_in_safe_struct
@@ -100,6 +108,7 @@ COMPILE_FAIL=(
     adopt_break_outside_loop
     adopt_break_unknown_label
     adopt_unused_local
+    arena_manual_leak
 )
 
 is_expected_fail() {

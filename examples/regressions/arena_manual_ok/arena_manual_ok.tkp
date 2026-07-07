@@ -1,0 +1,29 @@
+# Regression: S3 (#358) — `unsafe #must_free type Arena`, the dev-controlled manual region. An
+# `unsafe fn` opens an Arena (`Arena::new` -> tk_region_new), bump-allocates `ptr<T>`s INTO it
+# (`teko::mem::region_alloc` -> tk_region_alloc), READS the allocated values back through the raw
+# pointers (`bytes_from_ptr`), and BULK-FREES the whole region (`teko::mem::free(a)` ->
+# tk_region_drop_subtree) — freed on EVERY path: via a trailing inline free, via `defer {
+# mem::free(a) }`, and via BOTH arms of an `if` (AC#3, AC#4). Composes the wave's two features:
+# `#must_free` bars the region leak (dropping without free = compile error, see arena_manual_leak),
+# `unsafe` contains the residual dangling-pointer risk. Sums three sub-results: 42 (defer path,
+# a u64=42 read back) + 20 (if-true arm, a u64=20 read back) + 0 (if-false arm) = 62. Exit code 62.
+#
+# The Arena/region ops here are a LOCAL COPY of the stdlib `teko::mem::unsafe::Arena`, WITH the
+# `#must_free` / `unsafe` modifiers — this fixture is compiled by gen1/native, never the released
+# seed, so U1's `unsafe` grammar + S2's `#must_free` are available (unlike the stdlib module, which
+# stages both modifiers off until a seed refresh; see src/mem/unsafe/arena.tks's header). Mirrors
+# the unsafe_rawbuf_roundtrip convention: a regression fixture is its own standalone project.
+#
+# Must be built as a NATIVE binary (`region_alloc`/`bytes_from_ptr` are host-only arena builtins,
+# VM-unsupported by design — same honest-stop shape as buf_ptr_memset_roundtrip / unsafe_rawbuf_
+# roundtrip):
+#   teko build examples/regressions/arena_manual_ok -o /tmp/arena_bin
+#   /tmp/arena_bin/arena_manual_ok; echo "exit: $?"   # -> exit: 62
+# TEKO_MEM_PARANOID=1 leaves the exit unchanged (AC#5 — no leak on the freed-on-all-paths case).
+# On the VM (`teko run`) the same program honest-stops cleanly — verified by the harness's
+# NATIVE_ONLY handling (mirrors unsafe_rawbuf_roundtrip).
+name = "arena_manual_ok"
+source = "src"
+
+[artifact]
+kind = "binary"
