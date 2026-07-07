@@ -609,18 +609,17 @@ fn rhs_is_alias_source(e: TExpr) -> bool {
 
 /**
  * Join `UsShared` into the cells of both sides of an alias `dst = src` (both `dst` and the aliased
- * `src` become shared). Reads a `Ref<[]Unique>` so the grown axis is visible in place, mirroring the
- * `escape.tks` `acc.value` accumulator idiom.
+ * `src` become shared), returning the updated axis. Return-value threaded (a functional accumulate,
+ * like the cell-building walk) so the join is deterministic on both engines.
  *
  * @param cells  the cell universe
- * @param us     the unique-vs-shared axis (mutated in place through the ref)
+ * @param us     the unique-vs-shared axis so far
  * @param dst    the destination binding name
  * @param src    the aliased source name
- * @return       void — `us.value` carries the joined axis
+ * @return       the axis with both cells joined to `UsShared`
  */
-fn mark_alias_shared(cells: []Cell, us: Ref<[]Unique>, dst: str, src: str) -> void {
-    us.value = join_us_at(cells, us.value, dst, "")
-    us.value = join_us_at(cells, us.value, src, "")
+fn mark_alias_shared(cells: []Cell, us: []Unique, dst: str, src: str) -> []Unique {
+    join_us_at(cells, join_us_at(cells, us, dst, ""), src, "")
 }
 
 /**
@@ -667,20 +666,23 @@ fn set_us(us: []Unique, i: u32, v: Unique) -> []Unique {
  * The alias-transfer sweep over one statement block: every `let y = x` / `y = x` whose RHS is a
  * non-scalar bare-local read joins BOTH cells to `UsShared` (the any-alias-anywhere ⇒ shared reading
  * — the conservative over-reject direction). Monotone (only climbs `us` up); recurses into nested
- * blocks so a loop / adopter body's aliases count too.
+ * blocks so a loop / adopter body's aliases count too. Return-value threaded (a functional
+ * accumulate) so it is deterministic on both engines.
  *
  * @param body   the typed statement block
  * @param cells  the cell universe
- * @param us     the unique-vs-shared axis (mutated in place through the ref)
- * @return       void — `us.value` carries the joined axis
+ * @param us     the unique-vs-shared axis so far
+ * @return       the axis with this block's aliases joined to `UsShared`
  */
-fn transfer_block(body: []TStatement, cells: []Cell, us: Ref<[]Unique>) -> void {
+fn transfer_block(body: []TStatement, cells: []Cell, us: []Unique) -> []Unique {
+    mut acc = us
     mut i = 0
     loop {
         if i >= body.len { break }
-        transfer_stmt(body[i], cells, us)
+        acc = transfer_stmt(body[i], cells, acc)
         i++
     }
+    acc
 }
 
 /**
@@ -689,20 +691,20 @@ fn transfer_block(body: []TStatement, cells: []Cell, us: Ref<[]Unique>) -> void 
  *
  * @param s      the typed statement
  * @param cells  the cell universe
- * @param us     the unique-vs-shared axis (mutated in place through the ref)
- * @return       void — `us.value` carries the joined axis
+ * @param us     the unique-vs-shared axis so far
+ * @return       the axis with this statement's aliases joined to `UsShared`
  */
-fn transfer_stmt(s: TStatement, cells: []Cell, us: Ref<[]Unique>) -> void {
+fn transfer_stmt(s: TStatement, cells: []Cell, us: []Unique) -> []Unique {
     match s {
         TBinding as b => transfer_binding(b, cells, us)
         TAssign as a => transfer_assign(a, cells, us)
         TLoopStmt as l => transfer_block(l.body, cells, us)
         TDeferStmt as d => transfer_block(d.body, cells, us)
         TAdoptStmt as a => transfer_block(a.body, cells, us)
-        TReturn => { }
-        TExprStmt => { }
-        TBreakStmt => { }
-        TContinueStmt => { }
+        TReturn => us
+        TExprStmt => us
+        TBreakStmt => us
+        TContinueStmt => us
     }
 }
 
@@ -712,14 +714,14 @@ fn transfer_stmt(s: TStatement, cells: []Cell, us: Ref<[]Unique>) -> void {
  *
  * @param b      the typed binding
  * @param cells  the cell universe
- * @param us     the unique-vs-shared axis (mutated in place through the ref)
- * @return       void — `us.value` carries the joined axis
+ * @param us     the unique-vs-shared axis so far
+ * @return       the axis with this binding's alias (if any) joined to `UsShared`
  */
-fn transfer_binding(b: TBinding, cells: []Cell, us: Ref<[]Unique>) -> void {
-    if !rhs_is_alias_source(b.value) { return }
+fn transfer_binding(b: TBinding, cells: []Cell, us: []Unique) -> []Unique {
+    if !rhs_is_alias_source(b.value) { return us }
     match b.target {
         parser::SimpleName as sn => mark_alias_shared(cells, us, sn.name, alias_src_name(b.value))
-        parser::DestructurePattern => { }
+        parser::DestructurePattern => us
     }
 }
 
@@ -729,14 +731,14 @@ fn transfer_binding(b: TBinding, cells: []Cell, us: Ref<[]Unique>) -> void {
  *
  * @param a      the typed assignment
  * @param cells  the cell universe
- * @param us     the unique-vs-shared axis (mutated in place through the ref)
- * @return       void — `us.value` carries the joined axis
+ * @param us     the unique-vs-shared axis so far
+ * @return       the axis with this assignment's alias (if any) joined to `UsShared`
  */
-fn transfer_assign(a: TAssign, cells: []Cell, us: Ref<[]Unique>) -> void {
-    if !rhs_is_alias_source(a.value) { return }
+fn transfer_assign(a: TAssign, cells: []Cell, us: []Unique) -> []Unique {
+    if !rhs_is_alias_source(a.value) { return us }
     match a.kind {
         parser::AssignKind::Simple => mark_alias_shared(cells, us, a.name, alias_src_name(a.value))
-        _ => { }
+        _ => us
     }
 }
 
@@ -769,8 +771,7 @@ fn alias_src_name(e: TExpr) -> str {
  */
 pub fn fn_spine(f: TFunction) -> Spine {
     let cells = add_block_cells(f.body, add_param_cells(f, teko::list::empty()))
-    mut us = seed_us(cells)
-    transfer_block(f.body, cells, us)
+    let us = transfer_block(f.body, cells, seed_us(cells))
     Spine { cells = cells; pt = seed_pt(cells); bf = seed_bf(cells); us = us }
 }
 

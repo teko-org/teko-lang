@@ -16,11 +16,13 @@ use teko::parser
 fn sp_i64() -> Type { Prim { kind = PrimKind::I64 } }
 
 /**
- * A non-scalar `[]i64` slice type — an ALIAS source (`let y = x` on it joins both cells to shared).
+ * A non-scalar `str` type — an ALIAS source (`let y = x` on it joins both cells to shared). `str` is
+ * a VIEW `{ptr,len}` that may alias (escape.tks's own `type_is_scalar` note: deliberately NOT
+ * scalar), so it is the natural payload-free non-scalar for a hand-built alias input.
  *
- * @return the `[]i64` slice type
+ * @return the `str` type
  */
-fn sp_slice() -> Type { Slice { element = sp_i64() } }
+fn sp_nonscalar() -> Type { Str { } }
 
 /**
  * A typed variable read (`TVar`) of the given name and type — the bare-local alias-source shape.
@@ -42,7 +44,7 @@ fn sp_var(name: str, t: Type) -> TExpr {
  * @return       a `TFieldAccess` typed expression
  */
 fn sp_field(recv: str, field: str, t: Type) -> TExpr {
-    TExpr { kind = TFieldAccess { receiver = sp_var(recv, sp_slice()); field = field }; type = t; line = 0; col = 0 }
+    TExpr { kind = TFieldAccess { receiver = sp_var(recv, sp_nonscalar()); field = field }; type = t; line = 0; col = 0 }
 }
 
 /**
@@ -131,7 +133,7 @@ fn sp_fn(params: []parser::Param, body: []TStatement) -> TFunction {
  */
 #test fn spine_cell_universe_enumerates_bindings_ref_params_and_one_hop_fields() {
     let params = teko::list::push(teko::list::push(teko::list::empty(), sp_param("p")), sp_ref_param("r"))
-    let body = teko::list::push(teko::list::push(teko::list::empty(), sp_let("y", sp_slice_var("x"))), sp_exprstmt(sp_field("x", "f", sp_i64())))
+    let body = teko::list::push(teko::list::push(teko::list::empty(), sp_let("y", sp_nonscalar_var("x"))), sp_exprstmt(sp_field("x", "f", sp_i64())))
     let s = fn_spine(sp_fn(params, body))
     teko::assert::is_true(cell_of(s, "p") >= 0)
     teko::assert::is_true(cell_of(s, "r") >= 0)
@@ -141,12 +143,12 @@ fn sp_fn(params: []parser::Param, body: []TStatement) -> TFunction {
 }
 
 /**
- * A bare `[]i64` local read of the given name — an alias-source RHS.
+ * A bare non-scalar (`str`) local read of the given name — an alias-source RHS.
  *
  * @param name  the variable name
- * @return      a slice-typed `TVar`
+ * @return      a non-scalar-typed `TVar`
  */
-fn sp_slice_var(name: str) -> TExpr { sp_var(name, sp_slice()) }
+fn sp_nonscalar_var(name: str) -> TExpr { sp_var(name, sp_nonscalar()) }
 
 /**
  * Does the spine hold a one-hop cell keyed `name`.`field`?
@@ -223,7 +225,7 @@ fn sp_bf_is_none(b: BorrowedFrom) -> bool { match b { BfNone => true; _ => false
  * FALSE for both (the aliased-free UAF direction); a never-aliased binding stays unique ⇒ TRUE.
  */
 #test fn spine_alias_marks_both_cells_shared_and_is_unique_at_reflects_it() {
-    let body = teko::list::push(teko::list::push(teko::list::empty(), sp_let("x", sp_slice_var("src"))), sp_let("y", sp_slice_var("x")))
+    let body = teko::list::push(teko::list::push(teko::list::empty(), sp_let("x", sp_nonscalar_var("src"))), sp_let("y", sp_nonscalar_var("x")))
     let s = fn_spine(sp_fn(teko::list::empty(), body))
     let xi = cell_of(s, "x")
     let yi = cell_of(s, "y")
@@ -236,7 +238,7 @@ fn sp_bf_is_none(b: BorrowedFrom) -> bool { match b { BfNone => true; _ => false
  * sound-free floor (`examples/regressions/mem_free` must keep passing under PR-3).
  */
 #test fn spine_unaliased_binding_is_unique() {
-    let body = teko::list::push(teko::list::empty(), sp_let("xs", sp_field("obj", "data", sp_slice())))
+    let body = teko::list::push(teko::list::empty(), sp_let("xs", sp_field("obj", "data", sp_nonscalar())))
     let s = fn_spine(sp_fn(teko::list::empty(), body))
     let xi = cell_of(s, "xs")
     teko::assert::is_true(xi >= 0)
@@ -342,7 +344,7 @@ fn sp_bf_is_none(b: BorrowedFrom) -> bool { match b { BfNone => true; _ => false
  * verdicts (the transfer is idempotent at the fixpoint — the termination guarantee, ≤ |cells| × 3).
  */
 #test fn spine_fixpoint_is_stable_on_rerun() {
-    let body = teko::list::push(teko::list::push(teko::list::empty(), sp_let("x", sp_slice_var("src"))), sp_let("y", sp_slice_var("x")))
+    let body = teko::list::push(teko::list::push(teko::list::empty(), sp_let("x", sp_nonscalar_var("src"))), sp_let("y", sp_nonscalar_var("x")))
     let f = sp_fn(teko::list::empty(), body)
     let s1 = fn_spine(f)
     let s2 = fn_spine(f)
@@ -493,4 +495,14 @@ fn sp_set_pt(pt: []PointsTo, i: u32, v: PointsTo) -> []PointsTo {
         k++
     }
     acc
+}
+
+/**
+ * A non-scalar (`str`) type is NOT `type_is_scalar`, so a bare non-scalar local read IS an
+ * `rhs_is_alias_source` — the alias-source classification the unique-vs-shared transfer keys on.
+ */
+#test fn spine_nonscalar_local_read_is_an_alias_source() {
+    teko::assert::is_false(type_is_scalar(sp_nonscalar()))
+    teko::assert::is_true(rhs_is_alias_source(sp_nonscalar_var("z")))
+    teko::assert::is_false(rhs_is_alias_source(sp_var("k", sp_i64())))
 }
