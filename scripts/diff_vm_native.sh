@@ -66,12 +66,54 @@ EXPECTED_FAIL=(
 # crypto_rand_secure_bytes — calls teko::crypto::rand::secure_bytes, a `from "teko_rt"`
 #   extern (#194 C6); the VM rejects EVERY extern (not just raw platform ones — C7.1a), so
 #   this CSPRNG primitive is native-only, same shape as time_types.
+# unsafe_rawbuf_roundtrip — U3 (#334): an `unsafe fn` allocs a `RawBuf` (raw `ptr<byte>` +
+#   len) and a raw `extern` (libc memset, NOT `from "teko_rt"`) writes through its raw field;
+#   same host-only `buf_ptr` builtin the VM refuses, same honest-stop shape as
+#   buf_ptr_memset_roundtrip.
+# arena_manual_ok — S3 (#358): an `unsafe fn` opens an `unsafe #must_free type Arena`, bump-allocs
+#   `ptr<T>`s into it (teko::mem::region_alloc), reads them back (bytes_from_ptr), and bulk-frees
+#   the region on all paths (teko::mem::free -> tk_region_drop_subtree). region_alloc/bytes_from_ptr
+#   are host-only arena builtins the VM refuses — same honest-stop shape as unsafe_rawbuf_roundtrip.
 NATIVE_ONLY=(
     time_types
     extern_reachability
     buf_ptr_memset_roundtrip
     io_file_copy
     crypto_rand_secure_bytes
+    unsafe_rawbuf_roundtrip
+    arena_manual_ok
+)
+
+# ── COMPILE-FAIL list ──────────────────────────────────────────────────────────────────
+# NEGATIVE fixtures — a project the checker must REJECT (a compile error), on BOTH
+# engines, rather than run-and-compare exit codes/stdout (there is no successful run to
+# compare). Asserts `teko run` AND `teko build` both exit non-zero, proving the two
+# engines reject the SAME project identically.
+# must_free_leak — S2 (#336): a `#must_free` handle dropped without being freed on some
+#   path is a compile-time error (the local consume-or-fail dataflow), not a runtime one.
+# unsafe_field_in_safe_struct — U3 (#334) AC#4: a SAFE struct naming an unsafe-typed field
+#   (without the `unsafe` modifier itself) is a compile-time error (U2's #333 field-contagion
+#   gate), not a runtime one.
+# adopt_return_type_mismatch / adopt_break_outside_loop / adopt_break_unknown_label /
+#   adopt_unused_local — #337: `adopt { }` allows return/break/continue (unlike `defer`), so
+#   check_returns/check_labels/check_locals must still validate its body — these four fixtures
+#   each trip one of those checks from inside an adopt block.
+# ref_returned_rejected / ref_in_collection_rejected — #331 L1 KEEP-FOREVER guards: a fn that
+#   RETURNS a `Ref<T>` (R3) and a `Ref<T>` stored as a struct member (R4) each stay a compile
+#   error (spine-build-plan §7). PR-1's pure `fn_spine` query relaxed NEITHER — these prove it.
+# arena_manual_leak — S3 (#358): an `unsafe #must_free type Arena` opened in an `unsafe fn` and
+#   dropped WITHOUT `teko::mem::free(a)` on some path is a compile-time error (S2/#336's local
+#   consume-or-fail dataflow — the `#must_free` half of the composition), not a runtime one.
+COMPILE_FAIL=(
+    must_free_leak
+    unsafe_field_in_safe_struct
+    adopt_return_type_mismatch
+    adopt_break_outside_loop
+    adopt_break_unknown_label
+    adopt_unused_local
+    ref_returned_rejected
+    ref_in_collection_rejected
+    arena_manual_leak
 )
 
 is_expected_fail() {
@@ -83,6 +125,12 @@ is_expected_fail() {
 is_native_only() {
     local name="$1" x
     for x in "${NATIVE_ONLY[@]}"; do [ "$x" = "$name" ] && return 0; done
+    return 1
+}
+
+is_compile_fail() {
+    local name="$1" x
+    for x in "${COMPILE_FAIL[@]}"; do [ "$x" = "$name" ] && return 0; done
     return 1
 }
 
@@ -185,6 +233,24 @@ for proj in "${fixtures[@]}"; do
     name="$(basename "$proj")"
     out="$work/$name"
     mkdir -p "$out"
+
+    # ── NEGATIVE fixture: both engines must REJECT it (a compile error), not run ───
+    if is_compile_fail "$name"; then
+        run_limited "$TEKO" run "$proj" >"$out/vm.stdout" 2>"$out/vm.stderr"
+        vm_rc=$?
+        run_limited "$TEKO" build "$proj" -o "$out/bin" >"$out/build.stdout" 2>"$out/build.stderr"
+        native_rc=$?
+        if [ "$vm_rc" -ne 0 ] && [ "$native_rc" -ne 0 ]; then
+            pass=$((pass + 1))
+            printf 'PASS  %-28s both engines reject (compile-fail) vm=%s native=%s\n' "$name" "$vm_rc" "$native_rc"
+        else
+            fail=$((fail + 1)); failed_names+=("$name")
+            printf 'FAIL  %-28s expected BOTH engines to reject; vm=%s native=%s\n' "$name" "$vm_rc" "$native_rc"
+            [ "$vm_rc" -eq 0 ] && tail -5 "$out/vm.stdout" | sed 's/^/      | vm: /'
+            [ "$native_rc" -eq 0 ] && tail -5 "$out/build.stdout" | sed 's/^/      | native: /'
+        fi
+        continue
+    fi
 
     # ── engine 1: the VM (skipped for native-only fixtures) ────────────────────────
     if ! is_native_only "$name"; then

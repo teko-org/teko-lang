@@ -121,7 +121,20 @@ pub type ExprStmt = struct { expr: Expr }   // a bare expression on its own line
 // Nested `defer` is rejected by the checker.
 pub type DeferStmt = struct { body: []Statement }
 
-pub type Statement = variant Binding | Assign | Return | LoopStmt | BreakStmt | ContinueStmt | ExprStmt | DeferStmt
+/**
+ * `adopt [name] { stmts }` — opens an ADOPTER region; every object allocated lexically inside
+ * belongs to it, and the closing brace BULK-drops the whole subtree at once (cycles irrelevant —
+ * nothing is freed per-object). The C1 closer of the memory remodel (§1 L4). `adopt` is a
+ * CONTEXTUAL statement head (not a hard keyword) recognized by ident text at statement position.
+ *
+ * @field name  the optional bound name (`adopt r { … }`); empty = anonymous adopter. The region
+ *              is opened/dropped either way; the name only matters when a future increment lets
+ *              code reference the region handle.
+ * @field body  the statements executed inside the adopter region.
+ */
+pub type AdoptStmt = struct { name: str; body: []Statement }
+
+pub type Statement = variant Binding | Assign | Return | LoopStmt | BreakStmt | ContinueStmt | ExprStmt | DeferStmt | AdoptStmt
 
 // --- generic type-parameter CONSTRAINTS (W11/S6, 2026-07-01) -----------------------------
 // `<T: ConstraintExpr>` — a DEDICATED boolean grammar over NOMINAL atoms (variant/struct
@@ -185,6 +198,16 @@ pub type Function = struct {
     is_override: bool   // `override fn` — overrides a base virtual/abstract method
     has_inject: bool
     injects: []InjectBinding
+    /**
+     * An `unsafe fn` — the owner-total risk marker on a namespace function (U1, the
+     * 0.1.0.0-beta memory+unsafe remodel §2). `unsafe` is a contextual keyword (not
+     * reserved), so this flag is parsed but NOT enforced here: the checker (U2) is
+     * what makes an unsafe fn's contents actually unlock the risky operations. A
+     * method's `Function` (inside a struct/class body) always carries `is_unsafe =
+     * false` — per design, unsafe-ness attaches to the ENCLOSING TypeDecl, not to
+     * individual methods; `TypeDecl.is_unsafe` is the sole source of truth there.
+     */
+    is_unsafe: bool
 }
 // (OOP A1, 2026-07-01) methods = interleaved `fn` decls in the struct body (unified method
 // model): each Function's 1st param has_type=false ⇒ an INSTANCE method (the receiver, name
@@ -274,8 +297,44 @@ pub type TypeDecl = struct {   // nominal (B.13)
     di_kind: DiKind
     has_di_key: bool
     di_key: str
+    /**
+     * An `unsafe type M = struct|class { … }` — the owner-total risk marker on a
+     * type declaration (U1, the 0.1.0.0-beta memory+unsafe remodel §2). `unsafe` is
+     * a contextual keyword (not reserved), so this flag is parsed but NOT enforced
+     * here: the checker (U2) is what makes the contagion-by-composition and
+     * uncolored-calls rules bite. A trait/interface/enum/flags/alias/extern TypeDecl
+     * likewise just carries this flag (default `false` unless `unsafe` precedes it).
+     */
+    is_unsafe: bool
+    /**
+     * A `#must_free type M = struct|class { … }` — the RELEVANT-type marker (S2, the
+     * 0.1.0.0-beta memory+unsafe remodel #336), the DUAL of affine: a value of this type must
+     * be consumed (freed or moved) on at least one control-flow path, or the checker's local
+     * consume-or-fail dataflow (`type_function`) rejects the function at compile time. Parsed
+     * as a plain `#`-attribute (no payload), like `#singleton`/`#scoped`/`#transient`, but it
+     * may ONLY precede a `type` (never a `fn`/`flags`, never a `let`). Default `false` unless
+     * `#must_free` precedes the declaration.
+     */
+    must_free: bool
 }
-pub type UseDecl = struct { path: Path; has_alias: bool; alias: str }   // use a::b [as c]
+/**
+ * A `use` declaration, in one of three forms (S1, the 0.1.0.0-beta remodel §3.1):
+ * bare `use a::b`, aliased `use a::b as c`, or grouped `use a::b::[ X, Y ]`.
+ */
+pub type UseDecl = struct {
+    /** the owning namespace path (`a::b`), common to all three forms. */
+    path: Path
+    /** true iff an `as alias` follows the path (never true for the grouped form). */
+    has_alias: bool
+    /** the bound alias name (valid iff `has_alias`; `""` for bare/grouped forms). */
+    alias: str
+    /**
+     * the grouped import's names (`use a::b::[ X, Y ]` → `["X", "Y"]`); EMPTY for the two
+     * existing forms (bare and aliased) — an empty list is the "not a grouped import"
+     * sentinel the checker's `build_aliases` guards on.
+     */
+    names: []str
+}
 
 // --- R-main: a `.tks` file is a MAIN (executable entry) or a MODULE. ---
 pub type Decl = variant Function | TypeDecl   // a top-level declaration (a module's content)

@@ -3483,6 +3483,27 @@ pub fn exec_stmt(s: checker::TStatement, env: Venv) -> Step {
         // The VM drains the defer list in eval_call after exec_block completes.
         // Panic does NOT drain deferred blocks.
         checker::TDeferStmt as d => Stepped { env = push_defer(env, d.body); value = null }
+        checker::TAdoptStmt as a => exec_adopt(a, env)
+    }
+}
+
+/**
+ * exec_adopt — run an `adopt [name] { … }` body as an ORDINARY block. Region drops are a
+ * native-only reclamation detail invisible to program output, so the VM simply executes the body
+ * and pops its block-locals back to the outer scope (like exec_if's branch). Unlike a defer, the
+ * body's `return`/`break`/`continue` PROPAGATES: a non-Normal block flow becomes an Exit.
+ *
+ * @param a    the typed adopt statement
+ * @param env  the enclosing VM environment
+ * @return     Stepped on normal fall-through (block-locals popped), or Exit on return/break/continue
+ */
+fn exec_adopt(a: checker::TAdoptStmt, env: Venv) -> Step {
+    let base = env.slots.len
+    let bo = exec_block(a.body, env)
+    let popped = Venv { slots = loop_outer(bo.env.slots, base); prog = bo.env.prog; defers = bo.env.defers; cells = bo.env.cells; di_cache = bo.env.di_cache }
+    match bo.flow {
+        Normal as n => Stepped { env = popped; value = n.value }
+        _ => Exit { flow = bo.flow; env = popped }
     }
 }
 
@@ -3853,6 +3874,18 @@ fn cov_walk_expr(e: checker::TExpr, w: CovWalk) -> CovWalk {
     }
 }
 
+/**
+ * cov_walk_stmt — the VM's static full-program coverage-line pre-registration walk over ONE
+ * statement, mirroring the set of lines native codegen marks inline as it emits each statement
+ * (`emit_cov_lines`/`stmt_cov_lines`). `TLoopStmt` and `TAdoptStmt` both descend into their body
+ * via `cov_walk_block` — native emits every body statement through `emit_stmt` too (for `adopt`,
+ * via `emit_adopt` -> `emit_block`), so both bodies must be walked here for VM == native parity.
+ * `TDeferStmt`/`TBreakStmt`/`TContinueStmt` carry no directly-walked expression of their own.
+ *
+ * @param s  the statement to walk
+ * @param w  the accumulated coverage-walk state
+ * @return   `w` with every reachable line/branch site this statement contributes registered
+ */
 fn cov_walk_stmt(s: checker::TStatement, w: CovWalk) -> CovWalk {
     match s {
         checker::TBinding as b => cov_walk_expr(b.value, w)
@@ -3860,7 +3893,8 @@ fn cov_walk_stmt(s: checker::TStatement, w: CovWalk) -> CovWalk {
         checker::TReturn as r => if r.has_value { cov_walk_expr(r.value, w) } else { w }
         checker::TLoopStmt as l => cov_walk_block(l.body, w)
         checker::TExprStmt as x => cov_walk_expr(x.expr, w)
-        _ => w   // break/continue — no expr
+        checker::TAdoptStmt as ad => cov_walk_block(ad.body, w)
+        _ => w
     }
 }
 

@@ -1,0 +1,1044 @@
+use teko::parser
+
+/**
+ * A CELL in the spine's abstract domain — the unit the bounded points-to / uniqueness FACT
+ * (`src/checker/spine.tks`, namespace `teko::checker`, #331 L1) attaches its points-to /
+ * borrowed-from / unique-vs-shared axes to.
+ *
+ * The spine is layered BESIDE the untouched `escape.tks` name set (the #330 LAYER verdict):
+ * `escape.tks` computes a NAME SET (which locals outlive the frame); the spine computes a finer,
+ * per-cell lattice for one function. The two never interfere — `mark_*` / `fn_escaping_vars` stay
+ * byte-identical (a reviewer diffs `escape.tks` and sees zero change) — and the spine only ever
+ * CERTIFIES a subset of what the name set over-marked.
+ *
+ * PR-1 SCOPE: the PURE query (`fn_spine`) plus its two gate queries (`ref_target_outlives` /
+ * `is_unique_at`). Nothing consumes it for a decision yet (that is PR-2 / PR-3), so it emits no C
+ * and relaxes no gate — FIXPOINT is preserved by construction. The universe is FINITE per function
+ * (bindings + their one-hop fields + `Reference` params); the product lattice
+ * (`pt` × `bf` × `us`) has fixed height ≤ 3 per axis, bounding the STATE SPACE — not a claim every
+ * axis dynamically climbs. Only `pt` (the adopter-confinement transfer, §5.1) and `us` (the alias
+ * transfer) are MONOTONE-JOIN-climbed to a worklist fixpoint in ≤ |cells| × 3 join steps; `bf` is
+ * SINGLE-ASSIGNMENT (seeded once per `Reference` cell — a ref is parameter-only today — and, once
+ * PR-2's L2a relaxation lands, written once more by DEFINITE ASSIGNMENT at a local ref-bind's one
+ * syntactic borrow site, never by joining two candidate referents), so `BorrowedFrom` carries no
+ * join in this build (see its own doc-comment). The `name` / `field` pair projects to the
+ * `escape.tks` name set by dropping `field` (a one-hop `x.f` cell projects to the name `x`), so
+ * `fn_escaping_vars` stays byte-identical.
+ *
+ * @see docs/design/spine-build-plan.md §1 (L1 — the fact)
+ * @see docs/design/spine-layer-or-replace.md §2c.2 (the abstract domain + termination)
+ */
+pub type Cell = struct {
+    /**
+     * The binding / parameter name — the same key `str_set_*` uses (escape.tks name set).
+     */
+    name: str
+    /**
+     * A single field off `name` for a one-hop path (`x.f`), else "" for a bare binding / param.
+     * EXACTLY one hop; `a.b.c` is never a cell (it collapses to `⊤`).
+     */
+    field: str
+    /**
+     * True iff this cell is a `Reference`-typed parameter — the referent ANCHOR the outlives proof
+     * needs (R5: a ref is parameter-only today).
+     */
+    is_ref_param: bool
+}
+
+/**
+ * A `PtParam` payload — WHICH parameter slot a cell's value is allocated in (the param index).
+ *
+ * @field index  the 0-based parameter position that owns the value.
+ */
+pub type PtParamId = struct { index: u32 }
+
+/**
+ * A `PtAdopter` payload — WHICH lexical `adopt { }` region a cell's value is allocated in (§5.1, the
+ * ADOPT escape fact). `top` marks the safe-fallback `PtAdopter(⊤)`: any allocation inside ANY adopter
+ * whose precise region id exceeds the one-function budget, rejected on escape.
+ *
+ * @field region  the lexical adopter region id (valid iff `!top`).
+ * @field top     true iff this is the `⊤` fallback (region id un-nameable — reject on escape).
+ */
+pub type PtAdopterId = struct { region: u32; top: bool }
+
+/**
+ * The value is allocated in the FRAME region — it dies with the frame. The bottom of the points-to
+ * axis (the climb-floor).
+ */
+pub type PtFrame = struct { }
+/**
+ * The value is allocated in the ROOT region — it outlives the frame (a safe leak). One of the
+ * concrete allocation sites (rank 1).
+ */
+pub type PtRoot = struct { }
+/**
+ * The value is owned by a parameter slot (the caller owns it, so it outlives every frame local).
+ *
+ * @field id  the owning parameter slot.
+ */
+pub type PtParam = struct { id: PtParamId }
+/**
+ * The value is allocated lexically inside an `adopt { }` block — bulk-dropped at that block's brace.
+ *
+ * @field id  the lexical adopter region this allocation is confined to.
+ */
+pub type PtAdopter = struct { id: PtAdopterId }
+/**
+ * `⊤` — the allocation site is unknown / joined-over. Treated as `PtRoot` (the safe leak) by every
+ * consumer; a borrow of a `PtTop` referent is never provably outlived.
+ */
+pub type PtTop = struct { }
+/**
+ * WHERE a cell's value is allocated (the points-to axis). Join = set-union capped at Top; Top ⇒ treat
+ * as Root (the safe leak). `PtParam` carries its owning parameter slot; `PtAdopter` carries the
+ * lexical `adopt { }` region id (§5.1 — the ADOPT escape fact). Fixed height ≤ 3
+ * (`PtFrame < concrete site < PtTop`).
+ */
+pub type PointsTo = variant PtFrame | PtRoot | PtParam | PtAdopter | PtTop
+
+/**
+ * A `BfParam` payload — WHICH parameter a `Reference` cell borrows (its referent's param slot).
+ *
+ * @field index  the 0-based parameter position of the referent.
+ */
+pub type BfParamId = struct { index: u32 }
+
+/**
+ * A `BfLocal` payload — WHICH local name a `Reference` cell borrows (its referent's binding name).
+ *
+ * @field name  the referent local's binding name.
+ */
+pub type BfLocalId = struct { name: str }
+
+/**
+ * The cell borrows NOTHING — it is not a `Reference` (or its referent is un-recorded). The lattice
+ * bottom of the borrowed-from axis.
+ */
+pub type BfNone = struct { }
+/**
+ * The cell borrows a PARAMETER — the caller owns the referent, so it outlives every frame local.
+ *
+ * @field id  the borrowed parameter slot.
+ */
+pub type BfParam = struct { id: BfParamId }
+/**
+ * The cell borrows a LOCAL — the outlives proof holds only when the referent's block ENCLOSES the
+ * borrow's block.
+ *
+ * @field id  the borrowed local's binding name.
+ */
+pub type BfLocal = struct { id: BfLocalId }
+/**
+ * `⊤` — the referent is un-nameable (a shape `ref_target_outlives`' caller could not resolve to a
+ * single cell). The outlives proof FAILS (REJECT); conservative.
+ */
+pub type BfTop = struct { }
+/**
+ * For a `Reference` cell, WHICH referent it borrows (the borrowed-from axis). Unlike `pt` / `us`,
+ * `bf` is SINGLE-ASSIGNMENT, not join-climbed: a ref is parameter-only today, so `fn_spine` seeds it
+ * once per cell (`BfParam(i)` for a `Reference` param, `BfNone` otherwise) and no L1 transfer ever
+ * revisits it. PR-2's L2a relaxation writes `bf(r) := BfLocal(referent-name)` by DEFINITE ASSIGNMENT
+ * at the one syntactic borrow site a local ref-bind names — never by joining two candidate
+ * referents (a binding names at most one RHS) — so `BorrowedFrom` carries no join in this build.
+ * `⊤` (BfTop) ⇒ referent unknown ⇒ the outlives proof FAILS ⇒ REJECT.
+ */
+pub type BorrowedFrom = variant BfNone | BfParam | BfLocal | BfTop
+
+/**
+ * The cell is the SOLE live handle to its target — safe to `free` / move.
+ */
+pub type UsUnique = struct { }
+/**
+ * The cell is aliased — another binding still holds its target, so it may NOT be `free`d / moved.
+ */
+pub type UsShared = struct { }
+/**
+ * `⊤` — uniqueness unknown / joined-over. Treated as `Shared` (the safe direction).
+ */
+pub type UsTop = struct { }
+/**
+ * Whether a cell is the SOLE live handle to its target (the unique-vs-shared axis). `let y = x` on a
+ * non-scalar joins both to `UsShared`. `⊤` (UsTop) ⇒ `Shared` (the safe direction: a shared cell may
+ * not be `free`d). Fixed height ≤ 3 (`UsUnique < UsShared < UsTop`).
+ */
+pub type Unique = variant UsUnique | UsShared | UsTop
+
+/**
+ * The per-cell fact for one function — parallel arrays keyed by cell index (Teko has no Map in the
+ * compiler corpus; `escape.tks` uses the same parallel-`[]str` idiom). `fn_spine` returns this; the
+ * L2 gates (PR-2 / PR-3) query it via `ref_target_outlives` / `is_unique_at`.
+ *
+ * @field cells  the finite cell universe of the analyzed function.
+ * @field pt     the points-to axis, parallel to `cells`.
+ * @field bf     the borrowed-from axis, parallel to `cells`.
+ * @field us     the unique-vs-shared axis, parallel to `cells`.
+ */
+pub type Spine = struct {
+    cells: []Cell
+    pt: []PointsTo
+    bf: []BorrowedFrom
+    us: []Unique
+}
+
+/**
+ * Is `t` (a syntactic type annotation) a `Reference` (`Ref<T>`)? A `Reference` param is written
+ * `Ref<T>` — a `NamedType` whose single leading path segment is `Ref`. Matches the checker's own
+ * `Ref` recognition (resolve.tks) so the cell universe agrees with the resolved type.
+ *
+ * @param t  the parsed parameter type annotation
+ * @return   true iff `t` names `Ref<…>`
+ */
+fn type_ann_is_ref(t: parser::TypeExpr) -> bool {
+    match t {
+        parser::NamedType as nt => named_head_is_ref(nt)
+        parser::SliceType => false
+        parser::UnionType => false
+        parser::OptionalType => false
+        parser::FunctionType => false
+    }
+}
+
+/**
+ * Is this `NamedType`'s leading path segment exactly `Ref` (with a single generic argument)? The
+ * `Ref<T>` surface spelling of a `Reference`.
+ *
+ * @param nt  the named-type annotation
+ * @return    true iff its head segment is `Ref` and it carries one type argument
+ */
+fn named_head_is_ref(nt: parser::NamedType) -> bool {
+    if nt.path.segments.len == 0 { return false }
+    if nt.args.len != 1 { return false }
+    nt.path.segments[0].name == "Ref"
+}
+
+/**
+ * Look up a cell's index by its `name` / `field` key, or -1 when absent. Linear (cell sets are tiny —
+ * one function's bindings), mirroring the `str_set_*` idiom in `escape.tks`.
+ *
+ * @param cells  the cell universe
+ * @param name   the binding / parameter name
+ * @param field  the one-hop field ("" for a bare cell)
+ * @return       the 0-based cell index, or -1 when no such cell exists
+ */
+fn cell_index(cells: []Cell, name: str, field: str) -> i64 {
+    mut i = 0
+    loop {
+        if i >= cells.len { break }
+        if cells[i].name == name {
+            if cells[i].field == field { return i to i64 }
+        }
+        i++
+    }
+    -1
+}
+
+/**
+ * Add a cell (keyed by `name` / `field`) to `cells` if absent, returning the possibly-grown set.
+ * Keeps the universe deduped so the parallel axis arrays stay index-aligned.
+ *
+ * @param cells         the cell universe so far
+ * @param name          the binding / parameter name
+ * @param field         the one-hop field ("" for a bare cell)
+ * @param is_ref_param  true iff a `Reference` parameter cell
+ * @return              the cell universe including the (possibly new) cell
+ */
+fn add_cell(cells: []Cell, name: str, field: str, is_ref_param: bool) -> []Cell {
+    if cell_index(cells, name, field) >= 0 { return cells }
+    teko::list::push(cells, Cell { name = name; field = field; is_ref_param = is_ref_param })
+}
+
+/**
+ * Add every PARAMETER of `f` to the cell universe: one bare cell per param, marking a `Reference`
+ * param as `is_ref_param`. The bare cell anchors the referent an outlives proof reads.
+ *
+ * @param f      the analyzed function
+ * @param cells  the cell universe so far
+ * @return       the cell universe including `f`'s parameters
+ */
+fn add_param_cells(f: TFunction, cells: []Cell) -> []Cell {
+    mut acc = cells
+    mut i = 0
+    loop {
+        if i >= f.params.len { break }
+        let p = f.params[i]
+        let is_ref = if p.has_type { type_ann_is_ref(p.type_ann) } else { false }
+        acc = add_cell(acc, p.name, "", is_ref)
+        i++
+    }
+    acc
+}
+
+/**
+ * Add every BINDING target and one-hop field cell reachable from a statement block to the universe.
+ * A `TBinding` to a `SimpleName` yields a bare cell; a one-hop `x.f` field read / write off a bare
+ * local yields an `x.f` cell (`a.b.c` is NOT a cell — it collapses to `⊤`, added nowhere).
+ *
+ * @param body   the typed statement block
+ * @param cells  the cell universe so far
+ * @return       the cell universe including this block's binding + one-hop cells
+ */
+fn add_block_cells(body: []TStatement, cells: []Cell) -> []Cell {
+    mut acc = cells
+    mut i = 0
+    loop {
+        if i >= body.len { break }
+        acc = add_stmt_cells(body[i], acc)
+        i++
+    }
+    acc
+}
+
+/**
+ * Add the binding-target + one-hop field cells named by one statement, recursing into nested blocks
+ * (loop / defer / adopt bodies + if / match arms reached via expressions). Bounded by `f`'s syntactic
+ * size (each node is visited once).
+ *
+ * @param s      the typed statement
+ * @param cells  the cell universe so far
+ * @return       the cell universe including this statement's cells
+ */
+fn add_stmt_cells(s: TStatement, cells: []Cell) -> []Cell {
+    match s {
+        TBinding as b => add_binding_cell(b, cells)
+        TAssign as a => add_expr_cells(a.value, cells)
+        TReturn as r => if r.has_value { add_expr_cells(r.value, cells) } else { cells }
+        TExprStmt as es => add_expr_cells(es.expr, cells)
+        TLoopStmt as l => add_block_cells(l.body, cells)
+        TBreakStmt => cells
+        TContinueStmt => cells
+        TDeferStmt as d => add_block_cells(d.body, cells)
+        TAdoptStmt as a => add_block_cells(a.body, cells)
+    }
+}
+
+/**
+ * Add the bare cell named by a binding's `SimpleName` target (a destructure names no single cell),
+ * then the one-hop cells of its value.
+ *
+ * @param b      the typed binding
+ * @param cells  the cell universe so far
+ * @return       the cell universe including this binding's target cell
+ */
+fn add_binding_cell(b: TBinding, cells: []Cell) -> []Cell {
+    match b.target {
+        parser::SimpleName as sn => add_expr_cells(b.value, add_cell(cells, sn.name, "", false))
+        parser::DestructurePattern => add_expr_cells(b.value, cells)
+    }
+}
+
+/**
+ * Add a one-hop field cell (`x.f` off a bare local) named by an expression, recursing into control
+ * flow so nested blocks contribute their cells. A deeper path (`a.b.c`) contributes no cell (it
+ * collapses to `⊤`); a non-field expression contributes only its sub-cells.
+ *
+ * @param e      the typed expression
+ * @param cells  the cell universe so far
+ * @return       the cell universe including this expression's one-hop cells
+ */
+fn add_expr_cells(e: TExpr, cells: []Cell) -> []Cell {
+    match e.kind {
+        TFieldAccess as fa => add_field_cell(fa, cells)
+        TIfExpr as f => add_block_cells(f.else_blk, add_block_cells(f.then_blk, cells))
+        TMatchExpr as m => add_match_cells(m, cells)
+        _ => cells
+    }
+}
+
+/**
+ * Add the `x.f` one-hop cell for a field access whose receiver is a BARE local (`expr_is_bare_var`
+ * shape in `escape.tks`); a non-bare receiver contributes no one-hop cell (the path is deeper).
+ *
+ * @param fa     the typed field access
+ * @param cells  the cell universe so far
+ * @return       the cell universe including the one-hop cell (or unchanged)
+ */
+fn add_field_cell(fa: TFieldAccess, cells: []Cell) -> []Cell {
+    match fa.receiver.kind {
+        TVar as v => add_cell(cells, v.name, fa.field, false)
+        _ => add_expr_cells(fa.receiver, cells)
+    }
+}
+
+/**
+ * Add the one-hop cells reachable through a match expression's arm bodies (each arm is a statement
+ * block, like an if-branch).
+ *
+ * @param m      the typed match expression
+ * @param cells  the cell universe so far
+ * @return       the cell universe including the arm bodies' cells
+ */
+fn add_match_cells(m: TMatchExpr, cells: []Cell) -> []Cell {
+    mut acc = cells
+    mut i = 0
+    loop {
+        if i >= m.arms.len { break }
+        acc = add_block_cells(m.arms[i].body, acc)
+        i++
+    }
+    acc
+}
+
+/**
+ * Seed the points-to axis: a `Reference` param cell starts `PtParam(i)` (the caller owns its slot);
+ * every other cell starts `PtFrame` (the climb-floor). Parallel to `cells` by index.
+ *
+ * @param cells  the cell universe
+ * @return       the seeded points-to axis
+ */
+fn seed_pt(cells: []Cell) -> []PointsTo {
+    mut acc: []PointsTo = teko::list::empty()
+    mut i = 0
+    loop {
+        if i >= cells.len { break }
+        if cells[i].is_ref_param {
+            acc = teko::list::push(acc, PtParam { id = PtParamId { index = i to u32 } })
+        } else {
+            acc = teko::list::push(acc, PtFrame { })
+        }
+        i++
+    }
+    acc
+}
+
+/**
+ * Seed the borrowed-from axis: a `Reference` param cell starts `BfParam(i)` (it borrows its own
+ * slot); every other cell starts `BfNone`. Parallel to `cells` by index.
+ *
+ * @param cells  the cell universe
+ * @return       the seeded borrowed-from axis
+ */
+fn seed_bf(cells: []Cell) -> []BorrowedFrom {
+    mut acc: []BorrowedFrom = teko::list::empty()
+    mut i = 0
+    loop {
+        if i >= cells.len { break }
+        if cells[i].is_ref_param {
+            acc = teko::list::push(acc, BfParam { id = BfParamId { index = i to u32 } })
+        } else {
+            acc = teko::list::push(acc, BfNone { })
+        }
+        i++
+    }
+    acc
+}
+
+/**
+ * Seed the unique-vs-shared axis: every cell starts `UsUnique` (the climb-floor — aliasing joins it
+ * up to `UsShared`). Parallel to `cells` by index.
+ *
+ * @param cells  the cell universe
+ * @return       the seeded unique-vs-shared axis
+ */
+fn seed_us(cells: []Cell) -> []Unique {
+    mut acc: []Unique = teko::list::empty()
+    mut i = 0
+    loop {
+        if i >= cells.len { break }
+        acc = teko::list::push(acc, UsUnique { })
+        i++
+    }
+    acc
+}
+
+/**
+ * The lattice rank of a points-to value (`PtFrame` = 0 < concrete sites = 1 < `PtTop` = 2). The join
+ * keeps the higher rank; equal ranks with differing payloads climb to `PtTop` (the safe leak).
+ *
+ * @param p  the points-to value
+ * @return   its lattice rank
+ */
+fn pt_rank(p: PointsTo) -> u32 {
+    match p {
+        PtFrame => 0
+        PtParam => 1
+        PtAdopter => 1
+        PtRoot => 1
+        PtTop => 2
+    }
+}
+
+/**
+ * Do two points-to values name the SAME concrete site? Two `PtParam` agree iff same slot; two
+ * `PtAdopter` agree iff same non-top region; `PtRoot` agrees with `PtRoot`. Used by the join to
+ * decide whether equal-rank concrete sites climb to `PtTop`.
+ *
+ * @param a  the first points-to value
+ * @param b  the second points-to value
+ * @return   true iff both name the identical concrete allocation site
+ */
+fn pt_same_site(a: PointsTo, b: PointsTo) -> bool {
+    match a {
+        PtParam as pa => match b { PtParam as pb => pa.id.index == pb.id.index; _ => false }
+        PtAdopter as aa => match b { PtAdopter as ab => adopter_same(aa.id, ab.id); _ => false }
+        PtRoot => match b { PtRoot => true; _ => false }
+        PtFrame => false
+        PtTop => false
+    }
+}
+
+/**
+ * Do two adopter ids name the same lexical region? A `⊤` fallback id never agrees (its region is
+ * un-nameable), so two `PtAdopter(⊤)` still climb to `PtTop` — conservative.
+ *
+ * @param a  the first adopter id
+ * @param b  the second adopter id
+ * @return   true iff both are concrete and share a region id
+ */
+fn adopter_same(a: PtAdopterId, b: PtAdopterId) -> bool {
+    if a.top { return false }
+    if b.top { return false }
+    a.region == b.region
+}
+
+/**
+ * The points-to join (least upper bound). `PtFrame` is bottom; a concrete site joined with the same
+ * site is itself; two DIFFERENT concrete sites (or any pair reaching rank 2) climb to `PtTop` (the
+ * safe leak — treated as Root). Monotone: the result rank is ≥ both inputs.
+ *
+ * @param a  the current points-to value
+ * @param b  the incoming points-to value
+ * @return   the least upper bound of `a` and `b`
+ */
+fn pt_join(a: PointsTo, b: PointsTo) -> PointsTo {
+    let ra = pt_rank(a)
+    let rb = pt_rank(b)
+    if ra == 2 { return PtTop { } }
+    if rb == 2 { return PtTop { } }
+    if ra == 0 { return b }
+    if rb == 0 { return a }
+    if pt_same_site(a, b) { return a }
+    PtTop { }
+}
+
+/**
+ * The points-to axis threaded alongside a fresh-region-id counter while walking `adopt { }` blocks —
+ * each lexically distinct adopter earns its own `PtAdopter(region_id)` (§5.1), so the walk must carry
+ * both the growing axis and the next unused id together.
+ *
+ * @field pt           the points-to axis so far
+ * @field next_region  the next unused adopter region id
+ */
+type PtTransferState = struct { pt: []PointsTo; next_region: u32 }
+
+/**
+ * Return the points-to axis with index `i` replaced by `v` (parallel arrays are rebuilt by copy —
+ * the compiler corpus has no in-place slice write for a value element; mirrors `set_us`).
+ *
+ * @param pt  the points-to axis
+ * @param i   the cell index to replace
+ * @param v   the new points-to value
+ * @return    the axis with element `i` set to `v`
+ */
+fn set_pt(pt: []PointsTo, i: u32, v: PointsTo) -> []PointsTo {
+    mut acc: []PointsTo = teko::list::empty()
+    mut k = 0
+    loop {
+        if k >= pt.len { break }
+        if k to u32 == i {
+            acc = teko::list::push(acc, v)
+        } else {
+            acc = teko::list::push(acc, pt[k])
+        }
+        k++
+    }
+    acc
+}
+
+/**
+ * Join `PtAdopter(region)` into the cell keyed `name` (field "" — a bare binding target), returning
+ * the updated axis. A missing cell leaves the axis unchanged (the key is not in this function's
+ * universe).
+ *
+ * @param cells   the cell universe
+ * @param pt      the points-to axis
+ * @param name    the bound name allocated inside the adopter
+ * @param region  the enclosing adopter's region id
+ * @return        the axis with the named cell joined to `PtAdopter(region)`
+ */
+fn join_pt_adopter_at(cells: []Cell, pt: []PointsTo, name: str, region: u32) -> []PointsTo {
+    let idx = cell_index(cells, name, "")
+    if idx < 0 { return pt }
+    set_pt(pt, idx to u32, pt_join(pt[idx to u32], PtAdopter { id = PtAdopterId { region = region; top = false } }))
+}
+
+/**
+ * The points-to transfer sweep over one statement block: every binding target INSIDE an `adopt { }`
+ * body (walked with `in_region` = that adopter's id) joins `PtAdopter(region)` into its cell (§5.1);
+ * a nested `adopt { }` allocates its OWN fresh region id (`state.next_region` bumped) so distinct
+ * adopters never merge into the same site. Recurses into loop / defer bodies too (their bindings
+ * inherit the SAME enclosing adopter, if any).
+ *
+ * @param body       the typed statement block
+ * @param cells      the cell universe
+ * @param in_region  the enclosing adopter's region id, valid iff `has_region`
+ * @param has_region true iff this block is (transitively) inside an `adopt { }`
+ * @param state      the points-to axis + next-region-id counter so far
+ * @return           the updated transfer state
+ */
+fn pt_transfer_block(body: []TStatement, cells: []Cell, in_region: u32, has_region: bool, state: PtTransferState) -> PtTransferState {
+    mut acc = state
+    mut i = 0
+    loop {
+        if i >= body.len { break }
+        acc = pt_transfer_stmt(body[i], cells, in_region, has_region, acc)
+        i++
+    }
+    acc
+}
+
+/**
+ * Descend the points-to transfer into an expression's control-flow arm bodies under the SAME
+ * enclosing region: a statement- or value-position `if` / `match` carries a STATEMENT BLOCK per
+ * branch, and the cell universe enumerates those blocks' cells — so a binding allocated inside an
+ * in-adopter branch must still join `PtAdopter(region)`, else it stays `PtFrame` and the §5.1
+ * ADOPT-escape guard admits a borrow of it escaping the brace (an unsound under-approximation).
+ * Mirrors `add_expr_cells`; a non-branching expression carries no block, so it is a no-op.
+ *
+ * @param e          the typed expression
+ * @param cells      the cell universe
+ * @param in_region  the enclosing adopter's region id, valid iff `has_region`
+ * @param has_region true iff this expression is (transitively) inside an `adopt { }`
+ * @param state      the points-to axis + next-region-id counter so far
+ * @return           the updated transfer state
+ */
+fn pt_transfer_expr(e: TExpr, cells: []Cell, in_region: u32, has_region: bool, state: PtTransferState) -> PtTransferState {
+    match e.kind {
+        TIfExpr as f => pt_transfer_block(f.else_blk, cells, in_region, has_region, pt_transfer_block(f.then_blk, cells, in_region, has_region, state))
+        TMatchExpr as m => pt_transfer_match(m, cells, in_region, has_region, state)
+        _ => state
+    }
+}
+
+/**
+ * The points-to transfer over a match expression's arm bodies (each a statement block, like an
+ * if-branch) under the SAME enclosing region. State-threaded (functional accumulate).
+ *
+ * @param m          the typed match expression
+ * @param cells      the cell universe
+ * @param in_region  the enclosing adopter's region id, valid iff `has_region`
+ * @param has_region true iff this expression is (transitively) inside an `adopt { }`
+ * @param state      the points-to axis + next-region-id counter so far
+ * @return           the updated transfer state
+ */
+fn pt_transfer_match(m: TMatchExpr, cells: []Cell, in_region: u32, has_region: bool, state: PtTransferState) -> PtTransferState {
+    mut acc = state
+    mut i = 0
+    loop {
+        if i >= m.arms.len { break }
+        acc = pt_transfer_block(m.arms[i].body, cells, in_region, has_region, acc)
+        i++
+    }
+    acc
+}
+
+/**
+ * The points-to transfer for one statement: a `TBinding` to a `SimpleName` INSIDE an adopter joins
+ * `PtAdopter(region)` into its cell; `TLoopStmt` / `TDeferStmt` bodies recurse under the SAME
+ * enclosing region; a `TAdoptStmt` opens a FRESH region for its own body (nested adopters never
+ * collapse into one site); a statement- or value-position `if` / `match` recurses into its arm
+ * bodies (`pt_transfer_expr`) under the same region so a branch-local allocation is not missed.
+ *
+ * @param s          the typed statement
+ * @param cells      the cell universe
+ * @param in_region  the enclosing adopter's region id, valid iff `has_region`
+ * @param has_region true iff this statement is (transitively) inside an `adopt { }`
+ * @param state      the points-to axis + next-region-id counter so far
+ * @return           the updated transfer state
+ */
+fn pt_transfer_stmt(s: TStatement, cells: []Cell, in_region: u32, has_region: bool, state: PtTransferState) -> PtTransferState {
+    match s {
+        TBinding as b => pt_transfer_expr(b.value, cells, in_region, has_region, pt_transfer_binding(b, cells, in_region, has_region, state))
+        TLoopStmt as l => pt_transfer_block(l.body, cells, in_region, has_region, state)
+        TDeferStmt as d => pt_transfer_block(d.body, cells, in_region, has_region, state)
+        TAdoptStmt as a => pt_transfer_adopt(a, cells, state)
+        TAssign as a => pt_transfer_expr(a.value, cells, in_region, has_region, state)
+        TReturn as r => if r.has_value { pt_transfer_expr(r.value, cells, in_region, has_region, state) } else { state }
+        TExprStmt as es => pt_transfer_expr(es.expr, cells, in_region, has_region, state)
+        TBreakStmt => state
+        TContinueStmt => state
+    }
+}
+
+/**
+ * Join `PtAdopter(region)` into a binding's target cell when this binding is (transitively) inside an
+ * `adopt { }` block; a binding outside any adopter (`has_region = false`) is left untouched (its `pt`
+ * stays whatever the seed / an outer join already established).
+ *
+ * @param b          the typed binding
+ * @param cells      the cell universe
+ * @param in_region  the enclosing adopter's region id, valid iff `has_region`
+ * @param has_region true iff this binding is (transitively) inside an `adopt { }`
+ * @param state      the points-to axis + next-region-id counter so far
+ * @return           the updated transfer state
+ */
+fn pt_transfer_binding(b: TBinding, cells: []Cell, in_region: u32, has_region: bool, state: PtTransferState) -> PtTransferState {
+    if !has_region { return state }
+    match b.target {
+        parser::SimpleName as sn => PtTransferState { pt = join_pt_adopter_at(cells, state.pt, sn.name, in_region); next_region = state.next_region }
+        parser::DestructurePattern => state
+    }
+}
+
+/**
+ * Open a FRESH region for an `adopt { }` block's own body (bumping `next_region`), then walk that
+ * body under the new region id — a nested adopter never shares its enclosing adopter's site (each
+ * lexical `adopt { }` is bulk-dropped independently).
+ *
+ * @param a      the typed adopt statement
+ * @param cells  the cell universe
+ * @param state  the points-to axis + next-region-id counter so far
+ * @return       the updated transfer state
+ */
+fn pt_transfer_adopt(a: TAdoptStmt, cells: []Cell, state: PtTransferState) -> PtTransferState {
+    let region = state.next_region
+    let opened = PtTransferState { pt = state.pt; next_region = state.next_region + 1 }
+    pt_transfer_block(a.body, cells, region, true, opened)
+}
+
+/**
+ * The lattice rank of a unique-vs-shared value (`UsUnique` = 0 < `UsShared` = 1 < `UsTop` = 2).
+ *
+ * @param u  the unique-vs-shared value
+ * @return   its lattice rank
+ */
+fn us_rank(u: Unique) -> u32 {
+    match u {
+        UsUnique => 0
+        UsShared => 1
+        UsTop => 2
+    }
+}
+
+/**
+ * The unique-vs-shared join (least upper bound). `UsUnique` is bottom; any aliasing read climbs a
+ * cell to `UsShared`; `⊤` is `UsTop` (treated as shared). Monotone — the result rank is ≥ both
+ * inputs.
+ *
+ * @param a  the current unique-vs-shared value
+ * @param b  the incoming unique-vs-shared value
+ * @return   the least upper bound of `a` and `b`
+ */
+fn us_join(a: Unique, b: Unique) -> Unique {
+    if us_rank(a) >= us_rank(b) { return a }
+    b
+}
+
+/**
+ * Is `e` a bare local read (a `TVar`) — the alias source shape? Mirrors `expr_is_bare_var` in
+ * `escape.tks`: only a DIRECT variable read (no field / index / call wrapping) is an alias source.
+ *
+ * @param e  the typed expression
+ * @return   true iff `e` is a bare `TVar` read
+ */
+fn expr_is_bare_local(e: TExpr) -> bool {
+    match e.kind {
+        TVar => true
+        _ => false
+    }
+}
+
+/**
+ * Does binding / assigning to a value at `e` create an ALIAS of a non-scalar local (`let y = x` where
+ * `x` is a bare non-scalar local)? An alias joins BOTH cells to `UsShared`. A scalar copy is not an
+ * alias (it carries no shared handle).
+ *
+ * @param e  the typed RHS expression
+ * @return   true iff `e` is a bare non-scalar local read (an alias source)
+ */
+fn rhs_is_alias_source(e: TExpr) -> bool {
+    if !expr_is_bare_local(e) { return false }
+    !type_is_scalar(e.type)
+}
+
+/**
+ * Join `UsShared` into the cells of both sides of an alias `dst = src` (both `dst` and the aliased
+ * `src` become shared), returning the updated axis. Return-value threaded (a functional accumulate,
+ * like the cell-building walk) so the join is deterministic on both engines.
+ *
+ * @param cells  the cell universe
+ * @param us     the unique-vs-shared axis so far
+ * @param dst    the destination binding name
+ * @param src    the aliased source name
+ * @return       the axis with both cells joined to `UsShared`
+ */
+fn mark_alias_shared(cells: []Cell, us: []Unique, dst: str, src: str) -> []Unique {
+    join_us_at(cells, join_us_at(cells, us, dst, ""), src, "")
+}
+
+/**
+ * Join `UsShared` into the cell keyed by `name` / `field`, returning the possibly-updated axis. A
+ * missing cell leaves the axis unchanged (the key is not in this function's universe).
+ *
+ * @param cells  the cell universe
+ * @param us     the unique-vs-shared axis
+ * @param name   the cell's binding name
+ * @param field  the cell's one-hop field ("" for a bare cell)
+ * @return       the axis with the named cell joined to `UsShared`
+ */
+fn join_us_at(cells: []Cell, us: []Unique, name: str, field: str) -> []Unique {
+    let idx = cell_index(cells, name, field)
+    if idx < 0 { return us }
+    set_us(us, idx to u32, us_join(us[idx to u32], UsShared { }))
+}
+
+/**
+ * Return the unique-vs-shared axis with index `i` replaced by `v` (parallel arrays are rebuilt by
+ * copy — the compiler corpus has no in-place slice write for a value element).
+ *
+ * @param us  the unique-vs-shared axis
+ * @param i   the cell index to replace
+ * @param v   the new unique-vs-shared value
+ * @return    the axis with element `i` set to `v`
+ */
+fn set_us(us: []Unique, i: u32, v: Unique) -> []Unique {
+    mut acc: []Unique = teko::list::empty()
+    mut k = 0
+    loop {
+        if k >= us.len { break }
+        if k to u32 == i {
+            acc = teko::list::push(acc, v)
+        } else {
+            acc = teko::list::push(acc, us[k])
+        }
+        k++
+    }
+    acc
+}
+
+/**
+ * The alias-transfer sweep over one statement block: every `let y = x` / `y = x` whose RHS is a
+ * non-scalar bare-local read joins BOTH cells to `UsShared` (the any-alias-anywhere ⇒ shared reading
+ * — the conservative over-reject direction). Monotone (only climbs `us` up); recurses into nested
+ * blocks so a loop / adopter body's aliases count too. Return-value threaded (a functional
+ * accumulate) so it is deterministic on both engines.
+ *
+ * @param body   the typed statement block
+ * @param cells  the cell universe
+ * @param us     the unique-vs-shared axis so far
+ * @return       the axis with this block's aliases joined to `UsShared`
+ */
+fn transfer_block(body: []TStatement, cells: []Cell, us: []Unique) -> []Unique {
+    mut acc = us
+    mut i = 0
+    loop {
+        if i >= body.len { break }
+        acc = transfer_stmt(body[i], cells, acc)
+        i++
+    }
+    acc
+}
+
+/**
+ * Descend the alias-transfer into an expression's control-flow arm bodies. A statement- or
+ * value-position `if` / `match` carries a STATEMENT BLOCK per branch, and the cell universe
+ * (`add_expr_cells`) enumerates those blocks' cells — so the transfer MUST visit them too, else an
+ * alias created inside a branch never joins `UsShared` (an unsound under-approximation). Mirrors
+ * `add_expr_cells` exactly; a non-branching expression contributes no block, so it is a no-op.
+ *
+ * @param e      the typed expression
+ * @param cells  the cell universe
+ * @param us     the unique-vs-shared axis so far
+ * @return       the axis with the expression's arm-body aliases joined
+ */
+fn transfer_expr(e: TExpr, cells: []Cell, us: []Unique) -> []Unique {
+    match e.kind {
+        TIfExpr as f => transfer_block(f.else_blk, cells, transfer_block(f.then_blk, cells, us))
+        TMatchExpr as m => transfer_match(m, cells, us)
+        _ => us
+    }
+}
+
+/**
+ * The alias-transfer over a match expression's arm bodies (each arm is a statement block, like an
+ * if-branch). Return-value threaded (functional accumulate); monotone (only climbs `us` up).
+ *
+ * @param m      the typed match expression
+ * @param cells  the cell universe
+ * @param us     the unique-vs-shared axis so far
+ * @return       the axis with every arm body's aliases joined
+ */
+fn transfer_match(m: TMatchExpr, cells: []Cell, us: []Unique) -> []Unique {
+    mut acc = us
+    mut i = 0
+    loop {
+        if i >= m.arms.len { break }
+        acc = transfer_block(m.arms[i].body, cells, acc)
+        i++
+    }
+    acc
+}
+
+/**
+ * The alias-transfer for one statement. A `TBinding` / `TAssign` to a `SimpleName` whose RHS aliases
+ * a bare non-scalar local joins both cells to `UsShared`; a loop / defer / adopt body recurses; and
+ * a statement- or value-position `if` / `match` (`TExprStmt`, or a binding / assign / return value)
+ * recurses into its arm bodies (`transfer_expr`) so a branch-local alias is not missed.
+ *
+ * @param s      the typed statement
+ * @param cells  the cell universe
+ * @param us     the unique-vs-shared axis so far
+ * @return       the axis with this statement's aliases joined to `UsShared`
+ */
+fn transfer_stmt(s: TStatement, cells: []Cell, us: []Unique) -> []Unique {
+    match s {
+        TBinding as b => transfer_expr(b.value, cells, transfer_binding(b, cells, us))
+        TAssign as a => transfer_expr(a.value, cells, transfer_assign(a, cells, us))
+        TLoopStmt as l => transfer_block(l.body, cells, us)
+        TDeferStmt as d => transfer_block(d.body, cells, us)
+        TAdoptStmt as a => transfer_block(a.body, cells, us)
+        TReturn as r => if r.has_value { transfer_expr(r.value, cells, us) } else { us }
+        TExprStmt as es => transfer_expr(es.expr, cells, us)
+        TBreakStmt => us
+        TContinueStmt => us
+    }
+}
+
+/**
+ * The alias-transfer for a binding: `let y = x` where `x` is a bare non-scalar local aliases `y` and
+ * `x` to `UsShared`.
+ *
+ * @param b      the typed binding
+ * @param cells  the cell universe
+ * @param us     the unique-vs-shared axis so far
+ * @return       the axis with this binding's alias (if any) joined to `UsShared`
+ */
+fn transfer_binding(b: TBinding, cells: []Cell, us: []Unique) -> []Unique {
+    if !rhs_is_alias_source(b.value) { return us }
+    match b.target {
+        parser::SimpleName as sn => mark_alias_shared(cells, us, sn.name, alias_src_name(b.value))
+        parser::DestructurePattern => us
+    }
+}
+
+/**
+ * The alias-transfer for an assignment: `y = x` (a simple-name write) where `x` is a bare non-scalar
+ * local aliases `y` and `x` to `UsShared`. A field / deref write names no single alias pair.
+ *
+ * @param a      the typed assignment
+ * @param cells  the cell universe
+ * @param us     the unique-vs-shared axis so far
+ * @return       the axis with this assignment's alias (if any) joined to `UsShared`
+ */
+fn transfer_assign(a: TAssign, cells: []Cell, us: []Unique) -> []Unique {
+    if !rhs_is_alias_source(a.value) { return us }
+    match a.kind {
+        parser::AssignKind::Simple => mark_alias_shared(cells, us, a.name, alias_src_name(a.value))
+        _ => us
+    }
+}
+
+/**
+ * The aliased source name of an alias-source RHS (`rhs_is_alias_source` held): the bare `TVar`'s
+ * name. The fallback ("") is unreachable on that path.
+ *
+ * @param e  the typed RHS expression
+ * @return   the aliased source variable name
+ */
+fn alias_src_name(e: TExpr) -> str {
+    match e.kind {
+        TVar as v => v.name
+        _ => ""
+    }
+}
+
+/**
+ * The spine fact for one function — a bounded, per-function points-to / uniqueness lattice layered
+ * BESIDE `fn_escaping_vars` (the name set stays byte-identical; this only ever CERTIFIES a subset of
+ * what the name set over-marked). Builds the finite cell universe of `f`, seeds each axis at its
+ * climb-floor, then runs the monotone alias-transfer (`us`) and the adopter-confinement transfer
+ * (`pt`, §5.1) to a fixpoint. Every transfer only moves a cell UP the fixed-height (≤ 3) lattice, so
+ * it terminates in ≤ |cells| × 3 join steps (§2c.2 termination). Reads `f.params` + `f.body`; touches
+ * NO `mark_*` code.
+ *
+ * @param f  the typed function to analyze
+ * @return   the per-cell points-to / borrowed-from / unique-vs-shared fact for `f`
+ * @see      docs/design/spine-layer-or-replace.md §2c.2
+ * @since    0.1.0.0-beta (#331 L1)
+ */
+pub fn fn_spine(f: TFunction) -> Spine {
+    let cells = add_block_cells(f.body, add_param_cells(f, teko::list::empty()))
+    let us = transfer_block(f.body, cells, seed_us(cells))
+    let pt_state = pt_transfer_block(f.body, cells, 0, false, PtTransferState { pt = seed_pt(cells); next_region = 0 })
+    Spine { cells = cells; pt = pt_state.pt; bf = seed_bf(cells); us = us }
+}
+
+/**
+ * The cell index of a bare binding / parameter (`field` = "") named `name`, or -1 when un-nameable.
+ * The L2 gates (PR-2 / PR-3) call this to key a consumed / borrowed binding into its spine cell.
+ *
+ * @param s     the function's spine
+ * @param name  the binding / parameter name
+ * @return      the 0-based cell index, or -1 when the name is not in this function's universe
+ */
+pub fn cell_of(s: Spine, name: str) -> i64 {
+    cell_index(s.cells, name, "")
+}
+
+/**
+ * Does the referent of a borrow OUTLIVE the borrow — i.e. may `borrow` (a `Reference` cell) be
+ * stored / bound at its site without dangling? True iff the referent (`bf(borrow)`) is a `BfParam`
+ * (a param outlives every local — the caller owns it) OR a `BfLocal` whose block encloses the borrow
+ * (checked by the gate that calls this), AND the referent is not itself `pt = PtAdopter` escaping its
+ * adopter (§5.1). `bf = BfTop` ⇒ referent unknown ⇒ FALSE (REJECT). Conservative: unknown ⇒
+ * does-not-outlive. EXPOSED for PR-2's ref-storability gate; consumed by no gate in PR-1.
+ *
+ * @param s        the function's spine
+ * @param borrow   the cell index of the `Reference` being stored / bound
+ * @param referent the cell index of the referent (or a sentinel when un-nameable)
+ * @return         true iff the borrow provably does not outlive its referent
+ */
+pub fn ref_target_outlives(s: Spine, borrow: u32, referent: u32) -> bool {
+    if borrow >= s.bf.len { return false }
+    match s.bf[borrow] {
+        BfParam => referent_not_escaping_adopter(s, referent)
+        BfLocal => referent_not_escaping_adopter(s, referent)
+        BfNone => false
+        BfTop => false
+    }
+}
+
+/**
+ * Is the referent cell NOT an `adopt { }`-confined allocation escaping its brace (§5.1)? A referent
+ * whose `pt` is `PtAdopter` is bulk-dropped at the adopter brace, so a borrow surviving it dangles —
+ * REJECT. A sentinel / out-of-range referent index is treated as escaping (conservative FALSE).
+ *
+ * @param s        the function's spine
+ * @param referent the cell index of the referent
+ * @return         true iff the referent is not an adopter-confined allocation
+ */
+fn referent_not_escaping_adopter(s: Spine, referent: u32) -> bool {
+    if referent >= s.pt.len { return false }
+    match s.pt[referent] {
+        PtAdopter => false
+        PtFrame => true
+        PtRoot => true
+        PtParam => true
+        PtTop => true
+    }
+}
+
+/**
+ * Is `binding` the SOLE live handle — `us(binding) = UsUnique`? The affine `mem::free` /
+ * channel-send-move gate (PR-3, and the L2c consume contract below) consults this: a `UsShared` /
+ * `UsTop` cell may NOT be consumed (the aliased-free UAF, remodel §5 / #336 gap 1). Conservative:
+ * `⊤` ⇒ shared ⇒ FALSE. Any-alias-anywhere ⇒ shared at the fixpoint (a later increment may add
+ * flow-sensitivity; out of scope here). EXPOSED for PR-3; consumed by no gate in PR-1.
+ *
+ * L2c CONSUME CONTRACT (semantics only — spine-build-plan §4): a future `chan.send(x)` consume site
+ * MUST call `is_unique_at(s, cell_of(s, x))` and REJECT a shared / `⊤` target, identically to the
+ * L2b `mem::free` affine guard — one analysis, four guarantees. No channel surface exists yet, so
+ * L2c ships this documented primitive with no gate site and no fixture.
+ *
+ * @param s        the function's spine
+ * @param binding  the cell index of the consumed binding
+ * @return         true iff `binding` is provably unique (safe to free / move)
+ */
+pub fn is_unique_at(s: Spine, binding: u32) -> bool {
+    if binding >= s.us.len { return false }
+    match s.us[binding] {
+        UsUnique => true
+        UsShared => false
+        UsTop => false
+    }
+}

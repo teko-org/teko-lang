@@ -1,0 +1,1179 @@
+use teko::parser
+
+/**
+ * A scalar `i64` type — a copy source (NOT an alias source; reading it carries no shared handle).
+ *
+ * The #331 L1 unit suite (`src/checker/spine_test.tkt`, namespace `teko::checker`) lives beside the
+ * module so it reaches the PRIVATE lattice helpers (`pt_join` / `us_join` / the seeds) as
+ * well as the PUBLIC query surface (`fn_spine` / `cell_of` / `ref_target_outlives` / `is_unique_at`).
+ * It proves the fact is CORRECT on hand-built inputs: the finite cell universe, every lattice arm,
+ * the three joins, the monotone alias-transfer, both gate queries (unique vs shared,
+ * ref-outlives-yes / ref-outlives-no), the adopter-escape reject, and termination (a re-run reaches
+ * the same fixpoint).
+ *
+ * @return the `i64` primitive type
+ */
+fn sp_i64() -> Type { Prim { kind = PrimKind::I64 } }
+
+/**
+ * A non-scalar `str` type — an ALIAS source (`let y = x` on it joins both cells to shared). `str` is
+ * a VIEW `{ptr,len}` that may alias (escape.tks's own `type_is_scalar` note: deliberately NOT
+ * scalar), so it is the natural payload-free non-scalar for a hand-built alias input.
+ *
+ * @return the `str` type
+ */
+fn sp_nonscalar() -> Type { Str { } }
+
+/**
+ * A typed variable read (`TVar`) of the given name and type — the bare-local alias-source shape.
+ *
+ * @param name  the variable name
+ * @param t     the variable's resolved type
+ * @return      a `TVar` typed expression
+ */
+fn sp_var(name: str, t: Type) -> TExpr {
+    TExpr { kind = TVar { name = name; is_func = false; func_ns = "" }; type = t; line = 0; col = 0 }
+}
+
+/**
+ * A field-read expression `recv.field` off a bare local `recv`, typed `t` — the one-hop cell shape.
+ *
+ * @param recv   the bare-local receiver name
+ * @param field  the field name
+ * @param t      the field's resolved type
+ * @return       a `TFieldAccess` typed expression
+ */
+fn sp_field(recv: str, field: str, t: Type) -> TExpr {
+    TExpr { kind = TFieldAccess { receiver = sp_var(recv, sp_nonscalar()); field = field }; type = t; line = 0; col = 0 }
+}
+
+/**
+ * A `let name = value` binding to a simple name.
+ *
+ * @param name   the bound name
+ * @param value  the binding's typed RHS
+ * @return       a `TBinding` statement
+ */
+fn sp_let(name: str, value: TExpr) -> TStatement {
+    TBinding { kind = parser::BindKind::Let; target = parser::SimpleName { name = name }; bound = value.type; value = value }
+}
+
+/**
+ * A discarded expression statement (contributes its sub-cells but no binding target).
+ *
+ * @param e  the typed expression
+ * @return   a `TExprStmt` statement
+ */
+fn sp_exprstmt(e: TExpr) -> TStatement { TExprStmt { expr = e } }
+
+/**
+ * A plain (non-Reference) typed parameter with an `i64` annotation.
+ *
+ * @param name  the parameter name
+ * @return      a parser `Param` typed `i64`
+ */
+fn sp_param(name: str) -> parser::Param {
+    parser::Param { name = name; has_type = true; type_ann = parser::NamedType { path = sp_path("i64"); args = teko::list::empty() }; is_params = false; has_default = false; default_expr = sp_no_expr() }
+}
+
+/**
+ * A `Reference` parameter written `Ref<i64>` — the outlives-proof referent anchor.
+ *
+ * @param name  the parameter name
+ * @return      a parser `Param` typed `Ref<i64>`
+ */
+fn sp_ref_param(name: str) -> parser::Param {
+    parser::Param { name = name; has_type = true; type_ann = parser::NamedType { path = sp_path("Ref"); args = sp_one_arg("i64") }; is_params = false; has_default = false; default_expr = sp_no_expr() }
+}
+
+/**
+ * A single-segment path of the given name.
+ *
+ * @param name  the segment name
+ * @return      a parser `Path` with one segment
+ */
+fn sp_path(name: str) -> parser::Path {
+    parser::Path { segments = teko::list::push(teko::list::empty(), parser::Segment { name = name }) }
+}
+
+/**
+ * A one-element type-argument list holding a named type (for `Ref<T>`'s single arg).
+ *
+ * @param name  the argument type's name
+ * @return      a `[]TypeExpr` of length one
+ */
+fn sp_one_arg(name: str) -> []parser::TypeExpr {
+    teko::list::push(teko::list::empty(), parser::NamedType { path = sp_path(name); args = teko::list::empty() })
+}
+
+/**
+ * A placeholder syntactic expression for a param's unused default slot (never read here).
+ *
+ * @return a parser `Number` 0 expression
+ */
+fn sp_no_expr() -> parser::Expr {
+    parser::Expr { kind = parser::Number { is_float = false; value = 0; fval = 0.0 }; line = 0; col = 0 }
+}
+
+/**
+ * A minimal `TFunction` with the given params and body (the fields `fn_spine` never reads carry inert
+ * defaults).
+ *
+ * @param params  the function's parameters
+ * @param body    the function's typed statement block
+ * @return        a `TFunction` ready for `fn_spine`
+ */
+fn sp_fn(params: []parser::Param, body: []TStatement) -> TFunction {
+    TFunction { name = "f"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = params; return_type = Void { }; body = body; vis = parser::Visibility::Private; has_doc = false; doc = ""; namespace = "t"; file = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = "" }
+}
+
+/**
+ * The `fn_spine` cell universe correctly enumerates a bare param, a `Reference` param (marked
+ * `is_ref_param`), a `let` binding, and a one-hop `x.f` field cell — and nothing deeper.
+ */
+#test fn spine_cell_universe_enumerates_bindings_ref_params_and_one_hop_fields() {
+    let params = teko::list::push(teko::list::push(teko::list::empty(), sp_param("p")), sp_ref_param("r"))
+    let body = teko::list::push(teko::list::push(teko::list::empty(), sp_let("y", sp_nonscalar_var("x"))), sp_exprstmt(sp_field("x", "f", sp_i64())))
+    let s = fn_spine(sp_fn(params, body))
+    teko::assert::is_true(cell_of(s, "p") >= 0)
+    teko::assert::is_true(cell_of(s, "r") >= 0)
+    teko::assert::is_true(cell_of(s, "y") >= 0)
+    teko::assert::is_true(cell_of(s, "x") < 0)
+    teko::assert::is_true(sp_has_field_cell(s, "x", "f"))
+}
+
+/**
+ * A bare non-scalar (`str`) local read of the given name — an alias-source RHS.
+ *
+ * @param name  the variable name
+ * @return      a non-scalar-typed `TVar`
+ */
+fn sp_nonscalar_var(name: str) -> TExpr { sp_var(name, sp_nonscalar()) }
+
+/**
+ * Does the spine hold a one-hop cell keyed `name`.`field`?
+ *
+ * @param s      the spine
+ * @param name   the receiver name
+ * @param field  the field name
+ * @return       true iff the cell universe contains that one-hop cell
+ */
+fn sp_has_field_cell(s: Spine, name: str, field: str) -> bool {
+    mut i = 0
+    loop {
+        if i >= s.cells.len { break }
+        if s.cells[i].name == name {
+            if s.cells[i].field == field { return true }
+        }
+        i++
+    }
+    false
+}
+
+/**
+ * A `Reference` param seeds `pt = PtParam` and `bf = BfParam` on its slot, while a bare binding seeds
+ * `PtFrame` / `BfNone` — the initial climb-floor.
+ */
+#test fn spine_seeds_ref_param_to_param_axes_and_bindings_to_floor() {
+    let params = teko::list::push(teko::list::empty(), sp_ref_param("r"))
+    let body = teko::list::push(teko::list::empty(), sp_let("y", sp_var("k", sp_i64())))
+    let s = fn_spine(sp_fn(params, body))
+    let ri = cell_of(s, "r")
+    let yi = cell_of(s, "y")
+    teko::assert::is_true(ri >= 0)
+    teko::assert::is_true(yi >= 0)
+    teko::assert::is_true(sp_pt_is_param(s.pt[ri to u32]))
+    teko::assert::is_true(sp_bf_is_param(s.bf[ri to u32]))
+    teko::assert::is_true(sp_pt_is_frame(s.pt[yi to u32]))
+    teko::assert::is_true(sp_bf_is_none(s.bf[yi to u32]))
+}
+
+/**
+ * Is a points-to value `PtParam`?
+ *
+ * @param p  the points-to value
+ * @return   true iff `PtParam`
+ */
+fn sp_pt_is_param(p: PointsTo) -> bool { match p { PtParam => true; _ => false } }
+
+/**
+ * Is a points-to value `PtFrame`?
+ *
+ * @param p  the points-to value
+ * @return   true iff `PtFrame`
+ */
+fn sp_pt_is_frame(p: PointsTo) -> bool { match p { PtFrame => true; _ => false } }
+
+/**
+ * Is a borrowed-from value `BfParam`?
+ *
+ * @param b  the borrowed-from value
+ * @return   true iff `BfParam`
+ */
+fn sp_bf_is_param(b: BorrowedFrom) -> bool { match b { BfParam => true; _ => false } }
+
+/**
+ * Is a borrowed-from value `BfNone`?
+ *
+ * @param b  the borrowed-from value
+ * @return   true iff `BfNone`
+ */
+fn sp_bf_is_none(b: BorrowedFrom) -> bool { match b { BfNone => true; _ => false } }
+
+/**
+ * A `let y = x` aliasing a non-scalar local joins BOTH `x` and `y` to shared ⇒ `is_unique_at` is
+ * FALSE for both (the aliased-free UAF direction); a never-aliased binding stays unique ⇒ TRUE.
+ */
+#test fn spine_alias_marks_both_cells_shared_and_is_unique_at_reflects_it() {
+    let body = teko::list::push(teko::list::push(teko::list::empty(), sp_let("x", sp_nonscalar_var("src"))), sp_let("y", sp_nonscalar_var("x")))
+    let s = fn_spine(sp_fn(teko::list::empty(), body))
+    let xi = cell_of(s, "x")
+    let yi = cell_of(s, "y")
+    teko::assert::is_false(is_unique_at(s, xi to u32))
+    teko::assert::is_false(is_unique_at(s, yi to u32))
+}
+
+/**
+ * A binding whose RHS is a fresh (non-alias) value stays `UsUnique` ⇒ `is_unique_at` is TRUE — the
+ * sound-free floor (`examples/regressions/mem_free` must keep passing under PR-3).
+ */
+#test fn spine_unaliased_binding_is_unique() {
+    let body = teko::list::push(teko::list::empty(), sp_let("xs", sp_field("obj", "data", sp_nonscalar())))
+    let s = fn_spine(sp_fn(teko::list::empty(), body))
+    let xi = cell_of(s, "xs")
+    teko::assert::is_true(xi >= 0)
+    teko::assert::is_true(is_unique_at(s, xi to u32))
+}
+
+/**
+ * A scalar copy (`let n = m` where `m` is `i64`) is NOT an alias — `is_unique_at` stays TRUE for
+ * both (only a non-scalar bare-local read shares a handle).
+ */
+#test fn spine_scalar_copy_is_not_an_alias() {
+    let body = teko::list::push(teko::list::push(teko::list::empty(), sp_let("m", sp_var("k", sp_i64()))), sp_let("n", sp_var("m", sp_i64())))
+    let s = fn_spine(sp_fn(teko::list::empty(), body))
+    teko::assert::is_true(is_unique_at(s, cell_of(s, "m") to u32))
+    teko::assert::is_true(is_unique_at(s, cell_of(s, "n") to u32))
+}
+
+/**
+ * An alias (`let y = x`) inside an `if` arm body — reached only through a statement-position
+ * `TExprStmt(TIfExpr)` — still joins BOTH cells to shared: `transfer_stmt` descends into the branch
+ * bodies via `transfer_expr`. A top-level-only walk would leave `x` unique and let PR-3's affine
+ * free ADMIT `free(x)` while `y` still aliases it (the aliased-free UAF this fact exists to reject).
+ */
+#test fn spine_us_alias_inside_if_arm_joins_shared() {
+    let then_blk = teko::list::push(teko::list::empty(), sp_let("y", sp_nonscalar_var("x")))
+    let iff = TExpr { kind = TIfExpr { cond = sp_var("c", sp_bool_t()); then_blk = then_blk; has_else = false; else_blk = teko::list::empty() }; type = sp_nonscalar(); line = 0; col = 0 }
+    let body = teko::list::push(teko::list::push(teko::list::empty(),
+            sp_let("x", sp_field("obj", "data", sp_nonscalar()))),
+        sp_exprstmt(iff))
+    let s = fn_spine(sp_fn(teko::list::empty(), body))
+    teko::assert::is_false(is_unique_at(s, cell_of(s, "x") to u32))
+    teko::assert::is_false(is_unique_at(s, cell_of(s, "y") to u32))
+}
+
+/**
+ * The same alias inside a `match` arm body (reached through `TExprStmt(TMatchExpr)`) likewise joins
+ * both cells to shared — `transfer_match` descends into every arm body.
+ */
+#test fn spine_us_alias_inside_match_arm_joins_shared() {
+    let arm = TArm { pattern = parser::WildcardPattern { }; has_when = false; guard = sp_no_texpr(); body = teko::list::push(teko::list::empty(), sp_let("y", sp_nonscalar_var("x"))) }
+    let mtch = TExpr { kind = TMatchExpr { subject = sp_var("subj", sp_i64()); arms = teko::list::push(teko::list::empty(), arm) }; type = sp_nonscalar(); line = 0; col = 0 }
+    let body = teko::list::push(teko::list::push(teko::list::empty(),
+            sp_let("x", sp_field("obj", "data", sp_nonscalar()))),
+        sp_exprstmt(mtch))
+    let s = fn_spine(sp_fn(teko::list::empty(), body))
+    teko::assert::is_false(is_unique_at(s, cell_of(s, "x") to u32))
+    teko::assert::is_false(is_unique_at(s, cell_of(s, "y") to u32))
+}
+
+/**
+ * A binding allocated inside an `if` arm that is itself inside an `adopt { }` still joins
+ * `PtAdopter` — `pt_transfer_stmt` descends into the branch under the enclosing region, so the §5.1
+ * ADOPT-escape guard is not defeated by a branch (a top-level-only walk would leave it `PtFrame`).
+ */
+#test fn spine_pt_alloc_inside_in_adopter_if_arm_is_pt_adopter() {
+    let then_blk = teko::list::push(teko::list::empty(), sp_let("v", sp_i64_lit(1)))
+    let iff = TExpr { kind = TIfExpr { cond = sp_var("c", sp_bool_t()); then_blk = then_blk; has_else = false; else_blk = teko::list::empty() }; type = sp_i64(); line = 0; col = 0 }
+    let body = teko::list::push(teko::list::empty(), sp_adopt(teko::list::push(teko::list::empty(), sp_exprstmt(iff))))
+    let s = fn_spine(sp_fn(teko::list::empty(), body))
+    teko::assert::is_true(sp_pt_is_adopter(s.pt[cell_of(s, "v") to u32]))
+}
+
+/**
+ * Same for a `match` arm inside an `adopt { }` — `pt_transfer_match` descends into the arm body
+ * under the enclosing region.
+ */
+#test fn spine_pt_alloc_inside_in_adopter_match_arm_is_pt_adopter() {
+    let arm = TArm { pattern = parser::WildcardPattern { }; has_when = false; guard = sp_no_texpr(); body = teko::list::push(teko::list::empty(), sp_let("v", sp_i64_lit(1))) }
+    let mtch = TExpr { kind = TMatchExpr { subject = sp_var("subj", sp_i64()); arms = teko::list::push(teko::list::empty(), arm) }; type = sp_i64(); line = 0; col = 0 }
+    let body = teko::list::push(teko::list::empty(), sp_adopt(teko::list::push(teko::list::empty(), sp_exprstmt(mtch))))
+    let s = fn_spine(sp_fn(teko::list::empty(), body))
+    teko::assert::is_true(sp_pt_is_adopter(s.pt[cell_of(s, "v") to u32]))
+}
+
+/**
+ * `ref_target_outlives` ADMITS a borrow whose `bf` names a `BfParam` referent that is not adopter-
+ * confined (a param outlives every frame local), and REJECTS an out-of-range borrow index (a `bf`
+ * that never resolves ⇒ conservative FALSE).
+ */
+#test fn spine_ref_target_outlives_admits_param_referent_rejects_unknown() {
+    let params = teko::list::push(teko::list::empty(), sp_ref_param("r"))
+    let s = fn_spine(sp_fn(params, teko::list::empty()))
+    let ri = cell_of(s, "r") to u32
+    teko::assert::is_true(ref_target_outlives(s, ri, ri))
+    teko::assert::is_false(ref_target_outlives(s, 999, ri))
+}
+
+/**
+ * `ref_target_outlives` REJECTS a `BfNone` borrow (a non-Reference cell borrows nothing — no referent
+ * anchor, the conservative REJECT).
+ */
+#test fn spine_ref_target_outlives_rejects_non_reference_cell() {
+    let body = teko::list::push(teko::list::empty(), sp_let("y", sp_var("k", sp_i64())))
+    let s = fn_spine(sp_fn(teko::list::empty(), body))
+    let yi = cell_of(s, "y") to u32
+    teko::assert::is_false(ref_target_outlives(s, yi, yi))
+}
+
+/**
+ * `ref_target_outlives` REJECTS a `BfTop` borrow (the referent is unknown / joined-over) — the
+ * conservative unknown-referent arm, hand-installed since `fn_spine`'s L1 seeding never itself
+ * produces `BfTop`.
+ */
+#test fn spine_ref_target_outlives_rejects_bftop() {
+    let body = teko::list::push(teko::list::empty(), sp_let("y", sp_var("k", sp_i64())))
+    let base = fn_spine(sp_fn(teko::list::empty(), body))
+    let yi = cell_of(base, "y") to u32
+    let top_bf = sp_set_bf(base.bf, yi, sp_bf_top())
+    let s = Spine { cells = base.cells; pt = base.pt; bf = top_bf; us = base.us }
+    teko::assert::is_false(ref_target_outlives(s, yi, yi))
+}
+
+/**
+ * The points-to join is a monotone least-upper-bound: `PtFrame` is bottom, the same concrete site
+ * joins to itself, two DIFFERENT concrete sites climb to `PtTop`, and any `PtTop` input is absorbing.
+ */
+#test fn spine_pt_join_is_monotone_lub() {
+    let frame = sp_pt_frame()
+    let p0 = sp_pt_param(0)
+    let p1 = sp_pt_param(1)
+    let top = sp_pt_top()
+    teko::assert::is_true(sp_pt_is_param(pt_join(frame, p0)))
+    teko::assert::is_true(sp_pt_is_param(pt_join(p0, p0)))
+    teko::assert::is_true(sp_pt_is_top(pt_join(p0, p1)))
+    teko::assert::is_true(sp_pt_is_top(pt_join(top, frame)))
+    teko::assert::is_true(sp_pt_is_frame(pt_join(frame, frame)))
+}
+
+/**
+ * The unique-vs-shared join climbs monotonically: `UsUnique < UsShared < UsTop`, and any `UsTop`
+ * input is absorbing.
+ */
+#test fn spine_us_join_climbs_monotonically() {
+    teko::assert::is_true(sp_us_is_shared(us_join(sp_us_unique(), sp_us_shared())))
+    teko::assert::is_true(sp_us_is_unique(us_join(sp_us_unique(), sp_us_unique())))
+    teko::assert::is_true(sp_us_is_top(us_join(sp_us_shared(), sp_us_top())))
+}
+
+/**
+ * A borrow whose referent is `pt = PtAdopter` (an `adopt { }`-confined allocation) is REJECTED by
+ * `ref_target_outlives` even for a `BfParam` borrow (§5.1 — the ADOPT escape-UAF), while a `PtFrame`
+ * / `PtRoot` / `PtParam` / `PtTop` referent is NOT rejected on that axis.
+ */
+#test fn spine_ref_target_outlives_rejects_adopter_confined_referent() {
+    let params = teko::list::push(teko::list::empty(), sp_ref_param("r"))
+    let base = fn_spine(sp_fn(params, teko::list::empty()))
+    let ri = cell_of(base, "r") to u32
+    let adopter_pt = sp_set_pt(base.pt, ri, sp_pt_adopter(0))
+    let escaping = Spine { cells = base.cells; pt = adopter_pt; bf = base.bf; us = base.us }
+    teko::assert::is_false(ref_target_outlives(escaping, ri, ri))
+    let root_pt = sp_set_pt(base.pt, ri, sp_pt_root())
+    let sound = Spine { cells = base.cells; pt = root_pt; bf = base.bf; us = base.us }
+    teko::assert::is_true(ref_target_outlives(sound, ri, ri))
+}
+
+/**
+ * The worklist reaches a FIXPOINT: re-running `fn_spine` on the same function yields the same `us`
+ * verdicts (the transfer is idempotent at the fixpoint — the termination guarantee, ≤ |cells| × 3).
+ */
+#test fn spine_fixpoint_is_stable_on_rerun() {
+    let body = teko::list::push(teko::list::push(teko::list::empty(), sp_let("x", sp_nonscalar_var("src"))), sp_let("y", sp_nonscalar_var("x")))
+    let f = sp_fn(teko::list::empty(), body)
+    let s1 = fn_spine(f)
+    let s2 = fn_spine(f)
+    teko::assert::is_true(is_unique_at(s1, cell_of(s1, "x") to u32) == is_unique_at(s2, cell_of(s2, "x") to u32))
+    teko::assert::is_true(is_unique_at(s1, cell_of(s1, "y") to u32) == is_unique_at(s2, cell_of(s2, "y") to u32))
+    teko::assert::is_false(is_unique_at(s2, cell_of(s2, "x") to u32))
+}
+
+/**
+ * A `PtFrame` points-to value.
+ *
+ * @return the frame allocation site
+ */
+fn sp_pt_frame() -> PointsTo { PtFrame { } }
+
+/**
+ * A `PtRoot` points-to value.
+ *
+ * @return the root allocation site
+ */
+fn sp_pt_root() -> PointsTo { PtRoot { } }
+
+/**
+ * A `PtParam` points-to value for slot `i`.
+ *
+ * @param i  the parameter slot
+ * @return   the param allocation site
+ */
+fn sp_pt_param(i: u32) -> PointsTo { PtParam { id = PtParamId { index = i } } }
+
+/**
+ * A `PtAdopter` points-to value for region `id` (concrete, not the `⊤` fallback).
+ *
+ * @param id  the adopter region id
+ * @return    the adopter allocation site
+ */
+fn sp_pt_adopter(id: u32) -> PointsTo { PtAdopter { id = PtAdopterId { region = id; top = false } } }
+
+/**
+ * A `PtTop` points-to value.
+ *
+ * @return the joined-over allocation site
+ */
+fn sp_pt_top() -> PointsTo { PtTop { } }
+
+/**
+ * Is a points-to value `PtTop`?
+ *
+ * @param p  the points-to value
+ * @return   true iff `PtTop`
+ */
+fn sp_pt_is_top(p: PointsTo) -> bool { match p { PtTop => true; _ => false } }
+
+/**
+ * A `BfTop` borrowed-from value.
+ *
+ * @return the joined-over borrowed-from value
+ */
+fn sp_bf_top() -> BorrowedFrom { BfTop { } }
+
+/**
+ * A `UsUnique` unique-vs-shared value.
+ *
+ * @return the unique value
+ */
+fn sp_us_unique() -> Unique { UsUnique { } }
+
+/**
+ * A `UsShared` unique-vs-shared value.
+ *
+ * @return the shared value
+ */
+fn sp_us_shared() -> Unique { UsShared { } }
+
+/**
+ * A `UsTop` unique-vs-shared value.
+ *
+ * @return the joined-over unique-vs-shared value
+ */
+fn sp_us_top() -> Unique { UsTop { } }
+
+/**
+ * Is a unique-vs-shared value `UsUnique`?
+ *
+ * @param u  the value
+ * @return   true iff `UsUnique`
+ */
+fn sp_us_is_unique(u: Unique) -> bool { match u { UsUnique => true; _ => false } }
+
+/**
+ * Is a unique-vs-shared value `UsShared`?
+ *
+ * @param u  the value
+ * @return   true iff `UsShared`
+ */
+fn sp_us_is_shared(u: Unique) -> bool { match u { UsShared => true; _ => false } }
+
+/**
+ * Is a unique-vs-shared value `UsTop`?
+ *
+ * @param u  the value
+ * @return   true iff `UsTop`
+ */
+fn sp_us_is_top(u: Unique) -> bool { match u { UsTop => true; _ => false } }
+
+/**
+ * Return the points-to axis with index `i` replaced by `v` (a test-local rebuild-by-copy, mirroring
+ * the module's `set_us`).
+ *
+ * @param pt  the points-to axis
+ * @param i   the cell index to replace
+ * @param v   the new points-to value
+ * @return    the axis with element `i` set to `v`
+ */
+fn sp_set_pt(pt: []PointsTo, i: u32, v: PointsTo) -> []PointsTo {
+    mut acc: []PointsTo = teko::list::empty()
+    mut k = 0
+    loop {
+        if k >= pt.len { break }
+        if k to u32 == i {
+            acc = teko::list::push(acc, v)
+        } else {
+            acc = teko::list::push(acc, pt[k])
+        }
+        k++
+    }
+    acc
+}
+
+/**
+ * A non-scalar (`str`) type is NOT `type_is_scalar`, so a bare non-scalar local read IS an
+ * `rhs_is_alias_source` — the alias-source classification the unique-vs-shared transfer keys on.
+ */
+#test fn spine_nonscalar_local_read_is_an_alias_source() {
+    teko::assert::is_false(type_is_scalar(sp_nonscalar()))
+    teko::assert::is_true(rhs_is_alias_source(sp_nonscalar_var("z")))
+    teko::assert::is_false(rhs_is_alias_source(sp_var("k", sp_i64())))
+}
+
+/**
+ * A `[]T` slice annotation (the parameter surface for a non-Reference collection param) is NOT a
+ * `Ref<T>` — `type_ann_is_ref` returns false.
+ *
+ * @param name  the element type's name
+ * @return      a `[]name` slice type annotation
+ */
+fn sp_slice_ann(name: str) -> parser::TypeExpr {
+    parser::SliceType { element = parser::NamedType { path = sp_path(name); args = teko::list::empty() } }
+}
+
+/**
+ * A `T | U` union annotation is NOT a `Ref<T>` — `type_ann_is_ref` returns false.
+ *
+ * @return a two-member union type annotation
+ */
+fn sp_union_ann() -> parser::TypeExpr {
+    parser::UnionType { members = teko::list::push(teko::list::push(teko::list::empty(), sp_named_ann("i64")), sp_named_ann("str")) }
+}
+
+/**
+ * A `T?` optional annotation is NOT a `Ref<T>` — `type_ann_is_ref` returns false.
+ *
+ * @return an optional type annotation
+ */
+fn sp_optional_ann() -> parser::TypeExpr {
+    parser::OptionalType { inner = sp_named_ann("i64") }
+}
+
+/**
+ * A `(A) -> R` function-type annotation is NOT a `Ref<T>` — `type_ann_is_ref` returns false.
+ *
+ * @return a function-type annotation
+ */
+fn sp_function_ann() -> parser::TypeExpr {
+    parser::FunctionType { params = teko::list::push(teko::list::empty(), sp_named_ann("i64")); ret = sp_named_ann("i64") }
+}
+
+/**
+ * A bare named-type annotation (e.g. `i64`).
+ *
+ * @param name  the type's name
+ * @return      a `NamedType` annotation
+ */
+fn sp_named_ann(name: str) -> parser::TypeExpr {
+    parser::NamedType { path = sp_path(name); args = teko::list::empty() }
+}
+
+/**
+ * A `NamedType` whose head is `Ref` but carries ZERO or TWO type arguments (not the legal
+ * single-arg `Ref<T>` shape) is NOT recognized as a reference by `named_head_is_ref` — the arity
+ * guard.
+ *
+ * @return a `Ref` named-type annotation with no type arguments
+ */
+fn sp_ref_head_no_args() -> parser::TypeExpr {
+    parser::NamedType { path = sp_path("Ref"); args = teko::list::empty() }
+}
+
+/**
+ * `type_ann_is_ref` recognizes `Ref<T>` (a single-arg `NamedType` headed `Ref`) and rejects every
+ * other syntactic type-annotation shape: a plain name, a slice, a union, an optional, a function
+ * type, and a `Ref`-headed name with the wrong arity.
+ */
+#test fn spine_type_ann_is_ref_recognizes_only_ref_and_rejects_every_other_shape() {
+    teko::assert::is_true(type_ann_is_ref(parser::NamedType { path = sp_path("Ref"); args = sp_one_arg("i64") }))
+    teko::assert::is_false(type_ann_is_ref(sp_named_ann("i64")))
+    teko::assert::is_false(type_ann_is_ref(sp_slice_ann("i64")))
+    teko::assert::is_false(type_ann_is_ref(sp_union_ann()))
+    teko::assert::is_false(type_ann_is_ref(sp_optional_ann()))
+    teko::assert::is_false(type_ann_is_ref(sp_function_ann()))
+    teko::assert::is_false(type_ann_is_ref(sp_ref_head_no_args()))
+}
+
+/**
+ * An assignment `y = x` to a simple name (`AssignKind::Simple`).
+ *
+ * @param name   the assigned name
+ * @param value  the typed RHS
+ * @return       a `TAssign` statement
+ */
+fn sp_assign_simple(name: str, value: TExpr) -> TStatement {
+    TAssign { kind = parser::AssignKind::Simple; name = name; op = lexer::TokenKind::Assign; bound = value.type; value = value; deref = false; target = sp_no_texpr() }
+}
+
+/**
+ * A `Reference`-deref assignment `r.value = x` (`AssignKind::RefDeref`) — names no simple-alias
+ * pair, so the alias-transfer must leave both cells untouched.
+ *
+ * @param name   the dereferenced ref's name
+ * @param value  the typed RHS
+ * @return       a `TAssign` statement of kind `RefDeref`
+ */
+fn sp_assign_refderef(name: str, value: TExpr) -> TStatement {
+    TAssign { kind = parser::AssignKind::RefDeref; name = name; op = lexer::TokenKind::Assign; bound = value.type; value = value; deref = true; target = sp_no_texpr() }
+}
+
+/**
+ * The inert placeholder typed expression a `TAssign.target` carries when `kind != Field` (never
+ * read on that path — mirrors `tast.tks`'s own `no_texpr` sentinel convention).
+ *
+ * @return a `TNullLit` sentinel `TExpr`
+ */
+fn sp_no_texpr() -> TExpr {
+    TExpr { kind = TNullLit { }; type = Void { }; line = 0; col = 0 }
+}
+
+/**
+ * A bare `return value` statement.
+ *
+ * @param value  the typed return value
+ * @return       a `TReturn` statement with `has_value = true`
+ */
+fn sp_return(value: TExpr) -> TStatement {
+    TReturn { has_value = true; value = value }
+}
+
+/**
+ * A value-less `return` statement.
+ *
+ * @return a `TReturn` statement with `has_value = false`
+ */
+fn sp_return_void() -> TStatement {
+    TReturn { has_value = false; value = sp_no_texpr() }
+}
+
+/**
+ * An unlabeled `loop { body }` statement.
+ *
+ * @param body  the typed loop body
+ * @return      a `TLoopStmt` statement
+ */
+fn sp_loop(body: []TStatement) -> TStatement {
+    TLoopStmt { label = ""; body = body }
+}
+
+/**
+ * An unlabeled `defer { body }` statement.
+ *
+ * @param body  the typed defer body
+ * @return      a `TDeferStmt` statement
+ */
+fn sp_defer(body: []TStatement) -> TStatement {
+    TDeferStmt { body = body }
+}
+
+/**
+ * An anonymous `adopt { body }` statement.
+ *
+ * @param body  the typed adopter body
+ * @return      a `TAdoptStmt` statement
+ */
+fn sp_adopt(body: []TStatement) -> TStatement {
+    TAdoptStmt { name = ""; body = body }
+}
+
+/**
+ * An unlabeled `break` statement.
+ *
+ * @return a `TBreakStmt` statement
+ */
+fn sp_break() -> TStatement {
+    TBreakStmt { label = "" }
+}
+
+/**
+ * An unlabeled `continue` statement.
+ *
+ * @return a `TContinueStmt` statement
+ */
+fn sp_continue() -> TStatement {
+    TContinueStmt { label = "" }
+}
+
+/**
+ * `add_stmt_cells` reaches every statement shape: a `TAssign` contributes its RHS's one-hop cells,
+ * a value-`TReturn` contributes its value's cells, a value-less `TReturn` contributes nothing, and
+ * `TBreakStmt` / `TContinueStmt` contribute nothing (leaf statements with no cells).
+ */
+#test fn spine_add_stmt_cells_covers_assign_return_break_continue() {
+    let body = teko::list::push(teko::list::push(teko::list::push(teko::list::push(teko::list::empty(),
+                    sp_assign_simple("y", sp_field("x", "f", sp_i64()))),
+                sp_return(sp_field("z", "g", sp_i64()))),
+            sp_break()),
+        sp_continue())
+    let s = fn_spine(sp_fn(teko::list::empty(), body))
+    teko::assert::is_true(sp_has_field_cell(s, "x", "f"))
+    teko::assert::is_true(sp_has_field_cell(s, "z", "g"))
+}
+
+/**
+ * `add_stmt_cells` recurses into a `TLoopStmt` / `TDeferStmt` / `TAdoptStmt` body, so a one-hop
+ * field cell read inside any of the three nested-block shapes is still enumerated.
+ */
+#test fn spine_add_stmt_cells_recurses_into_loop_defer_adopt_bodies() {
+    let body = teko::list::push(teko::list::push(teko::list::push(teko::list::empty(),
+                sp_loop(teko::list::push(teko::list::empty(), sp_exprstmt(sp_field("lp", "a", sp_i64()))))),
+            sp_defer(teko::list::push(teko::list::empty(), sp_exprstmt(sp_field("df", "b", sp_i64()))))),
+        sp_adopt(teko::list::push(teko::list::empty(), sp_exprstmt(sp_field("ad", "c", sp_i64())))))
+    let s = fn_spine(sp_fn(teko::list::empty(), body))
+    teko::assert::is_true(sp_has_field_cell(s, "lp", "a"))
+    teko::assert::is_true(sp_has_field_cell(s, "df", "b"))
+    teko::assert::is_true(sp_has_field_cell(s, "ad", "c"))
+}
+
+/**
+ * A `TReturn` with `has_value = false` contributes no cell (the `else` arm of `add_stmt_cells`'s
+ * `TReturn` case).
+ */
+#test fn spine_add_stmt_cells_return_without_value_contributes_nothing() {
+    let body = teko::list::push(teko::list::empty(), sp_return_void())
+    let s = fn_spine(sp_fn(teko::list::empty(), body))
+    teko::assert::is_true(s.cells.len == 0)
+}
+
+/**
+ * A `TBinding` to a `DestructurePattern` names no single cell (only its value's one-hop cells are
+ * still walked) — the `add_binding_cell` destructure arm.
+ */
+#test fn spine_add_binding_cell_destructure_names_no_target_cell_but_walks_value() {
+    let body = teko::list::push(teko::list::empty(), TBinding { kind = parser::BindKind::Let; target = parser::DestructurePattern { names = teko::list::push(teko::list::push(teko::list::empty(), "a"), "b") }; bound = sp_i64(); value = sp_field("src", "h", sp_i64()) })
+    let s = fn_spine(sp_fn(teko::list::empty(), body))
+    teko::assert::is_true(sp_has_field_cell(s, "src", "h"))
+    teko::assert::is_true(cell_of(s, "a") < 0)
+}
+
+/**
+ * `add_expr_cells` recurses into a `TIfExpr`'s `then_blk` / `else_blk` and a `TMatchExpr`'s arm
+ * bodies, so a one-hop field cell read inside any nested branch is still enumerated.
+ */
+#test fn spine_add_expr_cells_recurses_into_if_and_match_branches() {
+    let iff = TExpr { kind = TIfExpr { cond = sp_var("c", sp_bool_t()); then_blk = teko::list::push(teko::list::empty(), sp_exprstmt(sp_field("th", "p", sp_i64()))); has_else = true; else_blk = teko::list::push(teko::list::empty(), sp_exprstmt(sp_field("el", "q", sp_i64()))) }; type = sp_i64(); line = 0; col = 0 }
+    let m = TExpr { kind = TMatchExpr { subject = sp_var("sub", sp_i64()); arms = teko::list::push(teko::list::empty(), sp_wild_arm(sp_field("ar", "r", sp_i64()))) }; type = sp_i64(); line = 0; col = 0 }
+    let body = teko::list::push(teko::list::push(teko::list::empty(), sp_exprstmt(iff)), sp_exprstmt(m))
+    let s = fn_spine(sp_fn(teko::list::empty(), body))
+    teko::assert::is_true(sp_has_field_cell(s, "th", "p"))
+    teko::assert::is_true(sp_has_field_cell(s, "el", "q"))
+    teko::assert::is_true(sp_has_field_cell(s, "ar", "r"))
+}
+
+/**
+ * A `bool` type — the `TIfExpr.cond` / match-guard scalar shape.
+ *
+ * @return the `bool` primitive type
+ */
+fn sp_bool_t() -> Type { Prim { kind = PrimKind::Bool } }
+
+/**
+ * A single wildcard match arm whose body is one discarded expression statement.
+ *
+ * @param bodyexpr  the arm body's one expression
+ * @return          a `TArm` matching everything
+ */
+fn sp_wild_arm(bodyexpr: TExpr) -> TArm {
+    TArm { pattern = parser::WildcardPattern { }; has_when = false; guard = sp_no_texpr(); body = teko::list::push(teko::list::empty(), sp_exprstmt(bodyexpr)) }
+}
+
+/**
+ * `pt_same_site` agrees on two `PtRoot` values, and DISAGREES (false) across every other pairing
+ * (different kinds, or a `PtFrame` / `PtTop` operand that names no concrete site).
+ */
+#test fn spine_pt_same_site_covers_root_and_cross_kind_pairs() {
+    teko::assert::is_true(pt_same_site(sp_pt_root(), sp_pt_root()))
+    teko::assert::is_false(pt_same_site(sp_pt_param(0), sp_pt_root()))
+    teko::assert::is_false(pt_same_site(sp_pt_adopter(0), sp_pt_param(0)))
+    teko::assert::is_false(pt_same_site(sp_pt_frame(), sp_pt_param(0)))
+    teko::assert::is_false(pt_same_site(sp_pt_top(), sp_pt_param(0)))
+}
+
+/**
+ * `adopter_same` returns false whenever EITHER id is the `⊤` fallback (even when both are `⊤`,
+ * conservatively never agreeing), and true only for two concrete ids sharing a region.
+ */
+#test fn spine_adopter_same_rejects_any_top_fallback() {
+    let concrete0 = PtAdopterId { region = 0; top = false }
+    let concrete0b = PtAdopterId { region = 0; top = false }
+    let concrete1 = PtAdopterId { region = 1; top = false }
+    let top = PtAdopterId { region = 0; top = true }
+    teko::assert::is_true(adopter_same(concrete0, concrete0b))
+    teko::assert::is_false(adopter_same(concrete0, concrete1))
+    teko::assert::is_false(adopter_same(top, concrete0))
+    teko::assert::is_false(adopter_same(concrete0, top))
+    teko::assert::is_false(adopter_same(top, top))
+}
+
+/**
+ * A `BfLocal` borrowed-from value naming local `name`.
+ *
+ * @param name  the borrowed local's name
+ * @return      the borrows-local value
+ */
+fn sp_bf_local(name: str) -> BorrowedFrom { BfLocal { id = BfLocalId { name = name } } }
+
+/**
+ * An assignment through `AssignKind::RefDeref` (`r.value = x`, a `Reference`-deref write) names no
+ * simple-alias pair — `transfer_assign`'s non-`Simple` branch leaves both cells untouched even when
+ * the RHS is itself a non-scalar bare-local read.
+ */
+#test fn spine_transfer_assign_ignores_non_simple_kind() {
+    let body = teko::list::push(teko::list::push(teko::list::empty(), sp_let("holder", sp_nonscalar_var("donor"))), sp_assign_refderef("holder", sp_nonscalar_var("donor")))
+    let s = fn_spine(sp_fn(teko::list::empty(), body))
+    teko::assert::is_false(is_unique_at(s, cell_of(s, "holder") to u32))
+}
+
+/**
+ * `alias_src_name`'s unreachable fallback (`""`) on a non-`TVar` expression — exercised directly
+ * since `rhs_is_alias_source` never routes a non-`TVar` RHS into it in normal use.
+ */
+#test fn spine_alias_src_name_non_var_fallback_is_empty() {
+    teko::assert::is_true(teko::runtime::str_eq(alias_src_name(sp_field("obj", "fld", sp_i64())), ""))
+}
+
+/**
+ * `ref_target_outlives` ADMITS a `BfLocal` borrow whose referent is not adopter-confined (the
+ * enclosing-block check is the caller's responsibility — this predicate only gates on referent
+ * kind + adopter-escape). `BfLocal` is not reachable from `fn_spine`'s L1 seeding (only PR-2's
+ * L2a relaxation ever writes it), so this hand-installs it on a built `Spine` to exercise the arm.
+ */
+#test fn spine_ref_target_outlives_admits_bflocal_referent() {
+    let body = teko::list::push(teko::list::push(teko::list::empty(), sp_let("owner", sp_i64_lit(1))), sp_let("holder", sp_i64_lit(2)))
+    let base = fn_spine(sp_fn(teko::list::empty(), body))
+    let oi = cell_of(base, "owner") to u32
+    let hi = cell_of(base, "holder") to u32
+    let bf_local = sp_set_bf(base.bf, hi, sp_bf_local("owner"))
+    let s = Spine { cells = base.cells; pt = base.pt; bf = bf_local; us = base.us }
+    teko::assert::is_true(ref_target_outlives(s, hi, oi))
+}
+
+/**
+ * Return the borrowed-from axis with index `i` replaced by `v` (a test-local rebuild-by-copy,
+ * mirroring the module's `set_us`).
+ *
+ * @param bf  the borrowed-from axis
+ * @param i   the cell index to replace
+ * @param v   the new borrowed-from value
+ * @return    the axis with element `i` set to `v`
+ */
+fn sp_set_bf(bf: []BorrowedFrom, i: u32, v: BorrowedFrom) -> []BorrowedFrom {
+    mut acc: []BorrowedFrom = teko::list::empty()
+    mut k = 0
+    loop {
+        if k >= bf.len { break }
+        if k to u32 == i {
+            acc = teko::list::push(acc, v)
+        } else {
+            acc = teko::list::push(acc, bf[k])
+        }
+        k++
+    }
+    acc
+}
+
+/**
+ * A plain `i64` literal expression (a fresh, non-aliasing value).
+ *
+ * @param v  the literal's integer value
+ * @return   a typed `i64` number expression
+ */
+fn sp_i64_lit(v: i128) -> TExpr {
+    TExpr { kind = TNumber { is_float = false; value = v; fval = 0.0 }; type = sp_i64(); line = 0; col = 0 }
+}
+
+/**
+ * `referent_not_escaping_adopter` treats an out-of-range referent index as ESCAPING (conservative
+ * FALSE) — the guard branch never exercised by an in-universe cell.
+ */
+#test fn spine_referent_not_escaping_adopter_rejects_out_of_range_index() {
+    let body = teko::list::push(teko::list::empty(), sp_let("only", sp_i64_lit(1)))
+    let s = fn_spine(sp_fn(teko::list::empty(), body))
+    teko::assert::is_false(referent_not_escaping_adopter(s, 999))
+}
+
+/**
+ * `is_unique_at` treats an out-of-range binding index as NOT unique (conservative FALSE) — the
+ * bounds-guard branch never exercised by an in-universe cell.
+ */
+#test fn spine_is_unique_at_rejects_out_of_range_index() {
+    let body = teko::list::push(teko::list::empty(), sp_let("only", sp_i64_lit(1)))
+    let s = fn_spine(sp_fn(teko::list::empty(), body))
+    teko::assert::is_false(is_unique_at(s, 999))
+}
+
+/**
+ * `add_cell` de-duplicates: adding the SAME `name` / `field` key twice leaves the universe with
+ * exactly one matching cell (the early-return `cell_index >= 0` branch).
+ */
+#test fn spine_add_cell_deduplicates_repeated_key() {
+    let once = add_cell(teko::list::empty(), "x", "", false)
+    let twice = add_cell(once, "x", "", false)
+    teko::assert::is_true(twice.len == 1)
+}
+
+/**
+ * `add_param_cells` covers a param with `has_type = false` (the OOP receiver-injected-type shape,
+ * `parser::Param`'s own contract) — never a `Reference`, since `type_ann_is_ref` is never consulted
+ * on that path.
+ */
+#test fn spine_add_param_cells_covers_receiver_param_without_type_annotation() {
+    let receiver = parser::Param { name = "self"; has_type = false; type_ann = sp_named_ann("i64"); is_params = false; has_default = false; default_expr = sp_no_expr() }
+    let params = teko::list::push(teko::list::empty(), receiver)
+    let s = fn_spine(sp_fn(params, teko::list::empty()))
+    let ri = cell_of(s, "self")
+    teko::assert::is_true(ri >= 0)
+    teko::assert::is_true(sp_pt_is_frame(s.pt[ri to u32]))
+}
+
+/**
+ * `add_field_cell` contributes NO cell for the OUTER two-hop path itself (`a.b.c` is never a cell —
+ * it collapses to `⊤`) when the receiver `a.b` is not a bare local; it still recurses into that
+ * non-bare receiver (`add_expr_cells`), so the INNER one-hop `a.b` is enumerated on its own.
+ */
+#test fn spine_add_field_cell_two_hop_path_yields_only_the_inner_one_hop_cell() {
+    let inner = sp_field("a", "b", sp_nonscalar())
+    let outer = TExpr { kind = TFieldAccess { receiver = inner; field = "c" }; type = sp_i64(); line = 0; col = 0 }
+    let body = teko::list::push(teko::list::empty(), sp_exprstmt(outer))
+    let s = fn_spine(sp_fn(teko::list::empty(), body))
+    teko::assert::is_true(sp_has_field_cell(s, "a", "b"))
+    teko::assert::is_false(sp_has_field_cell(s, "a", "c"))
+    teko::assert::is_true(cell_of(s, "a") < 0)
+}
+
+/**
+ * `pt_rank` maps every `PointsTo` member to its lattice rank: `PtFrame` = 0; `PtParam` / `PtAdopter`
+ * / `PtRoot` = 1; `PtTop` = 2.
+ */
+#test fn spine_pt_rank_covers_every_member() {
+    teko::assert::is_true(pt_rank(sp_pt_frame()) == 0)
+    teko::assert::is_true(pt_rank(sp_pt_param(0)) == 1)
+    teko::assert::is_true(pt_rank(sp_pt_adopter(0)) == 1)
+    teko::assert::is_true(pt_rank(sp_pt_root()) == 1)
+    teko::assert::is_true(pt_rank(sp_pt_top()) == 2)
+}
+
+/**
+ * `pt_same_site` agrees on two `PtAdopter` values sharing a concrete region, and DISAGREES for a
+ * `PtRoot` paired with any non-`PtRoot` (the remaining cross-kind arm `pt_same_site`'s prior test
+ * did not reach).
+ */
+#test fn spine_pt_same_site_covers_adopter_agreement_and_root_mismatch() {
+    teko::assert::is_true(pt_same_site(sp_pt_adopter(3), sp_pt_adopter(3)))
+    teko::assert::is_false(pt_same_site(sp_pt_root(), sp_pt_frame()))
+}
+
+/**
+ * `transfer_binding`'s `DestructurePattern` arm names no single target cell even when the RHS IS an
+ * alias source — a destructure binds MULTIPLE names, none of which this one-hop analysis can key,
+ * so the axis passes through unchanged (no cell is joined to `UsShared`).
+ */
+#test fn spine_transfer_binding_destructure_with_alias_source_rhs_is_a_no_op() {
+    let destructure = TBinding { kind = parser::BindKind::Let; target = parser::DestructurePattern { names = teko::list::push(teko::list::push(teko::list::empty(), "a"), "b") }; bound = sp_nonscalar(); value = sp_nonscalar_var("donor") }
+    let body = teko::list::push(teko::list::push(teko::list::empty(), sp_let("donor", sp_i64_lit(1))), destructure)
+    let s = fn_spine(sp_fn(teko::list::empty(), body))
+    teko::assert::is_true(is_unique_at(s, cell_of(s, "donor") to u32))
+}
+
+/**
+ * `transfer_assign`'s early return fires when the RHS is NOT an alias source (a scalar copy) — even
+ * for a `Simple`-kind assignment, no cell is joined to `UsShared`.
+ */
+#test fn spine_transfer_assign_scalar_rhs_is_a_no_op() {
+    let body = teko::list::push(teko::list::push(teko::list::push(teko::list::empty(), sp_let("m", sp_i64_lit(1))), sp_let("target", sp_i64_lit(2))), sp_assign_simple("target", sp_var("m", sp_i64())))
+    let s = fn_spine(sp_fn(teko::list::empty(), body))
+    teko::assert::is_true(is_unique_at(s, cell_of(s, "target") to u32))
+    teko::assert::is_true(is_unique_at(s, cell_of(s, "m") to u32))
+}
+
+/**
+ * `transfer_assign`'s `Simple`-kind arm joins BOTH cells to `UsShared` when the RHS IS an alias
+ * source (`target = donor` where `donor` is a bare non-scalar local) — the `mark_alias_shared` call
+ * reached FROM `transfer_assign` itself (distinct from `transfer_binding`'s own call site).
+ */
+#test fn spine_transfer_assign_simple_kind_with_alias_source_marks_both_shared() {
+    let body = teko::list::push(teko::list::push(teko::list::push(teko::list::empty(), sp_let("donor", sp_i64_lit(1))), sp_let("target", sp_i64_lit(2))), sp_assign_simple("target", sp_nonscalar_var("donor")))
+    let s = fn_spine(sp_fn(teko::list::empty(), body))
+    teko::assert::is_false(is_unique_at(s, cell_of(s, "target") to u32))
+    teko::assert::is_false(is_unique_at(s, cell_of(s, "donor") to u32))
+}
+
+/**
+ * `referent_not_escaping_adopter` ADMITS a `PtRoot` referent (a safe leak, never adopter-confined)
+ * and a `PtTop` referent (joined-over, treated as Root — never itself an adopter-escape reject).
+ */
+#test fn spine_referent_not_escaping_adopter_admits_root_and_top() {
+    let body = teko::list::push(teko::list::empty(), sp_let("only", sp_i64_lit(1)))
+    let base = fn_spine(sp_fn(teko::list::empty(), body))
+    let oi = cell_of(base, "only") to u32
+    let root_s = Spine { cells = base.cells; pt = sp_set_pt(base.pt, oi, sp_pt_root()); bf = base.bf; us = base.us }
+    let top_s = Spine { cells = base.cells; pt = sp_set_pt(base.pt, oi, sp_pt_top()); bf = base.bf; us = base.us }
+    teko::assert::is_true(referent_not_escaping_adopter(root_s, oi))
+    teko::assert::is_true(referent_not_escaping_adopter(top_s, oi))
+}
+
+/**
+ * `is_unique_at` treats a `UsTop` cell (joined-over) as NOT unique — the safe (over-reject)
+ * direction, exercised directly since `fn_spine`'s L1 transfer never itself produces `UsTop`.
+ */
+#test fn spine_is_unique_at_rejects_top() {
+    let body = teko::list::push(teko::list::empty(), sp_let("only", sp_i64_lit(1)))
+    let base = fn_spine(sp_fn(teko::list::empty(), body))
+    let oi = cell_of(base, "only") to u32
+    let top_us = sp_set_us(base.us, oi, sp_us_top())
+    let s = Spine { cells = base.cells; pt = base.pt; bf = base.bf; us = top_us }
+    teko::assert::is_false(is_unique_at(s, oi))
+}
+
+/**
+ * Return the unique-vs-shared axis with index `i` replaced by `v` (a test-local rebuild-by-copy,
+ * mirroring the module's `set_us`).
+ *
+ * @param us  the unique-vs-shared axis
+ * @param i   the cell index to replace
+ * @param v   the new unique-vs-shared value
+ * @return    the axis with element `i` set to `v`
+ */
+fn sp_set_us(us: []Unique, i: u32, v: Unique) -> []Unique {
+    mut acc: []Unique = teko::list::empty()
+    mut k = 0
+    loop {
+        if k >= us.len { break }
+        if k to u32 == i {
+            acc = teko::list::push(acc, v)
+        } else {
+            acc = teko::list::push(acc, us[k])
+        }
+        k++
+    }
+    acc
+}
+
+/**
+ * The region id of a `PtAdopter` points-to value (precondition: `p` IS `PtAdopter`).
+ *
+ * @param p  the points-to value
+ * @return   its adopter region id
+ */
+fn sp_pt_adopter_region(p: PointsTo) -> u32 {
+    match p { PtAdopter as a => a.id.region; _ => 999 to u32 }
+}
+
+/**
+ * Is a points-to value `PtAdopter`?
+ *
+ * @param p  the points-to value
+ * @return   true iff `PtAdopter`
+ */
+fn sp_pt_is_adopter(p: PointsTo) -> bool { match p { PtAdopter => true; _ => false } }
+
+/**
+ * `fn_spine`'s `pt`-transfer wires `pt_join`/`PtAdopter` end to end (spine-build-plan §5.1): a
+ * binding inside an `adopt { }` block is `pt = PtAdopter(region)`, while a sibling binding OUTSIDE
+ * any adopter stays the seeded `PtFrame` floor — proving the adopter-confinement fact is a REAL
+ * fixpoint transfer, not merely a hand-installed test fixture.
+ */
+#test fn spine_fn_spine_marks_adopter_confined_bindings_pt_adopter() {
+    let body = teko::list::push(teko::list::push(teko::list::empty(),
+            sp_let("outside", sp_i64_lit(1))),
+        sp_adopt(teko::list::push(teko::list::empty(), sp_let("inside", sp_i64_lit(2)))))
+    let s = fn_spine(sp_fn(teko::list::empty(), body))
+    let oi = cell_of(s, "outside") to u32
+    let ii = cell_of(s, "inside") to u32
+    teko::assert::is_true(sp_pt_is_frame(s.pt[oi]))
+    teko::assert::is_true(sp_pt_is_adopter(s.pt[ii]))
+}
+
+/**
+ * Two SIBLING (non-nested) `adopt { }` blocks each earn their OWN region id — a binding inside the
+ * first adopter and a binding inside the second are never `pt_same_site`, so a borrow could not
+ * conflate one adopter's lifetime with the other's.
+ */
+#test fn spine_fn_spine_gives_sibling_adopters_distinct_region_ids() {
+    let body = teko::list::push(teko::list::push(teko::list::empty(),
+            sp_adopt(teko::list::push(teko::list::empty(), sp_let("first", sp_i64_lit(1))))),
+        sp_adopt(teko::list::push(teko::list::empty(), sp_let("second", sp_i64_lit(2)))))
+    let s = fn_spine(sp_fn(teko::list::empty(), body))
+    let fi = cell_of(s, "first") to u32
+    let si = cell_of(s, "second") to u32
+    teko::assert::is_true(sp_pt_is_adopter(s.pt[fi]))
+    teko::assert::is_true(sp_pt_is_adopter(s.pt[si]))
+    teko::assert::is_false(sp_pt_adopter_region(s.pt[fi]) == sp_pt_adopter_region(s.pt[si]))
+}
+
+/**
+ * A NESTED `adopt { }` (an adopter inside another adopter's body) opens its OWN fresh region,
+ * distinct from its enclosing adopter's — the inner binding is confined to the inner region, not
+ * merged with the outer one.
+ */
+#test fn spine_fn_spine_nested_adopter_opens_a_fresh_region() {
+    let inner_adopt = sp_adopt(teko::list::push(teko::list::empty(), sp_let("inner", sp_i64_lit(1))))
+    let body = teko::list::push(teko::list::empty(), sp_adopt(teko::list::push(teko::list::push(teko::list::empty(), sp_let("outer", sp_i64_lit(2))), inner_adopt)))
+    let s = fn_spine(sp_fn(teko::list::empty(), body))
+    let oi = cell_of(s, "outer") to u32
+    let ii = cell_of(s, "inner") to u32
+    teko::assert::is_true(sp_pt_is_adopter(s.pt[oi]))
+    teko::assert::is_true(sp_pt_is_adopter(s.pt[ii]))
+    teko::assert::is_false(sp_pt_adopter_region(s.pt[oi]) == sp_pt_adopter_region(s.pt[ii]))
+}
+
+/**
+ * A binding inside a `loop { }` / `defer { }` body that is itself INSIDE an `adopt { }` block still
+ * inherits the enclosing adopter's region (`pt_transfer_stmt`'s `TLoopStmt` / `TDeferStmt` recursion
+ * threads `has_region` through unchanged).
+ */
+#test fn spine_fn_spine_loop_and_defer_inside_adopter_inherit_its_region() {
+    let body = teko::list::push(teko::list::empty(), sp_adopt(teko::list::push(teko::list::push(teko::list::empty(),
+                    sp_loop(teko::list::push(teko::list::empty(), sp_let("looped", sp_i64_lit(1))))),
+                sp_defer(teko::list::push(teko::list::empty(), sp_let("deferred", sp_i64_lit(2)))))))
+    let s = fn_spine(sp_fn(teko::list::empty(), body))
+    let li = cell_of(s, "looped") to u32
+    let di = cell_of(s, "deferred") to u32
+    teko::assert::is_true(sp_pt_is_adopter(s.pt[li]))
+    teko::assert::is_true(sp_pt_is_adopter(s.pt[di]))
+    teko::assert::is_true(sp_pt_adopter_region(s.pt[li]) == sp_pt_adopter_region(s.pt[di]))
+}
+
+/**
+ * `pt_transfer_binding`'s `DestructurePattern` arm names no single target cell inside an adopter
+ * either (mirrors `add_binding_cell` / `transfer_binding`'s own destructure no-op) — the axis passes
+ * through unchanged.
+ */
+#test fn spine_pt_transfer_binding_destructure_inside_adopter_is_a_no_op() {
+    let destructure = TBinding { kind = parser::BindKind::Let; target = parser::DestructurePattern { names = teko::list::push(teko::list::push(teko::list::empty(), "a"), "b") }; bound = sp_i64(); value = sp_i64_lit(1) }
+    let body = teko::list::push(teko::list::empty(), sp_adopt(teko::list::push(teko::list::empty(), destructure)))
+    let s = fn_spine(sp_fn(teko::list::empty(), body))
+    teko::assert::is_true(s.cells.len == 0)
+}
+
+/**
+ * `join_pt_adopter_at` leaves the axis UNCHANGED when the named key is not in the cell universe (the
+ * defensive `idx < 0` guard) — exercised directly since every binding `fn_spine` walks always has a
+ * corresponding cell in normal use.
+ */
+#test fn spine_join_pt_adopter_at_ignores_unknown_key() {
+    let body = teko::list::push(teko::list::empty(), sp_let("only", sp_i64_lit(1)))
+    let s = fn_spine(sp_fn(teko::list::empty(), body))
+    let unchanged = join_pt_adopter_at(s.cells, s.pt, "nonexistent", 0)
+    teko::assert::is_true(unchanged.len == s.pt.len)
+    teko::assert::is_true(sp_pt_is_frame(unchanged[cell_of(s, "only") to u32]))
+}
