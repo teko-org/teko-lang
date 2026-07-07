@@ -3658,8 +3658,106 @@ fn type_method(f: parser::Function, struct_name: str, env: Env, table: TypeTable
  * @return    null when every ref-to-local is spine-sound, else the R5 reject error
  */
 fn check_ref_storability(tf: TFunction) -> error? {
-    if !fn_has_ref_param(tf) { return null }
+    if !fn_has_ref_param(tf) {
+        if !stmts_have_free(tf.body) { return null }
+    }
     check_ref_storability_block(tf.body, fn_spine(tf))
+}
+
+/**
+ * (#331 L2b) The freed target name of a `teko::mem::free(x)` call (a `teko::mem`-namespaced call
+ * whose last segment is `free`, one bare-`TVar` argument), or `""` when `e` is not such a call.
+ *
+ * @param e  the typed expression
+ * @return   the freed variable name, or "" when not a `mem::free` call
+ */
+fn mem_free_target_name(e: TExpr) -> str {
+    match e.kind {
+        TCall as c => {
+            if c.call_ns != "teko::mem" { return "" }
+            if c.callee.segments.len == 0 { return "" }
+            if c.callee.segments[c.callee.segments.len - 1].name != "free" { return "" }
+            if c.args.len != 1 { return "" }
+            match c.args[0].kind {
+                TVar as v => v.name
+                _ => ""
+            }
+        }
+        _ => ""
+    }
+}
+
+/**
+ * (#331 L2b) The affine `mem::free` guard: the freed target must be the SOLE live handle
+ * (`is_unique_at`). A shared / `⊤` target (`let y = x; mem::free(x)`) would leave `y` dangling — the
+ * aliased-free UAF (remodel §5 / #336 HONEST-BOUNDS gap 1), invisible to static analysis AND ASan
+ * (only `TEKO_MEM_PARANOID`). This closes it statically. A non-free expression is a no-op.
+ *
+ * @param e      the typed expression (a `mem::free` call site, or anything else)
+ * @param spine  the enclosing function's spine
+ * @return       null when the free is sound (unique target) or `e` is not a free, else the reject
+ */
+fn check_free_site(e: TExpr, spine: Spine) -> error? {
+    let target = mem_free_target_name(e)
+    if target == "" { return null }
+    let ci = cell_of(spine, target)
+    if ci < 0 { return null }
+    if is_unique_at(spine, ci to u32) { return null }
+    error { message = $"cannot free `{target}` — it is aliased (another binding still holds it); `mem::free` requires the sole live handle" }
+}
+
+/**
+ * (#331 L2b) Does a statement block (transitively, through loop/defer/adopt bodies + if/match arms)
+ * contain a `mem::free` call? A cheap boolean scan (no spine) used by `check_ref_storability`'s
+ * fast-path: build the per-function spine ONLY when a ref parameter OR a free call is present.
+ *
+ * @param stmts  the typed statement block
+ * @return       true iff a `mem::free` call is reachable in the block
+ */
+fn stmts_have_free(stmts: []TStatement) -> bool {
+    mut i = 0
+    loop {
+        if i >= stmts.len { break }
+        if stmt_has_free(stmts[i]) { return true }
+        i++
+    }
+    false
+}
+
+/** (#331 L2b) Does one statement embed a `mem::free` call (recursing into nested blocks/arms)? */
+fn stmt_has_free(s: TStatement) -> bool {
+    match s {
+        TExprStmt as es => expr_has_free(es.expr)
+        TBinding as b => expr_has_free(b.value)
+        TAssign as a => expr_has_free(a.value)
+        TReturn as r => if r.has_value { expr_has_free(r.value) } else { false }
+        TLoopStmt as l => stmts_have_free(l.body)
+        TDeferStmt as d => stmts_have_free(d.body)
+        TAdoptStmt as a => stmts_have_free(a.body)
+        TBreakStmt => false
+        TContinueStmt => false
+    }
+}
+
+/** (#331 L2b) Does an expression embed a `mem::free` call (itself, or in an if/match arm body)? */
+fn expr_has_free(e: TExpr) -> bool {
+    if mem_free_target_name(e) != "" { return true }
+    match e.kind {
+        TIfExpr as f => if stmts_have_free(f.then_blk) { true } else { if f.has_else { stmts_have_free(f.else_blk) } else { false } }
+        TMatchExpr as m => match_arms_have_free(m)
+        _ => false
+    }
+}
+
+/** (#331 L2b) Does any match arm body embed a `mem::free` call? */
+fn match_arms_have_free(m: TMatchExpr) -> bool {
+    mut i = 0
+    loop {
+        if i >= m.arms.len { break }
+        if stmts_have_free(m.arms[i].body) { return true }
+        i++
+    }
+    false
 }
 
 /**
@@ -3735,7 +3833,7 @@ fn check_ref_storability_expr(e: TExpr, spine: Spine) -> error? {
     match e.kind {
         TIfExpr as f => match check_ref_storability_block(f.then_blk, spine) { error as er => return er; null => if f.has_else { check_ref_storability_block(f.else_blk, spine) } else { null } }
         TMatchExpr as m => check_ref_storability_match(m, spine)
-        _ => null
+        _ => check_free_site(e, spine)
     }
 }
 
