@@ -534,3 +534,209 @@ fn iwt_f15_coalesce_present_takes_the_left_value() {
 fn iwt_f15_coalesce_absent_takes_the_fallback() {
     teko::assert::is_true(interp_lmodule(iwt_coalesce_exit(false, 7, 99), "main", iwt_no_args()) == iwt_i128(99))
 }
+
+/**
+ * iwt_exit_const — append `exit(<code>)` (the terminal void-call + the ABI's
+ * trailing dead `const 0; ret`) into `block_id` (A1-5, #382 — the shared
+ * arm-tail every `match` fixture below uses, mirroring `iwt_exit_sum`'s
+ * single-block shape).
+ *
+ * @param LFunc f0  the function to append the exit sequence into
+ * @param u32 block_id  the block to append the exit sequence into
+ * @param i64 code  the exit code to emit
+ * @return LFunc  the advanced function
+ */
+fn iwt_exit_const(f0: LFunc, block_id: u32, code: i64) -> LFunc {
+    let c = alloc_vreg(f0)
+    mut f = c.func
+    f = append_inst(f, block_id, const_int_inst(c.vreg, iwt_i128(code), 0, 0))
+    let args = teko::list::push(teko::list::empty(), c.vreg)
+    f = append_inst(f, block_id, void_call_inst("tk_exit", args, false, 0, 0))
+    let z = alloc_vreg(f)
+    f = z.func
+    f = append_inst(f, block_id, const_int_inst(z.vreg, iwt_i128(0), 0, 0))
+    append_inst(f, block_id, ret_inst(z.vreg, 0, 0))
+}
+
+/**
+ * iwt_match_scalar_exit — F16: `exit(match e { 0=>10; 1=>20; _=>0 })` as
+ * hand-built LIR: a two-step `ICmpEq` test chain, each arm's success block
+ * exiting directly. Proves the interp follows a MULTI-ARM scalar test chain
+ * (composition of A1-1's branch/jump — A1-5, #382).
+ *
+ * @param i64 e_val  the match subject's value
+ * @return LModule  the hand-built single-function module
+ */
+fn iwt_match_scalar_exit(e_val: i64) -> LModule {
+    mut f = new_func("main", 0, teko::list::empty(), LType::I32)
+    let ev = alloc_vreg(f)
+    f = ev.func
+    f = append_inst(f, 0, const_int_inst(ev.vreg, iwt_i128(e_val), 0, 0))
+    let c0 = alloc_vreg(f)
+    f = c0.func
+    f = append_inst(f, 0, const_int_inst(c0.vreg, iwt_i128(0), 0, 0))
+    let t0 = alloc_vreg(f)
+    f = t0.func
+    f = append_inst(f, 0, bin_inst(t0.vreg, LBinOp::ICmpEq, ev.vreg, c0.vreg, 0, 0))
+    let arm0b = alloc_block(f)
+    f = arm0b.func
+    let next0b = alloc_block(f)
+    f = next0b.func
+    f = append_inst(f, 0, branch_inst(t0.vreg, arm0b.block_id, teko::list::empty(), next0b.block_id, teko::list::empty(), 0, 0))
+    f = iwt_exit_const(f, arm0b.block_id, 10)
+    let c1 = alloc_vreg(f)
+    f = c1.func
+    f = append_inst(f, next0b.block_id, const_int_inst(c1.vreg, iwt_i128(1), 0, 0))
+    let t1 = alloc_vreg(f)
+    f = t1.func
+    f = append_inst(f, next0b.block_id, bin_inst(t1.vreg, LBinOp::ICmpEq, ev.vreg, c1.vreg, 0, 0))
+    let arm1b = alloc_block(f)
+    f = arm1b.func
+    let next1b = alloc_block(f)
+    f = next1b.func
+    f = append_inst(f, next0b.block_id, branch_inst(t1.vreg, arm1b.block_id, teko::list::empty(), next1b.block_id, teko::list::empty(), 0, 0))
+    f = iwt_exit_const(f, arm1b.block_id, 20)
+    f = iwt_exit_const(f, next1b.block_id, 0)
+    add_func(empty_module(), f)
+}
+
+#test
+fn iwt_f16_match_scalar_first_arm_wins() {
+    teko::assert::is_true(interp_lmodule(iwt_match_scalar_exit(0), "main", iwt_no_args()) == iwt_i128(10))
+}
+
+#test
+fn iwt_f16_match_scalar_second_arm_wins() {
+    teko::assert::is_true(interp_lmodule(iwt_match_scalar_exit(1), "main", iwt_no_args()) == iwt_i128(20))
+}
+
+#test
+fn iwt_f16_match_scalar_wildcard_wins() {
+    teko::assert::is_true(interp_lmodule(iwt_match_scalar_exit(9), "main", iwt_no_args()) == iwt_i128(0))
+}
+
+/**
+ * iwt_match_guard_exit — F17: `exit(match x { 1 when flag => 100; _ => 0 })`,
+ * `flag` a second int PARAMETER standing in for an arbitrary guard condition
+ * (nonzero = true) — proves a FAILED guard falls through to the SAME next-arm
+ * block a failed pattern test targets (A1-5, #382, §2.4).
+ *
+ * @param i64 x_val  the match subject's value
+ * @param i64 flag_val  the guard's stand-in condition (nonzero = true)
+ * @return LModule  the hand-built single-function module
+ */
+fn iwt_match_guard_exit(x_val: i64, flag_val: i64) -> LModule {
+    mut f = new_func("main", 0, teko::list::empty(), LType::I32)
+    let xv = alloc_vreg(f)
+    f = xv.func
+    f = append_inst(f, 0, const_int_inst(xv.vreg, iwt_i128(x_val), 0, 0))
+    let flag = alloc_vreg(f)
+    f = flag.func
+    f = append_inst(f, 0, const_int_inst(flag.vreg, iwt_i128(flag_val), 0, 0))
+    let c1 = alloc_vreg(f)
+    f = c1.func
+    f = append_inst(f, 0, const_int_inst(c1.vreg, iwt_i128(1), 0, 0))
+    let t1 = alloc_vreg(f)
+    f = t1.func
+    f = append_inst(f, 0, bin_inst(t1.vreg, LBinOp::ICmpEq, xv.vreg, c1.vreg, 0, 0))
+    let armb = alloc_block(f)
+    f = armb.func
+    let nextb = alloc_block(f)
+    f = nextb.func
+    f = append_inst(f, 0, branch_inst(t1.vreg, armb.block_id, teko::list::empty(), nextb.block_id, teko::list::empty(), 0, 0))
+    let guardb = alloc_block(f)
+    f = guardb.func
+    f = append_inst(f, armb.block_id, branch_inst(flag.vreg, guardb.block_id, teko::list::empty(), nextb.block_id, teko::list::empty(), 0, 0))
+    f = iwt_exit_const(f, guardb.block_id, 100)
+    f = iwt_exit_const(f, nextb.block_id, 0)
+    add_func(empty_module(), f)
+}
+
+#test
+fn iwt_f17_match_guard_true_takes_the_guarded_arm() {
+    teko::assert::is_true(interp_lmodule(iwt_match_guard_exit(1, 1), "main", iwt_no_args()) == iwt_i128(100))
+}
+
+#test
+fn iwt_f17_match_guard_false_falls_through_to_the_next_arm() {
+    teko::assert::is_true(interp_lmodule(iwt_match_guard_exit(1, 0), "main", iwt_no_args()) == iwt_i128(0))
+}
+
+#test
+fn iwt_f17_match_pattern_false_never_reaches_the_guard() {
+    teko::assert::is_true(interp_lmodule(iwt_match_guard_exit(2, 1), "main", iwt_no_args()) == iwt_i128(0))
+}
+
+/**
+ * iwt_variant_payload_exit — F18: a hand-built `{tag@0, payload@8}` variant
+ * value whose ONE case (tag 0) is a struct payload (its OWN `{radius@0}`
+ * alloca, addressed indirectly through the variant's payload pointer) — `exit`s
+ * the payload's OWN field, proving a variant-tag arm both SELECTS its case (tag
+ * compare) and BINDS its payload (an indirect load through the payload pointer,
+ * mirroring `lower_variant_case_bind`) (A1-5, #382).
+ *
+ * @return LModule  the hand-built single-function module
+ */
+fn iwt_variant_payload_exit() -> LModule {
+    mut f = new_func("main", 0, teko::list::empty(), LType::I32)
+    let circle = alloc_vreg(f)
+    f = circle.func
+    f = append_inst(f, 0, alloca_inst(circle.vreg, 8, 8, 0, 0))
+    f = iwt_alloc_field(f, circle.vreg, 0, 42)
+    let v = alloc_vreg(f)
+    f = v.func
+    f = append_inst(f, 0, alloca_inst(v.vreg, 16, 8, 0, 0))
+    let tagaddr = alloc_vreg(f)
+    f = tagaddr.func
+    f = append_inst(f, 0, field_addr_inst(tagaddr.vreg, v.vreg, 0, 0, 0))
+    let tagc = alloc_vreg(f)
+    f = tagc.func
+    f = append_inst(f, 0, const_int_inst(tagc.vreg, iwt_i128(0), 0, 0))
+    f = append_inst(f, 0, store_inst(tagaddr.vreg, tagc.vreg, LType::I32, 0, 0))
+    let payaddr = alloc_vreg(f)
+    f = payaddr.func
+    f = append_inst(f, 0, field_addr_inst(payaddr.vreg, v.vreg, 8, 0, 0))
+    f = append_inst(f, 0, store_inst(payaddr.vreg, circle.vreg, LType::Ptr, 0, 0))
+    let tagaddr2 = alloc_vreg(f)
+    f = tagaddr2.func
+    f = append_inst(f, 0, field_addr_inst(tagaddr2.vreg, v.vreg, 0, 0, 0))
+    let tagv = alloc_vreg(f)
+    f = tagv.func
+    f = append_inst(f, 0, load_inst(tagv.vreg, tagaddr2.vreg, LType::I32, 0, 0))
+    let zero = alloc_vreg(f)
+    f = zero.func
+    f = append_inst(f, 0, const_int_inst(zero.vreg, iwt_i128(0), 0, 0))
+    let tagtest = alloc_vreg(f)
+    f = tagtest.func
+    f = append_inst(f, 0, bin_inst(tagtest.vreg, LBinOp::ICmpEq, tagv.vreg, zero.vreg, 0, 0))
+    let armb = alloc_block(f)
+    f = armb.func
+    let nextb = alloc_block(f)
+    f = nextb.func
+    f = append_inst(f, 0, branch_inst(tagtest.vreg, armb.block_id, teko::list::empty(), nextb.block_id, teko::list::empty(), 0, 0))
+    let payaddr2 = alloc_vreg(f)
+    f = payaddr2.func
+    f = append_inst(f, armb.block_id, field_addr_inst(payaddr2.vreg, v.vreg, 8, 0, 0))
+    let payptr = alloc_vreg(f)
+    f = payptr.func
+    f = append_inst(f, armb.block_id, load_inst(payptr.vreg, payaddr2.vreg, LType::Ptr, 0, 0))
+    let fieldaddr = alloc_vreg(f)
+    f = fieldaddr.func
+    f = append_inst(f, armb.block_id, field_addr_inst(fieldaddr.vreg, payptr.vreg, 0, 0, 0))
+    let radius = alloc_vreg(f)
+    f = radius.func
+    f = append_inst(f, armb.block_id, load_inst(radius.vreg, fieldaddr.vreg, LType::I64, 0, 0))
+    let eargs = teko::list::push(teko::list::empty(), radius.vreg)
+    f = append_inst(f, armb.block_id, void_call_inst("tk_exit", eargs, false, 0, 0))
+    let deadz = alloc_vreg(f)
+    f = deadz.func
+    f = append_inst(f, armb.block_id, const_int_inst(deadz.vreg, iwt_i128(0), 0, 0))
+    f = append_inst(f, armb.block_id, ret_inst(deadz.vreg, 0, 0))
+    f = iwt_exit_const(f, nextb.block_id, 0)
+    add_func(empty_module(), f)
+}
+
+#test
+fn iwt_f18_match_variant_payload_returns_the_bound_field() {
+    teko::assert::is_true(interp_lmodule(iwt_variant_payload_exit(), "main", iwt_no_args()) == iwt_i128(42))
+}
