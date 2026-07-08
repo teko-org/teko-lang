@@ -1536,3 +1536,134 @@ fn lwt_honest_stop_on_continue_outside_a_loop() {
     let out = match lower_function(f) { LoweredFunction => "ok"; error as e => e.message }
     teko::assert::str_contains(out, "break/continue outside a loop")
 }
+
+/** lwt_field — one `struct` field: `name: <tname>`, an all-public struct field (#414, #382). */
+fn lwt_field(name: str, tname: str) -> parser::Field {
+    parser::Field { name = name; type_ann = lwt_named_te(tname); vis = parser::Visibility::Pub; is_intern = false; has_doc = false; doc = "" }
+}
+
+/** lwt_struct_decl — a `struct <name> { <fields> }` TypeDecl, wrapped as a `checker::TItem`
+    (#414, #382). */
+fn lwt_struct_decl(name: str, fields: []parser::Field) -> checker::TItem {
+    parser::TypeDecl {
+        name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty()
+        body = parser::StructBody { fields = fields; methods = teko::list::empty(); implements = teko::list::empty() }
+        vis = parser::Visibility::Pub; has_doc = false; doc = ""
+        line = 0; col = 0; di_kind = parser::DiKind::None; has_di_key = false; di_key = ""
+        is_unsafe = false; must_free = false
+    }
+}
+
+/**
+ * lwt_two_fields — a two-element `[]parser::Field` list, in order (#414, #382).
+ *
+ * @param parser::Field a  the first field
+ * @param parser::Field b  the second field
+ * @return []parser::Field  `[a, b]`
+ */
+fn lwt_two_fields(a: parser::Field, b: parser::Field) -> []parser::Field {
+    teko::list::push(teko::list::push(teko::list::empty(), a), b)
+}
+
+/**
+ * lwt_three_fields — a three-element `[]parser::Field` list, in order (#414, #382).
+ *
+ * @param parser::Field a  the first field
+ * @param parser::Field b  the second field
+ * @param parser::Field c  the third field
+ * @return []parser::Field  `[a, b, c]`
+ */
+fn lwt_three_fields(a: parser::Field, b: parser::Field, c: parser::Field) -> []parser::Field {
+    teko::list::push(lwt_two_fields(a, b), c)
+}
+
+/**
+ * lwt_nested_struct_layout_program — `struct Point { x: i64; y: i64 }` (declared
+ * first, so its layout is already KNOWN) followed by `struct Line { a: byte; p:
+ * Point; c: byte }`, whose middle field is Point BY VALUE (#414, #382).
+ *
+ * @return checker::TProgram  the two-struct program
+ */
+fn lwt_nested_struct_layout_program() -> checker::TProgram {
+    let point = lwt_struct_decl("Point", lwt_two_fields(lwt_field("x", "i64"), lwt_field("y", "i64")))
+    let line = lwt_struct_decl("Line", lwt_three_fields(lwt_field("a", "byte"), lwt_field("p", "Point"), lwt_field("c", "byte")))
+    mut items: []checker::TItem = teko::list::empty()
+    items = teko::list::push(items, point)
+    items = teko::list::push(items, line)
+    checker::TProgram { items = items }
+}
+
+/**
+ * nested_struct_by_value_field_layout_accounts_for_the_inner_structs_real_width
+ * — #414, #382: `Line`'s middle field `p: Point` (a struct BY VALUE, size 16
+ * align 8) must widen `Line` to size 32 (`a`@0 padded to 8 for `p`, `p`@8
+ * spans its own 16 bytes, `c`@24 padded to the struct's own 8-byte
+ * alignment) — the OLD `ltype_of_typeexpr`-only mapping collapsed `p` to a
+ * bare `Ptr` (8 bytes), under-sizing `Line` to 24 and misplacing `c`@16.
+ */
+#test
+fn nested_struct_by_value_field_layout_accounts_for_the_inner_structs_real_width() {
+    let m = match lower_program(lwt_nested_struct_layout_program()) { LModule as x => x; error as err => return }
+    let text = print_lmodule(m)
+    teko::assert::str_contains(text, "layout Point: size=16 align=8 {x@0, y@8}")
+    teko::assert::str_contains(text, "layout Line: size=32 align=8 {a@0, p@8, c@24}")
+}
+
+/**
+ * lwt_forward_referenced_struct_field_falls_back_to_ptr — #414, #382: a field
+ * naming a struct declared LATER in program order (not yet in the
+ * accumulated layout table when `Early` itself is resolved) falls back to
+ * the scalar `Ptr` mapping, unchanged — `struct_layout_of_field` only
+ * widens a field whose named struct is ALREADY known.
+ */
+#test
+fn lwt_forward_referenced_struct_field_falls_back_to_ptr() {
+    let early = lwt_struct_decl("Early", teko::list::push(teko::list::empty(), lwt_field("later", "Later")))
+    let later = lwt_struct_decl("Later", teko::list::push(teko::list::empty(), lwt_field("v", "i64")))
+    mut items: []checker::TItem = teko::list::empty()
+    items = teko::list::push(items, early)
+    items = teko::list::push(items, later)
+    let prog = checker::TProgram { items = items }
+    let m = match lower_program(prog) { LModule as x => x; error as err => return }
+    let text = print_lmodule(m)
+    teko::assert::str_contains(text, "layout Early: size=8 align=8 {later@0}")
+}
+
+/**
+ * lwt_virtual_main_returns_the_trailing_top_level_expressions_value — #423,
+ * #382: `let x = 40; x + 2` (no explicit `exit`/`return`) — the loose
+ * top-level statement list's TRAILING non-void expression becomes the
+ * program's exit code, exactly like a non-void function body's own
+ * trailing-expression auto-return (#421). Before the fix, `close_virtual_main`
+ * unconditionally emitted `const 0; ret` here, discarding the `42` value.
+ */
+#test
+fn lwt_virtual_main_returns_the_trailing_top_level_expressions_value() {
+    mut items: []checker::TItem = teko::list::empty()
+    items = teko::list::push(items, lwt_item(lwt_bind("x", lwt_num_i64(40 to i128), checker::PrimKind::I64)))
+    let tail = lwt_bin(lexer::TokenKind::Plus, lwt_var("x", checker::PrimKind::I64), lwt_num_i64(2 to i128), checker::PrimKind::I64)
+    items = teko::list::push(items, lwt_item(lwt_exprstmt(tail)))
+    let prog = checker::TProgram { items = items }
+    let m = match lower_program(prog) { LModule as x => x; error as err => return }
+    let text = print_lmodule(m)
+    teko::assert::str_contains(text, "iadd ")
+    teko::assert::str_contains(text, "ret %2")
+    teko::assert::is_true(!teko::str::contains(text, "const 0"))
+}
+
+/**
+ * lwt_virtual_main_still_falls_through_to_return_zero_after_a_void_tail_call
+ * — #423, #382: a VOID-typed trailing expression-statement (a call to a
+ * void function/builtin, mirroring the existing `exit`-tail fixtures) is
+ * NOT an exit-code value — `close_virtual_main` still falls through to
+ * `const 0; ret` exactly as before the fix.
+ */
+#test
+fn lwt_virtual_main_still_falls_through_to_return_zero_after_a_void_tail_call() {
+    let void_call = lwt_call(lwt_path1("exit"), "", teko::list::push(teko::list::empty(), lwt_num_i64(1 to i128)), checker::Void { })
+    let prog = checker::TProgram { items = teko::list::push(teko::list::empty(), lwt_item(lwt_exprstmt(void_call))) }
+    let m = match lower_program(prog) { LModule as x => x; error as err => return }
+    let text = print_lmodule(m)
+    teko::assert::str_contains(text, "func @main() -> i32 {")
+    teko::assert::str_contains(text, "const 0")
+}

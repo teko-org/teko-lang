@@ -3780,25 +3780,145 @@ fn collect_struct_layout_item(acc: []LStructLayout, it: checker::TItem) -> []LSt
     `StructBody`; unchanged for any other type-declaration shape (enum/class/variant/…). */
 fn collect_struct_layout_decl(acc: []LStructLayout, td: parser::TypeDecl) -> []LStructLayout {
     match td.body {
-        parser::StructBody as sb => teko::list::push(acc, layout_of_fields(td.name, sb.fields))
+        parser::StructBody as sb => teko::list::push(acc, layout_of_fields(td.name, sb.fields, acc))
         _ => acc
     }
 }
 
-/** layout_of_fields — a struct's LStructLayout from its DECLARED field list: each field's
-    machine class comes from its syntactic annotation (ltype_of_typeexpr — the same mapping
-    a parameter list already uses), in the struct's own declared order. */
-fn layout_of_fields(name: str, fields: []parser::Field) -> LStructLayout {
+/**
+ * layout_of_fields — a struct's LStructLayout from its DECLARED field list: each
+ * field's machine class comes from its syntactic annotation (`ltype_of_typeexpr` —
+ * the same mapping a parameter list already uses), in the struct's own declared
+ * order. A field whose type NAMES an already-registered struct in `known` (an
+ * EARLIER-declared struct — layouts are collected in program order) is a
+ * struct-BY-VALUE field: its size/align come from that struct's OWN resolved
+ * layout (recursively already-computed, since it registered first), not from
+ * `ltype_of_typeexpr`'s total `Ptr` fallback (which would under-size it to 8
+ * bytes). A forward-referenced or non-struct field falls back to the scalar
+ * `ltype_size`/`ltype_align` mapping, unchanged (#414, #382).
+ *
+ * @param str name  the struct's canonical (declaring) name
+ * @param []parser::Field fields  the struct's declared fields, in order
+ * @param []LStructLayout known  every struct layout resolved so far (program
+ *                               order) — the lookup table a nested-struct
+ *                               field's size/align resolves against
+ * @return LStructLayout  the resolved size/align/per-field offsets
+ */
+fn layout_of_fields(name: str, fields: []parser::Field, known: []LStructLayout) -> LStructLayout {
     mut field_names: []str = teko::list::empty()
     mut field_types: []LType = teko::list::empty()
+    mut field_sizes: []u32 = teko::list::empty()
+    mut field_aligns: []u32 = teko::list::empty()
     mut i: u64 = 0
     loop {
         if i >= fields.len { break }
+        let te = fields[i].type_ann
+        let ft = ltype_of_typeexpr(te)
+        let nested = struct_layout_of_field(te, known)
         field_names = teko::list::push(field_names, fields[i].name)
-        field_types = teko::list::push(field_types, ltype_of_typeexpr(fields[i].type_ann))
+        field_types = teko::list::push(field_types, ft)
+        field_sizes = teko::list::push(field_sizes, field_size_of(ft, nested))
+        field_aligns = teko::list::push(field_aligns, field_align_of(ft, nested))
         i++
     }
-    layout_of(name, field_names, field_types)
+    layout_of_sized(name, field_names, field_types, field_sizes, field_aligns)
+}
+
+/**
+ * struct_layout_of_field — the ALREADY-KNOWN layout of a field's type, when that
+ * type is a single-segment Named type matching a struct in `known` by name; `null`
+ * for every other field-type shape (a scalar, a multi-segment path, a slice/
+ * optional/union/function annotation, or a forward reference to a not-yet-
+ * registered struct) (#414, #382).
+ *
+ * @param parser::TypeExpr te  the field's syntactic type annotation
+ * @param []LStructLayout known  every struct layout resolved so far
+ * @return LStructLayout?  the matching nested layout, or `null`
+ */
+fn struct_layout_of_field(te: parser::TypeExpr, known: []LStructLayout) -> LStructLayout? {
+    match named_type_name_of(te) {
+        str as name => find_known_struct_layout(known, name)
+        null => null
+    }
+}
+
+/**
+ * named_type_name_of — the bare name of a single-segment Named type annotation
+ * (`Point`, not `a::Point`); `null` for a multi-segment path or any other
+ * TypeExpr shape (#414, #382).
+ *
+ * @param parser::TypeExpr te  the syntactic type annotation
+ * @return str?  the single segment's name, or `null`
+ */
+fn named_type_name_of(te: parser::TypeExpr) -> str? {
+    match te {
+        parser::NamedType as nt => single_segment_name(nt.path)
+        _ => null
+    }
+}
+
+/**
+ * single_segment_name — `p`'s lone segment name, or `null` when `p` has zero or
+ * more than one segment (#414, #382).
+ *
+ * @param parser::Path p  the path to inspect
+ * @return str?  `p`'s single segment's name, or `null`
+ */
+fn single_segment_name(p: parser::Path) -> str? {
+    if p.segments.len != 1 { return null }
+    p.segments[0].name
+}
+
+/**
+ * find_known_struct_layout — the entry of `layouts` named `name`, or `null`
+ * when none matches (a NULLABLE sibling of `find_struct_layout`: a
+ * forward-referenced or non-struct field type is a routine "not (yet)
+ * known" outcome here, not an internal invariant break) (#414, #382).
+ *
+ * @param []LStructLayout layouts  the struct-layout table to search
+ * @param str name  the struct name to look up
+ * @return LStructLayout?  the matching entry, or `null`
+ */
+fn find_known_struct_layout(layouts: []LStructLayout, name: str) -> LStructLayout? {
+    mut i: u64 = 0
+    loop {
+        if i >= layouts.len { break }
+        if layouts[i].name == name { return layouts[i] }
+        i++
+    }
+    null
+}
+
+/**
+ * field_size_of — a field's byte size: `nested`'s own resolved size when
+ * present (a struct-by-value field), else `ft`'s scalar `ltype_size` (#414,
+ * #382).
+ *
+ * @param LType ft  the field's machine class (`ltype_of_typeexpr`'s mapping)
+ * @param LStructLayout? nested  the field's nested struct layout, when known
+ * @return u32  the field's byte size
+ */
+fn field_size_of(ft: LType, nested: LStructLayout?) -> u32 {
+    match nested {
+        LStructLayout as l => l.size
+        null => ltype_size(ft)
+    }
+}
+
+/**
+ * field_align_of — a field's byte alignment: `nested`'s own resolved alignment
+ * when present (a struct-by-value field), else `ft`'s scalar `ltype_align`
+ * (#414, #382).
+ *
+ * @param LType ft  the field's machine class (`ltype_of_typeexpr`'s mapping)
+ * @param LStructLayout? nested  the field's nested struct layout, when known
+ * @return u32  the field's byte alignment
+ */
+fn field_align_of(ft: LType, nested: LStructLayout?) -> u32 {
+    match nested {
+        LStructLayout as l => l.align
+        null => ltype_align(ft)
+    }
 }
 
 /**
@@ -3910,9 +4030,12 @@ fn lower_item_function(m: LModule, loose: []checker::TStatement, f: checker::TFu
 
 /**
  * lower_virtual_main — the synthesized `int main()` from the loose top-level
- * statements: lower each, and if control falls through append `%r = const 0;
- * ret %r` (the ABI: main returns int). An explicit `exit(n)` inside diverges,
- * so the trailing return is dead but harmless.
+ * statements: lower each, treating a trailing loose EXPRESSION statement as
+ * the program's exit-code value (mirrors `lower_fn_body`'s trailing-expression
+ * auto-return, #421 — `lower_main_tail`), and if control falls through append
+ * `%r = const 0; ret %r` when no such trailing value was found (the ABI: main
+ * returns int) (#423, #382). An explicit `exit(n)` inside diverges, so the
+ * trailing return is dead but harmless.
  *
  * @param []checker::TStatement loose  the program's loose top-level statements,
  *                                     in order
@@ -3934,24 +4057,117 @@ fn lower_virtual_main(loose: []checker::TStatement, layouts: []LStructLayout, en
         layouts = layouts; rodata = rodata; enums = enums; lifted = lifted
         defers = teko::list::empty(); loop_targets = teko::list::empty()
     }
-    let done = match lower_block(ctx0, loose) { LowerCtx as c => c; error as err => return err }
-    let closed = match close_virtual_main(done) { LowerCtx as c => c; error as err => return err }
+    let tail = match lower_main_tail(ctx0, loose) { LowerMainTail as x => x; error as err => return err }
+    let closed = match close_virtual_main(tail) { LowerCtx as c => c; error as err => return err }
     LoweredFunction { func = closed.func; rodata = closed.rodata; lifted = closed.lifted }
 }
 
 /**
- * close_virtual_main — fire any still-pending top-level defer (from index
- * 0, LIFO, A1-2, #382) and append `const 0; ret %r` when the body did not
- * already terminate.
+ * LowerMainTail — the outcome of lowering the loose top-level statement list:
+ * either it fell through with no trailing exit-code value (`has_value=false`
+ * — the last statement was not a value-producing expression, or the body was
+ * empty/already terminated), or its last statement was a non-void EXPRESSION
+ * statement, whose value is the program's exit code (`has_value=true`, `vreg`)
+ * (#423, #382).
+ */
+pub type LowerMainTail = struct { ctx: LowerCtx; has_value: bool; vreg: u32 }
+
+/**
+ * lower_main_tail — lower every loose top-level statement but the last
+ * plainly (`lower_stmt`, stopping early on an inner terminator — a labeled
+ * top-level `return` never occurs, but an early-terminating construct is
+ * handled the same as `lower_block`'s), then resolve the LAST statement
+ * through `lower_main_tail_stmt` — the only one eligible to supply the
+ * program's exit-code value (#423, #382).
  *
- * @param LowerCtx ctx  the context after lowering the loose top-level
- *                      statements
+ * @param LowerCtx ctx  the lowering context
+ * @param []checker::TStatement body  the program's loose top-level statements
+ * @return LowerMainTail | error  the advanced context, plus whether a
+ *                                trailing exit-code value was found
+ */
+fn lower_main_tail(ctx: LowerCtx, body: []checker::TStatement) -> LowerMainTail | error {
+    if body.len == 0 { return LowerMainTail { ctx = ctx; has_value = false; vreg = 0 } }
+    mut cur = ctx
+    mut i: u64 = 0
+    loop {
+        if i + 1 >= body.len { break }
+        let out = match lower_stmt(cur, body[i]) { LowerStmtOut as x => x; error as err => return err }
+        cur = out.ctx
+        if out.terminated { return LowerMainTail { ctx = cur; has_value = false; vreg = 0 } }
+        i++
+    }
+    lower_main_tail_stmt(cur, body[body.len - 1])
+}
+
+/**
+ * lower_main_tail_stmt — the loose top-level statement list's LAST statement:
+ * a non-void expression-statement's value IS the program's exit code
+ * (`lower_main_tail_expr`); every other statement kind lowers plainly, with
+ * no exit-code value (`lower_main_tail_other`) (#423, #382).
+ *
+ * @param LowerCtx ctx  the lowering context
+ * @param checker::TStatement s  the last loose top-level statement
+ * @return LowerMainTail | error  the advanced context, plus whether `s`
+ *                                supplied a trailing exit-code value
+ */
+fn lower_main_tail_stmt(ctx: LowerCtx, s: checker::TStatement) -> LowerMainTail | error {
+    match s {
+        checker::TExprStmt as es => lower_main_tail_expr(ctx, es)
+        _ => lower_main_tail_other(ctx, s)
+    }
+}
+
+/**
+ * lower_main_tail_expr — the loose top-level statement list's last statement,
+ * when it is an expression-statement: a VOID-typed expression (a diverging
+ * builtin call, or any other void call) lowers plainly with no exit-code
+ * value; a non-void expression's VReg IS the program's exit code (#423,
+ * #382).
+ *
+ * @param LowerCtx ctx  the lowering context
+ * @param checker::TExprStmt es  the trailing expression-statement
+ * @return LowerMainTail | error  the advanced context, plus `es`'s VReg when
+ *                                its type is non-void
+ */
+fn lower_main_tail_expr(ctx: LowerCtx, es: checker::TExprStmt) -> LowerMainTail | error {
+    if ltype_is_void(ltype_of(es.expr.type)) {
+        let out = match lower_expr_stmt(ctx, es) { LowerStmtOut as x => x; error as err => return err }
+        return LowerMainTail { ctx = out.ctx; has_value = false; vreg = 0 }
+    }
+    let lo = match lower_expr(ctx, es.expr) { Lowered as x => x; error as err => return err }
+    LowerMainTail { ctx = lo.ctx; has_value = true; vreg = lo.vreg }
+}
+
+/**
+ * lower_main_tail_other — the loose top-level statement list's last
+ * statement, when it is anything but an expression-statement (a binding,
+ * loop, defer, …): lowers plainly, with no exit-code value (#423, #382).
+ *
+ * @param LowerCtx ctx  the lowering context
+ * @param checker::TStatement s  the trailing non-expression statement
+ * @return LowerMainTail | error  the advanced context; never an exit-code
+ *                                value
+ */
+fn lower_main_tail_other(ctx: LowerCtx, s: checker::TStatement) -> LowerMainTail | error {
+    let out = match lower_stmt(ctx, s) { LowerStmtOut as x => x; error as err => return err }
+    LowerMainTail { ctx = out.ctx; has_value = false; vreg = 0 }
+}
+
+/**
+ * close_virtual_main — fire any still-pending top-level defer (from index 0,
+ * LIFO, A1-2, #382) and, when the body did not already terminate, append
+ * either `ret %v` (`tail.vreg`, when the loose top-level statements' trailing
+ * expression supplied one, #423) or `%r = const 0; ret %r` (no trailing
+ * value).
+ *
+ * @param LowerMainTail tail  the lowered loose top-level statements' outcome
  * @return LowerCtx | error  the closed context, or a NAMED internal error
  *                           when a pending defer fails to lower
  */
-fn close_virtual_main(ctx: LowerCtx) -> LowerCtx | error {
-    if block_terminated(ctx.func, ctx.block_id) { return ctx }
-    let replayed = match replay_defers(ctx, 0) { LowerCtx as c => c; error as err => return err }
+fn close_virtual_main(tail: LowerMainTail) -> LowerCtx | error {
+    if block_terminated(tail.ctx.func, tail.ctx.block_id) { return tail.ctx }
+    let replayed = match replay_defers(tail.ctx, 0) { LowerCtx as c => c; error as err => return err }
+    if tail.has_value { return ctx_append(replayed, ret_inst(tail.vreg, 0, 0)) }
     let r = ctx_alloc(replayed)
     let c0 = ctx_append(r.ctx, const_int_inst(r.vreg, 0 to i128, 0, 0))
     ctx_append(c0, ret_inst(r.vreg, 0, 0))
