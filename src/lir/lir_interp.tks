@@ -90,6 +90,64 @@ fn rf_get(rf: RegFile, r: u32) -> RFRead {
     RFRead { ok = true; value = rf.values[i] }
 }
 
+/** MemStore — the interpreter's WHOLE-RUN memory (A1-3, #382, §5.1): a growable list of
+    i128 CELLS, one cell per byte-granular address (an address IS a cell index — the
+    interp is an exit-code ORACLE, not a byte-accurate layout verifier; the real byte
+    layout is validated later by the C-vs-own differential, A4). `next` is the bump
+    cursor an `alloca` advances. */
+pub type MemStore = struct { cells: []i128; next: u32 }
+
+/** empty_memstore — an empty memory (the interpreter run's seed). */
+fn empty_memstore() -> MemStore { MemStore { cells = teko::list::empty(); next = 0 } }
+
+/** MemAlloc — the outcome of reserving `bytes` fresh cells: the advanced memory + the
+    base address (the FIRST reserved cell's index). */
+pub type MemAlloc = struct { mem: MemStore; addr: i128 }
+
+/** mem_alloc — reserve `bytes` fresh zero-valued cells at the bump cursor, returning the
+    base address (a cell index) the caller stores/loads through via LFieldAddr offsets. */
+fn mem_alloc(m: MemStore, bytes: u32) -> MemAlloc {
+    let base = m.next
+    mut cells = m.cells
+    mut i: u32 = 0
+    loop {
+        if i >= bytes { break }
+        cells = teko::list::push(cells, 0 to i128)
+        i++
+    }
+    MemAlloc { mem = MemStore { cells = cells; next = m.next + bytes }; addr = base to i128 }
+}
+
+/** MemRead — a memory read: whether `addr` was a valid (in-bounds, non-negative) cell +
+    its value. */
+pub type MemRead = struct { ok: bool; value: i128 }
+
+/** mem_load — read the cell at `addr`; ok=false for a negative or out-of-bounds address. */
+fn mem_load(m: MemStore, addr: i128) -> MemRead {
+    if addr < (0 to i128) { return MemRead { ok = false; value = 0 to i128 } }
+    let idx = addr to u64
+    if idx >= m.cells.len { return MemRead { ok = false; value = 0 to i128 } }
+    MemRead { ok = true; value = m.cells[idx] }
+}
+
+/** mem_store — write `value` into the cell at `addr`, returning the updated memory
+    (functional; a fresh cell list with the one slot rewritten — mirrors rf_set). A
+    negative or out-of-bounds address is an internal error (the lowering never emits one
+    that outruns its own alloca). */
+fn mem_store(m: MemStore, addr: i128, value: i128) -> MemStore | error {
+    if addr < (0 to i128) { return error { message = "lir interp: store to a negative address (internal)" } }
+    let idx = addr to u64
+    if idx >= m.cells.len { return error { message = "lir interp: store to an out-of-bounds address (internal)" } }
+    mut cells: []i128 = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= m.cells.len { break }
+        cells = teko::list::push(cells, if i == idx { value } else { m.cells[i] })
+        i++
+    }
+    MemStore { cells = cells; next = m.next }
+}
+
 /** interp_lmodule — run the function named `entry` in `m` with `args`, returning the exit
     code the program would produce: an explicit `tk_exit(n)` yields n; a plain `ret v` from
     the entry yields v; an out-of-subset op or a missing function yields a NEGATIVE sentinel
@@ -97,9 +155,9 @@ fn rf_get(rf: RegFile, r: u32) -> RFRead {
 pub fn interp_lmodule(m: LModule, entry: str, args: []i128) -> i128 {
     let f = find_lfunc(m, entry)
     if !f.found { return -1 to i128 }
-    let r = interp_call(m, f.func, args, 0)
-    if is_exit(r) { return r.value }
-    if is_return(r) { return r.value }
+    let r = interp_call(m, f.func, args, 0, empty_memstore())
+    if is_exit(r.result) { return r.result.value }
+    if is_return(r.result) { return r.result.value }
     -1 to i128
 }
 
@@ -122,12 +180,18 @@ fn empty_lfunc() -> LFunc {
     new_func("", 0, teko::list::empty(), LType::Void)
 }
 
+/** MemStep — a call's outcome: the resulting IResult + the memory it leaves behind (A1-3,
+    #382 — memory is WHOLE-RUN state, so mutations a callee makes through a pointer arg must
+    flow back into the caller; the callee's own register file, unlike its memory effects,
+    is private and not surfaced). */
+pub type MemStep = struct { result: IResult; mem: MemStore }
+
 /** interp_call — execute `f` with argument values `args`, at recursion `depth` (a guard
-    against a runaway self-call). Materializes the params into VRegs 0..n_params, then runs
-    the function's blocks starting at #B0 (interp_blocks follows jumps/branches to their
-    targets). */
-fn interp_call(m: LModule, f: LFunc, args: []i128, depth: u32) -> IResult {
-    if depth > 4096 { return ires_error("lir interp: call depth exceeded (runaway recursion?)") }
+    against a runaway self-call), threading `mem` (the whole-run memory) in and back out.
+    Materializes the params into VRegs 0..n_params, then runs the function's blocks starting
+    at #B0 (interp_blocks follows jumps/branches to their targets). */
+fn interp_call(m: LModule, f: LFunc, args: []i128, depth: u32, mem: MemStore) -> MemStep {
+    if depth > 4096 { return MemStep { result = ires_error("lir interp: call depth exceeded (runaway recursion?)"); mem = mem } }
     mut rf = new_regfile(f.next_vreg)
     mut i: u64 = 0
     loop {
@@ -136,8 +200,9 @@ fn interp_call(m: LModule, f: LFunc, args: []i128, depth: u32) -> IResult {
         rf = rf_set(rf, i to u32, a)
         i++
     }
-    if f.blocks.len == 0 { return ires_error("lir interp: function has no block") }
-    interp_blocks(m, f, 0, rf, depth)
+    if f.blocks.len == 0 { return MemStep { result = ires_error("lir interp: function has no block"); mem = mem } }
+    let step = interp_blocks(m, f, 0, rf, depth, mem)
+    MemStep { result = step.result; mem = step.mem }
 }
 
 /** LBlockHit — a block lookup result within one function. */
@@ -192,114 +257,160 @@ fn block_step_budget() -> u32 { 200000 }
 /** interp_blocks — run block `entry` in `f`, following LJump/LBranch to their targets
     (interp_block yields a GOTO outcome; this loop chases it) until a terminal outcome
     (`ret`, an exit unwind, or an error) leaves the function. `steps` is bounded by
-    block_step_budget (a cycle guard, mirroring interp_call's recursion-depth guard). */
-fn interp_blocks(m: LModule, f: LFunc, entry: u32, rf0: RegFile, depth: u32) -> IResult {
+    block_step_budget (a cycle guard, mirroring interp_call's recursion-depth guard). `mem`
+    (the whole-run memory, A1-3) threads through every block transition. */
+fn interp_blocks(m: LModule, f: LFunc, entry: u32, rf0: RegFile, depth: u32, mem0: MemStore) -> IStep {
     mut rf = rf0
+    mut mem = mem0
     mut cur = entry
     mut steps: u32 = 0
     loop {
-        if steps > block_step_budget() { return ires_error("lir interp: block-step budget exceeded (possible infinite loop)") }
+        if steps > block_step_budget() { return istep_stop(ires_error("lir interp: block-step budget exceeded (possible infinite loop)"), rf, mem) }
         let hit = find_lblock(f, cur)
-        if !hit.found { return ires_error("lir interp: jump/branch to an unknown block (internal)") }
-        let step = interp_block(m, f, hit.block, rf, depth)
-        if is_goto(step.result) { rf = step.rf; cur = step.result.value to u32; steps = steps + 1 } else { return step.result }
+        if !hit.found { return istep_stop(ires_error("lir interp: jump/branch to an unknown block (internal)"), rf, mem) }
+        let step = interp_block(m, f, hit.block, rf, depth, mem)
+        if is_goto(step.result) { rf = step.rf; mem = step.mem; cur = step.result.value to u32; steps = steps + 1 } else { return step }
     }
 }
 
-/** interp_block — run a block's instructions in order. A `const`/`bin`/`un`/`param`/`call`
-    advances within the block; `ret` unwinds the call (a terminal IResult); `jump`/`branch`
-    bind their block-args into the target's params and yield a GOTO outcome the caller
-    (interp_blocks) follows — the multi-block executor, not this function, loops across
-    blocks. A block that falls off its instruction stream without a terminator is an
+/** interp_block — run a block's instructions in order. A `const`/`bin`/`un`/`param`/`call`/
+    memory op advances within the block; `ret` unwinds the call (a terminal IResult);
+    `jump`/`branch` bind their block-args into the target's params and yield a GOTO outcome
+    the caller (interp_blocks) follows — the multi-block executor, not this function, loops
+    across blocks. A block that falls off its instruction stream without a terminator is an
     internal error (the lowering never produces one). */
-fn interp_block(m: LModule, f: LFunc, b: LBlock, rf0: RegFile, depth: u32) -> IStep {
+fn interp_block(m: LModule, f: LFunc, b: LBlock, rf0: RegFile, depth: u32, mem0: MemStore) -> IStep {
     mut rf = rf0
+    mut mem = mem0
     mut i: u64 = 0
     loop {
         if i >= b.insts.len { break }
         let inst = b.insts[i]
         match inst.op {
-            LJump as j => return interp_jump(f, j, rf)
-            LBranch as br => return interp_branch(f, br, rf)
+            LJump as j => return interp_jump(f, j, rf, mem)
+            LBranch as br => return interp_branch(f, br, rf, mem)
             _ => {
-                let step = interp_inst(m, f, inst, rf, depth)
+                let step = interp_inst(m, f, inst, rf, depth, mem)
                 if !is_continue(step.result) { return step }
                 rf = step.rf
+                mem = step.mem
             }
         }
         i++
     }
-    istep_stop(ires_error("lir interp: block fell through without a terminator"), rf)
+    istep_stop(ires_error("lir interp: block fell through without a terminator"), rf, mem)
 }
 
 /** interp_jump — an unconditional jump: bind its block-args into the target's params, then
     yield a GOTO to that target. */
-fn interp_jump(f: LFunc, j: LJump, rf: RegFile) -> IStep {
+fn interp_jump(f: LFunc, j: LJump, rf: RegFile, mem: MemStore) -> IStep {
     match bind_block_args(f, j.target, rf, j.args) {
-        RegFile as rf2 => istep_goto(j.target, rf2)
-        error as e => istep_stop(ires_error(e.message), rf)
+        RegFile as rf2 => istep_goto(j.target, rf2, mem)
+        error as e => istep_stop(ires_error(e.message), rf, mem)
     }
 }
 
 /** interp_branch — a conditional branch: the cond VReg picks the true/false edge (any
     nonzero value is true, matching the C backend's bool carrier), binds that edge's
     block-args into its target's params, and yields a GOTO to it. */
-fn interp_branch(f: LFunc, br: LBranch, rf: RegFile) -> IStep {
+fn interp_branch(f: LFunc, br: LBranch, rf: RegFile, mem: MemStore) -> IStep {
     let c = rf_get(rf, br.cond)
-    if !c.ok { return istep_stop(ires_error("lir interp: branch on an undefined VReg"), rf) }
+    if !c.ok { return istep_stop(ires_error("lir interp: branch on an undefined VReg"), rf, mem) }
     let taken = c.value != (0 to i128)
     let target = if taken { br.t_target } else { br.f_target }
     let args = if taken { br.t_args } else { br.f_args }
     match bind_block_args(f, target, rf, args) {
-        RegFile as rf2 => istep_goto(target, rf2)
-        error as e => istep_stop(ires_error(e.message), rf)
+        RegFile as rf2 => istep_goto(target, rf2, mem)
+        error as e => istep_stop(ires_error(e.message), rf, mem)
     }
 }
 
-/** IStep — one instruction's effect: an IResult (value/exit/error) + the register file it
-    leaves. A terminator (ret) returns an exit/value result the block propagates. */
-pub type IStep = struct { result: IResult; rf: RegFile }
+/** IStep — one instruction's effect: an IResult (value/exit/error) + the register file and
+    the memory (A1-3, #382) it leaves. A terminator (ret) returns an exit/value result the
+    block propagates. */
+pub type IStep = struct { result: IResult; rf: RegFile; mem: MemStore }
 
-/** istep_cont — a non-terminator step: continue with the updated register file (the result
-    is a CONTINUE placeholder the block loop advances past). */
-fn istep_cont(rf: RegFile) -> IStep { IStep { result = ires_continue(); rf = rf } }
+/** istep_cont — a non-terminator step: continue with the updated register file/memory (the
+    result is a CONTINUE placeholder the block loop advances past). */
+fn istep_cont(rf: RegFile, mem: MemStore) -> IStep { IStep { result = ires_continue(); rf = rf; mem = mem } }
 
 /** istep_stop — a terminator/exit/error step: propagate `r` (the block returns it). */
-fn istep_stop(r: IResult, rf: RegFile) -> IStep { IStep { result = r; rf = rf } }
+fn istep_stop(r: IResult, rf: RegFile, mem: MemStore) -> IStep { IStep { result = r; rf = rf; mem = mem } }
 
 /** istep_goto — a jump/branch's effect: continue at its target block (interp_blocks reads
-    `result`'s target id and carries `rf` forward). */
-fn istep_goto(target: u32, rf: RegFile) -> IStep { IStep { result = ires_goto(target); rf = rf } }
+    `result`'s target id and carries `rf`/`mem` forward). */
+fn istep_goto(target: u32, rf: RegFile, mem: MemStore) -> IStep { IStep { result = ires_goto(target); rf = rf; mem = mem } }
 
 /** interp_inst — execute one instruction: define its result VReg (for value ops) or
     propagate a terminator/exit. LJump/LBranch are intercepted by interp_block BEFORE
     reaching here — their arms below are unreachable, kept only so this match stays
     exhaustive over LOp. */
-fn interp_inst(m: LModule, f: LFunc, inst: LInst, rf: RegFile, depth: u32) -> IStep {
+fn interp_inst(m: LModule, f: LFunc, inst: LInst, rf: RegFile, depth: u32, mem: MemStore) -> IStep {
     match inst.op {
-        LConstInt as c => interp_def(rf, inst, c.val)
-        LConstFloat => istep_stop(ires_error("lir interp: float ops are out of the N1 run subset"), rf)
-        LBin as b => interp_bin(rf, inst, b)
-        LUn as u => interp_un(rf, inst, u)
-        LParam => istep_cont(rf)
-        LCall as c => interp_call_inst(m, f, inst, c, rf, depth)
-        LRet as r => interp_ret(rf, r)
-        LJump => istep_stop(ires_error("lir interp: internal — LJump must be intercepted by interp_block"), rf)
-        LBranch => istep_stop(ires_error("lir interp: internal — LBranch must be intercepted by interp_block"), rf)
+        LConstInt as c => interp_def(rf, inst, c.val, mem)
+        LConstFloat => istep_stop(ires_error("lir interp: float ops are out of the N1 run subset"), rf, mem)
+        LBin as b => interp_bin(rf, inst, b, mem)
+        LUn as u => interp_un(rf, inst, u, mem)
+        LParam => istep_cont(rf, mem)
+        LCall as c => interp_call_inst(m, f, inst, c, rf, depth, mem)
+        LRet as r => interp_ret(rf, r, mem)
+        LAlloca as a => interp_alloca(rf, inst, a, mem)
+        LFieldAddr as fa => interp_field_addr(rf, inst, fa, mem)
+        LLoad as ld => interp_load(rf, inst, ld, mem)
+        LStore as st => interp_store(rf, st, mem)
+        LJump => istep_stop(ires_error("lir interp: internal — LJump must be intercepted by interp_block"), rf, mem)
+        LBranch => istep_stop(ires_error("lir interp: internal — LBranch must be intercepted by interp_block"), rf, mem)
     }
 }
 
 /** interp_def — store `v` into the instruction's result VReg and continue. */
-fn interp_def(rf: RegFile, inst: LInst, v: i128) -> IStep {
-    istep_cont(rf_set(rf, inst.result, v))
+fn interp_def(rf: RegFile, inst: LInst, v: i128, mem: MemStore) -> IStep {
+    istep_cont(rf_set(rf, inst.result, v), mem)
 }
 
 /** interp_ret — a `ret %v` (or `ret`): unwind with the returned value (0 for a void ret). */
-fn interp_ret(rf: RegFile, r: LRet) -> IStep {
-    if !r.has_value { return istep_stop(ires_return(0 to i128), rf) }
+fn interp_ret(rf: RegFile, r: LRet, mem: MemStore) -> IStep {
+    if !r.has_value { return istep_stop(ires_return(0 to i128), rf, mem) }
     let v = rf_get(rf, r.value)
-    if !v.ok { return istep_stop(ires_error("lir interp: ret of an undefined VReg"), rf) }
-    istep_stop(ires_return(v.value), rf)
+    if !v.ok { return istep_stop(ires_error("lir interp: ret of an undefined VReg"), rf, mem) }
+    istep_stop(ires_return(v.value), rf, mem)
+}
+
+/** interp_alloca — reserve `a.bytes` fresh cells in `mem`, storing the base address into
+    the instruction's result VReg (A1-3, #382). */
+fn interp_alloca(rf: RegFile, inst: LInst, a: LAlloca, mem: MemStore) -> IStep {
+    let al = mem_alloc(mem, a.bytes)
+    istep_cont(rf_set(rf, inst.result, al.addr), al.mem)
+}
+
+/** interp_field_addr — the address `fa.offset` bytes past the CURRENT value of `fa.base`
+    (a cell index), stored into the result VReg (A1-3, #382). */
+fn interp_field_addr(rf: RegFile, inst: LInst, fa: LFieldAddr, mem: MemStore) -> IStep {
+    let b = rf_get(rf, fa.base)
+    if !b.ok { return istep_stop(ires_error("lir interp: field_addr on an undefined VReg"), rf, mem) }
+    istep_cont(rf_set(rf, inst.result, b.value + (fa.offset to i128)), mem)
+}
+
+/** interp_load — read the cell at the address held in `ld.addr`, storing it into the
+    result VReg (A1-3, #382). An out-of-bounds/undefined address is an internal error. */
+fn interp_load(rf: RegFile, inst: LInst, ld: LLoad, mem: MemStore) -> IStep {
+    let a = rf_get(rf, ld.addr)
+    if !a.ok { return istep_stop(ires_error("lir interp: load from an undefined VReg address"), rf, mem) }
+    let v = mem_load(mem, a.value)
+    if !v.ok { return istep_stop(ires_error("lir interp: load from an out-of-bounds address"), rf, mem) }
+    istep_cont(rf_set(rf, inst.result, v.value), mem)
+}
+
+/** interp_store — write the CURRENT value of `st.value` into the cell at `st.addr`
+    (A1-3, #382); yields no result. */
+fn interp_store(rf: RegFile, st: LStore, mem: MemStore) -> IStep {
+    let a = rf_get(rf, st.addr)
+    let v = rf_get(rf, st.value)
+    if !a.ok || !v.ok { return istep_stop(ires_error("lir interp: store operand is an undefined VReg"), rf, mem) }
+    match mem_store(mem, a.value, v.value) {
+        MemStore as mem2 => istep_cont(rf, mem2)
+        error as e => istep_stop(ires_error(e.message), rf, mem)
+    }
 }
 
 /** EvalOut — the result of an arithmetic evaluation: a computed value, or an error message
@@ -313,13 +424,13 @@ fn eval_err(msg: str) -> EvalOut { EvalOut { ok = false; value = 0 to i128; mess
 
 /** interp_bin — an integer binary op: read both operands, compute, store the result. A
     float op or a divide-by-zero honest-stops (the N1 fixtures never divide by zero). */
-fn interp_bin(rf: RegFile, inst: LInst, b: LBin) -> IStep {
+fn interp_bin(rf: RegFile, inst: LInst, b: LBin, mem: MemStore) -> IStep {
     let a = rf_get(rf, b.a)
     let c = rf_get(rf, b.b)
-    if !a.ok || !c.ok { return istep_stop(ires_error("lir interp: binary op on an undefined VReg"), rf) }
+    if !a.ok || !c.ok { return istep_stop(ires_error("lir interp: binary op on an undefined VReg"), rf, mem) }
     let r = eval_bin(b.op, a.value, c.value)
-    if !r.ok { return istep_stop(ires_error(r.message), rf) }
-    istep_cont(rf_set(rf, inst.result, r.value))
+    if !r.ok { return istep_stop(ires_error(r.message), rf, mem) }
+    istep_cont(rf_set(rf, inst.result, r.value), mem)
 }
 
 /** eval_bin — the arithmetic of an integer LBinOp over the i128 carrier. Signed and
@@ -380,12 +491,12 @@ fn eval_rem(a: i128, b: i128) -> EvalOut {
     interp treats as the identity over the i128 carrier (the fixtures cast between integer
     widths that all fit the carrier; a real narrowing mask is N2 when narrow types run). A
     float negation is out of the run subset. */
-fn interp_un(rf: RegFile, inst: LInst, u: LUn) -> IStep {
+fn interp_un(rf: RegFile, inst: LInst, u: LUn, mem: MemStore) -> IStep {
     let a = rf_get(rf, u.a)
-    if !a.ok { return istep_stop(ires_error("lir interp: unary op on an undefined VReg"), rf) }
+    if !a.ok { return istep_stop(ires_error("lir interp: unary op on an undefined VReg"), rf, mem) }
     let r = eval_un(u.op, a.value)
-    if !r.ok { return istep_stop(ires_error(r.message), rf) }
-    istep_cont(rf_set(rf, inst.result, r.value))
+    if !r.ok { return istep_stop(ires_error(r.message), rf, mem) }
+    istep_cont(rf_set(rf, inst.result, r.value), mem)
 }
 
 /** eval_un — the arithmetic of an integer LUnOp: INeg negates; ZExt/SExt/Trunc are the
@@ -402,25 +513,26 @@ fn eval_un(op: LUnOp, a: i128) -> EvalOut {
 }
 
 /** interp_call_inst — a call: `tk_exit(n)` unwinds with exit code n; a Teko-Teko call
-    (found in the module) recurses; any other runtime symbol honest-stops. */
-fn interp_call_inst(m: LModule, f: LFunc, inst: LInst, c: LCall, rf: RegFile, depth: u32) -> IStep {
+    (found in the module) recurses (its memory effects flow back into `mem`); any other
+    runtime symbol honest-stops. */
+fn interp_call_inst(m: LModule, f: LFunc, inst: LInst, c: LCall, rf: RegFile, depth: u32, mem: MemStore) -> IStep {
     let av = read_args(rf, c.args)
-    if !av.ok { return istep_stop(ires_error("lir interp: call arg is an undefined VReg"), rf) }
-    if c.symbol == "tk_exit" { return interp_exit(av.values, rf) }
+    if !av.ok { return istep_stop(ires_error("lir interp: call arg is an undefined VReg"), rf, mem) }
+    if c.symbol == "tk_exit" { return interp_exit(av.values, rf, mem) }
     let callee = find_lfunc(m, c.symbol)
-    if !callee.found { return istep_stop(ires_error(teko::str::concat("lir interp: unknown call target @", c.symbol)), rf) }
-    let r = interp_call(m, callee.func, av.values, depth + 1)
-    if is_exit(r) { return istep_stop(r, rf) }
-    if is_ierror(r) { return istep_stop(r, rf) }
-    if !is_return(r) { return istep_stop(ires_error("lir interp: callee did not return a value"), rf) }
-    if !inst.has_result { return istep_cont(rf) }
-    istep_cont(rf_set(rf, inst.result, r.value))
+    if !callee.found { return istep_stop(ires_error(teko::str::concat("lir interp: unknown call target @", c.symbol)), rf, mem) }
+    let r = interp_call(m, callee.func, av.values, depth + 1, mem)
+    if is_exit(r.result) { return istep_stop(r.result, rf, r.mem) }
+    if is_ierror(r.result) { return istep_stop(r.result, rf, r.mem) }
+    if !is_return(r.result) { return istep_stop(ires_error("lir interp: callee did not return a value"), rf, r.mem) }
+    if !inst.has_result { return istep_cont(rf, r.mem) }
+    istep_cont(rf_set(rf, inst.result, r.result.value), r.mem)
 }
 
 /** interp_exit — `tk_exit(n)`: unwind with exit code n (0 when called with no argument). */
-fn interp_exit(args: []i128, rf: RegFile) -> IStep {
+fn interp_exit(args: []i128, rf: RegFile, mem: MemStore) -> IStep {
     let code = if args.len == 0 { 0 to i128 } else { args[0] }
-    istep_stop(ires_exit(code), rf)
+    istep_stop(ires_exit(code), rf, mem)
 }
 
 /** RFArgs — a resolved argument-value list: whether every VReg was defined + the values. */

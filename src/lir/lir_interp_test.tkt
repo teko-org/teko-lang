@@ -291,3 +291,124 @@ fn iwt_f7_chain_breaks_at_the_second_term_is_false() {
 fn iwt_f7_chain_fails_at_the_first_term_is_false() {
     teko::assert::is_true(interp_lmodule(iwt_chain_lt_exit(5, 2, 3), "main", iwt_no_args()) == iwt_i128(0))
 }
+
+/** iwt_alloc_field — reserve a slot at `base`, store `val` at `offset`, then load it back
+    into a fresh VReg — the shared alloca/field_addr/store/load shape every A1-3 memory
+    fixture below builds on. */
+fn iwt_alloc_field(f0: LFunc, base: u32, offset: u32, val: i64) -> LFunc {
+    mut f = f0
+    let c = alloc_vreg(f)
+    f = c.func
+    f = append_inst(f, 0, const_int_inst(c.vreg, iwt_i128(val), 0, 0))
+    let a = alloc_vreg(f)
+    f = a.func
+    f = append_inst(f, 0, field_addr_inst(a.vreg, base, offset, 0, 0))
+    append_inst(f, 0, store_inst(a.vreg, c.vreg, LType::I64, 0, 0))
+}
+
+/** iwt_load_field — load the value at `base + offset` into a fresh VReg. */
+fn iwt_load_field(f0: LFunc, base: u32, offset: u32) -> FreshVReg {
+    let a = alloc_vreg(f0)
+    let f1 = a.func
+    let l = alloc_vreg(f1)
+    let f2 = append_inst(l.func, 0, field_addr_inst(a.vreg, base, offset, 0, 0))
+    FreshVReg { func = append_inst(f2, 0, load_inst(l.vreg, a.vreg, LType::I64, 0, 0)); vreg = l.vreg }
+}
+
+/** iwt_exit_sum — append `exit(a + b)` (a terminal void_call + the ABI's trailing
+    `const 0; ret`) to `f0`. */
+fn iwt_exit_sum(f0: LFunc, a: u32, b: u32) -> LFunc {
+    let s = alloc_vreg(f0)
+    mut f = s.func
+    f = append_inst(f, 0, bin_inst(s.vreg, LBinOp::IAdd, a, b, 0, 0))
+    let args = teko::list::push(teko::list::empty(), s.vreg)
+    f = append_inst(f, 0, void_call_inst("tk_exit", args, false, 0, 0))
+    let z = alloc_vreg(f)
+    f = z.func
+    f = append_inst(f, 0, const_int_inst(z.vreg, iwt_i128(0), 0, 0))
+    append_inst(f, 0, ret_inst(z.vreg, 0, 0))
+}
+
+/** iwt_struct_point_exit — F10: `let p = Point{x=3;y=4}; exit(p.x + p.y)` as hand-built
+    memory-op LIR: alloca a 16-byte/8-align slot, store both fields, load them back, exit
+    their sum (3+4=7). Proves the interp's cell-store model round-trips a struct write/read. */
+fn iwt_struct_point_exit() -> LModule {
+    mut f = new_func("main", 0, teko::list::empty(), LType::I32)
+    let base = alloc_vreg(f)
+    f = base.func
+    f = append_inst(f, 0, alloca_inst(base.vreg, 16, 8, 0, 0))
+    f = iwt_alloc_field(f, base.vreg, 0, 3)
+    f = iwt_alloc_field(f, base.vreg, 8, 4)
+    let lx = iwt_load_field(f, base.vreg, 0)
+    f = lx.func
+    let ly = iwt_load_field(f, base.vreg, 8)
+    f = ly.func
+    add_func(empty_module(), iwt_exit_sum(f, lx.vreg, ly.vreg))
+}
+
+#test
+fn iwt_f10_struct_field_roundtrip_sums_to_seven() {
+    teko::assert::is_true(interp_lmodule(iwt_struct_point_exit(), "main", iwt_no_args()) == iwt_i128(7))
+}
+
+/** iwt_array_index_exit — F11: `let a = [10,20,30]; exit(a[1])` as hand-built memory-op
+    LIR: alloca a 24-byte/8-align slot, store the three elements at their constant strides,
+    load index 1 (byte offset 8), exit it (20). Proves LFieldAddr's constant-folded index
+    addressing. */
+fn iwt_array_index_exit() -> LModule {
+    mut f = new_func("main", 0, teko::list::empty(), LType::I32)
+    let base = alloc_vreg(f)
+    f = base.func
+    f = append_inst(f, 0, alloca_inst(base.vreg, 24, 8, 0, 0))
+    f = iwt_alloc_field(f, base.vreg, 0, 10)
+    f = iwt_alloc_field(f, base.vreg, 8, 20)
+    f = iwt_alloc_field(f, base.vreg, 16, 30)
+    let r = iwt_load_field(f, base.vreg, 8)
+    f = r.func
+    let args = teko::list::push(teko::list::empty(), r.vreg)
+    f = append_inst(f, 0, void_call_inst("tk_exit", args, false, 0, 0))
+    let z = alloc_vreg(f)
+    f = z.func
+    f = append_inst(f, 0, const_int_inst(z.vreg, iwt_i128(0), 0, 0))
+    f = append_inst(f, 0, ret_inst(z.vreg, 0, 0))
+    add_func(empty_module(), f)
+}
+
+#test
+fn iwt_f11_array_index_reads_the_element() {
+    teko::assert::is_true(interp_lmodule(iwt_array_index_exit(), "main", iwt_no_args()) == iwt_i128(20))
+}
+
+/** iwt_struct_mutate_exit — F12: a field MUTATION via a load/add/store round-trip
+    (`p.x = p.x + 10`), then `exit(p.x + p.y)`: `{x=1,y=2}` mutates x to 11, so the sum
+    exits 13. Proves a STORE is visible to a LATER load through the same address. */
+fn iwt_struct_mutate_exit() -> LModule {
+    mut f = new_func("main", 0, teko::list::empty(), LType::I32)
+    let base = alloc_vreg(f)
+    f = base.func
+    f = append_inst(f, 0, alloca_inst(base.vreg, 16, 8, 0, 0))
+    f = iwt_alloc_field(f, base.vreg, 0, 1)
+    f = iwt_alloc_field(f, base.vreg, 8, 2)
+    let curx = iwt_load_field(f, base.vreg, 0)
+    f = curx.func
+    let ten = alloc_vreg(f)
+    f = ten.func
+    f = append_inst(f, 0, const_int_inst(ten.vreg, iwt_i128(10), 0, 0))
+    let newx = alloc_vreg(f)
+    f = newx.func
+    f = append_inst(f, 0, bin_inst(newx.vreg, LBinOp::IAdd, curx.vreg, ten.vreg, 0, 0))
+    let addr_x = alloc_vreg(f)
+    f = addr_x.func
+    f = append_inst(f, 0, field_addr_inst(addr_x.vreg, base.vreg, 0, 0, 0))
+    f = append_inst(f, 0, store_inst(addr_x.vreg, newx.vreg, LType::I64, 0, 0))
+    let rx = iwt_load_field(f, base.vreg, 0)
+    f = rx.func
+    let ry = iwt_load_field(f, base.vreg, 8)
+    f = ry.func
+    add_func(empty_module(), iwt_exit_sum(f, rx.vreg, ry.vreg))
+}
+
+#test
+fn iwt_f12_field_mutation_is_observed_after_store() {
+    teko::assert::is_true(interp_lmodule(iwt_struct_mutate_exit(), "main", iwt_no_args()) == iwt_i128(13))
+}

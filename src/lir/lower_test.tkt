@@ -86,11 +86,18 @@ fn lwt_fn(name: str, ns: str, params: []parser::Param, ret: checker::Type, body:
     }
 }
 
-/** lwt_lower_expr_text — lower a single expression into a fresh i64 fn body and return its
-    printed LIR (for asserting on the emitted instructions). */
+/** lwt_lower_expr_text — lower a single expression (with no registered struct layouts)
+    into a fresh i64 fn body and return its printed LIR (for asserting on the emitted
+    instructions). */
 fn lwt_lower_expr_text(e: checker::TExpr) -> str {
+    lwt_lower_expr_text_with(e, teko::list::empty())
+}
+
+/** lwt_lower_expr_text_with — lwt_lower_expr_text, but threading a struct-layout table
+    (A1-3, #382) so a TStructInit/TFieldAccess/TIndex fixture can resolve its offsets. */
+fn lwt_lower_expr_text_with(e: checker::TExpr, layouts: []LStructLayout) -> str {
     let f0 = new_func("t", 0, teko::list::empty(), LType::I64)
-    let ctx0 = LowerCtx { func = f0; block_id = 0; env = empty_lenv() }
+    let ctx0 = LowerCtx { func = f0; block_id = 0; env = empty_lenv(); layouts = layouts }
     let lo = match lower_expr(ctx0, e) { Lowered as x => x; error as err => return teko::str::concat("ERR: ", err.message) }
     print_lmodule(add_func(empty_module(), lo.ctx.func))
 }
@@ -360,4 +367,192 @@ fn lwt_honest_stop_on_generic_function() {
     }
     let ok = match lower_function(gf) { LFunc => false; error as e => teko::str::contains(e.message, "generic function not yet lowered") }
     teko::assert::is_true(ok)
+}
+
+/** lwt_point_layout — the LStructLayout of `struct Point { x: i64; y: i64 }` — a flat,
+    two-field, uniform-width aggregate (A1-3, #382 fixtures). */
+fn lwt_point_layout() -> LStructLayout {
+    let names = teko::list::push(teko::list::push(teko::list::empty(), "x"), "y")
+    let types = teko::list::push(teko::list::push(teko::list::empty(), LType::I64), LType::I64)
+    layout_of("Point", names, types)
+}
+
+/** lwt_one_layout — a one-entry layout table (the common case every fixture below needs). */
+fn lwt_one_layout(l: LStructLayout) -> []LStructLayout { teko::list::push(teko::list::empty(), l) }
+
+/** lwt_named_var — a TVar of a NAMED (struct) type — a receiver a field-access/assignment
+    fixture reads/writes through. */
+fn lwt_named_var(name: str, tname: str) -> checker::TExpr {
+    checker::TExpr { kind = checker::TVar { name = name; is_func = false; func_ns = "" }; type = checker::Named { name = tname }; line = 0; col = 0 }
+}
+
+/** lwt_struct_init — a `Name { f0 = v0, … }` node, in declared order. */
+fn lwt_struct_init(tname: str, field_names: []str, field_vals: []checker::TExpr) -> checker::TExpr {
+    checker::TExpr { kind = checker::TStructInit { field_names = field_names; field_vals = field_vals }; type = checker::Named { name = tname }; line = 0; col = 0 }
+}
+
+/** lwt_field_access — a `recv.field` node of resolved type `ft`. */
+fn lwt_field_access(recv: checker::TExpr, field: str, ft: checker::Type) -> checker::TExpr {
+    checker::TExpr { kind = checker::TFieldAccess { receiver = recv; field = field }; type = ft; line = 0; col = 0 }
+}
+
+#test
+fn lwt_lowers_struct_init_via_registered_layout() {
+    let names = teko::list::push(teko::list::push(teko::list::empty(), "x"), "y")
+    let vals = teko::list::push(teko::list::push(teko::list::empty(), lwt_num_i64(3 to i128)), lwt_num_i64(4 to i128))
+    let si = lwt_struct_init("Point", names, vals)
+    let text = lwt_lower_expr_text_with(si, lwt_one_layout(lwt_point_layout()))
+    teko::assert::str_contains(text, "%0 = alloca 16, align 8")
+    teko::assert::str_contains(text, "%2 = field_addr %0, 0")
+    teko::assert::str_contains(text, "store.i64 %2, %1")
+    teko::assert::str_contains(text, "%4 = field_addr %0, 8")
+    teko::assert::str_contains(text, "store.i64 %4, %3")
+}
+
+#test
+fn lwt_lowers_field_access_via_registered_layout() {
+    let p = lwt_named_var("p", "Point")
+    let fa = lwt_field_access(p, "y", lwt_prim(checker::PrimKind::I64))
+    let params = teko::list::push(teko::list::empty(), lwt_param("p", "Point"))
+    let body = teko::list::push(teko::list::empty(), lwt_ret(fa))
+    let f = lwt_fn("read_y", "teko::demo", params, checker::Prim { kind = checker::PrimKind::I64 }, body)
+    let lf = match lower_function(f, lwt_one_layout(lwt_point_layout())) { LFunc as x => x; error as err => return }
+    let text = print_lmodule(add_func(empty_module(), lf))
+    teko::assert::str_contains(text, "%1 = field_addr %0, 8")
+    teko::assert::str_contains(text, "%2 = load.i64 %1")
+    teko::assert::str_contains(text, "ret %2")
+}
+
+/** lwt_array_elem — a non-spread array element. */
+fn lwt_array_elem(e: checker::TExpr) -> checker::TArrayElem { checker::TArrayElem { is_spread = false; expr = e } }
+
+/** lwt_array_lit — `[e0, e1, …]`, each element of PrimKind `k`. */
+fn lwt_array_lit(elems: []checker::TExpr, k: checker::PrimKind) -> checker::TExpr {
+    mut es: []checker::TArrayElem = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= elems.len { break }
+        es = teko::list::push(es, lwt_array_elem(elems[i]))
+        i++
+    }
+    checker::TExpr { kind = checker::TArrayLit { elements = es }; type = checker::Slice { element = lwt_prim(k) }; line = 0; col = 0 }
+}
+
+/** lwt_index — `recv[index]` of resolved element type `et`. */
+fn lwt_index(recv: checker::TExpr, index: checker::TExpr, et: checker::Type) -> checker::TExpr {
+    checker::TExpr { kind = checker::TIndex { receiver = recv; index = index }; type = et; line = 0; col = 0 }
+}
+
+#test
+fn lwt_lowers_array_literal_and_constant_index() {
+    let elems = teko::list::push(teko::list::push(teko::list::push(teko::list::empty(), lwt_num_i64(10 to i128)), lwt_num_i64(20 to i128)), lwt_num_i64(30 to i128))
+    let arr = lwt_array_lit(elems, checker::PrimKind::I64)
+    let ix = lwt_index(arr, lwt_num_i64(1 to i128), lwt_prim(checker::PrimKind::I64))
+    let text = lwt_lower_expr_text(ix)
+    teko::assert::str_contains(text, "%0 = alloca 24, align 8")
+    teko::assert::str_contains(text, "%4 = field_addr %0, 8")
+    teko::assert::str_contains(text, "store.i64 %4, %3")
+    teko::assert::str_contains(text, "%7 = field_addr %0, 8")
+    teko::assert::str_contains(text, "%8 = load.i64 %7")
+}
+
+/** lwt_field_assign — `recv.field op= value`, a Field-kind TAssign whose target is the
+    typed field-access LHS (mirrors the checker's typer.tks shape). */
+fn lwt_field_assign(recv: checker::TExpr, field: str, op: lexer::TokenKind, value: checker::TExpr, bound: checker::Type) -> checker::TStatement {
+    let target = lwt_field_access(recv, field, bound)
+    checker::TAssign { kind = parser::AssignKind::Field; name = ""; op = op; bound = bound; value = value; deref = false; target = target }
+}
+
+#test
+fn lwt_lowers_plain_field_assignment_via_registered_layout() {
+    let p = lwt_named_var("p", "Point")
+    let assign = lwt_field_assign(p, "x", lexer::TokenKind::Assign, lwt_num_i64(9 to i128), lwt_prim(checker::PrimKind::I64))
+    let params = teko::list::push(teko::list::empty(), lwt_param("p", "Point"))
+    let body = teko::list::push(teko::list::push(teko::list::empty(), assign), lwt_ret(lwt_num_i64(0 to i128)))
+    let f = lwt_fn("write_x", "teko::demo", params, checker::Prim { kind = checker::PrimKind::I64 }, body)
+    let lf = match lower_function(f, lwt_one_layout(lwt_point_layout())) { LFunc as x => x; error as err => return }
+    let text = print_lmodule(add_func(empty_module(), lf))
+    teko::assert::str_contains(text, "%1 = field_addr %0, 0")
+    teko::assert::str_contains(text, "%2 = const 9")
+    teko::assert::str_contains(text, "store.i64 %1, %2")
+}
+
+#test
+fn lwt_lowers_compound_field_assignment_reads_then_writes() {
+    let p = lwt_named_var("p", "Point")
+    let assign = lwt_field_assign(p, "x", lexer::TokenKind::PlusEq, lwt_num_i64(5 to i128), lwt_prim(checker::PrimKind::I64))
+    let params = teko::list::push(teko::list::empty(), lwt_param("p", "Point"))
+    let body = teko::list::push(teko::list::push(teko::list::empty(), assign), lwt_ret(lwt_num_i64(0 to i128)))
+    let f = lwt_fn("bump_x", "teko::demo", params, checker::Prim { kind = checker::PrimKind::I64 }, body)
+    let lf = match lower_function(f, lwt_one_layout(lwt_point_layout())) { LFunc as x => x; error as err => return }
+    let text = print_lmodule(add_func(empty_module(), lf))
+    teko::assert::str_contains(text, "%2 = load.i64 %1")
+    teko::assert::str_contains(text, "%4 = iadd %2, %3")
+    teko::assert::str_contains(text, "store.i64 %1, %4")
+}
+
+#test
+fn lwt_lowers_simple_assignment_rebinds_the_env() {
+    mut items: []checker::TItem = teko::list::empty()
+    items = teko::list::push(items, lwt_item(lwt_bind("x", lwt_num_i64(1 to i128), checker::PrimKind::I64)))
+    let assign = checker::TAssign { kind = parser::AssignKind::Simple; name = "x"; op = lexer::TokenKind::Assign; bound = lwt_prim(checker::PrimKind::I64); value = lwt_num_i64(9 to i128); deref = false; target = checker::no_texpr() }
+    items = teko::list::push(items, lwt_item(assign))
+    items = teko::list::push(items, lwt_item(lwt_exprstmt(lwt_call(lwt_path1("exit"), "", teko::list::push(teko::list::empty(), lwt_var("x", checker::PrimKind::I64)), checker::Void { }))))
+    let prog = checker::TProgram { items = items }
+    let m = match lower_program(prog) { LModule as x => x; error as err => return }
+    let text = print_lmodule(m)
+    teko::assert::str_contains(text, "%1 = const 9")
+    teko::assert::str_contains(text, "call @tk_exit(%1)")
+}
+
+#test
+fn lwt_lowers_compound_simple_assignment_reads_then_rebinds() {
+    mut items: []checker::TItem = teko::list::empty()
+    items = teko::list::push(items, lwt_item(lwt_bind("x", lwt_num_i64(4 to i128), checker::PrimKind::I64)))
+    let assign = checker::TAssign { kind = parser::AssignKind::Simple; name = "x"; op = lexer::TokenKind::StarEq; bound = lwt_prim(checker::PrimKind::I64); value = lwt_num_i64(3 to i128); deref = false; target = checker::no_texpr() }
+    items = teko::list::push(items, lwt_item(assign))
+    items = teko::list::push(items, lwt_item(lwt_exprstmt(lwt_call(lwt_path1("exit"), "", teko::list::push(teko::list::empty(), lwt_var("x", checker::PrimKind::I64)), checker::Void { }))))
+    let prog = checker::TProgram { items = items }
+    let m = match lower_program(prog) { LModule as x => x; error as err => return }
+    let text = print_lmodule(m)
+    teko::assert::str_contains(text, "%2 = imul %0, %1")
+    teko::assert::str_contains(text, "call @tk_exit(%2)")
+}
+
+#test
+fn lwt_lowers_byte_literal() {
+    let bl = checker::TExpr { kind = checker::TByteLit { value = 200 to byte }; type = checker::Byte { }; line = 0; col = 0 }
+    teko::assert::str_contains(lwt_lower_expr_text(bl), "%0 = const 200")
+}
+
+#test
+fn lwt_lowers_bool_literal_true_and_false() {
+    let bt = checker::TExpr { kind = checker::TBoolLit { value = true }; type = lwt_prim(checker::PrimKind::Bool); line = 0; col = 0 }
+    teko::assert::str_contains(lwt_lower_expr_text(bt), "%0 = const 1")
+    let bf = checker::TExpr { kind = checker::TBoolLit { value = false }; type = lwt_prim(checker::PrimKind::Bool); line = 0; col = 0 }
+    teko::assert::str_contains(lwt_lower_expr_text(bf), "%0 = const 0")
+}
+
+#test
+fn lwt_lowers_null_literal_as_a_zero_ptr_const() {
+    let nl = checker::TExpr { kind = checker::TNullLit { }; type = checker::Optional { inner = lwt_prim(checker::PrimKind::I64) }; line = 0; col = 0 }
+    teko::assert::str_contains(lwt_lower_expr_text(nl), "%0 = const 0")
+}
+
+#test
+fn lwt_lowers_path_expr_to_its_resolved_value() {
+    let pe = checker::TExpr { kind = checker::TPathExpr { enum_name = "Color"; member = "Green"; ordinal = 1; value = 1 to u128 }; type = checker::Named { name = "Color" }; line = 0; col = 0 }
+    teko::assert::str_contains(lwt_lower_expr_text(pe), "%0 = const 1")
+}
+
+#test
+fn lwt_lowers_char_literal_ascii_to_its_codepoint() {
+    let cl = checker::TExpr { kind = checker::TCharLit { bytes = "A" }; type = checker::Char { }; line = 0; col = 0 }
+    teko::assert::str_contains(lwt_lower_expr_text(cl), "%0 = const 65")
+}
+
+#test
+fn lwt_lowers_char_literal_multibyte_to_its_codepoint() {
+    let cl = checker::TExpr { kind = checker::TCharLit { bytes = "é" }; type = checker::Char { }; line = 0; col = 0 }
+    teko::assert::str_contains(lwt_lower_expr_text(cl), "%0 = const 233")
 }

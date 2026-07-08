@@ -263,8 +263,10 @@ fn is_c_keyword(s: str) -> bool {
 
 /** LowerCtx — the lowering state threaded through the expr/stmt walk: the current LFunc
     being built + the id of the block instructions append to (N1 always block 0) + the
-    local env (name -> VReg) so a TVar resolves to its already-lowered value. */
-pub type LowerCtx = struct { func: LFunc; block_id: u32; env: LEnv }
+    local env (name -> VReg) so a TVar resolves to its already-lowered value + the
+    struct-layout table (A1-3, #382 — read-only for the whole lowering of a program, so
+    every copy just carries the SAME slice forward). */
+pub type LowerCtx = struct { func: LFunc; block_id: u32; env: LEnv; layouts: []LStructLayout }
 
 /** Lowered — the result of lowering an expression: the updated context + the VReg the
     value lives in. */
@@ -275,21 +277,29 @@ pub type Lowered = struct { ctx: LowerCtx; vreg: u32 }
     caller stops emitting into a closed block. */
 pub type LowerStmtOut = struct { ctx: LowerCtx; terminated: bool }
 
+/** ctx_with — a copy of `ctx` with a new func/block_id/env, carrying its (unchanged)
+    layouts table forward. Centralizes the one field every LowerCtx rebuild must not
+    forget, so a future field addition (A1-2's loop/defer stacks, …) touches this ONE
+    function instead of every construction site. */
+fn ctx_with(ctx: LowerCtx, func: LFunc, block_id: u32, env: LEnv) -> LowerCtx {
+    LowerCtx { func = func; block_id = block_id; env = env; layouts = ctx.layouts }
+}
+
 /** ctx_alloc — reserve a fresh VReg in the current function, returning it + the advanced
     context. Centralizes the alloc-then-use pattern every value-producing node repeats. */
 fn ctx_alloc(ctx: LowerCtx) -> Lowered {
     let fresh = alloc_vreg(ctx.func)
-    Lowered { ctx = LowerCtx { func = fresh.func; block_id = ctx.block_id; env = ctx.env }; vreg = fresh.vreg }
+    Lowered { ctx = ctx_with(ctx, fresh.func, ctx.block_id, ctx.env); vreg = fresh.vreg }
 }
 
 /** ctx_append — append `inst` to the current block, returning the updated context. */
 fn ctx_append(ctx: LowerCtx, inst: LInst) -> LowerCtx {
-    LowerCtx { func = append_inst(ctx.func, ctx.block_id, inst); block_id = ctx.block_id; env = ctx.env }
+    ctx_with(ctx, append_inst(ctx.func, ctx.block_id, inst), ctx.block_id, ctx.env)
 }
 
 /** ctx_bind — extend the context's local env with (name -> vreg). */
 fn ctx_bind(ctx: LowerCtx, name: str, vreg: u32) -> LowerCtx {
-    LowerCtx { func = ctx.func; block_id = ctx.block_id; env = lenv_bind(ctx.env, name, vreg) }
+    ctx_with(ctx, ctx.func, ctx.block_id, lenv_bind(ctx.env, name, vreg))
 }
 
 /** lower_expr — lower a typed expression to LIR, returning the VReg carrying its value.
@@ -305,6 +315,15 @@ pub fn lower_expr(ctx: LowerCtx, e: checker::TExpr) -> Lowered | error {
         checker::TCall as cl => lower_call(ctx, e, cl)
         checker::TCompare as cm => lower_compare(ctx, e, cm)
         checker::TIfExpr as f => lower_if_expr(ctx, e, f)
+        checker::TStructInit as si => lower_struct_init(ctx, e, si)
+        checker::TFieldAccess as fa => lower_field_access(ctx, e, fa)
+        checker::TIndex as ix => lower_index(ctx, e, ix)
+        checker::TArrayLit as al => lower_array_lit(ctx, e, al)
+        checker::TByteLit as b => lower_byte_lit(ctx, e, b)
+        checker::TCharLit as c => lower_char_lit(ctx, e, c)
+        checker::TBoolLit as b => lower_bool_lit(ctx, e, b)
+        checker::TNullLit as n => lower_null_lit(ctx, e, n)
+        checker::TPathExpr as p => lower_path_expr(ctx, e, p)
         _ => error { message = teko::str::concat("native backend N1: ", texpr_kind_name(e), " not yet lowered (N2)") }
     }
 }
@@ -458,7 +477,7 @@ fn lower_bool_and(ctx: LowerCtx, a_vreg: u32, b_vreg: u32, line: u32, col: u32) 
     let with_zero = append_inst(zc.func, elseb.block_id, const_int_inst(zc.vreg, 0 to i128, line, col))
     let else_args = teko::list::push(teko::list::empty(), zc.vreg)
     let after_else = append_inst(with_zero, elseb.block_id, jump_inst(mergeb.block_id, else_args, line, col))
-    Lowered { ctx = LowerCtx { func = after_else; block_id = mergeb.block_id; env = ctx.env }; vreg = mp.vreg }
+    Lowered { ctx = ctx_with(ctx, after_else, mergeb.block_id, ctx.env); vreg = mp.vreg }
 }
 
 /** lower_compare — a TCompare (`first` + `rest` chain) -> the chain of ICmp/FCmp opcodes,
@@ -553,6 +572,7 @@ fn call_symbol(c: checker::TCall) -> str | error {
 pub fn lower_stmt(ctx: LowerCtx, s: checker::TStatement) -> LowerStmtOut | error {
     match s {
         checker::TBinding as b => lower_binding(ctx, b)
+        checker::TAssign as a => lower_assign(ctx, a)
         checker::TReturn as r => lower_return(ctx, r)
         checker::TExprStmt as es => lower_expr_stmt(ctx, es)
         _ => error { message = teko::str::concat("native backend N1: ", tstmt_kind_name(s), " not yet lowered (N2)") }
@@ -597,7 +617,7 @@ fn lower_expr_stmt(ctx: LowerCtx, es: checker::TExprStmt) -> LowerStmtOut | erro
 /** ctx_goto — switch the context to emit into `block_id` (already allocated), keeping the
     function/env unchanged — used after a branch/jump splits control into a fresh block. */
 fn ctx_goto(ctx: LowerCtx, block_id: u32) -> LowerCtx {
-    LowerCtx { func = ctx.func; block_id = block_id; env = ctx.env }
+    ctx_with(ctx, ctx.func, block_id, ctx.env)
 }
 
 /** close_arm_to — close a lowered if-arm by jumping to `target` carrying `args` as its
@@ -673,13 +693,13 @@ fn lower_if_stmt(ctx: LowerCtx, e: checker::TExpr, f: checker::TIfExpr, cond_vre
     let elseb = alloc_block(thenb.func)
     let mergeblk = alloc_block(elseb.func)
     let br = branch_inst(cond_vreg, thenb.block_id, teko::list::empty(), elseb.block_id, teko::list::empty(), e.line, e.col)
-    let ctx1 = ctx_append(LowerCtx { func = mergeblk.func; block_id = ctx.block_id; env = ctx.env }, br)
+    let ctx1 = ctx_append(ctx_with(ctx, mergeblk.func, ctx.block_id, ctx.env), br)
     let then_done = match lower_block(ctx_goto(ctx1, thenb.block_id), f.then_blk) { LowerCtx as c => c; error as err => return err }
     let then_func = close_arm_to(then_done, mergeblk.block_id, teko::list::empty(), e.line, e.col)
-    let else_ctx = LowerCtx { func = then_func; block_id = elseb.block_id; env = ctx.env }
+    let else_ctx = ctx_with(ctx, then_func, elseb.block_id, ctx.env)
     let else_done = if f.has_else { match lower_block(else_ctx, f.else_blk) { LowerCtx as c => c; error as err => return err } } else { else_ctx }
     let else_func = close_arm_to(else_done, mergeblk.block_id, teko::list::empty(), e.line, e.col)
-    Lowered { ctx = LowerCtx { func = else_func; block_id = mergeblk.block_id; env = ctx.env }; vreg = 0 }
+    Lowered { ctx = ctx_with(ctx, else_func, mergeblk.block_id, ctx.env); vreg = 0 }
 }
 
 /** lower_if_value — the value-producing shape: both arms' TAIL values become the merge
@@ -692,15 +712,333 @@ fn lower_if_value(ctx: LowerCtx, e: checker::TExpr, f: checker::TIfExpr, cond_vr
     let mergeblk = alloc_block(elseb.func)
     let mp = add_block_param(mergeblk.func, mergeblk.block_id)
     let br = branch_inst(cond_vreg, thenb.block_id, teko::list::empty(), elseb.block_id, teko::list::empty(), e.line, e.col)
-    let ctx1 = ctx_append(LowerCtx { func = mp.func; block_id = ctx.block_id; env = ctx.env }, br)
+    let ctx1 = ctx_append(ctx_with(ctx, mp.func, ctx.block_id, ctx.env), br)
     let then_val = match lower_block_value(ctx_goto(ctx1, thenb.block_id), f.then_blk) { LowerBlockValue as x => x; error as err => return err }
     let then_args = teko::list::push(teko::list::empty(), then_val.vreg)
     let then_func = close_arm_to(then_val.ctx, mergeblk.block_id, then_args, e.line, e.col)
-    let else_ctx = LowerCtx { func = then_func; block_id = elseb.block_id; env = ctx.env }
+    let else_ctx = ctx_with(ctx, then_func, elseb.block_id, ctx.env)
     let else_val = match lower_block_value(else_ctx, f.else_blk) { LowerBlockValue as x => x; error as err => return err }
     let else_args = teko::list::push(teko::list::empty(), else_val.vreg)
     let else_func = close_arm_to(else_val.ctx, mergeblk.block_id, else_args, e.line, e.col)
-    Lowered { ctx = LowerCtx { func = else_func; block_id = mergeblk.block_id; env = ctx.env }; vreg = mp.vreg }
+    Lowered { ctx = ctx_with(ctx, else_func, mergeblk.block_id, ctx.env); vreg = mp.vreg }
+}
+
+/** named_type_name — the canonical name of a `Named` (struct) type, for looking up its
+    registered layout; any other type shape (the receiver isn't a struct) is out of the
+    A1-3 subset. */
+fn named_type_name(t: checker::Type) -> str | error {
+    match t {
+        checker::Named as n => n.name
+        _ => error { message = "native backend N1: field/index access on a non-struct receiver not yet lowered (N2)" }
+    }
+}
+
+/** find_struct_layout — the registered LStructLayout named `name`, or a NAMED internal
+    error (the checker guarantees every Named struct type was declared, so a miss here is
+    an invariant break, not a user error). */
+fn find_struct_layout(layouts: []LStructLayout, name: str) -> LStructLayout | error {
+    mut i: u64 = 0
+    loop {
+        if i >= layouts.len { break }
+        if layouts[i].name == name { return layouts[i] }
+        i++
+    }
+    error { message = teko::str::concat("native backend N1: no layout registered for struct `", name, "` (internal)") }
+}
+
+/** field_offset_of — the byte offset of `field` within `layout`, or a NAMED internal error
+    (the checker guarantees the field exists on the struct — a miss here is an invariant
+    break). */
+fn field_offset_of(layout: LStructLayout, field: str) -> u32 | error {
+    mut i: u64 = 0
+    loop {
+        if i >= layout.field_names.len { break }
+        if layout.field_names[i] == field { return layout.field_offsets[i] }
+        i++
+    }
+    error { message = teko::str::concat("native backend N1: unknown field `", field, "` on struct `", layout.name, "` (internal)") }
+}
+
+/** lower_struct_init — `Name { f = v, … }`: alloca a slot sized/aligned per the struct's
+    registered layout, then store each field's lowered value at its offset (declared
+    order). The struct's "value" is its alloca'd BASE ADDRESS (a Ptr VReg) — the memory
+    model every aggregate in the A1-3 subset shares (§5.1: the interp is an exit-code
+    oracle, not a byte-accurate simulator; A2+ isel reads the real byte layout off
+    LStructLayout, not off this VReg's class). */
+fn lower_struct_init(ctx: LowerCtx, e: checker::TExpr, si: checker::TStructInit) -> Lowered | error {
+    let name = match named_type_name(e.type) { str as s => s; error as err => return err }
+    let layout = match find_struct_layout(ctx.layouts, name) { LStructLayout as l => l; error as err => return err }
+    let base = ctx_alloc(ctx)
+    let with_alloca = ctx_append(base.ctx, alloca_inst(base.vreg, layout.size, layout.align, e.line, e.col))
+    store_struct_fields(with_alloca, base.vreg, layout, si.field_names, si.field_vals, e.line, e.col)
+}
+
+/** store_struct_fields — lower each field value in turn, storing it at its layout offset
+    from `base`; the result VReg is `base` itself (the struct's address, unchanged by the
+    stores). */
+fn store_struct_fields(ctx: LowerCtx, base: u32, layout: LStructLayout, field_names: []str, field_vals: []checker::TExpr, line: u32, col: u32) -> Lowered | error {
+    mut cur = ctx
+    mut i: u64 = 0
+    loop {
+        if i >= field_names.len { break }
+        let vo = match lower_expr(cur, field_vals[i]) { Lowered as x => x; error as err => return err }
+        let off = match field_offset_of(layout, field_names[i]) { u32 as o => o; error as err => return err }
+        let addr = ctx_alloc(vo.ctx)
+        let with_addr = ctx_append(addr.ctx, field_addr_inst(addr.vreg, base, off, line, col))
+        cur = ctx_append(with_addr, store_inst(addr.vreg, vo.vreg, ltype_of(field_vals[i].type), line, col))
+        i++
+    }
+    Lowered { ctx = cur; vreg = base }
+}
+
+/** lower_field_access — `recv.field` on a struct receiver: lower the receiver to its base
+    address, compute the field's address via its registered layout offset, then load its
+    value. A non-struct receiver (str/slice `.len`, an error's diagnostic fields, `Ref<T>`
+    `.value`, …) is out of the A1-3 subset — those arrive with fat pointers in A1-4. */
+fn lower_field_access(ctx: LowerCtx, e: checker::TExpr, fa: checker::TFieldAccess) -> Lowered | error {
+    let ro = match lower_expr(ctx, fa.receiver) { Lowered as x => x; error as err => return err }
+    let name = match named_type_name(fa.receiver.type) { str as s => s; error as err => return err }
+    let layout = match find_struct_layout(ro.ctx.layouts, name) { LStructLayout as l => l; error as err => return err }
+    let off = match field_offset_of(layout, fa.field) { u32 as o => o; error as err => return err }
+    let addr = ctx_alloc(ro.ctx)
+    let with_addr = ctx_append(addr.ctx, field_addr_inst(addr.vreg, ro.vreg, off, e.line, e.col))
+    let r = ctx_alloc(with_addr)
+    Lowered { ctx = ctx_append(r.ctx, load_inst(r.vreg, addr.vreg, ltype_of(e.type), e.line, e.col)); vreg = r.vreg }
+}
+
+/** slice_element_type — the element type of a `[]T` (Slice) type; any other receiver shape
+    (a `str`'s fat pointer arrives with A1-4) is out of the A1-3 subset. */
+fn slice_element_type(t: checker::Type) -> checker::Type | error {
+    match t {
+        checker::Slice as s => s.element
+        _ => error { message = "native backend N1: index receiver is not a slice (N2)" }
+    }
+}
+
+/** const_index_addr — a CONSTANT index folds directly into a static byte offset
+    (`index * stride`), a single `field_addr` (no runtime multiply). */
+fn const_index_addr(ctx: LowerCtx, base: u32, idx_value: i128, stride: u32, line: u32, col: u32) -> Lowered {
+    let offset = (idx_value * (stride to i128)) to u32
+    let r = ctx_alloc(ctx)
+    Lowered { ctx = ctx_append(r.ctx, field_addr_inst(r.vreg, base, offset, line, col)); vreg = r.vreg }
+}
+
+/** dynamic_index_addr — a NON-constant index multiplies through an ordinary `IMul` (index
+    * stride) then `IAdd`s onto `base` — `LFieldAddr.offset` only ever carries a compile-time
+    constant, so a runtime-computed byte offset is plain integer arithmetic on the address
+    VReg instead (the plan's §2.1 resolution). */
+fn dynamic_index_addr(ctx: LowerCtx, base: u32, index: checker::TExpr, stride: u32, line: u32, col: u32) -> Lowered | error {
+    let io = match lower_expr(ctx, index) { Lowered as x => x; error as err => return err }
+    let sc = ctx_alloc(io.ctx)
+    let with_stride = ctx_append(sc.ctx, const_int_inst(sc.vreg, stride to i128, line, col))
+    let mr = ctx_alloc(with_stride)
+    let with_mul = ctx_append(mr.ctx, bin_inst(mr.vreg, LBinOp::IMul, io.vreg, sc.vreg, line, col))
+    let ar = ctx_alloc(with_mul)
+    Lowered { ctx = ctx_append(ar.ctx, bin_inst(ar.vreg, LBinOp::IAdd, base, mr.vreg, line, col)); vreg = ar.vreg }
+}
+
+/** index_addr — the element address for `recv[index]`: `const_index_addr` when `index` is
+    a literal integer (folds to a single instruction), else `dynamic_index_addr`. */
+fn index_addr(ctx: LowerCtx, base: u32, index: checker::TExpr, stride: u32, line: u32, col: u32) -> Lowered | error {
+    match index.kind {
+        checker::TNumber as n => if n.is_float { dynamic_index_addr(ctx, base, index, stride, line, col) } else { const_index_addr(ctx, base, n.value, stride, line, col) }
+        _ => dynamic_index_addr(ctx, base, index, stride, line, col)
+    }
+}
+
+/** lower_index — `recv[index]` on a slice receiver: lower the receiver to its base
+    address, compute the element's address (folded when `index` is constant), then load its
+    value. A `str` receiver is deferred to A1-4 (fat pointers). */
+fn lower_index(ctx: LowerCtx, e: checker::TExpr, ix: checker::TIndex) -> Lowered | error {
+    let ro = match lower_expr(ctx, ix.receiver) { Lowered as x => x; error as err => return err }
+    match slice_element_type(ix.receiver.type) { checker::Type => { }; error as err => return err }
+    let elem_ty = ltype_of(e.type)
+    let addr_out = match index_addr(ro.ctx, ro.vreg, ix.index, ltype_size(elem_ty), e.line, e.col) { Lowered as x => x; error as err => return err }
+    let r = ctx_alloc(addr_out.ctx)
+    Lowered { ctx = ctx_append(r.ctx, load_inst(r.vreg, addr_out.vreg, elem_ty, e.line, e.col)); vreg = r.vreg }
+}
+
+/** lower_array_lit — `[e0, e1, …]`: alloca `elements.len * stride` bytes (the element's
+    machine size), then store each element at its constant offset. The literal's "value" is
+    its alloca'd base address, exactly like a struct literal — the length/fat-pointer
+    wrapping (`.len`, slicing, spreads) is A1-4's concern; a spread element (`..xs`) is out
+    of the A1-3 subset (its length isn't known until then). */
+fn lower_array_lit(ctx: LowerCtx, e: checker::TExpr, al: checker::TArrayLit) -> Lowered | error {
+    let elem_t = match slice_element_type(e.type) { checker::Type as t => t; error as err => return err }
+    let elem_ty = ltype_of(elem_t)
+    let stride = ltype_size(elem_ty)
+    let total = (al.elements.len to u32) * stride
+    let base = ctx_alloc(ctx)
+    let with_alloca = ctx_append(base.ctx, alloca_inst(base.vreg, total, ltype_align(elem_ty), e.line, e.col))
+    store_array_elements(with_alloca, base.vreg, al.elements, stride, e.line, e.col)
+}
+
+/** store_array_elements — lower each non-spread element in turn, storing it at its
+    constant `index * stride` offset from `base`; the result VReg is `base` itself. */
+fn store_array_elements(ctx: LowerCtx, base: u32, elements: []checker::TArrayElem, stride: u32, line: u32, col: u32) -> Lowered | error {
+    mut cur = ctx
+    mut i: u64 = 0
+    loop {
+        if i >= elements.len { break }
+        let elem = elements[i]
+        if elem.is_spread { return error { message = "native backend N1: spread array element not yet lowered (N2)" } }
+        let vo = match lower_expr(cur, elem.expr) { Lowered as x => x; error as err => return err }
+        let offset = (i to u32) * stride
+        let addr = ctx_alloc(vo.ctx)
+        let with_addr = ctx_append(addr.ctx, field_addr_inst(addr.vreg, base, offset, line, col))
+        cur = ctx_append(with_addr, store_inst(addr.vreg, vo.vreg, ltype_of(elem.expr.type), line, col))
+        i++
+    }
+    Lowered { ctx = cur; vreg = base }
+}
+
+/** bool_lit_value — a bool literal's i128 carrier (1 = true, 0 = false — the released seed
+    does not implement a `bool to <numeric>` cast, so this picks the constant explicitly,
+    mirroring the interp's own bool_to_i128 and lower_bool_and's zero constant). */
+fn bool_lit_value(v: bool) -> i128 { if v { 1 to i128 } else { 0 to i128 } }
+
+/** lower_byte_lit — a byte literal -> its value widened to the i128 carrier. */
+fn lower_byte_lit(ctx: LowerCtx, e: checker::TExpr, b: checker::TByteLit) -> Lowered {
+    let r = ctx_alloc(ctx)
+    Lowered { ctx = ctx_append(r.ctx, const_int_inst(r.vreg, b.value to i128, e.line, e.col)); vreg = r.vreg }
+}
+
+/** lower_bool_lit — a bool literal -> its i128 carrier (bool_lit_value). */
+fn lower_bool_lit(ctx: LowerCtx, e: checker::TExpr, b: checker::TBoolLit) -> Lowered {
+    let r = ctx_alloc(ctx)
+    Lowered { ctx = ctx_append(r.ctx, const_int_inst(r.vreg, bool_lit_value(b.value), e.line, e.col)); vreg = r.vreg }
+}
+
+/** lower_null_lit — `null` -> a zero (null) Ptr constant. */
+fn lower_null_lit(ctx: LowerCtx, e: checker::TExpr, n: checker::TNullLit) -> Lowered {
+    let r = ctx_alloc(ctx)
+    Lowered { ctx = ctx_append(r.ctx, const_int_inst(r.vreg, 0 to i128, e.line, e.col)); vreg = r.vreg }
+}
+
+/** lower_path_expr — `Enum::Member` -> its already-RESOLVED member value (the checker's
+    `.value`: the ordinal for a plain enum, `1 << ordinal` for a FLAGS enum). */
+fn lower_path_expr(ctx: LowerCtx, e: checker::TExpr, p: checker::TPathExpr) -> Lowered {
+    let r = ctx_alloc(ctx)
+    Lowered { ctx = ctx_append(r.ctx, const_int_inst(r.vreg, p.value to i128, e.line, e.col)); vreg = r.vreg }
+}
+
+/** utf8_codepoint2 — the codepoint of a validated 2-byte UTF-8 sequence. */
+fn utf8_codepoint2(s: str) -> u32 {
+    let b0 = s[0] to u32
+    let b1 = s[1] to u32
+    ((b0 & 0x1F) << 6) | (b1 & 0x3F)
+}
+
+/** utf8_codepoint3 — the codepoint of a validated 3-byte UTF-8 sequence. */
+fn utf8_codepoint3(s: str) -> u32 {
+    let b0 = s[0] to u32
+    let b1 = s[1] to u32
+    let b2 = s[2] to u32
+    ((b0 & 0x0F) << 12) | ((b1 & 0x3F) << 6) | (b2 & 0x3F)
+}
+
+/** utf8_codepoint4 — the codepoint of a validated 4-byte UTF-8 sequence. */
+fn utf8_codepoint4(s: str) -> u32 {
+    let b0 = s[0] to u32
+    let b1 = s[1] to u32
+    let b2 = s[2] to u32
+    let b3 = s[3] to u32
+    ((b0 & 0x07) << 18) | ((b1 & 0x3F) << 12) | ((b2 & 0x3F) << 6) | (b3 & 0x3F)
+}
+
+/** utf8_codepoint — the single codepoint a TCharLit's raw UTF-8 bytes decode to (the lexer
+    already validated `s` is EXACTLY one codepoint, 1-4 bytes). */
+fn utf8_codepoint(s: str) -> i128 {
+    if s.len == 1 { return (s[0] to u32) to i128 }
+    if s.len == 2 { return utf8_codepoint2(s) to i128 }
+    if s.len == 3 { return utf8_codepoint3(s) to i128 }
+    utf8_codepoint4(s) to i128
+}
+
+/** lower_char_lit — a char literal -> its decoded codepoint (the LIR's scalar
+    representation of `char` — distinct from the VM/C backend's `{ptr,len}` carrier; the
+    interp is an exit-code oracle, not a layout verifier, §5.1). */
+fn lower_char_lit(ctx: LowerCtx, e: checker::TExpr, c: checker::TCharLit) -> Lowered {
+    let r = ctx_alloc(ctx)
+    Lowered { ctx = ctx_append(r.ctx, const_int_inst(r.vreg, utf8_codepoint(c.bytes), e.line, e.col)); vreg = r.vreg }
+}
+
+/** plain_op_of_compound — the plain arithmetic token a compound-assignment operator
+    applies (`+=` -> `+`, …), so assignment reuses lbinop_of's family/signedness pick. A
+    bitwise/shift compound (`&=`, `<<=`, …) is out of the A1-3 subset (lbinop_of does not
+    lower them either — N2). */
+fn plain_op_of_compound(op: lexer::TokenKind) -> lexer::TokenKind | error {
+    match op {
+        lexer::TokenKind::PlusEq => lexer::TokenKind::Plus
+        lexer::TokenKind::MinusEq => lexer::TokenKind::Minus
+        lexer::TokenKind::StarEq => lexer::TokenKind::Star
+        lexer::TokenKind::SlashEq => lexer::TokenKind::Slash
+        lexer::TokenKind::PercentEq => lexer::TokenKind::Percent
+        _ => error { message = "native backend N1: compound assignment operator not yet lowered (N2)" }
+    }
+}
+
+/** lower_assign — a TAssign: Simple (a local rebind) or Field (a struct-field write via
+    memory); a Ref-deref (`.value op= …`) is out of the A1-3 subset (Ref<T> is not yet a
+    memory-modeled type here). */
+fn lower_assign(ctx: LowerCtx, a: checker::TAssign) -> LowerStmtOut | error {
+    match a.kind {
+        parser::AssignKind::Simple => lower_assign_simple(ctx, a)
+        parser::AssignKind::Field => lower_assign_field(ctx, a)
+        parser::AssignKind::RefDeref => error { message = "native backend N1: reference deref-assignment not yet lowered (N2)" }
+    }
+}
+
+/** lower_assign_simple — `name = e` rebinds the env to the newly-lowered value (an
+    SSA-lite shadow, exactly like a `let`); `name op= e` reads the CURRENT vreg, applies the
+    arithmetic op, and rebinds to the result. */
+fn lower_assign_simple(ctx: LowerCtx, a: checker::TAssign) -> LowerStmtOut | error {
+    if a.op == lexer::TokenKind::Assign {
+        let vo = match lower_expr(ctx, a.value) { Lowered as x => x; error as err => return err }
+        return LowerStmtOut { ctx = ctx_bind(vo.ctx, a.name, vo.vreg); terminated = false }
+    }
+    let cur = lenv_lookup(ctx.env, a.name)
+    if !cur.found { return error { message = teko::str::concat("native backend N1: unbound local `", a.name, "` (internal)") } }
+    let vo = match lower_expr(ctx, a.value) { Lowered as x => x; error as err => return err }
+    let k = match prim_kind_of(a.bound) { checker::PrimKind as p => p; error as err => return err }
+    let plain = match plain_op_of_compound(a.op) { lexer::TokenKind as t => t; error as err => return err }
+    let op = match lbinop_of(plain, k) { LBinOp as o => o; error as err => return err }
+    let r = ctx_alloc(vo.ctx)
+    let inst = bin_inst(r.vreg, op, cur.vreg, vo.vreg, a.value.line, a.value.col)
+    LowerStmtOut { ctx = ctx_bind(ctx_append(r.ctx, inst), a.name, r.vreg); terminated = false }
+}
+
+/** lower_assign_field — `recv.field = e` / `recv.field op= e`: lower the receiver to its
+    base address, compute the field's address via its registered layout offset, then store
+    (a compound op first loads the current value, applies it, then stores the result). */
+fn lower_assign_field(ctx: LowerCtx, a: checker::TAssign) -> LowerStmtOut | error {
+    let fa = match a.target.kind { checker::TFieldAccess as f => f; _ => return error { message = "native backend N1: field-assignment target is not a field access (internal)" } }
+    let ro = match lower_expr(ctx, fa.receiver) { Lowered as x => x; error as err => return err }
+    let name = match named_type_name(fa.receiver.type) { str as s => s; error as err => return err }
+    let layout = match find_struct_layout(ro.ctx.layouts, name) { LStructLayout as l => l; error as err => return err }
+    let off = match field_offset_of(layout, fa.field) { u32 as o => o; error as err => return err }
+    let addr = ctx_alloc(ro.ctx)
+    let with_addr = ctx_append(addr.ctx, field_addr_inst(addr.vreg, ro.vreg, off, a.target.line, a.target.col))
+    store_assign_value(with_addr, addr.vreg, ltype_of(a.bound), a)
+}
+
+/** store_assign_value — the shared tail of a field assignment: a plain `=` stores the
+    lowered RHS directly; a compound op loads the CURRENT field value first, applies the
+    arithmetic, then stores the result. */
+fn store_assign_value(ctx: LowerCtx, addr: u32, field_ty: LType, a: checker::TAssign) -> LowerStmtOut | error {
+    if a.op == lexer::TokenKind::Assign {
+        let vo = match lower_expr(ctx, a.value) { Lowered as x => x; error as err => return err }
+        return LowerStmtOut { ctx = ctx_append(vo.ctx, store_inst(addr, vo.vreg, field_ty, a.value.line, a.value.col)); terminated = false }
+    }
+    let cr = ctx_alloc(ctx)
+    let with_load = ctx_append(cr.ctx, load_inst(cr.vreg, addr, field_ty, a.value.line, a.value.col))
+    let vo = match lower_expr(with_load, a.value) { Lowered as x => x; error as err => return err }
+    let k = match prim_kind_of(a.bound) { checker::PrimKind as p => p; error as err => return err }
+    let plain = match plain_op_of_compound(a.op) { lexer::TokenKind as t => t; error as err => return err }
+    let op = match lbinop_of(plain, k) { LBinOp as o => o; error as err => return err }
+    let rr = ctx_alloc(vo.ctx)
+    let with_bin = ctx_append(rr.ctx, bin_inst(rr.vreg, op, cr.vreg, vo.vreg, a.value.line, a.value.col))
+    LowerStmtOut { ctx = ctx_append(with_bin, store_inst(addr, rr.vreg, field_ty, a.value.line, a.value.col)); terminated = false }
 }
 
 /** texpr_kind_name — a short spelling of a typed expression's kind for the honest-stop
@@ -770,8 +1108,10 @@ fn lower_block(ctx: LowerCtx, body: []checker::TStatement) -> LowerCtx | error {
     VRegs 0..n_params (bound in the env by name), then lower the body. A body that falls off
     the end without an explicit return gets an implicit void return (the checker guarantees a
     value-returning fn returns on every path, so this only fires for void fns). A generic or
-    extern function is out of the N1 subset. */
-pub fn lower_function(f: checker::TFunction) -> LFunc | error {
+    extern function is out of the N1 subset. `layouts` (A1-3, #382) is the program's
+    struct-layout table — defaulted empty so an arithmetic-only fixture (no structs in
+    scope) need not build one. */
+pub fn lower_function(f: checker::TFunction, layouts: []LStructLayout = teko::list::empty()) -> LFunc | error {
     if f.type_params.len != 0 { return error { message = "native backend N1: generic function not yet lowered (N2)" } }
     if f.is_extern { return error { message = "native backend N1: extern function has no body to lower" } }
     let ptypes = param_ltypes(f.params)
@@ -784,7 +1124,7 @@ pub fn lower_function(f: checker::TFunction) -> LFunc | error {
         env = lenv_bind(env, f.params[i].name, i to u32)
         i++
     }
-    let ctx0 = LowerCtx { func = fn0; block_id = 0; env = env }
+    let ctx0 = LowerCtx { func = fn0; block_id = 0; env = env; layouts = layouts }
     let done = match lower_block(ctx0, f.body) { LowerCtx as c => c; error as err => return err }
     close_function(done, f)
 }
@@ -837,33 +1177,99 @@ fn param_ltypes(params: []parser::Param) -> []LType {
     out
 }
 
-/** lower_program — the module entry: lower every top-level function, and gather the loose
-    top-level statements into a synthesized `main` (the VIRTUAL-MAIN the C backend also
-    builds), returning `int 0` if the statements fall through. Type/use declarations are
-    skipped (no code). Mirrors the loop of tk_emit_c over prog.items. */
+/** lower_program — the module entry: register every declared struct's layout (A1-3,
+    #382), lower every top-level function, and gather the loose top-level statements into a
+    synthesized `main` (the VIRTUAL-MAIN the C backend also builds), returning `int 0` if
+    the statements fall through. Type/use declarations otherwise carry no code. Mirrors the
+    loop of tk_emit_c over prog.items. */
 pub fn lower_program(prog: checker::TProgram) -> LModule | error {
-    mut m = empty_module()
+    let layouts = collect_struct_layouts(prog)
+    mut m = register_layouts(empty_module(), layouts)
     mut loose: []checker::TStatement = teko::list::empty()
     mut i: u64 = 0
     loop {
         if i >= prog.items.len { break }
-        let step = match lower_item(m, loose, prog.items[i]) { LowerItemOut as x => x; error as err => return err }
+        let step = match lower_item(m, loose, prog.items[i], layouts) { LowerItemOut as x => x; error as err => return err }
         m = step.module
         loose = step.loose
         i++
     }
-    add_func(m, match lower_virtual_main(loose) { LFunc as vf => vf; error as err => return err })
+    add_func(m, match lower_virtual_main(loose, layouts) { LFunc as vf => vf; error as err => return err })
+}
+
+/** register_layouts — return a copy of `m` with every entry of `layouts` appended to its
+    struct-layout table. */
+fn register_layouts(m: LModule, layouts: []LStructLayout) -> LModule {
+    mut cur = m
+    mut i: u64 = 0
+    loop {
+        if i >= layouts.len { break }
+        cur = add_layout(cur, layouts[i])
+        i++
+    }
+    cur
+}
+
+/** collect_struct_layouts — the declared-order, natural-alignment layout of every `struct`
+    type declaration in `prog` (A1-3, #382). A generic struct's type-parameter field
+    annotations collapse to Ptr (ltype_of_typeexpr's total fallback) — harmless, since no
+    A1-3 fixture instantiates one; a NON-struct type declaration (enum/class/variant/…)
+    contributes no layout entry. */
+fn collect_struct_layouts(prog: checker::TProgram) -> []LStructLayout {
+    mut out: []LStructLayout = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= prog.items.len { break }
+        out = collect_struct_layout_item(out, prog.items[i])
+        i++
+    }
+    out
+}
+
+/** collect_struct_layout_item — accumulate `it`'s layout (a struct TypeDecl) onto `acc`,
+    unchanged for every other item kind. */
+fn collect_struct_layout_item(acc: []LStructLayout, it: checker::TItem) -> []LStructLayout {
+    match it {
+        parser::TypeDecl as td => collect_struct_layout_decl(acc, td)
+        _ => acc
+    }
+}
+
+/** collect_struct_layout_decl — accumulate `td`'s layout onto `acc` when its body is a
+    `StructBody`; unchanged for any other type-declaration shape (enum/class/variant/…). */
+fn collect_struct_layout_decl(acc: []LStructLayout, td: parser::TypeDecl) -> []LStructLayout {
+    match td.body {
+        parser::StructBody as sb => teko::list::push(acc, layout_of_fields(td.name, sb.fields))
+        _ => acc
+    }
+}
+
+/** layout_of_fields — a struct's LStructLayout from its DECLARED field list: each field's
+    machine class comes from its syntactic annotation (ltype_of_typeexpr — the same mapping
+    a parameter list already uses), in the struct's own declared order. */
+fn layout_of_fields(name: str, fields: []parser::Field) -> LStructLayout {
+    mut field_names: []str = teko::list::empty()
+    mut field_types: []LType = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= fields.len { break }
+        field_names = teko::list::push(field_names, fields[i].name)
+        field_types = teko::list::push(field_types, ltype_of_typeexpr(fields[i].type_ann))
+        i++
+    }
+    layout_of(name, field_names, field_types)
 }
 
 /** LowerItemOut — the module + accumulated loose statements after folding one top-level
     item. */
 pub type LowerItemOut = struct { module: LModule; loose: []checker::TStatement }
 
-/** lower_item — fold one TItem: a function lowers into the module; a loose statement
-    accumulates for the virtual main; a type/use declaration is skipped. */
-fn lower_item(m: LModule, loose: []checker::TStatement, it: checker::TItem) -> LowerItemOut | error {
+/** lower_item — fold one TItem: a function lowers into the module (given the program's
+    struct-layout table); a loose statement accumulates for the virtual main; a type/use
+    declaration is skipped. */
+fn lower_item(m: LModule, loose: []checker::TStatement, it: checker::TItem, layouts: []LStructLayout) -> LowerItemOut | error {
     match it {
-        checker::TFunction as f => lower_item_function(m, loose, f)
+        checker::TFunction as f => lower_item_function(m, loose, f, layouts)
         checker::TStatement as s => LowerItemOut { module = m; loose = teko::list::push(loose, s) }
         _ => LowerItemOut { module = m; loose = loose }
     }
@@ -871,10 +1277,10 @@ fn lower_item(m: LModule, loose: []checker::TStatement, it: checker::TItem) -> L
 
 /** lower_item_function — lower a top-level function into the module (a `#test` function is
     skipped — it is not part of the emitted program). */
-fn lower_item_function(m: LModule, loose: []checker::TStatement, f: checker::TFunction) -> LowerItemOut | error {
+fn lower_item_function(m: LModule, loose: []checker::TStatement, f: checker::TFunction, layouts: []LStructLayout) -> LowerItemOut | error {
     if f.is_test { return LowerItemOut { module = m; loose = loose } }
     if f.is_extern { return LowerItemOut { module = m; loose = loose } }
-    let lf = match lower_function(f) { LFunc as x => x; error as err => return err }
+    let lf = match lower_function(f, layouts) { LFunc as x => x; error as err => return err }
     LowerItemOut { module = add_func(m, lf); loose = loose }
 }
 
@@ -882,9 +1288,9 @@ fn lower_item_function(m: LModule, loose: []checker::TStatement, f: checker::TFu
     lower each, and if control falls through append `%r = const 0; ret %r` (the ABI: main
     returns int). An explicit `exit(n)` inside diverges, so the trailing return is dead but
     harmless. */
-fn lower_virtual_main(loose: []checker::TStatement) -> LFunc | error {
+fn lower_virtual_main(loose: []checker::TStatement, layouts: []LStructLayout) -> LFunc | error {
     let fn0 = new_func("main", 0, teko::list::empty(), LType::I32)
-    let ctx0 = LowerCtx { func = fn0; block_id = 0; env = empty_lenv() }
+    let ctx0 = LowerCtx { func = fn0; block_id = 0; env = empty_lenv(); layouts = layouts }
     let done = match lower_block(ctx0, loose) { LowerCtx as c => c; error as err => return err }
     close_virtual_main(done)
 }
