@@ -1151,3 +1151,87 @@ fn lwt_lowers_capturing_lambda_literal_and_closure_call() {
     teko::assert::str_contains(text, "iadd %1,")
     teko::assert::str_contains(text, "call.indirect")
 }
+
+/**
+ * lwt_lowers_function_trailing_expression_as_implicit_return — #421: a
+ * NON-void `TFunction` whose body falls off the end (its last statement is
+ * an expression-statement, no explicit `return`) auto-returns that
+ * expression's value as its `LRet` — before the fix, `lower_block` discarded
+ * the trailing `iadd`'s VReg and the body closed with a bare `ret` (no
+ * value); the golden dump now shows `ret %2`.
+ */
+#test
+fn lwt_lowers_function_trailing_expression_as_implicit_return() {
+    let params = teko::list::push(teko::list::push(teko::list::empty(), lwt_param("a", "i64")), lwt_param("b", "i64"))
+    let tail = lwt_bin(lexer::TokenKind::Plus, lwt_var("a", checker::PrimKind::I64), lwt_var("b", checker::PrimKind::I64), checker::PrimKind::I64)
+    let body = teko::list::push(teko::list::empty(), lwt_exprstmt(tail))
+    let f = lwt_fn("add_tail", "teko::demo", params, checker::Prim { kind = checker::PrimKind::I64 }, body)
+    let lf = match lower_function(f) { LoweredFunction as x => x.func; error as err => return }
+    let text = print_lmodule(add_func(empty_module(), lf))
+    teko::assert::str_contains(text, "func @teko__demo__add_tail(%0: i64, %1: i64) -> i64 {")
+    teko::assert::str_contains(text, "%2 = iadd %0, %1")
+    teko::assert::str_contains(text, "ret %2")
+}
+
+/**
+ * lwt_lowers_lambda_trailing_expression_as_implicit_return — #421: an arrow
+ * lambda `(x) => x + 1` (no explicit `return`) auto-returns its trailing
+ * expression's value from the lifted body, exactly like a `TFunction` —
+ * before the fix the lifted `.Lclo0` body closed with a bare `ret` and the
+ * `iadd` result was unreachable.
+ */
+#test
+fn lwt_lowers_lambda_trailing_expression_as_implicit_return() {
+    let i64ty = lwt_prim(checker::PrimKind::I64)
+    let lam_body = teko::list::push(teko::list::empty(), lwt_exprstmt(lwt_bin(lexer::TokenKind::Plus, lwt_var("x", checker::PrimKind::I64), lwt_num_i64(1 to i128), checker::PrimKind::I64)))
+    let params = teko::list::push(teko::list::empty(), lwt_lambda_param("x", i64ty))
+    let lam = lwt_lambda(params, lam_body, teko::list::empty(), i64ty)
+    mut items: []checker::TItem = teko::list::empty()
+    items = teko::list::push(items, lwt_item(lwt_bind_typed("f", lam, lam.type)))
+    let call = lwt_closure_call("f", teko::list::push(teko::list::empty(), lwt_num_i64(41 to i128)), lam.type, i64ty)
+    items = teko::list::push(items, lwt_item(lwt_exprstmt(lwt_call(lwt_path1("exit"), "", teko::list::push(teko::list::empty(), call), checker::Void { }))))
+    let prog = checker::TProgram { items = items }
+    let m = match lower_program(prog) { LModule as x => x; error as err => return }
+    let text = print_lmodule(m)
+    teko::assert::str_contains(text, "func @.Lclo0(%0: ptr, %1: i64) -> i64 {")
+    teko::assert::str_contains(text, "%3 = iadd %1, %2")
+    teko::assert::str_contains(text, "ret %3")
+}
+
+/**
+ * lwt_interp_runs_function_trailing_expression_as_return_value — #421, the
+ * interp-oracle side: `fn f() -> i32 { 42 }` (no explicit `return`) lowered
+ * via `lower_function` and run through `interp_lmodule` yields exit code 42
+ * — before the fix the fall-through body closed with a valueless `ret`, so
+ * the interp's `is_return` outcome carried 0, not 42.
+ */
+#test
+fn lwt_interp_runs_function_trailing_expression_as_return_value() {
+    let body = teko::list::push(teko::list::empty(), lwt_exprstmt(lwt_num(42 to i128, checker::PrimKind::I32)))
+    let f = lwt_fn("f", "", teko::list::empty(), checker::Prim { kind = checker::PrimKind::I32 }, body)
+    let lf = match lower_function(f) { LoweredFunction as x => x.func; error as err => return }
+    let m = add_func(empty_module(), lf)
+    teko::assert::is_true(interp_lmodule(m, "f", teko::list::empty()) == (42 to i128))
+}
+
+/**
+ * lwt_interp_runs_lambda_trailing_expression_via_closure_call — #421, the
+ * interp-oracle side: an arrow lambda `(x) => x + 1` (no explicit `return`),
+ * called through its closure value with `x = 41`, yields 42 as the process
+ * exit code — before the fix the lifted lambda body's fall-through `ret`
+ * carried no value, so the closure call always resolved to 0.
+ */
+#test
+fn lwt_interp_runs_lambda_trailing_expression_via_closure_call() {
+    let i64ty = lwt_prim(checker::PrimKind::I64)
+    let lam_body = teko::list::push(teko::list::empty(), lwt_exprstmt(lwt_bin(lexer::TokenKind::Plus, lwt_var("x", checker::PrimKind::I64), lwt_num_i64(1 to i128), checker::PrimKind::I64)))
+    let params = teko::list::push(teko::list::empty(), lwt_lambda_param("x", i64ty))
+    let lam = lwt_lambda(params, lam_body, teko::list::empty(), i64ty)
+    mut items: []checker::TItem = teko::list::empty()
+    items = teko::list::push(items, lwt_item(lwt_bind_typed("f", lam, lam.type)))
+    let call = lwt_closure_call("f", teko::list::push(teko::list::empty(), lwt_num_i64(41 to i128)), lam.type, i64ty)
+    items = teko::list::push(items, lwt_item(lwt_exprstmt(lwt_call(lwt_path1("exit"), "", teko::list::push(teko::list::empty(), call), checker::Void { }))))
+    let prog = checker::TProgram { items = items }
+    let m = match lower_program(prog) { LModule as x => x; error as err => return }
+    teko::assert::is_true(interp_lmodule(m, "main", teko::list::empty()) == (42 to i128))
+}
