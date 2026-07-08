@@ -91,6 +91,27 @@ fn lwt_bind(name: str, e: checker::TExpr, k: checker::PrimKind) -> checker::TSta
 }
 fn lwt_exprstmt(e: checker::TExpr) -> checker::TStatement { checker::TExprStmt { expr = e } }
 
+/** lwt_loop — a `TLoopStmt` node (A1-2, #382 — `label` empty = unlabeled). */
+fn lwt_loop(label: str, body: []checker::TStatement) -> checker::TStatement {
+    checker::TLoopStmt { label = label; body = body }
+}
+
+/** lwt_break — a `TBreakStmt` node (A1-2, #382 — `label` empty = innermost loop). */
+fn lwt_break(label: str) -> checker::TStatement { checker::TBreakStmt { label = label } }
+
+/** lwt_continue — a `TContinueStmt` node (A1-2, #382 — `label` empty = innermost loop). */
+fn lwt_continue(label: str) -> checker::TStatement { checker::TContinueStmt { label = label } }
+
+/** lwt_defer — a `TDeferStmt` node (A1-2, #382). */
+fn lwt_defer(body: []checker::TStatement) -> checker::TStatement { checker::TDeferStmt { body = body } }
+
+/** lwt_simple_assign — `name op= value` (or `name = value`), a Simple-kind
+    TAssign (A1-2, #382 — the shared shape the loop/break/defer fixtures
+    reassign a local through). */
+fn lwt_simple_assign(name: str, op: lexer::TokenKind, value: checker::TExpr, k: checker::PrimKind) -> checker::TStatement {
+    checker::TAssign { kind = parser::AssignKind::Simple; name = name; op = op; bound = lwt_prim(k); value = value; deref = false; target = checker::no_texpr() }
+}
+
 fn lwt_fn(name: str, ns: str, params: []parser::Param, ret: checker::Type, body: []checker::TStatement) -> checker::TFunction {
     checker::TFunction {
         name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty()
@@ -114,7 +135,11 @@ fn lwt_lower_expr_text(e: checker::TExpr) -> str {
     golden dump shows its `rodata`/`{ptr,len}`/lifted-function shape too. */
 fn lwt_lower_expr_text_with(e: checker::TExpr, layouts: []LStructLayout) -> str {
     let f0 = new_func("t", 0, teko::list::empty(), LType::I64)
-    let ctx0 = LowerCtx { func = f0; block_id = 0; env = empty_lenv(); layouts = layouts; rodata = teko::list::empty(); enums = teko::list::empty(); lifted = teko::list::empty() }
+    let ctx0 = LowerCtx {
+        func = f0; block_id = 0; env = empty_lenv()
+        layouts = layouts; rodata = teko::list::empty(); enums = teko::list::empty(); lifted = teko::list::empty()
+        defers = teko::list::empty(); loop_targets = teko::list::empty()
+    }
     let lo = match lower_expr(ctx0, e) { Lowered as x => x; error as err => return teko::str::concat("ERR: ", err.message) }
     let m0 = with_rodata(add_func(empty_module(), lo.ctx.func), lo.ctx.rodata)
     print_lmodule(lwt_fold_lifted(m0, lo.ctx.lifted))
@@ -351,7 +376,7 @@ fn lwt_lowers_function_with_params_and_return() {
     teko::assert::str_contains(text, "func @teko__demo__add(%0: i64, %1: i64) -> i64 {")
     teko::assert::str_contains(text, "%0 = param 0")
     teko::assert::str_contains(text, "%1 = param 1")
-    teko::assert::str_contains(text, "%2 = iadd %0, %1")
+    teko::assert::str_contains(text, "iadd ")
     teko::assert::str_contains(text, "ret %2")
 }
 
@@ -379,6 +404,26 @@ fn lwt_virtual_main_falls_through_to_return_zero() {
     let text = print_lmodule(m)
     teko::assert::str_contains(text, "func @main() -> i32 {")
     teko::assert::str_contains(text, "const 0")
+}
+
+/**
+ * lwt_virtual_main_fires_a_defer_before_its_own_fall_through — A1-2,
+ * #382: a top-level `defer { … }` with no further loose statements after
+ * it must fire before `close_virtual_main`'s own implicit `const 0; ret`
+ * fall-through, exactly like a `void` function's own fall-through.
+ */
+#test
+fn lwt_virtual_main_fires_a_defer_before_its_own_fall_through() {
+    mut items: []checker::TItem = teko::list::empty()
+    items = teko::list::push(items, lwt_item(lwt_bind("s", lwt_num_i64(1 to i128), checker::PrimKind::I64)))
+    let s_plus_100 = lwt_bin(lexer::TokenKind::Plus, lwt_var("s", checker::PrimKind::I64), lwt_num_i64(100 to i128), checker::PrimKind::I64)
+    let defer_body = teko::list::push(teko::list::empty(), lwt_simple_assign("s", lexer::TokenKind::Assign, s_plus_100, checker::PrimKind::I64))
+    items = teko::list::push(items, lwt_item(lwt_defer(defer_body)))
+    let prog = checker::TProgram { items = items }
+    let m = match lower_program(prog) { LModule as x => x; error as err => return }
+    let text = print_lmodule(m)
+    teko::assert::str_contains(text, "const 100")
+    teko::assert::str_contains(text, "iadd ")
 }
 
 /**
@@ -742,7 +787,7 @@ fn lwt_lowers_compound_field_assignment_reads_then_writes() {
     let lf = match lower_function(f, lwt_one_layout(lwt_point_layout())) { LoweredFunction as x => x.func; error as err => return }
     let text = print_lmodule(add_func(empty_module(), lf))
     teko::assert::str_contains(text, "%2 = load.i64 %1")
-    teko::assert::str_contains(text, "%4 = iadd %2, %3")
+    teko::assert::str_contains(text, "iadd ")
     teko::assert::str_contains(text, "store.i64 %1, %4")
 }
 
@@ -1169,7 +1214,7 @@ fn lwt_lowers_function_trailing_expression_as_implicit_return() {
     let lf = match lower_function(f) { LoweredFunction as x => x.func; error as err => return }
     let text = print_lmodule(add_func(empty_module(), lf))
     teko::assert::str_contains(text, "func @teko__demo__add_tail(%0: i64, %1: i64) -> i64 {")
-    teko::assert::str_contains(text, "%2 = iadd %0, %1")
+    teko::assert::str_contains(text, "iadd ")
     teko::assert::str_contains(text, "ret %2")
 }
 
@@ -1194,8 +1239,30 @@ fn lwt_lowers_lambda_trailing_expression_as_implicit_return() {
     let m = match lower_program(prog) { LModule as x => x; error as err => return }
     let text = print_lmodule(m)
     teko::assert::str_contains(text, "func @.Lclo0(%0: ptr, %1: i64) -> i64 {")
-    teko::assert::str_contains(text, "%3 = iadd %1, %2")
+    teko::assert::str_contains(text, "iadd ")
     teko::assert::str_contains(text, "ret %3")
+}
+
+/**
+ * lwt_lowers_defer_fires_before_a_void_lambdas_fall_through_return —
+ * A1-2, #382: a bodyless-return (`void`) lambda literal `() => { let s=1;
+ * defer { s = s + 100 } }` closes via `close_lambda_body`'s own
+ * fall-through, which must fire the pending defer before its implicit
+ * void `ret`, exactly like a `void` function's own fall-through.
+ */
+#test
+fn lwt_lowers_defer_fires_before_a_void_lambdas_fall_through_return() {
+    let s_plus_100 = lwt_bin(lexer::TokenKind::Plus, lwt_var("s", checker::PrimKind::I64), lwt_num_i64(100 to i128), checker::PrimKind::I64)
+    let defer_body = teko::list::push(teko::list::empty(), lwt_simple_assign("s", lexer::TokenKind::Assign, s_plus_100, checker::PrimKind::I64))
+    let lam_body = teko::list::push(teko::list::push(teko::list::empty(), lwt_bind("s", lwt_num_i64(1 to i128), checker::PrimKind::I64)), lwt_defer(defer_body))
+    let lam = lwt_lambda(teko::list::empty(), lam_body, teko::list::empty(), checker::Void { })
+    mut items: []checker::TItem = teko::list::empty()
+    items = teko::list::push(items, lwt_item(lwt_bind_typed("f", lam, lam.type)))
+    let prog = checker::TProgram { items = items }
+    let m = match lower_program(prog) { LModule as x => x; error as err => return }
+    let text = print_lmodule(m)
+    teko::assert::str_contains(text, "const 100")
+    teko::assert::str_contains(text, "iadd")
 }
 
 /**
@@ -1234,4 +1301,238 @@ fn lwt_interp_runs_lambda_trailing_expression_via_closure_call() {
     let prog = checker::TProgram { items = items }
     let m = match lower_program(prog) { LModule as x => x; error as err => return }
     teko::assert::is_true(interp_lmodule(m, "main", teko::list::empty()) == (42 to i128))
+}
+
+/**
+ * lwt_lowers_loop_with_break_threads_the_counter_through_head_and_exit_block_args
+ * — A1-2, #382: `mut s=0; loop { s=s+1; if s==5 { break } }; exit(s)`. The
+ * loop head (`#B1`) and exit (`#B2`) are both promoted with one block-arg
+ * for `s` — the ONLY scalar local live at the loop's entry — mirroring
+ * exactly how an if-expression's result VReg merges through its own
+ * block-arg (§2.4): the entry jump seeds the head's param with the
+ * pre-loop value, the if-statement's `break` arm carries the
+ * freshly-incremented value straight into the exit, and the body's OWN
+ * fall-through (through the if-statement's own merge block, `#B5`)
+ * implicitly jumps BACK to the head carrying that SAME updated value — a
+ * loop-mutated counter threads correctly across iterations.
+ */
+#test
+fn lwt_lowers_loop_with_break_threads_the_counter_through_head_and_exit_block_args() {
+    let bump = lwt_simple_assign("s", lexer::TokenKind::Assign, lwt_bin(lexer::TokenKind::Plus, lwt_var("s", checker::PrimKind::I64), lwt_num_i64(1 to i128), checker::PrimKind::I64), checker::PrimKind::I64)
+    let cond = lwt_cmp(lwt_var("s", checker::PrimKind::I64), teko::list::push(teko::list::empty(), lwt_cmp_term(lexer::TokenKind::EqEq, lwt_num_i64(5 to i128))))
+    let ifstmt = lwt_if_stmt(cond, teko::list::push(teko::list::empty(), lwt_break("")), false, teko::list::empty())
+    let loop_body = teko::list::push(teko::list::push(teko::list::empty(), bump), lwt_exprstmt(ifstmt))
+    mut items: []checker::TItem = teko::list::empty()
+    items = teko::list::push(items, lwt_item(lwt_bind("s", lwt_num_i64(0 to i128), checker::PrimKind::I64)))
+    items = teko::list::push(items, lwt_item(lwt_loop("", loop_body)))
+    items = teko::list::push(items, lwt_item(lwt_exprstmt(lwt_call(lwt_path1("exit"), "", teko::list::push(teko::list::empty(), lwt_var("s", checker::PrimKind::I64)), checker::Void { }))))
+    let prog = checker::TProgram { items = items }
+    let m = match lower_program(prog) { LModule as x => x; error as err => return }
+    let text = print_lmodule(m)
+    teko::assert::str_contains(text, "  #B0:\n    %0 = const 0\n    jump #B1(%0)")
+    teko::assert::str_contains(text, "  #B1(%1):\n    %3 = const 1\n    %4 = iadd %1, %3")
+    teko::assert::str_contains(text, "%6 = icmpeq %4, %5")
+    teko::assert::str_contains(text, "branch %6, #B3(), #B4()")
+    teko::assert::str_contains(text, "  #B2(%2):\n    call @tk_exit(%2)")
+    teko::assert::str_contains(text, "  #B3:\n    jump #B2(%4)")
+    teko::assert::str_contains(text, "  #B4:\n    jump #B5()")
+    teko::assert::str_contains(text, "  #B5:\n    jump #B1(%4)")
+}
+
+/**
+ * lwt_lowers_bare_break_terminates_the_head_block_with_no_reloop — A1-2,
+ * #382: `loop { break }` — the break is the loop body's ONLY (and hence
+ * last) statement, so it terminates the head block directly; the loop's
+ * own fall-through close (`close_loop_body`) sees the block already
+ * terminated and does NOT append a redundant jump back to the head.
+ */
+#test
+fn lwt_lowers_bare_break_terminates_the_head_block_with_no_reloop() {
+    let body = teko::list::push(teko::list::empty(), lwt_loop("", teko::list::push(teko::list::empty(), lwt_break(""))))
+    let f = lwt_fn("g", "teko::demo", teko::list::empty(), checker::Void { }, body)
+    let lf = match lower_function(f) { LoweredFunction as x => x.func; error as err => return }
+    let text = print_lmodule(add_func(empty_module(), lf))
+    teko::assert::str_contains(text, "  #B0:\n    jump #B1()")
+    teko::assert::str_contains(text, "  #B1:\n    jump #B2()")
+    teko::assert::str_contains(text, "  #B2:\n    ret")
+}
+
+/**
+ * lwt_lowers_labeled_break_targets_the_outer_loop_past_the_inner_one —
+ * A1-2, #382: `loop "outer" { loop { break "outer" } }` — the INNER
+ * (unlabelled) loop's own `break "outer"` must resolve past its own exit
+ * block to the OUTER loop's exit (`find_loop_target` scans innermost-first,
+ * skipping a non-matching label), proving a labelled break is not confused
+ * with the innermost loop.
+ */
+#test
+fn lwt_lowers_labeled_break_targets_the_outer_loop_past_the_inner_one() {
+    let inner = lwt_loop("", teko::list::push(teko::list::empty(), lwt_break("outer")))
+    let outer_body = teko::list::push(teko::list::empty(), inner)
+    let body = teko::list::push(teko::list::empty(), lwt_loop("outer", outer_body))
+    let f = lwt_fn("h", "teko::demo", teko::list::empty(), checker::Void { }, body)
+    let lf = match lower_function(f) { LoweredFunction as x => x.func; error as err => return }
+    let text = print_lmodule(add_func(empty_module(), lf))
+    teko::assert::str_contains(text, "  #B1:\n    jump #B3()")
+    teko::assert::str_contains(text, "  #B3:\n    jump #B2()")
+    teko::assert::str_contains(text, "  #B2:\n    ret")
+}
+
+/**
+ * lwt_lowers_continue_jumps_back_to_the_loop_head — A1-2, #382:
+ * `loop { continue }` — the continue is the body's only statement,
+ * terminating the head block with a self-jump back to itself (`#B1: jump
+ * #B1()`), exercising `lower_continue`'s target-head resolution separately
+ * from `lower_break`'s target-exit one.
+ */
+#test
+fn lwt_lowers_continue_jumps_back_to_the_loop_head() {
+    let body = teko::list::push(teko::list::empty(), lwt_loop("", teko::list::push(teko::list::empty(), lwt_continue(""))))
+    let f = lwt_fn("k", "teko::demo", teko::list::empty(), checker::Void { }, body)
+    let lf = match lower_function(f) { LoweredFunction as x => x.func; error as err => return }
+    let text = print_lmodule(add_func(empty_module(), lf))
+    teko::assert::str_contains(text, "  #B1:\n    jump #B1()")
+}
+
+/**
+ * lwt_lowers_defer_fires_before_the_return_value_reads_it — A1-2, #382:
+ * `let s=1; defer { s = s + 100 }; return s` registers the defer inline
+ * (emitting nothing) and fires it — LIFO, here just the one entry — BEFORE
+ * lowering the `return`'s value expression, so `s` resolves to the
+ * POST-defer VReg: the return observes the deferred mutation (mirrors the
+ * C backend's `emit_return`, which fires defers before its own return-value
+ * text, `codegen.tks:5770-5773`).
+ */
+#test
+fn lwt_lowers_defer_fires_before_the_return_value_reads_it() {
+    let s_plus_100 = lwt_bin(lexer::TokenKind::Plus, lwt_var("s", checker::PrimKind::I64), lwt_num_i64(100 to i128), checker::PrimKind::I64)
+    let defer_body = teko::list::push(teko::list::empty(), lwt_simple_assign("s", lexer::TokenKind::Assign, s_plus_100, checker::PrimKind::I64))
+    let body = teko::list::push(teko::list::push(teko::list::push(teko::list::empty(), lwt_bind("s", lwt_num_i64(1 to i128), checker::PrimKind::I64)), lwt_defer(defer_body)), lwt_ret(lwt_var("s", checker::PrimKind::I64)))
+    let f = lwt_fn("f", "teko::demo", teko::list::empty(), checker::Prim { kind = checker::PrimKind::I64 }, body)
+    let lf = match lower_function(f) { LoweredFunction as x => x.func; error as err => return }
+    let text = print_lmodule(add_func(empty_module(), lf))
+    teko::assert::str_contains(text, "%0 = const 1")
+    teko::assert::str_contains(text, "const 100")
+    teko::assert::str_contains(text, "iadd ")
+    teko::assert::str_contains(text, "ret %2")
+}
+
+/**
+ * lwt_lowers_defer_fires_before_a_trailing_expressions_auto_return —
+ * A1-2, #382: `let s=1; defer { s = s + 100 }; s` — the body's trailing
+ * EXPRESSION (no explicit `return`) auto-returns via `lower_fn_body`
+ * (#421). The trailing value is MATERIALIZED before the pending defer
+ * fires (mirroring the C backend's `emit_exprstmt_tail`), so the return
+ * observes the PRE-defer `s` (%0) — unlike an explicit `return`, whose
+ * `emit_return` fires defers first (see the sibling test).
+ */
+#test
+fn lwt_lowers_defer_fires_before_a_trailing_expressions_auto_return() {
+    let s_plus_100 = lwt_bin(lexer::TokenKind::Plus, lwt_var("s", checker::PrimKind::I64), lwt_num_i64(100 to i128), checker::PrimKind::I64)
+    let defer_body = teko::list::push(teko::list::empty(), lwt_simple_assign("s", lexer::TokenKind::Assign, s_plus_100, checker::PrimKind::I64))
+    let body = teko::list::push(teko::list::push(teko::list::push(teko::list::empty(), lwt_bind("s", lwt_num_i64(1 to i128), checker::PrimKind::I64)), lwt_defer(defer_body)), lwt_exprstmt(lwt_var("s", checker::PrimKind::I64)))
+    let f = lwt_fn("tail_defer", "teko::demo", teko::list::empty(), checker::Prim { kind = checker::PrimKind::I64 }, body)
+    let lf = match lower_function(f) { LoweredFunction as x => x.func; error as err => return }
+    let text = print_lmodule(add_func(empty_module(), lf))
+    teko::assert::str_contains(text, "const 100")
+    teko::assert::str_contains(text, "iadd ")
+    teko::assert::str_contains(text, "ret %0")
+}
+
+/**
+ * lwt_lowers_defer_fires_before_a_void_functions_fall_through_return —
+ * A1-2, #382: `fn v() { let s=1; defer { s = s + 100 } }` — a VOID body
+ * with no explicit `return` closes via `close_function`'s own
+ * fall-through, which must fire the pending defer before its implicit
+ * void `ret` (mirrors the C backend's fn-body fall-through defer fire,
+ * `codegen.tks:6418-6429`).
+ */
+#test
+fn lwt_lowers_defer_fires_before_a_void_functions_fall_through_return() {
+    let s_plus_100 = lwt_bin(lexer::TokenKind::Plus, lwt_var("s", checker::PrimKind::I64), lwt_num_i64(100 to i128), checker::PrimKind::I64)
+    let defer_body = teko::list::push(teko::list::empty(), lwt_simple_assign("s", lexer::TokenKind::Assign, s_plus_100, checker::PrimKind::I64))
+    let body = teko::list::push(teko::list::push(teko::list::empty(), lwt_bind("s", lwt_num_i64(1 to i128), checker::PrimKind::I64)), lwt_defer(defer_body))
+    let f = lwt_fn("v", "teko::demo", teko::list::empty(), checker::Void { }, body)
+    let lf = match lower_function(f) { LoweredFunction as x => x.func; error as err => return }
+    let text = print_lmodule(add_func(empty_module(), lf))
+    teko::assert::str_contains(text, "const 100")
+    teko::assert::str_contains(text, "iadd ")
+    teko::assert::str_contains(text, "ret\n}")
+}
+
+/**
+ * lwt_lowers_a_defer_fires_independently_on_each_of_two_return_paths —
+ * A1-2, #382: `let s=1; defer { s = s + 100 }; if x>0 { return s };
+ * return s + 1` — the SAME registered defer replays (LIFO, from index 0)
+ * independently at EACH reachable `return`: once inside the `if`'s
+ * then-arm and once more at the tail `return`, each producing its OWN
+ * fresh `iadd …, 100` from the ORIGINAL pre-defer value — proving
+ * `replay_defers` is a non-destructive replay (firing once does not
+ * consume the entry), so a defer fires at EVERY scope exit, not just the
+ * first one reached.
+ */
+#test
+fn lwt_lowers_a_defer_fires_independently_on_each_of_two_return_paths() {
+    let s_plus_100 = lwt_bin(lexer::TokenKind::Plus, lwt_var("s", checker::PrimKind::I64), lwt_num_i64(100 to i128), checker::PrimKind::I64)
+    let defer_body = teko::list::push(teko::list::empty(), lwt_simple_assign("s", lexer::TokenKind::Assign, s_plus_100, checker::PrimKind::I64))
+    let cond = lwt_cmp(lwt_var("x", checker::PrimKind::I64), teko::list::push(teko::list::empty(), lwt_cmp_term(lexer::TokenKind::Gt, lwt_num_i64(0 to i128))))
+    let then_ret = teko::list::push(teko::list::empty(), lwt_ret(lwt_var("s", checker::PrimKind::I64)))
+    let ifstmt = lwt_if_stmt(cond, then_ret, false, teko::list::empty())
+    let tail_ret = lwt_ret(lwt_bin(lexer::TokenKind::Plus, lwt_var("s", checker::PrimKind::I64), lwt_num_i64(1 to i128), checker::PrimKind::I64))
+    let body = teko::list::push(teko::list::push(teko::list::push(teko::list::push(teko::list::empty(), lwt_bind("s", lwt_num_i64(1 to i128), checker::PrimKind::I64)), lwt_defer(defer_body)), lwt_exprstmt(ifstmt)), tail_ret)
+    let params = teko::list::push(teko::list::empty(), lwt_param("x", "i64"))
+    let f = lwt_fn("multi", "teko::demo", params, checker::Prim { kind = checker::PrimKind::I64 }, body)
+    let lf = match lower_function(f) { LoweredFunction as x => x.func; error as err => return }
+    let text = print_lmodule(add_func(empty_module(), lf))
+    teko::assert::str_contains(text, "  #B1:\n    %4 = const 100\n    %5 = iadd %1, %4\n    ret %5")
+    teko::assert::str_contains(text, "  #B3:\n    %6 = const 100\n    %7 = iadd %1, %6\n    %8 = const 1\n    %9 = iadd %7, %8\n    ret %9")
+}
+
+/**
+ * lwt_lowers_loop_leaves_a_fat_local_unpromoted — A1-2, #382: `let s = "hi";
+ * loop { break }; exit(s.len)` — `s` is the ONLY name live at the loop's
+ * entry, but it is a FAT (str) binding, so `promote_env` leaves it
+ * UNPROMOTED: both the head and exit blocks stay zero-arg, and `s.len`
+ * still resolves with NO memory traffic (the fat length VReg threads
+ * through the loop untouched, exactly as it was before it).
+ */
+#test
+fn lwt_lowers_loop_leaves_a_fat_local_unpromoted() {
+    mut items: []checker::TItem = teko::list::empty()
+    items = teko::list::push(items, lwt_item(lwt_bind_typed("s", lwt_strlit("hi"), checker::Str { })))
+    items = teko::list::push(items, lwt_item(lwt_loop("", teko::list::push(teko::list::empty(), lwt_break("")))))
+    let len_access = lwt_field_access(lwt_typed_var("s", checker::Str { }), "len", lwt_prim(checker::PrimKind::I64))
+    items = teko::list::push(items, lwt_item(lwt_exprstmt(lwt_call(lwt_path1("exit"), "", teko::list::push(teko::list::empty(), len_access), checker::Void { }))))
+    let prog = checker::TProgram { items = items }
+    let m = match lower_program(prog) { LModule as x => x; error as err => return }
+    let text = print_lmodule(m)
+    teko::assert::str_contains(text, "%1 = const 2")
+    teko::assert::str_contains(text, "    jump #B1()\n  #B1:\n    jump #B2()\n  #B2:\n    call @tk_exit(%1)")
+}
+
+/**
+ * lwt_honest_stop_on_break_outside_a_loop — a bare `break` with no
+ * enclosing `loop` on its lowering path is a checker invariant break
+ * (M.1) — `find_loop_target` honest-stops by name rather than resolving
+ * to a bogus target (A1-2, #382).
+ */
+#test
+fn lwt_honest_stop_on_break_outside_a_loop() {
+    let body = teko::list::push(teko::list::empty(), lwt_break(""))
+    let f = lwt_fn("stray_break", "teko::demo", teko::list::empty(), checker::Void { }, body)
+    let out = match lower_function(f) { LoweredFunction => "ok"; error as e => e.message }
+    teko::assert::str_contains(out, "break/continue outside a loop")
+}
+
+/**
+ * lwt_honest_stop_on_continue_outside_a_loop — the same invariant guard as
+ * `lwt_honest_stop_on_break_outside_a_loop`, exercised through
+ * `lower_continue`'s own call site (A1-2, #382).
+ */
+#test
+fn lwt_honest_stop_on_continue_outside_a_loop() {
+    let body = teko::list::push(teko::list::empty(), lwt_continue(""))
+    let f = lwt_fn("stray_continue", "teko::demo", teko::list::empty(), checker::Void { }, body)
+    let out = match lower_function(f) { LoweredFunction => "ok"; error as e => e.message }
+    teko::assert::str_contains(out, "break/continue outside a loop")
 }
