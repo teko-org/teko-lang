@@ -1,4 +1,5 @@
 use teko::checker
+use teko::io
 use teko::lexer
 use teko::parser
 
@@ -91,6 +92,27 @@ fn lwt_bind(name: str, e: checker::TExpr, k: checker::PrimKind) -> checker::TSta
 }
 fn lwt_exprstmt(e: checker::TExpr) -> checker::TStatement { checker::TExprStmt { expr = e } }
 
+/** lwt_loop — a `TLoopStmt` node (A1-2, #382 — `label` empty = unlabeled). */
+fn lwt_loop(label: str, body: []checker::TStatement) -> checker::TStatement {
+    checker::TLoopStmt { label = label; body = body }
+}
+
+/** lwt_break — a `TBreakStmt` node (A1-2, #382 — `label` empty = innermost loop). */
+fn lwt_break(label: str) -> checker::TStatement { checker::TBreakStmt { label = label } }
+
+/** lwt_continue — a `TContinueStmt` node (A1-2, #382 — `label` empty = innermost loop). */
+fn lwt_continue(label: str) -> checker::TStatement { checker::TContinueStmt { label = label } }
+
+/** lwt_defer — a `TDeferStmt` node (A1-2, #382). */
+fn lwt_defer(body: []checker::TStatement) -> checker::TStatement { checker::TDeferStmt { body = body } }
+
+/** lwt_simple_assign — `name op= value` (or `name = value`), a Simple-kind
+    TAssign (A1-2, #382 — the shared shape the loop/break/defer fixtures
+    reassign a local through). */
+fn lwt_simple_assign(name: str, op: lexer::TokenKind, value: checker::TExpr, k: checker::PrimKind) -> checker::TStatement {
+    checker::TAssign { kind = parser::AssignKind::Simple; name = name; op = op; bound = lwt_prim(k); value = value; deref = false; target = checker::no_texpr() }
+}
+
 fn lwt_fn(name: str, ns: str, params: []parser::Param, ret: checker::Type, body: []checker::TStatement) -> checker::TFunction {
     checker::TFunction {
         name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty()
@@ -114,7 +136,11 @@ fn lwt_lower_expr_text(e: checker::TExpr) -> str {
     golden dump shows its `rodata`/`{ptr,len}`/lifted-function shape too. */
 fn lwt_lower_expr_text_with(e: checker::TExpr, layouts: []LStructLayout) -> str {
     let f0 = new_func("t", 0, teko::list::empty(), LType::I64)
-    let ctx0 = LowerCtx { func = f0; block_id = 0; env = empty_lenv(); layouts = layouts; rodata = teko::list::empty(); enums = teko::list::empty(); lifted = teko::list::empty() }
+    let ctx0 = LowerCtx {
+        func = f0; block_id = 0; env = empty_lenv()
+        layouts = layouts; rodata = teko::list::empty(); enums = teko::list::empty(); lifted = teko::list::empty()
+        defers = teko::list::empty(); loop_targets = teko::list::empty()
+    }
     let lo = match lower_expr(ctx0, e) { Lowered as x => x; error as err => return teko::str::concat("ERR: ", err.message) }
     let m0 = with_rodata(add_func(empty_module(), lo.ctx.func), lo.ctx.rodata)
     print_lmodule(lwt_fold_lifted(m0, lo.ctx.lifted))
@@ -1234,4 +1260,96 @@ fn lwt_interp_runs_lambda_trailing_expression_via_closure_call() {
     let prog = checker::TProgram { items = items }
     let m = match lower_program(prog) { LModule as x => x; error as err => return }
     teko::assert::is_true(interp_lmodule(m, "main", teko::list::empty()) == (42 to i128))
+}
+
+#test
+fn lwt_debug_probe_loop_break() {
+    let bump = lwt_simple_assign("s", lexer::TokenKind::Assign, lwt_bin(lexer::TokenKind::Plus, lwt_var("s", checker::PrimKind::I64), lwt_num_i64(1 to i128), checker::PrimKind::I64), checker::PrimKind::I64)
+    let cond = lwt_cmp(lwt_var("s", checker::PrimKind::I64), teko::list::push(teko::list::empty(), lwt_cmp_term(lexer::TokenKind::EqEq, lwt_num_i64(5 to i128))))
+    let ifstmt = lwt_if_stmt(cond, teko::list::push(teko::list::empty(), lwt_break("")), false, teko::list::empty())
+    let loop_body = teko::list::push(teko::list::push(teko::list::empty(), bump), lwt_exprstmt(ifstmt))
+    mut items: []checker::TItem = teko::list::empty()
+    items = teko::list::push(items, lwt_item(lwt_bind("s", lwt_num_i64(0 to i128), checker::PrimKind::I64)))
+    items = teko::list::push(items, lwt_item(lwt_loop("", loop_body)))
+    items = teko::list::push(items, lwt_item(lwt_exprstmt(lwt_call(lwt_path1("exit"), "", teko::list::push(teko::list::empty(), lwt_var("s", checker::PrimKind::I64)), checker::Void { }))))
+    let prog = checker::TProgram { items = items }
+    let m = match lower_program(prog) { LModule as x => x; error as err => { teko::io::write_file("/tmp/dbg_loop.txt", teko::str::concat("ERR: ", err.message)); return } }
+    let text = print_lmodule(m)
+    teko::io::write_file("/tmp/dbg_loop.txt", text)
+    teko::assert::is_true(true)
+}
+
+#test
+fn lwt_debug_probe_defer_return() {
+    let s_plus_100 = lwt_bin(lexer::TokenKind::Plus, lwt_var("s", checker::PrimKind::I64), lwt_num_i64(100 to i128), checker::PrimKind::I64)
+    let defer_body = teko::list::push(teko::list::empty(), lwt_simple_assign("s", lexer::TokenKind::Assign, s_plus_100, checker::PrimKind::I64))
+    let body = teko::list::push(teko::list::push(teko::list::push(teko::list::empty(), lwt_bind("s", lwt_num_i64(1 to i128), checker::PrimKind::I64)), lwt_defer(defer_body)), lwt_ret(lwt_var("s", checker::PrimKind::I64)))
+    let f = lwt_fn("f", "teko::demo", teko::list::empty(), checker::Prim { kind = checker::PrimKind::I64 }, body)
+    let lf = match lower_function(f) { LoweredFunction as x => x.func; error as err => { teko::io::write_file("/tmp/dbg_defer.txt", teko::str::concat("ERR: ", err.message)); return } }
+    let text = print_lmodule(add_func(empty_module(), lf))
+    teko::io::write_file("/tmp/dbg_defer.txt", text)
+    teko::assert::is_true(true)
+}
+
+#test
+fn lwt_debug_probe_bare_break() {
+    let body = teko::list::push(teko::list::empty(), lwt_loop("", teko::list::push(teko::list::empty(), lwt_break(""))))
+    let f = lwt_fn("g", "teko::demo", teko::list::empty(), checker::Void { }, body)
+    let lf = match lower_function(f) { LoweredFunction as x => x.func; error as err => { teko::io::write_file("/tmp/dbg_bare_break.txt", teko::str::concat("ERR: ", err.message)); return } }
+    let text = print_lmodule(add_func(empty_module(), lf))
+    teko::io::write_file("/tmp/dbg_bare_break.txt", text)
+    teko::assert::is_true(true)
+}
+
+#test
+fn lwt_debug_probe_labeled_break() {
+    let inner = lwt_loop("", teko::list::push(teko::list::empty(), lwt_break("outer")))
+    let outer_body = teko::list::push(teko::list::empty(), inner)
+    let body = teko::list::push(teko::list::empty(), lwt_loop("outer", outer_body))
+    let f = lwt_fn("h", "teko::demo", teko::list::empty(), checker::Void { }, body)
+    let lf = match lower_function(f) { LoweredFunction as x => x.func; error as err => { teko::io::write_file("/tmp/dbg_labeled.txt", teko::str::concat("ERR: ", err.message)); return } }
+    let text = print_lmodule(add_func(empty_module(), lf))
+    teko::io::write_file("/tmp/dbg_labeled.txt", text)
+    teko::assert::is_true(true)
+}
+
+#test
+fn lwt_debug_probe_continue() {
+    let body = teko::list::push(teko::list::empty(), lwt_loop("", teko::list::push(teko::list::empty(), lwt_continue(""))))
+    let f = lwt_fn("k", "teko::demo", teko::list::empty(), checker::Void { }, body)
+    let lf = match lower_function(f) { LoweredFunction as x => x.func; error as err => { teko::io::write_file("/tmp/dbg_continue.txt", teko::str::concat("ERR: ", err.message)); return } }
+    let text = print_lmodule(add_func(empty_module(), lf))
+    teko::io::write_file("/tmp/dbg_continue.txt", text)
+    teko::assert::is_true(true)
+}
+
+#test
+fn lwt_debug_probe_defer_multi_exit() {
+    let s_plus_100 = lwt_bin(lexer::TokenKind::Plus, lwt_var("s", checker::PrimKind::I64), lwt_num_i64(100 to i128), checker::PrimKind::I64)
+    let defer_body = teko::list::push(teko::list::empty(), lwt_simple_assign("s", lexer::TokenKind::Assign, s_plus_100, checker::PrimKind::I64))
+    let cond = lwt_cmp(lwt_var("x", checker::PrimKind::I64), teko::list::push(teko::list::empty(), lwt_cmp_term(lexer::TokenKind::Gt, lwt_num_i64(0 to i128))))
+    let then_ret = teko::list::push(teko::list::empty(), lwt_ret(lwt_var("s", checker::PrimKind::I64)))
+    let ifstmt = lwt_if_stmt(cond, then_ret, false, teko::list::empty())
+    let tail_ret = lwt_ret(lwt_bin(lexer::TokenKind::Plus, lwt_var("s", checker::PrimKind::I64), lwt_num_i64(1 to i128), checker::PrimKind::I64))
+    let body = teko::list::push(teko::list::push(teko::list::push(teko::list::push(teko::list::empty(), lwt_bind("s", lwt_num_i64(1 to i128), checker::PrimKind::I64)), lwt_defer(defer_body)), lwt_exprstmt(ifstmt)), tail_ret)
+    let params = teko::list::push(teko::list::empty(), lwt_param("x", "i64"))
+    let f = lwt_fn("multi", "teko::demo", params, checker::Prim { kind = checker::PrimKind::I64 }, body)
+    let lf = match lower_function(f) { LoweredFunction as x => x.func; error as err => { teko::io::write_file("/tmp/dbg_multi.txt", teko::str::concat("ERR: ", err.message)); return } }
+    let text = print_lmodule(add_func(empty_module(), lf))
+    teko::io::write_file("/tmp/dbg_multi.txt", text)
+    teko::assert::is_true(true)
+}
+
+#test
+fn lwt_debug_probe_fat_passthrough() {
+    mut items: []checker::TItem = teko::list::empty()
+    items = teko::list::push(items, lwt_item(lwt_bind_typed("s", lwt_strlit("hi"), checker::Str { })))
+    items = teko::list::push(items, lwt_item(lwt_loop("", teko::list::push(teko::list::empty(), lwt_break("")))))
+    let len_access = lwt_field_access(lwt_typed_var("s", checker::Str { }), "len", lwt_prim(checker::PrimKind::I64))
+    items = teko::list::push(items, lwt_item(lwt_exprstmt(lwt_call(lwt_path1("exit"), "", teko::list::push(teko::list::empty(), len_access), checker::Void { }))))
+    let prog = checker::TProgram { items = items }
+    let m = match lower_program(prog) { LModule as x => x; error as err => { teko::io::write_file("/tmp/dbg_fat.txt", teko::str::concat("ERR: ", err.message)); return } }
+    let text = print_lmodule(m)
+    teko::io::write_file("/tmp/dbg_fat.txt", text)
+    teko::assert::is_true(true)
 }

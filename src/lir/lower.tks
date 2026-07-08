@@ -307,6 +307,22 @@ fn is_c_keyword(s: str) -> bool {
 pub type LEnumInfo = struct { name: str; members: []str }
 
 /**
+ * LoopTargets — one active `loop`'s break/continue jump targets (A1-2,
+ * #382): `head` is the block a `continue` jumps to (the loop body's own
+ * entry), `exit` is the block a `break` jumps to (the block immediately
+ * after the loop), `defer_base` is `ctx.defers.len` at the loop body's
+ * entry (so a break/continue crossing this loop fires exactly the defers
+ * registered INSIDE its own body, LIFO), and `names` is the ordered list
+ * of SCALAR local names `promote_env` gave a block-arg on both `head` and
+ * `exit` — the loop head/exit are both MERGE points (the entry edge and
+ * every back/break edge flow into them), so a `break`/`continue` jump must
+ * supply, in this SAME order, the CURRENT VReg of each — mirroring the
+ * SAME block-arg merge principle an if-expression's result VReg already
+ * uses (§2.4).
+ */
+pub type LoopTargets = struct { label: str; head: u32; exit: u32; defer_base: u64; names: []str }
+
+/**
  * LowerCtx — the lowering state threaded through the expr/stmt walk: the
  * current LFunc being built + the id of the block instructions append to (N1
  * always block 0) + the local env (name -> VReg) so a TVar resolves to its
@@ -321,9 +337,19 @@ pub type LEnumInfo = struct { name: str; members: []str }
  * every closure/thunk LFunc a `TLambda`/`TVar.is_func` lowering builds is
  * folded in here first, then into the module's `funcs` ONCE, at the very end
  * of `lower_program` — its length also serves as the monotonic id counter a
- * fresh lifted symbol's name embeds).
+ * fresh lifted symbol's name embeds) + the CURRENT FUNCTION'S pending-defer
+ * stack (A1-2, #382 — every `defer { … }` reached so far, in program order;
+ * append-only, reset per function/lambda body, fired in LIFO slices by
+ * `replay_defers` at each scope exit) + the active loop-target stack (A1-2,
+ * #382 — innermost loop last, so a `break`/`continue` resolves by scanning
+ * from the end; reset per function/lambda body, since neither construct
+ * crosses a function boundary).
  */
-pub type LowerCtx = struct { func: LFunc; block_id: u32; env: LEnv; layouts: []LStructLayout; rodata: []LRodata; enums: []LEnumInfo; lifted: []LFunc }
+pub type LowerCtx = struct {
+    func: LFunc; block_id: u32; env: LEnv
+    layouts: []LStructLayout; rodata: []LRodata; enums: []LEnumInfo; lifted: []LFunc
+    defers: []checker::TDeferStmt; loop_targets: []LoopTargets
+}
 
 /** Lowered — the result of lowering an expression: the updated context + the VReg the
     value lives in. */
@@ -350,7 +376,11 @@ pub type LowerStmtOut = struct { ctx: LowerCtx; terminated: bool }
  * @return LowerCtx  the rebuilt context
  */
 fn ctx_with(ctx: LowerCtx, func: LFunc, block_id: u32, env: LEnv) -> LowerCtx {
-    LowerCtx { func = func; block_id = block_id; env = env; layouts = ctx.layouts; rodata = ctx.rodata; enums = ctx.enums; lifted = ctx.lifted }
+    LowerCtx {
+        func = func; block_id = block_id; env = env
+        layouts = ctx.layouts; rodata = ctx.rodata; enums = ctx.enums; lifted = ctx.lifted
+        defers = ctx.defers; loop_targets = ctx.loop_targets
+    }
 }
 
 /**
@@ -363,7 +393,11 @@ fn ctx_with(ctx: LowerCtx, func: LFunc, block_id: u32, env: LEnv) -> LowerCtx {
  * @return LowerCtx  the rebuilt context
  */
 fn ctx_with_rodata(ctx: LowerCtx, rodata: []LRodata) -> LowerCtx {
-    LowerCtx { func = ctx.func; block_id = ctx.block_id; env = ctx.env; layouts = ctx.layouts; rodata = rodata; enums = ctx.enums; lifted = ctx.lifted }
+    LowerCtx {
+        func = ctx.func; block_id = ctx.block_id; env = ctx.env
+        layouts = ctx.layouts; rodata = rodata; enums = ctx.enums; lifted = ctx.lifted
+        defers = ctx.defers; loop_targets = ctx.loop_targets
+    }
 }
 
 /**
@@ -376,7 +410,45 @@ fn ctx_with_rodata(ctx: LowerCtx, rodata: []LRodata) -> LowerCtx {
  * @return LowerCtx  the rebuilt context
  */
 fn ctx_with_lifted(ctx: LowerCtx, lifted: []LFunc) -> LowerCtx {
-    LowerCtx { func = ctx.func; block_id = ctx.block_id; env = ctx.env; layouts = ctx.layouts; rodata = ctx.rodata; enums = ctx.enums; lifted = lifted }
+    LowerCtx {
+        func = ctx.func; block_id = ctx.block_id; env = ctx.env
+        layouts = ctx.layouts; rodata = ctx.rodata; enums = ctx.enums; lifted = lifted
+        defers = ctx.defers; loop_targets = ctx.loop_targets
+    }
+}
+
+/**
+ * ctx_with_defers — a copy of `ctx` with its pending-defer stack replaced by
+ * `defers` (everything else unchanged) — the one site a fresh `TDeferStmt`
+ * registration threads forward (A1-2, #382).
+ *
+ * @param LowerCtx ctx  the context to rebuild
+ * @param []checker::TDeferStmt defers  the grown defer stack
+ * @return LowerCtx  the rebuilt context
+ */
+fn ctx_with_defers(ctx: LowerCtx, defers: []checker::TDeferStmt) -> LowerCtx {
+    LowerCtx {
+        func = ctx.func; block_id = ctx.block_id; env = ctx.env
+        layouts = ctx.layouts; rodata = ctx.rodata; enums = ctx.enums; lifted = ctx.lifted
+        defers = defers; loop_targets = ctx.loop_targets
+    }
+}
+
+/**
+ * ctx_with_loops — a copy of `ctx` with its active loop-target stack
+ * replaced by `loop_targets` (everything else unchanged) — the site a
+ * `lower_loop` pushes/restores its own target (A1-2, #382).
+ *
+ * @param LowerCtx ctx  the context to rebuild
+ * @param []LoopTargets loop_targets  the replacement loop-target stack
+ * @return LowerCtx  the rebuilt context
+ */
+fn ctx_with_loops(ctx: LowerCtx, loop_targets: []LoopTargets) -> LowerCtx {
+    LowerCtx {
+        func = ctx.func; block_id = ctx.block_id; env = ctx.env
+        layouts = ctx.layouts; rodata = ctx.rodata; enums = ctx.enums; lifted = ctx.lifted
+        defers = ctx.defers; loop_targets = loop_targets
+    }
 }
 
 /** ctx_alloc — reserve a fresh VReg in the current function, returning it + the advanced
@@ -1342,21 +1414,28 @@ fn bind_lambda_captures(ctx: LowerCtx, layout: LStructLayout, captures: []checke
 }
 
 /**
- * close_lambda_body — append the implicit void return when the lifted
- * body's current block did not already terminate (mirrors `close_function`).
- * A NON-void lambda's block is already terminated by the time this runs —
- * `lower_fn_body` auto-returns its trailing expression (#421) — so this only
- * ever fires for a `void`-returning lambda's fall-through (A1-7 #382).
+ * close_lambda_body — fire any still-pending defer (from index 0, LIFO) and
+ * append the implicit void return when the lifted body's current block did
+ * not already terminate (mirrors `close_function`). A NON-void lambda's
+ * block is already terminated by the time this runs — `lower_fn_body`
+ * auto-returns its trailing expression (#421) — so this only ever fires for
+ * a `void`-returning lambda's fall-through (A1-7 #382; defer replay A1-2
+ * #382).
  *
  * @param LowerCtx ctx  the lifted body's lowering context, after its
  *                      statements have been lowered
  * @param u32 line  the source line to propagate onto a synthesized `ret`
  * @param u32 col  the source column to propagate onto a synthesized `ret`
- * @return LFunc  the closed function
+ * @return LowerCtx | error  the closed context (its `.func` is the closed
+ *                           function; its `.rodata`/`.lifted` carry forward
+ *                           any growth the fall-through defer replay made),
+ *                           or a NAMED internal error when a pending defer
+ *                           fails to lower
  */
-fn close_lambda_body(ctx: LowerCtx, line: u32, col: u32) -> LFunc {
-    if block_terminated(ctx.func, ctx.block_id) { return ctx.func }
-    ctx_append(ctx, ret_void_inst(line, col)).func
+fn close_lambda_body(ctx: LowerCtx, line: u32, col: u32) -> LowerCtx | error {
+    if block_terminated(ctx.func, ctx.block_id) { return ctx }
+    let replayed = match replay_defers(ctx, 0) { LowerCtx as c => c; error as err => return err }
+    ctx_append(replayed, ret_void_inst(line, col))
 }
 
 /** LoweredLambda — a lifted lambda body's (placeholder-symbol) `LFunc` + the
@@ -1391,10 +1470,15 @@ fn build_lambda_lfunc(lam: checker::TLambda, env_layout: LStructLayout, ctx: Low
     let all_ptypes = env_first_param_types(ptypes)
     let seed0 = new_func("", (lam.params.len + 1) to u32, all_ptypes, ltype_of(lam.ret))
     let seed = materialize_lambda_params(seed0, lam, line, col)
-    let ctx0 = LowerCtx { func = seed.func; block_id = 0; env = seed.env; layouts = ctx.layouts; rodata = ctx.rodata; enums = ctx.enums; lifted = ctx.lifted }
+    let ctx0 = LowerCtx {
+        func = seed.func; block_id = 0; env = seed.env
+        layouts = ctx.layouts; rodata = ctx.rodata; enums = ctx.enums; lifted = ctx.lifted
+        defers = teko::list::empty(); loop_targets = teko::list::empty()
+    }
     let with_captures = match bind_lambda_captures(ctx0, env_layout, lam.captures, line, col) { LowerCtx as c => c; error as err => return err }
     let done = match lower_fn_body(with_captures, lam.body, ltype_of(lam.ret), line, col) { LowerCtx as c => c; error as err => return err }
-    LoweredLambda { func = close_lambda_body(done, line, col); rodata = done.rodata; lifted = done.lifted }
+    let closed = match close_lambda_body(done, line, col) { LowerCtx as c => c; error as err => return err }
+    LoweredLambda { func = closed.func; rodata = closed.rodata; lifted = closed.lifted }
 }
 
 /**
@@ -1434,6 +1518,10 @@ pub fn lower_stmt(ctx: LowerCtx, s: checker::TStatement) -> LowerStmtOut | error
         checker::TAssign as a => lower_assign(ctx, a)
         checker::TReturn as r => lower_return(ctx, r)
         checker::TExprStmt as es => lower_expr_stmt(ctx, es)
+        checker::TLoopStmt as l => lower_loop(ctx, l)
+        checker::TBreakStmt as b => lower_break(ctx, b)
+        checker::TContinueStmt as c => lower_continue(ctx, c)
+        checker::TDeferStmt as d => lower_defer(ctx, d)
         _ => error { message = teko::str::concat("native backend N1: ", tstmt_kind_name(s), " not yet lowered (N2)") }
     }
 }
@@ -1460,14 +1548,28 @@ fn bind_target_name(t: parser::BindTarget) -> str | error {
     }
 }
 
-/** lower_return — `return e` (or bare `return`): lower the value (when present) and emit the
-    LRet terminator, closing the block. */
+/**
+ * lower_return — `return e` (or bare `return`): a `return` leaves EVERY
+ * enclosing scope, so first fire ALL pending defers (from index 0, LIFO —
+ * mirrors the C backend's `emit_return`, `codegen.tks:5770-5773`, which
+ * fires before its own return-value TEXT so a defer's mutation of a local
+ * IS observable through the value `r.value` reads afterward), THEN lower
+ * the return value (when present), THEN emit the `LRet` terminator, closing
+ * the block (A1-2, #382).
+ *
+ * @param LowerCtx ctx  the lowering context
+ * @param checker::TReturn r  the return node
+ * @return LowerStmtOut | error  the advanced (terminated) context, or a
+ *                               NAMED internal error when a pending defer
+ *                               body fails to lower
+ */
 fn lower_return(ctx: LowerCtx, r: checker::TReturn) -> LowerStmtOut | error {
+    let replayed = match replay_defers(ctx, 0) { LowerCtx as c => c; error as err => return err }
     if !r.has_value {
         let vinst = ret_void_inst(r.value.line, r.value.col)
-        return LowerStmtOut { ctx = ctx_append(ctx, vinst); terminated = true }
+        return LowerStmtOut { ctx = ctx_append(replayed, vinst); terminated = true }
     }
-    let lo = match lower_expr(ctx, r.value) { Lowered as x => x; error as err => return err }
+    let lo = match lower_expr(replayed, r.value) { Lowered as x => x; error as err => return err }
     let inst = ret_inst(lo.vreg, r.value.line, r.value.col)
     LowerStmtOut { ctx = ctx_append(lo.ctx, inst); terminated = true }
 }
@@ -1477,6 +1579,290 @@ fn lower_return(ctx: LowerCtx, r: checker::TReturn) -> LowerStmtOut | error {
 fn lower_expr_stmt(ctx: LowerCtx, es: checker::TExprStmt) -> LowerStmtOut | error {
     let lo = match lower_expr(ctx, es.expr) { Lowered as x => x; error as err => return err }
     LowerStmtOut { ctx = lo.ctx; terminated = false }
+}
+
+/**
+ * lower_defer — `defer { … }`: register the node onto the pending-defer
+ * stack (LIFO order is `replay_defers`'s job, at whichever scope exit fires
+ * it) and emit nothing inline — mirrors the C backend's `dctx_register`
+ * (`codegen.tks:5273-5277`) (A1-2, #382).
+ *
+ * @param LowerCtx ctx  the lowering context
+ * @param checker::TDeferStmt d  the defer node to register
+ * @return LowerStmtOut  the context with `d` appended to `.defers`
+ *                        (terminated=false — a `defer` never closes its
+ *                        enclosing block)
+ */
+fn lower_defer(ctx: LowerCtx, d: checker::TDeferStmt) -> LowerStmtOut {
+    LowerStmtOut { ctx = ctx_with_defers(ctx, teko::list::push(ctx.defers, d)); terminated = false }
+}
+
+/**
+ * replay_defers — fire every deferred body registered at index ≥ `base` in
+ * `ctx.defers`, LIFO (innermost/most-recent first), by lowering each body's
+ * statements straight-line into the CURRENT block — mirrors the C backend's
+ * `emit_defers` (`codegen.tks:5247-5271`). A defer body never itself
+ * contains a `return`/`break`/`continue`/`defer` (checker-enforced,
+ * `typer.tks:3068-3079`), so lowering it plainly via `lower_block` never
+ * re-enters this replay (A1-2, #382).
+ *
+ * @param LowerCtx ctx  the lowering context; its OWN `.defers` stack is READ
+ *                      (not shrunk — firing is a symbolic replay over
+ *                      already-lowered source structure, not a runtime pop)
+ * @param u64 base  the defer-stack index the exiting scope started at;
+ *                  every entry at or after this index fires
+ * @return LowerCtx | error  the advanced context (its current block grown
+ *                           with the replayed instructions), or a NAMED
+ *                           internal error when a defer body fails to lower
+ */
+fn replay_defers(ctx: LowerCtx, base: u64) -> LowerCtx | error {
+    mut cur = ctx
+    mut i: u64 = ctx.defers.len
+    loop {
+        if i <= base { break }
+        i = i - 1
+        cur = match lower_block(cur, ctx.defers[i].body) { LowerCtx as c => c; error as err => return err }
+    }
+    cur
+}
+
+/**
+ * PromotedEnv — the result of giving a MERGE block (a loop's head or exit)
+ * one block-arg per SCALAR (non-fat) name in an env: the advanced function,
+ * the rebuilt env (each such name now bound to its fresh block-arg VReg,
+ * every FAT binding passed through unchanged, unpromoted), and the ordered
+ * name list a caller matches against `env_scalar_vregs` to build a jump's
+ * argument list into this block (A1-2, #382 — a loop head/exit are both
+ * MERGE points, mirroring the SAME block-arg principle an if-expression's
+ * result VReg already uses, §2.4).
+ */
+pub type PromotedEnv = struct { func: LFunc; env: LEnv; names: []str }
+
+/**
+ * promote_env — allocate one fresh block-arg VReg per SCALAR (non-fat)
+ * binding in `env`, in order, on block `block_id`; rebuild the env with
+ * those names now bound to their fresh block-arg VReg. A FAT (str/slice)
+ * binding is left UNPROMOTED — its ptr/len stay whatever they were for the
+ * whole scope; no A1-2 fixture reassigns a fat local inside a loop
+ * (A1-2, #382).
+ *
+ * @param LFunc f  the function whose block gains the params
+ * @param u32 block_id  the merge block (already allocated) to add params to
+ * @param LEnv env  the env to promote (its SHAPE — names/fat-vs-scalar —
+ *                   drives which entries get a param)
+ * @return PromotedEnv  the advanced function + the rebuilt env + the ordered
+ *                       promoted-name list
+ */
+fn promote_env(f: LFunc, block_id: u32, env: LEnv) -> PromotedEnv {
+    mut cur_f = f
+    mut new_env = empty_lenv()
+    mut names: []str = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= env.names.len { break }
+        if env.has_len[i] {
+            new_env = lenv_bind_fat(new_env, env.names[i], env.vregs[i], env.len_vregs[i])
+        } else {
+            let bp = add_block_param(cur_f, block_id)
+            cur_f = bp.func
+            new_env = lenv_bind(new_env, env.names[i], bp.vreg)
+            names = teko::list::push(names, env.names[i])
+        }
+        i++
+    }
+    PromotedEnv { func = cur_f; env = new_env; names = names }
+}
+
+/**
+ * env_scalar_vregs — the CURRENT VReg of each SCALAR (non-fat) binding in
+ * `env`, in order — the argument list a jump/branch into a `promote_env`'d
+ * merge block supplies (A1-2, #382).
+ *
+ * @param LEnv env  the env to read
+ * @return []u32  each non-fat binding's current VReg, in order
+ */
+fn env_scalar_vregs(env: LEnv) -> []u32 {
+    mut out: []u32 = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= env.names.len { break }
+        if !env.has_len[i] { out = teko::list::push(out, env.vregs[i]) }
+        i++
+    }
+    out
+}
+
+/**
+ * jump_args_for_names — the CURRENT VReg of each name in `names` (in
+ * order), read from `env` — the argument list a `break`/`continue`/loop
+ * back-edge jump supplies into a target `promote_env`'d block whose params
+ * are exactly `names`, positionally (A1-2, #382).
+ *
+ * @param LEnv env  the env to read (the jump SITE's own, however deeply
+ *                  nested)
+ * @param []str names  the target block's promoted-name list (its param
+ *                      order)
+ * @return []u32  each name's current VReg, in the SAME order as `names`
+ */
+fn jump_args_for_names(env: LEnv, names: []str) -> []u32 {
+    mut out: []u32 = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= names.len { break }
+        out = teko::list::push(out, lenv_lookup(env, names[i]).vreg)
+        i++
+    }
+    out
+}
+
+/**
+ * find_loop_target — the loop-target the innermost matching loop resolves
+ * to: an empty `label` matches the INNERMOST active loop; a non-empty label
+ * scans from the innermost outward for the loop declared with that name —
+ * mirrors the C backend's `cg_target_defer_base` scan (`codegen.tks:
+ * 5299-5310`) (A1-2, #382).
+ *
+ * @param []LoopTargets loops  the active loop-target stack, outermost first
+ * @param str label  the break/continue's target label ("" = innermost)
+ * @return LoopTargets | error  the matching loop's targets, or a NAMED
+ *                              internal error when none match (a checker
+ *                              invariant break — a break/continue outside a
+ *                              loop never reaches lowering)
+ */
+fn find_loop_target(loops: []LoopTargets, label: str) -> LoopTargets | error {
+    mut i: u64 = loops.len
+    loop {
+        if i == 0 { break }
+        i = i - 1
+        let lt = loops[i]
+        if label.len == 0 || lt.label == label { return lt }
+    }
+    error { message = "native backend N1: break/continue outside a loop (internal)" }
+}
+
+/**
+ * lower_break — `break`/`break L`: resolve the target loop, fire every
+ * defer registered inside its own body (LIFO, from its `defer_base`), then
+ * jump to its exit block carrying the CURRENT VReg of each of its promoted
+ * names (A1-2, #382).
+ *
+ * @param LowerCtx ctx  the lowering context
+ * @param checker::TBreakStmt b  the break node
+ * @return LowerStmtOut | error  the advanced (terminated) context, or a
+ *                               NAMED internal error when the target loop
+ *                               is unresolved or a pending defer fails to
+ *                               lower
+ */
+fn lower_break(ctx: LowerCtx, b: checker::TBreakStmt) -> LowerStmtOut | error {
+    let target = match find_loop_target(ctx.loop_targets, b.label) { LoopTargets as t => t; error as err => return err }
+    let replayed = match replay_defers(ctx, target.defer_base) { LowerCtx as c => c; error as err => return err }
+    let args = jump_args_for_names(replayed.env, target.names)
+    LowerStmtOut { ctx = ctx_append(replayed, jump_inst(target.exit, args, 0, 0)); terminated = true }
+}
+
+/**
+ * lower_continue — `continue`/`continue L`: resolve the target loop, fire
+ * every defer registered inside its own body (LIFO, from its
+ * `defer_base`), then jump BACK to its head block carrying the CURRENT
+ * VReg of each of its promoted names (A1-2, #382).
+ *
+ * @param LowerCtx ctx  the lowering context
+ * @param checker::TContinueStmt c  the continue node
+ * @return LowerStmtOut | error  the advanced (terminated) context, or a
+ *                               NAMED internal error when the target loop
+ *                               is unresolved or a pending defer fails to
+ *                               lower
+ */
+fn lower_continue(ctx: LowerCtx, c: checker::TContinueStmt) -> LowerStmtOut | error {
+    let target = match find_loop_target(ctx.loop_targets, c.label) { LoopTargets as t => t; error as err => return err }
+    let replayed = match replay_defers(ctx, target.defer_base) { LowerCtx as c2 => c2; error as err => return err }
+    let args = jump_args_for_names(replayed.env, target.names)
+    LowerStmtOut { ctx = ctx_append(replayed, jump_inst(target.head, args, 0, 0)); terminated = true }
+}
+
+/**
+ * close_loop_body — close a loop's body block: if it already ended in a
+ * terminator (an explicit `return`/`break`/`continue`), leave it as-is;
+ * otherwise fire the loop's own pending defers (registered since
+ * `defer_base`, LIFO) and append an implicit jump BACK to `head` carrying
+ * the current VReg of each promoted name — the body fell through, an
+ * ordinary `while(1)` iteration end (mirrors the C backend's
+ * `emit_loop`'s fall-through edge, `codegen.tks:5845-5850`) (A1-2, #382).
+ *
+ * @param LowerCtx ctx  the context after lowering the loop's body
+ * @param u32 head  the loop head block a fall-through implicitly continues to
+ * @param []str names  the loop's promoted-name list (head's param order)
+ * @param u64 defer_base  the defer-stack index the loop's body started at
+ * @return LowerCtx | error  the context with its body block closed, or a
+ *                           NAMED internal error when a pending defer fails
+ *                           to lower
+ */
+fn close_loop_body(ctx: LowerCtx, head: u32, names: []str, defer_base: u64) -> LowerCtx | error {
+    if block_terminated(ctx.func, ctx.block_id) { return ctx }
+    let replayed = match replay_defers(ctx, defer_base) { LowerCtx as c => c; error as err => return err }
+    let args = jump_args_for_names(replayed.env, names)
+    ctx_append(replayed, jump_inst(head, args, 0, 0))
+}
+
+/**
+ * close_loop — the context immediately after a loop statement: positioned
+ * in the exit block with `exit_env` (every promoted name now reading the
+ * exit block's OWN param — the value whichever `break` was taken carried),
+ * the loop's OWN growth (rodata/lifted/enums/layouts/defers, from lowering
+ * its body) carried forward, and its OWN loop-target restored to what it
+ * was BEFORE the loop (the loop's break/continue target does not survive
+ * past it, A1-2, #382).
+ *
+ * @param LowerCtx outer  the context as it stood BEFORE the loop (its
+ *                        `.loop_targets` is what gets restored)
+ * @param LowerCtx body_done  the context after the loop's body (and its
+ *                            fall-through close) finished lowering
+ * @param u32 exit_block  the loop's exit block id (the new current block)
+ * @param LEnv exit_env  the exit block's own promoted env
+ * @return LowerCtx  the context positioned after the loop
+ */
+fn close_loop(outer: LowerCtx, body_done: LowerCtx, exit_block: u32, exit_env: LEnv) -> LowerCtx {
+    LowerCtx {
+        func = body_done.func; block_id = exit_block; env = exit_env
+        layouts = body_done.layouts; rodata = body_done.rodata; enums = body_done.enums; lifted = body_done.lifted
+        defers = body_done.defers; loop_targets = outer.loop_targets
+    }
+}
+
+/**
+ * lower_loop — a `loop { … }` statement: jump into the body's own block
+ * (`#Bhead`), lower the body there, and — when it falls through normally —
+ * fire its own pending defers before an implicit jump BACK to `#Bhead`
+ * (mirrors the C backend's `while(1){…}`, `codegen.tks:5813-5856`). The
+ * loop's exit block (`#Bexit`) follows immediately; `break` targets it,
+ * `continue` targets `#Bhead`. Both `#Bhead` and `#Bexit` are MERGE
+ * points — the loop head sees the entry edge AND every back edge, the exit
+ * sees every `break` edge — so both get one block-arg per SCALAR local live
+ * in the enclosing env (`promote_env`), threading a loop-mutated variable
+ * (a counter) correctly across iterations, exactly like an if-expression's
+ * result VReg merges through its own block-arg (§2.4) (A1-2, #382).
+ *
+ * @param LowerCtx ctx  the lowering context
+ * @param checker::TLoopStmt l  the loop node
+ * @return LowerStmtOut | error  the advanced context, positioned in
+ *                               `#Bexit` (terminated=false — code AFTER the
+ *                               loop is reachable through a `break`), or a
+ *                               NAMED internal error when the body fails to
+ *                               lower
+ */
+fn lower_loop(ctx: LowerCtx, l: checker::TLoopStmt) -> LowerStmtOut | error {
+    let headb = alloc_block(ctx.func)
+    let exitb = alloc_block(headb.func)
+    let head_seed = promote_env(exitb.func, headb.block_id, ctx.env)
+    let exit_seed = promote_env(head_seed.func, exitb.block_id, ctx.env)
+    let entry_args = env_scalar_vregs(ctx.env)
+    let entered = append_inst(exit_seed.func, ctx.block_id, jump_inst(headb.block_id, entry_args, 0, 0))
+    let defer_base = ctx.defers.len
+    let target = LoopTargets { label = l.label; head = headb.block_id; exit = exitb.block_id; defer_base = defer_base; names = head_seed.names }
+    let body_seed = ctx_with_loops(ctx_with(ctx, entered, headb.block_id, head_seed.env), teko::list::push(ctx.loop_targets, target))
+    let body_done = match lower_block(body_seed, l.body) { LowerCtx as c => c; error as err => return err }
+    let closed = match close_loop_body(body_done, headb.block_id, head_seed.names, defer_base) { LowerCtx as c => c; error as err => return err }
+    LowerStmtOut { ctx = close_loop(ctx, closed, exitb.block_id, exit_seed.env); terminated = false }
 }
 
 /** ctx_goto — switch the context to emit into `block_id` (already allocated), keeping the
@@ -3152,13 +3538,22 @@ fn lower_block(ctx: LowerCtx, body: []checker::TStatement) -> LowerCtx | error {
  * @param u32 col  the source column to propagate onto a synthesized `ret`
  * @return LowerCtx | error  the context after lowering every statement, its
  *                           block already closed with the `LRet` when a
- *                           trailing value was auto-returned
+ *                           trailing value was auto-returned. When the body
+ *                           has a pending defer, it fires (from index 0,
+ *                           LIFO) AFTER the trailing value is computed but
+ *                           BEFORE the auto-`ret` (A1-2, #382 — mirrors the
+ *                           C backend's value-arm ordering: tail into
+ *                           `sink` first, then its defers,
+ *                           `codegen.tks:4742-4749` — a defer here can still
+ *                           observe every body-local, but never affects the
+ *                           already-captured trailing value).
  */
 fn lower_fn_body(ctx: LowerCtx, body: []checker::TStatement, ret_ty: LType, line: u32, col: u32) -> LowerCtx | error {
     if body.len == 0 || ltype_is_void(ret_ty) { return lower_block(ctx, body) }
     let tail = match lower_block_value(ctx, body) { LowerBlockValue as x => x; error as err => return err }
     if tail.terminated { return tail.ctx }
-    ctx_append(tail.ctx, ret_inst(tail.vreg, line, col))
+    let replayed = match replay_defers(tail.ctx, 0) { LowerCtx as c => c; error as err => return err }
+    ctx_append(replayed, ret_inst(tail.vreg, line, col))
 }
 
 /**
@@ -3207,9 +3602,14 @@ pub fn lower_function(f: checker::TFunction, layouts: []LStructLayout = teko::li
         env = lenv_bind(env, f.params[i].name, i to u32)
         i++
     }
-    let ctx0 = LowerCtx { func = fn0; block_id = 0; env = env; layouts = layouts; rodata = rodata; enums = enums; lifted = lifted }
+    let ctx0 = LowerCtx {
+        func = fn0; block_id = 0; env = env
+        layouts = layouts; rodata = rodata; enums = enums; lifted = lifted
+        defers = teko::list::empty(); loop_targets = teko::list::empty()
+    }
     let done = match lower_fn_body(ctx0, f.body, ltype_of(f.return_type), f.line, f.col) { LowerCtx as c => c; error as err => return err }
-    match close_function(done, f) { LFunc as func => LoweredFunction { func = func; rodata = done.rodata; lifted = done.lifted }; error as err => return err }
+    let closed = match close_function(done, f) { LowerCtx as c => c; error as err => return err }
+    LoweredFunction { func = closed.func; rodata = closed.rodata; lifted = closed.lifted }
 }
 
 /** LoweredFunction — an `LFunc` + the interned-rodata table (A1-4, #382) and
@@ -3218,11 +3618,26 @@ pub fn lower_function(f: checker::TFunction, layouts: []LStructLayout = teko::li
     symbol numbering stays contiguous. */
 pub type LoweredFunction = struct { func: LFunc; rodata: []LRodata; lifted: []LFunc }
 
-/** close_function — append the implicit void return if the body did not terminate the block
-    (a void fn falling off the end), then return the built LFunc. */
-fn close_function(ctx: LowerCtx, f: checker::TFunction) -> LFunc | error {
-    if block_terminated(ctx.func, ctx.block_id) { return ctx.func }
-    ctx_append(ctx, ret_void_inst(f.line, f.col)).func
+/**
+ * close_function — fire any still-pending defer (from index 0, LIFO) and
+ * append the implicit void return if the body did not terminate the block
+ * (a void fn falling off the end, A1-2, #382 — mirrors the C backend's
+ * fn-body fall-through defer fire, `codegen.tks:6418-6429`), then return
+ * the closed context.
+ *
+ * @param LowerCtx ctx  the context after lowering the function's body
+ * @param checker::TFunction f  the function (its source position stamps the
+ *                              synthesized `ret`)
+ * @return LowerCtx | error  the closed context (its `.func` is the closed
+ *                           function; its `.rodata`/`.lifted` carry forward
+ *                           any growth the fall-through defer replay made),
+ *                           or a NAMED internal error when a pending defer
+ *                           fails to lower
+ */
+fn close_function(ctx: LowerCtx, f: checker::TFunction) -> LowerCtx | error {
+    if block_terminated(ctx.func, ctx.block_id) { return ctx }
+    let replayed = match replay_defers(ctx, 0) { LowerCtx as c => c; error as err => return err }
+    ctx_append(replayed, ret_void_inst(f.line, f.col))
 }
 
 /** block_terminated — does the block whose id is `block_id` end in a terminator (LRet/
@@ -3514,15 +3929,30 @@ fn lower_item_function(m: LModule, loose: []checker::TStatement, f: checker::TFu
  */
 fn lower_virtual_main(loose: []checker::TStatement, layouts: []LStructLayout, enums: []LEnumInfo, rodata: []LRodata, lifted: []LFunc) -> LoweredFunction | error {
     let fn0 = new_func("main", 0, teko::list::empty(), LType::I32)
-    let ctx0 = LowerCtx { func = fn0; block_id = 0; env = empty_lenv(); layouts = layouts; rodata = rodata; enums = enums; lifted = lifted }
+    let ctx0 = LowerCtx {
+        func = fn0; block_id = 0; env = empty_lenv()
+        layouts = layouts; rodata = rodata; enums = enums; lifted = lifted
+        defers = teko::list::empty(); loop_targets = teko::list::empty()
+    }
     let done = match lower_block(ctx0, loose) { LowerCtx as c => c; error as err => return err }
-    match close_virtual_main(done) { LFunc as func => LoweredFunction { func = func; rodata = done.rodata; lifted = done.lifted }; error as err => return err }
+    let closed = match close_virtual_main(done) { LowerCtx as c => c; error as err => return err }
+    LoweredFunction { func = closed.func; rodata = closed.rodata; lifted = closed.lifted }
 }
 
-/** close_virtual_main — append `const 0; ret %r` when the body did not already terminate. */
-fn close_virtual_main(ctx: LowerCtx) -> LFunc | error {
-    if block_terminated(ctx.func, ctx.block_id) { return ctx.func }
-    let r = ctx_alloc(ctx)
+/**
+ * close_virtual_main — fire any still-pending top-level defer (from index
+ * 0, LIFO, A1-2, #382) and append `const 0; ret %r` when the body did not
+ * already terminate.
+ *
+ * @param LowerCtx ctx  the context after lowering the loose top-level
+ *                      statements
+ * @return LowerCtx | error  the closed context, or a NAMED internal error
+ *                           when a pending defer fails to lower
+ */
+fn close_virtual_main(ctx: LowerCtx) -> LowerCtx | error {
+    if block_terminated(ctx.func, ctx.block_id) { return ctx }
+    let replayed = match replay_defers(ctx, 0) { LowerCtx as c => c; error as err => return err }
+    let r = ctx_alloc(replayed)
     let c0 = ctx_append(r.ctx, const_int_inst(r.vreg, 0 to i128, 0, 0))
-    ctx_append(c0, ret_inst(r.vreg, 0, 0)).func
+    ctx_append(c0, ret_inst(r.vreg, 0, 0))
 }
