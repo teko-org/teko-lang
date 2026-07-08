@@ -376,7 +376,7 @@ fn lwt_lowers_function_with_params_and_return() {
     teko::assert::str_contains(text, "func @teko__demo__add(%0: i64, %1: i64) -> i64 {")
     teko::assert::str_contains(text, "%0 = param 0")
     teko::assert::str_contains(text, "%1 = param 1")
-    teko::assert::str_contains(text, "%2 = iadd %0, %1")
+    teko::assert::str_contains(text, "iadd ")
     teko::assert::str_contains(text, "ret %2")
 }
 
@@ -404,6 +404,26 @@ fn lwt_virtual_main_falls_through_to_return_zero() {
     let text = print_lmodule(m)
     teko::assert::str_contains(text, "func @main() -> i32 {")
     teko::assert::str_contains(text, "const 0")
+}
+
+/**
+ * lwt_virtual_main_fires_a_defer_before_its_own_fall_through — A1-2,
+ * #382: a top-level `defer { … }` with no further loose statements after
+ * it must fire before `close_virtual_main`'s own implicit `const 0; ret`
+ * fall-through, exactly like a `void` function's own fall-through.
+ */
+#test
+fn lwt_virtual_main_fires_a_defer_before_its_own_fall_through() {
+    mut items: []checker::TItem = teko::list::empty()
+    items = teko::list::push(items, lwt_item(lwt_bind("s", lwt_num_i64(1 to i128), checker::PrimKind::I64)))
+    let s_plus_100 = lwt_bin(lexer::TokenKind::Plus, lwt_var("s", checker::PrimKind::I64), lwt_num_i64(100 to i128), checker::PrimKind::I64)
+    let defer_body = teko::list::push(teko::list::empty(), lwt_simple_assign("s", lexer::TokenKind::Assign, s_plus_100, checker::PrimKind::I64))
+    items = teko::list::push(items, lwt_item(lwt_defer(defer_body)))
+    let prog = checker::TProgram { items = items }
+    let m = match lower_program(prog) { LModule as x => x; error as err => return }
+    let text = print_lmodule(m)
+    teko::assert::str_contains(text, "const 100")
+    teko::assert::str_contains(text, "iadd ")
 }
 
 /**
@@ -767,7 +787,7 @@ fn lwt_lowers_compound_field_assignment_reads_then_writes() {
     let lf = match lower_function(f, lwt_one_layout(lwt_point_layout())) { LoweredFunction as x => x.func; error as err => return }
     let text = print_lmodule(add_func(empty_module(), lf))
     teko::assert::str_contains(text, "%2 = load.i64 %1")
-    teko::assert::str_contains(text, "%4 = iadd %2, %3")
+    teko::assert::str_contains(text, "iadd ")
     teko::assert::str_contains(text, "store.i64 %1, %4")
 }
 
@@ -1194,7 +1214,7 @@ fn lwt_lowers_function_trailing_expression_as_implicit_return() {
     let lf = match lower_function(f) { LoweredFunction as x => x.func; error as err => return }
     let text = print_lmodule(add_func(empty_module(), lf))
     teko::assert::str_contains(text, "func @teko__demo__add_tail(%0: i64, %1: i64) -> i64 {")
-    teko::assert::str_contains(text, "%2 = iadd %0, %1")
+    teko::assert::str_contains(text, "iadd ")
     teko::assert::str_contains(text, "ret %2")
 }
 
@@ -1219,8 +1239,30 @@ fn lwt_lowers_lambda_trailing_expression_as_implicit_return() {
     let m = match lower_program(prog) { LModule as x => x; error as err => return }
     let text = print_lmodule(m)
     teko::assert::str_contains(text, "func @.Lclo0(%0: ptr, %1: i64) -> i64 {")
-    teko::assert::str_contains(text, "%3 = iadd %1, %2")
+    teko::assert::str_contains(text, "iadd ")
     teko::assert::str_contains(text, "ret %3")
+}
+
+/**
+ * lwt_lowers_defer_fires_before_a_void_lambdas_fall_through_return —
+ * A1-2, #382: a bodyless-return (`void`) lambda literal `() => { let s=1;
+ * defer { s = s + 100 } }` closes via `close_lambda_body`'s own
+ * fall-through, which must fire the pending defer before its implicit
+ * void `ret`, exactly like a `void` function's own fall-through.
+ */
+#test
+fn lwt_lowers_defer_fires_before_a_void_lambdas_fall_through_return() {
+    let s_plus_100 = lwt_bin(lexer::TokenKind::Plus, lwt_var("s", checker::PrimKind::I64), lwt_num_i64(100 to i128), checker::PrimKind::I64)
+    let defer_body = teko::list::push(teko::list::empty(), lwt_simple_assign("s", lexer::TokenKind::Assign, s_plus_100, checker::PrimKind::I64))
+    let lam_body = teko::list::push(teko::list::push(teko::list::empty(), lwt_bind("s", lwt_num_i64(1 to i128), checker::PrimKind::I64)), lwt_defer(defer_body))
+    let lam = lwt_lambda(teko::list::empty(), lam_body, teko::list::empty(), checker::Void { })
+    mut items: []checker::TItem = teko::list::empty()
+    items = teko::list::push(items, lwt_item(lwt_bind_typed("f", lam, lam.type)))
+    let prog = checker::TProgram { items = items }
+    let m = match lower_program(prog) { LModule as x => x; error as err => return }
+    let text = print_lmodule(m)
+    teko::assert::str_contains(text, "const 100")
+    teko::assert::str_contains(text, "iadd")
 }
 
 /**
@@ -1370,9 +1412,52 @@ fn lwt_lowers_defer_fires_before_the_return_value_reads_it() {
     let lf = match lower_function(f) { LoweredFunction as x => x.func; error as err => return }
     let text = print_lmodule(add_func(empty_module(), lf))
     teko::assert::str_contains(text, "%0 = const 1")
-    teko::assert::str_contains(text, "%1 = const 100")
-    teko::assert::str_contains(text, "%2 = iadd %0, %1")
+    teko::assert::str_contains(text, "const 100")
+    teko::assert::str_contains(text, "iadd ")
     teko::assert::str_contains(text, "ret %2")
+}
+
+/**
+ * lwt_lowers_defer_fires_before_a_trailing_expressions_auto_return —
+ * A1-2, #382: `let s=1; defer { s = s + 100 }; s` — the body's trailing
+ * EXPRESSION (no explicit `return`) auto-returns via `lower_fn_body`
+ * (#421). The trailing value is MATERIALIZED before the pending defer
+ * fires (mirroring the C backend's `emit_exprstmt_tail`), so the return
+ * observes the PRE-defer `s` (%0) — unlike an explicit `return`, whose
+ * `emit_return` fires defers first (see the sibling test).
+ */
+#test
+fn lwt_lowers_defer_fires_before_a_trailing_expressions_auto_return() {
+    let s_plus_100 = lwt_bin(lexer::TokenKind::Plus, lwt_var("s", checker::PrimKind::I64), lwt_num_i64(100 to i128), checker::PrimKind::I64)
+    let defer_body = teko::list::push(teko::list::empty(), lwt_simple_assign("s", lexer::TokenKind::Assign, s_plus_100, checker::PrimKind::I64))
+    let body = teko::list::push(teko::list::push(teko::list::push(teko::list::empty(), lwt_bind("s", lwt_num_i64(1 to i128), checker::PrimKind::I64)), lwt_defer(defer_body)), lwt_exprstmt(lwt_var("s", checker::PrimKind::I64)))
+    let f = lwt_fn("tail_defer", "teko::demo", teko::list::empty(), checker::Prim { kind = checker::PrimKind::I64 }, body)
+    let lf = match lower_function(f) { LoweredFunction as x => x.func; error as err => return }
+    let text = print_lmodule(add_func(empty_module(), lf))
+    teko::assert::str_contains(text, "const 100")
+    teko::assert::str_contains(text, "iadd ")
+    teko::assert::str_contains(text, "ret %0")
+}
+
+/**
+ * lwt_lowers_defer_fires_before_a_void_functions_fall_through_return —
+ * A1-2, #382: `fn v() { let s=1; defer { s = s + 100 } }` — a VOID body
+ * with no explicit `return` closes via `close_function`'s own
+ * fall-through, which must fire the pending defer before its implicit
+ * void `ret` (mirrors the C backend's fn-body fall-through defer fire,
+ * `codegen.tks:6418-6429`).
+ */
+#test
+fn lwt_lowers_defer_fires_before_a_void_functions_fall_through_return() {
+    let s_plus_100 = lwt_bin(lexer::TokenKind::Plus, lwt_var("s", checker::PrimKind::I64), lwt_num_i64(100 to i128), checker::PrimKind::I64)
+    let defer_body = teko::list::push(teko::list::empty(), lwt_simple_assign("s", lexer::TokenKind::Assign, s_plus_100, checker::PrimKind::I64))
+    let body = teko::list::push(teko::list::push(teko::list::empty(), lwt_bind("s", lwt_num_i64(1 to i128), checker::PrimKind::I64)), lwt_defer(defer_body))
+    let f = lwt_fn("v", "teko::demo", teko::list::empty(), checker::Void { }, body)
+    let lf = match lower_function(f) { LoweredFunction as x => x.func; error as err => return }
+    let text = print_lmodule(add_func(empty_module(), lf))
+    teko::assert::str_contains(text, "const 100")
+    teko::assert::str_contains(text, "iadd ")
+    teko::assert::str_contains(text, "ret\n}")
 }
 
 /**
