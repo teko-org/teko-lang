@@ -2893,11 +2893,6 @@ fn type_binding(b: parser::Binding, env: Env, table: TypeTable) -> TypedStmt | e
     if bound_is_sentinel_slice {
         return error { message = "an empty list needs a known element type; annotate the binding (e.g. `mut xs: []i32 = teko::list::empty()`)" }
     }
-    // (MEM Step 0, R5 — RELAXED under the spine, #331 L2a) a BARE `Reference` bound is DEFERRED to
-    // the post-typing `check_ref_storability` gate: a ref bound to a local is sound iff the spine
-    // proves its param-rooted referent outlives it (the only ref value obtainable is a `Ref<T>`
-    // parameter read, whose referent is caller-owned). A NESTED ref (`[]Ref` / `Ref?` / variant) has
-    // no single referent anchor ⇒ KEEP the unconditional reject with the unchanged diagnostic.
     match bound {
         Reference => { }
         _ => if type_contains_ref(bound) { return error { message = "a reference cannot be bound to a local (parameter-only in this version)" } }
@@ -3004,10 +2999,6 @@ fn type_assign(a: parser::Assign, env: Env, table: TypeTable) -> TypedStmt | err
     }
     if !tb.is_mut { return error { message = $"cannot assign to immutable `{a.name}` — declare it `mut` (B.21)" } }
     mut v = match type_expr(a.value, env, table) { TExpr as te => te; error as e => return e }
-    // (MEM Step 0, R5 — RELAXED under the spine, #331 L2a) the assign twin: a bare `Reference` →
-    // `Reference` reassign (`mut r = p; r = q`) is DEFERRED to `check_ref_storability`; anything else
-    // (a nested ref on either side) KEEPs the unconditional reject. The `.value` deref-assign path
-    // above is exempt (it writes THROUGH a ref).
     let both_bare_ref = (match tb.type { Reference => true; _ => false }) && (match v.type { Reference => true; _ => false })
     if !both_bare_ref {
         if type_contains_ref(tb.type) || type_contains_ref(v.type) { return error { message = "a reference cannot be bound to a local (parameter-only in this version)" } }
@@ -3641,7 +3632,7 @@ fn type_method(f: parser::Function, struct_name: str, env: Env, table: TypeTable
         tb.stmts
     }
     let tf = TFunction { name = f.name; type_params = f.type_params; type_constraints = f.type_constraints; params = fixed_params; return_type = ret; body = body; vis = f.vis; has_doc = f.has_doc; doc = f.doc; namespace = ""; file = ""; line = 0; col = 0; is_test = f.is_test; is_extern = false; c_symbol = ""; from_lib = "" }
-    match check_ref_storability(tf) { null => { }; error as e => return e }   // (#331 L2a) R5 Ref-storability gate over the assembled method body
+    match check_ref_storability(tf) { null => { }; error as e => return e }
     tf
 }
 
@@ -3973,7 +3964,7 @@ fn type_function(f: parser::Function, env: Env, table: TypeTable) -> TFunction |
     if lc.failed { return error { message = lc.message } }
     match check_must_free(f, tbl, env.cur_ns, tb.stmts, table) { null => { }; error as e => return e }
     let tf = TFunction { name = f.name; type_params = f.type_params; type_constraints = f.type_constraints; params = f.params; return_type = ret; body = tb.stmts; vis = f.vis; has_doc = f.has_doc; doc = f.doc; namespace = ""; file = ""; line = 0; col = 0; is_test = f.is_test; is_extern = false; c_symbol = ""; from_lib = "" }   // (#49/E3) namespace/file/line stamped by type_item from the parsed item
-    match check_ref_storability(tf) { null => { }; error as e => return e }   // (#331 L2a) R5 Ref-storability gate over the assembled body
+    match check_ref_storability(tf) { null => { }; error as e => return e }
     tf
 }
 
