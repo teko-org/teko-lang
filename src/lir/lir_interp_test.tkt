@@ -740,3 +740,139 @@ fn iwt_variant_payload_exit() -> LModule {
 fn iwt_f18_match_variant_payload_returns_the_bound_field() {
     teko::assert::is_true(interp_lmodule(iwt_variant_payload_exit(), "main", iwt_no_args()) == iwt_i128(42))
 }
+
+/**
+ * iwt_iface_impl_fn — one interface implementation: `func @<symbol>(%0) { ret
+ * <code> }` — its single param stands in for the vtable-dispatch `data`
+ * receiver word, ignored, so each impl just returns its OWN distinct code
+ * (A1-6, #382).
+ *
+ * @param str symbol  the implementation's already-mangled function symbol
+ * @param i64 code  the value it returns
+ * @return LFunc  the hand-built single-block function
+ */
+fn iwt_iface_impl_fn(symbol: str, code: i64) -> LFunc {
+    mut f = new_func(symbol, 1, teko::list::push(teko::list::empty(), LType::Ptr), LType::I64)
+    let r = alloc_vreg(f)
+    f = r.func
+    f = append_inst(f, 0, const_int_inst(r.vreg, iwt_i128(code), 0, 0))
+    append_inst(f, 0, ret_inst(r.vreg, 0, 0))
+}
+
+/**
+ * iwt_iface_vtable — a one-slot vtable: an 8-byte alloca whose slot 0 holds
+ * the SYNTHETIC address of `impl_symbol` (`func_slot_addr`) — the memory
+ * shape `lower_iface_slot` indexes at `field_addr %vtable, 0` (A1-6, #382).
+ *
+ * @param LFunc f0  the function to append the vtable-build into
+ * @param LModule m  the module (`impl_symbol` must already be registered in
+ *                    its `funcs`, so its synthetic address resolves)
+ * @param str impl_symbol  the implementation function this vtable's slot 0
+ *                         dispatches to
+ * @return FreshVReg | error  the advanced function + the vtable's base
+ *                            address VReg, or a NAMED error when
+ *                            `impl_symbol` is unregistered
+ */
+fn iwt_iface_vtable(f0: LFunc, m: LModule, impl_symbol: str) -> FreshVReg | error {
+    let addr = match func_slot_addr(m, impl_symbol) { i128 as a => a; error as err => return err }
+    let vt = alloc_vreg(f0)
+    mut f = vt.func
+    f = append_inst(f, 0, alloca_inst(vt.vreg, 8, 8, 0, 0))
+    let c = alloc_vreg(f)
+    f = c.func
+    f = append_inst(f, 0, const_int_inst(c.vreg, addr, 0, 0))
+    f = append_inst(f, 0, store_inst(vt.vreg, c.vreg, LType::Ptr, 0, 0))
+    FreshVReg { func = f; vreg = vt.vreg }
+}
+
+/**
+ * iwt_iface_receiver — a two-word `{data@0, vtable@8}` fat pointer: an
+ * alloca'd 16-byte slot storing a dummy `data` word + the given `vtable`
+ * address — the shape `lower_iface_fatptr` reads (A1-6, #382).
+ *
+ * @param LFunc f0  the function to append the receiver-build into
+ * @param u32 vtable  the vtable's base address VReg (`iwt_iface_vtable`'s
+ *                    result)
+ * @return FreshVReg  the advanced function + the receiver's base address
+ *                     VReg
+ */
+fn iwt_iface_receiver(f0: LFunc, vtable: u32) -> FreshVReg {
+    let recv = alloc_vreg(f0)
+    mut f = recv.func
+    f = append_inst(f, 0, alloca_inst(recv.vreg, 16, 8, 0, 0))
+    f = iwt_alloc_field(f, recv.vreg, 0, 99)
+    let addr = alloc_vreg(f)
+    f = addr.func
+    f = append_inst(f, 0, field_addr_inst(addr.vreg, recv.vreg, 8, 0, 0))
+    f = append_inst(f, 0, store_inst(addr.vreg, vtable, LType::Ptr, 0, 0))
+    FreshVReg { func = f; vreg = recv.vreg }
+}
+
+/**
+ * iwt_iface_dispatch_exit — F19: `exit(recv.speak())`, hand-built exactly as
+ * `lower_iface_call` would emit it — load the receiver's `data`/`vtable`
+ * halves, index the vtable at slot 0, `call.indirect` through the resolved
+ * target with `data` as its sole arg, `exit` the result. Two impls
+ * (`teko__demo__speak_a` / `_b`) each own vtable, so picking the OTHER
+ * receiver dispatches to the OTHER impl — proves `LCallIndirect` resolves a
+ * DIFFERENT concrete function per receiver, not a fixed target (A1-6, #382).
+ *
+ * @param bool pick_b  dispatch through the `b`-impl receiver instead of `a`
+ * @return LModule | error  the hand-built two-impl module, or a NAMED error
+ *                          when the vtable-build's symbol lookup fails
+ */
+fn iwt_iface_dispatch_exit(pick_b: bool) -> LModule | error {
+    mut m = add_func(empty_module(), iwt_iface_impl_fn("teko__demo__speak_a", 11))
+    m = add_func(m, iwt_iface_impl_fn("teko__demo__speak_b", 22))
+    mut f = new_func("main", 0, teko::list::empty(), LType::I32)
+    let vta = match iwt_iface_vtable(f, m, "teko__demo__speak_a") { FreshVReg as x => x; error as err => return err }
+    f = vta.func
+    let vtb = match iwt_iface_vtable(f, m, "teko__demo__speak_b") { FreshVReg as x => x; error as err => return err }
+    f = vtb.func
+    let recva = iwt_iface_receiver(f, vta.vreg)
+    f = recva.func
+    let recvb = iwt_iface_receiver(f, vtb.vreg)
+    f = recvb.func
+    let recv = if pick_b { recvb.vreg } else { recva.vreg }
+    let dataaddr = alloc_vreg(f)
+    f = dataaddr.func
+    f = append_inst(f, 0, field_addr_inst(dataaddr.vreg, recv, 0, 0, 0))
+    let data = alloc_vreg(f)
+    f = data.func
+    f = append_inst(f, 0, load_inst(data.vreg, dataaddr.vreg, LType::Ptr, 0, 0))
+    let vtaddr = alloc_vreg(f)
+    f = vtaddr.func
+    f = append_inst(f, 0, field_addr_inst(vtaddr.vreg, recv, 8, 0, 0))
+    let vt = alloc_vreg(f)
+    f = vt.func
+    f = append_inst(f, 0, load_inst(vt.vreg, vtaddr.vreg, LType::Ptr, 0, 0))
+    let slotaddr = alloc_vreg(f)
+    f = slotaddr.func
+    f = append_inst(f, 0, field_addr_inst(slotaddr.vreg, vt.vreg, 0, 0, 0))
+    let target = alloc_vreg(f)
+    f = target.func
+    f = append_inst(f, 0, load_inst(target.vreg, slotaddr.vreg, LType::Ptr, 0, 0))
+    let cargs = teko::list::push(teko::list::empty(), data.vreg)
+    let result = alloc_vreg(f)
+    f = result.func
+    f = append_inst(f, 0, call_indirect_inst(result.vreg, target.vreg, cargs, false, 0, 0))
+    let eargs = teko::list::push(teko::list::empty(), result.vreg)
+    f = append_inst(f, 0, void_call_inst("tk_exit", eargs, false, 0, 0))
+    let z = alloc_vreg(f)
+    f = z.func
+    f = append_inst(f, 0, const_int_inst(z.vreg, iwt_i128(0), 0, 0))
+    f = append_inst(f, 0, ret_inst(z.vreg, 0, 0))
+    add_func(m, f)
+}
+
+#test
+fn iwt_f19_iface_dispatch_picks_the_a_impl() {
+    let m = match iwt_iface_dispatch_exit(false) { LModule as x => x; error => return }
+    teko::assert::is_true(interp_lmodule(m, "main", iwt_no_args()) == iwt_i128(11))
+}
+
+#test
+fn iwt_f19_iface_dispatch_picks_the_b_impl() {
+    let m = match iwt_iface_dispatch_exit(true) { LModule as x => x; error => return }
+    teko::assert::is_true(interp_lmodule(m, "main", iwt_no_args()) == iwt_i128(22))
+}

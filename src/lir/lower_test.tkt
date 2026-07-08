@@ -58,6 +58,20 @@ fn lwt_if_value(cond: checker::TExpr, then_blk: []checker::TStatement, else_blk:
 fn lwt_seg(s: str) -> parser::Segment { parser::Segment { name = s } }
 fn lwt_path1(s: str) -> parser::Path { parser::Path { segments = teko::list::push(teko::list::empty(), lwt_seg(s)) } }
 
+/**
+ * lwt_path2 — a two-segment path `a::b` (the `[<Iface>, <method>]` callee
+ * shape a dynamic contract-method dispatch's `TCall.callee` carries).
+ *
+ * @param str a  the first segment's name
+ * @param str b  the second segment's name
+ * @return parser::Path  the two-segment path `a::b`
+ *
+ * @since #382 A1-6
+ */
+fn lwt_path2(a: str, b: str) -> parser::Path {
+    parser::Path { segments = teko::list::push(teko::list::push(teko::list::empty(), lwt_seg(a)), lwt_seg(b)) }
+}
+
 fn lwt_call(path: parser::Path, ns: str, args: []checker::TExpr, ret: checker::Type) -> checker::TExpr {
     checker::TExpr {
         kind = checker::TCall { callee = path; args = args; call_ns = ns; is_closure_call = false; callee_type = checker::Void { }; is_iface_dispatch = false; iface_slot = 0 }
@@ -908,5 +922,60 @@ fn lwt_lowers_safe_field_access_via_branch_and_merge() {
     teko::assert::str_contains(text, "  #B1:\n    %2 = field_addr %0, 8\n    %3 = load.i64 %2\n    jump #B3(%3)")
     teko::assert::str_contains(text, "  #B2:\n    %4 = const 0\n    jump #B3(%4)")
     teko::assert::str_contains(text, "  #B3(%1):\n    ret %1")
+}
+
+/**
+ * lwt_iface_call — a dynamic contract-method `TCall`
+ * (`is_iface_dispatch=true`): `args[0]` is the receiver, `slot` its vtable
+ * index.
+ *
+ * @param str iface  the contract's canonical name (the callee path's first
+ *                   segment)
+ * @param str method  the dispatched method's name (the callee path's second
+ *                     segment)
+ * @param u32 slot  the method's vtable slot
+ * @param []checker::TExpr args  the call's arguments (`args[0]` is the
+ *                                receiver)
+ * @param checker::Type ret  the call's resolved return type
+ * @return checker::TExpr  the built interface-dispatch call node
+ *
+ * @since #382 A1-6
+ */
+fn lwt_iface_call(iface: str, method: str, slot: u32, args: []checker::TExpr, ret: checker::Type) -> checker::TExpr {
+    checker::TExpr {
+        kind = checker::TCall {
+            callee = lwt_path2(iface, method); args = args; call_ns = ""
+            is_closure_call = false; callee_type = checker::Void { }; is_iface_dispatch = true; iface_slot = slot
+        }
+        type = ret; line = 0; col = 0
+    }
+}
+
+#test
+fn lwt_lowers_iface_dispatch_call_via_vtable_load_and_indirect_call() {
+    let recv = lwt_num_i64(1000 to i128)
+    let extra = lwt_num_i64(7 to i128)
+    let args = teko::list::push(teko::list::push(teko::list::empty(), recv), extra)
+    let call = lwt_iface_call("Speaker", "speak", 2, args, lwt_prim(checker::PrimKind::I64))
+    let text = lwt_lower_expr_text(call)
+    teko::assert::str_contains(text, "%0 = const 1000")
+    teko::assert::str_contains(text, "%1 = field_addr %0, 0")
+    teko::assert::str_contains(text, "%2 = load.ptr %1")
+    teko::assert::str_contains(text, "%3 = field_addr %0, 8")
+    teko::assert::str_contains(text, "%4 = load.ptr %3")
+    teko::assert::str_contains(text, "%5 = field_addr %4, 16")
+    teko::assert::str_contains(text, "%6 = load.ptr %5")
+    teko::assert::str_contains(text, "%7 = const 7")
+    teko::assert::str_contains(text, "%8 = call.indirect %6(%2, %7)")
+}
+
+#test
+fn lwt_lowers_void_iface_dispatch_call_as_a_valueless_indirect_call() {
+    let recv = lwt_num_i64(2000 to i128)
+    let args = teko::list::push(teko::list::empty(), recv)
+    let call = lwt_iface_call("Speaker", "speak", 0, args, checker::Void { })
+    let text = lwt_lower_expr_text(call)
+    teko::assert::str_contains(text, "call.indirect %6(%2)")
+    teko::assert::is_true(!teko::str::contains(text, "= call.indirect"))
 }
 

@@ -595,13 +595,25 @@ fn lower_compare(ctx: LowerCtx, e: checker::TExpr, cmp: checker::TCompare) -> Lo
     Lowered { ctx = cur; vreg = acc }
 }
 
-/** lower_call — a direct call. The `exit`/`panic` builtins map to their runtime symbols
-    (tk_exit / tk_panic_str), matching the C backend; a Teko-Teko call resolves its symbol
-    through the shared mangler (call_ns::name). Arguments lower left-to-right. A closure/
-    interface-dispatch call is out of the N1 subset. */
+/**
+ * lower_call — a direct or interface-dispatch call. The `exit`/`panic`
+ * builtins map to their runtime symbols (tk_exit / tk_panic_str), matching
+ * the C backend; a Teko-Teko call resolves its symbol through the shared
+ * mangler (call_ns::name). Arguments lower left-to-right. A DYNAMIC
+ * contract-method call (`is_iface_dispatch`) routes to `lower_iface_call`
+ * (A1-6, #382); a closure call is still out of the subset (A1-7).
+ *
+ * @param LowerCtx ctx  the lowering context
+ * @param checker::TExpr e  the call expression (for its type + source
+ *                          position)
+ * @param checker::TCall c  the call node
+ * @return Lowered | error  the advanced context + the call's result VReg (0
+ *                          for a void call), or a NAMED honest-stop error
+ *                          for a closure call
+ */
 fn lower_call(ctx: LowerCtx, e: checker::TExpr, c: checker::TCall) -> Lowered | error {
     if c.is_closure_call { return error { message = "native backend N1: closure call not yet lowered (N2)" } }
-    if c.is_iface_dispatch { return error { message = "native backend N1: interface dispatch not yet lowered (N2)" } }
+    if c.is_iface_dispatch { return lower_iface_call(ctx, e, c) }
     let lo = match lower_args(ctx, c.args) { LoweredArgs as x => x; error as err => return err }
     lower_call_symbol(lo.ctx, e, c, lo.vregs)
 }
@@ -609,11 +621,35 @@ fn lower_call(ctx: LowerCtx, e: checker::TExpr, c: checker::TCall) -> Lowered | 
 /** LoweredArgs — the context after lowering an argument list + the VRegs, in order. */
 pub type LoweredArgs = struct { ctx: LowerCtx; vregs: []u32 }
 
-/** lower_args — lower each argument expression left-to-right, collecting its VReg. */
+/**
+ * lower_args — lower every argument expression left-to-right, collecting
+ * each one's VReg.
+ *
+ * @param LowerCtx ctx  the lowering context
+ * @param []checker::TExpr args  the argument list to lower
+ * @return LoweredArgs | error  the advanced context + the lowered VRegs, in
+ *                              order
+ */
 fn lower_args(ctx: LowerCtx, args: []checker::TExpr) -> LoweredArgs | error {
+    lower_args_from(ctx, args, 0)
+}
+
+/**
+ * lower_args_from — lower `args[start..]` left-to-right, collecting each
+ * one's VReg (A1-6, #382 — `lower_args` is the `start=0` case; the
+ * interface-dispatch path additionally needs the TAIL of an arg list, the
+ * receiver at index 0 having already been lowered separately).
+ *
+ * @param LowerCtx ctx  the lowering context
+ * @param []checker::TExpr args  the full argument list
+ * @param u64 start  the first index to lower (0 lowers every argument)
+ * @return LoweredArgs | error  the advanced context + the lowered VRegs, in
+ *                              order
+ */
+fn lower_args_from(ctx: LowerCtx, args: []checker::TExpr, start: u64) -> LoweredArgs | error {
     mut cur = ctx
     mut vregs: []u32 = teko::list::empty()
-    mut i: u64 = 0
+    mut i: u64 = start
     loop {
         if i >= args.len { break }
         let ao = match lower_expr(cur, args[i]) { Lowered as x => x; error as err => return err }
@@ -659,6 +695,140 @@ fn call_symbol(c: checker::TCall) -> str | error {
         return error { message = teko::str::concat("native backend N1: builtin `", last, "` not yet lowered (N2)") }
     }
     mangle_fn_symbol(c.call_ns, last)
+}
+
+/**
+ * IfaceFatPtr — the two loaded halves of an interface receiver's fat
+ * pointer (§5.3: `{data@0, vtable@8}`): its object-data VReg (field 0, the
+ * value a dispatched method call rides as its own receiver arg) and its
+ * vtable-base VReg (field 1, the address `lower_iface_slot` indexes).
+ *
+ * @since #382 A1-6
+ */
+pub type IfaceFatPtr = struct { ctx: LowerCtx; data: u32; vtable: u32 }
+
+/**
+ * lower_iface_fatptr — load both halves of an interface receiver's fat
+ * pointer at address `base`: the object-data pointer (offset 0) and the
+ * vtable-base pointer (offset `ptr-size`) — mirrors the C backend's
+ * `{ .data = …, .vtable = tk_vt_<Class>_<Iface> }` layout (`codegen.tks:
+ * 4088-4116`) (A1-6, #382).
+ *
+ * @param LowerCtx ctx  the lowering context
+ * @param u32 base  the receiver's fat-pointer address (a Ptr VReg)
+ * @param u32 line  the source line (propagated onto the emitted insts)
+ * @param u32 col  the source column (propagated onto the emitted insts)
+ * @return IfaceFatPtr  the advanced context + the loaded data/vtable VRegs
+ */
+fn lower_iface_fatptr(ctx: LowerCtx, base: u32, line: u32, col: u32) -> IfaceFatPtr {
+    let ptr_size = ltype_size(LType::Ptr)
+    let data_addr = ctx_alloc(ctx)
+    let with_data_addr = ctx_append(data_addr.ctx, field_addr_inst(data_addr.vreg, base, 0, line, col))
+    let data = ctx_alloc(with_data_addr)
+    let with_data = ctx_append(data.ctx, load_inst(data.vreg, data_addr.vreg, LType::Ptr, line, col))
+    let vt_addr = ctx_alloc(with_data)
+    let with_vt_addr = ctx_append(vt_addr.ctx, field_addr_inst(vt_addr.vreg, base, ptr_size, line, col))
+    let vt = ctx_alloc(with_vt_addr)
+    let with_vt = ctx_append(vt.ctx, load_inst(vt.vreg, vt_addr.vreg, LType::Ptr, line, col))
+    IfaceFatPtr { ctx = with_vt; data = data.vreg; vtable = vt.vreg }
+}
+
+/**
+ * lower_iface_slot — load the target function address out of `vtable`'s
+ * slot `slot`: `field_addr` at byte offset `slot * ptr-size`, then `load.ptr`
+ * — mirrors the C backend's `value.vtable[slot]` (`codegen.tks:2098-2100`)
+ * (A1-6, #382).
+ *
+ * @param LowerCtx ctx  the lowering context
+ * @param u32 vtable  the vtable-base VReg (`lower_iface_fatptr`'s result)
+ * @param u32 slot  the method's vtable slot (`TCall.iface_slot`)
+ * @param u32 line  the source line (propagated onto the emitted insts)
+ * @param u32 col  the source column (propagated onto the emitted insts)
+ * @return Lowered  the advanced context + the loaded target-function VReg
+ */
+fn lower_iface_slot(ctx: LowerCtx, vtable: u32, slot: u32, line: u32, col: u32) -> Lowered {
+    let ptr_size = ltype_size(LType::Ptr)
+    let slot_addr = ctx_alloc(ctx)
+    let with_slot_addr = ctx_append(slot_addr.ctx, field_addr_inst(slot_addr.vreg, vtable, slot * ptr_size, line, col))
+    let target = ctx_alloc(with_slot_addr)
+    Lowered { ctx = ctx_append(target.ctx, load_inst(target.vreg, slot_addr.vreg, LType::Ptr, line, col)); vreg = target.vreg }
+}
+
+/**
+ * iface_call_args — the indirect-call argument list: `data` prepended to
+ * `rest`, in order — mirrors the C backend's `value.data, args…`
+ * (`codegen.tks:2101-2109`).
+ *
+ * @param u32 data  the receiver's object-data VReg (goes first)
+ * @param []u32 rest  the remaining (already-lowered) argument VRegs
+ * @return []u32  `data` followed by `rest`, in order
+ *
+ * @since #382 A1-6
+ */
+fn iface_call_args(data: u32, rest: []u32) -> []u32 {
+    mut out: []u32 = teko::list::push(teko::list::empty(), data)
+    mut i: u64 = 0
+    loop {
+        if i >= rest.len { break }
+        out = teko::list::push(out, rest[i])
+        i++
+    }
+    out
+}
+
+/**
+ * lower_call_indirect — emit the `LCallIndirect` for a resolved target +
+ * argument list. A void-returning call emits a valueless instruction and
+ * returns a dummy VReg the caller must not read; a value call allocates a
+ * result VReg (mirrors `lower_call_symbol`).
+ *
+ * @param LowerCtx ctx  the lowering context
+ * @param checker::TExpr e  the call expression (for its type + source
+ *                          position)
+ * @param u32 target  the VReg holding the resolved callee's address
+ * @param []u32 args  the (already-lowered) argument VRegs, in order
+ * @return Lowered | error  the advanced context + the call's result VReg (0
+ *                          for a void call)
+ *
+ * @since #382 A1-6
+ */
+fn lower_call_indirect(ctx: LowerCtx, e: checker::TExpr, target: u32, args: []u32) -> Lowered | error {
+    if type_is_void(e.type) {
+        let inst = void_call_indirect_inst(target, args, false, e.line, e.col)
+        return Lowered { ctx = ctx_append(ctx, inst); vreg = 0 }
+    }
+    let r = ctx_alloc(ctx)
+    let inst = call_indirect_inst(r.vreg, target, args, false, e.line, e.col)
+    Lowered { ctx = ctx_append(r.ctx, inst); vreg = r.vreg }
+}
+
+/**
+ * lower_iface_call — a DYNAMIC contract-method call
+ * (`TCall.is_iface_dispatch`): the receiver (`c.args[0]`) is an interface
+ * fat pointer `{data@0, vtable@8}` (§5.3) — load both halves, index the
+ * vtable at `c.iface_slot` to fetch the target function address, then call
+ * THROUGH it with `data` prepended to the remaining (already-lowered)
+ * arguments — mirrors the C backend's `value.vtable[slot](value.data,
+ * args…)` (`codegen.tks:2058-2118`).
+ *
+ * @param LowerCtx ctx  the lowering context
+ * @param checker::TExpr e  the call expression (for its type + source
+ *                          position)
+ * @param checker::TCall c  the interface-dispatch call node (`args[0]` is
+ *                          the receiver)
+ * @return Lowered | error  the advanced context + the call's result VReg (0
+ *                          for a void call), or a NAMED internal error when
+ *                          the node is malformed
+ *
+ * @since #382 A1-6
+ */
+fn lower_iface_call(ctx: LowerCtx, e: checker::TExpr, c: checker::TCall) -> Lowered | error {
+    if c.args.len == 0 { return error { message = "native backend N1: malformed interface-dispatch call (internal)" } }
+    let ro = match lower_expr(ctx, c.args[0]) { Lowered as x => x; error as err => return err }
+    let fp = lower_iface_fatptr(ro.ctx, ro.vreg, e.line, e.col)
+    let tgt = lower_iface_slot(fp.ctx, fp.vtable, c.iface_slot, e.line, e.col)
+    let rest = match lower_args_from(tgt.ctx, c.args, 1) { LoweredArgs as x => x; error as err => return err }
+    lower_call_indirect(rest.ctx, e, tgt.vreg, iface_call_args(fp.data, rest.vregs))
 }
 
 /** lower_stmt — lower one statement, extending the env on a `let` and signaling block

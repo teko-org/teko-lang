@@ -100,8 +100,20 @@ pub type LStore = struct { addr: u32; value: u32; ty: LType }
     (A1-4, #382). */
 pub type LGlobalAddr = struct { symbol: str }
 
+/**
+ * LCallIndirect — call the function whose address is `target` (a Ptr VReg)
+ * with `args`. The vtable-dispatch path (A1-6) loads the slot address
+ * (base=vtable, offset=`slot*ptr-size`) then calls through it, `data`
+ * prepended as the first arg; the closure path (A1-7) calls the closure's
+ * function-pointer field the same way. `has_result`/`result` live on the
+ * enclosing `LInst`, exactly as for `LCall`.
+ *
+ * @since #382 A1-6
+ */
+pub type LCallIndirect = struct { target: u32; args: []u32; variadic: bool }
+
 /** LOp — the instruction payload (one of the operation cases above). */
-pub type LOp = variant LConstInt | LConstFloat | LBin | LUn | LCall | LParam | LRet | LJump | LBranch | LAlloca | LFieldAddr | LLoad | LStore | LGlobalAddr
+pub type LOp = variant LConstInt | LConstFloat | LBin | LUn | LCall | LParam | LRet | LJump | LBranch | LAlloca | LFieldAddr | LLoad | LStore | LGlobalAddr | LCallIndirect
 
 /** LInst — one instruction: the VReg it defines (has_result=false for terminators
     and void calls), its op, and the source position propagated from the TExpr (for
@@ -238,6 +250,37 @@ pub fn store_inst(addr: u32, value: u32, ty: LType, line: u32, col: u32) -> LIns
     global entry (A1-4, #382). */
 pub fn global_addr_inst(result: u32, symbol: str, line: u32, col: u32) -> LInst {
     LInst { result = result; has_result = true; op = LGlobalAddr { symbol = symbol }; line = line; col = col }
+}
+
+/**
+ * call_indirect_inst — a value-producing `%r = call.indirect %target(args)`
+ * instruction (A1-6, #382).
+ *
+ * @param u32 result    the VReg the call's return value is stored into
+ * @param u32 target    the VReg holding the callee's address
+ * @param []u32 args    the (already-lowered) argument VRegs, in order
+ * @param bool variadic whether the callee's variadic marker is set
+ * @param u32 line      the source line (propagated for the `.tsym` map)
+ * @param u32 col       the source column (propagated for the `.tsym` map)
+ * @return LInst  the built instruction
+ */
+pub fn call_indirect_inst(result: u32, target: u32, args: []u32, variadic: bool, line: u32, col: u32) -> LInst {
+    LInst { result = result; has_result = true; op = LCallIndirect { target = target; args = args; variadic = variadic }; line = line; col = col }
+}
+
+/**
+ * void_call_indirect_inst — a `call.indirect %target(args)` instruction that
+ * yields no value (a statement-level interface/closure call) (A1-6, #382).
+ *
+ * @param u32 target    the VReg holding the callee's address
+ * @param []u32 args    the (already-lowered) argument VRegs, in order
+ * @param bool variadic whether the callee's variadic marker is set
+ * @param u32 line      the source line (propagated for the `.tsym` map)
+ * @param u32 col       the source column (propagated for the `.tsym` map)
+ * @return LInst  the built instruction
+ */
+pub fn void_call_indirect_inst(target: u32, args: []u32, variadic: bool, line: u32, col: u32) -> LInst {
+    LInst { result = 0; has_result = false; op = LCallIndirect { target = target; args = args; variadic = variadic }; line = line; col = col }
 }
 
 /** push_inst_block — a fresh block with `inst` appended to its instruction stream. */

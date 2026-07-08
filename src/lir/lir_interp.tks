@@ -234,6 +234,56 @@ fn empty_lfunc() -> LFunc {
     new_func("", 0, teko::list::empty(), LType::Void)
 }
 
+/**
+ * func_slot_addr — the SYNTHETIC function-pointer value `LCallIndirect`'s
+ * vtable/closure machinery resolves back to `symbol`: `-(index+1)`, a
+ * NEGATIVE sentinel disjoint from every valid (non-negative) memory-cell
+ * address `mem_alloc` ever hands out. The interp's function-pointer model
+ * (§5.2) is this ADDRESS->SYMBOL MAP, computed ON DEMAND from `m.funcs`
+ * rather than threaded as a separate table — mirroring `rodata_base_of`'s
+ * recompute-don't-thread shape. A fixture bakes this value into a hand-built
+ * vtable slot via `const_int_inst` + `store_inst`; `resolve_func_addr` (below)
+ * inverts it back to the function at call time (A1-6, #382).
+ *
+ * @param LModule m  the module (its `funcs` table gives the index)
+ * @param str symbol  the target function's already-mangled symbol
+ * @return i128 | error  the synthetic address, or a NAMED error when `symbol`
+ *                       names no function in `m`
+ */
+pub fn func_slot_addr(m: LModule, symbol: str) -> i128 | error {
+    mut i: u64 = 0
+    loop {
+        if i >= m.funcs.len { break }
+        if m.funcs[i].symbol == symbol { return -((i to i128) + (1 to i128)) }
+        i++
+    }
+    error { message = teko::str::concat("lir interp: no function registered for vtable symbol `", symbol, "`") }
+}
+
+/**
+ * FuncAddrHit — a synthetic function-address resolution: whether `addr`
+ * names a module function + which one.
+ *
+ * @since #382 A1-6
+ */
+pub type FuncAddrHit = struct { found: bool; func: LFunc }
+
+/**
+ * resolve_func_addr — invert `func_slot_addr`: the module function a
+ * synthetic address `addr` names, or found=false for a non-negative
+ * (ordinary memory) address or an out-of-range index (A1-6, #382).
+ *
+ * @param LModule m  the module (its `funcs` table gives the index)
+ * @param i128 addr  the synthetic address to resolve
+ * @return FuncAddrHit  the resolved function, or found=false
+ */
+fn resolve_func_addr(m: LModule, addr: i128) -> FuncAddrHit {
+    if addr >= (0 to i128) { return FuncAddrHit { found = false; func = empty_lfunc() } }
+    let idx = (-addr - (1 to i128)) to u64
+    if idx >= m.funcs.len { return FuncAddrHit { found = false; func = empty_lfunc() } }
+    FuncAddrHit { found = true; func = m.funcs[idx] }
+}
+
 /** MemStep — a call's outcome: the resulting IResult + the memory it leaves behind (A1-3,
     #382 — memory is WHOLE-RUN state, so mutations a callee makes through a pointer arg must
     flow back into the caller; the callee's own register file, unlike its memory effects,
@@ -413,6 +463,7 @@ fn interp_inst(m: LModule, f: LFunc, inst: LInst, rf: RegFile, depth: u32, mem: 
         LLoad as ld => interp_load(rf, inst, ld, mem)
         LStore as st => interp_store(rf, st, mem)
         LGlobalAddr as g => interp_global_addr(m, rf, inst, g, mem)
+        LCallIndirect as ci => interp_call_indirect_inst(m, inst, ci, rf, depth, mem)
         LJump => istep_stop(ires_error("lir interp: internal — LJump must be intercepted by interp_block"), rf, mem)
         LBranch => istep_stop(ires_error("lir interp: internal — LBranch must be intercepted by interp_block"), rf, mem)
     }
@@ -590,6 +641,38 @@ fn interp_call_inst(m: LModule, f: LFunc, inst: LInst, c: LCall, rf: RegFile, de
     if is_exit(r.result) { return istep_stop(r.result, rf, r.mem) }
     if is_ierror(r.result) { return istep_stop(r.result, rf, r.mem) }
     if !is_return(r.result) { return istep_stop(ires_error("lir interp: callee did not return a value"), rf, r.mem) }
+    if !inst.has_result { return istep_cont(rf, r.mem) }
+    istep_cont(rf_set(rf, inst.result, r.result.value), r.mem)
+}
+
+/**
+ * interp_call_indirect_inst — `LCallIndirect`: resolve `ci.target`'s CURRENT
+ * value to a module function via `resolve_func_addr` (the vtable/closure
+ * function-pointer model, §5.2), then recurse exactly like a direct call —
+ * its memory effects flow back into `mem`. An address that resolves to no
+ * function honest-stops (A1-6, #382).
+ *
+ * @param LModule m  the module (for the function-address resolution)
+ * @param LInst inst  the enclosing instruction (its result VReg, when
+ *                     value-producing)
+ * @param LCallIndirect ci  the indirect-call op
+ * @param RegFile rf  the caller's register file
+ * @param u32 depth  the recursion-depth guard
+ * @param MemStore mem  the whole-run memory
+ * @return IStep  the call's effect (a CONTINUE with the result bound, or a
+ *                propagated exit/error)
+ */
+fn interp_call_indirect_inst(m: LModule, inst: LInst, ci: LCallIndirect, rf: RegFile, depth: u32, mem: MemStore) -> IStep {
+    let t = rf_get(rf, ci.target)
+    if !t.ok { return istep_stop(ires_error("lir interp: indirect call through an undefined VReg"), rf, mem) }
+    let hit = resolve_func_addr(m, t.value)
+    if !hit.found { return istep_stop(ires_error("lir interp: indirect call target resolves to no function"), rf, mem) }
+    let av = read_args(rf, ci.args)
+    if !av.ok { return istep_stop(ires_error("lir interp: indirect-call arg is an undefined VReg"), rf, mem) }
+    let r = interp_call(m, hit.func, av.values, depth + 1, mem)
+    if is_exit(r.result) { return istep_stop(r.result, rf, r.mem) }
+    if is_ierror(r.result) { return istep_stop(r.result, rf, r.mem) }
+    if !is_return(r.result) { return istep_stop(ires_error("lir interp: indirect callee did not return a value"), rf, r.mem) }
     if !inst.has_result { return istep_cont(rf, r.mem) }
     istep_cont(rf_set(rf, inst.result, r.result.value), r.mem)
 }
