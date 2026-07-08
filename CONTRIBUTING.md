@@ -29,7 +29,8 @@ Language-design tensions are resolved by the laws in [TEKO_CONSTITUTION.md](TEKO
 
 ## Branch and PR mechanics
 
-- **Base your PRs on `main`** (`gh pr create --base main`). The pre-reboot line lives on in git history only; `main` is the active development line (promoted from `chore/reboot` via PR #25).
+- **Wave dev model (remodel).** Development proceeds in **waves**, one per `0.X` version. Each wave has **one umbrella PR** (branch `remodel/<slug>`, base `main`) that carries the version bump and aggregates the wave. Every feature/fix is a **sub-PR based on the umbrella**, never on `main`, and you **never commit directly to `main`**. Each sub-PR is drained CLEAN (all checks green) into the umbrella. Before the umbrella merges, two passes run **pre-launch**: the **W15 quality sweep** (#234 verifier + #231 lint) and the **doc-sync** (this coherence pass). The umbrella → `main` merge (strict All-Green gate) is what ships the `0.X.0.0-beta` version. Every wave gets its own W15 sweep and doc-sync, until LTS.
+- Outside a wave (a hotfix or tooling change on `main`), base the PR on `main` directly.
 - Use **Conventional Commits** (`feat(parser): …`, `fix(vm): …`, `docs: …`, `chore: …`).
 - Keep PRs focused: one feature/fix per PR, with its tests and regression examples included.
 
@@ -46,9 +47,9 @@ Language-design tensions are resolved by the laws in [TEKO_CONSTITUTION.md](TEKO
 - **Comments = doc-comments only (ruling 2026-07-04, W15-from-now).** Every comment on a function, type, or member is a `/** … */` doc-comment attached to the declaration. Do NOT write inline comments (`// …` mid-body or trailing). If a line genuinely needs explaining, that is the signal to extract a well-named function instead of annotating it. This applies to **new code AND any code you touch** — a changed function's old inline comments are cleaned as part of the change, not left behind.
 - **Flatten; no "Hadouken" code (same ruling).** No deep-nested pyramids (`if { if { if … } }`, nested `match` arms). Flatten with early returns / guard clauses / continues. Where flattening is impossible, **extract a function/method** to cut cyclomatic complexity and keep functions short and single-purpose (and files from growing unbounded). New and touched code both land in this shape — we apply the W15 quality standard as-you-go so the final sweep is only verification.
 
-## Versioning (alpha)
+## Versioning
 
-The version is `MAJOR.MINOR.PATCH.BUILD-alpha`, held verbatim in `teko.tkp` (the single source of truth — the embedded `teko --version` and the release tag both read it). When the integrator merges a **code** change, they bump the 4th field (`BUILD`) by 1 in the PR; a `MAJOR`/`MINOR`/`PATCH` bump resets `BUILD` to 0. No Action detects the increment — the manifest carries it. Docs/config-only merges do not bump `teko.tkp` (no new release). A `teko.tkp` change on `main` auto-tags and publishes an alpha prerelease.
+The version is `MAJOR.MINOR.PATCH.BUILD-<stage>`, held verbatim in `teko.tkp` (the single source of truth — the embedded `teko --version` and the release tag both read it). The `<stage>` tracks the remodel: **`alpha`** (`0.0.1.x`, pre-remodel) → **`beta`** (the `0.X` remodel/backlog waves, one coherent subset each) → stable at **`1.0.0.0` = LTS**, once the backlog is empty. When the integrator merges a **code** change, they bump the 4th field (`BUILD`) by 1 in the PR; a `MAJOR`/`MINOR`/`PATCH` bump resets `BUILD` to 0. No Action detects the increment — the manifest carries it. Docs/config-only merges do not bump `teko.tkp` (no new release). A `teko.tkp` version change auto-tags and publishes a prerelease; during a wave, each sub-PR merge mints an intermediate `0.X.0.N-beta` seed that the umbrella dogfoods (progressive self-hosting).
 
 ## Reporting issues
 
