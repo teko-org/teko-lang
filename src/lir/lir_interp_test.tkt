@@ -876,3 +876,214 @@ fn iwt_f19_iface_dispatch_picks_the_b_impl() {
     let m = match iwt_iface_dispatch_exit(true) { LModule as x => x; error => return }
     teko::assert::is_true(interp_lmodule(m, "main", iwt_no_args()) == iwt_i128(22))
 }
+
+/**
+ * iwt_store_ptr_field — store `value` (a Ptr VReg) at `base + offset`
+ * (A1-7, #382 — the Ptr-typed counterpart of `iwt_alloc_field`, which stores
+ * an I64).
+ *
+ * @param LFunc f0  the function to append the store into
+ * @param u32 base  the aggregate's base address VReg
+ * @param u32 offset  the byte offset to store at
+ * @param u32 value  the Ptr VReg to store
+ * @return LFunc  the advanced function
+ */
+fn iwt_store_ptr_field(f0: LFunc, base: u32, offset: u32, value: u32) -> LFunc {
+    let a = alloc_vreg(f0)
+    let f1 = append_inst(a.func, 0, field_addr_inst(a.vreg, base, offset, 0, 0))
+    append_inst(f1, 0, store_inst(a.vreg, value, LType::Ptr, 0, 0))
+}
+
+/**
+ * iwt_load_ptr_field — load the Ptr value at `base + offset` into a fresh
+ * VReg (A1-7, #382 — the Ptr-typed counterpart of `iwt_load_field`, which
+ * loads an I64).
+ *
+ * @param LFunc f0  the function to append the load into
+ * @param u32 base  the aggregate's base address VReg
+ * @param u32 offset  the byte offset to load from
+ * @return FreshVReg  the advanced function + the loaded value's VReg
+ */
+fn iwt_load_ptr_field(f0: LFunc, base: u32, offset: u32) -> FreshVReg {
+    let a = alloc_vreg(f0)
+    let f1 = a.func
+    let l = alloc_vreg(f1)
+    let f2 = append_inst(l.func, 0, field_addr_inst(a.vreg, base, offset, 0, 0))
+    FreshVReg { func = append_inst(f2, 0, load_inst(l.vreg, a.vreg, LType::Ptr, 0, 0)); vreg = l.vreg }
+}
+
+/**
+ * iwt_build_closure — alloca a 16-byte `{fn@0, env@8}` closure struct
+ * (§5.3) storing `fn_addr`/`env_val`, returning its base address VReg — the
+ * memory shape `build_closure_literal`/`lower_closure_fatptr` share (A1-7,
+ * #382).
+ *
+ * @param LFunc f0  the function to append the closure build into
+ * @param u32 fn_addr  the callable's `LFuncAddr`-resolved VReg
+ * @param u32 env_val  the closure's env VReg (0 for a non-capturing closure)
+ * @return FreshVReg  the advanced function + the closure struct's base
+ *                     address
+ */
+fn iwt_build_closure(f0: LFunc, fn_addr: u32, env_val: u32) -> FreshVReg {
+    let base = alloc_vreg(f0)
+    mut f = base.func
+    f = append_inst(f, 0, alloca_inst(base.vreg, 16, 8, 0, 0))
+    f = iwt_store_ptr_field(f, base.vreg, 0, fn_addr)
+    f = iwt_store_ptr_field(f, base.vreg, 8, env_val)
+    FreshVReg { func = f; vreg = base.vreg }
+}
+
+/** ClosureLoad — the advanced function + a closure struct's loaded `{fn,
+    env}` halves (A1-7, #382 — mirrors `iwt_iface_receiver`'s data/vtable
+    pair, renamed for a closure's own fields). */
+type ClosureLoad = struct { func: LFunc; target: u32; env: u32 }
+
+/**
+ * iwt_load_closure — load both halves of a closure struct at `base` (A1-7,
+ * #382).
+ *
+ * @param LFunc f0  the function to append the loads into
+ * @param u32 base  the closure struct's base address VReg
+ * @return ClosureLoad  the advanced function + the loaded target/env VRegs
+ */
+fn iwt_load_closure(f0: LFunc, base: u32) -> ClosureLoad {
+    let t = iwt_load_ptr_field(f0, base, 0)
+    let e = iwt_load_ptr_field(t.func, base, 8)
+    ClosureLoad { func = e.func; target = t.vreg; env = e.vreg }
+}
+
+/**
+ * iwt_thunk_fn — a hand-built ENV-FIRST thunk wrapping `target_symbol`
+ * (A1-7, #382): `func @thunk_symbol(%0: ptr, %1: i64, %2: i64) -> i64 { %3 =
+ * call @target_symbol(%1, %2); ret %3 }` — ignores %0 (env), forwards the
+ * rest — mirrors `lower_var`'s fn-as-value thunk (`build_closure_thunk`).
+ *
+ * @param str thunk_symbol  the thunk's own symbol
+ * @param str target_symbol  the wrapped function's symbol
+ * @return LFunc  the built thunk
+ */
+fn iwt_thunk_fn(thunk_symbol: str, target_symbol: str) -> LFunc {
+    let ptypes = teko::list::push(teko::list::push(teko::list::push(teko::list::empty(), LType::Ptr), LType::I64), LType::I64)
+    mut f = new_func(thunk_symbol, 3, ptypes, LType::I64)
+    f = append_inst(f, 0, param_inst(0, 0, 0, 0))
+    f = append_inst(f, 0, param_inst(1, 1, 0, 0))
+    f = append_inst(f, 0, param_inst(2, 2, 0, 0))
+    let cargs = teko::list::push(teko::list::push(teko::list::empty(), 1 to u32), 2 to u32)
+    let r = alloc_vreg(f)
+    f = r.func
+    f = append_inst(f, 0, call_inst(r.vreg, target_symbol, cargs, false, 0, 0))
+    append_inst(f, 0, ret_inst(r.vreg, 0, 0))
+}
+
+/**
+ * iwt_fn_value_exit — F20: `let f = add; exit(f(2,3))`, hand-built exactly
+ * as `lower_var`'s fn-as-value arm + `lower_closure_call` would emit it: a
+ * closure literal `{fn=funcaddr @thunk, env=0}` calling THROUGH an env-first
+ * thunk that forwards to `teko__demo__add` — proves the `LFuncAddr` op
+ * resolves through `func_slot_addr`/`resolve_func_addr` (A1-7, #382).
+ *
+ * @return LModule  the hand-built module (`add` + its thunk + `main`)
+ */
+fn iwt_fn_value_exit() -> LModule {
+    mut m = add_func(empty_module(), iwt_add_fn())
+    m = add_func(m, iwt_thunk_fn("teko__demo__add_thunk", "teko__demo__add"))
+    mut f = new_func("main", 0, teko::list::empty(), LType::I32)
+    let fnaddr = alloc_vreg(f)
+    f = fnaddr.func
+    f = append_inst(f, 0, func_addr_inst(fnaddr.vreg, "teko__demo__add_thunk", 0, 0))
+    let nullv = alloc_vreg(f)
+    f = nullv.func
+    f = append_inst(f, 0, const_int_inst(nullv.vreg, iwt_i128(0), 0, 0))
+    let clo = iwt_build_closure(f, fnaddr.vreg, nullv.vreg)
+    f = clo.func
+    let loaded = iwt_load_closure(f, clo.vreg)
+    f = loaded.func
+    let a2 = alloc_vreg(f)
+    f = a2.func
+    f = append_inst(f, 0, const_int_inst(a2.vreg, iwt_i128(2), 0, 0))
+    let a3 = alloc_vreg(f)
+    f = a3.func
+    f = append_inst(f, 0, const_int_inst(a3.vreg, iwt_i128(3), 0, 0))
+    let cargs = teko::list::push(teko::list::push(teko::list::push(teko::list::empty(), loaded.env), a2.vreg), a3.vreg)
+    let result = alloc_vreg(f)
+    f = result.func
+    f = append_inst(f, 0, call_indirect_inst(result.vreg, loaded.target, cargs, false, 0, 0))
+    let eargs = teko::list::push(teko::list::empty(), result.vreg)
+    f = append_inst(f, 0, void_call_inst("tk_exit", eargs, false, 0, 0))
+    let z = alloc_vreg(f)
+    f = z.func
+    f = append_inst(f, 0, const_int_inst(z.vreg, iwt_i128(0), 0, 0))
+    f = append_inst(f, 0, ret_inst(z.vreg, 0, 0))
+    add_func(m, f)
+}
+
+#test
+fn iwt_f20_fn_value_called_indirectly() {
+    teko::assert::is_true(interp_lmodule(iwt_fn_value_exit(), "main", iwt_no_args()) == iwt_i128(5))
+}
+
+/**
+ * iwt_lambda_env_fn — a hand-built CAPTURING lambda body: `func @.Lclo0(%0:
+ * ptr, %1: i64) -> i64 { %2 = field_addr %0, 0; %3 = load.i64 %2; %4 = iadd
+ * %1, %3; ret %4 }` — parameter 0 is the env pointer, parameter 1 is the
+ * lambda's own declared parameter `x` — mirrors `build_lambda_lfunc`'s own
+ * env-first shape for a single captured field at offset 0 (A1-7, #382).
+ *
+ * @return LFunc  the built lambda body
+ */
+fn iwt_lambda_env_fn() -> LFunc {
+    let ptypes = teko::list::push(teko::list::push(teko::list::empty(), LType::Ptr), LType::I64)
+    mut f = new_func(".Lclo0", 2, ptypes, LType::I64)
+    f = append_inst(f, 0, param_inst(0, 0, 0, 0))
+    f = append_inst(f, 0, param_inst(1, 1, 0, 0))
+    let cap = iwt_load_field(f, 0, 0)
+    f = cap.func
+    let s = alloc_vreg(f)
+    f = s.func
+    f = append_inst(f, 0, bin_inst(s.vreg, LBinOp::IAdd, 1, cap.vreg, 0, 0))
+    append_inst(f, 0, ret_inst(s.vreg, 0, 0))
+}
+
+/**
+ * iwt_lambda_capture_exit — F21: `let captured=41; let f=(x)=>x+captured;
+ * exit(f(1))`, hand-built exactly as `lower_lambda` + `lower_closure_call`
+ * would emit it: an env struct holding `captured`, a closure literal
+ * `{fn=funcaddr @.Lclo0, env}`, called indirectly — proves a captured local
+ * round-trips through the env aggregate (A1-7, #382).
+ *
+ * @return LModule  the hand-built module (the lifted lambda body + `main`)
+ */
+fn iwt_lambda_capture_exit() -> LModule {
+    mut m = add_func(empty_module(), iwt_lambda_env_fn())
+    mut f = new_func("main", 0, teko::list::empty(), LType::I32)
+    let envbase = alloc_vreg(f)
+    f = envbase.func
+    f = append_inst(f, 0, alloca_inst(envbase.vreg, 8, 8, 0, 0))
+    f = iwt_alloc_field(f, envbase.vreg, 0, 41)
+    let fnaddr = alloc_vreg(f)
+    f = fnaddr.func
+    f = append_inst(f, 0, func_addr_inst(fnaddr.vreg, ".Lclo0", 0, 0))
+    let clo = iwt_build_closure(f, fnaddr.vreg, envbase.vreg)
+    f = clo.func
+    let loaded = iwt_load_closure(f, clo.vreg)
+    f = loaded.func
+    let x = alloc_vreg(f)
+    f = x.func
+    f = append_inst(f, 0, const_int_inst(x.vreg, iwt_i128(1), 0, 0))
+    let cargs = teko::list::push(teko::list::push(teko::list::empty(), loaded.env), x.vreg)
+    let result = alloc_vreg(f)
+    f = result.func
+    f = append_inst(f, 0, call_indirect_inst(result.vreg, loaded.target, cargs, false, 0, 0))
+    let eargs = teko::list::push(teko::list::empty(), result.vreg)
+    f = append_inst(f, 0, void_call_inst("tk_exit", eargs, false, 0, 0))
+    let z = alloc_vreg(f)
+    f = z.func
+    f = append_inst(f, 0, const_int_inst(z.vreg, iwt_i128(0), 0, 0))
+    f = append_inst(f, 0, ret_inst(z.vreg, 0, 0))
+    add_func(m, f)
+}
+
+#test
+fn iwt_f21_lambda_capture_roundtrip() {
+    teko::assert::is_true(interp_lmodule(iwt_lambda_capture_exit(), "main", iwt_no_args()) == iwt_i128(42))
+}

@@ -464,6 +464,7 @@ fn interp_inst(m: LModule, f: LFunc, inst: LInst, rf: RegFile, depth: u32, mem: 
         LStore as st => interp_store(rf, st, mem)
         LGlobalAddr as g => interp_global_addr(m, rf, inst, g, mem)
         LCallIndirect as ci => interp_call_indirect_inst(m, inst, ci, rf, depth, mem)
+        LFuncAddr as fa => interp_func_addr(m, rf, inst, fa, mem)
         LJump => istep_stop(ires_error("lir interp: internal — LJump must be intercepted by interp_block"), rf, mem)
         LBranch => istep_stop(ires_error("lir interp: internal — LBranch must be intercepted by interp_block"), rf, mem)
     }
@@ -527,6 +528,30 @@ fn interp_global_addr(m: LModule, rf: RegFile, inst: LInst, g: LGlobalAddr, mem:
     let hit = rodata_base_of(m.rodata, g.symbol)
     if !hit.ok { return istep_stop(ires_error(teko::str::concat("lir interp: unknown rodata symbol @", g.symbol)), rf, mem) }
     istep_cont(rf_set(rf, inst.result, hit.addr), mem)
+}
+
+/**
+ * interp_func_addr — resolve `fa.symbol` to its synthetic function-pointer
+ * value (`func_slot_addr`, the interp's fn-pointer model, §5.2), storing it
+ * into the instruction's result VReg — a function used as a VALUE (a bare fn
+ * reference, or a closure/thunk literal's `fn` field, A1-7 #382). An unknown
+ * symbol is an internal error (the lowering only ever emits this for a
+ * function it itself lowered or lifted into the module).
+ *
+ * @param LModule m  the module (its `funcs` table gives the synthetic
+ *                    address)
+ * @param RegFile rf  the caller's register file
+ * @param LInst inst  the enclosing instruction (its result VReg)
+ * @param LFuncAddr fa  the function-address op
+ * @param MemStore mem  the whole-run memory
+ * @return IStep  a CONTINUE with the resolved address bound, or a propagated
+ *                error
+ */
+fn interp_func_addr(m: LModule, rf: RegFile, inst: LInst, fa: LFuncAddr, mem: MemStore) -> IStep {
+    match func_slot_addr(m, fa.symbol) {
+        i128 as addr => istep_cont(rf_set(rf, inst.result, addr), mem)
+        error as e => istep_stop(ires_error(e.message), rf, mem)
+    }
 }
 
 /** EvalOut — the result of an arithmetic evaluation: a computed value, or an error message

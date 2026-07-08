@@ -109,13 +109,29 @@ fn lwt_lower_expr_text(e: checker::TExpr) -> str {
 
 /** lwt_lower_expr_text_with — lwt_lower_expr_text, but threading a struct-layout table
     (A1-3, #382) so a TStructInit/TFieldAccess/TIndex fixture can resolve its offsets. The
-    printed module folds in whatever the expression interned into rodata (A1-4, #382), so a
-    string-literal fixture's golden dump shows its `rodata`/`{ptr,len}` shape too. */
+    printed module folds in whatever the expression interned into rodata (A1-4, #382) and
+    whatever closure/thunk it lifted (A1-7, #382), so a string-literal or closure fixture's
+    golden dump shows its `rodata`/`{ptr,len}`/lifted-function shape too. */
 fn lwt_lower_expr_text_with(e: checker::TExpr, layouts: []LStructLayout) -> str {
     let f0 = new_func("t", 0, teko::list::empty(), LType::I64)
-    let ctx0 = LowerCtx { func = f0; block_id = 0; env = empty_lenv(); layouts = layouts; rodata = teko::list::empty(); enums = teko::list::empty() }
+    let ctx0 = LowerCtx { func = f0; block_id = 0; env = empty_lenv(); layouts = layouts; rodata = teko::list::empty(); enums = teko::list::empty(); lifted = teko::list::empty() }
     let lo = match lower_expr(ctx0, e) { Lowered as x => x; error as err => return teko::str::concat("ERR: ", err.message) }
-    print_lmodule(with_rodata(add_func(empty_module(), lo.ctx.func), lo.ctx.rodata))
+    let m0 = with_rodata(add_func(empty_module(), lo.ctx.func), lo.ctx.rodata)
+    print_lmodule(lwt_fold_lifted(m0, lo.ctx.lifted))
+}
+
+/** lwt_fold_lifted — append every entry of `lifted` into `m.funcs` (mirrors `lower.tks`'s
+    own `fold_lifted_funcs`, A1-7 #382 — kept local to the test file since it is the ONLY
+    caller here that needs to fold a lifted table outside `lower_program` itself). */
+fn lwt_fold_lifted(m: LModule, lifted: []LFunc) -> LModule {
+    mut cur = m
+    mut i: u64 = 0
+    loop {
+        if i >= lifted.len { break }
+        cur = add_func(cur, lifted[i])
+        i++
+    }
+    cur
 }
 
 #test
@@ -979,3 +995,159 @@ fn lwt_lowers_void_iface_dispatch_call_as_a_valueless_indirect_call() {
     teko::assert::is_true(!teko::str::contains(text, "= call.indirect"))
 }
 
+/**
+ * lwt_func_type — a resolved `Func` signature (A1-7, #382 — the type a
+ * closure-typed local/expression carries).
+ *
+ * @param []checker::Type params  the signature's parameter types, in order
+ * @param checker::Type ret  the signature's return type
+ * @return checker::Type  the built `Func` type
+ */
+fn lwt_func_type(params: []checker::Type, ret: checker::Type) -> checker::Type {
+    checker::Func { params = params; ret = ret; variadic = false; param_names = teko::list::empty(); n_required = params.len; defaults = teko::list::empty() }
+}
+
+/**
+ * lwt_bind_typed — a `let` binding of an ARBITRARY resolved type `ty` (A1-7,
+ * #382 — `lwt_bind` only covers a primitive-typed binding; a closure literal
+ * binds at its own `Func` type).
+ *
+ * @param str name  the bound name
+ * @param checker::TExpr e  the bound value
+ * @param checker::Type ty  the binding's resolved type
+ * @return checker::TStatement  the built `let` binding
+ */
+fn lwt_bind_typed(name: str, e: checker::TExpr, ty: checker::Type) -> checker::TStatement {
+    checker::TBinding { kind = parser::BindKind::Let; target = parser::SimpleName { name = name }; bound = ty; value = e }
+}
+
+/**
+ * lwt_fn_value — a bare top-level function used as a VALUE
+ * (`TVar.is_func=true`, A1-7, #382).
+ *
+ * @param str name  the referenced function's own (unqualified) name
+ * @param str ns  the referenced function's declaring namespace
+ * @param checker::Type ty  the reference's resolved `Func` type
+ * @return checker::TExpr  the built fn-as-value node
+ */
+fn lwt_fn_value(name: str, ns: str, ty: checker::Type) -> checker::TExpr {
+    checker::TExpr { kind = checker::TVar { name = name; is_func = true; func_ns = ns }; type = ty; line = 0; col = 0 }
+}
+
+/**
+ * lwt_closure_call — a call through a LOCAL closure value
+ * (`TCall.is_closure_call=true`, A1-7, #382).
+ *
+ * @param str name  the local closure variable's name
+ * @param []checker::TExpr args  the call's arguments
+ * @param checker::Type callee_ty  the closure's own resolved `Func` type
+ * @param checker::Type ret  the call's resolved return type
+ * @return checker::TExpr  the built closure-call node
+ */
+fn lwt_closure_call(name: str, args: []checker::TExpr, callee_ty: checker::Type, ret: checker::Type) -> checker::TExpr {
+    checker::TExpr {
+        kind = checker::TCall {
+            callee = lwt_path1(name); args = args; call_ns = ""
+            is_closure_call = true; callee_type = callee_ty; is_iface_dispatch = false; iface_slot = 0
+        }
+        type = ret; line = 0; col = 0
+    }
+}
+
+#test
+fn lwt_lowers_fn_value_and_closure_call_via_a_thunk() {
+    let fty = lwt_func_type(teko::list::push(teko::list::push(teko::list::empty(), lwt_prim(checker::PrimKind::I64)), lwt_prim(checker::PrimKind::I64)), lwt_prim(checker::PrimKind::I64))
+    mut items: []checker::TItem = teko::list::empty()
+    items = teko::list::push(items, lwt_item(lwt_bind_typed("f", lwt_fn_value("add", "teko::demo", fty), fty)))
+    let cargs = teko::list::push(teko::list::push(teko::list::empty(), lwt_num_i64(2 to i128)), lwt_num_i64(3 to i128))
+    let call = lwt_closure_call("f", cargs, fty, lwt_prim(checker::PrimKind::I64))
+    items = teko::list::push(items, lwt_item(lwt_exprstmt(lwt_call(lwt_path1("exit"), "", teko::list::push(teko::list::empty(), call), checker::Void { }))))
+    let prog = checker::TProgram { items = items }
+    let m = match lower_program(prog) { LModule as x => x; error as err => return }
+    let text = print_lmodule(m)
+    teko::assert::str_contains(text, "funcaddr @.Lclofn0")
+    teko::assert::str_contains(text, "func @.Lclofn0(%0: ptr, %1: i64, %2: i64) -> i64 {")
+    teko::assert::str_contains(text, "call @teko__demo__add(%1, %2)")
+    teko::assert::str_contains(text, "call.indirect")
+}
+
+/**
+ * lwt_lambda_param — one declared lambda parameter (A1-7, #382).
+ *
+ * @param str name  the parameter's name
+ * @param checker::Type ty  the parameter's resolved type
+ * @return checker::TLambdaParam  the built parameter node
+ */
+fn lwt_lambda_param(name: str, ty: checker::Type) -> checker::TLambdaParam {
+    checker::TLambdaParam { name = name; type = ty }
+}
+
+/**
+ * lwt_capture — one captured (free) variable (A1-7, #382 — always by-copy;
+ * `by_ref` only ever flips for a `Ref<T>`-typed capture, irrelevant to the
+ * lowering's own machine-class mapping).
+ *
+ * @param str name  the captured variable's name
+ * @param checker::Type ty  the captured variable's resolved type
+ * @return checker::TCapture  the built capture node
+ */
+fn lwt_capture(name: str, ty: checker::Type) -> checker::TCapture {
+    checker::TCapture { name = name; type = ty; by_ref = false }
+}
+
+/**
+ * lwt_lambda_types — the resolved type of each declared lambda parameter, in
+ * order (A1-7, #382 — feeds `lwt_func_type` so a lambda literal's own `Func`
+ * type matches its declared parameters).
+ *
+ * @param []checker::TLambdaParam params  the lambda's declared parameters
+ * @return []checker::Type  each parameter's resolved type, in order
+ */
+fn lwt_lambda_types(params: []checker::TLambdaParam) -> []checker::Type {
+    mut out: []checker::Type = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= params.len { break }
+        out = teko::list::push(out, params[i].type)
+        i++
+    }
+    out
+}
+
+/**
+ * lwt_lambda — a closure LITERAL node (`TLambda`, A1-7, #382).
+ *
+ * @param []checker::TLambdaParam params  the lambda's declared parameters
+ * @param []checker::TStatement body  the lambda's body statements
+ * @param []checker::TCapture captures  the lambda's captured-variable list
+ * @param checker::Type ret  the lambda's resolved return type
+ * @return checker::TExpr  the built lambda-literal node
+ */
+fn lwt_lambda(params: []checker::TLambdaParam, body: []checker::TStatement, captures: []checker::TCapture, ret: checker::Type) -> checker::TExpr {
+    checker::TExpr {
+        kind = checker::TLambda { params = params; body = body; captures = captures; ret = ret; lift_id = 0 }
+        type = lwt_func_type(lwt_lambda_types(params), ret); line = 0; col = 0
+    }
+}
+
+#test
+fn lwt_lowers_capturing_lambda_literal_and_closure_call() {
+    let i64ty = lwt_prim(checker::PrimKind::I64)
+    let lam_body = teko::list::push(teko::list::empty(), lwt_ret(lwt_bin(lexer::TokenKind::Plus, lwt_var("x", checker::PrimKind::I64), lwt_var("captured", checker::PrimKind::I64), checker::PrimKind::I64)))
+    let params = teko::list::push(teko::list::empty(), lwt_lambda_param("x", i64ty))
+    let captures = teko::list::push(teko::list::empty(), lwt_capture("captured", i64ty))
+    let lam = lwt_lambda(params, lam_body, captures, i64ty)
+    mut items: []checker::TItem = teko::list::empty()
+    items = teko::list::push(items, lwt_item(lwt_bind("captured", lwt_num_i64(41 to i128), checker::PrimKind::I64)))
+    items = teko::list::push(items, lwt_item(lwt_bind_typed("f", lam, lam.type)))
+    let call = lwt_closure_call("f", teko::list::push(teko::list::empty(), lwt_num_i64(1 to i128)), lam.type, i64ty)
+    items = teko::list::push(items, lwt_item(lwt_exprstmt(lwt_call(lwt_path1("exit"), "", teko::list::push(teko::list::empty(), call), checker::Void { }))))
+    let prog = checker::TProgram { items = items }
+    let m = match lower_program(prog) { LModule as x => x; error as err => return }
+    let text = print_lmodule(m)
+    teko::assert::str_contains(text, "funcaddr @.Lclo0")
+    teko::assert::str_contains(text, "func @.Lclo0(%0: ptr, %1: i64) -> i64 {")
+    teko::assert::str_contains(text, "field_addr %0, 0")
+    teko::assert::str_contains(text, "iadd %1,")
+    teko::assert::str_contains(text, "call.indirect")
+}
