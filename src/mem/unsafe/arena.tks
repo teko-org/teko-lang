@@ -1,44 +1,52 @@
 /**
  * `teko::mem::unsafe::Arena` (S3, issue #358) — a DEV-CONTROLLED, non-lexical MANUAL region: the
- * developer opens a region, bump-allocates raw pointers INTO it, and BULK-FREES the whole region
- * at a point of their own choosing. It is the unsafe, non-lexical complement to the safe lexical
- * `adopt { }` region (#337): where `adopt` drops at a brace, an `Arena` drops when the dev calls
- * `teko::mem::free(a)`. Per `docs/design/memory-unsafe-backend-remodel.md` §2/§3, it COMPOSES the
- * wave's two new features, each guarding the half it can:
+ * developer opens a region, bump-allocates raw pointers INTO it (via `teko::mem::region_alloc`), and
+ * BULK-FREES the whole region at a point of their own choosing (`teko::mem::free(a)`). It is the
+ * unsafe, non-lexical complement to the safe lexical `adopt { }` region (#337): where `adopt` drops
+ * at a brace, an `Arena` drops when the dev calls `teko::mem::free(a)`. Per
+ * `docs/design/memory-unsafe-backend-remodel.md` §2/§3 it COMPOSES the wave's two features, each
+ * guarding the half it can:
  *   * `#must_free` (S2, #336) BARS THE REGION LEAK — dropping an `Arena` without `mem::free`-ing it
  *     on some path is a COMPILE ERROR (the local consume-or-fail dataflow). The whole region can
  *     never be silently leaked.
  *   * `unsafe` (U2, #333) CONTAINS THE RESIDUAL RISK — after the bulk-free, any `ptr<T>` still held
- *     into the region is DANGLING (use-after-free). The spine/`#must_free` cannot track that
+ *     into the region is DANGLING (use-after-free). The spine / `#must_free` cannot track that
  *     aliasing (the known aliased-UAF gap), so the type is `unsafe`: the dev assumes exactly that
- *     risk, and only that. This is the honest, total, by-type M.3 fit.
+ *     risk, and only that. The honest, total, by-type M.3 fit.
  *
  * The handle carries the raw `tk_region *` as an opaque `uptr` word. `Arena::new` opens a fresh
  * child region under the process root (`teko::mem::region_new` -> `tk_region_new`); allocation is
- * `teko::mem::region_alloc(a.region, init)` (-> `tk_region_alloc` + init, a `ptr<T>` attached to
- * the region); `teko::mem::free(a)` bulk-drops the whole subtree (`tk_region_drop_subtree`). This
- * unit EXPOSES the S2 arena-tree runtime `adopt` already reuses — it builds no new allocator.
+ * `teko::mem::region_alloc(a.region, init)` (-> `tk_region_alloc` + init, a `ptr<T>` attached to the
+ * region); `teko::mem::free(a)` bulk-drops the whole subtree (`tk_region_drop_subtree`). This unit
+ * EXPOSES the S2 arena-tree runtime that `adopt` already reuses — it builds no new allocator. The
+ * `#must_free` flag PLUS the single-`uptr`-field STRUCTURE (`is_region_handle_name`) — never a
+ * hard-coded `Arena` name — is what routes `teko::mem::free(a)` to the bulk-drop instead of the
+ * slice/class free path, so a fixture's standalone copy of this shape lowers identically.
  *
- * SEED-BOOTSTRAP STAGING (mirrors `rawbuf.tks`'s header + DECISION_LOG D16): the currently released
- * seed predates U1's `unsafe` modifier, S2's `#must_free`, AND this PR's own `teko::mem::region_new`
- * / `teko::mem::region_alloc` builtins, so `teko . -o bin` (the seed parsing every `.tks` under
- * `src/`) CANNOT parse a literal `#must_free` / `unsafe type Arena` NOR type-check a body that calls
- * the new region builtins here. `Arena` therefore ships WITHOUT the `#must_free` / `unsafe` markers
- * AND without its `new`/allocation surface for now — just the plain handle TYPE, self-hosting today
- * — while `examples/regressions/arena_manual_ok` (a standalone project compiled by gen1, which DOES
- * understand both modifiers and both builtins) exercises the FULL `unsafe #must_free`-tagged
- * `Arena::new` -> `region_alloc` -> `teko::mem::free` surface, and `arena_manual_leak` proves the
- * compile-reject. Once a released seed carries U1/S2 + the region builtins, re-tag `Arena` (add the
- * `#must_free` line + the `unsafe` keyword) and restore the `new()` method + the free `alloc`
- * helper below — mechanical, no other change: the checker/codegen routing keys off the `#must_free`
- * flag + the single-`uptr`-field STRUCTURE (`is_region_handle_name`), never a hard-coded `Arena`
- * name, so the staged and re-tagged forms lower identically.
- *
- * This declaration, `Arena`, wraps the opaque region handle. `region` holds the raw `tk_region *`
- * as a `uptr`; it is the single field the `is_region_handle_name` probe recognizes to route
- * `teko::mem::free(a)` to the bulk-drop rather than the slice/class free path.
+ * RUNTIME EXERCISE (native-only, mirroring `RawBuf`): `Arena::new` opens a region via
+ * `teko::mem::region_new`, a host-only builtin the VM refuses (`use teko build`) exactly like
+ * `RawBuf`'s `buf_ptr` (C7.19) — so, like the stdlib `rawbuf_alloc`/`rawbuf_read`/`rawbuf_len`, this
+ * type's region methods carry no VM `#test` (`teko test` runs `#test` on the VM). The full create ->
+ * alloc -> read -> `mem::free` round-trip is the NATIVE-ONLY `examples/regressions/arena_manual_ok`
+ * fixture, and its negative twin `arena_manual_leak` proves the `#must_free` compile-reject; both
+ * exercise a standalone copy of this exact `#must_free` + single-`uptr`-field shape (a fixture is its
+ * own project and cannot `use` the compiler's own stdlib), so the canonical stdlib `Arena` here and
+ * the fixtures' copies lower identically through `is_region_handle_name`.
  */
-pub type Arena = struct {
+#must_free
+pub unsafe type Arena = struct {
     /** The raw `tk_region *` this handle owns, carried as an opaque `uptr`; 0 once bulk-freed. */
     region: uptr
+
+    /**
+     * Opens a fresh manual region (a new child of the process root) and wraps its raw handle. A
+     * method, so it carries no `unsafe` keyword of its own — it inherits its owning type's
+     * `unsafe`-ness; the returned `Arena` is `#must_free`, so every caller must `teko::mem::free`
+     * it (or move it out) on every path.
+     *
+     * @return Arena  a fresh `Arena` owning a newly opened child region
+     */
+    pub fn new() -> Arena {
+        Arena { region = teko::mem::region_new() }
+    }
 }
