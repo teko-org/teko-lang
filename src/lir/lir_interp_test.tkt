@@ -187,3 +187,107 @@ fn iwt_unknown_runtime_call_is_negative_sentinel() {
     f = append_inst(f, 0, ret_inst(z.vreg, 0, 0))
     teko::assert::is_true(interp_lmodule(add_func(empty_module(), f), "main", iwt_no_args()) == iwt_i128(-1))
 }
+
+/** iwt_if_exit — F6: `exit(if x<y {x} else {y})` — branch to a per-arm block, each jumping
+    to a merge block-arg carrying the picked value, exit(the merge value). Proves
+    interp_blocks follows an LBranch to its chosen target and binds the winning jump's
+    block-arg into the merge block's param. */
+fn iwt_if_exit(x: i64, y: i64) -> LModule {
+    mut f = new_func("main", 0, teko::list::empty(), LType::I32)
+    let vx = alloc_vreg(f)
+    f = vx.func
+    f = append_inst(f, 0, const_int_inst(vx.vreg, iwt_i128(x), 0, 0))
+    let vy = alloc_vreg(f)
+    f = vy.func
+    f = append_inst(f, 0, const_int_inst(vy.vreg, iwt_i128(y), 0, 0))
+    let vc = alloc_vreg(f)
+    f = vc.func
+    f = append_inst(f, 0, bin_inst(vc.vreg, LBinOp::ICmpLtS, vx.vreg, vy.vreg, 0, 0))
+    let thenb = alloc_block(f)
+    f = thenb.func
+    let elseb = alloc_block(f)
+    f = elseb.func
+    let mergeb = alloc_block(f)
+    f = mergeb.func
+    let mp = add_block_param(f, mergeb.block_id)
+    f = mp.func
+    f = append_inst(f, 0, branch_inst(vc.vreg, thenb.block_id, teko::list::empty(), elseb.block_id, teko::list::empty(), 0, 0))
+    f = append_inst(f, thenb.block_id, jump_inst(mergeb.block_id, teko::list::push(teko::list::empty(), vx.vreg), 0, 0))
+    f = append_inst(f, elseb.block_id, jump_inst(mergeb.block_id, teko::list::push(teko::list::empty(), vy.vreg), 0, 0))
+    let eargs = teko::list::push(teko::list::empty(), mp.vreg)
+    f = append_inst(f, mergeb.block_id, void_call_inst("tk_exit", eargs, false, 0, 0))
+    let z = alloc_vreg(f)
+    f = z.func
+    f = append_inst(f, mergeb.block_id, const_int_inst(z.vreg, iwt_i128(0), 0, 0))
+    f = append_inst(f, mergeb.block_id, ret_inst(z.vreg, 0, 0))
+    add_func(empty_module(), f)
+}
+
+#test
+fn iwt_f6_if_expr_picks_the_then_arm() {
+    teko::assert::is_true(interp_lmodule(iwt_if_exit(2, 100), "main", iwt_no_args()) == iwt_i128(2))
+}
+
+#test
+fn iwt_f6_if_expr_picks_the_else_arm() {
+    teko::assert::is_true(interp_lmodule(iwt_if_exit(100, 7), "main", iwt_no_args()) == iwt_i128(7))
+}
+
+/** iwt_chain_lt_exit — F7: `exit((a<b) && (b<c) ? 1 : 0)`, the branch-merge AND shape
+    lower_compare produces for a chained comparison `a<b<c`. Proves interp_blocks follows a
+    SEQUENCE of branch/merge transitions (not just one), short-circuiting past the second
+    comparison's block through the merge's 0 constant when the first term is already false. */
+fn iwt_chain_lt_exit(a: i64, b: i64, c: i64) -> LModule {
+    mut f = new_func("main", 0, teko::list::empty(), LType::I32)
+    let va = alloc_vreg(f)
+    f = va.func
+    f = append_inst(f, 0, const_int_inst(va.vreg, iwt_i128(a), 0, 0))
+    let vb = alloc_vreg(f)
+    f = vb.func
+    f = append_inst(f, 0, const_int_inst(vb.vreg, iwt_i128(b), 0, 0))
+    let vc = alloc_vreg(f)
+    f = vc.func
+    f = append_inst(f, 0, const_int_inst(vc.vreg, iwt_i128(c), 0, 0))
+    let t1 = alloc_vreg(f)
+    f = t1.func
+    f = append_inst(f, 0, bin_inst(t1.vreg, LBinOp::ICmpLtS, va.vreg, vb.vreg, 0, 0))
+    let t2 = alloc_vreg(f)
+    f = t2.func
+    f = append_inst(f, 0, bin_inst(t2.vreg, LBinOp::ICmpLtS, vb.vreg, vc.vreg, 0, 0))
+    let thenb = alloc_block(f)
+    f = thenb.func
+    let elseb = alloc_block(f)
+    f = elseb.func
+    let mergeb = alloc_block(f)
+    f = mergeb.func
+    let mp = add_block_param(f, mergeb.block_id)
+    f = mp.func
+    f = append_inst(f, 0, branch_inst(t1.vreg, thenb.block_id, teko::list::empty(), elseb.block_id, teko::list::empty(), 0, 0))
+    f = append_inst(f, thenb.block_id, jump_inst(mergeb.block_id, teko::list::push(teko::list::empty(), t2.vreg), 0, 0))
+    let zero = alloc_vreg(f)
+    f = zero.func
+    f = append_inst(f, elseb.block_id, const_int_inst(zero.vreg, iwt_i128(0), 0, 0))
+    f = append_inst(f, elseb.block_id, jump_inst(mergeb.block_id, teko::list::push(teko::list::empty(), zero.vreg), 0, 0))
+    let eargs = teko::list::push(teko::list::empty(), mp.vreg)
+    f = append_inst(f, mergeb.block_id, void_call_inst("tk_exit", eargs, false, 0, 0))
+    let z = alloc_vreg(f)
+    f = z.func
+    f = append_inst(f, mergeb.block_id, const_int_inst(z.vreg, iwt_i128(0), 0, 0))
+    f = append_inst(f, mergeb.block_id, ret_inst(z.vreg, 0, 0))
+    add_func(empty_module(), f)
+}
+
+#test
+fn iwt_f7_chain_all_ascending_is_true() {
+    teko::assert::is_true(interp_lmodule(iwt_chain_lt_exit(1, 2, 3), "main", iwt_no_args()) == iwt_i128(1))
+}
+
+#test
+fn iwt_f7_chain_breaks_at_the_second_term_is_false() {
+    teko::assert::is_true(interp_lmodule(iwt_chain_lt_exit(1, 5, 3), "main", iwt_no_args()) == iwt_i128(0))
+}
+
+#test
+fn iwt_f7_chain_fails_at_the_first_term_is_false() {
+    teko::assert::is_true(interp_lmodule(iwt_chain_lt_exit(5, 2, 3), "main", iwt_no_args()) == iwt_i128(0))
+}

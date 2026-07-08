@@ -162,6 +162,21 @@ pub fn ret_void_inst(line: u32, col: u32) -> LInst {
     LInst { result = 0; has_result = false; op = LRet { has_value = false; value = 0 }; line = line; col = col }
 }
 
+/** jump_inst — an unconditional `jump #Btarget(args)` terminator carrying block-args (the
+    SSA-lite merge). */
+pub fn jump_inst(target: u32, args: []u32, line: u32, col: u32) -> LInst {
+    LInst { result = 0; has_result = false; op = LJump { target = target; args = args }; line = line; col = col }
+}
+
+/** branch_inst — a conditional `branch %cond, #Bt(targs), #Bf(fargs)` terminator. */
+pub fn branch_inst(cond: u32, t_target: u32, t_args: []u32, f_target: u32, f_args: []u32, line: u32, col: u32) -> LInst {
+    LInst {
+        result = 0; has_result = false
+        op = LBranch { cond = cond; t_target = t_target; t_args = t_args; f_target = f_target; f_args = f_args }
+        line = line; col = col
+    }
+}
+
 /** push_inst_block — a fresh block with `inst` appended to its instruction stream. */
 fn push_inst_block(b: LBlock, inst: LInst) -> LBlock {
     LBlock { id = b.id; params = b.params; insts = teko::list::push(b.insts, inst) }
@@ -199,4 +214,51 @@ pub fn alloc_vreg(f: LFunc) -> FreshVReg {
 /** add_func — return a copy of `m` with `f` appended. */
 pub fn add_func(m: LModule, f: LFunc) -> LModule {
     LModule { funcs = teko::list::push(m.funcs, f) }
+}
+
+/** BlockRef — a freshly-allocated block's id + the function that reserved it (a plain
+    zero-param block — the then/else/head/exit arms a control-flow construct switches into;
+    a MERGE block additionally gets a block-arg via add_block_param). */
+pub type BlockRef = struct { func: LFunc; block_id: u32 }
+
+/** alloc_block — reserve a fresh empty block (no params) in `f`, appended after its
+    existing blocks. Block ids are dense and sequential: `f.blocks.len` IS the next free id
+    (the entry block #B0 is the only one `new_func` reserves, so the first `alloc_block`
+    yields #B1). */
+pub fn alloc_block(f: LFunc) -> BlockRef {
+    let id = f.blocks.len to u32
+    let b = LBlock { id = id; params = teko::list::empty(); insts = teko::list::empty() }
+    let widened = LFunc {
+        symbol = f.symbol; n_params = f.n_params; param_types = f.param_types; ret_type = f.ret_type
+        blocks = teko::list::push(f.blocks, b); next_vreg = f.next_vreg
+    }
+    BlockRef { func = widened; block_id = id }
+}
+
+/** BlockParam — a fresh block-arg reserved on an existing block: its VReg + the advanced
+    function (the block's params list gains exactly one more slot, positionally matching
+    the jump/branch edges that target it). */
+pub type BlockParam = struct { func: LFunc; vreg: u32 }
+
+/** add_block_param — reserve a fresh VReg and append it as a block-arg (an SSA-lite merge
+    parameter) on the block whose id is `block_id`. A merge block gets exactly one call to
+    this per value it carries (N1/N2 control-flow merges carry at most one). */
+pub fn add_block_param(f: LFunc, block_id: u32) -> BlockParam {
+    let fresh = alloc_vreg(f)
+    BlockParam { func = set_block_param(fresh.func, block_id, fresh.vreg); vreg = fresh.vreg }
+}
+
+/** set_block_param — return a copy of `f` with `vreg` appended to the params list of the
+    block whose id is `block_id` (mirrors append_inst's per-block rewrite shape). */
+fn set_block_param(f: LFunc, block_id: u32, vreg: u32) -> LFunc {
+    mut blocks: []LBlock = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= f.blocks.len { break }
+        let b = f.blocks[i]
+        let nb = if b.id == block_id { LBlock { id = b.id; params = teko::list::push(b.params, vreg); insts = b.insts } } else { b }
+        blocks = teko::list::push(blocks, nb)
+        i++
+    }
+    LFunc { symbol = f.symbol; n_params = f.n_params; param_types = f.param_types; ret_type = f.ret_type; blocks = blocks; next_vreg = f.next_vreg }
 }

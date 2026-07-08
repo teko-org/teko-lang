@@ -303,6 +303,8 @@ pub fn lower_expr(ctx: LowerCtx, e: checker::TExpr) -> Lowered | error {
         checker::TUnary as u => lower_unary(ctx, e, u)
         checker::TCast as c => lower_cast(ctx, e, c)
         checker::TCall as cl => lower_call(ctx, e, cl)
+        checker::TCompare as cm => lower_compare(ctx, e, cm)
+        checker::TIfExpr as f => lower_if_expr(ctx, e, f)
         _ => error { message = teko::str::concat("native backend N1: ", texpr_kind_name(e), " not yet lowered (N2)") }
     }
 }
@@ -372,6 +374,113 @@ fn prim_kind_of(t: checker::Type) -> checker::PrimKind | error {
     }
 }
 
+/** cmp_lbinop_of — the LBinOp for a comparison token given the LEFT operand's PrimKind:
+    float kinds pick the F-family; integers pick S/U by signedness (mirrors lbinop_of's
+    family pick, but over the comparison mnemonics). A non-primitive operand (str, a Named
+    type, ...) is out of the N1 subset — deferred to the phase that gives it a runtime value
+    (fat pointers land in A1-4). */
+fn cmp_lbinop_of(op: lexer::TokenKind, k: checker::PrimKind) -> LBinOp | error {
+    if prim_is_float_kind(k) { return cmp_lbinop_float(op) }
+    cmp_lbinop_int(op, prim_is_signed_int(k))
+}
+
+/** cmp_lbinop_float — the F-family LBinOp for a comparison token. */
+fn cmp_lbinop_float(op: lexer::TokenKind) -> LBinOp | error {
+    match op {
+        lexer::TokenKind::EqEq => LBinOp::FCmpEq
+        lexer::TokenKind::Ne => LBinOp::FCmpNe
+        lexer::TokenKind::Lt => LBinOp::FCmpLt
+        lexer::TokenKind::Le => LBinOp::FCmpLe
+        lexer::TokenKind::Gt => LBinOp::FCmpGt
+        lexer::TokenKind::Ge => LBinOp::FCmpGe
+        _ => error { message = "native backend N1: comparison operator not yet lowered (N2)" }
+    }
+}
+
+/** cmp_lbinop_int — the integer LBinOp for a comparison token; `==`/`!=` have no S/U split,
+    the ordered comparisons (`<`/`<=`/`>`/`>=`) pick S/U by `signed`. */
+fn cmp_lbinop_int(op: lexer::TokenKind, signed: bool) -> LBinOp | error {
+    match op {
+        lexer::TokenKind::EqEq => LBinOp::ICmpEq
+        lexer::TokenKind::Ne => LBinOp::ICmpNe
+        lexer::TokenKind::Lt => if signed { LBinOp::ICmpLtS } else { LBinOp::ICmpLtU }
+        lexer::TokenKind::Le => if signed { LBinOp::ICmpLeS } else { LBinOp::ICmpLeU }
+        lexer::TokenKind::Gt => if signed { LBinOp::ICmpGtS } else { LBinOp::ICmpGtU }
+        lexer::TokenKind::Ge => if signed { LBinOp::ICmpGeS } else { LBinOp::ICmpGeU }
+        _ => error { message = "native backend N1: comparison operator not yet lowered (N2)" }
+    }
+}
+
+/** CmpChain — the outcome of lowering every ADJACENT term of a TCompare: the updated
+    context + the bool VReg of each pairwise comparison (first-vs-rest[0], rest[0]-vs-
+    rest[1], ...), in order. */
+pub type CmpChain = struct { ctx: LowerCtx; bools: []u32 }
+
+/** lower_compare_terms — lower each rest-operand once (never re-lowering a shared node),
+    emitting the ICmp/FCmp opcode chosen by the LEFT operand's PrimKind for each adjacent
+    pair. */
+fn lower_compare_terms(ctx: LowerCtx, e: checker::TExpr, prev_type: checker::Type, prev_vreg: u32, rest: []checker::TCmpTerm) -> CmpChain | error {
+    mut cur = ctx
+    mut pv = prev_vreg
+    mut pt = prev_type
+    mut bools: []u32 = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= rest.len { break }
+        let term = rest[i]
+        let ro = match lower_expr(cur, term.operand) { Lowered as x => x; error as err => return err }
+        let k = match prim_kind_of(pt) { checker::PrimKind as p => p; error as err => return err }
+        let op = match cmp_lbinop_of(term.op, k) { LBinOp as o => o; error as err => return err }
+        let r = ctx_alloc(ro.ctx)
+        cur = ctx_append(r.ctx, bin_inst(r.vreg, op, pv, ro.vreg, e.line, e.col))
+        bools = teko::list::push(bools, r.vreg)
+        pv = ro.vreg
+        pt = term.operand.type
+        i++
+    }
+    CmpChain { ctx = cur; bools = bools }
+}
+
+/** lower_bool_and — short-circuit `a && b` over two ALREADY-lowered bool VRegs, via a
+    branch + merge block-arg (no bitwise op needed): if `a` is false the merge takes 0
+    directly; otherwise it takes `b`'s value. ANDs a TCompare's adjacent-term results
+    (`a<b<c` -> `(a<b) && (b<c)`), reusing the same block infra if-expr lowering builds. */
+fn lower_bool_and(ctx: LowerCtx, a_vreg: u32, b_vreg: u32, line: u32, col: u32) -> Lowered {
+    let thenb = alloc_block(ctx.func)
+    let elseb = alloc_block(thenb.func)
+    let mergeb = alloc_block(elseb.func)
+    let mp = add_block_param(mergeb.func, mergeb.block_id)
+    let br = branch_inst(a_vreg, thenb.block_id, teko::list::empty(), elseb.block_id, teko::list::empty(), line, col)
+    let after_br = append_inst(mp.func, ctx.block_id, br)
+    let then_args = teko::list::push(teko::list::empty(), b_vreg)
+    let after_then = append_inst(after_br, thenb.block_id, jump_inst(mergeb.block_id, then_args, line, col))
+    let zc = alloc_vreg(after_then)
+    let with_zero = append_inst(zc.func, elseb.block_id, const_int_inst(zc.vreg, 0 to i128, line, col))
+    let else_args = teko::list::push(teko::list::empty(), zc.vreg)
+    let after_else = append_inst(with_zero, elseb.block_id, jump_inst(mergeb.block_id, else_args, line, col))
+    Lowered { ctx = LowerCtx { func = after_else; block_id = mergeb.block_id; env = ctx.env }; vreg = mp.vreg }
+}
+
+/** lower_compare — a TCompare (`first` + `rest` chain) -> the chain of ICmp/FCmp opcodes,
+    ANDed together. A lone subject (no `rest`) is degenerate: its own value is already the
+    bool result (mirrors emit_compare's C twin). */
+fn lower_compare(ctx: LowerCtx, e: checker::TExpr, cmp: checker::TCompare) -> Lowered | error {
+    let lo = match lower_expr(ctx, cmp.first) { Lowered as x => x; error as err => return err }
+    if cmp.rest.len == 0 { return Lowered { ctx = lo.ctx; vreg = lo.vreg } }
+    let chain = match lower_compare_terms(lo.ctx, e, cmp.first.type, lo.vreg, cmp.rest) { CmpChain as c => c; error as err => return err }
+    mut cur = chain.ctx
+    mut acc = chain.bools[0]
+    mut i: u64 = 1
+    loop {
+        if i >= chain.bools.len { break }
+        let merged = lower_bool_and(cur, acc, chain.bools[i], e.line, e.col)
+        cur = merged.ctx
+        acc = merged.vreg
+        i++
+    }
+    Lowered { ctx = cur; vreg = acc }
+}
+
 /** lower_call — a direct call. The `exit`/`panic` builtins map to their runtime symbols
     (tk_exit / tk_panic_str), matching the C backend; a Teko-Teko call resolves its symbol
     through the shared mangler (call_ns::name). Arguments lower left-to-right. A closure/
@@ -406,7 +515,7 @@ fn lower_args(ctx: LowerCtx, args: []checker::TExpr) -> LoweredArgs | error {
     VReg the caller must not read; a value call allocates a result VReg. */
 fn lower_call_symbol(ctx: LowerCtx, e: checker::TExpr, c: checker::TCall, vregs: []u32) -> Lowered | error {
     let sym = match call_symbol(c) { str as s => s; error as err => return err }
-    if is_void_call(e.type) {
+    if type_is_void(e.type) {
         let inst = void_call_inst(sym, vregs, false, e.line, e.col)
         return Lowered { ctx = ctx_append(ctx, inst); vreg = 0 }
     }
@@ -415,8 +524,10 @@ fn lower_call_symbol(ctx: LowerCtx, e: checker::TExpr, c: checker::TCall, vregs:
     Lowered { ctx = ctx_append(r.ctx, inst); vreg = r.vreg }
 }
 
-/** is_void_call — does the call yield no value (a Void result type)? */
-fn is_void_call(t: checker::Type) -> bool {
+/** type_is_void — is `t` the Void marker (no value)? Shared by call lowering (a void call
+    emits a valueless instruction) and if-expression lowering (a Void-typed `if` is really an
+    if-STATEMENT — its merge carries zero block-args). */
+fn type_is_void(t: checker::Type) -> bool {
     match t { checker::Void => true; _ => false }
 }
 
@@ -481,6 +592,115 @@ fn lower_return(ctx: LowerCtx, r: checker::TReturn) -> LowerStmtOut | error {
 fn lower_expr_stmt(ctx: LowerCtx, es: checker::TExprStmt) -> LowerStmtOut | error {
     let lo = match lower_expr(ctx, es.expr) { Lowered as x => x; error as err => return err }
     LowerStmtOut { ctx = lo.ctx; terminated = false }
+}
+
+/** ctx_goto — switch the context to emit into `block_id` (already allocated), keeping the
+    function/env unchanged — used after a branch/jump splits control into a fresh block. */
+fn ctx_goto(ctx: LowerCtx, block_id: u32) -> LowerCtx {
+    LowerCtx { func = ctx.func; block_id = block_id; env = ctx.env }
+}
+
+/** close_arm_to — close a lowered if-arm by jumping to `target` carrying `args` as its
+    block-args, UNLESS the arm's block already ended in a terminator (an early return, or a
+    nested branch/jump) — such an arm's control never reaches this merge. */
+fn close_arm_to(ctx: LowerCtx, target: u32, args: []u32, line: u32, col: u32) -> LFunc {
+    if block_terminated(ctx.func, ctx.block_id) { return ctx.func }
+    append_inst(ctx.func, ctx.block_id, jump_inst(target, args, line, col))
+}
+
+/** LowerBlockValue — the outcome of lowering a value-producing if-expression arm's
+    statement block: either it fell through with the tail value in `vreg` (terminated=false
+    — the LAST statement was an expression-statement whose value IS the arm's result), or an
+    inner control-flow op (a `return`, the only one until A1-2's break/continue) already
+    closed the block (terminated=true, `vreg` unused). */
+pub type LowerBlockValue = struct { ctx: LowerCtx; terminated: bool; vreg: u32 }
+
+/** lower_block_value — lower an if-expression arm's statement block: every statement but
+    the last lowers as an ordinary effect-only statement; the last is the arm's TAIL VALUE
+    (an expression-statement) unless it already terminated the block on its own. Mirrors
+    emit_branch_value's "last statement is the value" shape (codegen.tks). */
+fn lower_block_value(ctx: LowerCtx, body: []checker::TStatement) -> LowerBlockValue | error {
+    if body.len == 0 { return error { message = "native backend N1: empty if-expression arm (internal)" } }
+    mut cur = ctx
+    mut i: u64 = 0
+    loop {
+        if i + 1 >= body.len { break }
+        let out = match lower_stmt(cur, body[i]) { LowerStmtOut as x => x; error as err => return err }
+        cur = out.ctx
+        if out.terminated { return LowerBlockValue { ctx = cur; terminated = true; vreg = 0 } }
+        i++
+    }
+    lower_tail_stmt(cur, body[body.len - 1])
+}
+
+/** lower_tail_stmt — an if-expression arm's final statement: an expression-statement's
+    value IS the arm's tail value; any other statement kind is delegated to
+    lower_tail_non_expr. */
+fn lower_tail_stmt(ctx: LowerCtx, s: checker::TStatement) -> LowerBlockValue | error {
+    match s {
+        checker::TExprStmt as es => {
+            let lo = match lower_expr(ctx, es.expr) { Lowered as x => x; error as err => return err }
+            LowerBlockValue { ctx = lo.ctx; terminated = false; vreg = lo.vreg }
+        }
+        _ => lower_tail_non_expr(ctx, s)
+    }
+}
+
+/** lower_tail_non_expr — a non-expression-statement tail: valid only if it terminates the
+    arm (a `return`); anything else honest-stops (a checker invariant break — a value-typed
+    if-expr arm whose tail neither returns nor yields a value). */
+fn lower_tail_non_expr(ctx: LowerCtx, s: checker::TStatement) -> LowerBlockValue | error {
+    let out = match lower_stmt(ctx, s) { LowerStmtOut as x => x; error as err => return err }
+    if out.terminated { return LowerBlockValue { ctx = out.ctx; terminated = true; vreg = 0 } }
+    error { message = "native backend N1: if-expression arm's tail statement does not yield a value (internal)" }
+}
+
+/** lower_if_expr — cond ? then : else via LBranch + per-arm blocks merging through a
+    block-arg. An if-EXPRESSION (its result type is not Void) merges with the arm's tail
+    value as a one-VReg block-arg; an if-STATEMENT (Void) merges with zero block-args.
+    Mirrors emit_if_value/emit_if_stmt's shape (codegen.tks), SSA-lite. */
+fn lower_if_expr(ctx: LowerCtx, e: checker::TExpr, f: checker::TIfExpr) -> Lowered | error {
+    let co = match lower_expr(ctx, f.cond) { Lowered as x => x; error as err => return err }
+    if type_is_void(e.type) { return lower_if_stmt(co.ctx, e, f, co.vreg) }
+    lower_if_value(co.ctx, e, f, co.vreg)
+}
+
+/** lower_if_stmt — the Void (no-value) shape: both arms lower their statement block for
+    effect only and merge with zero block-args; a missing `else` is a pass-through arm (jumps
+    straight to the merge). */
+fn lower_if_stmt(ctx: LowerCtx, e: checker::TExpr, f: checker::TIfExpr, cond_vreg: u32) -> Lowered | error {
+    let thenb = alloc_block(ctx.func)
+    let elseb = alloc_block(thenb.func)
+    let mergeblk = alloc_block(elseb.func)
+    let br = branch_inst(cond_vreg, thenb.block_id, teko::list::empty(), elseb.block_id, teko::list::empty(), e.line, e.col)
+    let ctx1 = ctx_append(LowerCtx { func = mergeblk.func; block_id = ctx.block_id; env = ctx.env }, br)
+    let then_done = match lower_block(ctx_goto(ctx1, thenb.block_id), f.then_blk) { LowerCtx as c => c; error as err => return err }
+    let then_func = close_arm_to(then_done, mergeblk.block_id, teko::list::empty(), e.line, e.col)
+    let else_ctx = LowerCtx { func = then_func; block_id = elseb.block_id; env = ctx.env }
+    let else_done = if f.has_else { match lower_block(else_ctx, f.else_blk) { LowerCtx as c => c; error as err => return err } } else { else_ctx }
+    let else_func = close_arm_to(else_done, mergeblk.block_id, teko::list::empty(), e.line, e.col)
+    Lowered { ctx = LowerCtx { func = else_func; block_id = mergeblk.block_id; env = ctx.env }; vreg = 0 }
+}
+
+/** lower_if_value — the value-producing shape: both arms' TAIL values become the merge
+    block's single block-arg (the if-expression's result VReg). An if-without-else used as a
+    value is out of the N1 subset (mirrors emit_if_value's own honest-stop). */
+fn lower_if_value(ctx: LowerCtx, e: checker::TExpr, f: checker::TIfExpr, cond_vreg: u32) -> Lowered | error {
+    if !f.has_else { return error { message = "native backend N1: if-without-else used as a value not yet lowered (N2)" } }
+    let thenb = alloc_block(ctx.func)
+    let elseb = alloc_block(thenb.func)
+    let mergeblk = alloc_block(elseb.func)
+    let mp = add_block_param(mergeblk.func, mergeblk.block_id)
+    let br = branch_inst(cond_vreg, thenb.block_id, teko::list::empty(), elseb.block_id, teko::list::empty(), e.line, e.col)
+    let ctx1 = ctx_append(LowerCtx { func = mp.func; block_id = ctx.block_id; env = ctx.env }, br)
+    let then_val = match lower_block_value(ctx_goto(ctx1, thenb.block_id), f.then_blk) { LowerBlockValue as x => x; error as err => return err }
+    let then_args = teko::list::push(teko::list::empty(), then_val.vreg)
+    let then_func = close_arm_to(then_val.ctx, mergeblk.block_id, then_args, e.line, e.col)
+    let else_ctx = LowerCtx { func = then_func; block_id = elseb.block_id; env = ctx.env }
+    let else_val = match lower_block_value(else_ctx, f.else_blk) { LowerBlockValue as x => x; error as err => return err }
+    let else_args = teko::list::push(teko::list::empty(), else_val.vreg)
+    let else_func = close_arm_to(else_val.ctx, mergeblk.block_id, else_args, e.line, e.col)
+    Lowered { ctx = LowerCtx { func = else_func; block_id = mergeblk.block_id; env = ctx.env }; vreg = mp.vreg }
 }
 
 /** texpr_kind_name — a short spelling of a typed expression's kind for the honest-stop
