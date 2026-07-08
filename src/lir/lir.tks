@@ -94,8 +94,14 @@ pub type LLoad = struct { addr: u32; ty: LType }
     no value (A1-3, #382). */
 pub type LStore = struct { addr: u32; value: u32; ty: LType }
 
+/** LGlobalAddr — the address of a named global/rodata symbol (a Ptr VReg). String literals
+    intern their bytes into the module's rodata table (`LRodata`) and reference the entry here;
+    the symbol is already the final linker name (the LIR never re-mangles, mirroring `LCall`)
+    (A1-4, #382). */
+pub type LGlobalAddr = struct { symbol: str }
+
 /** LOp — the instruction payload (one of the operation cases above). */
-pub type LOp = variant LConstInt | LConstFloat | LBin | LUn | LCall | LParam | LRet | LJump | LBranch | LAlloca | LFieldAddr | LLoad | LStore
+pub type LOp = variant LConstInt | LConstFloat | LBin | LUn | LCall | LParam | LRet | LJump | LBranch | LAlloca | LFieldAddr | LLoad | LStore | LGlobalAddr
 
 /** LInst — one instruction: the VReg it defines (has_result=false for terminators
     and void calls), its op, and the source position propagated from the TExpr (for
@@ -112,13 +118,23 @@ pub type LBlock = struct { id: u32; params: []u32; insts: []LInst }
     during lowering (functional threading — no mutable module state). */
 pub type LFunc = struct { symbol: str; n_params: u32; param_types: []LType; ret_type: LType; blocks: []LBlock; next_vreg: u32 }
 
-/** LModule — the whole lowered program: its functions + the struct-layout table
-    (A1-3, #382). Globals/rodata enter in A1-4. */
-pub type LModule = struct { funcs: []LFunc; layouts: []LStructLayout }
+/** LRodata — one read-only data entry: its already-final symbol + the raw bytes (a string
+    literal's UTF-8, or an interpolation piece's UTF-8). Referenced by `LGlobalAddr`
+    (A1-4, #382). */
+pub type LRodata = struct { symbol: str; bytes: []byte }
 
-/** empty_module — a module with no functions or layouts (the lowering seed). */
+/** LGlobal — one mutable/immutable top-level datum: its symbol, machine class, and
+    initializer image. No A1-4 lowering produces one yet (top-level consts are a later
+    construct); the field exists now so `LModule` widens only once (A1-4, #382). */
+pub type LGlobal = struct { symbol: str; ty: LType; bytes: []byte }
+
+/** LModule — the whole lowered program: its functions, its rodata + global tables, and the
+    struct-layout table (A1-3/A1-4, #382). */
+pub type LModule = struct { funcs: []LFunc; rodata: []LRodata; globals: []LGlobal; layouts: []LStructLayout }
+
+/** empty_module — a module with no functions/rodata/globals/layouts (the lowering seed). */
 pub fn empty_module() -> LModule {
-    LModule { funcs = teko::list::empty(); layouts = teko::list::empty() }
+    LModule { funcs = teko::list::empty(); rodata = teko::list::empty(); globals = teko::list::empty(); layouts = teko::list::empty() }
 }
 
 /** new_func — a fresh LFunc with an empty single block (#B0) reserving VRegs
@@ -218,6 +234,12 @@ pub fn store_inst(addr: u32, value: u32, ty: LType, line: u32, col: u32) -> LIns
     LInst { result = 0; has_result = false; op = LStore { addr = addr; value = value; ty = ty }; line = line; col = col }
 }
 
+/** global_addr_inst — a `%r = global_addr @<symbol>` instruction: the address of a rodata/
+    global entry (A1-4, #382). */
+pub fn global_addr_inst(result: u32, symbol: str, line: u32, col: u32) -> LInst {
+    LInst { result = result; has_result = true; op = LGlobalAddr { symbol = symbol }; line = line; col = col }
+}
+
 /** push_inst_block — a fresh block with `inst` appended to its instruction stream. */
 fn push_inst_block(b: LBlock, inst: LInst) -> LBlock {
     LBlock { id = b.id; params = b.params; insts = teko::list::push(b.insts, inst) }
@@ -254,12 +276,29 @@ pub fn alloc_vreg(f: LFunc) -> FreshVReg {
 
 /** add_func — return a copy of `m` with `f` appended. */
 pub fn add_func(m: LModule, f: LFunc) -> LModule {
-    LModule { funcs = teko::list::push(m.funcs, f); layouts = m.layouts }
+    LModule { funcs = teko::list::push(m.funcs, f); rodata = m.rodata; globals = m.globals; layouts = m.layouts }
 }
 
 /** add_layout — return a copy of `m` with the struct layout `l` appended. */
 pub fn add_layout(m: LModule, l: LStructLayout) -> LModule {
-    LModule { funcs = m.funcs; layouts = teko::list::push(m.layouts, l) }
+    LModule { funcs = m.funcs; rodata = m.rodata; globals = m.globals; layouts = teko::list::push(m.layouts, l) }
+}
+
+/** add_rodata — return a copy of `m` with the rodata entry `r` appended (A1-4, #382). */
+pub fn add_rodata(m: LModule, r: LRodata) -> LModule {
+    LModule { funcs = m.funcs; rodata = teko::list::push(m.rodata, r); globals = m.globals; layouts = m.layouts }
+}
+
+/** add_global — return a copy of `m` with the global entry `g` appended (A1-4, #382). */
+pub fn add_global(m: LModule, g: LGlobal) -> LModule {
+    LModule { funcs = m.funcs; rodata = m.rodata; globals = teko::list::push(m.globals, g); layouts = m.layouts }
+}
+
+/** with_rodata — return a copy of `m` with its ENTIRE rodata table replaced by `rodata`
+    (used once, at the end of `lower_program`, to fold the whole-program interned-string
+    table the per-function lowering accumulated — A1-4, #382). */
+pub fn with_rodata(m: LModule, rodata: []LRodata) -> LModule {
+    LModule { funcs = m.funcs; rodata = rodata; globals = m.globals; layouts = m.layouts }
 }
 
 /** BlockRef — a freshly-allocated block's id + the function that reserved it (a plain

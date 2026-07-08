@@ -94,12 +94,14 @@ fn lwt_lower_expr_text(e: checker::TExpr) -> str {
 }
 
 /** lwt_lower_expr_text_with — lwt_lower_expr_text, but threading a struct-layout table
-    (A1-3, #382) so a TStructInit/TFieldAccess/TIndex fixture can resolve its offsets. */
+    (A1-3, #382) so a TStructInit/TFieldAccess/TIndex fixture can resolve its offsets. The
+    printed module folds in whatever the expression interned into rodata (A1-4, #382), so a
+    string-literal fixture's golden dump shows its `rodata`/`{ptr,len}` shape too. */
 fn lwt_lower_expr_text_with(e: checker::TExpr, layouts: []LStructLayout) -> str {
     let f0 = new_func("t", 0, teko::list::empty(), LType::I64)
-    let ctx0 = LowerCtx { func = f0; block_id = 0; env = empty_lenv(); layouts = layouts }
+    let ctx0 = LowerCtx { func = f0; block_id = 0; env = empty_lenv(); layouts = layouts; rodata = teko::list::empty() }
     let lo = match lower_expr(ctx0, e) { Lowered as x => x; error as err => return teko::str::concat("ERR: ", err.message) }
-    print_lmodule(add_func(empty_module(), lo.ctx.func))
+    print_lmodule(with_rodata(add_func(empty_module(), lo.ctx.func), lo.ctx.rodata))
 }
 
 #test
@@ -261,7 +263,7 @@ fn lwt_lowers_if_stmt_without_else_via_branch_and_merge() {
     let params = teko::list::push(teko::list::push(teko::list::empty(), lwt_param("a", "i64")), lwt_param("b", "i64"))
     let body = teko::list::push(teko::list::push(teko::list::empty(), lwt_exprstmt(ifstmt)), lwt_ret(b))
     let f = lwt_fn("choose", "teko::demo", params, checker::Prim { kind = checker::PrimKind::I64 }, body)
-    let lf = match lower_function(f) { LFunc as x => x; error as err => return }
+    let lf = match lower_function(f) { LoweredFunction as x => x.func; error as err => return }
     let text = print_lmodule(add_func(empty_module(), lf))
     teko::assert::str_contains(text, "branch %2, #B1(), #B2()")
     teko::assert::str_contains(text, "  #B1:\n    ret %0")
@@ -280,7 +282,7 @@ fn lwt_lowers_if_expr_merges_with_a_block_arg() {
     let params = teko::list::push(teko::list::push(teko::list::empty(), lwt_param("x", "i64")), lwt_param("y", "i64"))
     let body = teko::list::push(teko::list::empty(), lwt_ret(ifexpr))
     let f = lwt_fn("pick", "teko::demo", params, checker::Prim { kind = checker::PrimKind::I64 }, body)
-    let lf = match lower_function(f) { LFunc as x2 => x2; error as err => return }
+    let lf = match lower_function(f) { LoweredFunction as x2 => x2.func; error as err => return }
     let text = print_lmodule(add_func(empty_module(), lf))
     teko::assert::str_contains(text, "branch %2, #B1(), #B2()")
     teko::assert::str_contains(text, "  #B1:\n    jump #B3(%0)")
@@ -314,7 +316,7 @@ fn lwt_lowers_function_with_params_and_return() {
     let params = teko::list::push(teko::list::push(teko::list::empty(), lwt_param("a", "i64")), lwt_param("b", "i64"))
     let body = teko::list::push(teko::list::empty(), lwt_ret(lwt_bin(lexer::TokenKind::Plus, lwt_var("a", checker::PrimKind::I64), lwt_var("b", checker::PrimKind::I64), checker::PrimKind::I64)))
     let f = lwt_fn("add", "teko::demo", params, checker::Prim { kind = checker::PrimKind::I64 }, body)
-    let lf = match lower_function(f) { LFunc as x => x; error as err => return }
+    let lf = match lower_function(f) { LoweredFunction as x => x.func; error as err => return }
     let text = print_lmodule(add_func(empty_module(), lf))
     teko::assert::str_contains(text, "func @teko__demo__add(%0: i64, %1: i64) -> i64 {")
     teko::assert::str_contains(text, "%0 = param 0")
@@ -365,7 +367,7 @@ fn lwt_honest_stop_on_generic_function() {
         vis = parser::Visibility::Private; has_doc = false; doc = ""
         file = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""
     }
-    let ok = match lower_function(gf) { LFunc => false; error as e => teko::str::contains(e.message, "generic function not yet lowered") }
+    let ok = match lower_function(gf) { LoweredFunction => false; error as e => teko::str::contains(e.message, "generic function not yet lowered") }
     teko::assert::is_true(ok)
 }
 
@@ -416,7 +418,7 @@ fn lwt_lowers_field_access_via_registered_layout() {
     let params = teko::list::push(teko::list::empty(), lwt_param("p", "Point"))
     let body = teko::list::push(teko::list::empty(), lwt_ret(fa))
     let f = lwt_fn("read_y", "teko::demo", params, checker::Prim { kind = checker::PrimKind::I64 }, body)
-    let lf = match lower_function(f, lwt_one_layout(lwt_point_layout())) { LFunc as x => x; error as err => return }
+    let lf = match lower_function(f, lwt_one_layout(lwt_point_layout())) { LoweredFunction as x => x.func; error as err => return }
     let text = print_lmodule(add_func(empty_module(), lf))
     teko::assert::str_contains(text, "%1 = field_addr %0, 8")
     teko::assert::str_contains(text, "%2 = load.i64 %1")
@@ -470,7 +472,7 @@ fn lwt_lowers_plain_field_assignment_via_registered_layout() {
     let params = teko::list::push(teko::list::empty(), lwt_param("p", "Point"))
     let body = teko::list::push(teko::list::push(teko::list::empty(), assign), lwt_ret(lwt_num_i64(0 to i128)))
     let f = lwt_fn("write_x", "teko::demo", params, checker::Prim { kind = checker::PrimKind::I64 }, body)
-    let lf = match lower_function(f, lwt_one_layout(lwt_point_layout())) { LFunc as x => x; error as err => return }
+    let lf = match lower_function(f, lwt_one_layout(lwt_point_layout())) { LoweredFunction as x => x.func; error as err => return }
     let text = print_lmodule(add_func(empty_module(), lf))
     teko::assert::str_contains(text, "%1 = field_addr %0, 0")
     teko::assert::str_contains(text, "%2 = const 9")
@@ -484,7 +486,7 @@ fn lwt_lowers_compound_field_assignment_reads_then_writes() {
     let params = teko::list::push(teko::list::empty(), lwt_param("p", "Point"))
     let body = teko::list::push(teko::list::push(teko::list::empty(), assign), lwt_ret(lwt_num_i64(0 to i128)))
     let f = lwt_fn("bump_x", "teko::demo", params, checker::Prim { kind = checker::PrimKind::I64 }, body)
-    let lf = match lower_function(f, lwt_one_layout(lwt_point_layout())) { LFunc as x => x; error as err => return }
+    let lf = match lower_function(f, lwt_one_layout(lwt_point_layout())) { LoweredFunction as x => x.func; error as err => return }
     let text = print_lmodule(add_func(empty_module(), lf))
     teko::assert::str_contains(text, "%2 = load.i64 %1")
     teko::assert::str_contains(text, "%4 = iadd %2, %3")
@@ -556,3 +558,4 @@ fn lwt_lowers_char_literal_multibyte_to_its_codepoint() {
     let cl = checker::TExpr { kind = checker::TCharLit { bytes = "é" }; type = checker::Char { }; line = 0; col = 0 }
     teko::assert::str_contains(lwt_lower_expr_text(cl), "%0 = const 233")
 }
+

@@ -151,14 +151,68 @@ fn mem_store(m: MemStore, addr: i128, value: i128) -> MemStore | error {
 /** interp_lmodule — run the function named `entry` in `m` with `args`, returning the exit
     code the program would produce: an explicit `tk_exit(n)` yields n; a plain `ret v` from
     the entry yields v; an out-of-subset op or a missing function yields a NEGATIVE sentinel
-    (-1) so a fixture's expected non-negative exit never collides with a failure. */
+    (-1) so a fixture's expected non-negative exit never collides with a failure. The whole-
+    run memory is SEEDED with every rodata entry's bytes before the entry function runs
+    (A1-4, #382), so a `load` off a `global_addr` finds real content from instruction 0. */
 pub fn interp_lmodule(m: LModule, entry: str, args: []i128) -> i128 {
     let f = find_lfunc(m, entry)
     if !f.found { return -1 to i128 }
-    let r = interp_call(m, f.func, args, 0, empty_memstore())
+    let r = interp_call(m, f.func, args, 0, seed_rodata(m))
     if is_exit(r.result) { return r.result.value }
     if is_return(r.result) { return r.result.value }
     -1 to i128
+}
+
+/** seed_rodata — a fresh memory with every entry of `m.rodata` pre-loaded, ONE CELL PER
+    BYTE, in table order — `rodata_base_of` recomputes the exact same cumulative offsets
+    purely from `m.rodata` (a STATIC, never-mutated table), so no separate address-table
+    needs threading through the interpreter: `LGlobalAddr` just re-derives its base address
+    from `m` (already a parameter everywhere) on every read (A1-4, #382). */
+fn seed_rodata(m: LModule) -> MemStore {
+    mut mem = empty_memstore()
+    mut i: u64 = 0
+    loop {
+        if i >= m.rodata.len { break }
+        let al = mem_alloc(mem, m.rodata[i].bytes.len to u32)
+        mem = store_bytes(al.mem, al.addr, m.rodata[i].bytes)
+        i++
+    }
+    mem
+}
+
+/** store_bytes — write each byte of `bytes` into its own cell starting at `base` (a
+    byte-granular fill, matching the interp's cell-per-address-unit memory model — A1-4,
+    #382). A write is never out-of-bounds here (the cells were just reserved by the caller's
+    `mem_alloc` of the exact same length), so a `mem_store` error is unreachable — kept as a
+    silent no-op fallback only so the match stays total. */
+fn store_bytes(m: MemStore, base: i128, bytes: []byte) -> MemStore {
+    mut cur = m
+    mut i: u64 = 0
+    loop {
+        if i >= bytes.len { break }
+        cur = match mem_store(cur, base + (i to i128), bytes[i] to i128) { MemStore as m2 => m2; error => cur }
+        i++
+    }
+    cur
+}
+
+/** RodataHit — a rodata symbol lookup: whether it was found + its base address (A1-4,
+    #382). */
+pub type RodataHit = struct { ok: bool; addr: i128 }
+
+/** rodata_base_of — the base address `seed_rodata` gave the entry named `symbol`, computed
+    by walking `rodata` and summing byte lengths up to the match — the SAME cumulative-offset
+    walk `seed_rodata` performs, so the two always agree (A1-4, #382). */
+fn rodata_base_of(rodata: []LRodata, symbol: str) -> RodataHit {
+    mut offset: i128 = 0 to i128
+    mut i: u64 = 0
+    loop {
+        if i >= rodata.len { break }
+        if rodata[i].symbol == symbol { return RodataHit { ok = true; addr = offset } }
+        offset = offset + (rodata[i].bytes.len to i128)
+        i++
+    }
+    RodataHit { ok = false; addr = 0 to i128 }
 }
 
 /** LFuncHit — a module function lookup result. */
@@ -358,6 +412,7 @@ fn interp_inst(m: LModule, f: LFunc, inst: LInst, rf: RegFile, depth: u32, mem: 
         LFieldAddr as fa => interp_field_addr(rf, inst, fa, mem)
         LLoad as ld => interp_load(rf, inst, ld, mem)
         LStore as st => interp_store(rf, st, mem)
+        LGlobalAddr as g => interp_global_addr(m, rf, inst, g, mem)
         LJump => istep_stop(ires_error("lir interp: internal — LJump must be intercepted by interp_block"), rf, mem)
         LBranch => istep_stop(ires_error("lir interp: internal — LBranch must be intercepted by interp_block"), rf, mem)
     }
@@ -411,6 +466,16 @@ fn interp_store(rf: RegFile, st: LStore, mem: MemStore) -> IStep {
         MemStore as mem2 => istep_cont(rf, mem2)
         error as e => istep_stop(ires_error(e.message), rf, mem)
     }
+}
+
+/** interp_global_addr — resolve `g.symbol` to its SEEDED rodata base address (`rodata_base_of`
+    over `m.rodata`), storing it into the instruction's result VReg; an unknown symbol is an
+    internal error (the lowering only ever emits a `global_addr` for a symbol it itself
+    interned) (A1-4, #382). */
+fn interp_global_addr(m: LModule, rf: RegFile, inst: LInst, g: LGlobalAddr, mem: MemStore) -> IStep {
+    let hit = rodata_base_of(m.rodata, g.symbol)
+    if !hit.ok { return istep_stop(ires_error(teko::str::concat("lir interp: unknown rodata symbol @", g.symbol)), rf, mem) }
+    istep_cont(rf_set(rf, inst.result, hit.addr), mem)
 }
 
 /** EvalOut — the result of an arithmetic evaluation: a computed value, or an error message
