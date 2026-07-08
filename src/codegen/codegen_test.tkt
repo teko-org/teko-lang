@@ -972,6 +972,65 @@ fn cgt_emit_defer() {
     teko::assert::is_true(teko::str::contains(r2, "_c"))   // drained inside the if AND at the tail
 }
 
+/**
+ * cgt_emit_adopt — (#337) verify the `adopt { }` lowering opens an adopter region and closes it
+ * with the SUBTREE-drop primitive, and that a NESTED adopt opens a second (inner) region. The
+ * emitted C must name tk_region_new (the adopter open) and tk_region_drop_subtree (the bulk-drop
+ * at the brace), NOT the plain tk_region_drop — that distinction is what reclaims the per-object
+ * child regions instead of leaking them to the process root.
+ */
+#test
+fn cgt_emit_adopt() {
+    let prog = cgt_prog()
+    let ret_type = checker::Prim { kind = checker::PrimKind::I64 }
+
+    let inner_body: []checker::TStatement = teko::list::push(cgt_empty_stmts(), checker::TBinding {
+            kind = parser::BindKind::Let
+            target = parser::SimpleName { name = "_a" }
+            bound = checker::Prim { kind = checker::PrimKind::I64 }
+            value = cgt_num_i64(0)
+    })
+    let adopt_s: checker::TStatement = checker::TAdoptStmt { name = ""; body = inner_body }
+    mut body: []checker::TStatement = cgt_empty_stmts()
+    body = teko::list::push(body, adopt_s)
+    body = teko::list::push(body, cgt_ret(cgt_num_i64(3)))
+    let f = cgt_fn0("cgt_fn_adopt", "teko::cgt", ret_type, body)
+    let r = match emit_function(cgt_empty(), prog, f) { []byte as o => str(o); error => "" }
+    teko::assert::is_true(teko::str::contains(r, "cgt_fn_adopt"))
+    teko::assert::is_true(teko::str::contains(r, "tk_region_new"))
+    teko::assert::is_true(teko::str::contains(r, "tk_region_drop_subtree"))
+
+    let named_s: checker::TStatement = checker::TAdoptStmt { name = "r"; body = inner_body }
+    let nested_body: []checker::TStatement = teko::list::push(cgt_empty_stmts(), named_s)
+    let outer_s: checker::TStatement = checker::TAdoptStmt { name = ""; body = nested_body }
+    mut body2: []checker::TStatement = cgt_empty_stmts()
+    body2 = teko::list::push(body2, outer_s)
+    body2 = teko::list::push(body2, cgt_ret(cgt_num_i64(3)))
+    let f2 = cgt_fn0("cgt_fn_adopt_nested", "teko::cgt", ret_type, body2)
+    let r2 = match emit_function(cgt_empty(), prog, f2) { []byte as o => str(o); error => "" }
+    teko::assert::is_true(teko::str::contains(r2, "cgt_fn_adopt_nested"))
+    teko::assert::is_true(count_substr(r2, "tk_region_drop_subtree") >= 2)
+}
+
+/**
+ * count_substr — the number of non-overlapping occurrences of `needle` in `hay`. Used by the
+ * nested-adopt test to prove BOTH the inner and outer adopters emit a subtree-drop.
+ *
+ * @param str hay  the text to search
+ * @param str needle  the substring to count (non-empty)
+ * @return u64  the occurrence count
+ */
+fn count_substr(hay: str, needle: str) -> u64 {
+    if needle.len == 0 { return 0 }
+    mut n: u64 = 0
+    mut i: u64 = 0
+    loop {
+        if i + needle.len > hay.len { break }
+        if teko::str::contains(teko::str::slice(hay, i, i + needle.len), needle) { n = n + 1; i = i + needle.len } else { i = i + 1 }
+    }
+    n
+}
+
 // ---------------------------------------------------------------------------
 // Helper: 3-segment path for teko::list::empty / push
 // ---------------------------------------------------------------------------
@@ -1049,7 +1108,7 @@ fn cgt_byvalue_boxed_variant() {
     let vm1: []parser::TypeExpr = teko::list::push(teko::list::empty(), cgt_named_te("i64"))
     let vm2: []parser::TypeExpr = teko::list::push(vm1, cgt_named_te("str"))
     let vbody = parser::VariantBody { type_expr = parser::UnionType { members = vm2 } }
-    let vdecl = parser::TypeDecl { name = "MyV"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = vbody; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; di_kind = parser::DiKind::None; has_di_key = false; di_key = "" }
+    let vdecl = parser::TypeDecl { name = "MyV"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = vbody; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; di_kind = parser::DiKind::None; has_di_key = false; di_key = ""; is_unsafe = false; must_free = false }
     teko::assert::is_true(cg_variant_has_member(vdecl, "i64"))
     teko::assert::is_false(cg_variant_has_member(vdecl, "unknown"))
 }
@@ -1073,7 +1132,7 @@ fn cgt_selfref_class_optional_field() {
         fields = fields
         methods = teko::list::empty()
     }
-    let cdecl = parser::TypeDecl { name = "Node"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = cbody; vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 0; col = 0; di_kind = parser::DiKind::None; has_di_key = false; di_key = "" }
+    let cdecl = parser::TypeDecl { name = "Node"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = cbody; vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 0; col = 0; di_kind = parser::DiKind::None; has_di_key = false; di_key = ""; is_unsafe = false; must_free = false }
     let prog = checker::TProgram { items = teko::list::push(teko::list::empty(), cdecl) }
 
     // the class IS recognized as a class (reference type)
@@ -1486,4 +1545,77 @@ fn bare_literal_narrow_binding_adopts_declared_type() {
     // shift count that only a 64-wide mask keeps in-range.
     let x = 1
     teko::assert::is_true((x << 40) == 1099511627776)   // 40 & 63 == 40 -> 1 << 40 (i64, no truncation)
+}
+
+/**
+ * Builds a single-`uptr`-field `#must_free` struct TypeDecl named `name` — the Arena-shaped
+ * manual region-handle (#358) the codegen region-free path recognizes structurally.
+ *
+ * @param str name  the type's name
+ * @return parser::TypeDecl  a `#must_free` struct TypeDecl with one `uptr` field named `region`
+ */
+fn cgt_region_handle_decl(name: str) -> parser::TypeDecl {
+    let field = parser::Field { name = "region"; type_ann = cgt_named_te("uptr"); vis = parser::Visibility::Pub; is_intern = false; has_doc = false; doc = "" }
+    let fields: []parser::Field = teko::list::push(teko::list::empty(), field)
+    let body = parser::StructBody { fields = fields; methods = teko::list::empty(); implements = teko::list::empty() }
+    parser::TypeDecl { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = body; vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 0; col = 0; di_kind = parser::DiKind::None; has_di_key = false; di_key = ""; is_unsafe = true; must_free = true }
+}
+
+/**
+ * A `TProgram` whose sole item is the region-handle TypeDecl `name` — so `type_table_of` /
+ * `is_region_handle_name` resolve it when the emit path probes for the Arena structure.
+ *
+ * @param str name  the region-handle type's name
+ * @return checker::TProgram  a program carrying exactly that TypeDecl
+ */
+fn cgt_prog_with_region_handle(name: str) -> checker::TProgram {
+    let items: []checker::TItem = teko::list::push(teko::list::empty(), cgt_region_handle_decl(name))
+    checker::TProgram { items = items }
+}
+
+/**
+ * Group S (#358): the manual-region codegen builtins. `emit_region_alloc` bump-allocates a `T`
+ * into a `uptr` region and copies the init in (a `ptr<T>` GNU stmt-expr routed through
+ * `tk_region_alloc`); `emit_region_free` bulk-drops a region handle via `tk_region_drop_subtree`
+ * and scrubs its `uptr` field; `region_new` lowers inline to `tk_region_new(tk_region_root())`.
+ */
+#test
+fn cgt_region_ops() {
+    let region_var = checker::TExpr {
+        kind = checker::TVar { name = "reg"; is_func = false; func_ns = "" }
+        type = checker::Uptr { }
+        line = 0; col = 0
+    }
+    let alloc_args: []checker::TExpr = teko::list::push(teko::list::push(teko::list::empty(), region_var), cgt_num(42 to i128, checker::PrimKind::U64))
+    let alloc_e = checker::TExpr {
+        kind = checker::TCall { callee = cgt_path3("teko", "mem", "region_alloc"); args = alloc_args; call_ns = "teko::mem"; is_closure_call = false; callee_type = checker::Void { }; is_iface_dispatch = false; iface_slot = 0 }
+        type = checker::Ptr { inner = checker::Prim { kind = checker::PrimKind::U64 } }
+        line = 0; col = 0
+    }
+    let alloc_out = match emit_expr(cgt_empty(), cgt_prog(), alloc_e) { []byte as o => str(o); error => "" }
+    teko::assert::is_true(teko::str::contains(alloc_out, "tk_region_alloc"))
+    teko::assert::is_true(teko::str::contains(alloc_out, "sizeof(uint64_t)"))
+
+    let new_e = checker::TExpr {
+        kind = checker::TCall { callee = cgt_path3("teko", "mem", "region_new"); args = teko::list::empty(); call_ns = "teko::mem"; is_closure_call = false; callee_type = checker::Void { }; is_iface_dispatch = false; iface_slot = 0 }
+        type = checker::Uptr { }
+        line = 0; col = 0
+    }
+    let new_out = match emit_expr(cgt_empty(), cgt_prog(), new_e) { []byte as o => str(o); error => "" }
+    teko::assert::is_true(teko::str::contains(new_out, "tk_region_new(tk_region_root())"))
+
+    let handle_var = checker::TExpr {
+        kind = checker::TVar { name = "a"; is_func = false; func_ns = "" }
+        type = checker::Named { name = "Arena" }
+        line = 0; col = 0
+    }
+    let free_args: []checker::TExpr = teko::list::push(teko::list::empty(), handle_var)
+    let free_e = checker::TExpr {
+        kind = checker::TCall { callee = cgt_path3("teko", "mem", "free"); args = free_args; call_ns = "teko::mem"; is_closure_call = false; callee_type = checker::Void { }; is_iface_dispatch = false; iface_slot = 0 }
+        type = checker::Void { }
+        line = 0; col = 0
+    }
+    let free_out = match emit_expr(cgt_empty(), cgt_prog_with_region_handle("Arena"), free_e) { []byte as o => str(o); error => "" }
+    teko::assert::is_true(teko::str::contains(free_out, "tk_region_drop_subtree"))
+    teko::assert::is_true(teko::str::contains(free_out, ".region"))
 }

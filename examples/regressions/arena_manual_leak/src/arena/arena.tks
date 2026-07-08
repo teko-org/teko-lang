@@ -1,0 +1,36 @@
+/**
+ * A LOCAL COPY of the S3 (`teko::mem::unsafe`, issue #358) `Arena` shape, WITH the `#must_free`
+ * and `unsafe` modifiers (compiled by gen1/native, never the released seed; see
+ * src/mem/unsafe/arena.tks's header). The dev-controlled MANUAL region — see arena_manual_ok for
+ * the positive shape. This fixture exists only to prove the NEGATIVE: an `Arena` dropped without
+ * being freed is a compile-time error.
+ */
+#must_free
+pub unsafe type Arena = struct {
+    /** The raw `tk_region *` this handle owns, carried as an opaque `uptr`; 0 once bulk-freed. */
+    region: uptr
+
+    /**
+     * Opens a fresh manual region (a new child of the process root) and wraps its raw handle.
+     *
+     * @return a fresh `Arena` owning a newly opened child region
+     */
+    pub fn new() -> Arena {
+        Arena { region = teko::mem::region_new() }
+    }
+}
+
+/**
+ * Opens an `Arena`, allocates into it, and RETURNS WITHOUT `teko::mem::free(a)` — the whole region
+ * is leaked. The `#must_free` local consume-or-fail dataflow (S2/#336) REJECTS this function at
+ * compile time: "`#must_free` value `a` is dropped without being freed on this path". This is the
+ * negative half of the #358 composition; the region can never be silently leaked.
+ *
+ * @return never returns a value — the function is rejected before codegen
+ */
+pub unsafe fn leak() -> i32 {
+    mut a = Arena::new()
+    let p = teko::mem::region_alloc(a.region, 42 to u64)
+    let back = teko::mem::bytes_from_ptr(p, 1)
+    back[0] to i32
+}

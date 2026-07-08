@@ -21,14 +21,14 @@
 
 Teko is a compiled, statically-typed programming language with a **fully self-hosting compiler**: the compiler is written in Teko itself and compiles its own source tree to a working native binary — and that binary rebuilds itself to a byte-identical fixpoint (generation 2 == generation 3).
 
-- **All-native output.** `teko build` lowers your program to C and hands it to the host C compiler — no runtime VM, no GC, no interpreter in production binaries.
+- **All-native output.** `teko build` lowers your program to C and hands it to the host C compiler — no runtime VM, no GC, no interpreter in production binaries. (C is the current lowering target; an own AOT backend is the 0.2 direction, not yet shipped.)
 - **A VM for development.** `teko run` executes the same checked program on a tree-walking VM for fast iteration and debugging; VM and native results are kept behaviorally identical by the project's differential-equivalence gate.
 - **Tests are part of the build.** `teko build` runs your `#test` functions **before** codegen; failing tests or a coverage floor below the manifest's threshold **bar the release**. Coverage can be exported as Cobertura XML (`--coverage`).
 - **Errors are values.** Functions return `T | error`; the `?` family (`T?`, `?.`, `??`) handles absence. There is no `null` outside `T?`, no exceptions, no `never`.
-- **Automatic memory without a GC.** Lexical arena regions with escape analysis — allocation and deallocation are compiler-managed; no `malloc`/`free`, no borrow checker ceremony.
+- **Automatic memory without a GC — with opt-in layers.** Arena regions are the invisible default: allocation and deallocation are compiler-managed, no GC, no borrow-checker ceremony (an *inferred* points-to/uniqueness fact — the "spine", under construction — is what makes stored borrows and manual `mem::free` sound; it is not a borrow checker you write to). On top ship two opt-in layers: `adopt { }` for cyclic or long-lived data (bulk-dropped at the block's brace), and `unsafe` — a **type/function modifier** (full risk ownership by type, not a block scope) — for explicit raw allocation. No `malloc`/`free` in safe code; raw allocation is explicit and contained behind `unsafe`.
 - **A deliberately small surface.** One loop construct (`loop` + `break`), `match` for control flow over data, generics via monomorphization, value structs, reference classes, pure-contract interfaces, bitflag `flags`, `extern` FFI to C libraries.
 
-> **Status: pre-release** (`0.0.1.0-bootstrap`). The language and compiler are under active, fast-moving development on `main`. Syntax and semantics can still change between commits. The compiler is fully self-hosting (gen-2 == gen-3 byte-identical fixpoint) and self-builds in under 300 MB of peak memory. See [TEKO_MASTER_PLAN.md](TEKO_MASTER_PLAN.md) for the live execution roadmap.
+> **Status: pre-release, beta.** The language and compiler are under active, fast-moving development; syntax and semantics can still change between commits. Versioning tracks the remodel: `alpha` (`0.0.1.x`, pre-remodel) → `beta` (the `0.X` remodel/backlog waves, each finalizing one coherent subset) → `1.0.0.0` = LTS once the backlog is empty. The current wave, **`0.1.0.0-beta`**, ships the memory model + `unsafe` (by type) + `adopt`. The compiler is fully self-hosting (gen-2 == gen-3 byte-identical fixpoint). See [TEKO_MASTER_PLAN.md](TEKO_MASTER_PLAN.md) for the live execution roadmap.
 
 ## A taste of Teko
 

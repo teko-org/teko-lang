@@ -270,6 +270,7 @@ fn write_tstatement(buf: []byte, t: StrTable, s: checker::TStatement) -> []byte 
         checker::TExprStmt as e => write_texpr(write_u8(buf, 6), t, e.expr)
         // TDeferStmt (7, C7.18): body ([]TStatement).
         checker::TDeferStmt as d => write_tstatements(write_u8(buf, 7), t, d.body)
+        checker::TAdoptStmt as a => write_tstatements(write_u32(write_u8(buf, 8), st_find(t, a.name)), t, a.body)
     }
 }
 
@@ -412,7 +413,8 @@ fn write_flags_body(buf: []byte, t: StrTable, f: parser::FlagsBody) -> []byte {
     sb
 }
 
-/** a parser TypeDecl: name + type_params + type_constraints + body + vis + has_doc + doc + line + col. */
+/** a parser TypeDecl: name + type_params + type_constraints + body + vis + has_doc + doc + line + col
+    + is_unsafe (U1, 0.1.0.0-beta memory+unsafe remodel — the parsed-but-unenforced `unsafe type` flag). */
 fn write_typedecl(buf: []byte, t: StrTable, d: parser::TypeDecl) -> []byte {
     mut b = write_u32(buf, st_find(t, d.name))
     b = write_strs(b, t, d.type_params)
@@ -422,14 +424,25 @@ fn write_typedecl(buf: []byte, t: StrTable, d: parser::TypeDecl) -> []byte {
     b = write_u8(b, (if d.has_doc { 1 } else { 0 }) to byte)
     b = write_u32(b, st_find(t, d.doc))
     b = write_u32(b, d.line to u32)
-    write_u32(b, d.col to u32)
+    b = write_u32(b, d.col to u32)
+    write_u8(b, (if d.is_unsafe { 1 } else { 0 }) to byte)
 }
 
-// a parser UseDecl: path + has_alias + alias.
+/**
+ * A parser `UseDecl`: `path` + `has_alias` + `alias` + `names` (S1, the 0.1.0.0-beta
+ * remodel §3.1 — the grouped-import name list, empty for the bare/aliased forms).
+ *
+ * @param []byte buf  the output buffer to append to
+ * @param StrTable t  the string table (names are interned; the caller's `collect_usedecl` must have
+ *            already interned every one)
+ * @param parser::UseDecl u  the `UseDecl` to serialize
+ * @return []byte  `buf` with the encoded `UseDecl` appended
+ */
 fn write_usedecl(buf: []byte, t: StrTable, u: parser::UseDecl) -> []byte {
     mut b = write_path(buf, t, u.path)
     b = write_u8(b, (if u.has_alias { 1 } else { 0 }) to byte)
-    write_u32(b, st_find(t, u.alias))
+    b = write_u32(b, st_find(t, u.alias))
+    write_strs(b, t, u.names)
 }
 
 /** (#165 C4) a parser::Function (a type-body METHOD): the full SIGNATURE + an honest body STUB.
@@ -438,7 +451,8 @@ fn write_usedecl(buf: []byte, t: StrTable, u: parser::UseDecl) -> []byte {
     body compiles at install), so has_body is written 0 and no body content rides (plan R2, law M.3).
     Layout: name, type_params, type_constraints, params, has_return, return_type (always — sentinel
     when absent), has_body (0), vis, has_doc, doc, line, col, is_test, is_extern, c_symbol, from_lib,
-    os_guard, is_intern, is_abstract, is_virtual, is_override. */
+    os_guard, is_intern, is_abstract, is_virtual, is_override, is_unsafe (U1 — always false for a
+    method; the enclosing TypeDecl.is_unsafe is the source of truth per the remodel design). */
 fn write_function(buf: []byte, t: StrTable, f: parser::Function) -> []byte {
     mut b = write_u32(buf, st_find(t, f.name))
     b = write_strs(b, t, f.type_params)
@@ -460,7 +474,8 @@ fn write_function(buf: []byte, t: StrTable, f: parser::Function) -> []byte {
     b = write_u8(b, (if f.is_intern { 1 } else { 0 }) to byte)
     b = write_u8(b, (if f.is_abstract { 1 } else { 0 }) to byte)
     b = write_u8(b, (if f.is_virtual { 1 } else { 0 }) to byte)
-    write_u8(b, (if f.is_override { 1 } else { 0 }) to byte)
+    b = write_u8(b, (if f.is_override { 1 } else { 0 }) to byte)
+    write_u8(b, (if f.is_unsafe { 1 } else { 0 }) to byte)
 }
 
 /** (#165 C4/C5) a []parser::Function (a type body's methods, in DECLARATION order = vtable order):

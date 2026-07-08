@@ -2,16 +2,25 @@ name: Tag on version bump
 
 # AUTOMATIC ADVANCEMENT of the bootstrap release tag.
 #
-# The teko.tkp manifest is the version SOURCE OF TRUTH. The bootstrap release is cut
-# from `main` ONLY, AFTER the reboot integration branch has been promoted to main.
-# When the manifest `version`/`suffix` bump lands on `main`, this workflow derives the
+# The teko.tkp manifest is the version SOURCE OF TRUTH. Two channels cut releases:
+#   • main            → the STABLE line (`*-alpha` today, `*-beta`/stable at LTS).
+#   • remodel/**       → the wave umbrella's INTERMEDIATE BETA SEED line (`*-beta`).
+# When the manifest `version`/`suffix` bump lands on either, this workflow derives the
 # tag (scripts/derive_version.sh) and — ONLY if that tag does not already exist on
 # the remote — creates an annotated tag at the pushed commit and pushes it.
 #
-# WHY main-ONLY: cutting a release from an in-progress integration branch (e.g.
-# chore/reboot) would prematurely tag an INCOMPLETE reboot. The release must be
-# minted only once the reboot→main promotion is done, so this workflow triggers on
-# `main` exclusively.
+# WHY remodel/** TOO (the intermediate-seed mechanism): the wave umbrella carries NEW
+# syntax (unsafe / #must_free / `use ::[…]` / adopt) that the last stable seed cannot
+# parse. To let the umbrella dogfood its own features, every sub-PR merged into it bumps
+# the teko.tkp BUILD field, and this workflow mints a `0.1.0.N-beta` tag → release.yml
+# publishes an intermediate compiler seed built from the umbrella tip. The next sub-PR's
+# CI then seeds from THAT beta (ci_provision_teko.sh is channel-aware), so the umbrella
+# progressively self-hosts as the wave lands. main is never seeded from an in-progress
+# umbrella beta (ci_provision excludes `-beta` on the stable channel).
+#
+# WHY NOT arbitrary branches: only `main` and the wave umbrellas (`remodel/**`, the
+# ratified umbrella-naming convention) mint tags; feature/sub-PR branches never do
+# (they don't touch teko.tkp, and a bump there wouldn't be an integration point).
 #
 # Pushing the tag must trigger .github/workflows/release.yml (its `push: tags:
 # '*-bootstrap'` path), which builds + gates + publishes the gen-3 release. This
@@ -37,7 +46,9 @@ name: Tag on version bump
 # a no-op.
 on:
   push:
-    branches: [main]
+    branches:
+      - main            # stable channel (*-alpha today)
+      - 'remodel/**'    # wave-umbrella beta-seed channel (*-beta) — one intermediate seed per sub-PR merge
     paths:
       - 'teko.tkp'   # the manifest carries the version — only re-tag when it changes
 
@@ -127,9 +138,14 @@ jobs:
             else
               echo "NOTE: push of tag '$DERIVED' was rejected (it likely now exists via a concurrent run). Treating as already-tagged."
             fi
-            # Dispatch the release on the default branch, passing the derived version.
-            # release.yml checks out its own ref and builds/gates/publishes for $DERIVED.
-            echo "Dispatching release.yml with version=$DERIVED"
-            gh workflow run release.yml -f version="$DERIVED"
+            # Dispatch the release AT THE JUST-PUSHED TAG (not the default branch), passing
+            # the derived version. This pins every checkout in release.yml to the tagged
+            # commit — critical for the beta line, whose tag points at the wave umbrella tip
+            # (NOT main): dispatching on main would build main's compiler instead. For the
+            # stable line it is strictly safer too (no race if main advances after tagging).
+            # release.yml exists on the default branch (registered) AND at the tag (has the
+            # workflow_dispatch trigger), so `--ref "$DERIVED"` runs the tag's version.
+            echo "Dispatching release.yml at ref=$DERIVED with version=$DERIVED"
+            gh workflow run release.yml --ref "$DERIVED" -f version="$DERIVED"
             echo "Dispatched release.yml — it will build + gate + publish '$DERIVED'."
           fi

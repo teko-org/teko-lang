@@ -568,7 +568,7 @@ fn type_param_reg(name: str, own_constraint: parser::ConstraintExpr, ns: str, ta
     let ifaces: []str = type_param_extends(own_constraint, table)
     let body: parser::TypeBody = if ifaces.len > 0 { parser::InterfaceBody { extends = ifaces; methods = teko::list::empty() } } else { parser::ExternBody { } }
     let carried_constraints = teko::list::push(teko::list::empty(), own_constraint)
-    let d = parser::TypeDecl { name = name; type_params = teko::list::empty(); type_constraints = carried_constraints; body = body; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; di_kind = parser::DiKind::None; has_di_key = false; di_key = "" }
+    let d = parser::TypeDecl { name = name; type_params = teko::list::empty(); type_constraints = carried_constraints; body = body; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; di_kind = parser::DiKind::None; has_di_key = false; di_key = ""; is_unsafe = false; must_free = false }
     TypeReg { name = name; namespace = ns; vis = parser::Visibility::Private; decl = d }
 }
 
@@ -832,6 +832,211 @@ pub fn is_class_name(name: str, table: TypeTable) -> bool {
         parser::TypeDecl as td => match td.body { parser::ClassBody => true; _ => false }
         error => false
     }
+}
+
+/**
+ * Is `name` a `#must_free` RELEVANT type (S2, the 0.1.0.0-beta memory+unsafe remodel #336) — a
+ * type whose value must be consumed (freed or moved) on every non-diverging control-flow path?
+ * Any TypeDecl kind may carry the flag (struct/class are the intended shape; the flag is purely
+ * a `TypeDecl` field, not gated by body kind here — a non-heap `#must_free` type still requires
+ * consumption, it just cannot reach `teko::mem::free`'s heap-shape check, so a stray one only
+ * ever fails the dataflow check, never silently passes).
+ *
+ * @param str name  a resolved (canonical or bare) type name
+ * @param TypeTable table  the program's type table
+ * @return bool  true iff `name`'s TypeDecl carries `must_free = true`
+ */
+pub fn is_must_free_name(name: str, table: TypeTable) -> bool {
+    match type_table_find(table, name, "") {
+        parser::TypeDecl as td => td.must_free
+        error => false
+    }
+}
+
+/**
+ * Is `name` a MANUAL REGION-HANDLE type (S3, issue #358 — the `unsafe #must_free type Arena`
+ * shape) — a `#must_free` struct declaring exactly one `uptr` field, which holds the raw
+ * `tk_region *` this handle bulk-frees? This is the STRUCTURAL signal that routes
+ * `teko::mem::free(handle)` to `tk_region_drop_subtree` (bulk-drop the whole child region),
+ * rather than the slice free-list or the class arena-per-object drop. Keyed off shape + the
+ * `#must_free` flag, never a hard-coded `Arena` name, so any project's region-handle type (the
+ * stdlib `teko::mem::unsafe::Arena` OR a fixture's local copy) is recognized identically.
+ *
+ * A non-`#must_free` struct, or one whose single field is not `uptr`, or any multi-field /
+ * non-struct type, is NOT a region handle — those keep their existing `teko::mem::free` routing
+ * (or are rejected as non-heap). Fails CLOSED: an unresolvable field type is treated as non-`uptr`.
+ *
+ * @param str name  a resolved (canonical or bare) type name
+ * @param TypeTable table  the program's type table
+ * @return bool  true iff `name` is a `#must_free` struct with a single `uptr` field
+ */
+pub fn is_region_handle_name(name: str, table: TypeTable) -> bool {
+    match type_table_find(table, name, "") {
+        parser::TypeDecl as td => is_region_handle_decl(td, table)
+        error => false
+    }
+}
+
+/**
+ * The structural test behind `is_region_handle_name`: `td` is a `#must_free` struct whose sole
+ * field resolves to the opaque word-size `uptr` (the raw `tk_region *` carrier). Split out so the
+ * region-field NAME can be recovered separately (`region_handle_field_name`) without re-deciding.
+ *
+ * @param parser::TypeDecl td  a resolved type declaration
+ * @param TypeTable table  the program's type table
+ * @return bool  true iff `td` is a `#must_free` single-`uptr`-field struct
+ */
+fn is_region_handle_decl(td: parser::TypeDecl, table: TypeTable) -> bool {
+    if !td.must_free { return false }
+    match td.body {
+        parser::StructBody as sb => {
+            if sb.fields.len != 1 { return false }
+            match resolve_type(sb.fields[0].type_ann, table, "") {
+                Type as t => match t { Uptr => true; _ => false }
+                error => false
+            }
+        }
+        _ => false
+    }
+}
+
+/**
+ * The NAME of a region-handle type's single `uptr` field — the field `teko::mem::free` codegen
+ * reads to reach the raw `tk_region *`. Only meaningful when `is_region_handle_name(name, …)` is
+ * true; returns the empty string otherwise (the caller has already gated on the predicate).
+ *
+ * @param str name  a resolved region-handle type name
+ * @param TypeTable table  the program's type table
+ * @return str  the single `uptr` field's name, or "" if `name` is not a region handle
+ */
+pub fn region_handle_field_name(name: str, table: TypeTable) -> str {
+    match type_table_find(table, name, "") {
+        parser::TypeDecl as td => match td.body {
+            parser::StructBody as sb => if sb.fields.len == 1 { sb.fields[0].name } else { "" }
+            _ => ""
+        }
+        error => ""
+    }
+}
+
+/**
+ * Is `name` declared `unsafe` (U1/U2, the 0.1.0.0-beta memory+unsafe remodel #333) — a
+ * `unsafe type M = struct|class { … }` whose values may only be named by another `unsafe`
+ * type or an `unsafe fn` (contagion-by-composition, never a spine/flow analysis — a pure
+ * nominal probe, mirroring `is_must_free_name`/`is_interface_name`). A bare builtin
+ * (`str`, `u64`, `byte`, `error`, …) or a type-param (`T`) misses the table entirely (or
+ * resolves to a synthetic opaque registration whose `is_unsafe` is false), so this
+ * predicate returns false for them by construction — never a false positive on safe
+ * scalars/generics.
+ *
+ * @param str name  a resolved (canonical or bare) type name
+ * @param TypeTable table  the program's type table
+ * @return bool  true iff `name`'s TypeDecl carries `is_unsafe = true`
+ */
+pub fn is_unsafe_type(name: str, table: TypeTable) -> bool {
+    match type_table_find(table, name, "") {
+        parser::TypeDecl as td => td.is_unsafe
+        error => false
+    }
+}
+
+/**
+ * Does the resolved `t` CARRY an unsafe-typed component — either `t` itself names an
+ * `unsafe type` (the leaf case) or `t` is a compositional carrier (`[]M`, `M?`, `Ref<M>`,
+ * `ptr<M>`, a variant with an unsafe member, or a `fn(…)->…` signature naming an unsafe
+ * param/return) wrapping one? Mirrors the recursion shape of `widens_into_at`/
+ * `carries_sentinel`: depth-bounded so a self-referential variant cannot loop. Fails
+ * CLOSED at the depth bound (a containment gate exhausting its budget must REJECT, never
+ * silently pass unsafe data through as "not carrying"). A `Func` is recursed into because
+ * this walk is about DATA the value's TYPE names, not call sites — calls stay uncolored,
+ * but a safe field/param typed `fn(Raw)->Raw` still stores/exposes `Raw` in its shape. This
+ * is the sole engine behind the U2 containment gates (field composition, fn signatures,
+ * locals, and generic-instance stamping) — every carrier the checker lets a value travel
+ * through must be walked here, or unsafe data could leak through it unchecked.
+ *
+ * @param Type t  a resolved semantic Type (a field/param/return/local's annotation)
+ * @param TypeTable table  the program's type table (for the leaf `is_unsafe_type` probe)
+ * @param i64 depth  remaining recursion budget (seed 32 — deeper than `widens_into`'s 16, since
+ *               generic composition (`Box<Box<Box<…>>>`) is a nesting source this walk
+ *               traverses that `widens_into_at` never does)
+ * @return bool  true iff `t` names, or transitively wraps, an unsafe type
+ */
+fn unsafe_carrying_at(t: Type, table: TypeTable, depth: i64) -> bool {
+    if depth <= 0 { return true }
+    match t {
+        Named as n => is_unsafe_type(n.name, table)
+        Slice as s => unsafe_carrying_at(s.element, table, depth - 1)
+        Optional as o => unsafe_carrying_at(o.inner, table, depth - 1)
+        Reference as r => unsafe_carrying_at(r.inner, table, depth - 1)
+        Ptr as p => match p.inner { Type as inner => unsafe_carrying_at(inner, table, depth - 1); null => false }
+        Func as f => func_type_unsafe_carrying(f, table, depth - 1)
+        Variant as v => {
+            mut i = 0
+            loop {
+                if i >= v.members.len { break }
+                if unsafe_carrying_at(v.members[i], table, depth - 1) { return true }
+                i++
+            }
+            false
+        }
+        _ => false
+    }
+}
+
+/**
+ * Does a `Func` type's signature — every param and the return — name or carry an unsafe
+ * type? Split out of `unsafe_carrying_at`'s `Func` arm to keep that match flat (single
+ * early-return loop over params, then the return type).
+ *
+ * @param Func f  the resolved function-type signature
+ * @param TypeTable table  the program's type table
+ * @param i64 depth  remaining recursion budget, already decremented by the caller
+ * @return bool  true iff any param or the return type is unsafe-carrying
+ */
+fn func_type_unsafe_carrying(f: Func, table: TypeTable, depth: i64) -> bool {
+    mut i = 0
+    loop {
+        if i >= f.params.len { break }
+        if unsafe_carrying_at(f.params[i], table, depth) { return true }
+        i++
+    }
+    unsafe_carrying_at(f.ret, table, depth)
+}
+
+/**
+ * Does the resolved `t` carry an unsafe-typed component (§2 contagion-by-composition)?
+ * The public, depth-seeded entry point over `unsafe_carrying_at` — seeded at 32 (deeper than
+ * `widens_into`'s 16 seed; see `unsafe_carrying_at`'s doc for why).
+ *
+ * @param Type t  a resolved semantic Type (a field/param/return/local's annotation)
+ * @param TypeTable table  the program's type table
+ * @return bool { unsafe_carrying_at(t, table, 32) }  true iff `t` names, or transitively wraps, an unsafe type
+ */
+pub fn unsafe_carrying(t: Type, table: TypeTable) -> bool { unsafe_carrying_at(t, table, 32) }
+
+/**
+ * Does ANY of a generic instantiation's resolved type-ARGUMENTS carry an unsafe type
+ * (`Box<Raw>`, `List<Raw>`, `Map<str, Raw>`, …)? Used at STAMP time (`instantiate_types`)
+ * so a generic instance whose substituted body embeds unsafe data becomes `is_unsafe = true`
+ * itself — otherwise a safe fn/field/local naming `Box<Raw>` would resolve to a stamped
+ * `Named{"Box__g__Raw"}` decl whose OWN `is_unsafe` is false (inherited only from the
+ * generic base template, which never mentions `Raw`), silently defeating every downstream
+ * containment gate (field/signature/local) that trusts a `Named`'s resolved decl. Marking
+ * the STAMP itself unsafe means the existing gates fire automatically, uniformly, with no
+ * separate `__g__`-name special-casing at each call site.
+ *
+ * @param []Type argtypes  the instantiation's resolved type-arguments, in declaration order
+ * @param TypeTable table  the program's type table
+ * @return bool  true iff any argument names, or transitively wraps, an unsafe type
+ */
+fn generic_args_unsafe_carrying(argtypes: []Type, table: TypeTable) -> bool {
+    mut i = 0
+    loop {
+        if i >= argtypes.len { break }
+        if unsafe_carrying(argtypes[i], table) { return true }
+        i++
+    }
+    false
 }
 
 // (#98) is `name` a POLYMORPHIC BASE — a class that MAY be inherited (`abstract`/`virtual`, never
@@ -1549,7 +1754,7 @@ fn subst_method_sig_names(f: parser::Function, params: []str, args: []parser::Ty
         i++
     }
     let nret = if f.has_return { subst_texpr_names(f.return_type, params, args) } else { f.return_type }
-    parser::Function { name = f.name; type_params = f.type_params; type_constraints = f.type_constraints; params = nps; has_return = f.has_return; return_type = nret; body = f.body; vis = f.vis; has_doc = f.has_doc; doc = f.doc; line = f.line; col = f.col; is_test = f.is_test; is_extern = f.is_extern; c_symbol = f.c_symbol; from_lib = f.from_lib; os_guard = f.os_guard; is_intern = f.is_intern; is_abstract = f.is_abstract; is_virtual = f.is_virtual; is_override = f.is_override; has_inject = f.has_inject; injects = f.injects }
+    parser::Function { name = f.name; type_params = f.type_params; type_constraints = f.type_constraints; params = nps; has_return = f.has_return; return_type = nret; body = f.body; vis = f.vis; has_doc = f.has_doc; doc = f.doc; line = f.line; col = f.col; is_test = f.is_test; is_extern = f.is_extern; c_symbol = f.c_symbol; from_lib = f.from_lib; os_guard = f.os_guard; is_intern = f.is_intern; is_abstract = f.is_abstract; is_virtual = f.is_virtual; is_override = f.is_override; has_inject = f.has_inject; injects = f.injects; is_unsafe = f.is_unsafe }
 }
 
 /**
@@ -1793,6 +1998,7 @@ fn collect_stmt_insts(s: parser::Statement, acc: []parser::TypeExpr) -> []parser
         parser::ExprStmt as es => out = collect_expr_insts(es.expr, out)
         parser::LoopStmt as l => out = collect_stmts_insts(l.body, out)
         parser::DeferStmt as d => out = collect_stmts_insts(d.body, out)
+        parser::AdoptStmt as a => out = collect_stmts_insts(a.body, out)
         _ => { }
     }
     out
@@ -1849,7 +2055,8 @@ pub fn instantiate_types(program: parser::Program, table: TypeTable) -> TypeTabl
                     parser::TypeDecl as gen => {
                         if gen.type_params.len != nt.args.len { continue }   // arity error surfaces at resolve
                         let nbody = subst_body_names(gen.body, gen.type_params, nt.args)
-                        let stamped = parser::TypeDecl { name = mangled; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = nbody; vis = gen.vis; has_doc = false; doc = ""; line = gen.line; col = gen.col; di_kind = parser::DiKind::None; has_di_key = false; di_key = "" }
+                        let inst_unsafe = gen.is_unsafe || generic_args_unsafe_carrying(argtypes, tbl)
+                        let stamped = parser::TypeDecl { name = mangled; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = nbody; vis = gen.vis; has_doc = false; doc = ""; line = gen.line; col = gen.col; di_kind = parser::DiKind::None; has_di_key = false; di_key = ""; is_unsafe = inst_unsafe; must_free = gen.must_free }
                         tbl = teko::list::push(tbl, TypeReg { name = mangled; namespace = type_ns_of(tbl, name); vis = gen.vis; decl = stamped })   // (#109 W2) stamp in the generic base's ns so the substituted body's bare field types resolve there
                         work = collect_body_insts(nbody, work)   // transitive instantiations in the stamped body
                     }
@@ -2001,7 +2208,7 @@ fn normalize_inst_method(f: parser::Function, table: TypeTable) -> parser::Funct
         i++
     }
     let nret = if f.has_return { normalize_inst_texpr(f.return_type, table) } else { f.return_type }
-    parser::Function { name = f.name; type_params = f.type_params; type_constraints = f.type_constraints; params = nps; has_return = f.has_return; return_type = nret; body = f.body; vis = f.vis; has_doc = f.has_doc; doc = f.doc; line = f.line; col = f.col; is_test = f.is_test; is_extern = f.is_extern; c_symbol = f.c_symbol; from_lib = f.from_lib; os_guard = f.os_guard; is_intern = f.is_intern; is_abstract = f.is_abstract; is_virtual = f.is_virtual; is_override = f.is_override; has_inject = f.has_inject; injects = f.injects }
+    parser::Function { name = f.name; type_params = f.type_params; type_constraints = f.type_constraints; params = nps; has_return = f.has_return; return_type = nret; body = f.body; vis = f.vis; has_doc = f.has_doc; doc = f.doc; line = f.line; col = f.col; is_test = f.is_test; is_extern = f.is_extern; c_symbol = f.c_symbol; from_lib = f.from_lib; os_guard = f.os_guard; is_intern = f.is_intern; is_abstract = f.is_abstract; is_virtual = f.is_virtual; is_override = f.is_override; has_inject = f.has_inject; injects = f.injects; is_unsafe = f.is_unsafe }
 }
 
 /**
@@ -2055,7 +2262,7 @@ fn normalize_inst_body(body: parser::TypeBody, table: TypeTable) -> parser::Type
 // variant member is `Gen<i64>`), so the syntactic body codegen/VM read agrees with the resolved
 // type. A NO-OP when the body has no generic-instance reference. (C: tk_normalize_inst_decl.)
 pub fn normalize_inst_decl(d: parser::TypeDecl, table: TypeTable) -> parser::TypeDecl {
-    parser::TypeDecl { name = d.name; type_params = d.type_params; type_constraints = d.type_constraints; body = normalize_inst_body(d.body, table); vis = d.vis; has_doc = d.has_doc; doc = d.doc; line = d.line; col = d.col; di_kind = d.di_kind; has_di_key = d.has_di_key; di_key = d.di_key }
+    parser::TypeDecl { name = d.name; type_params = d.type_params; type_constraints = d.type_constraints; body = normalize_inst_body(d.body, table); vis = d.vis; has_doc = d.has_doc; doc = d.doc; line = d.line; col = d.col; di_kind = d.di_kind; has_di_key = d.has_di_key; di_key = d.di_key; is_unsafe = d.is_unsafe; must_free = d.must_free }
 }
 
 // (W9.4) normalize EVERY stamped generic-instance decl's body in the table, so table_generic_instances

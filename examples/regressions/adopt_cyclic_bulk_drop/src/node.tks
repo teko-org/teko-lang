@@ -1,0 +1,71 @@
+/**
+ * Node — a class whose `peer` field points at another Node, so two instances can form a MUTUAL
+ * back-edge cycle. Each `class` object opens its own arena-per-object child region; when built
+ * directly inside an `adopt { }` block those child regions parent under the adopter, and the
+ * closing brace's subtree-drop reclaims the whole knot at once (cycles irrelevant).
+ *
+ * @field id    a small identity, printed to make the run deterministic.
+ * @field peer  the mutually-referenced Node (null until linked) — the cycle edge.
+ */
+type Node = class {
+    id: i64
+    peer: Node?
+
+    /**
+     * cyclic_bulk_drop — build a two-node cycle inside `adopt { }`, print it, and let the brace
+     * bulk-drop the subtree. The mutual back-edges (`a.peer = b`, `b.peer = a`) make a cycle no
+     * per-object free could reclaim; the adopter's subtree-drop reclaims it wholesale.
+     *
+     * @return  the sum of the two ids (a deterministic value the driver checks).
+     */
+    pub fn cyclic_bulk_drop() -> i64 {
+        mut total: i64 = 0
+        adopt {
+            let a = Node { id = 1; peer = null }
+            let b = Node { id = 2; peer = null }
+            a.peer = b
+            b.peer = a
+            total = a.id + b.id
+            teko::io::write($"cycle {a.id}-{b.id}\n")
+        }
+        total
+    }
+
+    /**
+     * nested_adopt — an `adopt` whose body itself contains an `adopt`. The inner adopter is a
+     * child region of the outer; the outer brace's subtree-drop reclaims both nested subtrees in
+     * one sweep (no double-free, no leak).
+     *
+     * @return  a deterministic marker value.
+     */
+    pub fn nested_adopt() -> i64 {
+        mut marker: i64 = 0
+        adopt {
+            let outer = Node { id = 10; peer = null }
+            adopt {
+                let inner = Node { id = 20; peer = null }
+                outer.peer = inner
+                marker = outer.id + inner.id
+                teko::io::write($"nested {outer.id}-{inner.id}\n")
+            }
+        }
+        marker
+    }
+
+    /**
+     * named_adopt — an `adopt r { }` with a bound name. The name is a parse/codegen label in this
+     * increment (no handle surface yet); the region is opened and subtree-dropped exactly as an
+     * anonymous adopter would be.
+     *
+     * @return  a deterministic marker value.
+     */
+    pub fn named_adopt() -> i64 {
+        mut marker: i64 = 0
+        adopt r {
+            let n = Node { id = 30; peer = null }
+            marker = n.id
+            teko::io::write($"named {n.id}\n")
+        }
+        marker
+    }
+}

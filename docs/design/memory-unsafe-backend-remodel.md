@@ -97,6 +97,40 @@ analysis. So `unsafe` is the keystone that **ships FIRST**, independent of the (
 (This corrects the earlier belief that `unsafe` containment was "a slice of the spine" — that was
 true for a *lexical block*, not for a *type marker*.)
 
+### 2c. The `unsafe #must_free` Arena — a dev-controlled manual region (=#358, owner 2026-07-06)
+
+A **manual, non-lexical, unsafe-only** region: the dev creates it, allocates pointers *into* it, and
+**bulk-frees the whole region** at a point of their choosing. It is the unsafe, non-lexical complement
+to the (lexical, safe) `adopt { }`.
+
+```teko
+unsafe #must_free type Arena = ...        // both markers coexist on the TypeDecl (U1 is_unsafe + S2 must_free)
+unsafe fn build() -> i64 {
+    mut a = Arena::new()                  // tk_region_new (fresh child region)
+    let p = a.alloc<Node>(...)            // ptr<Node> attached to a's lifetime
+    mem::free(a)                          // bulk-free the whole region (the #must_free consume)
+    0
+}                                         // dropping `a` without mem::free(a) => COMPILE ERROR
+```
+
+The elegance: it **composes the wave's two features, each guarding the half it can**.
+- **`#must_free` bars the region leak** — dropping the `Arena` without `mem::free(a)` is a compile
+  error (the §5a dataflow). You cannot leak the whole region.
+- **`unsafe` contains the residual** — after the bulk-free the pointers into the region are dangling
+  (the aliased-UAF the spine cannot track). The dev assumes *exactly* that risk, and only that.
+
+Zero grammar (stdlib type; the markers already parse). `Arena::new/alloc/free` map onto the existing
+`tk_region_new/alloc/free` arena tree (the same `adopt` reuses) — expose it, don't build a new allocator.
+
+**The full memory ladder (auto → raw):**
+
+| tool | lifetime | safety |
+|---|---|---|
+| `arena` default | per-scope (invisible) | safe |
+| `#must_free` / `mem::free` / `defer` / `adopt` | dev-controlled release | safe (the "C# `using`/`IDisposable`" tier — **stronger**: `#must_free` *forces* the release, C# only warns) |
+| **`unsafe #must_free` Arena** | dev-controlled region, bulk-free | unsafe (leak barred by `#must_free`; dangling owned by `unsafe`) |
+| `RawBuf` / `Owned<T>` | raw buffer | unsafe (malloc/free) |
+
 ---
 
 ## 3. Surface syntax additions (lexer + parser)
@@ -175,6 +209,35 @@ valid segment), OR name the namespace `teko::mem::raw` and reserve `unsafe` as a
 - **`#283`** (latent `-O2` UB in generated `teko.c`) — **obsoleted by the own-backend** (no C, no
   `zig cc -O2`); the native-ASan rolling audit is also draining this family.
 - **`#184` (#300)** — parked, blocked by `#301`; finalizes when `#301` lands.
+
+---
+
+## 5a. S2 `#must_free` — the LOCAL consume-or-fail dataflow's honest first-cut bounds
+
+`#must_free` (issue #336) is a **local, per-binding** dataflow — no points-to/uniqueness fact, so
+(mirroring the `mem::free` aliased-UAF note in §5) it is powerless against the ALIASED-FREE
+use-after-free (`y = x; free(x); use(y)`), which still needs the spine (`#331`). Implementation
+surfaced FOUR further first-cut bounds, recorded here so they are documented, not silently
+assumed:
+
+- **Loop bodies are NOT walked.** A `#must_free` binding declared inside a `loop { }` body is not
+  checked at all — a leak there compiles silently today. The dataflow only walks straight-line
+  blocks and `if`/`match` branches reached from a tracked binding's own declaration point; it
+  never recurses into a `TLoopStmt`'s body. Closing this is a scope WIDENING (loop-body-aware
+  walking), not a bug fix — deferred, tracked alongside the spine work.
+- **A `#must_free` PARAM can only be consumed by `return h`.** A parameter is always immutable
+  (B.21), and `teko::mem::free` requires a `mut` target — so a received handle can never reach
+  `mem::free` directly; only a move-out via `return` consumes it. Consuming a param by moving it
+  into a callee (rather than returning it) needs general move-tracking, which is the spine's job
+  (`#331`), not this local check's.
+- **Reassigning a `mut #must_free` local leaks the overwritten value.** `mut h = make(); h =
+  make()` (an unfreed `h` overwritten before any free) is NOT caught — the dataflow tracks
+  whether `h`'s NAME is eventually consumed somewhere in its scope, not whether every VALUE ever
+  bound to it was. General move/assignment tracking is again the spine's job (`#331`).
+- **`must_free` is not yet serialized in the `.tkb` codec** (it mirrors the pre-existing
+  un-serialized `di_kind` gap there) — so the constraint is currently MODULE-LOCAL: a `.tkb`-read
+  `TypeDecl` always carries `must_free = false`. A `.tkl` package boundary must not yet rely on
+  `#must_free` surviving a `.tkb` round-trip; wiring the codec is a follow-up.
 
 ---
 
