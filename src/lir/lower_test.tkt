@@ -99,7 +99,7 @@ fn lwt_lower_expr_text(e: checker::TExpr) -> str {
     string-literal fixture's golden dump shows its `rodata`/`{ptr,len}` shape too. */
 fn lwt_lower_expr_text_with(e: checker::TExpr, layouts: []LStructLayout) -> str {
     let f0 = new_func("t", 0, teko::list::empty(), LType::I64)
-    let ctx0 = LowerCtx { func = f0; block_id = 0; env = empty_lenv(); layouts = layouts; rodata = teko::list::empty() }
+    let ctx0 = LowerCtx { func = f0; block_id = 0; env = empty_lenv(); layouts = layouts; rodata = teko::list::empty(); enums = teko::list::empty() }
     let lo = match lower_expr(ctx0, e) { Lowered as x => x; error as err => return teko::str::concat("ERR: ", err.message) }
     print_lmodule(with_rodata(add_func(empty_module(), lo.ctx.func), lo.ctx.rodata))
 }
@@ -351,12 +351,235 @@ fn lwt_virtual_main_falls_through_to_return_zero() {
     teko::assert::str_contains(text, "const 0")
 }
 
+/**
+ * lwt_typed_var — a `TVar` of an ARBITRARY resolved type `ty` (A1-5, #382 — a
+ * `match` subject is not always a scalar/Named/Optional the other `lwt_*_var`
+ * helpers cover; a `Variant`-typed subject needs this general form).
+ *
+ * @param str name  the variable's name
+ * @param checker::Type ty  the variable's resolved type
+ * @return checker::TExpr  the typed `TVar` node
+ */
+fn lwt_typed_var(name: str, ty: checker::Type) -> checker::TExpr {
+    checker::TExpr { kind = checker::TVar { name = name; is_func = false; func_ns = "" }; type = ty; line = 0; col = 0 }
+}
+
+/**
+ * lwt_wildcard_pattern — a bare `_` pattern (A1-5, #382).
+ *
+ * @return parser::Pattern  the wildcard pattern node
+ */
+fn lwt_wildcard_pattern() -> parser::Pattern { parser::WildcardPattern { } }
+
+/**
+ * lwt_int_pattern — an integer-literal pattern `v` (A1-5, #382).
+ *
+ * @param i128 v  the literal's integer value
+ * @return parser::Pattern  the literal pattern node
+ */
+fn lwt_int_pattern(v: i128) -> parser::Pattern {
+    parser::LiteralPattern { value = parser::Expr { kind = parser::Number { is_float = false; value = v; fval = 0.0 }; line = 0; col = 0 } }
+}
+
+/**
+ * lwt_str_pattern — a string-literal pattern `text` (A1-5, #382).
+ *
+ * @param str text  the literal's own text
+ * @return parser::Pattern  the literal pattern node
+ */
+fn lwt_str_pattern(text: str) -> parser::Pattern {
+    parser::LiteralPattern { value = parser::Expr { kind = parser::StrLit { text = text }; line = 0; col = 0 } }
+}
+
+/**
+ * lwt_bind_pattern — `case as binding` (a variant case-select + payload bind),
+ * or `case` (no binding) when `binding` is empty (A1-5, #382).
+ *
+ * @param str case_name  the pattern's case name
+ * @param str binding  the name to bind the payload to (empty = no binding)
+ * @return parser::Pattern  the bind pattern node
+ */
+fn lwt_bind_pattern(case_name: str, binding: str) -> parser::Pattern {
+    parser::BindPattern { type_name = lwt_path1(case_name); has_binding = binding != ""; binding = binding; is_slice = false; slice_type = null; type_args = teko::list::empty() }
+}
+
+/**
+ * lwt_arm — an UNGUARDED match arm over `pat`, whose body is `body` (A1-5,
+ * #382).
+ *
+ * @param parser::Pattern pat  the arm's pattern
+ * @param []checker::TStatement body  the arm's statement block
+ * @return checker::TArm  the typed arm node
+ */
+fn lwt_arm(pat: parser::Pattern, body: []checker::TStatement) -> checker::TArm {
+    checker::TArm { pattern = pat; has_when = false; guard = lwt_num_i64(0 to i128); body = body }
+}
+
+/**
+ * lwt_guarded_arm — a `when`-guarded match arm over `pat` (A1-5, #382).
+ *
+ * @param parser::Pattern pat  the arm's pattern
+ * @param checker::TExpr guard  the `when` guard condition
+ * @param []checker::TStatement body  the arm's statement block
+ * @return checker::TArm  the typed arm node
+ */
+fn lwt_guarded_arm(pat: parser::Pattern, guard: checker::TExpr, body: []checker::TStatement) -> checker::TArm {
+    checker::TArm { pattern = pat; has_when = true; guard = guard; body = body }
+}
+
+/**
+ * lwt_match_value — a VALUE-producing `TMatchExpr` over `subject`/`arms`, typed
+ * `k` (A1-5, #382).
+ *
+ * @param checker::TExpr subject  the match's subject expression
+ * @param []checker::TArm arms  the match's arms, in order
+ * @param checker::PrimKind k  the match expression's own resolved primitive
+ *                             type
+ * @return checker::TExpr  the typed `TMatchExpr` node
+ */
+fn lwt_match_value(subject: checker::TExpr, arms: []checker::TArm, k: checker::PrimKind) -> checker::TExpr {
+    checker::TExpr { kind = checker::TMatchExpr { subject = subject; arms = arms }; type = lwt_prim(k); line = 0; col = 0 }
+}
+
+/**
+ * lwt_variant2 — an inline `checker::Variant` of two NOMINAL (`Named`) cases,
+ * in order (A1-5, #382).
+ *
+ * @param str a  the first case's Named type name
+ * @param str b  the second case's Named type name
+ * @return checker::Type  the inline `Variant` type
+ */
+fn lwt_variant2(a: str, b: str) -> checker::Type {
+    checker::Variant { members = teko::list::push(teko::list::push(teko::list::empty(), checker::Named { name = a }), checker::Named { name = b }) }
+}
+
+/**
+ * lwt_circle_layout — `struct Circle { radius: i64 }`'s registered layout
+ * (A1-5, #382).
+ *
+ * @return LStructLayout  Circle's resolved layout
+ */
+fn lwt_circle_layout() -> LStructLayout {
+    layout_of("Circle", teko::list::push(teko::list::empty(), "radius"), teko::list::push(teko::list::empty(), LType::I64))
+}
+
 #test
-fn lwt_honest_stop_on_match_expr() {
-    let subj = lwt_num_i64(1 to i128)
-    let mexpr = checker::TExpr { kind = checker::TMatchExpr { subject = subj; arms = teko::list::empty() }; type = checker::Prim { kind = checker::PrimKind::I64 }; line = 0; col = 0 }
-    let text = lwt_lower_expr_text(mexpr)
-    teko::assert::str_contains(text, "match-expression not yet lowered")
+fn lwt_lowers_match_value_scalar_arms_via_icmpeq() {
+    let subject = lwt_var("x", checker::PrimKind::I64)
+    let arm0 = lwt_arm(lwt_int_pattern(1 to i128), teko::list::push(teko::list::empty(), lwt_exprstmt(lwt_num_i64(10 to i128))))
+    let arm1 = lwt_arm(lwt_int_pattern(2 to i128), teko::list::push(teko::list::empty(), lwt_exprstmt(lwt_num_i64(20 to i128))))
+    let arm2 = lwt_arm(lwt_wildcard_pattern(), teko::list::push(teko::list::empty(), lwt_exprstmt(lwt_num_i64(0 to i128))))
+    let arms = teko::list::push(teko::list::push(teko::list::push(teko::list::empty(), arm0), arm1), arm2)
+    let match_expr = lwt_match_value(subject, arms, checker::PrimKind::I64)
+    let params = teko::list::push(teko::list::empty(), lwt_param("x", "i64"))
+    let body = teko::list::push(teko::list::empty(), lwt_ret(match_expr))
+    let f = lwt_fn("pick3", "teko::demo", params, checker::Prim { kind = checker::PrimKind::I64 }, body)
+    let lf = match lower_function(f) { LoweredFunction as r => r.func; error as err => return }
+    let text = print_lmodule(add_func(empty_module(), lf))
+    teko::assert::str_contains(text, "%3 = icmpeq %0, %2")
+    teko::assert::str_contains(text, "branch %3, #B2(), #B3()")
+    teko::assert::str_contains(text, "  #B2:\n    %4 = const 10\n    jump #B1(%4)")
+    teko::assert::str_contains(text, "%6 = icmpeq %0, %5")
+    teko::assert::str_contains(text, "branch %6, #B4(), #B5()")
+    teko::assert::str_contains(text, "  #B4:\n    %7 = const 20\n    jump #B1(%7)")
+    teko::assert::str_contains(text, "  #B5:\n    jump #B6()")
+    teko::assert::str_contains(text, "  #B6:\n    %8 = const 0\n    jump #B1(%8)")
+    teko::assert::str_contains(text, "  #B1(%1):\n    ret %1")
+}
+
+#test
+fn lwt_lowers_match_enum_member_pattern_via_registered_ordinal() {
+    let subject = lwt_typed_var("c", checker::Named { name = "Color" })
+    let arm0 = lwt_arm(lwt_bind_pattern("Red", ""), teko::list::push(teko::list::empty(), lwt_exprstmt(lwt_num_i64(10 to i128))))
+    let arm1 = lwt_arm(lwt_wildcard_pattern(), teko::list::push(teko::list::empty(), lwt_exprstmt(lwt_num_i64(0 to i128))))
+    let arms = teko::list::push(teko::list::push(teko::list::empty(), arm0), arm1)
+    let match_expr = lwt_match_value(subject, arms, checker::PrimKind::I64)
+    let params = teko::list::push(teko::list::empty(), lwt_param("c", "Color"))
+    let body = teko::list::push(teko::list::empty(), lwt_ret(match_expr))
+    let f = lwt_fn("pick_color", "teko::demo", params, checker::Prim { kind = checker::PrimKind::I64 }, body)
+    let enums = teko::list::push(teko::list::empty(), LEnumInfo { name = "Color"; members = teko::list::push(teko::list::push(teko::list::empty(), "Red"), "Green") })
+    let lf = match lower_function(f, teko::list::empty(), teko::list::empty(), enums) { LoweredFunction as r => r.func; error as err => return }
+    let text = print_lmodule(add_func(empty_module(), lf))
+    teko::assert::str_contains(text, "%2 = const 0")
+    teko::assert::str_contains(text, "%3 = icmpeq %0, %2")
+    teko::assert::str_contains(text, "branch %3, #B2(), #B3()")
+    teko::assert::str_contains(text, "  #B3:\n    jump #B4()")
+}
+
+#test
+fn lwt_lowers_match_when_guard_falls_through_to_next_arm() {
+    let subject = lwt_var("x", checker::PrimKind::I64)
+    let guard = lwt_cmp(subject, teko::list::push(teko::list::empty(), lwt_cmp_term(lexer::TokenKind::Gt, lwt_num_i64(0 to i128))))
+    let arm0 = lwt_guarded_arm(lwt_int_pattern(1 to i128), guard, teko::list::push(teko::list::empty(), lwt_exprstmt(lwt_num_i64(100 to i128))))
+    let arm1 = lwt_arm(lwt_wildcard_pattern(), teko::list::push(teko::list::empty(), lwt_exprstmt(lwt_num_i64(0 to i128))))
+    let arms = teko::list::push(teko::list::push(teko::list::empty(), arm0), arm1)
+    let match_expr = lwt_match_value(subject, arms, checker::PrimKind::I64)
+    let params = teko::list::push(teko::list::empty(), lwt_param("x", "i64"))
+    let body = teko::list::push(teko::list::empty(), lwt_ret(match_expr))
+    let f = lwt_fn("guarded_pick", "teko::demo", params, checker::Prim { kind = checker::PrimKind::I64 }, body)
+    let lf = match lower_function(f) { LoweredFunction as r => r.func; error as err => return }
+    let text = print_lmodule(add_func(empty_module(), lf))
+    teko::assert::str_contains(text, "branch %3, #B2(), #B3()")
+    teko::assert::str_contains(text, "branch %5, #B4(), #B3()")
+    teko::assert::str_contains(text, "  #B4:\n    %6 = const 100\n    jump #B1(%6)")
+    teko::assert::str_contains(text, "  #B3:\n    jump #B5()")
+}
+
+#test
+fn lwt_lowers_match_variant_case_binds_the_payload() {
+    let subject = lwt_typed_var("s", lwt_variant2("Circle", "Square"))
+    let payload = lwt_field_access(lwt_typed_var("c", checker::Named { name = "Circle" }), "radius", lwt_prim(checker::PrimKind::I64))
+    let arm0 = lwt_arm(lwt_bind_pattern("Circle", "c"), teko::list::push(teko::list::empty(), lwt_exprstmt(payload)))
+    let arms = teko::list::push(teko::list::empty(), arm0)
+    let match_expr = lwt_match_value(subject, arms, checker::PrimKind::I64)
+    let params = teko::list::push(teko::list::empty(), lwt_param("s", "Shape"))
+    let body = teko::list::push(teko::list::empty(), lwt_ret(match_expr))
+    let f = lwt_fn("read_case", "teko::demo", params, checker::Prim { kind = checker::PrimKind::I64 }, body)
+    let lf = match lower_function(f, lwt_one_layout(lwt_circle_layout())) { LoweredFunction as r => r.func; error as err => return }
+    let text = print_lmodule(add_func(empty_module(), lf))
+    teko::assert::str_contains(text, "%2 = field_addr %0, 0")
+    teko::assert::str_contains(text, "%3 = load.i32 %2")
+    teko::assert::str_contains(text, "%5 = icmpeq %3, %4")
+    teko::assert::str_contains(text, "%6 = field_addr %0, 8")
+    teko::assert::str_contains(text, "%7 = load.ptr %6")
+    teko::assert::str_contains(text, "%8 = field_addr %7, 0")
+    teko::assert::str_contains(text, "%9 = load.i64 %8")
+    teko::assert::str_contains(text, "jump #B1(%9)")
+    teko::assert::str_contains(text, "  #B1(%1):\n    ret %1")
+}
+
+#test
+fn lwt_lowers_match_string_arm_via_byte_compare() {
+    let subject = lwt_strlit("hi")
+    let arm0 = lwt_arm(lwt_str_pattern("hi"), teko::list::push(teko::list::empty(), lwt_exprstmt(lwt_num_i64(1 to i128))))
+    let arm1 = lwt_arm(lwt_wildcard_pattern(), teko::list::push(teko::list::empty(), lwt_exprstmt(lwt_num_i64(0 to i128))))
+    let arms = teko::list::push(teko::list::push(teko::list::empty(), arm0), arm1)
+    let match_expr = lwt_match_value(subject, arms, checker::PrimKind::I64)
+    let text = lwt_lower_expr_text(match_expr)
+    teko::assert::str_contains(text, "rodata .Lstr0: [104, 105]")
+    teko::assert::str_contains(text, "global_addr @.Lstr0")
+    teko::assert::str_contains(text, "load.i8")
+    teko::assert::is_true(teko::str::contains(text, "icmpeq"))
+    teko::assert::str_contains(text, "branch")
+}
+
+#test
+fn lwt_lowers_match_statement_merges_with_zero_block_args() {
+    let subject = lwt_var("x", checker::PrimKind::I64)
+    let track99 = lwt_call(lwt_path1("track"), "teko::demo", teko::list::push(teko::list::empty(), lwt_num_i64(99 to i128)), checker::Void { })
+    let track0 = lwt_call(lwt_path1("track"), "teko::demo", teko::list::push(teko::list::empty(), lwt_num_i64(0 to i128)), checker::Void { })
+    let arm0 = lwt_arm(lwt_int_pattern(1 to i128), teko::list::push(teko::list::empty(), lwt_exprstmt(track99)))
+    let arm1 = lwt_arm(lwt_wildcard_pattern(), teko::list::push(teko::list::empty(), lwt_exprstmt(track0)))
+    let arms = teko::list::push(teko::list::push(teko::list::empty(), arm0), arm1)
+    let match_stmt = checker::TExpr { kind = checker::TMatchExpr { subject = subject; arms = arms }; type = checker::Void { }; line = 0; col = 0 }
+    let params = teko::list::push(teko::list::empty(), lwt_param("x", "i64"))
+    let body = teko::list::push(teko::list::push(teko::list::empty(), lwt_exprstmt(match_stmt)), lwt_ret(lwt_num_i64(0 to i128)))
+    let f = lwt_fn("run_match_stmt", "teko::demo", params, checker::Prim { kind = checker::PrimKind::I64 }, body)
+    let lf = match lower_function(f) { LoweredFunction as r => r.func; error as err => return }
+    let text = print_lmodule(add_func(empty_module(), lf))
+    teko::assert::str_contains(text, "call @teko__demo__track(")
+    teko::assert::is_true(!teko::str::contains(text, "#B1(%"))
+    teko::assert::str_contains(text, "jump #B1()")
 }
 
 #test

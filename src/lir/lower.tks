@@ -298,15 +298,27 @@ fn is_c_keyword(s: str) -> bool {
     s == "typedef" || s == "extern" || s == "inline" || s == "restrict"
 }
 
-/** LowerCtx — the lowering state threaded through the expr/stmt walk: the current LFunc
-    being built + the id of the block instructions append to (N1 always block 0) + the
-    local env (name -> VReg) so a TVar resolves to its already-lowered value + the
-    struct-layout table (A1-3, #382 — read-only for the whole lowering of a program, so
-    every copy just carries the SAME slice forward) + the WHOLE-PROGRAM interned-rodata
-    table (A1-4, #382 — grows as string literals/interpolation pieces are found, so a
-    fresh entry mid-function is threaded forward like `func`, unlike the read-only
-    `layouts`). */
-pub type LowerCtx = struct { func: LFunc; block_id: u32; env: LEnv; layouts: []LStructLayout; rodata: []LRodata }
+/**
+ * LEnumInfo — one declared `enum` type's name + its member spellings, in
+ * declared order (the ORDINAL a bare/qualified enum-member match pattern tests
+ * against is that member's INDEX in this list — mirrors the checker's own
+ * `check_enum_pattern`/`enum_covered` convention, A1-5, #382).
+ */
+pub type LEnumInfo = struct { name: str; members: []str }
+
+/**
+ * LowerCtx — the lowering state threaded through the expr/stmt walk: the
+ * current LFunc being built + the id of the block instructions append to (N1
+ * always block 0) + the local env (name -> VReg) so a TVar resolves to its
+ * already-lowered value + the struct-layout table (A1-3, #382 — read-only for
+ * the whole lowering of a program, so every copy just carries the SAME slice
+ * forward) + the WHOLE-PROGRAM interned-rodata table (A1-4, #382 — grows as
+ * string literals/interpolation pieces are found, so a fresh entry mid-function
+ * is threaded forward like `func`, unlike the read-only `layouts`) + the
+ * WHOLE-PROGRAM enum table (A1-5, #382 — read-only, like `layouts`, so a
+ * `match` arm's bare enum-member pattern resolves its ordinal).
+ */
+pub type LowerCtx = struct { func: LFunc; block_id: u32; env: LEnv; layouts: []LStructLayout; rodata: []LRodata; enums: []LEnumInfo }
 
 /** Lowered — the result of lowering an expression: the updated context + the VReg the
     value lives in. */
@@ -317,19 +329,36 @@ pub type Lowered = struct { ctx: LowerCtx; vreg: u32 }
     caller stops emitting into a closed block. */
 pub type LowerStmtOut = struct { ctx: LowerCtx; terminated: bool }
 
-/** ctx_with — a copy of `ctx` with a new func/block_id/env, carrying its (unchanged)
-    layouts table + its (unchanged) rodata table forward. Centralizes the fields every
-    LowerCtx rebuild must not forget, so a future field addition touches this ONE function
-    instead of every construction site. Use `ctx_with_rodata` when the rodata table itself
-    grows (a string literal was just interned). */
+/**
+ * ctx_with — a copy of `ctx` with a new func/block_id/env, carrying its
+ * (unchanged) layouts/enums tables + its (unchanged) rodata table forward.
+ * Centralizes the fields every LowerCtx rebuild must not forget, so a future
+ * field addition touches this ONE function instead of every construction site.
+ * Use `ctx_with_rodata` when the rodata table itself grows (a string literal
+ * was just interned).
+ *
+ * @param LowerCtx ctx  the context to rebuild (its layouts/rodata/enums carry
+ *                      forward)
+ * @param LFunc func  the new current function
+ * @param u32 block_id  the new current block id
+ * @param LEnv env  the new local env
+ * @return LowerCtx  the rebuilt context
+ */
 fn ctx_with(ctx: LowerCtx, func: LFunc, block_id: u32, env: LEnv) -> LowerCtx {
-    LowerCtx { func = func; block_id = block_id; env = env; layouts = ctx.layouts; rodata = ctx.rodata }
+    LowerCtx { func = func; block_id = block_id; env = env; layouts = ctx.layouts; rodata = ctx.rodata; enums = ctx.enums }
 }
 
-/** ctx_with_rodata — a copy of `ctx` with its rodata table replaced by `rodata` (everything
-    else unchanged) — the one site a fresh interned entry threads forward (A1-4, #382). */
+/**
+ * ctx_with_rodata — a copy of `ctx` with its rodata table replaced by `rodata`
+ * (everything else unchanged) — the one site a fresh interned entry threads
+ * forward (A1-4, #382).
+ *
+ * @param LowerCtx ctx  the context to rebuild
+ * @param []LRodata rodata  the grown rodata table
+ * @return LowerCtx  the rebuilt context
+ */
 fn ctx_with_rodata(ctx: LowerCtx, rodata: []LRodata) -> LowerCtx {
-    LowerCtx { func = ctx.func; block_id = ctx.block_id; env = ctx.env; layouts = ctx.layouts; rodata = rodata }
+    LowerCtx { func = ctx.func; block_id = ctx.block_id; env = ctx.env; layouts = ctx.layouts; rodata = rodata; enums = ctx.enums }
 }
 
 /** ctx_alloc — reserve a fresh VReg in the current function, returning it + the advanced
@@ -382,6 +411,7 @@ pub fn lower_expr(ctx: LowerCtx, e: checker::TExpr) -> Lowered | error {
         checker::TInExpr as ine => lower_in_expr(ctx, e, ine)
         checker::TCoalesce as co => lower_coalesce(ctx, e, co)
         checker::TSafeFieldAccess as sfa => lower_safe_field_access(ctx, e, sfa)
+        checker::TMatchExpr as mx => lower_match(ctx, e, mx)
         _ => error { message = teko::str::concat("native backend N1: ", texpr_kind_name(e), " not yet lowered (N2)") }
     }
 }
@@ -857,6 +887,830 @@ fn lower_safe_field_access(ctx: LowerCtx, e: checker::TExpr, sfa: checker::TSafe
     Lowered { ctx = ctx_with(ctx1, else_func, mergeb.block_id, ctx1.env); vreg = mp.vreg }
 }
 
+/**
+ * MatchSubj — a `match`'s already-lowered SUBJECT: its resolved type (drives
+ * every arm's pattern-test/bind dispatch), its scalar/base-address VReg, and
+ * (for a `str` subject) its length VReg (`is_fat=false` leaves `len` unused)
+ * (A1-5, #382).
+ */
+type MatchSubj = struct { ty: checker::Type; vreg: u32; is_fat: bool; len: u32 }
+
+/**
+ * MatchSubjOut — the context after lowering a `match`'s subject exactly ONCE,
+ * plus the subject descriptor every arm reads (A1-5, #382).
+ */
+type MatchSubjOut = struct { ctx: LowerCtx; subj: MatchSubj }
+
+/**
+ * lower_match_subject — lower `subject` ONCE: a `str`/`[]T`-typed subject
+ * through the FAT path (ptr+len, for a string arm's byte-compare); every other
+ * subject through the plain scalar/address path (an enum's ordinal, a variant's
+ * base address, a plain integer, ...) (A1-5, #382).
+ *
+ * @param LowerCtx ctx  the lowering context to append the subject's
+ *                      instructions into
+ * @param checker::TExpr subject  the match's typed subject expression
+ * @return MatchSubjOut  the advanced context + the subject descriptor every arm
+ *                       reads
+ * @throws  when the subject expression itself fails to lower (propagated)
+ */
+fn lower_match_subject(ctx: LowerCtx, subject: checker::TExpr) -> MatchSubjOut | error {
+    if is_fat_type(subject.type) {
+        let fo = match lower_fat_expr(ctx, subject) { LoweredFat as x => x; error as err => return err }
+        return MatchSubjOut { ctx = fo.ctx; subj = MatchSubj { ty = subject.type; vreg = fo.ptr; is_fat = true; len = fo.len } }
+    }
+    let lo = match lower_expr(ctx, subject) { Lowered as x => x; error as err => return err }
+    MatchSubjOut { ctx = lo.ctx; subj = MatchSubj { ty = subject.type; vreg = lo.vreg; is_fat = false; len = 0 } }
+}
+
+/**
+ * VariantMember — one member of an inline `checker::Variant` subject resolved
+ * BY NAME: its declared INDEX (the runtime tag a variant-tag arm compares
+ * against) + its own Type (a `match` binding loads the payload at this Type's
+ * machine class) (A1-5, #382).
+ */
+type VariantMember = struct { index: u32; ty: checker::Type }
+
+/**
+ * find_variant_member — the NAMED member of `members` whose last path segment
+ * is `case_name`, or a NAMED internal error (an out-of-scope non-nominal member
+ * — prim/str/ error/... — is not a case A1-5 selects by name; A1-6+ widens
+ * this) (A1-5, #382).
+ *
+ * @param []checker::Type members  the variant subject's declared members, in
+ *                                 order
+ * @param str case_name  the pattern's case name (a bind/field pattern's last
+ *                       path segment)
+ * @return VariantMember  the matching member's declared index + its own Type
+ * @throws  when no member of `members` is Named `case_name` (an internal
+ *          invariant break)
+ */
+fn find_variant_member(members: []checker::Type, case_name: str) -> VariantMember | error {
+    mut i: u64 = 0
+    loop {
+        if i >= members.len { break }
+        match members[i] {
+            checker::Named as n => { if n.name == case_name { return VariantMember { index = i to u32; ty = members[i] } } }
+            _ => { }
+        }
+        i++
+    }
+    error { message = teko::str::concat("native backend N1: unknown variant case `", case_name, "` (internal)") }
+}
+
+/**
+ * find_enum_info — the LEnumInfo in `enums` named `name`, or `null` (a match
+ * subject bound to a plain Named type that is NOT a registered enum — a bare
+ * bind pattern over it always matches, A1-5, #382).
+ *
+ * @param []LEnumInfo enums  the program's whole enum table
+ * @param str name  the subject's Named type name to look up
+ * @return LEnumInfo?  the matching entry, or `null` when `name` is not a
+ *                     registered enum
+ */
+fn find_enum_info(enums: []LEnumInfo, name: str) -> LEnumInfo? {
+    mut i: u64 = 0
+    loop {
+        if i >= enums.len { break }
+        if enums[i].name == name { return enums[i] }
+        i++
+    }
+    null
+}
+
+/**
+ * enum_member_ordinal — the declared INDEX of `member` within `ei.members` (the
+ * ordinal an enum-subject pattern tests against, mirroring the checker's own
+ * `check_enum_pattern`), or a NAMED internal error when the name is not a
+ * member (A1-5, #382).
+ *
+ * @param LEnumInfo ei  the enum's declared name + member list
+ * @param str member  the pattern's bare/qualified member name
+ * @return u32  `member`'s declared index (its ordinal)
+ * @throws  when `member` is not one of `ei.members` (an internal invariant
+ *          break)
+ */
+fn enum_member_ordinal(ei: LEnumInfo, member: str) -> u32 | error {
+    mut i: u64 = 0
+    loop {
+        if i >= ei.members.len { break }
+        if ei.members[i] == member { return i to u32 }
+        i++
+    }
+    error { message = teko::str::concat("native backend N1: unknown enum member `", member, "` (internal)") }
+}
+
+/**
+ * bind_pattern_case_name — a BindPattern's case name (its type path's LAST
+ * segment) — the name a variant/enum-subject test resolves BY (A1-5, #382).
+ *
+ * @param parser::BindPattern bp  the pattern to read the case name from
+ * @return str  the type path's last segment name
+ */
+fn bind_pattern_case_name(bp: parser::BindPattern) -> str {
+    let segs = bp.type_name.segments
+    segs[segs.len - 1].name
+}
+
+/**
+ * field_pattern_case_name — a FieldPattern's case name (its type path's LAST
+ * segment), mirroring `bind_pattern_case_name` (A1-5, #382).
+ *
+ * @param parser::FieldPattern fp  the pattern to read the case name from
+ * @return str  the type path's last segment name
+ */
+fn field_pattern_case_name(fp: parser::FieldPattern) -> str {
+    let segs = fp.type_name.segments
+    segs[segs.len - 1].name
+}
+
+/**
+ * PatternTest — one arm's pattern-test outcome: `always=true` for a test that
+ * matches UNCONDITIONALLY (a wildcard, or a bind that names no case) — the
+ * caller then emits an unconditional jump instead of a branch (§2.4); otherwise
+ * `vreg` is the bool VReg the test computed (A1-5, #382).
+ */
+type PatternTest = struct { ctx: LowerCtx; always: bool; vreg: u32 }
+
+/**
+ * lower_pattern_test — the boolean test `pat` applies to `subj`: a wildcard
+ * always matches; a scalar/string literal tests equality; a bind/field pattern
+ * tests a variant's tag OR an enum's ordinal (falling back to an unconditional
+ * whole-value bind); a range/ alternation/`null` pattern is out of the A1-5
+ * subset (A1-5, #382).
+ *
+ * @param LowerCtx ctx  the lowering context to append the test's instructions
+ *                      into
+ * @param MatchSubj subj  the match's already-lowered subject
+ * @param parser::Pattern pat  the arm's syntactic pattern
+ * @param u32 line  the enclosing match expression's source line (patterns carry
+ *                  none)
+ * @param u32 col  the enclosing match expression's source column
+ * @return PatternTest  the test outcome (always-true, or a computed bool VReg)
+ * @throws  for a range/alternation/`null`/slice pattern, or an unresolvable
+ *          case/enum name
+ */
+fn lower_pattern_test(ctx: LowerCtx, subj: MatchSubj, pat: parser::Pattern, line: u32, col: u32) -> PatternTest | error {
+    match pat {
+        parser::WildcardPattern => PatternTest { ctx = ctx; always = true; vreg = 0 }
+        parser::LiteralPattern as lp => lower_literal_pattern_test(ctx, subj, lp, line, col)
+        parser::BindPattern as bp => lower_bind_pattern_test(ctx, subj, bp, line, col)
+        parser::FieldPattern as fp => lower_field_pattern_test(ctx, subj, fp, line, col)
+        parser::RangePattern => error { message = "native backend N1: range match pattern not yet lowered (N2)" }
+        parser::AltPattern => error { message = "native backend N1: alternation (`|`) match pattern not yet lowered (N2)" }
+        parser::NullPattern => error { message = "native backend N1: `null` match pattern not yet lowered (N2)" }
+    }
+}
+
+/**
+ * lower_literal_pattern_test — a scalar-literal pattern's test: a string
+ * literal compares bytes; an integer literal compares via `ICmpEq`; a float
+ * literal or any other literal shape (the parser only ever emits
+ * number/byte/str) is out of the A1-5 subset (A1-5, #382).
+ *
+ * @param LowerCtx ctx  the lowering context to append the test's instructions
+ *                      into
+ * @param MatchSubj subj  the match's already-lowered subject
+ * @param parser::LiteralPattern lp  the literal pattern to test
+ * @param u32 line  the source line to stamp the emitted instructions with
+ * @param u32 col  the source column to stamp the emitted instructions with
+ * @return PatternTest  the computed equality test
+ * @throws  for a float literal, or a literal shape the parser never emits
+ *          (internal)
+ */
+fn lower_literal_pattern_test(ctx: LowerCtx, subj: MatchSubj, lp: parser::LiteralPattern, line: u32, col: u32) -> PatternTest | error {
+    match lp.value.kind {
+        parser::StrLit as sl => lower_str_literal_pattern_test(ctx, subj, sl.text, line, col)
+        parser::Number as n => lower_number_literal_pattern_test(ctx, subj, n, line, col)
+        parser::ByteLit as b => lower_scalar_literal_pattern_test(ctx, subj, b.value to i128, line, col)
+        _ => error { message = "native backend N1: unsupported literal match pattern (internal)" }
+    }
+}
+
+/**
+ * lower_number_literal_pattern_test — an integer-literal pattern's `ICmpEq`
+ * test; a float literal pattern is out of the A1-5 subset (A1-5, #382).
+ *
+ * @param LowerCtx ctx  the lowering context to append the test's instructions
+ *                      into
+ * @param MatchSubj subj  the match's already-lowered subject
+ * @param parser::Number n  the syntactic number literal
+ * @param u32 line  the source line to stamp the emitted instructions with
+ * @param u32 col  the source column to stamp the emitted instructions with
+ * @return PatternTest  the computed equality test
+ * @throws  when `n` is a float literal (not yet lowered)
+ */
+fn lower_number_literal_pattern_test(ctx: LowerCtx, subj: MatchSubj, n: parser::Number, line: u32, col: u32) -> PatternTest | error {
+    if n.is_float { return error { message = "native backend N1: float match pattern not yet lowered (N2)" } }
+    lower_scalar_literal_pattern_test(ctx, subj, n.value, line, col)
+}
+
+/**
+ * lower_scalar_literal_pattern_test — `subj == const(value)` via `ICmpEq`
+ * (A1-5, #382).
+ *
+ * @param LowerCtx ctx  the lowering context to append the test's instructions
+ *                      into
+ * @param MatchSubj subj  the match's already-lowered subject
+ * @param i128 value  the constant to compare the subject against
+ * @param u32 line  the source line to stamp the emitted instructions with
+ * @param u32 col  the source column to stamp the emitted instructions with
+ * @return PatternTest  the computed equality test
+ */
+fn lower_scalar_literal_pattern_test(ctx: LowerCtx, subj: MatchSubj, value: i128, line: u32, col: u32) -> PatternTest {
+    let r = ctx_alloc(ctx)
+    let with_const = ctx_append(r.ctx, const_int_inst(r.vreg, value, line, col))
+    let cr = ctx_alloc(with_const)
+    let with_cmp = ctx_append(cr.ctx, bin_inst(cr.vreg, LBinOp::ICmpEq, subj.vreg, r.vreg, line, col))
+    PatternTest { ctx = with_cmp; always = false; vreg = cr.vreg }
+}
+
+/**
+ * lower_str_literal_pattern_test — a `str` literal pattern's test: the
+ * subject's length must equal the literal's, ANDed with an UNROLLED
+ * (compile-time-known length) per-byte equality chain over the subject's
+ * rodata/fat-pointer content — no runtime string-compare exists at the LIR
+ * level, so this is the "byte-wise compare" the plan calls for (A1-5, #382).
+ * Requires a FAT subject (a non-string subject reaching here is an invariant
+ * break).
+ *
+ * @param LowerCtx ctx  the lowering context to append the test's instructions
+ *                      into
+ * @param MatchSubj subj  the match's already-lowered (FAT) subject
+ * @param str text  the literal's own text
+ * @param u32 line  the source line to stamp the emitted instructions with
+ * @param u32 col  the source column to stamp the emitted instructions with
+ * @return PatternTest  the computed length+bytes equality test
+ * @throws  when `subj` is not a FAT (str/slice) subject (internal)
+ */
+fn lower_str_literal_pattern_test(ctx: LowerCtx, subj: MatchSubj, text: str, line: u32, col: u32) -> PatternTest | error {
+    if !subj.is_fat { return error { message = "native backend N1: string match pattern over a non-string subject (internal)" } }
+    let lenr = ctx_alloc(ctx)
+    let with_lenconst = ctx_append(lenr.ctx, const_int_inst(lenr.vreg, text.len to i128, line, col))
+    let lcmp = ctx_alloc(with_lenconst)
+    let with_lcmp = ctx_append(lcmp.ctx, bin_inst(lcmp.vreg, LBinOp::ICmpEq, subj.len, lenr.vreg, line, col))
+    let bytes_test = str_pattern_bytes_test(with_lcmp, subj, text, lcmp.vreg, line, col)
+    PatternTest { ctx = bytes_test.ctx; always = false; vreg = bytes_test.vreg }
+}
+
+/**
+ * str_pattern_bytes_test — AND `acc0` with one equality test per byte of `text`
+ * (unrolled at lowering time, since `text.len` is a compile-time constant),
+ * reusing `lower_bool_and`'s branch/merge shape for each conjunction (A1-5,
+ * #382).
+ *
+ * @param LowerCtx ctx  the lowering context to append every byte test's
+ *                      instructions into
+ * @param MatchSubj subj  the match's already-lowered (FAT) subject
+ * @param str text  the literal's own text (its bytes are compared one by one)
+ * @param u32 acc0  the running conjunction's SEED bool VReg (the length test)
+ * @param u32 line  the source line to stamp the emitted instructions with
+ * @param u32 col  the source column to stamp the emitted instructions with
+ * @return Lowered  the advanced context + the final conjunction's bool VReg
+ */
+fn str_pattern_bytes_test(ctx: LowerCtx, subj: MatchSubj, text: str, acc0: u32, line: u32, col: u32) -> Lowered {
+    mut cur = ctx
+    mut acc = acc0
+    mut i: u64 = 0
+    loop {
+        if i >= text.len { break }
+        let eq = str_pattern_byte_eq(cur, subj, text[i], i to u32, line, col)
+        let merged = lower_bool_and(eq.ctx, acc, eq.vreg, line, col)
+        cur = merged.ctx
+        acc = merged.vreg
+        i++
+    }
+    Lowered { ctx = cur; vreg = acc }
+}
+
+/**
+ * str_pattern_byte_eq — the subject's byte at the CONSTANT `index` (its fat
+ * pointer's base + `index`), compared for equality against the literal's own
+ * byte `want` (A1-5, #382).
+ *
+ * @param LowerCtx ctx  the lowering context to append the byte test's
+ *                      instructions into
+ * @param MatchSubj subj  the match's already-lowered (FAT) subject
+ * @param byte want  the literal's own byte at `index`
+ * @param u32 index  the constant byte offset within the subject's content
+ * @param u32 line  the source line to stamp the emitted instructions with
+ * @param u32 col  the source column to stamp the emitted instructions with
+ * @return Lowered  the advanced context + the byte-equality bool VReg
+ */
+fn str_pattern_byte_eq(ctx: LowerCtx, subj: MatchSubj, want: byte, index: u32, line: u32, col: u32) -> Lowered {
+    let addr = ctx_alloc(ctx)
+    let with_addr = ctx_append(addr.ctx, field_addr_inst(addr.vreg, subj.vreg, index, line, col))
+    let bl = ctx_alloc(with_addr)
+    let with_load = ctx_append(bl.ctx, load_inst(bl.vreg, addr.vreg, LType::I8, line, col))
+    let bc = ctx_alloc(with_load)
+    let with_bconst = ctx_append(bc.ctx, const_int_inst(bc.vreg, want to i128, line, col))
+    let eqr = ctx_alloc(with_bconst)
+    Lowered { ctx = ctx_append(eqr.ctx, bin_inst(eqr.vreg, LBinOp::ICmpEq, bl.vreg, bc.vreg, line, col)); vreg = eqr.vreg }
+}
+
+/**
+ * lower_bind_pattern_test — a BindPattern's test: over a `Variant` subject it
+ * selects a CASE (by tag); over a plain `Named` subject registered as an enum
+ * it selects a MEMBER (by ordinal); a slice pattern (`[]T as x`) is out of the
+ * A1-5 subset; anything else always matches (binds the whole subject) (A1-5,
+ * #382).
+ *
+ * @param LowerCtx ctx  the lowering context to append the test's instructions
+ *                      into
+ * @param MatchSubj subj  the match's already-lowered subject
+ * @param parser::BindPattern bp  the bind pattern to test
+ * @param u32 line  the source line to stamp the emitted instructions with
+ * @param u32 col  the source column to stamp the emitted instructions with
+ * @return PatternTest  the test outcome (always-true, or a computed bool VReg)
+ * @throws  for a slice pattern, or an unresolvable variant case name
+ */
+fn lower_bind_pattern_test(ctx: LowerCtx, subj: MatchSubj, bp: parser::BindPattern, line: u32, col: u32) -> PatternTest | error {
+    if bp.is_slice { return error { message = "native backend N1: slice match pattern not yet lowered (N2)" } }
+    match subj.ty {
+        checker::Variant as v => lower_variant_case_test(ctx, subj, v.members, bind_pattern_case_name(bp), line, col)
+        checker::Named as n => lower_named_bind_pattern_test(ctx, subj, n, bp, line, col)
+        _ => PatternTest { ctx = ctx; always = true; vreg = 0 }
+    }
+}
+
+/**
+ * lower_named_bind_pattern_test — a bind pattern over a plain `Named` subject:
+ * an enum member's ordinal test when `n.name` is a registered enum, else an
+ * unconditional (whole- value bind) match (A1-5, #382).
+ *
+ * @param LowerCtx ctx  the lowering context to append the test's instructions
+ *                      into
+ * @param MatchSubj subj  the match's already-lowered subject
+ * @param checker::Named n  the subject's resolved Named type
+ * @param parser::BindPattern bp  the bind pattern to test
+ * @param u32 line  the source line to stamp the emitted instructions with
+ * @param u32 col  the source column to stamp the emitted instructions with
+ * @return PatternTest  the test outcome (always-true, or a computed bool VReg)
+ * @throws  when `n.name` is a registered enum but the pattern names an unknown
+ *          member
+ */
+fn lower_named_bind_pattern_test(ctx: LowerCtx, subj: MatchSubj, n: checker::Named, bp: parser::BindPattern, line: u32, col: u32) -> PatternTest | error {
+    match find_enum_info(ctx.enums, n.name) {
+        LEnumInfo as ei => {
+            let ord = match enum_member_ordinal(ei, bind_pattern_case_name(bp)) { u32 as o => o; error as err => return err }
+            lower_scalar_literal_pattern_test(ctx, subj, ord to i128, line, col)
+        }
+        null => PatternTest { ctx = ctx; always = true; vreg = 0 }
+    }
+}
+
+/**
+ * lower_variant_case_test — `subj.tag == <case index>`: load the tag (field 0,
+ * `I32`) off the subject's base address, then compare against the named case's
+ * declared index (the variant runtime image is tag@0 + payload@8, per the
+ * plan's §5.3) (A1-5, #382).
+ *
+ * @param LowerCtx ctx  the lowering context to append the test's instructions
+ *                      into
+ * @param MatchSubj subj  the match's already-lowered (base-address) subject
+ * @param []checker::Type members  the variant subject's declared members, in
+ *                                 order
+ * @param str case_name  the pattern's case name
+ * @param u32 line  the source line to stamp the emitted instructions with
+ * @param u32 col  the source column to stamp the emitted instructions with
+ * @return PatternTest  the computed tag-equality test
+ * @throws  when `case_name` names no member of `members`
+ */
+fn lower_variant_case_test(ctx: LowerCtx, subj: MatchSubj, members: []checker::Type, case_name: str, line: u32, col: u32) -> PatternTest | error {
+    let vm = match find_variant_member(members, case_name) { VariantMember as x => x; error as err => return err }
+    let addr = ctx_alloc(ctx)
+    let with_addr = ctx_append(addr.ctx, field_addr_inst(addr.vreg, subj.vreg, 0, line, col))
+    let tagr = ctx_alloc(with_addr)
+    let with_tag = ctx_append(tagr.ctx, load_inst(tagr.vreg, addr.vreg, LType::I32, line, col))
+    let cr = ctx_alloc(with_tag)
+    let with_const = ctx_append(cr.ctx, const_int_inst(cr.vreg, vm.index to i128, line, col))
+    let eqr = ctx_alloc(with_const)
+    PatternTest { ctx = ctx_append(eqr.ctx, bin_inst(eqr.vreg, LBinOp::ICmpEq, tagr.vreg, cr.vreg, line, col)); always = false; vreg = eqr.vreg }
+}
+
+/**
+ * lower_field_pattern_test — a FieldPattern's test: the same variant-tag test a
+ * BindPattern case-select uses (a field-destructure ALSO selects a case); any
+ * other subject shape is out of the A1-5 subset (A1-5, #382).
+ *
+ * @param LowerCtx ctx  the lowering context to append the test's instructions
+ *                      into
+ * @param MatchSubj subj  the match's already-lowered subject
+ * @param parser::FieldPattern fp  the field pattern to test
+ * @param u32 line  the source line to stamp the emitted instructions with
+ * @param u32 col  the source column to stamp the emitted instructions with
+ * @return PatternTest  the computed tag-equality test
+ * @throws  when the subject is not a `Variant` type
+ */
+fn lower_field_pattern_test(ctx: LowerCtx, subj: MatchSubj, fp: parser::FieldPattern, line: u32, col: u32) -> PatternTest | error {
+    match subj.ty {
+        checker::Variant as v => lower_variant_case_test(ctx, subj, v.members, field_pattern_case_name(fp), line, col)
+        _ => error { message = "native backend N1: field match pattern over a non-variant subject not yet lowered (N2)" }
+    }
+}
+
+/**
+ * lower_pattern_binds — the bindings `pat` introduces into `ctx`'s env: a bind
+ * pattern binds a name; a field pattern destructures a variant's payload struct
+ * fields; a wildcard/ literal/range/alt pattern binds nothing (A1-5, #382).
+ *
+ * @param LowerCtx ctx  the lowering context to extend with the pattern's
+ *                      bindings
+ * @param MatchSubj subj  the match's already-lowered subject
+ * @param parser::Pattern pat  the arm's syntactic pattern
+ * @return LowerCtx  the context with every binding `pat` introduces applied
+ * @throws  when a bind/field pattern names an unresolvable variant case
+ */
+fn lower_pattern_binds(ctx: LowerCtx, subj: MatchSubj, pat: parser::Pattern) -> LowerCtx | error {
+    match pat {
+        parser::BindPattern as bp => lower_bind_pattern_binds(ctx, subj, bp)
+        parser::FieldPattern as fp => lower_field_pattern_binds(ctx, subj, fp)
+        _ => ctx
+    }
+}
+
+/**
+ * lower_bind_pattern_binds — `Foo as x`: over a `Variant` subject, `x` binds
+ * the CASE's payload (loaded at offset 8, per its own machine class); otherwise
+ * `x` binds the WHOLE subject VReg (or fat pair). A bindingless bind
+ * (`Foo`/`Foo as _`) binds nothing (A1-5, #382).
+ *
+ * @param LowerCtx ctx  the lowering context to extend with the pattern's
+ *                      binding
+ * @param MatchSubj subj  the match's already-lowered subject
+ * @param parser::BindPattern bp  the bind pattern to apply
+ * @return LowerCtx  the context with `bp`'s binding applied (unchanged when
+ *                   bindingless)
+ * @throws  when `bp` names an unresolvable variant case
+ */
+fn lower_bind_pattern_binds(ctx: LowerCtx, subj: MatchSubj, bp: parser::BindPattern) -> LowerCtx | error {
+    if !bp.has_binding { return ctx }
+    match subj.ty {
+        checker::Variant as v => lower_variant_case_bind(ctx, subj, v.members, bind_pattern_case_name(bp), bp.binding)
+        _ => bind_whole_subject(ctx, subj, bp.binding)
+    }
+}
+
+/**
+ * bind_whole_subject — bind `name` to the subject's own value: its fat (ptr,
+ * len) pair when `subj.is_fat`, else its plain scalar/address VReg (A1-5,
+ * #382).
+ *
+ * @param LowerCtx ctx  the lowering context to extend with the binding
+ * @param MatchSubj subj  the match's already-lowered subject
+ * @param str name  the name to bind
+ * @return LowerCtx  the context with `name` bound to the subject's own value
+ */
+fn bind_whole_subject(ctx: LowerCtx, subj: MatchSubj, name: str) -> LowerCtx {
+    if subj.is_fat { return ctx_bind_fat(ctx, name, subj.vreg, subj.len) }
+    ctx_bind(ctx, name, subj.vreg)
+}
+
+/**
+ * lower_variant_case_bind — `Foo as x` over a variant subject: `x` binds the
+ * case's PAYLOAD (a `field_addr` + `load` at offset 8, of the case type's own
+ * machine class — a Ptr for a struct case, so the bound name reads through the
+ * case's OWN registered layout exactly like an ordinary `TFieldAccess`) (A1-5,
+ * #382).
+ *
+ * @param LowerCtx ctx  the lowering context to append the load's instructions
+ *                      into
+ * @param MatchSubj subj  the match's already-lowered (base-address) subject
+ * @param []checker::Type members  the variant subject's declared members, in
+ *                                 order
+ * @param str case_name  the pattern's case name
+ * @param str binding  the name to bind the case's payload to
+ * @return LowerCtx  the context with `binding` bound to the case's loaded
+ *                   payload
+ * @throws  when `case_name` names no member of `members`
+ */
+fn lower_variant_case_bind(ctx: LowerCtx, subj: MatchSubj, members: []checker::Type, case_name: str, binding: str) -> LowerCtx | error {
+    let vm = match find_variant_member(members, case_name) { VariantMember as x => x; error as err => return err }
+    let ty = ltype_of(vm.ty)
+    let addr = ctx_alloc(ctx)
+    let with_addr = ctx_append(addr.ctx, field_addr_inst(addr.vreg, subj.vreg, 8, 0, 0))
+    let r = ctx_alloc(with_addr)
+    let with_load = ctx_append(r.ctx, load_inst(r.vreg, addr.vreg, ty, 0, 0))
+    ctx_bind(with_load, binding, r.vreg)
+}
+
+/**
+ * lower_field_pattern_binds — `Foo { f; g }` over a variant subject: read the
+ * case's payload POINTER (offset 8), then destructure the requested fields off
+ * its OWN registered struct layout; any other subject shape is out of the A1-5
+ * subset (A1-5, #382).
+ *
+ * @param LowerCtx ctx  the lowering context to append the destructure's
+ *                      instructions into
+ * @param MatchSubj subj  the match's already-lowered subject
+ * @param parser::FieldPattern fp  the field pattern to apply
+ * @return LowerCtx  the context with every requested field bound
+ * @throws  when the subject is not a `Variant` type, or the case is not a
+ *          struct
+ */
+fn lower_field_pattern_binds(ctx: LowerCtx, subj: MatchSubj, fp: parser::FieldPattern) -> LowerCtx | error {
+    match subj.ty {
+        checker::Variant as v => lower_variant_field_binds(ctx, subj, v.members, fp)
+        _ => error { message = "native backend N1: field match pattern over a non-variant subject not yet lowered (N2)" }
+    }
+}
+
+/**
+ * lower_variant_field_binds — resolve the named case's struct layout, load its
+ * payload base address (offset 8), then bind each requested field by its OWN
+ * registered offset/type (A1-5, #382).
+ *
+ * @param LowerCtx ctx  the lowering context to append the destructure's
+ *                      instructions into
+ * @param MatchSubj subj  the match's already-lowered (base-address) subject
+ * @param []checker::Type members  the variant subject's declared members, in
+ *                                 order
+ * @param parser::FieldPattern fp  the field pattern naming the case + its
+ *                                 requested fields
+ * @return LowerCtx  the context with every requested field bound
+ * @throws  when the case is unresolvable, not a struct, or a requested field is
+ *          unknown
+ */
+fn lower_variant_field_binds(ctx: LowerCtx, subj: MatchSubj, members: []checker::Type, fp: parser::FieldPattern) -> LowerCtx | error {
+    let vm = match find_variant_member(members, field_pattern_case_name(fp)) { VariantMember as x => x; error as err => return err }
+    let sname = match vm.ty { checker::Named as n => n.name; _ => return error { message = "native backend N1: field match pattern requires a struct case (internal)" } }
+    let layout = match find_struct_layout(ctx.layouts, sname) { LStructLayout as l => l; error as err => return err }
+    let paddr = ctx_alloc(ctx)
+    let with_paddr = ctx_append(paddr.ctx, field_addr_inst(paddr.vreg, subj.vreg, 8, 0, 0))
+    let base = ctx_alloc(with_paddr)
+    let with_base = ctx_append(base.ctx, load_inst(base.vreg, paddr.vreg, LType::Ptr, 0, 0))
+    bind_variant_fields(with_base, base.vreg, layout, fp.fields)
+}
+
+/**
+ * bind_variant_fields — bind each of `fields` (in order) to its own load off
+ * `base` via the registered `layout`'s offset/machine-class (A1-5, #382).
+ *
+ * @param LowerCtx ctx  the lowering context to append each field's load into
+ * @param u32 base  the case's own payload base address VReg
+ * @param LStructLayout layout  the case's registered struct layout
+ * @param []str fields  the requested field names, in order
+ * @return LowerCtx  the context with every field bound
+ * @throws  when a requested field is not registered on `layout`
+ */
+fn bind_variant_fields(ctx: LowerCtx, base: u32, layout: LStructLayout, fields: []str) -> LowerCtx | error {
+    mut cur = ctx
+    mut i: u64 = 0
+    loop {
+        if i >= fields.len { break }
+        let off = match field_offset_of(layout, fields[i]) { u32 as o => o; error as err => return err }
+        let fty = match field_type_of(layout, fields[i]) { LType as t => t; error as err => return err }
+        let addr = ctx_alloc(cur)
+        let with_addr = ctx_append(addr.ctx, field_addr_inst(addr.vreg, base, off, 0, 0))
+        let r = ctx_alloc(with_addr)
+        let with_load = ctx_append(r.ctx, load_inst(r.vreg, addr.vreg, fty, 0, 0))
+        cur = ctx_bind(with_load, fields[i], r.vreg)
+        i++
+    }
+    cur
+}
+
+/**
+ * MatchArmEntry — the context positioned at the START of an arm's BODY (its
+ * pattern's bindings applied, and — when present — its `when` guard already
+ * resolved TRUE) + the id of the NEXT-arm test block (the pattern's or guard's
+ * failure target), shared by the value and statement `match` lowerings (A1-5,
+ * #382).
+ */
+type MatchArmEntry = struct { ctx: LowerCtx; next_block: u32 }
+
+/**
+ * close_test_to — close the CURRENT test block: an unconditional jump for an
+ * `always` test (§2.4's "wildcard/binding arms are an unconditional jump"),
+ * else a conditional branch on the test's bool VReg (A1-5, #382).
+ *
+ * @param LowerCtx ctx  the context whose current block the terminator closes
+ * @param PatternTest test  the arm's pattern-test outcome
+ * @param u32 arm_block  the block id to enter on a match
+ * @param u32 next_block  the block id to fall through to on a non-match
+ * @param u32 line  the source line to stamp the terminator with
+ * @param u32 col  the source column to stamp the terminator with
+ * @return LowerCtx  the context with the current block closed
+ */
+fn close_test_to(ctx: LowerCtx, test: PatternTest, arm_block: u32, next_block: u32, line: u32, col: u32) -> LowerCtx {
+    if test.always { return ctx_append(ctx, jump_inst(arm_block, teko::list::empty(), line, col)) }
+    ctx_append(ctx, branch_inst(test.vreg, arm_block, teko::list::empty(), next_block, teko::list::empty(), line, col))
+}
+
+/**
+ * lower_match_arm_entry — test `arm`'s pattern against `subj`; on success,
+ * apply its bindings and (when present) test its `when` guard — a failed
+ * pattern OR a failed guard falls through to the SAME next-arm block. Returns
+ * the context positioned at the start of the arm's BODY plus the next-arm block
+ * id (A1-5, #382).
+ *
+ * @param LowerCtx ctx  the lowering context positioned at the arm's test site
+ * @param checker::TExpr e  the enclosing match expression (for its source
+ *                          position)
+ * @param checker::TArm arm  the arm to lower the entry (test/binds/guard) of
+ * @param MatchSubj subj  the match's already-lowered subject
+ * @return MatchArmEntry  the context at the arm's body start + the next-arm
+ *                        block id
+ * @throws  when the pattern test, its bindings, or its guard fail to lower
+ */
+fn lower_match_arm_entry(ctx: LowerCtx, e: checker::TExpr, arm: checker::TArm, subj: MatchSubj) -> MatchArmEntry | error {
+    let test = match lower_pattern_test(ctx, subj, arm.pattern, e.line, e.col) { PatternTest as x => x; error as err => return err }
+    let armb = alloc_block(test.ctx.func)
+    let nextb = alloc_block(armb.func)
+    let gated = close_test_to(ctx_with(test.ctx, nextb.func, test.ctx.block_id, test.ctx.env), test, armb.block_id, nextb.block_id, e.line, e.col)
+    let arm_ctx = match lower_pattern_binds(ctx_goto(gated, armb.block_id), subj, arm.pattern) { LowerCtx as c => c; error as err => return err }
+    if !arm.has_when { return MatchArmEntry { ctx = arm_ctx; next_block = nextb.block_id } }
+    lower_match_guard(arm_ctx, arm, nextb.block_id)
+}
+
+/**
+ * lower_match_guard — a `when` guard: branch on it, taking the guard-true edge
+ * into a fresh body block and falling through to `next_block` (the SAME target
+ * the pattern-test's own failure edge uses) on a false guard (A1-5, #382).
+ *
+ * @param LowerCtx ctx  the lowering context positioned at the arm's guard site
+ * @param checker::TArm arm  the guarded arm (`arm.guard` is valid — `has_when`
+ *                           is true)
+ * @param u32 next_block  the next-arm block id a false guard falls through to
+ * @return MatchArmEntry  the context at the guarded body's start + the next-arm
+ *                        block id
+ * @throws  when the guard expression fails to lower
+ */
+fn lower_match_guard(ctx: LowerCtx, arm: checker::TArm, next_block: u32) -> MatchArmEntry | error {
+    let guardo = match lower_expr(ctx, arm.guard) { Lowered as x => x; error as err => return err }
+    let guardb = alloc_block(guardo.ctx.func)
+    let guarded = append_inst(guardb.func, guardo.ctx.block_id, branch_inst(guardo.vreg, guardb.block_id, teko::list::empty(), next_block, teko::list::empty(), arm.guard.line, arm.guard.col))
+    MatchArmEntry { ctx = ctx_with(guardo.ctx, guarded, guardb.block_id, guardo.ctx.env); next_block = next_block }
+}
+
+/**
+ * lower_match_arm_value — lower one VALUE-position arm: its entry
+ * (test/binds/guard), its BODY as a tail-value block (mirrors an if-expression
+ * arm), then a jump to the merge block carrying the tail value; returns the
+ * context positioned at the next-arm test block (A1-5, #382).
+ *
+ * @param LowerCtx ctx  the lowering context positioned at the arm's test site
+ * @param checker::TExpr e  the enclosing match expression
+ * @param checker::TArm arm  the arm to lower
+ * @param MatchSubj subj  the match's already-lowered subject
+ * @param u32 merge_id  the merge block id the arm's tail value jumps to
+ * @return LowerCtx  the context positioned at the next-arm test block
+ * @throws  when the arm's entry or body fails to lower
+ */
+fn lower_match_arm_value(ctx: LowerCtx, e: checker::TExpr, arm: checker::TArm, subj: MatchSubj, merge_id: u32) -> LowerCtx | error {
+    let step = match lower_match_arm_entry(ctx, e, arm, subj) { MatchArmEntry as x => x; error as err => return err }
+    let bv = match lower_block_value(step.ctx, arm.body) { LowerBlockValue as x => x; error as err => return err }
+    let args = teko::list::push(teko::list::empty(), bv.vreg)
+    let closed = close_arm_to(bv.ctx, merge_id, args, e.line, e.col)
+    ctx_with(ctx, closed, step.next_block, ctx.env)
+}
+
+/**
+ * lower_match_arms_value — fold `lower_match_arm_value` over every arm, in
+ * order, threading the "next test" position from arm to arm; the final context
+ * is the DEAD-CODE fallback position past the last arm's test (unreachable when
+ * the checker's exhaustiveness holds) (A1-5, #382).
+ *
+ * @param LowerCtx ctx  the lowering context positioned at the first arm's test
+ *                      site
+ * @param checker::TExpr e  the enclosing match expression
+ * @param []checker::TArm arms  the match's arms, in order
+ * @param MatchSubj subj  the match's already-lowered subject
+ * @param u32 merge_id  the merge block id every arm's tail value jumps to
+ * @return LowerCtx  the context positioned past the last arm's test (the dead
+ *                   fallback)
+ * @throws  when any arm fails to lower
+ */
+fn lower_match_arms_value(ctx: LowerCtx, e: checker::TExpr, arms: []checker::TArm, subj: MatchSubj, merge_id: u32) -> LowerCtx | error {
+    mut cur = ctx
+    mut i: u64 = 0
+    loop {
+        if i >= arms.len { break }
+        cur = match lower_match_arm_value(cur, e, arms[i], subj, merge_id) { LowerCtx as c => c; error as err => return err }
+        i++
+    }
+    cur
+}
+
+/**
+ * lower_match_value — a `match` used as a VALUE: a merge block with ONE
+ * block-arg (the result), each arm's tail value feeding it; the DEAD-CODE
+ * fallback past the last arm merges a defensive zero (the checker's
+ * exhaustiveness makes it unreachable, mirroring
+ * `emit_match_tail_fallthrough_return`'s own defensive-return spirit) (A1-5,
+ * #382).
+ *
+ * @param LowerCtx ctx  the lowering context positioned right after the subject
+ * @param checker::TExpr e  the match expression (its `.type` is the result's
+ *                          machine class)
+ * @param checker::TMatchExpr m  the typed match (subject already lowered; only
+ *                               `.arms` used)
+ * @param MatchSubj subj  the match's already-lowered subject
+ * @return Lowered  the advanced context (positioned at the merge block) + its
+ *                  result VReg
+ * @throws  when any arm fails to lower
+ */
+fn lower_match_value(ctx: LowerCtx, e: checker::TExpr, m: checker::TMatchExpr, subj: MatchSubj) -> Lowered | error {
+    let mergeb = alloc_block(ctx.func)
+    let mp = add_block_param(mergeb.func, mergeb.block_id)
+    let base_ctx = ctx_with(ctx, mp.func, ctx.block_id, ctx.env)
+    let chain = match lower_match_arms_value(base_ctx, e, m.arms, subj, mergeb.block_id) { LowerCtx as c => c; error as err => return err }
+    let fb = ctx_alloc(chain)
+    let with_zero = ctx_append(fb.ctx, const_int_inst(fb.vreg, 0 to i128, e.line, e.col))
+    let fallback_args = teko::list::push(teko::list::empty(), fb.vreg)
+    let closed = append_inst(with_zero.func, with_zero.block_id, jump_inst(mergeb.block_id, fallback_args, e.line, e.col))
+    Lowered { ctx = ctx_with(ctx, closed, mergeb.block_id, ctx.env); vreg = mp.vreg }
+}
+
+/**
+ * lower_match_arm_stmt — lower one STATEMENT-position arm: its entry
+ * (test/binds/guard), its BODY for EFFECT ONLY (mirrors an if-statement arm),
+ * then a jump to the merge block (no value); returns the context positioned at
+ * the next-arm test block (A1-5, #382).
+ *
+ * @param LowerCtx ctx  the lowering context positioned at the arm's test site
+ * @param checker::TExpr e  the enclosing match expression
+ * @param checker::TArm arm  the arm to lower
+ * @param MatchSubj subj  the match's already-lowered subject
+ * @param u32 merge_id  the merge block id the arm jumps to after its body
+ * @return LowerCtx  the context positioned at the next-arm test block
+ * @throws  when the arm's entry or body fails to lower
+ */
+fn lower_match_arm_stmt(ctx: LowerCtx, e: checker::TExpr, arm: checker::TArm, subj: MatchSubj, merge_id: u32) -> LowerCtx | error {
+    let step = match lower_match_arm_entry(ctx, e, arm, subj) { MatchArmEntry as x => x; error as err => return err }
+    let done = match lower_block(step.ctx, arm.body) { LowerCtx as c => c; error as err => return err }
+    let closed = close_arm_to(done, merge_id, teko::list::empty(), e.line, e.col)
+    ctx_with(ctx, closed, step.next_block, ctx.env)
+}
+
+/**
+ * lower_match_arms_stmt — fold `lower_match_arm_stmt` over every arm, mirroring
+ * `lower_match_arms_value`'s chaining (A1-5, #382).
+ *
+ * @param LowerCtx ctx  the lowering context positioned at the first arm's test
+ *                      site
+ * @param checker::TExpr e  the enclosing match expression
+ * @param []checker::TArm arms  the match's arms, in order
+ * @param MatchSubj subj  the match's already-lowered subject
+ * @param u32 merge_id  the merge block id every arm jumps to after its body
+ * @return LowerCtx  the context positioned past the last arm's test (the dead
+ *                   fallback)
+ * @throws  when any arm fails to lower
+ */
+fn lower_match_arms_stmt(ctx: LowerCtx, e: checker::TExpr, arms: []checker::TArm, subj: MatchSubj, merge_id: u32) -> LowerCtx | error {
+    mut cur = ctx
+    mut i: u64 = 0
+    loop {
+        if i >= arms.len { break }
+        cur = match lower_match_arm_stmt(cur, e, arms[i], subj, merge_id) { LowerCtx as c => c; error as err => return err }
+        i++
+    }
+    cur
+}
+
+/**
+ * lower_match_stmt — a `match` used as a STATEMENT (a Void-typed `TMatchExpr`,
+ * embedded via `TExprStmt` — mirrors an if-statement): a merge block with ZERO
+ * block-args, each arm jumping to it after running for effect; the dead-code
+ * fallback past the last arm also jumps there unconditionally (A1-5, #382).
+ *
+ * @param LowerCtx ctx  the lowering context positioned right after the subject
+ * @param checker::TExpr e  the match expression (its `.type` is Void)
+ * @param checker::TMatchExpr m  the typed match (subject already lowered; only
+ *                               `.arms` used)
+ * @param MatchSubj subj  the match's already-lowered subject
+ * @return Lowered  the advanced context (positioned at the merge block); `vreg`
+ *                  unused
+ * @throws  when any arm fails to lower
+ */
+fn lower_match_stmt(ctx: LowerCtx, e: checker::TExpr, m: checker::TMatchExpr, subj: MatchSubj) -> Lowered | error {
+    let mergeb = alloc_block(ctx.func)
+    let base_ctx = ctx_with(ctx, mergeb.func, ctx.block_id, ctx.env)
+    let chain = match lower_match_arms_stmt(base_ctx, e, m.arms, subj, mergeb.block_id) { LowerCtx as c => c; error as err => return err }
+    let closed = append_inst(chain.func, chain.block_id, jump_inst(mergeb.block_id, teko::list::empty(), e.line, e.col))
+    Lowered { ctx = ctx_with(ctx, closed, mergeb.block_id, ctx.env); vreg = 0 }
+}
+
+/**
+ * lower_match — a `match` used as either a VALUE (`e.type` is not Void) or a
+ * STATEMENT (`e.type` is Void). Lowers the subject ONCE, then a linear TEST
+ * CHAIN: each arm's pattern test branches into its own body block on success,
+ * or falls through to the NEXT arm's test on failure; mirrors `lower_if_expr`'s
+ * value/void split (A1-5, #382).
+ *
+ * @param LowerCtx ctx  the lowering context to lower the whole match into
+ * @param checker::TExpr e  the match expression node
+ * @param checker::TMatchExpr m  the typed match (subject + arms)
+ * @return Lowered  the advanced context + the match's result VReg (unused for a
+ *                  statement)
+ * @throws  when the subject, any pattern test, or any arm body fails to lower
+ */
+fn lower_match(ctx: LowerCtx, e: checker::TExpr, m: checker::TMatchExpr) -> Lowered | error {
+    let so = match lower_match_subject(ctx, m.subject) { MatchSubjOut as x => x; error as err => return err }
+    if type_is_void(e.type) { return lower_match_stmt(so.ctx, e, m, so.subj) }
+    lower_match_value(so.ctx, e, m, so.subj)
+}
+
 /** is_fat_type — is `t` a fat-pointer-VALUED type (`str` or `[]T`)? Selects the
     ptr+len lowering path (`lower_fat_expr`/`lenv_bind_fat`) over the plain scalar one
     (A1-4, #382). */
@@ -1100,6 +1954,28 @@ fn field_offset_of(layout: LStructLayout, field: str) -> u32 | error {
     loop {
         if i >= layout.field_names.len { break }
         if layout.field_names[i] == field { return layout.field_offsets[i] }
+        i++
+    }
+    error { message = teko::str::concat("native backend N1: unknown field `", field, "` on struct `", layout.name, "` (internal)") }
+}
+
+/**
+ * field_type_of — the machine class of `field` within `layout`, or a NAMED
+ * internal error (mirrors `field_offset_of`; a `match` FieldPattern destructure
+ * reads a field it did not itself type-check, so it needs the LOAD width
+ * straight out of the layout table — A1-5, #382).
+ *
+ * @param LStructLayout layout  the struct's registered layout
+ * @param str field  the field name to look up
+ * @return LType  `field`'s registered machine class
+ * @throws  when `field` is not registered on `layout` (an internal invariant
+ *          break)
+ */
+fn field_type_of(layout: LStructLayout, field: str) -> LType | error {
+    mut i: u64 = 0
+    loop {
+        if i >= layout.field_names.len { break }
+        if layout.field_names[i] == field { return layout.field_types[i] }
         i++
     }
     error { message = teko::str::concat("native backend N1: unknown field `", field, "` on struct `", layout.name, "` (internal)") }
@@ -1491,18 +2367,30 @@ fn lower_block(ctx: LowerCtx, body: []checker::TStatement) -> LowerCtx | error {
     cur
 }
 
-/** lower_function — a TFunction -> an LFunc: materialize each parameter as an LParam into
-    VRegs 0..n_params (bound in the env by name), then lower the body. A body that falls off
-    the end without an explicit return gets an implicit void return (the checker guarantees a
-    value-returning fn returns on every path, so this only fires for void fns). A generic or
-    extern function is out of the N1 subset. `layouts` (A1-3, #382) is the program's
-    struct-layout table — defaulted empty so an arithmetic-only fixture (no structs in
-    scope) need not build one. `rodata` (A1-4, #382) SEEDS the interned-string table with
-    everything an earlier function already interned, and the returned `LoweredFunction`
-    carries the GROWN table back out — the whole-program accumulator `lower_program` threads
-    function-to-function so every string literal gets a distinct symbol across the WHOLE
-    program, not just within one function. */
-pub fn lower_function(f: checker::TFunction, layouts: []LStructLayout = teko::list::empty(), rodata: []LRodata = teko::list::empty()) -> LoweredFunction | error {
+/**
+ * lower_function — a TFunction -> an LFunc: materialize each parameter as an
+ * LParam into VRegs 0..n_params (bound in the env by name), then lower the
+ * body. A body that falls off the end without an explicit return gets an
+ * implicit void return (the checker guarantees a value-returning fn returns on
+ * every path, so this only fires for void fns). A generic or extern function is
+ * out of the N1 subset.
+ *
+ * @param checker::TFunction f  the typed function to lower
+ * @param []LStructLayout layouts  the program's struct-layout table (A1-3, #382
+ *                                 — defaulted empty so an arithmetic-only
+ *                                 fixture need not build one)
+ * @param []LRodata rodata  the whole-program interned-rodata table SEEDED with
+ *                          everything an earlier function already interned
+ *                          (A1-4, #382 — the returned `LoweredFunction` carries
+ *                          the GROWN table back out, so `lower_program` threads
+ *                          it function-to-function)
+ * @param []LEnumInfo enums  the program's enum-member table (A1-5, #382 —
+ *                           defaulted empty so a non-enum fixture need not
+ *                           build one)
+ * @return LoweredFunction  the built `LFunc` + its grown rodata table
+ * @throws  for a generic/extern function, or when its body fails to lower
+ */
+pub fn lower_function(f: checker::TFunction, layouts: []LStructLayout = teko::list::empty(), rodata: []LRodata = teko::list::empty(), enums: []LEnumInfo = teko::list::empty()) -> LoweredFunction | error {
     if f.type_params.len != 0 { return error { message = "native backend N1: generic function not yet lowered (N2)" } }
     if f.is_extern { return error { message = "native backend N1: extern function has no body to lower" } }
     let ptypes = param_ltypes(f.params)
@@ -1515,7 +2403,7 @@ pub fn lower_function(f: checker::TFunction, layouts: []LStructLayout = teko::li
         env = lenv_bind(env, f.params[i].name, i to u32)
         i++
     }
-    let ctx0 = LowerCtx { func = fn0; block_id = 0; env = env; layouts = layouts; rodata = rodata }
+    let ctx0 = LowerCtx { func = fn0; block_id = 0; env = env; layouts = layouts; rodata = rodata; enums = enums }
     let done = match lower_block(ctx0, f.body) { LowerCtx as c => c; error as err => return err }
     match close_function(done, f) { LFunc as func => LoweredFunction { func = func; rodata = done.rodata }; error as err => return err }
 }
@@ -1573,24 +2461,32 @@ fn param_ltypes(params: []parser::Param) -> []LType {
     out
 }
 
-/** lower_program — the module entry: register every declared struct's layout (A1-3,
-    #382), lower every top-level function, and gather the loose top-level statements into a
-    synthesized `main` (the VIRTUAL-MAIN the C backend also builds), returning `int 0` if
-    the statements fall through. Type/use declarations otherwise carry no code. Mirrors the
-    loop of tk_emit_c over prog.items. */
+/**
+ * lower_program — the module entry: register every declared struct's layout
+ * (A1-3, #382), collect every declared enum's members (A1-5, #382), lower every
+ * top-level function, and gather the loose top-level statements into a
+ * synthesized `main` (the VIRTUAL-MAIN the C backend also builds), returning
+ * `int 0` if the statements fall through. Type/use declarations otherwise carry
+ * no code. Mirrors the loop of tk_emit_c over prog.items.
+ *
+ * @param checker::TProgram prog  the whole typed program to lower
+ * @return LModule  the built module (functions + rodata/globals + layouts)
+ * @throws  when any function or the virtual main fails to lower
+ */
 pub fn lower_program(prog: checker::TProgram) -> LModule | error {
     let layouts = collect_struct_layouts(prog)
+    let enums = collect_enums(prog)
     mut m = register_layouts(empty_module(), layouts)
     mut loose: []checker::TStatement = teko::list::empty()
     mut i: u64 = 0
     loop {
         if i >= prog.items.len { break }
-        let step = match lower_item(m, loose, prog.items[i], layouts) { LowerItemOut as x => x; error as err => return err }
+        let step = match lower_item(m, loose, prog.items[i], layouts, enums) { LowerItemOut as x => x; error as err => return err }
         m = step.module
         loose = step.loose
         i++
     }
-    let vmain = match lower_virtual_main(loose, layouts, m.rodata) { LoweredFunction as x => x; error as err => return err }
+    let vmain = match lower_virtual_main(loose, layouts, enums, m.rodata) { LoweredFunction as x => x; error as err => return err }
     add_func(with_rodata(m, vmain.rodata), vmain.func)
 }
 
@@ -1657,40 +2553,127 @@ fn layout_of_fields(name: str, fields: []parser::Field) -> LStructLayout {
     layout_of(name, field_names, field_types)
 }
 
+/**
+ * collect_enums — the name + declared member list of every `enum` type
+ * declaration in `prog`, in program order (A1-5, #382 — a `match` arm's bare
+ * enum-member pattern resolves its ORDINAL through this table). A non-enum type
+ * declaration contributes no entry.
+ *
+ * @param checker::TProgram prog  the whole typed program to scan
+ * @return []LEnumInfo  every declared enum's name + member list, in program
+ *                      order
+ */
+fn collect_enums(prog: checker::TProgram) -> []LEnumInfo {
+    mut out: []LEnumInfo = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= prog.items.len { break }
+        out = collect_enum_item(out, prog.items[i])
+        i++
+    }
+    out
+}
+
+/**
+ * collect_enum_item — accumulate `it`'s enum info onto `acc`, unchanged for
+ * every other item kind.
+ *
+ * @param []LEnumInfo acc  the enum table accumulated so far
+ * @param checker::TItem it  the program item to fold
+ * @return []LEnumInfo  `acc`, with `it`'s enum info appended when applicable
+ */
+fn collect_enum_item(acc: []LEnumInfo, it: checker::TItem) -> []LEnumInfo {
+    match it {
+        parser::TypeDecl as td => collect_enum_decl(acc, td)
+        _ => acc
+    }
+}
+
+/**
+ * collect_enum_decl — accumulate `td`'s member list onto `acc` when its body is
+ * an `EnumBody`; unchanged for any other type-declaration shape
+ * (struct/class/variant/…).
+ *
+ * @param []LEnumInfo acc  the enum table accumulated so far
+ * @param parser::TypeDecl td  the type declaration to fold
+ * @return []LEnumInfo  `acc`, with `td`'s enum info appended when applicable
+ */
+fn collect_enum_decl(acc: []LEnumInfo, td: parser::TypeDecl) -> []LEnumInfo {
+    match td.body {
+        parser::EnumBody as eb => teko::list::push(acc, LEnumInfo { name = td.name; members = eb.members })
+        _ => acc
+    }
+}
+
 /** LowerItemOut — the module + accumulated loose statements after folding one top-level
     item. */
 pub type LowerItemOut = struct { module: LModule; loose: []checker::TStatement }
 
-/** lower_item — fold one TItem: a function lowers into the module (given the program's
-    struct-layout table); a loose statement accumulates for the virtual main; a type/use
-    declaration is skipped. */
-fn lower_item(m: LModule, loose: []checker::TStatement, it: checker::TItem, layouts: []LStructLayout) -> LowerItemOut | error {
+/**
+ * lower_item — fold one TItem: a function lowers into the module (given the
+ * program's struct-layout/enum tables); a loose statement accumulates for the
+ * virtual main; a type/use declaration is skipped.
+ *
+ * @param LModule m  the module accumulated so far
+ * @param []checker::TStatement loose  the loose top-level statements
+ *                                     accumulated so far
+ * @param checker::TItem it  the program item to fold
+ * @param []LStructLayout layouts  the program's struct-layout table
+ * @param []LEnumInfo enums  the program's enum table
+ * @return LowerItemOut  the advanced module + loose-statement list
+ * @throws  when a function item fails to lower
+ */
+fn lower_item(m: LModule, loose: []checker::TStatement, it: checker::TItem, layouts: []LStructLayout, enums: []LEnumInfo) -> LowerItemOut | error {
     match it {
-        checker::TFunction as f => lower_item_function(m, loose, f, layouts)
+        checker::TFunction as f => lower_item_function(m, loose, f, layouts, enums)
         checker::TStatement as s => LowerItemOut { module = m; loose = teko::list::push(loose, s) }
         _ => LowerItemOut { module = m; loose = loose }
     }
 }
 
-/** lower_item_function — lower a top-level function into the module (a `#test` function is
-    skipped — it is not part of the emitted program). Seeds the lowering with the module's
-    CURRENT rodata table and folds the grown table back in (A1-4, #382), so string literals
-    across every function get distinct symbols. */
-fn lower_item_function(m: LModule, loose: []checker::TStatement, f: checker::TFunction, layouts: []LStructLayout) -> LowerItemOut | error {
+/**
+ * lower_item_function — lower a top-level function into the module (a `#test`
+ * function is skipped — it is not part of the emitted program). Seeds the
+ * lowering with the module's CURRENT rodata table and folds the grown table
+ * back in (A1-4, #382), so string literals across every function get distinct
+ * symbols.
+ *
+ * @param LModule m  the module accumulated so far
+ * @param []checker::TStatement loose  the loose top-level statements
+ *                                     accumulated so far
+ * @param checker::TFunction f  the function to lower
+ * @param []LStructLayout layouts  the program's struct-layout table
+ * @param []LEnumInfo enums  the program's enum table
+ * @return LowerItemOut  the advanced module (unchanged `loose`)
+ * @throws  when `f`'s body fails to lower
+ */
+fn lower_item_function(m: LModule, loose: []checker::TStatement, f: checker::TFunction, layouts: []LStructLayout, enums: []LEnumInfo) -> LowerItemOut | error {
     if f.is_test { return LowerItemOut { module = m; loose = loose } }
     if f.is_extern { return LowerItemOut { module = m; loose = loose } }
-    let lf = match lower_function(f, layouts, m.rodata) { LoweredFunction as x => x; error as err => return err }
+    let lf = match lower_function(f, layouts, m.rodata, enums) { LoweredFunction as x => x; error as err => return err }
     LowerItemOut { module = add_func(with_rodata(m, lf.rodata), lf.func); loose = loose }
 }
 
-/** lower_virtual_main — the synthesized `int main()` from the loose top-level statements:
-    lower each, and if control falls through append `%r = const 0; ret %r` (the ABI: main
-    returns int). An explicit `exit(n)` inside diverges, so the trailing return is dead but
-    harmless. `rodata` (A1-4, #382) seeds the interned-string table with everything the
-    program's functions already interned. */
-fn lower_virtual_main(loose: []checker::TStatement, layouts: []LStructLayout, rodata: []LRodata) -> LoweredFunction | error {
+/**
+ * lower_virtual_main — the synthesized `int main()` from the loose top-level
+ * statements: lower each, and if control falls through append `%r = const 0;
+ * ret %r` (the ABI: main returns int). An explicit `exit(n)` inside diverges,
+ * so the trailing return is dead but harmless.
+ *
+ * @param []checker::TStatement loose  the program's loose top-level statements,
+ *                                     in order
+ * @param []LStructLayout layouts  the program's struct-layout table
+ * @param []LEnumInfo enums  the program's enum table
+ * @param []LRodata rodata  the whole-program interned-rodata table seeded with
+ *                          everything the program's functions already interned
+ *                          (A1-4, #382)
+ * @return LoweredFunction  the built virtual-main `LFunc` + its grown rodata
+ *                          table
+ * @throws  when any loose statement fails to lower
+ */
+fn lower_virtual_main(loose: []checker::TStatement, layouts: []LStructLayout, enums: []LEnumInfo, rodata: []LRodata) -> LoweredFunction | error {
     let fn0 = new_func("main", 0, teko::list::empty(), LType::I32)
-    let ctx0 = LowerCtx { func = fn0; block_id = 0; env = empty_lenv(); layouts = layouts; rodata = rodata }
+    let ctx0 = LowerCtx { func = fn0; block_id = 0; env = empty_lenv(); layouts = layouts; rodata = rodata; enums = enums }
     let done = match lower_block(ctx0, loose) { LowerCtx as c => c; error as err => return err }
     match close_virtual_main(done) { LFunc as func => LoweredFunction { func = func; rodata = done.rodata }; error as err => return err }
 }
