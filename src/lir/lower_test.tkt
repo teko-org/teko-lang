@@ -559,3 +559,131 @@ fn lwt_lowers_char_literal_multibyte_to_its_codepoint() {
     teko::assert::str_contains(lwt_lower_expr_text(cl), "%0 = const 233")
 }
 
+/** lwt_strlit — a `TStrLit` node holding `text` (A1-4, #382). */
+fn lwt_strlit(text: str) -> checker::TExpr {
+    checker::TExpr { kind = checker::TStrLit { text = text }; type = checker::Str { }; line = 0; col = 0 }
+}
+
+#test
+fn lwt_lowers_str_literal_interns_rodata_and_a_fat_pair() {
+    let text = lwt_lower_expr_text(lwt_strlit("hi"))
+    teko::assert::str_contains(text, "rodata .Lstr0: [104, 105]")
+    teko::assert::str_contains(text, "%0 = global_addr @.Lstr0")
+    teko::assert::str_contains(text, "%1 = const 2")
+}
+
+/** lwt_len_field — `recv.len`, always `u64`-typed (A1-4, #382). */
+fn lwt_len_field(recv: checker::TExpr) -> checker::TExpr {
+    checker::TExpr { kind = checker::TFieldAccess { receiver = recv; field = "len" }; type = lwt_prim(checker::PrimKind::U64); line = 0; col = 0 }
+}
+
+#test
+fn lwt_lowers_str_len_reads_the_fat_length_with_no_memory_traffic() {
+    let text = lwt_lower_expr_text(lwt_len_field(lwt_strlit("hello")))
+    teko::assert::str_contains(text, "%1 = const 5")
+    teko::assert::is_true(!teko::str::contains(text, "load."))
+}
+
+/** lwt_index_of — `recv[index]`, resolved element type `et` (A1-4, #382). */
+fn lwt_index_of(recv: checker::TExpr, index: checker::TExpr, et: checker::Type) -> checker::TExpr {
+    checker::TExpr { kind = checker::TIndex { receiver = recv; index = index }; type = et; line = 0; col = 0 }
+}
+
+#test
+fn lwt_lowers_str_index_loads_the_byte_off_rodata() {
+    let ix = lwt_index_of(lwt_strlit("abc"), lwt_num_i64(0 to i128), checker::Byte { })
+    let text = lwt_lower_expr_text(lwt_cast(ix, checker::PrimKind::I32))
+    teko::assert::str_contains(text, "rodata .Lstr0: [97, 98, 99]")
+    teko::assert::str_contains(text, "field_addr %0, 0")
+    teko::assert::str_contains(text, "load.i8")
+    teko::assert::str_contains(text, "zext")
+}
+
+/** lwt_interp — a `$"…{…}…"` node over `pieces`/`holes`, always no-spec (A1-4, #382). */
+fn lwt_interp(pieces: []str, holes: []checker::TExpr) -> checker::TExpr {
+    mut specs: []checker::TFSpec = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= holes.len { break }
+        specs = teko::list::push(specs, checker::TFSpec { kind = checker::TFSpecNone { } })
+        i++
+    }
+    checker::TExpr { kind = checker::TInterp { pieces = pieces; holes = holes; specs = specs }; type = checker::Str { }; line = 0; col = 0 }
+}
+
+#test
+fn lwt_lowers_interpolation_as_nested_str_concat_calls() {
+    let pieces = teko::list::push(teko::list::push(teko::list::empty(), "n="), "")
+    let holes = teko::list::push(teko::list::empty(), lwt_num_i64(7 to i128))
+    let text = lwt_lower_expr_text(lwt_interp(pieces, holes))
+    teko::assert::str_contains(text, "rodata .Lstr0: [110, 61]")
+    teko::assert::str_contains(text, "global_addr @.Lstr0")
+    teko::assert::str_contains(text, "call @tk_i64_to_str(")
+    teko::assert::str_contains(text, "call @tk_str_concat(")
+}
+
+/** lwt_in_expr — `lhs in [elems]`, always bool-typed (A1-4, #382). */
+fn lwt_in_expr(lhs: checker::TExpr, elems: []checker::TExpr) -> checker::TExpr {
+    checker::TExpr { kind = checker::TInExpr { lhs = lhs; elems = elems }; type = lwt_prim(checker::PrimKind::Bool); line = 0; col = 0 }
+}
+
+#test
+fn lwt_lowers_in_expr_as_an_eq_chain_ored_together() {
+    let elems = teko::list::push(teko::list::push(teko::list::empty(), lwt_num_i64(1 to i128)), lwt_num_i64(2 to i128))
+    let text = lwt_lower_expr_text(lwt_in_expr(lwt_num_i64(1 to i128), elems))
+    teko::assert::str_contains(text, "icmpeq")
+    teko::assert::str_contains(text, "ior")
+}
+
+/** lwt_optional_var — a `TVar` of `T?` type (A1-4, #382). */
+fn lwt_optional_var(name: str, k: checker::PrimKind) -> checker::TExpr {
+    checker::TExpr { kind = checker::TVar { name = name; is_func = false; func_ns = "" }; type = checker::Optional { inner = lwt_prim(k) }; line = 0; col = 0 }
+}
+
+/** lwt_coalesce — `left ?? right`, resolved type `ty` (A1-4, #382). */
+fn lwt_coalesce(left: checker::TExpr, right: checker::TExpr, ty: checker::Type) -> checker::TExpr {
+    checker::TExpr { kind = checker::TCoalesce { left = left; right = right }; type = ty; line = 0; col = 0 }
+}
+
+#test
+fn lwt_lowers_coalesce_via_branch_and_merge() {
+    let x = lwt_optional_var("x", checker::PrimKind::I64)
+    let co = lwt_coalesce(x, lwt_num_i64(42 to i128), lwt_prim(checker::PrimKind::I64))
+    let params = teko::list::push(teko::list::empty(), lwt_param("x", "i64"))
+    let body = teko::list::push(teko::list::empty(), lwt_ret(co))
+    let f = lwt_fn("pick_default", "teko::demo", params, checker::Prim { kind = checker::PrimKind::I64 }, body)
+    let lf = match lower_function(f) { LoweredFunction as r => r.func; error as err => return }
+    let text = print_lmodule(add_func(empty_module(), lf))
+    teko::assert::str_contains(text, "branch %0, #B1(), #B2()")
+    teko::assert::str_contains(text, "  #B1:\n    jump #B3(%0)")
+    teko::assert::str_contains(text, "  #B2:\n    %2 = const 42\n    jump #B3(%2)")
+    teko::assert::str_contains(text, "  #B3(%1):\n    ret %1")
+}
+
+/** lwt_named_opt_var — a `TVar` of `Named?` type — the safe-field-access receiver shape
+    (A1-4, #382). */
+fn lwt_named_opt_var(name: str, tname: str) -> checker::TExpr {
+    checker::TExpr { kind = checker::TVar { name = name; is_func = false; func_ns = "" }; type = checker::Optional { inner = checker::Named { name = tname } }; line = 0; col = 0 }
+}
+
+/** lwt_safe_field_access — `recv?.field` of resolved (unwrapped) field type `ft` — its
+    `.type` is `ft` widened into `Optional` (A1-4, #382). */
+fn lwt_safe_field_access(recv: checker::TExpr, field: str, ft: checker::Type) -> checker::TExpr {
+    checker::TExpr { kind = checker::TSafeFieldAccess { receiver = recv; field = field }; type = checker::Optional { inner = ft }; line = 0; col = 0 }
+}
+
+#test
+fn lwt_lowers_safe_field_access_via_branch_and_merge() {
+    let p = lwt_named_opt_var("p", "Point")
+    let sfa = lwt_safe_field_access(p, "y", lwt_prim(checker::PrimKind::I64))
+    let params = teko::list::push(teko::list::empty(), lwt_param("p", "Point"))
+    let body = teko::list::push(teko::list::empty(), lwt_ret(sfa))
+    let f = lwt_fn("read_y_opt", "teko::demo", params, checker::Optional { inner = checker::Prim { kind = checker::PrimKind::I64 } }, body)
+    let lf = match lower_function(f, lwt_one_layout(lwt_point_layout())) { LoweredFunction as r => r.func; error as err => return }
+    let text = print_lmodule(add_func(empty_module(), lf))
+    teko::assert::str_contains(text, "branch %0, #B1(), #B2()")
+    teko::assert::str_contains(text, "  #B1:\n    %2 = field_addr %0, 8\n    %3 = load.i64 %2\n    jump #B3(%3)")
+    teko::assert::str_contains(text, "  #B2:\n    %4 = const 0\n    jump #B3(%4)")
+    teko::assert::str_contains(text, "  #B3(%1):\n    ret %1")
+}
+

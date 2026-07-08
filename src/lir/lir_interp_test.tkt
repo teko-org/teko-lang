@@ -412,3 +412,125 @@ fn iwt_struct_mutate_exit() -> LModule {
 fn iwt_f12_field_mutation_is_observed_after_store() {
     teko::assert::is_true(interp_lmodule(iwt_struct_mutate_exit(), "main", iwt_no_args()) == iwt_i128(13))
 }
+
+/** iwt_bytes_of — a str literal's raw UTF-8 as a `[]byte` (the rodata payload the fixtures
+    below hand-build, mirroring `str_to_bytes` — A1-4, #382). */
+fn iwt_bytes_of(s: str) -> []byte {
+    mut out: []byte = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= s.len { break }
+        out = teko::list::push(out, s[i])
+        i++
+    }
+    out
+}
+
+/** iwt_one_rodata — a one-entry rodata table (the shape `lower_str_bytes_fat` interns —
+    A1-4, #382). */
+fn iwt_one_rodata(symbol: str, text: str) -> []LRodata {
+    teko::list::push(teko::list::empty(), LRodata { symbol = symbol; bytes = iwt_bytes_of(text) })
+}
+
+/** iwt_str_len_exit — F13: `exit("hello".len)` hand-built exactly as `lower_len_field`
+    would emit it: a `global_addr` for the (unused, but STILL materialized) pointer half,
+    then the compile-time-known length as a plain constant — proves a module WITH rodata
+    seeds/runs cleanly even when the entry never reads the rodata's bytes (A1-4, #382). */
+fn iwt_str_len_exit() -> LModule {
+    mut f = new_func("main", 0, teko::list::empty(), LType::I32)
+    let ptr = alloc_vreg(f)
+    f = ptr.func
+    f = append_inst(f, 0, global_addr_inst(ptr.vreg, ".Lstr0", 0, 0))
+    let lenv = alloc_vreg(f)
+    f = lenv.func
+    f = append_inst(f, 0, const_int_inst(lenv.vreg, iwt_i128(5), 0, 0))
+    let args = teko::list::push(teko::list::empty(), lenv.vreg)
+    f = append_inst(f, 0, void_call_inst("tk_exit", args, false, 0, 0))
+    let z = alloc_vreg(f)
+    f = z.func
+    f = append_inst(f, 0, const_int_inst(z.vreg, iwt_i128(0), 0, 0))
+    f = append_inst(f, 0, ret_inst(z.vreg, 0, 0))
+    with_rodata(add_func(empty_module(), f), iwt_one_rodata(".Lstr0", "hello"))
+}
+
+#test
+fn iwt_f13_str_len_reads_the_compile_time_length() {
+    teko::assert::is_true(interp_lmodule(iwt_str_len_exit(), "main", iwt_no_args()) == iwt_i128(5))
+}
+
+/** iwt_str_index_exit — F14: `exit("abc"[0] to i32)` hand-built exactly as
+    `lower_index_str` + `lower_cast` would emit it: `global_addr` -> `field_addr` (the
+    constant-folded byte offset) -> `load.i8` -> `zext` (u8->i32 widens) -> exit. Proves
+    `LGlobalAddr`/`seed_rodata`/`rodata_base_of` round-trip a REAL byte read off rodata
+    (A1-4, #382). */
+fn iwt_str_index_exit() -> LModule {
+    mut f = new_func("main", 0, teko::list::empty(), LType::I32)
+    let ptr = alloc_vreg(f)
+    f = ptr.func
+    f = append_inst(f, 0, global_addr_inst(ptr.vreg, ".Lstr0", 0, 0))
+    let addr = alloc_vreg(f)
+    f = addr.func
+    f = append_inst(f, 0, field_addr_inst(addr.vreg, ptr.vreg, 0, 0, 0))
+    let byte = alloc_vreg(f)
+    f = byte.func
+    f = append_inst(f, 0, load_inst(byte.vreg, addr.vreg, LType::I8, 0, 0))
+    let widened = alloc_vreg(f)
+    f = widened.func
+    f = append_inst(f, 0, un_inst(widened.vreg, LUnOp::ZExt, byte.vreg, 0, 0))
+    let args = teko::list::push(teko::list::empty(), widened.vreg)
+    f = append_inst(f, 0, void_call_inst("tk_exit", args, false, 0, 0))
+    let z = alloc_vreg(f)
+    f = z.func
+    f = append_inst(f, 0, const_int_inst(z.vreg, iwt_i128(0), 0, 0))
+    f = append_inst(f, 0, ret_inst(z.vreg, 0, 0))
+    with_rodata(add_func(empty_module(), f), iwt_one_rodata(".Lstr0", "abc"))
+}
+
+#test
+fn iwt_f14_str_index_reads_the_byte_off_rodata() {
+    teko::assert::is_true(interp_lmodule(iwt_str_index_exit(), "main", iwt_no_args()) == iwt_i128(97))
+}
+
+/** iwt_coalesce_exit — F15: `exit(x ?? fallback)` hand-built exactly as `lower_coalesce`
+    would emit it: `x` (a null sentinel 0 when ABSENT, else `present_val`) branches to a
+    merge carrying either `x` itself or the lowered fallback. Proves interp_blocks follows
+    the coalesce's branch/merge shape (a THIRD construct built on the same infra as the
+    if-expr F6 and the chained-compare F7 — A1-4, #382). */
+fn iwt_coalesce_exit(is_present: bool, present_val: i64, fallback: i64) -> LModule {
+    mut f = new_func("main", 0, teko::list::empty(), LType::I32)
+    let xv = alloc_vreg(f)
+    f = xv.func
+    let x_value = if is_present { present_val } else { 0 to i64 }
+    f = append_inst(f, 0, const_int_inst(xv.vreg, iwt_i128(x_value), 0, 0))
+    let thenb = alloc_block(f)
+    f = thenb.func
+    let elseb = alloc_block(f)
+    f = elseb.func
+    let mergeb = alloc_block(f)
+    f = mergeb.func
+    let mp = add_block_param(f, mergeb.block_id)
+    f = mp.func
+    f = append_inst(f, 0, branch_inst(xv.vreg, thenb.block_id, teko::list::empty(), elseb.block_id, teko::list::empty(), 0, 0))
+    f = append_inst(f, thenb.block_id, jump_inst(mergeb.block_id, teko::list::push(teko::list::empty(), xv.vreg), 0, 0))
+    let fb = alloc_vreg(f)
+    f = fb.func
+    f = append_inst(f, elseb.block_id, const_int_inst(fb.vreg, iwt_i128(fallback), 0, 0))
+    f = append_inst(f, elseb.block_id, jump_inst(mergeb.block_id, teko::list::push(teko::list::empty(), fb.vreg), 0, 0))
+    let eargs = teko::list::push(teko::list::empty(), mp.vreg)
+    f = append_inst(f, mergeb.block_id, void_call_inst("tk_exit", eargs, false, 0, 0))
+    let z = alloc_vreg(f)
+    f = z.func
+    f = append_inst(f, mergeb.block_id, const_int_inst(z.vreg, iwt_i128(0), 0, 0))
+    f = append_inst(f, mergeb.block_id, ret_inst(z.vreg, 0, 0))
+    add_func(empty_module(), f)
+}
+
+#test
+fn iwt_f15_coalesce_present_takes_the_left_value() {
+    teko::assert::is_true(interp_lmodule(iwt_coalesce_exit(true, 7, 99), "main", iwt_no_args()) == iwt_i128(7))
+}
+
+#test
+fn iwt_f15_coalesce_absent_takes_the_fallback() {
+    teko::assert::is_true(interp_lmodule(iwt_coalesce_exit(false, 7, 99), "main", iwt_no_args()) == iwt_i128(99))
+}
