@@ -1087,3 +1087,97 @@ fn iwt_lambda_capture_exit() -> LModule {
 fn iwt_f21_lambda_capture_roundtrip() {
     teko::assert::is_true(interp_lmodule(iwt_lambda_capture_exit(), "main", iwt_no_args()) == iwt_i128(42))
 }
+
+/**
+ * iwt_counting_loop_exit — F8 (A1-2, #382): a loop whose head is promoted
+ * with one block-arg for the running counter — `%hp` — bumped by one every
+ * iteration and compared against `target`; the branch's TRUE edge exits
+ * with the bumped value, the FALSE edge loops back carrying it — proving
+ * `interp_blocks` correctly re-enters an already-visited block (a genuine
+ * back-edge, not just a forward merge like F6/F7) and threads a mutated
+ * block-arg across iterations.
+ *
+ * @param i64 target  the counter value that ends the loop
+ * @return LModule  the built one-function module
+ */
+fn iwt_counting_loop_exit(target: i64) -> LModule {
+    mut f = new_func("main", 0, teko::list::empty(), LType::I32)
+    let s0 = alloc_vreg(f)
+    f = s0.func
+    f = append_inst(f, 0, const_int_inst(s0.vreg, iwt_i128(0), 0, 0))
+    let headb = alloc_block(f)
+    f = headb.func
+    let exitb = alloc_block(f)
+    f = exitb.func
+    let hp = add_block_param(f, headb.block_id)
+    f = hp.func
+    let ep = add_block_param(f, exitb.block_id)
+    f = ep.func
+    f = append_inst(f, 0, jump_inst(headb.block_id, teko::list::push(teko::list::empty(), s0.vreg), 0, 0))
+    let one = alloc_vreg(f)
+    f = one.func
+    f = append_inst(f, headb.block_id, const_int_inst(one.vreg, iwt_i128(1), 0, 0))
+    let bumped = alloc_vreg(f)
+    f = bumped.func
+    f = append_inst(f, headb.block_id, bin_inst(bumped.vreg, LBinOp::IAdd, hp.vreg, one.vreg, 0, 0))
+    let tgt = alloc_vreg(f)
+    f = tgt.func
+    f = append_inst(f, headb.block_id, const_int_inst(tgt.vreg, iwt_i128(target), 0, 0))
+    let cmp = alloc_vreg(f)
+    f = cmp.func
+    f = append_inst(f, headb.block_id, bin_inst(cmp.vreg, LBinOp::ICmpEq, bumped.vreg, tgt.vreg, 0, 0))
+    let loop_args = teko::list::push(teko::list::empty(), bumped.vreg)
+    f = append_inst(f, headb.block_id, branch_inst(cmp.vreg, exitb.block_id, loop_args, headb.block_id, loop_args, 0, 0))
+    let eargs = teko::list::push(teko::list::empty(), ep.vreg)
+    f = append_inst(f, exitb.block_id, void_call_inst("tk_exit", eargs, false, 0, 0))
+    let z = alloc_vreg(f)
+    f = z.func
+    f = append_inst(f, exitb.block_id, const_int_inst(z.vreg, iwt_i128(0), 0, 0))
+    f = append_inst(f, exitb.block_id, ret_inst(z.vreg, 0, 0))
+    add_func(empty_module(), f)
+}
+
+#test
+fn iwt_f8_counting_loop_with_break_sums_to_five() {
+    teko::assert::is_true(interp_lmodule(iwt_counting_loop_exit(5), "main", iwt_no_args()) == iwt_i128(5))
+}
+
+#test
+fn iwt_f8_counting_loop_with_break_runs_more_than_one_iteration() {
+    teko::assert::is_true(interp_lmodule(iwt_counting_loop_exit(200), "main", iwt_no_args()) == iwt_i128(200))
+}
+
+/**
+ * iwt_defer_return_exit — F9 (A1-2, #382): `let s=1; defer { s=s+100 };
+ * exit(s)` inlined straight-line (defer has NO LIR op of its own — it is
+ * pure re-lowering of its body at the exit point, so the shape a real
+ * `lower_function` would produce here is exactly this: the `iadd`
+ * appended BEFORE the value that reads it) — proves the deferred
+ * mutation is observable through the value the program exits with.
+ *
+ * @return LModule  the built one-function module
+ */
+fn iwt_defer_return_exit() -> LModule {
+    mut f = new_func("main", 0, teko::list::empty(), LType::I32)
+    let s0 = alloc_vreg(f)
+    f = s0.func
+    f = append_inst(f, 0, const_int_inst(s0.vreg, iwt_i128(1), 0, 0))
+    let hundred = alloc_vreg(f)
+    f = hundred.func
+    f = append_inst(f, 0, const_int_inst(hundred.vreg, iwt_i128(100), 0, 0))
+    let bumped = alloc_vreg(f)
+    f = bumped.func
+    f = append_inst(f, 0, bin_inst(bumped.vreg, LBinOp::IAdd, s0.vreg, hundred.vreg, 0, 0))
+    let eargs = teko::list::push(teko::list::empty(), bumped.vreg)
+    f = append_inst(f, 0, void_call_inst("tk_exit", eargs, false, 0, 0))
+    let z = alloc_vreg(f)
+    f = z.func
+    f = append_inst(f, 0, const_int_inst(z.vreg, iwt_i128(0), 0, 0))
+    f = append_inst(f, 0, ret_inst(z.vreg, 0, 0))
+    add_func(empty_module(), f)
+}
+
+#test
+fn iwt_f9_defer_observed_side_effect_via_return_value() {
+    teko::assert::is_true(interp_lmodule(iwt_defer_return_exit(), "main", iwt_no_args()) == iwt_i128(101))
+}
