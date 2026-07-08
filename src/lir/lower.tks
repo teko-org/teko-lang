@@ -1343,9 +1343,10 @@ fn bind_lambda_captures(ctx: LowerCtx, layout: LStructLayout, captures: []checke
 
 /**
  * close_lambda_body — append the implicit void return when the lifted
- * body's current block did not already terminate (mirrors `close_function`,
- * A1-7 #382 — a fall-through lambda body is out of scope for this phase's
- * fixtures, which always terminate via an explicit `return`).
+ * body's current block did not already terminate (mirrors `close_function`).
+ * A NON-void lambda's block is already terminated by the time this runs —
+ * `lower_fn_body` auto-returns its trailing expression (#421) — so this only
+ * ever fires for a `void`-returning lambda's fall-through (A1-7 #382).
  *
  * @param LowerCtx ctx  the lifted body's lowering context, after its
  *                      statements have been lowered
@@ -1368,10 +1369,10 @@ pub type LoweredLambda = struct { func: LFunc; rodata: []LRodata; lifted: []LFun
  * build_lambda_lfunc — lower a lambda's OWN body into an independent
  * `LFunc`: env-first parameters (`materialize_lambda_params`), each capture
  * bound by loading it off the env parameter (`bind_lambda_captures`), then
- * the body statements (`lower_block`), closed like a function
- * (`close_lambda_body`). Built with a PLACEHOLDER symbol — the caller
- * (`lower_lambda`) renames it once its final lifted id is known (A1-7,
- * #382).
+ * the body statements (`lower_fn_body` — a NON-void lambda auto-returns its
+ * trailing expression, #421), closed like a function (`close_lambda_body`).
+ * Built with a PLACEHOLDER symbol — the caller (`lower_lambda`) renames it
+ * once its final lifted id is known (A1-7, #382).
  *
  * @param checker::TLambda lam  the lambda node to lower
  * @param LStructLayout env_layout  the env aggregate's resolved layout
@@ -1392,7 +1393,7 @@ fn build_lambda_lfunc(lam: checker::TLambda, env_layout: LStructLayout, ctx: Low
     let seed = materialize_lambda_params(seed0, lam, line, col)
     let ctx0 = LowerCtx { func = seed.func; block_id = 0; env = seed.env; layouts = ctx.layouts; rodata = ctx.rodata; enums = ctx.enums; lifted = ctx.lifted }
     let with_captures = match bind_lambda_captures(ctx0, env_layout, lam.captures, line, col) { LowerCtx as c => c; error as err => return err }
-    let done = match lower_block(with_captures, lam.body) { LowerCtx as c => c; error as err => return err }
+    let done = match lower_fn_body(with_captures, lam.body, ltype_of(lam.ret), line, col) { LowerCtx as c => c; error as err => return err }
     LoweredLambda { func = close_lambda_body(done, line, col); rodata = done.rodata; lifted = done.lifted }
 }
 
@@ -3131,12 +3132,44 @@ fn lower_block(ctx: LowerCtx, body: []checker::TStatement) -> LowerCtx | error {
 }
 
 /**
+ * lower_fn_body — lower a function/lambda body, auto-returning its TRAILING
+ * expression as the body's `LRet` value when the body falls through (no
+ * explicit `return` on every path) and the function/lambda's return machine
+ * class is non-void (#421 — mirrors the C backend's `emit_block_tail` /
+ * `emit_exprstmt_tail`: "a block's trailing NORMAL value is the function's
+ * value"). A `void`-returning function/lambda, or an empty body, lowers every
+ * statement plainly (`lower_block`) and leaves the fall-through case to the
+ * caller's own implicit-void-return close (`close_function`/
+ * `close_lambda_body`). Reuses `lower_block_value`'s "last statement is the
+ * tail value" walk, so a trailing `if`/`match` EXPRESSION in tail position
+ * already resolves through the SAME machinery an if-expression arm uses — no
+ * duplicated control-flow logic.
+ *
+ * @param LowerCtx ctx  the lowering context
+ * @param []checker::TStatement body  the function/lambda's statement list
+ * @param LType ret_ty  the function/lambda's return machine class
+ * @param u32 line  the source line to propagate onto a synthesized `ret`
+ * @param u32 col  the source column to propagate onto a synthesized `ret`
+ * @return LowerCtx | error  the context after lowering every statement, its
+ *                           block already closed with the `LRet` when a
+ *                           trailing value was auto-returned
+ */
+fn lower_fn_body(ctx: LowerCtx, body: []checker::TStatement, ret_ty: LType, line: u32, col: u32) -> LowerCtx | error {
+    if body.len == 0 || ltype_is_void(ret_ty) { return lower_block(ctx, body) }
+    let tail = match lower_block_value(ctx, body) { LowerBlockValue as x => x; error as err => return err }
+    if tail.terminated { return tail.ctx }
+    ctx_append(tail.ctx, ret_inst(tail.vreg, line, col))
+}
+
+/**
  * lower_function — a TFunction -> an LFunc: materialize each parameter as an
  * LParam into VRegs 0..n_params (bound in the env by name), then lower the
- * body. A body that falls off the end without an explicit return gets an
- * implicit void return (the checker guarantees a value-returning fn returns on
- * every path, so this only fires for void fns). A generic or extern function is
- * out of the N1 subset.
+ * body (`lower_fn_body`). A NON-void body that falls off the end auto-returns
+ * its trailing expression's value (#421); a `void` body that falls off the
+ * end gets an implicit void return (`close_function`) — the checker
+ * guarantees a value-returning fn returns on every path, so a fall-through
+ * without a trailing value never reaches this function. A generic or extern
+ * function is out of the N1 subset.
  *
  * @param checker::TFunction f  the typed function to lower
  * @param []LStructLayout layouts  the program's struct-layout table (A1-3, #382
@@ -3175,7 +3208,7 @@ pub fn lower_function(f: checker::TFunction, layouts: []LStructLayout = teko::li
         i++
     }
     let ctx0 = LowerCtx { func = fn0; block_id = 0; env = env; layouts = layouts; rodata = rodata; enums = enums; lifted = lifted }
-    let done = match lower_block(ctx0, f.body) { LowerCtx as c => c; error as err => return err }
+    let done = match lower_fn_body(ctx0, f.body, ltype_of(f.return_type), f.line, f.col) { LowerCtx as c => c; error as err => return err }
     match close_function(done, f) { LFunc as func => LoweredFunction { func = func; rodata = done.rodata; lifted = done.lifted }; error as err => return err }
 }
 
