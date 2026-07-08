@@ -316,9 +316,14 @@ pub type LEnumInfo = struct { name: str; members: []str }
  * string literals/interpolation pieces are found, so a fresh entry mid-function
  * is threaded forward like `func`, unlike the read-only `layouts`) + the
  * WHOLE-PROGRAM enum table (A1-5, #382 — read-only, like `layouts`, so a
- * `match` arm's bare enum-member pattern resolves its ordinal).
+ * `match` arm's bare enum-member pattern resolves its ordinal) + the
+ * WHOLE-PROGRAM lifted-function table (A1-7, #382 — grows like `rodata`:
+ * every closure/thunk LFunc a `TLambda`/`TVar.is_func` lowering builds is
+ * folded in here first, then into the module's `funcs` ONCE, at the very end
+ * of `lower_program` — its length also serves as the monotonic id counter a
+ * fresh lifted symbol's name embeds).
  */
-pub type LowerCtx = struct { func: LFunc; block_id: u32; env: LEnv; layouts: []LStructLayout; rodata: []LRodata; enums: []LEnumInfo }
+pub type LowerCtx = struct { func: LFunc; block_id: u32; env: LEnv; layouts: []LStructLayout; rodata: []LRodata; enums: []LEnumInfo; lifted: []LFunc }
 
 /** Lowered — the result of lowering an expression: the updated context + the VReg the
     value lives in. */
@@ -345,7 +350,7 @@ pub type LowerStmtOut = struct { ctx: LowerCtx; terminated: bool }
  * @return LowerCtx  the rebuilt context
  */
 fn ctx_with(ctx: LowerCtx, func: LFunc, block_id: u32, env: LEnv) -> LowerCtx {
-    LowerCtx { func = func; block_id = block_id; env = env; layouts = ctx.layouts; rodata = ctx.rodata; enums = ctx.enums }
+    LowerCtx { func = func; block_id = block_id; env = env; layouts = ctx.layouts; rodata = ctx.rodata; enums = ctx.enums; lifted = ctx.lifted }
 }
 
 /**
@@ -358,7 +363,20 @@ fn ctx_with(ctx: LowerCtx, func: LFunc, block_id: u32, env: LEnv) -> LowerCtx {
  * @return LowerCtx  the rebuilt context
  */
 fn ctx_with_rodata(ctx: LowerCtx, rodata: []LRodata) -> LowerCtx {
-    LowerCtx { func = ctx.func; block_id = ctx.block_id; env = ctx.env; layouts = ctx.layouts; rodata = rodata; enums = ctx.enums }
+    LowerCtx { func = ctx.func; block_id = ctx.block_id; env = ctx.env; layouts = ctx.layouts; rodata = rodata; enums = ctx.enums; lifted = ctx.lifted }
+}
+
+/**
+ * ctx_with_lifted — a copy of `ctx` with its lifted-function table replaced
+ * by `lifted` (everything else unchanged) — the one site a fresh closure/
+ * thunk LFunc threads forward (A1-7, #382).
+ *
+ * @param LowerCtx ctx  the context to rebuild
+ * @param []LFunc lifted  the grown lifted-function table
+ * @return LowerCtx  the rebuilt context
+ */
+fn ctx_with_lifted(ctx: LowerCtx, lifted: []LFunc) -> LowerCtx {
+    LowerCtx { func = ctx.func; block_id = ctx.block_id; env = ctx.env; layouts = ctx.layouts; rodata = ctx.rodata; enums = ctx.enums; lifted = lifted }
 }
 
 /** ctx_alloc — reserve a fresh VReg in the current function, returning it + the advanced
@@ -390,7 +408,7 @@ fn ctx_bind_fat(ctx: LowerCtx, name: str, ptr: u32, len: u32) -> LowerCtx {
 pub fn lower_expr(ctx: LowerCtx, e: checker::TExpr) -> Lowered | error {
     match e.kind {
         checker::TNumber as n => lower_number(ctx, e, n)
-        checker::TVar as v => lower_var(ctx, v)
+        checker::TVar as v => lower_var(ctx, e, v)
         checker::TBinary as b => lower_binary(ctx, e, b)
         checker::TUnary as u => lower_unary(ctx, e, u)
         checker::TCast as c => lower_cast(ctx, e, c)
@@ -412,6 +430,7 @@ pub fn lower_expr(ctx: LowerCtx, e: checker::TExpr) -> Lowered | error {
         checker::TCoalesce as co => lower_coalesce(ctx, e, co)
         checker::TSafeFieldAccess as sfa => lower_safe_field_access(ctx, e, sfa)
         checker::TMatchExpr as mx => lower_match(ctx, e, mx)
+        checker::TLambda as lam => lower_lambda(ctx, e, lam)
         _ => error { message = teko::str::concat("native backend N1: ", texpr_kind_name(e), " not yet lowered (N2)") }
     }
 }
@@ -429,10 +448,10 @@ fn lower_number(ctx: LowerCtx, e: checker::TExpr, n: checker::TNumber) -> Lowere
 }
 
 /** lower_var — a local variable reference -> the VReg it already lives in (no instruction;
-    an SSA-lite value IS the var). A bare fn-as-value (is_func) is out of the N1 subset
-    (closures are N2). */
-fn lower_var(ctx: LowerCtx, v: checker::TVar) -> Lowered | error {
-    if v.is_func { return error { message = "native backend N1: function-as-value not yet lowered (N2)" } }
+    an SSA-lite value IS the var). A bare fn-as-value (`is_func`) instead builds a closure
+    literal wrapping the referenced top-level function (A1-7, #382 — `lower_fn_value`). */
+fn lower_var(ctx: LowerCtx, e: checker::TExpr, v: checker::TVar) -> Lowered | error {
+    if v.is_func { return lower_fn_value(ctx, e, v) }
     let hit = lenv_lookup(ctx.env, v.name)
     if !hit.found { return error { message = teko::str::concat("native backend N1: unbound local `", v.name, "` (internal)") } }
     Lowered { ctx = ctx; vreg = hit.vreg }
@@ -596,23 +615,24 @@ fn lower_compare(ctx: LowerCtx, e: checker::TExpr, cmp: checker::TCompare) -> Lo
 }
 
 /**
- * lower_call — a direct or interface-dispatch call. The `exit`/`panic`
- * builtins map to their runtime symbols (tk_exit / tk_panic_str), matching
- * the C backend; a Teko-Teko call resolves its symbol through the shared
- * mangler (call_ns::name). Arguments lower left-to-right. A DYNAMIC
+ * lower_call — a direct, interface-dispatch, or closure call. The `exit`/
+ * `panic` builtins map to their runtime symbols (tk_exit / tk_panic_str),
+ * matching the C backend; a Teko-Teko call resolves its symbol through the
+ * shared mangler (call_ns::name). Arguments lower left-to-right. A DYNAMIC
  * contract-method call (`is_iface_dispatch`) routes to `lower_iface_call`
- * (A1-6, #382); a closure call is still out of the subset (A1-7).
+ * (A1-6, #382); a call through a local closure VALUE (`is_closure_call`)
+ * routes to `lower_closure_call` (A1-7, #382).
  *
  * @param LowerCtx ctx  the lowering context
  * @param checker::TExpr e  the call expression (for its type + source
  *                          position)
  * @param checker::TCall c  the call node
  * @return Lowered | error  the advanced context + the call's result VReg (0
- *                          for a void call), or a NAMED honest-stop error
- *                          for a closure call
+ *                          for a void call), or a NAMED internal error when
+ *                          the node is malformed
  */
 fn lower_call(ctx: LowerCtx, e: checker::TExpr, c: checker::TCall) -> Lowered | error {
-    if c.is_closure_call { return error { message = "native backend N1: closure call not yet lowered (N2)" } }
+    if c.is_closure_call { return lower_closure_call(ctx, e, c) }
     if c.is_iface_dispatch { return lower_iface_call(ctx, e, c) }
     let lo = match lower_args(ctx, c.args) { LoweredArgs as x => x; error as err => return err }
     lower_call_symbol(lo.ctx, e, c, lo.vregs)
@@ -829,6 +849,579 @@ fn lower_iface_call(ctx: LowerCtx, e: checker::TExpr, c: checker::TCall) -> Lowe
     let tgt = lower_iface_slot(fp.ctx, fp.vtable, c.iface_slot, e.line, e.col)
     let rest = match lower_args_from(tgt.ctx, c.args, 1) { LoweredArgs as x => x; error as err => return err }
     lower_call_indirect(rest.ctx, e, tgt.vreg, iface_call_args(fp.data, rest.vregs))
+}
+
+/**
+ * func_type_of — extract the resolved `Func` signature from a checker type,
+ * or a NAMED internal error for any other shape (the checker guarantees a
+ * bare `is_func` reference's own type IS its declaring function's `Func`
+ * type — a miss here is an invariant break, A1-7 #382).
+ *
+ * @param checker::Type t  the type to narrow
+ * @return checker::Func | error  the resolved signature
+ */
+fn func_type_of(t: checker::Type) -> checker::Func | error {
+    match t {
+        checker::Func as f => f
+        _ => error { message = "native backend N1: function-value reference is not Func-typed (internal)" }
+    }
+}
+
+/**
+ * types_to_ltypes — the machine class of each resolved checker type, in
+ * order (A1-7, #382 — a closure/thunk signature's parameter machine
+ * classes).
+ *
+ * @param []checker::Type ts  the resolved types to map
+ * @return []LType  their machine classes, in order
+ */
+fn types_to_ltypes(ts: []checker::Type) -> []LType {
+    mut out: []LType = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= ts.len { break }
+        out = teko::list::push(out, ltype_of(ts[i]))
+        i++
+    }
+    out
+}
+
+/**
+ * ltype_is_void — is `t` the Void machine class (no value)? (A1-7, #382 — a
+ * closure/thunk with a void return skips the result-carrying `ret`.)
+ *
+ * @param LType t  the machine class to test
+ * @return bool  true for `LType::Void`
+ */
+fn ltype_is_void(t: LType) -> bool {
+    match t { Void => true; _ => false }
+}
+
+/**
+ * env_first_param_types — `Ptr` (the closure's env slot) prepended to
+ * `rest` — the ENV-FIRST ABI every lifted closure/thunk `LFunc` shares
+ * (A1-7, #382): `LCallIndirect` always passes the closure's env as the
+ * first argument, so every callable a closure literal's `fn` field may
+ * point to must accept it, whether or not it actually captures anything.
+ *
+ * @param []LType rest  the callable's OWN declared parameter machine
+ *                       classes
+ * @return []LType  `Ptr` followed by `rest`, in order
+ */
+fn env_first_param_types(rest: []LType) -> []LType {
+    mut out: []LType = teko::list::push(teko::list::empty(), LType::Ptr)
+    mut i: u64 = 0
+    loop {
+        if i >= rest.len { break }
+        out = teko::list::push(out, rest[i])
+        i++
+    }
+    out
+}
+
+/**
+ * lift_thunk_symbol — the deterministic symbol for the Nth fn-as-value
+ * thunk — an assembler-local-style name (`.Lclofn<N>`) that never collides
+ * with a Teko-visible symbol (mirrors `rodata_symbol`, A1-7 #382).
+ *
+ * @param u64 id  the thunk's reserved id (`ctx.lifted.len` at the time it
+ *                was reserved)
+ * @return str  the thunk's symbol
+ */
+fn lift_thunk_symbol(id: u64) -> str {
+    teko::str::concat(".Lclofn", teko::u64_to_str(id))
+}
+
+/**
+ * lift_lambda_symbol — the deterministic symbol for the Nth lifted lambda
+ * body — an assembler-local-style name (`.Lclo<N>`) that never collides
+ * with a Teko-visible symbol (mirrors `rodata_symbol`, A1-7 #382).
+ *
+ * @param u64 id  the lambda's reserved id
+ * @return str  the lifted body's symbol
+ */
+fn lift_lambda_symbol(id: u64) -> str {
+    teko::str::concat(".Lclo", teko::u64_to_str(id))
+}
+
+/**
+ * materialize_thunk_params — append a `param` instruction for every one of
+ * `f0`'s already-declared parameters (env at index 0, the wrapped
+ * function's own parameters after it), in order (A1-7, #382).
+ *
+ * @param LFunc f0  the thunk's (still bodyless) function shell
+ * @param u32 line  the source line to propagate onto each `param`
+ * @param u32 col  the source column to propagate onto each `param`
+ * @return LFunc  `f0` with every parameter materialized into its VReg
+ */
+fn materialize_thunk_params(f0: LFunc, line: u32, col: u32) -> LFunc {
+    mut f = f0
+    mut i: u64 = 0
+    loop {
+        if i >= f.n_params to u64 { break }
+        f = append_inst(f, 0, param_inst(i to u32, i to u32, line, col))
+        i++
+    }
+    f
+}
+
+/**
+ * thunk_forward_args — the VRegs `1..n` (skipping VReg 0, the ignored env
+ * parameter) — the argument list a thunk forwards to the wrapped function
+ * (A1-7, #382).
+ *
+ * @param u64 n  the wrapped function's own arity
+ * @return []u32  the VRegs `1..n`, in order
+ */
+fn thunk_forward_args(n: u64) -> []u32 {
+    mut out: []u32 = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= n { break }
+        out = teko::list::push(out, (i + 1) to u32)
+        i++
+    }
+    out
+}
+
+/**
+ * build_closure_thunk — an ENV-FIRST wrapper `LFunc` around `target_sym`: it
+ * accepts the env-first ABI (`env_first_param_types`), ignores the env
+ * parameter, and forwards its own remaining parameters straight through to
+ * `target_sym` — the bridge a bare top-level function needs to be called
+ * uniformly through `LCallIndirect` alongside a genuinely capturing lambda
+ * (A1-7, #382).
+ *
+ * @param str symbol  the thunk's own (lifted) symbol
+ * @param str target_sym  the wrapped function's already-mangled symbol
+ * @param []LType ptypes  the wrapped function's OWN parameter machine
+ *                        classes
+ * @param LType ret_ty  the wrapped function's return machine class
+ * @param u32 line  the source line to propagate onto every emitted inst
+ * @param u32 col  the source column to propagate onto every emitted inst
+ * @return LFunc  the built thunk
+ */
+fn build_closure_thunk(symbol: str, target_sym: str, ptypes: []LType, ret_ty: LType, line: u32, col: u32) -> LFunc {
+    let all_ptypes = env_first_param_types(ptypes)
+    let f0 = new_func(symbol, (ptypes.len + 1) to u32, all_ptypes, ret_ty)
+    let f1 = materialize_thunk_params(f0, line, col)
+    let args = thunk_forward_args(ptypes.len)
+    if ltype_is_void(ret_ty) {
+        let f2 = append_inst(f1, 0, void_call_inst(target_sym, args, false, line, col))
+        return append_inst(f2, 0, ret_void_inst(line, col))
+    }
+    let r = alloc_vreg(f1)
+    let f2 = append_inst(r.func, 0, call_inst(r.vreg, target_sym, args, false, line, col))
+    append_inst(f2, 0, ret_inst(r.vreg, line, col))
+}
+
+/**
+ * build_closure_literal — a closure VALUE `{fn@0, env@8}` (§5.3): alloca a
+ * 16-byte slot, store `fn_symbol`'s `LFuncAddr` VReg at offset 0 and
+ * `env_vreg` at offset 8 — the RESULT is the slot's base address (a Ptr
+ * VReg), the same memory shape `lower_closure_fatptr` reads back (A1-7,
+ * #382).
+ *
+ * @param LowerCtx ctx  the lowering context
+ * @param str fn_symbol  the callable's (already-mangled or lifted) symbol
+ * @param u32 env_vreg  the closure's env VReg (a null-Ptr const when it
+ *                       captures nothing)
+ * @param u32 line  the source line to propagate onto every emitted inst
+ * @param u32 col  the source column to propagate onto every emitted inst
+ * @return Lowered  the advanced context + the closure struct's base address
+ */
+fn build_closure_literal(ctx: LowerCtx, fn_symbol: str, env_vreg: u32, line: u32, col: u32) -> Lowered {
+    let ptr_size = ltype_size(LType::Ptr)
+    let fnaddr = ctx_alloc(ctx)
+    let with_fnaddr = ctx_append(fnaddr.ctx, func_addr_inst(fnaddr.vreg, fn_symbol, line, col))
+    let base = ctx_alloc(with_fnaddr)
+    let with_alloca = ctx_append(base.ctx, alloca_inst(base.vreg, ptr_size * 2, ptr_size, line, col))
+    let fslot = ctx_alloc(with_alloca)
+    let with_fslot_addr = ctx_append(fslot.ctx, field_addr_inst(fslot.vreg, base.vreg, 0, line, col))
+    let with_fn_store = ctx_append(with_fslot_addr, store_inst(fslot.vreg, fnaddr.vreg, LType::Ptr, line, col))
+    let eslot = ctx_alloc(with_fn_store)
+    let with_eslot_addr = ctx_append(eslot.ctx, field_addr_inst(eslot.vreg, base.vreg, ptr_size, line, col))
+    let with_env_store = ctx_append(with_eslot_addr, store_inst(eslot.vreg, env_vreg, LType::Ptr, line, col))
+    Lowered { ctx = with_env_store; vreg = base.vreg }
+}
+
+/**
+ * lower_fn_value — a bare top-level function used as a VALUE
+ * (`TVar.is_func`): lift an env-first THUNK wrapping it
+ * (`build_closure_thunk`) so it can be called uniformly through
+ * `LCallIndirect` alongside a genuinely capturing lambda, then build the
+ * closure literal `{fn=thunk, env=null}` — mirrors the C backend's
+ * `(tk_closure){ &<fn>, (void*)0 }` (`codegen.tks:5093-5096`), substituting
+ * the thunk for the raw function address so the ABI stays uniform (A1-7,
+ * #382).
+ *
+ * @param LowerCtx ctx  the lowering context
+ * @param checker::TExpr e  the var expression (its type is the referenced
+ *                          function's `Func` signature)
+ * @param checker::TVar v  the fn-as-value var node
+ * @return Lowered | error  the advanced context + the closure literal's base
+ *                          address, or a NAMED internal error
+ */
+fn lower_fn_value(ctx: LowerCtx, e: checker::TExpr, v: checker::TVar) -> Lowered | error {
+    let sig = match func_type_of(e.type) { checker::Func as f => f; error as err => return err }
+    let target_sym = mangle_fn_symbol(v.func_ns, v.name)
+    let ptypes = types_to_ltypes(sig.params)
+    let ret_ty = ltype_of(sig.ret)
+    let id = ctx.lifted.len
+    let thunk_sym = lift_thunk_symbol(id)
+    let thunk = build_closure_thunk(thunk_sym, target_sym, ptypes, ret_ty, e.line, e.col)
+    let ctx2 = ctx_with_lifted(ctx, teko::list::push(ctx.lifted, thunk))
+    let nullo = ctx_alloc(ctx2)
+    let with_null = ctx_append(nullo.ctx, const_int_inst(nullo.vreg, 0 to i128, e.line, e.col))
+    build_closure_literal(with_null, thunk_sym, nullo.vreg, e.line, e.col)
+}
+
+/**
+ * ClosureFatPtr — the two loaded halves of a closure value's `{fn@0, env@8}`
+ * memory layout (§5.3): the callable's function-address VReg and its
+ * captured-environment VReg. Reuses `lower_iface_fatptr`'s load sequence — a
+ * closure and an interface receiver share the identical two-Ptr-field shape
+ * (its `data`/`vtable` become this type's `target`/`env`).
+ *
+ * @since #382 A1-7
+ */
+pub type ClosureFatPtr = struct { ctx: LowerCtx; target: u32; env: u32 }
+
+/**
+ * lower_closure_fatptr — load both halves of a closure value's `{fn@0,
+ * env@8}` memory layout at address `base`, reusing `lower_iface_fatptr`'s
+ * load sequence (A1-7, #382).
+ *
+ * @param LowerCtx ctx  the lowering context
+ * @param u32 base  the closure's base address (a Ptr VReg)
+ * @param u32 line  the source line to propagate onto every emitted inst
+ * @param u32 col  the source column to propagate onto every emitted inst
+ * @return ClosureFatPtr  the advanced context + the loaded target/env VRegs
+ */
+fn lower_closure_fatptr(ctx: LowerCtx, base: u32, line: u32, col: u32) -> ClosureFatPtr {
+    let fp = lower_iface_fatptr(ctx, base, line, col)
+    ClosureFatPtr { ctx = fp.ctx; target = fp.data; env = fp.vtable }
+}
+
+/**
+ * closure_call_args — the indirect-call argument list: `env` prepended to
+ * `rest`, in order — mirrors `iface_call_args`'s `data`-first shape, but for
+ * a closure's env slot (A1-7, #382).
+ *
+ * @param u32 env  the closure's env VReg (goes first)
+ * @param []u32 rest  the remaining (already-lowered) argument VRegs
+ * @return []u32  `env` followed by `rest`, in order
+ */
+fn closure_call_args(env: u32, rest: []u32) -> []u32 {
+    mut out: []u32 = teko::list::push(teko::list::empty(), env)
+    mut i: u64 = 0
+    loop {
+        if i >= rest.len { break }
+        out = teko::list::push(out, rest[i])
+        i++
+    }
+    out
+}
+
+/**
+ * lower_closure_call — a call through a LOCAL closure VALUE
+ * (`TCall.is_closure_call`): the callee's last path segment names the local
+ * (mirrors the C backend's `emit_closure_call`, which reads the same
+ * identifier) — load its `{fn, env}` halves, then `LCallIndirect` through
+ * `fn` with `env` prepended to the remaining (already-lowered) arguments
+ * (A1-7, #382).
+ *
+ * @param LowerCtx ctx  the lowering context
+ * @param checker::TExpr e  the call expression (for its type + source
+ *                          position)
+ * @param checker::TCall c  the closure-call node (`c.callee`'s last segment
+ *                          names the local closure variable)
+ * @return Lowered | error  the advanced context + the call's result VReg (0
+ *                          for a void call), or a NAMED internal error when
+ *                          the node is malformed
+ */
+fn lower_closure_call(ctx: LowerCtx, e: checker::TExpr, c: checker::TCall) -> Lowered | error {
+    if c.callee.segments.len == 0 { return error { message = "native backend N1: empty closure-call path (internal)" } }
+    let name = c.callee.segments[c.callee.segments.len - 1].name
+    let hit = lenv_lookup(ctx.env, name)
+    if !hit.found { return error { message = teko::str::concat("native backend N1: unbound closure local `", name, "` (internal)") } }
+    let fp = lower_closure_fatptr(ctx, hit.vreg, e.line, e.col)
+    let rest = match lower_args(fp.ctx, c.args) { LoweredArgs as x => x; error as err => return err }
+    lower_call_indirect(rest.ctx, e, fp.target, closure_call_args(fp.env, rest.vregs))
+}
+
+/**
+ * lambda_capture_names — the declared name of each capture, in order (A1-7,
+ * #382 — parallels `lambda_capture_types`, the field list `layout_of`
+ * needs).
+ *
+ * @param []checker::TCapture captures  the lambda's captured-variable list
+ * @return []str  each capture's name, in order
+ */
+fn lambda_capture_names(captures: []checker::TCapture) -> []str {
+    mut out: []str = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= captures.len { break }
+        out = teko::list::push(out, captures[i].name)
+        i++
+    }
+    out
+}
+
+/**
+ * lambda_capture_types — the machine class of each capture, in order
+ * (A1-7, #382 — parallels `lambda_capture_names`).
+ *
+ * @param []checker::TCapture captures  the lambda's captured-variable list
+ * @return []LType  each capture's machine class, in order
+ */
+fn lambda_capture_types(captures: []checker::TCapture) -> []LType {
+    mut out: []LType = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= captures.len { break }
+        out = teko::list::push(out, ltype_of(captures[i].type))
+        i++
+    }
+    out
+}
+
+/**
+ * lambda_env_layout — the declared-order, natural-alignment layout of a
+ * lambda's env aggregate (one field per capture) — reuses `layout_of`, the
+ * same algorithm a `struct` declaration's layout gets (A1-7, #382). The
+ * layout's own name is a fixed debug label: it is never registered into
+ * `ctx.layouts` or looked up by name, only read directly by
+ * `build_lambda_env`/`bind_lambda_captures`.
+ *
+ * @param []checker::TCapture captures  the lambda's captured-variable list
+ * @return LStructLayout  the env aggregate's resolved layout
+ */
+fn lambda_env_layout(captures: []checker::TCapture) -> LStructLayout {
+    layout_of("<closure-env>", lambda_capture_names(captures), lambda_capture_types(captures))
+}
+
+/**
+ * store_lambda_captures — store each capture's CURRENT (already-lowered)
+ * value into the env aggregate at `base`, at its layout offset — mirrors
+ * `store_struct_fields`, but sources each field from the ENCLOSING scope's
+ * already-bound local (`lenv_lookup`) rather than re-lowering an expression
+ * (A1-7, #382).
+ *
+ * @param LowerCtx ctx  the lowering context (the ENCLOSING scope — every
+ *                      capture must already be bound in `ctx.env`)
+ * @param u32 base  the env aggregate's base address (a Ptr VReg)
+ * @param LStructLayout layout  the env aggregate's resolved layout
+ * @param []checker::TCapture captures  the lambda's captured-variable list
+ * @param u32 line  the source line to propagate onto every emitted inst
+ * @param u32 col  the source column to propagate onto every emitted inst
+ * @return Lowered | error  the advanced context + `base` (unchanged by the
+ *                          stores), or a NAMED internal error when a capture
+ *                          is unbound
+ */
+fn store_lambda_captures(ctx: LowerCtx, base: u32, layout: LStructLayout, captures: []checker::TCapture, line: u32, col: u32) -> Lowered | error {
+    mut cur = ctx
+    mut i: u64 = 0
+    loop {
+        if i >= captures.len { break }
+        let hit = lenv_lookup(cur.env, captures[i].name)
+        if !hit.found { return error { message = teko::str::concat("native backend N1: unbound capture `", captures[i].name, "` (internal)") } }
+        let off = match field_offset_of(layout, captures[i].name) { u32 as o => o; error as err => return err }
+        let addr = ctx_alloc(cur)
+        let with_addr = ctx_append(addr.ctx, field_addr_inst(addr.vreg, base, off, line, col))
+        cur = ctx_append(with_addr, store_inst(addr.vreg, hit.vreg, ltype_of(captures[i].type), line, col))
+        i++
+    }
+    Lowered { ctx = cur; vreg = base }
+}
+
+/**
+ * build_lambda_env — a lambda's env VALUE: a null Ptr const when it captures
+ * nothing, else an alloca'd aggregate (`lambda_env_layout`) with every
+ * capture's CURRENT value stored in (`store_lambda_captures`) — the address
+ * the lifted body's `bind_lambda_captures` reads back from (A1-7, #382).
+ *
+ * @param LowerCtx ctx  the lowering context (the ENCLOSING scope)
+ * @param LStructLayout layout  the env aggregate's resolved layout
+ * @param []checker::TCapture captures  the lambda's captured-variable list
+ * @param u32 line  the source line to propagate onto every emitted inst
+ * @param u32 col  the source column to propagate onto every emitted inst
+ * @return Lowered | error  the advanced context + the env VReg, or a NAMED
+ *                          internal error when a capture is unbound
+ */
+fn build_lambda_env(ctx: LowerCtx, layout: LStructLayout, captures: []checker::TCapture, line: u32, col: u32) -> Lowered | error {
+    if captures.len == 0 {
+        let r = ctx_alloc(ctx)
+        return Lowered { ctx = ctx_append(r.ctx, const_int_inst(r.vreg, 0 to i128, line, col)); vreg = r.vreg }
+    }
+    let base = ctx_alloc(ctx)
+    let with_alloca = ctx_append(base.ctx, alloca_inst(base.vreg, layout.size, layout.align, line, col))
+    store_lambda_captures(with_alloca, base.vreg, layout, captures, line, col)
+}
+
+/**
+ * lambda_param_ltypes — the machine class of a lambda's OWN declared
+ * parameters, in order (A1-7, #382 — parallels `param_ltypes`, but reading
+ * a `TLambdaParam`'s resolved type rather than a syntactic annotation).
+ *
+ * @param []checker::TLambdaParam params  the lambda's declared parameters
+ * @return []LType  each parameter's machine class, in order
+ */
+fn lambda_param_ltypes(params: []checker::TLambdaParam) -> []LType {
+    mut out: []LType = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= params.len { break }
+        out = teko::list::push(out, ltype_of(params[i].type))
+        i++
+    }
+    out
+}
+
+/** ParamSeed — a lifted lambda body's freshly-materialized function shell +
+    the local env binding its own declared parameters (name -> VReg, index
+    shifted by one past the env slot) (A1-7, #382). */
+pub type ParamSeed = struct { func: LFunc; env: LEnv }
+
+/**
+ * materialize_lambda_params — append a `param` instruction for the lifted
+ * body's env-first parameter list (env at VReg 0, then each declared
+ * parameter), binding every declared parameter's name into a fresh local
+ * env (A1-7, #382).
+ *
+ * @param LFunc f0  the lifted body's (still bodyless) function shell
+ * @param checker::TLambda lam  the lambda node (its declared parameters)
+ * @param u32 line  the source line to propagate onto every emitted inst
+ * @param u32 col  the source column to propagate onto every emitted inst
+ * @return ParamSeed  the advanced function + the local env binding the
+ *                     declared parameters
+ */
+fn materialize_lambda_params(f0: LFunc, lam: checker::TLambda, line: u32, col: u32) -> ParamSeed {
+    mut f = append_inst(f0, 0, param_inst(0, 0, line, col))
+    mut env = empty_lenv()
+    mut i: u64 = 0
+    loop {
+        if i >= lam.params.len { break }
+        let idx = (i + 1) to u32
+        f = append_inst(f, 0, param_inst(idx, idx, line, col))
+        env = lenv_bind(env, lam.params[i].name, idx)
+        i++
+    }
+    ParamSeed { func = f; env = env }
+}
+
+/**
+ * bind_lambda_captures — extend `ctx`'s local env with every capture,
+ * loading each one's value out of VReg 0 (the lifted body's env parameter)
+ * at its layout offset (A1-7, #382).
+ *
+ * @param LowerCtx ctx  the lifted body's OWN lowering context
+ * @param LStructLayout layout  the env aggregate's resolved layout
+ * @param []checker::TCapture captures  the lambda's captured-variable list
+ * @param u32 line  the source line to propagate onto every emitted inst
+ * @param u32 col  the source column to propagate onto every emitted inst
+ * @return LowerCtx | error  the extended context, or a NAMED internal error
+ *                           when the layout is malformed
+ */
+fn bind_lambda_captures(ctx: LowerCtx, layout: LStructLayout, captures: []checker::TCapture, line: u32, col: u32) -> LowerCtx | error {
+    mut cur = ctx
+    mut i: u64 = 0
+    loop {
+        if i >= captures.len { break }
+        let off = match field_offset_of(layout, captures[i].name) { u32 as o => o; error as err => return err }
+        let ty = match field_type_of(layout, captures[i].name) { LType as t => t; error as err => return err }
+        let addr = ctx_alloc(cur)
+        let with_addr = ctx_append(addr.ctx, field_addr_inst(addr.vreg, 0, off, line, col))
+        let val = ctx_alloc(with_addr)
+        let with_val = ctx_append(val.ctx, load_inst(val.vreg, addr.vreg, ty, line, col))
+        cur = ctx_bind(with_val, captures[i].name, val.vreg)
+        i++
+    }
+    cur
+}
+
+/**
+ * close_lambda_body — append the implicit void return when the lifted
+ * body's current block did not already terminate (mirrors `close_function`,
+ * A1-7 #382 — a fall-through lambda body is out of scope for this phase's
+ * fixtures, which always terminate via an explicit `return`).
+ *
+ * @param LowerCtx ctx  the lifted body's lowering context, after its
+ *                      statements have been lowered
+ * @param u32 line  the source line to propagate onto a synthesized `ret`
+ * @param u32 col  the source column to propagate onto a synthesized `ret`
+ * @return LFunc  the closed function
+ */
+fn close_lambda_body(ctx: LowerCtx, line: u32, col: u32) -> LFunc {
+    if block_terminated(ctx.func, ctx.block_id) { return ctx.func }
+    ctx_append(ctx, ret_void_inst(line, col)).func
+}
+
+/** LoweredLambda — a lifted lambda body's (placeholder-symbol) `LFunc` + the
+    rodata/lifted tables it (and everything lowered before it) grew (A1-7,
+    #382 — mirrors `LoweredFunction`, plus the lifted-function table so a
+    NESTED lambda inside this one's own body is not lost). */
+pub type LoweredLambda = struct { func: LFunc; rodata: []LRodata; lifted: []LFunc }
+
+/**
+ * build_lambda_lfunc — lower a lambda's OWN body into an independent
+ * `LFunc`: env-first parameters (`materialize_lambda_params`), each capture
+ * bound by loading it off the env parameter (`bind_lambda_captures`), then
+ * the body statements (`lower_block`), closed like a function
+ * (`close_lambda_body`). Built with a PLACEHOLDER symbol — the caller
+ * (`lower_lambda`) renames it once its final lifted id is known (A1-7,
+ * #382).
+ *
+ * @param checker::TLambda lam  the lambda node to lower
+ * @param LStructLayout env_layout  the env aggregate's resolved layout
+ * @param LowerCtx ctx  the ENCLOSING lowering context (its layouts/rodata/
+ *                      enums/lifted tables seed the lifted body's own; its
+ *                      OWN func/env/block_id are NOT reused)
+ * @param u32 line  the source line to propagate onto every synthesized inst
+ * @param u32 col  the source column to propagate onto every synthesized
+ *                 inst
+ * @return LoweredLambda | error  the built (placeholder-named) LFunc + the
+ *                                grown rodata/lifted tables, or an error
+ *                                when the body fails to lower
+ */
+fn build_lambda_lfunc(lam: checker::TLambda, env_layout: LStructLayout, ctx: LowerCtx, line: u32, col: u32) -> LoweredLambda | error {
+    let ptypes = lambda_param_ltypes(lam.params)
+    let all_ptypes = env_first_param_types(ptypes)
+    let seed0 = new_func("", (lam.params.len + 1) to u32, all_ptypes, ltype_of(lam.ret))
+    let seed = materialize_lambda_params(seed0, lam, line, col)
+    let ctx0 = LowerCtx { func = seed.func; block_id = 0; env = seed.env; layouts = ctx.layouts; rodata = ctx.rodata; enums = ctx.enums; lifted = ctx.lifted }
+    let with_captures = match bind_lambda_captures(ctx0, env_layout, lam.captures, line, col) { LowerCtx as c => c; error as err => return err }
+    let done = match lower_block(with_captures, lam.body) { LowerCtx as c => c; error as err => return err }
+    LoweredLambda { func = close_lambda_body(done, line, col); rodata = done.rodata; lifted = done.lifted }
+}
+
+/**
+ * lower_lambda — a closure LITERAL (`TLambda`): build the env aggregate
+ * from the ENCLOSING scope's captures (`build_lambda_env`), lower the
+ * lambda's OWN body into a lifted `LFunc` (`build_lambda_lfunc`) — its FINAL
+ * id is `built.lifted.len` (reserved AFTER any nested lambda inside its own
+ * body, so ids never collide), so it is renamed (`rename_lfunc`) only now —
+ * then build the closure literal `{fn=lifted, env}` — mirrors the C
+ * backend's `(tk_closure){ &__tkclo_<id>, env }` (`codegen.tks:5177-5178`)
+ * (A1-7, #382).
+ *
+ * @param LowerCtx ctx  the lowering context (the ENCLOSING scope)
+ * @param checker::TExpr e  the lambda expression (for its source position)
+ * @param checker::TLambda lam  the lambda node to lower
+ * @return Lowered | error  the advanced context + the closure literal's base
+ *                          address, or an error when the body fails to
+ *                          lower
+ */
+fn lower_lambda(ctx: LowerCtx, e: checker::TExpr, lam: checker::TLambda) -> Lowered | error {
+    let env_layout = lambda_env_layout(lam.captures)
+    let envo = match build_lambda_env(ctx, env_layout, lam.captures, e.line, e.col) { Lowered as x => x; error as err => return err }
+    let built = match build_lambda_lfunc(lam, env_layout, envo.ctx, e.line, e.col) { LoweredLambda as x => x; error as err => return err }
+    let id = built.lifted.len
+    let fn_sym = lift_lambda_symbol(id)
+    let named = rename_lfunc(built.func, fn_sym)
+    let ctx2 = ctx_with_lifted(ctx_with_rodata(envo.ctx, built.rodata), teko::list::push(built.lifted, named))
+    build_closure_literal(ctx2, fn_sym, envo.vreg, e.line, e.col)
 }
 
 /** lower_stmt — lower one statement, extending the env on a `let` and signaling block
@@ -2557,10 +3150,18 @@ fn lower_block(ctx: LowerCtx, body: []checker::TStatement) -> LowerCtx | error {
  * @param []LEnumInfo enums  the program's enum-member table (A1-5, #382 —
  *                           defaulted empty so a non-enum fixture need not
  *                           build one)
- * @return LoweredFunction  the built `LFunc` + its grown rodata table
- * @throws  for a generic/extern function, or when its body fails to lower
+ * @param []LFunc lifted  the whole-program lifted closure/thunk-function
+ *                        table SEEDED with everything an earlier function
+ *                        already lifted (A1-7, #382 — the returned
+ *                        `LoweredFunction` carries the GROWN table back out,
+ *                        so `lower_program` threads it function-to-function,
+ *                        exactly like `rodata`)
+ * @return LoweredFunction | error  the built `LFunc` + its grown rodata/
+ *                                  lifted tables; the `error` arm for a
+ *                                  generic/extern function, or when its body
+ *                                  fails to lower
  */
-pub fn lower_function(f: checker::TFunction, layouts: []LStructLayout = teko::list::empty(), rodata: []LRodata = teko::list::empty(), enums: []LEnumInfo = teko::list::empty()) -> LoweredFunction | error {
+pub fn lower_function(f: checker::TFunction, layouts: []LStructLayout = teko::list::empty(), rodata: []LRodata = teko::list::empty(), enums: []LEnumInfo = teko::list::empty(), lifted: []LFunc = teko::list::empty()) -> LoweredFunction | error {
     if f.type_params.len != 0 { return error { message = "native backend N1: generic function not yet lowered (N2)" } }
     if f.is_extern { return error { message = "native backend N1: extern function has no body to lower" } }
     let ptypes = param_ltypes(f.params)
@@ -2573,15 +3174,16 @@ pub fn lower_function(f: checker::TFunction, layouts: []LStructLayout = teko::li
         env = lenv_bind(env, f.params[i].name, i to u32)
         i++
     }
-    let ctx0 = LowerCtx { func = fn0; block_id = 0; env = env; layouts = layouts; rodata = rodata; enums = enums }
+    let ctx0 = LowerCtx { func = fn0; block_id = 0; env = env; layouts = layouts; rodata = rodata; enums = enums; lifted = lifted }
     let done = match lower_block(ctx0, f.body) { LowerCtx as c => c; error as err => return err }
-    match close_function(done, f) { LFunc as func => LoweredFunction { func = func; rodata = done.rodata }; error as err => return err }
+    match close_function(done, f) { LFunc as func => LoweredFunction { func = func; rodata = done.rodata; lifted = done.lifted }; error as err => return err }
 }
 
-/** LoweredFunction — an `LFunc` + the interned-rodata table it (and everything lowered
-    before it) grew (A1-4, #382) — `lower_function`'s return so the whole-program symbol
-    numbering stays contiguous. */
-pub type LoweredFunction = struct { func: LFunc; rodata: []LRodata }
+/** LoweredFunction — an `LFunc` + the interned-rodata table (A1-4, #382) and
+    the lifted closure/thunk-function table (A1-7, #382) it (and everything
+    lowered before it) grew — `lower_function`'s return so the whole-program
+    symbol numbering stays contiguous. */
+pub type LoweredFunction = struct { func: LFunc; rodata: []LRodata; lifted: []LFunc }
 
 /** close_function — append the implicit void return if the body did not terminate the block
     (a void fn falling off the end), then return the built LFunc. */
@@ -2640,24 +3242,52 @@ fn param_ltypes(params: []parser::Param) -> []LType {
  * no code. Mirrors the loop of tk_emit_c over prog.items.
  *
  * @param checker::TProgram prog  the whole typed program to lower
- * @return LModule  the built module (functions + rodata/globals + layouts)
- * @throws  when any function or the virtual main fails to lower
+ * @return LModule | error  the built module (functions + rodata/globals/
+ *                          layouts, every lifted closure/thunk folded in,
+ *                          A1-7 #382); the `error` arm when any function or
+ *                          the virtual main fails to lower
  */
 pub fn lower_program(prog: checker::TProgram) -> LModule | error {
     let layouts = collect_struct_layouts(prog)
     let enums = collect_enums(prog)
     mut m = register_layouts(empty_module(), layouts)
     mut loose: []checker::TStatement = teko::list::empty()
+    mut lifted: []LFunc = teko::list::empty()
     mut i: u64 = 0
     loop {
         if i >= prog.items.len { break }
-        let step = match lower_item(m, loose, prog.items[i], layouts, enums) { LowerItemOut as x => x; error as err => return err }
+        let step = match lower_item(m, loose, prog.items[i], layouts, enums, lifted) { LowerItemOut as x => x; error as err => return err }
         m = step.module
         loose = step.loose
+        lifted = step.lifted
         i++
     }
-    let vmain = match lower_virtual_main(loose, layouts, enums, m.rodata) { LoweredFunction as x => x; error as err => return err }
-    add_func(with_rodata(m, vmain.rodata), vmain.func)
+    let vmain = match lower_virtual_main(loose, layouts, enums, m.rodata, lifted) { LoweredFunction as x => x; error as err => return err }
+    fold_lifted_funcs(add_func(with_rodata(m, vmain.rodata), vmain.func), vmain.lifted)
+}
+
+/**
+ * fold_lifted_funcs — append every lifted closure/thunk `LFunc` (accumulated
+ * across the WHOLE program, A1-7, #382) into `m.funcs`, ONCE, after every
+ * top-level function AND the virtual main have finished lowering — folding
+ * per-function instead would re-add earlier entries on every subsequent
+ * function (the table is CUMULATIVE, like `rodata`).
+ *
+ * @param LModule m  the module accumulated so far (every real top-level
+ *                   function + the virtual main already folded in)
+ * @param []LFunc lifted  the whole-program lifted closure/thunk-function
+ *                        table
+ * @return LModule  `m` with every entry of `lifted` appended to its `funcs`
+ */
+fn fold_lifted_funcs(m: LModule, lifted: []LFunc) -> LModule {
+    mut cur = m
+    mut i: u64 = 0
+    loop {
+        if i >= lifted.len { break }
+        cur = add_func(cur, lifted[i])
+        i++
+    }
+    cur
 }
 
 /** register_layouts — return a copy of `m` with every entry of `layouts` appended to its
@@ -2775,9 +3405,9 @@ fn collect_enum_decl(acc: []LEnumInfo, td: parser::TypeDecl) -> []LEnumInfo {
     }
 }
 
-/** LowerItemOut — the module + accumulated loose statements after folding one top-level
-    item. */
-pub type LowerItemOut = struct { module: LModule; loose: []checker::TStatement }
+/** LowerItemOut — the module + accumulated loose statements + the WHOLE-PROGRAM
+    lifted closure/thunk-function table (A1-7, #382) after folding one top-level item. */
+pub type LowerItemOut = struct { module: LModule; loose: []checker::TStatement; lifted: []LFunc }
 
 /**
  * lower_item — fold one TItem: a function lowers into the module (given the
@@ -2790,14 +3420,17 @@ pub type LowerItemOut = struct { module: LModule; loose: []checker::TStatement }
  * @param checker::TItem it  the program item to fold
  * @param []LStructLayout layouts  the program's struct-layout table
  * @param []LEnumInfo enums  the program's enum table
- * @return LowerItemOut  the advanced module + loose-statement list
- * @throws  when a function item fails to lower
+ * @param []LFunc lifted  the whole-program lifted closure/thunk-function
+ *                        table accumulated so far (A1-7, #382)
+ * @return LowerItemOut | error  the advanced module + loose-statement/lifted
+ *                               lists; the `error` arm when a function item
+ *                               fails to lower
  */
-fn lower_item(m: LModule, loose: []checker::TStatement, it: checker::TItem, layouts: []LStructLayout, enums: []LEnumInfo) -> LowerItemOut | error {
+fn lower_item(m: LModule, loose: []checker::TStatement, it: checker::TItem, layouts: []LStructLayout, enums: []LEnumInfo, lifted: []LFunc) -> LowerItemOut | error {
     match it {
-        checker::TFunction as f => lower_item_function(m, loose, f, layouts, enums)
-        checker::TStatement as s => LowerItemOut { module = m; loose = teko::list::push(loose, s) }
-        _ => LowerItemOut { module = m; loose = loose }
+        checker::TFunction as f => lower_item_function(m, loose, f, layouts, enums, lifted)
+        checker::TStatement as s => LowerItemOut { module = m; loose = teko::list::push(loose, s); lifted = lifted }
+        _ => LowerItemOut { module = m; loose = loose; lifted = lifted }
     }
 }
 
@@ -2806,7 +3439,7 @@ fn lower_item(m: LModule, loose: []checker::TStatement, it: checker::TItem, layo
  * function is skipped — it is not part of the emitted program). Seeds the
  * lowering with the module's CURRENT rodata table and folds the grown table
  * back in (A1-4, #382), so string literals across every function get distinct
- * symbols.
+ * symbols; the lifted closure/thunk table threads the same way (A1-7, #382).
  *
  * @param LModule m  the module accumulated so far
  * @param []checker::TStatement loose  the loose top-level statements
@@ -2814,14 +3447,17 @@ fn lower_item(m: LModule, loose: []checker::TStatement, it: checker::TItem, layo
  * @param checker::TFunction f  the function to lower
  * @param []LStructLayout layouts  the program's struct-layout table
  * @param []LEnumInfo enums  the program's enum table
- * @return LowerItemOut  the advanced module (unchanged `loose`)
- * @throws  when `f`'s body fails to lower
+ * @param []LFunc lifted  the whole-program lifted closure/thunk-function
+ *                        table accumulated so far (A1-7, #382)
+ * @return LowerItemOut | error  the advanced module (unchanged `loose`) + the
+ *                               grown lifted table; the `error` arm when
+ *                               `f`'s body fails to lower
  */
-fn lower_item_function(m: LModule, loose: []checker::TStatement, f: checker::TFunction, layouts: []LStructLayout, enums: []LEnumInfo) -> LowerItemOut | error {
-    if f.is_test { return LowerItemOut { module = m; loose = loose } }
-    if f.is_extern { return LowerItemOut { module = m; loose = loose } }
-    let lf = match lower_function(f, layouts, m.rodata, enums) { LoweredFunction as x => x; error as err => return err }
-    LowerItemOut { module = add_func(with_rodata(m, lf.rodata), lf.func); loose = loose }
+fn lower_item_function(m: LModule, loose: []checker::TStatement, f: checker::TFunction, layouts: []LStructLayout, enums: []LEnumInfo, lifted: []LFunc) -> LowerItemOut | error {
+    if f.is_test { return LowerItemOut { module = m; loose = loose; lifted = lifted } }
+    if f.is_extern { return LowerItemOut { module = m; loose = loose; lifted = lifted } }
+    let lf = match lower_function(f, layouts, m.rodata, enums, lifted) { LoweredFunction as x => x; error as err => return err }
+    LowerItemOut { module = add_func(with_rodata(m, lf.rodata), lf.func); loose = loose; lifted = lf.lifted }
 }
 
 /**
@@ -2837,15 +3473,17 @@ fn lower_item_function(m: LModule, loose: []checker::TStatement, f: checker::TFu
  * @param []LRodata rodata  the whole-program interned-rodata table seeded with
  *                          everything the program's functions already interned
  *                          (A1-4, #382)
- * @return LoweredFunction  the built virtual-main `LFunc` + its grown rodata
- *                          table
- * @throws  when any loose statement fails to lower
+ * @param []LFunc lifted  the whole-program lifted closure/thunk-function
+ *                        table accumulated so far (A1-7, #382)
+ * @return LoweredFunction | error  the built virtual-main `LFunc` + its grown
+ *                                  rodata/lifted tables; the `error` arm when
+ *                                  any loose statement fails to lower
  */
-fn lower_virtual_main(loose: []checker::TStatement, layouts: []LStructLayout, enums: []LEnumInfo, rodata: []LRodata) -> LoweredFunction | error {
+fn lower_virtual_main(loose: []checker::TStatement, layouts: []LStructLayout, enums: []LEnumInfo, rodata: []LRodata, lifted: []LFunc) -> LoweredFunction | error {
     let fn0 = new_func("main", 0, teko::list::empty(), LType::I32)
-    let ctx0 = LowerCtx { func = fn0; block_id = 0; env = empty_lenv(); layouts = layouts; rodata = rodata; enums = enums }
+    let ctx0 = LowerCtx { func = fn0; block_id = 0; env = empty_lenv(); layouts = layouts; rodata = rodata; enums = enums; lifted = lifted }
     let done = match lower_block(ctx0, loose) { LowerCtx as c => c; error as err => return err }
-    match close_virtual_main(done) { LFunc as func => LoweredFunction { func = func; rodata = done.rodata }; error as err => return err }
+    match close_virtual_main(done) { LFunc as func => LoweredFunction { func = func; rodata = done.rodata; lifted = done.lifted }; error as err => return err }
 }
 
 /** close_virtual_main — append `const 0; ret %r` when the body did not already terminate. */
