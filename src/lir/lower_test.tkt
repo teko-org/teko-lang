@@ -37,6 +37,24 @@ fn lwt_cast(inner: checker::TExpr, k: checker::PrimKind) -> checker::TExpr {
     checker::TExpr { kind = checker::TCast { expr = inner }; type = lwt_prim(k); line = 0; col = 0 }
 }
 
+/** lwt_cmp_term — one adjacent term of a TCompare chain (`op operand`). */
+fn lwt_cmp_term(op: lexer::TokenKind, e: checker::TExpr) -> checker::TCmpTerm { checker::TCmpTerm { op = op; operand = e } }
+
+/** lwt_cmp — a TCompare node (`first` + the adjacent `terms`), always Bool-typed. */
+fn lwt_cmp(first: checker::TExpr, terms: []checker::TCmpTerm) -> checker::TExpr {
+    checker::TExpr { kind = checker::TCompare { first = first; rest = terms }; type = lwt_prim(checker::PrimKind::Bool); line = 0; col = 0 }
+}
+
+/** lwt_if_stmt — a Void (no-value) TIfExpr node, the if-STATEMENT shape. */
+fn lwt_if_stmt(cond: checker::TExpr, then_blk: []checker::TStatement, has_else: bool, else_blk: []checker::TStatement) -> checker::TExpr {
+    checker::TExpr { kind = checker::TIfExpr { cond = cond; then_blk = then_blk; has_else = has_else; else_blk = else_blk }; type = checker::Void { }; line = 0; col = 0 }
+}
+
+/** lwt_if_value — a value-producing TIfExpr node (always has an else), typed `k`. */
+fn lwt_if_value(cond: checker::TExpr, then_blk: []checker::TStatement, else_blk: []checker::TStatement, k: checker::PrimKind) -> checker::TExpr {
+    checker::TExpr { kind = checker::TIfExpr { cond = cond; then_blk = then_blk; has_else = true; else_blk = else_blk }; type = lwt_prim(k); line = 0; col = 0 }
+}
+
 fn lwt_seg(s: str) -> parser::Segment { parser::Segment { name = s } }
 fn lwt_path1(s: str) -> parser::Path { parser::Path { segments = teko::list::push(teko::list::empty(), lwt_seg(s)) } }
 
@@ -185,6 +203,90 @@ fn lwt_lowers_cast_i32_to_i64_sign_extends() {
     let inner = lwt_num(5 to i128, checker::PrimKind::I32)
     let e = lwt_cast(inner, checker::PrimKind::I64)
     teko::assert::str_contains(lwt_lower_expr_text(e), "%1 = sext %0")
+}
+
+#test
+fn lwt_lowers_single_lt_comparison() {
+    let e = lwt_cmp(lwt_num_i64(3 to i128), teko::list::push(teko::list::empty(), lwt_cmp_term(lexer::TokenKind::Lt, lwt_num_i64(5 to i128))))
+    teko::assert::str_contains(lwt_lower_expr_text(e), "%2 = icmplts %0, %1")
+}
+
+#test
+fn lwt_lowers_unsigned_ge_comparison() {
+    let e = lwt_cmp(lwt_num(3 to i128, checker::PrimKind::U32), teko::list::push(teko::list::empty(), lwt_cmp_term(lexer::TokenKind::Ge, lwt_num(5 to i128, checker::PrimKind::U32))))
+    teko::assert::str_contains(lwt_lower_expr_text(e), "%2 = icmpgeu %0, %1")
+}
+
+#test
+fn lwt_lowers_eq_and_ne_comparisons() {
+    let eq = lwt_cmp(lwt_num_i64(3 to i128), teko::list::push(teko::list::empty(), lwt_cmp_term(lexer::TokenKind::EqEq, lwt_num_i64(3 to i128))))
+    teko::assert::str_contains(lwt_lower_expr_text(eq), "icmpeq %0, %1")
+    let ne = lwt_cmp(lwt_num_i64(3 to i128), teko::list::push(teko::list::empty(), lwt_cmp_term(lexer::TokenKind::Ne, lwt_num_i64(3 to i128))))
+    teko::assert::str_contains(lwt_lower_expr_text(ne), "icmpne %0, %1")
+}
+
+#test
+fn lwt_lowers_float_eq_comparison() {
+    let e = lwt_cmp(lwt_fnum(1.5), teko::list::push(teko::list::empty(), lwt_cmp_term(lexer::TokenKind::EqEq, lwt_fnum(2.5))))
+    teko::assert::str_contains(lwt_lower_expr_text(e), "fcmpeq %0, %1")
+}
+
+#test
+fn lwt_lowers_chain_comparison_ands_adjacent_terms() {
+    let a = lwt_num_i64(1 to i128)
+    let b = lwt_num_i64(2 to i128)
+    let c = lwt_num_i64(3 to i128)
+    let terms = teko::list::push(teko::list::push(teko::list::empty(), lwt_cmp_term(lexer::TokenKind::Lt, b)), lwt_cmp_term(lexer::TokenKind::Lt, c))
+    let text = lwt_lower_expr_text(lwt_cmp(a, terms))
+    teko::assert::str_contains(text, "icmplts %0, %1")
+    teko::assert::str_contains(text, "icmplts %1, %3")
+    teko::assert::str_contains(text, "branch")
+    teko::assert::str_contains(text, "jump #B")
+}
+
+#test
+fn lwt_lowers_if_stmt_without_else_via_branch_and_merge() {
+    let a = lwt_var("a", checker::PrimKind::I64)
+    let b = lwt_var("b", checker::PrimKind::I64)
+    let cond = lwt_cmp(a, teko::list::push(teko::list::empty(), lwt_cmp_term(lexer::TokenKind::Lt, b)))
+    let then_blk = teko::list::push(teko::list::empty(), lwt_ret(a))
+    let ifstmt = lwt_if_stmt(cond, then_blk, false, then_blk)
+    let params = teko::list::push(teko::list::push(teko::list::empty(), lwt_param("a", "i64")), lwt_param("b", "i64"))
+    let body = teko::list::push(teko::list::push(teko::list::empty(), lwt_exprstmt(ifstmt)), lwt_ret(b))
+    let f = lwt_fn("choose", "teko::demo", params, checker::Prim { kind = checker::PrimKind::I64 }, body)
+    let lf = match lower_function(f) { LFunc as x => x; error as err => return }
+    let text = print_lmodule(add_func(empty_module(), lf))
+    teko::assert::str_contains(text, "branch %2, #B1(), #B2()")
+    teko::assert::str_contains(text, "  #B1:\n    ret %0")
+    teko::assert::str_contains(text, "  #B2:\n    jump #B3()")
+    teko::assert::str_contains(text, "  #B3:\n    ret %1")
+}
+
+#test
+fn lwt_lowers_if_expr_merges_with_a_block_arg() {
+    let x = lwt_var("x", checker::PrimKind::I64)
+    let y = lwt_var("y", checker::PrimKind::I64)
+    let cond = lwt_cmp(x, teko::list::push(teko::list::empty(), lwt_cmp_term(lexer::TokenKind::Lt, y)))
+    let then_blk = teko::list::push(teko::list::empty(), lwt_exprstmt(x))
+    let else_blk = teko::list::push(teko::list::empty(), lwt_exprstmt(y))
+    let ifexpr = lwt_if_value(cond, then_blk, else_blk, checker::PrimKind::I64)
+    let params = teko::list::push(teko::list::push(teko::list::empty(), lwt_param("x", "i64")), lwt_param("y", "i64"))
+    let body = teko::list::push(teko::list::empty(), lwt_ret(ifexpr))
+    let f = lwt_fn("pick", "teko::demo", params, checker::Prim { kind = checker::PrimKind::I64 }, body)
+    let lf = match lower_function(f) { LFunc as x2 => x2; error as err => return }
+    let text = print_lmodule(add_func(empty_module(), lf))
+    teko::assert::str_contains(text, "branch %2, #B1(), #B2()")
+    teko::assert::str_contains(text, "  #B1:\n    jump #B3(%0)")
+    teko::assert::str_contains(text, "  #B2:\n    jump #B3(%1)")
+    teko::assert::str_contains(text, "  #B3(%3):\n    ret %3")
+}
+
+#test
+fn lwt_honest_stop_on_if_without_else_as_a_value() {
+    let cond = lwt_cmp(lwt_num_i64(1 to i128), teko::list::push(teko::list::empty(), lwt_cmp_term(lexer::TokenKind::Lt, lwt_num_i64(2 to i128))))
+    let then_blk = teko::list::push(teko::list::empty(), lwt_exprstmt(lwt_num_i64(1 to i128)))
+    let ifexpr = checker::TExpr { kind = checker::TIfExpr { cond = cond; then_blk = then_blk; has_else = false; else_blk = then_blk }; type = lwt_prim(checker::PrimKind::I64); line = 0; col = 0 }
+    teko::assert::str_contains(lwt_lower_expr_text(ifexpr), "if-without-else used as a value not yet lowered")
 }
 
 #test
