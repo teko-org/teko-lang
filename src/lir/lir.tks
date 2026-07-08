@@ -74,8 +74,28 @@ pub type LJump = struct { target: u32; args: []u32 }
     target block + its block-args. N1 does not emit branches; declared for N2. */
 pub type LBranch = struct { cond: u32; t_target: u32; t_args: []u32; f_target: u32; f_args: []u32 }
 
+/** LAlloca — reserve a stack slot of `bytes` size and `align` alignment, yielding its
+    address as a Ptr VReg. The lowering computes bytes/align from the struct-layout table;
+    the address is the base an aggregate's field stores and loads key off (A1-3, #382). */
+pub type LAlloca = struct { bytes: u32; align: u32 }
+
+/** LFieldAddr — the address of a field inside an aggregate: `base + offset`, a Ptr VReg.
+    `offset` is a COMPILE-TIME CONSTANT byte offset (from the struct-layout table, or a
+    constant-folded array/slice index times its element stride); a DYNAMIC index instead
+    multiplies through an ordinary `IMul` then `IAdd`s onto the base — this op only ever
+    carries a static offset (A1-3, #382). */
+pub type LFieldAddr = struct { base: u32; offset: u32 }
+
+/** LLoad — load a value of machine class `ty` from address `addr` (a Ptr VReg), yielding
+    the value (A1-3, #382). */
+pub type LLoad = struct { addr: u32; ty: LType }
+
+/** LStore — store `value` (of machine class `ty`) to address `addr` (a Ptr VReg); yields
+    no value (A1-3, #382). */
+pub type LStore = struct { addr: u32; value: u32; ty: LType }
+
 /** LOp — the instruction payload (one of the operation cases above). */
-pub type LOp = variant LConstInt | LConstFloat | LBin | LUn | LCall | LParam | LRet | LJump | LBranch
+pub type LOp = variant LConstInt | LConstFloat | LBin | LUn | LCall | LParam | LRet | LJump | LBranch | LAlloca | LFieldAddr | LLoad | LStore
 
 /** LInst — one instruction: the VReg it defines (has_result=false for terminators
     and void calls), its op, and the source position propagated from the TExpr (for
@@ -92,13 +112,13 @@ pub type LBlock = struct { id: u32; params: []u32; insts: []LInst }
     during lowering (functional threading — no mutable module state). */
 pub type LFunc = struct { symbol: str; n_params: u32; param_types: []LType; ret_type: LType; blocks: []LBlock; next_vreg: u32 }
 
-/** LModule — the whole lowered program: its functions. Structs/globals/rodata
-    enter in N2. */
-pub type LModule = struct { funcs: []LFunc }
+/** LModule — the whole lowered program: its functions + the struct-layout table
+    (A1-3, #382). Globals/rodata enter in A1-4. */
+pub type LModule = struct { funcs: []LFunc; layouts: []LStructLayout }
 
-/** empty_module — a module with no functions (the lowering seed). */
+/** empty_module — a module with no functions or layouts (the lowering seed). */
 pub fn empty_module() -> LModule {
-    LModule { funcs = teko::list::empty() }
+    LModule { funcs = teko::list::empty(); layouts = teko::list::empty() }
 }
 
 /** new_func — a fresh LFunc with an empty single block (#B0) reserving VRegs
@@ -177,6 +197,27 @@ pub fn branch_inst(cond: u32, t_target: u32, t_args: []u32, f_target: u32, f_arg
     }
 }
 
+/** alloca_inst — a `%r = alloca <bytes>, align <align>` instruction (A1-3, #382). */
+pub fn alloca_inst(result: u32, bytes: u32, align: u32, line: u32, col: u32) -> LInst {
+    LInst { result = result; has_result = true; op = LAlloca { bytes = bytes; align = align }; line = line; col = col }
+}
+
+/** field_addr_inst — a `%r = field_addr %base, <offset>` instruction: the address `offset`
+    bytes past `base` (A1-3, #382). */
+pub fn field_addr_inst(result: u32, base: u32, offset: u32, line: u32, col: u32) -> LInst {
+    LInst { result = result; has_result = true; op = LFieldAddr { base = base; offset = offset }; line = line; col = col }
+}
+
+/** load_inst — a `%r = load.<ty> %addr` instruction (A1-3, #382). */
+pub fn load_inst(result: u32, addr: u32, ty: LType, line: u32, col: u32) -> LInst {
+    LInst { result = result; has_result = true; op = LLoad { addr = addr; ty = ty }; line = line; col = col }
+}
+
+/** store_inst — a `store.<ty> %addr, %value` instruction; yields no value (A1-3, #382). */
+pub fn store_inst(addr: u32, value: u32, ty: LType, line: u32, col: u32) -> LInst {
+    LInst { result = 0; has_result = false; op = LStore { addr = addr; value = value; ty = ty }; line = line; col = col }
+}
+
 /** push_inst_block — a fresh block with `inst` appended to its instruction stream. */
 fn push_inst_block(b: LBlock, inst: LInst) -> LBlock {
     LBlock { id = b.id; params = b.params; insts = teko::list::push(b.insts, inst) }
@@ -213,7 +254,12 @@ pub fn alloc_vreg(f: LFunc) -> FreshVReg {
 
 /** add_func — return a copy of `m` with `f` appended. */
 pub fn add_func(m: LModule, f: LFunc) -> LModule {
-    LModule { funcs = teko::list::push(m.funcs, f) }
+    LModule { funcs = teko::list::push(m.funcs, f); layouts = m.layouts }
+}
+
+/** add_layout — return a copy of `m` with the struct layout `l` appended. */
+pub fn add_layout(m: LModule, l: LStructLayout) -> LModule {
+    LModule { funcs = m.funcs; layouts = teko::list::push(m.layouts, l) }
 }
 
 /** BlockRef — a freshly-allocated block's id + the function that reserved it (a plain
@@ -261,4 +307,89 @@ fn set_block_param(f: LFunc, block_id: u32, vreg: u32) -> LFunc {
         i++
     }
     LFunc { symbol = f.symbol; n_params = f.n_params; param_types = f.param_types; ret_type = f.ret_type; blocks = blocks; next_vreg = f.next_vreg }
+}
+
+/**
+ * LStructLayout — the resolved layout of one aggregate: its canonical NAME, total size,
+ * alignment, and each field's byte offset — declared order, natural alignment, no
+ * reordering, so a plain-C struct laid out by `cc` agrees with this table BY CONSTRUCTION
+ * (the A4 C-vs-own differential holds without extra bookkeeping). `field_names` parallels
+ * `field_offsets` (same index) so a field is found BY NAME (the lowering never re-derives
+ * the declared order — it reads it straight out of this table) (A1-3, #382).
+ */
+pub type LStructLayout = struct { name: str; size: u32; align: u32; field_names: []str; field_offsets: []u32 }
+
+/**
+ * ltype_size — the byte size of one machine class: 1/2/4/8/16 for I8..I128 and F16/F32/F64
+ * by width, 8 for a Ptr (a 64-bit address), 0 for the value-less Void marker.
+ *
+ * @param LType t  the machine class
+ * @return u32  its size in bytes
+ */
+pub fn ltype_size(t: LType) -> u32 {
+    match t {
+        I8 => 1
+        I16 => 2
+        I32 => 4
+        I64 => 8
+        I128 => 16
+        F16 => 2
+        F32 => 4
+        F64 => 8
+        Ptr => 8
+        Void => 0
+    }
+}
+
+/**
+ * ltype_align — the natural alignment of one machine class: identical to its size for every
+ * scalar class here (each is a power of two), matching a plain C struct's default layout.
+ *
+ * @param LType t  the machine class
+ * @return u32  its alignment in bytes
+ */
+pub fn ltype_align(t: LType) -> u32 { ltype_size(t) }
+
+/**
+ * align_up — round `v` up to the next multiple of `a` (a no-op when `v` already fits, or
+ * when `a` is 0/1 — the zero-size Void case never grows the running offset).
+ *
+ * @param u32 v  the value to round
+ * @param u32 a  the alignment (a power of two, or 0/1 for none)
+ * @return u32  `v` rounded up to a multiple of `a`
+ */
+fn align_up(v: u32, a: u32) -> u32 {
+    if a <= 1 { return v }
+    let rem = v % a
+    if rem == 0 { return v }
+    v + (a - rem)
+}
+
+/**
+ * layout_of — compute a struct's declared-order, natural-alignment layout: walk
+ * `field_names`/`field_types` in order, padding each field's offset up to its own
+ * alignment, then rounding the whole struct's size up to its widest field's alignment
+ * (the standard C struct-layout algorithm, so A2+'s isel and the eventual C-vs-own
+ * differential agree with `cc` by construction — the plan's §5.3 resolution).
+ *
+ * @param str name  the struct's canonical (declaring) name
+ * @param []str field_names  the fields, in DECLARED order
+ * @param []LType field_types  each field's machine class, parallel to `field_names`
+ * @return LStructLayout  the resolved size/align/per-field offsets
+ */
+pub fn layout_of(name: str, field_names: []str, field_types: []LType) -> LStructLayout {
+    mut offsets: []u32 = teko::list::empty()
+    mut cur: u32 = 0
+    mut max_align: u32 = 1
+    mut i: u64 = 0
+    loop {
+        if i >= field_types.len { break }
+        let al = ltype_align(field_types[i])
+        let aligned = align_up(cur, al)
+        offsets = teko::list::push(offsets, aligned)
+        cur = aligned + ltype_size(field_types[i])
+        if al > max_align { max_align = al }
+        i++
+    }
+    LStructLayout { name = name; size = align_up(cur, max_align); align = max_align; field_names = field_names; field_offsets = offsets }
 }

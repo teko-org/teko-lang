@@ -159,6 +159,26 @@ fn print_ret(r: LRet) -> str {
     if r.has_value { teko::str::concat("ret ", vreg_ref(r.value)) } else { "ret" }
 }
 
+/** print_alloca — `alloca <bytes>, align <align>` (A1-3, #382). */
+fn print_alloca(a: LAlloca) -> str {
+    teko::str::concat("alloca ", teko::u64_to_str(a.bytes to u64), ", align ", teko::u64_to_str(a.align to u64))
+}
+
+/** print_field_addr — `field_addr %base, <offset>` (A1-3, #382). */
+fn print_field_addr(fa: LFieldAddr) -> str {
+    teko::str::concat("field_addr ", vreg_ref(fa.base), ", ", teko::u64_to_str(fa.offset to u64))
+}
+
+/** print_load — `load.<ty> %addr` (A1-3, #382). */
+fn print_load(l: LLoad) -> str {
+    teko::str::concat("load.", ltype_name(l.ty), " ", vreg_ref(l.addr))
+}
+
+/** print_store — `store.<ty> %addr, %value` (A1-3, #382). */
+fn print_store(s: LStore) -> str {
+    teko::str::concat("store.", ltype_name(s.ty), " ", vreg_ref(s.addr), ", ", vreg_ref(s.value))
+}
+
 /** print_jump — `jump #B<target>(<args>)`. */
 fn print_jump(j: LJump) -> str {
     teko::str::concat("jump #B", teko::u64_to_str(j.target to u64), "(", print_args(j.args), ")")
@@ -185,6 +205,10 @@ fn print_op(op: LOp) -> str {
         LRet as r => print_ret(r)
         LJump as j => print_jump(j)
         LBranch as br => print_branch(br)
+        LAlloca as a => print_alloca(a)
+        LFieldAddr as fa => print_field_addr(fa)
+        LLoad as l => print_load(l)
+        LStore as s => print_store(s)
     }
 }
 
@@ -235,10 +259,38 @@ fn print_func(f: LFunc) -> str {
     teko::str::concat(out, "}\n")
 }
 
-/** print_lmodule — the whole module as stable text: every function in declaration
-    order, blank-line separated. This is the artifact the diff/fixpoint gate reads. */
-pub fn print_lmodule(m: LModule) -> str {
+/** print_layout — one struct-layout header line: `layout <name>: size=<N> align=<N>
+    { <field>@<offset>, … }` (A1-3, #382). */
+fn print_layout(l: LStructLayout) -> str {
+    mut out = teko::str::concat("layout ", l.name, ": size=", teko::u64_to_str(l.size to u64), " align=", teko::u64_to_str(l.align to u64), " {")
+    mut i: u64 = 0
+    loop {
+        if i >= l.field_names.len { break }
+        if i > 0 { out = teko::str::concat(out, ", ") }
+        out = teko::str::concat(out, l.field_names[i], "@", teko::u64_to_str(l.field_offsets[i] to u64))
+        i++
+    }
+    teko::str::concat(out, "}\n")
+}
+
+/** print_layouts — every registered struct layout, one header line each, in table order
+    (empty for a module with no aggregates — byte-identical to N1's output). */
+fn print_layouts(m: LModule) -> str {
     mut out = ""
+    mut i: u64 = 0
+    loop {
+        if i >= m.layouts.len { break }
+        out = teko::str::concat(out, print_layout(m.layouts[i]))
+        i++
+    }
+    out
+}
+
+/** print_lmodule — the whole module as stable text: its struct-layout table (if any),
+    then every function in declaration order, blank-line separated. This is the artifact
+    the diff/fixpoint gate reads. */
+pub fn print_lmodule(m: LModule) -> str {
+    mut out = print_layouts(m)
     mut i: u64 = 0
     loop {
         if i >= m.funcs.len { break }

@@ -205,3 +205,79 @@ fn prints_block_header_with_a_param() {
     let text = print_lmodule(add_func(empty_module(), f))
     teko::assert::str_contains(text, teko::str::concat("#B1(%", teko::u64_to_str(p.vreg to u64), "):"))
 }
+
+/** lirt_mixed_width_fields — a struct with fields of every scalar width the layout
+    algorithm must pad between: `{ a: u8; b: u32; c: u8; d: i64 }`. */
+fn lirt_mixed_width_names() -> []str {
+    teko::list::push(teko::list::push(teko::list::push(teko::list::push(teko::list::empty(), "a"), "b"), "c"), "d")
+}
+
+fn lirt_mixed_width_types() -> []LType {
+    teko::list::push(teko::list::push(teko::list::push(teko::list::push(teko::list::empty(), LType::I8), LType::I32), LType::I8), LType::I64)
+}
+
+#test
+fn layout_of_pads_each_field_to_its_own_alignment() {
+    let l = layout_of("Mixed", lirt_mixed_width_names(), lirt_mixed_width_types())
+    teko::assert::is_true(l.field_offsets[0] == 0)
+    teko::assert::is_true(l.field_offsets[1] == 4)
+    teko::assert::is_true(l.field_offsets[2] == 8)
+    teko::assert::is_true(l.field_offsets[3] == 16)
+}
+
+#test
+fn layout_of_rounds_the_total_size_up_to_the_widest_alignment() {
+    let l = layout_of("Mixed", lirt_mixed_width_names(), lirt_mixed_width_types())
+    teko::assert::is_true(l.align == 8)
+    teko::assert::is_true(l.size == 24)
+}
+
+#test
+fn layout_of_flat_two_field_struct_matches_the_point_fixture() {
+    let names = teko::list::push(teko::list::push(teko::list::empty(), "x"), "y")
+    let types = teko::list::push(teko::list::push(teko::list::empty(), LType::I64), LType::I64)
+    let l = layout_of("Point", names, types)
+    teko::assert::is_true(l.size == 16)
+    teko::assert::is_true(l.align == 8)
+    teko::assert::is_true(l.field_offsets[0] == 0)
+    teko::assert::is_true(l.field_offsets[1] == 8)
+}
+
+#test
+fn prints_alloca_field_addr_load_and_store() {
+    mut f = new_func("m", 0, teko::list::empty(), LType::I32)
+    let base = alloc_vreg(f)
+    f = base.func
+    f = append_inst(f, 0, alloca_inst(base.vreg, 16, 8, 0, 0))
+    let c = alloc_vreg(f)
+    f = c.func
+    f = append_inst(f, 0, const_int_inst(c.vreg, 9, 0, 0))
+    let addr = alloc_vreg(f)
+    f = addr.func
+    f = append_inst(f, 0, field_addr_inst(addr.vreg, base.vreg, 8, 0, 0))
+    f = append_inst(f, 0, store_inst(addr.vreg, c.vreg, LType::I64, 0, 0))
+    let r = alloc_vreg(f)
+    f = r.func
+    f = append_inst(f, 0, load_inst(r.vreg, addr.vreg, LType::I64, 0, 0))
+    f = append_inst(f, 0, ret_inst(r.vreg, 0, 0))
+    let text = print_lmodule(add_func(empty_module(), f))
+    teko::assert::str_contains(text, "%0 = alloca 16, align 8")
+    teko::assert::str_contains(text, "%2 = field_addr %0, 8")
+    teko::assert::str_contains(text, "store.i64 %2, %1")
+    teko::assert::str_contains(text, "%3 = load.i64 %2")
+}
+
+#test
+fn prints_a_registered_struct_layout_header() {
+    let names = teko::list::push(teko::list::push(teko::list::empty(), "x"), "y")
+    let types = teko::list::push(teko::list::push(teko::list::empty(), LType::I64), LType::I64)
+    let m = add_layout(empty_module(), layout_of("Point", names, types))
+    let text = print_lmodule(m)
+    teko::assert::str_contains(text, "layout Point: size=16 align=8 {x@0, y@8}")
+}
+
+#test
+fn a_module_with_no_layouts_prints_no_header() {
+    let m = add_func(empty_module(), new_func("m", 0, teko::list::empty(), LType::I32))
+    teko::assert::is_true(!teko::str::contains(print_lmodule(m), "layout "))
+}
