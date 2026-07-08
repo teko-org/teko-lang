@@ -31,36 +31,20 @@ if [ -z "$TAGS" ]; then
   exit 1
 fi
 
-# CHANNEL SELECTION (branch-aware seed). A wave umbrella (`remodel/**`) ships NEW syntax the
-# last stable seed cannot parse, so it publishes an intermediate `*-beta` compiler seed on each
-# sub-PR merge and dogfoods it. We pick the channel from the CI ref:
-#   • beta   — a remodel/** PR base ($GITHUB_BASE_REF), a remodel/** branch push ($GITHUB_REF_NAME),
-#              or a *-beta tag build (release.yml on the beta tag). PREFERS the newest `*-beta` seed;
-#              falls back to the newest stable seed for the very first bootstrap (features are
-#              additive, so the alpha seed still builds the umbrella's gen1).
-#   • stable — everything else (main PRs/pushes, *-alpha tag builds). EXCLUDES `*-beta` tags so a
-#              main lane never seeds from an in-progress umbrella.
-# NOTE for a *-beta tag build: the tag being built is not published yet, so "newest beta" resolves
-# to the PREVIOUS intermediate seed — exactly the dogfooding chain we want.
-CHANNEL="stable"
-case "${GITHUB_BASE_REF:-}" in remodel/*) CHANNEL="beta" ;; esac
-case "${GITHUB_REF_NAME:-}" in remodel/*) CHANNEL="beta" ;; esac
-if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
-  case "${GITHUB_REF_NAME:-}" in *-beta) CHANNEL="beta" ;; esac
-fi
-if [ "$CHANNEL" = "beta" ]; then
-  BETA="$(printf '%s\n' "$TAGS" | grep -e '-beta$' || true)"
-  STABLE="$(printf '%s\n' "$TAGS" | grep -v -e '-beta$' || true)"
-  # beta seeds first (newest→oldest), then the stable line as the first-bootstrap fallback
-  TAGS="$(printf '%s\n%s\n' "$BETA" "$STABLE" | grep -v '^$' || true)"
-else
-  TAGS="$(printf '%s\n' "$TAGS" | grep -v -e '-beta$' || true)"
-fi
-if [ -z "$TAGS" ]; then
-  echo "ci_provision_teko: no usable release on the '$CHANNEL' channel for $REPO" >&2
-  exit 1
-fi
-echo "ci_provision_teko: channel=$CHANNEL (base='${GITHUB_BASE_REF:-}' ref='${GITHUB_REF_NAME:-}' type='${GITHUB_REF_TYPE:-}')"
+# SEED = the NEWEST usable released seed, ALWAYS. Features are ADDITIVE, so the freshest compiler
+# builds any older-or-equal source; there is no reason to pin an older one. `TAGS` is already
+# newest-version-first, and the `seed_from_tag` loop below skips a tag whose asset is missing (an
+# in-progress release building ITSELF) or whose binary miscompiled (version-sanity), falling to the
+# next — so "newest first" self-heals the self-build case without a channel split.
+#
+# This SUPERSEDES the old stable/beta channel selection (owner ruling 2026-07-08). That split
+# EXCLUDED `*-beta` tags from a `main`/`*-alpha` lane so it "never seeded from an in-progress
+# umbrella" — but every released seed is gated + working, and once `main` moved onto the `-beta`
+# line (0.1.0.0-beta shipped) the exclusion pinned the umbrella->main lane to the pre-remodel
+# `0.0.1.x-alpha`, which cannot parse wave-new `src/` syntax (`unsafe`/`#must_free`). Always-newest
+# fixes that: during the whole `0.X` beta era the newest release supplies every feature, and at
+# `1.0.0.0` the newest is simply the stable release.
+echo "ci_provision_teko: newest-first seed (base='${GITHUB_BASE_REF:-}' ref='${GITHUB_REF_NAME:-}' type='${GITHUB_REF_TYPE:-}')"
 
 seed_from_tag() {
   tag="$1"
