@@ -492,11 +492,12 @@ fn align_up(v: u32, a: u32) -> u32 {
 }
 
 /**
- * layout_of — compute a struct's declared-order, natural-alignment layout: walk
- * `field_names`/`field_types` in order, padding each field's offset up to its own
- * alignment, then rounding the whole struct's size up to its widest field's alignment
- * (the standard C struct-layout algorithm, so A2+'s isel and the eventual C-vs-own
- * differential agree with `cc` by construction — the plan's §5.3 resolution).
+ * layout_of — compute a struct's declared-order, natural-alignment layout from its
+ * SCALAR per-field machine classes: each field's own size/align comes from
+ * `ltype_size`/`ltype_align` (delegates to `layout_of_sized`). A nested struct-by-value
+ * field does NOT fit this scalar mapping (its real width is its own recursively-resolved
+ * layout, not a single `LType`'s size) — `layout_of_fields` (lower.tks) resolves that case
+ * and calls `layout_of_sized` directly instead (#414, #382).
  *
  * @param str name  the struct's canonical (declaring) name
  * @param []str field_names  the fields, in DECLARED order
@@ -504,18 +505,77 @@ fn align_up(v: u32, a: u32) -> u32 {
  * @return LStructLayout  the resolved size/align/per-field offsets
  */
 pub fn layout_of(name: str, field_names: []str, field_types: []LType) -> LStructLayout {
+    layout_of_sized(name, field_names, field_types, ltype_sizes_of(field_types), ltype_aligns_of(field_types))
+}
+
+/**
+ * layout_of_sized — compute a struct's declared-order layout from EXPLICIT per-field
+ * size/align arrays (rather than deriving them from `field_types`' scalar `ltype_size`/
+ * `ltype_align`): walk the fields in order, padding each one's offset up to its own
+ * `field_aligns` entry, then round the whole struct's size up to its widest field's
+ * alignment (the standard C struct-layout algorithm, so A2+'s isel and the eventual
+ * C-vs-own differential agree with `cc` by construction — the plan's §5.3 resolution).
+ * `layout_of_fields` (lower.tks) uses this directly so a nested struct-by-value field can
+ * supply its OWN recursively-resolved size/align instead of a scalar `LType`'s (#414, #382).
+ *
+ * @param str name  the struct's canonical (declaring) name
+ * @param []str field_names  the fields, in DECLARED order
+ * @param []LType field_types  each field's machine class, parallel to `field_names`
+ *                             (a nested struct-by-value field still carries `Ptr` here —
+ *                             only its SIZE/ALIGN are overridden, not its load/store class)
+ * @param []u32 field_sizes  each field's byte size, parallel to `field_names`
+ * @param []u32 field_aligns  each field's byte alignment, parallel to `field_names`
+ * @return LStructLayout  the resolved size/align/per-field offsets
+ */
+pub fn layout_of_sized(name: str, field_names: []str, field_types: []LType, field_sizes: []u32, field_aligns: []u32) -> LStructLayout {
     mut offsets: []u32 = teko::list::empty()
     mut cur: u32 = 0
     mut max_align: u32 = 1
     mut i: u64 = 0
     loop {
         if i >= field_types.len { break }
-        let al = ltype_align(field_types[i])
+        let al = field_aligns[i]
         let aligned = align_up(cur, al)
         offsets = teko::list::push(offsets, aligned)
-        cur = aligned + ltype_size(field_types[i])
+        cur = aligned + field_sizes[i]
         if al > max_align { max_align = al }
         i++
     }
     LStructLayout { name = name; size = align_up(cur, max_align); align = max_align; field_names = field_names; field_offsets = offsets; field_types = field_types }
+}
+
+/**
+ * ltype_sizes_of — each entry of `field_types` mapped through `ltype_size`, in order
+ * (a `layout_of`/`layout_of_sized` helper — #414, #382).
+ *
+ * @param []LType field_types  the machine classes to size
+ * @return []u32  the parallel byte sizes
+ */
+fn ltype_sizes_of(field_types: []LType) -> []u32 {
+    mut out: []u32 = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= field_types.len { break }
+        out = teko::list::push(out, ltype_size(field_types[i]))
+        i++
+    }
+    out
+}
+
+/**
+ * ltype_aligns_of — each entry of `field_types` mapped through `ltype_align`, in order
+ * (a `layout_of`/`layout_of_sized` helper — #414, #382).
+ *
+ * @param []LType field_types  the machine classes to align
+ * @return []u32  the parallel byte alignments
+ */
+fn ltype_aligns_of(field_types: []LType) -> []u32 {
+    mut out: []u32 = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= field_types.len { break }
+        out = teko::list::push(out, ltype_align(field_types[i]))
+        i++
+    }
+    out
 }
